@@ -1,0 +1,2654 @@
+const r4x_api = @import("r4x_api.zig");
+const std = @import("std");
+const device_inventory = @import("../platform/device_inventory.zig");
+const acpi = @import("../platform/acpi.zig");
+const block_storage = @import("../storage/block.zig");
+const cpu = @import("../platform/cpu.zig");
+const irq_status = @import("../platform/irq.zig");
+const pci = @import("../platform/pci.zig");
+const pcie = @import("../platform/pcie.zig");
+const protocol_api = @import("../kernel/protocol_api.zig");
+const protocol_registry = @import("../protocol/registry.zig");
+const scheduler = @import("../sched/scheduler.zig");
+const sched_sync = @import("../sched/sync.zig");
+const sched_task = @import("../sched/task.zig");
+const service_core = @import("../kernel/service_core.zig");
+const crash = @import("../kernel/crash.zig");
+const mem_blocks = @import("../memory/blocks.zig");
+const mem_phys = @import("../memory/phys.zig");
+const mem_backing_store = @import("../memory/backing_store.zig");
+const mem_reclaim = @import("../memory/reclaim.zig");
+const mem_virt = @import("../memory/virt.zig");
+const boot_info = @import("../bootloader/boot_info.zig");
+const boot_perf = @import("../kernel/boot_perf.zig");
+const loader_perf = @import("../kernel/loader_perf.zig");
+const module_file = @import("../kernel/module_file.zig");
+const display = @import("../display/display.zig");
+const page_cache = @import("../fs/page_cache.zig");
+const fat32_fs = @import("../fs/fat/fat32.zig");
+const fs_request = @import("../fs/request.zig");
+const paging = @import("../memory/paging.zig");
+const page_tables = @import("../memory/page_tables.zig");
+const r4sys_api = @import("r4sys.zig");
+const timer = @import("../kernel/timer.zig");
+const usb_core = @import("../driver/usb/core.zig");
+const usb_host = @import("../driver/usb/host_controller.zig");
+const audio_core = @import("../audio/core.zig");
+const tcp = @import("../net/tcp.zig");
+const fpu = @import("../arch/x86_64/fpu.zig");
+const r4p = @import("r4p.zig");
+const driver_work = @import("../kernel/driver_work.zig");
+const kernel_version = @import("../kernel/version.zig");
+
+pub const name = "R4DEV";
+
+pub const ProgramMemorySummary = r4x_api.ProgramMemorySummary;
+pub const KernelVersion = r4x_api.KernelVersion;
+
+pub const ProgramMemoryBlockInfo = r4x_api.ProgramMemoryBlockInfo;
+
+pub const ProgramVmReserveProbe = r4x_api.ProgramVmReserveProbe;
+
+pub const memory_pressure_snapshot_version = r4x_api.memory_pressure_snapshot_version;
+
+pub const memory_pressure_level_unknown = r4x_api.memory_pressure_level_unknown;
+pub const memory_pressure_level_normal = r4x_api.memory_pressure_level_normal;
+pub const memory_pressure_level_watch = r4x_api.memory_pressure_level_watch;
+pub const memory_pressure_level_warning = r4x_api.memory_pressure_level_warning;
+pub const memory_pressure_level_critical = r4x_api.memory_pressure_level_critical;
+
+pub const memory_pressure_flag_no_pagefile = r4x_api.memory_pressure_flag_no_pagefile;
+pub const memory_pressure_flag_no_swap = r4x_api.memory_pressure_flag_no_swap;
+pub const memory_pressure_flag_commit_limited = r4x_api.memory_pressure_flag_commit_limited;
+pub const memory_pressure_flag_demand_commit = r4x_api.memory_pressure_flag_demand_commit;
+pub const memory_pressure_flag_profile_limits = r4x_api.memory_pressure_flag_profile_limits;
+pub const memory_pressure_flag_no_reclaim = r4x_api.memory_pressure_flag_no_reclaim;
+pub const memory_pressure_flag_fs_cache_reclaim = r4x_api.memory_pressure_flag_fs_cache_reclaim;
+pub const memory_pressure_flag_vm_page_reclaim = r4x_api.memory_pressure_flag_vm_page_reclaim;
+
+pub const memory_pressure_oom_alloc_returns_null = r4x_api.memory_pressure_oom_alloc_returns_null;
+pub const memory_pressure_oom_vm_returns_error = r4x_api.memory_pressure_oom_vm_returns_error;
+pub const memory_pressure_oom_fault_escalates = r4x_api.memory_pressure_oom_fault_escalates;
+pub const memory_pressure_oom_no_overcommit = r4x_api.memory_pressure_oom_no_overcommit;
+pub const memory_reclaim_probe_version = r4x_api.memory_reclaim_probe_version;
+pub const memory_reclaim_reason_diagnostic = r4x_api.memory_reclaim_reason_diagnostic;
+pub const memory_reclaim_reason_vm_commit = r4x_api.memory_reclaim_reason_vm_commit;
+pub const memory_reclaim_reason_vm_fault = r4x_api.memory_reclaim_reason_vm_fault;
+pub const memory_reclaim_reason_loader_commit = r4x_api.memory_reclaim_reason_loader_commit;
+pub const memory_backing_store_probe_version = r4x_api.memory_backing_store_probe_version;
+pub const memory_backing_store_status_unavailable = r4x_api.memory_backing_store_status_unavailable;
+pub const memory_backing_store_status_ready = r4x_api.memory_backing_store_status_ready;
+pub const memory_backing_store_status_invalid_request = r4x_api.memory_backing_store_status_invalid_request;
+pub const memory_backing_store_status_missing_file = r4x_api.memory_backing_store_status_missing_file;
+pub const memory_backing_store_status_directory = r4x_api.memory_backing_store_status_directory;
+pub const memory_backing_store_status_too_small = r4x_api.memory_backing_store_status_too_small;
+pub const memory_backing_store_status_unsupported_fs = r4x_api.memory_backing_store_status_unsupported_fs;
+pub const memory_backing_store_status_unsupported_flags = r4x_api.memory_backing_store_status_unsupported_flags;
+pub const memory_backing_store_flag_file_backed = r4x_api.memory_backing_store_flag_file_backed;
+pub const memory_backing_store_flag_existing_file = r4x_api.memory_backing_store_flag_existing_file;
+pub const memory_backing_store_flag_fat32 = r4x_api.memory_backing_store_flag_fat32;
+pub const memory_backing_store_flag_reserve_only = r4x_api.memory_backing_store_flag_reserve_only;
+pub const memory_backing_store_flag_pager_disabled = r4x_api.memory_backing_store_flag_pager_disabled;
+pub const memory_backing_store_flag_uses_fs_api = r4x_api.memory_backing_store_flag_uses_fs_api;
+pub const memory_backing_store_flag_no_second_io_path = r4x_api.memory_backing_store_flag_no_second_io_path;
+pub const memory_backing_store_flag_page_aligned_request = r4x_api.memory_backing_store_flag_page_aligned_request;
+pub const memory_backing_store_blocker_invalid_request = r4x_api.memory_backing_store_blocker_invalid_request;
+pub const memory_backing_store_blocker_unsupported_flags = r4x_api.memory_backing_store_blocker_unsupported_flags;
+pub const memory_backing_store_blocker_missing_file = r4x_api.memory_backing_store_blocker_missing_file;
+pub const memory_backing_store_blocker_directory = r4x_api.memory_backing_store_blocker_directory;
+pub const memory_backing_store_blocker_too_small = r4x_api.memory_backing_store_blocker_too_small;
+pub const memory_backing_store_blocker_unsupported_fs = r4x_api.memory_backing_store_blocker_unsupported_fs;
+pub const memory_backing_store_blocker_unaligned_request = r4x_api.memory_backing_store_blocker_unaligned_request;
+pub const memory_backing_store_slot_probe_version = r4x_api.memory_backing_store_slot_probe_version;
+pub const memory_backing_store_slot_operation_probe = r4x_api.memory_backing_store_slot_operation_probe;
+pub const memory_backing_store_slot_operation_reserve = r4x_api.memory_backing_store_slot_operation_reserve;
+pub const memory_backing_store_slot_operation_release = r4x_api.memory_backing_store_slot_operation_release;
+pub const memory_backing_store_slot_operation_mark_error = r4x_api.memory_backing_store_slot_operation_mark_error;
+pub const memory_backing_store_slot_operation_recover = r4x_api.memory_backing_store_slot_operation_recover;
+pub const memory_backing_store_slot_owner_kind_diagnostic = r4x_api.memory_backing_store_slot_owner_kind_diagnostic;
+pub const memory_backing_store_slot_owner_kind_r4x_instance = r4x_api.memory_backing_store_slot_owner_kind_r4x_instance;
+pub const memory_backing_store_slot_owner_kind_vm_region = r4x_api.memory_backing_store_slot_owner_kind_vm_region;
+pub const memory_backing_store_slot_owner_kind_pager = r4x_api.memory_backing_store_slot_owner_kind_pager;
+pub const memory_backing_store_slot_status_unavailable = r4x_api.memory_backing_store_slot_status_unavailable;
+pub const memory_backing_store_slot_status_ready = r4x_api.memory_backing_store_slot_status_ready;
+pub const memory_backing_store_slot_status_reserved = r4x_api.memory_backing_store_slot_status_reserved;
+pub const memory_backing_store_slot_status_released = r4x_api.memory_backing_store_slot_status_released;
+pub const memory_backing_store_slot_status_error_marked = r4x_api.memory_backing_store_slot_status_error_marked;
+pub const memory_backing_store_slot_status_recovered = r4x_api.memory_backing_store_slot_status_recovered;
+pub const memory_backing_store_slot_status_invalid_request = r4x_api.memory_backing_store_slot_status_invalid_request;
+pub const memory_backing_store_slot_status_backing_unavailable = r4x_api.memory_backing_store_slot_status_backing_unavailable;
+pub const memory_backing_store_slot_status_insufficient_capacity = r4x_api.memory_backing_store_slot_status_insufficient_capacity;
+pub const memory_backing_store_slot_status_table_full = r4x_api.memory_backing_store_slot_status_table_full;
+pub const memory_backing_store_slot_status_reservation_not_found = r4x_api.memory_backing_store_slot_status_reservation_not_found;
+pub const memory_backing_store_slot_status_unsupported_flags = r4x_api.memory_backing_store_slot_status_unsupported_flags;
+pub const memory_backing_store_slot_status_unsupported_operation = r4x_api.memory_backing_store_slot_status_unsupported_operation;
+pub const memory_backing_store_slot_status_owner_mismatch = r4x_api.memory_backing_store_slot_status_owner_mismatch;
+pub const memory_backing_store_slot_flag_file_backed = r4x_api.memory_backing_store_slot_flag_file_backed;
+pub const memory_backing_store_slot_flag_backing_ready = r4x_api.memory_backing_store_slot_flag_backing_ready;
+pub const memory_backing_store_slot_flag_metadata_only = r4x_api.memory_backing_store_slot_flag_metadata_only;
+pub const memory_backing_store_slot_flag_range_table = r4x_api.memory_backing_store_slot_flag_range_table;
+pub const memory_backing_store_slot_flag_page_sized_slots = r4x_api.memory_backing_store_slot_flag_page_sized_slots;
+pub const memory_backing_store_slot_flag_pager_disabled = r4x_api.memory_backing_store_slot_flag_pager_disabled;
+pub const memory_backing_store_slot_flag_eviction_disabled = r4x_api.memory_backing_store_slot_flag_eviction_disabled;
+pub const memory_backing_store_slot_flag_no_page_io = r4x_api.memory_backing_store_slot_flag_no_page_io;
+pub const memory_backing_store_slot_flag_recovery_available = r4x_api.memory_backing_store_slot_flag_recovery_available;
+pub const memory_backing_store_slot_blocker_invalid_request = r4x_api.memory_backing_store_slot_blocker_invalid_request;
+pub const memory_backing_store_slot_blocker_unsupported_flags = r4x_api.memory_backing_store_slot_blocker_unsupported_flags;
+pub const memory_backing_store_slot_blocker_unsupported_operation = r4x_api.memory_backing_store_slot_blocker_unsupported_operation;
+pub const memory_backing_store_slot_blocker_backing_not_ready = r4x_api.memory_backing_store_slot_blocker_backing_not_ready;
+pub const memory_backing_store_slot_blocker_zero_capacity = r4x_api.memory_backing_store_slot_blocker_zero_capacity;
+pub const memory_backing_store_slot_blocker_insufficient_capacity = r4x_api.memory_backing_store_slot_blocker_insufficient_capacity;
+pub const memory_backing_store_slot_blocker_table_full = r4x_api.memory_backing_store_slot_blocker_table_full;
+pub const memory_backing_store_slot_blocker_reservation_not_found = r4x_api.memory_backing_store_slot_blocker_reservation_not_found;
+pub const memory_backing_store_slot_blocker_unaligned_backing = r4x_api.memory_backing_store_slot_blocker_unaligned_backing;
+pub const memory_backing_store_slot_blocker_owner_mismatch = r4x_api.memory_backing_store_slot_blocker_owner_mismatch;
+pub const memory_backing_store_slot_blocker_invalid_owner = r4x_api.memory_backing_store_slot_blocker_invalid_owner;
+pub const memory_pager_gate_probe_version = r4x_api.memory_pager_gate_probe_version;
+pub const memory_pager_gate_status_unavailable = r4x_api.memory_pager_gate_status_unavailable;
+pub const memory_pager_gate_status_ready = r4x_api.memory_pager_gate_status_ready;
+pub const memory_pager_gate_status_invalid_request = r4x_api.memory_pager_gate_status_invalid_request;
+pub const memory_pager_gate_status_backing_unavailable = r4x_api.memory_pager_gate_status_backing_unavailable;
+pub const memory_pager_gate_status_vm_region_missing = r4x_api.memory_pager_gate_status_vm_region_missing;
+pub const memory_pager_gate_status_no_nonresident_commit = r4x_api.memory_pager_gate_status_no_nonresident_commit;
+pub const memory_pager_gate_status_insufficient_capacity = r4x_api.memory_pager_gate_status_insufficient_capacity;
+pub const memory_pager_gate_status_rollback_failed = r4x_api.memory_pager_gate_status_rollback_failed;
+pub const memory_pager_gate_status_unsupported_flags = r4x_api.memory_pager_gate_status_unsupported_flags;
+pub const memory_pager_gate_status_table_full = r4x_api.memory_pager_gate_status_table_full;
+pub const memory_pager_gate_flag_file_backed = r4x_api.memory_pager_gate_flag_file_backed;
+pub const memory_pager_gate_flag_backing_ready = r4x_api.memory_pager_gate_flag_backing_ready;
+pub const memory_pager_gate_flag_metadata_only = r4x_api.memory_pager_gate_flag_metadata_only;
+pub const memory_pager_gate_flag_vm_region_attached = r4x_api.memory_pager_gate_flag_vm_region_attached;
+pub const memory_pager_gate_flag_commit_gate = r4x_api.memory_pager_gate_flag_commit_gate;
+pub const memory_pager_gate_flag_fault_gate = r4x_api.memory_pager_gate_flag_fault_gate;
+pub const memory_pager_gate_flag_slot_reservation_tested = r4x_api.memory_pager_gate_flag_slot_reservation_tested;
+pub const memory_pager_gate_flag_rollback_complete = r4x_api.memory_pager_gate_flag_rollback_complete;
+pub const memory_pager_gate_flag_pager_disabled = r4x_api.memory_pager_gate_flag_pager_disabled;
+pub const memory_pager_gate_flag_eviction_disabled = r4x_api.memory_pager_gate_flag_eviction_disabled;
+pub const memory_pager_gate_flag_no_page_io = r4x_api.memory_pager_gate_flag_no_page_io;
+pub const memory_pager_gate_flag_no_swap = r4x_api.memory_pager_gate_flag_no_swap;
+pub const memory_pager_gate_flag_no_second_io_path = r4x_api.memory_pager_gate_flag_no_second_io_path;
+pub const memory_pager_gate_flag_page_sized_slots = r4x_api.memory_pager_gate_flag_page_sized_slots;
+pub const memory_pager_gate_blocker_invalid_request = r4x_api.memory_pager_gate_blocker_invalid_request;
+pub const memory_pager_gate_blocker_unsupported_flags = r4x_api.memory_pager_gate_blocker_unsupported_flags;
+pub const memory_pager_gate_blocker_backing_not_ready = r4x_api.memory_pager_gate_blocker_backing_not_ready;
+pub const memory_pager_gate_blocker_vm_region_missing = r4x_api.memory_pager_gate_blocker_vm_region_missing;
+pub const memory_pager_gate_blocker_vm_region_not_r4x = r4x_api.memory_pager_gate_blocker_vm_region_not_r4x;
+pub const memory_pager_gate_blocker_no_nonresident_commit = r4x_api.memory_pager_gate_blocker_no_nonresident_commit;
+pub const memory_pager_gate_blocker_unaligned_request = r4x_api.memory_pager_gate_blocker_unaligned_request;
+pub const memory_pager_gate_blocker_insufficient_capacity = r4x_api.memory_pager_gate_blocker_insufficient_capacity;
+pub const memory_pager_gate_blocker_table_full = r4x_api.memory_pager_gate_blocker_table_full;
+pub const memory_pager_gate_blocker_rollback_failed = r4x_api.memory_pager_gate_blocker_rollback_failed;
+pub const memory_page_io_probe_version = r4x_api.memory_page_io_probe_version;
+pub const memory_page_io_operation_page_out = r4x_api.memory_page_io_operation_page_out;
+pub const memory_page_io_operation_page_in = r4x_api.memory_page_io_operation_page_in;
+pub const memory_page_io_status_unavailable = r4x_api.memory_page_io_status_unavailable;
+pub const memory_page_io_status_ready = r4x_api.memory_page_io_status_ready;
+pub const memory_page_io_status_page_out_ok = r4x_api.memory_page_io_status_page_out_ok;
+pub const memory_page_io_status_page_in_ok = r4x_api.memory_page_io_status_page_in_ok;
+pub const memory_page_io_status_invalid_request = r4x_api.memory_page_io_status_invalid_request;
+pub const memory_page_io_status_backing_unavailable = r4x_api.memory_page_io_status_backing_unavailable;
+pub const memory_page_io_status_vm_region_missing = r4x_api.memory_page_io_status_vm_region_missing;
+pub const memory_page_io_status_reservation_not_found = r4x_api.memory_page_io_status_reservation_not_found;
+pub const memory_page_io_status_slot_not_valid = r4x_api.memory_page_io_status_slot_not_valid;
+pub const memory_page_io_status_io_failed = r4x_api.memory_page_io_status_io_failed;
+pub const memory_page_io_status_partial_io = r4x_api.memory_page_io_status_partial_io;
+pub const memory_page_io_status_unsupported_flags = r4x_api.memory_page_io_status_unsupported_flags;
+pub const memory_page_io_status_slot_error = r4x_api.memory_page_io_status_slot_error;
+pub const memory_page_io_status_owner_mismatch = r4x_api.memory_page_io_status_owner_mismatch;
+pub const memory_page_io_status_stale_generation = r4x_api.memory_page_io_status_stale_generation;
+pub const memory_page_io_status_slot_already_valid = r4x_api.memory_page_io_status_slot_already_valid;
+pub const memory_page_io_flag_file_backed = r4x_api.memory_page_io_flag_file_backed;
+pub const memory_page_io_flag_backing_ready = r4x_api.memory_page_io_flag_backing_ready;
+pub const memory_page_io_flag_vm_region_attached = r4x_api.memory_page_io_flag_vm_region_attached;
+pub const memory_page_io_flag_slot_reserved = r4x_api.memory_page_io_flag_slot_reserved;
+pub const memory_page_io_flag_slot_valid = r4x_api.memory_page_io_flag_slot_valid;
+pub const memory_page_io_flag_slot_dirty = r4x_api.memory_page_io_flag_slot_dirty;
+pub const memory_page_io_flag_slot_clean = r4x_api.memory_page_io_flag_slot_clean;
+pub const memory_page_io_flag_explicit_request = r4x_api.memory_page_io_flag_explicit_request;
+pub const memory_page_io_flag_uses_fs_api = r4x_api.memory_page_io_flag_uses_fs_api;
+pub const memory_page_io_flag_no_second_io_path = r4x_api.memory_page_io_flag_no_second_io_path;
+pub const memory_page_io_flag_pager_disabled = r4x_api.memory_page_io_flag_pager_disabled;
+pub const memory_page_io_flag_eviction_disabled = r4x_api.memory_page_io_flag_eviction_disabled;
+pub const memory_page_io_flag_no_swap = r4x_api.memory_page_io_flag_no_swap;
+pub const memory_page_io_flag_page_sized_slots = r4x_api.memory_page_io_flag_page_sized_slots;
+pub const memory_page_io_flag_page_out = r4x_api.memory_page_io_flag_page_out;
+pub const memory_page_io_flag_page_in = r4x_api.memory_page_io_flag_page_in;
+pub const memory_page_io_flag_owner_matched = r4x_api.memory_page_io_flag_owner_matched;
+pub const memory_page_io_flag_generation_checked = r4x_api.memory_page_io_flag_generation_checked;
+pub const memory_page_io_flag_multi_page = r4x_api.memory_page_io_flag_multi_page;
+pub const memory_page_io_flag_eviction_request = r4x_api.memory_page_io_flag_eviction_request;
+pub const memory_page_io_flag_retry_request = r4x_api.memory_page_io_flag_retry_request;
+pub const memory_page_io_flag_retryable_failure = r4x_api.memory_page_io_flag_retryable_failure;
+pub const memory_page_io_flag_permanent_failure = r4x_api.memory_page_io_flag_permanent_failure;
+pub const memory_page_io_flag_data_preserved = r4x_api.memory_page_io_flag_data_preserved;
+pub const memory_page_io_blocker_invalid_request = r4x_api.memory_page_io_blocker_invalid_request;
+pub const memory_page_io_blocker_unsupported_flags = r4x_api.memory_page_io_blocker_unsupported_flags;
+pub const memory_page_io_blocker_backing_not_ready = r4x_api.memory_page_io_blocker_backing_not_ready;
+pub const memory_page_io_blocker_vm_region_missing = r4x_api.memory_page_io_blocker_vm_region_missing;
+pub const memory_page_io_blocker_vm_region_not_r4x = r4x_api.memory_page_io_blocker_vm_region_not_r4x;
+pub const memory_page_io_blocker_unaligned_region_offset = r4x_api.memory_page_io_blocker_unaligned_region_offset;
+pub const memory_page_io_blocker_region_offset_outside_commit = r4x_api.memory_page_io_blocker_region_offset_outside_commit;
+pub const memory_page_io_blocker_reservation_not_found = r4x_api.memory_page_io_blocker_reservation_not_found;
+pub const memory_page_io_blocker_slot_index_out_of_range = r4x_api.memory_page_io_blocker_slot_index_out_of_range;
+pub const memory_page_io_blocker_slot_not_valid = r4x_api.memory_page_io_blocker_slot_not_valid;
+pub const memory_page_io_blocker_io_failed = r4x_api.memory_page_io_blocker_io_failed;
+pub const memory_page_io_blocker_partial_io = r4x_api.memory_page_io_blocker_partial_io;
+pub const memory_page_io_blocker_slot_error = r4x_api.memory_page_io_blocker_slot_error;
+pub const memory_page_io_blocker_owner_mismatch = r4x_api.memory_page_io_blocker_owner_mismatch;
+pub const memory_page_io_blocker_stale_generation = r4x_api.memory_page_io_blocker_stale_generation;
+pub const memory_page_io_blocker_slot_already_valid = r4x_api.memory_page_io_blocker_slot_already_valid;
+pub const memory_page_io_blocker_invalid_owner = r4x_api.memory_page_io_blocker_invalid_owner;
+pub const memory_vm_page_state_probe_version = r4x_api.memory_vm_page_state_probe_version;
+pub const memory_vm_page_state_operation_query = r4x_api.memory_vm_page_state_operation_query;
+pub const memory_vm_page_state_operation_mark_dirty = r4x_api.memory_vm_page_state_operation_mark_dirty;
+pub const memory_vm_page_state_operation_mark_clean = r4x_api.memory_vm_page_state_operation_mark_clean;
+pub const memory_vm_page_state_operation_bind_slot = r4x_api.memory_vm_page_state_operation_bind_slot;
+pub const memory_vm_page_state_operation_clear_slot = r4x_api.memory_vm_page_state_operation_clear_slot;
+pub const memory_vm_page_state_operation_mark_pinned = r4x_api.memory_vm_page_state_operation_mark_pinned;
+pub const memory_vm_page_state_operation_clear_pinned = r4x_api.memory_vm_page_state_operation_clear_pinned;
+pub const memory_vm_page_state_operation_mark_busy = r4x_api.memory_vm_page_state_operation_mark_busy;
+pub const memory_vm_page_state_operation_clear_busy = r4x_api.memory_vm_page_state_operation_clear_busy;
+pub const memory_vm_page_state_operation_mark_error = r4x_api.memory_vm_page_state_operation_mark_error;
+pub const memory_vm_page_state_operation_clear_error = r4x_api.memory_vm_page_state_operation_clear_error;
+pub const memory_vm_page_state_status_unavailable = r4x_api.memory_vm_page_state_status_unavailable;
+pub const memory_vm_page_state_status_ready = r4x_api.memory_vm_page_state_status_ready;
+pub const memory_vm_page_state_status_invalid_request = r4x_api.memory_vm_page_state_status_invalid_request;
+pub const memory_vm_page_state_status_region_missing = r4x_api.memory_vm_page_state_status_region_missing;
+pub const memory_vm_page_state_status_region_not_r4x = r4x_api.memory_vm_page_state_status_region_not_r4x;
+pub const memory_vm_page_state_status_unaligned_request = r4x_api.memory_vm_page_state_status_unaligned_request;
+pub const memory_vm_page_state_status_outside_commit = r4x_api.memory_vm_page_state_status_outside_commit;
+pub const memory_vm_page_state_status_table_full = r4x_api.memory_vm_page_state_status_table_full;
+pub const memory_vm_page_state_status_not_initialized = r4x_api.memory_vm_page_state_status_not_initialized;
+pub const memory_vm_page_state_status_unsupported_operation = r4x_api.memory_vm_page_state_status_unsupported_operation;
+pub const memory_vm_page_state_status_unsupported_flags = r4x_api.memory_vm_page_state_status_unsupported_flags;
+pub const memory_vm_page_state_flag_committed = r4x_api.memory_vm_page_state_flag_committed;
+pub const memory_vm_page_state_flag_resident = r4x_api.memory_vm_page_state_flag_resident;
+pub const memory_vm_page_state_flag_dirty = r4x_api.memory_vm_page_state_flag_dirty;
+pub const memory_vm_page_state_flag_pinned = r4x_api.memory_vm_page_state_flag_pinned;
+pub const memory_vm_page_state_flag_busy = r4x_api.memory_vm_page_state_flag_busy;
+pub const memory_vm_page_state_flag_error = r4x_api.memory_vm_page_state_flag_error;
+pub const memory_vm_page_state_flag_slot_bound = r4x_api.memory_vm_page_state_flag_slot_bound;
+pub const memory_vm_page_state_flag_hardware_dirty_synced = r4x_api.memory_vm_page_state_flag_hardware_dirty_synced;
+pub const memory_vm_page_state_flag_vm_owned_state = r4x_api.memory_vm_page_state_flag_vm_owned_state;
+pub const memory_vm_page_state_flag_explicit_request = r4x_api.memory_vm_page_state_flag_explicit_request;
+pub const memory_vm_page_state_flag_no_eviction = r4x_api.memory_vm_page_state_flag_no_eviction;
+pub const memory_vm_page_state_flag_no_swap = r4x_api.memory_vm_page_state_flag_no_swap;
+pub const memory_vm_page_state_flag_no_fault_io = r4x_api.memory_vm_page_state_flag_no_fault_io;
+pub const memory_vm_page_state_flag_page_sized = r4x_api.memory_vm_page_state_flag_page_sized;
+pub const memory_vm_page_state_flag_fault_page_in = r4x_api.memory_vm_page_state_flag_fault_page_in;
+pub const memory_vm_page_state_flag_eviction_enabled = r4x_api.memory_vm_page_state_flag_eviction_enabled;
+pub const memory_vm_page_state_blocker_invalid_request = r4x_api.memory_vm_page_state_blocker_invalid_request;
+pub const memory_vm_page_state_blocker_unsupported_flags = r4x_api.memory_vm_page_state_blocker_unsupported_flags;
+pub const memory_vm_page_state_blocker_region_missing = r4x_api.memory_vm_page_state_blocker_region_missing;
+pub const memory_vm_page_state_blocker_region_not_r4x = r4x_api.memory_vm_page_state_blocker_region_not_r4x;
+pub const memory_vm_page_state_blocker_unaligned_request = r4x_api.memory_vm_page_state_blocker_unaligned_request;
+pub const memory_vm_page_state_blocker_outside_commit = r4x_api.memory_vm_page_state_blocker_outside_commit;
+pub const memory_vm_page_state_blocker_table_full = r4x_api.memory_vm_page_state_blocker_table_full;
+pub const memory_vm_page_state_blocker_not_initialized = r4x_api.memory_vm_page_state_blocker_not_initialized;
+pub const memory_vm_page_state_blocker_unsupported_operation = r4x_api.memory_vm_page_state_blocker_unsupported_operation;
+
+pub const ProgramMemoryPressureSnapshot = r4x_api.ProgramMemoryPressureSnapshot;
+
+pub const ProgramMemoryReclaimProbe = r4x_api.ProgramMemoryReclaimProbe;
+
+pub const ProgramMemoryBackingStoreProbe = r4x_api.ProgramMemoryBackingStoreProbe;
+
+pub const ProgramMemoryBackingStoreSlotProbe = r4x_api.ProgramMemoryBackingStoreSlotProbe;
+
+pub const ProgramMemoryPagerGateProbe = r4x_api.ProgramMemoryPagerGateProbe;
+
+pub const ProgramMemoryPageIoProbe = r4x_api.ProgramMemoryPageIoProbe;
+
+pub const ProgramMemoryVmPageStateProbe = r4x_api.ProgramMemoryVmPageStateProbe;
+
+pub const DeviceInventorySummary = r4x_api.DeviceInventorySummary;
+
+pub const DeviceInventoryRecord = r4x_api.DeviceInventoryRecord;
+
+pub const hardware_summary_flag_acpi = r4x_api.hardware_summary_flag_acpi;
+pub const hardware_summary_flag_pcie = r4x_api.hardware_summary_flag_pcie;
+pub const hardware_summary_flag_legacy_pci = r4x_api.hardware_summary_flag_legacy_pci;
+pub const hardware_summary_flag_ioapic = r4x_api.hardware_summary_flag_ioapic;
+pub const hardware_summary_flag_hpet = r4x_api.hardware_summary_flag_hpet;
+pub const hardware_summary_flag_xhci = r4x_api.hardware_summary_flag_xhci;
+pub const hardware_summary_flag_ahci = r4x_api.hardware_summary_flag_ahci;
+pub const hardware_summary_flag_nvme = r4x_api.hardware_summary_flag_nvme;
+pub const hardware_summary_flag_usb_configured = r4x_api.hardware_summary_flag_usb_configured;
+
+pub const HardwareSummary = r4x_api.HardwareSummary;
+
+pub const ProtocolStatus = r4x_api.ProtocolStatus;
+pub const ProtocolBuffer = r4x_api.ProtocolBuffer;
+
+pub const BootInfoFlags = struct {
+    pub const initialized: u32 = 0x0000_0001;
+    pub const memory_map_truncated: u32 = 0x0000_0002;
+    pub const has_hhdm: u32 = 0x0000_0004;
+    pub const has_framebuffer: u32 = 0x0000_0008;
+    pub const has_rsdp: u32 = 0x0000_0010;
+    pub const has_edid: u32 = 0x0000_0020;
+};
+
+pub const BootInfoSummary = r4x_api.BootInfoSummary;
+
+pub const BootInfoMemoryEntry = r4x_api.BootInfoMemoryEntry;
+
+pub const paging_flag_initialized = r4x_api.paging_flag_initialized;
+pub const paging_flag_active_root_matches_hardware = r4x_api.paging_flag_active_root_matches_hardware;
+pub const paging_flag_r4os_root_active = r4x_api.paging_flag_r4os_root_active;
+pub const paging_flag_cr3_switch_done = r4x_api.paging_flag_cr3_switch_done;
+pub const paging_flag_limine_quarantine = r4x_api.paging_flag_limine_quarantine;
+
+pub const paging_root_owner_unknown = r4x_api.paging_root_owner_unknown;
+pub const paging_root_owner_bootloader = r4x_api.paging_root_owner_bootloader;
+pub const paging_root_owner_r4os = r4x_api.paging_root_owner_r4os;
+
+pub const PagingSummary = r4x_api.PagingSummary;
+
+pub const display_summary_flag_registered = r4x_api.display_summary_flag_registered;
+pub const display_summary_flag_visible = r4x_api.display_summary_flag_visible;
+pub const display_summary_flag_fixed_mode = r4x_api.display_summary_flag_fixed_mode;
+pub const display_summary_flag_cpu_present = r4x_api.display_summary_flag_cpu_present;
+pub const display_summary_flag_xrgb32 = r4x_api.display_summary_flag_xrgb32;
+
+pub const DisplaySummary = r4x_api.DisplaySummary;
+
+pub const performance_snapshot_version = r4x_api.performance_snapshot_version;
+
+pub const performance_flag_scheduler_ready = r4x_api.performance_flag_scheduler_ready;
+pub const performance_flag_display_ready = r4x_api.performance_flag_display_ready;
+pub const performance_flag_boot_perf_ready = r4x_api.performance_flag_boot_perf_ready;
+pub const performance_flag_wait_objects_ready = r4x_api.performance_flag_wait_objects_ready;
+pub const performance_flag_lock_diagnostics_ready = r4x_api.performance_flag_lock_diagnostics_ready;
+pub const performance_flag_storage_request_queue_ready = r4x_api.performance_flag_storage_request_queue_ready;
+pub const performance_flag_fs_request_ready = r4x_api.performance_flag_fs_request_ready;
+pub const performance_flag_service_queue_ready = r4x_api.performance_flag_service_queue_ready;
+pub const performance_flag_preemption_readiness_ready = r4x_api.performance_flag_preemption_readiness_ready;
+pub const performance_flag_fpu_state_ready = r4x_api.performance_flag_fpu_state_ready;
+pub const performance_flag_fs_page_cache_ready = r4x_api.performance_flag_fs_page_cache_ready;
+pub const performance_flag_fs_writeback_ready = r4x_api.performance_flag_fs_writeback_ready;
+pub const performance_flag_fs_reclaim_ready = r4x_api.performance_flag_fs_reclaim_ready;
+pub const performance_flag_fs_pmm_reclaim_ready = r4x_api.performance_flag_fs_pmm_reclaim_ready;
+pub const performance_flag_global_reclaim_ready = r4x_api.performance_flag_global_reclaim_ready;
+pub const performance_flag_memory_backing_store_ready = r4x_api.performance_flag_memory_backing_store_ready;
+pub const performance_flag_memory_backing_store_slots_ready = r4x_api.performance_flag_memory_backing_store_slots_ready;
+pub const performance_flag_memory_pager_gates_ready = r4x_api.performance_flag_memory_pager_gates_ready;
+pub const performance_flag_memory_page_io_ready = r4x_api.performance_flag_memory_page_io_ready;
+pub const performance_flag_memory_vm_page_state_ready = r4x_api.performance_flag_memory_vm_page_state_ready;
+pub const performance_flag_memory_eviction_ready = r4x_api.performance_flag_memory_eviction_ready;
+pub const performance_flag_memory_pager_error_policy_ready = r4x_api.performance_flag_memory_pager_error_policy_ready;
+pub const performance_flag_productive_preemption_ready = r4x_api.performance_flag_productive_preemption_ready;
+pub const performance_flag_scheduler_latency_ready = r4x_api.performance_flag_scheduler_latency_ready;
+pub const performance_flag_avx_state_ready = r4x_api.performance_flag_avx_state_ready;
+pub const performance_flag_driver_workqueue_ready = r4x_api.performance_flag_driver_workqueue_ready;
+pub const performance_flag_storage_driver_completion_ready = r4x_api.performance_flag_storage_driver_completion_ready;
+pub const performance_flag_display_responsiveness_ready = r4x_api.performance_flag_display_responsiveness_ready;
+pub const performance_flag_audio_latency_ready = r4x_api.performance_flag_audio_latency_ready;
+pub const performance_flag_loader_performance_ready = r4x_api.performance_flag_loader_performance_ready;
+pub const performance_flag_hot_path_index_ready = r4x_api.performance_flag_hot_path_index_ready;
+pub const performance_flag_loader_memory_ready = r4x_api.performance_flag_loader_memory_ready;
+
+pub const performance_missing_blocked_object = r4x_api.performance_missing_blocked_object;
+pub const performance_missing_wait_latency_histogram = r4x_api.performance_missing_wait_latency_histogram;
+pub const performance_missing_fs_latency_histogram = r4x_api.performance_missing_fs_latency_histogram;
+pub const performance_missing_tcp_latency_histogram = r4x_api.performance_missing_tcp_latency_histogram;
+pub const performance_missing_display_latency_histogram = r4x_api.performance_missing_display_latency_histogram;
+pub const performance_missing_driver_completion_latency = r4x_api.performance_missing_driver_completion_latency;
+pub const performance_missing_service_latency_histogram = r4x_api.performance_missing_service_latency_histogram;
+pub const performance_missing_preemption_latency_histogram = r4x_api.performance_missing_preemption_latency_histogram;
+
+pub const performance_preemption_gate_productive_disabled = r4x_api.performance_preemption_gate_productive_disabled;
+pub const performance_preemption_gate_kernel_critical = r4x_api.performance_preemption_gate_kernel_critical;
+pub const performance_preemption_gate_memory_paging = r4x_api.performance_preemption_gate_memory_paging;
+pub const performance_preemption_gate_driver_irq = r4x_api.performance_preemption_gate_driver_irq;
+pub const performance_preemption_gate_fs_storage = r4x_api.performance_preemption_gate_fs_storage;
+pub const performance_preemption_gate_service_program = r4x_api.performance_preemption_gate_service_program;
+pub const performance_preemption_gate_fpu_state = r4x_api.performance_preemption_gate_fpu_state;
+
+pub const performance_fpu_backend_none = r4x_api.performance_fpu_backend_none;
+pub const performance_fpu_backend_fxsave = r4x_api.performance_fpu_backend_fxsave;
+pub const performance_fpu_backend_xsave = r4x_api.performance_fpu_backend_xsave;
+pub const performance_simd_abi_none = r4x_api.performance_simd_abi_none;
+pub const performance_simd_abi_sse2 = r4x_api.performance_simd_abi_sse2;
+pub const performance_simd_abi_avx = r4x_api.performance_simd_abi_avx;
+pub const performance_simd_abi_avx2 = r4x_api.performance_simd_abi_avx2;
+pub const fs_cache_pagefile_blocker_no_pagefile = r4x_api.fs_cache_pagefile_blocker_no_pagefile;
+pub const fs_cache_pagefile_blocker_no_swap = r4x_api.fs_cache_pagefile_blocker_no_swap;
+pub const fs_cache_pagefile_blocker_static_cache = r4x_api.fs_cache_pagefile_blocker_static_cache;
+pub const fs_cache_pagefile_blocker_no_global_reclaim = r4x_api.fs_cache_pagefile_blocker_no_global_reclaim;
+pub const fs_cache_pagefile_blocker_no_pager = r4x_api.fs_cache_pagefile_blocker_no_pager;
+
+pub const ProgramPerformanceSummary = r4x_api.ProgramPerformanceSummary;
+
+pub const ProgramInstanceStorageSummary = r4x_api.ProgramInstanceStorageSummary;
+pub const ProgramInstanceStorageSelfTestResult = r4x_api.ProgramInstanceStorageSelfTestResult;
+pub const ProgramRegistrySummary = r4x_api.ProgramRegistrySummary;
+pub const ProgramRegistrySummaryV2 = r4x_api.ProgramRegistrySummaryV2;
+pub const ProgramRegistrySelfTestResult = r4x_api.ProgramRegistrySelfTestResult;
+pub const ProgramRegistrySelfTestResultV2 = r4x_api.ProgramRegistrySelfTestResultV2;
+pub const ProgramInventorySummary = r4x_api.ProgramInventorySummary;
+pub const program_registry_self_test_operation_arm_lifecycle_failure = r4x_api.program_registry_self_test_operation_arm_lifecycle_failure;
+pub const program_registry_self_test_operation_arm_next_growth = r4x_api.program_registry_self_test_operation_arm_next_growth;
+pub const program_registry_self_test_operation_force_next_id = r4x_api.program_registry_self_test_operation_force_next_id;
+pub const program_registry_self_test_operation_reset = r4x_api.program_registry_self_test_operation_reset;
+pub const program_registry_self_test_operation_signal_reaper = r4x_api.program_registry_self_test_operation_signal_reaper;
+pub const program_registry_self_test_flag_allowed = r4x_api.program_registry_self_test_flag_allowed;
+pub const program_registry_self_test_flag_armed = r4x_api.program_registry_self_test_flag_armed;
+pub const program_registry_self_test_flag_reset = r4x_api.program_registry_self_test_flag_reset;
+pub const program_registry_self_test_flag_one_shot = r4x_api.program_registry_self_test_flag_one_shot;
+pub const program_registry_self_test_flag_denied = r4x_api.program_registry_self_test_flag_denied;
+pub const program_registry_self_test_flag_busy = r4x_api.program_registry_self_test_flag_busy;
+pub const program_registry_self_test_flag_lifecycle_armed = r4x_api.program_registry_self_test_flag_lifecycle_armed;
+pub const program_registry_self_test_flag_lifecycle_consumed = r4x_api.program_registry_self_test_flag_lifecycle_consumed;
+pub const program_registry_self_test_flag_reaper_signalled = r4x_api.program_registry_self_test_flag_reaper_signalled;
+pub const program_registry_self_test_flag_lifecycle_retried = r4x_api.program_registry_self_test_flag_lifecycle_retried;
+pub const program_registry_self_test_flag_lifecycle_recovered = r4x_api.program_registry_self_test_flag_lifecycle_recovered;
+pub const program_registry_self_test_phase_none = r4x_api.program_registry_self_test_phase_none;
+pub const program_registry_self_test_phase_completion_reserve = r4x_api.program_registry_self_test_phase_completion_reserve;
+pub const program_registry_self_test_phase_storage = r4x_api.program_registry_self_test_phase_storage;
+pub const program_registry_self_test_phase_image = r4x_api.program_registry_self_test_phase_image;
+pub const program_registry_self_test_phase_stack = r4x_api.program_registry_self_test_phase_stack;
+pub const program_registry_self_test_phase_task = r4x_api.program_registry_self_test_phase_task;
+pub const program_registry_self_test_phase_publish = r4x_api.program_registry_self_test_phase_publish;
+pub const program_registry_self_test_phase_exit_commit = r4x_api.program_registry_self_test_phase_exit_commit;
+pub const program_registry_self_test_phase_cancel_execution = r4x_api.program_registry_self_test_phase_cancel_execution;
+pub const program_registry_self_test_phase_detach_task = r4x_api.program_registry_self_test_phase_detach_task;
+pub const program_registry_self_test_phase_output_detach = r4x_api.program_registry_self_test_phase_output_detach;
+pub const program_registry_self_test_phase_storage_release = r4x_api.program_registry_self_test_phase_storage_release;
+pub const program_registry_self_test_phase_image_stack_vm_release = r4x_api.program_registry_self_test_phase_image_stack_vm_release;
+pub const program_registry_self_test_phase_slot_reclaim = r4x_api.program_registry_self_test_phase_slot_reclaim;
+pub const program_registry_summary_flag_failure_armed = r4x_api.program_registry_summary_flag_failure_armed;
+pub const program_instance_storage_self_test_flag_heap_ready = r4x_api.program_instance_storage_self_test_flag_heap_ready;
+pub const program_instance_storage_self_test_flag_payload_balance = r4x_api.program_instance_storage_self_test_flag_payload_balance;
+pub const program_instance_storage_self_test_flag_rollback_path = r4x_api.program_instance_storage_self_test_flag_rollback_path;
+pub const program_instance_storage_self_test_flag_storage_baseline_restored = r4x_api.program_instance_storage_self_test_flag_storage_baseline_restored;
+
+pub const ProgramInstanceStorageSummaryProvider = *const fn (*ProgramInstanceStorageSummary) void;
+pub const ProgramInstanceStorageSelfTestProvider = *const fn (*ProgramInstanceStorageSelfTestResult) i32;
+pub const ProgramRegistrySummaryProvider = *const fn (*ProgramRegistrySummaryV2) void;
+pub const ProgramRegistrySelfTestProvider = *const fn (*ProgramRegistrySelfTestResultV2) i32;
+pub const ExecutionInventorySummaryProvider = *const fn (*ProgramInventorySummary) i32;
+
+var program_instance_storage_summary_provider: ?ProgramInstanceStorageSummaryProvider = null;
+var program_instance_storage_self_test_provider: ?ProgramInstanceStorageSelfTestProvider = null;
+var program_registry_summary_provider: ?ProgramRegistrySummaryProvider = null;
+var program_registry_self_test_provider: ?ProgramRegistrySelfTestProvider = null;
+var execution_inventory_summary_provider: ?ExecutionInventorySummaryProvider = null;
+
+// Boot-time provider seams keep R4DEV independent from r4x.zig. Providers are
+// installed before the R4DEV table is published and remain immutable at runtime.
+pub fn setProgramInstanceStorageSummaryProvider(provider: ?ProgramInstanceStorageSummaryProvider) void {
+    program_instance_storage_summary_provider = provider;
+}
+
+pub fn setProgramInstanceStorageSelfTestProvider(provider: ?ProgramInstanceStorageSelfTestProvider) void {
+    program_instance_storage_self_test_provider = provider;
+}
+
+pub fn setProgramRegistrySummaryProvider(provider: ?ProgramRegistrySummaryProvider) void {
+    program_registry_summary_provider = provider;
+}
+
+pub fn setProgramRegistrySelfTestProvider(provider: ?ProgramRegistrySelfTestProvider) void {
+    program_registry_self_test_provider = provider;
+}
+
+pub fn setExecutionInventorySummaryProvider(provider: ?ExecutionInventorySummaryProvider) void {
+    execution_inventory_summary_provider = provider;
+}
+
+pub const ProgramTaskPerformanceInfo = r4x_api.ProgramTaskPerformanceInfo;
+
+pub const ProgramStoragePerformanceInfo = r4x_api.ProgramStoragePerformanceInfo;
+
+pub const ProgramBootPhasePerformanceInfo = r4x_api.ProgramBootPhasePerformanceInfo;
+
+const program_instance_storage_summary_v1_size: u32 = 256;
+const program_instance_storage_summary_v2_size: u32 = @sizeOf(ProgramInstanceStorageSummary);
+
+fn writeProgramInstanceStorageSummaryPrefix(
+    out: *ProgramInstanceStorageSummary,
+    value: *const ProgramInstanceStorageSummary,
+    byte_count: u32,
+) void {
+    const destination: [*]u8 = @ptrCast(out);
+    const source = std.mem.asBytes(value);
+    @memcpy(destination[0..byte_count], source[0..byte_count]);
+}
+
+pub fn programInstanceStorageSummary(out: *ProgramInstanceStorageSummary) callconv(.c) i32 {
+    var value: ProgramInstanceStorageSummary = .{};
+    const provider = program_instance_storage_summary_provider;
+    if (provider) |fill| fill(&value);
+    value.version = 1;
+    value.size = program_instance_storage_summary_v1_size;
+    writeProgramInstanceStorageSummaryPrefix(out, &value, program_instance_storage_summary_v1_size);
+    return if (provider != null) 1 else 0;
+}
+
+pub fn programInstanceStorageSummaryV2(out: *ProgramInstanceStorageSummary) callconv(.c) i32 {
+    if (out.version < 2 or out.size < program_instance_storage_summary_v2_size) return -1;
+    var value: ProgramInstanceStorageSummary = .{};
+    const provider = program_instance_storage_summary_provider;
+    if (provider) |fill| fill(&value);
+    value.version = 2;
+    value.size = program_instance_storage_summary_v2_size;
+    out.* = value;
+    return if (provider != null) 1 else 0;
+}
+
+pub fn programInstanceStorageSelfTest(out: *ProgramInstanceStorageSelfTestResult) callconv(.c) i32 {
+    var value: ProgramInstanceStorageSelfTestResult = .{};
+    const provider = program_instance_storage_self_test_provider orelse {
+        out.* = value;
+        return 0;
+    };
+    const result = provider(&value);
+    value.version = 1;
+    value.size = @sizeOf(ProgramInstanceStorageSelfTestResult);
+    out.* = value;
+    return result;
+}
+
+pub fn programRegistrySummary(out: *ProgramRegistrySummary) callconv(.c) i32 {
+    var value: ProgramRegistrySummaryV2 = .{};
+    const provider = program_registry_summary_provider orelse {
+        out.* = .{};
+        return 0;
+    };
+    provider(&value);
+    var legacy: ProgramRegistrySummary = .{};
+    @memcpy(std.mem.asBytes(&legacy), std.mem.asBytes(&value)[0..@sizeOf(ProgramRegistrySummary)]);
+    legacy.version = 1;
+    legacy.size = @sizeOf(ProgramRegistrySummary);
+    out.* = legacy;
+    return 1;
+}
+
+pub fn programRegistrySelfTest(out: *ProgramRegistrySelfTestResult) callconv(.c) i32 {
+    var value: ProgramRegistrySelfTestResultV2 = .{
+        .operation = out.operation,
+    };
+    const provider = program_registry_self_test_provider orelse {
+        out.* = .{ .operation = value.operation };
+        return 0;
+    };
+    const result = provider(&value);
+    var legacy: ProgramRegistrySelfTestResult = .{};
+    @memcpy(std.mem.asBytes(&legacy), std.mem.asBytes(&value)[0..@sizeOf(ProgramRegistrySelfTestResult)]);
+    legacy.version = 1;
+    legacy.size = @sizeOf(ProgramRegistrySelfTestResult);
+    out.* = legacy;
+    return result;
+}
+
+pub fn programRegistrySummaryV2(out: *ProgramRegistrySummaryV2) callconv(.c) i32 {
+    var value: ProgramRegistrySummaryV2 = .{};
+    const provider = program_registry_summary_provider orelse {
+        out.* = value;
+        return 0;
+    };
+    provider(&value);
+    value.version = 2;
+    value.size = @sizeOf(ProgramRegistrySummaryV2);
+    out.* = value;
+    return 1;
+}
+
+pub fn programRegistrySelfTestV2(out: *ProgramRegistrySelfTestResultV2) callconv(.c) i32 {
+    var value: ProgramRegistrySelfTestResultV2 = .{
+        .operation = out.operation,
+        .lifecycle_phase = out.lifecycle_phase,
+        .requested_next_id = out.requested_next_id,
+    };
+    const provider = program_registry_self_test_provider orelse {
+        out.* = value;
+        return 0;
+    };
+    const result = provider(&value);
+    value.version = 2;
+    value.size = @sizeOf(ProgramRegistrySelfTestResultV2);
+    out.* = value;
+    return result;
+}
+
+pub fn executionInventorySummary(out: *ProgramInventorySummary) callconv(.c) i32 {
+    var value: ProgramInventorySummary = .{};
+    const provider = execution_inventory_summary_provider orelse {
+        out.* = value;
+        return 0;
+    };
+    const result = provider(&value);
+    value.version = r4x_api.program_inventory_version;
+    value.size = @sizeOf(ProgramInventorySummary);
+    out.* = value;
+    return result;
+}
+
+pub fn kernelVersion(out: *KernelVersion) callconv(.c) i32 {
+    if (out.version < 1 or out.size < @sizeOf(KernelVersion)) return -1;
+    out.* = .{
+        .version = 1,
+        .size = @sizeOf(KernelVersion),
+        .major = kernel_version.current.major,
+        .minor = kernel_version.current.minor,
+        .patch = kernel_version.current.patch,
+    };
+    return 1;
+}
+
+comptime {
+    if (@sizeOf(ProgramRegistrySummary) != 160 or @sizeOf(ProgramRegistrySummaryV2) != 224)
+        @compileError("R4DEV program registry summary ABI drift");
+    if (@sizeOf(ProgramRegistrySelfTestResult) != 64 or @sizeOf(ProgramRegistrySelfTestResultV2) != 136)
+        @compileError("R4DEV program registry self-test ABI drift");
+    if (@sizeOf(ProgramInventorySummary) != 160)
+        @compileError("R4DEV execution inventory summary ABI drift");
+    if (@sizeOf(KernelVersion) != 24)
+        @compileError("R4DEV kernel version ABI drift");
+}
+
+pub fn memorySummary(out: *ProgramMemorySummary) callconv(.c) i32 {
+    const blocks = mem_blocks.summary();
+    const virt = mem_virt.stats();
+    out.* = .{
+        .total_slots_used = blocks.total_slots_used,
+        .active_blocks = blocks.active_blocks,
+        .released_blocks = blocks.released_blocks,
+        .error_blocks = blocks.error_blocks,
+        .physical_bytes = blocks.physical_bytes,
+        .virtual_bytes = blocks.virtual_bytes,
+        .reserved_bytes = blocks.reserved_bytes,
+        .committed_bytes = blocks.committed_bytes,
+        .free_physical_bytes = blocks.free_physical_bytes,
+        .largest_free_phys_base = blocks.largest_free_phys_base,
+        .largest_free_phys_len = blocks.largest_free_phys_len,
+        .largest_free_virtual_base = virt.largest_free_virtual_base,
+        .largest_free_virtual_len = virt.largest_free_virtual_len,
+        .app_system_reserve_frames = virt.app_system_reserve_frames,
+        .app_available_frames = virt.app_available_frames,
+        .by_kind = blocks.by_kind,
+        .by_owner = blocks.by_owner,
+        .by_status = blocks.by_status,
+        .overflow = if (blocks.overflow or virt.overflow) 1 else 0,
+        .reserved0 = 0,
+    };
+    return 0;
+}
+
+pub fn memoryBlockCount() callconv(.c) u32 {
+    const count = mem_blocks.summary().active_blocks;
+    return if (count > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(count);
+}
+
+pub fn memoryBlock(index: u32, out: *ProgramMemoryBlockInfo) callconv(.c) i32 {
+    const block = mem_blocks.activeAt(index) orelse {
+        out.* = .{};
+        return 0;
+    };
+    out.* = .{
+        .id = block.id,
+        .kind = @intFromEnum(block.kind),
+        .owner = @intFromEnum(block.owner),
+        .status = @intFromEnum(block.status),
+        .reserved0 = 0,
+        .owner_id = block.owner_id,
+        .phys_base = block.phys_base,
+        .phys_len = block.phys_len,
+        .virt_base = block.virt_base,
+        .virt_len = block.virt_len,
+        .reserved_bytes = block.reserved_bytes,
+        .committed_bytes = block.committed_bytes,
+        .name = .{0} ** 32,
+    };
+    copyFixedZ(out.name[0..], block.name);
+    return 1;
+}
+
+pub fn memoryPressureSnapshot(out: *ProgramMemoryPressureSnapshot) callconv(.c) i32 {
+    const phys = mem_phys.stats();
+    const blocks = mem_blocks.summary();
+    const virt = mem_virt.stats();
+    const fs_cache = page_cache.summary();
+
+    const total_physical_bytes = phys.total_frames * mem_phys.FRAME_SIZE;
+    const free_physical_bytes = phys.free_frames * mem_phys.FRAME_SIZE;
+    const used_physical_bytes = phys.used_frames * mem_phys.FRAME_SIZE;
+    const vm_reclaimable_bytes = mem_virt.evictableBytes();
+    const reclaimable_bytes = saturatingAdd(fs_cache.pmm_reclaimable_bytes, vm_reclaimable_bytes);
+    const dirty_bytes = saturatingAdd(fs_cache.pmm_dirty_bytes, mem_virt.evictableDirtyBytes());
+    const non_reclaimable_bytes = if (used_physical_bytes > reclaimable_bytes)
+        used_physical_bytes - reclaimable_bytes
+    else
+        0;
+    const app_system_reserve_bytes = virt.app_system_reserve_frames * mem_phys.FRAME_SIZE;
+    const app_available_bytes = virt.app_available_frames * mem_phys.FRAME_SIZE;
+    const committed_nonresident_bytes = if (virt.committed_bytes > virt.resident_bytes)
+        virt.committed_bytes - virt.resident_bytes
+    else
+        0;
+    const commit_budget_bytes = saturatingAdd(virt.resident_bytes, app_available_bytes);
+    const commit_headroom_bytes = if (commit_budget_bytes > virt.committed_bytes)
+        commit_budget_bytes - virt.committed_bytes
+    else
+        0;
+
+    var flags: u32 = memory_pressure_flag_no_pagefile |
+        memory_pressure_flag_no_swap |
+        memory_pressure_flag_commit_limited |
+        memory_pressure_flag_demand_commit |
+        memory_pressure_flag_profile_limits;
+    if (reclaimable_bytes > 0) {
+        if (fs_cache.pmm_reclaimable_bytes > 0) flags |= memory_pressure_flag_fs_cache_reclaim;
+        if (vm_reclaimable_bytes > 0) flags |= memory_pressure_flag_vm_page_reclaim;
+    } else {
+        flags |= memory_pressure_flag_no_reclaim;
+    }
+
+    out.* = .{
+        .version = memory_pressure_snapshot_version,
+        .size = @sizeOf(ProgramMemoryPressureSnapshot),
+        .flags = flags,
+        .pressure_level = pressureLevel(total_physical_bytes, app_available_bytes, commit_headroom_bytes),
+        .oom_policy_flags = memory_pressure_oom_alloc_returns_null |
+            memory_pressure_oom_vm_returns_error |
+            memory_pressure_oom_fault_escalates |
+            memory_pressure_oom_no_overcommit,
+        .reserved0 = 0,
+        .total_physical_bytes = total_physical_bytes,
+        .free_physical_bytes = free_physical_bytes,
+        .used_physical_bytes = used_physical_bytes,
+        .largest_free_physical_bytes = blocks.largest_free_phys_len,
+        .app_system_reserve_bytes = app_system_reserve_bytes,
+        .app_available_bytes = app_available_bytes,
+        .virtual_reserved_bytes = virt.reserved_bytes,
+        .virtual_committed_bytes = virt.committed_bytes,
+        .virtual_resident_bytes = virt.resident_bytes,
+        .largest_free_virtual_bytes = virt.largest_free_virtual_len,
+        .committed_nonresident_bytes = committed_nonresident_bytes,
+        .commit_budget_bytes = commit_budget_bytes,
+        .commit_headroom_bytes = commit_headroom_bytes,
+        .reclaimable_bytes = reclaimable_bytes,
+        .dirty_bytes = dirty_bytes,
+        .non_reclaimable_bytes = non_reclaimable_bytes,
+        .fault_count = virt.fault_count,
+        .failed_faults = virt.failed_faults,
+        .reserved1 = .{0} ** 4,
+    };
+    return 1;
+}
+
+pub fn memoryReclaimProbe(requested_frames_raw: u32, out: *ProgramMemoryReclaimProbe) callconv(.c) i32 {
+    const requested_frames = clampReclaimFrames(requested_frames_raw);
+    const result = mem_reclaim.reclaimFrames(.diagnostic, requested_frames);
+    const reclaim_summary = mem_reclaim.summary();
+
+    out.* = .{
+        .version = memory_reclaim_probe_version,
+        .size = @sizeOf(ProgramMemoryReclaimProbe),
+        .reason = @intFromEnum(result.reason),
+        .requested_frames = result.requested_frames,
+        .returned_frames = result.returned_frames,
+        .reserved0 = 0,
+        .returned_bytes = result.returned_bytes,
+        .dirty_drains = result.dirty_drains,
+        .failed_drains = result.failed_drains,
+        .before_free_frames = result.before_free_frames,
+        .after_free_frames = result.after_free_frames,
+        .elapsed_ticks = result.elapsed_ticks,
+        .total_attempts = reclaim_summary.attempts,
+        .total_successes = reclaim_summary.successes,
+        .total_failures = reclaim_summary.failures,
+        .fs_returned_frames = result.fs_returned_frames,
+        .vm_returned_frames = result.vm_returned_frames,
+        .vm_page_outs_lo = if (result.vm_page_outs > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(result.vm_page_outs),
+        .vm_failures_lo = if (result.vm_failures > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(result.vm_failures),
+        .fs_returned_bytes = result.fs_returned_bytes,
+        .vm_returned_bytes = result.vm_returned_bytes,
+        .vm_page_outs = result.vm_page_outs,
+        .vm_failures = result.vm_failures,
+        .reserved1 = .{0} ** 4,
+    };
+    return if (result.returned_frames > 0) 1 else 0;
+}
+
+pub fn memoryBackingStoreProbe(path_ptr: [*:0]const u8, requested_bytes: u64, flags: u32, out: *ProgramMemoryBackingStoreProbe) callconv(.c) i32 {
+    var file_info: r4sys_api.FileInfo = .{};
+    const file_rc = r4sys_api.fileInfo(path_ptr, &file_info);
+
+    var drive_info: r4sys_api.DriveInfo = .{};
+    var fat32 = false;
+    var cluster_bytes: u32 = 0;
+    if (file_info.drive >= 'A' and file_info.drive <= 'Z') {
+        const drive_index: u32 = @intCast(file_info.drive - 'A');
+        if (r4sys_api.driveInfo(drive_index, &drive_info) > 0 and drive_info.cluster_bytes != 0) {
+            cluster_bytes = drive_info.cluster_bytes;
+        }
+    }
+    if (file_rc >= 0) {
+        fat32 = true;
+    }
+
+    const result = mem_backing_store.probe(.{
+        .requested_bytes = requested_bytes,
+        .flags = flags,
+        .path = path_ptr,
+        .file_exists = file_rc > 0 and file_info.exists != 0,
+        .is_dir = file_info.is_dir != 0,
+        .fat32 = fat32,
+        .file_size = file_info.size,
+        .cluster_bytes = cluster_bytes,
+        .first_cluster = file_info.first_cluster,
+    });
+    const backing_summary = mem_backing_store.summary();
+
+    out.* = .{
+        .version = memory_backing_store_probe_version,
+        .size = @sizeOf(ProgramMemoryBackingStoreProbe),
+        .status = result.status,
+        .flags = result.flags,
+        .blockers = result.blockers,
+        .pager_enabled = result.pager_enabled,
+        .anonymous_paging_enabled = result.anonymous_paging_enabled,
+        .cluster_bytes = result.cluster_bytes,
+        .requested_bytes = result.requested_bytes,
+        .available_bytes = result.available_bytes,
+        .file_size = result.file_size,
+        .first_cluster = result.first_cluster,
+        .reserved0 = 0,
+        .total_probes = backing_summary.probes,
+        .total_ready = backing_summary.ready,
+        .total_failures = backing_summary.failures,
+        .reserved1 = .{0} ** 4,
+    };
+    return if (result.status == memory_backing_store_status_ready) 1 else 0;
+}
+
+pub fn memoryBackingStoreSlotProbe(path_ptr: [*:0]const u8, backing_bytes: u64, operation: u32, requested_slots: u64, reservation_id: u32, owner_kind: u32, owner_id: u32, region_id: u32, flags: u32, out: *ProgramMemoryBackingStoreSlotProbe) callconv(.c) i32 {
+    var file_info: r4sys_api.FileInfo = .{};
+    const file_rc = r4sys_api.fileInfo(path_ptr, &file_info);
+
+    var drive_info: r4sys_api.DriveInfo = .{};
+    var fat32 = false;
+    var cluster_bytes: u32 = 0;
+    if (file_info.drive >= 'A' and file_info.drive <= 'Z') {
+        const drive_index: u32 = @intCast(file_info.drive - 'A');
+        if (r4sys_api.driveInfo(drive_index, &drive_info) > 0 and drive_info.cluster_bytes != 0) {
+            cluster_bytes = drive_info.cluster_bytes;
+        }
+    }
+    if (file_rc >= 0) {
+        fat32 = true;
+    }
+
+    const backing_result = mem_backing_store.probe(.{
+        .requested_bytes = backing_bytes,
+        .flags = 0,
+        .path = path_ptr,
+        .file_exists = file_rc > 0 and file_info.exists != 0,
+        .is_dir = file_info.is_dir != 0,
+        .fat32 = fat32,
+        .file_size = file_info.size,
+        .cluster_bytes = cluster_bytes,
+        .first_cluster = file_info.first_cluster,
+    });
+    const result = mem_backing_store.slotProbe(.{
+        .operation = operation,
+        .requested_slots = requested_slots,
+        .reservation_id = reservation_id,
+        .owner_kind = owner_kind,
+        .owner_id = owner_id,
+        .region_id = region_id,
+        .flags = flags,
+        .backing = backing_result,
+    });
+
+    out.* = .{
+        .version = memory_backing_store_slot_probe_version,
+        .size = @sizeOf(ProgramMemoryBackingStoreSlotProbe),
+        .status = result.status,
+        .operation = result.operation,
+        .flags = result.flags,
+        .blockers = result.blockers,
+        .slot_bytes = result.slot_bytes,
+        .max_ranges = result.max_ranges,
+        .pager_enabled = result.pager_enabled,
+        .eviction_enabled = result.eviction_enabled,
+        .page_in_enabled = result.page_in_enabled,
+        .page_out_enabled = result.page_out_enabled,
+        .reservation_id = result.reservation_id,
+        .owner_kind = result.owner_kind,
+        .owner_id = result.owner_id,
+        .region_id = result.region_id,
+        .range_count = result.range_count,
+        .reserved0 = 0,
+        .capacity_slots = result.capacity_slots,
+        .requested_slots = result.requested_slots,
+        .reserved_slots = result.reserved_slots,
+        .free_slots = result.free_slots,
+        .valid_slots = result.valid_slots,
+        .dirty_slots = result.dirty_slots,
+        .error_slots = result.error_slots,
+        .first_slot = result.first_slot,
+        .slot_count = result.slot_count,
+        .generation = result.generation,
+        .total_probes = result.total_probes,
+        .total_reserves = result.total_reserves,
+        .total_releases = result.total_releases,
+        .total_error_marks = result.total_error_marks,
+        .total_recoveries = result.total_recoveries,
+        .total_failures = result.total_failures,
+        .lifecycle_cleanup_count = mem_backing_store.slotSummary().lifecycle_cleanups,
+        .lifecycle_released_ranges = mem_backing_store.slotSummary().lifecycle_released_ranges,
+        .lifecycle_released_slots = mem_backing_store.slotSummary().lifecycle_released_slots,
+        .reserved1 = .{0} ** 1,
+    };
+
+    return switch (result.status) {
+        memory_backing_store_slot_status_ready,
+        memory_backing_store_slot_status_reserved,
+        memory_backing_store_slot_status_released,
+        memory_backing_store_slot_status_error_marked,
+        memory_backing_store_slot_status_recovered,
+        => 1,
+        else => 0,
+    };
+}
+
+pub fn memoryPagerGateProbe(path_ptr: [*:0]const u8, backing_bytes: u64, region_id: u32, requested_bytes: u64, flags: u32, out: *ProgramMemoryPagerGateProbe) callconv(.c) i32 {
+    var file_info: r4sys_api.FileInfo = .{};
+    const file_rc = r4sys_api.fileInfo(path_ptr, &file_info);
+
+    var drive_info: r4sys_api.DriveInfo = .{};
+    var fat32 = false;
+    var cluster_bytes: u32 = 0;
+    if (file_info.drive >= 'A' and file_info.drive <= 'Z') {
+        const drive_index: u32 = @intCast(file_info.drive - 'A');
+        if (r4sys_api.driveInfo(drive_index, &drive_info) > 0 and drive_info.cluster_bytes != 0) {
+            cluster_bytes = drive_info.cluster_bytes;
+        }
+    }
+    if (file_rc >= 0) {
+        fat32 = true;
+    }
+
+    const backing_result = mem_backing_store.probe(.{
+        .requested_bytes = backing_bytes,
+        .flags = 0,
+        .path = path_ptr,
+        .file_exists = file_rc > 0 and file_info.exists != 0,
+        .is_dir = file_info.is_dir != 0,
+        .fat32 = fat32,
+        .file_size = file_info.size,
+        .cluster_bytes = cluster_bytes,
+        .first_cluster = file_info.first_cluster,
+    });
+
+    var vm_region_exists = false;
+    var vm_region_is_r4x = false;
+    var owner_id: u32 = 0;
+    var committed_bytes: u64 = 0;
+    var resident_bytes: u64 = 0;
+    var fault_count: u64 = 0;
+    var failed_faults: u64 = 0;
+    if (mem_virt.rangeInfo(region_id)) |range| {
+        vm_region_exists = true;
+        vm_region_is_r4x = range.window == .r4x_vm;
+        owner_id = saturatingU32FromU64(range.owner_id);
+        committed_bytes = range.committed_bytes;
+        resident_bytes = range.resident_bytes;
+        fault_count = range.fault_count;
+        failed_faults = range.failed_faults;
+    }
+
+    const result = mem_backing_store.pagerGateProbe(.{
+        .requested_bytes = requested_bytes,
+        .region_id = region_id,
+        .owner_id = owner_id,
+        .flags = flags,
+        .vm_region_exists = vm_region_exists,
+        .vm_region_is_r4x = vm_region_is_r4x,
+        .committed_bytes = committed_bytes,
+        .resident_bytes = resident_bytes,
+        .fault_count = fault_count,
+        .failed_faults = failed_faults,
+        .backing = backing_result,
+    });
+
+    out.* = .{
+        .version = memory_pager_gate_probe_version,
+        .size = @sizeOf(ProgramMemoryPagerGateProbe),
+        .status = result.status,
+        .flags = result.flags,
+        .blockers = result.blockers,
+        .region_id = result.region_id,
+        .owner_id = result.owner_id,
+        .slot_bytes = result.slot_bytes,
+        .requested_bytes = result.requested_bytes,
+        .committed_bytes = result.committed_bytes,
+        .resident_bytes = result.resident_bytes,
+        .nonresident_bytes = result.nonresident_bytes,
+        .requested_slots = result.requested_slots,
+        .prepared_slots = result.prepared_slots,
+        .capacity_slots = result.capacity_slots,
+        .free_before_slots = result.free_before_slots,
+        .free_after_slots = result.free_after_slots,
+        .reserved_before_slots = result.reserved_before_slots,
+        .reserved_after_slots = result.reserved_after_slots,
+        .slot_reservation_id = result.slot_reservation_id,
+        .rollback_completed = result.rollback_completed,
+        .commit_gate_enabled = result.commit_gate_enabled,
+        .fault_gate_enabled = result.fault_gate_enabled,
+        .pager_enabled = result.pager_enabled,
+        .eviction_enabled = result.eviction_enabled,
+        .page_in_enabled = result.page_in_enabled,
+        .page_out_enabled = result.page_out_enabled,
+        .reserved0 = .{0} ** 2,
+        .slot_generation = result.slot_generation,
+        .fault_count = result.fault_count,
+        .failed_faults = result.failed_faults,
+        .total_probes = result.total_probes,
+        .total_ready = result.total_ready,
+        .total_rollbacks = result.total_rollbacks,
+        .total_failures = result.total_failures,
+        .reserved1 = .{0} ** 4,
+    };
+
+    return if (result.status == memory_pager_gate_status_ready) 1 else 0;
+}
+
+pub fn memoryPageIoProbe(
+    path_ptr: [*:0]const u8,
+    backing_bytes: u64,
+    operation: u32,
+    region_id: u32,
+    region_offset: u64,
+    reservation_id: u32,
+    slot_index: u64,
+    page_count: u64,
+    owner_kind: u32,
+    owner_id: u32,
+    expected_generation: u64,
+    page_ptr: [*]u8,
+    flags: u32,
+    out: *ProgramMemoryPageIoProbe,
+) callconv(.c) i32 {
+    var file_info: r4sys_api.FileInfo = .{};
+    const file_rc = r4sys_api.fileInfo(path_ptr, &file_info);
+
+    var drive_info: r4sys_api.DriveInfo = .{};
+    var fat32 = false;
+    var cluster_bytes: u32 = 0;
+    if (file_info.drive >= 'A' and file_info.drive <= 'Z') {
+        const drive_index: u32 = @intCast(file_info.drive - 'A');
+        if (r4sys_api.driveInfo(drive_index, &drive_info) > 0 and drive_info.cluster_bytes != 0) {
+            cluster_bytes = drive_info.cluster_bytes;
+        }
+    }
+    if (file_rc >= 0) {
+        fat32 = true;
+    }
+
+    const backing_result = mem_backing_store.probe(.{
+        .requested_bytes = backing_bytes,
+        .flags = 0,
+        .path = path_ptr,
+        .file_exists = file_rc > 0 and file_info.exists != 0,
+        .is_dir = file_info.is_dir != 0,
+        .fat32 = fat32,
+        .file_size = file_info.size,
+        .cluster_bytes = cluster_bytes,
+        .first_cluster = file_info.first_cluster,
+    });
+
+    var vm_region_exists = false;
+    var vm_region_is_r4x = false;
+    var committed_bytes: u64 = 0;
+    var resident_bytes: u64 = 0;
+    if (mem_virt.rangeInfo(region_id)) |range| {
+        vm_region_exists = true;
+        vm_region_is_r4x = range.window == .r4x_vm;
+        committed_bytes = range.committed_bytes;
+        resident_bytes = range.resident_bytes;
+    }
+
+    const page_io_input = mem_backing_store.PageIoInput{
+        .operation = operation,
+        .region_id = region_id,
+        .region_offset = region_offset,
+        .reservation_id = reservation_id,
+        .slot_index = slot_index,
+        .page_count = page_count,
+        .owner_kind = owner_kind,
+        .owner_id = owner_id,
+        .expected_generation = expected_generation,
+        .flags = flags,
+        .vm_region_exists = vm_region_exists,
+        .vm_region_is_r4x = vm_region_is_r4x,
+        .committed_bytes = committed_bytes,
+        .resident_bytes = resident_bytes,
+        .backing = backing_result,
+    };
+
+    const prepared = mem_backing_store.pageIoPrepare(page_io_input);
+    if (prepared.status != memory_page_io_status_ready) {
+        recordVmPagerPolicyFailure(prepared);
+        fillPageIoProbe(out, prepared);
+        return 0;
+    }
+
+    var io_status: i32 = 0;
+    var io_bytes: u32 = 0;
+    const transfer_len: u32 = @intCast(prepared.transfer_bytes);
+    switch (operation) {
+        memory_page_io_operation_page_out => {
+            io_status = r4sys_api.fileWriteAt(path_ptr, prepared.backing_offset, page_ptr, transfer_len);
+        },
+        memory_page_io_operation_page_in => {
+            io_status = r4sys_api.fileReadAt64(path_ptr, prepared.backing_offset, page_ptr, transfer_len);
+        },
+        else => {},
+    }
+    if (io_status > 0) io_bytes = @intCast(io_status);
+
+    var complete_input = page_io_input;
+    complete_input.io_status = io_status;
+    complete_input.io_bytes = io_bytes;
+    const completed = mem_backing_store.pageIoComplete(complete_input);
+    if (completed.status != memory_page_io_status_page_out_ok and completed.status != memory_page_io_status_page_in_ok) {
+        recordVmPagerPolicyFailure(completed);
+    }
+    if (completed.status == memory_page_io_status_page_out_ok and completed.owner_kind == memory_backing_store_slot_owner_kind_vm_region) {
+        _ = mem_virt.applyPageIoState(.{
+            .region_id = completed.region_id,
+            .region_offset = completed.region_offset,
+            .page_count = completed.page_count,
+            .slot_reservation_id = completed.reservation_id,
+            .slot_index = completed.slot_index,
+            .slot_generation = completed.slot_generation,
+        }, true);
+    }
+    fillPageIoProbe(out, completed);
+    return switch (completed.status) {
+        memory_page_io_status_page_out_ok,
+        memory_page_io_status_page_in_ok,
+        => 1,
+        else => 0,
+    };
+}
+
+fn fillPageIoProbe(out: *ProgramMemoryPageIoProbe, result: mem_backing_store.PageIoResult) void {
+    out.* = .{
+        .version = memory_page_io_probe_version,
+        .size = @sizeOf(ProgramMemoryPageIoProbe),
+        .status = result.status,
+        .operation = result.operation,
+        .flags = result.flags,
+        .blockers = result.blockers,
+        .region_id = result.region_id,
+        .reservation_id = result.reservation_id,
+        .owner_kind = result.owner_kind,
+        .owner_id = result.owner_id,
+        .slot_bytes = result.slot_bytes,
+        .io_bytes = result.io_bytes,
+        .io_status = result.io_status,
+        .page_count_lo = if (result.page_count > 0xffff_ffff) 0xffff_ffff else @intCast(result.page_count),
+        .region_offset = result.region_offset,
+        .committed_bytes = result.committed_bytes,
+        .resident_bytes = result.resident_bytes,
+        .slot_index = result.slot_index,
+        .page_count = result.page_count,
+        .transfer_bytes = result.transfer_bytes,
+        .expected_generation = result.expected_generation,
+        .backing_slot = result.backing_slot,
+        .backing_offset = result.backing_offset,
+        .capacity_slots = result.capacity_slots,
+        .reserved_slots = result.reserved_slots,
+        .valid_slots = result.valid_slots,
+        .dirty_slots = result.dirty_slots,
+        .error_slots = result.error_slots,
+        .pager_enabled = result.pager_enabled,
+        .eviction_enabled = result.eviction_enabled,
+        .page_in_enabled = result.page_in_enabled,
+        .page_out_enabled = result.page_out_enabled,
+        .slot_generation = result.slot_generation,
+        .total_prepares = result.total_prepares,
+        .total_page_outs = result.total_page_outs,
+        .total_page_ins = result.total_page_ins,
+        .total_failures = result.total_failures,
+        .retry_limit = result.retry_limit,
+        .backoff_ticks = result.backoff_ticks,
+        .reserved1 = .{0} ** 2,
+        .total_retry_attempts = result.total_retry_attempts,
+        .total_retryable_failures = result.total_retryable_failures,
+        .total_permanent_failures = result.total_permanent_failures,
+        .total_retry_limit_hits = result.total_retry_limit_hits,
+        .total_failed_page_outs = result.total_failed_page_outs,
+        .total_failed_page_ins = result.total_failed_page_ins,
+        .total_data_preserved_pages = result.total_data_preserved_pages,
+        .total_data_lost_pages = result.total_data_lost_pages,
+    };
+}
+
+fn recordVmPagerPolicyFailure(result: mem_backing_store.PageIoResult) void {
+    if (result.owner_kind != memory_backing_store_slot_owner_kind_vm_region) return;
+    if (result.status == memory_page_io_status_ready or
+        result.status == memory_page_io_status_page_out_ok or
+        result.status == memory_page_io_status_page_in_ok)
+    {
+        return;
+    }
+
+    mem_virt.recordPagerPolicyFailure(.{
+        .region_id = result.region_id,
+        .region_offset = result.region_offset,
+        .page_count = result.page_count,
+    }, result.operation == memory_page_io_operation_page_out);
+}
+
+pub fn memoryVmPageStateProbe(
+    region_id: u32,
+    region_offset: u64,
+    page_count: u64,
+    operation: u32,
+    slot_reservation_id: u32,
+    slot_index: u64,
+    slot_generation: u64,
+    flags: u32,
+    out: *ProgramMemoryVmPageStateProbe,
+) callconv(.c) i32 {
+    const result = mem_virt.pageStateProbe(.{
+        .operation = operation,
+        .region_id = region_id,
+        .region_offset = region_offset,
+        .page_count = page_count,
+        .slot_reservation_id = slot_reservation_id,
+        .slot_index = slot_index,
+        .slot_generation = slot_generation,
+        .flags = flags,
+    });
+    fillVmPageStateProbe(out, result);
+    return if (result.status == memory_vm_page_state_status_ready) 1 else 0;
+}
+
+fn fillVmPageStateProbe(out: *ProgramMemoryVmPageStateProbe, result: mem_virt.PageStateResult) void {
+    out.* = .{
+        .version = memory_vm_page_state_probe_version,
+        .size = @sizeOf(ProgramMemoryVmPageStateProbe),
+        .status = result.status,
+        .operation = result.operation,
+        .flags = result.flags,
+        .blockers = result.blockers,
+        .region_id = result.region_id,
+        .page_size = result.page_size,
+        .max_spans = result.max_spans,
+        .span_count = result.span_count,
+        .slot_reservation_id = result.slot_reservation_id,
+        .page_count_lo = result.page_count_lo,
+        .region_offset = result.region_offset,
+        .page_count = result.page_count,
+        .committed_pages = result.committed_pages,
+        .resident_pages = result.resident_pages,
+        .nonresident_pages = result.nonresident_pages,
+        .dirty_pages = result.dirty_pages,
+        .clean_pages = result.clean_pages,
+        .pinned_pages = result.pinned_pages,
+        .busy_pages = result.busy_pages,
+        .error_pages = result.error_pages,
+        .slot_bound_pages = result.slot_bound_pages,
+        .slot_index = result.slot_index,
+        .slot_generation = result.slot_generation,
+        .total_transitions = result.total_transitions,
+        .dirty_marks = result.dirty_marks,
+        .clean_marks = result.clean_marks,
+        .slot_binds = result.slot_binds,
+        .slot_clears = result.slot_clears,
+        .pinned_marks = result.pinned_marks,
+        .pinned_clears = result.pinned_clears,
+        .busy_marks = result.busy_marks,
+        .busy_clears = result.busy_clears,
+        .error_marks = result.error_marks,
+        .error_clears = result.error_clears,
+        .table_full_failures = result.table_full_failures,
+        .cleanup_pages = result.cleanup_pages,
+        .reserved1 = .{0} ** 4,
+    };
+}
+
+pub fn pagingSummary(out: *PagingSummary) callconv(.c) i32 {
+    const p = paging.stats();
+    const pt = page_tables.stats();
+    const blocks = mem_blocks.summary();
+    const active_count: u32 = if (blocks.active_blocks > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(blocks.active_blocks);
+    var page_table_blocks: u64 = 0;
+    var kernel_page_table_blocks: u64 = 0;
+    var bootloader_page_table_blocks: u64 = 0;
+    var page_table_bytes: u64 = 0;
+
+    var i: u32 = 0;
+    while (i < active_count) : (i += 1) {
+        const block = mem_blocks.activeAt(i) orelse continue;
+        if (block.kind != .page_table) continue;
+        page_table_blocks += 1;
+        page_table_bytes +%= block.phys_len;
+        if (block.owner == .kernel) kernel_page_table_blocks += 1;
+        if (block.owner == .bootloader) bootloader_page_table_blocks += 1;
+    }
+
+    var flags: u32 = 0;
+    if (p.initialized) flags |= paging_flag_initialized;
+    if (p.active_root_confirmed) flags |= paging_flag_active_root_matches_hardware;
+    if (p.r4os_root_active) flags |= paging_flag_r4os_root_active;
+    if (pt.cr3_switch_done) flags |= paging_flag_cr3_switch_done;
+    if (pt.limine_quarantined_frames != 0) flags |= paging_flag_limine_quarantine;
+
+    out.* = .{
+        .flags = flags,
+        .root_owner = pagingRootOwner(p.root_owner),
+        .reserved0 = .{0} ** 3,
+        .active_root_phys = p.active_root_phys,
+        .hardware_cr3 = p.hardware_cr3,
+        .old_cr3 = pt.old_cr3,
+        .new_cr3 = pt.new_cr3,
+        .page_table_blocks = page_table_blocks,
+        .kernel_page_table_blocks = kernel_page_table_blocks,
+        .bootloader_page_table_blocks = bootloader_page_table_blocks,
+        .page_table_bytes = page_table_bytes,
+        .limine_old_table_frames = pt.limine_old_table_frames,
+        .limine_active_table_frames = pt.limine_active_table_frames,
+        .limine_referenced_frames = pt.limine_referenced_frames,
+        .limine_quarantined_frames = pt.limine_quarantined_frames,
+        .limine_released_frames = pt.limine_released_frames,
+        .limine_retained_frames = pt.limine_retained_frames,
+        .root_mismatches = p.root_mismatches,
+        .map_pages = p.map_pages,
+        .unmap_pages = p.unmap_pages,
+        .invlpg_flushes = p.invlpg_flushes,
+    };
+    return 1;
+}
+
+pub fn displaySummary(out: *DisplaySummary) callconv(.c) i32 {
+    const s = display.stats();
+    var flags: u32 = 0;
+    if (s.registered) flags |= display_summary_flag_registered;
+    if ((s.flags & display.DeviceFlags.visible) != 0) flags |= display_summary_flag_visible;
+    if ((s.flags & display.DeviceFlags.fixed_mode) != 0) flags |= display_summary_flag_fixed_mode;
+    if ((s.flags & display.DeviceFlags.cpu_present) != 0) flags |= display_summary_flag_cpu_present;
+    if ((s.flags & display.DeviceFlags.xrgb32) != 0) flags |= display_summary_flag_xrgb32;
+
+    out.* = .{
+        .flags = flags,
+        .backend_kind = @intFromEnum(s.kind),
+        .cache_policy = @intFromEnum(s.mapping.cache_policy),
+        .bpp = s.mode.bpp,
+        .width = s.mode.width,
+        .height = s.mode.height,
+        .pitch = s.mode.pitch,
+        .last_present_reason = @intFromEnum(s.last_present_reason),
+        .last_present_converted = if (s.last_present_converted) 1 else 0,
+        .last_present_x = s.last_present_rect.x,
+        .last_present_y = s.last_present_rect.y,
+        .last_present_w = s.last_present_rect.w,
+        .last_present_h = s.last_present_rect.h,
+        .present_count = s.present_count,
+        .present_pixels_total = s.present_pixels_total,
+        .present_bytes_total = s.present_bytes_total,
+        .last_present_pixels = s.last_present_pixels,
+        .last_present_bytes = s.last_present_bytes,
+        .full_present_count = s.full_present_count,
+        .partial_present_count = s.partial_present_count,
+        .fill_present_count = s.fill_present_count,
+        .rect_present_count = s.rect_present_count,
+        .packed32_present_count = s.packed32_present_count,
+        .xrgb32_present_count = s.xrgb32_present_count,
+        .conversion_present_count = s.conversion_present_count,
+        .present_total_ticks = s.present_total_ticks,
+        .present_max_ticks = s.present_max_ticks,
+        .present_last_ticks = s.present_last_ticks,
+        .present_slow_count = s.present_slow_count,
+    };
+    copyFixedZ(out.backend_name[0..], s.name);
+    return if (s.registered) 1 else 0;
+}
+
+pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
+    const sched = scheduler.stats();
+    const tasks = sched_task.summary();
+    const boot = boot_perf.snapshot();
+    const loader = loader_perf.snapshot();
+    const display_stats = display.stats();
+    const svc = service_core.performanceSummary();
+    const audio = audio_core.performanceSummary();
+    const wait_summary = sched_sync.summary();
+    const lock_summary = sched_sync.lockSummary();
+    const fs_summary = fs_request.summary();
+    const fs_cache = page_cache.summary();
+    const fat32_summary = fat32_fs.summary();
+    const reclaim_summary = mem_reclaim.summary();
+    const backing_summary = mem_backing_store.summary();
+    const backing_slot_summary = mem_backing_store.slotSummary();
+    const pager_gate_summary = mem_backing_store.pagerGateSummary();
+    const page_io_summary = mem_backing_store.pageIoSummary();
+    const page_state_summary = mem_virt.pageStateSummary();
+    const hot_path_summary = mem_virt.hotPathStats();
+    const loader_file_stats = module_file.stats();
+    const fpu_status = fpu.status();
+    const work_summary = driver_work.summary();
+    const block_runtime = block_storage.runtimeWorkerSummary();
+    const fs_diagnostic = r4sys_api.fsFailureDiagnostic();
+    const fs_result: u32 = @bitCast(fs_diagnostic.result);
+    const fs_meta: u32 = if (fs_diagnostic.sequence == 0)
+        0
+    else
+        0x8000_0000 |
+            ((fs_result & 0xFF) << 20) |
+            ((@intFromEnum(fs_diagnostic.kind) & 0x0F) << 16) |
+            (fs_diagnostic.task_id & 0x0000_FFFF);
+    const fs_lookup: u32 = if (fs_diagnostic.lookup_stage != 0)
+        fs_diagnostic.lookup_stage
+    else
+        (fs_diagnostic.sequence & 0x000F_FFFF) << 12;
+    var tcp_summary: tcp.Summary = .{};
+    tcp.summary(&tcp_summary);
+
+    var storage_queue_depth_total: u32 = 0;
+    var storage_queue_used_total: u32 = 0;
+    var storage_queue_high_water_total: u32 = 0;
+    var storage_busy_devices: u32 = 0;
+    var storage_failed_devices: u32 = 0;
+    var storage_read_ops: u64 = 0;
+    var storage_read_sectors: u64 = 0;
+    var storage_read_failures: u64 = 0;
+    var storage_write_ops: u64 = 0;
+    var storage_write_sectors: u64 = 0;
+    var storage_write_failures: u64 = 0;
+    var storage_flush_ops: u64 = 0;
+    var storage_flush_failures: u64 = 0;
+    var storage_busy_rejections: u64 = 0;
+    var storage_timeout_failures: u64 = 0;
+    var storage_completions: u64 = 0;
+    var storage_backend_recoveries: u64 = 0;
+    var storage_backend_recovery_failures: u64 = 0;
+    var storage_queued_requests: u64 = 0;
+    var storage_dequeued_requests: u64 = 0;
+    var storage_queue_full_waits: u64 = 0;
+    var storage_queue_full_rejections: u64 = 0;
+    var storage_completion_waits: u64 = 0;
+    var storage_completion_timeouts: u64 = 0;
+    var storage_completion_total_ticks: u64 = 0;
+    var storage_completion_max_ticks: u64 = 0;
+    var storage_completion_last_ticks: u64 = 0;
+    var index: usize = 0;
+    while (index < block_storage.slotCount()) : (index += 1) {
+        const dev = block_storage.get(index) orelse continue;
+        storage_queue_depth_total +%= dev.queue_depth;
+        storage_queue_used_total +%= block_storage.queueUsed(index);
+        storage_queue_high_water_total +%= dev.stats.queue_high_water;
+        if (dev.state == .busy) storage_busy_devices += 1;
+        if (dev.state == .failed) storage_failed_devices += 1;
+        storage_read_ops +%= dev.stats.read_ops;
+        storage_read_sectors +%= dev.stats.read_sectors;
+        storage_read_failures +%= dev.stats.read_failures;
+        storage_write_ops +%= dev.stats.write_ops;
+        storage_write_sectors +%= dev.stats.write_sectors;
+        storage_write_failures +%= dev.stats.write_failures;
+        storage_flush_ops +%= dev.stats.flush_ops;
+        storage_flush_failures +%= dev.stats.flush_failures;
+        storage_busy_rejections +%= dev.stats.busy_rejections;
+        storage_timeout_failures +%= dev.stats.timeout_failures;
+        storage_completions +%= dev.stats.completions;
+        storage_backend_recoveries +%= dev.stats.backend_recoveries;
+        storage_backend_recovery_failures +%= dev.stats.backend_recovery_failures;
+        storage_queued_requests +%= dev.stats.queued_requests;
+        storage_dequeued_requests +%= dev.stats.dequeued_requests;
+        storage_queue_full_waits +%= dev.stats.queue_full_waits;
+        storage_queue_full_rejections +%= dev.stats.queue_full_rejections;
+        storage_completion_waits +%= dev.stats.completion_waits;
+        storage_completion_timeouts +%= dev.stats.completion_timeouts;
+        storage_completion_total_ticks +%= dev.stats.completion_total_ticks;
+        if (dev.stats.completion_max_ticks > storage_completion_max_ticks) storage_completion_max_ticks = dev.stats.completion_max_ticks;
+        if (dev.stats.completion_last_ticks > storage_completion_last_ticks) storage_completion_last_ticks = dev.stats.completion_last_ticks;
+    }
+
+    var flags: u32 = 0;
+    if (sched.initialized) flags |= performance_flag_scheduler_ready;
+    if (display_stats.registered) flags |= performance_flag_display_ready | performance_flag_display_responsiveness_ready;
+    if (audio.max_streams > 0) flags |= performance_flag_audio_latency_ready;
+    if (boot.initialized) flags |= performance_flag_boot_perf_ready;
+    if (loader.initialized != 0) flags |= performance_flag_loader_performance_ready;
+    if (hot_path_summary.range_index_capacity != 0) flags |= performance_flag_hot_path_index_ready;
+    if (loader.initialized != 0) flags |= performance_flag_loader_memory_ready;
+    flags |= performance_flag_wait_objects_ready;
+    flags |= performance_flag_lock_diagnostics_ready;
+    flags |= performance_flag_storage_request_queue_ready;
+    flags |= performance_flag_fs_request_ready;
+    flags |= performance_flag_service_queue_ready;
+    flags |= performance_flag_preemption_readiness_ready;
+    flags |= performance_flag_fs_page_cache_ready;
+    flags |= performance_flag_fs_writeback_ready;
+    flags |= performance_flag_fs_reclaim_ready;
+    flags |= performance_flag_fs_pmm_reclaim_ready;
+    flags |= performance_flag_global_reclaim_ready;
+    flags |= performance_flag_memory_backing_store_ready;
+    flags |= performance_flag_memory_backing_store_slots_ready;
+    flags |= performance_flag_memory_pager_gates_ready;
+    flags |= performance_flag_memory_page_io_ready;
+    flags |= performance_flag_memory_vm_page_state_ready;
+    flags |= performance_flag_memory_eviction_ready;
+    flags |= performance_flag_memory_pager_error_policy_ready;
+    flags |= performance_flag_productive_preemption_ready;
+    flags |= performance_flag_scheduler_latency_ready;
+    if (work_summary.initialized != 0 and work_summary.worker_started != 0) flags |= performance_flag_driver_workqueue_ready;
+    if (block_runtime.worker_started != 0 and block_runtime.worker_runtime_requests != 0 and
+        block_runtime.worker_runtime_completions != 0 and block_runtime.completion_signals != 0)
+    {
+        flags |= performance_flag_storage_driver_completion_ready;
+    }
+    if (fpu_status.enabled) flags |= performance_flag_fpu_state_ready;
+    if (fpu_status.avx_enabled and fpu_status.avx2_enabled) flags |= performance_flag_avx_state_ready;
+
+    var preemption_gate_mask: u32 = 0;
+    if (sched.preemption_enabled == 0) preemption_gate_mask |= performance_preemption_gate_productive_disabled;
+    if (sched.preempt_disable_depth != 0) preemption_gate_mask |= performance_preemption_gate_kernel_critical;
+    if (!fpu_status.enabled) preemption_gate_mask |= performance_preemption_gate_fpu_state;
+
+    out.* = .{
+        .version = performance_snapshot_version,
+        .size = @sizeOf(ProgramPerformanceSummary),
+        .flags = flags,
+        .missing_flags = performance_missing_fs_latency_histogram |
+            performance_missing_service_latency_histogram |
+            performance_missing_tcp_latency_histogram,
+        .ticks = sched.ticks,
+        .tick_hz = timer.frequency(),
+        .current_task_index = sched.current_index,
+        // Transitional v1 compatibility until the paginated 0.59.11 task
+        // snapshot exists: this field is the exact current ordinal scan bound,
+        // never an admission capacity. Existing diagnostics can therefore
+        // enumerate the dynamic registry without interpreting zero as empty.
+        .task_max_count = tasks.total,
+        .task_count = tasks.total,
+        .task_ready = tasks.ready,
+        .task_running = tasks.running,
+        .task_blocked = tasks.blocked,
+        .task_dead = tasks.dead,
+        .task_workers = tasks.workers,
+        .scheduler_yields = sched.yields,
+        .scheduler_sleeps = sched.sleeps,
+        .scheduler_wakes = sched.wakes,
+        .scheduler_idle_waits = sched.idle_waits,
+        .boot_phase_count = boot.phase_count,
+        .boot_current_phase = @intFromEnum(boot.current_phase),
+        // Temporary 0.63.22 hardware diagnostic: bit 31 marks a captured FS
+        // failure; bits 20..27 contain its signed result byte, bits 16..19
+        // its request kind and the low 16 bits identify the observing task.
+        .reserved0 = fs_meta,
+        .boot_transition_count = boot.transition_count,
+        .boot_total_ticks = boot.total_ticks,
+        .storage_device_count = saturatingU32FromUsize(block_storage.count()),
+        .storage_queue_depth_total = storage_queue_depth_total,
+        .storage_queue_used_total = storage_queue_used_total,
+        .storage_queue_high_water_total = storage_queue_high_water_total,
+        .storage_busy_devices = storage_busy_devices,
+        .storage_failed_devices = storage_failed_devices,
+        .storage_read_ops = storage_read_ops,
+        .storage_read_sectors = storage_read_sectors,
+        .storage_read_failures = storage_read_failures,
+        .storage_write_ops = storage_write_ops,
+        .storage_write_sectors = storage_write_sectors,
+        .storage_write_failures = storage_write_failures,
+        .storage_flush_ops = storage_flush_ops,
+        .storage_flush_failures = storage_flush_failures,
+        .storage_busy_rejections = storage_busy_rejections,
+        .storage_timeout_failures = storage_timeout_failures,
+        .storage_completions = storage_completions,
+        .storage_backend_recoveries = storage_backend_recoveries,
+        .storage_backend_recovery_failures = storage_backend_recovery_failures,
+        .storage_queued_requests = storage_queued_requests,
+        .storage_dequeued_requests = storage_dequeued_requests,
+        .storage_queue_full_waits = storage_queue_full_waits,
+        .storage_queue_full_rejections = storage_queue_full_rejections,
+        .storage_completion_waits = storage_completion_waits,
+        .storage_completion_timeouts = storage_completion_timeouts,
+        .storage_completion_total_ticks = storage_completion_total_ticks,
+        .storage_completion_max_ticks = storage_completion_max_ticks,
+        .storage_completion_last_ticks = storage_completion_last_ticks,
+        .fs_requests = fs_summary.requests,
+        .fs_completed = fs_summary.completed,
+        .fs_failed = fs_summary.failed,
+        .fs_read_requests = fs_summary.read_requests,
+        .fs_write_requests = fs_summary.write_requests,
+        .fs_metadata_requests = fs_summary.metadata_requests,
+        .fs_stream_requests = fs_summary.stream_requests,
+        .fs_lock_acquires = fs_summary.lock_acquires,
+        .fs_lock_contention_waits = fs_summary.lock_contention_waits,
+        .fs_lock_timeouts = fs_summary.lock_timeouts,
+        .fs_boot_bypass = fs_summary.boot_bypass,
+        .fs_total_ticks = fs_summary.total_ticks,
+        .fs_max_ticks = fs_summary.max_ticks,
+        .fs_last_ticks = fs_summary.last_ticks,
+        .fs_active_kind = fs_summary.active_kind,
+        .fs_last_kind = fs_summary.last_kind,
+        .fs_active_drive = fs_summary.active_drive,
+        .fs_last_drive = fs_summary.last_drive,
+        .service_max_count = svc.max_services,
+        .services_used = svc.used_services,
+        .services_running = svc.running_services,
+        .service_endpoints = svc.endpoints_used,
+        .service_request_pending = svc.request_pending,
+        .service_response_pending = svc.response_pending,
+        .service_queue_depth_total = svc.queue_depth_total,
+        .service_queue_used_total = svc.queue_used_total,
+        .service_queue_high_water_total = svc.queue_high_water_total,
+        .service_active_workers = svc.active_workers,
+        .service_max_active_workers = svc.max_active_workers,
+        .service_open_handles = svc.open_handles,
+        .service_requests = svc.requests,
+        .service_responses = svc.responses,
+        .service_drops = svc.drops,
+        .service_busy_rejections = svc.busy_rejections,
+        .service_timeouts = svc.timeouts,
+        .service_cancellations = svc.cancellations,
+        .service_completion_waits = svc.completion_waits,
+        .service_completion_timeouts = svc.completion_timeouts,
+        .tcp_max_connections = tcp_summary.max_connections,
+        .tcp_active_connections = tcp_summary.active_connections,
+        .tcp_active_listeners = tcp_summary.active_listeners,
+        .tcp_buffer_size = tcp_summary.buffer_size,
+        .tcp_data_tx = tcp_summary.data_tx,
+        .tcp_data_rx = tcp_summary.data_rx,
+        .tcp_retransmits = tcp_summary.retransmits,
+        .tcp_rx_drops = tcp_summary.rx_drops,
+        .tcp_timeouts = tcp_summary.timeouts,
+        .tcp_checksum_errors = tcp_summary.checksum_errors,
+        .display_present_count = display_stats.present_count,
+        .display_present_bytes_total = display_stats.present_bytes_total,
+        .display_last_present_bytes = display_stats.last_present_bytes,
+        .display_full_present_count = display_stats.full_present_count,
+        .display_partial_present_count = display_stats.partial_present_count,
+        .display_present_total_ticks = display_stats.present_total_ticks,
+        .display_present_max_ticks = display_stats.present_max_ticks,
+        .display_present_last_ticks = display_stats.present_last_ticks,
+        .display_present_slow_count = display_stats.present_slow_count,
+        .audio_open_streams = audio.open_streams,
+        .audio_registered_backends = audio.registered_backends,
+        .audio_active_backends = audio.active_backends,
+        .audio_registered_synths = audio.registered_synths,
+        .audio_stream_writes = audio.total_stream_writes,
+        .audio_backend_ok = audio.backend_ok,
+        .audio_backend_fail = audio.backend_fail,
+        .audio_backend_underruns = audio.backend_status_underruns,
+        .audio_backend_errors = audio.backend_status_errors,
+        .audio_stream_ring_bytes = audio.stream_ring_bytes,
+        .audio_stream_available_bytes = audio.stream_available_bytes,
+        .audio_stream_high_water_bytes = audio.stream_available_high_water_bytes,
+        .audio_stream_write_truncations = audio.stream_write_truncations,
+        .audio_stream_dropped_bytes = audio.stream_dropped_bytes,
+        .audio_stream_write_total_ticks = audio.stream_write_total_ticks,
+        .audio_stream_write_max_ticks = audio.stream_write_max_ticks,
+        .audio_stream_write_last_ticks = audio.stream_write_last_ticks,
+        .audio_backend_write_calls = audio.backend_write_calls,
+        .audio_backend_write_total_ticks = audio.backend_write_total_ticks,
+        .audio_backend_write_max_ticks = audio.backend_write_max_ticks,
+        .audio_backend_write_last_ticks = audio.backend_write_last_ticks,
+        .audio_backend_refills = audio.backend_status_refills,
+        .audio_backend_silence_refills = audio.backend_status_silence_refills,
+        .audio_backend_buffer_bytes = audio.backend_status_buffer_bytes,
+        .audio_backend_queued_buffers = audio.backend_status_queued_buffers,
+        .audio_backend_last_buffer_bytes = audio.backend_status_last_buffer_bytes,
+        .audio_backend_refill_total_ticks = audio.backend_status_refill_total_ticks,
+        .audio_backend_refill_max_ticks = audio.backend_status_refill_max_ticks,
+        .audio_backend_refill_last_ticks = audio.backend_status_refill_last_ticks,
+        .loader_initialized = loader.initialized,
+        .loader_started = loader.loader_started,
+        .loader_completed = loader.loader_completed,
+        .loader_r4p_runtime_started = loader.r4p_runtime_started,
+        .loader_r4p_runtime_completed = loader.r4p_runtime_completed,
+        .loader_service_boot_status = loader.service_boot_status,
+        .loader_boot_critical_count = loader.boot_critical_count,
+        .loader_lazy_candidate_count = loader.lazy_candidate_count,
+        .loader_total_ticks = loader.loader_total_ticks,
+        .loader_r4p_runtime_total_ticks = loader.r4p_runtime_total_ticks,
+        .loader_service_boot_ticks = loader.service_boot_ticks,
+        .loader_config_load_ticks = loader.config_load_ticks,
+        .loader_config_bytes = loader.config_bytes,
+        .loader_config_driver_count = loader.config_driver_count,
+        .loader_config_disabled_count = loader.config_disabled_count,
+        .loader_config_option_count = loader.config_option_count,
+        .loader_r4l_scan_entries = loader.r4l_scan_entries,
+        .loader_r4l_candidates = loader.r4l_candidates,
+        .loader_r4l_loaded = loader.r4l_loaded,
+        .loader_r4l_failed = loader.r4l_failed,
+        .loader_r4l_scan_ticks = loader.r4l_scan_ticks,
+        .loader_r4l_read_ticks = loader.r4l_read_ticks,
+        .loader_r4l_resolve_ticks = loader.r4l_resolve_ticks,
+        .loader_r4l_load_ticks = loader.r4l_load_ticks,
+        .loader_r4d_scan_entries = loader.r4d_scan_entries,
+        .loader_r4d_candidates = loader.r4d_candidates,
+        .loader_r4d_discovered = loader.r4d_discovered,
+        .loader_r4d_failed = loader.r4d_failed,
+        .loader_r4d_scan_ticks = loader.r4d_scan_ticks,
+        .loader_r4d_read_ticks = loader.r4d_read_ticks,
+        .loader_r4d_probe_ticks = loader.r4d_probe_ticks,
+        .loader_r4p_scan_entries = loader.r4p_scan_entries,
+        .loader_r4p_candidates = loader.r4p_candidates,
+        .loader_r4p_discovered = loader.r4p_discovered,
+        .loader_r4p_active = loader.r4p_active,
+        .loader_r4p_blocked = loader.r4p_blocked,
+        .loader_r4p_failed = loader.r4p_failed,
+        .loader_r4p_scan_ticks = loader.r4p_scan_ticks,
+        .loader_r4p_read_ticks = loader.r4p_read_ticks,
+        .loader_r4p_resolve_ticks = loader.r4p_resolve_ticks,
+        .loader_r4p_init_ticks = loader.r4p_init_ticks,
+        .hot_path_vm_range_index_capacity = hot_path_summary.range_index_capacity,
+        .hot_path_vm_range_index_entries = hot_path_summary.range_index_entries,
+        .hot_path_vm_range_index_tombstones = hot_path_summary.range_index_tombstones,
+        .hot_path_vm_range_index_probe_max = hot_path_summary.range_index_probe_max,
+        .hot_path_vm_range_index_probe_last = hot_path_summary.range_index_probe_last,
+        .hot_path_vm_range_free_slot_probe_max = hot_path_summary.range_free_slot_probe_max,
+        .hot_path_vm_range_free_slot_probe_last = hot_path_summary.range_free_slot_probe_last,
+        .hot_path_bounded_block_device_scan_max = saturatingU32FromUsize(block_storage.maxDevices()),
+        .hot_path_bounded_tcp_connection_scan_max = @intCast(tcp.MAX_CONNECTIONS),
+        .hot_path_vm_range_index_lookups = hot_path_summary.range_index_lookups,
+        .hot_path_vm_range_index_hits = hot_path_summary.range_index_hits,
+        .hot_path_vm_range_index_misses = hot_path_summary.range_index_misses,
+        .hot_path_vm_range_index_probe_total = hot_path_summary.range_index_probe_total,
+        .hot_path_vm_range_index_rebuilds = hot_path_summary.range_index_rebuilds,
+        .hot_path_vm_range_index_insert_failures = hot_path_summary.range_index_insert_failures,
+        .hot_path_vm_range_free_slot_lookups = hot_path_summary.range_free_slot_lookups,
+        .hot_path_vm_range_free_slot_probe_total = hot_path_summary.range_free_slot_probe_total,
+        .loader_file_active_buffers = loader_file_stats.active_buffers,
+        .loader_file_reserved_bytes = loader_file_stats.reserved_bytes,
+        .loader_file_committed_bytes = loader_file_stats.committed_bytes,
+        .loader_file_peak_reserved_bytes = loader_file_stats.peak_reserved_bytes,
+        .loader_file_peak_committed_bytes = loader_file_stats.peak_committed_bytes,
+        .loader_file_full_reads = loader_file_stats.full_reads,
+        .loader_file_range_reads = loader_file_stats.range_reads,
+        .loader_file_reserve_failures = loader_file_stats.reserve_failures,
+        .loader_file_commit_failures = loader_file_stats.commit_failures,
+        .loader_file_read_failures = loader_file_stats.read_failures,
+        .loader_file_short_reads = loader_file_stats.short_reads,
+        .loader_file_release_failures = loader_file_stats.release_failures,
+        .loader_file_pressure_reclaim_attempts = loader_file_stats.pressure_reclaim_attempts,
+        .loader_file_pressure_reclaimed_frames = loader_file_stats.pressure_reclaimed_frames,
+        .loader_file_pressure_failures = loader_file_stats.pressure_failures,
+        .wait_object_waits = sched.object_waits,
+        .wait_object_wakes = sched.object_wakes,
+        .wait_object_timeouts = sched.object_timeouts,
+        .wait_object_cancellations = sched.object_cancels,
+        .wait_queue_waits = wait_summary.queue_waits,
+        .wait_queue_wake_one = wait_summary.wake_one,
+        .wait_queue_wake_all = wait_summary.wake_all,
+        .wait_queue_timeouts = wait_summary.timeouts,
+        .wait_queue_cancellations = wait_summary.cancellations,
+        .wait_queue_drops = wait_summary.drops,
+        .lock_acquires = lock_summary.acquires,
+        .lock_releases = lock_summary.releases,
+        .lock_recursive_acquires = lock_summary.recursive_acquires,
+        .lock_contention_waits = lock_summary.contention_waits,
+        .lock_contention_timeouts = lock_summary.contention_timeouts,
+        .lock_order_violations = lock_summary.order_violations,
+        .lock_sleep_checks = lock_summary.sleep_checks,
+        .lock_sleep_under_lock = lock_summary.sleep_under_lock,
+        .lock_sleep_under_no_sleep_lock = lock_summary.sleep_under_no_sleep_lock,
+        .lock_unlock_mismatches = lock_summary.unlock_mismatches,
+        .lock_held_slots_used = lock_summary.held_slots_used,
+        .lock_current_depth = lock_summary.current_depth,
+        .lock_max_depth = lock_summary.max_depth,
+        .fpu_lazy_saves = sched_task.fpu_lazy_saves,
+        .fpu_lazy_skips = sched_task.fpu_lazy_skips,
+        .lock_tracking_drops = lock_summary.tracking_drops,
+        .preemption_supported = sched.preemption_supported,
+        .preemption_enabled = sched.preemption_enabled,
+        .preemption_test_mode = sched.preemption_test_mode,
+        .preemption_gate_mask = preemption_gate_mask,
+        .preempt_disable_depth = sched.preempt_disable_depth,
+        .preempt_disable_max_depth = sched.preempt_disable_max_depth,
+        // Temporary 0.63.22 hardware diagnostic. The high 20 bits are the
+        // NTFS failure generation; the low 12 bits identify path depth and
+        // the exact not-found branch. Non-lookup failures carry only the
+        // generic FS diagnostic sequence in the high bits.
+        .reserved1 = fs_lookup,
+        .preempt_disable_underflows = sched.preempt_disable_underflows,
+        .preempt_disable_calls = sched.preempt_disable_calls,
+        .preempt_enable_calls = sched.preempt_enable_calls,
+        .preemption_simulation_ticks = sched.preemption_simulation_ticks,
+        .preemption_eligible_ticks = sched.preemption_eligible_ticks,
+        .preemption_deferred_disabled = sched.preemption_deferred_disabled,
+        .preemption_deferred_critical = sched.preemption_deferred_critical,
+        .preemption_deferred_no_task = sched.preemption_deferred_no_task,
+        .preemption_deferred_no_ready = sched.preemption_deferred_no_ready,
+        .preemption_switch_ticks = sched.preemption_switch_ticks,
+        .long_running_task_warnings = sched.long_running_task_warnings,
+        .starvation_warnings = sched.starvation_warnings,
+        .fpu_state_supported = if (fpu_status.initialized) 1 else 0,
+        .fpu_state_enabled = if (fpu_status.enabled) 1 else 0,
+        .fpu_state_backend = fpu_status.backend,
+        .fpu_state_bytes = fpu_status.state_bytes,
+        .fpu_state_storage_bytes = fpu_status.state_storage_bytes,
+        .fpu_task_state_count = sched_task.validFpuStateCount(),
+        .fpu_avx_supported = if (fpu_status.avx_supported) 1 else 0,
+        .fpu_avx_enabled = if (fpu_status.avx_enabled) 1 else 0,
+        .fpu_avx2_supported = if (fpu_status.avx2_supported) 1 else 0,
+        .fpu_avx2_enabled = if (fpu_status.avx2_enabled) 1 else 0,
+        .fpu_simd_abi = fpu_status.simd_abi,
+        .fpu_xsave_required_bytes = fpu_status.state_bytes,
+        .fpu_xcr0_mask = fpu_status.xcr0_mask,
+        .fpu_save_count = fpu_status.save_count,
+        .fpu_restore_count = fpu_status.restore_count,
+        .fpu_task_init_count = fpu_status.task_init_count,
+        .fpu_task_state_bytes = fpu_status.task_state_bytes,
+        .fs_cache_capacity = fs_cache.capacity,
+        .fs_cache_sector_bytes = fs_cache.sector_bytes,
+        .fs_cache_entries_used = fs_cache.entries_used,
+        .fs_cache_dirty_entries = fs_cache.dirty_entries,
+        .fs_cache_reads = fs_cache.reads,
+        .fs_cache_hits = fs_cache.hits,
+        .fs_cache_misses = fs_cache.misses,
+        .fs_cache_fills = fs_cache.fills,
+        .fs_cache_evictions = fs_cache.evictions,
+        .fs_cache_invalidations = fs_cache.invalidations,
+        .fs_cache_write_through_requests = fs_cache.write_through_requests,
+        .fs_cache_write_through_updates = fs_cache.write_through_updates,
+        .fs_cache_flushes = fs_cache.flushes,
+        .fs_cache_read_errors = fs_cache.read_errors,
+        .fs_cache_write_errors = fs_cache.write_errors,
+        .fs_cache_writeback_waits = fs_cache.writeback_waits,
+        .fs_cache_writeback_errors = fs_cache.writeback_errors,
+        .fs_cache_dirty_bytes = fs_cache.dirty_bytes,
+        .fs_cache_dirty_high_water_entries = fs_cache.dirty_high_water_entries,
+        .fs_cache_writeback_queue_depth = fs_cache.writeback_queue_depth,
+        .fs_cache_writeback_queue_high_water = fs_cache.writeback_queue_high_water,
+        .fs_cache_deferred_write_requests = fs_cache.deferred_write_requests,
+        .fs_cache_dirty_sector_updates = fs_cache.dirty_sector_updates,
+        .fs_cache_writeback_drains = fs_cache.writeback_drains,
+        .fs_cache_writeback_sectors = fs_cache.writeback_sectors,
+        .fs_cache_writeback_pressure_drains = fs_cache.writeback_pressure_drains,
+        .fs_cache_writeback_flush_drains = fs_cache.writeback_flush_drains,
+        .fs_cache_writeback_total_ticks = fs_cache.writeback_total_ticks,
+        .fs_cache_writeback_max_ticks = fs_cache.writeback_max_ticks,
+        .fs_cache_writeback_last_ticks = fs_cache.writeback_last_ticks,
+        .fs_cache_writeback_retries = fs_cache.writeback_retries,
+        .fs_cache_clean_reclaimable_entries = fs_cache.clean_reclaimable_entries,
+        .fs_cache_dirty_non_reclaimable_entries = fs_cache.dirty_non_reclaimable_entries,
+        .fs_cache_pagefile_ready = 0,
+        .fs_cache_pagefile_blockers = fs_cache_pagefile_blocker_no_pagefile |
+            fs_cache_pagefile_blocker_no_swap |
+            fs_cache_pagefile_blocker_no_pager,
+        .fs_cache_clean_reclaimable_bytes = fs_cache.clean_reclaimable_bytes,
+        .fs_cache_dirty_non_reclaimable_bytes = fs_cache.dirty_non_reclaimable_bytes,
+        .fs_cache_reclaim_scans = fs_cache.reclaim_scans,
+        .fs_cache_reclaim_clean_entries = fs_cache.reclaim_clean_entries,
+        .fs_cache_reclaim_dirty_drains = fs_cache.reclaim_dirty_drains,
+        .fs_cache_reclaim_failed_drains = fs_cache.reclaim_failed_drains,
+        .fs_cache_payload_frame_bytes = fs_cache.payload_frame_bytes,
+        .fs_cache_payload_frames = fs_cache.payload_frames,
+        .fs_cache_payload_bytes = fs_cache.payload_bytes,
+        .fs_cache_pmm_reclaimable_bytes = fs_cache.pmm_reclaimable_bytes,
+        .fs_cache_pmm_dirty_bytes = fs_cache.pmm_dirty_bytes,
+        .fs_cache_payload_allocations = fs_cache.payload_allocations,
+        .fs_cache_payload_allocation_failures = fs_cache.payload_allocation_failures,
+        .fs_cache_payload_releases = fs_cache.payload_releases,
+        .fs_cache_reclaim_returned_frames = fs_cache.reclaim_returned_frames,
+        .fs_cache_reclaim_returned_bytes = fs_cache.reclaim_returned_bytes,
+        .global_reclaim_attempts = reclaim_summary.attempts,
+        .global_reclaim_successes = reclaim_summary.successes,
+        .global_reclaim_failures = reclaim_summary.failures,
+        .global_reclaim_requested_frames = reclaim_summary.requested_frames,
+        .global_reclaim_returned_frames = reclaim_summary.returned_frames,
+        .global_reclaim_returned_bytes = reclaim_summary.returned_bytes,
+        .global_reclaim_dirty_drains = reclaim_summary.dirty_drains,
+        .global_reclaim_failed_drains = reclaim_summary.failed_drains,
+        .global_reclaim_total_ticks = reclaim_summary.total_ticks,
+        .global_reclaim_max_ticks = reclaim_summary.max_ticks,
+        .global_reclaim_last_ticks = reclaim_summary.last_ticks,
+        .global_reclaim_last_reason = reclaim_summary.last_reason,
+        .global_reclaim_last_requested_frames = reclaim_summary.last_requested_frames,
+        .global_reclaim_last_returned_frames = reclaim_summary.last_returned_frames,
+        .global_reclaim_reserved0 = 0,
+        .global_reclaim_fs_returned_frames = reclaim_summary.fs_returned_frames,
+        .global_reclaim_fs_returned_bytes = reclaim_summary.fs_returned_bytes,
+        .global_reclaim_vm_returned_frames = reclaim_summary.vm_returned_frames,
+        .global_reclaim_vm_returned_bytes = reclaim_summary.vm_returned_bytes,
+        .global_reclaim_vm_page_outs = reclaim_summary.vm_page_outs,
+        .global_reclaim_vm_failures = reclaim_summary.vm_failures,
+        .memory_backing_store_status = backing_summary.last_status,
+        .memory_backing_store_flags = backing_summary.last_flags,
+        .memory_backing_store_blockers = backing_summary.last_blockers,
+        .memory_backing_store_cluster_bytes = backing_summary.last_cluster_bytes,
+        .memory_backing_store_requested_bytes = backing_summary.last_requested_bytes,
+        .memory_backing_store_available_bytes = backing_summary.last_available_bytes,
+        .memory_backing_store_file_size = backing_summary.last_file_size,
+        .memory_backing_store_probe_count = backing_summary.probes,
+        .memory_backing_store_ready_count = backing_summary.ready,
+        .memory_backing_store_failure_count = backing_summary.failures,
+        .memory_backing_store_first_cluster = backing_summary.last_first_cluster,
+        .memory_backing_store_pager_enabled = 0,
+        .memory_backing_store_anonymous_paging_enabled = 0,
+        .memory_backing_store_reserved0 = 0,
+        .memory_backing_store_slot_status = backing_slot_summary.last_status,
+        .memory_backing_store_slot_operation = backing_slot_summary.last_operation,
+        .memory_backing_store_slot_flags = backing_slot_summary.last_flags,
+        .memory_backing_store_slot_blockers = backing_slot_summary.last_blockers,
+        .memory_backing_store_slot_bytes = backing_slot_summary.slot_bytes,
+        .memory_backing_store_slot_max_ranges = backing_slot_summary.max_ranges,
+        .memory_backing_store_slot_range_count = backing_slot_summary.range_count,
+        .memory_backing_store_slot_last_owner_kind = backing_slot_summary.last_owner_kind,
+        .memory_backing_store_slot_capacity = backing_slot_summary.capacity_slots,
+        .memory_backing_store_slot_reserved = backing_slot_summary.reserved_slots,
+        .memory_backing_store_slot_free = backing_slot_summary.free_slots,
+        .memory_backing_store_slot_valid = backing_slot_summary.valid_slots,
+        .memory_backing_store_slot_dirty = backing_slot_summary.dirty_slots,
+        .memory_backing_store_slot_error = backing_slot_summary.error_slots,
+        .memory_backing_store_slot_last_reservation_id = backing_slot_summary.last_reservation_id,
+        .memory_backing_store_slot_last_owner_id = backing_slot_summary.last_owner_id,
+        .memory_backing_store_slot_last_region_id = backing_slot_summary.last_region_id,
+        .memory_backing_store_slot_pager_enabled = 0,
+        .memory_backing_store_slot_eviction_enabled = 1,
+        .memory_backing_store_slot_page_in_enabled = 1,
+        .memory_backing_store_slot_page_out_enabled = 1,
+        .memory_backing_store_slot_reserved1 = 0,
+        .memory_backing_store_slot_last_first_slot = backing_slot_summary.last_first_slot,
+        .memory_backing_store_slot_last_slot_count = backing_slot_summary.last_slot_count,
+        .memory_backing_store_slot_generation = backing_slot_summary.generation,
+        .memory_backing_store_slot_probe_count = backing_slot_summary.probes,
+        .memory_backing_store_slot_reserve_count = backing_slot_summary.reserves,
+        .memory_backing_store_slot_release_count = backing_slot_summary.releases,
+        .memory_backing_store_slot_error_mark_count = backing_slot_summary.error_marks,
+        .memory_backing_store_slot_recovery_count = backing_slot_summary.recoveries,
+        .memory_backing_store_slot_failure_count = backing_slot_summary.failures,
+        .memory_backing_store_slot_lifecycle_cleanup_count = backing_slot_summary.lifecycle_cleanups,
+        .memory_backing_store_slot_lifecycle_released_ranges = backing_slot_summary.lifecycle_released_ranges,
+        .memory_backing_store_slot_lifecycle_released_slots = backing_slot_summary.lifecycle_released_slots,
+        .memory_pager_gate_status = pager_gate_summary.last_status,
+        .memory_pager_gate_flags = pager_gate_summary.last_flags,
+        .memory_pager_gate_blockers = pager_gate_summary.last_blockers,
+        .memory_pager_gate_region_id = pager_gate_summary.last_region_id,
+        .memory_pager_gate_owner_id = pager_gate_summary.last_owner_id,
+        .memory_pager_gate_slot_bytes = 4096,
+        .memory_pager_gate_rollback_completed = pager_gate_summary.rollback_completed,
+        .memory_pager_gate_reserved0 = 0,
+        .memory_pager_gate_requested_bytes = pager_gate_summary.requested_bytes,
+        .memory_pager_gate_committed_bytes = pager_gate_summary.committed_bytes,
+        .memory_pager_gate_resident_bytes = pager_gate_summary.resident_bytes,
+        .memory_pager_gate_nonresident_bytes = pager_gate_summary.nonresident_bytes,
+        .memory_pager_gate_requested_slots = pager_gate_summary.requested_slots,
+        .memory_pager_gate_prepared_slots = pager_gate_summary.prepared_slots,
+        .memory_pager_gate_capacity_slots = pager_gate_summary.capacity_slots,
+        .memory_pager_gate_free_before_slots = pager_gate_summary.free_before_slots,
+        .memory_pager_gate_free_after_slots = pager_gate_summary.free_after_slots,
+        .memory_pager_gate_reserved_before_slots = pager_gate_summary.reserved_before_slots,
+        .memory_pager_gate_reserved_after_slots = pager_gate_summary.reserved_after_slots,
+        .memory_pager_gate_last_reservation_id = pager_gate_summary.last_reservation_id,
+        .memory_pager_gate_commit_gate_enabled = pager_gate_summary.commit_gate_enabled,
+        .memory_pager_gate_fault_gate_enabled = pager_gate_summary.fault_gate_enabled,
+        .memory_pager_gate_pager_enabled = pager_gate_summary.pager_enabled,
+        .memory_pager_gate_eviction_enabled = pager_gate_summary.eviction_enabled,
+        .memory_pager_gate_page_in_enabled = pager_gate_summary.page_in_enabled,
+        .memory_pager_gate_page_out_enabled = pager_gate_summary.page_out_enabled,
+        .memory_pager_gate_reserved1 = 0,
+        .memory_pager_gate_slot_generation = pager_gate_summary.slot_generation,
+        .memory_pager_gate_fault_count = pager_gate_summary.fault_count,
+        .memory_pager_gate_failed_faults = pager_gate_summary.failed_faults,
+        .memory_pager_gate_probe_count = pager_gate_summary.probes,
+        .memory_pager_gate_ready_count = pager_gate_summary.ready,
+        .memory_pager_gate_rollback_count = pager_gate_summary.rollbacks,
+        .memory_pager_gate_failure_count = pager_gate_summary.failures,
+        .memory_page_io_status = page_io_summary.last_status,
+        .memory_page_io_operation = page_io_summary.last_operation,
+        .memory_page_io_flags = page_io_summary.last_flags,
+        .memory_page_io_blockers = page_io_summary.last_blockers,
+        .memory_page_io_region_id = page_io_summary.last_region_id,
+        .memory_page_io_reservation_id = page_io_summary.last_reservation_id,
+        .memory_page_io_owner_kind = page_io_summary.last_owner_kind,
+        .memory_page_io_owner_id = page_io_summary.last_owner_id,
+        .memory_page_io_slot_bytes = 4096,
+        .memory_page_io_io_bytes = page_io_summary.io_bytes,
+        .memory_page_io_io_status = page_io_summary.io_status,
+        .memory_page_io_pager_enabled = page_io_summary.pager_enabled,
+        .memory_page_io_eviction_enabled = page_io_summary.eviction_enabled,
+        .memory_page_io_page_in_enabled = page_io_summary.page_in_enabled,
+        .memory_page_io_page_out_enabled = page_io_summary.page_out_enabled,
+        .memory_page_io_reserved0 = 0,
+        .memory_page_io_region_offset = page_io_summary.region_offset,
+        .memory_page_io_page_count = page_io_summary.page_count,
+        .memory_page_io_transfer_bytes = page_io_summary.transfer_bytes,
+        .memory_page_io_expected_generation = page_io_summary.expected_generation,
+        .memory_page_io_backing_slot = page_io_summary.backing_slot,
+        .memory_page_io_backing_offset = page_io_summary.backing_offset,
+        .memory_page_io_capacity_slots = page_io_summary.capacity_slots,
+        .memory_page_io_reserved_slots = page_io_summary.reserved_slots,
+        .memory_page_io_valid_slots = page_io_summary.valid_slots,
+        .memory_page_io_dirty_slots = page_io_summary.dirty_slots,
+        .memory_page_io_error_slots = page_io_summary.error_slots,
+        .memory_page_io_slot_generation = page_io_summary.slot_generation,
+        .memory_page_io_prepare_count = page_io_summary.prepares,
+        .memory_page_io_page_out_count = page_io_summary.page_outs,
+        .memory_page_io_page_in_count = page_io_summary.page_ins,
+        .memory_page_io_failure_count = page_io_summary.failures,
+        .memory_page_io_retry_attempt_count = page_io_summary.retry_attempts,
+        .memory_page_io_retryable_failure_count = page_io_summary.retryable_failures,
+        .memory_page_io_permanent_failure_count = page_io_summary.permanent_failures,
+        .memory_page_io_retry_limit_hit_count = page_io_summary.retry_limit_hits,
+        .memory_page_io_failed_page_out_count = page_io_summary.failed_page_outs,
+        .memory_page_io_failed_page_in_count = page_io_summary.failed_page_ins,
+        .memory_page_io_data_preserved_pages = page_io_summary.data_preserved_pages,
+        .memory_page_io_data_lost_pages = page_io_summary.data_lost_pages,
+        .memory_vm_page_state_status = page_state_summary.last_status,
+        .memory_vm_page_state_operation = page_state_summary.last_operation,
+        .memory_vm_page_state_flags = page_state_summary.last_flags,
+        .memory_vm_page_state_blockers = page_state_summary.last_blockers,
+        .memory_vm_page_state_region_id = page_state_summary.last_region_id,
+        .memory_vm_page_state_page_size = @intCast(paging.PAGE_SIZE),
+        .memory_vm_page_state_max_spans = page_state_summary.max_spans,
+        .memory_vm_page_state_span_count = page_state_summary.span_count,
+        .memory_vm_page_state_slot_reservation_id = page_state_summary.last_slot_reservation_id,
+        .memory_vm_page_state_page_count_lo = if (page_state_summary.last_page_count > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(page_state_summary.last_page_count),
+        .memory_vm_page_state_reserved0 = .{0} ** 2,
+        .memory_vm_page_state_region_offset = page_state_summary.last_region_offset,
+        .memory_vm_page_state_page_count = page_state_summary.last_page_count,
+        .memory_vm_page_state_committed_pages = page_state_summary.committed_pages,
+        .memory_vm_page_state_resident_pages = page_state_summary.resident_pages,
+        .memory_vm_page_state_nonresident_pages = page_state_summary.nonresident_pages,
+        .memory_vm_page_state_dirty_pages = page_state_summary.dirty_pages,
+        .memory_vm_page_state_clean_pages = page_state_summary.clean_pages,
+        .memory_vm_page_state_pinned_pages = page_state_summary.pinned_pages,
+        .memory_vm_page_state_busy_pages = page_state_summary.busy_pages,
+        .memory_vm_page_state_error_pages = page_state_summary.error_pages,
+        .memory_vm_page_state_slot_bound_pages = page_state_summary.slot_bound_pages,
+        .memory_vm_page_state_slot_index = page_state_summary.last_slot_index,
+        .memory_vm_page_state_slot_generation = page_state_summary.last_slot_generation,
+        .memory_vm_page_state_transition_count = page_state_summary.transitions,
+        .memory_vm_page_state_dirty_mark_count = page_state_summary.dirty_marks,
+        .memory_vm_page_state_clean_mark_count = page_state_summary.clean_marks,
+        .memory_vm_page_state_slot_bind_count = page_state_summary.slot_binds,
+        .memory_vm_page_state_slot_clear_count = page_state_summary.slot_clears,
+        .memory_vm_page_state_pinned_mark_count = page_state_summary.pinned_marks,
+        .memory_vm_page_state_pinned_clear_count = page_state_summary.pinned_clears,
+        .memory_vm_page_state_busy_mark_count = page_state_summary.busy_marks,
+        .memory_vm_page_state_busy_clear_count = page_state_summary.busy_clears,
+        .memory_vm_page_state_error_mark_count = page_state_summary.error_marks,
+        .memory_vm_page_state_error_clear_count = page_state_summary.error_clears,
+        .memory_vm_page_state_table_full_failures = page_state_summary.table_full_failures,
+        .memory_vm_page_state_cleanup_pages = page_state_summary.cleanup_pages,
+        .memory_vm_page_state_fault_page_in_count = page_state_summary.fault_page_ins,
+        .memory_vm_page_state_fault_page_in_failure_count = page_state_summary.fault_page_in_failures,
+        .memory_vm_page_state_page_out_nonresident_pages = page_state_summary.page_out_nonresident_pages,
+        .memory_vm_eviction_attempt_count = page_state_summary.eviction_attempts,
+        .memory_vm_eviction_success_count = page_state_summary.eviction_successes,
+        .memory_vm_eviction_failure_count = page_state_summary.eviction_failures,
+        .memory_vm_eviction_candidate_count = page_state_summary.eviction_candidates,
+        .memory_vm_eviction_page_out_count = page_state_summary.eviction_page_outs,
+        .memory_vm_eviction_clean_page_count = page_state_summary.eviction_clean_pages,
+        .memory_vm_eviction_dirty_page_count = page_state_summary.eviction_dirty_pages,
+        .memory_vm_eviction_returned_frames = page_state_summary.eviction_returned_frames,
+        .memory_vm_eviction_no_backing_count = page_state_summary.eviction_no_backing,
+        .memory_vm_eviction_no_candidate_count = page_state_summary.eviction_no_candidate,
+        .memory_vm_eviction_slot_failure_count = page_state_summary.eviction_slot_failures,
+        .memory_vm_eviction_io_failure_count = page_state_summary.eviction_io_failures,
+        .memory_vm_eviction_skipped_nonresident = page_state_summary.eviction_skipped_nonresident,
+        .memory_vm_eviction_skipped_pinned = page_state_summary.eviction_skipped_pinned,
+        .memory_vm_eviction_skipped_busy = page_state_summary.eviction_skipped_busy,
+        .memory_vm_eviction_skipped_error = page_state_summary.eviction_skipped_error,
+        .memory_vm_eviction_skipped_unmapped = page_state_summary.eviction_skipped_unmapped,
+        .memory_vm_pager_failed_page_out_count = page_state_summary.pager_failed_page_outs,
+        .memory_vm_pager_failed_page_in_count = page_state_summary.pager_failed_page_ins,
+        .memory_vm_pager_data_preserved_pages = page_state_summary.pager_data_preserved_pages,
+        .memory_vm_pager_data_lost_pages = page_state_summary.pager_data_lost_pages,
+        .memory_vm_pager_dirty_preserved_pages = page_state_summary.pager_dirty_preserved_pages,
+        .memory_vm_pager_disabled_eviction_gates = page_state_summary.pager_disabled_eviction_gates,
+        .preemption_quantum_ticks = sched.preemption_quantum_ticks,
+        .preemption_quantum_expired = sched.preemption_quantum_expired,
+        .preemption_deferred_quantum = sched.preemption_deferred_quantum,
+        .preemption_deferred_kernel_ip = sched.preemption_deferred_kernel_ip,
+        .preemption_app_code_ticks = sched.preemption_app_code_ticks,
+        .scheduler_ready_latency_samples = sched.ready_latency_samples,
+        .scheduler_ready_latency_total_ticks = sched.ready_latency_total_ticks,
+        .scheduler_ready_latency_max_ticks = sched.ready_latency_max_ticks,
+        .scheduler_ready_latency_last_ticks = sched.ready_latency_last_ticks,
+        .scheduler_ready_waiting_max_ticks = sched.ready_waiting_max_ticks,
+        .scheduler_run_without_switch_max_ticks = sched.run_without_switch_max_ticks,
+        .scheduler_quantum_overrun_count = sched.quantum_overrun_count,
+        .scheduler_quantum_overrun_max_ticks = sched.quantum_overrun_max_ticks,
+        .scheduler_preemption_deferred_max_ticks = sched.preemption_deferred_max_ticks,
+        .scheduler_long_running_warn_ticks = sched.long_running_warn_threshold_ticks,
+        .scheduler_starvation_warn_ticks = sched.starvation_warn_threshold_ticks,
+        .wait_object_total_ticks = sched.wait_object_total_ticks,
+        .wait_object_max_ticks = sched.wait_object_max_ticks,
+        .wait_object_last_ticks = sched.wait_object_last_ticks,
+        .wait_queue_total_ticks = wait_summary.total_wait_ticks,
+        .wait_queue_max_ticks = wait_summary.max_wait_ticks,
+        .wait_queue_last_ticks = wait_summary.last_wait_ticks,
+        .driver_work_capacity = work_summary.queue_capacity,
+        .driver_work_depth = work_summary.queue_depth,
+        .driver_work_high_water = work_summary.queue_high_water,
+        .driver_work_worker_started = work_summary.worker_started,
+        .driver_work_submitted = work_summary.submitted,
+        .driver_work_submitted_from_irq = work_summary.submitted_from_irq,
+        .driver_work_submitted_from_task = work_summary.submitted_from_task,
+        .driver_work_started = work_summary.started,
+        .driver_work_completed = work_summary.completed,
+        .driver_work_failed = work_summary.failed,
+        .driver_work_cancelled = work_summary.cancelled,
+        .driver_work_dropped = work_summary.dropped,
+        .driver_work_waits = work_summary.waits,
+        .driver_work_wait_timeouts = work_summary.wait_timeouts,
+        .driver_work_wait_denied_irq = work_summary.wait_denied_irq,
+        .driver_work_wait_total_ticks = work_summary.wait_total_ticks,
+        .driver_work_wait_max_ticks = work_summary.wait_max_ticks,
+        .driver_work_wait_last_ticks = work_summary.wait_last_ticks,
+        .driver_work_queue_total_ticks = work_summary.queue_total_ticks,
+        .driver_work_queue_max_ticks = work_summary.queue_max_ticks,
+        .driver_work_queue_last_ticks = work_summary.queue_last_ticks,
+        .driver_work_run_total_ticks = work_summary.run_total_ticks,
+        .driver_work_run_max_ticks = work_summary.run_max_ticks,
+        .driver_work_run_last_ticks = work_summary.run_last_ticks,
+        .driver_work_releases = work_summary.releases,
+        .driver_work_invalid_handles = work_summary.invalid_handles,
+        .driver_work_cleanup_cancelled = work_summary.cleanup_cancelled,
+        .driver_wait_ticks_calls = work_summary.sleep_waits,
+        .driver_wait_ticks_denied_irq = work_summary.sleep_denied_irq,
+        .driver_wait_ticks_total = work_summary.sleep_total_ticks,
+        .storage_worker_started = block_runtime.worker_started,
+        .storage_worker_task_id = block_runtime.worker_task_id,
+        .storage_worker_wakeups = block_runtime.worker_wakeups,
+        .storage_worker_runs = block_runtime.worker_runs,
+        .storage_worker_idle_waits = block_runtime.worker_idle_waits,
+        .storage_worker_queue_scans = block_runtime.worker_queue_scans,
+        .storage_worker_runtime_requests = block_runtime.worker_runtime_requests,
+        .storage_worker_runtime_completions = block_runtime.worker_runtime_completions,
+        .storage_boot_inline_requests = block_runtime.boot_inline_requests,
+        .storage_boot_inline_completions = block_runtime.boot_inline_completions,
+        .storage_completion_signals = block_runtime.completion_signals,
+        .fat32_read_sectors = fat32_summary.read_sectors,
+        .fat32_write_sectors = fat32_summary.write_sectors,
+        .fat32_read_failures = fat32_summary.read_failures,
+        .fat32_write_failures = fat32_summary.write_failures,
+        .fat32_flushes = fat32_summary.flushes,
+        .fat32_flush_failures = fat32_summary.flush_failures,
+        .fat32_flush_total_ticks = fat32_summary.flush_total_ticks,
+        .fat32_flush_max_ticks = fat32_summary.flush_max_ticks,
+        .fat32_flush_last_ticks = fat32_summary.flush_last_ticks,
+        .fat32_file_writes = fat32_summary.file_writes,
+        .fat32_file_appends = fat32_summary.file_appends,
+        .fat32_file_write_ranges = fat32_summary.file_write_ranges,
+        .fat32_file_write_bytes = fat32_summary.file_write_bytes,
+        .fat32_file_append_bytes = fat32_summary.file_append_bytes,
+        .fat32_dir_scans = fat32_summary.dir_scans,
+        .fat32_dir_entries_scanned = fat32_summary.dir_entries_scanned,
+        .fat32_dir_entry_updates = fat32_summary.dir_entry_updates,
+        .fat32_cluster_walk_steps = fat32_summary.cluster_walk_steps,
+        .fat32_fat_reads = fat32_summary.fat_reads,
+        .fat32_fat_writes = fat32_summary.fat_writes,
+        .fat32_fat_mirror_writes = fat32_summary.fat_mirror_writes,
+        .fat32_alloc_chain_calls = fat32_summary.alloc_chain_calls,
+        .fat32_alloc_clusters = fat32_summary.alloc_clusters,
+        .fat32_alloc_search_steps = fat32_summary.alloc_search_steps,
+        .fat32_operation_failures = fat32_summary.operation_failures,
+        .fat32_operation_total_ticks = fat32_summary.operation_total_ticks,
+        .fat32_operation_max_ticks = fat32_summary.operation_max_ticks,
+        .fat32_operation_last_ticks = fat32_summary.operation_last_ticks,
+        .fat32_active_operation = fat32_summary.active_operation,
+        .fat32_last_operation = fat32_summary.last_operation,
+        .fat32_yield_points = fat32_summary.yield_points,
+        .fat32_yields = fat32_summary.yields,
+        .fat32_yield_skips = fat32_summary.yield_skips,
+        .fat32_alloc_runs = fat32_summary.alloc_runs,
+        .fat32_alloc_run_clusters = fat32_summary.alloc_run_clusters,
+        .fat32_alloc_run_max_clusters = fat32_summary.alloc_run_max_clusters,
+        .fat32_fat_sector_writes = fat32_summary.fat_sector_writes,
+        .fat32_read_extent_cache_hits = fat32_summary.read_extent_cache_hits,
+        .fat32_read_extent_cache_misses = fat32_summary.read_extent_cache_misses,
+        .fat32_read_extent_cache_stores = fat32_summary.read_extent_cache_stores,
+        .fat32_read_extent_cache_clusters = fat32_summary.read_extent_cache_clusters,
+        .fat32_fsinfo_reads = fat32_summary.fsinfo_reads,
+        .fat32_fsinfo_valid_mounts = fat32_summary.fsinfo_valid_mounts,
+        .fat32_fsinfo_rebuilds = fat32_summary.fsinfo_rebuilds,
+        .fat32_fsinfo_writes = fat32_summary.fsinfo_writes,
+        .fat32_inusemap_builds = fat32_summary.inusemap_builds,
+        .fat32_inusemap_clusters = fat32_summary.inusemap_clusters,
+        .fat32_inusemap_alloc_hits = fat32_summary.inusemap_alloc_hits,
+        .fat32_inusemap_alloc_misses = fat32_summary.inusemap_alloc_misses,
+    };
+    return 1;
+}
+
+pub fn performanceTask(index: u32, out: *ProgramTaskPerformanceInfo) callconv(.c) i32 {
+    const t = sched_task.pinByOrdinal(index) orelse {
+        out.* = .{};
+        return 0;
+    };
+    defer _ = sched_task.unpin(t);
+    const now = timer.tickCount();
+    const blocked_ticks = if (t.state == .blocked and t.blocked_since_tick != 0 and now >= t.blocked_since_tick)
+        now - t.blocked_since_tick
+    else
+        0;
+    const ticks_since_yield = if (t.last_yield_tick != 0 and now >= t.last_yield_tick)
+        now - t.last_yield_tick
+    else
+        0;
+    const ticks_since_scheduled = if (t.last_scheduled_tick != 0 and now >= t.last_scheduled_tick)
+        now - t.last_scheduled_tick
+    else
+        0;
+    out.* = .{
+        .index = index,
+        .id = t.id,
+        .state = sched_task.stateCode(t.state),
+        .flags = if (t.entry != null) 1 else 0,
+        .wake_tick = t.wake_tick,
+        .blocked_since_tick = t.blocked_since_tick,
+        .blocked_ticks = blocked_ticks,
+        .created_tick = t.created_tick,
+        .last_scheduled_tick = t.last_scheduled_tick,
+        .last_yield_tick = t.last_yield_tick,
+        .ticks_since_yield = ticks_since_yield,
+        .run_ticks = t.run_ticks,
+        .switches_in = t.switches_in,
+        .stack_base = t.stack_base,
+        .stack_top = t.stack_top,
+        .stack_bytes = if (t.stack_top >= t.stack_base) t.stack_top - t.stack_base else 0,
+        .blocked_object = t.wait_object,
+        .wait_result = @intFromEnum(t.wait_result),
+        .preempt_disable_depth = t.preempt_disable_depth,
+        .preempt_disable_max_depth = t.preempt_disable_max_depth,
+        .ticks_since_scheduled = ticks_since_scheduled,
+        .preemption_probe_hits = t.preemption_probe_hits,
+        .preemption_deferred_ticks = t.preemption_deferred_ticks,
+        .long_run_warnings = t.long_run_warnings,
+        .starvation_warnings = t.starvation_warnings,
+        .ready_since_tick = t.ready_since_tick,
+        .last_ready_latency_ticks = t.last_ready_latency_ticks,
+        .max_ready_latency_ticks = t.max_ready_latency_ticks,
+        .last_wait_ticks = t.last_wait_ticks,
+        .max_wait_ticks = t.max_wait_ticks,
+        .max_run_without_switch_ticks = t.max_run_without_switch_ticks,
+        .max_preemption_deferred_ticks = t.max_preemption_deferred_ticks,
+    };
+    copyFixedZ(out.name[0..], t.name);
+    copyFixedZ(out.wait_reason[0..], t.wait_reason);
+    return 1;
+}
+
+pub fn performanceStorage(index: u32, out: *ProgramStoragePerformanceInfo) callconv(.c) i32 {
+    const device = block_storage.get(index) orelse {
+        out.* = .{};
+        return 0;
+    };
+    out.* = .{
+        .index = index,
+        .bus = @intFromEnum(device.bus),
+        .state = @intFromEnum(device.state),
+        .source = @intFromEnum(device.source),
+        .flags = (if (device.removable) @as(u32, 1) else 0) |
+            (if (device.writable) @as(u32, 2) else 0),
+        .port = device.port,
+        .sector_size = device.sector_size,
+        .max_sectors_per_request = device.max_sectors_per_request,
+        .queue_depth = device.queue_depth,
+        .queue_used = block_storage.queueUsed(index),
+        .queue_high_water = device.stats.queue_high_water,
+        .timeout_ticks = device.timeout_ticks,
+        .sector_count = device.sector_count,
+        .active_request_id = device.stats.active_request.id,
+        .active_request_kind = @intFromEnum(device.stats.active_request.kind),
+        .active_request_sectors = device.stats.active_request.sectors,
+        .active_request_lba = device.stats.active_request.lba,
+        .last_request_id = device.stats.last_request.id,
+        .last_request_kind = @intFromEnum(device.stats.last_request.kind),
+        .last_request_sectors = device.stats.last_request.sectors,
+        .last_request_lba = device.stats.last_request.lba,
+        .read_ops = device.stats.read_ops,
+        .read_sectors = device.stats.read_sectors,
+        .read_failures = device.stats.read_failures,
+        .write_ops = device.stats.write_ops,
+        .write_sectors = device.stats.write_sectors,
+        .write_failures = device.stats.write_failures,
+        .flush_ops = device.stats.flush_ops,
+        .flush_failures = device.stats.flush_failures,
+        .busy_rejections = device.stats.busy_rejections,
+        .timeout_failures = device.stats.timeout_failures,
+        .completions = device.stats.completions,
+        .backend_recoveries = device.stats.backend_recoveries,
+        .backend_recovery_failures = device.stats.backend_recovery_failures,
+        .queued_requests = device.stats.queued_requests,
+        .dequeued_requests = device.stats.dequeued_requests,
+        .queue_full_waits = device.stats.queue_full_waits,
+        .queue_full_rejections = device.stats.queue_full_rejections,
+        .completion_waits = device.stats.completion_waits,
+        .completion_timeouts = device.stats.completion_timeouts,
+        .completion_total_ticks = device.stats.completion_total_ticks,
+        .completion_max_ticks = device.stats.completion_max_ticks,
+        .completion_last_ticks = device.stats.completion_last_ticks,
+        .last_error = @intFromEnum(device.stats.last_error),
+        .last_sense_valid = if (device.stats.last_sense.valid) 1 else 0,
+        .last_sense = packSense(device.stats.last_sense),
+        .completion_signals = device.stats.completion_signals,
+        .worker_requests = device.stats.worker_requests,
+        .worker_completions = device.stats.worker_completions,
+        .boot_inline_requests = device.stats.boot_inline_requests,
+        .boot_inline_completions = device.stats.boot_inline_completions,
+    };
+    copyFixedZ(out.name[0..], device.name);
+    copyFixedZ(out.driver[0..], device.driver);
+    copyFixedZ(out.controller[0..], device.controller);
+    return 1;
+}
+
+pub fn performanceBootPhase(index: u32, out: *ProgramBootPhasePerformanceInfo) callconv(.c) i32 {
+    const phase = boot_perf.phaseAt(index) orelse {
+        out.* = .{};
+        return 0;
+    };
+    out.* = .{
+        .index = index,
+        .phase = @intFromEnum(phase.phase),
+        .first_tick = phase.first_tick,
+        .last_tick = phase.last_tick,
+        .total_ticks = phase.total_ticks,
+        .transitions = phase.transitions,
+    };
+    copyFixedZ(out.name[0..], bootPhaseName(phase.phase));
+    return 1;
+}
+
+pub fn deviceInventorySummary(out: *DeviceInventorySummary) callconv(.c) i32 {
+    const s = device_inventory.snapshot();
+    out.* = .{
+        .total = @intCast(s.count),
+        .with_driver = s.with_driver,
+        .without_driver = s.without_driver,
+        .unknown = s.unknown,
+        .truncated = if (s.truncated) 1 else 0,
+    };
+    return 1;
+}
+
+pub fn deviceInventoryRecord(index: u32, out: *DeviceInventoryRecord) callconv(.c) i32 {
+    const s = device_inventory.snapshot();
+    if (index >= s.count) return 0;
+    const record_index: usize = @intCast(index);
+    const rec = s.records[record_index];
+    out.* = .{
+        .binding = @intFromEnum(rec.binding),
+        .bus = @intFromEnum(rec.bus),
+        .flags = if (rec.has_pci_address) 1 else 0,
+        .bus_no = rec.bus_no,
+        .device_no = rec.device_no,
+        .function_no = rec.function_no,
+        .class_code = rec.class_code,
+        .subclass = rec.subclass,
+        .prog_if = rec.prog_if,
+        .vendor_id = rec.vendor_id,
+        .device_id = rec.device_id,
+    };
+    copyFixedZ(out.name[0..], rec.name);
+    copyFixedZ(out.driver[0..], rec.driver);
+    copyFixedZ(out.status[0..], rec.status);
+    copyFixedZ(out.note[0..], rec.note);
+    return 1;
+}
+
+pub fn hardwareSummary(out: *HardwareSummary) callconv(.c) i32 {
+    const ai = acpi.info();
+    const ps = pcie.status();
+    const irq = irq_status.status();
+    const usb = usb_core.summary();
+    const inv = device_inventory.snapshot();
+    const cs = cpu.status();
+
+    var flags: u32 = 0;
+    if (ai.rsdp_phys != 0) flags |= hardware_summary_flag_acpi;
+    if (ps.enumerated) flags |= hardware_summary_flag_pcie;
+    const legacy_pci_devices: u32 = @intCast(@min(pci.count(), 0xFFFF_FFFF));
+    const block_devices: u32 = @intCast(@min(block_storage.count(), 0xFFFF_FFFF));
+    if (!ps.enumerated and legacy_pci_devices != 0) flags |= hardware_summary_flag_legacy_pci;
+    if (irq.ioapic_runtime_mapped or irq.ioapic_routing_active) flags |= hardware_summary_flag_ioapic;
+    if (irq.hpet_available) flags |= hardware_summary_flag_hpet;
+    if (ps.xhci_count != 0 or usb_host.findByName("XHCI") != null) flags |= hardware_summary_flag_xhci;
+    if (ps.ahci_count != 0 or hasBlockBus(.ahci)) flags |= hardware_summary_flag_ahci;
+    if (ps.nvme_count != 0 or hasBlockBus(.nvme)) flags |= hardware_summary_flag_nvme;
+    if (usb.configured != 0) flags |= hardware_summary_flag_usb_configured;
+
+    var driver_records: u32 = 0;
+    var protocol_records: u32 = 0;
+    var display_controllers: u32 = 0;
+    var index: usize = 0;
+    while (index < inv.count) : (index += 1) {
+        const rec = inv.records[index];
+        if (rec.bus == .driver) driver_records += 1;
+        if (rec.bus == .protocol) protocol_records += 1;
+        if (rec.class_code == 0x03) display_controllers += 1;
+    }
+
+    out.* = .{
+        .flags = flags,
+        .acpi_tables = ai.table_count,
+        .acpi_invalid_tables = ai.invalid_table_count,
+        .pcie_devices = ps.stored_count,
+        .legacy_pci_devices = legacy_pci_devices,
+        .storage_controllers = ps.ahci_count + ps.nvme_count,
+        .network_controllers = ps.network_count,
+        .display_controllers = display_controllers,
+        .usb_controllers = ps.xhci_count,
+        .hda_controllers = ps.hda_count,
+        .block_devices = block_devices,
+        .usb_devices = @intCast(usb.count),
+        .usb_configured = @intCast(usb.configured),
+        .driver_records = driver_records,
+        .protocol_records = protocol_records,
+        .irq_controller = @intFromEnum(irq.controller),
+        .timer_backend = @intFromEnum(irq.timer),
+        .lapic_count = irq.lapic_count,
+        .ioapic_count = irq.ioapic_count,
+        .iso_count = irq.iso_count,
+        .hpet_frequency_hz = irq.hpet_frequency_hz,
+        .cpu_logical_processors = if (cs.logical_processors == 0) 1 else @intCast(cs.logical_processors),
+        .cpu_physical_address_bits = cs.physical_address_bits,
+        .cpu_virtual_address_bits = cs.virtual_address_bits,
+    };
+    return 1;
+}
+
+fn hasBlockBus(bus: block_storage.Bus) bool {
+    var index: usize = 0;
+    while (index < block_storage.slotCount()) : (index += 1) {
+        const device = block_storage.get(index) orelse continue;
+        if (device.bus == bus) return true;
+    }
+    return false;
+}
+
+pub fn protocolStatus(role_ptr: [*]const u8, role_len: u32, out: *ProtocolStatus) callconv(.c) i32 {
+    const role = roleSlice(role_ptr, role_len) orelse {
+        out.* = .{};
+        return -2;
+    };
+    const entry = protocol_registry.moduleEntryForRole(role) orelse protocol_registry.builtinEntryForRole(role) orelse {
+        out.* = .{};
+        return -5;
+    };
+    out.* = .{
+        .state = protocolStateValue(entry.state),
+        .flags = protocolSourceFlags(entry.source),
+        .last_error = entry.last_error,
+        .reserved = 0,
+    };
+    copyFixedZ(out.note[0..], entry.note[0..entry.note_len]);
+    return 0;
+}
+
+pub fn protocolDispatch(role_ptr: [*]const u8, role_len: u32, op: u32, in_buffer: *const ProtocolBuffer, out_buffer: *ProtocolBuffer) callconv(.c) i32 {
+    const role = roleSlice(role_ptr, role_len) orelse return -2;
+    return r4p.dispatch(role, op, in_buffer, out_buffer);
+}
+
+pub fn bootInfoSummary(out: *BootInfoSummary) callconv(.c) i32 {
+    const info = boot_info.get();
+    out.* = .{
+        .flags = bootInfoFlags(info),
+        .memory_map_count = @intCast(@min(info.memory_map_entries.len, 0xFFFF_FFFF)),
+        .max_memory_map_entries = boot_info.MAX_MEMORY_MAP_ENTRIES,
+        .hhdm_offset = info.hhdm_offset orelse 0,
+        .rsdp_address = info.rsdp_address orelse 0,
+    };
+    copyFixedZ(out.bootloader_name[0..], info.bootloader_name);
+    if (info.framebuffer) |fb| {
+        out.framebuffer_address = @intFromPtr(fb.address);
+        out.framebuffer_width = fb.width;
+        out.framebuffer_height = fb.height;
+        out.framebuffer_pitch = fb.pitch;
+        out.framebuffer_bpp = fb.bpp;
+        out.framebuffer_memory_model = fb.memory_model;
+        out.framebuffer_red_mask_size = fb.red_mask_size;
+        out.framebuffer_red_mask_shift = fb.red_mask_shift;
+        out.framebuffer_green_mask_size = fb.green_mask_size;
+        out.framebuffer_green_mask_shift = fb.green_mask_shift;
+        out.framebuffer_blue_mask_size = fb.blue_mask_size;
+        out.framebuffer_blue_mask_shift = fb.blue_mask_shift;
+        out.edid_size = fb.edid_size;
+        out.edid_address = if (fb.edid) |edid| @intFromPtr(edid) else 0;
+    }
+    return 1;
+}
+
+pub fn bootInfoMemoryCount() callconv(.c) u32 {
+    const count = boot_info.memoryMap().len;
+    return @intCast(@min(count, 0xFFFF_FFFF));
+}
+
+pub fn bootInfoMemoryEntry(index: u32, out: *BootInfoMemoryEntry) callconv(.c) i32 {
+    const entries = boot_info.memoryMap();
+    if (index >= entries.len) {
+        out.* = .{};
+        return 0;
+    }
+    const entry = entries[@intCast(index)];
+    out.* = .{
+        .base = entry.base,
+        .length = entry.length,
+        .kind = @intFromEnum(entry.kind),
+    };
+    return 1;
+}
+
+fn bootInfoFlags(info: *const boot_info.Info) u32 {
+    var flags: u32 = 0;
+    if (info.initialized) flags |= BootInfoFlags.initialized;
+    if (info.memory_map_truncated) flags |= BootInfoFlags.memory_map_truncated;
+    if (info.hhdm_offset != null) flags |= BootInfoFlags.has_hhdm;
+    if (info.framebuffer != null) flags |= BootInfoFlags.has_framebuffer;
+    if (info.rsdp_address != null) flags |= BootInfoFlags.has_rsdp;
+    if (info.framebuffer) |fb| {
+        if (fb.edid != null and fb.edid_size != 0) flags |= BootInfoFlags.has_edid;
+    }
+    return flags;
+}
+
+fn pagingRootOwner(owner: paging.RootOwner) u8 {
+    return switch (owner) {
+        .unknown => paging_root_owner_unknown,
+        .bootloader => paging_root_owner_bootloader,
+        .r4os => paging_root_owner_r4os,
+    };
+}
+
+fn pressureLevel(total_physical_bytes: u64, app_available_bytes: u64, commit_headroom_bytes: u64) u32 {
+    if (total_physical_bytes == 0) return memory_pressure_level_unknown;
+    const available = if (app_available_bytes < commit_headroom_bytes) app_available_bytes else commit_headroom_bytes;
+    const critical_floor = maxU64(8 * 1024 * 1024, total_physical_bytes / 128);
+    const warning_floor = maxU64(32 * 1024 * 1024, total_physical_bytes / 64);
+    const watch_floor = maxU64(128 * 1024 * 1024, total_physical_bytes / 16);
+    if (available == 0 or available <= critical_floor) return memory_pressure_level_critical;
+    if (available <= warning_floor) return memory_pressure_level_warning;
+    if (available <= watch_floor) return memory_pressure_level_watch;
+    return memory_pressure_level_normal;
+}
+
+fn saturatingAdd(a: u64, b: u64) u64 {
+    const value = a +% b;
+    return if (value < a) ~@as(u64, 0) else value;
+}
+
+fn maxU64(a: u64, b: u64) u64 {
+    return if (a > b) a else b;
+}
+
+fn clampReclaimFrames(value: u32) u32 {
+    if (value == 0) return 1;
+    return if (value > 64) 64 else value;
+}
+
+fn saturatingU32FromUsize(value: usize) u32 {
+    return if (value > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(value);
+}
+
+fn saturatingU32FromU64(value: u64) u32 {
+    return if (value > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(value);
+}
+
+fn packSense(sense: block_storage.SenseSnapshot) u32 {
+    if (!sense.valid) return 0;
+    return (@as(u32, sense.opcode) << 24) |
+        (@as(u32, sense.key) << 16) |
+        (@as(u32, sense.asc) << 8) |
+        @as(u32, sense.ascq);
+}
+
+fn bootPhaseName(phase: crash.BootPhase) []const u8 {
+    return switch (phase) {
+        .unknown => "unknown",
+        .entry => "entry",
+        .cpu => "cpu",
+        .timer => "timer",
+        .driver => "driver",
+        .input => "input",
+        .memory => "memory",
+        .storage => "storage",
+        .module => "module",
+        .platform => "platform",
+        .loader => "loader",
+        .irq => "irq",
+        .service => "service",
+        .runtime => "runtime",
+        .audio => "audio",
+        .network => "network",
+        .usb => "usb",
+        .driver_policy => "driver-policy",
+        .shell => "shell",
+    };
+}
+
+fn roleSlice(role_ptr: [*]const u8, role_len: u32) ?[]const u8 {
+    if (role_len == 0 or role_len >= protocol_registry.MAX_ROLE) return null;
+    return role_ptr[0..role_len];
+}
+
+fn protocolStateValue(state: protocol_registry.State) u32 {
+    return switch (state) {
+        .loaded => 1,
+        .active => 2,
+        .fallback => 3,
+        .blocked => 4,
+        .err => 5,
+        .disabled => 6,
+        else => 0,
+    };
+}
+
+fn protocolSourceFlags(source: protocol_registry.Source) u32 {
+    return switch (source) {
+        .builtin => 1 << 0,
+        .r4p => 1 << 1,
+        .preload => 1 << 2,
+    };
+}
+
+fn copyFixedZ(out: []u8, value: []const u8) void {
+    @memset(out, 0);
+    if (out.len == 0) return;
+    const count = @min(value.len, out.len - 1);
+    if (count > 0) @memcpy(out[0..count], value[0..count]);
+}

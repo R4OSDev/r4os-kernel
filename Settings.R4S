@@ -1,0 +1,14 @@
+﻿# R4OS Kernel path mappings
+# WORKSPACE_ROOT and REPOSITORIES_ROOT are relative to this Kernel directory.
+# CONTRACT_ROOT is relative to REPOSITORIES_ROOT. DEVKIT_ROOT and
+# ARTIFACTS_ROOT are relative to WORKSPACE_ROOT; ZIG_ROOT is relative to
+# DEVKIT_ROOT. Every value may instead be absolute. Do not wrap values in quotes.
+
+WORKSPACE_ROOT=../..
+REPOSITORIES_ROOT=..
+
+CONTRACT_ROOT=Contract
+
+DEVKIT_ROOT=DevKit
+ARTIFACTS_ROOT=Artifacts
+ZIG_ROOT=Toolchains/Zig

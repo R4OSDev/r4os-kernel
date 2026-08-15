@@ -1,0 +1,35 @@
+﻿R4OS Kernel - Herkunft
+=======================
+
+Kanonischer Quellstand der Uebernahme:
+
+    Repository: R4mbo/R4OS
+    Commit:     259cbfac272c47ac1a7828de973512d17b29ae10
+    Archivkopf: 2c0ca0473b5eeb5f3417db82fa666368ed67d5df
+    Kernelbaum: e3d47fc2ee4b5917727af288f39a0a6a07ee9003
+
+Ausgangseinheiten:
+
+    Code/Kernel/
+    Code/limine.conf
+    Code/System/SDK/r4os/ntfs_format.zig
+    Code/System/SDK/r4os/ntfs_volume.zig
+    Code/System/SDK/r4os/system_update_recovery.zig
+    Code/System/SDK/r4os/upload_publish_claim.zig
+    Code/System/SDK/r4os/registry_core.zig
+
+Alle 185 Dateien des alten Kernelbaums wurden vor der Grenzaenderung gegen
+ihre Git-Blobs geprueft. Die fuenf Supportdateien sind ebenfalls bytegleich
+zum eingefrorenen Referenzcommit und liegen nun explizit innerhalb der
+Kernelgrenze, damit der Kernel keine SDK-Quelle importiert.
+
+Absichtliche Grenzaenderungen:
+
+- Der alte Root-Build und sein Modul-Aggregat wurden nicht uebernommen.
+- `build.zig` baut ausschliesslich `r4os.elf` und kernelnahe Hosttests.
+- Die generierte Kernel-ABI wird nicht mehr lokal materialisiert, sondern aus
+  dem versionierten Contract-Paket konsumiert.
+- `Boot/limine.conf` bewahrt die eingefrorene Boot- und Preloadkonfiguration;
+  die spaetere Distribution entscheidet ueber ihre konkrete Imagebelegung.
+- Caches, `zig-out`, fertige Kernelartefakte und Distributionsausgaben bleiben
+  unversioniert.
