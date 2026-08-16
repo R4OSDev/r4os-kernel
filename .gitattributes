@@ -20,3 +20,4 @@
 *.R4B -text
 *.bin -text
 *.elf -text
+*.md text eol=lf

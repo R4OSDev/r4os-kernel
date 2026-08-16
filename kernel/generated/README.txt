@@ -1,11 +1,9 @@
-﻿Bootscreen-Kernel-Artefakte
-===========================
+﻿Kernel-Local Bootscreen Artifacts
+=================================
 
-Dieser Ordner enthaelt lokale Build-Artefakte fuer `@embedFile`.
+This directory contains local build artifacts used by @embedFile.
+BOOTSCREEN.R4B is copied here from Assets/Bootscreen/Generated because Zig
+requires embedded files inside the kernel package path.
 
-`BOOTSCREEN.R4B` wird vom Build aus
-`Code/Kernel/Assets/Bootscreen/Generated/BOOTSCREEN.R4B` hierher kopiert, weil Zig
-eingebettete Dateien innerhalb des Kernel-Paketpfads erwartet.
-
-Die Datei ist nicht versioniert. Bearbeitbare Quelle bleibt ausschliesslich
-`Code/Kernel/Assets/Bootscreen/BOOTSCREEN.BMP`.
+The artifact is not versioned. Assets/Bootscreen/BOOTSCREEN.BMP remains the
+only editable source.

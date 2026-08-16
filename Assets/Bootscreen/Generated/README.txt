@@ -1,17 +1,13 @@
-﻿Build-Artefakte
-===============
+﻿Generated Bootscreen Artifacts
+==============================
 
-Dieser Ordner ist der Ausgabepfad fuer erzeugte Bootscreen-Artefakte.
+This directory is the output location for generated bootscreen artifacts.
+The build converts Assets/Bootscreen/BOOTSCREEN.BMP into BOOTSCREEN.R4B.
+The R4B file is a build artifact and is not versioned.
 
-`BOOTSCREEN.R4B` wird von `DevTools/Scripts/ConvertBootscreenBmp.zig` aus
-`Code/Kernel/Assets/Bootscreen/BOOTSCREEN.BMP` erzeugt. Die `.R4B`-Datei ist ein
-Build-Artefakt und wird nicht versioniert.
+A normal build must generate the artifact. Missing or invalid BMP input is a
+hard build failure; no stale bootscreen fallback is used.
 
-Ab 0.54.16 muss der normale Build dieses Artefakt erzeugen. Fehlt das BMP oder
-ist es ungueltig, soll der Build fehlschlagen statt still auf einen alten
-Bootscreen auszuweichen.
-
-`Build.bat` kopiert diese Datei danach nach
-`Code/Kernel/kernel/generated/BOOTSCREEN.R4B`, weil Zig eingebettete Dateien im
-Kernel-Paketpfad erwartet. Diese Kopie ist ebenfalls ein Build-Artefakt und
-nicht versioniert.
+The build then copies BOOTSCREEN.R4B into kernel/generated because Zig
+requires embedded files to be inside the kernel package path. That copy is
+also an unversioned build artifact.
