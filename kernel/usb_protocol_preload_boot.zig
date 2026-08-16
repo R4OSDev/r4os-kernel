@@ -13,7 +13,6 @@ const R4I_ROLE_OFF: usize = 40;
 const R4I_DATA_OFF_FIELD: usize = 88;
 
 const PreloadKind = enum {
-    library,
     protocol,
     driver,
 };
@@ -27,7 +26,6 @@ const R4IEntry = struct {
 
 const R4IView = struct {
     entries: []const R4IEntry,
-    r4l_count: usize = 0,
     r4p_count: usize = 0,
     r4d_count: usize = 0,
 };
@@ -39,7 +37,6 @@ const RequiredModule = struct {
 };
 
 const required = [_]RequiredModule{
-    .{ .name = "R4DEV.R4L", .marker = "r4os.preload.r4l=R4DEV", .kind = .library },
     .{ .name = "HIDREPORT.R4P", .marker = "r4os.preload.usb-r4p=HIDREPORT", .kind = .protocol },
     .{ .name = "USBHID.R4P", .marker = "r4os.preload.usb-r4p=USBHID", .kind = .protocol },
     .{ .name = "USBBOT.R4P", .marker = "r4os.preload.usb-r4p=USBBOT", .kind = .protocol },
@@ -74,7 +71,6 @@ pub fn init() bool {
             continue;
         };
         const ok = switch (req.kind) {
-            .library => r4p.loadPreloadLibrary(req.name, bytes),
             .protocol => r4p.loadPreloadModule(req.name, bytes),
             .driver => r4d.runtimeLoadSucceeded(r4d.loadPreloadModule(req.name, bytes)),
         };
@@ -92,8 +88,6 @@ pub fn init() bool {
     if (r4i) |image| {
         log.puts("[PRELOAD] R4I entries=");
         log.putDec(image.entries.len);
-        log.puts(" r4l=");
-        log.putDec(image.r4l_count);
         log.puts(" r4p=");
         log.putDec(image.r4p_count);
         log.puts(" r4d=");
@@ -155,7 +149,6 @@ fn parseR4I(bytes: []const u8) ?R4IView {
             .bytes = bytes[payload_off .. payload_off + payload_len],
         };
         switch (kind) {
-            1 => view.r4l_count += 1,
             2 => view.r4p_count += 1,
             3 => view.r4d_count += 1,
             else => return null,

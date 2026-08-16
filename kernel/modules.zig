@@ -4,6 +4,7 @@ const k = @import("log.zig");
 const loader_perf = @import("loader_perf.zig");
 const module_file = @import("module_file.zig");
 const module_r4m = @import("module_r4m.zig");
+const r4x_api = @import("../program/r4x_api.zig");
 
 const PAGE_SIZE: usize = 4096;
 const MAX_MODULES: usize = 64;
@@ -15,7 +16,6 @@ const MAX_IMPORTS_PER_MODULE: usize = 16;
 const MAX_EXPORTS_PER_MODULE: usize = 16;
 const MAX_R4M_METADATA_PROBE: usize = 2048;
 const MAX_R4M_NAME_PROBE: usize = 128;
-const KERNEL_PROVIDER_PING_VALUE: u32 = 0x4B505231; // "KPR1"
 const ACTIVE_BOOT_GENERATION: u32 = 1;
 const R4L_INTERFACE_MAGIC: u32 = 0x31493452;
 const R4L_INTERFACE_HEADER_VERSION: u16 = 1;
@@ -40,6 +40,21 @@ const R4M_RELOC_BASE_REL64: u32 = 3;
 const R4M_RELOC_IMPORT_SLOT64: u32 = 4;
 
 pub const Kind = module_r4m.Kind;
+
+const platform_api_queries: [r4x_api.r4_platform_apis.len]r4x_api.R4LQuery = blk: {
+    var queries: [r4x_api.r4_platform_apis.len]r4x_api.R4LQuery = undefined;
+    for (r4x_api.r4_platform_apis, 0..) |meta, index| {
+        queries[index] = .{
+            .magic = r4x_api.r4l_abi_magic,
+            .abi_version = r4x_api.r4l_abi_version,
+            .size = r4x_api.r4l_query_struct_size,
+            .group = @intFromEnum(meta.group),
+            .kernel_bridge = 0,
+            .reserved = 0,
+        };
+    }
+    break :blk queries;
+};
 
 pub const State = enum(u8) {
     empty,
@@ -164,7 +179,6 @@ pub const Entry = struct {
     reloc_import_slot64_count: u32 = 0,
     resolved_import_count: u32 = 0,
     resolver_status: ResolverStatus = .none,
-    normal_import_target: bool = true,
     bss_zeroed: bool = true,
     generation: u32 = 0,
     pinned: bool = false,
@@ -181,7 +195,6 @@ var symbol_dependency_errors: u32 = 0;
 var version_dependency_errors: u32 = 0;
 var cycle_dependency_errors: u32 = 0;
 var duplicate_provider_errors: u32 = 0;
-var kernel_provider_policy_errors: u32 = 0;
 var libraries_generation_active: bool = false;
 
 pub fn init() void {
@@ -194,9 +207,8 @@ pub fn init() void {
     version_dependency_errors = 0;
     cycle_dependency_errors = 0;
     duplicate_provider_errors = 0;
-    kernel_provider_policy_errors = 0;
     libraries_generation_active = false;
-    registerKernelProvider();
+    registerPlatformApis();
 }
 
 pub fn loadSystemLibraries() void {
@@ -256,7 +268,7 @@ pub fn loadSystemLibraries() void {
     k.putDec(countUsed());
     k.puts("\r\n");
 
-    if (missing_dependency_errors != 0 or symbol_dependency_errors != 0 or version_dependency_errors != 0 or cycle_dependency_errors != 0 or duplicate_provider_errors != 0 or unresolved_import_errors != 0 or kernel_provider_policy_errors != 0) {
+    if (missing_dependency_errors != 0 or symbol_dependency_errors != 0 or version_dependency_errors != 0 or cycle_dependency_errors != 0 or duplicate_provider_errors != 0 or unresolved_import_errors != 0) {
         k.puts("[MOD] resolver errors missing=");
         k.putDec(missing_dependency_errors);
         k.puts(" symbol=");
@@ -269,8 +281,6 @@ pub fn loadSystemLibraries() void {
         k.putDec(duplicate_provider_errors);
         k.puts(" unresolved=");
         k.putDec(unresolved_import_errors);
-        k.puts(" provider_policy=");
-        k.putDec(kernel_provider_policy_errors);
         k.puts("\r\n");
     }
 }
@@ -290,7 +300,7 @@ pub fn dumpSummary() void {
             .r4x => r4x += 1,
             .r4d => r4d += 1,
             .r4p => r4p += 1,
-            .kernel_provider, .kernel_module_reserved => builtin += 1,
+            .platform_api_provider_reserved, .kernel_module_reserved => builtin += 1,
         }
         if (e.state == .failed or e.resolver_status == .failed) failed += 1;
     }
@@ -318,7 +328,7 @@ pub fn dumpSummary() void {
         k.putDec(relocation_range_errors);
         k.puts("\r\n");
     }
-    if (missing_dependency_errors != 0 or symbol_dependency_errors != 0 or version_dependency_errors != 0 or cycle_dependency_errors != 0 or duplicate_provider_errors != 0 or unresolved_import_errors != 0 or kernel_provider_policy_errors != 0) {
+    if (missing_dependency_errors != 0 or symbol_dependency_errors != 0 or version_dependency_errors != 0 or cycle_dependency_errors != 0 or duplicate_provider_errors != 0 or unresolved_import_errors != 0) {
         k.puts("[MOD] resolver errors missing=");
         k.putDec(missing_dependency_errors);
         k.puts(" symbol=");
@@ -331,8 +341,6 @@ pub fn dumpSummary() void {
         k.putDec(duplicate_provider_errors);
         k.puts(" unresolved=");
         k.putDec(unresolved_import_errors);
-        k.puts(" provider_policy=");
-        k.putDec(kernel_provider_policy_errors);
         k.puts("\r\n");
     }
 }
@@ -351,33 +359,41 @@ pub fn entryAt(index: usize) ?*const Entry {
     return &entries[index];
 }
 
-fn registerKernelProvider() void {
-    const slot = freeSlot() orelse return;
-    const e = &entries[slot];
-    e.* = .{
-        .used = true,
-        .kind = .kernel_provider,
-        .state = .builtin,
-        .resolver_status = .builtin,
-        .normal_import_target = false,
-        .export_count = 1,
-        .generation = ACTIVE_BOOT_GENERATION,
-        .pinned = true,
-    };
-    e.name_len = copyBytes("KernelProvider", e.name[0..]);
-    e.path_len = copyBytes("builtin:R4KERNEL", e.path[0..]);
-    e.exports[0] = .{
-        .used = true,
-        .version = 1,
-        .address = @intFromPtr(&kernelProviderPing),
-        .section_index = 0,
-        .section_offset = 0,
-    };
-    e.exports[0].name_len = copyBytes("KernelPing", e.exports[0].name[0..]);
+pub fn platformApiGroupId(name: []const u8) ?u32 {
+    for (r4x_api.r4_platform_apis) |meta| {
+        if (nameEq(name, meta.name)) return @intFromEnum(meta.group);
+    }
+    return null;
 }
 
-fn kernelProviderPing() callconv(.c) u32 {
-    return KERNEL_PROVIDER_PING_VALUE;
+fn registerPlatformApis() void {
+    comptime {
+        if (r4x_api.r4_platform_apis.len != 6) @compileError("expected exactly six built-in platform APIs");
+    }
+    for (r4x_api.r4_platform_apis, 0..) |meta, index| {
+        const slot = freeSlot() orelse return;
+        const e = &entries[slot];
+        e.* = .{
+            .used = true,
+            .kind = .platform_api_provider_reserved,
+            .state = .builtin,
+            .resolver_status = .builtin,
+            .export_count = 1,
+            .generation = ACTIVE_BOOT_GENERATION,
+            .pinned = true,
+        };
+        e.name_len = copyBytes(meta.name, e.name[0..]);
+        e.path_len = copyBytes("builtin:", e.path[0..]);
+        e.path_len += copyBytes(meta.name, e.path[e.path_len..]);
+        e.exports[0] = .{
+            .used = true,
+            .version = 1,
+            .address = @intFromPtr(&platform_api_queries[index]),
+            .section_index = 0,
+            .section_offset = 0,
+        };
+        e.exports[0].name_len = copyBytes("Query", e.exports[0].name[0..]);
+    }
 }
 
 fn collectPendingLibrary(volume: vfs.Volume, file_entry: vfs.Entry, file_name: []const u8, out: *PendingLibrary) bool {
@@ -450,39 +466,6 @@ fn readPendingLibraryProbe(volume: vfs.Volume, file_entry: vfs.Entry, file_name:
     probe.header = header;
     probe.module_name_len = copyBytes(module_name, probe.module_name[0..]);
     return probe;
-}
-
-fn hasForbiddenKernelProviderImport(bytes: []const u8, header: Header, kind: Kind, module_name: []const u8) bool {
-    var i: usize = 0;
-    while (i < header.import_count) : (i += 1) {
-        const import = readImport(bytes, header, i) orelse return true;
-        if (nameEq(import.module, "KernelProvider") and !kernelProviderImportAllowed(kind, module_name)) return true;
-    }
-    return false;
-}
-
-fn hasForbiddenKernelProviderImportFromFile(source: module_file.FileSource, file_size: usize, header: Header, kind: Kind, module_name: []const u8) bool {
-    var i: usize = 0;
-    while (i < header.import_count) : (i += 1) {
-        var module_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const import = readImportFromFile(source, file_size, header, i, module_buf[0..], symbol_buf[0..]) orelse return true;
-        if (nameEq(import.module, "KernelProvider") and !kernelProviderImportAllowed(kind, module_name)) return true;
-    }
-    return false;
-}
-
-fn kernelProviderImportAllowed(kind: Kind, module_name: []const u8) bool {
-    return kind == .r4l and isKernelPlatformModule(module_name);
-}
-
-fn isKernelPlatformModule(module_name: []const u8) bool {
-    return nameEq(module_name, "R4SYS") or
-        nameEq(module_name, "R4DESK") or
-        nameEq(module_name, "R4DRAW") or
-        nameEq(module_name, "R4NET") or
-        nameEq(module_name, "R4AUDIO") or
-        nameEq(module_name, "R4DEV");
 }
 
 fn freePendingLibraries(pending: []PendingLibrary) void {
@@ -585,6 +568,12 @@ pub fn loadResolvedBytes(bytes: []const u8, expected_kind: Kind, fallback_name: 
         k.puts("\r\n");
         return null;
     };
+    if (!module_r4m.isLoadableContainerKind(kind) or !module_r4m.isLoadableContainerKind(expected_kind)) {
+        k.puts("[MOD] reserved ModuleKind: ");
+        k.puts(fallback_name);
+        k.puts("\r\n");
+        return null;
+    }
     if (kind != expected_kind) {
         k.puts("[MOD] unexpected ModuleKind: ");
         k.puts(fallback_name);
@@ -599,13 +588,6 @@ pub fn loadResolvedBytes(bytes: []const u8, expected_kind: Kind, fallback_name: 
     }
 
     const importer_name = moduleName(bytes, header) orelse fallbackModuleName(fallback_name);
-    if (hasForbiddenKernelProviderImport(bytes, header, kind, importer_name)) {
-        kernel_provider_policy_errors += 1;
-        k.puts("[MOD] resolver provider policy reject importer=");
-        k.puts(importer_name);
-        k.puts("\r\n");
-        return null;
-    }
 
     var resolved_buf: [MAX_IMPORTS_PER_MODULE]ResolvedImport = .{ResolvedImport{}} ** MAX_IMPORTS_PER_MODULE;
     if (header.import_count > resolved_buf.len) {
@@ -642,6 +624,12 @@ pub fn loadResolvedBytes(bytes: []const u8, expected_kind: Kind, fallback_name: 
 }
 
 pub fn loadResolvedFile(source: module_file.FileSource, expected_kind: Kind, fallback_name: []const u8, path: []const u8) ?usize {
+    if (!module_r4m.isLoadableContainerKind(expected_kind)) {
+        k.puts("[MOD] reserved ModuleKind: ");
+        k.puts(fallback_name);
+        k.puts("\r\n");
+        return null;
+    }
     const file_size: usize = @intCast(source.entry.size);
     const header = readR4MHeaderFromFile(source, file_size, expected_kind, "r4m-module-header") orelse {
         k.puts("[MOD] bad R4M0 header: ");
@@ -670,13 +658,6 @@ pub fn loadResolvedFile(source: module_file.FileSource, expected_kind: Kind, fal
 
     var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
     const importer_name = moduleNameFromFile(source, header, meta_buf[0..]) orelse fallbackModuleName(fallback_name);
-    if (hasForbiddenKernelProviderImportFromFile(source, file_size, header, kind, importer_name)) {
-        kernel_provider_policy_errors += 1;
-        k.puts("[MOD] resolver provider policy reject importer=");
-        k.puts(importer_name);
-        k.puts("\r\n");
-        return null;
-    }
 
     var resolved_buf: [MAX_IMPORTS_PER_MODULE]ResolvedImport = .{ResolvedImport{}} ** MAX_IMPORTS_PER_MODULE;
     if (header.import_count > resolved_buf.len) {
@@ -730,10 +711,10 @@ pub fn exportInfo(slot: usize, symbol: []const u8, min_version: u32) ?ExportInfo
     if (slot >= entries.len or !entries[slot].used) return null;
     const exp = findExport(&entries[slot], symbol) orelse return null;
     if (exp.version < min_version) return null;
-    if (entries[slot].kind == .kernel_provider) return .{
+    if (entries[slot].kind == .platform_api_provider_reserved) return .{
         .address = exp.address,
         .version = exp.version,
-        .available_size = 0,
+        .available_size = r4x_api.r4l_query_struct_size,
         .generation = entries[slot].generation,
     };
     if (exp.section_index >= entries[slot].section_count or exp.section_index >= entries[slot].sections.len) return null;
@@ -759,15 +740,6 @@ pub fn resolveExportInfo(module_name: []const u8, symbol: []const u8, min_versio
 
 fn resolveImport(pending: []PendingLibrary, importer_index: usize, import: ImportRecord) ?ResolvedImport {
     const importer_name = pending[importer_index].module_name[0..pending[importer_index].module_name_len];
-    if (nameEq(import.module, "KernelProvider") and !kernelProviderImportAllowed(.r4l, importer_name)) {
-        kernel_provider_policy_errors += 1;
-        k.puts("[MOD] resolver provider policy reject module=");
-        k.puts(import.module);
-        k.puts(" importer=");
-        k.puts(importer_name);
-        k.puts("\r\n");
-        return null;
-    }
     if (findByName(import.module)) |slot| {
         return resolveImportFromEntry(&entries[slot], import, importer_name);
     }
@@ -948,7 +920,6 @@ fn loadR4MFile(source: module_file.FileSource, file_size: usize, header: Header,
         .reloc_import_slot64_count = reloc_stats.import_slot64,
         .resolved_import_count = @intCast(resolved_imports.len),
         .resolver_status = .resolved,
-        .normal_import_target = kind != .kernel_provider,
         .bss_zeroed = bss_zeroed,
         .generation = ACTIVE_BOOT_GENERATION,
         .pinned = kind == .r4l,
@@ -1100,7 +1071,6 @@ fn loadR4M(bytes: []const u8, expected_kind: Kind, fallback_name: []const u8, pa
         .reloc_import_slot64_count = reloc_stats.import_slot64,
         .resolved_import_count = @intCast(resolved_imports.len),
         .resolver_status = .resolved,
-        .normal_import_target = kind != .kernel_provider,
         .bss_zeroed = bss_zeroed,
         .generation = ACTIVE_BOOT_GENERATION,
         .pinned = kind == .r4l,
@@ -1934,7 +1904,7 @@ fn kindFromRaw(raw: u16) ?Kind {
         2 => .r4l,
         3 => .r4d,
         4 => .r4p,
-        5 => .kernel_provider,
+        5 => .platform_api_provider_reserved,
         6 => .kernel_module_reserved,
         else => null,
     };
@@ -1946,7 +1916,7 @@ fn kindName(kind: Kind) []const u8 {
         .r4l => "r4l",
         .r4d => "r4d",
         .r4p => "r4p",
-        .kernel_provider => "kernel_provider",
+        .platform_api_provider_reserved => "platform_api_provider_reserved",
         .kernel_module_reserved => "kernel_module_reserved",
     };
 }
@@ -2082,13 +2052,33 @@ test "Runtime-R4L identity parser fails closed" {
     try testing.expectEqual(@as(?Kind, null), kindFromRaw(7));
 }
 
-test "KernelProvider policy rejects normal and unknown Runtime-R4L importers" {
+test "built-in platform APIs own the six reserved Query providers" {
     const testing = @import("std").testing;
 
-    try testing.expect(kernelProviderImportAllowed(.r4l, "R4SYS"));
-    try testing.expect(kernelProviderImportAllowed(.r4l, "r4dev"));
-    try testing.expect(!kernelProviderImportAllowed(.r4x, "R4SYS"));
-    try testing.expect(!kernelProviderImportAllowed(.r4d, "R4SYS"));
-    try testing.expect(!kernelProviderImportAllowed(.r4p, "R4SYS"));
-    try testing.expect(!kernelProviderImportAllowed(.r4l, "EXAMPLE"));
+    try testing.expect(module_r4m.isLoadableContainerKind(.r4x));
+    try testing.expect(module_r4m.isLoadableContainerKind(.r4l));
+    try testing.expect(module_r4m.isLoadableContainerKind(.r4d));
+    try testing.expect(module_r4m.isLoadableContainerKind(.r4p));
+    try testing.expect(!module_r4m.isLoadableContainerKind(.platform_api_provider_reserved));
+    try testing.expect(!module_r4m.isLoadableContainerKind(.kernel_module_reserved));
+
+    init();
+    try testing.expectEqual(r4x_api.r4_platform_apis.len, countUsed());
+    for (r4x_api.r4_platform_apis) |meta| {
+        const slot = findByName(meta.name) orelse return error.MissingPlatformApi;
+        const entry = entries[slot];
+        try testing.expectEqual(Kind.platform_api_provider_reserved, entry.kind);
+        try testing.expectEqual(State.builtin, entry.state);
+        const info = exportInfo(slot, "Query", 1) orelse return error.MissingPlatformQuery;
+        try testing.expectEqual(r4x_api.r4l_query_struct_size, info.available_size);
+        const query: *const r4x_api.R4LQuery = @ptrFromInt(info.address);
+        try testing.expectEqual(r4x_api.r4l_abi_magic, query.magic);
+        try testing.expectEqual(r4x_api.r4l_abi_version, query.abi_version);
+        try testing.expectEqual(@intFromEnum(meta.group), query.group);
+        try testing.expectEqual(@as(u64, 0), query.kernel_bridge);
+        try testing.expectEqual(@as(u64, 0), query.reserved);
+        try testing.expectEqual(@as(?u32, @intFromEnum(meta.group)), platformApiGroupId(meta.name));
+    }
+    try testing.expectEqual(@as(?u32, 6), platformApiGroupId("r4dev"));
+    try testing.expectEqual(@as(?u32, null), platformApiGroupId("R4STD"));
 }

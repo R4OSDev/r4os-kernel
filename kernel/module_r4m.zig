@@ -15,7 +15,7 @@ pub const Kind = enum(u16) {
     r4l = 2,
     r4d = 3,
     r4p = 4,
-    kernel_provider = 5,
+    platform_api_provider_reserved = 5,
     kernel_module_reserved = 6,
 };
 
@@ -226,9 +226,16 @@ pub fn kindFromRaw(raw: u16) ?Kind {
         2 => .r4l,
         3 => .r4d,
         4 => .r4p,
-        5 => .kernel_provider,
+        5 => .platform_api_provider_reserved,
         6 => .kernel_module_reserved,
         else => null,
+    };
+}
+
+pub fn isLoadableContainerKind(kind: Kind) bool {
+    return switch (kind) {
+        .r4x, .r4l, .r4d, .r4p => true,
+        .platform_api_provider_reserved, .kernel_module_reserved => false,
     };
 }
 
@@ -380,6 +387,7 @@ fn validateHeader(header: Header, file_size: usize, expected_kind: ?Kind, limits
     if (header.arch != ARCH_X86_64) return reject(verbose, name, "arch");
     if (header.header_size != HEADER_SIZE) return reject(verbose, name, "header-size");
     const kind = header.kind() orelse return reject(verbose, name, "kind");
+    if (!isLoadableContainerKind(kind)) return reject(verbose, name, "reserved-kind");
     if (expected_kind) |expected| {
         if (kind != expected) return reject(verbose, name, "unexpected-kind");
     }

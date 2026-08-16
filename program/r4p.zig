@@ -121,13 +121,6 @@ pub fn loadAll() void {
     k.puts("\r\n");
 }
 
-pub fn loadPreloadLibrary(name: []const u8, bytes: []const u8) bool {
-    ensureInitialized();
-    var path_buf: [MAX_PATH]u8 = .{0} ** MAX_PATH;
-    const path = buildModulePath("PRELOAD:\\", name, &path_buf);
-    return modsys.loadResolvedBytes(bytes, .r4l, name, path) != null;
-}
-
 pub fn loadPreloadModule(name: []const u8, bytes: []const u8) bool {
     ensureInitialized();
     var path_buf: [MAX_PATH]u8 = .{0} ** MAX_PATH;

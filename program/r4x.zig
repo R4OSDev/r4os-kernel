@@ -6591,10 +6591,10 @@ fn buildR4XStartImportsFromRanges(source: module_file.FileSource, file_size: usi
         var module_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
         var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
         const import = readR4MImportFromRanges(source, file_size, header, i, module_buf[0..], symbol_buf[0..]) orelse return false;
-        // Gruppen-IDs gehoeren ausschliesslich zu den sechs
-        // kernelimplementierten Query-Interfaces. Jeder andere Export wird
-        // als benanntes Interface mit group_id=0 transportiert.
-        const platform_group_id = if (stdMemEql(import.symbol, "Query")) platformR4LGroupId(import.module) else null;
+        // Gruppen-IDs gehoeren ausschliesslich zu den sechs fest eingebauten
+        // Plattform-APIs. Jeder Runtime-R4L-Export wird als benanntes
+        // Interface mit group_id=0 transportiert.
+        const platform_group_id = if (stdMemEql(import.symbol, "Query")) modules.platformApiGroupId(import.module) else null;
         const group_id = platform_group_id orelse 0;
         var seed = R4XStartImportSeed{
             .group_id = group_id,
@@ -6640,16 +6640,6 @@ fn r4xstartGroupInterface(group_id: u32) ?u64 {
         R4L_GROUP_R4DEV => @intFromPtr(&r4xstart_r4dev_table),
         else => null,
     };
-}
-
-fn platformR4LGroupId(name: []const u8) ?u32 {
-    if (stdMemEql(name, "R4SYS")) return R4L_GROUP_R4SYS;
-    if (stdMemEql(name, "R4DESK")) return R4L_GROUP_R4DESK;
-    if (stdMemEql(name, "R4DRAW")) return R4L_GROUP_R4DRAW;
-    if (stdMemEql(name, "R4NET")) return R4L_GROUP_R4NET;
-    if (stdMemEql(name, "R4AUDIO")) return R4L_GROUP_R4AUDIO;
-    if (stdMemEql(name, "R4DEV")) return R4L_GROUP_R4DEV;
-    return null;
 }
 
 fn copyR4XStartName(src: []const u8, dest: []u8, out_len: *usize) bool {
