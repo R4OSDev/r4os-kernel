@@ -4,6 +4,7 @@ const phys = @import("../memory/phys.zig");
 const timer = @import("../kernel/timer.zig");
 const protocol_api = @import("../kernel/protocol_api.zig");
 const r4p = @import("../program/r4p.zig");
+const r4x_api = @import("../program/r4x_api.zig");
 const r4p_contract = @import("../net/r4p_contract.zig");
 const k = @import("../kernel/log.zig");
 
@@ -381,6 +382,18 @@ pub fn writeStream(id: u32, ptr: [*]const u8, byte_count: u32) i32 {
     if (byte_count == 0) return 0;
     const max_write = if (byte_count < s.ring.len) @as(usize, @intCast(byte_count)) else s.ring.len;
     const max_write_u32: u32 = @intCast(max_write);
+    const backend_start = timer.tickCount();
+    if (writeActivePcm(ptr[0..max_write], s.rate, s.channels, s.format)) |result| {
+        backend_write_calls +%= 1;
+        recordTickStat(&backend_write_total_ticks, &backend_write_max_ticks, &backend_write_last_ticks, backend_start);
+        if (result == 0) {
+            total_backend_ok += 1;
+        } else {
+            if (result != r4x_api.service_api_result_busy) total_backend_fail += 1;
+            recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
+            return result;
+        }
+    }
     if (byte_count > max_write_u32) {
         stream_write_truncations +%= 1;
         stream_dropped_bytes +%= @as(u64, byte_count - max_write_u32);
@@ -394,16 +407,6 @@ pub fn writeStream(id: u32, ptr: [*]const u8, byte_count: u32) i32 {
     if (s.available > stream_available_high_water) stream_available_high_water = @intCast(s.available);
     s.total_written += max_write;
     total_stream_writes += 1;
-    const backend_start = timer.tickCount();
-    if (writeActivePcm(ptr[0..max_write], s.rate, s.channels, s.format)) |ok| {
-        backend_write_calls +%= 1;
-        recordTickStat(&backend_write_total_ticks, &backend_write_max_ticks, &backend_write_last_ticks, backend_start);
-        if (ok) {
-            total_backend_ok += 1;
-        } else {
-            total_backend_fail += 1;
-        }
-    }
     mixAvailable(s);
     recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
     return @intCast(max_write);
@@ -508,8 +511,8 @@ pub fn sidPlayFrame(handle: u32, play_addr: u16, frame_hz: u16) i32 {
         sid_pcm_writes += 1;
         engine.renders +%= 1;
         const len: usize = @intCast(rendered);
-        const ok = writeActivePcm(block[0..len], DEFAULT_RATE, DEFAULT_CHANNELS, FORMAT_S16LE) orelse return 0;
-        if (ok) {
+        const result = writeActivePcm(block[0..len], DEFAULT_RATE, DEFAULT_CHANNELS, FORMAT_S16LE) orelse return 0;
+        if (result == 0) {
             sid_pcm_ok += 1;
             total_backend_ok += 1;
         } else {
@@ -1313,11 +1316,11 @@ fn setActiveAudioBackend(slot: usize) void {
     bootlog.puts(" [OK]\r\n");
 }
 
-fn writeActivePcm(data: []const u8, rate: u32, channels: u16, format: u16) ?bool {
+fn writeActivePcm(data: []const u8, rate: u32, channels: u16, format: u16) ?i32 {
     const slot = active_audio_slot orelse return null;
     const backend = &audio_backends[slot];
-    if (backend.write_pcm) |write_pcm| return write_pcm(data, rate, channels, format);
-    if (backend.write_pcm_ctx) |write_pcm_ctx| return write_pcm_ctx(backend.context, data.ptr, @intCast(data.len), rate, channels, format) == 0;
+    if (backend.write_pcm) |write_pcm| return if (write_pcm(data, rate, channels, format)) 0 else -1;
+    if (backend.write_pcm_ctx) |write_pcm_ctx| return write_pcm_ctx(backend.context, data.ptr, @intCast(data.len), rate, channels, format);
     return null;
 }
 
