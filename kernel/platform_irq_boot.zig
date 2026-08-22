@@ -65,6 +65,7 @@ pub fn init() bool {
     current.hpet_status = hpet.initFromAcpi(acpi_info);
     current.hpet_visible = current.hpet_status.available;
     current.hpet_initialized = current.hpet_status.mapped and current.hpet_status.enabled;
+    time_core.attachHpetClock();
 
     if (ioapic.activateLegacyRoutes()) {
         pic.maskAll();
@@ -212,10 +213,10 @@ fn validateActiveTimerTicks(min_ticks: u64) TimerValidation {
     if (!hpet_status.enabled or hpet_status.frequency_hz == 0) return .{};
 
     const start_hpet = hpet.readMainCounter();
-    const deadline = start_hpet + hpet_status.frequency_hz / 20;
+    const duration = hpet_status.frequency_hz / 20;
     const start_ticks = timer.tickCount();
     interrupts.enable();
-    while (hpet.readMainCounter() < deadline and timer.tickCount() < start_ticks + min_ticks) {
+    while (hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter()) < duration and timer.tickCount() < start_ticks + min_ticks) {
         asm volatile ("pause");
     }
     interrupts.disable();

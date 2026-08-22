@@ -7,6 +7,7 @@ const gdt = @import("../arch/x86_64/gdt.zig");
 const idt = @import("../arch/x86_64/idt.zig");
 const fpu = @import("../arch/x86_64/fpu.zig");
 const cpu = @import("../platform/cpu.zig");
+const monotonic = @import("../platform/monotonic.zig");
 const fatal = @import("fatal.zig");
 const pic = @import("../arch/x86_64/pic.zig");
 
@@ -19,6 +20,7 @@ pub fn init() void {
     idt.init();
     pic.init();
     _ = cpu.detect();
+    monotonic.configureCpuClock();
     if (!fpu.init()) fatal.kernelFatal(.cpu, "FPU/SSE task-state init failed");
 
     initialized = true;

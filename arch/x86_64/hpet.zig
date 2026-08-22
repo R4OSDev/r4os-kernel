@@ -1,5 +1,6 @@
 const acpi = @import("../../platform/acpi.zig");
 const bootlog = @import("../../kernel/bootlog.zig");
+const monotonic_math = @import("../../platform/monotonic_math.zig");
 const k = @import("../../kernel/log.zig");
 const paging = @import("../../memory/paging.zig");
 const phys = @import("../../memory/phys.zig");
@@ -53,6 +54,7 @@ pub const Status = struct {
 
 var current: Status = .{};
 var base_virt: u64 = 0;
+var counter_extension_state: u64 = 0;
 
 pub fn initFromAcpi(info: acpi.Info) Status {
     current = .{
@@ -98,6 +100,7 @@ pub fn initFromAcpi(info: acpi.Info) Status {
         current.timer0_64bit_capable = (timer0 & TIMER_64BIT_CAPABLE) != 0;
     }
     current.counter = readMainCounter();
+    @atomicStore(u64, &counter_extension_state, current.counter & 0xFFFF_FFFF, .release);
     current.reason = "MMIO mapped, main counter enabled, interrupts disabled";
     logStatus();
     return current;
@@ -124,6 +127,28 @@ pub fn readMainCounter() u64 {
     return value & 0xFFFF_FFFF;
 }
 
+pub fn readExtendedMainCounter() u64 {
+    if (!current.mapped) return 0;
+    if (current.counter_64bit) return readMainCounter();
+
+    var state = @atomicLoad(u64, &counter_extension_state, .acquire);
+    while (true) {
+        const low: u32 = @truncate(readMainCounter());
+        const next = monotonic_math.extendCounter32(state, low);
+        if (next == state) return state;
+        if (@cmpxchgWeak(u64, &counter_extension_state, state, next, .acq_rel, .acquire)) |actual| {
+            state = actual;
+        } else {
+            return next;
+        }
+    }
+}
+
+pub fn elapsedMainCounter(start: u64, end: u64) u64 {
+    if (current.counter_64bit) return end -% start;
+    return (end -% start) & 0xFFFF_FFFF;
+}
+
 pub fn startLegacyIrqTimer(requested_hz: u32) bool {
     if (!current.mapped or current.frequency_hz == 0 or current.comparator_count == 0) {
         current.reason = "HPET timer unavailable";
@@ -145,19 +170,18 @@ pub fn startLegacyIrqTimer(requested_hz: u32) bool {
     current.timer_hz = hz;
     current.timer0_period = period;
 
-    var config = read64(REG_CONFIG);
-    config &= ~CONFIG_ENABLE;
-    write64(REG_CONFIG, config);
-    write64(REG_MAIN_COUNTER, 0);
-
     var timer_config = read64(REG_TIMER0_CONFIG);
     timer_config &= ~(TIMER_INT_TYPE_LEVEL | TIMER_INT_ENABLE | TIMER_PERIODIC | TIMER_32BIT_MODE | TIMER_ROUTE_MASK | TIMER_FSB_ENABLE);
-    timer_config |= TIMER_PERIODIC | TIMER_INT_ENABLE | TIMER_SET_ACCUMULATOR;
+    timer_config |= TIMER_PERIODIC | TIMER_SET_ACCUMULATOR;
     write64(REG_TIMER0_CONFIG, timer_config);
+    const counter_mask: u64 = if (current.timer0_64bit_capable) ~@as(u64, 0) else 0xFFFF_FFFF;
+    const first_deadline = (readMainCounter() +% period) & counter_mask;
+    write64(REG_TIMER0_COMPARATOR, first_deadline);
     write64(REG_TIMER0_COMPARATOR, period);
-    write64(REG_TIMER0_COMPARATOR, period);
+    timer_config |= TIMER_INT_ENABLE;
+    write64(REG_TIMER0_CONFIG, timer_config);
 
-    config = (read64(REG_CONFIG) | CONFIG_ENABLE | CONFIG_LEGACY_REPLACEMENT);
+    const config = read64(REG_CONFIG) | CONFIG_ENABLE | CONFIG_LEGACY_REPLACEMENT;
     write64(REG_CONFIG, config);
 
     current.config = read64(REG_CONFIG);

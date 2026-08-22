@@ -3,10 +3,22 @@ const rtc = @import("../arch/x86_64/rtc.zig");
 const acpi = @import("acpi.zig");
 const bootlog = @import("../kernel/bootlog.zig");
 const timer = @import("../kernel/timer.zig");
+const monotonic = @import("monotonic.zig");
 
 pub const WallClock = rtc.DateTime;
 
 pub const State = r4x_api.TimeState;
+pub const MonotonicSnapshot = monotonic.Snapshot;
+pub const MonotonicStamp = monotonic.Stamp;
+
+pub const monotonic_flag_valid = monotonic.flag_valid;
+pub const monotonic_flag_continuous = monotonic.flag_continuous;
+pub const monotonic_flag_high_resolution = monotonic.flag_high_resolution;
+pub const monotonic_flag_irq_independent = monotonic.flag_irq_independent;
+pub const monotonic_flag_invariant = monotonic.flag_invariant;
+pub const monotonic_flag_early_origin = monotonic.flag_early_origin;
+pub const monotonic_flag_calibrated = monotonic.flag_calibrated;
+pub const monotonic_flag_degraded = monotonic.flag_degraded;
 
 pub fn wallClock() WallClock {
     return rtc.readDateTime(acpi.info().fadt_century);
@@ -66,6 +78,34 @@ pub fn monotonicBackendId() u32 {
     };
 }
 
+pub fn attachHpetClock() void {
+    monotonic.attachHpetClock();
+}
+
+pub fn monotonicSnapshot() MonotonicSnapshot {
+    return monotonic.snapshot();
+}
+
+pub fn monotonicNanoseconds() ?u64 {
+    return monotonic.nowNanoseconds();
+}
+
+pub fn monotonicCapture() MonotonicStamp {
+    return monotonic.capture();
+}
+
+pub fn monotonicResolve(stamp: MonotonicStamp) ?u64 {
+    return monotonic.resolve(stamp);
+}
+
+pub fn monotonicElapsed(start: MonotonicStamp, end: MonotonicStamp) ?u64 {
+    return monotonic.elapsedNanoseconds(start, end);
+}
+
+pub fn monotonicElapsedSince(start: MonotonicStamp) ?u64 {
+    return monotonic.elapsedSince(start);
+}
+
 pub fn logStatus() void {
     const now = wallClock();
     bootlog.puts("[TIME] rtc=");
@@ -79,6 +119,14 @@ pub fn logStatus() void {
         .fallback => "fallback",
     });
     bootlog.puts(" monotonic=");
+    const clock = monotonic.snapshot();
+    bootlog.puts(switch (clock.source) {
+        .unavailable => "unavailable",
+        .tsc => "TSC",
+        .hpet => "HPET main counter",
+        .periodic_event => timer.backendName(),
+    });
+    bootlog.puts(" event=");
     bootlog.puts(timer.backendName());
     bootlog.puts("\r\n");
 }

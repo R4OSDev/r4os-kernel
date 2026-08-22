@@ -17,6 +17,11 @@ On Linux or macOS:
 `Settings.R4S` maps the Contract, DevKit, and artifact paths. The kernel
 build is ReleaseSafe and does not enable SIMD.
 
+The platform exposes a continuous nanosecond clock independently from the
+periodic PIT, HPET, or LAPIC scheduler event source. Exact invariant-TSC and
+free-running HPET sources are preferred; hardware without either capability
+uses an explicitly degraded periodic fallback.
+
 Detailed German migration notes are preserved in
 `DOCUMENTATION.de.txt`.
 

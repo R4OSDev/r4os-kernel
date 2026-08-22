@@ -3,6 +3,7 @@ const ioapic = @import("../arch/x86_64/ioapic.zig");
 const pic = @import("../arch/x86_64/pic.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const timer = @import("timer.zig");
+const time_core = @import("../platform/time.zig");
 const k = @import("log.zig");
 
 pub const MAX_IRQS: usize = 32;
@@ -33,6 +34,21 @@ pub const IrqStats = extern struct {
     last_owner: u32 = 0,
 };
 
+pub const IrqTimingStats = struct {
+    dispatch_samples: u64 = 0,
+    handler_samples: u64 = 0,
+    observer_reads: u64 = 0,
+    dispatch_total_ns: u64 = 0,
+    dispatch_max_ns: u64 = 0,
+    dispatch_last_ns: u64 = 0,
+    handler_total_ns: u64 = 0,
+    handler_max_ns: u64 = 0,
+    handler_last_ns: u64 = 0,
+    clock_generation: u32 = 0,
+    unavailable_samples: u32 = 0,
+    mixed_generation: bool = false,
+};
+
 const Entry = struct {
     active: bool = false,
     shared: bool = false,
@@ -43,6 +59,7 @@ const Entry = struct {
 
 var entries: [MAX_IRQS][MAX_HANDLERS_PER_IRQ]Entry = .{.{Entry{}} ** MAX_HANDLERS_PER_IRQ} ** MAX_IRQS;
 var stats_table: [MAX_IRQS]IrqStats = initStats();
+var timing_table: [MAX_IRQS]IrqTimingStats = .{IrqTimingStats{}} ** MAX_IRQS;
 var dispatch_depth: u32 = 0;
 var active_owner: u32 = 0;
 
@@ -169,11 +186,20 @@ pub fn stats(irq: u8, out: *IrqStats) i32 {
     return 0;
 }
 
+pub fn timingStats(irq: u8, out: *IrqTimingStats) i32 {
+    if (irq >= MAX_IRQS) return -1;
+    out.* = timing_table[@intCast(irq)];
+    return 0;
+}
+
 pub fn dispatch(irq: u8) void {
     if (irq >= MAX_IRQS) return;
     const irq_index: usize = @intCast(irq);
     var invoked = false;
     var last_result: u32 = 0;
+    const measure_dispatch = stats_table[irq_index].registered != 0;
+    const dispatch_start = if (measure_dispatch) time_core.monotonicCapture() else time_core.MonotonicStamp{};
+    if (measure_dispatch) timing_table[irq_index].observer_reads +|= 1;
 
     dispatch_depth +|= 1;
     defer dispatch_depth -= 1;
@@ -190,6 +216,8 @@ pub fn dispatch(irq: u8) void {
             invoked = true;
             active_owner = entry.owner;
             const start = timer.tickCount();
+            const timing_start = time_core.monotonicCapture();
+            timing_table[irq_index].observer_reads +|= 1;
             // R4D modules are built with the normal SIMD-capable module
             // target.  Unlike a task, an asynchronous IRQ handler has no FPU
             // context of its own, so preserve the interrupted R4X state and
@@ -197,6 +225,8 @@ pub fn dispatch(irq: u8) void {
             const fpu_guard = scheduler.enterExternalIrqFpuGuard();
             last_result = handler(irq, entry.context);
             scheduler.leaveExternalIrqFpuGuard(fpu_guard);
+            const timing_end = time_core.monotonicCapture();
+            timing_table[irq_index].observer_reads +|= 1;
             const elapsed = elapsedTicks(start, timer.tickCount());
             stats_table[irq_index].handler_total_ticks +%= elapsed;
             stats_table[irq_index].handler_last_ticks = elapsed;
@@ -206,6 +236,7 @@ pub fn dispatch(irq: u8) void {
             if ((last_result & IRQ_RESULT_HANDLED) != 0) {
                 stats_table[irq_index].handled_count +%= 1;
             }
+            recordHandlerTiming(irq_index, timing_start, timing_end);
         }
     }
 
@@ -213,6 +244,47 @@ pub fn dispatch(irq: u8) void {
         stats_table[irq_index].dispatch_count +%= 1;
         stats_table[irq_index].last_result = last_result;
     }
+    if (measure_dispatch) {
+        const dispatch_end = time_core.monotonicCapture();
+        timing_table[irq_index].observer_reads +|= 1;
+        recordDispatchTiming(irq_index, dispatch_start, dispatch_end);
+    }
+}
+
+fn recordHandlerTiming(index: usize, start: time_core.MonotonicStamp, end: time_core.MonotonicStamp) void {
+    const elapsed = measuredElapsed(index, start, end) orelse return;
+    var timing = &timing_table[index];
+    timing.handler_samples +|= 1;
+    timing.handler_total_ns +|= elapsed;
+    timing.handler_last_ns = elapsed;
+    if (elapsed > timing.handler_max_ns) timing.handler_max_ns = elapsed;
+}
+
+fn recordDispatchTiming(index: usize, start: time_core.MonotonicStamp, end: time_core.MonotonicStamp) void {
+    const elapsed = measuredElapsed(index, start, end) orelse return;
+    var timing = &timing_table[index];
+    timing.dispatch_samples +|= 1;
+    timing.dispatch_total_ns +|= elapsed;
+    timing.dispatch_last_ns = elapsed;
+    if (elapsed > timing.dispatch_max_ns) timing.dispatch_max_ns = elapsed;
+}
+
+fn measuredElapsed(index: usize, start: time_core.MonotonicStamp, end: time_core.MonotonicStamp) ?u64 {
+    var timing = &timing_table[index];
+    if (start.generation != end.generation) {
+        timing.mixed_generation = true;
+        timing.unavailable_samples +|= 1;
+        return null;
+    }
+    if (timing.clock_generation == 0) {
+        timing.clock_generation = start.generation;
+    } else if (timing.clock_generation != start.generation) {
+        timing.mixed_generation = true;
+    }
+    return time_core.monotonicElapsed(start, end) orelse {
+        timing.unavailable_samples +|= 1;
+        return null;
+    };
 }
 
 fn elapsedTicks(start: u64, end: u64) u64 {

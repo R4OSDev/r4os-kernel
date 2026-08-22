@@ -332,6 +332,7 @@ var registry_writeback_cache: RegistryWritebackCache = .{};
 pub const RegistryKeyInfo = r4x_api.RegistryKeyInfo;
 
 pub const RegistryValueInfo = r4x_api.RegistryValueInfo;
+pub const MonotonicClockInfo = r4x_api.MonotonicClockInfo;
 
 var path_resolver: ?ResolveTargetFn = null;
 var stream_owner_resolver: ?ResolveStreamOwnerFn = null;
@@ -372,6 +373,42 @@ pub fn timeSecondsSinceMidnight() callconv(.c) u32 {
 
 pub fn timeState(out: *time_core.State) callconv(.c) void {
     out.* = time_core.state();
+}
+
+pub fn monotonicClock(out: *MonotonicClockInfo) callconv(.c) i32 {
+    comptime {
+        if (time_core.monotonic_flag_valid != r4x_api.monotonic_clock_flag_valid or
+            time_core.monotonic_flag_continuous != r4x_api.monotonic_clock_flag_continuous or
+            time_core.monotonic_flag_high_resolution != r4x_api.monotonic_clock_flag_high_resolution or
+            time_core.monotonic_flag_irq_independent != r4x_api.monotonic_clock_flag_irq_independent or
+            time_core.monotonic_flag_invariant != r4x_api.monotonic_clock_flag_invariant or
+            time_core.monotonic_flag_early_origin != r4x_api.monotonic_clock_flag_early_origin or
+            time_core.monotonic_flag_calibrated != r4x_api.monotonic_clock_flag_calibrated or
+            time_core.monotonic_flag_degraded != r4x_api.monotonic_clock_flag_degraded)
+        {
+            @compileError("monotonic clock flag contract drift");
+        }
+    }
+    const clock = time_core.monotonicSnapshot();
+    out.* = .{
+        .flags = clock.flags,
+        .source = @intFromEnum(clock.source),
+        .generation = clock.generation,
+        .event_backend = switch (clock.event_backend) {
+            .pit => 0,
+            .hpet => 1,
+            .lapic => 2,
+        },
+        .instant_ns = clock.instant_ns,
+        .frequency_hz = r4x_api.monotonic_clock_frequency_hz,
+        .resolution_ns = clock.resolution_ns,
+        .source_frequency_hz = clock.source_frequency_hz,
+        .event_frequency_numerator = clock.event.frequency_numerator,
+        .event_frequency_denominator = clock.event.frequency_denominator,
+        .event_requested_hz = clock.event.requested_hz,
+        .event_effective_hz = clock.event.effective_hz,
+    };
+    return if (clock.valid) 1 else 0;
 }
 
 pub fn timeSetState(request: *const time_core.State) callconv(.c) i32 {

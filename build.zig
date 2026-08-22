@@ -170,6 +170,7 @@ pub fn build(b: *std.Build) void {
         "driver/usb/xhci_ring_cycle.zig",
         "kernel/bootscreen_r4b_format.zig",
         "net/config_writer.zig",
+        "platform/monotonic_math.zig",
         "program/gui_alpha8.zig",
         "program/r4x_start.zig",
         "sched/wait_node.zig",

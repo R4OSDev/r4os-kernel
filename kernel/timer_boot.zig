@@ -4,6 +4,7 @@
 // and PIC. Later timer switches to HPET/LAPIC stay in the existing timer core.
 
 const timer = @import("timer.zig");
+const monotonic = @import("../platform/monotonic.zig");
 
 var initialized = false;
 
@@ -11,6 +12,7 @@ pub fn init() void {
     if (initialized) return;
 
     timer.initPit(timer.DEFAULT_HZ);
+    monotonic.attachPeriodicClock();
 
     initialized = true;
 }

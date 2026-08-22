@@ -4,6 +4,7 @@ const boot_perf = @import("boot_perf.zig");
 const crash = @import("crash.zig");
 const crash_screen = @import("crash_screen.zig");
 const timer = @import("timer.zig");
+const monotonic = @import("../platform/monotonic.zig");
 
 const PendingFailure = struct {
     active: bool = false,
@@ -15,6 +16,7 @@ var current_phase: crash.BootPhase = .entry;
 var pending_failure: PendingFailure = .{};
 
 pub fn init() void {
+    monotonic.earlyInit();
     current_phase = .entry;
     pending_failure = .{};
     boot_perf.init();

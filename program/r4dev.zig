@@ -39,11 +39,15 @@ const fpu = @import("../arch/x86_64/fpu.zig");
 const r4p = @import("r4p.zig");
 const driver_work = @import("../kernel/driver_work.zig");
 const kernel_version = @import("../kernel/version.zig");
+const irq_router = @import("../kernel/irq_router.zig");
+const time_core = @import("../platform/time.zig");
 
 pub const name = "R4DEV";
 
 pub const ProgramMemorySummary = r4x_api.ProgramMemorySummary;
 pub const KernelVersion = r4x_api.KernelVersion;
+pub const ProgramBootPhaseClockInfo = r4x_api.ProgramBootPhaseClockInfo;
+pub const ProgramIrqTimingInfo = r4x_api.ProgramIrqTimingInfo;
 
 pub const ProgramMemoryBlockInfo = r4x_api.ProgramMemoryBlockInfo;
 
@@ -1413,10 +1417,21 @@ pub fn displaySummary(out: *DisplaySummary) callconv(.c) i32 {
 }
 
 pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
+    const caller_version = out.version;
+    const caller_size: usize = out.size;
+    const v1_size: usize = @offsetOf(ProgramPerformanceSummary, "monotonic_clock_flags");
+    if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= @sizeOf(ProgramPerformanceSummary))
+        performance_snapshot_version
+    else
+        1;
+    const version_capacity: usize = if (negotiated_version >= 2) @sizeOf(ProgramPerformanceSummary) else v1_size;
+    const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
     const tasks = sched_task.summary();
     const boot = boot_perf.snapshot();
     const loader = loader_perf.snapshot();
+    const monotonic_clock = time_core.monotonicSnapshot();
     const display_stats = display.stats();
     const svc = service_core.performanceSummary();
     const audio = audio_core.performanceSummary();
@@ -1553,9 +1568,9 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     if (sched.preempt_disable_depth != 0) preemption_gate_mask |= performance_preemption_gate_kernel_critical;
     if (!fpu_status.enabled) preemption_gate_mask |= performance_preemption_gate_fpu_state;
 
-    out.* = .{
-        .version = performance_snapshot_version,
-        .size = @sizeOf(ProgramPerformanceSummary),
+    var result: ProgramPerformanceSummary = .{
+        .version = negotiated_version,
+        .size = @intCast(copy_size),
         .flags = flags,
         .missing_flags = performance_missing_fs_latency_histogram |
             performance_missing_service_latency_histogram |
@@ -2210,7 +2225,35 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .fat32_inusemap_clusters = fat32_summary.inusemap_clusters,
         .fat32_inusemap_alloc_hits = fat32_summary.inusemap_alloc_hits,
         .fat32_inusemap_alloc_misses = fat32_summary.inusemap_alloc_misses,
+        .monotonic_clock_flags = monotonic_clock.flags,
+        .monotonic_clock_source = @intFromEnum(monotonic_clock.source),
+        .monotonic_clock_generation = monotonic_clock.generation,
+        .monotonic_event_backend = switch (monotonic_clock.event_backend) {
+            .pit => 0,
+            .hpet => 1,
+            .lapic => 2,
+        },
+        .monotonic_clock_resolution_ns = monotonic_clock.resolution_ns,
+        .monotonic_source_frequency_hz = monotonic_clock.source_frequency_hz,
+        .monotonic_event_frequency_numerator = monotonic_clock.event.frequency_numerator,
+        .monotonic_event_frequency_denominator = monotonic_clock.event.frequency_denominator,
+        .monotonic_event_requested_hz = monotonic_clock.event.requested_hz,
+        .monotonic_event_effective_hz = monotonic_clock.event.effective_hz,
+        .boot_timing_valid = if (boot.timing_valid) 1 else 0,
+        .boot_timing_unavailable_spans = boot.timing_unavailable_spans,
+        .boot_timing_dropped_spans = boot.timing_dropped_spans,
+        .loader_timing_valid_spans = loader.timing_valid_spans,
+        .loader_timing_unavailable_spans = loader.timing_unavailable_spans,
+        .boot_total_ns = boot.total_ns,
+        .boot_now_ns = boot.now_ns,
+        .loader_total_ns = loader.loader_total_ns,
+        .loader_r4p_runtime_total_ns = loader.r4p_runtime_total_ns,
+        .loader_service_boot_ns = loader.service_boot_ns,
+        .loader_config_load_ns = loader.config_load_ns,
     };
+    const destination: [*]u8 = @ptrCast(out);
+    const source = std.mem.asBytes(&result);
+    @memcpy(destination[0..copy_size], source[0..copy_size]);
     return 1;
 }
 
@@ -2351,6 +2394,72 @@ pub fn performanceBootPhase(index: u32, out: *ProgramBootPhasePerformanceInfo) c
         .transitions = phase.transitions,
     };
     copyFixedZ(out.name[0..], bootPhaseName(phase.phase));
+    return 1;
+}
+
+pub fn performanceBootPhaseClock(index: u32, out: *ProgramBootPhaseClockInfo) callconv(.c) i32 {
+    const phase = boot_perf.phaseAt(index) orelse {
+        out.* = .{};
+        return 0;
+    };
+    const clock = time_core.monotonicSnapshot();
+    out.* = .{
+        .index = index,
+        .phase = @intFromEnum(phase.phase),
+        .clock_flags = if (phase.timing_valid)
+            clock.flags
+        else
+            clock.flags & ~r4x_api.monotonic_clock_flag_valid,
+        .clock_source = @intFromEnum(clock.source),
+        .clock_generation = clock.generation,
+        .transitions = phase.transitions,
+        .first_ns = phase.first_ns,
+        .last_ns = phase.last_ns,
+        .total_ns = phase.total_ns,
+        .unavailable_spans = phase.timing_unavailable_spans,
+    };
+    copyFixedZ(out.name[0..], bootPhaseName(phase.phase));
+    return 1;
+}
+
+pub fn performanceIrqTiming(irq: u32, out: *ProgramIrqTimingInfo) callconv(.c) i32 {
+    if (irq >= irq_router.MAX_IRQS) {
+        out.* = .{};
+        return 0;
+    }
+    var legacy: irq_router.IrqStats = .{};
+    var timing: irq_router.IrqTimingStats = .{};
+    _ = irq_router.stats(@intCast(irq), &legacy);
+    _ = irq_router.timingStats(@intCast(irq), &timing);
+    const clock = time_core.monotonicSnapshot();
+    var coverage = r4x_api.performance_irq_coverage_dispatch |
+        r4x_api.performance_irq_coverage_external_handler |
+        r4x_api.performance_irq_coverage_delivery_unavailable;
+    if ((clock.flags & r4x_api.monotonic_clock_flag_irq_independent) != 0)
+        coverage |= r4x_api.performance_irq_coverage_irq_safe_clock;
+    if (timing.mixed_generation)
+        coverage |= r4x_api.performance_irq_coverage_mixed_generation;
+    out.* = .{
+        .irq = @intCast(irq),
+        .registered = legacy.registered,
+        .shared = legacy.shared,
+        .masked = legacy.masked,
+        .coverage_flags = coverage,
+        .clock_flags = clock.flags,
+        .clock_source = @intFromEnum(clock.source),
+        .clock_generation = if (timing.clock_generation != 0) timing.clock_generation else clock.generation,
+        .unavailable_samples = timing.unavailable_samples,
+        .dispatch_samples = timing.dispatch_samples,
+        .handler_samples = timing.handler_samples,
+        .observer_reads = timing.observer_reads,
+        .delivery_samples = 0,
+        .dispatch_total_ns = timing.dispatch_total_ns,
+        .dispatch_max_ns = timing.dispatch_max_ns,
+        .dispatch_last_ns = timing.dispatch_last_ns,
+        .handler_total_ns = timing.handler_total_ns,
+        .handler_max_ns = timing.handler_max_ns,
+        .handler_last_ns = timing.handler_last_ns,
+    };
     return 1;
 }
 

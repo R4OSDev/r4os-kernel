@@ -183,11 +183,10 @@ pub fn initTimerFromHpet(requested_hz: u32) bool {
     writeReg(REG_TIMER_INITIAL_COUNT, 0xFFFF_FFFF);
 
     const start_hpet = hpet.readMainCounter();
-    const deadline = start_hpet + hpet_delta;
-    while (hpet.readMainCounter() < deadline) {
+    while (hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter()) < hpet_delta) {
         asm volatile ("pause");
     }
-    const elapsed_hpet = hpet.readMainCounter() - start_hpet;
+    const elapsed_hpet = hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter());
     const lapic_current = readReg(REG_TIMER_CURRENT_COUNT);
     const elapsed_lapic = 0xFFFF_FFFF -% lapic_current;
     stopTimer();
@@ -232,7 +231,7 @@ pub fn initTimerFromHpet(requested_hz: u32) bool {
 }
 
 pub fn stopTimer() void {
-    if (base_virt != 0) {
+    if (base_virt != 0 or x2_mode) {
         writeReg(REG_TIMER_INITIAL_COUNT, 0);
         writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_MASKED);
         current.timer_lvt = readReg(REG_LVT_TIMER);

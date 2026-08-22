@@ -34,3 +34,20 @@ Distributionsquelle und kennt keine optionale Runtime-Library beim Namen.
 Die fuenf Dateien unter `Support/` sind bytegenaue, kernel-eigene Snapshots
 der beim Referenzbuild eingebundenen, allokationsfreien Kernhelfer. Ihre
 Herkunft und die Migrationsgrenze stehen in `PROVENANCE.txt`.
+
+Monotone Plattformzeit
+----------------------
+
+`platform/monotonic.zig` besitzt die kontinuierliche Nanosekundenepoche. Eine
+exakt ueber CPUID.15 kalibrierte invariante TSC ist der bevorzugte fruehe und
+guenstige Zeitgeber; andernfalls dient der freilaufende HPET-Hauptzaehler als
+IRQ-unabhaengige Quelle. Fehlen beide, bleibt ein ausdruecklich degradiertes
+periodisches Ereignismodell verfuegbar. Der periodische PIT-, HPET- oder
+LAPIC-Takt ist davon getrennt und behaelt ueber Backendwechsel eigene logische
+Tick- und Ereignisepochen samt wirksamer rationaler Rate.
+
+R4SYS stellt Instant und Clockmetadaten additiv bereit. R4DEV liefert darauf
+aufbauende Bootphasen- und IRQ-Zeitaufzeichnungen. Historische Spannen werden
+nur aufgeloest, wenn ihre Quelle spaeter exakt kalibriert werden konnte;
+andernfalls bleiben sie sichtbar als nicht verfuegbar. RTC und CMOS gehoeren
+nicht in diesen monotonen Lesepfad.

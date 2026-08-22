@@ -5238,6 +5238,7 @@ fn configureR4XStartR4SysTable() void {
         .module_resource_read = &r4api.r4sys.moduleResourceRead,
         .program_module_path = &apiProgramModulePath,
         .program_module_running = &r4api.r4sys.programModuleRunning,
+        .monotonic_clock = &r4api.r4sys.monotonicClock,
     });
 }
 
@@ -5690,6 +5691,8 @@ fn configureR4XStartR4DevTable() void {
         .execution_inventory_summary = &r4api.r4dev.executionInventorySummary,
         .program_instance_storage_summary_v2 = &r4api.r4dev.programInstanceStorageSummaryV2,
         .kernel_version = &r4api.r4dev.kernelVersion,
+        .performance_boot_phase_clock = &r4api.r4dev.performanceBootPhaseClock,
+        .performance_irq_timing = &r4api.r4dev.performanceIrqTiming,
     });
 }
 

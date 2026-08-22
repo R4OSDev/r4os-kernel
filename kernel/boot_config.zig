@@ -42,7 +42,7 @@ pub const Config = struct {
 var current: Config = .{};
 
 pub fn load() *const Config {
-    const start_tick = loader_perf.now();
+    const start_tick = loader_perf.beginConfigLoad();
     resetDefaults();
     const volume = vfs.volumeForDrive('C') orelse {
         bootlog.puts("[CONF][WARN] C: FAT32 volume missing, using defaults\r\n");
