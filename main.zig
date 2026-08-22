@@ -138,9 +138,9 @@ export fn kmain() callconv(.c) noreturn {
     fatal.setBootPhase(.usb);
     bootscreen.setPhase(.usb_hid);
     requireBootStep(usb_hid_boot.init(), .usb, "USB-HID boot failed");
-    fatal.setBootPhase(.runtime);
-    bootscreen.setPhase(.runtime);
-    requireBootStep(runtime_boot.initTaskRuntime(), .runtime, "Task runtime boot failed");
+    fatal.setBootPhase(.task_runtime);
+    bootscreen.setPhase(.task_runtime);
+    requireBootStep(runtime_boot.initTaskRuntime(), .task_runtime, "Task runtime boot failed");
     fatal.setBootPhase(.driver_policy);
     bootscreen.setPhase(.driver_policy);
     requireBootStep(driver_policy_boot.init(), .driver_policy, "Driver policy boot failed");

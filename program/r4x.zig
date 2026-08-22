@@ -14,6 +14,7 @@ const module_r4m = @import("../kernel/module_r4m.zig");
 const modules = @import("../kernel/modules.zig");
 const services = @import("../kernel/services.zig");
 const crash = @import("../kernel/crash.zig");
+const boot_perf = @import("../kernel/boot_perf.zig");
 const boot_status = @import("../kernel/boot_status.zig");
 const bootlog = @import("../kernel/bootlog.zig");
 const boot_config = @import("../kernel/boot_config.zig");
@@ -5239,6 +5240,7 @@ fn configureR4XStartR4SysTable() void {
         .program_module_path = &apiProgramModulePath,
         .program_module_running = &r4api.r4sys.programModuleRunning,
         .monotonic_clock = &r4api.r4sys.monotonicClock,
+        .boot_ready = &apiBootReady,
     });
 }
 
@@ -5693,6 +5695,7 @@ fn configureR4XStartR4DevTable() void {
         .kernel_version = &r4api.r4dev.kernelVersion,
         .performance_boot_phase_clock = &r4api.r4dev.performanceBootPhaseClock,
         .performance_irq_timing = &r4api.r4dev.performanceIrqTiming,
+        .performance_boot_summary = &r4api.r4dev.performanceBootSummary,
     });
 }
 
@@ -5711,6 +5714,10 @@ pub fn runShellPath(d: *drive.Drive, path: []const u8, args: []const u8, working
 pub fn runShellPathWithHost(d: *drive.Drive, path: []const u8, args: []const u8, working_drive: *drive.Drive, host: ConsoleHostKind) RunResult {
     const file = resolveProgramFile(d, path) orelse return .not_found;
     return runProgramFile(file, .shell, .auto, args, working_drive, host, .{});
+}
+
+pub fn activeShellInstanceId() u32 {
+    return shell_instance_id orelse 0;
 }
 
 // 0.56.3: Der fruehere program_spawn_lock um das komplette runProgramFile
@@ -13074,11 +13081,14 @@ fn commitProgramExit(handle: ProgramProcessHandle, exit_code: i32, requested_rea
         foreground_instance_id = null;
         foreground_instance_generation = 0;
     }
-    if (shell_instance_id != null and shell_instance_id.? == handle.instance_id and shell_instance_generation == handle.generation) {
+    const boot_shell_exited = shell_instance_id != null and shell_instance_id.? == handle.instance_id and shell_instance_generation == handle.generation;
+    if (boot_shell_exited) {
         shell_instance_id = null;
         shell_instance_generation = 0;
     }
     unlockProgramRegistry();
+
+    if (boot_shell_exited) boot_perf.failShellExited(handle.instance_id);
 
     orphanOwnedProgramCompletions(handle);
     terminateProgramThreadsForHandle(handle, -9, scheduler.currentId());
@@ -13669,6 +13679,21 @@ fn apiProgramModulePath(out_ptr: [*]u8, out_len: u32) callconv(.c) i32 {
     if (len > out_len) return -3;
     @memcpy(out_ptr[0..len], runtime.module_path[0..len]);
     return @intCast(len);
+}
+
+fn apiBootReady() callconv(.c) i32 {
+    comptime {
+        if (boot_perf.ready_result_completed != r4x_api.boot_ready_result_completed or
+            boot_perf.ready_result_already_completed != r4x_api.boot_ready_result_already_completed or
+            boot_perf.ready_error_not_expected_shell != r4x_api.boot_ready_error_not_boot_shell or
+            boot_perf.ready_error_boot_failed != r4x_api.boot_ready_error_boot_failed)
+        {
+            @compileError("boot readiness result contract drift");
+        }
+    }
+    const instance = currentInstance() orelse return boot_perf.ready_error_not_expected_shell;
+    if (instance.role != .shell) return boot_perf.ready_error_not_expected_shell;
+    return boot_perf.completeReady(instance.id);
 }
 
 fn currentInstance() ?*ProgramInstance {

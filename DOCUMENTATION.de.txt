@@ -51,3 +51,20 @@ aufbauende Bootphasen- und IRQ-Zeitaufzeichnungen. Historische Spannen werden
 nur aufgeloest, wenn ihre Quelle spaeter exakt kalibriert werden konnte;
 andernfalls bleiben sie sichtbar als nicht verfuegbar. RTC und CMOS gehoeren
 nicht in diesen monotonen Lesepfad.
+
+Abgeschlossenes Bootmessfenster
+-------------------------------
+
+`kernel/boot_perf.zig` bleibt bis zur tatsaechlichen Shellbereitschaft im
+Zustand `running`. Der Launcher bindet genau die konfigurierte oder als
+Fallback gestartete Shellinstanz; nur diese darf ueber R4SYS `boot_ready`
+ihren ersten nutzbaren Desktopframe beziehungsweise Prompt melden. Der erste
+gueltige Aufruf schliesst die aktuelle Shellphase und friert Endpunkt,
+Gesamtdauer, Phasenspannen und Clockmetadaten gemeinsam ein. Wiederholungen
+derselben Shell sind idempotent. Synchrone Launchfehler, Fallbackauswahl,
+Fatalfehler und ein Shell-Exit vor Readiness bleiben unterscheidbar.
+
+R4DEV `performance_boot_summary` liest dafuer nur den kleinen festen
+Bootdatensatz; breite Subsystem-Summaries oder aktive Diagnoseprobes gehoeren
+nicht in diesen Pfad. Die spaeten Phasen laufen einmalig in der Reihenfolge
+`task_runtime`, `driver_policy`, `runtime`, `shell`.

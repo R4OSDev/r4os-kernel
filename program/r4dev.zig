@@ -47,6 +47,7 @@ pub const name = "R4DEV";
 pub const ProgramMemorySummary = r4x_api.ProgramMemorySummary;
 pub const KernelVersion = r4x_api.KernelVersion;
 pub const ProgramBootPhaseClockInfo = r4x_api.ProgramBootPhaseClockInfo;
+pub const ProgramBootPerformanceInfo = r4x_api.ProgramBootPerformanceInfo;
 pub const ProgramIrqTimingInfo = r4x_api.ProgramIrqTimingInfo;
 
 pub const ProgramMemoryBlockInfo = r4x_api.ProgramMemoryBlockInfo;
@@ -2402,16 +2403,16 @@ pub fn performanceBootPhaseClock(index: u32, out: *ProgramBootPhaseClockInfo) ca
         out.* = .{};
         return 0;
     };
-    const clock = time_core.monotonicSnapshot();
+    const boot = boot_perf.snapshot();
     out.* = .{
         .index = index,
         .phase = @intFromEnum(phase.phase),
         .clock_flags = if (phase.timing_valid)
-            clock.flags
+            boot.clock_flags
         else
-            clock.flags & ~r4x_api.monotonic_clock_flag_valid,
-        .clock_source = @intFromEnum(clock.source),
-        .clock_generation = clock.generation,
+            boot.clock_flags & ~r4x_api.monotonic_clock_flag_valid,
+        .clock_source = boot.clock_source,
+        .clock_generation = boot.clock_generation,
         .transitions = phase.transitions,
         .first_ns = phase.first_ns,
         .last_ns = phase.last_ns,
@@ -2420,6 +2421,64 @@ pub fn performanceBootPhaseClock(index: u32, out: *ProgramBootPhaseClockInfo) ca
     };
     copyFixedZ(out.name[0..], bootPhaseName(phase.phase));
     return 1;
+}
+
+pub fn performanceBootSummary(out: *ProgramBootPerformanceInfo) callconv(.c) i32 {
+    comptime {
+        if (@intFromEnum(boot_perf.CompletionState.uninitialized) != r4x_api.boot_performance_state_uninitialized or
+            @intFromEnum(boot_perf.CompletionState.running) != r4x_api.boot_performance_state_running or
+            @intFromEnum(boot_perf.CompletionState.ready) != r4x_api.boot_performance_state_ready or
+            @intFromEnum(boot_perf.CompletionState.fallback_ready) != r4x_api.boot_performance_state_fallback_ready or
+            @intFromEnum(boot_perf.CompletionState.failed) != r4x_api.boot_performance_state_failed or
+            @intFromEnum(boot_perf.CompletionReason.none) != r4x_api.boot_completion_reason_none or
+            @intFromEnum(boot_perf.CompletionReason.configured_shell_ready) != r4x_api.boot_completion_reason_configured_shell_ready or
+            @intFromEnum(boot_perf.CompletionReason.terminal_fallback_ready) != r4x_api.boot_completion_reason_terminal_fallback_ready or
+            @intFromEnum(boot_perf.CompletionReason.recovery_fallback_ready) != r4x_api.boot_completion_reason_recovery_fallback_ready or
+            @intFromEnum(boot_perf.CompletionReason.no_shell) != r4x_api.boot_completion_reason_no_shell or
+            @intFromEnum(boot_perf.CompletionReason.fatal_error) != r4x_api.boot_completion_reason_fatal_error or
+            @intFromEnum(boot_perf.CompletionReason.shell_exited_before_ready) != r4x_api.boot_completion_reason_shell_exited_before_ready)
+        {
+            @compileError("boot performance state contract drift");
+        }
+    }
+    const boot = boot_perf.snapshot();
+    const terminal = boot.state == .ready or boot.state == .fallback_ready or boot.state == .failed;
+    const ready = boot.state == .ready or boot.state == .fallback_ready;
+    var flags: u32 = 0;
+    if (boot.initialized) flags |= r4x_api.boot_performance_flag_initialized;
+    if (terminal) flags |= r4x_api.boot_performance_flag_completed | r4x_api.boot_performance_flag_frozen;
+    if (ready) flags |= r4x_api.boot_performance_flag_ready;
+    if (boot.state == .fallback_ready) flags |= r4x_api.boot_performance_flag_fallback;
+    if (boot.state == .failed) flags |= r4x_api.boot_performance_flag_failed;
+    if (boot.timing_valid) flags |= r4x_api.boot_performance_flag_timing_valid;
+    out.* = .{
+        .version = r4x_api.boot_performance_version,
+        .size = r4x_api.boot_performance_size,
+        .state = @intFromEnum(boot.state),
+        .completion_reason = @intFromEnum(boot.completion_reason),
+        .flags = flags,
+        .current_phase = @intFromEnum(boot.current_phase),
+        .phase_count = boot.phase_count,
+        .timing_span_count = boot.timing_span_count,
+        .timing_unavailable_spans = boot.timing_unavailable_spans,
+        .timing_dropped_spans = boot.timing_dropped_spans,
+        .clock_flags = boot.clock_flags,
+        .clock_source = boot.clock_source,
+        .clock_generation = boot.clock_generation,
+        .configured_attempts = boot.configured_attempts,
+        .fallback_attempts = boot.fallback_attempts,
+        .launch_failures = boot.launch_failures,
+        .shell_instance_id = boot.shell_instance_id,
+        .boot_start_tick = boot.boot_start_tick,
+        .boot_end_tick = boot.now_tick,
+        .total_ticks = boot.total_ticks,
+        .boot_start_ns = if (boot.timing_valid and boot.now_ns >= boot.total_ns) boot.now_ns - boot.total_ns else 0,
+        .boot_end_ns = boot.now_ns,
+        .total_ns = boot.total_ns,
+        .clock_resolution_ns = boot.clock_resolution_ns,
+        .transition_count = boot.transition_count,
+    };
+    return if (boot.initialized) 1 else 0;
 }
 
 pub fn performanceIrqTiming(irq: u32, out: *ProgramIrqTimingInfo) callconv(.c) i32 {
@@ -2727,6 +2786,7 @@ fn bootPhaseName(phase: crash.BootPhase) []const u8 {
         .usb => "usb",
         .driver_policy => "driver-policy",
         .shell => "shell",
+        .task_runtime => "task-runtime",
     };
 }
 

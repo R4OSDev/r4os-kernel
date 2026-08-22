@@ -53,11 +53,13 @@ pub fn haltPendingOrMessage(phase: crash.BootPhase, fallback_message: []const u8
 
 pub fn kernelFatal(phase: crash.BootPhase, message: []const u8) noreturn {
     current_phase = phase;
+    boot_perf.failFatal();
     var report = crash.fromKernelFatal(phase, timer.tickCount(), message);
     renderAndHalt(&report);
 }
 
 pub fn zigPanic(message: []const u8) noreturn {
+    boot_perf.failFatal();
     var report = crash.fromZigPanic(current_phase, timer.tickCount(), message);
     renderAndHalt(&report);
 }

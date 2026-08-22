@@ -1,4 +1,5 @@
 const boot_config = @import("boot_config.zig");
+const boot_perf = @import("boot_perf.zig");
 const boot_status = @import("boot_status.zig");
 const bootscreen = @import("bootscreen.zig");
 const bootlog = @import("bootlog.zig");
@@ -103,8 +104,9 @@ fn tryStartConfigured(boot_drive: *drive.Drive, working_drive: *drive.Drive, pat
     }
     bootlog.puts("\r\n");
 
+    boot_perf.beginShellAttempt(.configured);
     return switch (r4x.runShellPathWithHost(boot_drive, path, args, working_drive, shellHostForPath(path))) {
-        .ran => .ran,
+        .ran => resultRan(),
         .not_found => resultNotFound("Configured shell", path),
         .failed => resultFailed("Configured shell", path),
     };
@@ -115,10 +117,11 @@ fn tryStartTerminalFallback(boot_drive: *drive.Drive, working_drive: *drive.Driv
     bootlog.puts(TERMINAL_FALLBACK_PATH);
     bootlog.puts("\r\n");
 
+    boot_perf.beginShellAttempt(.terminal_fallback);
     return switch (r4x.runShellPathWithHost(boot_drive, TERMINAL_FALLBACK_PATH, "", working_drive, .terminal_mode)) {
-        .ran => .ran,
-        .not_found => .not_found,
-        .failed => .failed,
+        .ran => resultRan(),
+        .not_found => resultLaunchFailure(.not_found),
+        .failed => resultLaunchFailure(.failed),
     };
 }
 
@@ -152,14 +155,26 @@ fn tryStartRecoveryFallback(boot_drive: *drive.Drive, working_drive: *drive.Driv
     bootlog.puts(path);
     bootlog.puts("\r\n");
 
+    boot_perf.beginShellAttempt(.recovery_fallback);
     return switch (r4x.runShellPathWithHost(boot_drive, path, "", working_drive, .terminal_mode)) {
-        .ran => .ran,
-        .not_found => .not_found,
-        .failed => .failed,
+        .ran => resultRan(),
+        .not_found => resultLaunchFailure(.not_found),
+        .failed => resultLaunchFailure(.failed),
     };
 }
 
+fn resultRan() r4x.RunResult {
+    boot_perf.noteShellLaunched(r4x.activeShellInstanceId());
+    return .ran;
+}
+
+fn resultLaunchFailure(result: r4x.RunResult) r4x.RunResult {
+    boot_perf.noteShellLaunchFailure();
+    return result;
+}
+
 fn resultNotFound(label: []const u8, path: []const u8) r4x.RunResult {
+    boot_perf.noteShellLaunchFailure();
     k.puts(label);
     k.puts(" not found: ");
     k.puts(path);
@@ -173,6 +188,7 @@ fn resultNotFound(label: []const u8, path: []const u8) r4x.RunResult {
 }
 
 fn resultFailed(label: []const u8, path: []const u8) r4x.RunResult {
+    boot_perf.noteShellLaunchFailure();
     k.puts(label);
     k.puts(" failed: ");
     k.puts(path);
@@ -186,6 +202,7 @@ fn resultFailed(label: []const u8, path: []const u8) r4x.RunResult {
 }
 
 fn noExternalShellCrash(configured_path: []const u8) noreturn {
+    boot_perf.failNoShell();
     bootlog.puts("[LAUNCH][CRASH] no external shell available; checked config=");
     bootlog.puts(configured_path);
     bootlog.puts(" terminal=");

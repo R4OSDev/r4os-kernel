@@ -38,6 +38,7 @@ pub const BootPhase = enum(u8) {
     usb = 16,
     driver_policy = 17,
     shell = 18,
+    task_runtime = 19,
 };
 
 pub const CrashEntry = enum(u8) {
@@ -513,6 +514,7 @@ pub fn bootPhaseName(phase: BootPhase) []const u8 {
         .usb => "usb",
         .driver_policy => "driver_policy",
         .shell => "shell",
+        .task_runtime => "task_runtime",
     };
 }
 

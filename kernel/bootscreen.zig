@@ -28,6 +28,7 @@ pub const Phase = enum(u8) {
     audio = 90,
     network = 93,
     usb_hid = 96,
+    task_runtime = 97,
     driver_policy = 98,
     runtime = 99,
     handoff = 100,
