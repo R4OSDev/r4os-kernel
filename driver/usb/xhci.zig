@@ -24,13 +24,10 @@ const MAX_USB_INTERFACES: usize = 8;
 const MAX_USB_ENDPOINTS: usize = 16;
 const MAX_STRING_CHARS: usize = 32;
 const MAX_SCRATCHPADS: usize = 32;
-const WAIT_GUARD: u32 = 1_000_000;
-const LONG_WAIT_GUARD: u32 = 10_000_000;
 // Last-resort finite bound if both the IRQ timer and TSC are broken. Normal
 // timeouts are owned by usb_wait.Deadline and never by this CPU-speed loop.
 const COMMAND_WAIT_GUARD: u32 = 4_000_000_000;
 const CONTROLLER_OWNERSHIP_TIMEOUT_TICKS: u64 = 15 * @as(u64, timer.DEFAULT_HZ);
-const PORT_DEBOUNCE_READS: u8 = 8;
 const TimeoutClock = enum { ticks, hpet, tsc, tsc_fallback, recovery_budget, cpu_guard };
 
 const COMMAND_TRB_COUNT: usize = 256;
@@ -144,6 +141,7 @@ const PORTSC_PLS_U0: u32 = 0;
 const PORTSC_PP: u32 = 1 << 9;
 const PORTSC_PIC_MASK: u32 = 0x3 << 14;
 const PORTSC_WPR: u32 = 1 << 31;
+const PORTSC_CSC: u32 = 1 << 17;
 const PORTSC_CHANGE_MASK: u32 = (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 21) | (1 << 22) | (1 << 23);
 const PORTSC_WRITE_PRESERVE_MASK: u32 = PORTSC_PP | PORTSC_PIC_MASK;
 
@@ -456,6 +454,24 @@ pub const Status = struct {
     event_tsc_timeouts: u64 = 0,
     event_recovery_budget_timeouts: u64 = 0,
     event_cpu_guard_timeouts: u64 = 0,
+    wait_calls: u64 = 0,
+    wait_successes: u64 = 0,
+    wait_timeouts: u64 = 0,
+    wait_early_calls: u64 = 0,
+    wait_runtime_calls: u64 = 0,
+    wait_requested_ms: u64 = 0,
+    wait_elapsed_ns: u64 = 0,
+    wait_max_elapsed_ns: u64 = 0,
+    wait_iterations: u64 = 0,
+    wait_blocked_ticks: u64 = 0,
+    last_wait_reason: []const u8 = "none",
+    last_wait_phase: u8 = 0,
+    last_wait_requested_ms: u32 = 0,
+    last_wait_elapsed_ns: u64 = 0,
+    last_wait_iterations: u64 = 0,
+    last_wait_blocked_ticks: u64 = 0,
+    last_wait_retry: u8 = 0,
+    last_wait_success: bool = false,
     stale_events: u64 = 0,
     ring_full: u64 = 0,
     deferred_events_pending: usize = 0,
@@ -676,6 +692,7 @@ var active_command: ?event_router.Match = null;
 pub fn probe() bool {
     closeLastSyncTransferIncident();
     current = .{ .probed = true };
+    usb_wait.resetMetrics();
     command_ring_virt = 0;
     event_ring_virt = 0;
     erst_virt = 0;
@@ -766,6 +783,25 @@ pub fn probe() bool {
 
 pub fn status() Status {
     var result = current;
+    const waits = usb_wait.metrics();
+    result.wait_calls = waits.calls;
+    result.wait_successes = waits.successes;
+    result.wait_timeouts = waits.timeouts;
+    result.wait_early_calls = waits.early_calls;
+    result.wait_runtime_calls = waits.runtime_calls;
+    result.wait_requested_ms = waits.requested_ms;
+    result.wait_elapsed_ns = waits.elapsed_ns;
+    result.wait_max_elapsed_ns = waits.max_elapsed_ns;
+    result.wait_iterations = waits.iterations;
+    result.wait_blocked_ticks = waits.blocked_ticks;
+    result.last_wait_reason = waits.last_reason;
+    result.last_wait_phase = @intFromEnum(waits.last_phase);
+    result.last_wait_requested_ms = waits.last_requested_ms;
+    result.last_wait_elapsed_ns = waits.last_elapsed_ns;
+    result.last_wait_iterations = waits.last_iterations;
+    result.last_wait_blocked_ticks = waits.last_blocked_ticks;
+    result.last_wait_retry = waits.last_retry;
+    result.last_wait_success = waits.last_success;
     if (first_interrupt_ring_virt != 0) {
         const ring: [*]const Trb = @ptrFromInt(first_interrupt_ring_virt);
         result.interrupt_link_cycle = @intFromBool((ring[TRANSFER_TRB_COUNT - 1].control & TRB_CYCLE) != 0);
@@ -921,10 +957,16 @@ fn handleBiosHandoff() void {
                 return;
             }
             write32(offset, current.legacy_usblegsup_before | USBLEGSUP_OS_OWNED);
-            var wait: u32 = 0;
-            while ((read32(offset) & USBLEGSUP_BIOS_OWNED) != 0 and wait < WAIT_GUARD) : (wait += 1) {}
+            var wait = usb_wait.Wait.begin(
+                usb_timing.XHCI_BIOS_HANDOFF_TIMEOUT_MS,
+                "xhci-bios-handoff",
+                0,
+            );
+            while ((read32(offset) & USBLEGSUP_BIOS_OWNED) != 0 and !wait.expired()) wait.idle();
             current.legacy_usblegsup_after = read32(offset);
-            if ((current.legacy_usblegsup_after & USBLEGSUP_BIOS_OWNED) == 0) {
+            const released = (current.legacy_usblegsup_after & USBLEGSUP_BIOS_OWNED) == 0;
+            _ = wait.finish(released);
+            if (released) {
                 current.bios_handoff = "ok";
             } else {
                 current.timeouts += 1;
@@ -956,7 +998,12 @@ fn stopController() bool {
     var cmd = readOp32(OP_USBCMD);
     cmd &= ~USBCMD_RUN;
     writeOp32(OP_USBCMD, cmd);
-    if (!waitOpSet(OP_USBSTS, USBSTS_HCH, WAIT_GUARD)) {
+    if (!waitOpSet(
+        OP_USBSTS,
+        USBSTS_HCH,
+        usb_timing.XHCI_CONTROLLER_HALT_TIMEOUT_MS,
+        "xhci-controller-halt",
+    )) {
         current.timeouts += 1;
         current.reason = "timeout waiting for xHCI halt";
         return false;
@@ -967,12 +1014,22 @@ fn stopController() bool {
 
 fn resetController() bool {
     writeOp32(OP_USBCMD, readOp32(OP_USBCMD) | USBCMD_HCRST);
-    if (!waitOpClear(OP_USBCMD, USBCMD_HCRST, LONG_WAIT_GUARD)) {
+    if (!waitOpClear(
+        OP_USBCMD,
+        USBCMD_HCRST,
+        usb_timing.XHCI_CONTROLLER_RESET_TIMEOUT_MS,
+        "xhci-controller-reset",
+    )) {
         current.timeouts += 1;
         current.reason = "timeout waiting for xHCI reset bit clear";
         return false;
     }
-    if (!waitOpClear(OP_USBSTS, USBSTS_CNR, LONG_WAIT_GUARD)) {
+    if (!waitOpClear(
+        OP_USBSTS,
+        USBSTS_CNR,
+        usb_timing.XHCI_CONTROLLER_READY_TIMEOUT_MS,
+        "xhci-controller-ready",
+    )) {
         current.timeouts += 1;
         current.reason = "timeout waiting for controller not ready";
         return false;
@@ -1089,7 +1146,12 @@ fn initEventRing() void {
 fn runController() bool {
     writeOp32(OP_USBSTS, USBSTS_EINT | USBSTS_PCD | USBSTS_HCE);
     writeOp32(OP_USBCMD, readOp32(OP_USBCMD) | USBCMD_RUN);
-    if (!waitOpClear(OP_USBSTS, USBSTS_HCH, LONG_WAIT_GUARD)) {
+    if (!waitOpClear(
+        OP_USBSTS,
+        USBSTS_HCH,
+        usb_timing.XHCI_CONTROLLER_RUN_TIMEOUT_MS,
+        "xhci-controller-run",
+    )) {
         current.timeouts += 1;
         current.reason = "timeout waiting for xHCI run";
         return false;
@@ -1127,17 +1189,19 @@ fn refreshPortStatus(p: *PortStatus, index_value: usize) void {
 
 fn preparePortState(index: usize, p: *PortStatus, phase: PortPreparePhase) bool {
     refreshPortStatus(p, index);
-    p.debounce_ok = false;
+    const was_debounced = p.debounce_ok;
     const initial_changes = clearPortChanges(index);
     if (initial_changes != 0) {
         p.change_bits |= initial_changes;
         refreshPortStatus(p, index);
     }
     if (!p.connected) {
+        p.debounce_ok = false;
         p.reset_reason = "no-device";
         return false;
     }
-    if (!debounceConnectedPort(index, p)) {
+    p.debounce_ok = was_debounced and (initial_changes & PORTSC_CSC) == 0;
+    if (!p.debounce_ok and !debounceConnectedPort(index, p)) {
         p.reset_reason = phaseReason(phase, "debounce-timeout", "probe-debounce-timeout");
         current.port_debounce_failures += 1;
         return false;
@@ -1158,7 +1222,11 @@ fn preparePortState(index: usize, p: *PortStatus, phase: PortPreparePhase) bool 
         if (p.reset_ok) current.reset_ports += 1;
         refreshPortStatus(p, index);
         if (p.reset_ok and p.connected and p.enabled) {
-            usb_wait.milliseconds(usb_timing.PORT_RESET_RECOVERY_MS);
+            _ = usb_wait.millisecondsWithReason(
+                usb_timing.PORT_RESET_RECOVERY_MS,
+                "xhci-port-reset-recovery",
+                0,
+            );
             refreshPortStatus(p, index);
         }
     }
@@ -1206,25 +1274,40 @@ fn clearPortChanges(index: usize) u32 {
 
 fn debounceConnectedPort(index: usize, p: *PortStatus) bool {
     const base = OP_PORT_BASE + (@as(u64, index) * OP_PORT_STRIDE);
+    const observed_mask = PORTSC_CCS | PORTSC_PED | PORTSC_PLS_MASK | PORTSC_PR | PORTSC_WPR;
     var last = readOp32(base);
-    var stable: u8 = 0;
-    var guard: u32 = 0;
-    while (guard < WAIT_GUARD and stable < PORT_DEBOUNCE_READS) : (guard += 1) {
+    var wait = usb_wait.Wait.begin(
+        usb_timing.XHCI_PORT_DEBOUNCE_TIMEOUT_MS,
+        "xhci-port-debounce",
+        0,
+    );
+    var stable = usb_wait.Deadline.begin(usb_timing.XHCI_PORT_DEBOUNCE_STABLE_MS);
+    while (!wait.expired()) {
         const now = readOp32(base);
         if ((now & PORTSC_CCS) == 0) {
+            stable.finish();
+            _ = wait.finish(false);
             refreshPortStatus(p, index);
             return false;
         }
-        if ((now & (PORTSC_CCS | PORTSC_PED | PORTSC_PLS_MASK | PORTSC_PR | PORTSC_WPR)) == (last & (PORTSC_CCS | PORTSC_PED | PORTSC_PLS_MASK | PORTSC_PR | PORTSC_WPR))) {
-            stable += 1;
-        } else {
-            stable = 0;
+        if ((now & observed_mask) != (last & observed_mask)) {
+            stable.finish();
+            stable = usb_wait.Deadline.begin(usb_timing.XHCI_PORT_DEBOUNCE_STABLE_MS);
             last = now;
+        } else if (stable.expiredAny()) {
+            stable.finish();
+            _ = wait.finish(true);
+            refreshPortStatus(p, index);
+            p.debounce_ok = true;
+            return true;
         }
+        wait.idle();
     }
+    stable.finish();
+    _ = wait.finish(false);
     refreshPortStatus(p, index);
-    p.debounce_ok = stable >= PORT_DEBOUNCE_READS;
-    return p.debounce_ok;
+    p.debounce_ok = false;
+    return false;
 }
 
 fn ensurePortPower(index: usize, p: *PortStatus) bool {
@@ -1233,12 +1316,24 @@ fn ensurePortPower(index: usize, p: *PortStatus) bool {
     current.port_power_requests += 1;
     const before = readOp32(base);
     writeOp32(base, (before & PORTSC_WRITE_PRESERVE_MASK) | PORTSC_PP | (before & PORTSC_CHANGE_MASK));
-    var guard: u32 = 0;
-    while (guard < WAIT_GUARD) : (guard += 1) {
+    var wait = usb_wait.Wait.begin(
+        usb_timing.XHCI_PORT_POWER_TIMEOUT_MS,
+        "xhci-port-power",
+        0,
+    );
+    while (!wait.expired()) {
         refreshPortStatus(p, index);
-        if (!p.connected) return false;
-        if (p.powered) return true;
+        if (!p.connected) {
+            _ = wait.finish(false);
+            return false;
+        }
+        if (p.powered) {
+            _ = wait.finish(true);
+            return true;
+        }
+        wait.idle();
     }
+    _ = wait.finish(false);
     current.timeouts += 1;
     return false;
 }
@@ -1249,14 +1344,21 @@ fn resetPort(index_value: u8) bool {
     _ = clearPortChanges(@intCast(index_value));
     const value = (before & PORTSC_WRITE_PRESERVE_MASK) | PORTSC_PR;
     writeOp32(base, value);
-    var guard: u32 = 0;
-    while (guard < LONG_WAIT_GUARD) : (guard += 1) {
+    var wait = usb_wait.Wait.begin(
+        usb_timing.XHCI_PORT_RESET_TIMEOUT_MS,
+        "xhci-port-reset",
+        0,
+    );
+    while (!wait.expired()) {
         const portsc = readOp32(base);
         if ((portsc & PORTSC_PR) == 0 and ((portsc & PORTSC_PED) != 0 or (portsc & PORTSC_CCS) == 0)) {
             _ = clearPortChanges(@intCast(index_value));
+            _ = wait.finish(true);
             return true;
         }
+        wait.idle();
     }
+    _ = wait.finish(false);
     current.timeouts += 1;
     return false;
 }
@@ -1266,14 +1368,23 @@ fn warmResetPort(index_value: u8) bool {
     const before = readOp32(base);
     _ = clearPortChanges(@intCast(index_value));
     writeOp32(base, (before & PORTSC_WRITE_PRESERVE_MASK) | PORTSC_WPR);
-    var guard: u32 = 0;
-    while (guard < LONG_WAIT_GUARD) : (guard += 1) {
+    var wait = usb_wait.Wait.begin(
+        usb_timing.XHCI_PORT_WARM_RESET_TIMEOUT_MS,
+        "xhci-port-warm-reset",
+        0,
+    );
+    while (!wait.expired()) {
         const portsc = readOp32(base);
         if ((portsc & PORTSC_WPR) == 0) {
             _ = clearPortChanges(@intCast(index_value));
-            return (portsc & PORTSC_CCS) == 0 or ((portsc & PORTSC_PED) != 0 and portLinkState(portsc) == PORTSC_PLS_U0);
+            const ready = (portsc & PORTSC_CCS) == 0 or
+                ((portsc & PORTSC_PED) != 0 and portLinkState(portsc) == PORTSC_PLS_U0);
+            _ = wait.finish(ready);
+            return ready;
         }
+        wait.idle();
     }
+    _ = wait.finish(false);
     current.timeouts += 1;
     return false;
 }
@@ -1281,12 +1392,24 @@ fn warmResetPort(index_value: u8) bool {
 fn waitPortU0(index_value: u8, p: *PortStatus) bool {
     const index_usize: usize = @intCast(index_value);
     current.port_u0_waits += 1;
-    var guard: u32 = 0;
-    while (guard < LONG_WAIT_GUARD) : (guard += 1) {
+    var wait = usb_wait.Wait.begin(
+        usb_timing.XHCI_PORT_U0_TIMEOUT_MS,
+        "xhci-port-u0",
+        0,
+    );
+    while (!wait.expired()) {
         refreshPortStatus(p, index_usize);
-        if ((p.portsc & PORTSC_CCS) == 0) return false;
-        if ((p.portsc & PORTSC_PED) != 0 and portLinkState(p.portsc) == PORTSC_PLS_U0) return true;
+        if ((p.portsc & PORTSC_CCS) == 0) {
+            _ = wait.finish(false);
+            return false;
+        }
+        if ((p.portsc & PORTSC_PED) != 0 and portLinkState(p.portsc) == PORTSC_PLS_U0) {
+            _ = wait.finish(true);
+            return true;
+        }
+        wait.idle();
     }
+    _ = wait.finish(false);
     return false;
 }
 
@@ -2076,7 +2199,13 @@ fn addressFirstDevice() bool {
     current.last_slot_id = completion.slot_id;
     current.address_device_ok = completion.code == COMPLETION_SUCCESS;
     if (!current.address_device_ok) current.failures += 1;
-    if (current.address_device_ok) usb_wait.milliseconds(usb_timing.SET_ADDRESS_SETTLE_MS);
+    if (current.address_device_ok) {
+        _ = usb_wait.millisecondsWithReason(
+            usb_timing.SET_ADDRESS_SETTLE_MS,
+            "xhci-address-settle",
+            0,
+        );
+    }
     return current.address_device_ok;
 }
 
@@ -3931,8 +4060,12 @@ fn waitMatchingEventWithin(
 ) ?XhciEvent {
     if (deferred_events.take(expected)) |event| return event;
     if (drainEventBatch(expected)) |event| return event;
-    var deadline = usb_wait.Deadline.begin(usb_timing.XHCI_EVENT_TIMEOUT_MS);
-    defer deadline.finish();
+    var wait = usb_wait.Wait.begin(
+        usb_timing.XHCI_EVENT_TIMEOUT_MS,
+        "xhci-event",
+        0,
+    );
+    const deadline = &wait.deadline;
     const uses_tick_deadline = deadline.usesTickDeadline();
     const uses_hpet_deadline = deadline.usesHpetDeadline();
     const uses_tsc_deadline = deadline.usesTscDeadline();
@@ -3966,17 +4099,24 @@ fn waitMatchingEventWithin(
             timeout_clock = if (deadline.usesFallbackTsc()) .tsc_fallback else .tsc;
             break;
         }
-        if (drainEventBatch(expected)) |event| return event;
-        if (deferred_events.take(expected)) |event| return event;
+        if (drainEventBatch(expected)) |event| {
+            _ = wait.finish(true);
+            return event;
+        }
+        if (deferred_events.take(expected)) |event| {
+            _ = wait.finish(true);
+            return event;
+        }
         if (guard >= COMMAND_WAIT_GUARD) {
             timeout_clock = .cpu_guard;
             break;
         }
-        asm volatile ("pause");
+        wait.idle();
     }
     const elapsed_ticks = deadline.elapsedTicks();
     const elapsed_hpet = deadline.elapsedHpet();
     const elapsed_tsc = deadline.elapsedTsc();
+    _ = wait.finish(false);
     if (timeout_clock == .ticks) {
         current.event_tick_timeouts +%= 1;
     } else if (timeout_clock == .hpet) {
@@ -4422,19 +4562,29 @@ fn writeDoorbell(index_value: u8, target: u32) void {
     write32((current.dboff & 0xFFFF_FFFC) + @as(u64, index_value) * 4, target);
 }
 
-fn waitOpSet(offset: u64, mask: u32, guard_limit: u32) bool {
-    var guard: u32 = 0;
-    while (guard < guard_limit) : (guard += 1) {
-        if ((readOp32(offset) & mask) == mask) return true;
+fn waitOpSet(offset: u64, mask: u32, timeout_ms: u32, reason: []const u8) bool {
+    var wait = usb_wait.Wait.begin(timeout_ms, reason, 0);
+    while (!wait.expired()) {
+        if ((readOp32(offset) & mask) == mask) {
+            _ = wait.finish(true);
+            return true;
+        }
+        wait.idle();
     }
+    _ = wait.finish(false);
     return false;
 }
 
-fn waitOpClear(offset: u64, mask: u32, guard_limit: u32) bool {
-    var guard: u32 = 0;
-    while (guard < guard_limit) : (guard += 1) {
-        if ((readOp32(offset) & mask) == 0) return true;
+fn waitOpClear(offset: u64, mask: u32, timeout_ms: u32, reason: []const u8) bool {
+    var wait = usb_wait.Wait.begin(timeout_ms, reason, 0);
+    while (!wait.expired()) {
+        if ((readOp32(offset) & mask) == 0) {
+            _ = wait.finish(true);
+            return true;
+        }
+        wait.idle();
     }
+    _ = wait.finish(false);
     return false;
 }
 

@@ -48,10 +48,20 @@ pub const Status = struct {
     sector_size: u32 = 0,
     inquiry_ok: bool = false,
     inquiry_retries: u64 = 0,
+    inquiry_wait_elapsed_ns: u64 = 0,
     test_unit_ready_ok: bool = false,
     test_unit_ready_retries: u64 = 0,
+    ready_wait_elapsed_ns: u64 = 0,
     read_capacity_ok: bool = false,
     read_capacity_retries: u64 = 0,
+    capacity_wait_elapsed_ns: u64 = 0,
+    retry_delay_calls: u64 = 0,
+    retry_budget_timeouts: u64 = 0,
+    transient_sense_retries: u64 = 0,
+    unknown_sense_retries: u64 = 0,
+    permanent_sense_stops: u64 = 0,
+    last_retry_opcode: u8 = 0,
+    last_retry_number: u8 = 0,
     mode_sense_ok: bool = false,
     write_protected_known: bool = false,
     write_protected: bool = false,
@@ -167,10 +177,9 @@ pub fn init() bool {
         if (!requireMscProtocolRoles()) return false;
         if (!ensureSelected()) return false;
         current.bound = true;
-        // Real flash media may NAK bulk traffic for a while after becoming
-        // Configured. Do not turn CPU speed into an accidental readiness
-        // timeout; give the BOT transport one deterministic settle window.
-        usb_wait.milliseconds(usb_timing.MSC_POST_CONFIG_SETTLE_MS);
+        // Probe the actual device state immediately. Ready media no longer
+        // pays a blind settle second; transient command/Sense states own the
+        // bounded waits below.
         current.inquiry_ok = scsiInquiryWithRetry();
         if (!current.inquiry_ok) {
             return false;
@@ -319,7 +328,7 @@ fn readBlock(_: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
             0,
         )) {
             current.read_transport_retries += 1;
-            usb_wait.milliseconds(usb_timing.SCSI_RETRY_DELAY_MS);
+            retryDelay("usbmsc-read-retry", 0x28, 1);
             if (ensureSelected() and scsiRead10(@intCast(lba), sectors, out[0..len])) {
                 current.read_transport_retry_successes += 1;
                 current.reads += 1;
@@ -373,7 +382,7 @@ fn writeBlock(_: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
             0,
         )) {
             current.write_transport_retries += 1;
-            usb_wait.milliseconds(usb_timing.SCSI_RETRY_DELAY_MS);
+            retryDelay("usbmsc-write-retry", 0x2A, 1);
             if (ensureSelected() and scsiWrite10(@intCast(lba), sectors, data[0..len])) {
                 current.write_transport_retry_successes += 1;
                 current.writes += 1;
@@ -408,7 +417,7 @@ fn flushBlock(_: ?*anyopaque) bool {
             0,
         )) {
             current.flush_transport_retries += 1;
-            usb_wait.milliseconds(usb_timing.SCSI_RETRY_DELAY_MS);
+            retryDelay("usbmsc-flush-retry", 0x35, 1);
             if (ensureSelected() and scsiSynchronizeCache10()) {
                 current.flush_transport_retry_successes += 1;
                 current.flushes += 1;
@@ -502,12 +511,22 @@ fn scsiInquiry() bool {
 }
 
 fn scsiInquiryWithRetry() bool {
+    var budget = usb_wait.Deadline.begin(usb_timing.SCSI_INQUIRY_BUDGET_MS);
+    defer {
+        current.inquiry_wait_elapsed_ns = budget.elapsedNanoseconds();
+        budget.finish();
+    }
     var attempt: u8 = 0;
     while (attempt < usb_timing.SCSI_INQUIRY_ATTEMPTS) : (attempt += 1) {
         if (scsiInquiry()) return true;
         if (attempt + 1 >= usb_timing.SCSI_INQUIRY_ATTEMPTS) break;
+        if (budget.expiredAny()) {
+            current.retry_budget_timeouts += 1;
+            break;
+        }
+        if (!shouldRetryScsiFailure(attempt)) break;
         current.inquiry_retries += 1;
-        usb_wait.milliseconds(usb_timing.SCSI_RETRY_DELAY_MS);
+        retryDelay("usbmsc-inquiry-retry", 0x12, attempt + 1);
     }
     return false;
 }
@@ -518,13 +537,22 @@ fn scsiTestUnitReady() bool {
 }
 
 fn waitForScsiReady() bool {
+    var budget = usb_wait.Deadline.begin(usb_timing.SCSI_READY_BUDGET_MS);
+    defer {
+        current.ready_wait_elapsed_ns = budget.elapsedNanoseconds();
+        budget.finish();
+    }
     var attempt: u8 = 0;
     while (attempt < usb_timing.SCSI_READY_ATTEMPTS) : (attempt += 1) {
         if (scsiTestUnitReady()) return true;
-        if (!current.last_failure_transport) _ = scsiRequestSense();
         if (attempt + 1 >= usb_timing.SCSI_READY_ATTEMPTS) break;
+        if (budget.expiredAny()) {
+            current.retry_budget_timeouts += 1;
+            break;
+        }
+        if (!shouldRetryScsiFailure(attempt)) break;
         current.test_unit_ready_retries += 1;
-        usb_wait.milliseconds(usb_timing.SCSI_RETRY_DELAY_MS);
+        retryDelay("usbmsc-ready-retry", 0x00, attempt + 1);
     }
     return false;
 }
@@ -577,15 +605,66 @@ fn scsiReadCapacity10() bool {
 }
 
 fn scsiReadCapacityWithRetry() bool {
+    var budget = usb_wait.Deadline.begin(usb_timing.SCSI_CAPACITY_BUDGET_MS);
+    defer {
+        current.capacity_wait_elapsed_ns = budget.elapsedNanoseconds();
+        budget.finish();
+    }
     var attempt: u8 = 0;
     while (attempt < usb_timing.SCSI_CAPACITY_ATTEMPTS) : (attempt += 1) {
         if (scsiReadCapacity10()) return true;
-        if (!current.last_failure_transport) _ = scsiRequestSense();
         if (attempt + 1 >= usb_timing.SCSI_CAPACITY_ATTEMPTS) break;
+        if (budget.expiredAny()) {
+            current.retry_budget_timeouts += 1;
+            break;
+        }
+        if (!shouldRetryScsiFailure(attempt)) break;
         current.read_capacity_retries += 1;
-        usb_wait.milliseconds(usb_timing.SCSI_RETRY_DELAY_MS);
+        retryDelay("usbmsc-capacity-retry", 0x25, attempt + 1);
     }
     return false;
+}
+
+fn shouldRetryScsiFailure(retries: u8) bool {
+    if (current.last_failure_transport) {
+        return retry_policy.shouldRetryScsiFailure(
+            true,
+            current.last_recovery_ok,
+            false,
+            0,
+            0,
+            0,
+            retries,
+        );
+    }
+
+    _ = scsiRequestSense();
+    const retry = retry_policy.shouldRetryScsiFailure(
+        current.last_failure_transport,
+        current.last_recovery_ok,
+        current.sense_valid,
+        current.sense_key,
+        current.sense_asc,
+        current.sense_ascq,
+        retries,
+    );
+    if (current.sense_valid) {
+        if (retry) {
+            current.transient_sense_retries += 1;
+        } else {
+            current.permanent_sense_stops += 1;
+        }
+    } else if (retry) {
+        current.unknown_sense_retries += 1;
+    }
+    return retry;
+}
+
+fn retryDelay(reason: []const u8, opcode: u8, retry: u8) void {
+    current.retry_delay_calls += 1;
+    current.last_retry_opcode = opcode;
+    current.last_retry_number = retry;
+    _ = usb_wait.millisecondsWithReason(usb_timing.SCSI_RETRY_DELAY_MS, reason, retry);
 }
 
 fn scsiModeSense6() bool {
