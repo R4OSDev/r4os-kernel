@@ -303,6 +303,23 @@ pub fn metadataRange() MetadataRange {
     };
 }
 
+// Product-boot invariant: validate only the structure created by init().
+// Allocation, error-injection, alignment, and churn probes belong to the
+// explicit -Dboot-selftests diagnostic kernel.
+pub fn bootInvariant() bool {
+    if (!control.initialized or control.range_id == 0) return false;
+    if (control.committed_pages < MIN_COMMITTED_PAGES or control.committed_pages > control.cap_pages) return false;
+    if (control.heap_top != committedBytes() or control.heap_top < MIN_BLOCK) return false;
+    if (control.active_blocks != 0 or control.used_bytes != 0) return false;
+    if (control.free_blocks != 1 or control.free_bytes != control.heap_top) return false;
+
+    const first = word(0).*;
+    if ((first & 1) != 0 or blockSize(first) != control.heap_top) return false;
+    if (word(8).* != FREE_MAGIC or word(control.heap_top - FOOTER_SIZE).* != first) return false;
+    if (word(16).* != NONE or word(24).* != NONE) return false;
+    return control.bins[binIndex(control.heap_top)] == 0;
+}
+
 pub fn dumpStats() void {
     const s = stats();
     k.puts("  Kernel heap: v3 pages=");

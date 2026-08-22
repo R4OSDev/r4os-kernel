@@ -16,6 +16,7 @@ const services = @import("../kernel/services.zig");
 const crash = @import("../kernel/crash.zig");
 const boot_perf = @import("../kernel/boot_perf.zig");
 const boot_status = @import("../kernel/boot_status.zig");
+const bootscreen = @import("../kernel/bootscreen.zig");
 const bootlog = @import("../kernel/bootlog.zig");
 const boot_config = @import("../kernel/boot_config.zig");
 const k = @import("../kernel/log.zig");
@@ -13693,7 +13694,12 @@ fn apiBootReady() callconv(.c) i32 {
     }
     const instance = currentInstance() orelse return boot_perf.ready_error_not_expected_shell;
     if (instance.role != .shell) return boot_perf.ready_error_not_expected_shell;
-    return boot_perf.completeReady(instance.id);
+    const result = boot_perf.completeReady(instance.id);
+    if (result == boot_perf.ready_result_completed) {
+        bootscreen.completeForHandoff();
+        boot_status.releaseForUserSession();
+    }
+    return result;
 }
 
 fn currentInstance() ?*ProgramInstance {

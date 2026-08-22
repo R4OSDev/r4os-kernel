@@ -23,6 +23,13 @@ Alle Werte duerfen relativ oder absolut gesetzt werden. Die Buildstarter sind
 der verbindliche Einstieg, weil sie den gemappten Contract-Checkout vor der
 Zig-Paketaufloesung als lokalen Fork einsetzen.
 
+Normale Kernelartefakte fuehren im Boot nur die nicht mutierende Heapstruktur-
+Invariante und den fuer den spaeteren CR3-Wechsel erforderlichen R4OS-PML4-
+Dry-Run aus. Die invasiven Heap-, Page-Table-, Synchronisations- und
+Schedulerproben sind ausschliesslich im expliziten Diagnoseartefakt aktiv:
+
+    Build.bat -Dboot-selftests=true
+
 Grenze
 ------
 
@@ -63,6 +70,14 @@ gueltige Aufruf schliesst die aktuelle Shellphase und friert Endpunkt,
 Gesamtdauer, Phasenspannen und Clockmetadaten gemeinsam ein. Wiederholungen
 derselben Shell sind idempotent. Synchrone Launchfehler, Fallbackauswahl,
 Fatalfehler und ein Shell-Exit vor Readiness bleiben unterscheidbar.
+
+Die Aufnahme des Shelltasks und dessen Readiness sind zwei getrennte
+Lebenszyklusereignisse. Sobald der Launcher den Shelltask erfolgreich
+aufgenommen hat, beendet und reapt der Scheduler den einmaligen `kernel-main`-
+Boottask; er bleibt weder lauffaehig noch in der Rotation. Erst der erste
+gueltige `boot_ready`-Aufruf friert die Messung ein, beendet den Bootrenderer
+ohne den bereits sichtbaren ersten Frame zu uebermalen und gibt die
+Benutzersitzung frei.
 
 R4DEV `performance_boot_summary` liest dafuer nur den kleinen festen
 Bootdatensatz; breite Subsystem-Summaries oder aktive Diagnoseprobes gehoeren

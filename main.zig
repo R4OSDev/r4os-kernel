@@ -152,17 +152,21 @@ export fn kmain() callconv(.c) noreturn {
     // 0.59.13: DHCP acquisition follows the real R4D link in its own task.
     // It must start after the NIC modules and scheduler, just like net-rx.
     _ = net_core.startDhcpTask();
-    // 0.56.13: Sync-Selbsttest (Mutex-Timeout-Budget, Event-Lost-Wakeup)
-    // braucht Kernel-Threads, daher hier statt in memory_boot. FAIL ist
-    // ein COM1-Marker, den der Gate-serial-markers-Subtest erfasst;
-    // der Boot laeuft weiter (Sync bleibt benutzbar, nur lauter Befund).
-    _ = sched_sync.selfTest();
+    // Invasive correctness workloads are excluded from every normal kernel
+    // artifact. The explicit -Dboot-selftests diagnostic kernel preserves
+    // their real boot-time coverage without charging product readiness.
+    if (comptime config.enable_boot_selftests) {
+        if (!sched_sync.selfTest()) fatal.kernelFatal(.runtime, "Boot sync selftest failed");
+    }
     // 0.56.17: Autonomer Input-Poll-Task - NACH initTaskRuntime (sonst von
     // task.init() gewischt); pollt USB-HID im 10-ms-Takt ohne Konsumenten.
     _ = usb_hid_boot.startPollTask();
-    // 0.56.18: Prioritaets-Selbsttest (SCHEDPRIO-Marker) - braucht
-    // Kernel-Threads, laeuft einmalig ~0,5 s und raeumt sich selbst auf.
-    _ = sched_scheduler.prioritySelfTest();
+    if (comptime config.enable_boot_selftests) {
+        if (!sched_scheduler.prioritySelfTest()) fatal.kernelFatal(.runtime, "Boot scheduler priority selftest failed");
+        boot_status.statusLine("BOOTSELFTEST OK heap=1 page_tables=1 sync=1 priority=1\r\n");
+    } else {
+        boot_status.statusLine("BOOTSELFTEST OFF heap=0 page_tables=0 sync=0 priority=0\r\n");
+    }
     // 0.59.10: Nur mit OPTION TASKREGISTRY selftest=yes. Die echte QEMU-
     // Abnahme belastet die dynamische Task-/Wait-/Stack-/Reserve-Linie;
     // normale Produktionsboots fuehren hier keinen Zusatztest aus.

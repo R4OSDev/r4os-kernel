@@ -1,7 +1,5 @@
 const boot_config = @import("boot_config.zig");
 const boot_perf = @import("boot_perf.zig");
-const boot_status = @import("boot_status.zig");
-const bootscreen = @import("bootscreen.zig");
 const bootlog = @import("bootlog.zig");
 const drive = @import("../fs/drive.zig");
 const fatal = @import("fatal.zig");
@@ -10,7 +8,6 @@ const loader_perf = @import("loader_perf.zig");
 const r4x = @import("../program/r4x.zig");
 const usb_msc = @import("../driver/usb/msc.zig");
 const scheduler = @import("../sched/scheduler.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
 
 const TERMINAL_FALLBACK_PATH = "/R4OS/SOFTWARE/TERMINAL/TERMINAL.R4X";
 const SERVICE_MANAGER_BOOT_PATH = "/R4OS/SOFTWARE/TERMINAL/SERVMAN.R4X";
@@ -31,13 +28,13 @@ pub fn start(config: *const boot_config.Config, usable_bytes: u64) noreturn {
         startServiceManagerBoot(boot_drive, working_drive);
 
         switch (tryStartConfigured(boot_drive, working_drive, configured_path, configured_args)) {
-            .ran => waitForShellAfterBoot(),
+            .ran => retireBootTaskAfterLaunch(),
             .not_found, .failed => {},
         }
 
         if (!samePath(configured_path, TERMINAL_FALLBACK_PATH)) {
             switch (tryStartTerminalFallback(boot_drive, working_drive)) {
-                .ran => waitForShellAfterBoot(),
+                .ran => retireBootTaskAfterLaunch(),
                 .not_found => {
                     k.puts("External Terminal fallback not found: ");
                     k.puts(TERMINAL_FALLBACK_PATH);
@@ -129,7 +126,7 @@ fn startRecoveryFallbacks(boot_drive: *drive.Drive, working_drive: *drive.Drive,
     for (RECOVERY_FALLBACK_PATHS) |path| {
         if (samePath(configured_path, path) or samePath(TERMINAL_FALLBACK_PATH, path)) continue;
         switch (tryStartRecoveryFallback(boot_drive, working_drive, path)) {
-            .ran => waitForShellAfterBoot(),
+            .ran => retireBootTaskAfterLaunch(),
             .not_found => {
                 k.puts("External recovery shell not found: ");
                 k.puts(path);
@@ -229,23 +226,9 @@ fn noExternalShellCrash(configured_path: []const u8) noreturn {
     fatal.kernelFatal(.shell, "No external shell available");
 }
 
-fn waitForShellAfterBoot() noreturn {
-    bootscreen.completeForHandoff();
-    boot_status.releaseForUserSession();
-    // 0.56.40: wie scheduler.exitCurrent - nie heiss spinnen, bei
-    // leerer Ready-Menge IF explizit oeffnen und hlt'en (IF=0-Ring-
-    // Befund, SLEEP-Haenger). hlt NUR im Idle-Fall: dieser Boot-Task
-    // bleibt fuer immer in der Rotation; ein unkonditionales hlt nach
-    // jedem yield bremste jede Rotationsrunde um bis zu einen Tick
-    // (FSDIAG-Smoke-Watchdog-Befund).
-    while (true) {
-        if (scheduler.hasOtherReadyTask()) {
-            scheduler.yield();
-        } else {
-            interrupts.enable();
-            interrupts.waitForInterrupt();
-        }
-    }
+fn retireBootTaskAfterLaunch() noreturn {
+    bootlog.puts("[LAUNCH] boot task retiring after shell admission\r\n");
+    scheduler.exitCurrentAndRetire();
 }
 
 fn samePath(a: []const u8, b: []const u8) bool {

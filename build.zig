@@ -54,6 +54,11 @@ pub fn build(b: *std.Build) void {
         "stack-guard-test",
         "Spawn a kernel thread that intentionally overflows its stack",
     ) orelse false;
+    const boot_selftests = b.option(
+        bool,
+        "boot-selftests",
+        "Run invasive heap, page-table, scheduler, and sync selftests during boot",
+    ) orelse false;
     const net_loss_test = b.option(
         bool,
         "net-loss-test",
@@ -106,6 +111,7 @@ pub fn build(b: *std.Build) void {
     config.addOption(bool, "enable_metrics", enable_metrics);
     config.addOption(bool, "force_x2apic", force_x2apic);
     config.addOption(bool, "enable_stack_guard_test", stack_guard_test);
+    config.addOption(bool, "enable_boot_selftests", boot_selftests);
     config.addOption(bool, "enable_net_loss_test", net_loss_test);
     kernel_mod.addOptions("config", config);
     kernel_mod.addImport("r4os_kernel_contract", contract_kernel);

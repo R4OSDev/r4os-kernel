@@ -69,7 +69,11 @@ pub fn setPhase(phase: Phase) void {
 }
 
 pub fn completeForHandoff() void {
-    setPhase(.handoff);
+    // The shell reports readiness after its first committed frame/prompt.
+    // Retire the boot renderer without painting over that ready surface.
+    last_phase = .handoff;
+    active_framebuffer = null;
+    active_geometry = .{};
 }
 
 pub fn renderPreparedR4B(framebuf: *fb.Framebuffer, bytes: []const u8) bool {

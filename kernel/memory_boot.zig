@@ -5,6 +5,7 @@
 // boot order; memory domain logic stays in the modules under Code/Kernel/memory/.
 
 const display = @import("../display/display.zig");
+const config = @import("config");
 const blocks = @import("../memory/blocks.zig");
 const heap = @import("../memory/heap.zig");
 const mem_map = @import("../memory/map.zig");
@@ -84,11 +85,15 @@ fn initPagingCore() bool {
 }
 
 fn initPageTableBuilder() bool {
-    beginPhase("Page-table builder sanity");
-    if (!page_tables.bootSanityCheck()) {
-        return fail("Page-table builder sanity failed");
+    if (comptime config.enable_boot_selftests) {
+        beginPhase("Page-table builder selftest");
+        if (!page_tables.bootSanityCheck()) {
+            return fail("Page-table builder selftest failed");
+        }
+        endPhase("Page-table builder selftest");
+    } else {
+        skipPhase("Page-table builder selftest");
     }
-    endPhase("Page-table builder sanity");
 
     beginPhase("R4OS PML4 dry-run");
     if (!page_tables.buildKernelSpaceDryRun()) {
@@ -125,8 +130,13 @@ fn initKernelHeap() bool {
         return fail("Kernel heap init failed");
     }
     heap.dumpStats();
-    if (!heap.selfTest()) {
-        return fail("Kernel heap selftest failed");
+    if (!heap.bootInvariant()) {
+        return fail("Kernel heap invariant failed");
+    }
+    if (comptime config.enable_boot_selftests) {
+        if (!heap.selfTest()) {
+            return fail("Kernel heap selftest failed");
+        }
     }
     endPhase("Kernel heap");
     return true;

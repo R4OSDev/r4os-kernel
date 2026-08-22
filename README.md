@@ -22,6 +22,18 @@ periodic PIT, HPET, or LAPIC scheduler event source. Exact invariant-TSC and
 free-running HPET sources are preferred; hardware without either capability
 uses an explicitly degraded periodic fallback.
 
+Normal kernel artifacts perform only the non-mutating heap structure check
+and the required kernel-space page-table dry run. The invasive heap,
+page-table, synchronization, and scheduler probes are available only in an
+explicit diagnostic artifact:
+
+    Build.bat -Dboot-selftests=true
+
+Once the shell task has been admitted, the one-shot kernel boot task exits and
+is reaped. The shell's first `boot_ready` call independently freezes the boot
+measurement and retires the boot renderer without repainting the ready shell
+surface.
+
 Detailed German migration notes are preserved in
 `DOCUMENTATION.de.txt`.
 

@@ -479,6 +479,17 @@ pub fn wakeTask(target: *task.Task, result: task.WaitResult) bool {
 }
 
 pub fn exitCurrent() noreturn {
+    exitCurrentImpl(false);
+}
+
+// The boot owner has no external lifecycle reaper. Mark it for deferred
+// release before the terminal context switch so it cannot remain in the
+// runtime registry after its successful handoff.
+pub fn exitCurrentAndRetire() noreturn {
+    exitCurrentImpl(true);
+}
+
+fn exitCurrentImpl(retire: bool) noreturn {
     const irq_flags = interrupts.saveAndDisable();
     preemptDisable();
     if (current()) |t| {
@@ -495,6 +506,7 @@ pub fn exitCurrent() noreturn {
         t.wait_reason = "";
         t.wait_object = 0;
         t.wait_result = .killed;
+        t.retire_pending = retire;
     }
     preemptEnable();
     interrupts.restore(irq_flags);
