@@ -14,7 +14,6 @@ const fs_request = @import("../fs/request.zig");
 const fatal = @import("fatal.zig");
 const mbr = @import("../storage/mbr.zig");
 const memory_boot = @import("memory_boot.zig");
-const nvme = @import("../driver/storage/nvme.zig");
 const usb_msc = @import("../driver/usb/msc.zig");
 const xhci = @import("../driver/usb/xhci.zig");
 const k = @import("log.zig");
@@ -169,25 +168,24 @@ fn probeAhci(pcie_status: anytype) void {
 }
 
 fn probeNvme(pcie_status: anytype) void {
-    if (pcie_status.nvme_count > 0) {
-        if (driver_registry.findByName("NVME")) |existing| {
-            const entry = driver_registry.get(existing);
-            if (entry != null and entry.?.source == .preload and entry.?.state == .active) {
-                if (hasPreloadStorageBackend(.nvme)) {
-                    k.puts("[NVME] preload R4D active; legacy rescue data path skipped; owner=preload\r\n");
-                    return;
-                }
-                k.puts("[NVME][WARN] preload R4D active without blockdevice; legacy rescue data path armed; owner=preload\r\n");
-            }
+    if (pcie_status.nvme_count == 0) return;
+    if (driver_registry.findByName("NVME")) |existing| {
+        const entry = driver_registry.get(existing) orelse {
+            k.puts("[NVME][WARN] canonical preload registry entry unavailable\r\n");
+            return;
+        };
+        if (entry.source == .preload and entry.state == .active and hasPreloadStorageBackend(.nvme)) {
+            k.puts("[NVME] canonical preload R4D active; owner=preload\r\n");
+            return;
         }
-        const slot = driver_registry.beginLoad("NVMe", 2, 1);
-        if (nvme.probe()) {
-            markInitialized(slot);
-            if (nvme.blockDeviceCount() > 0) markActive(slot);
-        } else {
-            markFailed(slot);
+        if (entry.source == .preload and entry.state == .active) {
+            k.puts("[NVME][WARN] canonical preload R4D active without blockdevice; no second controller owner\r\n");
+            return;
         }
+        k.puts("[NVME][WARN] canonical preload R4D failed or inactive; no second controller owner\r\n");
+        return;
     }
+    k.puts("[NVME][WARN] canonical preload R4D missing; no built-in controller fallback\r\n");
 }
 
 fn scanRegisteredBlockDevices() void {
@@ -202,13 +200,6 @@ fn scanRegisteredBlockDevices() void {
     while (ahci_slot < 8) : (ahci_slot += 1) {
         if (ahci.deviceIndexAt(ahci_slot)) |disk| {
             scanBlockDevice(&scanned, disk, "AHCI");
-        }
-    }
-
-    var nvme_slot: usize = 0;
-    while (nvme_slot < nvme.blockDeviceCount()) : (nvme_slot += 1) {
-        if (nvme.deviceIndexAt(nvme_slot)) |disk| {
-            scanBlockDevice(&scanned, disk, "NVMe");
         }
     }
 

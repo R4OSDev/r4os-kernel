@@ -85,10 +85,14 @@ const RequestSlot = struct {
     submit_tick: u64 = 0,
     start_tick: u64 = 0,
     complete_tick: u64 = 0,
-    // Once a runtime request has entered the backend, its buffer remains
-    // caller-owned until finishRequest publishes completion.  A timeout may
-    // therefore only latch the result; it must never recycle an active slot.
+    // Once a runtime request has entered the backend, its buffer must remain
+    // alive until finishRequest observes that the synchronous callback has
+    // returned.  A finite timeout detaches the caller and transfers bounce-
+    // buffer ownership to that late completion; the active slot itself is
+    // never recycled early.
     timeout_requested: bool = false,
+    caller_detached: bool = false,
+    backend_owns_buffer: bool = false,
 };
 
 const RequestExecution = struct {
@@ -107,6 +111,7 @@ const RequestExecution = struct {
 const RequestResult = struct {
     ok: bool = false,
     err: Error = .none,
+    buffer_detached: bool = false,
 };
 
 const ExecutionMode = enum(u8) {
@@ -626,7 +631,8 @@ fn readChunk(device: *Device, lba: u64, sectors: u16, out: []u8) Error {
         }
     else
         null;
-    defer if (bounce) |memory| {
+    var release_bounce = true;
+    defer if (release_bounce) if (bounce) |memory| {
         _ = heap.free(memory);
     };
     const request_buffer = if (bounce) |memory| memory.ptr else out.ptr;
@@ -637,6 +643,7 @@ fn readChunk(device: *Device, lba: u64, sectors: u16, out: []u8) Error {
     };
     scheduleDeviceQueue(device, use_runtime_worker);
     const result = waitForRequest(device, request_id, requestTimeout(device));
+    if (result.buffer_detached) release_bounce = false;
     if (!result.ok) return result.err;
     if (bounce) |memory| @memcpy(out[0..byte_count], memory[0..byte_count]);
     return .none;
@@ -687,7 +694,8 @@ fn writeChunk(device: *Device, lba: u64, sectors: u16, data: []const u8) Error {
         }
     else
         null;
-    defer if (bounce) |memory| {
+    var release_bounce = true;
+    defer if (release_bounce) if (bounce) |memory| {
         _ = heap.free(memory);
     };
     if (bounce) |memory| @memcpy(memory[0..byte_count], data[0..byte_count]);
@@ -699,6 +707,7 @@ fn writeChunk(device: *Device, lba: u64, sectors: u16, data: []const u8) Error {
     };
     scheduleDeviceQueue(device, use_runtime_worker);
     const result = waitForRequest(device, request_id, requestTimeout(device));
+    if (result.buffer_detached) release_bounce = false;
     return if (result.ok) .none else result.err;
 }
 
@@ -850,6 +859,7 @@ fn executeRequest(device: *Device, request: RequestExecution) RequestResult {
 }
 
 fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Error) void {
+    var detached_buffer: ?[]u8 = null;
     const locked = lockDevice(device);
     if (request.slot_index >= effectiveQueueDepth(device)) {
         unlockDevice(device, locked);
@@ -865,8 +875,16 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
     if (device.active_executions != 0) device.active_executions -= 1;
     const complete_tick = timer.tickCount();
     const latency = if (complete_tick >= request.start_tick) complete_tick - request.start_tick else 0;
-    slot.state = .completed;
     const timed_out = slot.timeout_requested;
+    const caller_detached = slot.caller_detached;
+    if (caller_detached and slot.backend_owns_buffer) {
+        detached_buffer = switch (request.kind) {
+            .read => if (request.buffer) |ptr| ptr[0..request.buffer_len] else null,
+            .write => if (request.const_buffer) |ptr| @constCast(ptr[0..request.buffer_len]) else null,
+            else => null,
+        };
+    }
+    slot.state = .completed;
     slot.ok = if (timed_out) false else ok;
     slot.err = if (timed_out) .timeout else err;
     slot.complete_tick = complete_tick;
@@ -876,15 +894,17 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
     device.stats.completion_total_ticks +%= latency;
     if (latency > device.stats.completion_max_ticks) device.stats.completion_max_ticks = latency;
     if (timed_out) {
-        recordRequestFailure(device, request.kind, .timeout);
+        if (!caller_detached) recordRequestFailure(device, request.kind, .timeout);
     } else if (ok) {
         recordRequestSuccess(device, request.kind, request.sectors);
     } else {
         recordRequestFailure(device, request.kind, err);
     }
-    _ = device.completion_available.wakeAll();
-    device.stats.completion_signals +%= 1;
-    runtime_summary.completion_signals +%= 1;
+    if (!caller_detached) {
+        _ = device.completion_available.wakeAll();
+        device.stats.completion_signals +%= 1;
+        runtime_summary.completion_signals +%= 1;
+    }
     switch (request.mode) {
         .boot_inline => {
             device.stats.boot_inline_completions +%= 1;
@@ -895,8 +915,12 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
             runtime_summary.worker_runtime_completions +%= 1;
         },
     }
-    _ = device.slot_available.wakeOne();
+    if (caller_detached) {
+        slot.* = .{};
+        _ = device.slot_available.wakeOne();
+    }
     unlockDevice(device, locked);
+    if (detached_buffer) |memory| _ = heap.free(memory);
 }
 
 // Storage-wait watchdog (0.60.20): a device registered without a timeout
@@ -904,12 +928,11 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
 // (worker stuck in the driver, lost completion) then froze the whole
 // system, because the requester holds the FS request path while it sleeps.
 // Now every wait runs in bounded observation slices.  A queued request can
-// be cancelled safely when its caller timeout expires.  An active request
-// cannot: the synchronous backend still owns raw caller-buffer pointers.
-// Its timeout is latched and returned only after the backend has stopped
-// touching those pointers.  WAIT_FOREVER remains an ownership-safe forever
-// wait, but produces a visible first snapshot followed by exponentially
-// backed-off updates so the original root cause survives in bounded logs.
+// be cancelled safely when its caller timeout expires.  An active runtime
+// request detaches its caller: the worker retains the non-pageable bounce
+// buffer and frees it only after the backend callback returns.  This bounds
+// caller latency without an unsafe early free or slot reuse. WAIT_FOREVER
+// remains an ownership-safe forever wait and keeps the backed-off reports.
 const WATCHDOG_SLICE_TICKS: u64 = 5 * @as(u64, timer.DEFAULT_HZ);
 
 fn shouldReportWatchdogSlice(slices: u32) bool {
@@ -1091,7 +1114,6 @@ fn putDec(value: u64) void {
 fn waitForRequest(device: *Device, request_id: u64, timeout: u64) RequestResult {
     var counted_wait = false;
     var watchdog_slices: u32 = 0;
-    var timeout_latched = false;
     var incident_token: diag_screen.IncidentToken = .{};
     defer if (incident_token.valid()) {
         // Success and classified failure both end this reporter's lifetime.
@@ -1127,7 +1149,7 @@ fn waitForRequest(device: *Device, request_id: u64, timeout: u64) RequestResult 
             continue;
         }
 
-        if (forever or timeout_latched) {
+        if (forever) {
             const wait_result = device.completion_available.wait(WATCHDOG_SLICE_TICKS, "block-completion");
             if (wait_result == .signaled) continue;
             watchdog_slices += 1;
@@ -1160,13 +1182,16 @@ fn waitForRequest(device: *Device, request_id: u64, timeout: u64) RequestResult 
                         timeout_slot.timeout_requested = true;
                         device.stats.completion_timeouts +%= 1;
                     }
-                    timeout_latched = true;
+                    timeout_slot.caller_detached = true;
+                    timeout_slot.backend_owns_buffer = timeout_slot.kind == .read or timeout_slot.kind == .write;
+                    recordRequestFailure(device, timeout_slot.kind, .timeout);
+                    const buffer_detached = timeout_slot.backend_owns_buffer;
                     unlockDevice(device, timeout_locked);
                     watchdog_slices += 1;
                     if (shouldReportWatchdogSlice(watchdog_slices)) {
                         watchdogReport(device, request_id, watchdog_slices, &incident_token);
                     }
-                    continue;
+                    return .{ .err = .timeout, .buffer_detached = buffer_detached };
                 },
                 .completed => {
                     unlockDevice(device, timeout_locked);
