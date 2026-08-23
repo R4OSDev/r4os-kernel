@@ -45,6 +45,7 @@ pub const LockRank = struct {
     // Block-Device (der Cache ruft block.read/write, die yielden).
     pub const fs_page_cache: u16 = 155;
     pub const block_device: u16 = 160;
+    pub const audio_core: u16 = 280;
     pub const driver_registry: u16 = 300;
     pub const protocol_registry: u16 = 320;
     pub const display_state: u16 = 400;

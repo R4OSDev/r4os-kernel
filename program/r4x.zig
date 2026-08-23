@@ -5402,10 +5402,10 @@ fn configureR4XStartR4NetTable() void {
 
 fn configureR4XStartR4AudioTable() void {
     r4xstart_r4audio_table = r4x_api.buildR4AudioTable(.{
-        .audio_open_stream = &r4api.r4audio.openStream,
-        .audio_write = &r4api.r4audio.write,
-        .audio_close = &r4api.r4audio.close,
-        .audio_set_volume = &r4api.r4audio.setVolume,
+        .audio_open_stream = &apiAudioOpenStream,
+        .audio_write = &apiAudioWrite,
+        .audio_close = &apiAudioClose,
+        .audio_set_volume = &apiAudioSetVolume,
         .sid_acquire = &r4api.r4audio.sidAcquire,
         .sid_write_register = &r4api.r4audio.sidWriteRegister,
         .sid_release = &r4api.r4audio.sidRelease,
@@ -5422,6 +5422,38 @@ fn configureR4XStartR4AudioTable() void {
         .opl3_render_block = &r4api.r4audio.opl3RenderBlock,
         .opl3_stop = &r4api.r4audio.opl3Stop,
     });
+}
+
+fn apiAudioOpenStream(rate: u32, channels: u16, format: u16) callconv(.c) i32 {
+    const handle = currentProgramHandle() orelse return r4x_api.service_api_result_invalid;
+    return audio.openStreamForOwner(.{
+        .instance_id = handle.instance_id,
+        .generation = handle.generation,
+    }, rate, channels, format);
+}
+
+fn apiAudioWrite(stream_id: u32, data_ptr: [*]const u8, byte_count: u32) callconv(.c) i32 {
+    const handle = currentProgramHandle() orelse return r4x_api.service_api_result_invalid;
+    return audio.writeStreamForOwner(.{
+        .instance_id = handle.instance_id,
+        .generation = handle.generation,
+    }, stream_id, data_ptr, byte_count);
+}
+
+fn apiAudioClose(stream_id: u32) callconv(.c) i32 {
+    const handle = currentProgramHandle() orelse return r4x_api.service_api_result_invalid;
+    return audio.closeStreamForOwner(.{
+        .instance_id = handle.instance_id,
+        .generation = handle.generation,
+    }, stream_id);
+}
+
+fn apiAudioSetVolume(stream_id: u32, fixed_volume: u32) callconv(.c) i32 {
+    const handle = currentProgramHandle() orelse return r4x_api.service_api_result_invalid;
+    return audio.setVolumeForOwner(.{
+        .instance_id = handle.instance_id,
+        .generation = handle.generation,
+    }, stream_id, fixed_volume);
 }
 
 fn fillProgramInstanceStorageSummary(out: *r4api.r4dev.ProgramInstanceStorageSummary) void {
@@ -7370,14 +7402,12 @@ fn runForegroundProgram(reservation: *const ProgramInstanceReservation, reservat
                 last_exit_code = completion.exit_code;
                 last_display_used = (completion.flags & PROGRAM_COMPLETION_FLAG_DISPLAY_USED) != 0;
             }
-            audio.closeAllStreams();
             return .ran;
         }
         if (programSpawnTransactionCancelled()) {
             cancelPublishedSpawn(handle);
             setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_TASK_FAILED);
             abandonProgramCompletion(handle);
-            audio.closeAllStreams();
             return .failed;
         }
         scheduler.yield();
@@ -13680,6 +13710,10 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                 if (!releaseThreadsForHandle(handle)) return deferProgramRetire(handle);
                 if (!purgeCancelledAsyncIoRequestsForHandle(handle)) return deferProgramRetire(handle);
                 if (!r4api.r4sys.releaseStreamSlotsForProgram(handle.instance_id, handle.generation)) return deferProgramRetire(handle);
+                if (!audio.closeStreamsForOwner(.{
+                    .instance_id = handle.instance_id,
+                    .generation = handle.generation,
+                })) return deferProgramRetire(handle);
                 if (!advanceProgramRetirePhase(slot, handle, completion, .detach_task, .output_detach)) return deferProgramRetire(handle);
                 if (consumeProgramLifecycleFailure(.detach_task)) return deferProgramRetire(handle);
                 phase = .output_detach;

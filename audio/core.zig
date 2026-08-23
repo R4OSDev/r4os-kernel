@@ -1,12 +1,15 @@
 const bootlog = @import("../kernel/bootlog.zig");
 const heap = @import("../memory/heap.zig");
 const phys = @import("../memory/phys.zig");
+const sync = @import("../sched/sync.zig");
 const timer = @import("../kernel/timer.zig");
 const protocol_api = @import("../kernel/protocol_api.zig");
 const r4p = @import("../program/r4p.zig");
 const r4x_api = @import("../program/r4x_api.zig");
 const r4p_contract = @import("../net/r4p_contract.zig");
 const k = @import("../kernel/log.zig");
+const mixer = @import("mixer.zig");
+const pcm = @import("pcm.zig");
 
 pub const FORMAT_S16LE: u16 = 1;
 pub const FORMAT_U8: u16 = 2;
@@ -19,6 +22,10 @@ const MAX_AUDIO_BACKENDS: usize = 4;
 const MAX_SYNTH_ENGINES: usize = 8;
 const SID_REGISTER_COUNT: u8 = 25;
 const SID_RENDER_BYTES: usize = 3840;
+const MIX_QUANTUM_BYTES: usize = 480 * pcm.TARGET_FRAME_BYTES;
+
+pub const StreamOwner = mixer.Owner;
+pub const kernel_stream_owner: StreamOwner = .{};
 
 pub const MidiProtocolStatus = struct {
     source: []const u8 = "none",
@@ -112,13 +119,17 @@ pub const StreamState = enum(u8) {
 const Stream = struct {
     state: StreamState = .empty,
     id: u32 = 0,
+    owner: StreamOwner = .{},
     rate: u32 = 0,
     channels: u16 = 0,
     format: u16 = 0,
     volume: u32 = 0x0001_0000,
     ring: []u8 = &empty_ring,
+    read_pos: usize = 0,
     write_pos: usize = 0,
     available: usize = 0,
+    deferred_once: bool = false,
+    resampler: pcm.ResamplerState = .{},
     total_written: u64 = 0,
 };
 
@@ -175,6 +186,8 @@ const AudioBackend = struct {
 
 var empty_ring: [0]u8 = .{};
 var streams: [MAX_STREAMS]Stream = .{Stream{}} ** MAX_STREAMS;
+var stream_lock = sync.Mutex.initClass("audio-streams", sync.LockRank.audio_core, .sleepable);
+var mix_scratch: [MIX_QUANTUM_BYTES]u8 = .{0} ** MIX_QUANTUM_BYTES;
 var next_stream_id: u32 = 1;
 var audio_backends: [MAX_AUDIO_BACKENDS]AudioBackend = .{AudioBackend{}} ** MAX_AUDIO_BACKENDS;
 var active_audio_slot: ?usize = null;
@@ -273,7 +286,12 @@ pub const PerformanceSummary = struct {
 };
 
 pub fn init() void {
-    streams = .{Stream{}} ** MAX_STREAMS;
+    for (&streams) |*stream| {
+        const reusable_ring = stream.ring;
+        stream.* = .{};
+        if (reusable_ring.len == RING_BYTES) stream.ring = reusable_ring;
+    }
+    stream_lock = sync.Mutex.initClass("audio-streams", sync.LockRank.audio_core, .sleepable);
     next_stream_id = 1;
     audio_backends = .{AudioBackend{}} ** MAX_AUDIO_BACKENDS;
     active_audio_slot = null;
@@ -355,16 +373,27 @@ pub fn sidProtocolStatus() SidProtocolStatus {
 }
 
 pub fn openStream(rate: u32, channels: u16, format: u16) i32 {
-    if (!validStreamFormat(rate, channels, format)) return -1;
-    const slot = freeStreamSlot() orelse return -2;
-    const ring = heap.alloc(RING_BYTES, 16) orelse return -3;
+    return openStreamForOwner(kernel_stream_owner, rate, channels, format);
+}
+
+pub fn openStreamForOwner(owner: StreamOwner, rate: u32, channels: u16, format: u16) i32 {
+    if (!owner.valid() or !validStreamFormat(rate, channels, format)) return r4x_api.service_api_result_invalid;
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
+    defer _ = stream_lock.unlock();
+    if (!activeOutputPresent()) return r4x_api.service_api_result_no_endpoint;
+    const slot = freeStreamSlotLocked() orelse return r4x_api.service_api_result_full;
+    const ring = if (streams[slot].ring.len == RING_BYTES)
+        streams[slot].ring
+    else
+        heap.alloc(RING_BYTES, 16) orelse return -3;
     const id = next_stream_id;
-    next_stream_id += 1;
+    next_stream_id +%= 1;
     if (next_stream_id == 0) next_stream_id = 1;
 
     streams[slot] = .{
         .state = .open,
         .id = id,
+        .owner = owner,
         .rate = rate,
         .channels = channels,
         .format = format,
@@ -377,71 +406,149 @@ pub fn openStream(rate: u32, channels: u16, format: u16) i32 {
 }
 
 pub fn writeStream(id: u32, ptr: [*]const u8, byte_count: u32) i32 {
+    return writeStreamForOwner(kernel_stream_owner, id, ptr, byte_count);
+}
+
+pub fn writeStreamForOwner(owner: StreamOwner, id: u32, ptr: [*]const u8, byte_count: u32) i32 {
     const write_start = timer.tickCount();
-    const s = streamById(id) orelse return -1;
+    if (!owner.valid()) return r4x_api.service_api_result_invalid;
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
+    defer _ = stream_lock.unlock();
+    const stream = streamByOwnerLocked(owner, id) orelse return r4x_api.service_api_result_not_found;
     if (byte_count == 0) return 0;
-    const max_write = if (byte_count < s.ring.len) @as(usize, @intCast(byte_count)) else s.ring.len;
-    const max_write_u32: u32 = @intCast(max_write);
-    const backend_start = timer.tickCount();
-    if (writeActivePcm(ptr[0..max_write], s.rate, s.channels, s.format)) |result| {
-        backend_write_calls +%= 1;
-        recordTickStat(&backend_write_total_ticks, &backend_write_max_ticks, &backend_write_last_ticks, backend_start);
-        if (result == 0) {
-            total_backend_ok += 1;
-        } else {
-            if (result != r4x_api.service_api_result_busy) total_backend_fail += 1;
+    if (!activeOutputPresent()) {
+        total_backend_fail +%= 1;
+        recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
+        return r4x_api.service_api_result_no_endpoint;
+    }
+
+    const frame_bytes = pcm.sourceFrameBytes(stream.channels, stream.format) orelse return r4x_api.service_api_result_invalid;
+    const requested_bytes: usize = @intCast(byte_count);
+    const requested_frames = requested_bytes / frame_bytes;
+    if (requested_frames == 0) return r4x_api.service_api_result_invalid;
+
+    var free_output_frames = (stream.ring.len - stream.available) / pcm.TARGET_FRAME_BYTES;
+    var fitting_frames: usize = @intCast((@as(u64, free_output_frames) * stream.rate) / pcm.TARGET_RATE);
+    var accepted_frames = @min(requested_frames, fitting_frames);
+    if (accepted_frames == 0) {
+        const pre_pump = pumpAvailableLocked(true);
+        if (pre_pump < 0) {
             recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
-            return result;
+            return pre_pump;
+        }
+        free_output_frames = (stream.ring.len - stream.available) / pcm.TARGET_FRAME_BYTES;
+        fitting_frames = @intCast((@as(u64, free_output_frames) * stream.rate) / pcm.TARGET_RATE);
+        accepted_frames = @min(requested_frames, fitting_frames);
+    }
+    if (accepted_frames == 0) {
+        recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
+        return r4x_api.service_api_result_busy;
+    }
+
+    const accepted_bytes = accepted_frames * frame_bytes;
+    const input = ptr[0..accepted_bytes];
+    const was_empty = stream.available == 0;
+    stream.resampler.beginChunk(stream.rate, stream.channels, stream.format);
+    while (!stream.resampler.chunk_done) {
+        const produced = pcm.convertStreamingToStereoS16(
+            &stream.resampler,
+            input,
+            stream.rate,
+            stream.channels,
+            stream.format,
+            mix_scratch[0..],
+        );
+        if (produced == 0 or mixer.ringWrite(stream.ring, &stream.write_pos, &stream.available, mix_scratch[0..produced]) != produced) {
+            recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
+            return r4x_api.service_api_result_busy;
         }
     }
-    if (byte_count > max_write_u32) {
+    if (was_empty) stream.deferred_once = false;
+    if (stream.available > stream_available_high_water) stream_available_high_water = @intCast(stream.available);
+    stream.total_written +%= accepted_bytes;
+    total_stream_writes +%= 1;
+    if (accepted_bytes < requested_bytes) {
         stream_write_truncations +%= 1;
-        stream_dropped_bytes +%= @as(u64, byte_count - max_write_u32);
+        stream_dropped_bytes +%= requested_bytes - accepted_bytes;
     }
-    var i: usize = 0;
-    while (i < max_write) : (i += 1) {
-        s.ring[(s.write_pos + i) % s.ring.len] = ptr[i];
-    }
-    s.write_pos = (s.write_pos + max_write) % s.ring.len;
-    s.available = if (s.available + max_write > s.ring.len) s.ring.len else s.available + max_write;
-    if (s.available > stream_available_high_water) stream_available_high_water = @intCast(s.available);
-    s.total_written += max_write;
-    total_stream_writes += 1;
-    mixAvailable(s);
+
+    _ = pumpAvailableLocked(false);
     recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
-    return @intCast(max_write);
+    return @intCast(accepted_bytes);
 }
 
 pub fn closeStream(id: u32) i32 {
-    const s = streamById(id) orelse return -1;
-    s.state = .closed;
-    s.available = 0;
-    if (openStreamCountExcept(id) == 0) {
-        stopActivePcm();
+    return closeStreamForOwner(kernel_stream_owner, id);
+}
+
+pub fn closeStreamForOwner(owner: StreamOwner, id: u32) i32 {
+    if (!owner.valid()) return r4x_api.service_api_result_invalid;
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
+    defer _ = stream_lock.unlock();
+    const stream = streamByOwnerLocked(owner, id) orelse return r4x_api.service_api_result_not_found;
+    const pump_result = pumpAvailableLocked(true);
+    if (pump_result < 0) return pump_result;
+    if (openStreamCountLocked() == 1 and !sid_acquired and !midi_acquired) {
+        const stop_result = stopActivePcmResult();
+        if (stop_result < 0) return stop_result;
     }
+    if (!releaseStreamLocked(stream)) return -3;
     bootlog.puts("[AUDIO] stream close id=");
     bootlog.putDec(id);
     bootlog.puts("\r\n");
     return 0;
 }
 
-pub fn closeAllStreams() void {
-    var had_open = false;
-    var i: usize = 0;
-    while (i < streams.len) : (i += 1) {
-        if (streams[i].state != .open) continue;
-        had_open = true;
-        streams[i].state = .closed;
-        streams[i].available = 0;
+pub fn closeStreamsForOwner(owner: StreamOwner) bool {
+    if (!owner.valid() or (owner.instance_id == 0 and owner.generation == 0)) return false;
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return false;
+    defer _ = stream_lock.unlock();
+
+    var matching: u32 = 0;
+    var owner_queued = false;
+    for (&streams) |*stream| {
+        if (stream.state != .open or !mixer.sameOwner(stream.owner, owner)) continue;
+        matching += 1;
+        owner_queued = owner_queued or stream.available != 0;
     }
-    if (had_open) {
-        stopActivePcm();
+    if (matching == 0) return true;
+    if (owner_queued and activeOutputPresent() and pumpAvailableLocked(true) < 0) return false;
+    if (matching == openStreamCountLocked() and !sid_acquired and !midi_acquired) {
+        if (stopActivePcmResult() < 0) return false;
+    }
+
+    var released = true;
+    for (&streams) |*stream| {
+        if (stream.state != .open or !mixer.sameOwner(stream.owner, owner)) continue;
+        stream_dropped_bytes +%= stream.available;
+        stream.available = 0;
+        if (!releaseStreamLocked(stream)) released = false;
+    }
+    return released;
+}
+
+pub fn closeAllStreams() void {
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return;
+    defer _ = stream_lock.unlock();
+    _ = stopActivePcmResult();
+    for (&streams) |*stream| {
+        if (stream.state != .open) continue;
+        stream_dropped_bytes +%= stream.available;
+        stream.available = 0;
+        _ = releaseStreamLocked(stream);
     }
 }
 
 pub fn setVolume(id: u32, fixed_volume: u32) i32 {
-    const s = streamById(id) orelse return -1;
-    s.volume = fixed_volume;
+    return setVolumeForOwner(kernel_stream_owner, id, fixed_volume);
+}
+
+pub fn setVolumeForOwner(owner: StreamOwner, id: u32, fixed_volume: u32) i32 {
+    if (!owner.valid()) return r4x_api.service_api_result_invalid;
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
+    defer _ = stream_lock.unlock();
+    const stream = streamByOwnerLocked(owner, id) orelse return r4x_api.service_api_result_not_found;
+    stream.volume = fixed_volume;
     return 0;
 }
 
@@ -571,9 +678,7 @@ pub fn midiClose(handle: u32) i32 {
     stopActiveMidiSynth();
     active_midi_synth_slot = null;
     midi_acquired = false;
-    if (openStreamCountExcept(0) == 0) {
-        stopActivePcm();
-    }
+    stopPcmIfNoStreams();
     return 0;
 }
 
@@ -830,6 +935,8 @@ pub fn audioBackendHasOutput(name: []const u8) bool {
 }
 
 pub fn performanceSummary() PerformanceSummary {
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return .{};
+    defer _ = stream_lock.unlock();
     var out = PerformanceSummary{
         .total_stream_writes = total_stream_writes,
         .backend_ok = total_backend_ok,
@@ -852,10 +959,10 @@ pub fn performanceSummary() PerformanceSummary {
     };
     var i: usize = 0;
     while (i < streams.len) : (i += 1) {
+        out.stream_ring_bytes +%= @intCast(streams[i].ring.len);
         switch (streams[i].state) {
             .open => {
                 out.open_streams += 1;
-                out.stream_ring_bytes +%= @intCast(streams[i].ring.len);
                 out.stream_available_bytes +%= @intCast(streams[i].available);
             },
             .closed => out.closed_streams += 1,
@@ -896,6 +1003,8 @@ pub fn performanceSummary() PerformanceSummary {
 }
 
 pub fn dumpStatus() void {
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return;
+    defer _ = stream_lock.unlock();
     k.puts("Audio:\r\n");
     k.puts("  Backend: ");
     if (active_audio_slot) |slot| {
@@ -1325,13 +1434,18 @@ fn writeActivePcm(data: []const u8, rate: u32, channels: u16, format: u16) ?i32 
 }
 
 fn stopActivePcm() void {
-    const slot = active_audio_slot orelse return;
+    _ = stopActivePcmResult();
+}
+
+fn stopActivePcmResult() i32 {
+    const slot = active_audio_slot orelse return 0;
     const backend = &audio_backends[slot];
     if (backend.stop_pcm) |stop_pcm| {
         stop_pcm();
-        return;
+        return 0;
     }
-    if (backend.stop_pcm_ctx) |stop_pcm_ctx| _ = stop_pcm_ctx(backend.context);
+    if (backend.stop_pcm_ctx) |stop_pcm_ctx| return stop_pcm_ctx(backend.context);
+    return 0;
 }
 
 fn activateFirstNativeBackend() void {
@@ -1544,7 +1658,14 @@ fn validStreamFormat(rate: u32, channels: u16, format: u16) bool {
     return format == FORMAT_S16LE or format == FORMAT_U8;
 }
 
-fn freeStreamSlot() ?usize {
+fn activeOutputPresent() bool {
+    const slot = active_audio_slot orelse return false;
+    const backend = &audio_backends[slot];
+    return backend.registered and backend.active and
+        (backend.write_pcm != null or backend.write_pcm_ctx != null);
+}
+
+fn freeStreamSlotLocked() ?usize {
     var i: usize = 0;
     while (i < streams.len) : (i += 1) {
         if (streams[i].state == .empty or streams[i].state == .closed) return i;
@@ -1552,26 +1673,108 @@ fn freeStreamSlot() ?usize {
     return null;
 }
 
-fn streamById(id: u32) ?*Stream {
+fn streamByOwnerLocked(owner: StreamOwner, id: u32) ?*Stream {
     var i: usize = 0;
     while (i < streams.len) : (i += 1) {
-        if (streams[i].state == .open and streams[i].id == id) return &streams[i];
+        if (streams[i].state == .open and streams[i].id == id and mixer.sameOwner(streams[i].owner, owner)) return &streams[i];
     }
     return null;
 }
 
-fn openStreamCountExcept(closing_id: u32) u32 {
+fn openStreamCountLocked() u32 {
     var count: u32 = 0;
     var i: usize = 0;
     while (i < streams.len) : (i += 1) {
-        if (streams[i].state == .open and streams[i].id != closing_id) count += 1;
+        if (streams[i].state == .open) count += 1;
     }
     return count;
 }
 
-fn mixAvailable(stream: *Stream) void {
-    if (!mixer_backend.active) return;
-    stream.available = 0;
+fn releaseStreamLocked(stream: *Stream) bool {
+    const id = stream.id;
+    const reusable_ring = stream.ring;
+    stream.* = .{ .state = .closed, .id = id, .ring = reusable_ring };
+    return true;
+}
+
+fn pumpAvailableLocked(force: bool) i32 {
+    const max_passes = MAX_STREAMS * (RING_BYTES / MIX_QUANTUM_BYTES + 2);
+    var pass: usize = 0;
+    while (pass < max_passes) : (pass += 1) {
+        var selected: [MAX_STREAMS]bool = .{false} ** MAX_STREAMS;
+        var open_count: u32 = 0;
+        var ready_count: u32 = 0;
+        var single_ready: usize = 0;
+        var chunk_bytes: usize = MIX_QUANTUM_BYTES;
+
+        for (&streams, 0..) |*stream, index| {
+            if (stream.state != .open) continue;
+            open_count += 1;
+            if (stream.available < pcm.TARGET_FRAME_BYTES) continue;
+            ready_count += 1;
+            single_ready = index;
+        }
+        if (ready_count == 0) return 0;
+
+        if (ready_count == 1) {
+            const stream = &streams[single_ready];
+            if (open_count > 1 and !force and !stream.deferred_once) {
+                stream.deferred_once = true;
+                return 0;
+            }
+            selected[single_ready] = true;
+            chunk_bytes = @min(chunk_bytes, stream.available);
+        } else {
+            for (&streams, 0..) |*stream, index| {
+                if (stream.state != .open or stream.available < pcm.TARGET_FRAME_BYTES) continue;
+                selected[index] = true;
+                chunk_bytes = @min(chunk_bytes, stream.available);
+            }
+        }
+
+        chunk_bytes -= chunk_bytes % pcm.TARGET_FRAME_BYTES;
+        if (chunk_bytes == 0) return 0;
+        var byte_offset: usize = 0;
+        while (byte_offset < chunk_bytes) : (byte_offset += 2) {
+            var total: i64 = 0;
+            for (&streams, 0..) |*stream, index| {
+                if (!selected[index]) continue;
+                total = mixer.accumulateSample(
+                    total,
+                    mixer.ringReadS16(stream.ring, stream.read_pos, byte_offset),
+                    stream.volume,
+                );
+            }
+            mixer.writeS16(mix_scratch[0..], byte_offset, mixer.clampSample(total));
+        }
+
+        const backend_start = timer.tickCount();
+        const result = writeActivePcm(
+            mix_scratch[0..chunk_bytes],
+            pcm.TARGET_RATE,
+            pcm.TARGET_CHANNELS,
+            pcm.FORMAT_S16LE,
+        ) orelse r4x_api.service_api_result_no_endpoint;
+        backend_write_calls +%= 1;
+        recordTickStat(&backend_write_total_ticks, &backend_write_max_ticks, &backend_write_last_ticks, backend_start);
+        if (result != 0) {
+            if (result != r4x_api.service_api_result_busy) total_backend_fail +%= 1;
+            return result;
+        }
+        total_backend_ok +%= 1;
+        for (&streams, 0..) |*stream, index| {
+            if (!selected[index]) continue;
+            mixer.ringConsume(stream.ring.len, &stream.read_pos, &stream.available, chunk_bytes);
+            stream.deferred_once = false;
+        }
+    }
+    return r4x_api.service_api_result_busy;
+}
+
+fn stopPcmIfNoStreams() void {
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return;
+    defer _ = stream_lock.unlock();
+    if (openStreamCountLocked() == 0) stopActivePcm();
 }
 
 fn copyZ(ptr: [*:0]const u8, out: []u8) ?[]const u8 {
