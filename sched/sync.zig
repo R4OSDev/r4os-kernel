@@ -408,15 +408,20 @@ pub const Completion = struct {
     }
 
     pub fn completeAll(self: *Completion) void {
+        _ = self.completeAllCount();
+    }
+
+    pub fn completeAllCount(self: *Completion) u32 {
         const irq_flags = self.queue.enterCritical();
         defer self.queue.leaveCritical(irq_flags);
-        if (self.queue.core.closing) return;
+        if (self.queue.core.closing) return 0;
         const woke = self.queue.wakeAllWithLocked(.signaled);
         if (woke == 0) {
             self.completed +|= 1;
         } else {
             global_summary.wake_all +%= 1;
         }
+        return woke;
     }
 
     pub fn cancelAll(self: *Completion) u32 {

@@ -366,7 +366,15 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     const audio_count = cleanupAudioOwner(owner);
     const usb_host_count = usb_host.cleanupOwner(owner);
     const irq_count = irq_router.cleanupOwner(owner);
-    const work_count = driver_work.cleanupOwner(owner);
+    const work_cleanup = driver_work.cleanupOwner(owner);
+    if (!work_cleanup.quiesced) {
+        token.active = false;
+        bootlog.puts("[R4D] cleanup owner=");
+        bootlog.putDec(owner);
+        bootlog.puts(" work-quiesce=FAILED dma=retained resources=quarantined\r\n");
+        return false;
+    }
+    const work_count = work_cleanup.removed;
     const dma_count = cleanupDmaOwner(owner);
     token.active = false;
 

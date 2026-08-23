@@ -5699,6 +5699,7 @@ fn configureR4XStartR4DevTable() void {
         .performance_boot_phase_clock = &r4api.r4dev.performanceBootPhaseClock,
         .performance_irq_timing = &r4api.r4dev.performanceIrqTiming,
         .performance_boot_summary = &r4api.r4dev.performanceBootSummary,
+        .performance_driver_work = &r4api.r4dev.performanceDriverWork,
     });
 }
 

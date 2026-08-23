@@ -49,6 +49,8 @@ pub const KernelVersion = r4x_api.KernelVersion;
 pub const ProgramBootPhaseClockInfo = r4x_api.ProgramBootPhaseClockInfo;
 pub const ProgramBootPerformanceInfo = r4x_api.ProgramBootPerformanceInfo;
 pub const ProgramIrqTimingInfo = r4x_api.ProgramIrqTimingInfo;
+pub const ProgramDriverWorkPerformanceMetrics = r4x_api.ProgramDriverWorkPerformanceMetrics;
+pub const ProgramDriverWorkPerformanceInfo = r4x_api.ProgramDriverWorkPerformanceInfo;
 
 pub const ProgramMemoryBlockInfo = r4x_api.ProgramMemoryBlockInfo;
 
@@ -2534,6 +2536,24 @@ pub fn performanceBootSummary(out: *ProgramBootPerformanceInfo) callconv(.c) i32
         .transition_count = boot.transition_count,
     };
     return if (boot.initialized) 1 else 0;
+}
+
+pub fn performanceDriverWork(owner: u32, out: *ProgramDriverWorkPerformanceInfo) callconv(.c) i32 {
+    comptime {
+        if (@sizeOf(driver_work.PerformanceMetrics) != @sizeOf(ProgramDriverWorkPerformanceMetrics) or
+            @alignOf(driver_work.PerformanceMetrics) != @alignOf(ProgramDriverWorkPerformanceMetrics) or
+            @sizeOf(driver_work.Performance) != @sizeOf(ProgramDriverWorkPerformanceInfo) or
+            @alignOf(driver_work.Performance) != @alignOf(ProgramDriverWorkPerformanceInfo))
+        {
+            @compileError("driver-work performance contract drift");
+        }
+    }
+    if (owner > driver_work.OWNER_CAPACITY) {
+        out.* = .{ .selected_owner = owner };
+        return -1;
+    }
+    out.* = @bitCast(driver_work.performance(owner));
+    return 1;
 }
 
 pub fn performanceIrqTiming(irq: u32, out: *ProgramIrqTimingInfo) callconv(.c) i32 {
