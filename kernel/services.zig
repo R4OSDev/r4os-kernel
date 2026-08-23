@@ -1,3 +1,4 @@
+const std = @import("std");
 const r4x_api = @import("../program/r4x_api.zig");
 const sync = @import("../sched/sync.zig");
 const task_context = @import("../sched/task_context.zig");
@@ -178,12 +179,26 @@ pub const PerformanceSummary = struct {
     targeted_response_wake_misses: u64 = 0,
     admission_waits: u64 = 0,
     admission_timeouts: u64 = 0,
+    payload_copy_bytes: u64 = 0,
+    payload_clear_bytes: u64 = 0,
+    slot_metadata_resets: u64 = 0,
+    endpoint_metadata_resets: u64 = 0,
+    endpoint_payload_reset_bytes: u64 = 0,
+};
+
+const LifetimePerformance = struct {
+    payload_copy_bytes: u64 = 0,
+    payload_clear_bytes: u64 = 0,
+    slot_metadata_resets: u64 = 0,
+    endpoint_metadata_resets: u64 = 0,
+    endpoint_payload_reset_bytes: u64 = 0,
 };
 
 var entries: [MAX_SERVICES]Entry = .{Entry{}} ** MAX_SERVICES;
 var endpoints: [MAX_ENDPOINTS]Endpoint = .{Endpoint{}} ** MAX_ENDPOINTS;
 var next_endpoint_handle: u32 = 1;
 var next_request_id: u32 = 1;
+var lifetime_performance: LifetimePerformance = .{};
 var registry_lock = sync.Mutex.initClass("service-registry", sync.LockRank.service_registry, .sleepable);
 
 fn lockRegistry() bool {
@@ -332,7 +347,13 @@ pub fn countUsed() usize {
 pub fn performanceSummary() PerformanceSummary {
     const locked = lockRegistry();
     defer unlockRegistry(locked);
-    var out = PerformanceSummary{};
+    var out = PerformanceSummary{
+        .payload_copy_bytes = lifetime_performance.payload_copy_bytes,
+        .payload_clear_bytes = lifetime_performance.payload_clear_bytes,
+        .slot_metadata_resets = lifetime_performance.slot_metadata_resets,
+        .endpoint_metadata_resets = lifetime_performance.endpoint_metadata_resets,
+        .endpoint_payload_reset_bytes = lifetime_performance.endpoint_payload_reset_bytes,
+    };
     var i: usize = 0;
     while (i < entries.len) : (i += 1) {
         const e = &entries[i];
@@ -471,12 +492,12 @@ pub fn registerEndpoint(name: []const u8, instance_id: u32, flags: u32, out: *Ap
         return API_OK;
     }
     const free = freeEndpointSlot() orelse return API_ERR_FULL;
-    endpoints[free] = .{
-        .used = true,
-        .service_slot = slot,
-        .handle = allocateEndpointHandle(),
-        .flags = flags,
-    };
+    var ep = &endpoints[free];
+    resetEndpointMetadata(ep, true);
+    ep.used = true;
+    ep.service_slot = slot;
+    ep.handle = allocateEndpointHandle();
+    ep.flags = flags;
     fillApiInfo(slot, out, now_ticks);
     return API_OK;
 }
@@ -485,8 +506,7 @@ pub fn unregisterEndpoint(handle: u32) i32 {
     const locked = lockRegistry();
     defer unlockRegistry(locked);
     const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    wakeEndpointWaiters(&endpoints[idx], .cancelled);
-    endpoints[idx] = .{};
+    retireEndpoint(&endpoints[idx], .cancelled);
     return API_OK;
 }
 
@@ -727,16 +747,19 @@ fn publishRequestLocked(ep: *Endpoint, client_id: u32, op: u16, payload: []const
     };
     var slot = &ep.queue[slot_idx];
     const request_id = allocateRequestId();
-    slot.* = .{
-        .state = .queued,
-        .request_id = request_id,
-        .client_id = client_id,
-        .op = op,
-        .flags = ep.flags,
-        .request_len = @intCast(payload.len),
-        .response_status = API_OK,
-    };
-    if (payload.len > 0) @memcpy(slot.request_payload[0..payload.len], payload);
+    resetRequestSlotMetadata(slot);
+    slot.request_id = request_id;
+    slot.client_id = client_id;
+    slot.op = op;
+    slot.flags = ep.flags;
+    slot.request_len = @intCast(payload.len);
+    if (payload.len > 0) {
+        @memcpy(slot.request_payload[0..payload.len], payload);
+        lifetime_performance.payload_copy_bytes +%= payload.len;
+    }
+    // Der Zustand wird zuletzt publiziert. Damit sind nur die neu gesetzten
+    // Laengen sichtbar; alte Bytes hinter request_len bleiben unerreichbar.
+    slot.state = .queued;
     ep.requests +%= 1;
     noteQueueHighWater(ep);
     _ = ep.requests_available.wakeOne();
@@ -757,7 +780,10 @@ pub fn recvRequest(handle: u32, header: *ApiMessageHeader, out: []u8) i32 {
         fillMessageHeader(slot, header, slot.request_len, API_OK);
         return API_ERR_BUFFER_TOO_SMALL;
     }
-    if (len > 0) @memcpy(out[0..len], slot.request_payload[0..len]);
+    if (len > 0) {
+        @memcpy(out[0..len], slot.request_payload[0..len]);
+        lifetime_performance.payload_copy_bytes +%= len;
+    }
     fillMessageHeader(slot, header, slot.request_len, API_OK);
     slot.state = .delivered;
     noteActiveWorkers(ep);
@@ -773,8 +799,10 @@ pub fn reply(handle: u32, request_id: u32, status: i32, payload: []const u8) i32
     if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
     const slot_idx = deliveredRequestSlotById(ep, request_id) orelse return API_ERR_NOT_FOUND;
     var slot = &ep.queue[slot_idx];
-    @memset(slot.response_payload[0..], 0);
-    if (payload.len > 0) @memcpy(slot.response_payload[0..payload.len], payload);
+    if (payload.len > 0) {
+        @memcpy(slot.response_payload[0..payload.len], payload);
+        lifetime_performance.payload_copy_bytes +%= payload.len;
+    }
     slot.response_len = @intCast(payload.len);
     slot.response_status = status;
     slot.state = .responded;
@@ -802,7 +830,10 @@ pub fn takeResponse(handle: u32, request_id: u32, header: *ApiMessageHeader, out
         _ = ep.slots_available.release(1);
         return API_ERR_BUFFER_TOO_SMALL;
     }
-    if (len > 0) @memcpy(out[0..len], slot.response_payload[0..len]);
+    if (len > 0) {
+        @memcpy(out[0..len], slot.response_payload[0..len]);
+        lifetime_performance.payload_copy_bytes +%= len;
+    }
     clearRequestSlot(slot);
     _ = ep.slots_available.release(1);
     return @intCast(len);
@@ -992,7 +1023,11 @@ fn findByNameIn(table: *const [MAX_SERVICES]Entry, name: []const u8) ?usize {
 }
 
 fn resetEndpoints() void {
-    endpoints = .{Endpoint{}} ** MAX_ENDPOINTS;
+    lifetime_performance = .{};
+    for (&endpoints) |*ep| {
+        if (ep.used) wakeEndpointWaiters(ep, .cancelled);
+        resetEndpointMetadata(ep, false);
+    }
     next_endpoint_handle = 1;
     next_request_id = 1;
 }
@@ -1031,8 +1066,7 @@ fn clearEndpointForSlot(slot: usize) void {
     var i: usize = 0;
     while (i < endpoints.len) : (i += 1) {
         if (endpoints[i].used and endpoints[i].service_slot == slot) {
-            wakeEndpointWaiters(&endpoints[i], .cancelled);
-            endpoints[i] = .{};
+            retireEndpoint(&endpoints[i], .cancelled);
         }
     }
 }
@@ -1119,7 +1153,52 @@ fn noteActiveWorkers(ep: *Endpoint) void {
 
 fn clearRequestSlot(slot: *RequestSlot) void {
     _ = slot.response_available.close(.cancelled);
-    slot.* = .{};
+    resetRequestSlotMetadata(slot);
+    lifetime_performance.slot_metadata_resets +%= 1;
+}
+
+fn resetRequestSlotMetadata(slot: *RequestSlot) void {
+    slot.state = .free;
+    slot.request_id = 0;
+    slot.client_id = 0;
+    slot.op = 0;
+    slot.flags = 0;
+    slot.request_len = 0;
+    slot.response_len = 0;
+    slot.response_status = API_OK;
+    slot.response_available = sync.WaitQueue.init();
+}
+
+fn retireEndpoint(ep: *Endpoint, result: sync.WaitResult) void {
+    wakeEndpointWaiters(ep, result);
+    resetEndpointMetadata(ep, true);
+}
+
+fn resetEndpointMetadata(ep: *Endpoint, count_reset: bool) void {
+    ep.used = false;
+    ep.service_slot = 0;
+    ep.handle = 0;
+    ep.flags = 0;
+    ep.queue_high_water = 0;
+    ep.max_active_workers = 0;
+    ep.open_handles = 0;
+    ep.requests = 0;
+    ep.responses = 0;
+    ep.drops = 0;
+    ep.busy_rejections = 0;
+    ep.timeouts = 0;
+    ep.cancellations = 0;
+    ep.completion_waits = 0;
+    ep.completion_timeouts = 0;
+    ep.completion_wait_rounds = 0;
+    ep.targeted_response_wakes = 0;
+    ep.targeted_response_wake_misses = 0;
+    ep.admission_waits = 0;
+    ep.admission_timeouts = 0;
+    ep.requests_available = sync.WaitQueue.init();
+    ep.slots_available = sync.Semaphore.init(@intCast(API_ENDPOINT_QUEUE_DEPTH), @intCast(API_ENDPOINT_QUEUE_DEPTH));
+    for (&ep.queue) |*slot| resetRequestSlotMetadata(slot);
+    if (count_reset) lifetime_performance.endpoint_metadata_resets +%= 1;
 }
 
 fn wakeEndpointWaiters(ep: *Endpoint, result: sync.WaitResult) void {
@@ -1292,4 +1371,59 @@ fn nameEq(a: []const u8, b: []const u8) bool {
 fn upper(ch: u8) u8 {
     if (ch >= 'a' and ch <= 'z') return ch - ('a' - 'A');
     return ch;
+}
+
+test "request slot metadata reset preserves payload storage" {
+    var slot = RequestSlot{};
+    @memset(slot.request_payload[0..], 0xA5);
+    @memset(slot.response_payload[0..], 0x5A);
+    slot.state = .responded;
+    slot.request_id = 42;
+    slot.client_id = 7;
+    slot.op = 3;
+    slot.flags = 9;
+    slot.request_len = 4096;
+    slot.response_len = 1;
+    slot.response_status = -4;
+
+    resetRequestSlotMetadata(&slot);
+
+    try std.testing.expectEqual(RequestState.free, slot.state);
+    try std.testing.expectEqual(@as(u32, 0), slot.request_id);
+    try std.testing.expectEqual(@as(u16, 0), slot.request_len);
+    try std.testing.expectEqual(@as(u16, 0), slot.response_len);
+    try std.testing.expectEqual(API_OK, slot.response_status);
+    try std.testing.expectEqual(@as(u8, 0xA5), slot.request_payload[0]);
+    try std.testing.expectEqual(@as(u8, 0xA5), slot.request_payload[API_MAX_PAYLOAD - 1]);
+    try std.testing.expectEqual(@as(u8, 0x5A), slot.response_payload[0]);
+    try std.testing.expectEqual(@as(u8, 0x5A), slot.response_payload[API_MAX_PAYLOAD - 1]);
+}
+
+test "endpoint metadata reset preserves every slot payload" {
+    var ep = Endpoint{};
+    ep.used = true;
+    ep.handle = 99;
+    ep.requests = 12;
+    for (&ep.queue, 0..) |*slot, index| {
+        @memset(slot.request_payload[0..], @intCast(index + 1));
+        @memset(slot.response_payload[0..], @intCast(index + 17));
+        slot.state = .responded;
+        slot.request_len = @intCast(index + 1);
+        slot.response_len = @intCast(index + 2);
+    }
+
+    resetEndpointMetadata(&ep, false);
+
+    try std.testing.expect(!ep.used);
+    try std.testing.expectEqual(@as(u32, 0), ep.handle);
+    try std.testing.expectEqual(@as(u64, 0), ep.requests);
+    for (&ep.queue, 0..) |*slot, index| {
+        try std.testing.expectEqual(RequestState.free, slot.state);
+        try std.testing.expectEqual(@as(u16, 0), slot.request_len);
+        try std.testing.expectEqual(@as(u16, 0), slot.response_len);
+        try std.testing.expectEqual(@as(u8, @intCast(index + 1)), slot.request_payload[0]);
+        try std.testing.expectEqual(@as(u8, @intCast(index + 1)), slot.request_payload[API_MAX_PAYLOAD - 1]);
+        try std.testing.expectEqual(@as(u8, @intCast(index + 17)), slot.response_payload[0]);
+        try std.testing.expectEqual(@as(u8, @intCast(index + 17)), slot.response_payload[API_MAX_PAYLOAD - 1]);
+    }
 }

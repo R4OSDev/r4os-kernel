@@ -1422,9 +1422,12 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const caller_size: usize = out.size;
     const v1_size: usize = @offsetOf(ProgramPerformanceSummary, "monotonic_clock_flags");
     const v2_size: usize = @offsetOf(ProgramPerformanceSummary, "service_completion_wait_rounds");
+    const v3_size: usize = @offsetOf(ProgramPerformanceSummary, "service_payload_copy_bytes");
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
     const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= @sizeOf(ProgramPerformanceSummary))
         performance_snapshot_version
+    else if (caller_version >= 3 and caller_size >= v3_size)
+        3
     else if (caller_version >= 2 and caller_size >= v2_size)
         2
     else
@@ -1432,6 +1435,7 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const version_capacity: usize = switch (negotiated_version) {
         1 => v1_size,
         2 => v2_size,
+        3 => v3_size,
         else => @sizeOf(ProgramPerformanceSummary),
     };
     const copy_size = @min(caller_size, version_capacity);
@@ -1680,6 +1684,11 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .service_targeted_response_wake_misses = svc.targeted_response_wake_misses,
         .service_admission_waits = svc.admission_waits,
         .service_admission_timeouts = svc.admission_timeouts,
+        .service_payload_copy_bytes = svc.payload_copy_bytes,
+        .service_payload_clear_bytes = svc.payload_clear_bytes,
+        .service_slot_metadata_resets = svc.slot_metadata_resets,
+        .service_endpoint_metadata_resets = svc.endpoint_metadata_resets,
+        .service_endpoint_payload_reset_bytes = svc.endpoint_payload_reset_bytes,
         .tcp_max_connections = tcp_summary.max_connections,
         .tcp_active_connections = tcp_summary.active_connections,
         .tcp_active_listeners = tcp_summary.active_listeners,

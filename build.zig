@@ -182,6 +182,7 @@ pub fn build(b: *std.Build) void {
         "sched/wait_node.zig",
     };
     for (unit_tests) |path| addUnitTest(b, test_step, path);
+    addContractUnitTest(b, test_step, contract, "services_tests.zig");
     addLoaderTests(b, test_step, contract, config);
 
     addProviderNegative(
@@ -208,6 +209,28 @@ fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, path: []const u8) void
             .optimize = .ReleaseSafe,
         }),
     });
+    const run = b.addRunArtifact(tests);
+    test_step.dependOn(&run.step);
+}
+
+fn addContractUnitTest(
+    b: *std.Build,
+    test_step: *std.Build.Step,
+    contract: *std.Build.Dependency,
+    path: []const u8,
+) void {
+    const host_contract = b.createModule(.{
+        .root_source_file = contract.path("Generated/Kernel/Zig/r4x_api_generated.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    const root = b.createModule(.{
+        .root_source_file = b.path(path),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    root.addImport("r4os_kernel_contract", host_contract);
+    const tests = b.addTest(.{ .root_module = root });
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
 }
