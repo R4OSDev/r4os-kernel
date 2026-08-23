@@ -8,6 +8,8 @@ const task_context = @import("../sched/task_context.zig");
 const desktop_events = @import("../kernel/desktop_events.zig");
 const timer = @import("../kernel/timer.zig");
 const r4draw = @import("r4draw.zig");
+const scheduler = @import("../sched/scheduler.zig");
+const remote_frame_state = @import("remote_frame_state.zig");
 
 pub const name = "R4DESK";
 pub const clipboard_text_size: usize = 4096;
@@ -65,23 +67,25 @@ pub const ClipboardInfo = r4x_api.ClipboardInfo;
 
 pub const RemoteFrameInfo = r4x_api.RemoteFrameInfo;
 
-// 0.56.38: Shared-Frame-Mapping - liefert dem Konsumenten (RDPSVC) die
-// Adresse des Remote-Frame-Puffers direkt (R4X laeuft im gemeinsamen,
-// voll vertrauten Adressraum; Leitbild: kein Sicherheitsmodell). Die
-// generation steigt bei jeder Neuallokation des Puffers; der Konsument
-// ruft remoteFrameMap pro Frame neu (billiger Tabellen-Call) und liest
-// nur bei unveraenderter Geometrie direkt.
+// Shared-Frame-Mapping fuer RDPSVC. Die Adresse zeigt auf einen vom Live-
+// Publisher getrennten Snapshot; generation benennt dessen Frame-Revision.
+// Der Konsument mappt owner-thread-only pro Frame und validiert generation
+// gegen die zuvor gelesene RemoteFrameInfo.revision.
 pub const RemoteFrameMapInfo = r4x_api.RemoteFrameMapInfo;
 
 pub const RemoteInputEvent = r4x_api.RemoteInputEvent;
 
 pub const RemoteInputStatus = r4x_api.RemoteInputStatus;
 
-const RemoteRect = struct {
-    x: u32 = 0,
-    y: u32 = 0,
-    w: u32 = 0,
-    h: u32 = 0,
+const RemoteRect = remote_frame_state.Rect;
+
+const RemoteFrameSnapshot = struct {
+    memory: ?[]u8 = null,
+    pixels: ?[]u32 = null,
+    capacity_pixels: usize = 0,
+    revision: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
 };
 
 var clipboard_text: [clipboard_text_size]u8 = .{0} ** clipboard_text_size;
@@ -92,15 +96,18 @@ var remote_frame_pixels: ?[]u32 = null;
 var remote_frame_capacity_pixels: usize = 0;
 var remote_frame_info: RemoteFrameInfo = .{};
 var remote_frame_ready: bool = false;
-// 0.56.38: Shared-Frame-Zustand. Sobald ein Mapping ausgegeben wurde,
-// darf ein Realloc den alten Puffer nicht mehr sofort freigeben (der
-// Konsument koennte noch mitten in einem Frame-Read stehen); alte
-// Puffer wandern in einen kleinen Retired-Ring. Geometriewechsel sind
-// Boot-/Konfigurationsereignisse - der Ring laeuft praktisch nie um.
-var remote_frame_generation: u64 = 0;
-var remote_frame_mapped: bool = false;
+// Publisher schreibt nur in den Live-Puffer. Leser pinnen ihn waehrend
+// eines API-Aufrufs und pruefen danach die Sequenz; Shared-Mappings werden
+// in zwei getrennten Snapshots materialisiert und bleiben dadurch waehrend
+// RLE/Netz-I/O unveraendert.
+var remote_frame_write_sequence: u64 = 0;
+var remote_frame_readers: u32 = 0;
+var remote_frame_published_revision: u32 = 0;
+var remote_frame_history: remote_frame_state.History = .{};
+var remote_frame_snapshots: [2]RemoteFrameSnapshot = .{ RemoteFrameSnapshot{}, RemoteFrameSnapshot{} };
+var remote_frame_snapshot_active: usize = 1;
 var remote_frame_retired: [4]?[]u8 = .{ null, null, null, null };
-var remote_frame_retired_next: usize = 0;
+const REMOTE_FRAME_SNAPSHOT_ATTEMPTS: usize = 8;
 // 0.56.27: Event-Wait fuer remoteFrameWait - remoteFramePublish weckt die
 // Queue, Waiter pruefen die Revision als waitUnless-Praedikat (kein
 // Lost-Wakeup, Muster 0.56.19/0.56.22).
@@ -114,7 +121,8 @@ const RemoteFrameWaitCtx = struct {
 
 fn predStillWaitFrame(raw: *anyopaque) bool {
     const c: *RemoteFrameWaitCtx = @ptrCast(@alignCast(raw));
-    return !(remote_frame_ready and remote_frame_info.revision != c.last_revision);
+    const revision = @atomicLoad(u32, &remote_frame_published_revision, .acquire);
+    return revision == 0 or revision == c.last_revision;
 }
 var remote_input_queue: [remote_input_queue_capacity]RemoteInputEvent = .{RemoteInputEvent{}} ** remote_input_queue_capacity;
 var remote_input_head: usize = 0;
@@ -213,38 +221,56 @@ pub fn clipboardClear() callconv(.c) i32 {
 
 pub fn remoteFrameInfo(out: *RemoteFrameInfo) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
-    out.* = remote_frame_info;
-    return if (remote_frame_ready) 0 else remote_frame_error_unavailable;
+    if (!captureRemoteFrameInfo(null, out)) {
+        out.* = .{};
+        return remote_frame_error_unavailable;
+    }
+    return 0;
 }
 
 pub fn remoteFrameRead(offset_pixels: u32, out: [*]u32, pixel_count: u32, out_info: *RemoteFrameInfo) callconv(.c) i32 {
-    if (@intFromPtr(out_info) != 0) out_info.* = remote_frame_info;
-    if (!remote_frame_ready) return remote_frame_error_unavailable;
-    const pixels = remote_frame_pixels orelse return remote_frame_error_unavailable;
-    const offset: usize = @intCast(offset_pixels);
-    if (offset > pixels.len) return remote_frame_error_out_of_range;
-    if (pixel_count == 0) return 0;
-    if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
-    const remaining = pixels.len - offset;
-    if (remaining == 0) return 0;
-    const requested: usize = @intCast(pixel_count);
-    const count = @min(requested, remaining);
-    @memcpy(out[0..count], pixels[offset .. offset + count]);
-    return @intCast(count);
+    if (pixel_count != 0 and @intFromPtr(out) == 0) return remote_frame_error_invalid;
+
+    var attempt: usize = 0;
+    while (attempt < REMOTE_FRAME_SNAPSHOT_ATTEMPTS) : (attempt += 1) {
+        const sequence = beginRemoteFrameRead() orelse continue;
+        const info = remote_frame_info;
+        const pixels = remote_frame_pixels;
+        var result: i32 = remote_frame_error_unavailable;
+        if (remote_frame_ready and pixels != null) {
+            const frame_pixels: usize = @intCast(info.frame_pixels);
+            const offset: usize = @intCast(offset_pixels);
+            if (offset > frame_pixels) {
+                result = remote_frame_error_out_of_range;
+            } else if (pixel_count == 0 or offset == frame_pixels) {
+                result = 0;
+            } else {
+                const count = @min(@as(usize, @intCast(pixel_count)), frame_pixels - offset);
+                @memcpy(out[0..count], pixels.?[offset .. offset + count]);
+                result = @intCast(count);
+            }
+        }
+        if (!finishRemoteFrameRead(sequence)) continue;
+        if (@intFromPtr(out_info) != 0) out_info.* = info;
+        return result;
+    }
+    if (@intFromPtr(out_info) != 0) out_info.* = .{};
+    return remote_frame_error_unavailable;
 }
 
 pub fn remoteFrameWait(last_revision: u32, timeout_ticks: u64, out: *RemoteFrameInfo) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
-    if (!remote_frame_ready) {
-        out.* = remote_frame_info;
+    if (currentRemoteFrameRevision() == 0) {
+        out.* = .{};
         return remote_frame_error_unavailable;
     }
 
     var waited: u64 = 0;
     while (true) {
-        if (remote_frame_ready and remote_frame_info.revision != last_revision) {
-            out.* = remote_frame_info;
-            return 1;
+        const revision = currentRemoteFrameRevision();
+        if (revision != 0 and revision != last_revision) {
+            if (captureRemoteFrameInfo(last_revision, out)) return 1;
+            continue;
         }
         if (waited >= timeout_ticks) break;
         const slice = @min(REMOTE_FRAME_WAIT_SLICE_TICKS, timeout_ticks - waited);
@@ -252,8 +278,9 @@ pub fn remoteFrameWait(last_revision: u32, timeout_ticks: u64, out: *RemoteFrame
         _ = remote_frame_waitq.waitUnless(slice, "remote-frame", predStillWaitFrame, &wait_ctx);
         waited += slice;
     }
-    out.* = remote_frame_info;
-    return 0;
+    if (captureRemoteFrameInfo(null, out)) return 0;
+    out.* = .{};
+    return remote_frame_error_unavailable;
 }
 
 // 0.56.28: blockierender Aktivitaets-Wait fuer den Desktop-Renderer.
@@ -277,8 +304,15 @@ pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32
     if (@intFromPtr(pixels_ptr) == 0) return remote_frame_error_invalid;
 
     const total_pixels: usize = @intCast(total_pixels_u64);
-    if (!ensureRemoteFrameCapacity(total_pixels)) return remote_frame_error_oom;
-    const dest = remote_frame_pixels orelse return remote_frame_error_oom;
+    beginRemoteFrameWrite();
+    if (!ensureRemoteFrameCapacity(total_pixels)) {
+        finishRemoteFrameWrite();
+        return remote_frame_error_oom;
+    }
+    const dest = remote_frame_pixels orelse {
+        finishRemoteFrameWrite();
+        return remote_frame_error_oom;
+    };
     const source = pixels_ptr[0..@as(usize, @intCast(source_pixels_u64))];
 
     const geometry_changed = !remote_frame_ready or
@@ -309,6 +343,9 @@ pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32
         .cursor_flags = info.cursor_flags,
     };
     remote_frame_ready = true;
+    remote_frame_history.record(revision, rect);
+    finishRemoteFrameWrite();
+    @atomicStore(u32, &remote_frame_published_revision, revision, .release);
     _ = remote_frame_waitq.wakeAll();
 
     const copied = @as(u64, rect.w) * @as(u64, rect.h);
@@ -319,10 +356,11 @@ pub fn remoteInputPush(event: *const RemoteInputEvent) callconv(.c) i32 {
     if (@intFromPtr(event) == 0) return remote_input_error_invalid;
     if (event.magic != remote_input_magic or event.version != remote_input_version) return remote_input_error_invalid;
     if (!validRemoteInputKind(event.kind)) return remote_input_error_invalid;
+
+    scheduler.preemptDisable();
     if (remote_input_pending >= remote_input_queue_capacity) {
-        remote_input_tail = (remote_input_tail + 1) % remote_input_queue_capacity;
-        remote_input_pending -= 1;
-        remote_input_dropped +%= 1;
+        scheduler.preemptEnable();
+        return remote_input_error_full;
     }
 
     var stored = event.*;
@@ -332,6 +370,7 @@ pub fn remoteInputPush(event: *const RemoteInputEvent) callconv(.c) i32 {
     remote_input_pending += 1;
     remote_input_pushed +%= 1;
     remote_input_last = stored;
+    scheduler.preemptEnable();
     // Publish the complete queue entry before waking the Desktop. Otherwise
     // it can poll an empty queue and sleep again without a second signal.
     desktop_events.signal();
@@ -340,6 +379,8 @@ pub fn remoteInputPush(event: *const RemoteInputEvent) callconv(.c) i32 {
 
 pub fn remoteInputPoll(out: *RemoteInputEvent) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return remote_input_error_invalid;
+    scheduler.preemptDisable();
+    defer scheduler.preemptEnable();
     if (remote_input_pending == 0) {
         out.* = RemoteInputEvent{};
         return 0;
@@ -353,6 +394,8 @@ pub fn remoteInputPoll(out: *RemoteInputEvent) callconv(.c) i32 {
 
 pub fn remoteInputStatus(out: *RemoteInputStatus) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return remote_input_error_invalid;
+    scheduler.preemptDisable();
+    defer scheduler.preemptEnable();
     out.* = .{
         .capacity = @intCast(remote_input_queue_capacity),
         .pending = @intCast(remote_input_pending),
@@ -528,18 +571,15 @@ fn ensureRemoteFrameCapacity(pixel_count: usize) bool {
     if (pixel_count == 0) return false;
     if (remote_frame_capacity_pixels >= pixel_count and remote_frame_pixels != null) return true;
     if (pixel_count > (~@as(usize, 0)) / @sizeOf(u32)) return false;
+    drainRemoteFrameRetiredIfIdle();
     const bytes = pixel_count * @sizeOf(u32);
     const memory = heap.alloc(bytes, @alignOf(u32)) orelse return false;
     if (remote_frame_memory) |old| {
-        if (remote_frame_mapped) {
-            // 0.56.38: Mapping ausgegeben -> alten Puffer zurueckhalten
-            // statt freigeben (Konsument koennte noch lesen). Der Ring
-            // gibt erst den aeltesten Zurueckgehaltenen frei.
-            if (remote_frame_retired[remote_frame_retired_next]) |oldest| _ = heap.free(oldest);
-            remote_frame_retired[remote_frame_retired_next] = old;
-            remote_frame_retired_next = (remote_frame_retired_next + 1) % remote_frame_retired.len;
-        } else {
+        if (@atomicLoad(u32, &remote_frame_readers, .acquire) == 0) {
             _ = heap.free(old);
+        } else if (!retainRemoteFrameMemory(old)) {
+            _ = heap.free(memory);
+            return false;
         }
     }
     const aligned: [*]align(@alignOf(u32)) u8 = @alignCast(memory.ptr);
@@ -549,23 +589,153 @@ fn ensureRemoteFrameCapacity(pixel_count: usize) bool {
     remote_frame_capacity_pixels = pixel_count;
     remote_frame_ready = false;
     remote_frame_info = .{};
-    remote_frame_generation +%= 1;
+    remote_frame_history.reset();
+    @atomicStore(u32, &remote_frame_published_revision, 0, .release);
     return true;
 }
 
-// 0.56.38: Shared-Frame-Mapping fuer den Doppelkopie-freien Lesepfad
-// (Befund 9.2). remoteFrameRead bleibt als Kompat-Pfad vollstaendig
-// erhalten; Konsumenten validieren generation/capacity pro Frame.
+fn retainRemoteFrameMemory(memory: []u8) bool {
+    for (&remote_frame_retired) |*slot| {
+        if (slot.* == null) {
+            slot.* = memory;
+            return true;
+        }
+    }
+    return false;
+}
+
+fn drainRemoteFrameRetiredIfIdle() void {
+    if (@atomicLoad(u32, &remote_frame_readers, .acquire) != 0) return;
+    for (&remote_frame_retired) |*slot| {
+        if (slot.*) |memory| _ = heap.free(memory);
+        slot.* = null;
+    }
+}
+
+fn ensureRemoteFrameSnapshotCapacity(index: usize, pixel_count: usize) bool {
+    if (index >= remote_frame_snapshots.len or pixel_count == 0) return false;
+    const snapshot = &remote_frame_snapshots[index];
+    if (snapshot.capacity_pixels >= pixel_count and snapshot.pixels != null) return true;
+    if (pixel_count > (~@as(usize, 0)) / @sizeOf(u32)) return false;
+    const memory = heap.alloc(pixel_count * @sizeOf(u32), @alignOf(u32)) orelse return false;
+    if (snapshot.memory) |old| _ = heap.free(old);
+    const aligned: [*]align(@alignOf(u32)) u8 = @alignCast(memory.ptr);
+    const raw: [*]u32 = @ptrCast(aligned);
+    snapshot.* = .{
+        .memory = memory,
+        .pixels = raw[0..pixel_count],
+        .capacity_pixels = pixel_count,
+    };
+    return true;
+}
+
+// Das Mapping zeigt auf einen vom Publisher getrennten Snapshot. Die beiden
+// Slots halten den zuletzt ausgegebenen Puffer waehrend des naechsten Map-
+// Aufrufs stabil; gemaess ABI bleibt der Pfad owner-thread-only. generation
+// ist die Frame-Revision und muss vom Konsumenten gegen RemoteFrameInfo
+// validiert werden, bevor er Pixel ueber I/O weitergibt.
 pub fn remoteFrameMap(out: *RemoteFrameMapInfo) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
     out.* = .{};
-    const pixels = remote_frame_pixels orelse return remote_frame_error_unavailable;
-    if (!remote_frame_ready) return remote_frame_error_unavailable;
-    remote_frame_mapped = true;
-    out.pixels_addr = @intFromPtr(pixels.ptr);
-    out.capacity_pixels = remote_frame_capacity_pixels;
-    out.generation = remote_frame_generation;
-    return 0;
+    const target_index = 1 - remote_frame_snapshot_active;
+    var attempt: usize = 0;
+    while (attempt < REMOTE_FRAME_SNAPSHOT_ATTEMPTS) : (attempt += 1) {
+        const sequence = beginRemoteFrameRead() orelse continue;
+        const info = remote_frame_info;
+        const live_pixels = remote_frame_pixels;
+        if (!remote_frame_ready or live_pixels == null or info.frame_pixels == 0) {
+            _ = finishRemoteFrameRead(sequence);
+            return remote_frame_error_unavailable;
+        }
+
+        const required: usize = @intCast(info.frame_pixels);
+        if (remote_frame_snapshots[target_index].capacity_pixels < required or
+            remote_frame_snapshots[target_index].pixels == null)
+        {
+            _ = finishRemoteFrameRead(sequence);
+            if (!ensureRemoteFrameSnapshotCapacity(target_index, required)) return remote_frame_error_oom;
+            continue;
+        }
+
+        const snapshot = &remote_frame_snapshots[target_index];
+        const geometry_changed = snapshot.width != info.width or snapshot.height != info.height;
+        const rect = if (snapshot.revision == 0 or geometry_changed)
+            RemoteRect{ .w = info.width, .h = info.height }
+        else
+            remote_frame_history.unionSince(snapshot.revision, info.revision, info.width, info.height);
+        if (!rect.empty()) {
+            copyRemoteFrameRect(snapshot.pixels.?[0..required], live_pixels.?[0..required], info.width, info.width, rect);
+        }
+        if (!finishRemoteFrameRead(sequence)) {
+            snapshot.revision = 0;
+            continue;
+        }
+
+        snapshot.revision = info.revision;
+        snapshot.width = info.width;
+        snapshot.height = info.height;
+        remote_frame_snapshot_active = target_index;
+        out.pixels_addr = @intFromPtr(snapshot.pixels.?.ptr);
+        out.capacity_pixels = snapshot.capacity_pixels;
+        out.generation = info.revision;
+        return 0;
+    }
+    return remote_frame_error_unavailable;
+}
+
+fn beginRemoteFrameWrite() void {
+    const sequence = @atomicLoad(u64, &remote_frame_write_sequence, .acquire);
+    @atomicStore(u64, &remote_frame_write_sequence, sequence +% 1, .release);
+}
+
+fn finishRemoteFrameWrite() void {
+    const sequence = @atomicLoad(u64, &remote_frame_write_sequence, .acquire);
+    @atomicStore(u64, &remote_frame_write_sequence, sequence +% 1, .release);
+}
+
+fn beginRemoteFrameRead() ?u64 {
+    const sequence = @atomicLoad(u64, &remote_frame_write_sequence, .acquire);
+    if ((sequence & 1) != 0) return null;
+    _ = @atomicRmw(u32, &remote_frame_readers, .Add, 1, .acq_rel);
+    const confirmed = @atomicLoad(u64, &remote_frame_write_sequence, .acquire);
+    if (confirmed == sequence and (confirmed & 1) == 0) return sequence;
+    _ = @atomicRmw(u32, &remote_frame_readers, .Sub, 1, .acq_rel);
+    return null;
+}
+
+fn finishRemoteFrameRead(sequence: u64) bool {
+    const confirmed = @atomicLoad(u64, &remote_frame_write_sequence, .acquire);
+    const previous = @atomicRmw(u32, &remote_frame_readers, .Sub, 1, .acq_rel);
+    if (previous == 1) drainRemoteFrameRetiredIfIdle();
+    return confirmed == sequence and (confirmed & 1) == 0;
+}
+
+fn captureRemoteFrameInfo(since_revision: ?u32, out: *RemoteFrameInfo) bool {
+    var attempt: usize = 0;
+    while (attempt < REMOTE_FRAME_SNAPSHOT_ATTEMPTS) : (attempt += 1) {
+        const sequence = beginRemoteFrameRead() orelse continue;
+        var info = remote_frame_info;
+        const ready = remote_frame_ready;
+        if (ready) {
+            if (since_revision) |revision| {
+                if (revision != info.revision) {
+                    const rect = remote_frame_history.unionSince(revision, info.revision, info.width, info.height);
+                    info.dirty_x = @intCast(rect.x);
+                    info.dirty_y = @intCast(rect.y);
+                    info.dirty_w = rect.w;
+                    info.dirty_h = rect.h;
+                }
+            }
+        }
+        if (!finishRemoteFrameRead(sequence)) continue;
+        out.* = info;
+        return ready;
+    }
+    return false;
+}
+
+fn currentRemoteFrameRevision() u32 {
+    return @atomicLoad(u32, &remote_frame_published_revision, .acquire);
 }
 
 fn bumpRemoteFrameRevision() u32 {

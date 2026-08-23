@@ -185,6 +185,7 @@ pub fn build(b: *std.Build) void {
         "platform/monotonic_math.zig",
         "platform/pci_scan.zig",
         "program/gui_alpha8.zig",
+        "program/remote_frame_state.zig",
         "program/r4x_start.zig",
         "sched/wait_node.zig",
         "storage/block_split.zig",
