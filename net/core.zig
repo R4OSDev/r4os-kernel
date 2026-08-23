@@ -9,6 +9,7 @@ const dhcp = @import("dhcp.zig");
 const dhcp_runtime = @import("dhcp_runtime.zig");
 const dns = @import("dns.zig");
 const tcp = @import("tcp.zig");
+const tcp_runtime = @import("tcp_runtime.zig");
 const serial_link = @import("serial_link.zig");
 const timing = @import("timing.zig");
 const boot_config = @import("../kernel/boot_config.zig");
@@ -625,6 +626,10 @@ pub fn init() void {
     arp_cache_entries = .{ArpCacheEntry{}} ** ARP_CACHE_ENTRIES;
     arp_cache_next_slot = 0;
     tcp.reset();
+    tcp_rto.reset();
+    tcp_proactive_retransmits = 0;
+    tcp_rto_samples = 0;
+    tcp_rto_last_ticks = 0;
     icmp_sequence = 1;
     arp_cache_updated_tick = 0;
     ethernet_r4p_rx = 0;
@@ -791,6 +796,7 @@ fn resetAdapterLifecycleInternal(index: usize, reason: []const u8, diagnostic_sc
 pub fn cleanupNetworkOperations(reason: []const u8) CleanupStatus {
     const closed_udp = closeAllUdpSockets(reason);
     const tcp_cleanup = tcp.abortAll(reason);
+    tcp_rto.reset();
     const dhcp_cancelled = cancelDhcpOperation(reason);
     const dns_cancelled = cancelDnsOperation(reason);
 
@@ -3179,6 +3185,9 @@ fn tcpHandleRx(ip_view: ipv4.PacketView) void {
         tcp_last_error = "r4p-view";
         return;
     };
+    // Vor applyRxView sichern: RST/FIN duerfen den Slot im selben Aufruf
+    // schliessen, der RTO-Zustand gehoert trotzdem genau dieser Generation.
+    const rx_identity = tcp.connectionIdentityForSegment(view);
     if (tcp.applyRxView(view)) |parsed| {
         if ((parsed.flags & tcp.FLAG_SYN) != 0 and (parsed.flags & tcp.FLAG_ACK) == 0) {
             if (tcp.acceptInbound(parsed, nextTcpSeq(parsed.source_ip, parsed.source_port))) |conn_id| {
@@ -3189,9 +3198,13 @@ fn tcpHandleRx(ip_view: ipv4.PacketView) void {
                 _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
             }
         }
-        // 0.56.23: RTO-Sample bei ACK-Fortschritt.
+        // ACK-Fortschritt wird gegen die vor dem Zustandswechsel gebundene
+        // Connection ausgewertet. Geschlossene Generationen werden geloest.
         if ((parsed.flags & tcp.FLAG_ACK) != 0) {
-            if (tcp.connectionIdForSegment(parsed)) |ack_conn| rtoOnAck(ack_conn);
+            if (rx_identity) |identity| rtoOnAck(identity);
+        }
+        if (rx_identity) |identity| {
+            if (!tcp.identityActive(identity)) tcp_rto.release(identity);
         }
         // 0.56.22: Wartende Tasks wecken - jedes verarbeitete Segment
         // kann established/readable/closed-Zustaende geaendert haben.
@@ -4769,10 +4782,11 @@ fn rxTaskMain() callconv(.c) void {
             pollAdapters(RX_TASK_POLL_ROUNDS);
         }
         iterations +%= 1;
-        // 0.56.20: TIME_WAIT-/LAST_ACK-Slots freigeben; der Task laeuft im
-        // 1-Tick-Takt, iterations dient als Tick-Naeherung fuer die Frist.
-        _ = tcp.reapTimeWait(iterations);
-        proactiveRetransmitSweep(iterations);
+        // TCP-Fristen verwenden ausschliesslich dieselbe monotone Tick-Domain
+        // wie ihre Sendestempel. iterations bleibt nur der Log-Zaehler.
+        const now = time_core.monotonicTicks();
+        _ = tcp.reapTimeWait(now);
+        proactiveRetransmitSweep(now);
         retryDhcpTaskStartIfDue();
         if (iterations % RX_TASK_LOG_INTERVAL == 0) logRxTaskStatus();
         // 0.56.29: 10 ms Echtzeit-Raster (wie 1 Tick bei 100 Hz); NIC-IRQ
@@ -5774,24 +5788,23 @@ pub fn tcpConnect(remote_ip: [4]u8, port: u16) i32 {
     if (conn <= 0) return conn;
     const conn_id: u32 = @intCast(conn);
     const syn = sendTcpForConnection(conn_id, tcp.FLAG_SYN, "") orelse {
-        tcp.abort(conn_id, "syn-tx");
+        abortTcpConnection(conn_id, "syn-tx");
         return r4p_contract.TCP_RESULT_BAD_STATE;
     };
     if (syn != .ok) {
-        tcp.abort(conn_id, txResultName(syn));
+        abortTcpConnection(conn_id, txResultName(syn));
         return r4p_contract.TCP_RESULT_BAD_STATE;
     }
     var retransmits: u8 = 0;
-    rtoStampSend(conn_id);
     while (!waitForTcpEstablished(conn_id, rtoBackoff(conn_id, retransmits))) {
         if (retransmits >= TCP_MAX_RETRANSMITS) break;
-        const retry = retransmitTcpConnection(conn_id, "syn-retry");
+        const retry = retransmitTcpConnection(conn_id, .syn, "syn-retry");
         if (retry != .ok) break;
         retransmits += 1;
     }
     if (!tcp.established(conn_id)) {
         tcp.markTimeout("connect-timeout");
-        tcp.abort(conn_id, "connect-timeout");
+        abortTcpConnection(conn_id, "connect-timeout");
         return r4p_contract.TCP_RESULT_BAD_STATE;
     }
     _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
@@ -5800,9 +5813,12 @@ pub fn tcpConnect(remote_ip: [4]u8, port: u16) i32 {
 
 pub fn tcpWrite(conn_id: u32, data: []const u8) i32 {
     if (!tcp.established(conn_id) or data.len > MAX_PACKET_SIZE - tcp.HEADER_SIZE) return r4p_contract.TCP_RESULT_BAD_STATE;
-    const result = sendTcpForConnection(conn_id, tcp.FLAG_ACK | tcp.FLAG_PSH, data) orelse return r4p_contract.TCP_RESULT_NO_CONNECTION;
+    const allowed = tcp.sendAllowance(conn_id, data.len);
+    if (allowed == 0) return 0;
+    const result = sendTcpForConnection(conn_id, tcp.FLAG_ACK | tcp.FLAG_PSH, data[0..allowed]) orelse return r4p_contract.TCP_RESULT_NO_CONNECTION;
+    if (result == .busy) return 0;
     if (result != .ok) return r4p_contract.TCP_RESULT_BAD_STATE;
-    return @intCast(data.len);
+    return @intCast(allowed);
 }
 
 pub fn tcpRead(conn_id: u32, out: []u8) i32 {
@@ -5813,14 +5829,9 @@ pub fn tcpRead(conn_id: u32, out: []u8) i32 {
         return immediate;
     }
     if (immediate != 0) return immediate;
-    var retransmits: u8 = 0;
-    rtoStampSend(conn_id);
-    while (true) {
-        if (waitForTcpRead(conn_id, out, rtoBackoff(conn_id, retransmits))) |got| return got;
-        if (retransmits >= TCP_MAX_RETRANSMITS) break;
-        if (retransmitTcpData(conn_id) != .ok) break;
-        retransmits += 1;
-    }
+    // Ein leerer Read wartet nur auf Gegenrichtungsdaten. Retransmits sind
+    // ausschliesslich Eigentum des unbestaetigten Sendekatalogs/RTO-Sweeps.
+    if (waitForTcpRead(conn_id, out, SERVICE_OPERATION_TIMEOUT_TICKS)) |got| return got;
     tcp.markTimeout("read-timeout");
     return 0;
 }
@@ -6018,6 +6029,8 @@ pub fn tcpAcceptPollOnListener(port: u16, conn_id_out: *u32) i32 {
 }
 
 pub fn tcpClose(conn_id: u32) i32 {
+    const closing_identity = tcp.connectionIdentity(conn_id);
+    defer if (closing_identity) |identity| tcp_rto.release(identity);
     // 0.56.20-Nachfix: Nach Peer-FIN (closed() deckt last_ack/time_wait)
     // ist die Gegenseite fertig - ein eigener FIN+Warte-Zyklus blockierte
     // nur den Aufrufer (FTPSVC-Stall nach STOR: SIZE-Antwort blieb im
@@ -6030,7 +6043,6 @@ pub fn tcpClose(conn_id: u32) i32 {
     if (sendTcpForConnection(conn_id, tcp.FLAG_ACK | tcp.FLAG_FIN, "")) |result| {
         if (result != .ok) return tcp.close(conn_id);
         var retransmits: u8 = 0;
-        rtoStampSend(conn_id);
         while (!waitForTcpClosed(conn_id, rtoBackoff(conn_id, retransmits))) {
             if (retransmits >= TCP_MAX_RETRANSMITS) break;
             if (retransmitTcpFin(conn_id) != .ok) break;
@@ -6053,8 +6065,14 @@ pub fn tcpAbort(conn_id: u32) i32 {
     }
     if (!found) return r4p_contract.TCP_RESULT_NO_CONNECTION;
     if (sendTcpForConnection(conn_id, tcp.FLAG_ACK | tcp.FLAG_RST, "")) |_| {}
-    tcp.abort(conn_id, "abort");
+    abortTcpConnection(conn_id, "abort");
     return r4p_contract.TCP_RESULT_OK;
+}
+
+fn abortTcpConnection(conn_id: u32, reason: []const u8) void {
+    const identity = tcp.connectionIdentity(conn_id);
+    tcp.abort(conn_id, reason);
+    if (identity) |bound| tcp_rto.release(bound);
 }
 
 pub fn tcpSummary(out: *tcp.Summary) void {
@@ -6070,10 +6088,9 @@ pub fn localIp() [4]u8 {
 }
 
 fn sendTcpForConnection(conn_id: u32, flags: u16, payload: []const u8) ?TxResult {
-    // 0.56.25: Datensegment => RTO-Messung/Retransmit-Fenster starten
-    // (falls nicht schon eine Messung laeuft). Der net-rx-Task
-    // retransmittiert das aelteste unbestaetigte Segment bei RTO-Ablauf.
-    if (payload.len != 0) rtoStampSend(conn_id);
+    // Der Katalogplatz wird vor dem Drahtzugriff reservierbar geprueft. So
+    // kann kein erfolgreich gesendetes Segment ohne Retransmitbesitz enden.
+    if (!tcp.canTrackSend(conn_id, flags, payload.len)) return .busy;
     const plan = tcp.planSend(conn_id) orelse return null;
     var result = sendTcpFromPlan(plan, flags, payload);
     // 0.56.7: .busy = TX-Ring voll (alle 4 Slots in Flight, z.B. kurzer
@@ -6093,7 +6110,11 @@ fn sendTcpForConnection(conn_id: u32, flags: u16, payload: []const u8) ?TxResult
             result = sendTcpFromPlan(plan, flags, payload);
         }
     }
-    if (result == .ok) tcp.commitSent(conn_id, flags, payload);
+    if (result == .ok) {
+        const sent_tick = time_core.monotonicTicks();
+        if (!tcp.commitSent(conn_id, flags, payload, sent_tick)) return .backend_error;
+        if (tcp_runtime.needsTracking(flags, payload.len)) rtoStampSend(conn_id);
+    }
     return result;
 }
 
@@ -6103,25 +6124,25 @@ fn sendTcpFromPlan(plan: tcp.SendPlan, flags: u16, payload: []const u8) TxResult
     return sendIpv4Payload(plan.remote_ip, tcp.IPV4_PROTOCOL, segment);
 }
 
-fn retransmitTcpConnection(conn_id: u32, reason: []const u8) TxResult {
-    const plan = tcp.planRetransmit(conn_id) orelse return .backend_error;
+fn retransmitTcpConnection(conn_id: u32, kind: tcp.RetransmitKind, reason: []const u8) TxResult {
+    const plan = tcp.planRetransmit(conn_id, kind) orelse return .backend_error;
     var segment_buf: [MAX_PACKET_SIZE]u8 = .{0} ** MAX_PACKET_SIZE;
     const segment = tcpBuildSegment(segment_buf[0..], net_config.localIp(), plan.remote_ip, plan.local_port, plan.remote_port, plan.seq, plan.ack, plan.flags, plan.payload, plan.rx_window) orelse return .too_large;
     const result = sendIpv4Payload(plan.remote_ip, tcp.IPV4_PROTOCOL, segment);
-    if (result == .ok) tcp.recordRetransmit(conn_id, reason);
+    if (result == .ok) {
+        const sent_tick = time_core.monotonicTicks();
+        if (!tcp.recordRetransmit(conn_id, plan.token, sent_tick, reason)) return .backend_error;
+        rtoRefreshFromCatalog(conn_id);
+    }
     return result;
 }
 
 fn retransmitTcpData(conn_id: u32) TxResult {
-    const plan = tcp.planRetransmit(conn_id) orelse return .backend_error;
-    if (plan.payload.len == 0) return .backend_error;
-    return retransmitTcpConnection(conn_id, "data-retry");
+    return retransmitTcpConnection(conn_id, .data, "data-retry");
 }
 
 fn retransmitTcpFin(conn_id: u32) TxResult {
-    const plan = tcp.planRetransmit(conn_id) orelse return .backend_error;
-    if ((plan.flags & tcp.FLAG_FIN) == 0) return .backend_error;
-    return retransmitTcpConnection(conn_id, "fin-retry");
+    return retransmitTcpConnection(conn_id, .fin, "fin-retry");
 }
 
 // --- 0.56.22: Eventgetriebene TCP-Waits (Befund 6.2) ---
@@ -6136,30 +6157,17 @@ fn retransmitTcpFin(conn_id: u32) TxResult {
 // 0.56.40: hz-neutral (250-ms-Slice; bei 100 Hz wie zuvor 25 Ticks).
 const TCP_WAIT_SLICE_TICKS: u64 = timing.msToTicks(250);
 
-// --- 0.56.23: Adaptiver RTO (Befund 6.3) ---
-// SRTT lebt in core (tcp.zig bleibt ohne Timer): Messbeginn beim Senden
-// (Retry-Schleifen stempeln), Sample wenn ein ACK den tx_ack der
-// Verbindung ueber den gestempelten Stand hinausschiebt.
-const TcpRtoState = struct {
-    srtt_ticks: u64 = 0,
-    sent_tick: u64 = 0,
-    sent_tx_ack: u32 = 0,
-    // 0.56.25: proaktiver Retransmit im net-rx-Task (Retransmit vom
-    // blockierenden Read-Pfad ENTKOPPELT, Befund 6.5). resend_count
-    // treibt den RTO-Backoff und deckelt die Wiederholungen.
-    resend_count: u8 = 0,
-};
+// Adaptiver RTO: Der physische Slot ist nur zusammen mit Connection-ID und
+// Slotgeneration gueltig. Der Sendekatalog besitzt die Segmentzeitstempel;
+// diese Tabelle besitzt ausschliesslich die connection-lokale SRTT-Messung.
 var tcp_proactive_retransmits: u64 = 0;
-var tcp_rto: [tcp.MAX_CONNECTIONS]TcpRtoState = .{TcpRtoState{}} ** tcp.MAX_CONNECTIONS;
+var tcp_rto: tcp_runtime.RtoTable = .{};
 var tcp_rto_samples: u64 = 0;
 var tcp_rto_last_ticks: u64 = 0;
 
-fn rtoSlot(conn_id: u32) *TcpRtoState {
-    return &tcp_rto[@as(usize, conn_id) % tcp_rto.len];
-}
-
 fn rtoForConn(conn_id: u32) u64 {
-    const st = rtoSlot(conn_id);
+    const identity = tcp.connectionIdentity(conn_id) orelse return TCP_RTO_MAX_TICKS;
+    const st = tcp_rto.bind(identity) orelse return TCP_RTO_MAX_TICKS;
     if (st.srtt_ticks == 0) return TCP_RTO_MAX_TICKS;
     const rto = st.srtt_ticks * 2;
     if (rto < TCP_RTO_MIN_TICKS) return TCP_RTO_MIN_TICKS;
@@ -6178,54 +6186,65 @@ fn rtoBackoff(conn_id: u32, retransmits: u8) u64 {
     return t;
 }
 
-// 0.56.25: Retransmit-Entkopplung (Befund 6.5). Der net-rx-Task prueft
-// pro Tick, ob eine Verbindung ein unbestaetigtes Datensegment hat, dessen
-// RTO abgelaufen ist, und retransmittiert es proaktiv - unabhaengig davon,
-// ob gerade ein Read/Connect blockiert. Gedeckelt per resend_count-Backoff
-// (wie die synchronen Schleifen); rtoOnAck raeumt bei ACK-Fortschritt auf.
+// Der net-rx-Task retransmittiert das aelteste unbestaetigte Datensegment.
+// SYN und FIN bleiben Eigentum ihrer synchronen Connect-/Close-Schleifen.
 const PROACTIVE_MAX_RESEND: u8 = 5;
 
 fn proactiveRetransmitSweep(now: u64) void {
-    var i: u32 = 0;
-    while (i < tcp.MAX_CONNECTIONS) : (i += 1) {
-        const st = &tcp_rto[@as(usize, i) % tcp_rto.len];
-        if (st.sent_tick == 0) continue;
-        if (st.resend_count >= PROACTIVE_MAX_RESEND) continue;
-        const rto = rtoBackoff(i, st.resend_count);
-        if (now < st.sent_tick or now - st.sent_tick < rto) continue;
-        if (!tcp.established(i)) {
-            st.sent_tick = 0;
+    var slot: usize = 0;
+    while (slot < tcp.MAX_CONNECTIONS) : (slot += 1) {
+        const identity = tcp.connectionIdentityAt(slot) orelse {
+            tcp_rto.releaseSlot(slot);
             continue;
+        };
+        if (!tcp.established(identity.connection_id)) continue;
+        const outstanding = tcp.outstandingInfo(identity.connection_id, .data) orelse continue;
+        if (outstanding.retransmits >= PROACTIVE_MAX_RESEND) continue;
+        const st = tcp_rto.bind(identity) orelse continue;
+        if (st.sent_tick == 0 or st.sent_tick != outstanding.sent_tick) {
+            st.sent_tick = outstanding.sent_tick;
+            st.sent_tx_ack = tcp.txAckOf(identity.connection_id);
         }
-        // txAckOf-Fortschritt seit dem Stempel bedeutet: bestaetigt,
-        // rtoOnAck raeumt es beim ACK-Segment auf - hier nichts tun.
-        if (tcp.txAckOf(i) != st.sent_tx_ack) continue;
-        if (retransmitTcpData(i) != .ok) {
-            st.sent_tick = 0;
-            continue;
-        }
+        const rto = rtoBackoff(identity.connection_id, outstanding.retransmits);
+        if (!tcp_runtime.deadlineReached(now, st.sent_tick +% rto)) continue;
+        if (tcp.txAckOf(identity.connection_id) != st.sent_tx_ack) continue;
+        if (retransmitTcpData(identity.connection_id) != .ok) continue;
         tcp_proactive_retransmits +%= 1;
-        st.resend_count +|= 1;
-        st.sent_tick = now;
     }
 }
 
 fn rtoStampSend(conn_id: u32) void {
-    const st = rtoSlot(conn_id);
+    const identity = tcp.connectionIdentity(conn_id) orelse return;
+    const st = tcp_rto.bind(identity) orelse return;
     if (st.sent_tick != 0) return; // Messung laeuft schon
-    st.sent_tick = time_core.monotonicTicks();
+    const outstanding = tcp.outstandingInfo(conn_id, .any) orelse return;
+    st.sent_tick = outstanding.sent_tick;
     st.sent_tx_ack = tcp.txAckOf(conn_id);
 }
 
-fn rtoOnAck(conn_id: u32) void {
-    const st = rtoSlot(conn_id);
+fn rtoRefreshFromCatalog(conn_id: u32) void {
+    const identity = tcp.connectionIdentity(conn_id) orelse return;
+    const st = tcp_rto.bind(identity) orelse return;
+    if (tcp.outstandingInfo(conn_id, .any)) |outstanding| {
+        st.sent_tick = outstanding.sent_tick;
+        st.sent_tx_ack = tcp.txAckOf(conn_id);
+    } else {
+        st.sent_tick = 0;
+        st.sent_tx_ack = tcp.txAckOf(conn_id);
+    }
+}
+
+fn rtoOnAck(identity: tcp.ConnectionIdentity) void {
+    if (!tcp.identityActive(identity)) {
+        tcp_rto.release(identity);
+        return;
+    }
+    const st = tcp_rto.bind(identity) orelse return;
     if (st.sent_tick == 0) return;
-    const now_ack = tcp.txAckOf(conn_id);
+    const now_ack = tcp.txAckOf(identity.connection_id);
     if (now_ack == st.sent_tx_ack) return; // kein Fortschritt
     const now = time_core.monotonicTicks();
     const sample = if (now > st.sent_tick) now - st.sent_tick else 1;
-    st.sent_tick = 0;
-    st.resend_count = 0;
     if (st.srtt_ticks == 0) {
         st.srtt_ticks = sample;
     } else {
@@ -6233,6 +6252,13 @@ fn rtoOnAck(conn_id: u32) void {
     }
     tcp_rto_samples +%= 1;
     tcp_rto_last_ticks = st.srtt_ticks;
+    if (tcp.outstandingInfo(identity.connection_id, .any)) |outstanding| {
+        st.sent_tick = outstanding.sent_tick;
+        st.sent_tx_ack = now_ack;
+    } else {
+        st.sent_tick = 0;
+        st.sent_tx_ack = now_ack;
+    }
 }
 
 var tcp_activity: sync.WaitQueue = sync.WaitQueue.init();

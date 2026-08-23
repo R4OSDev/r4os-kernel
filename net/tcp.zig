@@ -1,14 +1,13 @@
 pub const IPV4_PROTOCOL: u8 = 6;
 pub const HEADER_SIZE: usize = 20;
-pub const MAX_CONNECTIONS: usize = 16;
+pub const MAX_CONNECTIONS: usize = tcp_runtime.CONNECTION_CAPACITY;
 pub const MAX_LISTENERS: usize = 4;
 pub const BUFFER_SIZE: usize = 256 * 1024;
 pub const MAX_ADVERTISED_WINDOW: u16 = 0xFFFF;
 pub const OUT_OF_ORDER_SLOT_COUNT: usize = 48;
 pub const OUT_OF_ORDER_SLOT_SIZE: usize = 2048;
-// 0.56.20: Retransmit-Kopie auf Segmentgroesse gedeckelt (Befund 13.1.4) -
-// Sendesegmente sind MSS-gebunden, 256K pro Slot waren reine Verschwendung.
-pub const LAST_PAYLOAD_SIZE: usize = 2048;
+pub const SENT_SEGMENT_CAPACITY: usize = tcp_runtime.SENT_SEGMENT_CAPACITY;
+pub const SENT_PAYLOAD_CAPACITY: usize = tcp_runtime.SENT_PAYLOAD_CAPACITY;
 // 0.56.20: Frist fuer TIME_WAIT-/LAST_ACK-/FIN_WAIT-Slots (Befund 13.1.3);
 // gleicher Wert wie timing.DEFAULT_TCP_TIME_WAIT_TICKS.
 pub const TIME_WAIT_TICKS: u64 = @import("timing.zig").msToTicks(3_000);
@@ -17,8 +16,8 @@ pub fn connectionSlotBytes() usize {
     return @sizeOf(Connection);
 }
 
-pub const FLAG_FIN: u16 = 0x001;
-pub const FLAG_SYN: u16 = 0x002;
+pub const FLAG_FIN: u16 = tcp_runtime.FLAG_FIN;
+pub const FLAG_SYN: u16 = tcp_runtime.FLAG_SYN;
 pub const FLAG_RST: u16 = 0x004;
 pub const FLAG_PSH: u16 = 0x008;
 pub const FLAG_ACK: u16 = 0x010;
@@ -48,6 +47,8 @@ pub const SegmentView = struct {
 
 pub const ConnectionInfo = r4x_api.TcpConnectionInfo;
 pub const Summary = r4x_api.TcpSummary;
+pub const ConnectionIdentity = tcp_runtime.ConnectionIdentity;
+pub const RetransmitKind = tcp_runtime.SegmentKind;
 
 pub const CleanupResult = struct {
     connections: u32 = 0,
@@ -100,11 +101,20 @@ pub const RetransmitPlan = struct {
     flags: u16,
     rx_window: u16,
     payload: []const u8,
+    token: u64,
+    sent_tick: u64,
+    retransmits: u8,
+};
+
+pub const OutstandingInfo = struct {
+    sent_tick: u64,
+    retransmits: u8,
 };
 
 const Connection = struct {
     used: bool = false,
     id: u32 = 0,
+    generation: u32 = 0,
     state: State = .closed,
     local_port: u16 = 0,
     remote_port: u16 = 0,
@@ -122,12 +132,11 @@ const Connection = struct {
     rx_head: usize = 0,
     rx_len: usize = 0,
     rx: [BUFFER_SIZE]u8 = .{0} ** BUFFER_SIZE,
-    last_valid: bool = false,
     last_seq: u32 = 0,
     last_ack: u32 = 0,
     last_flags: u16 = 0,
     last_len: usize = 0,
-    last_payload: [LAST_PAYLOAD_SIZE]u8 = .{0} ** LAST_PAYLOAD_SIZE,
+    sent: tcp_runtime.SendCatalog = .{},
     out_of_order: [OUT_OF_ORDER_SLOT_COUNT]OutOfOrderSegment = .{OutOfOrderSegment{}} ** OUT_OF_ORDER_SLOT_COUNT,
 };
 
@@ -145,6 +154,7 @@ const Listener = struct {
 
 var stats: Stats = .{};
 var connections: [MAX_CONNECTIONS]Connection = .{Connection{}} ** MAX_CONNECTIONS;
+var slot_generations: [MAX_CONNECTIONS]u32 = .{0} ** MAX_CONNECTIONS;
 var listeners: [MAX_LISTENERS]Listener = .{Listener{}} ** MAX_LISTENERS;
 var next_id: u32 = 1;
 var next_port: u16 = 49152;
@@ -152,6 +162,7 @@ var next_port: u16 = 49152;
 pub fn reset() void {
     stats = .{};
     connections = .{Connection{}} ** MAX_CONNECTIONS;
+    slot_generations = .{0} ** MAX_CONNECTIONS;
     listeners = .{Listener{}} ** MAX_LISTENERS;
     next_id = 1;
     next_port = 49152;
@@ -229,6 +240,7 @@ pub fn selfTestConnect(remote_ip: [4]u8, remote_port: u16) i32 {
     c.* = .{
         .used = true,
         .id = next_id,
+        .generation = nextSlotGeneration(idx),
         .state = .syn_sent,
         .local_port = next_port,
         .remote_port = remote_port,
@@ -254,6 +266,7 @@ pub fn beginLiveConnect(remote_ip: [4]u8, remote_port: u16, initial_seq: u32) i3
     c.* = .{
         .used = true,
         .id = next_id,
+        .generation = nextSlotGeneration(idx),
         .state = .syn_sent,
         .local_port = next_port,
         .remote_port = remote_port,
@@ -319,6 +332,7 @@ pub fn acceptInbound(view: SegmentView, initial_seq: u32) ?u32 {
     c.* = .{
         .used = true,
         .id = next_id,
+        .generation = nextSlotGeneration(idx),
         .state = .syn_received,
         .local_port = view.dest_port,
         .remote_port = view.source_port,
@@ -365,6 +379,28 @@ pub fn established(conn_id: u32) bool {
     return c.state == .established;
 }
 
+pub fn connectionIdentity(conn_id: u32) ?ConnectionIdentity {
+    var slot: usize = 0;
+    while (slot < connections.len) : (slot += 1) {
+        const c = &connections[slot];
+        if (!c.used or c.id != conn_id or c.generation == 0) continue;
+        return .{ .connection_id = c.id, .slot = slot, .generation = c.generation };
+    }
+    return null;
+}
+
+pub fn connectionIdentityAt(slot: usize) ?ConnectionIdentity {
+    if (slot >= connections.len) return null;
+    const c = &connections[slot];
+    if (!c.used or c.id == 0 or c.generation == 0) return null;
+    return .{ .connection_id = c.id, .slot = slot, .generation = c.generation };
+}
+
+pub fn identityActive(identity: ConnectionIdentity) bool {
+    const current = connectionIdentityAt(identity.slot) orelse return false;
+    return current.eql(identity);
+}
+
 pub fn connectionWithDataOnPort(port: u16) ?u32 {
     var i: usize = 0;
     while (i < connections.len) : (i += 1) {
@@ -393,6 +429,11 @@ pub fn claimAccepted(conn_id: u32) bool {
 pub fn connectionIdForSegment(view: SegmentView) ?u32 {
     const c = matchConnection(view) orelse return null;
     return c.id;
+}
+
+pub fn connectionIdentityForSegment(view: SegmentView) ?ConnectionIdentity {
+    const c = matchConnection(view) orelse return null;
+    return connectionIdentity(c.id);
 }
 
 pub fn abortConnectionsOnPort(port: u16, reason: []const u8) void {
@@ -436,24 +477,52 @@ pub fn planSend(conn_id: u32) ?SendPlan {
     };
 }
 
-pub fn planRetransmit(conn_id: u32) ?RetransmitPlan {
+pub fn sendAllowance(conn_id: u32, requested: usize) usize {
+    const c = byId(conn_id) orelse return 0;
+    if (c.state != .established) return 0;
+    return tcp_runtime.sendAllowance(c.tx_window, requested, c.sent.hasCapacity());
+}
+
+pub fn canTrackSend(conn_id: u32, flags: u16, payload_len: usize) bool {
+    const c = byId(conn_id) orelse return false;
+    if (c.state == .closed) return false;
+    if (!tcp_runtime.needsTracking(flags, payload_len)) return true;
+    return payload_len <= SENT_PAYLOAD_CAPACITY and c.sent.hasCapacity();
+}
+
+pub fn planRetransmit(conn_id: u32, kind: RetransmitKind) ?RetransmitPlan {
     const c = byId(conn_id) orelse return null;
-    if (!c.last_valid or c.state == .closed) return null;
+    if (c.state == .closed) return null;
+    const segment = c.sent.oldest(kind) orelse return null;
     return .{
         .local_port = c.local_port,
         .remote_port = c.remote_port,
         .remote_ip = c.remote_ip,
-        .seq = c.last_seq,
-        .ack = c.last_ack,
-        .flags = c.last_flags,
+        .seq = segment.seq,
+        .ack = segment.ack,
+        .flags = segment.flags,
         .rx_window = advertisedWindow(c),
-        .payload = c.last_payload[0..c.last_len],
+        .payload = segment.payloadSlice(),
+        .token = segment.token,
+        .sent_tick = segment.sent_tick,
+        .retransmits = segment.retransmits,
     };
 }
 
-pub fn commitSent(conn_id: u32, flags: u16, payload: []const u8) void {
-    const c = byId(conn_id) orelse return;
-    rememberSent(c, flags, payload);
+pub fn outstandingInfo(conn_id: u32, kind: RetransmitKind) ?OutstandingInfo {
+    const c = byId(conn_id) orelse return null;
+    const segment = c.sent.oldest(kind) orelse return null;
+    return .{ .sent_tick = segment.sent_tick, .retransmits = segment.retransmits };
+}
+
+pub fn outstandingCount(conn_id: u32) usize {
+    const c = byId(conn_id) orelse return 0;
+    return c.sent.count();
+}
+
+pub fn commitSent(conn_id: u32, flags: u16, payload: []const u8, sent_tick: u64) bool {
+    const c = byId(conn_id) orelse return false;
+    if (!rememberSent(c, flags, payload, sent_tick)) return false;
     const payload_len = payload.len;
     if ((flags & FLAG_SYN) != 0) {
         if ((flags & FLAG_ACK) != 0) {
@@ -463,7 +532,7 @@ pub fn commitSent(conn_id: u32, flags: u16, payload: []const u8) void {
             stats.syn_tx += 1;
             stats.last_error = "syn";
         }
-        return;
+        return true;
     }
     if ((flags & FLAG_ACK) != 0) stats.ack_tx += 1;
     if (payload_len != 0) {
@@ -479,13 +548,16 @@ pub fn commitSent(conn_id: u32, flags: u16, payload: []const u8) void {
         stats.fin_tx += 1;
         stats.last_error = "fin";
     }
+    return true;
 }
 
-pub fn recordRetransmit(conn_id: u32, reason: []const u8) void {
-    const c = byId(conn_id) orelse return;
+pub fn recordRetransmit(conn_id: u32, token: u64, sent_tick: u64, reason: []const u8) bool {
+    const c = byId(conn_id) orelse return false;
+    if (!c.sent.markRetransmitted(token, sent_tick)) return false;
     c.retransmits += 1;
     stats.retransmits += 1;
     stats.last_error = reason;
+    return true;
 }
 
 // 0.56.22: Nicht-konsumierende Lesbarkeits-Pruefung fuer die
@@ -997,6 +1069,12 @@ fn allocConnection() ?usize {
     return null;
 }
 
+fn nextSlotGeneration(slot: usize) u32 {
+    slot_generations[slot] +%= 1;
+    if (slot_generations[slot] == 0) slot_generations[slot] = 1;
+    return slot_generations[slot];
+}
+
 fn reapClosedConnectionSlots() u32 {
     var count: u32 = 0;
     var i: usize = 0;
@@ -1033,15 +1111,14 @@ fn activeCount() u32 {
     return count;
 }
 
-fn rememberSent(c: *Connection, flags: u16, payload: []const u8) void {
-    if ((flags & (FLAG_SYN | FLAG_FIN)) == 0 and payload.len == 0) return;
-    c.last_valid = true;
+fn rememberSent(c: *Connection, flags: u16, payload: []const u8, sent_tick: u64) bool {
+    if (!tcp_runtime.needsTracking(flags, payload.len)) return true;
+    if (c.sent.track(c.seq, c.ack, flags, payload, sent_tick) == null) return false;
     c.last_seq = c.seq;
     c.last_ack = c.ack;
     c.last_flags = flags;
-    const copy_len = if (payload.len > c.last_payload.len) c.last_payload.len else payload.len;
-    if (copy_len != 0) @memcpy(c.last_payload[0..copy_len], payload[0..copy_len]);
-    c.last_len = copy_len;
+    c.last_len = payload.len;
+    return true;
 }
 
 fn updateTxWindow(c: *Connection, view: SegmentView) void {
@@ -1052,8 +1129,9 @@ fn updateTxWindow(c: *Connection, view: SegmentView) void {
     if (c.tx_ack == 0 or seqAfter(view.ack, c.tx_ack)) {
         c.tx_ack = view.ack;
     }
+    _ = c.sent.acknowledge(view.ack);
     const right_edge = view.ack +% @as(u32, view.window);
-    c.tx_window = if (right_edge >= c.seq) right_edge - c.seq else 0;
+    c.tx_window = if (seqAfter(right_edge, c.seq)) right_edge -% c.seq else 0;
 }
 
 fn writeRx(c: *Connection, data: []const u8) usize {
@@ -1108,6 +1186,7 @@ fn segmentSeqAcceptable(c: *const Connection, view: SegmentView) bool {
 fn resetConnectionSlot(c: *Connection) void {
     c.used = false;
     c.id = 0;
+    c.generation = 0;
     c.state = .closed;
     c.local_port = 0;
     c.remote_port = 0;
@@ -1124,11 +1203,11 @@ fn resetConnectionSlot(c: *Connection) void {
     c.time_wait_until = 0;
     c.rx_head = 0;
     c.rx_len = 0;
-    c.last_valid = false;
     c.last_seq = 0;
     c.last_ack = 0;
     c.last_flags = 0;
     c.last_len = 0;
+    c.sent.reset();
     for (&c.out_of_order) |*slot| slot.valid = false;
 }
 
@@ -1152,8 +1231,8 @@ pub fn reapTimeWait(now: u64) u32 {
         if (c.state == .closed and c.rx_len == 0) {
             if (c.time_wait_until == 0) {
                 c.time_wait_until = now +% TIME_WAIT_TICKS;
-            } else if (now >= c.time_wait_until) {
-                c.used = false;
+            } else if (tcp_runtime.deadlineReached(now, c.time_wait_until)) {
+                resetConnectionSlot(c);
                 freed += 1;
             }
             continue;
@@ -1163,9 +1242,8 @@ pub fn reapTimeWait(now: u64) u32 {
             c.time_wait_until = now +% TIME_WAIT_TICKS;
             continue;
         }
-        if (now >= c.time_wait_until) {
-            c.state = .closed;
-            c.used = false;
+        if (tcp_runtime.deadlineReached(now, c.time_wait_until)) {
+            resetConnectionSlot(c);
             freed += 1;
         }
     }
@@ -1312,4 +1390,5 @@ pub fn wraparoundProbe() bool {
     _ = applyRxView(fin) orelse return false;
     return c.ack == 3 and c.state == .closed;
 }
+const tcp_runtime = @import("tcp_runtime.zig");
 const r4x_api = @import("../program/r4x_api.zig");
