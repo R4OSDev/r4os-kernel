@@ -1627,6 +1627,7 @@ pub const RegistryValueInfo = generated.RegistryValueInfo;
 pub const ServiceInfo = generated.ServiceInfo;
 pub const ServiceDetail = generated.ServiceDetail;
 pub const ServiceMessageHeader = generated.ServiceMessageHeader;
+pub const ServiceDeadlineFooter = generated.ServiceDeadlineFooter;
 pub const IpcSummary = generated.IpcSummary;
 pub const IpcChannelInfo = generated.IpcChannelInfo;
 pub const IpcPerformanceSummary = generated.IpcPerformanceSummary;

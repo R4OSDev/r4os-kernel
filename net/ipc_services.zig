@@ -1,5 +1,6 @@
 const ipc = @import("../kernel/ipc.zig");
 const bootlog = @import("../kernel/bootlog.zig");
+const r4x_api = @import("../program/r4x_api.zig");
 const dns = @import("dns.zig");
 const net = @import("core.zig");
 const net_timing = @import("timing.zig");
@@ -799,11 +800,11 @@ fn handle(channel_id: u32, request: []const u8, response: []u8) i32 {
         return writeResponse(response, channel_id, op, request_id, RESULT_OK, bytes[0..@sizeOf(DhcpServiceStatus)]);
     }
     if (channel_id == ipc.CHANNEL_NET_DHCP and (op == OP_DHCP_ACQUIRE or op == OP_DHCP_RENEW or op == OP_DHCP_RELEASE)) {
-        writeDhcpOperation(&w, op);
+        writeDhcpOperation(&w, op, request_payload);
         return writeResponse(response, channel_id, op, request_id, RESULT_OK, w.slice());
     }
     if (channel_id == ipc.CHANNEL_NET_DHCP and (op == OP_DHCP_ACQUIRE_RESULT or op == OP_DHCP_RENEW_RESULT or op == OP_DHCP_RELEASE_RESULT)) {
-        const result = makeDhcpOperationResult(op);
+        const result = makeDhcpOperationResult(op, request_payload);
         const bytes: [*]const u8 = @ptrCast(&result);
         return writeResponse(response, channel_id, op, request_id, RESULT_OK, bytes[0..@sizeOf(DhcpServiceResult)]);
     }
@@ -970,10 +971,11 @@ fn makeDhcpStatusResult() DhcpServiceStatus {
     return out;
 }
 
-fn writeDhcpOperation(w: *Writer, op: u16) void {
+fn writeDhcpOperation(w: *Writer, op: u16, payload: []const u8) void {
+    const request = splitServiceDeadline(payload);
     const result = switch (op) {
-        OP_DHCP_ACQUIRE => net.dhcpAcquireDefault(),
-        OP_DHCP_RENEW => net.dhcpRenewDefault(),
+        OP_DHCP_ACQUIRE => net.dhcpAcquireDefaultUntil(request.deadline_tick),
+        OP_DHCP_RENEW => net.dhcpRenewDefaultUntil(request.deadline_tick),
         OP_DHCP_RELEASE => net.dhcpReleaseDefault(),
         else => unreachable,
     };
@@ -1014,10 +1016,11 @@ fn writeDhcpOperation(w: *Writer, op: u16) void {
     w.text(s.last_error);
 }
 
-fn makeDhcpOperationResult(op: u16) DhcpServiceResult {
+fn makeDhcpOperationResult(op: u16, payload: []const u8) DhcpServiceResult {
+    const request = splitServiceDeadline(payload);
     const tx = switch (op) {
-        OP_DHCP_ACQUIRE_RESULT => net.dhcpAcquireDefault(),
-        OP_DHCP_RENEW_RESULT => net.dhcpRenewDefault(),
+        OP_DHCP_ACQUIRE_RESULT => net.dhcpAcquireDefaultUntil(request.deadline_tick),
+        OP_DHCP_RENEW_RESULT => net.dhcpRenewDefaultUntil(request.deadline_tick),
         OP_DHCP_RELEASE_RESULT => net.dhcpReleaseDefault(),
         else => unreachable,
     };
@@ -1791,20 +1794,21 @@ const TcpResultPayload = struct {
 };
 
 fn makeTcpResult(op: u16, payload: []const u8, data_out: []u8, client_id: u16) TcpResultPayload {
+    const request = if (op == OP_TCP_CONNECT_RESULT) splitServiceDeadline(payload) else ServiceDeadlineRequest{ .payload = payload };
     var out = TcpServiceResult{ .action = tcpResultAction(op), .read_max = @intCast(TCP_RESULT_DATA_MAX), .owner_id = client_id };
     const data = switch (op) {
-        OP_TCP_CONNECT_RESULT => tcpConnectResult(&out, payload, client_id),
-        OP_TCP_WRITE_RESULT => tcpWriteResult(&out, payload, client_id),
-        OP_TCP_READ_RESULT => tcpReadResult(&out, payload, data_out, client_id),
-        OP_TCP_CLOSE_RESULT => tcpCloseResult(&out, payload, client_id),
-        OP_TCP_LISTEN_RESULT => tcpListenResult(&out, payload),
-        OP_TCP_ACCEPT_READ_RESULT => tcpAcceptReadResult(&out, payload, data_out, client_id),
-        OP_TCP_CLOSE_LISTEN_RESULT => tcpCloseListenResult(&out, payload),
-        OP_TCP_POLL_RESULT => tcpPollResult(&out, payload, client_id),
-        OP_TCP_ACCEPT_RESULT => tcpAcceptResult(&out, payload, client_id),
-        OP_TCP_ABORT_RESULT => tcpAbortResult(&out, payload, client_id),
-        OP_TCP_ACCEPT_POLL_RESULT => tcpAcceptPollResult(&out, payload, client_id),
-        OP_TCP_RETRANSMIT_RESULT => tcpRetransmitResult(&out, payload, client_id),
+        OP_TCP_CONNECT_RESULT => tcpConnectResult(&out, request.payload, request.deadline_tick, client_id),
+        OP_TCP_WRITE_RESULT => tcpWriteResult(&out, request.payload, client_id),
+        OP_TCP_READ_RESULT => tcpReadResult(&out, request.payload, data_out, client_id),
+        OP_TCP_CLOSE_RESULT => tcpCloseResult(&out, request.payload, client_id),
+        OP_TCP_LISTEN_RESULT => tcpListenResult(&out, request.payload),
+        OP_TCP_ACCEPT_READ_RESULT => tcpAcceptReadResult(&out, request.payload, data_out, client_id),
+        OP_TCP_CLOSE_LISTEN_RESULT => tcpCloseListenResult(&out, request.payload),
+        OP_TCP_POLL_RESULT => tcpPollResult(&out, request.payload, client_id),
+        OP_TCP_ACCEPT_RESULT => tcpAcceptResult(&out, request.payload, client_id),
+        OP_TCP_ABORT_RESULT => tcpAbortResult(&out, request.payload, client_id),
+        OP_TCP_ACCEPT_POLL_RESULT => tcpAcceptPollResult(&out, request.payload, client_id),
+        OP_TCP_RETRANSMIT_RESULT => tcpRetransmitResult(&out, request.payload, client_id),
         else => "",
     };
     fillTcpResultStatus(&out);
@@ -1830,13 +1834,13 @@ fn tcpResultAction(op: u16) u16 {
     };
 }
 
-fn tcpConnectResult(out: *TcpServiceResult, payload: []const u8, client_id: u16) []const u8 {
+fn tcpConnectResult(out: *TcpServiceResult, payload: []const u8, deadline_tick: ?u64, client_id: u16) []const u8 {
     if (payload.len < 6) return tcpBadRequestResult(out);
     out.remote_ip = .{ payload[0], payload[1], payload[2], payload[3] };
     out.port = readU16(payload, 4);
     out.remote_port = out.port;
     out.flags |= TCP_FLAG_REMOTE_VALID;
-    const conn = net.tcpConnect(out.remote_ip, out.port);
+    const conn = net.tcpConnectUntil(out.remote_ip, out.port, deadline_tick);
     if (conn <= 0) {
         out.result = conn;
         setTcpLifecycle(out, tcpLifecycleCauseFromError(fixedText(net.tcpStats().last_error)));
@@ -3160,6 +3164,30 @@ fn copyBounded(out: []u8, value: []const u8) void {
     if (len != 0) @memcpy(out[0..len], value[0..len]);
 }
 
+const ServiceDeadlineRequest = struct {
+    payload: []const u8,
+    deadline_tick: ?u64 = null,
+};
+
+fn splitServiceDeadline(payload: []const u8) ServiceDeadlineRequest {
+    const footer_size = @sizeOf(r4x_api.ServiceDeadlineFooter);
+    if (payload.len < footer_size) return .{ .payload = payload };
+    const footer = payload[payload.len - footer_size ..];
+    const expected = r4x_api.ServiceDeadlineFooter{};
+    if (readU32(footer, 0) != expected.magic or
+        readU16(footer, 4) != expected.version or
+        readU16(footer, 6) != footer_size or
+        readU32(footer, 8) != @as(u32, @intCast(payload.len - footer_size)) or
+        readU32(footer, 12) != 0)
+    {
+        return .{ .payload = payload };
+    }
+    return .{
+        .payload = payload[0 .. payload.len - footer_size],
+        .deadline_tick = readU64(footer, 16),
+    };
+}
+
 fn stringLenZ(value: []const u8) usize {
     var len: usize = 0;
     while (len < value.len and value[len] != 0) : (len += 1) {}
@@ -3253,6 +3281,10 @@ fn readU16(in_bytes: []const u8, offset: usize) u16 {
 
 fn readU32(in_bytes: []const u8, offset: usize) u32 {
     return @as(u32, readU16(in_bytes, offset)) | (@as(u32, readU16(in_bytes, offset + 2)) << 16);
+}
+
+fn readU64(in_bytes: []const u8, offset: usize) u64 {
+    return @as(u64, readU32(in_bytes, offset)) | (@as(u64, readU32(in_bytes, offset + 4)) << 32);
 }
 
 fn readI32(in_bytes: []const u8, offset: usize) i32 {

@@ -5053,20 +5053,28 @@ pub fn arpFlush() void {
 }
 
 pub fn dhcpAcquireDefault() TxResult {
+    return dhcpAcquireDefaultUntil(null);
+}
+
+pub fn dhcpAcquireDefaultUntil(deadline_tick: ?u64) TxResult {
     net_config.enableDhcp();
     if (adapter_count == 0) {
         dhcp_stats.last_error = "no-adapter";
         return .no_adapter;
     }
-    return dhcpAcquire(0);
+    return dhcpAcquireUntil(0, deadline_tick);
 }
 
 pub fn dhcpRenewDefault() TxResult {
+    return dhcpRenewDefaultUntil(null);
+}
+
+pub fn dhcpRenewDefaultUntil(deadline_tick: ?u64) TxResult {
     if (adapter_count == 0) {
         dhcp_stats.last_error = "no-adapter";
         return .no_adapter;
     }
-    return dhcpRenew(0);
+    return dhcpRenewUntil(0, deadline_tick);
 }
 
 pub fn dhcpReleaseDefault() TxResult {
@@ -5084,6 +5092,10 @@ pub fn dhcpReleaseDefault() TxResult {
 }
 
 pub fn dhcpAcquire(adapter_index: usize) TxResult {
+    return dhcpAcquireUntil(adapter_index, null);
+}
+
+pub fn dhcpAcquireUntil(adapter_index: usize, deadline_tick: ?u64) TxResult {
     if (adapter_index >= adapter_count) {
         dhcp_stats.last_error = "no-adapter";
         return .no_adapter;
@@ -5092,13 +5104,14 @@ pub fn dhcpAcquire(adapter_index: usize) TxResult {
         dhcp_stats.last_error = "link-down";
         return .link_down;
     }
+    if (dhcpDeadlineExpired(deadline_tick)) return dhcpDeadlineResult("acquire-timeout");
     if (!beginDhcpOperation("acquire", .acquire)) return .busy;
-    const result = dhcpAcquireOperation(adapter_index);
+    const result = dhcpAcquireOperation(adapter_index, deadline_tick);
     finishDhcpOperation(result, true);
     return result;
 }
 
-fn dhcpAcquireOperation(adapter_index: usize) TxResult {
+fn dhcpAcquireOperation(adapter_index: usize, deadline_tick: ?u64) TxResult {
     const socket_raw = bindDhcpClientSocket() orelse return .backend_error;
     const socket: u32 = @intCast(socket_raw);
     defer _ = udpClose(socket);
@@ -5114,7 +5127,7 @@ fn dhcpAcquireOperation(adapter_index: usize) TxResult {
         return .too_large;
     };
     setDhcpResponseExpectation(.offer, xid, adapters[adapter_index].mac);
-    var result = sendDhcpWithOfferRetry(adapter_index, socket, discover, "offer-timeout");
+    var result = sendDhcpWithOfferRetry(adapter_index, socket, discover, "offer-timeout", deadline_tick);
     if (result != .ok) return result;
     if (dhcp_stats.lease.xid != 0 and dhcp_stats.lease.xid != xid) {
         dhcp_stats.last_error = "xid-mismatch";
@@ -5131,7 +5144,7 @@ fn dhcpAcquireOperation(adapter_index: usize) TxResult {
         return .too_large;
     };
     setDhcpResponseExpectation(.ack_or_nak, xid, adapters[adapter_index].mac);
-    result = sendDhcpWithAckRetry(adapter_index, socket, request, "ack-timeout");
+    result = sendDhcpWithAckRetry(adapter_index, socket, request, "ack-timeout", deadline_tick);
     if (result != .ok) return result;
     if (!dhcp_stats.lease.bound or isZeroIp(dhcp_stats.lease.offered_ip)) {
         dhcp_stats.last_error = "not-bound";
@@ -5148,6 +5161,10 @@ fn dhcpAcquireOperation(adapter_index: usize) TxResult {
 }
 
 pub fn dhcpRenew(adapter_index: usize) TxResult {
+    return dhcpRenewUntil(adapter_index, null);
+}
+
+pub fn dhcpRenewUntil(adapter_index: usize, deadline_tick: ?u64) TxResult {
     if (adapter_index >= adapter_count) {
         dhcp_stats.last_error = "no-adapter";
         return .no_adapter;
@@ -5156,13 +5173,14 @@ pub fn dhcpRenew(adapter_index: usize) TxResult {
         dhcp_stats.last_error = "no-lease";
         return .backend_error;
     }
+    if (dhcpDeadlineExpired(deadline_tick)) return dhcpDeadlineResult("renew-timeout");
     if (!beginDhcpOperation("renew", .renew)) return .busy;
-    const result = dhcpRenewOperation(adapter_index);
+    const result = dhcpRenewOperation(adapter_index, deadline_tick);
     finishDhcpOperation(result, true);
     return result;
 }
 
-fn dhcpRenewOperation(adapter_index: usize) TxResult {
+fn dhcpRenewOperation(adapter_index: usize, deadline_tick: ?u64) TxResult {
     const socket_raw = bindDhcpClientSocket() orelse return .backend_error;
     const socket: u32 = @intCast(socket_raw);
     defer _ = udpClose(socket);
@@ -5180,7 +5198,7 @@ fn dhcpRenewOperation(adapter_index: usize) TxResult {
     };
     setDhcpResponseExpectation(.ack_or_nak, xid, adapters[adapter_index].mac);
     const nak_before = dhcp_stats.nak_rx;
-    const result = sendDhcpWithAckRetryFrom(adapter_index, socket, DHCP_ZERO_IP, DHCP_BROADCAST_IP, request, "renew-timeout");
+    const result = sendDhcpWithAckRetryFrom(adapter_index, socket, DHCP_ZERO_IP, DHCP_BROADCAST_IP, request, "renew-timeout", deadline_tick);
     if (result != .ok) {
         if (dhcp_stats.nak_rx <= nak_before) {
             dhcp_stats.lease = previous_lease;
@@ -5266,9 +5284,11 @@ fn sendDhcpUdp(adapter_index: usize, socket: u32, dhcp_payload: []const u8) TxRe
     return sendDhcpUdpFrom(adapter_index, socket, DHCP_ZERO_IP, DHCP_BROADCAST_IP, dhcp_payload);
 }
 
-fn sendDhcpWithOfferRetry(adapter_index: usize, socket: u32, dhcp_payload: []const u8, timeout_label: []const u8) TxResult {
+fn sendDhcpWithOfferRetry(adapter_index: usize, socket: u32, dhcp_payload: []const u8, timeout_label: []const u8, deadline_tick: ?u64) TxResult {
     var attempt: u8 = 1;
     while (attempt <= DHCP_MAX_ATTEMPTS) : (attempt += 1) {
+        const wait_ticks = dhcpWaitBudget(deadline_tick, dhcpAttemptTimeout(attempt));
+        if (wait_ticks == 0) return dhcpDeadlineResult(timeout_label);
         if (!dhcpOperationCanContinue(adapter_index)) return dhcpCancelledResult(adapter_index);
         dhcp_stats.last_attempt = attempt;
         const offer_target = dhcp_stats.offer_rx + 1;
@@ -5277,7 +5297,7 @@ fn sendDhcpWithOfferRetry(adapter_index: usize, socket: u32, dhcp_payload: []con
             dhcp_stats.last_error = txResultName(result);
             return result;
         }
-        if (waitForDhcpProgress(adapter_index, socket, offer_target, dhcp_stats.ack_rx, dhcpAttemptTimeout(attempt))) return .ok;
+        if (waitForDhcpProgress(adapter_index, socket, offer_target, dhcp_stats.ack_rx, wait_ticks)) return .ok;
         if (!dhcpOperationCanContinue(adapter_index)) return dhcpCancelledResult(adapter_index);
         recordDhcpRetry(timeout_label, attempt);
     }
@@ -5285,13 +5305,15 @@ fn sendDhcpWithOfferRetry(adapter_index: usize, socket: u32, dhcp_payload: []con
     return .backend_error;
 }
 
-fn sendDhcpWithAckRetry(adapter_index: usize, socket: u32, dhcp_payload: []const u8, timeout_label: []const u8) TxResult {
-    return sendDhcpWithAckRetryFrom(adapter_index, socket, DHCP_ZERO_IP, DHCP_BROADCAST_IP, dhcp_payload, timeout_label);
+fn sendDhcpWithAckRetry(adapter_index: usize, socket: u32, dhcp_payload: []const u8, timeout_label: []const u8, deadline_tick: ?u64) TxResult {
+    return sendDhcpWithAckRetryFrom(adapter_index, socket, DHCP_ZERO_IP, DHCP_BROADCAST_IP, dhcp_payload, timeout_label, deadline_tick);
 }
 
-fn sendDhcpWithAckRetryFrom(adapter_index: usize, socket: u32, source_ip: [4]u8, dest_ip: [4]u8, dhcp_payload: []const u8, timeout_label: []const u8) TxResult {
+fn sendDhcpWithAckRetryFrom(adapter_index: usize, socket: u32, source_ip: [4]u8, dest_ip: [4]u8, dhcp_payload: []const u8, timeout_label: []const u8, deadline_tick: ?u64) TxResult {
     var attempt: u8 = 1;
     while (attempt <= DHCP_MAX_ATTEMPTS) : (attempt += 1) {
+        const wait_ticks = dhcpWaitBudget(deadline_tick, dhcpAttemptTimeout(attempt));
+        if (wait_ticks == 0) return dhcpDeadlineResult(timeout_label);
         if (!dhcpOperationCanContinue(adapter_index)) return dhcpCancelledResult(adapter_index);
         dhcp_stats.last_attempt = attempt;
         const ack_target = dhcp_stats.ack_rx + 1;
@@ -5301,7 +5323,7 @@ fn sendDhcpWithAckRetryFrom(adapter_index: usize, socket: u32, source_ip: [4]u8,
             dhcp_stats.last_error = txResultName(result);
             return result;
         }
-        if (waitForDhcpAckOrNak(adapter_index, socket, ack_target, nak_before + 1, dhcpAttemptTimeout(attempt))) {
+        if (waitForDhcpAckOrNak(adapter_index, socket, ack_target, nak_before + 1, wait_ticks)) {
             if (dhcp_stats.nak_rx > nak_before) {
                 dhcp_stats.lease.bound = false;
                 net_config.clearDhcpLease();
@@ -5324,6 +5346,24 @@ fn sendDhcpUdpFrom(adapter_index: usize, socket: u32, source_ip: [4]u8, dest_ip:
 
 fn dhcpAttemptTimeout(attempt: u8) u64 {
     return DHCP_TIMEOUT_TICKS * @as(u64, attempt);
+}
+
+fn dhcpDeadlineExpired(deadline_tick: ?u64) bool {
+    const deadline = deadline_tick orelse return false;
+    return time_core.monotonicTicks() >= deadline;
+}
+
+fn dhcpWaitBudget(deadline_tick: ?u64, attempt_ticks: u64) u64 {
+    const deadline = deadline_tick orelse return attempt_ticks;
+    const now = time_core.monotonicTicks();
+    if (now >= deadline) return 0;
+    return @min(attempt_ticks, deadline - now);
+}
+
+fn dhcpDeadlineResult(label: []const u8) TxResult {
+    dhcp_stats.timeouts += 1;
+    dhcp_stats.last_error = label;
+    return .backend_error;
 }
 
 fn recordDhcpRetry(timeout_label: []const u8, attempt: u8) void {
@@ -5780,9 +5820,19 @@ pub fn icmpEchoTarget(target_ip: [4]u8) TxResult {
 }
 
 pub fn tcpConnect(remote_ip: [4]u8, port: u16) i32 {
+    return tcpConnectUntil(remote_ip, port, null);
+}
+
+pub fn tcpConnectUntil(remote_ip: [4]u8, port: u16, request_deadline_tick: ?u64) i32 {
     if (adapter_count == 0) {
         tcp.setError("no-adapter");
         return r4p_contract.TCP_RESULT_NO_CONNECTION;
+    }
+    if (request_deadline_tick) |deadline| {
+        if (time_core.monotonicTicks() >= deadline) {
+            tcp.markTimeout("connect-timeout");
+            return r4p_contract.TCP_RESULT_BAD_STATE;
+        }
     }
     const conn = tcp.beginLiveConnect(remote_ip, port, nextTcpSeq(remote_ip, port));
     if (conn <= 0) return conn;
@@ -5796,7 +5846,13 @@ pub fn tcpConnect(remote_ip: [4]u8, port: u16) i32 {
         return r4p_contract.TCP_RESULT_BAD_STATE;
     }
     var retransmits: u8 = 0;
-    while (!waitForTcpEstablished(conn_id, rtoBackoff(conn_id, retransmits))) {
+    while (true) {
+        const now = time_core.monotonicTicks();
+        if (request_deadline_tick) |deadline| if (now >= deadline) break;
+        const attempt_deadline = now +| rtoBackoff(conn_id, retransmits);
+        const wait_deadline = if (request_deadline_tick) |deadline| @min(deadline, attempt_deadline) else attempt_deadline;
+        if (waitForTcpEstablishedUntil(conn_id, wait_deadline)) break;
+        if (request_deadline_tick) |deadline| if (time_core.monotonicTicks() >= deadline) break;
         if (retransmits >= TCP_MAX_RETRANSMITS) break;
         const retry = retransmitTcpConnection(conn_id, .syn, "syn-retry");
         if (retry != .ok) break;
@@ -6299,15 +6355,15 @@ fn predStillWaitPortConn(raw: *anyopaque) bool {
     return tcp.connectionOnPort(c.port) == null;
 }
 
-fn waitForTcpEstablished(conn_id: u32, timeout_ticks: u64) bool {
+fn waitForTcpEstablishedUntil(conn_id: u32, deadline_tick: u64) bool {
     pollAdapters(TCP_POLL_ROUNDS);
-    const deadline = timing.Deadline.start(timeout_ticks, 1);
     var ctx = TcpWaitCtx{ .conn_id = conn_id };
     while (true) {
         if (tcp.established(conn_id)) return true;
         if (tcp.closed(conn_id)) return false;
-        if (deadline.expiredNow()) return tcp.established(conn_id);
-        _ = tcp_activity.waitUnless(TCP_WAIT_SLICE_TICKS, "tcp-est", predStillWaitEstablished, &ctx);
+        const now = time_core.monotonicTicks();
+        if (now >= deadline_tick) return tcp.established(conn_id);
+        _ = tcp_activity.waitUnless(@min(TCP_WAIT_SLICE_TICKS, deadline_tick - now), "tcp-est", predStillWaitEstablished, &ctx);
     }
 }
 
