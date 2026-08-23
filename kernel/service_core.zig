@@ -169,6 +169,10 @@ pub fn submitRequest(handle: u32, client_id: u32, op: u16, payload: []const u8) 
     return legacy.submitRequest(handle, client_id, op, payload);
 }
 
+pub fn submitRequestWait(handle: u32, client_id: u32, op: u16, payload: []const u8, timeout_ticks: u64) i32 {
+    return legacy.submitRequestWait(handle, client_id, op, payload, timeout_ticks);
+}
+
 pub fn recvRequest(handle: u32, header: *ApiMessageHeader, out: []u8) i32 {
     return legacy.recvRequest(handle, header, out);
 }

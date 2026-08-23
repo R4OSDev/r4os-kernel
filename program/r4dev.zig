@@ -1421,12 +1421,19 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const caller_version = out.version;
     const caller_size: usize = out.size;
     const v1_size: usize = @offsetOf(ProgramPerformanceSummary, "monotonic_clock_flags");
+    const v2_size: usize = @offsetOf(ProgramPerformanceSummary, "service_completion_wait_rounds");
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
     const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= @sizeOf(ProgramPerformanceSummary))
         performance_snapshot_version
+    else if (caller_version >= 2 and caller_size >= v2_size)
+        2
     else
         1;
-    const version_capacity: usize = if (negotiated_version >= 2) @sizeOf(ProgramPerformanceSummary) else v1_size;
+    const version_capacity: usize = switch (negotiated_version) {
+        1 => v1_size,
+        2 => v2_size,
+        else => @sizeOf(ProgramPerformanceSummary),
+    };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
     const tasks = sched_task.summary();
@@ -1668,6 +1675,11 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .service_cancellations = svc.cancellations,
         .service_completion_waits = svc.completion_waits,
         .service_completion_timeouts = svc.completion_timeouts,
+        .service_completion_wait_rounds = svc.completion_wait_rounds,
+        .service_targeted_response_wakes = svc.targeted_response_wakes,
+        .service_targeted_response_wake_misses = svc.targeted_response_wake_misses,
+        .service_admission_waits = svc.admission_waits,
+        .service_admission_timeouts = svc.admission_timeouts,
         .tcp_max_connections = tcp_summary.max_connections,
         .tcp_active_connections = tcp_summary.active_connections,
         .tcp_active_listeners = tcp_summary.active_listeners,

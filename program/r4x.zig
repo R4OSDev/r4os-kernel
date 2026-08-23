@@ -11075,14 +11075,16 @@ fn serviceCallCore(async_req: *AsyncIoRequest, handle: u32, op: u16, request_ptr
     if (@intFromPtr(response_ptr) == 0) return services.API_ERR_INVALID;
     const instance = currentInstance() orelse return services.API_ERR_INVALID;
     const request = if (request_len == 0) "" else request_ptr[0..@as(usize, @intCast(request_len))];
-    // submitRequest publishes into the service registry before the returned
-    // ID can be attached to the AsyncIoRequest. Keep hard-kill deferred only
-    // across that cross-registry handoff, then restore normal cancellation.
-    const publish_token = task_context.enterUnwind();
-    if (!publish_token.admitted()) return IO_ERROR_BUSY;
-    const request_id_raw = services.submitRequest(handle, instance.id, op, request);
+    const forever = timeout_ticks == sync.WAIT_FOREVER;
+    const start_ticks = r4api.r4sys.ticks();
+    const deadline = if (forever) @as(u64, 0) else start_ticks +| timeout_ticks;
+    // Slot admission may block, so hard-kill remains enabled while queued.
+    // The service core arms this token only after admission and immediately
+    // before publishing the RequestSlot. It stays active across the short
+    // cross-registry handoff into AsyncIoRequest.service_request_id.
+    var publish_token: task_context.UnwindToken = .{};
+    const request_id_raw = services.submitRequestWaitGuarded(handle, instance.id, op, request, timeout_ticks, &publish_token);
     if (request_id_raw <= 0) {
-        _ = task_context.leaveUnwind(publish_token);
         return request_id_raw;
     }
     const request_id: u32 = @intCast(request_id_raw);
@@ -11101,17 +11103,15 @@ fn serviceCallCore(async_req: *AsyncIoRequest, handle: u32, op: u16, request_ptr
     }
     defer clearAsyncServiceRequestId(async_req, request_id);
     const response = response_ptr[0..@as(usize, @intCast(response_capacity))];
-    const timeout = timeout_ticks;
-    const start_ticks = r4api.r4sys.ticks();
     while (true) {
         const result = services.takeResponse(handle, request_id, response_header, response);
         if (result < 0) return result;
         if (result > 0 or response_header.magic == services.API_MAGIC) return result;
         const now_ticks = r4api.r4sys.ticks();
-        const elapsed = if (now_ticks >= start_ticks) now_ticks - start_ticks else timeout;
-        if (elapsed >= timeout) break;
-        const wait_result = services.waitResponse(handle, request_id, timeout - elapsed);
-        if (wait_result == services.API_ERR_TIMEOUT) continue;
+        if (!forever and now_ticks >= deadline) break;
+        const remaining = if (forever) sync.WAIT_FOREVER else deadline - now_ticks;
+        const wait_result = services.waitResponse(handle, request_id, remaining);
+        if (wait_result == services.API_ERR_TIMEOUT) break;
         if (wait_result < 0) {
             _ = services.cancelRequest(handle, request_id);
             return wait_result;

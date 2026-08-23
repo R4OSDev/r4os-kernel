@@ -1,5 +1,7 @@
 const r4x_api = @import("../program/r4x_api.zig");
 const sync = @import("../sched/sync.zig");
+const task_context = @import("../sched/task_context.zig");
+const timer = @import("timer.zig");
 
 pub const MAX_SERVICES: usize = 16;
 pub const MAX_NAME: usize = 32;
@@ -83,6 +85,7 @@ const RequestSlot = struct {
     request_len: u16 = 0,
     response_len: u16 = 0,
     response_status: i32 = API_OK,
+    response_available: sync.WaitQueue = sync.WaitQueue.init(),
     request_payload: [API_MAX_PAYLOAD]u8 = .{0} ** API_MAX_PAYLOAD,
     response_payload: [API_MAX_PAYLOAD]u8 = .{0} ** API_MAX_PAYLOAD,
 };
@@ -139,9 +142,13 @@ const Endpoint = struct {
     cancellations: u64 = 0,
     completion_waits: u64 = 0,
     completion_timeouts: u64 = 0,
+    completion_wait_rounds: u64 = 0,
+    targeted_response_wakes: u64 = 0,
+    targeted_response_wake_misses: u64 = 0,
+    admission_waits: u64 = 0,
+    admission_timeouts: u64 = 0,
     requests_available: sync.WaitQueue = sync.WaitQueue.init(),
-    responses_available: sync.WaitQueue = sync.WaitQueue.init(),
-    slots_available: sync.WaitQueue = sync.WaitQueue.init(),
+    slots_available: sync.Semaphore = sync.Semaphore.init(@intCast(API_ENDPOINT_QUEUE_DEPTH), @intCast(API_ENDPOINT_QUEUE_DEPTH)),
     queue: [API_ENDPOINT_QUEUE_DEPTH]RequestSlot = .{RequestSlot{}} ** API_ENDPOINT_QUEUE_DEPTH,
 };
 
@@ -166,6 +173,11 @@ pub const PerformanceSummary = struct {
     cancellations: u64 = 0,
     completion_waits: u64 = 0,
     completion_timeouts: u64 = 0,
+    completion_wait_rounds: u64 = 0,
+    targeted_response_wakes: u64 = 0,
+    targeted_response_wake_misses: u64 = 0,
+    admission_waits: u64 = 0,
+    admission_timeouts: u64 = 0,
 };
 
 var entries: [MAX_SERVICES]Entry = .{Entry{}} ** MAX_SERVICES;
@@ -352,6 +364,11 @@ pub fn performanceSummary() PerformanceSummary {
         out.cancellations +%= ep.cancellations;
         out.completion_waits +%= ep.completion_waits;
         out.completion_timeouts +%= ep.completion_timeouts;
+        out.completion_wait_rounds +%= ep.completion_wait_rounds;
+        out.targeted_response_wakes +%= ep.targeted_response_wakes;
+        out.targeted_response_wake_misses +%= ep.targeted_response_wake_misses;
+        out.admission_waits +%= ep.admission_waits;
+        out.admission_timeouts +%= ep.admission_timeouts;
     }
     return out;
 }
@@ -488,44 +505,223 @@ pub fn endpointPoll(handle: u32) i32 {
 // wird NIE ueber den Schlaf gehalten; das waitUnless-Praedikat schliesst
 // das Lost-Wakeup-Fenster zwischen Unlock und addWaiter (submitRequest
 // koennte dazwischen queuen und wakeOne ins Leere feuern).
-fn endpointWaitStillNeeded(ctx: *anyopaque) bool {
-    const ep: *Endpoint = @ptrCast(@alignCast(ctx));
-    if (!ep.used) return false;
-    return countQueuedSlots(ep) == 0;
+const EndpointWaitContext = struct {
+    endpoint: *Endpoint,
+    handle: u32,
+};
+
+fn endpointWaitStillNeeded(raw: *anyopaque) bool {
+    const ctx: *EndpointWaitContext = @ptrCast(@alignCast(raw));
+    return ctx.endpoint.used and
+        ctx.endpoint.handle == ctx.handle and
+        countQueuedSlots(ctx.endpoint) == 0;
+}
+
+fn releaseMutexForWait(raw: *anyopaque) void {
+    const mutex: *sync.Mutex = @ptrCast(@alignCast(raw));
+    _ = mutex.unlock();
 }
 
 pub fn endpointWait(handle: u32, timeout_ticks: u64) i32 {
-    var ep_ptr: *Endpoint = undefined;
-    {
-        const locked = lockRegistry();
-        defer unlockRegistry(locked);
-        const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-        const ep = &endpoints[idx];
-        if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
-        const queued = countQueuedSlots(ep);
-        if (queued > 0) return @intCast(queued);
-        ep_ptr = ep;
-    }
-
-    _ = ep_ptr.requests_available.waitUnless(timeout_ticks, "svc-endpoint", endpointWaitStillNeeded, ep_ptr);
-
     const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
+    const idx = endpointForHandle(handle) orelse {
+        unlockRegistry(locked);
+        return API_ERR_BAD_HANDLE;
+    };
     const ep = &endpoints[idx];
-    if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
-    return @intCast(countQueuedSlots(ep));
+    if (!serviceSlotRunning(ep.service_slot)) {
+        unlockRegistry(locked);
+        return API_ERR_NOT_RUNNING;
+    }
+    const queued = countQueuedSlots(ep);
+    if (queued > 0) {
+        unlockRegistry(locked);
+        return @intCast(queued);
+    }
+    var wait_ctx = EndpointWaitContext{ .endpoint = ep, .handle = handle };
+    _ = ep.requests_available.waitUnlessReleasing(
+        timeout_ticks,
+        "svc-endpoint",
+        endpointWaitStillNeeded,
+        &wait_ctx,
+        releaseMutexForWait,
+        &registry_lock,
+    );
+
+    const result_locked = lockRegistry();
+    defer unlockRegistry(result_locked);
+    const result_idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
+    const result_ep = &endpoints[result_idx];
+    if (!serviceSlotRunning(result_ep.service_slot)) return API_ERR_NOT_RUNNING;
+    return @intCast(countQueuedSlots(result_ep));
 }
 
 pub fn submitRequest(handle: u32, client_id: u32, op: u16, payload: []const u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
     if (op == 0) return API_ERR_INVALID;
     if (payload.len > API_MAX_PAYLOAD) return API_ERR_PAYLOAD_TOO_LARGE;
+    const locked = lockRegistry();
+    defer unlockRegistry(locked);
     const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
     var ep = &endpoints[idx];
     if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
+    if (!ep.slots_available.tryAcquire()) {
+        ep.busy_rejections +%= 1;
+        return API_ERR_BUSY;
+    }
+    return publishRequestLocked(ep, client_id, op, payload);
+}
+
+pub fn submitRequestWait(handle: u32, client_id: u32, op: u16, payload: []const u8, timeout_ticks: u64) i32 {
+    return submitRequestWaitInternal(handle, client_id, op, payload, timeout_ticks, null);
+}
+
+pub fn submitRequestWaitGuarded(
+    handle: u32,
+    client_id: u32,
+    op: u16,
+    payload: []const u8,
+    timeout_ticks: u64,
+    publish_unwind: *task_context.UnwindToken,
+) i32 {
+    publish_unwind.* = .{};
+    return submitRequestWaitInternal(handle, client_id, op, payload, timeout_ticks, publish_unwind);
+}
+
+fn submitRequestWaitInternal(
+    handle: u32,
+    client_id: u32,
+    op: u16,
+    payload: []const u8,
+    timeout_ticks: u64,
+    publish_unwind: ?*task_context.UnwindToken,
+) i32 {
+    if (op == 0) return API_ERR_INVALID;
+    if (payload.len > API_MAX_PAYLOAD) return API_ERR_PAYLOAD_TOO_LARGE;
+
+    const forever = timeout_ticks == sync.WAIT_FOREVER;
+    const deadline = if (forever) @as(u64, 0) else timer.tickCount() +| timeout_ticks;
+    const locked = lockRegistry();
+    const idx = endpointForHandle(handle) orelse {
+        unlockRegistry(locked);
+        return API_ERR_BAD_HANDLE;
+    };
+    var ep = &endpoints[idx];
+    if (!serviceSlotRunning(ep.service_slot)) {
+        unlockRegistry(locked);
+        return API_ERR_NOT_RUNNING;
+    }
+    if (timeout_ticks != 0 and !forever and timer.tickCount() >= deadline) {
+        ep.timeouts +%= 1;
+        ep.admission_timeouts +%= 1;
+        unlockRegistry(locked);
+        return API_ERR_TIMEOUT;
+    }
+    if (ep.slots_available.tryAcquire()) {
+        const result = publishRequestWithOptionalUnwindLocked(ep, client_id, op, payload, publish_unwind, .{});
+        unlockRegistry(locked);
+        return result;
+    }
+
+    if (timeout_ticks == 0) {
+        ep.busy_rejections +%= 1;
+        unlockRegistry(locked);
+        return API_ERR_BUSY;
+    }
+
+    const now = timer.tickCount();
+    if (!forever and now >= deadline) {
+        ep.timeouts +%= 1;
+        ep.admission_timeouts +%= 1;
+        unlockRegistry(locked);
+        return API_ERR_TIMEOUT;
+    }
+    ep.admission_waits +%= 1;
+    const remaining = if (forever) sync.WAIT_FOREVER else deadline - now;
+    var admission_unwind: task_context.UnwindToken = .{};
+    const wait_result = ep.slots_available.acquireReleasingGuarded(
+        remaining,
+        releaseMutexForWait,
+        &registry_lock,
+        &admission_unwind,
+    );
+
+    const result_locked = lockRegistry();
+    defer unlockRegistry(result_locked);
+    const result_idx = endpointForHandle(handle) orelse {
+        leaveAdmissionUnwind(&admission_unwind);
+        return switch (wait_result) {
+            .cancelled, .killed => API_ERR_NOT_RUNNING,
+            else => API_ERR_BAD_HANDLE,
+        };
+    };
+    ep = &endpoints[result_idx];
+    if (!serviceSlotRunning(ep.service_slot)) {
+        leaveAdmissionUnwind(&admission_unwind);
+        return API_ERR_NOT_RUNNING;
+    }
+    switch (wait_result) {
+        .signaled => {},
+        .timeout => {
+            ep.timeouts +%= 1;
+            ep.admission_timeouts +%= 1;
+            return API_ERR_TIMEOUT;
+        },
+        .cancelled, .killed => {
+            leaveAdmissionUnwind(&admission_unwind);
+            return API_ERR_NOT_RUNNING;
+        },
+        .none, .failed => {
+            leaveAdmissionUnwind(&admission_unwind);
+            return API_ERR_BUSY;
+        },
+    }
+    if (!forever and timer.tickCount() >= deadline) {
+        _ = ep.slots_available.release(1);
+        leaveAdmissionUnwind(&admission_unwind);
+        ep.timeouts +%= 1;
+        ep.admission_timeouts +%= 1;
+        return API_ERR_TIMEOUT;
+    }
+    return publishRequestWithOptionalUnwindLocked(ep, client_id, op, payload, publish_unwind, admission_unwind);
+}
+
+fn publishRequestWithOptionalUnwindLocked(
+    ep: *Endpoint,
+    client_id: u32,
+    op: u16,
+    payload: []const u8,
+    publish_unwind: ?*task_context.UnwindToken,
+    acquired_unwind: task_context.UnwindToken,
+) i32 {
+    var owned_unwind = acquired_unwind;
+    if (publish_unwind) |out| {
+        if (!owned_unwind.active) {
+            owned_unwind = task_context.enterUnwind();
+            if (!owned_unwind.admitted()) {
+                _ = ep.slots_available.release(1);
+                return API_ERR_BUSY;
+            }
+        }
+        out.* = owned_unwind;
+    }
+    const result = publishRequestLocked(ep, client_id, op, payload);
+    if (result <= 0) {
+        leaveAdmissionUnwind(&owned_unwind);
+        if (publish_unwind) |out| out.* = .{};
+    } else if (publish_unwind == null) {
+        leaveAdmissionUnwind(&owned_unwind);
+    }
+    return result;
+}
+
+fn leaveAdmissionUnwind(unwind: *task_context.UnwindToken) void {
+    if (unwind.active) _ = task_context.leaveUnwind(unwind.*);
+    unwind.* = .{};
+}
+
+fn publishRequestLocked(ep: *Endpoint, client_id: u32, op: u16, payload: []const u8) i32 {
     const slot_idx = freeRequestSlot(ep) orelse {
+        _ = ep.slots_available.release(1);
         ep.busy_rejections +%= 1;
         return API_ERR_BUSY;
     };
@@ -583,7 +779,11 @@ pub fn reply(handle: u32, request_id: u32, status: i32, payload: []const u8) i32
     slot.response_status = status;
     slot.state = .responded;
     ep.responses +%= 1;
-    _ = ep.responses_available.wakeAll();
+    if (slot.response_available.wakeOne() != 0) {
+        ep.targeted_response_wakes +%= 1;
+    } else {
+        ep.targeted_response_wake_misses +%= 1;
+    }
     return API_OK;
 }
 
@@ -599,72 +799,77 @@ pub fn takeResponse(handle: u32, request_id: u32, header: *ApiMessageHeader, out
     fillMessageHeader(slot, header, slot.response_len, slot.response_status);
     if (out.len < len) {
         clearRequestSlot(slot);
-        _ = ep.slots_available.wakeOne();
+        _ = ep.slots_available.release(1);
         return API_ERR_BUFFER_TOO_SMALL;
     }
     if (len > 0) @memcpy(out[0..len], slot.response_payload[0..len]);
     clearRequestSlot(slot);
-    _ = ep.slots_available.wakeOne();
+    _ = ep.slots_available.release(1);
     return @intCast(len);
+}
+
+const ResponseWaitContext = struct {
+    slot: *RequestSlot,
+    request_id: u32,
+};
+
+fn responseWaitStillNeeded(raw: *anyopaque) bool {
+    const ctx: *ResponseWaitContext = @ptrCast(@alignCast(raw));
+    return ctx.slot.request_id == ctx.request_id and
+        ctx.slot.state != .free and
+        ctx.slot.state != .responded;
 }
 
 pub fn waitResponse(handle: u32, request_id: u32, timeout_ticks: u64) i32 {
     if (request_id == 0) return API_ERR_INVALID;
-
-    var remaining = timeout_ticks;
-    var counted_wait = false;
-    while (true) {
-        const locked = lockRegistry();
-        const idx = endpointForHandle(handle) orelse {
-            unlockRegistry(locked);
-            return API_ERR_BAD_HANDLE;
-        };
-        var ep = &endpoints[idx];
-        if (!serviceSlotRunning(ep.service_slot)) {
-            unlockRegistry(locked);
-            return API_ERR_NOT_RUNNING;
-        }
-        if (respondedRequestSlotById(ep, request_id) != null) {
-            unlockRegistry(locked);
-            return API_OK;
-        }
-        if (requestSlotById(ep, request_id) == null) {
-            unlockRegistry(locked);
-            return API_ERR_NOT_FOUND;
-        }
-        if (!counted_wait) {
-            ep.completion_waits +%= 1;
-            counted_wait = true;
-        }
-        var wait_queue = &ep.responses_available;
+    const locked = lockRegistry();
+    const idx = endpointForHandle(handle) orelse {
         unlockRegistry(locked);
-
-        if (timeout_ticks == 0) {
-            const count_locked = lockRegistry();
-            if (endpointForHandle(handle)) |timeout_idx| {
-                endpoints[timeout_idx].timeouts +%= 1;
-                endpoints[timeout_idx].completion_timeouts +%= 1;
-            }
-            unlockRegistry(count_locked);
-            return API_ERR_TIMEOUT;
-        }
-
-        const slice = if (remaining == sync.WAIT_FOREVER or remaining > 1) @as(u64, 1) else remaining;
-        const result = wait_queue.wait(slice, "service-response");
-        if (result == .cancelled) return API_ERR_NOT_RUNNING;
-        if (remaining != sync.WAIT_FOREVER) {
-            if (remaining <= slice) {
-                const count_locked = lockRegistry();
-                if (endpointForHandle(handle)) |timeout_idx| {
-                    endpoints[timeout_idx].timeouts +%= 1;
-                    endpoints[timeout_idx].completion_timeouts +%= 1;
-                }
-                unlockRegistry(count_locked);
-                return API_ERR_TIMEOUT;
-            }
-            remaining -= slice;
-        }
+        return API_ERR_BAD_HANDLE;
+    };
+    var ep = &endpoints[idx];
+    if (!serviceSlotRunning(ep.service_slot)) {
+        unlockRegistry(locked);
+        return API_ERR_NOT_RUNNING;
     }
+    if (respondedRequestSlotById(ep, request_id) != null) {
+        unlockRegistry(locked);
+        return API_OK;
+    }
+    const slot_idx = requestSlotById(ep, request_id) orelse {
+        unlockRegistry(locked);
+        return API_ERR_NOT_FOUND;
+    };
+    ep.completion_waits +%= 1;
+    ep.completion_wait_rounds +%= 1;
+    var wait_ctx = ResponseWaitContext{ .slot = &ep.queue[slot_idx], .request_id = request_id };
+    const wait_result = wait_ctx.slot.response_available.waitUnlessReleasing(
+        timeout_ticks,
+        "service-response",
+        responseWaitStillNeeded,
+        &wait_ctx,
+        releaseMutexForWait,
+        &registry_lock,
+    );
+
+    const result_locked = lockRegistry();
+    defer unlockRegistry(result_locked);
+    const result_idx = endpointForHandle(handle) orelse return switch (wait_result) {
+        .cancelled, .killed => API_ERR_NOT_RUNNING,
+        else => API_ERR_BAD_HANDLE,
+    };
+    ep = &endpoints[result_idx];
+    if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
+    if (wait_result == .timeout) {
+        ep.timeouts +%= 1;
+        ep.completion_timeouts +%= 1;
+        return API_ERR_TIMEOUT;
+    }
+    if (wait_result == .cancelled or wait_result == .killed) return API_ERR_NOT_RUNNING;
+    if (wait_result == .none or wait_result == .failed) return API_ERR_BUSY;
+    if (respondedRequestSlotById(ep, request_id) != null) return API_OK;
+    if (requestSlotById(ep, request_id) == null) return API_ERR_NOT_FOUND;
+    return API_ERR_BUSY;
 }
 
 pub fn cancelRequest(handle: u32, request_id: u32) i32 {
@@ -676,8 +881,7 @@ pub fn cancelRequest(handle: u32, request_id: u32) i32 {
     ep.drops +%= 1;
     ep.cancellations +%= 1;
     clearRequestSlot(&ep.queue[slot_idx]);
-    _ = ep.responses_available.wakeAll();
-    _ = ep.slots_available.wakeOne();
+    _ = ep.slots_available.release(1);
     return API_OK;
 }
 
@@ -914,19 +1118,19 @@ fn noteActiveWorkers(ep: *Endpoint) void {
 }
 
 fn clearRequestSlot(slot: *RequestSlot) void {
+    _ = slot.response_available.close(.cancelled);
     slot.* = .{};
 }
 
 fn wakeEndpointWaiters(ep: *Endpoint, result: sync.WaitResult) void {
-    if (result == .cancelled) {
-        _ = ep.requests_available.cancelAll();
-        _ = ep.responses_available.cancelAll();
-        _ = ep.slots_available.cancelAll();
-    } else {
-        _ = ep.requests_available.wakeAll();
-        _ = ep.responses_available.wakeAll();
-        _ = ep.slots_available.wakeAll();
+    var i: usize = 0;
+    while (i < ep.queue.len) : (i += 1) {
+        if (ep.queue[i].state != .free) {
+            _ = ep.queue[i].response_available.close(result);
+        }
     }
+    _ = ep.requests_available.close(result);
+    _ = ep.slots_available.queue.close(result);
 }
 
 fn serviceSlotRunning(slot: usize) bool {

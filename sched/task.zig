@@ -125,6 +125,10 @@ pub const Task = struct {
     // waits (for example the serialized filesystem request transaction).
     // They block hard kill/reap but are not reported as sleep-under-lock.
     unwind_guard_count: u32 = 0,
+    // A semaphore may transfer a permit directly to this task while waking
+    // it. The handoff guard keeps that permit recoverable until the resumed
+    // caller has published the resource protected by it.
+    wait_handoff_guard_pending: bool = false,
     held_locks: [8]HeldLockRecord = .{HeldLockRecord{}} ** 8,
     stack_base: u64 = 0,
     stack_top: u64 = 0,

@@ -1,12 +1,14 @@
 const scheduler = @import("scheduler.zig");
 const task = @import("task.zig");
 const wait_node = @import("wait_node.zig");
+const task_context = @import("task_context.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const timer = @import("../kernel/timer.zig");
 const config = @import("config");
 
 pub const WAIT_FOREVER: u64 = scheduler.WAIT_FOREVER;
 pub const WaitResult = task.WaitResult;
+pub const WaitReleaseFn = *const fn (*anyopaque) void;
 
 pub const WaitSummary = struct {
     queue_waits: u64 = 0,
@@ -116,6 +118,44 @@ pub const WaitQueue = struct {
     pub fn waitUnless(self: *WaitQueue, timeout_ticks: u64, reason: []const u8, still_needed: ?*const fn (*anyopaque) bool, ctx: ?*anyopaque) WaitResult {
         const current_task = scheduler.current() orelse return .failed;
         const irq_flags = self.enterCritical();
+        return self.waitUnlessCritical(timeout_ticks, reason, still_needed, ctx, current_task, irq_flags);
+    }
+
+    // Atomically transfers a caller-held owner lock into this wait queue.
+    // The release callback runs after the queue IRQ/preemption critical
+    // section has started but before the predicate and intrusive enrollment.
+    // A producer that needs the same owner lock can therefore neither publish
+    // and miss an unenrolled waiter nor recycle the predicate context in the
+    // unlock-to-wait gap. The owner lock is already released when this method
+    // parks, so no lock is held across the sleep.
+    pub fn waitUnlessReleasing(
+        self: *WaitQueue,
+        timeout_ticks: u64,
+        reason: []const u8,
+        still_needed: ?*const fn (*anyopaque) bool,
+        ctx: ?*anyopaque,
+        release: WaitReleaseFn,
+        release_ctx: *anyopaque,
+    ) WaitResult {
+        const current_task = scheduler.current();
+        const irq_flags = self.enterCritical();
+        release(release_ctx);
+        const admitted_task = current_task orelse {
+            self.leaveCritical(irq_flags);
+            return .failed;
+        };
+        return self.waitUnlessCritical(timeout_ticks, reason, still_needed, ctx, admitted_task, irq_flags);
+    }
+
+    fn waitUnlessCritical(
+        self: *WaitQueue,
+        timeout_ticks: u64,
+        reason: []const u8,
+        still_needed: ?*const fn (*anyopaque) bool,
+        ctx: ?*anyopaque,
+        current_task: *task.Task,
+        irq_flags: u64,
+    ) WaitResult {
         if (self.core.closing) {
             self.leaveCritical(irq_flags);
             global_summary.cancellations +%= 1;
@@ -238,6 +278,26 @@ pub const WaitQueue = struct {
             const target: *task.Task = @ptrCast(@alignCast(node.owner));
             if (target.generation != node.owner_generation) continue;
             if (scheduler.wakeTask(target, result)) return target.id;
+        }
+        return 0;
+    }
+
+    // A semaphore permit is owned as soon as its FIFO waiter is selected,
+    // before that waiter can run again. Protect this short handoff so a hard
+    // kill cannot strand the permit between wake and caller publication.
+    fn popAndWakeWithHandoffGuard(self: *WaitQueue) u32 {
+        while (wait_node.popFront(&self.core)) |node| {
+            const target: *task.Task = @ptrCast(@alignCast(node.owner));
+            if (target.generation != node.owner_generation) continue;
+            if (target.wait_handoff_guard_pending or target.unwind_guard_count == 0xFFFF_FFFF) {
+                _ = scheduler.wakeTask(target, .failed);
+                continue;
+            }
+            target.unwind_guard_count += 1;
+            target.wait_handoff_guard_pending = true;
+            if (scheduler.wakeTask(target, .signaled)) return target.id;
+            target.wait_handoff_guard_pending = false;
+            target.unwind_guard_count -= 1;
         }
         return 0;
     }
@@ -410,7 +470,43 @@ pub const Semaphore = struct {
         // Token consumption and intrusive waiter enrollment happen under the
         // same queue critical section. A release can therefore neither place
         // a token between a stale pre-check and enrollment nor lose a wake.
-        return self.queue.waitUnless(timeout_ticks, "semaphore", stillNeeded, self);
+        return finishUnguardedAcquire(self.queue.waitUnless(timeout_ticks, "semaphore", stillNeeded, self));
+    }
+
+    pub fn acquireReleasing(self: *Semaphore, timeout_ticks: u64, release_fn: WaitReleaseFn, release_ctx: *anyopaque) WaitResult {
+        return finishUnguardedAcquire(self.queue.waitUnlessReleasing(timeout_ticks, "semaphore", stillNeeded, self, release_fn, release_ctx));
+    }
+
+    const GuardedAcquireContext = struct {
+        semaphore: *Semaphore,
+        unwind: *task_context.UnwindToken,
+        admission_failed: bool = false,
+    };
+
+    // Like acquireReleasing, but returns an active unwind token with every
+    // acquired permit. The token is armed inside the queue critical section
+    // both for predicate consumption and FIFO wake handoff.
+    pub fn acquireReleasingGuarded(
+        self: *Semaphore,
+        timeout_ticks: u64,
+        release_fn: WaitReleaseFn,
+        release_ctx: *anyopaque,
+        unwind: *task_context.UnwindToken,
+    ) WaitResult {
+        unwind.* = .{};
+        var ctx = GuardedAcquireContext{ .semaphore = self, .unwind = unwind };
+        const result = self.queue.waitUnlessReleasing(
+            timeout_ticks,
+            "semaphore",
+            guardedStillNeeded,
+            &ctx,
+            release_fn,
+            release_ctx,
+        );
+        if (result != .signaled) return result;
+        if (unwind.active) return .signaled;
+        if (ctx.admission_failed) return .failed;
+        return if (claimHandoffGuard(unwind)) .signaled else .failed;
     }
 
     pub fn release(self: *Semaphore, count: u32) u32 {
@@ -419,7 +515,7 @@ pub const Semaphore = struct {
         var released: u32 = 0;
         var i: u32 = 0;
         while (i < count) : (i += 1) {
-            if (self.queue.popAndWake(.signaled) == 0) {
+            if (self.queue.popAndWakeWithHandoffGuard() == 0) {
                 if (self.count >= self.max_count) break;
                 self.count += 1;
             } else {
@@ -433,6 +529,44 @@ pub const Semaphore = struct {
     fn stillNeeded(raw: *anyopaque) bool {
         const self: *Semaphore = @ptrCast(@alignCast(raw));
         return !self.tryAcquireLocked();
+    }
+
+    fn guardedStillNeeded(raw: *anyopaque) bool {
+        const ctx: *GuardedAcquireContext = @ptrCast(@alignCast(raw));
+        if (ctx.semaphore.count == 0) return true;
+        const unwind = task_context.enterUnwind();
+        if (!unwind.admitted()) {
+            ctx.admission_failed = true;
+            return false;
+        }
+        ctx.semaphore.count -= 1;
+        ctx.unwind.* = unwind;
+        return false;
+    }
+
+    fn claimHandoffGuard(unwind: *task_context.UnwindToken) bool {
+        const current_task = scheduler.current() orelse return false;
+        const irq_flags = interrupts.saveAndDisable();
+        scheduler.preemptDisable();
+        defer {
+            scheduler.preemptEnable();
+            interrupts.restore(irq_flags);
+        }
+        if (!current_task.wait_handoff_guard_pending or current_task.unwind_guard_count == 0) return false;
+        current_task.wait_handoff_guard_pending = false;
+        unwind.* = .{
+            .counter = &current_task.unwind_guard_count,
+            .context_present = true,
+            .active = true,
+        };
+        return true;
+    }
+
+    fn finishUnguardedAcquire(result: WaitResult) WaitResult {
+        if (result != .signaled) return result;
+        var unwind: task_context.UnwindToken = .{};
+        if (claimHandoffGuard(&unwind)) _ = task_context.leaveUnwind(unwind);
+        return result;
     }
 };
 

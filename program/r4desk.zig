@@ -4,6 +4,7 @@ const mouse = @import("../driver/input/mouse.zig");
 const heap = @import("../memory/heap.zig");
 const services = @import("../kernel/services.zig");
 const sync = @import("../sched/sync.zig");
+const task_context = @import("../sched/task_context.zig");
 const desktop_events = @import("../kernel/desktop_events.zig");
 const timer = @import("../kernel/timer.zig");
 const r4draw = @import("r4draw.zig");
@@ -459,20 +460,46 @@ fn clipboardServiceCall(op: u16, request: []const u8, response: []u8, header: *s
     var info: services.ApiInfo = .{};
     const open = services.apiOpen(clipboard_service_name, &info, 0);
     if (open != services.API_OK or info.handle == 0) return null;
+    defer _ = services.apiClose(info.handle);
 
     header.* = .{ .magic = 0, .version = 0 };
-    const request_id_raw = services.submitRequest(info.handle, 0, op, request);
+    const start_ticks = timer.tickCount();
+    const deadline = start_ticks +| clipboard_service_timeout_ticks;
+    var request_unwind: task_context.UnwindToken = .{};
+    const request_id_raw = services.submitRequestWaitGuarded(
+        info.handle,
+        0,
+        op,
+        request,
+        clipboard_service_timeout_ticks,
+        &request_unwind,
+    );
     if (request_id_raw <= 0) return null;
     const request_id: u32 = @intCast(request_id_raw);
+    defer _ = task_context.leaveUnwind(request_unwind);
+    var request_active = true;
+    defer {
+        if (request_active) _ = services.cancelRequest(info.handle, request_id);
+    }
 
-    var waited: u64 = 0;
-    while (waited <= clipboard_service_timeout_ticks) : (waited += 1) {
+    while (true) {
         const result = services.takeResponse(info.handle, request_id, header, response);
         if (result < 0) return result;
-        if (result > 0 or header.magic == services.API_MAGIC) return result;
-        waitOneTick("clipboard-service");
+        if (result > 0 or header.magic == services.API_MAGIC) {
+            request_active = false;
+            return result;
+        }
+        const now = timer.tickCount();
+        if (now >= deadline) break;
+        const wait_result = services.waitResponse(info.handle, request_id, deadline - now);
+        if (wait_result == services.API_ERR_TIMEOUT) break;
+        if (wait_result < 0) {
+            _ = services.cancelRequest(info.handle, request_id);
+            return wait_result;
+        }
     }
     _ = services.cancelRequest(info.handle, request_id);
+    request_active = false;
     return services.API_ERR_TIMEOUT;
 }
 
@@ -485,11 +512,6 @@ fn fillKeyboardLayoutInfo(out: *KeyboardLayoutInfo, index: usize) ?void {
     };
     copyFixedZ(out.name[0..], layout_name);
     copyFixedZ(out.display[0..], display);
-}
-
-fn waitOneTick(reason: []const u8) void {
-    var wait = sync.TimerWait.init();
-    _ = wait.waitReason(1, reason);
 }
 
 fn clearClipboardStorage() void {
