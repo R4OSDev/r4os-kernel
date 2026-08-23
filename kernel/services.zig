@@ -1,5 +1,7 @@
 const std = @import("std");
 const r4x_api = @import("../program/r4x_api.zig");
+const monotonic = @import("../platform/monotonic.zig");
+const scheduler = @import("../sched/scheduler.zig");
 const sync = @import("../sched/sync.zig");
 const task_context = @import("../sched/task_context.zig");
 const timer = @import("timer.zig");
@@ -69,6 +71,52 @@ pub const ApiDetail = r4x_api.ServiceDetail;
 pub const ApiMessageHeader = r4x_api.ServiceMessageHeader;
 
 const MAX_ENDPOINTS: usize = MAX_SERVICES;
+const SERVICE_LOCK_FAMILY_COUNT: usize = 7;
+const SERVICE_LOCK_TIMING_STRIDE: u64 = 64;
+const REQUEST_ID_BLOCK_SIZE: u32 = 256;
+const REQUEST_ID_MAX: u32 = 0x7FFF_FFFE;
+
+const LockFamily = enum(u8) {
+    registry_control = 0,
+    registry_lookup = 1,
+    registry_snapshot = 2,
+    endpoint_lifecycle = 3,
+    endpoint_data = 4,
+    endpoint_wait = 5,
+    endpoint_snapshot = 6,
+};
+
+const LockTiming = struct {
+    acquisitions: u64 = 0,
+    contentions: u64 = 0,
+    timing_samples: u64 = 0,
+    wait_ns: u64 = 0,
+    wait_max_ns: u64 = 0,
+    hold_ns: u64 = 0,
+    hold_max_ns: u64 = 0,
+    timing_unavailable: u64 = 0,
+};
+
+const TimedLock = struct {
+    mutex: *sync.Mutex,
+    timing: ?*LockTiming = null,
+    hold_started: monotonic.Stamp = .{},
+    timed: bool = false,
+    locked: bool = false,
+    admitted: bool = false,
+};
+
+const EndpointLifetimePerformance = struct {
+    payload_copy_bytes: u64 = 0,
+    payload_clear_bytes: u64 = 0,
+    slot_metadata_resets: u64 = 0,
+    endpoint_metadata_resets: u64 = 0,
+    endpoint_payload_reset_bytes: u64 = 0,
+    queue_scan_passes: u64 = 0,
+    queue_scan_slots: u64 = 0,
+    revalidations: u64 = 0,
+    stale_rejections: u64 = 0,
+};
 
 const RequestState = enum(u8) {
     free,
@@ -128,6 +176,16 @@ pub const Entry = struct {
 };
 
 const Endpoint = struct {
+    // The lock, generation, reserved request-ID range and lifetime counters
+    // are stable slot identity.
+    // resetEndpointMetadata must never replace them while stale waiters may
+    // still be resuming against this address.
+    lock: sync.Mutex = sync.Mutex.initClass("service-endpoint", sync.LockRank.service_endpoint, .sleepable),
+    generation: u64 = 0,
+    request_id_next: u32 = 0,
+    request_id_limit: u32 = 0,
+    lifetime: EndpointLifetimePerformance = .{},
+    lock_timing: [SERVICE_LOCK_FAMILY_COUNT]LockTiming = .{LockTiming{}} ** SERVICE_LOCK_FAMILY_COUNT,
     used: bool = false,
     service_slot: usize = 0,
     handle: u32 = 0,
@@ -184,29 +242,308 @@ pub const PerformanceSummary = struct {
     slot_metadata_resets: u64 = 0,
     endpoint_metadata_resets: u64 = 0,
     endpoint_payload_reset_bytes: u64 = 0,
-};
-
-const LifetimePerformance = struct {
-    payload_copy_bytes: u64 = 0,
-    payload_clear_bytes: u64 = 0,
-    slot_metadata_resets: u64 = 0,
-    endpoint_metadata_resets: u64 = 0,
-    endpoint_payload_reset_bytes: u64 = 0,
+    queue_scan_passes: u64 = 0,
+    queue_scan_slots: u64 = 0,
+    endpoint_revalidations: u64 = 0,
+    endpoint_stale_rejections: u64 = 0,
+    lock_family_count: u32 = @intCast(SERVICE_LOCK_FAMILY_COUNT),
+    lock_reserved0: u32 = 0,
+    lock_acquisitions: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
+    lock_contentions: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
+    lock_wait_ns: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
+    lock_wait_max_ns: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
+    lock_hold_ns: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
+    lock_hold_max_ns: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
+    lock_timing_unavailable: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
+    lock_timing_stride: u32 = @intCast(SERVICE_LOCK_TIMING_STRIDE),
+    lock_timing_reserved0: u32 = 0,
+    lock_timing_samples: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
 };
 
 var entries: [MAX_SERVICES]Entry = .{Entry{}} ** MAX_SERVICES;
 var endpoints: [MAX_ENDPOINTS]Endpoint = .{Endpoint{}} ** MAX_ENDPOINTS;
 var next_endpoint_handle: u32 = 1;
 var next_request_id: u32 = 1;
-var lifetime_performance: LifetimePerformance = .{};
 var registry_lock = sync.Mutex.initClass("service-registry", sync.LockRank.service_registry, .sleepable);
+var registry_lock_timing: [SERVICE_LOCK_FAMILY_COUNT]LockTiming = .{LockTiming{}} ** SERVICE_LOCK_FAMILY_COUNT;
 
-fn lockRegistry() bool {
-    return registry_lock.lock(sync.WAIT_FOREVER);
+fn lockFamilyIndex(family: LockFamily) usize {
+    return @intFromEnum(family);
 }
 
-fn unlockRegistry(locked: bool) void {
-    if (locked) _ = registry_lock.unlock();
+fn noteElapsed(timing: *LockTiming, start: monotonic.Stamp, end: monotonic.Stamp, is_hold: bool) void {
+    const elapsed = monotonic.elapsedNanoseconds(start, end) orelse {
+        timing.timing_unavailable +%= 1;
+        return;
+    };
+    if (is_hold) {
+        timing.hold_ns +%= elapsed;
+        if (elapsed > timing.hold_max_ns) timing.hold_max_ns = elapsed;
+    } else {
+        timing.wait_ns +%= elapsed;
+        if (elapsed > timing.wait_max_ns) timing.wait_max_ns = elapsed;
+    }
+}
+
+fn acquireTimedLock(mutex: *sync.Mutex, timing: *LockTiming) TimedLock {
+    // Before scheduler admission the kernel is single-threaded. Preserve the
+    // historical boot-time lock bypass without pretending it was measured.
+    if (scheduler.current() == null) return .{ .mutex = mutex, .admitted = true };
+
+    const immediate = mutex.tryLock();
+    const wait_started = if (immediate) monotonic.Stamp{} else monotonic.capture();
+    const acquired = immediate or mutex.lock(sync.WAIT_FOREVER);
+    if (!acquired) return .{ .mutex = mutex };
+    timing.acquisitions +%= 1;
+    if (!immediate) timing.contentions +%= 1;
+    const sampled = !immediate or ((timing.acquisitions -% 1) % SERVICE_LOCK_TIMING_STRIDE == 0);
+    const acquired_at = if (sampled) monotonic.capture() else monotonic.Stamp{};
+    if (sampled) {
+        timing.timing_samples +%= 1;
+        // An uncontended try-lock has no scheduler wait. Measuring its few
+        // instructions with HPET MMIO would perturb the hot path more than
+        // the lock itself, so only real contention contributes wait time.
+        if (!immediate) noteElapsed(timing, wait_started, acquired_at, false);
+    }
+    return .{
+        .mutex = mutex,
+        .timing = timing,
+        .hold_started = acquired_at,
+        .timed = sampled,
+        .locked = true,
+        .admitted = true,
+    };
+}
+
+fn tryAcquireTimedLock(mutex: *sync.Mutex, timing: *LockTiming) ?TimedLock {
+    if (scheduler.current() == null) return TimedLock{ .mutex = mutex, .admitted = true };
+    if (!mutex.tryLock()) {
+        timing.contentions +%= 1;
+        return null;
+    }
+    timing.acquisitions +%= 1;
+    const sampled = (timing.acquisitions -% 1) % SERVICE_LOCK_TIMING_STRIDE == 0;
+    const acquired_at = if (sampled) monotonic.capture() else monotonic.Stamp{};
+    if (sampled) timing.timing_samples +%= 1;
+    return .{
+        .mutex = mutex,
+        .timing = timing,
+        .hold_started = acquired_at,
+        .timed = sampled,
+        .locked = true,
+        .admitted = true,
+    };
+}
+
+fn releaseTimedLock(guard: *TimedLock) void {
+    if (guard.locked) {
+        if (guard.timed) {
+            if (guard.timing) |timing| noteElapsed(timing, guard.hold_started, monotonic.capture(), true);
+        }
+        _ = guard.mutex.unlock();
+    }
+    guard.locked = false;
+    guard.admitted = false;
+}
+
+fn releaseTimedLockForWait(raw: *anyopaque) void {
+    const guard: *TimedLock = @ptrCast(@alignCast(raw));
+    releaseTimedLock(guard);
+}
+
+fn lockRegistry(family: LockFamily) TimedLock {
+    return acquireTimedLock(&registry_lock, &registry_lock_timing[lockFamilyIndex(family)]);
+}
+
+fn unlockRegistry(guard: *TimedLock) void {
+    releaseTimedLock(guard);
+}
+
+const EndpointIdentity = struct {
+    endpoint: *Endpoint,
+    handle: u32,
+    generation: u64,
+    service_slot: usize,
+};
+
+const EndpointLease = struct {
+    endpoint: *Endpoint,
+    identity: EndpointIdentity,
+    guard: TimedLock,
+};
+
+const LifecycleEndpointLease = struct {
+    endpoint: *Endpoint,
+    guard: TimedLock,
+};
+
+const LifecycleAttempt = union(enum) {
+    none,
+    contended: *Endpoint,
+    locked: LifecycleEndpointLease,
+};
+
+const QueueCounts = struct {
+    queued: u32 = 0,
+    delivered: u32 = 0,
+    responded: u32 = 0,
+    used: u32 = 0,
+};
+
+fn addLockTiming(out: *PerformanceSummary, index: usize, timing: LockTiming) void {
+    out.lock_acquisitions[index] +%= timing.acquisitions;
+    out.lock_contentions[index] +%= timing.contentions;
+    out.lock_wait_ns[index] +%= timing.wait_ns;
+    if (timing.wait_max_ns > out.lock_wait_max_ns[index]) out.lock_wait_max_ns[index] = timing.wait_max_ns;
+    out.lock_hold_ns[index] +%= timing.hold_ns;
+    if (timing.hold_max_ns > out.lock_hold_max_ns[index]) out.lock_hold_max_ns[index] = timing.hold_max_ns;
+    out.lock_timing_unavailable[index] +%= timing.timing_unavailable;
+    out.lock_timing_samples[index] +%= timing.timing_samples;
+}
+
+fn addEndpointLifetime(out: *PerformanceSummary, ep: *const Endpoint) void {
+    out.payload_copy_bytes +%= ep.lifetime.payload_copy_bytes;
+    out.payload_clear_bytes +%= ep.lifetime.payload_clear_bytes;
+    out.slot_metadata_resets +%= ep.lifetime.slot_metadata_resets;
+    out.endpoint_metadata_resets +%= ep.lifetime.endpoint_metadata_resets;
+    out.endpoint_payload_reset_bytes +%= ep.lifetime.endpoint_payload_reset_bytes;
+    out.queue_scan_passes +%= ep.lifetime.queue_scan_passes;
+    out.queue_scan_slots +%= ep.lifetime.queue_scan_slots;
+    out.endpoint_revalidations +%= ep.lifetime.revalidations;
+    out.endpoint_stale_rejections +%= ep.lifetime.stale_rejections;
+}
+
+fn tryLifecycleEndpoint(ep: *Endpoint) LifecycleAttempt {
+    const timing = &ep.lock_timing[lockFamilyIndex(.endpoint_lifecycle)];
+    const guard = tryAcquireTimedLock(&ep.lock, timing) orelse return .{ .contended = ep };
+    return .{ .locked = .{ .endpoint = ep, .guard = guard } };
+}
+
+fn tryLifecycleEndpointForSlot(slot: usize) LifecycleAttempt {
+    const index = endpointForSlot(slot) orelse return .none;
+    return tryLifecycleEndpoint(&endpoints[index]);
+}
+
+fn tryLifecycleEndpointForHandle(handle: u32) LifecycleAttempt {
+    const index = endpointForHandle(handle) orelse return .none;
+    return tryLifecycleEndpoint(&endpoints[index]);
+}
+
+fn waitForEndpointLifecycle(ep: *Endpoint) void {
+    var guard = acquireTimedLock(&ep.lock, &ep.lock_timing[lockFamilyIndex(.endpoint_lifecycle)]);
+    if (guard.admitted) releaseTimedLock(&guard);
+}
+
+fn endpointIdentityForSlotLocked(slot: usize) ?EndpointIdentity {
+    const index = endpointForSlot(slot) orelse return null;
+    const ep = &endpoints[index];
+    return .{
+        .endpoint = ep,
+        .handle = ep.handle,
+        .generation = ep.generation,
+        .service_slot = ep.service_slot,
+    };
+}
+
+fn endpointIdentityForHandleLocked(handle: u32) ?EndpointIdentity {
+    const index = endpointForHandle(handle) orelse return null;
+    const ep = &endpoints[index];
+    return .{
+        .endpoint = ep,
+        .handle = ep.handle,
+        .generation = ep.generation,
+        .service_slot = ep.service_slot,
+    };
+}
+
+fn lookupEndpointIdentity(handle: u32) ?EndpointIdentity {
+    var registry_guard = lockRegistry(.registry_lookup);
+    defer unlockRegistry(&registry_guard);
+    return endpointIdentityForHandleLocked(handle);
+}
+
+fn identityMatches(ep: *const Endpoint, identity: EndpointIdentity) bool {
+    return ep.used and
+        ep.handle == identity.handle and
+        ep.generation == identity.generation and
+        ep.service_slot == identity.service_slot;
+}
+
+fn lockEndpointIdentity(identity: EndpointIdentity, family: LockFamily) ?EndpointLease {
+    var guard = acquireTimedLock(&identity.endpoint.lock, &identity.endpoint.lock_timing[lockFamilyIndex(family)]);
+    if (!guard.admitted) return null;
+    identity.endpoint.lifetime.revalidations +%= 1;
+    if (!identityMatches(identity.endpoint, identity)) {
+        identity.endpoint.lifetime.stale_rejections +%= 1;
+        releaseTimedLock(&guard);
+        return null;
+    }
+    return .{ .endpoint = identity.endpoint, .identity = identity, .guard = guard };
+}
+
+fn lockEndpointForHandle(handle: u32, family: LockFamily) ?EndpointLease {
+    const identity = lookupEndpointIdentity(handle) orelse return null;
+    return lockEndpointIdentity(identity, family);
+}
+
+fn unlockEndpoint(lease: *EndpointLease) void {
+    releaseTimedLock(&lease.guard);
+}
+
+fn markEntryStarting(entry: *Entry) void {
+    entry.state = .starting;
+    entry.instance_id = 0;
+    entry.exit_code = 0;
+    entry.last_error_len = 0;
+}
+
+fn disableEntry(entry: *Entry) void {
+    entry.start_mode = .disabled;
+    entry.state = .disabled;
+    entry.instance_id = 0;
+    entry.start_tick = 0;
+}
+
+fn ifEntryDisabledElseStopped(entry: *const Entry) State {
+    return if (entry.start_mode == .disabled) .disabled else .stopped;
+}
+
+fn alwaysFailed(_: *const Entry) State {
+    return .failed;
+}
+
+fn finishServiceState(name: []const u8, stateFor: *const fn (*const Entry) State, exit_code: i32, error_text: []const u8) i32 {
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        const slot = findByNameIn(&entries, name) orelse {
+            unlockRegistry(&registry_guard);
+            return ERR_NOT_FOUND;
+        };
+        switch (tryLifecycleEndpointForSlot(slot)) {
+            .contended => |ep| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(ep);
+                continue;
+            },
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                retireEndpointLocked(locked.endpoint, .cancelled);
+                finishEntryState(&entries[slot], stateFor, exit_code, error_text);
+                releaseTimedLock(&endpoint_guard);
+            },
+            .none => finishEntryState(&entries[slot], stateFor, exit_code, error_text),
+        }
+        unlockRegistry(&registry_guard);
+        return OK;
+    }
+}
+
+fn finishEntryState(entry: *Entry, stateFor: *const fn (*const Entry) State, exit_code: i32, error_text: []const u8) void {
+    entry.state = stateFor(entry);
+    entry.instance_id = 0;
+    entry.exit_code = exit_code;
+    entry.start_tick = 0;
+    entry.last_error_len = copy(error_text, entry.last_error[0..]);
 }
 
 pub fn init() void {
@@ -218,44 +555,110 @@ pub fn register(name: []const u8, path: []const u8, args: []const u8, start_mode
 }
 
 pub fn registerWithDescription(name: []const u8, path: []const u8, args: []const u8, start_mode: StartMode, description: []const u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
+    var registry_guard = lockRegistry(.registry_control);
+    defer unlockRegistry(&registry_guard);
     return registerIn(&entries, name, path, args, start_mode, description);
 }
 
 pub fn unregister(name: []const u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    if (findByNameIn(&entries, name)) |slot| clearEndpointForSlot(slot);
-    return unregisterIn(&entries, name);
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        const slot = findByNameIn(&entries, name) orelse {
+            unlockRegistry(&registry_guard);
+            return ERR_NOT_FOUND;
+        };
+        switch (tryLifecycleEndpointForSlot(slot)) {
+            .contended => |ep| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(ep);
+                continue;
+            },
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                retireEndpointLocked(locked.endpoint, .cancelled);
+                const result = unregisterIn(&entries, name);
+                releaseTimedLock(&endpoint_guard);
+                unlockRegistry(&registry_guard);
+                return result;
+            },
+            .none => {
+                const result = unregisterIn(&entries, name);
+                unlockRegistry(&registry_guard);
+                return result;
+            },
+        }
+    }
 }
 
 pub fn setState(name: []const u8, state: State, instance_id: u32, exit_code: i32, error_text: []const u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    if (state == .stopped or state == .failed or state == .disabled) {
-        if (findByNameIn(&entries, name)) |slot| clearEndpointForSlot(slot);
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        const slot = findByNameIn(&entries, name) orelse {
+            unlockRegistry(&registry_guard);
+            return ERR_NOT_FOUND;
+        };
+        const retire = state != .running or entries[slot].instance_id != instance_id;
+        if (!retire) {
+            const result = setStateIn(&entries, name, state, instance_id, exit_code, error_text);
+            unlockRegistry(&registry_guard);
+            return result;
+        }
+        switch (tryLifecycleEndpointForSlot(slot)) {
+            .contended => |ep| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(ep);
+                continue;
+            },
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                retireEndpointLocked(locked.endpoint, .cancelled);
+                const result = setStateIn(&entries, name, state, instance_id, exit_code, error_text);
+                releaseTimedLock(&endpoint_guard);
+                unlockRegistry(&registry_guard);
+                return result;
+            },
+            .none => {
+                const result = setStateIn(&entries, name, state, instance_id, exit_code, error_text);
+                unlockRegistry(&registry_guard);
+                return result;
+            },
+        }
     }
-    return setStateIn(&entries, name, state, instance_id, exit_code, error_text);
 }
 
 pub fn markStarting(name: []const u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const slot = findByNameIn(&entries, name) orelse return ERR_NOT_FOUND;
-    clearEndpointForSlot(slot);
-    var e = &entries[slot];
-    if (e.start_mode == .disabled) return ERR_INVALID;
-    e.state = .starting;
-    e.instance_id = 0;
-    e.exit_code = 0;
-    e.last_error_len = 0;
-    return OK;
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        const slot = findByNameIn(&entries, name) orelse {
+            unlockRegistry(&registry_guard);
+            return ERR_NOT_FOUND;
+        };
+        if (entries[slot].start_mode == .disabled) {
+            unlockRegistry(&registry_guard);
+            return ERR_INVALID;
+        }
+        switch (tryLifecycleEndpointForSlot(slot)) {
+            .contended => |ep| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(ep);
+                continue;
+            },
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                retireEndpointLocked(locked.endpoint, .cancelled);
+                markEntryStarting(&entries[slot]);
+                releaseTimedLock(&endpoint_guard);
+            },
+            .none => markEntryStarting(&entries[slot]),
+        }
+        unlockRegistry(&registry_guard);
+        return OK;
+    }
 }
 
 pub fn markRunning(name: []const u8, instance_id: u32, start_tick: u64) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
+    var registry_guard = lockRegistry(.registry_control);
+    defer unlockRegistry(&registry_guard);
     const slot = findByNameIn(&entries, name) orelse return ERR_NOT_FOUND;
     var e = &entries[slot];
     if (e.start_mode == .disabled or instance_id == 0) return ERR_INVALID;
@@ -268,92 +671,106 @@ pub fn markRunning(name: []const u8, instance_id: u32, start_tick: u64) i32 {
 }
 
 pub fn markStopping(name: []const u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const slot = findByNameIn(&entries, name) orelse return ERR_NOT_FOUND;
-    var e = &entries[slot];
-    if (e.state != .running and e.state != .starting) return ERR_INVALID;
-    clearEndpointForSlot(slot);
-    e.state = .stopping;
-    return OK;
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        const slot = findByNameIn(&entries, name) orelse {
+            unlockRegistry(&registry_guard);
+            return ERR_NOT_FOUND;
+        };
+        if (entries[slot].state != .running and entries[slot].state != .starting) {
+            unlockRegistry(&registry_guard);
+            return ERR_INVALID;
+        }
+        switch (tryLifecycleEndpointForSlot(slot)) {
+            .contended => |ep| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(ep);
+                continue;
+            },
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                retireEndpointLocked(locked.endpoint, .cancelled);
+                entries[slot].state = .stopping;
+                releaseTimedLock(&endpoint_guard);
+            },
+            .none => entries[slot].state = .stopping,
+        }
+        unlockRegistry(&registry_guard);
+        return OK;
+    }
 }
 
 pub fn markStopped(name: []const u8, exit_code: i32) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const slot = findByNameIn(&entries, name) orelse return ERR_NOT_FOUND;
-    clearEndpointForSlot(slot);
-    var e = &entries[slot];
-    e.state = if (e.start_mode == .disabled) .disabled else .stopped;
-    e.instance_id = 0;
-    e.exit_code = exit_code;
-    e.start_tick = 0;
-    e.last_error_len = 0;
-    return OK;
+    return finishServiceState(name, ifEntryDisabledElseStopped, exit_code, "");
 }
 
 pub fn markFailed(name: []const u8, exit_code: i32, error_text: []const u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const slot = findByNameIn(&entries, name) orelse return ERR_NOT_FOUND;
-    clearEndpointForSlot(slot);
-    var e = &entries[slot];
-    e.state = .failed;
-    e.instance_id = 0;
-    e.exit_code = exit_code;
-    e.start_tick = 0;
-    e.last_error_len = copy(error_text, e.last_error[0..]);
-    return OK;
+    return finishServiceState(name, alwaysFailed, exit_code, error_text);
 }
 
 pub fn bumpRestartCount(name: []const u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
+    var registry_guard = lockRegistry(.registry_control);
+    defer unlockRegistry(&registry_guard);
     const slot = findByNameIn(&entries, name) orelse return ERR_NOT_FOUND;
     entries[slot].restart_count +%= 1;
     return OK;
 }
 
 pub fn setStartMode(name: []const u8, start_mode: StartMode) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const slot = findByNameIn(&entries, name) orelse return ERR_NOT_FOUND;
-    entries[slot].start_mode = start_mode;
-    if (start_mode == .disabled) {
-        clearEndpointForSlot(slot);
-        entries[slot].state = .disabled;
-        entries[slot].instance_id = 0;
-        entries[slot].start_tick = 0;
-    } else if (entries[slot].state == .disabled) {
-        entries[slot].state = .stopped;
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        const slot = findByNameIn(&entries, name) orelse {
+            unlockRegistry(&registry_guard);
+            return ERR_NOT_FOUND;
+        };
+        if (start_mode != .disabled) {
+            entries[slot].start_mode = start_mode;
+            if (entries[slot].state == .disabled) entries[slot].state = .stopped;
+            unlockRegistry(&registry_guard);
+            return OK;
+        }
+        switch (tryLifecycleEndpointForSlot(slot)) {
+            .contended => |ep| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(ep);
+                continue;
+            },
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                retireEndpointLocked(locked.endpoint, .cancelled);
+                disableEntry(&entries[slot]);
+                releaseTimedLock(&endpoint_guard);
+            },
+            .none => disableEntry(&entries[slot]),
+        }
+        unlockRegistry(&registry_guard);
+        return OK;
     }
-    return OK;
 }
 
-pub fn entryAt(index: usize) ?*const Entry {
+pub fn entryAt(index: usize) ?Entry {
+    var registry_guard = lockRegistry(.registry_snapshot);
+    defer unlockRegistry(&registry_guard);
     if (index >= entries.len or !entries[index].used) return null;
-    return &entries[index];
+    return entries[index];
 }
 
-pub fn entryByName(name: []const u8) ?*const Entry {
+pub fn entryByName(name: []const u8) ?Entry {
+    var registry_guard = lockRegistry(.registry_snapshot);
+    defer unlockRegistry(&registry_guard);
     const slot = findByNameIn(&entries, name) orelse return null;
-    return &entries[slot];
+    return entries[slot];
 }
 
 pub fn countUsed() usize {
+    var registry_guard = lockRegistry(.registry_snapshot);
+    defer unlockRegistry(&registry_guard);
     return countUsedIn(&entries);
 }
 
 pub fn performanceSummary() PerformanceSummary {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    var out = PerformanceSummary{
-        .payload_copy_bytes = lifetime_performance.payload_copy_bytes,
-        .payload_clear_bytes = lifetime_performance.payload_clear_bytes,
-        .slot_metadata_resets = lifetime_performance.slot_metadata_resets,
-        .endpoint_metadata_resets = lifetime_performance.endpoint_metadata_resets,
-        .endpoint_payload_reset_bytes = lifetime_performance.endpoint_payload_reset_bytes,
-    };
+    var out = PerformanceSummary{};
+    var registry_guard = lockRegistry(.registry_snapshot);
     var i: usize = 0;
     while (i < entries.len) : (i += 1) {
         const e = &entries[i];
@@ -362,19 +779,34 @@ pub fn performanceSummary() PerformanceSummary {
         if (e.state == .running) out.running_services += 1;
     }
     i = 0;
+    while (i < 3) : (i += 1) addLockTiming(&out, i, registry_lock_timing[i]);
+    unlockRegistry(&registry_guard);
+
+    i = 0;
     while (i < endpoints.len) : (i += 1) {
+        var endpoint_guard = acquireTimedLock(
+            &endpoints[i].lock,
+            &endpoints[i].lock_timing[lockFamilyIndex(.endpoint_snapshot)],
+        );
+        if (!endpoint_guard.admitted) continue;
         const ep = &endpoints[i];
-        if (!ep.used) continue;
-        const queued = countQueuedSlots(ep);
-        const active = countDeliveredSlots(ep);
-        const responded = countRespondedSlots(ep);
+        addEndpointLifetime(&out, ep);
+        var family_index: usize = 3;
+        while (family_index < SERVICE_LOCK_FAMILY_COUNT) : (family_index += 1) {
+            addLockTiming(&out, family_index, ep.lock_timing[family_index]);
+        }
+        if (!ep.used) {
+            releaseTimedLock(&endpoint_guard);
+            continue;
+        }
+        const counts = queueCounts(ep);
         out.endpoints_used += 1;
-        out.request_pending +%= queued + active;
-        out.response_pending +%= responded;
+        out.request_pending +%= counts.queued + counts.delivered;
+        out.response_pending +%= counts.responded;
         out.queue_depth_total +%= @intCast(API_ENDPOINT_QUEUE_DEPTH);
-        out.queue_used_total +%= countUsedSlots(ep);
+        out.queue_used_total +%= counts.used;
         out.queue_high_water_total +%= ep.queue_high_water;
-        out.active_workers +%= active;
+        out.active_workers +%= counts.delivered;
         if (ep.max_active_workers > out.max_active_workers) out.max_active_workers = ep.max_active_workers;
         out.open_handles +%= ep.open_handles;
         out.requests +%= ep.requests;
@@ -390,200 +822,236 @@ pub fn performanceSummary() PerformanceSummary {
         out.targeted_response_wake_misses +%= ep.targeted_response_wake_misses;
         out.admission_waits +%= ep.admission_waits;
         out.admission_timeouts +%= ep.admission_timeouts;
+        releaseTimedLock(&endpoint_guard);
     }
     return out;
 }
 
 pub fn apiInfoAt(index: u32, out: *ApiInfo, now_ticks: u64) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
+    var registry_guard = lockRegistry(.registry_snapshot);
     out.* = .{};
     var seen: u32 = 0;
     var i: usize = 0;
     while (i < entries.len) : (i += 1) {
         if (!entries[i].used) continue;
         if (seen == index) {
-            fillApiInfo(i, out, now_ticks);
+            fillApiInfoEntryLocked(i, out, now_ticks);
+            const identity = endpointIdentityForSlotLocked(i);
+            unlockRegistry(&registry_guard);
+            fillApiInfoEndpoint(identity, out);
             return 1;
         }
         seen += 1;
     }
+    unlockRegistry(&registry_guard);
     return 0;
 }
 
 pub fn apiDetailAt(index: u32, out: *ApiDetail, now_ticks: u64) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
+    var registry_guard = lockRegistry(.registry_snapshot);
     out.* = .{};
     var seen: u32 = 0;
     var i: usize = 0;
     while (i < entries.len) : (i += 1) {
         if (!entries[i].used) continue;
         if (seen == index) {
-            fillApiDetail(i, out, now_ticks);
+            fillApiDetailEntryLocked(i, out, now_ticks);
+            const identity = endpointIdentityForSlotLocked(i);
+            unlockRegistry(&registry_guard);
+            fillApiInfoEndpoint(identity, &out.info);
             return 1;
         }
         seen += 1;
     }
+    unlockRegistry(&registry_guard);
     return 0;
 }
 
 pub fn apiStatus(name: []const u8, out: *ApiInfo, now_ticks: u64) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
+    var registry_guard = lockRegistry(.registry_snapshot);
     out.* = .{};
-    const slot = findByNameIn(&entries, name) orelse return API_ERR_NOT_FOUND;
-    fillApiInfo(slot, out, now_ticks);
+    const slot = findByNameIn(&entries, name) orelse {
+        unlockRegistry(&registry_guard);
+        return API_ERR_NOT_FOUND;
+    };
+    fillApiInfoEntryLocked(slot, out, now_ticks);
+    const identity = endpointIdentityForSlotLocked(slot);
+    unlockRegistry(&registry_guard);
+    fillApiInfoEndpoint(identity, out);
     return API_OK;
 }
 
 pub fn apiDetailByName(name: []const u8, out: *ApiDetail, now_ticks: u64) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
+    var registry_guard = lockRegistry(.registry_snapshot);
     out.* = .{};
-    const slot = findByNameIn(&entries, name) orelse return API_ERR_NOT_FOUND;
-    fillApiDetail(slot, out, now_ticks);
+    const slot = findByNameIn(&entries, name) orelse {
+        unlockRegistry(&registry_guard);
+        return API_ERR_NOT_FOUND;
+    };
+    fillApiDetailEntryLocked(slot, out, now_ticks);
+    const identity = endpointIdentityForSlotLocked(slot);
+    unlockRegistry(&registry_guard);
+    fillApiInfoEndpoint(identity, &out.info);
     return API_OK;
 }
 
 pub fn apiOpen(name: []const u8, out: *ApiInfo, now_ticks: u64) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
+    var registry_guard = lockRegistry(.registry_lookup);
     out.* = .{};
-    const slot = findByNameIn(&entries, name) orelse return API_ERR_NOT_FOUND;
+    const slot = findByNameIn(&entries, name) orelse {
+        unlockRegistry(&registry_guard);
+        return API_ERR_NOT_FOUND;
+    };
+    fillApiInfoEntryLocked(slot, out, now_ticks);
     if (entries[slot].state != .running or entries[slot].instance_id == 0) {
-        fillApiInfo(slot, out, now_ticks);
+        unlockRegistry(&registry_guard);
         return API_ERR_NOT_RUNNING;
     }
-    if (endpointForSlot(slot) == null) {
-        fillApiInfo(slot, out, now_ticks);
+    const identity = endpointIdentityForSlotLocked(slot) orelse {
+        unlockRegistry(&registry_guard);
         return API_ERR_NO_ENDPOINT;
-    }
-    if (endpointForSlot(slot)) |idx| {
-        endpoints[idx].open_handles +%= 1;
-    }
-    fillApiInfo(slot, out, now_ticks);
+    };
+    unlockRegistry(&registry_guard);
+
+    var endpoint_lease = lockEndpointIdentity(identity, .endpoint_data) orelse return API_ERR_NOT_RUNNING;
+    defer unlockEndpoint(&endpoint_lease);
+    endpoint_lease.endpoint.open_handles +%= 1;
+    fillApiInfoEndpointLocked(endpoint_lease.endpoint, out);
     return API_OK;
 }
 
 pub fn apiClose(handle: u32) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    var ep = &endpoints[idx];
-    if (ep.open_handles > 0) ep.open_handles -= 1;
+    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    if (endpoint_lease.endpoint.open_handles > 0) endpoint_lease.endpoint.open_handles -= 1;
     return API_OK;
 }
 
 pub fn registerEndpoint(name: []const u8, instance_id: u32, flags: u32, out: *ApiInfo, now_ticks: u64) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    out.* = .{};
     if (instance_id == 0) return API_ERR_INVALID;
-    const slot = findByNameIn(&entries, name) orelse return API_ERR_NOT_FOUND;
-    const e = &entries[slot];
-    if (e.state != .running or e.instance_id != instance_id) {
-        fillApiInfo(slot, out, now_ticks);
-        return API_ERR_NOT_RUNNING;
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        out.* = .{};
+        const slot = findByNameIn(&entries, name) orelse {
+            unlockRegistry(&registry_guard);
+            return API_ERR_NOT_FOUND;
+        };
+        fillApiInfoEntryLocked(slot, out, now_ticks);
+        const e = &entries[slot];
+        if (e.state != .running or e.instance_id != instance_id) {
+            unlockRegistry(&registry_guard);
+            return API_ERR_NOT_RUNNING;
+        }
+
+        const endpoint_index = endpointForSlot(slot) orelse freeEndpointSlot() orelse {
+            unlockRegistry(&registry_guard);
+            return API_ERR_FULL;
+        };
+        const ep = &endpoints[endpoint_index];
+        switch (tryLifecycleEndpoint(ep)) {
+            .contended => |contended| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(contended);
+                continue;
+            },
+            .none => unreachable,
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                if (!ep.used) {
+                    resetEndpointMetadata(ep, true);
+                    advanceEndpointGeneration(ep);
+                    ep.used = true;
+                    ep.service_slot = slot;
+                    ep.handle = allocateEndpointHandle();
+                }
+                ep.flags = flags;
+                fillApiInfoEndpointLocked(ep, out);
+                releaseTimedLock(&endpoint_guard);
+                unlockRegistry(&registry_guard);
+                return API_OK;
+            },
+        }
     }
-    if (endpointForSlot(slot)) |idx| {
-        endpoints[idx].flags = flags;
-        fillApiInfo(slot, out, now_ticks);
-        return API_OK;
-    }
-    const free = freeEndpointSlot() orelse return API_ERR_FULL;
-    var ep = &endpoints[free];
-    resetEndpointMetadata(ep, true);
-    ep.used = true;
-    ep.service_slot = slot;
-    ep.handle = allocateEndpointHandle();
-    ep.flags = flags;
-    fillApiInfo(slot, out, now_ticks);
-    return API_OK;
 }
 
 pub fn unregisterEndpoint(handle: u32) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    retireEndpoint(&endpoints[idx], .cancelled);
-    return API_OK;
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        switch (tryLifecycleEndpointForHandle(handle)) {
+            .none => {
+                unlockRegistry(&registry_guard);
+                return API_ERR_BAD_HANDLE;
+            },
+            .contended => |ep| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(ep);
+                continue;
+            },
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                retireEndpointLocked(locked.endpoint, .cancelled);
+                releaseTimedLock(&endpoint_guard);
+                unlockRegistry(&registry_guard);
+                return API_OK;
+            },
+        }
+    }
 }
 
 pub fn endpointPoll(handle: u32) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    const ep = &endpoints[idx];
-    if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
-    return @intCast(countQueuedSlots(ep));
+    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    return @intCast(queueCounts(endpoint_lease.endpoint).queued);
 }
 
 // 0.56.19: Blockierendes Endpoint-API (Befund 8.5). Wartet auf der
 // vorhandenen requests_available-WaitQueue des Endpoints, bis Requests
-// anliegen oder der Timeout ablaeuft. MEMSUITE-Regel: der Registry-Lock
-// wird NIE ueber den Schlaf gehalten; das waitUnless-Praedikat schliesst
-// das Lost-Wakeup-Fenster zwischen Unlock und addWaiter (submitRequest
-// koennte dazwischen queuen und wakeOne ins Leere feuern).
+// anliegen oder der Timeout ablaeuft. Seit 0.69.9 uebergibt der persistente
+// Endpoint-Lock atomar an die WaitQueue; weder Endpoint- noch Registry-Lock
+// werden ueber den Schlaf gehalten. Das Praedikat schliesst weiterhin das
+// Lost-Wakeup-Fenster zwischen Unlock und Enrollment.
 const EndpointWaitContext = struct {
-    endpoint: *Endpoint,
-    handle: u32,
+    identity: EndpointIdentity,
 };
 
 fn endpointWaitStillNeeded(raw: *anyopaque) bool {
     const ctx: *EndpointWaitContext = @ptrCast(@alignCast(raw));
-    return ctx.endpoint.used and
-        ctx.endpoint.handle == ctx.handle and
-        countQueuedSlots(ctx.endpoint) == 0;
-}
-
-fn releaseMutexForWait(raw: *anyopaque) void {
-    const mutex: *sync.Mutex = @ptrCast(@alignCast(raw));
-    _ = mutex.unlock();
+    return identityMatches(ctx.identity.endpoint, ctx.identity) and
+        !hasQueuedRequest(ctx.identity.endpoint);
 }
 
 pub fn endpointWait(handle: u32, timeout_ticks: u64) i32 {
-    const locked = lockRegistry();
-    const idx = endpointForHandle(handle) orelse {
-        unlockRegistry(locked);
-        return API_ERR_BAD_HANDLE;
-    };
-    const ep = &endpoints[idx];
-    if (!serviceSlotRunning(ep.service_slot)) {
-        unlockRegistry(locked);
-        return API_ERR_NOT_RUNNING;
-    }
-    const queued = countQueuedSlots(ep);
+    const identity = lookupEndpointIdentity(handle) orelse return API_ERR_BAD_HANDLE;
+    var endpoint_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    const queued = queueCounts(endpoint_lease.endpoint).queued;
     if (queued > 0) {
-        unlockRegistry(locked);
         return @intCast(queued);
     }
-    var wait_ctx = EndpointWaitContext{ .endpoint = ep, .handle = handle };
-    _ = ep.requests_available.waitUnlessReleasing(
+    var wait_ctx = EndpointWaitContext{ .identity = identity };
+    const wait_result = endpoint_lease.endpoint.requests_available.waitUnlessReleasing(
         timeout_ticks,
         "svc-endpoint",
         endpointWaitStillNeeded,
         &wait_ctx,
-        releaseMutexForWait,
-        &registry_lock,
+        releaseTimedLockForWait,
+        &endpoint_lease.guard,
     );
 
-    const result_locked = lockRegistry();
-    defer unlockRegistry(result_locked);
-    const result_idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    const result_ep = &endpoints[result_idx];
-    if (!serviceSlotRunning(result_ep.service_slot)) return API_ERR_NOT_RUNNING;
-    return @intCast(countQueuedSlots(result_ep));
+    var result_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return switch (wait_result) {
+        .cancelled, .killed => API_ERR_NOT_RUNNING,
+        else => API_ERR_BAD_HANDLE,
+    };
+    defer unlockEndpoint(&result_lease);
+    return @intCast(queueCounts(result_lease.endpoint).queued);
 }
 
 pub fn submitRequest(handle: u32, client_id: u32, op: u16, payload: []const u8) i32 {
     if (op == 0) return API_ERR_INVALID;
     if (payload.len > API_MAX_PAYLOAD) return API_ERR_PAYLOAD_TOO_LARGE;
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    var ep = &endpoints[idx];
-    if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
+    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    const ep = endpoint_lease.endpoint;
     if (!ep.slots_available.tryAcquire()) {
         ep.busy_rejections +%= 1;
         return API_ERR_BUSY;
@@ -620,31 +1088,21 @@ fn submitRequestWaitInternal(
 
     const forever = timeout_ticks == sync.WAIT_FOREVER;
     const deadline = if (forever) @as(u64, 0) else timer.tickCount() +| timeout_ticks;
-    const locked = lockRegistry();
-    const idx = endpointForHandle(handle) orelse {
-        unlockRegistry(locked);
-        return API_ERR_BAD_HANDLE;
-    };
-    var ep = &endpoints[idx];
-    if (!serviceSlotRunning(ep.service_slot)) {
-        unlockRegistry(locked);
-        return API_ERR_NOT_RUNNING;
-    }
+    const identity = lookupEndpointIdentity(handle) orelse return API_ERR_BAD_HANDLE;
+    var endpoint_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    var ep = endpoint_lease.endpoint;
     if (timeout_ticks != 0 and !forever and timer.tickCount() >= deadline) {
         ep.timeouts +%= 1;
         ep.admission_timeouts +%= 1;
-        unlockRegistry(locked);
         return API_ERR_TIMEOUT;
     }
     if (ep.slots_available.tryAcquire()) {
-        const result = publishRequestWithOptionalUnwindLocked(ep, client_id, op, payload, publish_unwind, .{});
-        unlockRegistry(locked);
-        return result;
+        return publishRequestWithOptionalUnwindLocked(ep, client_id, op, payload, publish_unwind, .{});
     }
 
     if (timeout_ticks == 0) {
         ep.busy_rejections +%= 1;
-        unlockRegistry(locked);
         return API_ERR_BUSY;
     }
 
@@ -652,7 +1110,6 @@ fn submitRequestWaitInternal(
     if (!forever and now >= deadline) {
         ep.timeouts +%= 1;
         ep.admission_timeouts +%= 1;
-        unlockRegistry(locked);
         return API_ERR_TIMEOUT;
     }
     ep.admission_waits +%= 1;
@@ -660,25 +1117,20 @@ fn submitRequestWaitInternal(
     var admission_unwind: task_context.UnwindToken = .{};
     const wait_result = ep.slots_available.acquireReleasingGuarded(
         remaining,
-        releaseMutexForWait,
-        &registry_lock,
+        releaseTimedLockForWait,
+        &endpoint_lease.guard,
         &admission_unwind,
     );
 
-    const result_locked = lockRegistry();
-    defer unlockRegistry(result_locked);
-    const result_idx = endpointForHandle(handle) orelse {
+    var result_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse {
         leaveAdmissionUnwind(&admission_unwind);
         return switch (wait_result) {
             .cancelled, .killed => API_ERR_NOT_RUNNING,
             else => API_ERR_BAD_HANDLE,
         };
     };
-    ep = &endpoints[result_idx];
-    if (!serviceSlotRunning(ep.service_slot)) {
-        leaveAdmissionUnwind(&admission_unwind);
-        return API_ERR_NOT_RUNNING;
-    }
+    defer unlockEndpoint(&result_lease);
+    ep = result_lease.endpoint;
     switch (wait_result) {
         .signaled => {},
         .timeout => {
@@ -746,7 +1198,7 @@ fn publishRequestLocked(ep: *Endpoint, client_id: u32, op: u16, payload: []const
         return API_ERR_BUSY;
     };
     var slot = &ep.queue[slot_idx];
-    const request_id = allocateRequestId();
+    const request_id = allocateRequestId(ep);
     resetRequestSlotMetadata(slot);
     slot.request_id = request_id;
     slot.client_id = client_id;
@@ -755,7 +1207,7 @@ fn publishRequestLocked(ep: *Endpoint, client_id: u32, op: u16, payload: []const
     slot.request_len = @intCast(payload.len);
     if (payload.len > 0) {
         @memcpy(slot.request_payload[0..payload.len], payload);
-        lifetime_performance.payload_copy_bytes +%= payload.len;
+        ep.lifetime.payload_copy_bytes +%= payload.len;
     }
     // Der Zustand wird zuletzt publiziert. Damit sind nur die neu gesetzten
     // Laengen sichtbar; alte Bytes hinter request_len bleiben unerreichbar.
@@ -767,12 +1219,10 @@ fn publishRequestLocked(ep: *Endpoint, client_id: u32, op: u16, payload: []const
 }
 
 pub fn recvRequest(handle: u32, header: *ApiMessageHeader, out: []u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
     clearMessageHeader(header);
-    const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    var ep = &endpoints[idx];
-    if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
+    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    const ep = endpoint_lease.endpoint;
     const slot_idx = queuedRequestSlot(ep) orelse return 0;
     var slot = &ep.queue[slot_idx];
     const len: usize = @intCast(slot.request_len);
@@ -782,7 +1232,7 @@ pub fn recvRequest(handle: u32, header: *ApiMessageHeader, out: []u8) i32 {
     }
     if (len > 0) {
         @memcpy(out[0..len], slot.request_payload[0..len]);
-        lifetime_performance.payload_copy_bytes +%= len;
+        ep.lifetime.payload_copy_bytes +%= len;
     }
     fillMessageHeader(slot, header, slot.request_len, API_OK);
     slot.state = .delivered;
@@ -791,17 +1241,15 @@ pub fn recvRequest(handle: u32, header: *ApiMessageHeader, out: []u8) i32 {
 }
 
 pub fn reply(handle: u32, request_id: u32, status: i32, payload: []const u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
     if (payload.len > API_MAX_PAYLOAD) return API_ERR_PAYLOAD_TOO_LARGE;
-    const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    var ep = &endpoints[idx];
-    if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
+    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    const ep = endpoint_lease.endpoint;
     const slot_idx = deliveredRequestSlotById(ep, request_id) orelse return API_ERR_NOT_FOUND;
     var slot = &ep.queue[slot_idx];
     if (payload.len > 0) {
         @memcpy(slot.response_payload[0..payload.len], payload);
-        lifetime_performance.payload_copy_bytes +%= payload.len;
+        ep.lifetime.payload_copy_bytes +%= payload.len;
     }
     slot.response_len = @intCast(payload.len);
     slot.response_status = status;
@@ -816,81 +1264,72 @@ pub fn reply(handle: u32, request_id: u32, status: i32, payload: []const u8) i32
 }
 
 pub fn takeResponse(handle: u32, request_id: u32, header: *ApiMessageHeader, out: []u8) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
     clearMessageHeader(header);
-    const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    var ep = &endpoints[idx];
+    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    const ep = endpoint_lease.endpoint;
     const slot_idx = respondedRequestSlotById(ep, request_id) orelse return 0;
     var slot = &ep.queue[slot_idx];
     const len: usize = @intCast(slot.response_len);
     fillMessageHeader(slot, header, slot.response_len, slot.response_status);
     if (out.len < len) {
-        clearRequestSlot(slot);
+        clearRequestSlot(ep, slot);
         _ = ep.slots_available.release(1);
         return API_ERR_BUFFER_TOO_SMALL;
     }
     if (len > 0) {
         @memcpy(out[0..len], slot.response_payload[0..len]);
-        lifetime_performance.payload_copy_bytes +%= len;
+        ep.lifetime.payload_copy_bytes +%= len;
     }
-    clearRequestSlot(slot);
+    clearRequestSlot(ep, slot);
     _ = ep.slots_available.release(1);
     return @intCast(len);
 }
 
 const ResponseWaitContext = struct {
+    identity: EndpointIdentity,
     slot: *RequestSlot,
     request_id: u32,
 };
 
 fn responseWaitStillNeeded(raw: *anyopaque) bool {
     const ctx: *ResponseWaitContext = @ptrCast(@alignCast(raw));
-    return ctx.slot.request_id == ctx.request_id and
+    return identityMatches(ctx.identity.endpoint, ctx.identity) and
+        ctx.slot.request_id == ctx.request_id and
         ctx.slot.state != .free and
         ctx.slot.state != .responded;
 }
 
 pub fn waitResponse(handle: u32, request_id: u32, timeout_ticks: u64) i32 {
     if (request_id == 0) return API_ERR_INVALID;
-    const locked = lockRegistry();
-    const idx = endpointForHandle(handle) orelse {
-        unlockRegistry(locked);
-        return API_ERR_BAD_HANDLE;
-    };
-    var ep = &endpoints[idx];
-    if (!serviceSlotRunning(ep.service_slot)) {
-        unlockRegistry(locked);
-        return API_ERR_NOT_RUNNING;
-    }
-    if (respondedRequestSlotById(ep, request_id) != null) {
-        unlockRegistry(locked);
-        return API_OK;
-    }
-    const slot_idx = requestSlotById(ep, request_id) orelse {
-        unlockRegistry(locked);
-        return API_ERR_NOT_FOUND;
-    };
+    const identity = lookupEndpointIdentity(handle) orelse return API_ERR_BAD_HANDLE;
+    var endpoint_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    var ep = endpoint_lease.endpoint;
+    const slot_idx = requestSlotById(ep, request_id) orelse return API_ERR_NOT_FOUND;
+    if (ep.queue[slot_idx].state == .responded) return API_OK;
     ep.completion_waits +%= 1;
     ep.completion_wait_rounds +%= 1;
-    var wait_ctx = ResponseWaitContext{ .slot = &ep.queue[slot_idx], .request_id = request_id };
+    var wait_ctx = ResponseWaitContext{
+        .identity = identity,
+        .slot = &ep.queue[slot_idx],
+        .request_id = request_id,
+    };
     const wait_result = wait_ctx.slot.response_available.waitUnlessReleasing(
         timeout_ticks,
         "service-response",
         responseWaitStillNeeded,
         &wait_ctx,
-        releaseMutexForWait,
-        &registry_lock,
+        releaseTimedLockForWait,
+        &endpoint_lease.guard,
     );
 
-    const result_locked = lockRegistry();
-    defer unlockRegistry(result_locked);
-    const result_idx = endpointForHandle(handle) orelse return switch (wait_result) {
+    var result_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return switch (wait_result) {
         .cancelled, .killed => API_ERR_NOT_RUNNING,
         else => API_ERR_BAD_HANDLE,
     };
-    ep = &endpoints[result_idx];
-    if (!serviceSlotRunning(ep.service_slot)) return API_ERR_NOT_RUNNING;
+    defer unlockEndpoint(&result_lease);
+    ep = result_lease.endpoint;
     if (wait_result == .timeout) {
         ep.timeouts +%= 1;
         ep.completion_timeouts +%= 1;
@@ -898,20 +1337,18 @@ pub fn waitResponse(handle: u32, request_id: u32, timeout_ticks: u64) i32 {
     }
     if (wait_result == .cancelled or wait_result == .killed) return API_ERR_NOT_RUNNING;
     if (wait_result == .none or wait_result == .failed) return API_ERR_BUSY;
-    if (respondedRequestSlotById(ep, request_id) != null) return API_OK;
-    if (requestSlotById(ep, request_id) == null) return API_ERR_NOT_FOUND;
-    return API_ERR_BUSY;
+    const result_slot = requestSlotById(ep, request_id) orelse return API_ERR_NOT_FOUND;
+    return if (ep.queue[result_slot].state == .responded) API_OK else API_ERR_BUSY;
 }
 
 pub fn cancelRequest(handle: u32, request_id: u32) i32 {
-    const locked = lockRegistry();
-    defer unlockRegistry(locked);
-    const idx = endpointForHandle(handle) orelse return API_ERR_BAD_HANDLE;
-    var ep = &endpoints[idx];
+    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
+    defer unlockEndpoint(&endpoint_lease);
+    const ep = endpoint_lease.endpoint;
     const slot_idx = requestSlotById(ep, request_id) orelse return API_ERR_NOT_FOUND;
     ep.drops +%= 1;
     ep.cancellations +%= 1;
-    clearRequestSlot(&ep.queue[slot_idx]);
+    clearRequestSlot(ep, &ep.queue[slot_idx]);
     _ = ep.slots_available.release(1);
     return API_OK;
 }
@@ -1023,10 +1460,15 @@ fn findByNameIn(table: *const [MAX_SERVICES]Entry, name: []const u8) ?usize {
 }
 
 fn resetEndpoints() void {
-    lifetime_performance = .{};
     for (&endpoints) |*ep| {
         if (ep.used) wakeEndpointWaiters(ep, .cancelled);
         resetEndpointMetadata(ep, false);
+        ep.lock = sync.Mutex.initClass("service-endpoint", sync.LockRank.service_endpoint, .sleepable);
+        ep.generation = 0;
+        ep.request_id_next = 0;
+        ep.request_id_limit = 0;
+        ep.lifetime = .{};
+        ep.lock_timing = .{LockTiming{}} ** SERVICE_LOCK_FAMILY_COUNT;
     }
     next_endpoint_handle = 1;
     next_request_id = 1;
@@ -1034,6 +1476,8 @@ fn resetEndpoints() void {
 
 fn resetRegistryState() void {
     entries = .{Entry{}} ** MAX_SERVICES;
+    registry_lock = sync.Mutex.initClass("service-registry", sync.LockRank.service_registry, .sleepable);
+    registry_lock_timing = .{LockTiming{}} ** SERVICE_LOCK_FAMILY_COUNT;
     resetEndpoints();
 }
 
@@ -1062,99 +1506,109 @@ fn endpointForHandle(handle: u32) ?usize {
     return null;
 }
 
-fn clearEndpointForSlot(slot: usize) void {
+fn noteQueueScan(ep: *Endpoint, slots: usize) void {
+    ep.lifetime.queue_scan_passes +%= 1;
+    ep.lifetime.queue_scan_slots +%= slots;
+}
+
+fn freeRequestSlot(ep: *Endpoint) ?usize {
     var i: usize = 0;
-    while (i < endpoints.len) : (i += 1) {
-        if (endpoints[i].used and endpoints[i].service_slot == slot) {
-            retireEndpoint(&endpoints[i], .cancelled);
+    while (i < ep.queue.len) : (i += 1) {
+        if (ep.queue[i].state == .free) {
+            noteQueueScan(ep, i + 1);
+            return i;
         }
     }
-}
-
-fn freeRequestSlot(ep: *const Endpoint) ?usize {
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == .free) return i;
-    }
+    noteQueueScan(ep, ep.queue.len);
     return null;
 }
 
-fn queuedRequestSlot(ep: *const Endpoint) ?usize {
+fn queuedRequestSlot(ep: *Endpoint) ?usize {
     var i: usize = 0;
     while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == .queued) return i;
+        if (ep.queue[i].state == .queued) {
+            noteQueueScan(ep, i + 1);
+            return i;
+        }
     }
+    noteQueueScan(ep, ep.queue.len);
     return null;
 }
 
-fn requestSlotById(ep: *const Endpoint, request_id: u32) ?usize {
+fn hasQueuedRequest(ep: *const Endpoint) bool {
     var i: usize = 0;
     while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state != .free and ep.queue[i].request_id == request_id) return i;
+        if (ep.queue[i].state == .queued) return true;
     }
+    return false;
+}
+
+fn requestSlotById(ep: *Endpoint, request_id: u32) ?usize {
+    var i: usize = 0;
+    while (i < ep.queue.len) : (i += 1) {
+        if (ep.queue[i].state != .free and ep.queue[i].request_id == request_id) {
+            noteQueueScan(ep, i + 1);
+            return i;
+        }
+    }
+    noteQueueScan(ep, ep.queue.len);
     return null;
 }
 
-fn deliveredRequestSlotById(ep: *const Endpoint, request_id: u32) ?usize {
+fn deliveredRequestSlotById(ep: *Endpoint, request_id: u32) ?usize {
     var i: usize = 0;
     while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == .delivered and ep.queue[i].request_id == request_id) return i;
+        if (ep.queue[i].state == .delivered and ep.queue[i].request_id == request_id) {
+            noteQueueScan(ep, i + 1);
+            return i;
+        }
     }
+    noteQueueScan(ep, ep.queue.len);
     return null;
 }
 
-fn respondedRequestSlotById(ep: *const Endpoint, request_id: u32) ?usize {
+fn respondedRequestSlotById(ep: *Endpoint, request_id: u32) ?usize {
     var i: usize = 0;
     while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == .responded and ep.queue[i].request_id == request_id) return i;
+        if (ep.queue[i].state == .responded and ep.queue[i].request_id == request_id) {
+            noteQueueScan(ep, i + 1);
+            return i;
+        }
     }
+    noteQueueScan(ep, ep.queue.len);
     return null;
 }
 
-fn countQueuedSlots(ep: *const Endpoint) u32 {
-    return countSlotsByState(ep, .queued);
-}
-
-fn countDeliveredSlots(ep: *const Endpoint) u32 {
-    return countSlotsByState(ep, .delivered);
-}
-
-fn countRespondedSlots(ep: *const Endpoint) u32 {
-    return countSlotsByState(ep, .responded);
-}
-
-fn countUsedSlots(ep: *const Endpoint) u32 {
-    var count: u32 = 0;
+fn queueCounts(ep: *Endpoint) QueueCounts {
+    var counts = QueueCounts{};
     var i: usize = 0;
     while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state != .free) count += 1;
+        switch (ep.queue[i].state) {
+            .free => {},
+            .queued => counts.queued += 1,
+            .delivered => counts.delivered += 1,
+            .responded => counts.responded += 1,
+        }
     }
-    return count;
-}
-
-fn countSlotsByState(ep: *const Endpoint, state: RequestState) u32 {
-    var count: u32 = 0;
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == state) count += 1;
-    }
-    return count;
+    counts.used = counts.queued + counts.delivered + counts.responded;
+    noteQueueScan(ep, ep.queue.len);
+    return counts;
 }
 
 fn noteQueueHighWater(ep: *Endpoint) void {
-    const used = countUsedSlots(ep);
+    const used = queueCounts(ep).used;
     if (used > ep.queue_high_water) ep.queue_high_water = used;
 }
 
 fn noteActiveWorkers(ep: *Endpoint) void {
-    const active = countDeliveredSlots(ep);
+    const active = queueCounts(ep).delivered;
     if (active > ep.max_active_workers) ep.max_active_workers = active;
 }
 
-fn clearRequestSlot(slot: *RequestSlot) void {
+fn clearRequestSlot(ep: *Endpoint, slot: *RequestSlot) void {
     _ = slot.response_available.close(.cancelled);
     resetRequestSlotMetadata(slot);
-    lifetime_performance.slot_metadata_resets +%= 1;
+    ep.lifetime.slot_metadata_resets +%= 1;
 }
 
 fn resetRequestSlotMetadata(slot: *RequestSlot) void {
@@ -1169,7 +1623,7 @@ fn resetRequestSlotMetadata(slot: *RequestSlot) void {
     slot.response_available = sync.WaitQueue.init();
 }
 
-fn retireEndpoint(ep: *Endpoint, result: sync.WaitResult) void {
+fn retireEndpointLocked(ep: *Endpoint, result: sync.WaitResult) void {
     wakeEndpointWaiters(ep, result);
     resetEndpointMetadata(ep, true);
 }
@@ -1198,7 +1652,7 @@ fn resetEndpointMetadata(ep: *Endpoint, count_reset: bool) void {
     ep.requests_available = sync.WaitQueue.init();
     ep.slots_available = sync.Semaphore.init(@intCast(API_ENDPOINT_QUEUE_DEPTH), @intCast(API_ENDPOINT_QUEUE_DEPTH));
     for (&ep.queue) |*slot| resetRequestSlotMetadata(slot);
-    if (count_reset) lifetime_performance.endpoint_metadata_resets +%= 1;
+    if (count_reset) ep.lifetime.endpoint_metadata_resets +%= 1;
 }
 
 fn wakeEndpointWaiters(ep: *Endpoint, result: sync.WaitResult) void {
@@ -1212,8 +1666,9 @@ fn wakeEndpointWaiters(ep: *Endpoint, result: sync.WaitResult) void {
     _ = ep.slots_available.queue.close(result);
 }
 
-fn serviceSlotRunning(slot: usize) bool {
-    return slot < entries.len and entries[slot].used and entries[slot].state == .running and entries[slot].instance_id != 0;
+fn advanceEndpointGeneration(ep: *Endpoint) void {
+    ep.generation +%= 1;
+    if (ep.generation == 0) ep.generation = 1;
 }
 
 fn allocateEndpointHandle() u32 {
@@ -1223,14 +1678,35 @@ fn allocateEndpointHandle() u32 {
     return if (handle == 0) 1 else handle;
 }
 
-fn allocateRequestId() u32 {
-    const id = next_request_id;
-    next_request_id +%= 1;
-    if (next_request_id == 0 or next_request_id > 0x7FFF_FFFE) next_request_id = 1;
-    return if (id == 0) 1 else id;
+fn allocateRequestId(ep: *Endpoint) u32 {
+    return allocateRequestIdFrom(ep, &next_request_id);
 }
 
-fn fillApiInfo(slot: usize, out: *ApiInfo, now_ticks: u64) void {
+fn allocateRequestIdFrom(ep: *Endpoint, counter: *u32) u32 {
+    if (ep.request_id_next != 0 and ep.request_id_next <= ep.request_id_limit) {
+        const id = ep.request_id_next;
+        ep.request_id_next += 1;
+        return id;
+    }
+
+    var observed = @atomicLoad(u32, counter, .monotonic);
+    while (true) {
+        const first: u32 = if (observed == 0 or observed > REQUEST_ID_MAX) 1 else observed;
+        const available = REQUEST_ID_MAX - first + 1;
+        const count = @min(REQUEST_ID_BLOCK_SIZE, available);
+        const after = first + count;
+        const next_global: u32 = if (after > REQUEST_ID_MAX) 1 else after;
+        if (@cmpxchgWeak(u32, counter, observed, next_global, .monotonic, .monotonic)) |actual| {
+            observed = actual;
+        } else {
+            ep.request_id_next = first + 1;
+            ep.request_id_limit = first + count - 1;
+            return first;
+        }
+    }
+}
+
+fn fillApiInfoEntryLocked(slot: usize, out: *ApiInfo, now_ticks: u64) void {
     out.* = .{};
     if (slot >= entries.len or !entries[slot].used) return;
     const e = &entries[slot];
@@ -1245,36 +1721,41 @@ fn fillApiInfo(slot: usize, out: *ApiInfo, now_ticks: u64) void {
     }
     if (e.name_len > 0) @memcpy(out.name[0..e.name_len], e.name[0..e.name_len]);
     if (e.last_error_len > 0) @memcpy(out.last_error[0..e.last_error_len], e.last_error[0..e.last_error_len]);
-    if (endpointForSlot(slot)) |idx| {
-        const ep = &endpoints[idx];
-        out.handle = ep.handle;
-        out.flags |= API_FLAG_ENDPOINT;
-        out.flags |= API_FLAG_QUEUE_BACKED;
-        const queued = countQueuedSlots(ep);
-        const active = countDeliveredSlots(ep);
-        const responded = countRespondedSlots(ep);
-        if (queued != 0 or active != 0) out.flags |= API_FLAG_REQUEST_PENDING;
-        if (responded != 0) out.flags |= API_FLAG_RESPONSE_PENDING;
-        out.requests = ep.requests;
-        out.responses = ep.responses;
-        out.drops = ep.drops;
-        out.queue_depth = @intCast(API_ENDPOINT_QUEUE_DEPTH);
-        out.queue_used = countUsedSlots(ep);
-        out.queue_high_water = ep.queue_high_water;
-        out.active_workers = active;
-        out.max_active_workers = ep.max_active_workers;
-        out.open_handles = ep.open_handles;
-        out.busy_rejections = ep.busy_rejections;
-        out.timeouts = ep.timeouts;
-        out.cancellations = ep.cancellations;
-    }
 }
 
-fn fillApiDetail(slot: usize, out: *ApiDetail, now_ticks: u64) void {
+fn fillApiInfoEndpoint(identity: ?EndpointIdentity, out: *ApiInfo) void {
+    const exact = identity orelse return;
+    var endpoint_lease = lockEndpointIdentity(exact, .endpoint_snapshot) orelse return;
+    defer unlockEndpoint(&endpoint_lease);
+    fillApiInfoEndpointLocked(endpoint_lease.endpoint, out);
+}
+
+fn fillApiInfoEndpointLocked(ep: *Endpoint, out: *ApiInfo) void {
+    const counts = queueCounts(ep);
+    out.handle = ep.handle;
+    out.flags |= API_FLAG_ENDPOINT;
+    out.flags |= API_FLAG_QUEUE_BACKED;
+    if (counts.queued != 0 or counts.delivered != 0) out.flags |= API_FLAG_REQUEST_PENDING;
+    if (counts.responded != 0) out.flags |= API_FLAG_RESPONSE_PENDING;
+    out.requests = ep.requests;
+    out.responses = ep.responses;
+    out.drops = ep.drops;
+    out.queue_depth = @intCast(API_ENDPOINT_QUEUE_DEPTH);
+    out.queue_used = counts.used;
+    out.queue_high_water = ep.queue_high_water;
+    out.active_workers = counts.delivered;
+    out.max_active_workers = ep.max_active_workers;
+    out.open_handles = ep.open_handles;
+    out.busy_rejections = ep.busy_rejections;
+    out.timeouts = ep.timeouts;
+    out.cancellations = ep.cancellations;
+}
+
+fn fillApiDetailEntryLocked(slot: usize, out: *ApiDetail, now_ticks: u64) void {
     out.* = .{};
     if (slot >= entries.len or !entries[slot].used) return;
     const e = &entries[slot];
-    fillApiInfo(slot, &out.info, now_ticks);
+    fillApiInfoEntryLocked(slot, &out.info, now_ticks);
     if (e.path_len > 0) @memcpy(out.path[0..e.path_len], e.path[0..e.path_len]);
     if (e.args_len > 0) @memcpy(out.args[0..e.args_len], e.args[0..e.args_len]);
     if (e.description_len > 0) @memcpy(out.description[0..e.description_len], e.description[0..e.description_len]);
@@ -1403,7 +1884,12 @@ test "endpoint metadata reset preserves every slot payload" {
     var ep = Endpoint{};
     ep.used = true;
     ep.handle = 99;
+    ep.generation = 7;
+    ep.request_id_next = 41;
+    ep.request_id_limit = 64;
     ep.requests = 12;
+    ep.lifetime.payload_copy_bytes = 1234;
+    ep.lock_timing[lockFamilyIndex(.endpoint_data)].acquisitions = 9;
     for (&ep.queue, 0..) |*slot, index| {
         @memset(slot.request_payload[0..], @intCast(index + 1));
         @memset(slot.response_payload[0..], @intCast(index + 17));
@@ -1416,7 +1902,12 @@ test "endpoint metadata reset preserves every slot payload" {
 
     try std.testing.expect(!ep.used);
     try std.testing.expectEqual(@as(u32, 0), ep.handle);
+    try std.testing.expectEqual(@as(u64, 7), ep.generation);
+    try std.testing.expectEqual(@as(u32, 41), ep.request_id_next);
+    try std.testing.expectEqual(@as(u32, 64), ep.request_id_limit);
     try std.testing.expectEqual(@as(u64, 0), ep.requests);
+    try std.testing.expectEqual(@as(u64, 1234), ep.lifetime.payload_copy_bytes);
+    try std.testing.expectEqual(@as(u64, 9), ep.lock_timing[lockFamilyIndex(.endpoint_data)].acquisitions);
     for (&ep.queue, 0..) |*slot, index| {
         try std.testing.expectEqual(RequestState.free, slot.state);
         try std.testing.expectEqual(@as(u16, 0), slot.request_len);
@@ -1426,4 +1917,81 @@ test "endpoint metadata reset preserves every slot payload" {
         try std.testing.expectEqual(@as(u8, @intCast(index + 17)), slot.response_payload[0]);
         try std.testing.expectEqual(@as(u8, @intCast(index + 17)), slot.response_payload[API_MAX_PAYLOAD - 1]);
     }
+}
+
+test "request id blocks stay globally unique and endpoint local" {
+    var counter: u32 = 1;
+    var first = Endpoint{};
+    var second = Endpoint{};
+
+    try std.testing.expectEqual(@as(u32, 1), allocateRequestIdFrom(&first, &counter));
+    try std.testing.expectEqual(@as(u32, 257), allocateRequestIdFrom(&second, &counter));
+    try std.testing.expectEqual(@as(u32, 2), allocateRequestIdFrom(&first, &counter));
+    try std.testing.expectEqual(@as(u32, 258), allocateRequestIdFrom(&second, &counter));
+    try std.testing.expectEqual(@as(u32, 513), counter);
+
+    var wrap = Endpoint{};
+    counter = REQUEST_ID_MAX;
+    try std.testing.expectEqual(REQUEST_ID_MAX, allocateRequestIdFrom(&wrap, &counter));
+    try std.testing.expectEqual(@as(u32, 1), allocateRequestIdFrom(&wrap, &counter));
+}
+
+test "queue snapshot counts all states in one measured pass" {
+    var ep = Endpoint{};
+    ep.queue[0].state = .queued;
+    ep.queue[1].state = .delivered;
+    ep.queue[2].state = .responded;
+    ep.queue[3].state = .queued;
+
+    const counts = queueCounts(&ep);
+
+    try std.testing.expectEqual(@as(u32, 2), counts.queued);
+    try std.testing.expectEqual(@as(u32, 1), counts.delivered);
+    try std.testing.expectEqual(@as(u32, 1), counts.responded);
+    try std.testing.expectEqual(@as(u32, 4), counts.used);
+    try std.testing.expectEqual(@as(u64, 1), ep.lifetime.queue_scan_passes);
+    try std.testing.expectEqual(@as(u64, API_ENDPOINT_QUEUE_DEPTH), ep.lifetime.queue_scan_slots);
+}
+
+test "endpoint generation rejects a stale identity after immediate reuse" {
+    var ep = Endpoint{};
+    advanceEndpointGeneration(&ep);
+    ep.used = true;
+    ep.handle = 41;
+    ep.service_slot = 3;
+    const stale = EndpointIdentity{
+        .endpoint = &ep,
+        .handle = ep.handle,
+        .generation = ep.generation,
+        .service_slot = ep.service_slot,
+    };
+
+    resetEndpointMetadata(&ep, false);
+    advanceEndpointGeneration(&ep);
+    ep.used = true;
+    ep.handle = 42;
+    ep.service_slot = 3;
+
+    try std.testing.expect(!identityMatches(&ep, stale));
+    try std.testing.expectEqual(@as(u64, 2), ep.generation);
+}
+
+test "two endpoint slots retain independent locks queues and telemetry" {
+    var first = Endpoint{};
+    var second = Endpoint{};
+    first.queue[0].state = .queued;
+    second.queue[0].state = .responded;
+    first.lock_timing[lockFamilyIndex(.endpoint_data)].acquisitions = 5;
+    second.lock_timing[lockFamilyIndex(.endpoint_data)].acquisitions = 11;
+
+    const first_counts = queueCounts(&first);
+    const second_counts = queueCounts(&second);
+
+    try std.testing.expect(@intFromPtr(&first.lock) != @intFromPtr(&second.lock));
+    try std.testing.expectEqual(@as(u32, 1), first_counts.queued);
+    try std.testing.expectEqual(@as(u32, 0), first_counts.responded);
+    try std.testing.expectEqual(@as(u32, 0), second_counts.queued);
+    try std.testing.expectEqual(@as(u32, 1), second_counts.responded);
+    try std.testing.expectEqual(@as(u64, 5), first.lock_timing[lockFamilyIndex(.endpoint_data)].acquisitions);
+    try std.testing.expectEqual(@as(u64, 11), second.lock_timing[lockFamilyIndex(.endpoint_data)].acquisitions);
 }

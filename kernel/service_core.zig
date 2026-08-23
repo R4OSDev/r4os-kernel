@@ -108,11 +108,11 @@ pub fn markFailed(name: []const u8, exit_code: i32, error_text: []const u8) i32 
     return legacy.markFailed(name, exit_code, error_text);
 }
 
-pub fn entryAt(index: usize) ?*const Entry {
+pub fn entryAt(index: usize) ?Entry {
     return legacy.entryAt(index);
 }
 
-pub fn entryByName(name: []const u8) ?*const Entry {
+pub fn entryByName(name: []const u8) ?Entry {
     return legacy.entryByName(name);
 }
 

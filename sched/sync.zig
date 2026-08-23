@@ -36,6 +36,9 @@ pub const LockRank = struct {
     // task-bound owner addresses and never acquires this sleepable lock.
     pub const program_registry: u16 = 110;
     pub const service_registry: u16 = 120;
+    // Stable service endpoints are pinned through service_registry and then
+    // protect their queue, payload and waiter state independently.
+    pub const service_endpoint: u16 = 130;
     pub const block_registry: u16 = 140;
     pub const fs_volume: u16 = 150;
     // 0.56.8: Page-Cache liegt zwischen FS (ruft den Cache) und

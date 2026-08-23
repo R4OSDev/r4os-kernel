@@ -1423,9 +1423,16 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v1_size: usize = @offsetOf(ProgramPerformanceSummary, "monotonic_clock_flags");
     const v2_size: usize = @offsetOf(ProgramPerformanceSummary, "service_completion_wait_rounds");
     const v3_size: usize = @offsetOf(ProgramPerformanceSummary, "service_payload_copy_bytes");
+    const v4_size: usize = @offsetOf(ProgramPerformanceSummary, "service_queue_scan_passes");
+    const v5_size: usize = @offsetOf(ProgramPerformanceSummary, "service_lock_timing_stride");
+    const v6_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= @sizeOf(ProgramPerformanceSummary))
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v6_size)
         performance_snapshot_version
+    else if (caller_version >= 5 and caller_size >= v5_size)
+        5
+    else if (caller_version >= 4 and caller_size >= v4_size)
+        4
     else if (caller_version >= 3 and caller_size >= v3_size)
         3
     else if (caller_version >= 2 and caller_size >= v2_size)
@@ -1436,7 +1443,9 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         1 => v1_size,
         2 => v2_size,
         3 => v3_size,
-        else => @sizeOf(ProgramPerformanceSummary),
+        4 => v4_size,
+        5 => v5_size,
+        else => v6_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -1689,6 +1698,22 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .service_slot_metadata_resets = svc.slot_metadata_resets,
         .service_endpoint_metadata_resets = svc.endpoint_metadata_resets,
         .service_endpoint_payload_reset_bytes = svc.endpoint_payload_reset_bytes,
+        .service_queue_scan_passes = svc.queue_scan_passes,
+        .service_queue_scan_slots = svc.queue_scan_slots,
+        .service_endpoint_revalidations = svc.endpoint_revalidations,
+        .service_endpoint_stale_rejections = svc.endpoint_stale_rejections,
+        .service_lock_family_count = svc.lock_family_count,
+        .service_lock_reserved0 = svc.lock_reserved0,
+        .service_lock_acquisitions = svc.lock_acquisitions,
+        .service_lock_contentions = svc.lock_contentions,
+        .service_lock_wait_ns = svc.lock_wait_ns,
+        .service_lock_wait_max_ns = svc.lock_wait_max_ns,
+        .service_lock_hold_ns = svc.lock_hold_ns,
+        .service_lock_hold_max_ns = svc.lock_hold_max_ns,
+        .service_lock_timing_unavailable = svc.lock_timing_unavailable,
+        .service_lock_timing_stride = svc.lock_timing_stride,
+        .service_lock_timing_reserved0 = svc.lock_timing_reserved0,
+        .service_lock_timing_samples = svc.lock_timing_samples,
         .tcp_max_connections = tcp_summary.max_connections,
         .tcp_active_connections = tcp_summary.active_connections,
         .tcp_active_listeners = tcp_summary.active_listeners,

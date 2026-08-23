@@ -7751,34 +7751,40 @@ fn apiIoWait(request_id: u32, timeout_ticks: u64, out: *ProgramIoInfo) callconv(
         unlockAsyncIoRequests();
         return IO_ERROR_NOT_FOUND;
     };
-    var completion: ?*sync.Completion = null;
-    if (req.state == .pending or req.state == .running) {
-        req.waiters +|= 1;
-        completion = &req.completion;
+    if (req.state != .pending and req.state != .running) {
+        // A fast request can complete before its submitter reaches IoWait.
+        // Return that stable result directly while still owning the request
+        // lock; the former shared tail unlocked this already-released lock a
+        // second time when no Completion wait was needed.
+        const info = asyncIoInfo(req);
+        const status = req.status;
+        unlockAsyncIoRequests();
+        out.* = info;
+        return status;
     }
+    req.waiters +|= 1;
+    const completion = &req.completion;
     unlockAsyncIoRequests();
 
-    if (completion) |done| {
-        const wait_result = done.wait(timeout_ticks);
-        if (!lockAsyncIoRequests()) return IO_ERROR_BUSY;
-        req = asyncIoRequestForCaller(request_id) orelse {
-            unlockAsyncIoRequests();
-            return IO_ERROR_NOT_FOUND;
-        };
-        if (req.waiters != 0) req.waiters -= 1;
-        const completed = req.state != .pending and req.state != .running;
-        if (wait_result == .timeout and !completed) {
-            unlockAsyncIoRequests();
-            return IO_ERROR_TIMEOUT;
-        }
-        if ((wait_result == .cancelled or wait_result == .killed) and !completed) {
-            unlockAsyncIoRequests();
-            return IO_ERROR_CANCELLED;
-        }
-        if (wait_result != .signaled and !completed) {
-            unlockAsyncIoRequests();
-            return IO_ERROR_BUSY;
-        }
+    const wait_result = completion.wait(timeout_ticks);
+    if (!lockAsyncIoRequests()) return IO_ERROR_BUSY;
+    req = asyncIoRequestForCaller(request_id) orelse {
+        unlockAsyncIoRequests();
+        return IO_ERROR_NOT_FOUND;
+    };
+    if (req.waiters != 0) req.waiters -= 1;
+    const completed = req.state != .pending and req.state != .running;
+    if (wait_result == .timeout and !completed) {
+        unlockAsyncIoRequests();
+        return IO_ERROR_TIMEOUT;
+    }
+    if ((wait_result == .cancelled or wait_result == .killed) and !completed) {
+        unlockAsyncIoRequests();
+        return IO_ERROR_CANCELLED;
+    }
+    if (wait_result != .signaled and !completed) {
+        unlockAsyncIoRequests();
+        return IO_ERROR_BUSY;
     }
     const info = asyncIoInfo(req);
     const status = req.status;
