@@ -85,7 +85,6 @@ const UDP_STATUS_MAGIC: u32 = 0x53504455;
 const UDP_STATUS_VERSION: u16 = 2;
 const UDP_RESULT_MAGIC: u32 = 0x52504455;
 const UDP_RESULT_VERSION: u16 = 2;
-const RESPONSE_RECV_ATTEMPTS: usize = ipc.QUEUE_DEPTH + 1;
 const DHCP_ACTION_ACQUIRE: u16 = 1;
 const DHCP_ACTION_RENEW: u16 = 2;
 const DHCP_ACTION_RELEASE: u16 = 3;
@@ -690,17 +689,17 @@ pub fn sendRequestAsClient(channel_id: u32, op: u16, request_id: u32, client_id:
         service_backpressure_status.response_buffer_small += 1;
         return RESULT_BAD_REQUEST;
     }
-    var header: [HEADER_SIZE]u8 = .{0} ** HEADER_SIZE;
-    writeHeader(header[0..], channel_id, op, request_id, RESULT_OK, @intCast(payload.len)) orelse return RESULT_BAD_REQUEST;
-    writeU16(header[0..], 16, client_id);
-    var message: [ipc.MAX_MESSAGE_SIZE]u8 = .{0} ** ipc.MAX_MESSAGE_SIZE;
-    @memcpy(message[0..HEADER_SIZE], header[0..]);
+    var message: [ipc.MAX_MESSAGE_SIZE]u8 = undefined;
+    writeHeader(message[0..], channel_id, op, request_id, RESULT_OK, @intCast(payload.len)) orelse return RESULT_BAD_REQUEST;
+    writeU16(message[0..], 16, client_id);
     if (payload.len != 0) @memcpy(message[HEADER_SIZE .. HEADER_SIZE + payload.len], payload);
-    if (ipc.send(channel_id, message[0 .. HEADER_SIZE + payload.len]) < 0) {
+    const got = ipc.request(channel_id, message[0 .. HEADER_SIZE + payload.len], out, ipc.WAIT_FOREVER);
+    if (got < 0) {
+        if (out.len < ipc.MAX_MESSAGE_SIZE) service_backpressure_status.response_buffer_small += 1;
         service_backpressure_status.send_failures += 1;
         return RESULT_BAD_SERVICE;
     }
-    return recvMatchingResponse(channel_id, op, request_id, out);
+    return got;
 }
 
 pub fn staleResponseSkips() u64 {
@@ -774,30 +773,6 @@ pub fn parsePayload(response: []const u8, status: *i32) ?[]const u8 {
     return response[HEADER_SIZE .. HEADER_SIZE + payload_len];
 }
 
-fn recvMatchingResponse(channel_id: u32, op: u16, request_id: u32, out: []u8) i32 {
-    var attempts: usize = 0;
-    while (attempts < RESPONSE_RECV_ATTEMPTS) : (attempts += 1) {
-        const got = ipc.recv(channel_id, out);
-        if (got < 0 and out.len < ipc.MAX_MESSAGE_SIZE) service_backpressure_status.response_buffer_small += 1;
-        if (got <= 0) return RESULT_BAD_SERVICE;
-        const response = out[0..@as(usize, @intCast(got))];
-        if (responseMatches(response, channel_id, op, request_id)) return got;
-        stale_responses_skipped += 1;
-        service_backpressure_status.stale_skips = stale_responses_skipped;
-    }
-    return RESULT_BAD_SERVICE;
-}
-
-fn responseMatches(response: []const u8, channel_id: u32, op: u16, request_id: u32) bool {
-    if (response.len < HEADER_SIZE) return false;
-    if (readU32(response, 0) != MAGIC or readU16(response, 4) != VERSION) return false;
-    if (readU16(response, 6) != @as(u16, @intCast(channel_id))) return false;
-    if (readU16(response, 8) != op) return false;
-    if (readU32(response, 12) != request_id) return false;
-    const payload_len = readU16(response, 18);
-    return HEADER_SIZE + payload_len <= response.len;
-}
-
 fn handle(channel_id: u32, request: []const u8, response: []u8) i32 {
     if (request.len < HEADER_SIZE) return writeError(response, channel_id, 0, 0, RESULT_BAD_REQUEST);
     if (readU32(request, 0) != MAGIC or readU16(request, 4) != VERSION) return writeError(response, channel_id, 0, 0, RESULT_BAD_REQUEST);
@@ -810,7 +785,7 @@ fn handle(channel_id: u32, request: []const u8, response: []u8) i32 {
     const request_payload = request[HEADER_SIZE .. HEADER_SIZE + payload_len];
     if (service != channel_id) return writeError(response, channel_id, op, request_id, RESULT_BAD_SERVICE);
 
-    var response_payload: [ipc.MAX_MESSAGE_SIZE - HEADER_SIZE]u8 = .{0} ** (ipc.MAX_MESSAGE_SIZE - HEADER_SIZE);
+    var response_payload: [ipc.MAX_MESSAGE_SIZE - HEADER_SIZE]u8 = undefined;
     var w = Writer{ .out = response_payload[0..] };
     if (op == OP_SERVICE_RESTART) {
         const status = restartServices("manual");

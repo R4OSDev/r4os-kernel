@@ -14,6 +14,7 @@ const memory_reclaim = @import("../memory/reclaim.zig");
 const r4p = @import("../program/r4p.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const shell_launcher = @import("shell_launcher.zig");
+const service_ipc = @import("service_ipc.zig");
 const block_storage = @import("../storage/block.zig");
 const task = @import("../sched/task.zig");
 
@@ -37,6 +38,12 @@ pub fn initTaskRuntime() bool {
         return false;
     }
     log.puts("  Scheduler ");
+    log.puts("[OK]\r\n");
+
+    if (!service_ipc.startRuntimeWorker()) {
+        return false;
+    }
+    log.puts("  Service IPC worker ");
     log.puts("[OK]\r\n");
 
     if (!driver_work.init()) {

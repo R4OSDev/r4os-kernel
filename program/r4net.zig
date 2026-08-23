@@ -4,6 +4,7 @@ const ipc = @import("../kernel/ipc.zig");
 const net = @import("../net/core.zig");
 const net_config = @import("../net/config.zig");
 const net_config_writer = @import("../net/config_writer.zig");
+const net_ipc_services = @import("../net/ipc_services.zig");
 const serial_link = @import("../net/serial_link.zig");
 
 pub const name = "R4NET";
@@ -11,6 +12,8 @@ pub const name = "R4NET";
 pub const IpcSummary = r4x_api.IpcSummary;
 
 pub const IpcChannelInfo = r4x_api.IpcChannelInfo;
+
+pub const IpcPerformanceSummary = r4x_api.IpcPerformanceSummary;
 
 pub const TcpSummary = r4x_api.TcpSummary;
 
@@ -174,7 +177,8 @@ pub fn ipcClose(channel_id: u32) callconv(.c) i32 {
 
 pub fn ipcSummary(out: *IpcSummary) callconv(.c) i32 {
     var s: ipc.Summary = .{};
-    ipc.summary(&s);
+    const result = ipc.summary(&s);
+    if (result < 0) return result;
     out.* = .{
         .max_channels = s.max_channels,
         .active_channels = s.active_channels,
@@ -186,7 +190,7 @@ pub fn ipcSummary(out: *IpcSummary) callconv(.c) i32 {
         .errors = s.errors,
         .echo_tests = s.echo_tests,
     };
-    return 1;
+    return result;
 }
 
 pub fn ipcChannel(channel_id: u32, out: *IpcChannelInfo) callconv(.c) i32 {
@@ -205,6 +209,77 @@ pub fn ipcChannel(channel_id: u32, out: *IpcChannelInfo) callconv(.c) i32 {
         .receives = info.receives,
         .drops = info.drops,
         .name = info.name,
+    };
+    return result;
+}
+
+pub fn netServiceRequest(
+    channel_id: u32,
+    op: u16,
+    request_id: u32,
+    client_id: u16,
+    payload_ptr: [*]const u8,
+    payload_len: u32,
+    out_ptr: [*]u8,
+    out_capacity: u32,
+) callconv(.c) i32 {
+    if (payload_len > ipc.MAX_MESSAGE_SIZE - net_ipc_services.HEADER_SIZE) return net_ipc_services.RESULT_BAD_REQUEST;
+    if (out_capacity > ipc.MAX_MESSAGE_SIZE) return net_ipc_services.RESULT_BAD_REQUEST;
+    const payload = payload_ptr[0..@as(usize, @intCast(payload_len))];
+    const out = out_ptr[0..@as(usize, @intCast(out_capacity))];
+    return net_ipc_services.sendRequestAsClient(channel_id, op, request_id, client_id, payload, out);
+}
+
+pub fn ipcPerformance(channel_id: u32, out: *IpcPerformanceSummary) callconv(.c) i32 {
+    const caller_version = out.version;
+    const caller_size: usize = out.size;
+    const header_size: usize = @offsetOf(IpcPerformanceSummary, "worker_started");
+    const required_size: usize = @sizeOf(IpcPerformanceSummary);
+    if (caller_version == 0 or caller_size < header_size) return -1;
+    if (caller_size < required_size) {
+        out.version = 1;
+        out.size = @intCast(required_size);
+        return -1;
+    }
+
+    var s: ipc.PerformanceSummary = .{};
+    const result = ipc.performanceSummaryFor(channel_id, &s);
+    if (result < 0) return result;
+    out.* = .{
+        .version = 1,
+        .size = @intCast(required_size),
+        .worker_started = s.worker_started,
+        .worker_task_id = s.worker_task_id,
+        .active_channels = s.active_channels,
+        .queue_used = s.queue_used,
+        .queue_ready = s.queue_ready,
+        .queue_running = s.queue_running,
+        .queue_limit = s.queue_limit,
+        .handler_queued = s.handler_queued,
+        .handler_completed = s.handler_completed,
+        .handler_failures = s.handler_failures,
+        .handler_direct = s.handler_direct,
+        .handler_waits = s.handler_waits,
+        .handler_wait_timeouts = s.handler_wait_timeouts,
+        .handler_queue_ns = s.handler_queue_ns,
+        .handler_queue_max_ns = s.handler_queue_max_ns,
+        .handler_run_ns = s.handler_run_ns,
+        .handler_run_max_ns = s.handler_run_max_ns,
+        .handler_e2e_ns = s.handler_e2e_ns,
+        .handler_e2e_max_ns = s.handler_e2e_max_ns,
+        .request_bytes = s.request_bytes,
+        .response_bytes = s.response_bytes,
+        .payload_copy_bytes = s.payload_copy_bytes,
+        .payload_clear_bytes = s.payload_clear_bytes,
+        .queue_full = s.queue_full,
+        .queue_empty = s.queue_empty,
+        .admission_waits = s.admission_waits,
+        .admission_timeouts = s.admission_timeouts,
+        .recv_buffer_small = s.recv_buffer_small,
+        .response_search_slots = s.response_search_slots,
+        .stale_drops = s.stale_drops,
+        .lock_contentions = s.lock_contentions,
+        .irq_denied = s.irq_denied,
     };
     return result;
 }
