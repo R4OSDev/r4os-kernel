@@ -9,6 +9,7 @@ const timer = @import("../../kernel/timer.zig");
 const tss = @import("tss.zig");
 const keyboard = @import("../../driver/input/keyboard.zig");
 const mouse = @import("../../driver/input/mouse.zig");
+const ps2_controller = @import("../../driver/input/i8042.zig");
 const k = @import("../../kernel/log.zig");
 const crash = @import("../../kernel/crash.zig");
 const crash_screen = @import("../../kernel/crash_screen.zig");
@@ -185,8 +186,7 @@ pub export fn irqDispatch(frame: *const InterruptFrame) callconv(.c) void {
         timer.PIT_IRQ => {
             request_preempt = scheduler.onTick(timer.onIrq(), r4x.isPreemptibleInstructionPointer(frame.rip));
         },
-        keyboard.IRQ => keyboard.onIrq(),
-        mouse.IRQ => mouse.onIrq(),
+        keyboard.IRQ, mouse.IRQ => ps2_controller.onIrq(irq),
         else => {},
     }
     irq_router.dispatch(irq);

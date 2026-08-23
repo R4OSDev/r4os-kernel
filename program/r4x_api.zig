@@ -1577,6 +1577,7 @@ pub const ProgramIrqTimingInfo = generated.ProgramIrqTimingInfo;
 pub const ProgramDriverWorkPerformanceMetrics = generated.ProgramDriverWorkPerformanceMetrics;
 pub const ProgramDriverWorkPerformanceInfo = generated.ProgramDriverWorkPerformanceInfo;
 pub const ProgramPciInventoryPerformanceInfo = generated.ProgramPciInventoryPerformanceInfo;
+pub const ProgramInputPerformanceInfo = generated.ProgramInputPerformanceInfo;
 pub const pci_inventory_capacity = generated.pci_inventory_capacity;
 pub const pci_inventory_flag_enumerated = generated.pci_inventory_flag_enumerated;
 pub const pci_inventory_flag_ecam = generated.pci_inventory_flag_ecam;

@@ -9,8 +9,7 @@ pub const IRQ: u8 = 1;
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;
 const STATUS_OUTPUT_FULL: u8 = 0x01;
-const STATUS_AUX_DATA: u8 = 0x20;
-const BUFFER_LEN: usize = 64;
+const BUFFER_LEN: usize = 256;
 const MODIFIER_STALE_MS: u64 = 750;
 
 pub const InputHook = *const fn () callconv(.c) u8;
@@ -54,6 +53,9 @@ var scancode_count: u64 = 0;
 var decoded_count: u64 = 0;
 var unmapped_character_count: u64 = 0;
 var layout_fallback_count: u64 = 0;
+var push_attempt_count: u64 = 0;
+var dropped_count: u64 = 0;
+var queue_high_water: u32 = 0;
 
 pub const Stats = struct {
     irq_count: u64,
@@ -61,6 +63,11 @@ pub const Stats = struct {
     decoded_count: u64,
     unmapped_character_count: u64,
     layout_fallback_count: u64,
+    push_attempt_count: u64,
+    dropped_count: u64,
+    queue_capacity: u32,
+    queue_pending: u32,
+    queue_high_water: u32,
     modifiers: u8,
     modifier_stale_resets: u64,
     pending: bool,
@@ -88,16 +95,13 @@ pub fn disable() void {
     drainOutput();
 }
 
-pub fn onIrq() void {
+pub fn noteIrq() void {
     irq_count +%= 1;
-    while ((io.inb(STATUS_PORT) & STATUS_OUTPUT_FULL) != 0) {
-        const status = io.inb(STATUS_PORT);
-        const data = io.inb(DATA_PORT);
-        if ((status & STATUS_AUX_DATA) == 0) {
-            scancode_count +%= 1;
-            handleScancode(data);
-        }
-    }
+}
+
+pub fn onControllerByte(data: u8) void {
+    scancode_count +%= 1;
+    handleScancode(data);
 }
 
 pub fn readChar() ?u8 {
@@ -130,6 +134,11 @@ pub fn stats() Stats {
         .decoded_count = decoded_count,
         .unmapped_character_count = unmapped_character_count,
         .layout_fallback_count = layout_fallback_count,
+        .push_attempt_count = push_attempt_count,
+        .dropped_count = dropped_count,
+        .queue_capacity = BUFFER_LEN - 1,
+        .queue_pending = queuePendingCount(),
+        .queue_high_water = queue_high_water,
         .modifiers = modifierBits(),
         .modifier_stale_resets = modifier_stale_resets,
         .pending = pending(),
@@ -312,13 +321,23 @@ fn handleScancode(scancode: u8) void {
 }
 
 fn push(codepoint: u32) void {
+    push_attempt_count +%= 1;
     const next = (head + 1) % BUFFER_LEN;
-    if (next == tail) return;
+    if (next == tail) {
+        dropped_count +%= 1;
+        return;
+    }
     buf[head] = codepoint;
     head = next;
     decoded_count +%= 1;
+    const queued = queuePendingCount();
+    if (queued > queue_high_water) queue_high_water = queued;
     // 0.56.28: Desktop-Aktivitaets-Event (weckt desktopActivityWait).
     desktop_events.signal();
+}
+
+fn queuePendingCount() u32 {
+    return @intCast(if (head >= tail) head - tail else BUFFER_LEN - tail + head);
 }
 
 fn drainOutput() void {

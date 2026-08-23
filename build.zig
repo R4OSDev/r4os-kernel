@@ -166,6 +166,7 @@ pub fn build(b: *std.Build) void {
         "bootscreen_tests.zig",
         "display/console_scroll_buffer.zig",
         "display/framebuffer.zig",
+        "input_controller_tests.zig",
         "driver/input/key_layout.zig",
         "driver/usb/usb_boot_timing.zig",
         "driver/usb/usb_msc_retry.zig",

@@ -10,7 +10,6 @@ const COMMAND_PORT: u16 = 0x64;
 
 const STATUS_OUTPUT_FULL: u8 = 0x01;
 const STATUS_INPUT_FULL: u8 = 0x02;
-const STATUS_AUX_DATA: u8 = 0x20;
 
 const CMD_READ_CONFIG: u8 = 0x20;
 const CMD_WRITE_CONFIG: u8 = 0x60;
@@ -124,17 +123,13 @@ pub fn disable() void {
     button_press_latch = 0;
 }
 
-pub fn onIrq() void {
+pub fn noteIrq() void {
     irq_count +%= 1;
-    var guard: u32 = 0;
-    while (guard < 16) : (guard += 1) {
-        const status = io.inb(STATUS_PORT);
-        if ((status & STATUS_OUTPUT_FULL) == 0) break;
-        const data = io.inb(DATA_PORT);
-        if ((status & STATUS_AUX_DATA) == 0) continue;
-        bytes_received +%= 1;
-        handleByte(data);
-    }
+}
+
+pub fn onControllerByte(data: u8) void {
+    bytes_received +%= 1;
+    handleByte(data);
 }
 
 pub fn snapshot() State {

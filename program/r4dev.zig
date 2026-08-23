@@ -40,6 +40,8 @@ const driver_work = @import("../kernel/driver_work.zig");
 const kernel_version = @import("../kernel/version.zig");
 const irq_router = @import("../kernel/irq_router.zig");
 const time_core = @import("../platform/time.zig");
+const ps2_controller = @import("../driver/input/i8042.zig");
+const keyboard = @import("../driver/input/keyboard.zig");
 
 pub const name = "R4DEV";
 
@@ -51,6 +53,7 @@ pub const ProgramIrqTimingInfo = r4x_api.ProgramIrqTimingInfo;
 pub const ProgramDriverWorkPerformanceMetrics = r4x_api.ProgramDriverWorkPerformanceMetrics;
 pub const ProgramDriverWorkPerformanceInfo = r4x_api.ProgramDriverWorkPerformanceInfo;
 pub const ProgramPciInventoryPerformanceInfo = r4x_api.ProgramPciInventoryPerformanceInfo;
+pub const ProgramInputPerformanceInfo = r4x_api.ProgramInputPerformanceInfo;
 
 pub const ProgramMemoryBlockInfo = r4x_api.ProgramMemoryBlockInfo;
 
@@ -475,12 +478,14 @@ pub const ProgramInstanceStorageSelfTestProvider = *const fn (*ProgramInstanceSt
 pub const ProgramRegistrySummaryProvider = *const fn (*ProgramRegistrySummaryV2) void;
 pub const ProgramRegistrySelfTestProvider = *const fn (*ProgramRegistrySelfTestResultV2) i32;
 pub const ExecutionInventorySummaryProvider = *const fn (*ProgramInventorySummary) i32;
+pub const InputPerformanceProvider = *const fn (*ProgramInputPerformanceInfo) void;
 
 var program_instance_storage_summary_provider: ?ProgramInstanceStorageSummaryProvider = null;
 var program_instance_storage_self_test_provider: ?ProgramInstanceStorageSelfTestProvider = null;
 var program_registry_summary_provider: ?ProgramRegistrySummaryProvider = null;
 var program_registry_self_test_provider: ?ProgramRegistrySelfTestProvider = null;
 var execution_inventory_summary_provider: ?ExecutionInventorySummaryProvider = null;
+var input_performance_provider: ?InputPerformanceProvider = null;
 
 // Boot-time provider seams keep R4DEV independent from r4x.zig. Providers are
 // installed before the R4DEV table is published and remain immutable at runtime.
@@ -502,6 +507,10 @@ pub fn setProgramRegistrySelfTestProvider(provider: ?ProgramRegistrySelfTestProv
 
 pub fn setExecutionInventorySummaryProvider(provider: ?ExecutionInventorySummaryProvider) void {
     execution_inventory_summary_provider = provider;
+}
+
+pub fn setInputPerformanceProvider(provider: ?InputPerformanceProvider) void {
+    input_performance_provider = provider;
 }
 
 pub const ProgramTaskPerformanceInfo = r4x_api.ProgramTaskPerformanceInfo;
@@ -2574,6 +2583,29 @@ pub fn performancePciInventory(out: *ProgramPciInventoryPerformanceInfo) callcon
     }
     out.* = @bitCast(pci_inventory.performance());
     return if (pci_inventory.status().enumerated) 1 else 0;
+}
+
+pub fn performanceInput(out: *ProgramInputPerformanceInfo) callconv(.c) i32 {
+    const controller = ps2_controller.stats();
+    const keys = keyboard.stats();
+    out.* = .{
+        .keyboard_queue_capacity = keys.queue_capacity,
+        .keyboard_queue_pending = keys.queue_pending,
+        .keyboard_queue_high_water = keys.queue_high_water,
+        .i8042_irq1_count = controller.irq1_count,
+        .i8042_irq12_count = controller.irq12_count,
+        .i8042_byte_count = controller.byte_count,
+        .i8042_keyboard_byte_count = controller.keyboard_byte_count,
+        .i8042_mouse_byte_count = controller.mouse_byte_count,
+        .i8042_keyboard_bytes_on_irq12 = controller.keyboard_bytes_on_irq12,
+        .i8042_mouse_bytes_on_irq1 = controller.mouse_bytes_on_irq1,
+        .i8042_drain_limit_hits = controller.drain_limit_hits,
+        .keyboard_push_attempts = keys.push_attempt_count,
+        .keyboard_accepted = keys.decoded_count,
+        .keyboard_dropped = keys.dropped_count,
+    };
+    if (input_performance_provider) |provider| provider(out);
+    return 1;
 }
 
 pub fn performanceIrqTiming(irq: u32, out: *ProgramIrqTimingInfo) callconv(.c) i32 {

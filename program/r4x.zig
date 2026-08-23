@@ -124,8 +124,8 @@ const PROGRAM_REGISTRY_PRESSURE_SHRINK_HYSTERESIS: u64 = 8;
 const MAX_ASYNC_IO_REQUESTS: usize = 64;
 const ASYNC_IO_SYNC_CLOSE_RETRY_LIMIT: u32 = 64;
 const ASYNC_IO_RETIRE_RETRY_TEST_ATTEMPTS: u32 = ASYNC_IO_SYNC_CLOSE_RETRY_LIMIT + 1;
-const INPUT_QUEUE_SIZE: usize = 64;
-const GUI_EVENT_QUEUE_SIZE: usize = 16;
+const INPUT_QUEUE_SIZE: usize = 4096;
+const GUI_EVENT_QUEUE_SIZE: usize = 64;
 const GUI_EVENT_KIND_MOUSE_MOVE: u32 = 5;
 const GUI_EVENT_KIND_FONT_CHANGED: u32 = 7;
 const GUI_TEXT_SIZE: usize = 512;
@@ -775,6 +775,7 @@ const ProgramConsolePayload = struct {
     input_queue: [INPUT_QUEUE_SIZE]u8 = .{0} ** INPUT_QUEUE_SIZE,
     input_head: usize = 0,
     input_tail: usize = 0,
+    input_high_water: u32 = 0,
     output_len: usize = 0,
     revision: u32 = 0,
     host: ConsoleHostKind = .none,
@@ -875,6 +876,7 @@ const ProgramGuiPayload = struct {
     events: [GUI_EVENT_QUEUE_SIZE]GuiEvent = .{GuiEvent{}} ** GUI_EVENT_QUEUE_SIZE,
     event_head: usize = 0,
     event_tail: usize = 0,
+    event_high_water: u32 = 0,
     text: [GUI_TEXT_SIZE]u8 = .{0} ** GUI_TEXT_SIZE,
     font_id: u32 = GUI_FONT_BUILTIN_ID,
     title: [GUI_TITLE_SIZE]u8 = .{0} ** GUI_TITLE_SIZE,
@@ -1059,9 +1061,13 @@ const PROGRAM_RUNTIME_PAYLOAD_MAX_BYTES: usize = 2112;
 // instance; only the budget follows the contract growth.
 const PROGRAM_PROCESS_PAYLOAD_MAX_BYTES: usize = 448 - 128 + drive.MAX_PATH;
 const PROGRAM_ENVIRONMENT_PAYLOAD_MAX_BYTES: usize = 2112;
-const PROGRAM_CONSOLE_PAYLOAD_MAX_BYTES: usize = 256;
+// 0.69.18: the bounded 4095-byte console queue accepts one complete maximum
+// clipboard transfer without per-byte registry and reaper work.
+const PROGRAM_CONSOLE_PAYLOAD_MAX_BYTES: usize = 8 * 1024;
 const PROGRAM_CONSOLE_OUTPUT_PAYLOAD_MAX_BYTES: usize = 17 * 1024;
-const PROGRAM_GUI_PAYLOAD_MAX_BYTES: usize = 2 * 1024;
+// 0.69.18: 63 GUI events absorb ordinary focus/key/button bursts while
+// mouse moves are still coalesced inside the bounded per-instance payload.
+const PROGRAM_GUI_PAYLOAD_MAX_BYTES: usize = 8 * 1024;
 const PROGRAM_GUI_FRAME_PAYLOAD_MAX_BYTES: usize = 256;
 const PROGRAM_GUI_COMMAND_NODE_BUDGET_BYTES: usize = 31 * 1024;
 const PROGRAM_GUI_COMMAND_NODE_MAX_BYTES: usize = @sizeOf(ProgramGuiCommandPayload) + GUI_COMMAND_BLOCK_TARGET_CAPACITY * @sizeOf(ProgramGuiCommand);
@@ -1074,9 +1080,9 @@ comptime {
     if (@sizeOf(ProgramRuntimePayload) > PROGRAM_RUNTIME_PAYLOAD_MAX_BYTES) @compileError("ProgramRuntimePayload exceeds 2112-byte 0.61.13 budget");
     if (@sizeOf(ProgramProcessPayload) > PROGRAM_PROCESS_PAYLOAD_MAX_BYTES) @compileError("ProgramProcessPayload exceeds the 0.59.7 budget (448 base + 0.60.19 CWD growth)");
     if (@sizeOf(ProgramEnvironmentPayload) > PROGRAM_ENVIRONMENT_PAYLOAD_MAX_BYTES) @compileError("ProgramEnvironmentPayload exceeds 2112-byte 0.59.7 budget");
-    if (@sizeOf(ProgramConsolePayload) > PROGRAM_CONSOLE_PAYLOAD_MAX_BYTES) @compileError("ProgramConsolePayload exceeds 256-byte 0.59.7 budget");
+    if (@sizeOf(ProgramConsolePayload) > PROGRAM_CONSOLE_PAYLOAD_MAX_BYTES) @compileError("ProgramConsolePayload exceeds the 8-KB 0.69.18 budget");
     if (@sizeOf(ProgramConsoleOutputPayload) > PROGRAM_CONSOLE_OUTPUT_PAYLOAD_MAX_BYTES) @compileError("ProgramConsoleOutputPayload exceeds 17-KB 0.59.7 budget");
-    if (@sizeOf(ProgramGuiPayload) > PROGRAM_GUI_PAYLOAD_MAX_BYTES) @compileError("ProgramGuiPayload exceeds 2-KB 0.59.7 budget");
+    if (@sizeOf(ProgramGuiPayload) > PROGRAM_GUI_PAYLOAD_MAX_BYTES) @compileError("ProgramGuiPayload exceeds the 8-KB 0.69.18 budget");
     if (@sizeOf(ProgramGuiFramePayload) > PROGRAM_GUI_FRAME_PAYLOAD_MAX_BYTES) @compileError("ProgramGuiFramePayload exceeds 256-byte budget");
     if (PROGRAM_GUI_COMMAND_NODE_MAX_BYTES > PROGRAM_GUI_COMMAND_NODE_BUDGET_BYTES) @compileError("ProgramGuiCommandPayload node exceeds 31-KB budget");
     if (@sizeOf(ProgramGuiCommandPayload) % @alignOf(ProgramGuiCommand) != 0) @compileError("ProgramGuiCommandPayload trailing commands are not aligned");
@@ -4139,6 +4145,20 @@ var next_exit_sequence: u64 = 1;
 var last_exit_sequence: u64 = 0;
 var next_instance_id: u32 = 1;
 
+var gui_event_push_attempts: u64 = 0;
+var gui_event_accepted: u64 = 0;
+var gui_mouse_move_coalesced: u64 = 0;
+var gui_mouse_move_evicted: u64 = 0;
+var gui_event_rejected: u64 = 0;
+var console_input_push_calls: u64 = 0;
+var console_input_batch_calls: u64 = 0;
+var console_input_bytes_attempted: u64 = 0;
+var console_input_bytes_accepted: u64 = 0;
+var console_input_full_events: u64 = 0;
+var program_launch_attempts: u64 = 0;
+var program_entries_started: u64 = 0;
+var program_attach_wait_events: u64 = 0;
+
 pub const ProgramLifecycleFailurePhase = enum(u8) {
     none = 0,
     completion_reserve = 1,
@@ -5298,6 +5318,7 @@ fn configureR4XStartR4DeskTable() void {
         .program_spawn_with_console_host = &apiProgramSpawnWithConsoleHost,
         .program_spawn_with_console_host_handle = &apiProgramSpawnWithConsoleHostHandle,
         .program_set_window_handle = &apiProgramSetWindowHandle,
+        .console_push_input = &apiConsolePushInput,
     });
 }
 
@@ -5655,12 +5676,64 @@ fn runProgramRegistrySelfTestProvider(out: *r4api.r4dev.ProgramRegistrySelfTestR
     return result;
 }
 
+fn fillInputPerformanceInfo(out: *r4api.r4dev.ProgramInputPerformanceInfo) void {
+    var gui_pending: u64 = 0;
+    var console_pending: u64 = 0;
+    var gui_active: u32 = 0;
+    var console_active: u32 = 0;
+    var gui_high_water: u32 = 0;
+    var console_high_water: u32 = 0;
+    var attach_pending: u32 = 0;
+
+    if (lockProgramRegistry()) {
+        var iterator = programRegistryIterator(false);
+        while (iterator.next()) |instance| {
+            if (instance.gui_payload) |gui| {
+                gui_active +|= 1;
+                gui_pending +|= guiEventPendingCount(gui);
+                gui_high_water = @max(gui_high_water, gui.event_high_water);
+                if (gui.start_attach_pending) attach_pending +|= 1;
+            }
+            if (instance.console_payload) |console| {
+                console_active +|= 1;
+                console_pending +|= console.state.stdin_pending;
+                console_high_water = @max(console_high_water, console.input_high_water);
+            }
+        }
+        unlockProgramRegistry();
+    }
+
+    out.gui_queue_capacity = @intCast(GUI_EVENT_QUEUE_SIZE - 1);
+    out.gui_queue_pending = @intCast(@min(gui_pending, std.math.maxInt(u32)));
+    out.gui_queue_high_water = gui_high_water;
+    out.gui_queue_active = gui_active;
+    out.console_queue_capacity = @intCast(INPUT_QUEUE_SIZE - 1);
+    out.console_queue_pending = @intCast(@min(console_pending, std.math.maxInt(u32)));
+    out.console_queue_high_water = console_high_water;
+    out.console_queue_active = console_active;
+    out.program_start_attach_pending = attach_pending;
+    out.gui_push_attempts = gui_event_push_attempts;
+    out.gui_accepted = gui_event_accepted;
+    out.gui_mouse_move_coalesced = gui_mouse_move_coalesced;
+    out.gui_mouse_move_evicted = gui_mouse_move_evicted;
+    out.gui_rejected = gui_event_rejected;
+    out.console_push_calls = console_input_push_calls;
+    out.console_batch_calls = console_input_batch_calls;
+    out.console_bytes_attempted = console_input_bytes_attempted;
+    out.console_bytes_accepted = console_input_bytes_accepted;
+    out.console_full_events = console_input_full_events;
+    out.program_launch_attempts = program_launch_attempts;
+    out.program_entries_started = program_entries_started;
+    out.program_attach_wait_events = program_attach_wait_events;
+}
+
 fn configureR4XStartR4DevTable() void {
     r4api.r4dev.setProgramInstanceStorageSummaryProvider(&fillProgramInstanceStorageSummary);
     r4api.r4dev.setProgramInstanceStorageSelfTestProvider(&runProgramInstanceStorageSelfTestProvider);
     r4api.r4dev.setProgramRegistrySummaryProvider(&fillProgramRegistrySummary);
     r4api.r4dev.setProgramRegistrySelfTestProvider(&runProgramRegistrySelfTestProvider);
     r4api.r4dev.setExecutionInventorySummaryProvider(&fillExecutionInventorySummaryProvider);
+    r4api.r4dev.setInputPerformanceProvider(&fillInputPerformanceInfo);
     r4xstart_r4dev_table = r4x_api.buildR4DevTable(.{
         .device_inventory_summary = &r4api.r4dev.deviceInventorySummary,
         .device_inventory_record = &r4api.r4dev.deviceInventoryRecord,
@@ -5701,6 +5774,7 @@ fn configureR4XStartR4DevTable() void {
         .performance_boot_summary = &r4api.r4dev.performanceBootSummary,
         .performance_driver_work = &r4api.r4dev.performanceDriverWork,
         .performance_pci_inventory = &r4api.r4dev.performancePciInventory,
+        .performance_input = &r4api.r4dev.performanceInput,
     });
 }
 
@@ -5951,6 +6025,7 @@ fn programSpawnTransactionCancelled() bool {
 }
 
 fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: []const u8, working_drive: *drive.Drive, shell_host: ConsoleHostKind, options: ProgramLaunchOptions) RunResult {
+    program_launch_attempts +%= 1;
     configureApiGroups();
     setProgramLaunchError(options, PROGRAM_HANDLE_OK);
     const spawn_thread = currentProgramThread();
@@ -7521,6 +7596,7 @@ fn programTaskMain() callconv(.c) void {
     // receives the process handle and then attaches its window slot. Do not let
     // user code observe the intermediate, unhosted state. Other launch modes
     // never set this flag and retain their established start behaviour.
+    if (run.app_class == .gui and guiPayloadConst(run).start_attach_pending) program_attach_wait_events +%= 1;
     while (run.app_class == .gui and guiPayloadConst(run).start_attach_pending) {
         if (run.close_requested) break;
         scheduler.yield();
@@ -7585,6 +7661,7 @@ fn callInstanceEntry(run: *ProgramInstance) i32 {
     const entry = normalizeThreadEntry(run, run.entry) orelse return THREAD_ERROR_INVALID;
     run.entry = entry;
     prepareR4XStartContext(run);
+    program_entries_started +%= 1;
     return r4os_call_program(entry, @intFromPtr(&runtimePayload(run).r4xstart_context), run.stack_top);
 }
 
@@ -10946,25 +11023,60 @@ fn apiGuiPushEvent(id: u32, event: *const GuiEvent) callconv(.c) i32 {
 }
 
 fn enqueueGuiEvent(gui: *ProgramGuiPayload, event: *const GuiEvent) i32 {
-    if (event.kind == GUI_EVENT_KIND_MOUSE_MOVE and gui.event_head != gui.event_tail) {
-        const previous_tail = if (gui.event_tail == 0) gui.events.len - 1 else gui.event_tail - 1;
-        if (gui.events[previous_tail].kind == GUI_EVENT_KIND_MOUSE_MOVE) {
-            gui.events[previous_tail] = event.*;
-            return 0;
+    gui_event_push_attempts +%= 1;
+
+    // Pointer events carry their own coordinates. Removing an older move and
+    // appending the newest one therefore preserves all ordering-sensitive
+    // events between them while bounding move traffic to one queued sample.
+    if (event.kind == GUI_EVENT_KIND_MOUSE_MOVE) {
+        if (findQueuedGuiMouseMove(gui)) |index| {
+            removeQueuedGuiEvent(gui, index);
+            gui_mouse_move_coalesced +%= 1;
         }
     }
 
     const next_tail = (gui.event_tail + 1) % GUI_EVENT_QUEUE_SIZE;
     if (next_tail == gui.event_head) {
-        if (gui.events[gui.event_head].kind == GUI_EVENT_KIND_MOUSE_MOVE) {
-            gui.event_head = (gui.event_head + 1) % GUI_EVENT_QUEUE_SIZE;
+        if (findQueuedGuiMouseMove(gui)) |index| {
+            removeQueuedGuiEvent(gui, index);
+            gui_mouse_move_evicted +%= 1;
         } else {
+            gui_event_rejected +%= 1;
             return -3;
         }
     }
     gui.events[gui.event_tail] = event.*;
     gui.event_tail = (gui.event_tail + 1) % GUI_EVENT_QUEUE_SIZE;
+    gui_event_accepted +%= 1;
+    const pending = guiEventPendingCount(gui);
+    if (pending > gui.event_high_water) gui.event_high_water = pending;
     return 0;
+}
+
+fn findQueuedGuiMouseMove(gui: *const ProgramGuiPayload) ?usize {
+    var index = gui.event_head;
+    while (index != gui.event_tail) : (index = (index + 1) % GUI_EVENT_QUEUE_SIZE) {
+        if (gui.events[index].kind == GUI_EVENT_KIND_MOUSE_MOVE) return index;
+    }
+    return null;
+}
+
+fn removeQueuedGuiEvent(gui: *ProgramGuiPayload, remove_index: usize) void {
+    var index = remove_index;
+    while (true) {
+        const next = (index + 1) % GUI_EVENT_QUEUE_SIZE;
+        if (next == gui.event_tail) break;
+        gui.events[index] = gui.events[next];
+        index = next;
+    }
+    gui.event_tail = if (gui.event_tail == 0) GUI_EVENT_QUEUE_SIZE - 1 else gui.event_tail - 1;
+}
+
+fn guiEventPendingCount(gui: *const ProgramGuiPayload) u32 {
+    return @intCast(if (gui.event_tail >= gui.event_head)
+        gui.event_tail - gui.event_head
+    else
+        GUI_EVENT_QUEUE_SIZE - gui.event_head + gui.event_tail);
 }
 
 /// Font ids are a live catalogue view.  A reload therefore sends every
@@ -12432,18 +12544,47 @@ fn apiConsoleSetMetrics(id: u32, cols: u32, rows: u32) callconv(.c) i32 {
 }
 
 fn apiConsolePushKey(id: u32, key: u8) callconv(.c) i32 {
+    console_input_push_calls +%= 1;
     reapFinishedInstances();
-    const instance = instanceById(id) orelse return -1;
+    const lease = pinProgramInstance(id) orelse return -1;
+    defer unpinProgramInstance(&lease);
+    const instance = lease.instance;
     if (instance.done) return -2;
     if (instance.app_class != .console) return -3;
+    const data = [_]u8{key};
+    return if (pushConsoleInput(instance, data[0..]) == 1) 0 else -4;
+}
+
+fn apiConsolePushInput(id: u32, data: [*]const u8, length: u32) callconv(.c) i32 {
+    console_input_push_calls +%= 1;
+    console_input_batch_calls +%= 1;
+    if (@intFromPtr(data) == 0) return -5;
+    reapFinishedInstances();
+    const lease = pinProgramInstance(id) orelse return -1;
+    defer unpinProgramInstance(&lease);
+    const instance = lease.instance;
+    if (instance.done) return -2;
+    if (instance.app_class != .console) return -3;
+    return @intCast(pushConsoleInput(instance, data[0..@as(usize, @intCast(length))]));
+}
+
+fn pushConsoleInput(instance: *ProgramInstance, data: []const u8) usize {
     const console = consolePayload(instance);
-    const next_head = (console.input_head + 1) % INPUT_QUEUE_SIZE;
-    if (next_head == console.input_tail) return -4;
-    console.input_queue[console.input_head] = key;
-    console.input_head = next_head;
-    console.state.stdin_bytes +%= 1;
+    console_input_bytes_attempted +%= @as(u64, @intCast(data.len));
+    var accepted: usize = 0;
+    while (accepted < data.len) : (accepted += 1) {
+        const next_head = (console.input_head + 1) % INPUT_QUEUE_SIZE;
+        if (next_head == console.input_tail) break;
+        console.input_queue[console.input_head] = data[accepted];
+        console.input_head = next_head;
+    }
+    if (accepted != data.len) console_input_full_events +%= 1;
+    if (accepted == 0) return 0;
+    console_input_bytes_accepted +%= @as(u64, @intCast(accepted));
+    console.state.stdin_bytes +%= @as(u32, @intCast(accepted));
     updateConsoleInputPending(instance);
-    return 0;
+    if (console.state.stdin_pending > console.input_high_water) console.input_high_water = console.state.stdin_pending;
+    return accepted;
 }
 
 fn apiConsoleWrite(stream_raw: u32, data: [*]const u8, len: u32) callconv(.c) i32 {
