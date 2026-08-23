@@ -2,6 +2,7 @@ pub const CAPACITY: usize = 256;
 
 pub const TRANSFER_EVENT_TYPE: u8 = 32;
 pub const COMMAND_COMPLETION_EVENT_TYPE: u8 = 33;
+pub const PORT_STATUS_CHANGE_EVENT_TYPE: u8 = 34;
 pub const EVENT_DATA_BIT: u32 = 1 << 2;
 pub const MAX_TRANSFER_TRB_POINTERS: usize = 3;
 
@@ -25,7 +26,124 @@ pub const Event = struct {
         if (self.event_type != TRANSFER_EVENT_TYPE and self.event_type != COMMAND_COMPLETION_EVENT_TYPE) return null;
         return normalizeTrbPointer(self.parameter);
     }
+
+    pub fn portId(self: Event) ?u8 {
+        if (self.event_type != PORT_STATUS_CHANGE_EVENT_TYPE) return null;
+        return @truncate(self.parameter >> 24);
+    }
 };
+
+pub const PortAction = enum {
+    acknowledge,
+    remove,
+    enumerate,
+    replace,
+};
+
+pub fn decidePortAction(has_runtime: bool, connected: bool, connection_changed: bool) PortAction {
+    if (connection_changed and has_runtime) return if (connected) .replace else .remove;
+    if (!connected) return if (has_runtime) .remove else .acknowledge;
+    if (!has_runtime) return .enumerate;
+    return .acknowledge;
+}
+
+pub const PortChangeSnapshot = struct {
+    pending_mask: u16 = 0,
+    pending: u8 = 0,
+    events: u64 = 0,
+    queued: u64 = 0,
+    coalesced: u64 = 0,
+    invalid: u64 = 0,
+    taken: u64 = 0,
+    retries: u64 = 0,
+    high_water: u8 = 0,
+};
+
+pub const PortChanges = struct {
+    pending_mask: u16 = 0,
+    events: u64 = 0,
+    queued: u64 = 0,
+    coalesced: u64 = 0,
+    invalid: u64 = 0,
+    taken: u64 = 0,
+    retries: u64 = 0,
+    high_water: u8 = 0,
+
+    pub fn init() PortChanges {
+        return .{};
+    }
+
+    pub fn reset(self: *PortChanges) void {
+        self.* = .{};
+    }
+
+    // Returns true for every Port Status Change Event, including malformed
+    // port IDs. Callers must not feed a consumed port event into the generic
+    // stale-event path merely because the ID is unusable.
+    pub fn route(self: *PortChanges, event: Event, max_ports: u8) bool {
+        const port = event.portId() orelse return false;
+        self.events +%= 1;
+        if (port == 0 or port > max_ports or port > 16) {
+            self.invalid +%= 1;
+            return true;
+        }
+
+        const shift: u4 = @intCast(port - 1);
+        const bit = @as(u16, 1) << shift;
+        if ((self.pending_mask & bit) != 0) {
+            self.coalesced +%= 1;
+            return true;
+        }
+        self.pending_mask |= bit;
+        self.queued +%= 1;
+        const count = maskCount(self.pending_mask);
+        if (count > self.high_water) self.high_water = count;
+        return true;
+    }
+
+    pub fn takeNext(self: *PortChanges) ?u8 {
+        var index: u5 = 0;
+        while (index < 16) : (index += 1) {
+            const shift: u4 = @intCast(index);
+            const bit = @as(u16, 1) << shift;
+            if ((self.pending_mask & bit) == 0) continue;
+            self.pending_mask &= ~bit;
+            self.taken +%= 1;
+            return @intCast(index + 1);
+        }
+        return null;
+    }
+
+    pub fn retry(self: *PortChanges, port: u8) void {
+        if (port == 0 or port > 16) return;
+        const shift: u4 = @intCast(port - 1);
+        self.pending_mask |= @as(u16, 1) << shift;
+        self.retries +%= 1;
+    }
+
+    pub fn snapshot(self: *const PortChanges) PortChangeSnapshot {
+        return .{
+            .pending_mask = self.pending_mask,
+            .pending = maskCount(self.pending_mask),
+            .events = self.events,
+            .queued = self.queued,
+            .coalesced = self.coalesced,
+            .invalid = self.invalid,
+            .taken = self.taken,
+            .retries = self.retries,
+            .high_water = self.high_water,
+        };
+    }
+};
+
+fn maskCount(mask: u16) u8 {
+    var value = mask;
+    var count: u8 = 0;
+    while (value != 0) : (value >>= 1) {
+        if ((value & 1) != 0) count += 1;
+    }
+    return count;
+}
 
 pub const TransferMatch = struct {
     slot_id: u8,
@@ -455,6 +573,64 @@ test "purge helpers preserve unrelated event order and counters" {
     const command = mailbox.take(commandMatch(0x4000)) orelse return error.CommandOrderWasLost;
     try testing.expectEqual(@as(u64, 0x4000), command.parameter);
     try testing.expectEqual(@as(u64, 2), mailbox.snapshot().purged);
+}
+
+test "port-change burst is retained per port and coalesced visibly" {
+    const testing = @import("std").testing;
+    var changes = PortChanges.init();
+
+    var index: usize = 0;
+    while (index < 512) : (index += 1) {
+        const port: u8 = @intCast((index % 4) + 1);
+        try testing.expect(changes.route(.{
+            .event_type = PORT_STATUS_CHANGE_EVENT_TYPE,
+            .code = 1,
+            .parameter = @as(u64, port) << 24,
+        }, 8));
+    }
+
+    const burst = changes.snapshot();
+    try testing.expectEqual(@as(u8, 4), burst.pending);
+    try testing.expectEqual(@as(u64, 512), burst.events);
+    try testing.expectEqual(@as(u64, 4), burst.queued);
+    try testing.expectEqual(@as(u64, 508), burst.coalesced);
+    try testing.expectEqual(@as(u8, 4), burst.high_water);
+
+    try testing.expectEqual(@as(u8, 1), changes.takeNext() orelse return error.MissingPortOne);
+    try testing.expectEqual(@as(u8, 2), changes.takeNext() orelse return error.MissingPortTwo);
+    try testing.expectEqual(@as(u8, 3), changes.takeNext() orelse return error.MissingPortThree);
+    try testing.expectEqual(@as(u8, 4), changes.takeNext() orelse return error.MissingPortFour);
+    try testing.expect(changes.takeNext() == null);
+    try testing.expectEqual(@as(u64, 4), changes.snapshot().taken);
+}
+
+test "malformed port event is handled but never becomes generic stale work" {
+    const testing = @import("std").testing;
+    var changes = PortChanges.init();
+
+    try testing.expect(changes.route(.{
+        .event_type = PORT_STATUS_CHANGE_EVENT_TYPE,
+        .parameter = @as(u64, 9) << 24,
+    }, 8));
+    try testing.expect(!changes.route(.{
+        .event_type = TRANSFER_EVENT_TYPE,
+        .parameter = @as(u64, 1) << 24,
+    }, 8));
+
+    const snapshot = changes.snapshot();
+    try testing.expectEqual(@as(u64, 1), snapshot.events);
+    try testing.expectEqual(@as(u64, 1), snapshot.invalid);
+    try testing.expectEqual(@as(u8, 0), snapshot.pending);
+}
+
+test "port lifecycle decision distinguishes replace from harmless changes" {
+    const testing = @import("std").testing;
+    try testing.expectEqual(PortAction.enumerate, decidePortAction(false, true, true));
+    try testing.expectEqual(PortAction.replace, decidePortAction(true, true, true));
+    try testing.expectEqual(PortAction.remove, decidePortAction(true, false, true));
+    try testing.expectEqual(PortAction.remove, decidePortAction(true, false, false));
+    try testing.expectEqual(PortAction.acknowledge, decidePortAction(true, true, false));
+    try testing.expectEqual(PortAction.acknowledge, decidePortAction(false, false, true));
 }
 
 test "router self test" {

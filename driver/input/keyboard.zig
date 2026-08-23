@@ -1,6 +1,7 @@
 const io = @import("../../arch/x86_64/io.zig");
 const desktop_events = @import("../../kernel/desktop_events.zig");
 const key_layout = @import("key_layout.zig");
+const codepoint_queue = @import("codepoint_queue.zig");
 const pic = @import("../../arch/x86_64/pic.zig");
 const time_core = @import("../../platform/time.zig");
 
@@ -9,7 +10,6 @@ pub const IRQ: u8 = 1;
 const DATA_PORT: u16 = 0x60;
 const STATUS_PORT: u16 = 0x64;
 const STATUS_OUTPUT_FULL: u8 = 0x01;
-const BUFFER_LEN: usize = 256;
 const MODIFIER_STALE_MS: u64 = 750;
 
 pub const InputHook = *const fn () callconv(.c) u8;
@@ -34,9 +34,7 @@ pub const KEY_DELETE: u8 = 0x7F;
 
 pub const Layout = key_layout.Layout;
 
-var buf: [BUFFER_LEN]u32 = .{0} ** BUFFER_LEN;
-var head: usize = 0;
-var tail: usize = 0;
+var queue = codepoint_queue.Queue.init();
 var shift_down = false;
 var ctrl_down = false;
 var alt_down = false;
@@ -53,9 +51,6 @@ var scancode_count: u64 = 0;
 var decoded_count: u64 = 0;
 var unmapped_character_count: u64 = 0;
 var layout_fallback_count: u64 = 0;
-var push_attempt_count: u64 = 0;
-var dropped_count: u64 = 0;
-var queue_high_water: u32 = 0;
 
 pub const Stats = struct {
     irq_count: u64,
@@ -83,8 +78,7 @@ pub fn init() void {
 
 pub fn disable() void {
     pic.mask(IRQ);
-    head = 0;
-    tail = 0;
+    queue.clear();
     shift_down = false;
     ctrl_down = false;
     alt_down = false;
@@ -117,28 +111,34 @@ pub fn readCodepoint() ?u32 {
         const hooked = hook();
         if (hooked != 0) return hooked;
     }
-    if (head == tail) return null;
-    const codepoint = buf[tail];
-    tail = (tail + 1) % BUFFER_LEN;
-    return codepoint;
+    return queue.pop();
 }
 
 pub fn pending() bool {
-    return head != tail;
+    return queue.pending();
+}
+
+pub fn queueFreeCount() u32 {
+    return queue.freeCount();
+}
+
+pub fn canAccept(count: u32) bool {
+    return queue.canAccept(count);
 }
 
 pub fn stats() Stats {
+    const queue_stats = queue.snapshot();
     return .{
         .irq_count = irq_count,
         .scancode_count = scancode_count,
         .decoded_count = decoded_count,
         .unmapped_character_count = unmapped_character_count,
         .layout_fallback_count = layout_fallback_count,
-        .push_attempt_count = push_attempt_count,
-        .dropped_count = dropped_count,
-        .queue_capacity = BUFFER_LEN - 1,
-        .queue_pending = queuePendingCount(),
-        .queue_high_water = queue_high_water,
+        .push_attempt_count = queue_stats.push_attempts,
+        .dropped_count = queue_stats.dropped,
+        .queue_capacity = codepoint_queue.CAPACITY,
+        .queue_pending = queue_stats.pending,
+        .queue_high_water = queue_stats.high_water,
         .modifiers = modifierBits(),
         .modifier_stale_resets = modifier_stale_resets,
         .pending = pending(),
@@ -321,23 +321,10 @@ fn handleScancode(scancode: u8) void {
 }
 
 fn push(codepoint: u32) void {
-    push_attempt_count +%= 1;
-    const next = (head + 1) % BUFFER_LEN;
-    if (next == tail) {
-        dropped_count +%= 1;
-        return;
-    }
-    buf[head] = codepoint;
-    head = next;
+    if (!queue.tryPush(codepoint)) return;
     decoded_count +%= 1;
-    const queued = queuePendingCount();
-    if (queued > queue_high_water) queue_high_water = queued;
     // 0.56.28: Desktop-Aktivitaets-Event (weckt desktopActivityWait).
     desktop_events.signal();
-}
-
-fn queuePendingCount() u32 {
-    return @intCast(if (head >= tail) head - tail else BUFFER_LEN - tail + head);
 }
 
 fn drainOutput() void {

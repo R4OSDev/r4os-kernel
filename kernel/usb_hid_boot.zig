@@ -303,10 +303,12 @@ fn dumpStatusToBootlog() void {
     bootlog.puts("\r\n");
 }
 
-// 0.56.17: Autonomen Input-Poll-Task starten - nur wenn USB-HID aktiv
-// gebunden ist (ohne Bindings kein Task-Slot-Verbrauch). Aufruf aus
-// main.zig NACH initTaskRuntime.
+// Runtime-Tasks erst nach initTaskRuntime starten: Der controller-eigene
+// Porttask bleibt auch ohne Boot-HID aktiv, damit Hotplug-Events den Eventring
+// nicht fuellen und neue Geraete autonom in den USB-Katalog gelangen. Der
+// HID-Poller bleibt an eine tatsaechliche Bindung gekoppelt.
 pub fn startPollTask() bool {
+    if (!xhci.startPortTask()) return false;
     if (!current.active) return true;
     return usb_hid.startPollTask();
 }

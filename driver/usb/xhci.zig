@@ -4,6 +4,8 @@ const k = @import("../../kernel/log.zig");
 const paging = @import("../../memory/paging.zig");
 const phys = @import("../../memory/phys.zig");
 const pcie = @import("../../platform/pci_inventory.zig");
+const sched_task = @import("../../sched/task.zig");
+const scheduler = @import("../../sched/scheduler.zig");
 const sync = @import("../../sched/sync.zig");
 const timer = @import("../../kernel/timer.zig");
 const usb_core = @import("core.zig");
@@ -28,6 +30,7 @@ const MAX_SCRATCHPADS: usize = 32;
 // timeouts are owned by usb_wait.Deadline and never by this CPU-speed loop.
 const COMMAND_WAIT_GUARD: u32 = 4_000_000_000;
 const CONTROLLER_OWNERSHIP_TIMEOUT_TICKS: u64 = 15 * @as(u64, timer.DEFAULT_HZ);
+const PORT_SERVICE_IDLE_TICKS: u64 = @max(1, (10 * @as(u64, timer.DEFAULT_HZ)) / 1000);
 const TimeoutClock = enum { ticks, hpet, tsc, tsc_fallback, recovery_budget, cpu_guard };
 
 const COMMAND_TRB_COUNT: usize = 256;
@@ -483,6 +486,21 @@ pub const Status = struct {
     retained_slots: u8 = 0,
     runtime_switches: u64 = 0,
     port_change_clears: u64 = 0,
+    port_change_events: u64 = 0,
+    port_change_queued: u64 = 0,
+    port_change_coalesced: u64 = 0,
+    port_change_invalid: u64 = 0,
+    port_change_taken: u64 = 0,
+    port_change_retries: u64 = 0,
+    port_change_pending_mask: u16 = 0,
+    port_change_pending: u8 = 0,
+    port_change_high_water: u8 = 0,
+    port_service_calls: u64 = 0,
+    port_service_failures: u64 = 0,
+    port_catalog_changes: u64 = 0,
+    port_task_started: bool = false,
+    port_task_id: u32 = 0,
+    port_task_iterations: u64 = 0,
     port_debounce_failures: u64 = 0,
     port_power_requests: u64 = 0,
     port_u0_waits: u64 = 0,
@@ -684,10 +702,16 @@ var first_descriptor_virt: u64 = 0;
 var runtimes: [MAX_USB_DEVICES]DeviceRuntime = .{DeviceRuntime{}} ** MAX_USB_DEVICES;
 var active_runtime_index: ?usize = null;
 var deferred_events = event_router.Mailbox.init();
+var pending_port_changes = event_router.PortChanges.init();
 var active_sync_transfer: ?event_router.Match = null;
 var last_timed_out_sync_transfer: ?event_router.Match = null;
 var last_sync_transfer_incident: diag_screen.IncidentToken = .{};
 var active_command: ?event_router.Match = null;
+pub const TopologyHook = *const fn () callconv(.c) void;
+var topology_hook: ?TopologyHook = null;
+var port_task_started = false;
+var port_task_id: u32 = 0;
+var port_task_iterations: u64 = 0;
 
 pub fn probe() bool {
     closeLastSyncTransferIncident();
@@ -717,6 +741,7 @@ pub fn probe() bool {
     runtimes = .{DeviceRuntime{}} ** MAX_USB_DEVICES;
     active_runtime_index = null;
     deferred_events.reset();
+    pending_port_changes.reset();
     active_sync_transfer = null;
     last_timed_out_sync_transfer = null;
     last_sync_transfer_incident = .{};
@@ -841,7 +866,124 @@ pub fn status() Status {
     result.deferred_events_overflows = deferred.overflows;
     result.deferred_events_purged = deferred.purged;
     result.deferred_events_high_water = deferred.high_water;
+    const ports = pending_port_changes.snapshot();
+    result.port_change_events = ports.events;
+    result.port_change_queued = ports.queued;
+    result.port_change_coalesced = ports.coalesced;
+    result.port_change_invalid = ports.invalid;
+    result.port_change_taken = ports.taken;
+    result.port_change_retries = ports.retries;
+    result.port_change_pending_mask = ports.pending_mask;
+    result.port_change_pending = ports.pending;
+    result.port_change_high_water = ports.high_water;
+    result.port_task_started = port_task_started;
+    result.port_task_id = port_task_id;
+    result.port_task_iterations = port_task_iterations;
     return result;
+}
+
+pub fn setTopologyHook(hook: ?TopologyHook) void {
+    topology_hook = hook;
+}
+
+// The xHCI event ring is shared by commands, transfers and root-port
+// changes. A controller-owned task is therefore the single autonomous
+// drainer for idle-time port events; class drivers only receive a catalog
+// notification after the controller transaction has ended.
+pub fn startPortTask() bool {
+    if (port_task_started) return true;
+    if (!current.present or !current.controller_running or event_ring_virt == 0) return true;
+    const worker = sched_task.createKernelThread("xhci-port", portTaskMain) orelse {
+        k.puts("[XHCI] port-task create failed\r\n");
+        return false;
+    };
+    port_task_started = true;
+    port_task_id = worker.id;
+    k.puts("[XHCI] port-task started id=");
+    k.putDec(worker.id);
+    k.puts("\r\n");
+    return true;
+}
+
+fn portTaskMain() callconv(.c) void {
+    while (true) {
+        _ = servicePortChanges();
+        port_task_iterations +%= 1;
+        scheduler.sleepTicksWithReason(PORT_SERVICE_IDLE_TICKS, "xhci-port-idle");
+    }
+}
+
+pub fn servicePortChanges() bool {
+    if (!current.present or !current.controller_running or event_ring_virt == 0) return false;
+    if (!acquireControllerOwnership()) {
+        current.port_service_failures +%= 1;
+        return false;
+    }
+    const catalog_changed = servicePortChangesLocked();
+    releaseControllerOwnership();
+    if (catalog_changed) {
+        if (topology_hook) |hook| hook();
+    }
+    return catalog_changed;
+}
+
+fn servicePortChangesLocked() bool {
+    current.port_service_calls +%= 1;
+    const events_before = pending_port_changes.snapshot().events;
+    drainMaintenanceEventBatch();
+
+    var catalog_changed = false;
+    var budget: usize = 0;
+    while (budget < MAX_PORTS) : (budget += 1) {
+        const port = pending_port_changes.takeNext() orelse break;
+        const outcome = servicePendingPortChange(port);
+        if (outcome.catalog_changed) catalog_changed = true;
+        if (outcome.retry) {
+            pending_port_changes.retry(port);
+            break;
+        }
+    }
+    if ((readOp32(OP_USBSTS) & USBSTS_PCD) != 0) {
+        writeOp32(OP_USBSTS, USBSTS_PCD);
+        _ = readOp32(OP_USBSTS);
+    }
+    if (catalog_changed) current.port_catalog_changes +%= 1;
+    if (pending_port_changes.snapshot().events != events_before or catalog_changed) emitPortServiceMarker();
+    return catalog_changed;
+}
+
+fn emitPortServiceMarker() void {
+    const ports = pending_port_changes.snapshot();
+    k.puts("[XHCIPORT] events=");
+    k.putDec(ports.events);
+    k.puts(" pending=");
+    k.putDec(ports.pending);
+    k.puts(" queued=");
+    k.putDec(ports.queued);
+    k.puts(" coalesced=");
+    k.putDec(ports.coalesced);
+    k.puts(" invalid=");
+    k.putDec(ports.invalid);
+    k.puts(" taken=");
+    k.putDec(ports.taken);
+    k.puts(" retries=");
+    k.putDec(ports.retries);
+    k.puts(" failures=");
+    k.putDec(current.port_service_failures);
+    k.puts(" catalog_changes=");
+    k.putDec(current.port_catalog_changes);
+    k.puts("\r\n");
+}
+
+fn drainMaintenanceEventBatch() void {
+    var processed: u16 = 0;
+    var guard: u32 = 0;
+    while (guard < 1024) : (guard += 1) {
+        const event = pollEvent() orelse break;
+        processed +%= 1;
+        routeForeignEvent(event);
+    }
+    commitEventBatch(processed);
 }
 
 pub fn deviceHandleFromCore(dev: *const usb_core.Device) DeviceHandle {
@@ -891,7 +1033,14 @@ pub fn bulkOutHandleFromCore(dev: *const usb_core.Device) EndpointHandle {
 
 pub fn selectDeviceHandle(handle: *DeviceHandle) bool {
     if (handle.port == 0) return false;
-    refreshPortsAndReclaim();
+    if (port_task_started) {
+        refreshPortSnapshotByNumber(handle.port);
+    } else {
+        // Boot-time callers run before the autonomous owner exists and still
+        // need the legacy complete refresh. Runtime callers use the targeted
+        // port read and leave lifecycle work to the controller-owned task.
+        refreshPortsAndReclaim();
+    }
     if (!portIsConnected(handle.port)) return false;
     if (handle.slot_id != 0) {
         if (!activateRuntimeByIdentity(handle.slot_id, handle.port)) return false;
@@ -2248,6 +2397,134 @@ fn refreshPortsAndReclaim() void {
     readRuntime();
     readPorts();
     reclaimDisconnectedRuntimes();
+}
+
+const PortServiceOutcome = struct {
+    catalog_changed: bool = false,
+    retry: bool = false,
+};
+
+fn servicePendingPortChange(port: u8) PortServiceOutcome {
+    if (port == 0 or port > current.port_count_seen or port > @as(u8, MAX_PORTS)) {
+        current.port_service_failures +%= 1;
+        return .{};
+    }
+
+    const index: usize = @intCast(port - 1);
+    var snapshot = current.first_ports[index];
+    refreshPortStatus(&snapshot, index);
+    storePortSnapshot(index, snapshot);
+
+    const runtime_index = runtimeIndexForPort(port);
+    const action = event_router.decidePortAction(
+        runtime_index != null,
+        snapshot.connected,
+        (snapshot.change_bits & PORTSC_CSC) != 0,
+    );
+    var catalog_changed = false;
+
+    if (action == .remove or action == .replace) {
+        if (runtime_index) |runtime| {
+            if (!reclaimRuntimeForPort(runtime, port)) {
+                current.port_service_failures +%= 1;
+                current.reason = "xHCI hotplug reclaim failed";
+                return .{ .retry = true };
+            }
+            current.port_disconnects +%= 1;
+            catalog_changed = true;
+        }
+    }
+
+    if (action == .acknowledge or action == .remove) {
+        acknowledgePortChanges(index);
+        return .{ .catalog_changed = catalog_changed };
+    }
+
+    var prepared = current.first_ports[index];
+    // A newly attached or replaced device has not passed the boot-time reset
+    // pass. Use the startup preparation contract so even an already enabled
+    // SuperSpeed port receives the mandatory enumeration reset. PortStatus
+    // deliberately retains boot diagnostics across ordinary refreshes, so a
+    // reused physical port must discard the previous device's preparation
+    // state before starting the new lifecycle.
+    prepared.debounce_ok = false;
+    prepared.reset_attempted = false;
+    prepared.reset_ok = false;
+    prepared.reset_reason = "hotplug-not-started";
+    if (!preparePortState(index, &prepared, .startup)) {
+        storePortSnapshot(index, prepared);
+        current.port_service_failures +%= 1;
+        current.reason = "xHCI hotplug port not ready";
+        return .{ .catalog_changed = catalog_changed };
+    }
+    storePortSnapshot(index, prepared);
+
+    if (!probePortDevice(index) or !current.get_config_ok) {
+        disableCurrentSlotForScan();
+        acknowledgePortChanges(index);
+        current.port_service_failures +%= 1;
+        current.reason = "xHCI hotplug enumeration failed";
+        return .{ .catalog_changed = catalog_changed };
+    }
+    publishCurrentCoreDevice();
+    persistActiveRuntime();
+    acknowledgePortChanges(index);
+    return .{ .catalog_changed = true };
+}
+
+fn runtimeIndexForPort(port: u8) ?usize {
+    var index: usize = 0;
+    while (index < runtimes.len) : (index += 1) {
+        if (runtimes[index].active and runtimes[index].port == port) return index;
+    }
+    return null;
+}
+
+fn reclaimRuntimeForPort(runtime_index: usize, port: u8) bool {
+    if (runtime_index >= runtimes.len or !runtimes[runtime_index].active) return true;
+    persistActiveRuntime();
+    const slot = runtimes[runtime_index].slot_id;
+    if (slot == 0 or runtimes[runtime_index].port != port) return false;
+    if (!disableSlot(slot)) return false;
+    _ = usb_core.removeByPort("xhci", port);
+    releaseRuntimeBySlot(slot);
+    current.reclaimed_slots +%= 1;
+    return true;
+}
+
+fn acknowledgePortChanges(index: usize) void {
+    _ = clearPortChanges(index);
+    var snapshot = current.first_ports[index];
+    refreshPortStatus(&snapshot, index);
+    storePortSnapshot(index, snapshot);
+}
+
+fn storePortSnapshot(index: usize, snapshot: PortStatus) void {
+    if (index >= @as(usize, current.port_count_seen) or index >= MAX_PORTS) return;
+    const previous = current.first_ports[index];
+    if (previous.connected != snapshot.connected) {
+        if (snapshot.connected) {
+            current.connected_ports +|= 1;
+        } else if (current.connected_ports > 0) {
+            current.connected_ports -= 1;
+        }
+    }
+    if (previous.enabled != snapshot.enabled) {
+        if (snapshot.enabled) {
+            current.enabled_ports +|= 1;
+        } else if (current.enabled_ports > 0) {
+            current.enabled_ports -= 1;
+        }
+    }
+    current.first_ports[index] = snapshot;
+}
+
+fn refreshPortSnapshotByNumber(port: u8) void {
+    if (port == 0 or port > current.port_count_seen) return;
+    const index: usize = @intCast(port - 1);
+    var snapshot = current.first_ports[index];
+    refreshPortStatus(&snapshot, index);
+    storePortSnapshot(index, snapshot);
 }
 
 fn portIsConnected(port: u8) bool {
@@ -4152,6 +4429,7 @@ fn clearOverflowedInterruptOwner(event: XhciEvent) bool {
 }
 
 fn routeForeignEvent(event: XhciEvent) void {
+    if (pending_port_changes.route(event, current.port_count_seen)) return;
     if (eventHasLiveOwner(event)) {
         switch (deferred_events.enqueue(event)) {
             .queued => return,

@@ -12,10 +12,13 @@ const k = @import("../../kernel/log.zig");
 const sched_task = @import("../../sched/task.zig");
 const scheduler = @import("../../sched/scheduler.zig");
 
-const BUFFER_LEN: usize = 32;
 const MOUSE_POLL_BUDGET: usize = 8;
 const REPORT_BUFFER_LEN: usize = 32;
 const REPORT_DESCRIPTOR_MAX: usize = 512;
+// One boot-keyboard report can publish all decoded usages plus both GUI
+// transitions. Polling pauses before taking ownership of such a report unless
+// the canonical keyboard queue can accept the complete worst-case burst.
+const KEYBOARD_REPORT_QUEUE_RESERVE: u32 = r4p_contract.USB_HID_BOOT_MAX_KEYS + 2;
 
 const HidKind = enum {
     keyboard,
@@ -91,6 +94,13 @@ pub const Status = struct {
     decoded_keys: u64 = 0,
     decoded_mouse: u64 = 0,
     drops: u64 = 0,
+    keyboard_backpressure_active: bool = false,
+    keyboard_backpressure_polls: u64 = 0,
+    keyboard_queue_capacity: u32 = 0,
+    keyboard_queue_pending: u32 = 0,
+    keyboard_queue_free: u32 = 0,
+    keyboard_queue_drops: u64 = 0,
+    topology_reconciles: u64 = 0,
     failures: u64 = 0,
     setup_warnings: u8 = 0,
     protocol_ok: bool = false,
@@ -121,10 +131,10 @@ pub const Status = struct {
 var current: Status = .{};
 var keyboard_binding: HidBinding = .{};
 var mouse_binding: HidBinding = .{};
-var buf: [BUFFER_LEN]u8 = .{0} ** BUFFER_LEN;
-var head: usize = 0;
-var tail: usize = 0;
 var service_polls: u64 = 0;
+var keyboard_backpressure_active = false;
+var keyboard_backpressure_polls: u64 = 0;
+var topology_reconciles: u64 = 0;
 var boot_r4p_classify: u64 = 0;
 var boot_r4p_keyboard: u64 = 0;
 var boot_r4p_mouse: u64 = 0;
@@ -137,14 +147,16 @@ pub fn init() bool {
     current = .{ .initialized = true, .reason = "no USB HID boot device found" };
     keyboard_binding = .{};
     mouse_binding = .{};
-    head = 0;
-    tail = 0;
     service_polls = 0;
+    keyboard_backpressure_active = false;
+    keyboard_backpressure_polls = 0;
+    topology_reconciles = 0;
     boot_r4p_classify = 0;
     boot_r4p_keyboard = 0;
     boot_r4p_mouse = 0;
     boot_dispatch_failures = 0;
     boot_last_result = 0;
+    xhci.setTopologyHook(topologyChangedHook);
 
     var index: usize = 0;
     while (usb_core.deviceAt(index)) |dev| : (index += 1) {
@@ -157,6 +169,55 @@ pub fn init() bool {
         if (current.setup_warnings != 0) current.reason = "USB HID boot keyboard bound; USB HID boot mouse bound; optional class setup warning";
     }
     return current.keyboard_bound or current.mouse_bound;
+}
+
+fn topologyChangedHook() callconv(.c) void {
+    topology_reconciles +%= 1;
+    reconcileBindings();
+    if (keyboard_binding.bound or mouse_binding.bound) _ = startPollTask();
+}
+
+fn reconcileBindings() void {
+    if (!xhci.acquireControllerOwnership()) {
+        current.reason = "USB HID topology reconcile ownership failed";
+        return;
+    }
+    defer xhci.releaseControllerOwnership();
+
+    if (keyboard_binding.present and !bindingStillPublished(&keyboard_binding)) keyboard_binding = .{};
+    if (mouse_binding.present and !bindingStillPublished(&mouse_binding)) mouse_binding = .{};
+    if (!keyboard_binding.bound) {
+        keyboard_backpressure_active = false;
+        keyboard.setPollHook(null);
+    }
+    if (!mouse_binding.bound) mouse.setPollHook(null);
+
+    current.unsupported_hid = 0;
+    current.missing_endpoint_hid = 0;
+    current.protocol_required_missing = 0;
+    var index: usize = 0;
+    while (usb_core.deviceAt(index)) |dev| : (index += 1) scanDevice(dev);
+
+    refreshAggregateStatus();
+    if (current.keyboard_bound and current.mouse_bound) {
+        current.reason = "USB HID boot keyboard bound; USB HID boot mouse bound";
+    } else if (current.keyboard_bound) {
+        current.reason = "USB HID boot keyboard bound";
+    } else if (current.mouse_bound) {
+        current.reason = "USB HID boot mouse bound";
+    } else {
+        current.reason = "no USB HID boot device found";
+    }
+}
+
+fn bindingStillPublished(binding: *const HidBinding) bool {
+    if (!binding.present or binding.port == 0 or binding.device.slot_id == 0) return false;
+    var index: usize = 0;
+    while (usb_core.deviceAt(index)) |dev| : (index += 1) {
+        if (!dev.active or !dev.configured) continue;
+        if (dev.port == binding.port and dev.slot_id == binding.device.slot_id) return true;
+    }
+    return false;
 }
 
 fn scanDevice(dev: *const usb_core.Device) void {
@@ -312,13 +373,6 @@ pub fn status() Status {
     return current;
 }
 
-pub fn readChar() ?u8 {
-    if (head == tail) return null;
-    const c = buf[tail];
-    tail = (tail + 1) % BUFFER_LEN;
-    return c;
-}
-
 pub fn diagnosticPoll() void {
     servicePoll();
 }
@@ -393,6 +447,7 @@ fn pollTaskMain() callconv(.c) void {
 // weiterhin aktiven Bindings = Output-Context-Offset korrekt).
 fn emitPollTaskMarker() void {
     const xs = xhci.status();
+    const keys = keyboard.stats();
     k.puts("[USBHIDPOLL] service_polls=");
     k.putDec(service_polls);
     k.puts(" interrupt_polls=");
@@ -457,6 +512,22 @@ fn emitPollTaskMarker() void {
     k.putDec(xs.ring_full);
     k.puts(" stale_events=");
     k.putDec(xs.stale_events);
+    k.puts(" port_events=");
+    k.putDec(xs.port_change_events);
+    k.puts(" port_pending=");
+    k.putDec(xs.port_change_pending);
+    k.puts(" port_coalesced=");
+    k.putDec(xs.port_change_coalesced);
+    k.puts(" keyboard_pending=");
+    k.putDec(keys.queue_pending);
+    k.puts(" keyboard_free=");
+    k.putDec(keys.queue_capacity - keys.queue_pending);
+    k.puts(" keyboard_drops=");
+    k.putDec(keys.dropped_count);
+    k.puts(" backpressure=");
+    k.putDec(@intFromBool(keyboard_backpressure_active));
+    k.puts(" backpressure_polls=");
+    k.putDec(keyboard_backpressure_polls);
     k.puts(" erdp=0x");
     k.putHex(xs.erdp0, 16);
     k.puts(" iman=0x");
@@ -570,7 +641,14 @@ fn pollMouse() void {
 
 fn pollBinding(binding: *HidBinding, kind: HidKind) bool {
     if (!binding.bound) return false;
-    if (kind == .keyboard and pending()) return false;
+    if (kind == .keyboard) {
+        if (!keyboard.canAccept(KEYBOARD_REPORT_QUEUE_RESERVE)) {
+            keyboard_backpressure_active = true;
+            keyboard_backpressure_polls +%= 1;
+            return false;
+        }
+        keyboard_backpressure_active = false;
+    }
     if (!xhci.acquireControllerOwnership()) {
         binding.failures += 1;
         return false;
@@ -838,6 +916,7 @@ fn usageToExtendedSet1(usage: u8) ?u8 {
 }
 
 fn refreshAggregateStatus() void {
+    const keyboard_queue = keyboard.stats();
     current.keyboard_present = keyboard_binding.present;
     current.keyboard_bound = keyboard_binding.bound;
     current.mouse_present = mouse_binding.present;
@@ -847,6 +926,13 @@ fn refreshAggregateStatus() void {
     current.reports = keyboard_binding.reports + mouse_binding.reports;
     current.duplicate_reports = keyboard_binding.duplicate_reports + mouse_binding.duplicate_reports;
     current.service_polls = service_polls;
+    current.keyboard_backpressure_active = keyboard_backpressure_active;
+    current.keyboard_backpressure_polls = keyboard_backpressure_polls;
+    current.keyboard_queue_capacity = keyboard_queue.queue_capacity;
+    current.keyboard_queue_pending = keyboard_queue.queue_pending;
+    current.keyboard_queue_free = keyboard_queue.queue_capacity - keyboard_queue.queue_pending;
+    current.keyboard_queue_drops = keyboard_queue.dropped_count;
+    current.topology_reconciles = topology_reconciles;
     current.failures = keyboard_binding.failures + mouse_binding.failures;
     current.setup_warnings = keyboard_binding.setup_warnings +| mouse_binding.setup_warnings;
     current.report_id_heuristic = current.report_id_heuristic or keyboard_binding.report_id_heuristic or mouse_binding.report_id_heuristic;
@@ -898,10 +984,6 @@ fn aggregateOk(flag: AggregateFlag) bool {
         if (flag == .idle and !mouse_binding.idle_ok) return false;
     }
     return have_bound;
-}
-
-fn pending() bool {
-    return head != tail;
 }
 
 fn reportsEqual(a: []const u8, b: []const u8) bool {
