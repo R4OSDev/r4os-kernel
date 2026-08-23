@@ -691,6 +691,12 @@ var active_command: ?event_router.Match = null;
 
 pub fn probe() bool {
     closeLastSyncTransferIncident();
+    if (!teardownForReprobe()) {
+        current.failures += 1;
+        current.reason = "xHCI reprobe teardown could not halt controller";
+        bootlog.puts("[XHCI][WARN] reprobe teardown retained active DMA\r\n");
+        return false;
+    }
     current = .{ .probed = true };
     usb_wait.resetMetrics();
     command_ring_virt = 0;
@@ -985,9 +991,15 @@ fn initController() bool {
     if (!stopController()) return false;
     if (!resetController()) return false;
     readCapabilities();
-    if (!allocControllerMemory()) return false;
+    if (!allocControllerMemory()) {
+        freeControllerMemory();
+        return false;
+    }
     setupRingsAndContexts();
-    if (!runController()) return false;
+    if (!runController()) {
+        if (stopController()) freeControllerMemory();
+        return false;
+    }
     readPorts();
     resetConnectedPorts();
     _ = enumerateFirstConnectedDevice();
@@ -1009,6 +1021,7 @@ fn stopController() bool {
         return false;
     }
     current.controller_stopped = true;
+    current.controller_running = false;
     return true;
 }
 
@@ -1052,6 +1065,52 @@ fn allocControllerMemory() bool {
     if (!allocScratchpads()) return false;
     current.dma_ready = true;
     return true;
+}
+
+fn teardownForReprobe() bool {
+    if (!current.probed) return true;
+    persistActiveRuntime();
+    if (current.mapped and current.mmio_virt != 0) {
+        if (!stopController()) return false;
+    }
+    freeAllRuntimes();
+    freeControllerMemory();
+    if (current.present) {
+        _ = pcie.writeCommand(current.device, current.command_before);
+        current.command_after = pcie.readCommand(current.device);
+    }
+    usb_core.reset();
+    return true;
+}
+
+fn freeControllerMemory() void {
+    if (current.mapped and current.op_virt != 0 and current.runtime_virt != 0) {
+        writeRt32(RT_IR0_IMAN, 0);
+        writeRt32(RT_IR0_ERSTSZ, 0);
+        writeRt64(RT_IR0_ERSTBA, 0);
+        writeRt64(RT_IR0_ERDP, 0);
+        writeOp32(OP_CONFIG, 0);
+        writeOp64(OP_CRCR, 0);
+        writeOp64(OP_DCBAAP, 0);
+        dmaFence();
+    }
+    var i: usize = 0;
+    while (i < scratchpad_frames.len) : (i += 1) {
+        freeDmaFrame(&scratchpad_frames[i]);
+    }
+    freeDmaFrame(&current.scratchpad_array_phys);
+    freeDmaFrame(&current.erst_phys);
+    freeDmaFrame(&current.event_ring_phys);
+    freeDmaFrame(&current.command_ring_phys);
+    freeDmaFrame(&current.dcbaa_phys);
+    scratchpad_array_virt = 0;
+    scratchpad_frames = .{0} ** MAX_SCRATCHPADS;
+    erst_virt = 0;
+    event_ring_virt = 0;
+    command_ring_virt = 0;
+    dcbaa_virt = 0;
+    current.scratchpad_count = 0;
+    current.dma_ready = false;
 }
 
 fn failAlloc(name: []const u8) bool {
@@ -1749,7 +1808,7 @@ fn disableCurrentSlotForScan() void {
     if (current.addressed_slot_id == 0) return;
     const slot = current.addressed_slot_id;
     const port = current.addressed_port;
-    _ = disableSlot(slot);
+    if (!disableSlot(slot)) return;
     if (port != 0) _ = usb_core.removeByPort("xhci", port);
     releaseRuntimeBySlot(slot);
     current.addressed_slot_id = 0;
@@ -1778,9 +1837,10 @@ fn disableSlot(slot: u8) bool {
     if (!ok) {
         current.disable_slot_failures += 1;
     }
-    if (dcbaa_virt != 0) {
+    if (ok and dcbaa_virt != 0) {
         const dcbaa: [*]u64 = @ptrFromInt(dcbaa_virt);
         dcbaa[slot] = 0;
+        dmaFence();
     }
     return ok;
 }
@@ -1819,16 +1879,16 @@ fn allocateRuntime(slot_id: u8, port: u8, speed: u8) ?usize {
             .slot_id = slot_id,
             .port = port,
             .speed = speed,
-            .device_context_phys = allocFrameZero() orelse return failAllocRuntime(i, "device context"),
-            .input_context_phys = allocFrameZero() orelse return failAllocRuntime(i, "input context"),
-            .ep0_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "ep0 ring"),
-            .interrupt_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "interrupt ring"),
-            .interrupt_buffer_phys = allocFrameZero() orelse return failAllocRuntime(i, "interrupt buffer"),
-            .bulk_in_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "bulk in ring"),
-            .bulk_out_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "bulk out ring"),
-            .bulk_buffer_phys = allocFrameZero() orelse return failAllocRuntime(i, "bulk buffer"),
-            .descriptor_phys = allocFrameZero() orelse return failAllocRuntime(i, "descriptor"),
         };
+        rt.device_context_phys = allocFrameZero() orelse return failAllocRuntime(i, "device context");
+        rt.input_context_phys = allocFrameZero() orelse return failAllocRuntime(i, "input context");
+        rt.ep0_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "ep0 ring");
+        rt.interrupt_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "interrupt ring");
+        rt.interrupt_buffer_phys = allocFrameZero() orelse return failAllocRuntime(i, "interrupt buffer");
+        rt.bulk_in_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "bulk in ring");
+        rt.bulk_out_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "bulk out ring");
+        rt.bulk_buffer_phys = allocFrameZero() orelse return failAllocRuntime(i, "bulk buffer");
+        rt.descriptor_phys = allocFrameZero() orelse return failAllocRuntime(i, "descriptor");
         rt.device_virt = phys.physToVirt(rt.device_context_phys);
         rt.input_virt = phys.physToVirt(rt.input_context_phys);
         rt.ep0_ring_virt = phys.physToVirt(rt.ep0_ring_phys);
@@ -1847,7 +1907,7 @@ fn allocateRuntime(slot_id: u8, port: u8, speed: u8) ?usize {
 }
 
 fn failAllocRuntime(index_value: usize, what: []const u8) ?usize {
-    runtimes[index_value] = .{};
+    freeRuntimeFrames(&runtimes[index_value]);
     _ = failAlloc(what);
     return null;
 }
@@ -2061,11 +2121,92 @@ fn releaseRuntimeBySlot(slot_id: u8) void {
     var i: usize = 0;
     while (i < runtimes.len) : (i += 1) {
         if (!runtimes[i].active or runtimes[i].slot_id != slot_id) continue;
-        runtimes[i].active = false;
+        const was_active = active_runtime_index != null and active_runtime_index.? == i;
+        freeRuntimeFrames(&runtimes[i]);
         if (current.retained_slots > 0) current.retained_slots -= 1;
-        if (active_runtime_index != null and active_runtime_index.? == i) active_runtime_index = null;
+        if (was_active) {
+            active_runtime_index = null;
+            clearCurrentRuntimeSelection(slot_id);
+        }
         return;
     }
+}
+
+fn freeRuntimeFrames(rt: *DeviceRuntime) void {
+    freeDmaFrame(&rt.descriptor_phys);
+    freeDmaFrame(&rt.bulk_buffer_phys);
+    freeDmaFrame(&rt.bulk_out_ring_phys);
+    freeDmaFrame(&rt.bulk_in_ring_phys);
+    freeDmaFrame(&rt.interrupt_buffer_phys);
+    freeDmaFrame(&rt.interrupt_ring_phys);
+    freeDmaFrame(&rt.ep0_ring_phys);
+    freeDmaFrame(&rt.input_context_phys);
+    freeDmaFrame(&rt.device_context_phys);
+    rt.* = .{};
+}
+
+fn freeAllRuntimes() void {
+    for (&runtimes) |*rt| freeRuntimeFrames(rt);
+    runtimes = .{DeviceRuntime{}} ** MAX_USB_DEVICES;
+    active_runtime_index = null;
+    current.retained_slots = 0;
+    clearCurrentRuntimeSelection(current.addressed_slot_id);
+}
+
+fn freeDmaFrame(frame: *u64) void {
+    if (frame.* == 0) return;
+    phys.freeFrame(frame.*);
+    frame.* = 0;
+}
+
+fn clearCurrentRuntimeSelection(slot_id: u8) void {
+    if (slot_id != 0 and current.addressed_slot_id != slot_id) return;
+    current.addressed_slot_id = 0;
+    current.addressed_port = 0;
+    current.addressed_speed = 0;
+    current.config_value = 0;
+    current.device_vendor_id = 0;
+    current.device_product_id = 0;
+    current.get_config_ok = false;
+    current.device_context_phys = 0;
+    current.input_context_phys = 0;
+    current.ep0_ring_phys = 0;
+    current.interrupt_ring_phys = 0;
+    current.interrupt_buffer_phys = 0;
+    current.bulk_in_ring_phys = 0;
+    current.bulk_out_ring_phys = 0;
+    current.bulk_buffer_phys = 0;
+    current.descriptor_phys = 0;
+    first_device_virt = 0;
+    first_input_virt = 0;
+    first_ep0_ring_virt = 0;
+    first_interrupt_ring_virt = 0;
+    first_interrupt_buffer_virt = 0;
+    first_bulk_in_ring_virt = 0;
+    first_bulk_out_ring_virt = 0;
+    first_bulk_buffer_virt = 0;
+    first_descriptor_virt = 0;
+    current.control_endpoint_faulted = false;
+    current.interrupt_endpoint_configured = false;
+    current.interrupt_endpoint_faulted = false;
+    current.interrupt_pending = false;
+    current.interrupt_pending_trb_phys = 0;
+    current.interrupt_pending_streak = 0;
+    current.interrupt_endpoint_id = 0;
+    current.interrupt_endpoint_address = 0;
+    current.interrupt_endpoint_max_packet = 0;
+    current.interrupt_endpoint_interval_raw = 0;
+    current.interrupt_endpoint_interval_context = 0;
+    current.bulk_endpoints_configured = false;
+    current.bulk_endpoints_faulted = false;
+    current.bulk_in_endpoint_id = 0;
+    current.bulk_in_endpoint_address = 0;
+    current.bulk_in_endpoint_max_packet = 0;
+    current.bulk_in_endpoint_max_burst = 0;
+    current.bulk_out_endpoint_id = 0;
+    current.bulk_out_endpoint_address = 0;
+    current.bulk_out_endpoint_max_packet = 0;
+    current.bulk_out_endpoint_max_burst = 0;
 }
 
 fn reclaimDisconnectedRuntimes() void {
@@ -2077,7 +2218,7 @@ fn reclaimDisconnectedRuntimes() void {
         const port = runtimes[i].port;
         if (slot == 0 or port == 0 or portIsConnected(port)) continue;
         current.port_disconnects += 1;
-        _ = disableSlot(slot);
+        if (!disableSlot(slot)) continue;
         _ = usb_core.removeByPort("xhci", port);
         releaseRuntimeBySlot(slot);
         current.reclaimed_slots += 1;

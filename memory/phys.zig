@@ -1,3 +1,4 @@
+const std = @import("std");
 const boot_info = @import("../bootloader/boot_info.zig");
 const blocks = @import("blocks.zig");
 const mem_map = @import("map.zig");
@@ -154,10 +155,19 @@ fn allocFrameLinear() ?u64 {
 }
 
 pub fn allocContiguousFrames(count: u64) ?u64 {
+    return allocContiguousFramesBelow(count, std.math.maxInt(u64));
+}
+
+pub fn allocContiguousFramesBelow(count: u64, max_phys_addr: u64) ?u64 {
     if (!initialized or count == 0) return null;
+    const addressable_frames = if (max_phys_addr == std.math.maxInt(u64))
+        total_frames
+    else
+        @min(total_frames, (max_phys_addr + 1) / FRAME_SIZE);
+    if (count > addressable_frames) return null;
     const words = bitmapWords();
     var start: u64 = 1;
-    while (start + count <= total_frames) : (start += 1) {
+    while (start <= addressable_frames - count) : (start += 1) {
         // 0.56.12: volle Woerter beim Fehlschlag ueberspringen.
         if (words) |w| {
             if (isUsed(start) and (start & 63) == 0 and w[start / 64] == ~@as(u64, 0)) {

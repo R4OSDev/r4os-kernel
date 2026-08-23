@@ -1,3 +1,4 @@
+const std = @import("std");
 const io = @import("../arch/x86_64/io.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const audio = @import("../audio/core.zig");
@@ -18,8 +19,9 @@ const timer = @import("timer.zig");
 const usb_host = @import("../driver/usb/host_controller.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 16 (0.59.19): append-only um pci_enable_msi erweitert.
-pub const VERSION: u32 = 16;
+// Version 17 (0.69.17): append-only um begrenzte DMA-Allokation und
+// explizites MSI-Rollback erweitert.
+pub const VERSION: u32 = 17;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -239,6 +241,24 @@ const DmaAllocation = struct {
     bytes: u32 = 0,
 };
 
+const MsiAllocation = struct {
+    used: bool = false,
+    owner: u32 = 0,
+    bus_kind: u8 = 0,
+    bus: u8 = 0,
+    device: u8 = 0,
+    function: u8 = 0,
+    irq: u8 = 0,
+    capability: u16 = 0,
+    original_control: u16 = 0,
+    original_command: u16 = 0,
+};
+
+const MsiOwnerCleanupResult = struct {
+    removed: u32 = 0,
+    failed: bool = false,
+};
+
 var current_owner: u32 = 0;
 var current_owner_guard = sync.UnwindGuard.init("r4d-owner");
 var dma_allocations: [MAX_R4D_DMA_ALLOCATIONS]DmaAllocation = .{DmaAllocation{}} ** MAX_R4D_DMA_ALLOCATIONS;
@@ -364,6 +384,14 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     finishOwnerNetMutation(token);
     const audio_count = cleanupAudioOwner(owner);
     const usb_host_count = usb_host.cleanupOwner(owner);
+    const msi_cleanup = cleanupMsiOwner(owner);
+    if (msi_cleanup.failed) {
+        token.active = false;
+        bootlog.puts("[R4D] cleanup owner=");
+        bootlog.putDec(owner);
+        bootlog.puts(" msi-disable=FAILED resources=quarantined\r\n");
+        return false;
+    }
     const irq_count = irq_router.cleanupOwner(owner);
     const work_cleanup = driver_work.cleanupOwner(owner);
     if (!work_cleanup.quiesced) {
@@ -380,6 +408,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     if (irq_count == 0 and
         work_count == 0 and
         dma_count == 0 and
+        msi_cleanup.removed == 0 and
         audio_count == 0 and
         storage_cleanup.removed == 0 and
         usb_host_count == 0 and
@@ -395,6 +424,8 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     bootlog.putDec(work_count);
     bootlog.puts(" dma=");
     bootlog.putDec(dma_count);
+    bootlog.puts(" msi=");
+    bootlog.putDec(msi_cleanup.removed);
     bootlog.puts(" audio=");
     bootlog.putDec(audio_count);
     bootlog.puts(" storage=");
@@ -480,6 +511,10 @@ pub const Table = extern struct {
     // verlaessliches INTx-Routing. Rueckgabe ist die Router-IRQ (>= 0) aus
     // dem festen MSI-Fenster oder ein negativer Fehlercode.
     pci_enable_msi: *const fn (u8, u8, u8, u8) callconv(.c) i32,
+    // 0.69.17 (Version 17, append-only): DMA fuer Geraete mit begrenzter
+    // Adressbreite und explizites MSI-Rollback fuer Fehler-/Unloadpfade.
+    alloc_dma_region_constrained: *const fn (u32, u32, u64, *DmaBuffer) callconv(.c) i32,
+    pci_disable_msi: *const fn (u8, u8, u8, u8) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -539,6 +574,8 @@ pub var table = Table{
     .driver_completion_release = driverCompletionRelease,
     .driver_work_summary = driverWorkSummary,
     .pci_enable_msi = pciEnableMsi,
+    .alloc_dma_region_constrained = allocDmaRegionConstrained,
+    .pci_disable_msi = pciDisableMsi,
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
@@ -622,12 +659,16 @@ fn freeDmaBuffer(phys_addr: u64, bytes: u32) callconv(.c) void {
 }
 
 fn allocDmaRegion(bytes: u32, alignment: u32, out: *DmaBuffer) callconv(.c) i32 {
+    return allocDmaRegionConstrained(bytes, alignment, std.math.maxInt(u64), out);
+}
+
+fn allocDmaRegionConstrained(bytes: u32, alignment: u32, max_phys_addr: u64, out: *DmaBuffer) callconv(.c) i32 {
     out.* = .{};
     const dma_alignment = if (alignment == 0) @as(u32, @intCast(phys.FRAME_SIZE)) else alignment;
     if (bytes == 0) return -1;
     if (@as(u64, dma_alignment) > phys.FRAME_SIZE) return -2;
     const frames = frameCount(bytes) orelse return -3;
-    const phys_addr = phys.allocContiguousFrames(frames) orelse return -4;
+    const phys_addr = phys.allocContiguousFramesBelow(frames, max_phys_addr) orelse return -4;
     const virt_addr = phys.physToVirt(phys_addr);
     const total_bytes = frames * phys.FRAME_SIZE;
     const data: [*]u8 = @ptrFromInt(virt_addr);
@@ -746,9 +787,15 @@ fn pciFindByClass(class_code: u8, subclass: u8, start_index: u32, out: *PciDevic
 const MSI_IRQ_BASE: u8 = 24;
 const MSI_IRQ_COUNT: u8 = 8;
 const IDT_IRQ_VECTOR_BASE: u32 = 32;
-var msi_slots: [MSI_IRQ_COUNT]bool = .{false} ** MSI_IRQ_COUNT;
+var msi_allocations: [MSI_IRQ_COUNT]MsiAllocation = .{MsiAllocation{}} ** MSI_IRQ_COUNT;
 
 fn pciEnableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i32 {
+    const owner = activeOwner();
+    if (owner == 0) return -6;
+    for (msi_allocations) |allocation| {
+        if (!allocation.used or allocation.bus_kind != bus_kind or allocation.bus != bus or allocation.device != device or allocation.function != function) continue;
+        return if (allocation.owner == owner) @intCast(allocation.irq) else -6;
+    }
     const status_command = pciReadConfig32(bus_kind, bus, device, function, 0x04);
     if (status_command == 0xFFFF_FFFF or (status_command & (@as(u32, 1) << 20)) == 0) return -1;
 
@@ -770,13 +817,15 @@ fn pciEnableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i3
     if (cap == 0) return -2;
 
     var slot: u8 = 0;
-    while (slot < MSI_IRQ_COUNT and msi_slots[slot]) : (slot += 1) {}
+    while (slot < MSI_IRQ_COUNT and msi_allocations[slot].used) : (slot += 1) {}
     if (slot >= MSI_IRQ_COUNT) return -3;
     const irq: u8 = MSI_IRQ_BASE + slot;
     const vector: u32 = IDT_IRQ_VECTOR_BASE + irq;
 
     const cap_header = pciReadConfig32(bus_kind, bus, device, function, cap);
+    if (cap_header == 0xFFFF_FFFF) return -1;
     const control: u16 = @truncate(cap_header >> 16);
+    if ((control & 1) != 0) return -7;
     const is_64bit = (control & (1 << 7)) != 0;
 
     // Fixed/Edge an den BSP; Multiple Message Enable bleibt auf einer
@@ -791,24 +840,111 @@ fn pciEnableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i3
     }
     const new_control: u32 = (@as(u32, control) & ~@as(u32, 0x0070)) | 0x0001;
     const cap_write = (cap_header & 0x0000_FFFF) | (new_control << 16);
-    if (pciWriteConfig32(bus_kind, bus, device, function, cap, cap_write) != 0) return -4;
+    if (pciWriteConfig32(bus_kind, bus, device, function, cap, cap_write) != 0) {
+        _ = restoreMsiHardware(bus_kind, bus, device, function, cap, control, @truncate(status_command));
+        return -4;
+    }
     const verified = pciReadConfig32(bus_kind, bus, device, function, cap);
-    if (verified == 0xFFFF_FFFF or ((verified >> 16) & 0x0001) == 0) return -5;
+    if (verified == 0xFFFF_FFFF or ((verified >> 16) & 0x0001) == 0) {
+        _ = restoreMsiHardware(bus_kind, bus, device, function, cap, control, @truncate(status_command));
+        return -5;
+    }
 
     // INTx am Endpunkt deaktivieren; der W1C-Statusanteil wird nie geechot.
     const command_raw = pciReadConfig32(bus_kind, bus, device, function, 0x04);
     if (command_raw != 0xFFFF_FFFF) {
         const command = (command_raw & 0x0000_FFFF) | (@as(u32, 1) << 10);
-        _ = pciWriteConfig32(bus_kind, bus, device, function, 0x04, command);
+        if (pciWriteConfig32(bus_kind, bus, device, function, 0x04, command) != 0) {
+            _ = restoreMsiHardware(bus_kind, bus, device, function, cap, control, @truncate(status_command));
+            return -4;
+        }
+        const command_verify = pciReadConfig32(bus_kind, bus, device, function, 0x04);
+        if (command_verify == 0xFFFF_FFFF or (command_verify & (@as(u32, 1) << 10)) == 0) {
+            _ = restoreMsiHardware(bus_kind, bus, device, function, cap, control, @truncate(status_command));
+            return -5;
+        }
     }
 
-    msi_slots[slot] = true;
+    msi_allocations[slot] = .{
+        .used = true,
+        .owner = owner,
+        .bus_kind = bus_kind,
+        .bus = bus,
+        .device = device,
+        .function = function,
+        .irq = irq,
+        .capability = cap,
+        .original_control = control,
+        .original_command = @truncate(status_command),
+    };
     bootlog.puts("[R4D] MSI enabled irq=");
     bootlog.putDec(irq);
     bootlog.puts(" vector=");
     bootlog.putDec(vector);
     bootlog.puts("\r\n");
     return @intCast(irq);
+}
+
+fn pciDisableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i32 {
+    const owner = activeOwner();
+    for (&msi_allocations) |*allocation| {
+        if (!allocation.used or allocation.bus_kind != bus_kind or allocation.bus != bus or allocation.device != device or allocation.function != function) continue;
+        if (owner != 0 and allocation.owner != owner) return -2;
+        if (!restoreMsiAllocation(allocation)) return -3;
+        allocation.* = .{};
+        return 0;
+    }
+    return 0;
+}
+
+fn restoreMsiAllocation(allocation: *const MsiAllocation) bool {
+    return restoreMsiHardware(
+        allocation.bus_kind,
+        allocation.bus,
+        allocation.device,
+        allocation.function,
+        allocation.capability,
+        allocation.original_control,
+        allocation.original_command,
+    );
+}
+
+fn restoreMsiHardware(bus_kind: u8, bus: u8, device: u8, function: u8, capability: u16, original_control: u16, original_command: u16) bool {
+    const current_header = pciReadConfig32(bus_kind, bus, device, function, capability);
+    if (current_header == 0xFFFF_FFFF) return false;
+    const disabled_control = @as(u16, @truncate(current_header >> 16)) & ~@as(u16, 1);
+    const disabled_header = (current_header & 0x0000_FFFF) | (@as(u32, disabled_control) << 16);
+    if (pciWriteConfig32(bus_kind, bus, device, function, capability, disabled_header) != 0) return false;
+    const disabled_verify = pciReadConfig32(bus_kind, bus, device, function, capability);
+    if (disabled_verify == 0xFFFF_FFFF or ((disabled_verify >> 16) & 1) != 0) return false;
+
+    const original_header = (disabled_verify & 0x0000_FFFF) | (@as(u32, original_control) << 16);
+    if (pciWriteConfig32(bus_kind, bus, device, function, capability, original_header) != 0) return false;
+    const current_command = pciReadConfig32(bus_kind, bus, device, function, 0x04);
+    if (current_command == 0xFFFF_FFFF) return false;
+    const intx_mask: u32 = @as(u32, 1) << 10;
+    const restored_command = (current_command & 0x0000_FFFF & ~intx_mask) | (@as(u32, original_command) & intx_mask);
+    if (pciWriteConfig32(bus_kind, bus, device, function, 0x04, restored_command) != 0) return false;
+    const final_header = pciReadConfig32(bus_kind, bus, device, function, capability);
+    const final_command = pciReadConfig32(bus_kind, bus, device, function, 0x04);
+    return final_header != 0xFFFF_FFFF and
+        ((final_header >> 16) & 1) == 0 and
+        final_command != 0xFFFF_FFFF and
+        (final_command & intx_mask) == (@as(u32, original_command) & intx_mask);
+}
+
+fn cleanupMsiOwner(owner: u32) MsiOwnerCleanupResult {
+    var result: MsiOwnerCleanupResult = .{};
+    for (&msi_allocations) |*allocation| {
+        if (!allocation.used or allocation.owner != owner) continue;
+        if (!restoreMsiAllocation(allocation)) {
+            result.failed = true;
+            continue;
+        }
+        allocation.* = .{};
+        result.removed += 1;
+    }
+    return result;
 }
 
 fn pciReadConfig32(bus_kind: u8, bus: u8, device: u8, function: u8, offset: u16) callconv(.c) u32 {
