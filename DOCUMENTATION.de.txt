@@ -83,3 +83,24 @@ R4DEV `performance_boot_summary` liest dafuer nur den kleinen festen
 Bootdatensatz; breite Subsystem-Summaries oder aktive Diagnoseprobes gehoeren
 nicht in diesen Pfad. Die spaeten Phasen laufen einmalig in der Reihenfolge
 `task_runtime`, `driver_policy`, `runtime`, `shell`.
+
+Kanonische PCI- und PCIe-Inventur
+---------------------------------
+
+`platform/pci_inventory.zig` ist die einzige produktive Businventur. Eine
+gueltige, im finalen Kernel-Root vollstaendig bereitgestellte Segment-0-ECAM-
+Apertur wird zuerst enumeriert. CF8/CFC bleibt fuer fehlendes ECAM und nur
+fuer nicht durch ein partielles ECAM-Fenster abgedeckte Busse erhalten. Die
+feste Kapazitaet von 64 Eintraegen meldet Found, Stored, Dropped und Truncated
+getrennt und beendet die Restinventur nach dem ersten belegten Ueberlauf.
+
+AHCI, NVMe, XHCI, Netzwerk, DeviceInventory, HardwareSummary und die R4D-
+Fassade konsumieren denselben Snapshot. Klassensuchen vergleichen dessen
+statische Felder, bevor ein Treffer materialisiert wird. Interrupt Line und
+Pin stammen gemeinsam aus Register 0x3C; Command und BARs werden nur fuer den
+tatsaechlich angeforderten Detailpfad gelesen. R4DEV stellt die skalaren
+Quellen-, Zugriffs-, Mapping-, Kapazitaets- und Zeitzaehler append-only als
+`performance_pci_inventory` bereit. Liegt die gesamte fruehe Inventur
+innerhalb eines noch groben periodischen Takts, bleibt der Zeitwert null und
+`timing_unavailable` weist die nicht aufloesbare Gesamt-/Teilspanne explizit
+aus.

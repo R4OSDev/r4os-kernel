@@ -5,8 +5,7 @@ const acpi = @import("../platform/acpi.zig");
 const block_storage = @import("../storage/block.zig");
 const cpu = @import("../platform/cpu.zig");
 const irq_status = @import("../platform/irq.zig");
-const pci = @import("../platform/pci.zig");
-const pcie = @import("../platform/pcie.zig");
+const pci_inventory = @import("../platform/pci_inventory.zig");
 const protocol_api = @import("../kernel/protocol_api.zig");
 const protocol_registry = @import("../protocol/registry.zig");
 const scheduler = @import("../sched/scheduler.zig");
@@ -51,6 +50,7 @@ pub const ProgramBootPerformanceInfo = r4x_api.ProgramBootPerformanceInfo;
 pub const ProgramIrqTimingInfo = r4x_api.ProgramIrqTimingInfo;
 pub const ProgramDriverWorkPerformanceMetrics = r4x_api.ProgramDriverWorkPerformanceMetrics;
 pub const ProgramDriverWorkPerformanceInfo = r4x_api.ProgramDriverWorkPerformanceInfo;
+pub const ProgramPciInventoryPerformanceInfo = r4x_api.ProgramPciInventoryPerformanceInfo;
 
 pub const ProgramMemoryBlockInfo = r4x_api.ProgramMemoryBlockInfo;
 
@@ -2556,6 +2556,26 @@ pub fn performanceDriverWork(owner: u32, out: *ProgramDriverWorkPerformanceInfo)
     return 1;
 }
 
+pub fn performancePciInventory(out: *ProgramPciInventoryPerformanceInfo) callconv(.c) i32 {
+    comptime {
+        if (@sizeOf(pci_inventory.Performance) != @sizeOf(ProgramPciInventoryPerformanceInfo) or
+            @alignOf(pci_inventory.Performance) != @alignOf(ProgramPciInventoryPerformanceInfo) or
+            pci_inventory.max_devices != r4x_api.pci_inventory_capacity or
+            pci_inventory.flag_enumerated != r4x_api.pci_inventory_flag_enumerated or
+            pci_inventory.flag_ecam != r4x_api.pci_inventory_flag_ecam or
+            pci_inventory.flag_legacy != r4x_api.pci_inventory_flag_legacy or
+            pci_inventory.flag_partial != r4x_api.pci_inventory_flag_partial or
+            pci_inventory.flag_truncated != r4x_api.pci_inventory_flag_truncated or
+            pci_inventory.flag_ecam_aperture_ready != r4x_api.pci_inventory_flag_ecam_aperture_ready or
+            pci_inventory.flag_ecam_rejected_segment != r4x_api.pci_inventory_flag_ecam_rejected_segment)
+        {
+            @compileError("PCI inventory performance contract drift");
+        }
+    }
+    out.* = @bitCast(pci_inventory.performance());
+    return if (pci_inventory.status().enumerated) 1 else 0;
+}
+
 pub fn performanceIrqTiming(irq: u32, out: *ProgramIrqTimingInfo) callconv(.c) i32 {
     if (irq >= irq_router.MAX_IRQS) {
         out.* = .{};
@@ -2636,7 +2656,7 @@ pub fn deviceInventoryRecord(index: u32, out: *DeviceInventoryRecord) callconv(.
 
 pub fn hardwareSummary(out: *HardwareSummary) callconv(.c) i32 {
     const ai = acpi.info();
-    const ps = pcie.status();
+    const ps = pci_inventory.status();
     const irq = irq_status.status();
     const usb = usb_core.summary();
     const inv = device_inventory.snapshot();
@@ -2644,10 +2664,10 @@ pub fn hardwareSummary(out: *HardwareSummary) callconv(.c) i32 {
 
     var flags: u32 = 0;
     if (ai.rsdp_phys != 0) flags |= hardware_summary_flag_acpi;
-    if (ps.enumerated) flags |= hardware_summary_flag_pcie;
-    const legacy_pci_devices: u32 = @intCast(@min(pci.count(), 0xFFFF_FFFF));
+    if (ps.ecam_used) flags |= hardware_summary_flag_pcie;
+    const legacy_pci_devices = ps.legacy_stored_count;
     const block_devices: u32 = @intCast(@min(block_storage.count(), 0xFFFF_FFFF));
-    if (!ps.enumerated and legacy_pci_devices != 0) flags |= hardware_summary_flag_legacy_pci;
+    if (ps.legacy_used and legacy_pci_devices != 0) flags |= hardware_summary_flag_legacy_pci;
     if (irq.ioapic_runtime_mapped or irq.ioapic_routing_active) flags |= hardware_summary_flag_ioapic;
     if (irq.hpet_available) flags |= hardware_summary_flag_hpet;
     if (ps.xhci_count != 0 or usb_host.findByName("XHCI") != null) flags |= hardware_summary_flag_xhci;
@@ -2670,7 +2690,7 @@ pub fn hardwareSummary(out: *HardwareSummary) callconv(.c) i32 {
         .flags = flags,
         .acpi_tables = ai.table_count,
         .acpi_invalid_tables = ai.invalid_table_count,
-        .pcie_devices = ps.stored_count,
+        .pcie_devices = ps.ecam_stored_count,
         .legacy_pci_devices = legacy_pci_devices,
         .storage_controllers = ps.ahci_count + ps.nvme_count,
         .network_controllers = ps.network_count,

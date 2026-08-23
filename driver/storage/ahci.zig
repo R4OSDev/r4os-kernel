@@ -1,7 +1,7 @@
 const bootlog = @import("../../kernel/bootlog.zig");
 const paging = @import("../../memory/paging.zig");
 const phys = @import("../../memory/phys.zig");
-const pcie = @import("../../platform/pcie.zig");
+const pcie = @import("../../platform/pci_inventory.zig");
 const block = @import("../../storage/block.zig");
 
 const REG_CAP: u64 = 0x00;
@@ -673,7 +673,7 @@ fn portSkipReason(ps: PortStatus) ?[]const u8 {
 fn enableBusMaster() void {
     var command = pcie.readCommand(current.device);
     command |= 0x0006;
-    pcie.writeCommand(current.device, command);
+    _ = pcie.writeCommand(current.device, command);
 }
 
 fn handleBiosHandoff() void {

@@ -19,8 +19,7 @@ const protocol_registry = @import("../protocol/registry.zig");
 const r4p = @import("../program/r4p.zig");
 const r4p_contract = @import("r4p_contract.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
-const pci = @import("../platform/pci.zig");
-const pcie = @import("../platform/pcie.zig");
+const pci_inventory = @import("../platform/pci_inventory.zig");
 const time_core = @import("../platform/time.zig");
 const kernel_config = @import("config");
 const scheduler = @import("../sched/scheduler.zig");
@@ -1738,17 +1737,9 @@ fn recordTxResult(result: TxResult) TxResult {
 
 pub fn candidateCount() usize {
     var total: usize = 0;
-    const ps = pcie.status();
-    if (ps.enumerated) {
-        var index: usize = 0;
-        while (pcie.deviceAt(index)) |d| : (index += 1) {
-            if (isNetwork(d.class_code, d.subclass)) total += 1;
-        }
-    } else {
-        var index: usize = 0;
-        while (pci.deviceAt(index)) |d| : (index += 1) {
-            if (isNetwork(d.class_code, d.subclass)) total += 1;
-        }
+    var index: usize = 0;
+    while (pci_inventory.deviceAt(index)) |d| : (index += 1) {
+        if (isNetwork(d.class_code, d.subclass)) total += 1;
     }
     return total;
 }

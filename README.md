@@ -22,6 +22,11 @@ periodic PIT, HPET, or LAPIC scheduler event source. Exact invariant-TSC and
 free-running HPET sources are preferred; hardware without either capability
 uses an explicitly degraded periodic fallback.
 
+PCI and PCIe devices are enumerated once through a canonical inventory.
+Mapped segment-0 ECAM coverage is preferred; legacy CF8/CFC access is retained
+only as a bounded fallback for missing or uncovered buses. Stored class fields
+serve inventory searches without additional configuration-space reads.
+
 Normal kernel artifacts perform only the non-mutating heap structure check
 and the required kernel-space page-table dry run. The invasive heap,
 page-table, synchronization, and scheduler probes are available only in an

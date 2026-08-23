@@ -5,8 +5,7 @@ const bootlog = @import("bootlog.zig");
 const boot_config = @import("boot_config.zig");
 const log_event = @import("log_event.zig");
 const net = @import("../net/core.zig");
-const pci = @import("../platform/pci.zig");
-const pcie = @import("../platform/pcie.zig");
+const pci_inventory = @import("../platform/pci_inventory.zig");
 const platform_cpu = @import("../platform/cpu.zig");
 const paging = @import("../memory/paging.zig");
 const phys = @import("../memory/phys.zig");
@@ -721,37 +720,24 @@ fn activeOwner() u32 {
 }
 
 fn pciDeviceCount() callconv(.c) u32 {
-    const ps = pcie.status();
-    if (ps.enumerated) return ps.stored_count;
-    return @intCast(pci.count());
+    return @intCast(pci_inventory.count());
 }
 
 fn pciDeviceAt(index: u32, out: *PciDeviceInfo) callconv(.c) i32 {
     out.* = .{};
-    const ps = pcie.status();
-    if (ps.enumerated) {
-        const dev = pcie.deviceAt(@intCast(index)) orelse return -1;
-        out.* = pciInfoFromPcie(dev);
-        return 0;
-    }
-    const dev = pci.deviceAt(@intCast(index)) orelse return -1;
-    out.* = pciInfoFromPci(dev);
+    const dev = pci_inventory.deviceAt(@intCast(index)) orelse return -1;
+    out.* = pciInfoFromDevice(dev);
+    pci_inventory.noteDetailMaterialization();
     return 0;
 }
 
 fn pciFindByClass(class_code: u8, subclass: u8, start_index: u32, out: *PciDeviceInfo) callconv(.c) i32 {
     out.* = .{};
-    var index = start_index;
-    const total = pciDeviceCount();
-    while (index < total) : (index += 1) {
-        var info: PciDeviceInfo = .{};
-        if (pciDeviceAt(index, &info) != 0) continue;
-        if (info.class_code == class_code and info.subclass == subclass) {
-            out.* = info;
-            return @intCast(index);
-        }
-    }
-    return -1;
+    const index = pci_inventory.findByClass(class_code, subclass, @intCast(start_index)) orelse return -1;
+    const dev = pci_inventory.deviceAt(index) orelse return -1;
+    out.* = pciInfoFromDevice(dev);
+    pci_inventory.noteDetailMaterialization();
+    return @intCast(index);
 }
 
 // 0.59.19: MSI-Fenster. Router-IRQs 24..31 haben feste IDT-Vektoren 56..63,
@@ -826,34 +812,17 @@ fn pciEnableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i3
 }
 
 fn pciReadConfig32(bus_kind: u8, bus: u8, device: u8, function: u8, offset: u16) callconv(.c) u32 {
-    if (bus_kind == NET_BUS_PCIE) {
-        const ps = pcie.status();
-        if (ps.mcfg_base == 0) return 0xFFFF_FFFF;
-        return pcie.readConfig32(ps.mcfg_base, bus, device, function, offset);
-    }
-    if (bus_kind == NET_BUS_PCI) return pci.readConfig32(bus, device, function, @truncate(offset));
-    return 0xFFFF_FFFF;
+    return pci_inventory.readConfig32At(bus_kind, bus, device, function, offset);
 }
 
 fn pciWriteConfig32(bus_kind: u8, bus: u8, device: u8, function: u8, offset: u16, value: u32) callconv(.c) i32 {
-    if (bus_kind == NET_BUS_PCIE) {
-        const ps = pcie.status();
-        if (ps.mcfg_base == 0) return -1;
-        pcie.writeConfig32(ps.mcfg_base, bus, device, function, offset, value);
-        return 0;
-    }
-    if (bus_kind == NET_BUS_PCI) {
-        pci.writeConfig32(bus, device, function, @truncate(offset), value);
-        return 0;
-    }
-    return -1;
+    return if (pci_inventory.writeConfig32At(bus_kind, bus, device, function, offset, value)) 0 else -1;
 }
 
 fn pciReadBar(bus_kind: u8, bus: u8, device: u8, function: u8, index: u8) callconv(.c) u32 {
     if (index >= 6) return 0;
-    if (bus_kind == NET_BUS_PCIE) return pcie.readBar(.{ .bus = bus, .device = device, .function = function }, index);
-    if (bus_kind == NET_BUS_PCI) return pci.readBar(.{ .bus = bus, .device = device, .function = function, .vendor_id = 0, .device_id = 0, .class_code = 0, .subclass = 0, .prog_if = 0 }, index);
-    return 0;
+    if (bus_kind != NET_BUS_PCIE and bus_kind != NET_BUS_PCI) return 0;
+    return pci_inventory.readBar(.{ .bus_kind = bus_kind, .bus = bus, .device = device, .function = function }, index);
 }
 
 fn pciEnableBusMaster(bus_kind: u8, bus: u8, device: u8, function: u8, flags: u32) callconv(.c) i32 {
@@ -924,9 +893,8 @@ fn pciMapBar(bus_kind: u8, bus: u8, device: u8, function: u8, index: u8, bytes: 
 
 fn pciReadBar64(bus_kind: u8, bus: u8, device: u8, function: u8, index: u8) u64 {
     if (index >= 6) return 0;
-    if (bus_kind == NET_BUS_PCIE) return pcie.readBar64(.{ .bus = bus, .device = device, .function = function }, index);
-    if (bus_kind == NET_BUS_PCI) return pci.readBar64(.{ .bus = bus, .device = device, .function = function, .vendor_id = 0, .device_id = 0, .class_code = 0, .subclass = 0, .prog_if = 0 }, index);
-    return 0;
+    if (bus_kind != NET_BUS_PCIE and bus_kind != NET_BUS_PCI) return 0;
+    return pci_inventory.readBar64(.{ .bus_kind = bus_kind, .bus = bus, .device = device, .function = function }, index);
 }
 
 fn getOption(driver: [*:0]const u8, key: [*:0]const u8) callconv(.c) [*:0]const u8 {
@@ -1602,9 +1570,10 @@ fn validSectorSize(size: u32) bool {
     return size == 512 or size == 1024 or size == 2048 or size == 4096;
 }
 
-fn pciInfoFromPci(dev: pci.Device) PciDeviceInfo {
+fn pciInfoFromDevice(dev: pci_inventory.Device) PciDeviceInfo {
+    const route = pci_inventory.readInterruptRoute(dev);
     return .{
-        .bus_kind = NET_BUS_PCI,
+        .bus_kind = dev.bus_kind,
         .bus = dev.bus,
         .device = dev.device,
         .function = dev.function,
@@ -1613,26 +1582,9 @@ fn pciInfoFromPci(dev: pci.Device) PciDeviceInfo {
         .class_code = dev.class_code,
         .subclass = dev.subclass,
         .prog_if = dev.prog_if,
-        .interrupt_line = pci.readInterruptLine(dev),
-        .interrupt_pin = pci.readInterruptPin(dev),
-        .command = pci.readCommand(dev),
-    };
-}
-
-fn pciInfoFromPcie(dev: pcie.Device) PciDeviceInfo {
-    return .{
-        .bus_kind = NET_BUS_PCIE,
-        .bus = dev.bus,
-        .device = dev.device,
-        .function = dev.function,
-        .vendor_id = dev.vendor_id,
-        .device_id = dev.device_id,
-        .class_code = dev.class_code,
-        .subclass = dev.subclass,
-        .prog_if = dev.prog_if,
-        .interrupt_line = pcie.readInterruptLine(dev),
-        .interrupt_pin = pcie.readInterruptPin(dev),
-        .command = pcie.readCommand(dev),
+        .interrupt_line = route.line,
+        .interrupt_pin = route.pin,
+        .command = pci_inventory.readCommand(dev),
     };
 }
 

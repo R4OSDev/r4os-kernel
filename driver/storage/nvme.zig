@@ -2,7 +2,7 @@ const bootlog = @import("../../kernel/bootlog.zig");
 const k = @import("../../kernel/log.zig");
 const paging = @import("../../memory/paging.zig");
 const phys = @import("../../memory/phys.zig");
-const pcie = @import("../../platform/pcie.zig");
+const pcie = @import("../../platform/pci_inventory.zig");
 const block = @import("../../storage/block.zig");
 
 const REG_CAP: u64 = 0x00;
@@ -856,7 +856,7 @@ fn nameForNamespace(slot: usize) []const u8 {
 fn enablePciMemoryBusMaster() void {
     var command = pcie.readCommand(current.device);
     command |= 0x0006;
-    pcie.writeCommand(current.device, command);
+    _ = pcie.writeCommand(current.device, command);
     current.command = pcie.readCommand(current.device);
 }
 

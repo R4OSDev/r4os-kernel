@@ -1,24 +1,30 @@
 const io = @import("../arch/x86_64/io.zig");
 const bootlog = @import("../kernel/bootlog.zig");
+const pci_scan = @import("pci_scan.zig");
 
 const CONFIG_ADDRESS: u16 = 0x0CF8;
 const CONFIG_DATA: u16 = 0x0CFC;
-const MAX_DEVICES: usize = 64;
+const MAX_DEVICES: usize = pci_scan.max_devices;
 const MAX_LOGGED_DEVICES: usize = 24;
 
-pub const Device = struct {
-    bus: u8,
-    device: u8,
-    function: u8,
-    vendor_id: u16,
-    device_id: u16,
-    class_code: u8,
-    subclass: u8,
-    prog_if: u8,
+pub const Device = pci_scan.Device;
+
+pub const AccessMetrics = struct {
+    config_reads: u64 = 0,
+    config_writes: u64 = 0,
 };
 
 var devices: [MAX_DEVICES]Device = undefined;
 var device_count: usize = 0;
+var access_metrics: AccessMetrics = .{};
+
+pub fn resetAccessMetrics() void {
+    access_metrics = .{};
+}
+
+pub fn accessMetrics() AccessMetrics {
+    return access_metrics;
+}
 
 pub fn enumerateLegacy() void {
     device_count = 0;
@@ -41,6 +47,7 @@ pub fn enumerateLegacy() void {
                 const device_id: u16 = @truncate(vendor_device >> 16);
                 const class_reg = readConfig32(@intCast(bus), dev, func, 0x08);
                 const info = Device{
+                    .bus_kind = pci_scan.bus_kind_legacy,
                     .bus = @intCast(bus),
                     .device = dev,
                     .function = func,
@@ -130,16 +137,19 @@ pub fn enableMemoryAndBusMaster(device: Device) void {
 }
 
 pub fn readConfig32(bus: u8, device: u8, function: u8, offset: u8) u32 {
+    access_metrics.config_reads +%= 1;
     io.outl(CONFIG_ADDRESS, configAddress(bus, device, function, offset));
     return io.inl(CONFIG_DATA);
 }
 
 pub fn writeConfig32(bus: u8, device: u8, function: u8, offset: u8, value: u32) void {
+    access_metrics.config_writes +%= 1;
     io.outl(CONFIG_ADDRESS, configAddress(bus, device, function, offset));
     io.outl(CONFIG_DATA, value);
 }
 
 pub fn writeConfig8(bus: u8, device: u8, function: u8, offset: u8, value: u8) void {
+    access_metrics.config_writes +%= 1;
     io.outl(CONFIG_ADDRESS, configAddress(bus, device, function, offset));
     io.outb(CONFIG_DATA + @as(u16, offset & 3), value);
 }

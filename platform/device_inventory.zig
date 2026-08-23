@@ -11,8 +11,7 @@ const drive = @import("../fs/drive.zig");
 const irq_status = @import("irq.zig");
 const net_config = @import("../net/config.zig");
 const net = @import("../net/core.zig");
-const pci = @import("pci.zig");
-const pcie = @import("pcie.zig");
+const pci_inventory = @import("pci_inventory.zig");
 const protocol_registry = @import("../protocol/registry.zig");
 
 const MAX_RECORDS: usize = 128;
@@ -174,17 +173,9 @@ fn addBlockDeviceRecords(s: *Snapshot) void {
 }
 
 fn addBusRecords(s: *Snapshot) void {
-    const ps = pcie.status();
-    if (ps.enumerated) {
-        var index: usize = 0;
-        while (pcie.deviceAt(index)) |d| : (index += 1) {
-            s.add(recordFromPcie(d));
-        }
-    } else {
-        var index: usize = 0;
-        while (pci.deviceAt(index)) |d| : (index += 1) {
-            s.add(recordFromPci(d));
-        }
+    var index: usize = 0;
+    while (pci_inventory.deviceAt(index)) |d| : (index += 1) {
+        s.add(recordFromPciDevice(d));
     }
 }
 
@@ -360,12 +351,9 @@ fn usbDeviceStatus(d: *const usb_core.Device, class_code: u8, subclass: u8, prot
     return if (d.configured) "configured" else "addressed";
 }
 
-fn recordFromPci(d: pci.Device) Record {
-    return recordFromFields(.pci, d.bus, d.device, d.function, d.vendor_id, d.device_id, d.class_code, d.subclass, d.prog_if);
-}
-
-fn recordFromPcie(d: pcie.Device) Record {
-    return recordFromFields(.pcie, d.bus, d.device, d.function, d.vendor_id, d.device_id, d.class_code, d.subclass, d.prog_if);
+fn recordFromPciDevice(d: pci_inventory.Device) Record {
+    const bus_kind: Bus = if (d.bus_kind == pci_inventory.bus_kind_ecam) .pcie else .pci;
+    return recordFromFields(bus_kind, d.bus, d.device, d.function, d.vendor_id, d.device_id, d.class_code, d.subclass, d.prog_if);
 }
 
 fn recordFromFields(bus_kind: Bus, bus_no: u8, device_no: u8, function_no: u8, vendor_id: u16, device_id: u16, class_code: u8, subclass: u8, prog_if: u8) Record {

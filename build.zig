@@ -179,6 +179,7 @@ pub fn build(b: *std.Build) void {
         "kernel/service_ipc_queue.zig",
         "net/config_writer.zig",
         "platform/monotonic_math.zig",
+        "platform/pci_scan.zig",
         "program/gui_alpha8.zig",
         "program/r4x_start.zig",
         "sched/wait_node.zig",

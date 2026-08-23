@@ -3,7 +3,7 @@ const diag_screen = @import("../../kernel/diag_screen.zig");
 const k = @import("../../kernel/log.zig");
 const paging = @import("../../memory/paging.zig");
 const phys = @import("../../memory/phys.zig");
-const pcie = @import("../../platform/pcie.zig");
+const pcie = @import("../../platform/pci_inventory.zig");
 const sync = @import("../../sched/sync.zig");
 const timer = @import("../../kernel/timer.zig");
 const usb_core = @import("core.zig");
@@ -915,7 +915,7 @@ fn sameDeviceTarget(a: DeviceHandle, b: DeviceHandle) bool {
 
 fn enablePciMemoryAndBusMaster() void {
     const wanted = current.command_before | PCI_COMMAND_MEMORY | PCI_COMMAND_BUS_MASTER;
-    pcie.writeCommand(current.device, wanted);
+    _ = pcie.writeCommand(current.device, wanted);
     current.command_after = pcie.readCommand(current.device);
 }
 

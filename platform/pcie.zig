@@ -2,8 +2,9 @@ const acpi = @import("acpi.zig");
 const bootlog = @import("../kernel/bootlog.zig");
 const paging = @import("../memory/paging.zig");
 const phys = @import("../memory/phys.zig");
+const pci_scan = @import("pci_scan.zig");
 
-const MAX_DEVICES: usize = 64;
+const MAX_DEVICES: usize = pci_scan.max_devices;
 const MAX_LOGGED_DEVICES: usize = 24;
 
 const CLASS_MASS_STORAGE: u8 = 0x01;
@@ -17,16 +18,7 @@ const CLASS_SERIAL_BUS: u8 = 0x0C;
 const SUBCLASS_USB: u8 = 0x03;
 const PROGIF_XHCI: u8 = 0x30;
 
-pub const Device = struct {
-    bus: u8 = 0,
-    device: u8 = 0,
-    function: u8 = 0,
-    vendor_id: u16 = 0,
-    device_id: u16 = 0,
-    class_code: u8 = 0,
-    subclass: u8 = 0,
-    prog_if: u8 = 0,
-};
+pub const Device = pci_scan.Device;
 
 pub const Status = struct {
     available: bool = false,
@@ -35,6 +27,15 @@ pub const Status = struct {
     segment: u16 = 0,
     start_bus: u8 = 0,
     end_bus: u8 = 0,
+    aperture_ready: bool = false,
+    aperture_bytes: u64 = 0,
+    mapping_checks: u64 = 0,
+    mapping_hits: u64 = 0,
+    mapping_misses: u64 = 0,
+    fast_accesses: u64 = 0,
+    config_reads: u64 = 0,
+    config_writes: u64 = 0,
+    invalid_accesses: u64 = 0,
     device_count: u32 = 0,
     stored_count: u32 = 0,
     ahci_count: u32 = 0,
@@ -54,16 +55,44 @@ pub const Status = struct {
 var current: Status = .{};
 var devices: [MAX_DEVICES]Device = .{Device{}} ** MAX_DEVICES;
 
-pub fn enumerate() Status {
-    const info = acpi.info();
+pub fn configure(info: acpi.Info) void {
+    const bus_count: u64 = if (info.mcfg_base != 0 and info.mcfg_start_bus <= info.mcfg_end_bus)
+        @as(u64, info.mcfg_end_bus) - @as(u64, info.mcfg_start_bus) + 1
+    else
+        0;
     current = .{
-        .available = info.mcfg_base != 0,
+        .available = info.mcfg_base != 0 and bus_count != 0,
         .mcfg_base = info.mcfg_base,
         .segment = info.mcfg_segment,
         .start_bus = info.mcfg_start_bus,
         .end_bus = info.mcfg_end_bus,
-        .reason = "MCFG ECAM missing",
+        .aperture_bytes = bus_count << 20,
+        .reason = if (info.mcfg_base != 0 and bus_count != 0) "MCFG configured" else "MCFG ECAM missing",
     };
+    @memset(devices[0..], Device{});
+}
+
+pub fn activateMappedAperture() bool {
+    if (!current.available or current.aperture_bytes == 0) return false;
+    if (current.mcfg_base > ~@as(u64, 0) - (current.aperture_bytes - 1)) {
+        current.invalid_accesses +%= 1;
+        current.reason = "MCFG ECAM range overflow";
+        return false;
+    }
+    const last = current.mcfg_base + current.aperture_bytes - 1;
+    current.mapping_checks +%= 2;
+    const first_mapped = paging.isMapped(phys.physToVirt(current.mcfg_base));
+    const last_mapped = paging.isMapped(phys.physToVirt(last));
+    if (first_mapped) current.mapping_hits +%= 1 else current.mapping_misses +%= 1;
+    if (last_mapped) current.mapping_hits +%= 1 else current.mapping_misses +%= 1;
+    current.aperture_ready = first_mapped and last_mapped;
+    current.reason = if (current.aperture_ready) "MCFG ECAM aperture ready" else "MCFG ECAM aperture mapping missing";
+    return current.aperture_ready;
+}
+
+pub fn enumerate() Status {
+    const info = acpi.info();
+    configure(info);
     @memset(devices[0..], Device{});
     bootlog.puts("[PCIE] enumeration\r\n");
     if (info.mcfg_base == 0) {
@@ -139,17 +168,38 @@ pub fn deviceAt(index: usize) ?Device {
 }
 
 pub fn readConfig32(base: u64, bus: u8, device: u8, function: u8, offset: u16) u32 {
-    const addr = base + (@as(u64, bus) << 20) + (@as(u64, device) << 15) + (@as(u64, function) << 12) + (offset & 0xFFC);
+    current.config_reads +%= 1;
+    const addr = configAddress(base, bus, device, function, offset) orelse {
+        current.invalid_accesses +%= 1;
+        return 0xFFFF_FFFF;
+    };
     if (!ensureMapped(addr)) return 0xFFFF_FFFF;
     const ptr: *volatile u32 = @ptrFromInt(phys.physToVirt(addr));
     return ptr.*;
 }
 
 pub fn writeConfig32(base: u64, bus: u8, device: u8, function: u8, offset: u16, value: u32) void {
-    const addr = base + (@as(u64, bus) << 20) + (@as(u64, device) << 15) + (@as(u64, function) << 12) + (offset & 0xFFC);
+    current.config_writes +%= 1;
+    const addr = configAddress(base, bus, device, function, offset) orelse {
+        current.invalid_accesses +%= 1;
+        return;
+    };
     if (!ensureMapped(addr)) return;
     const ptr: *volatile u32 = @ptrFromInt(phys.physToVirt(addr));
     ptr.* = value;
+}
+
+pub fn readCurrentConfig32(bus: u8, device: u8, function: u8, offset: u16) u32 {
+    return readConfig32(current.mcfg_base, bus, device, function, offset);
+}
+
+pub fn writeCurrentConfig32(bus: u8, device: u8, function: u8, offset: u16, value: u32) bool {
+    if (!validAccess(current.mcfg_base, bus, device, function, offset)) {
+        current.invalid_accesses +%= 1;
+        return false;
+    }
+    writeConfig32(current.mcfg_base, bus, device, function, offset, value);
+    return true;
 }
 
 pub fn readBar(device: Device, index: u8) u32 {
@@ -214,15 +264,37 @@ fn store(device: Device) void {
 }
 
 fn ensureMapped(addr: u64) bool {
+    if (current.aperture_ready) {
+        current.fast_accesses +%= 1;
+        return true;
+    }
     const page = addr & ~(paging.PAGE_SIZE - 1);
     const virt = phys.physToVirt(page);
+    current.mapping_checks +%= 1;
     if (!paging.isMapped(virt)) {
+        current.mapping_misses +%= 1;
         if (!paging.mapPage(virt, page, paging.WRITABLE | paging.CACHE_DISABLE | paging.NO_EXECUTE)) {
             current.malformed_reads += 1;
             return false;
         }
+    } else {
+        current.mapping_hits +%= 1;
     }
     return true;
+}
+
+fn configAddress(base: u64, bus: u8, device: u8, function: u8, offset: u16) ?u64 {
+    if (!validAccess(base, bus, device, function, offset)) return null;
+    const relative = pci_scan.ecamOffset(current.start_bus, bus, device, function, offset) orelse return null;
+    if (base > ~@as(u64, 0) - relative) return null;
+    return base + relative;
+}
+
+fn validAccess(base: u64, bus: u8, device: u8, function: u8, offset: u16) bool {
+    return current.available and
+        base == current.mcfg_base and
+        bus >= current.start_bus and bus <= current.end_bus and
+        device < 32 and function < 8 and offset <= 0x0FFF;
 }
 
 fn logDevice(prefix: []const u8, device: Device) void {

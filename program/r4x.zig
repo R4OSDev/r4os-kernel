@@ -5700,6 +5700,7 @@ fn configureR4XStartR4DevTable() void {
         .performance_irq_timing = &r4api.r4dev.performanceIrqTiming,
         .performance_boot_summary = &r4api.r4dev.performanceBootSummary,
         .performance_driver_work = &r4api.r4dev.performanceDriverWork,
+        .performance_pci_inventory = &r4api.r4dev.performancePciInventory,
     });
 }
 

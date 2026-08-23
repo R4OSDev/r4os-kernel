@@ -1,6 +1,5 @@
 const boot_info = @import("../bootloader/boot_info.zig");
 const acpi = @import("../platform/acpi.zig");
-const pcie = @import("../platform/pcie.zig");
 const blocks = @import("blocks.zig");
 const heap = @import("heap.zig");
 const layout = @import("layout.zig");
@@ -392,14 +391,13 @@ pub fn mapDeviceSpaceDryRun(info: acpi.Info) bool {
     if (info.madt_lapic_address != 0) required |= DEVICE_LAPIC;
     if (info.madt_first_ioapic_address != 0) required |= DEVICE_IOAPIC;
     if (info.hpet_base != 0) required |= DEVICE_HPET;
-    if (info.mcfg_base != 0) required |= DEVICE_ECAM;
+    if (info.mcfg_base != 0 and info.mcfg_start_bus <= info.mcfg_end_bus) required |= DEVICE_ECAM;
     if (info.fadt_reset_supported and info.fadt_reset_gas_valid and info.fadt_reset_address_space == 0) required |= DEVICE_ACPI_RESET;
 
     if (!mapFramebufferWindow(&kernel_space_builder, source_root)) return failDeviceSpace();
     if (!mapAcpiFirmware(info)) return failDeviceSpace();
     if (!mapPlatformMmio(info)) return failDeviceSpace();
     if (!mapPcieEcam(info)) return failDeviceSpace();
-    if (!mapPcieBars()) return failDeviceSpace();
 
     stats_value.device_mapping_count = device_mapping_count;
     if ((stats_value.device_probe_bits & required) != required) return failDeviceSpace();
@@ -831,46 +829,10 @@ fn mapPlatformMmio(info: acpi.Info) bool {
 
 fn mapPcieEcam(info: acpi.Info) bool {
     if (info.mcfg_base == 0) return true;
+    if (info.mcfg_start_bus > info.mcfg_end_bus) return true;
     const bus_count = @as(u64, info.mcfg_end_bus) - @as(u64, info.mcfg_start_bus) + 1;
-    const start_offset = @as(u64, info.mcfg_start_bus) * layout.MiB;
-    const base = checkedAdd(info.mcfg_base, start_offset) orelse return false;
     const len = checkedMul(bus_count, layout.MiB) orelse return false;
-    return mapMmioWindow("pcie-ecam", base, len, DEVICE_ECAM);
-}
-
-fn mapPcieBars() bool {
-    const status_value = pcie.status();
-    if (!status_value.enumerated or status_value.stored_count == 0) return true;
-
-    var ok = true;
-    var device_index: usize = 0;
-    while (device_index < status_value.stored_count) : (device_index += 1) {
-        const dev = pcie.deviceAt(device_index) orelse continue;
-        var bar: u8 = 0;
-        while (bar < 6) {
-            const low = pcie.readBar(dev, bar);
-            if (low == 0 or low == 0xffff_ffff) {
-                bar += 1;
-                continue;
-            }
-            if ((low & 1) != 0) {
-                bar += 1;
-                continue;
-            }
-            const bar_type = (low >> 1) & 0x3;
-            const raw = if (bar_type == 0x2 and bar < 5) pcie.readBar64(dev, bar) else @as(u64, low);
-            const base = raw & ~@as(u64, 0xf);
-            if (base != 0) {
-                ok = mapMmioWindow("pcie-bar-mmio", base, layout.PAGE_SIZE, DEVICE_PCIE_BAR) and ok;
-                if (ok) {
-                    stats_value.pcie_bar_count += 1;
-                    stats_value.pcie_bar_bytes += layout.PAGE_SIZE;
-                }
-            }
-            bar += if (bar_type == 0x2 and bar < 5) 2 else 1;
-        }
-    }
-    return ok;
+    return mapMmioWindow("pcie-ecam", info.mcfg_base, len, DEVICE_ECAM);
 }
 
 fn mapMmioWindow(name: []const u8, phys_base: u64, len: u64, bit: u32) bool {
