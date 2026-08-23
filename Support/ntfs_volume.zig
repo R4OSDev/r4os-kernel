@@ -176,6 +176,10 @@ pub const WriteStatus = enum(u8) {
     unsupported,
     offset_mismatch,
     io,
+    /// The primary mutation failed and at least one required rollback or
+    /// dirty-clear step failed as well.  Callers must preserve the dirty
+    /// volume state and must not reinterpret this as the primary error.
+    cleanup_failed,
 };
 
 /// Result of a name/path lookup.  `not_found` is reserved for a completely
@@ -1393,35 +1397,64 @@ fn mappedClustersInUnit(attr: *const AttrScratch, unit_start_vcn: u64, unit_clus
 // Write phase 1: allocation
 // ---------------------------------------------------------------------------
 
-/// Finds and marks `count` free clusters in $Bitmap (contiguous first fit,
-/// then any free run).  Marks bits durable BEFORE returning.  Returns the
-/// number of runs written into `runs_out` or null.
-fn allocateClusters(v: *const Volume, count: u64, runs_out: []ntfs.Run) ?usize {
+pub const AllocationResult = struct {
+    status: WriteStatus,
+    produced: usize = 0,
+};
+
+const FindFreeRunResult = struct {
+    status: WriteStatus,
+    run: ntfs.Run = .{ .length_clusters = 0, .lcn = null },
+};
+
+/// Finds `count` free clusters first, without mutating $Bitmap, and only then
+/// marks the complete prepared run set.  Capacity and search failures cannot
+/// therefore strand an already-marked prefix.  If a bitmap RMW fails, the
+/// current (possibly partially written) run and every earlier run are cleared
+/// before the failure becomes visible.
+fn allocateClusters(v: *const Volume, count: u64, runs_out: []ntfs.Run) AllocationResult {
     const bitmap_attr = &v.scratch.attr_cluster;
-    if (!collectAttribute(v, ntfs.MFT_RECORD_BITMAP, .data, &[_]u8{}, bitmap_attr)) return null;
-    if (bitmap_attr.resident) return null;
+    if (!collectAttribute(v, ntfs.MFT_RECORD_BITMAP, .data, &[_]u8{}, bitmap_attr)) return .{ .status = .io };
+    if (bitmap_attr.resident) return .{ .status = .io };
+    if (count == 0) return .{ .status = .ok };
     const total = v.totalClusters();
 
     var produced: usize = 0;
     var needed = count;
     var search_start: u64 = 0;
     while (needed > 0) {
-        const run = findFreeRun(v, bitmap_attr, total, search_start, needed) orelse {
-            // Roll back already marked runs to keep the bitmap exact.
-            var i: usize = 0;
-            while (i < produced) : (i += 1) {
-                _ = setBitmapRange(v, bitmap_attr, runs_out[i].lcn.?, runs_out[i].length_clusters, false);
-            }
-            return null;
-        };
-        if (produced >= runs_out.len) return null;
-        if (!setBitmapRange(v, bitmap_attr, run.lcn.?, run.length_clusters, true)) return null;
+        if (produced >= runs_out.len) return .{ .status = .record_full };
+        const found = findFreeRun(v, bitmap_attr, total, search_start, needed);
+        if (found.status != .ok) return .{ .status = found.status };
+        const run = found.run;
         runs_out[produced] = run;
         produced += 1;
         needed -= run.length_clusters;
-        search_start = checkedAddU64(run.lcn.?, run.length_clusters) orelse return null;
+        search_start = checkedAddU64(run.lcn.?, run.length_clusters) orelse return .{ .status = .io };
     }
-    return produced;
+
+    var marked: usize = 0;
+    while (marked < produced) : (marked += 1) {
+        const run = runs_out[marked];
+        if (!setBitmapRange(v, bitmap_attr, run.lcn.?, run.length_clusters, true)) {
+            // Include the current range: setBitmapRange may already have
+            // committed one or more of its bitmap sectors before failing.
+            const rollback_ok = rollbackClusterRanges(v, bitmap_attr, runs_out[0 .. marked + 1]);
+            return .{ .status = if (rollback_ok) .io else .cleanup_failed };
+        }
+    }
+    return .{ .status = .ok, .produced = produced };
+}
+
+fn rollbackClusterRanges(v: *const Volume, bitmap_attr: *const AttrScratch, runs: []const ntfs.Run) bool {
+    var ok = true;
+    for (runs) |run| {
+        const lcn = run.lcn orelse continue;
+        // Continue after a failed clear so every independent range gets its
+        // best chance to return to the pre-allocation state.
+        if (!setBitmapRange(v, bitmap_attr, lcn, run.length_clusters, false)) ok = false;
+    }
+    return ok;
 }
 
 fn freeClusters(v: *const Volume, runs: []const ntfs.Run) bool {
@@ -1436,7 +1469,7 @@ fn freeClusters(v: *const Volume, runs: []const ntfs.Run) bool {
 }
 
 /// Longest free run starting at or after `from`, capped at `max_len`.
-fn findFreeRun(v: *const Volume, bitmap_attr: *const AttrScratch, total: u64, from: u64, max_len: u64) ?ntfs.Run {
+fn findFreeRun(v: *const Volume, bitmap_attr: *const AttrScratch, total: u64, from: u64, max_len: u64) FindFreeRunResult {
     var sector_buf: [SECTOR_SIZE]u8 = undefined;
     var run_start: ?u64 = null;
     var run_len: u64 = 0;
@@ -1446,8 +1479,8 @@ fn findFreeRun(v: *const Volume, bitmap_attr: *const AttrScratch, total: u64, fr
         const byte_index = cluster / 8;
         const sector_index = byte_index / SECTOR_SIZE;
         if (sector_index != loaded_sector) {
-            const bitmap_offset = sectorByteOffset(sector_index) orelse return null;
-            if (!readRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..])) return null;
+            const bitmap_offset = sectorByteOffset(sector_index) orelse return .{ .status = .io };
+            if (!readRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..])) return .{ .status = .io };
             loaded_sector = sector_index;
         }
         const bit = (sector_buf[@intCast(byte_index % SECTOR_SIZE)] >> @intCast(cluster % 8)) & 1;
@@ -1459,9 +1492,9 @@ fn findFreeRun(v: *const Volume, bitmap_attr: *const AttrScratch, total: u64, fr
             break;
         }
     }
-    const start = run_start orelse return null;
-    if (run_len == 0) return null;
-    return .{ .length_clusters = run_len, .lcn = start };
+    const start = run_start orelse return .{ .status = .no_space };
+    if (run_len == 0) return .{ .status = .no_space };
+    return .{ .status = .ok, .run = .{ .length_clusters = run_len, .lcn = start } };
 }
 
 /// Sets or clears a cluster range in $Bitmap and writes the touched sectors.
@@ -1574,7 +1607,9 @@ fn growMft(v: *const Volume) bool {
     if (data_attr.count + 8 > data_attr.runs.len) return false;
 
     var new_runs: [8]ntfs.Run = undefined;
-    const produced = allocateClusters(v, add_clusters, new_runs[0..]) orelse return false;
+    const allocation = allocateClusters(v, add_clusters, new_runs[0..]);
+    if (allocation.status != .ok) return false;
+    const produced = allocation.produced;
 
     // Zero the fresh area before record 0 references it (free records are
     // zeroed, matching the formatter's layout that chkdsk accepts).
@@ -1616,7 +1651,7 @@ fn growMft(v: *const Volume) bool {
     var header = loadRecord(v, ntfs.MFT_RECORD_MFT, v.scratch.write_record[0..]) orelse return false;
     const record = v.scratch.write_record[0..v.record_bytes];
     if (!updateNonResident(record, &header, .data, &[_]u8{}, data_attr.runs[0..total_runs], new_bytes, new_bytes, new_bytes)) {
-        _ = freeClusters(v, new_runs[0..produced]);
+        if (!freeClusters(v, new_runs[0..produced])) return false;
         return false;
     }
     if (!updateFileNameDup(record, header, new_bytes, new_bytes, 0)) return false;
@@ -2162,7 +2197,9 @@ fn allocateIndexBlockVcn(v: *const Volume, dir_record: u64) ?u64 {
     if (!have_alloc) {
         // First-time creation with one cluster.
         var run: [1]ntfs.Run = undefined;
-        const produced = allocateClusters(v, 1, run[0..]) orelse return null;
+        const allocation = allocateClusters(v, 1, run[0..]);
+        if (allocation.status != .ok) return null;
+        const produced = allocation.produced;
         if (produced != 1) return null;
         const header = loadRecord(v, dir_record, v.scratch.record[0..]) orelse return null;
         _ = header;
@@ -2187,7 +2224,7 @@ fn allocateIndexBlockVcn(v: *const Volume, dir_record: u64) ?u64 {
         const total = (0x48 + mapping_len + 7) & ~@as(usize, 7);
         writeLe32(attr_buf[0..], 4, @intCast(total));
         if (!insertAttrRaw(record, attr_buf[0..total])) {
-            _ = freeClusters(v, run[0..1]);
+            if (!freeClusters(v, run[0..1])) return null;
             return null;
         }
 
@@ -2203,7 +2240,7 @@ fn allocateIndexBlockVcn(v: *const Volume, dir_record: u64) ?u64 {
         @memcpy(bmp_buf[0x18..0x20], &ntfs.I30_NAME_UTF16);
         bmp_buf[0x20] = 0x01;
         if (!insertAttrRaw(record, bmp_buf[0..0x28])) {
-            _ = freeClusters(v, run[0..1]);
+            if (!freeClusters(v, run[0..1])) return null;
             return null;
         }
         if (!storeRecord(v, dir_record, record)) return null;
@@ -2228,7 +2265,9 @@ fn allocateIndexBlockVcn(v: *const Volume, dir_record: u64) ?u64 {
     var grew = false;
     if (vcn == capacity) {
         if (alloc.count >= MAX_DATA_RUNS) return null;
-        const produced = allocateClusters(v, 1, grow_run[0..]) orelse return null;
+        const allocation = allocateClusters(v, 1, grow_run[0..]);
+        if (allocation.status != .ok) return null;
+        const produced = allocation.produced;
         if (produced != 1) return null;
         // Merge with the last run when physically adjacent to keep the
         // runlist compact.
@@ -2260,7 +2299,7 @@ fn allocateIndexBlockVcn(v: *const Volume, dir_record: u64) ?u64 {
         if (!runlistPhysicalRangeValid(v, alloc.runs[0..alloc.count])) return null;
         const new_bytes = checkedAddU64(alloc.alloc_size, @as(u64, v.index_block_bytes)) orelse return null;
         if (!updateNonResident(record, &header, .index_allocation, &ntfs.I30_NAME_UTF16, alloc.runs[0..alloc.count], new_bytes, new_bytes, new_bytes)) {
-            _ = freeClusters(v, grow_run[0..1]);
+            if (!freeClusters(v, grow_run[0..1])) return null;
             return null;
         }
     }
@@ -3501,20 +3540,21 @@ pub fn createFile(v: *const Volume, parent_record: u64, name: []const u8, data: 
         if (v.cluster_bytes == 0) return abortWrite(v, .io);
         const rounded_size = checkedAddU64(data_len, @as(u64, v.cluster_bytes) - 1) orelse return abortWrite(v, .invalid);
         const clusters = rounded_size / v.cluster_bytes;
-        run_count = allocateClusters(v, clusters, runs[0..]) orelse return abortWrite(v, .no_space);
+        const allocation = allocateClusters(v, clusters, runs[0..]);
+        if (allocation.status != .ok) return abortWrite(v, allocation.status);
+        run_count = allocation.produced;
         alloc_size = checkedMulU64(clusters, @as(u64, v.cluster_bytes)) orelse {
-            _ = freeClusters(v, runs[0..run_count]);
-            return abortWrite(v, .io);
+            return abortWriteFreeing(v, runs[0..run_count], .io);
         };
-        if (!budgetedFlush(v)) return .io;
+        if (!budgetedFlush(v)) return abortWriteFreeing(v, runs[0..run_count], .io);
     }
 
     const slot = allocateRecord(v) orelse return abortWriteFreeing(v, runs[0..run_count], .no_space);
-    if (!budgetedFlush(v)) return .io;
+    if (!budgetedFlush(v)) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
 
     // Write payload before the record references it.
     if (!resident and data.len > 0) {
-        if (!writeRunBytes(v, runs[0..run_count], 0, data)) return .io;
+        if (!writeRunBytes(v, runs[0..run_count], 0, data)) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
         // Zero the slack in the last cluster.
         const tail = alloc_size - data.len;
         if (tail > 0) {
@@ -3522,21 +3562,20 @@ pub fn createFile(v: *const Volume, parent_record: u64, name: []const u8, data: 
             var written: u64 = 0;
             while (written < tail) {
                 const chunk = @min(tail - written, zeros.len);
-                if (!writeRunBytes(v, runs[0..run_count], data.len + written, zeros[0..@intCast(chunk)])) return .io;
+                if (!writeRunBytes(v, runs[0..run_count], data.len + written, zeros[0..@intCast(chunk)])) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
                 written += chunk;
             }
         }
-        if (!budgetedFlush(v)) return .io;
+        if (!budgetedFlush(v)) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
     }
 
     // Build and store the record.
     if (buildFileRecord(v, slot.number, slot.sequence, parent_record, parent_sequence, name, if (resident) data else null, data.len, alloc_size) == 0) {
-        _ = releaseRecord(v, slot.number);
-        return abortWriteFreeing(v, runs[0..run_count], .invalid);
+        return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .invalid);
     }
     if (!resident and data.len > 0) {
-        var header = ntfs.FileRecordHeader.parse(v.scratch.write_record[0..v.record_bytes]) orelse return .io;
-        if (!updateNonResident(v.scratch.write_record[0..v.record_bytes], &header, .data, &[_]u8{}, runs[0..run_count], data.len, data.len, alloc_size)) return .io;
+        var header = ntfs.FileRecordHeader.parse(v.scratch.write_record[0..v.record_bytes]) orelse return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
+        if (!updateNonResident(v.scratch.write_record[0..v.record_bytes], &header, .data, &[_]u8{}, runs[0..run_count], data.len, data.len, alloc_size)) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .record_full);
     }
     if (!storeRecord(v, slot.number, v.scratch.write_record[0..v.record_bytes])) return .io;
     if (!budgetedFlush(v)) return .io;
@@ -3546,18 +3585,16 @@ pub fn createFile(v: *const Volume, parent_record: u64, name: []const u8, data: 
     // clears the dirty flag, leaving the directory exactly as before.
     var key: [0x10 + 0x42 + 2 * NAME_UNITS_MAX]u8 = undefined;
     const key_len = buildFileNameKey(v, key[0..], parent_record, parent_sequence, name, false, alloc_size, data.len) orelse {
-        markRecordFree(v, slot.number);
-        _ = releaseRecord(v, slot.number);
-        return abortWriteFreeing(v, runs[0..run_count], .invalid);
+        return abortWriteReleasingRecord(v, slot.number, true, runs[0..run_count], .invalid);
     };
     const key_ref = ntfs.FileReference.pack(.{ .record = slot.number, .sequence = slot.sequence });
     const insert = indexInsert(v, parent_record, key_ref, key[0..key_len]);
     if (insert != .ok) {
-        markRecordFree(v, slot.number);
-        _ = releaseRecord(v, slot.number);
-        if (!resident and run_count > 0) _ = freeClusters(v, runs[0..run_count]);
-        _ = setDirty(v, false);
-        return insert;
+        // An I/O result can mean that the index write reached media but its
+        // completion was lost.  Never free a record or clusters that may
+        // already be visible through that index; leave the volume dirty.
+        if (insert == .io or insert == .cleanup_failed) return insert;
+        return abortWriteReleasingRecord(v, slot.number, true, runs[0..run_count], insert);
     }
     if (!budgetedFlush(v)) return .io;
 
@@ -3566,14 +3603,14 @@ pub fn createFile(v: *const Volume, parent_record: u64, name: []const u8, data: 
 }
 
 /// Clears the in-use flag of a record in place (rollback helper).
-fn markRecordFree(v: *const Volume, number: u64) void {
-    if (!loadRecordRaw(v, number, v.scratch.write_record[0..])) return;
+fn markRecordFree(v: *const Volume, number: u64) bool {
+    if (!loadRecordRaw(v, number, v.scratch.write_record[0..])) return false;
     const record = v.scratch.write_record[0..v.record_bytes];
-    if (readLe32(record, 0) != ntfs.FILE_MAGIC) return;
+    if (readLe32(record, 0) != ntfs.FILE_MAGIC) return false;
     var flags = readLe16(record, 0x16);
     flags &= ~@as(u16, 0x01);
     writeLe16(record, 0x16, flags);
-    _ = storeRecord(v, number, record);
+    return storeRecord(v, number, record);
 }
 
 /// Overwrites an existing file, or creates it when absent.
@@ -4140,19 +4177,18 @@ fn spillDataToExtension(v: *const Volume, base_number: u64, runs: []const ntfs.R
         // Even a fresh full extension record cannot hold the runlist: the
         // multi-record VCN split is out of 0.60.16 scope.  Roll back the
         // just-allocated record bit before reporting.
-        _ = releaseRecord(v, ext_number);
-        return .record_full;
+        return rollbackUnpublishedRecord(v, ext_number, false, .record_full);
     }
     if (!storeRecord(v, ext_number, ext)) return .io;
-    if (!budgetedFlush(v)) return .io;
+    if (!budgetedFlush(v)) return rollbackUnpublishedRecord(v, ext_number, true, .io);
 
     // Base record: drop $DATA, add the $ATTRIBUTE_LIST.  Read SI/FN instances
     // first; the extension $DATA has instance 0 (emitNonResidentDataStub).
-    const header = loadRecord(v, base_number, v.scratch.write_record[0..]) orelse return .io;
+    const header = loadRecord(v, base_number, v.scratch.write_record[0..]) orelse return rollbackUnpublishedRecord(v, ext_number, true, .io);
     const base = v.scratch.write_record[0..v.record_bytes];
-    const si_instance = attributeInstance(base, header, .standard_information) orelse return .io;
-    const fn_instance = attributeInstance(base, header, .file_name) orelse return .io;
-    if (!removeAttrRaw(base, .data, &[_]u8{})) return .io;
+    const si_instance = attributeInstance(base, header, .standard_information) orelse return rollbackUnpublishedRecord(v, ext_number, true, .io);
+    const fn_instance = attributeInstance(base, header, .file_name) orelse return rollbackUnpublishedRecord(v, ext_number, true, .io);
+    if (!removeAttrRaw(base, .data, &[_]u8{})) return rollbackUnpublishedRecord(v, ext_number, true, .io);
     var list_value: [3 * 0x20]u8 = undefined;
     const list_len = buildDataAttributeListValue(list_value[0..], base_number, header.sequence, si_instance, fn_instance, ext_number, ext_seq, 0);
     var list_attr: [0x18 + 3 * 0x20]u8 = undefined;
@@ -4166,7 +4202,7 @@ fn spillDataToExtension(v: *const Volume, base_number: u64, runs: []const ntfs.R
     writeLe32(list_attr[0..], 0x10, @intCast(list_len));
     writeLe16(list_attr[0..], 0x14, value_offset);
     @memcpy(list_attr[value_offset .. value_offset + list_len], list_value[0..list_len]);
-    if (!insertAttrRaw(base, list_attr[0..attr_total])) return .record_full;
+    if (!insertAttrRaw(base, list_attr[0..attr_total])) return rollbackUnpublishedRecord(v, ext_number, true, .record_full);
     if (!storeRecord(v, base_number, base)) return .io;
     return .ok;
 }
@@ -4331,7 +4367,7 @@ fn appendFileAtOffsetImpl(v: *const Volume, parent_record: u64, name: []const u8
         if (durable and !budgetedFlush(v)) return .io;
         last_append_diagnostic_stage = 10; // slack runlist
         const commit = commitDataRunlist(v, found.record, attr.runs[0..attr.count], total, total, attr.alloc_size);
-        if (commit != .ok) return abortWrite(v, commit);
+        if (commit != .ok) return abortWriteAfterCommitFailure(v, commit);
         if (durable and !budgetedFlush(v)) return .io;
         last_append_diagnostic_stage = 11; // slack FILE_NAME
         if (!updateFileNameDupOnBase(v, found.record, attr.alloc_size, total)) return .io;
@@ -4354,8 +4390,10 @@ fn appendFileAtOffsetImpl(v: *const Volume, parent_record: u64, name: []const u8
     const need_clusters = required_clusters - allocated_clusters;
     if (attr.count + 8 > attr.runs.len) return abortWrite(v, .record_full);
     var new_runs: [8]ntfs.Run = undefined;
-    const produced = allocateClusters(v, need_clusters, new_runs[0..]) orelse return abortWrite(v, .no_space);
-    if (durable and !budgetedFlush(v)) return .io;
+    const allocation = allocateClusters(v, need_clusters, new_runs[0..]);
+    if (allocation.status != .ok) return abortWrite(v, allocation.status);
+    const produced = allocation.produced;
+    if (durable and !budgetedFlush(v)) return abortWriteFreeing(v, new_runs[0..produced], .io);
     var total_runs = attr.count;
     for (new_runs[0..produced]) |run| {
         const adjacent = if (total_runs > 0 and
@@ -4364,8 +4402,7 @@ fn appendFileAtOffsetImpl(v: *const Volume, parent_record: u64, name: []const u8
                 attr.runs[total_runs - 1].lcn.?,
                 attr.runs[total_runs - 1].length_clusters,
             ) orelse {
-                _ = freeClusters(v, new_runs[0..produced]);
-                return abortWrite(v, .io);
+                return abortWriteFreeing(v, new_runs[0..produced], .io);
             }) == run.lcn.?
         else
             false;
@@ -4374,38 +4411,37 @@ fn appendFileAtOffsetImpl(v: *const Volume, parent_record: u64, name: []const u8
                 attr.runs[total_runs - 1].length_clusters,
                 run.length_clusters,
             ) orelse {
-                _ = freeClusters(v, new_runs[0..produced]);
-                return abortWrite(v, .io);
+                return abortWriteFreeing(v, new_runs[0..produced], .io);
             };
         } else {
             if (total_runs >= attr.runs.len) {
-                _ = freeClusters(v, new_runs[0..produced]);
-                return abortWrite(v, .record_full);
+                return abortWriteFreeing(v, new_runs[0..produced], .record_full);
             }
             attr.runs[total_runs] = run;
             total_runs += 1;
         }
     }
     if (!runlistPhysicalRangeValid(v, attr.runs[0..total_runs])) {
-        _ = freeClusters(v, new_runs[0..produced]);
-        return abortWrite(v, .io);
+        return abortWriteFreeing(v, new_runs[0..produced], .io);
     }
     const extension_bytes = checkedMulU64(need_clusters, @as(u64, v.cluster_bytes)) orelse {
-        _ = freeClusters(v, new_runs[0..produced]);
-        return abortWrite(v, .io);
+        return abortWriteFreeing(v, new_runs[0..produced], .io);
     };
     const new_alloc = checkedAddU64(attr.alloc_size, extension_bytes) orelse {
-        _ = freeClusters(v, new_runs[0..produced]);
-        return abortWrite(v, .io);
+        return abortWriteFreeing(v, new_runs[0..produced], .io);
     };
     last_append_diagnostic_stage = 14; // extended payload
-    if (!writeRunBytes(v, attr.runs[0..total_runs], attr.data_size, data)) return .io;
-    if (durable and !budgetedFlush(v)) return .io;
+    if (!writeRunBytes(v, attr.runs[0..total_runs], attr.data_size, data)) return abortWriteFreeing(v, new_runs[0..produced], .io);
+    if (durable and !budgetedFlush(v)) return abortWriteFreeing(v, new_runs[0..produced], .io);
     last_append_diagnostic_stage = 15; // extended runlist
     const commit = commitDataRunlist(v, found.record, attr.runs[0..total_runs], total, total, new_alloc);
     if (commit != .ok) {
-        _ = freeClusters(v, new_runs[0..produced]);
-        _ = setDirty(v, false);
+        // record_full/no_space are pre-publication failures.  An I/O result
+        // may mean the new runlist is already visible and must never be
+        // followed by a best-effort free of its clusters.
+        if (commit == .record_full or commit == .no_space) {
+            return abortWriteFreeing(v, new_runs[0..produced], commit);
+        }
         return commit;
     }
     if (durable and !budgetedFlush(v)) return .io;
@@ -4437,24 +4473,25 @@ fn convertResidentAndAppend(v: *const Volume, parent_record: u64, name: []const 
     const rounded_total = checkedAddU64(total, @as(u64, v.cluster_bytes) - 1) orelse return abortWrite(v, .invalid);
     const clusters = rounded_total / v.cluster_bytes;
     var runs: [MAX_DATA_RUNS]ntfs.Run = undefined;
-    const produced = allocateClusters(v, clusters, runs[0..]) orelse return abortWrite(v, .no_space);
+    const allocation = allocateClusters(v, clusters, runs[0..]);
+    if (allocation.status != .ok) return abortWrite(v, allocation.status);
+    const produced = allocation.produced;
     const alloc_bytes = checkedMulU64(clusters, @as(u64, v.cluster_bytes)) orelse {
-        _ = freeClusters(v, runs[0..produced]);
-        return abortWrite(v, .io);
+        return abortWriteFreeing(v, runs[0..produced], .io);
     };
-    if (durable and !budgetedFlush(v)) return .io;
+    if (durable and !budgetedFlush(v)) return abortWriteFreeing(v, runs[0..produced], .io);
 
     // Old resident payload + new data into the fresh clusters.
     if (attr.resident_len > 0) {
-        if (!writeRunBytes(v, runs[0..produced], 0, attr.resident_copy[0..attr.resident_len])) return .io;
+        if (!writeRunBytes(v, runs[0..produced], 0, attr.resident_copy[0..attr.resident_len])) return abortWriteFreeing(v, runs[0..produced], .io);
     }
-    if (!writeRunBytes(v, runs[0..produced], attr.resident_len, data)) return .io;
-    if (durable and !budgetedFlush(v)) return .io;
+    if (!writeRunBytes(v, runs[0..produced], attr.resident_len, data)) return abortWriteFreeing(v, runs[0..produced], .io);
+    if (durable and !budgetedFlush(v)) return abortWriteFreeing(v, runs[0..produced], .io);
 
     // Swap the record's $DATA to a non-resident stub with the new runlist.
-    var header = loadRecord(v, record_number, v.scratch.write_record[0..]) orelse return .io;
+    var header = loadRecord(v, record_number, v.scratch.write_record[0..]) orelse return abortWriteFreeing(v, runs[0..produced], .io);
     const record = v.scratch.write_record[0..v.record_bytes];
-    if (!removeAttrRaw(record, .data, &[_]u8{})) return .io;
+    if (!removeAttrRaw(record, .data, &[_]u8{})) return abortWriteFreeing(v, runs[0..produced], .io);
     var stub: [0x48]u8 = .{0} ** 0x48;
     writeLe32(stub[0..], 0, @intFromEnum(ntfs.AttrType.data));
     writeLe32(stub[0..], 4, 0x48);
@@ -4463,12 +4500,10 @@ fn convertResidentAndAppend(v: *const Volume, parent_record: u64, name: []const 
     writeLe64(stub[0..], 0x28, alloc_bytes);
     writeLe64(stub[0..], 0x30, total);
     writeLe64(stub[0..], 0x38, total);
-    if (!insertAttrRaw(record, stub[0..])) return .io;
-    header = ntfs.FileRecordHeader.parse(record) orelse return .io;
+    if (!insertAttrRaw(record, stub[0..])) return abortWriteFreeing(v, runs[0..produced], .io);
+    header = ntfs.FileRecordHeader.parse(record) orelse return abortWriteFreeing(v, runs[0..produced], .io);
     if (!updateNonResident(record, &header, .data, &[_]u8{}, runs[0..produced], total, total, alloc_bytes)) {
-        _ = freeClusters(v, runs[0..produced]);
-        _ = setDirty(v, false);
-        return .record_full;
+        return abortWriteFreeing(v, runs[0..produced], .record_full);
     }
     _ = updateFileNameDup(record, header, alloc_bytes, total, v.now_filetime);
     if (!storeRecord(v, record_number, record)) return .io;
@@ -4550,28 +4585,23 @@ pub fn createDirectory(v: *const Volume, parent_record: u64, name: []const u8) W
 
     if (!setDirty(v, true)) return .io;
     const slot = allocateRecord(v) orelse return abortWrite(v, .no_space);
-    if (!budgetedFlush(v)) return .io;
+    if (!budgetedFlush(v)) return abortWriteReleasingRecord(v, slot.number, false, &.{}, .io);
 
     if (buildDirRecord(v, slot.number, slot.sequence, parent_record, parent_sequence, name) == 0) {
-        _ = releaseRecord(v, slot.number);
-        return abortWrite(v, .invalid);
+        return abortWriteReleasingRecord(v, slot.number, false, &.{}, .invalid);
     }
     if (!storeRecord(v, slot.number, v.scratch.write_record[0..v.record_bytes])) return .io;
     if (!budgetedFlush(v)) return .io;
 
     var key: [0x10 + 0x42 + 2 * NAME_UNITS_MAX]u8 = undefined;
     const key_len = buildFileNameKey(v, key[0..], parent_record, parent_sequence, name, true, 0, 0) orelse {
-        markRecordFree(v, slot.number);
-        _ = releaseRecord(v, slot.number);
-        return abortWrite(v, .invalid);
+        return abortWriteReleasingRecord(v, slot.number, true, &.{}, .invalid);
     };
     const key_ref = ntfs.FileReference.pack(.{ .record = slot.number, .sequence = slot.sequence });
     const insert = indexInsert(v, parent_record, key_ref, key[0..key_len]);
     if (insert != .ok) {
-        markRecordFree(v, slot.number);
-        _ = releaseRecord(v, slot.number);
-        _ = setDirty(v, false);
-        return insert;
+        if (insert == .io or insert == .cleanup_failed) return insert;
+        return abortWriteReleasingRecord(v, slot.number, true, &.{}, insert);
     }
     if (!budgetedFlush(v)) return .io;
     if (!setDirty(v, false)) return .io;
@@ -5458,10 +5488,12 @@ fn fillHolesInRuns(v: *const Volume, attr: *AttrScratch, offset: u64, len: u64) 
                 break :build;
             }
             var new_runs: [8]ntfs.Run = undefined;
-            const produced = allocateClusters(v, need, new_runs[0..]) orelse {
-                status = .no_space;
+            const allocation = allocateClusters(v, need, new_runs[0..]);
+            if (allocation.status != .ok) {
+                status = allocation.status;
                 break :build;
-            };
+            }
+            const produced = allocation.produced;
             for (new_runs[0..produced]) |nr| {
                 fresh[fresh_count] = nr;
                 fresh_count += 1;
@@ -5485,7 +5517,7 @@ fn fillHolesInRuns(v: *const Volume, attr: *AttrScratch, offset: u64, len: u64) 
     }
 
     if (status != .ok) {
-        _ = freeClusters(v, fresh[0..fresh_count]);
+        if (fresh_count != 0 and !freeClusters(v, fresh[0..fresh_count])) return .cleanup_failed;
         return status;
     }
     if (!changed) return .ok;
@@ -5550,7 +5582,7 @@ pub fn writeFileAt(v: *const Volume, record_number: u64, offset: u64, data: []co
     if (!budgetedFlush(v)) return .io;
     const new_init = if (write_end > attr.initialized_size) write_end else attr.initialized_size;
     const commit = commitDataRunlist(v, record_number, attr.runs[0..attr.count], attr.data_size, new_init, attr.alloc_size);
-    if (commit != .ok) return abortWrite(v, commit);
+    if (commit != .ok) return abortWriteAfterCommitFailure(v, commit);
     if (!budgetedFlush(v)) return .io;
     if (!setDirty(v, false)) return .io;
     return .ok;
@@ -5597,12 +5629,63 @@ pub fn storeRecordForTest(v: *const Volume, number: u64) bool {
 }
 
 fn abortWrite(v: *const Volume, status: WriteStatus) WriteStatus {
-    _ = setDirty(v, false);
+    if (status == .cleanup_failed) return status;
+    if (!setDirty(v, false)) return .cleanup_failed;
     return status;
 }
 
+fn abortWriteAfterCommitFailure(v: *const Volume, status: WriteStatus) WriteStatus {
+    // A store returning I/O may have reached media before its completion was
+    // lost.  Keep the dirty bracket in that ambiguous state; clearing it
+    // would falsely certify a runlist whose visibility is unknown.
+    if (status == .io or status == .cleanup_failed) return status;
+    return abortWrite(v, status);
+}
+
 fn abortWriteFreeing(v: *const Volume, runs: []const ntfs.Run, status: WriteStatus) WriteStatus {
-    _ = freeClusters(v, runs);
-    _ = setDirty(v, false);
+    if (status == .cleanup_failed) return status;
+    // If cluster release fails, the dirty bit is deliberately retained.  A
+    // successful dirty clear must never hide incomplete allocation cleanup.
+    if (runs.len != 0 and !freeClusters(v, runs)) return .cleanup_failed;
+    return abortWrite(v, status);
+}
+
+fn abortWriteReleasingRecord(
+    v: *const Volume,
+    record_number: u64,
+    record_stored: bool,
+    runs: []const ntfs.Run,
+    status: WriteStatus,
+) WriteStatus {
+    if (status == .cleanup_failed) return status;
+    // A stored record is made non-live before its MFT bitmap bit and owned
+    // clusters are released.  Stopping on the first failure avoids freeing
+    // storage that an on-disk record may still reference.
+    if (record_stored and !markRecordFree(v, record_number)) return .cleanup_failed;
+    if (!releaseRecord(v, record_number)) return .cleanup_failed;
+    return abortWriteFreeing(v, runs, status);
+}
+
+fn rollbackUnpublishedRecord(v: *const Volume, record_number: u64, record_stored: bool, status: WriteStatus) WriteStatus {
+    if (record_stored and !markRecordFree(v, record_number)) return .cleanup_failed;
+    if (!releaseRecord(v, record_number)) return .cleanup_failed;
     return status;
+}
+
+/// Host-model seams for allocation and cleanup fault injection.  Production
+/// filesystem adapters do not use these entry points.
+pub fn allocateClustersForTest(v: *const Volume, count: u64, runs_out: []ntfs.Run) AllocationResult {
+    return allocateClusters(v, count, runs_out);
+}
+
+pub fn freeClustersForTest(v: *const Volume, runs: []const ntfs.Run) bool {
+    return freeClusters(v, runs);
+}
+
+pub fn abortWriteForTest(v: *const Volume, status: WriteStatus) WriteStatus {
+    return abortWrite(v, status);
+}
+
+pub fn abortWriteFreeingForTest(v: *const Volume, runs: []const ntfs.Run, status: WriteStatus) WriteStatus {
+    return abortWriteFreeing(v, runs, status);
 }

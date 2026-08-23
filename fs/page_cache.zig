@@ -624,7 +624,9 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
     stats.write_through_requests +%= 1;
     releaseLock(guard);
     locked = false;
-    const write_ok = block.write(device_index, lba, sectors, staged_data[0..byte_count]);
+    const write_result = block.writeWithProgress(device_index, lba, sectors, staged_data[0..byte_count]);
+    const completed_sectors: usize = @min(@as(usize, write_result.sectors_completed), sector_count);
+    const write_ok = write_result.err == .none and completed_sectors == sector_count;
 
     // Every pinned page must be released under the cache lock on both success
     // and failure. relock() is deliberately non-abandoning.
@@ -643,9 +645,13 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
                 entries[index].device_index == device_index and
                 entries[index].page_lba == page and
                 entries[index].io_busy;
-            if (owns_entry and write_ok) {
+            const completed_in_span = if (completed_sectors > offset)
+                @min(span, completed_sectors - offset)
+            else
+                0;
+            if (owns_entry and completed_in_span != 0) {
                 var page_offset: usize = 0;
-                while (page_offset < span) : (page_offset += 1) {
+                while (page_offset < completed_in_span) : (page_offset += 1) {
                     const bit = @as(u8, 1) << @as(u3, @intCast(first + page_offset));
                     entries[index].valid_mask &= ~bit;
                     entries[index].dirty_mask &= ~bit;
@@ -658,7 +664,7 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
                 owned_entries[index / 64] &= ~ownership_bit;
                 const was_reserved = (reserved_entries[index / 64] & ownership_bit) != 0;
                 reserved_entries[index / 64] &= ~ownership_bit;
-                if ((write_ok or was_reserved) and
+                if ((completed_in_span != 0 or was_reserved) and
                     entries[index].valid_mask == 0 and
                     entries[index].dirty_mask == 0)
                 {
@@ -684,11 +690,11 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
             return false;
         }
     }
+    stats.write_through_updates +%= @intCast(completed_sectors);
     if (!write_ok) {
         stats.write_errors +%= 1;
         return false;
     }
-    stats.write_through_updates +%= @intCast(sector_count);
     return true;
 }
 

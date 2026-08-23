@@ -1,4 +1,5 @@
 const diag_screen = @import("../kernel/diag_screen.zig");
+const block_split = @import("block_split.zig");
 const drive = @import("../fs/drive.zig");
 const heap = @import("../memory/heap.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
@@ -125,6 +126,14 @@ pub const Error = enum {
     backend_read,
     backend_write,
     backend_flush,
+};
+
+/// Exact committed prefix of a logical write.  Filesystem/cache callers use
+/// this to invalidate only sectors that definitely reached the backend when
+/// a later backend-sized chunk fails.
+pub const TransferResult = struct {
+    sectors_completed: u16 = 0,
+    err: Error = .none,
 };
 
 pub const Stats = struct {
@@ -584,6 +593,22 @@ pub fn read(index: usize, lba: u64, sectors: u16, out: []u8) bool {
         recordReadFailure(device, err);
         return false;
     }
+    var iterator = block_split.Iterator.init(sectors, device.max_sectors_per_request, device.sector_size) orelse {
+        recordReadFailure(device, .invalid_request);
+        return false;
+    };
+    while (iterator.next()) |chunk| {
+        if (readChunk(
+            device,
+            lba + @as(u64, chunk.sector_offset),
+            chunk.sectors,
+            out[chunk.byte_offset .. chunk.byte_offset + chunk.byte_count],
+        ) != .none) return false;
+    }
+    return true;
+}
+
+fn readChunk(device: *Device, lba: u64, sectors: u16, out: []u8) Error {
     const byte_count = @as(usize, sectors) * @as(usize, device.sector_size);
 
     // The runtime block worker is a different task.  It must never retain a
@@ -597,7 +622,7 @@ pub fn read(index: usize, lba: u64, sectors: u16, out: []u8) bool {
     const bounce = if (use_runtime_worker)
         heap.alloc(byte_count, 16) orelse {
             recordReadFailure(device, .busy);
-            return false;
+            return .busy;
         }
     else
         null;
@@ -606,34 +631,59 @@ pub fn read(index: usize, lba: u64, sectors: u16, out: []u8) bool {
     };
     const request_buffer = if (bounce) |memory| memory.ptr else out.ptr;
     const request_id = enqueueRequest(device, .read, lba, sectors, request_buffer, null, byte_count) orelse {
-        recordReadFailure(device, device.stats.last_error);
-        return false;
+        const err = device.stats.last_error;
+        recordReadFailure(device, err);
+        return err;
     };
     scheduleDeviceQueue(device, use_runtime_worker);
     const result = waitForRequest(device, request_id, requestTimeout(device));
-    if (!result.ok) return false;
+    if (!result.ok) return result.err;
     if (bounce) |memory| @memcpy(out[0..byte_count], memory[0..byte_count]);
-    return true;
+    return .none;
 }
 
 pub fn write(index: usize, lba: u64, sectors: u16, data: []const u8) bool {
-    var pin = pinDevice(index) orelse return false;
+    const result = writeWithProgress(index, lba, sectors, data);
+    return result.err == .none and result.sectors_completed == sectors;
+}
+
+pub fn writeWithProgress(index: usize, lba: u64, sectors: u16, data: []const u8) TransferResult {
+    var pin = pinDevice(index) orelse return .{ .err = .invalid_request };
     defer unpinDevice(&pin);
     const device = pin.device;
     if (device.write_fn == null or !device.writable) {
         recordWriteFailure(device, .no_writer);
-        return false;
+        return .{ .err = .no_writer };
     }
     if (validateRequest(device, lba, sectors, data.len)) |err| {
         recordWriteFailure(device, err);
-        return false;
+        return .{ .err = err };
     }
+    var iterator = block_split.Iterator.init(sectors, device.max_sectors_per_request, device.sector_size) orelse {
+        recordWriteFailure(device, .invalid_request);
+        return .{ .err = .invalid_request };
+    };
+    var completed: u16 = 0;
+    while (iterator.next()) |chunk| {
+        const err = writeChunk(
+            device,
+            lba + @as(u64, chunk.sector_offset),
+            chunk.sectors,
+            data[chunk.byte_offset .. chunk.byte_offset + chunk.byte_count],
+        );
+        if (err != .none) return .{ .sectors_completed = completed, .err = err };
+        completed += chunk.sectors;
+    }
+    return .{ .sectors_completed = completed };
+}
+
+fn writeChunk(device: *Device, lba: u64, sectors: u16, data: []const u8) Error {
     const byte_count = @as(usize, sectors) * @as(usize, device.sector_size);
     const use_runtime_worker = runtimeWorkerReady();
     const bounce = if (use_runtime_worker)
         heap.alloc(byte_count, 16) orelse {
             recordWriteFailure(device, .busy);
-            return false;
+            return .busy;
         }
     else
         null;
@@ -643,11 +693,13 @@ pub fn write(index: usize, lba: u64, sectors: u16, data: []const u8) bool {
     if (bounce) |memory| @memcpy(memory[0..byte_count], data[0..byte_count]);
     const request_buffer = if (bounce) |memory| memory.ptr else data.ptr;
     const request_id = enqueueRequest(device, .write, lba, sectors, null, request_buffer, byte_count) orelse {
-        recordWriteFailure(device, device.stats.last_error);
-        return false;
+        const err = device.stats.last_error;
+        recordWriteFailure(device, err);
+        return err;
     };
     scheduleDeviceQueue(device, use_runtime_worker);
-    return waitForRequest(device, request_id, requestTimeout(device)).ok;
+    const result = waitForRequest(device, request_id, requestTimeout(device));
+    return if (result.ok) .none else result.err;
 }
 
 pub fn flush(index: usize) bool {
@@ -1191,7 +1243,7 @@ fn recordFlushFailure(device: *Device, err: Error) void {
 
 fn validateRequest(device: *const Device, lba: u64, sectors: u16, bytes: usize) ?Error {
     if (sectors == 0) return .invalid_request;
-    if (device.max_sectors_per_request != 0 and sectors > device.max_sectors_per_request) return .request_too_large;
+    if (@as(u64, sectors) > std.math.maxInt(u64) - lba) return .out_of_range;
     if (bytes < @as(usize, sectors) * @as(usize, device.sector_size)) return .buffer_too_small;
     if (device.sector_count != 0) {
         if (lba >= device.sector_count) return .out_of_range;

@@ -184,6 +184,7 @@ pub fn build(b: *std.Build) void {
         "program/gui_alpha8.zig",
         "program/r4x_start.zig",
         "sched/wait_node.zig",
+        "storage/block_split.zig",
     };
     for (unit_tests) |path| addUnitTest(b, test_step, path);
     addContractUnitTest(b, test_step, contract, config, "services_tests.zig");

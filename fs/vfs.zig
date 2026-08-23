@@ -799,7 +799,7 @@ fn appendStatusFromNtfs(status: ntfs_fs.WriteStatus) AppendStatus {
         .exists => .invalid,
         .offset_mismatch => .offset_mismatch,
         .no_space, .dir_full, .record_full => .too_large,
-        .io => .io,
+        .io, .cleanup_failed => .io,
     };
 }
 

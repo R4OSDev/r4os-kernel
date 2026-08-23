@@ -622,7 +622,7 @@ pub fn renameEntryStatus(volume: Volume, parent: u64, old_name: []const u8, new_
         // NTFS implements rename. Any other backend result can arise after
         // its dirty bracket or a durable sub-step has begun, so even a
         // low-level "unsupported" is not proof that Copy/Delete is safe.
-        .directory, .not_directory, .not_empty, .read_only_target, .no_space, .dir_full, .record_full, .unsupported, .offset_mismatch, .io => .io,
+        .directory, .not_directory, .not_empty, .read_only_target, .no_space, .dir_full, .record_full, .unsupported, .offset_mismatch, .io, .cleanup_failed => .io,
     };
 }
 
