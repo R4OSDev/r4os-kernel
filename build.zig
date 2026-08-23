@@ -180,6 +180,7 @@ pub fn build(b: *std.Build) void {
         "kernel/driver_work_queue.zig",
         "kernel/service_ipc_queue.zig",
         "net/config_writer.zig",
+        "net/serial_link_runtime.zig",
         "net/tcp_runtime.zig",
         "platform/monotonic_math.zig",
         "platform/pci_scan.zig",

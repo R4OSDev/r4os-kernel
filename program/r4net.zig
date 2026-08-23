@@ -476,7 +476,7 @@ pub fn serialLinkHostTest() callconv(.c) i32 {
 pub fn serialLinkInbox(out: *SerialLinkMessage) callconv(.c) i32 {
     serial_link.poll();
     var message: serial_link.Message = .{};
-    if (!serial_link.lastMessage(&message)) {
+    if (!serial_link.takeMessage(&message)) {
         out.* = .{};
         return 0;
     }

@@ -1,15 +1,21 @@
 const serial = @import("../driver/com.zig");
+const interrupts = @import("../arch/x86_64/interrupts.zig");
 const protocol_api = @import("../kernel/protocol_api.zig");
+const time_core = @import("../platform/time.zig");
 const r4p = @import("../program/r4p.zig");
 const r4p_contract = @import("r4p_contract.zig");
+const scheduler = @import("../sched/scheduler.zig");
+const runtime = @import("serial_link_runtime.zig");
+const timing = @import("timing.zig");
 
 pub const MAGIC: [4]u8 = .{ 'R', '4', 'S', 'L' };
 pub const VERSION: u8 = 1;
 pub const TYPE_DIAG: u8 = 1;
 pub const TYPE_MESSAGE: u8 = 2;
 pub const HEADER_SIZE: usize = 10;
-pub const MAX_PAYLOAD: usize = 256;
+pub const MAX_PAYLOAD: usize = runtime.max_payload;
 pub const MAX_FRAME: usize = HEADER_SIZE + MAX_PAYLOAD;
+const TX_FRAME_TIMEOUT_MS: u64 = 250;
 
 const State = struct {
     present: bool = false,
@@ -40,6 +46,7 @@ const State = struct {
     last_payload: [MAX_PAYLOAD]u8 = .{0} ** MAX_PAYLOAD,
     last_message_len: u16 = 0,
     last_message: [MAX_PAYLOAD]u8 = .{0} ** MAX_PAYLOAD,
+    message_queue: runtime.MessageQueue = .{},
     last_error: []const u8 = "none",
 };
 
@@ -75,10 +82,7 @@ pub const Snapshot = struct {
     last_error: [32]u8 = .{0} ** 32,
 };
 
-pub const Message = struct {
-    len: u16 = 0,
-    data: [MAX_PAYLOAD]u8 = .{0} ** MAX_PAYLOAD,
-};
+pub const Message = runtime.Message;
 
 var state: State = .{};
 
@@ -114,7 +118,15 @@ pub fn sendFrame(frame_type: u8, payload: []const u8) bool {
         state.last_error = "tx-length";
         return false;
     };
-    writeFrame(frame[0..len]);
+    const written = writeFrame(frame[0..len]);
+    if (written != len) {
+        state.tx_skipped +%= len - written;
+        state.timeouts +%= 1;
+        state.last_error = "tx-timeout";
+        return false;
+    }
+    state.tx_frames +%= 1;
+    state.last_error = "none";
     return true;
 }
 
@@ -127,6 +139,8 @@ pub fn sendMessage(payload: []const u8) bool {
 }
 
 pub fn snapshot(out: *Snapshot) void {
+    const flags = interrupts.saveAndDisable();
+    defer interrupts.restore(flags);
     out.* = .{
         .present = state.present,
         .initialized = state.initialized,
@@ -162,20 +176,27 @@ pub fn snapshot(out: *Snapshot) void {
     copyFixed(out.last_error[0..], state.last_error);
 }
 
-pub fn lastMessage(out: *Message) bool {
-    out.* = .{};
-    if (state.last_message_len == 0) return false;
-    const message_len: usize = @intCast(state.last_message_len);
-    out.len = state.last_message_len;
-    @memcpy(out.data[0..message_len], state.last_message[0..message_len]);
-    return true;
+pub fn takeMessage(out: *Message) bool {
+    const flags = interrupts.saveAndDisable();
+    defer interrupts.restore(flags);
+    return state.message_queue.pop(out);
 }
 
-fn writeFrame(frame: []const u8) void {
-    for (frame) |byte| serial.com2.putc(byte);
-    state.tx_frames += 1;
-    state.tx_bytes += frame.len;
-    state.last_error = "none";
+fn writeFrame(frame: []const u8) usize {
+    const timeout_ticks = @max(@as(u64, 1), timing.msToTicks(TX_FRAME_TIMEOUT_MS));
+    const deadline = runtime.TxDeadline.begin(time_core.monotonicTicks(), timeout_ticks);
+    var written: usize = 0;
+    while (written < frame.len) {
+        const progress = serial.com2.writeAvailable(frame[written..]);
+        if (progress != 0) {
+            written += progress;
+            continue;
+        }
+        if (deadline.expired(time_core.monotonicTicks())) break;
+        scheduler.sleepTicksWithReason(1, "serial-link-tx-wait");
+    }
+    state.tx_bytes +%= written;
+    return written;
 }
 
 fn parseByte(byte: u8) void {
@@ -267,9 +288,17 @@ fn applyR4slFrame(op: r4p_contract.R4slOp) void {
     state.last_payload_len = @intCast(payload_len);
     if (payload_len != 0) @memcpy(state.last_payload[0..payload_len], op.payload[0..payload_len]);
     if (op.frame_type == TYPE_MESSAGE) {
-        state.message_rx += 1;
+        const flags = interrupts.saveAndDisable();
+        state.message_rx +%= 1;
         state.last_message_len = @intCast(payload_len);
         if (payload_len != 0) @memcpy(state.last_message[0..payload_len], op.payload[0..payload_len]);
+        const queued = state.message_queue.push(op.payload[0..payload_len]);
+        interrupts.restore(flags);
+        if (!queued) {
+            state.overflows +%= 1;
+            state.last_error = "message-queue-full";
+            return;
+        }
     }
     state.last_error = "none";
 }

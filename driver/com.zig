@@ -36,6 +36,16 @@ pub const Port = struct {
         io.outb(self.base, c);
     }
 
+    // Nonblocking runtime path for COM2/Serial-Link. Once THR is empty the
+    // enabled 16550 FIFO accepts one bounded burst; callers own retry and
+    // deadline policy and therefore never hide a stalled byte as success.
+    pub fn writeAvailable(self: Port, data: []const u8) usize {
+        if (data.len == 0 or (io.inb(self.base + 5) & 0x20) == 0) return 0;
+        const count = @min(data.len, UART_FIFO_DEPTH);
+        for (data[0..count]) |byte| io.outb(self.base, byte);
+        return count;
+    }
+
     pub fn hasData(self: Port) bool {
         return (io.inb(self.base + 5) & 0x01) != 0;
     }
