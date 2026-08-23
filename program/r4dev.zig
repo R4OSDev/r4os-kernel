@@ -1425,10 +1425,13 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v3_size: usize = @offsetOf(ProgramPerformanceSummary, "service_payload_copy_bytes");
     const v4_size: usize = @offsetOf(ProgramPerformanceSummary, "service_queue_scan_passes");
     const v5_size: usize = @offsetOf(ProgramPerformanceSummary, "service_lock_timing_stride");
-    const v6_size: usize = @sizeOf(ProgramPerformanceSummary);
+    const v6_size: usize = @offsetOf(ProgramPerformanceSummary, "service_registry_index_queries");
+    const v7_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v6_size)
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v7_size)
         performance_snapshot_version
+    else if (caller_version >= 6 and caller_size >= v6_size)
+        6
     else if (caller_version >= 5 and caller_size >= v5_size)
         5
     else if (caller_version >= 4 and caller_size >= v4_size)
@@ -1445,7 +1448,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         3 => v3_size,
         4 => v4_size,
         5 => v5_size,
-        else => v6_size,
+        6 => v6_size,
+        else => v7_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -1714,6 +1718,11 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .service_lock_timing_stride = svc.lock_timing_stride,
         .service_lock_timing_reserved0 = svc.lock_timing_reserved0,
         .service_lock_timing_samples = svc.lock_timing_samples,
+        .service_registry_index_queries = svc.registry_index_queries,
+        .service_registry_refresh_requests = svc.registry_refresh_requests,
+        .service_registry_refresh_visits = svc.registry_refresh_visits,
+        .service_registry_instance_lookups = svc.registry_instance_lookups,
+        .service_registry_index_end_markers = svc.registry_index_end_markers,
         .tcp_max_connections = tcp_summary.max_connections,
         .tcp_active_connections = tcp_summary.active_connections,
         .tcp_active_listeners = tcp_summary.active_listeners,

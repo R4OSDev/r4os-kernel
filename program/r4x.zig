@@ -11041,8 +11041,21 @@ fn apiProgramClass(path_ptr: [*:0]const u8, policy_raw: u32) callconv(.c) i32 {
 
 fn apiServiceInfo(index: u32, out: *ServiceInfo) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return services.API_ERR_INVALID;
-    serviceApiRefreshAll();
-    return services.apiInfoAt(index, out, r4api.r4sys.ticks());
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        var target = (if (attempt == 0)
+            services.beginApiIndexRefresh(index)
+        else
+            services.retryApiIndexRefresh(index)) orelse {
+            out.* = .{};
+            return 0;
+        };
+        if (!serviceApiRefreshTarget(&target)) continue;
+        const result = services.apiInfoForIndexTarget(target, out, r4api.r4sys.ticks());
+        if (result != services.API_ERR_BUSY) return result;
+    }
+    out.* = .{};
+    return services.API_ERR_BUSY;
 }
 
 fn apiServiceStatus(name_ptr: [*:0]const u8, out: *ServiceInfo) callconv(.c) i32 {
@@ -11188,8 +11201,21 @@ fn apiServiceEndpointReply(handle: u32, request_id: u32, status: i32, payload_pt
 
 fn apiServiceDetail(index: u32, out: *ServiceDetail) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return services.API_ERR_INVALID;
-    serviceApiRefreshAll();
-    return services.apiDetailAt(index, out, r4api.r4sys.ticks());
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        var target = (if (attempt == 0)
+            services.beginApiIndexRefresh(index)
+        else
+            services.retryApiIndexRefresh(index)) orelse {
+            out.* = .{};
+            return 0;
+        };
+        if (!serviceApiRefreshTarget(&target)) continue;
+        const result = services.apiDetailForIndexTarget(target, out, r4api.r4sys.ticks());
+        if (result != services.API_ERR_BUSY) return result;
+    }
+    out.* = .{};
+    return services.API_ERR_BUSY;
 }
 
 fn apiServiceDetailByName(name_ptr: [*:0]const u8, out: *ServiceDetail) callconv(.c) i32 {
@@ -11424,14 +11450,55 @@ fn serviceApiStopByName(name: []const u8, out: *ServiceInfo, timeout_ticks: u64)
     return services.API_ERR_TIMEOUT;
 }
 
-fn serviceApiRefreshAll() void {
-    var i: usize = 0;
-    while (i < services.MAX_SERVICES) : (i += 1) {
-        const entry = services.entryAt(i) orelse continue;
-        var name_buf: [services.MAX_NAME]u8 = undefined;
-        @memcpy(name_buf[0..entry.name_len], entry.name[0..entry.name_len]);
-        serviceApiRefreshName(name_buf[0..entry.name_len]);
+fn serviceApiRefreshTarget(target: *services.ApiIndexTarget) bool {
+    const entry = services.entryForApiIndexTarget(target.*) orelse return false;
+    if (entry.instance_id == 0) return true;
+    if (!services.noteApiIndexInstanceLookup(target.*)) return false;
+
+    if (instanceSnapshot(entry.instance_id)) |snapshot| {
+        if (snapshot.app_class != INSTANCE_CLASS_SERVICE) {
+            if (services.markFailedTarget(target.*, -2, "instance class mismatch") != services.OK) return false;
+            target.instance_id = 0;
+            target.state = .failed;
+        } else if (snapshot.state == @intFromEnum(InstanceState.done)) {
+            const exit_code = snapshot.exit_code;
+            _ = finishInstance(entry.instance_id);
+            const current = services.entryForApiIndexTarget(target.*) orelse return false;
+            if (current.state == .stopping or exit_code == 0) {
+                if (services.markStoppedTarget(target.*, exit_code) != services.OK) return false;
+                target.state = if (current.start_mode == .disabled) .disabled else .stopped;
+            } else {
+                if (services.markFailedTarget(target.*, exit_code, "service exited") != services.OK) return false;
+                target.state = .failed;
+            }
+            target.instance_id = 0;
+        } else if (snapshot.close_requested and entry.state != .stopping) {
+            if (services.markStoppingTarget(target.*) != services.OK) return false;
+            target.state = .stopping;
+        }
+        return services.entryForApiIndexTarget(target.*) != null;
     }
+
+    var exit_code = takeExitCode(entry.instance_id) orelse (if (entry.state == .stopping) @as(i32, 0) else @as(i32, -1));
+    var handle: ProgramProcessHandle = .{};
+    if (apiProgramOpenHandle(entry.instance_id, &handle) == PROGRAM_HANDLE_OK) {
+        var completion: ProgramProcessCompletion = .{};
+        const reap_status = apiProgramHandleReap(&handle, &completion);
+        if (reap_status == PROGRAM_HANDLE_ERROR_WOULD_BLOCK) {
+            return services.entryForApiIndexTarget(target.*) != null;
+        }
+        if (reap_status == PROGRAM_HANDLE_OK) exit_code = completion.exit_code;
+    }
+    const current = services.entryForApiIndexTarget(target.*) orelse return false;
+    if (current.state == .stopping or exit_code == 0) {
+        if (services.markStoppedTarget(target.*, exit_code) != services.OK) return false;
+        target.state = if (current.start_mode == .disabled) .disabled else .stopped;
+    } else {
+        if (services.markFailedTarget(target.*, exit_code, "service exited") != services.OK) return false;
+        target.state = .failed;
+    }
+    target.instance_id = 0;
+    return true;
 }
 
 fn waitOneTick(reason: []const u8) void {

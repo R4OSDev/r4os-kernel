@@ -63,6 +63,7 @@ pub const API_START_DISABLED = legacy.API_START_DISABLED;
 pub const State = legacy.State;
 pub const StartMode = legacy.StartMode;
 pub const Entry = legacy.Entry;
+pub const ApiIndexTarget = legacy.ApiIndexTarget;
 pub const ApiInfo = legacy.ApiInfo;
 pub const ApiDetail = legacy.ApiDetail;
 pub const ApiMessageHeader = legacy.ApiMessageHeader;
@@ -108,6 +109,18 @@ pub fn markFailed(name: []const u8, exit_code: i32, error_text: []const u8) i32 
     return legacy.markFailed(name, exit_code, error_text);
 }
 
+pub fn markStoppingTarget(target: ApiIndexTarget) i32 {
+    return legacy.markStoppingTarget(target);
+}
+
+pub fn markStoppedTarget(target: ApiIndexTarget, exit_code: i32) i32 {
+    return legacy.markStoppedTarget(target, exit_code);
+}
+
+pub fn markFailedTarget(target: ApiIndexTarget, exit_code: i32, error_text: []const u8) i32 {
+    return legacy.markFailedTarget(target, exit_code, error_text);
+}
+
 pub fn entryAt(index: usize) ?Entry {
     return legacy.entryAt(index);
 }
@@ -124,12 +137,36 @@ pub fn performanceSummary() PerformanceSummary {
     return legacy.performanceSummary();
 }
 
+pub fn beginApiIndexRefresh(index: u32) ?ApiIndexTarget {
+    return legacy.beginApiIndexRefresh(index);
+}
+
+pub fn retryApiIndexRefresh(index: u32) ?ApiIndexTarget {
+    return legacy.retryApiIndexRefresh(index);
+}
+
+pub fn entryForApiIndexTarget(target: ApiIndexTarget) ?Entry {
+    return legacy.entryForApiIndexTarget(target);
+}
+
+pub fn noteApiIndexInstanceLookup(target: ApiIndexTarget) bool {
+    return legacy.noteApiIndexInstanceLookup(target);
+}
+
 pub fn apiInfoAt(index: u32, out: *ApiInfo, now_ticks: u64) i32 {
     return legacy.apiInfoAt(index, out, now_ticks);
 }
 
 pub fn apiDetailAt(index: u32, out: *ApiDetail, now_ticks: u64) i32 {
     return legacy.apiDetailAt(index, out, now_ticks);
+}
+
+pub fn apiInfoForIndexTarget(target: ApiIndexTarget, out: *ApiInfo, now_ticks: u64) i32 {
+    return legacy.apiInfoForIndexTarget(target, out, now_ticks);
+}
+
+pub fn apiDetailForIndexTarget(target: ApiIndexTarget, out: *ApiDetail, now_ticks: u64) i32 {
+    return legacy.apiDetailForIndexTarget(target, out, now_ticks);
 }
 
 pub fn apiStatus(name: []const u8, out: *ApiInfo, now_ticks: u64) i32 {

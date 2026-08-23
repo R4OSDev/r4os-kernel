@@ -75,6 +75,7 @@ const SERVICE_LOCK_FAMILY_COUNT: usize = 7;
 const SERVICE_LOCK_TIMING_STRIDE: u64 = 64;
 const REQUEST_ID_BLOCK_SIZE: u32 = 256;
 const REQUEST_ID_MAX: u32 = 0x7FFF_FFFE;
+const API_INDEX_INVALID_SLOT: u8 = 0xFF;
 
 const LockFamily = enum(u8) {
     registry_control = 0,
@@ -175,6 +176,20 @@ pub const Entry = struct {
     last_error_len: usize = 0,
 };
 
+/// Stable internal identity for one dense ServiceInfo/ServiceDetail index.
+/// Structural registry changes invalidate every outstanding target through
+/// registry_generation; ordinary state changes keep the target usable as
+/// long as the same service instance remains attached.
+pub const ApiIndexTarget = struct {
+    registry_generation: u64 = 0,
+    api_index: u32 = 0,
+    service_slot: usize = 0,
+    instance_id: u32 = 0,
+    state: State = .empty,
+    name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
+    name_len: usize = 0,
+};
+
 const Endpoint = struct {
     // The lock, generation, reserved request-ID range and lifetime counters
     // are stable slot identity.
@@ -258,6 +273,19 @@ pub const PerformanceSummary = struct {
     lock_timing_stride: u32 = @intCast(SERVICE_LOCK_TIMING_STRIDE),
     lock_timing_reserved0: u32 = 0,
     lock_timing_samples: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
+    registry_index_queries: u64 = 0,
+    registry_refresh_requests: u64 = 0,
+    registry_refresh_visits: u64 = 0,
+    registry_instance_lookups: u64 = 0,
+    registry_index_end_markers: u64 = 0,
+};
+
+const RegistryEnumerationPerformance = struct {
+    index_queries: u64 = 0,
+    refresh_requests: u64 = 0,
+    refresh_visits: u64 = 0,
+    instance_lookups: u64 = 0,
+    index_end_markers: u64 = 0,
 };
 
 var entries: [MAX_SERVICES]Entry = .{Entry{}} ** MAX_SERVICES;
@@ -266,6 +294,10 @@ var next_endpoint_handle: u32 = 1;
 var next_request_id: u32 = 1;
 var registry_lock = sync.Mutex.initClass("service-registry", sync.LockRank.service_registry, .sleepable);
 var registry_lock_timing: [SERVICE_LOCK_FAMILY_COUNT]LockTiming = .{LockTiming{}} ** SERVICE_LOCK_FAMILY_COUNT;
+var api_index_slots: [MAX_SERVICES]u8 = .{API_INDEX_INVALID_SLOT} ** MAX_SERVICES;
+var api_index_count: u32 = 0;
+var registry_generation: u64 = 1;
+var registry_enumeration_performance: RegistryEnumerationPerformance = .{};
 
 fn lockFamilyIndex(family: LockFamily) usize {
     return @intFromEnum(family);
@@ -357,6 +389,87 @@ fn lockRegistry(family: LockFamily) TimedLock {
 
 fn unlockRegistry(guard: *TimedLock) void {
     releaseTimedLock(guard);
+}
+
+fn rebuildApiIndexLocked() void {
+    @memset(api_index_slots[0..], API_INDEX_INVALID_SLOT);
+    api_index_count = 0;
+    var slot: usize = 0;
+    while (slot < entries.len) : (slot += 1) {
+        if (!entries[slot].used) continue;
+        api_index_slots[api_index_count] = @intCast(slot);
+        api_index_count += 1;
+    }
+}
+
+fn noteRegistryStructureChangedLocked() void {
+    registry_generation +%= 1;
+    if (registry_generation == 0) registry_generation = 1;
+    rebuildApiIndexLocked();
+}
+
+fn apiSlotAtLocked(index: u32) ?usize {
+    if (index >= api_index_count) return null;
+    const slot: usize = api_index_slots[index];
+    if (slot >= entries.len or !entries[slot].used) return null;
+    return slot;
+}
+
+fn apiTargetSlotLocked(target: ApiIndexTarget, require_instance: bool) ?usize {
+    if (target.registry_generation != registry_generation) return null;
+    const slot = apiSlotAtLocked(target.api_index) orelse return null;
+    if (slot != target.service_slot) return null;
+    const entry = &entries[slot];
+    if (entry.name_len != target.name_len or
+        !nameEq(entry.name[0..entry.name_len], target.name[0..target.name_len])) return null;
+    if (require_instance and entry.instance_id != target.instance_id) return null;
+    return slot;
+}
+
+fn selectApiIndexTarget(index: u32, count_query: bool) ?ApiIndexTarget {
+    var registry_guard = lockRegistry(.registry_snapshot);
+    defer unlockRegistry(&registry_guard);
+    if (count_query) registry_enumeration_performance.index_queries +%= 1;
+    const slot = apiSlotAtLocked(index) orelse {
+        if (count_query) registry_enumeration_performance.index_end_markers +%= 1;
+        return null;
+    };
+    const entry = &entries[slot];
+    if (count_query) registry_enumeration_performance.refresh_requests +%= 1;
+    registry_enumeration_performance.refresh_visits +%= 1;
+    var target = ApiIndexTarget{
+        .registry_generation = registry_generation,
+        .api_index = index,
+        .service_slot = slot,
+        .instance_id = entry.instance_id,
+        .state = entry.state,
+        .name_len = entry.name_len,
+    };
+    if (entry.name_len > 0) @memcpy(target.name[0..entry.name_len], entry.name[0..entry.name_len]);
+    return target;
+}
+
+pub fn beginApiIndexRefresh(index: u32) ?ApiIndexTarget {
+    return selectApiIndexTarget(index, true);
+}
+
+pub fn retryApiIndexRefresh(index: u32) ?ApiIndexTarget {
+    return selectApiIndexTarget(index, false);
+}
+
+pub fn entryForApiIndexTarget(target: ApiIndexTarget) ?Entry {
+    var registry_guard = lockRegistry(.registry_snapshot);
+    defer unlockRegistry(&registry_guard);
+    const slot = apiTargetSlotLocked(target, true) orelse return null;
+    return entries[slot];
+}
+
+pub fn noteApiIndexInstanceLookup(target: ApiIndexTarget) bool {
+    var registry_guard = lockRegistry(.registry_snapshot);
+    defer unlockRegistry(&registry_guard);
+    if (apiTargetSlotLocked(target, true) == null) return false;
+    registry_enumeration_performance.instance_lookups +%= 1;
+    return true;
 }
 
 const EndpointIdentity = struct {
@@ -557,7 +670,9 @@ pub fn register(name: []const u8, path: []const u8, args: []const u8, start_mode
 pub fn registerWithDescription(name: []const u8, path: []const u8, args: []const u8, start_mode: StartMode, description: []const u8) i32 {
     var registry_guard = lockRegistry(.registry_control);
     defer unlockRegistry(&registry_guard);
-    return registerIn(&entries, name, path, args, start_mode, description);
+    const result = registerIn(&entries, name, path, args, start_mode, description);
+    if (result >= 0) noteRegistryStructureChangedLocked();
+    return result;
 }
 
 pub fn unregister(name: []const u8) i32 {
@@ -577,12 +692,14 @@ pub fn unregister(name: []const u8) i32 {
                 var endpoint_guard = locked.guard;
                 retireEndpointLocked(locked.endpoint, .cancelled);
                 const result = unregisterIn(&entries, name);
+                if (result == OK) noteRegistryStructureChangedLocked();
                 releaseTimedLock(&endpoint_guard);
                 unlockRegistry(&registry_guard);
                 return result;
             },
             .none => {
                 const result = unregisterIn(&entries, name);
+                if (result == OK) noteRegistryStructureChangedLocked();
                 unlockRegistry(&registry_guard);
                 return result;
             },
@@ -708,6 +825,70 @@ pub fn markFailed(name: []const u8, exit_code: i32, error_text: []const u8) i32 
     return finishServiceState(name, alwaysFailed, exit_code, error_text);
 }
 
+pub fn markStoppingTarget(target: ApiIndexTarget) i32 {
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        const slot = apiTargetSlotLocked(target, true) orelse {
+            unlockRegistry(&registry_guard);
+            return ERR_NOT_FOUND;
+        };
+        if (entries[slot].state != .running and entries[slot].state != .starting) {
+            unlockRegistry(&registry_guard);
+            return ERR_INVALID;
+        }
+        switch (tryLifecycleEndpointForSlot(slot)) {
+            .contended => |ep| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(ep);
+                continue;
+            },
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                retireEndpointLocked(locked.endpoint, .cancelled);
+                entries[slot].state = .stopping;
+                releaseTimedLock(&endpoint_guard);
+            },
+            .none => entries[slot].state = .stopping,
+        }
+        unlockRegistry(&registry_guard);
+        return OK;
+    }
+}
+
+pub fn markStoppedTarget(target: ApiIndexTarget, exit_code: i32) i32 {
+    return finishServiceTargetState(target, ifEntryDisabledElseStopped, exit_code, "");
+}
+
+pub fn markFailedTarget(target: ApiIndexTarget, exit_code: i32, error_text: []const u8) i32 {
+    return finishServiceTargetState(target, alwaysFailed, exit_code, error_text);
+}
+
+fn finishServiceTargetState(target: ApiIndexTarget, stateFor: *const fn (*const Entry) State, exit_code: i32, error_text: []const u8) i32 {
+    while (true) {
+        var registry_guard = lockRegistry(.registry_control);
+        const slot = apiTargetSlotLocked(target, true) orelse {
+            unlockRegistry(&registry_guard);
+            return ERR_NOT_FOUND;
+        };
+        switch (tryLifecycleEndpointForSlot(slot)) {
+            .contended => |ep| {
+                unlockRegistry(&registry_guard);
+                waitForEndpointLifecycle(ep);
+                continue;
+            },
+            .locked => |locked| {
+                var endpoint_guard = locked.guard;
+                retireEndpointLocked(locked.endpoint, .cancelled);
+                finishEntryState(&entries[slot], stateFor, exit_code, error_text);
+                releaseTimedLock(&endpoint_guard);
+            },
+            .none => finishEntryState(&entries[slot], stateFor, exit_code, error_text),
+        }
+        unlockRegistry(&registry_guard);
+        return OK;
+    }
+}
+
 pub fn bumpRestartCount(name: []const u8) i32 {
     var registry_guard = lockRegistry(.registry_control);
     defer unlockRegistry(&registry_guard);
@@ -778,6 +959,11 @@ pub fn performanceSummary() PerformanceSummary {
         out.used_services += 1;
         if (e.state == .running) out.running_services += 1;
     }
+    out.registry_index_queries = registry_enumeration_performance.index_queries;
+    out.registry_refresh_requests = registry_enumeration_performance.refresh_requests;
+    out.registry_refresh_visits = registry_enumeration_performance.refresh_visits;
+    out.registry_instance_lookups = registry_enumeration_performance.instance_lookups;
+    out.registry_index_end_markers = registry_enumeration_performance.index_end_markers;
     i = 0;
     while (i < 3) : (i += 1) addLockTiming(&out, i, registry_lock_timing[i]);
     unlockRegistry(&registry_guard);
@@ -830,41 +1016,57 @@ pub fn performanceSummary() PerformanceSummary {
 pub fn apiInfoAt(index: u32, out: *ApiInfo, now_ticks: u64) i32 {
     var registry_guard = lockRegistry(.registry_snapshot);
     out.* = .{};
-    var seen: u32 = 0;
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        if (!entries[i].used) continue;
-        if (seen == index) {
-            fillApiInfoEntryLocked(i, out, now_ticks);
-            const identity = endpointIdentityForSlotLocked(i);
-            unlockRegistry(&registry_guard);
-            fillApiInfoEndpoint(identity, out);
-            return 1;
-        }
-        seen += 1;
-    }
+    const slot = apiSlotAtLocked(index) orelse {
+        unlockRegistry(&registry_guard);
+        return 0;
+    };
+    fillApiInfoEntryLocked(slot, out, now_ticks);
+    const identity = endpointIdentityForSlotLocked(slot);
     unlockRegistry(&registry_guard);
-    return 0;
+    fillApiInfoEndpoint(identity, out);
+    return 1;
 }
 
 pub fn apiDetailAt(index: u32, out: *ApiDetail, now_ticks: u64) i32 {
     var registry_guard = lockRegistry(.registry_snapshot);
     out.* = .{};
-    var seen: u32 = 0;
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        if (!entries[i].used) continue;
-        if (seen == index) {
-            fillApiDetailEntryLocked(i, out, now_ticks);
-            const identity = endpointIdentityForSlotLocked(i);
-            unlockRegistry(&registry_guard);
-            fillApiInfoEndpoint(identity, &out.info);
-            return 1;
-        }
-        seen += 1;
-    }
+    const slot = apiSlotAtLocked(index) orelse {
+        unlockRegistry(&registry_guard);
+        return 0;
+    };
+    fillApiDetailEntryLocked(slot, out, now_ticks);
+    const identity = endpointIdentityForSlotLocked(slot);
     unlockRegistry(&registry_guard);
-    return 0;
+    fillApiInfoEndpoint(identity, &out.info);
+    return 1;
+}
+
+pub fn apiInfoForIndexTarget(target: ApiIndexTarget, out: *ApiInfo, now_ticks: u64) i32 {
+    var registry_guard = lockRegistry(.registry_snapshot);
+    out.* = .{};
+    const slot = apiTargetSlotLocked(target, true) orelse {
+        unlockRegistry(&registry_guard);
+        return API_ERR_BUSY;
+    };
+    fillApiInfoEntryLocked(slot, out, now_ticks);
+    const identity = endpointIdentityForSlotLocked(slot);
+    unlockRegistry(&registry_guard);
+    fillApiInfoEndpoint(identity, out);
+    return 1;
+}
+
+pub fn apiDetailForIndexTarget(target: ApiIndexTarget, out: *ApiDetail, now_ticks: u64) i32 {
+    var registry_guard = lockRegistry(.registry_snapshot);
+    out.* = .{};
+    const slot = apiTargetSlotLocked(target, true) orelse {
+        unlockRegistry(&registry_guard);
+        return API_ERR_BUSY;
+    };
+    fillApiDetailEntryLocked(slot, out, now_ticks);
+    const identity = endpointIdentityForSlotLocked(slot);
+    unlockRegistry(&registry_guard);
+    fillApiInfoEndpoint(identity, &out.info);
+    return 1;
 }
 
 pub fn apiStatus(name: []const u8, out: *ApiInfo, now_ticks: u64) i32 {
@@ -1478,6 +1680,10 @@ fn resetRegistryState() void {
     entries = .{Entry{}} ** MAX_SERVICES;
     registry_lock = sync.Mutex.initClass("service-registry", sync.LockRank.service_registry, .sleepable);
     registry_lock_timing = .{LockTiming{}} ** SERVICE_LOCK_FAMILY_COUNT;
+    api_index_slots = .{API_INDEX_INVALID_SLOT} ** MAX_SERVICES;
+    api_index_count = 0;
+    registry_generation = 1;
+    registry_enumeration_performance = .{};
     resetEndpoints();
 }
 
@@ -1852,6 +2058,88 @@ fn nameEq(a: []const u8, b: []const u8) bool {
 fn upper(ch: u8) u8 {
     if (ch >= 'a' and ch <= 'z') return ch - ('a' - 'A');
     return ch;
+}
+
+test "dense service API index covers empty partial full and hole reuse" {
+    resetRegistryState();
+    var info: ApiInfo = .{};
+    try std.testing.expectEqual(@as(i32, 0), apiInfoAt(0, &info, 0));
+    try std.testing.expect(beginApiIndexRefresh(0) == null);
+
+    try std.testing.expectEqual(@as(i32, 0), register("A", "C:\\A.R4X", "", .manual));
+    try std.testing.expectEqual(@as(i32, 1), register("B", "C:\\B.R4X", "", .manual));
+    try std.testing.expectEqual(@as(i32, 2), register("C", "C:\\C.R4X", "", .manual));
+    try std.testing.expectEqual(OK, unregister("B"));
+    try std.testing.expectEqual(@as(i32, 1), register("D", "C:\\D.R4X", "", .manual));
+
+    try std.testing.expectEqual(@as(i32, 1), apiInfoAt(0, &info, 0));
+    try std.testing.expectEqualStrings("A", info.name[0..1]);
+    try std.testing.expectEqual(@as(i32, 1), apiInfoAt(1, &info, 0));
+    try std.testing.expectEqualStrings("D", info.name[0..1]);
+    try std.testing.expectEqual(@as(i32, 1), apiInfoAt(2, &info, 0));
+    try std.testing.expectEqualStrings("C", info.name[0..1]);
+    try std.testing.expectEqual(@as(i32, 0), apiInfoAt(3, &info, 0));
+
+    var detail: ApiDetail = .{};
+    try std.testing.expectEqual(@as(i32, 1), apiDetailAt(1, &detail, 0));
+    try std.testing.expectEqualStrings("D", detail.info.name[0..1]);
+    try std.testing.expectEqualStrings("C:\\D.R4X", detail.path[0..8]);
+
+    var slot: usize = 3;
+    while (slot < MAX_SERVICES) : (slot += 1) {
+        var name_buf: [8]u8 = undefined;
+        const name = try std.fmt.bufPrint(name_buf[0..], "S{d}", .{slot});
+        var path_buf: [24]u8 = undefined;
+        const path = try std.fmt.bufPrint(path_buf[0..], "C:\\S{d}.R4X", .{slot});
+        try std.testing.expectEqual(@as(i32, @intCast(slot)), register(name, path, "", .manual));
+    }
+    try std.testing.expectEqual(ERR_FULL, register("FULL", "C:\\FULL.R4X", "", .manual));
+    var index: u32 = 0;
+    while (index < MAX_SERVICES) : (index += 1) {
+        try std.testing.expect(beginApiIndexRefresh(index) != null);
+    }
+    try std.testing.expect(beginApiIndexRefresh(MAX_SERVICES) == null);
+}
+
+test "service API index target is linear measured and generation safe" {
+    resetRegistryState();
+    try std.testing.expectEqual(@as(i32, 0), register("ONE", "C:\\ONE.R4X", "", .manual));
+    try std.testing.expectEqual(@as(i32, 1), register("TWO", "C:\\TWO.R4X", "", .manual));
+    try std.testing.expectEqual(OK, markRunning("TWO", 42, 7));
+
+    const first = beginApiIndexRefresh(0) orelse return error.TestUnexpectedResult;
+    var second = beginApiIndexRefresh(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(beginApiIndexRefresh(2) == null);
+    try std.testing.expect(noteApiIndexInstanceLookup(second));
+    var summary = performanceSummary();
+    try std.testing.expectEqual(@as(u64, 3), summary.registry_index_queries);
+    try std.testing.expectEqual(@as(u64, 2), summary.registry_refresh_requests);
+    try std.testing.expectEqual(@as(u64, 2), summary.registry_refresh_visits);
+    try std.testing.expectEqual(@as(u64, 1), summary.registry_instance_lookups);
+    try std.testing.expectEqual(@as(u64, 1), summary.registry_index_end_markers);
+
+    var detail: ApiDetail = .{};
+    try std.testing.expectEqual(@as(i32, 1), apiDetailForIndexTarget(second, &detail, 8));
+    try std.testing.expectEqual(API_STATE_RUNNING, detail.info.state);
+    try std.testing.expectEqualStrings("C:\\TWO.R4X", detail.path[0..10]);
+    try std.testing.expectEqual(OK, markStoppingTarget(second));
+    second.state = .stopping;
+    try std.testing.expectEqual(@as(i32, 1), apiDetailForIndexTarget(second, &detail, 8));
+    try std.testing.expectEqual(API_STATE_STOPPING, detail.info.state);
+    try std.testing.expectEqual(OK, markStoppedTarget(second, 0));
+    second.instance_id = 0;
+    second.state = .stopped;
+    var info: ApiInfo = .{};
+    try std.testing.expectEqual(@as(i32, 1), apiInfoForIndexTarget(second, &info, 8));
+    try std.testing.expectEqual(API_STATE_STOPPED, info.state);
+
+    try std.testing.expectEqual(@as(i32, 2), register("THREE", "C:\\THREE.R4X", "", .manual));
+    try std.testing.expectEqual(API_ERR_BUSY, apiInfoForIndexTarget(first, &info, 9));
+    const retried = retryApiIndexRefresh(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i32, 1), apiInfoForIndexTarget(retried, &info, 9));
+    summary = performanceSummary();
+    try std.testing.expectEqual(@as(u64, 2), summary.registry_refresh_requests);
+    try std.testing.expectEqual(@as(u64, 3), summary.registry_refresh_visits);
 }
 
 test "request slot metadata reset preserves payload storage" {
