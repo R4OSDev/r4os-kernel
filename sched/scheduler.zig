@@ -51,6 +51,10 @@ var preemption_deferred_max_ticks: u64 = 0;
 var reschedule_requested = false;
 var wakeup_reschedule_request_count: u64 = 0;
 var wakeup_preemption_switch_count: u64 = 0;
+var safe_reschedule_point_count: u64 = 0;
+var safe_reschedule_switch_count: u64 = 0;
+var safe_reschedule_deferred_irq_count: u64 = 0;
+var safe_reschedule_deferred_owner_count: u64 = 0;
 var ready_candidate_visit_count: u64 = 0;
 var timeout_candidate_visit_count: u64 = 0;
 var warning_candidate_visit_count: u64 = 0;
@@ -67,6 +71,10 @@ pub const preemption_quantum_ticks: u32 = @intCast(@max(1, (30 * timer.DEFAULT_H
 pub const long_running_warn_ticks: u64 = @max(1, (1000 * @as(u64, timer.DEFAULT_HZ)) / 1000);
 pub const starvation_warn_ticks: u64 = @max(1, (2000 * @as(u64, timer.DEFAULT_HZ)) / 1000);
 const MAX_TIMEOUT_WAKEUPS_PER_IRQ: u32 = 64;
+pub const ready_latency_bucket_count: usize = 5;
+var ready_latency_role_samples: [task.role_count]u64 = .{0} ** task.role_count;
+var ready_latency_role_buckets: [task.role_count][ready_latency_bucket_count]u64 =
+    .{.{0} ** ready_latency_bucket_count} ** task.role_count;
 
 pub const Stats = struct {
     initialized: bool = false,
@@ -122,6 +130,14 @@ pub const Stats = struct {
     priority_picks_normal: u64 = 0,
     priority_picks_low: u64 = 0,
     priority_rr_picks: u64 = 0,
+    role_picks: [task.role_count]u64 = .{0} ** task.role_count,
+    ready_latency_role_samples: [task.role_count]u64 = .{0} ** task.role_count,
+    ready_latency_role_buckets: [task.role_count][ready_latency_bucket_count]u64 =
+        .{.{0} ** ready_latency_bucket_count} ** task.role_count,
+    safe_reschedule_points: u64 = 0,
+    safe_reschedule_switches: u64 = 0,
+    safe_reschedule_deferred_irq: u64 = 0,
+    safe_reschedule_deferred_owner: u64 = 0,
 };
 
 pub fn init() bool {
@@ -171,10 +187,22 @@ pub fn init() bool {
     reschedule_requested = false;
     wakeup_reschedule_request_count = 0;
     wakeup_preemption_switch_count = 0;
+    safe_reschedule_point_count = 0;
+    safe_reschedule_switch_count = 0;
+    safe_reschedule_deferred_irq_count = 0;
+    safe_reschedule_deferred_owner_count = 0;
     ready_candidate_visit_count = 0;
     timeout_candidate_visit_count = 0;
     warning_candidate_visit_count = 0;
     timeout_storm_deferral_count = 0;
+    ready_latency_role_samples = .{0} ** task.role_count;
+    ready_latency_role_buckets = .{.{0} ** ready_latency_bucket_count} ** task.role_count;
+    priority_selects = 0;
+    priority_picks_high = 0;
+    priority_picks_normal = 0;
+    priority_picks_low = 0;
+    priority_rr_picks = 0;
+    role_picks = .{0} ** task.role_count;
     external_irq_fpu_guard_entries = 0;
     external_irq_fpu_guard_mismatches = 0;
     external_irq_fpu_guard_mismatch_reported = false;
@@ -244,6 +272,13 @@ pub fn stats() Stats {
         .priority_picks_normal = priority_picks_normal,
         .priority_picks_low = priority_picks_low,
         .priority_rr_picks = priority_rr_picks,
+        .role_picks = role_picks,
+        .ready_latency_role_samples = ready_latency_role_samples,
+        .ready_latency_role_buckets = ready_latency_role_buckets,
+        .safe_reschedule_points = safe_reschedule_point_count,
+        .safe_reschedule_switches = safe_reschedule_switch_count,
+        .safe_reschedule_deferred_irq = safe_reschedule_deferred_irq_count,
+        .safe_reschedule_deferred_owner = safe_reschedule_deferred_owner_count,
     };
 }
 
@@ -267,6 +302,10 @@ pub const StructureStats = struct {
     timeout_storm_deferrals: u64 = 0,
     wakeup_reschedule_requests: u64 = 0,
     wakeup_preemption_switches: u64 = 0,
+    safe_reschedule_points: u64 = 0,
+    safe_reschedule_switches: u64 = 0,
+    safe_reschedule_deferred_irq: u64 = 0,
+    safe_reschedule_deferred_owner: u64 = 0,
     reschedule_pending: bool = false,
 };
 
@@ -278,6 +317,10 @@ pub fn structureStats() StructureStats {
         .timeout_storm_deferrals = timeout_storm_deferral_count,
         .wakeup_reschedule_requests = wakeup_reschedule_request_count,
         .wakeup_preemption_switches = wakeup_preemption_switch_count,
+        .safe_reschedule_points = safe_reschedule_point_count,
+        .safe_reschedule_switches = safe_reschedule_switch_count,
+        .safe_reschedule_deferred_irq = safe_reschedule_deferred_irq_count,
+        .safe_reschedule_deferred_owner = safe_reschedule_deferred_owner_count,
         .reschedule_pending = reschedule_requested,
     };
 }
@@ -405,7 +448,7 @@ pub fn yield() void {
         return;
     };
     task.recordYield(old, now);
-    const priority_wakeup = reschedule_requested and task.hasHigherPriorityReady(old.priority);
+    const priority_wakeup = reschedule_requested and task.hasMoreUrgentReady(old);
     const next_task = nextReadyTask(priority_wakeup) orelse {
         reschedule_requested = false;
         preemptEnable();
@@ -413,7 +456,7 @@ pub fn yield() void {
         return;
     };
     if (old.state == .running) task.markReady(old, now);
-    recordReadyLatency(task.recordScheduled(next_task, now));
+    recordReadyLatency(next_task, task.recordScheduled(next_task, now));
     task.markRunning(next_task);
     task.saveFpuState(old);
     task.restoreFpuState(next_task);
@@ -432,22 +475,20 @@ pub fn preemptFromIrq() void {
     const old = current_task orelse return;
     if (old.state != .running) return;
 
-    const wakeup_switch = reschedule_requested and task.hasHigherPriorityReady(old.priority);
+    const wakeup_switch = reschedule_requested and task.hasMoreUrgentReady(old);
     const next_task = nextReadyTask(wakeup_switch) orelse {
         reschedule_requested = false;
         return;
     };
 
     task.markReady(old, now);
-    recordReadyLatency(task.recordScheduled(next_task, now));
+    recordReadyLatency(next_task, task.recordScheduled(next_task, now));
     task.markRunning(next_task);
     task.saveFpuState(old);
     task.restoreFpuState(next_task);
     current_task = next_task;
     task_context.bind(&next_task.unwind_guard_count);
-    if (wakeup_switch and @intFromEnum(next_task.priority) < @intFromEnum(old.priority)) {
-        wakeup_preemption_switch_count +%= 1;
-    }
+    if (wakeup_switch) wakeup_preemption_switch_count +%= 1;
     refreshRescheduleRequest(next_task);
     r4os_context_switch(&old.rsp, next_task.rsp);
 }
@@ -499,7 +540,7 @@ pub fn parkBlocked(blocked_task: *task.Task) void {
         }
     }
     if (current_task == blocked_task and blocked_task.state == .ready) {
-        recordReadyLatency(task.recordScheduled(blocked_task, timer.tickCount()));
+        recordReadyLatency(blocked_task, task.recordScheduled(blocked_task, timer.tickCount()));
         task.markRunning(blocked_task);
     }
 }
@@ -520,7 +561,7 @@ pub fn wakeTask(target: *task.Task, result: task.WaitResult) bool {
         else => {},
     }
     if (current_task) |running| {
-        if (running.state == .running and @intFromEnum(target.priority) < @intFromEnum(running.priority)) {
+        if (running.state == .running and task.dispatchRank(target) < task.dispatchRank(running)) {
             reschedule_requested = true;
             wakeup_reschedule_request_count +%= 1;
         }
@@ -535,7 +576,7 @@ pub fn preemptPendingWake(preemptible_instruction_pointer: bool) bool {
     if (!reschedule_requested or !initialized) return false;
     const running = current_task orelse return false;
     if (running.state != .running) return false;
-    if (!task.hasHigherPriorityReady(running.priority)) {
+    if (!task.hasMoreUrgentReady(running)) {
         reschedule_requested = false;
         return false;
     }
@@ -562,6 +603,42 @@ pub fn preemptPendingWake(preemptible_instruction_pointer: bool) bool {
     }
     preemption_app_code_tick_count +%= 1;
     preemption_switch_tick_count +%= 1;
+    return true;
+}
+
+// Explicit owner-safe return boundary for synchronous kernel producers. It is
+// deliberately not called by generic WaitQueue code: that code may still be
+// nested inside an endpoint, registry, or device owner. Callers place this
+// only after releasing their owner and lock state. IRQ producers use the
+// separate post-handler/EOI decision in idt.zig.
+pub fn safeReschedulePoint() bool {
+    safe_reschedule_point_count +%= 1;
+    if (!reschedule_requested or !initialized or preemption_enabled == 0) return false;
+
+    const irq_flags = interrupts.saveAndDisable();
+    if (!interrupts.wereEnabled(irq_flags)) {
+        safe_reschedule_deferred_irq_count +%= 1;
+        interrupts.restore(irq_flags);
+        return false;
+    }
+    const running = current_task orelse {
+        interrupts.restore(irq_flags);
+        return false;
+    };
+    if (running.state != .running or !task.hasMoreUrgentReady(running)) {
+        reschedule_requested = false;
+        interrupts.restore(irq_flags);
+        return false;
+    }
+    if (currentPreemptDepth() != 0 or running.held_lock_count != 0 or running.wait_handoff_guard_pending) {
+        safe_reschedule_deferred_owner_count +%= 1;
+        interrupts.restore(irq_flags);
+        return false;
+    }
+    interrupts.restore(irq_flags);
+
+    safe_reschedule_switch_count +%= 1;
+    yield();
     return true;
 }
 
@@ -775,7 +852,7 @@ fn runTimerPreemption(now: u64, preemptible_instruction_pointer: bool) bool {
         preemption_deferred_no_ready_count +%= 1;
         return false;
     }
-    const priority_wakeup = reschedule_requested and task.hasHigherPriorityReady(running.priority);
+    const priority_wakeup = reschedule_requested and task.hasMoreUrgentReady(running);
     if (reschedule_requested and !priority_wakeup) reschedule_requested = false;
     const scheduled_ticks = ticksSince(now, running.last_scheduled_tick);
     if (!priority_wakeup and scheduled_ticks < @as(u64, preemption_quantum_ticks)) {
@@ -845,11 +922,27 @@ fn recordRuntimeWarnings(now: u64) void {
     }
 }
 
-fn recordReadyLatency(latency: u64) void {
+fn readyLatencyBucket(latency: u64) usize {
+    return if (latency == 0)
+        0
+    else if (latency == 1)
+        1
+    else if (latency <= 3)
+        2
+    else if (latency <= 7)
+        3
+    else
+        4;
+}
+
+fn recordReadyLatency(selected: *const task.Task, latency: u64) void {
     ready_latency_sample_count +%= 1;
     ready_latency_total_ticks +%= latency;
     ready_latency_last_ticks = latency;
     if (latency > ready_latency_max_ticks) ready_latency_max_ticks = latency;
+    const role_index: usize = @intFromEnum(selected.role);
+    ready_latency_role_samples[role_index] +%= 1;
+    ready_latency_role_buckets[role_index][readyLatencyBucket(latency)] +%= 1;
 }
 
 fn recordObjectWaitLatency(wait_ticks: u64) void {
@@ -892,9 +985,10 @@ var priority_picks_high: u64 = 0;
 var priority_picks_normal: u64 = 0;
 var priority_picks_low: u64 = 0;
 var priority_rr_picks: u64 = 0;
+var role_picks: [task.role_count]u64 = .{0} ** task.role_count;
 fn refreshRescheduleRequest(running: *task.Task) void {
     if (reschedule_requested) {
-        reschedule_requested = task.hasHigherPriorityReady(running.priority);
+        reschedule_requested = task.hasMoreUrgentReady(running);
     }
 }
 
@@ -912,23 +1006,24 @@ fn nextReadyTask(force_priority: bool) ?*task.Task {
     }
 
     var best: ?*task.Task = null;
-    var best_prio: u8 = 255;
+    var best_rank: u8 = task.no_dispatch_rank;
     var cursor = task.firstReady();
     while (cursor) |candidate| : (cursor = task.nextReady(candidate)) {
         ready_candidate_visit_count +%= 1;
-        const p = @intFromEnum(candidate.priority);
-        if (p < best_prio) {
-            best_prio = p;
+        const rank = task.dispatchRank(candidate);
+        if (rank < best_rank) {
+            best_rank = rank;
             best = candidate;
-            if (p == @intFromEnum(task.Priority.high)) break;
+            if (rank == 0) break;
         }
     }
-    if (best != null) {
-        switch (@as(task.Priority, @enumFromInt(best_prio))) {
+    if (best) |selected| {
+        switch (task.effectivePriority(selected)) {
             .high => priority_picks_high +%= 1,
             .normal => priority_picks_normal +%= 1,
             .low => priority_picks_low +%= 1,
         }
+        role_picks[@intFromEnum(selected.role)] +%= 1;
     }
     return best;
 }
@@ -977,15 +1072,15 @@ pub fn prioritySelfTest() bool {
         return false;
     }
 
-    const old_priority = me.priority;
-    if (!task.setPriority(me, .high)) return false;
+    const old_role = me.role;
+    if (!task.assignRole(me, .input)) return false;
     me.max_ready_latency_ticks = 0;
     var round: u32 = 0;
     while (round < ST_PRIO_ROUNDS) : (round += 1) {
         sleepTicksWithReason(1, "schedprio");
     }
     const high_latency_max = me.max_ready_latency_ticks;
-    _ = task.setPriority(me, old_priority);
+    _ = task.assignRole(me, old_role);
     st_prio_busy_stop = true;
     // Busy-Threads sehen das Stop-Flag beim naechsten Spin-Check und
     // beenden sich selbst (exitCurrent via Trampolin).

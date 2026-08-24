@@ -20,6 +20,9 @@ pub const WaitSummary = struct {
     total_wait_ticks: u64 = 0,
     max_wait_ticks: u64 = 0,
     last_wait_ticks: u64 = 0,
+    directed_wakes: u64 = 0,
+    directed_scans: u64 = 0,
+    directed_fifo_bypasses: u64 = 0,
 };
 
 var global_summary: WaitSummary = .{};
@@ -71,6 +74,9 @@ pub const LockSummary = struct {
     current_depth: u32 = 0,
     max_depth: u32 = 0,
     tracking_drops: u32 = 0,
+    role_inversions: u64 = 0,
+    role_donations: u64 = 0,
+    role_donation_releases: u64 = 0,
 };
 
 var global_lock_summary: LockSummary = .{};
@@ -199,7 +205,7 @@ pub const WaitQueue = struct {
     }
 
     pub fn wakeOne(self: *WaitQueue) u32 {
-        const id = self.wakeOneWith(.signaled);
+        const id = self.wakeOneWith(.signaled, true);
         if (id != 0) global_summary.wake_one +%= 1;
         return id;
     }
@@ -229,7 +235,7 @@ pub const WaitQueue = struct {
     }
 
     pub fn cancelOne(self: *WaitQueue) u32 {
-        return self.wakeOneWith(.cancelled);
+        return self.wakeOneWith(.cancelled, false);
     }
 
     pub fn cancelAll(self: *WaitQueue) u32 {
@@ -244,7 +250,7 @@ pub const WaitQueue = struct {
 
     fn wakeAllWithLocked(self: *WaitQueue, result: WaitResult) u32 {
         var count: u32 = 0;
-        while (self.popAndWake(result) != 0) : (count +|= 1) {}
+        while (self.popAndWake(result, false) != 0) : (count +|= 1) {}
         return count;
     }
 
@@ -271,26 +277,55 @@ pub const WaitQueue = struct {
         return @intFromPtr(self);
     }
 
-    fn wakeOneWith(self: *WaitQueue, result: WaitResult) u32 {
+    fn wakeOneWith(self: *WaitQueue, result: WaitResult, directed: bool) u32 {
         const irq_flags = self.enterCritical();
         defer self.leaveCritical(irq_flags);
-        return self.popAndWake(result);
+        return self.popAndWake(result, directed);
     }
 
-    fn popAndWake(self: *WaitQueue, result: WaitResult) u32 {
-        while (wait_node.popFront(&self.core)) |node| {
+    fn popAndWake(self: *WaitQueue, result: WaitResult, directed: bool) u32 {
+        while (self.popWaiter(directed)) |node| {
             const target: *task.Task = @ptrCast(@alignCast(node.owner));
             if (target.generation != node.owner_generation) continue;
-            if (scheduler.wakeTask(target, result)) return target.id;
+            if (scheduler.wakeTask(target, result)) {
+                if (directed) global_summary.directed_wakes +%= 1;
+                return target.id;
+            }
         }
         return 0;
+    }
+
+    // Directed single-wake selection prefers the most urgent enrolled role
+    // and preserves FIFO order inside one rank. Drain/cancel paths remain
+    // strict FIFO because they must visit every waiter regardless of policy.
+    fn popWaiter(self: *WaitQueue, directed: bool) ?*wait_node.Node {
+        if (!directed) return wait_node.popFront(&self.core);
+        const head = self.core.head orelse return null;
+        var selected: ?*wait_node.Node = null;
+        var best_rank: u8 = task.no_dispatch_rank;
+        var cursor: ?*wait_node.Node = head;
+        while (cursor) |node| : (cursor = node.next) {
+            global_summary.directed_scans +%= 1;
+            const candidate: *task.Task = @ptrCast(@alignCast(node.owner));
+            if (candidate.generation != node.owner_generation or candidate.state != .blocked) continue;
+            const rank = task.wakeDispatchRank(candidate);
+            if (rank < best_rank) {
+                best_rank = rank;
+                selected = node;
+                if (rank == 0) break;
+            }
+        }
+        const chosen = selected orelse return wait_node.popFront(&self.core);
+        if (chosen != head) global_summary.directed_fifo_bypasses +%= 1;
+        _ = wait_node.detach(chosen);
+        return chosen;
     }
 
     // A semaphore permit is owned as soon as its FIFO waiter is selected,
     // before that waiter can run again. Protect this short handoff so a hard
     // kill cannot strand the permit between wake and caller publication.
     fn popAndWakeWithHandoffGuard(self: *WaitQueue) u32 {
-        while (wait_node.popFront(&self.core)) |node| {
+        while (self.popWaiter(true)) |node| {
             const target: *task.Task = @ptrCast(@alignCast(node.owner));
             if (target.generation != node.owner_generation) continue;
             if (target.wait_handoff_guard_pending or target.unwind_guard_count == 0xFFFF_FFFF) {
@@ -299,7 +334,10 @@ pub const WaitQueue = struct {
             }
             target.unwind_guard_count += 1;
             target.wait_handoff_guard_pending = true;
-            if (scheduler.wakeTask(target, .signaled)) return target.id;
+            if (scheduler.wakeTask(target, .signaled)) {
+                global_summary.directed_wakes +%= 1;
+                return target.id;
+            }
             target.wait_handoff_guard_pending = false;
             target.unwind_guard_count -= 1;
         }
@@ -350,7 +388,7 @@ pub const EventV2 = struct {
         // signaled=true ein Waiter eintreten und das Signal verlieren.
         const irq_flags = self.queue.enterCritical();
         if (self.mode == .auto_reset) {
-            if (self.queue.wakeOneWith(.signaled) == 0) {
+            if (self.queue.wakeOneWith(.signaled, true) == 0) {
                 self.signaled = true;
             } else {
                 global_summary.wake_one +%= 1;
@@ -401,7 +439,7 @@ pub const Completion = struct {
         const irq_flags = self.queue.enterCritical();
         defer self.queue.leaveCritical(irq_flags);
         if (self.queue.core.closing) return;
-        if (self.queue.popAndWake(.signaled) == 0) {
+        if (self.queue.popAndWake(.signaled, true) == 0) {
             self.completed +|= 1;
         } else {
             global_summary.wake_one +%= 1;
@@ -608,6 +646,7 @@ pub const Mutex = struct {
     mode: LockMode = .sleepable,
     name: []const u8 = "local",
     queue: WaitQueue = WaitQueue.init(),
+    donation_rank: u8 = task.no_dispatch_rank,
 
     pub fn init() Mutex {
         return .{};
@@ -656,6 +695,7 @@ pub const Mutex = struct {
         const deadline = if (bounded) timer.deadlineAfterNow(timeout_ticks) else 0;
         var remaining = timeout_ticks;
         while (true) {
+            self.donateCurrentWaiter();
             const result = self.queue.waitUnless(remaining, "mutex", stillOwned, self);
             if (result != .signaled) {
                 global_lock_summary.contention_timeouts +%= 1;
@@ -709,6 +749,12 @@ pub const Mutex = struct {
             }
             self.owner = 0;
             self.owner_generation = 0;
+            if (self.donation_rank != task.no_dispatch_rank) {
+                if (task.removeDispatchDonation(current_task, self.donation_rank)) {
+                    global_lock_summary.role_donation_releases +%= 1;
+                }
+                self.donation_rank = task.no_dispatch_rank;
+            }
             wake_waiter = true;
         }
         return true;
@@ -731,6 +777,32 @@ pub const Mutex = struct {
     fn stillOwned(raw: *anyopaque) bool {
         const self: *Mutex = @ptrCast(@alignCast(raw));
         return self.owner != 0 or self.owner_generation != 0;
+    }
+
+    fn donateCurrentWaiter(self: *Mutex) void {
+        const waiter = scheduler.current() orelse return;
+        const desired_rank = task.dispatchRank(waiter);
+        scheduler.preemptDisable();
+        defer scheduler.preemptEnable();
+        if (self.owner == 0 or self.owner_generation == 0 or
+            (self.owner == waiter.id and self.owner_generation == waiter.generation) or
+            desired_rank >= self.donation_rank)
+        {
+            return;
+        }
+        const owner_task = task.pinByIdentity(self.owner, self.owner_generation) orelse return;
+        defer _ = task.unpin(owner_task);
+        if (desired_rank >= task.dispatchRank(owner_task)) return;
+
+        global_lock_summary.role_inversions +%= 1;
+        if (self.donation_rank != task.no_dispatch_rank) {
+            _ = task.removeDispatchDonation(owner_task, self.donation_rank);
+            self.donation_rank = task.no_dispatch_rank;
+        }
+        if (task.addDispatchDonationByIdentity(owner_task.id, owner_task.generation, desired_rank)) {
+            self.donation_rank = desired_rank;
+            global_lock_summary.role_donations +%= 1;
+        }
     }
 };
 

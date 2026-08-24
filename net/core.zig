@@ -4649,7 +4649,7 @@ pub fn rxTaskSummary() RxTaskSummary {
 
 pub fn startRxTask() bool {
     if (rx_task_started) return true;
-    const worker = sched_task.createKernelThread("net-rx", rxTaskMain) orelse {
+    const worker = sched_task.createKernelThreadWithRole("net-rx", rxTaskMain, .short_completion) orelse {
         k.puts("NET rx-task create failed\r\n");
         return false;
     };
@@ -4664,7 +4664,7 @@ pub fn startRxTask() bool {
 
 pub fn startDhcpTask() bool {
     if (dhcp_task_started) return true;
-    const worker = sched_task.createKernelThread("dhcp-link", dhcpTaskMain) orelse {
+    const worker = sched_task.createKernelThreadWithRole("dhcp-link", dhcpTaskMain, .batch) orelse {
         dhcp_task_retry_requested = true;
         dhcp_task_next_retry_tick = time_core.monotonicTicks() +| DHCP_TASK_START_RETRY_TICKS;
         k.puts("DHCP05913 task=create-failed\r\n");

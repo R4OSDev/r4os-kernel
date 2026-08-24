@@ -50,9 +50,16 @@ wakes and leaves a visible backlog for the next delivery. Equal deadlines keep
 enrollment order, cancellation unlinks the exact waiter, and hardware horizons
 are crossed through bounded one-shot checkpoints. R4X tasks also carry an
 immutable direct execution-owner binding; timer IRQ attribution does not scan
-ProgramThread or asynchronous-I/O registries. A wake of a higher priority task
-requests rescheduling, but the switch is consumed only at a safe IRQ exit after
-wait-queue critical sections have been released.
+ProgramThread or asynchronous-I/O registries. Kernel owners assign the internal
+roles input, short completion, interactive, and batch; applications cannot
+select scheduler policy. Input and completion boosts have per-activation tick
+and dispatch budgets and are demoted to interactive rank after exhaustion.
+Directed single wakes prefer the most urgent role while preserving FIFO order
+inside that role; drain and cancellation paths remain FIFO. A more urgent wake
+requests rescheduling, but a switch is consumed only after queue and owner
+state is published, either at a lock-safe synchronous return point or at the
+existing post-handler/EOI IRQ boundary. Bounded mutex role donation covers
+short inversions without creating an unbounded high-priority lane.
 
 Detailed German migration notes are preserved in
 `DOCUMENTATION.de.txt`.

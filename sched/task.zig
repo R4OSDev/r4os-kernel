@@ -41,14 +41,52 @@ pub const State = enum(u8) {
     dead,
 };
 
-// 0.56.18: Prioritaetsklassen (Befund 4.1). HIGH fuer Eingabe-Pfade
-// (usb-hid-poll), NORMAL fuer alles andere; LOW wird erst vergeben, wenn
-// ein echter Batch-Konsument existiert. Auswahl in scheduler.nextReadyTask.
+// Public modules cannot select scheduler policy. Kernel owners assign one of
+// these internal roles before publishing a Task ready; Priority remains the
+// compact diagnostic lane derived from that role.
 pub const Priority = enum(u8) {
     high = 0,
     normal = 1,
     low = 2,
 };
+
+pub const Role = enum(u8) {
+    input = 0,
+    short_completion = 1,
+    interactive = 2,
+    batch = 3,
+};
+
+pub const role_count: usize = 4;
+pub const no_dispatch_rank: u8 = 0xFF;
+
+pub const RolePolicy = struct {
+    priority: Priority,
+    run_budget_ticks: u32,
+    dispatch_budget: u16,
+};
+
+// Input and short completions may jump normal work only for a small activation
+// budget. Once either bound is consumed they run as normal interactive work
+// until they block and are woken again. The every-eighth scheduler fairness
+// turn remains an independent system-wide bound for repeated activations.
+pub fn rolePolicy(role: Role) RolePolicy {
+    return switch (role) {
+        .input => .{ .priority = .high, .run_budget_ticks = 2, .dispatch_budget = 4 },
+        .short_completion => .{ .priority = .high, .run_budget_ticks = 4, .dispatch_budget = 4 },
+        .interactive => .{ .priority = .normal, .run_budget_ticks = 0, .dispatch_budget = 0 },
+        .batch => .{ .priority = .low, .run_budget_ticks = 0, .dispatch_budget = 0 },
+    };
+}
+
+pub fn roleName(role: Role) []const u8 {
+    return switch (role) {
+        .input => "input",
+        .short_completion => "completion",
+        .interactive => "interactive",
+        .batch => "batch",
+    };
+}
 
 pub const WaitResult = enum(u32) {
     none = 0,
@@ -157,7 +195,18 @@ pub const Task = struct {
     stack_base: u64 = 0,
     stack_top: u64 = 0,
     stack_range_id: u32 = 0,
+    role: Role = .interactive,
     priority: Priority = .normal,
+    role_budget_ticks_remaining: u32 = 0,
+    role_budget_dispatches_remaining: u16 = 0,
+    role_budget_exhausted_recorded: bool = false,
+    inherited_rank_counts: [role_count]u16 = .{0} ** role_count,
+    donation_budget_ticks_remaining: u32 = 0,
+    donation_budget_dispatches_remaining: u16 = 0,
+    donation_budget_exhausted_recorded: bool = false,
+    role_activations: u64 = 0,
+    role_budget_exhaustions: u64 = 0,
+    donation_budget_exhaustions: u64 = 0,
     execution_owner_kind: ExecutionOwnerKind = .none,
     execution_owner_context: ?*anyopaque = null,
     entry: ?Entry = null,
@@ -228,7 +277,13 @@ var registry_tail: ?*Task = null;
 var ready_head: ?*Task = null;
 var ready_tail: ?*Task = null;
 var ready_count: usize = 0;
-var ready_priority_counts: [3]usize = .{0} ** 3;
+var ready_dispatch_counts: [role_count]usize = .{0} ** role_count;
+var role_activation_counts: [role_count]u64 = .{0} ** role_count;
+var role_budget_exhaustion_counts: [role_count]u64 = .{0} ** role_count;
+var donation_request_count: u64 = 0;
+var donation_apply_count: u64 = 0;
+var donation_release_count: u64 = 0;
+var donation_budget_exhaustion_count: u64 = 0;
 var timeout_head: ?*Task = null;
 var timeout_tail: ?*Task = null;
 var timeout_count: usize = 0;
@@ -311,7 +366,13 @@ pub fn init() bool {
     ready_head = null;
     ready_tail = null;
     ready_count = 0;
-    ready_priority_counts = .{0} ** 3;
+    ready_dispatch_counts = .{0} ** role_count;
+    role_activation_counts = .{0} ** role_count;
+    role_budget_exhaustion_counts = .{0} ** role_count;
+    donation_request_count = 0;
+    donation_apply_count = 0;
+    donation_release_count = 0;
+    donation_budget_exhaustion_count = 0;
     timeout_head = null;
     timeout_tail = null;
     timeout_count = 0;
@@ -341,7 +402,7 @@ pub fn init() bool {
     if (!prepareCriticalReserve()) return false;
     initialized = true;
     var create_failure: CreateFailure = .none;
-    _ = createTask("kernel-main", .running, false, null, &create_failure) orelse {
+    _ = createTask("kernel-main", .running, false, null, .interactive, &create_failure) orelse {
         initialized = false;
         cleanupCriticalReserve();
         return false;
@@ -365,10 +426,10 @@ pub fn createKernelTask(name: []const u8, state: State) ?*Task {
 }
 
 pub fn createKernelTaskWithFailure(name: []const u8, state: State, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, state, true, null, failure_out);
+    return createTask(name, state, true, null, .interactive, failure_out);
 }
 
-fn createTask(name: []const u8, state: State, needs_fpu: bool, entry: ?Entry, failure_out: *CreateFailure) ?*Task {
+fn createTask(name: []const u8, state: State, needs_fpu: bool, entry: ?Entry, role: Role, failure_out: *CreateFailure) ?*Task {
     failure_out.* = .none;
     if (!initialized) {
         recordCreateFailure(failure_out, .memory);
@@ -453,6 +514,7 @@ fn createTask(name: []const u8, state: State, needs_fpu: bool, entry: ?Entry, fa
         .fpu_state_valid = fpu_memory != null,
         .uses_fpu = needs_fpu,
     };
+    configureRoleFields(new_task, role);
 
     const irq_flags = interrupts.saveAndDisable();
     const id = allocateTaskIdLocked() orelse {
@@ -470,6 +532,7 @@ fn createTask(name: []const u8, state: State, needs_fpu: bool, entry: ?Entry, fa
     new_task.id = id;
     new_task.generation = generation;
     linkRegistryLocked(new_task);
+    if (state == .ready or state == .running) resetRoleActivationLocked(new_task);
     interrupts.restore(irq_flags);
     return new_task;
 }
@@ -629,8 +692,130 @@ fn unlinkRegistryLocked(t: *Task) void {
     bumpInventoryMutationEpochLocked();
 }
 
-fn priorityIndex(priority: Priority) usize {
-    return @intFromEnum(priority);
+fn roleIndex(role: Role) usize {
+    return @intFromEnum(role);
+}
+
+fn roleBoostActive(t: *const Task) bool {
+    const policy = rolePolicy(t.role);
+    if (policy.priority != .high) return false;
+    return t.role_budget_ticks_remaining != 0 and t.role_budget_dispatches_remaining != 0;
+}
+
+fn bestInheritedRank(t: *const Task) u8 {
+    for (t.inherited_rank_counts, 0..) |rank_count, index| {
+        if (rank_count != 0) return @intCast(index);
+    }
+    return no_dispatch_rank;
+}
+
+fn donationBoostActive(t: *const Task) bool {
+    return bestInheritedRank(t) != no_dispatch_rank and
+        t.donation_budget_ticks_remaining != 0 and
+        t.donation_budget_dispatches_remaining != 0;
+}
+
+pub fn dispatchRank(t: *const Task) u8 {
+    const base: u8 = switch (t.role) {
+        .input => if (roleBoostActive(t)) 0 else 2,
+        .short_completion => if (roleBoostActive(t)) 1 else 2,
+        .interactive => 2,
+        .batch => 3,
+    };
+    if (!donationBoostActive(t)) return base;
+    return @min(base, bestInheritedRank(t));
+}
+
+// Selection performed before scheduler.wakeTask must evaluate the activation
+// that will be published, not the exhausted budget of the task's previous
+// run. finishWait resets exactly this role budget before Ready insertion.
+pub fn wakeDispatchRank(t: *const Task) u8 {
+    return switch (t.role) {
+        .input => 0,
+        .short_completion => 1,
+        .interactive => 2,
+        .batch => 3,
+    };
+}
+
+pub fn effectivePriority(t: *const Task) Priority {
+    return switch (dispatchRank(t)) {
+        0, 1 => .high,
+        2 => .normal,
+        else => .low,
+    };
+}
+
+fn adjustReadyDispatchCountLocked(t: *const Task, old_rank: u8, new_rank: u8) void {
+    if (!t.ready_linked or old_rank == new_rank) return;
+    if (old_rank < ready_dispatch_counts.len and ready_dispatch_counts[old_rank] != 0) {
+        ready_dispatch_counts[old_rank] -= 1;
+    }
+    if (new_rank < ready_dispatch_counts.len) ready_dispatch_counts[new_rank] += 1;
+}
+
+fn configureRoleFields(t: *Task, role: Role) void {
+    const policy = rolePolicy(role);
+    t.role = role;
+    t.priority = policy.priority;
+    t.role_budget_ticks_remaining = policy.run_budget_ticks;
+    t.role_budget_dispatches_remaining = policy.dispatch_budget;
+    t.role_budget_exhausted_recorded = false;
+}
+
+fn resetRoleActivationLocked(t: *Task) void {
+    const old_rank = dispatchRank(t);
+    const policy = rolePolicy(t.role);
+    t.priority = policy.priority;
+    t.role_budget_ticks_remaining = policy.run_budget_ticks;
+    t.role_budget_dispatches_remaining = policy.dispatch_budget;
+    t.role_budget_exhausted_recorded = false;
+    t.role_activations +%= 1;
+    role_activation_counts[roleIndex(t.role)] +%= 1;
+    adjustReadyDispatchCountLocked(t, old_rank, dispatchRank(t));
+}
+
+fn noteRoleBudgetExhaustedLocked(t: *Task) void {
+    if (t.role_budget_exhausted_recorded or rolePolicy(t.role).priority != .high) return;
+    if (t.role_budget_ticks_remaining != 0 and t.role_budget_dispatches_remaining != 0) return;
+    t.role_budget_exhausted_recorded = true;
+    t.role_budget_exhaustions +%= 1;
+    role_budget_exhaustion_counts[roleIndex(t.role)] +%= 1;
+}
+
+fn noteDonationBudgetExhaustedLocked(t: *Task) void {
+    if (t.donation_budget_exhausted_recorded or bestInheritedRank(t) == no_dispatch_rank) return;
+    if (t.donation_budget_ticks_remaining != 0 and t.donation_budget_dispatches_remaining != 0) return;
+    t.donation_budget_exhausted_recorded = true;
+    t.donation_budget_exhaustions +%= 1;
+    donation_budget_exhaustion_count +%= 1;
+}
+
+fn consumeDispatchBudgetsLocked(t: *Task) void {
+    const old_rank = dispatchRank(t);
+    if (rolePolicy(t.role).priority == .high and t.role_budget_dispatches_remaining != 0) {
+        t.role_budget_dispatches_remaining -= 1;
+        noteRoleBudgetExhaustedLocked(t);
+    }
+    if (bestInheritedRank(t) != no_dispatch_rank and t.donation_budget_dispatches_remaining != 0) {
+        t.donation_budget_dispatches_remaining -= 1;
+        noteDonationBudgetExhaustedLocked(t);
+    }
+    adjustReadyDispatchCountLocked(t, old_rank, dispatchRank(t));
+}
+
+fn consumeRunBudgetsLocked(t: *Task, elapsed: u64) void {
+    if (elapsed == 0) return;
+    if (rolePolicy(t.role).priority == .high and t.role_budget_ticks_remaining != 0) {
+        const consumed: u32 = @intCast(@min(elapsed, @as(u64, t.role_budget_ticks_remaining)));
+        t.role_budget_ticks_remaining -= consumed;
+        noteRoleBudgetExhaustedLocked(t);
+    }
+    if (bestInheritedRank(t) != no_dispatch_rank and t.donation_budget_ticks_remaining != 0) {
+        const consumed: u32 = @intCast(@min(elapsed, @as(u64, t.donation_budget_ticks_remaining)));
+        t.donation_budget_ticks_remaining -= consumed;
+        noteDonationBudgetExhaustedLocked(t);
+    }
 }
 
 fn linkReadyLocked(t: *Task) void {
@@ -641,7 +826,7 @@ fn linkReadyLocked(t: *Task) void {
     ready_tail = t;
     t.ready_linked = true;
     ready_count += 1;
-    ready_priority_counts[priorityIndex(t.priority)] += 1;
+    ready_dispatch_counts[dispatchRank(t)] += 1;
 }
 
 fn unlinkReadyLocked(t: *Task) void {
@@ -652,8 +837,8 @@ fn unlinkReadyLocked(t: *Task) void {
     t.ready_next = null;
     t.ready_linked = false;
     if (ready_count != 0) ready_count -= 1;
-    const index = priorityIndex(t.priority);
-    if (ready_priority_counts[index] != 0) ready_priority_counts[index] -= 1;
+    const index = dispatchRank(t);
+    if (ready_dispatch_counts[index] != 0) ready_dispatch_counts[index] -= 1;
 }
 
 fn linkTimeoutLocked(t: *Task) void {
@@ -1024,7 +1209,12 @@ pub fn createKernelThread(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelThreadWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .ready, false, entry, failure_out);
+    return createTask(name, .ready, false, entry, .interactive, failure_out);
+}
+
+pub fn createKernelThreadWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
+    var failure: CreateFailure = .none;
+    return createTask(name, .ready, false, entry, role, &failure);
 }
 
 pub fn createKernelThreadBlocked(name: []const u8, entry: Entry) ?*Task {
@@ -1033,7 +1223,12 @@ pub fn createKernelThreadBlocked(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelThreadBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .blocked, true, entry, failure_out);
+    return createTask(name, .blocked, true, entry, .interactive, failure_out);
+}
+
+pub fn createKernelThreadBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
+    var failure: CreateFailure = .none;
+    return createTask(name, .blocked, true, entry, role, &failure);
 }
 
 pub fn createKernelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
@@ -1042,7 +1237,12 @@ pub fn createKernelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelWorkerBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .blocked, false, entry, failure_out);
+    return createTask(name, .blocked, false, entry, .interactive, failure_out);
+}
+
+pub fn createKernelWorkerBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
+    var failure: CreateFailure = .none;
+    return createTask(name, .blocked, false, entry, role, &failure);
 }
 
 // Critical workers consume one of four boot-time Task+Stack bundles. Normal
@@ -1055,10 +1255,15 @@ pub fn createKernelThreadCritical(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelThreadCriticalWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createCriticalTask(name, .ready, entry, failure_out);
+    return createCriticalTask(name, .ready, entry, .interactive, failure_out);
 }
 
-fn createCriticalTask(name: []const u8, state: State, entry: Entry, failure_out: *CreateFailure) ?*Task {
+pub fn createKernelThreadCriticalWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
+    var failure: CreateFailure = .none;
+    return createCriticalTask(name, .ready, entry, role, &failure);
+}
+
+fn createCriticalTask(name: []const u8, state: State, entry: Entry, role: Role, failure_out: *CreateFailure) ?*Task {
     failure_out.* = .none;
     if (!initialized) {
         recordCreateFailure(failure_out, .memory);
@@ -1106,6 +1311,7 @@ fn createCriticalTask(name: []const u8, state: State, entry: Entry, failure_out:
         .entry = entry,
         .uses_fpu = false,
     };
+    configureRoleFields(new_task, role);
     const id = allocateTaskIdLocked() orelse {
         recordCreateFailure(failure_out, .memory);
         resetCriticalTaskLocked(bundle, index);
@@ -1123,6 +1329,7 @@ fn createCriticalTask(name: []const u8, state: State, entry: Entry, failure_out:
     bundle.in_use = true;
     critical_reserve_in_use += 1;
     linkRegistryLocked(new_task);
+    if (state == .ready or state == .running) resetRoleActivationLocked(new_task);
     interrupts.restore(irq_flags);
     return new_task;
 }
@@ -1306,13 +1513,16 @@ pub fn readyCount() usize {
     return ready_count;
 }
 
-pub fn hasHigherPriorityReady(priority: Priority) bool {
-    const limit = priorityIndex(priority);
+pub fn hasReadyMoreUrgentThanRank(rank: u8) bool {
     var index: usize = 0;
-    while (index < limit) : (index += 1) {
-        if (ready_priority_counts[index] != 0) return true;
+    while (index < @min(@as(usize, rank), ready_dispatch_counts.len)) : (index += 1) {
+        if (ready_dispatch_counts[index] != 0) return true;
     }
     return false;
+}
+
+pub fn hasMoreUrgentReady(running: *const Task) bool {
+    return hasReadyMoreUrgentThanRank(dispatchRank(running));
 }
 
 pub fn firstTimedWait() ?*Task {
@@ -1364,7 +1574,7 @@ pub fn queueSnapshot() QueueSnapshot {
     var expected_ready: usize = 0;
     var expected_timed: usize = 0;
     var expected_reap: usize = 0;
-    var expected_priorities: [3]usize = .{0} ** 3;
+    var expected_dispatch: [role_count]usize = .{0} ** role_count;
     var previous: ?*Task = null;
     var cursor = registry_head;
     while (cursor) |candidate| {
@@ -1385,7 +1595,7 @@ pub fn queueSnapshot() QueueSnapshot {
         }
         if (should_be_ready) {
             expected_ready += 1;
-            expected_priorities[priorityIndex(candidate.priority)] += 1;
+            expected_dispatch[dispatchRank(candidate)] += 1;
         }
         if (should_be_timed) expected_timed += 1;
         if (should_be_reaped) expected_reap += 1;
@@ -1396,7 +1606,7 @@ pub fn queueSnapshot() QueueSnapshot {
 
     previous = null;
     cursor = ready_head;
-    var observed_priorities: [3]usize = .{0} ** 3;
+    var observed_dispatch: [role_count]usize = .{0} ** role_count;
     while (cursor) |candidate| {
         out.ready += 1;
         if (out.ready > ready_count) {
@@ -1404,15 +1614,15 @@ pub fn queueSnapshot() QueueSnapshot {
             break;
         }
         if (!candidate.ready_linked or candidate.state != .ready or candidate.ready_prev != previous) out.valid = false;
-        observed_priorities[priorityIndex(candidate.priority)] += 1;
+        observed_dispatch[dispatchRank(candidate)] += 1;
         previous = candidate;
         cursor = candidate.ready_next;
     }
-    var priorities_match = true;
-    for (observed_priorities, ready_priority_counts, expected_priorities) |observed, tracked, expected| {
-        if (observed != tracked or observed != expected) priorities_match = false;
+    var dispatch_matches = true;
+    for (observed_dispatch, ready_dispatch_counts, expected_dispatch) |observed, tracked, expected| {
+        if (observed != tracked or observed != expected) dispatch_matches = false;
     }
-    if (out.ready != ready_count or out.ready != expected_ready or previous != ready_tail or !priorities_match)
+    if (out.ready != ready_count or out.ready != expected_ready or previous != ready_tail or !dispatch_matches)
         out.valid = false;
 
     previous = null;
@@ -1452,17 +1662,80 @@ pub fn queueSnapshot() QueueSnapshot {
     return out;
 }
 
-pub fn setPriority(t: *Task, priority: Priority) bool {
+pub fn assignRole(t: *Task, role: Role) bool {
     const irq_flags = interrupts.saveAndDisable();
     defer interrupts.restore(irq_flags);
     if (!containsTaskLocked(t) or t.state == .unused or t.state == .dead) return false;
-    if (t.priority == priority) return true;
-    if (t.ready_linked) {
-        const old_index = priorityIndex(t.priority);
-        if (ready_priority_counts[old_index] != 0) ready_priority_counts[old_index] -= 1;
-        ready_priority_counts[priorityIndex(priority)] += 1;
+    if (t.role == role) return true;
+    const old_rank = dispatchRank(t);
+    configureRoleFields(t, role);
+    adjustReadyDispatchCountLocked(t, old_rank, dispatchRank(t));
+    return true;
+}
+
+pub const RoleStats = struct {
+    activations: [role_count]u64 = .{0} ** role_count,
+    budget_exhaustions: [role_count]u64 = .{0} ** role_count,
+    donation_requests: u64 = 0,
+    donations_applied: u64 = 0,
+    donations_released: u64 = 0,
+    donation_budget_exhaustions: u64 = 0,
+};
+
+pub fn roleStats() RoleStats {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    return .{
+        .activations = role_activation_counts,
+        .budget_exhaustions = role_budget_exhaustion_counts,
+        .donation_requests = donation_request_count,
+        .donations_applied = donation_apply_count,
+        .donations_released = donation_release_count,
+        .donation_budget_exhaustions = donation_budget_exhaustion_count,
+    };
+}
+
+const DONATION_RUN_BUDGET_TICKS: u32 = 4;
+const DONATION_DISPATCH_BUDGET: u16 = 4;
+
+pub fn addDispatchDonationByIdentity(id: u32, generation: u64, rank: u8) bool {
+    if (rank >= role_count) return false;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    donation_request_count +%= 1;
+    const target = findByIdentityLocked(id, generation) orelse return false;
+    if (target.state == .unused or target.state == .dead) return false;
+    const old_rank = dispatchRank(target);
+    const old_best = bestInheritedRank(target);
+    const index: usize = rank;
+    if (target.inherited_rank_counts[index] == 0xFFFF) return false;
+    target.inherited_rank_counts[index] += 1;
+    if (old_best == no_dispatch_rank or rank < old_best) {
+        target.donation_budget_ticks_remaining = DONATION_RUN_BUDGET_TICKS;
+        target.donation_budget_dispatches_remaining = DONATION_DISPATCH_BUDGET;
+        target.donation_budget_exhausted_recorded = false;
     }
-    t.priority = priority;
+    donation_apply_count +%= 1;
+    adjustReadyDispatchCountLocked(target, old_rank, dispatchRank(target));
+    return true;
+}
+
+pub fn removeDispatchDonation(t: *Task, rank: u8) bool {
+    if (rank >= role_count) return false;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (!containsTaskLocked(t) or t.state == .unused) return false;
+    const index: usize = rank;
+    if (t.inherited_rank_counts[index] == 0) return false;
+    const old_rank = dispatchRank(t);
+    t.inherited_rank_counts[index] -= 1;
+    if (bestInheritedRank(t) == no_dispatch_rank) {
+        t.donation_budget_ticks_remaining = 0;
+        t.donation_budget_dispatches_remaining = 0;
+        t.donation_budget_exhausted_recorded = false;
+    }
+    donation_release_count +%= 1;
+    adjustReadyDispatchCountLocked(t, old_rank, dispatchRank(t));
     return true;
 }
 
@@ -1549,6 +1822,7 @@ pub fn markReady(t: *Task, now: u64) void {
     unlinkTimeoutLocked(t);
     t.state = .ready;
     t.ready_since_tick = now;
+    if (was_durably_blocked) resetRoleActivationLocked(t);
     linkReadyLocked(t);
     if (was_durably_blocked) bumpInventoryMutationEpochLocked();
 }
@@ -1576,6 +1850,7 @@ pub fn recordScheduled(t: *Task, now: u64) u64 {
     t.last_scheduled_tick = now;
     t.last_accounted_tick = now;
     t.switches_in +%= 1;
+    consumeDispatchBudgetsLocked(t);
     return latency;
 }
 
@@ -1590,6 +1865,7 @@ pub fn recordRunTick(t: *Task, now: u64) u64 {
         0;
     t.run_ticks +|= accounted;
     t.last_accounted_tick = now;
+    consumeRunBudgetsLocked(t, accounted);
     const run_ticks = ticksSince(now, t.last_scheduled_tick);
     if (run_ticks > t.max_run_without_switch_ticks) t.max_run_without_switch_ticks = run_ticks;
     return run_ticks;
@@ -1669,6 +1945,15 @@ pub fn pinByIdentity(id: u32, generation: u64) ?*Task {
     const irq_flags = interrupts.saveAndDisable();
     defer interrupts.restore(irq_flags);
     const target = findByIdentityLocked(id, generation) orelse return null;
+    if (target.state == .unused or target.release_in_progress or target.pin_count == 0xFFFF_FFFF) return null;
+    target.pin_count += 1;
+    return target;
+}
+
+pub fn pinById(id: u32) ?*Task {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    const target = findByIdLocked(id) orelse return null;
     if (target.state == .unused or target.release_in_progress or target.pin_count == 0xFFFF_FFFF) return null;
     target.pin_count += 1;
     return target;
@@ -2111,6 +2396,7 @@ pub fn finishWait(t: *Task, result: WaitResult) u64 {
     t.wait_reason = "";
     t.wait_object = 0;
     t.wait_result = result;
+    resetRoleActivationLocked(t);
     linkReadyLocked(t);
     bumpInventoryMutationEpochLocked();
     return wait_ticks;
@@ -2309,12 +2595,20 @@ pub fn dump() void {
         k.puts(task.name);
         k.puts(" ");
         k.puts(stateName(task.state));
+        k.puts(" role=");
+        k.puts(roleName(task.role));
         k.puts(" prio=");
-        k.puts(switch (task.priority) {
+        k.puts(switch (effectivePriority(task)) {
             .high => "high",
             .normal => "normal",
             .low => "low",
         });
+        if (rolePolicy(task.role).priority == .high) {
+            k.puts(" budget=");
+            k.putDec(task.role_budget_ticks_remaining);
+            k.puts("/");
+            k.putDec(task.role_budget_dispatches_remaining);
+        }
         if (task.entry != null) {
             k.puts(" worker=yes");
         }

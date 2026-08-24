@@ -113,11 +113,26 @@ unveraenderliche direkte Execution-Owner-Bindung. Die Timer-IRQ-Pruefung kann
 den Programmbesitzer deshalb generationengeprueft in O(1) aufloesen, ohne die
 ProgramThread-Registry oder die Async-I/O-Slots zu durchsuchen.
 
-Ein Wake eines hoeher priorisierten Tasks publiziert weiterhin nur den
-Ready-Zustand, setzt aber zusaetzlich eine Reschedule-Anforderung. Der Wechsel
-findet nie im WaitQueue-Lock statt: Der Timer oder ein anderer IRQ konsumiert
-die Anforderung erst nach Handlern und EOI, nur bei freigegebener Preemption
-und einem sicheren Programminstruktionszeiger. Bis dahin bleibt sie pending.
+Schedulerrollen werden ausschliesslich von konkreten Kernelbesitzern vergeben:
+`input`, `short_completion`, `interactive` und `batch`. R4X-Anwendungen und
+R4X-Services bleiben normale interaktive Arbeit und koennen weder HIGH noch
+eine Echtzeitklasse anfordern. Input besitzt pro Aktivierung 2 Tick- und 4
+Dispatch-Budgeteinheiten, kurze Completion 4 und 4. Ist eine der Grenzen
+erschoepft, faellt die Aktivierung auf den interaktiven Dispatchrang zurueck;
+ein erneuter Boost entsteht erst nach Blockieren und Wake. Die bestehende
+achte FIFO-Auswahl garantiert davon unabhaengig Fortschritt fuer normale und
+niedrige Arbeit. Eine Mutex-Inversion kann den Besitzer fuer hoechstens 4
+Ticks beziehungsweise Dispatches auf den Rang des wichtigeren Waiters heben.
+
+Ein gerichteter Einzel-Wake waehlt den wichtigsten angemeldeten Rollenrang
+und bleibt innerhalb desselben Rangs FIFO. Wake-all-, Kill-, Retry- und
+Cancel-Pfade behalten ihre vollstaendige FIFO-Drainage. Der Wake publiziert
+zuerst den Ready-Zustand und setzt bei tatsaechlich wichtigerer Arbeit eine
+Reschedule-Anforderung. Ein Wechsel findet nie im WaitQueue- oder Besitzerlock
+statt: IRQs konsumieren ihn erst nach Handlern und EOI; synchrone Service- und
+Completionproduzenten verwenden einen expliziten Rueckkehrpunkt erst nach der
+vollstaendigen Publikation und pruefen Interruptzustand, Preemption,
+Lockbesitz und Semaphore-Handoff. Bis dahin bleibt die Anforderung pending.
 
 Synth-PCM und Protokollbruecke
 -----------------------------

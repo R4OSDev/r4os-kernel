@@ -217,7 +217,7 @@ pub fn init() void {
 
 pub fn startRuntimeWorker() bool {
     if (worker_started) return true;
-    const worker = sched_task.createKernelThread("ipc-worker", workerMain) orelse return false;
+    const worker = sched_task.createKernelThreadWithRole("ipc-worker", workerMain, .short_completion) orelse return false;
     worker_task_id = worker.id;
     worker_started = true;
     return true;
@@ -893,6 +893,7 @@ fn runWorkerTarget(target: WorkerTarget) void {
     unlockChannel(&guard);
     completion.complete();
     publishWorkerCompletion(target);
+    _ = scheduler.safeReschedulePoint();
 }
 
 fn publishWorkerCompletion(target: WorkerTarget) void {

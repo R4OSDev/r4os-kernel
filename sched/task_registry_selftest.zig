@@ -2,11 +2,15 @@ const std = @import("std");
 const fpu = @import("../arch/x86_64/fpu.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const boot_config = @import("../kernel/boot_config.zig");
+const driver_work = @import("../kernel/driver_work.zig");
+const service_ipc = @import("../kernel/service_ipc.zig");
 const k = @import("../kernel/log.zig");
 const heap = @import("../memory/heap.zig");
 const phys = @import("../memory/phys.zig");
 const virt = @import("../memory/virt.zig");
 const net_core = @import("../net/core.zig");
+const block_storage = @import("../storage/block.zig");
+const usb_hid = @import("../driver/usb/hid.zig");
 const timer = @import("../kernel/timer.zig");
 const scheduler = @import("scheduler.zig");
 const sync = @import("sync.zig");
@@ -28,6 +32,9 @@ const DEADLINE_LONG_TICKS: u64 = 20;
 const DEADLINE_IRQ_BAR: u64 = 3;
 const DEADLINE_LATENESS_BAR: u64 = 3;
 const DEADLINE_STORM_COUNT: usize = 65;
+const DIRECTED_ROLE_COUNT: usize = 4;
+const BUDGET_ROLE_COUNT: usize = 3;
+const BUDGET_INPUT_TURNS: u32 = 16;
 
 const WorkerKind = enum {
     runnable,
@@ -55,6 +62,7 @@ const WorkerMix = struct {
     runnable: u64 = 0,
     blocked: u64 = 0,
     priorities: u8 = 0,
+    roles: u8 = 0,
     stable: bool = true,
 };
 
@@ -77,6 +85,22 @@ var deadline_probe_irqs: u64 = 0;
 var deadline_probe_lateness: u64 = 0;
 var deadline_probe_checkpointed = false;
 var deadline_storm_batches: u32 = 0;
+var directed_tasks: [DIRECTED_ROLE_COUNT]?*task.Task = .{null} ** DIRECTED_ROLE_COUNT;
+var directed_ids: [DIRECTED_ROLE_COUNT]u32 = .{0} ** DIRECTED_ROLE_COUNT;
+var directed_generations: [DIRECTED_ROLE_COUNT]u64 = .{0} ** DIRECTED_ROLE_COUNT;
+var directed_results: u32 = 0;
+var directed_failures: u32 = 0;
+var budget_tasks: [BUDGET_ROLE_COUNT]?*task.Task = .{null} ** BUDGET_ROLE_COUNT;
+var budget_ids: [BUDGET_ROLE_COUNT]u32 = .{0} ** BUDGET_ROLE_COUNT;
+var budget_generations: [BUDGET_ROLE_COUNT]u64 = .{0} ** BUDGET_ROLE_COUNT;
+var budget_turns: [BUDGET_ROLE_COUNT]u32 = .{0} ** BUDGET_ROLE_COUNT;
+var budget_stop = false;
+var inversion_mutex = sync.Mutex.initClass("taskreg-role-inversion", sync.LockRank.local, .sleepable);
+var inversion_holder_owned = false;
+var inversion_release_holder = false;
+var inversion_holder_done = false;
+var inversion_waiter_done = false;
+var inversion_waiter_acquired = false;
 
 var signal_event = sync.EventV2.initMode(false, .manual_reset);
 var cancel_queue = sync.WaitQueue.init();
@@ -84,6 +108,7 @@ var timeout_queue = sync.WaitQueue.init();
 var kill_queue = sync.WaitQueue.init();
 var finish_queue = sync.WaitQueue.init();
 var wake_probe_event = sync.EventV2.initMode(false, .manual_reset);
+var directed_queue = sync.WaitQueue.init();
 
 pub fn runIfEnabled() bool {
     const value = boot_config.optionValue(boot_config.get(), "TASKREGISTRY", "selftest") orelse return true;
@@ -109,7 +134,12 @@ fn run() bool {
     if (!queueProjectionValid("warm")) return fail("queue-warm");
     if (!runDeadlineProbe()) return fail("deadline-probe");
     if (!runDeadlineStormProbe()) return fail("deadline-storm");
+    if (!runOwnerRoleProbe()) return fail("role-owners");
+    if (!runDirectedWakeProbe()) return fail("role-directed-wake");
+    if (!runBudgetFairnessProbe()) return fail("role-budget-fairness");
+    if (!runInversionProbe()) return fail("role-inversion");
     if (!runWakeProbe()) return fail("wakeup-probe");
+    if (!roleLatencyDistributionsValid()) return fail("role-latency-distribution");
     _ = task.reapDeferred();
     _ = task.reclaimStackCache(0);
     if (!queueProjectionValid("wake-reaped")) return fail("queue-wake-reaped");
@@ -179,7 +209,7 @@ fn run() bool {
     }
 
     const mix = countWorkerStates();
-    if (!mix.stable or mix.live < 128 or mix.runnable == 0 or mix.blocked == 0 or mix.priorities != 0b111 or worker_failures != 0) {
+    if (!mix.stable or mix.live < 128 or mix.runnable == 0 or mix.blocked == 0 or mix.priorities != 0b111 or mix.roles != 0b1111 or worker_failures != 0) {
         cleanupWorkers();
         return fail("concurrency-state");
     }
@@ -189,7 +219,7 @@ fn run() bool {
     k.putDec(mix.runnable);
     k.puts(" blocked=");
     k.putDec(mix.blocked);
-    k.puts(" priorities=3 wait=OK stable=OK\r\n");
+    k.puts(" priorities=3 roles=4 wait=OK stable=OK\r\n");
 
     release_workers = true;
     _ = finish_queue.wakeAll();
@@ -316,6 +346,20 @@ fn run() bool {
     k.puts(" batches=");
     k.putDec(deadline_storm_batches);
     k.puts(" periodic=restored fallback=0\r\n");
+    const role_stats = task.roleStats();
+    const wait_stats = sync.summary();
+    const scheduler_stats = scheduler.structureStats();
+    k.puts("TASKREG06933 roles=input+completion+interactive+batch owners=OK directed=");
+    k.putDec(wait_stats.directed_wakes);
+    k.puts(" bypasses=");
+    k.putDec(wait_stats.directed_fifo_bypasses);
+    k.puts(" budget_exhaust=");
+    k.putDec(role_stats.budget_exhaustions[@intFromEnum(task.Role.input)]);
+    k.puts(" donation=");
+    k.putDec(role_stats.donations_applied);
+    k.puts(" safe_switch=");
+    k.putDec(scheduler_stats.safe_reschedule_switches);
+    k.puts(" latency_buckets=OK fairness=normal+low timeout=OK lock_owner=OK\r\n");
     k.puts("TASKREG05910 result: OK\r\n");
     return true;
 }
@@ -340,12 +384,29 @@ fn resetState() void {
     deadline_probe_lateness = 0;
     deadline_probe_checkpointed = false;
     deadline_storm_batches = 0;
+    directed_tasks = .{null} ** DIRECTED_ROLE_COUNT;
+    directed_ids = .{0} ** DIRECTED_ROLE_COUNT;
+    directed_generations = .{0} ** DIRECTED_ROLE_COUNT;
+    directed_results = 0;
+    directed_failures = 0;
+    budget_tasks = .{null} ** BUDGET_ROLE_COUNT;
+    budget_ids = .{0} ** BUDGET_ROLE_COUNT;
+    budget_generations = .{0} ** BUDGET_ROLE_COUNT;
+    budget_turns = .{0} ** BUDGET_ROLE_COUNT;
+    budget_stop = false;
+    inversion_mutex = sync.Mutex.initClass("taskreg-role-inversion", sync.LockRank.local, .sleepable);
+    inversion_holder_owned = false;
+    inversion_release_holder = false;
+    inversion_holder_done = false;
+    inversion_waiter_done = false;
+    inversion_waiter_acquired = false;
     signal_event = sync.EventV2.initMode(false, .manual_reset);
     cancel_queue = sync.WaitQueue.init();
     timeout_queue = sync.WaitQueue.init();
     kill_queue = sync.WaitQueue.init();
     finish_queue = sync.WaitQueue.init();
     wake_probe_event = sync.EventV2.initMode(false, .manual_reset);
+    directed_queue = sync.WaitQueue.init();
 }
 
 fn runDeadlineProbe() bool {
@@ -499,6 +560,311 @@ fn queueProjectionValid(label: []const u8) bool {
     return false;
 }
 
+fn taskHasRole(id: u32, expected: task.Role) bool {
+    if (id == 0) return false;
+    const found = task.pinById(id) orelse return false;
+    defer _ = task.unpin(found);
+    return found.role == expected;
+}
+
+fn runOwnerRoleProbe() bool {
+    const ipc = service_ipc.performanceSummary();
+    const work = driver_work.summary();
+    const block = block_storage.runtimeWorkerSummary();
+    const net = net_core.rxTaskSummary();
+    const input = usb_hid.pollTaskSummary();
+    const input_status = usb_hid.status();
+    const ipc_ok = ipc.worker_started != 0 and taskHasRole(ipc.worker_task_id, .short_completion);
+    const work_ok = work.worker_started != 0 and taskHasRole(work.worker_task_id, .short_completion);
+    const block_ok = block.worker_started != 0 and taskHasRole(block.worker_task_id, .batch);
+    const net_ok = net.started and taskHasRole(net.task_id, .short_completion);
+    // Headless QEMU deliberately has no USB-HID binding, so usb_hid_boot does
+    // not start a pointless poller. If hardware is bound, however, the real
+    // owner must exist and carry the input role.
+    const input_ok = if (input.started)
+        taskHasRole(input.task_id, .input)
+    else
+        !input_status.keyboard_bound and !input_status.mouse_bound;
+    const ok = ipc_ok and work_ok and block_ok and net_ok and input_ok;
+    if (!ok) {
+        k.puts("TASKREG06933 role-owners ipc=");
+        k.puts(if (ipc_ok) "OK" else "FAIL");
+        k.puts(" work=");
+        k.puts(if (work_ok) "OK" else "FAIL");
+        k.puts(" block=");
+        k.puts(if (block_ok) "OK" else "FAIL");
+        k.puts(" net=");
+        k.puts(if (net_ok) "OK" else "FAIL");
+        k.puts(" input=");
+        k.puts(if (input_ok) "OK" else "FAIL");
+        k.puts(if (input.started) "/started\r\n" else "/absent\r\n");
+    }
+    return ok;
+}
+
+const directed_enrollment_roles = [_]task.Role{
+    .batch,
+    .interactive,
+    .short_completion,
+    .input,
+};
+const directed_expected_indices = [_]usize{ 3, 2, 1, 0 };
+
+fn directedTaskIndex(current: *task.Task) ?usize {
+    for (directed_tasks, 0..) |candidate, index| {
+        if (candidate == current) return index;
+    }
+    return null;
+}
+
+fn directedWakeMain() callconv(.c) void {
+    const current = scheduler.current() orelse {
+        directed_failures +%= 1;
+        return;
+    };
+    _ = directedTaskIndex(current) orelse {
+        directed_failures +%= 1;
+        return;
+    };
+    if (directed_queue.wait(sync.WAIT_FOREVER, "taskreg-role-directed") == .signaled) {
+        directed_results +%= 1;
+    } else {
+        directed_failures +%= 1;
+    }
+}
+
+fn cleanupDirectedWakeProbe() bool {
+    _ = directed_queue.cancelAll();
+    var ok = true;
+    for (&directed_tasks, 0..) |*slot, index| {
+        const created = slot.* orelse continue;
+        if (task.isAliveIdentity(directed_ids[index], directed_generations[index]) and
+            !task.killIdentity(directed_ids[index], directed_generations[index])) ok = false;
+        if (!task.unpin(created)) ok = false;
+        if (!task.releaseDeadIdentity(directed_ids[index], directed_generations[index])) ok = false;
+        slot.* = null;
+    }
+    _ = task.reapDeferred();
+    return ok;
+}
+
+fn runDirectedWakeProbe() bool {
+    directed_queue = sync.WaitQueue.init();
+    directed_results = 0;
+    directed_failures = 0;
+    const before = sync.summary();
+
+    for (directed_enrollment_roles, 0..) |role, index| {
+        const created = task.createKernelThreadBlockedWithRole("taskreg-role-directed", directedWakeMain, role) orelse {
+            _ = cleanupDirectedWakeProbe();
+            return false;
+        };
+        if (!task.pin(created)) {
+            _ = task.retireIdentity(created.id, created.generation);
+            _ = cleanupDirectedWakeProbe();
+            return false;
+        }
+        directed_tasks[index] = created;
+        directed_ids[index] = created.id;
+        directed_generations[index] = created.generation;
+        task.markReady(created, timer.tickCount());
+
+        var spins: usize = 0;
+        while ((created.state != .blocked or !std.mem.eql(u8, created.wait_reason, "taskreg-role-directed")) and
+            spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
+        if (created.state != .blocked) {
+            _ = cleanupDirectedWakeProbe();
+            return false;
+        }
+    }
+
+    for (directed_expected_indices) |index| {
+        if (directed_queue.wakeOne() != directed_ids[index]) {
+            _ = cleanupDirectedWakeProbe();
+            return false;
+        }
+    }
+    const safe_before = scheduler.structureStats();
+    const safe_switched = scheduler.safeReschedulePoint();
+    const safe_after = scheduler.structureStats();
+
+    var spins: usize = 0;
+    while (directed_results + directed_failures < DIRECTED_ROLE_COUNT and spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
+    const after = sync.summary();
+    const ok = directed_results == DIRECTED_ROLE_COUNT and directed_failures == 0 and
+        after.directed_wakes >= before.directed_wakes + DIRECTED_ROLE_COUNT and
+        after.directed_fifo_bypasses >= before.directed_fifo_bypasses + 3 and
+        after.directed_scans >= before.directed_scans + DIRECTED_ROLE_COUNT and
+        safe_switched and safe_after.safe_reschedule_switches > safe_before.safe_reschedule_switches and
+        task.queueSnapshot().valid;
+    const cleaned = cleanupDirectedWakeProbe();
+    return ok and cleaned;
+}
+
+fn budgetTaskIndex(current: *task.Task) ?usize {
+    for (budget_tasks, 0..) |candidate, index| {
+        if (candidate == current) return index;
+    }
+    return null;
+}
+
+fn budgetFairnessMain() callconv(.c) void {
+    const current = scheduler.current() orelse return;
+    const index = budgetTaskIndex(current) orelse return;
+    while (!budget_stop) {
+        budget_turns[index] +%= 1;
+        if (index == 0 and budget_turns[0] >= BUDGET_INPUT_TURNS and
+            budget_turns[1] != 0 and budget_turns[2] != 0)
+        {
+            budget_stop = true;
+        }
+        scheduler.yield();
+    }
+}
+
+fn cleanupBudgetFairnessProbe() bool {
+    budget_stop = true;
+    var ok = true;
+    for (&budget_tasks, 0..) |*slot, index| {
+        const created = slot.* orelse continue;
+        if (task.isAliveIdentity(budget_ids[index], budget_generations[index]) and
+            !task.killIdentity(budget_ids[index], budget_generations[index])) ok = false;
+        if (!task.unpin(created)) ok = false;
+        if (!task.releaseDeadIdentity(budget_ids[index], budget_generations[index])) ok = false;
+        slot.* = null;
+    }
+    _ = task.reapDeferred();
+    return ok;
+}
+
+fn runBudgetFairnessProbe() bool {
+    const roles = [_]task.Role{ .input, .interactive, .batch };
+    budget_turns = .{0} ** BUDGET_ROLE_COUNT;
+    budget_stop = false;
+    const before = task.roleStats();
+    for (roles, 0..) |role, index| {
+        const created = task.createKernelThreadBlockedWithRole("taskreg-role-budget", budgetFairnessMain, role) orelse {
+            _ = cleanupBudgetFairnessProbe();
+            return false;
+        };
+        if (!task.pin(created)) {
+            _ = task.retireIdentity(created.id, created.generation);
+            _ = cleanupBudgetFairnessProbe();
+            return false;
+        }
+        budget_tasks[index] = created;
+        budget_ids[index] = created.id;
+        budget_generations[index] = created.generation;
+        task.markReady(created, timer.tickCount());
+    }
+
+    var spins: usize = 0;
+    while ((!budget_stop or budget_tasks[0].?.state != .dead or
+        budget_tasks[1].?.state != .dead or budget_tasks[2].?.state != .dead) and
+        spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
+    const after = task.roleStats();
+    const input_task = budget_tasks[0].?;
+    const ok = budget_stop and budget_turns[0] >= BUDGET_INPUT_TURNS and
+        budget_turns[1] != 0 and budget_turns[2] != 0 and
+        input_task.role_budget_exhaustions != 0 and
+        after.budget_exhaustions[@intFromEnum(task.Role.input)] >
+            before.budget_exhaustions[@intFromEnum(task.Role.input)] and
+        task.queueSnapshot().valid;
+    const cleaned = cleanupBudgetFairnessProbe();
+    return ok and cleaned;
+}
+
+fn inversionHolderMain() callconv(.c) void {
+    if (!inversion_mutex.lock(sync.WAIT_FOREVER)) return;
+    inversion_holder_owned = true;
+    while (!inversion_release_holder) scheduler.yield();
+    if (!inversion_mutex.unlock()) return;
+    inversion_holder_done = true;
+}
+
+fn inversionWaiterMain() callconv(.c) void {
+    if (inversion_mutex.lock(200)) {
+        inversion_waiter_acquired = true;
+        _ = inversion_mutex.unlock();
+    }
+    inversion_waiter_done = true;
+}
+
+fn cleanupInversionProbe(holder: ?*task.Task, waiter: ?*task.Task) bool {
+    inversion_release_holder = true;
+    var ok = true;
+    const pair = [_]?*task.Task{ holder, waiter };
+    for (pair) |maybe_task| {
+        const created = maybe_task orelse continue;
+        const id = created.id;
+        const generation = created.generation;
+        if (task.isAliveIdentity(id, generation) and !task.killIdentity(id, generation)) ok = false;
+        if (!task.unpin(created)) ok = false;
+        if (!task.releaseDeadIdentity(id, generation)) ok = false;
+    }
+    _ = task.reapDeferred();
+    return ok;
+}
+
+fn runInversionProbe() bool {
+    inversion_mutex = sync.Mutex.initClass("taskreg-role-inversion", sync.LockRank.local, .sleepable);
+    inversion_holder_owned = false;
+    inversion_release_holder = false;
+    inversion_holder_done = false;
+    inversion_waiter_done = false;
+    inversion_waiter_acquired = false;
+    const before = sync.lockSummary();
+
+    const holder = task.createKernelThreadBlockedWithRole("taskreg-role-holder", inversionHolderMain, .batch) orelse return false;
+    if (!task.pin(holder)) {
+        _ = task.retireIdentity(holder.id, holder.generation);
+        return false;
+    }
+    task.markReady(holder, timer.tickCount());
+    var spins: usize = 0;
+    while (!inversion_holder_owned and spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
+    if (!inversion_holder_owned) return cleanupInversionProbe(holder, null) and false;
+
+    const waiter = task.createKernelThreadBlockedWithRole("taskreg-role-waiter", inversionWaiterMain, .input) orelse {
+        _ = cleanupInversionProbe(holder, null);
+        return false;
+    };
+    if (!task.pin(waiter)) {
+        _ = task.retireIdentity(waiter.id, waiter.generation);
+        _ = cleanupInversionProbe(holder, null);
+        return false;
+    }
+    task.markReady(waiter, timer.tickCount());
+    spins = 0;
+    while ((waiter.state != .blocked or !std.mem.eql(u8, waiter.wait_reason, "mutex")) and spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
+    if (waiter.state != .blocked) return cleanupInversionProbe(holder, waiter) and false;
+
+    inversion_release_holder = true;
+    spins = 0;
+    while ((!inversion_holder_done or !inversion_waiter_done) and spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
+    const after = sync.lockSummary();
+    const ok = inversion_holder_done and inversion_waiter_done and inversion_waiter_acquired and
+        inversion_mutex.owner == 0 and inversion_mutex.owner_generation == 0 and inversion_mutex.depth == 0 and
+        inversion_mutex.donation_rank == task.no_dispatch_rank and
+        after.role_inversions > before.role_inversions and
+        after.role_donations > before.role_donations and
+        after.role_donation_releases > before.role_donation_releases and
+        task.queueSnapshot().valid;
+    const cleaned = cleanupInversionProbe(holder, waiter);
+    return ok and cleaned;
+}
+
+fn roleLatencyDistributionsValid() bool {
+    const stats = scheduler.stats();
+    for (stats.ready_latency_role_samples, stats.ready_latency_role_buckets) |samples, buckets| {
+        if (samples == 0) return false;
+        var total: u64 = 0;
+        for (buckets) |value| total +%= value;
+        if (total != samples) return false;
+    }
+    return true;
+}
+
 fn wakeProbeMain() callconv(.c) void {
     wake_probe_entered = true;
     if (wake_probe_event.waitResult(sync.WAIT_FOREVER) == .signaled) {
@@ -508,11 +874,11 @@ fn wakeProbeMain() callconv(.c) void {
 
 fn runWakeProbe() bool {
     const caller = scheduler.current() orelse return false;
-    const old_priority = caller.priority;
+    const old_role = caller.role;
     const probe = task.createKernelThreadBlocked("taskreg-wakeup", wakeProbeMain) orelse return false;
     const probe_id = probe.id;
     const probe_generation = probe.generation;
-    if (!task.setPriority(probe, .high)) {
+    if (!task.assignRole(probe, .input)) {
         _ = task.retireIdentity(probe_id, probe_generation);
         return false;
     }
@@ -520,7 +886,7 @@ fn runWakeProbe() bool {
 
     var spins: usize = 0;
     while ((!wake_probe_entered or probe.state != .blocked) and spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
-    if (!wake_probe_entered or probe.state != .blocked or !task.setPriority(caller, .normal)) {
+    if (!wake_probe_entered or probe.state != .blocked or !task.assignRole(caller, .interactive)) {
         if (task.isAliveIdentity(probe_id, probe_generation)) _ = task.killIdentity(probe_id, probe_generation);
         _ = task.retireIdentity(probe_id, probe_generation);
         return false;
@@ -532,15 +898,19 @@ fn runWakeProbe() bool {
     const published_without_switch = scheduler.current() == caller and
         after_signal.wakeup_reschedule_requests > before.wakeup_reschedule_requests and
         after_signal.reschedule_pending;
+    const safe_switched = scheduler.safeReschedulePoint();
+    const after_safe = scheduler.structureStats();
 
     spins = 0;
     while (!wake_probe_completed and spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
     wake_probe_latency = probe.last_ready_latency_ticks;
-    _ = task.setPriority(caller, old_priority);
+    _ = task.assignRole(caller, old_role);
     const bounded = wake_probe_completed and wake_probe_latency <= WAKE_LATENCY_BAR;
     if (task.isAliveIdentity(probe_id, probe_generation)) _ = task.killIdentity(probe_id, probe_generation);
     const retired = task.retireIdentity(probe_id, probe_generation);
-    return published_without_switch and bounded and retired != .pending;
+    return published_without_switch and safe_switched and
+        after_safe.safe_reschedule_switches > after_signal.safe_reschedule_switches and
+        bounded and retired != .pending;
 }
 
 fn createWorkers() bool {
@@ -552,10 +922,11 @@ fn createWorkers() bool {
             _ = task.releaseDeadIdentity(created.id, created.generation);
             return false;
         }
-        if (!task.setPriority(created, switch (index % 3) {
-            0 => .high,
-            1 => .normal,
-            else => .low,
+        if (!task.assignRole(created, switch (index % 4) {
+            0 => .input,
+            1 => .short_completion,
+            2 => .interactive,
+            else => .batch,
         })) return false;
         worker_tasks[index] = created;
         worker_ids[index] = created.id;
@@ -739,6 +1110,7 @@ fn countWorkerStates() WorkerMix {
         if (current.state == .dead or current.state == .unused) continue;
         out.live += 1;
         out.priorities |= @as(u8, 1) << @intCast(@intFromEnum(current.priority));
+        out.roles |= @as(u8, 1) << @intCast(@intFromEnum(current.role));
         switch (current.state) {
             .ready, .running => out.runnable += 1,
             .blocked => out.blocked += 1,

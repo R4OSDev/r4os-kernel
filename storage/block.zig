@@ -275,7 +275,7 @@ pub fn initRuntimeWorker() bool {
     runtime_worker_started = false;
     runtime_worker_task_id = 0;
     runtime_worker_task_generation = 0;
-    const worker = sched_task.createKernelThreadCritical("block-work", workerMain) orelse {
+    const worker = sched_task.createKernelThreadCriticalWithRole("block-work", workerMain, .batch) orelse {
         runtime_summary.worker_started = 0;
         runtime_summary.worker_task_id = 0;
         return false;

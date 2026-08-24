@@ -412,16 +412,10 @@ pub fn pollTaskSummary() PollTaskSummary {
 
 pub fn startPollTask() bool {
     if (poll_task_started) return true;
-    const worker = sched_task.createKernelThreadBlocked("usb-hid-poll", pollTaskMain) orelse {
+    const worker = sched_task.createKernelThreadBlockedWithRole("usb-hid-poll", pollTaskMain, .input) orelse {
         k.puts("USBHID poll-task create failed\r\n");
         return false;
     };
-    // 0.56.18: Eingabe-Pfad bekommt HIGH (Befund 4.1).
-    if (!sched_task.setPriority(worker, .high)) {
-        _ = sched_task.retireIdentity(worker.id, worker.generation);
-        k.puts("USBHID poll-task priority failed\r\n");
-        return false;
-    }
     poll_task_started = true;
     poll_task_id = worker.id;
     sched_task.markReady(worker, timer_core.tickCount());

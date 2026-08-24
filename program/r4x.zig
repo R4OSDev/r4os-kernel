@@ -5125,7 +5125,7 @@ pub fn initializeRuntime(usable_bytes: u64) void {
     k.setOutputHookIntercept(kprintOutputHook);
     keyboard.setInputHook(keyboardInputHook);
     if (!program_reaper_started) {
-        if (task.createKernelThreadCritical("r4x-reaper", programReaperMain) != null) program_reaper_started = true;
+        if (task.createKernelThreadCriticalWithRole("r4x-reaper", programReaperMain, .batch) != null) program_reaper_started = true;
     }
 }
 
@@ -7826,7 +7826,7 @@ fn apiIoServiceCall(handle: u32, op: u16, request_ptr: [*]const u8, request_len:
         .service_response_capacity = response_capacity,
         .service_timeout_ticks = timeout_ticks,
     };
-    const worker = task.createKernelWorkerBlocked("r4x-async-io", asyncIoTaskMain) orelse {
+    const worker = task.createKernelWorkerBlockedWithRole("r4x-async-io", asyncIoTaskMain, .short_completion) orelse {
         req.* = .{};
         unlockAsyncIoRequests();
         return IO_ERROR_SPAWN_FAILED;
@@ -8034,7 +8034,7 @@ fn submitAsyncFileRequest(kind: AsyncIoKind, path: [*:0]const u8, offset: u64, d
         unlockAsyncIoRequests();
         return IO_ERROR_INVALID;
     }
-    const worker = task.createKernelWorkerBlocked("r4x-async-io", asyncIoTaskMain) orelse {
+    const worker = task.createKernelWorkerBlockedWithRole("r4x-async-io", asyncIoTaskMain, .batch) orelse {
         req.* = .{};
         unlockAsyncIoRequests();
         return IO_ERROR_SPAWN_FAILED;
@@ -11366,7 +11366,9 @@ fn apiServiceEndpointReply(handle: u32, request_id: u32, status: i32, payload_pt
     if (payload_len > services.API_MAX_PAYLOAD) return services.API_ERR_PAYLOAD_TOO_LARGE;
     if (payload_len != 0 and @intFromPtr(payload_ptr) == 0) return services.API_ERR_INVALID;
     const payload = if (payload_len == 0) "" else payload_ptr[0..@as(usize, @intCast(payload_len))];
-    return services.reply(handle, request_id, status, payload);
+    const result = services.reply(handle, request_id, status, payload);
+    _ = scheduler.safeReschedulePoint();
+    return result;
 }
 
 fn apiServiceDetail(index: u32, out: *ServiceDetail) callconv(.c) i32 {

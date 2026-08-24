@@ -287,7 +287,7 @@ pub fn init() bool {
     initialized = true;
     summary_state.initialized = 1;
     summary_state.queue_capacity = QUEUE_CAPACITY;
-    const worker = sched_task.createKernelThread("r4d-work", workerMain) orelse {
+    const worker = sched_task.createKernelThreadWithRole("r4d-work", workerMain, .short_completion) orelse {
         summary_state.worker_started = 0;
         return false;
     };
@@ -899,12 +899,14 @@ fn publishCompletion(slot: usize, handle: u32) void {
                     addMetric(owner, "wake_waiters", wake_count);
                 }
                 leaveCritical(critical, owner);
+                _ = scheduler.safeReschedulePoint();
                 return;
             }
         },
         .invalid, .stale => {},
     }
     leaveCritical(critical, 0);
+    _ = scheduler.safeReschedulePoint();
 }
 
 fn validateHandleLocked(handle: u32) ?usize {

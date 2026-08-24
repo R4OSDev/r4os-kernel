@@ -31,7 +31,7 @@ pub fn start() bool {
     // The deadman is part of the progress floor: allocator pressure must not
     // prevent it from starting and public hard-kill APIs must not remove the
     // only framebuffer-visible observer of a later storage/lock stall.
-    if (sched_task.createKernelThreadCritical("deadman", deadmanMain) != null) started = true;
+    if (sched_task.createKernelThreadCriticalWithRole("deadman", deadmanMain, .batch) != null) started = true;
     return started;
 }
 

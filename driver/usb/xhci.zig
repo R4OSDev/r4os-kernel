@@ -893,7 +893,7 @@ pub fn setTopologyHook(hook: ?TopologyHook) void {
 pub fn startPortTask() bool {
     if (port_task_started) return true;
     if (!current.present or !current.controller_running or event_ring_virt == 0) return true;
-    const worker = sched_task.createKernelThread("xhci-port", portTaskMain) orelse {
+    const worker = sched_task.createKernelThreadWithRole("xhci-port", portTaskMain, .short_completion) orelse {
         k.puts("[XHCI] port-task create failed\r\n");
         return false;
     };
