@@ -1065,7 +1065,12 @@ fn registerAudioOutputBackend(name: [*:0]const u8, backend: *const anyopaque) ca
     };
     copyZName(name, slot.name[0..], &slot.name_len);
 
-    const result = audio.registerExternalAudioBackendZ(name, descriptor.context, descriptor.write_pcm.?, descriptor.stop, descriptor.status);
+    const result = audio.registerExternalAudioBackendZ(name, .{
+        .formats = descriptor.formats,
+        .min_rate = descriptor.min_rate,
+        .max_rate = descriptor.max_rate,
+        .max_channels = descriptor.max_channels,
+    }, descriptor.context, descriptor.write_pcm.?, descriptor.stop, descriptor.status);
     if (result != 0) {
         slot.* = R4DAudioBackend{};
         return -3;

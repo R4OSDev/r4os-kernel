@@ -167,6 +167,7 @@ pub fn build(b: *std.Build) void {
         "display/console_scroll_buffer.zig",
         "display/framebuffer.zig",
         "input_controller_tests.zig",
+        "audio/backend_contract.zig",
         "audio/mixer.zig",
         "driver/input/codepoint_queue.zig",
         "driver/input/key_layout.zig",

@@ -8,11 +8,12 @@ const r4p = @import("../program/r4p.zig");
 const r4x_api = @import("../program/r4x_api.zig");
 const r4p_contract = @import("../net/r4p_contract.zig");
 const k = @import("../kernel/log.zig");
+const backend_contract = @import("backend_contract.zig");
 const mixer = @import("mixer.zig");
 const pcm = @import("pcm.zig");
 
-pub const FORMAT_S16LE: u16 = 1;
-pub const FORMAT_U8: u16 = 2;
+pub const FORMAT_S16LE: u16 = backend_contract.FORMAT_S16LE;
+pub const FORMAT_U8: u16 = backend_contract.FORMAT_U8;
 pub const DEFAULT_RATE: u32 = 48_000;
 pub const DEFAULT_CHANNELS: u16 = 2;
 pub const RING_BYTES: usize = 16 * 1024;
@@ -26,6 +27,7 @@ const MIX_QUANTUM_BYTES: usize = 480 * pcm.TARGET_FRAME_BYTES;
 
 pub const StreamOwner = mixer.Owner;
 pub const kernel_stream_owner: StreamOwner = .{};
+pub const BackendPcmLimits = backend_contract.Limits;
 
 pub const MidiProtocolStatus = struct {
     source: []const u8 = "none",
@@ -182,6 +184,7 @@ const AudioBackend = struct {
     write_pcm_ctx: ?WritePcmCtxFn = null,
     stop_pcm_ctx: ?StopPcmCtxFn = null,
     status_ctx: ?StatusCtxFn = null,
+    pcm_limits: ?BackendPcmLimits = null,
 };
 
 var empty_ring: [0]u8 = .{};
@@ -773,7 +776,7 @@ pub fn freeDmaBuffer(phys_addr: u64, bytes: u32) void {
 pub fn registerAudioBackendZ(name: [*:0]const u8, backend: *const anyopaque) i32 {
     var buf: [MAX_NAME]u8 = undefined;
     const name_slice = copyZ(name, buf[0..]) orelse return -1;
-    return if (registerAudioBackendInternal(name_slice, backend, null, null, null, null, null, null)) 0 else -2;
+    return if (registerAudioBackendInternal(name_slice, backend, null, null, null, null, null, null, null)) 0 else -2;
 }
 
 pub fn registerMixerBackendZ(name: [*:0]const u8, backend: *const anyopaque) i32 {
@@ -787,13 +790,13 @@ pub fn registerSynthEngineZ(name: [*:0]const u8, engine: *const anyopaque) i32 {
 }
 
 pub fn registerAudioBackend(name: []const u8, backend: ?*const anyopaque) void {
-    _ = registerAudioBackendInternal(name, backend, null, null, null, null, null, null);
+    _ = registerAudioBackendInternal(name, backend, null, null, null, null, null, null, null);
 }
 
-pub fn registerExternalAudioBackendZ(name: [*:0]const u8, context: ?*anyopaque, write_pcm: WritePcmCtxFn, stop_pcm: ?StopPcmCtxFn, status: ?StatusCtxFn) i32 {
+pub fn registerExternalAudioBackendZ(name: [*:0]const u8, limits: BackendPcmLimits, context: ?*anyopaque, write_pcm: WritePcmCtxFn, stop_pcm: ?StopPcmCtxFn, status: ?StatusCtxFn) i32 {
     var buf: [MAX_NAME]u8 = undefined;
     const name_slice = copyZ(name, buf[0..]) orelse return -1;
-    return if (registerAudioBackendInternal(name_slice, null, null, null, context, write_pcm, stop_pcm, status)) 0 else -2;
+    return if (registerAudioBackendInternal(name_slice, null, null, null, context, write_pcm, stop_pcm, status, limits)) 0 else -2;
 }
 
 pub fn registerExternalSynthEngineZ(name: [*:0]const u8, context: ?*anyopaque, send_midi: ?SynthMidiSendCtxFn, render: ?SynthRenderCtxFn, stop: ?SynthStopCtxFn, status: ?SynthStatusCtxFn, opl3_reset: ?SynthOpl3ResetCtxFn, opl3_write_register: ?SynthOpl3WriteRegisterCtxFn, sid_acquire: ?SynthSidAcquireCtxFn, sid_release: ?SynthSidReleaseCtxFn, sid_set_model: ?SynthSidSetModelCtxFn, sid_write_register: ?SynthSidWriteRegisterCtxFn, sid_load_data: ?SynthSidLoadDataCtxFn, sid_init: ?SynthSidInitCtxFn, sid_play_frame: ?SynthSidPlayFrameCtxFn, sid_render_pcm: ?SynthSidRenderPcmCtxFn) i32 {
@@ -883,7 +886,7 @@ fn registerSynthEngineInternal(name: []const u8, engine: ?*const anyopaque, send
 }
 
 pub fn registerNativeAudioBackend(name: []const u8, write_pcm: WritePcmFn, stop_pcm: ?StopPcmFn) void {
-    _ = registerAudioBackendInternal(name, null, write_pcm, stop_pcm, null, null, null, null);
+    _ = registerAudioBackendInternal(name, null, write_pcm, stop_pcm, null, null, null, null, null);
 }
 
 pub fn selectAudioBackend(name: []const u8) bool {
@@ -1382,7 +1385,7 @@ fn registerMixerBackend(name: []const u8, backend: ?*const anyopaque) void {
     bootlog.puts(" [OK]\r\n");
 }
 
-fn registerAudioBackendInternal(name: []const u8, backend: ?*const anyopaque, write_pcm: ?WritePcmFn, stop_pcm: ?StopPcmFn, context: ?*anyopaque, write_pcm_ctx: ?WritePcmCtxFn, stop_pcm_ctx: ?StopPcmCtxFn, status_ctx: ?StatusCtxFn) bool {
+fn registerAudioBackendInternal(name: []const u8, backend: ?*const anyopaque, write_pcm: ?WritePcmFn, stop_pcm: ?StopPcmFn, context: ?*anyopaque, write_pcm_ctx: ?WritePcmCtxFn, stop_pcm_ctx: ?StopPcmCtxFn, status_ctx: ?StatusCtxFn, pcm_limits: ?BackendPcmLimits) bool {
     const slot = findAudioBackend(name) orelse freeAudioBackendSlot() orelse {
         bootlog.puts("[AUDIO][WARN] audio backend registry full\r\n");
         return false;
@@ -1400,6 +1403,7 @@ fn registerAudioBackendInternal(name: []const u8, backend: ?*const anyopaque, wr
         .write_pcm_ctx = write_pcm_ctx,
         .stop_pcm_ctx = stop_pcm_ctx,
         .status_ctx = status_ctx,
+        .pcm_limits = pcm_limits,
     };
     entry.name_len = if (name.len < MAX_NAME) name.len else MAX_NAME - 1;
     if (entry.name_len > 0) @memcpy(entry.name[0..entry.name_len], name[0..entry.name_len]);
@@ -1428,6 +1432,9 @@ fn setActiveAudioBackend(slot: usize) void {
 fn writeActivePcm(data: []const u8, rate: u32, channels: u16, format: u16) ?i32 {
     const slot = active_audio_slot orelse return null;
     const backend = &audio_backends[slot];
+    if (backend.pcm_limits) |limits| {
+        if (!limits.accepts(rate, channels, format)) return r4x_api.service_api_result_invalid;
+    }
     if (backend.write_pcm) |write_pcm| return if (write_pcm(data, rate, channels, format)) 0 else -1;
     if (backend.write_pcm_ctx) |write_pcm_ctx| return write_pcm_ctx(backend.context, data.ptr, @intCast(data.len), rate, channels, format);
     return null;
