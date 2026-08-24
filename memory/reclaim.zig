@@ -1,4 +1,5 @@
 const page_cache = @import("../fs/page_cache.zig");
+const ntfs_fs = @import("../fs/ntfs/ntfs.zig");
 const phys = @import("phys.zig");
 const timer = @import("../kernel/timer.zig");
 const task_context = @import("../sched/task_context.zig");
@@ -119,6 +120,10 @@ pub fn reclaimFrames(reason: Reason, requested_frames_raw: u32) Result {
 
     in_reclaim = true;
     defer in_reclaim = false;
+    // Decoded NTFS metadata is fixed-capacity and owns no sector payloads,
+    // but its reusable entries are still first-class pressure candidates.
+    // The NTFS owner bounds this pass independently of the frame request.
+    _ = ntfs_fs.reclaimMetadataCacheEntries(requested_frames);
     var task_stack_result = SourceResult{};
     if (task_stack_reclaimer) |reclaimer| {
         const requested_stacks = (requested_frames +| (task_stack_frames - 1)) / task_stack_frames;

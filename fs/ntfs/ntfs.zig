@@ -12,6 +12,7 @@ const ntfs = @import("ntfs_format");
 const nv = @import("ntfs_volume");
 const page_cache = @import("../page_cache.zig");
 const heap = @import("../../memory/heap.zig");
+const timer = @import("../../kernel/timer.zig");
 const time_core = @import("../../platform/time.zig");
 const k = @import("../../kernel/log.zig");
 
@@ -23,6 +24,8 @@ const MAX_DIRECT_WRITE_SECTORS: u32 = 2048;
 const NAME_MAX: usize = 768; // matches vfs.NAME_MAX / nv.NAME_MAX (0.60.19)
 const MAX_VOLUMES: usize = 4;
 const MAX_MFT_RUNS: usize = nv.MAX_MFT_RUNS;
+const METADATA_NEGATIVE_TTL_TICKS: u64 = timer.DEFAULT_HZ;
+const METADATA_RECLAIM_ENTRY_BUDGET: u32 = 8;
 
 pub const ATTR_READ_ONLY: u8 = nv.ATTR_READ_ONLY;
 pub const ATTR_HIDDEN: u8 = nv.ATTR_HIDDEN;
@@ -97,10 +100,12 @@ const VolumeState = struct {
     mft_runs: [MAX_MFT_RUNS]ntfs.Run = undefined,
     mft_run_count: usize = 0,
     upcase: ?[]u8 = null,
+    metadata_cache: nv.MetadataCache = .{},
 };
 
 var states: [MAX_VOLUMES]VolumeState = .{VolumeState{}} ** MAX_VOLUMES;
 var scratch: nv.Scratch = .{};
+var metadata_reclaim_volume_cursor: usize = 0;
 
 // ---------------------------------------------------------------------------
 // Page-cache device seam
@@ -168,6 +173,8 @@ fn buildVolume(volume: Volume) nv.Volume {
         .upcase = state.upcase orelse &[_]u8{},
         .scratch = &scratch,
         .now_filetime = nowFiletime(),
+        .metadata_cache = &state.metadata_cache,
+        .metadata_cache_now_ticks = timer.tickCount(),
     };
 }
 
@@ -237,6 +244,7 @@ pub fn inspect(device_index: usize, first_lba: u32) ?Volume {
     state.index_block_bytes = info.index_block_bytes;
     state.total_sectors = info.total_sectors;
     state.mft_run_count = info.mft_run_count;
+    state.metadata_cache.beginMount(METADATA_NEGATIVE_TTL_TICKS);
     state.in_use = true;
 
     var volume = Volume{
@@ -280,6 +288,87 @@ fn failInspect(state: *VolumeState, reason: []const u8) ?Volume {
     }
     state.in_use = false;
     return null;
+}
+
+/// Explicit media-generation boundary for future unmount/removable-device
+/// owners. Mounted block devices cannot currently unregister, but callers
+/// that replace externally visible media must invalidate before reprobe.
+pub fn invalidateMetadataForDevice(device_index: usize) void {
+    for (&states) |*state| {
+        if (!state.in_use or state.device_index != device_index) continue;
+        state.metadata_cache.invalidateExternal();
+    }
+}
+
+/// Drops a bounded number of decoded cache entries under global memory
+/// pressure. The fixed cache control storage stays resident; no sector page
+/// or mutable filesystem payload is owned here.
+pub fn reclaimMetadataCacheEntries(requested_entries_raw: u32) nv.MetadataReclaimResult {
+    const requested = @min(requested_entries_raw, METADATA_RECLAIM_ENTRY_BUDGET);
+    var result = nv.MetadataReclaimResult{ .requested_entries = requested };
+    if (requested == 0) return result;
+    var volume_probes: usize = 0;
+    while (volume_probes < states.len and result.reclaimed_entries < requested) : (volume_probes += 1) {
+        const index = metadata_reclaim_volume_cursor;
+        metadata_reclaim_volume_cursor = (metadata_reclaim_volume_cursor + 1) % states.len;
+        const state = &states[index];
+        if (!state.in_use) continue;
+        const remaining = requested - result.reclaimed_entries;
+        const one = state.metadata_cache.reclaim(remaining);
+        result.inspected_entries +|= one.inspected_entries;
+        result.reclaimed_entries +|= one.reclaimed_entries;
+    }
+    return result;
+}
+
+pub fn metadataCacheSummary() nv.MetadataCacheSummary {
+    var out = nv.MetadataCacheSummary{};
+    out.active_volumes = 0;
+    out.mount_generation = 0;
+    out.content_generation = 0;
+    out.negative_ttl_ticks = 0;
+    for (&states) |*state| {
+        if (!state.in_use) continue;
+        const one = state.metadata_cache.summary();
+        out.active_volumes +|= 1;
+        out.bytes_per_volume = @max(out.bytes_per_volume, one.bytes_per_volume);
+        out.mount_generation = @max(out.mount_generation, one.mount_generation);
+        out.content_generation = @max(out.content_generation, one.content_generation);
+        out.negative_ttl_ticks = @max(out.negative_ttl_ticks, one.negative_ttl_ticks);
+        out.record_entries +|= one.record_entries;
+        out.attribute_entries +|= one.attribute_entries;
+        out.index_entries +|= one.index_entries;
+        out.path_entries +|= one.path_entries;
+        out.record_hits +%= one.record_hits;
+        out.record_misses +%= one.record_misses;
+        out.record_stores +%= one.record_stores;
+        out.record_evictions +%= one.record_evictions;
+        out.attribute_hits +%= one.attribute_hits;
+        out.attribute_misses +%= one.attribute_misses;
+        out.attribute_stores +%= one.attribute_stores;
+        out.attribute_evictions +%= one.attribute_evictions;
+        out.index_hits +%= one.index_hits;
+        out.index_misses +%= one.index_misses;
+        out.index_stores +%= one.index_stores;
+        out.index_evictions +%= one.index_evictions;
+        out.path_queries +%= one.path_queries;
+        out.path_positive_hits +%= one.path_positive_hits;
+        out.path_negative_hits +%= one.path_negative_hits;
+        out.path_misses +%= one.path_misses;
+        out.path_positive_stores +%= one.path_positive_stores;
+        out.path_negative_stores +%= one.path_negative_stores;
+        out.path_expirations +%= one.path_expirations;
+        out.lookup_tree_walks +%= one.lookup_tree_walks;
+        out.recovery_cache_bypasses +%= one.recovery_cache_bypasses;
+        out.mount_invalidations +%= one.mount_invalidations;
+        out.mutation_invalidations +%= one.mutation_invalidations;
+        out.external_invalidations +%= one.external_invalidations;
+        out.invalidated_entries +%= one.invalidated_entries;
+        out.reclaim_requests +%= one.reclaim_requests;
+        out.reclaim_scans +%= one.reclaim_scans;
+        out.reclaimed_entries +%= one.reclaimed_entries;
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------

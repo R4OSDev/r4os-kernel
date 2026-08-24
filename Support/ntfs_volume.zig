@@ -32,6 +32,13 @@ pub const NAME_UNITS_MAX: usize = 255;
 pub const NAME_MAX: usize = 768;
 pub const MAX_MFT_RUNS: usize = 64;
 pub const MAX_ATTR_RUNS: usize = 256;
+pub const METADATA_CACHE_VERSION: u32 = 1;
+pub const METADATA_RECORD_CAPACITY: usize = 8;
+pub const METADATA_ATTRIBUTE_CAPACITY: usize = 4;
+pub const METADATA_INDEX_CAPACITY: usize = 2;
+pub const METADATA_PATH_CAPACITY: usize = 8;
+pub const METADATA_CACHE_SLOT_CAPACITY: usize = METADATA_RECORD_CAPACITY +
+    METADATA_ATTRIBUTE_CAPACITY + METADATA_INDEX_CAPACITY + METADATA_PATH_CAPACITY;
 const MAX_INDEX_DEPTH: usize = 8;
 const MAX_PATH_DEPTH: usize = 24;
 const MAX_DATA_RUNS: usize = 24;
@@ -123,6 +130,11 @@ pub const Volume = struct {
     now_filetime: u64 = 0,
     security_id_file: u32 = 265,
     security_id_dir: u32 = 264,
+    /// Optional caller-owned decoded-metadata cache. Kernel mounts provide
+    /// one stable cache per mount slot; host models may leave it disabled.
+    metadata_cache: ?*MetadataCache = null,
+    /// Monotonic caller clock used only for bounded negative-entry expiry.
+    metadata_cache_now_ticks: u64 = 0,
 
     pub fn sectorsPerCluster(self: *const Volume) u32 {
         return @intCast(self.cluster_bytes / SECTOR_SIZE);
@@ -235,6 +247,10 @@ fn readSectors(v: *const Volume, lba: u64, count: u32, out: []u8) bool {
 
 fn writeSectors(v: *const Volume, lba: u64, count: u32, data: []const u8) bool {
     if (!sectorIoRangeValid(v, lba, count, data.len)) return false;
+    // Invalidate decoded metadata before any physical write can become
+    // visible. This deliberately covers data, namespace, recovery and
+    // partial-failure paths with one correctness boundary.
+    if (count != 0) if (v.metadata_cache) |cache| cache.invalidateMutation();
     return v.device.write_sectors(v.device.ctx, lba, count, data);
 }
 
@@ -476,11 +492,15 @@ pub fn loadRecord(v: *const Volume, number: u64, buf: []u8) ?ntfs.FileRecordHead
     if (v.record_bytes == 0 or v.record_bytes > buf.len) return null;
     const record = buf[0..v.record_bytes];
     const byte_offset = checkedMulU64(number, @as(u64, v.record_bytes)) orelse return null;
-    if (!mftByteIo(v, byte_offset, record, null)) return null;
-    if (ntfs.applyFixups(record) != .ok) return null;
+    const cached = if (v.metadata_cache) |cache| cache.lookupRecord(number, record) else false;
+    if (!cached) {
+        if (!mftByteIo(v, byte_offset, record, null)) return null;
+        if (ntfs.applyFixups(record) != .ok) return null;
+    }
     const header = ntfs.FileRecordHeader.parse(record) orelse return null;
     if (header.record_number != number) return null;
     if (!header.inUse()) return null;
+    if (!cached) if (v.metadata_cache) |cache| cache.storeRecord(number, record);
     return header;
 }
 
@@ -506,6 +526,7 @@ fn storeRecord(v: *const Volume, number: u64, buf: []u8) bool {
     }
     // Leave the buffer fixed-up-removed for continued use.
     _ = ntfs.applyFixups(record);
+    if (v.metadata_cache) |cache| cache.storeRecord(number, record);
     return true;
 }
 
@@ -683,6 +704,9 @@ fn attributeStreamValid(record: []const u8, header: ntfs.FileRecordHeader) bool 
 /// Collects all extents of one attribute, following $ATTRIBUTE_LIST.
 /// Uses scratch.record and scratch.part_record.
 pub fn collectAttributeStatus(v: *const Volume, record_number: u64, attr_type: ntfs.AttrType, name_utf16: []const u8, out: *AttrScratch) LookupStatus {
+    if (v.metadata_cache) |cache| {
+        if (cache.lookupAttribute(record_number, attr_type, name_utf16, out)) return .found;
+    }
     out.* = .{};
     const header = loadRecord(v, record_number, v.scratch.record[0..]) orelse return .io;
     const record = v.scratch.record[0..v.record_bytes];
@@ -741,7 +765,11 @@ pub fn collectAttributeStatus(v: *const Volume, record_number: u64, attr_type: n
         }
         if (iterator.offset != list_attr.value.len) return .io;
         if (listed_match and !found_any) return .io;
-        if (found_any) return if (geometry.complete()) .found else .io;
+        if (found_any) {
+            if (!geometry.complete()) return .io;
+            if (v.metadata_cache) |cache| cache.storeAttribute(record_number, attr_type, name_utf16, out);
+            return .found;
+        }
     }
 
     // Without a matching $ATTRIBUTE_LIST entry, scan the base record rather
@@ -759,7 +787,9 @@ pub fn collectAttributeStatus(v: *const Volume, record_number: u64, attr_type: n
         found_direct = true;
     }
     if (!found_direct) return .not_found;
-    return if (geometry.complete()) .found else .io;
+    if (!geometry.complete()) return .io;
+    if (v.metadata_cache) |cache| cache.storeAttribute(record_number, attr_type, name_utf16, out);
+    return .found;
 }
 
 /// Compatibility wrapper for callers that only need found/not-found.
@@ -788,6 +818,541 @@ pub const LookupResult = struct {
     block_vcn: u64 = 0,
     entry_offset: usize = 0,
 };
+
+pub const MetadataCacheSummary = struct {
+    version: u32 = METADATA_CACHE_VERSION,
+    active_volumes: u32 = 0,
+    slot_capacity: u32 = METADATA_CACHE_SLOT_CAPACITY,
+    bytes_per_volume: u32 = 0,
+    record_capacity: u32 = METADATA_RECORD_CAPACITY,
+    attribute_capacity: u32 = METADATA_ATTRIBUTE_CAPACITY,
+    index_capacity: u32 = METADATA_INDEX_CAPACITY,
+    path_capacity: u32 = METADATA_PATH_CAPACITY,
+    mount_generation: u64 = 0,
+    content_generation: u64 = 0,
+    negative_ttl_ticks: u64 = 0,
+    record_entries: u32 = 0,
+    attribute_entries: u32 = 0,
+    index_entries: u32 = 0,
+    path_entries: u32 = 0,
+    record_hits: u64 = 0,
+    record_misses: u64 = 0,
+    record_stores: u64 = 0,
+    record_evictions: u64 = 0,
+    attribute_hits: u64 = 0,
+    attribute_misses: u64 = 0,
+    attribute_stores: u64 = 0,
+    attribute_evictions: u64 = 0,
+    index_hits: u64 = 0,
+    index_misses: u64 = 0,
+    index_stores: u64 = 0,
+    index_evictions: u64 = 0,
+    path_queries: u64 = 0,
+    path_positive_hits: u64 = 0,
+    path_negative_hits: u64 = 0,
+    path_misses: u64 = 0,
+    path_positive_stores: u64 = 0,
+    path_negative_stores: u64 = 0,
+    path_expirations: u64 = 0,
+    lookup_tree_walks: u64 = 0,
+    recovery_cache_bypasses: u64 = 0,
+    mount_invalidations: u64 = 0,
+    mutation_invalidations: u64 = 0,
+    external_invalidations: u64 = 0,
+    invalidated_entries: u64 = 0,
+    reclaim_requests: u64 = 0,
+    reclaim_scans: u64 = 0,
+    reclaimed_entries: u64 = 0,
+};
+
+pub const MetadataReclaimResult = struct {
+    requested_entries: u32 = 0,
+    inspected_entries: u32 = 0,
+    reclaimed_entries: u32 = 0,
+};
+
+const RecordCacheEntry = struct {
+    valid: bool = false,
+    generation: u64 = 0,
+    last_used: u64 = 0,
+    number: u64 = 0,
+    byte_len: u16 = 0,
+    bytes: [4096]u8 = undefined,
+};
+
+const AttributeCacheEntry = struct {
+    valid: bool = false,
+    generation: u64 = 0,
+    last_used: u64 = 0,
+    record_number: u64 = 0,
+    attr_type: u32 = 0,
+    name_len: u16 = 0,
+    name: [NAME_UNITS_MAX * 2]u8 = undefined,
+    runs: [MAX_ATTR_RUNS]ntfs.Run = undefined,
+    count: u16 = 0,
+    data_size: u64 = 0,
+    initialized_size: u64 = 0,
+    alloc_size: u64 = 0,
+    flags: u16 = 0,
+    compression_unit: u8 = 0,
+    resident: bool = false,
+    resident_len: u16 = 0,
+    resident_copy: [1024]u8 = undefined,
+};
+
+const IndexCacheEntry = struct {
+    valid: bool = false,
+    generation: u64 = 0,
+    last_used: u64 = 0,
+    directory_record: u64 = 0,
+    vcn: u64 = 0,
+    byte_len: u16 = 0,
+    bytes: [4096]u8 = undefined,
+};
+
+const PathCacheEntry = struct {
+    valid: bool = false,
+    generation: u64 = 0,
+    last_used: u64 = 0,
+    directory_record: u64 = 0,
+    name_len: u16 = 0,
+    name_utf16: [NAME_UNITS_MAX * 2]u8 = undefined,
+    negative: bool = false,
+    expires_at: u64 = 0,
+    result: LookupResult = undefined,
+};
+
+const PathCacheLookup = enum {
+    miss,
+    positive,
+    negative,
+};
+
+/// Fixed, caller-owned cache of decoded NTFS metadata. It never owns sector
+/// payloads and never grows: every replacement and reclaim pass is bounded by
+/// the capacities above. The filesystem request owner serializes mutations;
+/// cache operations themselves neither allocate nor wait.
+pub const MetadataCache = struct {
+    records: [METADATA_RECORD_CAPACITY]RecordCacheEntry = .{RecordCacheEntry{}} ** METADATA_RECORD_CAPACITY,
+    attributes: [METADATA_ATTRIBUTE_CAPACITY]AttributeCacheEntry = .{AttributeCacheEntry{}} ** METADATA_ATTRIBUTE_CAPACITY,
+    indices: [METADATA_INDEX_CAPACITY]IndexCacheEntry = .{IndexCacheEntry{}} ** METADATA_INDEX_CAPACITY,
+    paths: [METADATA_PATH_CAPACITY]PathCacheEntry = .{PathCacheEntry{}} ** METADATA_PATH_CAPACITY,
+    generation: u64 = 1,
+    mount_generation: u64 = 0,
+    negative_ttl_ticks: u64 = 0,
+    access_clock: u64 = 0,
+    reclaim_cursor: usize = 0,
+    counters: MetadataCacheSummary = .{},
+
+    pub fn beginMount(self: *MetadataCache, negative_ttl_ticks: u64) void {
+        const invalidated = self.clearEntries();
+        self.mount_generation = nextGeneration(self.mount_generation);
+        self.generation = nextGeneration(self.generation);
+        self.negative_ttl_ticks = negative_ttl_ticks;
+        self.counters.mount_invalidations +%= 1;
+        self.counters.invalidated_entries +%= invalidated;
+    }
+
+    pub fn invalidateExternal(self: *MetadataCache) void {
+        const invalidated = self.clearEntries();
+        self.generation = nextGeneration(self.generation);
+        self.counters.external_invalidations +%= 1;
+        self.counters.invalidated_entries +%= invalidated;
+    }
+
+    fn invalidateMutation(self: *MetadataCache) void {
+        const invalidated = self.clearEntries();
+        if (invalidated == 0) return;
+        self.generation = nextGeneration(self.generation);
+        self.counters.mutation_invalidations +%= 1;
+        self.counters.invalidated_entries +%= invalidated;
+    }
+
+    fn touch(self: *MetadataCache) u64 {
+        self.access_clock = nextGeneration(self.access_clock);
+        return self.access_clock;
+    }
+
+    fn lookupRecord(self: *MetadataCache, number: u64, out: []u8) bool {
+        for (&self.records) |*entry| {
+            if (!entry.valid or entry.generation != self.generation or
+                entry.number != number or entry.byte_len != out.len)
+            {
+                continue;
+            }
+            @memcpy(out, entry.bytes[0..out.len]);
+            entry.last_used = self.touch();
+            self.counters.record_hits +%= 1;
+            return true;
+        }
+        self.counters.record_misses +%= 1;
+        return false;
+    }
+
+    fn storeRecord(self: *MetadataCache, number: u64, bytes: []const u8) void {
+        if (bytes.len == 0 or bytes.len > 4096) return;
+        var target: usize = 0;
+        var oldest = ~@as(u64, 0);
+        for (self.records, 0..) |entry, index| {
+            if (!entry.valid or entry.generation != self.generation) {
+                target = index;
+                oldest = 0;
+                break;
+            }
+            if (entry.number == number) {
+                target = index;
+                oldest = 0;
+                break;
+            }
+            if (entry.last_used < oldest) {
+                oldest = entry.last_used;
+                target = index;
+            }
+        }
+        var entry = &self.records[target];
+        if (oldest != 0 and entry.valid) self.counters.record_evictions +%= 1;
+        entry.valid = true;
+        entry.generation = self.generation;
+        entry.last_used = self.touch();
+        entry.number = number;
+        entry.byte_len = @intCast(bytes.len);
+        @memcpy(entry.bytes[0..bytes.len], bytes);
+        self.counters.record_stores +%= 1;
+    }
+
+    fn lookupAttribute(
+        self: *MetadataCache,
+        record_number: u64,
+        attr_type: ntfs.AttrType,
+        name_utf16: []const u8,
+        out: *AttrScratch,
+    ) bool {
+        if (name_utf16.len > NAME_UNITS_MAX * 2) return false;
+        for (&self.attributes) |*entry| {
+            if (!entry.valid or entry.generation != self.generation or
+                entry.record_number != record_number or
+                entry.attr_type != @intFromEnum(attr_type) or
+                entry.name_len != name_utf16.len or
+                !eqlBytes(entry.name[0..entry.name_len], name_utf16))
+            {
+                continue;
+            }
+            out.* = .{};
+            out.count = entry.count;
+            if (entry.count != 0) @memcpy(out.runs[0..entry.count], entry.runs[0..entry.count]);
+            out.data_size = entry.data_size;
+            out.initialized_size = entry.initialized_size;
+            out.alloc_size = entry.alloc_size;
+            out.flags = entry.flags;
+            out.compression_unit = entry.compression_unit;
+            out.resident = entry.resident;
+            out.resident_len = entry.resident_len;
+            if (entry.resident_len != 0) {
+                @memcpy(out.resident_copy[0..entry.resident_len], entry.resident_copy[0..entry.resident_len]);
+            }
+            entry.last_used = self.touch();
+            self.counters.attribute_hits +%= 1;
+            return true;
+        }
+        self.counters.attribute_misses +%= 1;
+        return false;
+    }
+
+    fn storeAttribute(
+        self: *MetadataCache,
+        record_number: u64,
+        attr_type: ntfs.AttrType,
+        name_utf16: []const u8,
+        value: *const AttrScratch,
+    ) void {
+        if (name_utf16.len > NAME_UNITS_MAX * 2 or value.count > MAX_ATTR_RUNS or
+            value.resident_len > 1024)
+        {
+            return;
+        }
+        var target: usize = 0;
+        var oldest = ~@as(u64, 0);
+        for (self.attributes, 0..) |entry, index| {
+            if (!entry.valid or entry.generation != self.generation) {
+                target = index;
+                oldest = 0;
+                break;
+            }
+            if (entry.record_number == record_number and
+                entry.attr_type == @intFromEnum(attr_type) and
+                entry.name_len == name_utf16.len and
+                eqlBytes(entry.name[0..entry.name_len], name_utf16))
+            {
+                target = index;
+                oldest = 0;
+                break;
+            }
+            if (entry.last_used < oldest) {
+                oldest = entry.last_used;
+                target = index;
+            }
+        }
+        var entry = &self.attributes[target];
+        if (oldest != 0 and entry.valid) self.counters.attribute_evictions +%= 1;
+        entry.valid = true;
+        entry.generation = self.generation;
+        entry.last_used = self.touch();
+        entry.record_number = record_number;
+        entry.attr_type = @intFromEnum(attr_type);
+        entry.name_len = @intCast(name_utf16.len);
+        if (name_utf16.len != 0) @memcpy(entry.name[0..name_utf16.len], name_utf16);
+        entry.count = @intCast(value.count);
+        if (value.count != 0) @memcpy(entry.runs[0..value.count], value.runs[0..value.count]);
+        entry.data_size = value.data_size;
+        entry.initialized_size = value.initialized_size;
+        entry.alloc_size = value.alloc_size;
+        entry.flags = value.flags;
+        entry.compression_unit = value.compression_unit;
+        entry.resident = value.resident;
+        entry.resident_len = @intCast(value.resident_len);
+        if (value.resident_len != 0) {
+            @memcpy(entry.resident_copy[0..value.resident_len], value.resident_copy[0..value.resident_len]);
+        }
+        self.counters.attribute_stores +%= 1;
+    }
+
+    fn lookupIndex(self: *MetadataCache, directory_record: u64, vcn: u64, out: []u8) bool {
+        for (&self.indices) |*entry| {
+            if (!entry.valid or entry.generation != self.generation or
+                entry.directory_record != directory_record or entry.vcn != vcn or
+                entry.byte_len != out.len)
+            {
+                continue;
+            }
+            @memcpy(out, entry.bytes[0..out.len]);
+            entry.last_used = self.touch();
+            self.counters.index_hits +%= 1;
+            return true;
+        }
+        self.counters.index_misses +%= 1;
+        return false;
+    }
+
+    fn storeIndex(self: *MetadataCache, directory_record: u64, vcn: u64, bytes: []const u8) void {
+        if (bytes.len == 0 or bytes.len > 4096) return;
+        var target: usize = 0;
+        var oldest = ~@as(u64, 0);
+        for (self.indices, 0..) |entry, index| {
+            if (!entry.valid or entry.generation != self.generation) {
+                target = index;
+                oldest = 0;
+                break;
+            }
+            if (entry.directory_record == directory_record and entry.vcn == vcn) {
+                target = index;
+                oldest = 0;
+                break;
+            }
+            if (entry.last_used < oldest) {
+                oldest = entry.last_used;
+                target = index;
+            }
+        }
+        var entry = &self.indices[target];
+        if (oldest != 0 and entry.valid) self.counters.index_evictions +%= 1;
+        entry.valid = true;
+        entry.generation = self.generation;
+        entry.last_used = self.touch();
+        entry.directory_record = directory_record;
+        entry.vcn = vcn;
+        entry.byte_len = @intCast(bytes.len);
+        @memcpy(entry.bytes[0..bytes.len], bytes);
+        self.counters.index_stores +%= 1;
+    }
+
+    fn lookupPath(
+        self: *MetadataCache,
+        upcase: []const u8,
+        directory_record: u64,
+        name_utf16: []const u8,
+        now_ticks: u64,
+        out: *LookupResult,
+    ) PathCacheLookup {
+        self.counters.path_queries +%= 1;
+        for (&self.paths) |*entry| {
+            if (!entry.valid or entry.generation != self.generation or
+                entry.directory_record != directory_record or
+                ntfs.compareFileNames(upcase, entry.name_utf16[0..entry.name_len], name_utf16) != .eq)
+            {
+                continue;
+            }
+            if (entry.negative and now_ticks >= entry.expires_at) {
+                entry.valid = false;
+                self.counters.path_expirations +%= 1;
+                continue;
+            }
+            entry.last_used = self.touch();
+            if (entry.negative) {
+                self.counters.path_negative_hits +%= 1;
+                return .negative;
+            }
+            out.* = entry.result;
+            self.counters.path_positive_hits +%= 1;
+            return .positive;
+        }
+        self.counters.path_misses +%= 1;
+        return .miss;
+    }
+
+    fn storePath(
+        self: *MetadataCache,
+        directory_record: u64,
+        name_utf16: []const u8,
+        status: LookupStatus,
+        value: *const LookupResult,
+        now_ticks: u64,
+    ) void {
+        if (name_utf16.len == 0 or name_utf16.len > NAME_UNITS_MAX * 2 or status == .io) return;
+        if (status == .not_found and self.negative_ttl_ticks == 0) return;
+        var target: usize = 0;
+        var oldest = ~@as(u64, 0);
+        for (self.paths, 0..) |entry, index| {
+            if (!entry.valid or entry.generation != self.generation) {
+                target = index;
+                oldest = 0;
+                break;
+            }
+            if (entry.last_used < oldest) {
+                oldest = entry.last_used;
+                target = index;
+            }
+        }
+        var entry = &self.paths[target];
+        entry.valid = true;
+        entry.generation = self.generation;
+        entry.last_used = self.touch();
+        entry.directory_record = directory_record;
+        entry.name_len = @intCast(name_utf16.len);
+        @memcpy(entry.name_utf16[0..name_utf16.len], name_utf16);
+        entry.negative = status == .not_found;
+        entry.expires_at = if (entry.negative)
+            saturatingAdd(now_ticks, self.negative_ttl_ticks)
+        else
+            0;
+        if (status == .found) {
+            entry.result = value.*;
+            self.counters.path_positive_stores +%= 1;
+        } else {
+            self.counters.path_negative_stores +%= 1;
+        }
+    }
+
+    fn noteTreeWalk(self: *MetadataCache) void {
+        self.counters.lookup_tree_walks +%= 1;
+    }
+
+    fn noteRecoveryBypass(self: *MetadataCache) void {
+        self.counters.recovery_cache_bypasses +%= 1;
+    }
+
+    pub fn reclaim(self: *MetadataCache, requested_entries_raw: u32) MetadataReclaimResult {
+        const requested_entries = @min(requested_entries_raw, @as(u32, METADATA_CACHE_SLOT_CAPACITY));
+        var result = MetadataReclaimResult{ .requested_entries = requested_entries };
+        self.counters.reclaim_requests +%= 1;
+        while (result.inspected_entries < METADATA_CACHE_SLOT_CAPACITY and
+            result.reclaimed_entries < requested_entries)
+        {
+            const slot = self.reclaim_cursor;
+            self.reclaim_cursor = (self.reclaim_cursor + 1) % METADATA_CACHE_SLOT_CAPACITY;
+            result.inspected_entries += 1;
+            if (self.clearSlot(slot)) result.reclaimed_entries += 1;
+        }
+        self.counters.reclaim_scans +%= result.inspected_entries;
+        self.counters.reclaimed_entries +%= result.reclaimed_entries;
+        return result;
+    }
+
+    pub fn summary(self: *const MetadataCache) MetadataCacheSummary {
+        var out = self.counters;
+        out.version = METADATA_CACHE_VERSION;
+        out.active_volumes = 1;
+        out.slot_capacity = METADATA_CACHE_SLOT_CAPACITY;
+        out.bytes_per_volume = @sizeOf(MetadataCache);
+        out.record_capacity = METADATA_RECORD_CAPACITY;
+        out.attribute_capacity = METADATA_ATTRIBUTE_CAPACITY;
+        out.index_capacity = METADATA_INDEX_CAPACITY;
+        out.path_capacity = METADATA_PATH_CAPACITY;
+        out.mount_generation = self.mount_generation;
+        out.content_generation = self.generation;
+        out.negative_ttl_ticks = self.negative_ttl_ticks;
+        for (self.records) |entry| if (entry.valid) {
+            out.record_entries += 1;
+        };
+        for (self.attributes) |entry| if (entry.valid) {
+            out.attribute_entries += 1;
+        };
+        for (self.indices) |entry| if (entry.valid) {
+            out.index_entries += 1;
+        };
+        for (self.paths) |entry| if (entry.valid) {
+            out.path_entries += 1;
+        };
+        return out;
+    }
+
+    fn clearEntries(self: *MetadataCache) u32 {
+        var cleared: u32 = 0;
+        for (&self.records) |*entry| if (entry.valid) {
+            entry.valid = false;
+            cleared += 1;
+        };
+        for (&self.attributes) |*entry| if (entry.valid) {
+            entry.valid = false;
+            cleared += 1;
+        };
+        for (&self.indices) |*entry| if (entry.valid) {
+            entry.valid = false;
+            cleared += 1;
+        };
+        for (&self.paths) |*entry| if (entry.valid) {
+            entry.valid = false;
+            cleared += 1;
+        };
+        return cleared;
+    }
+
+    fn clearSlot(self: *MetadataCache, slot: usize) bool {
+        if (slot < METADATA_RECORD_CAPACITY) {
+            const entry = &self.records[slot];
+            if (!entry.valid) return false;
+            entry.valid = false;
+            return true;
+        }
+        var relative = slot - METADATA_RECORD_CAPACITY;
+        if (relative < METADATA_ATTRIBUTE_CAPACITY) {
+            const entry = &self.attributes[relative];
+            if (!entry.valid) return false;
+            entry.valid = false;
+            return true;
+        }
+        relative -= METADATA_ATTRIBUTE_CAPACITY;
+        if (relative < METADATA_INDEX_CAPACITY) {
+            const entry = &self.indices[relative];
+            if (!entry.valid) return false;
+            entry.valid = false;
+            return true;
+        }
+        relative -= METADATA_INDEX_CAPACITY;
+        const entry = &self.paths[relative];
+        if (!entry.valid) return false;
+        entry.valid = false;
+        return true;
+    }
+};
+
+fn nextGeneration(current: u64) u64 {
+    const next = current +% 1;
+    return if (next == 0) 1 else next;
+}
+
+fn saturatingAdd(a: u64, b: u64) u64 {
+    return if (b > ~@as(u64, 0) - a) ~@as(u64, 0) else a + b;
+}
 
 fn entryFromFileName(reference: ntfs.FileReference, file_name: ntfs.FileName) ?Entry {
     var entry = Entry{
@@ -824,6 +1389,19 @@ fn loadIndexBlock(v: *const Volume, alloc_runs: []const ntfs.Run, vcn: u64) bool
     const byte_offset = clusterByteOffset(v, vcn) orelse return false;
     if (!readRunBytes(v, alloc_runs, byte_offset, block)) return false;
     return ntfs.applyFixups(block) == .ok;
+}
+
+/// Read-side INDX cache. Mutation helpers deliberately keep using the direct
+/// loader because their scratch blocks are changed in place and every write
+/// invalidates the shared metadata generation before publication.
+fn loadIndexBlockCached(v: *const Volume, directory_record: u64, alloc_runs: []const ntfs.Run, vcn: u64) bool {
+    const block = v.scratch.block[0..v.index_block_bytes];
+    if (v.metadata_cache) |cache| {
+        if (cache.lookupIndex(directory_record, vcn, block)) return true;
+    }
+    if (!loadIndexBlock(v, alloc_runs, vcn)) return false;
+    if (v.metadata_cache) |cache| cache.storeIndex(directory_record, vcn, block);
+    return true;
 }
 
 fn storeIndexBlock(v: *const Volume, alloc_runs: []const ntfs.Run, vcn: u64) bool {
@@ -894,6 +1472,40 @@ fn lookupInDirectoryStatusMode(
     const target_len = ntfs.utf8ToUtf16(name, v.scratch.name_utf16[0..]) orelse return .io;
     const target = v.scratch.name_utf16[0..target_len];
 
+    if (v.metadata_cache) |cache| {
+        if (allow_transient_alias) {
+            cache.noteRecoveryBypass();
+        } else {
+            switch (cache.lookupPath(v.upcase, dir_record, target, v.metadata_cache_now_ticks, out)) {
+                .positive => return .found,
+                .negative => return recordLookupNotFound(diagnostic_depth, 10),
+                .miss => {},
+            }
+            cache.noteTreeWalk();
+        }
+    }
+    const status = lookupInDirectoryStatusUncached(
+        v,
+        dir_record,
+        target,
+        out,
+        allow_transient_alias,
+        diagnostic_depth,
+    );
+    if (!allow_transient_alias) if (v.metadata_cache) |cache| {
+        cache.storePath(dir_record, target, status, out, v.metadata_cache_now_ticks);
+    };
+    return status;
+}
+
+fn lookupInDirectoryStatusUncached(
+    v: *const Volume,
+    dir_record: u64,
+    target: []const u8,
+    out: *LookupResult,
+    allow_transient_alias: bool,
+    diagnostic_depth: u32,
+) LookupStatus {
     const header = loadRecord(v, dir_record, v.scratch.record[0..]) orelse return .io;
     if (dir_record > U32_MAX or !header.inUse() or
         header.record_number != @as(u32, @intCast(dir_record)) or
@@ -996,7 +1608,7 @@ fn lookupInDirectoryStatusMode(
         if (!route_decided) return .io;
         const vcn = next_vcn orelse return .io;
         if (!have_allocation) return .io;
-        if (!loadIndexBlock(v, alloc.runs[0..alloc.count], vcn)) return .io;
+        if (!loadIndexBlockCached(v, dir_record, alloc.runs[0..alloc.count], vcn)) return .io;
         const block = ntfs.IndexBlock.parse(v.scratch.block[0..v.index_block_bytes]) orelse return .io;
         if (block.vcn != vcn) return .io;
         node_entries = block.entries;
@@ -1212,7 +1824,7 @@ fn emitEntry(sink: *EnumSink, entry: Entry) void {
     sink.seen += 1;
 }
 
-fn walkNode(v: *const Volume, alloc_runs: []const ntfs.Run, sink: *EnumSink, node_vcn: ?u64, root_entries: []const u8, depth: usize, hide_system: bool) void {
+fn walkNode(v: *const Volume, dir_record: u64, alloc_runs: []const ntfs.Run, sink: *EnumSink, node_vcn: ?u64, root_entries: []const u8, depth: usize, hide_system: bool) void {
     if (sink.failed or sink.found != null) return;
     if (depth >= MAX_INDEX_DEPTH) {
         sink.failed = true;
@@ -1222,7 +1834,7 @@ fn walkNode(v: *const Volume, alloc_runs: []const ntfs.Run, sink: *EnumSink, nod
     while (true) {
         var entries: []const u8 = undefined;
         if (node_vcn) |vcn| {
-            if (!loadIndexBlock(v, alloc_runs, vcn)) {
+            if (!loadIndexBlockCached(v, dir_record, alloc_runs, vcn)) {
                 sink.failed = true;
                 return;
             }
@@ -1255,7 +1867,7 @@ fn walkNode(v: *const Volume, alloc_runs: []const ntfs.Run, sink: *EnumSink, nod
         }
         const is_end = entry.isEnd();
         if (entry.hasSubNode()) {
-            walkNode(v, alloc_runs, sink, entry.sub_node_vcn.?, root_entries, depth + 1, hide_system);
+            walkNode(v, dir_record, alloc_runs, sink, entry.sub_node_vcn.?, root_entries, depth + 1, hide_system);
             if (sink.failed or sink.found != null) return;
         }
         if (is_end) return;
@@ -1279,9 +1891,9 @@ pub fn enumerateDirectory(v: *const Volume, dir_record: u64, sink: *EnumSink) bo
         const header2 = loadRecord(v, dir_record, v.scratch.record[0..]) orelse return false;
         const root_attr2 = ntfs.findAttribute(record, header2, .index_root, &ntfs.I30_NAME_UTF16) orelse return false;
         const index_root2 = ntfs.IndexRoot.parse(root_attr2.value) orelse return false;
-        walkNode(v, alloc.runs[0..alloc.count], sink, null, index_root2.entries, 0, hide_system);
+        walkNode(v, dir_record, alloc.runs[0..alloc.count], sink, null, index_root2.entries, 0, hide_system);
     } else {
-        walkNode(v, &[_]ntfs.Run{}, sink, null, index_root.entries, 0, hide_system);
+        walkNode(v, dir_record, &[_]ntfs.Run{}, sink, null, index_root.entries, 0, hide_system);
     }
     return !sink.failed;
 }
@@ -5688,4 +6300,96 @@ pub fn abortWriteForTest(v: *const Volume, status: WriteStatus) WriteStatus {
 
 pub fn abortWriteFreeingForTest(v: *const Volume, runs: []const ntfs.Run, status: WriteStatus) WriteStatus {
     return abortWriteFreeing(v, runs, status);
+}
+
+test "metadata cache generation invalidates every decoded cache kind" {
+    const testing = @import("std").testing;
+    var cache = MetadataCache{};
+    cache.beginMount(100);
+
+    const record = [_]u8{ 1, 2, 3, 4 };
+    cache.storeRecord(17, record[0..]);
+    var record_out: [4]u8 = undefined;
+    try testing.expect(cache.lookupRecord(17, record_out[0..]));
+    try testing.expectEqualSlices(u8, record[0..], record_out[0..]);
+
+    var attribute = AttrScratch{};
+    attribute.runs[0] = .{ .length_clusters = 3, .lcn = 91 };
+    attribute.count = 1;
+    attribute.data_size = 12288;
+    cache.storeAttribute(17, .data, &[_]u8{}, &attribute);
+    var attribute_out = AttrScratch{};
+    try testing.expect(cache.lookupAttribute(17, .data, &[_]u8{}, &attribute_out));
+    try testing.expectEqual(@as(usize, 1), attribute_out.count);
+    try testing.expectEqual(@as(u64, 91), attribute_out.runs[0].lcn.?);
+
+    const block = [_]u8{0x49} ** 32;
+    cache.storeIndex(5, 2, block[0..]);
+    var block_out: [32]u8 = undefined;
+    try testing.expect(cache.lookupIndex(5, 2, block_out[0..]));
+
+    var name: [32]u8 = undefined;
+    const name_len = ntfs.asciiToUtf16("CACHE.TXT", name[0..]).?;
+    const found = LookupResult{
+        .record = 17,
+        .sequence = 4,
+        .entry = .{ .record = 17, .sequence = 4 },
+    };
+    cache.storePath(5, name[0..name_len], .found, &found, 10);
+    var found_out: LookupResult = undefined;
+    try testing.expectEqual(PathCacheLookup.positive, cache.lookupPath(&[_]u8{}, 5, name[0..name_len], 10, &found_out));
+    try testing.expectEqual(@as(u64, 17), found_out.record);
+
+    const before = cache.summary();
+    try testing.expectEqual(@as(u32, 1), before.record_entries);
+    try testing.expectEqual(@as(u32, 1), before.attribute_entries);
+    try testing.expectEqual(@as(u32, 1), before.index_entries);
+    try testing.expectEqual(@as(u32, 1), before.path_entries);
+
+    cache.invalidateMutation();
+    const after = cache.summary();
+    try testing.expectEqual(@as(u32, 0), after.record_entries + after.attribute_entries + after.index_entries + after.path_entries);
+    try testing.expectEqual(@as(u64, 1), after.mutation_invalidations);
+    try testing.expectEqual(@as(u64, 4), after.invalidated_entries);
+    try testing.expect(!cache.lookupRecord(17, record_out[0..]));
+}
+
+test "negative path cache expires and external generation rejects stale results" {
+    const testing = @import("std").testing;
+    var cache = MetadataCache{};
+    cache.beginMount(10);
+    var name: [32]u8 = undefined;
+    const name_len = ntfs.asciiToUtf16("MISSING.TXT", name[0..]).?;
+    var unused = LookupResult{ .record = 0, .sequence = 0, .entry = .{} };
+    cache.storePath(5, name[0..name_len], .not_found, &unused, 100);
+    try testing.expectEqual(PathCacheLookup.negative, cache.lookupPath(&[_]u8{}, 5, name[0..name_len], 109, &unused));
+    try testing.expectEqual(PathCacheLookup.miss, cache.lookupPath(&[_]u8{}, 5, name[0..name_len], 110, &unused));
+    try testing.expectEqual(@as(u64, 1), cache.summary().path_expirations);
+
+    cache.storePath(5, name[0..name_len], .not_found, &unused, 200);
+    cache.invalidateExternal();
+    try testing.expectEqual(PathCacheLookup.miss, cache.lookupPath(&[_]u8{}, 5, name[0..name_len], 201, &unused));
+    try testing.expectEqual(@as(u64, 1), cache.summary().external_invalidations);
+}
+
+test "metadata cache capacity and reclaim work stay bounded" {
+    const testing = @import("std").testing;
+    var cache = MetadataCache{};
+    cache.beginMount(100);
+    var payload: [8]u8 = undefined;
+    var number: u64 = 0;
+    while (number < METADATA_RECORD_CAPACITY + 1) : (number += 1) {
+        @memset(payload[0..], @truncate(number));
+        cache.storeRecord(number, payload[0..]);
+    }
+    var summary = cache.summary();
+    try testing.expectEqual(@as(u32, METADATA_RECORD_CAPACITY), summary.record_entries);
+    try testing.expectEqual(@as(u64, 1), summary.record_evictions);
+
+    const reclaimed = cache.reclaim(3);
+    try testing.expectEqual(@as(u32, 3), reclaimed.reclaimed_entries);
+    try testing.expect(reclaimed.inspected_entries <= METADATA_CACHE_SLOT_CAPACITY);
+    summary = cache.summary();
+    try testing.expectEqual(@as(u32, METADATA_RECORD_CAPACITY - 3), summary.record_entries);
+    try testing.expectEqual(@as(u64, 3), summary.reclaimed_entries);
 }

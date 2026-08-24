@@ -25,6 +25,7 @@ const module_file = @import("../kernel/module_file.zig");
 const display = @import("../display/display.zig");
 const page_cache = @import("../fs/page_cache.zig");
 const fat32_fs = @import("../fs/fat/fat32.zig");
+const ntfs_fs = @import("../fs/ntfs/ntfs.zig");
 const fs_request = @import("../fs/request.zig");
 const paging = @import("../memory/paging.zig");
 const page_tables = @import("../memory/page_tables.zig");
@@ -1441,10 +1442,13 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v8_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_drive_gate_count");
     const v9_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_bulk_write_requests");
     const v10_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_policy_version");
-    const v11_size: usize = @sizeOf(ProgramPerformanceSummary);
+    const v11_size: usize = @offsetOf(ProgramPerformanceSummary, "ntfs_metadata_cache_version");
+    const v12_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v11_size)
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v12_size)
         performance_snapshot_version
+    else if (caller_version >= 11 and caller_size >= v11_size)
+        11
     else if (caller_version >= 10 and caller_size >= v10_size)
         10
     else if (caller_version >= 9 and caller_size >= v9_size)
@@ -1476,7 +1480,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         8 => v8_size,
         9 => v9_size,
         10 => v10_size,
-        else => v11_size,
+        11 => v11_size,
+        else => v12_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -1492,6 +1497,7 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const fs_summary = fs_request.summary();
     const fs_cache = page_cache.summary();
     const fat32_summary = fat32_fs.summary();
+    const ntfs_metadata = ntfs_fs.metadataCacheSummary();
     const reclaim_summary = mem_reclaim.summary();
     const backing_summary = mem_backing_store.summary();
     const backing_slot_summary = mem_backing_store.slotSummary();
@@ -2046,6 +2052,49 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .fs_cache_read_ahead_hits = fs_cache.read_ahead_hits,
         .fs_cache_read_ahead_cancellations = fs_cache.read_ahead_cancellations,
         .fs_cache_read_ahead_budget_skips = fs_cache.read_ahead_budget_skips,
+        .ntfs_metadata_cache_version = ntfs_metadata.version,
+        .ntfs_metadata_cache_active_volumes = ntfs_metadata.active_volumes,
+        .ntfs_metadata_cache_bytes_per_volume = ntfs_metadata.bytes_per_volume,
+        .ntfs_metadata_cache_slot_capacity = ntfs_metadata.slot_capacity,
+        .ntfs_metadata_record_capacity = ntfs_metadata.record_capacity,
+        .ntfs_metadata_attribute_capacity = ntfs_metadata.attribute_capacity,
+        .ntfs_metadata_index_capacity = ntfs_metadata.index_capacity,
+        .ntfs_metadata_path_capacity = ntfs_metadata.path_capacity,
+        .ntfs_metadata_record_entries = ntfs_metadata.record_entries,
+        .ntfs_metadata_attribute_entries = ntfs_metadata.attribute_entries,
+        .ntfs_metadata_index_entries = ntfs_metadata.index_entries,
+        .ntfs_metadata_path_entries = ntfs_metadata.path_entries,
+        .ntfs_metadata_mount_generation = ntfs_metadata.mount_generation,
+        .ntfs_metadata_content_generation = ntfs_metadata.content_generation,
+        .ntfs_metadata_negative_ttl_ticks = ntfs_metadata.negative_ttl_ticks,
+        .ntfs_metadata_record_hits = ntfs_metadata.record_hits,
+        .ntfs_metadata_record_misses = ntfs_metadata.record_misses,
+        .ntfs_metadata_record_stores = ntfs_metadata.record_stores,
+        .ntfs_metadata_record_evictions = ntfs_metadata.record_evictions,
+        .ntfs_metadata_attribute_hits = ntfs_metadata.attribute_hits,
+        .ntfs_metadata_attribute_misses = ntfs_metadata.attribute_misses,
+        .ntfs_metadata_attribute_stores = ntfs_metadata.attribute_stores,
+        .ntfs_metadata_attribute_evictions = ntfs_metadata.attribute_evictions,
+        .ntfs_metadata_index_hits = ntfs_metadata.index_hits,
+        .ntfs_metadata_index_misses = ntfs_metadata.index_misses,
+        .ntfs_metadata_index_stores = ntfs_metadata.index_stores,
+        .ntfs_metadata_index_evictions = ntfs_metadata.index_evictions,
+        .ntfs_metadata_path_queries = ntfs_metadata.path_queries,
+        .ntfs_metadata_path_positive_hits = ntfs_metadata.path_positive_hits,
+        .ntfs_metadata_path_negative_hits = ntfs_metadata.path_negative_hits,
+        .ntfs_metadata_path_misses = ntfs_metadata.path_misses,
+        .ntfs_metadata_path_positive_stores = ntfs_metadata.path_positive_stores,
+        .ntfs_metadata_path_negative_stores = ntfs_metadata.path_negative_stores,
+        .ntfs_metadata_path_expirations = ntfs_metadata.path_expirations,
+        .ntfs_metadata_lookup_tree_walks = ntfs_metadata.lookup_tree_walks,
+        .ntfs_metadata_recovery_cache_bypasses = ntfs_metadata.recovery_cache_bypasses,
+        .ntfs_metadata_mount_invalidations = ntfs_metadata.mount_invalidations,
+        .ntfs_metadata_mutation_invalidations = ntfs_metadata.mutation_invalidations,
+        .ntfs_metadata_external_invalidations = ntfs_metadata.external_invalidations,
+        .ntfs_metadata_invalidated_entries = ntfs_metadata.invalidated_entries,
+        .ntfs_metadata_reclaim_requests = ntfs_metadata.reclaim_requests,
+        .ntfs_metadata_reclaim_scans = ntfs_metadata.reclaim_scans,
+        .ntfs_metadata_reclaimed_entries = ntfs_metadata.reclaimed_entries,
         .fs_cache_clean_reclaimable_entries = fs_cache.clean_reclaimable_entries,
         .fs_cache_dirty_non_reclaimable_entries = fs_cache.dirty_non_reclaimable_entries,
         .fs_cache_pagefile_ready = 0,
