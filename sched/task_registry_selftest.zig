@@ -6,6 +6,7 @@ const heap = @import("../memory/heap.zig");
 const phys = @import("../memory/phys.zig");
 const virt = @import("../memory/virt.zig");
 const net_core = @import("../net/core.zig");
+const timer = @import("../kernel/timer.zig");
 const scheduler = @import("scheduler.zig");
 const sync = @import("sync.zig");
 const task = @import("task.zig");
@@ -20,6 +21,7 @@ const KILL_END: usize = WORKER_COUNT;
 const CHURN_COUNT: usize = 10_000;
 const WAIT_BUDGET: usize = 20_000;
 const NETWORK_PROGRESS_TICK_BUDGET: usize = 64;
+const WAKE_LATENCY_BAR: u64 = 3;
 
 const WorkerKind = enum {
     runnable,
@@ -61,12 +63,16 @@ var timeout_results: u32 = 0;
 var release_workers = false;
 var churn_completed: u32 = 0;
 var short_completed: u32 = 0;
+var wake_probe_entered = false;
+var wake_probe_completed = false;
+var wake_probe_latency: u64 = 0;
 
 var signal_event = sync.EventV2.initMode(false, .manual_reset);
 var cancel_queue = sync.WaitQueue.init();
 var timeout_queue = sync.WaitQueue.init();
 var kill_queue = sync.WaitQueue.init();
 var finish_queue = sync.WaitQueue.init();
+var wake_probe_event = sync.EventV2.initMode(false, .manual_reset);
 
 pub fn runIfEnabled() bool {
     const value = boot_config.optionValue(boot_config.get(), "TASKREGISTRY", "selftest") orelse return true;
@@ -89,6 +95,11 @@ fn run() bool {
     }
     cleanupWorkers();
     resetState();
+    if (!queueProjectionValid("warm")) return fail("queue-warm");
+    if (!runWakeProbe()) return fail("wakeup-probe");
+    _ = task.reapDeferred();
+    _ = task.reclaimStackCache(0);
+    if (!queueProjectionValid("wake-reaped")) return fail("queue-wake-reaped");
     phase("begin");
 
     const baseline = takeBaseline();
@@ -102,6 +113,17 @@ fn run() bool {
         cleanupWorkers();
         return fail("concurrency-publish");
     }
+    if (!queueProjectionValid("created")) {
+        cleanupWorkers();
+        return fail("queue-created");
+    }
+    const reap_before = task.reapStats();
+    _ = task.reapDeferred();
+    const reap_after = task.reapStats();
+    if (reap_after.candidate_visits != reap_before.candidate_visits) {
+        cleanupWorkers();
+        return fail("reaper-empty-scan");
+    }
     if (!waitForStarted()) {
         cleanupWorkers();
         return fail("concurrency-start");
@@ -114,6 +136,11 @@ fn run() bool {
         return fail("wait-enrollment");
     }
     phase("enrolled");
+    const enrolled_queues = task.queueSnapshot();
+    if (!enrolled_queues.valid or enrolled_queues.registry < WORKER_COUNT or enrolled_queues.ready >= enrolled_queues.registry) {
+        cleanupWorkers();
+        return fail("queue-enrolled");
+    }
 
     signal_event.signal();
     const cancelled = cancel_queue.cancelAll();
@@ -133,6 +160,10 @@ fn run() bool {
         return fail("wait-results");
     }
     phase("wait-results");
+    if (!queueProjectionValid("wait-results")) {
+        cleanupWorkers();
+        return fail("queue-wait-results");
+    }
 
     const mix = countWorkerStates();
     if (!mix.stable or mix.live < 128 or mix.runnable == 0 or mix.blocked == 0 or mix.priorities != 0b111 or worker_failures != 0) {
@@ -160,6 +191,7 @@ fn run() bool {
         return fail("concurrency-baseline");
     }
     phase("reaped");
+    if (!queueProjectionValid("reaped")) return fail("queue-reaped");
 
     phase("churn-begin");
     if (!runChurn(baseline)) return fail("churn");
@@ -170,6 +202,7 @@ fn run() bool {
         return fail("churn-baseline");
     }
     phase("churn-complete");
+    if (!queueProjectionValid("churn")) return fail("queue-churn");
 
     k.puts("TASKREG05910 churn=10000 task=baseline heap=baseline pmm=baseline vm=baseline fpu=baseline\r\n");
 
@@ -187,6 +220,7 @@ fn run() bool {
     const rx_ticks_before = rx_task.run_ticks;
     const rx_switches_before = rx_task.switches_in;
     const rx_polls_before = rx_summary.polls;
+    const rx_iterations_before = rx_summary.iterations;
 
     if (!runOomReserveTest()) return fail("oom-reserve");
     _ = task.reapDeferred();
@@ -197,12 +231,13 @@ fn run() bool {
     }
 
     var rx_summary_after = net_core.rxTaskSummary();
-    // A short net-rx dispatch normally finishes well inside one 1-kHz timer
-    // interval, so run_ticks can legitimately stay unchanged. Accept either
-    // a sampled running tick or the stronger pair of a new dispatch plus a
-    // completed adapter poll.
+    // A short net-rx dispatch normally finishes inside one timer interval, so
+    // run_ticks can stay unchanged. The loop counter is the direct progress
+    // proof even in the headless no-NIC environment where adapter polls are
+    // intentionally zero.
     var network_progress = rx_task.generation == rx_generation and
-        (rx_task.run_ticks > rx_ticks_before or
+        (rx_summary_after.iterations > rx_iterations_before or
+            rx_task.run_ticks > rx_ticks_before or
             (rx_task.switches_in > rx_switches_before and rx_summary_after.polls > rx_polls_before));
     var progress_spins: usize = 0;
     while (!network_progress and progress_spins < NETWORK_PROGRESS_TICK_BUDGET) : (progress_spins += 1) {
@@ -212,7 +247,8 @@ fn run() bool {
         scheduler.sleepTicksWithReason(1, "taskreg-net-progress");
         rx_summary_after = net_core.rxTaskSummary();
         network_progress = rx_task.generation == rx_generation and
-            (rx_task.run_ticks > rx_ticks_before or
+            (rx_summary_after.iterations > rx_iterations_before or
+                rx_task.run_ticks > rx_ticks_before or
                 (rx_task.switches_in > rx_switches_before and rx_summary_after.polls > rx_polls_before));
     }
     k.puts("TASKREG05910 network run_ticks=");
@@ -227,12 +263,27 @@ fn run() bool {
     k.putDec(rx_polls_before);
     k.puts("->");
     k.putDec(rx_summary_after.polls);
+    k.puts(" iterations=");
+    k.putDec(rx_iterations_before);
+    k.puts("->");
+    k.putDec(rx_summary_after.iterations);
     k.puts("\r\n");
     const current_caller = scheduler.current() orelse return fail("caller-lost");
     const caller_alive = current_caller == caller and current_caller.id == caller_id and current_caller.generation == caller_generation and current_caller.state == .running;
     if (!network_progress or !caller_alive) return fail("critical-progress");
 
     k.puts("TASKREG05910 admission fault=task_metadata normal=REJECTED critical=OK reserve=returned netrx=progress caller=alive recovery=OK\r\n");
+    k.puts("TASKREG06931 queues=OK registry=");
+    k.putDec(enrolled_queues.registry);
+    k.puts(" ready=");
+    k.putDec(enrolled_queues.ready);
+    k.puts(" timed=");
+    k.putDec(enrolled_queues.timed);
+    k.puts(" reaper_empty_visits=0 wake_latency=");
+    k.putDec(wake_probe_latency);
+    k.puts(" wake_bar=");
+    k.putDec(WAKE_LATENCY_BAR);
+    k.puts(" wake_request=OK lock_handoff=OK\r\n");
     k.puts("TASKREG05910 result: OK\r\n");
     return true;
 }
@@ -249,30 +300,96 @@ fn resetState() void {
     release_workers = false;
     churn_completed = 0;
     short_completed = 0;
+    wake_probe_entered = false;
+    wake_probe_completed = false;
+    wake_probe_latency = 0;
     signal_event = sync.EventV2.initMode(false, .manual_reset);
     cancel_queue = sync.WaitQueue.init();
     timeout_queue = sync.WaitQueue.init();
     kill_queue = sync.WaitQueue.init();
     finish_queue = sync.WaitQueue.init();
+    wake_probe_event = sync.EventV2.initMode(false, .manual_reset);
+}
+
+fn queueProjectionValid(label: []const u8) bool {
+    const snapshot = task.queueSnapshot();
+    if (snapshot.valid) return true;
+    k.puts("TASKREG06931 queue-invalid phase=");
+    k.puts(label);
+    k.puts(" registry=");
+    k.putDec(snapshot.registry);
+    k.puts(" ready=");
+    k.putDec(snapshot.ready);
+    k.puts(" timed=");
+    k.putDec(snapshot.timed);
+    k.puts(" reap=");
+    k.putDec(snapshot.reap);
+    k.puts("\r\n");
+    return false;
+}
+
+fn wakeProbeMain() callconv(.c) void {
+    wake_probe_entered = true;
+    if (wake_probe_event.waitResult(sync.WAIT_FOREVER) == .signaled) {
+        wake_probe_completed = true;
+    }
+}
+
+fn runWakeProbe() bool {
+    const caller = scheduler.current() orelse return false;
+    const old_priority = caller.priority;
+    const probe = task.createKernelThreadBlocked("taskreg-wakeup", wakeProbeMain) orelse return false;
+    const probe_id = probe.id;
+    const probe_generation = probe.generation;
+    if (!task.setPriority(probe, .high)) {
+        _ = task.retireIdentity(probe_id, probe_generation);
+        return false;
+    }
+    task.markReady(probe, timer.tickCount());
+
+    var spins: usize = 0;
+    while ((!wake_probe_entered or probe.state != .blocked) and spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
+    if (!wake_probe_entered or probe.state != .blocked or !task.setPriority(caller, .normal)) {
+        if (task.isAliveIdentity(probe_id, probe_generation)) _ = task.killIdentity(probe_id, probe_generation);
+        _ = task.retireIdentity(probe_id, probe_generation);
+        return false;
+    }
+
+    const before = scheduler.structureStats();
+    wake_probe_event.signal();
+    const after_signal = scheduler.structureStats();
+    const published_without_switch = scheduler.current() == caller and
+        after_signal.wakeup_reschedule_requests > before.wakeup_reschedule_requests and
+        after_signal.reschedule_pending;
+
+    spins = 0;
+    while (!wake_probe_completed and spins < WAIT_BUDGET) : (spins += 1) scheduler.yield();
+    wake_probe_latency = probe.last_ready_latency_ticks;
+    _ = task.setPriority(caller, old_priority);
+    const bounded = wake_probe_completed and wake_probe_latency <= WAKE_LATENCY_BAR;
+    if (task.isAliveIdentity(probe_id, probe_generation)) _ = task.killIdentity(probe_id, probe_generation);
+    const retired = task.retireIdentity(probe_id, probe_generation);
+    return published_without_switch and bounded and retired != .pending;
 }
 
 fn createWorkers() bool {
     var index: usize = 0;
     while (index < WORKER_COUNT) : (index += 1) {
-        const created = task.createKernelThread("taskreg-worker", workerMain) orelse return false;
+        const created = task.createKernelThreadBlocked("taskreg-worker", workerMain) orelse return false;
         if (!task.pin(created)) {
             _ = task.killIdentity(created.id, created.generation);
             _ = task.releaseDeadIdentity(created.id, created.generation);
             return false;
         }
-        created.priority = switch (index % 3) {
+        if (!task.setPriority(created, switch (index % 3) {
             0 => .high,
             1 => .normal,
             else => .low,
-        };
+        })) return false;
         worker_tasks[index] = created;
         worker_ids[index] = created.id;
         worker_generations[index] = created.generation;
+        task.markReady(created, timer.tickCount());
     }
     return true;
 }

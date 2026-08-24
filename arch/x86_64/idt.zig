@@ -182,9 +182,14 @@ pub export fn irqDispatch(frame: *const InterruptFrame) callconv(.c) void {
 
     const irq: u8 = @intCast(vector - pic.MASTER_OFFSET);
     var request_preempt = false;
+    const preemptible_instruction_pointer = r4x.isPreemptibleInstructionPointer(frame.rip);
+    var wake_request_checkpoint = scheduler.structureStats().wakeup_reschedule_requests;
     switch (irq) {
         timer.PIT_IRQ => {
-            request_preempt = scheduler.onTick(timer.onIrq(), r4x.isPreemptibleInstructionPointer(frame.rip));
+            request_preempt = scheduler.onTick(timer.onIrq(), preemptible_instruction_pointer);
+            // Timer wakeups were considered by onTick. Only a new wake from a
+            // subsequently dispatched device handler needs another decision.
+            wake_request_checkpoint = scheduler.structureStats().wakeup_reschedule_requests;
         },
         keyboard.IRQ, mouse.IRQ => ps2_controller.onIrq(irq),
         else => {},
@@ -194,6 +199,12 @@ pub export fn irqDispatch(frame: *const InterruptFrame) callconv(.c) void {
         pic.endOfInterrupt(irq);
     }
     lapic.endOfInterrupt();
+    if (!request_preempt and
+        (irq != timer.PIT_IRQ or
+            scheduler.structureStats().wakeup_reschedule_requests != wake_request_checkpoint))
+    {
+        request_preempt = scheduler.preemptPendingWake(preemptible_instruction_pointer);
+    }
     if (request_preempt) scheduler.preemptFromIrq();
 }
 

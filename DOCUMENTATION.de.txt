@@ -84,6 +84,28 @@ Bootdatensatz; breite Subsystem-Summaries oder aktive Diagnoseprobes gehoeren
 nicht in diesen Pfad. Die spaeten Phasen laufen einmalig in der Reihenfolge
 `task_runtime`, `driver_policy`, `runtime`, `shell`.
 
+Skalierende Scheduler-Arbeitsmengen
+-----------------------------------
+
+Die stabile Task-Registry bleibt Besitz-, Identitaets- und Inventarindex. Sie
+ist keine Runqueue: Ready-Tasks, endliche Timer-Waits und deferred zu reapende
+Tasks besitzen jeweils eine eigene intrusive Projektion. Auswahl und
+Starvation-Metrik laufen damit ueber Ready, der Tick nur ueber faellige
+Timeout-Kandidaten und ein Reap-Pass nur ueber seine zu diesem Pass gehoerende
+Kandidaten. Zustandswechsel aktualisieren Registryprojektion und Taskzustand
+gemeinsam bei gesperrten Interrupts.
+
+ProgramThread- und Async-I/O-Tasks erhalten vor ihrer Ready-Publikation eine
+unveraenderliche direkte Execution-Owner-Bindung. Die Timer-IRQ-Pruefung kann
+den Programmbesitzer deshalb generationengeprueft in O(1) aufloesen, ohne die
+ProgramThread-Registry oder die Async-I/O-Slots zu durchsuchen.
+
+Ein Wake eines hoeher priorisierten Tasks publiziert weiterhin nur den
+Ready-Zustand, setzt aber zusaetzlich eine Reschedule-Anforderung. Der Wechsel
+findet nie im WaitQueue-Lock statt: Der Timer oder ein anderer IRQ konsumiert
+die Anforderung erst nach Handlern und EOI, nur bei freigegebener Preemption
+und einem sicheren Programminstruktionszeiger. Bis dahin bleibt sie pending.
+
 Synth-PCM und Protokollbruecke
 -----------------------------
 

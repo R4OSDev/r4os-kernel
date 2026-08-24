@@ -4623,12 +4623,14 @@ var rx_task_started = false;
 var rx_task_id: u32 = 0;
 var rx_task_generation: u64 = 0;
 var rx_task_polls: u64 = 0;
+var rx_task_iterations: u64 = 0;
 
 pub const RxTaskSummary = struct {
     started: bool = false,
     task_id: u32 = 0,
     task_generation: u64 = 0,
     polls: u64 = 0,
+    iterations: u64 = 0,
     guard_skips: u64 = 0,
     nested_polls: u64 = 0,
 };
@@ -4639,6 +4641,7 @@ pub fn rxTaskSummary() RxTaskSummary {
         .task_id = rx_task_id,
         .task_generation = rx_task_generation,
         .polls = rx_task_polls,
+        .iterations = rx_task_iterations,
         .guard_skips = net_poll_skips,
         .nested_polls = net_poll_nested,
     };
@@ -4775,20 +4778,19 @@ fn logIpv4(ip: [4]u8) void {
 const RX_TASK_LOG_INTERVAL: u64 = 2000;
 
 fn rxTaskMain() callconv(.c) void {
-    var iterations: u64 = 0;
     while (true) {
         if (adapter_count > 0) {
             rx_task_polls +%= 1;
             pollAdapters(RX_TASK_POLL_ROUNDS);
         }
-        iterations +%= 1;
+        rx_task_iterations +%= 1;
         // TCP-Fristen verwenden ausschliesslich dieselbe monotone Tick-Domain
         // wie ihre Sendestempel. iterations bleibt nur der Log-Zaehler.
         const now = time_core.monotonicTicks();
         _ = tcp.reapTimeWait(now);
         proactiveRetransmitSweep(now);
         retryDhcpTaskStartIfDue();
-        if (iterations % RX_TASK_LOG_INTERVAL == 0) logRxTaskStatus();
+        if (rx_task_iterations % RX_TASK_LOG_INTERVAL == 0) logRxTaskStatus();
         // 0.56.29: 10 ms Echtzeit-Raster (wie 1 Tick bei 100 Hz); NIC-IRQ
         // weckt frueher, das hier ist nur der Poll-Fallback.
         scheduler.sleepTicksWithReason(timing.msToTicks(10), "net-rx-idle");

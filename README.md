@@ -39,6 +39,14 @@ is reaped. The shell's first `boot_ready` call independently freezes the boot
 measurement and retires the boot renderer without repainting the ready shell
 surface.
 
+The stable task registry is an ownership and inventory index, not a run queue.
+Ready selection, timed wakeups, and deferred reaping use separate intrusive
+projections, so their hot paths scale with the relevant work set. R4X tasks
+also carry an immutable direct execution-owner binding; timer IRQ attribution
+does not scan ProgramThread or asynchronous-I/O registries. A wake of a higher
+priority task requests rescheduling, but the switch is consumed only at a safe
+IRQ exit after wait-queue critical sections have been released.
+
 Detailed German migration notes are preserved in
 `DOCUMENTATION.de.txt`.
 

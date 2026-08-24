@@ -7831,6 +7831,14 @@ fn apiIoServiceCall(handle: u32, op: u16, request_ptr: [*]const u8, request_len:
         unlockAsyncIoRequests();
         return IO_ERROR_SPAWN_FAILED;
     };
+    if (!task.bindExecutionOwner(worker, .async_io, @ptrCast(req))) {
+        const worker_id = worker.id;
+        const worker_generation = worker.generation;
+        req.* = .{};
+        unlockAsyncIoRequests();
+        _ = task.retireIdentity(worker_id, worker_generation);
+        return IO_ERROR_SPAWN_FAILED;
+    }
     req.task_id = worker.id;
     req.task_generation = worker.generation;
     out_request_id.* = req.id;
@@ -8031,6 +8039,14 @@ fn submitAsyncFileRequest(kind: AsyncIoKind, path: [*:0]const u8, offset: u64, d
         unlockAsyncIoRequests();
         return IO_ERROR_SPAWN_FAILED;
     };
+    if (!task.bindExecutionOwner(worker, .async_io, @ptrCast(req))) {
+        const worker_id = worker.id;
+        const worker_generation = worker.generation;
+        req.* = .{};
+        unlockAsyncIoRequests();
+        _ = task.retireIdentity(worker_id, worker_generation);
+        return IO_ERROR_SPAWN_FAILED;
+    }
     req.task_id = worker.id;
     req.task_generation = worker.generation;
     out_request_id.* = req.id;
@@ -8228,13 +8244,11 @@ fn unlockAsyncIoRequests() void {
 
 fn currentAsyncIoRequest() ?*AsyncIoRequest {
     const current_task = scheduler.current() orelse return null;
-    var i: usize = 0;
-    while (i < async_io_requests.len) : (i += 1) {
-        if (async_io_requests[i].used and
-            async_io_requests[i].task_id == current_task.id and
-            async_io_requests[i].task_generation == current_task.generation) return &async_io_requests[i];
-    }
-    return null;
+    const owner = task.executionOwner(current_task);
+    if (owner.kind != .async_io) return null;
+    const req: *AsyncIoRequest = @ptrCast(@alignCast(owner.context orelse return null));
+    if (!req.used or req.task_id != current_task.id or req.task_generation != current_task.generation) return null;
+    return req;
 }
 
 fn asyncIoRequestForCaller(request_id: u32) ?*AsyncIoRequest {
@@ -8593,7 +8607,14 @@ fn apiThreadCreateHandle(entry: RawEntryFn, arg: u64, stack_reserve_bytes: u64, 
         .join_owner_task_generation = 0,
         .join_queue = sync.WaitQueue.init(),
     };
+    if (!task.bindExecutionOwner(new_task, .program_thread, @ptrCast(thread_ctx))) {
+        _ = task.retireIdentity(new_task.id, new_task.generation);
+        _ = freeProgramThreadMemory(thread_ctx);
+        _ = freeProgramStack(&stack);
+        return THREAD_ERROR_NO_MEMORY;
+    }
     if (!publishProgramThread(thread_ctx)) {
+        _ = task.clearExecutionOwner(new_task, @ptrCast(thread_ctx));
         _ = task.retireIdentity(new_task.id, new_task.generation);
         _ = freeProgramThreadMemory(thread_ctx);
         _ = freeProgramStack(&stack);
@@ -8905,7 +8926,12 @@ fn registerMainThread(instance: *ProgramInstance, program_task: *task.Task) ?*Pr
         .join_owner_task_generation = 0,
         .join_queue = sync.WaitQueue.init(),
     };
+    if (!task.bindExecutionOwner(program_task, .program_thread, @ptrCast(thread_ctx))) {
+        _ = freeProgramThreadMemory(thread_ctx);
+        return null;
+    }
     if (!publishProgramThread(thread_ctx)) {
+        _ = task.clearExecutionOwner(program_task, @ptrCast(thread_ctx));
         _ = freeProgramThreadMemory(thread_ctx);
         return null;
     }
@@ -8999,13 +9025,11 @@ fn freeProgramThreadMemory(thread_ctx: *ProgramThread) bool {
 
 fn currentProgramThread() ?*ProgramThread {
     const current_task = scheduler.current() orelse return null;
-    const irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(irq_flags);
-    var cursor = program_thread_head;
-    while (cursor) |thread_ctx| : (cursor = thread_ctx.registry_next) {
-        if (thread_ctx.used and thread_ctx.task_id == current_task.id and thread_ctx.task_generation == current_task.generation) return thread_ctx;
-    }
-    return null;
+    const owner = task.executionOwner(current_task);
+    if (owner.kind != .program_thread) return null;
+    const thread_ctx: *ProgramThread = @ptrCast(@alignCast(owner.context orelse return null));
+    if (!thread_ctx.used or thread_ctx.task_id != current_task.id or thread_ctx.task_generation != current_task.generation) return null;
+    return thread_ctx;
 }
 
 fn programThreadByIdLocked(id: u32) ?*ProgramThread {

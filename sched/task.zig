@@ -59,6 +59,20 @@ pub const WaitResult = enum(u32) {
     failed = 5,
 };
 
+// The scheduler-facing owner relation is immutable after a blocked task is
+// published.  Keeping the untyped pointer here avoids a Task <-> R4X import
+// cycle while letting program/r4x.zig recover its exact stable owner in O(1).
+pub const ExecutionOwnerKind = enum(u8) {
+    none,
+    program_thread,
+    async_io,
+};
+
+pub const ExecutionOwner = struct {
+    kind: ExecutionOwnerKind = .none,
+    context: ?*anyopaque = null,
+};
+
 pub const Entry = *const fn () callconv(.c) void;
 
 pub const HeldLockRecord = struct {
@@ -95,6 +109,15 @@ pub const RetireResult = enum(u8) {
 pub const Task = struct {
     registry_prev: ?*Task = null,
     registry_next: ?*Task = null,
+    ready_prev: ?*Task = null,
+    ready_next: ?*Task = null,
+    ready_linked: bool = false,
+    timeout_prev: ?*Task = null,
+    timeout_next: ?*Task = null,
+    timeout_linked: bool = false,
+    reap_prev: ?*Task = null,
+    reap_next: ?*Task = null,
+    reap_linked: bool = false,
     generation: u64 = 0,
     pin_count: u32 = 0,
     retire_pending: bool = false,
@@ -134,6 +157,8 @@ pub const Task = struct {
     stack_top: u64 = 0,
     stack_range_id: u32 = 0,
     priority: Priority = .normal,
+    execution_owner_kind: ExecutionOwnerKind = .none,
+    execution_owner_context: ?*anyopaque = null,
     entry: ?Entry = null,
     created_tick: u64 = 0,
     ready_since_tick: u64 = 0,
@@ -198,6 +223,18 @@ pub const InventoryPage = struct {
 
 var registry_head: ?*Task = null;
 var registry_tail: ?*Task = null;
+var ready_head: ?*Task = null;
+var ready_tail: ?*Task = null;
+var ready_count: usize = 0;
+var ready_priority_counts: [3]usize = .{0} ** 3;
+var timeout_head: ?*Task = null;
+var timeout_tail: ?*Task = null;
+var timeout_count: usize = 0;
+var reap_head: ?*Task = null;
+var reap_tail: ?*Task = null;
+var reap_count: usize = 0;
+var reap_pass_count: u64 = 0;
+var reap_candidate_visit_count: u64 = 0;
 var rollback_retry_head: ?*Task = null;
 var rollback_retry_count: usize = 0;
 var task_count: usize = 0;
@@ -268,6 +305,18 @@ pub fn init() bool {
     initialized = false;
     registry_head = null;
     registry_tail = null;
+    ready_head = null;
+    ready_tail = null;
+    ready_count = 0;
+    ready_priority_counts = .{0} ** 3;
+    timeout_head = null;
+    timeout_tail = null;
+    timeout_count = 0;
+    reap_head = null;
+    reap_tail = null;
+    reap_count = 0;
+    reap_pass_count = 0;
+    reap_candidate_visit_count = 0;
     rollback_retry_head = null;
     rollback_retry_count = 0;
     task_count = 0;
@@ -559,16 +608,95 @@ fn linkRegistryLocked(t: *Task) void {
     registry_tail = t;
     task_count += 1;
     if (task_count > task_peak) task_peak = task_count;
+    if (t.state == .ready) linkReadyLocked(t);
+    if (t.state == .blocked and t.wake_tick != 0) linkTimeoutLocked(t);
+    if (t.retire_pending and !t.release_in_progress) linkReapLocked(t);
     bumpInventoryMutationEpochLocked();
 }
 
 fn unlinkRegistryLocked(t: *Task) void {
+    unlinkReadyLocked(t);
+    unlinkTimeoutLocked(t);
+    unlinkReapLocked(t);
     if (t.registry_prev) |previous| previous.registry_next = t.registry_next else registry_head = t.registry_next;
     if (t.registry_next) |following| following.registry_prev = t.registry_prev else registry_tail = t.registry_prev;
     t.registry_prev = null;
     t.registry_next = null;
     if (task_count != 0) task_count -= 1;
     bumpInventoryMutationEpochLocked();
+}
+
+fn priorityIndex(priority: Priority) usize {
+    return @intFromEnum(priority);
+}
+
+fn linkReadyLocked(t: *Task) void {
+    if (t.ready_linked) return;
+    t.ready_prev = ready_tail;
+    t.ready_next = null;
+    if (ready_tail) |tail| tail.ready_next = t else ready_head = t;
+    ready_tail = t;
+    t.ready_linked = true;
+    ready_count += 1;
+    ready_priority_counts[priorityIndex(t.priority)] += 1;
+}
+
+fn unlinkReadyLocked(t: *Task) void {
+    if (!t.ready_linked) return;
+    if (t.ready_prev) |previous| previous.ready_next = t.ready_next else ready_head = t.ready_next;
+    if (t.ready_next) |following| following.ready_prev = t.ready_prev else ready_tail = t.ready_prev;
+    t.ready_prev = null;
+    t.ready_next = null;
+    t.ready_linked = false;
+    if (ready_count != 0) ready_count -= 1;
+    const index = priorityIndex(t.priority);
+    if (ready_priority_counts[index] != 0) ready_priority_counts[index] -= 1;
+}
+
+fn linkTimeoutLocked(t: *Task) void {
+    if (t.timeout_linked or t.wake_tick == 0) return;
+    t.timeout_prev = timeout_tail;
+    t.timeout_next = null;
+    if (timeout_tail) |tail| tail.timeout_next = t else timeout_head = t;
+    timeout_tail = t;
+    t.timeout_linked = true;
+    timeout_count += 1;
+}
+
+fn unlinkTimeoutLocked(t: *Task) void {
+    if (!t.timeout_linked) return;
+    if (t.timeout_prev) |previous| previous.timeout_next = t.timeout_next else timeout_head = t.timeout_next;
+    if (t.timeout_next) |following| following.timeout_prev = t.timeout_prev else timeout_tail = t.timeout_prev;
+    t.timeout_prev = null;
+    t.timeout_next = null;
+    t.timeout_linked = false;
+    if (timeout_count != 0) timeout_count -= 1;
+}
+
+fn linkReapLocked(t: *Task) void {
+    if (t.reap_linked or !t.retire_pending or t.release_in_progress) return;
+    t.reap_prev = reap_tail;
+    t.reap_next = null;
+    if (reap_tail) |tail| tail.reap_next = t else reap_head = t;
+    reap_tail = t;
+    t.reap_linked = true;
+    reap_count += 1;
+}
+
+fn unlinkReapLocked(t: *Task) void {
+    if (!t.reap_linked) return;
+    if (t.reap_prev) |previous| previous.reap_next = t.reap_next else reap_head = t.reap_next;
+    if (t.reap_next) |following| following.reap_prev = t.reap_prev else reap_tail = t.reap_prev;
+    t.reap_prev = null;
+    t.reap_next = null;
+    t.reap_linked = false;
+    if (reap_count != 0) reap_count -= 1;
+}
+
+fn rotateReapHeadLocked(t: *Task) void {
+    if (!t.reap_linked or reap_head != t or reap_tail == t) return;
+    unlinkReapLocked(t);
+    linkReapLocked(t);
 }
 
 fn bumpInventoryMutationEpochLocked() void {
@@ -1131,6 +1259,203 @@ pub fn nextCircular(t: *const Task) ?*Task {
     return t.registry_next orelse registry_head;
 }
 
+// Scheduler-only intrusive views. All membership transitions happen with
+// interrupts disabled; scheduler selection and timer dispatch already run in
+// that same boundary and therefore never touch the global registry.
+pub fn firstReady() ?*Task {
+    return ready_head;
+}
+
+pub fn nextReady(t: *const Task) ?*Task {
+    return t.ready_next;
+}
+
+pub fn readyCount() usize {
+    return ready_count;
+}
+
+pub fn hasHigherPriorityReady(priority: Priority) bool {
+    const limit = priorityIndex(priority);
+    var index: usize = 0;
+    while (index < limit) : (index += 1) {
+        if (ready_priority_counts[index] != 0) return true;
+    }
+    return false;
+}
+
+pub fn firstTimedWait() ?*Task {
+    return timeout_head;
+}
+
+pub fn nextTimedWait(t: *const Task) ?*Task {
+    return t.timeout_next;
+}
+
+pub fn timedWaitCount() usize {
+    return timeout_count;
+}
+
+pub fn deferredReapCount() usize {
+    return reap_count + rollback_retry_count;
+}
+
+pub const ReapStats = struct {
+    passes: u64 = 0,
+    candidate_visits: u64 = 0,
+    pending: usize = 0,
+};
+
+pub fn reapStats() ReapStats {
+    return .{
+        .passes = reap_pass_count,
+        .candidate_visits = reap_candidate_visit_count,
+        .pending = deferredReapCount(),
+    };
+}
+
+pub const QueueSnapshot = struct {
+    registry: usize = 0,
+    ready: usize = 0,
+    timed: usize = 0,
+    reap: usize = 0,
+    valid: bool = true,
+};
+
+// Bounded diagnostic for the existing TASKREGISTRY gate. It proves that each
+// scheduler list is an exact projection of the stable ownership registry;
+// production dispatch itself never calls this registry traversal.
+pub fn queueSnapshot() QueueSnapshot {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+
+    var out: QueueSnapshot = .{};
+    var expected_ready: usize = 0;
+    var expected_timed: usize = 0;
+    var expected_reap: usize = 0;
+    var expected_priorities: [3]usize = .{0} ** 3;
+    var previous: ?*Task = null;
+    var cursor = registry_head;
+    while (cursor) |candidate| {
+        out.registry += 1;
+        if (out.registry > task_count) {
+            out.valid = false;
+            break;
+        }
+        if (candidate.registry_prev != previous) out.valid = false;
+        const should_be_ready = candidate.state == .ready;
+        const should_be_timed = candidate.state == .blocked and candidate.wake_tick != 0;
+        const should_be_reaped = candidate.retire_pending and !candidate.release_in_progress;
+        if (candidate.ready_linked != should_be_ready or
+            candidate.timeout_linked != should_be_timed or
+            candidate.reap_linked != should_be_reaped)
+        {
+            out.valid = false;
+        }
+        if (should_be_ready) {
+            expected_ready += 1;
+            expected_priorities[priorityIndex(candidate.priority)] += 1;
+        }
+        if (should_be_timed) expected_timed += 1;
+        if (should_be_reaped) expected_reap += 1;
+        previous = candidate;
+        cursor = candidate.registry_next;
+    }
+    if (out.registry != task_count or previous != registry_tail) out.valid = false;
+
+    previous = null;
+    cursor = ready_head;
+    var observed_priorities: [3]usize = .{0} ** 3;
+    while (cursor) |candidate| {
+        out.ready += 1;
+        if (out.ready > ready_count) {
+            out.valid = false;
+            break;
+        }
+        if (!candidate.ready_linked or candidate.state != .ready or candidate.ready_prev != previous) out.valid = false;
+        observed_priorities[priorityIndex(candidate.priority)] += 1;
+        previous = candidate;
+        cursor = candidate.ready_next;
+    }
+    var priorities_match = true;
+    for (observed_priorities, ready_priority_counts, expected_priorities) |observed, tracked, expected| {
+        if (observed != tracked or observed != expected) priorities_match = false;
+    }
+    if (out.ready != ready_count or out.ready != expected_ready or previous != ready_tail or !priorities_match)
+        out.valid = false;
+
+    previous = null;
+    cursor = timeout_head;
+    while (cursor) |candidate| {
+        out.timed += 1;
+        if (out.timed > timeout_count) {
+            out.valid = false;
+            break;
+        }
+        if (!candidate.timeout_linked or candidate.state != .blocked or candidate.wake_tick == 0 or candidate.timeout_prev != previous) out.valid = false;
+        previous = candidate;
+        cursor = candidate.timeout_next;
+    }
+    if (out.timed != timeout_count or out.timed != expected_timed or previous != timeout_tail) out.valid = false;
+
+    previous = null;
+    cursor = reap_head;
+    while (cursor) |candidate| {
+        out.reap += 1;
+        if (out.reap > reap_count) {
+            out.valid = false;
+            break;
+        }
+        if (!candidate.reap_linked or !candidate.retire_pending or candidate.release_in_progress or candidate.reap_prev != previous) out.valid = false;
+        previous = candidate;
+        cursor = candidate.reap_next;
+    }
+    if (out.reap != reap_count or out.reap != expected_reap or previous != reap_tail) out.valid = false;
+    return out;
+}
+
+pub fn setPriority(t: *Task, priority: Priority) bool {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (!containsTaskLocked(t) or t.state == .unused or t.state == .dead) return false;
+    if (t.priority == priority) return true;
+    if (t.ready_linked) {
+        const old_index = priorityIndex(t.priority);
+        if (ready_priority_counts[old_index] != 0) ready_priority_counts[old_index] -= 1;
+        ready_priority_counts[priorityIndex(priority)] += 1;
+    }
+    t.priority = priority;
+    return true;
+}
+
+// Binding is only accepted before a task can execute. The owner object must
+// outlive the task; R4X retirement already releases the Task before freeing
+// ProgramThread or AsyncIoRequest storage.
+pub fn bindExecutionOwner(t: *Task, kind: ExecutionOwnerKind, context: *anyopaque) bool {
+    if (kind == .none) return false;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (!containsTaskLocked(t) or t.state != .blocked or t.execution_owner_context != null) return false;
+    t.execution_owner_kind = kind;
+    t.execution_owner_context = context;
+    return true;
+}
+
+pub fn clearExecutionOwner(t: *Task, context: *const anyopaque) bool {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (!containsTaskLocked(t) or t.state != .blocked or t.execution_owner_context != @constCast(context)) return false;
+    t.execution_owner_kind = .none;
+    t.execution_owner_context = null;
+    return true;
+}
+
+pub fn executionOwner(t: *const Task) ExecutionOwner {
+    return .{
+        .kind = t.execution_owner_kind,
+        .context = t.execution_owner_context,
+    };
+}
+
 pub fn ordinalOf(wanted: *const Task) ?usize {
     const irq_flags = interrupts.saveAndDisable();
     defer interrupts.restore(irq_flags);
@@ -1178,17 +1503,27 @@ pub fn validFpuStateCount() u32 {
 }
 
 pub fn markReady(t: *Task, now: u64) void {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (t.state == .unused or t.state == .dead) return;
     const was_durably_blocked = t.state == .blocked;
+    unlinkTimeoutLocked(t);
     t.state = .ready;
     t.ready_since_tick = now;
-    if (was_durably_blocked) bumpInventoryMutationEpoch();
+    linkReadyLocked(t);
+    if (was_durably_blocked) bumpInventoryMutationEpochLocked();
 }
 
 pub fn markRunning(t: *Task) void {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (t.state == .unused or t.state == .dead) return;
     const was_durably_blocked = t.state == .blocked;
+    unlinkReadyLocked(t);
+    unlinkTimeoutLocked(t);
     t.state = .running;
     t.ready_since_tick = 0;
-    if (was_durably_blocked) bumpInventoryMutationEpoch();
+    if (was_durably_blocked) bumpInventoryMutationEpochLocked();
 }
 
 pub fn recordScheduled(t: *Task, now: u64) u64 {
@@ -1307,6 +1642,33 @@ pub fn unpin(t: *Task) bool {
     return true;
 }
 
+fn transitionToDeadLocked(t: *Task, result: WaitResult, retire: bool) void {
+    _ = wait_node.detach(&t.wait_node);
+    unlinkReadyLocked(t);
+    unlinkTimeoutLocked(t);
+    t.state = .dead;
+    t.ready_since_tick = 0;
+    t.wake_tick = 0;
+    t.blocked_since_tick = 0;
+    t.wait_reason = "";
+    t.wait_object = 0;
+    t.wait_result = result;
+    if (retire) {
+        t.retire_pending = true;
+        linkReapLocked(t);
+    }
+    bumpInventoryMutationEpochLocked();
+}
+
+pub fn finishCurrentForExit(t: *Task, retire: bool) bool {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (!containsTaskLocked(t) or t.state == .unused or t.state == .dead) return false;
+    if (t.held_lock_count != 0 or t.unwind_guard_count != 0) return false;
+    transitionToDeadLocked(t, .killed, retire);
+    return true;
+}
+
 pub fn kill(id: u32) bool {
     const irq_flags = interrupts.saveAndDisable();
     defer interrupts.restore(irq_flags);
@@ -1325,15 +1687,7 @@ pub fn kill(id: u32) bool {
         kill_held_lock_deferrals +%= 1;
         return false;
     }
-    _ = wait_node.detach(&target.wait_node);
-    target.state = .dead;
-    target.ready_since_tick = 0;
-    target.wake_tick = 0;
-    target.blocked_since_tick = 0;
-    target.wait_reason = "";
-    target.wait_object = 0;
-    target.wait_result = .killed;
-    bumpInventoryMutationEpochLocked();
+    transitionToDeadLocked(target, .killed, false);
     return true;
 }
 
@@ -1348,15 +1702,7 @@ pub fn killIdentity(id: u32, generation: u64) bool {
         kill_held_lock_deferrals +%= 1;
         return false;
     }
-    _ = wait_node.detach(&target.wait_node);
-    target.state = .dead;
-    target.ready_since_tick = 0;
-    target.wake_tick = 0;
-    target.blocked_since_tick = 0;
-    target.wait_reason = "";
-    target.wait_object = 0;
-    target.wait_result = .killed;
-    bumpInventoryMutationEpochLocked();
+    transitionToDeadLocked(target, .killed, false);
     return true;
 }
 
@@ -1389,6 +1735,7 @@ pub fn releaseDead(id: u32) bool {
         return false;
     }
     target.retire_pending = true;
+    linkReapLocked(target);
     if (isCurrentTask(target)) {
         recycle_guard_hits +%= 1;
         k.puts("TASK RECYCLE GUARD: releaseDead deferred for current task (id=");
@@ -1424,6 +1771,7 @@ pub fn releaseDeadIdentity(id: u32, generation: u64) bool {
         return false;
     }
     target.retire_pending = true;
+    linkReapLocked(target);
     if (isCurrentTask(target)) {
         recycle_guard_hits +%= 1;
         interrupts.restore(irq_flags);
@@ -1470,17 +1818,10 @@ pub fn retireIdentity(id: u32, generation: u64) RetireResult {
             interrupts.restore(irq_flags);
             return .pending;
         }
-        _ = wait_node.detach(&target.wait_node);
-        target.state = .dead;
-        target.ready_since_tick = 0;
-        target.wake_tick = 0;
-        target.blocked_since_tick = 0;
-        target.wait_reason = "";
-        target.wait_object = 0;
-        target.wait_result = .killed;
-        bumpInventoryMutationEpochLocked();
+        transitionToDeadLocked(target, .killed, true);
     }
     target.retire_pending = true;
+    linkReapLocked(target);
     if (target.pin_count != 0 or
         !wait_node.isDetached(&target.wait_node) or
         target.held_lock_count != 0 or
@@ -1519,6 +1860,7 @@ fn claimTaskReleaseLocked(t: *Task) ?task_context.UnwindToken {
     const token = task_context.enterUnwind();
     if (!token.admitted()) return null;
     t.release_in_progress = true;
+    unlinkReapLocked(t);
     return token;
 }
 
@@ -1528,25 +1870,30 @@ fn claimTaskReleaseLocked(t: *Task) ?task_context.UnwindToken {
 // immediate retry spin while preserving retire_pending and the exact Range ID.
 pub fn reapDeferred() u32 {
     var reaped: u32 = 0;
-    while (true) {
+    reap_pass_count +%= 1;
+    const snapshot_flags = interrupts.saveAndDisable();
+    var remaining = reap_count;
+    interrupts.restore(snapshot_flags);
+    while (remaining != 0) : (remaining -= 1) {
         const irq_flags = interrupts.saveAndDisable();
         var victim: ?*Task = null;
         var release_token: ?task_context.UnwindToken = null;
-        var cursor = registry_head;
-        while (cursor) |candidate| {
-            const following = candidate.registry_next;
+        if (reap_head) |candidate| {
+            reap_candidate_visit_count +%= 1;
             if (claimTaskReleaseLocked(candidate)) |token| {
                 victim = candidate;
                 release_token = token;
-                break;
+            } else {
+                // Ineligible pins/current ownership remain a relevant reaper
+                // candidate, but each is inspected at most once per pass.
+                rotateReapHeadLocked(candidate);
             }
-            cursor = following;
         }
         interrupts.restore(irq_flags);
 
-        const retired = victim orelse break;
-        if (!completeTaskRelease(retired, release_token.?)) break;
-        reaped +%= 1;
+        if (victim) |retired| {
+            if (completeTaskRelease(retired, release_token.?)) reaped +%= 1;
+        }
     }
     _ = retryOneUnpublishedRollback();
     return reaped;
@@ -1562,7 +1909,10 @@ fn completeTaskRelease(t: *Task, release_token: task_context.UnwindToken) bool {
 
     const irq_flags = interrupts.saveAndDisable();
     if (!containsTaskLocked(t) or !t.release_in_progress or !releaseEligibleLocked(t)) {
-        if (containsTaskLocked(t)) t.release_in_progress = false;
+        if (containsTaskLocked(t)) {
+            t.release_in_progress = false;
+            linkReapLocked(t);
+        }
         interrupts.restore(irq_flags);
         k.puts("TASK RELEASE INVARIANT: retry anchor changed\r\n");
         return false;
@@ -1572,6 +1922,7 @@ fn completeTaskRelease(t: *Task, release_token: task_context.UnwindToken) bool {
         const slot: usize = t.critical_reserve_slot;
         if (slot >= critical_reserve.len) {
             t.release_in_progress = false;
+            linkReapLocked(t);
             interrupts.restore(irq_flags);
             k.puts("Critical task reserve slot invalid\r\n");
             return false;
@@ -1579,6 +1930,7 @@ fn completeTaskRelease(t: *Task, release_token: task_context.UnwindToken) bool {
         const bundle = &critical_reserve[slot];
         if (bundle.task != t or !bundle.in_use) {
             t.release_in_progress = false;
+            linkReapLocked(t);
             interrupts.restore(irq_flags);
             k.puts("Critical task reserve ownership mismatch\r\n");
             return false;
@@ -1611,6 +1963,7 @@ fn clearTaskReleaseClaim(t: *Task) void {
     if (containsTaskLocked(t)) {
         t.release_in_progress = false;
         t.retire_pending = true;
+        linkReapLocked(t);
     }
     interrupts.restore(irq_flags);
 }
@@ -1694,6 +2047,10 @@ fn noteWakeTick(wake_tick: u64) void {
 }
 
 pub fn beginWait(t: *Task, wake_tick: u64, reason: []const u8, object: u64) void {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    unlinkReadyLocked(t);
+    unlinkTimeoutLocked(t);
     t.wake_tick = wake_tick;
     t.blocked_since_tick = timer.tickCount();
     t.wait_reason = reason;
@@ -1701,16 +2058,20 @@ pub fn beginWait(t: *Task, wake_tick: u64, reason: []const u8, object: u64) void
     t.wait_result = .none;
     t.ready_since_tick = 0;
     t.state = .blocked;
+    linkTimeoutLocked(t);
     noteWakeTick(wake_tick);
-    bumpInventoryMutationEpoch();
+    bumpInventoryMutationEpochLocked();
 }
 
 pub fn finishWait(t: *Task, result: WaitResult) u64 {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
     _ = wait_node.detach(&t.wait_node);
     const now = timer.tickCount();
     const wait_ticks = ticksSince(now, t.blocked_since_tick);
     t.last_wait_ticks = wait_ticks;
     if (wait_ticks > t.max_wait_ticks) t.max_wait_ticks = wait_ticks;
+    unlinkTimeoutLocked(t);
     t.state = .ready;
     t.ready_since_tick = now;
     t.wake_tick = 0;
@@ -1718,7 +2079,8 @@ pub fn finishWait(t: *Task, result: WaitResult) u64 {
     t.wait_reason = "";
     t.wait_object = 0;
     t.wait_result = result;
-    bumpInventoryMutationEpoch();
+    linkReadyLocked(t);
+    bumpInventoryMutationEpochLocked();
     return wait_ticks;
 }
 

@@ -48,6 +48,12 @@ var run_without_switch_max_ticks: u64 = 0;
 var quantum_overrun_count: u64 = 0;
 var quantum_overrun_max_ticks: u64 = 0;
 var preemption_deferred_max_ticks: u64 = 0;
+var reschedule_requested = false;
+var wakeup_reschedule_request_count: u64 = 0;
+var wakeup_preemption_switch_count: u64 = 0;
+var ready_candidate_visit_count: u64 = 0;
+var timeout_candidate_visit_count: u64 = 0;
+var warning_candidate_visit_count: u64 = 0;
 
 pub const WAIT_FOREVER: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 pub const timer_wait_object: u64 = 0x5449_4D45_5741_4954; // "TIMEWAIT"
@@ -160,11 +166,15 @@ pub fn init() bool {
     quantum_overrun_count = 0;
     quantum_overrun_max_ticks = 0;
     preemption_deferred_max_ticks = 0;
+    reschedule_requested = false;
+    wakeup_reschedule_request_count = 0;
+    wakeup_preemption_switch_count = 0;
+    ready_candidate_visit_count = 0;
+    timeout_candidate_visit_count = 0;
+    warning_candidate_visit_count = 0;
     external_irq_fpu_guard_entries = 0;
     external_irq_fpu_guard_mismatches = 0;
     external_irq_fpu_guard_mismatch_reported = false;
-    priority_rr_cursor_id = 0;
-    priority_rr_cursor_generation = 0;
     // 0.56.15: Recycle-Wachhund (Befund 13.2.3) - task.zig darf den Slot des
     // aktuell laufenden Tasks nie recyceln (exitCurrent laeuft auf seinem
     // Stack weiter, bis der Scheduler weggeschaltet hat).
@@ -238,14 +248,27 @@ pub fn current() ?*task.Task {
 // sofort yielden statt zu hlt'en, sonst bremst jeder Rotationsbesuch
 // das System um bis zu einen Tick.
 pub fn hasOtherReadyTask() bool {
-    if (!initialized) return false;
-    const running = current_task;
-    var cursor = task.first();
-    while (cursor) |candidate| : (cursor = task.next(candidate)) {
-        if (candidate == running) continue;
-        if (candidate.state == .ready) return true;
-    }
-    return false;
+    return initialized and task.readyCount() != 0;
+}
+
+pub const StructureStats = struct {
+    ready_candidate_visits: u64 = 0,
+    timeout_candidate_visits: u64 = 0,
+    warning_candidate_visits: u64 = 0,
+    wakeup_reschedule_requests: u64 = 0,
+    wakeup_preemption_switches: u64 = 0,
+    reschedule_pending: bool = false,
+};
+
+pub fn structureStats() StructureStats {
+    return .{
+        .ready_candidate_visits = ready_candidate_visit_count,
+        .timeout_candidate_visits = timeout_candidate_visit_count,
+        .warning_candidate_visits = warning_candidate_visit_count,
+        .wakeup_reschedule_requests = wakeup_reschedule_request_count,
+        .wakeup_preemption_switches = wakeup_preemption_switch_count,
+        .reschedule_pending = reschedule_requested,
+    };
 }
 
 pub fn currentId() ?u32 {
@@ -371,7 +394,9 @@ pub fn yield() void {
         return;
     };
     task.recordYield(old, now);
-    const next_task = nextReadyTask(old) orelse {
+    const priority_wakeup = reschedule_requested and task.hasHigherPriorityReady(old.priority);
+    const next_task = nextReadyTask(priority_wakeup) orelse {
+        reschedule_requested = false;
         preemptEnable();
         interrupts.restore(irq_flags);
         return;
@@ -384,6 +409,7 @@ pub fn yield() void {
     preemptEnable();
     current_task = next_task;
     task_context.bind(&next_task.unwind_guard_count);
+    refreshRescheduleRequest(next_task);
     r4os_context_switch(&old.rsp, next_task.rsp);
     interrupts.restore(irq_flags);
     _ = task.reapDeferred();
@@ -395,7 +421,11 @@ pub fn preemptFromIrq() void {
     const old = current_task orelse return;
     if (old.state != .running) return;
 
-    const next_task = nextReadyTask(old) orelse return;
+    const wakeup_switch = reschedule_requested and task.hasHigherPriorityReady(old.priority);
+    const next_task = nextReadyTask(wakeup_switch) orelse {
+        reschedule_requested = false;
+        return;
+    };
 
     task.markReady(old, now);
     recordReadyLatency(task.recordScheduled(next_task, now));
@@ -404,6 +434,10 @@ pub fn preemptFromIrq() void {
     task.restoreFpuState(next_task);
     current_task = next_task;
     task_context.bind(&next_task.unwind_guard_count);
+    if (wakeup_switch and @intFromEnum(next_task.priority) < @intFromEnum(old.priority)) {
+        wakeup_preemption_switch_count +%= 1;
+    }
+    refreshRescheduleRequest(next_task);
     r4os_context_switch(&old.rsp, next_task.rsp);
 }
 
@@ -475,6 +509,49 @@ pub fn wakeTask(target: *task.Task, result: task.WaitResult) bool {
         .cancelled => object_cancel_count +%= 1,
         else => {},
     }
+    if (current_task) |running| {
+        if (running.state == .running and @intFromEnum(target.priority) < @intFromEnum(running.priority)) {
+            reschedule_requested = true;
+            wakeup_reschedule_request_count +%= 1;
+        }
+    }
+    return true;
+}
+
+// A wake only publishes ready state while the wait queue still owns its
+// critical section. IRQ dispatch calls this after all handlers and EOIs, so a
+// higher-priority task can take over without switching inside a queue lock.
+pub fn preemptPendingWake(preemptible_instruction_pointer: bool) bool {
+    if (!reschedule_requested or !initialized) return false;
+    const running = current_task orelse return false;
+    if (running.state != .running) return false;
+    if (!task.hasHigherPriorityReady(running.priority)) {
+        reschedule_requested = false;
+        return false;
+    }
+    const scheduled_ticks = ticksSince(timer.tickCount(), running.last_scheduled_tick);
+    preemption_eligible_tick_count +%= 1;
+    task.recordPreemptionProbe(running);
+    if (currentPreemptDepth() != 0) {
+        preemption_deferred_critical_count +%= 1;
+        task.recordPreemptionDeferred(running, scheduled_ticks);
+        recordPreemptionDeferredWindow(scheduled_ticks);
+        return false;
+    }
+    if (!preemptible_instruction_pointer) {
+        preemption_deferred_kernel_ip_count +%= 1;
+        task.recordPreemptionDeferred(running, scheduled_ticks);
+        recordPreemptionDeferredWindow(scheduled_ticks);
+        return false;
+    }
+    if (preemption_enabled == 0) {
+        preemption_deferred_disabled_count +%= 1;
+        task.recordPreemptionDeferred(running, scheduled_ticks);
+        recordPreemptionDeferredWindow(scheduled_ticks);
+        return false;
+    }
+    preemption_app_code_tick_count +%= 1;
+    preemption_switch_tick_count +%= 1;
     return true;
 }
 
@@ -499,14 +576,12 @@ fn exitCurrentImpl(retire: bool) noreturn {
             k.puts("\r\n");
             interrupts.haltForever();
         }
-        _ = task.detachWait(t);
-        t.state = .dead;
-        t.wake_tick = 0;
-        t.blocked_since_tick = 0;
-        t.wait_reason = "";
-        t.wait_object = 0;
-        t.wait_result = .killed;
-        t.retire_pending = retire;
+        if (!task.finishCurrentForExit(t, retire)) {
+            k.puts("TASK EXIT INVARIANT: transition rejected id=");
+            k.putDec(t.id);
+            k.puts("\r\n");
+            interrupts.haltForever();
+        }
     }
     preemptEnable();
     interrupts.restore(irq_flags);
@@ -545,14 +620,16 @@ pub fn onTick(now: u64, preemptible_instruction_pointer: bool) bool {
     // berechnet sie hier als einziger neu (nach oben).
     if (now >= task.minWakeTick()) {
         var next_min: u64 = task.NO_WAKE_TICK;
-        var cursor = task.first();
-        while (cursor) |candidate| : (cursor = task.next(candidate)) {
-            if (candidate.state != .blocked or candidate.wake_tick == 0) continue;
+        var cursor = task.firstTimedWait();
+        while (cursor) |candidate| {
+            const following = task.nextTimedWait(candidate);
+            timeout_candidate_visit_count +%= 1;
             if (now >= candidate.wake_tick) {
                 _ = wakeTask(candidate, .timeout);
             } else if (candidate.wake_tick < next_min) {
                 next_min = candidate.wake_tick;
             }
+            cursor = following;
         }
         task.setMinWakeTick(next_min);
     }
@@ -663,21 +740,24 @@ fn runTimerPreemption(now: u64, preemptible_instruction_pointer: bool) bool {
         return false;
     }
     // This is only an eligibility probe. It must not consume a priority
-    // selection or advance the independent fairness cursor; the IRQ switch
-    // performs the one authoritative ready-task selection afterwards.
-    if (!hasReadyTaskExcluding(running)) {
+    // selection or an anti-starvation turn; the IRQ switch performs the one
+    // authoritative ready-task selection afterwards.
+    if (task.readyCount() == 0) {
+        reschedule_requested = false;
         preemption_deferred_no_ready_count +%= 1;
         return false;
     }
+    const priority_wakeup = reschedule_requested and task.hasHigherPriorityReady(running.priority);
+    if (reschedule_requested and !priority_wakeup) reschedule_requested = false;
     const scheduled_ticks = ticksSince(now, running.last_scheduled_tick);
-    if (scheduled_ticks < @as(u64, preemption_quantum_ticks)) {
+    if (!priority_wakeup and scheduled_ticks < @as(u64, preemption_quantum_ticks)) {
         preemption_deferred_quantum_count +%= 1;
         task.recordPreemptionDeferred(running, scheduled_ticks);
         recordPreemptionDeferredWindow(scheduled_ticks);
         return false;
     }
 
-    preemption_quantum_expired_count +%= 1;
+    if (!priority_wakeup) preemption_quantum_expired_count +%= 1;
     preemption_eligible_tick_count +%= 1;
     task.recordPreemptionProbe(running);
     if (currentPreemptDepth() != 0) {
@@ -721,9 +801,9 @@ fn recordRuntimeWarnings(now: u64) void {
     if ((now & 0xF) != 0) return;
     // 0.56.13 (Befund 4.4): Starvation-Scan nur mit Metrics (-Dmetrics).
     if (comptime !config.enable_metrics) return;
-    var cursor = task.first();
-    while (cursor) |candidate| : (cursor = task.next(candidate)) {
-        if (candidate.state != .ready) continue;
+    var cursor = task.firstReady();
+    while (cursor) |candidate| : (cursor = task.nextReady(candidate)) {
+        warning_candidate_visit_count +%= 1;
         const base_tick = if (candidate.ready_since_tick != 0)
             candidate.ready_since_tick
         else
@@ -774,8 +854,8 @@ fn ticksSince(now: u64, then: u64) u64 {
 }
 
 // 0.56.18: Prioritaetsbewusste Auswahl (Befund 4.1). Beste Klasse gewinnt;
-// innerhalb der Klasse bleibt die Rotation ab start+1 erhalten (Round-
-// Robin). Anti-Starvation: jede 8. Auswahl ist reines Round-Robin, damit
+// innerhalb der Klasse liefert die Ready-FIFO Round-Robin. Anti-Starvation:
+// jede 8. Auswahl nimmt den FIFO-Kopf unabhaengig von der Prioritaet, damit
 // NORMAL/LOW unter HIGH-Dauerlast garantiert drankommen.
 const PRIORITY_RR_INTERVAL: u64 = 8;
 
@@ -784,67 +864,30 @@ var priority_picks_high: u64 = 0;
 var priority_picks_normal: u64 = 0;
 var priority_picks_low: u64 = 0;
 var priority_rr_picks: u64 = 0;
-var priority_rr_cursor_id: u32 = 0;
-var priority_rr_cursor_generation: u64 = 0;
-
-fn hasReadyTaskExcluding(excluded: *task.Task) bool {
-    var cursor = task.first();
-    while (cursor) |candidate| : (cursor = task.next(candidate)) {
-        if (candidate != excluded and candidate.state == .ready) return true;
+fn refreshRescheduleRequest(running: *task.Task) void {
+    if (reschedule_requested) {
+        reschedule_requested = task.hasHigherPriorityReady(running.priority);
     }
-    return false;
 }
 
-fn plainNextReadyTask(start: *task.Task) ?*task.Task {
-    var anchor = start;
-    if (priority_rr_cursor_id != 0) {
-        var saved_cursor = task.first();
-        while (saved_cursor) |saved| : (saved_cursor = task.next(saved)) {
-            if (saved.id == priority_rr_cursor_id and saved.generation == priority_rr_cursor_generation) {
-                anchor = saved;
-                break;
-            }
-        }
-    }
-
-    var cursor = task.nextCircular(anchor) orelse return null;
-    while (cursor != anchor) : (cursor = task.nextCircular(cursor) orelse return null) {
-        if (cursor == start) continue;
-        if (cursor.state == .ready) {
-            priority_rr_cursor_id = cursor.id;
-            priority_rr_cursor_generation = cursor.generation;
-            return cursor;
-        }
-    }
-
-    // The saved cursor may be the only ready task besides the current one.
-    // Fall back to one complete scan from current without retaining a raw
-    // pointer; the next fairness pass resumes after the selected identity.
-    cursor = task.nextCircular(start) orelse return null;
-    while (cursor != start) : (cursor = task.nextCircular(cursor) orelse return null) {
-        if (cursor.state == .ready) {
-            priority_rr_cursor_id = cursor.id;
-            priority_rr_cursor_generation = cursor.generation;
-            return cursor;
-        }
-    }
-    return null;
+fn plainNextReadyTask() ?*task.Task {
+    ready_candidate_visit_count +%= 1;
+    return task.firstReady();
 }
 
-fn nextReadyTask(start: *task.Task) ?*task.Task {
+fn nextReadyTask(force_priority: bool) ?*task.Task {
     priority_selects +%= 1;
-    if (priority_selects % PRIORITY_RR_INTERVAL == 0) {
-        const selected = plainNextReadyTask(start);
+    if (!force_priority and priority_selects % PRIORITY_RR_INTERVAL == 0) {
+        const selected = plainNextReadyTask();
         if (selected != null) priority_rr_picks +%= 1;
         return selected;
     }
 
     var best: ?*task.Task = null;
     var best_prio: u8 = 255;
-    var cursor = task.nextCircular(start) orelse return null;
-    while (cursor != start) : (cursor = task.nextCircular(cursor) orelse return null) {
-        const candidate = cursor;
-        if (candidate.state != .ready) continue;
+    var cursor = task.firstReady();
+    while (cursor) |candidate| : (cursor = task.nextReady(candidate)) {
+        ready_candidate_visit_count +%= 1;
         const p = @intFromEnum(candidate.priority);
         if (p < best_prio) {
             best_prio = p;
@@ -907,14 +950,14 @@ pub fn prioritySelfTest() bool {
     }
 
     const old_priority = me.priority;
-    me.priority = .high;
+    if (!task.setPriority(me, .high)) return false;
     me.max_ready_latency_ticks = 0;
     var round: u32 = 0;
     while (round < ST_PRIO_ROUNDS) : (round += 1) {
         sleepTicksWithReason(1, "schedprio");
     }
     const high_latency_max = me.max_ready_latency_ticks;
-    me.priority = old_priority;
+    _ = task.setPriority(me, old_priority);
     st_prio_busy_stop = true;
     // Busy-Threads sehen das Stop-Flag beim naechsten Spin-Check und
     // beenden sich selbst (exitCurrent via Trampolin).
