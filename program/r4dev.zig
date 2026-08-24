@@ -1440,10 +1440,13 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v7_size: usize = @offsetOf(ProgramPerformanceSummary, "hot_path_memory_block_physical_index_entries");
     const v8_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_drive_gate_count");
     const v9_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_bulk_write_requests");
-    const v10_size: usize = @sizeOf(ProgramPerformanceSummary);
+    const v10_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_policy_version");
+    const v11_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v10_size)
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v11_size)
         performance_snapshot_version
+    else if (caller_version >= 10 and caller_size >= v10_size)
+        10
     else if (caller_version >= 9 and caller_size >= v9_size)
         9
     else if (caller_version >= 8 and caller_size >= v8_size)
@@ -1472,7 +1475,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         7 => v7_size,
         8 => v8_size,
         9 => v9_size,
-        else => v10_size,
+        10 => v10_size,
+        else => v11_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -2019,6 +2023,29 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .fs_cache_selective_flushes = fs_cache.selective_flushes,
         .fs_cache_selective_writeback_sectors = fs_cache.selective_writeback_sectors,
         .fs_cache_selective_foreign_dirty_sectors_skipped = fs_cache.selective_foreign_dirty_sectors_skipped,
+        .fs_cache_policy_version = fs_cache.policy_version,
+        .fs_cache_policy_device_capacity = fs_cache.policy_device_capacity,
+        .fs_cache_policy_dirty_high_pages = fs_cache.policy_dirty_high_pages,
+        .fs_cache_policy_dirty_low_pages = fs_cache.policy_dirty_low_pages,
+        .fs_cache_policy_max_dirty_age_ticks = fs_cache.policy_max_dirty_age_ticks,
+        .fs_cache_policy_background_page_budget = fs_cache.policy_background_page_budget,
+        .fs_cache_policy_worker_started = fs_cache.policy_worker_started,
+        .fs_cache_policy_worker_task_id = fs_cache.policy_worker_task_id,
+        .fs_cache_policy_device_dirty_high_water = fs_cache.policy_device_dirty_high_water,
+        .fs_cache_policy_worker_wakeups = fs_cache.policy_worker_wakeups,
+        .fs_cache_policy_background_drains = fs_cache.policy_background_drains,
+        .fs_cache_policy_background_sectors = fs_cache.policy_background_sectors,
+        .fs_cache_policy_background_pressure_drains = fs_cache.policy_background_pressure_drains,
+        .fs_cache_policy_background_age_drains = fs_cache.policy_background_age_drains,
+        .fs_cache_policy_background_errors = fs_cache.policy_background_errors,
+        .fs_cache_policy_clean_device_probes = fs_cache.policy_clean_device_probes,
+        .fs_cache_policy_dirty_device_probes = fs_cache.policy_dirty_device_probes,
+        .fs_cache_policy_full_scan_fallbacks = fs_cache.policy_full_scan_fallbacks,
+        .fs_cache_read_ahead_requests = fs_cache.read_ahead_requests,
+        .fs_cache_read_ahead_issued = fs_cache.read_ahead_issued,
+        .fs_cache_read_ahead_hits = fs_cache.read_ahead_hits,
+        .fs_cache_read_ahead_cancellations = fs_cache.read_ahead_cancellations,
+        .fs_cache_read_ahead_budget_skips = fs_cache.read_ahead_budget_skips,
         .fs_cache_clean_reclaimable_entries = fs_cache.clean_reclaimable_entries,
         .fs_cache_dirty_non_reclaimable_entries = fs_cache.dirty_non_reclaimable_entries,
         .fs_cache_pagefile_ready = 0,

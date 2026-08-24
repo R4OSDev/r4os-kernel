@@ -11,6 +11,7 @@ const loader_perf = @import("loader_perf.zig");
 const log = @import("log.zig");
 const memory_boot = @import("memory_boot.zig");
 const memory_reclaim = @import("../memory/reclaim.zig");
+const page_cache = @import("../fs/page_cache.zig");
 const r4p = @import("../program/r4p.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const shell_launcher = @import("shell_launcher.zig");
@@ -57,6 +58,12 @@ pub fn initTaskRuntime() bool {
         return false;
     }
     log.puts("  Block worker ");
+    log.puts("[OK]\r\n");
+
+    if (!page_cache.startPolicyWorker()) {
+        return false;
+    }
+    log.puts("  Page-cache policy worker ");
     log.puts("[OK]\r\n");
 
     task_runtime_initialized = true;

@@ -32,14 +32,17 @@ const timer = @import("../kernel/timer.zig");
 const heap = @import("../memory/heap.zig");
 const mem_phys = @import("../memory/phys.zig");
 const page_cache_batch = @import("page_cache_batch.zig");
+const page_cache_policy = @import("page_cache_policy.zig");
 const sync = @import("../sched/sync.zig");
 const scheduler = @import("../sched/scheduler.zig");
+const sched_task = @import("../sched/task.zig");
 const task_context = @import("../sched/task_context.zig");
 
 pub const SECTOR_SIZE: usize = 512;
 const PAGE_SECTORS: usize = 8;
 const PAGE_BYTES: usize = PAGE_SECTORS * SECTOR_SIZE;
 const MAX_ENTRIES: usize = 512;
+const MAX_DEVICES: usize = page_cache_policy.max_devices;
 const BUCKET_COUNT: usize = 1024;
 const MAX_WRITEBACK_RETRIES: usize = 1;
 const PAYLOAD_FRAME_BYTES: usize = 4096;
@@ -52,6 +55,19 @@ const FULL_MASK: u8 = 0xFF;
 // 0.56.40: hz-neutral (3600 s Wachhund; bei 100 Hz wie zuvor 360000).
 const LOCK_TIMEOUT_TICKS: u64 = 3600 * @as(u64, timer.DEFAULT_HZ);
 const BUSY_WAIT_LIMIT_TICKS: usize = 5 * @as(usize, timer.DEFAULT_HZ);
+const POLICY_VERSION: u32 = 1;
+const BACKGROUND_INTERVAL_TICKS: u64 = @max(1, @as(u64, timer.DEFAULT_HZ) / 4);
+const BACKGROUND_REQUEUE_TICKS: u64 = @max(1, @as(u64, timer.DEFAULT_HZ) / 100);
+const BACKGROUND_FAILURE_BACKOFF_TICKS: u64 = @as(u64, timer.DEFAULT_HZ);
+const MAX_DIRTY_AGE_TICKS: u64 = 2 * @as(u64, timer.DEFAULT_HZ);
+const BACKGROUND_PAGE_BUDGET: usize = 4;
+const READ_AHEAD_TRIGGER_SECTORS: u32 = PAGE_SECTORS * 2;
+const READ_AHEAD_RESIDENT_PAGES_PER_DEVICE: u16 = 2;
+const READ_AHEAD_FREE_FLOOR: u16 = 32;
+
+comptime {
+    if (MAX_ENTRIES != page_cache_policy.max_entries) @compileError("page-cache policy entry capacity mismatch");
+}
 
 pub const Summary = struct {
     enabled: bool = false,
@@ -111,6 +127,29 @@ pub const Summary = struct {
     selective_flushes: u64 = 0,
     selective_writeback_sectors: u64 = 0,
     selective_foreign_dirty_sectors_skipped: u64 = 0,
+    policy_version: u32 = POLICY_VERSION,
+    policy_device_capacity: u32 = MAX_DEVICES,
+    policy_dirty_high_pages: u32 = page_cache_policy.dirty_high_pages,
+    policy_dirty_low_pages: u32 = page_cache_policy.dirty_low_pages,
+    policy_max_dirty_age_ticks: u64 = MAX_DIRTY_AGE_TICKS,
+    policy_background_page_budget: u32 = BACKGROUND_PAGE_BUDGET,
+    policy_worker_started: u32 = 0,
+    policy_worker_task_id: u32 = 0,
+    policy_worker_wakeups: u64 = 0,
+    policy_background_drains: u64 = 0,
+    policy_background_sectors: u64 = 0,
+    policy_background_pressure_drains: u64 = 0,
+    policy_background_age_drains: u64 = 0,
+    policy_background_errors: u64 = 0,
+    policy_clean_device_probes: u64 = 0,
+    policy_dirty_device_probes: u64 = 0,
+    policy_full_scan_fallbacks: u64 = 0,
+    policy_device_dirty_high_water: u32 = 0,
+    read_ahead_requests: u64 = 0,
+    read_ahead_issued: u64 = 0,
+    read_ahead_hits: u64 = 0,
+    read_ahead_cancellations: u64 = 0,
+    read_ahead_budget_skips: u64 = 0,
 };
 
 /// Identifies the dirty sectors produced by one filesystem mutation.  Zero is
@@ -138,10 +177,23 @@ const Entry = struct {
     dirty_mask: u8 = 0,
     last_use: u64 = 0,
     dirty_sequence: u64 = 0,
+    dirty_since_tick: u64 = 0,
     dirty_owner: [PAGE_SECTORS]WriteBatch = .{NO_WRITE_BATCH} ** PAGE_SECTORS,
     dirty_write_sequence: [PAGE_SECTORS]u64 = .{0} ** PAGE_SECTORS,
+    read_ahead: bool = false,
     phys_addr: u64 = 0,
     next: u16 = NO_INDEX,
+};
+
+const BackgroundReason = enum {
+    pressure,
+    age,
+};
+
+const BackgroundSelection = struct {
+    index: usize,
+    device_index: usize,
+    reason: BackgroundReason,
 };
 
 var entries: [MAX_ENTRIES]Entry = .{Entry{}} ** MAX_ENTRIES;
@@ -152,6 +204,17 @@ var dirty_clock: u64 = 0;
 var dirty_write_clock: u64 = 0;
 var write_batch_clock: WriteBatch = NO_WRITE_BATCH;
 var dirty_entry_count: u32 = 0;
+var dirty_sector_count: u64 = 0;
+var dirty_sector_count_by_device: [MAX_DEVICES]u64 = .{0} ** MAX_DEVICES;
+var payload_frame_count: u32 = 0;
+var policy_index: page_cache_policy.Index = page_cache_policy.Index.init();
+var policy_event: sync.EventV2 = sync.EventV2.initMode(false, .auto_reset);
+var policy_worker_started = false;
+var policy_worker_task_id: u32 = 0;
+var background_failure_until: [MAX_DEVICES]u64 = .{0} ** MAX_DEVICES;
+var read_ahead_states: [MAX_DEVICES]page_cache_policy.ReadAhead =
+    .{page_cache_policy.ReadAhead{}} ** MAX_DEVICES;
+var read_ahead_device_cursor: u8 = 0;
 var cache_lock: sync.Mutex = .{};
 
 pub fn init() void {
@@ -164,13 +227,40 @@ pub fn init() void {
         .sector_bytes = SECTOR_SIZE,
         .capacity = MAX_ENTRIES,
         .payload_frame_bytes = PAYLOAD_FRAME_BYTES_U32,
+        .policy_version = POLICY_VERSION,
+        .policy_device_capacity = MAX_DEVICES,
+        .policy_dirty_high_pages = page_cache_policy.dirty_high_pages,
+        .policy_dirty_low_pages = page_cache_policy.dirty_low_pages,
+        .policy_max_dirty_age_ticks = MAX_DIRTY_AGE_TICKS,
+        .policy_background_page_budget = BACKGROUND_PAGE_BUDGET,
     };
     clock = 0;
     dirty_clock = 0;
     dirty_write_clock = 0;
     write_batch_clock = NO_WRITE_BATCH;
     dirty_entry_count = 0;
+    dirty_sector_count = 0;
+    dirty_sector_count_by_device = .{0} ** MAX_DEVICES;
+    payload_frame_count = 0;
+    policy_index = page_cache_policy.Index.init();
+    policy_event = sync.EventV2.initMode(false, .auto_reset);
+    policy_worker_started = false;
+    policy_worker_task_id = 0;
+    background_failure_until = .{0} ** MAX_DEVICES;
+    read_ahead_states = .{page_cache_policy.ReadAhead{}} ** MAX_DEVICES;
+    read_ahead_device_cursor = 0;
     cache_lock = sync.Mutex.initClass("fs-page-cache", sync.LockRank.fs_page_cache, .sleepable);
+}
+
+pub fn startPolicyWorker() bool {
+    if (policy_worker_started) return true;
+    const worker = sched_task.createKernelThreadWithRole("pgcache-wb", policyWorkerMain, .batch) orelse return false;
+    policy_worker_started = true;
+    policy_worker_task_id = worker.id;
+    stats.policy_worker_started = 1;
+    stats.policy_worker_task_id = worker.id;
+    policy_event.signal();
+    return true;
 }
 
 /// Starts an operation-scoped dirty set. The token is intentionally explicit:
@@ -191,24 +281,11 @@ pub fn summary() Summary {
     const guard = acquireLock() orelse return stats;
     defer releaseLock(guard);
     var out = stats;
-    var used: u32 = 0;
-    var dirty_pages: u32 = 0;
-    var dirty_sectors: u64 = 0;
-    var clean_pages: u32 = 0;
-    var frames: u32 = 0;
-    var index: usize = 0;
-    while (index < entries.len) : (index += 1) {
-        const e = entries[index];
-        if (e.phys_addr != 0) frames += 1;
-        if (!e.valid) continue;
-        used += 1;
-        if (e.dirty_mask != 0) {
-            dirty_pages += 1;
-            dirty_sectors += @popCount(e.dirty_mask);
-        } else {
-            clean_pages += 1;
-        }
-    }
+    const used: u32 = policy_index.entryCount();
+    const dirty_pages: u32 = dirty_entry_count;
+    const dirty_sectors = dirty_sector_count;
+    const clean_pages: u32 = used - dirty_pages;
+    const frames = payload_frame_count;
     out.enabled = true;
     out.sector_bytes = SECTOR_SIZE;
     out.capacity = MAX_ENTRIES;
@@ -225,6 +302,15 @@ pub fn summary() Summary {
     out.payload_bytes = @as(u64, frames) * PAYLOAD_FRAME_BYTES_U64;
     out.pmm_reclaimable_bytes = @as(u64, clean_pages) * PAYLOAD_FRAME_BYTES_U64;
     out.pmm_dirty_bytes = @as(u64, dirty_pages) * PAYLOAD_FRAME_BYTES_U64;
+    out.policy_worker_started = if (policy_worker_started) 1 else 0;
+    out.policy_worker_task_id = policy_worker_task_id;
+    out.policy_clean_device_probes = policy_index.clean_device_probes;
+    out.policy_dirty_device_probes = policy_index.dirty_device_probes;
+    var device_high_water: u16 = 0;
+    for (policy_index.devices) |device| {
+        if (device.dirty_high_water > device_high_water) device_high_water = device.dirty_high_water;
+    }
+    out.policy_device_dirty_high_water = device_high_water;
     return out;
 }
 
@@ -249,6 +335,7 @@ pub fn readSector(device_index: usize, lba: u64, out: []u8) bool {
     stats.reads +%= 1;
     const bit = sectorBit(lba);
     const target_page = pageLba(lba);
+    noteDemandStartLocked(device_index, target_page);
     var counted_miss = false;
     var busy_guard: usize = 0;
     while (true) {
@@ -316,6 +403,7 @@ pub fn readSector(device_index: usize, lba: u64, out: []u8) bool {
             };
             const off = sectorOffset(lba);
             entries[index].last_use = nextClock();
+            noteDemandHitLocked(index);
             // Snapshot into resident kernel-stack memory while metadata is
             // locked, then drop every cache owner before touching a pageable
             // caller buffer. preTouch was not a pin: the page could be
@@ -374,6 +462,7 @@ pub fn readSectors(device_index: usize, lba: u64, count: u32, out: []u8) bool {
     };
     defer _ = task_context.leaveUnwind(unwind);
 
+    noteDemandStartLocked(device_index, pageLba(lba));
     var done: u32 = 0;
     while (done < count) {
         const cur = lba + done;
@@ -451,6 +540,7 @@ pub fn readSectors(device_index: usize, lba: u64, count: u32, out: []u8) bool {
                 const copy_bytes = span * SECTOR_SIZE;
                 @memcpy(caller_copy[0..copy_bytes], frame_f[off_f .. off_f + copy_bytes]);
                 entries[index].last_use = nextClock();
+                noteDemandHitLocked(index);
                 releaseLock(guard);
                 @memcpy(out[@as(usize, done) * SECTOR_SIZE ..][0..copy_bytes], caller_copy[0..copy_bytes]);
                 relock(guard);
@@ -465,6 +555,7 @@ pub fn readSectors(device_index: usize, lba: u64, count: u32, out: []u8) bool {
             const copy_bytes = span * SECTOR_SIZE;
             @memcpy(caller_copy[0..copy_bytes], frame[off .. off + copy_bytes]);
             entries[index].last_use = nextClock();
+            noteDemandHitLocked(index);
             stats.hits +%= span;
             releaseLock(guard);
             @memcpy(out[@as(usize, done) * SECTOR_SIZE ..][0..copy_bytes], caller_copy[0..copy_bytes]);
@@ -481,6 +572,7 @@ pub fn readSectors(device_index: usize, lba: u64, count: u32, out: []u8) bool {
         }
         done += @intCast(span);
     }
+    scheduleReadAheadLocked(device_index, lba, count);
     return true;
 }
 
@@ -562,10 +654,14 @@ pub fn writeSectorInBatch(device_index: usize, lba: u64, data: []const u8, batch
             return false;
         };
         const off = sectorOffset(lba);
+        dropReadAheadResidencyLocked(index);
+        if (!markDirty(index, bit, batch)) {
+            stats.write_errors +%= 1;
+            return false;
+        }
         @memcpy(frame[off .. off + SECTOR_SIZE], caller_copy[0..]);
         entries[index].valid_mask |= bit;
         entries[index].last_use = nextClock();
-        markDirty(index, bit, batch);
         stats.dirty_sector_updates +%= 1;
         stats.deferred_write_requests +%= 1;
         return true;
@@ -649,6 +745,12 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
             }
             continue;
         }
+        dropReadAheadResidencyLocked(index);
+        if (!policy_index.pin(index)) {
+            releaseDirectWritePins(&owned_entries, &reserved_entries);
+            stats.write_errors +%= 1;
+            return false;
+        }
         entries[index].io_busy = true;
         const ownership_bit = @as(u64, 1) << @as(u6, @intCast(index % 64));
         owned_entries[index / 64] |= ownership_bit;
@@ -696,6 +798,7 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
             }
             if (owns_entry) {
                 entries[index].io_busy = false;
+                _ = policy_index.unpin(index, entries[index].dirty_mask != 0);
                 owned_entries[index / 64] &= ~ownership_bit;
                 const was_reserved = (reserved_entries[index / 64] & ownership_bit) != 0;
                 reserved_entries[index / 64] &= ~ownership_bit;
@@ -741,7 +844,10 @@ fn releaseDirectWritePins(
     while (index < entries.len) : (index += 1) {
         const bit = @as(u64, 1) << @as(u6, @intCast(index % 64));
         if ((owned_entries[index / 64] & bit) == 0) continue;
-        if (entries[index].io_busy) entries[index].io_busy = false;
+        if (entries[index].io_busy) {
+            entries[index].io_busy = false;
+            _ = policy_index.unpin(index, entries[index].dirty_mask != 0);
+        }
         if ((reserved_entries[index / 64] & bit) != 0 and
             entries[index].valid and
             entries[index].valid_mask == 0 and
@@ -784,6 +890,10 @@ pub fn flushDeviceBatch(device_index: usize, batch: WriteBatch) bool {
     defer _ = task_context.leaveUnwind(unwind);
     stats.flushes +%= 1;
     stats.selective_flushes +%= 1;
+    // A background writeback temporarily detaches its page from the dirty
+    // FIFO. Wait for target-device dirty pins before taking the ownership
+    // snapshot so an explicit durability boundary cannot overlook them.
+    if (!waitForDeviceDirtyIdle(guard, device_index)) return false;
     const all_dirty = dirtySectorsForDevice(device_index);
     const owned_dirty = dirtySectorsForDeviceBatch(device_index, batch);
     if (all_dirty > owned_dirty) {
@@ -857,6 +967,9 @@ pub fn invalidateDevice(device_index: usize) void {
     defer releaseLock(guard);
     const unwind = enterOperation() orelse return;
     defer _ = task_context.leaveUnwind(unwind);
+    if (device_index < MAX_DEVICES and read_ahead_states[device_index].cancelAll()) {
+        stats.read_ahead_cancellations +%= 1;
+    }
     while (true) {
         var found: ?usize = null;
         var index: usize = 0;
@@ -1007,7 +1120,8 @@ fn unlinkEntry(index: usize) void {
 
 // Legt einen leeren Eintrag (valid, ohne gueltige Sektoren) samt Frame an.
 fn createEntry(device_index: usize, page_lba: u64) ?usize {
-    const index = selectWritableSlot() orelse return null;
+    if (device_index >= MAX_DEVICES) return null;
+    const index = selectWritableSlot(device_index) orelse return null;
     const kept_phys = entries[index].phys_addr;
     entries[index] = .{
         .valid = true,
@@ -1019,6 +1133,13 @@ fn createEntry(device_index: usize, page_lba: u64) ?usize {
     if (ensurePayload(index) == null) {
         const phys = entries[index].phys_addr;
         entries[index] = .{ .phys_addr = phys };
+        _ = policy_index.release(index);
+        return null;
+    }
+    if (!policy_index.attachClean(index, device_index)) {
+        const phys = entries[index].phys_addr;
+        entries[index] = .{ .phys_addr = phys };
+        _ = policy_index.release(index);
         return null;
     }
     linkEntry(index);
@@ -1062,6 +1183,7 @@ fn fillEntryUnlocked(guard: bool, index: usize) bool {
         (@as(u8, 1) << @as(u3, @intCast(readable_sectors))) - 1;
     if ((readable_mask & ~mask_before) == 0) return false;
 
+    if (!policy_index.pin(index)) return false;
     entries[index].io_busy = true;
     releaseLock(guard);
 
@@ -1097,6 +1219,7 @@ fn fillEntryUnlocked(guard: bool, index: usize) bool {
 
     relock(guard);
     entries[index].io_busy = false;
+    _ = policy_index.unpin(index, entries[index].dirty_mask != 0);
     if (ok) {
         entries[index].valid_mask = mask_before | readable_mask;
         entries[index].last_use = nextClock();
@@ -1105,14 +1228,10 @@ fn fillEntryUnlocked(guard: bool, index: usize) bool {
     return ok;
 }
 
-fn selectWritableSlot() ?usize {
-    var index: usize = 0;
-    while (index < entries.len) : (index += 1) {
-        if (!entries[index].valid) return index;
-    }
-
+fn selectWritableSlot(preferred_device: usize) ?usize {
+    if (policy_index.claimFree()) |index| return index;
     stats.reclaim_scans +%= 1;
-    const slot = selectCleanSlot() orelse {
+    const slot = policy_index.cleanVictim(preferred_device) orelse {
         // Alles dirty oder gepinnt: KEIN Writeback hier - der wuerde
         // den Lock innerhalb eines verschachtelten Ablaufs freigeben.
         // Der Aufrufer faellt auf unkached/Write-Through zurueck;
@@ -1124,32 +1243,8 @@ fn selectWritableSlot() ?usize {
     return slot;
 }
 
-fn selectCleanSlot() ?usize {
-    var best: ?usize = null;
-    var best_use: u64 = 0;
-    var index: usize = 0;
-    while (index < entries.len) : (index += 1) {
-        if (!entries[index].valid or entries[index].dirty_mask != 0 or entries[index].io_busy) continue;
-        if (best == null or entries[index].last_use < best_use) {
-            best = index;
-            best_use = entries[index].last_use;
-        }
-    }
-    return best;
-}
-
 fn selectCleanPayloadSlot() ?usize {
-    var best: ?usize = null;
-    var best_use: u64 = 0;
-    var index: usize = 0;
-    while (index < entries.len) : (index += 1) {
-        if (!entries[index].valid or entries[index].dirty_mask != 0 or entries[index].io_busy or entries[index].phys_addr == 0) continue;
-        if (best == null or entries[index].last_use < best_use) {
-            best = index;
-            best_use = entries[index].last_use;
-        }
-    }
-    return best;
+    return policy_index.cleanVictim(null);
 }
 
 fn reclaimLocked(guard: bool, target_frames: u32, allow_dirty_drain: bool) ReclaimResult {
@@ -1187,6 +1282,8 @@ fn reclaimLocked(guard: bool, target_frames: u32, allow_dirty_drain: bool) Recla
 const DrainReason = enum {
     flush,
     pressure,
+    background_pressure,
+    background_age,
 };
 
 fn drainDevice(guard: bool, device_index: usize, reason: DrainReason) bool {
@@ -1194,7 +1291,15 @@ fn drainDevice(guard: bool, device_index: usize, reason: DrainReason) bool {
     const start = timer.tickCount();
     stats.writeback_waits +%= 1;
     var written: u64 = 0;
-    while (findOldestDirtyForDevice(device_index)) |index| {
+    while (dirtyEntriesForDevice(device_index) != 0) {
+        const index = findOldestDirtyForDevice(device_index) orelse {
+            if (device_index < MAX_DEVICES and policy_index.devices[device_index].busy_dirty != 0) {
+                if (!waitForDeviceDirtyIdle(guard, device_index)) return false;
+                continue;
+            }
+            recordDirtyIndexFallback(device_index);
+            return false;
+        };
         const before = stats.writeback_sectors;
         if (!writebackEntryUnlocked(guard, index)) return false;
         written +%= stats.writeback_sectors - before;
@@ -1204,11 +1309,19 @@ fn drainDevice(guard: bool, device_index: usize, reason: DrainReason) bool {
 }
 
 fn drainDeviceBatch(guard: bool, device_index: usize, batch: WriteBatch, reason: DrainReason) bool {
+    if (!waitForDeviceDirtyIdle(guard, device_index)) return false;
     if (dirtySectorsForDeviceBatch(device_index, batch) == 0) return true;
     const start = timer.tickCount();
     stats.writeback_waits +%= 1;
     var written: u64 = 0;
-    while (findOldestDirtyForDeviceBatch(device_index, batch)) |index| {
+    while (true) {
+        const index = findOldestDirtyForDeviceBatch(device_index, batch) orelse {
+            if (device_index < MAX_DEVICES and policy_index.devices[device_index].busy_dirty != 0) {
+                if (!waitForDeviceDirtyIdle(guard, device_index)) return false;
+                continue;
+            }
+            break;
+        };
         const before = stats.writeback_sectors;
         if (!writebackEntryBatchUnlocked(guard, index, batch)) return false;
         written +%= stats.writeback_sectors - before;
@@ -1223,7 +1336,15 @@ fn drainAll(guard: bool, reason: DrainReason) bool {
     const start = timer.tickCount();
     stats.writeback_waits +%= 1;
     var written: u64 = 0;
-    while (findOldestDirty()) |index| {
+    while (dirtyEntries() != 0) {
+        const index = findOldestDirty() orelse {
+            if (hasBusyDirty()) {
+                if (!waitForAnyDirtyIdle(guard)) return false;
+                continue;
+            }
+            recordDirtyIndexFallback(null);
+            return false;
+        };
         const before = stats.writeback_sectors;
         if (!writebackEntryUnlocked(guard, index)) return false;
         written +%= stats.writeback_sectors - before;
@@ -1277,6 +1398,10 @@ fn writebackEntrySelectedUnlocked(guard: bool, index: usize, batch: ?WriteBatch)
         stats.writeback_errors +%= 1;
         return false;
     };
+    if (!policy_index.pin(index)) {
+        stats.writeback_errors +%= 1;
+        return false;
+    }
     entries[index].io_busy = true;
     releaseLock(guard);
 
@@ -1332,62 +1457,50 @@ fn writebackEntrySelectedUnlocked(guard: bool, index: usize, batch: ?WriteBatch)
     relock(guard);
     entries[index].io_busy = false;
     clearDirtyBits(index, written_bits);
+    _ = policy_index.unpin(index, !ok or entries[index].dirty_mask != 0);
     stats.writeback_sectors +%= @popCount(written_bits);
     if (!ok) stats.writeback_errors +%= 1;
     return ok;
 }
 
 fn findOldestDirty() ?usize {
-    var best: ?usize = null;
-    var best_sequence: u64 = 0;
-    var index: usize = 0;
-    while (index < entries.len) : (index += 1) {
-        if (!entries[index].valid or entries[index].dirty_mask == 0) continue;
-        if (best == null or entries[index].dirty_sequence < best_sequence) {
-            best = index;
-            best_sequence = entries[index].dirty_sequence;
-        }
-    }
-    return best;
+    const device_index = policy_index.nextDirtyDevice(false) orelse return null;
+    return policy_index.dirtyHead(device_index);
 }
 
 fn findOldestDirtyForDevice(device_index: usize) ?usize {
-    var best: ?usize = null;
-    var best_sequence: u64 = 0;
-    var index: usize = 0;
-    while (index < entries.len) : (index += 1) {
-        if (!entries[index].valid or entries[index].dirty_mask == 0 or entries[index].device_index != device_index) continue;
-        if (best == null or entries[index].dirty_sequence < best_sequence) {
-            best = index;
-            best_sequence = entries[index].dirty_sequence;
-        }
-    }
-    return best;
+    return policy_index.dirtyHead(device_index);
 }
 
 fn findOldestDirtyForDeviceBatch(device_index: usize, batch: WriteBatch) ?usize {
     var best: ?usize = null;
     var best_sequence: u64 = 0;
-    var index: usize = 0;
-    while (index < entries.len) : (index += 1) {
+    var cursor = policy_index.dirtyHead(device_index);
+    while (cursor) |index| {
         const entry = &entries[index];
-        if (!entry.valid or entry.device_index != device_index) continue;
-        const sequence = oldestDirtySequenceForBatch(entry, batch) orelse continue;
-        if (best == null or sequence < best_sequence) {
-            best = index;
-            best_sequence = sequence;
+        if (oldestDirtySequenceForBatch(entry, batch)) |sequence| {
+            if (best == null or sequence < best_sequence) {
+                best = index;
+                best_sequence = sequence;
+            }
         }
+        cursor = policy_index.nextDirty(index);
     }
     return best;
 }
 
-fn markDirty(index: usize, bits: u8, owner: WriteBatch) void {
-    if (index >= entries.len or !entries[index].valid) return;
+fn markDirty(index: usize, bits: u8, owner: WriteBatch) bool {
+    if (index >= entries.len or !entries[index].valid or entries[index].device_index >= MAX_DEVICES) return false;
+    const newly_dirty = bits & ~entries[index].dirty_mask;
     if (entries[index].dirty_mask == 0) {
+        if (!policy_index.markDirty(index)) return false;
         entries[index].dirty_sequence = nextDirtySequence();
+        entries[index].dirty_since_tick = @max(1, timer.tickCount());
         dirty_entry_count +%= 1;
     }
     entries[index].dirty_mask |= bits;
+    dirty_sector_count +%= @popCount(newly_dirty);
+    dirty_sector_count_by_device[entries[index].device_index] +%= @popCount(newly_dirty);
     var sector: usize = 0;
     while (sector < PAGE_SECTORS) : (sector += 1) {
         const bit = @as(u8, 1) << @as(u3, @intCast(sector));
@@ -1396,6 +1509,8 @@ fn markDirty(index: usize, bits: u8, owner: WriteBatch) void {
         entries[index].dirty_write_sequence[sector] = nextDirtyWriteSequence();
     }
     updateDirtyHighWater();
+    if (policy_index.devices[entries[index].device_index].pressure_active) policy_event.signal();
+    return true;
 }
 
 fn clearDirtyBits(index: usize, bits: u8) void {
@@ -1403,6 +1518,11 @@ fn clearDirtyBits(index: usize, bits: u8) void {
     const cleared = entries[index].dirty_mask & bits;
     if (cleared == 0) return;
     entries[index].dirty_mask &= ~cleared;
+    const cleared_count: u64 = @popCount(cleared);
+    dirty_sector_count -|= cleared_count;
+    if (entries[index].device_index < MAX_DEVICES) {
+        dirty_sector_count_by_device[entries[index].device_index] -|= cleared_count;
+    }
     page_cache_batch.clearOwnership(
         &entries[index].dirty_owner,
         &entries[index].dirty_write_sequence,
@@ -1410,7 +1530,9 @@ fn clearDirtyBits(index: usize, bits: u8) void {
     );
     if (entries[index].dirty_mask == 0) {
         entries[index].dirty_sequence = 0;
+        entries[index].dirty_since_tick = 0;
         if (dirty_entry_count != 0) dirty_entry_count -= 1;
+        _ = policy_index.clearDirty(index);
     }
 }
 
@@ -1437,6 +1559,7 @@ fn recordDrain(reason: DrainReason, written: u64, start_tick: u64) void {
             stats.writeback_pressure_drains +%= 1;
             stats.reclaim_dirty_drains +%= written;
         },
+        .background_pressure, .background_age => {},
     }
     stats.writeback_last_ticks = elapsed;
     stats.writeback_total_ticks +%= elapsed;
@@ -1449,47 +1572,82 @@ fn elapsedTicks(start_tick: u64) u64 {
 }
 
 fn dirtyEntries() u32 {
-    var dirty: u32 = 0;
-    var index: usize = 0;
-    while (index < entries.len) : (index += 1) {
-        if (entries[index].valid and entries[index].dirty_mask != 0) dirty += 1;
-    }
-    return dirty;
+    return dirty_entry_count;
 }
 
 fn dirtyEntriesForDevice(device_index: usize) u32 {
-    var dirty: u32 = 0;
-    var index: usize = 0;
-    while (index < entries.len) : (index += 1) {
-        if (entries[index].valid and entries[index].dirty_mask != 0 and entries[index].device_index == device_index) dirty += 1;
-    }
-    return dirty;
+    if (device_index >= MAX_DEVICES) return 0;
+    return policy_index.devices[device_index].dirty;
 }
 
 fn dirtySectorsForDevice(device_index: usize) u64 {
-    var dirty: u64 = 0;
-    // Iterate the global array by reference. Entry now carries per-sector
-    // ownership metadata; value iteration materializes the complete cache
-    // array as a roughly 88-KB stack temporary when this helper is inlined.
-    for (&entries) |*entry| {
-        if (entry.valid and entry.device_index == device_index) dirty +%= @popCount(entry.dirty_mask);
-    }
-    return dirty;
+    if (device_index >= MAX_DEVICES) return 0;
+    return dirty_sector_count_by_device[device_index];
 }
 
 fn dirtySectorsForDeviceBatch(device_index: usize, batch: WriteBatch) u64 {
     var dirty: u64 = 0;
-    for (&entries) |*entry| {
-        if (entry.valid and entry.device_index == device_index) dirty +%= @popCount(dirtyMaskForBatch(entry, batch));
+    var cursor = policy_index.dirtyHead(device_index);
+    while (cursor) |index| {
+        dirty +%= @popCount(dirtyMaskForBatch(&entries[index], batch));
+        cursor = policy_index.nextDirty(index);
     }
     return dirty;
 }
 
 fn hasBusyEntry() bool {
-    for (&entries) |*entry| {
-        if (entry.valid and entry.io_busy) return true;
+    return policy_index.busy_count != 0;
+}
+
+fn hasBusyDirty() bool {
+    for (policy_index.devices) |device| {
+        if (device.busy_dirty != 0) return true;
     }
     return false;
+}
+
+fn waitForDeviceDirtyIdle(guard: bool, device_index: usize) bool {
+    if (device_index >= MAX_DEVICES) return false;
+    while (policy_index.devices[device_index].busy_dirty != 0) {
+        // A false guard denotes single-threaded boot, where a busy owner
+        // cannot make progress independently and therefore signals an
+        // invariant violation instead of entering a spin loop.
+        if (!guard or !waitBusy(guard)) return false;
+    }
+    return true;
+}
+
+fn waitForAnyDirtyIdle(guard: bool) bool {
+    while (hasBusyDirty()) {
+        if (!guard or !waitBusy(guard)) return false;
+    }
+    return true;
+}
+
+fn recordDirtyIndexFallback(device_filter: ?usize) void {
+    // This is deliberately an exceptional diagnostic full scan. Routine
+    // selection stays on the per-device queues; the counter makes any index
+    // divergence visible instead of silently treating dirty data as clean.
+    stats.policy_full_scan_fallbacks +%= 1;
+    var observed: u64 = 0;
+    for (&entries) |*entry| {
+        if (!entry.valid or entry.dirty_mask == 0) continue;
+        if (device_filter) |device_index| {
+            if (entry.device_index != device_index) continue;
+        }
+        observed +%= 1;
+    }
+    const incident_token = diag_screen.beginResolvableIncident();
+    diag_screen.write("[PGCACHE] dirty index fallback dev=");
+    if (device_filter) |device_index| {
+        diag_screen.writeDec(device_index);
+    } else {
+        diag_screen.write("all");
+    }
+    diag_screen.write(" observed=");
+    diag_screen.writeDec(observed);
+    diag_screen.endLine();
+    _ = diag_screen.resolveIncident(incident_token);
 }
 
 fn evictForReplacement(index: usize) void {
@@ -1498,16 +1656,23 @@ fn evictForReplacement(index: usize) void {
     if (entries[index].dirty_mask == 0) stats.reclaim_clean_entries +%= 1;
     // Frame behalten: der Slot wird sofort wiederbelegt (createEntry
     // uebernimmt phys_addr), das spart Free+Alloc pro Eviction.
+    dropReadAheadResidencyLocked(index);
     unlinkEntry(index);
+    _ = policy_index.detach(index);
     const phys = entries[index].phys_addr;
     entries[index] = .{ .phys_addr = phys };
 }
 
 fn clearEntry(index: usize, reclaim: bool) void {
     if (index >= entries.len) return;
-    if (entries[index].valid) unlinkEntry(index);
+    if (entries[index].valid) {
+        dropReadAheadResidencyLocked(index);
+        unlinkEntry(index);
+        _ = policy_index.detach(index);
+    }
     releasePayload(index, reclaim);
     entries[index] = .{};
+    _ = policy_index.release(index);
 }
 
 fn ensurePayload(index: usize) ?[]u8 {
@@ -1523,6 +1688,7 @@ fn ensurePayload(index: usize) ?[]u8 {
             };
         };
         entries[index].phys_addr = phys_addr;
+        payload_frame_count +%= 1;
         stats.payload_allocations +%= 1;
     }
     return payloadFrame(index);
@@ -1540,6 +1706,7 @@ fn releasePayload(index: usize, reclaim: bool) void {
     if (index >= entries.len or entries[index].phys_addr == 0) return;
     mem_phys.freeFrame(entries[index].phys_addr);
     entries[index].phys_addr = 0;
+    if (payload_frame_count != 0) payload_frame_count -= 1;
     stats.payload_releases +%= 1;
     if (reclaim) {
         stats.reclaim_returned_frames +%= 1;
@@ -1550,6 +1717,235 @@ fn releasePayload(index: usize, reclaim: bool) void {
 fn releaseAllPayloads(reclaim: bool) void {
     var index: usize = 0;
     while (index < entries.len) : (index += 1) releasePayload(index, reclaim);
+}
+
+const BackgroundOutcome = enum {
+    none,
+    wrote,
+    failed,
+};
+
+fn policyWorkerMain() callconv(.c) void {
+    while (true) {
+        _ = policy_event.waitResult(BACKGROUND_INTERVAL_TICKS);
+        stats.policy_worker_wakeups +%= 1;
+
+        var pages: usize = 0;
+        var failed = false;
+        while (pages < BACKGROUND_PAGE_BUDGET) {
+            switch (backgroundWritebackOne()) {
+                .none => break,
+                .wrote => pages += 1,
+                .failed => {
+                    failed = true;
+                    break;
+                },
+            }
+        }
+
+        // Dirty progress owns priority. Speculation runs only when this wake
+        // found no eligible pressure/age page and consumes at most one page.
+        if (pages == 0 and !failed) _ = readAheadOne();
+
+        if (pages == BACKGROUND_PAGE_BUDGET and backgroundNeedsPromptWake()) {
+            scheduler.sleepTicksWithReason(BACKGROUND_REQUEUE_TICKS, "pgcache-policy-yield");
+            policy_event.signal();
+        }
+    }
+}
+
+fn backgroundWritebackOne() BackgroundOutcome {
+    const guard = acquireLock() orelse return .failed;
+    defer releaseLock(guard);
+    const unwind = enterOperation() orelse return .failed;
+    defer _ = task_context.leaveUnwind(unwind);
+
+    const now = timer.tickCount();
+    const selection = selectBackgroundDirtyLocked(now) orelse return .none;
+    const start = now;
+    const before = stats.writeback_sectors;
+    stats.writeback_waits +%= 1;
+    if (!writebackEntryUnlocked(guard, selection.index)) {
+        background_failure_until[selection.device_index] = timer.deadlineAfter(
+            timer.tickCount(),
+            BACKGROUND_FAILURE_BACKOFF_TICKS,
+        );
+        stats.policy_background_errors +%= 1;
+        return .failed;
+    }
+    background_failure_until[selection.device_index] = 0;
+    const written = stats.writeback_sectors - before;
+    if (written == 0) return .none;
+    stats.policy_background_drains +%= 1;
+    stats.policy_background_sectors +%= written;
+    switch (selection.reason) {
+        .pressure => {
+            stats.policy_background_pressure_drains +%= 1;
+            recordDrain(.background_pressure, written, start);
+        },
+        .age => {
+            stats.policy_background_age_drains +%= 1;
+            recordDrain(.background_age, written, start);
+        },
+    }
+    return .wrote;
+}
+
+fn selectBackgroundDirtyLocked(now: u64) ?BackgroundSelection {
+    var visited: u8 = 0;
+    var probes: usize = 0;
+    while (probes < MAX_DEVICES) : (probes += 1) {
+        const device_index = policy_index.nextDirtyDevice(false) orelse break;
+        const bit = @as(u8, 1) << @as(u3, @intCast(device_index));
+        if ((visited & bit) != 0) break;
+        visited |= bit;
+        if (now < background_failure_until[device_index]) continue;
+        const index = policy_index.dirtyHead(device_index) orelse continue;
+        const reason: BackgroundReason = if (policy_index.devices[device_index].pressure_active)
+            .pressure
+        else if (page_cache_policy.ageDue(now, entries[index].dirty_since_tick, MAX_DIRTY_AGE_TICKS))
+            .age
+        else
+            continue;
+        return .{ .index = index, .device_index = device_index, .reason = reason };
+    }
+    return null;
+}
+
+fn backgroundNeedsPromptWake() bool {
+    const guard = acquireLock() orelse return false;
+    defer releaseLock(guard);
+    const now = timer.tickCount();
+    var device_index: usize = 0;
+    while (device_index < MAX_DEVICES) : (device_index += 1) {
+        if (now < background_failure_until[device_index]) continue;
+        const index = policy_index.dirtyHead(device_index) orelse continue;
+        if (policy_index.devices[device_index].pressure_active or
+            page_cache_policy.ageDue(now, entries[index].dirty_since_tick, MAX_DIRTY_AGE_TICKS)) return true;
+    }
+    return false;
+}
+
+fn noteDemandStartLocked(device_index: usize, page_lba: u64) void {
+    if (device_index >= MAX_DEVICES) return;
+    if (read_ahead_states[device_index].demand(page_lba)) {
+        stats.read_ahead_cancellations +%= 1;
+    }
+}
+
+fn noteDemandHitLocked(index: usize) void {
+    if (index >= entries.len or !entries[index].valid) return;
+    policy_index.touchClean(index);
+    if (!entries[index].read_ahead or entries[index].device_index >= MAX_DEVICES) return;
+    entries[index].read_ahead = false;
+    read_ahead_states[entries[index].device_index].consumeResident();
+    stats.read_ahead_hits +%= 1;
+}
+
+fn scheduleReadAheadLocked(device_index: usize, lba: u64, count: u32) void {
+    if (!policy_worker_started or device_index >= MAX_DEVICES or count < READ_AHEAD_TRIGGER_SECTORS) return;
+    const count_u64: u64 = count;
+    const end_lba = lba +% count_u64;
+    if (end_lba < lba or end_lba == 0) return;
+    const last_page = pageLba(end_lba - 1);
+    const next_page = last_page +% PAGE_SECTORS;
+    if (next_page <= last_page) return;
+    const device = block.get(device_index) orelse return;
+    if (device.sector_size != SECTOR_SIZE) return;
+    if (device.sector_count != 0 and next_page >= device.sector_count) return;
+
+    stats.read_ahead_requests +%= 1;
+    if (findEntry(device_index, next_page) != null) {
+        stats.read_ahead_budget_skips +%= 1;
+        return;
+    }
+    if (read_ahead_states[device_index].schedule(next_page)) {
+        stats.read_ahead_cancellations +%= 1;
+    }
+    policy_event.signal();
+}
+
+fn readAheadOne() bool {
+    const guard = acquireLock() orelse return false;
+    defer releaseLock(guard);
+    const unwind = enterOperation() orelse return false;
+    defer _ = task_context.leaveUnwind(unwind);
+
+    var probes: usize = 0;
+    while (probes < MAX_DEVICES) : (probes += 1) {
+        const device_index = (@as(usize, read_ahead_device_cursor) + probes) % MAX_DEVICES;
+        var state = &read_ahead_states[device_index];
+        if (!state.pending or state.inflight) continue;
+        read_ahead_device_cursor = @intCast((device_index + 1) % MAX_DEVICES);
+        const request = state.begin() orelse continue;
+        if (state.resident_pages >= READ_AHEAD_RESIDENT_PAGES_PER_DEVICE or
+            policy_index.free_count <= READ_AHEAD_FREE_FLOOR)
+        {
+            _ = state.complete(request, false);
+            stats.read_ahead_budget_skips +%= 1;
+            continue;
+        }
+        if (findEntry(device_index, request.page) != null) {
+            _ = state.complete(request, false);
+            stats.read_ahead_budget_skips +%= 1;
+            continue;
+        }
+        const index = createReadAheadEntryLocked(device_index, request.page) orelse {
+            _ = state.complete(request, false);
+            stats.read_ahead_budget_skips +%= 1;
+            continue;
+        };
+        const ok = fillEntryWithBackendPolicy(guard, index);
+        const publish = state.complete(request, ok);
+        if (publish) {
+            entries[index].read_ahead = true;
+            state.resident_pages += 1;
+            stats.read_ahead_issued +%= 1;
+        } else if (entries[index].valid and !entries[index].io_busy and entries[index].dirty_mask == 0) {
+            clearEntry(index, false);
+        }
+        return true;
+    }
+    return false;
+}
+
+fn createReadAheadEntryLocked(device_index: usize, page_lba_value: u64) ?usize {
+    if (policy_index.free_count <= READ_AHEAD_FREE_FLOOR) return null;
+    const index = policy_index.claimFree() orelse return null;
+    const kept_phys = entries[index].phys_addr;
+    entries[index] = .{
+        .valid = true,
+        .device_index = device_index,
+        .page_lba = page_lba_value,
+        .last_use = nextClock(),
+        .phys_addr = kept_phys,
+    };
+    if (entries[index].phys_addr == 0) {
+        const phys_addr = mem_phys.allocFrame() orelse {
+            entries[index] = .{};
+            _ = policy_index.release(index);
+            return null;
+        };
+        entries[index].phys_addr = phys_addr;
+        payload_frame_count +%= 1;
+        stats.payload_allocations +%= 1;
+    }
+    if (payloadFrame(index) == null or !policy_index.attachClean(index, device_index)) {
+        releasePayload(index, false);
+        entries[index] = .{};
+        _ = policy_index.release(index);
+        return null;
+    }
+    linkEntry(index);
+    return index;
+}
+
+fn dropReadAheadResidencyLocked(index: usize) void {
+    if (index >= entries.len or !entries[index].read_ahead) return;
+    entries[index].read_ahead = false;
+    if (entries[index].device_index < MAX_DEVICES) {
+        read_ahead_states[entries[index].device_index].consumeResident();
+    }
 }
 
 fn updateDirtyHighWater() void {
