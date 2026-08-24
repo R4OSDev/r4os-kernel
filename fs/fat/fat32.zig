@@ -44,6 +44,10 @@ pub const Volume = struct {
     root_cluster: u32,
     fs_info_sector: u16,
     backup_boot_sector: u16,
+    // Non-zero only in a regular mutation. Recovery/ownership operations
+    // deliberately retain zero and therefore keep their full-device flush
+    // boundary for lost-completion reconciliation.
+    write_batch: page_cache.WriteBatch = page_cache.NO_WRITE_BATCH,
 
     fn firstDataSector(self: Volume) u32 {
         return self.partition_lba + self.reserved_sectors + @as(u32, self.fat_count) * self.sectors_per_fat;
@@ -334,13 +338,13 @@ fn readSector(device_index: usize, lba: u64, sectors: u16, out: []u8) bool {
     return false;
 }
 
-fn writeSector(device_index: usize, lba: u64, sectors: u16, data: []const u8) bool {
+fn writeSector(volume: Volume, lba: u64, sectors: u16, data: []const u8) bool {
     if (sectors == 0) return false;
-    if (sectors == 1 and page_cache.writeSector(device_index, lba, data)) {
+    if (sectors == 1 and page_cache.writeSectorInBatch(volume.device_index, lba, data, volume.write_batch)) {
         stats.write_sectors +%= 1;
         return true;
     }
-    if (sectors > 1 and page_cache.writeSectorsDirect(device_index, lba, sectors, data)) {
+    if (sectors > 1 and page_cache.writeSectorsDirect(volume.device_index, lba, sectors, data)) {
         stats.write_sectors +%= @intCast(sectors);
         return true;
     }
@@ -348,9 +352,27 @@ fn writeSector(device_index: usize, lba: u64, sectors: u16, data: []const u8) bo
     return false;
 }
 
+fn beginMutation(volume: Volume) ?Volume {
+    var scoped = volume;
+    scoped.write_batch = page_cache.beginWriteBatch() orelse return null;
+    return scoped;
+}
+
 fn flushDevice(device_index: usize) bool {
     const start_tick = timer.tickCount();
     const ok = page_cache.flushDevice(device_index);
+    const elapsed = elapsedTicks(start_tick);
+    stats.flushes +%= 1;
+    if (!ok) stats.flush_failures +%= 1;
+    stats.flush_last_ticks = elapsed;
+    stats.flush_total_ticks +%= elapsed;
+    if (elapsed > stats.flush_max_ticks) stats.flush_max_ticks = elapsed;
+    return ok;
+}
+
+fn flushMutation(volume: Volume) bool {
+    const start_tick = timer.tickCount();
+    const ok = page_cache.flushDeviceBatch(volume.device_index, volume.write_batch);
     const elapsed = elapsedTicks(start_tick);
     stats.flushes +%= 1;
     if (!ok) stats.flush_failures +%= 1;
@@ -650,9 +672,9 @@ fn writeFsInfoState(volume: Volume, state: *const VolumeRuntimeState) bool {
     writeLe32(sector[488..492], state.free_clusters);
     writeLe32(sector[492..496], if (state.next_free_cluster >= 2 and state.next_free_cluster < allocClusterEnd(volume)) state.next_free_cluster else FSINFO_UNKNOWN);
     writeLe32(sector[508..512], FSINFO_TRAIL_SIGNATURE);
-    if (!writeSector(volume.device_index, fsInfoLba(volume), 1, sector[0..])) return false;
+    if (!writeSector(volume, fsInfoLba(volume), 1, sector[0..])) return false;
     if (backupFsInfoSectorValid(volume) and backupFsInfoLba(volume) != fsInfoLba(volume)) {
-        if (!writeSector(volume.device_index, backupFsInfoLba(volume), 1, sector[0..])) return false;
+        if (!writeSector(volume, backupFsInfoLba(volume), 1, sector[0..])) return false;
     }
     stats.fsinfo_writes +%= 1;
     return true;
@@ -1114,10 +1136,11 @@ pub fn readFileRange(volume: Volume, entry: Entry, offset: usize, out: []u8) ?us
     return copied;
 }
 
-pub fn writeFileRange(volume: Volume, entry: Entry, offset: usize, data: []const u8) ?usize {
+pub fn writeFileRange(original_volume: Volume, entry: Entry, offset: usize, data: []const u8) ?usize {
     const start_tick = beginOperation(.write_range);
     var ok = false;
     defer finishOperation(.write_range, start_tick, ok);
+    const volume = beginMutation(original_volume) orelse return null;
 
     if (entry.isDir() or entry.isReadOnly()) return null;
     if (offset > entry.size) return null;
@@ -1130,17 +1153,18 @@ pub fn writeFileRange(volume: Volume, entry: Entry, offset: usize, data: []const
     if (data.len > available) return null;
     if (entry.first_cluster < 2) return null;
     if (!writeRangeInChain(volume, entry.first_cluster, offset, data)) return null;
-    if (!flushVolume(volume)) return null;
+    if (!flushMutation(volume)) return null;
     stats.file_write_ranges +%= 1;
     stats.file_write_bytes +%= @intCast(data.len);
     ok = true;
     return data.len;
 }
 
-pub fn writeFile(volume: Volume, parent_cluster: u32, name: []const u8, data: []const u8) bool {
+pub fn writeFile(original_volume: Volume, parent_cluster: u32, name: []const u8, data: []const u8) bool {
     const start_tick = beginOperation(.write_file);
     var ok = false;
     defer finishOperation(.write_file, start_tick, ok);
+    const volume = beginMutation(original_volume) orelse return false;
 
     invalidateAppendCache();
     if (!validInputName(name)) return false;
@@ -1170,7 +1194,7 @@ pub fn writeFile(volume: Volume, parent_cluster: u32, name: []const u8, data: []
         if (first_cluster != 0) freeChain(volume, first_cluster);
         return false;
     }
-    ok = flushVolume(volume);
+    ok = flushMutation(volume);
     if (ok) {
         stats.file_writes +%= 1;
         stats.file_write_bytes +%= @intCast(data.len);
@@ -1211,7 +1235,8 @@ pub fn appendFileAtOffsetStatusDeferred(volume: Volume, parent_cluster: u32, nam
     return status;
 }
 
-fn appendFileInternal(volume: Volume, parent_cluster: u32, name: []const u8, expected_size: ?u32, create_missing: bool, commit_mode: AppendCommitMode, data: []const u8) AppendStatus {
+fn appendFileInternal(original_volume: Volume, parent_cluster: u32, name: []const u8, expected_size: ?u32, create_missing: bool, commit_mode: AppendCommitMode, data: []const u8) AppendStatus {
+    const volume = beginMutation(original_volume) orelse return .io;
     invalidateReadRangeCache();
     if (!validInputName(name)) return .invalid;
     const loc = cachedAppendLocation(volume, parent_cluster, name, expected_size) orelse find_blk: {
@@ -1279,7 +1304,7 @@ fn appendFileInternal(volume: Volume, parent_cluster: u32, name: []const u8, exp
     if (write_start_cluster < 2) return .io;
     if (!writeRangeFromCluster(volume, write_start_cluster, old_size % cluster_size, data)) return .io;
     if (!updateFileLocation(volume, loc.lba, loc.offset, first_cluster, @intCast(new_size))) return .io;
-    if (commit_mode == .flush and !flushVolume(volume)) return .io;
+    if (commit_mode == .flush and !flushMutation(volume)) return .io;
 
     const last_cluster = if (added.last >= 2) added.last else last_existing_cluster;
     rememberAppendLocation(volume, parent_cluster, name, loc, first_cluster, @intCast(new_size), last_cluster);
@@ -1296,10 +1321,11 @@ pub fn copyFileNoReplace(src_volume: Volume, dst_volume: Volume, src_entry: Entr
     return copyFileWithMode(src_volume, dst_volume, src_entry, dst_parent_cluster, dst_name, false);
 }
 
-fn copyFileWithMode(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent_cluster: u32, dst_name: []const u8, replace_existing: bool) bool {
+fn copyFileWithMode(src_volume: Volume, original_dst_volume: Volume, src_entry: Entry, dst_parent_cluster: u32, dst_name: []const u8, replace_existing: bool) bool {
     const start_tick = beginOperation(.copy_file);
     var ok = false;
     defer finishOperation(.copy_file, start_tick, ok);
+    const dst_volume = beginMutation(original_dst_volume) orelse return false;
 
     invalidateAppendCache();
     if (src_entry.isDir() or !validInputName(dst_name)) return false;
@@ -1331,15 +1357,16 @@ fn copyFileWithMode(src_volume: Volume, dst_volume: Volume, src_entry: Entry, ds
         if (first_cluster != 0) freeChain(dst_volume, first_cluster);
         return false;
     }
-    ok = flushVolume(dst_volume);
+    ok = flushMutation(dst_volume);
     if (ok) stats.file_write_bytes +%= @intCast(file_size);
     return ok;
 }
 
-pub fn makeDirectory(volume: Volume, parent_cluster: u32, name: []const u8) bool {
+pub fn makeDirectory(original_volume: Volume, parent_cluster: u32, name: []const u8) bool {
     const start_tick = beginOperation(.make_directory);
     var ok = false;
     defer finishOperation(.make_directory, start_tick, ok);
+    const volume = beginMutation(original_volume) orelse return false;
 
     invalidateAppendCache();
     if (!validInputName(name)) return false;
@@ -1365,21 +1392,22 @@ pub fn makeDirectory(volume: Volume, parent_cluster: u32, name: []const u8) bool
         freeChain(volume, new_cluster);
         return false;
     }
-    ok = flushVolume(volume);
+    ok = flushMutation(volume);
     return ok;
 }
 
-pub fn deleteFile(volume: Volume, parent_cluster: u32, name: []const u8) bool {
+pub fn deleteFile(original_volume: Volume, parent_cluster: u32, name: []const u8) bool {
     const start_tick = beginOperation(.delete_file);
     var ok = false;
     defer finishOperation(.delete_file, start_tick, ok);
+    const volume = beginMutation(original_volume) orelse return false;
 
     invalidateAppendCache();
     var loc: EntryLocation = undefined;
     if (findEntryLocationStatus(volume, parent_cluster, name, &loc) != .found) return false;
     if (loc.entry.isDir() or loc.entry.isReadOnly()) return false;
     if (!deleteAt(volume, loc)) return false;
-    ok = flushVolume(volume);
+    ok = flushMutation(volume);
     return ok;
 }
 
@@ -1429,17 +1457,18 @@ pub fn deleteFileIfIdentity(
     return if (ok) .deleted else .io;
 }
 
-pub fn removeDirectory(volume: Volume, parent_cluster: u32, name: []const u8) bool {
+pub fn removeDirectory(original_volume: Volume, parent_cluster: u32, name: []const u8) bool {
     const start_tick = beginOperation(.remove_directory);
     var ok = false;
     defer finishOperation(.remove_directory, start_tick, ok);
+    const volume = beginMutation(original_volume) orelse return false;
 
     invalidateAppendCache();
     var loc: EntryLocation = undefined;
     if (findEntryLocationStatus(volume, parent_cluster, name, &loc) != .found) return false;
     if (!loc.entry.isDir() or !directoryIsEmpty(volume, loc.entry.first_cluster)) return false;
     if (!deleteAt(volume, loc)) return false;
-    ok = flushVolume(volume);
+    ok = flushMutation(volume);
     return ok;
 }
 
@@ -1671,10 +1700,11 @@ pub fn renameEntry(volume: Volume, parent_cluster: u32, old_name: []const u8, ne
 /// carrying LFN slots is rejected as not_atomic: rewriting its short alias
 /// alone would leave a checksum-invalid LFN chain, while rebuilding/deleting
 /// that chain would require a multi-entry transaction.
-pub fn renameEntryStatus(volume: Volume, parent_cluster: u32, old_name: []const u8, new_name: []const u8) RenameStatus {
+pub fn renameEntryStatus(original_volume: Volume, parent_cluster: u32, old_name: []const u8, new_name: []const u8) RenameStatus {
     const start_tick = beginOperation(.rename_entry);
     var ok = false;
     defer finishOperation(.rename_entry, start_tick, ok);
+    const volume = beginMutation(original_volume) orelse return .io;
 
     invalidateAppendCache();
     if (!validShortInput(old_name) or !validShortInput(new_name)) return .not_atomic;
@@ -1699,17 +1729,18 @@ pub fn renameEntryStatus(volume: Volume, parent_cluster: u32, old_name: []const 
     var sector: [SECTOR_SIZE]u8 = undefined;
     if (!readSector(volume.device_index, loc.lba, 1, sector[0..])) return .io;
     @memcpy(sector[loc.offset .. loc.offset + 11], &short);
-    if (!writeSector(volume.device_index, loc.lba, 1, sector[0..])) return .io;
+    if (!writeSector(volume, loc.lba, 1, sector[0..])) return .io;
     stats.dir_entry_updates +%= 1;
-    if (!flushVolume(volume)) return .io;
+    if (!flushMutation(volume)) return .io;
     ok = true;
     return .ok;
 }
 
-pub fn setAttributes(volume: Volume, parent_cluster: u32, name: []const u8, set_mask: u8, clear_mask: u8) bool {
+pub fn setAttributes(original_volume: Volume, parent_cluster: u32, name: []const u8, set_mask: u8, clear_mask: u8) bool {
     const start_tick = beginOperation(.set_attributes);
     var ok = false;
     defer finishOperation(.set_attributes, start_tick, ok);
+    const volume = beginMutation(original_volume) orelse return false;
 
     invalidateAppendCache();
     var loc: EntryLocation = undefined;
@@ -1721,9 +1752,9 @@ pub fn setAttributes(volume: Volume, parent_cluster: u32, name: []const u8, set_
     attr &= ~(clear_mask & (ATTR_READ_ONLY | ATTR_HIDDEN | ATTR_SYSTEM | ATTR_ARCHIVE));
     if (loc.entry.isDir()) attr |= ATTR_DIRECTORY;
     sector[loc.offset + 11] = attr;
-    if (!writeSector(volume.device_index, loc.lba, 1, sector[0..])) return false;
+    if (!writeSector(volume, loc.lba, 1, sector[0..])) return false;
     stats.dir_entry_updates +%= 1;
-    ok = flushVolume(volume);
+    ok = flushMutation(volume);
     return ok;
 }
 
@@ -2351,7 +2382,7 @@ fn writeDirectoryEntry(volume: Volume, directory_cluster: u32, raw_entry: []cons
                 cooperate(&coop_steps);
                 if (sector[off] == 0x00 or sector[off] == 0xE5) {
                     @memcpy(sector[off .. off + 32], raw_entry[0..32]);
-                    if (!writeSector(volume.device_index, lba, 1, sector[0..])) return false;
+                    if (!writeSector(volume, lba, 1, sector[0..])) return false;
                     stats.dir_entry_updates +%= 1;
                     return true;
                 }
@@ -2407,7 +2438,7 @@ fn writeDirectorySlots(volume: Volume, slots: []const DirectorySlot, raw_entries
         const slot = slots[index];
         if (!readSector(volume.device_index, slot.lba, 1, sector[0..])) return false;
         @memcpy(sector[slot.offset .. slot.offset + 32], raw_entries[index * 32 ..][0..32]);
-        if (!writeSector(volume.device_index, slot.lba, 1, sector[0..])) return false;
+        if (!writeSector(volume, slot.lba, 1, sector[0..])) return false;
     }
     stats.dir_entry_updates +%= @intCast(slots.len);
     return true;
@@ -2609,7 +2640,7 @@ fn markDirectorySlotDeleted(volume: Volume, slot: DirectorySlot) bool {
     var sector: [SECTOR_SIZE]u8 = undefined;
     if (!readSector(volume.device_index, slot.lba, 1, sector[0..])) return false;
     sector[slot.offset] = 0xE5;
-    if (!writeSector(volume.device_index, slot.lba, 1, sector[0..])) return false;
+    if (!writeSector(volume, slot.lba, 1, sector[0..])) return false;
     stats.dir_entry_updates +%= 1;
     return true;
 }
@@ -2657,7 +2688,7 @@ fn initDirectoryCluster(volume: Volume, cluster: u32, parent_cluster: u32) bool 
     var i: u8 = 0;
     var coop_steps: u32 = 0;
     while (i < volume.sectors_per_cluster) : (i += 1) {
-        if (!writeSector(volume.device_index, volume.clusterLba(cluster) + i, 1, sector[0..])) return false;
+        if (!writeSector(volume, volume.clusterLba(cluster) + i, 1, sector[0..])) return false;
         @memset(sector[0..], 0);
         cooperate(&coop_steps);
     }
@@ -2678,7 +2709,7 @@ fn writeClusterData(volume: Volume, start_cluster: u32, data: []const u8) bool {
                 @memcpy(sector[0..count], data[written .. written + count]);
                 written += count;
             }
-            if (!writeSector(volume.device_index, volume.clusterLba(cluster) + i, 1, sector[0..])) return false;
+            if (!writeSector(volume, volume.clusterLba(cluster) + i, 1, sector[0..])) return false;
             cooperate(&coop_steps);
         }
         if (written >= data.len) return true;
@@ -2708,7 +2739,7 @@ fn copyClusterData(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst
         if (!readSector(src_volume.device_index, src_volume.clusterLba(src_cluster) + src_sector_index, 1, sector[0..])) return false;
         const count = if (remaining < SECTOR_SIZE) remaining else SECTOR_SIZE;
         if (count < SECTOR_SIZE) @memset(sector[count..], 0);
-        if (!writeSector(dst_volume.device_index, dst_volume.clusterLba(dst_cluster) + dst_sector_index, 1, sector[0..])) return false;
+        if (!writeSector(dst_volume, dst_volume.clusterLba(dst_cluster) + dst_sector_index, 1, sector[0..])) return false;
         remaining -= count;
         cooperate(&coop_steps);
         if (remaining == 0) return true;
@@ -2757,7 +2788,7 @@ fn updateFileLocation(volume: Volume, lba: u32, offset: usize, first_cluster: u3
     writeLe16(raw[18..20], stamp.date);
     writeLe16(raw[22..24], stamp.time);
     writeLe16(raw[24..26], stamp.date);
-    if (!writeSector(volume.device_index, lba, 1, sector[0..])) return false;
+    if (!writeSector(volume, lba, 1, sector[0..])) return false;
     stats.dir_entry_updates +%= 1;
     return true;
 }
@@ -2986,7 +3017,7 @@ fn writeRangeInChain(volume: Volume, start_cluster: u32, offset: usize, data: []
                 const full_sectors = @min((data.len - written) / SECTOR_SIZE, @as(usize, volume.sectors_per_cluster - sector_index));
                 if (full_sectors > 0) {
                     const byte_count = full_sectors * SECTOR_SIZE;
-                    if (!writeSector(volume.device_index, lba, @intCast(full_sectors), data[written .. written + byte_count])) return false;
+                    if (!writeSector(volume, lba, @intCast(full_sectors), data[written .. written + byte_count])) return false;
                     written += byte_count;
                     sector_index += @intCast(full_sectors);
                     cooperate(&coop_steps);
@@ -2995,11 +3026,11 @@ fn writeRangeInChain(volume: Volume, start_cluster: u32, offset: usize, data: []
             }
             const count = @min(SECTOR_SIZE - sector_offset, data.len - written);
             if (sector_offset == 0 and count == SECTOR_SIZE) {
-                if (!writeSector(volume.device_index, lba, 1, data[written .. written + SECTOR_SIZE])) return false;
+                if (!writeSector(volume, lba, 1, data[written .. written + SECTOR_SIZE])) return false;
             } else {
                 if (!readSector(volume.device_index, lba, 1, sector[0..])) return false;
                 @memcpy(sector[sector_offset .. sector_offset + count], data[written .. written + count]);
-                if (!writeSector(volume.device_index, lba, 1, sector[0..])) return false;
+                if (!writeSector(volume, lba, 1, sector[0..])) return false;
             }
             written += count;
             sector_offset = 0;
@@ -3035,7 +3066,7 @@ fn writeRangeFromCluster(volume: Volume, start_cluster: u32, in_cluster_offset: 
                 const full_sectors = @min((data.len - written) / SECTOR_SIZE, @as(usize, volume.sectors_per_cluster - sector_index));
                 if (full_sectors > 0) {
                     const byte_count = full_sectors * SECTOR_SIZE;
-                    if (!writeSector(volume.device_index, lba, @intCast(full_sectors), data[written .. written + byte_count])) return false;
+                    if (!writeSector(volume, lba, @intCast(full_sectors), data[written .. written + byte_count])) return false;
                     written += byte_count;
                     sector_index += @intCast(full_sectors);
                     cooperate(&coop_steps);
@@ -3044,11 +3075,11 @@ fn writeRangeFromCluster(volume: Volume, start_cluster: u32, in_cluster_offset: 
             }
             const count = @min(SECTOR_SIZE - sector_offset, data.len - written);
             if (sector_offset == 0 and count == SECTOR_SIZE) {
-                if (!writeSector(volume.device_index, lba, 1, data[written .. written + SECTOR_SIZE])) return false;
+                if (!writeSector(volume, lba, 1, data[written .. written + SECTOR_SIZE])) return false;
             } else {
                 if (!readSector(volume.device_index, lba, 1, sector[0..])) return false;
                 @memcpy(sector[sector_offset .. sector_offset + count], data[written .. written + count]);
-                if (!writeSector(volume.device_index, lba, 1, sector[0..])) return false;
+                if (!writeSector(volume, lba, 1, sector[0..])) return false;
             }
             written += count;
             sector_offset = 0;
@@ -3429,7 +3460,7 @@ fn writeFatChainRunAll(volume: Volume, start_cluster: u32, count: usize, fillwit
                 const old = readLe32(sector[offset..][0..4]);
                 writeLe32(sector[offset..][0..4], (old & 0xF000_0000) | (next_value & 0x0FFF_FFFF));
             }
-            if (!writeSector(volume.device_index, lba, 1, sector[0..])) return false;
+            if (!writeSector(volume, lba, 1, sector[0..])) return false;
             stats.fat_mirror_writes +%= 1;
             stats.fat_sector_writes +%= 1;
             cooperate(&coop_steps);

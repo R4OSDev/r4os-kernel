@@ -16,6 +16,10 @@ const time_core = @import("../../platform/time.zig");
 const k = @import("../../kernel/log.zig");
 
 const SECTOR_SIZE: usize = 512;
+// Bound staging ownership while still preserving normal 1/2-MB NTFS extents
+// as one or two page-cache/block submissions instead of 2,048/4,096 seam
+// calls. The block core still splits each submission at the backend limit.
+const MAX_DIRECT_WRITE_SECTORS: u32 = 2048;
 const NAME_MAX: usize = 768; // matches vfs.NAME_MAX / nv.NAME_MAX (0.60.19)
 const MAX_VOLUMES: usize = 4;
 const MAX_MFT_RUNS: usize = nv.MAX_MFT_RUNS;
@@ -112,10 +116,28 @@ fn seamRead(ctx: *anyopaque, lba: u64, count: u32, out: []u8) bool {
 
 fn seamWrite(ctx: *anyopaque, lba: u64, count: u32, data: []const u8) bool {
     const c: *DeviceCtx = @ptrCast(@alignCast(ctx));
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        const off: usize = @intCast(i);
-        if (!page_cache.writeSector(c.device_index, lba + i, data[off * SECTOR_SIZE .. (off + 1) * SECTOR_SIZE])) return false;
+    if (count == 0) return true;
+    const total_bytes = @as(usize, count) * SECTOR_SIZE;
+    if (data.len < total_bytes) return false;
+    if (count == 1) return page_cache.writeSector(c.device_index, lba, data[0..SECTOR_SIZE]);
+
+    // writeSectorsDirect owns a staged copy, pins every overlapping cache
+    // identity, and invalidates exactly the backend-confirmed prefix. Thus a
+    // short/failed write is visible to the shared NTFS recovery logic without
+    // leaving stale cache lines, while seamFlush remains the durability and
+    // crash-order barrier.
+    var done: u32 = 0;
+    while (done < count) {
+        const chunk = @min(count - done, MAX_DIRECT_WRITE_SECTORS);
+        const byte_offset = @as(usize, done) * SECTOR_SIZE;
+        const byte_count = @as(usize, chunk) * SECTOR_SIZE;
+        if (!page_cache.writeSectorsDirect(
+            c.device_index,
+            lba + done,
+            @intCast(chunk),
+            data[byte_offset .. byte_offset + byte_count],
+        )) return false;
+        done += chunk;
     }
     return true;
 }

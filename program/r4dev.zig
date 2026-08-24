@@ -1439,10 +1439,13 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v6_size: usize = @offsetOf(ProgramPerformanceSummary, "service_registry_index_queries");
     const v7_size: usize = @offsetOf(ProgramPerformanceSummary, "hot_path_memory_block_physical_index_entries");
     const v8_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_drive_gate_count");
-    const v9_size: usize = @sizeOf(ProgramPerformanceSummary);
+    const v9_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_bulk_write_requests");
+    const v10_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v9_size)
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v10_size)
         performance_snapshot_version
+    else if (caller_version >= 9 and caller_size >= v9_size)
+        9
     else if (caller_version >= 8 and caller_size >= v8_size)
         8
     else if (caller_version >= 7 and caller_size >= v7_size)
@@ -1468,7 +1471,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         6 => v6_size,
         7 => v7_size,
         8 => v8_size,
-        else => v9_size,
+        9 => v9_size,
+        else => v10_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -2010,6 +2014,11 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .fs_cache_writeback_max_ticks = fs_cache.writeback_max_ticks,
         .fs_cache_writeback_last_ticks = fs_cache.writeback_last_ticks,
         .fs_cache_writeback_retries = fs_cache.writeback_retries,
+        .fs_cache_bulk_write_requests = fs_cache.bulk_write_requests,
+        .fs_cache_bulk_write_sectors = fs_cache.bulk_write_sectors,
+        .fs_cache_selective_flushes = fs_cache.selective_flushes,
+        .fs_cache_selective_writeback_sectors = fs_cache.selective_writeback_sectors,
+        .fs_cache_selective_foreign_dirty_sectors_skipped = fs_cache.selective_foreign_dirty_sectors_skipped,
         .fs_cache_clean_reclaimable_entries = fs_cache.clean_reclaimable_entries,
         .fs_cache_dirty_non_reclaimable_entries = fs_cache.dirty_non_reclaimable_entries,
         .fs_cache_pagefile_ready = 0,

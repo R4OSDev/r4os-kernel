@@ -185,6 +185,7 @@ pub fn build(b: *std.Build) void {
         "driver/usb/xhci_event_router.zig",
         "driver/usb/xhci_ring_cycle.zig",
         "fs/request_scope.zig",
+        "fs/page_cache_batch.zig",
         "kernel/bootscreen_r4b_format.zig",
         "kernel/driver_work_queue.zig",
         "kernel/service_ipc_queue.zig",

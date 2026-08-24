@@ -31,6 +31,7 @@ const diag_screen = @import("../kernel/diag_screen.zig");
 const timer = @import("../kernel/timer.zig");
 const heap = @import("../memory/heap.zig");
 const mem_phys = @import("../memory/phys.zig");
+const page_cache_batch = @import("page_cache_batch.zig");
 const sync = @import("../sched/sync.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const task_context = @import("../sched/task_context.zig");
@@ -105,7 +106,18 @@ pub const Summary = struct {
     reclaim_returned_bytes: u64 = 0,
     lock_timeouts: u64 = 0,
     busy_waits: u64 = 0,
+    bulk_write_requests: u64 = 0,
+    bulk_write_sectors: u64 = 0,
+    selective_flushes: u64 = 0,
+    selective_writeback_sectors: u64 = 0,
+    selective_foreign_dirty_sectors_skipped: u64 = 0,
 };
+
+/// Identifies the dirty sectors produced by one filesystem mutation.  Zero is
+/// deliberately reserved for legacy/unscoped writes, so a selective commit
+/// can never mistake older dirty state for work owned by the caller.
+pub const WriteBatch = page_cache_batch.Owner;
+pub const NO_WRITE_BATCH: WriteBatch = page_cache_batch.no_owner;
 
 pub const ReclaimResult = struct {
     requested_frames: u32 = 0,
@@ -126,6 +138,8 @@ const Entry = struct {
     dirty_mask: u8 = 0,
     last_use: u64 = 0,
     dirty_sequence: u64 = 0,
+    dirty_owner: [PAGE_SECTORS]WriteBatch = .{NO_WRITE_BATCH} ** PAGE_SECTORS,
+    dirty_write_sequence: [PAGE_SECTORS]u64 = .{0} ** PAGE_SECTORS,
     phys_addr: u64 = 0,
     next: u16 = NO_INDEX,
 };
@@ -135,6 +149,9 @@ var buckets: [BUCKET_COUNT]u16 = .{NO_INDEX} ** BUCKET_COUNT;
 var stats: Summary = .{};
 var clock: u64 = 0;
 var dirty_clock: u64 = 0;
+var dirty_write_clock: u64 = 0;
+var write_batch_clock: WriteBatch = NO_WRITE_BATCH;
+var dirty_entry_count: u32 = 0;
 var cache_lock: sync.Mutex = .{};
 
 pub fn init() void {
@@ -150,7 +167,21 @@ pub fn init() void {
     };
     clock = 0;
     dirty_clock = 0;
+    dirty_write_clock = 0;
+    write_batch_clock = NO_WRITE_BATCH;
+    dirty_entry_count = 0;
     cache_lock = sync.Mutex.initClass("fs-page-cache", sync.LockRank.fs_page_cache, .sleepable);
+}
+
+/// Starts an operation-scoped dirty set. The token is intentionally explicit:
+/// filesystem code must pass it into every cached write that belongs to the
+/// mutation and later into flushDeviceBatch().
+pub fn beginWriteBatch() ?WriteBatch {
+    const guard = acquireLock() orelse return null;
+    defer releaseLock(guard);
+    write_batch_clock +%= 1;
+    if (write_batch_clock == NO_WRITE_BATCH) write_batch_clock = 1;
+    return write_batch_clock;
 }
 
 pub fn summary() Summary {
@@ -462,6 +493,10 @@ fn maskCovers(mask: u8, first: usize, len: usize) bool {
 }
 
 pub fn writeSector(device_index: usize, lba: u64, data: []const u8) bool {
+    return writeSectorInBatch(device_index, lba, data, NO_WRITE_BATCH);
+}
+
+pub fn writeSectorInBatch(device_index: usize, lba: u64, data: []const u8, batch: WriteBatch) bool {
     if (data.len < SECTOR_SIZE) {
         stats.write_errors +%= 1;
         return false;
@@ -530,7 +565,7 @@ pub fn writeSector(device_index: usize, lba: u64, data: []const u8) bool {
         @memcpy(frame[off .. off + SECTOR_SIZE], caller_copy[0..]);
         entries[index].valid_mask |= bit;
         entries[index].last_use = nextClock();
-        markDirty(index, bit);
+        markDirty(index, bit, batch);
         stats.dirty_sector_updates +%= 1;
         stats.deferred_write_requests +%= 1;
         return true;
@@ -548,6 +583,10 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
         stats.write_errors +%= 1;
         return false;
     }
+    if (sector_count > 1) {
+        stats.bulk_write_requests +%= 1;
+        stats.bulk_write_sectors +%= @intCast(sector_count);
+    }
     // preTouch is not residency ownership. Stage the complete pageable
     // caller range into kernel heap before reserving cache pages; otherwise
     // block.write's bounce copy could fault while those same pages are
@@ -557,18 +596,15 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
         return false;
     };
     defer _ = task_context.leaveUnwind(staging_unwind);
-    var staging_stack: [PAGE_BYTES]u8 = undefined;
-    const staging_heap: ?[]u8 = if (byte_count > staging_stack.len)
-        heap.alloc(byte_count, 16) orelse {
-            stats.write_errors +%= 1;
-            return false;
-        }
-    else
-        null;
-    defer if (staging_heap) |memory| {
-        _ = heap.free(memory);
+    // This path is also reached from the comparatively deep R4X async-I/O
+    // call chain. A 4-KB stack fallback crossed that task's guard page as
+    // soon as NTFS started preserving multi-sector requests. Kernel-heap
+    // staging is resident and keeps the task stack bounded for every size.
+    const staged_data = heap.alloc(byte_count, 16) orelse {
+        stats.write_errors +%= 1;
+        return false;
     };
-    const staged_data = if (staging_heap) |memory| memory else staging_stack[0..byte_count];
+    defer _ = heap.free(staged_data);
     @memcpy(staged_data[0..byte_count], data[0..byte_count]);
     const guard = acquireLock() orelse {
         stats.write_errors +%= 1;
@@ -654,10 +690,9 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
                 while (page_offset < completed_in_span) : (page_offset += 1) {
                     const bit = @as(u8, 1) << @as(u3, @intCast(first + page_offset));
                     entries[index].valid_mask &= ~bit;
-                    entries[index].dirty_mask &= ~bit;
+                    clearDirtyBits(index, bit);
                     stats.invalidations +%= 1;
                 }
-                if (entries[index].dirty_mask == 0) entries[index].dirty_sequence = 0;
             }
             if (owns_entry) {
                 entries[index].io_busy = false;
@@ -736,6 +771,34 @@ pub fn flushDevice(device_index: usize) bool {
     return true;
 }
 
+/// Commits only dirty sectors tagged with `batch`, then issues the same
+/// backend durability barrier as flushDevice(). Dirty sectors from earlier or
+/// concurrent operations remain cached, including when they share a 4-KB
+/// cache page with the committed mutation.
+pub fn flushDeviceBatch(device_index: usize, batch: WriteBatch) bool {
+    if (batch == NO_WRITE_BATCH) return flushDevice(device_index);
+    const guard = acquireLock() orelse return false;
+    var locked = true;
+    defer if (locked) releaseLock(guard);
+    const unwind = enterOperation() orelse return false;
+    defer _ = task_context.leaveUnwind(unwind);
+    stats.flushes +%= 1;
+    stats.selective_flushes +%= 1;
+    const all_dirty = dirtySectorsForDevice(device_index);
+    const owned_dirty = dirtySectorsForDeviceBatch(device_index, batch);
+    if (all_dirty > owned_dirty) {
+        stats.selective_foreign_dirty_sectors_skipped +%= all_dirty - owned_dirty;
+    }
+    if (!drainDeviceBatch(guard, device_index, batch, .flush)) return false;
+    releaseLock(guard);
+    locked = false;
+    if (!block.flush(device_index)) {
+        stats.writeback_errors +%= 1;
+        return false;
+    }
+    return true;
+}
+
 pub fn flushAll() bool {
     const guard = acquireLock() orelse return false;
     var locked = true;
@@ -782,7 +845,7 @@ pub fn invalidateSector(device_index: usize, lba: u64) void {
             continue;
         }
         entries[index].valid_mask &= ~bit;
-        entries[index].dirty_mask &= ~bit;
+        clearDirtyBits(index, bit);
         stats.invalidations +%= 1;
         if (entries[index].valid_mask == 0) clearEntry(index, false);
         return;
@@ -1140,6 +1203,21 @@ fn drainDevice(guard: bool, device_index: usize, reason: DrainReason) bool {
     return true;
 }
 
+fn drainDeviceBatch(guard: bool, device_index: usize, batch: WriteBatch, reason: DrainReason) bool {
+    if (dirtySectorsForDeviceBatch(device_index, batch) == 0) return true;
+    const start = timer.tickCount();
+    stats.writeback_waits +%= 1;
+    var written: u64 = 0;
+    while (findOldestDirtyForDeviceBatch(device_index, batch)) |index| {
+        const before = stats.writeback_sectors;
+        if (!writebackEntryBatchUnlocked(guard, index, batch)) return false;
+        written +%= stats.writeback_sectors - before;
+    }
+    stats.selective_writeback_sectors +%= written;
+    recordDrain(reason, written, start);
+    return true;
+}
+
 fn drainAll(guard: bool, reason: DrainReason) bool {
     if (dirtyEntries() == 0) return true;
     const start = timer.tickCount();
@@ -1172,6 +1250,14 @@ fn writebackOldestDirty(guard: bool, reason: DrainReason) bool {
 // Schreiber auf dieselbe Seite warten solange (waitBusy), daher ist der
 // Frame waehrend des I/O stabil.
 fn writebackEntryUnlocked(guard: bool, index: usize) bool {
+    return writebackEntrySelectedUnlocked(guard, index, null);
+}
+
+fn writebackEntryBatchUnlocked(guard: bool, index: usize, batch: WriteBatch) bool {
+    return writebackEntrySelectedUnlocked(guard, index, batch);
+}
+
+fn writebackEntrySelectedUnlocked(guard: bool, index: usize, batch: ?WriteBatch) bool {
     if (index >= entries.len) return true;
     while (entries[index].valid and entries[index].io_busy) {
         if (!waitBusy(guard)) return false;
@@ -1180,7 +1266,10 @@ fn writebackEntryUnlocked(guard: bool, index: usize) bool {
         // immer korrekt, die Drain-Schleifen re-scannen ohnehin.
     }
     if (!entries[index].valid) return true;
-    const dirty_snapshot = entries[index].dirty_mask;
+    const dirty_snapshot = if (batch) |owner|
+        dirtyMaskForBatch(&entries[index], owner)
+    else
+        entries[index].dirty_mask;
     if (dirty_snapshot == 0) return true;
     const device = entries[index].device_index;
     const page = entries[index].page_lba;
@@ -1242,8 +1331,7 @@ fn writebackEntryUnlocked(guard: bool, index: usize) bool {
 
     relock(guard);
     entries[index].io_busy = false;
-    entries[index].dirty_mask &= ~written_bits;
-    if (entries[index].dirty_mask == 0) entries[index].dirty_sequence = 0;
+    clearDirtyBits(index, written_bits);
     stats.writeback_sectors +%= @popCount(written_bits);
     if (!ok) stats.writeback_errors +%= 1;
     return ok;
@@ -1277,13 +1365,66 @@ fn findOldestDirtyForDevice(device_index: usize) ?usize {
     return best;
 }
 
-fn markDirty(index: usize, bit: u8) void {
+fn findOldestDirtyForDeviceBatch(device_index: usize, batch: WriteBatch) ?usize {
+    var best: ?usize = null;
+    var best_sequence: u64 = 0;
+    var index: usize = 0;
+    while (index < entries.len) : (index += 1) {
+        const entry = &entries[index];
+        if (!entry.valid or entry.device_index != device_index) continue;
+        const sequence = oldestDirtySequenceForBatch(entry, batch) orelse continue;
+        if (best == null or sequence < best_sequence) {
+            best = index;
+            best_sequence = sequence;
+        }
+    }
+    return best;
+}
+
+fn markDirty(index: usize, bits: u8, owner: WriteBatch) void {
     if (index >= entries.len or !entries[index].valid) return;
     if (entries[index].dirty_mask == 0) {
         entries[index].dirty_sequence = nextDirtySequence();
+        dirty_entry_count +%= 1;
     }
-    entries[index].dirty_mask |= bit;
+    entries[index].dirty_mask |= bits;
+    var sector: usize = 0;
+    while (sector < PAGE_SECTORS) : (sector += 1) {
+        const bit = @as(u8, 1) << @as(u3, @intCast(sector));
+        if ((bits & bit) == 0) continue;
+        entries[index].dirty_owner[sector] = owner;
+        entries[index].dirty_write_sequence[sector] = nextDirtyWriteSequence();
+    }
     updateDirtyHighWater();
+}
+
+fn clearDirtyBits(index: usize, bits: u8) void {
+    if (index >= entries.len or bits == 0) return;
+    const cleared = entries[index].dirty_mask & bits;
+    if (cleared == 0) return;
+    entries[index].dirty_mask &= ~cleared;
+    page_cache_batch.clearOwnership(
+        &entries[index].dirty_owner,
+        &entries[index].dirty_write_sequence,
+        cleared,
+    );
+    if (entries[index].dirty_mask == 0) {
+        entries[index].dirty_sequence = 0;
+        if (dirty_entry_count != 0) dirty_entry_count -= 1;
+    }
+}
+
+fn dirtyMaskForBatch(entry: *const Entry, batch: WriteBatch) u8 {
+    return page_cache_batch.maskForOwner(entry.dirty_mask, &entry.dirty_owner, batch);
+}
+
+fn oldestDirtySequenceForBatch(entry: *const Entry, batch: WriteBatch) ?u64 {
+    return page_cache_batch.oldestSequenceForOwner(
+        entry.dirty_mask,
+        &entry.dirty_owner,
+        &entry.dirty_write_sequence,
+        batch,
+    );
 }
 
 fn recordDrain(reason: DrainReason, written: u64, start_tick: u64) void {
@@ -1325,8 +1466,27 @@ fn dirtyEntriesForDevice(device_index: usize) u32 {
     return dirty;
 }
 
+fn dirtySectorsForDevice(device_index: usize) u64 {
+    var dirty: u64 = 0;
+    // Iterate the global array by reference. Entry now carries per-sector
+    // ownership metadata; value iteration materializes the complete cache
+    // array as a roughly 88-KB stack temporary when this helper is inlined.
+    for (&entries) |*entry| {
+        if (entry.valid and entry.device_index == device_index) dirty +%= @popCount(entry.dirty_mask);
+    }
+    return dirty;
+}
+
+fn dirtySectorsForDeviceBatch(device_index: usize, batch: WriteBatch) u64 {
+    var dirty: u64 = 0;
+    for (&entries) |*entry| {
+        if (entry.valid and entry.device_index == device_index) dirty +%= @popCount(dirtyMaskForBatch(entry, batch));
+    }
+    return dirty;
+}
+
 fn hasBusyEntry() bool {
-    for (entries) |entry| {
+    for (&entries) |*entry| {
         if (entry.valid and entry.io_busy) return true;
     }
     return false;
@@ -1393,7 +1553,7 @@ fn releaseAllPayloads(reclaim: bool) void {
 }
 
 fn updateDirtyHighWater() void {
-    const dirty = dirtyEntries();
+    const dirty = dirty_entry_count;
     if (dirty > stats.dirty_high_water_entries) stats.dirty_high_water_entries = dirty;
     if (dirty > stats.writeback_queue_high_water) stats.writeback_queue_high_water = dirty;
 }
@@ -1407,4 +1567,10 @@ fn nextDirtySequence() u64 {
     dirty_clock +%= 1;
     if (dirty_clock == 0) dirty_clock = 1;
     return dirty_clock;
+}
+
+fn nextDirtyWriteSequence() u64 {
+    dirty_write_clock +%= 1;
+    if (dirty_write_clock == 0) dirty_write_clock = 1;
+    return dirty_write_clock;
 }
