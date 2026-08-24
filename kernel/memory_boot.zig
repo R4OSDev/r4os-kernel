@@ -69,6 +69,9 @@ fn initPhysicalAllocator() bool {
     if (!phys.init()) {
         return fail("Physical allocator init failed");
     }
+    if (comptime config.enable_boot_selftests) {
+        if (!blocks.indexInvariant()) return fail("MemoryBlock index invariant failed");
+    }
     phys.dumpStats();
     endPhase("Physical allocator");
     return true;
@@ -136,6 +139,9 @@ fn initKernelHeap() bool {
     if (comptime config.enable_boot_selftests) {
         if (!heap.selfTest()) {
             return fail("Kernel heap selftest failed");
+        }
+        if (!blocks.indexInvariant() or !virt.metadataInvariant()) {
+            return fail("Memory metadata index invariant failed");
         }
     }
     endPhase("Kernel heap");

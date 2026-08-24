@@ -13,6 +13,7 @@ pub const MAX_COMMIT_SPANS: usize = 4096;
 pub const MAX_PAGE_STATE_SPANS: usize = 8192;
 pub const WINDOW_COUNT: usize = 8;
 pub const RANGE_ID_INDEX_CAPACITY: usize = MAX_RANGES * 2;
+const INVALID_RANGE_POSITION: u16 = std.math.maxInt(u16);
 
 const MB: u64 = 1024 * 1024;
 const GB: u64 = 1024 * MB;
@@ -198,6 +199,23 @@ pub const HotPathStats = struct {
     range_free_slot_probe_total: u64 = 0,
     range_free_slot_probe_max: u32 = 0,
     range_free_slot_probe_last: u32 = 0,
+    range_address_entries: u32 = 0,
+    range_address_lookups: u64 = 0,
+    range_address_probe_total: u64 = 0,
+    range_address_probe_max: u32 = 0,
+    range_address_probe_last: u32 = 0,
+    commit_span_active: u32 = 0,
+    commit_span_lookups: u64 = 0,
+    commit_span_steps: u64 = 0,
+    commit_span_step_max: u32 = 0,
+    page_state_span_active: u32 = 0,
+    page_state_span_lookups: u64 = 0,
+    page_state_span_steps: u64 = 0,
+    page_state_span_step_max: u32 = 0,
+    reclaim_cursor_range_steps: u64 = 0,
+    reclaim_cursor_span_steps: u64 = 0,
+    reclaim_cursor_page_steps: u64 = 0,
+    reclaim_cursor_wraps: u64 = 0,
 };
 
 pub const PageStateInput = struct {
@@ -331,6 +349,8 @@ const CommitSpan = struct {
     range_id: u32 = 0,
     base: u64 = 0,
     len: u64 = 0,
+    prev: ?u16 = null,
+    next: ?u16 = null,
 };
 
 const PageStateSpan = struct {
@@ -342,6 +362,8 @@ const PageStateSpan = struct {
     slot_reservation_id: u32 = 0,
     slot_index: u64 = 0,
     slot_generation: u64 = 0,
+    prev: ?u16 = null,
+    next: ?u16 = null,
 };
 
 const FaultPageState = struct {
@@ -391,7 +413,10 @@ const Range = struct {
     // current committed-byte count or losing the range as a retry anchor.
     partial_uncommit_base: u64 = 0,
     partial_uncommit_len: u64 = 0,
+    partial_uncommit_cursor: u64 = 0,
     partial_uncommit_accounted: bool = false,
+    commit_span_head: ?u16 = null,
+    page_state_span_head: ?u16 = null,
 
     fn active(self: Range) bool {
         return self.slot_used and self.status != .released;
@@ -429,11 +454,20 @@ const WINDOWS = [_]WindowDef{
 
 var ranges: [MAX_RANGES]Range = .{Range{}} ** MAX_RANGES;
 var range_id_index: [RANGE_ID_INDEX_CAPACITY]RangeIdIndexEntry = .{RangeIdIndexEntry{}} ** RANGE_ID_INDEX_CAPACITY;
+var range_address_order: [MAX_RANGES]u16 = .{0} ** MAX_RANGES;
+var range_address_position: [MAX_RANGES]u16 = .{INVALID_RANGE_POSITION} ** MAX_RANGES;
 var commit_spans: [MAX_COMMIT_SPANS]CommitSpan = .{CommitSpan{}} ** MAX_COMMIT_SPANS;
 var page_state_spans: [MAX_PAGE_STATE_SPANS]PageStateSpan = .{PageStateSpan{}} ** MAX_PAGE_STATE_SPANS;
 var page_state_summary: PageStateSummary = .{};
 var range_id_index_entries: usize = 0;
 var range_id_index_tombstones: usize = 0;
+var range_address_count: usize = 0;
+var commit_span_free_head: ?u16 = null;
+var commit_span_active_count: u32 = 0;
+var page_state_span_free_head: ?u16 = null;
+var page_state_span_active_count: u32 = 0;
+var reclaim_cursor_range_slot: ?u16 = null;
+var reclaim_cursor_page: u64 = 0;
 var next_free_range_slot: usize = 0;
 var hot_path_stats: HotPathStats = .{};
 var next_id: u32 = 1;
@@ -445,12 +479,27 @@ pub fn init() bool {
     i = 0;
     while (i < range_id_index.len) : (i += 1) range_id_index[i] = .{};
     i = 0;
-    while (i < commit_spans.len) : (i += 1) commit_spans[i] = .{};
+    while (i < range_address_position.len) : (i += 1) range_address_position[i] = INVALID_RANGE_POSITION;
+    commit_span_free_head = null;
     i = 0;
-    while (i < page_state_spans.len) : (i += 1) page_state_spans[i] = .{};
+    while (i < commit_spans.len) : (i += 1) {
+        commit_spans[i] = .{ .next = commit_span_free_head };
+        commit_span_free_head = @intCast(i);
+    }
+    page_state_span_free_head = null;
+    i = 0;
+    while (i < page_state_spans.len) : (i += 1) {
+        page_state_spans[i] = .{ .next = page_state_span_free_head };
+        page_state_span_free_head = @intCast(i);
+    }
     page_state_summary = .{};
     range_id_index_entries = 0;
     range_id_index_tombstones = 0;
+    range_address_count = 0;
+    commit_span_active_count = 0;
+    page_state_span_active_count = 0;
+    reclaim_cursor_range_slot = null;
+    reclaim_cursor_page = 0;
     next_free_range_slot = 0;
     hot_path_stats = .{};
     next_id = 1;
@@ -568,7 +617,8 @@ fn allocClaimedFrame(range: Range, reclaim_reason: reclaim.Reason) Error!u64 {
 }
 
 fn releaseClaimedFrame(frame: u64) void {
-    var release_plan = blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE) catch return;
+    var release_plan: blocks.PhysicalReleasePlan = undefined;
+    blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE, &release_plan) catch return;
     defer blocks.cancelPhysicalRangeRelease(&release_plan);
     phys.freeFrame(frame);
     blocks.commitPhysicalRangeRelease(&release_plan);
@@ -585,7 +635,7 @@ pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_
         recordDemandFaultFailure(range);
         return false;
     }
-    if (!commitSpanCovers(range.id, fault_page, paging.PAGE_SIZE)) {
+    if (!commitSpanCoversForRange(range, fault_page, paging.PAGE_SIZE)) {
         recordDemandFaultFailure(range);
         return false;
     }
@@ -596,7 +646,7 @@ pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_
     }
 
     const page_index = (fault_page - range.base) / paging.PAGE_SIZE;
-    if (pageStateForFault(range.id, page_index)) |fault_state| {
+    if (pageStateForFaultInRange(range, page_index)) |fault_state| {
         if ((fault_state.flags & page_state_flag_slot_bound) != 0) {
             return handlePageInFault(range, fault_page, page_index, fault_state);
         }
@@ -657,7 +707,9 @@ pub fn release(id: u32) Error!void {
     // with the virtual reserve. Callers that know a compact committed span
     // (notably guarded program stacks) uncommit it first; do not walk every
     // page of an already-empty multi-megabyte reservation afterwards.
-    publishPartialUncommit(range, range.base, range.len, true);
+    const resuming_release = range.partial_uncommit_len != 0 and
+        range.partial_uncommit_base == range.base and range.partial_uncommit_len == range.len;
+    if (!resuming_release) publishPartialUncommit(range, range.base, range.len, true);
     if (range.committed_bytes != 0) {
         uncommitSpan(range, range.base, range.len, true) catch |err| {
             blocks.setCommitted(range.block_id, range.committed_bytes) catch |block_err| return convertBlockError(block_err);
@@ -668,12 +720,14 @@ pub fn release(id: u32) Error!void {
     // retry. Keep block release, ID tombstone and Range retirement in one
     // IRQ-atomic no-yield publication boundary.
     const release_irq_flags = interrupts.saveAndDisable();
-    removeCommitSpansForRange(range.id);
     blocks.release(range.block_id) catch |err| {
         interrupts.restore(release_irq_flags);
         return convertBlockError(err);
     };
+    removeCommitSpansForRange(range.id);
+    removePageStateForRange(range.id);
     removeRangeIdIndex(range.id);
+    removeRangeAddressIndex(idx);
     range.status = .released;
     range.committed_bytes = 0;
     range.resident_bytes = 0;
@@ -684,6 +738,7 @@ pub fn release(id: u32) Error!void {
     range.guard_len = 0;
     range.partial_uncommit_base = 0;
     range.partial_uncommit_len = 0;
+    range.partial_uncommit_cursor = 0;
     range.partial_uncommit_accounted = false;
     next_free_range_slot = idx;
     interrupts.restore(release_irq_flags);
@@ -754,7 +809,7 @@ pub fn pageStateProbe(input: PageStateInput) PageStateResult {
         recordPageState(&result);
         return result;
     };
-    if (!commitSpanCovers(input.region_id, range.base + input.region_offset, byte_count)) {
+    if (!commitSpanCoversForRange(range, range.base + input.region_offset, byte_count)) {
         result.status = page_state_status_outside_commit;
         result.blockers |= page_state_blocker_outside_commit;
         recordPageState(&result);
@@ -981,6 +1036,7 @@ fn reserveAtInternal(req: ReserveAtRequest) Error!u32 {
         next_free_range_slot = slot;
         return Error.TableFull;
     }
+    insertRangeAddressIndex(slot);
     return id;
 }
 
@@ -989,38 +1045,43 @@ fn firstFit(window: Window, len: u64, alignment: u64) Error!u64 {
     const window_end = checkedEnd(def.base, def.len) orelse return Error.Overflow;
     var candidate = alignUpChecked(def.base, alignment) orelse return Error.Overflow;
 
-    while (candidate < window_end) {
+    var pos = lowerBoundAddress(def.base);
+    while (pos < range_address_count) : (pos += 1) {
+        const range = ranges[range_address_order[pos]];
+        if (range.base >= window_end) break;
+        if (range.window != window) continue;
         const candidate_end = checkedEnd(candidate, len) orelse return Error.Overflow;
-        if (candidate_end > window_end) break;
-
-        var conflict = false;
-        var i: usize = 0;
-        while (i < ranges.len) : (i += 1) {
-            const range = ranges[i];
-            if (!range.active() or range.window != window) continue;
-            if (!rangesOverlap(candidate, len, range.base, range.len)) continue;
-            const next = alignUpChecked(range.base + range.len, alignment) orelse return Error.Overflow;
+        if (candidate_end > window_end) return Error.NoSpace;
+        if (candidate_end <= range.base) return candidate;
+        const range_end = checkedEnd(range.base, range.len) orelse return Error.Overflow;
+        if (range_end > candidate) {
+            const next = alignUpChecked(range_end, alignment) orelse return Error.Overflow;
             if (next <= candidate) return Error.Overflow;
             candidate = next;
-            conflict = true;
-            break;
         }
-        if (!conflict) return candidate;
     }
-    return Error.NoSpace;
+    const candidate_end = checkedEnd(candidate, len) orelse return Error.Overflow;
+    return if (candidate_end <= window_end) candidate else Error.NoSpace;
 }
 
 fn uncommitSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) Error!void {
     if (range.window == .r4x_vm) return uncommitDemandSpan(range, start, len, skip_unmapped);
 
-    var offset: u64 = 0;
-    while (offset < len) : (offset += paging.PAGE_SIZE) {
-        const virt = start + offset;
+    const end = checkedEnd(start, len) orelse return Error.Overflow;
+    var virt = if (range.partial_uncommit_cursor >= start and range.partial_uncommit_cursor <= end)
+        range.partial_uncommit_cursor
+    else
+        start;
+    while (virt < end) : (virt += paging.PAGE_SIZE) {
         if (!paging.isMapped(virt)) {
-            if (skip_unmapped) continue;
+            if (skip_unmapped) {
+                advancePartialUncommitCursor(range, virt + paging.PAGE_SIZE);
+                continue;
+            }
             return Error.NotCommitted;
         }
         try uncommitPage(range, virt, true);
+        advancePartialUncommitCursor(range, virt + paging.PAGE_SIZE);
     }
 }
 
@@ -1031,7 +1092,16 @@ fn publishPartialUncommit(range: *Range, base: u64, len: u64, reset_accounted: b
     const irq_flags = interrupts.saveAndDisable();
     range.partial_uncommit_base = base;
     range.partial_uncommit_len = len;
-    if (reset_accounted) range.partial_uncommit_accounted = false;
+    if (reset_accounted) {
+        range.partial_uncommit_cursor = base;
+        range.partial_uncommit_accounted = false;
+    }
+    interrupts.restore(irq_flags);
+}
+
+fn advancePartialUncommitCursor(range: *Range, cursor: u64) void {
+    const irq_flags = interrupts.saveAndDisable();
+    range.partial_uncommit_cursor = cursor;
     interrupts.restore(irq_flags);
 }
 
@@ -1039,26 +1109,34 @@ fn clearPartialUncommit(range: *Range) void {
     const irq_flags = interrupts.saveAndDisable();
     range.partial_uncommit_base = 0;
     range.partial_uncommit_len = 0;
+    range.partial_uncommit_cursor = 0;
     range.partial_uncommit_accounted = false;
     interrupts.restore(irq_flags);
 }
 
 fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) Error!void {
-    if (!skip_unmapped and !commitSpanCovers(range.id, start, len)) return Error.NotCommitted;
-    if (try removeCommitSpanNeedsSlot(range.id, start, len)) {
-        if (freeCommitSpanSlot() == null) return Error.TableFull;
-    }
+    if (!skip_unmapped and !commitSpanCoversForRange(range, start, len)) return Error.NotCommitted;
+    const end = checkedEnd(start, len) orelse return Error.Overflow;
+    var commit_split = try reserveCommitSplitSlot(range.id, start, len);
+    defer if (commit_split) |slot| releaseCommitSpanSlot(slot);
+    const first_page = (start - range.base) / paging.PAGE_SIZE;
+    const end_page = first_page + len / paging.PAGE_SIZE;
+    var page_splits = try reservePageStateSplitSlots(range, first_page, end_page);
+    defer releaseReservedPageStateSlots(&page_splits);
 
-    var offset: u64 = 0;
-    while (offset < len) : (offset += paging.PAGE_SIZE) {
-        const virt = start + offset;
+    var virt = if (range.partial_uncommit_cursor >= start and range.partial_uncommit_cursor <= end)
+        range.partial_uncommit_cursor
+    else
+        start;
+    while (virt < end) : (virt += paging.PAGE_SIZE) {
         if (paging.isMapped(virt)) {
             try uncommitPage(range, virt, false);
         }
+        advancePartialUncommitCursor(range, virt + paging.PAGE_SIZE);
     }
 
-    try removeCommitSpan(range.id, start, len);
-    removePageStateRange(range.id, (start - range.base) / paging.PAGE_SIZE, len / paging.PAGE_SIZE);
+    try removeCommitSpanReserved(range.id, start, len, &commit_split);
+    try removePageStateRangeReserved(range, first_page, end_page, &page_splits);
     const irq_flags = interrupts.saveAndDisable();
     if (!range.partial_uncommit_accounted) {
         if (skip_unmapped and len > range.committed_bytes) {
@@ -1075,7 +1153,8 @@ fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) 
 
 fn uncommitPage(range: *Range, virt: u64, count_logical_commit: bool) Error!void {
     const frame = paging.mappedFrame(virt) orelse return Error.NotCommitted;
-    var release_plan = blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE) catch |err| return convertBlockError(err);
+    var release_plan: blocks.PhysicalReleasePlan = undefined;
+    blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE, &release_plan) catch |err| return convertBlockError(err);
     defer blocks.cancelPhysicalRangeRelease(&release_plan);
     if (!paging.unmapPage(virt)) {
         return Error.MapFailed;
@@ -1161,154 +1240,289 @@ fn isAppRange(range: Range) bool {
 }
 
 fn addCommitSpan(range_id: u32, base: u64, len: u64) Error!void {
-    const slot = freeCommitSpanSlot() orelse return Error.TableFull;
+    const range_index = indexById(range_id) orelse return Error.NotFound;
+    const range = &ranges[range_index];
+    const end = checkedEnd(base, len) orelse return Error.Overflow;
+    hot_path_stats.commit_span_lookups +%= 1;
+
+    var previous: ?u16 = null;
+    var current = range.commit_span_head;
+    var steps: usize = 0;
+    while (current) |slot| {
+        steps += 1;
+        if (commit_spans[slot].base >= base) break;
+        previous = slot;
+        current = commit_spans[slot].next;
+    }
+    recordCommitSpanSteps(steps);
+
+    if (previous) |slot| {
+        const previous_end = checkedEnd(commit_spans[slot].base, commit_spans[slot].len) orelse return Error.Overflow;
+        if (previous_end > base) return Error.Overlap;
+        if (previous_end == base) {
+            if (current) |next_slot| {
+                if (commit_spans[next_slot].base < end) return Error.Overlap;
+                if (commit_spans[next_slot].base == end) {
+                    const next_end = checkedEnd(commit_spans[next_slot].base, commit_spans[next_slot].len) orelse return Error.Overflow;
+                    commit_spans[slot].len = next_end - commit_spans[slot].base;
+                    unlinkCommitSpan(range, next_slot);
+                    releaseCommitSpanSlot(next_slot);
+                    return;
+                }
+            }
+            commit_spans[slot].len = end - commit_spans[slot].base;
+            return;
+        }
+    }
+    if (current) |slot| {
+        if (commit_spans[slot].base < end) return Error.Overlap;
+        if (commit_spans[slot].base == end) {
+            const next_end = checkedEnd(commit_spans[slot].base, commit_spans[slot].len) orelse return Error.Overflow;
+            commit_spans[slot].base = base;
+            commit_spans[slot].len = next_end - base;
+            return;
+        }
+    }
+
+    const slot = allocCommitSpanSlot() orelse return Error.TableFull;
     commit_spans[slot] = .{
         .slot_used = true,
         .range_id = range_id,
         .base = base,
         .len = len,
+        .prev = previous,
+        .next = current,
     };
-    coalesceCommitSpans(range_id) catch |err| return err;
+    if (previous) |prev_slot| {
+        commit_spans[prev_slot].next = slot;
+    } else {
+        range.commit_span_head = slot;
+    }
+    if (current) |next_slot| commit_spans[next_slot].prev = slot;
 }
 
 fn removeCommitSpan(range_id: u32, base: u64, len: u64) Error!void {
-    _ = checkedEnd(base, len) orelse return Error.Overflow;
-
-    var i: usize = 0;
-    while (i < commit_spans.len) : (i += 1) {
-        var span = &commit_spans[i];
-        if (!span.slot_used or span.range_id != range_id) continue;
-        if (!rangesOverlap(base, len, span.base, span.len)) continue;
-
-        const span_end = checkedEnd(span.base, span.len) orelse return Error.Overflow;
-        const release_end = checkedEnd(base, len) orelse return Error.Overflow;
-        const keep_left = span.base < base;
-        const keep_right = span_end > release_end;
-        const left_len = if (keep_left) base - span.base else 0;
-        const right_base = release_end;
-        const right_len = if (keep_right) span_end - release_end else 0;
-
-        if (keep_left and keep_right) {
-            const slot = freeCommitSpanSlot() orelse return Error.TableFull;
-            span.len = left_len;
-            commit_spans[slot] = .{
-                .slot_used = true,
-                .range_id = range_id,
-                .base = right_base,
-                .len = right_len,
-            };
-        } else if (keep_left) {
-            span.len = left_len;
-        } else if (keep_right) {
-            span.base = right_base;
-            span.len = right_len;
-        } else {
-            span.* = .{};
-        }
-    }
+    var reserved = try reserveCommitSplitSlot(range_id, base, len);
+    defer if (reserved) |slot| releaseCommitSpanSlot(slot);
+    try removeCommitSpanReserved(range_id, base, len, &reserved);
 }
 
 fn removeCommitSpanNeedsSlot(range_id: u32, base: u64, len: u64) Error!bool {
-    _ = checkedEnd(base, len) orelse return Error.Overflow;
+    const range_index = indexById(range_id) orelse return Error.NotFound;
+    const range = &ranges[range_index];
     const release_end = checkedEnd(base, len) orelse return Error.Overflow;
-
-    var i: usize = 0;
-    while (i < commit_spans.len) : (i += 1) {
-        const span = commit_spans[i];
-        if (!span.slot_used or span.range_id != range_id) continue;
+    hot_path_stats.commit_span_lookups +%= 1;
+    var current = range.commit_span_head;
+    var steps: usize = 0;
+    while (current) |slot| : (current = commit_spans[slot].next) {
+        steps += 1;
+        const span = commit_spans[slot];
+        if (span.base >= release_end) break;
         if (!rangesOverlap(base, len, span.base, span.len)) continue;
         const span_end = checkedEnd(span.base, span.len) orelse return Error.Overflow;
-        if (span.base < base and span_end > release_end) return true;
+        if (span.base < base and span_end > release_end) {
+            recordCommitSpanSteps(steps);
+            return true;
+        }
     }
+    recordCommitSpanSteps(steps);
     return false;
 }
 
-fn removeCommitSpansForRange(range_id: u32) void {
-    var i: usize = 0;
-    while (i < commit_spans.len) : (i += 1) {
-        if (commit_spans[i].slot_used and commit_spans[i].range_id == range_id) commit_spans[i] = .{};
+fn reserveCommitSplitSlot(range_id: u32, base: u64, len: u64) Error!?u16 {
+    if (!try removeCommitSpanNeedsSlot(range_id, base, len)) return null;
+    return allocCommitSpanSlot() orelse Error.TableFull;
+}
+
+fn removeCommitSpanReserved(range_id: u32, base: u64, len: u64, reserved: *?u16) Error!void {
+    const range_index = indexById(range_id) orelse return Error.NotFound;
+    const range = &ranges[range_index];
+    const release_end = checkedEnd(base, len) orelse return Error.Overflow;
+    hot_path_stats.commit_span_lookups +%= 1;
+
+    var current = range.commit_span_head;
+    var steps: usize = 0;
+    while (current) |slot| {
+        steps += 1;
+        const next = commit_spans[slot].next;
+        const span_base = commit_spans[slot].base;
+        if (span_base >= release_end) break;
+        const span_end = checkedEnd(span_base, commit_spans[slot].len) orelse return Error.Overflow;
+        if (span_end <= base) {
+            current = next;
+            continue;
+        }
+
+        const keep_left = span_base < base;
+        const keep_right = span_end > release_end;
+        if (keep_left and keep_right) {
+            const right_slot = reserved.* orelse return Error.TableFull;
+            reserved.* = null;
+            const old_next = commit_spans[slot].next;
+            commit_spans[slot].len = base - span_base;
+            commit_spans[right_slot] = .{
+                .slot_used = true,
+                .range_id = range_id,
+                .base = release_end,
+                .len = span_end - release_end,
+                .prev = slot,
+                .next = old_next,
+            };
+            commit_spans[slot].next = right_slot;
+            if (old_next) |next_slot| commit_spans[next_slot].prev = right_slot;
+            break;
+        } else if (keep_left) {
+            commit_spans[slot].len = base - span_base;
+        } else if (keep_right) {
+            commit_spans[slot].base = release_end;
+            commit_spans[slot].len = span_end - release_end;
+            break;
+        } else {
+            unlinkCommitSpan(range, slot);
+            releaseCommitSpanSlot(slot);
+        }
+        current = next;
     }
+    recordCommitSpanSteps(steps);
+}
+
+fn removeCommitSpansForRange(range_id: u32) void {
+    const range_index = indexById(range_id) orelse return;
+    const range = &ranges[range_index];
+    var current = range.commit_span_head;
+    while (current) |slot| {
+        const next = commit_spans[slot].next;
+        releaseCommitSpanSlot(slot);
+        current = next;
+    }
+    range.commit_span_head = null;
 }
 
 fn commitSpanOverlaps(range_id: u32, base: u64, len: u64) bool {
-    var i: usize = 0;
-    while (i < commit_spans.len) : (i += 1) {
-        const span = commit_spans[i];
-        if (!span.slot_used or span.range_id != range_id) continue;
-        if (rangesOverlap(base, len, span.base, span.len)) return true;
+    const range_index = indexById(range_id) orelse return false;
+    return commitSpanOverlapsForRange(&ranges[range_index], base, len);
+}
+
+fn commitSpanOverlapsForRange(range: *const Range, base: u64, len: u64) bool {
+    const end = checkedEnd(base, len) orelse return false;
+    hot_path_stats.commit_span_lookups +%= 1;
+    var current = range.commit_span_head;
+    var steps: usize = 0;
+    while (current) |slot| : (current = commit_spans[slot].next) {
+        steps += 1;
+        const span = commit_spans[slot];
+        if (span.base >= end) break;
+        const span_end = checkedEnd(span.base, span.len) orelse {
+            recordCommitSpanSteps(steps);
+            return true;
+        };
+        if (span_end > base) {
+            recordCommitSpanSteps(steps);
+            return true;
+        }
     }
+    recordCommitSpanSteps(steps);
     return false;
 }
 
 fn commitSpanCovers(range_id: u32, base: u64, len: u64) bool {
+    const range_index = indexById(range_id) orelse return false;
+    return commitSpanCoversForRange(&ranges[range_index], base, len);
+}
+
+fn commitSpanCoversForRange(range: *const Range, base: u64, len: u64) bool {
     const end = checkedEnd(base, len) orelse return false;
+    hot_path_stats.commit_span_lookups +%= 1;
     var cursor = base;
-    while (cursor < end) {
-        var next = cursor;
-        var i: usize = 0;
-        while (i < commit_spans.len) : (i += 1) {
-            const span = commit_spans[i];
-            if (!span.slot_used or span.range_id != range_id) continue;
-            const span_end = checkedEnd(span.base, span.len) orelse return false;
-            if (span.base <= cursor and cursor < span_end and span_end > next) next = span_end;
-        }
-        if (next == cursor) return false;
-        cursor = if (next > end) end else next;
-    }
-    return true;
-}
-
-fn coalesceCommitSpans(range_id: u32) Error!void {
-    var changed = true;
-    while (changed) {
-        changed = false;
-        var i: usize = 0;
-        while (i < commit_spans.len) : (i += 1) {
-            if (!commit_spans[i].slot_used or commit_spans[i].range_id != range_id) continue;
-            const a_end = checkedEnd(commit_spans[i].base, commit_spans[i].len) orelse return Error.Overflow;
-            var j: usize = i + 1;
-            while (j < commit_spans.len) : (j += 1) {
-                if (!commit_spans[j].slot_used or commit_spans[j].range_id != range_id) continue;
-                const b_end = checkedEnd(commit_spans[j].base, commit_spans[j].len) orelse return Error.Overflow;
-                if (a_end < commit_spans[j].base or b_end < commit_spans[i].base) continue;
-                const new_base = if (commit_spans[i].base < commit_spans[j].base) commit_spans[i].base else commit_spans[j].base;
-                const new_end = if (a_end > b_end) a_end else b_end;
-                commit_spans[i].base = new_base;
-                commit_spans[i].len = new_end - new_base;
-                commit_spans[j] = .{};
-                changed = true;
-                break;
-            }
-            if (changed) break;
+    var current = range.commit_span_head;
+    var steps: usize = 0;
+    while (current) |slot| : (current = commit_spans[slot].next) {
+        steps += 1;
+        const span = commit_spans[slot];
+        const span_end = checkedEnd(span.base, span.len) orelse {
+            recordCommitSpanSteps(steps);
+            return false;
+        };
+        if (span_end <= cursor) continue;
+        if (span.base > cursor) break;
+        cursor = @min(span_end, end);
+        if (cursor == end) {
+            recordCommitSpanSteps(steps);
+            return true;
         }
     }
+    recordCommitSpanSteps(steps);
+    return false;
 }
 
-fn freeCommitSpanSlot() ?usize {
-    var i: usize = 0;
-    while (i < commit_spans.len) : (i += 1) {
-        if (!commit_spans[i].slot_used) return i;
+fn allocCommitSpanSlot() ?u16 {
+    const slot = commit_span_free_head orelse return null;
+    commit_span_free_head = commit_spans[slot].next;
+    commit_spans[slot] = .{};
+    commit_span_active_count +|= 1;
+    return slot;
+}
+
+fn releaseCommitSpanSlot(slot: u16) void {
+    commit_spans[slot] = .{ .next = commit_span_free_head };
+    commit_span_free_head = slot;
+    if (commit_span_active_count != 0) commit_span_active_count -= 1;
+}
+
+fn unlinkCommitSpan(range: *Range, slot: u16) void {
+    const previous = commit_spans[slot].prev;
+    const next = commit_spans[slot].next;
+    if (previous) |prev_slot| {
+        commit_spans[prev_slot].next = next;
+    } else {
+        range.commit_span_head = next;
     }
-    return null;
+    if (next) |next_slot| commit_spans[next_slot].prev = previous;
 }
 
 fn rangeByAddress(addr: u64) ?*Range {
-    var i: usize = 0;
-    while (i < ranges.len) : (i += 1) {
-        if (!ranges[i].active()) continue;
-        const end = checkedEnd(ranges[i].base, ranges[i].len) orelse continue;
-        if (addr >= ranges[i].base and addr < end) return &ranges[i];
+    hot_path_stats.range_address_lookups +%= 1;
+    var probes: usize = 0;
+    var low: usize = 0;
+    var high = range_address_count;
+    while (low < high) {
+        probes += 1;
+        const mid = low + (high - low) / 2;
+        if (ranges[range_address_order[mid]].base <= addr) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    recordRangeAddressProbe(probes);
+    if (low == 0) return null;
+    const slot: usize = range_address_order[low - 1];
+    const end = checkedEnd(ranges[slot].base, ranges[slot].len) orelse return null;
+    if (addr < end) {
+        return &ranges[slot];
     }
     return null;
 }
 
 fn pageStateForFault(range_id: u32, page_index: u64) ?FaultPageState {
-    var i: usize = 0;
-    while (i < page_state_spans.len) : (i += 1) {
-        const span = page_state_spans[i];
-        if (!span.slot_used or span.range_id != range_id) continue;
-        const span_end = checkedAdd(span.first_page, span.page_count) orelse continue;
-        if (page_index < span.first_page or page_index >= span_end) continue;
+    const range_index = indexById(range_id) orelse return null;
+    return pageStateForFaultInRange(&ranges[range_index], page_index);
+}
+
+fn pageStateForFaultInRange(range: *const Range, page_index: u64) ?FaultPageState {
+    hot_path_stats.page_state_span_lookups +%= 1;
+    var current = range.page_state_span_head;
+    var steps: usize = 0;
+    while (current) |slot| : (current = page_state_spans[slot].next) {
+        steps += 1;
+        const span = page_state_spans[slot];
+        const span_end = checkedAdd(span.first_page, span.page_count) orelse {
+            recordPageStateSpanSteps(steps);
+            return null;
+        };
+        if (page_index < span.first_page) break;
+        if (page_index >= span_end) continue;
+        recordPageStateSpanSteps(steps);
         return .{
             .flags = span.flags,
             .slot_reservation_id = span.slot_reservation_id,
@@ -1316,6 +1530,7 @@ fn pageStateForFault(range_id: u32, page_index: u64) ?FaultPageState {
             .slot_generation = span.slot_generation,
         };
     }
+    recordPageStateSpanSteps(steps);
     return null;
 }
 
@@ -1374,7 +1589,8 @@ fn handlePageInFault(range: *Range, fault_page: u64, page_index: u64, fault_stat
     complete_input.io_bytes = io_bytes;
     const completed = backing_store.pageIoComplete(complete_input);
     if (completed.status != backing_store.page_io_status_page_in_ok) {
-        var release_plan = blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE) catch {
+        var release_plan: blocks.PhysicalReleasePlan = undefined;
+        blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE, &release_plan) catch {
             return recordPageInFaultFailure(range, page_index, true);
         };
         defer blocks.cancelPhysicalRangeRelease(&release_plan);
@@ -1407,7 +1623,7 @@ fn makePageRangeNonresident(region_id: u32, region_offset: u64, page_count: u64)
     const idx = indexById(region_id) orelse return Error.NotFound;
     const range = &ranges[idx];
     try validateInside(range.*, region_offset, byte_count);
-    if (!commitSpanCovers(region_id, range.base + region_offset, byte_count)) return Error.NotCommitted;
+    if (!commitSpanCoversForRange(range, range.base + region_offset, byte_count)) return Error.NotCommitted;
     const first_page = region_offset / paging.PAGE_SIZE;
     defer blocks.coalescePhysicalRanges();
     var nonresident_pages: u64 = 0;
@@ -1481,14 +1697,17 @@ pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32) rec
 pub fn evictableBytes() u64 {
     if (!initialized or backing_store.activeBackingResult() == null) return 0;
     var bytes: u64 = 0;
-    var i: usize = 0;
-    while (i < page_state_spans.len) : (i += 1) {
-        const span = page_state_spans[i];
-        if (!span.slot_used) continue;
-        const evictable_flags = page_state_flag_committed | page_state_flag_resident;
-        if ((span.flags & evictable_flags) != evictable_flags) continue;
-        if ((span.flags & (page_state_flag_pinned | page_state_flag_busy | page_state_flag_error)) != 0) continue;
-        bytes +%= span.page_count * paging.PAGE_SIZE;
+    var range_pos: usize = 0;
+    while (range_pos < range_address_count) : (range_pos += 1) {
+        const range = ranges[range_address_order[range_pos]];
+        var current = range.page_state_span_head;
+        while (current) |slot| : (current = page_state_spans[slot].next) {
+            const span = page_state_spans[slot];
+            const evictable_flags = page_state_flag_committed | page_state_flag_resident;
+            if ((span.flags & evictable_flags) != evictable_flags) continue;
+            if ((span.flags & (page_state_flag_pinned | page_state_flag_busy | page_state_flag_error)) != 0) continue;
+            bytes +%= span.page_count * paging.PAGE_SIZE;
+        }
     }
     return bytes;
 }
@@ -1496,86 +1715,134 @@ pub fn evictableBytes() u64 {
 pub fn evictableDirtyBytes() u64 {
     if (!initialized or backing_store.activeBackingResult() == null) return 0;
     var bytes: u64 = 0;
-    var i: usize = 0;
-    while (i < page_state_spans.len) : (i += 1) {
-        const span = page_state_spans[i];
-        if (!span.slot_used) continue;
-        const evictable_flags = page_state_flag_committed | page_state_flag_resident | page_state_flag_dirty;
-        if ((span.flags & evictable_flags) != evictable_flags) continue;
-        if ((span.flags & (page_state_flag_pinned | page_state_flag_busy | page_state_flag_error)) != 0) continue;
-        bytes +%= span.page_count * paging.PAGE_SIZE;
+    var range_pos: usize = 0;
+    while (range_pos < range_address_count) : (range_pos += 1) {
+        const range = ranges[range_address_order[range_pos]];
+        var current = range.page_state_span_head;
+        while (current) |slot| : (current = page_state_spans[slot].next) {
+            const span = page_state_spans[slot];
+            const evictable_flags = page_state_flag_committed | page_state_flag_resident | page_state_flag_dirty;
+            if ((span.flags & evictable_flags) != evictable_flags) continue;
+            if ((span.flags & (page_state_flag_pinned | page_state_flag_busy | page_state_flag_error)) != 0) continue;
+            bytes +%= span.page_count * paging.PAGE_SIZE;
+        }
     }
     return bytes;
 }
 
 fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8) EvictionStep {
-    var range_index: usize = 0;
-    while (range_index < ranges.len) : (range_index += 1) {
-        var range = &ranges[range_index];
-        if (!range.active() or range.window != .r4x_vm or range.owner != .r4x_instance) continue;
-        if (range.owner_id == 0 or range.owner_id > std.math.maxInt(u32)) continue;
-
-        var span_index: usize = 0;
-        while (span_index < page_state_spans.len) : (span_index += 1) {
-            const span = page_state_spans[span_index];
-            if (!span.slot_used or span.range_id != range.id) continue;
-            if ((span.flags & page_state_flag_committed) == 0) continue;
-
-            var offset: u64 = 0;
-            while (offset < span.page_count) : (offset += 1) {
-                const page_index = span.first_page + offset;
-                const virt = range.base + page_index * paging.PAGE_SIZE;
-                if (range.guard_len != 0 and rangesOverlap(virt, paging.PAGE_SIZE, range.guard_base, range.guard_len)) {
-                    page_state_summary.pager_disabled_eviction_gates +%= 1;
-                    continue;
-                }
-                if ((span.flags & page_state_flag_resident) == 0) {
-                    page_state_summary.eviction_skipped_nonresident +%= 1;
-                    continue;
-                }
-                if ((span.flags & page_state_flag_pinned) != 0) {
-                    page_state_summary.eviction_skipped_pinned +%= 1;
-                    page_state_summary.pager_disabled_eviction_gates +%= 1;
-                    continue;
-                }
-                if ((span.flags & page_state_flag_busy) != 0) {
-                    page_state_summary.eviction_skipped_busy +%= 1;
-                    page_state_summary.pager_disabled_eviction_gates +%= 1;
-                    continue;
-                }
-                if ((span.flags & page_state_flag_error) != 0) {
-                    page_state_summary.eviction_skipped_error +%= 1;
-                    page_state_summary.pager_disabled_eviction_gates +%= 1;
-                    continue;
-                }
-                if (!paging.isMapped(virt)) {
-                    page_state_summary.eviction_skipped_unmapped +%= 1;
-                    continue;
-                }
-
-                syncHardwareDirty(range.*, page_index, 1);
-                const current = pageStateForFault(range.id, page_index) orelse {
-                    page_state_summary.eviction_skipped_nonresident +%= 1;
-                    continue;
-                };
-                if ((current.flags & page_state_flag_resident) == 0) {
-                    page_state_summary.eviction_skipped_nonresident +%= 1;
-                    continue;
-                }
-                if ((current.flags & (page_state_flag_pinned | page_state_flag_busy | page_state_flag_error)) != 0) {
-                    if ((current.flags & page_state_flag_pinned) != 0) page_state_summary.eviction_skipped_pinned +%= 1;
-                    if ((current.flags & page_state_flag_busy) != 0) page_state_summary.eviction_skipped_busy +%= 1;
-                    if ((current.flags & page_state_flag_error) != 0) page_state_summary.eviction_skipped_error +%= 1;
-                    page_state_summary.pager_disabled_eviction_gates +%= 1;
-                    continue;
-                }
-
-                page_state_summary.eviction_candidates +%= 1;
-                return evictResidentPage(range, page_index, current, backing, path);
-            }
+    if (range_address_count == 0) return .{ .outcome = .skipped };
+    var start_pos: usize = 0;
+    var start_page: u64 = 0;
+    if (reclaim_cursor_range_slot) |cursor_slot| {
+        const raw_position = range_address_position[cursor_slot];
+        if (raw_position != INVALID_RANGE_POSITION and @as(usize, raw_position) < range_address_count) {
+            start_pos = raw_position;
+            start_page = reclaim_cursor_page;
         }
     }
+
+    var visited: usize = 0;
+    var range_pos = start_pos;
+    while (visited < range_address_count) : (visited += 1) {
+        const range_slot = range_address_order[range_pos];
+        var range = &ranges[range_slot];
+        hot_path_stats.reclaim_cursor_range_steps +%= 1;
+        const page_floor = if (visited == 0) start_page else 0;
+
+        if (range.active() and range.window == .r4x_vm and range.owner == .r4x_instance and
+            range.owner_id != 0 and range.owner_id <= std.math.maxInt(u32))
+        {
+            var span_cursor = range.page_state_span_head;
+            while (span_cursor) |span_slot| : (span_cursor = page_state_spans[span_slot].next) {
+                hot_path_stats.reclaim_cursor_span_steps +%= 1;
+                const span = page_state_spans[span_slot];
+                if ((span.flags & page_state_flag_committed) == 0) continue;
+                const span_end = checkedAdd(span.first_page, span.page_count) orelse continue;
+                if (span_end <= page_floor) continue;
+
+                var page_index = @max(span.first_page, page_floor);
+                while (page_index < span_end) : (page_index += 1) {
+                    hot_path_stats.reclaim_cursor_page_steps +%= 1;
+                    setReclaimCursorAfterPage(range_pos, page_index + 1);
+                    const virt = range.base + page_index * paging.PAGE_SIZE;
+                    if (range.guard_len != 0 and rangesOverlap(virt, paging.PAGE_SIZE, range.guard_base, range.guard_len)) {
+                        page_state_summary.pager_disabled_eviction_gates +%= 1;
+                        continue;
+                    }
+                    if ((span.flags & page_state_flag_resident) == 0) {
+                        page_state_summary.eviction_skipped_nonresident +%= 1;
+                        continue;
+                    }
+                    if ((span.flags & page_state_flag_pinned) != 0) {
+                        page_state_summary.eviction_skipped_pinned +%= 1;
+                        page_state_summary.pager_disabled_eviction_gates +%= 1;
+                        continue;
+                    }
+                    if ((span.flags & page_state_flag_busy) != 0) {
+                        page_state_summary.eviction_skipped_busy +%= 1;
+                        page_state_summary.pager_disabled_eviction_gates +%= 1;
+                        continue;
+                    }
+                    if ((span.flags & page_state_flag_error) != 0) {
+                        page_state_summary.eviction_skipped_error +%= 1;
+                        page_state_summary.pager_disabled_eviction_gates +%= 1;
+                        continue;
+                    }
+                    if (!paging.isMapped(virt)) {
+                        page_state_summary.eviction_skipped_unmapped +%= 1;
+                        continue;
+                    }
+
+                    syncHardwareDirty(range.*, page_index, 1);
+                    const state = pageStateForFaultInRange(range, page_index) orelse {
+                        page_state_summary.eviction_skipped_nonresident +%= 1;
+                        continue;
+                    };
+                    if ((state.flags & page_state_flag_resident) == 0) {
+                        page_state_summary.eviction_skipped_nonresident +%= 1;
+                        continue;
+                    }
+                    if ((state.flags & (page_state_flag_pinned | page_state_flag_busy | page_state_flag_error)) != 0) {
+                        if ((state.flags & page_state_flag_pinned) != 0) page_state_summary.eviction_skipped_pinned +%= 1;
+                        if ((state.flags & page_state_flag_busy) != 0) page_state_summary.eviction_skipped_busy +%= 1;
+                        if ((state.flags & page_state_flag_error) != 0) page_state_summary.eviction_skipped_error +%= 1;
+                        page_state_summary.pager_disabled_eviction_gates +%= 1;
+                        continue;
+                    }
+
+                    page_state_summary.eviction_candidates +%= 1;
+                    return evictResidentPage(range, page_index, state, backing, path);
+                }
+            }
+        }
+
+        range_pos += 1;
+        if (range_pos == range_address_count) {
+            range_pos = 0;
+            hot_path_stats.reclaim_cursor_wraps +%= 1;
+        }
+        reclaim_cursor_range_slot = range_address_order[range_pos];
+        reclaim_cursor_page = 0;
+    }
     return .{ .outcome = .skipped };
+}
+
+fn setReclaimCursorAfterPage(range_pos: usize, next_page: u64) void {
+    const slot = range_address_order[range_pos];
+    const range_pages = ranges[slot].len / paging.PAGE_SIZE;
+    if (next_page < range_pages) {
+        reclaim_cursor_range_slot = slot;
+        reclaim_cursor_page = next_page;
+        return;
+    }
+    var next_pos = range_pos + 1;
+    if (next_pos == range_address_count) {
+        next_pos = 0;
+        hot_path_stats.reclaim_cursor_wraps +%= 1;
+    }
+    reclaim_cursor_range_slot = range_address_order[next_pos];
+    reclaim_cursor_page = 0;
 }
 
 fn evictResidentPage(range: *Range, page_index: u64, state: FaultPageState, backing: backing_store.Result, path: [*:0]const u8) EvictionStep {
@@ -1927,7 +2194,23 @@ const SlotBinding = struct {
 
 fn addPageStateSpan(range_id: u32, first_page: u64, page_count: u64, flags: u32, reservation_id: u32, slot_index: u64, slot_generation: u64) Error!void {
     if (page_count == 0) return;
-    const slot = freePageStateSpanSlot() orelse return Error.TableFull;
+    _ = checkedAdd(first_page, page_count) orelse return Error.Overflow;
+    const range_index = indexById(range_id) orelse return Error.NotFound;
+    const range = &ranges[range_index];
+    hot_path_stats.page_state_span_lookups +%= 1;
+
+    var previous: ?u16 = null;
+    var current = range.page_state_span_head;
+    var steps: usize = 0;
+    while (current) |current_slot| {
+        steps += 1;
+        if (page_state_spans[current_slot].first_page >= first_page) break;
+        previous = current_slot;
+        current = page_state_spans[current_slot].next;
+    }
+    recordPageStateSpanSteps(steps);
+
+    const slot = allocPageStateSpanSlot() orelse return Error.TableFull;
     page_state_spans[slot] = .{
         .slot_used = true,
         .range_id = range_id,
@@ -1937,30 +2220,45 @@ fn addPageStateSpan(range_id: u32, first_page: u64, page_count: u64, flags: u32,
         .slot_reservation_id = reservation_id,
         .slot_index = slot_index,
         .slot_generation = slot_generation,
+        .prev = previous,
+        .next = current,
     };
-    try coalescePageStateSpans(range_id);
+    if (previous) |prev_slot| {
+        page_state_spans[prev_slot].next = slot;
+    } else {
+        range.page_state_span_head = slot;
+    }
+    if (current) |next_slot| page_state_spans[next_slot].prev = slot;
+    try coalescePageStateSpansForRange(range);
     page_state_summary.transitions +%= 1;
 }
 
 fn pageStateSet(range_id: u32, first_page: u64, page_count: u64, add_flags: u32, remove_flags: u32, binding: ?SlotBinding, count_transition: bool) Error!void {
     if (page_count == 0) return;
     const end_page = checkedAdd(first_page, page_count) orelse return Error.Overflow;
-    try splitPageStateBoundaries(range_id, first_page, end_page);
+    const range_index = indexById(range_id) orelse return Error.NotFound;
+    const range = &ranges[range_index];
+    var reserved = try reservePageStateSplitSlots(range, first_page, end_page);
+    defer releaseReservedPageStateSlots(&reserved);
+    try splitPageStateBoundariesReserved(range, first_page, end_page, &reserved);
 
     var changed = false;
-    var i: usize = 0;
-    while (i < page_state_spans.len) : (i += 1) {
-        var span = &page_state_spans[i];
-        if (!span.slot_used or span.range_id != range_id) continue;
-        const span_end = checkedAdd(span.first_page, span.page_count) orelse continue;
+    hot_path_stats.page_state_span_lookups +%= 1;
+    var current = range.page_state_span_head;
+    var steps: usize = 0;
+    while (current) |slot| : (current = page_state_spans[slot].next) {
+        steps += 1;
+        var span = &page_state_spans[slot];
+        if (span.first_page >= end_page) break;
+        const span_end = checkedAdd(span.first_page, span.page_count) orelse return Error.Overflow;
         if (span.first_page < first_page or span_end > end_page) continue;
         const before_flags = span.flags;
         span.flags |= add_flags;
         span.flags &= ~remove_flags;
-        if (binding) |slot| {
-            span.slot_reservation_id = slot.reservation_id;
-            span.slot_index = slot.slot_index + (span.first_page - first_page);
-            span.slot_generation = slot.slot_generation;
+        if (binding) |slot_binding| {
+            span.slot_reservation_id = slot_binding.reservation_id;
+            span.slot_index = slot_binding.slot_index + (span.first_page - first_page);
+            span.slot_generation = slot_binding.slot_generation;
         }
         if ((span.flags & page_state_flag_slot_bound) == 0) {
             span.slot_reservation_id = 0;
@@ -1969,41 +2267,75 @@ fn pageStateSet(range_id: u32, first_page: u64, page_count: u64, add_flags: u32,
         }
         if (before_flags != span.flags or binding != null) changed = true;
     }
+    recordPageStateSpanSteps(steps);
 
-    try coalescePageStateSpans(range_id);
+    try coalescePageStateSpansForRange(range);
     if (changed and count_transition) page_state_summary.transitions +%= 1;
 }
 
-fn splitPageStateBoundaries(range_id: u32, first_page: u64, end_page: u64) Error!void {
-    var changed = true;
-    while (changed) {
-        changed = false;
-        var i: usize = 0;
-        while (i < page_state_spans.len) : (i += 1) {
-            const span = page_state_spans[i];
-            if (!span.slot_used or span.range_id != range_id) continue;
-            const span_end = checkedAdd(span.first_page, span.page_count) orelse return Error.Overflow;
-            if (first_page > span.first_page and first_page < span_end) {
-                try splitPageStateSpan(i, first_page);
-                changed = true;
-                break;
-            }
-            if (end_page > span.first_page and end_page < span_end) {
-                try splitPageStateSpan(i, end_page);
-                changed = true;
-                break;
-            }
-        }
+fn reservePageStateSplitSlots(range: *const Range, first_page: u64, end_page: u64) Error![2]?u16 {
+    var needed: usize = 0;
+    hot_path_stats.page_state_span_lookups +%= 1;
+    var current = range.page_state_span_head;
+    var steps: usize = 0;
+    while (current) |slot| : (current = page_state_spans[slot].next) {
+        steps += 1;
+        const span = page_state_spans[slot];
+        if (span.first_page >= end_page) break;
+        const span_end = checkedAdd(span.first_page, span.page_count) orelse return Error.Overflow;
+        if (first_page > span.first_page and first_page < span_end) needed += 1;
+        if (end_page > span.first_page and end_page < span_end) needed += 1;
+        if (needed == 2) break;
+    }
+    recordPageStateSpanSteps(steps);
+
+    if (@as(usize, page_state_span_active_count) + needed > MAX_PAGE_STATE_SPANS) return Error.TableFull;
+    var reserved: [2]?u16 = .{ null, null };
+    var i: usize = 0;
+    while (i < needed) : (i += 1) {
+        reserved[i] = allocPageStateSpanSlot() orelse {
+            releaseReservedPageStateSlots(&reserved);
+            return Error.TableFull;
+        };
+    }
+    return reserved;
+}
+
+fn splitPageStateBoundariesReserved(range: *Range, first_page: u64, end_page: u64, reserved: *[2]?u16) Error!void {
+    try splitPageStateBoundaryReserved(range, first_page, reserved);
+    if (end_page != first_page) try splitPageStateBoundaryReserved(range, end_page, reserved);
+}
+
+fn splitPageStateBoundaryReserved(range: *Range, boundary: u64, reserved: *[2]?u16) Error!void {
+    var current = range.page_state_span_head;
+    while (current) |slot| : (current = page_state_spans[slot].next) {
+        const span = page_state_spans[slot];
+        if (boundary <= span.first_page) return;
+        const span_end = checkedAdd(span.first_page, span.page_count) orelse return Error.Overflow;
+        if (boundary >= span_end) continue;
+        const right_slot = takeReservedPageStateSlot(reserved) orelse return Error.TableFull;
+        splitPageStateSpanReserved(slot, boundary, right_slot);
+        return;
     }
 }
 
-fn splitPageStateSpan(index: usize, split_page: u64) Error!void {
-    var span = &page_state_spans[index];
-    const span_end = checkedAdd(span.first_page, span.page_count) orelse return Error.Overflow;
-    if (split_page <= span.first_page or split_page >= span_end) return;
+fn takeReservedPageStateSlot(reserved: *[2]?u16) ?u16 {
+    var i: usize = 0;
+    while (i < reserved.len) : (i += 1) {
+        if (reserved[i]) |slot| {
+            reserved[i] = null;
+            return slot;
+        }
+    }
+    return null;
+}
+
+fn splitPageStateSpanReserved(slot: u16, split_page: u64, right_slot: u16) void {
+    var span = &page_state_spans[slot];
+    const span_end = span.first_page + span.page_count;
     const right_count = span_end - split_page;
-    const slot = freePageStateSpanSlot() orelse return Error.TableFull;
-    page_state_spans[slot] = .{
+    const old_next = span.next;
+    page_state_spans[right_slot] = .{
         .slot_used = true,
         .range_id = span.range_id,
         .first_page = split_page,
@@ -2012,70 +2344,70 @@ fn splitPageStateSpan(index: usize, split_page: u64) Error!void {
         .slot_reservation_id = span.slot_reservation_id,
         .slot_index = if ((span.flags & page_state_flag_slot_bound) != 0) span.slot_index + (split_page - span.first_page) else 0,
         .slot_generation = span.slot_generation,
+        .prev = slot,
+        .next = old_next,
     };
+    span.next = right_slot;
     span.page_count = split_page - span.first_page;
+    if (old_next) |next_slot| page_state_spans[next_slot].prev = right_slot;
 }
 
-fn removePageStateRange(range_id: u32, first_page: u64, page_count: u64) void {
+fn removePageStateRange(range_id: u32, first_page: u64, page_count: u64) Error!void {
     if (page_count == 0) return;
-    const end_page = checkedAdd(first_page, page_count) orelse return;
-    splitPageStateBoundaries(range_id, first_page, end_page) catch {
-        removePageStateForRange(range_id);
-        return;
-    };
+    const end_page = checkedAdd(first_page, page_count) orelse return Error.Overflow;
+    const range_index = indexById(range_id) orelse return Error.NotFound;
+    const range = &ranges[range_index];
+    var reserved = try reservePageStateSplitSlots(range, first_page, end_page);
+    defer releaseReservedPageStateSlots(&reserved);
+    try removePageStateRangeReserved(range, first_page, end_page, &reserved);
+}
+
+fn removePageStateRangeReserved(range: *Range, first_page: u64, end_page: u64, reserved: *[2]?u16) Error!void {
+    try splitPageStateBoundariesReserved(range, first_page, end_page, reserved);
     var removed_pages: u64 = 0;
-    var i: usize = 0;
-    while (i < page_state_spans.len) : (i += 1) {
-        const span = page_state_spans[i];
-        if (!span.slot_used or span.range_id != range_id) continue;
-        const span_end = checkedAdd(span.first_page, span.page_count) orelse continue;
+    var current = range.page_state_span_head;
+    while (current) |slot| {
+        const next = page_state_spans[slot].next;
+        const span = page_state_spans[slot];
+        if (span.first_page >= end_page) break;
+        const span_end = checkedAdd(span.first_page, span.page_count) orelse return Error.Overflow;
         if (span.first_page >= first_page and span_end <= end_page) {
             removed_pages +%= span.page_count;
-            page_state_spans[i] = .{};
+            unlinkPageStateSpan(range, slot);
+            releasePageStateSpanSlot(slot);
         }
+        current = next;
     }
     page_state_summary.cleanup_pages +%= removed_pages;
-    coalescePageStateSpans(range_id) catch {};
+    try coalescePageStateSpansForRange(range);
 }
 
 fn removePageStateForRange(range_id: u32) void {
+    const range_index = indexById(range_id) orelse return;
+    const range = &ranges[range_index];
     var removed_pages: u64 = 0;
-    var i: usize = 0;
-    while (i < page_state_spans.len) : (i += 1) {
-        if (page_state_spans[i].slot_used and page_state_spans[i].range_id == range_id) {
-            removed_pages +%= page_state_spans[i].page_count;
-            page_state_spans[i] = .{};
-        }
+    var current = range.page_state_span_head;
+    while (current) |slot| {
+        const next = page_state_spans[slot].next;
+        removed_pages +%= page_state_spans[slot].page_count;
+        releasePageStateSpanSlot(slot);
+        current = next;
     }
+    range.page_state_span_head = null;
     page_state_summary.cleanup_pages +%= removed_pages;
 }
 
-fn coalescePageStateSpans(range_id: u32) Error!void {
-    var changed = true;
-    while (changed) {
-        changed = false;
-        var i: usize = 0;
-        while (i < page_state_spans.len) : (i += 1) {
-            if (!page_state_spans[i].slot_used or page_state_spans[i].range_id != range_id) continue;
-            const a_end = checkedAdd(page_state_spans[i].first_page, page_state_spans[i].page_count) orelse return Error.Overflow;
-            var j: usize = i + 1;
-            while (j < page_state_spans.len) : (j += 1) {
-                if (!page_state_spans[j].slot_used or page_state_spans[j].range_id != range_id) continue;
-                const b_end = checkedAdd(page_state_spans[j].first_page, page_state_spans[j].page_count) orelse return Error.Overflow;
-                if (a_end == page_state_spans[j].first_page and pageStateSpansMergeable(page_state_spans[i], page_state_spans[j])) {
-                    page_state_spans[i].page_count += page_state_spans[j].page_count;
-                    page_state_spans[j] = .{};
-                    changed = true;
-                    break;
-                }
-                if (b_end == page_state_spans[i].first_page and pageStateSpansMergeable(page_state_spans[j], page_state_spans[i])) {
-                    page_state_spans[j].page_count += page_state_spans[i].page_count;
-                    page_state_spans[i] = .{};
-                    changed = true;
-                    break;
-                }
-            }
-            if (changed) break;
+fn coalescePageStateSpansForRange(range: *Range) Error!void {
+    var current = range.page_state_span_head;
+    while (current) |slot| {
+        const next = page_state_spans[slot].next orelse break;
+        const span_end = checkedAdd(page_state_spans[slot].first_page, page_state_spans[slot].page_count) orelse return Error.Overflow;
+        if (span_end == page_state_spans[next].first_page and pageStateSpansMergeable(page_state_spans[slot], page_state_spans[next])) {
+            page_state_spans[slot].page_count += page_state_spans[next].page_count;
+            unlinkPageStateSpan(range, next);
+            releasePageStateSpanSlot(next);
+        } else {
+            current = next;
         }
     }
 }
@@ -2091,11 +2423,16 @@ fn fillPageStateCounts(range_id: u32, first_page: u64, page_count: u64, result: 
     const end_page = checkedAdd(first_page, page_count) orelse return;
     result.span_count = activePageStateSpanCount();
     result.flags |= page_state_flag_hardware_dirty_synced;
+    const range_index = indexById(range_id) orelse return;
+    const range = &ranges[range_index];
     var first_slot_seen = false;
-    var i: usize = 0;
-    while (i < page_state_spans.len) : (i += 1) {
-        const span = page_state_spans[i];
-        if (!span.slot_used or span.range_id != range_id) continue;
+    hot_path_stats.page_state_span_lookups +%= 1;
+    var current = range.page_state_span_head;
+    var steps: usize = 0;
+    while (current) |slot| : (current = page_state_spans[slot].next) {
+        steps += 1;
+        const span = page_state_spans[slot];
+        if (span.first_page >= end_page) break;
         const span_end = checkedAdd(span.first_page, span.page_count) orelse continue;
         if (!pageRangesOverlap(first_page, end_page, span.first_page, span_end)) continue;
         const overlap_start = if (span.first_page > first_page) span.first_page else first_page;
@@ -2118,6 +2455,7 @@ fn fillPageStateCounts(range_id: u32, first_page: u64, page_count: u64, result: 
             }
         }
     }
+    recordPageStateSpanSteps(steps);
     if (result.committed_pages >= result.resident_pages) result.nonresident_pages = result.committed_pages - result.resident_pages;
     if (result.committed_pages >= result.dirty_pages) result.clean_pages = result.committed_pages - result.dirty_pages;
     result.total_transitions = page_state_summary.transitions;
@@ -2186,20 +2524,42 @@ fn recordPageState(result: *const PageStateResult) void {
 }
 
 fn activePageStateSpanCount() u32 {
-    var count: u32 = 0;
-    var i: usize = 0;
-    while (i < page_state_spans.len) : (i += 1) {
-        if (page_state_spans[i].slot_used) count +|= 1;
-    }
-    return count;
+    return page_state_span_active_count;
 }
 
-fn freePageStateSpanSlot() ?usize {
+fn allocPageStateSpanSlot() ?u16 {
+    const slot = page_state_span_free_head orelse return null;
+    page_state_span_free_head = page_state_spans[slot].next;
+    page_state_spans[slot] = .{};
+    page_state_span_active_count +|= 1;
+    return slot;
+}
+
+fn releasePageStateSpanSlot(slot: u16) void {
+    page_state_spans[slot] = .{ .next = page_state_span_free_head };
+    page_state_span_free_head = slot;
+    if (page_state_span_active_count != 0) page_state_span_active_count -= 1;
+}
+
+fn releaseReservedPageStateSlots(reserved: *[2]?u16) void {
     var i: usize = 0;
-    while (i < page_state_spans.len) : (i += 1) {
-        if (!page_state_spans[i].slot_used) return i;
+    while (i < reserved.len) : (i += 1) {
+        if (reserved[i]) |slot| {
+            releasePageStateSpanSlot(slot);
+            reserved[i] = null;
+        }
     }
-    return null;
+}
+
+fn unlinkPageStateSpan(range: *Range, slot: u16) void {
+    const previous = page_state_spans[slot].prev;
+    const next = page_state_spans[slot].next;
+    if (previous) |prev_slot| {
+        page_state_spans[prev_slot].next = next;
+    } else {
+        range.page_state_span_head = next;
+    }
+    if (next) |next_slot| page_state_spans[next_slot].prev = previous;
 }
 
 fn pageRangesOverlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) bool {
@@ -2216,29 +2576,21 @@ fn largestFreeInWindow(window: Window) FreeSpan {
     var cursor = def.base;
     const window_end = checkedEnd(def.base, def.len) orelse return best;
 
-    while (cursor < window_end) {
-        var inside_used = false;
-        var used_end = cursor;
-        var next_used_base = window_end;
-        var i: usize = 0;
-        while (i < ranges.len) : (i += 1) {
-            const range = ranges[i];
-            if (!range.active() or range.window != window) continue;
-            const range_end = checkedEnd(range.base, range.len) orelse return best;
-            if (range.base <= cursor and cursor < range_end) {
-                inside_used = true;
-                if (range_end > used_end) used_end = range_end;
-            } else if (range.base > cursor and range.base < next_used_base) {
-                next_used_base = range.base;
-            }
+    var pos = lowerBoundAddress(def.base);
+    while (pos < range_address_count) : (pos += 1) {
+        const range = ranges[range_address_order[pos]];
+        if (range.base >= window_end) break;
+        if (range.window != window) continue;
+        if (range.base > cursor) {
+            const free_len = range.base - cursor;
+            if (free_len > best.len) best = .{ .base = cursor, .len = free_len };
         }
-        if (inside_used) {
-            cursor = used_end;
-            continue;
-        }
-        const free_len = next_used_base - cursor;
-        if (free_len > best.len) best = .{ .base = cursor, .len = free_len };
-        cursor = next_used_base;
+        const range_end = checkedEnd(range.base, range.len) orelse return best;
+        if (range_end > cursor) cursor = range_end;
+    }
+
+    if (cursor < window_end and window_end - cursor > best.len) {
+        best = .{ .base = cursor, .len = window_end - cursor };
     }
 
     return best;
@@ -2279,6 +2631,59 @@ fn freeSlot() ?usize {
     }
     recordFreeSlotProbe(probes);
     return null;
+}
+
+fn lowerBoundAddress(base: u64) usize {
+    var low: usize = 0;
+    var high = range_address_count;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        if (ranges[range_address_order[mid]].base < base) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
+fn insertRangeAddressIndex(slot: usize) void {
+    const pos = lowerBoundAddress(ranges[slot].base);
+    var i = range_address_count;
+    while (i > pos) {
+        range_address_order[i] = range_address_order[i - 1];
+        range_address_position[range_address_order[i]] = @intCast(i);
+        i -= 1;
+    }
+    range_address_order[pos] = @intCast(slot);
+    range_address_position[slot] = @intCast(pos);
+    range_address_count += 1;
+}
+
+fn removeRangeAddressIndex(slot: usize) void {
+    const raw_pos = range_address_position[slot];
+    if (raw_pos == INVALID_RANGE_POSITION) return;
+    const pos: usize = raw_pos;
+    if (pos >= range_address_count or range_address_order[pos] != slot) return;
+
+    if (reclaim_cursor_range_slot != null and reclaim_cursor_range_slot.? == slot) {
+        if (range_address_count > 1) {
+            const next_pos = if (pos + 1 < range_address_count) pos + 1 else 0;
+            reclaim_cursor_range_slot = range_address_order[next_pos];
+            reclaim_cursor_page = 0;
+        } else {
+            reclaim_cursor_range_slot = null;
+            reclaim_cursor_page = 0;
+        }
+    }
+
+    var i = pos;
+    while (i + 1 < range_address_count) : (i += 1) {
+        range_address_order[i] = range_address_order[i + 1];
+        range_address_position[range_address_order[i]] = @intCast(i);
+    }
+    range_address_count -= 1;
+    range_address_position[slot] = INVALID_RANGE_POSITION;
 }
 
 fn allocId() Error!u32 {
@@ -2420,12 +2825,151 @@ fn recordFreeSlotProbe(probes: usize) void {
     if (p > hot_path_stats.range_free_slot_probe_max) hot_path_stats.range_free_slot_probe_max = p;
 }
 
+fn recordRangeAddressProbe(probes: usize) void {
+    const p: u32 = @intCast(@min(probes, std.math.maxInt(u32)));
+    hot_path_stats.range_address_probe_last = p;
+    hot_path_stats.range_address_probe_total +%= p;
+    if (p > hot_path_stats.range_address_probe_max) hot_path_stats.range_address_probe_max = p;
+}
+
+fn recordCommitSpanSteps(steps: usize) void {
+    const value: u32 = @intCast(@min(steps, std.math.maxInt(u32)));
+    hot_path_stats.commit_span_steps +%= value;
+    if (value > hot_path_stats.commit_span_step_max) hot_path_stats.commit_span_step_max = value;
+}
+
+fn recordPageStateSpanSteps(steps: usize) void {
+    const value: u32 = @intCast(@min(steps, std.math.maxInt(u32)));
+    hot_path_stats.page_state_span_steps +%= value;
+    if (value > hot_path_stats.page_state_span_step_max) hot_path_stats.page_state_span_step_max = value;
+}
+
 pub fn hotPathStats() HotPathStats {
     var out = hot_path_stats;
     out.range_index_capacity = @intCast(RANGE_ID_INDEX_CAPACITY);
     out.range_index_entries = @intCast(@min(range_id_index_entries, std.math.maxInt(u32)));
     out.range_index_tombstones = @intCast(@min(range_id_index_tombstones, std.math.maxInt(u32)));
+    out.range_address_entries = @intCast(@min(range_address_count, std.math.maxInt(u32)));
+    out.commit_span_active = commit_span_active_count;
+    out.page_state_span_active = page_state_span_active_count;
     return out;
+}
+
+pub fn metadataInvariant() bool {
+    if (!initialized or range_address_count != range_id_index_entries) return false;
+    var commit_seen: [MAX_COMMIT_SPANS / 64]u64 = .{0} ** (MAX_COMMIT_SPANS / 64);
+    var page_seen: [MAX_PAGE_STATE_SPANS / 64]u64 = .{0} ** (MAX_PAGE_STATE_SPANS / 64);
+    var active_ranges: usize = 0;
+    var linked_commit_spans: usize = 0;
+    var linked_page_spans: usize = 0;
+
+    var slot_index: usize = 0;
+    while (slot_index < ranges.len) : (slot_index += 1) {
+        const range = &ranges[slot_index];
+        if (!range.active()) {
+            if (range_address_position[slot_index] != INVALID_RANGE_POSITION) return false;
+            continue;
+        }
+        active_ranges += 1;
+        const position = range_address_position[slot_index];
+        if (position == INVALID_RANGE_POSITION or @as(usize, position) >= range_address_count or
+            range_address_order[position] != slot_index or rawIndexById(range.id) != slot_index)
+        {
+            return false;
+        }
+
+        var previous_commit: ?u16 = null;
+        var commit_cursor = range.commit_span_head;
+        var commit_steps: usize = 0;
+        while (commit_cursor) |span_slot| : (commit_cursor = commit_spans[span_slot].next) {
+            commit_steps += 1;
+            if (commit_steps > MAX_COMMIT_SPANS or !markMetadataSeen(commit_seen[0..], span_slot)) return false;
+            const span = commit_spans[span_slot];
+            if (!span.slot_used or span.range_id != range.id or span.prev != previous_commit or span.len == 0) return false;
+            if (previous_commit) |previous_slot| {
+                const previous_end = checkedEnd(commit_spans[previous_slot].base, commit_spans[previous_slot].len) orelse return false;
+                if (previous_end >= span.base) return false;
+            }
+            previous_commit = span_slot;
+            linked_commit_spans += 1;
+        }
+
+        var previous_page: ?u16 = null;
+        var page_cursor = range.page_state_span_head;
+        var page_steps: usize = 0;
+        while (page_cursor) |span_slot| : (page_cursor = page_state_spans[span_slot].next) {
+            page_steps += 1;
+            if (page_steps > MAX_PAGE_STATE_SPANS or !markMetadataSeen(page_seen[0..], span_slot)) return false;
+            const span = page_state_spans[span_slot];
+            if (!span.slot_used or span.range_id != range.id or span.prev != previous_page or span.page_count == 0) return false;
+            if (previous_page) |previous_slot| {
+                const previous_end = checkedAdd(page_state_spans[previous_slot].first_page, page_state_spans[previous_slot].page_count) orelse return false;
+                if (previous_end > span.first_page or
+                    (previous_end == span.first_page and pageStateSpansMergeable(page_state_spans[previous_slot], span))) return false;
+            }
+            previous_page = span_slot;
+            linked_page_spans += 1;
+        }
+    }
+    if (active_ranges != range_address_count or linked_commit_spans != commit_span_active_count or
+        linked_page_spans != page_state_span_active_count) return false;
+
+    var position: usize = 0;
+    while (position < range_address_count) : (position += 1) {
+        const slot: usize = range_address_order[position];
+        if (!ranges[slot].active() or range_address_position[slot] != position) return false;
+        if (position != 0) {
+            const previous = ranges[range_address_order[position - 1]];
+            const previous_end = checkedEnd(previous.base, previous.len) orelse return false;
+            if (previous_end > ranges[slot].base) return false;
+        }
+    }
+
+    var free_commit_count: usize = 0;
+    var free_commit = commit_span_free_head;
+    while (free_commit) |span_slot| : (free_commit = commit_spans[span_slot].next) {
+        free_commit_count += 1;
+        if (free_commit_count > MAX_COMMIT_SPANS or commit_spans[span_slot].slot_used or
+            !markMetadataSeen(commit_seen[0..], span_slot)) return false;
+    }
+    var free_page_count: usize = 0;
+    var free_page = page_state_span_free_head;
+    while (free_page) |span_slot| : (free_page = page_state_spans[span_slot].next) {
+        free_page_count += 1;
+        if (free_page_count > MAX_PAGE_STATE_SPANS or page_state_spans[span_slot].slot_used or
+            !markMetadataSeen(page_seen[0..], span_slot)) return false;
+    }
+    if (linked_commit_spans + free_commit_count != MAX_COMMIT_SPANS or
+        linked_page_spans + free_page_count != MAX_PAGE_STATE_SPANS) return false;
+    if (reclaim_cursor_range_slot) |cursor_slot| {
+        if (!ranges[cursor_slot].active() or range_address_position[cursor_slot] == INVALID_RANGE_POSITION) return false;
+    }
+    return true;
+}
+
+fn rawIndexById(id: u32) ?usize {
+    var probes: usize = 0;
+    var position = rangeIdIndexStart(id);
+    while (probes < range_id_index.len) : (probes += 1) {
+        const entry = range_id_index[position];
+        switch (entry.state) {
+            .empty => return null,
+            .tombstone => {},
+            .used => if (entry.id == id) return entry.slot,
+        }
+        position = (position + 1) % range_id_index.len;
+    }
+    return null;
+}
+
+fn markMetadataSeen(seen: []u64, raw_index: u16) bool {
+    const index: usize = raw_index;
+    const word_index = index / 64;
+    const bit: u6 = @intCast(index % 64);
+    const mask = @as(u64, 1) << bit;
+    if ((seen[word_index] & mask) != 0) return false;
+    seen[word_index] |= mask;
+    return true;
 }
 
 fn firstOwnedRange(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) ?u32 {
@@ -2443,10 +2987,16 @@ fn firstOwnedRange(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) ?u32 
 }
 
 fn overlapsExisting(base: u64, len: u64) bool {
-    var i: usize = 0;
-    while (i < ranges.len) : (i += 1) {
-        const range = ranges[i];
-        if (range.active() and rangesOverlap(base, len, range.base, range.len)) return true;
+    const end = checkedEnd(base, len) orelse return true;
+    const pos = lowerBoundAddress(base);
+    if (pos > 0) {
+        const previous = ranges[range_address_order[pos - 1]];
+        const previous_end = checkedEnd(previous.base, previous.len) orelse return true;
+        if (previous_end > base) return true;
+    }
+    if (pos < range_address_count) {
+        const next = ranges[range_address_order[pos]];
+        if (next.base < end) return true;
     }
     return false;
 }

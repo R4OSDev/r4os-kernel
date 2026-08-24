@@ -1437,10 +1437,13 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v4_size: usize = @offsetOf(ProgramPerformanceSummary, "service_queue_scan_passes");
     const v5_size: usize = @offsetOf(ProgramPerformanceSummary, "service_lock_timing_stride");
     const v6_size: usize = @offsetOf(ProgramPerformanceSummary, "service_registry_index_queries");
-    const v7_size: usize = @sizeOf(ProgramPerformanceSummary);
+    const v7_size: usize = @offsetOf(ProgramPerformanceSummary, "hot_path_memory_block_physical_index_entries");
+    const v8_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v7_size)
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v8_size)
         performance_snapshot_version
+    else if (caller_version >= 7 and caller_size >= v7_size)
+        7
     else if (caller_version >= 6 and caller_size >= v6_size)
         6
     else if (caller_version >= 5 and caller_size >= v5_size)
@@ -1460,7 +1463,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         4 => v4_size,
         5 => v5_size,
         6 => v6_size,
-        else => v7_size,
+        7 => v7_size,
+        else => v8_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -1483,6 +1487,7 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const page_io_summary = mem_backing_store.pageIoSummary();
     const page_state_summary = mem_virt.pageStateSummary();
     const hot_path_summary = mem_virt.hotPathStats();
+    const block_hot_path_summary = mem_blocks.hotPathStats();
     const loader_file_stats = module_file.stats();
     const fpu_status = fpu.status();
     const work_summary = driver_work.summary();
@@ -1840,6 +1845,38 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .hot_path_vm_range_index_insert_failures = hot_path_summary.range_index_insert_failures,
         .hot_path_vm_range_free_slot_lookups = hot_path_summary.range_free_slot_lookups,
         .hot_path_vm_range_free_slot_probe_total = hot_path_summary.range_free_slot_probe_total,
+        .hot_path_memory_block_physical_index_entries = block_hot_path_summary.physical_index_entries,
+        .hot_path_memory_block_physical_step_max = block_hot_path_summary.physical_step_max,
+        .hot_path_memory_block_id_index_entries = block_hot_path_summary.id_index_entries,
+        .hot_path_memory_block_id_step_max = block_hot_path_summary.id_index_step_max,
+        .hot_path_memory_block_free_slot_word_step_max = block_hot_path_summary.free_slot_word_step_max,
+        .hot_path_memory_vm_range_address_entries = hot_path_summary.range_address_entries,
+        .hot_path_memory_vm_range_address_probe_max = hot_path_summary.range_address_probe_max,
+        .hot_path_memory_vm_range_address_probe_last = hot_path_summary.range_address_probe_last,
+        .hot_path_memory_vm_commit_span_active = hot_path_summary.commit_span_active,
+        .hot_path_memory_vm_commit_span_step_max = hot_path_summary.commit_span_step_max,
+        .hot_path_memory_vm_page_state_span_active = hot_path_summary.page_state_span_active,
+        .hot_path_memory_vm_page_state_span_step_max = hot_path_summary.page_state_span_step_max,
+        .hot_path_memory_block_physical_lookups = block_hot_path_summary.physical_lookups,
+        .hot_path_memory_block_physical_steps = block_hot_path_summary.physical_steps,
+        .hot_path_memory_block_physical_mutations = block_hot_path_summary.physical_mutations,
+        .hot_path_memory_block_physical_rebuilds = block_hot_path_summary.physical_rebuilds,
+        .hot_path_memory_block_id_lookups = block_hot_path_summary.id_index_lookups,
+        .hot_path_memory_block_id_steps = block_hot_path_summary.id_index_steps,
+        .hot_path_memory_block_free_slot_lookups = block_hot_path_summary.free_slot_lookups,
+        .hot_path_memory_block_free_slot_word_steps = block_hot_path_summary.free_slot_word_steps,
+        .hot_path_memory_block_claim_transactions = block_hot_path_summary.claim_transactions,
+        .hot_path_memory_block_claim_rollbacks = block_hot_path_summary.claim_rollbacks,
+        .hot_path_memory_vm_range_address_lookups = hot_path_summary.range_address_lookups,
+        .hot_path_memory_vm_range_address_probe_total = hot_path_summary.range_address_probe_total,
+        .hot_path_memory_vm_commit_span_lookups = hot_path_summary.commit_span_lookups,
+        .hot_path_memory_vm_commit_span_steps = hot_path_summary.commit_span_steps,
+        .hot_path_memory_vm_page_state_span_lookups = hot_path_summary.page_state_span_lookups,
+        .hot_path_memory_vm_page_state_span_steps = hot_path_summary.page_state_span_steps,
+        .hot_path_memory_vm_reclaim_range_steps = hot_path_summary.reclaim_cursor_range_steps,
+        .hot_path_memory_vm_reclaim_span_steps = hot_path_summary.reclaim_cursor_span_steps,
+        .hot_path_memory_vm_reclaim_page_steps = hot_path_summary.reclaim_cursor_page_steps,
+        .hot_path_memory_vm_reclaim_wraps = hot_path_summary.reclaim_cursor_wraps,
         .loader_file_active_buffers = loader_file_stats.active_buffers,
         .loader_file_reserved_bytes = loader_file_stats.reserved_bytes,
         .loader_file_committed_bytes = loader_file_stats.committed_bytes,

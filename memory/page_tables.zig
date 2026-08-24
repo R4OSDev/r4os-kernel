@@ -1412,7 +1412,8 @@ fn allocFrame(kind: blocks.Kind, name: []const u8) ?u64 {
 
 fn releaseFrame(frame: u64) void {
     if (frame == 0) return;
-    var release_plan = blocks.preparePhysicalRangeRelease(frame, layout.PAGE_SIZE) catch return;
+    var release_plan: blocks.PhysicalReleasePlan = undefined;
+    blocks.preparePhysicalRangeRelease(frame, layout.PAGE_SIZE, &release_plan) catch return;
     defer blocks.cancelPhysicalRangeRelease(&release_plan);
     phys.freeFrame(frame);
     blocks.commitPhysicalRangeRelease(&release_plan);

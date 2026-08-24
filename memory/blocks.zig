@@ -1,3 +1,4 @@
+const std = @import("std");
 const boot_info = @import("../bootloader/boot_info.zig");
 const k = @import("../kernel/log.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
@@ -6,6 +7,8 @@ pub const MAX_BLOCKS: usize = 8192;
 pub const KIND_COUNT: usize = 14;
 pub const OWNER_COUNT: usize = 8;
 pub const STATUS_COUNT: usize = 7;
+pub const ID_INDEX_CAPACITY: usize = MAX_BLOCKS * 2;
+const FREE_SLOT_WORDS: usize = MAX_BLOCKS / 64;
 
 pub const Kind = enum(u8) {
     boot = 0,
@@ -125,6 +128,43 @@ pub const Summary = struct {
     overflow: bool = false,
 };
 
+pub const HotPathStats = struct {
+    physical_index_entries: u32 = 0,
+    physical_lookups: u64 = 0,
+    physical_steps: u64 = 0,
+    physical_step_max: u32 = 0,
+    physical_mutations: u64 = 0,
+    physical_rebuilds: u64 = 0,
+    id_index_entries: u32 = 0,
+    id_index_lookups: u64 = 0,
+    id_index_steps: u64 = 0,
+    id_index_step_max: u32 = 0,
+    free_slot_lookups: u64 = 0,
+    free_slot_word_steps: u64 = 0,
+    free_slot_word_step_max: u32 = 0,
+    claim_transactions: u64 = 0,
+    claim_rollbacks: u64 = 0,
+};
+
+const PhysicalNode = struct {
+    in_tree: bool = false,
+    left: ?u16 = null,
+    right: ?u16 = null,
+    height: u8 = 1,
+};
+
+const IdIndexState = enum(u8) {
+    empty = 0,
+    used = 1,
+    tombstone = 2,
+};
+
+const IdIndexEntry = struct {
+    state: IdIndexState = .empty,
+    id: u32 = 0,
+    slot: u16 = 0,
+};
+
 // Complete, already validated metadata mutation for one physical release.
 // The plan owns concrete destination slots and IDs, so applying it after a
 // PTE unmap performs no searches, allocations or fallible arithmetic.
@@ -146,11 +186,32 @@ pub const PhysicalReleasePlan = struct {
 const Table = struct {
     entries: []MemoryBlock,
     next_id: u32 = 1,
+    physical_nodes: [MAX_BLOCKS]PhysicalNode = .{PhysicalNode{}} ** MAX_BLOCKS,
+    physical_root: ?u16 = null,
+    physical_entry_count: u32 = 0,
+    id_index: [ID_INDEX_CAPACITY]IdIndexEntry = .{IdIndexEntry{}} ** ID_INDEX_CAPACITY,
+    id_index_entries: u32 = 0,
+    id_index_tombstones: u32 = 0,
+    free_slot_words: [FREE_SLOT_WORDS]u64 = .{std.math.maxInt(u64)} ** FREE_SLOT_WORDS,
+    next_free_slot_word: usize = 0,
+    hot_path_stats: HotPathStats = .{},
 
     fn reset(self: *Table) void {
         var i: usize = 0;
         while (i < self.entries.len) : (i += 1) self.entries[i] = .{};
+        i = 0;
+        while (i < self.physical_nodes.len) : (i += 1) self.physical_nodes[i] = .{};
+        i = 0;
+        while (i < self.id_index.len) : (i += 1) self.id_index[i] = .{};
+        i = 0;
+        while (i < self.free_slot_words.len) : (i += 1) self.free_slot_words[i] = std.math.maxInt(u64);
         self.next_id = 1;
+        self.physical_root = null;
+        self.physical_entry_count = 0;
+        self.id_index_entries = 0;
+        self.id_index_tombstones = 0;
+        self.next_free_slot_word = 0;
+        self.hot_path_stats = .{};
     }
 
     fn register(self: *Table, req: RegisterRequest) Error!u32 {
@@ -163,7 +224,7 @@ const Table = struct {
 
         const slot = self.freeSlot() orelse return Error.TableFull;
         const id = self.allocId() catch |err| return err;
-        self.entries[slot] = .{
+        self.replaceEntry(slot, .{
             .slot_used = true,
             .id = id,
             .kind = req.kind,
@@ -177,7 +238,7 @@ const Table = struct {
             .virt_len = req.virt_len,
             .reserved_bytes = req.reserved_bytes,
             .committed_bytes = req.committed_bytes,
-        };
+        });
         return id;
     }
 
@@ -191,6 +252,7 @@ const Table = struct {
         name: []const u8,
     ) Error!u32 {
         if (len == 0 or checkedEnd(base, len) == null) return Error.EmptyRange;
+        self.hot_path_stats.claim_transactions +%= 1;
 
         const free_index = self.containingFreePhysical(base, len) orelse return Error.NotFree;
         const free = self.entries[free_index];
@@ -204,9 +266,12 @@ const Table = struct {
         // ID cursor must also roll back exactly on a late split/merge error.
         var journal = PhysicalMutationJournal.init(self.next_id);
         try journal.remember(self.entries, free_index);
-        errdefer journal.rollback(self);
+        errdefer {
+            self.hot_path_stats.claim_rollbacks +%= 1;
+            journal.rollback(self);
+        }
 
-        self.entries[free_index].status = .released;
+        self.replaceEntry(free_index, releasedEntry(free));
 
         if (before_len != 0) {
             try journal.remember(self.entries, self.freeSlot() orelse return Error.TableFull);
@@ -253,20 +318,20 @@ const Table = struct {
         return id;
     }
 
-    fn preparePhysicalRangeRelease(self: *Table, base: u64, len: u64) Error!PhysicalReleasePlan {
-        return self.buildPhysicalReleasePlan(base, len) catch |err| switch (err) {
+    fn preparePhysicalRangeRelease(self: *Table, base: u64, len: u64, plan: *PhysicalReleasePlan) Error!void {
+        self.buildPhysicalReleasePlan(base, len, plan) catch |err| switch (err) {
             // Coalescing is semantically neutral and may recover ordinary
             // metadata pressure. The second plan is still entirely private;
             // no claimed block has been mutated on either failure path.
             Error.TableFull => {
                 self.coalescePhysical();
-                return self.buildPhysicalReleasePlan(base, len);
+                return self.buildPhysicalReleasePlan(base, len, plan);
             },
             else => return err,
         };
     }
 
-    fn buildPhysicalReleasePlan(self: *const Table, base: u64, len: u64) Error!PhysicalReleasePlan {
+    fn buildPhysicalReleasePlan(self: *Table, base: u64, len: u64, plan: *PhysicalReleasePlan) Error!void {
         if (len == 0) return Error.EmptyRange;
         const release_end = checkedEnd(base, len) orelse return Error.Overflow;
         const target_index = self.containingClaimedPhysical(base, len) orelse return Error.NotFound;
@@ -276,7 +341,7 @@ const Table = struct {
         const before_len = base - block.phys_base;
         const after_len = block_end - release_end;
 
-        var plan = PhysicalReleasePlan{
+        plan.* = PhysicalReleasePlan{
             .target_index = target_index,
             .target_released = releasedEntry(block),
             .next_id_after = self.next_id,
@@ -339,14 +404,7 @@ const Table = struct {
             slots[slot_count] = target_index;
             slot_count += 1;
         }
-        var slot_index: usize = 0;
-        while (slot_count < request_count and slot_index < self.entries.len) : (slot_index += 1) {
-            if (slot_index == target_index) continue;
-            const entry = self.entries[slot_index];
-            if (entry.slot_used and entry.status != .released) continue;
-            slots[slot_count] = slot_index;
-            slot_count += 1;
-        }
+        self.collectFreeSlots(&slots, &slot_count, request_count, target_index);
         if (slot_count != request_count) return Error.TableFull;
 
         var next_id = self.next_id;
@@ -361,7 +419,6 @@ const Table = struct {
         }
         plan.write_count = @intCast(request_count);
         plan.next_id_after = next_id;
-        return plan;
     }
 
     const ReleasedFreeMerge = struct {
@@ -371,26 +428,21 @@ const Table = struct {
         secondary_released: MemoryBlock = .{},
     };
 
-    fn planReleasedFreeMerge(self: *const Table, base: u64, release_end: u64, ignore_id: u32) Error!ReleasedFreeMerge {
-        var left_index: ?usize = null;
-        var right_index: ?usize = null;
-        var i: usize = 0;
-        while (i < self.entries.len) : (i += 1) {
-            const entry = self.entries[i];
-            if (!entry.active() or entry.id == ignore_id or entry.kind != .free or entry.owner != .system or
-                entry.owner_id != 0 or entry.status != .free or entry.virt_len != 0 or !strEq(entry.name, "free"))
-            {
-                continue;
-            }
+    fn planReleasedFreeMerge(self: *Table, base: u64, release_end: u64, ignore_id: u32) Error!ReleasedFreeMerge {
+        var left_index = self.physicalPredecessorBefore(base, ignore_id);
+        if (left_index) |index| {
+            const entry = self.entries[index];
             const entry_end = checkedEnd(entry.phys_base, entry.phys_len) orelse return Error.Overflow;
-            if (entry_end == base) {
-                if (left_index != null) return Error.Overlap;
-                left_index = i;
-            }
-            if (entry.phys_base == release_end) {
-                if (right_index != null) return Error.Overlap;
-                right_index = i;
-            }
+            if (entry_end != base or !isCanonicalFree(entry)) left_index = null;
+        }
+        var right_index = self.physicalLowerBound(release_end);
+        if (right_index) |index| {
+            const entry = self.entries[index];
+            if (entry.id == ignore_id) right_index = self.physicalSuccessor(index);
+        }
+        if (right_index) |index| {
+            const entry = self.entries[index];
+            if (entry.phys_base != release_end or !isCanonicalFree(entry)) right_index = null;
         }
         if (left_index == null and right_index == null) return .{};
 
@@ -419,12 +471,12 @@ const Table = struct {
     }
 
     fn commitPhysicalRangeRelease(self: *Table, plan: PhysicalReleasePlan, coalesce_now: bool) void {
-        self.entries[plan.target_index] = plan.target_released;
-        if (plan.merge_primary_index) |index| self.entries[index] = plan.merge_primary_entry;
-        if (plan.merge_secondary_index) |index| self.entries[index] = plan.merge_secondary_released;
+        self.replaceEntry(plan.target_index, plan.target_released);
+        if (plan.merge_primary_index) |index| self.replaceEntry(index, plan.merge_primary_entry);
+        if (plan.merge_secondary_index) |index| self.replaceEntry(index, plan.merge_secondary_released);
         var i: usize = 0;
         while (i < @as(usize, plan.write_count)) : (i += 1) {
-            self.entries[plan.write_indices[i]] = plan.write_entries[i];
+            self.replaceEntry(plan.write_indices[i], plan.write_entries[i]);
         }
         self.next_id = plan.next_id_after;
         if (coalesce_now) self.coalescePhysical();
@@ -449,11 +501,13 @@ const Table = struct {
         const before_len = base - block.phys_base;
         const after_len = block_end - tag_end;
 
-        self.entries[idx].status = .released;
-        self.entries[idx].reserved_bytes = 0;
-        self.entries[idx].committed_bytes = 0;
+        var journal = PhysicalMutationJournal.init(self.next_id);
+        try journal.remember(self.entries, idx);
+        errdefer journal.rollback(self);
+        self.replaceEntry(idx, releasedEntry(block));
 
         if (before_len != 0) {
+            try journal.remember(self.entries, self.freeSlot() orelse return Error.TableFull);
             _ = try self.register(.{
                 .kind = block.kind,
                 .owner = block.owner,
@@ -467,7 +521,7 @@ const Table = struct {
             });
         }
 
-        const tagged_id = try self.addOrMergePhysical(.{
+        const tag_request = RegisterRequest{
             .kind = kind,
             .owner = owner,
             .owner_id = owner_id,
@@ -477,9 +531,16 @@ const Table = struct {
             .phys_len = len,
             .reserved_bytes = if (status == .free or status == .released) 0 else len,
             .committed_bytes = if (status == .committed or status == .mapped) len else 0,
-        });
+        };
+        if (try self.physicalMergeSlot(tag_request)) |merge_slot| {
+            try journal.remember(self.entries, merge_slot);
+        } else {
+            try journal.remember(self.entries, self.freeSlot() orelse return Error.TableFull);
+        }
+        const tagged_id = try self.addOrMergePhysical(tag_request);
 
         if (after_len != 0) {
+            try journal.remember(self.entries, self.freeSlot() orelse return Error.TableFull);
             _ = try self.register(.{
                 .kind = block.kind,
                 .owner = block.owner,
@@ -498,58 +559,40 @@ const Table = struct {
     }
 
     fn addOrMergePhysical(self: *Table, req: RegisterRequest) Error!u32 {
-        var i: usize = 0;
-        while (i < self.entries.len) : (i += 1) {
-            var block = self.entries[i];
-            if (!block.active()) continue;
-            if (block.kind != req.kind or
-                block.owner != req.owner or
-                block.owner_id != req.owner_id or
-                block.status != req.status or
-                block.virt_len != 0 or
-                !strEq(block.name, req.name))
-            {
-                continue;
-            }
+        if (try self.physicalMergeSlot(req)) |index| {
+            var block = self.entries[index];
             const block_end = checkedEnd(block.phys_base, block.phys_len) orelse return Error.Overflow;
             const req_end = checkedEnd(req.phys_base, req.phys_len) orelse return Error.Overflow;
+            const combined_phys = checkedAdd(block.phys_len, req.phys_len) orelse return Error.Overflow;
+            const combined_reserved = checkedAdd(block.reserved_bytes, req.reserved_bytes) orelse return Error.Overflow;
+            const combined_committed = checkedAdd(block.committed_bytes, req.committed_bytes) orelse return Error.Overflow;
             if (block_end == req.phys_base) {
-                block.phys_len = checkedAdd(block.phys_len, req.phys_len) orelse return Error.Overflow;
-                block.reserved_bytes = checkedAdd(block.reserved_bytes, req.reserved_bytes) orelse return Error.Overflow;
-                block.committed_bytes = checkedAdd(block.committed_bytes, req.committed_bytes) orelse return Error.Overflow;
-                self.entries[i] = block;
-                return block.id;
-            }
-            if (req_end == block.phys_base) {
+                block.phys_len = combined_phys;
+            } else if (req_end == block.phys_base) {
                 block.phys_base = req.phys_base;
-                block.phys_len = checkedAdd(block.phys_len, req.phys_len) orelse return Error.Overflow;
-                block.reserved_bytes = checkedAdd(block.reserved_bytes, req.reserved_bytes) orelse return Error.Overflow;
-                block.committed_bytes = checkedAdd(block.committed_bytes, req.committed_bytes) orelse return Error.Overflow;
-                self.entries[i] = block;
-                return block.id;
+                block.phys_len = combined_phys;
+            } else {
+                unreachable;
             }
+            block.reserved_bytes = combined_reserved;
+            block.committed_bytes = combined_committed;
+            self.replaceEntry(index, block);
+            return block.id;
         }
 
         return self.register(req);
     }
 
-    fn physicalMergeSlot(self: *const Table, req: RegisterRequest) Error!?usize {
-        var i: usize = 0;
-        while (i < self.entries.len) : (i += 1) {
-            const block = self.entries[i];
-            if (!block.active()) continue;
-            if (block.kind != req.kind or
-                block.owner != req.owner or
-                block.owner_id != req.owner_id or
-                block.status != req.status or
-                block.virt_len != 0 or
-                !strEq(block.name, req.name))
-            {
-                continue;
-            }
+    fn physicalMergeSlot(self: *Table, req: RegisterRequest) Error!?usize {
+        const req_end = checkedEnd(req.phys_base, req.phys_len) orelse return Error.Overflow;
+        if (self.physicalPredecessorBefore(req.phys_base, 0)) |left| {
+            const block = self.entries[left];
             const block_end = checkedEnd(block.phys_base, block.phys_len) orelse return Error.Overflow;
-            const req_end = checkedEnd(req.phys_base, req.phys_len) orelse return Error.Overflow;
-            if (block_end == req.phys_base or req_end == block.phys_base) return i;
+            if (block_end == req.phys_base and canMergePhysicalRequest(block, req)) return left;
+        }
+        if (self.physicalLowerBound(req_end)) |right| {
+            const block = self.entries[right];
+            if (block.phys_base == req_end and canMergePhysicalRequest(block, req)) return right;
         }
         return null;
     }
@@ -568,7 +611,7 @@ const Table = struct {
         if (req.committed_bytes) |value| block.committed_bytes = value;
         validateBytes(block.reserved_bytes, block.committed_bytes) catch |err| return err;
 
-        self.entries[idx] = block;
+        self.replaceEntry(idx, block);
     }
 
     fn setCommitted(self: *Table, id: u32, bytes: u64) Error!void {
@@ -591,9 +634,7 @@ const Table = struct {
 
     fn release(self: *Table, id: u32) Error!void {
         const idx = self.indexById(id) orelse return Error.NotFound;
-        self.entries[idx].status = .released;
-        self.entries[idx].reserved_bytes = 0;
-        self.entries[idx].committed_bytes = 0;
+        self.replaceEntry(idx, releasedEntry(self.entries[idx]));
     }
 
     fn snapshot(self: *const Table, out: []MemoryBlock) SnapshotResult {
@@ -686,12 +727,39 @@ const Table = struct {
         return s;
     }
 
-    fn freeSlot(self: *const Table) ?usize {
-        var i: usize = 0;
-        while (i < self.entries.len) : (i += 1) {
-            if (!self.entries[i].slot_used or self.entries[i].status == .released) return i;
+    fn freeSlot(self: *Table) ?usize {
+        self.hot_path_stats.free_slot_lookups +%= 1;
+        var scanned: usize = 0;
+        while (scanned < self.free_slot_words.len) : (scanned += 1) {
+            const word_index = (self.next_free_slot_word + scanned) % self.free_slot_words.len;
+            const word = self.free_slot_words[word_index];
+            if (word == 0) continue;
+            const bit: u6 = @intCast(@ctz(word));
+            const slot = word_index * 64 + bit;
+            self.next_free_slot_word = word_index;
+            self.recordFreeSlotSteps(scanned + 1);
+            return slot;
         }
+        self.recordFreeSlotSteps(scanned);
         return null;
+    }
+
+    fn collectFreeSlots(self: *Table, slots: *[3]usize, slot_count: *usize, wanted: usize, excluded: usize) void {
+        var word_index: usize = 0;
+        var words_scanned: usize = 0;
+        while (slot_count.* < wanted and word_index < self.free_slot_words.len) : (word_index += 1) {
+            words_scanned += 1;
+            var word = self.free_slot_words[word_index];
+            while (word != 0 and slot_count.* < wanted) {
+                const bit: u6 = @intCast(@ctz(word));
+                const slot = word_index * 64 + bit;
+                word &= ~(@as(u64, 1) << bit);
+                if (slot == excluded) continue;
+                slots[slot_count.*] = slot;
+                slot_count.* += 1;
+            }
+        }
+        self.recordFreeSlotSteps(words_scanned);
     }
 
     fn allocId(self: *Table) Error!u32 {
@@ -701,47 +769,63 @@ const Table = struct {
         return id;
     }
 
-    fn indexById(self: *const Table, id: u32) ?usize {
-        var i: usize = 0;
-        while (i < self.entries.len) : (i += 1) {
-            if (self.entries[i].slot_used and self.entries[i].id == id) return i;
+    fn indexById(self: *Table, id: u32) ?usize {
+        self.hot_path_stats.id_index_lookups +%= 1;
+        var steps: usize = 0;
+        var position = idIndexStart(id);
+        while (steps < self.id_index.len) : (steps += 1) {
+            const index_entry = self.id_index[position];
+            switch (index_entry.state) {
+                .empty => {
+                    self.recordIdIndexSteps(steps + 1);
+                    return null;
+                },
+                .tombstone => {},
+                .used => {
+                    if (index_entry.id == id) {
+                        self.recordIdIndexSteps(steps + 1);
+                        const slot: usize = index_entry.slot;
+                        if (slot < self.entries.len and self.entries[slot].slot_used and self.entries[slot].id == id) return slot;
+                        return null;
+                    }
+                },
+            }
+            position = (position + 1) % self.id_index.len;
         }
+        self.recordIdIndexSteps(steps);
         return null;
     }
 
-    fn containingFreePhysical(self: *const Table, base: u64, len: u64) ?usize {
+    fn containingFreePhysical(self: *Table, base: u64, len: u64) ?usize {
         const end = checkedEnd(base, len) orelse return null;
-        var i: usize = 0;
-        while (i < self.entries.len) : (i += 1) {
-            const block = self.entries[i];
-            if (!block.active() or block.kind != .free or block.status != .free) continue;
-            const block_end = checkedEnd(block.phys_base, block.phys_len) orelse continue;
-            if (base >= block.phys_base and end <= block_end) return i;
-        }
+        const index = self.physicalFloor(base) orelse return null;
+        const block = self.entries[index];
+        if (!isCanonicalFree(block)) return null;
+        const block_end = checkedEnd(block.phys_base, block.phys_len) orelse return null;
+        if (end <= block_end) return index;
         return null;
     }
 
-    fn containingClaimedPhysical(self: *const Table, base: u64, len: u64) ?usize {
+    fn containingClaimedPhysical(self: *Table, base: u64, len: u64) ?usize {
         const end = checkedEnd(base, len) orelse return null;
-        var i: usize = 0;
-        while (i < self.entries.len) : (i += 1) {
-            const block = self.entries[i];
-            if (!block.active() or block.kind == .free or block.status == .free or block.phys_len == 0) continue;
-            const block_end = checkedEnd(block.phys_base, block.phys_len) orelse continue;
-            if (base >= block.phys_base and end <= block_end) return i;
-        }
+        const index = self.physicalFloor(base) orelse return null;
+        const block = self.entries[index];
+        if (!block.active() or block.kind == .free or block.status == .free or block.phys_len == 0) return null;
+        const block_end = checkedEnd(block.phys_base, block.phys_len) orelse return null;
+        if (end <= block_end) return index;
         return null;
     }
 
-    fn overlapsActive(self: *const Table, base: u64, len: u64, physical: bool, ignore_id: u32) bool {
+    fn overlapsActive(self: *Table, base: u64, len: u64, physical: bool, ignore_id: u32) bool {
         if (len == 0) return false;
         const end = checkedEnd(base, len) orelse return true;
+        if (physical) return self.physicalOverlap(base, end, ignore_id);
         var i: usize = 0;
         while (i < self.entries.len) : (i += 1) {
             const block = self.entries[i];
             if (!block.active() or block.id == ignore_id) continue;
-            const other_base = if (physical) block.phys_base else block.virt_base;
-            const other_len = if (physical) block.phys_len else block.virt_len;
+            const other_base = block.virt_base;
+            const other_len = block.virt_len;
             if (other_len == 0) continue;
             const other_end = checkedEnd(other_base, other_len) orelse return true;
             if (base < other_end and other_base < end) return true;
@@ -750,42 +834,449 @@ const Table = struct {
     }
 
     fn coalescePhysical(self: *Table) void {
-        var changed = true;
-        while (changed) {
-            changed = false;
-            var a: usize = 0;
-            while (a < self.entries.len) : (a += 1) {
-                if (!self.entries[a].active() or self.entries[a].virt_len != 0 or self.entries[a].phys_len == 0) continue;
-                var b: usize = a + 1;
-                while (b < self.entries.len) : (b += 1) {
-                    if (!canMergePhysical(self.entries[a], self.entries[b])) continue;
-                    const a_end = checkedEnd(self.entries[a].phys_base, self.entries[a].phys_len) orelse continue;
-                    const b_end = checkedEnd(self.entries[b].phys_base, self.entries[b].phys_len) orelse continue;
-                    if (a_end == self.entries[b].phys_base) {
-                        self.entries[a].phys_len = checkedAdd(self.entries[a].phys_len, self.entries[b].phys_len) orelse continue;
-                        self.entries[a].reserved_bytes = checkedAdd(self.entries[a].reserved_bytes, self.entries[b].reserved_bytes) orelse continue;
-                        self.entries[a].committed_bytes = checkedAdd(self.entries[a].committed_bytes, self.entries[b].committed_bytes) orelse continue;
-                        self.entries[b].status = .released;
-                        self.entries[b].reserved_bytes = 0;
-                        self.entries[b].committed_bytes = 0;
-                        changed = true;
-                        break;
-                    }
-                    if (b_end == self.entries[a].phys_base) {
-                        self.entries[a].phys_base = self.entries[b].phys_base;
-                        self.entries[a].phys_len = checkedAdd(self.entries[a].phys_len, self.entries[b].phys_len) orelse continue;
-                        self.entries[a].reserved_bytes = checkedAdd(self.entries[a].reserved_bytes, self.entries[b].reserved_bytes) orelse continue;
-                        self.entries[a].committed_bytes = checkedAdd(self.entries[a].committed_bytes, self.entries[b].committed_bytes) orelse continue;
-                        self.entries[b].status = .released;
-                        self.entries[b].reserved_bytes = 0;
-                        self.entries[b].committed_bytes = 0;
-                        changed = true;
-                        break;
-                    }
+        var current = self.physicalMinimum(self.physical_root);
+        while (current) |left_index| {
+            const right_index = self.physicalSuccessor(left_index) orelse break;
+            const left = self.entries[left_index];
+            const right = self.entries[right_index];
+            const left_end = checkedEnd(left.phys_base, left.phys_len) orelse {
+                current = @intCast(right_index);
+                continue;
+            };
+            if (left_end != right.phys_base or !canMergePhysical(left, right)) {
+                current = @intCast(right_index);
+                continue;
+            }
+            const phys_len = checkedAdd(left.phys_len, right.phys_len) orelse {
+                current = @intCast(right_index);
+                continue;
+            };
+            const reserved_bytes = checkedAdd(left.reserved_bytes, right.reserved_bytes) orelse {
+                current = @intCast(right_index);
+                continue;
+            };
+            const committed_bytes = checkedAdd(left.committed_bytes, right.committed_bytes) orelse {
+                current = @intCast(right_index);
+                continue;
+            };
+            var merged = left;
+            merged.phys_len = phys_len;
+            merged.reserved_bytes = reserved_bytes;
+            merged.committed_bytes = committed_bytes;
+            self.replaceEntry(left_index, merged);
+            self.replaceEntry(right_index, releasedEntry(right));
+        }
+    }
+
+    fn replaceEntry(self: *Table, index: usize, entry: MemoryBlock) void {
+        if (self.physical_nodes[index].in_tree) self.physicalRemove(@intCast(index));
+        if (self.entries[index].slot_used) self.idIndexRemove(self.entries[index].id);
+
+        self.entries[index] = entry;
+        self.setSlotReusable(index, !entry.slot_used or entry.status == .released);
+        if (entry.slot_used) self.idIndexInsert(entry.id, @intCast(index));
+        if (usesPhysicalIndex(entry)) self.physicalInsert(@intCast(index));
+        self.hot_path_stats.physical_mutations +%= 1;
+    }
+
+    fn setSlotReusable(self: *Table, index: usize, reusable: bool) void {
+        const word_index = index / 64;
+        const bit: u6 = @intCast(index % 64);
+        const mask = @as(u64, 1) << bit;
+        if (reusable) {
+            self.free_slot_words[word_index] |= mask;
+            if (word_index < self.next_free_slot_word) self.next_free_slot_word = word_index;
+        } else {
+            self.free_slot_words[word_index] &= ~mask;
+        }
+    }
+
+    fn idIndexInsert(self: *Table, id: u32, slot: u16) void {
+        var position = idIndexStart(id);
+        var steps: usize = 0;
+        while (steps < self.id_index.len) : (steps += 1) {
+            if (self.id_index[position].state == .empty) {
+                self.id_index[position] = .{ .state = .used, .id = id, .slot = slot };
+                self.id_index_entries +|= 1;
+                return;
+            }
+            if (self.id_index[position].state == .used and self.id_index[position].id == id) {
+                self.id_index[position].slot = slot;
+                return;
+            }
+            position = (position + 1) % self.id_index.len;
+        }
+        unreachable;
+    }
+
+    fn idIndexRemove(self: *Table, id: u32) void {
+        var position = idIndexStart(id);
+        var steps: usize = 0;
+        while (steps < self.id_index.len) : (steps += 1) {
+            const entry = self.id_index[position];
+            if (entry.state == .empty) return;
+            if (entry.state == .used and entry.id == id) {
+                self.id_index[position] = .{};
+                if (self.id_index_entries != 0) self.id_index_entries -= 1;
+                var rehash = (position + 1) % self.id_index.len;
+                while (self.id_index[rehash].state == .used) : (rehash = (rehash + 1) % self.id_index.len) {
+                    const displaced = self.id_index[rehash];
+                    self.id_index[rehash] = .{};
+                    if (self.id_index_entries != 0) self.id_index_entries -= 1;
+                    self.idIndexInsert(displaced.id, displaced.slot);
                 }
-                if (changed) break;
+                return;
+            }
+            position = (position + 1) % self.id_index.len;
+        }
+    }
+
+    fn physicalInsert(self: *Table, slot: u16) void {
+        self.physical_nodes[slot] = .{ .in_tree = true };
+        self.physical_root = self.physicalInsertAt(self.physical_root, slot);
+        self.physical_entry_count +|= 1;
+    }
+
+    fn physicalInsertAt(self: *Table, root: ?u16, slot: u16) u16 {
+        const root_slot = root orelse return slot;
+        if (self.physicalLess(slot, root_slot)) {
+            self.physical_nodes[root_slot].left = self.physicalInsertAt(self.physical_nodes[root_slot].left, slot);
+        } else {
+            self.physical_nodes[root_slot].right = self.physicalInsertAt(self.physical_nodes[root_slot].right, slot);
+        }
+        return self.rebalancePhysical(root_slot);
+    }
+
+    fn physicalRemove(self: *Table, slot: u16) void {
+        if (!self.physical_nodes[slot].in_tree) return;
+        self.physical_root = self.physicalRemoveAt(self.physical_root, slot);
+        self.physical_nodes[slot] = .{};
+        if (self.physical_entry_count != 0) self.physical_entry_count -= 1;
+    }
+
+    fn physicalRemoveAt(self: *Table, root: ?u16, slot: u16) ?u16 {
+        const root_slot = root orelse return null;
+        if (self.physicalLess(slot, root_slot)) {
+            self.physical_nodes[root_slot].left = self.physicalRemoveAt(self.physical_nodes[root_slot].left, slot);
+            return self.rebalancePhysical(root_slot);
+        }
+        if (self.physicalLess(root_slot, slot)) {
+            self.physical_nodes[root_slot].right = self.physicalRemoveAt(self.physical_nodes[root_slot].right, slot);
+            return self.rebalancePhysical(root_slot);
+        }
+
+        const left = self.physical_nodes[root_slot].left;
+        const right = self.physical_nodes[root_slot].right;
+        if (left == null) return right;
+        if (right == null) return left;
+        const detached = self.detachPhysicalMinimum(right.?);
+        self.physical_nodes[detached.minimum].left = left;
+        self.physical_nodes[detached.minimum].right = detached.root;
+        return self.rebalancePhysical(detached.minimum);
+    }
+
+    const DetachedPhysicalMinimum = struct {
+        root: ?u16,
+        minimum: u16,
+    };
+
+    fn detachPhysicalMinimum(self: *Table, root_slot: u16) DetachedPhysicalMinimum {
+        const left = self.physical_nodes[root_slot].left;
+        if (left == null) {
+            return .{ .root = self.physical_nodes[root_slot].right, .minimum = root_slot };
+        }
+        const detached = self.detachPhysicalMinimum(left.?);
+        self.physical_nodes[root_slot].left = detached.root;
+        return .{ .root = self.rebalancePhysical(root_slot), .minimum = detached.minimum };
+    }
+
+    fn rebalancePhysical(self: *Table, root_slot: u16) u16 {
+        self.updatePhysicalHeight(root_slot);
+        const balance = @as(i16, self.physicalHeight(self.physical_nodes[root_slot].left)) -
+            @as(i16, self.physicalHeight(self.physical_nodes[root_slot].right));
+        if (balance > 1) {
+            const left = self.physical_nodes[root_slot].left.?;
+            if (self.physicalHeight(self.physical_nodes[left].left) < self.physicalHeight(self.physical_nodes[left].right)) {
+                self.physical_nodes[root_slot].left = self.rotatePhysicalLeft(left);
+            }
+            return self.rotatePhysicalRight(root_slot);
+        }
+        if (balance < -1) {
+            const right = self.physical_nodes[root_slot].right.?;
+            if (self.physicalHeight(self.physical_nodes[right].right) < self.physicalHeight(self.physical_nodes[right].left)) {
+                self.physical_nodes[root_slot].right = self.rotatePhysicalRight(right);
+            }
+            return self.rotatePhysicalLeft(root_slot);
+        }
+        return root_slot;
+    }
+
+    fn rotatePhysicalLeft(self: *Table, root_slot: u16) u16 {
+        const right = self.physical_nodes[root_slot].right.?;
+        const transfer = self.physical_nodes[right].left;
+        self.physical_nodes[right].left = root_slot;
+        self.physical_nodes[root_slot].right = transfer;
+        self.updatePhysicalHeight(root_slot);
+        self.updatePhysicalHeight(right);
+        return right;
+    }
+
+    fn rotatePhysicalRight(self: *Table, root_slot: u16) u16 {
+        const left = self.physical_nodes[root_slot].left.?;
+        const transfer = self.physical_nodes[left].right;
+        self.physical_nodes[left].right = root_slot;
+        self.physical_nodes[root_slot].left = transfer;
+        self.updatePhysicalHeight(root_slot);
+        self.updatePhysicalHeight(left);
+        return left;
+    }
+
+    fn physicalHeight(self: *const Table, slot: ?u16) u8 {
+        return if (slot) |index| self.physical_nodes[index].height else 0;
+    }
+
+    fn updatePhysicalHeight(self: *Table, slot: u16) void {
+        self.physical_nodes[slot].height = 1 + @max(
+            self.physicalHeight(self.physical_nodes[slot].left),
+            self.physicalHeight(self.physical_nodes[slot].right),
+        );
+    }
+
+    fn physicalLess(self: *const Table, left: u16, right: u16) bool {
+        const left_base = self.entries[left].phys_base;
+        const right_base = self.entries[right].phys_base;
+        return left_base < right_base or (left_base == right_base and left < right);
+    }
+
+    fn physicalFloor(self: *Table, base: u64) ?usize {
+        self.hot_path_stats.physical_lookups +%= 1;
+        var current = self.physical_root;
+        var result: ?u16 = null;
+        var steps: usize = 0;
+        while (current) |slot| {
+            steps += 1;
+            if (self.entries[slot].phys_base <= base) {
+                result = slot;
+                current = self.physical_nodes[slot].right;
+            } else {
+                current = self.physical_nodes[slot].left;
             }
         }
+        self.recordPhysicalSteps(steps);
+        return if (result) |slot| slot else null;
+    }
+
+    fn physicalLowerBound(self: *Table, base: u64) ?usize {
+        self.hot_path_stats.physical_lookups +%= 1;
+        var current = self.physical_root;
+        var result: ?u16 = null;
+        var steps: usize = 0;
+        while (current) |slot| {
+            steps += 1;
+            if (self.entries[slot].phys_base >= base) {
+                result = slot;
+                current = self.physical_nodes[slot].left;
+            } else {
+                current = self.physical_nodes[slot].right;
+            }
+        }
+        self.recordPhysicalSteps(steps);
+        return if (result) |slot| slot else null;
+    }
+
+    fn physicalPredecessorBefore(self: *Table, base: u64, ignore_id: u32) ?usize {
+        self.hot_path_stats.physical_lookups +%= 1;
+        var current = self.physical_root;
+        var result: ?u16 = null;
+        var steps: usize = 0;
+        while (current) |slot| {
+            steps += 1;
+            if (self.entries[slot].phys_base < base) {
+                result = slot;
+                current = self.physical_nodes[slot].right;
+            } else {
+                current = self.physical_nodes[slot].left;
+            }
+        }
+        if (result) |slot| {
+            if (ignore_id != 0 and self.entries[slot].id == ignore_id) result = self.physicalPredecessor(slot);
+        }
+        self.recordPhysicalSteps(steps);
+        return if (result) |slot| slot else null;
+    }
+
+    fn physicalPredecessor(self: *Table, target: u16) ?u16 {
+        var current = self.physical_root;
+        var result: ?u16 = null;
+        while (current) |slot| {
+            if (self.physicalLess(slot, target)) {
+                result = slot;
+                current = self.physical_nodes[slot].right;
+            } else {
+                current = self.physical_nodes[slot].left;
+            }
+        }
+        return result;
+    }
+
+    fn physicalSuccessor(self: *Table, target_index: usize) ?usize {
+        const target: u16 = @intCast(target_index);
+        self.hot_path_stats.physical_lookups +%= 1;
+        var current = self.physical_root;
+        var result: ?u16 = null;
+        var steps: usize = 0;
+        while (current) |slot| {
+            steps += 1;
+            if (self.physicalLess(target, slot)) {
+                result = slot;
+                current = self.physical_nodes[slot].left;
+            } else {
+                current = self.physical_nodes[slot].right;
+            }
+        }
+        self.recordPhysicalSteps(steps);
+        return if (result) |slot| slot else null;
+    }
+
+    fn physicalMinimum(self: *const Table, root: ?u16) ?u16 {
+        var current = root orelse return null;
+        while (self.physical_nodes[current].left) |left| current = left;
+        return current;
+    }
+
+    fn physicalOverlap(self: *Table, base: u64, end: u64, ignore_id: u32) bool {
+        if (self.physicalFloor(base)) |floor_index| {
+            const block = self.entries[floor_index];
+            if (block.id != ignore_id) {
+                const block_end = checkedEnd(block.phys_base, block.phys_len) orelse return true;
+                if (base < block_end and block.phys_base < end) return true;
+            }
+        }
+        var next = self.physicalLowerBound(base);
+        if (next) |index| {
+            if (self.entries[index].id == ignore_id) next = self.physicalSuccessor(index);
+        }
+        if (next) |index| {
+            const block = self.entries[index];
+            const block_end = checkedEnd(block.phys_base, block.phys_len) orelse return true;
+            if (base < block_end and block.phys_base < end) return true;
+        }
+        return false;
+    }
+
+    fn rebuildIndexes(self: *Table) void {
+        self.hot_path_stats.physical_rebuilds +%= 1;
+        var i: usize = 0;
+        while (i < self.physical_nodes.len) : (i += 1) self.physical_nodes[i] = .{};
+        i = 0;
+        while (i < self.id_index.len) : (i += 1) self.id_index[i] = .{};
+        i = 0;
+        while (i < self.free_slot_words.len) : (i += 1) self.free_slot_words[i] = 0;
+        self.physical_root = null;
+        self.physical_entry_count = 0;
+        self.id_index_entries = 0;
+        self.id_index_tombstones = 0;
+        self.next_free_slot_word = 0;
+        i = 0;
+        while (i < self.entries.len) : (i += 1) {
+            const entry = self.entries[i];
+            self.setSlotReusable(i, !entry.slot_used or entry.status == .released);
+            if (entry.slot_used) self.idIndexInsert(entry.id, @intCast(i));
+            if (usesPhysicalIndex(entry)) self.physicalInsert(@intCast(i));
+        }
+    }
+
+    const PhysicalValidation = struct {
+        valid: bool = true,
+        count: u32 = 0,
+        height: u8 = 0,
+        minimum: ?u16 = null,
+        maximum: ?u16 = null,
+    };
+
+    fn indexInvariant(self: *const Table) bool {
+        const physical = self.validatePhysicalTree(self.physical_root, 0);
+        if (!physical.valid or physical.count != self.physical_entry_count) return false;
+        var physical_entries: u32 = 0;
+        var id_entries: u32 = 0;
+        var i: usize = 0;
+        while (i < self.entries.len) : (i += 1) {
+            const entry = self.entries[i];
+            const word = self.free_slot_words[i / 64];
+            const bit: u6 = @intCast(i % 64);
+            const reusable = (word & (@as(u64, 1) << bit)) != 0;
+            if (reusable != (!entry.slot_used or entry.status == .released)) return false;
+            if (entry.slot_used) {
+                id_entries +|= 1;
+                if (self.idIndexFindRaw(entry.id) != i) return false;
+            }
+            if (usesPhysicalIndex(entry)) {
+                physical_entries +|= 1;
+                if (!self.physical_nodes[i].in_tree) return false;
+            } else if (self.physical_nodes[i].in_tree) {
+                return false;
+            }
+        }
+        return physical_entries == self.physical_entry_count and id_entries == self.id_index_entries;
+    }
+
+    fn validatePhysicalTree(self: *const Table, root: ?u16, depth: u8) PhysicalValidation {
+        const slot = root orelse return .{};
+        if (depth > 64 or !self.physical_nodes[slot].in_tree or !usesPhysicalIndex(self.entries[slot])) return .{ .valid = false };
+        const left = self.validatePhysicalTree(self.physical_nodes[slot].left, depth + 1);
+        if (!left.valid) return .{ .valid = false };
+        const right = self.validatePhysicalTree(self.physical_nodes[slot].right, depth + 1);
+        if (!right.valid) return .{ .valid = false };
+        if (left.maximum) |left_max| {
+            if (!self.physicalLess(left_max, slot)) return .{ .valid = false };
+            const left_end = checkedEnd(self.entries[left_max].phys_base, self.entries[left_max].phys_len) orelse return .{ .valid = false };
+            if (left_end > self.entries[slot].phys_base) return .{ .valid = false };
+        }
+        if (right.minimum) |right_min| {
+            if (!self.physicalLess(slot, right_min)) return .{ .valid = false };
+            const slot_end = checkedEnd(self.entries[slot].phys_base, self.entries[slot].phys_len) orelse return .{ .valid = false };
+            if (slot_end > self.entries[right_min].phys_base) return .{ .valid = false };
+        }
+        const expected_height: u8 = 1 + @max(left.height, right.height);
+        if (self.physical_nodes[slot].height != expected_height) return .{ .valid = false };
+        const balance = @as(i16, left.height) - @as(i16, right.height);
+        if (balance < -1 or balance > 1) return .{ .valid = false };
+        return .{
+            .count = left.count +| right.count +| 1,
+            .height = expected_height,
+            .minimum = left.minimum orelse slot,
+            .maximum = right.maximum orelse slot,
+        };
+    }
+
+    fn idIndexFindRaw(self: *const Table, id: u32) ?usize {
+        var position = idIndexStart(id);
+        var steps: usize = 0;
+        while (steps < self.id_index.len) : (steps += 1) {
+            const entry = self.id_index[position];
+            if (entry.state == .empty) return null;
+            if (entry.state == .used and entry.id == id) return entry.slot;
+            position = (position + 1) % self.id_index.len;
+        }
+        return null;
+    }
+
+    fn recordPhysicalSteps(self: *Table, steps: usize) void {
+        const value: u32 = @intCast(@min(steps, std.math.maxInt(u32)));
+        self.hot_path_stats.physical_steps +%= value;
+        if (value > self.hot_path_stats.physical_step_max) self.hot_path_stats.physical_step_max = value;
+    }
+
+    fn recordIdIndexSteps(self: *Table, steps: usize) void {
+        const value: u32 = @intCast(@min(steps, std.math.maxInt(u32)));
+        self.hot_path_stats.id_index_steps +%= value;
+        if (value > self.hot_path_stats.id_index_step_max) self.hot_path_stats.id_index_step_max = value;
+    }
+
+    fn recordFreeSlotSteps(self: *Table, steps: usize) void {
+        const value: u32 = @intCast(@min(steps, std.math.maxInt(u32)));
+        self.hot_path_stats.free_slot_word_steps +%= value;
+        if (value > self.hot_path_stats.free_slot_word_step_max) self.hot_path_stats.free_slot_word_step_max = value;
     }
 };
 
@@ -819,6 +1310,7 @@ const PhysicalMutationJournal = struct {
             target.entries[self.indices[remaining]] = self.entries[remaining];
         }
         target.next_id = self.next_id;
+        target.rebuildIndexes();
     }
 };
 
@@ -860,20 +1352,20 @@ pub fn claimPhysicalRange(
 }
 
 pub fn releasePhysicalRange(base: u64, len: u64) Error!void {
-    var plan = try preparePhysicalRangeRelease(base, len);
+    var plan: PhysicalReleasePlan = undefined;
+    try preparePhysicalRangeRelease(base, len, &plan);
     finishPhysicalRangeRelease(&plan, true);
 }
 
-pub fn preparePhysicalRangeRelease(base: u64, len: u64) Error!PhysicalReleasePlan {
+pub fn preparePhysicalRangeRelease(base: u64, len: u64, plan: *PhysicalReleasePlan) Error!void {
     if (!initialized) return Error.NotInitialized;
     const irq_flags = interrupts.saveAndDisable();
-    var plan = table.preparePhysicalRangeRelease(base, len) catch |err| {
+    table.preparePhysicalRangeRelease(base, len, plan) catch |err| {
         interrupts.restore(irq_flags);
         return err;
     };
     plan.irq_flags = irq_flags;
     plan.active = true;
-    return plan;
 }
 
 // Applies a previously validated plan after the caller has unmapped the PTE.
@@ -902,7 +1394,8 @@ fn finishPhysicalRangeRelease(plan: *PhysicalReleasePlan, coalesce_now: bool) vo
 // across an external operation. VM teardown uses prepare+commit directly and
 // therefore never repeats the full-table preflight after unmapping a page.
 pub fn releasePhysicalRangeDeferred(base: u64, len: u64) Error!void {
-    var plan = try preparePhysicalRangeRelease(base, len);
+    var plan: PhysicalReleasePlan = undefined;
+    try preparePhysicalRangeRelease(base, len, &plan);
     finishPhysicalRangeRelease(&plan, false);
 }
 
@@ -977,6 +1470,18 @@ pub fn activeAt(active_index: u32) ?MemoryBlock {
 pub fn summary() Summary {
     if (!initialized) return .{};
     return table.summary();
+}
+
+pub fn hotPathStats() HotPathStats {
+    if (!initialized) return .{};
+    var result = table.hot_path_stats;
+    result.physical_index_entries = table.physical_entry_count;
+    result.id_index_entries = table.id_index_entries;
+    return result;
+}
+
+pub fn indexInvariant() bool {
+    return initialized and table.indexInvariant();
 }
 
 pub fn dumpSummary() void {
@@ -1171,6 +1676,36 @@ fn checkedAddInto(target: *u64, value: u64, overflow: *bool) void {
 fn splitPhysicalBytes(bytes: u64, part_len: u64) u64 {
     if (bytes == 0) return 0;
     return if (bytes >= part_len) part_len else bytes;
+}
+
+fn idIndexStart(id: u32) usize {
+    const mixed = @as(u64, id) *% 11400714819323198485;
+    return @intCast(mixed % ID_INDEX_CAPACITY);
+}
+
+fn usesPhysicalIndex(block: MemoryBlock) bool {
+    return block.active() and block.phys_len != 0;
+}
+
+fn isCanonicalFree(block: MemoryBlock) bool {
+    return block.active() and
+        block.kind == .free and
+        block.owner == .system and
+        block.owner_id == 0 and
+        block.status == .free and
+        block.virt_len == 0 and
+        strEq(block.name, "free");
+}
+
+fn canMergePhysicalRequest(block: MemoryBlock, req: RegisterRequest) bool {
+    return block.active() and
+        block.virt_len == 0 and
+        block.phys_len != 0 and
+        block.kind == req.kind and
+        block.owner == req.owner and
+        block.owner_id == req.owner_id and
+        block.status == req.status and
+        strEq(block.name, req.name);
 }
 
 fn canMergePhysical(a: MemoryBlock, b: MemoryBlock) bool {
