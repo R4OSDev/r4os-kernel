@@ -37,6 +37,11 @@ explicit diagnostic artifact:
 
     Build.bat -Dboot-selftests=true
 
+The controller-parallel block-dispatch and resident direct-buffer runtime
+acceptance can be enabled independently of the other invasive probes:
+
+    Build.bat -Dblock-dispatch-selftest=true
+
 Once the shell task has been admitted, the one-shot kernel boot task exits and
 is reaped. The shell's first `boot_ready` call independently freezes the boot
 measurement and retires the boot renderer without repainting the ready shell

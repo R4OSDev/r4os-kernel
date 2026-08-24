@@ -35,6 +35,7 @@ const sched_sync = @import("sched/sync.zig");
 const sched_task = @import("sched/task.zig");
 const sched_scheduler = @import("sched/scheduler.zig");
 const task_registry_selftest = @import("sched/task_registry_selftest.zig");
+const block_storage = @import("storage/block.zig");
 const bootscreen = @import("kernel/bootscreen.zig");
 const boot_display = @import("display/boot_display.zig");
 const kernel_version = @import("kernel/version.zig");
@@ -157,6 +158,9 @@ export fn kmain() callconv(.c) noreturn {
     // their real boot-time coverage without charging product readiness.
     if (comptime config.enable_boot_selftests) {
         if (!sched_sync.selfTest()) fatal.kernelFatal(.runtime, "Boot sync selftest failed");
+    }
+    if (comptime config.enable_boot_selftests or config.enable_block_dispatch_selftest) {
+        if (!block_storage.parallelDispatchSelfTest()) fatal.kernelFatal(.runtime, "Block dispatch selftest failed");
     }
     // 0.56.17: Autonomer Input-Poll-Task - NACH initTaskRuntime (sonst von
     // task.init() gewischt); pollt USB-HID im 10-ms-Takt ohne Konsumenten.

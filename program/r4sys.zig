@@ -2505,7 +2505,11 @@ pub fn fileCopy(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
     if (isRootPath(src_target.path) or isRootPath(dst_target.path)) return -3;
     if (src_target.drive_ref.letter == dst_target.drive_ref.letter and stdMemEql(src_target.path, dst_target.path)) return -8;
 
-    var req = fs_request.begin(.file_copy, src_target.drive_ref.letter) orelse return -10;
+    var req = fs_request.beginPair(
+        .file_copy,
+        src_target.drive_ref.letter,
+        dst_target.drive_ref.letter,
+    ) orelse return -10;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var entry: vfs.Entry = undefined;
@@ -2545,7 +2549,11 @@ pub fn fileMove(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
     if (isRootPath(src_target.path) or isRootPath(dst_target.path)) return -3;
     if (src_target.drive_ref.letter == dst_target.drive_ref.letter and stdMemEql(src_target.path, dst_target.path)) return -8;
 
-    var req = fs_request.begin(.file_move, src_target.drive_ref.letter) orelse return -12;
+    var req = fs_request.beginPair(
+        .file_move,
+        src_target.drive_ref.letter,
+        dst_target.drive_ref.letter,
+    ) orelse return -12;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var entry: vfs.Entry = undefined;

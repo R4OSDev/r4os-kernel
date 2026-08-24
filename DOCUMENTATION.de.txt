@@ -30,6 +30,12 @@ Schedulerproben sind ausschliesslich im expliziten Diagnoseartefakt aktiv:
 
     Build.bat -Dboot-selftests=true
 
+Die isolierte Laufzeitabnahme fuer controller-parallelen Blockdispatch und
+direkte, eigentuerfixierte Puffer laesst sich ohne die uebrigen invasiven
+Bootproben bauen:
+
+    Build.bat -Dblock-dispatch-selftest=true
+
 Grenze
 ------
 

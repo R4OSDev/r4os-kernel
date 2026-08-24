@@ -1,6 +1,6 @@
 // Checked SYSUPD ownership transition.
 //
-// Callers must hold the global fs_request gate (or run during the
+// Callers must hold the target volume's fs_request gate (or run during the
 // single-threaded pre-runtime recovery phase).  Lookup, full-content
 // fingerprints, transient alias identity, the backend ownership transfer,
 // cleanup and final verification consequently form one namespace-critical

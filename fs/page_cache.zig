@@ -624,7 +624,7 @@ pub fn writeSectorsDirect(device_index: usize, lba: u64, sectors: u16, data: []c
     stats.write_through_requests +%= 1;
     releaseLock(guard);
     locked = false;
-    const write_result = block.writeWithProgress(device_index, lba, sectors, staged_data[0..byte_count]);
+    const write_result = block.writeDirectWithProgress(device_index, lba, sectors, staged_data[0..byte_count]);
     const completed_sectors: usize = @min(@as(usize, write_result.sectors_completed), sector_count);
     const write_ok = write_result.err == .none and completed_sectors == sector_count;
 
@@ -1009,7 +1009,7 @@ fn fillEntryUnlocked(guard: bool, index: usize) bool {
         // sein; das ist kein Transportfehler und benoetigt keinen Fallback.
         // io_busy haelt Schreiber fern.
         const byte_count = readable_sectors * SECTOR_SIZE;
-        ok = block.read(
+        ok = block.readDirect(
             device,
             page,
             @intCast(readable_sectors),
@@ -1023,7 +1023,7 @@ fn fillEntryUnlocked(guard: bool, index: usize) bool {
         while (sector < readable_sectors) : (sector += 1) {
             const bit = @as(u8, 1) << @as(u3, @intCast(sector));
             if ((mask_before & bit) != 0) continue;
-            if (!block.read(device, page + sector, 1, buf[0..])) {
+            if (!block.readDirect(device, page + sector, 1, buf[0..])) {
                 ok = false;
                 break;
             }
@@ -1224,7 +1224,7 @@ fn writebackEntryUnlocked(guard: bool, index: usize) bool {
             0;
         var retries: usize = 0;
         while (true) {
-            if (block.write(device, page + sector, @intCast(run_len), frame[off .. off + run_bytes])) break;
+            if (block.writeDirect(device, page + sector, @intCast(run_len), frame[off .. off + run_bytes])) break;
             if (retries >= max_retries) {
                 ok = false;
                 break;

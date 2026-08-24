@@ -832,13 +832,7 @@ fn handle(channel_id: u32, request: []const u8, response: []u8) i32 {
         return writeResponse(response, channel_id, op, request_id, RESULT_OK, w.slice());
     }
     if (channel_id == ipc.CHANNEL_NET_TCP and isTcpResultOperation(op)) {
-        var data_buf: [TCP_RESULT_DATA_MAX]u8 = undefined;
-        const tcp_result = makeTcpResult(op, request_payload, data_buf[0..], client_id);
-        const result_bytes: [*]const u8 = @ptrCast(&tcp_result.result);
-        var payload_buf: [@sizeOf(TcpServiceResult) + TCP_RESULT_DATA_MAX]u8 = undefined;
-        @memcpy(payload_buf[0..@sizeOf(TcpServiceResult)], result_bytes[0..@sizeOf(TcpServiceResult)]);
-        if (tcp_result.data.len != 0) @memcpy(payload_buf[@sizeOf(TcpServiceResult) .. @sizeOf(TcpServiceResult) + tcp_result.data.len], tcp_result.data);
-        return writeResponse(response, channel_id, op, request_id, RESULT_OK, payload_buf[0 .. @sizeOf(TcpServiceResult) + tcp_result.data.len]);
+        return handleTcpResultOperation(response, channel_id, op, request_id, request_payload, client_id);
     }
     if (channel_id == ipc.CHANNEL_NET_UDP and op == OP_UDP_STATUS_RESULT) {
         const status_result = makeUdpStatusResult();
@@ -850,13 +844,7 @@ fn handle(channel_id: u32, request: []const u8, response: []u8) i32 {
         return writeResponse(response, channel_id, op, request_id, RESULT_OK, w.slice());
     }
     if (channel_id == ipc.CHANNEL_NET_UDP and isUdpResultOperation(op)) {
-        var data_buf: [UDP_RESULT_DATA_MAX]u8 = undefined;
-        const udp_result = makeUdpResult(op, request_payload, data_buf[0..]);
-        const result_bytes: [*]const u8 = @ptrCast(&udp_result.result);
-        var payload_buf: [@sizeOf(UdpServiceResult) + UDP_RESULT_DATA_MAX]u8 = undefined;
-        @memcpy(payload_buf[0..@sizeOf(UdpServiceResult)], result_bytes[0..@sizeOf(UdpServiceResult)]);
-        if (udp_result.data.len != 0) @memcpy(payload_buf[@sizeOf(UdpServiceResult) .. @sizeOf(UdpServiceResult) + udp_result.data.len], udp_result.data);
-        return writeResponse(response, channel_id, op, request_id, RESULT_OK, payload_buf[0 .. @sizeOf(UdpServiceResult) + udp_result.data.len]);
+        return handleUdpResultOperation(response, channel_id, op, request_id, request_payload);
     }
     if (op != OP_STATUS) return writeError(response, channel_id, op, request_id, RESULT_BAD_OP);
     switch (channel_id) {
@@ -867,6 +855,49 @@ fn handle(channel_id: u32, request: []const u8, response: []u8) i32 {
         else => return writeError(response, channel_id, op, request_id, RESULT_BAD_SERVICE),
     }
     return writeResponse(response, channel_id, op, request_id, RESULT_OK, w.slice());
+}
+
+// TCP- und UDP-Ergebnisantworten besitzen jeweils zwei fast 4 KB grosse
+// Arbeitsbereiche. Bleiben beide Zweige im gemeinsamen Handler, reserviert
+// ReleaseSafe sie zusammen in dessen Frame. Der einzelne service-ipc-Worker
+// lief dadurch beim ersten SSH-Accept in den Guard seines 64-KB-Stacks.
+// Getrennte, nicht inlinebare Frames halten nur den tatsaechlich ausgefuehrten
+// Protokollzweig gleichzeitig aktiv und bewahren die Handler-Reentranz.
+noinline fn handleTcpResultOperation(
+    response: []u8,
+    channel_id: u32,
+    op: u16,
+    request_id: u32,
+    request_payload: []const u8,
+    client_id: u16,
+) i32 {
+    var data_buf: [TCP_RESULT_DATA_MAX]u8 = undefined;
+    const tcp_result = makeTcpResult(op, request_payload, data_buf[0..], client_id);
+    const result_bytes: [*]const u8 = @ptrCast(&tcp_result.result);
+    var payload_buf: [@sizeOf(TcpServiceResult) + TCP_RESULT_DATA_MAX]u8 = undefined;
+    @memcpy(payload_buf[0..@sizeOf(TcpServiceResult)], result_bytes[0..@sizeOf(TcpServiceResult)]);
+    if (tcp_result.data.len != 0) {
+        @memcpy(payload_buf[@sizeOf(TcpServiceResult) .. @sizeOf(TcpServiceResult) + tcp_result.data.len], tcp_result.data);
+    }
+    return writeResponse(response, channel_id, op, request_id, RESULT_OK, payload_buf[0 .. @sizeOf(TcpServiceResult) + tcp_result.data.len]);
+}
+
+noinline fn handleUdpResultOperation(
+    response: []u8,
+    channel_id: u32,
+    op: u16,
+    request_id: u32,
+    request_payload: []const u8,
+) i32 {
+    var data_buf: [UDP_RESULT_DATA_MAX]u8 = undefined;
+    const udp_result = makeUdpResult(op, request_payload, data_buf[0..]);
+    const result_bytes: [*]const u8 = @ptrCast(&udp_result.result);
+    var payload_buf: [@sizeOf(UdpServiceResult) + UDP_RESULT_DATA_MAX]u8 = undefined;
+    @memcpy(payload_buf[0..@sizeOf(UdpServiceResult)], result_bytes[0..@sizeOf(UdpServiceResult)]);
+    if (udp_result.data.len != 0) {
+        @memcpy(payload_buf[@sizeOf(UdpServiceResult) .. @sizeOf(UdpServiceResult) + udp_result.data.len], udp_result.data);
+    }
+    return writeResponse(response, channel_id, op, request_id, RESULT_OK, payload_buf[0 .. @sizeOf(UdpServiceResult) + udp_result.data.len]);
 }
 
 fn writeDhcpStatus(w: *Writer) void {

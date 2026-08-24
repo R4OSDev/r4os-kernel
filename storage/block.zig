@@ -1,4 +1,5 @@
 const diag_screen = @import("../kernel/diag_screen.zig");
+const block_dispatch = @import("block_dispatch.zig");
 const block_split = @import("block_split.zig");
 const drive = @import("../fs/drive.zig");
 const heap = @import("../memory/heap.zig");
@@ -87,12 +88,11 @@ const RequestSlot = struct {
     complete_tick: u64 = 0,
     // Once a runtime request has entered the backend, its buffer must remain
     // alive until finishRequest observes that the synchronous callback has
-    // returned.  A finite timeout detaches the caller and transfers bounce-
-    // buffer ownership to that late completion; the active slot itself is
-    // never recycled early.
+    // returned. Bounce ownership may transfer to a late completion. A direct
+    // resident borrower instead remains blocked until that callback returns.
+    buffer_ownership: block_dispatch.BufferOwnership = .none,
     timeout_requested: bool = false,
     caller_detached: bool = false,
-    backend_owns_buffer: bool = false,
 };
 
 const RequestExecution = struct {
@@ -104,6 +104,7 @@ const RequestExecution = struct {
     buffer: ?[*]u8,
     const_buffer: ?[*]const u8,
     buffer_len: usize,
+    buffer_ownership: block_dispatch.BufferOwnership,
     start_tick: u64,
     mode: ExecutionMode,
 };
@@ -173,6 +174,12 @@ pub const Stats = struct {
     flush_failures: u64 = 0,
     backend_recoveries: u64 = 0,
     backend_recovery_failures: u64 = 0,
+    direct_requests: u64 = 0,
+    direct_bytes: u64 = 0,
+    bounce_allocations: u64 = 0,
+    bounce_bytes: u64 = 0,
+    bounce_copy_bytes: u64 = 0,
+    direct_timeout_waits: u64 = 0,
     last_sense: SenseSnapshot = .{},
     last_error: Error = .none,
 };
@@ -189,6 +196,17 @@ pub const RuntimeSummary = struct {
     boot_inline_requests: u64 = 0,
     boot_inline_completions: u64 = 0,
     completion_signals: u64 = 0,
+    controller_count: u32 = 0,
+    worker_count: u32 = 0,
+    worker_start_failures: u64 = 0,
+    worker_parallel_active: u32 = 0,
+    worker_parallel_active_max: u32 = 0,
+    direct_requests: u64 = 0,
+    direct_bytes: u64 = 0,
+    bounce_allocations: u64 = 0,
+    bounce_bytes: u64 = 0,
+    bounce_copy_bytes: u64 = 0,
+    direct_timeout_waits: u64 = 0,
 };
 
 pub const Device = struct {
@@ -217,6 +235,7 @@ pub const Device = struct {
     state: State = .registered,
     stats: Stats = .{},
     active_executions: u32 = 0,
+    controller_lane: u8 = block_dispatch.no_lane,
     request_slots: [MAX_REQUEST_QUEUE_DEPTH]RequestSlot = .{RequestSlot{}} ** MAX_REQUEST_QUEUE_DEPTH,
     slot_available: sync.WaitQueue = sync.WaitQueue.init(),
     completion_available: sync.WaitQueue = sync.WaitQueue.init(),
@@ -256,7 +275,20 @@ var device_slot_count: usize = 0;
 var runtime_worker_started = false;
 var runtime_worker_task_id: u32 = 0;
 var runtime_worker_task_generation: u64 = 0;
-var runtime_event = sync.EventV2.initMode(false, .auto_reset);
+var primary_controller_lane: u8 = block_dispatch.no_lane;
+var controller_map: block_dispatch.ControllerMap = .{};
+const ControllerRuntime = struct {
+    worker_started: bool = false,
+    worker_task_id: u32 = 0,
+    worker_task_generation: u64 = 0,
+    event: sync.EventV2 = sync.EventV2.initMode(false, .auto_reset),
+};
+var controller_runtime: [block_dispatch.max_controllers]ControllerRuntime =
+    .{ControllerRuntime{}} ** block_dispatch.max_controllers;
+const worker_names = [_][]const u8{
+    "block-work",  "block-work1", "block-work2", "block-work3",
+    "block-work4", "block-work5", "block-work6", "block-work7",
+};
 var runtime_summary: RuntimeSummary = .{};
 
 pub fn init() void {
@@ -266,7 +298,9 @@ pub fn init() void {
     runtime_worker_started = false;
     runtime_worker_task_id = 0;
     runtime_worker_task_generation = 0;
-    runtime_event = sync.EventV2.initMode(false, .auto_reset);
+    primary_controller_lane = block_dispatch.no_lane;
+    controller_map = .{};
+    controller_runtime = .{ControllerRuntime{}} ** block_dispatch.max_controllers;
     runtime_summary = .{};
 }
 
@@ -275,16 +309,44 @@ pub fn initRuntimeWorker() bool {
     runtime_worker_started = false;
     runtime_worker_task_id = 0;
     runtime_worker_task_generation = 0;
-    const worker = sched_task.createKernelThreadCriticalWithRole("block-work", workerMain, .batch) orelse {
+    primary_controller_lane = block_dispatch.no_lane;
+    var lane: usize = 0;
+    while (lane < controller_runtime.len) : (lane += 1) {
+        controller_runtime[lane].worker_started = false;
+        controller_runtime[lane].worker_task_id = 0;
+        controller_runtime[lane].worker_task_generation = 0;
+        controller_runtime[lane].event = sync.EventV2.initMode(false, .auto_reset);
+    }
+
+    lane = 0;
+    while (lane < controller_runtime.len) : (lane += 1) {
+        if (!controller_map.used[lane]) continue;
+        if (primary_controller_lane == block_dispatch.no_lane) {
+            if (!startControllerWorker(@intCast(lane), true)) {
+                runtime_summary.worker_started = 0;
+                runtime_summary.worker_task_id = 0;
+                return false;
+            }
+            primary_controller_lane = @intCast(lane);
+            continue;
+        }
+        if (!startControllerWorker(@intCast(lane), false)) {
+            runtime_summary.worker_start_failures +%= 1;
+        }
+    }
+    if (primary_controller_lane == block_dispatch.no_lane) {
+        // The runtime storage contract always has at least one boot device.
+        // Fail visibly instead of publishing a worker that can own no queue.
         runtime_summary.worker_started = 0;
         runtime_summary.worker_task_id = 0;
         return false;
-    };
+    }
+    const primary = &controller_runtime[primary_controller_lane];
     runtime_worker_started = true;
-    runtime_worker_task_id = worker.id;
-    runtime_worker_task_generation = worker.generation;
+    runtime_worker_task_id = primary.worker_task_id;
+    runtime_worker_task_generation = primary.worker_task_generation;
     runtime_summary.worker_started = 1;
-    runtime_summary.worker_task_id = worker.id;
+    runtime_summary.worker_task_id = primary.worker_task_id;
     return true;
 }
 
@@ -297,6 +359,14 @@ pub fn runtimeWorkerSummary() RuntimeSummary {
     const alive = runtimeWorkerIdentityAlive();
     out.worker_started = if (alive) 1 else 0;
     out.worker_task_id = if (alive) runtime_worker_task_id else 0;
+    out.controller_count = controller_map.count();
+    out.worker_count = 0;
+    var lane: usize = 0;
+    while (lane < controller_runtime.len) : (lane += 1) {
+        if (controller_map.used[lane] and controllerWorkerAlive(@intCast(lane))) {
+            out.worker_count += 1;
+        }
+    }
     return out;
 }
 
@@ -307,24 +377,60 @@ fn runtimeWorkerIdentityAlive() bool {
         sched_task.isAliveIdentity(runtime_worker_task_id, runtime_worker_task_generation);
 }
 
+fn controllerWorkerAlive(lane: u8) bool {
+    if (lane >= controller_runtime.len) return false;
+    const runtime = &controller_runtime[lane];
+    return runtime.worker_started and
+        runtime.worker_task_id != 0 and
+        runtime.worker_task_generation != 0 and
+        sched_task.isAliveIdentity(runtime.worker_task_id, runtime.worker_task_generation);
+}
+
+fn startControllerWorker(lane: u8, critical: bool) bool {
+    if (lane >= controller_runtime.len) return false;
+    if (controllerWorkerAlive(lane)) return true;
+    const worker = if (critical)
+        sched_task.createKernelThreadCriticalWithRole(worker_names[lane], workerMain, .batch)
+    else
+        sched_task.createKernelThreadWithRole(worker_names[lane], workerMain, .batch);
+    const task = worker orelse return false;
+    controller_runtime[lane].worker_started = true;
+    controller_runtime[lane].worker_task_id = task.id;
+    controller_runtime[lane].worker_task_generation = task.generation;
+    return true;
+}
+
 pub fn register(device: Device) ?usize {
     const irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(irq_flags);
+    const result = registerLocked(device);
+    const controller_lane = if (result) |index| devices[index].device.controller_lane else block_dispatch.no_lane;
+    interrupts.restore(irq_flags);
+    if (result != null) {
+        if (runtimeWorkerIdentityAlive() and !controllerWorkerAlive(controller_lane)) {
+            if (!startControllerWorker(controller_lane, false)) {
+                runtime_summary.worker_start_failures +%= 1;
+            }
+        }
+    }
+    return result;
+}
+
+fn registerLocked(device: Device) ?usize {
     if (device_count >= MAX_DEVICES) return null;
     if (findByNameLocked(device.name) != null) return null;
     if (device.queue_depth == 0 or @as(usize, device.queue_depth) > MAX_REQUEST_QUEUE_DEPTH) return null;
 
     var target_index: usize = 0;
     while (target_index < device_slot_count and devices[target_index].used) : (target_index += 1) {}
-    if (target_index == device_slot_count) {
-        if (device_slot_count >= devices.len) return null;
-        device_slot_count += 1;
-    }
+    if (target_index == device_slot_count and device_slot_count >= devices.len) return null;
+    const controller_lane = controller_map.assign(device.controller) orelse return null;
+    if (target_index == device_slot_count) device_slot_count += 1;
 
     var normalized = device;
     normalized.state = .registered;
     normalized.stats = .{};
     normalized.active_executions = 0;
+    normalized.controller_lane = controller_lane;
     normalized.request_slots = .{RequestSlot{}} ** MAX_REQUEST_QUEUE_DEPTH;
     normalized.slot_available = sync.WaitQueue.init();
     normalized.completion_available = sync.WaitQueue.init();
@@ -445,10 +551,20 @@ fn commitRetirement(slot: *DeviceSlot) bool {
     const irq_flags = interrupts.saveAndDisable();
     defer interrupts.restore(irq_flags);
     if (!slot.used or !slot.retiring or slot.pin_count != 0) return false;
+    const retired_lane = slot.device.controller_lane;
     slot.used = false;
     slot.retiring = false;
     if (device_count != 0) device_count -= 1;
+    if (!controllerLaneInUseLocked(retired_lane)) controller_map.clear(retired_lane);
     return true;
+}
+
+fn controllerLaneInUseLocked(lane: u8) bool {
+    var index: usize = 0;
+    while (index < device_slot_count) : (index += 1) {
+        if (devices[index].used and devices[index].device.controller_lane == lane) return true;
+    }
+    return false;
 }
 
 fn deviceIsQuiescent(device: *Device) bool {
@@ -591,6 +707,17 @@ pub fn sourceLabel(source: Source) []const u8 {
 }
 
 pub fn read(index: usize, lba: u64, sectors: u16, out: []u8) bool {
+    return readWithPolicy(index, lba, sectors, out, false);
+}
+
+/// Kernel-only direct I/O. The caller proves that `out` is resident,
+/// owner-fixed and alive until this synchronous call returns. Unlike the
+/// general API, an active timeout cannot detach this borrowed buffer.
+pub fn readDirect(index: usize, lba: u64, sectors: u16, out: []u8) bool {
+    return readWithPolicy(index, lba, sectors, out, true);
+}
+
+fn readWithPolicy(index: usize, lba: u64, sectors: u16, out: []u8, trusted_resident: bool) bool {
     var pin = pinDevice(index) orelse return false;
     defer unpinDevice(&pin);
     const device = pin.device;
@@ -608,12 +735,13 @@ pub fn read(index: usize, lba: u64, sectors: u16, out: []u8) bool {
             lba + @as(u64, chunk.sector_offset),
             chunk.sectors,
             out[chunk.byte_offset .. chunk.byte_offset + chunk.byte_count],
+            trusted_resident,
         ) != .none) return false;
     }
     return true;
 }
 
-fn readChunk(device: *Device, lba: u64, sectors: u16, out: []u8) Error {
+fn readChunk(device: *Device, lba: u64, sectors: u16, out: []u8, trusted_resident: bool) Error {
     const byte_count = @as(usize, sectors) * @as(usize, device.sector_size);
 
     // The runtime block worker is a different task.  It must never retain a
@@ -624,7 +752,7 @@ fn readChunk(device: *Device, lba: u64, sectors: u16, out: []u8) Error {
     // the exact request has completed.  Early boot still executes inline and
     // therefore needs no allocation.
     const use_runtime_worker = runtimeWorkerReady();
-    const bounce = if (use_runtime_worker)
+    const bounce = if (use_runtime_worker and !trusted_resident)
         heap.alloc(byte_count, 16) orelse {
             recordReadFailure(device, .busy);
             return .busy;
@@ -635,8 +763,25 @@ fn readChunk(device: *Device, lba: u64, sectors: u16, out: []u8) Error {
     defer if (release_bounce) if (bounce) |memory| {
         _ = heap.free(memory);
     };
+    const buffer_ownership: block_dispatch.BufferOwnership = if (!use_runtime_worker)
+        .none
+    else if (trusted_resident)
+        .borrowed_resident
+    else
+        .bounce_owned;
+    if (buffer_ownership == .borrowed_resident) {
+        device.stats.direct_requests +%= 1;
+        device.stats.direct_bytes +%= byte_count;
+        runtime_summary.direct_requests +%= 1;
+        runtime_summary.direct_bytes +%= byte_count;
+    } else if (buffer_ownership == .bounce_owned) {
+        device.stats.bounce_allocations +%= 1;
+        device.stats.bounce_bytes +%= byte_count;
+        runtime_summary.bounce_allocations +%= 1;
+        runtime_summary.bounce_bytes +%= byte_count;
+    }
     const request_buffer = if (bounce) |memory| memory.ptr else out.ptr;
-    const request_id = enqueueRequest(device, .read, lba, sectors, request_buffer, null, byte_count) orelse {
+    const request_id = enqueueRequest(device, .read, lba, sectors, request_buffer, null, byte_count, buffer_ownership) orelse {
         const err = device.stats.last_error;
         recordReadFailure(device, err);
         return err;
@@ -645,7 +790,11 @@ fn readChunk(device: *Device, lba: u64, sectors: u16, out: []u8) Error {
     const result = waitForRequest(device, request_id, requestTimeout(device));
     if (result.buffer_detached) release_bounce = false;
     if (!result.ok) return result.err;
-    if (bounce) |memory| @memcpy(out[0..byte_count], memory[0..byte_count]);
+    if (bounce) |memory| {
+        @memcpy(out[0..byte_count], memory[0..byte_count]);
+        device.stats.bounce_copy_bytes +%= byte_count;
+        runtime_summary.bounce_copy_bytes +%= byte_count;
+    }
     return .none;
 }
 
@@ -655,6 +804,21 @@ pub fn write(index: usize, lba: u64, sectors: u16, data: []const u8) bool {
 }
 
 pub fn writeWithProgress(index: usize, lba: u64, sectors: u16, data: []const u8) TransferResult {
+    return writeWithProgressPolicy(index, lba, sectors, data, false);
+}
+
+/// Kernel-only direct I/O with the same resident, owner-fixed lifetime
+/// requirement as readDirect.
+pub fn writeDirect(index: usize, lba: u64, sectors: u16, data: []const u8) bool {
+    const result = writeDirectWithProgress(index, lba, sectors, data);
+    return result.err == .none and result.sectors_completed == sectors;
+}
+
+pub fn writeDirectWithProgress(index: usize, lba: u64, sectors: u16, data: []const u8) TransferResult {
+    return writeWithProgressPolicy(index, lba, sectors, data, true);
+}
+
+fn writeWithProgressPolicy(index: usize, lba: u64, sectors: u16, data: []const u8, trusted_resident: bool) TransferResult {
     var pin = pinDevice(index) orelse return .{ .err = .invalid_request };
     defer unpinDevice(&pin);
     const device = pin.device;
@@ -677,6 +841,7 @@ pub fn writeWithProgress(index: usize, lba: u64, sectors: u16, data: []const u8)
             lba + @as(u64, chunk.sector_offset),
             chunk.sectors,
             data[chunk.byte_offset .. chunk.byte_offset + chunk.byte_count],
+            trusted_resident,
         );
         if (err != .none) return .{ .sectors_completed = completed, .err = err };
         completed += chunk.sectors;
@@ -684,10 +849,10 @@ pub fn writeWithProgress(index: usize, lba: u64, sectors: u16, data: []const u8)
     return .{ .sectors_completed = completed };
 }
 
-fn writeChunk(device: *Device, lba: u64, sectors: u16, data: []const u8) Error {
+fn writeChunk(device: *Device, lba: u64, sectors: u16, data: []const u8, trusted_resident: bool) Error {
     const byte_count = @as(usize, sectors) * @as(usize, device.sector_size);
     const use_runtime_worker = runtimeWorkerReady();
-    const bounce = if (use_runtime_worker)
+    const bounce = if (use_runtime_worker and !trusted_resident)
         heap.alloc(byte_count, 16) orelse {
             recordWriteFailure(device, .busy);
             return .busy;
@@ -698,9 +863,30 @@ fn writeChunk(device: *Device, lba: u64, sectors: u16, data: []const u8) Error {
     defer if (release_bounce) if (bounce) |memory| {
         _ = heap.free(memory);
     };
-    if (bounce) |memory| @memcpy(memory[0..byte_count], data[0..byte_count]);
+    const buffer_ownership: block_dispatch.BufferOwnership = if (!use_runtime_worker)
+        .none
+    else if (trusted_resident)
+        .borrowed_resident
+    else
+        .bounce_owned;
+    if (buffer_ownership == .borrowed_resident) {
+        device.stats.direct_requests +%= 1;
+        device.stats.direct_bytes +%= byte_count;
+        runtime_summary.direct_requests +%= 1;
+        runtime_summary.direct_bytes +%= byte_count;
+    } else if (buffer_ownership == .bounce_owned) {
+        device.stats.bounce_allocations +%= 1;
+        device.stats.bounce_bytes +%= byte_count;
+        runtime_summary.bounce_allocations +%= 1;
+        runtime_summary.bounce_bytes +%= byte_count;
+    }
+    if (bounce) |memory| {
+        @memcpy(memory[0..byte_count], data[0..byte_count]);
+        device.stats.bounce_copy_bytes +%= byte_count;
+        runtime_summary.bounce_copy_bytes +%= byte_count;
+    }
     const request_buffer = if (bounce) |memory| memory.ptr else data.ptr;
-    const request_id = enqueueRequest(device, .write, lba, sectors, null, request_buffer, byte_count) orelse {
+    const request_id = enqueueRequest(device, .write, lba, sectors, null, request_buffer, byte_count, buffer_ownership) orelse {
         const err = device.stats.last_error;
         recordWriteFailure(device, err);
         return err;
@@ -716,7 +902,7 @@ pub fn flush(index: usize) bool {
     defer unpinDevice(&pin);
     const device = pin.device;
     if (device.flush_fn == null) return true;
-    const request_id = enqueueRequest(device, .flush, 0, 0, null, null, 0) orelse {
+    const request_id = enqueueRequest(device, .flush, 0, 0, null, null, 0, .none) orelse {
         recordFlushFailure(device, device.stats.last_error);
         return false;
     };
@@ -724,7 +910,16 @@ pub fn flush(index: usize) bool {
     return waitForRequest(device, request_id, requestTimeout(device)).ok;
 }
 
-fn enqueueRequest(device: *Device, kind: RequestKind, lba: u64, sectors: u16, buffer: ?[*]u8, const_buffer: ?[*]const u8, buffer_len: usize) ?u64 {
+fn enqueueRequest(
+    device: *Device,
+    kind: RequestKind,
+    lba: u64,
+    sectors: u16,
+    buffer: ?[*]u8,
+    const_buffer: ?[*]const u8,
+    buffer_len: usize,
+    buffer_ownership: block_dispatch.BufferOwnership,
+) ?u64 {
     const timeout = requestTimeout(device);
     const forever = timeout == sync.WAIT_FOREVER;
     const wait_start = timer.tickCount();
@@ -743,6 +938,7 @@ fn enqueueRequest(device: *Device, kind: RequestKind, lba: u64, sectors: u16, bu
                 .buffer = buffer,
                 .const_buffer = const_buffer,
                 .buffer_len = buffer_len,
+                .buffer_ownership = buffer_ownership,
                 .submit_tick = timer.tickCount(),
             };
             device.stats.queued_requests +%= 1;
@@ -779,7 +975,15 @@ fn scheduleDeviceQueue(device: *Device, use_runtime_worker: bool) void {
     // asynchronous worker if that worker became live between enqueue/wake.
     if (use_runtime_worker) {
         runtime_summary.worker_wakeups +%= 1;
-        runtime_event.signal();
+        const lane = effectiveWorkerLane(device.controller_lane);
+        if (lane != block_dispatch.no_lane) {
+            controller_runtime[lane].event.signal();
+            return;
+        }
+        // A worker disappearing between admission and publication is rare,
+        // but the request still owns a safe resident/bounce buffer. Execute
+        // it synchronously instead of stranding the queue.
+        _ = pumpDeviceQueue(device, .boot_inline);
         return;
     }
 
@@ -819,6 +1023,7 @@ fn beginNextRequest(device: *Device, mode: ExecutionMode) ?RequestExecution {
         .buffer = slot.buffer,
         .const_buffer = slot.const_buffer,
         .buffer_len = slot.buffer_len,
+        .buffer_ownership = slot.buffer_ownership,
         .start_tick = start_tick,
         .mode = mode,
     };
@@ -830,6 +1035,10 @@ fn beginNextRequest(device: *Device, mode: ExecutionMode) ?RequestExecution {
         .runtime_worker => {
             device.stats.worker_requests +%= 1;
             runtime_summary.worker_runtime_requests +%= 1;
+            runtime_summary.worker_parallel_active +|= 1;
+            if (runtime_summary.worker_parallel_active > runtime_summary.worker_parallel_active_max) {
+                runtime_summary.worker_parallel_active_max = runtime_summary.worker_parallel_active;
+            }
         },
     }
     unlockDevice(device, locked);
@@ -877,7 +1086,7 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
     const latency = if (complete_tick >= request.start_tick) complete_tick - request.start_tick else 0;
     const timed_out = slot.timeout_requested;
     const caller_detached = slot.caller_detached;
-    if (caller_detached and slot.backend_owns_buffer) {
+    if (caller_detached and slot.buffer_ownership == .bounce_owned) {
         detached_buffer = switch (request.kind) {
             .read => if (request.buffer) |ptr| ptr[0..request.buffer_len] else null,
             .write => if (request.const_buffer) |ptr| @constCast(ptr[0..request.buffer_len]) else null,
@@ -913,6 +1122,9 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
         .runtime_worker => {
             device.stats.worker_completions +%= 1;
             runtime_summary.worker_runtime_completions +%= 1;
+            if (runtime_summary.worker_parallel_active != 0) {
+                runtime_summary.worker_parallel_active -= 1;
+            }
         },
     }
     if (caller_detached) {
@@ -929,10 +1141,11 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
 // system, because the requester holds the FS request path while it sleeps.
 // Now every wait runs in bounded observation slices.  A queued request can
 // be cancelled safely when its caller timeout expires.  An active runtime
-// request detaches its caller: the worker retains the non-pageable bounce
-// buffer and frees it only after the backend callback returns.  This bounds
-// caller latency without an unsafe early free or slot reuse. WAIT_FOREVER
-// remains an ownership-safe forever wait and keeps the backed-off reports.
+// request with a bounce buffer detaches its caller: the worker frees that
+// buffer only after the backend callback returns. A trusted direct request
+// cannot detach its borrowed resident buffer, so its owner waits for physical
+// completion after the timeout has been classified. WAIT_FOREVER remains an
+// ownership-safe forever wait and keeps the backed-off reports.
 const WATCHDOG_SLICE_TICKS: u64 = 5 * @as(u64, timer.DEFAULT_HZ);
 
 fn shouldReportWatchdogSlice(slices: u32) bool {
@@ -1178,20 +1391,37 @@ fn waitForRequest(device: *Device, request_id: u64, timeout: u64) RequestResult 
                     return .{ .err = .timeout };
                 },
                 .active => {
-                    if (!timeout_slot.timeout_requested) {
+                    const first_timeout = !timeout_slot.timeout_requested;
+                    if (first_timeout) {
                         timeout_slot.timeout_requested = true;
                         device.stats.completion_timeouts +%= 1;
                     }
-                    timeout_slot.caller_detached = true;
-                    timeout_slot.backend_owns_buffer = timeout_slot.kind == .read or timeout_slot.kind == .write;
-                    recordRequestFailure(device, timeout_slot.kind, .timeout);
-                    const buffer_detached = timeout_slot.backend_owns_buffer;
-                    unlockDevice(device, timeout_locked);
-                    watchdog_slices += 1;
-                    if (shouldReportWatchdogSlice(watchdog_slices)) {
-                        watchdogReport(device, request_id, watchdog_slices, &incident_token);
+                    switch (block_dispatch.activeTimeoutAction(timeout_slot.buffer_ownership)) {
+                        .wait_for_completion => {
+                            if (first_timeout) {
+                                device.stats.direct_timeout_waits +%= 1;
+                                runtime_summary.direct_timeout_waits +%= 1;
+                            }
+                            unlockDevice(device, timeout_locked);
+                            watchdog_slices += 1;
+                            if (shouldReportWatchdogSlice(watchdog_slices)) {
+                                watchdogReport(device, request_id, watchdog_slices, &incident_token);
+                            }
+                            _ = device.completion_available.wait(WATCHDOG_SLICE_TICKS, "block-direct-completion");
+                            continue;
+                        },
+                        .detach, .detach_with_buffer => |action| {
+                            timeout_slot.caller_detached = true;
+                            recordRequestFailure(device, timeout_slot.kind, .timeout);
+                            const buffer_detached = action == .detach_with_buffer;
+                            unlockDevice(device, timeout_locked);
+                            watchdog_slices += 1;
+                            if (shouldReportWatchdogSlice(watchdog_slices)) {
+                                watchdogReport(device, request_id, watchdog_slices, &incident_token);
+                            }
+                            return .{ .err = .timeout, .buffer_detached = buffer_detached };
+                        },
                     }
-                    return .{ .err = .timeout, .buffer_detached = buffer_detached };
                 },
                 .completed => {
                     unlockDevice(device, timeout_locked);
@@ -1374,18 +1604,46 @@ fn canBlockOnStorage() bool {
 }
 
 fn workerMain() callconv(.c) void {
+    var lane = currentWorkerLane();
+    while (lane == block_dispatch.no_lane) {
+        scheduler.yield();
+        lane = currentWorkerLane();
+    }
     while (true) {
-        if (pumpAllRuntimeQueues()) continue;
+        if (pumpControllerRuntimeQueues(lane)) continue;
         runtime_summary.worker_idle_waits +%= 1;
-        _ = runtime_event.waitResult(scheduler.WAIT_FOREVER);
+        _ = controller_runtime[lane].event.waitResult(scheduler.WAIT_FOREVER);
     }
 }
 
-fn pumpAllRuntimeQueues() bool {
+fn currentWorkerLane() u8 {
+    const current = scheduler.current() orelse return block_dispatch.no_lane;
+    var lane: usize = 0;
+    while (lane < controller_runtime.len) : (lane += 1) {
+        const runtime = &controller_runtime[lane];
+        if (runtime.worker_started and
+            runtime.worker_task_id == current.id and
+            runtime.worker_task_generation == current.generation)
+        {
+            return @intCast(lane);
+        }
+    }
+    return block_dispatch.no_lane;
+}
+
+fn effectiveWorkerLane(controller_lane: u8) u8 {
+    if (controllerWorkerAlive(controller_lane)) return controller_lane;
+    if (controllerWorkerAlive(primary_controller_lane)) return primary_controller_lane;
+    return block_dispatch.no_lane;
+}
+
+fn pumpControllerRuntimeQueues(worker_lane: u8) bool {
     runtime_summary.worker_queue_scans +%= 1;
     var did_work = false;
     var index: usize = 0;
     while (index < device_slot_count) : (index += 1) {
+        if (!devices[index].used or devices[index].retiring) continue;
+        if (effectiveWorkerLane(devices[index].device.controller_lane) != worker_lane) continue;
         if (pumpRuntimeDevice(index)) did_work = true;
     }
     if (did_work) runtime_summary.worker_runs +%= 1;
@@ -1396,6 +1654,149 @@ fn pumpRuntimeDevice(index: usize) bool {
     var pin = pinDevice(index) orelse return false;
     defer unpinDevice(&pin);
     return pumpDeviceQueue(pin.device, .runtime_worker);
+}
+
+// Boot-option-gated runtime acceptance for controller ownership. A deliberately
+// blocked callback on one synthetic controller must not hold up a request on
+// another controller. Static buffers also exercise the borrowed-resident path
+// and prove that this path performs neither a bounce allocation nor a copy.
+var dispatch_test_slow_entered = sync.EventV2.initMode(false, .auto_reset);
+var dispatch_test_slow_release = sync.EventV2.initMode(false, .auto_reset);
+var dispatch_test_slow_done = sync.EventV2.initMode(false, .auto_reset);
+var dispatch_test_fast_done = sync.EventV2.initMode(false, .auto_reset);
+var dispatch_test_slow_index: usize = 0;
+var dispatch_test_fast_index: usize = 0;
+var dispatch_test_slow_ok = false;
+var dispatch_test_fast_ok = false;
+var dispatch_test_slow_buffer: [512]u8 = .{0} ** 512;
+var dispatch_test_fast_buffer: [512]u8 = .{0} ** 512;
+
+pub fn parallelDispatchSelfTest() bool {
+    if (!runtimeWorkerReady()) return dispatchSelfTestResult(false, .{}, .{});
+    dispatch_test_slow_entered = sync.EventV2.initMode(false, .auto_reset);
+    dispatch_test_slow_release = sync.EventV2.initMode(false, .auto_reset);
+    dispatch_test_slow_done = sync.EventV2.initMode(false, .auto_reset);
+    dispatch_test_fast_done = sync.EventV2.initMode(false, .auto_reset);
+    dispatch_test_slow_ok = false;
+    dispatch_test_fast_ok = false;
+    dispatch_test_slow_buffer = .{0} ** dispatch_test_slow_buffer.len;
+    dispatch_test_fast_buffer = .{0} ** dispatch_test_fast_buffer.len;
+    const before = runtimeWorkerSummary();
+
+    const slow_index = register(.{
+        .name = "dispatch-test-slow",
+        .controller = "dispatch-test-controller-slow",
+        .bus = .ram,
+        .sector_size = 512,
+        .sector_count = 1,
+        .queue_depth = 1,
+        .ctx = null,
+        .read_fn = dispatchTestSlowRead,
+    }) orelse return dispatchSelfTestResult(false, before, runtimeWorkerSummary());
+    dispatch_test_slow_index = slow_index;
+    const fast_index = register(.{
+        .name = "dispatch-test-fast",
+        .controller = "dispatch-test-controller-fast",
+        .bus = .ram,
+        .sector_size = 512,
+        .sector_count = 1,
+        .queue_depth = 1,
+        .ctx = null,
+        .read_fn = dispatchTestFastRead,
+    }) orelse {
+        _ = unregister(slow_index);
+        return dispatchSelfTestResult(false, before, runtimeWorkerSummary());
+    };
+    dispatch_test_fast_index = fast_index;
+
+    var ok = true;
+    var slow_started = false;
+    var fast_started = false;
+    var fast_observed = false;
+    if (sched_task.createKernelThreadWithRole("blk-test-slow", dispatchTestSlowRequester, .batch) == null) {
+        ok = false;
+    } else {
+        slow_started = true;
+    }
+    if (slow_started and dispatch_test_slow_entered.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled) {
+        ok = false;
+    } else if (slow_started and sched_task.createKernelThreadWithRole("blk-test-fast", dispatchTestFastRequester, .batch) == null) {
+        ok = false;
+    } else if (slow_started) {
+        fast_started = true;
+    }
+    if (fast_started and dispatch_test_fast_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) == .signaled) {
+        fast_observed = true;
+    } else if (fast_started) {
+        ok = false;
+    }
+
+    dispatch_test_slow_release.signal();
+    if (slow_started and dispatch_test_slow_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled) {
+        ok = false;
+    }
+    if (fast_started and !fast_observed and
+        dispatch_test_fast_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled)
+    {
+        ok = false;
+    }
+    const after = runtimeWorkerSummary();
+    ok = dispatch_test_slow_ok and
+        dispatch_test_fast_ok and
+        after.controller_count >= before.controller_count + 2 and
+        after.worker_count >= before.worker_count + 2 and
+        after.worker_parallel_active_max >= 2 and
+        after.direct_requests >= before.direct_requests + 2 and
+        after.bounce_allocations == before.bounce_allocations and
+        after.bounce_copy_bytes == before.bounce_copy_bytes and ok;
+
+    const fast_unregistered = unregister(fast_index);
+    const slow_unregistered = unregister(slow_index);
+    ok = fast_unregistered and slow_unregistered and ok;
+    return dispatchSelfTestResult(ok, before, after);
+}
+
+fn dispatchTestSlowRead(_: ?*anyopaque, _: u64, _: u16, out: []u8) bool {
+    dispatch_test_slow_entered.signal();
+    if (dispatch_test_slow_release.waitResult(sync.WAIT_FOREVER) != .signaled) return false;
+    @memset(out, 0x53);
+    return true;
+}
+
+fn dispatchTestFastRead(_: ?*anyopaque, _: u64, _: u16, out: []u8) bool {
+    @memset(out, 0x46);
+    return true;
+}
+
+fn dispatchTestSlowRequester() callconv(.c) void {
+    dispatch_test_slow_ok = readDirect(dispatch_test_slow_index, 0, 1, dispatch_test_slow_buffer[0..]);
+    dispatch_test_slow_done.signal();
+    scheduler.exitCurrent();
+}
+
+fn dispatchTestFastRequester() callconv(.c) void {
+    dispatch_test_fast_ok = readDirect(dispatch_test_fast_index, 0, 1, dispatch_test_fast_buffer[0..]);
+    dispatch_test_fast_done.signal();
+    scheduler.exitCurrent();
+}
+
+fn dispatchSelfTestResult(ok: bool, before: RuntimeSummary, after: RuntimeSummary) bool {
+    k.puts("BLOCKDISPATCHCHECK ");
+    k.puts(if (ok) "OK" else "FAIL");
+    k.puts(" controllers=");
+    k.putDec(after.controller_count);
+    k.puts(" workers=");
+    k.putDec(after.worker_count);
+    k.puts(" parallelMax=");
+    k.putDec(after.worker_parallel_active_max);
+    k.puts(" directDelta=");
+    k.putDec(after.direct_requests -| before.direct_requests);
+    k.puts(" bounceAllocDelta=");
+    k.putDec(after.bounce_allocations -| before.bounce_allocations);
+    k.puts(" bounceCopyDelta=");
+    k.putDec(after.bounce_copy_bytes -| before.bounce_copy_bytes);
+    k.puts("\r\n");
+    return ok;
 }
 
 fn busName(bus: Bus) []const u8 {

@@ -199,6 +199,10 @@ var worker_started = false;
 var worker_task_id: u32 = 0;
 var worker_cursor: usize = 0;
 var worker_event = sync.EventV2.initMode(false, .auto_reset);
+// Genau ein ipc-worker bearbeitet Handlerziele. Sein Antwortpuffer bleibt
+// deshalb worker-eigen, muss aber nicht bei jeder tiefen Netzantwort 4 KB des
+// begrenzten Kernel-Task-Stacks belegen.
+var worker_response: [MAX_MESSAGE_SIZE]u8 = undefined;
 var channels: [MAX_CHANNELS]Channel = .{Channel{}} ** MAX_CHANNELS;
 var total_sends: u64 = 0;
 var total_receives: u64 = 0;
@@ -845,11 +849,10 @@ fn takeNextWorkerTarget() ?WorkerTarget {
 fn runWorkerTarget(target: WorkerTarget) void {
     const message = &channels[target.channel_index].queue[target.slot_index];
     const request_len: usize = @intCast(message.meta.len);
-    var response: [MAX_MESSAGE_SIZE]u8 = undefined;
     const produced = target.handler(
         channels[target.channel_index].id,
         message.data[0..request_len],
-        response[0..],
+        worker_response[0..],
     );
     const completed_at = monotonic.capture();
 
@@ -871,7 +874,7 @@ fn runWorkerTarget(target: WorkerTarget) void {
     if (valid) {
         const len: usize = @intCast(produced);
         if (len != 0) {
-            @memcpy(slot.data[0..len], response[0..len]);
+            @memcpy(slot.data[0..len], worker_response[0..len]);
             ch.lifetime.payload_copy_bytes +%= len;
         }
         slot.meta.len = @intCast(len);

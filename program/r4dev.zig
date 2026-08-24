@@ -1438,10 +1438,13 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v5_size: usize = @offsetOf(ProgramPerformanceSummary, "service_lock_timing_stride");
     const v6_size: usize = @offsetOf(ProgramPerformanceSummary, "service_registry_index_queries");
     const v7_size: usize = @offsetOf(ProgramPerformanceSummary, "hot_path_memory_block_physical_index_entries");
-    const v8_size: usize = @sizeOf(ProgramPerformanceSummary);
+    const v8_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_drive_gate_count");
+    const v9_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v8_size)
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v9_size)
         performance_snapshot_version
+    else if (caller_version >= 8 and caller_size >= v8_size)
+        8
     else if (caller_version >= 7 and caller_size >= v7_size)
         7
     else if (caller_version >= 6 and caller_size >= v6_size)
@@ -1464,7 +1467,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         5 => v5_size,
         6 => v6_size,
         7 => v7_size,
-        else => v8_size,
+        8 => v8_size,
+        else => v9_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -1877,6 +1881,23 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .hot_path_memory_vm_reclaim_span_steps = hot_path_summary.reclaim_cursor_span_steps,
         .hot_path_memory_vm_reclaim_page_steps = hot_path_summary.reclaim_cursor_page_steps,
         .hot_path_memory_vm_reclaim_wraps = hot_path_summary.reclaim_cursor_wraps,
+        .fs_drive_gate_count = saturatingU32FromUsize(fs_request.drive_gate_count),
+        .fs_active_requests = fs_summary.active_requests,
+        .fs_parallel_active_max = fs_summary.parallel_active_max,
+        .storage_controller_count = block_runtime.controller_count,
+        .storage_worker_count = block_runtime.worker_count,
+        .storage_worker_parallel_active = block_runtime.worker_parallel_active,
+        .storage_worker_parallel_active_max = block_runtime.worker_parallel_active_max,
+        .fs_single_drive_requests = fs_summary.single_drive_requests,
+        .fs_cross_drive_requests = fs_summary.cross_drive_requests,
+        .fs_global_requests = fs_summary.global_requests,
+        .storage_worker_start_failures = block_runtime.worker_start_failures,
+        .storage_direct_requests = block_runtime.direct_requests,
+        .storage_direct_bytes = block_runtime.direct_bytes,
+        .storage_bounce_allocations = block_runtime.bounce_allocations,
+        .storage_bounce_bytes = block_runtime.bounce_bytes,
+        .storage_bounce_copy_bytes = block_runtime.bounce_copy_bytes,
+        .storage_direct_timeout_waits = block_runtime.direct_timeout_waits,
         .loader_file_active_buffers = loader_file_stats.active_buffers,
         .loader_file_reserved_bytes = loader_file_stats.reserved_bytes,
         .loader_file_committed_bytes = loader_file_stats.committed_bytes,
