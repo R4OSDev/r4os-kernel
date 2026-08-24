@@ -7,6 +7,7 @@ const phys = @import("../../memory/phys.zig");
 
 const REG_CAPABILITIES: u64 = 0x000;
 const REG_CONFIG: u64 = 0x010;
+const REG_INTERRUPT_STATUS: u64 = 0x020;
 const REG_MAIN_COUNTER: u64 = 0x0F0;
 const REG_TIMER0_CONFIG: u64 = 0x100;
 const REG_TIMER0_COMPARATOR: u64 = 0x108;
@@ -33,6 +34,7 @@ pub const Status = struct {
     timer0_periodic_capable: bool = false,
     timer0_64bit_capable: bool = false,
     timer0_irq_active: bool = false,
+    timer0_one_shot: bool = false,
     comparator_count: u8 = 0,
     revision: u8 = 0,
     number: u8 = 0,
@@ -166,9 +168,9 @@ pub fn startLegacyIrqTimer(requested_hz: u32) bool {
     const hz = if (requested_hz == 0) 100 else requested_hz;
     var period = current.frequency_hz / hz;
     if (period == 0) period = 1;
-    current.timer_ticks = 0;
     current.timer_hz = hz;
     current.timer0_period = period;
+    current.timer0_one_shot = false;
 
     var timer_config = read64(REG_TIMER0_CONFIG);
     timer_config &= ~(TIMER_INT_TYPE_LEVEL | TIMER_INT_ENABLE | TIMER_PERIODIC | TIMER_32BIT_MODE | TIMER_ROUTE_MASK | TIMER_FSB_ENABLE);
@@ -198,6 +200,85 @@ pub fn startLegacyIrqTimer(requested_hz: u32) bool {
     return current.timer0_irq_active;
 }
 
+pub fn startLegacyOneShotTimer(tick_hz: u32) bool {
+    if (!current.mapped or current.frequency_hz == 0 or current.comparator_count == 0) {
+        current.reason = "HPET one-shot unavailable";
+        return false;
+    }
+    if (!current.legacy_replacement_capable) {
+        current.reason = "HPET one-shot needs legacy IRQ0 replacement";
+        return false;
+    }
+
+    var timer_config = read64(REG_TIMER0_CONFIG);
+    timer_config &= ~(TIMER_INT_TYPE_LEVEL | TIMER_INT_ENABLE | TIMER_PERIODIC | TIMER_SET_ACCUMULATOR | TIMER_32BIT_MODE | TIMER_ROUTE_MASK | TIMER_FSB_ENABLE);
+    write64(REG_TIMER0_CONFIG, timer_config);
+    write64(REG_INTERRUPT_STATUS, 1);
+
+    const config = read64(REG_CONFIG) | CONFIG_ENABLE | CONFIG_LEGACY_REPLACEMENT;
+    write64(REG_CONFIG, config);
+
+    current.config = read64(REG_CONFIG);
+    current.timer0_config = read64(REG_TIMER0_CONFIG);
+    current.enabled = (current.config & CONFIG_ENABLE) != 0;
+    current.timer0_irq_active = false;
+    current.timer0_one_shot = current.enabled and (current.config & CONFIG_LEGACY_REPLACEMENT) != 0;
+    current.timer_hz = tick_hz;
+    current.timer0_period = 0;
+    current.reason = if (current.timer0_one_shot)
+        "HPET comparator 0 one-shot legacy IRQ0 ready"
+    else
+        "HPET one-shot setup incomplete";
+    return current.timer0_one_shot;
+}
+
+pub fn armLegacyOneShotTicks(requested_ticks: u64, tick_hz: u32) u64 {
+    if (!current.timer0_one_shot and !startLegacyOneShotTimer(tick_hz)) return 0;
+    if (tick_hz == 0 or current.frequency_hz == 0) return 0;
+
+    const wanted_ticks = @max(@as(u64, 1), requested_ticks);
+    const counter_limit: u64 = if (current.timer0_64bit_capable)
+        0x3FFF_FFFF_FFFF_FFFF
+    else
+        0x7FFF_FFFF;
+    var counter_delta = monotonic_math.ticksToCounterCeil(wanted_ticks, current.frequency_hz, tick_hz);
+    counter_delta = @max(counter_delta, @as(u64, @max(current.min_tick, 1)));
+    const clamped = counter_delta > counter_limit;
+    if (clamped) counter_delta = counter_limit;
+
+    var timer_config = read64(REG_TIMER0_CONFIG);
+    timer_config &= ~(TIMER_INT_TYPE_LEVEL | TIMER_INT_ENABLE | TIMER_PERIODIC | TIMER_SET_ACCUMULATOR | TIMER_32BIT_MODE | TIMER_ROUTE_MASK | TIMER_FSB_ENABLE);
+    write64(REG_TIMER0_CONFIG, timer_config);
+    write64(REG_INTERRUPT_STATUS, 1);
+
+    const counter_mask: u64 = if (current.timer0_64bit_capable) ~@as(u64, 0) else 0xFFFF_FFFF;
+    const comparator = (readMainCounter() +% counter_delta) & counter_mask;
+    write64(REG_TIMER0_COMPARATOR, comparator);
+    timer_config |= TIMER_INT_ENABLE;
+    write64(REG_TIMER0_CONFIG, timer_config);
+
+    current.timer0_config = read64(REG_TIMER0_CONFIG);
+    current.timer0_comparator = comparator;
+    current.timer0_irq_active = (current.timer0_config & TIMER_INT_ENABLE) != 0;
+    if (!current.timer0_irq_active) return 0;
+    current.reason = "HPET comparator 0 one-shot armed";
+    return if (clamped)
+        @max(@as(u64, 1), monotonic_math.counterToTicks(counter_delta, current.frequency_hz, tick_hz))
+    else
+        wanted_ticks;
+}
+
+pub fn disarmLegacyOneShotTimer() void {
+    if (!current.mapped or !current.timer0_one_shot) return;
+    var timer_config = read64(REG_TIMER0_CONFIG);
+    timer_config &= ~TIMER_INT_ENABLE;
+    write64(REG_TIMER0_CONFIG, timer_config);
+    write64(REG_INTERRUPT_STATUS, 1);
+    current.timer0_config = read64(REG_TIMER0_CONFIG);
+    current.timer0_irq_active = false;
+    current.reason = "HPET comparator 0 one-shot disarmed";
+}
+
 pub fn stopLegacyIrqTimer() void {
     if (!current.mapped) return;
     var timer_config = read64(REG_TIMER0_CONFIG);
@@ -214,6 +295,7 @@ pub fn stopLegacyIrqTimer() void {
     current.timer0_comparator = read64(REG_TIMER0_COMPARATOR);
     current.enabled = (current.config & CONFIG_ENABLE) != 0;
     current.timer0_irq_active = false;
+    current.timer0_one_shot = false;
     current.timer_hz = 0;
     current.timer0_period = 0;
     current.reason = "HPET main counter enabled, comparator interrupts disabled";
@@ -221,6 +303,7 @@ pub fn stopLegacyIrqTimer() void {
 }
 
 pub fn onTimerIrq() u64 {
+    if (current.mapped) write64(REG_INTERRUPT_STATUS, 1);
     const p: *volatile u64 = &current.timer_ticks;
     p.* +%= 1;
     return p.*;
@@ -281,6 +364,8 @@ pub fn dumpStatus() void {
     k.puts(if (s.timer0_64bit_capable) "yes" else "no");
     k.puts(" irq_active=");
     k.puts(if (s.timer0_irq_active) "yes" else "no");
+    k.puts(" one_shot=");
+    k.puts(if (s.timer0_one_shot) "yes" else "no");
     k.puts(" hz=");
     k.putDec(s.timer_hz);
     k.puts(" ticks=");

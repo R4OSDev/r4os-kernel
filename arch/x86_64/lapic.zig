@@ -38,6 +38,7 @@ pub const Status = struct {
     software_enabled: bool = false,
     timer_enabled: bool = false,
     timer_calibrated: bool = false,
+    timer_one_shot: bool = false,
     bsp: bool = false,
     x2apic: bool = false,
     phys_base: u64 = 0,
@@ -215,7 +216,6 @@ pub fn initTimerFromHpet(requested_hz: u32) bool {
     current.timer_initial_count = @intCast(initial_u128);
     current.calibration_hpet_ticks = elapsed_hpet;
     current.calibration_lapic_ticks = elapsed_lapic;
-    current.timer_ticks = 0;
     current.timer_calibrated = true;
     current.timer_reason = "calibrated against HPET";
 
@@ -225,8 +225,68 @@ pub fn initTimerFromHpet(requested_hz: u32) bool {
     current.timer_lvt = readReg(REG_LVT_TIMER);
     current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
     current.timer_enabled = true;
+    current.timer_one_shot = false;
     current.timer_reason = "periodic LAPIC timer active";
     logTimerStatus(true);
+    return true;
+}
+
+pub fn startOneShotTimer() bool {
+    if (!isEnabled() or !current.timer_calibrated or current.timer_initial_count < MIN_TIMER_INITIAL_COUNT) {
+        current.timer_reason = "LAPIC one-shot unavailable without calibration";
+        return false;
+    }
+    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
+    writeReg(REG_TIMER_INITIAL_COUNT, 0);
+    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_MASKED);
+    current.timer_lvt = readReg(REG_LVT_TIMER);
+    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
+    current.timer_enabled = true;
+    current.timer_one_shot = true;
+    current.timer_reason = "LAPIC one-shot ready";
+    return true;
+}
+
+pub fn armOneShotTicks(requested_ticks: u64) u64 {
+    if (!current.timer_one_shot and !startOneShotTimer()) return 0;
+    const count_per_tick = @as(u64, current.timer_initial_count);
+    if (count_per_tick == 0) return 0;
+    const maximum_ticks = @max(@as(u64, 1), @as(u64, 0xFFFF_FFFE) / count_per_tick);
+    const programmed_ticks = @min(@max(@as(u64, 1), requested_ticks), maximum_ticks);
+    const initial_count: u32 = @intCast(programmed_ticks * count_per_tick);
+
+    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
+    writeReg(REG_LVT_TIMER, TIMER_VECTOR);
+    writeReg(REG_TIMER_INITIAL_COUNT, initial_count);
+    current.timer_lvt = readReg(REG_LVT_TIMER);
+    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
+    current.timer_enabled = true;
+    current.timer_reason = "LAPIC one-shot armed";
+    return programmed_ticks;
+}
+
+pub fn disarmOneShotTimer() void {
+    if (!current.timer_one_shot) return;
+    writeReg(REG_TIMER_INITIAL_COUNT, 0);
+    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_MASKED);
+    current.timer_lvt = readReg(REG_LVT_TIMER);
+    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
+    current.timer_reason = "LAPIC one-shot disarmed";
+}
+
+pub fn resumePeriodicTimer() bool {
+    if (!isEnabled() or !current.timer_calibrated or current.timer_initial_count < MIN_TIMER_INITIAL_COUNT) {
+        current.timer_reason = "LAPIC periodic resume unavailable";
+        return false;
+    }
+    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
+    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_PERIODIC);
+    writeReg(REG_TIMER_INITIAL_COUNT, current.timer_initial_count);
+    current.timer_lvt = readReg(REG_LVT_TIMER);
+    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
+    current.timer_enabled = true;
+    current.timer_one_shot = false;
+    current.timer_reason = "periodic LAPIC timer active";
     return true;
 }
 
@@ -238,6 +298,7 @@ pub fn stopTimer() void {
         current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
     }
     current.timer_enabled = false;
+    current.timer_one_shot = false;
 }
 
 pub fn onTimerIrq() u64 {
@@ -298,6 +359,8 @@ pub fn dumpStatus() void {
     k.puts(if (s.timer_enabled) "active" else "off");
     k.puts(" calibrated=");
     k.puts(if (s.timer_calibrated) "yes" else "no");
+    k.puts(" one_shot=");
+    k.puts(if (s.timer_one_shot) "yes" else "no");
     k.puts(" vector=0x");
     k.putHex(s.timer_vector, 2);
     k.puts(" hz=");

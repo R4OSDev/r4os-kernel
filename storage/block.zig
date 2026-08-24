@@ -728,7 +728,7 @@ fn enqueueRequest(device: *Device, kind: RequestKind, lba: u64, sectors: u16, bu
     const timeout = requestTimeout(device);
     const forever = timeout == sync.WAIT_FOREVER;
     const wait_start = timer.tickCount();
-    const finite_deadline = if (forever) std.math.maxInt(u64) else wait_start +| timeout;
+    const finite_deadline = if (forever) std.math.maxInt(u64) else timer.deadlineAfter(wait_start, timeout);
     while (true) {
         const locked = lockDevice(device);
         if (findFreeSlot(device)) |slot_index| {
@@ -1123,7 +1123,7 @@ fn waitForRequest(device: *Device, request_id: u64, timeout: u64) RequestResult 
     };
     const forever = timeout == sync.WAIT_FOREVER;
     const wait_start = timer.tickCount();
-    const finite_deadline = if (forever) std.math.maxInt(u64) else wait_start +| timeout;
+    const finite_deadline = if (forever) std.math.maxInt(u64) else timer.deadlineAfter(wait_start, timeout);
     while (true) {
         const locked = lockDevice(device);
         const slot_index = findSlotById(device, request_id) orelse {

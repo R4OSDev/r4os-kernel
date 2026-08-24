@@ -11266,7 +11266,7 @@ fn serviceCallCore(async_req: *AsyncIoRequest, handle: u32, op: u16, request_ptr
     const request = if (request_len == 0) "" else request_ptr[0..@as(usize, @intCast(request_len))];
     const forever = timeout_ticks == sync.WAIT_FOREVER;
     const start_ticks = r4api.r4sys.ticks();
-    const deadline = if (forever) @as(u64, 0) else start_ticks +| timeout_ticks;
+    const deadline = if (forever) @as(u64, 0) else timer.deadlineAfter(start_ticks, timeout_ticks);
     // Slot admission may block, so hard-kill remains enabled while queued.
     // The service core arms this token only after admission and immediately
     // before publishing the RequestSlot. It stays active across the short
@@ -13557,7 +13557,7 @@ fn reapHostedConsoleInstancesForPressure() void {
     }
     if (target) |handle| {
         program_reaper_event.signal();
-        const deadline = timer.tickCount() +% @max(@as(u64, timer.frequency()), 100);
+        const deadline = timer.deadlineAfterNow(@max(@as(u64, timer.frequency()), 100));
         while (true) {
             const check_locked = lockProgramRegistry();
             if (check_locked) {

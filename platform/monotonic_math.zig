@@ -12,6 +12,34 @@ pub fn scaleFloor(value: u64, numerator: u64, denominator: u64) u64 {
     return if (result > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(result);
 }
 
+pub fn scaleCeil(value: u64, numerator: u64, denominator: u64) u64 {
+    if (value == 0 or numerator == 0 or denominator == 0) return 0;
+    const product = @as(u128, value) * numerator;
+    const result = (product + denominator - 1) / denominator;
+    return if (result > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(result);
+}
+
+pub fn counterToTicks(counter_delta: u64, counter_frequency_hz: u64, tick_frequency_hz: u32) u64 {
+    return scaleFloor(counter_delta, tick_frequency_hz, counter_frequency_hz);
+}
+
+pub fn ticksToCounterCeil(ticks: u64, counter_frequency_hz: u64, tick_frequency_hz: u32) u64 {
+    return scaleCeil(ticks, counter_frequency_hz, tick_frequency_hz);
+}
+
+pub fn finiteDeadline(now: u64, duration: u64) u64 {
+    const no_deadline = std.math.maxInt(u64);
+    const max_finite = no_deadline - 1;
+    if (duration >= max_finite -| now) return max_finite;
+    return now + duration;
+}
+
+pub fn boundedDeadlineDelta(now: u64, deadline: u64, maximum: u64) u64 {
+    if (maximum == 0) return 0;
+    if (deadline <= now) return 1;
+    return @min(deadline - now, maximum);
+}
+
 pub fn cyclesToNanoseconds(cycles: u64, frequency_hz: u64) u64 {
     return scaleFloor(cycles, nanoseconds_per_second, frequency_hz);
 }
@@ -87,6 +115,21 @@ test "event rate preserves effective rational frequency" {
 
 test "conversion saturates instead of wrapping" {
     try std.testing.expectEqual(std.math.maxInt(u64), scaleFloor(std.math.maxInt(u64), std.math.maxInt(u64), 1));
+    try std.testing.expectEqual(std.math.maxInt(u64), scaleCeil(std.math.maxInt(u64), std.math.maxInt(u64), 1));
+}
+
+test "deadline conversion preserves a never-early one-shot boundary" {
+    try std.testing.expectEqual(@as(u64, 3), counterToTicks(30_000, 10_000_000, 1000));
+    try std.testing.expectEqual(@as(u64, 30_000), ticksToCounterCeil(3, 10_000_000, 1000));
+    try std.testing.expectEqual(@as(u64, 1), ticksToCounterCeil(1, 1, 1000));
+}
+
+test "finite deadlines saturate below the no-deadline sentinel" {
+    const no_deadline = std.math.maxInt(u64);
+    try std.testing.expectEqual(@as(u64, 125), finiteDeadline(100, 25));
+    try std.testing.expectEqual(no_deadline - 1, finiteDeadline(no_deadline - 10, 20));
+    try std.testing.expectEqual(@as(u64, 1), boundedDeadlineDelta(100, 99, 50));
+    try std.testing.expectEqual(@as(u64, 50), boundedDeadlineDelta(100, 1000, 50));
 }
 
 test "rates are reduced without changing their value" {

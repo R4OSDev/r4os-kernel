@@ -1,5 +1,6 @@
 const std = @import("std");
 const fpu = @import("../arch/x86_64/fpu.zig");
+const interrupts = @import("../arch/x86_64/interrupts.zig");
 const boot_config = @import("../kernel/boot_config.zig");
 const k = @import("../kernel/log.zig");
 const heap = @import("../memory/heap.zig");
@@ -22,6 +23,11 @@ const CHURN_COUNT: usize = 10_000;
 const WAIT_BUDGET: usize = 20_000;
 const NETWORK_PROGRESS_TICK_BUDGET: usize = 64;
 const WAKE_LATENCY_BAR: u64 = 3;
+const DEADLINE_EARLY_TICKS: u64 = 4;
+const DEADLINE_LONG_TICKS: u64 = 20;
+const DEADLINE_IRQ_BAR: u64 = 3;
+const DEADLINE_LATENESS_BAR: u64 = 3;
+const DEADLINE_STORM_COUNT: usize = 65;
 
 const WorkerKind = enum {
     runnable,
@@ -66,6 +72,11 @@ var short_completed: u32 = 0;
 var wake_probe_entered = false;
 var wake_probe_completed = false;
 var wake_probe_latency: u64 = 0;
+var deadline_probe_elapsed: u64 = 0;
+var deadline_probe_irqs: u64 = 0;
+var deadline_probe_lateness: u64 = 0;
+var deadline_probe_checkpointed = false;
+var deadline_storm_batches: u32 = 0;
 
 var signal_event = sync.EventV2.initMode(false, .manual_reset);
 var cancel_queue = sync.WaitQueue.init();
@@ -96,6 +107,8 @@ fn run() bool {
     cleanupWorkers();
     resetState();
     if (!queueProjectionValid("warm")) return fail("queue-warm");
+    if (!runDeadlineProbe()) return fail("deadline-probe");
+    if (!runDeadlineStormProbe()) return fail("deadline-storm");
     if (!runWakeProbe()) return fail("wakeup-probe");
     _ = task.reapDeferred();
     _ = task.reclaimStackCache(0);
@@ -284,6 +297,25 @@ fn run() bool {
     k.puts(" wake_bar=");
     k.putDec(WAKE_LATENCY_BAR);
     k.puts(" wake_request=OK lock_handoff=OK\r\n");
+    k.puts("TASKREG06932 deadline_queue=ordered backend=");
+    k.puts(timer.backendName());
+    k.puts(" idle_irqs=");
+    k.putDec(deadline_probe_irqs);
+    k.puts(" irq_bar=");
+    k.putDec(DEADLINE_IRQ_BAR);
+    k.puts(" elapsed=");
+    k.putDec(deadline_probe_elapsed);
+    k.puts(" requested=");
+    k.putDec(DEADLINE_EARLY_TICKS);
+    k.puts(" lateness=");
+    k.putDec(deadline_probe_lateness);
+    k.puts(" earlier=OK cancel=OK long=");
+    k.puts(if (deadline_probe_checkpointed) "checkpointed" else "FAILED");
+    k.puts(" storm=");
+    k.putDec(DEADLINE_STORM_COUNT);
+    k.puts(" batches=");
+    k.putDec(deadline_storm_batches);
+    k.puts(" periodic=restored fallback=0\r\n");
     k.puts("TASKREG05910 result: OK\r\n");
     return true;
 }
@@ -303,12 +335,151 @@ fn resetState() void {
     wake_probe_entered = false;
     wake_probe_completed = false;
     wake_probe_latency = 0;
+    deadline_probe_elapsed = 0;
+    deadline_probe_irqs = 0;
+    deadline_probe_lateness = 0;
+    deadline_probe_checkpointed = false;
+    deadline_storm_batches = 0;
     signal_event = sync.EventV2.initMode(false, .manual_reset);
     cancel_queue = sync.WaitQueue.init();
     timeout_queue = sync.WaitQueue.init();
     kill_queue = sync.WaitQueue.init();
     finish_queue = sync.WaitQueue.init();
     wake_probe_event = sync.EventV2.initMode(false, .manual_reset);
+}
+
+fn runDeadlineProbe() bool {
+    const before = timer.deadlineStats();
+    if (!before.enabled or !before.capable or timer.activeBackend() == .pit) return false;
+
+    const irq_flags = interrupts.saveAndDisable();
+    scheduler.preemptDisable();
+
+    var ok = timer.enterIdleDeadline(timer.MAX_FINITE_DEADLINE);
+    const long_state = timer.deadlineStats();
+    deadline_probe_checkpointed = long_state.armed_deadline != timer.NO_DEADLINE and
+        long_state.armed_deadline < timer.MAX_FINITE_DEADLINE;
+    ok = timer.leaveIdleDeadline() and ok;
+
+    const start = timer.tickCount();
+    const long_deadline = timer.deadlineAfter(start, DEADLINE_LONG_TICKS);
+    const early_deadline = timer.deadlineAfter(start, DEADLINE_EARLY_TICKS);
+    ok = timer.enterIdleDeadline(long_deadline) and ok;
+    ok = timer.enterIdleDeadline(early_deadline) and ok;
+
+    while (timer.tickCount() < early_deadline) {
+        interrupts.enable();
+        interrupts.waitForInterrupt();
+        interrupts.disable();
+        if (timer.tickCount() < early_deadline) {
+            ok = timer.leaveIdleDeadline() and ok;
+            ok = timer.enterIdleDeadline(early_deadline) and ok;
+        }
+    }
+    ok = timer.leaveIdleDeadline() and ok;
+
+    scheduler.preemptEnable();
+    interrupts.restore(irq_flags);
+
+    const after = timer.deadlineStats();
+    deadline_probe_elapsed = timer.tickCount() - start;
+    deadline_probe_irqs = after.timer_irqs - before.timer_irqs;
+    deadline_probe_lateness = after.last_lateness_ticks;
+    return ok and
+        deadline_probe_checkpointed and
+        after.mode == .periodic and
+        after.earlier_reprograms > before.earlier_reprograms and
+        after.cancels > before.cancels and
+        after.periodic_resumes >= before.periodic_resumes + 2 and
+        after.runtime_fallbacks == before.runtime_fallbacks and
+        deadline_probe_elapsed >= DEADLINE_EARLY_TICKS and
+        deadline_probe_irqs >= 1 and deadline_probe_irqs <= DEADLINE_IRQ_BAR and
+        after.last_lateness_ticks <= DEADLINE_LATENESS_BAR;
+}
+
+fn runDeadlineStormProbe() bool {
+    var probes: [DEADLINE_STORM_COUNT]?*task.Task = .{null} ** DEADLINE_STORM_COUNT;
+    var index: usize = 0;
+    while (index < probes.len) : (index += 1) {
+        const created = task.createKernelThreadBlocked("taskreg-deadline-storm", shortWorker) orelse {
+            _ = cleanupDeadlineStorm(&probes);
+            return false;
+        };
+        if (!task.pin(created)) {
+            _ = task.retireIdentity(created.id, created.generation);
+            _ = cleanupDeadlineStorm(&probes);
+            return false;
+        }
+        probes[index] = created;
+    }
+
+    // Publish the already expired equal deadlines under one IRQ boundary so
+    // the periodic source cannot drain a partial enrollment. Deadline 1 is
+    // older than every runtime wait at this boot phase and makes FIFO order
+    // directly observable at the projection head.
+    const irq_flags = interrupts.saveAndDisable();
+    for (probes) |created| {
+        task.beginWait(created.?, 1, "taskreg-deadline-storm", scheduler.timer_wait_object);
+    }
+    const enrolled = task.firstTimedWait() == probes[0] and task.queueSnapshot().valid;
+    const before = scheduler.structureStats();
+    _ = scheduler.onTick(timer.tickCount(), false);
+    const fifo_head = task.firstTimedWait() == probes[DEADLINE_STORM_COUNT - 1];
+    var ready_after_first: usize = 0;
+    index = 0;
+    while (index < DEADLINE_STORM_COUNT - 1) : (index += 1) {
+        if (probes[index].?.state == .ready) ready_after_first += 1;
+    }
+    const bounded_tail = probes[DEADLINE_STORM_COUNT - 1].?.state == .blocked;
+    const deferred = scheduler.structureStats();
+    const deferred_once = deferred.timeout_storm_deferrals == before.timeout_storm_deferrals + 1;
+
+    _ = scheduler.onTick(timer.tickCount(), false);
+    const drained = probes[DEADLINE_STORM_COUNT - 1].?.state == .ready;
+    const projections_valid = task.queueSnapshot().valid;
+    interrupts.restore(irq_flags);
+
+    const bounded = enrolled and fifo_head and
+        ready_after_first == DEADLINE_STORM_COUNT - 1 and bounded_tail and
+        deferred_once and drained and projections_valid;
+    if (!bounded) {
+        k.puts("TASKREG06932 storm-failed enrolled=");
+        k.putDec(@intFromBool(enrolled));
+        k.puts(" fifo_head=");
+        k.putDec(@intFromBool(fifo_head));
+        k.puts(" ready_first=");
+        k.putDec(ready_after_first);
+        k.puts(" tail_blocked=");
+        k.putDec(@intFromBool(bounded_tail));
+        k.puts(" deferral=");
+        k.putDec(@intFromBool(deferred_once));
+        k.puts(" drained=");
+        k.putDec(@intFromBool(drained));
+        k.puts(" projection=");
+        k.putDec(@intFromBool(projections_valid));
+        k.puts("\r\n");
+    }
+    deadline_storm_batches = 2;
+    const cleaned = cleanupDeadlineStorm(&probes);
+    return bounded and cleaned;
+}
+
+fn cleanupDeadlineStorm(probes: *[DEADLINE_STORM_COUNT]?*task.Task) bool {
+    var ok = true;
+    for (probes) |*slot| {
+        const created = slot.* orelse continue;
+        if (task.isAliveIdentity(created.id, created.generation) and
+            !task.killIdentity(created.id, created.generation))
+        {
+            ok = false;
+        }
+        if (!task.unpin(created)) ok = false;
+        if (!task.releaseDeadIdentity(created.id, created.generation)) ok = false;
+        slot.* = null;
+    }
+    _ = task.reapDeferred();
+    _ = task.reclaimStackCache(0);
+    return ok;
 }
 
 fn queueProjectionValid(label: []const u8) bool {

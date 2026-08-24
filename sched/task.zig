@@ -115,6 +115,7 @@ pub const Task = struct {
     timeout_prev: ?*Task = null,
     timeout_next: ?*Task = null,
     timeout_linked: bool = false,
+    timeout_sequence: u64 = 0,
     reap_prev: ?*Task = null,
     reap_next: ?*Task = null,
     reap_linked: bool = false,
@@ -163,6 +164,7 @@ pub const Task = struct {
     created_tick: u64 = 0,
     ready_since_tick: u64 = 0,
     last_scheduled_tick: u64 = 0,
+    last_accounted_tick: u64 = 0,
     last_yield_tick: u64 = 0,
     last_ready_latency_ticks: u64 = 0,
     max_ready_latency_ticks: u64 = 0,
@@ -230,6 +232,7 @@ var ready_priority_counts: [3]usize = .{0} ** 3;
 var timeout_head: ?*Task = null;
 var timeout_tail: ?*Task = null;
 var timeout_count: usize = 0;
+var next_timeout_sequence: u64 = 1;
 var reap_head: ?*Task = null;
 var reap_tail: ?*Task = null;
 var reap_count: usize = 0;
@@ -312,6 +315,7 @@ pub fn init() bool {
     timeout_head = null;
     timeout_tail = null;
     timeout_count = 0;
+    next_timeout_sequence = 1;
     reap_head = null;
     reap_tail = null;
     reap_count = 0;
@@ -334,8 +338,6 @@ pub fn init() bool {
     create_failure_stats = .{};
     forced_next_create_failure = .none;
     kill_held_lock_deferrals = 0;
-    min_wake_tick = NO_WAKE_TICK;
-
     if (!prepareCriticalReserve()) return false;
     initialized = true;
     var create_failure: CreateFailure = .none;
@@ -443,6 +445,7 @@ fn createTask(name: []const u8, state: State, needs_fpu: bool, entry: ?Entry, fa
         .created_tick = now,
         .ready_since_tick = if (state == .ready) now else 0,
         .last_scheduled_tick = if (state == .running) now else 0,
+        .last_accounted_tick = if (state == .running) now else 0,
         .switches_in = if (state == .running) 1 else 0,
         .entry = entry,
         .fpu_state = fpu_memory,
@@ -655,12 +658,40 @@ fn unlinkReadyLocked(t: *Task) void {
 
 fn linkTimeoutLocked(t: *Task) void {
     if (t.timeout_linked or t.wake_tick == 0) return;
-    t.timeout_prev = timeout_tail;
-    t.timeout_next = null;
-    if (timeout_tail) |tail| tail.timeout_next = t else timeout_head = t;
-    timeout_tail = t;
+    if (t.timeout_sequence == 0) t.timeout_sequence = allocateTimeoutSequenceLocked();
+
+    var following: ?*Task = null;
+    var previous = timeout_tail;
+    while (previous) |candidate| {
+        if (candidate.wake_tick < t.wake_tick or
+            (candidate.wake_tick == t.wake_tick and candidate.timeout_sequence < t.timeout_sequence))
+        {
+            break;
+        }
+        following = candidate;
+        previous = candidate.timeout_prev;
+    }
+    t.timeout_prev = previous;
+    t.timeout_next = following;
+    if (previous) |before| before.timeout_next = t else timeout_head = t;
+    if (following) |after| after.timeout_prev = t else timeout_tail = t;
     t.timeout_linked = true;
     timeout_count += 1;
+}
+
+fn allocateTimeoutSequenceLocked() u64 {
+    if (next_timeout_sequence == 0 or next_timeout_sequence == ~@as(u64, 0)) {
+        var sequence: u64 = 1;
+        var cursor = timeout_head;
+        while (cursor) |candidate| : (cursor = candidate.timeout_next) {
+            candidate.timeout_sequence = sequence;
+            sequence +|= 1;
+        }
+        next_timeout_sequence = sequence;
+    }
+    const sequence = next_timeout_sequence;
+    next_timeout_sequence +|= 1;
+    return sequence;
 }
 
 fn unlinkTimeoutLocked(t: *Task) void {
@@ -670,6 +701,7 @@ fn unlinkTimeoutLocked(t: *Task) void {
     t.timeout_prev = null;
     t.timeout_next = null;
     t.timeout_linked = false;
+    t.timeout_sequence = 0;
     if (timeout_count != 0) timeout_count -= 1;
 }
 
@@ -1392,6 +1424,13 @@ pub fn queueSnapshot() QueueSnapshot {
             break;
         }
         if (!candidate.timeout_linked or candidate.state != .blocked or candidate.wake_tick == 0 or candidate.timeout_prev != previous) out.valid = false;
+        if (previous) |before| {
+            if (before.wake_tick > candidate.wake_tick or
+                (before.wake_tick == candidate.wake_tick and before.timeout_sequence >= candidate.timeout_sequence))
+            {
+                out.valid = false;
+            }
+        }
         previous = candidate;
         cursor = candidate.timeout_next;
     }
@@ -1535,6 +1574,7 @@ pub fn recordScheduled(t: *Task, now: u64) u64 {
     if (latency > t.max_ready_latency_ticks) t.max_ready_latency_ticks = latency;
     t.ready_since_tick = 0;
     t.last_scheduled_tick = now;
+    t.last_accounted_tick = now;
     t.switches_in +%= 1;
     return latency;
 }
@@ -1544,7 +1584,12 @@ pub fn recordYield(t: *Task, now: u64) void {
 }
 
 pub fn recordRunTick(t: *Task, now: u64) u64 {
-    t.run_ticks +%= 1;
+    const accounted = if (now >= t.last_accounted_tick)
+        now - t.last_accounted_tick
+    else
+        0;
+    t.run_ticks +|= accounted;
+    t.last_accounted_tick = now;
     const run_ticks = ticksSince(now, t.last_scheduled_tick);
     if (run_ticks > t.max_run_without_switch_ticks) t.max_run_without_switch_ticks = run_ticks;
     return run_ticks;
@@ -2025,25 +2070,13 @@ fn releaseTaskStack(t: *Task) bool {
     return true;
 }
 
-// 0.56.18: Untere Schranke fuer den naechsten faelligen Timeout (Befund
-// 4.3). onTick ueberspringt den Task-Scan, solange now < min_wake_tick.
-// Die Schranke darf zu NIEDRIG sein (weckt nur einen unnoetigen Scan,
-// der sie neu berechnet), aber nie zu hoch - deshalb wird sie hier bei
-// jedem neuen Timeout nur nach unten gezogen und ausschliesslich vom
-// onTick-Scan neu angehoben.
-pub const NO_WAKE_TICK: u64 = 0xFFFF_FFFF_FFFF_FFFF;
-var min_wake_tick: u64 = NO_WAKE_TICK;
+// The timed-wait projection is the scheduler's ordered deadline queue. Equal
+// deadlines retain enrollment order through timeout_sequence; the head is
+// therefore the complete O(1) source for one-shot idle programming.
+pub const NO_WAKE_TICK: u64 = timer.NO_DEADLINE;
 
 pub fn minWakeTick() u64 {
-    return min_wake_tick;
-}
-
-pub fn setMinWakeTick(value: u64) void {
-    min_wake_tick = value;
-}
-
-fn noteWakeTick(wake_tick: u64) void {
-    if (wake_tick != 0 and wake_tick < min_wake_tick) min_wake_tick = wake_tick;
+    return if (timeout_head) |head| head.wake_tick else NO_WAKE_TICK;
 }
 
 pub fn beginWait(t: *Task, wake_tick: u64, reason: []const u8, object: u64) void {
@@ -2059,7 +2092,6 @@ pub fn beginWait(t: *Task, wake_tick: u64, reason: []const u8, object: u64) void
     t.ready_since_tick = 0;
     t.state = .blocked;
     linkTimeoutLocked(t);
-    noteWakeTick(wake_tick);
     bumpInventoryMutationEpochLocked();
 }
 

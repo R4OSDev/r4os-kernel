@@ -507,7 +507,7 @@ fn clipboardServiceCall(op: u16, request: []const u8, response: []u8, header: *s
 
     header.* = .{ .magic = 0, .version = 0 };
     const start_ticks = timer.tickCount();
-    const deadline = start_ticks +| clipboard_service_timeout_ticks;
+    const deadline = timer.deadlineAfter(start_ticks, clipboard_service_timeout_ticks);
     var request_unwind: task_context.UnwindToken = .{};
     const request_id_raw = services.submitRequestWaitGuarded(
         info.handle,

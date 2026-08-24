@@ -517,7 +517,7 @@ fn submitHandler(
 ) i32 {
     if (!worker_started) return fail();
     const completion_forever = completion_timeout_ticks == WAIT_FOREVER;
-    const completion_deadline = if (completion_forever) @as(u64, 0) else timer.tickCount() +| completion_timeout_ticks;
+    const completion_deadline = if (completion_forever) @as(u64, 0) else timer.deadlineAfterNow(completion_timeout_ticks);
     var admission = admitHandler(
         channel_id,
         payload,
@@ -546,7 +546,7 @@ fn admitHandler(
 ) ?HandlerAdmission {
     const idx = index(channel_id) orelse return null;
     const admission_forever = admission_timeout_ticks == WAIT_FOREVER;
-    const admission_deadline = if (admission_forever) @as(u64, 0) else timer.tickCount() +| admission_timeout_ticks;
+    const admission_deadline = if (admission_forever) @as(u64, 0) else timer.deadlineAfterNow(admission_timeout_ticks);
     var guard = lockChannel(&channels[idx]) orelse return null;
     var ch = guard.channel;
     if (!ch.active) activateLocked(ch, channel_id);

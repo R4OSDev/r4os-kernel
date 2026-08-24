@@ -653,7 +653,7 @@ pub const Mutex = struct {
         // naechsten Bewerber weggeschnappt) wieder volle timeout_ticks -
         // unter Dauer-Contention wartete lock() unbegrenzt.
         const bounded = timeout_ticks != WAIT_FOREVER;
-        const deadline = if (bounded) timer.tickCount() +% timeout_ticks else 0;
+        const deadline = if (bounded) timer.deadlineAfterNow(timeout_ticks) else 0;
         var remaining = timeout_ticks;
         while (true) {
             const result = self.queue.waitUnless(remaining, "mutex", stillOwned, self);
@@ -782,7 +782,7 @@ pub const UnwindGuard = struct {
         if (self.tryEnter()) return true;
         if (self.permanentAdmissionFailure() or timeout_ticks == 0) return false;
         const bounded = timeout_ticks != WAIT_FOREVER;
-        const deadline = if (bounded) timer.tickCount() +% timeout_ticks else 0;
+        const deadline = if (bounded) timer.deadlineAfterNow(timeout_ticks) else 0;
         var remaining = timeout_ticks;
         while (true) {
             const result = self.queue.waitUnless(remaining, self.name, stillOwned, self);

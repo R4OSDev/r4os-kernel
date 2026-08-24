@@ -1289,7 +1289,7 @@ fn submitRequestWaitInternal(
     if (payload.len > API_MAX_PAYLOAD) return API_ERR_PAYLOAD_TOO_LARGE;
 
     const forever = timeout_ticks == sync.WAIT_FOREVER;
-    const deadline = if (forever) @as(u64, 0) else timer.tickCount() +| timeout_ticks;
+    const deadline = if (forever) @as(u64, 0) else timer.deadlineAfterNow(timeout_ticks);
     const identity = lookupEndpointIdentity(handle) orelse return API_ERR_BAD_HANDLE;
     var endpoint_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return API_ERR_BAD_HANDLE;
     defer unlockEndpoint(&endpoint_lease);

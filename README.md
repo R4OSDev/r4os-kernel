@@ -18,9 +18,12 @@ On Linux or macOS:
 build is ReleaseSafe and does not enable SIMD.
 
 The platform exposes a continuous nanosecond clock independently from the
-periodic PIT, HPET, or LAPIC scheduler event source. Exact invariant-TSC and
-free-running HPET sources are preferred; hardware without either capability
-uses an explicitly degraded periodic fallback.
+scheduler event source. Exact invariant-TSC and free-running HPET sources are
+preferred. On the modern timer path, logical scheduler ticks continue from the
+HPET main counter while active work uses periodic HPET or LAPIC delivery. True
+idle programs only the earliest finite wait as an HPET or calibrated-LAPIC
+one-shot; no pending deadline disarms the event source. PIT remains the
+explicitly degraded periodic fallback.
 
 PCI and PCIe devices are enumerated once through a canonical inventory.
 Mapped segment-0 ECAM coverage is preferred; legacy CF8/CFC access is retained
@@ -41,11 +44,15 @@ surface.
 
 The stable task registry is an ownership and inventory index, not a run queue.
 Ready selection, timed wakeups, and deferred reaping use separate intrusive
-projections, so their hot paths scale with the relevant work set. R4X tasks
-also carry an immutable direct execution-owner binding; timer IRQ attribution
-does not scan ProgramThread or asynchronous-I/O registries. A wake of a higher
-priority task requests rescheduling, but the switch is consumed only at a safe
-IRQ exit after wait-queue critical sections have been released.
+projections, so their hot paths scale with the relevant work set. Finite waits
+form a stable ordered deadline queue; one timer IRQ publishes at most 64 due
+wakes and leaves a visible backlog for the next delivery. Equal deadlines keep
+enrollment order, cancellation unlinks the exact waiter, and hardware horizons
+are crossed through bounded one-shot checkpoints. R4X tasks also carry an
+immutable direct execution-owner binding; timer IRQ attribution does not scan
+ProgramThread or asynchronous-I/O registries. A wake of a higher priority task
+requests rescheduling, but the switch is consumed only at a safe IRQ exit after
+wait-queue critical sections have been released.
 
 Detailed German migration notes are preserved in
 `DOCUMENTATION.de.txt`.

@@ -215,8 +215,9 @@ fn validateActiveTimerTicks(min_ticks: u64) TimerValidation {
     const start_hpet = hpet.readMainCounter();
     const duration = hpet_status.frequency_hz / 20;
     const start_ticks = timer.tickCount();
+    const deadline = timer.deadlineAfter(start_ticks, min_ticks);
     interrupts.enable();
-    while (hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter()) < duration and timer.tickCount() < start_ticks + min_ticks) {
+    while (hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter()) < duration and timer.tickCount() < deadline) {
         asm volatile ("pause");
     }
     interrupts.disable();

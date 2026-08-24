@@ -1,6 +1,8 @@
 const config = @import("config");
 const lapic = @import("../arch/x86_64/lapic.zig");
 const hpet = @import("../arch/x86_64/hpet.zig");
+const interrupts = @import("../arch/x86_64/interrupts.zig");
+const ioapic = @import("../arch/x86_64/ioapic.zig");
 const pit = @import("../arch/x86_64/pit.zig");
 const monotonic_math = @import("../platform/monotonic_math.zig");
 
@@ -12,6 +14,13 @@ pub const Backend = enum {
 
 pub const PIT_IRQ = pit.IRQ;
 pub const DEFAULT_HZ = pit.DEFAULT_HZ;
+pub const NO_DEADLINE: u64 = ~@as(u64, 0);
+pub const MAX_FINITE_DEADLINE: u64 = NO_DEADLINE - 1;
+
+pub const Mode = enum {
+    periodic,
+    one_shot_idle,
+};
 
 pub const EventClockInfo = struct {
     requested_hz: u32 = 0,
@@ -21,17 +30,58 @@ pub const EventClockInfo = struct {
     resolution_ns: u64 = 0,
 };
 
+pub const DeadlineStats = struct {
+    enabled: bool = false,
+    capable: bool = false,
+    mode: Mode = .periodic,
+    armed_deadline: u64 = NO_DEADLINE,
+    timer_irqs: u64 = 0,
+    idle_entries: u64 = 0,
+    one_shot_arms: u64 = 0,
+    earlier_reprograms: u64 = 0,
+    cancels: u64 = 0,
+    periodic_resumes: u64 = 0,
+    runtime_fallbacks: u64 = 0,
+    late_irqs: u64 = 0,
+    max_lateness_ticks: u64 = 0,
+    last_lateness_ticks: u64 = 0,
+    last_irq_tick: u64 = 0,
+};
+
 var backend: Backend = .pit;
 var initialized = false;
 var tick_epoch: u64 = 0;
 var tick_origin: u64 = 0;
 var event_epoch_ns: u64 = 0;
 var event_origin: u64 = 0;
+var logical_hz: u32 = DEFAULT_HZ;
+var modern_counter_origin: u64 = 0;
+var modern_counter_frequency_hz: u64 = 0;
+var deadline_enabled = false;
+var deadline_mode: Mode = .periodic;
+var armed_deadline: u64 = NO_DEADLINE;
+var timer_irq_count: u64 = 0;
+var idle_entry_count: u64 = 0;
+var one_shot_arm_count: u64 = 0;
+var earlier_reprogram_count: u64 = 0;
+var deadline_cancel_count: u64 = 0;
+var periodic_resume_count: u64 = 0;
+var runtime_fallback_count: u64 = 0;
+var late_irq_count: u64 = 0;
+var max_lateness_ticks: u64 = 0;
+var last_lateness_ticks: u64 = 0;
+var last_irq_tick: u64 = 0;
 
 pub fn initPit(requested_hz: u32) void {
     if (initialized) rebaseActiveClock();
-    pit.init(requested_hz);
+    logical_hz = if (requested_hz == 0) DEFAULT_HZ else requested_hz;
+    pit.init(logical_hz);
     backend = .pit;
+    modern_counter_origin = 0;
+    modern_counter_frequency_hz = 0;
+    deadline_enabled = false;
+    deadline_mode = .periodic;
+    armed_deadline = NO_DEADLINE;
     activateBackendOrigins();
     initialized = true;
 }
@@ -39,7 +89,9 @@ pub fn initPit(requested_hz: u32) void {
 pub fn trySwitchToLapic(requested_hz: u32) bool {
     if (!lapic.initTimerFromHpet(requested_hz)) return false;
     rebaseActiveClock();
+    logical_hz = if (requested_hz == 0) DEFAULT_HZ else requested_hz;
     backend = .lapic;
+    activateModernCounter();
     activateBackendOrigins();
     return true;
 }
@@ -47,7 +99,9 @@ pub fn trySwitchToLapic(requested_hz: u32) bool {
 pub fn trySwitchToHpet(requested_hz: u32) bool {
     if (!hpet.startLegacyIrqTimer(requested_hz)) return false;
     rebaseActiveClock();
+    logical_hz = if (requested_hz == 0) DEFAULT_HZ else requested_hz;
     backend = .hpet;
+    activateModernCounter();
     activateBackendOrigins();
     return true;
 }
@@ -56,7 +110,14 @@ pub fn fallbackToPit() void {
     rebaseActiveClock();
     if (backend == .lapic) lapic.stopTimer();
     if (backend == .hpet) hpet.stopLegacyIrqTimer();
+    if (ioapic.isRoutingActive()) _ = ioapic.setLegacyIrqMasked(PIT_IRQ, false);
+    pit.init(logical_hz);
     backend = .pit;
+    modern_counter_origin = 0;
+    modern_counter_frequency_hz = 0;
+    deadline_enabled = false;
+    deadline_mode = .periodic;
+    armed_deadline = NO_DEADLINE;
     activateBackendOrigins();
 }
 
@@ -69,15 +130,41 @@ pub fn onIrq() u64 {
     }
     switch (backend) {
         .pit => pit.onTick(),
-        .hpet => return hpet.onTimerIrq(),
-        .lapic => return lapic.onTimerIrq(),
+        .hpet => _ = hpet.onTimerIrq(),
+        .lapic => _ = lapic.onTimerIrq(),
     }
-    return tickCount();
+    timer_irq_count +%= 1;
+    const now = tickCount();
+    last_irq_tick = now;
+    if (deadline_mode == .one_shot_idle) {
+        last_lateness_ticks = 0;
+        if (armed_deadline != NO_DEADLINE and now > armed_deadline) {
+            const lateness = now - armed_deadline;
+            last_lateness_ticks = lateness;
+            late_irq_count +%= 1;
+            if (lateness > max_lateness_ticks) max_lateness_ticks = lateness;
+        }
+        armed_deadline = NO_DEADLINE;
+    }
+    return now;
 }
 
 pub fn tickCount() u64 {
     const local = rawTickCount();
-    return tick_epoch +% (local -% tick_origin);
+    return tick_epoch +| (local -% tick_origin);
+}
+
+pub fn deadlineAfter(now: u64, duration_ticks: u64) u64 {
+    return monotonic_math.finiteDeadline(now, duration_ticks);
+}
+
+pub fn deadlineAfterNow(duration_ticks: u64) u64 {
+    return deadlineAfter(tickCount(), duration_ticks);
+}
+
+pub fn remainingUntil(now: u64, deadline: u64) u64 {
+    if (deadline == NO_DEADLINE) return NO_DEADLINE;
+    return if (now >= deadline) 0 else deadline - now;
 }
 
 pub fn eventNanoseconds() u64 {
@@ -95,22 +182,7 @@ pub fn eventNanoseconds() u64 {
 pub fn eventClockInfo() EventClockInfo {
     const rate = switch (backend) {
         .pit => monotonic_math.reducedRate(pit.BASE_HZ, pit.divisor()),
-        .hpet => blk: {
-            const status = hpet.status();
-            break :blk monotonic_math.reducedRate(status.frequency_hz, status.timer0_period);
-        },
-        .lapic => blk: {
-            const status = lapic.status();
-            const numerator_wide = @as(u128, status.calibration_lapic_ticks) * hpet.status().frequency_hz;
-            const denominator_wide = @as(u128, status.calibration_hpet_ticks) * status.timer_initial_count;
-            if (numerator_wide == 0 or denominator_wide == 0 or
-                numerator_wide > @as(u128, ~@as(u64, 0)) or
-                denominator_wide > @as(u128, ~@as(u64, 0)))
-            {
-                break :blk monotonic_math.Rate{ .numerator = status.timer_frequency_hz, .denominator = 1 };
-            }
-            break :blk monotonic_math.reducedRate(@intCast(numerator_wide), @intCast(denominator_wide));
-        },
+        .hpet, .lapic => monotonic_math.Rate{ .numerator = logical_hz, .denominator = 1 },
     };
     const requested = frequency();
     return .{
@@ -125,15 +197,29 @@ pub fn eventClockInfo() EventClockInfo {
 fn rawTickCount() u64 {
     return switch (backend) {
         .pit => pit.tickCount(),
-        .hpet => hpet.timerTickCount(),
-        .lapic => lapic.timerTickCount(),
+        .hpet, .lapic => modernTickCount(),
     };
+}
+
+fn modernTickCount() u64 {
+    if (modern_counter_frequency_hz == 0) return 0;
+    return monotonic_math.counterToTicks(
+        hpet.readExtendedMainCounter() -% modern_counter_origin,
+        modern_counter_frequency_hz,
+        logical_hz,
+    );
+}
+
+fn activateModernCounter() void {
+    const status = hpet.status();
+    modern_counter_frequency_hz = status.frequency_hz;
+    modern_counter_origin = hpet.readExtendedMainCounter();
 }
 
 fn rebaseActiveClock() void {
     if (!initialized) return;
     const local = rawTickCount();
-    tick_epoch +%= local -% tick_origin;
+    tick_epoch +|= local -% tick_origin;
     const rate = eventClockInfo();
     event_epoch_ns +|= monotonic_math.rateToNanoseconds(
         local -% event_origin,
@@ -149,10 +235,121 @@ fn activateBackendOrigins() void {
 }
 
 pub fn frequency() u32 {
-    return switch (backend) {
-        .pit => pit.frequency(),
-        .hpet => hpet.timerFrequency(),
-        .lapic => lapic.timerFrequency(),
+    return logical_hz;
+}
+
+pub fn enableDeadlineScheduling() bool {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    deadline_enabled = backend != .pit and modern_counter_frequency_hz != 0;
+    deadline_mode = .periodic;
+    armed_deadline = NO_DEADLINE;
+    return deadline_enabled;
+}
+
+pub fn enterIdleDeadline(requested_deadline: u64) bool {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (!deadline_enabled or backend == .pit) return false;
+
+    const now = tickCount();
+    if (deadline_mode == .periodic) {
+        const prepared = switch (backend) {
+            .hpet => hpet.startLegacyOneShotTimer(logical_hz),
+            .lapic => lapic.startOneShotTimer(),
+            .pit => false,
+        };
+        if (!prepared) {
+            runtime_fallback_count +%= 1;
+            fallbackToPit();
+            return false;
+        }
+        deadline_mode = .one_shot_idle;
+        idle_entry_count +%= 1;
+    }
+
+    if (requested_deadline == NO_DEADLINE) {
+        disarmOneShotBackend();
+        armed_deadline = NO_DEADLINE;
+        return true;
+    }
+
+    if (armed_deadline != NO_DEADLINE and requested_deadline < armed_deadline) {
+        earlier_reprogram_count +%= 1;
+    }
+    const delta = monotonic_math.boundedDeadlineDelta(now, requested_deadline, MAX_FINITE_DEADLINE -| now);
+    const programmed_ticks = switch (backend) {
+        .hpet => hpet.armLegacyOneShotTicks(delta, logical_hz),
+        .lapic => lapic.armOneShotTicks(delta),
+        .pit => 0,
+    };
+    if (programmed_ticks == 0) {
+        runtime_fallback_count +%= 1;
+        fallbackToPit();
+        return false;
+    }
+    armed_deadline = deadlineAfter(now, programmed_ticks);
+    one_shot_arm_count +%= 1;
+    return true;
+}
+
+pub fn leaveIdleDeadline() bool {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (deadline_mode != .one_shot_idle) return backend != .pit;
+
+    if (armed_deadline != NO_DEADLINE) deadline_cancel_count +%= 1;
+    disarmOneShotBackend();
+    armed_deadline = NO_DEADLINE;
+    const resumed = switch (backend) {
+        .hpet => hpet.startLegacyIrqTimer(logical_hz),
+        .lapic => lapic.resumePeriodicTimer(),
+        .pit => true,
+    };
+    if (!resumed) {
+        runtime_fallback_count +%= 1;
+        fallbackToPit();
+        return false;
+    }
+    deadline_mode = .periodic;
+    periodic_resume_count +%= 1;
+    return true;
+}
+
+fn disarmOneShotBackend() void {
+    switch (backend) {
+        .hpet => hpet.disarmLegacyOneShotTimer(),
+        .lapic => lapic.disarmOneShotTimer(),
+        .pit => {},
+    }
+}
+
+pub fn deadlineStats() DeadlineStats {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    return .{
+        .enabled = deadline_enabled,
+        .capable = backend != .pit and modern_counter_frequency_hz != 0,
+        .mode = deadline_mode,
+        .armed_deadline = armed_deadline,
+        .timer_irqs = timer_irq_count,
+        .idle_entries = idle_entry_count,
+        .one_shot_arms = one_shot_arm_count,
+        .earlier_reprograms = earlier_reprogram_count,
+        .cancels = deadline_cancel_count,
+        .periodic_resumes = periodic_resume_count,
+        .runtime_fallbacks = runtime_fallback_count,
+        .late_irqs = late_irq_count,
+        .max_lateness_ticks = max_lateness_ticks,
+        .last_lateness_ticks = last_lateness_ticks,
+        .last_irq_tick = last_irq_tick,
+    };
+}
+
+pub fn deadlineModeName() []const u8 {
+    return switch (deadline_mode) {
+        .periodic => if (deadline_enabled) "periodic-active" else "periodic-fallback",
+        .one_shot_idle => "one-shot-idle",
     };
 }
 

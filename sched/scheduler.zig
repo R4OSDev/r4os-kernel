@@ -54,6 +54,7 @@ var wakeup_preemption_switch_count: u64 = 0;
 var ready_candidate_visit_count: u64 = 0;
 var timeout_candidate_visit_count: u64 = 0;
 var warning_candidate_visit_count: u64 = 0;
+var timeout_storm_deferral_count: u64 = 0;
 
 pub const WAIT_FOREVER: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 pub const timer_wait_object: u64 = 0x5449_4D45_5741_4954; // "TIMEWAIT"
@@ -65,6 +66,7 @@ pub const preemption_test_mode: u32 = 0;
 pub const preemption_quantum_ticks: u32 = @intCast(@max(1, (30 * timer.DEFAULT_HZ) / 1000));
 pub const long_running_warn_ticks: u64 = @max(1, (1000 * @as(u64, timer.DEFAULT_HZ)) / 1000);
 pub const starvation_warn_ticks: u64 = @max(1, (2000 * @as(u64, timer.DEFAULT_HZ)) / 1000);
+const MAX_TIMEOUT_WAKEUPS_PER_IRQ: u32 = 64;
 
 pub const Stats = struct {
     initialized: bool = false,
@@ -172,6 +174,7 @@ pub fn init() bool {
     ready_candidate_visit_count = 0;
     timeout_candidate_visit_count = 0;
     warning_candidate_visit_count = 0;
+    timeout_storm_deferral_count = 0;
     external_irq_fpu_guard_entries = 0;
     external_irq_fpu_guard_mismatches = 0;
     external_irq_fpu_guard_mismatch_reported = false;
@@ -179,6 +182,12 @@ pub fn init() bool {
     // aktuell laufenden Tasks nie recyceln (exitCurrent laeuft auf seinem
     // Stack weiter, bis der Scheduler weggeschaltet hat).
     task.setCurrentProvider(current);
+    const deadline_mode = timer.enableDeadlineScheduling();
+    k.puts("[TIMER] deadline_queue=ordered idle=");
+    k.puts(if (deadline_mode) "one-shot" else "periodic-fallback");
+    k.puts(" backend=");
+    k.puts(timer.backendName());
+    k.puts("\r\n");
     return true;
 }
 
@@ -255,6 +264,7 @@ pub const StructureStats = struct {
     ready_candidate_visits: u64 = 0,
     timeout_candidate_visits: u64 = 0,
     warning_candidate_visits: u64 = 0,
+    timeout_storm_deferrals: u64 = 0,
     wakeup_reschedule_requests: u64 = 0,
     wakeup_preemption_switches: u64 = 0,
     reschedule_pending: bool = false,
@@ -265,6 +275,7 @@ pub fn structureStats() StructureStats {
         .ready_candidate_visits = ready_candidate_visit_count,
         .timeout_candidate_visits = timeout_candidate_visit_count,
         .warning_candidate_visits = warning_candidate_visit_count,
+        .timeout_storm_deferrals = timeout_storm_deferral_count,
         .wakeup_reschedule_requests = wakeup_reschedule_request_count,
         .wakeup_preemption_switches = wakeup_preemption_switch_count,
         .reschedule_pending = reschedule_requested,
@@ -463,7 +474,7 @@ pub fn blockCurrent(object: u64, timeout_ticks: u64, reason: []const u8) ?*task.
     defer preemptEnable();
     const running = current_task orelse return null;
     const now = timer.tickCount();
-    const wake_tick = if (timeout_ticks == WAIT_FOREVER) 0 else now + timeout_ticks;
+    const wake_tick = if (timeout_ticks == WAIT_FOREVER) 0 else timer.deadlineAfter(now, timeout_ticks);
     task.beginWait(running, wake_tick, reason, object);
     sleep_count +%= 1;
     object_wait_count +%= 1;
@@ -483,8 +494,7 @@ pub fn parkBlocked(blocked_task: *task.Task) void {
         yield();
         if (blocked_task.state == .blocked) {
             idle_wait_count +%= 1;
-            interrupts.enable();
-            interrupts.waitForInterrupt();
+            waitForInterruptUntilNextDeadline();
             interrupts.restore(park_irq_flags);
         }
     }
@@ -599,10 +609,19 @@ fn exitCurrentImpl(retire: bool) noreturn {
         if (hasOtherReadyTask()) {
             yield();
         } else {
-            interrupts.enable();
-            interrupts.waitForInterrupt();
+            waitForInterruptUntilNextDeadline();
         }
     }
+}
+
+fn waitForInterruptUntilNextDeadline() void {
+    const irq_flags = interrupts.saveAndDisable();
+    _ = timer.enterIdleDeadline(task.minWakeTick());
+    interrupts.enable();
+    interrupts.waitForInterrupt();
+    interrupts.disable();
+    _ = timer.leaveIdleDeadline();
+    interrupts.restore(irq_flags);
 }
 
 pub fn onTick(now: u64, preemptible_instruction_pointer: bool) bool {
@@ -615,23 +634,18 @@ pub fn onTick(now: u64, preemptible_instruction_pointer: bool) bool {
             }
         }
     }
-    // 0.56.18: Timeout-Scan nur, wenn ueberhaupt ein Timeout faellig sein
-    // kann (Befund 4.3). min_wake_tick ist eine untere Schranke; der Scan
-    // berechnet sie hier als einziger neu (nach oben).
-    if (now >= task.minWakeTick()) {
-        var next_min: u64 = task.NO_WAKE_TICK;
-        var cursor = task.firstTimedWait();
-        while (cursor) |candidate| {
-            const following = task.nextTimedWait(candidate);
-            timeout_candidate_visit_count +%= 1;
-            if (now >= candidate.wake_tick) {
-                _ = wakeTask(candidate, .timeout);
-            } else if (candidate.wake_tick < next_min) {
-                next_min = candidate.wake_tick;
-            }
-            cursor = following;
-        }
-        task.setMinWakeTick(next_min);
+    // The timed projection is ordered, so IRQ work stops at the first future
+    // deadline. A simultaneous-deadline storm is drained in bounded batches;
+    // the periodic active mode or the next one-shot checkpoint continues it.
+    var timeout_wakeups: u32 = 0;
+    while (timeout_wakeups < MAX_TIMEOUT_WAKEUPS_PER_IRQ) : (timeout_wakeups += 1) {
+        const candidate = task.firstTimedWait() orelse break;
+        timeout_candidate_visit_count +%= 1;
+        if (candidate.wake_tick > now) break;
+        _ = wakeTask(candidate, .timeout);
+    }
+    if (task.firstTimedWait()) |candidate| {
+        if (candidate.wake_tick <= now) timeout_storm_deferral_count +%= 1;
     }
     const should_preempt = runTimerPreemption(now, preemptible_instruction_pointer);
     recordRuntimeWarnings(now);
@@ -715,6 +729,20 @@ pub fn dumpStatus() void {
     k.putDec(wait_object_max_ticks);
     k.puts(" run_max=");
     k.putDec(run_without_switch_max_ticks);
+    k.puts("\r\n");
+    const deadline = timer.deadlineStats();
+    k.puts("  Timer deadlines: mode=");
+    k.puts(timer.deadlineModeName());
+    k.puts(" irqs=");
+    k.putDec(deadline.timer_irqs);
+    k.puts(" idle_entries=");
+    k.putDec(deadline.idle_entries);
+    k.puts(" arms=");
+    k.putDec(deadline.one_shot_arms);
+    k.puts(" cancels=");
+    k.putDec(deadline.cancels);
+    k.puts(" storm_deferrals=");
+    k.putDec(timeout_storm_deferral_count);
     k.puts("\r\n");
     dumpCurrent();
     task.dump();
