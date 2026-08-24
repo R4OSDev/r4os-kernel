@@ -84,6 +84,23 @@ Bootdatensatz; breite Subsystem-Summaries oder aktive Diagnoseprobes gehoeren
 nicht in diesen Pfad. Die spaeten Phasen laufen einmalig in der Reihenfolge
 `task_runtime`, `driver_policy`, `runtime`, `shell`.
 
+Synth-PCM und Protokollbruecke
+-----------------------------
+
+Der Audio-Core akzeptiert eine Synth-Engine nur dann als MIDI-Renderer, wenn
+der angeforderte Name, das MIDI-Flag, ein Ereignisempfaenger und der
+append-only PCM-Callback zusammenpassen. Der Callback rendert 1 bis 1024
+Frames in einen Kernelpuffer; erst danach wird exakt dieser Block mit 48 kHz,
+Stereo und s16le an das aktive AudioBackend geschrieben. Bei `Busy` bleibt er
+fuer denselben Retry erhalten, alle anderen Backendfehler gelangen zum
+R4AUDIO-Aufrufer.
+
+SID verwendet denselben Grundsatz mit einem 960-Frame-Puffer. Ein Retry
+schreibt zunaechst den ausstehenden Block und fuehrt die 6510-Playroutine
+nicht erneut aus. DriverApi v18 stellt externen Treibern den synchronen
+R4P-Dispatch bereit; nach dem Laden der R4P-Module wendet der Runtime-Boot das
+konfigurierte SID-Modell nochmals ueber `audio.sid` an.
+
 Kanonische PCI- und PCIe-Inventur
 ---------------------------------
 

@@ -16,6 +16,7 @@ const scheduler = @import("../sched/scheduler.zig");
 const shell_launcher = @import("shell_launcher.zig");
 const service_ipc = @import("service_ipc.zig");
 const block_storage = @import("../storage/block.zig");
+const audio = @import("../audio/core.zig");
 const task = @import("../sched/task.zig");
 
 var task_runtime_initialized = false;
@@ -66,6 +67,7 @@ pub fn start() noreturn {
     const r4p_start = loader_perf.beginR4pRuntime();
     r4p.loadAll();
     loader_perf.finishR4pRuntime(r4p_start);
+    _ = audio.applyConfiguredSidModel();
     r4p.dumpStatus();
     boot_status.statusLine("  Loader [OK]\r\n");
 

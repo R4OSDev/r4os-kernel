@@ -10,6 +10,8 @@ const pci_inventory = @import("../platform/pci_inventory.zig");
 const platform_cpu = @import("../platform/cpu.zig");
 const paging = @import("../memory/paging.zig");
 const phys = @import("../memory/phys.zig");
+const protocol_api = @import("protocol_api.zig");
+const r4p = @import("../program/r4p.zig");
 const irq_router = @import("irq_router.zig");
 const driver_work = @import("driver_work.zig");
 const scheduler = @import("../sched/scheduler.zig");
@@ -19,9 +21,9 @@ const timer = @import("timer.zig");
 const usb_host = @import("../driver/usb/host_controller.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 17 (0.69.17): append-only um begrenzte DMA-Allokation und
-// explizites MSI-Rollback erweitert.
-pub const VERSION: u32 = 17;
+// Version 18 (0.69.28): append-only um produktiven R4P-Dispatch fuer
+// Laufzeitdaten externer Treiber erweitert.
+pub const VERSION: u32 = 18;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -146,7 +148,10 @@ pub const SynthEngineDescriptor = extern struct {
     sid_init: ?*const fn (?*anyopaque, u32, u32, u32) callconv(.c) i32,
     sid_play_frame: ?*const fn (?*anyopaque, u32, u32, u32) callconv(.c) i32,
     sid_render_pcm: ?*const fn (?*anyopaque, u32, [*]u8, u32) callconv(.c) i32,
+    render_pcm: ?audio.SynthRenderPcmCtxFn,
 };
+
+const SYNTH_ENGINE_V1_SIZE: u32 = @intCast(@offsetOf(SynthEngineDescriptor, "render_pcm"));
 
 pub const StorageBackendStatus = extern struct {
     state: u32,
@@ -515,6 +520,9 @@ pub const Table = extern struct {
     // Adressbreite und explizites MSI-Rollback fuer Fehler-/Unloadpfade.
     alloc_dma_region_constrained: *const fn (u32, u32, u64, *DmaBuffer) callconv(.c) i32,
     pci_disable_msi: *const fn (u8, u8, u8, u8) callconv(.c) i32,
+    // 0.69.28 (Version 18, append-only): synchroner R4P-Dispatch fuer
+    // Treiber-Hotpaths, die den installierten Protokollvertrag benoetigen.
+    protocol_dispatch: *const fn ([*:0]const u8, u32, *const protocol_api.ProtocolBuffer, *protocol_api.ProtocolBuffer) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -576,6 +584,7 @@ pub var table = Table{
     .pci_enable_msi = pciEnableMsi,
     .alloc_dma_region_constrained = allocDmaRegionConstrained,
     .pci_disable_msi = pciDisableMsi,
+    .protocol_dispatch = protocolDispatch,
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
@@ -1200,7 +1209,11 @@ fn registerSynthEngine(name: [*:0]const u8, engine: *const anyopaque) callconv(.
 
 fn registerSynthEngineV2(name: [*:0]const u8, engine: *const SynthEngineDescriptor) callconv(.c) i32 {
     if (!validSynthEngine(engine)) return -1;
-    return audio.registerExternalSynthEngineZ(name, engine.context, engine.midi_send, engine.render, engine.stop, engine.status, engine.opl3_reset, engine.opl3_write_register, engine.sid_acquire, engine.sid_release, engine.sid_set_model, engine.sid_write_register, engine.sid_load_data, engine.sid_init, engine.sid_play_frame, engine.sid_render_pcm);
+    return audio.registerExternalSynthEngineZ(name, engine.flags, engine.context, engine.midi_send, engine.render, engine.stop, engine.status, engine.opl3_reset, engine.opl3_write_register, engine.sid_acquire, engine.sid_release, engine.sid_set_model, engine.sid_write_register, engine.sid_load_data, engine.sid_init, engine.sid_play_frame, engine.sid_render_pcm, synthRenderPcm(engine));
+}
+
+fn protocolDispatch(role: [*:0]const u8, op: u32, in_buffer: *const protocol_api.ProtocolBuffer, out_buffer: *protocol_api.ProtocolBuffer) callconv(.c) i32 {
+    return r4p.dispatch(zSlice(role), op, in_buffer, out_buffer);
 }
 
 fn registerMixerBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
@@ -1290,19 +1303,25 @@ fn validSynthEngine(descriptor: *const SynthEngineDescriptor) bool {
         bootlog.puts("[R4D][ERROR] synth engine version mismatch\r\n");
         return false;
     }
-    if (descriptor.size < @sizeOf(SynthEngineDescriptor)) {
+    if (descriptor.size < SYNTH_ENGINE_V1_SIZE) {
         bootlog.puts("[R4D][ERROR] synth engine descriptor too small\r\n");
         return false;
     }
     if (descriptor.midi_send == null and descriptor.render == null and descriptor.stop == null and descriptor.status == null and
         descriptor.opl3_reset == null and descriptor.opl3_write_register == null and descriptor.sid_acquire == null and
         descriptor.sid_release == null and descriptor.sid_set_model == null and descriptor.sid_write_register == null and descriptor.sid_load_data == null and
-        descriptor.sid_init == null and descriptor.sid_play_frame == null and descriptor.sid_render_pcm == null)
+        descriptor.sid_init == null and descriptor.sid_play_frame == null and descriptor.sid_render_pcm == null and synthRenderPcm(descriptor) == null)
     {
         bootlog.puts("[R4D][ERROR] synth engine has no operations\r\n");
         return false;
     }
     return true;
+}
+
+fn synthRenderPcm(descriptor: *const SynthEngineDescriptor) ?audio.SynthRenderPcmCtxFn {
+    const required_size = @offsetOf(SynthEngineDescriptor, "render_pcm") + @sizeOf(?audio.SynthRenderPcmCtxFn);
+    if (descriptor.size < required_size) return null;
+    return descriptor.render_pcm;
 }
 
 fn validStorageBackend(descriptor: *const StorageBackendDescriptor) bool {

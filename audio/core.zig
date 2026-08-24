@@ -23,6 +23,9 @@ const MAX_AUDIO_BACKENDS: usize = 4;
 const MAX_SYNTH_ENGINES: usize = 8;
 const SID_REGISTER_COUNT: u8 = 25;
 const SID_RENDER_BYTES: usize = 3840;
+const SYNTH_RENDER_MAX_FRAMES: u32 = 1024;
+const SYNTH_RENDER_MAX_BYTES: usize = SYNTH_RENDER_MAX_FRAMES * @sizeOf(i16) * DEFAULT_CHANNELS;
+const SYNTH_ENGINE_FLAG_MIDI: u32 = 1 << 0;
 const MIX_QUANTUM_BYTES: usize = 480 * pcm.TARGET_FRAME_BYTES;
 
 pub const StreamOwner = mixer.Owner;
@@ -90,6 +93,7 @@ pub const SynthRenderFn = *const fn () void;
 pub const SynthStopFn = *const fn () void;
 pub const SynthMidiSendCtxFn = *const fn (?*anyopaque, u8, u8, u8, u8) callconv(.c) i32;
 pub const SynthRenderCtxFn = *const fn (?*anyopaque) callconv(.c) i32;
+pub const SynthRenderPcmCtxFn = *const fn (?*anyopaque, [*]u8, u32, u32, u16, u16) callconv(.c) i32;
 pub const SynthStopCtxFn = *const fn (?*anyopaque) callconv(.c) i32;
 pub const SynthOpl3ResetCtxFn = *const fn (?*anyopaque) callconv(.c) i32;
 pub const SynthOpl3WriteRegisterCtxFn = *const fn (?*anyopaque, u8, u8, u8) callconv(.c) i32;
@@ -144,6 +148,7 @@ const NamedBackend = struct {
 
 const SynthEngine = struct {
     registered: bool = false,
+    flags: u32 = 0,
     name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
     name_len: usize = 0,
     ptr: ?*const anyopaque = null,
@@ -153,6 +158,7 @@ const SynthEngine = struct {
     stop: ?SynthStopFn = null,
     midi_send_ctx: ?SynthMidiSendCtxFn = null,
     render_ctx: ?SynthRenderCtxFn = null,
+    render_pcm_ctx: ?SynthRenderPcmCtxFn = null,
     stop_ctx: ?SynthStopCtxFn = null,
     status_ctx: ?SynthStatusCtxFn = null,
     opl3_reset_ctx: ?SynthOpl3ResetCtxFn = null,
@@ -167,6 +173,8 @@ const SynthEngine = struct {
     sid_render_pcm_ctx: ?SynthSidRenderPcmCtxFn = null,
     external_contract: bool = false,
     migration_bridge: bool = false,
+    pcm_pending: [SYNTH_RENDER_MAX_BYTES]u8 = .{0} ** SYNTH_RENDER_MAX_BYTES,
+    pcm_pending_len: u32 = 0,
     sends: u64 = 0,
     renders: u64 = 0,
     stops: u64 = 0,
@@ -238,6 +246,8 @@ var sid_last_result: i32 = 0;
 var sid_pcm_writes: u64 = 0;
 var sid_pcm_ok: u64 = 0;
 var sid_pcm_fail: u64 = 0;
+var sid_pcm_pending: [SID_RENDER_BYTES]u8 = .{0} ** SID_RENDER_BYTES;
+var sid_pcm_pending_len: u32 = 0;
 var sid_r4p_model: u64 = 0;
 var sid_r4p_register: u64 = 0;
 var sid_r4p_io: u64 = 0;
@@ -342,6 +352,7 @@ pub fn init() void {
     sid_pcm_writes = 0;
     sid_pcm_ok = 0;
     sid_pcm_fail = 0;
+    sid_pcm_pending_len = 0;
     resetSidProtocolCounters();
     registerMixerBackend("SimpleKernelMixer", null);
     bootlog.puts("[AUDIO] core ready pcm u8/s16le mono/stereo\r\n");
@@ -349,11 +360,17 @@ pub fn init() void {
 
 pub fn configureSidModel(model: []const u8) void {
     sid_model_option = model;
+    _ = applyConfiguredSidModel();
+}
+
+pub fn applyConfiguredSidModel() i32 {
     if (sidEngine()) |engine| {
         if (engine.sid_set_model_ctx) |set_model| {
             sid_last_result = set_model(engine.context, sidModelId());
+            return sid_last_result;
         }
     }
+    return r4x_api.service_api_result_no_endpoint;
 }
 
 pub fn sidModelNameZ() [*:0]const u8 {
@@ -561,7 +578,10 @@ pub fn sidAcquire() i32 {
     if (sid_acquired) return -2;
     const result = acquire(engine.context);
     sid_last_result = result;
-    if (result > 0) sid_acquired = true;
+    if (result > 0) {
+        sid_acquired = true;
+        sid_pcm_pending_len = 0;
+    }
     return result;
 }
 
@@ -583,6 +603,7 @@ pub fn sidRelease(handle: u32) i32 {
     if (handle != 1 or !sid_acquired) return -1;
     sid_last_result = release(engine.context, handle);
     sid_acquired = false;
+    sid_pcm_pending_len = 0;
     return sid_last_result;
 }
 
@@ -608,30 +629,21 @@ pub fn sidPlayFrame(handle: u32, play_addr: u16, frame_hz: u16) i32 {
     const play_frame = engine.sid_play_frame_ctx orelse return -3;
     const render_pcm = engine.sid_render_pcm_ctx orelse return -3;
     if (handle != 1 or !sid_acquired) return -1;
+    if (sid_pcm_pending_len != 0) return flushPendingSidPcm();
     sid_last_result = play_frame(engine.context, handle, play_addr, frame_hz);
-    if (sid_last_result == 0) {
-        var block: [SID_RENDER_BYTES]u8 = undefined;
-        const rendered = render_pcm(engine.context, handle, block[0..].ptr, SID_RENDER_BYTES);
-        sid_last_result = rendered;
-        if (rendered < 0) {
-            sid_pcm_fail += 1;
-            total_backend_fail += 1;
-            return rendered;
-        }
-        sid_pcm_writes += 1;
-        engine.renders +%= 1;
-        const len: usize = @intCast(rendered);
-        const result = writeActivePcm(block[0..len], DEFAULT_RATE, DEFAULT_CHANNELS, FORMAT_S16LE) orelse return 0;
-        if (result == 0) {
-            sid_pcm_ok += 1;
-            total_backend_ok += 1;
-        } else {
-            sid_pcm_fail += 1;
-            total_backend_fail += 1;
-        }
-        return 0;
+    if (sid_last_result != 0) return sid_last_result;
+
+    const rendered = render_pcm(engine.context, handle, sid_pcm_pending[0..].ptr, SID_RENDER_BYTES);
+    sid_last_result = rendered;
+    if (rendered <= 0 or rendered > SID_RENDER_BYTES or (@as(u32, @intCast(rendered)) % pcm.TARGET_FRAME_BYTES) != 0) {
+        sid_pcm_fail +%= 1;
+        total_backend_fail +%= 1;
+        return if (rendered < 0) rendered else r4x_api.service_api_result_invalid;
     }
-    return sid_last_result;
+    sid_pcm_pending_len = @intCast(rendered);
+    sid_pcm_writes +%= 1;
+    engine.renders +%= 1;
+    return flushPendingSidPcm();
 }
 
 pub fn sidStop(handle: u32) i32 {
@@ -640,20 +652,40 @@ pub fn sidStop(handle: u32) i32 {
     if (handle != 1 or !sid_acquired) return -1;
     sid_last_result = stop(engine.context);
     if (sid_last_result == 0) engine.stops +%= 1;
+    sid_pcm_pending_len = 0;
     stopActivePcm();
     return sid_last_result;
+}
+
+fn flushPendingSidPcm() i32 {
+    const len: usize = @intCast(sid_pcm_pending_len);
+    if (len == 0) return 0;
+    const result = writeActivePcm(sid_pcm_pending[0..len], DEFAULT_RATE, DEFAULT_CHANNELS, FORMAT_S16LE) orelse r4x_api.service_api_result_no_endpoint;
+    sid_last_result = result;
+    if (result == 0) {
+        sid_pcm_pending_len = 0;
+        sid_pcm_ok +%= 1;
+        total_backend_ok +%= 1;
+    } else if (result != r4x_api.service_api_result_busy) {
+        sid_pcm_fail +%= 1;
+        total_backend_fail +%= 1;
+    }
+    return result;
 }
 
 pub fn midiOpenSynth(backend_z: [*:0]const u8) i32 {
     var buf: [MAX_NAME]u8 = undefined;
     const requested = copyZ(backend_z, buf[0..]) orelse return -1;
-    if (requested.len == 0) {
-        if (findSynthEngine("OPL3") == null and findSynthEngine("MIDI") == null) return -2;
-    } else if (findSynthEngine(requested) == null) {
-        return -2;
-    }
     if (midi_acquired) return -3;
-    active_midi_synth_slot = findRenderableSynthEngine() orelse return -4;
+    const selected = if (requested.len == 0)
+        findRenderableSynthEngine() orelse return -4
+    else blk: {
+        const slot = findSynthEngine(requested) orelse return -2;
+        if (!synthCanRenderMidi(slot)) return -4;
+        break :blk slot;
+    };
+    synth_engines[selected].pcm_pending_len = 0;
+    active_midi_synth_slot = selected;
     midi_acquired = true;
     return 1;
 }
@@ -662,8 +694,10 @@ pub fn midiSend(handle: u32, channel: u8, status: u8, data1: u8, data2: u8) i32 
     if (handle != 1 or !midi_acquired) return -1;
     if (channel > 15) return -2;
     if (status == 0) {
-        renderActiveMidiSynth();
-        return 0;
+        const encoded_frames = @as(u32, data1) | (@as(u32, data2) << 8);
+        const requested_frames = if (encoded_frames == 0) SYNTH_RENDER_MAX_FRAMES else encoded_frames;
+        if (requested_frames > SYNTH_RENDER_MAX_FRAMES) return r4x_api.service_api_result_invalid;
+        return renderActiveMidiSynth(requested_frames);
     }
     const event = classifyMidiEvent(channel, status, data1, data2) orelse return -3;
     midi_last_channel = channel;
@@ -672,17 +706,17 @@ pub fn midiSend(handle: u32, channel: u8, status: u8, data1: u8, data2: u8) i32 
     midi_last_data2 = data2;
     midi_last_event = event.event;
     midi_send_count += 1;
-    sendActiveMidiSynth(channel, event.normalized_status, data1, data2);
-    return 0;
+    return sendActiveMidiSynth(channel, event.normalized_status, data1, data2);
 }
 
 pub fn midiClose(handle: u32) i32 {
     if (handle != 1 or !midi_acquired) return -1;
-    stopActiveMidiSynth();
+    const stop_result = stopActiveMidiSynth();
+    if (active_midi_synth_slot) |slot| synth_engines[slot].pcm_pending_len = 0;
     active_midi_synth_slot = null;
     midi_acquired = false;
     stopPcmIfNoStreams();
-    return 0;
+    return stop_result;
 }
 
 pub fn midiProtocolStatus() MidiProtocolStatus {
@@ -745,10 +779,7 @@ pub fn opl3RunRegisterDemo() void {
 
 pub fn opl3RenderBlock() i32 {
     const slot = findSynthEngine("OPL3") orelse return -2;
-    const render = synth_engines[slot].render_ctx orelse return -3;
-    const result = render(synth_engines[slot].context);
-    if (result >= 0) synth_engines[slot].renders += 1;
-    return result;
+    return renderSynthPcm(slot, SYNTH_RENDER_MAX_FRAMES);
 }
 
 pub fn opl3Stop() i32 {
@@ -799,10 +830,10 @@ pub fn registerExternalAudioBackendZ(name: [*:0]const u8, limits: BackendPcmLimi
     return if (registerAudioBackendInternal(name_slice, null, null, null, context, write_pcm, stop_pcm, status, limits)) 0 else -2;
 }
 
-pub fn registerExternalSynthEngineZ(name: [*:0]const u8, context: ?*anyopaque, send_midi: ?SynthMidiSendCtxFn, render: ?SynthRenderCtxFn, stop: ?SynthStopCtxFn, status: ?SynthStatusCtxFn, opl3_reset: ?SynthOpl3ResetCtxFn, opl3_write_register: ?SynthOpl3WriteRegisterCtxFn, sid_acquire: ?SynthSidAcquireCtxFn, sid_release: ?SynthSidReleaseCtxFn, sid_set_model: ?SynthSidSetModelCtxFn, sid_write_register: ?SynthSidWriteRegisterCtxFn, sid_load_data: ?SynthSidLoadDataCtxFn, sid_init: ?SynthSidInitCtxFn, sid_play_frame: ?SynthSidPlayFrameCtxFn, sid_render_pcm: ?SynthSidRenderPcmCtxFn) i32 {
+pub fn registerExternalSynthEngineZ(name: [*:0]const u8, flags: u32, context: ?*anyopaque, send_midi: ?SynthMidiSendCtxFn, render: ?SynthRenderCtxFn, stop: ?SynthStopCtxFn, status: ?SynthStatusCtxFn, opl3_reset: ?SynthOpl3ResetCtxFn, opl3_write_register: ?SynthOpl3WriteRegisterCtxFn, sid_acquire: ?SynthSidAcquireCtxFn, sid_release: ?SynthSidReleaseCtxFn, sid_set_model: ?SynthSidSetModelCtxFn, sid_write_register: ?SynthSidWriteRegisterCtxFn, sid_load_data: ?SynthSidLoadDataCtxFn, sid_init: ?SynthSidInitCtxFn, sid_play_frame: ?SynthSidPlayFrameCtxFn, sid_render_pcm: ?SynthSidRenderPcmCtxFn, render_pcm: ?SynthRenderPcmCtxFn) i32 {
     var buf: [MAX_NAME]u8 = undefined;
     const name_slice = copyZ(name, buf[0..]) orelse return -1;
-    return if (registerSynthEngineInternal(name_slice, null, null, null, null, context, send_midi, render, stop, status, opl3_reset, opl3_write_register, sid_acquire, sid_release, sid_set_model, sid_write_register, sid_load_data, sid_init, sid_play_frame, sid_render_pcm, true, false)) 0 else -2;
+    return if (registerSynthEngineInternal(name_slice, flags, null, null, null, null, context, send_midi, render, render_pcm, stop, status, opl3_reset, opl3_write_register, sid_acquire, sid_release, sid_set_model, sid_write_register, sid_load_data, sid_init, sid_play_frame, sid_render_pcm, true, false)) 0 else -2;
 }
 
 pub fn unregisterAudioBackendByName(name: []const u8) i32 {
@@ -827,14 +858,14 @@ pub fn unregisterAudioBackendZ(name: [*:0]const u8) i32 {
 }
 
 pub fn registerSynthEngine(name: []const u8, engine: ?*const anyopaque) bool {
-    return registerSynthEngineInternal(name, engine, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, nameEq(name, "SID"));
+    return registerSynthEngineInternal(name, 0, engine, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, nameEq(name, "SID"));
 }
 
 pub fn registerNativeSynthEngine(name: []const u8, send_midi: ?SynthMidiSendFn, render: ?SynthRenderFn, stop: ?SynthStopFn) void {
-    _ = registerSynthEngineInternal(name, null, send_midi, render, stop, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, false);
+    _ = registerSynthEngineInternal(name, if (send_midi != null) SYNTH_ENGINE_FLAG_MIDI else 0, null, send_midi, render, stop, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, false);
 }
 
-fn registerSynthEngineInternal(name: []const u8, engine: ?*const anyopaque, send_midi: ?SynthMidiSendFn, render: ?SynthRenderFn, stop: ?SynthStopFn, context: ?*anyopaque, send_midi_ctx: ?SynthMidiSendCtxFn, render_ctx: ?SynthRenderCtxFn, stop_ctx: ?SynthStopCtxFn, status_ctx: ?SynthStatusCtxFn, opl3_reset_ctx: ?SynthOpl3ResetCtxFn, opl3_write_register_ctx: ?SynthOpl3WriteRegisterCtxFn, sid_acquire_ctx: ?SynthSidAcquireCtxFn, sid_release_ctx: ?SynthSidReleaseCtxFn, sid_set_model_ctx: ?SynthSidSetModelCtxFn, sid_write_register_ctx: ?SynthSidWriteRegisterCtxFn, sid_load_data_ctx: ?SynthSidLoadDataCtxFn, sid_init_ctx: ?SynthSidInitCtxFn, sid_play_frame_ctx: ?SynthSidPlayFrameCtxFn, sid_render_pcm_ctx: ?SynthSidRenderPcmCtxFn, external_contract: bool, migration_bridge: bool) bool {
+fn registerSynthEngineInternal(name: []const u8, flags: u32, engine: ?*const anyopaque, send_midi: ?SynthMidiSendFn, render: ?SynthRenderFn, stop: ?SynthStopFn, context: ?*anyopaque, send_midi_ctx: ?SynthMidiSendCtxFn, render_ctx: ?SynthRenderCtxFn, render_pcm_ctx: ?SynthRenderPcmCtxFn, stop_ctx: ?SynthStopCtxFn, status_ctx: ?SynthStatusCtxFn, opl3_reset_ctx: ?SynthOpl3ResetCtxFn, opl3_write_register_ctx: ?SynthOpl3WriteRegisterCtxFn, sid_acquire_ctx: ?SynthSidAcquireCtxFn, sid_release_ctx: ?SynthSidReleaseCtxFn, sid_set_model_ctx: ?SynthSidSetModelCtxFn, sid_write_register_ctx: ?SynthSidWriteRegisterCtxFn, sid_load_data_ctx: ?SynthSidLoadDataCtxFn, sid_init_ctx: ?SynthSidInitCtxFn, sid_play_frame_ctx: ?SynthSidPlayFrameCtxFn, sid_render_pcm_ctx: ?SynthSidRenderPcmCtxFn, external_contract: bool, migration_bridge: bool) bool {
     const slot = findSynthEngine(name) orelse freeSynthEngineSlot() orelse {
         bootlog.puts("[AUDIO][WARN] synth engine registry full\r\n");
         return false;
@@ -845,6 +876,7 @@ fn registerSynthEngineInternal(name: []const u8, engine: ?*const anyopaque, send
     const stops = entry.stops;
     entry.* = .{
         .registered = true,
+        .flags = flags,
         .ptr = engine,
         .context = context,
         .midi_send = send_midi,
@@ -852,6 +884,7 @@ fn registerSynthEngineInternal(name: []const u8, engine: ?*const anyopaque, send
         .stop = stop,
         .midi_send_ctx = send_midi_ctx,
         .render_ctx = render_ctx,
+        .render_pcm_ctx = render_pcm_ctx,
         .stop_ctx = stop_ctx,
         .status_ctx = status_ctx,
         .opl3_reset_ctx = opl3_reset_ctx,
@@ -1144,19 +1177,20 @@ fn dumpMidiStatus() void {
     k.puts("\r\n");
 }
 
-fn sendActiveMidiSynth(channel: u8, status: u8, data1: u8, data2: u8) void {
-    const slot = active_midi_synth_slot orelse return;
+fn sendActiveMidiSynth(channel: u8, status: u8, data1: u8, data2: u8) i32 {
+    const slot = active_midi_synth_slot orelse return r4x_api.service_api_result_no_endpoint;
     const engine = &synth_engines[slot];
     if (engine.midi_send_ctx) |send| {
-        if (send(engine.context, channel, status, data1, data2) >= 0) {
-            engine.sends += 1;
-        }
-        return;
+        const result = send(engine.context, channel, status, data1, data2);
+        if (result >= 0) engine.sends +%= 1;
+        return result;
     }
     if (engine.midi_send) |send| {
         send(channel, status, data1, data2);
-        engine.sends += 1;
+        engine.sends +%= 1;
+        return 0;
     }
+    return r4x_api.service_api_result_no_endpoint;
 }
 
 fn classifyMidiEvent(channel: u8, status: u8, data1: u8, data2: u8) ?r4p_contract.AudioMidiOp {
@@ -1347,35 +1381,53 @@ fn resetSidProtocolCounters() void {
     sid_last_voice = 0;
 }
 
-fn renderActiveMidiSynth() void {
-    const slot = active_midi_synth_slot orelse return;
-    const engine = &synth_engines[slot];
+fn renderActiveMidiSynth(requested_frames: u32) i32 {
+    const slot = active_midi_synth_slot orelse return r4x_api.service_api_result_no_endpoint;
     midi_render_ticks +%= 1;
-    if (engine.render_ctx) |render| {
-        if (render(engine.context) >= 0) {
-            engine.renders += 1;
-        }
-        return;
-    }
-    if (engine.render) |render| {
-        render();
-        engine.renders += 1;
-    }
+    return renderSynthPcm(slot, requested_frames);
 }
 
-fn stopActiveMidiSynth() void {
-    const slot = active_midi_synth_slot orelse return;
+fn stopActiveMidiSynth() i32 {
+    const slot = active_midi_synth_slot orelse return 0;
     const engine = &synth_engines[slot];
     if (engine.stop_ctx) |stop| {
-        if (stop(engine.context) >= 0) {
-            engine.stops += 1;
-        }
-        return;
+        const result = stop(engine.context);
+        if (result >= 0) engine.stops +%= 1;
+        return result;
     }
     if (engine.stop) |stop| {
         stop();
-        engine.stops += 1;
+        engine.stops +%= 1;
     }
+    return 0;
+}
+
+fn renderSynthPcm(slot: usize, requested_frames: u32) i32 {
+    if (requested_frames == 0 or requested_frames > SYNTH_RENDER_MAX_FRAMES) return r4x_api.service_api_result_invalid;
+    const engine = &synth_engines[slot];
+    if (engine.pcm_pending_len != 0) return flushPendingSynthPcm(engine);
+    const render_pcm = engine.render_pcm_ctx orelse return r4x_api.service_api_result_no_endpoint;
+    const capacity = requested_frames * @as(u32, @intCast(pcm.TARGET_FRAME_BYTES));
+    const rendered = render_pcm(engine.context, engine.pcm_pending[0..].ptr, capacity, DEFAULT_RATE, DEFAULT_CHANNELS, FORMAT_S16LE);
+    if (rendered < 0) return rendered;
+    if (rendered == 0) return 0;
+    if (rendered != @as(i32, @intCast(capacity))) return r4x_api.service_api_result_invalid;
+    engine.pcm_pending_len = @intCast(rendered);
+    engine.renders +%= 1;
+    return flushPendingSynthPcm(engine);
+}
+
+fn flushPendingSynthPcm(engine: *SynthEngine) i32 {
+    const len: usize = @intCast(engine.pcm_pending_len);
+    if (len == 0) return 0;
+    const result = writeActivePcm(engine.pcm_pending[0..len], DEFAULT_RATE, DEFAULT_CHANNELS, FORMAT_S16LE) orelse r4x_api.service_api_result_no_endpoint;
+    if (result == 0) {
+        engine.pcm_pending_len = 0;
+        total_backend_ok +%= 1;
+    } else if (result != r4x_api.service_api_result_busy) {
+        total_backend_fail +%= 1;
+    }
+    return result;
 }
 
 fn registerMixerBackend(name: []const u8, backend: ?*const anyopaque) void {
@@ -1587,7 +1639,6 @@ fn sidModelId() u32 {
 }
 
 fn findRenderableSynthEngine() ?usize {
-    if (findSynthEngine("OPL3") == null and findSynthEngine("MIDI") == null) return null;
     if (findSynthEngine("OPL3")) |slot| {
         if (synthCanRenderMidi(slot)) return slot;
     }
@@ -1604,8 +1655,9 @@ fn findRenderableSynthEngine() ?usize {
 
 fn synthCanRenderMidi(slot: usize) bool {
     const synth = &synth_engines[slot];
-    return (synth.midi_send != null or synth.midi_send_ctx != null) and
-        (synth.render != null or synth.render_ctx != null);
+    return (synth.flags & SYNTH_ENGINE_FLAG_MIDI) != 0 and
+        (synth.midi_send != null or synth.midi_send_ctx != null) and
+        synth.render_pcm_ctx != null;
 }
 
 fn freeAudioBackendSlot() ?usize {
