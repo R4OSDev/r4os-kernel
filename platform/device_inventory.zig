@@ -476,8 +476,8 @@ fn statusFor(binding: Binding, class_code: u8, subclass: u8, vendor_id: u16, dev
 fn noteFor(class_code: u8, subclass: u8, prog_if: u8, vendor_id: u16, device_id: u16) []const u8 {
     if (class_code == 0x01 and subclass == 0x01 and preloadBlockCount(.ata) > 1) return "Legacy IDE/ATA source=preload; ATAPIO.R4D blockdevices registered";
     if (class_code == 0x01 and subclass == 0x01 and preloadBlockCount(.ata) > 0) return "Legacy IDE/ATA source=preload; ATAPIO.R4D blockdevice registered";
-    if (class_code == 0x01 and subclass == 0x06 and preloadBlockCount(.ahci) > 1) return "AHCI source=preload; AHCI.R4D storage boundary active; legacy rescue data path registered block devices";
-    if (class_code == 0x01 and subclass == 0x06 and preloadBlockCount(.ahci) > 0) return "AHCI source=preload; AHCI.R4D storage boundary active; legacy rescue data path registered block device";
+    if (class_code == 0x01 and subclass == 0x06 and preloadBlockCount(.ahci) > 1) return "AHCI source=preload; AHCI.R4D IDENTIFY-backed parallel block devices active";
+    if (class_code == 0x01 and subclass == 0x06 and preloadBlockCount(.ahci) > 0) return "AHCI source=preload; AHCI.R4D IDENTIFY-backed block device active";
     if (class_code == 0x01 and subclass == 0x06 and blockCount(.ahci) > 0) return "AHCI source=legacy-rescue; block device registered outside standard owner";
     if (class_code == 0x01 and subclass == 0x06) return "AHCI candidate; standard owner is AHCI.R4D preload";
     if (class_code == 0x01 and subclass == 0x08 and preloadBlockCount(.nvme) > 1) return "NVMe source=preload; NVME.R4D active namespaces registered as read/write block devices";
@@ -610,7 +610,7 @@ fn blockDeviceNote(d: *const block.Device, block_index: usize) []const u8 {
         if (d.removable) return "USB source=built-in; removable read-only blockdevice";
         return "USB source=built-in; blockdevice";
     }
-    if (d.bus == .ahci and d.source == .preload) return "AHCI source=preload; AHCI.R4D legacy rescue read/write blockdevice";
+    if (d.bus == .ahci and d.source == .preload) return "AHCI.R4D source=preload; IDENTIFY-backed parallel read/write blockdevice";
     if (d.bus == .ahci) return "AHCI source=built-in; port registered as read/write blockdevice";
     if (d.bus == .ata) return "Legacy IDE/ATA source=built-in; device registered as blockdevice";
     if (d.bus == .ram) return "RAM drive blockdevice";

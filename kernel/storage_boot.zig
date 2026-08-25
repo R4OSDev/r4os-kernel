@@ -141,29 +141,37 @@ fn probeAtapioPreload() void {
 }
 
 fn probeAhci(pcie_status: anytype) void {
-    if (pcie_status.ahci_count > 0) {
-        const slot = if (driver_registry.findByName("AHCI")) |existing| blk: {
-            const entry = driver_registry.get(existing) orelse break :blk driver_registry.beginLoad("AHCI", 2, 1);
-            if (entry.source == .preload and entry.state == .active) {
-                k.puts("[AHCI] preload R4D active; legacy rescue data path armed; owner=preload\r\n");
-                ahci.setPreloadOwner();
-                break :blk existing;
-            }
-            ahci.resetBuiltInOwner();
-            break :blk driver_registry.beginLoad("AHCI", 2, 1);
-        } else blk: {
-            ahci.resetBuiltInOwner();
-            break :blk driver_registry.beginLoad("AHCI", 2, 1);
-        };
-        if (ahci.probe()) {
-            markInitialized(slot);
-            if (ahci.blockDeviceCount() > 0) markActive(slot);
-        } else {
-            markFailed(slot);
-        }
-    } else {
+    if (pcie_status.ahci_count == 0) {
         ahci.resetBuiltInOwner();
         _ = ahci.probe();
+        return;
+    }
+
+    if (driver_registry.findByName("AHCI")) |existing| {
+        const entry = driver_registry.get(existing) orelse {
+            k.puts("[AHCI][WARN] canonical preload registry entry unavailable; no second controller owner\r\n");
+            return;
+        };
+        if (entry.source == .preload and entry.state == .active and hasPreloadStorageBackend(.ahci)) {
+            k.puts("[AHCI] canonical preload R4D active; owner=preload\r\n");
+            return;
+        }
+        if (entry.source == .preload and entry.state == .active) {
+            k.puts("[AHCI][WARN] canonical preload R4D active without blockdevice; no second controller owner\r\n");
+            return;
+        }
+        k.puts("[AHCI][WARN] canonical preload R4D failed or inactive; built-in depth-one rescue requested\r\n");
+    } else {
+        k.puts("[AHCI][WARN] canonical preload R4D missing; built-in depth-one rescue requested\r\n");
+    }
+
+    ahci.resetBuiltInOwner();
+    const slot = driver_registry.beginLoad("AHCI", 2, 1);
+    if (ahci.probe()) {
+        markInitialized(slot);
+        if (ahci.blockDeviceCount() > 0) markActive(slot);
+    } else {
+        markFailed(slot);
     }
 }
 
