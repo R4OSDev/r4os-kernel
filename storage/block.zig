@@ -482,7 +482,6 @@ fn registerLocked(device: Device) ?usize {
     if (device_count >= MAX_DEVICES) return null;
     if (findByNameLocked(device.name) != null) return null;
     if (device.queue_depth == 0 or @as(usize, device.queue_depth) > MAX_REQUEST_QUEUE_DEPTH) return null;
-    if (device.async_submit_fn != null and !runtimeWorkerIdentityAlive()) return null;
 
     var target_index: usize = 0;
     while (target_index < device_slot_count and devices[target_index].used) : (target_index += 1) {}
@@ -1170,10 +1169,15 @@ fn pumpDeviceQueue(device: *Device, mode: ExecutionMode) bool {
         }
         const request = beginNextRequest(device, mode) orelse break;
         did_work = true;
-        if (device.async_submit_fn) |submit| {
+        // Preload storage is registered and scanned before the scheduler and
+        // controller workers exist. A v2 backend therefore keeps its v1
+        // callbacks as the bounded boot fallback and switches to nonblocking
+        // submit only on the runtime worker. This permits one canonical
+        // descriptor to remain bootable and become parallel later.
+        if (useAsyncSubmission(mode, device.async_submit_fn != null)) if (device.async_submit_fn) |submit| {
             submitAsyncRequest(device, request, submit);
             continue;
-        }
+        };
         const result = executeRequest(device, request);
         finishRequest(device, request, result.ok, result.err);
     }
@@ -1287,7 +1291,7 @@ fn beginNextRequest(device: *Device, mode: ExecutionMode) ?RequestExecution {
     slot.state = .active;
     slot.start_tick = start_tick;
     slot.execution_mode = mode;
-    if (device.async_submit_fn != null) {
+    if (useAsyncSubmission(mode, device.async_submit_fn != null)) {
         slot.backend_handle = nextBackendHandle(device.slot_index, slot_index);
         if (!slot.completion_latch.activate(slot.backend_handle)) {
             slot.state = .queued;
@@ -1337,6 +1341,10 @@ fn beginNextRequest(device: *Device, mode: ExecutionMode) ?RequestExecution {
     }
     unlockDevice(device, locked);
     return request;
+}
+
+fn useAsyncSubmission(mode: ExecutionMode, has_submit: bool) bool {
+    return has_submit and mode == .runtime_worker;
 }
 
 fn executionFromSlot(slot_index: usize, slot: RequestSlot) RequestExecution {
@@ -2619,4 +2627,10 @@ fn strEqIgnoreCase(a: []const u8, b: []const u8) bool {
         if (ca != cb) return false;
     }
     return true;
+}
+
+test "preload v2 storage uses synchronous boot fallback before async runtime" {
+    try std.testing.expect(!useAsyncSubmission(.boot_inline, true));
+    try std.testing.expect(useAsyncSubmission(.runtime_worker, true));
+    try std.testing.expect(!useAsyncSubmission(.runtime_worker, false));
 }

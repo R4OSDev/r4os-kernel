@@ -61,9 +61,12 @@ const MAX_R4D_STORAGE_NAME: usize = 32;
 const STORAGE_CALLBACK_OWNER_CAPACITY: usize = 8;
 const MAX_R4D_AUDIO_BACKENDS: usize = 4;
 const MAX_R4D_AUDIO_NAME: usize = 32;
-const MAX_R4D_DMA_ALLOCATIONS: usize = 32;
-const MAX_R4D_DMA_PINS: usize = 32;
-const MAX_R4D_DMA_MAPPINGS: usize = 32;
+// Eight block backends can each expose the block core's full asynchronous
+// depth. Segment mappings are therefore capacity-matched to 8 * 16 rather
+// than retaining the old single-controller diagnostic limit of 32.
+const MAX_R4D_DMA_ALLOCATIONS: usize = 128;
+const MAX_R4D_DMA_PINS: usize = 128;
+const MAX_R4D_DMA_MAPPINGS: usize = 128;
 const MAX_R4D_DMA_MAP_BYTES: u32 = 16 * 1024 * 1024;
 const MAX_MMIO_MAP_BYTES: u64 = 16 * 1024 * 1024;
 const MMIO_MAP_WRITE_COMBINING: u32 = 1 << 0;
@@ -1074,12 +1077,16 @@ fn dmaPhysicalPage(virt_page: u64) ?u64 {
 }
 
 fn freeDmaPinSlot() ?usize {
-    for (dma_pins, 0..) |pin, index| if (!pin.used) return index;
+    // Iterate the resident tables by reference. Iterating these fixed arrays
+    // by value asks Zig to materialize a complete snapshot in the caller's
+    // stack frame; with the v19 mapping capacity that can exceed a runtime
+    // worker stack before the first DMA mapping is even inspected.
+    for (&dma_pins, 0..) |*pin, index| if (!pin.used) return index;
     return null;
 }
 
 fn freeDmaMappingSlot() ?usize {
-    for (dma_mappings, 0..) |mapping, index| if (!mapping.used) return index;
+    for (&dma_mappings, 0..) |*mapping, index| if (!mapping.used) return index;
     return null;
 }
 
@@ -2104,6 +2111,9 @@ fn commitStorageOwnerCleanup(plan: *StorageCleanupPlan) StorageCleanupResult {
                 const magnitude: u64 = @intCast(if (signed_result < 0) -signed_result else signed_result);
                 bootlog.putDec(magnitude);
                 bootlog.puts("\r\n");
+                _ = storage.cancelUnregister(&entry.token);
+                result.remaining +|= 1;
+                continue;
             }
         }
         if (!storage.commitUnregister(&entry.token)) {
@@ -2157,7 +2167,7 @@ fn cleanupNetOwner(owner: u32) NetOwnerCleanupResult {
 }
 
 fn ownerHasNetBackend(owner: u32) bool {
-    for (r4d_net_backends) |backend| {
+    for (&r4d_net_backends) |*backend| {
         if (backend.used and backend.owner == owner) return true;
     }
     return false;
