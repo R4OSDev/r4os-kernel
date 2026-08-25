@@ -1,7 +1,8 @@
 // Pure retry policy for USB Mass Storage BOT commands.
 //
 // BOT/xHCI recovery repairs the transport, but it does not replay the SCSI
-// command that failed. READ10, a sector-exact WRITE10, and SYNCHRONIZE CACHE
+// command that failed. READ(10/16), a sector-exact WRITE(10/16), and
+// SYNCHRONIZE CACHE
 // are safe to repeat once after a fully successful recovery. Command/protocol
 // failures and incomplete recoveries must never be retried as transport
 // failures.

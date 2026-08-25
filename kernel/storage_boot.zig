@@ -16,6 +16,7 @@ const mbr = @import("../storage/mbr.zig");
 const memory_boot = @import("memory_boot.zig");
 const usb_msc = @import("../driver/usb/msc.zig");
 const xhci = @import("../driver/usb/xhci.zig");
+const usb_host = @import("../driver/usb/host_controller.zig");
 const k = @import("log.zig");
 
 var foundation_initialized = false;
@@ -83,23 +84,24 @@ pub fn mbrSuccesses() usize {
 }
 
 fn probeXhci(pcie_status: anytype) void {
-    if (pcie_status.xhci_count > 0) {
-        const slot = if (driver_registry.findByName("XHCI")) |existing| blk: {
-            const entry = driver_registry.get(existing) orelse break :blk driver_registry.beginLoad("XHCI", 255, 1);
-            if (entry.source == .preload and entry.state == .active) {
-                k.puts("[XHCI] preload R4D active; legacy rescue data path armed; owner=preload\r\n");
-                break :blk null;
-            }
-            break :blk driver_registry.beginLoad("XHCI", 255, 1);
-        } else driver_registry.beginLoad("XHCI", 255, 1);
-        if (xhci.probe()) {
-            markInitialized(slot);
-            markActive(slot);
-        } else {
-            markFailed(slot);
-        }
+    if (usb_host.findByName("XHCI")) |host_index| {
+        const host = usb_host.at(host_index) orelse return;
+        k.puts("[XHCI] canonical host already initialized source=");
+        k.puts(usb_host.sourceLabel(host.source));
+        k.puts("; no second controller owner\r\n");
+        return;
+    }
+
+    const slot = if (pcie_status.xhci_count > 0)
+        driver_registry.beginLoad("XHCI", 255, 2)
+    else
+        null;
+    k.puts("[XHCI][WARN] activation R4D missing; starting sole built-in rescue owner\r\n");
+    if (xhci.probe()) {
+        markInitialized(slot);
+        markActive(slot);
     } else {
-        _ = xhci.probe();
+        markFailed(slot);
     }
 }
 

@@ -4,7 +4,10 @@ pub const TRANSFER_EVENT_TYPE: u8 = 32;
 pub const COMMAND_COMPLETION_EVENT_TYPE: u8 = 33;
 pub const PORT_STATUS_CHANGE_EVENT_TYPE: u8 = 34;
 pub const EVENT_DATA_BIT: u32 = 1 << 2;
-pub const MAX_TRANSFER_TRB_POINTERS: usize = 3;
+// One endpoint TD may span the complete 64-KiB controller bounce area. Keep
+// every Normal-TRB pointer so an error on an early segment still resolves to
+// the exact transfer owner, including a producer-ring wrap.
+pub const MAX_TRANSFER_TRB_POINTERS: usize = 32;
 
 const TRB_POINTER_MASK: u64 = ~@as(u64, 0x0f);
 
@@ -283,10 +286,12 @@ pub const Mailbox = struct {
 };
 
 pub fn transferMatch(slot_id: u8, endpoint_id: u8, trb_phys: u64) Match {
+    var pointers: [MAX_TRANSFER_TRB_POINTERS]u64 = .{0} ** MAX_TRANSFER_TRB_POINTERS;
+    pointers[0] = normalizeTrbPointer(trb_phys);
     return .{ .transfer = .{
         .slot_id = slot_id,
         .endpoint_id = endpoint_id,
-        .trb_phys = .{ normalizeTrbPointer(trb_phys), 0, 0 },
+        .trb_phys = pointers,
         .trb_count = 1,
     } };
 }
@@ -493,7 +498,11 @@ test "control TD matches setup data and status pointers only" {
     // Setup liegt am Ringende, Data und Status nach dem Link-TRB wieder am
     // Ringanfang. Die Match-Menge darf daher keine zusammenhaengende Range
     // annehmen.
-    const expected = transferTdMatch(6, 1, .{ 0x4fe0, 0x4000, 0x4010 }, 3);
+    var pointers: [MAX_TRANSFER_TRB_POINTERS]u64 = .{0} ** MAX_TRANSFER_TRB_POINTERS;
+    pointers[0] = 0x4fe0;
+    pointers[1] = 0x4000;
+    pointers[2] = 0x4010;
+    const expected = transferTdMatch(6, 1, pointers, 3);
 
     const setup_error = Event{
         .event_type = TRANSFER_EVENT_TYPE,
@@ -529,6 +538,37 @@ test "control TD matches setup data and status pointers only" {
     try testing.expect(matches(status_error, expected));
     try testing.expect(!matches(foreign, expected));
     try testing.expect(!matches(setup_error, transferMatch(6, 1, 0x4010)));
+}
+
+test "large bulk TD matches every segment on both sides of ring wrap" {
+    const testing = @import("std").testing;
+    var pointers: [MAX_TRANSFER_TRB_POINTERS]u64 = .{0} ** MAX_TRANSFER_TRB_POINTERS;
+    var index: usize = 0;
+    while (index < 16) : (index += 1) {
+        const ring_index = (252 + index) % 255;
+        pointers[index] = 0x8000 + @as(u64, ring_index) * 16;
+    }
+    const expected = transferTdMatch(9, 5, pointers, 16);
+    try testing.expect(matches(.{
+        .event_type = TRANSFER_EVENT_TYPE,
+        .code = 4,
+        .slot_id = 9,
+        .endpoint_id = 5,
+        .parameter = pointers[0] + 15,
+    }, expected));
+    try testing.expect(matches(.{
+        .event_type = TRANSFER_EVENT_TYPE,
+        .code = 1,
+        .slot_id = 9,
+        .endpoint_id = 5,
+        .parameter = pointers[15],
+    }, expected));
+    try testing.expect(!matches(.{
+        .event_type = TRANSFER_EVENT_TYPE,
+        .slot_id = 9,
+        .endpoint_id = 5,
+        .parameter = 0x8ff0,
+    }, expected));
 }
 
 test "overflow never overwrites a queued completion" {

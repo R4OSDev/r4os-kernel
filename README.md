@@ -55,6 +55,15 @@ nonblocking submit and exact completion while retaining the version-1
 synchronous depth-one adapter. The canonical lifetime rules are in the
 Contract repository's `ABI/R4DDriver.txt`.
 
+DriverApi v21 makes XHCI.R4D the activation owner of one kernel-resident xHCI
+backend instead of a second hardware implementation. UsbHostController v2
+dispatches port, control, bulk, interrupt, recovery and poll operations and
+reports capabilities and activity. Endpoint-bound generation handles allow a
+pending HID transfer and storage transfer to coexist; the event ring wakes by
+INTx when routed and retains bounded polling as fallback. Bulk TDs span up to
+64 KiB in page-bounded TRBs, including a chained ring wrap. Failed controller
+halt vetoes unload.
+
 Once the shell task has been admitted, the one-shot kernel boot task exits and
 is reaped. The shell's first `boot_ready` call independently freezes the boot
 measurement and retires the boot renderer without repainting the ready shell

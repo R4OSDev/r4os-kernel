@@ -489,6 +489,10 @@ pub const USB_SCSI_OP_BUILD_SYNC_CACHE10: u32 = 8;
 pub const USB_SCSI_OP_PARSE_SENSE: u32 = 9;
 pub const USB_SCSI_OP_PARSE_CAPACITY10: u32 = 10;
 pub const USB_SCSI_OP_PARSE_MODE_SENSE6: u32 = 11;
+pub const USB_SCSI_OP_BUILD_READ_CAPACITY16: u32 = 13;
+pub const USB_SCSI_OP_BUILD_READ16: u32 = 14;
+pub const USB_SCSI_OP_BUILD_WRITE16: u32 = 15;
+pub const USB_SCSI_OP_PARSE_CAPACITY16: u32 = 16;
 
 pub const USB_SCSI_RESULT_OK: i32 = 0;
 pub const USB_SCSI_RESULT_BAD_PARAM: i32 = -1;
@@ -518,6 +522,11 @@ pub const UsbScsiBlockOp = extern struct {
     reserved: [2]u8 = .{0} ** 2,
     cdb: [USB_SCSI_MAX_CDB]u8 = .{0} ** USB_SCSI_MAX_CDB,
     data: [USB_SCSI_MAX_DATA]u8 = .{0} ** USB_SCSI_MAX_DATA,
+    lba64: u64 = 0,
+    block_count: u32 = 0,
+    logical_block_size: u32 = 0,
+    capacity_format: u8 = 0,
+    reserved2: [7]u8 = .{0} ** 7,
 };
 
 pub const AUDIO_MIDI_OP_CLASSIFY_EVENT: u32 = 1;

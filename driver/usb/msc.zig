@@ -5,13 +5,14 @@ const protocol_api = @import("../../kernel/protocol_api.zig");
 const r4p = @import("../../program/r4p.zig");
 const r4p_contract = @import("../../net/r4p_contract.zig");
 const usb_core = @import("core.zig");
+const usb_host = @import("host_controller.zig");
 const retry_policy = @import("usb_msc_retry.zig");
 const xhci = @import("xhci.zig");
 const usb_timing = @import("usb_boot_timing.zig");
 const usb_wait = @import("usb_boot_wait.zig");
 
-const SECTOR_SIZE: u32 = 512;
-const MAX_SECTORS_PER_REQUEST: u16 = 8;
+const LEGACY_SECTOR_SIZE: u32 = 512;
+const MAX_TRANSFER_BYTES: u32 = 64 * 1024;
 const CBW_LEN: usize = 31;
 const CSW_LEN: usize = 13;
 const DATA_BUF_LEN: usize = 4096;
@@ -46,6 +47,17 @@ pub const Status = struct {
     bulk_out_max_packet: u16 = 0,
     sector_count: u64 = 0,
     sector_size: u32 = 0,
+    max_sectors_per_request: u16 = 0,
+    capacity_format: u8 = 0,
+    capacity16_used: bool = false,
+    read10_commands: u64 = 0,
+    read16_commands: u64 = 0,
+    write10_commands: u64 = 0,
+    write16_commands: u64 = 0,
+    transport: []const u8 = "BOT",
+    lun: u8 = 0,
+    max_lun: u8 = 0,
+    uas_supported: bool = false,
     inquiry_ok: bool = false,
     inquiry_retries: u64 = 0,
     inquiry_wait_elapsed_ns: u64 = 0,
@@ -195,10 +207,11 @@ pub fn init() bool {
             return false;
         }
         current.mode_sense_ok = scsiModeSense6();
-        if (current.sector_size != SECTOR_SIZE) {
-            current.reason = "unsupported sector size";
+        if (!validLogicalBlockSize(current.sector_size)) {
+            current.reason = "unsupported logical block size";
             return false;
         }
+        current.max_sectors_per_request = maxSectorsForBlockSize(current.sector_size);
         registerBlockDevice();
         current.reason = if (current.block_registered) "USB mass storage block device active" else "block register failed";
         return current.block_registered;
@@ -268,6 +281,21 @@ pub fn reselectActiveDevice() bool {
     return ensureSelected();
 }
 
+fn validLogicalBlockSize(bytes: u32) bool {
+    return bytes >= 512 and bytes <= MAX_TRANSFER_BYTES and (bytes & (bytes - 1)) == 0;
+}
+
+fn maxSectorsForBlockSize(bytes: u32) u16 {
+    if (!validLogicalBlockSize(bytes)) return 0;
+    return @intCast(@min(MAX_TRANSFER_BYTES / bytes, 0xFFFF));
+}
+
+fn usesReadWrite16(lba: u64, sectors: u16) bool {
+    if (lba > 0xFFFF_FFFF) return true;
+    if (sectors == 0) return false;
+    return @as(u64, sectors - 1) > 0xFFFF_FFFF - lba;
+}
+
 fn registerBlockDevice() void {
     const index = block.register(.{
         .name = "usb0",
@@ -275,9 +303,9 @@ fn registerBlockDevice() void {
         .bus = .usb,
         .controller = "xhci",
         .port = current.port,
-        .sector_size = SECTOR_SIZE,
+        .sector_size = current.sector_size,
         .sector_count = current.sector_count,
-        .max_sectors_per_request = MAX_SECTORS_PER_REQUEST,
+        .max_sectors_per_request = current.max_sectors_per_request,
         .queue_depth = 1,
         .removable = true,
         .writable = !current.write_protected,
@@ -299,15 +327,11 @@ fn readBlock(_: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
         return false;
     }
     defer xhci.releaseControllerOwnership();
-    if (sectors == 0 or sectors > MAX_SECTORS_PER_REQUEST) {
+    if (sectors == 0 or sectors > current.max_sectors_per_request) {
         current.read_failures += 1;
         return false;
     }
-    if (out.len < @as(usize, sectors) * SECTOR_SIZE) {
-        current.read_failures += 1;
-        return false;
-    }
-    if (lba > 0xFFFF_FFFF) {
+    if (out.len < @as(usize, sectors) * current.sector_size) {
         current.read_failures += 1;
         return false;
     }
@@ -315,8 +339,8 @@ fn readBlock(_: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
         current.read_failures += 1;
         return false;
     }
-    const len = @as(usize, sectors) * SECTOR_SIZE;
-    if (!scsiRead10(@intCast(lba), sectors, out[0..len])) {
+    const len = @as(usize, sectors) * current.sector_size;
+    if (!scsiRead(lba, sectors, out[0..len])) {
         // A completed BOT reset plus xHCI endpoint recovery restores the
         // transport, but the failed READ itself has not happened again.
         // Retry that idempotent read exactly once.  This is especially
@@ -328,15 +352,15 @@ fn readBlock(_: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
             0,
         )) {
             current.read_transport_retries += 1;
-            retryDelay("usbmsc-read-retry", 0x28, 1);
-            if (ensureSelected() and scsiRead10(@intCast(lba), sectors, out[0..len])) {
+            retryDelay("usbmsc-read-retry", if (usesReadWrite16(lba, sectors)) 0x88 else 0x28, 1);
+            if (ensureSelected() and scsiRead(lba, sectors, out[0..len])) {
                 current.read_transport_retry_successes += 1;
                 current.reads += 1;
                 // command() has already resolved the generation-bound direct
                 // diagnostic incident after receiving a valid CSW.  Logging
                 // this success through diag_screen would create a new,
                 // non-resolvable blue incident after recovery.
-                k.puts("[USBMSC] READ10 transport retry recovered\n");
+                k.puts("[USBMSC] READ transport retry recovered\n");
                 return true;
             }
         }
@@ -354,15 +378,11 @@ fn writeBlock(_: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
         return false;
     }
     defer xhci.releaseControllerOwnership();
-    if (sectors == 0 or sectors > MAX_SECTORS_PER_REQUEST) {
+    if (sectors == 0 or sectors > current.max_sectors_per_request) {
         current.write_failures += 1;
         return false;
     }
-    if (data.len < @as(usize, sectors) * SECTOR_SIZE) {
-        current.write_failures += 1;
-        return false;
-    }
-    if (lba > 0xFFFF_FFFF) {
+    if (data.len < @as(usize, sectors) * current.sector_size) {
         current.write_failures += 1;
         return false;
     }
@@ -370,8 +390,8 @@ fn writeBlock(_: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
         current.write_failures += 1;
         return false;
     }
-    const len = @as(usize, sectors) * SECTOR_SIZE;
-    if (!scsiWrite10(@intCast(lba), sectors, data[0..len])) {
+    const len = @as(usize, sectors) * current.sector_size;
+    if (!scsiWrite(lba, sectors, data[0..len])) {
         // Reissuing the exact same sector range with the same bytes is
         // idempotent even if the original CSW was lost after the device had
         // accepted some or all data. Recovery only repairs BOT/xHCI; replay
@@ -382,11 +402,11 @@ fn writeBlock(_: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
             0,
         )) {
             current.write_transport_retries += 1;
-            retryDelay("usbmsc-write-retry", 0x2A, 1);
-            if (ensureSelected() and scsiWrite10(@intCast(lba), sectors, data[0..len])) {
+            retryDelay("usbmsc-write-retry", if (usesReadWrite16(lba, sectors)) 0x8A else 0x2A, 1);
+            if (ensureSelected() and scsiWrite(lba, sectors, data[0..len])) {
                 current.write_transport_retry_successes += 1;
                 current.writes += 1;
-                k.puts("[USBMSC] WRITE10 transport retry recovered\n");
+                k.puts("[USBMSC] WRITE transport retry recovered\n");
                 return true;
             }
         }
@@ -604,6 +624,24 @@ fn scsiReadCapacity10() bool {
     return true;
 }
 
+fn scsiReadCapacity16() bool {
+    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_READ_CAPACITY16, 0, 0) orelse return failCommand();
+    if (!command(cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, data_buf[0..cmd.transfer_len])) return false;
+    const actual: usize = @intCast(current.last_data_actual_len);
+    if (!parseScsiCapacity16(data_buf[0..actual])) {
+        setDataLengthReason("capacity16-short-or-invalid", current.last_data_actual_len);
+        return failCommand();
+    }
+    current.capacity16_used = true;
+    return true;
+}
+
+fn scsiReadCapacity() bool {
+    if (!scsiReadCapacity10()) return false;
+    if (current.sector_count != 0) return true;
+    return scsiReadCapacity16();
+}
+
 fn scsiReadCapacityWithRetry() bool {
     var budget = usb_wait.Deadline.begin(usb_timing.SCSI_CAPACITY_BUDGET_MS);
     defer {
@@ -612,7 +650,7 @@ fn scsiReadCapacityWithRetry() bool {
     }
     var attempt: u8 = 0;
     while (attempt < usb_timing.SCSI_CAPACITY_ATTEMPTS) : (attempt += 1) {
-        if (scsiReadCapacity10()) return true;
+        if (scsiReadCapacity()) return true;
         if (attempt + 1 >= usb_timing.SCSI_CAPACITY_ATTEMPTS) break;
         if (budget.expiredAny()) {
             current.retry_budget_timeouts += 1;
@@ -678,13 +716,19 @@ fn scsiModeSense6() bool {
     return true;
 }
 
-fn scsiRead10(lba: u32, sectors: u16, out: []u8) bool {
-    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_READ10, lba, sectors) orelse return failCommand();
+fn scsiRead(lba: u64, sectors: u16, out: []u8) bool {
+    const use16 = usesReadWrite16(lba, sectors);
+    const opcode = if (use16) r4p_contract.USB_SCSI_OP_BUILD_READ16 else r4p_contract.USB_SCSI_OP_BUILD_READ10;
+    const cmd = buildScsiCommand(opcode, lba, sectors) orelse return failCommand();
+    if (use16) current.read16_commands +%= 1 else current.read10_commands +%= 1;
     return command(cmd.cdb[0..cmd.len], cmd.direction, @intCast(out.len), out);
 }
 
-fn scsiWrite10(lba: u32, sectors: u16, data: []const u8) bool {
-    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_WRITE10, lba, sectors) orelse return failCommand();
+fn scsiWrite(lba: u64, sectors: u16, data: []const u8) bool {
+    const use16 = usesReadWrite16(lba, sectors);
+    const opcode = if (use16) r4p_contract.USB_SCSI_OP_BUILD_WRITE16 else r4p_contract.USB_SCSI_OP_BUILD_WRITE10;
+    const cmd = buildScsiCommand(opcode, lba, sectors) orelse return failCommand();
+    if (use16) current.write16_commands +%= 1 else current.write10_commands +%= 1;
     return command(cmd.cdb[0..cmd.len], cmd.direction, @intCast(data.len), @constCast(data));
 }
 
@@ -693,15 +737,18 @@ fn scsiSynchronizeCache10() bool {
     return command(cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, data_buf[0..cmd.transfer_len]);
 }
 
-fn buildScsiCommand(opcode: u32, lba: u32, sectors: u16) ?ScsiCommand {
+fn buildScsiCommand(opcode: u32, lba: u64, sectors: u16) ?ScsiCommand {
     return buildScsiCommandR4p(opcode, lba, sectors);
 }
 
-fn buildScsiCommandR4p(opcode: u32, lba: u32, sectors: u16) ?ScsiCommand {
+fn buildScsiCommandR4p(opcode: u32, lba: u64, sectors: u16) ?ScsiCommand {
     if (!r4p.hasActiveR4p("usb.scsi_block")) return null;
     var op: r4p_contract.UsbScsiBlockOp = .{
-        .lba = lba,
+        .lba = @truncate(lba),
+        .lba64 = lba,
         .sectors = sectors,
+        .block_count = sectors,
+        .logical_block_size = if (current.sector_size == 0) LEGACY_SECTOR_SIZE else current.sector_size,
     };
     if (!dispatchScsi(opcode, &op)) return null;
     if (op.result != r4p_contract.USB_SCSI_RESULT_OK or op.cdb_len == 0 or op.cdb_len > 16) return null;
@@ -755,6 +802,19 @@ fn parseScsiCapacityR4p(data: []const u8) bool {
     if (!dispatchScsi(r4p_contract.USB_SCSI_OP_PARSE_CAPACITY10, &op) or op.result != r4p_contract.USB_SCSI_RESULT_OK) return false;
     current.sector_count = op.sector_count;
     current.sector_size = op.sector_size;
+    current.capacity_format = op.capacity_format;
+    scsi_r4p_parse +%= 1;
+    return true;
+}
+
+fn parseScsiCapacity16(data: []const u8) bool {
+    if (!r4p.hasActiveR4p("usb.scsi_block") or data.len > r4p_contract.USB_SCSI_MAX_DATA) return false;
+    var op: r4p_contract.UsbScsiBlockOp = .{ .allocation_len = @intCast(data.len) };
+    @memcpy(op.data[0..data.len], data);
+    if (!dispatchScsi(r4p_contract.USB_SCSI_OP_PARSE_CAPACITY16, &op) or op.result != r4p_contract.USB_SCSI_RESULT_OK) return false;
+    current.sector_count = op.sector_count;
+    current.sector_size = op.sector_size;
+    current.capacity_format = op.capacity_format;
     scsi_r4p_parse +%= 1;
     return true;
 }
@@ -827,18 +887,16 @@ fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u
         return failCommand();
     }
 
-    if (!xhci.bulkOutForHandle(&current.bulk_out_handle, cbw[0..])) return failTransportAt("cbw-out");
+    _ = hostBulkOut(&current.bulk_out_handle, cbw[0..]) orelse return failTransportAt("cbw-out");
     var data_actual_len: u32 = 0;
     if (transfer_len != 0) {
         const data = buffer[0..@intCast(transfer_len)];
         switch (direction) {
             .in => {
-                if (!xhci.bulkInForHandle(&current.bulk_in_handle, data)) return failTransportAt("data-in");
-                data_actual_len = xhci.status().last_bulk_actual_len;
+                data_actual_len = hostBulkIn(&current.bulk_in_handle, data) orelse return failTransportAt("data-in");
             },
             .out => {
-                if (!xhci.bulkOutForHandle(&current.bulk_out_handle, data)) return failTransportAt("data-out");
-                data_actual_len = xhci.status().last_bulk_actual_len;
+                data_actual_len = hostBulkOut(&current.bulk_out_handle, data) orelse return failTransportAt("data-out");
             },
             .none => {
                 current.reason = "SCSI data direction missing";
@@ -848,9 +906,8 @@ fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u
         current.last_data_actual_len = data_actual_len;
     }
     var csw: [CSW_LEN]u8 = .{0} ** CSW_LEN;
-    if (!xhci.bulkInForHandle(&current.bulk_in_handle, csw[0..])) return failTransportAt("csw-in");
-    const csw_transfer = xhci.status();
-    if (csw_transfer.last_bulk_actual_len != CSW_LEN) return failTransportAt("csw-short");
+    const csw_actual = hostBulkIn(&current.bulk_in_handle, csw[0..]) orelse return failTransportAt("csw-in");
+    if (csw_actual != CSW_LEN) return failTransportAt("csw-short");
     const csw_result = parseCsw(csw[0..], tag, transfer_len);
     current.commands += 1;
 
@@ -872,10 +929,11 @@ fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u
         }
     }
 
-    // READ(10)/WRITE(10) have a fixed block count.  A successful CSW with a
+    // READ/WRITE(10/16) have a fixed block count. A successful CSW with a
     // non-zero residue (or a short USB IN) is not a successful block I/O.
     if (csw_result == r4p_contract.USB_MSC_BOT_RESULT_OK and
-        (current.last_opcode == 0x28 or current.last_opcode == 0x2A) and
+        (current.last_opcode == 0x28 or current.last_opcode == 0x2A or
+            current.last_opcode == 0x88 or current.last_opcode == 0x8A) and
         (data_actual_len != transfer_len or current.last_csw_residue != 0))
     {
         current.short_data_errors += 1;
@@ -921,6 +979,18 @@ fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u
             return failTransport();
         },
     }
+}
+
+fn hostBulkIn(endpoint: *const xhci.EndpointHandle, buffer: []u8) ?u32 {
+    var host_endpoint = xhci.usbHostEndpointHandle(endpoint.*);
+    const result = usb_host.bulkTransfer(&host_endpoint, buffer, 1);
+    return if (result < 0) null else @intCast(result);
+}
+
+fn hostBulkOut(endpoint: *const xhci.EndpointHandle, buffer: []u8) ?u32 {
+    var host_endpoint = xhci.usbHostEndpointHandle(endpoint.*);
+    const result = usb_host.bulkTransfer(&host_endpoint, buffer, 2);
+    return if (result < 0) null else @intCast(result);
 }
 
 fn buildCbw(cdb: []const u8, direction: Direction, transfer_len: u32, tag: u32, out: []u8) ?void {
@@ -1053,6 +1123,9 @@ fn opcodeName(opcode: u8) []const u8 {
         0x28 => "READ10",
         0x2A => "WRITE10",
         0x35 => "SYNC-CACHE",
+        0x88 => "READ16",
+        0x8A => "WRITE16",
+        0x9E => "READ-CAPACITY16",
         else => "OP",
     };
 }

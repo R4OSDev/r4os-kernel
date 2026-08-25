@@ -8,6 +8,7 @@ const mouse = @import("../input/mouse.zig");
 const usb_core = @import("core.zig");
 const hid_report = @import("hid_report.zig");
 const xhci = @import("xhci.zig");
+const usb_host = @import("host_controller.zig");
 const k = @import("../../kernel/log.zig");
 const sched_task = @import("../../sched/task.zig");
 const scheduler = @import("../../sched/scheduler.zig");
@@ -657,18 +658,23 @@ fn pollBinding(binding: *HidBinding, kind: HidKind) bool {
     var report: [REPORT_BUFFER_LEN]u8 = .{0} ** REPORT_BUFFER_LEN;
     const report_len = reportTransferLength(binding);
     binding.polls += 1;
-    switch (xhci.pollInterruptInReportStatus(&binding.endpoint, report[0..report_len])) {
-        .no_report => {
+    var host_endpoint = xhci.usbHostEndpointHandle(binding.endpoint);
+    var actual_len: u32 = 0;
+    switch (usb_host.interruptTransfer(&host_endpoint, report[0..report_len], &actual_len)) {
+        0 => {
             binding.no_reports += 1;
             return false;
         },
-        .failed => {
+        1 => {},
+        else => {
             binding.failures += 1;
             return false;
         },
-        .report => {},
     }
-    const actual_report_len = actualReportLength(report_len);
+    const actual_report_len = if (actual_len == 0 or actual_len > report_len)
+        actualReportLength(report_len)
+    else
+        @as(usize, @intCast(actual_len));
     binding.last_report_request_len = clippedU8(xhci.lastInterruptRequestedLength());
     binding.last_report_residue = xhci.lastInterruptResidue();
     binding.reports += 1;

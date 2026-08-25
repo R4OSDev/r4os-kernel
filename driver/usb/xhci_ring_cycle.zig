@@ -5,6 +5,19 @@ pub const Advance = struct {
     wrapped: bool,
 };
 
+const trb_cycle: u32 = 1 << 0;
+const trb_chain: u32 = 1 << 4;
+
+// Publishes the two producer-owned Link-TRB bits together. A transfer TD
+// which wraps from the last usable ring entry to entry zero must carry CH
+// across the Link TRB; otherwise the xHC terminates the TD at the wrap.
+pub fn publishedLinkControl(control: u32, cycle: u8, continues_td: bool) u32 {
+    var out = control & ~(trb_cycle | trb_chain);
+    if ((cycle & 1) != 0) out |= trb_cycle;
+    if (continues_td) out |= trb_chain;
+    return out;
+}
+
 // Plant die Producer-Transition nach genau einem geschriebenen normalen TRB.
 // Bei einem Wrap muss der Link-TRB noch mit dem alten PCS an den Consumer
 // uebergeben werden. Erst danach wechselt der Producer auf das PCS des neuen
@@ -115,6 +128,19 @@ test "800 submissions cross three complete ring wraps" {
     try testing.expectEqual(@as(u16, 35), enqueue);
     try testing.expectEqual(@as(u8, 0), producer_cycle);
     try testing.expectEqual(@as(u8, 1), link_cycle);
+}
+
+test "link publication preserves a TD across wrap and clears stale chain" {
+    const testing = @import("std").testing;
+    const base: u32 = (6 << 10) | (1 << 1) | trb_cycle;
+    const continued = publishedLinkControl(base, 1, true);
+    try testing.expect((continued & trb_cycle) != 0);
+    try testing.expect((continued & trb_chain) != 0);
+
+    const terminal = publishedLinkControl(continued, 0, false);
+    try testing.expect((terminal & trb_cycle) == 0);
+    try testing.expect((terminal & trb_chain) == 0);
+    try testing.expectEqual(base & ~(trb_cycle | trb_chain), terminal);
 }
 
 test "ring-cycle self test" {

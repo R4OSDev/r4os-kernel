@@ -59,6 +59,28 @@ serialisiert alle Audiogeraete; sein Schedulerboost wird nach vier Ticks oder
 Dispatches zurueckgestuft. Performance-Snapshot v2 trennt Queuezeit,
 Deadline-Miss, Budgetueberzug und Admission-Rejection global und je Owner.
 
+Kanonischer ereignisgetriebener USB-Pfad seit 0.69.43
+------------------------------------------------------
+
+DriverApi v21 macht XHCI.R4D zum Aktivierungs- und Registrybesitzer genau
+eines kernelresidenten xHCI-Pfads. Das Modul besitzt keine zweite PCI-, MMIO-
+oder DMA-Domaene; nur bei fehlender R4D-Aktivierung darf ein einzelner
+eingebauter Fallback starten. UsbHostController v2 dispatcht Portscan,
+Adressierung, Konfiguration, Control, Bulk, Interrupt, Reset, Clear-Halt und
+Poll/Completion tatsaechlich und weist Capability-, Aktivitaets-, IRQ-, Poll-
+und Completionstatus aus.
+
+Bis zu 32 generationsgepruefte Transferobjekte gehoeren jeweils Slot,
+Endpoint und der exakten TRB-Menge. Ein wartender HID-Interrupttransfer kann
+daher parallel zu einem synchronen Storage-TD bestehen. Der gemeinsame
+Eventring wird nach Schedulerstart per INTx geweckt und in begrenzten Batches
+geleert; fehlendes oder unbrauchbares Routing behaelt den 10-ms-Pollfallback.
+Bulk-TDs verwenden bis zu 16 seitenbegrenzte TRBs fuer 64 KiB. Beim Ringwrap
+traegt auch der Link-TRB das Chain-Bit, und Fehler auf jedem Segment werden
+dem exakten Transfer zugeordnet. Timeout, Stall/Clear-Halt, Reset, Hotplug und
+Unload beseitigen nur die zugehoerigen Generationen. Ein nicht haltbarer
+Controller vetoisiert den Unload und behaelt seine Ressourcen.
+
 Grenze
 ------
 

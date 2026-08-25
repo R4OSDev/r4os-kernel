@@ -21,11 +21,13 @@ const sync = @import("../sched/sync.zig");
 const storage = @import("../storage/block.zig");
 const timer = @import("timer.zig");
 const usb_host = @import("../driver/usb/host_controller.zig");
+const xhci = @import("../driver/usb/xhci.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 20 (0.69.42): append-only um deadline-isolierte Audiorefills mit
-// begrenztem Budget und stabilem Geraete-Serialisierungsschluessel erweitert.
-pub const VERSION: u32 = 20;
+// Version 21 (0.69.43): append-only um die ownergebundene Aktivierung eines
+// kernelresidenten USB-Hostbackends erweitert. Das R4D besitzt dabei keine
+// zweite PCI-/MMIO-/DMA-Domaene.
+pub const VERSION: u32 = 21;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -43,7 +45,7 @@ const STORAGE_BUS_NVME: u32 = 3;
 const STORAGE_BUS_USB: u32 = 4;
 const STORAGE_BUS_RAM: u32 = 5;
 const STORAGE_BUS_VIRTIO: u32 = 6;
-const USB_HOST_BACKEND_VERSION: u32 = 1;
+const USB_HOST_BACKEND_VERSION: u32 = usb_host.BACKEND_VERSION;
 const USB_HOST_SOURCE_BUILTIN: u32 = 0;
 const USB_HOST_SOURCE_PRELOAD: u32 = 1;
 const USB_HOST_SOURCE_DISK: u32 = 2;
@@ -519,7 +521,14 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     }
     finishOwnerNetMutation(token);
     const audio_count = cleanupAudioOwner(owner);
-    const usb_host_count = usb_host.cleanupOwner(owner);
+    const usb_host_cleanup = usb_host.cleanupOwner(owner);
+    if (usb_host_cleanup.failed) {
+        token.active = false;
+        bootlog.puts("[R4D] cleanup owner=");
+        bootlog.putDec(owner);
+        bootlog.puts(" usb-host-finalize=FAILED resources=quarantined\r\n");
+        return false;
+    }
     const msi_cleanup = cleanupMsiOwner(owner);
     if (msi_cleanup.failed) {
         token.active = false;
@@ -547,7 +556,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         msi_cleanup.removed == 0 and
         audio_count == 0 and
         storage_cleanup.removed == 0 and
-        usb_host_count == 0 and
+        usb_host_cleanup.removed == 0 and
         net_cleanup.removed == 0)
     {
         return true;
@@ -567,7 +576,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     bootlog.puts(" storage=");
     bootlog.putDec(storage_cleanup.removed);
     bootlog.puts(" usb-host=");
-    bootlog.putDec(usb_host_count);
+    bootlog.putDec(usb_host_cleanup.removed);
     bootlog.puts(" net=");
     bootlog.putDec(net_cleanup.removed);
     bootlog.puts("\r\n");
@@ -665,6 +674,9 @@ pub const Table = extern struct {
     dma_unpin_buffer: *const fn (*DmaPinnedBuffer) callconv(.c) i32,
     // 0.69.42 (Version 20, append-only): deadline-isolierte Audiorefills.
     driver_work_submit_request: *const fn (*const DriverWorkRequest, *u32) callconv(.c) i32,
+    // 0.69.43 (Version 21, append-only): ein R4D aktiviert genau ein
+    // kernelresidentes USB-Hostbackend und bleibt dessen Registry-Owner.
+    activate_usb_host_controller: *const fn ([*:0]const u8, u32) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -734,6 +746,7 @@ pub var table = Table{
     .dma_unmap = dmaUnmap,
     .dma_unpin_buffer = dmaUnpinBuffer,
     .driver_work_submit_request = driverWorkSubmitRequest,
+    .activate_usb_host_controller = activateUsbHostController,
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
@@ -1701,7 +1714,13 @@ fn registerUsbHostController(name: [*:0]const u8, descriptor: *const UsbHostCont
 }
 
 fn unregisterUsbHostController(name: [*:0]const u8) callconv(.c) i32 {
-    return if (usb_host.unregisterByName(zSlice(name))) 0 else -1;
+    return if (usb_host.unregisterByName(zSlice(name), activeOwner())) 0 else -1;
+}
+
+fn activateUsbHostController(name: [*:0]const u8, source: u32) callconv(.c) i32 {
+    if (!zEqSlice(name, "XHCI")) return -1;
+    if (source != USB_HOST_SOURCE_PRELOAD and source != USB_HOST_SOURCE_DISK) return -2;
+    return xhci.activate(activeOwner(), source);
 }
 
 fn registerInputBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
@@ -1912,6 +1931,32 @@ fn validUsbHostController(descriptor: *const UsbHostControllerDescriptor) bool {
     }
     if (descriptor.control_transfer == null) {
         bootlog.puts("[R4D][ERROR] usb host missing control_transfer\r\n");
+        return false;
+    }
+    const known_flags = usb_host.FLAG_PORT_SCAN | usb_host.FLAG_CONTROL |
+        usb_host.FLAG_BULK | usb_host.FLAG_INTERRUPT | usb_host.FLAG_EVENT_IRQ |
+        usb_host.FLAG_POLL_FALLBACK | usb_host.FLAG_MULTI_TRANSFER | usb_host.FLAG_HOTPLUG;
+    if ((descriptor.flags & ~known_flags) != 0) {
+        bootlog.puts("[R4D][ERROR] usb host unknown capability flags\r\n");
+        return false;
+    }
+    if ((descriptor.flags & usb_host.FLAG_PORT_SCAN) == 0 or
+        (descriptor.flags & usb_host.FLAG_CONTROL) == 0 or
+        (descriptor.flags & usb_host.FLAG_BULK) == 0 or
+        (descriptor.flags & usb_host.FLAG_INTERRUPT) == 0 or
+        (descriptor.flags & usb_host.FLAG_POLL_FALLBACK) == 0 or
+        descriptor.address_device == null or
+        descriptor.configure_device == null or
+        descriptor.bulk_transfer == null or
+        descriptor.interrupt_transfer == null or
+        descriptor.reset_port == null or
+        descriptor.clear_halt == null or
+        descriptor.reset_endpoint == null or
+        descriptor.poll == null or
+        descriptor.shutdown == null or
+        descriptor.status == null)
+    {
+        bootlog.puts("[R4D][ERROR] usb host v2 capability/callback mismatch\r\n");
         return false;
     }
     return true;

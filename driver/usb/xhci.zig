@@ -8,6 +8,7 @@ const sched_task = @import("../../sched/task.zig");
 const scheduler = @import("../../sched/scheduler.zig");
 const sync = @import("../../sched/sync.zig");
 const timer = @import("../../kernel/timer.zig");
+const irq_router = @import("../../kernel/irq_router.zig");
 const usb_core = @import("core.zig");
 const usb_host = @import("host_controller.zig");
 const event_router = @import("xhci_event_router.zig");
@@ -15,6 +16,8 @@ const ring_cycle = @import("xhci_ring_cycle.zig");
 const bulk_completion = @import("xhci_bulk_completion.zig");
 const endpoint_context = @import("xhci_endpoint_context.zig");
 const endpoint_recovery = @import("xhci_endpoint_recovery.zig");
+const transfer_pool = @import("xhci_transfer_pool.zig");
+const trb_chain = @import("xhci_trb_chain.zig");
 const usb_timing = @import("usb_boot_timing.zig");
 const usb_wait = @import("usb_boot_wait.zig");
 
@@ -31,6 +34,7 @@ const MAX_SCRATCHPADS: usize = 32;
 const COMMAND_WAIT_GUARD: u32 = 4_000_000_000;
 const CONTROLLER_OWNERSHIP_TIMEOUT_TICKS: u64 = 15 * @as(u64, timer.DEFAULT_HZ);
 const PORT_SERVICE_IDLE_TICKS: u64 = @max(1, (10 * @as(u64, timer.DEFAULT_HZ)) / 1000);
+const EVENT_IRQ_POLL_TICKS: u64 = @max(1, @as(u64, timer.DEFAULT_HZ) / 100);
 const TimeoutClock = enum { ticks, hpet, tsc, tsc_fallback, recovery_budget, cpu_guard };
 
 const COMMAND_TRB_COUNT: usize = 256;
@@ -100,6 +104,7 @@ const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
 
 const USBCMD_RUN: u32 = 1 << 0;
 const USBCMD_HCRST: u32 = 1 << 1;
+const USBCMD_INTE: u32 = 1 << 2;
 const USBSTS_HCH: u32 = 1 << 0;
 const USBSTS_EINT: u32 = 1 << 3;
 const USBSTS_PCD: u32 = 1 << 4;
@@ -123,6 +128,7 @@ const TRB_TYPE_STATUS_STAGE: u32 = 4;
 const TRB_TYPE_TRANSFER_EVENT: u32 = 32;
 const TRB_TYPE_COMMAND_COMPLETION_EVENT: u32 = 33;
 const TRB_LINK_TOGGLE_CYCLE: u32 = 1 << 1;
+const TRB_CHAIN: u32 = 1 << 4;
 const TRB_IOC: u32 = 1 << 5;
 const TRB_IDT: u32 = 1 << 6;
 const SETUP_TRT_IN_DATA: u32 = 3 << 16;
@@ -163,6 +169,8 @@ const INPUT_CONTEXT_BYTES: usize = @intCast(phys.FRAME_SIZE);
 const EP0_RING_BYTES: usize = @intCast(phys.FRAME_SIZE);
 const INTERRUPT_RING_BYTES: usize = @intCast(phys.FRAME_SIZE);
 const INTERRUPT_BUFFER_BYTES: usize = @intCast(phys.FRAME_SIZE);
+const BULK_BUFFER_BYTES: usize = trb_chain.MAX_TRANSFER_BYTES;
+const BULK_BUFFER_FRAMES: u16 = @intCast(BULK_BUFFER_BYTES / @as(usize, @intCast(phys.FRAME_SIZE)));
 const DESCRIPTOR_BYTES: usize = @intCast(phys.FRAME_SIZE);
 const TRANSFER_TRB_COUNT: usize = 256;
 const DEVICE_DESCRIPTOR_LEN: u16 = 18;
@@ -296,6 +304,7 @@ const DeviceRuntime = struct {
     bulk_in_ring_phys: u64 = 0,
     bulk_out_ring_phys: u64 = 0,
     bulk_buffer_phys: u64 = 0,
+    bulk_buffer_frames: u16 = 0,
     descriptor_phys: u64 = 0,
     device_virt: u64 = 0,
     input_virt: u64 = 0,
@@ -320,6 +329,7 @@ const DeviceRuntime = struct {
     interrupt_endpoint_faulted: bool = false,
     interrupt_pending: bool = false,
     interrupt_pending_trb_phys: u64 = 0,
+    interrupt_transfer_handle: u32 = 0,
     interrupt_pending_streak: u64 = 0,
     last_interrupt_ep_state: u8 = 0,
     last_interrupt_request_len: u32 = 0,
@@ -457,6 +467,17 @@ pub const Status = struct {
     event_tsc_timeouts: u64 = 0,
     event_recovery_budget_timeouts: u64 = 0,
     event_cpu_guard_timeouts: u64 = 0,
+    host_controller_id: u32 = 0,
+    owner_id: u32 = 0,
+    host_source: u32 = 0,
+    irq_line: u8 = 0xFF,
+    irq_pin: u8 = 0,
+    irq_registered: bool = false,
+    irq_mode: []const u8 = "poll",
+    irq_count: u64 = 0,
+    irq_handled: u64 = 0,
+    irq_wakeups: u64 = 0,
+    poll_fallbacks: u64 = 0,
     wait_calls: u64 = 0,
     wait_successes: u64 = 0,
     wait_timeouts: u64 = 0,
@@ -544,6 +565,7 @@ pub const Status = struct {
     bulk_in_ring_phys: u64 = 0,
     bulk_out_ring_phys: u64 = 0,
     bulk_buffer_phys: u64 = 0,
+    bulk_buffer_frames: u16 = 0,
     descriptor_phys: u64 = 0,
     ep0_enqueue: u16 = 0,
     ep0_cycle: u8 = 1,
@@ -560,6 +582,7 @@ pub const Status = struct {
     interrupt_endpoint_faulted: bool = false,
     interrupt_pending: bool = false,
     interrupt_pending_trb_phys: u64 = 0,
+    interrupt_transfer_handle: u32 = 0,
     interrupt_pending_index: u16 = 0,
     interrupt_hw_dequeue: u64 = 0,
     bulk_endpoints_configured: bool = false,
@@ -613,6 +636,13 @@ pub const Status = struct {
     transfer_events: u64 = 0,
     bulk_transfers: u64 = 0,
     bulk_failures: u64 = 0,
+    transfer_objects_active: u32 = 0,
+    transfer_objects_high_water: u32 = 0,
+    transfer_objects_submitted: u64 = 0,
+    transfer_objects_completed: u64 = 0,
+    transfer_objects_timed_out: u64 = 0,
+    transfer_objects_cancelled: u64 = 0,
+    transfer_objects_failed: u64 = 0,
     last_bulk_direction: []const u8 = "none",
     last_bulk_result: []const u8 = "none",
     last_bulk_request_len: u32 = 0,
@@ -703,17 +733,57 @@ var runtimes: [MAX_USB_DEVICES]DeviceRuntime = .{DeviceRuntime{}} ** MAX_USB_DEV
 var active_runtime_index: ?usize = null;
 var deferred_events = event_router.Mailbox.init();
 var pending_port_changes = event_router.PortChanges.init();
-var active_sync_transfer: ?event_router.Match = null;
-var last_timed_out_sync_transfer: ?event_router.Match = null;
+var transfer_objects = transfer_pool.Pool.init();
 var last_sync_transfer_incident: diag_screen.IncidentToken = .{};
 var active_command: ?event_router.Match = null;
 pub const TopologyHook = *const fn () callconv(.c) void;
 var topology_hook: ?TopologyHook = null;
 var port_task_started = false;
+var port_task_stop = false;
 var port_task_id: u32 = 0;
 var port_task_iterations: u64 = 0;
+var event_irq = sync.Event.initMode(false, .auto_reset);
+var irq_registered = false;
+var activated_owner_id: u32 = 0;
+
+var canonical_backend: usb_host.Descriptor = .{
+    .flags = usb_host.FLAG_PORT_SCAN |
+        usb_host.FLAG_CONTROL |
+        usb_host.FLAG_BULK |
+        usb_host.FLAG_INTERRUPT |
+        usb_host.FLAG_EVENT_IRQ |
+        usb_host.FLAG_POLL_FALLBACK |
+        usb_host.FLAG_MULTI_TRANSFER |
+        usb_host.FLAG_HOTPLUG,
+    .port_scan = hostPortScan,
+    .address_device = hostAddressDevice,
+    .configure_device = hostConfigureDevice,
+    .control_transfer = hostControlTransfer,
+    .bulk_transfer = hostBulkTransfer,
+    .interrupt_transfer = hostInterruptTransfer,
+    .reset_port = hostResetPort,
+    .clear_halt = hostClearHalt,
+    .reset_endpoint = hostResetEndpoint,
+    .poll = hostPoll,
+    .shutdown = hostShutdown,
+    .status = hostStatus,
+};
 
 pub fn probe() bool {
+    return probeOwned(0, 0);
+}
+
+// XHCI.R4D is an activation boundary only. The kernel-resident backend owns
+// the controller from this call through registry cleanup/unload, so no R4D
+// code maps BARs or allocates a second DMA domain.
+pub fn activate(owner_id: u32, source: u32) i32 {
+    if (usb_host.findByName("XHCI") != null) return -2;
+    _ = probeOwned(owner_id, source);
+    const index = usb_host.findByName("XHCI") orelse return -3;
+    return @intCast(index);
+}
+
+fn probeOwned(owner_id: u32, source: u32) bool {
     closeLastSyncTransferIncident();
     if (!teardownForReprobe()) {
         current.failures += 1;
@@ -742,12 +812,27 @@ pub fn probe() bool {
     active_runtime_index = null;
     deferred_events.reset();
     pending_port_changes.reset();
-    active_sync_transfer = null;
-    last_timed_out_sync_transfer = null;
+    transfer_objects.reset();
     last_sync_transfer_incident = .{};
     active_command = null;
+    event_irq = sync.Event.initMode(false, .auto_reset);
+    irq_registered = false;
+    activated_owner_id = owner_id;
+    port_task_stop = false;
     usb_core.reset();
-    _ = usb_host.registerBuiltIn("XHCI");
+    canonical_backend.source = source;
+    const host_index = if (source == 0)
+        usb_host.registerBuiltIn("XHCI", &canonical_backend)
+    else
+        usb_host.register("XHCI", &canonical_backend, owner_id);
+    const registered_index = host_index orelse {
+        current.reason = "xHCI host registry owner already exists";
+        return false;
+    };
+    current.host_controller_id = usb_host.controllerId(registered_index);
+    current.owner_id = owner_id;
+    current.host_source = source;
+    defer _ = usb_host.setState(registered_index, if (current.controller_running) .active else .failed);
     const ps = pcie.status();
     if (ps.xhci_count == 0) {
         current.reason = "no xHCI controller found";
@@ -758,6 +843,9 @@ pub fn probe() bool {
 
     current.present = true;
     current.device = ps.first_xhci;
+    const irq_route = pcie.readInterruptRoute(current.device);
+    current.irq_line = irq_route.line;
+    current.irq_pin = irq_route.pin;
     current.command_before = pcie.readCommand(current.device);
     current.bar0_raw = pcie.readBar(current.device, 0);
     current.bar1_raw = pcie.readBar(current.device, 1);
@@ -879,6 +967,15 @@ pub fn status() Status {
     result.port_task_started = port_task_started;
     result.port_task_id = port_task_id;
     result.port_task_iterations = port_task_iterations;
+    const transfers = transfer_objects.snapshot();
+    result.transfer_objects_active = transfers.active;
+    result.transfer_objects_high_water = transfers.high_water;
+    result.transfer_objects_submitted = transfers.submitted;
+    result.transfer_objects_completed = transfers.completed;
+    result.transfer_objects_timed_out = transfers.timed_out;
+    result.transfer_objects_cancelled = transfers.cancelled;
+    result.transfer_objects_failed = transfers.failed;
+    result.irq_registered = irq_registered;
     return result;
 }
 
@@ -893,6 +990,7 @@ pub fn setTopologyHook(hook: ?TopologyHook) void {
 pub fn startPortTask() bool {
     if (port_task_started) return true;
     if (!current.present or !current.controller_running or event_ring_virt == 0) return true;
+    _ = startEventIrq();
     const worker = sched_task.createKernelThreadWithRole("xhci-port", portTaskMain, .short_completion) orelse {
         k.puts("[XHCI] port-task create failed\r\n");
         return false;
@@ -906,11 +1004,18 @@ pub fn startPortTask() bool {
 }
 
 fn portTaskMain() callconv(.c) void {
-    while (true) {
+    while (!port_task_stop) {
+        if (irq_registered) {
+            if (event_irq.wait(PORT_SERVICE_IDLE_TICKS)) current.irq_wakeups +%= 1 else current.poll_fallbacks +%= 1;
+        } else {
+            scheduler.sleepTicksWithReason(PORT_SERVICE_IDLE_TICKS, "xhci-port-idle");
+            current.poll_fallbacks +%= 1;
+        }
         _ = servicePortChanges();
         port_task_iterations +%= 1;
-        scheduler.sleepTicksWithReason(PORT_SERVICE_IDLE_TICKS, "xhci-port-idle");
     }
+    port_task_started = false;
+    port_task_id = 0;
 }
 
 pub fn servicePortChanges() bool {
@@ -949,7 +1054,70 @@ fn servicePortChangesLocked() bool {
     }
     if (catalog_changed) current.port_catalog_changes +%= 1;
     if (pending_port_changes.snapshot().events != events_before or catalog_changed) emitPortServiceMarker();
+    rearmEventIrq();
     return catalog_changed;
+}
+
+fn startEventIrq() bool {
+    if (irq_registered) return true;
+    if (current.irq_line == 0xFF or current.irq_line == 0 or current.irq_line >= irq_router.MAX_IRQS) {
+        current.irq_mode = "poll-fallback";
+        return false;
+    }
+    const result = irq_router.register(
+        current.irq_line,
+        eventIrqHandler,
+        0,
+        irq_router.IRQ_FLAG_SHARED | irq_router.IRQ_FLAG_LEVEL_LOW,
+        activated_owner_id,
+    );
+    if (result != 0) {
+        current.irq_mode = "poll-fallback";
+        return false;
+    }
+    irq_registered = true;
+    current.irq_registered = true;
+    current.irq_mode = "intx-event";
+    writeOp32(OP_USBCMD, readOp32(OP_USBCMD) | USBCMD_INTE);
+    rearmEventIrq();
+    k.puts("[XHCI] event IRQ active line=");
+    k.putDec(current.irq_line);
+    k.puts(" with poll fallback\r\n");
+    return true;
+}
+
+fn stopEventIrq() void {
+    if (current.mapped and current.op_virt != 0 and current.runtime_virt != 0) {
+        writeRt32(RT_IR0_IMAN, 0);
+        writeOp32(OP_USBCMD, readOp32(OP_USBCMD) & ~USBCMD_INTE);
+    }
+    if (irq_registered) _ = irq_router.unregister(current.irq_line, eventIrqHandler, 0);
+    irq_registered = false;
+    current.irq_registered = false;
+    current.irq_mode = "poll";
+}
+
+fn rearmEventIrq() void {
+    if (!irq_registered or !current.controller_running) return;
+    writeRt32(RT_IR0_IMAN, IMAN_IE);
+    _ = readRt32(RT_IR0_IMAN);
+}
+
+fn eventIrqHandler(_: u8, _: usize) callconv(.c) u32 {
+    if (!irq_registered or !current.controller_running) return 0;
+    const status_value = readOp32(OP_USBSTS);
+    const iman = readRt32(RT_IR0_IMAN);
+    if ((status_value & (USBSTS_EINT | USBSTS_PCD)) == 0 and (iman & IMAN_IP) == 0) return 0;
+    current.irq_count +%= 1;
+    // Mask only the xHC interrupter until a task has drained and advanced
+    // ERDP. The shared line remains available to other devices.
+    writeRt32(RT_IR0_IMAN, (iman & ~IMAN_IE) | IMAN_IP);
+    if ((status_value & (USBSTS_EINT | USBSTS_PCD)) != 0) {
+        writeOp32(OP_USBSTS, status_value & (USBSTS_EINT | USBSTS_PCD));
+    }
+    current.irq_handled +%= 1;
+    event_irq.signal();
+    return irq_router.IRQ_RESULT_HANDLED;
 }
 
 fn emitPortServiceMarker() void {
@@ -984,6 +1152,215 @@ fn drainMaintenanceEventBatch() void {
         routeForeignEvent(event);
     }
     commitEventBatch(processed);
+}
+
+pub fn usbHostDeviceHandle(handle: DeviceHandle) usb_host.DeviceHandle {
+    return .{
+        .controller_id = current.host_controller_id,
+        .port = handle.port,
+        .slot_id = handle.slot_id,
+        .speed = handle.speed,
+        .config_value = handle.config_value,
+        .vendor_id = handle.vendor_id,
+        .product_id = handle.product_id,
+    };
+}
+
+pub fn usbHostEndpointHandle(handle: EndpointHandle) usb_host.EndpointHandle {
+    return .{
+        .device = usbHostDeviceHandle(handle.device),
+        .kind = switch (handle.kind) {
+            .control => 0,
+            .interrupt_in => 1,
+            .bulk_in => 2,
+            .bulk_out => 3,
+        },
+        .address = handle.address,
+        .endpoint_id = handle.endpoint_id,
+        .max_packet = handle.max_packet,
+        .interval = handle.interval,
+        .max_burst = handle.max_burst,
+    };
+}
+
+fn deviceFromUsbHost(handle: *const usb_host.DeviceHandle) DeviceHandle {
+    return .{
+        .port = handle.port,
+        .slot_id = handle.slot_id,
+        .speed = handle.speed,
+        .config_value = handle.config_value,
+        .vendor_id = handle.vendor_id,
+        .product_id = handle.product_id,
+    };
+}
+
+fn endpointFromUsbHost(handle: *const usb_host.EndpointHandle) ?EndpointHandle {
+    return .{
+        .device = deviceFromUsbHost(&handle.device),
+        .kind = switch (handle.kind) {
+            0 => .control,
+            1 => .interrupt_in,
+            2 => .bulk_in,
+            3 => .bulk_out,
+            else => return null,
+        },
+        .address = handle.address,
+        .endpoint_id = handle.endpoint_id,
+        .max_packet = handle.max_packet,
+        .interval = handle.interval,
+        .max_burst = handle.max_burst,
+    };
+}
+
+fn hostPortScan(_: ?*anyopaque) callconv(.c) i32 {
+    return if (servicePortChanges()) 1 else 0;
+}
+
+fn hostAddressDevice(_: ?*anyopaque, port: u8, out: *usb_host.DeviceHandle) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    if (!selectDeviceByPort(port)) return -2;
+    const handle = DeviceHandle{
+        .port = current.addressed_port,
+        .slot_id = current.addressed_slot_id,
+        .speed = current.addressed_speed,
+        .config_value = current.config_value,
+        .vendor_id = current.device_vendor_id,
+        .product_id = current.device_product_id,
+    };
+    out.* = usbHostDeviceHandle(handle);
+    return 0;
+}
+
+fn hostConfigureDevice(_: ?*anyopaque, raw: *const usb_host.DeviceHandle, configuration: u8) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    var handle = deviceFromUsbHost(raw);
+    if (!selectDeviceHandle(&handle)) return -2;
+    if (configuration != 0) current.config_value = configuration;
+    return if (setFirstConfiguration()) 0 else -3;
+}
+
+fn hostControlTransfer(_: ?*anyopaque, raw_device: *const usb_host.DeviceHandle, raw_request: *const usb_host.ControlRequest, buffer: [*]u8, len: u32) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    var device = deviceFromUsbHost(raw_device);
+    if (!selectDeviceHandle(&device) or first_descriptor_virt == 0) return -2;
+    if (raw_request.length > len or raw_request.length > DESCRIPTOR_BYTES) return -3;
+    const direction: ControlDirection = switch (raw_request.direction) {
+        0 => .none,
+        1 => .in,
+        2 => .out,
+        else => return -4,
+    };
+    const scratch: [*]u8 = @ptrFromInt(first_descriptor_virt);
+    const transfer_len: usize = raw_request.length;
+    if (direction == .out and transfer_len != 0) @memcpy(scratch[0..transfer_len], buffer[0..transfer_len]);
+    if (direction == .in and transfer_len != 0) @memset(scratch[0..transfer_len], 0);
+    const ok = submitControl(.{
+        .request_type = raw_request.request_type,
+        .request = raw_request.request,
+        .value = raw_request.value,
+        .index_value = raw_request.index_value,
+        .length = raw_request.length,
+        .data_phys = if (direction == .none) 0 else current.descriptor_phys,
+        .direction = direction,
+    });
+    if (!ok) return -5;
+    const actual = @as(u32, raw_request.length) - current.last_control_residue;
+    if (direction == .in and actual != 0) @memcpy(buffer[0..actual], scratch[0..actual]);
+    return @intCast(actual);
+}
+
+fn hostBulkTransfer(_: ?*anyopaque, raw: *const usb_host.EndpointHandle, buffer: [*]u8, len: u32, direction: u32) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    var endpoint = endpointFromUsbHost(raw) orelse return -2;
+    const bytes = buffer[0..len];
+    const ok = switch (direction) {
+        1 => endpoint.kind == .bulk_in and bulkInForHandle(&endpoint, bytes),
+        2 => endpoint.kind == .bulk_out and bulkOutForHandle(&endpoint, bytes),
+        else => false,
+    };
+    if (!ok) return -3;
+    return @intCast(current.last_bulk_actual_len);
+}
+
+fn hostInterruptTransfer(_: ?*anyopaque, raw: *const usb_host.EndpointHandle, buffer: [*]u8, len: u32, actual: *u32) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    var endpoint = endpointFromUsbHost(raw) orelse return -2;
+    const result = pollInterruptInReportStatus(&endpoint, buffer[0..len]);
+    actual.* = @intCast(lastInterruptActualLength());
+    return switch (result) {
+        .report => 1,
+        .no_report => 0,
+        .failed => -3,
+    };
+}
+
+fn hostResetPort(_: ?*anyopaque, port: u8) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    return if (resetPort(port)) 0 else -2;
+}
+
+fn hostClearHalt(_: ?*anyopaque, raw: *const usb_host.EndpointHandle) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    var endpoint = endpointFromUsbHost(raw) orelse return -2;
+    return if (clearEndpointHaltForHandle(&endpoint.device, endpoint.address)) 0 else -3;
+}
+
+fn hostResetEndpoint(_: ?*anyopaque, raw: *const usb_host.EndpointHandle) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    var endpoint = endpointFromUsbHost(raw) orelse return -2;
+    return if (resetEndpointStateForHandle(&endpoint.device, endpoint.address)) 0 else -3;
+}
+
+fn hostPoll(_: ?*anyopaque) callconv(.c) i32 {
+    return if (servicePortChanges()) 1 else 0;
+}
+
+fn hostShutdown(_: ?*anyopaque) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    port_task_stop = true;
+    const ok = teardownForReprobe();
+    if (ok) {
+        current.probed = false;
+        current.controller_running = false;
+        current.present = false;
+        current.reason = "xHCI backend unloaded";
+    } else {
+        current.reason = "xHCI unload halt failed; resources retained";
+    }
+    return if (ok) 0 else -2;
+}
+
+fn hostStatus(_: ?*anyopaque, out: *usb_host.Status) callconv(.c) i32 {
+    if (!acquireControllerOwnership()) return -1;
+    defer releaseControllerOwnership();
+    const snapshot = status();
+    const transfer_snapshot = transfer_objects.snapshot();
+    out.* = .{
+        .state = if (snapshot.controller_running) 1 else if (snapshot.present) 0 else 2,
+        .source = snapshot.host_source,
+        .ports = snapshot.port_count_seen,
+        .devices = @intCast(usb_core.count()),
+        .transfers = snapshot.control_transfers + snapshot.bulk_transfers + snapshot.interrupt_polls,
+        .failures = snapshot.failures,
+        .flags = canonical_backend.flags,
+        .queue_depth = transfer_pool.MAX_TRANSFERS,
+        .max_transfer_bytes = trb_chain.MAX_TRANSFER_BYTES,
+        .active_transfers = transfer_snapshot.active,
+        .completions = transfer_snapshot.completed,
+        .interrupts = snapshot.irq_handled,
+        .polls = snapshot.poll_fallbacks,
+        .cancellations = transfer_snapshot.cancelled,
+    };
+    return 0;
 }
 
 pub fn deviceHandleFromCore(dev: *const usb_core.Device) DeviceHandle {
@@ -1218,6 +1595,8 @@ fn allocControllerMemory() bool {
 
 fn teardownForReprobe() bool {
     if (!current.probed) return true;
+    port_task_stop = true;
+    stopEventIrq();
     persistActiveRuntime();
     if (current.mapped and current.mmio_virt != 0) {
         if (!stopController()) return false;
@@ -1306,7 +1685,8 @@ fn setupRingsAndContexts() void {
     writeRt32(RT_IR0_ERSTSZ, 1);
     writeRt64(RT_IR0_ERDP, current.event_ring_phys);
     // xHCI 4.9.4: ERSTBA zuletzt; dieser Write setzt die Event-Ring-
-    // State-Machine in den Startzustand. R4OS pollt, daher bleibt IE aus.
+    // State-Machine in den Startzustand. IE bleibt waehrend des fruehen
+    // Poll-Boots aus und wird erst nach IRQ-Router-/Schedulerstart aktiviert.
     writeRt64(RT_IR0_ERSTBA, current.erst_phys);
     writeRt32(RT_IR0_IMAN, IMAN_IP);
     _ = readRt32(RT_IR0_IMAN);
@@ -1336,8 +1716,7 @@ fn initCommandRing() void {
 
 fn initEventRing() void {
     deferred_events.reset();
-    active_sync_transfer = null;
-    last_timed_out_sync_transfer = null;
+    transfer_objects.reset();
     active_command = null;
     const ring: [*]Trb = @ptrFromInt(event_ring_virt);
     var i: usize = 0;
@@ -1509,7 +1888,16 @@ fn debounceConnectedPort(index: usize, p: *PortStatus) bool {
             p.debounce_ok = true;
             return true;
         }
-        wait.idle();
+        if (irq_registered and scheduler.current() != null) {
+            if (event_irq.wait(EVENT_IRQ_POLL_TICKS)) {
+                current.irq_wakeups +%= 1;
+            } else {
+                current.poll_fallbacks +%= 1;
+            }
+        } else {
+            current.poll_fallbacks +%= 1;
+            wait.idle();
+        }
     }
     stable.finish();
     _ = wait.finish(false);
@@ -1850,6 +2238,7 @@ fn resetFirstEnumerationFields() void {
     current.interrupt_endpoint_faulted = false;
     current.interrupt_pending = false;
     current.interrupt_pending_trb_phys = 0;
+    current.interrupt_transfer_handle = 0;
     current.interrupt_pending_streak = 0;
     current.last_interrupt_ep_state = 0;
     current.interrupt_endpoint_id = 0;
@@ -1967,6 +2356,7 @@ fn disableCurrentSlotForScan() void {
     current.interrupt_endpoint_faulted = false;
     current.interrupt_pending = false;
     current.interrupt_pending_trb_phys = 0;
+    current.interrupt_transfer_handle = 0;
     current.interrupt_pending_streak = 0;
     current.interrupt_endpoint_id = 0;
     current.interrupt_endpoint_address = 0;
@@ -2008,7 +2398,7 @@ fn allocFirstDeviceRuntime() bool {
     @memset(input[0..INPUT_CONTEXT_BYTES], 0);
     @memset(descriptor[0..DESCRIPTOR_BYTES], 0);
     @memset(interrupt_buffer[0..INTERRUPT_BUFFER_BYTES], 0);
-    @memset(bulk_buffer[0..INTERRUPT_BUFFER_BYTES], 0);
+    @memset(bulk_buffer[0..BULK_BUFFER_BYTES], 0);
     const dcbaa: [*]u64 = @ptrFromInt(dcbaa_virt);
     dcbaa[current.addressed_slot_id] = current.device_context_phys;
     initEp0Ring();
@@ -2036,7 +2426,8 @@ fn allocateRuntime(slot_id: u8, port: u8, speed: u8) ?usize {
         rt.interrupt_buffer_phys = allocFrameZero() orelse return failAllocRuntime(i, "interrupt buffer");
         rt.bulk_in_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "bulk in ring");
         rt.bulk_out_ring_phys = allocFrameZero() orelse return failAllocRuntime(i, "bulk out ring");
-        rt.bulk_buffer_phys = allocFrameZero() orelse return failAllocRuntime(i, "bulk buffer");
+        rt.bulk_buffer_frames = BULK_BUFFER_FRAMES;
+        rt.bulk_buffer_phys = allocContiguousZero(BULK_BUFFER_FRAMES) orelse return failAllocRuntime(i, "bulk buffer");
         rt.descriptor_phys = allocFrameZero() orelse return failAllocRuntime(i, "descriptor");
         rt.device_virt = phys.physToVirt(rt.device_context_phys);
         rt.input_virt = phys.physToVirt(rt.input_context_phys);
@@ -2135,6 +2526,7 @@ fn persistActiveRuntime() void {
     rt.bulk_in_ring_phys = current.bulk_in_ring_phys;
     rt.bulk_out_ring_phys = current.bulk_out_ring_phys;
     rt.bulk_buffer_phys = current.bulk_buffer_phys;
+    rt.bulk_buffer_frames = current.bulk_buffer_frames;
     rt.descriptor_phys = current.descriptor_phys;
     rt.device_virt = first_device_virt;
     rt.input_virt = first_input_virt;
@@ -2159,6 +2551,7 @@ fn persistActiveRuntime() void {
     rt.interrupt_endpoint_faulted = current.interrupt_endpoint_faulted;
     rt.interrupt_pending = current.interrupt_pending;
     rt.interrupt_pending_trb_phys = current.interrupt_pending_trb_phys;
+    rt.interrupt_transfer_handle = current.interrupt_transfer_handle;
     rt.interrupt_pending_streak = current.interrupt_pending_streak;
     rt.last_interrupt_ep_state = current.last_interrupt_ep_state;
     rt.last_interrupt_request_len = current.last_interrupt_request_len;
@@ -2200,6 +2593,7 @@ fn loadRuntime(index_value: usize) void {
     current.bulk_in_ring_phys = rt.bulk_in_ring_phys;
     current.bulk_out_ring_phys = rt.bulk_out_ring_phys;
     current.bulk_buffer_phys = rt.bulk_buffer_phys;
+    current.bulk_buffer_frames = rt.bulk_buffer_frames;
     current.descriptor_phys = rt.descriptor_phys;
     first_device_virt = rt.device_virt;
     first_input_virt = rt.input_virt;
@@ -2223,6 +2617,7 @@ fn loadRuntime(index_value: usize) void {
     current.interrupt_endpoint_configured = rt.interrupt_endpoint_configured;
     current.interrupt_endpoint_faulted = rt.interrupt_endpoint_faulted;
     current.interrupt_pending = rt.interrupt_pending;
+    current.interrupt_transfer_handle = rt.interrupt_transfer_handle;
     current.interrupt_pending_trb_phys = rt.interrupt_pending_trb_phys;
     current.interrupt_pending_streak = rt.interrupt_pending_streak;
     current.last_interrupt_ep_state = rt.last_interrupt_ep_state;
@@ -2250,23 +2645,7 @@ fn loadRuntime(index_value: usize) void {
 
 fn releaseRuntimeBySlot(slot_id: u8) void {
     _ = deferred_events.purgeSlot(slot_id);
-    if (active_sync_transfer) |owner| {
-        switch (owner) {
-            .transfer => |transfer| if (transfer.slot_id == slot_id) {
-                active_sync_transfer = null;
-            },
-            .command => {},
-        }
-    }
-    if (last_timed_out_sync_transfer) |owner| {
-        switch (owner) {
-            .transfer => |transfer| if (transfer.slot_id == slot_id) {
-                last_timed_out_sync_transfer = null;
-                closeLastSyncTransferIncident();
-            },
-            .command => {},
-        }
-    }
+    if (transfer_objects.purgeSlot(slot_id) != 0) closeLastSyncTransferIncident();
     var i: usize = 0;
     while (i < runtimes.len) : (i += 1) {
         if (!runtimes[i].active or runtimes[i].slot_id != slot_id) continue;
@@ -2283,7 +2662,8 @@ fn releaseRuntimeBySlot(slot_id: u8) void {
 
 fn freeRuntimeFrames(rt: *DeviceRuntime) void {
     freeDmaFrame(&rt.descriptor_phys);
-    freeDmaFrame(&rt.bulk_buffer_phys);
+    freeDmaFrames(&rt.bulk_buffer_phys, rt.bulk_buffer_frames);
+    rt.bulk_buffer_frames = 0;
     freeDmaFrame(&rt.bulk_out_ring_phys);
     freeDmaFrame(&rt.bulk_in_ring_phys);
     freeDmaFrame(&rt.interrupt_buffer_phys);
@@ -2308,6 +2688,16 @@ fn freeDmaFrame(frame: *u64) void {
     frame.* = 0;
 }
 
+fn freeDmaFrames(base: *u64, count: u16) void {
+    if (base.* == 0) return;
+    if (count <= 1) {
+        phys.freeFrame(base.*);
+    } else {
+        phys.freeContiguousFrames(base.*, count);
+    }
+    base.* = 0;
+}
+
 fn clearCurrentRuntimeSelection(slot_id: u8) void {
     if (slot_id != 0 and current.addressed_slot_id != slot_id) return;
     current.addressed_slot_id = 0;
@@ -2325,6 +2715,7 @@ fn clearCurrentRuntimeSelection(slot_id: u8) void {
     current.bulk_in_ring_phys = 0;
     current.bulk_out_ring_phys = 0;
     current.bulk_buffer_phys = 0;
+    current.bulk_buffer_frames = 0;
     current.descriptor_phys = 0;
     first_device_virt = 0;
     first_input_virt = 0;
@@ -2340,6 +2731,7 @@ fn clearCurrentRuntimeSelection(slot_id: u8) void {
     current.interrupt_endpoint_faulted = false;
     current.interrupt_pending = false;
     current.interrupt_pending_trb_phys = 0;
+    current.interrupt_transfer_handle = 0;
     current.interrupt_pending_streak = 0;
     current.interrupt_endpoint_id = 0;
     current.interrupt_endpoint_address = 0;
@@ -2379,6 +2771,7 @@ fn reclaimDisconnectedRuntimes() void {
             current.interrupt_endpoint_faulted = false;
             current.interrupt_pending = false;
             current.interrupt_pending_trb_phys = 0;
+            current.interrupt_transfer_handle = 0;
             current.interrupt_pending_streak = 0;
             current.interrupt_endpoint_id = 0;
             current.interrupt_endpoint_address = 0;
@@ -2552,6 +2945,7 @@ fn initEp0Ring() void {
 
 fn initInterruptRing() void {
     if (currentInterruptOwnerMatch()) |owner| _ = deferred_events.purge(owner);
+    releaseInterruptTransfer(true);
     const ring: [*]Trb = @ptrFromInt(first_interrupt_ring_virt);
     var i: usize = 0;
     while (i < TRANSFER_TRB_COUNT) : (i += 1) ring[i] = .{ .parameter = 0, .status = 0, .control = 0 };
@@ -2564,6 +2958,7 @@ fn initInterruptRing() void {
     current.interrupt_cycle = 1;
     current.interrupt_pending = false;
     current.interrupt_pending_trb_phys = 0;
+    current.interrupt_transfer_handle = 0;
     current.interrupt_pending_streak = 0;
 }
 
@@ -2799,6 +3194,7 @@ pub fn configureFirstInterruptInEndpoint(endpoint_address: u8, max_packet: u16, 
     const dci: u8 = endpoint_number * 2 + 1;
     if (dci >= 32) return false;
     if (currentInterruptOwnerMatch()) |owner| _ = deferred_events.purge(owner);
+    releaseInterruptTransfer(true);
     current.interrupt_pending = false;
     current.interrupt_pending_trb_phys = 0;
     current.interrupt_pending_streak = 0;
@@ -3066,16 +3462,12 @@ fn endpointRecoveryCommandWithin(
 }
 
 fn drainUnresolvedTransferDci(dci: u8) void {
-    const owner = last_timed_out_sync_transfer orelse return;
-    const belongs = switch (owner) {
-        .transfer => |transfer| transfer.slot_id == current.addressed_slot_id and
-            transfer.endpoint_id == dci,
-        .command => false,
-    };
-    if (!belongs) return;
+    const handle = transfer_objects.timedOutHandle(current.addressed_slot_id, dci) orelse return;
+    const owner = transfer_objects.matchForHandle(handle) orelse return;
     _ = drainEventBatch(owner);
     _ = deferred_events.purge(owner);
-    last_timed_out_sync_transfer = null;
+    _ = transfer_objects.cancel(handle);
+    _ = transfer_objects.release(handle);
     // USBMSC takes ownership before recovery. Any token still held here was
     // abandoned by a direct xHCI caller and reaches its terminal boundary
     // once the timed-out TD has been purged/skipped.
@@ -3490,6 +3882,7 @@ pub fn pollFirstInterruptInReportStatus(out: []u8) InterruptPollResult {
     if (out.len == 0 or out.len > INTERRUPT_BUFFER_BYTES) return .failed;
     current.interrupt_polls += 1;
     if (current.interrupt_pending and current.interrupt_pending_trb_phys == 0) {
+        releaseInterruptTransfer(true);
         current.interrupt_pending = false;
         current.interrupt_pending_streak = 0;
     }
@@ -3506,6 +3899,20 @@ pub fn pollFirstInterruptInReportStatus(out: []u8) InterruptPollResult {
             trbType(TRB_TYPE_NORMAL) | TRB_IOC,
         );
         current.interrupt_pending_trb_phys = submission.trb_phys;
+        const expected = event_router.transferMatch(
+            current.addressed_slot_id,
+            current.interrupt_endpoint_id,
+            submission.trb_phys,
+        );
+        current.interrupt_transfer_handle = transfer_objects.begin(
+            .interrupt_in,
+            expected,
+            timer.tickCount(),
+        ) orelse {
+            current.interrupt_pending_trb_phys = 0;
+            current.failures += 1;
+            return .failed;
+        };
         dmaFence();
         current.interrupt_pending = true;
         current.interrupt_pending_streak = 0;
@@ -3538,6 +3945,11 @@ pub fn pollFirstInterruptInReportStatus(out: []u8) InterruptPollResult {
         }
         return .no_report;
     };
+    if (current.interrupt_transfer_handle != 0) {
+        _ = transfer_objects.complete(current.interrupt_transfer_handle, completion);
+        _ = transfer_objects.release(current.interrupt_transfer_handle);
+        current.interrupt_transfer_handle = 0;
+    }
     current.last_transfer_completion_code = completion.code;
     current.last_interrupt_completion_code = completion.code;
     current.last_interrupt_residue = completion.length;
@@ -3621,29 +4033,40 @@ pub fn bulkOut(data: []const u8) bool {
         current.last_bulk_result = "not-ready";
         return false;
     }
-    if (data.len == 0 or data.len > INTERRUPT_BUFFER_BYTES) {
+    if (data.len == 0 or data.len > BULK_BUFFER_BYTES) {
         current.last_bulk_result = "bad-length";
         return false;
     }
-    if (active_sync_transfer != null) {
-        current.last_bulk_result = "busy";
+    if (transfer_objects.timedOutHandle(current.addressed_slot_id, current.bulk_out_endpoint_id) != null) {
+        current.last_bulk_result = "recovery-required";
         return false;
     }
     const buf: [*]u8 = @ptrFromInt(first_bulk_buffer_virt);
     @memcpy(buf[0..data.len], data);
-    const submission = writeBulkTrb(false, current.bulk_buffer_phys, @intCast(data.len), trbType(TRB_TYPE_NORMAL) | TRB_IOC);
-    const expected = event_router.transferMatch(current.addressed_slot_id, current.bulk_out_endpoint_id, submission.trb_phys);
-    active_sync_transfer = expected;
-    defer active_sync_transfer = null;
+    const submission = writeBulkTrbChain(false, current.bulk_buffer_phys, @intCast(data.len)) orelse {
+        current.last_bulk_result = "chain-failed";
+        return false;
+    };
+    const expected = event_router.transferTdMatch(current.addressed_slot_id, current.bulk_out_endpoint_id, submission.trb_phys, submission.trb_count);
+    const transfer_handle = transfer_objects.begin(.bulk_out, expected, timer.tickCount()) orelse {
+        current.last_bulk_result = "transfer-table-full";
+        return false;
+    };
+    var retain_transfer = false;
+    defer {
+        if (!retain_transfer) _ = transfer_objects.release(transfer_handle);
+    }
     dmaFence();
     current.bulk_transfers += 1;
     writeDoorbell(current.addressed_slot_id, current.bulk_out_endpoint_id);
     const completion = waitTransferCompletion(expected) orelse {
-        last_timed_out_sync_transfer = expected;
+        _ = transfer_objects.markTimeout(transfer_handle);
+        retain_transfer = true;
         current.bulk_failures += 1;
         current.last_bulk_result = "timeout";
         return false;
     };
+    _ = transfer_objects.complete(transfer_handle, completion);
     current.last_transfer_completion_code = completion.code;
     recordBulkCompletion(false, @intCast(data.len), completion);
     const evaluated = bulk_completion.evaluate(false, @intCast(data.len), completion.code, completion.length);
@@ -3667,29 +4090,40 @@ pub fn bulkIn(out: []u8) bool {
         current.last_bulk_result = "not-ready";
         return false;
     }
-    if (out.len == 0 or out.len > INTERRUPT_BUFFER_BYTES) {
+    if (out.len == 0 or out.len > BULK_BUFFER_BYTES) {
         current.last_bulk_result = "bad-length";
         return false;
     }
-    if (active_sync_transfer != null) {
-        current.last_bulk_result = "busy";
+    if (transfer_objects.timedOutHandle(current.addressed_slot_id, current.bulk_in_endpoint_id) != null) {
+        current.last_bulk_result = "recovery-required";
         return false;
     }
     const buf: [*]u8 = @ptrFromInt(first_bulk_buffer_virt);
     @memset(buf[0..out.len], 0);
-    const submission = writeBulkTrb(true, current.bulk_buffer_phys, @intCast(out.len), trbType(TRB_TYPE_NORMAL) | TRB_IOC);
-    const expected = event_router.transferMatch(current.addressed_slot_id, current.bulk_in_endpoint_id, submission.trb_phys);
-    active_sync_transfer = expected;
-    defer active_sync_transfer = null;
+    const submission = writeBulkTrbChain(true, current.bulk_buffer_phys, @intCast(out.len)) orelse {
+        current.last_bulk_result = "chain-failed";
+        return false;
+    };
+    const expected = event_router.transferTdMatch(current.addressed_slot_id, current.bulk_in_endpoint_id, submission.trb_phys, submission.trb_count);
+    const transfer_handle = transfer_objects.begin(.bulk_in, expected, timer.tickCount()) orelse {
+        current.last_bulk_result = "transfer-table-full";
+        return false;
+    };
+    var retain_transfer = false;
+    defer {
+        if (!retain_transfer) _ = transfer_objects.release(transfer_handle);
+    }
     dmaFence();
     current.bulk_transfers += 1;
     writeDoorbell(current.addressed_slot_id, current.bulk_in_endpoint_id);
     const completion = waitTransferCompletion(expected) orelse {
-        last_timed_out_sync_transfer = expected;
+        _ = transfer_objects.markTimeout(transfer_handle);
+        retain_transfer = true;
         current.bulk_failures += 1;
         current.last_bulk_result = "timeout";
         return false;
     };
+    _ = transfer_objects.complete(transfer_handle, completion);
     current.last_transfer_completion_code = completion.code;
     recordBulkCompletion(true, @intCast(out.len), completion);
     const evaluated = bulk_completion.evaluate(true, @intCast(out.len), completion.code, completion.length);
@@ -3715,10 +4149,33 @@ fn pollInterruptCompletion(expected: event_router.Match) ?XhciEvent {
 }
 
 const BulkSubmission = struct {
+    trb_phys: [event_router.MAX_TRANSFER_TRB_POINTERS]u64 = .{0} ** event_router.MAX_TRANSFER_TRB_POINTERS,
+    trb_count: u8 = 0,
+};
+
+const BulkTrbSubmission = struct {
     trb_phys: u64,
 };
 
-fn writeBulkTrb(in_dir: bool, parameter: u64, status_value: u32, control_extra: u32) BulkSubmission {
+fn writeBulkTrbChain(in_dir: bool, parameter: u64, bytes: u32) ?BulkSubmission {
+    const plan = trb_chain.build(parameter, bytes) orelse return null;
+    var out: BulkSubmission = .{};
+    const segment_count: usize = plan.count;
+    var index: usize = 0;
+    while (index < segment_count) : (index += 1) {
+        const segment = plan.segments[index];
+        const remaining_trbs: u32 = @intCast(segment_count - index - 1);
+        const status_value = segment.len | (@as(u32, @intCast(@min(remaining_trbs, 31))) << 17);
+        const last = index + 1 == segment_count;
+        const control = trbType(TRB_TYPE_NORMAL) | if (last) TRB_IOC else TRB_CHAIN;
+        const submission = writeBulkTrb(in_dir, segment.phys, status_value, control);
+        out.trb_phys[out.trb_count] = submission.trb_phys;
+        out.trb_count += 1;
+    }
+    return out;
+}
+
+fn writeBulkTrb(in_dir: bool, parameter: u64, status_value: u32, control_extra: u32) BulkTrbSubmission {
     const ring: [*]Trb = @ptrFromInt(if (in_dir) first_bulk_in_ring_virt else first_bulk_out_ring_virt);
     const enqueue = if (in_dir) current.bulk_in_enqueue else current.bulk_out_enqueue;
     const ring_phys = if (in_dir) current.bulk_in_ring_phys else current.bulk_out_ring_phys;
@@ -3728,10 +4185,11 @@ fn writeBulkTrb(in_dir: bool, parameter: u64, status_value: u32, control_extra: 
     const producer_cycle = if (in_dir) current.bulk_in_cycle else current.bulk_out_cycle;
     const advance = ring_cycle.afterSubmission(enqueue, producer_cycle, TRANSFER_TRB_COUNT);
     if (advance.wrapped) {
-        updateLinkTrbCycle(
+        updateLinkTrb(
             if (in_dir) first_bulk_in_ring_virt else first_bulk_out_ring_virt,
             TRANSFER_TRB_COUNT,
             advance.link_cycle,
+            (control_extra & TRB_CHAIN) != 0,
         );
     }
     if (in_dir) {
@@ -3813,7 +4271,7 @@ fn submitControlWithin(
     if (current.addressed_slot_id == 0 or first_ep0_ring_virt == 0) return false;
     if (current.control_endpoint_faulted) return false;
     if (req.direction != .none and (req.length == 0 or req.data_phys == 0)) return false;
-    if (active_sync_transfer != null) return false;
+    if (transfer_objects.timedOutHandle(current.addressed_slot_id, 1) != null) return false;
     if (recovery_budget) |budget| {
         if (budget.expiredAny()) return false;
     }
@@ -3845,13 +4303,17 @@ fn submitControlWithin(
     control_trb_phys[control_trb_count] = writeTransferTrb(0, 0, status_control);
     control_trb_count += 1;
     const expected = event_router.transferTdMatch(current.addressed_slot_id, 1, control_trb_phys, control_trb_count);
-    active_sync_transfer = expected;
-    defer active_sync_transfer = null;
+    const transfer_handle = transfer_objects.begin(.control, expected, timer.tickCount()) orelse return false;
+    var retain_transfer = false;
+    defer {
+        if (!retain_transfer) _ = transfer_objects.release(transfer_handle);
+    }
     dmaFence();
     current.control_transfers += 1;
     writeDoorbell(current.addressed_slot_id, 1);
     const completion = waitTransferCompletionWithin(expected, recovery_budget) orelse {
-        last_timed_out_sync_transfer = expected;
+        _ = transfer_objects.markTimeout(transfer_handle);
+        retain_transfer = true;
         current.last_control_completion_code = 0xFF;
         current.control_timeouts += 1;
         current.control_failures += 1;
@@ -3862,6 +4324,7 @@ fn submitControlWithin(
         closeLastSyncTransferIncident();
         return false;
     };
+    _ = transfer_objects.complete(transfer_handle, completion);
     current.last_transfer_completion_code = completion.code;
     current.last_control_completion_code = completion.code;
     current.last_control_residue = completion.length;
@@ -3955,6 +4418,7 @@ fn recoverInterruptEndpoint(from_pending: bool) bool {
     if (slot == 0 or ep_id == 0) return false;
     const pending_owner = currentInterruptOwnerMatch();
     if (pending_owner) |owner| _ = deferred_events.purge(owner);
+    releaseInterruptTransfer(true);
     current.interrupt_recoveries +%= 1;
     if (from_pending) current.interrupt_pending_timeouts +%= 1;
     const ok = resetFirstEndpointState(current.interrupt_endpoint_address);
@@ -3964,6 +4428,13 @@ fn recoverInterruptEndpoint(from_pending: bool) bool {
     current.interrupt_pending_streak = 0;
     dmaFence();
     return ok;
+}
+
+fn releaseInterruptTransfer(cancel: bool) void {
+    if (current.interrupt_transfer_handle == 0) return;
+    if (cancel) _ = transfer_objects.cancel(current.interrupt_transfer_handle);
+    _ = transfer_objects.release(current.interrupt_transfer_handle);
+    current.interrupt_transfer_handle = 0;
 }
 
 const InterruptSubmission = struct {
@@ -3984,7 +4455,7 @@ fn writeInterruptTrb(parameter: u64, status_value: u32, control_extra: u32) Inte
     if (advance.wrapped) {
         // Der Link gehoert noch zum alten Umlauf: erst mit dem alten PCS an
         // den xHC uebergeben, dann lokal auf das PCS des neuen Umlaufs gehen.
-        updateLinkTrbCycle(first_interrupt_ring_virt, TRANSFER_TRB_COUNT, advance.link_cycle);
+        updateLinkTrb(first_interrupt_ring_virt, TRANSFER_TRB_COUNT, advance.link_cycle, false);
     }
     current.interrupt_enqueue = advance.next_enqueue;
     current.interrupt_cycle = advance.next_producer_cycle;
@@ -4057,7 +4528,7 @@ fn writeTransferTrb(parameter: u64, status_value: u32, control_extra: u32) u64 {
     ring[enqueue] = .{ .parameter = parameter, .status = status_value, .control = control_extra | cycle };
     const advance = ring_cycle.afterSubmission(enqueue, current.ep0_cycle, TRANSFER_TRB_COUNT);
     if (advance.wrapped) {
-        updateLinkTrbCycle(first_ep0_ring_virt, TRANSFER_TRB_COUNT, advance.link_cycle);
+        updateLinkTrb(first_ep0_ring_virt, TRANSFER_TRB_COUNT, advance.link_cycle, (control_extra & TRB_CHAIN) != 0);
         current.ep0_ring_wraps += 1;
     }
     current.ep0_enqueue = advance.next_enqueue;
@@ -4386,9 +4857,7 @@ fn runtimeInterruptOwnerMatch(rt: *const DeviceRuntime) ?event_router.Match {
 }
 
 fn eventHasLiveOwner(event: XhciEvent) bool {
-    if (active_sync_transfer) |owner| {
-        if (event_router.matches(event, owner)) return true;
-    }
+    if (transfer_objects.owns(event)) return true;
     if (active_command) |owner| {
         if (event_router.matches(event, owner)) return true;
     }
@@ -4406,10 +4875,15 @@ fn eventHasLiveOwner(event: XhciEvent) bool {
 }
 
 fn clearOverflowedInterruptOwner(event: XhciEvent) bool {
+    if (transfer_objects.matchingHandle(event)) |handle| {
+        _ = transfer_objects.cancel(handle);
+        _ = transfer_objects.release(handle);
+    }
     if (currentInterruptOwnerMatch()) |owner| {
         if (event_router.matches(event, owner)) {
             current.interrupt_pending = false;
             current.interrupt_pending_trb_phys = 0;
+            current.interrupt_transfer_handle = 0;
             current.interrupt_pending_streak = 0;
             return true;
         }
@@ -4421,6 +4895,7 @@ fn clearOverflowedInterruptOwner(event: XhciEvent) bool {
             if (!event_router.matches(event, owner)) continue;
             runtimes[i].interrupt_pending = false;
             runtimes[i].interrupt_pending_trb_phys = 0;
+            runtimes[i].interrupt_transfer_handle = 0;
             runtimes[i].interrupt_pending_streak = 0;
             return true;
         }
@@ -4756,7 +5231,7 @@ fn submitCommandWithin(
     current.commands += 1;
     const advance = ring_cycle.afterSubmission(enqueue, current.command_cycle, COMMAND_TRB_COUNT);
     if (advance.wrapped) {
-        updateLinkTrbCycle(command_ring_virt, COMMAND_TRB_COUNT, advance.link_cycle);
+        updateLinkTrb(command_ring_virt, COMMAND_TRB_COUNT, advance.link_cycle, false);
         current.command_ring_wraps += 1;
     }
     current.command_enqueue = advance.next_enqueue;
@@ -4772,18 +5247,14 @@ fn toggleCycle(cycle: *u8) void {
     cycle.* = if (cycle.* == 0) 1 else 0;
 }
 
-fn updateLinkTrbCycle(ring_virt: u64, count: usize, cycle: u8) void {
+fn updateLinkTrb(ring_virt: u64, count: usize, cycle: u8, continues_td: bool) void {
     if (ring_virt == 0 or count == 0) return;
     const ring: [*]Trb = @ptrFromInt(ring_virt);
     const idx = count - 1;
     // Nutz-TRBs muessen vollstaendig sichtbar sein, bevor das Cycle-Bit den
     // Link an den xHC uebergibt (xHCI Producer-Publish-Reihenfolge).
     dmaFence();
-    if (cycle == 0) {
-        ring[idx].control &= ~TRB_CYCLE;
-    } else {
-        ring[idx].control |= TRB_CYCLE;
-    }
+    ring[idx].control = ring_cycle.publishedLinkControl(ring[idx].control, cycle, continues_td);
     dmaFence();
 }
 
@@ -4867,6 +5338,7 @@ fn commitEventBatch(processed: u16) void {
     writeRt64(RT_IR0_ERDP, dequeue | ERDP_EHB);
     _ = readRt64(RT_IR0_ERDP);
     current.event_erdp_commits +%= 1;
+    rearmEventIrq();
 }
 
 fn recordLastEvent(event: XhciEvent) void {
@@ -5039,6 +5511,14 @@ fn allocFrameZero() ?u64 {
     const frame = phys.allocFrame() orelse return null;
     zeroFrame(phys.physToVirt(frame));
     return frame;
+}
+
+fn allocContiguousZero(frame_count: u16) ?u64 {
+    if (frame_count == 0) return null;
+    const base = phys.allocContiguousFrames(frame_count) orelse return null;
+    const bytes: [*]u8 = @ptrFromInt(phys.physToVirt(base));
+    @memset(bytes[0 .. @as(usize, frame_count) * @as(usize, @intCast(phys.FRAME_SIZE))], 0);
+    return base;
 }
 
 fn zeroFrame(virt: u64) void {

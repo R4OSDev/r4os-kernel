@@ -80,6 +80,7 @@ pub const Snapshot = struct {
 
 var current_snapshot: Snapshot = .{};
 var network_notes: [net.MAX_ADAPTERS][96]u8 = .{.{0} ** 96} ** net.MAX_ADAPTERS;
+var xhci_note: [256]u8 = .{0} ** 256;
 
 pub fn snapshot() *const Snapshot {
     current_snapshot = .{};
@@ -464,8 +465,12 @@ fn statusFor(binding: Binding, class_code: u8, subclass: u8, vendor_id: u16, dev
         if (total_blocks > 1) return "active-block-multi";
         if (total_blocks > 0) return "active-block";
     }
-    if (class_code == 0x0C and subclass == 0x03 and xhciHostIsPreload()) return "host-preload-active";
-    if (class_code == 0x0C and subclass == 0x03 and xhciHostPresent()) return "host-rescue-active";
+    if (class_code == 0x0C and subclass == 0x03 and xhciHostIsPreload()) {
+        return if (xhciHostActive()) "host-preload-active" else "host-preload-failed";
+    }
+    if (class_code == 0x0C and subclass == 0x03 and xhciHostPresent()) {
+        return if (xhciHostActive()) "host-rescue-active" else "host-rescue-failed";
+    }
     return switch (binding) {
         .with_driver => "bound-or-platform-active",
         .without_driver => "detected-no-driver",
@@ -487,13 +492,7 @@ fn noteFor(class_code: u8, subclass: u8, prog_if: u8, vendor_id: u16, device_id:
     if (class_code == 0x01 and subclass == 0x08) return "NVMe candidate; standard owner is NVME.R4D preload";
     if (class_code == 0x0C and subclass == 0x03 and prog_if == 0x30) {
         if (usb_host.findByName("XHCI")) |host_slot| {
-            const controller = usb_host.at(host_slot);
-            const is_preload = if (controller) |hc| hc.source == .preload else false;
-            const usb = usb_core.summary();
-            if (usb.configured != 0 and is_preload) return "xHCI source=preload; XHCI.R4D host backend registered; legacy rescue data path parsed USB configuration";
-            if (is_preload) return "xHCI source=preload; XHCI.R4D host backend registered; legacy rescue data path armed";
-            if (usb.configured != 0) return "xHCI source=legacy-rescue; USB configuration parsed outside standard owner";
-            return "xHCI source=legacy-rescue; host backend registered outside standard owner";
+            return xhciHostNote(host_slot);
         }
     }
     if (class_code == 0x0C and subclass == 0x03 and prog_if == 0x30) return "xHCI USB candidate; standard owner is XHCI.R4D preload";
@@ -641,10 +640,57 @@ fn xhciHostPresent() bool {
     return usb_host.findByName("XHCI") != null;
 }
 
+fn xhciHostActive() bool {
+    const index = usb_host.findByName("XHCI") orelse return false;
+    const controller = usb_host.at(index) orelse return false;
+    return controller.state == .active;
+}
+
 fn xhciHostIsPreload() bool {
     const index = usb_host.findByName("XHCI") orelse return false;
     const controller = usb_host.at(index) orelse return false;
     return controller.source == .preload;
+}
+
+fn xhciHostNote(index: usize) []const u8 {
+    @memset(xhci_note[0..], 0);
+    const controller = usb_host.at(index) orelse return "xHCI host registry entry unavailable";
+    var status: usb_host.Status = .{};
+    const status_ok = usb_host.statusAt(index, &status) == 0;
+    var w = NoteWriter{ .out = xhci_note[0..] };
+    w.text("xHCI source=");
+    w.text(usb_host.sourceLabel(controller.source));
+    w.text("; sole canonical owner; state=");
+    w.text(switch (controller.state) {
+        .registered => "registered",
+        .active => "active",
+        .failed => "failed",
+    });
+    if (!status_ok) {
+        w.text("; status=unavailable");
+        return w.slice();
+    }
+    const dispatch_flags = usb_host.FLAG_PORT_SCAN | usb_host.FLAG_CONTROL |
+        usb_host.FLAG_BULK | usb_host.FLAG_INTERRUPT;
+    w.text("; dispatch=");
+    w.text(if ((status.flags & dispatch_flags) == dispatch_flags) "port/control/bulk/interrupt" else "partial");
+    w.text("; event=");
+    w.text(if ((status.flags & usb_host.FLAG_EVENT_IRQ) != 0) "irq+poll" else "poll");
+    w.text("; q=");
+    w.num(status.queue_depth);
+    w.text(" max=");
+    w.num(status.max_transfer_bytes);
+    w.text(" active=");
+    w.num(status.active_transfers);
+    w.text(" done=");
+    w.num(status.completions);
+    w.text(" irq=");
+    w.num(status.interrupts);
+    w.text(" polls=");
+    w.num(status.polls);
+    w.text(" cancel=");
+    w.num(status.cancellations);
+    return w.slice();
 }
 
 fn hasMountedDrive(block_index: usize) bool {
