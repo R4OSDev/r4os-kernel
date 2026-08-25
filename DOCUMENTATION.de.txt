@@ -31,10 +31,23 @@ Schedulerproben sind ausschliesslich im expliziten Diagnoseartefakt aktiv:
     Build.bat -Dboot-selftests=true
 
 Die isolierte Laufzeitabnahme fuer controller-parallelen Blockdispatch und
-direkte, eigentuerfixierte Puffer laesst sich ohne die uebrigen invasiven
-Bootproben bauen:
+direkte, eigentuerfixierte Puffer erweitert sich seit 0.69.39 um den
+asynchronen Tiefe-zwei-Vertrag. Sie prueft Out-of-order-Completion,
+Flushbarriere, Timeout/Cancel, Kill- und Unload-Veto, Reset sowie doppelte und
+verspaetete Completion ohne die uebrigen invasiven Bootproben:
 
     Build.bat -Dblock-dispatch-selftest=true
+
+Unter Linux gilt entsprechend:
+
+    ./Build.sh -Dblock-dispatch-selftest=true
+
+DriverApi v19 mappt vorhandene residente R4D-Puffer ownergebunden auf bis zu
+64 harte DMA-Segmente oder einen expliziten Bouncefallback. StorageBackend v2
+trennt Submit und Completion; `queue_depth` bezeichnet nur noch gleichzeitig
+hardwarebesessene Requests. Alte synchrone Backends werden auf Tiefe eins
+normalisiert. Der kanonische ABI-Vertrag liegt im Contract-Repository unter
+`ABI/R4DDriver.txt`.
 
 Grenze
 ------

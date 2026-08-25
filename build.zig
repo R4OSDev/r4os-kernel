@@ -62,7 +62,7 @@ pub fn build(b: *std.Build) void {
     const block_dispatch_selftest = b.option(
         bool,
         "block-dispatch-selftest",
-        "Run the controller-parallel block-dispatch selftest during boot",
+        "Run controller-parallel and asynchronous block-dispatch selftests during boot",
     ) orelse false;
     const net_loss_test = b.option(
         bool,
@@ -188,6 +188,7 @@ pub fn build(b: *std.Build) void {
         "fs/page_cache_batch.zig",
         "fs/page_cache_policy.zig",
         "kernel/bootscreen_r4b_format.zig",
+        "kernel/dma_segments.zig",
         "kernel/driver_work_queue.zig",
         "kernel/service_ipc_queue.zig",
         "net/config_writer.zig",

@@ -281,6 +281,7 @@ var last_submitted_owner: u32 = 0;
 var last_started_owner: u32 = 0;
 var last_completed_owner: u32 = 0;
 var last_cleanup_owner: u32 = 0;
+var running_callback_owner: u32 = 0;
 
 pub fn init() bool {
     if (initialized and worker_started) return true;
@@ -830,8 +831,15 @@ fn runSlot(slot: usize) void {
         finishSlot(slot, -1);
         return;
     };
+    running_callback_owner = items[slot].owner;
+    defer running_callback_owner = 0;
     const result = handler(items[slot].context);
     finishSlot(slot, result);
+}
+
+pub fn currentOwner() u32 {
+    if (!currentIsWorker()) return 0;
+    return running_callback_owner;
 }
 
 fn finishSlot(slot: usize, result: i32) void {

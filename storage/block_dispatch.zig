@@ -24,6 +24,68 @@ pub fn activeTimeoutAction(ownership: BufferOwnership) ActiveTimeoutAction {
     };
 }
 
+pub const Completion = struct {
+    result: i32 = 0,
+    bytes: u32 = 0,
+};
+
+// IRQ callbacks only claim this latch; the owning block worker consumes the
+// publication and performs queue, buffer and waiter teardown.  A handle is
+// never accepted twice and invalidation happens before a request slot can be
+// reused.
+pub const CompletionLatch = struct {
+    handle: u64 = 0,
+    claimed: bool = false,
+    ready: bool = false,
+    result: i32 = 0,
+    bytes: u32 = 0,
+
+    pub fn activate(self: *CompletionLatch, handle: u64) bool {
+        if (handle == 0) return false;
+        self.* = .{ .handle = handle };
+        return true;
+    }
+
+    pub fn publish(self: *CompletionLatch, handle: u64, result: i32, bytes: u32) bool {
+        if (handle == 0 or self.handle != handle or self.claimed) return false;
+        self.claimed = true;
+        self.ready = true;
+        self.result = result;
+        self.bytes = bytes;
+        return true;
+    }
+
+    // Used when submit rejects a request before ownership reaches hardware.
+    // An inline completion published by the backend wins the race.
+    pub fn rejectSubmission(self: *CompletionLatch, handle: u64) bool {
+        if (handle == 0 or self.handle != handle or self.claimed) return false;
+        self.claimed = true;
+        return true;
+    }
+
+    pub fn take(self: *CompletionLatch) ?Completion {
+        if (!self.ready) return null;
+        self.ready = false;
+        return .{ .result = self.result, .bytes = self.bytes };
+    }
+
+    pub fn invalidate(self: *CompletionLatch) void {
+        self.* = .{};
+    }
+};
+
+pub fn submissionAllowed(
+    active_count: u32,
+    max_in_flight: u16,
+    candidate_is_flush: bool,
+    flush_in_flight: bool,
+) bool {
+    if (max_in_flight == 0 or active_count >= max_in_flight) return false;
+    if (flush_in_flight) return false;
+    if (candidate_is_flush and active_count != 0) return false;
+    return true;
+}
+
 pub const ControllerMap = struct {
     used: [max_controllers]bool = .{false} ** max_controllers,
     names: [max_controllers][max_controller_name]u8 =
@@ -103,4 +165,34 @@ test "active timeout preserves borrowed resident buffer lifetime" {
     try std.testing.expectEqual(ActiveTimeoutAction.detach, activeTimeoutAction(.none));
     try std.testing.expectEqual(ActiveTimeoutAction.detach_with_buffer, activeTimeoutAction(.bounce_owned));
     try std.testing.expectEqual(ActiveTimeoutAction.wait_for_completion, activeTimeoutAction(.borrowed_resident));
+}
+
+test "completion latch accepts exactly one matching publication" {
+    var latch: CompletionLatch = .{};
+    try std.testing.expect(latch.activate(0x1234));
+    try std.testing.expect(!latch.publish(0x4321, 0, 512));
+    try std.testing.expect(latch.publish(0x1234, 0, 512));
+    try std.testing.expect(!latch.publish(0x1234, -1, 0));
+    const completion = latch.take() orelse return error.MissingCompletion;
+    try std.testing.expectEqual(@as(i32, 0), completion.result);
+    try std.testing.expectEqual(@as(u32, 512), completion.bytes);
+    try std.testing.expect(latch.take() == null);
+    latch.invalidate();
+    try std.testing.expect(!latch.publish(0x1234, 0, 512));
+}
+
+test "inline completion wins over a conflicting submit rejection" {
+    var latch: CompletionLatch = .{};
+    try std.testing.expect(latch.activate(9));
+    try std.testing.expect(latch.publish(9, 0, 4096));
+    try std.testing.expect(!latch.rejectSubmission(9));
+}
+
+test "queue depth is in-flight capacity and flush is an exclusive barrier" {
+    try std.testing.expect(submissionAllowed(0, 2, false, false));
+    try std.testing.expect(submissionAllowed(1, 2, false, false));
+    try std.testing.expect(!submissionAllowed(2, 2, false, false));
+    try std.testing.expect(!submissionAllowed(1, 2, true, false));
+    try std.testing.expect(submissionAllowed(0, 2, true, false));
+    try std.testing.expect(!submissionAllowed(0, 2, false, true));
 }

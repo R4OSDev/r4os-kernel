@@ -18,6 +18,38 @@ pub const MAX_REQUEST_QUEUE_DEPTH: usize = 16;
 pub const ReadFn = *const fn (ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool;
 pub const WriteFn = *const fn (ctx: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool;
 pub const FlushFn = *const fn (ctx: ?*anyopaque) bool;
+pub const AsyncCompleteFn = *const fn (handle: u64, result: i32, bytes: u32) callconv(.c) void;
+
+pub const ASYNC_RESULT_OK: i32 = 0;
+pub const ASYNC_RESULT_ERROR: i32 = -1;
+pub const ASYNC_RESULT_CANCELLED: i32 = -2;
+pub const ASYNC_RESULT_TIMEOUT: i32 = -3;
+pub const ASYNC_RESULT_RESET: i32 = -4;
+pub const ASYNC_RESULT_SHUTDOWN: i32 = -5;
+
+pub const CANCEL_REASON_TIMEOUT: u32 = 1;
+pub const CANCEL_REASON_CALLER: u32 = 2;
+pub const CANCEL_REASON_RESET: u32 = 3;
+pub const CANCEL_REASON_SHUTDOWN: u32 = 4;
+
+pub const AsyncRequest = struct {
+    handle: u64,
+    kind: RequestKind,
+    lba: u64,
+    sectors: u16,
+    buffer: ?[*]u8,
+    const_buffer: ?[*]const u8,
+    buffer_len: usize,
+    complete: AsyncCompleteFn,
+};
+
+// `submit` is nonblocking. Zero transfers request ownership to the backend;
+// every accepted request must publish exactly one completion. A nonzero
+// result rejects ownership unless the backend already completed inline.
+pub const AsyncSubmitFn = *const fn (ctx: ?*anyopaque, request: *const AsyncRequest) i32;
+pub const AsyncCancelFn = *const fn (ctx: ?*anyopaque, handle: u64, reason: u32) i32;
+// A successful reset proves that no old command can access its buffer again.
+pub const AsyncResetFn = *const fn (ctx: ?*anyopaque, reason: u32) i32;
 
 pub const Bus = enum {
     unknown,
@@ -93,6 +125,11 @@ const RequestSlot = struct {
     buffer_ownership: block_dispatch.BufferOwnership = .none,
     timeout_requested: bool = false,
     caller_detached: bool = false,
+    cancel_requested: bool = false,
+    completion_override: Error = .none,
+    backend_handle: u64 = 0,
+    completion_latch: block_dispatch.CompletionLatch = .{},
+    execution_mode: ExecutionMode = .boot_inline,
 };
 
 const RequestExecution = struct {
@@ -107,6 +144,7 @@ const RequestExecution = struct {
     buffer_ownership: block_dispatch.BufferOwnership,
     start_tick: u64,
     mode: ExecutionMode,
+    backend_handle: u64,
 };
 
 const RequestResult = struct {
@@ -132,6 +170,9 @@ pub const Error = enum {
     backend_read,
     backend_write,
     backend_flush,
+    cancelled,
+    reset,
+    shutdown,
 };
 
 /// Exact committed prefix of a logical write.  Filesystem/cache callers use
@@ -180,6 +221,13 @@ pub const Stats = struct {
     bounce_bytes: u64 = 0,
     bounce_copy_bytes: u64 = 0,
     direct_timeout_waits: u64 = 0,
+    async_submissions: u64 = 0,
+    async_completions: u64 = 0,
+    async_cancel_requests: u64 = 0,
+    async_resets: u64 = 0,
+    duplicate_completions: u64 = 0,
+    late_completions: u64 = 0,
+    in_flight_high_water: u32 = 0,
     last_sense: SenseSnapshot = .{},
     last_error: Error = .none,
 };
@@ -207,6 +255,14 @@ pub const RuntimeSummary = struct {
     bounce_bytes: u64 = 0,
     bounce_copy_bytes: u64 = 0,
     direct_timeout_waits: u64 = 0,
+    async_submissions: u64 = 0,
+    async_completions: u64 = 0,
+    async_cancel_requests: u64 = 0,
+    async_resets: u64 = 0,
+    duplicate_completions: u64 = 0,
+    late_completions: u64 = 0,
+    in_flight: u32 = 0,
+    in_flight_high_water: u32 = 0,
 };
 
 pub const Device = struct {
@@ -232,7 +288,12 @@ pub const Device = struct {
     read_fn: ReadFn,
     write_fn: ?WriteFn = null,
     flush_fn: ?FlushFn = null,
+    async_submit_fn: ?AsyncSubmitFn = null,
+    async_cancel_fn: ?AsyncCancelFn = null,
+    async_reset_fn: ?AsyncResetFn = null,
     state: State = .registered,
+    resetting: bool = false,
+    slot_index: u8 = 0,
     stats: Stats = .{},
     active_executions: u32 = 0,
     controller_lane: u8 = block_dispatch.no_lane,
@@ -290,6 +351,7 @@ const worker_names = [_][]const u8{
     "block-work4", "block-work5", "block-work6", "block-work7",
 };
 var runtime_summary: RuntimeSummary = .{};
+var next_backend_handle_sequence: u64 = 0;
 
 pub fn init() void {
     devices = .{DeviceSlot{}} ** MAX_DEVICES;
@@ -302,6 +364,7 @@ pub fn init() void {
     controller_map = .{};
     controller_runtime = .{ControllerRuntime{}} ** block_dispatch.max_controllers;
     runtime_summary = .{};
+    next_backend_handle_sequence = 0;
 }
 
 pub fn initRuntimeWorker() bool {
@@ -419,6 +482,7 @@ fn registerLocked(device: Device) ?usize {
     if (device_count >= MAX_DEVICES) return null;
     if (findByNameLocked(device.name) != null) return null;
     if (device.queue_depth == 0 or @as(usize, device.queue_depth) > MAX_REQUEST_QUEUE_DEPTH) return null;
+    if (device.async_submit_fn != null and !runtimeWorkerIdentityAlive()) return null;
 
     var target_index: usize = 0;
     while (target_index < device_slot_count and devices[target_index].used) : (target_index += 1) {}
@@ -427,7 +491,13 @@ fn registerLocked(device: Device) ?usize {
     if (target_index == device_slot_count) device_slot_count += 1;
 
     var normalized = device;
+    // queue_depth is the hardware in-flight limit. Synchronous callbacks are
+    // adapted through one execution lane even if an old descriptor advertised
+    // a larger software queue.
+    if (normalized.async_submit_fn == null) normalized.queue_depth = 1;
     normalized.state = .registered;
+    normalized.resetting = false;
+    normalized.slot_index = @intCast(target_index);
     normalized.stats = .{};
     normalized.active_executions = 0;
     normalized.controller_lane = controller_lane;
@@ -568,7 +638,7 @@ fn controllerLaneInUseLocked(lane: u8) bool {
 }
 
 fn deviceIsQuiescent(device: *Device) bool {
-    if (device.active_executions != 0 or countUsedSlots(device) != 0) return false;
+    if (device.resetting or device.active_executions != 0 or countUsedSlots(device) != 0) return false;
     if (device.queue_lock.owner != 0 or device.queue_lock.depth != 0) return false;
     if (device.slot_available.hasWaiters()) return false;
     if (device.completion_available.hasWaiters()) return false;
@@ -675,6 +745,96 @@ pub fn finishBackendRecovery(index: usize, ok: bool) void {
         device.stats.backend_recovery_failures += 1;
         device.state = .failed;
     }
+}
+
+// A successful backend reset is the only boundary that may retire an active
+// asynchronous request without waiting for its physical completion. The
+// backend promises that old commands can no longer touch buffers before the
+// callback returns; handles are invalidated before waiters or slots are freed.
+pub fn reset(index: usize, reason: u32) bool {
+    var pin = pinDevice(index) orelse return false;
+    defer unpinDevice(&pin);
+    const device = pin.device;
+    const reset_fn = device.async_reset_fn orelse return false;
+
+    var active: [MAX_REQUEST_QUEUE_DEPTH]RequestExecution = undefined;
+    var cancel_needed: [MAX_REQUEST_QUEUE_DEPTH]bool = .{false} ** MAX_REQUEST_QUEUE_DEPTH;
+    var active_count: usize = 0;
+    const locked = lockDevice(device);
+    if (device.resetting) {
+        unlockDevice(device, locked);
+        return false;
+    }
+    device.resetting = true;
+    device.state = .recovering;
+    for (&device.request_slots, 0..) |*slot, slot_index| {
+        switch (slot.state) {
+            .queued => {
+                slot.state = .completed;
+                slot.ok = false;
+                slot.err = .reset;
+                slot.complete_tick = timer.tickCount();
+                recordRequestFailure(device, slot.kind, .reset);
+            },
+            .active => {
+                if (slot.completion_override == .none) slot.completion_override = .reset;
+                const first_cancel = !slot.cancel_requested;
+                slot.cancel_requested = true;
+                if (active_count < active.len) {
+                    active[active_count] = executionFromSlot(slot_index, slot.*);
+                    cancel_needed[active_count] = first_cancel;
+                    active_count += 1;
+                }
+            },
+            .free, .completed => {},
+        }
+    }
+    _ = device.completion_available.wakeAll();
+    unlockDevice(device, locked);
+
+    var cancel_index: usize = 0;
+    while (cancel_index < active_count) : (cancel_index += 1) {
+        if (cancel_needed[cancel_index]) {
+            requestBackendCancel(device, active[cancel_index], CANCEL_REASON_RESET);
+        }
+    }
+    device.stats.async_resets +%= 1;
+    runtime_summary.async_resets +%= 1;
+    if (reset_fn(device.ctx, reason) != 0) {
+        const failed_locked = lockDevice(device);
+        device.resetting = false;
+        device.state = .failed;
+        unlockDevice(device, failed_locked);
+        return false;
+    }
+
+    var finish_index: usize = 0;
+    while (finish_index < active_count) : (finish_index += 1) {
+        forceCompleteAfterReset(device, active[finish_index]);
+    }
+    const finish_locked = lockDevice(device);
+    device.resetting = false;
+    device.state = if (device.active_executions == 0) .active else .busy;
+    _ = device.slot_available.wakeAll();
+    _ = device.completion_available.wakeAll();
+    unlockDevice(device, finish_locked);
+    return true;
+}
+
+fn forceCompleteAfterReset(device: *Device, original: RequestExecution) void {
+    const locked = lockDevice(device);
+    if (original.slot_index >= device.request_slots.len) {
+        unlockDevice(device, locked);
+        return;
+    }
+    const slot = &device.request_slots[original.slot_index];
+    if (slot.state != .active or slot.id != original.id or slot.backend_handle != original.backend_handle) {
+        unlockDevice(device, locked);
+        return;
+    }
+    const request = executionFromSlot(original.slot_index, slot.*);
+    unlockDevice(device, locked);
+    finishRequest(device, request, false, .reset);
 }
 
 pub fn recordSense(index: usize, opcode: u8, key: u8, asc: u8, ascq: u8) void {
@@ -822,7 +982,7 @@ fn writeWithProgressPolicy(index: usize, lba: u64, sectors: u16, data: []const u
     var pin = pinDevice(index) orelse return .{ .err = .invalid_request };
     defer unpinDevice(&pin);
     const device = pin.device;
-    if (device.write_fn == null or !device.writable) {
+    if ((device.write_fn == null and device.async_submit_fn == null) or !device.writable) {
         recordWriteFailure(device, .no_writer);
         return .{ .err = .no_writer };
     }
@@ -901,7 +1061,7 @@ pub fn flush(index: usize) bool {
     var pin = pinDevice(index) orelse return false;
     defer unpinDevice(&pin);
     const device = pin.device;
-    if (device.flush_fn == null) return true;
+    if (device.flush_fn == null and device.async_submit_fn == null) return true;
     const request_id = enqueueRequest(device, .flush, 0, 0, null, null, 0, .none) orelse {
         recordFlushFailure(device, device.stats.last_error);
         return false;
@@ -926,6 +1086,11 @@ fn enqueueRequest(
     const finite_deadline = if (forever) std.math.maxInt(u64) else timer.deadlineAfter(wait_start, timeout);
     while (true) {
         const locked = lockDevice(device);
+        if (device.resetting) {
+            unlockDevice(device, locked);
+            recordQueueBackpressure(device, .busy);
+            return null;
+        }
         if (findFreeSlot(device)) |slot_index| {
             device.stats.next_request_id +%= 1;
             const id = device.stats.next_request_id;
@@ -964,7 +1129,11 @@ fn enqueueRequest(
         const remaining = if (forever) sync.WAIT_FOREVER else finite_deadline - now;
         const wait_result = device.slot_available.wait(remaining, "block-slot");
         if (wait_result == .signaled) continue;
-        recordQueueBackpressure(device, if (wait_result == .timeout) .timeout else .busy);
+        recordQueueBackpressure(device, switch (wait_result) {
+            .timeout => .timeout,
+            .cancelled, .killed, .failed => .cancelled,
+            else => .busy,
+        });
         return null;
     }
 }
@@ -992,12 +1161,109 @@ fn scheduleDeviceQueue(device: *Device, use_runtime_worker: bool) void {
 
 fn pumpDeviceQueue(device: *Device, mode: ExecutionMode) bool {
     var did_work = false;
-    while (beginNextRequest(device, mode)) |request| {
+    while (true) {
+        if (takeReadyCompletion(device)) |ready| {
+            did_work = true;
+            const result = classifyAsyncCompletion(ready.request, ready.completion);
+            finishRequest(device, ready.request, result.ok, result.err);
+            continue;
+        }
+        const request = beginNextRequest(device, mode) orelse break;
         did_work = true;
+        if (device.async_submit_fn) |submit| {
+            submitAsyncRequest(device, request, submit);
+            continue;
+        }
         const result = executeRequest(device, request);
         finishRequest(device, request, result.ok, result.err);
     }
     return did_work;
+}
+
+const ReadyCompletion = struct {
+    request: RequestExecution,
+    completion: block_dispatch.Completion,
+};
+
+fn takeReadyCompletion(device: *Device) ?ReadyCompletion {
+    const locked = lockDevice(device);
+    var index: usize = 0;
+    while (index < device.request_slots.len) : (index += 1) {
+        const slot = &device.request_slots[index];
+        if (slot.state != .active or slot.backend_handle == 0) continue;
+        const irq_flags = interrupts.saveAndDisable();
+        const completion = slot.completion_latch.take();
+        interrupts.restore(irq_flags);
+        if (completion) |value| {
+            const request = executionFromSlot(index, slot.*);
+            unlockDevice(device, locked);
+            return .{ .request = request, .completion = value };
+        }
+    }
+    unlockDevice(device, locked);
+    return null;
+}
+
+fn submitAsyncRequest(device: *Device, request: RequestExecution, submit: AsyncSubmitFn) void {
+    device.stats.async_submissions +%= 1;
+    runtime_summary.async_submissions +%= 1;
+    const public_request = AsyncRequest{
+        .handle = request.backend_handle,
+        .kind = request.kind,
+        .lba = request.lba,
+        .sectors = request.sectors,
+        .buffer = request.buffer,
+        .const_buffer = request.const_buffer,
+        .buffer_len = request.buffer_len,
+        .complete = asyncBackendComplete,
+    };
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) {
+        finishRequest(device, request, false, .busy);
+        return;
+    }
+    defer _ = task_context.leaveUnwind(unwind);
+    const submit_result = submit(device.ctx, &public_request);
+    if (submit_result == 0) return;
+
+    // A backend may complete inline before returning. Completion owns the
+    // terminal result in that race; otherwise the nonzero submit result means
+    // hardware never acquired the request or its buffer.
+    const irq_flags = interrupts.saveAndDisable();
+    const rejected = if (request.slot_index < device.request_slots.len)
+        device.request_slots[request.slot_index].completion_latch.rejectSubmission(request.backend_handle)
+    else
+        false;
+    interrupts.restore(irq_flags);
+    if (!rejected) return;
+    finishRequest(device, request, false, if (submit_result > 0) .busy else backendErrorForKind(request.kind));
+}
+
+fn classifyAsyncCompletion(request: RequestExecution, completion: block_dispatch.Completion) RequestResult {
+    if (completion.result == ASYNC_RESULT_OK) {
+        const expected: u32 = switch (request.kind) {
+            .read, .write => @intCast(request.buffer_len),
+            .flush, .none => 0,
+        };
+        if (completion.bytes == expected) return .{ .ok = true };
+        return .{ .err = backendErrorForKind(request.kind) };
+    }
+    return .{ .err = switch (completion.result) {
+        ASYNC_RESULT_CANCELLED => .cancelled,
+        ASYNC_RESULT_TIMEOUT => .timeout,
+        ASYNC_RESULT_RESET => .reset,
+        ASYNC_RESULT_SHUTDOWN => .shutdown,
+        else => backendErrorForKind(request.kind),
+    } };
+}
+
+fn backendErrorForKind(kind: RequestKind) Error {
+    return switch (kind) {
+        .read => .backend_read,
+        .write => .backend_write,
+        .flush => .backend_flush,
+        .none => .invalid_request,
+    };
 }
 
 fn beginNextRequest(device: *Device, mode: ExecutionMode) ?RequestExecution {
@@ -1006,11 +1272,38 @@ fn beginNextRequest(device: *Device, mode: ExecutionMode) ?RequestExecution {
         unlockDevice(device, locked);
         return null;
     };
+    const queued = &device.request_slots[slot_index];
+    if (device.resetting or !block_dispatch.submissionAllowed(
+        device.active_executions,
+        device.queue_depth,
+        queued.kind == .flush,
+        hasActiveFlush(device),
+    )) {
+        unlockDevice(device, locked);
+        return null;
+    }
     const start_tick = timer.tickCount();
     var slot = &device.request_slots[slot_index];
     slot.state = .active;
     slot.start_tick = start_tick;
+    slot.execution_mode = mode;
+    if (device.async_submit_fn != null) {
+        slot.backend_handle = nextBackendHandle(device.slot_index, slot_index);
+        if (!slot.completion_latch.activate(slot.backend_handle)) {
+            slot.state = .queued;
+            slot.backend_handle = 0;
+            unlockDevice(device, locked);
+            return null;
+        }
+    }
     device.active_executions +|= 1;
+    if (device.active_executions > device.stats.in_flight_high_water) {
+        device.stats.in_flight_high_water = device.active_executions;
+    }
+    runtime_summary.in_flight +|= 1;
+    if (runtime_summary.in_flight > runtime_summary.in_flight_high_water) {
+        runtime_summary.in_flight_high_water = runtime_summary.in_flight;
+    }
     device.stats.dequeued_requests +%= 1;
     device.stats.active_request = snapshotFromSlot(slot.*);
     device.state = .busy;
@@ -1026,6 +1319,7 @@ fn beginNextRequest(device: *Device, mode: ExecutionMode) ?RequestExecution {
         .buffer_ownership = slot.buffer_ownership,
         .start_tick = start_tick,
         .mode = mode,
+        .backend_handle = slot.backend_handle,
     };
     switch (mode) {
         .boot_inline => {
@@ -1045,7 +1339,85 @@ fn beginNextRequest(device: *Device, mode: ExecutionMode) ?RequestExecution {
     return request;
 }
 
+fn executionFromSlot(slot_index: usize, slot: RequestSlot) RequestExecution {
+    return .{
+        .slot_index = slot_index,
+        .id = slot.id,
+        .kind = slot.kind,
+        .lba = slot.lba,
+        .sectors = slot.sectors,
+        .buffer = slot.buffer,
+        .const_buffer = slot.const_buffer,
+        .buffer_len = slot.buffer_len,
+        .buffer_ownership = slot.buffer_ownership,
+        .start_tick = slot.start_tick,
+        .mode = slot.execution_mode,
+        .backend_handle = slot.backend_handle,
+    };
+}
+
+fn hasActiveFlush(device: *const Device) bool {
+    for (device.request_slots) |slot| {
+        if (slot.state == .active and slot.kind == .flush) return true;
+    }
+    return false;
+}
+
+fn nextBackendHandle(device_index: u8, request_slot: usize) u64 {
+    next_backend_handle_sequence = (next_backend_handle_sequence +% 1) & 0x0000_FFFF_FFFF_FFFF;
+    if (next_backend_handle_sequence == 0) next_backend_handle_sequence = 1;
+    return (next_backend_handle_sequence << 16) |
+        (@as(u64, device_index) + 1) << 8 |
+        (@as(u64, @intCast(request_slot)) + 1);
+}
+
+pub fn asyncBackendComplete(handle: u64, result: i32, bytes: u32) callconv(.c) void {
+    const encoded_request = handle & 0xFF;
+    const encoded_device = (handle >> 8) & 0xFF;
+    if (encoded_request == 0 or encoded_device == 0) {
+        runtime_summary.late_completions +%= 1;
+        return;
+    }
+    const request_slot: usize = @intCast(encoded_request - 1);
+    const device_index: usize = @intCast(encoded_device - 1);
+    if (device_index >= devices.len or request_slot >= MAX_REQUEST_QUEUE_DEPTH) {
+        runtime_summary.late_completions +%= 1;
+        return;
+    }
+
+    const irq_flags = interrupts.saveAndDisable();
+    const device_slot = &devices[device_index];
+    if (!device_slot.used) {
+        runtime_summary.late_completions +%= 1;
+        interrupts.restore(irq_flags);
+        return;
+    }
+    const device = &device_slot.device;
+    const slot = &device.request_slots[request_slot];
+    if (slot.state != .active or slot.backend_handle != handle) {
+        device.stats.late_completions +%= 1;
+        runtime_summary.late_completions +%= 1;
+        interrupts.restore(irq_flags);
+        return;
+    }
+    if (!slot.completion_latch.publish(handle, result, bytes)) {
+        device.stats.duplicate_completions +%= 1;
+        runtime_summary.duplicate_completions +%= 1;
+        interrupts.restore(irq_flags);
+        return;
+    }
+    const lane = effectiveWorkerLane(device.controller_lane);
+    interrupts.restore(irq_flags);
+    if (lane != block_dispatch.no_lane) {
+        runtime_summary.worker_wakeups +%= 1;
+        controller_runtime[lane].event.signal();
+    }
+}
+
 fn executeRequest(device: *Device, request: RequestExecution) RequestResult {
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return .{ .err = .busy };
+    defer _ = task_context.leaveUnwind(unwind);
     switch (request.kind) {
         .read => {
             const out_ptr = request.buffer orelse return .{ .err = .buffer_too_small };
@@ -1075,16 +1447,22 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
         return;
     }
     var slot = &device.request_slots[request.slot_index];
-    if (slot.id != request.id or slot.state != .active) {
+    if (slot.id != request.id or slot.state != .active or
+        (request.backend_handle != 0 and slot.backend_handle != request.backend_handle))
+    {
         unlockDevice(device, locked);
         return;
     }
+    const irq_flags = interrupts.saveAndDisable();
+    slot.completion_latch.invalidate();
+    interrupts.restore(irq_flags);
     // Only the exact live execution owns one active count. A stale or double
     // completion must not make quiescence visible while real I/O still runs.
     if (device.active_executions != 0) device.active_executions -= 1;
+    if (runtime_summary.in_flight != 0) runtime_summary.in_flight -= 1;
     const complete_tick = timer.tickCount();
     const latency = if (complete_tick >= request.start_tick) complete_tick - request.start_tick else 0;
-    const timed_out = slot.timeout_requested;
+    const completion_override = slot.completion_override;
     const caller_detached = slot.caller_detached;
     if (caller_detached and slot.buffer_ownership == .bounce_owned) {
         detached_buffer = switch (request.kind) {
@@ -1094,20 +1472,24 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
         };
     }
     slot.state = .completed;
-    slot.ok = if (timed_out) false else ok;
-    slot.err = if (timed_out) .timeout else err;
+    slot.ok = if (completion_override != .none) false else ok;
+    slot.err = if (completion_override != .none) completion_override else err;
     slot.complete_tick = complete_tick;
     device.stats.last_request = snapshotFromSlot(slot.*);
-    device.stats.active_request = .{};
+    device.stats.active_request = oldestActiveSnapshot(device, request.slot_index);
     device.stats.completion_last_ticks = latency;
     device.stats.completion_total_ticks +%= latency;
     if (latency > device.stats.completion_max_ticks) device.stats.completion_max_ticks = latency;
-    if (timed_out) {
-        if (!caller_detached) recordRequestFailure(device, request.kind, .timeout);
+    if (completion_override != .none) {
+        if (!caller_detached) recordRequestFailure(device, request.kind, completion_override);
     } else if (ok) {
         recordRequestSuccess(device, request.kind, request.sectors);
     } else {
         recordRequestFailure(device, request.kind, err);
+    }
+    if (request.backend_handle != 0) {
+        device.stats.async_completions +%= 1;
+        runtime_summary.async_completions +%= 1;
     }
     if (!caller_detached) {
         _ = device.completion_available.wakeAll();
@@ -1365,6 +1747,13 @@ fn waitForRequest(device: *Device, request_id: u64, timeout: u64) RequestResult 
         if (forever) {
             const wait_result = device.completion_available.wait(WATCHDOG_SLICE_TICKS, "block-completion");
             if (wait_result == .signaled) continue;
+            if (wait_result == .cancelled or wait_result == .killed or wait_result == .failed) {
+                switch (requestAbort(device, request_id, .cancelled, CANCEL_REASON_CALLER)) {
+                    .retry => continue,
+                    .done => |result| return result,
+                    .wait_for_completion => {},
+                }
+            }
             watchdog_slices += 1;
             if (shouldReportWatchdogSlice(watchdog_slices)) {
                 watchdogReport(device, request_id, watchdog_slices, &incident_token);
@@ -1374,75 +1763,111 @@ fn waitForRequest(device: *Device, request_id: u64, timeout: u64) RequestResult 
         // A foreign completion wakeup must not restart the caller's entire
         // timeout.  Every pass waits only the remaining absolute budget.
         const now = timer.tickCount();
+        var wait_result: sync.WaitResult = .timeout;
         if (now < finite_deadline) {
-            const wait_result = device.completion_available.wait(finite_deadline - now, "block-completion");
+            wait_result = device.completion_available.wait(finite_deadline - now, "block-completion");
             if (wait_result == .signaled) continue;
         }
-        const timeout_locked = lockDevice(device);
-        if (findSlotById(device, request_id)) |timeout_slot_index| {
-            var timeout_slot = &device.request_slots[timeout_slot_index];
-            switch (timeout_slot.state) {
-                .queued => {
-                    recordRequestFailure(device, timeout_slot.kind, .timeout);
-                    timeout_slot.* = .{};
-                    _ = device.slot_available.wakeOne();
-                    device.stats.completion_timeouts +%= 1;
-                    unlockDevice(device, timeout_locked);
-                    return .{ .err = .timeout };
-                },
-                .active => {
-                    const first_timeout = !timeout_slot.timeout_requested;
-                    if (first_timeout) {
-                        timeout_slot.timeout_requested = true;
-                        device.stats.completion_timeouts +%= 1;
-                    }
-                    switch (block_dispatch.activeTimeoutAction(timeout_slot.buffer_ownership)) {
-                        .wait_for_completion => {
-                            if (first_timeout) {
-                                device.stats.direct_timeout_waits +%= 1;
-                                runtime_summary.direct_timeout_waits +%= 1;
-                            }
-                            unlockDevice(device, timeout_locked);
-                            watchdog_slices += 1;
-                            if (shouldReportWatchdogSlice(watchdog_slices)) {
-                                watchdogReport(device, request_id, watchdog_slices, &incident_token);
-                            }
-                            _ = device.completion_available.wait(WATCHDOG_SLICE_TICKS, "block-direct-completion");
-                            continue;
-                        },
-                        .detach, .detach_with_buffer => |action| {
-                            timeout_slot.caller_detached = true;
-                            recordRequestFailure(device, timeout_slot.kind, .timeout);
-                            const buffer_detached = action == .detach_with_buffer;
-                            unlockDevice(device, timeout_locked);
-                            watchdog_slices += 1;
-                            if (shouldReportWatchdogSlice(watchdog_slices)) {
-                                watchdogReport(device, request_id, watchdog_slices, &incident_token);
-                            }
-                            return .{ .err = .timeout, .buffer_detached = buffer_detached };
-                        },
-                    }
-                },
-                .completed => {
-                    unlockDevice(device, timeout_locked);
-                    continue;
-                },
-                .free => {},
-            }
-        } else {
-            device.stats.timeout_failures +%= 1;
-            device.stats.last_error = .timeout;
+        const abort_error: Error = if (wait_result == .cancelled or wait_result == .killed or wait_result == .failed)
+            .cancelled
+        else
+            .timeout;
+        const abort_reason = if (abort_error == .timeout) CANCEL_REASON_TIMEOUT else CANCEL_REASON_CALLER;
+        switch (requestAbort(device, request_id, abort_error, abort_reason)) {
+            .retry => continue,
+            .done => |result| return result,
+            .wait_for_completion => {
+                watchdog_slices += 1;
+                if (shouldReportWatchdogSlice(watchdog_slices)) {
+                    watchdogReport(device, request_id, watchdog_slices, &incident_token);
+                }
+                _ = device.completion_available.wait(WATCHDOG_SLICE_TICKS, "block-direct-completion");
+                continue;
+            },
         }
-        device.stats.completion_timeouts +%= 1;
-        unlockDevice(device, timeout_locked);
-        return .{ .err = .timeout };
     }
+}
+
+const AbortDisposition = union(enum) {
+    retry,
+    wait_for_completion,
+    done: RequestResult,
+};
+
+fn requestAbort(device: *Device, request_id: u64, abort_error: Error, reason: u32) AbortDisposition {
+    const locked = lockDevice(device);
+    const slot_index = findSlotById(device, request_id) orelse {
+        if (abort_error == .timeout) {
+            device.stats.timeout_failures +%= 1;
+            device.stats.completion_timeouts +%= 1;
+        }
+        device.stats.last_error = abort_error;
+        unlockDevice(device, locked);
+        return .{ .done = .{ .err = abort_error } };
+    };
+    var slot = &device.request_slots[slot_index];
+    switch (slot.state) {
+        .queued => {
+            recordRequestFailure(device, slot.kind, abort_error);
+            if (abort_error == .timeout) device.stats.completion_timeouts +%= 1;
+            slot.* = .{};
+            _ = device.slot_available.wakeOne();
+            unlockDevice(device, locked);
+            return .{ .done = .{ .err = abort_error } };
+        },
+        .completed => {
+            unlockDevice(device, locked);
+            return .retry;
+        },
+        .active => {
+            const first_abort = slot.completion_override == .none;
+            if (first_abort) slot.completion_override = abort_error;
+            const first_timeout = abort_error == .timeout and !slot.timeout_requested;
+            if (first_timeout) {
+                slot.timeout_requested = true;
+                device.stats.completion_timeouts +%= 1;
+            }
+            const first_cancel = !slot.cancel_requested;
+            if (first_cancel) slot.cancel_requested = true;
+            const request = executionFromSlot(slot_index, slot.*);
+            const action = block_dispatch.activeTimeoutAction(slot.buffer_ownership);
+            if (action == .wait_for_completion) {
+                if (first_timeout) {
+                    device.stats.direct_timeout_waits +%= 1;
+                    runtime_summary.direct_timeout_waits +%= 1;
+                }
+                unlockDevice(device, locked);
+                if (first_cancel) requestBackendCancel(device, request, reason);
+                return .wait_for_completion;
+            }
+
+            const first_detach = !slot.caller_detached;
+            slot.caller_detached = true;
+            if (first_detach) recordRequestFailure(device, slot.kind, abort_error);
+            const buffer_detached = action == .detach_with_buffer;
+            unlockDevice(device, locked);
+            if (first_cancel) requestBackendCancel(device, request, reason);
+            return .{ .done = .{ .err = abort_error, .buffer_detached = buffer_detached } };
+        },
+        .free => {
+            unlockDevice(device, locked);
+            return .{ .done = .{ .err = abort_error } };
+        },
+    }
+}
+
+fn requestBackendCancel(device: *Device, request: RequestExecution, reason: u32) void {
+    if (request.backend_handle == 0) return;
+    const cancel = device.async_cancel_fn orelse return;
+    device.stats.async_cancel_requests +%= 1;
+    runtime_summary.async_cancel_requests +%= 1;
+    _ = cancel(device.ctx, request.backend_handle, reason);
 }
 
 fn recordRequestSuccess(device: *Device, kind: RequestKind, sectors: u16) void {
     device.stats.last_error = .none;
     device.stats.completions += 1;
-    device.state = .active;
+    device.state = if (device.active_executions != 0) .busy else .active;
     switch (kind) {
         .read => {
             device.stats.read_ops += 1;
@@ -1460,7 +1885,7 @@ fn recordRequestSuccess(device: *Device, kind: RequestKind, sectors: u16) void {
 fn recordRequestFailure(device: *Device, kind: RequestKind, err: Error) void {
     device.stats.last_error = err;
     if (err == .timeout) device.stats.timeout_failures += 1;
-    device.state = .failed;
+    device.state = if (device.active_executions != 0) .busy else .failed;
     switch (kind) {
         .read => device.stats.read_failures += 1,
         .write => device.stats.write_failures += 1,
@@ -1512,8 +1937,8 @@ fn requestTimeout(device: *const Device) u64 {
 }
 
 fn effectiveQueueDepth(device: *const Device) usize {
-    const configured: usize = if (device.queue_depth == 0) 1 else @intCast(device.queue_depth);
-    return @min(configured, MAX_REQUEST_QUEUE_DEPTH);
+    _ = device;
+    return MAX_REQUEST_QUEUE_DEPTH;
 }
 
 fn findFreeSlot(device: *Device) ?usize {
@@ -1527,11 +1952,15 @@ fn findFreeSlot(device: *Device) ?usize {
 
 fn findQueuedSlot(device: *Device) ?usize {
     const limit = effectiveQueueDepth(device);
+    var selected: ?usize = null;
     var i: usize = 0;
     while (i < limit) : (i += 1) {
-        if (device.request_slots[i].state == .queued) return i;
+        if (device.request_slots[i].state != .queued) continue;
+        if (selected == null or device.request_slots[i].id < device.request_slots[selected.?].id) {
+            selected = i;
+        }
     }
-    return null;
+    return selected;
 }
 
 fn findSlotById(device: *Device, request_id: u64) ?usize {
@@ -1565,6 +1994,18 @@ fn snapshotFromSlot(slot: RequestSlot) RequestSnapshot {
         .lba = slot.lba,
         .sectors = slot.sectors,
     };
+}
+
+fn oldestActiveSnapshot(device: *const Device, excluding: usize) RequestSnapshot {
+    var selected: ?RequestSlot = null;
+    var index: usize = 0;
+    while (index < device.request_slots.len) : (index += 1) {
+        if (index == excluding) continue;
+        const slot = device.request_slots[index];
+        if (slot.state != .active) continue;
+        if (selected == null or slot.id < selected.?.id) selected = slot;
+    }
+    return if (selected) |slot| snapshotFromSlot(slot) else .{};
 }
 
 fn lockDevice(device: *Device) bool {
@@ -1753,7 +2194,9 @@ pub fn parallelDispatchSelfTest() bool {
     const fast_unregistered = unregister(fast_index);
     const slow_unregistered = unregister(slow_index);
     ok = fast_unregistered and slow_unregistered and ok;
-    return dispatchSelfTestResult(ok, before, after);
+    const dispatch_ok = dispatchSelfTestResult(ok, before, after);
+    const async_ok = asyncDispatchSelfTest();
+    return dispatch_ok and async_ok;
 }
 
 fn dispatchTestSlowRead(_: ?*anyopaque, _: u64, _: u16, out: []u8) bool {
@@ -1799,6 +2242,316 @@ fn dispatchSelfTestResult(ok: bool, before: RuntimeSummary, after: RuntimeSummar
     return ok;
 }
 
+const AsyncTestState = struct {
+    submissions: u32 = 0,
+    cancels: u32 = 0,
+    timeout_cancels: u32 = 0,
+    reset_cancels: u32 = 0,
+    resets: u32 = 0,
+    requests: [8]AsyncRequest = undefined,
+};
+
+var async_test_state: AsyncTestState = .{};
+var async_test_submitted = sync.EventV2.initMode(false, .auto_reset);
+var async_test_first_done = sync.EventV2.initMode(false, .auto_reset);
+var async_test_second_done = sync.EventV2.initMode(false, .auto_reset);
+var async_test_reset_done = sync.EventV2.initMode(false, .auto_reset);
+var async_test_timeout_done = sync.EventV2.initMode(false, .auto_reset);
+var async_test_flush_first_done = sync.EventV2.initMode(false, .auto_reset);
+var async_test_flush_done = sync.EventV2.initMode(false, .auto_reset);
+var async_test_flush_last_done = sync.EventV2.initMode(false, .auto_reset);
+var async_test_index: usize = 0;
+var async_test_first_ok = false;
+var async_test_second_ok = false;
+var async_test_reset_ok = true;
+var async_test_timeout_ok = true;
+var async_test_flush_first_ok = false;
+var async_test_flush_ok = false;
+var async_test_flush_last_ok = false;
+var async_test_first_buffer: [512]u8 = .{0} ** 512;
+var async_test_second_buffer: [512]u8 = .{0} ** 512;
+var async_test_reset_buffer: [512]u8 = .{0} ** 512;
+var async_test_timeout_buffer: [512]u8 = .{0} ** 512;
+var async_test_flush_first_buffer: [512]u8 = .{0} ** 512;
+var async_test_flush_last_buffer: [512]u8 = .{0} ** 512;
+
+fn asyncDispatchSelfTest() bool {
+    async_test_state = .{};
+    async_test_submitted = sync.EventV2.initMode(false, .auto_reset);
+    async_test_first_done = sync.EventV2.initMode(false, .auto_reset);
+    async_test_second_done = sync.EventV2.initMode(false, .auto_reset);
+    async_test_reset_done = sync.EventV2.initMode(false, .auto_reset);
+    async_test_timeout_done = sync.EventV2.initMode(false, .auto_reset);
+    async_test_flush_first_done = sync.EventV2.initMode(false, .auto_reset);
+    async_test_flush_done = sync.EventV2.initMode(false, .auto_reset);
+    async_test_flush_last_done = sync.EventV2.initMode(false, .auto_reset);
+    async_test_first_ok = false;
+    async_test_second_ok = false;
+    async_test_reset_ok = true;
+    async_test_timeout_ok = true;
+    async_test_flush_first_ok = false;
+    async_test_flush_ok = false;
+    async_test_flush_last_ok = false;
+    async_test_first_buffer = .{0} ** async_test_first_buffer.len;
+    async_test_second_buffer = .{0} ** async_test_second_buffer.len;
+    async_test_reset_buffer = .{0} ** async_test_reset_buffer.len;
+    async_test_timeout_buffer = .{0} ** async_test_timeout_buffer.len;
+    async_test_flush_first_buffer = .{0} ** async_test_flush_first_buffer.len;
+    async_test_flush_last_buffer = .{0} ** async_test_flush_last_buffer.len;
+    const before = runtimeWorkerSummary();
+
+    const index = register(.{
+        .name = "dispatch-test-async",
+        .controller = "dispatch-test-controller-async",
+        .bus = .ram,
+        .sector_size = 512,
+        .sector_count = 8,
+        .queue_depth = 2,
+        .timeout_ticks = 50,
+        .ctx = &async_test_state,
+        .read_fn = asyncTestSyncRead,
+        .async_submit_fn = asyncTestSubmit,
+        .async_cancel_fn = asyncTestCancel,
+        .async_reset_fn = asyncTestReset,
+    }) orelse return asyncDispatchSelfTestResult(false, before, runtimeWorkerSummary());
+    async_test_index = index;
+
+    var ok = true;
+    if (sched_task.createKernelThreadWithRole("blk-async-a", asyncTestFirstRequester, .batch) == null or
+        sched_task.createKernelThreadWithRole("blk-async-b", asyncTestSecondRequester, .batch) == null)
+    {
+        ok = false;
+    }
+    if (ok and !asyncTestWaitForSubmissions(2)) ok = false;
+    if (ok) {
+        if (get(index)) |device| {
+            if (device.active_executions != 2) ok = false;
+        } else {
+            ok = false;
+        }
+    }
+    if (ok) {
+        const second = asyncTestFindRequest(.read, 1) orelse return asyncDispatchSelfTestResult(false, before, runtimeWorkerSummary());
+        const first = asyncTestFindRequest(.read, 0) orelse return asyncDispatchSelfTestResult(false, before, runtimeWorkerSummary());
+        if (second.buffer) |buffer| @memset(buffer[0..second.buffer_len], 0xB2);
+        if (first.buffer) |buffer| @memset(buffer[0..first.buffer_len], 0xA1);
+        second.complete(second.handle, ASYNC_RESULT_OK, @intCast(second.buffer_len));
+        second.complete(second.handle, ASYNC_RESULT_OK, @intCast(second.buffer_len));
+        first.complete(first.handle, ASYNC_RESULT_OK, @intCast(first.buffer_len));
+    }
+    if (async_test_first_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled or
+        async_test_second_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled)
+    {
+        ok = false;
+    }
+    ok = async_test_first_ok and async_test_second_ok and
+        async_test_first_buffer[0] == 0xA1 and async_test_second_buffer[0] == 0xB2 and ok;
+
+    const reset_task = sched_task.createKernelThreadWithRole("blk-async-reset", asyncTestResetRequester, .batch);
+    if (reset_task == null) {
+        ok = false;
+    }
+    if (ok and !asyncTestWaitForSubmissions(3)) ok = false;
+    var late_handle: u64 = 0;
+    if (ok) {
+        late_handle = (asyncTestFindRequest(.read, 2) orelse return asyncDispatchSelfTestResult(false, before, runtimeWorkerSummary())).handle;
+        const kill_deferrals_before = sched_task.killHeldLockDeferrals();
+        if (sched_task.kill(reset_task.?.id) or sched_task.killHeldLockDeferrals() <= kill_deferrals_before) ok = false;
+        // Unload admission must remain transactional while either a caller pin
+        // or a hardware-owned request is live.
+        if (unregister(index)) ok = false;
+        if (!reset(index, CANCEL_REASON_RESET)) ok = false;
+    }
+    if (async_test_reset_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled) ok = false;
+    if (late_handle != 0) asyncBackendComplete(late_handle, ASYNC_RESULT_OK, 512);
+
+    if (sched_task.createKernelThreadWithRole("blk-async-timeout", asyncTestTimeoutRequester, .batch) == null) {
+        ok = false;
+    }
+    if (ok and !asyncTestWaitForSubmissions(4)) ok = false;
+    if (async_test_timeout_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled) ok = false;
+    ok = !async_test_timeout_ok and async_test_state.timeout_cancels == 1 and ok;
+
+    // Queue read -> flush -> read while depth two is available. The flush may
+    // not be submitted beside the first read, and the later read may not pass
+    // it. This covers the actual async path rather than only the pure policy.
+    if (sched_task.createKernelThreadWithRole("blk-async-before-flush", asyncTestFlushFirstRequester, .batch) == null) {
+        ok = false;
+    }
+    if (ok and !asyncTestWaitForSubmissions(5)) ok = false;
+    if (sched_task.createKernelThreadWithRole("blk-async-flush", asyncTestFlushRequester, .batch) == null) {
+        ok = false;
+    }
+    if (ok and (async_test_submitted.waitResult(5) != .timeout or queueUsed(index) != 2)) ok = false;
+    if (sched_task.createKernelThreadWithRole("blk-async-after-flush", asyncTestFlushLastRequester, .batch) == null) {
+        ok = false;
+    }
+    if (ok and (async_test_submitted.waitResult(5) != .timeout or queueUsed(index) != 3)) ok = false;
+    if (ok) {
+        const first = async_test_state.requests[4];
+        if (first.kind != .read or first.lba != 4) {
+            ok = false;
+        } else {
+            if (first.buffer) |buffer| @memset(buffer[0..first.buffer_len], 0xC4);
+            first.complete(first.handle, ASYNC_RESULT_OK, @intCast(first.buffer_len));
+        }
+    }
+    if (ok and !asyncTestWaitForSubmissions(6)) ok = false;
+    if (ok) {
+        const flush_request = async_test_state.requests[5];
+        if (flush_request.kind != .flush or async_test_state.submissions != 6) {
+            ok = false;
+        } else {
+            flush_request.complete(flush_request.handle, ASYNC_RESULT_OK, 0);
+        }
+    }
+    if (ok and !asyncTestWaitForSubmissions(7)) ok = false;
+    if (ok) {
+        const last = async_test_state.requests[6];
+        if (last.kind != .read or last.lba != 5) {
+            ok = false;
+        } else {
+            if (last.buffer) |buffer| @memset(buffer[0..last.buffer_len], 0xD5);
+            last.complete(last.handle, ASYNC_RESULT_OK, @intCast(last.buffer_len));
+        }
+    }
+    if (async_test_flush_first_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled or
+        async_test_flush_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled or
+        async_test_flush_last_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled)
+    {
+        ok = false;
+    }
+    ok = async_test_flush_first_ok and async_test_flush_ok and async_test_flush_last_ok and
+        async_test_flush_first_buffer[0] == 0xC4 and async_test_flush_last_buffer[0] == 0xD5 and ok;
+
+    const after = runtimeWorkerSummary();
+    ok = !async_test_reset_ok and
+        async_test_state.cancels == 2 and
+        async_test_state.reset_cancels == 1 and
+        async_test_state.resets == 1 and
+        after.in_flight_high_water >= 2 and
+        after.duplicate_completions > before.duplicate_completions and
+        after.late_completions > before.late_completions and ok;
+    ok = unregister(index) and ok;
+    return asyncDispatchSelfTestResult(ok, before, after);
+}
+
+fn asyncTestWaitForSubmissions(expected: u32) bool {
+    while (async_test_state.submissions < expected) {
+        if (async_test_submitted.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled) return false;
+    }
+    return async_test_state.submissions == expected;
+}
+
+fn asyncTestFindRequest(kind: RequestKind, lba: u64) ?AsyncRequest {
+    var index: usize = 0;
+    while (index < async_test_state.submissions) : (index += 1) {
+        const request = async_test_state.requests[index];
+        if (request.kind == kind and request.lba == lba) return request;
+    }
+    return null;
+}
+
+fn asyncTestSyncRead(_: ?*anyopaque, _: u64, _: u16, _: []u8) bool {
+    return false;
+}
+
+fn asyncTestSubmit(ctx: ?*anyopaque, request: *const AsyncRequest) i32 {
+    const state: *AsyncTestState = @ptrCast(@alignCast(ctx orelse return -1));
+    if (state.submissions >= state.requests.len) return -1;
+    state.requests[state.submissions] = request.*;
+    state.submissions += 1;
+    async_test_submitted.signal();
+    return 0;
+}
+
+fn asyncTestCancel(ctx: ?*anyopaque, handle: u64, reason: u32) i32 {
+    const state: *AsyncTestState = @ptrCast(@alignCast(ctx orelse return -1));
+    state.cancels += 1;
+    if (reason == CANCEL_REASON_TIMEOUT) {
+        state.timeout_cancels += 1;
+        var index: usize = 0;
+        while (index < state.submissions) : (index += 1) {
+            const request = state.requests[index];
+            if (request.handle != handle) continue;
+            request.complete(handle, ASYNC_RESULT_CANCELLED, 0);
+            return 0;
+        }
+        return -1;
+    }
+    if (reason == CANCEL_REASON_RESET) state.reset_cancels += 1;
+    return 0;
+}
+
+fn asyncTestReset(ctx: ?*anyopaque, _: u32) i32 {
+    const state: *AsyncTestState = @ptrCast(@alignCast(ctx orelse return -1));
+    state.resets += 1;
+    return 0;
+}
+
+fn asyncTestFirstRequester() callconv(.c) void {
+    async_test_first_ok = readDirect(async_test_index, 0, 1, async_test_first_buffer[0..]);
+    async_test_first_done.signal();
+    scheduler.exitCurrent();
+}
+
+fn asyncTestSecondRequester() callconv(.c) void {
+    async_test_second_ok = readDirect(async_test_index, 1, 1, async_test_second_buffer[0..]);
+    async_test_second_done.signal();
+    scheduler.exitCurrent();
+}
+
+fn asyncTestResetRequester() callconv(.c) void {
+    async_test_reset_ok = readDirect(async_test_index, 2, 1, async_test_reset_buffer[0..]);
+    async_test_reset_done.signal();
+    scheduler.exitCurrent();
+}
+
+fn asyncTestTimeoutRequester() callconv(.c) void {
+    async_test_timeout_ok = readDirect(async_test_index, 3, 1, async_test_timeout_buffer[0..]);
+    async_test_timeout_done.signal();
+    scheduler.exitCurrent();
+}
+
+fn asyncTestFlushFirstRequester() callconv(.c) void {
+    async_test_flush_first_ok = readDirect(async_test_index, 4, 1, async_test_flush_first_buffer[0..]);
+    async_test_flush_first_done.signal();
+    scheduler.exitCurrent();
+}
+
+fn asyncTestFlushRequester() callconv(.c) void {
+    async_test_flush_ok = flush(async_test_index);
+    async_test_flush_done.signal();
+    scheduler.exitCurrent();
+}
+
+fn asyncTestFlushLastRequester() callconv(.c) void {
+    async_test_flush_last_ok = readDirect(async_test_index, 5, 1, async_test_flush_last_buffer[0..]);
+    async_test_flush_last_done.signal();
+    scheduler.exitCurrent();
+}
+
+fn asyncDispatchSelfTestResult(ok: bool, before: RuntimeSummary, after: RuntimeSummary) bool {
+    k.puts("BLOCKASYNCCHECK ");
+    k.puts(if (ok) "OK" else "FAIL");
+    k.puts(" inflightMax=");
+    k.putDec(after.in_flight_high_water);
+    k.puts(" submits=");
+    k.putDec(after.async_submissions -| before.async_submissions);
+    k.puts(" completions=");
+    k.putDec(after.async_completions -| before.async_completions);
+    k.puts(" duplicates=");
+    k.putDec(after.duplicate_completions -| before.duplicate_completions);
+    k.puts(" late=");
+    k.putDec(after.late_completions -| before.late_completions);
+    k.puts(" resets=");
+    k.putDec(after.async_resets -| before.async_resets);
+    k.puts(" cancels=");
+    k.putDec(after.async_cancel_requests -| before.async_cancel_requests);
+    k.puts("\r\n");
+    return ok;
+}
+
 fn busName(bus: Bus) []const u8 {
     return switch (bus) {
         .unknown => "unknown",
@@ -1834,6 +2587,9 @@ fn errorName(err: Error) []const u8 {
         .backend_read => "backend-read",
         .backend_write => "backend-write",
         .backend_flush => "backend-flush",
+        .cancelled => "cancelled",
+        .reset => "reset",
+        .shutdown => "shutdown",
     };
 }
 

@@ -10,6 +10,8 @@ const pci_inventory = @import("../platform/pci_inventory.zig");
 const platform_cpu = @import("../platform/cpu.zig");
 const paging = @import("../memory/paging.zig");
 const phys = @import("../memory/phys.zig");
+const memory_layout = @import("../memory/layout.zig");
+const dma_segments = @import("dma_segments.zig");
 const protocol_api = @import("protocol_api.zig");
 const r4p = @import("../program/r4p.zig");
 const irq_router = @import("irq_router.zig");
@@ -21,15 +23,15 @@ const timer = @import("timer.zig");
 const usb_host = @import("../driver/usb/host_controller.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 18 (0.69.28): append-only um produktiven R4P-Dispatch fuer
-// Laufzeitdaten externer Treiber erweitert.
-pub const VERSION: u32 = 18;
+// Version 19 (0.69.39): append-only um ownergebundene Pin-/Segment-DMA-
+// Abbildungen mit expliziter Synchronisation erweitert.
+pub const VERSION: u32 = 19;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
 const AUDIO_BACKEND_FORMAT_U8: u32 = 1 << 1;
 const SYNTH_ENGINE_VERSION: u32 = 1;
-const STORAGE_BACKEND_VERSION: u32 = 1;
+const STORAGE_BACKEND_VERSION: u32 = 2;
 const STORAGE_BACKEND_FLAG_REMOVABLE: u32 = 1 << 0;
 const STORAGE_BACKEND_FLAG_WRITABLE: u32 = 1 << 1;
 const STORAGE_SOURCE_BUILTIN: u32 = 0;
@@ -56,9 +58,13 @@ const MAX_R4D_NET_BACKENDS: usize = 8;
 const MAX_R4D_NET_NAME: usize = 32;
 const MAX_R4D_STORAGE_BACKENDS: usize = 8;
 const MAX_R4D_STORAGE_NAME: usize = 32;
+const STORAGE_CALLBACK_OWNER_CAPACITY: usize = 8;
 const MAX_R4D_AUDIO_BACKENDS: usize = 4;
 const MAX_R4D_AUDIO_NAME: usize = 32;
 const MAX_R4D_DMA_ALLOCATIONS: usize = 32;
+const MAX_R4D_DMA_PINS: usize = 32;
+const MAX_R4D_DMA_MAPPINGS: usize = 32;
+const MAX_R4D_DMA_MAP_BYTES: u32 = 16 * 1024 * 1024;
 const MAX_MMIO_MAP_BYTES: u64 = 16 * 1024 * 1024;
 const MMIO_MAP_WRITE_COMBINING: u32 = 1 << 0;
 
@@ -74,6 +80,55 @@ pub const DmaBuffer = extern struct {
     alignment: u32 = 0,
     flags: u32 = 0,
     reserved: u32 = 0,
+};
+
+pub const DMA_ABI_VERSION: u32 = 1;
+pub const DMA_DIRECTION_BIDIRECTIONAL: u32 = 0;
+pub const DMA_DIRECTION_TO_DEVICE: u32 = 1;
+pub const DMA_DIRECTION_FROM_DEVICE: u32 = 2;
+pub const DMA_FLAG_COHERENT: u16 = 1 << 0;
+pub const DMA_FLAG_STREAMING: u16 = 1 << 1;
+pub const DMA_FLAG_ALLOW_BOUNCE: u16 = 1 << 2;
+pub const DMA_MAPPING_FLAG_BOUNCED: u32 = 1 << 16;
+
+pub const DmaSegment = dma_segments.Segment;
+
+pub const DmaPinnedBuffer = extern struct {
+    version: u32 = DMA_ABI_VERSION,
+    size: u32 = @sizeOf(DmaPinnedBuffer),
+    handle: u64 = 0,
+    virt_addr: u64 = 0,
+    bytes: u32 = 0,
+    page_count: u32 = 0,
+    flags: u32 = 0,
+    reserved: u32 = 0,
+};
+
+pub const DmaConstraints = extern struct {
+    version: u32 = DMA_ABI_VERSION,
+    size: u32 = @sizeOf(DmaConstraints),
+    dma_mask: u64 = std.math.maxInt(u64),
+    boundary: u64 = 0,
+    max_segment_bytes: u32 = 0,
+    alignment: u32 = 1,
+    max_segments: u16 = dma_segments.max_segments,
+    flags: u16 = DMA_FLAG_COHERENT | DMA_FLAG_ALLOW_BOUNCE,
+    reserved: u32 = 0,
+};
+
+pub const DmaMapping = extern struct {
+    version: u32 = DMA_ABI_VERSION,
+    size: u32 = @sizeOf(DmaMapping),
+    handle: u64 = 0,
+    pin_handle: u64 = 0,
+    requested_bytes: u32 = 0,
+    mapped_bytes: u32 = 0,
+    direction: u32 = DMA_DIRECTION_BIDIRECTIONAL,
+    flags: u32 = 0,
+    segment_count: u16 = 0,
+    reserved0: u16 = 0,
+    reserved1: u32 = 0,
+    segments: [dma_segments.max_segments]DmaSegment = .{DmaSegment{}} ** dma_segments.max_segments,
 };
 
 pub const PciDeviceInfo = extern struct {
@@ -162,6 +217,25 @@ pub const StorageBackendStatus = extern struct {
     recovery_failures: u64,
 };
 
+pub const StorageRequestComplete = storage.AsyncCompleteFn;
+
+pub const StorageRequest = extern struct {
+    version: u32 = 1,
+    size: u32 = @sizeOf(StorageRequest),
+    handle: u64 = 0,
+    operation: u32 = 0,
+    flags: u32 = 0,
+    lba: u64 = 0,
+    sectors: u32 = 0,
+    buffer_bytes: u32 = 0,
+    buffer_addr: u64 = 0,
+    complete: StorageRequestComplete,
+};
+
+pub const StorageSubmitFn = *const fn (?*anyopaque, *const StorageRequest) callconv(.c) i32;
+pub const StorageCancelFn = *const fn (?*anyopaque, u64, u32) callconv(.c) i32;
+pub const StorageResetFn = *const fn (?*anyopaque, u32) callconv(.c) i32;
+
 pub const StorageBackendDescriptor = extern struct {
     version: u32,
     size: u32,
@@ -180,7 +254,14 @@ pub const StorageBackendDescriptor = extern struct {
     flush: ?*const fn (?*anyopaque) callconv(.c) i32,
     shutdown: ?*const fn (?*anyopaque) callconv(.c) i32,
     status: ?*const fn (?*anyopaque, *StorageBackendStatus) callconv(.c) i32,
+    // Version 2 append-only async contract. A missing submit callback keeps
+    // the complete v1 prefix on the synchronous depth-one adapter.
+    submit: ?StorageSubmitFn,
+    cancel: ?StorageCancelFn,
+    reset: ?StorageResetFn,
 };
+
+const STORAGE_BACKEND_V1_SIZE: u32 = @intCast(@offsetOf(StorageBackendDescriptor, "submit"));
 
 pub const UsbHostStatus = usb_host.Status;
 pub const UsbDeviceHandle = usb_host.DeviceHandle;
@@ -246,6 +327,33 @@ const DmaAllocation = struct {
     bytes: u32 = 0,
 };
 
+const DmaPinRecord = struct {
+    used: bool = false,
+    generation: u64 = 0,
+    owner: u32 = 0,
+    virt_addr: u64 = 0,
+    bytes: u32 = 0,
+    page_count: u32 = 0,
+    map_count: u32 = 0,
+};
+
+const DmaMappingRecord = struct {
+    used: bool = false,
+    generation: u64 = 0,
+    owner: u32 = 0,
+    pin_slot: usize = 0,
+    pin_handle: u64 = 0,
+    direction: u32 = DMA_DIRECTION_BIDIRECTIONAL,
+    flags: u32 = 0,
+    original_virt: u64 = 0,
+    requested_bytes: u32 = 0,
+    bounce_phys: u64 = 0,
+    bounce_virt: u64 = 0,
+    bounce_bytes: u32 = 0,
+    device_owned: bool = false,
+    segments: dma_segments.SegmentList = .{},
+};
+
 const MsiAllocation = struct {
     used: bool = false,
     owner: u32 = 0,
@@ -266,7 +374,26 @@ const MsiOwnerCleanupResult = struct {
 
 var current_owner: u32 = 0;
 var current_owner_guard = sync.UnwindGuard.init("r4d-owner");
+
+const StorageCallbackOwner = struct {
+    used: bool = false,
+    task_id: u32 = 0,
+    owner: u32 = 0,
+    depth: u32 = 0,
+};
+
+const StorageCallbackToken = struct {
+    slot: usize,
+    task_id: u32,
+};
+
+var storage_callback_owners: [STORAGE_CALLBACK_OWNER_CAPACITY]StorageCallbackOwner =
+    .{StorageCallbackOwner{}} ** STORAGE_CALLBACK_OWNER_CAPACITY;
 var dma_allocations: [MAX_R4D_DMA_ALLOCATIONS]DmaAllocation = .{DmaAllocation{}} ** MAX_R4D_DMA_ALLOCATIONS;
+var dma_pins: [MAX_R4D_DMA_PINS]DmaPinRecord = .{DmaPinRecord{}} ** MAX_R4D_DMA_PINS;
+var dma_pin_generations: [MAX_R4D_DMA_PINS]u64 = .{0} ** MAX_R4D_DMA_PINS;
+var dma_mappings: [MAX_R4D_DMA_MAPPINGS]DmaMappingRecord = .{DmaMappingRecord{}} ** MAX_R4D_DMA_MAPPINGS;
+var dma_mapping_generations: [MAX_R4D_DMA_MAPPINGS]u64 = .{0} ** MAX_R4D_DMA_MAPPINGS;
 
 pub const OwnerCleanupToken = struct {
     owner: u32 = 0,
@@ -523,6 +650,15 @@ pub const Table = extern struct {
     // 0.69.28 (Version 18, append-only): synchroner R4P-Dispatch fuer
     // Treiber-Hotpaths, die den installierten Protokollvertrag benoetigen.
     protocol_dispatch: *const fn ([*:0]const u8, u32, *const protocol_api.ProtocolBuffer, *protocol_api.ProtocolBuffer) callconv(.c) i32,
+    // 0.69.39 (Version 19, append-only): vorhandene residente Puffer werden
+    // erst ownergebunden gepinnt, danach unter harten Hardwaregrenzen auf
+    // eine feste Segmentliste oder einen kontrollierten Bouncepfad gemappt.
+    dma_pin_buffer: *const fn (u64, u32, u32, *DmaPinnedBuffer) callconv(.c) i32,
+    dma_map_pinned: *const fn (*const DmaPinnedBuffer, *const DmaConstraints, u32, *DmaMapping) callconv(.c) i32,
+    dma_sync_for_device: *const fn (*const DmaMapping) callconv(.c) i32,
+    dma_sync_for_cpu: *const fn (*const DmaMapping) callconv(.c) i32,
+    dma_unmap: *const fn (*DmaMapping) callconv(.c) i32,
+    dma_unpin_buffer: *const fn (*DmaPinnedBuffer) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -585,6 +721,12 @@ pub var table = Table{
     .alloc_dma_region_constrained = allocDmaRegionConstrained,
     .pci_disable_msi = pciDisableMsi,
     .protocol_dispatch = protocolDispatch,
+    .dma_pin_buffer = dmaPinBuffer,
+    .dma_map_pinned = dmaMapPinned,
+    .dma_sync_for_device = dmaSyncForDevice,
+    .dma_sync_for_cpu = dmaSyncForCpu,
+    .dma_unmap = dmaUnmap,
+    .dma_unpin_buffer = dmaUnpinBuffer,
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
@@ -661,10 +803,11 @@ fn allocDmaBuffer(bytes: u32, alignment: u32) callconv(.c) u64 {
 }
 
 fn freeDmaBuffer(phys_addr: u64, bytes: u32) callconv(.c) void {
+    _ = bytes;
     if (phys_addr == 0) return;
-    const frames = frameCount(bytes) orelse 1;
-    untrackDmaAllocation(phys_addr);
-    phys.freeContiguousFrames(phys_addr, frames);
+    const allocation = takeDmaAllocation(activeOwner(), phys_addr) orelse return;
+    const frames = frameCount(allocation.bytes) orelse return;
+    phys.freeContiguousFrames(allocation.phys_addr, frames);
 }
 
 fn allocDmaRegion(bytes: u32, alignment: u32, out: *DmaBuffer) callconv(.c) i32 {
@@ -673,6 +816,8 @@ fn allocDmaRegion(bytes: u32, alignment: u32, out: *DmaBuffer) callconv(.c) i32 
 
 fn allocDmaRegionConstrained(bytes: u32, alignment: u32, max_phys_addr: u64, out: *DmaBuffer) callconv(.c) i32 {
     out.* = .{};
+    const owner = activeOwner();
+    if (owner == 0 or irq_router.inDispatch()) return -6;
     const dma_alignment = if (alignment == 0) @as(u32, @intCast(phys.FRAME_SIZE)) else alignment;
     if (bytes == 0) return -1;
     if (@as(u64, dma_alignment) > phys.FRAME_SIZE) return -2;
@@ -682,7 +827,7 @@ fn allocDmaRegionConstrained(bytes: u32, alignment: u32, max_phys_addr: u64, out
     const total_bytes = frames * phys.FRAME_SIZE;
     const data: [*]u8 = @ptrFromInt(virt_addr);
     @memset(data[0..@intCast(total_bytes)], 0);
-    if (!trackDmaAllocation(current_owner, phys_addr, @intCast(total_bytes))) {
+    if (!trackDmaAllocation(owner, phys_addr, @intCast(total_bytes))) {
         phys.freeContiguousFrames(phys_addr, frames);
         return -5;
     }
@@ -702,10 +847,304 @@ fn freeDmaRegion(buffer: *DmaBuffer) callconv(.c) void {
         buffer.* = .{};
         return;
     }
-    const frames = frameCount(buffer.bytes) orelse 0;
-    untrackDmaAllocation(buffer.phys_addr);
-    if (frames > 0) phys.freeContiguousFrames(buffer.phys_addr, frames);
+    if (irq_router.inDispatch()) return;
+    const allocation = takeDmaAllocation(activeOwner(), buffer.phys_addr) orelse return;
+    const frames = frameCount(allocation.bytes) orelse 0;
+    if (frames > 0) phys.freeContiguousFrames(allocation.phys_addr, frames);
     buffer.* = .{};
+}
+
+fn dmaPinBuffer(virt_addr: u64, bytes: u32, flags: u32, out: *DmaPinnedBuffer) callconv(.c) i32 {
+    out.* = .{};
+    const owner = activeOwner();
+    if (owner == 0 or irq_router.inDispatch()) return -1;
+    if (virt_addr == 0 or bytes == 0 or bytes > MAX_R4D_DMA_MAP_BYTES or flags != 0) return -2;
+    const end = std.math.add(u64, virt_addr, bytes) catch return -2;
+    if (end > std.math.maxInt(u64) - (phys.FRAME_SIZE - 1)) return -2;
+    const first_page = alignDown(virt_addr, phys.FRAME_SIZE);
+    const last_page_end = alignUp(end, phys.FRAME_SIZE);
+    if (last_page_end <= first_page) return -2;
+    const page_count_u64 = (last_page_end - first_page) / phys.FRAME_SIZE;
+    if (page_count_u64 == 0 or page_count_u64 > std.math.maxInt(u32)) return -2;
+
+    var page_index: u64 = 0;
+    while (page_index < page_count_u64) : (page_index += 1) {
+        const virt_page = first_page + page_index * phys.FRAME_SIZE;
+        _ = dmaPhysicalPage(virt_page) orelse return -3;
+    }
+
+    const slot = freeDmaPinSlot() orelse return -5;
+    dma_pin_generations[slot] = dma_segments.nextGeneration(dma_pin_generations[slot]);
+    const handle = dma_segments.makeHandle(slot, dma_pin_generations[slot]) orelse return -5;
+    dma_pins[slot] = .{
+        .used = true,
+        .generation = dma_pin_generations[slot],
+        .owner = owner,
+        .virt_addr = virt_addr,
+        .bytes = bytes,
+        .page_count = @intCast(page_count_u64),
+    };
+    out.* = .{
+        .handle = handle,
+        .virt_addr = virt_addr,
+        .bytes = bytes,
+        .page_count = @intCast(page_count_u64),
+        .flags = flags,
+    };
+    return 0;
+}
+
+fn dmaMapPinned(pin: *const DmaPinnedBuffer, constraints: *const DmaConstraints, direction: u32, out: *DmaMapping) callconv(.c) i32 {
+    out.* = .{};
+    const owner = activeOwner();
+    if (owner == 0 or irq_router.inDispatch()) return -1;
+    if (!validDmaPinHeader(pin) or !validDmaConstraints(constraints) or !validDmaDirection(direction)) return -2;
+    const pin_slot = dma_segments.handleSlot(pin.handle, dma_pins.len) orelse return -3;
+    var pinned = &dma_pins[pin_slot];
+    if (!pinned.used or pinned.owner != owner or pinned.generation != dma_segments.handleGeneration(pin.handle) or
+        pinned.virt_addr != pin.virt_addr or pinned.bytes != pin.bytes)
+    {
+        return -3;
+    }
+    if (pinned.map_count == std.math.maxInt(u32)) return -4;
+    const mapping_slot = freeDmaMappingSlot() orelse return -5;
+    const normalized = dmaSegmentConstraints(constraints.*) orelse return -2;
+
+    var mapped_segments = buildPinnedDmaSegments(pinned, normalized) catch |err| switch (err) {
+        error.InvalidArgument, error.Overflow => return -2,
+        error.AddressLimit, error.Alignment, error.TooManySegments => blk: {
+            if ((constraints.flags & DMA_FLAG_ALLOW_BOUNCE) == 0) return -6;
+            break :blk dma_segments.SegmentList{};
+        },
+    };
+    var bounce_phys: u64 = 0;
+    var bounce_virt: u64 = 0;
+    var bounce_bytes: u32 = 0;
+    var mapping_flags: u32 = constraints.flags;
+    if (mapped_segments.count == 0) {
+        const frames = frameCount(pinned.bytes) orelse return -2;
+        bounce_phys = phys.allocContiguousFramesBelow(frames, constraints.dma_mask) orelse return -7;
+        const allocated_bytes = frames * phys.FRAME_SIZE;
+        if (allocated_bytes > std.math.maxInt(u32)) {
+            phys.freeContiguousFrames(bounce_phys, frames);
+            return -7;
+        }
+        bounce_bytes = @intCast(allocated_bytes);
+        bounce_virt = phys.physToVirt(bounce_phys);
+        mapped_segments = dma_segments.singleRange(bounce_phys, pinned.bytes, normalized) catch {
+            phys.freeContiguousFrames(bounce_phys, frames);
+            return -7;
+        };
+        const bounce: [*]u8 = @ptrFromInt(bounce_virt);
+        @memset(bounce[0..bounce_bytes], 0);
+        mapping_flags |= DMA_MAPPING_FLAG_BOUNCED;
+    }
+
+    dma_mapping_generations[mapping_slot] = dma_segments.nextGeneration(dma_mapping_generations[mapping_slot]);
+    const handle = dma_segments.makeHandle(mapping_slot, dma_mapping_generations[mapping_slot]) orelse {
+        if (bounce_phys != 0) phys.freeContiguousFrames(bounce_phys, frameCount(bounce_bytes) orelse 0);
+        return -5;
+    };
+    dma_mappings[mapping_slot] = .{
+        .used = true,
+        .generation = dma_mapping_generations[mapping_slot],
+        .owner = owner,
+        .pin_slot = pin_slot,
+        .pin_handle = pin.handle,
+        .direction = direction,
+        .flags = mapping_flags,
+        .original_virt = pinned.virt_addr,
+        .requested_bytes = pinned.bytes,
+        .bounce_phys = bounce_phys,
+        .bounce_virt = bounce_virt,
+        .bounce_bytes = bounce_bytes,
+        .segments = mapped_segments,
+    };
+    pinned.map_count += 1;
+    if (!syncMappingForDevice(&dma_mappings[mapping_slot])) {
+        releaseDmaMapping(mapping_slot, false);
+        return -8;
+    }
+    out.* = mappingDescriptor(handle, &dma_mappings[mapping_slot]);
+    return 0;
+}
+
+fn dmaSyncForDevice(mapping: *const DmaMapping) callconv(.c) i32 {
+    if (irq_router.inDispatch()) return -1;
+    const slot = dmaMappingSlotForOwner(mapping.handle, activeOwner()) orelse return -2;
+    return if (syncMappingForDevice(&dma_mappings[slot])) 0 else -3;
+}
+
+fn dmaSyncForCpu(mapping: *const DmaMapping) callconv(.c) i32 {
+    if (irq_router.inDispatch()) return -1;
+    const slot = dmaMappingSlotForOwner(mapping.handle, activeOwner()) orelse return -2;
+    return if (syncMappingForCpu(&dma_mappings[slot])) 0 else -3;
+}
+
+fn dmaUnmap(mapping: *DmaMapping) callconv(.c) i32 {
+    if (irq_router.inDispatch()) return -1;
+    const slot = dmaMappingSlotForOwner(mapping.handle, activeOwner()) orelse return -2;
+    releaseDmaMapping(slot, true);
+    mapping.* = .{};
+    return 0;
+}
+
+fn dmaUnpinBuffer(pin: *DmaPinnedBuffer) callconv(.c) i32 {
+    if (irq_router.inDispatch()) return -1;
+    const owner = activeOwner();
+    const slot = dma_segments.handleSlot(pin.handle, dma_pins.len) orelse return -2;
+    const record = &dma_pins[slot];
+    if (!record.used or record.owner != owner or record.generation != dma_segments.handleGeneration(pin.handle)) return -2;
+    if (record.map_count != 0) return -3;
+    record.* = .{};
+    pin.* = .{};
+    return 0;
+}
+
+fn validDmaPinHeader(pin: *const DmaPinnedBuffer) bool {
+    return pin.version == DMA_ABI_VERSION and pin.size >= @sizeOf(DmaPinnedBuffer) and pin.handle != 0;
+}
+
+fn validDmaConstraints(constraints: *const DmaConstraints) bool {
+    const mode = constraints.flags & (DMA_FLAG_COHERENT | DMA_FLAG_STREAMING);
+    const known = DMA_FLAG_COHERENT | DMA_FLAG_STREAMING | DMA_FLAG_ALLOW_BOUNCE;
+    return constraints.version == DMA_ABI_VERSION and
+        constraints.size >= @sizeOf(DmaConstraints) and
+        constraints.reserved == 0 and
+        constraints.max_segments != 0 and
+        constraints.max_segments <= dma_segments.max_segments and
+        constraints.alignment != 0 and
+        constraints.alignment <= phys.FRAME_SIZE and
+        mode != 0 and mode != (DMA_FLAG_COHERENT | DMA_FLAG_STREAMING) and
+        (constraints.flags & ~known) == 0;
+}
+
+fn validDmaDirection(direction: u32) bool {
+    return direction == DMA_DIRECTION_BIDIRECTIONAL or
+        direction == DMA_DIRECTION_TO_DEVICE or
+        direction == DMA_DIRECTION_FROM_DEVICE;
+}
+
+fn dmaSegmentConstraints(constraints: DmaConstraints) ?dma_segments.Constraints {
+    if (constraints.boundary != 0 and (constraints.boundary & (constraints.boundary - 1)) != 0) return null;
+    if ((constraints.alignment & (constraints.alignment - 1)) != 0) return null;
+    return .{
+        .dma_mask = constraints.dma_mask,
+        .boundary = constraints.boundary,
+        .max_segment_bytes = constraints.max_segment_bytes,
+        .alignment = constraints.alignment,
+        .max_segment_count = constraints.max_segments,
+    };
+}
+
+fn buildPinnedDmaSegments(
+    pinned: *const DmaPinRecord,
+    constraints: dma_segments.Constraints,
+) dma_segments.Error!dma_segments.SegmentList {
+    const end = std.math.add(u64, pinned.virt_addr, pinned.bytes) catch return error.Overflow;
+    if (end > std.math.maxInt(u64) - (phys.FRAME_SIZE - 1)) return error.Overflow;
+    const first_page = alignDown(pinned.virt_addr, phys.FRAME_SIZE);
+    const last_page_end = alignUp(end, phys.FRAME_SIZE);
+    const page_count = (last_page_end - first_page) / phys.FRAME_SIZE;
+    if (page_count != pinned.page_count) return error.InvalidArgument;
+
+    var result: dma_segments.SegmentList = .{};
+    var remaining: u64 = pinned.bytes;
+    var page_index: u64 = 0;
+    while (page_index < page_count) : (page_index += 1) {
+        const virt_page = first_page + page_index * phys.FRAME_SIZE;
+        const frame = dmaPhysicalPage(virt_page) orelse return error.InvalidArgument;
+        const offset: u64 = if (page_index == 0) pinned.virt_addr - first_page else 0;
+        const take: u32 = @intCast(@min(remaining, phys.FRAME_SIZE - offset));
+        try dma_segments.appendRange(&result, frame + offset, take, constraints);
+        remaining -= take;
+    }
+    if (remaining != 0) return error.InvalidArgument;
+    return result;
+}
+
+fn dmaPhysicalPage(virt_page: u64) ?u64 {
+    if ((virt_page & (phys.FRAME_SIZE - 1)) != 0) return null;
+    const direct_base = phys.physToVirt(0);
+    const physical_bytes = std.math.mul(u64, phys.stats().total_frames, phys.FRAME_SIZE) catch return null;
+    const direct_end = std.math.add(u64, direct_base, physical_bytes) catch return null;
+    if (virt_page >= direct_base and virt_page < direct_end) return virt_page - direct_base;
+    if (virt_page >= memory_layout.MMIO_BASE and virt_page < memory_layout.FRAMEBUFFER_END) return null;
+    return paging.mappedFrame(virt_page);
+}
+
+fn freeDmaPinSlot() ?usize {
+    for (dma_pins, 0..) |pin, index| if (!pin.used) return index;
+    return null;
+}
+
+fn freeDmaMappingSlot() ?usize {
+    for (dma_mappings, 0..) |mapping, index| if (!mapping.used) return index;
+    return null;
+}
+
+fn dmaMappingSlotForOwner(handle: u64, owner: u32) ?usize {
+    if (owner == 0) return null;
+    const slot = dma_segments.handleSlot(handle, dma_mappings.len) orelse return null;
+    const mapping = &dma_mappings[slot];
+    if (!mapping.used or mapping.owner != owner or mapping.generation != dma_segments.handleGeneration(handle)) return null;
+    return slot;
+}
+
+fn mappingDescriptor(handle: u64, mapping: *const DmaMappingRecord) DmaMapping {
+    var out = DmaMapping{
+        .handle = handle,
+        .pin_handle = mapping.pin_handle,
+        .requested_bytes = mapping.requested_bytes,
+        .mapped_bytes = mapping.requested_bytes,
+        .direction = mapping.direction,
+        .flags = mapping.flags,
+        .segment_count = mapping.segments.count,
+    };
+    @memcpy(out.segments[0..], mapping.segments.segments[0..]);
+    return out;
+}
+
+fn syncMappingForDevice(mapping: *DmaMappingRecord) bool {
+    if (!mapping.used) return false;
+    if (mapping.bounce_virt != 0 and
+        (mapping.direction == DMA_DIRECTION_TO_DEVICE or mapping.direction == DMA_DIRECTION_BIDIRECTIONAL))
+    {
+        const source: [*]const u8 = @ptrFromInt(mapping.original_virt);
+        const target: [*]u8 = @ptrFromInt(mapping.bounce_virt);
+        @memcpy(target[0..mapping.requested_bytes], source[0..mapping.requested_bytes]);
+    }
+    asm volatile ("mfence" ::: .{ .memory = true });
+    mapping.device_owned = true;
+    return true;
+}
+
+fn syncMappingForCpu(mapping: *DmaMappingRecord) bool {
+    if (!mapping.used) return false;
+    asm volatile ("mfence" ::: .{ .memory = true });
+    if (mapping.bounce_virt != 0 and
+        (mapping.direction == DMA_DIRECTION_FROM_DEVICE or mapping.direction == DMA_DIRECTION_BIDIRECTIONAL))
+    {
+        const source: [*]const u8 = @ptrFromInt(mapping.bounce_virt);
+        const target: [*]u8 = @ptrFromInt(mapping.original_virt);
+        @memcpy(target[0..mapping.requested_bytes], source[0..mapping.requested_bytes]);
+    }
+    mapping.device_owned = false;
+    return true;
+}
+
+fn releaseDmaMapping(slot: usize, copy_back: bool) void {
+    if (slot >= dma_mappings.len or !dma_mappings[slot].used) return;
+    const mapping = &dma_mappings[slot];
+    if (copy_back) _ = syncMappingForCpu(mapping);
+    if (mapping.bounce_phys != 0 and mapping.bounce_bytes != 0) {
+        const frames = frameCount(mapping.bounce_bytes) orelse 0;
+        if (frames != 0) phys.freeContiguousFrames(mapping.bounce_phys, frames);
+    }
+    if (mapping.pin_slot < dma_pins.len and dma_pins[mapping.pin_slot].used and dma_pins[mapping.pin_slot].map_count != 0) {
+        dma_pins[mapping.pin_slot].map_count -= 1;
+    }
+    mapping.* = .{};
 }
 
 fn frameCount(bytes: u32) ?u64 {
@@ -765,8 +1204,56 @@ fn driverWorkSummary(out: *DriverWorkSummary) callconv(.c) i32 {
 }
 
 fn activeOwner() u32 {
-    if (current_owner != 0) return current_owner;
-    return irq_router.currentOwner();
+    const irq_owner = irq_router.currentOwner();
+    if (irq_owner != 0) return irq_owner;
+    const storage_owner = currentStorageCallbackOwner();
+    if (storage_owner != 0) return storage_owner;
+    const work_owner = driver_work.currentOwner();
+    if (work_owner != 0) return work_owner;
+    if (current_owner != 0 and current_owner_guard.ownedByCurrent()) return current_owner;
+    return 0;
+}
+
+fn enterStorageCallback(owner: u32) ?StorageCallbackToken {
+    if (owner == 0) return null;
+    // Before scheduler admission the boot path is the only execution owner;
+    // task ID zero is therefore a unique and safe callback identity.
+    const task_id = scheduler.currentId() orelse 0;
+    var free_slot: ?usize = null;
+    for (&storage_callback_owners, 0..) |*entry, index| {
+        if (!entry.used) {
+            if (free_slot == null) free_slot = index;
+            continue;
+        }
+        if (entry.task_id != task_id) continue;
+        if (entry.owner != owner or entry.depth == std.math.maxInt(u32)) return null;
+        entry.depth += 1;
+        return .{ .slot = index, .task_id = task_id };
+    }
+    const slot = free_slot orelse return null;
+    storage_callback_owners[slot] = .{
+        .used = true,
+        .task_id = task_id,
+        .owner = owner,
+        .depth = 1,
+    };
+    return .{ .slot = slot, .task_id = task_id };
+}
+
+fn leaveStorageCallback(token: StorageCallbackToken) void {
+    if (token.slot >= storage_callback_owners.len) return;
+    const entry = &storage_callback_owners[token.slot];
+    if (!entry.used or entry.task_id != token.task_id or entry.depth == 0) return;
+    entry.depth -= 1;
+    if (entry.depth == 0) entry.* = .{};
+}
+
+fn currentStorageCallbackOwner() u32 {
+    const task_id = scheduler.currentId() orelse 0;
+    for (storage_callback_owners) |entry| {
+        if (entry.used and entry.task_id == task_id and entry.depth != 0) return entry.owner;
+    }
+    return 0;
 }
 
 fn pciDeviceCount() callconv(.c) u32 {
@@ -1107,6 +1594,7 @@ fn unregisterAudioBackend(name: [*:0]const u8) callconv(.c) i32 {
 fn registerStorageBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
     const descriptor: *const StorageBackendDescriptor = @ptrCast(@alignCast(backend));
     if (!validStorageBackend(descriptor)) return -1;
+    const async_submit = storageBackendSubmit(descriptor);
     if (storage.findByName(zSlice(name)) != null) {
         bootlog.puts("[R4D][ERROR] storage backend duplicate name ");
         putZ(name);
@@ -1134,7 +1622,7 @@ fn registerStorageBackend(name: [*:0]const u8, backend: *const anyopaque) callco
         .sector_size = descriptor.sector_size,
         .sector_count = descriptor.sector_count,
         .max_sectors_per_request = descriptor.max_sectors_per_request,
-        .queue_depth = descriptor.queue_depth,
+        .queue_depth = if (async_submit != null) descriptor.queue_depth else 1,
         .timeout_ticks = descriptor.timeout_ticks,
         .removable = (descriptor.flags & STORAGE_BACKEND_FLAG_REMOVABLE) != 0,
         .writable = (descriptor.flags & STORAGE_BACKEND_FLAG_WRITABLE) != 0,
@@ -1144,6 +1632,9 @@ fn registerStorageBackend(name: [*:0]const u8, backend: *const anyopaque) callco
         .read_fn = r4dStorageRead,
         .write_fn = if (descriptor.write != null) r4dStorageWrite else null,
         .flush_fn = if (descriptor.flush != null) r4dStorageFlush else null,
+        .async_submit_fn = if (async_submit != null) r4dStorageSubmit else null,
+        .async_cancel_fn = if (storageBackendCancel(descriptor) != null) r4dStorageCancel else null,
+        .async_reset_fn = if (storageBackendReset(descriptor) != null) r4dStorageReset else null,
     }) orelse {
         slot.* = R4DStorageBackend{};
         bootlog.puts("[R4D][ERROR] storage block table full\r\n");
@@ -1325,20 +1816,25 @@ fn synthRenderPcm(descriptor: *const SynthEngineDescriptor) ?audio.SynthRenderPc
 }
 
 fn validStorageBackend(descriptor: *const StorageBackendDescriptor) bool {
-    if (descriptor.version != STORAGE_BACKEND_VERSION) {
+    if (descriptor.version == 0 or descriptor.version > STORAGE_BACKEND_VERSION) {
         bootlog.puts("[R4D][ERROR] storage backend version mismatch\r\n");
         return false;
     }
-    if (descriptor.size < @sizeOf(StorageBackendDescriptor)) {
+    if (descriptor.size < STORAGE_BACKEND_V1_SIZE) {
         bootlog.puts("[R4D][ERROR] storage backend descriptor too small\r\n");
         return false;
     }
-    if (descriptor.read == null) {
+    const async_submit = storageBackendSubmit(descriptor);
+    if (async_submit == null and descriptor.read == null) {
         bootlog.puts("[R4D][ERROR] storage backend missing read callback\r\n");
         return false;
     }
-    if ((descriptor.flags & STORAGE_BACKEND_FLAG_WRITABLE) != 0 and descriptor.write == null) {
+    if (async_submit == null and (descriptor.flags & STORAGE_BACKEND_FLAG_WRITABLE) != 0 and descriptor.write == null) {
         bootlog.puts("[R4D][ERROR] storage backend writable without write callback\r\n");
+        return false;
+    }
+    if (async_submit == null and (storageBackendCancel(descriptor) != null or storageBackendReset(descriptor) != null)) {
+        bootlog.puts("[R4D][ERROR] storage backend async controls without submit\r\n");
         return false;
     }
     if (descriptor.sector_count == 0) {
@@ -1362,6 +1858,24 @@ fn validStorageBackend(descriptor: *const StorageBackendDescriptor) bool {
         return false;
     }
     return true;
+}
+
+fn storageBackendSubmit(descriptor: *const StorageBackendDescriptor) ?StorageSubmitFn {
+    const required: u32 = @intCast(@offsetOf(StorageBackendDescriptor, "submit") + @sizeOf(?StorageSubmitFn));
+    if (descriptor.version < 2 or descriptor.size < required) return null;
+    return descriptor.submit;
+}
+
+fn storageBackendCancel(descriptor: *const StorageBackendDescriptor) ?StorageCancelFn {
+    const required: u32 = @intCast(@offsetOf(StorageBackendDescriptor, "cancel") + @sizeOf(?StorageCancelFn));
+    if (descriptor.version < 2 or descriptor.size < required) return null;
+    return descriptor.cancel;
+}
+
+fn storageBackendReset(descriptor: *const StorageBackendDescriptor) ?StorageResetFn {
+    const required: u32 = @intCast(@offsetOf(StorageBackendDescriptor, "reset") + @sizeOf(?StorageResetFn));
+    if (descriptor.version < 2 or descriptor.size < required) return null;
+    return descriptor.reset;
 }
 
 fn validUsbHostController(descriptor: *const UsbHostControllerDescriptor) bool {
@@ -1462,6 +1976,8 @@ fn r4dStorageRead(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
     const raw = ctx orelse return false;
     const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
     const read = backend.descriptor.read orelse return false;
+    const callback = enterStorageCallback(backend.owner) orelse return false;
+    defer leaveStorageCallback(callback);
     return read(backend.descriptor.context, lba, sectors, out.ptr, @intCast(out.len)) == 0;
 }
 
@@ -1469,6 +1985,8 @@ fn r4dStorageWrite(ctx: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) b
     const raw = ctx orelse return false;
     const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
     const write = backend.descriptor.write orelse return false;
+    const callback = enterStorageCallback(backend.owner) orelse return false;
+    defer leaveStorageCallback(callback);
     return write(backend.descriptor.context, lba, sectors, data.ptr, @intCast(data.len)) == 0;
 }
 
@@ -1476,7 +1994,50 @@ fn r4dStorageFlush(ctx: ?*anyopaque) bool {
     const raw = ctx orelse return false;
     const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
     const flush = backend.descriptor.flush orelse return true;
+    const callback = enterStorageCallback(backend.owner) orelse return false;
+    defer leaveStorageCallback(callback);
     return flush(backend.descriptor.context) == 0;
+}
+
+fn r4dStorageSubmit(ctx: ?*anyopaque, request: *const storage.AsyncRequest) i32 {
+    const raw = ctx orelse return -1;
+    const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
+    const submit = storageBackendSubmit(backend.descriptor) orelse return -1;
+    const buffer_addr: u64 = switch (request.kind) {
+        .read => if (request.buffer) |ptr| @intFromPtr(ptr) else 0,
+        .write => if (request.const_buffer) |ptr| @intFromPtr(ptr) else 0,
+        .flush, .none => 0,
+    };
+    const public_request = StorageRequest{
+        .handle = request.handle,
+        .operation = @intFromEnum(request.kind),
+        .lba = request.lba,
+        .sectors = request.sectors,
+        .buffer_bytes = @intCast(request.buffer_len),
+        .buffer_addr = buffer_addr,
+        .complete = request.complete,
+    };
+    const callback = enterStorageCallback(backend.owner) orelse return -1;
+    defer leaveStorageCallback(callback);
+    return submit(backend.descriptor.context, &public_request);
+}
+
+fn r4dStorageCancel(ctx: ?*anyopaque, handle: u64, reason: u32) i32 {
+    const raw = ctx orelse return -1;
+    const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
+    const cancel = storageBackendCancel(backend.descriptor) orelse return -1;
+    const callback = enterStorageCallback(backend.owner) orelse return -1;
+    defer leaveStorageCallback(callback);
+    return cancel(backend.descriptor.context, handle, reason);
+}
+
+fn r4dStorageReset(ctx: ?*anyopaque, reason: u32) i32 {
+    const raw = ctx orelse return -1;
+    const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
+    const reset_fn = storageBackendReset(backend.descriptor) orelse return -1;
+    const callback = enterStorageCallback(backend.owner) orelse return -1;
+    defer leaveStorageCallback(callback);
+    return reset_fn(backend.descriptor.context, reason);
 }
 
 const StorageCleanupResult = struct {
@@ -1667,17 +2228,33 @@ fn trackDmaAllocation(owner: u32, phys_addr: u64, bytes: u32) bool {
     return false;
 }
 
-fn untrackDmaAllocation(phys_addr: u64) void {
+fn takeDmaAllocation(owner: u32, phys_addr: u64) ?DmaAllocation {
+    if (owner == 0) return null;
     var index: usize = 0;
     while (index < dma_allocations.len) : (index += 1) {
-        if (!dma_allocations[index].used or dma_allocations[index].phys_addr != phys_addr) continue;
+        if (!dma_allocations[index].used or dma_allocations[index].owner != owner or dma_allocations[index].phys_addr != phys_addr) continue;
+        const allocation = dma_allocations[index];
         dma_allocations[index] = .{};
-        return;
+        return allocation;
     }
+    return null;
 }
 
 fn cleanupDmaOwner(owner: u32) u32 {
     var removed: u32 = 0;
+    var mapping_index: usize = 0;
+    while (mapping_index < dma_mappings.len) : (mapping_index += 1) {
+        if (!dma_mappings[mapping_index].used or dma_mappings[mapping_index].owner != owner) continue;
+        releaseDmaMapping(mapping_index, true);
+        removed += 1;
+    }
+    var pin_index: usize = 0;
+    while (pin_index < dma_pins.len) : (pin_index += 1) {
+        if (!dma_pins[pin_index].used or dma_pins[pin_index].owner != owner) continue;
+        if (dma_pins[pin_index].map_count != 0) continue;
+        dma_pins[pin_index] = .{};
+        removed += 1;
+    }
     var index: usize = 0;
     while (index < dma_allocations.len) : (index += 1) {
         const allocation = dma_allocations[index];
