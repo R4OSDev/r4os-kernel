@@ -101,6 +101,34 @@ Aktivierungstor serialisiert konkurrierende Erststarts, ohne einen Lock ueber
 Datei-I/O zu halten. Die fuer USB-HID und USB-Massenspeicher benoetigten vier
 Bootprotokolle bleiben als explizite Preloads vor dem Diskkatalog aktiv.
 
+Generationsgebundener Registrypfad seit 0.69.45
+------------------------------------------------
+
+R4SYS behaelt den vollstaendig validierten R4R1-View gemeinsam mit seinen
+unveraenderlichen Bytes und der Dateigeneration in einem von zwei festen
+Slots. Wiederholte `registry_key_info`-, Enum- und Get-Aufrufe suchen direkt
+in diesem Zustand; sie reservieren keinen 32-KB-Heapblock, laden SYSTEM.R4R
+nicht erneut und wiederholen auch nicht die Vollvalidierung. Der kurze
+`r4r-hive-state`-Lock umfasst nur residenten Parse- und Kopierzugriff und
+wird nie ueber Datei-I/O, Yield oder Heaparbeit gehalten.
+
+Eine atomare, nicht als Registry-Lock verfolgte Transaktionsschranke
+serialisiert Mutationen und Flushes. Der Writer rekonstruiert genau die
+naechste Generation im inaktiven Slot, prueft die TMP-Kopie bytegenau und
+verwendet danach den vorhandenen atomaren VFS-Eigentumswechsel fuer
+SYSTEM.TMP, SYSTEM.BAK und SYSTEM.R4R. Leser bleiben waehrenddessen auf der
+vollstaendigen alten Generation. Erst der bytegenau bestaetigte Zielinhalt
+schaltet den aktiven Slot um. Eindeutige Fehler publizieren nichts;
+mehrdeutige I/O-Abschluesse bleiben als ausstehende Generation erhalten und
+muessen vor dem naechsten Registryzugriff idempotent aufgeloest werden.
+
+Auch der Deferred-Writeback behaelt seinen schmutzigen validierten Slot nach
+einem erfolgreichen Flush als sauberen Readcache. Dadurch entfallen der
+fruehere Reload nach jedem normalen Commit sowie mindestens 80 KB temporaere
+Heapreservierung und deren Freigabevergiftung pro Einzelmutation. Eine
+Shutdown-Zeile weist Generation, Reads, Cachetreffer, Dateiladungen,
+Validierungen, Publikationen, Commits, Fehler und atomare Retries aus.
+
 Grenze
 ------
 

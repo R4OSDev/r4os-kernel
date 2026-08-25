@@ -316,18 +316,43 @@ var registry_write_values: [registry_build_value_max]registry.BuildValue = [_]re
 var registry_write_keys: [registry_build_key_max]registry.BuildKey = [_]registry.BuildKey{empty_registry_build_key} ** registry_build_key_max;
 var registry_value_key_indices: [registry_build_value_max]u32 = [_]u32{registry.invalid_index} ** registry_build_value_max;
 var registry_flat_key_order: [registry_build_key_max]u32 = [_]u32{registry.invalid_index} ** registry_build_key_max;
+var registry_write_path_pool: [registry_path_pool_max]u8 = .{0} ** registry_path_pool_max;
 const registry_recent_documents_root = "SYSTEM\\Shell\\RecentDocuments";
+const registry_slot_none: u8 = 0xff;
 
-const RegistryWritebackCache = struct {
+const RegistryHiveSlot = struct {
     valid: bool = false,
     dirty: bool = false,
     kind: registry.HiveKind = .system,
     len: usize = 0,
+    view: ?registry.HiveView = null,
     bytes: [registry_max_hive_bytes]u8 = .{0} ** registry_max_hive_bytes,
-    verify: [registry_max_hive_bytes]u8 = .{0} ** registry_max_hive_bytes,
 };
 
-var registry_writeback_cache: RegistryWritebackCache = .{};
+const RegistryPerformance = struct {
+    read_calls: u64 = 0,
+    cache_hits: u64 = 0,
+    file_loads: u64 = 0,
+    validation_passes: u64 = 0,
+    publications: u64 = 0,
+    commits: u64 = 0,
+    commit_failures: u64 = 0,
+    atomic_retries: u64 = 0,
+};
+
+const RegistryHiveState = struct {
+    active_slot: u8 = registry_slot_none,
+    pending_slot: u8 = registry_slot_none,
+    slots: [2]RegistryHiveSlot = .{ RegistryHiveSlot{}, RegistryHiveSlot{} },
+    verify: [registry_max_hive_bytes]u8 = .{0} ** registry_max_hive_bytes,
+    performance: RegistryPerformance = .{},
+};
+
+var registry_hive_state: RegistryHiveState = .{};
+var registry_state_lock = sync.Mutex.initClass("r4r-hive-state", sync.LockRank.registry_state, .sleepable);
+// File reads and atomic replacement may yield. This gate serializes those
+// transactions without becoming a tracked Registry lock held across I/O.
+var registry_transaction_gate: u8 = 0;
 
 pub const RegistryKeyInfo = r4x_api.RegistryKeyInfo;
 
@@ -479,6 +504,44 @@ fn flushRegistryWritebackForShutdown() void {
     if (result != registry_api_result_ok) {
         k.puts("R4SYS shutdown: registry writeback flush failed\r\n");
     }
+    logRegistryPerformance();
+}
+
+fn logRegistryPerformance() void {
+    if (!lockRegistryState()) return;
+    const performance = registry_hive_state.performance;
+    const active = registry_hive_state.active_slot;
+    const generation = if (active != registry_slot_none and registry_hive_state.slots[active].view != null)
+        registry_hive_state.slots[active].view.?.header.generation
+    else
+        0;
+    const dirty = active != registry_slot_none and registry_hive_state.slots[active].dirty;
+    const pending = registry_hive_state.pending_slot != registry_slot_none;
+    unlockRegistryState();
+
+    k.puts("[R4SYS] registry generation=");
+    k.putDec(generation);
+    k.puts(" reads=");
+    k.putDec(performance.read_calls);
+    k.puts(" cacheHits=");
+    k.putDec(performance.cache_hits);
+    k.puts(" fileLoads=");
+    k.putDec(performance.file_loads);
+    k.puts(" validations=");
+    k.putDec(performance.validation_passes);
+    k.puts(" publications=");
+    k.putDec(performance.publications);
+    k.puts(" commits=");
+    k.putDec(performance.commits);
+    k.puts(" failures=");
+    k.putDec(performance.commit_failures);
+    k.puts(" retries=");
+    k.putDec(performance.atomic_retries);
+    k.puts(" dirty=");
+    k.puts(if (dirty) "yes" else "no");
+    k.puts(" pending=");
+    k.puts(if (pending) "yes" else "no");
+    k.puts("\r\n");
 }
 
 fn flushPageCacheForShutdown() void {
@@ -494,11 +557,12 @@ pub fn registryKeyInfo(path_ptr: [*:0]const u8, out: *RegistryKeyInfo) callconv(
     const parsed = registry.parseRoot(key_path) orelse return registry_api_result_bad_path;
     if (!activeRegistryHive(parsed.kind)) return registry_api_result_unsupported;
 
-    const mem = heap.alloc(registry_max_hive_bytes, 16) orelse return registry_api_result_io;
-    defer _ = heap.free(mem);
-    const loaded = loadRegistryHive(parsed.kind, mem);
-    if (loaded.result != registry_api_result_ok) return loaded.result;
-    const hive = loaded.view.?;
+    const prepared = prepareRegistryRead(parsed.kind);
+    if (prepared != registry_api_result_ok) return prepared;
+    if (!lockRegistryState()) return registry_api_result_io;
+    defer unlockRegistryState();
+    const hive = registryCachedViewLocked(parsed.kind) orelse return registry_api_result_hive_not_found;
+    noteRegistryReadLocked();
     const key_index = hive.findKey(key_path) orelse return registry_api_result_key_not_found;
     const key = hive.keyAt(key_index);
 
@@ -515,11 +579,12 @@ pub fn registryEnumKey(path_ptr: [*:0]const u8, index: u32, out_ptr: [*]u8, capa
     const parsed = registry.parseRoot(key_path) orelse return registry_api_result_bad_path;
     if (!activeRegistryHive(parsed.kind)) return registry_api_result_unsupported;
 
-    const mem = heap.alloc(registry_max_hive_bytes, 16) orelse return registry_api_result_io;
-    defer _ = heap.free(mem);
-    const loaded = loadRegistryHive(parsed.kind, mem);
-    if (loaded.result != registry_api_result_ok) return loaded.result;
-    const hive = loaded.view.?;
+    const prepared = prepareRegistryRead(parsed.kind);
+    if (prepared != registry_api_result_ok) return prepared;
+    if (!lockRegistryState()) return registry_api_result_io;
+    defer unlockRegistryState();
+    const hive = registryCachedViewLocked(parsed.kind) orelse return registry_api_result_hive_not_found;
+    noteRegistryReadLocked();
     const key_index = hive.findKey(key_path) orelse return registry_api_result_key_not_found;
     const key = hive.keyAt(key_index);
     if (index >= key.child_count) return registry_api_result_key_not_found;
@@ -535,11 +600,12 @@ pub fn registryEnumValue(path_ptr: [*:0]const u8, index: u32, out: *RegistryValu
     const parsed = registry.parseRoot(key_path) orelse return registry_api_result_bad_path;
     if (!activeRegistryHive(parsed.kind)) return registry_api_result_unsupported;
 
-    const mem = heap.alloc(registry_max_hive_bytes, 16) orelse return registry_api_result_io;
-    defer _ = heap.free(mem);
-    const loaded = loadRegistryHive(parsed.kind, mem);
-    if (loaded.result != registry_api_result_ok) return loaded.result;
-    const hive = loaded.view.?;
+    const prepared = prepareRegistryRead(parsed.kind);
+    if (prepared != registry_api_result_ok) return prepared;
+    if (!lockRegistryState()) return registry_api_result_io;
+    defer unlockRegistryState();
+    const hive = registryCachedViewLocked(parsed.kind) orelse return registry_api_result_hive_not_found;
+    noteRegistryReadLocked();
     const key_index = hive.findKey(key_path) orelse return registry_api_result_key_not_found;
     const key = hive.keyAt(key_index);
     if (index >= key.value_count) return registry_api_result_value_not_found;
@@ -558,11 +624,12 @@ pub fn registryGetValue(path_ptr: [*:0]const u8, name_ptr: [*:0]const u8, out_in
     const parsed = registry.parseRoot(key_path) orelse return registry_api_result_bad_path;
     if (!activeRegistryHive(parsed.kind)) return registry_api_result_unsupported;
 
-    const mem = heap.alloc(registry_max_hive_bytes, 16) orelse return registry_api_result_io;
-    defer _ = heap.free(mem);
-    const loaded = loadRegistryHive(parsed.kind, mem);
-    if (loaded.result != registry_api_result_ok) return loaded.result;
-    const hive = loaded.view.?;
+    const prepared = prepareRegistryRead(parsed.kind);
+    if (prepared != registry_api_result_ok) return prepared;
+    if (!lockRegistryState()) return registry_api_result_io;
+    defer unlockRegistryState();
+    const hive = registryCachedViewLocked(parsed.kind) orelse return registry_api_result_hive_not_found;
+    noteRegistryReadLocked();
     const key_index = hive.findKey(key_path) orelse return registry_api_result_key_not_found;
     const value_index = hive.findValue(key_index, value_name) orelse return registry_api_result_value_not_found;
     const value = hive.valueAt(value_index);
@@ -868,6 +935,7 @@ pub fn fileWrite(path_ptr: [*:0]const u8, data_ptr: [*]const u8, len: u32) callc
     if (!invalidateStreamSlotsForResolved(target.drive_ref.letter, targetOnBootVolume(target), parent, existing, basename))
         return -4;
     if (!vfs.writeFile(volume, parent, basename, data_ptr[0..@intCast(len)])) return -4;
+    invalidateRegistryCacheIfHivePath(raw_path);
     ok = true;
     return @intCast(len);
 }
@@ -1460,6 +1528,7 @@ pub fn fileDelete(path_ptr: [*:0]const u8) callconv(.c) i32 {
     switch (resolveOptionalEntryStatus(volume, target.path, &existing)) {
         .found => {},
         .not_found => {
+            invalidateRegistryCacheIfHivePath(raw_path);
             ok = true;
             return 0;
         },
@@ -1479,12 +1548,14 @@ pub fn fileDelete(path_ptr: [*:0]const u8) callconv(.c) i32 {
             .not_found => {
                 // The backend mutation completed but its final completion was
                 // lost; absence is the authoritative idempotent result.
+                invalidateRegistryCacheIfHivePath(raw_path);
                 ok = true;
                 return 1;
             },
             .found, .io => return -6,
         }
     }
+    invalidateRegistryCacheIfHivePath(raw_path);
     ok = true;
     return 1;
 }
@@ -2241,6 +2312,8 @@ pub fn fileRename(old_ptr: [*:0]const u8, new_ptr: [*:0]const u8) callconv(.c) i
     )) return -8;
     switch (vfs.renameEntryStatus(volume, parent, baseName(old_target.path), baseName(new_target.path))) {
         .ok => {
+            invalidateRegistryCacheIfHivePath(raw_old);
+            invalidateRegistryCacheIfHivePath(raw_new);
             ok = true;
             return 1;
         },
@@ -2277,6 +2350,8 @@ pub fn fileRename(old_ptr: [*:0]const u8, new_ptr: [*:0]const u8) callconv(.c) i
         return 0;
     }
     if (!vfs.deleteFile(volume, parent, baseName(old_target.path))) return -8;
+    invalidateRegistryCacheIfHivePath(raw_old);
+    invalidateRegistryCacheIfHivePath(raw_new);
     ok = true;
     return 1;
 }
@@ -2531,6 +2606,7 @@ pub fn fileCopy(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
         baseName(dst_target.path),
     )) return -9;
     if (!vfs.copyFile(src_volume, dst_volume, entry, dst_parent, baseName(dst_target.path))) return -9;
+    invalidateRegistryCacheIfHivePath(raw_dst);
     ok = true;
     return 1;
 }
@@ -3588,69 +3664,83 @@ const RegistryValueList = struct {
     }
 };
 
-const MutatingRegistryHive = struct {
-    result: i32,
-    present: bool = false,
-    view: ?registry.HiveView = null,
-};
-
 fn registryMutateValue(kind: RegistryMutationKind, hive_kind: registry.HiveKind, key_path: []const u8, value_name: []const u8, value_type: registry.ValueType, data: []const u8) i32 {
     if (!activeRegistryHive(hive_kind)) return registry_api_result_unsupported;
+    acquireRegistryTransactionGate();
+    defer releaseRegistryTransactionGate();
+
+    const resumed = resumePendingRegistryCommitUnderTransaction();
+    if (resumed != registry_api_result_ok) return resumed;
+
     const deferred_commit = isDeferredRegistryWritebackPath(hive_kind, key_path);
     if (!deferred_commit) {
-        const flush_result = flushRegistryWriteback();
+        const flush_result = flushRegistryWritebackUnderTransaction();
         if (flush_result != registry_api_result_ok) return flush_result;
     }
 
-    const hive_mem = heap.alloc(registry_max_hive_bytes, 16) orelse return registry_api_result_io;
-    defer _ = heap.free(hive_mem);
-    const out_mem = heap.alloc(registry_max_hive_bytes, 16) orelse return registry_api_result_io;
-    defer _ = heap.free(out_mem);
-    const path_pool = heap.alloc(registry_path_pool_max, 16) orelse return registry_api_result_io;
-    defer _ = heap.free(path_pool);
+    const loaded = ensureRegistryHiveCachedUnderTransaction(hive_kind);
+    if (loaded != registry_api_result_ok and loaded != registry_api_result_hive_not_found) return loaded;
+    if (kind == .delete and loaded == registry_api_result_hive_not_found) return registry_api_result_hive_not_found;
 
-    const loaded = loadRegistryHiveForMutation(hive_kind, hive_mem);
-    if (loaded.result != registry_api_result_ok) return loaded.result;
-    if (kind == .delete and !loaded.present) return registry_api_result_hive_not_found;
+    const candidate = buildRegistryMutationCandidate(kind, hive_kind, key_path, value_name, value_type, data);
+    if (candidate.result != registry_api_result_ok) return candidate.result;
+    if (deferred_commit) {
+        return publishRegistryCandidate(candidate.slot, true);
+    }
 
-    var list = RegistryValueList.init(path_pool);
+    const committed = commitRegistrySlotUnderTransaction(candidate.slot, false);
+    if (committed.result == registry_api_result_ok) {
+        return publishRegistryCandidate(candidate.slot, false);
+    }
+    noteRegistryCommitFailure(candidate.slot, committed.uncertain);
+    return committed.result;
+}
+
+const RegistryCandidate = struct {
+    result: i32,
+    slot: u8 = registry_slot_none,
+};
+
+fn buildRegistryMutationCandidate(kind: RegistryMutationKind, hive_kind: registry.HiveKind, key_path: []const u8, value_name: []const u8, value_type: registry.ValueType, data: []const u8) RegistryCandidate {
+    if (!lockRegistryState()) return .{ .result = registry_api_result_io };
+    defer unlockRegistryState();
+
+    const current = registryCachedViewLocked(hive_kind);
+    const candidate_index = inactiveRegistrySlotLocked();
+    var candidate_slot = &registry_hive_state.slots[candidate_index];
+    candidate_slot.valid = false;
+    candidate_slot.dirty = false;
+    candidate_slot.view = null;
+    candidate_slot.len = 0;
+
+    var list = RegistryValueList.init(registry_write_path_pool[0..]);
     var target_key_index: ?u32 = null;
-    if (loaded.view) |hive| {
+    if (current) |hive| {
         target_key_index = hive.findKey(key_path);
         if (kind == .delete) {
-            const key_index = target_key_index orelse return registry_api_result_key_not_found;
-            _ = hive.findValue(key_index, value_name) orelse return registry_api_result_value_not_found;
+            const key_index = target_key_index orelse return .{ .result = registry_api_result_key_not_found };
+            _ = hive.findValue(key_index, value_name) orelse return .{ .result = registry_api_result_value_not_found };
         }
         const collect_result = collectRegistryValues(hive, &list, target_key_index, value_name);
-        if (collect_result != registry_api_result_ok) return collect_result;
+        if (collect_result != registry_api_result_ok) return .{ .result = collect_result };
     }
 
     if (kind == .set) {
-        if (!list.append(key_path, value_name, value_type, data)) return registry_api_result_buffer_too_small;
+        if (!list.append(key_path, value_name, value_type, data)) return .{ .result = registry_api_result_buffer_too_small };
     }
 
-    const generation: u64 = if (loaded.view) |hive| hive.header.generation + 1 else 1;
-    if (deferred_commit) {
-        return buildAndDeferRegistryHive(hive_kind, generation, list.items(), out_mem);
-    }
-    return buildAndCommitRegistryHive(hive_kind, generation, list.items(), out_mem, hive_mem);
-}
-
-fn loadRegistryHiveForMutation(kind: registry.HiveKind, buffer: []u8) MutatingRegistryHive {
-    if (registryCacheBytes(kind)) |bytes| {
-        if (buffer.len < bytes.len) return .{ .result = registry_api_result_buffer_too_small, .present = true };
-        @memcpy(buffer[0..bytes.len], bytes);
-        const view = registry.HiveView.parse(buffer[0..bytes.len]) catch return .{ .result = registry_api_result_hive_corrupt, .present = true };
-        return .{ .result = registry_api_result_ok, .present = true, .view = view };
-    }
-    var path_buf: [max_api_path]u8 = undefined;
-    const path = registryHivePathZ(kind, path_buf[0..]) orelse return .{ .result = registry_api_result_bad_path };
-    const read = fileRead(path, buffer.ptr, @intCast(buffer.len));
-    if (read == -5) return .{ .result = registry_api_result_buffer_too_small };
-    if (read <= 0) return .{ .result = registry_api_result_ok };
-    const bytes = buffer[0..@intCast(read)];
-    const view = registry.HiveView.parse(bytes) catch return .{ .result = registry_api_result_hive_corrupt, .present = true };
-    return .{ .result = registry_api_result_ok, .present = true, .view = view };
+    const generation = if (current) |hive| nextRegistryGeneration(hive.header.generation) else 1;
+    const view = registry.buildHiveViewInto(candidate_slot.bytes[0..], .{
+        .keys = registry_write_keys[0..],
+        .value_key_indices = registry_value_key_indices[0..],
+        .flat_key_order = registry_flat_key_order[0..],
+    }, hive_kind, generation, list.items()) catch |err| return .{ .result = registryBuildError(err) };
+    candidate_slot.valid = true;
+    candidate_slot.kind = hive_kind;
+    candidate_slot.len = view.bytes.len;
+    candidate_slot.view = view;
+    registry_hive_state.performance.validation_passes +%= 1;
+    return .{ .result = registry_api_result_ok, .slot = candidate_index };
 }
 
 fn collectRegistryValues(hive: registry.HiveView, list: *RegistryValueList, skip_key_index: ?u32, skip_value_name: []const u8) i32 {
@@ -3693,24 +3783,6 @@ fn registryKeyPathForBuild(hive: registry.HiveView, key_index: u32, list: *Regis
     return list.path_pool[start..list.path_len];
 }
 
-fn buildAndCommitRegistryHive(kind: registry.HiveKind, generation: u64, values: []const registry.BuildValue, out_mem: []u8, verify_mem: []u8) i32 {
-    const bytes = registry.buildHiveInto(out_mem, .{
-        .keys = registry_write_keys[0..],
-        .value_key_indices = registry_value_key_indices[0..],
-        .flat_key_order = registry_flat_key_order[0..],
-    }, kind, generation, values) catch |err| return registryBuildError(err);
-    return commitRegistryHiveBytes(kind, bytes, verify_mem);
-}
-
-fn buildAndDeferRegistryHive(kind: registry.HiveKind, generation: u64, values: []const registry.BuildValue, out_mem: []u8) i32 {
-    const bytes = registry.buildHiveInto(out_mem, .{
-        .keys = registry_write_keys[0..],
-        .value_key_indices = registry_value_key_indices[0..],
-        .flat_key_order = registry_flat_key_order[0..],
-    }, kind, generation, values) catch |err| return registryBuildError(err);
-    return storeRegistryWriteback(kind, bytes, true);
-}
-
 fn registryBuildError(err: registry.Error) i32 {
     return switch (err) {
         error.InvalidPath, error.RootMismatch => registry_api_result_bad_path,
@@ -3720,99 +3792,284 @@ fn registryBuildError(err: registry.Error) i32 {
     };
 }
 
-fn commitRegistryHiveBytes(kind: registry.HiveKind, bytes: []const u8, verify_mem: []u8) i32 {
-    _ = registry.HiveView.parse(bytes) catch return registry_api_result_hive_corrupt;
+const RegistryCommitResult = struct {
+    result: i32,
+    uncertain: bool = false,
+};
+
+fn commitRegistrySlotUnderTransaction(slot_index: u8, stage_prepared: bool) RegistryCommitResult {
+    if (!lockRegistryState()) return .{ .result = registry_api_result_io };
+    if (slot_index >= registry_hive_state.slots.len or !registry_hive_state.slots[slot_index].valid) {
+        unlockRegistryState();
+        return .{ .result = registry_api_result_io };
+    }
+    const slot = &registry_hive_state.slots[slot_index];
+    const kind = slot.kind;
+    const bytes = slot.view.?.bytes;
+    unlockRegistryState();
 
     var sys_path_buf: [max_api_path]u8 = undefined;
     var registry_dir_buf: [max_api_path]u8 = undefined;
-    _ = dirCreate(literalRegistryPathZ("C:\\R4OS", sys_path_buf[0..]) orelse return registry_api_result_bad_path);
-    _ = dirCreate(literalRegistryPathZ("C:\\R4OS\\REGISTRY", registry_dir_buf[0..]) orelse return registry_api_result_bad_path);
+    _ = dirCreate(literalRegistryPathZ("C:\\R4OS", sys_path_buf[0..]) orelse return .{ .result = registry_api_result_bad_path });
+    _ = dirCreate(literalRegistryPathZ("C:\\R4OS\\REGISTRY", registry_dir_buf[0..]) orelse return .{ .result = registry_api_result_bad_path });
 
     var tmp_buf: [max_api_path]u8 = undefined;
     var hive_buf: [max_api_path]u8 = undefined;
     var bak_buf: [max_api_path]u8 = undefined;
-    const tmp_path = registryHiveTmpPathZ(kind, tmp_buf[0..]) orelse return registry_api_result_bad_path;
-    const hive_path = registryHivePathZ(kind, hive_buf[0..]) orelse return registry_api_result_bad_path;
-    const bak_path = registryHiveBakPathZ(kind, bak_buf[0..]) orelse return registry_api_result_bad_path;
+    const tmp_path = registryHiveTmpPathZ(kind, tmp_buf[0..]) orelse return .{ .result = registry_api_result_bad_path };
+    const hive_path = registryHivePathZ(kind, hive_buf[0..]) orelse return .{ .result = registry_api_result_bad_path };
+    const bak_path = registryHiveBakPathZ(kind, bak_buf[0..]) orelse return .{ .result = registry_api_result_bad_path };
 
-    _ = fileDelete(tmp_path);
-    const written = fileWrite(tmp_path, bytes.ptr, @intCast(bytes.len));
-    if (written < 0 or @as(usize, @intCast(written)) != bytes.len) return registry_api_result_io;
+    if (!stage_prepared) {
+        if (fileDelete(tmp_path) < 0 or fileDelete(bak_path) < 0) return .{ .result = registry_api_result_io };
+        const written = fileWrite(tmp_path, bytes.ptr, @intCast(bytes.len));
+        if (written < 0 or @as(usize, @intCast(written)) != bytes.len) return .{ .result = registry_api_result_io };
 
-    const read_back = fileRead(tmp_path, verify_mem.ptr, @intCast(verify_mem.len));
-    if (read_back < 0 or @as(usize, @intCast(read_back)) != bytes.len) return registry_api_result_io;
-    _ = registry.HiveView.parse(verify_mem[0..@intCast(read_back)]) catch return registry_api_result_hive_corrupt;
-
-    if (registryFileExists(hive_path)) {
-        _ = fileDelete(bak_path);
-        if (fileCopy(hive_path, bak_path) <= 0) return registry_api_result_io;
-        _ = fileDelete(hive_path);
+        const read_back = fileRead(tmp_path, registry_hive_state.verify[0..].ptr, @intCast(registry_hive_state.verify.len));
+        if (read_back < 0 or @as(usize, @intCast(read_back)) != bytes.len or
+            !stdMemEql(registry_hive_state.verify[0..@intCast(read_back)], bytes))
+        {
+            return .{ .result = registry_api_result_io };
+        }
     }
-    if (fileRename(tmp_path, hive_path) <= 0) return registry_api_result_io;
-    invalidateRegistryWriteback(kind);
-    return registry_api_result_ok;
+
+    var replaced = fileReplaceAtomic(hive_path, tmp_path, bak_path, file_replace_atomic_flag_consume_stage);
+    if (replaced == file_replace_atomic_error_io) {
+        noteRegistryAtomicRetry();
+        replaced = fileReplaceAtomic(hive_path, tmp_path, bak_path, file_replace_atomic_flag_consume_stage);
+    }
+    if (replaced != file_replace_atomic_result_ok) {
+        return .{ .result = registry_api_result_io, .uncertain = replaced == file_replace_atomic_error_io };
+    }
+
+    const installed = fileRead(hive_path, registry_hive_state.verify[0..].ptr, @intCast(registry_hive_state.verify.len));
+    if (installed < 0 or @as(usize, @intCast(installed)) != bytes.len or
+        !stdMemEql(registry_hive_state.verify[0..@intCast(installed)], bytes))
+    {
+        return .{ .result = registry_api_result_io, .uncertain = true };
+    }
+    noteRegistryCommit();
+    return .{ .result = registry_api_result_ok };
 }
 
 fn flushRegistryWriteback() i32 {
-    if (!registry_writeback_cache.valid or !registry_writeback_cache.dirty) return registry_api_result_ok;
-    const kind = registry_writeback_cache.kind;
-    const bytes = registry_writeback_cache.bytes[0..registry_writeback_cache.len];
-    const result = commitRegistryHiveBytes(kind, bytes, registry_writeback_cache.verify[0..]);
-    if (result == registry_api_result_ok) {
-        invalidateRegistryWriteback(kind);
-    }
-    return result;
+    acquireRegistryTransactionGate();
+    defer releaseRegistryTransactionGate();
+    const resumed = resumePendingRegistryCommitUnderTransaction();
+    if (resumed != registry_api_result_ok) return resumed;
+    return flushRegistryWritebackUnderTransaction();
 }
 
-fn storeRegistryWriteback(kind: registry.HiveKind, bytes: []const u8, dirty: bool) i32 {
-    _ = registry.HiveView.parse(bytes) catch return registry_api_result_hive_corrupt;
-    if (bytes.len > registry_writeback_cache.bytes.len) return registry_api_result_buffer_too_small;
-    const cache_start = @intFromPtr(&registry_writeback_cache.bytes[0]);
-    const cache_end = cache_start + registry_writeback_cache.bytes.len;
-    const source_start = @intFromPtr(bytes.ptr);
-    const source_inside_cache = source_start >= cache_start and source_start < cache_end;
-    if (!source_inside_cache and bytes.len != 0) {
-        @memcpy(registry_writeback_cache.bytes[0..bytes.len], bytes);
+fn flushRegistryWritebackUnderTransaction() i32 {
+    if (!lockRegistryState()) return registry_api_result_io;
+    const active = registry_hive_state.active_slot;
+    if (active == registry_slot_none or !registry_hive_state.slots[active].valid or !registry_hive_state.slots[active].dirty) {
+        unlockRegistryState();
+        return registry_api_result_ok;
     }
-    registry_writeback_cache.valid = true;
-    registry_writeback_cache.dirty = dirty;
-    registry_writeback_cache.kind = kind;
-    registry_writeback_cache.len = bytes.len;
+    unlockRegistryState();
+
+    const committed = commitRegistrySlotUnderTransaction(active, false);
+    if (committed.result != registry_api_result_ok) {
+        noteRegistryCommitFailure(active, committed.uncertain);
+        return committed.result;
+    }
+    if (!lockRegistryState()) return registry_api_result_io;
+    registry_hive_state.slots[active].dirty = false;
+    registry_hive_state.pending_slot = registry_slot_none;
+    unlockRegistryState();
     return registry_api_result_ok;
 }
 
-fn registryCacheBytes(kind: registry.HiveKind) ?[]const u8 {
-    if (!registry_writeback_cache.valid or registry_writeback_cache.kind != kind) return null;
-    return registry_writeback_cache.bytes[0..registry_writeback_cache.len];
-}
-
-fn invalidateRegistryWriteback(kind: registry.HiveKind) void {
-    if (!registry_writeback_cache.valid or registry_writeback_cache.kind != kind) return;
-    registry_writeback_cache.valid = false;
-    registry_writeback_cache.dirty = false;
-    registry_writeback_cache.len = 0;
-}
-
-const LoadedRegistryHive = struct {
-    result: i32,
-    view: ?registry.HiveView = null,
-};
-
-fn loadRegistryHive(kind: registry.HiveKind, buffer: []u8) LoadedRegistryHive {
-    if (registryCacheBytes(kind)) |bytes| {
-        if (buffer.len < bytes.len) return .{ .result = registry_api_result_buffer_too_small };
-        @memcpy(buffer[0..bytes.len], bytes);
-        const view = registry.HiveView.parse(buffer[0..bytes.len]) catch return .{ .result = registry_api_result_hive_corrupt };
-        return .{ .result = registry_api_result_ok, .view = view };
+fn resumePendingRegistryCommitUnderTransaction() i32 {
+    if (!lockRegistryState()) return registry_api_result_io;
+    const pending = registry_hive_state.pending_slot;
+    if (pending == registry_slot_none) {
+        unlockRegistryState();
+        return registry_api_result_ok;
     }
+    unlockRegistryState();
+
+    const committed = commitRegistrySlotUnderTransaction(pending, true);
+    if (committed.result != registry_api_result_ok) {
+        noteRegistryCommitFailure(pending, true);
+        return committed.result;
+    }
+    if (!lockRegistryState()) return registry_api_result_io;
+    if (registry_hive_state.active_slot == pending) {
+        registry_hive_state.slots[pending].dirty = false;
+        registry_hive_state.pending_slot = registry_slot_none;
+        unlockRegistryState();
+        return registry_api_result_ok;
+    }
+    publishRegistrySlotLocked(pending, false);
+    unlockRegistryState();
+    return registry_api_result_ok;
+}
+
+fn prepareRegistryRead(kind: registry.HiveKind) i32 {
+    if (!lockRegistryState()) return registry_api_result_io;
+    const ready = registryCachedViewLocked(kind) != null and registry_hive_state.pending_slot == registry_slot_none;
+    if (ready) registry_hive_state.performance.cache_hits +%= 1;
+    unlockRegistryState();
+    if (ready) return registry_api_result_ok;
+
+    acquireRegistryTransactionGate();
+    defer releaseRegistryTransactionGate();
+    const resumed = resumePendingRegistryCommitUnderTransaction();
+    if (resumed != registry_api_result_ok) return resumed;
+    return ensureRegistryHiveCachedUnderTransaction(kind);
+}
+
+fn ensureRegistryHiveCachedUnderTransaction(kind: registry.HiveKind) i32 {
+    if (!lockRegistryState()) return registry_api_result_io;
+    if (registryCachedViewLocked(kind) != null) {
+        unlockRegistryState();
+        return registry_api_result_ok;
+    }
+    const candidate_index = inactiveRegistrySlotLocked();
+    var candidate = &registry_hive_state.slots[candidate_index];
+    candidate.valid = false;
+    candidate.dirty = false;
+    candidate.view = null;
+    candidate.len = 0;
+    unlockRegistryState();
+
     var path_buf: [max_api_path]u8 = undefined;
-    const path = registryHivePathZ(kind, path_buf[0..]) orelse return .{ .result = registry_api_result_bad_path };
-    const read = fileRead(path, buffer.ptr, @intCast(buffer.len));
-    if (read == -5) return .{ .result = registry_api_result_buffer_too_small };
-    if (read <= 0) return .{ .result = registry_api_result_hive_not_found };
-    const bytes = buffer[0..@intCast(read)];
-    const view = registry.HiveView.parse(bytes) catch return .{ .result = registry_api_result_hive_corrupt };
-    return .{ .result = registry_api_result_ok, .view = view };
+    const path = registryHivePathZ(kind, path_buf[0..]) orelse return registry_api_result_bad_path;
+    const read = fileRead(path, candidate.bytes[0..].ptr, @intCast(candidate.bytes.len));
+    noteRegistryFileLoad();
+    if (read == -5) return registry_api_result_buffer_too_small;
+    if (read == -3) return registry_api_result_hive_not_found;
+    if (read < 0) return registry_api_result_io;
+    const view = registry.HiveView.parse(candidate.bytes[0..@intCast(read)]) catch return registry_api_result_hive_corrupt;
+
+    if (!lockRegistryState()) return registry_api_result_io;
+    candidate.valid = true;
+    candidate.dirty = false;
+    candidate.kind = kind;
+    candidate.len = view.bytes.len;
+    candidate.view = view;
+    registry_hive_state.performance.validation_passes +%= 1;
+    publishRegistrySlotLocked(candidate_index, false);
+    unlockRegistryState();
+    return registry_api_result_ok;
+}
+
+fn publishRegistryCandidate(slot_index: u8, dirty: bool) i32 {
+    if (!lockRegistryState()) return registry_api_result_io;
+    defer unlockRegistryState();
+    if (slot_index >= registry_hive_state.slots.len or !registry_hive_state.slots[slot_index].valid)
+        return registry_api_result_io;
+    publishRegistrySlotLocked(slot_index, dirty);
+    return registry_api_result_ok;
+}
+
+fn publishRegistrySlotLocked(slot_index: u8, dirty: bool) void {
+    const previous = registry_hive_state.active_slot;
+    registry_hive_state.slots[slot_index].dirty = dirty;
+    registry_hive_state.active_slot = slot_index;
+    registry_hive_state.pending_slot = registry_slot_none;
+    registry_hive_state.performance.publications +%= 1;
+    if (previous != registry_slot_none and previous != slot_index) {
+        registry_hive_state.slots[previous].valid = false;
+        registry_hive_state.slots[previous].dirty = false;
+        registry_hive_state.slots[previous].view = null;
+        registry_hive_state.slots[previous].len = 0;
+    }
+}
+
+fn noteRegistryCommitFailure(slot_index: u8, uncertain: bool) void {
+    if (!lockRegistryState()) return;
+    registry_hive_state.performance.commit_failures +%= 1;
+    if (uncertain and slot_index < registry_hive_state.slots.len and registry_hive_state.slots[slot_index].valid) {
+        registry_hive_state.pending_slot = slot_index;
+    } else if (slot_index < registry_hive_state.slots.len and registry_hive_state.active_slot != slot_index) {
+        registry_hive_state.slots[slot_index].valid = false;
+        registry_hive_state.slots[slot_index].view = null;
+        registry_hive_state.slots[slot_index].len = 0;
+    }
+    unlockRegistryState();
+}
+
+fn noteRegistryFileLoad() void {
+    if (!lockRegistryState()) return;
+    registry_hive_state.performance.file_loads +%= 1;
+    unlockRegistryState();
+}
+
+fn noteRegistryCommit() void {
+    if (!lockRegistryState()) return;
+    registry_hive_state.performance.commits +%= 1;
+    unlockRegistryState();
+}
+
+fn noteRegistryAtomicRetry() void {
+    if (!lockRegistryState()) return;
+    registry_hive_state.performance.atomic_retries +%= 1;
+    unlockRegistryState();
+}
+
+fn noteRegistryReadLocked() void {
+    registry_hive_state.performance.read_calls +%= 1;
+}
+
+fn registryCachedViewLocked(kind: registry.HiveKind) ?registry.HiveView {
+    const active = registry_hive_state.active_slot;
+    if (active == registry_slot_none) return null;
+    const slot = &registry_hive_state.slots[active];
+    if (!slot.valid or slot.kind != kind) return null;
+    return slot.view;
+}
+
+fn inactiveRegistrySlotLocked() u8 {
+    return if (registry_hive_state.active_slot == 0) 1 else 0;
+}
+
+fn nextRegistryGeneration(current: u64) u64 {
+    const next = current +% 1;
+    return if (next == 0) 1 else next;
+}
+
+fn lockRegistryState() bool {
+    return registry_state_lock.lock(sync.WAIT_FOREVER);
+}
+
+fn unlockRegistryState() void {
+    _ = registry_state_lock.unlock();
+}
+
+fn acquireRegistryTransactionGate() void {
+    while (@cmpxchgStrong(u8, &registry_transaction_gate, 0, 1, .acquire, .monotonic) != null) scheduler.yield();
+}
+
+fn releaseRegistryTransactionGate() void {
+    @atomicStore(u8, &registry_transaction_gate, 0, .release);
+}
+
+fn invalidateRegistryCacheIfHivePath(path: []const u8) void {
+    if (!registryHivePathMatches(path)) return;
+    if (!lockRegistryState()) return;
+    registry_hive_state.active_slot = registry_slot_none;
+    registry_hive_state.pending_slot = registry_slot_none;
+    for (&registry_hive_state.slots) |*slot| {
+        slot.valid = false;
+        slot.dirty = false;
+        slot.view = null;
+        slot.len = 0;
+    }
+    unlockRegistryState();
+}
+
+fn registryHivePathMatches(path: []const u8) bool {
+    const expected = "C:\\R4OS\\REGISTRY\\SYSTEM.R4R";
+    if (path.len != expected.len) return false;
+    for (path, expected) |actual_ch, expected_ch| {
+        const actual = if (actual_ch == '/') '\\' else asciiUpper(actual_ch);
+        const want = if (expected_ch == '/') '\\' else asciiUpper(expected_ch);
+        if (actual != want) return false;
+    }
+    return true;
 }
 
 fn registryHivePathZ(kind: registry.HiveKind, out: []u8) ?[*:0]const u8 {
@@ -3868,11 +4125,6 @@ fn asciiLower(value: u8) u8 {
 fn literalRegistryPathZ(text: []const u8, out: []u8) ?[*:0]const u8 {
     if (!copyPathZ(text, out)) return null;
     return @ptrCast(out.ptr);
-}
-
-fn registryFileExists(path: [*:0]const u8) bool {
-    var info: FileInfo = .{};
-    return fileInfo(path, &info) > 0 and info.exists != 0;
 }
 
 fn fillRegistryValueInfo(out: *RegistryValueInfo, hive: registry.HiveView, value: registry.ValueRecord) void {

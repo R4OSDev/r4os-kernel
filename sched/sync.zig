@@ -38,6 +38,10 @@ pub const LockRank = struct {
     // Dynamic ProgramInstance registry. IRQ/exception attribution uses stable
     // task-bound owner addresses and never acquires this sleepable lock.
     pub const program_registry: u16 = 110;
+    // The persistent R4R hive cache protects only already resident bytes and
+    // parsed views. Registry file I/O is serialized by a separate untracked
+    // transaction gate and never runs while this lock is held.
+    pub const registry_state: u16 = 115;
     pub const service_registry: u16 = 120;
     // Stable service endpoints are pinned through service_registry and then
     // protect their queue, payload and waiter state independently.

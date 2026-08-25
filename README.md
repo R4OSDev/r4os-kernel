@@ -71,6 +71,15 @@ relocations, ABI checks, dependencies, and initialization run on the first
 actual role use. Required USB boot protocols retain their explicit eager
 preload path.
 
+R4SYS retains a validated R4R1 hive view for its complete file generation.
+Ordinary Registry reads use the resident immutable bytes without heap churn,
+file reload, or repeated full validation. A separate transaction gate builds
+the next generation in an inactive fixed slot, verifies the staged bytes, and
+uses the filesystem's atomic target/backup ownership transfer. Readers remain
+on the previous complete generation until the installed target is verified;
+definite failures publish nothing and ambiguous completions must reconcile
+before later Registry work proceeds.
+
 Once the shell task has been admitted, the one-shot kernel boot task exits and
 is reaped. The shell's first `boot_ready` call independently freezes the boot
 measurement and retires the boot renderer without repainting the ready shell

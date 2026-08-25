@@ -313,6 +313,10 @@ pub fn parseRoot(path: []const u8) ?ParsedRoot {
 }
 
 pub fn buildHiveInto(out: []u8, scratch: BuildScratch, kind: HiveKind, generation: u64, values: []const BuildValue) Error![]const u8 {
+    return (try buildHiveViewInto(out, scratch, kind, generation, values)).bytes;
+}
+
+pub fn buildHiveViewInto(out: []u8, scratch: BuildScratch, kind: HiveKind, generation: u64, values: []const BuildValue) Error!HiveView {
     if (scratch.keys.len == 0 or scratch.flat_key_order.len == 0) return Error.TooManyEntries;
     if (values.len > scratch.value_key_indices.len) return Error.TooManyEntries;
 
@@ -438,9 +442,7 @@ pub fn buildHiveInto(out: []u8, scratch: BuildScratch, kind: HiveKind, generatio
     writeU32(out, 56, if (data_heap_size == 0) 0 else @as(u32, @intCast(data_heap_offset)));
     writeU32(out, 60, @intCast(data_heap_size));
 
-    const bytes = out[0..file_size];
-    _ = try HiveView.parse(bytes);
-    return bytes;
+    return HiveView.parse(out[0..file_size]);
 }
 
 fn validate(view: HiveView) Error!void {
