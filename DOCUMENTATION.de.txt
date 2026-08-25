@@ -81,6 +81,26 @@ dem exakten Transfer zugeordnet. Timeout, Stall/Clear-Halt, Reset, Hotplug und
 Unload beseitigen nur die zugehoerigen Generationen. Ein nicht haltbarer
 Controller vetoisiert den Unload und behaelt seine Ressourcen.
 
+Bedarfsgeladener R4M0- und R4P-Pfad seit 0.69.44
+------------------------------------------------
+
+Dateibasierte R4M0-Relocationtabellen werden in datensatzgenauen Fenstern von
+170 Eintraegen beziehungsweise 4.080 Bytes gelesen. Kernelmodule und R4X-
+Programme wenden die Eintraege weiterhin strikt in Dateireihenfolge an;
+Validierungs- und Fehlerreihenfolge bleiben damit erhalten. Die Zahl der
+synchronen Dateianforderungen skaliert mit den Fenstern statt mit jedem
+einzelnen 24-Byte-Relocationdatensatz.
+
+Der Runtime-Boot katalogisiert installierte Disk-R4Ps nur anhand des
+validierten Headers, der Tabellenbereiche und der Metadaten. Sectiondaten,
+Relocations, Exporte und Initialisierung werden erst bei der ersten echten
+Rollenabfrage beziehungsweise beim ersten Dispatch geladen. Abhaengigkeiten
+werden dabei in Manifestreihenfolge rekursiv aktiviert; fehlende, blockierte
+und zyklische Pfade behalten unterscheidbare Registry-Zustaende. Ein globales
+Aktivierungstor serialisiert konkurrierende Erststarts, ohne einen Lock ueber
+Datei-I/O zu halten. Die fuer USB-HID und USB-Massenspeicher benoetigten vier
+Bootprotokolle bleiben als explizite Preloads vor dem Diskkatalog aktiv.
+
 Grenze
 ------
 

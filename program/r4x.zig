@@ -6773,9 +6773,18 @@ fn copyR4XStartName(src: []const u8, dest: []u8, out_len: *usize) bool {
 }
 
 fn applyR4MRelocationsFromRanges(source: module_file.FileSource, header: module_r4m.Header, sections: []const R4MSection, section_offsets: []const usize, image: []u8, resolved_imports: []const ResolvedR4MImport) bool {
+    var reader = module_r4m.RelocationWindowReader.init(source, header, "r4x-relocation-table", true);
     var i: usize = 0;
     while (i < header.reloc_count) : (i += 1) {
-        const reloc = readR4MRelocationFromRanges(source, header, i) orelse return false;
+        const record = reader.next() orelse return false;
+        const reloc = R4MRelocation{
+            .kind = record.kind,
+            .patch_section = record.patch_section,
+            .patch_offset = record.patch_offset,
+            .target_section = record.target_section,
+            .target_offset = record.target_offset,
+            .addend = record.addend,
+        };
         if (!applyR4MRelocation(reloc, sections, section_offsets, image, resolved_imports)) return false;
     }
     return true;
@@ -6854,18 +6863,6 @@ fn readR4MImportFromRanges(source: module_file.FileSource, file_size: usize, hea
         .symbol = symbol_name,
         .min_version = record.min_version,
         .flags = record.flags,
-    };
-}
-
-fn readR4MRelocationFromRanges(source: module_file.FileSource, header: module_r4m.Header, index: usize) ?R4MRelocation {
-    const record = module_r4m.readRelocationRecord(source, header, index, "r4x-relocation-table", true) orelse return null;
-    return .{
-        .kind = record.kind,
-        .patch_section = record.patch_section,
-        .patch_offset = record.patch_offset,
-        .target_section = record.target_section,
-        .target_offset = record.target_offset,
-        .addend = record.addend,
     };
 }
 

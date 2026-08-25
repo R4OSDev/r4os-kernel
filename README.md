@@ -64,6 +64,13 @@ INTx when routed and retains bounded polling as fallback. Bulk TDs span up to
 64 KiB in page-bounded TRBs, including a chained ring wrap. Failed controller
 halt vetoes unload.
 
+File-backed R4M0 relocation tables are streamed in record-aligned 4,080-byte
+windows while preserving record and error order. Installed disk R4P modules
+are catalogued from header and metadata only; their complete image,
+relocations, ABI checks, dependencies, and initialization run on the first
+actual role use. Required USB boot protocols retain their explicit eager
+preload path.
+
 Once the shell task has been admitted, the one-shot kernel boot task exits and
 is reaped. The shell's first `boot_ready` call independently freezes the boot
 measurement and retires the boot renderer without repainting the ready shell

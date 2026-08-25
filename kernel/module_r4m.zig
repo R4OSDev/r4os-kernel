@@ -7,6 +7,8 @@ pub const ENTRY_SIZE: usize = 16;
 pub const IMPORT_SIZE: usize = 16;
 pub const EXPORT_SIZE: usize = 16;
 pub const RELOCATION_SIZE: usize = 24;
+pub const RELOCATION_WINDOW_RECORDS: usize = 170;
+pub const RELOCATION_WINDOW_SIZE: usize = RELOCATION_WINDOW_RECORDS * RELOCATION_SIZE;
 pub const VERSION: u16 = 1;
 pub const ARCH_X86_64: u16 = 1;
 
@@ -118,6 +120,65 @@ pub const RelocationRecord = struct {
     target_offset: u32,
     addend: i32,
 };
+
+/// Streams the unchanged relocation table in record-aligned windows.  The
+/// caller still observes and applies records in their original order, while
+/// the filesystem sees one request per window instead of one 24-byte request
+/// per relocation.
+pub const RelocationWindowReader = struct {
+    source: module_file.FileSource,
+    header: Header,
+    name: []const u8,
+    verbose: bool,
+    next_index: usize = 0,
+    window_first: usize = 0,
+    window_count: usize = 0,
+    window: [RELOCATION_WINDOW_SIZE]u8 = .{0} ** RELOCATION_WINDOW_SIZE,
+
+    pub fn init(source: module_file.FileSource, header: Header, name: []const u8, verbose: bool) RelocationWindowReader {
+        return .{
+            .source = source,
+            .header = header,
+            .name = name,
+            .verbose = verbose,
+        };
+    }
+
+    pub fn next(self: *RelocationWindowReader) ?RelocationRecord {
+        if (self.next_index >= self.header.reloc_count) return null;
+        if (self.window_count == 0 or self.next_index < self.window_first or self.next_index >= self.window_first + self.window_count) {
+            if (!self.fillWindow()) return null;
+        }
+        const local_index = self.next_index - self.window_first;
+        const offset = local_index * RELOCATION_SIZE;
+        self.next_index += 1;
+        return decodeRelocationRecord(self.window[offset .. offset + RELOCATION_SIZE]);
+    }
+
+    fn fillWindow(self: *RelocationWindowReader) bool {
+        const total: usize = @intCast(self.header.reloc_count);
+        if (self.next_index >= total) return false;
+        const count = @min(RELOCATION_WINDOW_RECORDS, total - self.next_index);
+        const byte_count = count * RELOCATION_SIZE;
+        const table_offset: usize = @intCast(self.header.reloc_off);
+        const offset = table_offset + self.next_index * RELOCATION_SIZE;
+        if (!module_file.readExact(.{
+            .source = self.source,
+            .offset = offset,
+            .out = self.window[0..byte_count],
+            .name = self.name,
+            .verbose = self.verbose,
+        })) return false;
+        self.window_first = self.next_index;
+        self.window_count = count;
+        return true;
+    }
+};
+
+pub fn relocationWindowCount(record_count: usize) usize {
+    if (record_count == 0) return 0;
+    return 1 + (record_count - 1) / RELOCATION_WINDOW_RECORDS;
+}
 
 pub const MetadataIterator = struct {
     meta: []const u8,
@@ -330,6 +391,10 @@ pub fn readRelocationRecord(source: module_file.FileSource, header: Header, inde
         .name = name,
         .verbose = verbose,
     })) return null;
+    return decodeRelocationRecord(raw[0..]);
+}
+
+fn decodeRelocationRecord(raw: []const u8) RelocationRecord {
     return .{
         .kind = readLe32(raw[0..4]),
         .patch_section = readLe32(raw[4..8]),
@@ -458,4 +523,35 @@ fn readLe32(bytes: []const u8) u32 {
         (@as(u32, bytes[1]) << 8) |
         (@as(u32, bytes[2]) << 16) |
         (@as(u32, bytes[3]) << 24);
+}
+
+test "relocation windows scale with contiguous table ranges" {
+    const testing = @import("std").testing;
+
+    try testing.expectEqual(@as(usize, 0), relocationWindowCount(0));
+    try testing.expectEqual(@as(usize, 1), relocationWindowCount(1));
+    try testing.expectEqual(@as(usize, 1), relocationWindowCount(RELOCATION_WINDOW_RECORDS));
+    try testing.expectEqual(@as(usize, 2), relocationWindowCount(RELOCATION_WINDOW_RECORDS + 1));
+    try testing.expectEqual(@as(usize, 139), relocationWindowCount(23_510));
+
+    var raw: [RELOCATION_SIZE]u8 = .{0} ** RELOCATION_SIZE;
+    raw[0] = 4;
+    raw[4] = 2;
+    raw[8] = 0x78;
+    raw[9] = 0x56;
+    raw[10] = 0x34;
+    raw[11] = 0x12;
+    raw[12] = 3;
+    raw[16] = 9;
+    raw[20] = 0xFE;
+    raw[21] = 0xFF;
+    raw[22] = 0xFF;
+    raw[23] = 0xFF;
+    const record = decodeRelocationRecord(raw[0..]);
+    try testing.expectEqual(@as(u32, 4), record.kind);
+    try testing.expectEqual(@as(u32, 2), record.patch_section);
+    try testing.expectEqual(@as(u32, 0x12345678), record.patch_offset);
+    try testing.expectEqual(@as(u32, 3), record.target_section);
+    try testing.expectEqual(@as(u32, 9), record.target_offset);
+    try testing.expectEqual(@as(i32, -2), record.addend);
 }

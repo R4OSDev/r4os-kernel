@@ -1507,9 +1507,18 @@ fn applyRelocations(bytes: []const u8, header: Header, sections: []const Section
 
 fn applyRelocationsFromFile(source: module_file.FileSource, header: Header, sections: []const SectionHeader, section_offsets: []const usize, image: []u8, module_name: []const u8, resolved_imports: []const ResolvedImport) ?RelocStats {
     var stats: RelocStats = .{};
+    var reader = module_r4m.RelocationWindowReader.init(source, header, "r4m-relocation-table", true);
     var i: usize = 0;
     while (i < header.reloc_count) : (i += 1) {
-        const reloc = readRelocationFromFile(source, header, i) orelse return null;
+        const record = reader.next() orelse return null;
+        const reloc = Relocation{
+            .kind = record.kind,
+            .patch_section = record.patch_section,
+            .patch_offset = record.patch_offset,
+            .target_section = record.target_section,
+            .target_offset = record.target_offset,
+            .addend = record.addend,
+        };
         switch (applyRelocation(reloc, sections, section_offsets, image, resolved_imports)) {
             .ok => {},
             .unknown_type => {
@@ -1614,18 +1623,6 @@ fn readRelocation(bytes: []const u8, header: Header, index: usize) ?Relocation {
         .target_section = readLe32(bytes[off + 12 .. off + 16]),
         .target_offset = readLe32(bytes[off + 16 .. off + 20]),
         .addend = @bitCast(readLe32(bytes[off + 20 .. off + 24])),
-    };
-}
-
-fn readRelocationFromFile(source: module_file.FileSource, header: Header, index: usize) ?Relocation {
-    const record = module_r4m.readRelocationRecord(source, header, index, "r4m-relocation-table", true) orelse return null;
-    return .{
-        .kind = record.kind,
-        .patch_section = record.patch_section,
-        .patch_offset = record.patch_offset,
-        .target_section = record.target_section,
-        .target_offset = record.target_offset,
-        .addend = record.addend,
     };
 }
 

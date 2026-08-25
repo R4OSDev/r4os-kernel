@@ -7,6 +7,7 @@ const module_r4m = @import("../kernel/module_r4m.zig");
 const protocol_api = @import("../kernel/protocol_api.zig");
 const registry = @import("../protocol/registry.zig");
 const modsys = @import("../kernel/modules.zig");
+const scheduler = @import("../sched/scheduler.zig");
 
 const VERSION: u16 = 1;
 const MAX_MODULES: usize = 32;
@@ -14,6 +15,7 @@ const MAX_DEPENDENCIES: usize = 16;
 const MAX_PATH: usize = 96;
 const R4M_HEADER_SIZE: usize = 64;
 const MAX_R4M_METADATA_PROBE: usize = 2048;
+const MAX_ACTIVATION_DEPTH: usize = MAX_MODULES;
 
 pub const ROLE_STATE_MISSING: u8 = 0;
 pub const ROLE_STATE_LOADED: u8 = 1;
@@ -51,10 +53,30 @@ const R4MProtocolInfo = struct {
     name_len: usize = 0,
     role: [registry.MAX_ROLE]u8 = .{0} ** registry.MAX_ROLE,
     role_len: usize = 0,
-    category: u16,
+    category: u16 = 0,
     dependencies: [MAX_DEPENDENCIES][registry.MAX_ROLE]u8 = .{.{0} ** registry.MAX_ROLE} ** MAX_DEPENDENCIES,
     dependency_lens: [MAX_DEPENDENCIES]usize = .{0} ** MAX_DEPENDENCIES,
     dependency_count: usize = 0,
+};
+
+const CandidateState = enum(u8) {
+    cataloged,
+    loading,
+    finished,
+    invalid,
+};
+
+const Candidate = struct {
+    used: bool = false,
+    state: CandidateState = .cataloged,
+    file_source: ?module_file.FileSource = null,
+    registry_slot: usize = 0,
+    module_index: ?usize = null,
+    file_name: [64]u8 = .{0} ** 64,
+    file_name_len: usize = 0,
+    path: [MAX_PATH]u8 = .{0} ** MAX_PATH,
+    path_len: usize = 0,
+    info: R4MProtocolInfo = .{},
 };
 
 pub const RoleRuntimeStatus = struct {
@@ -64,17 +86,31 @@ pub const RoleRuntimeStatus = struct {
 };
 
 var modules: [MAX_MODULES]Module = .{Module{}} ** MAX_MODULES;
+var candidates: [MAX_MODULES]Candidate = .{Candidate{}} ** MAX_MODULES;
 var initialized: bool = false;
+var disk_catalog_loaded: bool = false;
 var late_duplicate_skipped: usize = 0;
 var preload_headers: usize = 0;
+var cataloged_roles: usize = 0;
+var cataloged_candidates: usize = 0;
+var demand_loads: usize = 0;
+var activation_gate: u8 = 0;
 
 pub fn loadAll() void {
     ensureInitialized();
+    if (disk_catalog_loaded) {
+        refreshPerformanceResults();
+        return;
+    }
+    disk_catalog_loaded = true;
     late_duplicate_skipped = 0;
+    cataloged_roles = 0;
+    cataloged_candidates = 0;
+    demand_loads = 0;
 
     const volume = vfs.volumeForDrive('C') orelse {
         k.puts("[R4P] C: FAT32 volume not mounted\r\n");
-        loader_perf.recordR4pResults(0, activeR4pCount(), blockedR4pCount(), failedR4pCount());
+        refreshPerformanceResults();
         return;
     };
     var resolve_req = fs_request.begin(.loader_read, 'C') orelse return;
@@ -82,7 +118,7 @@ pub fn loadAll() void {
     const dir_cluster = vfs.resolvePath(volume, "/R4OS/PROTOCOLS") orelse {
         fs_request.finish(&resolve_req, resolve_ok);
         k.puts("[R4P] /R4OS/PROTOCOLS not found\r\n");
-        loader_perf.recordR4pResults(0, activeR4pCount(), blockedR4pCount(), failedR4pCount());
+        refreshPerformanceResults();
         return;
     };
     resolve_ok = true;
@@ -90,7 +126,6 @@ pub fn loadAll() void {
 
     k.puts("[R4P] scanning /R4OS/PROTOCOLS\r\n");
     var index: usize = 0;
-    var loaded_headers: usize = 0;
     while (true) : (index += 1) {
         var name_buf: [64]u8 = .{0} ** 64;
         var entry_req = fs_request.begin(.loader_read, 'C') orelse break;
@@ -105,17 +140,20 @@ pub fn loadAll() void {
         const name = zName(name_buf[0..]);
         if (entry.isDir() or !hasR4pExtension(name)) continue;
         loader_perf.recordR4pCandidate();
-        if (loadModuleForEntry(volume, entry, name)) loaded_headers += 1;
+        _ = catalogModuleForEntry(volume, entry, name);
     }
 
-    resolveAndInit();
-    loader_perf.recordR4pResults(loaded_headers, activeR4pCount(), blockedR4pCount(), failedR4pCount());
-    k.puts("[R4P] modules discovered=");
-    k.putDec(loaded_headers);
+    refreshPerformanceResults();
+    k.puts("[R4P] catalog roles=");
+    k.putDec(cataloged_roles);
+    k.puts(" candidates=");
+    k.putDec(cataloged_candidates);
     k.puts(" active=");
     k.putDec(activeR4pCount());
+    k.puts(" demand-full=");
+    k.putDec(demand_loads);
     if (late_duplicate_skipped != 0) {
-        k.puts(" skipped=");
+        k.puts(" alternates=");
         k.putDec(late_duplicate_skipped);
     }
     k.puts("\r\n");
@@ -147,6 +185,7 @@ pub fn dumpStatus() void {
 }
 
 pub fn dispatch(role: []const u8, op: u32, in_buffer: *const protocol_api.ProtocolBuffer, out_buffer: *protocol_api.ProtocolBuffer) i32 {
+    if (!ensureRoleActive(role)) return -5;
     const module = activeModuleForRole(role) orelse return -5;
     const dispatch_fn = module.dispatch_fn orelse return -4;
     protocol_api.enter(module.registry_slot);
@@ -156,7 +195,7 @@ pub fn dispatch(role: []const u8, op: u32, in_buffer: *const protocol_api.Protoc
 }
 
 pub fn hasActiveR4p(role: []const u8) bool {
-    return activeModuleForRole(role) != null;
+    return ensureRoleActive(role);
 }
 
 pub fn activeSourceName(role: []const u8) []const u8 {
@@ -174,7 +213,7 @@ pub fn requiredSourceName(role: []const u8) []const u8 {
 pub fn roleRuntimeStatus(role: []const u8) RoleRuntimeStatus {
     const entry = registry.r4pEntryForRole(role);
     return .{
-        .active_r4p = hasActiveR4p(role),
+        .active_r4p = activeModuleForRole(role) != null,
         .builtin_fallback = registry.builtinEntryForRole(role) != null,
         .state = if (entry) |e| roleStateValue(e.state) else ROLE_STATE_MISSING,
     };
@@ -191,33 +230,67 @@ fn activeModuleForRole(role: []const u8) ?*const Module {
     return null;
 }
 
-fn loadModuleForEntry(volume: vfs.Volume, entry: vfs.Entry, file_name: []const u8) bool {
+fn catalogModuleForEntry(volume: vfs.Volume, entry: vfs.Entry, file_name: []const u8) bool {
     if (entry.size == 0) return false;
+    const read_start = loader_perf.now();
     const info = readR4MProtocolInfoFromFile(volume, entry, file_name) orelse {
+        loader_perf.addR4pReadTicks(read_start);
         k.puts("[R4P] invalid R4M0 module: ");
         k.puts(file_name);
         k.puts("\r\n");
         return false;
     };
+    loader_perf.addR4pReadTicks(read_start);
     if (!protocolInfoFits(info, file_name)) return false;
     const info_role = protocolInfoRole(&info);
-    if (registry.moduleEntryForRole(info_role) != null) {
+
+    var registry_slot: usize = undefined;
+    if (registry.moduleEntryForRole(info_role)) |existing| {
+        if (existing.source == .preload or existing.state != .loaded) {
+            late_duplicate_skipped += 1;
+            k.puts("[R4P] skip duplicate role ");
+            k.puts(info_role);
+            k.puts(" from ");
+            k.puts(file_name);
+            k.puts("\r\n");
+            return false;
+        }
+        registry_slot = registrySlotForCatalogRole(info_role) orelse {
+            late_duplicate_skipped += 1;
+            return false;
+        };
         late_duplicate_skipped += 1;
-        k.puts("[R4P] skip duplicate role ");
-        k.puts(info_role);
-        k.puts(" from ");
-        k.puts(file_name);
-        k.puts("\r\n");
-        return false;
+    } else {
+        registry_slot = registry.catalogR4p(protocolInfoName(&info), info_role, info.category, VERSION, protocol_api.VERSION) orelse {
+            k.puts("[R4P] registry full for role ");
+            k.puts(info_role);
+            k.puts("\r\n");
+            return false;
+        };
+        cataloged_roles += 1;
     }
-    const source: module_file.FileSource = .{
-        .volume = volume,
-        .entry = entry,
-        .drive_letter = 'C',
+
+    const candidate_slot = freeCandidateSlot() orelse {
+        registry.setError(registry_slot, -3, "lazy candidate table full");
+        k.puts("[R4P] candidate table full\r\n");
+        return false;
     };
-    var path_buf: [MAX_PATH]u8 = .{0} ** MAX_PATH;
-    const path = buildModulePath("C:\\R4OS\\PROTOCOLS\\", file_name, &path_buf);
-    return loadModuleFileWithInfo(source, info, file_name, path, .r4p);
+    var candidate = Candidate{
+        .used = true,
+        .file_source = module_file.FileSource{
+            .volume = volume,
+            .entry = entry,
+            .drive_letter = 'C',
+        },
+        .registry_slot = registry_slot,
+        .info = info,
+    };
+    candidate.file_name_len = copyBytes(file_name, candidate.file_name[0..]);
+    candidate.path_len = copyBytes("C:\\R4OS\\PROTOCOLS\\", candidate.path[0..]);
+    candidate.path_len += copyBytes(file_name, candidate.path[candidate.path_len..]);
+    candidates[candidate_slot] = candidate;
+    cataloged_candidates += 1;
+    return true;
 }
 
 fn loadModuleBytes(bytes: []const u8, file_name: []const u8, path: []const u8, source: registry.Source) bool {
@@ -277,43 +350,56 @@ fn loadModuleBytesWithInfo(bytes: []const u8, info: R4MProtocolInfo, file_name: 
     return true;
 }
 
-fn loadModuleFileWithInfo(file_source: module_file.FileSource, info: R4MProtocolInfo, file_name: []const u8, path: []const u8, source: registry.Source) bool {
+fn loadCatalogCandidate(candidate_index: usize) ?usize {
+    if (candidate_index >= candidates.len or !candidates[candidate_index].used) return null;
+    const candidate = &candidates[candidate_index];
+    const file_source = candidate.file_source orelse return null;
+    const info = candidate.info;
+    const file_name = candidateFileName(candidate);
+    const path = candidatePath(candidate);
     const module_slot = freeModuleSlot() orelse {
         k.puts("[R4P] module table full\r\n");
-        return false;
+        return null;
     };
-    if (!protocolInfoFits(info, file_name)) return false;
+    if (!protocolInfoFits(info, file_name)) return null;
     const info_name = protocolInfoName(&info);
     const info_role = protocolInfoRole(&info);
-    if (registry.moduleEntryForRole(info_role) != null) {
-        if (source == .r4p) late_duplicate_skipped += 1;
-        k.puts("[R4P] skip duplicate role ");
-        k.puts(info_role);
-        k.puts(" from ");
-        k.puts(file_name);
-        k.puts("\r\n");
-        return false;
-    }
-    const loaded_module_slot = modsys.loadResolvedFile(file_source, .r4p, file_name, path) orelse return false;
-    const init_addr = modsys.exportAddress(loaded_module_slot, "ProtocolInit", 1) orelse return missingExport("ProtocolInit");
-    const shutdown_addr = modsys.exportAddress(loaded_module_slot, "ProtocolShutdown", 1) orelse return missingExport("ProtocolShutdown");
-    const query_addr = modsys.exportAddress(loaded_module_slot, "ProtocolQuery", 1) orelse return missingExport("ProtocolQuery");
-    const dispatch_addr = modsys.exportAddress(loaded_module_slot, "ProtocolDispatch", 1) orelse return missingExport("ProtocolDispatch");
-    const registry_slot = switch (source) {
-        .preload => registry.beginLoadPreload(info_name, info_role, info.category, VERSION, protocol_api.VERSION),
-        else => registry.beginLoadR4p(info_name, info_role, info.category, VERSION, protocol_api.VERSION),
-    } orelse {
-        k.puts("[R4P] duplicate role or registry full: ");
-        k.puts(info_role);
-        k.puts("\r\n");
-        return false;
+    if (!registry.selectCatalogR4p(candidate.registry_slot, info_name, info_role, info.category, VERSION, protocol_api.VERSION)) return null;
+
+    demand_loads += 1;
+    k.puts("[R4P] demand role=");
+    k.puts(info_role);
+    k.puts(" file=");
+    k.puts(file_name);
+    k.puts("\r\n");
+    const read_start = loader_perf.now();
+    const loaded_module_slot = modsys.loadResolvedFile(file_source, .r4p, file_name, path) orelse {
+        loader_perf.addR4pReadTicks(read_start);
+        return null;
+    };
+    loader_perf.addR4pReadTicks(read_start);
+    const init_addr = modsys.exportAddress(loaded_module_slot, "ProtocolInit", 1) orelse {
+        _ = missingExport("ProtocolInit");
+        return null;
+    };
+    const shutdown_addr = modsys.exportAddress(loaded_module_slot, "ProtocolShutdown", 1) orelse {
+        _ = missingExport("ProtocolShutdown");
+        return null;
+    };
+    const query_addr = modsys.exportAddress(loaded_module_slot, "ProtocolQuery", 1) orelse {
+        _ = missingExport("ProtocolQuery");
+        return null;
+    };
+    const dispatch_addr = modsys.exportAddress(loaded_module_slot, "ProtocolDispatch", 1) orelse {
+        _ = missingExport("ProtocolDispatch");
+        return null;
     };
 
     modules[module_slot] = .{
         .used = true,
-        .source = source,
+        .source = .r4p,
         .module_slot = loaded_module_slot,
-        .registry_slot = registry_slot,
+        .registry_slot = candidate.registry_slot,
         .dependency_count = info.dependency_count,
         .init = @ptrFromInt(init_addr),
         .shutdown = @ptrFromInt(shutdown_addr),
@@ -321,7 +407,93 @@ fn loadModuleFileWithInfo(file_source: module_file.FileSource, info: R4MProtocol
         .dispatch_fn = @ptrFromInt(dispatch_addr),
     };
     storeProtocolInfo(&modules[module_slot], info);
-    return true;
+    candidate.module_index = module_slot;
+    return module_slot;
+}
+
+const ActivationResult = enum {
+    active,
+    invalid_candidate,
+    inactive,
+};
+
+fn ensureRoleActive(role: []const u8) bool {
+    if (activeModuleForRole(role) != null) return true;
+    acquireActivationGate();
+    defer releaseActivationGate();
+    return ensureRoleActiveSerial(role, 0);
+}
+
+fn ensureRoleActiveSerial(role: []const u8, depth: usize) bool {
+    if (activeModuleForRole(role) != null) return true;
+    if (depth >= MAX_ACTIVATION_DEPTH) return false;
+
+    var saw_candidate = false;
+    var saw_loading = false;
+    var i: usize = 0;
+    while (i < candidates.len) : (i += 1) {
+        if (!candidates[i].used or !nameEq(protocolInfoRole(&candidates[i].info), role)) continue;
+        saw_candidate = true;
+        switch (candidates[i].state) {
+            .loading => saw_loading = true,
+            .finished => return activeModuleForRole(role) != null,
+            .invalid => continue,
+            .cataloged => switch (activateCandidate(i, depth)) {
+                .active => return true,
+                .inactive => return false,
+                .invalid_candidate => continue,
+            },
+        }
+    }
+    if (saw_loading) return false;
+    if (saw_candidate) {
+        if (registrySlotForCatalogRole(role)) |slot| registry.setError(slot, -4, "all lazy candidates invalid");
+        refreshPerformanceResults();
+    }
+    return false;
+}
+
+fn activateCandidate(candidate_index: usize, depth: usize) ActivationResult {
+    const candidate = &candidates[candidate_index];
+    candidate.state = .loading;
+    const module_index = loadCatalogCandidate(candidate_index) orelse {
+        candidate.state = .invalid;
+        return .invalid_candidate;
+    };
+    const module = &modules[module_index];
+
+    var dependency_index: usize = 0;
+    while (dependency_index < module.dependency_count) : (dependency_index += 1) {
+        const dependency = moduleDependency(module, dependency_index);
+        if (dependency.len == 0 or !ensureRoleActiveSerial(dependency, depth + 1)) {
+            const dep_entry = registry.r4pEntryForRole(dependency);
+            const note = if (dep_entry == null)
+                "dependency missing"
+            else if (dep_entry.?.state == .loaded)
+                "dependency cycle or unresolved dependency"
+            else
+                "dependency blocked";
+            registry.setBlocked(module.registry_slot, -5, note);
+            module.initialized = true;
+            candidate.state = .finished;
+            refreshPerformanceResults();
+            return .inactive;
+        }
+    }
+
+    initModule(module);
+    module.initialized = true;
+    candidate.state = .finished;
+    refreshPerformanceResults();
+    return if (activeModuleForRole(moduleRole(module)) != null) .active else .inactive;
+}
+
+fn acquireActivationGate() void {
+    while (@cmpxchgStrong(u8, &activation_gate, 0, 1, .acquire, .monotonic) != null) scheduler.yield();
+}
+
+fn releaseActivationGate() void {
+    @atomicStore(u8, &activation_gate, 0, .release);
 }
 
 fn resolveAndInit() void {
@@ -458,12 +630,22 @@ fn failedR4pCount() usize {
     return count;
 }
 
+fn refreshPerformanceResults() void {
+    loader_perf.recordR4pResults(cataloged_roles, activeR4pCount(), blockedR4pCount(), failedR4pCount());
+}
+
 fn ensureInitialized() void {
     if (initialized) return;
     registry.init();
     modules = .{Module{}} ** MAX_MODULES;
+    candidates = .{Candidate{}} ** MAX_MODULES;
     preload_headers = 0;
+    disk_catalog_loaded = false;
     late_duplicate_skipped = 0;
+    cataloged_roles = 0;
+    cataloged_candidates = 0;
+    demand_loads = 0;
+    activation_gate = 0;
     initialized = true;
 }
 
@@ -490,6 +672,23 @@ fn freeModuleSlot() ?usize {
     return null;
 }
 
+fn freeCandidateSlot() ?usize {
+    var i: usize = 0;
+    while (i < candidates.len) : (i += 1) {
+        if (!candidates[i].used) return i;
+    }
+    return null;
+}
+
+fn registrySlotForCatalogRole(role: []const u8) ?usize {
+    var i: usize = 0;
+    while (i < candidates.len) : (i += 1) {
+        if (!candidates[i].used) continue;
+        if (nameEq(protocolInfoRole(&candidates[i].info), role)) return candidates[i].registry_slot;
+    }
+    return null;
+}
+
 fn missingExport(name: []const u8) bool {
     k.puts("[R4P] missing export ");
     k.puts(name);
@@ -508,6 +707,14 @@ fn moduleRole(module: *const Module) []const u8 {
 fn moduleDependency(module: *const Module, index: usize) []const u8 {
     if (index >= module.dependency_count or index >= MAX_DEPENDENCIES) return "";
     return module.dependencies[index][0..module.dependency_lens[index]];
+}
+
+fn candidateFileName(candidate: *const Candidate) []const u8 {
+    return candidate.file_name[0..candidate.file_name_len];
+}
+
+fn candidatePath(candidate: *const Candidate) []const u8 {
+    return candidate.path[0..candidate.path_len];
 }
 
 fn protocolInfoFits(info: R4MProtocolInfo, file_name: []const u8) bool {

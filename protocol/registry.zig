@@ -62,6 +62,28 @@ pub fn beginLoadR4p(name: []const u8, role: []const u8, category_value: u16, ver
     return beginLoadModule(.r4p, name, role, category_value, version, api_version);
 }
 
+pub fn catalogR4p(name: []const u8, role: []const u8, category_value: u16, version: u16, api_version: u32) ?usize {
+    if (findModuleByRole(role) != null) return null;
+    const slot = freeSlot() orelse return null;
+    writeEntry(slot, .r4p, .loaded, name, role, category_value, version, api_version, 0, "installed; lazy");
+    return slot;
+}
+
+pub fn selectCatalogR4p(slot: usize, name: []const u8, role: []const u8, category_value: u16, version: u16, api_version: u32) bool {
+    if (slot >= entries.len or !entries[slot].used) return false;
+    const entry = &entries[slot];
+    if (entry.source != .r4p or !nameEq(entry.role[0..entry.role_len], role)) return false;
+    entry.name = .{0} ** MAX_NAME;
+    entry.name_len = copy(name, entry.name[0..]);
+    entry.category = category_value;
+    entry.version = version;
+    entry.api_version = api_version;
+    entry.last_error = 0;
+    entry.state = .loaded;
+    setNote(slot, "loading on demand");
+    return true;
+}
+
 pub fn beginLoadPreload(name: []const u8, role: []const u8, category_value: u16, version: u16, api_version: u32) ?usize {
     return beginLoadModule(.preload, name, role, category_value, version, api_version);
 }
