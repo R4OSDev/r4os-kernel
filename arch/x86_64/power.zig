@@ -3,6 +3,7 @@ const io = @import("io.zig");
 const acpi = @import("../../platform/acpi.zig");
 const bootlog = @import("../../kernel/bootlog.zig");
 const k = @import("../../kernel/log.zig");
+const smp = @import("../../kernel/smp.zig");
 
 const QEMU_PM1_CONTROL: u16 = 0x0604;
 const BOCHS_PM_CONTROL: u16 = 0xB004;
@@ -11,6 +12,7 @@ const SLP_EN: u16 = 1 << 13;
 
 pub fn poweroff() noreturn {
     io.cli();
+    smp.stopOthers();
 
     bootlog.puts("[POWER] poweroff requested\r\n");
     const info = acpi.info();

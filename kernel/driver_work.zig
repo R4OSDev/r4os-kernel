@@ -351,6 +351,9 @@ pub fn init() bool {
     summary_state.initialized = 1;
     summary_state.queue_capacity = QUEUE_CAPACITY;
     if (!worker_started) {
+        // R4D callbacks are third-party owner code. The queue itself is SMP
+        // safe, but callbacks remain on the BSP until their individual
+        // reentrancy contract is known; the audio deadline lane is serial too.
         const worker = sched_task.createKernelThreadWithRole("r4d-work", workerMain, .short_completion) orelse {
             summary_state.worker_started = 0;
             return false;

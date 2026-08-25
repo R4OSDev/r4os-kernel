@@ -9,7 +9,7 @@ const log_event = @import("log_event.zig");
 const net = @import("../net/core.zig");
 const net_backend = @import("../net/backend_contract.zig");
 const pci_inventory = @import("../platform/pci_inventory.zig");
-const platform_cpu = @import("../platform/cpu.zig");
+const smp = @import("smp.zig");
 const paging = @import("../memory/paging.zig");
 const phys = @import("../memory/phys.zig");
 const memory_layout = @import("../memory/layout.zig");
@@ -1402,9 +1402,10 @@ fn pciEnableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i3
     if ((control & 1) != 0) return -7;
     const is_64bit = (control & (1 << 7)) != 0;
 
-    // Fixed/Edge an den BSP; Multiple Message Enable bleibt auf einer
-    // Nachricht. Message Data traegt direkt den IDT-Vektor.
-    const address: u32 = 0xFEE0_0000 | (platform_cpu.bootApicId() << 12);
+    // Fixed/Edge to one internal scheduler target; Multiple Message Enable
+    // remains one. No public affinity or multi-vector ABI is introduced.
+    const msi_target = smp.irqTarget(slot + 1);
+    const address: u32 = 0xFEE0_0000 | (msi_target << 12);
     if (pciWriteConfig32(bus_kind, bus, device, function, cap + 0x04, address) != 0) return -4;
     if (is_64bit) {
         if (pciWriteConfig32(bus_kind, bus, device, function, cap + 0x08, 0) != 0) return -4;

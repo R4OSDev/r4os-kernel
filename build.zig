@@ -69,6 +69,11 @@ pub fn build(b: *std.Build) void {
         "net-loss-test",
         "Drop every Nth received network frame in test builds",
     ) orelse false;
+    const smp_fail_ap_index = b.option(
+        u32,
+        "smp-fail-ap-index",
+        "Diagnostic seam: leave the selected AP index offline",
+    ) orelse 0xFFFF_FFFF;
     const strip_kernel = b.option(
         bool,
         "strip-kernel",
@@ -100,7 +105,7 @@ pub fn build(b: *std.Build) void {
         .red_zone = false,
         .pic = false,
         .sanitize_c = .off,
-        .single_threaded = true,
+        .single_threaded = false,
         .stack_check = false,
         .stack_protector = false,
         .strip = strip_kernel,
@@ -119,6 +124,7 @@ pub fn build(b: *std.Build) void {
     config.addOption(bool, "enable_boot_selftests", boot_selftests);
     config.addOption(bool, "enable_block_dispatch_selftest", block_dispatch_selftest);
     config.addOption(bool, "enable_net_loss_test", net_loss_test);
+    config.addOption(u32, "smp_fail_ap_index", smp_fail_ap_index);
     kernel_mod.addOptions("config", config);
     kernel_mod.addImport("r4os_kernel_contract", contract_kernel);
     kernel_mod.addImport("r4f_format", b.createModule(.{
@@ -156,6 +162,7 @@ pub fn build(b: *std.Build) void {
     }));
     kernel_mod.addAssemblyFile(b.path("arch/x86_64/cpu.S"));
     kernel_mod.addAssemblyFile(b.path("arch/x86_64/isr.S"));
+    kernel_mod.addAssemblyFile(b.path("arch/x86_64/ap_trampoline.S"));
 
     const kernel = b.addExecutable(.{
         .name = "r4os.elf",
@@ -195,6 +202,7 @@ pub fn build(b: *std.Build) void {
         "kernel/driver_work_deadline.zig",
         "kernel/driver_work_queue.zig",
         "kernel/service_ipc_queue.zig",
+        "kernel/smp_policy.zig",
         "net/backend_contract.zig",
         "net/config_writer.zig",
         "net/rx_handoff.zig",

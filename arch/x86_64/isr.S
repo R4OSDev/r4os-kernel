@@ -2,6 +2,7 @@
 
 .extern exceptionDispatch
 .extern irqDispatch
+.extern ipiDispatch
 
 .macro ISR_NOERR vector
 .global isr\vector
@@ -97,6 +98,18 @@ IRQ 29
 IRQ 30
 IRQ 31
 
+.macro IPI name vector
+.global \name
+.type \name, @function
+\name:
+    pushq $0
+    pushq $\vector
+    jmp ipi_common
+.endm
+
+IPI ipi_reschedule, 0xF0
+IPI ipi_stop,       0xF1
+
 .global isr_common
 .type isr_common, @function
 isr_common:
@@ -116,8 +129,14 @@ isr_common:
     pushq %r14
     pushq %r15
 
+    # An interrupt may hit at either SysV stack phase. Preserve the exact
+    # frame pointer in a callee-saved register and align the call stack before
+    # entering Zig. The saved guest r12 is already part of the frame above.
     movq %rsp, %rdi
+    movq %rsp, %r12
+    andq $-16, %rsp
     call exceptionDispatch
+    movq %r12, %rsp
 
     popq %r15
     popq %r14
@@ -158,7 +177,54 @@ irq_common:
     pushq %r15
 
     movq %rsp, %rdi
+    movq %rsp, %r12
+    andq $-16, %rsp
     call irqDispatch
+    movq %r12, %rsp
+
+    popq %r15
+    popq %r14
+    popq %r13
+    popq %r12
+    popq %r11
+    popq %r10
+    popq %r9
+    popq %r8
+    popq %rsi
+    popq %rdi
+    popq %rbp
+    popq %rdx
+    popq %rcx
+    popq %rbx
+    popq %rax
+
+    addq $16, %rsp
+    iretq
+
+.global ipi_common
+.type ipi_common, @function
+ipi_common:
+    pushq %rax
+    pushq %rbx
+    pushq %rcx
+    pushq %rdx
+    pushq %rbp
+    pushq %rdi
+    pushq %rsi
+    pushq %r8
+    pushq %r9
+    pushq %r10
+    pushq %r11
+    pushq %r12
+    pushq %r13
+    pushq %r14
+    pushq %r15
+
+    movq %rsp, %rdi
+    movq %rsp, %r12
+    andq $-16, %rsp
+    call ipiDispatch
+    movq %r12, %rsp
 
     popq %r15
     popq %r14

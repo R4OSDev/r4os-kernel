@@ -1,4 +1,5 @@
 const interrupts = @import("../arch/x86_64/interrupts.zig");
+const percpu = @import("../arch/x86_64/percpu.zig");
 const ioapic = @import("../arch/x86_64/ioapic.zig");
 const pic = @import("../arch/x86_64/pic.zig");
 const scheduler = @import("../sched/scheduler.zig");
@@ -60,15 +61,15 @@ const Entry = struct {
 var entries: [MAX_IRQS][MAX_HANDLERS_PER_IRQ]Entry = .{.{Entry{}} ** MAX_HANDLERS_PER_IRQ} ** MAX_IRQS;
 var stats_table: [MAX_IRQS]IrqStats = initStats();
 var timing_table: [MAX_IRQS]IrqTimingStats = .{IrqTimingStats{}} ** MAX_IRQS;
-var dispatch_depth: u32 = 0;
-var active_owner: u32 = 0;
+var dispatch_depth: [percpu.max_cpus]u32 = .{0} ** percpu.max_cpus;
+var active_owner: [percpu.max_cpus]u32 = .{0} ** percpu.max_cpus;
 
 pub fn inDispatch() bool {
-    return dispatch_depth != 0;
+    return dispatch_depth[percpu.currentIndex()] != 0;
 }
 
 pub fn currentOwner() u32 {
-    return active_owner;
+    return active_owner[percpu.currentIndex()];
 }
 
 // 0.56.9: Kernel-Space-Schranke fuer Handler-Zeiger. Die rip=0- bzw.
@@ -105,8 +106,8 @@ pub fn register(irq: u8, handler: IrqHandler, context: usize, flags: u32, owner:
         return -4;
     }
 
-    interrupts.disable();
-    defer interrupts.enable();
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
 
     const shared = (flags & IRQ_FLAG_SHARED) != 0;
     const irq_index: usize = @intCast(irq);
@@ -142,8 +143,8 @@ pub fn register(irq: u8, handler: IrqHandler, context: usize, flags: u32, owner:
 pub fn cleanupOwner(owner: u32) u32 {
     if (owner == 0) return 0;
 
-    interrupts.disable();
-    defer interrupts.enable();
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
 
     var removed: u32 = 0;
     var irq: u8 = 0;
@@ -166,8 +167,8 @@ pub fn cleanupOwner(owner: u32) u32 {
 pub fn unregister(irq: u8, handler: IrqHandler, context: usize) i32 {
     if (irq >= MAX_IRQS) return -1;
 
-    interrupts.disable();
-    defer interrupts.enable();
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
 
     const irq_index: usize = @intCast(irq);
     for (&entries[irq_index]) |*entry| {
@@ -182,12 +183,16 @@ pub fn unregister(irq: u8, handler: IrqHandler, context: usize) i32 {
 
 pub fn stats(irq: u8, out: *IrqStats) i32 {
     if (irq >= MAX_IRQS) return -1;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
     out.* = stats_table[@intCast(irq)];
     return 0;
 }
 
 pub fn timingStats(irq: u8, out: *IrqTimingStats) i32 {
     if (irq >= MAX_IRQS) return -1;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
     out.* = timing_table[@intCast(irq)];
     return 0;
 }
@@ -201,8 +206,9 @@ pub fn dispatch(irq: u8) void {
     const dispatch_start = if (measure_dispatch) time_core.monotonicCapture() else time_core.MonotonicStamp{};
     if (measure_dispatch) timing_table[irq_index].observer_reads +|= 1;
 
-    dispatch_depth +|= 1;
-    defer dispatch_depth -= 1;
+    const cpu_index = percpu.currentIndex();
+    dispatch_depth[cpu_index] +|= 1;
+    defer dispatch_depth[cpu_index] -= 1;
 
     for (entries[irq_index]) |entry| {
         if (!entry.active) continue;
@@ -214,7 +220,7 @@ pub fn dispatch(irq: u8) void {
                 continue;
             }
             invoked = true;
-            active_owner = entry.owner;
+            active_owner[cpu_index] = entry.owner;
             const start = timer.tickCount();
             const timing_start = time_core.monotonicCapture();
             timing_table[irq_index].observer_reads +|= 1;
@@ -232,7 +238,7 @@ pub fn dispatch(irq: u8) void {
             stats_table[irq_index].handler_last_ticks = elapsed;
             if (elapsed > stats_table[irq_index].handler_max_ticks) stats_table[irq_index].handler_max_ticks = elapsed;
             stats_table[irq_index].last_owner = entry.owner;
-            active_owner = 0;
+            active_owner[cpu_index] = 0;
             if ((last_result & IRQ_RESULT_HANDLED) != 0) {
                 stats_table[irq_index].handled_count +%= 1;
             }

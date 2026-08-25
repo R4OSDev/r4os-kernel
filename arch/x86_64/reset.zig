@@ -7,6 +7,7 @@ const page_tables = @import("../../memory/page_tables.zig");
 const pci = @import("../../platform/pci.zig");
 const pcie = @import("../../platform/pcie.zig");
 const platform_cpu = @import("../../platform/cpu.zig");
+const smp = @import("../../kernel/smp.zig");
 
 const KBD_STATUS: u16 = 0x64;
 const KBD_COMMAND: u16 = 0x64;
@@ -23,6 +24,7 @@ const MAX_RESET_GRACE_SPINS: u64 = 50_000_000;
 
 pub fn reboot() noreturn {
     io.cli();
+    smp.stopOthers();
     bootlog.puts("[RESET] reboot requested\r\n");
     // Snapshot all CPU frequency metadata before the first reset write. Once
     // firmware starts the reset, only register-local operations are trusted.

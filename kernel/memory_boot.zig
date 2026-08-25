@@ -16,6 +16,7 @@ const virt = @import("../memory/virt.zig");
 const boot_status = @import("boot_status.zig");
 const fatal = @import("fatal.zig");
 const k = @import("log.zig");
+const smp = @import("smp.zig");
 
 var core_initialized = false;
 var summary_ready = false;
@@ -69,6 +70,7 @@ fn initPhysicalAllocator() bool {
     if (!phys.init()) {
         return fail("Physical allocator init failed");
     }
+    smp.reserveLowMemory();
     if (comptime config.enable_boot_selftests) {
         if (!blocks.indexInvariant()) return fail("MemoryBlock index invariant failed");
     }

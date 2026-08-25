@@ -7353,7 +7353,10 @@ fn runForegroundProgram(reservation: *const ProgramInstanceReservation, reservat
             if (consoleTargetByHandle(target_handle)) |host| console.host = consolePayloadConst(host).host;
         }
     }
-    const program_task = task.createKernelThreadBlocked("r4x-program", programTaskMain) orelse {
+    // Foreground programs share the interactive shell/console transaction
+    // and therefore retain the BSP legacy boundary. Detached console jobs
+    // below are the first audited R4X class admitted to AP runqueues.
+    const program_task = task.createLegacyThreadBlocked("r4x-program", programTaskMain) orelse {
         rollbackReservedProgramInstance(reservation);
         reservation_active.* = false;
         k.puts("Program task create failed\r\n");
@@ -7465,7 +7468,8 @@ fn runShellProgram(reservation: *const ProgramInstanceReservation, reservation_a
             console.revision = 1;
         }
     }
-    const shell_task = task.createKernelThreadBlocked("r4x-shell", shellTaskMain) orelse {
+    // The persistent shell owns global console and child-lifecycle state.
+    const shell_task = task.createLegacyThreadBlocked("r4x-shell", shellTaskMain) orelse {
         rollbackReservedProgramInstance(reservation);
         reservation_active.* = false;
         k.puts("Shell task create failed\r\n");
@@ -7566,7 +7570,15 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
         payload.revision = 1;
     }
 
-    const program_task = task.createKernelThreadBlocked(if (app_class == .service) "r4x-service" else "r4x-app", programTaskMain) orelse {
+    // Global program/console owners remain on the BSP. LSTRX is the first
+    // explicitly audited CPU-only R4X container: the Test-profile loader
+    // probe starts four ordinary instances and verifies their full teardown.
+    // This allow-list is internal ownership policy, not a public affinity ABI.
+    const smp_audited = app_class == .console and isSmpAuditedBackgroundR4x(loaded);
+    const program_task = (if (smp_audited)
+        task.createParallelThreadBlocked("r4x-app", programTaskMain)
+    else
+        task.createLegacyThreadBlocked(if (app_class == .service) "r4x-service" else "r4x-app", programTaskMain)) orelse {
         rollbackReservedProgramInstance(reservation);
         reservation_active.* = false;
         k.puts("Program task create failed\r\n");
@@ -7615,6 +7627,11 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
     if (options.out_handle) |out_handle| out_handle.* = handle;
     task.markReady(program_task, timer.tickCount());
     return .ran;
+}
+
+fn isSmpAuditedBackgroundR4x(loaded: LoadedProgram) bool {
+    const origin = loaded.origin[0..loaded.origin_len];
+    return std.ascii.eqlIgnoreCase(origin, "C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG\\LSTRX.R4X");
 }
 
 fn programTaskMain() callconv(.c) void {
@@ -8590,7 +8607,11 @@ fn apiThreadCreateHandle(entry: RawEntryFn, arg: u64, stack_reserve_bytes: u64, 
         return THREAD_ERROR_NO_MEMORY;
     };
     var task_failure: task.CreateFailure = .none;
-    const new_task = task.createKernelThreadBlockedWithFailure("r4x-thread", programThreadTaskMain, &task_failure) orelse {
+    const parallel_owner = if (scheduler.current()) |owner_task| owner_task.smp_eligible else false;
+    const new_task = (if (parallel_owner)
+        task.createParallelThreadBlockedWithFailure("r4x-thread", programThreadTaskMain, &task_failure)
+    else
+        task.createLegacyThreadBlockedWithFailure("r4x-thread", programThreadTaskMain, &task_failure)) orelse {
         _ = freeProgramThreadMemory(thread_ctx);
         _ = freeProgramStack(&stack);
         return threadCreateErrorForTaskFailure(task_failure);

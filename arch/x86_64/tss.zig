@@ -1,4 +1,5 @@
 const STACK_SIZE: usize = 16 * 1024;
+const percpu = @import("percpu.zig");
 
 pub const DOUBLE_FAULT_IST: u8 = 1;
 pub const FAULT_IST: u8 = 2;
@@ -21,18 +22,22 @@ pub const Tss = packed struct {
     iomap_base: u16 = @sizeOf(Tss),
 };
 
-var tss: Tss align(16) = .{};
-var double_fault_stack: [STACK_SIZE]u8 align(16) = undefined;
-var fault_stack: [STACK_SIZE]u8 align(16) = undefined;
+var cpu_tss: [percpu.max_cpus]Tss align(16) = .{Tss{}} ** percpu.max_cpus;
+var double_fault_stacks: [percpu.max_cpus][STACK_SIZE]u8 align(16) = undefined;
+var fault_stacks: [percpu.max_cpus][STACK_SIZE]u8 align(16) = undefined;
 
-pub fn init() void {
-    tss.rsp0 = stackTop(&fault_stack);
-    tss.ist1 = stackTop(&double_fault_stack);
-    tss.ist2 = stackTop(&fault_stack);
+pub fn init(index: u32) void {
+    if (index >= percpu.max_cpus) return;
+    const slot: usize = @intCast(index);
+    cpu_tss[slot] = .{};
+    cpu_tss[slot].rsp0 = stackTop(&fault_stacks[slot]);
+    cpu_tss[slot].ist1 = stackTop(&double_fault_stacks[slot]);
+    cpu_tss[slot].ist2 = stackTop(&fault_stacks[slot]);
 }
 
-pub fn base() u64 {
-    return @intFromPtr(&tss);
+pub fn base(index: u32) u64 {
+    if (index >= percpu.max_cpus) return 0;
+    return @intFromPtr(&cpu_tss[index]);
 }
 
 pub fn limit() u32 {

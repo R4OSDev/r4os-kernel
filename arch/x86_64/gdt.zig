@@ -1,4 +1,5 @@
 const k = @import("../../kernel/log.zig");
+const percpu = @import("percpu.zig");
 const tss = @import("tss.zig");
 
 const CODE_SELECTOR: u16 = 0x08;
@@ -13,28 +14,37 @@ const DescriptorTablePointer = packed struct {
 extern fn r4os_load_gdt(gdtr: *const DescriptorTablePointer) callconv(.c) void;
 extern fn r4os_load_tss(selector: u16) callconv(.c) void;
 
-var gdt: [5]u64 align(8) = .{
-    0x0000000000000000, // null
-    0x00AF9A000000FFFF, // kernel code: base 0, limit ignored in long mode
-    0x00CF92000000FFFF, // kernel data
-    0x0000000000000000, // TSS low
-    0x0000000000000000, // TSS high
+const initial_gdt = [5]u64{
+    0x0000000000000000,
+    0x00AF9A000000FFFF,
+    0x00CF92000000FFFF,
+    0x0000000000000000,
+    0x0000000000000000,
 };
 
-pub fn init() void {
-    tss.init();
-    setTssDescriptor(tss.base(), tss.limit());
+var cpu_gdts: [percpu.max_cpus][5]u64 align(8) = .{initial_gdt} ** percpu.max_cpus;
 
-    const gdtr = DescriptorTablePointer{
-        .limit = @sizeOf(@TypeOf(gdt)) - 1,
-        .base = @intFromPtr(&gdt),
-    };
-    r4os_load_gdt(&gdtr);
-    r4os_load_tss(TSS_SELECTOR);
+pub fn init() void {
+    initCurrent(0);
     k.puts("  GDT loaded ");
     k.puts("[OK]\r\n");
     k.puts("  TSS loaded ");
     k.puts("[OK]\r\n");
+}
+
+pub fn initCurrent(index: u32) void {
+    if (index >= percpu.max_cpus) return;
+    const slot: usize = @intCast(index);
+    cpu_gdts[slot] = initial_gdt;
+    tss.init(index);
+    setTssDescriptor(&cpu_gdts[slot], tss.base(index), tss.limit());
+
+    const gdtr = DescriptorTablePointer{
+        .limit = @sizeOf(@TypeOf(cpu_gdts[slot])) - 1,
+        .base = @intFromPtr(&cpu_gdts[slot]),
+    };
+    r4os_load_gdt(&gdtr);
+    r4os_load_tss(TSS_SELECTOR);
 }
 
 pub fn codeSelector() u16 {
@@ -45,7 +55,7 @@ pub fn dataSelector() u16 {
     return DATA_SELECTOR;
 }
 
-fn setTssDescriptor(base: u64, limit: u32) void {
+fn setTssDescriptor(table: *[5]u64, base: u64, limit: u32) void {
     var low: u64 = 0;
     low |= @as(u64, limit & 0xFFFF);
     low |= (base & 0xFFFFFF) << 16;
@@ -55,6 +65,6 @@ fn setTssDescriptor(base: u64, limit: u32) void {
 
     const high: u64 = base >> 32;
 
-    gdt[3] = low;
-    gdt[4] = high;
+    table[3] = low;
+    table[4] = high;
 }

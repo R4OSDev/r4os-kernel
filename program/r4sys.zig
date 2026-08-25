@@ -446,6 +446,8 @@ pub fn timeSetState(request: *const time_core.State) callconv(.c) i32 {
 }
 
 pub fn bootLogInfo(out: *BootLogInfo) callconv(.c) i32 {
+    const flags = interrupts.saveAndDisable();
+    defer interrupts.restore(flags);
     out.* = .{
         .capacity = @intCast(bootlog.capacity()),
         .length = @intCast(bootlog.length()),
@@ -458,6 +460,8 @@ pub fn bootLogInfo(out: *BootLogInfo) callconv(.c) i32 {
 }
 
 pub fn bootLogRead(offset: u32, out: [*]u8, capacity_value: u32) callconv(.c) i32 {
+    const flags = interrupts.saveAndDisable();
+    defer interrupts.restore(flags);
     if (capacity_value == 0) return 0;
     const len = bootlog.length();
     const offset_usize: usize = @intCast(offset);

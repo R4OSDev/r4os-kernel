@@ -10,6 +10,7 @@ const cpu = @import("../platform/cpu.zig");
 const monotonic = @import("../platform/monotonic.zig");
 const fatal = @import("fatal.zig");
 const pic = @import("../arch/x86_64/pic.zig");
+const smp = @import("smp.zig");
 
 var initialized = false;
 
@@ -20,6 +21,7 @@ pub fn init() void {
     idt.init();
     pic.init();
     _ = cpu.detect();
+    smp.initBsp();
     monotonic.configureCpuClock();
     if (!fpu.init()) fatal.kernelFatal(.cpu, "FPU/SSE task-state init failed");
 

@@ -1,5 +1,11 @@
 .section .text
 
+.global r4os_current_cpu_index
+.type r4os_current_cpu_index, @function
+r4os_current_cpu_index:
+    movl %gs:0, %eax
+    ret
+
 .global r4os_load_gdt
 .type r4os_load_gdt, @function
 r4os_load_gdt:
@@ -85,6 +91,16 @@ r4os_context_switch:
 
     movq %rsp, (%rdi)
     movq %rsi, %rsp
+
+    # The outgoing task becomes selectable only after its complete switch RSP
+    # is published above.  Run the global scheduler-boundary release on the
+    # incoming stack, below its saved context, so another CPU can never load a
+    # stale outgoing RSP.  r15 is callee-saved and temporarily anchors the
+    # incoming context while the call stack is aligned for SysV.
+    movq %rsp, %r15
+    andq $-16, %rsp
+    call r4os_finish_context_switch
+    movq %r15, %rsp
 
     popq %r15
     popq %r14

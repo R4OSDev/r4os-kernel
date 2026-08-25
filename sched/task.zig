@@ -5,6 +5,8 @@ const k = @import("../kernel/log.zig");
 const timer = @import("../kernel/timer.zig");
 const fpu = @import("../arch/x86_64/fpu.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
+const percpu = @import("../arch/x86_64/percpu.zig");
+const smp_policy = @import("../kernel/smp_policy.zig");
 const initial_stack = @import("initial_stack.zig");
 const task_context = @import("task_context.zig");
 const wait_node = @import("wait_node.zig");
@@ -115,6 +117,7 @@ pub const Entry = *const fn () callconv(.c) void;
 
 pub const HeldLockRecord = struct {
     object_id: u64 = 0,
+    name: []const u8 = "",
     rank: u16 = 0,
     mode_no_sleep: bool = false,
     active: bool = false,
@@ -171,6 +174,12 @@ pub const Task = struct {
     rollback_next: ?*Task = null,
     critical_reserve_slot: u8 = NO_CRITICAL_RESERVE_SLOT,
     id: u32 = 0,
+    home_cpu: u8 = 0,
+    home_cpu_bound: bool = false,
+    running_cpu: u8 = 0xFF,
+    smp_eligible: bool = false,
+    smp_r4x_work: bool = false,
+    cpu_idle: bool = false,
     name: []const u8 = "",
     state: State = .unused,
     rsp: u64 = 0,
@@ -274,10 +283,14 @@ pub const InventoryPage = struct {
 
 var registry_head: ?*Task = null;
 var registry_tail: ?*Task = null;
-var ready_head: ?*Task = null;
-var ready_tail: ?*Task = null;
-var ready_count: usize = 0;
-var ready_dispatch_counts: [role_count]usize = .{0} ** role_count;
+const ReadyQueue = struct {
+    head: ?*Task = null,
+    tail: ?*Task = null,
+    count: usize = 0,
+    dispatch_counts: [role_count]usize = .{0} ** role_count,
+};
+
+var ready_queues: [percpu.max_cpus]ReadyQueue = .{ReadyQueue{}} ** percpu.max_cpus;
 var role_activation_counts: [role_count]u64 = .{0} ** role_count;
 var role_budget_exhaustion_counts: [role_count]u64 = .{0} ** role_count;
 var donation_request_count: u64 = 0;
@@ -363,10 +376,7 @@ pub fn init() bool {
     initialized = false;
     registry_head = null;
     registry_tail = null;
-    ready_head = null;
-    ready_tail = null;
-    ready_count = 0;
-    ready_dispatch_counts = .{0} ** role_count;
+    ready_queues = .{ReadyQueue{}} ** percpu.max_cpus;
     role_activation_counts = .{0} ** role_count;
     role_budget_exhaustion_counts = .{0} ** role_count;
     donation_request_count = 0;
@@ -402,11 +412,12 @@ pub fn init() bool {
     if (!prepareCriticalReserve()) return false;
     initialized = true;
     var create_failure: CreateFailure = .none;
-    _ = createTask("kernel-main", .running, false, null, .interactive, &create_failure) orelse {
+    _ = createTask("kernel-main", .running, false, null, .interactive, false, false, &create_failure) orelse {
         initialized = false;
         cleanupCriticalReserve();
         return false;
     };
+    percpu.setWorkActive(0, true);
     // 0.56.15: Boot-Marker fuer die Guard-Page-Abnahme.
     k.puts("[TASKSTACK] guard-pages active: guard=");
     k.putDec(STACK_GUARD_SIZE);
@@ -426,10 +437,19 @@ pub fn createKernelTask(name: []const u8, state: State) ?*Task {
 }
 
 pub fn createKernelTaskWithFailure(name: []const u8, state: State, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, state, true, null, .interactive, failure_out);
+    return createTask(name, state, true, null, .interactive, false, false, failure_out);
 }
 
-fn createTask(name: []const u8, state: State, needs_fpu: bool, entry: ?Entry, role: Role, failure_out: *CreateFailure) ?*Task {
+fn createTask(
+    name: []const u8,
+    state: State,
+    needs_fpu: bool,
+    entry: ?Entry,
+    role: Role,
+    smp_eligible: bool,
+    smp_r4x_work: bool,
+    failure_out: *CreateFailure,
+) ?*Task {
     failure_out.* = .none;
     if (!initialized) {
         recordCreateFailure(failure_out, .memory);
@@ -499,6 +519,11 @@ fn createTask(name: []const u8, state: State, needs_fpu: bool, entry: ?Entry, ro
     new_task.* = .{
         .name = name,
         .state = state,
+        .home_cpu = if (state == .running) @intCast(percpu.currentIndex()) else 0,
+        .home_cpu_bound = state == .running,
+        .running_cpu = if (state == .running) @intCast(percpu.currentIndex()) else 0xFF,
+        .smp_eligible = smp_eligible,
+        .smp_r4x_work = smp_r4x_work,
         .rsp = if (entry != null) initialRsp(stack.top) else 0,
         .stack_base = stack.base,
         .stack_top = stack.top,
@@ -748,10 +773,11 @@ pub fn effectivePriority(t: *const Task) Priority {
 
 fn adjustReadyDispatchCountLocked(t: *const Task, old_rank: u8, new_rank: u8) void {
     if (!t.ready_linked or old_rank == new_rank) return;
-    if (old_rank < ready_dispatch_counts.len and ready_dispatch_counts[old_rank] != 0) {
-        ready_dispatch_counts[old_rank] -= 1;
+    const queue = readyQueueForTask(t);
+    if (old_rank < queue.dispatch_counts.len and queue.dispatch_counts[old_rank] != 0) {
+        queue.dispatch_counts[old_rank] -= 1;
     }
-    if (new_rank < ready_dispatch_counts.len) ready_dispatch_counts[new_rank] += 1;
+    if (new_rank < queue.dispatch_counts.len) queue.dispatch_counts[new_rank] += 1;
 }
 
 fn configureRoleFields(t: *Task, role: Role) void {
@@ -820,25 +846,55 @@ fn consumeRunBudgetsLocked(t: *Task, elapsed: u64) void {
 
 fn linkReadyLocked(t: *Task) void {
     if (t.ready_linked) return;
-    t.ready_prev = ready_tail;
+    const queue = readyQueueForTask(t);
+    t.ready_prev = queue.tail;
     t.ready_next = null;
-    if (ready_tail) |tail| tail.ready_next = t else ready_head = t;
-    ready_tail = t;
+    if (queue.tail) |tail| tail.ready_next = t else queue.head = t;
+    queue.tail = t;
     t.ready_linked = true;
-    ready_count += 1;
-    ready_dispatch_counts[dispatchRank(t)] += 1;
+    queue.count += 1;
+    queue.dispatch_counts[dispatchRank(t)] += 1;
 }
 
 fn unlinkReadyLocked(t: *Task) void {
     if (!t.ready_linked) return;
-    if (t.ready_prev) |previous| previous.ready_next = t.ready_next else ready_head = t.ready_next;
-    if (t.ready_next) |following| following.ready_prev = t.ready_prev else ready_tail = t.ready_prev;
+    const queue = readyQueueForTask(t);
+    if (t.ready_prev) |previous| previous.ready_next = t.ready_next else queue.head = t.ready_next;
+    if (t.ready_next) |following| following.ready_prev = t.ready_prev else queue.tail = t.ready_prev;
     t.ready_prev = null;
     t.ready_next = null;
     t.ready_linked = false;
-    if (ready_count != 0) ready_count -= 1;
+    if (queue.count != 0) queue.count -= 1;
     const index = dispatchRank(t);
-    if (ready_dispatch_counts[index] != 0) ready_dispatch_counts[index] -= 1;
+    if (queue.dispatch_counts[index] != 0) queue.dispatch_counts[index] -= 1;
+}
+
+fn readyQueue(cpu_index: u32) *ReadyQueue {
+    const index: usize = @intCast(if (cpu_index < percpu.max_cpus) cpu_index else 0);
+    return &ready_queues[index];
+}
+
+fn readyQueueForTask(t: *const Task) *ReadyQueue {
+    return readyQueue(t.home_cpu);
+}
+
+fn selectHomeCpuLocked(t: *Task) void {
+    if (!t.smp_eligible) {
+        t.home_cpu = 0;
+        t.home_cpu_bound = true;
+        return;
+    }
+    // Initial placement is balanced, but a suspended kernel stack is not
+    // migrated between processors in the SMP foundation.  This keeps all
+    // hidden architectural/task-local state on one CPU while preserving
+    // per-CPU runqueues and parallel execution. Rebind only after CPU loss.
+    if (t.home_cpu_bound and percpu.isSchedulable(t.home_cpu)) return;
+    var loads: [percpu.max_cpus]usize = .{0} ** percpu.max_cpus;
+    for (ready_queues, 0..) |queue, index| {
+        loads[index] = queue.count + @intFromBool(percpu.workActive(@intCast(index)));
+    }
+    t.home_cpu = @intCast(smp_policy.leastLoadedCpu(percpu.schedulableMask(), &loads));
+    t.home_cpu_bound = true;
 }
 
 fn linkTimeoutLocked(t: *Task) void {
@@ -1198,6 +1254,11 @@ pub fn recycleGuardHits() u64 {
 }
 
 fn isCurrentTask(t: *Task) bool {
+    // Cross-CPU lifetime truth.  A task that has completed its logical dead
+    // transition may still execute the exit/yield path on its stack until the
+    // assembler switch has published the outgoing RSP.  A caller-local
+    // current() check cannot see that owner on another CPU.
+    if (t.running_cpu != 0xFF) return true;
     const provider = current_provider orelse return false;
     const current = provider() orelse return false;
     return current == t;
@@ -1209,12 +1270,17 @@ pub fn createKernelThread(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelThreadWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .ready, false, entry, .interactive, failure_out);
+    return createTask(name, .ready, false, entry, .interactive, false, false, failure_out);
 }
 
 pub fn createKernelThreadWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .ready, false, entry, role, &failure);
+    return createTask(name, .ready, false, entry, role, false, false, &failure);
+}
+
+pub fn createParallelKernelThreadWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
+    var failure: CreateFailure = .none;
+    return createTask(name, .ready, false, entry, role, true, false, &failure);
 }
 
 pub fn createKernelThreadBlocked(name: []const u8, entry: Entry) ?*Task {
@@ -1223,12 +1289,33 @@ pub fn createKernelThreadBlocked(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelThreadBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .blocked, true, entry, .interactive, failure_out);
+    return createTask(name, .blocked, true, entry, .interactive, false, false, failure_out);
 }
 
 pub fn createKernelThreadBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, true, entry, role, &failure);
+    return createTask(name, .blocked, true, entry, role, false, false, &failure);
+}
+
+pub fn createParallelThreadBlocked(name: []const u8, entry: Entry) ?*Task {
+    var failure: CreateFailure = .none;
+    return createTask(name, .blocked, true, entry, .interactive, true, true, &failure);
+}
+
+pub fn createParallelThreadBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
+    return createTask(name, .blocked, true, entry, .interactive, true, true, failure_out);
+}
+
+// R4X owners that still depend on global singleton state remain on the BSP
+// until their complete call graph has been audited.  This is an internal
+// ownership policy, not a public CPU-affinity ABI.
+pub fn createLegacyThreadBlocked(name: []const u8, entry: Entry) ?*Task {
+    var failure: CreateFailure = .none;
+    return createTask(name, .blocked, true, entry, .interactive, false, false, &failure);
+}
+
+pub fn createLegacyThreadBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
+    return createTask(name, .blocked, true, entry, .interactive, false, false, failure_out);
 }
 
 pub fn createKernelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
@@ -1237,12 +1324,28 @@ pub fn createKernelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelWorkerBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .blocked, false, entry, .interactive, failure_out);
+    return createTask(name, .blocked, false, entry, .interactive, false, false, failure_out);
 }
 
 pub fn createKernelWorkerBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, false, entry, role, &failure);
+    return createTask(name, .blocked, false, entry, role, false, false, &failure);
+}
+
+pub fn createParallelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
+    var failure: CreateFailure = .none;
+    return createTask(name, .blocked, false, entry, .interactive, true, false, &failure);
+}
+
+pub fn createCpuIdleTask(cpu_index: u32) ?*Task {
+    if (cpu_index == 0 or cpu_index >= percpu.max_cpus) return null;
+    var failure: CreateFailure = .none;
+    const idle = createTask("cpu-idle", .blocked, false, null, .batch, false, false, &failure) orelse return null;
+    const irq_flags = interrupts.saveAndDisable();
+    idle.home_cpu = @intCast(cpu_index);
+    idle.cpu_idle = true;
+    interrupts.restore(irq_flags);
+    return idle;
 }
 
 // Critical workers consume one of four boot-time Task+Stack bundles. Normal
@@ -1501,8 +1604,8 @@ pub fn nextCircular(t: *const Task) ?*Task {
 // Scheduler-only intrusive views. All membership transitions happen with
 // interrupts disabled; scheduler selection and timer dispatch already run in
 // that same boundary and therefore never touch the global registry.
-pub fn firstReady() ?*Task {
-    return ready_head;
+pub fn firstReady(cpu_index: u32) ?*Task {
+    return readyQueue(cpu_index).head;
 }
 
 pub fn nextReady(t: *const Task) ?*Task {
@@ -1510,19 +1613,26 @@ pub fn nextReady(t: *const Task) ?*Task {
 }
 
 pub fn readyCount() usize {
-    return ready_count;
+    var total: usize = 0;
+    for (ready_queues) |queue| total += queue.count;
+    return total;
 }
 
-pub fn hasReadyMoreUrgentThanRank(rank: u8) bool {
+pub fn readyCountForCpu(cpu_index: u32) usize {
+    return readyQueue(cpu_index).count;
+}
+
+pub fn hasReadyMoreUrgentThanRank(cpu_index: u32, rank: u8) bool {
+    const queue = readyQueue(cpu_index);
     var index: usize = 0;
-    while (index < @min(@as(usize, rank), ready_dispatch_counts.len)) : (index += 1) {
-        if (ready_dispatch_counts[index] != 0) return true;
+    while (index < @min(@as(usize, rank), queue.dispatch_counts.len)) : (index += 1) {
+        if (queue.dispatch_counts[index] != 0) return true;
     }
     return false;
 }
 
-pub fn hasMoreUrgentReady(running: *const Task) bool {
-    return hasReadyMoreUrgentThanRank(dispatchRank(running));
+pub fn hasMoreUrgentReady(cpu_index: u32, running: *const Task) bool {
+    return hasReadyMoreUrgentThanRank(cpu_index, dispatchRank(running));
 }
 
 pub fn firstTimedWait() ?*Task {
@@ -1574,7 +1684,8 @@ pub fn queueSnapshot() QueueSnapshot {
     var expected_ready: usize = 0;
     var expected_timed: usize = 0;
     var expected_reap: usize = 0;
-    var expected_dispatch: [role_count]usize = .{0} ** role_count;
+    var expected_dispatch: [percpu.max_cpus][role_count]usize =
+        .{.{0} ** role_count} ** percpu.max_cpus;
     var previous: ?*Task = null;
     var cursor = registry_head;
     while (cursor) |candidate| {
@@ -1584,7 +1695,9 @@ pub fn queueSnapshot() QueueSnapshot {
             break;
         }
         if (candidate.registry_prev != previous) out.valid = false;
-        const should_be_ready = candidate.state == .ready;
+        // A remote wake may publish .ready while the old CPU still owns the
+        // live stack.  It joins a runqueue only at noteSwitchedOut().
+        const should_be_ready = candidate.state == .ready and candidate.running_cpu == 0xFF;
         const should_be_timed = candidate.state == .blocked and candidate.wake_tick != 0;
         const should_be_reaped = candidate.retire_pending and !candidate.release_in_progress;
         if (candidate.ready_linked != should_be_ready or
@@ -1595,7 +1708,7 @@ pub fn queueSnapshot() QueueSnapshot {
         }
         if (should_be_ready) {
             expected_ready += 1;
-            expected_dispatch[dispatchRank(candidate)] += 1;
+            expected_dispatch[candidate.home_cpu][dispatchRank(candidate)] += 1;
         }
         if (should_be_timed) expected_timed += 1;
         if (should_be_reaped) expected_reap += 1;
@@ -1604,26 +1717,35 @@ pub fn queueSnapshot() QueueSnapshot {
     }
     if (out.registry != task_count or previous != registry_tail) out.valid = false;
 
-    previous = null;
-    cursor = ready_head;
-    var observed_dispatch: [role_count]usize = .{0} ** role_count;
-    while (cursor) |candidate| {
-        out.ready += 1;
-        if (out.ready > ready_count) {
-            out.valid = false;
-            break;
+    var queue_index: usize = 0;
+    while (queue_index < percpu.max_cpus) : (queue_index += 1) {
+        const queue = &ready_queues[queue_index];
+        previous = null;
+        cursor = queue.head;
+        var observed_dispatch: [role_count]usize = .{0} ** role_count;
+        var observed_count: usize = 0;
+        while (cursor) |candidate| {
+            out.ready += 1;
+            observed_count += 1;
+            if (observed_count > queue.count) {
+                out.valid = false;
+                break;
+            }
+            if (!candidate.ready_linked or candidate.state != .ready or
+                candidate.home_cpu != queue_index or candidate.ready_prev != previous)
+            {
+                out.valid = false;
+            }
+            observed_dispatch[dispatchRank(candidate)] += 1;
+            previous = candidate;
+            cursor = candidate.ready_next;
         }
-        if (!candidate.ready_linked or candidate.state != .ready or candidate.ready_prev != previous) out.valid = false;
-        observed_dispatch[dispatchRank(candidate)] += 1;
-        previous = candidate;
-        cursor = candidate.ready_next;
+        for (observed_dispatch, queue.dispatch_counts, expected_dispatch[queue_index]) |observed, tracked, expected| {
+            if (observed != tracked or observed != expected) out.valid = false;
+        }
+        if (observed_count != queue.count or previous != queue.tail) out.valid = false;
     }
-    var dispatch_matches = true;
-    for (observed_dispatch, ready_dispatch_counts, expected_dispatch) |observed, tracked, expected| {
-        if (observed != tracked or observed != expected) dispatch_matches = false;
-    }
-    if (out.ready != ready_count or out.ready != expected_ready or previous != ready_tail or !dispatch_matches)
-        out.valid = false;
+    if (out.ready != readyCount() or out.ready != expected_ready) out.valid = false;
 
     previous = null;
     cursor = timeout_head;
@@ -1821,8 +1943,10 @@ pub fn markReady(t: *Task, now: u64) void {
     const was_durably_blocked = t.state == .blocked;
     unlinkTimeoutLocked(t);
     t.state = .ready;
+    t.running_cpu = 0xFF;
     t.ready_since_tick = now;
     if (was_durably_blocked) resetRoleActivationLocked(t);
+    if (was_durably_blocked) selectHomeCpuLocked(t);
     linkReadyLocked(t);
     if (was_durably_blocked) bumpInventoryMutationEpochLocked();
 }
@@ -1834,9 +1958,39 @@ pub fn markRunning(t: *Task) void {
     const was_durably_blocked = t.state == .blocked;
     unlinkReadyLocked(t);
     unlinkTimeoutLocked(t);
+    t.home_cpu = @intCast(percpu.currentIndex());
+    t.home_cpu_bound = true;
+    t.running_cpu = @intCast(percpu.currentIndex());
+    percpu.setWorkActive(percpu.currentIndex(), !t.cpu_idle);
     t.state = .running;
     t.ready_since_tick = 0;
     if (was_durably_blocked) bumpInventoryMutationEpochLocked();
+}
+
+pub fn parkCpuIdle(t: *Task) void {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (!t.cpu_idle or t.state == .dead or t.state == .unused) return;
+    unlinkReadyLocked(t);
+    unlinkTimeoutLocked(t);
+    t.state = .blocked;
+    t.running_cpu = 0xFF;
+    t.ready_since_tick = 0;
+}
+
+pub fn noteSwitchedOut(t: *Task) void {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (t.state == .running) return;
+    t.running_cpu = 0xFF;
+    // A remote wake may win after blockCurrent() published .blocked but
+    // before this CPU reached the physical switch boundary.  finishWait()
+    // then records .ready without queueing the still-running stack. Publish
+    // it only now, after the old stack can no longer be selected twice.
+    if (t.state == .ready and !t.ready_linked) {
+        selectHomeCpuLocked(t);
+        linkReadyLocked(t);
+    }
 }
 
 pub fn recordScheduled(t: *Task, now: u64) u64 {
@@ -1977,6 +2131,9 @@ fn transitionToDeadLocked(t: *Task, result: WaitResult, retire: bool) void {
     unlinkReadyLocked(t);
     unlinkTimeoutLocked(t);
     t.state = .dead;
+    // Keep running_cpu until noteSwitchedOut().  This closes the SMP reaper
+    // window in which another CPU could otherwise release the still-active
+    // exit stack after the logical dead transition.
     t.ready_since_tick = 0;
     t.wake_tick = 0;
     t.blocked_since_tick = 0;
@@ -2005,6 +2162,7 @@ pub fn kill(id: u32) bool {
     const target = findByIdLocked(id) orelse return false;
     if (target.state == .unused or target.state == .dead) return false;
     if (isCurrentTask(target)) return false;
+    if (target.state == .running) return false;
     // Reserved workers are the recovery/I/O/reaper progress floor.  A public
     // hard kill cannot run their defers and would both strand owned work and
     // consume the reserve bundle forever.  Natural return still transitions
@@ -2027,6 +2185,7 @@ pub fn killIdentity(id: u32, generation: u64) bool {
     const target = findByIdentityLocked(id, generation) orelse return false;
     if (target.state == .unused or target.state == .dead) return false;
     if (isCurrentTask(target)) return false;
+    if (target.state == .running) return false;
     if (target.critical_reserve_slot != NO_CRITICAL_RESERVE_SLOT) return false;
     if (target.held_lock_count != 0 or target.unwind_guard_count != 0) {
         kill_held_lock_deferrals +%= 1;
@@ -2175,6 +2334,7 @@ fn canReapLocked(t: *Task) bool {
 fn releaseEligibleLocked(t: *Task) bool {
     return t.retire_pending and
         t.state == .dead and
+        t.running_cpu == 0xFF and
         t.pin_count == 0 and
         !isCurrentTask(t) and
         wait_node.isDetached(&t.wait_node) and
@@ -2397,7 +2557,12 @@ pub fn finishWait(t: *Task, result: WaitResult) u64 {
     t.wait_object = 0;
     t.wait_result = result;
     resetRoleActivationLocked(t);
-    linkReadyLocked(t);
+    if (t.running_cpu == 0xFF) {
+        selectHomeCpuLocked(t);
+        linkReadyLocked(t);
+    } else {
+        t.home_cpu = t.running_cpu;
+    }
     bumpInventoryMutationEpochLocked();
     return wait_ticks;
 }

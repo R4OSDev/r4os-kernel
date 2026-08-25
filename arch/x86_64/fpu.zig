@@ -169,6 +169,19 @@ pub fn init() bool {
     return true;
 }
 
+// Apply the BSP-selected task-state contract to an application processor.
+// Feature selection and the canonical initial image remain global/read-only;
+// CR0, CR4, XCR0 and the live register file are CPU-local architectural state.
+pub fn initCurrentCpu() bool {
+    if (!initialized or active_backend == .none) return false;
+    r4os_write_cr0(active_cr0);
+    r4os_write_cr4(active_cr4);
+    if (active_backend == .xsave) r4os_xsetbv(0, active_xcr0_mask);
+    r4os_fninit();
+    restoreRaw(initial_state[0..active_state_bytes]);
+    return true;
+}
+
 pub fn initTaskState(state: []u8) bool {
     const bytes = activeStateBytes();
     if (!validTaskStateBuffer(state.ptr, state.len, bytes)) return false;

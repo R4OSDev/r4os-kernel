@@ -19,6 +19,8 @@ const service_ipc = @import("service_ipc.zig");
 const block_storage = @import("../storage/block.zig");
 const audio = @import("../audio/core.zig");
 const task = @import("../sched/task.zig");
+const platform_boot = @import("platform_boot.zig");
+const smp = @import("smp.zig");
 
 var task_runtime_initialized = false;
 
@@ -40,6 +42,14 @@ pub fn initTaskRuntime() bool {
         return false;
     }
     log.puts("  Scheduler ");
+    log.puts("[OK]\r\n");
+
+    const acpi_info = platform_boot.acpiInfo() orelse return false;
+    if (!smp.startApplicationProcessors(acpi_info)) return false;
+    // APs must be online before runtime R4D registration so new INTx/MSI
+    // routes can select an actual online target at their one-vector boundary.
+    smp.activate();
+    log.puts("  SMP foundation ");
     log.puts("[OK]\r\n");
 
     if (!service_ipc.startRuntimeWorker()) {

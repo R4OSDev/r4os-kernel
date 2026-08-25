@@ -5,6 +5,7 @@ const paging = @import("paging.zig");
 const phys = @import("phys.zig");
 const reclaim = @import("reclaim.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
+const percpu = @import("../arch/x86_64/percpu.zig");
 const k = @import("../kernel/log.zig");
 const r4sys_api = @import("../program/r4sys.zig");
 
@@ -509,6 +510,8 @@ pub fn init() bool {
 }
 
 pub fn reserve(req: ReserveRequest) Error!u32 {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(req.len) catch |err| return err;
     const alignment = normalizeAlignment(req.alignment) catch |err| return err;
@@ -526,6 +529,8 @@ pub fn reserve(req: ReserveRequest) Error!u32 {
 }
 
 pub fn reserveAt(req: ReserveAtRequest) Error!u32 {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(req.len) catch |err| return err;
     if (!isAligned(req.base, paging.PAGE_SIZE)) return Error.BadAlignment;
@@ -542,6 +547,8 @@ pub fn reserveAt(req: ReserveAtRequest) Error!u32 {
 }
 
 pub fn commit(id: u32, offset: u64, len_raw: u64) Error!void {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(len_raw) catch |err| return err;
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
@@ -597,6 +604,11 @@ fn allocClaimedFrame(range: Range, reclaim_reason: reclaim.Reason) Error!u64 {
         const frame = phys.allocFrame() orelse {
             if (!reclaimed) {
                 reclaimed = true;
+                // Reclaimers may reach filesystem/block I/O and yield.  The
+                // transitional SMP owner boundary is deliberately no-sleep;
+                // callers holding it fail with controlled OOM instead of
+                // lending the global owner lock across a context switch.
+                if (interrupts.inLegacyCriticalSection()) return Error.OutOfMemory;
                 if (reclaim.reclaimFrames(reclaim_reason, 1).returned_frames > 0) {
                     attempts = 0;
                     continue;
@@ -625,6 +637,9 @@ fn releaseClaimedFrame(frame: u64) void {
 }
 
 pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_id: u64) bool {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    var owner_locked = true;
+    defer if (owner_locked) interrupts.restore(owner_irq_flags);
     if (!initialized) return false;
     if ((error_code & PAGE_FAULT_PRESENT) != 0) return false;
     const fault_page = alignDownValue(addr, paging.PAGE_SIZE);
@@ -648,6 +663,15 @@ pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_
     const page_index = (fault_page - range.base) / paging.PAGE_SIZE;
     if (pageStateForFaultInRange(range, page_index)) |fault_state| {
         if ((fault_state.flags & page_state_flag_slot_bound) != 0) {
+            // Backing I/O may sleep. Pageable VM remains a BSP owner in the
+            // SMP foundation; release the transitional no-sleep boundary and
+            // retain the existing busy/generation/lifecycle transaction.
+            if (percpu.currentIndex() != 0) {
+                recordDemandFaultFailure(range);
+                return false;
+            }
+            owner_locked = false;
+            interrupts.restore(owner_irq_flags);
             return handlePageInFault(range, fault_page, page_index, fault_state);
         }
     }
@@ -671,6 +695,8 @@ pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_
 }
 
 pub fn uncommit(id: u32, offset: u64, len_raw: u64) Error!void {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(len_raw) catch |err| return err;
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
@@ -697,6 +723,8 @@ pub fn uncommit(id: u32, offset: u64, len_raw: u64) Error!void {
 }
 
 pub fn release(id: u32) Error!void {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const idx = indexById(id) orelse return Error.NotFound;
     var range = &ranges[idx];
@@ -745,6 +773,8 @@ pub fn release(id: u32) Error!void {
 }
 
 pub fn releaseOwner(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) u64 {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized) return 0;
     var released: u64 = 0;
     while (true) {
@@ -756,6 +786,8 @@ pub fn releaseOwner(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) u64 
 }
 
 pub fn protectGuard(id: u32, offset: u64, len_raw: u64) Error!void {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(len_raw) catch |err| return err;
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
@@ -769,6 +801,8 @@ pub fn protectGuard(id: u32, offset: u64, len_raw: u64) Error!void {
 }
 
 pub fn clearGuard(id: u32) Error!void {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const idx = indexById(id) orelse return Error.NotFound;
     ranges[idx].guard_base = 0;
@@ -776,6 +810,8 @@ pub fn clearGuard(id: u32) Error!void {
 }
 
 pub fn rangeInfo(id: u32) ?RangeInfo {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized) return null;
     const idx = indexById(id) orelse return null;
     const range = ranges[idx];
@@ -784,6 +820,8 @@ pub fn rangeInfo(id: u32) ?RangeInfo {
 }
 
 pub fn pageStateProbe(input: PageStateInput) PageStateResult {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     var result = makePageStateResult(input);
     if (!validatePageStateInput(input, &result)) {
         recordPageState(&result);
@@ -834,6 +872,8 @@ pub fn pageStateProbe(input: PageStateInput) PageStateResult {
 }
 
 pub fn applyPageIoState(input: PageStateInput, page_out: bool) PageStateResult {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     var adjusted = input;
     adjusted.operation = if (page_out) page_state_operation_bind_slot else page_state_operation_query;
     var result = pageStateProbe(adjusted);
@@ -850,12 +890,16 @@ pub fn applyPageIoState(input: PageStateInput, page_out: bool) PageStateResult {
 }
 
 pub fn pageStateSummary() PageStateSummary {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     var summary = page_state_summary;
     summary.span_count = activePageStateSpanCount();
     return summary;
 }
 
 pub fn recordPagerPolicyFailure(input: PageStateInput, page_out: bool) void {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (input.page_count == 0) return;
     const idx = indexById(input.region_id) orelse return;
     const range = ranges[idx];
@@ -887,6 +931,8 @@ pub fn recordPagerPolicyFailure(input: PageStateInput, page_out: bool) void {
 }
 
 pub fn stats() Stats {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     var s: Stats = .{};
     if (!initialized) return s;
 
@@ -922,6 +968,8 @@ pub fn stats() Stats {
 }
 
 pub fn ownerStats(owner: blocks.Owner, owner_id: u64, window_filter: ?Window, kind_filter: ?blocks.Kind) OwnerStats {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     var s: OwnerStats = .{};
     if (!initialized) return s;
 
@@ -948,6 +996,8 @@ pub fn ownerStats(owner: blocks.Owner, owner_id: u64, window_filter: ?Window, ki
 }
 
 pub fn dumpStats() void {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     const s = stats();
     k.puts("  Virtual ranges: active=");
     k.putDec(s.active_ranges);
@@ -1643,6 +1693,13 @@ pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32) rec
     const requested_frames = if (requested_frames_raw == 0) 1 else requested_frames_raw;
     var result = reclaim.SourceResult{};
     if (!initialized) return result;
+    // The pager transaction intentionally spans filesystem/block waits and
+    // therefore cannot hold the transitional saveAndDisable owner lock.
+    // Normal VM and lifecycle work remains BSP-owned; AP callers fail closed.
+    if (percpu.currentIndex() != 0) {
+        result.failures = 1;
+        return result;
+    }
 
     page_state_summary.eviction_attempts +%= 1;
     const backing = backing_store.activeBackingResult() orelse {
@@ -1695,6 +1752,8 @@ pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32) rec
 }
 
 pub fn evictableBytes() u64 {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized or backing_store.activeBackingResult() == null) return 0;
     var bytes: u64 = 0;
     var range_pos: usize = 0;
@@ -1713,6 +1772,8 @@ pub fn evictableBytes() u64 {
 }
 
 pub fn evictableDirtyBytes() u64 {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized or backing_store.activeBackingResult() == null) return 0;
     var bytes: u64 = 0;
     var range_pos: usize = 0;
@@ -2845,6 +2906,8 @@ fn recordPageStateSpanSteps(steps: usize) void {
 }
 
 pub fn hotPathStats() HotPathStats {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     var out = hot_path_stats;
     out.range_index_capacity = @intCast(RANGE_ID_INDEX_CAPACITY);
     out.range_index_entries = @intCast(@min(range_id_index_entries, std.math.maxInt(u32)));
@@ -2856,6 +2919,8 @@ pub fn hotPathStats() HotPathStats {
 }
 
 pub fn metadataInvariant() bool {
+    const owner_irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(owner_irq_flags);
     if (!initialized or range_address_count != range_id_index_entries) return false;
     var commit_seen: [MAX_COMMIT_SPANS / 64]u64 = .{0} ** (MAX_COMMIT_SPANS / 64);
     var page_seen: [MAX_PAGE_STATE_SPANS / 64]u64 = .{0} ** (MAX_PAGE_STATE_SPANS / 64);

@@ -3,12 +3,13 @@ const task_context = @import("task_context.zig");
 const config = @import("config");
 const fpu = @import("../arch/x86_64/fpu.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
+const lapic = @import("../arch/x86_64/lapic.zig");
+const percpu = @import("../arch/x86_64/percpu.zig");
 const timer = @import("../kernel/timer.zig");
 const k = @import("../kernel/log.zig");
 
 extern fn r4os_context_switch(old_rsp: *u64, new_rsp: u64) callconv(.c) void;
 
-var current_task: ?*task.Task = null;
 var initialized = false;
 var yield_count: u64 = 0;
 var sleep_count: u64 = 0;
@@ -18,7 +19,6 @@ var object_wait_count: u64 = 0;
 var object_wake_count: u64 = 0;
 var object_timeout_count: u64 = 0;
 var object_cancel_count: u64 = 0;
-var boot_preempt_disable_depth: u32 = 0;
 var preempt_disable_call_count: u64 = 0;
 var preempt_enable_call_count: u64 = 0;
 var preempt_disable_underflow_count: u64 = 0;
@@ -48,7 +48,26 @@ var run_without_switch_max_ticks: u64 = 0;
 var quantum_overrun_count: u64 = 0;
 var quantum_overrun_max_ticks: u64 = 0;
 var preemption_deferred_max_ticks: u64 = 0;
-var reschedule_requested = false;
+const RESCHEDULE_VECTOR: u8 = 0xF0;
+
+const CpuSchedulerState = struct {
+    current_task: ?*task.Task = null,
+    idle_task: ?*task.Task = null,
+    initialized: bool = false,
+    boot_preempt_disable_depth: u32 = 0,
+    reschedule_requested: bool = false,
+};
+
+var cpu_states: [percpu.max_cpus]CpuSchedulerState = .{CpuSchedulerState{}} ** percpu.max_cpus;
+
+fn cpuState(index: u32) *CpuSchedulerState {
+    const slot: usize = @intCast(if (index < percpu.max_cpus) index else 0);
+    return &cpu_states[slot];
+}
+
+fn localState() *CpuSchedulerState {
+    return cpuState(percpu.currentIndex());
+}
 var wakeup_reschedule_request_count: u64 = 0;
 var wakeup_preemption_switch_count: u64 = 0;
 var safe_reschedule_point_count: u64 = 0;
@@ -143,8 +162,11 @@ pub const Stats = struct {
 pub fn init() bool {
     task_context.clear();
     if (task.count() == 0) return false;
-    current_task = task.first() orelse return false;
-    task_context.bind(&current_task.?.unwind_guard_count);
+    cpu_states = .{CpuSchedulerState{}} ** percpu.max_cpus;
+    const state = localState();
+    state.current_task = task.first() orelse return false;
+    state.initialized = true;
+    task_context.bind(&state.current_task.?.unwind_guard_count);
     initialized = true;
     yield_count = 0;
     sleep_count = 0;
@@ -154,7 +176,7 @@ pub fn init() bool {
     object_wake_count = 0;
     object_timeout_count = 0;
     object_cancel_count = 0;
-    boot_preempt_disable_depth = 0;
+    state.boot_preempt_disable_depth = 0;
     preempt_disable_call_count = 0;
     preempt_enable_call_count = 0;
     preempt_disable_underflow_count = 0;
@@ -184,7 +206,7 @@ pub fn init() bool {
     quantum_overrun_count = 0;
     quantum_overrun_max_ticks = 0;
     preemption_deferred_max_ticks = 0;
-    reschedule_requested = false;
+    state.reschedule_requested = false;
     wakeup_reschedule_request_count = 0;
     wakeup_preemption_switch_count = 0;
     safe_reschedule_point_count = 0;
@@ -219,8 +241,44 @@ pub fn init() bool {
     return true;
 }
 
+pub fn prepareSecondary(index: u32) bool {
+    if (!initialized or index == 0 or index >= percpu.max_cpus) return false;
+    const state = cpuState(index);
+    if (state.idle_task != null) return true;
+    state.idle_task = task.createCpuIdleTask(index) orelse return false;
+    return true;
+}
+
+pub fn initSecondary(index: u32) bool {
+    if (!initialized or index == 0 or index >= percpu.max_cpus) return false;
+    const state = cpuState(index);
+    const idle = state.idle_task orelse return false;
+    task_context.clear();
+    state.current_task = idle;
+    state.boot_preempt_disable_depth = 0;
+    state.reschedule_requested = false;
+    state.initialized = true;
+    task.markRunning(idle);
+    task_context.bind(&idle.unwind_guard_count);
+    percpu.setSchedulerReady(index, true);
+    return true;
+}
+
+pub fn secondaryLoop() noreturn {
+    interrupts.enable();
+    while (true) {
+        // yield() performs the queue observation inside the owner boundary;
+        // the wait helper then performs the final atomic no-work recheck.
+        yield();
+        waitForInterruptUntilNextDeadline();
+    }
+}
+
 pub fn stats() Stats {
-    const diagnostic_ordinal = if (current_task) |running| task.ordinalOf(running) orelse 0 else 0;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    const state = localState();
+    const diagnostic_ordinal = if (state.current_task) |running| task.ordinalOf(running) orelse 0 else 0;
     return .{
         .initialized = initialized,
         // Legacy ABI field only. Scheduler identity is the stable Task object;
@@ -283,8 +341,9 @@ pub fn stats() Stats {
 }
 
 pub fn current() ?*task.Task {
-    if (!initialized) return null;
-    return current_task;
+    const state = localState();
+    if (!initialized or !state.initialized) return null;
+    return state.current_task;
 }
 
 // 0.56.40: Idle-Erkennung fuer die Exit-/Boot-Warteschleifen. true,
@@ -292,7 +351,9 @@ pub fn current() ?*task.Task {
 // sofort yielden statt zu hlt'en, sonst bremst jeder Rotationsbesuch
 // das System um bis zu einen Tick.
 pub fn hasOtherReadyTask() bool {
-    return initialized and task.readyCount() != 0;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    return initialized and localState().initialized and task.readyCountForCpu(percpu.currentIndex()) != 0;
 }
 
 pub const StructureStats = struct {
@@ -310,6 +371,9 @@ pub const StructureStats = struct {
 };
 
 pub fn structureStats() StructureStats {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    const state = localState();
     return .{
         .ready_candidate_visits = ready_candidate_visit_count,
         .timeout_candidate_visits = timeout_candidate_visit_count,
@@ -321,7 +385,7 @@ pub fn structureStats() StructureStats {
         .safe_reschedule_switches = safe_reschedule_switch_count,
         .safe_reschedule_deferred_irq = safe_reschedule_deferred_irq_count,
         .safe_reschedule_deferred_owner = safe_reschedule_deferred_owner_count,
-        .reschedule_pending = reschedule_requested,
+        .reschedule_pending = state.reschedule_requested,
     };
 }
 
@@ -354,7 +418,7 @@ var external_irq_fpu_guard_mismatch_reported = false;
 pub fn enterExternalIrqFpuGuard() ExternalIrqFpuGuard {
     if (fpu.activeStateBytes() == 0) return .{};
 
-    const running = current_task;
+    const running = localState().current_task;
     var restore_task_state = false;
     if (running) |interrupted| {
         if (interrupted.uses_fpu and
@@ -384,7 +448,7 @@ pub fn leaveExternalIrqFpuGuard(guard: ExternalIrqFpuGuard) void {
 
     if (guard.restore_task_state) {
         if (guard.interrupted_task) |interrupted| {
-            if (current_task == interrupted and
+            if (localState().current_task == interrupted and
                 interrupted.generation == guard.interrupted_generation and
                 interrupted.uses_fpu and
                 interrupted.fpu_state_valid and
@@ -408,19 +472,21 @@ pub fn leaveExternalIrqFpuGuard(guard: ExternalIrqFpuGuard) void {
 }
 
 pub fn preemptDisable() void {
+    const state = localState();
     preempt_disable_call_count +%= 1;
     if (current()) |running_task| {
         const depth = task.recordPreemptDisable(running_task);
         if (depth > preempt_disable_max_depth) preempt_disable_max_depth = depth;
         return;
     }
-    boot_preempt_disable_depth +|= 1;
-    if (boot_preempt_disable_depth > preempt_disable_max_depth) {
-        preempt_disable_max_depth = boot_preempt_disable_depth;
+    state.boot_preempt_disable_depth +|= 1;
+    if (state.boot_preempt_disable_depth > preempt_disable_max_depth) {
+        preempt_disable_max_depth = state.boot_preempt_disable_depth;
     }
 }
 
 pub fn preemptEnable() void {
+    const state = localState();
     preempt_enable_call_count +%= 1;
     if (current()) |running_task| {
         if (!task.recordPreemptEnable(running_task)) {
@@ -428,69 +494,128 @@ pub fn preemptEnable() void {
         }
         return;
     }
-    if (boot_preempt_disable_depth == 0) {
+    if (state.boot_preempt_disable_depth == 0) {
         preempt_disable_underflow_count +%= 1;
         return;
     }
-    boot_preempt_disable_depth -= 1;
+    state.boot_preempt_disable_depth -= 1;
 }
 
 pub fn yield() void {
-    if (!initialized or task.count() <= 1) return;
+    const state = localState();
+    if (!initialized or !state.initialized) return;
     const irq_flags = interrupts.saveAndDisable();
     yield_count +%= 1;
     const now = timer.tickCount();
 
     preemptDisable();
-    const old = current_task orelse {
+    const old = state.current_task orelse {
         preemptEnable();
         interrupts.restore(irq_flags);
         return;
     };
     task.recordYield(old, now);
-    const priority_wakeup = reschedule_requested and task.hasMoreUrgentReady(old);
-    const next_task = nextReadyTask(priority_wakeup) orelse {
-        reschedule_requested = false;
+    const priority_wakeup = state.reschedule_requested and task.hasMoreUrgentReady(percpu.currentIndex(), old);
+    const selected = nextReadyTask(priority_wakeup);
+    const next_task = selected orelse blk: {
+        state.reschedule_requested = false;
+        if (old.state == .running) {
+            preemptEnable();
+            interrupts.restore(irq_flags);
+            return;
+        }
+        break :blk state.idle_task orelse {
+            preemptEnable();
+            interrupts.restore(irq_flags);
+            return;
+        };
+    };
+    // A task whose remote wake raced its physical block boundary used to be
+    // selectable from its own queue. Never restore an older context of the
+    // stack that is executing this scheduler invocation.
+    if (next_task == old) {
+        task.markRunning(old);
         preemptEnable();
+        state.reschedule_requested = false;
         interrupts.restore(irq_flags);
         return;
-    };
-    if (old.state == .running) task.markReady(old, now);
+    }
+    if (old.state == .running) {
+        if (old.cpu_idle) task.parkCpuIdle(old) else task.markReady(old, now);
+    } else {
+        task.noteSwitchedOut(old);
+    }
     recordReadyLatency(next_task, task.recordScheduled(next_task, now));
     task.markRunning(next_task);
     task.saveFpuState(old);
     task.restoreFpuState(next_task);
+    noteProductiveTask(next_task);
     preemptEnable();
-    current_task = next_task;
+    state.current_task = next_task;
     task_context.bind(&next_task.unwind_guard_count);
     refreshRescheduleRequest(next_task);
+    requireSwitchBoundary(old);
     r4os_context_switch(&old.rsp, next_task.rsp);
     interrupts.restore(irq_flags);
     _ = task.reapDeferred();
 }
 
 pub fn preemptFromIrq() void {
-    if (!initialized or task.count() <= 1) return;
+    const state = localState();
+    if (!initialized or !state.initialized) return;
     const now = timer.tickCount();
-    const old = current_task orelse return;
+    const old = state.current_task orelse return;
     if (old.state != .running) return;
 
-    const wakeup_switch = reschedule_requested and task.hasMoreUrgentReady(old);
+    const wakeup_switch = state.reschedule_requested and task.hasMoreUrgentReady(percpu.currentIndex(), old);
     const next_task = nextReadyTask(wakeup_switch) orelse {
-        reschedule_requested = false;
+        state.reschedule_requested = false;
         return;
     };
+    if (next_task == old) {
+        task.markRunning(old);
+        state.reschedule_requested = false;
+        return;
+    }
 
     task.markReady(old, now);
     recordReadyLatency(next_task, task.recordScheduled(next_task, now));
     task.markRunning(next_task);
     task.saveFpuState(old);
     task.restoreFpuState(next_task);
-    current_task = next_task;
+    noteProductiveTask(next_task);
+    state.current_task = next_task;
     task_context.bind(&next_task.unwind_guard_count);
     if (wakeup_switch) wakeup_preemption_switch_count +%= 1;
     refreshRescheduleRequest(next_task);
+    requireSwitchBoundary(old);
     r4os_context_switch(&old.rsp, next_task.rsp);
+}
+
+fn requireSwitchBoundary(outgoing: *const task.Task) void {
+    if (!interrupts.legacySerializationEnabled()) return;
+    const depth = percpu.legacyCriticalDepth().*;
+    if (depth == 1) return;
+    k.puts("[SMP] switch boundary violation cpu=");
+    k.putDec(percpu.currentIndex());
+    k.puts(" task=");
+    k.putDec(outgoing.id);
+    k.puts("/");
+    k.puts(outgoing.name);
+    k.puts(" depth=");
+    k.putDec(depth);
+    k.puts(" state=");
+    k.puts(task.stateName(outgoing.state));
+    k.puts("\r\n");
+    interrupts.haltForever();
+}
+
+// Called by r4os_context_switch after the outgoing RSP is durable and while
+// running below the incoming saved context.  This is the SMP publication
+// boundary: ready tasks cannot be selected remotely before their stack image
+// is complete.
+export fn r4os_finish_context_switch() callconv(.c) void {
+    if (!interrupts.releaseLegacyForContextSwitch()) interrupts.haltForever();
 }
 
 pub fn sleepTicks(ticks: u64) void {
@@ -508,12 +633,13 @@ pub fn sleepTicksWithReason(ticks: u64, reason: []const u8) void {
 }
 
 pub fn blockCurrent(object: u64, timeout_ticks: u64, reason: []const u8) ?*task.Task {
-    if (!initialized) return null;
+    const state = localState();
+    if (!initialized or !state.initialized) return null;
     const irq_flags = interrupts.saveAndDisable();
     defer interrupts.restore(irq_flags);
     preemptDisable();
     defer preemptEnable();
-    const running = current_task orelse return null;
+    const running = state.current_task orelse return null;
     const now = timer.tickCount();
     const wake_tick = if (timeout_ticks == WAIT_FOREVER) 0 else timer.deadlineAfter(now, timeout_ticks);
     task.beginWait(running, wake_tick, reason, object);
@@ -539,7 +665,7 @@ pub fn parkBlocked(blocked_task: *task.Task) void {
             interrupts.restore(park_irq_flags);
         }
     }
-    if (current_task == blocked_task and blocked_task.state == .ready) {
+    if (localState().current_task == blocked_task and blocked_task.state == .ready) {
         recordReadyLatency(blocked_task, task.recordScheduled(blocked_task, timer.tickCount()));
         task.markRunning(blocked_task);
     }
@@ -560,9 +686,15 @@ pub fn wakeTask(target: *task.Task, result: task.WaitResult) bool {
         .cancelled => object_cancel_count +%= 1,
         else => {},
     }
-    if (current_task) |running| {
+    const target_cpu: u32 = target.home_cpu;
+    const target_state = cpuState(target_cpu);
+    if (target_cpu != percpu.currentIndex() and percpu.isSchedulable(target_cpu)) {
+        target_state.reschedule_requested = true;
+        wakeup_reschedule_request_count +%= 1;
+        sendRescheduleToCpu(target_cpu);
+    } else if (target_state.current_task) |running| {
         if (running.state == .running and task.dispatchRank(target) < task.dispatchRank(running)) {
-            reschedule_requested = true;
+            target_state.reschedule_requested = true;
             wakeup_reschedule_request_count +%= 1;
         }
     }
@@ -573,11 +705,12 @@ pub fn wakeTask(target: *task.Task, result: task.WaitResult) bool {
 // critical section. IRQ dispatch calls this after all handlers and EOIs, so a
 // higher-priority task can take over without switching inside a queue lock.
 pub fn preemptPendingWake(preemptible_instruction_pointer: bool) bool {
-    if (!reschedule_requested or !initialized) return false;
-    const running = current_task orelse return false;
+    const state = localState();
+    if (!state.reschedule_requested or !initialized or !state.initialized) return false;
+    const running = state.current_task orelse return false;
     if (running.state != .running) return false;
-    if (!task.hasMoreUrgentReady(running)) {
-        reschedule_requested = false;
+    if (!task.hasMoreUrgentReady(percpu.currentIndex(), running)) {
+        state.reschedule_requested = false;
         return false;
     }
     const scheduled_ticks = ticksSince(timer.tickCount(), running.last_scheduled_tick);
@@ -612,8 +745,9 @@ pub fn preemptPendingWake(preemptible_instruction_pointer: bool) bool {
 // only after releasing their owner and lock state. IRQ producers use the
 // separate post-handler/EOI decision in idt.zig.
 pub fn safeReschedulePoint() bool {
+    const state = localState();
     safe_reschedule_point_count +%= 1;
-    if (!reschedule_requested or !initialized or preemption_enabled == 0) return false;
+    if (!state.reschedule_requested or !initialized or !state.initialized or preemption_enabled == 0) return false;
 
     const irq_flags = interrupts.saveAndDisable();
     if (!interrupts.wereEnabled(irq_flags)) {
@@ -621,12 +755,12 @@ pub fn safeReschedulePoint() bool {
         interrupts.restore(irq_flags);
         return false;
     }
-    const running = current_task orelse {
+    const running = state.current_task orelse {
         interrupts.restore(irq_flags);
         return false;
     };
-    if (running.state != .running or !task.hasMoreUrgentReady(running)) {
-        reschedule_requested = false;
+    if (running.state != .running or !task.hasMoreUrgentReady(percpu.currentIndex(), running)) {
+        state.reschedule_requested = false;
         interrupts.restore(irq_flags);
         return false;
     }
@@ -660,6 +794,25 @@ fn exitCurrentImpl(retire: bool) noreturn {
         if (t.held_lock_count != 0 or t.unwind_guard_count != 0) {
             k.puts("TASK EXIT INVARIANT: owned synchronization remains id=");
             k.putDec(t.id);
+            k.puts(" locks=");
+            k.putDec(t.held_lock_count);
+            k.puts(" unwind=");
+            k.putDec(t.unwind_guard_count);
+            k.puts(" objects=");
+            var lock_index: usize = 0;
+            var wrote_lock = false;
+            while (lock_index < t.held_locks.len) : (lock_index += 1) {
+                const held = t.held_locks[lock_index];
+                if (!held.active) continue;
+                if (wrote_lock) k.puts(",");
+                k.puts(held.name);
+                k.puts("=");
+                k.putHex(held.object_id, 16);
+                k.puts("@");
+                k.putDec(held.rank);
+                wrote_lock = true;
+            }
+            if (!wrote_lock) k.puts("none");
             k.puts("\r\n");
             interrupts.haltForever();
         }
@@ -672,6 +825,10 @@ fn exitCurrentImpl(retire: bool) noreturn {
     }
     preemptEnable();
     interrupts.restore(irq_flags);
+    // A terminal task must cross the physical switch boundary even when its
+    // local runqueue is empty. In that case yield() selects this CPU's idle
+    // task, clears running_cpu and makes deferred teardown possible.
+    yield();
     // 0.56.40: NIE heiss spinnen. yield() restauriert die IF-Flags des
     // jeweiligen Task-Eintritts - ein Zombie, der den Exit-Pfad mit
     // IF=0 erreicht, reichte das im yield-Ring endlos weiter: sobald
@@ -693,17 +850,30 @@ fn exitCurrentImpl(retire: bool) noreturn {
 
 fn waitForInterruptUntilNextDeadline() void {
     const irq_flags = interrupts.saveAndDisable();
-    _ = timer.enterIdleDeadline(task.minWakeTick());
-    interrupts.enable();
-    interrupts.waitForInterrupt();
+    // Recheck after joining the cross-CPU owner boundary.  A remote producer
+    // cannot publish work between this check and the lock release below; its
+    // IPI is then consumed by the adjacent STI/HLT sequence.
+    if (task.readyCountForCpu(percpu.currentIndex()) != 0) {
+        interrupts.restore(irq_flags);
+        return;
+    }
+    const bsp = percpu.currentIndex() == 0;
+    if (bsp) _ = timer.enterIdleDeadline(task.minWakeTick());
+    if (!interrupts.releaseLegacyForContextSwitch()) interrupts.haltForever();
+    interrupts.enableAndWaitForInterrupt();
     interrupts.disable();
-    _ = timer.leaveIdleDeadline();
+    if (bsp) {
+        const leave_flags = interrupts.saveAndDisable();
+        _ = timer.leaveIdleDeadline();
+        interrupts.restore(leave_flags);
+    }
     interrupts.restore(irq_flags);
 }
 
 pub fn onTick(now: u64, preemptible_instruction_pointer: bool) bool {
-    if (initialized) {
-        if (current_task) |running| {
+    const state = localState();
+    if (initialized and state.initialized) {
+        if (state.current_task) |running| {
             if (running.state == .running) {
                 const run_ticks = task.recordRunTick(running, now);
                 recordRunWindow(run_ticks);
@@ -729,6 +899,32 @@ pub fn onTick(now: u64, preemptible_instruction_pointer: bool) bool {
     return should_preempt;
 }
 
+pub fn onSecondaryTick(now: u64, preemptible_instruction_pointer: bool) bool {
+    _ = preemptible_instruction_pointer;
+    const state = localState();
+    if (!initialized or !state.initialized) return false;
+    if (state.current_task) |running| {
+        if (running.state == .running and !running.cpu_idle) {
+            const run_ticks = task.recordRunTick(running, now);
+            recordRunWindow(run_ticks);
+            recordQuantumOverrun(run_ticks);
+        }
+    }
+    recordRuntimeWarnings(now);
+    // The initial SMP contract keeps AP context switches at explicit
+    // scheduler boundaries. Interrupt-frame preemption remains owned by the
+    // proven BSP path until the AP interrupt-return path has its own audited
+    // continuation contract.
+    return false;
+}
+
+pub fn onRescheduleIpi(preemptible_instruction_pointer: bool) void {
+    if (percpu.currentIndex() != 0) return;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    if (preemptPendingWake(preemptible_instruction_pointer)) preemptFromIrq();
+}
+
 pub fn dumpCurrent() void {
     k.puts("  Scheduler current: ");
     if (current()) |t| {
@@ -743,11 +939,12 @@ pub fn dumpCurrent() void {
 }
 
 pub fn dumpStatus() void {
+    const state = localState();
     k.puts("Scheduler status\r\n");
     k.puts("  Initialized: ");
     k.puts(if (initialized) "yes" else "no");
     k.puts(" current_index=");
-    if (current_task) |running| {
+    if (state.current_task) |running| {
         k.putDec(task.ordinalOf(running) orelse 0);
     } else {
         k.putDec(0);
@@ -827,16 +1024,17 @@ pub fn dumpStatus() void {
 
 fn currentPreemptDepth() u32 {
     if (current()) |running_task| return running_task.preempt_disable_depth;
-    return boot_preempt_disable_depth;
+    return localState().boot_preempt_disable_depth;
 }
 
 fn runTimerPreemption(now: u64, preemptible_instruction_pointer: bool) bool {
+    const state = localState();
     preemption_simulation_tick_count +%= 1;
     if (!initialized) {
         preemption_deferred_no_task_count +%= 1;
         return false;
     }
-    const running = current_task orelse {
+    const running = state.current_task orelse {
         preemption_deferred_no_task_count +%= 1;
         return false;
     };
@@ -847,13 +1045,13 @@ fn runTimerPreemption(now: u64, preemptible_instruction_pointer: bool) bool {
     // This is only an eligibility probe. It must not consume a priority
     // selection or an anti-starvation turn; the IRQ switch performs the one
     // authoritative ready-task selection afterwards.
-    if (task.readyCount() == 0) {
-        reschedule_requested = false;
+    if (task.readyCountForCpu(percpu.currentIndex()) == 0) {
+        state.reschedule_requested = false;
         preemption_deferred_no_ready_count +%= 1;
         return false;
     }
-    const priority_wakeup = reschedule_requested and task.hasMoreUrgentReady(running);
-    if (reschedule_requested and !priority_wakeup) reschedule_requested = false;
+    const priority_wakeup = state.reschedule_requested and task.hasMoreUrgentReady(percpu.currentIndex(), running);
+    if (state.reschedule_requested and !priority_wakeup) state.reschedule_requested = false;
     const scheduled_ticks = ticksSince(now, running.last_scheduled_tick);
     if (!priority_wakeup and scheduled_ticks < @as(u64, preemption_quantum_ticks)) {
         preemption_deferred_quantum_count +%= 1;
@@ -890,9 +1088,10 @@ fn runTimerPreemption(now: u64, preemptible_instruction_pointer: bool) bool {
 }
 
 fn recordRuntimeWarnings(now: u64) void {
+    const state = localState();
     if (!initialized) return;
-    if (current_task) |running| {
-        if (running.state == .running) {
+    if (state.current_task) |running| {
+        if (running.state == .running and !running.cpu_idle) {
             const since = ticksSince(now, running.last_scheduled_tick);
             if (since >= long_running_warn_ticks and
                 ticksSince(now, running.last_long_run_warning_tick) >= long_running_warn_ticks)
@@ -906,7 +1105,7 @@ fn recordRuntimeWarnings(now: u64) void {
     if ((now & 0xF) != 0) return;
     // 0.56.13 (Befund 4.4): Starvation-Scan nur mit Metrics (-Dmetrics).
     if (comptime !config.enable_metrics) return;
-    var cursor = task.firstReady();
+    var cursor = task.firstReady(percpu.currentIndex());
     while (cursor) |candidate| : (cursor = task.nextReady(candidate)) {
         warning_candidate_visit_count +%= 1;
         const base_tick = if (candidate.ready_since_tick != 0)
@@ -987,14 +1186,15 @@ var priority_picks_low: u64 = 0;
 var priority_rr_picks: u64 = 0;
 var role_picks: [task.role_count]u64 = .{0} ** task.role_count;
 fn refreshRescheduleRequest(running: *task.Task) void {
-    if (reschedule_requested) {
-        reschedule_requested = task.hasMoreUrgentReady(running);
+    const state = localState();
+    if (state.reschedule_requested) {
+        state.reschedule_requested = task.hasMoreUrgentReady(percpu.currentIndex(), running);
     }
 }
 
 fn plainNextReadyTask() ?*task.Task {
     ready_candidate_visit_count +%= 1;
-    return task.firstReady();
+    return task.firstReady(percpu.currentIndex());
 }
 
 fn nextReadyTask(force_priority: bool) ?*task.Task {
@@ -1007,7 +1207,7 @@ fn nextReadyTask(force_priority: bool) ?*task.Task {
 
     var best: ?*task.Task = null;
     var best_rank: u8 = task.no_dispatch_rank;
-    var cursor = task.firstReady();
+    var cursor = task.firstReady(percpu.currentIndex());
     while (cursor) |candidate| : (cursor = task.nextReady(candidate)) {
         ready_candidate_visit_count +%= 1;
         const rank = task.dispatchRank(candidate);
@@ -1026,6 +1226,29 @@ fn nextReadyTask(force_priority: bool) ?*task.Task {
         role_picks[@intFromEnum(selected.role)] +%= 1;
     }
     return best;
+}
+
+fn sendRescheduleToCpu(cpu_index: u32) void {
+    if (cpu_index == percpu.currentIndex() or !percpu.isSchedulable(cpu_index)) return;
+    const apic_id = percpu.apicId(cpu_index) orelse return;
+    _ = lapic.sendReschedule(apic_id, RESCHEDULE_VECTOR);
+}
+
+fn noteProductiveTask(selected: *const task.Task) void {
+    if (!selected.smp_eligible or selected.cpu_idle) return;
+    const cpu_index = percpu.currentIndex();
+    if (!percpu.noteProductive(cpu_index, selected.smp_r4x_work)) return;
+    // The test-only kernel scaling probe reports its complete CPU mask in one
+    // compact serial record. Keep the persistent 64-KiB bootlog for product
+    // diagnostics; only the first audited R4X execution needs this marker.
+    if (!selected.smp_r4x_work) return;
+    k.puts("[SMP] productive cpu=");
+    k.putDec(cpu_index);
+    k.puts(" task=");
+    k.puts(selected.name);
+    k.puts(" class=");
+    k.puts("r4x");
+    k.puts("\r\n");
 }
 
 export fn taskEntryTrampoline() callconv(.c) noreturn {

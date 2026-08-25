@@ -2,6 +2,7 @@ const gdt = @import("gdt.zig");
 const interrupts = @import("interrupts.zig");
 const ioapic = @import("ioapic.zig");
 const lapic = @import("lapic.zig");
+const percpu = @import("percpu.zig");
 const pic = @import("pic.zig");
 const irq_router = @import("../../kernel/irq_router.zig");
 const scheduler = @import("../../sched/scheduler.zig");
@@ -18,6 +19,8 @@ const r4x = @import("../../program/r4x.zig");
 
 const IDT_ENTRIES = 256;
 const INTERRUPT_GATE: u8 = 0x8E;
+pub const RESCHEDULE_VECTOR: u8 = 0xF0;
+pub const STOP_VECTOR: u8 = 0xF1;
 
 const DescriptorTablePointer = packed struct {
     limit: u16,
@@ -134,6 +137,8 @@ extern fn irq28() callconv(.c) void;
 extern fn irq29() callconv(.c) void;
 extern fn irq30() callconv(.c) void;
 extern fn irq31() callconv(.c) void;
+extern fn ipi_reschedule() callconv(.c) void;
+extern fn ipi_stop() callconv(.c) void;
 
 var idt: [IDT_ENTRIES]IdtEntry align(16) = .{IdtEntry{}} ** IDT_ENTRIES;
 
@@ -167,22 +172,37 @@ pub fn init() void {
         idt[pic.MASTER_OFFSET + irq].set(handler, gdt.codeSelector(), INTERRUPT_GATE, 0);
     }
 
+    idt[RESCHEDULE_VECTOR].set(@ptrCast(&ipi_reschedule), gdt.codeSelector(), INTERRUPT_GATE, 0);
+    idt[STOP_VECTOR].set(@ptrCast(&ipi_stop), gdt.codeSelector(), INTERRUPT_GATE, 0);
+
+    loadCurrent();
+    k.puts("  IDT loaded ");
+    k.puts("[OK]\r\n");
+}
+
+pub fn loadCurrent() void {
     const idtr = DescriptorTablePointer{
         .limit = @sizeOf(@TypeOf(idt)) - 1,
         .base = @intFromPtr(&idt),
     };
     r4os_load_idt(&idtr);
-    k.puts("  IDT loaded ");
-    k.puts("[OK]\r\n");
 }
 
 pub export fn irqDispatch(frame: *const InterruptFrame) callconv(.c) void {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
     const vector = frame.vector;
     if (vector < pic.MASTER_OFFSET or vector >= pic.MASTER_OFFSET + irq_handlers.len) return;
 
     const irq: u8 = @intCast(vector - pic.MASTER_OFFSET);
     var request_preempt = false;
     const preemptible_instruction_pointer = r4x.isPreemptibleInstructionPointer(frame.rip);
+    if (percpu.currentIndex() != 0 and irq == timer.PIT_IRQ) {
+        request_preempt = scheduler.onSecondaryTick(timer.tickCount(), preemptible_instruction_pointer);
+        lapic.endOfInterrupt();
+        if (request_preempt) scheduler.preemptFromIrq();
+        return;
+    }
     var wake_request_checkpoint = scheduler.structureStats().wakeup_reschedule_requests;
     switch (irq) {
         timer.PIT_IRQ => {
@@ -208,6 +228,23 @@ pub export fn irqDispatch(frame: *const InterruptFrame) callconv(.c) void {
     if (request_preempt) scheduler.preemptFromIrq();
 }
 
+pub export fn ipiDispatch(frame: *const InterruptFrame) callconv(.c) void {
+    switch (frame.vector) {
+        RESCHEDULE_VECTOR => {
+            lapic.endOfInterrupt();
+            scheduler.onRescheduleIpi(r4x.isPreemptibleInstructionPointer(frame.rip));
+        },
+        STOP_VECTOR => {
+            lapic.endOfInterrupt();
+            const index = percpu.currentIndex();
+            percpu.setSchedulable(index, false);
+            _ = percpu.setState(index, .offline);
+            interrupts.haltForever();
+        },
+        else => lapic.endOfInterrupt(),
+    }
+}
+
 fn istForVector(vector: usize) u8 {
     return switch (vector) {
         2, 8, 18 => tss.DOUBLE_FAULT_IST,
@@ -219,6 +256,32 @@ fn istForVector(vector: usize) u8 {
 pub export fn exceptionDispatch(frame: *const InterruptFrame) callconv(.c) void {
     const page_fault_addr = if (frame.vector == 14) readCr2() else 0;
     if (frame.vector == 14 and r4x.handlePageFault(page_fault_addr, frame.error_code)) return;
+
+    k.puts("[SMP] exception cpu=");
+    k.putDec(percpu.currentIndex());
+    if (scheduler.current()) |current_task| {
+        k.puts(" task=");
+        k.putDec(current_task.id);
+        k.puts("/");
+        k.puts(current_task.name);
+        k.puts(" state_raw=");
+        const state_raw: *const u8 = @ptrCast(&current_task.state);
+        k.putDec(state_raw.*);
+        k.puts(" running_cpu=");
+        k.putDec(current_task.running_cpu);
+        k.puts(" saved_rsp=0x");
+        k.putHex(current_task.rsp, 16);
+        k.puts(" stack=0x");
+        k.putHex(current_task.stack_base, 16);
+        k.puts("..0x");
+        k.putHex(current_task.stack_top, 16);
+    }
+    const fault_rsp = interruptedRsp(frame);
+    k.puts(" rip=0x");
+    k.putHex(frame.rip, 16);
+    k.puts(" interrupted_rsp=0x");
+    k.putHex(fault_rsp, 16);
+    k.puts("\r\n");
 
     const entry = crash.enterCrashPath();
     var report = crash.fromCpuException(.{
@@ -278,7 +341,13 @@ fn readCr2() u64 {
 }
 
 fn interruptedRsp(frame: *const InterruptFrame) u64 {
-    return @intFromPtr(&frame.rip) + 24;
+    const after_rflags = @intFromPtr(&frame.rip) + 24;
+    const vector: usize = @intCast(frame.vector);
+    if (vector < IDT_ENTRIES and istForVector(vector) != 0) {
+        const saved_rsp: *const u64 = @ptrFromInt(after_rflags);
+        return saved_rsp.*;
+    }
+    return after_rflags;
 }
 
 fn faultMemoryForException(vector: u64, addr: u64) crash.FaultMemoryInfo {

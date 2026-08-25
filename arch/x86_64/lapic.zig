@@ -18,6 +18,8 @@ const REG_ID: u32 = 0x020;
 const REG_VERSION: u32 = 0x030;
 const REG_EOI: u32 = 0x0B0;
 const REG_SVR: u32 = 0x0F0;
+const REG_ICR_LOW: u32 = 0x300;
+const REG_ICR_HIGH: u32 = 0x310;
 const REG_LVT_TIMER: u32 = 0x320;
 const REG_TIMER_INITIAL_COUNT: u32 = 0x380;
 const REG_TIMER_CURRENT_COUNT: u32 = 0x390;
@@ -31,6 +33,10 @@ const TIMER_PERIODIC: u32 = 1 << 17;
 const TIMER_DIVIDE_BY_16: u32 = 0x3;
 const CALIBRATION_HPET_DIVISOR: u64 = 100;
 const MIN_TIMER_INITIAL_COUNT: u32 = 16;
+const ICR_DELIVERY_PENDING: u32 = 1 << 12;
+const ICR_INIT_ASSERT: u32 = 0x0000_C500;
+const ICR_INIT_DEASSERT: u32 = 0x0000_8500;
+const ICR_STARTUP: u32 = 0x0000_0600;
 
 pub const Status = struct {
     available: bool = false,
@@ -156,6 +162,76 @@ pub fn status() Status {
 
 pub fn isEnabled() bool {
     return current.enabled and current.software_enabled and (base_virt != 0 or x2_mode);
+}
+
+pub fn initCurrentCpu() bool {
+    if (base_virt == 0 and !x2_mode) return false;
+    var apic_base = msr.read(IA32_APIC_BASE);
+    apic_base |= APIC_BASE_ENABLE;
+    if (x2_mode) apic_base |= APIC_BASE_X2APIC;
+    msr.write(IA32_APIC_BASE, apic_base);
+    const old_svr = readReg(REG_SVR);
+    writeReg(REG_SVR, (old_svr & ~@as(u32, 0xFF)) | SVR_ENABLE | SPURIOUS_VECTOR);
+    return (readReg(REG_SVR) & SVR_ENABLE) != 0;
+}
+
+pub fn localApicId() u32 {
+    if (x2_mode) return readReg(REG_ID);
+    return readReg(REG_ID) >> 24;
+}
+
+// AP timers are calibrated independently because the global event clock may
+// use HPET and LAPIC calibration is CPU-local.  Only the resulting count is
+// stored in CpuLocal; BSP timer/deadline state remains untouched.
+pub fn startSecondaryPeriodicTimer(requested_hz: u32) bool {
+    if (!initCurrentCpu()) return false;
+    const reference = hpet.status();
+    if (!reference.enabled or reference.frequency_hz == 0) return false;
+    const hz = if (requested_hz == 0) 100 else requested_hz;
+    const hpet_delta = reference.frequency_hz / CALIBRATION_HPET_DIVISOR;
+    if (hpet_delta == 0) return false;
+
+    writeReg(REG_TIMER_INITIAL_COUNT, 0);
+    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
+    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_MASKED);
+    writeReg(REG_TIMER_INITIAL_COUNT, 0xFFFF_FFFF);
+    const start_hpet = hpet.readMainCounter();
+    while (hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter()) < hpet_delta) {
+        asm volatile ("pause");
+    }
+    const elapsed_hpet = hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter());
+    const elapsed_lapic = 0xFFFF_FFFF -% readReg(REG_TIMER_CURRENT_COUNT);
+    writeReg(REG_TIMER_INITIAL_COUNT, 0);
+    if (elapsed_hpet == 0 or elapsed_lapic < MIN_TIMER_INITIAL_COUNT) return false;
+    const numerator = @as(u128, elapsed_lapic) * @as(u128, reference.frequency_hz);
+    const denominator = @as(u128, elapsed_hpet) * @as(u128, hz);
+    if (denominator == 0) return false;
+    const initial = numerator / denominator;
+    if (initial < MIN_TIMER_INITIAL_COUNT or initial > 0xFFFF_FFFE) return false;
+    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
+    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_PERIODIC);
+    writeReg(REG_TIMER_INITIAL_COUNT, @intCast(initial));
+    return true;
+}
+
+pub fn sendInitSipi(apic_id: u32, vector: u8) bool {
+    if (!isEnabled() or vector == 0) return false;
+    if (!writeIcr(apic_id, ICR_INIT_ASSERT) or !waitIcrIdle()) return false;
+    delayMicroseconds(10_000);
+    if (!writeIcr(apic_id, ICR_INIT_DEASSERT) or !waitIcrIdle()) return false;
+    delayMicroseconds(200);
+    if (!writeIcr(apic_id, ICR_STARTUP | vector) or !waitIcrIdle()) return false;
+    delayMicroseconds(200);
+    if (!writeIcr(apic_id, ICR_STARTUP | vector) or !waitIcrIdle()) return false;
+    return true;
+}
+
+pub fn sendReschedule(apic_id: u32, vector: u8) bool {
+    return writeIcr(apic_id, vector) and waitIcrIdle();
+}
+
+pub fn sendStop(apic_id: u32, vector: u8) bool {
+    return writeIcr(apic_id, vector) and waitIcrIdle();
 }
 
 pub fn initTimerFromHpet(requested_hz: u32) bool {
@@ -418,6 +494,39 @@ fn writeReg(offset: u32, value: u32) void {
     }
     const ptr: *volatile u32 = @ptrFromInt(base_virt + offset);
     ptr.* = value;
+}
+
+fn writeIcr(apic_id: u32, low: u32) bool {
+    if (x2_mode) {
+        msr.write(X2APIC_MSR_BASE + (REG_ICR_LOW >> 4), (@as(u64, apic_id) << 32) | low);
+        return true;
+    }
+    if (apic_id > 0xFF or base_virt == 0) return false;
+    writeReg(REG_ICR_HIGH, apic_id << 24);
+    writeReg(REG_ICR_LOW, low);
+    return true;
+}
+
+fn waitIcrIdle() bool {
+    var spins: u32 = 0;
+    while ((readReg(REG_ICR_LOW) & ICR_DELIVERY_PENDING) != 0) : (spins += 1) {
+        if (spins >= 1_000_000) return false;
+        asm volatile ("pause");
+    }
+    return true;
+}
+
+fn delayMicroseconds(microseconds: u64) void {
+    const reference = hpet.status();
+    if (reference.enabled and reference.frequency_hz != 0) {
+        const requested = (@as(u128, reference.frequency_hz) * microseconds) / 1_000_000;
+        const delta: u64 = @intCast(@max(@as(u128, 1), requested));
+        const start = hpet.readMainCounter();
+        while (hpet.elapsedMainCounter(start, hpet.readMainCounter()) < delta) asm volatile ("pause");
+        return;
+    }
+    var spins = microseconds *| 256;
+    while (spins != 0) : (spins -= 1) asm volatile ("pause");
 }
 
 fn logStatus() void {

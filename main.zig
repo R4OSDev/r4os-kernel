@@ -8,6 +8,7 @@ const config = @import("config");
 const crash = @import("kernel/crash.zig");
 const crash_screen = @import("kernel/crash_screen.zig");
 const fatal = @import("kernel/fatal.zig");
+const log = @import("kernel/log.zig");
 const boot_intro = @import("kernel/boot_intro.zig");
 const com_debug_boot = @import("kernel/com_debug_boot.zig");
 const cpu_boot = @import("kernel/cpu_boot.zig");
@@ -39,6 +40,7 @@ const block_storage = @import("storage/block.zig");
 const bootscreen = @import("kernel/bootscreen.zig");
 const boot_display = @import("display/boot_display.zig");
 const kernel_version = @import("kernel/version.zig");
+const smp = @import("kernel/smp.zig");
 
 pub const panic = std.debug.FullPanic(handleZigPanic);
 
@@ -147,6 +149,7 @@ export fn kmain() callconv(.c) noreturn {
     requireBootStep(driver_policy_boot.init(), .driver_policy, "Driver policy boot failed");
     fatal.setBootPhase(.runtime);
     bootscreen.setPhase(.runtime);
+    _ = smp.runAcceptanceProbeIfEnabled();
     // 0.56.2: Hintergrund-RX-Task - NACH initTaskRuntime (sonst von
     // task.init() gewischt) und NACH driver_policy_boot (NIC geladen).
     _ = net_core.startRxTask();
@@ -202,6 +205,10 @@ fn requireBootStep(ok: bool, phase: crash.BootPhase, fallback_message: []const u
 }
 
 fn handleZigPanic(message: []const u8, ret_addr: ?usize) noreturn {
-    _ = ret_addr;
+    if (ret_addr) |address| {
+        log.puts("[CRASH] panic-ret=0x");
+        log.putHex(address, 16);
+        log.puts("\r\n");
+    }
     fatal.zigPanic(message);
 }

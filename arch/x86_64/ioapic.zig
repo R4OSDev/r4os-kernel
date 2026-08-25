@@ -4,6 +4,7 @@ const k = @import("../../kernel/log.zig");
 const lapic = @import("lapic.zig");
 const paging = @import("../../memory/paging.zig");
 const phys = @import("../../memory/phys.zig");
+const percpu = @import("percpu.zig");
 
 const REGSEL: u64 = 0x00;
 const IOWIN: u64 = 0x10;
@@ -61,6 +62,7 @@ pub const Status = struct {
 
 var current: Status = .{};
 var base_virt: u64 = 0;
+var next_runtime_target: u32 = 1;
 
 pub fn initFromAcpi(info: acpi.Info) Status {
     current = .{
@@ -192,9 +194,24 @@ pub fn activatePciIntxIrq(irq: u8) bool {
     var route = routeForIrq(irq);
     if (!route.present or !route.in_range) return false;
     route.flags = PCI_INTX_FLAGS;
+    route.target_lapic = chooseRuntimeTarget();
     if (!programRoute(route)) return false;
     refreshKnownRedirection(route.redir_index);
     return true;
+}
+
+fn chooseRuntimeTarget() u8 {
+    const mask = percpu.schedulableMask();
+    if (@popCount(mask) <= 1) return lapic.status().id;
+    var attempts: u32 = 0;
+    while (attempts < percpu.max_cpus) : (attempts += 1) {
+        const index = next_runtime_target % @as(u32, @intCast(percpu.max_cpus));
+        next_runtime_target +%= 1;
+        if (index == 0 or !percpu.isSchedulable(index)) continue;
+        const apic_id = percpu.apicId(index) orelse continue;
+        if (apic_id <= 0xFF) return @intCast(apic_id);
+    }
+    return lapic.status().id;
 }
 
 pub fn activateLegacyRoutes() bool {

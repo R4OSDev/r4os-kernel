@@ -13,13 +13,11 @@
 //   - Trailing-Release gibt freie Seiten am Heap-Ende zurueck, behaelt aber
 //     RELEASE_KEEP_PAGES als Hysterese gegen Commit/Uncommit-Thrash.
 //
-// NICHT-PREEMPTIERBARKEITS-INVARIANTE (Befund 1.3): Der Heap ist bewusst
-// lockfrei. Das traegt nur, weil (a) der Scheduler kooperativ ist und
-// Kernel-Code zwischen Yields nicht verdraengt wird, (b) KEINE Funktion in
-// dieser Datei yieldet oder blockiert und (c) kein IRQ-Handler allokiert.
-// Wer einen dieser Punkte aendert, MUSS einen Heap-Lock einfuehren. Ein
-// Reentry-Waechter (control.in_heap) macht Verstoesse als Zaehler + einmalige
-// COM1-Zeile sichtbar, statt still Metadaten zu zerstoeren.
+// SMP-INVARIANTE: Der Heap yieldet und blockiert weiterhin nicht. Seine
+// Metadaten werden jedoch ueber die reentrant globale IRQ-/Legacy-Grenze
+// serialisiert, weil lokales Nicht-Preemptieren mehrere CPUs nicht schuetzt.
+// Der Reentry-Waechter (control.in_heap) erkennt damit nur noch echte
+// Rekursion auf derselben CPU und nicht erlaubte parallele Nutzung.
 //
 // Block-Layout (alle Offsets relativ HEAP_BASE, Granularitaet 16 Byte):
 //   [start+0]  word0: Blockgroesse (inkl. Header/Footer) | bit0 = used
@@ -34,6 +32,7 @@ const paging = @import("paging.zig");
 const virt = @import("virt.zig");
 const map = @import("map.zig");
 const k = @import("../kernel/log.zig");
+const interrupts = @import("../arch/x86_64/interrupts.zig");
 const task_context = @import("../sched/task_context.zig");
 
 const HEAP_BASE: u64 = virt.windowBase(.kernel_heap);
@@ -275,6 +274,8 @@ fn reallocInPlace(mem: []u8, new_size: usize, align_value: usize) InPlaceResult 
 }
 
 pub fn stats() Stats {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
     var s: Stats = .{
         .pages = control.committed_pages,
         .capacity_bytes = committedBytes(),
@@ -307,6 +308,8 @@ pub fn metadataRange() MetadataRange {
 // Allocation, error-injection, alignment, and churn probes belong to the
 // explicit -Dboot-selftests diagnostic kernel.
 pub fn bootInvariant() bool {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
     if (!control.initialized or control.range_id == 0) return false;
     if (control.committed_pages < MIN_COMMITTED_PAGES or control.committed_pages > control.cap_pages) return false;
     if (control.heap_top != committedBytes() or control.heap_top < MIN_BLOCK) return false;
@@ -901,12 +904,15 @@ fn rdtsc() u64 {
 
 const HeapGuard = struct {
     unwind: task_context.UnwindToken,
+    irq_flags: u64,
 };
 
 fn enterHeap() ?HeapGuard {
+    const irq_flags = interrupts.saveAndDisable();
     const unwind = task_context.enterUnwind();
     if (!unwind.admitted()) {
         control.reentry_errors += 1;
+        interrupts.restore(irq_flags);
         return null;
     }
     if (control.in_heap) {
@@ -915,16 +921,18 @@ fn enterHeap() ?HeapGuard {
             control.reentry_reported = true;
             k.puts("HEAP REENTRY detected (non-preempt invariant violated)\r\n");
         }
+        interrupts.restore(irq_flags);
         _ = task_context.leaveUnwind(unwind);
         return null;
     }
     control.in_heap = true;
-    return .{ .unwind = unwind };
+    return .{ .unwind = unwind, .irq_flags = irq_flags };
 }
 
 fn leaveHeap(guard: HeapGuard) void {
     control.in_heap = false;
     _ = task_context.leaveUnwind(guard.unwind);
+    interrupts.restore(guard.irq_flags);
 }
 
 fn committedBytes() usize {

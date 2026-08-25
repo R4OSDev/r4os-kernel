@@ -664,8 +664,12 @@ pub const Mutex = struct {
         const current_task = scheduler.current() orelse return false;
         const current_id = current_task.id;
         const current_generation = current_task.generation;
+        const irq_flags = interrupts.saveAndDisable();
         scheduler.preemptDisable();
-        defer scheduler.preemptEnable();
+        defer {
+            scheduler.preemptEnable();
+            interrupts.restore(irq_flags);
+        }
 
         if (self.owner == 0 and self.owner_generation == 0) {
             if (current_task.held_lock_count == 0xFFFF_FFFF) return false;
@@ -674,7 +678,7 @@ pub const Mutex = struct {
             self.owner_generation = current_generation;
             self.depth = 1;
             current_task.held_lock_count += 1;
-            recordLockAcquire(current_task, self.objectId(), self.rank, self.mode);
+            recordLockAcquire(current_task, self.objectId(), self.name, self.rank, self.mode);
             return true;
         }
         if (self.owner == current_id and self.owner_generation == current_generation) {
@@ -724,6 +728,7 @@ pub const Mutex = struct {
         const current_generation = current_task.generation;
         var wake_waiter = false;
 
+        const irq_flags = interrupts.saveAndDisable();
         scheduler.preemptDisable();
         defer {
             // A selected waiter does not own the mutex yet. If it is hard-
@@ -734,6 +739,7 @@ pub const Mutex = struct {
             // through waitUnless.
             if (wake_waiter) _ = self.queue.wakeAll();
             scheduler.preemptEnable();
+            interrupts.restore(irq_flags);
         }
 
         if (self.owner != current_id or self.owner_generation != current_generation or self.depth == 0) {
@@ -786,8 +792,12 @@ pub const Mutex = struct {
     fn donateCurrentWaiter(self: *Mutex) void {
         const waiter = scheduler.current() orelse return;
         const desired_rank = task.dispatchRank(waiter);
+        const irq_flags = interrupts.saveAndDisable();
         scheduler.preemptDisable();
-        defer scheduler.preemptEnable();
+        defer {
+            scheduler.preemptEnable();
+            interrupts.restore(irq_flags);
+        }
         if (self.owner == 0 or self.owner_generation == 0 or
             (self.owner == waiter.id and self.owner_generation == waiter.generation) or
             desired_rank >= self.donation_rank)
@@ -835,8 +845,12 @@ pub const UnwindGuard = struct {
 
     pub fn tryEnter(self: *UnwindGuard) bool {
         const current_task = scheduler.current() orelse return self.tryEnterBoot();
+        const irq_flags = interrupts.saveAndDisable();
         scheduler.preemptDisable();
-        defer scheduler.preemptEnable();
+        defer {
+            scheduler.preemptEnable();
+            interrupts.restore(irq_flags);
+        }
 
         if (self.isFree()) {
             if (current_task.unwind_guard_count == 0xFFFF_FFFF) return false;
@@ -876,6 +890,7 @@ pub const UnwindGuard = struct {
     pub fn leave(self: *UnwindGuard) bool {
         const current_task = scheduler.current() orelse return self.leaveBoot();
         var wake_waiter = false;
+        const irq_flags = interrupts.saveAndDisable();
         scheduler.preemptDisable();
         defer {
             // As with Mutex, a signalled task has not acquired the guard yet.
@@ -884,6 +899,7 @@ pub const UnwindGuard = struct {
             // the rest on an already free guard.
             if (wake_waiter) _ = self.queue.wakeAll();
             scheduler.preemptEnable();
+            interrupts.restore(irq_flags);
         }
 
         if (self.owner != current_task.id or
@@ -961,9 +977,8 @@ fn recordLockOrder(owner_task: *task.Task, object_id: u64, rank: u16) void {
     }
 }
 
-fn recordLockAcquire(owner_task: *task.Task, object_id: u64, rank: u16, mode: LockMode) void {
+fn recordLockAcquire(owner_task: *task.Task, object_id: u64, name: []const u8, rank: u16, mode: LockMode) void {
     global_lock_summary.acquires +%= 1;
-    if (comptime !config.enable_metrics) return;
     var free_slot: ?usize = null;
     var i: usize = 0;
     while (i < owner_task.held_locks.len) : (i += 1) {
@@ -976,6 +991,7 @@ fn recordLockAcquire(owner_task: *task.Task, object_id: u64, rank: u16, mode: Lo
     };
     owner_task.held_locks[slot] = .{
         .object_id = object_id,
+        .name = name,
         .rank = rank,
         .mode_no_sleep = mode == .no_sleep,
         .active = true,
@@ -985,7 +1001,6 @@ fn recordLockAcquire(owner_task: *task.Task, object_id: u64, rank: u16, mode: Lo
 }
 
 fn recordLockRelease(owner_task: *task.Task, object_id: u64) void {
-    if (comptime !config.enable_metrics) return;
     var i: usize = 0;
     while (i < owner_task.held_locks.len) : (i += 1) {
         if (owner_task.held_locks[i].active and owner_task.held_locks[i].object_id == object_id) {
