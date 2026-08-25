@@ -509,6 +509,8 @@ const LoadedProgram = struct {
     memory_contract: ProgramMemoryContract = .{},
     imports: [MAX_R4M_IMPORTS]R4XStartImportSeed = .{R4XStartImportSeed{}} ** MAX_R4M_IMPORTS,
     import_count: u32 = 0,
+    loader_section_count: u32 = 0,
+    loader_relocation_count: u32 = 0,
     /// Aufgeloester Startpfad aus ProgramFile.origin, siehe dort.
     origin: [MODULE_ORIGIN_MAX]u8 = .{0} ** MODULE_ORIGIN_MAX,
     origin_len: u16 = 0,
@@ -6032,6 +6034,114 @@ const ProgramLaunchOptions = struct {
     error_out: ?*i32 = null,
 };
 
+const SubsystemTrace = struct {
+    id: []const u8,
+    mode: []const u8,
+};
+
+const SubsystemTraceRecord = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+fn parseSubsystemTrace(args: []const u8) ?SubsystemTrace {
+    const trace_magic = "R4SUBSYS1";
+    if (!std.mem.startsWith(u8, args, trace_magic)) return null;
+    var remaining = args[trace_magic.len..];
+    var trace_id: ?[]const u8 = null;
+    var trace_mode: []const u8 = "?";
+    while (remaining.len != 0) {
+        const record = takeSubsystemTraceRecord(&remaining) orelse return null;
+        if (std.ascii.eqlIgnoreCase(record.key, "T")) {
+            if (trace_id != null or record.value.len != 16) return null;
+            for (record.value) |byte| if (!std.ascii.isHex(byte)) return null;
+            trace_id = record.value;
+        } else if (std.ascii.eqlIgnoreCase(record.key, "M")) {
+            trace_mode = record.value;
+        }
+    }
+    return .{ .id = trace_id orelse return null, .mode = trace_mode };
+}
+
+fn takeSubsystemTraceRecord(remaining: *[]const u8) ?SubsystemTraceRecord {
+    if (remaining.*.len == 0 or remaining.*[0] != ';') return null;
+    var cursor = remaining.*[1..];
+    const key_len = takeSubsystemTraceLength(&cursor) orelse return null;
+    if (key_len == 0 or key_len > cursor.len) return null;
+    const key = cursor[0..key_len];
+    cursor = cursor[key_len..];
+    if (cursor.len == 0 or cursor[0] != '=') return null;
+    cursor = cursor[1..];
+    const value_len = takeSubsystemTraceLength(&cursor) orelse return null;
+    if (value_len > cursor.len) return null;
+    const value = cursor[0..value_len];
+    remaining.* = cursor[value_len..];
+    return .{ .key = key, .value = value };
+}
+
+fn takeSubsystemTraceLength(cursor: *[]const u8) ?usize {
+    var length: usize = 0;
+    var digits: usize = 0;
+    while (digits < cursor.*.len and cursor.*[digits] >= '0' and cursor.*[digits] <= '9') : (digits += 1) {
+        if (length > 127) return null;
+        length = length * 10 + cursor.*[digits] - '0';
+    }
+    if (digits == 0 or digits >= cursor.*.len or cursor.*[digits] != ':') return null;
+    cursor.* = cursor.*[digits + 1 ..];
+    return length;
+}
+
+fn traceNowNanoseconds() u64 {
+    return time_core.monotonicNanoseconds() orelse timer.eventNanoseconds();
+}
+
+fn logSubsystemTracePhase(trace: SubsystemTrace, phase: []const u8, now_ns: u64) void {
+    k.puts("[R4BASIC-LAUNCH] id=");
+    k.puts(trace.id);
+    k.puts(" mode=");
+    k.puts(trace.mode);
+    k.puts(" phase=");
+    k.puts(phase);
+    k.puts(" ns=");
+    k.putDec(now_ns);
+    k.puts("\r\n");
+}
+
+fn logSubsystemLoaderTrace(
+    trace: SubsystemTrace,
+    start_ns: u64,
+    module_before: module_file.Stats,
+    fs_before: fs_request.Summary,
+    loaded: *const LoadedProgram,
+) void {
+    const now_ns = traceNowNanoseconds();
+    const module_after = module_file.stats();
+    const fs_after = fs_request.summary();
+    k.puts("[R4BASIC-LAUNCH] id=");
+    k.puts(trace.id);
+    k.puts(" mode=");
+    k.puts(trace.mode);
+    k.puts(" phase=loader-complete ns=");
+    k.putDec(now_ns);
+    k.puts(" duration_ns=");
+    k.putDec(now_ns -| start_ns);
+    k.puts(" range_reads=");
+    k.putDec(module_after.range_reads -| module_before.range_reads);
+    k.puts(" fs_requests=");
+    k.putDec(fs_after.requests -| fs_before.requests);
+    k.puts(" gate_waits=");
+    k.putDec(fs_after.lock_contention_waits -| fs_before.lock_contention_waits);
+    k.puts(" fs_ticks=");
+    k.putDec(fs_after.total_ticks -| fs_before.total_ticks);
+    k.puts(" sections=");
+    k.putDec(loaded.loader_section_count);
+    k.puts(" imports=");
+    k.putDec(loaded.import_count);
+    k.puts(" relocations=");
+    k.putDec(loaded.loader_relocation_count);
+    k.puts("\r\n");
+}
+
 fn setProgramLaunchError(options: ProgramLaunchOptions, status: i32) void {
     if (options.error_out) |error_out| error_out.* = status;
     if (status == PROGRAM_HANDLE_OK) return;
@@ -6069,6 +6179,16 @@ fn programSpawnTransactionCancelled() bool {
 
 fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: []const u8, working_drive: *drive.Drive, shell_host: ConsoleHostKind, options: ProgramLaunchOptions) RunResult {
     program_launch_attempts +%= 1;
+    const subsystem_trace = parseSubsystemTrace(args);
+    var loader_start_ns: u64 = 0;
+    var module_stats_before: module_file.Stats = undefined;
+    var fs_stats_before: fs_request.Summary = undefined;
+    if (subsystem_trace) |trace| {
+        loader_start_ns = traceNowNanoseconds();
+        module_stats_before = module_file.stats();
+        fs_stats_before = fs_request.summary();
+        logSubsystemTracePhase(trace, "admission", loader_start_ns);
+    }
     configureApiGroups();
     setProgramLaunchError(options, PROGRAM_HANDLE_OK);
     const spawn_thread = currentProgramThread();
@@ -6121,6 +6241,13 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_LOAD_FAILED);
         return .failed;
     };
+    if (subsystem_trace) |trace| logSubsystemLoaderTrace(
+        trace,
+        loader_start_ns,
+        module_stats_before,
+        fs_stats_before,
+        &loaded,
+    );
     loaded.origin = file.origin;
     loaded.origin_len = file.origin_len;
     if (programSpawnTransactionCancelled()) {
@@ -6376,6 +6503,8 @@ fn loadR4MProgramImage(file: ProgramFile, owner_id: u32, app_class: AppClass) ?L
         .memory_contract = memory_contract,
         .imports = r4xstart_imports,
         .import_count = r4xstart_import_count,
+        .loader_section_count = r4m.section_count,
+        .loader_relocation_count = r4m.reloc_count,
     };
 }
 
@@ -7716,6 +7845,10 @@ fn callInstanceEntry(run: *ProgramInstance) i32 {
     const entry = normalizeThreadEntry(run, run.entry) orelse return THREAD_ERROR_INVALID;
     run.entry = entry;
     prepareR4XStartContext(run);
+    const process = processPayloadConst(run);
+    if (parseSubsystemTrace(process.args[0..cStringLen(process.args[0..])])) |trace| {
+        logSubsystemTracePhase(trace, "r4xstart", traceNowNanoseconds());
+    }
     program_entries_started +%= 1;
     return r4os_call_program(entry, @intFromPtr(&runtimePayload(run).r4xstart_context), run.stack_top);
 }
