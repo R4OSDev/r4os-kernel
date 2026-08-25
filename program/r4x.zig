@@ -5322,6 +5322,9 @@ fn configureR4XStartR4DeskTable() void {
         .program_spawn_with_console_host_handle = &apiProgramSpawnWithConsoleHostHandle,
         .program_set_window_handle = &apiProgramSetWindowHandle,
         .console_push_input = &apiConsolePushInput,
+        .remote_frame_acquire = &r4api.r4desk.remoteFrameAcquire,
+        .remote_frame_release = &r4api.r4desk.remoteFrameRelease,
+        .remote_frame_consumers = &r4api.r4desk.remoteFrameConsumers,
     });
 }
 
@@ -5359,6 +5362,7 @@ fn configureR4XStartR4DrawTable() void {
         .gui_frame_cancel = &apiGuiFrameCancel,
         .gui_frame_info = &apiGuiFrameInfo,
         .gui_frame_read = &apiGuiFrameRead,
+        .display_blit_xrgb32_stride = &r4api.r4draw.displayBlitXrgb32Stride,
     });
 }
 

@@ -86,9 +86,14 @@ pub fn displayPresent() callconv(.c) i32 {
 }
 
 pub fn displayBlitXrgb32(x: i32, y: i32, w: u32, h: u32, pixels: [*]const u32, pixel_count: u32) callconv(.c) i32 {
+    return displayBlitXrgb32Stride(x, y, w, h, pixels, pixel_count, w);
+}
+
+pub fn displayBlitXrgb32Stride(x: i32, y: i32, w: u32, h: u32, pixels: [*]const u32, pixel_count: u32, source_stride_pixels: u32) callconv(.c) i32 {
     if (x < 0 or y < 0 or w == 0 or h == 0) return -1;
     if (@intFromPtr(pixels) == 0) return -1;
-    const needed = @as(u64, w) * @as(u64, h);
+    if (source_stride_pixels < w) return -1;
+    const needed = (@as(u64, h) - 1) * @as(u64, source_stride_pixels) + @as(u64, w);
     if (needed > pixel_count) return -2;
     const bytes_needed = needed * 4;
     if (bytes_needed > @as(u64, ~@as(usize, 0))) return -2;
@@ -100,7 +105,7 @@ pub fn displayBlitXrgb32(x: i32, y: i32, w: u32, h: u32, pixels: [*]const u32, p
         w,
         h,
         raw[0..@intCast(bytes_needed)],
-        w,
+        source_stride_pixels,
     );
     if (!ok) return -3;
     markDisplayUsed();

@@ -102,6 +102,8 @@ var remote_frame_ready: bool = false;
 // RLE/Netz-I/O unveraendert.
 var remote_frame_write_sequence: u64 = 0;
 var remote_frame_readers: u32 = 0;
+var remote_frame_consumers_count: u32 = 0;
+var remote_frame_revision_counter: u32 = 0;
 var remote_frame_published_revision: u32 = 0;
 var remote_frame_history: remote_frame_state.History = .{};
 var remote_frame_snapshots: [2]RemoteFrameSnapshot = .{ RemoteFrameSnapshot{}, RemoteFrameSnapshot{} };
@@ -291,6 +293,41 @@ pub fn desktopActivityWait(last_seq: u64, timeout_ticks: u64, out_seq: *u64) cal
     return desktop_events.wait(last_seq, timeout_ticks, out_seq);
 }
 
+pub fn remoteFrameAcquire() callconv(.c) i32 {
+    var current = @atomicLoad(u32, &remote_frame_consumers_count, .acquire);
+    while (true) {
+        if (current >= 0x7fff_ffff) return remote_frame_error_invalid;
+        const next = current + 1;
+        if (@cmpxchgWeak(u32, &remote_frame_consumers_count, current, next, .acq_rel, .acquire)) |observed| {
+            current = observed;
+            continue;
+        }
+        if (current == 0) desktop_events.signal();
+        return @intCast(next);
+    }
+}
+
+pub fn remoteFrameRelease() callconv(.c) i32 {
+    var current = @atomicLoad(u32, &remote_frame_consumers_count, .acquire);
+    while (true) {
+        if (current == 0) return 0;
+        const next = current - 1;
+        if (@cmpxchgWeak(u32, &remote_frame_consumers_count, current, next, .acq_rel, .acquire)) |observed| {
+            current = observed;
+            continue;
+        }
+        if (next == 0) {
+            discardRemoteFrameStorage();
+            desktop_events.signal();
+        }
+        return @intCast(next);
+    }
+}
+
+pub fn remoteFrameConsumers() callconv(.c) u32 {
+    return @atomicLoad(u32, &remote_frame_consumers_count, .acquire);
+}
+
 pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32, pixel_count: u32) callconv(.c) i32 {
     if (@intFromPtr(info) == 0) return remote_frame_error_invalid;
     if (info.format != remote_frame_format_xrgb32 or info.bytes_per_pixel != 4) return remote_frame_error_unsupported;
@@ -302,6 +339,7 @@ pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32
     const source_pixels_u64 = @as(u64, info.stride_pixels) * @as(u64, info.height);
     if (source_pixels_u64 > @as(u64, pixel_count)) return remote_frame_error_invalid;
     if (@intFromPtr(pixels_ptr) == 0) return remote_frame_error_invalid;
+    if (remoteFrameConsumers() == 0) return 0;
 
     const total_pixels: usize = @intCast(total_pixels_u64);
     beginRemoteFrameWrite();
@@ -594,6 +632,40 @@ fn ensureRemoteFrameCapacity(pixel_count: usize) bool {
     return true;
 }
 
+fn discardRemoteFrameStorage() void {
+    beginRemoteFrameWrite();
+    const live_memory = remote_frame_memory;
+    var snapshot_memory: [2]?[]u8 = .{ null, null };
+    for (&remote_frame_snapshots, 0..) |*snapshot, index| {
+        snapshot_memory[index] = snapshot.memory;
+        snapshot.* = .{};
+    }
+    remote_frame_memory = null;
+    remote_frame_pixels = null;
+    remote_frame_capacity_pixels = 0;
+    remote_frame_info = .{};
+    remote_frame_ready = false;
+    remote_frame_history.reset();
+    remote_frame_snapshot_active = 1;
+    finishRemoteFrameWrite();
+    @atomicStore(u32, &remote_frame_published_revision, 0, .release);
+    _ = remote_frame_waitq.wakeAll();
+
+    if (live_memory) |memory| {
+        if (@atomicLoad(u32, &remote_frame_readers, .acquire) == 0) {
+            _ = heap.free(memory);
+        } else {
+            // A reader already inside a bounded copy keeps the detached live
+            // allocation pinned until the last such API call retires it.
+            _ = retainRemoteFrameMemory(memory);
+        }
+    }
+    for (snapshot_memory) |memory| {
+        if (memory) |owned| _ = heap.free(owned);
+    }
+    drainRemoteFrameRetiredIfIdle();
+}
+
 fn retainRemoteFrameMemory(memory: []u8) bool {
     for (&remote_frame_retired) |*slot| {
         if (slot.* == null) {
@@ -739,8 +811,9 @@ fn currentRemoteFrameRevision() u32 {
 }
 
 fn bumpRemoteFrameRevision() u32 {
-    var next = remote_frame_info.revision +% 1;
+    var next = remote_frame_revision_counter +% 1;
     if (next == 0) next = 1;
+    remote_frame_revision_counter = next;
     return next;
 }
 
