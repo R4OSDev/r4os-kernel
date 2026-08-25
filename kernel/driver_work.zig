@@ -5,13 +5,18 @@ const sched_task = @import("../sched/task.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const sync = @import("../sched/sync.zig");
 const timer = @import("timer.zig");
+const deadline_policy = @import("driver_work_deadline.zig");
 const work_queue = @import("driver_work_queue.zig");
 
 pub const VERSION: u32 = 1;
-pub const PERFORMANCE_VERSION: u32 = 1;
+pub const PERFORMANCE_VERSION: u32 = 2;
 pub const QUEUE_CAPACITY: u32 = @intCast(work_queue.capacity);
 pub const OWNER_CAPACITY: u32 = 16;
-pub const WORKER_COUNT: u32 = 1;
+pub const WORKER_COUNT: u32 = 2;
+pub const DEADLINE_WORKER_COUNT: u32 = 1;
+pub const DEADLINE_QUEUE_CAPACITY: u32 = work_queue.deadline_queue_capacity;
+pub const DEADLINE_RESERVED_CAPACITY: u32 = work_queue.deadline_reserved_capacity;
+pub const DEADLINE_MAX_BUDGET_TICKS: u64 = deadline_policy.max_budget_ticks;
 pub const LONG_CALLBACK_THRESHOLD_NS: u64 = 1_000_000;
 pub const CLEANUP_JOIN_TIMEOUT_TICKS: u64 = 1000;
 
@@ -27,6 +32,20 @@ pub const WORK_FLAG_FROM_IRQ: u32 = 1 << 0;
 pub const RESULT_CANCELLED: i32 = -7;
 
 pub const WorkHandler = *const fn (usize) callconv(.c) i32;
+
+// R4D DriverApi v20. Audio refill work declares an absolute one-shot tick
+// deadline, a bounded callback budget, and an opaque stable device key.
+pub const WorkRequest = extern struct {
+    version: u32 = deadline_policy.request_version,
+    size: u32 = @sizeOf(WorkRequest),
+    handler: WorkHandler,
+    context: usize = 0,
+    flags: u32 = WORK_FLAG_NONE,
+    work_class: u32 = deadline_policy.class_audio_refill,
+    serial_key: u64 = 0,
+    deadline_tick: u64 = 0,
+    budget_ticks: u64 = 0,
+};
 
 // R4D ABI v1. Keep this fixed-layout prefix compatible.
 pub const CompletionStatus = extern struct {
@@ -214,6 +233,39 @@ pub const Performance = extern struct {
     owner_waiters_max: u32 = 0,
     long_callback_threshold_ns: u64 = LONG_CALLBACK_THRESHOLD_NS,
     metrics: PerformanceMetrics = .{},
+    deadline_worker_started: u32 = 0,
+    deadline_worker_task_id: u32 = 0,
+    deadline_worker_count: u32 = DEADLINE_WORKER_COUNT,
+    deadline_queue_capacity: u32 = DEADLINE_QUEUE_CAPACITY,
+    deadline_queued_slots: u32 = 0,
+    deadline_running_slots: u32 = 0,
+    deadline_queue_high_water: u32 = 0,
+    owner_deadline_queued_slots: u32 = 0,
+    owner_deadline_running_slots: u32 = 0,
+    owner_deadline_queue_high_water: u32 = 0,
+    deadline_submitted: u64 = 0,
+    deadline_started: u64 = 0,
+    deadline_completed: u64 = 0,
+    deadline_misses: u64 = 0,
+    deadline_budget_overruns: u64 = 0,
+    deadline_queue_rejections: u64 = 0,
+    deadline_queue_total_ticks: u64 = 0,
+    deadline_queue_max_ticks: u64 = 0,
+    deadline_lateness_total_ticks: u64 = 0,
+    deadline_lateness_max_ticks: u64 = 0,
+};
+
+const DeadlineMetrics = struct {
+    submitted: u64 = 0,
+    started: u64 = 0,
+    completed: u64 = 0,
+    misses: u64 = 0,
+    budget_overruns: u64 = 0,
+    queue_rejections: u64 = 0,
+    queue_total_ticks: u64 = 0,
+    queue_max_ticks: u64 = 0,
+    lateness_total_ticks: u64 = 0,
+    lateness_max_ticks: u64 = 0,
 };
 
 pub const CleanupResult = struct {
@@ -226,6 +278,9 @@ const WorkItem = struct {
     handle: u32 = 0,
     generation: u32 = 0,
     flags: u32 = 0,
+    serial_key: u64 = 0,
+    deadline_tick: u64 = 0,
+    budget_ticks: u64 = 0,
     handler: ?WorkHandler = null,
     context: usize = 0,
     result: i32 = 0,
@@ -266,12 +321,18 @@ const OwnerSearch = struct {
 var initialized = false;
 var worker_started = false;
 var worker_task_id: u32 = 0;
+var deadline_worker_started = false;
+var deadline_worker_task_id: u32 = 0;
 var items: [work_queue.capacity]WorkItem = .{WorkItem{}} ** work_queue.capacity;
+var deadline_ticks: [work_queue.capacity]u64 = .{0} ** work_queue.capacity;
 var book = work_queue.Bookkeeping{};
 var queue_event = sync.EventV2.initMode(false, .auto_reset);
+var deadline_event = sync.EventV2.initMode(false, .auto_reset);
 var summary_state: Summary = .{};
 var global_metrics: PerformanceMetrics = .{};
 var owner_metrics: [OWNER_CAPACITY]PerformanceMetrics = .{PerformanceMetrics{}} ** OWNER_CAPACITY;
+var global_deadline_metrics: DeadlineMetrics = .{};
+var owner_deadline_metrics: [OWNER_CAPACITY]DeadlineMetrics = .{DeadlineMetrics{}} ** OWNER_CAPACITY;
 var owner_current: [OWNER_CAPACITY]OwnerCurrent = .{OwnerCurrent{}} ** OWNER_CAPACITY;
 var owner_final_head: [OWNER_CAPACITY]u8 = .{work_queue.no_slot} ** OWNER_CAPACITY;
 var owner_final_tail: [OWNER_CAPACITY]u8 = .{work_queue.no_slot} ** OWNER_CAPACITY;
@@ -281,40 +342,98 @@ var last_submitted_owner: u32 = 0;
 var last_started_owner: u32 = 0;
 var last_completed_owner: u32 = 0;
 var last_cleanup_owner: u32 = 0;
-var running_callback_owner: u32 = 0;
+var normal_callback_owner: u32 = 0;
+var deadline_callback_owner: u32 = 0;
 
 pub fn init() bool {
-    if (initialized and worker_started) return true;
+    if (initialized and worker_started and deadline_worker_started) return true;
     initialized = true;
     summary_state.initialized = 1;
     summary_state.queue_capacity = QUEUE_CAPACITY;
-    const worker = sched_task.createKernelThreadWithRole("r4d-work", workerMain, .short_completion) orelse {
-        summary_state.worker_started = 0;
-        return false;
-    };
-    worker_task_id = worker.id;
-    worker_started = true;
+    if (!worker_started) {
+        const worker = sched_task.createKernelThreadWithRole("r4d-work", workerMain, .short_completion) orelse {
+            summary_state.worker_started = 0;
+            return false;
+        };
+        worker_task_id = worker.id;
+        worker_started = true;
+        summary_state.worker_task_id = worker_task_id;
+    }
+    if (!deadline_worker_started) {
+        const worker = sched_task.createKernelThreadWithRole("r4d-audio", deadlineWorkerMain, .short_completion) orelse {
+            summary_state.worker_started = 0;
+            return false;
+        };
+        deadline_worker_task_id = worker.id;
+        deadline_worker_started = true;
+    }
     summary_state.worker_started = 1;
-    summary_state.worker_task_id = worker_task_id;
-    return true;
+    return worker_started and deadline_worker_started;
 }
 
 pub fn submit(owner: u32, handler: WorkHandler, context: usize, flags: u32, out_handle: *u32) i32 {
-    out_handle.* = 0;
     const actual_irq = irq_router.inDispatch();
-    if (!initialized or !worker_started) {
+    const source: work_queue.SourceClass = if (actual_irq or (flags & WORK_FLAG_FROM_IRQ) != 0) .irq else .task;
+    return submitInternal(owner, handler, context, flags, source, 0, 0, 0, actual_irq, out_handle);
+}
+
+pub fn submitRequest(owner: u32, request: *const WorkRequest, out_handle: *u32) i32 {
+    out_handle.* = 0;
+    if ((request.flags & ~WORK_FLAG_FROM_IRQ) != 0 or
+        !deadline_policy.validRequest(
+            request.version,
+            request.size,
+            @intCast(@sizeOf(WorkRequest)),
+            request.work_class,
+            request.serial_key,
+            request.deadline_tick,
+            request.budget_ticks,
+        ))
+    {
+        return -3;
+    }
+    return submitInternal(
+        owner,
+        request.handler,
+        request.context,
+        request.flags,
+        .deadline,
+        request.serial_key,
+        request.deadline_tick,
+        request.budget_ticks,
+        irq_router.inDispatch(),
+        out_handle,
+    );
+}
+
+fn submitInternal(
+    owner: u32,
+    handler: WorkHandler,
+    context: usize,
+    flags: u32,
+    source: work_queue.SourceClass,
+    serial_key: u64,
+    deadline_tick: u64,
+    budget_ticks: u64,
+    actual_irq: bool,
+    out_handle: *u32,
+) i32 {
+    out_handle.* = 0;
+    const worker_ready = if (source == .deadline) deadline_worker_started else worker_started;
+    if (!initialized or !worker_ready) {
         const critical = enterCritical();
         addMetric(owner, "dropped", 1);
+        if (source == .deadline) addDeadlineMetric(owner, "queue_rejections", 1);
         summary_state.dropped +%= 1;
         leaveCritical(critical, owner);
         return -1;
     }
 
-    const source: work_queue.SourceClass = if (actual_irq or (flags & WORK_FLAG_FROM_IRQ) != 0) .irq else .task;
     const critical = enterCritical();
     const slot = book.reserveAndEnqueue(source) orelse {
         addMetric(owner, "dropped", 1);
         addMetric(owner, "full_rejections", 1);
+        if (source == .deadline) addDeadlineMetric(owner, "queue_rejections", 1);
         if (book.retainedCount() != 0) addMetric(owner, "retained_full_rejections", 1);
         summary_state.dropped +%= 1;
         syncLegacyCurrentLocked();
@@ -329,12 +448,16 @@ pub fn submit(owner: u32, handler: WorkHandler, context: usize, flags: u32, out_
         .handle = handle,
         .generation = generation,
         .flags = flags | if (actual_irq) WORK_FLAG_FROM_IRQ else WORK_FLAG_NONE,
+        .serial_key = serial_key,
+        .deadline_tick = deadline_tick,
+        .budget_ticks = budget_ticks,
         .handler = handler,
         .context = context,
         .submitted_tick = timer.tickCount(),
         .submitted_at = monotonic.capture(),
         .completion = sync.Completion.init(),
     };
+    deadline_ticks[slot] = deadline_tick;
     noteOwnerReserveLocked(owner, source);
     out_handle.* = handle;
     last_submitted_owner = owner;
@@ -344,10 +467,12 @@ pub fn submit(owner: u32, handler: WorkHandler, context: usize, flags: u32, out_
     } else {
         addMetric(owner, "submitted_actual_task", 1);
     }
-    switch (source) {
-        .irq => addMetric(owner, "submitted_irq_class", 1),
-        .task => addMetric(owner, "submitted_task_class", 1),
+    if (actual_irq or (flags & WORK_FLAG_FROM_IRQ) != 0) {
+        addMetric(owner, "submitted_irq_class", 1);
+    } else {
+        addMetric(owner, "submitted_task_class", 1);
     }
+    if (source == .deadline) addDeadlineMetric(owner, "submitted", 1);
     summary_state.submitted +%= 1;
     if (actual_irq) {
         summary_state.submitted_from_irq +%= 1;
@@ -357,7 +482,11 @@ pub fn submit(owner: u32, handler: WorkHandler, context: usize, flags: u32, out_
     syncLegacyCurrentLocked();
     leaveCritical(critical, owner);
 
-    queue_event.signal();
+    if (source == .deadline) {
+        deadline_event.signal();
+    } else {
+        queue_event.signal();
+    }
     return 0;
 }
 
@@ -567,6 +696,7 @@ pub fn completionRelease(handle: u32) i32 {
     noteOwnerReleaseLocked(owner, final_state);
     const generation = items[slot].generation;
     items[slot] = .{ .generation = generation };
+    deadline_ticks[slot] = 0;
     addMetric(owner, "releases", 1);
     summary_state.releases +%= 1;
     syncLegacyCurrentLocked();
@@ -707,7 +837,7 @@ pub fn summary() Summary {
     syncLegacyCurrentLocked();
     var out = summary_state;
     out.initialized = if (initialized) 1 else 0;
-    out.worker_started = if (worker_started) 1 else 0;
+    out.worker_started = if (worker_started and deadline_worker_started) 1 else 0;
     out.worker_task_id = worker_task_id;
     out.queue_capacity = QUEUE_CAPACITY;
     leaveCritical(critical, 0);
@@ -723,12 +853,17 @@ pub fn performance(owner: u32) Performance {
         &global_metrics
     else
         ownerMetricsConst(owner) orelse &zero_metrics;
+    var zero_deadline_metrics = DeadlineMetrics{};
+    const selected_deadline_metrics: *const DeadlineMetrics = if (owner == 0)
+        &global_deadline_metrics
+    else
+        ownerDeadlineMetricsConst(owner) orelse &zero_deadline_metrics;
     var current = OwnerCurrent{};
     if (ownerCurrentConst(owner)) |selected_current| current = selected_current.*;
 
     var out = Performance{
         .selected_owner = owner,
-        .owner_present = if (owner == 0 or ownerHasHistoryLocked(owner, selected_metrics, current)) 1 else 0,
+        .owner_present = if (owner == 0 or ownerHasHistoryLocked(owner, selected_metrics, selected_deadline_metrics, current)) 1 else 0,
         .initialized = if (initialized) 1 else 0,
         .worker_started = if (worker_started) 1 else 0,
         .worker_task_id = worker_task_id,
@@ -763,6 +898,24 @@ pub fn performance(owner: u32) Performance {
         .owner_waiters_current = current.waiters,
         .owner_waiters_max = current.waiters_max,
         .metrics = selected_metrics.*,
+        .deadline_worker_started = if (deadline_worker_started) 1 else 0,
+        .deadline_worker_task_id = deadline_worker_task_id,
+        .deadline_queued_slots = book.deadline_queued_count,
+        .deadline_running_slots = book.deadline_running_count,
+        .deadline_queue_high_water = book.deadline_queue_high_water,
+        .owner_deadline_queued_slots = current.deadline_queued,
+        .owner_deadline_running_slots = current.deadline_running,
+        .owner_deadline_queue_high_water = current.deadline_queue_high_water,
+        .deadline_submitted = selected_deadline_metrics.submitted,
+        .deadline_started = selected_deadline_metrics.started,
+        .deadline_completed = selected_deadline_metrics.completed,
+        .deadline_misses = selected_deadline_metrics.misses,
+        .deadline_budget_overruns = selected_deadline_metrics.budget_overruns,
+        .deadline_queue_rejections = selected_deadline_metrics.queue_rejections,
+        .deadline_queue_total_ticks = selected_deadline_metrics.queue_total_ticks,
+        .deadline_queue_max_ticks = selected_deadline_metrics.queue_max_ticks,
+        .deadline_lateness_total_ticks = selected_deadline_metrics.lateness_total_ticks,
+        .deadline_lateness_max_ticks = selected_deadline_metrics.lateness_max_ticks,
     };
     const final_slot = oldestFinalForOwnerLocked(owner);
     if (final_slot) |index| {
@@ -779,22 +932,46 @@ pub fn performance(owner: u32) Performance {
 
 fn workerMain() callconv(.c) void {
     while (true) {
-        if (takeNext()) |slot| {
-            runSlot(slot);
+        if (takeNextNormal()) |slot| {
+            runSlot(slot, false);
             continue;
         }
         _ = queue_event.waitResult(scheduler.WAIT_FOREVER);
     }
 }
 
-fn takeNext() ?usize {
+fn deadlineWorkerMain() callconv(.c) void {
+    while (true) {
+        if (takeNextDeadline()) |slot| {
+            runSlot(slot, true);
+            continue;
+        }
+        _ = deadline_event.waitResult(scheduler.WAIT_FOREVER);
+    }
+}
+
+fn takeNextNormal() ?usize {
     const critical = enterCritical();
-    const selection = book.takeNext() orelse {
+    const selection = book.takeNextNormal() orelse {
         addMetric(0, "selection_empty", 1);
         syncLegacyCurrentLocked();
         leaveCritical(critical, 0);
         return null;
     };
+    return beginSelectionLocked(critical, selection);
+}
+
+fn takeNextDeadline() ?usize {
+    const critical = enterCritical();
+    const selection = book.takeNextDeadline(deadline_ticks[0..]) orelse {
+        syncLegacyCurrentLocked();
+        leaveCritical(critical, 0);
+        return null;
+    };
+    return beginSelectionLocked(critical, selection);
+}
+
+fn beginSelectionLocked(critical: CriticalGuard, selection: work_queue.Selection) usize {
     const slot = selection.slot;
     const owner = items[slot].owner;
     items[slot].started_tick = timer.tickCount();
@@ -802,14 +979,25 @@ fn takeNext() ?usize {
     noteOwnerStartedLocked(owner, selection.source);
     last_started_owner = owner;
     addMetric(owner, "started", 1);
+    if ((items[slot].flags & WORK_FLAG_FROM_IRQ) != 0) {
+        addMetric(owner, "started_irq_class", 1);
+    } else {
+        addMetric(owner, "started_task_class", 1);
+    }
     switch (selection.source) {
-        .irq => {
-            addMetric(owner, "started_irq_class", 1);
-            addMetric(owner, "selection_irq", 1);
-        },
-        .task => {
-            addMetric(owner, "started_task_class", 1);
-            addMetric(owner, "selection_task", 1);
+        .irq => addMetric(owner, "selection_irq", 1),
+        .task => addMetric(owner, "selection_task", 1),
+        .deadline => {
+            addDeadlineMetric(owner, "started", 1);
+            const queue_ticks = elapsedTicks(items[slot].submitted_tick, items[slot].started_tick);
+            addDeadlineMetric(owner, "queue_total_ticks", queue_ticks);
+            maxDeadlineMetric(owner, "queue_max_ticks", queue_ticks);
+            if (items[slot].started_tick > items[slot].deadline_tick) {
+                const lateness = items[slot].started_tick - items[slot].deadline_tick;
+                addDeadlineMetric(owner, "misses", 1);
+                addDeadlineMetric(owner, "lateness_total_ticks", lateness);
+                maxDeadlineMetric(owner, "lateness_max_ticks", lateness);
+            }
         },
     }
     if (selection.irq_preferred) addMetric(owner, "selection_irq_preferred", 1);
@@ -826,20 +1014,30 @@ fn takeNext() ?usize {
     return slot;
 }
 
-fn runSlot(slot: usize) void {
+fn runSlot(slot: usize, deadline_lane: bool) void {
     const handler = items[slot].handler orelse {
         finishSlot(slot, -1);
         return;
     };
-    running_callback_owner = items[slot].owner;
-    defer running_callback_owner = 0;
+    if (deadline_lane) {
+        deadline_callback_owner = items[slot].owner;
+    } else {
+        normal_callback_owner = items[slot].owner;
+    }
+    defer if (deadline_lane) {
+        deadline_callback_owner = 0;
+    } else {
+        normal_callback_owner = 0;
+    };
     const result = handler(items[slot].context);
     finishSlot(slot, result);
 }
 
 pub fn currentOwner() u32 {
-    if (!currentIsWorker()) return 0;
-    return running_callback_owner;
+    const current_id = scheduler.currentId() orelse return 0;
+    if (current_id == worker_task_id) return normal_callback_owner;
+    if (current_id == deadline_worker_task_id) return deadline_callback_owner;
+    return 0;
 }
 
 fn finishSlot(slot: usize, result: i32) void {
@@ -864,13 +1062,14 @@ fn finishSlot(slot: usize, result: i32) void {
         items[slot].completed_tick = completed_tick;
         items[slot].completed_at = completed_at;
         items[slot].completion_published = false;
-        noteOwnerCompletedLocked(owner);
+        noteOwnerCompletedLocked(owner, source);
         appendOwnerFinalLocked(owner, slot);
         last_completed_owner = owner;
         addMetric(owner, "completed", 1);
-        switch (source) {
-            .irq => addMetric(owner, "completed_irq_class", 1),
-            .task => addMetric(owner, "completed_task_class", 1),
+        if ((items[slot].flags & WORK_FLAG_FROM_IRQ) != 0) {
+            addMetric(owner, "completed_irq_class", 1);
+        } else {
+            addMetric(owner, "completed_task_class", 1);
         }
         if (result != 0) addMetric(owner, "failed", 1);
         if (items[slot].cleanup_waiting) addMetric(owner, "cleanup_late_finishes", 1);
@@ -881,6 +1080,10 @@ fn finishSlot(slot: usize, result: i32) void {
         }
 
         const run_ticks = elapsedTicks(items[slot].started_tick, completed_tick);
+        if (source == .deadline) {
+            addDeadlineMetric(owner, "completed", 1);
+            if (run_ticks > items[slot].budget_ticks) addDeadlineMetric(owner, "budget_overruns", 1);
+        }
         summary_state.completed +%= 1;
         if (result != 0) summary_state.failed +%= 1;
         summary_state.run_total_ticks +%= run_ticks;
@@ -1021,9 +1224,9 @@ fn noteOwnerCancelledLocked(owner: u32, source: work_queue.SourceClass) void {
     current.cancel(source);
 }
 
-fn noteOwnerCompletedLocked(owner: u32) void {
+fn noteOwnerCompletedLocked(owner: u32, source: work_queue.SourceClass) void {
     const current = ownerCurrent(owner) orelse return;
-    current.complete();
+    current.complete(source);
 }
 
 fn noteOwnerReleaseLocked(owner: u32, state: work_queue.State) void {
@@ -1129,12 +1332,12 @@ fn cleanupRemainingTicks(started_tick: u64) u64 {
 
 fn currentIsWorker() bool {
     const current_id = scheduler.currentId() orelse return false;
-    return current_id == worker_task_id;
+    return current_id == worker_task_id or current_id == deadline_worker_task_id;
 }
 
-fn ownerHasHistoryLocked(owner: u32, metrics: *const PerformanceMetrics, current: OwnerCurrent) bool {
+fn ownerHasHistoryLocked(owner: u32, metrics: *const PerformanceMetrics, deadline_metrics: *const DeadlineMetrics, current: OwnerCurrent) bool {
     return ownerIndex(owner) != null and
-        (current.used != 0 or current.used_high_water != 0 or metrics.submitted != 0 or metrics.cleanup_calls != 0);
+        (current.used != 0 or current.used_high_water != 0 or metrics.submitted != 0 or deadline_metrics.submitted != 0 or metrics.cleanup_calls != 0);
 }
 
 fn ownerIndex(owner: u32) ?usize {
@@ -1152,6 +1355,16 @@ fn ownerMetricsConst(owner: u32) ?*const PerformanceMetrics {
     return &owner_metrics[index];
 }
 
+fn ownerDeadlineMetrics(owner: u32) ?*DeadlineMetrics {
+    const index = ownerIndex(owner) orelse return null;
+    return &owner_deadline_metrics[index];
+}
+
+fn ownerDeadlineMetricsConst(owner: u32) ?*const DeadlineMetrics {
+    const index = ownerIndex(owner) orelse return null;
+    return &owner_deadline_metrics[index];
+}
+
 fn ownerCurrent(owner: u32) ?*OwnerCurrent {
     const index = ownerIndex(owner) orelse return null;
     return &owner_current[index];
@@ -1166,6 +1379,20 @@ fn addMetric(owner: u32, comptime field: []const u8, value: anytype) void {
     @field(global_metrics, field) +%= @as(u64, @intCast(value));
     if (ownerMetrics(owner)) |metrics| {
         @field(metrics, field) +%= @as(u64, @intCast(value));
+    }
+}
+
+fn addDeadlineMetric(owner: u32, comptime field: []const u8, value: anytype) void {
+    @field(global_deadline_metrics, field) +%= @as(u64, @intCast(value));
+    if (ownerDeadlineMetrics(owner)) |metrics| {
+        @field(metrics, field) +%= @as(u64, @intCast(value));
+    }
+}
+
+fn maxDeadlineMetric(owner: u32, comptime field: []const u8, value: u64) void {
+    if (value > @field(global_deadline_metrics, field)) @field(global_deadline_metrics, field) = value;
+    if (ownerDeadlineMetrics(owner)) |metrics| {
+        if (value > @field(metrics, field)) @field(metrics, field) = value;
     }
 }
 

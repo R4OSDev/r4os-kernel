@@ -49,6 +49,16 @@ hardwarebesessene Requests. Alte synchrone Backends werden auf Tiefe eins
 normalisiert. Der kanonische ABI-Vertrag liegt im Contract-Repository unter
 `ABI/R4DDriver.txt`.
 
+DriverApi v20 ergaenzt fuer Audiorefills eine kopierte Anforderung mit
+absoluter Tickdeadline, einem Budget von hoechstens vier Ticks und einem
+stabilen Geraeteschluessel. Die EDF-sortierte Queue besitzt hoechstens vier
+wartende Eintraege und einen eigenen `r4d-audio`-Worker. Normale Driver-Arbeit
+behaelt ihre IRQ-/Task-FIFO und laesst zwei der 16 gemeinsamen Lebenszyklus-
+Slots fuer Deadline-Arbeit frei. Der einzelne Short-Completion-Worker
+serialisiert alle Audiogeraete; sein Schedulerboost wird nach vier Ticks oder
+Dispatches zurueckgestuft. Performance-Snapshot v2 trennt Queuezeit,
+Deadline-Miss, Budgetueberzug und Admission-Rejection global und je Owner.
+
 Grenze
 ------
 

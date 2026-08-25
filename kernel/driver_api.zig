@@ -23,9 +23,9 @@ const timer = @import("timer.zig");
 const usb_host = @import("../driver/usb/host_controller.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 19 (0.69.39): append-only um ownergebundene Pin-/Segment-DMA-
-// Abbildungen mit expliziter Synchronisation erweitert.
-pub const VERSION: u32 = 19;
+// Version 20 (0.69.42): append-only um deadline-isolierte Audiorefills mit
+// begrenztem Budget und stabilem Geraete-Serialisierungsschluessel erweitert.
+pub const VERSION: u32 = 20;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -153,6 +153,7 @@ pub const PciDeviceInfo = extern struct {
 pub const IrqHandler = irq_router.IrqHandler;
 pub const IrqStats = irq_router.IrqStats;
 pub const DriverWorkHandler = driver_work.WorkHandler;
+pub const DriverWorkRequest = driver_work.WorkRequest;
 pub const DriverCompletionStatus = driver_work.CompletionStatus;
 pub const DriverWorkSummary = driver_work.Summary;
 
@@ -662,6 +663,8 @@ pub const Table = extern struct {
     dma_sync_for_cpu: *const fn (*const DmaMapping) callconv(.c) i32,
     dma_unmap: *const fn (*DmaMapping) callconv(.c) i32,
     dma_unpin_buffer: *const fn (*DmaPinnedBuffer) callconv(.c) i32,
+    // 0.69.42 (Version 20, append-only): deadline-isolierte Audiorefills.
+    driver_work_submit_request: *const fn (*const DriverWorkRequest, *u32) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -730,6 +733,7 @@ pub var table = Table{
     .dma_sync_for_cpu = dmaSyncForCpu,
     .dma_unmap = dmaUnmap,
     .dma_unpin_buffer = dmaUnpinBuffer,
+    .driver_work_submit_request = driverWorkSubmitRequest,
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
@@ -1187,6 +1191,10 @@ fn irqStats(irq: u8, out: *IrqStats) callconv(.c) i32 {
 
 fn driverWorkSubmit(handler: DriverWorkHandler, context: usize, flags: u32, out_handle: *u32) callconv(.c) i32 {
     return driver_work.submit(activeOwner(), handler, context, flags, out_handle);
+}
+
+fn driverWorkSubmitRequest(request: *const DriverWorkRequest, out_handle: *u32) callconv(.c) i32 {
+    return driver_work.submitRequest(activeOwner(), request, out_handle);
 }
 
 fn driverWorkCancel(handle: u32) callconv(.c) i32 {

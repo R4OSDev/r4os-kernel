@@ -47,10 +47,13 @@ be enabled independently of the other invasive probes:
 On Linux or macOS use `./Build.sh -Dblock-dispatch-selftest=true`.
 
 DriverApi v19 adds owner-bound pin/map/sync/unmap segment DMA for existing
-resident buffers. StorageBackend v2 separates nonblocking submit and exact
-completion while retaining the version-1 synchronous depth-one adapter. The
-canonical lifetime rules are in the Contract repository's
-`ABI/R4DDriver.txt`.
+resident buffers. Version 20 adds bounded audio-refill requests with an
+absolute tick deadline, device serialization key, and a separate EDF queue
+served by one budgeted short-completion worker. Normal IRQ/task Driver Work
+keeps its fair FIFO and reserved progress. StorageBackend v2 separates
+nonblocking submit and exact completion while retaining the version-1
+synchronous depth-one adapter. The canonical lifetime rules are in the
+Contract repository's `ABI/R4DDriver.txt`.
 
 Once the shell task has been admitted, the one-shot kernel boot task exits and
 is reaped. The shell's first `boot_ready` call independently freezes the boot
