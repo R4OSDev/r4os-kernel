@@ -796,7 +796,7 @@ fn runNetDiagOp(op: u32) i32 {
         NET_DIAG_OP_POWER => net.runPowerLifecycleProbe(),
         NET_DIAG_OP_LIFECYCLE => net.runLinkLifecycleProbe(),
         NET_DIAG_OP_RESET => net.runAdapterResetProbe(),
-        NET_DIAG_OP_DRIVER => net.runDriverLifecycleProbe() and net.runRxHandoffProbe(),
+        NET_DIAG_OP_DRIVER => net.runDriverLifecycleProbe() and net.runRxHandoffProbe() and net.runBackendCapabilityProbe(),
         NET_DIAG_OP_ENVIRONMENT => net.runEnvironmentContractProbe(),
         NET_DIAG_OP_LIMIT => net.runLimitContractProbe(),
         NET_DIAG_OP_CORPUS => net.runPacketCorpusProbe(),

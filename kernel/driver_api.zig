@@ -7,6 +7,7 @@ const bootlog = @import("bootlog.zig");
 const boot_config = @import("boot_config.zig");
 const log_event = @import("log_event.zig");
 const net = @import("../net/core.zig");
+const net_backend = @import("../net/backend_contract.zig");
 const pci_inventory = @import("../platform/pci_inventory.zig");
 const platform_cpu = @import("../platform/cpu.zig");
 const paging = @import("../memory/paging.zig");
@@ -25,9 +26,9 @@ const usb_host = @import("../driver/usb/host_controller.zig");
 const xhci = @import("../driver/usb/xhci.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 23 (0.69.49): append-only um den IRQ-sicheren RX-Arbeitsweckruf
-// erweitert. Framekopie und Protokollbatch bleiben im Netcore-Task.
-pub const VERSION: u32 = 23;
+// Version 24 (0.69.50): append-only um ausgehandelte Netzwerkfaehigkeiten
+// und Metadatenpakete mit kanonischem Flat-Fallback erweitert.
+pub const VERSION: u32 = 24;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -49,7 +50,7 @@ const USB_HOST_BACKEND_VERSION: u32 = usb_host.BACKEND_VERSION;
 const USB_HOST_SOURCE_BUILTIN: u32 = 0;
 const USB_HOST_SOURCE_PRELOAD: u32 = 1;
 const USB_HOST_SOURCE_DISK: u32 = 2;
-const NET_BACKEND_VERSION: u32 = 1;
+const NET_BACKEND_VERSION: u32 = net_backend.version;
 const NET_BACKEND_FLAG_LINK_UP: u32 = 1 << 0;
 const NET_BACKEND_FLAG_BROADCAST: u32 = 1 << 1;
 const NET_BACKEND_FLAG_TRUSTED: u32 = 1 << 2;
@@ -77,6 +78,12 @@ const empty_z: [1:0]u8 = .{0};
 var option_value_z: [64:0]u8 = .{0} ** 64;
 
 pub const NetBackendStatus = net.BackendStatus;
+pub const NetBufferSegment = net_backend.BufferSegment;
+pub const NetPacket = net_backend.Packet;
+pub const NetTxComplete = net_backend.TxComplete;
+pub const NetTxRequest = net_backend.TxRequest;
+pub const NetTransmitPacketFn = net_backend.TransmitPacketFn;
+pub const NetBackendNegotiation = net_backend.Negotiation;
 
 pub const DmaBuffer = extern struct {
     phys_addr: u64 = 0,
@@ -294,7 +301,20 @@ pub const NetBackendDescriptor = extern struct {
     poll: ?*const fn (?*anyopaque) callconv(.c) void,
     shutdown: ?*const fn (?*anyopaque) callconv(.c) i32,
     status: ?*const fn (?*anyopaque, *NetBackendStatus) callconv(.c) i32,
+    offered_capabilities: u64,
+    required_capabilities: u64,
+    rx_queue_count: u16,
+    tx_queue_count: u16,
+    max_rx_segments: u16,
+    max_tx_segments: u16,
+    rx_ownership: u32,
+    tx_ownership: u32,
+    interrupt_moderation_us: u32,
+    reserved2: u32,
+    transmit_packet: ?NetTransmitPacketFn,
 };
+
+const NET_BACKEND_V1_SIZE: u32 = @intCast(@offsetOf(NetBackendDescriptor, "offered_capabilities"));
 
 const R4DStorageBackend = struct {
     used: bool = false,
@@ -312,6 +332,7 @@ const R4DNetBackend = struct {
     name: [MAX_R4D_NET_NAME]u8 = .{0} ** MAX_R4D_NET_NAME,
     name_len: usize = 0,
     descriptor: *const NetBackendDescriptor = undefined,
+    negotiation: NetBackendNegotiation = .{},
 };
 
 const R4DAudioBackend = struct {
@@ -697,6 +718,10 @@ pub const Table = extern struct {
     // 0.69.49 (Version 23, append-only): IRQ-sicheres, adapterbezogenes
     // Wakeup fuer den begrenzten Netcore-RX-Handoff.
     net_schedule_rx: *const fn (i32) callconv(.c) i32,
+    // 0.69.50 (Version 24, append-only): ausgehandelte Backendfaehigkeiten
+    // und RX-Metadaten mit verpflichtendem kanonischem Flat-Fallback.
+    net_backend_query: *const fn (i32, *NetBackendNegotiation) callconv(.c) i32,
+    net_receive_packet: *const fn (i32, *const NetPacket) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -770,6 +795,8 @@ pub var table = Table{
     .register_display_blit_backend = registerDisplayBlitBackend,
     .unregister_display_blit_backend = unregisterDisplayBlitBackend,
     .net_schedule_rx = netScheduleRx,
+    .net_backend_query = netBackendQuery,
+    .net_receive_packet = netReceivePacket,
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
@@ -1787,6 +1814,16 @@ fn registerMixerBackend(name: [*:0]const u8, backend: *const anyopaque) callconv
 fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
     const descriptor: *const NetBackendDescriptor = @ptrCast(@alignCast(backend));
     if (!validNetBackend(descriptor)) return -1;
+    const negotiation = net_backend.negotiate(netBackendOffer(descriptor)) catch |err| {
+        bootlog.puts("[R4D][ERROR] net backend capability negotiation failed: ");
+        bootlog.puts(switch (err) {
+            error.InvalidOffer => "invalid-offer",
+            error.RequiredNotOffered => "required-not-offered",
+            error.RequiredUnsupported => "required-unsupported",
+        });
+        bootlog.puts("\r\n");
+        return -4;
+    };
     const slot_index = freeR4DNetBackendSlot() orelse {
         bootlog.puts("[R4D][ERROR] net backend table full\r\n");
         return -2;
@@ -1796,6 +1833,7 @@ fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.
         .used = true,
         .owner = current_owner,
         .descriptor = descriptor,
+        .negotiation = negotiation,
     };
     copyZName(name, slot.name[0..], &slot.name_len);
 
@@ -1813,6 +1851,7 @@ fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.
         .mac = descriptor.mac,
         .mtu = descriptor.mtu,
         .flags = flags,
+        .backend = negotiation,
         .link = if ((descriptor.flags & NET_BACKEND_FLAG_LINK_UP) != 0) .up else .unknown,
         .ops = .{
             .transmit = if (descriptor.transmit != null) r4dNetTransmit else null,
@@ -1830,6 +1869,14 @@ fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.
     bootlog.puts(slot.name[0..slot.name_len]);
     bootlog.puts(" adapter=");
     bootlog.putDec(adapter_index);
+    bootlog.puts(" caps=");
+    bootlog.putHex(negotiation.accepted, 16);
+    bootlog.puts("/");
+    bootlog.putHex(negotiation.offered, 16);
+    bootlog.puts(" queues=");
+    bootlog.putDec(negotiation.rx_queue_count);
+    bootlog.puts("/");
+    bootlog.putDec(negotiation.tx_queue_count);
     bootlog.puts("\r\n");
     return @intCast(adapter_index);
 }
@@ -2002,11 +2049,12 @@ fn validUsbHostController(descriptor: *const UsbHostControllerDescriptor) bool {
 }
 
 fn validNetBackend(descriptor: *const NetBackendDescriptor) bool {
-    if (descriptor.version != NET_BACKEND_VERSION) {
+    if (descriptor.version != 1 and descriptor.version != NET_BACKEND_VERSION) {
         bootlog.puts("[R4D][ERROR] net backend version mismatch\r\n");
         return false;
     }
-    if (descriptor.size < @sizeOf(NetBackendDescriptor)) {
+    const required_size: u32 = if (descriptor.version == 1) NET_BACKEND_V1_SIZE else @sizeOf(NetBackendDescriptor);
+    if (descriptor.size < required_size) {
         bootlog.puts("[R4D][ERROR] net backend descriptor too small\r\n");
         return false;
     }
@@ -2027,11 +2075,32 @@ fn validNetBackend(descriptor: *const NetBackendDescriptor) bool {
     if (descriptor.poll) |p| fnptr_ok = fnptr_ok and netFnPlausible(@intFromPtr(p));
     if (descriptor.status) |p| fnptr_ok = fnptr_ok and netFnPlausible(@intFromPtr(p));
     if (descriptor.shutdown) |p| fnptr_ok = fnptr_ok and netFnPlausible(@intFromPtr(p));
+    if (netBackendTransmitPacket(descriptor)) |p| fnptr_ok = fnptr_ok and netFnPlausible(@intFromPtr(p));
     if (!fnptr_ok) {
         bootlog.puts("[R4D][ERROR] NETBACKEND BAD FNPTR (unrelocated?)\r\n");
         return false;
     }
     return true;
+}
+
+fn netBackendOffer(descriptor: *const NetBackendDescriptor) net_backend.Offer {
+    if (descriptor.version < 2 or descriptor.size < @sizeOf(NetBackendDescriptor)) return .{};
+    return .{
+        .offered = descriptor.offered_capabilities,
+        .required = descriptor.required_capabilities,
+        .rx_queue_count = descriptor.rx_queue_count,
+        .tx_queue_count = descriptor.tx_queue_count,
+        .max_rx_segments = descriptor.max_rx_segments,
+        .max_tx_segments = descriptor.max_tx_segments,
+        .rx_ownership = descriptor.rx_ownership,
+        .tx_ownership = descriptor.tx_ownership,
+        .interrupt_moderation_us = descriptor.interrupt_moderation_us,
+    };
+}
+
+fn netBackendTransmitPacket(descriptor: *const NetBackendDescriptor) ?NetTransmitPacketFn {
+    if (descriptor.version < 2 or descriptor.size < @sizeOf(NetBackendDescriptor)) return null;
+    return descriptor.transmit_packet;
 }
 
 fn netFnPlausible(ptr: u64) bool {
@@ -2070,6 +2139,7 @@ fn netReceiveFrame(adapter_index: i32, frame: [*]const u8, len: u32) callconv(.c
     const slice = frame[0..@intCast(len)];
     return switch (net.receiveFrame(index, slice)) {
         .accepted => 0,
+        .accepted_fallback => 0,
         .invalid_adapter => -1,
         .invalid_frame => -2,
         .unavailable => -3,
@@ -2083,6 +2153,32 @@ fn netScheduleRx(adapter_index: i32) callconv(.c) i32 {
     const index: usize = @intCast(adapter_index);
     if (index >= net.count()) return -1;
     return if (net.scheduleRxWork(index)) 0 else -3;
+}
+
+fn netBackendQuery(adapter_index: i32, out: *NetBackendNegotiation) callconv(.c) i32 {
+    if (adapter_index < 0) return -1;
+    if (!net_backend.validNegotiationQuery(out)) return -2;
+    const backend = findR4DNetBackend(@intCast(adapter_index)) orelse return -1;
+    out.* = backend.negotiation;
+    return 0;
+}
+
+fn netReceivePacket(adapter_index: i32, packet: *const NetPacket) callconv(.c) i32 {
+    if (adapter_index < 0) return -1;
+    const index: usize = @intCast(adapter_index);
+    const backend = findR4DNetBackend(index) orelse return -1;
+    if (!net_backend.validRxPacket(packet, backend.negotiation, net.MAX_PACKET_SIZE)) return -2;
+    const frame_ptr: [*]const u8 = @ptrFromInt(packet.fallback_addr);
+    const frame = frame_ptr[0..@intCast(packet.fallback_bytes)];
+    return switch (net.receivePacket(index, packet.queue_index, packet.flags, frame)) {
+        .accepted => 0,
+        .accepted_fallback => 1,
+        .invalid_adapter => -1,
+        .invalid_frame => -2,
+        .unavailable => -3,
+        .queue_busy => -4,
+        .irq_context => -5,
+    };
 }
 
 fn r4dStorageRead(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {

@@ -119,6 +119,28 @@ unbrauchbares Routing. NETRX weist Wakeup-/Fallbackzahlen, Queuebelegung und
 High-Water, Backpressure, Batchbudgetenden, Schedule- und Handoff-Tail sowie
 die Gleichung angenommen = verarbeitet + abgebrochen + belegt aus.
 
+Ausgehandelte Netzwerkqueues und Offloads seit 0.69.50
+------------------------------------------------------
+
+NetBackend v2 erweitert den vollstaendigen v1-Praefix append-only um Angebot
+und Pflichtmenge fuer RX-/TX-Pruefsummen, Scatter, VLAN, Segmentierung,
+Moderation, Notification-Suppression, Completion und Multiqueue. DriverApi
+v24 liefert die Auswahl nach der Registrierung und nimmt versionierte
+Pakete entgegen. Unbekannte oder abgelehnte optionale Angaben werden gemeinsam
+verworfen; die verpflichtend enthaltenen Flat-Bytes durchlaufen unveraendert
+den alten Softwarepfad. Abgelehnte Pflichtfaehigkeiten verhindern dagegen die
+Registrierung.
+
+Der BSP-Netcore waehlt genau eine RX- und TX-Queue, einen Flat-Puffer,
+geliehenen Besitz bis zur Rueckkehr und keine Moderation. Einziger produktiver
+Offload ist eine vom VirtioNet-Treiber angebotene, vom Kernel angenommene und
+strukturell erneut eingegrenzte RX-TCP-/UDP-Pruefsummenvalidierung. Die IPv4-
+Headerpruefung bleibt immer aktiv. `ProtocolBuffer.flags` erreicht nur den
+jeweiligen RX-Dispatch von NetUdp oder NetTcp; TX und alle unfaehigen,
+unbekannten, fragmentierten oder anders gekapselten Pfade berechnen die
+Pruefsumme weiter in Software. NETCAP prueft Ein-Queue-, Pflicht- und
+byteidentische Fallbacksemantik; NETRX weist Nutzung und Fallbacks aus.
+
 Bedarfsgeladener R4M0- und R4P-Pfad seit 0.69.44
 ------------------------------------------------
 

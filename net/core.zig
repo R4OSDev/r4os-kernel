@@ -12,6 +12,7 @@ const tcp = @import("tcp.zig");
 const tcp_runtime = @import("tcp_runtime.zig");
 const serial_link = @import("serial_link.zig");
 const timing = @import("timing.zig");
+const backend_contract = @import("backend_contract.zig");
 const rx_handoff = @import("rx_handoff.zig");
 const boot_config = @import("../kernel/boot_config.zig");
 const ipc = @import("../kernel/ipc.zig");
@@ -86,7 +87,6 @@ const DHCP_BROADCAST_IP: [4]u8 = .{ 255, 255, 255, 255 };
 const DHCP_ZERO_IP: [4]u8 = .{ 0, 0, 0, 0 };
 const DHCP_BROADCAST_MAC: [6]u8 = .{ 255, 255, 255, 255, 255, 255 };
 pub const ADAPTER_FLAG_TRUSTED_BACKEND: u32 = 1 << 0;
-pub const ADAPTER_FLAG_HW_CHECKSUM: u32 = 1 << 1;
 pub const ADAPTER_FLAG_BROADCAST: u32 = 1 << 2;
 pub const TcpSummary = r4x_api.TcpSummary;
 pub const TcpConnectionInfo = r4x_api.TcpConnectionInfo;
@@ -95,6 +95,7 @@ pub const TimingStatus = timing.Status;
 
 pub const RxAdmission = enum {
     accepted,
+    accepted_fallback,
     invalid_adapter,
     invalid_frame,
     unavailable,
@@ -447,6 +448,11 @@ pub const BackendStatus = extern struct {
     tx_errors: u64 = 0,
     rx_overflows: u64 = 0,
     rx_recoveries: u64 = 0,
+    offered_capabilities: u64 = 0,
+    accepted_capabilities: u64 = 0,
+    rx_offload_packets: u64 = 0,
+    rx_software_fallbacks: u64 = 0,
+    rx_metadata_errors: u64 = 0,
 };
 
 pub const Adapter = struct {
@@ -466,6 +472,7 @@ pub const Adapter = struct {
     registered_tick: u64 = 0,
     state_changed_tick: u64 = 0,
     stats: Stats = .{},
+    backend: backend_contract.Negotiation = .{},
     ops: AdapterOps = .{},
 };
 
@@ -539,6 +546,11 @@ var rx_schedule_latency_last_ns: u64 = 0;
 var rx_schedule_latency_max_ns: u64 = 0;
 var rx_latency_unavailable: u64 = 0;
 var rx_irq_frame_rejects: u64 = 0;
+var rx_metadata_submissions: u64 = 0;
+var rx_metadata_selected: u64 = 0;
+var rx_metadata_fallbacks: u64 = 0;
+var rx_l4_offload_used: u64 = 0;
+var rx_l4_software_checks: u64 = 0;
 var diag_lifecycle_link_up: bool = true;
 var app_ipv4_queues: [APP_IPV4_BUCKET_COUNT]AppIpv4Queue = .{AppIpv4Queue{}} ** APP_IPV4_BUCKET_COUNT;
 var app_ipv4_next_seq: u64 = 1;
@@ -667,6 +679,11 @@ pub fn init() void {
     rx_schedule_latency_max_ns = 0;
     rx_latency_unavailable = 0;
     rx_irq_frame_rejects = 0;
+    rx_metadata_submissions = 0;
+    rx_metadata_selected = 0;
+    rx_metadata_fallbacks = 0;
+    rx_l4_offload_used = 0;
+    rx_l4_software_checks = 0;
     app_ipv4_queues = .{AppIpv4Queue{}} ** APP_IPV4_BUCKET_COUNT;
     app_ipv4_next_seq = 1;
     ethernet.reset(&eth_stats);
@@ -1393,6 +1410,9 @@ pub fn runRxHandoffProbe() bool {
         status.schedules_from_irq <= status.schedules and
         status.release_failures == 0 and
         status.irq_frame_rejects == 0 and
+        status.metadata_selected <= status.metadata_submissions and
+        status.metadata_fallbacks <= status.metadata_submissions and
+        status.l4_offload_used <= status.metadata_selected and
         status.ownership_balanced;
 
     k.puts("NETRX handoff-probe result=");
@@ -1427,11 +1447,98 @@ pub fn runRxHandoffProbe() bool {
     k.putDec(status.handoff_latency_max_ns);
     k.puts(" irq-inline=");
     k.putDec(status.irq_frame_rejects);
+    k.puts(" offload=");
+    k.putDec(status.l4_offload_used);
+    k.puts("/");
+    k.putDec(status.metadata_selected);
+    k.puts(" fallback=");
+    k.putDec(status.metadata_fallbacks);
+    k.puts(" software=");
+    k.putDec(status.l4_software_checks);
     k.puts("\r\n");
 
     if (ok) {
         driver_lifecycle_tests +%= 1;
         driver_lifecycle_cases +%= 8;
+    }
+    return ok;
+}
+
+pub fn runBackendCapabilityProbe() bool {
+    const capable = backend_contract.negotiate(.{
+        .offered = backend_contract.capability_rx_l4_checksum_valid |
+            backend_contract.capability_multiqueue,
+        .rx_queue_count = 4,
+        .tx_queue_count = 4,
+    }) catch return false;
+    const flat = backend_contract.negotiate(.{}) catch return false;
+    if (backend_contract.negotiate(.{
+        .offered = backend_contract.capability_tx_segmentation,
+        .required = backend_contract.capability_tx_segmentation,
+    })) |_| {
+        return false;
+    } else |err| {
+        if (err != error.RequiredUnsupported) return false;
+    }
+
+    var frame: [42]u8 = .{0} ** 42;
+    frame[12] = 0x08;
+    frame[13] = 0x00;
+    frame[14] = 0x45;
+    frame[16] = 0;
+    frame[17] = 28;
+    frame[23] = udp.IPV4_PROTOCOL;
+    frame[38] = 0;
+    frame[39] = 8;
+    const original = frame;
+
+    const capable_metadata = backend_contract.selectRxMetadata(
+        capable.accepted,
+        backend_contract.packet_flag_rx_l4_checksum_valid,
+        &frame,
+    );
+    const flat_metadata = backend_contract.selectRxMetadata(
+        flat.accepted,
+        backend_contract.packet_flag_rx_l4_checksum_valid,
+        &frame,
+    );
+    const unknown_metadata = backend_contract.selectRxMetadata(
+        capable.accepted,
+        backend_contract.packet_flag_rx_l4_checksum_valid | (@as(u64, 1) << 63),
+        &frame,
+    );
+    const packet_descriptor = backend_contract.Packet{
+        .fallback_addr = 1,
+        .fallback_bytes = frame.len,
+    };
+    var wrong_queue = packet_descriptor;
+    wrong_queue.queue_index = 1;
+    const ok = capable.accepted == backend_contract.capability_rx_l4_checksum_valid and
+        capable.rejected == backend_contract.capability_multiqueue and
+        capable.rx_queue_count == 1 and capable.tx_queue_count == 1 and
+        flat.accepted == 0 and flat.rejected == 0 and
+        capable_metadata == .l4_checksum_valid and
+        flat_metadata == .software_fallback and
+        unknown_metadata == .software_fallback and
+        backend_contract.validRxPacket(&packet_descriptor, capable, MAX_PACKET_SIZE) and
+        !backend_contract.validRxPacket(&wrong_queue, capable, MAX_PACKET_SIZE) and
+        memEql(&frame, &original);
+
+    k.puts("NETCAP negotiation-probe result=");
+    k.puts(if (ok) "OK" else "FAILED");
+    k.puts(" accepted=");
+    k.putHex(capable.accepted, 16);
+    k.puts(" rejected=");
+    k.putHex(capable.rejected, 16);
+    k.puts(" queues=");
+    k.putDec(capable.rx_queue_count);
+    k.puts("/");
+    k.putDec(capable.tx_queue_count);
+    k.puts(" fallback=byte-identical\r\n");
+
+    if (ok) {
+        driver_lifecycle_tests +%= 1;
+        driver_lifecycle_cases +%= 7;
     }
     return ok;
 }
@@ -1763,6 +1870,18 @@ pub fn scheduleRxWork(adapter_index: usize) bool {
 /// retained and retried by the task-side poll instead of entering R4P, socket
 /// wakeups or reply transmission from an external interrupt.
 pub fn receiveFrame(adapter_index: usize, frame: []const u8) RxAdmission {
+    return receiveFrameInternal(adapter_index, 0, 0, frame, false);
+}
+
+/// Versioned packet intake. The canonical flat bytes always take the same
+/// bounded copy path as `receiveFrame`; metadata can only remove the one
+/// negotiated L4 checksum pass. Unknown or rejected metadata returns
+/// `accepted_fallback` after copying the bytes unchanged.
+pub fn receivePacket(adapter_index: usize, queue_index: u16, packet_flags: u64, frame: []const u8) RxAdmission {
+    return receiveFrameInternal(adapter_index, queue_index, packet_flags, frame, true);
+}
+
+fn receiveFrameInternal(adapter_index: usize, queue_index: u16, packet_flags: u64, frame: []const u8, metadata_api: bool) RxAdmission {
     if (irq_router.inDispatch()) {
         const irq_flags = rxEnterCritical();
         rx_irq_frame_rejects +%= 1;
@@ -1773,27 +1892,42 @@ pub fn receiveFrame(adapter_index: usize, frame: []const u8) RxAdmission {
     if (!enterBackendCallback()) return .unavailable;
     defer leaveBackendCallback();
     if (adapter_index >= adapter_count) return .invalid_adapter;
+    if (queue_index >= adapters[adapter_index].backend.rx_queue_count) return .invalid_frame;
+
+    const decision = if (metadata_api)
+        backend_contract.selectRxMetadata(adapters[adapter_index].backend.accepted, packet_flags, frame)
+    else
+        backend_contract.RxMetadataDecision.software;
+    const metadata = rx_handoff.Metadata{
+        .l4_checksum_valid = decision == .l4_checksum_valid,
+        .software_fallback = decision == .software_fallback,
+    };
 
     const enqueued_ns = time_core.monotonicNanoseconds() orelse 0;
     var should_signal = false;
     const irq_flags = rxEnterCritical();
     const was_empty = rx_handoff_queue.queuedCount() == 0;
-    const result = rx_handoff_queue.enqueue(adapter_index, frame, enqueued_ns);
+    const result = rx_handoff_queue.enqueueWithMetadata(adapter_index, frame, enqueued_ns, metadata);
     switch (result) {
-        .accepted => should_signal = was_empty,
+        .accepted => {
+            should_signal = was_empty;
+            if (metadata_api and packet_flags != 0) rx_metadata_submissions +%= 1;
+            if (decision == .l4_checksum_valid) rx_metadata_selected +%= 1;
+            if (decision == .software_fallback) rx_metadata_fallbacks +%= 1;
+        },
         .busy => should_signal = true,
         .invalid_frame => {},
     }
     rxLeaveCritical(irq_flags);
     if (should_signal) rx_work_event.signal();
     return switch (result) {
-        .accepted => .accepted,
+        .accepted => if (decision == .software_fallback) .accepted_fallback else .accepted,
         .invalid_frame => .invalid_frame,
         .busy => .queue_busy,
     };
 }
 
-fn processReceivedFrame(adapter_index: usize, frame: []const u8) bool {
+fn processReceivedFrame(adapter_index: usize, frame: []const u8, metadata: rx_handoff.Metadata) bool {
     if (adapter_index >= adapter_count) return false;
     if (comptime kernel_config.enable_net_loss_test) {
         net_loss_counter +%= 1;
@@ -1835,12 +1969,19 @@ fn processReceivedFrame(adapter_index: usize, frame: []const u8) bool {
         learnIpv4Sender(ip_view.source_ip, source_mac);
         enqueueAppIpv4(ip_view);
         icmpHandleRx(ip_view);
-        if (udpHandleRx(ip_view)) |udp_view| {
+        const l4_checksum_valid = metadata.l4_checksum_valid and
+            (ip_view.protocol == udp.IPV4_PROTOCOL or ip_view.protocol == tcp.IPV4_PROTOCOL);
+        if (l4_checksum_valid) {
+            rx_l4_offload_used +%= 1;
+        } else if (ip_view.protocol == udp.IPV4_PROTOCOL or ip_view.protocol == tcp.IPV4_PROTOCOL) {
+            rx_l4_software_checks +%= 1;
+        }
+        if (udpHandleRxMetadata(ip_view, l4_checksum_valid)) |udp_view| {
             dispatchUdpSocketDatagram(udp_view);
             if ((udp_view.dest_port == dhcp.CLIENT_PORT or udp_view.source_port == dhcp.SERVER_PORT) and !udpSocketPortBound(udp_view.dest_port)) _ = dhcpHandleMessage(udp_view.payload);
             if ((udp_view.dest_port == dns.PORT or udp_view.source_port == dns.PORT) and !udpSocketPortBound(udp_view.dest_port)) _ = dnsHandleResponse(udp_view.payload);
         }
-        tcpHandleRx(ip_view);
+        tcpHandleRxMetadata(ip_view, l4_checksum_valid);
         if (icmpIsEchoRequest(ip_view.payload)) sendIcmpEchoReply(adapter_index, frame, ip_view);
         adapters[adapter_index].stats.rx_packets += 1;
         adapters[adapter_index].stats.rx_bytes += frame.len;
@@ -1876,7 +2017,7 @@ fn processOneRxHandoff() bool {
 
     const process_start_ns = time_core.monotonicNanoseconds() orelse 0;
     rx_processing_depth +%= 1;
-    const protocol_ok = processReceivedFrame(claim.adapter_index, frame);
+    const protocol_ok = processReceivedFrame(claim.adapter_index, frame, claim.metadata);
     rx_processing_depth -= 1;
 
     const finish_flags = rxEnterCritical();
@@ -2745,6 +2886,10 @@ fn udpBuildDatagram(out: []u8, source_ip: [4]u8, dest_ip: [4]u8, source_port: u1
 }
 
 fn udpHandleRx(ip_view: ipv4.PacketView) ?udp.DatagramView {
+    return udpHandleRxMetadata(ip_view, false);
+}
+
+fn udpHandleRxMetadata(ip_view: ipv4.PacketView, l4_checksum_valid: bool) ?udp.DatagramView {
     if (ip_view.protocol != udp.IPV4_PROTOCOL) return null;
     var op = newUdpOp() orelse {
         udp_dispatch_failures += 1;
@@ -2753,7 +2898,8 @@ fn udpHandleRx(ip_view: ipv4.PacketView) ?udp.DatagramView {
     };
     op.source_ip = ip_view.source_ip;
     op.dest_ip = ip_view.dest_ip;
-    if (!setUdpDatagram(&op, ip_view.payload) or !udpDispatch(r4p_contract.UDP_OP_HANDLE_RX, &op)) {
+    const buffer_flags: u32 = if (l4_checksum_valid) backend_contract.protocol_buffer_flag_rx_l4_checksum_valid else 0;
+    if (!setUdpDatagram(&op, ip_view.payload) or !udpDispatchFlags(r4p_contract.UDP_OP_HANDLE_RX, &op, buffer_flags)) {
         udp_stats.last_error = "r4p-dispatch";
         return null;
     }
@@ -2795,11 +2941,15 @@ fn setUdpDatagram(op: *r4p_contract.UdpOp, datagram: []const u8) bool {
 }
 
 fn udpDispatch(opcode: u32, op: *r4p_contract.UdpOp) bool {
+    return udpDispatchFlags(opcode, op, 0);
+}
+
+fn udpDispatchFlags(opcode: u32, op: *r4p_contract.UdpOp, flags: u32) bool {
     var buffer = protocol_api.ProtocolBuffer{
         .data = @ptrCast(op),
         .len = @sizeOf(r4p_contract.UdpOp),
         .capacity = @sizeOf(r4p_contract.UdpOp),
-        .flags = 0,
+        .flags = flags,
         .reserved = 0,
     };
     const result = r4p.dispatch("net.udp", opcode, &buffer, &buffer);
@@ -3483,6 +3633,10 @@ fn applyDnsRxResult(op: r4p_contract.DnsOp) void {
 }
 
 fn tcpHandleRx(ip_view: ipv4.PacketView) void {
+    tcpHandleRxMetadata(ip_view, false);
+}
+
+fn tcpHandleRxMetadata(ip_view: ipv4.PacketView, l4_checksum_valid: bool) void {
     if (ip_view.protocol != tcp.IPV4_PROTOCOL) return;
     var op = newTcpOp() orelse {
         tcp_dispatch_failures += 1;
@@ -3491,7 +3645,8 @@ fn tcpHandleRx(ip_view: ipv4.PacketView) void {
     };
     op.source_ip = ip_view.source_ip;
     op.dest_ip = ip_view.dest_ip;
-    if (!setTcpSegment(&op, ip_view.payload) or !tcpDispatch(r4p_contract.TCP_OP_HANDLE_RX, &op)) {
+    const buffer_flags: u32 = if (l4_checksum_valid) backend_contract.protocol_buffer_flag_rx_l4_checksum_valid else 0;
+    if (!setTcpSegment(&op, ip_view.payload) or !tcpDispatchFlags(r4p_contract.TCP_OP_HANDLE_RX, &op, buffer_flags)) {
         tcp_last_error = "r4p-dispatch";
         return;
     }
@@ -3623,11 +3778,15 @@ fn setTcpSegment(op: *r4p_contract.TcpOp, segment: []const u8) bool {
 }
 
 fn tcpDispatch(opcode: u32, op: *r4p_contract.TcpOp) bool {
+    return tcpDispatchFlags(opcode, op, 0);
+}
+
+fn tcpDispatchFlags(opcode: u32, op: *r4p_contract.TcpOp, flags: u32) bool {
     var buffer = protocol_api.ProtocolBuffer{
         .data = @ptrCast(op),
         .len = @sizeOf(r4p_contract.TcpOp),
         .capacity = @sizeOf(r4p_contract.TcpOp),
-        .flags = 0,
+        .flags = flags,
         .reserved = 0,
     };
     const result = r4p.dispatch("net.tcp", opcode, &buffer, &buffer);
@@ -4998,6 +5157,11 @@ pub const RxTaskSummary = struct {
     schedule_latency_max_ns: u64 = 0,
     irq_frame_rejects: u64 = 0,
     release_failures: u64 = 0,
+    metadata_submissions: u64 = 0,
+    metadata_selected: u64 = 0,
+    metadata_fallbacks: u64 = 0,
+    l4_offload_used: u64 = 0,
+    l4_software_checks: u64 = 0,
     ownership_balanced: bool = false,
 };
 
@@ -5037,6 +5201,11 @@ pub fn rxTaskSummary() RxTaskSummary {
         .schedule_latency_max_ns = rx_schedule_latency_max_ns,
         .irq_frame_rejects = rx_irq_frame_rejects,
         .release_failures = rx_release_failures,
+        .metadata_submissions = rx_metadata_submissions,
+        .metadata_selected = rx_metadata_selected,
+        .metadata_fallbacks = rx_metadata_fallbacks,
+        .l4_offload_used = rx_l4_offload_used,
+        .l4_software_checks = rx_l4_software_checks,
         .ownership_balanced = rx_handoff_queue.accepted ==
             rx_handoff_queue.released + rx_handoff_queue.cancelled + occupied,
     };
@@ -5269,6 +5438,14 @@ fn logRxTaskStatus() void {
     k.putDec(handoff.irq_frame_rejects);
     k.puts(" balanced=");
     k.puts(if (handoff.ownership_balanced) "yes" else "no");
+    k.puts(" offload=");
+    k.putDec(handoff.l4_offload_used);
+    k.puts("/");
+    k.putDec(handoff.metadata_selected);
+    k.puts("/");
+    k.putDec(handoff.metadata_fallbacks);
+    k.puts(" software=");
+    k.putDec(handoff.l4_software_checks);
     k.puts(" polls=");
     k.putDec(handoff.polls);
     k.puts(" skips=");
@@ -5312,6 +5489,18 @@ fn logRxTaskStatus() void {
             k.putDec(bs.irq_count);
             k.puts("/");
             k.putDec(bs.irq_handled);
+            if (bs.offered_capabilities != 0) {
+                k.puts(" nic_caps=");
+                k.putHex(bs.accepted_capabilities, 16);
+                k.puts("/");
+                k.putHex(bs.offered_capabilities, 16);
+                k.puts(" nic_offload=");
+                k.putDec(bs.rx_offload_packets);
+                k.puts("/");
+                k.putDec(bs.rx_software_fallbacks);
+                k.puts("/");
+                k.putDec(bs.rx_metadata_errors);
+            }
         }
     }
     k.puts("\r\n");

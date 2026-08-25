@@ -79,6 +79,12 @@ latency; the timer remains a routing watchdog. Accepted, processed, cancelled
 and occupied ownership plus queue, batch and tail-latency counters are exposed
 through the NETRX diagnostic snapshot.
 
+NetBackend v2 and DriverApi v24 negotiate queue count, ownership, segments,
+checksum, VLAN/segmentation, moderation and completion metadata without
+changing the v1 prefix. The BSP implementation selects one queue and only
+validated RX TCP/UDP checksums. Every metadata packet still carries canonical
+flat bytes; unknown or rejected fields take the byte-identical software path.
+
 File-backed R4M0 relocation tables are streamed in record-aligned 4,080-byte
 windows while preserving record and error order. Installed disk R4P modules
 are catalogued from header and metadata only; their complete image,

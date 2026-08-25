@@ -7,12 +7,18 @@ const SlotState = enum(u8) {
     processing,
 };
 
+pub const Metadata = struct {
+    l4_checksum_valid: bool = false,
+    software_fallback: bool = false,
+};
+
 const Slot = struct {
     state: SlotState = .free,
     generation: u32 = 0,
     adapter_index: usize = 0,
     len: u16 = 0,
     enqueued_ns: u64 = 0,
+    metadata: Metadata = .{},
     data: [max_frame_bytes]u8 = .{0} ** max_frame_bytes,
 };
 
@@ -28,6 +34,7 @@ pub const Claim = struct {
     adapter_index: usize,
     len: u16,
     enqueued_ns: u64,
+    metadata: Metadata,
 };
 
 /// Fixed-capacity ownership queue for the NIC-to-protocol handoff.
@@ -57,6 +64,10 @@ pub const Queue = struct {
     }
 
     pub fn enqueue(self: *Queue, adapter_index: usize, frame_bytes: []const u8, enqueued_ns: u64) EnqueueResult {
+        return self.enqueueWithMetadata(adapter_index, frame_bytes, enqueued_ns, .{});
+    }
+
+    pub fn enqueueWithMetadata(self: *Queue, adapter_index: usize, frame_bytes: []const u8, enqueued_ns: u64, metadata: Metadata) EnqueueResult {
         if (frame_bytes.len == 0 or frame_bytes.len > max_frame_bytes) return .invalid_frame;
         if (self.free_count == 0) {
             self.busy +%= 1;
@@ -71,6 +82,7 @@ pub const Queue = struct {
         slot.adapter_index = adapter_index;
         slot.len = @intCast(frame_bytes.len);
         slot.enqueued_ns = enqueued_ns;
+        slot.metadata = metadata;
         @memcpy(slot.data[0..frame_bytes.len], frame_bytes);
         slot.state = .queued;
 
@@ -98,6 +110,7 @@ pub const Queue = struct {
             .adapter_index = slot.adapter_index,
             .len = slot.len,
             .enqueued_ns = slot.enqueued_ns,
+            .metadata = slot.metadata,
         };
     }
 
@@ -118,6 +131,7 @@ pub const Queue = struct {
         slot.adapter_index = 0;
         slot.len = 0;
         slot.enqueued_ns = 0;
+        slot.metadata = .{};
         self.free_slots[self.free_count] = @intCast(slot_index);
         self.free_count += 1;
         self.released +%= 1;
@@ -152,6 +166,7 @@ pub const Queue = struct {
             slot.adapter_index = 0;
             slot.len = 0;
             slot.enqueued_ns = 0;
+            slot.metadata = .{};
         }
         for (&self.free_slots, 0..) |*slot, index| slot.* = @intCast(index);
     }
@@ -162,11 +177,13 @@ test "RX handoff preserves FIFO bytes and exactly-once release" {
     var queue: Queue = .{};
     queue.reset();
 
-    try std.testing.expectEqual(EnqueueResult.accepted, queue.enqueue(2, &.{ 1, 2, 3 }, 11));
+    try std.testing.expectEqual(EnqueueResult.accepted, queue.enqueueWithMetadata(2, &.{ 1, 2, 3 }, 11, .{ .l4_checksum_valid = true }));
     try std.testing.expectEqual(EnqueueResult.accepted, queue.enqueue(4, &.{ 9, 8 }, 12));
 
     const first = queue.claim().?;
     try std.testing.expectEqual(@as(usize, 2), first.adapter_index);
+    try std.testing.expect(first.metadata.l4_checksum_valid);
+    try std.testing.expect(!first.metadata.software_fallback);
     try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, queue.frame(first).?);
     try std.testing.expect(queue.release(first));
     try std.testing.expect(!queue.release(first));

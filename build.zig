@@ -195,6 +195,7 @@ pub fn build(b: *std.Build) void {
         "kernel/driver_work_deadline.zig",
         "kernel/driver_work_queue.zig",
         "kernel/service_ipc_queue.zig",
+        "net/backend_contract.zig",
         "net/config_writer.zig",
         "net/rx_handoff.zig",
         "net/serial_link_runtime.zig",
