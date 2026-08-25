@@ -93,6 +93,32 @@ Backend oder kompatibles Zielformat oder meldet der Callback einen Fehler,
 kopiert der Kernel dieselbe komplette Generation ueber bootfb-cpu. Nur der
 DisplayManager fuehrt Presentstatistik, Generation und abgeschlossenen Fence.
 
+Begrenzter Netzwerk-RX-Handoff seit 0.69.49
+--------------------------------------------
+
+DriverApi v23 ergaenzt einen IRQ-sicheren adapterbezogenen RX-Arbeitsweckruf.
+RTL8139, RTL8168 und VirtioNet quittieren und klassifizieren im externen IRQ
+nur noch eine feste Menge geraetespezifischen Zustands. Ringcursor,
+Framekopie, R4P-Dispatch, Antworten und Waiter-Wakeups bleiben ausserhalb des
+IRQ im `net-rx`-Task. Reine TX-, Link- oder Konfigurationsursachen starten
+keinen kompletten RX-Pfad.
+
+Netcore kopiert angenommene Frames in eine feste Besitzqueue mit 64 Slots zu
+je hoechstens 1536 Bytes. Ein Slot bleibt auch waehrend begrenzter
+verschachtelter Protokollprogression belegt und wird nach Erfolg oder
+klassifiziertem Protokollfehler genau einmal freigegeben. Bei voller Queue
+meldet die Aufnahme Backpressure; der Treiber behaelt seinen exakten
+Deskriptor beziehungsweise Ringkopf und weckt erneut. Explizite Backend- oder
+Systemtransitionen duerfen Queuebesitz erst nach dem Drain aller Callbacks
+abbrechen.
+
+Eine Aktivierung verarbeitet hoechstens 32 Protokollframes. IRQ-Arbeit und
+der Uebergang der gemeinsamen Queue von leer auf belegt signalisieren dasselbe
+Event; der 10-ms-Poll bleibt ausschliesslich als Watchdog fuer fehlendes oder
+unbrauchbares Routing. NETRX weist Wakeup-/Fallbackzahlen, Queuebelegung und
+High-Water, Backpressure, Batchbudgetenden, Schedule- und Handoff-Tail sowie
+die Gleichung angenommen = verarbeitet + abgebrochen + belegt aus.
+
 Bedarfsgeladener R4M0- und R4P-Pfad seit 0.69.44
 ------------------------------------------------
 
@@ -192,6 +218,14 @@ Boottask; er bleibt weder lauffaehig noch in der Rotation. Erst der erste
 gueltige `boot_ready`-Aufruf friert die Messung ein, beendet den Bootrenderer
 ohne den bereits sichtbaren ersten Frame zu uebermalen und gibt die
 Benutzersitzung frei.
+
+Synthetische Kernelthread-Kontexte bilden dabei auch ohne echten `call` den
+SysV-x86_64-Funktionseintritt exakt nach. Nach sechs Register-Restores und dem
+`ret` des Context-Switches sieht der gemeinsame Trampolin RSP modulo 16 gleich
+8. Ein reserviertes Wort unterhalb des ausgerichteten Stackendes stellt diese
+Form her; ein eigener Layouttest haelt Assembly-Restoreframe und Zig-Aufbau
+zusammen. Damit duerfen bedarfsgeladene Module in Kernelworkern ausgerichtete
+SIMD-Stackzugriffe verwenden.
 
 R4DEV `performance_boot_summary` liest dafuer nur den kleinen festen
 Bootdatensatz; breite Subsystem-Summaries oder aktive Diagnoseprobes gehoeren

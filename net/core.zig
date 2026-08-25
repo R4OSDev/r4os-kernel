@@ -12,9 +12,11 @@ const tcp = @import("tcp.zig");
 const tcp_runtime = @import("tcp_runtime.zig");
 const serial_link = @import("serial_link.zig");
 const timing = @import("timing.zig");
+const rx_handoff = @import("rx_handoff.zig");
 const boot_config = @import("../kernel/boot_config.zig");
 const ipc = @import("../kernel/ipc.zig");
 const bootlog = @import("../kernel/bootlog.zig");
+const irq_router = @import("../kernel/irq_router.zig");
 const protocol_api = @import("../kernel/protocol_api.zig");
 const protocol_registry = @import("../protocol/registry.zig");
 const r4p = @import("../program/r4p.zig");
@@ -30,6 +32,8 @@ const k = @import("../kernel/log.zig");
 
 pub const MAX_ADAPTERS: usize = 8;
 pub const MAX_PACKET_SIZE: usize = 1536;
+pub const RX_HANDOFF_QUEUE_SIZE: usize = rx_handoff.capacity;
+pub const RX_HANDOFF_BATCH_BUDGET: usize = 32;
 pub const PACKET_POOL_SIZE: usize = 16;
 pub const APP_IPV4_QUEUE_SIZE: usize = 64;
 pub const APP_IPV4_PAYLOAD_MAX: usize = MAX_PACKET_SIZE;
@@ -88,6 +92,15 @@ pub const TcpSummary = r4x_api.TcpSummary;
 pub const TcpConnectionInfo = r4x_api.TcpConnectionInfo;
 pub const TCP_BUFFER_SIZE: usize = tcp.BUFFER_SIZE;
 pub const TimingStatus = timing.Status;
+
+pub const RxAdmission = enum {
+    accepted,
+    invalid_adapter,
+    invalid_frame,
+    unavailable,
+    queue_busy,
+    irq_context,
+};
 
 pub const ProtocolKind = enum {
     ethernet,
@@ -498,6 +511,34 @@ var packet_pool: [PACKET_POOL_SIZE]Packet = .{Packet{}} ** PACKET_POOL_SIZE;
 var packet_used: [PACKET_POOL_SIZE]bool = .{false} ** PACKET_POOL_SIZE;
 var packet_drops: u64 = 0;
 var buffer_small_events: u64 = 0;
+var rx_handoff_queue: rx_handoff.Queue = .{};
+var rx_work_event = sync.EventV2.initMode(false, .auto_reset);
+var rx_schedule_mask: u16 = 0;
+var rx_schedule_stamps: [MAX_ADAPTERS]time_core.MonotonicStamp =
+    .{time_core.MonotonicStamp{}} ** MAX_ADAPTERS;
+var rx_schedule_calls: u64 = 0;
+var rx_schedule_from_irq: u64 = 0;
+var rx_schedule_coalesced: u64 = 0;
+var rx_schedule_invalid: u64 = 0;
+var rx_event_wakeups: u64 = 0;
+var rx_event_timeouts: u64 = 0;
+var rx_protocol_success: u64 = 0;
+var rx_protocol_failures: u64 = 0;
+var rx_processing_depth: u8 = 0;
+var rx_release_failures: u64 = 0;
+var rx_batches: u64 = 0;
+var rx_batch_max: u32 = 0;
+var rx_budget_exhaustions: u64 = 0;
+var rx_handoff_latency_samples: u64 = 0;
+var rx_handoff_latency_total_ns: u64 = 0;
+var rx_handoff_latency_last_ns: u64 = 0;
+var rx_handoff_latency_max_ns: u64 = 0;
+var rx_schedule_latency_samples: u64 = 0;
+var rx_schedule_latency_total_ns: u64 = 0;
+var rx_schedule_latency_last_ns: u64 = 0;
+var rx_schedule_latency_max_ns: u64 = 0;
+var rx_latency_unavailable: u64 = 0;
+var rx_irq_frame_rejects: u64 = 0;
 var diag_lifecycle_link_up: bool = true;
 var app_ipv4_queues: [APP_IPV4_BUCKET_COUNT]AppIpv4Queue = .{AppIpv4Queue{}} ** APP_IPV4_BUCKET_COUNT;
 var app_ipv4_next_seq: u64 = 1;
@@ -599,6 +640,33 @@ pub fn init() void {
     packet_used = .{false} ** PACKET_POOL_SIZE;
     packet_drops = 0;
     buffer_small_events = 0;
+    rx_handoff_queue.reset();
+    rx_work_event = sync.EventV2.initMode(false, .auto_reset);
+    rx_schedule_mask = 0;
+    rx_schedule_stamps = .{time_core.MonotonicStamp{}} ** MAX_ADAPTERS;
+    rx_schedule_calls = 0;
+    rx_schedule_from_irq = 0;
+    rx_schedule_coalesced = 0;
+    rx_schedule_invalid = 0;
+    rx_event_wakeups = 0;
+    rx_event_timeouts = 0;
+    rx_protocol_success = 0;
+    rx_protocol_failures = 0;
+    rx_processing_depth = 0;
+    rx_release_failures = 0;
+    rx_batches = 0;
+    rx_batch_max = 0;
+    rx_budget_exhaustions = 0;
+    rx_handoff_latency_samples = 0;
+    rx_handoff_latency_total_ns = 0;
+    rx_handoff_latency_last_ns = 0;
+    rx_handoff_latency_max_ns = 0;
+    rx_schedule_latency_samples = 0;
+    rx_schedule_latency_total_ns = 0;
+    rx_schedule_latency_last_ns = 0;
+    rx_schedule_latency_max_ns = 0;
+    rx_latency_unavailable = 0;
+    rx_irq_frame_rejects = 0;
     app_ipv4_queues = .{AppIpv4Queue{}} ** APP_IPV4_BUCKET_COUNT;
     app_ipv4_next_seq = 1;
     ethernet.reset(&eth_stats);
@@ -820,6 +888,7 @@ pub fn beginSystemTransition(reason: []const u8) bool {
     // that publication, then drain every callback admitted in the tiny gap.
     _ = @atomicRmw(bool, &backend_admission_closed, .Xchg, true, .acq_rel);
     if (!drainBackendCallbacks("system-transition")) return false;
+    _ = cancelRxHandoffQueue();
     _ = cleanupNetworkOperations(reason);
     var index: usize = 0;
     while (index < adapter_count) : (index += 1) setAdapterLifecycle(index, .shutdown);
@@ -843,7 +912,10 @@ pub fn beginBackendMutation() bool {
         endBackendMutation();
         return false;
     }
-    if (drainBackendCallbacks("backend-mutation")) return true;
+    if (drainBackendCallbacks("backend-mutation")) {
+        _ = cancelRxHandoffQueue();
+        return true;
+    }
     endBackendMutation();
     return false;
 }
@@ -1311,6 +1383,59 @@ pub fn driverLifecycleStatus() DriverLifecycleStatus {
     };
 }
 
+pub fn runRxHandoffProbe() bool {
+    const status = rxTaskSummary();
+    const ok = status.started and
+        status.queue_capacity == RX_HANDOFF_QUEUE_SIZE and
+        status.queue_high_water <= status.queue_capacity and
+        status.batch_max <= RX_HANDOFF_BATCH_BUDGET and
+        status.processed == status.protocol_success + status.protocol_failures and
+        status.schedules_from_irq <= status.schedules and
+        status.release_failures == 0 and
+        status.irq_frame_rejects == 0 and
+        status.ownership_balanced;
+
+    k.puts("NETRX handoff-probe result=");
+    k.puts(if (ok) "OK" else "FAILED");
+    k.puts(" accepted=");
+    k.putDec(status.accepted);
+    k.puts(" processed=");
+    k.putDec(status.processed);
+    k.puts(" cancelled=");
+    k.putDec(status.cancelled);
+    k.puts(" queue=");
+    k.putDec(status.queue_ready);
+    k.puts("/");
+    k.putDec(status.queue_occupied);
+    k.puts("/");
+    k.putDec(status.queue_high_water);
+    k.puts(" busy=");
+    k.putDec(status.queue_busy);
+    k.puts(" irq-wake=");
+    k.putDec(status.schedules_from_irq);
+    k.puts(" event=");
+    k.putDec(status.event_wakeups);
+    k.puts(" fallback=");
+    k.putDec(status.fallback_timeouts);
+    k.puts(" batch-max=");
+    k.putDec(status.batch_max);
+    k.puts(" budget-end=");
+    k.putDec(status.budget_exhaustions);
+    k.puts(" schedule-tail-ns=");
+    k.putDec(status.schedule_latency_max_ns);
+    k.puts(" handoff-tail-ns=");
+    k.putDec(status.handoff_latency_max_ns);
+    k.puts(" irq-inline=");
+    k.putDec(status.irq_frame_rejects);
+    k.puts("\r\n");
+
+    if (ok) {
+        driver_lifecycle_tests +%= 1;
+        driver_lifecycle_cases +%= 8;
+    }
+    return ok;
+}
+
 pub fn diagnosticCountersStatus() DiagnosticCountersStatus {
     return .{
         .packet_corpus_tests = packet_corpus_tests,
@@ -1591,9 +1716,84 @@ const NET_LOSS_EVERY_N: u64 = 64;
 var net_loss_counter: u64 = 0;
 var net_loss_drops: u64 = 0;
 
-pub fn receiveFrame(adapter_index: usize, frame: []const u8) bool {
+fn rxEnterCritical() u64 {
+    const irq_flags = interrupts.saveAndDisable();
+    scheduler.preemptDisable();
+    return irq_flags;
+}
+
+fn rxLeaveCritical(irq_flags: u64) void {
+    scheduler.preemptEnable();
+    interrupts.restore(irq_flags);
+}
+
+/// Announces device-owned RX work without touching a packet buffer. This is
+/// the only network operation intended for an R4D IRQ handler: the handler
+/// acknowledges its cause, records one adapter bit and wakes `net-rx`.
+pub fn scheduleRxWork(adapter_index: usize) bool {
     if (!enterBackendCallback()) return false;
     defer leaveBackendCallback();
+    if (adapter_index >= adapter_count) {
+        const irq_flags = rxEnterCritical();
+        rx_schedule_invalid +%= 1;
+        rxLeaveCritical(irq_flags);
+        return false;
+    }
+
+    const stamp = time_core.monotonicCapture();
+    const bit = @as(u16, 1) << @intCast(adapter_index);
+    var should_signal = false;
+    const irq_flags = rxEnterCritical();
+    rx_schedule_calls +%= 1;
+    if (irq_router.inDispatch()) rx_schedule_from_irq +%= 1;
+    if ((rx_schedule_mask & bit) != 0) {
+        rx_schedule_coalesced +%= 1;
+    } else {
+        rx_schedule_mask |= bit;
+        rx_schedule_stamps[adapter_index] = stamp;
+        should_signal = true;
+    }
+    rxLeaveCritical(irq_flags);
+    if (should_signal) rx_work_event.signal();
+    return true;
+}
+
+/// Copies a driver-owned frame into the bounded common queue. Protocol work
+/// never runs here. IRQ callers are rejected so the device descriptor can be
+/// retained and retried by the task-side poll instead of entering R4P, socket
+/// wakeups or reply transmission from an external interrupt.
+pub fn receiveFrame(adapter_index: usize, frame: []const u8) RxAdmission {
+    if (irq_router.inDispatch()) {
+        const irq_flags = rxEnterCritical();
+        rx_irq_frame_rejects +%= 1;
+        rxLeaveCritical(irq_flags);
+        return .irq_context;
+    }
+    if (frame.len == 0 or frame.len > MAX_PACKET_SIZE) return .invalid_frame;
+    if (!enterBackendCallback()) return .unavailable;
+    defer leaveBackendCallback();
+    if (adapter_index >= adapter_count) return .invalid_adapter;
+
+    const enqueued_ns = time_core.monotonicNanoseconds() orelse 0;
+    var should_signal = false;
+    const irq_flags = rxEnterCritical();
+    const was_empty = rx_handoff_queue.queuedCount() == 0;
+    const result = rx_handoff_queue.enqueue(adapter_index, frame, enqueued_ns);
+    switch (result) {
+        .accepted => should_signal = was_empty,
+        .busy => should_signal = true,
+        .invalid_frame => {},
+    }
+    rxLeaveCritical(irq_flags);
+    if (should_signal) rx_work_event.signal();
+    return switch (result) {
+        .accepted => .accepted,
+        .invalid_frame => .invalid_frame,
+        .busy => .queue_busy,
+    };
+}
+
+fn processReceivedFrame(adapter_index: usize, frame: []const u8) bool {
     if (adapter_index >= adapter_count) return false;
     if (comptime kernel_config.enable_net_loss_test) {
         net_loss_counter +%= 1;
@@ -1653,6 +1853,125 @@ pub fn receiveFrame(adapter_index: usize, frame: []const u8) bool {
     adapters[adapter_index].stats.rx_packets += 1;
     adapters[adapter_index].stats.rx_bytes += frame.len;
     return true;
+}
+
+fn processOneRxHandoff() bool {
+    // The callback reference prevents an adapter removal from reindexing the
+    // claimed frame while protocol code runs or yields.
+    if (!enterBackendCallback()) return false;
+    defer leaveBackendCallback();
+
+    const irq_flags = rxEnterCritical();
+    const claim = rx_handoff_queue.claim() orelse {
+        rxLeaveCritical(irq_flags);
+        return false;
+    };
+    const frame = rx_handoff_queue.frame(claim) orelse {
+        rx_release_failures +%= 1;
+        _ = rx_handoff_queue.release(claim);
+        rxLeaveCritical(irq_flags);
+        return false;
+    };
+    rxLeaveCritical(irq_flags);
+
+    const process_start_ns = time_core.monotonicNanoseconds() orelse 0;
+    rx_processing_depth +%= 1;
+    const protocol_ok = processReceivedFrame(claim.adapter_index, frame);
+    rx_processing_depth -= 1;
+
+    const finish_flags = rxEnterCritical();
+    if (protocol_ok) {
+        rx_protocol_success +%= 1;
+    } else {
+        rx_protocol_failures +%= 1;
+    }
+    if (!rx_handoff_queue.release(claim)) rx_release_failures +%= 1;
+    if (claim.enqueued_ns != 0 and process_start_ns >= claim.enqueued_ns) {
+        const latency = process_start_ns - claim.enqueued_ns;
+        rx_handoff_latency_samples +%= 1;
+        rx_handoff_latency_total_ns +%= latency;
+        rx_handoff_latency_last_ns = latency;
+        if (latency > rx_handoff_latency_max_ns) rx_handoff_latency_max_ns = latency;
+    } else {
+        rx_latency_unavailable +%= 1;
+    }
+    rxLeaveCritical(finish_flags);
+    return true;
+}
+
+fn processRxHandoffBatch(budget: usize) usize {
+    if (budget == 0) return 0;
+    var processed: usize = 0;
+    while (processed < budget and processOneRxHandoff()) : (processed += 1) {}
+    if (processed == 0) return 0;
+
+    const irq_flags = rxEnterCritical();
+    rx_batches +%= 1;
+    if (processed > rx_batch_max) rx_batch_max = @intCast(processed);
+    if (processed == budget and rx_handoff_queue.queuedCount() != 0) rx_budget_exhaustions +%= 1;
+    rxLeaveCritical(irq_flags);
+    return processed;
+}
+
+fn rxHandoffHasReadyWork() bool {
+    const irq_flags = rxEnterCritical();
+    const ready = rx_handoff_queue.queuedCount() != 0;
+    rxLeaveCritical(irq_flags);
+    return ready;
+}
+
+fn takeScheduledAdapters() u16 {
+    var stamps: [MAX_ADAPTERS]time_core.MonotonicStamp =
+        .{time_core.MonotonicStamp{}} ** MAX_ADAPTERS;
+    const irq_flags = rxEnterCritical();
+    const mask = rx_schedule_mask;
+    rx_schedule_mask = 0;
+    var index: usize = 0;
+    while (index < MAX_ADAPTERS) : (index += 1) {
+        const bit = @as(u16, 1) << @intCast(index);
+        if ((mask & bit) == 0) continue;
+        stamps[index] = rx_schedule_stamps[index];
+        rx_schedule_stamps[index] = .{};
+    }
+    rxLeaveCritical(irq_flags);
+
+    var samples: u64 = 0;
+    var total_ns: u64 = 0;
+    var last_ns: u64 = 0;
+    var max_ns: u64 = 0;
+    var unavailable: u64 = 0;
+    index = 0;
+    while (index < MAX_ADAPTERS) : (index += 1) {
+        const bit = @as(u16, 1) << @intCast(index);
+        if ((mask & bit) == 0) continue;
+        const latency = time_core.monotonicElapsedSince(stamps[index]) orelse {
+            unavailable += 1;
+            continue;
+        };
+        samples += 1;
+        total_ns +%= latency;
+        last_ns = latency;
+        if (latency > max_ns) max_ns = latency;
+    }
+    if (samples != 0 or unavailable != 0) {
+        const metric_flags = rxEnterCritical();
+        rx_schedule_latency_samples +%= samples;
+        rx_schedule_latency_total_ns +%= total_ns;
+        rx_schedule_latency_last_ns = last_ns;
+        if (max_ns > rx_schedule_latency_max_ns) rx_schedule_latency_max_ns = max_ns;
+        rx_latency_unavailable +%= unavailable;
+        rxLeaveCritical(metric_flags);
+    }
+    return mask;
+}
+
+fn cancelRxHandoffQueue() usize {
+    const irq_flags = rxEnterCritical();
+    const cancelled = rx_handoff_queue.cancelAll();
+    rx_schedule_mask = 0;
+    rx_schedule_stamps = .{time_core.MonotonicStamp{}} ** MAX_ADAPTERS;
+    rxLeaveCritical(irq_flags);
+    return cancelled;
 }
 
 pub fn transmit(adapter_index: usize, frame: []const u8) TxResult {
@@ -4567,23 +4886,27 @@ pub fn runR4pRuntimeProbe() bool {
     return status.dispatch_failures == dispatch_failures;
 }
 
-// 0.56.2: Reentrancy-Guard - der RX-Pfad (receiveFrame -> R4P-Dispatch)
-// kann yielden; ohne Guard laufen konkurrierende Task-Polls in denselben
-// NIC-RX-Ring. Ein Drainer-TASK zur Zeit; fremde Tasks ueberspringen.
-// WICHTIG: Der SELBE Task darf verschachtelt weiterpollen - RX-Handler
-// senden Antworten (SYN-ACK/ARP) und laufen dabei erneut durch
-// pollAdapters; ein Selbst-Skip liesse den ARP-Resolve im RX-Kontext
-// verhungern (0.56.2-Lauf-Befund).
+// Exactly one task may move a device RX cursor. Drivers now only copy into the
+// common queue; R4P and socket wakeups are run later by net-rx. A protocol
+// handler may still poll recursively while resolving ARP. In that case one
+// queued frame is processed from another ownership slot, preserving the old
+// forward-progress guarantee without reusing the outer frame buffer.
 var net_poll_gate = sync.UnwindGuard.init("net-poll");
 var net_poll_skips: u64 = 0;
 var net_poll_nested: u64 = 0;
+const RX_NESTED_PROCESS_LIMIT: u8 = 4;
+const ALL_ADAPTER_MASK: u16 = (@as(u16, 1) << MAX_ADAPTERS) - 1;
 
 pub fn pollAdapters(rounds: usize) void {
+    pollAdapterMask(rounds, ALL_ADAPTER_MASK);
+}
+
+fn pollAdapterMask(rounds: usize, adapter_mask: u16) void {
     if (!enterBackendCallback()) return;
     defer leaveBackendCallback();
     if (scheduler.current() == null) {
         // Before scheduler start there is no concurrent task context.
-        pollAdaptersInner(rounds);
+        pollAdaptersInner(rounds, adapter_mask);
         return;
     }
 
@@ -4594,10 +4917,18 @@ pub fn pollAdapters(rounds: usize) void {
     }
     if (nested) net_poll_nested +%= 1;
     defer _ = net_poll_gate.leave();
-    pollAdaptersInner(rounds);
+    pollAdaptersInner(rounds, adapter_mask);
+
+    // An ARP/DHCP/TCP wait entered from protocol RX cannot wait for its own
+    // outer activation. Consume one different ready slot, with a hard depth
+    // bound, so nested progress stays finite and the top-level batch remains
+    // the normal execution path.
+    if (rx_processing_depth != 0 and rx_processing_depth < RX_NESTED_PROCESS_LIMIT and isRxTaskCurrent()) {
+        _ = processRxHandoffBatch(1);
+    }
 }
 
-fn pollAdaptersInner(rounds: usize) void {
+fn pollAdaptersInner(rounds: usize, adapter_mask: u16) void {
     // 0.56.2: rounds wird bewusst auf EINE Runde gedeckelt. Ein einzelner
     // poll() drained den kompletten NIC-Ring (drainRx-Budget); die
     // historischen Mehrfach-Runden (bis 32768) erzeugten nur zigtausende
@@ -4608,8 +4939,15 @@ fn pollAdaptersInner(rounds: usize) void {
     _ = rounds;
     var index: usize = 0;
     while (index < adapter_count) : (index += 1) {
+        const bit = @as(u16, 1) << @intCast(index);
+        if ((adapter_mask & bit) == 0) continue;
         if (adapters[index].ops.poll) |poll| poll(index);
     }
+}
+
+fn isRxTaskCurrent() bool {
+    const current = scheduler.current() orelse return false;
+    return current.id == rx_task_id and current.generation == rx_task_generation;
 }
 
 // 0.56.2: Autonomer Hintergrund-RX-Task. Der heutige Netzstack nimmt
@@ -4617,7 +4955,8 @@ fn pollAdaptersInner(rounds: usize) void {
 // nicht zugestellt, Befund 6.1/0.56.1-Baseline) - ohne diesen Task ist
 // eingehender Verkehr im Idle nichtdeterministisch. Start aus main.zig
 // NACH initTaskRuntime (task.init() wischt fruehere Threads).
-const RX_TASK_POLL_ROUNDS: usize = 4;
+const RX_TASK_POLL_ROUNDS: usize = 1;
+const RX_TASK_FALLBACK_TICKS: u64 = @max(1, timing.msToTicks(10));
 
 var rx_task_started = false;
 var rx_task_id: u32 = 0;
@@ -4633,10 +4972,39 @@ pub const RxTaskSummary = struct {
     iterations: u64 = 0,
     guard_skips: u64 = 0,
     nested_polls: u64 = 0,
+    queue_capacity: u32 = RX_HANDOFF_QUEUE_SIZE,
+    queue_ready: u32 = 0,
+    queue_occupied: u32 = 0,
+    queue_high_water: u32 = 0,
+    accepted: u64 = 0,
+    processed: u64 = 0,
+    cancelled: u64 = 0,
+    queue_busy: u64 = 0,
+    protocol_success: u64 = 0,
+    protocol_failures: u64 = 0,
+    schedules: u64 = 0,
+    schedules_from_irq: u64 = 0,
+    schedule_coalesced: u64 = 0,
+    event_wakeups: u64 = 0,
+    fallback_timeouts: u64 = 0,
+    batches: u64 = 0,
+    batch_max: u32 = 0,
+    budget_exhaustions: u64 = 0,
+    handoff_latency_samples: u64 = 0,
+    handoff_latency_last_ns: u64 = 0,
+    handoff_latency_max_ns: u64 = 0,
+    schedule_latency_samples: u64 = 0,
+    schedule_latency_last_ns: u64 = 0,
+    schedule_latency_max_ns: u64 = 0,
+    irq_frame_rejects: u64 = 0,
+    release_failures: u64 = 0,
+    ownership_balanced: bool = false,
 };
 
 pub fn rxTaskSummary() RxTaskSummary {
-    return .{
+    const irq_flags = rxEnterCritical();
+    const occupied = rx_handoff_queue.occupiedCount();
+    const summary: RxTaskSummary = .{
         .started = rx_task_started,
         .task_id = rx_task_id,
         .task_generation = rx_task_generation,
@@ -4644,7 +5012,36 @@ pub fn rxTaskSummary() RxTaskSummary {
         .iterations = rx_task_iterations,
         .guard_skips = net_poll_skips,
         .nested_polls = net_poll_nested,
+        .queue_ready = @intCast(rx_handoff_queue.queuedCount()),
+        .queue_occupied = @intCast(occupied),
+        .queue_high_water = @intCast(rx_handoff_queue.high_water),
+        .accepted = rx_handoff_queue.accepted,
+        .processed = rx_handoff_queue.released,
+        .cancelled = rx_handoff_queue.cancelled,
+        .queue_busy = rx_handoff_queue.busy,
+        .protocol_success = rx_protocol_success,
+        .protocol_failures = rx_protocol_failures,
+        .schedules = rx_schedule_calls,
+        .schedules_from_irq = rx_schedule_from_irq,
+        .schedule_coalesced = rx_schedule_coalesced,
+        .event_wakeups = rx_event_wakeups,
+        .fallback_timeouts = rx_event_timeouts,
+        .batches = rx_batches,
+        .batch_max = rx_batch_max,
+        .budget_exhaustions = rx_budget_exhaustions,
+        .handoff_latency_samples = rx_handoff_latency_samples,
+        .handoff_latency_last_ns = rx_handoff_latency_last_ns,
+        .handoff_latency_max_ns = rx_handoff_latency_max_ns,
+        .schedule_latency_samples = rx_schedule_latency_samples,
+        .schedule_latency_last_ns = rx_schedule_latency_last_ns,
+        .schedule_latency_max_ns = rx_schedule_latency_max_ns,
+        .irq_frame_rejects = rx_irq_frame_rejects,
+        .release_failures = rx_release_failures,
+        .ownership_balanced = rx_handoff_queue.accepted ==
+            rx_handoff_queue.released + rx_handoff_queue.cancelled + occupied,
     };
+    rxLeaveCritical(irq_flags);
+    return summary;
 }
 
 pub fn startRxTask() bool {
@@ -4659,6 +5056,14 @@ pub fn startRxTask() bool {
     k.puts("NET rx-task started id=");
     k.putDec(worker.id);
     k.puts("\r\n");
+    k.puts("NETRX handoff queue=");
+    k.putDec(RX_HANDOFF_QUEUE_SIZE);
+    k.puts(" batch=");
+    k.putDec(RX_HANDOFF_BATCH_BUDGET);
+    k.puts(" irq-inline=blocked wake=event fallback-ms=10\r\n");
+    var adapter_index: usize = 0;
+    while (adapter_index < adapter_count) : (adapter_index += 1) _ = scheduleRxWork(adapter_index);
+    if (adapter_count == 0) rx_work_event.signal();
     return true;
 }
 
@@ -4779,10 +5184,34 @@ const RX_TASK_LOG_INTERVAL: u64 = 2000;
 
 fn rxTaskMain() callconv(.c) void {
     while (true) {
-        if (adapter_count > 0) {
-            rx_task_polls +%= 1;
-            pollAdapters(RX_TASK_POLL_ROUNDS);
+        const event_wakeup = rx_work_event.wait(RX_TASK_FALLBACK_TICKS);
+        const wake_flags = rxEnterCritical();
+        if (event_wakeup) {
+            rx_event_wakeups +%= 1;
+        } else {
+            rx_event_timeouts +%= 1;
         }
+        rxLeaveCritical(wake_flags);
+
+        const scheduled_mask = takeScheduledAdapters();
+        var processed = processRxHandoffBatch(RX_HANDOFF_BATCH_BUDGET);
+
+        // An IRQ services only the adapters whose RX/recovery cause it
+        // recorded. The 10-ms timeout remains a compatibility watchdog for
+        // devices without usable routing and polls every adapter once.
+        if (adapter_count > 0 and (scheduled_mask != 0 or !event_wakeup or rx_task_iterations == 0)) {
+            rx_task_polls +%= 1;
+            const poll_mask = if (scheduled_mask != 0) scheduled_mask else ALL_ADAPTER_MASK;
+            pollAdapterMask(RX_TASK_POLL_ROUNDS, poll_mask);
+            if (processed < RX_HANDOFF_BATCH_BUDGET) {
+                processed += processRxHandoffBatch(RX_HANDOFF_BATCH_BUDGET - processed);
+            }
+        }
+
+        // A protocol batch is the scheduling boundary. Remaining queue work
+        // gets a fresh activation instead of extending this run without a
+        // bound; EventV2 makes the publication race-free.
+        if (rxHandoffHasReadyWork()) rx_work_event.signal();
         rx_task_iterations +%= 1;
         // TCP-Fristen verwenden ausschliesslich dieselbe monotone Tick-Domain
         // wie ihre Sendestempel. iterations bleibt nur der Log-Zaehler.
@@ -4791,9 +5220,6 @@ fn rxTaskMain() callconv(.c) void {
         proactiveRetransmitSweep(now);
         retryDhcpTaskStartIfDue();
         if (rx_task_iterations % RX_TASK_LOG_INTERVAL == 0) logRxTaskStatus();
-        // 0.56.29: 10 ms Echtzeit-Raster (wie 1 Tick bei 100 Hz); NIC-IRQ
-        // weckt frueher, das hier ist nur der Poll-Fallback.
-        scheduler.sleepTicksWithReason(timing.msToTicks(10), "net-rx-idle");
     }
 }
 
@@ -4808,10 +5234,45 @@ fn logRxTaskStatus() void {
     // NIC -> Kernel-TCP. (Die feingranulare Schicht-5-Instrumentierung
     // aus 0.56.2 - acceptInbound-null-Gruende, SYN-ACK-TxResult - wurde
     // nach dem Fund wieder entfernt.)
-    k.puts("NETRX polls=");
-    k.putDec(rx_task_polls);
+    const handoff = rxTaskSummary();
+    k.puts("NETRX handoff=");
+    k.putDec(handoff.processed);
+    k.puts("/");
+    k.putDec(handoff.accepted);
+    k.puts(" queue=");
+    k.putDec(handoff.queue_ready);
+    k.puts("/");
+    k.putDec(handoff.queue_occupied);
+    k.puts("/");
+    k.putDec(handoff.queue_high_water);
+    k.puts(" busy=");
+    k.putDec(handoff.queue_busy);
+    k.puts(" batch=");
+    k.putDec(handoff.batch_max);
+    k.puts("/");
+    k.putDec(handoff.budget_exhaustions);
+    k.puts(" wake=");
+    k.putDec(handoff.schedules_from_irq);
+    k.puts("/");
+    k.putDec(handoff.event_wakeups);
+    k.puts("/");
+    k.putDec(handoff.fallback_timeouts);
+    k.puts(" latency-ns=");
+    k.putDec(handoff.schedule_latency_last_ns);
+    k.puts("/");
+    k.putDec(handoff.schedule_latency_max_ns);
+    k.puts("+");
+    k.putDec(handoff.handoff_latency_last_ns);
+    k.puts("/");
+    k.putDec(handoff.handoff_latency_max_ns);
+    k.puts(" irq-inline=");
+    k.putDec(handoff.irq_frame_rejects);
+    k.puts(" balanced=");
+    k.puts(if (handoff.ownership_balanced) "yes" else "no");
+    k.puts(" polls=");
+    k.putDec(handoff.polls);
     k.puts(" skips=");
-    k.putDec(net_poll_skips);
+    k.putDec(handoff.guard_skips);
     const t = tcp.getStats();
     k.puts(" tcp_rx=");
     k.putDec(t.rx_segments);

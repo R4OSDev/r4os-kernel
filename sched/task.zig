@@ -5,6 +5,7 @@ const k = @import("../kernel/log.zig");
 const timer = @import("../kernel/timer.zig");
 const fpu = @import("../arch/x86_64/fpu.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
+const initial_stack = @import("initial_stack.zig");
 const task_context = @import("task_context.zig");
 const wait_node = @import("wait_node.zig");
 
@@ -22,7 +23,6 @@ const STACK_SIZE: usize = 64 * 1024;
 // Stack-Frames (>4K, z.B. sendTcpForConnection ~1K, Diag-Puffer) den
 // Guard nicht ueberspringen koennen; uncommitted = kostet nur Adressraum.
 const STACK_GUARD_SIZE: usize = 16 * 1024;
-const SAVED_REG_COUNT: usize = 6;
 const STACK_CACHE_LIMIT: usize = 8;
 const CRITICAL_RESERVE_COUNT: usize = 4;
 const NO_CRITICAL_RESERVE_SLOT: u8 = 0xFF;
@@ -2657,10 +2657,11 @@ pub fn dump() void {
 extern fn taskEntryTrampoline() callconv(.c) noreturn;
 
 fn initialRsp(stack_top: u64) u64 {
-    var sp = stack_top & ~@as(u64, 0xF);
+    const prepared = initial_stack.layout(stack_top);
+    var sp = prepared.entry_rsp;
     sp = push(sp, @intFromPtr(&taskEntryTrampoline));
     var i: usize = 0;
-    while (i < SAVED_REG_COUNT) : (i += 1) {
+    while (i < initial_stack.saved_register_count) : (i += 1) {
         sp = push(sp, 0);
     }
     return sp;

@@ -25,10 +25,9 @@ const usb_host = @import("../driver/usb/host_controller.zig");
 const xhci = @import("../driver/usb/xhci.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 22 (0.69.48): append-only um genau einen ownergebundenen,
-// synchronen Display-Blitbeschleuniger erweitert. Displayziel und sicherer
-// CPU-Fallback bleiben im Kernelbesitz.
-pub const VERSION: u32 = 22;
+// Version 23 (0.69.49): append-only um den IRQ-sicheren RX-Arbeitsweckruf
+// erweitert. Framekopie und Protokollbatch bleiben im Netcore-Task.
+pub const VERSION: u32 = 23;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -695,6 +694,9 @@ pub const Table = extern struct {
     // Display-Blitpfad; Ziel, Fallback und Fence bleiben Kernelbesitz.
     register_display_blit_backend: *const fn ([*:0]const u8, *const display_blit.Descriptor) callconv(.c) i32,
     unregister_display_blit_backend: *const fn ([*:0]const u8) callconv(.c) i32,
+    // 0.69.49 (Version 23, append-only): IRQ-sicheres, adapterbezogenes
+    // Wakeup fuer den begrenzten Netcore-RX-Handoff.
+    net_schedule_rx: *const fn (i32) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -767,6 +769,7 @@ pub var table = Table{
     .activate_usb_host_controller = activateUsbHostController,
     .register_display_blit_backend = registerDisplayBlitBackend,
     .unregister_display_blit_backend = unregisterDisplayBlitBackend,
+    .net_schedule_rx = netScheduleRx,
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
@@ -2065,7 +2068,21 @@ fn netReceiveFrame(adapter_index: i32, frame: [*]const u8, len: u32) callconv(.c
     if (len == 0 or len > net.MAX_PACKET_SIZE) return -2;
     const index: usize = @intCast(adapter_index);
     const slice = frame[0..@intCast(len)];
-    return if (net.receiveFrame(index, slice)) 0 else -3;
+    return switch (net.receiveFrame(index, slice)) {
+        .accepted => 0,
+        .invalid_adapter => -1,
+        .invalid_frame => -2,
+        .unavailable => -3,
+        .queue_busy => -4,
+        .irq_context => -5,
+    };
+}
+
+fn netScheduleRx(adapter_index: i32) callconv(.c) i32 {
+    if (adapter_index < 0) return -1;
+    const index: usize = @intCast(adapter_index);
+    if (index >= net.count()) return -1;
+    return if (net.scheduleRxWork(index)) 0 else -3;
 }
 
 fn r4dStorageRead(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {

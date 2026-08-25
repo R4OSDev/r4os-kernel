@@ -70,6 +70,15 @@ before calling it. The backend borrows every address only for that callback;
 an absent, incompatible or failed backend causes one complete boot-framebuffer
 CPU copy, while DisplayManager alone owns present statistics and fences.
 
+DriverApi v23 adds an IRQ-safe adapter RX-work notification. Network IRQ
+handlers acknowledge and classify bounded device causes only. The `net-rx`
+task polls the published adapter, copies frames into a fixed 64-slot queue and
+runs protocol work in batches of at most 32. Queue backpressure leaves the
+device entry owned by its driver. Event wakeups remove normal 10-ms poll
+latency; the timer remains a routing watchdog. Accepted, processed, cancelled
+and occupied ownership plus queue, batch and tail-latency counters are exposed
+through the NETRX diagnostic snapshot.
+
 File-backed R4M0 relocation tables are streamed in record-aligned 4,080-byte
 windows while preserving record and error order. Installed disk R4P modules
 are catalogued from header and metadata only; their complete image,
@@ -90,6 +99,12 @@ Once the shell task has been admitted, the one-shot kernel boot task exits and
 is reaped. The shell's first `boot_ready` call independently freezes the boot
 measurement and retires the boot renderer without repainting the ready shell
 surface.
+
+Synthetic kernel-thread contexts preserve the SysV x86_64 call boundary: after
+the context switch restores six registers and enters the common trampoline by
+`ret`, its stack pointer is 8 modulo 16. A reserved word below the aligned
+stack top supplies the call-shaped entry layout, and a build-time layout test
+keeps the assembly restore frame and Zig stack construction in agreement.
 
 The stable task registry is an ownership and inventory index, not a run queue.
 Ready selection, timed wakeups, and deferred reaping use separate intrusive
