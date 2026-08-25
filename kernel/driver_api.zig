@@ -2,6 +2,7 @@ const std = @import("std");
 const io = @import("../arch/x86_64/io.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const audio = @import("../audio/core.zig");
+const display_blit = @import("../display/blit_backend.zig");
 const bootlog = @import("bootlog.zig");
 const boot_config = @import("boot_config.zig");
 const log_event = @import("log_event.zig");
@@ -24,10 +25,10 @@ const usb_host = @import("../driver/usb/host_controller.zig");
 const xhci = @import("../driver/usb/xhci.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 21 (0.69.43): append-only um die ownergebundene Aktivierung eines
-// kernelresidenten USB-Hostbackends erweitert. Das R4D besitzt dabei keine
-// zweite PCI-/MMIO-/DMA-Domaene.
-pub const VERSION: u32 = 21;
+// Version 22 (0.69.48): append-only um genau einen ownergebundenen,
+// synchronen Display-Blitbeschleuniger erweitert. Displayziel und sicherer
+// CPU-Fallback bleiben im Kernelbesitz.
+pub const VERSION: u32 = 22;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -405,6 +406,7 @@ pub const OwnerCleanupToken = struct {
     owner: u32 = 0,
     storage_plan: StorageCleanupPlan = .{},
     net_mutation_active: bool = false,
+    display_blit_prepared: bool = false,
     shutdown_started: bool = false,
     active: bool = false,
 };
@@ -446,6 +448,12 @@ pub fn prepareOwnerCleanup(owner: u32) ?OwnerCleanupToken {
         }
         token.net_mutation_active = true;
     }
+    if (!display_blit.prepareOwnerCleanup(owner)) {
+        cancelStorageOwnerCleanup(&token.storage_plan);
+        finishOwnerNetMutation(&token);
+        return null;
+    }
+    token.display_blit_prepared = true;
     token.active = true;
     return token;
 }
@@ -454,6 +462,7 @@ pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
     if (!token.active or token.shutdown_started or current_owner != token.owner or !current_owner_guard.ownedByCurrent()) return false;
     cancelStorageOwnerCleanup(&token.storage_plan);
     finishOwnerNetMutation(token);
+    if (token.display_blit_prepared) display_blit.cancelOwnerCleanup(token.owner);
     token.active = false;
     return true;
 }
@@ -491,6 +500,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     if (!token.shutdown_started) {
         cancelStorageOwnerCleanup(&token.storage_plan);
         finishOwnerNetMutation(token);
+        if (token.display_blit_prepared) display_blit.cancelOwnerCleanup(owner);
         token.active = false;
         return false;
     }
@@ -520,6 +530,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         return false;
     }
     finishOwnerNetMutation(token);
+    const display_blit_count = display_blit.cleanupOwner(owner);
     const audio_count = cleanupAudioOwner(owner);
     const usb_host_cleanup = usb_host.cleanupOwner(owner);
     if (usb_host_cleanup.failed) {
@@ -557,6 +568,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         audio_count == 0 and
         storage_cleanup.removed == 0 and
         usb_host_cleanup.removed == 0 and
+        display_blit_count == 0 and
         net_cleanup.removed == 0)
     {
         return true;
@@ -577,6 +589,8 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     bootlog.putDec(storage_cleanup.removed);
     bootlog.puts(" usb-host=");
     bootlog.putDec(usb_host_cleanup.removed);
+    bootlog.puts(" display-blit=");
+    bootlog.putDec(display_blit_count);
     bootlog.puts(" net=");
     bootlog.putDec(net_cleanup.removed);
     bootlog.puts("\r\n");
@@ -590,7 +604,7 @@ pub fn cleanupOwner(owner: u32) bool {
     var token = prepareOwnerCleanup(owner) orelse {
         bootlog.puts("[R4D] cleanup veto owner=");
         bootlog.putDec(owner);
-        bootlog.puts(" storage-busy\r\n");
+        bootlog.puts(" backend-busy\r\n");
         return false;
     };
     return commitOwnerCleanup(&token);
@@ -677,6 +691,10 @@ pub const Table = extern struct {
     // 0.69.43 (Version 21, append-only): ein R4D aktiviert genau ein
     // kernelresidentes USB-Hostbackend und bleibt dessen Registry-Owner.
     activate_usb_host_controller: *const fn ([*:0]const u8, u32) callconv(.c) i32,
+    // 0.69.48 (Version 22, append-only): genau ein externer synchroner
+    // Display-Blitpfad; Ziel, Fallback und Fence bleiben Kernelbesitz.
+    register_display_blit_backend: *const fn ([*:0]const u8, *const display_blit.Descriptor) callconv(.c) i32,
+    unregister_display_blit_backend: *const fn ([*:0]const u8) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -747,6 +765,8 @@ pub var table = Table{
     .dma_unpin_buffer = dmaUnpinBuffer,
     .driver_work_submit_request = driverWorkSubmitRequest,
     .activate_usb_host_controller = activateUsbHostController,
+    .register_display_blit_backend = registerDisplayBlitBackend,
+    .unregister_display_blit_backend = unregisterDisplayBlitBackend,
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
@@ -1721,6 +1741,22 @@ fn activateUsbHostController(name: [*:0]const u8, source: u32) callconv(.c) i32 
     if (!zEqSlice(name, "XHCI")) return -1;
     if (source != USB_HOST_SOURCE_PRELOAD and source != USB_HOST_SOURCE_DISK) return -2;
     return xhci.activate(activeOwner(), source);
+}
+
+fn registerDisplayBlitBackend(name: [*:0]const u8, descriptor: *const display_blit.Descriptor) callconv(.c) i32 {
+    const owner = activeOwner();
+    if (owner == 0 or @intFromPtr(descriptor) == 0) return -1;
+    const result = display_blit.register(owner, zSlice(name), descriptor);
+    if (result == 0) {
+        bootlog.puts("[R4D] register display blit backend ");
+        putZ(name);
+        bootlog.puts("\r\n");
+    }
+    return result;
+}
+
+fn unregisterDisplayBlitBackend(name: [*:0]const u8) callconv(.c) i32 {
+    return display_blit.unregister(activeOwner(), zSlice(name));
 }
 
 fn registerInputBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {

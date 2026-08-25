@@ -187,6 +187,7 @@ pub fn typeName(driver_type: u16) []const u8 {
         3 => "input",
         4 => "synth",
         5 => "net",
+        6 => "display",
         255 => "misc",
         else => "unknown",
     };

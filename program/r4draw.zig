@@ -1,6 +1,7 @@
 const r4x_api = @import("r4x_api.zig");
 const surface_pipeline = @import("../display/surface_pipeline.zig");
-const display = @import("../display/display.zig");
+const presenter = @import("../display/presenter.zig");
+const surface = @import("../display/surface.zig");
 const font = @import("../kernel/font.zig");
 const font_catalog = @import("../kernel/font_catalog.zig");
 const mouse = @import("../driver/input/mouse.zig");
@@ -17,6 +18,11 @@ pub const FontCatalogChangedFn = *const fn () void;
 pub const GuiFontInfo = r4x_api.GuiFontInfo;
 
 pub const GuiTextMetrics = r4x_api.GuiTextMetrics;
+pub const DisplayDamageRect = r4x_api.DisplayDamageRect;
+pub const DisplayPresentCapabilities = r4x_api.DisplayPresentCapabilities;
+pub const DisplayPresentCompletion = r4x_api.DisplayPresentCompletion;
+pub const DisplayPresentRequest = r4x_api.DisplayPresentRequest;
+pub const DisplayPresentResult = r4x_api.DisplayPresentResult;
 
 var display_used_hook: ?MarkDisplayUsedFn = null;
 var font_catalog_changed_hook: ?FontCatalogChangedFn = null;
@@ -98,18 +104,139 @@ pub fn displayBlitXrgb32Stride(x: i32, y: i32, w: u32, h: u32, pixels: [*]const 
     const bytes_needed = needed * 4;
     if (bytes_needed > @as(u64, ~@as(usize, 0))) return -2;
 
-    const raw: [*]const u8 = @ptrCast(pixels);
-    const ok = display.presentXrgb32Rect(
-        @intCast(x),
-        @intCast(y),
-        w,
-        h,
-        raw[0..@intCast(bytes_needed)],
-        source_stride_pixels,
-    );
-    if (!ok) return -3;
+    const source_view = surface.View{
+        .pixels = pixels[0..@intCast(needed)],
+        .width = w,
+        .height = h,
+        .pitch_pixels = source_stride_pixels,
+    };
+    const region = presenter.Region{
+        .destination_x = @intCast(x),
+        .destination_y = @intCast(y),
+        .w = w,
+        .h = h,
+    };
+    const result = presenter.presentXrgb32(.{
+        .source = source_view,
+        .regions = (&region)[0..1],
+        .reason = .legacy_bridge,
+    });
+    if (!result.success) return -3;
     markDisplayUsed();
     return 0;
+}
+
+pub fn displayPresentRegions(
+    request: *const DisplayPresentRequest,
+    pixels: [*]const u32,
+    pixel_count: u32,
+    regions: [*]const DisplayDamageRect,
+    region_count: u32,
+    out: *DisplayPresentResult,
+) callconv(.c) i32 {
+    if (@intFromPtr(out) == 0) return r4x_api.display_present_error_invalid;
+    out.* = .{};
+    if (@intFromPtr(request) == 0 or @intFromPtr(pixels) == 0 or @intFromPtr(regions) == 0) return r4x_api.display_present_error_invalid;
+    if (request.magic != r4x_api.display_present_magic or request.version != r4x_api.display_present_version or
+        request.size < @sizeOf(DisplayPresentRequest) or request.format != r4x_api.display_present_format_xrgb32 or
+        request.source_width == 0 or request.source_height == 0 or request.source_stride_pixels < request.source_width or
+        region_count == 0 or region_count > r4x_api.display_damage_max_regions)
+    {
+        return r4x_api.display_present_error_invalid;
+    }
+    const needed = (@as(u64, request.source_height) - 1) * request.source_stride_pixels + request.source_width;
+    if (needed > pixel_count) return r4x_api.display_present_error_out_of_range;
+
+    var normalized: [r4x_api.display_damage_max_regions]presenter.Region =
+        .{presenter.Region{}} ** r4x_api.display_damage_max_regions;
+    var index: usize = 0;
+    while (index < region_count) : (index += 1) {
+        const region = regions[index];
+        if (region.x < 0 or region.y < 0 or region.w == 0 or region.h == 0) return r4x_api.display_present_error_out_of_range;
+        const x: u32 = @intCast(region.x);
+        const y: u32 = @intCast(region.y);
+        if (x >= request.source_width or y >= request.source_height or
+            region.w > request.source_width - x or region.h > request.source_height - y)
+        {
+            return r4x_api.display_present_error_out_of_range;
+        }
+        normalized[index] = .{
+            .source_x = x,
+            .source_y = y,
+            .destination_x = x,
+            .destination_y = y,
+            .w = region.w,
+            .h = region.h,
+        };
+    }
+
+    const source_view = surface.View{
+        .pixels = pixels[0..pixel_count],
+        .width = request.source_width,
+        .height = request.source_height,
+        .pitch_pixels = request.source_stride_pixels,
+        .revision = request.source_generation,
+    };
+    const result = presenter.presentXrgb32(.{
+        .source = source_view,
+        .regions = normalized[0..region_count],
+        .reason = .redraw,
+        .source_generation = request.source_generation,
+        .input_tick = request.input_tick,
+        .input_tick_valid = (request.flags & r4x_api.display_present_request_flag_input_tick_valid) != 0,
+    });
+    fillPresentResult(result, out);
+    if (!result.success) return r4x_api.display_present_error_unavailable;
+    _ = surface_pipeline.present();
+    markDisplayUsed();
+    return 0;
+}
+
+pub fn displayPresentCapabilities(out: *DisplayPresentCapabilities) callconv(.c) i32 {
+    if (@intFromPtr(out) == 0) return r4x_api.display_present_error_invalid;
+    const capabilities = @import("../display/display.zig").presentCapabilities();
+    out.* = .{
+        .flags = capabilities.flags,
+        .formats = capabilities.formats,
+        .max_regions = capabilities.max_regions,
+        .backend_kind = capabilities.backend_kind,
+        .backend_name = capabilities.backend_name,
+        .fallback_name = capabilities.fallback_name,
+    };
+    return 0;
+}
+
+pub fn displayPresentCompletion(fence: u64, out: *DisplayPresentCompletion) callconv(.c) i32 {
+    if (@intFromPtr(out) == 0 or fence == 0) return r4x_api.display_present_error_invalid;
+    const display = @import("../display/display.zig");
+    const complete = display.presentFenceCompleted(fence);
+    out.* = .{
+        .flags = if (complete) r4x_api.display_present_completion_complete else 0,
+        .fence = fence,
+        .completed_fence = display.highestCompletedFence(),
+        .result = if (complete) 0 else r4x_api.display_present_error_unavailable,
+    };
+    return out.result;
+}
+
+fn fillPresentResult(result: presenter.PresentResult, out: *DisplayPresentResult) void {
+    out.* = .{
+        .flags = (if (result.success) r4x_api.display_present_result_success else 0) |
+            (if (result.success and result.fence == result.completed_fence) r4x_api.display_present_result_completed else 0) |
+            (if (result.accelerated) r4x_api.display_present_result_accelerated else 0) |
+            (if (result.fallback) r4x_api.display_present_result_fallback else 0),
+        .source_generation = result.source_generation,
+        .present_generation = result.present_generation,
+        .fence = result.fence,
+        .completed_fence = result.completed_fence,
+        .region_count = result.region_count,
+        .pixel_count = result.pixel_count,
+        .fallback_regions = result.fallback_regions,
+        .backend_error = result.backend_error,
+        .present_tick = result.present_tick,
+        .elapsed_ticks = result.elapsed_ticks,
+        .backend_name = result.backend_name,
+    };
 }
 
 pub fn fontCount() callconv(.c) u32 {

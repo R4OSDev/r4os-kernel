@@ -1,13 +1,10 @@
-// R4OS display presenter contract.
+// Canonical surface-to-display presenter.
 //
-// Introduced in 0.26.4 as the neutral boundary between software surfaces and
-// the DisplayManager/DisplayBackend path. The legacy surface_pipeline present path remains
-// active until later 0.26.X steps migrate call sites onto this contract.
+// This module normalizes source/destination regions. DisplayManager owns the
+// only productive present counters, backend selection, fences and fallback.
 
 const surface = @import("surface.zig");
-const display = @import("../display/display.zig");
-
-var stats_storage: PresentStats = .{};
+const display = @import("display.zig");
 
 pub const PresentReason = enum {
     unknown,
@@ -18,93 +15,83 @@ pub const PresentReason = enum {
     legacy_bridge,
 };
 
-pub const PresentMode = enum {
-    partial,
-    full,
+pub const Region = struct {
+    source_x: u32 = 0,
+    source_y: u32 = 0,
+    destination_x: u32 = 0,
+    destination_y: u32 = 0,
+    w: u32 = 0,
+    h: u32 = 0,
 };
 
 pub const PresentRequest = struct {
-    source: *surface.Surface,
-    rect: surface.Rect,
+    source: surface.View,
+    regions: []const Region,
     reason: PresentReason = .redraw,
+    source_generation: u64 = 0,
+    input_tick: u64 = 0,
+    input_tick_valid: bool = false,
 };
 
-pub const PresentResult = struct {
-    rect: surface.Rect,
-    mode: PresentMode,
-    pixels: usize,
-};
+pub const PresentResult = display.PresentOutcome;
 
-pub const PresentStats = struct {
-    presents: u64 = 0,
-    full_presents: u64 = 0,
-    partial_presents: u64 = 0,
-    skipped_empty: u64 = 0,
-    pixels_presented: u64 = 0,
-    last_rect: surface.Rect = surface.Rect.empty(),
-    last_reason: PresentReason = .unknown,
+pub fn presentXrgb32(request: PresentRequest) PresentResult {
+    if (request.source.format != .xrgb32 or request.regions.len == 0 or
+        request.regions.len > display.MAX_PRESENT_REGIONS)
+    {
+        return .{ .source_generation = request.source_generation };
+    }
 
-    pub fn record(self: *PresentStats, result: PresentResult, reason: PresentReason) void {
-        self.presents +%= 1;
-        switch (result.mode) {
-            .full => self.full_presents +%= 1,
-            .partial => self.partial_presents +%= 1,
+    var normalized: [display.MAX_PRESENT_REGIONS]display.PresentRegion =
+        .{display.PresentRegion{}} ** display.MAX_PRESENT_REGIONS;
+    for (request.regions, 0..) |region, index| {
+        if (region.w == 0 or region.h == 0 or
+            @as(u64, region.source_x) + region.w > request.source.width or
+            @as(u64, region.source_y) + region.h > request.source.height)
+        {
+            return .{ .source_generation = request.source_generation };
         }
-        self.pixels_presented +%= @as(u64, @intCast(result.pixels));
-        self.last_rect = result.rect;
-        self.last_reason = reason;
+        normalized[index] = .{
+            .dst_x = region.destination_x,
+            .dst_y = region.destination_y,
+            .src_x = region.source_x,
+            .src_y = region.source_y,
+            .w = region.w,
+            .h = region.h,
+        };
     }
 
-    pub fn recordSkippedEmpty(self: *PresentStats) void {
-        self.skipped_empty +%= 1;
+    const pixel_count = request.source.pixels.len;
+    if (pixel_count > ~@as(u32, 0) or request.source.pitch_pixels > ~@as(u32, 0)) {
+        return .{ .source_generation = request.source_generation };
     }
-};
+    return display.presentXrgb32Regions(
+        request.source.pixels.ptr,
+        @intCast(pixel_count),
+        @intCast(request.source.pitch_pixels),
+        normalized[0..request.regions.len],
+        request.source_generation,
+        request.input_tick,
+        request.input_tick_valid,
+    );
+}
 
-pub fn normalize(request: PresentRequest) ?PresentResult {
-    const clipped = request.rect.clipTo(request.source.width, request.source.height) orelse return null;
-    const full = clipped.x == 0 and clipped.y == 0 and
-        clipped.w == request.source.width and clipped.h == request.source.height;
-
-    return .{
-        .rect = clipped,
-        .mode = if (full) .full else .partial,
-        .pixels = clipped.w * clipped.h,
+pub fn presentRect(source: *surface.Surface, rect: surface.Rect, reason: PresentReason) PresentResult {
+    const clipped = rect.clipTo(source.width, source.height) orelse return .{};
+    const x: u32 = @intCast(clipped.x);
+    const y: u32 = @intCast(clipped.y);
+    const region = Region{
+        .source_x = x,
+        .source_y = y,
+        .destination_x = x,
+        .destination_y = y,
+        .w = @intCast(clipped.w),
+        .h = @intCast(clipped.h),
     };
-}
-
-pub fn presentXrgb32(request: PresentRequest) ?PresentResult {
-    if (request.source.format != .xrgb32) return null;
-    const result = normalize(request) orelse {
-        stats_storage.recordSkippedEmpty();
-        return null;
-    };
-
-    const rect = result.rect;
-    const x0 = @as(usize, @intCast(rect.x));
-    const y0 = @as(usize, @intCast(rect.y));
-    const source = request.source;
-    const offset = (y0 * source.pitch_pixels + x0) * @sizeOf(u32);
-    const byte_len = source.pixels.len * @sizeOf(u32);
-    if (offset >= byte_len) return null;
-    const bytes = @as([*]const u8, @ptrCast(source.pixels.ptr))[0..byte_len];
-
-    if (!display.presentXrgb32Rect(
-        @intCast(x0),
-        @intCast(y0),
-        @intCast(rect.w),
-        @intCast(rect.h),
-        bytes[offset..],
-        @intCast(source.pitch_pixels),
-    )) return null;
-
-    stats_storage.record(result, request.reason);
-    return result;
-}
-
-pub fn stats() PresentStats {
-    return stats_storage;
-}
-
-pub fn resetStats() void {
-    stats_storage = .{};
+    return presentXrgb32(.{
+        .source = source.view(),
+        .regions = (&region)[0..1],
+        .reason = reason,
+        .source_generation = source.revision,
+    });
 }

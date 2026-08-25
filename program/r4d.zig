@@ -25,6 +25,7 @@ const DriverType = enum(u16) {
     input = 3,
     synth = 4,
     net = 5,
+    display = 6,
     misc = 255,
     unknown = 0,
 };
@@ -846,6 +847,7 @@ fn parseDriverTypeName(value: []const u8) ?u16 {
     if (nameEq(value, "input")) return 3;
     if (nameEq(value, "synth")) return 4;
     if (nameEq(value, "net")) return 5;
+    if (nameEq(value, "display")) return 6;
     if (nameEq(value, "misc")) return 255;
     return null;
 }
@@ -931,6 +933,7 @@ fn driverType(value: u16) ?DriverType {
         3 => .input,
         4 => .synth,
         5 => .net,
+        6 => .display,
         255 => .misc,
         else => null,
     };
@@ -943,6 +946,7 @@ fn driverTypeName(value: u16) []const u8 {
         .input => "input",
         .synth => "synth",
         .net => "net",
+        .display => "display",
         .misc => "misc",
         .unknown => "unknown",
     };

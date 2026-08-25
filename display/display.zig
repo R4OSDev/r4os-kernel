@@ -1,4 +1,5 @@
 const fb = @import("framebuffer.zig");
+const blit_backend = @import("blit_backend.zig");
 const cpu = @import("../platform/cpu.zig");
 const paging = @import("../memory/paging.zig");
 const timer = @import("../kernel/timer.zig");
@@ -38,6 +39,37 @@ pub const Rect = struct {
     y: u32 = 0,
     w: u32 = 0,
     h: u32 = 0,
+};
+
+pub const MAX_PRESENT_REGIONS: usize = 8;
+pub const PRESENT_FORMAT_XRGB32: u32 = 1;
+
+pub const PresentRegion = blit_backend.Region;
+
+pub const PresentOutcome = struct {
+    success: bool = false,
+    accelerated: bool = false,
+    fallback: bool = false,
+    source_generation: u64 = 0,
+    present_generation: u64 = 0,
+    fence: u64 = 0,
+    completed_fence: u64 = 0,
+    region_count: u32 = 0,
+    pixel_count: u32 = 0,
+    fallback_regions: u32 = 0,
+    backend_error: i32 = 0,
+    present_tick: u64 = 0,
+    elapsed_ticks: u64 = 0,
+    backend_name: [blit_backend.NAME_BYTES]u8 = .{0} ** blit_backend.NAME_BYTES,
+};
+
+pub const PresentCapabilities = struct {
+    flags: u32 = 0,
+    formats: u32 = PRESENT_FORMAT_XRGB32,
+    max_regions: u32 = MAX_PRESENT_REGIONS,
+    backend_kind: u32 = 1,
+    backend_name: [blit_backend.NAME_BYTES]u8 = .{0} ** blit_backend.NAME_BYTES,
+    fallback_name: [blit_backend.NAME_BYTES]u8 = .{0} ** blit_backend.NAME_BYTES,
 };
 
 pub const MappingKind = enum(u8) {
@@ -158,6 +190,8 @@ const bootfb_ops: DeviceOps = .{
 
 var bootfb_device: Device = .{ .ops = &bootfb_ops };
 var primary_device: ?*Device = null;
+var present_generation: u64 = 0;
+var completed_fence: u64 = 0;
 
 pub fn registerBootBackend(target: DisplayTarget) void {
     bootfb_device = .{
@@ -170,6 +204,8 @@ pub fn registerBootBackend(target: DisplayTarget) void {
         .ops = &bootfb_ops,
     };
     primary_device = &bootfb_device;
+    present_generation = 0;
+    completed_fence = 0;
 }
 
 pub fn activeBackendRegistered() bool {
@@ -294,12 +330,217 @@ pub fn presentPacked32Rect(x0: u64, y0: u64, w: u64, h: u64, src: []const u8, sr
 }
 
 pub fn presentXrgb32Rect(x0: u64, y0: u64, w: u64, h: u64, src: []const u8, src_stride_pixels: u64) bool {
-    const device = primary_device orelse return false;
-    const op = device.ops.present_xrgb32_rect orelse return false;
+    if (x0 > ~@as(u32, 0) or y0 > ~@as(u32, 0) or w > ~@as(u32, 0) or h > ~@as(u32, 0) or
+        src_stride_pixels > ~@as(u32, 0) or (src.len & 3) != 0 or (@intFromPtr(src.ptr) & 3) != 0)
+    {
+        return false;
+    }
+    const pixels: [*]const u32 = @ptrCast(@alignCast(src.ptr));
+    const region = PresentRegion{
+        .dst_x = @intCast(x0),
+        .dst_y = @intCast(y0),
+        .src_x = 0,
+        .src_y = 0,
+        .w = @intCast(w),
+        .h = @intCast(h),
+    };
+    return presentXrgb32Regions(
+        pixels,
+        @intCast(src.len / @sizeOf(u32)),
+        @intCast(src_stride_pixels),
+        (&region)[0..1],
+        0,
+        0,
+        false,
+    ).success;
+}
+
+/// The sole productive XRGB32 present/statistics path. All regions are
+/// validated before the first visible write. The external backend is one
+/// synchronous optimization attempt; every absence, incompatibility or
+/// callback error falls back to the boot framebuffer copy for the complete
+/// generation.
+pub fn presentXrgb32Regions(
+    source: [*]const u32,
+    source_pixel_count: u32,
+    source_stride_pixels: u32,
+    regions: []const PresentRegion,
+    source_generation: u64,
+    input_tick: u64,
+    input_tick_valid: bool,
+) PresentOutcome {
+    var outcome = PresentOutcome{ .source_generation = source_generation };
+    const device = primary_device orelse return outcome;
+    const f = device.framebuffer orelse return outcome;
+    if (!fb.supportsRgb32(f) or source_pixel_count == 0 or source_stride_pixels == 0 or
+        regions.len == 0 or regions.len > MAX_PRESENT_REGIONS)
+    {
+        return outcome;
+    }
+
+    var pixels_total: u64 = 0;
+    var bounds = Rect{};
+    for (regions, 0..) |region, index| {
+        if (!validPresentRegion(region, device.mode, source_pixel_count, source_stride_pixels)) return outcome;
+        const region_pixels = @as(u64, region.w) * region.h;
+        if (pixels_total > ~@as(u32, 0) - region_pixels) return outcome;
+        pixels_total += region_pixels;
+        if (index == 0) {
+            bounds = .{ .x = region.dst_x, .y = region.dst_y, .w = region.w, .h = region.h };
+        } else {
+            bounds = mergeRect(bounds, .{ .x = region.dst_x, .y = region.dst_y, .w = region.w, .h = region.h });
+        }
+    }
+
     const start = timer.tickCount();
-    const ok = op(device, x0, y0, w, h, src, src_stride_pixels);
-    if (ok) recordPresentTiming(device, start);
-    return ok;
+    var external = blit_backend.InvokeResult{};
+    if (fb.isNativeXrgb32(f) and (f.pitch & 3) == 0) {
+        const job = blit_backend.Job{
+            .target_address = @intFromPtr(f.address),
+            .target_width = @intCast(f.width),
+            .target_height = @intCast(f.height),
+            .target_pitch_pixels = @intCast(f.pitch / @sizeOf(u32)),
+            .source_pixel_count = source_pixel_count,
+            .source_address = @intFromPtr(source),
+            .source_stride_pixels = source_stride_pixels,
+            .region_count = @intCast(regions.len),
+            .regions_address = @intFromPtr(regions.ptr),
+        };
+        external = blit_backend.invoke(&job);
+    }
+
+    if (external.attempted and external.result == 0) {
+        outcome.accelerated = true;
+        outcome.backend_name = external.name;
+    } else {
+        const source_bytes = @as([*]const u8, @ptrCast(source))[0 .. @as(usize, source_pixel_count) * @sizeOf(u32)];
+        for (regions) |region| {
+            if (!bootfbCopyXrgb32Region(device, region, source_bytes, source_stride_pixels)) return outcome;
+        }
+        outcome.fallback = true;
+        outcome.fallback_regions = @intCast(regions.len);
+        outcome.backend_error = if (external.attempted) external.result else 0;
+        copyName(outcome.backend_name[0..], "bootfb-cpu");
+    }
+
+    present_generation +%= 1;
+    if (present_generation == 0) present_generation = 1;
+    completed_fence = present_generation;
+    const completed_tick = timer.tickCount();
+    recordPresentAggregate(device, .xrgb32_present, bounds, pixels_total, false);
+    recordPresentTimingAt(device, start, completed_tick);
+    outcome.success = true;
+    outcome.present_generation = present_generation;
+    outcome.fence = present_generation;
+    outcome.completed_fence = completed_fence;
+    outcome.region_count = @intCast(regions.len);
+    outcome.pixel_count = @intCast(pixels_total);
+    outcome.present_tick = completed_tick;
+    outcome.elapsed_ticks = if (input_tick_valid and completed_tick >= input_tick) completed_tick - input_tick else 0;
+    return outcome;
+}
+
+pub fn presentCapabilities() PresentCapabilities {
+    var result = PresentCapabilities{
+        .flags = 1 | 2 | 4,
+    };
+    copyName(result.backend_name[0..], "bootfb-cpu");
+    copyName(result.fallback_name[0..], "bootfb-cpu");
+    const external = blit_backend.snapshot();
+    const target_compatible = if (primary_device) |device|
+        if (device.framebuffer) |frame| fb.isNativeXrgb32(frame) and (frame.pitch & 3) == 0 else false
+    else
+        false;
+    if (external.active and target_compatible) {
+        result.flags |= 8 | 16;
+        result.backend_kind = 2;
+        result.backend_name = external.name;
+        result.max_regions = @intCast(@min(@as(usize, external.max_regions), MAX_PRESENT_REGIONS));
+    }
+    return result;
+}
+
+pub fn presentFenceCompleted(fence: u64) bool {
+    return fence != 0 and fence <= completed_fence;
+}
+
+pub fn highestCompletedFence() u64 {
+    return completed_fence;
+}
+
+test "external blit error falls back once and preserves exact damage" {
+    const testing = @import("std").testing;
+    const FailBackend = struct {
+        fn present(_: usize, _: *const blit_backend.Job) callconv(.c) i32 {
+            return -77;
+        }
+    };
+
+    var target: [64]u32 align(32) = .{0xA5A5_A5A5} ** 64;
+    var frame = fb.Framebuffer{
+        .address = @ptrCast(target[0..].ptr),
+        .width = 8,
+        .height = 8,
+        .pitch = 8 * @sizeOf(u32),
+        .bpp = 32,
+        .memory_model = 1,
+        .red_mask_size = 8,
+        .red_mask_shift = 16,
+        .green_mask_size = 8,
+        .green_mask_shift = 8,
+        .blue_mask_size = 8,
+        .blue_mask_shift = 0,
+        .unused = .{0} ** 5,
+        .edid_size = 0,
+        .edid = null,
+    };
+    registerBootBackend(.{
+        .name = "test-bootfb",
+        .kind = .bootfb,
+        .flags = DeviceFlags.visible | DeviceFlags.cpu_present | DeviceFlags.rgb32 | DeviceFlags.xrgb32,
+        .mode = .{ .width = 8, .height = 8, .pitch = 32, .bpp = 32 },
+        .framebuffer = &frame,
+    });
+    defer {
+        primary_device = null;
+        bootfb_device = .{ .ops = &bootfb_ops };
+        present_generation = 0;
+        completed_fence = 0;
+    }
+
+    const descriptor = blit_backend.Descriptor{
+        .flags = blit_backend.REQUIRED_FLAGS | blit_backend.FLAG_CPU_FAST_COPY,
+        .max_regions = MAX_PRESENT_REGIONS,
+        .present = FailBackend.present,
+    };
+    try testing.expectEqual(@as(i32, 0), blit_backend.register(91, "FAILBLIT", &descriptor));
+    defer _ = blit_backend.unregister(91, "FAILBLIT");
+
+    var source: [64]u32 align(32) = undefined;
+    for (&source, 0..) |*pixel, index| pixel.* = 0x0010_0000 | @as(u32, @intCast(index));
+    const regions = [_]PresentRegion{
+        .{ .dst_x = 1, .dst_y = 1, .src_x = 1, .src_y = 1, .w = 2, .h = 2 },
+        .{ .dst_x = 5, .dst_y = 5, .src_x = 5, .src_y = 5, .w = 2, .h = 2 },
+    };
+    const outcome = presentXrgb32Regions(source[0..].ptr, source.len, 8, regions[0..], 44, 0, false);
+    try testing.expect(outcome.success);
+    try testing.expect(outcome.fallback);
+    try testing.expect(!outcome.accelerated);
+    try testing.expectEqual(@as(i32, -77), outcome.backend_error);
+    try testing.expectEqual(@as(u32, 2), outcome.region_count);
+    try testing.expectEqual(@as(u32, 8), outcome.pixel_count);
+    try testing.expectEqual(outcome.fence, outcome.completed_fence);
+    try testing.expect(presentFenceCompleted(outcome.fence));
+
+    var y: usize = 0;
+    while (y < 8) : (y += 1) {
+        var x: usize = 0;
+        while (x < 8) : (x += 1) {
+            const damaged = (x >= 1 and x < 3 and y >= 1 and y < 3) or
+                (x >= 5 and x < 7 and y >= 5 and y < 7);
+            try testing.expectEqual(if (damaged) source[y * 8 + x] else 0xA5A5_A5A5, target[y * 8 + x]);
+        }
+    }
 }
 
 pub fn operationNames(flags: u32) []const u8 {
@@ -420,19 +661,83 @@ fn bootfbPresentXrgb32Rect(device: *Device, x0: u64, y0: u64, w: u64, h: u64, sr
     return true;
 }
 
+fn bootfbCopyXrgb32Region(device: *Device, region: PresentRegion, src: []const u8, src_stride_pixels: u32) bool {
+    const f = device.framebuffer orelse return false;
+    const src_stride_bytes = @as(u64, src_stride_pixels) * @sizeOf(u32);
+    const row_bytes = @as(u64, region.w) * @sizeOf(u32);
+    const first_offset = (@as(u64, region.src_y) * src_stride_pixels + region.src_x) * @sizeOf(u32);
+    const last_end = first_offset + (@as(u64, region.h) - 1) * src_stride_bytes + row_bytes;
+    if (last_end > src.len) return false;
+
+    var y: u32 = 0;
+    while (y < region.h) : (y += 1) {
+        const src_offset: usize = @intCast(first_offset + @as(u64, y) * src_stride_bytes);
+        if (fb.isNativeXrgb32(f)) {
+            const dst = f.address + (@as(u64, region.dst_y) + y) * f.pitch + @as(u64, region.dst_x) * @sizeOf(u32);
+            copyToVisible(dst, src[src_offset .. src_offset + @as(usize, @intCast(row_bytes))]);
+            continue;
+        }
+        var x: u32 = 0;
+        while (x < region.w) : (x += 1) {
+            const pixel_offset = src_offset + @as(usize, x) * @sizeOf(u32);
+            fb.putPacked32(
+                f,
+                @as(u64, region.dst_x) + x,
+                @as(u64, region.dst_y) + y,
+                fb.packRgb(f, readXrgb32(src, pixel_offset)),
+            );
+        }
+    }
+    return true;
+}
+
+fn validPresentRegion(region: PresentRegion, mode: Mode, source_pixel_count: u32, source_stride_pixels: u32) bool {
+    if (region.w == 0 or region.h == 0 or region.src_x >= source_stride_pixels) return false;
+    if (region.w > source_stride_pixels - region.src_x) return false;
+    if (region.dst_x >= mode.width or region.dst_y >= mode.height) return false;
+    if (region.w > mode.width - region.dst_x or region.h > mode.height - region.dst_y) return false;
+    const last_row = @as(u64, region.src_y) + region.h - 1;
+    const last_end = last_row * source_stride_pixels + region.src_x + region.w;
+    return last_end <= source_pixel_count;
+}
+
+fn mergeRect(a: Rect, b: Rect) Rect {
+    const left = @min(a.x, b.x);
+    const top = @min(a.y, b.y);
+    const right = @max(@as(u64, a.x) + a.w, @as(u64, b.x) + b.w);
+    const bottom = @max(@as(u64, a.y) + a.h, @as(u64, b.y) + b.h);
+    return .{
+        .x = left,
+        .y = top,
+        .w = @intCast(right - left),
+        .h = @intCast(bottom - top),
+    };
+}
+
+fn copyName(out: []u8, name: []const u8) void {
+    @memset(out, 0);
+    if (out.len == 0) return;
+    const count = @min(name.len, out.len - 1);
+    if (count != 0) @memcpy(out[0..count], name[0..count]);
+}
+
 fn recordPresent(device: *Device, reason: PresentReason, x: u32, y: u32, w: u32, h: u32, converted: bool) void {
     const pixels = @as(u64, w) * h;
+    recordPresentAggregate(device, reason, .{ .x = x, .y = y, .w = w, .h = h }, pixels, converted);
+}
+
+fn recordPresentAggregate(device: *Device, reason: PresentReason, bounds: Rect, pixels: u64, converted: bool) void {
     const bytes = pixels * 4;
     device.present_count += 1;
     device.present_pixels_total += pixels;
     device.present_bytes_total += bytes;
     device.last_present_pixels = pixels;
     device.last_present_bytes = bytes;
-    device.last_present_rect = .{ .x = x, .y = y, .w = w, .h = h };
+    device.last_present_rect = bounds;
     device.last_present_reason = reason;
     device.last_present_converted = converted;
     if (converted) device.conversion_present_count += 1;
-    if (x == 0 and y == 0 and w == device.mode.width and h == device.mode.height) {
+    if (bounds.x == 0 and bounds.y == 0 and bounds.w == device.mode.width and bounds.h == device.mode.height and pixels == @as(u64, device.mode.width) * device.mode.height) {
         device.full_present_count += 1;
     } else {
         device.partial_present_count += 1;
@@ -447,7 +752,10 @@ fn recordPresent(device: *Device, reason: PresentReason, x: u32, y: u32, w: u32,
 }
 
 fn recordPresentTiming(device: *Device, start: u64) void {
-    const end = timer.tickCount();
+    recordPresentTimingAt(device, start, timer.tickCount());
+}
+
+fn recordPresentTimingAt(device: *Device, start: u64, end: u64) void {
     const elapsed = if (end >= start) end - start else 0;
     device.present_total_ticks +%= elapsed;
     device.present_last_ticks = elapsed;

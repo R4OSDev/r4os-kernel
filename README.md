@@ -64,6 +64,12 @@ INTx when routed and retains bounded polling as fallback. Bulk TDs span up to
 64 KiB in page-bounded TRBs, including a chained ring wrap. Failed controller
 halt vetoes unload.
 
+DriverApi v22 admits one owner-bound synchronous display-blit backend.
+R4DRAW normalizes complete XRGB32 generations with at most eight regions
+before calling it. The backend borrows every address only for that callback;
+an absent, incompatible or failed backend causes one complete boot-framebuffer
+CPU copy, while DisplayManager alone owns present statistics and fences.
+
 File-backed R4M0 relocation tables are streamed in record-aligned 4,080-byte
 windows while preserving record and error order. Installed disk R4P modules
 are catalogued from header and metadata only; their complete image,

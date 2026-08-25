@@ -98,6 +98,17 @@ pub const Surface = struct {
         return .{ .x = 0, .y = 0, .w = self.width, .h = self.height };
     }
 
+    pub fn view(self: *const Surface) View {
+        return .{
+            .pixels = self.pixels,
+            .width = self.width,
+            .height = self.height,
+            .pitch_pixels = self.pitch_pixels,
+            .format = self.format,
+            .revision = self.revision,
+        };
+    }
+
     pub fn line(self: *Surface, y: usize) []u32 {
         const start = y * self.pitch_pixels;
         return self.pixels[start .. start + self.width];
@@ -122,4 +133,13 @@ pub const Surface = struct {
         }
         self.revision +%= 1;
     }
+};
+
+pub const View = struct {
+    pixels: []const u32,
+    width: usize,
+    height: usize,
+    pitch_pixels: usize,
+    format: PixelFormat = .xrgb32,
+    revision: u64 = 0,
 };

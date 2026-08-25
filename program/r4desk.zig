@@ -72,6 +72,7 @@ pub const RemoteFrameInfo = r4x_api.RemoteFrameInfo;
 // Der Konsument mappt owner-thread-only pro Frame und validiert generation
 // gegen die zuvor gelesene RemoteFrameInfo.revision.
 pub const RemoteFrameMapInfo = r4x_api.RemoteFrameMapInfo;
+pub const DisplayDamageRect = r4x_api.DisplayDamageRect;
 
 pub const RemoteInputEvent = r4x_api.RemoteInputEvent;
 
@@ -388,6 +389,94 @@ pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32
 
     const copied = @as(u64, rect.w) * @as(u64, rect.h);
     return if (copied > 0x7fff_ffff) 0x7fff_ffff else @intCast(copied);
+}
+
+pub fn remoteFramePublishRegions(
+    info: *const RemoteFrameInfo,
+    pixels_ptr: [*]const u32,
+    pixel_count: u32,
+    regions_ptr: [*]const DisplayDamageRect,
+    region_count: u32,
+) callconv(.c) i32 {
+    if (@intFromPtr(info) == 0 or @intFromPtr(pixels_ptr) == 0 or @intFromPtr(regions_ptr) == 0) return remote_frame_error_invalid;
+    if (info.format != remote_frame_format_xrgb32 or info.bytes_per_pixel != 4) return remote_frame_error_unsupported;
+    if (info.width == 0 or info.height == 0 or info.stride_pixels < info.width or
+        region_count == 0 or region_count > r4x_api.display_damage_max_regions)
+    {
+        return remote_frame_error_invalid;
+    }
+    const total_pixels_u64 = @as(u64, info.width) * info.height;
+    const source_pixels_u64 = @as(u64, info.stride_pixels) * info.height;
+    const max_frame_pixels: u64 = 0xffff_ffff / @sizeOf(u32);
+    if (total_pixels_u64 == 0 or total_pixels_u64 > max_frame_pixels or source_pixels_u64 > pixel_count) return remote_frame_error_invalid;
+
+    var regions: [r4x_api.display_damage_max_regions]RemoteRect =
+        .{RemoteRect{}} ** r4x_api.display_damage_max_regions;
+    var copied_pixels: u64 = 0;
+    var bounds = RemoteRect{};
+    var index: usize = 0;
+    while (index < region_count) : (index += 1) {
+        const source_region = regions_ptr[index];
+        if (source_region.x < 0 or source_region.y < 0 or source_region.w == 0 or source_region.h == 0) return remote_frame_error_out_of_range;
+        const x: u32 = @intCast(source_region.x);
+        const y: u32 = @intCast(source_region.y);
+        if (x >= info.width or y >= info.height or source_region.w > info.width - x or source_region.h > info.height - y) return remote_frame_error_out_of_range;
+        const region = RemoteRect{ .x = x, .y = y, .w = source_region.w, .h = source_region.h };
+        regions[index] = region;
+        copied_pixels += @as(u64, region.w) * region.h;
+        bounds = if (index == 0) region else mergeRemoteRect(bounds, region);
+    }
+    if (remoteFrameConsumers() == 0) return 0;
+
+    const total_pixels: usize = @intCast(total_pixels_u64);
+    beginRemoteFrameWrite();
+    if (!ensureRemoteFrameCapacity(total_pixels)) {
+        finishRemoteFrameWrite();
+        return remote_frame_error_oom;
+    }
+    const dest = remote_frame_pixels orelse {
+        finishRemoteFrameWrite();
+        return remote_frame_error_oom;
+    };
+    const source = pixels_ptr[0..@as(usize, @intCast(source_pixels_u64))];
+    const geometry_changed = !remote_frame_ready or
+        remote_frame_info.width != info.width or remote_frame_info.height != info.height;
+    if (geometry_changed) {
+        const full = RemoteRect{ .x = 0, .y = 0, .w = info.width, .h = info.height };
+        copyRemoteFrameRect(dest, source, info.width, info.stride_pixels, full);
+        bounds = full;
+        copied_pixels = total_pixels_u64;
+    } else {
+        for (regions[0..region_count]) |region| copyRemoteFrameRect(dest, source, info.width, info.stride_pixels, region);
+    }
+
+    const revision = bumpRemoteFrameRevision();
+    remote_frame_info = .{
+        .magic = remote_frame_magic,
+        .version = remote_frame_version,
+        .flags = remote_frame_flag_ready | remote_frame_flag_dirty_valid | remote_frame_flag_cursor_valid,
+        .format = remote_frame_format_xrgb32,
+        .width = info.width,
+        .height = info.height,
+        .stride_pixels = info.width,
+        .bytes_per_pixel = 4,
+        .revision = revision,
+        .frame_pixels = @intCast(total_pixels),
+        .frame_bytes = @intCast(total_pixels * @sizeOf(u32)),
+        .dirty_x = @intCast(bounds.x),
+        .dirty_y = @intCast(bounds.y),
+        .dirty_w = bounds.w,
+        .dirty_h = bounds.h,
+        .cursor_x = info.cursor_x,
+        .cursor_y = info.cursor_y,
+        .cursor_flags = info.cursor_flags,
+    };
+    remote_frame_ready = true;
+    remote_frame_history.record(revision, bounds);
+    finishRemoteFrameWrite();
+    @atomicStore(u32, &remote_frame_published_revision, revision, .release);
+    _ = remote_frame_waitq.wakeAll();
+    return if (copied_pixels > 0x7fff_ffff) 0x7fff_ffff else @intCast(copied_pixels);
 }
 
 pub fn remoteInputPush(event: *const RemoteInputEvent) callconv(.c) i32 {
@@ -852,6 +941,19 @@ fn normalizeRemoteRect(info: *const RemoteFrameInfo, force_full: bool) RemoteRec
     return .{
         .x = @intCast(left),
         .y = @intCast(top),
+        .w = @intCast(right - left),
+        .h = @intCast(bottom - top),
+    };
+}
+
+fn mergeRemoteRect(a: RemoteRect, b: RemoteRect) RemoteRect {
+    const left = @min(a.x, b.x);
+    const top = @min(a.y, b.y);
+    const right = @max(@as(u64, a.x) + a.w, @as(u64, b.x) + b.w);
+    const bottom = @max(@as(u64, a.y) + a.h, @as(u64, b.y) + b.h);
+    return .{
+        .x = left,
+        .y = top,
         .w = @intCast(right - left),
         .h = @intCast(bottom - top),
     };

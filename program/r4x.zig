@@ -5325,6 +5325,7 @@ fn configureR4XStartR4DeskTable() void {
         .remote_frame_acquire = &r4api.r4desk.remoteFrameAcquire,
         .remote_frame_release = &r4api.r4desk.remoteFrameRelease,
         .remote_frame_consumers = &r4api.r4desk.remoteFrameConsumers,
+        .remote_frame_publish_regions = &r4api.r4desk.remoteFramePublishRegions,
     });
 }
 
@@ -5363,6 +5364,9 @@ fn configureR4XStartR4DrawTable() void {
         .gui_frame_info = &apiGuiFrameInfo,
         .gui_frame_read = &apiGuiFrameRead,
         .display_blit_xrgb32_stride = &r4api.r4draw.displayBlitXrgb32Stride,
+        .display_present_regions = &r4api.r4draw.displayPresentRegions,
+        .display_present_capabilities = &r4api.r4draw.displayPresentCapabilities,
+        .display_present_completion = &r4api.r4draw.displayPresentCompletion,
     });
 }
 

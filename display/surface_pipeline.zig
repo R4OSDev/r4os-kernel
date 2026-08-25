@@ -1,5 +1,4 @@
 const display = @import("display.zig");
-const presenter = @import("presenter.zig");
 
 const Target = struct {
     width: u64 = 0,
@@ -22,7 +21,6 @@ var target: Target = .{};
 var frame_active = false;
 var frame_mode: FrameMode = .none;
 var last_frame_mode: FrameMode = .none;
-var present_count: u64 = 0;
 
 pub fn initFromDisplayManager() void {
     const mode = display.activeMode() orelse {
@@ -42,8 +40,6 @@ pub fn initTarget(new_target: Target) void {
     frame_active = false;
     frame_mode = .none;
     last_frame_mode = .none;
-    present_count = 0;
-    presenter.resetStats();
 }
 
 pub fn width() u32 {
@@ -75,7 +71,5 @@ pub fn present() i32 {
     if (frame_mode != .none) last_frame_mode = frame_mode;
     frame_active = false;
     frame_mode = .none;
-    present_count +%= 1;
-    if (present_count == 0) present_count = 1;
     return 1;
 }

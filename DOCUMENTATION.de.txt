@@ -81,6 +81,18 @@ dem exakten Transfer zugeordnet. Timeout, Stall/Clear-Halt, Reset, Hotplug und
 Unload beseitigen nur die zugehoerigen Generationen. Ein nicht haltbarer
 Controller vetoisiert den Unload und behaelt seine Ressourcen.
 
+Kanonischer Display-Presentpfad seit 0.69.48
+--------------------------------------------
+
+DriverApi v22 registriert genau einen ownergebundenen synchronen Display-
+Blitverbraucher. R4DRAW, Presenter und DisplayManager validieren eine
+vollstaendige XRGB32-Generation mit hoechstens acht getrennten Regionen,
+Quellstride und optionalem Eingabetick vor dem ersten sichtbaren Zugriff.
+Der externe Callback leiht alle Adressen nur fuer diesen Aufruf. Fehlen
+Backend oder kompatibles Zielformat oder meldet der Callback einen Fehler,
+kopiert der Kernel dieselbe komplette Generation ueber bootfb-cpu. Nur der
+DisplayManager fuehrt Presentstatistik, Generation und abgeschlossenen Fence.
+
 Bedarfsgeladener R4M0- und R4P-Pfad seit 0.69.44
 ------------------------------------------------
 
