@@ -357,6 +357,11 @@ var registry_transaction_gate: u8 = 0;
 pub const RegistryKeyInfo = r4x_api.RegistryKeyInfo;
 
 pub const RegistryValueInfo = r4x_api.RegistryValueInfo;
+pub const RegistryBatchOperation = r4x_api.RegistryBatchOperation;
+pub const RegistryBatchResult = r4x_api.RegistryBatchResult;
+pub const RegistrySnapshotCursor = r4x_api.RegistrySnapshotCursor;
+pub const RegistrySnapshotEntry = r4x_api.RegistrySnapshotEntry;
+pub const RegistrySnapshotPageInfo = r4x_api.RegistrySnapshotPageInfo;
 pub const MonotonicClockInfo = r4x_api.MonotonicClockInfo;
 
 var path_resolver: ?ResolveTargetFn = null;
@@ -662,6 +667,196 @@ pub fn registryDeleteValue(path_ptr: [*:0]const u8, name_ptr: [*:0]const u8) cal
     const parsed = registry.parseRoot(key_path) orelse return registry_api_result_bad_path;
     if (!activeRegistryHive(parsed.kind)) return registry_api_result_unsupported;
     return registryMutateValue(.delete, parsed.kind, key_path, value_name, .binary, "");
+}
+
+pub fn registrySnapshotBegin(path_ptr: [*:0]const u8, kind: u32, cursor: *RegistrySnapshotCursor) callconv(.c) i32 {
+    if (@intFromPtr(path_ptr) == 0 or @intFromPtr(cursor) == 0) return registry_api_result_invalid;
+    if (kind != r4x_api.registry_snapshot_kind_keys and kind != r4x_api.registry_snapshot_kind_values)
+        return registry_api_result_invalid;
+
+    const previous_restarts = if (registrySnapshotCursorShapeValid(cursor)) cursor.restarts else 0;
+    var path_buf: [registry_max_path]u8 = undefined;
+    const key_path = copyZ(path_ptr, path_buf[0..]) orelse return registry_api_result_bad_path;
+    const parsed = registry.parseRoot(key_path) orelse return registry_api_result_bad_path;
+    if (!activeRegistryHive(parsed.kind)) return registry_api_result_unsupported;
+
+    const prepared = prepareRegistryRead(parsed.kind);
+    if (prepared != registry_api_result_ok) return prepared;
+    if (!lockRegistryState()) return registry_api_result_io;
+    defer unlockRegistryState();
+    const hive = registryCachedViewLocked(parsed.kind) orelse return registry_api_result_hive_not_found;
+    noteRegistryReadLocked();
+    const key_index = hive.findKey(key_path) orelse return registry_api_result_key_not_found;
+    const key = hive.keyAt(key_index);
+    cursor.* = .{
+        .version = r4x_api.registry_snapshot_version,
+        .size = @sizeOf(RegistrySnapshotCursor),
+        .generation = hive.header.generation,
+        .key_index = key_index,
+        .kind = kind,
+        .next_index = 0,
+        .total = if (kind == r4x_api.registry_snapshot_kind_keys) key.child_count else key.value_count,
+        .flags = r4x_api.registry_snapshot_cursor_flag_initialized,
+        .restarts = previous_restarts,
+    };
+    return registry_api_result_ok;
+}
+
+pub fn registrySnapshotPage(
+    cursor: *RegistrySnapshotCursor,
+    out_entries: [*]RegistrySnapshotEntry,
+    entry_capacity: u32,
+    out_data: [*]u8,
+    data_capacity: u32,
+    out_page: *RegistrySnapshotPageInfo,
+) callconv(.c) i32 {
+    if (@intFromPtr(cursor) == 0 or @intFromPtr(out_entries) == 0 or
+        @intFromPtr(out_data) == 0 or @intFromPtr(out_page) == 0)
+        return registry_api_result_invalid;
+    initRegistrySnapshotPage(cursor, out_page);
+    if (!registrySnapshotCursorValid(cursor) or entry_capacity == 0 or
+        entry_capacity > r4x_api.registry_snapshot_page_max or
+        data_capacity > r4x_api.registry_snapshot_data_max)
+        return registry_api_result_invalid;
+
+    const prepared = prepareRegistryRead(.system);
+    if (prepared != registry_api_result_ok) return prepared;
+    if (!lockRegistryState()) return registry_api_result_io;
+    defer unlockRegistryState();
+    const hive = registryCachedViewLocked(.system) orelse return registry_api_result_hive_not_found;
+    noteRegistryReadLocked();
+    if (hive.header.generation != cursor.generation) {
+        cursor.restarts +|= 1;
+        out_page.status = r4x_api.registry_snapshot_status_restart;
+        return registry_api_result_ok;
+    }
+    if (cursor.key_index >= hive.header.key_count or cursor.next_index > cursor.total) {
+        out_page.status = r4x_api.registry_snapshot_status_invalid;
+        return registry_api_result_invalid;
+    }
+
+    const key = hive.keyAt(cursor.key_index);
+    const live_total = if (cursor.kind == r4x_api.registry_snapshot_kind_keys) key.child_count else key.value_count;
+    if (live_total != cursor.total) {
+        cursor.restarts +|= 1;
+        out_page.status = r4x_api.registry_snapshot_status_restart;
+        return registry_api_result_ok;
+    }
+
+    const remaining = cursor.total - cursor.next_index;
+    const returned: u32 = @min(remaining, entry_capacity);
+    var data_used: usize = 0;
+    var relative: u32 = 0;
+    while (relative < returned) : (relative += 1) {
+        const entry = &out_entries[relative];
+        entry.* = .{};
+        const source_index = cursor.next_index + relative;
+        if (cursor.kind == r4x_api.registry_snapshot_kind_keys) {
+            if (key.child_count != 0 and key.first_child_index == registry.invalid_index)
+                return registry_api_result_hive_corrupt;
+            const child = hive.keyAt(key.first_child_index + source_index);
+            entry.kind = @intCast(r4x_api.registry_snapshot_kind_keys);
+            copyFixedZ(entry.name[0..], hive.keyName(child));
+        } else {
+            if (key.value_count != 0 and key.first_value_index == registry.invalid_index)
+                return registry_api_result_hive_corrupt;
+            const value = hive.valueAt(key.first_value_index + source_index);
+            const data = hive.valueData(value);
+            entry.kind = @intCast(r4x_api.registry_snapshot_kind_values);
+            entry.value_type = @intFromEnum(value.value_type);
+            entry.data_len = value.data_len;
+            copyFixedZ(entry.name[0..], hive.valueName(value));
+            const data_capacity_usize: usize = @intCast(data_capacity);
+            if (data.len <= data_capacity_usize - data_used) {
+                entry.flags = r4x_api.registry_snapshot_entry_flag_data_present;
+                entry.data_offset = @intCast(data_used);
+                if (data.len != 0) @memcpy(out_data[data_used .. data_used + data.len], data);
+                data_used += data.len;
+            } else {
+                entry.flags = r4x_api.registry_snapshot_entry_flag_data_omitted;
+            }
+        }
+    }
+
+    cursor.next_index += returned;
+    out_page.* = .{
+        .version = r4x_api.registry_snapshot_version,
+        .size = @sizeOf(RegistrySnapshotPageInfo),
+        .generation = cursor.generation,
+        .total = cursor.total,
+        .returned = returned,
+        .next_index = cursor.next_index,
+        .data_bytes = @intCast(data_used),
+        .kind = cursor.kind,
+        .status = if (cursor.next_index < cursor.total)
+            r4x_api.registry_snapshot_status_more
+        else
+            r4x_api.registry_snapshot_status_complete,
+    };
+    return registry_api_result_ok;
+}
+
+pub fn registryBatchMutate(
+    operations_ptr: [*]const RegistryBatchOperation,
+    operation_count: u32,
+    blob_ptr: [*]const u8,
+    blob_len: u32,
+    out_result: *RegistryBatchResult,
+) callconv(.c) i32 {
+    if (@intFromPtr(operations_ptr) == 0 or @intFromPtr(blob_ptr) == 0 or @intFromPtr(out_result) == 0)
+        return registry_api_result_invalid;
+    if (out_result.version != r4x_api.registry_batch_version or out_result.size < @sizeOf(RegistryBatchResult))
+        return registry_api_result_invalid;
+    out_result.* = registryBatchResultInit(operation_count);
+    if (operation_count == 0 or operation_count > r4x_api.registry_batch_operation_max or
+        blob_len > r4x_api.registry_batch_blob_max)
+        return registry_api_result_invalid;
+
+    const operations = operations_ptr[0..@intCast(operation_count)];
+    const blob = blob_ptr[0..@intCast(blob_len)];
+    if (validateRegistryBatch(operations, blob, out_result)) |validation_error| return validation_error;
+
+    acquireRegistryTransactionGate();
+    defer releaseRegistryTransactionGate();
+    const resumed = resumePendingRegistryCommitUnderTransaction();
+    if (resumed != registry_api_result_ok) {
+        out_result.status = r4x_api.registry_batch_status_commit_failed;
+        return resumed;
+    }
+    const flushed = flushRegistryWritebackUnderTransaction();
+    if (flushed != registry_api_result_ok) {
+        out_result.status = r4x_api.registry_batch_status_commit_failed;
+        return flushed;
+    }
+    const loaded = ensureRegistryHiveCachedUnderTransaction(.system);
+    if (loaded != registry_api_result_ok and loaded != registry_api_result_hive_not_found) {
+        out_result.status = r4x_api.registry_batch_status_commit_failed;
+        return loaded;
+    }
+
+    const candidate = buildRegistryBatchCandidate(operations, blob, out_result);
+    if (candidate.result != registry_api_result_ok) {
+        out_result.status = r4x_api.registry_batch_status_validation_failed;
+        out_result.generation_after = out_result.generation_before;
+        return candidate.result;
+    }
+
+    const committed = commitRegistrySlotUnderTransaction(candidate.slot, false);
+    if (committed.result != registry_api_result_ok) {
+        noteRegistryCommitFailure(candidate.slot, committed.uncertain);
+        out_result.status = r4x_api.registry_batch_status_commit_failed;
+        out_result.generation_after = out_result.generation_before;
+        return committed.result;
+    }
+    const published = publishRegistryCandidate(candidate.slot, false);
+    if (published != registry_api_result_ok) {
+        out_result.status = r4x_api.registry_batch_status_commit_failed;
+        out_result.generation_after = out_result.generation_before;
+        return published;
+    }
+    out_result.status = r4x_api.registry_batch_status_committed;
+    out_result.generation_after = candidate.generation;
+    return registry_api_result_ok;
 }
 
 pub fn driveInfo(index: u32, out: *DriveInfo) callconv(.c) i32 {
@@ -3618,6 +3813,145 @@ fn stdMemEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
+fn registrySnapshotCursorShapeValid(cursor: *const RegistrySnapshotCursor) bool {
+    return cursor.version == r4x_api.registry_snapshot_version and
+        cursor.size >= @sizeOf(RegistrySnapshotCursor);
+}
+
+fn registrySnapshotCursorValid(cursor: *const RegistrySnapshotCursor) bool {
+    return registrySnapshotCursorShapeValid(cursor) and
+        cursor.generation != 0 and
+        (cursor.flags & r4x_api.registry_snapshot_cursor_flag_initialized) != 0 and
+        (cursor.kind == r4x_api.registry_snapshot_kind_keys or
+            cursor.kind == r4x_api.registry_snapshot_kind_values);
+}
+
+fn initRegistrySnapshotPage(cursor: *const RegistrySnapshotCursor, out_page: *RegistrySnapshotPageInfo) void {
+    out_page.* = .{
+        .version = r4x_api.registry_snapshot_version,
+        .size = @sizeOf(RegistrySnapshotPageInfo),
+        .generation = cursor.generation,
+        .total = cursor.total,
+        .next_index = cursor.next_index,
+        .kind = cursor.kind,
+        .status = r4x_api.registry_snapshot_status_invalid,
+    };
+}
+
+fn registryBatchResultInit(operation_count: u32) RegistryBatchResult {
+    return .{
+        .version = r4x_api.registry_batch_version,
+        .size = @sizeOf(RegistryBatchResult),
+        .operation_count = operation_count,
+        .failed_index = r4x_api.registry_batch_failed_index_none,
+        .status = r4x_api.registry_batch_status_invalid,
+    };
+}
+
+fn registryBatchSlice(blob: []const u8, offset: u32, len: u32) ?[]const u8 {
+    const start: usize = @intCast(offset);
+    const count: usize = @intCast(len);
+    if (start > blob.len or count > blob.len - start) return null;
+    return blob[start .. start + count];
+}
+
+fn failRegistryBatchValidation(out_result: *RegistryBatchResult, index: usize, result: i32) i32 {
+    out_result.failed_index = @intCast(index);
+    out_result.status = r4x_api.registry_batch_status_validation_failed;
+    return result;
+}
+
+fn validateRegistryBatch(
+    operations: []const RegistryBatchOperation,
+    blob: []const u8,
+    out_result: *RegistryBatchResult,
+) ?i32 {
+    for (operations, 0..) |operation, index| {
+        if (operation.reserved0 != 0 or
+            (operation.operation != r4x_api.registry_batch_operation_set and
+                operation.operation != r4x_api.registry_batch_operation_delete))
+            return failRegistryBatchValidation(out_result, index, registry_api_result_invalid);
+
+        const key_path = registryBatchSlice(blob, operation.key_path_offset, operation.key_path_len) orelse
+            return failRegistryBatchValidation(out_result, index, registry_api_result_invalid);
+        const value_name = registryBatchSlice(blob, operation.value_name_offset, operation.value_name_len) orelse
+            return failRegistryBatchValidation(out_result, index, registry_api_result_invalid);
+        if (key_path.len == 0 or key_path.len > r4x_api.registry_path_max_bytes)
+            return failRegistryBatchValidation(out_result, index, registry_api_result_bad_path);
+        const parsed = registry.parseRoot(key_path) orelse
+            return failRegistryBatchValidation(out_result, index, registry_api_result_bad_path);
+        if (!activeRegistryHive(parsed.kind))
+            return failRegistryBatchValidation(out_result, index, registry_api_result_unsupported);
+        if (!validRegistryBatchValueName(value_name))
+            return failRegistryBatchValidation(out_result, index, registry_api_result_invalid);
+
+        if (operation.operation == r4x_api.registry_batch_operation_delete) {
+            if (operation.value_type != 0 or operation.data_len != 0)
+                return failRegistryBatchValidation(out_result, index, registry_api_result_invalid);
+        } else {
+            const value_type = registry.ValueType.fromInt(operation.value_type) orelse
+                return failRegistryBatchValidation(out_result, index, registry_api_result_invalid);
+            const data = registryBatchSlice(blob, operation.data_offset, operation.data_len) orelse
+                return failRegistryBatchValidation(out_result, index, registry_api_result_invalid);
+            if (!validRegistryBatchPayload(value_type, data))
+                return failRegistryBatchValidation(out_result, index, registry_api_result_invalid);
+        }
+
+        var prior_index: usize = 0;
+        while (prior_index < index) : (prior_index += 1) {
+            const prior = operations[prior_index];
+            const prior_path = registryBatchSlice(blob, prior.key_path_offset, prior.key_path_len) orelse unreachable;
+            const prior_name = registryBatchSlice(blob, prior.value_name_offset, prior.value_name_len) orelse unreachable;
+            if (registryBatchPathEql(prior_path, key_path) and asciiEqlIgnoreCase(prior_name, value_name))
+                return failRegistryBatchValidation(out_result, index, registry_api_result_invalid);
+        }
+    }
+    return null;
+}
+
+fn validRegistryBatchValueName(value_name: []const u8) bool {
+    if (value_name.len > 63) return false;
+    for (value_name) |ch| {
+        if (ch < 0x20 or ch == 0x7f or ch == 0 or ch == '\\' or ch == '/' or ch == '=') return false;
+    }
+    return true;
+}
+
+fn validRegistryBatchPayload(value_type: registry.ValueType, data: []const u8) bool {
+    return switch (value_type) {
+        .string, .binary => true,
+        .u32 => data.len == 4,
+        .u64 => data.len == 8,
+        .bool => data.len == 1 and (data[0] == 0 or data[0] == 1),
+        .multi_string => validRegistryBatchMultiString(data),
+    };
+}
+
+fn validRegistryBatchMultiString(data: []const u8) bool {
+    if (data.len < 4) return false;
+    const count = readLe32(data[0..4]);
+    var offset: usize = 4;
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        if (offset + 2 > data.len) return false;
+        const len: usize = readLe16(data[offset .. offset + 2]);
+        offset += 2;
+        if (len > data.len - offset) return false;
+        offset += len;
+    }
+    return offset == data.len;
+}
+
+fn registryBatchPathEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |a_raw, b_raw| {
+        const a_ch = if (a_raw == '/') '\\' else asciiUpper(a_raw);
+        const b_ch = if (b_raw == '/') '\\' else asciiUpper(b_raw);
+        if (a_ch != b_ch) return false;
+    }
+    return true;
+}
+
 const RegistryMutationKind = enum {
     set,
     delete,
@@ -3699,7 +4033,108 @@ fn registryMutateValue(kind: RegistryMutationKind, hive_kind: registry.HiveKind,
 const RegistryCandidate = struct {
     result: i32,
     slot: u8 = registry_slot_none,
+    generation: u64 = 0,
 };
+
+fn buildRegistryBatchCandidate(
+    operations: []const RegistryBatchOperation,
+    blob: []const u8,
+    out_result: *RegistryBatchResult,
+) RegistryCandidate {
+    if (!lockRegistryState()) return .{ .result = registry_api_result_io };
+    defer unlockRegistryState();
+
+    const current = registryCachedViewLocked(.system);
+    out_result.generation_before = if (current) |hive| hive.header.generation else 0;
+    out_result.generation_after = out_result.generation_before;
+
+    for (operations, 0..) |operation, index| {
+        if (operation.operation != r4x_api.registry_batch_operation_delete) continue;
+        const hive = current orelse {
+            out_result.failed_index = @intCast(index);
+            return .{ .result = registry_api_result_hive_not_found };
+        };
+        const key_path = registryBatchSlice(blob, operation.key_path_offset, operation.key_path_len) orelse unreachable;
+        const value_name = registryBatchSlice(blob, operation.value_name_offset, operation.value_name_len) orelse unreachable;
+        const key_index = hive.findKey(key_path) orelse {
+            out_result.failed_index = @intCast(index);
+            return .{ .result = registry_api_result_key_not_found };
+        };
+        _ = hive.findValue(key_index, value_name) orelse {
+            out_result.failed_index = @intCast(index);
+            return .{ .result = registry_api_result_value_not_found };
+        };
+    }
+
+    const candidate_index = inactiveRegistrySlotLocked();
+    var candidate_slot = &registry_hive_state.slots[candidate_index];
+    candidate_slot.valid = false;
+    candidate_slot.dirty = false;
+    candidate_slot.view = null;
+    candidate_slot.len = 0;
+
+    var list = RegistryValueList.init(registry_write_path_pool[0..]);
+    if (current) |hive| {
+        const collect_result = collectRegistryValuesForBatch(hive, &list, operations, blob);
+        if (collect_result != registry_api_result_ok) return .{ .result = collect_result };
+    }
+    for (operations) |operation| {
+        if (operation.operation != r4x_api.registry_batch_operation_set) continue;
+        const key_path = registryBatchSlice(blob, operation.key_path_offset, operation.key_path_len) orelse unreachable;
+        const value_name = registryBatchSlice(blob, operation.value_name_offset, operation.value_name_len) orelse unreachable;
+        const data = registryBatchSlice(blob, operation.data_offset, operation.data_len) orelse unreachable;
+        const value_type = registry.ValueType.fromInt(operation.value_type) orelse unreachable;
+        if (!list.append(key_path, value_name, value_type, data))
+            return .{ .result = registry_api_result_buffer_too_small };
+    }
+
+    const generation = if (current) |hive| nextRegistryGeneration(hive.header.generation) else 1;
+    const view = registry.buildHiveViewInto(candidate_slot.bytes[0..], .{
+        .keys = registry_write_keys[0..],
+        .value_key_indices = registry_value_key_indices[0..],
+        .flat_key_order = registry_flat_key_order[0..],
+    }, .system, generation, list.items()) catch |err| return .{ .result = registryBuildError(err) };
+    candidate_slot.valid = true;
+    candidate_slot.kind = .system;
+    candidate_slot.len = view.bytes.len;
+    candidate_slot.view = view;
+    registry_hive_state.performance.validation_passes +%= 1;
+    return .{ .result = registry_api_result_ok, .slot = candidate_index, .generation = generation };
+}
+
+fn collectRegistryValuesForBatch(
+    hive: registry.HiveView,
+    list: *RegistryValueList,
+    operations: []const RegistryBatchOperation,
+    blob: []const u8,
+) i32 {
+    var key_index: u32 = 0;
+    while (key_index < hive.header.key_count) : (key_index += 1) {
+        const key = hive.keyAt(key_index);
+        if (key.value_count == 0) continue;
+        const build_path = registryKeyPathForBuild(hive, key_index, list) orelse
+            return registry_api_result_buffer_too_small;
+
+        var value_offset: u32 = 0;
+        while (value_offset < key.value_count) : (value_offset += 1) {
+            const value = hive.valueAt(key.first_value_index + value_offset);
+            const value_name = hive.valueName(value);
+            var replaced = false;
+            for (operations) |operation| {
+                const target_path = registryBatchSlice(blob, operation.key_path_offset, operation.key_path_len) orelse unreachable;
+                const target_name = registryBatchSlice(blob, operation.value_name_offset, operation.value_name_len) orelse unreachable;
+                if (registryBatchPathEql(build_path, target_path) and asciiEqlIgnoreCase(value_name, target_name)) {
+                    replaced = true;
+                    break;
+                }
+            }
+            if (replaced) continue;
+            if (!list.append(build_path, value_name, value.value_type, hive.valueData(value)))
+                return registry_api_result_buffer_too_small;
+        }
+    }
+    return registry_api_result_ok;
+}
 
 fn buildRegistryMutationCandidate(kind: RegistryMutationKind, hive_kind: registry.HiveKind, key_path: []const u8, value_name: []const u8, value_type: registry.ValueType, data: []const u8) RegistryCandidate {
     if (!lockRegistryState()) return .{ .result = registry_api_result_io };

@@ -5262,6 +5262,9 @@ fn configureR4XStartR4SysTable() void {
         .program_module_running = &r4api.r4sys.programModuleRunning,
         .monotonic_clock = &r4api.r4sys.monotonicClock,
         .boot_ready = &apiBootReady,
+        .registry_snapshot_begin = &r4api.r4sys.registrySnapshotBegin,
+        .registry_snapshot_page = &r4api.r4sys.registrySnapshotPage,
+        .registry_batch_mutate = &r4api.r4sys.registryBatchMutate,
     });
 }
 
