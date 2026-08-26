@@ -227,8 +227,10 @@ const IO_ERROR_BUSY: i32 = -7;
 const IO_ERROR_UNSUPPORTED: i32 = -8;
 const IO_ERROR_CANCELLED: i32 = -9;
 const IO_ERROR_TOO_LARGE: i32 = -10;
+const IO_ERROR_LOCK_VIOLATION: i32 = r4x_api.io_error_lock_violation;
 const IO_INFO_VERSION: u32 = 1;
 const IO_FLAGS_SUPPORTED: u32 = 0;
+const IO_FILE_LOCK_FLAG_UNLOCK: u32 = r4x_api.io_file_lock_flag_unlock;
 
 const MEM_ERROR_RETIRED: i32 = -8;
 const VM_PROBE_OK: i32 = 0;
@@ -681,6 +683,9 @@ const AsyncIoKind = enum(u32) {
     file_stream_finish = 7,
     file_stream_abort = 8,
     service_call = 9,
+    file_write_at = 10,
+    file_info = 11,
+    file_lock = 12,
 };
 
 const AsyncIoState = enum(u32) {
@@ -735,6 +740,18 @@ const AsyncIoRequest = struct {
     service_response_capacity: u32 = 0,
     service_timeout_ticks: u64 = 0,
     service_request_id: u32 = 0,
+};
+
+const MAX_FILE_RANGE_LOCKS: usize = 64;
+
+const FileRangeLock = struct {
+    used: bool = false,
+    owner_instance_id: u32 = 0,
+    owner_instance_generation: u64 = 0,
+    offset: u64 = 0,
+    length: u64 = 0,
+    path: [MAX_API_PATH]u8 = .{0} ** MAX_API_PATH,
+    path_len: usize = 0,
 };
 
 const AsyncIoRetireClaim = struct {
@@ -4742,6 +4759,7 @@ var program_stack_telemetry_by_profile: [MEMORY_PROFILE_COUNT]ProgramStackTeleme
 var next_thread_generation: u64 = 1;
 var next_inventory_snapshot_generation: u64 = 1;
 var async_io_requests: [MAX_ASYNC_IO_REQUESTS]AsyncIoRequest = .{AsyncIoRequest{}} ** MAX_ASYNC_IO_REQUESTS;
+var file_range_locks: [MAX_FILE_RANGE_LOCKS]FileRangeLock = .{FileRangeLock{}} ** MAX_FILE_RANGE_LOCKS;
 var async_io_retire_retry_test_armed = false;
 var async_io_retire_retry_test_consumed = false;
 var async_io_retire_retry_test_remaining: u32 = 0;
@@ -5709,6 +5727,7 @@ pub fn reclaimProgramRegistryUnderPressure() void {
 var next_thread_id: u32 = 1;
 var next_async_io_id: u32 = 1;
 var async_io_lock = sync.Mutex.initClass("r4x-async-io", sync.LockRank.program_instances, .sleepable);
+var file_range_lock = sync.Mutex.initClass("r4x-file-range-lock", sync.LockRank.program_instances, .sleepable);
 var foreground_instance_id: ?u32 = null;
 var foreground_instance_generation: u64 = 0;
 var shell_instance_id: ?u32 = null;
@@ -5894,6 +5913,9 @@ fn configureR4XStartR4SysTable() void {
         .registry_snapshot_begin = &r4api.r4sys.registrySnapshotBegin,
         .registry_snapshot_page = &r4api.r4sys.registrySnapshotPage,
         .registry_batch_mutate = &r4api.r4sys.registryBatchMutate,
+        .io_file_write_at = &apiIoFileWriteAt,
+        .io_file_info = &apiIoFileInfo,
+        .io_file_lock = &apiIoFileLock,
     });
 }
 
@@ -8751,6 +8773,18 @@ fn apiIoFileAppend(path: [*:0]const u8, data: [*]const u8, len: u64, flags: u32,
     return submitAsyncFileRequest(.file_append, path, 0, @intFromPtr(data), len, 0, 0, flags, out_request_id);
 }
 
+fn apiIoFileWriteAt(path: [*:0]const u8, offset: u64, data: [*]const u8, len: u64, flags: u32, out_request_id: *u32) callconv(.c) i32 {
+    return submitAsyncFileRequest(.file_write_at, path, offset, @intFromPtr(data), len, 0, 0, flags, out_request_id);
+}
+
+fn apiIoFileInfo(path: [*:0]const u8, flags: u32, out_request_id: *u32) callconv(.c) i32 {
+    return submitAsyncFileRequest(.file_info, path, 0, 0, 0, 0, 0, flags, out_request_id);
+}
+
+fn apiIoFileLock(path: [*:0]const u8, offset: u64, length: u64, flags: u32, out_request_id: *u32) callconv(.c) i32 {
+    return submitAsyncFileRequest(.file_lock, path, offset, 0, length, 0, 0, flags, out_request_id);
+}
+
 fn apiIoFileStreamBegin(path: [*:0]const u8, flags: u32, out_request_id: *u32) callconv(.c) i32 {
     return submitAsyncFileRequest(.file_stream_begin, path, 0, 0, 0, 0, 0, flags, out_request_id);
 }
@@ -8980,8 +9014,12 @@ fn waitAndCloseIoRequest(request_id: u32) i32 {
 fn submitAsyncFileRequest(kind: AsyncIoKind, path: [*:0]const u8, offset: u64, data_ptr: usize, data_len: u64, out_ptr: usize, out_len: u64, flags: u32, out_request_id: *u32) i32 {
     if (@intFromPtr(out_request_id) == 0 or @intFromPtr(path) == 0) return IO_ERROR_INVALID;
     out_request_id.* = 0;
-    if ((flags & ~IO_FLAGS_SUPPORTED) != 0 and kind != .file_stream_begin and kind != .file_stream_write and kind != .file_stream_finish) return IO_ERROR_UNSUPPORTED;
-    if ((kind == .file_write or kind == .file_append or kind == .file_stream_write) and data_len != 0 and data_ptr == 0) return IO_ERROR_INVALID;
+    if (kind == .file_lock) {
+        if ((flags & ~IO_FILE_LOCK_FLAG_UNLOCK) != 0 or data_len == 0) return IO_ERROR_INVALID;
+    } else if ((flags & ~IO_FLAGS_SUPPORTED) != 0 and kind != .file_stream_begin and kind != .file_stream_write and kind != .file_stream_finish) {
+        return IO_ERROR_UNSUPPORTED;
+    }
+    if ((kind == .file_write or kind == .file_append or kind == .file_write_at or kind == .file_stream_write) and data_len != 0 and data_ptr == 0) return IO_ERROR_INVALID;
     if ((kind == .file_read or kind == .file_read_at) and out_len != 0 and out_ptr == 0) return IO_ERROR_INVALID;
     const instance = currentInstance() orelse return IO_ERROR_NO_INSTANCE;
     if (instance.done) return IO_ERROR_NO_INSTANCE;
@@ -9162,16 +9200,19 @@ fn asyncIoTaskMain() callconv(.c) void {
 }
 
 fn performAsyncIo(req: *AsyncIoRequest) i32 {
-    if (req.data_len > 0xFFFF_FFFF or req.out_len > 0xFFFF_FFFF) return IO_ERROR_TOO_LARGE;
+    if (req.kind != .file_lock and (req.data_len > 0xFFFF_FFFF or req.out_len > 0xFFFF_FFFF)) return IO_ERROR_TOO_LARGE;
     var empty_byte: [1]u8 = .{0};
     const path_ptr: [*:0]const u8 = @ptrCast(req.path[0..].ptr);
-    const data_ptr: [*]const u8 = if (req.data_len == 0) @ptrCast(empty_byte[0..].ptr) else @ptrFromInt(req.data_ptr);
-    const out_ptr: [*]u8 = if (req.out_len == 0) @ptrCast(empty_byte[0..].ptr) else @ptrFromInt(req.out_ptr);
+    const data_ptr: [*]const u8 = if (req.data_ptr == 0) @ptrCast(empty_byte[0..].ptr) else @ptrFromInt(req.data_ptr);
+    const out_ptr: [*]u8 = if (req.out_ptr == 0) @ptrCast(empty_byte[0..].ptr) else @ptrFromInt(req.out_ptr);
     return switch (req.kind) {
         .file_read => r4api.r4sys.fileRead(path_ptr, out_ptr, @intCast(req.out_len)),
-        .file_read_at => if (req.offset > 0xFFFF_FFFF) IO_ERROR_TOO_LARGE else r4api.r4sys.fileReadAt(path_ptr, @intCast(req.offset), out_ptr, @intCast(req.out_len)),
+        .file_read_at => r4api.r4sys.fileReadAt64(path_ptr, req.offset, out_ptr, @intCast(req.out_len)),
         .file_write => r4api.r4sys.fileWrite(path_ptr, data_ptr, @intCast(req.data_len)),
         .file_append => r4api.r4sys.fileAppend(path_ptr, data_ptr, @intCast(req.data_len)),
+        .file_write_at => normalizeAsyncWriteAtResult(r4api.r4sys.fileWriteAt(path_ptr, req.offset, data_ptr, @intCast(req.data_len))),
+        .file_info => performAsyncFileInfo(path_ptr),
+        .file_lock => performAsyncFileLock(req),
         .file_stream_begin => r4api.r4sys.fileStreamBegin(path_ptr, req.flags),
         .file_stream_write => r4api.r4sys.fileStreamWrite(path_ptr, req.offset, data_ptr, @intCast(req.data_len), req.flags),
         .file_stream_finish => r4api.r4sys.fileStreamFinish(path_ptr, req.offset, req.flags),
@@ -9179,6 +9220,106 @@ fn performAsyncIo(req: *AsyncIoRequest) i32 {
         .service_call => performAsyncServiceCall(req),
         .none => IO_ERROR_INVALID,
     };
+}
+
+fn normalizeAsyncWriteAtResult(result: i32) i32 {
+    if (result >= 0) return result;
+    return switch (result) {
+        -1 => IO_ERROR_INVALID,
+        -2, -3 => IO_ERROR_NOT_FOUND,
+        -7 => IO_ERROR_BUSY,
+        -8 => IO_ERROR_TOO_LARGE,
+        else => IO_ERROR_BUSY,
+    };
+}
+
+fn performAsyncFileInfo(path: [*:0]const u8) i32 {
+    var info: r4api.r4sys.FileInfo = .{};
+    const result = r4api.r4sys.fileInfo(path, &info);
+    if (result == 0) return IO_ERROR_NOT_FOUND;
+    if (result < 0) {
+        return switch (result) {
+            -1 => IO_ERROR_INVALID,
+            -2 => IO_ERROR_NOT_FOUND,
+            else => IO_ERROR_BUSY,
+        };
+    }
+    if (info.is_dir != 0) return IO_ERROR_INVALID;
+    if (info.size > std.math.maxInt(i32)) return IO_ERROR_TOO_LARGE;
+    return @intCast(info.size);
+}
+
+fn performAsyncFileLock(req: *const AsyncIoRequest) i32 {
+    if (req.path_len == 0 or req.data_len == 0 or (req.flags & ~IO_FILE_LOCK_FLAG_UNLOCK) != 0) return IO_ERROR_INVALID;
+    if (!file_range_lock.lock(sync.WAIT_FOREVER)) return IO_ERROR_BUSY;
+    defer _ = file_range_lock.unlock();
+
+    if ((req.flags & IO_FILE_LOCK_FLAG_UNLOCK) != 0) {
+        for (&file_range_locks) |*entry| {
+            if (!entry.used or
+                entry.owner_instance_id != req.owner_instance_id or
+                entry.owner_instance_generation != req.owner_instance_generation or
+                entry.offset != req.offset or entry.length != req.data_len or
+                !fileRangeLockPathEqual(entry, req)) continue;
+            entry.* = .{};
+            return IO_OK;
+        }
+        return IO_ERROR_LOCK_VIOLATION;
+    }
+
+    for (&file_range_locks) |*entry| {
+        if (!entry.used or !fileRangeLockPathEqual(entry, req)) continue;
+        if (entry.owner_instance_id == req.owner_instance_id and
+            entry.owner_instance_generation == req.owner_instance_generation) continue;
+        if (fileRangesOverlap(entry.offset, entry.length, req.offset, req.data_len)) return IO_ERROR_LOCK_VIOLATION;
+    }
+
+    for (&file_range_locks) |*entry| {
+        if (entry.used) continue;
+        entry.* = .{
+            .used = true,
+            .owner_instance_id = req.owner_instance_id,
+            .owner_instance_generation = req.owner_instance_generation,
+            .offset = req.offset,
+            .length = req.data_len,
+            .path_len = req.path_len,
+        };
+        @memcpy(entry.path[0..req.path_len], req.path[0..req.path_len]);
+        entry.path[req.path_len] = 0;
+        return IO_OK;
+    }
+    return IO_ERROR_NO_SLOTS;
+}
+
+fn fileRangesOverlap(a_offset: u64, a_length: u64, b_offset: u64, b_length: u64) bool {
+    const a_end = std.math.add(u64, a_offset, a_length) catch std.math.maxInt(u64);
+    const b_end = std.math.add(u64, b_offset, b_length) catch std.math.maxInt(u64);
+    return a_offset < b_end and b_offset < a_end;
+}
+
+fn fileRangeLockPathEqual(entry: *const FileRangeLock, req: *const AsyncIoRequest) bool {
+    if (entry.path_len != req.path_len) return false;
+    var index: usize = 0;
+    while (index < entry.path_len) : (index += 1) {
+        if (normalizedFileLockPathByte(entry.path[index]) != normalizedFileLockPathByte(req.path[index])) return false;
+    }
+    return true;
+}
+
+fn normalizedFileLockPathByte(byte: u8) u8 {
+    if (byte == '/') return '\\';
+    return std.ascii.toUpper(byte);
+}
+
+fn releaseFileRangeLocksForHandle(handle: ProgramProcessHandle) bool {
+    if (!file_range_lock.lock(sync.WAIT_FOREVER)) return false;
+    defer _ = file_range_lock.unlock();
+    for (&file_range_locks) |*entry| {
+        if (entry.used and
+            entry.owner_instance_id == handle.instance_id and
+            entry.owner_instance_generation == handle.generation) entry.* = .{};
+    }
+    return true;
 }
 
 fn performAsyncServiceCall(req: *AsyncIoRequest) i32 {
@@ -15422,6 +15563,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                 terminateProgramThreadsForHandle(handle, -9, null);
                 if (!releaseThreadsForHandle(handle)) return deferProgramRetire(handle);
                 if (!purgeCancelledAsyncIoRequestsForHandle(handle)) return deferProgramRetire(handle);
+                if (!releaseFileRangeLocksForHandle(handle)) return deferProgramRetire(handle);
                 if (!r4api.r4sys.releaseStreamSlotsForProgram(handle.instance_id, handle.generation)) return deferProgramRetire(handle);
                 if (!audio.closeStreamsForOwner(.{
                     .instance_id = handle.instance_id,
