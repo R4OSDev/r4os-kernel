@@ -283,6 +283,24 @@ Bootdatensatz; breite Subsystem-Summaries oder aktive Diagnoseprobes gehoeren
 nicht in diesen Pfad. Die spaeten Phasen laufen einmalig in der Reihenfolge
 `task_runtime`, `driver_policy`, `runtime`, `shell`.
 
+Ereignisgesteuerte Konsolen seit 0.69.67
+----------------------------------------
+
+R4DESK stellt optional einen generationengebundenen Inputwait bereit. Der
+Consumer prueft Bulkqueue und Generation unter dem Queuebesitzerlock und
+uebergibt diesen atomar an die Scheduler-WaitQueue; Eingabeproducer
+publizieren erst Bytes und Generation und wecken danach. Close, Kill und
+Queueabbau erreichen denselben Wake-/Cancelpfad. `consoleRead` und `readKey`
+bleiben nichtblockierende Bulk- beziehungsweise Polloperationen.
+
+Konsolenausgabe liegt in versiegelten 16-KB-Quellbloecken. Sichtbare
+Hosttranscripte und private Completiontranscripte halten Referenzen auf
+dieselben Bytes, besitzen aber eigene begrenzte Segmentlisten und
+Dropgrenzen. Der Produzent versiegelt einen vollen Block, bevor er ein noch
+referenziertes Byte ueberschreiben koennte. Revisionen und Desktopsignale
+werden einmal pro vollstaendig geschriebenem Batch publiziert; Completion-
+Read bleibt bis zum Reap generationengeprueft und stabil.
+
 Skalierende Scheduler-Arbeitsmengen
 -----------------------------------
 

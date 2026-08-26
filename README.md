@@ -144,6 +144,12 @@ state is published, either at a lock-safe synchronous return point or at the
 existing post-handler/EOI IRQ boundary. Bounded mutex role donation covers
 short inversions without creating an unbounded high-priority lane.
 
+Console input can use an optional generation-bound wait while legacy key polls
+and bulk reads remain available. Console output is retained in sealed source
+blocks referenced by both the visible host transcript and an owned completion;
+each transcript keeps its own 16-KiB boundary, while revisions and desktop
+signals are published once per complete write batch.
+
 Detailed German migration notes are preserved in
 `DOCUMENTATION.de.txt`.
 

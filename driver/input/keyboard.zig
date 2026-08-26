@@ -4,6 +4,7 @@ const key_layout = @import("key_layout.zig");
 const codepoint_queue = @import("codepoint_queue.zig");
 const pic = @import("../../arch/x86_64/pic.zig");
 const time_core = @import("../../platform/time.zig");
+const sync = @import("../../sched/sync.zig");
 
 pub const IRQ: u8 = 1;
 
@@ -35,6 +36,8 @@ pub const KEY_DELETE: u8 = 0x7F;
 pub const Layout = key_layout.Layout;
 
 var queue = codepoint_queue.Queue.init();
+var input_wait = sync.WaitQueue.init();
+var input_generation: u64 = 0;
 var shift_down = false;
 var ctrl_down = false;
 var alt_down = false;
@@ -72,6 +75,7 @@ pub const Stats = struct {
 };
 
 pub fn init() void {
+    _ = input_wait.reopen();
     drainOutput();
     pic.unmask(IRQ);
 }
@@ -86,6 +90,7 @@ pub fn disable() void {
     modifier_tick = 0;
     modifier_key_seen = false;
     extended = false;
+    _ = input_wait.close(.cancelled);
     drainOutput();
 }
 
@@ -116,6 +121,30 @@ pub fn readCodepoint() ?u32 {
 
 pub fn pending() bool {
     return queue.pending();
+}
+
+pub fn inputGeneration() u64 {
+    return input_wait.readSequence(&input_generation);
+}
+
+pub fn signalInputActivity() void {
+    _ = input_wait.bumpSequenceAndWakeAll(&input_generation);
+}
+
+const InputWaitContext = struct {
+    last_generation: u64,
+};
+
+fn inputWaitStillNeeded(raw: *anyopaque) bool {
+    const context: *InputWaitContext = @ptrCast(@alignCast(raw));
+    return input_generation == context.last_generation and !queue.pending();
+}
+
+pub fn waitInput(last_generation: u64, timeout_ticks: u64, out_generation: *u64) sync.WaitResult {
+    var context = InputWaitContext{ .last_generation = last_generation };
+    const result = input_wait.waitUnless(timeout_ticks, "keyboard-input", inputWaitStillNeeded, &context);
+    out_generation.* = input_wait.readSequence(&input_generation);
+    return result;
 }
 
 pub fn queueFreeCount() u32 {
@@ -323,6 +352,7 @@ fn handleScancode(scancode: u8) void {
 fn push(codepoint: u32) void {
     if (!queue.tryPush(codepoint)) return;
     decoded_count +%= 1;
+    _ = input_wait.bumpSequenceAndWakeAll(&input_generation);
     // 0.56.28: Desktop-Aktivitaets-Event (weckt desktopActivityWait).
     desktop_events.signal();
 }

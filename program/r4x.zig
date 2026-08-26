@@ -162,6 +162,7 @@ const GUI_ARGB32_MAX_PIXELS: usize = r4x_api.gui_argb32_max_pixels;
 const GUI_RASTER_NODE_MAX_WORDS: usize = @max(GUI_RASTER_MAX_PIXELS, (GUI_ALPHA8_MAX_PIXELS + 3) / 4);
 const GUI_TITLE_SIZE: usize = 64;
 const CONSOLE_OUTPUT_SIZE: usize = 16 * 1024;
+const CONSOLE_TRANSCRIPT_SEGMENTS: usize = 256;
 const CONSOLE_MIN_COLS: u32 = 1;
 const CONSOLE_MAX_COLS: u32 = 512;
 const CONSOLE_MIN_ROWS: u32 = 1;
@@ -762,6 +763,7 @@ const ProgramPayloadKind = enum(u16) {
     gui_raster = 8,
     gui_frame = 9,
     gui_frame_data = 10,
+    console_transcript = 11,
 };
 
 const ProgramPayloadHeader = struct {
@@ -800,17 +802,39 @@ const ProgramProcessPayload = struct {
 
 const ProgramConsoleOutputPayload = struct {
     header: ProgramPayloadHeader = .{},
+    ref_count: u32 = 0,
+    active_ref_count: u32 = 0,
+    next_sequence: u64 = 0,
+    active_accounted: bool = false,
+    reserved: [7]u8 = .{0} ** 7,
     bytes: [CONSOLE_OUTPUT_SIZE]u8 = .{0} ** CONSOLE_OUTPUT_SIZE,
+};
+
+const ProgramConsoleOutputSegment = struct {
+    payload: ?*ProgramConsoleOutputPayload = null,
+    start_sequence: u64 = 0,
+    length: u32 = 0,
+    reserved: u32 = 0,
+};
+
+const ProgramConsoleTranscriptPayload = struct {
+    header: ProgramPayloadHeader = .{},
+    segment_count: u32 = 0,
+    output_len: u32 = 0,
+    segments: [CONSOLE_TRANSCRIPT_SEGMENTS]ProgramConsoleOutputSegment = .{ProgramConsoleOutputSegment{}} ** CONSOLE_TRANSCRIPT_SEGMENTS,
 };
 
 const ProgramConsolePayload = struct {
     header: ProgramPayloadHeader = .{},
-    output_payload: ?*ProgramConsoleOutputPayload = null,
+    transcript_payload: ?*ProgramConsoleTranscriptPayload = null,
+    writer_payload: ?*ProgramConsoleOutputPayload = null,
     input_queue: [INPUT_QUEUE_SIZE]u8 = .{0} ** INPUT_QUEUE_SIZE,
     input_head: usize = 0,
     input_tail: usize = 0,
     input_high_water: u32 = 0,
-    output_len: usize = 0,
+    input_generation: u64 = 0,
+    input_lock: sync.Mutex = sync.Mutex.initClass("console-input", sync.LockRank.program_instances, .sleepable),
+    input_wait: sync.WaitQueue = sync.WaitQueue.init(),
     revision: u32 = 0,
     host: ConsoleHostKind = .none,
     io_target_id: u32 = 0,
@@ -1116,6 +1140,7 @@ const PROGRAM_ENVIRONMENT_PAYLOAD_MAX_BYTES: usize = 2112;
 // clipboard transfer without per-byte registry and reaper work.
 const PROGRAM_CONSOLE_PAYLOAD_MAX_BYTES: usize = 8 * 1024;
 const PROGRAM_CONSOLE_OUTPUT_PAYLOAD_MAX_BYTES: usize = 17 * 1024;
+const PROGRAM_CONSOLE_TRANSCRIPT_PAYLOAD_MAX_BYTES: usize = 8 * 1024;
 // 0.69.18: 63 GUI events absorb ordinary focus/key/button bursts while
 // mouse moves are still coalesced inside the bounded per-instance payload.
 const PROGRAM_GUI_PAYLOAD_MAX_BYTES: usize = 8 * 1024;
@@ -1133,6 +1158,7 @@ comptime {
     if (@sizeOf(ProgramEnvironmentPayload) > PROGRAM_ENVIRONMENT_PAYLOAD_MAX_BYTES) @compileError("ProgramEnvironmentPayload exceeds 2112-byte 0.59.7 budget");
     if (@sizeOf(ProgramConsolePayload) > PROGRAM_CONSOLE_PAYLOAD_MAX_BYTES) @compileError("ProgramConsolePayload exceeds the 8-KB 0.69.18 budget");
     if (@sizeOf(ProgramConsoleOutputPayload) > PROGRAM_CONSOLE_OUTPUT_PAYLOAD_MAX_BYTES) @compileError("ProgramConsoleOutputPayload exceeds 17-KB 0.59.7 budget");
+    if (@sizeOf(ProgramConsoleTranscriptPayload) > PROGRAM_CONSOLE_TRANSCRIPT_PAYLOAD_MAX_BYTES) @compileError("ProgramConsoleTranscriptPayload exceeds the 8-KB 0.69.67 budget");
     if (@sizeOf(ProgramGuiPayload) > PROGRAM_GUI_PAYLOAD_MAX_BYTES) @compileError("ProgramGuiPayload exceeds the 8-KB 0.69.18 budget");
     if (@sizeOf(ProgramGuiFramePayload) > PROGRAM_GUI_FRAME_PAYLOAD_MAX_BYTES) @compileError("ProgramGuiFramePayload exceeds 256-byte budget");
     if (PROGRAM_GUI_COMMAND_NODE_MAX_BYTES > PROGRAM_GUI_COMMAND_NODE_BUDGET_BYTES) @compileError("ProgramGuiCommandPayload node exceeds 31-KB budget");
@@ -1471,6 +1497,144 @@ fn validateInstancePayloadHeaderBytes(header: *const ProgramPayloadHeader, owner
     return true;
 }
 
+fn validateConsoleOutputPayload(payload: *const ProgramConsoleOutputPayload, owner_id: u32) bool {
+    if (!validateInstancePayloadHeader(ProgramConsoleOutputPayload, payload, owner_id, .console_output)) return false;
+    if (payload.ref_count == 0 or payload.active_ref_count > payload.ref_count or !std.mem.allEqual(u8, payload.reserved[0..], 0)) {
+        instance_storage_stats.header_errors +%= 1;
+        return false;
+    }
+    return true;
+}
+
+fn allocateConsoleOutputPayload(owner_id: u32) ?*ProgramConsoleOutputPayload {
+    const payload = allocateInstancePayload(ProgramConsoleOutputPayload, owner_id, .console_output) orelse return null;
+    payload.ref_count = 1;
+    payload.active_ref_count = 1;
+    payload.active_accounted = programRegistryOwnerIsPublished(owner_id);
+    return payload;
+}
+
+fn retainConsoleOutputPayload(payload: *ProgramConsoleOutputPayload, active: bool) bool {
+    if (payload.ref_count == std.math.maxInt(u32) or (active and payload.active_ref_count == std.math.maxInt(u32))) return false;
+    payload.ref_count += 1;
+    if (active) {
+        if (payload.active_ref_count == 0 and !payload.active_accounted) {
+            noteActivePayloadAllocation(@sizeOf(ProgramConsoleOutputPayload));
+            payload.active_accounted = true;
+        }
+        payload.active_ref_count += 1;
+    }
+    return true;
+}
+
+fn makeConsoleOutputPayloadRefInactive(payload: *ProgramConsoleOutputPayload) bool {
+    if (payload.active_ref_count == 0) return false;
+    payload.active_ref_count -= 1;
+    if (payload.active_ref_count == 0 and payload.active_accounted) {
+        noteActivePayloadRelease(@sizeOf(ProgramConsoleOutputPayload));
+        payload.active_accounted = false;
+    }
+    return true;
+}
+
+fn freeConsoleOutputPayloadMemory(payload: *ProgramConsoleOutputPayload) bool {
+    const owner_id = payload.header.owner_id;
+    if (payload.ref_count != 0 or payload.active_ref_count != 0 or payload.active_accounted or
+        !validateInstancePayloadHeader(ProgramConsoleOutputPayload, payload, owner_id, .console_output))
+    {
+        quarantinePayload(.console_output, @sizeOf(ProgramConsoleOutputPayload));
+        return false;
+    }
+    const bytes: [*]u8 = @ptrCast(payload);
+    if (heap.free(bytes[0..@sizeOf(ProgramConsoleOutputPayload)]) != .ok) {
+        instance_storage_stats.free_failures +%= 1;
+        quarantinePayload(.console_output, @sizeOf(ProgramConsoleOutputPayload));
+        return false;
+    }
+    instance_storage_stats.payload_releases +%= 1;
+    notePayloadRelease(.console_output, @sizeOf(ProgramConsoleOutputPayload));
+    return true;
+}
+
+fn releaseConsoleOutputPayload(payload: *ProgramConsoleOutputPayload, active: bool) bool {
+    if (payload.ref_count == 0 or (active and !makeConsoleOutputPayloadRefInactive(payload))) return false;
+    payload.ref_count -= 1;
+    if (payload.ref_count != 0) return true;
+    if (payload.active_ref_count != 0) {
+        instance_storage_stats.header_errors +%= 1;
+        return false;
+    }
+    return freeConsoleOutputPayloadMemory(payload);
+}
+
+fn releaseConsoleTranscriptSegments(transcript: *ProgramConsoleTranscriptPayload, active: bool) bool {
+    var released = true;
+    var index: usize = 0;
+    while (index < transcript.segment_count) : (index += 1) {
+        const payload = transcript.segments[index].payload orelse {
+            released = false;
+            continue;
+        };
+        transcript.segments[index] = .{};
+        if (!releaseConsoleOutputPayload(payload, active)) released = false;
+    }
+    transcript.segment_count = 0;
+    transcript.output_len = 0;
+    return released;
+}
+
+fn makeConsoleTranscriptInactive(transcript: *ProgramConsoleTranscriptPayload) bool {
+    var converted = true;
+    var index: usize = 0;
+    while (index < transcript.segment_count) : (index += 1) {
+        const payload = transcript.segments[index].payload orelse {
+            converted = false;
+            continue;
+        };
+        if (!makeConsoleOutputPayloadRefInactive(payload)) converted = false;
+    }
+    return converted;
+}
+
+fn validateConsoleTranscript(transcript: *const ProgramConsoleTranscriptPayload, owner_id: u32) bool {
+    if (!validateInstancePayloadHeader(ProgramConsoleTranscriptPayload, transcript, owner_id, .console_transcript) or
+        transcript.segment_count > transcript.segments.len or transcript.output_len > CONSOLE_OUTPUT_SIZE)
+    {
+        instance_storage_stats.header_errors +%= 1;
+        return false;
+    }
+    var total: u64 = 0;
+    var index: usize = 0;
+    while (index < transcript.segment_count) : (index += 1) {
+        const segment = transcript.segments[index];
+        const payload = segment.payload orelse {
+            instance_storage_stats.header_errors +%= 1;
+            return false;
+        };
+        if (segment.length == 0 or segment.reserved != 0 or
+            !validateConsoleOutputPayload(payload, payload.header.owner_id))
+        {
+            instance_storage_stats.header_errors +%= 1;
+            return false;
+        }
+        const end = std.math.add(u64, segment.start_sequence, segment.length) catch {
+            instance_storage_stats.header_errors +%= 1;
+            return false;
+        };
+        const retained_start = payload.next_sequence -| @min(payload.next_sequence, CONSOLE_OUTPUT_SIZE);
+        if (segment.start_sequence < retained_start or end > payload.next_sequence) {
+            instance_storage_stats.header_errors +%= 1;
+            return false;
+        }
+        total += segment.length;
+    }
+    if (total != transcript.output_len) {
+        instance_storage_stats.header_errors +%= 1;
+        return false;
+    }
+    return true;
+}
+
 fn allocateProgramInstanceStorage(owner_id: u32, app_class: AppClass, inherit_environment: bool) ?ProgramInstanceStorage {
     const runtime = allocateInstancePayload(ProgramRuntimePayload, owner_id, .runtime) orelse {
         instance_storage_stats.transaction_rollbacks +%= 1;
@@ -1497,7 +1661,7 @@ fn allocateProgramInstanceStorage(owner_id: u32, app_class: AppClass, inherit_en
                 return null;
             };
             storage.console = console;
-            console.output_payload = allocateInstancePayload(ProgramConsoleOutputPayload, owner_id, .console_output) orelse {
+            console.transcript_payload = allocateInstancePayload(ProgramConsoleTranscriptPayload, owner_id, .console_transcript) orelse {
                 instance_storage_stats.transaction_rollbacks +%= 1;
                 rollbackProgramInstanceStorage(owner_id, &storage);
                 return null;
@@ -1989,8 +2153,14 @@ fn validateProgramInstanceStorageTransaction(owner_id: u32, storage: *const Prog
         const console_valid = validateInstancePayloadHeader(ProgramConsolePayload, console, owner_id, .console);
         if (!console_valid) {
             valid = false;
-        } else if (console.output_payload) |output| {
-            if (!validateInstancePayloadHeader(ProgramConsoleOutputPayload, output, owner_id, .console_output)) valid = false;
+        } else if (console.transcript_payload) |transcript| {
+            if (!validateConsoleTranscript(transcript, owner_id)) valid = false;
+            if (console.writer_payload) |output| {
+                if (!validateConsoleOutputPayload(output, owner_id)) valid = false;
+            }
+        } else {
+            instance_storage_stats.header_errors +%= 1;
+            valid = false;
         }
     }
 
@@ -2028,8 +2198,11 @@ fn validateProgramInstanceStorage(instance: *const ProgramInstance) bool {
         const console_valid = validateInstancePayloadHeader(ProgramConsolePayload, console, instance.id, .console);
         if (!console_valid) {
             valid = false;
-        } else if (console.output_payload) |output| {
-            if (!validateInstancePayloadHeader(ProgramConsoleOutputPayload, output, instance.id, .console_output)) valid = false;
+        } else if (console.transcript_payload) |transcript| {
+            if (!validateConsoleTranscript(transcript, instance.id)) valid = false;
+            if (console.writer_payload) |output| {
+                if (!validateConsoleOutputPayload(output, instance.id)) valid = false;
+            }
         } else {
             instance_storage_stats.header_errors +%= 1;
             valid = false;
@@ -2090,9 +2263,14 @@ fn rollbackProgramInstanceStorage(owner_id: u32, storage: *ProgramInstanceStorag
         _ = releaseInstancePayload(ProgramGuiPayload, payload, owner_id, .gui);
     }
     if (storage.console) |payload| {
-        if (payload.output_payload) |output| {
-            payload.output_payload = null;
-            _ = releaseInstancePayload(ProgramConsoleOutputPayload, output, owner_id, .console_output);
+        if (payload.transcript_payload) |transcript| {
+            payload.transcript_payload = null;
+            _ = releaseConsoleTranscriptSegments(transcript, true);
+            _ = releaseInstancePayload(ProgramConsoleTranscriptPayload, transcript, owner_id, .console_transcript);
+        }
+        if (payload.writer_payload) |output| {
+            payload.writer_payload = null;
+            _ = releaseConsoleOutputPayload(output, true);
         }
         storage.console = null;
         _ = releaseInstancePayload(ProgramConsolePayload, payload, owner_id, .console);
@@ -2108,7 +2286,7 @@ fn rollbackProgramInstanceStorage(owner_id: u32, storage: *ProgramInstanceStorag
 fn detachProgramCompletionOutput(instance: *ProgramInstance, completion: *ProgramCompletionNode) bool {
     if (instance.storage_teardown_blocked) return false;
     if (instance.console_payload) |console| {
-        if (console.output_payload == null) {
+        if (console.transcript_payload == null) {
             // A valid retry is suppressed by the slot-local once flag.  Seeing
             // an already-null source on the first attempt is therefore an
             // invalid hierarchy, not a transient state to spin on forever.
@@ -2123,25 +2301,44 @@ fn detachProgramCompletionOutput(instance: *ProgramInstance, completion: *Progra
         instance.storage_teardown_blocked = true;
         return false;
     }
+    if (!console_output_lock.lock(sync.WAIT_FOREVER)) return false;
+    defer _ = console_output_lock.unlock();
     const console = instance.console_payload orelse return true;
-    const output = console.output_payload orelse unreachable;
+    const transcript = console.transcript_payload orelse unreachable;
     // Detach ownership before either transfer or free.  Once the slot's
     // output_detach once flag is set, no retry can observe this pointer in
     // ProgramInstance storage again.
-    console.output_payload = null;
+    if (console.writer_payload) |writer| {
+        console.writer_payload = null;
+        if (!releaseConsoleOutputPayload(writer, true)) {
+            instance.storage_teardown_blocked = true;
+            return false;
+        }
+    }
+    console.transcript_payload = null;
     if (completion.retain_output) {
-        completion.output_payload = output;
-        completion.output_length = @intCast(@min(console.output_len, output.bytes.len));
+        if (!makeConsoleTranscriptInactive(transcript)) {
+            instance.storage_teardown_blocked = true;
+            return false;
+        }
+        completion.output_payload = transcript;
+        completion.output_length = transcript.output_len;
         completion.output_revision = console.revision;
         if (completion.output_length != 0) completion.flags |= PROGRAM_COMPLETION_FLAG_OUTPUT;
-        noteActivePayloadRelease(@sizeOf(ProgramConsoleOutputPayload));
+        noteActivePayloadRelease(@sizeOf(ProgramConsoleTranscriptPayload));
+        completion.output_storage_bytes = @sizeOf(ProgramConsoleTranscriptPayload);
         const locked = lockProgramRegistry();
         if (locked) {
-            program_registry_stats.completion_output_bytes +%= @sizeOf(ProgramConsoleOutputPayload);
+            program_registry_stats.completion_output_bytes +%= completion.output_storage_bytes;
             unlockProgramRegistry();
         }
     } else {
-        _ = releaseInstancePayload(ProgramConsoleOutputPayload, output, instance.id, .console_output);
+        if (!releaseConsoleTranscriptSegments(transcript, true) or
+            !releaseInstancePayload(ProgramConsoleTranscriptPayload, transcript, instance.id, .console_transcript))
+        {
+            instance.storage_teardown_blocked = true;
+            return false;
+        }
     }
     return true;
 }
@@ -2163,7 +2360,7 @@ fn releaseProgramInstanceStorage(instance: *ProgramInstance, completion: *Progra
     if (instance.console_payload) |payload| {
         // The output pointer must have crossed the preceding persistent
         // output_detach boundary before the console payload can be freed.
-        if (payload.output_payload != null) {
+        if (payload.transcript_payload != null or payload.writer_payload != null) {
             instance.storage_teardown_blocked = true;
             return false;
         }
@@ -2187,29 +2384,25 @@ fn releaseProgramInstanceStorage(instance: *ProgramInstance, completion: *Progra
 }
 
 fn freeCompletionOutput(node: *ProgramCompletionNode) void {
-    const output = node.output_payload orelse return;
+    const transcript = node.output_payload orelse return;
     node.output_payload = null;
-    if (!validateInstancePayloadHeader(ProgramConsoleOutputPayload, output, node.handle.instance_id, .console_output)) {
-        quarantinePayload(.console_output, @sizeOf(ProgramConsoleOutputPayload));
+    if (!console_output_lock.lock(sync.WAIT_FOREVER)) {
+        node.output_payload = transcript;
         return;
     }
-    const bytes: [*]u8 = @ptrCast(output);
-    if (heap.free(bytes[0..@sizeOf(ProgramConsoleOutputPayload)]) != .ok) {
-        instance_storage_stats.free_failures +%= 1;
-        quarantinePayload(.console_output, @sizeOf(ProgramConsoleOutputPayload));
-        return;
-    }
-    instance_storage_stats.payload_releases +%= 1;
-    notePayloadRelease(.console_output, @sizeOf(ProgramConsoleOutputPayload));
+    defer _ = console_output_lock.unlock();
+    _ = releaseConsoleTranscriptSegments(transcript, false);
+    _ = releaseInstancePayload(ProgramConsoleTranscriptPayload, transcript, node.handle.instance_id, .console_transcript);
     const locked = lockProgramRegistry();
     if (locked) {
-        if (program_registry_stats.completion_output_bytes >= @sizeOf(ProgramConsoleOutputPayload)) {
-            program_registry_stats.completion_output_bytes -= @sizeOf(ProgramConsoleOutputPayload);
+        if (program_registry_stats.completion_output_bytes >= node.output_storage_bytes) {
+            program_registry_stats.completion_output_bytes -= node.output_storage_bytes;
         } else {
             program_registry_stats.completion_output_bytes = 0;
         }
         unlockProgramRegistry();
     }
+    node.output_storage_bytes = 0;
 }
 
 pub fn instanceStorageStats() ProgramInstanceStorageStats {
@@ -3262,7 +3455,7 @@ const PayloadByteCounters = struct {
 fn payloadCategoryBytes(kind: ProgramPayloadKind) PayloadByteCounters {
     return switch (kind) {
         .runtime, .process, .environment => .{ .current = &instance_storage_stats.current_runtime_bytes, .peak = &instance_storage_stats.peak_runtime_bytes },
-        .console, .console_output => .{ .current = &instance_storage_stats.current_console_bytes, .peak = &instance_storage_stats.peak_console_bytes },
+        .console, .console_output, .console_transcript => .{ .current = &instance_storage_stats.current_console_bytes, .peak = &instance_storage_stats.peak_console_bytes },
         .gui, .gui_frame, .gui_commands, .gui_raster, .gui_frame_data => .{ .current = &instance_storage_stats.current_gui_bytes, .peak = &instance_storage_stats.peak_gui_bytes },
     };
 }
@@ -3274,6 +3467,7 @@ fn payloadCount(kind: ProgramPayloadKind) *u32 {
         .environment => &instance_storage_stats.active_environment_payloads,
         .console => &instance_storage_stats.active_console_payloads,
         .console_output => &instance_storage_stats.active_console_output_payloads,
+        .console_transcript => &instance_storage_stats.active_console_output_payloads,
         .gui => &instance_storage_stats.active_gui_payloads,
         .gui_frame => &instance_storage_stats.active_gui_frame_payloads,
         .gui_commands => &instance_storage_stats.active_gui_command_payloads,
@@ -3319,7 +3513,8 @@ fn programInstancePayloadBytes(instance: *const ProgramInstance) u64 {
     }
     if (instance.console_payload) |console| {
         bytes += @sizeOf(ProgramConsolePayload);
-        if (console.output_payload != null) bytes += @sizeOf(ProgramConsoleOutputPayload);
+        if (console.transcript_payload != null) bytes += @sizeOf(ProgramConsoleTranscriptPayload);
+        if (console.writer_payload != null) bytes += @sizeOf(ProgramConsoleOutputPayload);
     }
     if (instance.gui_payload) |gui| {
         bytes += @sizeOf(ProgramGuiPayload);
@@ -4503,7 +4698,8 @@ const ProgramCompletionNode = struct {
     role: u8 = 0,
     exit_reason: u8 = PROGRAM_EXIT_REASON_NATURAL,
     console_state: ConsoleState = .{},
-    output_payload: ?*ProgramConsoleOutputPayload = null,
+    output_payload: ?*ProgramConsoleTranscriptPayload = null,
+    output_storage_bytes: u64 = 0,
 };
 
 const ExitRecord = struct {
@@ -4567,6 +4763,27 @@ var console_input_batch_calls: u64 = 0;
 var console_input_bytes_attempted: u64 = 0;
 var console_input_bytes_accepted: u64 = 0;
 var console_input_full_events: u64 = 0;
+var console_read_calls: u64 = 0;
+var console_read_empty: u64 = 0;
+var console_read_bytes: u64 = 0;
+var console_wait_calls: u64 = 0;
+var console_wait_blocks: u64 = 0;
+var console_wait_immediate: u64 = 0;
+var console_wait_wakes: u64 = 0;
+var console_wait_timeouts: u64 = 0;
+var console_wait_cancellations: u64 = 0;
+var console_output_write_calls: u64 = 0;
+var console_output_source_bytes: u64 = 0;
+var console_output_visible_append_bytes: u64 = 0;
+var console_output_capture_append_bytes: u64 = 0;
+var console_output_shared_bytes: u64 = 0;
+var console_output_revision_batches: u64 = 0;
+var console_output_desktop_signals: u64 = 0;
+var console_output_compactions: u64 = 0;
+var console_output_compaction_bytes: u64 = 0;
+var console_output_segment_drops: u64 = 0;
+var console_output_segment_drop_bytes: u64 = 0;
+var console_output_lock = sync.Mutex.initClass("console-output", sync.LockRank.program_instances, .sleepable);
 var program_launch_attempts: u64 = 0;
 var program_entries_started: u64 = 0;
 var program_attach_wait_events: u64 = 0;
@@ -5714,6 +5931,7 @@ fn configureR4XStartR4DeskTable() void {
         .console_push_key = &apiConsolePushKey,
         .console_write = &apiConsoleWrite,
         .console_read = &apiConsoleRead,
+        .console_input_wait = &apiConsoleInputWait,
         .clipboard_write = &r4api.r4desk.clipboardWrite,
         .clipboard_read = &r4api.r4desk.clipboardRead,
         .clipboard_revision = &r4api.r4desk.clipboardRevision,
@@ -6180,6 +6398,26 @@ fn fillInputPerformanceInfo(out: *r4api.r4dev.ProgramInputPerformanceInfo) void 
     out.console_bytes_attempted = console_input_bytes_attempted;
     out.console_bytes_accepted = console_input_bytes_accepted;
     out.console_full_events = console_input_full_events;
+    out.console_read_calls = console_read_calls;
+    out.console_read_empty = console_read_empty;
+    out.console_read_bytes = console_read_bytes;
+    out.console_wait_calls = console_wait_calls;
+    out.console_wait_blocks = console_wait_blocks;
+    out.console_wait_immediate = console_wait_immediate;
+    out.console_wait_wakes = console_wait_wakes;
+    out.console_wait_timeouts = console_wait_timeouts;
+    out.console_wait_cancellations = console_wait_cancellations;
+    out.console_output_write_calls = console_output_write_calls;
+    out.console_output_source_bytes = console_output_source_bytes;
+    out.console_output_visible_append_bytes = console_output_visible_append_bytes;
+    out.console_output_capture_append_bytes = console_output_capture_append_bytes;
+    out.console_output_shared_bytes = console_output_shared_bytes;
+    out.console_output_revision_batches = console_output_revision_batches;
+    out.console_output_desktop_signals = console_output_desktop_signals;
+    out.console_output_compactions = console_output_compactions;
+    out.console_output_compaction_bytes = console_output_compaction_bytes;
+    out.console_output_segment_drops = console_output_segment_drops;
+    out.console_output_segment_drop_bytes = console_output_segment_drop_bytes;
     out.program_launch_attempts = program_launch_attempts;
     out.program_entries_started = program_entries_started;
     out.program_attach_wait_events = program_attach_wait_events;
@@ -10174,9 +10412,8 @@ fn threadInfo(thread_ctx: *const ProgramThread) ProgramThreadInfo {
 
 fn apiPrint(text: [*:0]const u8) callconv(.c) void {
     var i: usize = 0;
-    while (i < 4096 and text[i] != 0) : (i += 1) {
-        apiOutputTextByte(.stdout, text[i]);
-    }
+    while (i < 4096 and text[i] != 0) : (i += 1) {}
+    apiOutputTextSpan(.stdout, text[0..i]);
 }
 
 fn apiPutc(ch: u8) callconv(.c) void {
@@ -10184,15 +10421,11 @@ fn apiPutc(ch: u8) callconv(.c) void {
 }
 
 fn apiOutputTextByte(stream: ConsoleStream, ch: u8) void {
-    if (ch == '\n') {
-        apiOutputByte(stream, '\r');
-        apiOutputByte(stream, '\n');
-    } else if (ch != '\r') {
-        apiOutputByte(stream, ch);
-    }
+    const data = [_]u8{ch};
+    apiOutputTextSpan(stream, data[0..]);
 }
 
-fn apiOutputByte(stream: ConsoleStream, ch: u8) void {
+fn captureOutputByte(ch: u8) void {
     if (output_capture) |buffer| {
         if (output_capture_len < buffer.len) {
             buffer[output_capture_len] = ch;
@@ -10200,10 +10433,32 @@ fn apiOutputByte(stream: ConsoleStream, ch: u8) void {
         } else {
             output_capture_truncated = true;
         }
-    } else if (routeCurrentConsoleOutput(stream, ch)) {
+    }
+}
+
+fn apiOutputTextSpan(stream: ConsoleStream, data: []const u8) void {
+    if (data.len == 0) return;
+    if (output_capture != null) {
+        for (data) |ch| {
+            if (ch == '\n') {
+                captureOutputByte('\r');
+                captureOutputByte('\n');
+            } else if (ch != '\r') {
+                captureOutputByte(ch);
+            }
+        }
         return;
-    } else if (currentInstance()) |instance| {
-        mirrorHeadlessShellSmokeOutput(instance, stream, ch);
+    }
+    if (routeCurrentConsoleOutputBatch(stream, data, true)) return;
+    if (currentInstance()) |instance| {
+        for (data) |ch| {
+            if (ch == '\n') {
+                mirrorHeadlessShellSmokeOutput(instance, stream, '\r');
+                mirrorHeadlessShellSmokeOutput(instance, stream, '\n');
+            } else if (ch != '\r') {
+                mirrorHeadlessShellSmokeOutput(instance, stream, ch);
+            }
+        }
     }
 }
 
@@ -10216,11 +10471,23 @@ fn mirrorHeadlessShellSmokeOutput(instance: *const ProgramInstance, stream: Cons
 }
 
 fn apiReadKey() callconv(.c) u8 {
-    return readInputByte() orelse 0;
+    console_read_calls +%= 1;
+    const value = readInputByte() orelse {
+        console_read_empty +%= 1;
+        return 0;
+    };
+    console_read_bytes +%= 1;
+    return value;
 }
 
 fn apiReadKeyCodepoint() callconv(.c) u32 {
-    return readInputCodepoint() orelse 0;
+    console_read_calls +%= 1;
+    const value = readInputCodepoint() orelse {
+        console_read_empty +%= 1;
+        return 0;
+    };
+    console_read_bytes +%= 1;
+    return value;
 }
 
 fn apiMemAlloc(size: u32, alignment: u32, out_ptr: *u64) callconv(.c) i32 {
@@ -10825,6 +11092,7 @@ fn apiProgramHandleRequestClose(handle_ptr: *const ProgramProcessHandle) callcon
         bumpProgramInventoryEpochLocked();
     }
     unlockProgramRegistry();
+    signalConsoleInputForHandle(handle);
     requestConsoleClientsClose(handle);
     return PROGRAM_HANDLE_OK;
 }
@@ -10910,13 +11178,13 @@ fn apiProgramCompletionRead(handle_ptr: *const ProgramProcessHandle, offset: u32
     defer unlockProgramRegistry();
     const node = completionForHandleLocked(handle_ptr.*) orelse return programHandleMissingStatusLocked(handle_ptr.*);
     if (node.state != .ready) return PROGRAM_HANDLE_ERROR_WOULD_BLOCK;
-    const payload = node.output_payload orelse return PROGRAM_HANDLE_ERROR_OUTPUT_UNAVAILABLE;
+    const transcript = node.output_payload orelse return PROGRAM_HANDLE_ERROR_OUTPUT_UNAVAILABLE;
     if ((node.flags & PROGRAM_COMPLETION_FLAG_OUTPUT) == 0) return PROGRAM_HANDLE_ERROR_OUTPUT_UNAVAILABLE;
     const start: usize = @intCast(offset);
     const length: usize = @intCast(node.output_length);
     if (start > length) return PROGRAM_HANDLE_ERROR_OUTPUT_RANGE;
     const count = @min(@as(usize, @intCast(capacity)), length - start);
-    if (count != 0) @memcpy(out[0..count], payload.bytes[start .. start + count]);
+    if (count != 0 and readConsoleTranscript(transcript, start, out[0..count]) != count) return PROGRAM_HANDLE_ERROR_OUTPUT_RANGE;
     out_read.* = @intCast(count);
     return PROGRAM_HANDLE_OK;
 }
@@ -13495,24 +13763,197 @@ fn apiGuiFrameGenerationRead(
     return r4x_api.gui_frame_result_ok;
 }
 
+fn consoleTranscript(instance: *ProgramInstance) ?*ProgramConsoleTranscriptPayload {
+    return consolePayload(instance).transcript_payload;
+}
+
+fn consoleTranscriptConst(instance: *const ProgramInstance) ?*const ProgramConsoleTranscriptPayload {
+    return consolePayloadConst(instance).transcript_payload;
+}
+
+fn readConsoleTranscript(transcript: *const ProgramConsoleTranscriptPayload, offset: usize, out: []u8) usize {
+    if (offset >= transcript.output_len or out.len == 0) return 0;
+    var logical_offset = offset;
+    var written: usize = 0;
+    var segment_index: usize = 0;
+    while (segment_index < transcript.segment_count and written < out.len) : (segment_index += 1) {
+        const segment = transcript.segments[segment_index];
+        const segment_len: usize = @intCast(segment.length);
+        if (logical_offset >= segment_len) {
+            logical_offset -= segment_len;
+            continue;
+        }
+        const payload = segment.payload orelse break;
+        var sequence = segment.start_sequence + logical_offset;
+        var remaining = @min(segment_len - logical_offset, out.len - written);
+        while (remaining != 0) {
+            const ring_offset: usize = @intCast(sequence % CONSOLE_OUTPUT_SIZE);
+            const count = @min(remaining, CONSOLE_OUTPUT_SIZE - ring_offset);
+            @memcpy(out[written .. written + count], payload.bytes[ring_offset .. ring_offset + count]);
+            written += count;
+            sequence += count;
+            remaining -= count;
+        }
+        logical_offset = 0;
+    }
+    return written;
+}
+
+fn removeFirstConsoleTranscriptSegment(transcript: *ProgramConsoleTranscriptPayload, active: bool) bool {
+    if (transcript.segment_count == 0) return false;
+    const payload = transcript.segments[0].payload orelse return false;
+    var index: usize = 1;
+    while (index < transcript.segment_count) : (index += 1) transcript.segments[index - 1] = transcript.segments[index];
+    transcript.segment_count -= 1;
+    transcript.segments[transcript.segment_count] = .{};
+    return releaseConsoleOutputPayload(payload, active);
+}
+
+fn dropConsoleTranscriptPrefix(instance: *ProgramInstance, byte_count: usize) void {
+    const transcript = consoleTranscript(instance) orelse return;
+    var remaining = @min(byte_count, @as(usize, @intCast(transcript.output_len)));
+    const dropped = remaining;
+    while (remaining != 0 and transcript.segment_count != 0) {
+        var first = &transcript.segments[0];
+        const segment_len: usize = @intCast(first.length);
+        if (remaining < segment_len) {
+            first.start_sequence += remaining;
+            first.length -= @intCast(remaining);
+            transcript.output_len -= @intCast(remaining);
+            remaining = 0;
+            break;
+        }
+        remaining -= segment_len;
+        transcript.output_len -= first.length;
+        console_output_segment_drops +%= 1;
+        _ = removeFirstConsoleTranscriptSegment(transcript, true);
+    }
+    const actual = dropped - remaining;
+    if (actual != 0) {
+        const console = consolePayload(instance);
+        console.state.output_dropped_bytes +%= @intCast(actual);
+        console_output_segment_drop_bytes +%= @intCast(actual);
+    }
+}
+
+fn compactConsoleTranscript(instance: *ProgramInstance) bool {
+    const transcript = consoleTranscript(instance) orelse return false;
+    if (transcript.segment_count < transcript.segments.len) return true;
+    const output = allocateConsoleOutputPayload(instance.id) orelse return false;
+    const length: usize = @intCast(transcript.output_len);
+    const copied = readConsoleTranscript(transcript, 0, output.bytes[0..length]);
+    if (copied != length) {
+        _ = releaseConsoleOutputPayload(output, true);
+        return false;
+    }
+    output.next_sequence = length;
+    if (length != 0 and !retainConsoleOutputPayload(output, true)) {
+        _ = releaseConsoleOutputPayload(output, true);
+        return false;
+    }
+    if (!releaseConsoleTranscriptSegments(transcript, true)) {
+        if (length != 0) _ = releaseConsoleOutputPayload(output, true);
+        _ = releaseConsoleOutputPayload(output, true);
+        return false;
+    }
+    if (length != 0) {
+        transcript.segments[0] = .{ .payload = output, .start_sequence = 0, .length = @intCast(length) };
+        transcript.segment_count = 1;
+        transcript.output_len = @intCast(length);
+    }
+    _ = releaseConsoleOutputPayload(output, true);
+    console_output_compactions +%= 1;
+    console_output_compaction_bytes +%= @intCast(length);
+    return true;
+}
+
+fn ensureConsoleTranscriptSegmentCapacity(instance: *ProgramInstance) bool {
+    const transcript = consoleTranscript(instance) orelse return false;
+    if (transcript.segment_count < transcript.segments.len) return true;
+    if (compactConsoleTranscript(instance)) return true;
+    while (transcript.segment_count >= transcript.segments.len and transcript.segment_count != 0) {
+        const drop = transcript.segments[0].length;
+        dropConsoleTranscriptPrefix(instance, drop);
+    }
+    return transcript.segment_count < transcript.segments.len;
+}
+
+fn appendConsoleTranscriptReference(instance: *ProgramInstance, payload: *ProgramConsoleOutputPayload, sequence: u64, capture: bool) bool {
+    const transcript = consoleTranscript(instance) orelse return false;
+    if (transcript.segment_count != 0) {
+        const tail = &transcript.segments[transcript.segment_count - 1];
+        if (tail.payload == payload and tail.start_sequence + tail.length == sequence and tail.length != std.math.maxInt(u32)) {
+            tail.length += 1;
+            transcript.output_len += 1;
+            if (capture) console_output_capture_append_bytes +%= 1 else console_output_visible_append_bytes +%= 1;
+            if (transcript.output_len > CONSOLE_OUTPUT_SIZE) dropConsoleTranscriptPrefix(instance, transcript.output_len - CONSOLE_OUTPUT_SIZE);
+            consolePayload(instance).state.output_len = transcript.output_len;
+            return true;
+        }
+    }
+    if (!ensureConsoleTranscriptSegmentCapacity(instance) or !retainConsoleOutputPayload(payload, true)) return false;
+    const index: usize = @intCast(transcript.segment_count);
+    transcript.segments[index] = .{ .payload = payload, .start_sequence = sequence, .length = 1 };
+    transcript.segment_count += 1;
+    transcript.output_len += 1;
+    if (capture) console_output_capture_append_bytes +%= 1 else console_output_visible_append_bytes +%= 1;
+    if (transcript.output_len > CONSOLE_OUTPUT_SIZE) dropConsoleTranscriptPrefix(instance, transcript.output_len - CONSOLE_OUTPUT_SIZE);
+    consolePayload(instance).state.output_len = transcript.output_len;
+    return true;
+}
+
+fn ensureConsoleWriter(instance: *ProgramInstance) ?*ProgramConsoleOutputPayload {
+    const console = consolePayload(instance);
+    if (console.writer_payload) |writer| {
+        // A backing block is sealed before its first byte could be
+        // overwritten.  Visible and completion transcripts may retain
+        // different subsets of the source stream, so wrapping one producer
+        // ring in place would corrupt the older subset of either consumer.
+        if (writer.next_sequence < CONSOLE_OUTPUT_SIZE) return writer;
+        const replacement = allocateConsoleOutputPayload(instance.id) orelse return null;
+        console.writer_payload = replacement;
+        _ = releaseConsoleOutputPayload(writer, true);
+        return replacement;
+    }
+    const writer = allocateConsoleOutputPayload(instance.id) orelse return null;
+    console.writer_payload = writer;
+    return writer;
+}
+
+fn appendConsoleSourceByte(instance: *ProgramInstance, ch: u8) ?struct { payload: *ProgramConsoleOutputPayload, sequence: u64 } {
+    const writer = ensureConsoleWriter(instance) orelse return null;
+    const sequence = writer.next_sequence;
+    writer.bytes[@intCast(sequence % CONSOLE_OUTPUT_SIZE)] = ch;
+    writer.next_sequence += 1;
+    console_output_source_bytes +%= 1;
+    return .{ .payload = writer, .sequence = sequence };
+}
+
+fn readConsoleTranscriptTail(transcript: *const ProgramConsoleTranscriptPayload, out: []u8) usize {
+    const count = @min(out.len, @as(usize, @intCast(transcript.output_len)));
+    return readConsoleTranscript(transcript, @as(usize, @intCast(transcript.output_len)) - count, out[0..count]);
+}
+
 fn apiConsoleOutput(id: u32, out: [*]u8, capacity: u32) callconv(.c) i32 {
     if (capacity == 0) return -2;
     if (pinProgramInstance(id)) |lease| {
         defer unpinProgramInstance(&lease);
         const instance = lease.instance;
-        const console = instance.console_payload orelse {
+        if (instance.console_payload == null) {
             out[0] = 0;
             return -3;
-        };
-        const output = console.output_payload orelse {
+        }
+        if (!console_output_lock.lock(sync.WAIT_FOREVER)) {
+            out[0] = 0;
+            return -1;
+        }
+        defer _ = console_output_lock.unlock();
+        const transcript = consoleTranscriptConst(instance) orelse {
             out[0] = 0;
             return -3;
         };
         const max_len: usize = @intCast(capacity - 1);
-        const count = @min(max_len, console.output_len);
-        const start = console.output_len - count;
-        var i: usize = 0;
-        while (i < count) : (i += 1) out[i] = output.bytes[start + i];
+        const count = readConsoleTranscriptTail(transcript, out[0..max_len]);
         out[count] = 0;
         return @intCast(count);
     }
@@ -13525,14 +13966,17 @@ fn apiConsoleOutput(id: u32, out: [*]u8, capacity: u32) callconv(.c) i32 {
         out[0] = 0;
         return -3;
     }
-    const output = completion.output_payload orelse {
+    const transcript = completion.output_payload orelse {
         out[0] = 0;
         return 0;
     };
     const length: usize = @intCast(completion.output_length);
     const count = @min(@as(usize, @intCast(capacity - 1)), length);
-    const start = length - count;
-    @memcpy(out[0..count], output.bytes[start .. start + count]);
+    const copied = readConsoleTranscript(transcript, length - count, out[0..count]);
+    if (copied != count) {
+        out[0] = 0;
+        return -1;
+    }
     out[count] = 0;
     return @intCast(count);
 }
@@ -13625,6 +14069,8 @@ fn apiConsolePushInput(id: u32, data: [*]const u8, length: u32) callconv(.c) i32
 fn pushConsoleInput(instance: *ProgramInstance, data: []const u8) usize {
     const console = consolePayload(instance);
     console_input_bytes_attempted +%= @as(u64, @intCast(data.len));
+    if (!console.input_lock.lock(sync.WAIT_FOREVER)) return 0;
+    defer _ = console.input_lock.unlock();
     var accepted: usize = 0;
     while (accepted < data.len) : (accepted += 1) {
         const next_head = (console.input_head + 1) % INPUT_QUEUE_SIZE;
@@ -13636,8 +14082,9 @@ fn pushConsoleInput(instance: *ProgramInstance, data: []const u8) usize {
     if (accepted == 0) return 0;
     console_input_bytes_accepted +%= @as(u64, @intCast(accepted));
     console.state.stdin_bytes +%= @as(u32, @intCast(accepted));
-    updateConsoleInputPending(instance);
+    updateConsoleInputPendingLocked(console);
     if (console.state.stdin_pending > console.input_high_water) console.input_high_water = console.state.stdin_pending;
+    _ = console.input_wait.bumpSequenceAndWakeAll(&console.input_generation);
     return accepted;
 }
 
@@ -13645,12 +14092,12 @@ fn apiConsoleWrite(stream_raw: u32, data: [*]const u8, len: u32) callconv(.c) i3
     const stream = parseConsoleStream(stream_raw) orelse return -1;
     if (stream == .stdin) return -2;
     const count = @min(@as(usize, @intCast(len)), @as(usize, 4096));
-    var i: usize = 0;
-    while (i < count) : (i += 1) apiOutputTextByte(stream, data[i]);
+    apiOutputTextSpan(stream, data[0..count]);
     return @intCast(count);
 }
 
 fn apiConsoleRead(out: [*]u8, capacity: u32) callconv(.c) i32 {
+    console_read_calls +%= 1;
     if (capacity == 0) return 0;
     var count: usize = 0;
     const max_len: usize = @intCast(capacity);
@@ -13659,7 +14106,152 @@ fn apiConsoleRead(out: [*]u8, capacity: u32) callconv(.c) i32 {
         out[count] = ch;
         count += 1;
     }
+    if (count == 0) console_read_empty +%= 1 else console_read_bytes +%= @intCast(count);
     return @intCast(count);
+}
+
+const ConsoleInputWaitContext = struct {
+    console: *ProgramConsolePayload,
+    source: *ProgramInstance,
+    last_generation: u64,
+};
+
+fn consoleInputWaitStillNeeded(raw: *anyopaque) bool {
+    const context: *ConsoleInputWaitContext = @ptrCast(@alignCast(raw));
+    return context.console.input_generation == context.last_generation and
+        context.console.input_head == context.console.input_tail and
+        !context.source.close_requested;
+}
+
+fn releaseConsoleInputLock(raw: *anyopaque) void {
+    const console: *ProgramConsolePayload = @ptrCast(@alignCast(raw));
+    _ = console.input_lock.unlock();
+}
+
+fn mapConsoleInputWaitResult(result: sync.WaitResult) i32 {
+    return switch (result) {
+        .signaled => blk: {
+            console_wait_wakes +%= 1;
+            break :blk r4x_api.console_input_wait_ready;
+        },
+        .timeout => blk: {
+            console_wait_timeouts +%= 1;
+            break :blk r4x_api.console_input_wait_timeout;
+        },
+        .cancelled, .killed => blk: {
+            console_wait_cancellations +%= 1;
+            break :blk r4x_api.console_input_wait_error_closed;
+        },
+        .none, .failed => r4x_api.console_input_wait_error_failed,
+    };
+}
+
+fn apiConsoleInputWait(last_generation: u64, timeout_ticks: u64, out_generation: *u64) callconv(.c) i32 {
+    if (@intFromPtr(out_generation) == 0) return r4x_api.console_input_wait_error_invalid;
+    out_generation.* = last_generation;
+    console_wait_calls +%= 1;
+    const source = currentInstance() orelse return r4x_api.console_input_wait_error_invalid;
+    if (source.app_class != .console) return r4x_api.console_input_wait_error_invalid;
+    const source_console = consolePayload(source);
+
+    var input_lease: ?ProgramInstanceLease = null;
+    if (source_console.io_target_id != 0) {
+        const handle = ProgramProcessHandle{
+            .instance_id = source_console.io_target_id,
+            .reserved = 0,
+            .generation = source_console.io_target_generation,
+        };
+        input_lease = pinProgramHandle(handle, false) orelse return r4x_api.console_input_wait_error_closed;
+    } else if (source.role == .background or (source.role == .shell and source_console.host != .none)) {
+        const handle = currentProgramHandle() orelse return r4x_api.console_input_wait_error_invalid;
+        input_lease = pinProgramHandle(handle, false) orelse return r4x_api.console_input_wait_error_closed;
+    }
+    defer if (input_lease) |*lease| unpinProgramInstance(lease);
+
+    if (input_lease) |lease| {
+        const console = consolePayload(lease.instance);
+        if (!console.input_lock.lock(sync.WAIT_FOREVER)) return r4x_api.console_input_wait_error_failed;
+        const current_generation = console.input_generation;
+        if (source.close_requested) {
+            out_generation.* = current_generation;
+            _ = console.input_lock.unlock();
+            console_wait_cancellations +%= 1;
+            return r4x_api.console_input_wait_error_closed;
+        }
+        if (console.input_head != console.input_tail or current_generation != last_generation) {
+            out_generation.* = current_generation;
+            _ = console.input_lock.unlock();
+            console_wait_immediate +%= 1;
+            return r4x_api.console_input_wait_ready;
+        }
+        if (timeout_ticks == 0) {
+            out_generation.* = current_generation;
+            _ = console.input_lock.unlock();
+            console_wait_timeouts +%= 1;
+            return r4x_api.console_input_wait_timeout;
+        }
+        var context = ConsoleInputWaitContext{ .console = console, .source = source, .last_generation = last_generation };
+        console_wait_blocks +%= 1;
+        const result = console.input_wait.waitUnlessReleasing(
+            timeout_ticks,
+            "console-input",
+            consoleInputWaitStillNeeded,
+            &context,
+            releaseConsoleInputLock,
+            console,
+        );
+        out_generation.* = console.input_wait.readSequence(&console.input_generation);
+        return mapConsoleInputWaitResult(result);
+    }
+
+    const current_generation = keyboard.inputGeneration();
+    if (keyboard.pending() or current_generation != last_generation) {
+        out_generation.* = current_generation;
+        console_wait_immediate +%= 1;
+        return r4x_api.console_input_wait_ready;
+    }
+    if (timeout_ticks == 0) {
+        out_generation.* = current_generation;
+        console_wait_timeouts +%= 1;
+        return r4x_api.console_input_wait_timeout;
+    }
+    console_wait_blocks +%= 1;
+    return mapConsoleInputWaitResult(keyboard.waitInput(last_generation, timeout_ticks, out_generation));
+}
+
+fn signalConsoleInputPayload(console: *ProgramConsolePayload) void {
+    if (!console.input_lock.lock(sync.WAIT_FOREVER)) return;
+    _ = console.input_wait.bumpSequenceAndWakeAll(&console.input_generation);
+    _ = console.input_lock.unlock();
+}
+
+fn signalConsoleInputForInstance(source: *ProgramInstance) void {
+    if (source.app_class != .console) return;
+    const source_console = consolePayload(source);
+    if (source_console.io_target_id != 0) {
+        const handle = ProgramProcessHandle{
+            .instance_id = source_console.io_target_id,
+            .reserved = 0,
+            .generation = source_console.io_target_generation,
+        };
+        if (pinProgramHandle(handle, false)) |target| {
+            signalConsoleInputPayload(consolePayload(target.instance));
+            var lease = target;
+            unpinProgramInstance(&lease);
+        }
+        return;
+    }
+    if (source.role == .background or (source.role == .shell and source_console.host != .none)) {
+        signalConsoleInputPayload(source_console);
+    } else {
+        keyboard.signalInputActivity();
+    }
+}
+
+fn signalConsoleInputForHandle(handle: ProgramProcessHandle) void {
+    var lease = pinProgramHandle(handle, true) orelse return;
+    defer unpinProgramInstance(&lease);
+    signalConsoleInputForInstance(lease.instance);
 }
 
 fn kprintOutputHook(ch: u8) callconv(.c) bool {
@@ -13712,86 +14304,150 @@ fn inheritedConsoleTargetId(app_class: AppClass) u32 {
 
 fn popInput(instance: *ProgramInstance) ?u8 {
     const console = consolePayload(instance);
+    if (!console.input_lock.lock(sync.WAIT_FOREVER)) return null;
+    defer _ = console.input_lock.unlock();
     if (console.input_head == console.input_tail) return null;
     const ch = console.input_queue[console.input_tail];
     console.input_tail = (console.input_tail + 1) % INPUT_QUEUE_SIZE;
-    updateConsoleInputPending(instance);
+    updateConsoleInputPendingLocked(console);
     return ch;
 }
 
 fn routeCurrentConsoleOutput(stream: ConsoleStream, ch: u8) bool {
+    const data = [_]u8{ch};
+    return routeCurrentConsoleOutputBatch(stream, data[0..], false);
+}
+
+fn routeCurrentConsoleOutputBatch(stream: ConsoleStream, data: []const u8, normalize_text: bool) bool {
+    if (data.len == 0) return true;
     const source = currentInstance() orelse return false;
     if (source.app_class != .console) return false;
 
     const source_console = consolePayload(source);
-    if (source_console.io_target_id != 0) {
-        // An inherited console is both an output destination and a lifecycle
-        // capture source. Keep the child's private transcript for completion
-        // retention, then present the byte through the inherited target once.
-        appendConsoleOutput(source, stream, ch, false);
+    const inherited = source_console.io_target_id != 0;
+    var target_lease: ?ProgramInstanceLease = null;
+    var target: ?*ProgramInstance = null;
+    if (inherited) {
         const target_handle = ProgramProcessHandle{
             .instance_id = source_console.io_target_id,
             .reserved = 0,
             .generation = source_console.io_target_generation,
         };
-        var target = pinProgramHandle(target_handle, false) orelse return true;
-        defer unpinProgramInstance(&target);
-        if (target.instance.app_class != .console) return true;
-        appendConsoleOutput(target.instance, stream, ch, true);
-        return true;
+        if (pinProgramHandle(target_handle, false)) |lease| {
+            target_lease = lease;
+            if (lease.instance.app_class == .console) target = lease.instance;
+        }
+    } else {
+        target = currentConsoleInstance() orelse return false;
+    }
+    defer if (target_lease) |*lease| unpinProgramInstance(lease);
+
+    if (!console_output_lock.lock(sync.WAIT_FOREVER)) return true;
+    defer _ = console_output_lock.unlock();
+    console_output_write_calls +%= 1;
+    var source_changed = false;
+    var target_changed = false;
+
+    for (data) |raw| {
+        if (normalize_text and raw == '\r') continue;
+        if (normalize_text and raw == '\n') {
+            emitConsoleOutputByte(source, target, stream, '\r', inherited, &source_changed, &target_changed);
+            emitConsoleOutputByte(source, target, stream, '\n', inherited, &source_changed, &target_changed);
+        } else {
+            emitConsoleOutputByte(source, target, stream, raw, inherited, &source_changed, &target_changed);
+        }
     }
 
-    const target = currentConsoleInstance() orelse return false;
-    appendConsoleOutput(target, stream, ch, true);
+    if (target) |presented| {
+        if (presented == source) {
+            if (source_changed or target_changed) bumpConsoleOutputRevision(source, true);
+        } else {
+            if (source_changed) bumpConsoleOutputRevision(source, false);
+            if (target_changed) bumpConsoleOutputRevision(presented, true);
+        }
+    } else if (source_changed) {
+        bumpConsoleOutputRevision(source, false);
+    }
     return true;
 }
 
-fn appendConsoleOutput(instance: *ProgramInstance, stream: ConsoleStream, ch: u8, present: bool) void {
-    const console = consolePayload(instance);
-    const output = console.output_payload orelse return;
+fn emitConsoleOutputByte(
+    source: *ProgramInstance,
+    target: ?*ProgramInstance,
+    stream: ConsoleStream,
+    ch: u8,
+    inherited: bool,
+    source_changed: *bool,
+    target_changed: *bool,
+) void {
     if (ch == 0x0C) {
-        clearConsoleOutputWithPresentation(instance, present);
-        if (present) mirrorConsoleControl(instance, ch);
+        clearConsoleTranscriptState(source);
+        source_changed.* = true;
+        if (target) |presented| {
+            if (presented != source) clearConsoleTranscriptState(presented);
+            target_changed.* = true;
+            mirrorConsoleControl(presented, ch);
+        }
         return;
     }
     if (ch == 0x08) {
-        backspaceConsoleOutput(instance);
-        if (present) mirrorConsoleControl(instance, ch);
+        backspaceConsoleTranscriptState(source);
+        source_changed.* = true;
+        if (target) |presented| {
+            if (presented != source) backspaceConsoleTranscriptState(presented);
+            target_changed.* = true;
+            mirrorConsoleControl(presented, ch);
+        }
         return;
     }
-    if (console.output_len < output.bytes.len) {
-        output.bytes[console.output_len] = ch;
-        console.output_len += 1;
-    } else {
-        var i: usize = 1;
-        while (i < output.bytes.len) : (i += 1) {
-            output.bytes[i - 1] = output.bytes[i];
-        }
-        output.bytes[output.bytes.len - 1] = ch;
-        console.state.output_dropped_bytes +%= 1;
+
+    const stored = appendConsoleSourceByte(source, ch) orelse return;
+    const source_capture = inherited and (target == null or target.? != source);
+    const source_appended = appendConsoleTranscriptReference(source, stored.payload, stored.sequence, source_capture);
+    if (source_appended) {
+        bumpConsoleStreamCounter(source, stream);
+        advanceConsoleCursor(source, ch);
+        source_changed.* = true;
     }
-    console.state.output_len = @intCast(console.output_len);
-    bumpConsoleStreamCounter(instance, stream);
-    advanceConsoleCursor(instance, ch);
-    bumpConsoleRevision(instance);
-    if (present) mirrorConsoleByte(instance, ch);
+
+    if (target) |presented| {
+        if (presented == source) {
+            target_changed.* = source_appended;
+            if (source_appended) mirrorConsoleByte(presented, ch);
+        } else {
+            const target_appended = appendConsoleTranscriptReference(presented, stored.payload, stored.sequence, false);
+            if (target_appended) {
+                bumpConsoleStreamCounter(presented, stream);
+                advanceConsoleCursor(presented, ch);
+                target_changed.* = true;
+                mirrorConsoleByte(presented, ch);
+            }
+            if (source_appended and target_appended) console_output_shared_bytes +%= 1;
+        }
+    }
 }
 
-fn backspaceConsoleOutput(instance: *ProgramInstance) void {
+fn backspaceConsoleTranscriptState(instance: *ProgramInstance) void {
     const console = consolePayload(instance);
-    const output = console.output_payload orelse return;
-    if (console.output_len > 0) {
-        console.output_len -= 1;
-        output.bytes[console.output_len] = 0;
+    const transcript = consoleTranscript(instance) orelse return;
+    if (transcript.segment_count != 0 and transcript.output_len != 0) {
+        const tail = &transcript.segments[transcript.segment_count - 1];
+        tail.length -= 1;
+        transcript.output_len -= 1;
+        if (tail.length == 0) {
+            const payload = tail.payload orelse return;
+            transcript.segment_count -= 1;
+            transcript.segments[transcript.segment_count] = .{};
+            _ = releaseConsoleOutputPayload(payload, true);
+        }
     }
-    console.state.output_len = @intCast(console.output_len);
+    console.state.output_len = transcript.output_len;
     if (console.state.cursor_x > 0) {
         console.state.cursor_x -= 1;
     } else if (console.state.cursor_y > 0) {
         console.state.cursor_y -= 1;
         console.state.cursor_x = @intCast(if (console.state.cols > 0) console.state.cols - 1 else 0);
     }
-    bumpConsoleRevision(instance);
 }
 
 pub fn isHostedConsoleContext() bool {
@@ -13834,14 +14490,16 @@ pub fn requestDesktopFromHostedConsole() bool {
 }
 
 fn clearConsoleOutput(instance: *ProgramInstance) void {
-    clearConsoleOutputWithPresentation(instance, true);
+    if (!console_output_lock.lock(sync.WAIT_FOREVER)) return;
+    clearConsoleTranscriptState(instance);
+    _ = console_output_lock.unlock();
+    bumpConsoleOutputRevision(instance, true);
 }
 
-fn clearConsoleOutputWithPresentation(instance: *ProgramInstance, present: bool) void {
+fn clearConsoleTranscriptState(instance: *ProgramInstance) void {
     const console = consolePayload(instance);
-    const output = console.output_payload orelse return;
-    @memset(output.bytes[0..], 0);
-    console.output_len = 0;
+    const transcript = consoleTranscript(instance) orelse return;
+    _ = releaseConsoleTranscriptSegments(transcript, true);
     console.state.clear_count +%= 1;
     console.state.output_len = 0;
     console.state.scrollback_lines = 1;
@@ -13849,8 +14507,7 @@ fn clearConsoleOutputWithPresentation(instance: *ProgramInstance, present: bool)
     console.state.cursor_x = 0;
     console.state.cursor_y = 0;
     console.state.cursor_visible = 1;
-    if (present and isRawFullscreenPresenter(instance)) k.clearConsole();
-    bumpConsoleRevision(instance);
+    if (isRawFullscreenPresenter(instance)) k.clearConsole();
 }
 
 fn mirrorConsoleControl(instance: *const ProgramInstance, ch: u8) void {
@@ -13880,6 +14537,12 @@ fn bumpConsoleStreamCounter(instance: *ProgramInstance, stream: ConsoleStream) v
 
 fn updateConsoleInputPending(instance: *ProgramInstance) void {
     const console = consolePayload(instance);
+    if (!console.input_lock.lock(sync.WAIT_FOREVER)) return;
+    defer _ = console.input_lock.unlock();
+    updateConsoleInputPendingLocked(console);
+}
+
+fn updateConsoleInputPendingLocked(console: *ProgramConsolePayload) void {
     if (console.input_head >= console.input_tail) {
         console.state.stdin_pending = @intCast(console.input_head - console.input_tail);
     } else {
@@ -13891,26 +14554,32 @@ fn refreshConsoleState(instance: *ProgramInstance) void {
     updateConsoleInputPending(instance);
     const console = consolePayload(instance);
     console.state.output_capacity = @intCast(CONSOLE_OUTPUT_SIZE);
-    console.state.output_len = @intCast(console.output_len);
-    console.state.scrollback_lines = countConsoleOutputLines(instance);
+    if (!console_output_lock.lock(sync.WAIT_FOREVER)) return;
+    defer _ = console_output_lock.unlock();
+    const transcript = consoleTranscriptConst(instance) orelse return;
+    console.state.output_len = transcript.output_len;
+    console.state.scrollback_lines = countConsoleOutputLines(transcript, console.state.cols);
 }
 
-fn countConsoleOutputLines(instance: *const ProgramInstance) u32 {
-    const console = consolePayloadConst(instance);
-    const output = console.output_payload orelse return 1;
-    const cols = @max(@as(u32, 1), console.state.cols);
+fn countConsoleOutputLines(transcript: *const ProgramConsoleTranscriptPayload, configured_cols: u32) u32 {
+    const cols = @max(@as(u32, 1), configured_cols);
     var lines: u32 = 0;
     var line_len: u32 = 0;
-    var i: usize = 0;
-    while (i < console.output_len) : (i += 1) {
-        const ch = output.bytes[i];
-        if (ch == '\r') continue;
-        if (ch == '\n' or line_len >= cols) {
-            lines += 1;
-            line_len = 0;
-            if (ch == '\n') continue;
+    var offset: usize = 0;
+    var buffer: [256]u8 = undefined;
+    while (offset < transcript.output_len) {
+        const count = readConsoleTranscript(transcript, offset, buffer[0..]);
+        if (count == 0) break;
+        for (buffer[0..count]) |ch| {
+            if (ch == '\r') continue;
+            if (ch == '\n' or line_len >= cols) {
+                lines += 1;
+                line_len = 0;
+                if (ch == '\n') continue;
+            }
+            if (consolePrintable(ch)) line_len += 1;
         }
-        if (consolePrintable(ch)) line_len += 1;
+        offset += count;
     }
     if (line_len > 0 or lines == 0) lines += 1;
     return lines;
@@ -13980,6 +14649,17 @@ fn bumpConsoleRevision(instance: *ProgramInstance) void {
     console.revision +%= 1;
     if (console.revision == 0) console.revision = 1;
     desktop_events.signal();
+}
+
+fn bumpConsoleOutputRevision(instance: *ProgramInstance, present: bool) void {
+    const console = consolePayload(instance);
+    console.revision +%= 1;
+    if (console.revision == 0) console.revision = 1;
+    console_output_revision_batches +%= 1;
+    if (present) {
+        console_output_desktop_signals +%= 1;
+        desktop_events.signal();
+    }
 }
 
 fn appendGuiCommand(instance: *ProgramInstance, command: ProgramGuiCommand) i32 {
@@ -14268,11 +14948,8 @@ fn r4xstartYield(ctx: *const R4XStartContext) callconv(.c) void {
 }
 
 fn r4xstartR4SysWrite(data: [*]const u8, len: u32) callconv(.c) i32 {
-    var i: usize = 0;
     const limit: usize = @intCast(len);
-    while (i < limit) : (i += 1) {
-        apiOutputTextByte(.stdout, data[i]);
-    }
+    apiOutputTextSpan(.stdout, data[0..limit]);
     return @intCast(len);
 }
 
@@ -14347,7 +15024,7 @@ fn commitProgramExit(handle: ProgramProcessHandle, exit_code: i32, requested_rea
     if (instance.console_payload) |console| {
         completion.console_state = console.state;
         completion.output_revision = console.revision;
-        completion.output_length = @intCast(@min(console.output_len, CONSOLE_OUTPUT_SIZE));
+        completion.output_length = if (console.transcript_payload) |transcript| transcript.output_len else 0;
     }
     completion.sequence = appendExitHistoryLocked(handle, instance, exit_code, exit_reason, completion.start_tick, finish_tick);
     slot.state = .done;
@@ -14361,11 +15038,14 @@ fn commitProgramExit(handle: ProgramProcessHandle, exit_code: i32, requested_rea
         foreground_instance_generation = 0;
     }
     const boot_shell_exited = shell_instance_id != null and shell_instance_id.? == handle.instance_id and shell_instance_generation == handle.generation;
+    const exit_console = instance.console_payload;
     if (boot_shell_exited) {
         shell_instance_id = null;
         shell_instance_generation = 0;
     }
     unlockProgramRegistry();
+
+    if (exit_console) |console| _ = console.input_wait.close(.cancelled);
 
     if (boot_shell_exited) boot_perf.failShellExited(handle.instance_id);
 
@@ -14512,6 +15192,7 @@ fn requestConsoleClientsClose(host: ProgramProcessHandle) void {
     _ = host;
     while (true) {
         var changed = false;
+        var changed_handle: ?ProgramProcessHandle = null;
         const locked = lockProgramRegistry();
         if (!locked) return;
         var chunk = program_registry_head;
@@ -14527,12 +15208,14 @@ fn requestConsoleClientsClose(host: ProgramProcessHandle) void {
                 const parent = lookupProgramRegistryHandleLocked(parent_handle, false) orelse continue;
                 if (!parent.instance.close_requested) continue;
                 slot.instance.close_requested = true;
+                changed_handle = programHandleForSlot(slot);
                 bumpProgramInventoryEpochLocked();
                 changed = true;
                 break :search;
             }
         }
         unlockProgramRegistry();
+        if (changed_handle) |handle| signalConsoleInputForHandle(handle);
         if (!changed) return;
     }
 }
