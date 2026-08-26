@@ -384,7 +384,10 @@ const GuiSize = r4x_api.GuiSize;
 const GuiEvent = r4x_api.GuiEvent;
 const GuiCommand = r4x_api.GuiCommand;
 const GuiFrameCommand = r4x_api.GuiFrameCommand;
+const GuiFrameGenerationInfo = r4x_api.GuiFrameGenerationInfo;
 const GuiFrameInfo = r4x_api.GuiFrameInfo;
+const GuiIndexed8Resource = r4x_api.GuiIndexed8Resource;
+const DisplayDamageRect = r4x_api.DisplayDamageRect;
 const GuiPathSegment = r4x_api.GuiPathSegment;
 const GuiShapeResource = r4x_api.GuiShapeResource;
 const GuiFontInfo = r4x_api.GuiFontInfo;
@@ -821,6 +824,7 @@ const ProgramGuiCommandResourceKind = enum(u16) {
     xrgb32 = 2,
     alpha8 = 3,
     path = 4,
+    indexed8 = 5,
 };
 
 // Kernel-owned display-list truth.  The legacy GuiCommand ABI is materialized
@@ -885,11 +889,15 @@ const ProgramGuiFramePayload = struct {
     resource_payload: ?*ProgramGuiResourcePayload = null,
     resource_tail: ?*ProgramGuiResourcePayload = null,
     retired_next: ?*ProgramGuiFramePayload = null,
+    base_frame: ?*ProgramGuiFramePayload = null,
     command_count: u64 = 0,
     resource_len: u64 = 0,
     raster_words: u64 = 0,
     node_sequence: u64 = 0,
     generation: u64 = 0,
+    damage_regions: [r4x_api.gui_frame_max_damage_regions]DisplayDamageRect = .{DisplayDamageRect{}} ** r4x_api.gui_frame_max_damage_regions,
+    damage_count: u32 = 0,
+    chain_depth: u32 = 1,
     reader_refs: u32 = 0,
     build_failed: bool = false,
     explicit_build: bool = false,
@@ -918,6 +926,12 @@ const ProgramGuiPayload = struct {
     frame_cancels: u64 = 0,
     frame_oom: u64 = 0,
     frame_snapshot_reads: u64 = 0,
+    frame_generation_reads: u64 = 0,
+    frame_delta_commits: u64 = 0,
+    frame_full_commits: u64 = 0,
+    frame_indexed8_commands: u64 = 0,
+    frame_indexed8_resource_bytes: u64 = 0,
+    frame_avoided_clone_bytes: u64 = 0,
     frame_last_error: i32 = 0,
     frame_peak_bytes: u64 = 0,
     frame_peak_commands: u64 = 0,
@@ -1325,7 +1339,7 @@ fn guiResourcePayloadWordsConst(payload: *const ProgramGuiResourcePayload) []con
 fn guiResourcePayloadKind(resource_kind: ProgramGuiCommandResourceKind) ?ProgramPayloadKind {
     return switch (resource_kind) {
         .xrgb32, .alpha8 => .gui_raster,
-        .utf8, .path => .gui_frame_data,
+        .utf8, .path, .indexed8 => .gui_frame_data,
         .none => null,
     };
 }
@@ -1680,6 +1694,16 @@ fn nextPhysicalGuiResource(start: ?*const ProgramGuiResourcePayload) ?*const Pro
 
 fn validateGuiFrame(frame: *const ProgramGuiFramePayload, owner_id: u32) bool {
     if (!validateGuiFrameOwnership(frame, owner_id)) return false;
+    if (frame.damage_count > r4x_api.gui_frame_max_damage_regions or frame.chain_depth == 0 or
+        frame.chain_depth > r4x_api.gui_frame_max_delta_chain) return false;
+    var damage_index: usize = 0;
+    while (damage_index < frame.damage_count) : (damage_index += 1) {
+        const region = frame.damage_regions[damage_index];
+        if (region.w == 0 or region.h == 0) return false;
+        const right = std.math.add(i64, region.x, region.w) catch return false;
+        const bottom = std.math.add(i64, region.y, region.h) catch return false;
+        if (right > std.math.maxInt(i32) or bottom > std.math.maxInt(i32)) return false;
+    }
 
     var command_raster_words: u64 = 0;
     var physical_resource = nextPhysicalGuiResource(frame.resource_payload);
@@ -1698,6 +1722,7 @@ fn validateGuiFrame(frame: *const ProgramGuiFramePayload, owner_id: u32) bool {
                 r4x_api.gui_frame_command_kind_shadow,
                 r4x_api.gui_frame_command_kind_argb32,
                 => .path,
+                r4x_api.gui_frame_command_kind_indexed8 => .indexed8,
                 else => {
                     instance_storage_stats.header_errors +%= 1;
                     return false;
@@ -1769,7 +1794,21 @@ fn validateGuiFrame(frame: *const ProgramGuiFramePayload, owner_id: u32) bool {
     return true;
 }
 
-fn guiFrameBytes(frame: *const ProgramGuiFramePayload) u64 {
+fn validateCommittedGuiFrameChain(root: *const ProgramGuiFramePayload, owner_id: u32, retired_root: bool) bool {
+    var cursor: ?*const ProgramGuiFramePayload = root;
+    var depth: u32 = 0;
+    while (cursor) |frame| : (cursor = frame.base_frame) {
+        depth += 1;
+        if (depth > r4x_api.gui_frame_max_delta_chain or frame.generation == 0 or frame.build_failed or
+            !validateGuiFrame(frame, owner_id) or frame.retired != (depth == 1 and retired_root)) return false;
+        if (frame.base_frame) |base| {
+            if (frame.damage_count == 0 or frame.chain_depth != base.chain_depth + 1 or base.generation >= frame.generation) return false;
+        } else if (frame.damage_count != 0 or frame.chain_depth != 1) return false;
+    }
+    return depth == root.chain_depth;
+}
+
+fn guiFrameLocalBytes(frame: *const ProgramGuiFramePayload) u64 {
     var bytes: u64 = frame.header.requested_bytes;
     var command_cursor = frame.command_payload;
     while (command_cursor) |payload| {
@@ -1784,6 +1823,45 @@ fn guiFrameBytes(frame: *const ProgramGuiFramePayload) u64 {
     return bytes;
 }
 
+fn guiFrameBytes(frame: *const ProgramGuiFramePayload) u64 {
+    var bytes: u64 = 0;
+    var cursor: ?*const ProgramGuiFramePayload = frame;
+    var depth: u32 = 0;
+    while (cursor) |item| : (cursor = item.base_frame) {
+        if (depth >= r4x_api.gui_frame_max_delta_chain) return std.math.maxInt(u64);
+        bytes +|= guiFrameLocalBytes(item);
+        depth += 1;
+    }
+    return bytes;
+}
+
+fn guiFrameChainCommandCount(frame: *const ProgramGuiFramePayload) u64 {
+    var count: u64 = 0;
+    var cursor: ?*const ProgramGuiFramePayload = frame;
+    while (cursor) |item| : (cursor = item.base_frame) count +|= item.command_count;
+    return count;
+}
+
+fn guiFrameChainResourceBytes(frame: *const ProgramGuiFramePayload) u64 {
+    var count: u64 = 0;
+    var cursor: ?*const ProgramGuiFramePayload = frame;
+    while (cursor) |item| : (cursor = item.base_frame) count +|= item.resource_len;
+    return count;
+}
+
+fn guiFrameChainRasterWords(frame: *const ProgramGuiFramePayload) u64 {
+    var count: u64 = 0;
+    var cursor: ?*const ProgramGuiFramePayload = frame;
+    while (cursor) |item| : (cursor = item.base_frame) count +|= item.raster_words;
+    return count;
+}
+
+fn guiFrameChainHasReaders(frame: *const ProgramGuiFramePayload) bool {
+    var cursor: ?*const ProgramGuiFramePayload = frame;
+    while (cursor) |item| : (cursor = item.base_frame) if (item.reader_refs != 0) return true;
+    return false;
+}
+
 fn guiOwnedFrameBytes(gui: *const ProgramGuiPayload) u64 {
     var bytes: u64 = 0;
     if (gui.committed_frame) |frame| bytes +%= guiFrameBytes(frame);
@@ -1795,10 +1873,10 @@ fn guiOwnedFrameBytes(gui: *const ProgramGuiPayload) u64 {
 
 fn guiOwnedFrameCommands(gui: *const ProgramGuiPayload) u64 {
     var count: u64 = 0;
-    if (gui.committed_frame) |frame| count +%= frame.command_count;
+    if (gui.committed_frame) |frame| count +%= guiFrameChainCommandCount(frame);
     if (gui.building_frame) |frame| count +%= frame.command_count;
     var retired = gui.retired_frames;
-    while (retired) |frame| : (retired = frame.retired_next) count +%= frame.command_count;
+    while (retired) |frame| : (retired = frame.retired_next) count +%= guiFrameChainCommandCount(frame);
     return count;
 }
 
@@ -1809,7 +1887,7 @@ fn refreshGuiFrameOwnerPeak(gui: *ProgramGuiPayload) void {
     if (commands > gui.frame_peak_commands) gui.frame_peak_commands = commands;
 }
 
-fn releaseGuiFrame(frame: *ProgramGuiFramePayload, owner_id: u32) bool {
+fn releaseGuiFrameLocal(frame: *ProgramGuiFramePayload, owner_id: u32) bool {
     // Teardown only needs an owner/link-safe hierarchy.  A private fallible
     // clone or batch delta may legitimately contain commands whose resources
     // were not prepared yet; semantic validation would leak that partial OOM
@@ -1854,23 +1932,38 @@ fn releaseGuiFrame(frame: *ProgramGuiFramePayload, owner_id: u32) bool {
     return released;
 }
 
+fn releaseGuiFrame(frame: *ProgramGuiFramePayload, owner_id: u32) bool {
+    if (guiFrameChainHasReaders(frame)) return false;
+    var released = true;
+    var cursor: ?*ProgramGuiFramePayload = frame;
+    while (cursor) |item| {
+        const base = item.base_frame;
+        item.base_frame = null;
+        item.chain_depth = 1;
+        if (!releaseGuiFrameLocal(item, owner_id)) released = false;
+        cursor = base;
+    }
+    return released;
+}
+
 fn validateGuiFrameSet(gui: *const ProgramGuiPayload, owner_id: u32) bool {
     if (gui.committed_frame != null and gui.committed_frame == gui.building_frame) {
         instance_storage_stats.header_errors +%= 1;
         return false;
     }
     if (gui.committed_frame) |frame| {
-        if (frame.generation == 0 or frame.retired or frame.build_failed or !validateGuiFrame(frame, owner_id)) return false;
+        if (!validateCommittedGuiFrameChain(frame, owner_id, false)) return false;
     }
     if (gui.building_frame) |frame| {
-        if (frame.generation != 0 or frame.retired or frame.reader_refs != 0 or !validateGuiFrame(frame, owner_id)) return false;
+        if (frame.generation != 0 or frame.retired or frame.reader_refs != 0 or frame.base_frame != null or
+            frame.chain_depth != 1 or !validateGuiFrame(frame, owner_id)) return false;
     }
 
     var cursor = gui.retired_frames;
     var previous_generation: u64 = std.math.maxInt(u64);
     while (cursor) |frame| {
         if (!frame.retired or frame.generation == 0 or frame.generation >= previous_generation or
-            frame == gui.committed_frame or frame == gui.building_frame or !validateGuiFrame(frame, owner_id))
+            frame == gui.committed_frame or frame == gui.building_frame or !validateCommittedGuiFrameChain(frame, owner_id, true))
         {
             instance_storage_stats.header_errors +%= 1;
             return false;
@@ -1960,11 +2053,11 @@ fn validateProgramInstanceStorage(instance: *const ProgramInstance) bool {
 
 fn releaseGuiFrameSet(gui: *ProgramGuiPayload, owner_id: u32) bool {
     if (!validateGuiFrameSet(gui, owner_id)) return false;
-    if ((gui.committed_frame != null and gui.committed_frame.?.reader_refs != 0) or
-        (gui.building_frame != null and gui.building_frame.?.reader_refs != 0)) return false;
+    if ((gui.committed_frame != null and guiFrameChainHasReaders(gui.committed_frame.?)) or
+        (gui.building_frame != null and guiFrameChainHasReaders(gui.building_frame.?))) return false;
     var retired_check = gui.retired_frames;
     while (retired_check) |frame| : (retired_check = frame.retired_next) {
-        if (frame.reader_refs != 0) return false;
+        if (guiFrameChainHasReaders(frame)) return false;
     }
 
     const building = gui.building_frame;
@@ -2208,6 +2301,8 @@ pub fn runInstanceStorageSelfTest() bool {
     if (!testGuiAtomicCommitGrowthFailure(0xFFFE_000B, heap_baseline, storage_baseline)) return failInstanceStorageSelfTest(case_id, heap_baseline, storage_baseline);
     case_id += 1;
     if (!testGuiRetiredReaderLifetime(0xFFFE_000C, heap_baseline, storage_baseline)) return failInstanceStorageSelfTest(case_id, heap_baseline, storage_baseline);
+    case_id += 1;
+    if (!testGuiDeltaIndexed8(0xFFFE_000D, heap_baseline, storage_baseline)) return failInstanceStorageSelfTest(case_id, heap_baseline, storage_baseline);
 
     instance_storage_self_test_report = .{
         .cases = case_id,
@@ -2923,6 +3018,103 @@ fn testGuiRetiredReaderLifetime(owner_id: u32, heap_baseline: heap.Stats, storag
     return retired_ok and released and instanceStorageHeapBaselineEqual(heap_baseline, heap.stats()) and instanceStorageCurrentEqual(storage_baseline, instanceStorageStats());
 }
 
+fn testGuiDeltaIndexed8(owner_id: u32, heap_baseline: heap.Stats, storage_baseline: ProgramInstanceStorageStats) bool {
+    var storage = allocateProgramInstanceStorage(owner_id, .gui, false) orelse return false;
+    var fake = ProgramInstance{
+        .id = owner_id,
+        .app_class = .gui,
+        .entry = undefined,
+        .stack_top = 0,
+        .runtime_payload = storage.runtime,
+        .process_payload = storage.process,
+        .gui_payload = storage.gui,
+    };
+    const valid = blk: {
+        if (guiFrameBegin(&fake) != 0) break :blk false;
+        const base_commands = [_]GuiFrameCommand{
+            .{ .kind = r4x_api.gui_frame_command_kind_clear, .rgb = 0x010203 },
+            .{ .kind = r4x_api.gui_frame_command_kind_text, .resource_bytes = 1 },
+        };
+        if (guiFrameAppendBatch(&fake, base_commands[0..], "B") != 0 or guiFrameCommit(&fake) != 0) break :blk false;
+        const base = fake.gui_payload.?.committed_frame orelse break :blk false;
+        const base_generation = base.generation;
+        const base_bytes = guiFrameBytes(base);
+
+        const damage = [_]DisplayDamageRect{
+            .{ .x = 0, .y = 0, .w = 1, .h = 1 },
+            .{ .x = 3, .y = 3, .w = 1, .h = 1 },
+        };
+        if (guiFrameBeginDamage(&fake, damage[0..]) != 0) break :blk false;
+        var resource = [_]u8{0} ** (r4x_api.gui_indexed8_pixels_offset + 4);
+        var header = GuiIndexed8Resource{
+            .source_w = 2,
+            .source_h = 2,
+            .guest_w = 2,
+            .guest_h = 2,
+            .viewport_w = 4,
+            .viewport_h = 4,
+            .pixel_stride = 2,
+        };
+        @memcpy(resource[0..@sizeOf(GuiIndexed8Resource)], std.mem.asBytes(&header));
+        @memcpy(resource[r4x_api.gui_indexed8_palette_offset + 4 .. r4x_api.gui_indexed8_palette_offset + 8], &[_]u8{ 0x33, 0x22, 0x11, 0 });
+        @memcpy(resource[r4x_api.gui_indexed8_pixels_offset..], &[_]u8{ 0, 1, 1, 0 });
+        const indexed_command = GuiFrameCommand{
+            .kind = r4x_api.gui_frame_command_kind_indexed8,
+            .w = 4,
+            .h = 4,
+            .resource_bytes = resource.len,
+        };
+        if (!validateGuiFrameBatchCommand(&indexed_command, resource[0..]) or
+            guiFrameAppendBatch(&fake, (&[_]GuiFrameCommand{indexed_command})[0..], resource[0..]) != 0 or
+            guiFrameCommit(&fake) != 0) break :blk false;
+
+        const delta = fake.gui_payload.?.committed_frame orelse break :blk false;
+        const gui = fake.gui_payload.?;
+        if (delta.base_frame != base or delta.chain_depth != 2 or delta.damage_count != damage.len or
+            delta.command_count != 1 or guiFrameChainCommandCount(delta) != 3 or
+            guiFrameChainResourceBytes(delta) != resource.len + 1 or
+            gui.frame_delta_commits != 1 or gui.frame_full_commits != 1 or
+            gui.frame_indexed8_commands != 1 or gui.frame_indexed8_resource_bytes != resource.len or
+            gui.frame_avoided_clone_bytes < base_bytes) break :blk false;
+
+        var info: GuiFrameGenerationInfo = .{};
+        fillGuiFrameGenerationInfo(gui, .{ .instance_id = owner_id, .generation = 1 }, delta, &info);
+        if ((info.flags & r4x_api.gui_frame_generation_flag_delta) == 0 or
+            (info.flags & r4x_api.gui_frame_generation_flag_indexed8) == 0 or
+            info.base_generation != base_generation or info.command_count != 1 or
+            info.total_command_count != 3 or info.damage_count != damage.len) break :blk false;
+
+        var local_commands: [1]GuiFrameCommand = undefined;
+        var full_commands: [3]GuiFrameCommand = undefined;
+        var local_resource: [resource.len]u8 = undefined;
+        var local_damage: [damage.len]DisplayDamageRect = undefined;
+        if (copyGuiFrameLocalCommands(delta, 0, local_commands[0..]) != local_commands.len or
+            copyGuiFrameCommands(delta, full_commands[0..]) != full_commands.len or
+            copyGuiFrameLocalResourceBytes(delta, 0, local_resource[0..]) != local_resource.len) break :blk false;
+        @memcpy(local_damage[0..], delta.damage_regions[0..damage.len]);
+        if (local_commands[0].kind != r4x_api.gui_frame_command_kind_indexed8 or
+            local_commands[0].resource_offset != 0 or full_commands[2].resource_offset != 1 or
+            !std.mem.eql(u8, local_resource[0..], resource[0..]) or !std.meta.eql(local_damage, damage)) break :blk false;
+
+        var bad_header = header;
+        bad_header.pixel_stride = 3;
+        var invalid_resource = resource;
+        @memcpy(invalid_resource[0..@sizeOf(GuiIndexed8Resource)], std.mem.asBytes(&bad_header));
+        if (validateGuiFrameBatchCommand(&indexed_command, invalid_resource[0..])) break :blk false;
+
+        var base_capture = captureGuiFrameGeneration(&fake, base_generation) orelse break :blk false;
+        if (base_capture.frame != base or base.reader_refs != 1) break :blk false;
+        if (guiFrameBegin(&fake) != 0) break :blk false;
+        const replacement = [_]GuiFrameCommand{.{ .kind = r4x_api.gui_frame_command_kind_clear, .rgb = 0x0A0B0C }};
+        if (guiFrameAppendBatch(&fake, replacement[0..], &.{}) != 0 or guiFrameCommit(&fake) != 0 or gui.retired_frames != delta) break :blk false;
+        releaseCapturedGuiFrame(&fake, &base_capture);
+        if (gui.retired_frames != null) break :blk false;
+        break :blk true;
+    };
+    rollbackProgramInstanceStorage(owner_id, &storage);
+    return valid and instanceStorageHeapBaselineEqual(heap_baseline, heap.stats()) and instanceStorageCurrentEqual(storage_baseline, instanceStorageStats());
+}
+
 fn failInstanceStorageSelfTest(case_id: u32, heap_baseline: heap.Stats, storage_baseline: ProgramInstanceStorageStats) bool {
     const heap_ok = instanceStorageHeapBaselineEqual(heap_baseline, heap.stats());
     const storage_ok = instanceStorageCurrentEqual(storage_baseline, instanceStorageStats());
@@ -3436,6 +3628,21 @@ fn captureCommittedGuiFrame(instance: *ProgramInstance, expected_generation: ?u6
     return .{ .gui = gui, .frame = frame, .generation = frame.generation };
 }
 
+fn captureGuiFrameGeneration(instance: *ProgramInstance, generation: u64) ?GuiFrameCapture {
+    if (generation == 0) return null;
+    const gui = instance.gui_payload orelse return null;
+    lockGuiFrameState(gui);
+    defer _ = gui.frame_lock.unlock();
+    var cursor = gui.committed_frame;
+    while (cursor) |frame| : (cursor = frame.base_frame) {
+        if (frame.generation != generation) continue;
+        if (frame.reader_refs == std.math.maxInt(u32)) return null;
+        frame.reader_refs += 1;
+        return .{ .gui = gui, .frame = frame, .generation = generation };
+    }
+    return null;
+}
+
 fn removeRetiredGuiFrameLocked(gui: *ProgramGuiPayload, frame: *ProgramGuiFramePayload) bool {
     var previous: ?*ProgramGuiFramePayload = null;
     var cursor = gui.retired_frames;
@@ -3456,6 +3663,32 @@ fn removeRetiredGuiFrameLocked(gui: *ProgramGuiPayload, frame: *ProgramGuiFrameP
     return false;
 }
 
+fn guiFrameChainContains(root: *const ProgramGuiFramePayload, wanted: *const ProgramGuiFramePayload) bool {
+    var cursor: ?*const ProgramGuiFramePayload = root;
+    while (cursor) |frame| : (cursor = frame.base_frame) if (frame == wanted) return true;
+    return false;
+}
+
+fn removeReleasableRetiredGuiChainLocked(gui: *ProgramGuiPayload, changed: *const ProgramGuiFramePayload) ?*ProgramGuiFramePayload {
+    var previous: ?*ProgramGuiFramePayload = null;
+    var cursor = gui.retired_frames;
+    while (cursor) |root| {
+        if (guiFrameChainContains(root, changed) and !guiFrameChainHasReaders(root)) {
+            if (previous) |before| {
+                before.retired_next = root.retired_next;
+            } else {
+                gui.retired_frames = root.retired_next;
+            }
+            root.retired_next = null;
+            root.retired = false;
+            return root;
+        }
+        previous = root;
+        cursor = root.retired_next;
+    }
+    return null;
+}
+
 fn releaseCapturedGuiFrame(instance: *ProgramInstance, capture: *GuiFrameCapture) void {
     var release_frame: ?*ProgramGuiFramePayload = null;
     const gui = capture.gui;
@@ -3464,13 +3697,7 @@ fn releaseCapturedGuiFrame(instance: *ProgramInstance, capture: *GuiFrameCapture
         instance_storage_stats.header_errors +%= 1;
     } else {
         capture.frame.reader_refs -= 1;
-        if (capture.frame.reader_refs == 0 and capture.frame.retired) {
-            if (removeRetiredGuiFrameLocked(gui, capture.frame)) {
-                release_frame = capture.frame;
-            } else {
-                instance_storage_stats.header_errors +%= 1;
-            }
-        }
+        if (capture.frame.reader_refs == 0) release_frame = removeReleasableRetiredGuiChainLocked(gui, capture.frame);
     }
     _ = gui.frame_lock.unlock();
     if (release_frame) |frame| _ = releaseGuiFrame(frame, instance.id);
@@ -3506,47 +3733,68 @@ fn linkClonedGuiResource(frame: *ProgramGuiFramePayload, payload: *ProgramGuiRes
 
 fn cloneGuiFrame(instance: *ProgramInstance, source: *const ProgramGuiFramePayload) ?*ProgramGuiFramePayload {
     const clone = allocateGuiFramePayload(instance.id, false) orelse return null;
-    var command_cursor = source.command_payload;
-    while (command_cursor) |source_payload| : (command_cursor = source_payload.next) {
-        if (!guiFrameCanLinkNodes(clone, 1)) {
+    var chain: [r4x_api.gui_frame_max_delta_chain]*const ProgramGuiFramePayload = undefined;
+    var chain_count: usize = 0;
+    var chain_cursor: ?*const ProgramGuiFramePayload = source;
+    while (chain_cursor) |frame| : (chain_cursor = frame.base_frame) {
+        if (chain_count >= chain.len) {
             _ = releaseGuiFrame(clone, instance.id);
             return null;
         }
-        const payload = allocateGuiCommandPayload(instance.id, clone.command_count, source_payload.command_count) orelse {
-            _ = releaseGuiFrame(clone, instance.id);
-            return null;
-        };
-        payload.command_count = source_payload.command_count;
-        @memcpy(
-            guiCommandPayloadCommands(payload)[0..payload.command_count],
-            guiCommandPayloadCommandsConst(source_payload)[0..source_payload.command_count],
-        );
-        linkClonedGuiCommand(clone, payload);
+        chain[chain_count] = frame;
+        chain_count += 1;
     }
-    var resource_cursor = source.resource_payload;
-    while (resource_cursor) |source_payload| : (resource_cursor = source_payload.next) {
-        if (!guiFrameCanLinkNodes(clone, 1)) {
-            _ = releaseGuiFrame(clone, instance.id);
-            return null;
+
+    while (chain_count != 0) {
+        chain_count -= 1;
+        const source_frame = chain[chain_count];
+        const resource_base = clone.resource_len;
+        const raster_base = clone.raster_words;
+        var command_cursor = source_frame.command_payload;
+        while (command_cursor) |source_payload| : (command_cursor = source_payload.next) {
+            if (!guiFrameCanLinkNodes(clone, 1)) {
+                _ = releaseGuiFrame(clone, instance.id);
+                return null;
+            }
+            const payload = allocateGuiCommandPayload(instance.id, clone.command_count, source_payload.command_count) orelse {
+                _ = releaseGuiFrame(clone, instance.id);
+                return null;
+            };
+            payload.command_count = source_payload.command_count;
+            @memcpy(
+                guiCommandPayloadCommands(payload)[0..payload.command_count],
+                guiCommandPayloadCommandsConst(source_payload)[0..source_payload.command_count],
+            );
+            for (guiCommandPayloadCommands(payload)[0..payload.command_count]) |*command| {
+                if (command.payload_bytes != 0) command.payload_offset += resource_base;
+                if (command.resource_kind == .xrgb32 or command.resource_kind == .alpha8) command.raster_word_offset += raster_base;
+            }
+            linkClonedGuiCommand(clone, payload);
         }
-        const payload = allocateGuiResourcePayload(
-            instance.id,
-            clone.resource_len,
-            source_payload.raster_word_offset,
-            source_payload.byte_count,
-            source_payload.resource_kind,
-        ) orelse {
-            _ = releaseGuiFrame(clone, instance.id);
-            return null;
-        };
-        @memcpy(guiResourcePayloadData(payload), guiResourcePayloadDataConst(source_payload));
-        linkClonedGuiResource(clone, payload);
+        var resource_cursor = source_frame.resource_payload;
+        while (resource_cursor) |source_payload| : (resource_cursor = source_payload.next) {
+            if (!guiFrameCanLinkNodes(clone, 1)) {
+                _ = releaseGuiFrame(clone, instance.id);
+                return null;
+            }
+            const payload = allocateGuiResourcePayload(
+                instance.id,
+                clone.resource_len,
+                source_payload.raster_word_offset + raster_base,
+                source_payload.byte_count,
+                source_payload.resource_kind,
+            ) orelse {
+                _ = releaseGuiFrame(clone, instance.id);
+                return null;
+            };
+            @memcpy(guiResourcePayloadData(payload), guiResourcePayloadDataConst(source_payload));
+            linkClonedGuiResource(clone, payload);
+        }
+        // Batch APPEND stores XRGB/Alpha resources in generic byte nodes. The
+        // command semantics remain authoritative for the flattened legacy
+        // raster stream, so advance by the generation-local aggregate.
+        clone.raster_words = raster_base + source_frame.raster_words;
     }
-    // Batch APPEND stores its byte-exact shared blob in generic data nodes;
-    // legacy raster-word offsets are command semantics, not a property of
-    // those physical nodes.  Preserve the source total for mixed new/legacy
-    // incremental drawing after a commit.
-    clone.raster_words = source.raster_words;
     return clone;
 }
 
@@ -3562,6 +3810,7 @@ fn batchCommandResourceKind(command: *const GuiFrameCommand) ?ProgramGuiCommandR
         r4x_api.gui_frame_command_kind_shadow,
         r4x_api.gui_frame_command_kind_argb32,
         => .path,
+        r4x_api.gui_frame_command_kind_indexed8 => .indexed8,
         else => null,
     };
 }
@@ -3584,6 +3833,65 @@ fn guiShapeReadU32(bytes: []const u8, offset: usize) ?u32 {
 
 fn guiShapeField(bytes: []const u8, comptime name: []const u8) ?u32 {
     return guiShapeReadU32(bytes, @offsetOf(GuiShapeResource, name));
+}
+
+fn validateGuiIndexed8Resource(command: *const GuiFrameCommand, resource: []const u8) bool {
+    if (command.w == 0 or command.h == 0 or command.w > GUI_RASTER_MAX_WIDTH or command.h > GUI_RASTER_MAX_HEIGHT or
+        command.rgb != 0 or command.fg != 0 or command.bg != 0 or command.font_id != 0 or
+        command.text_w != 0 or command.text_h != 0 or command.baseline != 0 or command.line_height != 0 or
+        command.parameter0 != 0 or command.parameter1 != 0) return false;
+    if (resource.len < r4x_api.gui_indexed8_pixels_offset) return false;
+    if (guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "version")) != r4x_api.gui_indexed8_resource_version or
+        guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "size")) != r4x_api.gui_indexed8_resource_size) return false;
+
+    const source_x = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "source_x")) orelse return false;
+    const source_y = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "source_y")) orelse return false;
+    const source_w = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "source_w")) orelse return false;
+    const source_h = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "source_h")) orelse return false;
+    const guest_w = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "guest_w")) orelse return false;
+    const guest_h = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "guest_h")) orelse return false;
+    const viewport_x: i32 = @bitCast(guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "viewport_x")) orelse return false);
+    const viewport_y: i32 = @bitCast(guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "viewport_y")) orelse return false);
+    const viewport_w = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "viewport_w")) orelse return false;
+    const viewport_h = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "viewport_h")) orelse return false;
+    const palette_entries = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "palette_entries")) orelse return false;
+    const palette_offset = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "palette_offset")) orelse return false;
+    const pixels_offset = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "pixels_offset")) orelse return false;
+    const pixel_stride = guiShapeReadU32(resource, @offsetOf(GuiIndexed8Resource, "pixel_stride")) orelse return false;
+    if (source_w == 0 or source_h == 0 or source_w > GUI_RASTER_MAX_WIDTH or source_h > GUI_RASTER_MAX_HEIGHT or
+        guest_w == 0 or guest_h == 0 or viewport_w == 0 or viewport_h == 0 or
+        palette_entries != r4x_api.gui_indexed8_palette_entries or palette_offset != r4x_api.gui_indexed8_palette_offset or
+        pixels_offset != r4x_api.gui_indexed8_pixels_offset or pixel_stride != source_w) return false;
+    const source_right = std.math.add(u64, source_x, source_w) catch return false;
+    const source_bottom = std.math.add(u64, source_y, source_h) catch return false;
+    if (source_right > guest_w or source_bottom > guest_h) return false;
+    const pixels = std.math.mul(u64, source_w, source_h) catch return false;
+    const required = std.math.add(u64, pixels_offset, pixels) catch return false;
+    if (required != resource.len or command.resource_bytes != required) return false;
+
+    const command_left: i64 = command.x;
+    const command_top: i64 = command.y;
+    const command_right = std.math.add(i64, command_left, command.w) catch return false;
+    const command_bottom = std.math.add(i64, command_top, command.h) catch return false;
+    const viewport_left: i64 = viewport_x;
+    const viewport_top: i64 = viewport_y;
+    const viewport_right = std.math.add(i64, viewport_left, viewport_w) catch return false;
+    const viewport_bottom = std.math.add(i64, viewport_top, viewport_h) catch return false;
+    if (command_left < viewport_left or command_top < viewport_top or command_right > viewport_right or command_bottom > viewport_bottom) return false;
+    const local_left: u64 = @intCast(command_left - viewport_left);
+    const local_top: u64 = @intCast(command_top - viewport_top);
+    const local_right: u64 = @intCast(command_right - viewport_left);
+    const local_bottom: u64 = @intCast(command_bottom - viewport_top);
+    const mapped_left = (local_left * guest_w) / viewport_w;
+    const mapped_top = (local_top * guest_h) / viewport_h;
+    const mapped_right = ((local_right - 1) * guest_w) / viewport_w;
+    const mapped_bottom = ((local_bottom - 1) * guest_h) / viewport_h;
+    if (mapped_left < source_x or mapped_top < source_y or mapped_right >= source_right or mapped_bottom >= source_bottom) return false;
+
+    var palette_byte: usize = @intCast(palette_offset + 3);
+    const palette_end: usize = @intCast(pixels_offset);
+    while (palette_byte < palette_end) : (palette_byte += @sizeOf(u32)) if (resource[palette_byte] != 0) return false;
+    return true;
 }
 
 fn guiShapeFloat(bits: u32) ?f32 {
@@ -3758,6 +4066,9 @@ fn validateGuiFrameBatchCommand(command: *const GuiFrameCommand, resources: []co
             if (pixels > GUI_ARGB32_MAX_PIXELS) return false;
             const bytes = std.math.mul(u64, pixels, @sizeOf(u32)) catch return false;
             return command.resource_bytes == bytes;
+        },
+        r4x_api.gui_frame_command_kind_indexed8 => {
+            return resource_kind == .indexed8 and validateGuiIndexed8Resource(command, resource);
         },
         r4x_api.gui_frame_command_kind_path_fill,
         r4x_api.gui_frame_command_kind_path_stroke,
@@ -3975,6 +4286,46 @@ fn guiFrameBegin(instance: *ProgramInstance) i32 {
     return 0;
 }
 
+fn validGuiDamageRegion(region: DisplayDamageRect) bool {
+    if (region.w == 0 or region.h == 0) return false;
+    const right = std.math.add(i64, @as(i64, region.x), @as(i64, region.w)) catch return false;
+    const bottom = std.math.add(i64, @as(i64, region.y), @as(i64, region.h)) catch return false;
+    return right <= std.math.maxInt(i32) and bottom <= std.math.maxInt(i32);
+}
+
+fn guiFrameBeginDamage(instance: *ProgramInstance, regions: []const DisplayDamageRect) i32 {
+    if (regions.len == 0 or regions.len > r4x_api.gui_frame_max_damage_regions) return r4x_api.gui_frame_error_invalid;
+    for (regions) |region| if (!validGuiDamageRegion(region)) return r4x_api.gui_frame_error_invalid;
+    const gui = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
+    lockGuiFrameState(gui);
+    if (gui.building_frame != null or gui.committed_frame == null or
+        gui.committed_frame.?.chain_depth >= r4x_api.gui_frame_max_delta_chain)
+    {
+        _ = gui.frame_lock.unlock();
+        return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
+    }
+    _ = gui.frame_lock.unlock();
+
+    const frame = allocateGuiFramePayload(instance.id, true) orelse {
+        guiFrameMarkBuildFailed(gui, null);
+        return r4x_api.gui_frame_error_oom;
+    };
+    @memcpy(frame.damage_regions[0..regions.len], regions);
+    frame.damage_count = @intCast(regions.len);
+    lockGuiFrameState(gui);
+    if (gui.building_frame != null or gui.committed_frame == null or
+        gui.committed_frame.?.chain_depth >= r4x_api.gui_frame_max_delta_chain)
+    {
+        _ = gui.frame_lock.unlock();
+        _ = releaseGuiFrame(frame, instance.id);
+        return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
+    }
+    gui.building_frame = frame;
+    refreshGuiFrameOwnerPeak(gui);
+    _ = gui.frame_lock.unlock();
+    return setGuiFrameResult(gui, r4x_api.gui_frame_result_ok);
+}
+
 fn guiFrameReplaceBuild(instance: *ProgramInstance, explicit_build: bool) ?*ProgramGuiFramePayload {
     const gui = ensureGuiPayload(instance) orelse return null;
     const frame = allocateGuiFramePayload(instance.id, explicit_build) orelse {
@@ -4062,6 +4413,7 @@ fn guiFrameCommit(instance: *ProgramInstance) i32 {
     const gui = instance.gui_payload orelse return -2;
     const building = gui.building_frame orelse return -3;
     if (building.build_failed or !validateGuiFrame(building, instance.id)) return -3;
+    const is_delta = building.damage_count != 0;
     var release_old: ?*ProgramGuiFramePayload = null;
     lockGuiFrameState(gui);
     if (gui.building_frame != building or building.build_failed) {
@@ -4071,25 +4423,47 @@ fn guiFrameCommit(instance: *ProgramInstance) i32 {
     // Consume the global generation only after the prepared frame has won
     // the final state check.  From here through the pointer swap there are no
     // fallible steps, so failed/cancelled builds never burn a generation.
+    const old = gui.committed_frame;
+    if (is_delta and (old == null or old.?.chain_depth >= r4x_api.gui_frame_max_delta_chain)) {
+        _ = gui.frame_lock.unlock();
+        return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
+    }
     const generation = reserveGuiFrameGeneration() orelse {
         building.build_failed = true;
         _ = gui.frame_lock.unlock();
         return -7;
     };
-    const old = gui.committed_frame;
     building.generation = generation;
     building.explicit_build = false;
+    if (is_delta) {
+        building.base_frame = old.?;
+        building.chain_depth = old.?.chain_depth + 1;
+    }
     gui.committed_frame = building;
     gui.building_frame = null;
     gui.frame_commits +%= 1;
     instance_storage_stats.gui_frame_commits +%= 1;
-    if (old) |old_frame| {
-        if (old_frame.reader_refs == 0) {
-            release_old = old_frame;
-        } else {
-            old_frame.retired = true;
-            old_frame.retired_next = gui.retired_frames;
-            gui.retired_frames = old_frame;
+    if (is_delta) {
+        gui.frame_delta_commits +%= 1;
+        gui.frame_avoided_clone_bytes +|= guiFrameBytes(old.?);
+    } else {
+        gui.frame_full_commits +%= 1;
+        if (old) |old_frame| {
+            if (!guiFrameChainHasReaders(old_frame)) {
+                release_old = old_frame;
+            } else {
+                old_frame.retired = true;
+                old_frame.retired_next = gui.retired_frames;
+                gui.retired_frames = old_frame;
+            }
+        }
+    }
+    var command_cursor = building.command_payload;
+    while (command_cursor) |payload| : (command_cursor = payload.next) {
+        for (guiCommandPayloadCommandsConst(payload)[0..payload.command_count]) |command| {
+            if (command.kind != r4x_api.gui_frame_command_kind_indexed8) continue;
+            gui.frame_indexed8_commands +%= 1;
+            gui.frame_indexed8_resource_bytes +|= command.payload_bytes;
         }
     }
     refreshGuiFrameOwnerPeak(gui);
@@ -5405,6 +5779,9 @@ fn configureR4XStartR4DrawTable() void {
         .display_present_regions = &r4api.r4draw.displayPresentRegions,
         .display_present_capabilities = &r4api.r4draw.displayPresentCapabilities,
         .display_present_completion = &r4api.r4draw.displayPresentCompletion,
+        .gui_frame_begin_damage = &apiGuiFrameBeginDamage,
+        .gui_frame_generation_info = &apiGuiFrameGenerationInfo,
+        .gui_frame_generation_read = &apiGuiFrameGenerationRead,
     });
 }
 
@@ -12411,18 +12788,36 @@ fn apiGuiCommand(id: u32, index: u32, out: *GuiCommand) callconv(.c) i32 {
         return 0;
     };
     defer releaseCapturedGuiFrame(instance, &capture);
-    const command = guiFrameCommandAt(capture.frame, index) orelse {
+    const location = guiFrameCommandLocationAt(capture.frame, index) orelse {
         out.* = .{};
         return 0;
     };
-    if (!materializeLegacyGuiCommand(capture.frame, command, out)) {
+    if (!materializeLegacyGuiCommandAt(location, out)) {
         out.* = .{};
         return -2;
     }
     return 1;
 }
 
-fn guiFrameCommandAt(frame: *const ProgramGuiFramePayload, index: u64) ?*const ProgramGuiCommand {
+const GuiFrameCommandLocation = struct {
+    frame: *const ProgramGuiFramePayload,
+    command: *const ProgramGuiCommand,
+    resource_base: u64,
+    raster_base: u64,
+};
+
+fn collectGuiFrameChain(frame: *const ProgramGuiFramePayload, out: *[r4x_api.gui_frame_max_delta_chain]*const ProgramGuiFramePayload) usize {
+    var count: usize = 0;
+    var cursor: ?*const ProgramGuiFramePayload = frame;
+    while (cursor) |item| : (cursor = item.base_frame) {
+        if (count >= out.len) return 0;
+        out[count] = item;
+        count += 1;
+    }
+    return count;
+}
+
+fn guiFrameLocalCommandAt(frame: *const ProgramGuiFramePayload, index: u64) ?*const ProgramGuiCommand {
     if (index >= frame.command_count) return null;
     var cursor = frame.command_payload;
     while (cursor) |payload| : (cursor = payload.next) {
@@ -12432,7 +12827,33 @@ fn guiFrameCommandAt(frame: *const ProgramGuiFramePayload, index: u64) ?*const P
     return null;
 }
 
-fn copyGuiFrameResourceBytes(frame: *const ProgramGuiFramePayload, start: u64, out: []u8) usize {
+fn guiFrameCommandLocationAt(frame: *const ProgramGuiFramePayload, index: u64) ?GuiFrameCommandLocation {
+    var chain: [r4x_api.gui_frame_max_delta_chain]*const ProgramGuiFramePayload = undefined;
+    var count = collectGuiFrameChain(frame, &chain);
+    if (count == 0) return null;
+    var command_base: u64 = 0;
+    var resource_base: u64 = 0;
+    var raster_base: u64 = 0;
+    while (count != 0) {
+        count -= 1;
+        const item = chain[count];
+        if (index < command_base + item.command_count) {
+            const command = guiFrameLocalCommandAt(item, index - command_base) orelse return null;
+            return .{ .frame = item, .command = command, .resource_base = resource_base, .raster_base = raster_base };
+        }
+        command_base += item.command_count;
+        resource_base += item.resource_len;
+        raster_base += item.raster_words;
+    }
+    return null;
+}
+
+fn guiFrameCommandAt(frame: *const ProgramGuiFramePayload, index: u64) ?*const ProgramGuiCommand {
+    const location = guiFrameCommandLocationAt(frame, index) orelse return null;
+    return location.command;
+}
+
+fn copyGuiFrameLocalResourceBytes(frame: *const ProgramGuiFramePayload, start: u64, out: []u8) usize {
     if (out.len == 0 or start >= frame.resource_len) return 0;
     const wanted_u64 = @min(@as(u64, out.len), frame.resource_len - start);
     const wanted: usize = @intCast(wanted_u64);
@@ -12451,7 +12872,29 @@ fn copyGuiFrameResourceBytes(frame: *const ProgramGuiFramePayload, start: u64, o
     return copied;
 }
 
-fn materializeLegacyGuiCommand(frame: *const ProgramGuiFramePayload, command: *const ProgramGuiCommand, out: *GuiCommand) bool {
+fn copyGuiFrameResourceBytes(frame: *const ProgramGuiFramePayload, start: u64, out: []u8) usize {
+    const total = guiFrameChainResourceBytes(frame);
+    if (out.len == 0 or start >= total) return 0;
+    var chain: [r4x_api.gui_frame_max_delta_chain]*const ProgramGuiFramePayload = undefined;
+    var count = collectGuiFrameChain(frame, &chain);
+    if (count == 0) return 0;
+    var global_base: u64 = 0;
+    var copied: usize = 0;
+    while (count != 0 and copied < out.len) {
+        count -= 1;
+        const item = chain[count];
+        const item_end = global_base + item.resource_len;
+        if (start + copied < item_end) {
+            const local_start = if (start + copied > global_base) start + copied - global_base else 0;
+            copied += copyGuiFrameLocalResourceBytes(item, local_start, out[copied..]);
+        }
+        global_base = item_end;
+    }
+    return copied;
+}
+
+fn materializeLegacyGuiCommandAt(location: GuiFrameCommandLocation, out: *GuiCommand) bool {
+    const command = location.command;
     out.* = .{
         .kind = command.kind,
         .x = command.x,
@@ -12472,26 +12915,32 @@ fn materializeLegacyGuiCommand(frame: *const ProgramGuiFramePayload, command: *c
         .none => {},
         .utf8 => {
             const count = @min(command.payload_bytes, out.text.len - 1);
-            if (copyGuiFrameResourceBytes(frame, command.payload_offset, out.text[0..count]) != count) return false;
+            if (copyGuiFrameLocalResourceBytes(location.frame, command.payload_offset, out.text[0..count]) != count) return false;
             out.text[count] = 0;
         },
         .xrgb32 => {
-            if (command.raster_word_offset > std.math.maxInt(u32) or command.parameter0 > std.math.maxInt(u32)) return false;
-            out.rgb = @intCast(command.raster_word_offset);
+            const raster_offset = std.math.add(u64, location.raster_base, command.raster_word_offset) catch return false;
+            if (raster_offset > std.math.maxInt(u32) or command.parameter0 > std.math.maxInt(u32)) return false;
+            out.rgb = @intCast(raster_offset);
             // Frame v1 reserves flags and carries XRGB scale in parameter0;
             // synthesize the frozen legacy GuiCommand representation.
             out.flags = @intCast(command.parameter0);
         },
         .alpha8 => {
             const packed_words = (std.math.add(u64, command.payload_bytes, 3) catch return false) / 4;
-            if (command.raster_word_offset > std.math.maxInt(u32) or packed_words > std.math.maxInt(u32)) return false;
-            out.fg = @intCast(command.raster_word_offset);
+            const raster_offset = std.math.add(u64, location.raster_base, command.raster_word_offset) catch return false;
+            if (raster_offset > std.math.maxInt(u32) or packed_words > std.math.maxInt(u32)) return false;
+            out.fg = @intCast(raster_offset);
             out.bg = @intCast(packed_words);
             out.flags = 1;
         },
-        .path => return false,
+        .path, .indexed8 => return false,
     }
     return true;
+}
+
+fn materializeLegacyGuiCommand(frame: *const ProgramGuiFramePayload, command: *const ProgramGuiCommand, out: *GuiCommand) bool {
+    return materializeLegacyGuiCommandAt(.{ .frame = frame, .command = command, .resource_base = 0, .raster_base = 0 }, out);
 }
 
 fn guiRasterReadCount(available: u64, capacity: u32) usize {
@@ -12500,7 +12949,7 @@ fn guiRasterReadCount(available: u64, capacity: u32) usize {
     return @intCast(@min(available, @min(requested, return_limit)));
 }
 
-fn copyGuiRasterWords(frame: *const ProgramGuiFramePayload, start: u64, out: []u32) usize {
+fn copyGuiLocalRasterWords(frame: *const ProgramGuiFramePayload, start: u64, out: []u32) usize {
     if (out.len == 0 or start >= frame.raster_words) return 0;
     const wanted: usize = @intCast(@min(@as(u64, out.len), frame.raster_words - start));
     var copied: usize = 0;
@@ -12524,7 +12973,7 @@ fn copyGuiRasterWords(frame: *const ProgramGuiFramePayload, start: u64, out: []u
                 const local_byte = local_word * 4;
                 var encoded = [_]u8{0} ** 4;
                 const available = @min(@as(u64, 4), command.payload_bytes - local_byte);
-                if (copyGuiFrameResourceBytes(frame, command.payload_offset + local_byte, encoded[0..@intCast(available)]) != available) return copied;
+                if (copyGuiFrameLocalResourceBytes(frame, command.payload_offset + local_byte, encoded[0..@intCast(available)]) != available) return copied;
                 out[copied] = @as(u32, encoded[0]) |
                     (@as(u32, encoded[1]) << 8) |
                     (@as(u32, encoded[2]) << 16) |
@@ -12532,6 +12981,28 @@ fn copyGuiRasterWords(frame: *const ProgramGuiFramePayload, start: u64, out: []u
             }
             if (copied == wanted) return copied;
         }
+    }
+    return copied;
+}
+
+fn copyGuiRasterWords(frame: *const ProgramGuiFramePayload, start: u64, out: []u32) usize {
+    const total = guiFrameChainRasterWords(frame);
+    if (out.len == 0 or start >= total) return 0;
+    var chain: [r4x_api.gui_frame_max_delta_chain]*const ProgramGuiFramePayload = undefined;
+    var count = collectGuiFrameChain(frame, &chain);
+    if (count == 0) return 0;
+    var global_base: u64 = 0;
+    var copied: usize = 0;
+    while (count != 0 and copied < out.len) {
+        count -= 1;
+        const item = chain[count];
+        const item_end = global_base + item.raster_words;
+        const position = start + @as(u64, @intCast(copied));
+        if (position < item_end) {
+            const local_start = if (position > global_base) position - global_base else 0;
+            copied += copyGuiLocalRasterWords(item, local_start, out[copied..]);
+        }
+        global_base = item_end;
     }
     return copied;
 }
@@ -12546,8 +13017,9 @@ fn apiGuiRasterRead(id: u32, offset: u32, out: [*]u32, capacity: u32) callconv(.
     var capture = captureCommittedGuiFrame(instance, null) orelse return 0;
     defer releaseCapturedGuiFrame(instance, &capture);
     const start: u64 = offset;
-    if (start >= capture.frame.raster_words) return 0;
-    const available = capture.frame.raster_words - start;
+    const total_words = guiFrameChainRasterWords(capture.frame);
+    if (start >= total_words) return 0;
+    const available = total_words - start;
     const count = guiRasterReadCount(available, capacity);
     const copied = copyGuiRasterWords(capture.frame, start, out[0..count]);
     return @intCast(copied);
@@ -12629,8 +13101,8 @@ fn fillGuiFrameInfoLocked(gui: *const ProgramGuiPayload, owner: ProgramProcessHa
         .owner = owner,
         .committed_generation = if (committed) |frame| frame.generation else 0,
         .building_generation = if (building) |frame| frame.generation else 0,
-        .committed_command_count = if (committed) |frame| frame.command_count else 0,
-        .committed_resource_bytes = if (committed) |frame| frame.resource_len else 0,
+        .committed_command_count = if (committed) |frame| guiFrameChainCommandCount(frame) else 0,
+        .committed_resource_bytes = if (committed) |frame| guiFrameChainResourceBytes(frame) else 0,
         .building_command_count = if (building) |frame| frame.command_count else 0,
         .building_resource_bytes = if (building) |frame| frame.resource_len else 0,
         .current_frame_bytes = guiOwnedFrameBytes(gui),
@@ -12666,7 +13138,7 @@ fn fillCurrentGuiFrameInfoForId(instance_id: u32, result: i32, out: *GuiFrameInf
     _ = gui.frame_lock.unlock();
 }
 
-fn externalGuiFrameCommand(command: *const ProgramGuiCommand) GuiFrameCommand {
+fn externalGuiFrameCommandWithBase(command: *const ProgramGuiCommand, resource_base: u64) GuiFrameCommand {
     return .{
         .version = r4x_api.gui_frame_command_version,
         .size = r4x_api.gui_frame_command_size,
@@ -12687,22 +13159,41 @@ fn externalGuiFrameCommand(command: *const ProgramGuiCommand) GuiFrameCommand {
         .text_h = command.text_h,
         .baseline = command.baseline,
         .line_height = command.line_height,
-        .resource_offset = command.payload_offset,
+        .resource_offset = if (command.payload_bytes == 0) 0 else command.payload_offset + resource_base,
         .resource_bytes = command.payload_bytes,
         .parameter0 = command.parameter0,
         .parameter1 = command.parameter1,
     };
 }
 
-fn copyGuiFrameCommands(frame: *const ProgramGuiFramePayload, out: []GuiFrameCommand) usize {
+fn externalGuiFrameCommand(command: *const ProgramGuiCommand) GuiFrameCommand {
+    return externalGuiFrameCommandWithBase(command, 0);
+}
+
+fn copyGuiFrameLocalCommands(frame: *const ProgramGuiFramePayload, resource_base: u64, out: []GuiFrameCommand) usize {
     var copied: usize = 0;
     var cursor = frame.command_payload;
     while (cursor) |payload| : (cursor = payload.next) {
         const commands = guiCommandPayloadCommandsConst(payload);
         for (commands[0..payload.command_count]) |*command| {
-            out[copied] = externalGuiFrameCommand(command);
+            out[copied] = externalGuiFrameCommandWithBase(command, resource_base);
             copied += 1;
         }
+    }
+    return copied;
+}
+
+fn copyGuiFrameCommands(frame: *const ProgramGuiFramePayload, out: []GuiFrameCommand) usize {
+    var chain: [r4x_api.gui_frame_max_delta_chain]*const ProgramGuiFramePayload = undefined;
+    var count = collectGuiFrameChain(frame, &chain);
+    if (count == 0) return 0;
+    var copied: usize = 0;
+    var resource_base: u64 = 0;
+    while (count != 0) {
+        count -= 1;
+        const item = chain[count];
+        copied += copyGuiFrameLocalCommands(item, resource_base, out[copied..]);
+        resource_base += item.resource_len;
     }
     return copied;
 }
@@ -12712,6 +13203,15 @@ fn apiGuiFrameBegin() callconv(.c) i32 {
     const result = guiFrameBegin(instance);
     if (instance.gui_payload) |gui| gui.frame_last_error = result;
     return result;
+}
+
+fn apiGuiFrameBeginDamage(regions_ptr: [*]const DisplayDamageRect, region_count: u32) callconv(.c) i32 {
+    const instance = currentInstance() orelse return r4x_api.gui_frame_error_unavailable;
+    const gui = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
+    if (@intFromPtr(regions_ptr) == 0 or region_count == 0 or region_count > r4x_api.gui_frame_max_damage_regions) {
+        return setGuiFrameResult(gui, r4x_api.gui_frame_error_invalid);
+    }
+    return guiFrameBeginDamage(instance, regions_ptr[0..region_count]);
 }
 
 fn apiGuiFrameAppend(
@@ -12836,7 +13336,9 @@ fn apiGuiFrameRead(
         _ = gui.frame_lock.unlock();
         return r4x_api.gui_frame_error_invalid;
     }
-    if (command_capacity < frame.command_count or resource_capacity < frame.resource_len) {
+    const total_commands = guiFrameChainCommandCount(frame);
+    const total_resources = guiFrameChainResourceBytes(frame);
+    if (command_capacity < total_commands or resource_capacity < total_resources) {
         gui.frame_last_error = r4x_api.gui_frame_error_buffer_too_small;
         fillGuiFrameInfoLocked(gui, handle, out);
         _ = gui.frame_lock.unlock();
@@ -12858,15 +13360,138 @@ fn apiGuiFrameRead(
     _ = gui.frame_lock.unlock();
 
     var capture = GuiFrameCapture{ .gui = gui, .frame = frame, .generation = frame.generation };
-    if (frame.command_count != 0) {
-        const commands = commands_ptr.?[0..@intCast(frame.command_count)];
+    if (total_commands != 0) {
+        const commands = commands_ptr.?[0..@intCast(total_commands)];
         _ = copyGuiFrameCommands(frame, commands);
     }
-    if (frame.resource_len != 0) {
-        const resources = resources_ptr.?[0..@intCast(frame.resource_len)];
+    if (total_resources != 0) {
+        const resources = resources_ptr.?[0..@intCast(total_resources)];
         _ = copyGuiFrameResourceBytes(frame, 0, resources);
     }
     releaseCapturedGuiFrame(lease.instance, &capture);
+    return r4x_api.gui_frame_result_ok;
+}
+
+fn validGuiFrameGenerationInfoOutput(out: *const GuiFrameGenerationInfo) bool {
+    return out.version >= r4x_api.gui_frame_generation_info_version and out.size >= r4x_api.gui_frame_generation_info_size;
+}
+
+fn guiFrameContainsIndexed8(frame: *const ProgramGuiFramePayload) bool {
+    var cursor = frame.command_payload;
+    while (cursor) |payload| : (cursor = payload.next) {
+        for (guiCommandPayloadCommandsConst(payload)[0..payload.command_count]) |command| {
+            if (command.kind == r4x_api.gui_frame_command_kind_indexed8) return true;
+        }
+    }
+    return false;
+}
+
+fn fillGuiFrameGenerationInfo(gui: *const ProgramGuiPayload, owner: ProgramProcessHandle, frame: *const ProgramGuiFramePayload, out: *GuiFrameGenerationInfo) void {
+    var flags: u32 = if (frame.base_frame == null)
+        r4x_api.gui_frame_generation_flag_full
+    else
+        r4x_api.gui_frame_generation_flag_delta;
+    if (guiFrameContainsIndexed8(frame)) flags |= r4x_api.gui_frame_generation_flag_indexed8;
+    out.* = .{
+        .flags = flags,
+        .damage_count = frame.damage_count,
+        .owner = owner,
+        .generation = frame.generation,
+        .base_generation = if (frame.base_frame) |base| base.generation else 0,
+        .command_count = frame.command_count,
+        .resource_bytes = frame.resource_len,
+        .total_command_count = guiFrameChainCommandCount(frame),
+        .total_resource_bytes = guiFrameChainResourceBytes(frame),
+        .chain_depth = frame.chain_depth,
+        .delta_commit_count = gui.frame_delta_commits,
+        .full_commit_count = gui.frame_full_commits,
+        .indexed8_command_count = gui.frame_indexed8_commands,
+        .indexed8_resource_bytes = gui.frame_indexed8_resource_bytes,
+        .avoided_clone_bytes = gui.frame_avoided_clone_bytes,
+        .generation_read_count = gui.frame_generation_reads,
+    };
+}
+
+fn apiGuiFrameGenerationInfo(handle_ptr: *const ProgramProcessHandle, generation: u64, out: *GuiFrameGenerationInfo) callconv(.c) i32 {
+    if (@intFromPtr(handle_ptr) == 0 or @intFromPtr(out) == 0 or generation == 0) return r4x_api.gui_frame_error_invalid;
+    if (!validGuiFrameGenerationInfoOutput(out)) return r4x_api.gui_frame_error_invalid;
+    const handle = handle_ptr.*;
+    if (!programHandleValid(handle)) {
+        out.* = .{ .owner = handle, .generation = generation };
+        return r4x_api.gui_frame_error_invalid;
+    }
+    const lease_value = pinProgramHandle(handle, false) orelse {
+        out.* = .{ .owner = handle, .generation = generation };
+        return r4x_api.gui_frame_error_invalid;
+    };
+    var lease = lease_value;
+    defer unpinProgramInstance(&lease);
+    var capture = captureGuiFrameGeneration(lease.instance, generation) orelse {
+        out.* = .{ .owner = handle, .generation = generation };
+        return r4x_api.gui_frame_error_stale;
+    };
+    defer releaseCapturedGuiFrame(lease.instance, &capture);
+    const gui = capture.gui;
+    lockGuiFrameState(gui);
+    fillGuiFrameGenerationInfo(gui, handle, capture.frame, out);
+    _ = gui.frame_lock.unlock();
+    return r4x_api.gui_frame_result_ok;
+}
+
+fn apiGuiFrameGenerationRead(
+    handle_ptr: *const ProgramProcessHandle,
+    generation: u64,
+    commands_ptr: ?[*]GuiFrameCommand,
+    command_capacity: u64,
+    resources_ptr: ?[*]u8,
+    resource_capacity: u64,
+    regions_ptr: ?[*]DisplayDamageRect,
+    region_capacity: u32,
+    out: *GuiFrameGenerationInfo,
+) callconv(.c) i32 {
+    if (@intFromPtr(handle_ptr) == 0 or @intFromPtr(out) == 0 or generation == 0) return r4x_api.gui_frame_error_invalid;
+    if (!validGuiFrameGenerationInfoOutput(out)) return r4x_api.gui_frame_error_invalid;
+    const handle = handle_ptr.*;
+    if (!programHandleValid(handle)) {
+        out.* = .{ .owner = handle, .generation = generation };
+        return r4x_api.gui_frame_error_invalid;
+    }
+    const lease_value = pinProgramHandle(handle, false) orelse {
+        out.* = .{ .owner = handle, .generation = generation };
+        return r4x_api.gui_frame_error_invalid;
+    };
+    var lease = lease_value;
+    defer unpinProgramInstance(&lease);
+    var capture = captureGuiFrameGeneration(lease.instance, generation) orelse {
+        out.* = .{ .owner = handle, .generation = generation };
+        return r4x_api.gui_frame_error_stale;
+    };
+    defer releaseCapturedGuiFrame(lease.instance, &capture);
+    const gui = capture.gui;
+    const frame = capture.frame;
+    lockGuiFrameState(gui);
+    fillGuiFrameGenerationInfo(gui, handle, frame, out);
+    _ = gui.frame_lock.unlock();
+    if ((commands_ptr == null and command_capacity != 0) or
+        (resources_ptr == null and resource_capacity != 0) or
+        (regions_ptr == null and region_capacity != 0)) return r4x_api.gui_frame_error_invalid;
+    if (command_capacity < frame.command_count or resource_capacity < frame.resource_len or region_capacity < frame.damage_count) {
+        return r4x_api.gui_frame_error_buffer_too_small;
+    }
+    if (command_capacity > std.math.maxInt(usize) or resource_capacity > std.math.maxInt(usize) or
+        !validateGuiFrame(frame, lease.instance.id)) return r4x_api.gui_frame_error_overflow;
+
+    if (frame.command_count != 0) {
+        _ = copyGuiFrameLocalCommands(frame, 0, commands_ptr.?[0..@intCast(frame.command_count)]);
+    }
+    if (frame.resource_len != 0) {
+        _ = copyGuiFrameLocalResourceBytes(frame, 0, resources_ptr.?[0..@intCast(frame.resource_len)]);
+    }
+    if (frame.damage_count != 0) @memcpy(regions_ptr.?[0..frame.damage_count], frame.damage_regions[0..frame.damage_count]);
+    lockGuiFrameState(gui);
+    gui.frame_generation_reads +%= 1;
+    fillGuiFrameGenerationInfo(gui, handle, frame, out);
+    _ = gui.frame_lock.unlock();
     return r4x_api.gui_frame_result_ok;
 }
 
