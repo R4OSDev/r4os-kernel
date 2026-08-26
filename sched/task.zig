@@ -28,6 +28,7 @@ const STACK_GUARD_SIZE: usize = 16 * 1024;
 const STACK_CACHE_LIMIT: usize = 8;
 const CRITICAL_RESERVE_COUNT: usize = 4;
 const NO_CRITICAL_RESERVE_SLOT: u8 = 0xFF;
+const STACK_HIGH_WATER_PATTERN: u8 = 0xA5;
 
 // Zero is the legacy diagnostic spelling for resource-limited/dynamic. It is
 // deliberately not a capacity and must never be used to size another table.
@@ -204,6 +205,8 @@ pub const Task = struct {
     stack_base: u64 = 0,
     stack_top: u64 = 0,
     stack_range_id: u32 = 0,
+    stack_high_water_bytes: u64 = 0,
+    stack_high_water_measured: bool = false,
     role: Role = .interactive,
     priority: Priority = .normal,
     role_budget_ticks_remaining: u32 = 0,
@@ -281,6 +284,17 @@ pub const InventoryPage = struct {
     has_more: bool = false,
 };
 
+pub const StackTelemetryStats = struct {
+    created: u64 = 0,
+    released: u64 = 0,
+    high_water_total_bytes: u64 = 0,
+    high_water_max_bytes: u64 = 0,
+    create_cycles_total: u64 = 0,
+    create_cycles_max: u64 = 0,
+    release_cycles_total: u64 = 0,
+    release_cycles_max: u64 = 0,
+};
+
 var registry_head: ?*Task = null;
 var registry_tail: ?*Task = null;
 const ReadyQueue = struct {
@@ -318,6 +332,38 @@ var initialized = false;
 var create_failure_stats: CreateFailureStats = .{};
 var forced_next_create_failure: CreateFailure = .none;
 var kill_held_lock_deferrals: u64 = 0;
+var stack_telemetry_by_role: [role_count]StackTelemetryStats = .{StackTelemetryStats{}} ** role_count;
+
+pub fn stackTelemetryStats() StackTelemetryStats {
+    var out: StackTelemetryStats = .{};
+    for (&stack_telemetry_by_role) |*stats| {
+        out.created +%= @atomicLoad(u64, &stats.created, .monotonic);
+        out.released +%= @atomicLoad(u64, &stats.released, .monotonic);
+        out.high_water_total_bytes +%= @atomicLoad(u64, &stats.high_water_total_bytes, .monotonic);
+        out.high_water_max_bytes = @max(out.high_water_max_bytes, @atomicLoad(u64, &stats.high_water_max_bytes, .monotonic));
+        out.create_cycles_total +%= @atomicLoad(u64, &stats.create_cycles_total, .monotonic);
+        out.create_cycles_max = @max(out.create_cycles_max, @atomicLoad(u64, &stats.create_cycles_max, .monotonic));
+        out.release_cycles_total +%= @atomicLoad(u64, &stats.release_cycles_total, .monotonic);
+        out.release_cycles_max = @max(out.release_cycles_max, @atomicLoad(u64, &stats.release_cycles_max, .monotonic));
+    }
+    return out;
+}
+
+fn recordStackCreate(role: Role, cycles: u64) void {
+    const stats = &stack_telemetry_by_role[@intFromEnum(role)];
+    _ = @atomicRmw(u64, &stats.created, .Add, 1, .monotonic);
+    _ = @atomicRmw(u64, &stats.create_cycles_total, .Add, cycles, .monotonic);
+    _ = @atomicRmw(u64, &stats.create_cycles_max, .Max, cycles, .monotonic);
+}
+
+fn recordStackRelease(role: Role, high_water_bytes: u64, cycles: u64) void {
+    const stats = &stack_telemetry_by_role[@intFromEnum(role)];
+    _ = @atomicRmw(u64, &stats.released, .Add, 1, .monotonic);
+    _ = @atomicRmw(u64, &stats.high_water_total_bytes, .Add, high_water_bytes, .monotonic);
+    _ = @atomicRmw(u64, &stats.high_water_max_bytes, .Max, high_water_bytes, .monotonic);
+    _ = @atomicRmw(u64, &stats.release_cycles_total, .Add, cycles, .monotonic);
+    _ = @atomicRmw(u64, &stats.release_cycles_max, .Max, cycles, .monotonic);
+}
 
 pub fn createFailureStats() CreateFailureStats {
     const irq_flags = interrupts.saveAndDisable();
@@ -409,6 +455,7 @@ pub fn init() bool {
     create_failure_stats = .{};
     forced_next_create_failure = .none;
     kill_held_lock_deferrals = 0;
+    stack_telemetry_by_role = .{StackTelemetryStats{}} ** role_count;
     if (!prepareCriticalReserve()) return false;
     initialized = true;
     var create_failure: CreateFailure = .none;
@@ -455,6 +502,7 @@ fn createTask(
         recordCreateFailure(failure_out, .memory);
         return null;
     }
+    const create_started_cycles = readTimestampCounter();
     const unwind = task_context.enterUnwind();
     if (!unwind.admitted()) {
         recordCreateFailure(failure_out, .memory);
@@ -559,6 +607,7 @@ fn createTask(
     linkRegistryLocked(new_task);
     if (state == .ready or state == .running) resetRoleActivationLocked(new_task);
     interrupts.restore(irq_flags);
+    recordStackCreate(role, readTimestampCounter() -% create_started_cycles);
     return new_task;
 }
 
@@ -1086,6 +1135,7 @@ fn allocGuardedStack(retry_owner: *Task) ?GuardedStack {
         stack_cache_count = last;
         stack_cache_hits +%= 1;
         interrupts.restore(irq_flags);
+        poisonGuardedStack(cached);
         return cached;
     }
     stack_cache_misses +%= 1;
@@ -1126,11 +1176,41 @@ fn allocGuardedStack(retry_owner: *Task) ?GuardedStack {
         });
         return null;
     };
-    return .{
+    const stack: GuardedStack = .{
         .range_id = range_id,
         .base = info.base + STACK_GUARD_SIZE,
         .top = info.base + STACK_GUARD_SIZE + STACK_SIZE,
     };
+    poisonGuardedStack(stack);
+    return stack;
+}
+
+fn poisonGuardedStack(stack: GuardedStack) void {
+    if (stack.base == 0 or stack.top <= stack.base) return;
+    const len: usize = @intCast(stack.top - stack.base);
+    const bytes: [*]u8 = @ptrFromInt(stack.base);
+    @memset(bytes[0..len], STACK_HIGH_WATER_PATTERN);
+}
+
+fn measureTaskStackHighWater(t: *Task) void {
+    if (t.stack_high_water_measured) return;
+    t.stack_high_water_measured = true;
+    if (t.stack_base == 0 or t.stack_top <= t.stack_base) return;
+    const len: usize = @intCast(t.stack_top - t.stack_base);
+    const bytes: [*]const u8 = @ptrFromInt(t.stack_base);
+    var untouched: usize = 0;
+    while (untouched < len and bytes[untouched] == STACK_HIGH_WATER_PATTERN) : (untouched += 1) {}
+    t.stack_high_water_bytes = @intCast(len - untouched);
+}
+
+fn readTimestampCounter() u64 {
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | lo;
 }
 
 fn anchorFreshStackRelease(retry_owner: *Task, stack: GuardedStack) void {
@@ -1372,6 +1452,7 @@ fn createCriticalTask(name: []const u8, state: State, entry: Entry, role: Role, 
         recordCreateFailure(failure_out, .memory);
         return null;
     }
+    const create_started_cycles = readTimestampCounter();
 
     const irq_flags = interrupts.saveAndDisable();
     var selected_index: ?usize = null;
@@ -1434,6 +1515,7 @@ fn createCriticalTask(name: []const u8, state: State, entry: Entry, role: Role, 
     linkRegistryLocked(new_task);
     if (state == .ready or state == .running) resetRoleActivationLocked(new_task);
     interrupts.restore(irq_flags);
+    recordStackCreate(role, readTimestampCounter() -% create_started_cycles);
     return new_task;
 }
 
@@ -2391,11 +2473,22 @@ pub fn reapDeferred() u32 {
 
 fn completeTaskRelease(t: *Task, release_token: task_context.UnwindToken) bool {
     defer _ = task_context.leaveUnwind(release_token);
+    const release_started_cycles = readTimestampCounter();
 
     if (!releaseTaskResources(t)) {
         clearTaskReleaseClaim(t);
         return false;
     }
+    if (t.critical_reserve_slot != NO_CRITICAL_RESERVE_SLOT) {
+        measureTaskStackHighWater(t);
+        poisonGuardedStack(.{
+            .range_id = t.stack_range_id,
+            .base = t.stack_base,
+            .top = t.stack_top,
+        });
+    }
+    const released_role = t.role;
+    const released_high_water = t.stack_high_water_bytes;
 
     const irq_flags = interrupts.saveAndDisable();
     if (!containsTaskLocked(t) or !t.release_in_progress or !releaseEligibleLocked(t)) {
@@ -2430,6 +2523,7 @@ fn completeTaskRelease(t: *Task, release_token: task_context.UnwindToken) bool {
         bundle.in_use = false;
         if (critical_reserve_in_use != 0) critical_reserve_in_use -= 1;
         interrupts.restore(irq_flags);
+        recordStackRelease(released_role, released_high_water, readTimestampCounter() -% release_started_cycles);
         return true;
     }
 
@@ -2437,7 +2531,10 @@ fn completeTaskRelease(t: *Task, release_token: task_context.UnwindToken) bool {
     // necessarily unlinked operation: freeing the Task object itself.
     unlinkRegistryLocked(t);
     interrupts.restore(irq_flags);
-    if (freeTaskMemory(t)) return true;
+    if (freeTaskMemory(t)) {
+        recordStackRelease(released_role, released_high_water, readTimestampCounter() -% release_started_cycles);
+        return true;
+    }
 
     const retry_flags = interrupts.saveAndDisable();
     t.release_in_progress = false;
@@ -2494,6 +2591,7 @@ fn releaseTaskStack(t: *Task) bool {
         t.stack_top = 0;
         return true;
     }
+    measureTaskStackHighWater(t);
     var release_direct = false;
     const stack: GuardedStack = .{
         .range_id = t.stack_range_id,

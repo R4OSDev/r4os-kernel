@@ -111,9 +111,16 @@ const ARGS_MAX: usize = 127;
 const KB: u64 = 1024;
 const MB: u64 = 1024 * KB;
 const GB: u64 = 1024 * MB;
-const PROGRAM_STACK_RESERVE_SIZE: u64 = 8 * 1024 * 1024;
-const PROGRAM_STACK_INITIAL_COMMIT_SIZE: u64 = 64 * 1024;
-const PROGRAM_STACK_SERVICE_INITIAL_COMMIT_SIZE: u64 = 128 * 1024;
+// 0.69.59: Canary-Hochwasser im Standard-Gast: normal 139256 Byte,
+// desktop 241344 Byte, service 48560 Byte, large-service 202456 Byte und
+// build-tool 176232 Byte. Die verkleinerten Reserven behalten mindestens
+// rund Faktor 16 zum beobachteten Profilmaximum. Browser/Workstation bleiben
+// ohne repraesentativen Lauf bewusst unveraendert; Commit waechst weiter in
+// kontrollierten 64-KB-Schritten hinter dem wandernden Guard.
+const PROGRAM_STACK_RESERVE_SIZE: u64 = 4 * MB;
+const PROGRAM_STACK_LARGE_RESERVE_SIZE: u64 = 8 * MB;
+const PROGRAM_STACK_INITIAL_COMMIT_SIZE: u64 = 64 * KB;
+const PROGRAM_STACK_SERVICE_INITIAL_COMMIT_SIZE: u64 = 64 * KB;
 const PROGRAM_STACK_GROW_SIZE: u64 = 64 * 1024;
 const PROGRAM_STACK_GUARD_SIZE: u64 = paging.PAGE_SIZE;
 const PAGE_FAULT_PRESENT: u64 = 1 << 0;
@@ -516,6 +523,33 @@ const LoadedProgram = struct {
     origin_len: u16 = 0,
 };
 
+const MemoryProfile = enum(u8) {
+    unknown = 0,
+    tiny = 1,
+    normal = 2,
+    desktop = 3,
+    service = 4,
+    large_service = 5,
+    build_tool = 6,
+    browser = 7,
+    workstation = 8,
+};
+const MEMORY_PROFILE_COUNT: usize = 9;
+const PROGRAM_STACK_HIGH_WATER_PATTERN: u8 = 0xA5;
+
+const ProgramStackTelemetryStats = struct {
+    creates: u64 = 0,
+    releases: u64 = 0,
+    reserve_max_bytes: u64 = 0,
+    initial_commit_max_bytes: u64 = 0,
+    committed_max_bytes: u64 = 0,
+    high_water_max_bytes: u64 = 0,
+    create_cycles_total: u64 = 0,
+    create_cycles_max: u64 = 0,
+    release_cycles_total: u64 = 0,
+    release_cycles_max: u64 = 0,
+};
+
 const ProgramStack = struct {
     range_id: u32 = 0,
     base: u64 = 0,
@@ -526,6 +560,13 @@ const ProgramStack = struct {
     guard_size: u64 = 0,
     top: u64 = 0,
     owner_id: u32 = 0,
+    profile: MemoryProfile = .unknown,
+    initial_commit_size: u64 = 0,
+    create_cycles: u64 = 0,
+    telemetry_high_water: u64 = 0,
+    telemetry_committed_pages: u32 = 0,
+    serial_telemetry: bool = false,
+    telemetry_measured: bool = false,
 };
 
 const ProgramResources = struct {
@@ -544,18 +585,6 @@ const AppClass = enum(u8) {
     console,
     gui,
     service,
-};
-
-const MemoryProfile = enum(u8) {
-    unknown = 0,
-    tiny = 1,
-    normal = 2,
-    desktop = 3,
-    service = 4,
-    large_service = 5,
-    build_tool = 6,
-    browser = 7,
-    workstation = 8,
 };
 
 const ProgramMemoryLimits = struct {
@@ -922,6 +951,12 @@ const ProgramInstance = struct {
     program_stack_committed_size: u64 = 0,
     program_stack_guard_base: u64 = 0,
     program_stack_guard_size: u64 = 0,
+    program_stack_initial_commit_size: u64 = 0,
+    program_stack_create_cycles: u64 = 0,
+    program_stack_telemetry_high_water: u64 = 0,
+    program_stack_telemetry_committed_pages: u32 = 0,
+    program_stack_serial_telemetry: bool = false,
+    program_stack_telemetry_measured: bool = false,
     memory_profile: MemoryProfile = .normal,
     memory_limits: ProgramMemoryLimits = .{},
     memory_tag: [16]u8 = .{0} ** 16,
@@ -4133,6 +4168,7 @@ var program_thread_count: usize = 0;
 var program_thread_peak: usize = 0;
 var program_thread_mutation_epoch: u64 = 1;
 var program_thread_create_failures: u64 = 0;
+var program_stack_telemetry_by_profile: [MEMORY_PROFILE_COUNT]ProgramStackTelemetryStats = .{ProgramStackTelemetryStats{}} ** MEMORY_PROFILE_COUNT;
 var next_thread_generation: u64 = 1;
 var next_inventory_snapshot_generation: u64 = 1;
 var async_io_requests: [MAX_ASYNC_IO_REQUESTS]AsyncIoRequest = .{AsyncIoRequest{}} ** MAX_ASYNC_IO_REQUESTS;
@@ -6260,7 +6296,7 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_LOAD_FAILED);
         return .failed;
     }
-    const stack = allocateProgramStack(instance_id, loaded.memory_contract.limits) orelse {
+    const stack = allocateProgramStack(instance_id, loaded.memory_contract, parseSubsystemTrace(args) != null) orelse {
         k.puts("Program stack allocation failed\r\n");
         freeProgramImage(loaded.image);
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_NO_MEMORY);
@@ -6709,7 +6745,7 @@ fn memoryLimitsForProfile(profile: MemoryProfile) ProgramMemoryLimits {
             .vm_reserve_limit = 2 * GB,
             .vm_commit_limit = 512 * MB,
             .resident_limit = 512 * MB,
-            .stack_reserve = 16 * MB,
+            .stack_reserve = PROGRAM_STACK_RESERVE_SIZE,
             .stack_initial_commit = 128 * KB,
         },
         .service => .{
@@ -6723,14 +6759,14 @@ fn memoryLimitsForProfile(profile: MemoryProfile) ProgramMemoryLimits {
             .vm_reserve_limit = 4 * GB,
             .vm_commit_limit = 1024 * MB,
             .resident_limit = 1024 * MB,
-            .stack_reserve = 16 * MB,
-            .stack_initial_commit = PROGRAM_STACK_SERVICE_INITIAL_COMMIT_SIZE,
+            .stack_reserve = PROGRAM_STACK_LARGE_RESERVE_SIZE,
+            .stack_initial_commit = 128 * KB,
         },
         .build_tool => .{
             .vm_reserve_limit = 4 * GB,
             .vm_commit_limit = 1024 * MB,
             .resident_limit = 1024 * MB,
-            .stack_reserve = 16 * MB,
+            .stack_reserve = PROGRAM_STACK_LARGE_RESERVE_SIZE,
             .stack_initial_commit = 128 * KB,
         },
         .browser => .{
@@ -7084,11 +7120,123 @@ fn freeProgramImage(image: ProgramImage) void {
     };
 }
 
-fn allocateProgramStack(owner_id: u32, limits: ProgramMemoryLimits) ?ProgramStack {
-    return allocateProgramStackWithLimits(owner_id, limits.stack_reserve, limits.stack_initial_commit);
+fn recordProgramStackCreate(profile: MemoryProfile, reserve_bytes: u64, initial_commit_bytes: u64, cycles: u64) void {
+    const stats = &program_stack_telemetry_by_profile[@intFromEnum(profile)];
+    _ = @atomicRmw(u64, &stats.creates, .Add, 1, .monotonic);
+    _ = @atomicRmw(u64, &stats.reserve_max_bytes, .Max, reserve_bytes, .monotonic);
+    _ = @atomicRmw(u64, &stats.initial_commit_max_bytes, .Max, initial_commit_bytes, .monotonic);
+    _ = @atomicRmw(u64, &stats.create_cycles_total, .Add, cycles, .monotonic);
+    _ = @atomicRmw(u64, &stats.create_cycles_max, .Max, cycles, .monotonic);
 }
 
-fn allocateProgramStackWithLimits(owner_id: u32, reserve_size: u64, initial_commit_size: u64) ?ProgramStack {
+fn recordProgramStackRelease(stack: *const ProgramStack, committed_bytes: u64, release_cycles: u64) ProgramStackTelemetryStats {
+    const stats = &program_stack_telemetry_by_profile[@intFromEnum(stack.profile)];
+    _ = @atomicRmw(u64, &stats.releases, .Add, 1, .monotonic);
+    _ = @atomicRmw(u64, &stats.committed_max_bytes, .Max, committed_bytes, .monotonic);
+    _ = @atomicRmw(u64, &stats.high_water_max_bytes, .Max, stack.telemetry_high_water, .monotonic);
+    _ = @atomicRmw(u64, &stats.release_cycles_total, .Add, release_cycles, .monotonic);
+    _ = @atomicRmw(u64, &stats.release_cycles_max, .Max, release_cycles, .monotonic);
+    return loadProgramStackTelemetryStats(stack.profile);
+}
+
+fn loadProgramStackTelemetryStats(profile: MemoryProfile) ProgramStackTelemetryStats {
+    const stats = &program_stack_telemetry_by_profile[@intFromEnum(profile)];
+    return .{
+        .creates = @atomicLoad(u64, &stats.creates, .monotonic),
+        .releases = @atomicLoad(u64, &stats.releases, .monotonic),
+        .reserve_max_bytes = @atomicLoad(u64, &stats.reserve_max_bytes, .monotonic),
+        .initial_commit_max_bytes = @atomicLoad(u64, &stats.initial_commit_max_bytes, .monotonic),
+        .committed_max_bytes = @atomicLoad(u64, &stats.committed_max_bytes, .monotonic),
+        .high_water_max_bytes = @atomicLoad(u64, &stats.high_water_max_bytes, .monotonic),
+        .create_cycles_total = @atomicLoad(u64, &stats.create_cycles_total, .monotonic),
+        .create_cycles_max = @atomicLoad(u64, &stats.create_cycles_max, .monotonic),
+        .release_cycles_total = @atomicLoad(u64, &stats.release_cycles_total, .monotonic),
+        .release_cycles_max = @atomicLoad(u64, &stats.release_cycles_max, .monotonic),
+    };
+}
+
+fn poisonProgramStackSpan(base: u64, len_raw: u64) void {
+    if (base == 0 or len_raw == 0) return;
+    const len: usize = @intCast(len_raw);
+    const bytes: [*]u8 = @ptrFromInt(base);
+    @memset(bytes[0..len], PROGRAM_STACK_HIGH_WATER_PATTERN);
+}
+
+fn measureProgramStackHighWater(stack: *ProgramStack) void {
+    if (stack.telemetry_measured) return;
+    stack.telemetry_measured = true;
+    stack.telemetry_committed_pages = std.math.cast(u32, stack.committed_size / paging.PAGE_SIZE) orelse std.math.maxInt(u32);
+    if (stack.committed_base == 0 or stack.top <= stack.committed_base) return;
+    const len: usize = @intCast(stack.top - stack.committed_base);
+    const bytes: [*]const u8 = @ptrFromInt(stack.committed_base);
+    var untouched: usize = 0;
+    while (untouched < len and bytes[untouched] == PROGRAM_STACK_HIGH_WATER_PATTERN) : (untouched += 1) {}
+    stack.telemetry_high_water = @intCast(len - untouched);
+}
+
+fn readStackTimestampCounter() u64 {
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+    asm volatile ("rdtsc"
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
+
+fn logProgramStackRelease(stack: *const ProgramStack, committed_bytes: u64, release_cycles: u64, stats: ProgramStackTelemetryStats) void {
+    const task_stats = task.stackTelemetryStats();
+    const cache_stats = task.stackCacheStats();
+    const critical_stats = task.criticalReserveStats();
+    k.puts("[R4XSTACK] release owner=");
+    k.putDec(stack.owner_id);
+    k.puts(" profile=");
+    k.puts(memoryProfileName(stack.profile));
+    k.puts(" reserve=");
+    k.putDec(stack.reserve_size);
+    k.puts(" initial=");
+    k.putDec(stack.initial_commit_size);
+    k.puts(" committed=");
+    k.putDec(committed_bytes);
+    k.puts(" highwater=");
+    k.putDec(stack.telemetry_high_water);
+    k.puts(" creates=");
+    k.putDec(stats.creates);
+    k.puts(" releases=");
+    k.putDec(stats.releases);
+    k.puts(" create_cycles=");
+    k.putDec(stack.create_cycles);
+    k.puts(" create_cycles_max=");
+    k.putDec(stats.create_cycles_max);
+    k.puts(" release_cycles=");
+    k.putDec(release_cycles);
+    k.puts(" release_cycles_max=");
+    k.putDec(stats.release_cycles_max);
+    k.puts(" kernel_highwater_max=");
+    k.putDec(task_stats.high_water_max_bytes);
+    k.puts(" kernel_create_cycles_max=");
+    k.putDec(task_stats.create_cycles_max);
+    k.puts(" kernel_release_cycles_max=");
+    k.putDec(task_stats.release_cycles_max);
+    k.puts(" kernel_cache_cached=");
+    k.putDec(cache_stats.cached);
+    k.puts(" kernel_cache_hits=");
+    k.putDec(cache_stats.hits);
+    k.puts(" kernel_cache_misses=");
+    k.putDec(cache_stats.misses);
+    k.puts(" critical_available=");
+    k.putDec(critical_stats.available);
+    k.puts(" critical_in_use=");
+    k.putDec(critical_stats.in_use);
+    k.puts("\r\n");
+}
+
+fn allocateProgramStack(owner_id: u32, contract: ProgramMemoryContract, serial_telemetry: bool) ?ProgramStack {
+    return allocateProgramStackWithLimits(owner_id, contract.limits.stack_reserve, contract.limits.stack_initial_commit, contract.profile, serial_telemetry);
+}
+
+fn allocateProgramStackWithLimits(owner_id: u32, reserve_size: u64, initial_commit_size: u64, profile: MemoryProfile, serial_telemetry: bool) ?ProgramStack {
+    const create_started_cycles = readStackTimestampCounter();
     const reserve_len = pageAlignU64(reserve_size) orelse return null;
     const initial_len = pageAlignU64(initial_commit_size) orelse return null;
     if (reserve_len <= PROGRAM_STACK_GUARD_SIZE or initial_len > reserve_len - PROGRAM_STACK_GUARD_SIZE) return null;
@@ -7131,6 +7279,9 @@ fn allocateProgramStackWithLimits(owner_id: u32, reserve_size: u64, initial_comm
         return null;
     };
 
+    poisonProgramStackSpan(committed_base, initial_len);
+    const create_cycles = readStackTimestampCounter() -% create_started_cycles;
+    recordProgramStackCreate(profile, info.len, initial_len, create_cycles);
     return .{
         .range_id = range_id,
         .base = info.base,
@@ -7141,12 +7292,19 @@ fn allocateProgramStackWithLimits(owner_id: u32, reserve_size: u64, initial_comm
         .guard_size = PROGRAM_STACK_GUARD_SIZE,
         .top = top,
         .owner_id = owner_id,
+        .profile = profile,
+        .initial_commit_size = initial_len,
+        .create_cycles = create_cycles,
+        .serial_telemetry = serial_telemetry,
     };
 }
 
 fn freeProgramStack(stack: *ProgramStack) bool {
     if (stack.range_id == 0) return true;
-    const release_started = timer.tickCount();
+    measureProgramStackHighWater(stack);
+    const committed_bytes = @as(u64, stack.telemetry_committed_pages) * paging.PAGE_SIZE;
+    const release_started_tick = timer.tickCount();
+    const release_started_cycles = readStackTimestampCounter();
     if (stack.committed_size != 0 and stack.committed_base >= stack.base) {
         mem_virt.uncommit(stack.range_id, stack.committed_base - stack.base, stack.committed_size) catch |err| {
             k.puts("Program stack committed-span release failed: ");
@@ -7162,8 +7320,7 @@ fn freeProgramStack(stack: *ProgramStack) bool {
                 k.puts("\r\n");
                 return false;
             };
-            stack.* = .{};
-            return true;
+            return finishProgramStackRelease(stack, committed_bytes, release_started_tick, release_started_cycles);
         };
         stack.committed_size = 0;
     }
@@ -7173,17 +7330,24 @@ fn freeProgramStack(stack: *ProgramStack) bool {
         k.puts("\r\n");
         return false;
     };
-    const release_finished = timer.tickCount();
-    const release_ticks = if (release_finished >= release_started) release_finished - release_started else 0;
+    return finishProgramStackRelease(stack, committed_bytes, release_started_tick, release_started_cycles);
+}
+
+fn finishProgramStackRelease(stack: *ProgramStack, committed_bytes: u64, release_started_tick: u64, release_started_cycles: u64) bool {
+    const release_finished_tick = timer.tickCount();
+    const release_ticks = if (release_finished_tick >= release_started_tick) release_finished_tick - release_started_tick else 0;
+    const release_cycles = readStackTimestampCounter() -% release_started_cycles;
     if (release_ticks >= 25) {
         k.puts("[R4XTHREAD] slow stack release ticks=");
         k.putDec(release_ticks);
         k.puts(" reserve=");
         k.putDec(stack.reserve_size);
         k.puts(" committed=");
-        k.putDec(stack.committed_size);
+        k.putDec(committed_bytes);
         k.puts("\r\n");
     }
+    const stats = recordProgramStackRelease(stack, committed_bytes, release_cycles);
+    if (stack.serial_telemetry) logProgramStackRelease(stack, committed_bytes, release_cycles, stats);
     stack.* = .{};
     return true;
 }
@@ -7358,6 +7522,7 @@ fn growProgramStack(stack: *ProgramStack, fault_addr: u64) bool {
         return false;
     };
 
+    poisonProgramStackSpan(desired_base, commit_len);
     stack.committed_base = desired_base;
     stack.committed_size += commit_len;
     stack.guard_base = new_guard_base;
@@ -7376,6 +7541,13 @@ fn stackFromInstance(instance: *const ProgramInstance) ?ProgramStack {
         .guard_size = instance.program_stack_guard_size,
         .top = instance.stack_top,
         .owner_id = instance.id,
+        .profile = instance.memory_profile,
+        .initial_commit_size = instance.program_stack_initial_commit_size,
+        .create_cycles = instance.program_stack_create_cycles,
+        .telemetry_high_water = instance.program_stack_telemetry_high_water,
+        .telemetry_committed_pages = instance.program_stack_telemetry_committed_pages,
+        .serial_telemetry = instance.program_stack_serial_telemetry,
+        .telemetry_measured = instance.program_stack_telemetry_measured,
     };
 }
 
@@ -7387,6 +7559,12 @@ fn writeStackToInstance(instance: *ProgramInstance, stack: ProgramStack) void {
     instance.program_stack_committed_size = stack.committed_size;
     instance.program_stack_guard_base = stack.guard_base;
     instance.program_stack_guard_size = stack.guard_size;
+    instance.program_stack_initial_commit_size = stack.initial_commit_size;
+    instance.program_stack_create_cycles = stack.create_cycles;
+    instance.program_stack_telemetry_high_water = stack.telemetry_high_water;
+    instance.program_stack_telemetry_committed_pages = stack.telemetry_committed_pages;
+    instance.program_stack_serial_telemetry = stack.serial_telemetry;
+    instance.program_stack_telemetry_measured = stack.telemetry_measured;
     instance.stack_top = stack.top;
 }
 
@@ -7836,6 +8014,8 @@ fn programThreadTaskMain() callconv(.c) void {
     thread_ctx.entry = entry;
     markProgramThreadRunning(thread_ctx);
     const exit_code = r4os_call_program(entry, thread_ctx.arg, thread_ctx.stack.top);
+    measureProgramStackHighWater(&thread_ctx.stack);
+    if (thread_ctx.stack.serial_telemetry) logProgramStackHighWater(instance, &thread_ctx.stack, thread_ctx.id);
     markProgramThreadDone(thread_ctx, exit_code);
     unpinProgramThreadExecution(thread_ctx);
     scheduler.exitCurrent();
@@ -7850,7 +8030,38 @@ fn callInstanceEntry(run: *ProgramInstance) i32 {
         logSubsystemTracePhase(trace, "r4xstart", traceNowNanoseconds());
     }
     program_entries_started +%= 1;
-    return r4os_call_program(entry, @intFromPtr(&runtimePayload(run).r4xstart_context), run.stack_top);
+    const exit_code = r4os_call_program(entry, @intFromPtr(&runtimePayload(run).r4xstart_context), run.stack_top);
+    if (stackFromInstance(run)) |initial_stack| {
+        var measured_stack = initial_stack;
+        measureProgramStackHighWater(&measured_stack);
+        writeStackToInstance(run, measured_stack);
+        if (measured_stack.serial_telemetry) logProgramStackHighWater(run, &measured_stack, 0);
+    }
+    return exit_code;
+}
+
+fn logProgramStackHighWater(instance: *const ProgramInstance, stack: *const ProgramStack, thread_id: u32) void {
+    const runtime = runtimePayloadConst(instance);
+    const module_len: usize = @min(@as(usize, @intCast(runtime.module_path_len)), runtime.module_path.len);
+    k.puts("[R4XSTACK] highwater owner=");
+    k.putDec(instance.id);
+    k.puts(" thread=");
+    k.putDec(thread_id);
+    k.puts(" module=");
+    if (module_len == 0) k.puts("unknown") else k.puts(runtime.module_path[0..module_len]);
+    k.puts(" profile=");
+    k.puts(memoryProfileName(stack.profile));
+    k.puts(" reserve=");
+    k.putDec(stack.reserve_size);
+    k.puts(" initial=");
+    k.putDec(stack.initial_commit_size);
+    k.puts(" committed=");
+    k.putDec(stack.committed_size);
+    k.puts(" highwater=");
+    k.putDec(stack.telemetry_high_water);
+    k.puts(" create_cycles=");
+    k.putDec(stack.create_cycles);
+    k.puts("\r\n");
 }
 
 fn apiFileRead(path: [*:0]const u8, out: [*]u8, max_len: u32) callconv(.c) i32 {
@@ -8733,7 +8944,7 @@ fn apiThreadCreateHandle(entry: RawEntryFn, arg: u64, stack_reserve_bytes: u64, 
     const reserve_len = normalizeThreadStackReserve(instance, stack_reserve_bytes) orelse return THREAD_ERROR_INVALID;
     const initial_len = initialThreadStackCommit(instance, reserve_len) orelse return THREAD_ERROR_INVALID;
     if (!systemCommitLimitAllows(initial_len)) return THREAD_ERROR_NO_MEMORY;
-    var stack = allocateProgramStackWithLimits(instance.id, reserve_len, initial_len) orelse return THREAD_ERROR_NO_MEMORY;
+    var stack = allocateProgramStackWithLimits(instance.id, reserve_len, initial_len, instance.memory_profile, instance.program_stack_serial_telemetry) orelse return THREAD_ERROR_NO_MEMORY;
 
     const thread_ctx = allocProgramThreadSlot() orelse {
         _ = freeProgramStack(&stack);
@@ -13289,6 +13500,12 @@ fn createInstance(
             .program_stack_committed_size = stack.committed_size,
             .program_stack_guard_base = stack.guard_base,
             .program_stack_guard_size = stack.guard_size,
+            .program_stack_initial_commit_size = stack.initial_commit_size,
+            .program_stack_create_cycles = stack.create_cycles,
+            .program_stack_telemetry_high_water = stack.telemetry_high_water,
+            .program_stack_telemetry_committed_pages = stack.telemetry_committed_pages,
+            .program_stack_serial_telemetry = stack.serial_telemetry,
+            .program_stack_telemetry_measured = stack.telemetry_measured,
             .memory_profile = loaded.memory_contract.profile,
             .memory_limits = loaded.memory_contract.limits,
             .memory_tag = loaded.memory_contract.tag,
@@ -13949,6 +14166,12 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                     slot.instance.program_stack_committed_size = 0;
                     slot.instance.program_stack_guard_base = 0;
                     slot.instance.program_stack_guard_size = 0;
+                    slot.instance.program_stack_initial_commit_size = 0;
+                    slot.instance.program_stack_create_cycles = 0;
+                    slot.instance.program_stack_telemetry_high_water = 0;
+                    slot.instance.program_stack_telemetry_committed_pages = 0;
+                    slot.instance.program_stack_serial_telemetry = false;
+                    slot.instance.program_stack_telemetry_measured = false;
                     slot.retire_image_stack_released = true;
                 }
                 if (!slot.retire_owner_released) {

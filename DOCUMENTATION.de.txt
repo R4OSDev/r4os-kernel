@@ -249,6 +249,35 @@ Form her; ein eigener Layouttest haelt Assembly-Restoreframe und Zig-Aufbau
 zusammen. Damit duerfen bedarfsgeladene Module in Kernelworkern ausgerichtete
 SIMD-Stackzugriffe verwenden.
 
+Stack-Hochwasser und Profile seit 0.69.59
+-----------------------------------------
+
+Frische, gecachte und kritisch reservierte Kerneltaskstacks sowie neu
+committete R4X-Stackspannen werden mit einem Canarymuster vorbelegt. Normaler
+Ruecklauf und der gemeinsame Freigabepfad messen einmalig den beschriebenen
+Hochwasserbereich. Pro Schedulerrolle beziehungsweise R4X-Speicherprofil
+werden Create-/Release-Anzahl, Maximalhochwasser und TSC-Zyklen gesammelt.
+Profil- und Rollenzaehler werden auf SMP atomar fortgeschrieben. Der
+instrumentierte R4BASIC-Abnahmestart schreibt begrenzte `[R4XSTACK]`-Zeilen
+mit Besitzer, Modul, Profil, Reserve, Initial-/Endcommit, Hochwasser, Zyklen,
+Cache und kritischer Reserve; normale Starts erzeugen keinen seriellen
+Zusatzverkehr.
+
+Der repraesentative Ein-CPU-Testgast mass maximal 139.256 Byte fuer normal,
+241.344 fuer desktop, 48.560 fuer service, 202.456 fuer large-service und
+176.232 fuer build-tool. Normal, service und desktop reservieren deshalb
+4 MiB; large-service und build-tool 8 MiB. Initialcommits sind 64 KiB fuer
+normal/service und 128 KiB fuer desktop/large-service/build-tool. Tiny bleibt
+bei 2 MiB/64 KiB. Browser und workstation bleiben ohne repraesentativen
+Klickifax-Lauf bewusst bei 32 MiB/256 KiB. Der wandernde Guard und das
+64-KiB-Commitwachstum bleiben fuer alle Profile erhalten.
+
+Das Kerneltaskmaximum betrug 39.800 von 65.536 Byte. Wegen dieses Messwerts
+und des historischen echten net-rx-Ueberlaufs bei 32 KiB bleibt der
+64-KiB-Kernelstack unveraendert. Auch der reclaimbare Cache von acht und die
+vier kritischen Reservestacks bleiben bestehen. Messung und Freigabe halten
+keinen Scheduler-, Registry- oder Ressourcenlock ueber den Speicherabbau.
+
 R4DEV `performance_boot_summary` liest dafuer nur den kleinen festen
 Bootdatensatz; breite Subsystem-Summaries oder aktive Diagnoseprobes gehoeren
 nicht in diesen Pfad. Die spaeten Phasen laufen einmalig in der Reihenfolge

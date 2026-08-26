@@ -112,6 +112,19 @@ the context switch restores six registers and enters the common trampoline by
 stack top supplies the call-shaped entry layout, and a build-time layout test
 keeps the assembly restore frame and Zig stack construction in agreement.
 
+Kernel-task and R4X program stacks now carry one-lifetime canary high-water
+telemetry plus TSC creation/release costs. The Test guest measured at most
+39,800 of the 65,536 committed kernel-stack bytes, so the kernel size, eight
+cached stacks and four critical reserves stay unchanged. Program profiles use
+the measured reserves: normal/service/desktop reserve 4 MiB and
+large-service/build-tool 8 MiB, with 64- or 128-KiB initial commits. Tiny stays
+at 2 MiB and unmeasured browser/workstation profiles stay at 32 MiB. All retain
+the moving guard and 64-KiB commit growth. Profile/role aggregates update
+atomically on SMP. The instrumented R4BASIC acceptance emits bounded
+`[R4XSTACK]` records with owner, module, profile, reserve, commit, high-water,
+cycles, cache and critical occupancy at normal return and common teardown;
+ordinary launches do not add serial traffic.
+
 The stable task registry is an ownership and inventory index, not a run queue.
 Ready selection, timed wakeups, and deferred reaping use separate intrusive
 projections, so their hot paths scale with the relevant work set. Finite waits
