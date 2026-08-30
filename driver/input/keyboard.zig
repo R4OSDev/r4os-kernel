@@ -2,6 +2,7 @@ const io = @import("../../arch/x86_64/io.zig");
 const desktop_events = @import("../../kernel/desktop_events.zig");
 const key_layout = @import("key_layout.zig");
 const codepoint_queue = @import("codepoint_queue.zig");
+const physical_key = @import("physical_key.zig");
 const pic = @import("../../arch/x86_64/pic.zig");
 const time_core = @import("../../platform/time.zig");
 const sync = @import("../../sched/sync.zig");
@@ -36,6 +37,7 @@ pub const KEY_DELETE: u8 = 0x7F;
 pub const Layout = key_layout.Layout;
 
 var queue = codepoint_queue.Queue.init();
+var physical_queue = physical_key.Queue.init();
 var input_wait = sync.WaitQueue.init();
 var input_generation: u64 = 0;
 var shift_down = false;
@@ -76,6 +78,7 @@ pub const Stats = struct {
 
 pub fn init() void {
     _ = input_wait.reopen();
+    physical_queue.clear();
     drainOutput();
     pic.unmask(IRQ);
 }
@@ -83,6 +86,7 @@ pub fn init() void {
 pub fn disable() void {
     pic.mask(IRQ);
     queue.clear();
+    physical_queue.clear();
     shift_down = false;
     ctrl_down = false;
     alt_down = false;
@@ -117,6 +121,17 @@ pub fn readCodepoint() ?u32 {
         if (hooked != 0) return hooked;
     }
     return queue.pop();
+}
+
+pub const PhysicalEvent = physical_key.Event;
+pub const PhysicalStats = physical_key.Snapshot;
+
+pub fn readPhysicalEvent() ?PhysicalEvent {
+    return physical_queue.pop();
+}
+
+pub fn physicalStats() PhysicalStats {
+    return physical_queue.snapshot();
 }
 
 pub fn pending() bool {
@@ -244,6 +259,14 @@ fn handleScancode(scancode: u8) void {
     if (scancode == 0xE0) {
         extended = true;
         return;
+    }
+    const physical_extended = extended;
+    const physical_released = (scancode & 0x80) != 0;
+    const physical_make = scancode & 0x7F;
+    if (physical_key.set1Usage(physical_make, physical_extended)) |usage| {
+        if (physical_queue.transition(usage, !physical_released, time_core.monotonicTicks())) {
+            desktop_events.signal();
+        }
     }
     if (extended) {
         extended = false;

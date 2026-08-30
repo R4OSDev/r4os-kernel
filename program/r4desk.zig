@@ -78,6 +78,8 @@ pub const RemoteInputEvent = r4x_api.RemoteInputEvent;
 
 pub const RemoteInputStatus = r4x_api.RemoteInputStatus;
 
+pub const PhysicalKeyEvent = r4x_api.PhysicalKeyEvent;
+
 const RemoteRect = remote_frame_state.Rect;
 
 const RemoteFrameSnapshot = struct {
@@ -159,6 +161,30 @@ pub fn mouseShow() callconv(.c) void {
 
 pub fn mouseHide() callconv(.c) void {
     mouse.disableCursor();
+}
+
+pub fn physicalKeyPoll(out: *PhysicalKeyEvent) callconv(.c) i32 {
+    if (@intFromPtr(out) == 0) return r4x_api.physical_key_poll_error_invalid;
+    const event = keyboard.readPhysicalEvent() orelse {
+        out.* = .{};
+        return r4x_api.physical_key_poll_empty;
+    };
+    out.* = .{
+        .magic = r4x_api.physical_key_magic,
+        .version = r4x_api.physical_key_version,
+        .size = @sizeOf(PhysicalKeyEvent),
+        .kind = switch (event.kind) {
+            .down => r4x_api.physical_key_kind_down,
+            .up => r4x_api.physical_key_kind_up,
+            .reset => r4x_api.physical_key_kind_reset,
+        },
+        .key = event.usage,
+        .modifiers = event.modifiers,
+        .flags = event.flags,
+        .sequence = event.sequence,
+        .tick = event.tick,
+    };
+    return r4x_api.physical_key_poll_ready;
 }
 
 pub fn keyboardLayoutCurrent(out: *KeyboardLayoutInfo) callconv(.c) i32 {

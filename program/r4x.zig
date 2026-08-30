@@ -5990,6 +5990,7 @@ fn configureR4XStartR4DeskTable() void {
         .remote_frame_release = &r4api.r4desk.remoteFrameRelease,
         .remote_frame_consumers = &r4api.r4desk.remoteFrameConsumers,
         .remote_frame_publish_regions = &r4api.r4desk.remoteFramePublishRegions,
+        .physical_key_poll = &r4api.r4desk.physicalKeyPoll,
     });
 }
 
