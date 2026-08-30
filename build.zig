@@ -176,7 +176,6 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Build the kernel and run kernel-owned host tests");
     test_step.dependOn(&kernel.step);
     const unit_tests = [_][]const u8{
-        "bootscreen_tests.zig",
         "display/console_scroll_buffer.zig",
         "display/framebuffer.zig",
         "input_controller_tests.zig",
@@ -211,6 +210,7 @@ pub fn build(b: *std.Build) void {
         "platform/monotonic_math.zig",
         "platform/pci_scan.zig",
         "program/gui_alpha8.zig",
+        "program/lifecycle_retire_policy.zig",
         "program/remote_frame_state.zig",
         "program/r4x_start.zig",
         "sched/initial_stack.zig",
@@ -219,6 +219,7 @@ pub fn build(b: *std.Build) void {
         "storage/block_split.zig",
     };
     for (unit_tests) |path| addUnitTest(b, test_step, path);
+    addBootscreenUnitTest(b, test_step);
     addContractUnitTest(b, test_step, contract, config, "services_tests.zig");
     addLoaderTests(b, test_step, contract, config);
 
@@ -236,6 +237,22 @@ pub fn build(b: *std.Build) void {
         "Tests/Fixture/ProviderMissingFieldNegative.zig",
         "missing struct field",
     );
+}
+
+fn addBootscreenUnitTest(b: *std.Build, test_step: *std.Build.Step) void {
+    const root = b.createModule(.{
+        .root_source_file = b.path("bootscreen_tests.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    root.addImport("r4f_format", b.createModule(.{
+        .root_source_file = b.path("kernel/font_format.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }));
+    const tests = b.addTest(.{ .root_module = root });
+    const run = b.addRunArtifact(tests);
+    test_step.dependOn(&run.step);
 }
 
 fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, path: []const u8) void {

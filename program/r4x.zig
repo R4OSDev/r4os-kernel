@@ -30,6 +30,7 @@ const task_context = @import("../sched/task_context.zig");
 const r4api = @import("r4api.zig");
 const r4x_api = @import("r4x_api.zig");
 const r4x_start = @import("r4x_start.zig");
+const lifecycle_retire_policy = @import("lifecycle_retire_policy.zig");
 const gui_alpha8 = @import("gui_alpha8.zig");
 const desktop_events = @import("../kernel/desktop_events.zig");
 const std = @import("std");
@@ -5527,6 +5528,17 @@ fn unpinProgramThreadExecution(thread_ctx: *ProgramThread) void {
     if (wake_reaper) program_reaper_event.signal();
 }
 
+fn naturalExitEpilogueOwnsTask(thread_ctx: *const ProgramThread) bool {
+    const scheduler_task_present = thread_ctx.task_id != 0 and
+        thread_ctx.task_generation != 0 and
+        task.existsIdentity(thread_ctx.task_id, thread_ctx.task_generation);
+    return lifecycle_retire_policy.naturalExitEpilogueOwnsTask(
+        thread_ctx.state == .exited,
+        thread_ctx.execution_pinned,
+        scheduler_task_present,
+    );
+}
+
 fn enqueueProgramRetireLocked(slot: *ProgramRegistrySlot) bool {
     // A slot has exactly one queue or worker owner.  In particular, an API
     // nudge cannot enqueue the stable slot address while a reaper is between
@@ -6509,8 +6521,13 @@ pub fn runShellPath(d: *drive.Drive, path: []const u8, args: []const u8, working
 }
 
 pub fn runShellPathWithHost(d: *drive.Drive, path: []const u8, args: []const u8, working_drive: *drive.Drive, host: ConsoleHostKind) RunResult {
-    const file = resolveProgramFile(d, path) orelse return .not_found;
-    return runProgramFile(file, .shell, .auto, args, working_drive, host, .{});
+    const report_boot_launch = bootscreen.isActive();
+    reportBootLaunchStage(report_boot_launch, "Pfad pruefen");
+    const file = resolveProgramFileWithBootReport(d, path, report_boot_launch) orelse return .not_found;
+    reportBootLaunchStage(report_boot_launch, "Start vorbereiten");
+    return runProgramFile(file, .shell, .auto, args, working_drive, host, .{
+        .report_boot_launch = report_boot_launch,
+    });
 }
 
 pub fn activeShellInstanceId() u32 {
@@ -6624,10 +6641,22 @@ pub fn takeExitCode(id: u32) ?i32 {
 }
 
 fn resolveProgramFile(d: *drive.Drive, path: []const u8) ?ProgramFile {
+    return resolveProgramFileWithBootReport(d, path, false);
+}
+
+fn resolveProgramFileWithBootReport(d: *drive.Drive, path: []const u8, report_boot_launch: bool) ?ProgramFile {
     const volume = vfs.volumeForDrive(d.letter) orelse return null;
-    var req = fs_request.begin(.loader_read, d.letter) orelse return null;
+    reportBootLaunchStage(report_boot_launch, "FS-Sperre pruefen");
+    var req = fs_request.tryBegin(.loader_read, d.letter) orelse blk: {
+        // Preserve the normal bounded wait after an immediate, observation-
+        // only probe.  The persistent marker distinguishes a foreign volume
+        // owner from a stall in the following path lookup on real hardware.
+        reportBootFilesystemWait(report_boot_launch, d.letter);
+        break :blk fs_request.begin(.loader_read, d.letter) orelse return null;
+    };
     var ok = false;
     defer fs_request.finish(&req, ok);
+    reportBootLaunchStage(report_boot_launch, "Dateipfad suchen");
     const entry = vfs.resolveEntry(volume, path) orelse return null;
     if (entry.isDir()) return null;
     if (entry.size == 0) {
@@ -6652,6 +6681,103 @@ fn resolveProgramFile(d: *drive.Drive, path: []const u8) ?ProgramFile {
     }
     resolved.origin_len = @intCast(origin_len);
     return resolved;
+}
+
+fn reportBootFilesystemWait(enabled: bool, drive_letter: u8) void {
+    if (!enabled or !bootscreen.isActive()) return;
+    const snapshot = fs_request.gateSnapshot(drive_letter) orelse {
+        reportBootLaunchStage(enabled, "FS-Sperre wartet");
+        return;
+    };
+    const owner_task = task.pinByIdentity(snapshot.owner_task_id, snapshot.owner_task_generation) orelse {
+        bootscreen.setDetail("FS-Halter fehlt");
+        bootlog.puts("[FSGATE] desktop wait owner missing task=");
+        bootlog.putDec(snapshot.owner_task_id);
+        bootlog.puts(" generation=");
+        bootlog.putDec(snapshot.owner_task_generation);
+        bootlog.puts(" kind=");
+        bootlog.putDec(@intFromEnum(snapshot.kind));
+        bootlog.puts("\r\n");
+        return;
+    };
+    defer _ = task.unpin(owner_task);
+
+    var owner_name = owner_task.name;
+    var activity = filesystemKindLabel(snapshot.kind);
+    const execution_owner = task.executionOwner(owner_task);
+    switch (execution_owner.kind) {
+        .program_thread => {
+            if (execution_owner.context) |context| {
+                const thread_ctx: *ProgramThread = @ptrCast(@alignCast(context));
+                if (thread_ctx.used and
+                    thread_ctx.task_id == snapshot.owner_task_id and
+                    thread_ctx.task_generation == snapshot.owner_task_generation)
+                {
+                    if (programModuleBaseName(thread_ctx.owner_instance)) |name| owner_name = name;
+                }
+            }
+        },
+        .async_io => {
+            if (execution_owner.context) |context| {
+                const request: *AsyncIoRequest = @ptrCast(@alignCast(context));
+                if (request.used and
+                    request.task_id == snapshot.owner_task_id and
+                    request.task_generation == snapshot.owner_task_generation)
+                {
+                    if (programModuleBaseName(request.owner_instance)) |name| owner_name = name;
+                    if (request.path_len != 0 and request.path_len <= request.path.len) {
+                        const file_name = baseName(request.path[0..request.path_len]);
+                        if (file_name.len != 0) activity = file_name;
+                    }
+                }
+            }
+        },
+        .none => {},
+    }
+    if (owner_task.state == .blocked and owner_task.wait_reason.len != 0) {
+        activity = owner_task.wait_reason;
+    }
+
+    bootscreen.setServiceStage(owner_name, activity);
+    bootlog.puts("[FSGATE] desktop wait owner_task=");
+    bootlog.putDec(snapshot.owner_task_id);
+    bootlog.puts(" owner_generation=");
+    bootlog.putDec(snapshot.owner_task_generation);
+    bootlog.puts(" kind=");
+    bootlog.putDec(@intFromEnum(snapshot.kind));
+    bootlog.puts(" owner=");
+    bootlog.puts(owner_name);
+    bootlog.puts(" activity=");
+    bootlog.puts(activity);
+    bootlog.puts("\r\n");
+}
+
+fn programModuleBaseName(instance: ?*const ProgramInstance) ?[]const u8 {
+    const owner = instance orelse return null;
+    const runtime = owner.runtime_payload orelse return null;
+    const path_len: usize = @intCast(runtime.module_path_len);
+    if (path_len == 0 or path_len > runtime.module_path.len) return null;
+    const name = baseName(runtime.module_path[0..path_len]);
+    return if (name.len == 0) null else name;
+}
+
+fn filesystemKindLabel(kind: fs_request.Kind) []const u8 {
+    return switch (kind) {
+        .drive_info, .dir_list, .dir_entry, .file_info => "Metadaten",
+        .file_read, .file_read_at, .loader_read, .config_read => "lesen",
+        .file_write, .file_write_at, .file_append, .config_write => "schreiben",
+        .stream_begin => "Stream beginnen",
+        .stream_write => "Stream schreiben",
+        .stream_finish => "Stream beenden",
+        .stream_abort => "Stream abbrechen",
+        .file_delete, .file_delete_if_match => "Datei loeschen",
+        .dir_create => "Ordner anlegen",
+        .dir_delete => "Ordner loeschen",
+        .file_rename => "umbenennen",
+        .file_copy => "kopieren",
+        .file_move => "verschieben",
+        .file_replace_atomic, .file_update_atomic_checked => "Update schreiben",
+    };
 }
 
 pub fn usedDisplay() bool {
@@ -6705,6 +6831,7 @@ const ProgramLaunchOptions = struct {
     // launch transaction. Internal/legacy callers leave it null and retain
     // the established RunResult-only contract.
     error_out: ?*i32 = null,
+    report_boot_launch: bool = false,
 };
 
 const SubsystemTrace = struct {
@@ -6842,7 +6969,7 @@ fn leaveProgramSpawnTransaction(thread_ctx: ?*ProgramThread) void {
     killConsoleClients(handle);
     unpinProgramThreadExecution(thread);
     program_reaper_event.signal();
-    scheduler.exitCurrent();
+    scheduler.exitCurrentAndRetire();
 }
 
 fn programSpawnTransactionCancelled() bool {
@@ -6862,6 +6989,7 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
         fs_stats_before = fs_request.summary();
         logSubsystemTracePhase(trace, "admission", loader_start_ns);
     }
+    reportBootLaunchStage(options.report_boot_launch, "API vorbereiten");
     configureApiGroups();
     setProgramLaunchError(options, PROGRAM_HANDLE_OK);
     const spawn_thread = currentProgramThread();
@@ -6878,6 +7006,7 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
     // 0.59.8: Slot und kollisionssichere ID werden vor dem ersten R4X-Read
     // reserviert. Die Registry zeigt den Eintrag bis publishProgramInstance
     // nicht; der defer deckt jeden fruehen Loader-/Stackfehler ab.
+    reportBootLaunchStage(options.report_boot_launch, "Slot reservieren");
     var reservation = switch (reserveProgramInstanceSlot()) {
         .reservation => |value| value,
         .failure => |failure| {
@@ -6891,11 +7020,13 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
     };
     var reservation_active = true;
     defer if (reservation_active) cancelProgramInstanceReservation(&reservation);
+    reportBootLaunchStage(options.report_boot_launch, "Completion anlegen");
     if (consumeProgramLifecycleFailure(.completion_reserve) or !allocateProgramCompletionNode(&reservation, options.owner, options.owner_handle, options.legacy_id, options.retain_output)) {
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_NO_MEMORY);
         return .failed;
     }
     const instance_id = reservation.id;
+    reportBootLaunchStage(options.report_boot_launch, "Header laden");
     const header = readProgramHeader(file) orelse {
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_LOAD_FAILED);
         return .failed;
@@ -6910,6 +7041,7 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_INVALID);
         return .failed;
     }
+    reportBootLaunchStage(options.report_boot_launch, "Image laden");
     var loaded = loadProgramImage(file, header, instance_id, app_class) orelse {
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_LOAD_FAILED);
         return .failed;
@@ -6933,6 +7065,7 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_LOAD_FAILED);
         return .failed;
     }
+    reportBootLaunchStage(options.report_boot_launch, "Stack anlegen");
     const stack = allocateProgramStack(instance_id, loaded.memory_contract, parseSubsystemTrace(args) != null) orelse {
         k.puts("Program stack allocation failed\r\n");
         freeProgramImage(loaded.image);
@@ -6950,6 +7083,7 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
         return .failed;
     }
 
+    reportBootLaunchStage(options.report_boot_launch, "Startobjekte anlegen");
     return switch (mode) {
         .foreground => runForegroundProgram(&reservation, &reservation_active, loaded, stack, app_class, args, working_drive, options),
         .shell => runShellProgram(&reservation, &reservation_active, loaded, stack, app_class, args, working_drive, shell_host, options),
@@ -8348,15 +8482,18 @@ fn runForegroundProgram(reservation: *const ProgramInstanceReservation, reservat
     if (options.out_handle) |out_handle| out_handle.* = handle;
     foreground_instance_id = instance.id;
     foreground_instance_generation = handle.generation;
+    const report_boot_lifecycle = bootscreen.isActive();
     task.markReady(program_task, timer.tickCount());
 
     while (true) {
         if (programCompletionIsReady(handle)) {
+            if (report_boot_lifecycle) bootscreen.setDetail("SERVMAN: Rueckgabe");
             var completion: ProgramProcessCompletion = .{};
             if (consumeProgramCompletion(handle, &completion) == PROGRAM_HANDLE_OK) {
                 last_exit_code = completion.exit_code;
                 last_display_used = (completion.flags & PROGRAM_COMPLETION_FLAG_DISPLAY_USED) != 0;
             }
+            if (report_boot_lifecycle) bootscreen.setDetail("Dienstmanager fertig");
             return .ran;
         }
         if (programSpawnTransactionCancelled()) {
@@ -8370,6 +8507,7 @@ fn runForegroundProgram(reservation: *const ProgramInstanceReservation, reservat
 }
 
 fn runShellProgram(reservation: *const ProgramInstanceReservation, reservation_active: *bool, loaded: LoadedProgram, stack: ProgramStack, app_class: AppClass, args: []const u8, working_drive: *drive.Drive, host: ConsoleHostKind, options: ProgramLaunchOptions) RunResult {
+    reportBootLaunchStage(options.report_boot_launch, "Altlasten pruefen");
     reapFinishedInstances();
     if (programSpawnTransactionCancelled()) {
         freeProgramResources(loaded.image, stack);
@@ -8383,6 +8521,7 @@ fn runShellProgram(reservation: *const ProgramInstanceReservation, reservation_a
         return .failed;
     }
 
+    reportBootLaunchStage(options.report_boot_launch, "Instanz anlegen");
     const instance = createInstance(reservation, .shell, app_class, loaded, stack, args, working_drive, loaded.origin[0..loaded.origin_len]) orelse {
         k.puts("Shell instance allocation failed\r\n");
         freeProgramResources(loaded.image, stack);
@@ -8413,6 +8552,7 @@ fn runShellProgram(reservation: *const ProgramInstanceReservation, reservation_a
         }
     }
     // The persistent shell owns global console and child-lifecycle state.
+    reportBootLaunchStage(options.report_boot_launch, "Task anlegen");
     const shell_task = task.createLegacyThreadBlocked("r4x-shell", shellTaskMain) orelse {
         rollbackReservedProgramInstance(reservation);
         reservation_active.* = false;
@@ -8428,6 +8568,7 @@ fn runShellProgram(reservation: *const ProgramInstanceReservation, reservation_a
         return .failed;
     }
     instance.task_id = shell_task.id;
+    reportBootLaunchStage(options.report_boot_launch, "Thread binden");
     if (registerMainThread(instance, shell_task) == null) {
         _ = releaseCreatedProgramTask(shell_task);
         rollbackReservedProgramInstance(reservation);
@@ -8441,6 +8582,7 @@ fn runShellProgram(reservation: *const ProgramInstanceReservation, reservation_a
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_TASK_FAILED);
         return .failed;
     }
+    reportBootLaunchStage(options.report_boot_launch, "Instanz veroeffentlichen");
     if (consumeProgramLifecycleFailure(.publish) or !publishProgramInstance(reservation)) {
         rollbackRegisteredProgramReservation(reservation, reservation_active);
         k.puts("Shell registry publish failed\r\n");
@@ -8457,6 +8599,7 @@ fn runShellProgram(reservation: *const ProgramInstanceReservation, reservation_a
     if (options.out_handle) |out_handle| out_handle.* = handle;
     shell_instance_id = instance.id;
     shell_instance_generation = handle.generation;
+    reportBootLaunchStage(options.report_boot_launch, "Task einreihen");
     task.markReady(shell_task, timer.tickCount());
     return .ran;
 }
@@ -8580,15 +8723,18 @@ fn isSmpAuditedBackgroundR4x(loaded: LoadedProgram) bool {
 
 fn programTaskMain() callconv(.c) void {
     const thread_ctx = currentProgramThread() orelse {
-        scheduler.exitCurrent();
+        scheduler.exitCurrentAndRetire();
         return;
     };
     const run = pinProgramThreadExecution(thread_ctx) orelse {
         markProgramThreadDone(thread_ctx, THREAD_ERROR_NO_INSTANCE);
-        scheduler.exitCurrent();
+        scheduler.exitCurrentAndRetire();
         return;
     };
     const handle = ProgramProcessHandle{ .instance_id = thread_ctx.instance_id, .reserved = 0, .generation = thread_ctx.instance_generation };
+    const report_boot_lifecycle = bootscreen.isActive() and
+        foreground_instance_id != null and foreground_instance_id.? == handle.instance_id and
+        foreground_instance_generation == handle.generation;
     markProgramHandleRunning(handle);
     markProgramThreadRunning(thread_ctx);
     // Handle-based GUI spawning is a two-step host transaction: Desktop first
@@ -8602,50 +8748,61 @@ fn programTaskMain() callconv(.c) void {
     }
     {
         const exit_code = callInstanceEntry(run);
+        if (report_boot_lifecycle) bootscreen.setDetail("SERVMAN: Programmende");
         markProgramThreadDone(thread_ctx, exit_code);
+        if (report_boot_lifecycle) bootscreen.setDetail("SERVMAN: Threadende");
         markInstanceDone(handle, exit_code);
+        if (report_boot_lifecycle) bootscreen.setDetail("SERVMAN: Instanzende");
     }
+    if (report_boot_lifecycle) bootscreen.setDetail("SERVMAN: Freigabe");
     unpinProgramThreadExecution(thread_ctx);
-    scheduler.exitCurrent();
+    if (report_boot_lifecycle) bootscreen.setDetail("SERVMAN: Freigegeben");
+    scheduler.exitCurrentAndRetire();
 }
 
 fn shellTaskMain() callconv(.c) void {
     const thread_ctx = currentProgramThread() orelse {
-        scheduler.exitCurrent();
+        scheduler.exitCurrentAndRetire();
         return;
     };
+    const report_boot_launch = bootscreen.isActive() and
+        shell_instance_id != null and shell_instance_id.? == thread_ctx.instance_id and
+        shell_instance_generation == thread_ctx.instance_generation;
+    reportBootLaunchStage(report_boot_launch, "Shelltask gestartet");
     const run = pinProgramThreadExecution(thread_ctx) orelse {
         markProgramThreadDone(thread_ctx, THREAD_ERROR_NO_INSTANCE);
-        scheduler.exitCurrent();
+        scheduler.exitCurrentAndRetire();
         return;
     };
+    reportBootLaunchStage(report_boot_launch, "Instanz gebunden");
     const handle = ProgramProcessHandle{ .instance_id = thread_ctx.instance_id, .reserved = 0, .generation = thread_ctx.instance_generation };
     markProgramHandleRunning(handle);
     markProgramThreadRunning(thread_ctx);
     {
+        reportBootLaunchStage(report_boot_launch, "R4XStart aufrufen");
         const exit_code = callInstanceEntry(run);
         markProgramThreadDone(thread_ctx, exit_code);
         markInstanceDone(handle, exit_code);
         k.puts("Shell program returned\r\n");
     }
     unpinProgramThreadExecution(thread_ctx);
-    scheduler.exitCurrent();
+    scheduler.exitCurrentAndRetire();
 }
 
 fn programThreadTaskMain() callconv(.c) void {
     const thread_ctx = currentProgramThreadReady() orelse {
-        scheduler.exitCurrent();
+        scheduler.exitCurrentAndRetire();
         return;
     };
     const instance = pinProgramThreadExecution(thread_ctx) orelse {
         markProgramThreadDone(thread_ctx, THREAD_ERROR_NO_INSTANCE);
-        scheduler.exitCurrent();
+        scheduler.exitCurrentAndRetire();
         return;
     };
     const entry = normalizeThreadEntry(instance, thread_ctx.entry) orelse {
         markProgramThreadDone(thread_ctx, THREAD_ERROR_INVALID);
         unpinProgramThreadExecution(thread_ctx);
-        scheduler.exitCurrent();
+        scheduler.exitCurrentAndRetire();
         return;
     };
     thread_ctx.entry = entry;
@@ -8655,7 +8812,7 @@ fn programThreadTaskMain() callconv(.c) void {
     if (thread_ctx.stack.serial_telemetry) logProgramStackHighWater(instance, &thread_ctx.stack, thread_ctx.id);
     markProgramThreadDone(thread_ctx, exit_code);
     unpinProgramThreadExecution(thread_ctx);
-    scheduler.exitCurrent();
+    scheduler.exitCurrentAndRetire();
 }
 
 fn callInstanceEntry(run: *ProgramInstance) i32 {
@@ -9167,20 +9324,20 @@ fn markAsyncIoClosePendingForCaller(request_id: u32) bool {
 }
 
 fn asyncIoTaskMain() callconv(.c) void {
-    if (!lockAsyncIoRequests()) scheduler.exitCurrent();
+    if (!lockAsyncIoRequests()) scheduler.exitCurrentAndRetire();
     const req = currentAsyncIoRequest() orelse {
         unlockAsyncIoRequests();
-        scheduler.exitCurrent();
+        scheduler.exitCurrentAndRetire();
     };
     req.state = .running;
     unlockAsyncIoRequests();
 
     const result = performAsyncIo(req);
-    if (!lockAsyncIoRequests()) scheduler.exitCurrent();
+    if (!lockAsyncIoRequests()) scheduler.exitCurrentAndRetire();
     const current_task = scheduler.current();
     if (!req.used or current_task == null or req.task_id != current_task.?.id or req.task_generation != current_task.?.generation) {
         unlockAsyncIoRequests();
-        scheduler.exitCurrent();
+        scheduler.exitCurrentAndRetire();
     }
     if (req.cancel_requested) {
         req.result = IO_ERROR_CANCELLED;
@@ -9196,7 +9353,7 @@ fn asyncIoTaskMain() callconv(.c) void {
     req.completed_tick = timer.tickCount();
     req.completion.completeAll();
     unlockAsyncIoRequests();
-    scheduler.exitCurrent();
+    scheduler.exitCurrentAndRetire();
 }
 
 fn performAsyncIo(req: *AsyncIoRequest) i32 {
@@ -9777,7 +9934,7 @@ fn threadCreateErrorForTaskFailure(failure: task.CreateFailure) i32 {
 }
 
 fn apiThreadExit(exit_code: i32) callconv(.c) void {
-    const thread_ctx = currentProgramThread() orelse scheduler.exitCurrent();
+    const thread_ctx = currentProgramThread() orelse scheduler.exitCurrentAndRetire();
     markProgramThreadDone(thread_ctx, exit_code);
     if ((thread_ctx.flags & THREAD_FLAG_MAIN) != 0) {
         const handle = ProgramProcessHandle{
@@ -9788,7 +9945,7 @@ fn apiThreadExit(exit_code: i32) callconv(.c) void {
         markInstanceDone(handle, exit_code);
     }
     unpinProgramThreadExecution(thread_ctx);
-    scheduler.exitCurrent();
+    scheduler.exitCurrentAndRetire();
 }
 
 const ProgramThreadJoinClaim = union(enum) {
@@ -9974,7 +10131,7 @@ fn finishJoinedThread(target: *ProgramThread, owner_task_id: u32, owner_task_gen
     target.retire_in_progress = true;
     bumpProgramThreadInventoryEpochLocked();
     interrupts.restore(irq_flags);
-    if (!completeProgramThreadRetire(target, release_token)) {
+    if (!completeProgramThreadRetire(target, release_token, false)) {
         k.puts("[R4XTHREAD] join cleanup deferred thread=");
         k.putDec(target_id);
         k.puts("\r\n");
@@ -10247,6 +10404,11 @@ fn terminateProgramThreadsForHandle(handle: ProgramProcessHandle, exit_code: i32
     while (cursor) |thread_ctx| : (cursor = thread_ctx.registry_next) {
         if (!thread_ctx.used or thread_ctx.instance_id != handle.instance_id or thread_ctx.instance_generation != handle.generation) continue;
         if (skip_task_id != null and thread_ctx.task_id == skip_task_id.?) continue;
+        // A naturally returned R4X task still executes its kernel epilogue
+        // until it releases the generation pin and its exact scheduler Task
+        // generation has published .dead. Killing it in either half of this
+        // handoff can strand the pin or preempt the terminal context switch.
+        if (naturalExitEpilogueOwnsTask(thread_ctx)) continue;
         if (thread_ctx.state != .exited and thread_ctx.state != .killed) {
             thread_ctx.exit_code = exit_code;
             thread_ctx.state = .killed;
@@ -10274,30 +10436,58 @@ fn releaseThreadsForInstance(instance_id: u32) bool {
 }
 
 fn releaseThreadsForHandle(handle: ProgramProcessHandle) bool {
+    return releaseThreadsForHandleReporting(handle, false);
+}
+
+fn releaseThreadsForHandleReporting(handle: ProgramProcessHandle, report_boot_foreground: bool) bool {
     while (true) {
         switch (claimProgramThreadRetireForHandle(handle)) {
             .done => return true,
-            .pending => return false,
+            .pending => |reason| {
+                reportBootForegroundRetireStage(report_boot_foreground, programThreadRetirePendingDetail(reason));
+                return false;
+            },
             .claimed => |claim| {
-                if (!completeProgramThreadRetire(claim.thread_ctx, claim.release_token)) return false;
+                reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Thread freigeben");
+                if (!completeProgramThreadRetire(claim.thread_ctx, claim.release_token, report_boot_foreground)) return false;
             },
         }
     }
 }
 
+const ProgramThreadRetirePendingReason = enum {
+    spawn_transaction,
+    natural_task_owner,
+    retire_claim,
+    join,
+    thread_pin,
+    reaper_guard,
+};
+
 const ProgramThreadRetireClaim = union(enum) {
     done,
-    pending,
+    pending: ProgramThreadRetirePendingReason,
     claimed: struct {
         thread_ctx: *ProgramThread,
         release_token: task_context.UnwindToken,
     },
 };
 
+fn programThreadRetirePendingDetail(reason: ProgramThreadRetirePendingReason) []const u8 {
+    return switch (reason) {
+        .spawn_transaction => "SERVMAN: Spawn wartet",
+        .natural_task_owner => "SERVMAN: Task-Reaper wartet",
+        .retire_claim => "SERVMAN: Reaper wartet",
+        .join => "SERVMAN: Join wartet",
+        .thread_pin => "SERVMAN: Thread-Pin wartet",
+        .reaper_guard => "SERVMAN: Schutz wartet",
+    };
+}
+
 fn claimProgramThreadRetireForHandle(handle: ProgramProcessHandle) ProgramThreadRetireClaim {
     const irq_flags = interrupts.saveAndDisable();
     defer interrupts.restore(irq_flags);
-    var saw_pending = false;
+    var pending_reason: ?ProgramThreadRetirePendingReason = null;
     var inventory_changed = false;
     var cursor = program_thread_head;
     while (cursor) |thread_ctx| : (cursor = thread_ctx.registry_next) {
@@ -10314,21 +10504,35 @@ fn claimProgramThreadRetireForHandle(handle: ProgramProcessHandle) ProgramThread
         if (thread_ctx.join_queue.hasWaiters()) _ = thread_ctx.join_queue.cancelAll();
         if (thread_ctx.spawn_transaction_depth != 0) {
             thread_ctx.exit_deferred = true;
-            saw_pending = true;
+            if (pending_reason == null) pending_reason = .spawn_transaction;
             continue;
         }
-        if (thread_ctx.retire_in_progress or
-            thread_ctx.join_lease_active or
+        // The deferred reaper may run as soon as markInstanceDone publishes
+        // .retire. A natural owner transfers its exact Task generation to the
+        // scheduler reaper and remains present until that independent Task
+        // teardown is complete. Hard-killed threads stay program-reaper-owned.
+        if (naturalExitEpilogueOwnsTask(thread_ctx)) {
+            if (pending_reason == null) pending_reason = .natural_task_owner;
+            continue;
+        }
+        if (thread_ctx.retire_in_progress) {
+            if (pending_reason == null) pending_reason = .retire_claim;
+            continue;
+        }
+        if (thread_ctx.join_lease_active or
             thread_ctx.join_waiter_refs != 0 or
-            thread_ctx.join_queue.hasWaiters() or
-            thread_ctx.pin_count != 0)
+            thread_ctx.join_queue.hasWaiters())
         {
-            saw_pending = true;
+            if (pending_reason == null) pending_reason = .join;
+            continue;
+        }
+        if (thread_ctx.pin_count != 0) {
+            if (pending_reason == null) pending_reason = .thread_pin;
             continue;
         }
         const release_token = task_context.enterUnwind();
         if (!release_token.admitted()) {
-            saw_pending = true;
+            if (pending_reason == null) pending_reason = .reaper_guard;
             continue;
         }
         thread_ctx.retire_in_progress = true;
@@ -10337,7 +10541,7 @@ fn claimProgramThreadRetireForHandle(handle: ProgramProcessHandle) ProgramThread
         return .{ .claimed = .{ .thread_ctx = thread_ctx, .release_token = release_token } };
     }
     if (inventory_changed) bumpProgramThreadInventoryEpochLocked();
-    return if (saw_pending) .pending else .done;
+    return if (pending_reason) |reason| .{ .pending = reason } else .done;
 }
 
 fn clearProgramThreadRetireClaim(thread_ctx: *ProgramThread) void {
@@ -10353,7 +10557,11 @@ fn clearProgramThreadRetireClaim(thread_ctx: *ProgramThread) void {
     }
 }
 
-fn completeProgramThreadRetire(thread_ctx: *ProgramThread, release_token: task_context.UnwindToken) bool {
+fn completeProgramThreadRetire(
+    thread_ctx: *ProgramThread,
+    release_token: task_context.UnwindToken,
+    report_boot_foreground: bool,
+) bool {
     defer _ = task_context.leaveUnwind(release_token);
     const owner_task_id = thread_ctx.task_id;
     const owner_task_generation = thread_ctx.task_generation;
@@ -10363,15 +10571,18 @@ fn completeProgramThreadRetire(thread_ctx: *ProgramThread, release_token: task_c
         .generation = thread_ctx.instance_generation,
     };
     if (!thread_ctx.task_detached) {
+        reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Task freigeben");
         const current_task = scheduler.current();
         const current_task_id = if (current_task) |value| value.id else 0;
         const current_task_generation = if (current_task) |value| value.generation else 0;
         if (!releaseProgramTaskGeneration(owner_task_id, owner_task_generation, current_task_id, current_task_generation)) {
+            reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Task wartet");
             clearProgramThreadRetireClaim(thread_ctx);
             return false;
         }
         thread_ctx.task_detached = true;
         bumpProgramThreadInventoryEpoch();
+        reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Task frei");
     }
     // The caller task and its intrusive Completion waiter are now physically
     // detached, so it cannot publish another request while cancellation
@@ -10380,28 +10591,34 @@ fn completeProgramThreadRetire(thread_ctx: *ProgramThread, release_token: task_c
     // process-wide. Retire all workers submitted by this exact task identity
     // before purging their anchors and releasing the matching R4SYS namespace
     // leases. Keep task identity until all three operations have succeeded.
+    reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O abbrechen");
     if (!cancelAsyncIoRequestsForCaller(
         thread_handle,
         owner_task_id,
         owner_task_generation,
     )) {
+        reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O wartet");
         clearProgramThreadRetireClaim(thread_ctx);
         return false;
     }
+    reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O entfernen");
     if (!purgeCancelledAsyncIoRequestsForCaller(
         thread_handle,
         owner_task_id,
         owner_task_generation,
     )) {
+        reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O-Abbau wartet");
         clearProgramThreadRetireClaim(thread_ctx);
         return false;
     }
+    reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Streams loesen");
     if (!r4api.r4sys.releaseStreamSlotsForProgramThread(
         thread_ctx.instance_id,
         thread_ctx.instance_generation,
         owner_task_id,
         owner_task_generation,
     )) {
+        reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Streams warten");
         clearProgramThreadRetireClaim(thread_ctx);
         return false;
     }
@@ -10411,7 +10628,9 @@ fn completeProgramThreadRetire(thread_ctx: *ProgramThread, release_token: task_c
         bumpProgramThreadInventoryEpoch();
     }
     if (!thread_ctx.stack_released) {
+        reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Stack freigeben");
         if (thread_ctx.stack.range_id != 0 and !freeProgramStack(&thread_ctx.stack)) {
+            reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Stack wartet");
             clearProgramThreadRetireClaim(thread_ctx);
             return false;
         }
@@ -10420,6 +10639,7 @@ fn completeProgramThreadRetire(thread_ctx: *ProgramThread, release_token: task_c
     }
     unpinProgramThreadExecution(thread_ctx);
     if (thread_ctx.execution_pinned) {
+        reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Pin wartet");
         clearProgramThreadRetireClaim(thread_ctx);
         return false;
     }
@@ -10435,6 +10655,7 @@ fn completeProgramThreadRetire(thread_ctx: *ProgramThread, release_token: task_c
         thread_ctx.join_queue.hasWaiters())
     {
         interrupts.restore(irq_flags);
+        reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Thread wartet");
         clearProgramThreadRetireClaim(thread_ctx);
         return false;
     }
@@ -10442,7 +10663,12 @@ fn completeProgramThreadRetire(thread_ctx: *ProgramThread, release_token: task_c
     unlinkProgramThreadLocked(thread_ctx);
     interrupts.restore(irq_flags);
 
-    if (freeProgramThreadMemory(thread_ctx)) return true;
+    if (freeProgramThreadMemory(thread_ctx)) {
+        reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Thread frei");
+        return true;
+    }
+
+    reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Speicher wartet");
 
     const retry_flags = interrupts.saveAndDisable();
     linkProgramThreadLocked(thread_ctx);
@@ -12376,6 +12602,7 @@ fn apiServiceInfo(index: u32, out: *ServiceInfo) callconv(.c) i32 {
             services.beginApiIndexRefresh(index)
         else
             services.retryApiIndexRefresh(index)) orelse {
+            reportBootServicePlanComplete();
             out.* = .{};
             return 0;
         };
@@ -12538,6 +12765,7 @@ fn apiServiceDetail(index: u32, out: *ServiceDetail) callconv(.c) i32 {
             services.beginApiIndexRefresh(index)
         else
             services.retryApiIndexRefresh(index)) orelse {
+            reportBootServicePlanComplete();
             out.* = .{};
             return 0;
         };
@@ -12562,6 +12790,33 @@ fn apiServiceStart(name_ptr: [*:0]const u8, out: *ServiceInfo) callconv(.c) i32 
     var name_buf: [services.MAX_NAME]u8 = undefined;
     const name = copyZ(name_ptr, name_buf[0..]) orelse return services.API_ERR_INVALID;
     return serviceApiStartByName(name, out);
+}
+
+fn reportBootService(name: []const u8) void {
+    if (!isBootServiceManagerCaller()) return;
+    bootscreen.setService(name);
+}
+
+fn reportBootServiceStage(name: []const u8, stage: []const u8) void {
+    if (!isBootServiceManagerCaller()) return;
+    bootscreen.setServiceStage(name, stage);
+}
+
+fn reportBootServicePlanComplete() void {
+    if (!isBootServiceManagerCaller()) return;
+    bootscreen.setDetail("Dienstplan fertig");
+}
+
+fn reportBootServiceError(name: []const u8) void {
+    if (!isBootServiceManagerCaller()) return;
+    bootscreen.setServiceError(name);
+}
+
+fn isBootServiceManagerCaller() bool {
+    if (!bootscreen.isActive()) return false;
+    const foreground_id = foreground_instance_id orelse return false;
+    const instance = currentInstance() orelse return false;
+    return instance.id == foreground_id;
 }
 
 fn apiServiceStop(name_ptr: [*:0]const u8, out: *ServiceInfo, timeout_ticks: u64) callconv(.c) i32 {
@@ -12673,17 +12928,38 @@ fn apiServiceInstall(name_ptr: [*:0]const u8, path_ptr: [*:0]const u8, args_ptr:
     var args_buf: [services.MAX_ARGS]u8 = undefined;
     var description_buf: [services.MAX_DESCRIPTION]u8 = undefined;
     const name = copyZ(name_ptr, name_buf[0..]) orelse return services.API_ERR_INVALID;
-    const raw_path = copyZ(path_ptr, path_buf[0..]) orelse return services.API_ERR_INVALID;
-    const args = copyZ(args_ptr, args_buf[0..]) orelse return services.API_ERR_INVALID;
-    const description = copyZ(description_ptr, description_buf[0..]) orelse return services.API_ERR_INVALID;
+    reportBootService(name);
+    const raw_path = copyZ(path_ptr, path_buf[0..]) orelse {
+        reportBootServiceError(name);
+        return services.API_ERR_INVALID;
+    };
+    const args = copyZ(args_ptr, args_buf[0..]) orelse {
+        reportBootServiceError(name);
+        return services.API_ERR_INVALID;
+    };
+    const description = copyZ(description_ptr, description_buf[0..]) orelse {
+        reportBootServiceError(name);
+        return services.API_ERR_INVALID;
+    };
 
     var resolved_buf: [MAX_API_PATH]u8 = undefined;
-    const target = resolveServiceProgramTarget(raw_path, &resolved_buf) orelse return services.API_ERR_BAD_PATH;
+    const target = resolveServiceProgramTarget(raw_path, &resolved_buf) orelse {
+        reportBootServiceError(name);
+        return services.API_ERR_BAD_PATH;
+    };
     var full_path_buf: [services.MAX_PATH]u8 = undefined;
-    const full_path = buildServiceDosPath(target.drive_ref, target.path, full_path_buf[0..]) orelse return services.API_ERR_BAD_PATH;
+    const full_path = buildServiceDosPath(target.drive_ref, target.path, full_path_buf[0..]) orelse {
+        reportBootServiceError(name);
+        return services.API_ERR_BAD_PATH;
+    };
     const register_result = services.registerWithDescription(name, full_path, args, start_mode, description);
-    if (register_result < 0) return serviceApiRegistryResult(register_result);
-    return services.apiStatus(name, out, r4api.r4sys.ticks());
+    if (register_result < 0) {
+        reportBootServiceError(name);
+        return serviceApiRegistryResult(register_result);
+    }
+    const status = services.apiStatus(name, out, r4api.r4sys.ticks());
+    if (status != services.API_OK) reportBootServiceError(name);
+    return status;
 }
 
 fn apiServiceRemove(name_ptr: [*:0]const u8) callconv(.c) i32 {
@@ -12700,32 +12976,46 @@ fn apiServiceRemove(name_ptr: [*:0]const u8) callconv(.c) i32 {
 
 fn serviceApiStartByName(name: []const u8, out: *ServiceInfo) i32 {
     out.* = .{};
+    reportBootService(name);
     serviceApiRefreshName(name);
-    const entry = services.entryByName(name) orelse return services.API_ERR_NOT_FOUND;
+    const entry = services.entryByName(name) orelse {
+        reportBootServiceError(name);
+        return services.API_ERR_NOT_FOUND;
+    };
     const service_name = entry.name[0..entry.name_len];
     if (entry.start_mode == .disabled or entry.state == .disabled) {
         _ = services.apiStatus(service_name, out, r4api.r4sys.ticks());
+        reportBootServiceError(service_name);
         return services.API_ERR_DISABLED;
     }
     if (entry.state == .running or entry.state == .starting or entry.state == .stopping) {
-        return services.apiStatus(service_name, out, r4api.r4sys.ticks());
+        const status = services.apiStatus(service_name, out, r4api.r4sys.ticks());
+        if (status != services.API_OK) reportBootServiceError(service_name);
+        return status;
     }
 
     _ = services.markStarting(service_name);
+    reportBootServiceStage(service_name, "Pfad pruefen");
     var path_buf: [MAX_API_PATH]u8 = undefined;
     const target = resolveServiceProgramTarget(entry.path[0..entry.path_len], &path_buf) orelse {
         _ = services.markFailed(service_name, -1, "path invalid or not service R4X");
         _ = services.apiStatus(service_name, out, r4api.r4sys.ticks());
+        reportBootServiceError(service_name);
         return services.API_ERR_BAD_PATH;
     };
+    reportBootServiceStage(service_name, "laden");
     const raw_id = spawnPath(target.drive_ref, target.path, entry.args[0..entry.args_len], target.drive_ref);
     if (raw_id <= 0) {
         _ = services.markFailed(service_name, raw_id, "spawn failed");
         _ = services.apiStatus(service_name, out, r4api.r4sys.ticks());
+        reportBootServiceError(service_name);
         return services.API_ERR_SPAWN_FAILED;
     }
+    reportBootServiceStage(service_name, "gestartet");
     _ = services.markRunning(service_name, @intCast(raw_id), r4api.r4sys.ticks());
-    return services.apiStatus(service_name, out, r4api.r4sys.ticks());
+    const status = services.apiStatus(service_name, out, r4api.r4sys.ticks());
+    if (status != services.API_OK) reportBootServiceError(service_name);
+    return status;
 }
 
 fn serviceApiStopByName(name: []const u8, out: *ServiceInfo, timeout_ticks: u64) i32 {
@@ -15526,9 +15816,23 @@ fn advanceProgramRetirePhase(
     return true;
 }
 
+fn reportBootForegroundRetireStage(enabled: bool, detail: []const u8) void {
+    if (!enabled or !bootscreen.isActive()) return;
+    bootscreen.setDetail(detail);
+}
+
+fn reportBootLaunchStage(enabled: bool, detail: []const u8) void {
+    if (!enabled or !bootscreen.isActive()) return;
+    bootscreen.setDetail(detail);
+    bootlog.puts("[LAUNCH] shell stage=");
+    bootlog.puts(detail);
+    bootlog.puts("\r\n");
+}
+
 fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
     var handle: ProgramProcessHandle = .{};
     var completion: *ProgramCompletionNode = undefined;
+    var report_boot_foreground = false;
     var phase: ProgramRetirePhase = .cancel_execution;
     const locked = lockProgramRegistry();
     if (!locked) return .deferred;
@@ -15545,6 +15849,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
         unlockProgramRegistry();
         return deferProgramRetire(handle);
     };
+    report_boot_foreground = completion.role == @intFromEnum(InstanceRole.foreground);
     // Do not wait on the task's own execution pin here: detach_task is the
     // phase that can release it. advanceProgramRetirePhase gates the first
     // payload-owning boundary until that pin and every external lease are 0.
@@ -15554,14 +15859,17 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
     while (phase != .slot_reclaim) {
         switch (phase) {
             .cancel_execution => {
+                reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Abbruchpruefung");
                 if (!cancelAsyncIoRequestsForHandle(handle)) return deferProgramRetire(handle);
                 if (!advanceProgramRetirePhase(slot, handle, completion, .cancel_execution, .detach_task)) return deferProgramRetire(handle);
                 if (consumeProgramLifecycleFailure(.cancel_execution)) return deferProgramRetire(handle);
                 phase = .detach_task;
             },
             .detach_task => {
+                reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Taskabbau");
                 terminateProgramThreadsForHandle(handle, -9, null);
-                if (!releaseThreadsForHandle(handle)) return deferProgramRetire(handle);
+                if (!releaseThreadsForHandleReporting(handle, report_boot_foreground)) return deferProgramRetire(handle);
+                reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O-Abbau");
                 if (!purgeCancelledAsyncIoRequestsForHandle(handle)) return deferProgramRetire(handle);
                 if (!releaseFileRangeLocksForHandle(handle)) return deferProgramRetire(handle);
                 if (!r4api.r4sys.releaseStreamSlotsForProgram(handle.instance_id, handle.generation)) return deferProgramRetire(handle);
@@ -15574,6 +15882,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                 phase = .output_detach;
             },
             .output_detach => {
+                reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Ausgabeabbau");
                 if (!slot.retire_output_detached) {
                     if (!detachProgramCompletionOutput(&slot.instance, completion)) return deferProgramRetire(handle);
                     slot.retire_output_detached = true;
@@ -15583,6 +15892,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                 phase = .storage_release;
             },
             .storage_release => {
+                reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Kontextabbau");
                 if (!slot.retire_storage_released) {
                     if (!releaseProgramInstanceStorage(&slot.instance, completion)) return deferProgramRetire(handle);
                     slot.retire_storage_released = true;
@@ -15592,6 +15902,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                 phase = .image_stack_vm_release;
             },
             .image_stack_vm_release => {
+                reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Imageabbau");
                 // First detach every core-owned address into this worker's
                 // local snapshot.  The persisted phase is advanced only after
                 // image, stack and residual owner teardown have all returned.
@@ -15640,6 +15951,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
     // The final seam models a failed READY/slot-clear publication after all
     // destructive owner phases are durably complete.  Retrying this boundary
     // cannot revisit output, heap, image, stack or VM teardown.
+    reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Abschluss");
     if (consumeProgramLifecycleFailure(.slot_reclaim)) return deferProgramRetire(handle);
 
     var auto_consume: ?*ProgramCompletionNode = null;
@@ -15674,6 +15986,8 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
     }
     clearProgramRegistrySlotLocked(reap_slot);
     unlockProgramRegistry();
+
+    reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Bereit");
 
     if (auto_consume) |node| {
         freeCompletionOutput(node);

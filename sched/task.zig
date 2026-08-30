@@ -2295,6 +2295,17 @@ pub fn isAliveIdentity(id: u32, generation: u64) bool {
     return target.state != .unused and target.state != .dead;
 }
 
+/// Presence is stronger than liveness: a dead Task remains present until its
+/// terminal switch has completed and the scheduler reaper has released the
+/// exact generation. External owner registries use this boundary before
+/// freeing raw execution-owner context.
+pub fn existsIdentity(id: u32, generation: u64) bool {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    const target = findByIdentityLocked(id, generation) orelse return false;
+    return target.state != .unused;
+}
+
 pub fn releaseDead(id: u32) bool {
     const irq_flags = interrupts.saveAndDisable();
     const target = findByIdLocked(id) orelse {

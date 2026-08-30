@@ -1,6 +1,7 @@
 // Runtime, scheduler, and launcher completion for kernel startup.
 
 const boot_status = @import("boot_status.zig");
+const bootscreen = @import("bootscreen.zig");
 const config = @import("config");
 const deadman = @import("deadman.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
@@ -31,6 +32,7 @@ fn reclaimTaskStackCache(requested_stacks: u32) u32 {
 pub fn initTaskRuntime() bool {
     if (task_runtime_initialized) return true;
 
+    bootscreen.setStatus("Task-System starten");
     if (!task.init()) {
         return false;
     }
@@ -38,6 +40,7 @@ pub fn initTaskRuntime() bool {
     log.puts("  Task system ");
     log.puts("[OK]\r\n");
 
+    bootscreen.setStatus("Scheduler starten");
     if (!scheduler.init()) {
         return false;
     }
@@ -45,6 +48,7 @@ pub fn initTaskRuntime() bool {
     log.puts("[OK]\r\n");
 
     const acpi_info = platform_boot.acpiInfo() orelse return false;
+    bootscreen.setStatus("SMP starten");
     if (!smp.startApplicationProcessors(acpi_info)) return false;
     // APs must be online before runtime R4D registration so new INTx/MSI
     // routes can select an actual online target at their one-vector boundary.
@@ -52,24 +56,28 @@ pub fn initTaskRuntime() bool {
     log.puts("  SMP foundation ");
     log.puts("[OK]\r\n");
 
+    bootscreen.setStatus("Service-IPC starten");
     if (!service_ipc.startRuntimeWorker()) {
         return false;
     }
     log.puts("  Service IPC worker ");
     log.puts("[OK]\r\n");
 
+    bootscreen.setStatus("Treiberarbeit starten");
     if (!driver_work.init()) {
         return false;
     }
     log.puts("  Driver workqueue ");
     log.puts("[OK]\r\n");
 
+    bootscreen.setStatus("Block-Worker starten");
     if (!block_storage.initRuntimeWorker()) {
         return false;
     }
     log.puts("  Block worker ");
     log.puts("[OK]\r\n");
 
+    bootscreen.setStatus("Seitencache starten");
     if (!page_cache.startPolicyWorker()) {
         return false;
     }
@@ -81,6 +89,7 @@ pub fn initTaskRuntime() bool {
 }
 
 pub fn start() noreturn {
+    bootscreen.setStatus("Protokolle laden");
     const r4p_start = loader_perf.beginR4pRuntime();
     r4p.loadAll();
     loader_perf.finishR4pRuntime(r4p_start);
@@ -92,10 +101,19 @@ pub fn start() noreturn {
         fatal.kernelFatal(.runtime, "Task runtime init failed");
     }
 
+    // The platform timer handoff deliberately returns to the single-threaded
+    // boot path with IF=0. Newly created tasks enable interrupts in their
+    // trampoline, but kernel-main keeps executing on its original stack and
+    // therefore needs an explicit runtime boundary. Without this transition,
+    // a USB block worker can correctly park for one timer tick while the
+    // launcher spins with IF=0, preventing the very wakeup it is waiting for.
+    interrupts.enable();
+
     if (config.enable_page_fault_test) triggerPageFaultTest();
 
     // Runtime diagnostic, deliberately last in the boot: everything the
     // deadman scans (registry, timer, console sinks) is final here.
+    bootscreen.setStatus("Watchdog starten");
     if (deadman.start()) {
         boot_status.statusLine("  Deadman watchdog [OK]\r\n");
     } else {
@@ -104,6 +122,7 @@ pub fn start() noreturn {
     }
 
     log.puts("\r\n  Launcher [START]\r\n");
+    bootscreen.setStatus("Launcher starten");
     const loaded_config = loader_boot.config() orelse fatal.kernelFatal(.runtime, "Loader boot state missing");
     fatal.setBootPhase(.shell);
     shell_launcher.start(loaded_config, memory_boot.usableBytes());

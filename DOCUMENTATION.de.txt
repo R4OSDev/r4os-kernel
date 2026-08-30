@@ -5,6 +5,77 @@ Dieses Repository enthaelt den R4OS-Kernel fuer x86_64, seine Limine-
 Bootintegration, den Linker, zwingend eingebaute Bestandteile und kernelnahe
 Tests. Der Kernel wird fest in ReleaseSafe und ohne SIMD gebaut.
 
+Zweizeiliger frueher Bootstatus seit 0.71.11
+---------------------------------------------
+
+Der fruehe Framebuffer-Bootscreen reserviert unter dem Ladebalken genau zwei
+begrenzte Textzeilen. Zeile eins wird vor jedem potentiell blockierenden
+Bootschritt aktualisiert; der R4D-Plan nennt vor Laden und Initialisierung
+jeden konfigurierten Treiber als `Treiber: NAME`. Zeile zwei bleibt bei einem
+fehlerfreien Start ausserhalb des Dienst-Autostarts leer. Waehrend dieses
+Abschnitts nennt sie erst `Dienstplan laden` und danach vor jedem Start
+`Dienst: NAME`. Der synchrone Startpfad praezisiert bei Bedarf mit
+`NAME: Pfad pruefen`, `NAME: laden` und `NAME: gestartet`; das erreichte
+Listenende erscheint als `Dienstplan fertig`. Begrenzte `SERVMAN:`-Marker
+unterscheiden danach Programm-, Thread- und Instanzende, die Grenze vor und
+nach Freigabe des Execution-Pins, Scheduler-Task-, I/O-, Ausgabe-, Kontext-
+und Imageabbau, Completion-Bereitschaft sowie die Rueckgabe an den Bootstarter.
+Vor dem Desktopstart wird dieses fluechtige Detail geloescht. Der erste
+erkannte, handlungsrelevante Fehler ersetzt das Detail dauerhaft. Spaetere
+Folgefehler verdecken ihn nicht.
+
+Beim anschliessenden Shellstart zeigt Zeile zwei vor jeder moeglicherweise
+blockierenden Grenze Pfadauflosung, API-Vorbereitung, Slot-/Completion-
+Reservierung, Header-/Image-Laden, Stack, Instanz, Task, Thread, Publikation,
+Ready-Aufnahme, gestarteten Shelltask, Instanzbindung und den Aufruf von
+`R4XStart`. Bleibt `R4XStart aufrufen` sichtbar, ist der Benutzercode erreicht,
+hat aber noch keinen ersten nutzbaren Frame mit `boot_ready` gemeldet. Die
+gleichen Stufen stehen begrenzt im Bootlog.
+
+Innerhalb der Pfadauflosung prueft der Shellstart die Volume-Spur zuerst ohne
+Warten. `FS-Sperre wartet` bezeichnet einen fremden Dateisystembesitzer; danach
+gilt unveraendert die normale begrenzte Aufnahme. `Dateipfad suchen` bedeutet,
+dass die Spur bereits gehoert und die VFS-/NTFS-Suche laeuft. Diese Probe
+aendert weder Startsemantik noch Dateisystem-Timeout.
+
+Ist der Halter generationstreu erreichbar, zeigt Zeile zwei statt des
+generischen Wartetextes `MODUL: AKTIVITAET`. Der Kernel pinnt dazu erst die
+exakte Taskgeneration und nennt danach bevorzugt den Scheduler-Wartegrund,
+sonst den Dateinamen des asynchronen Requests oder seine kurze Request-Art.
+`FS-Halter fehlt` trennt einen nicht mehr erreichbaren Besitzer von einem
+lebenden blockierten Request. Task-ID, Generation und Request-Art stehen
+zusaetzlich vollstaendig im Bootlog.
+
+Ein natuerlich zurueckgekehrter ProgramThread uebergibt seinen Task-Speicher
+mit `exitCurrentAndRetire` an den Scheduler-Reaper. Er behaelt den Besitz an
+seinem Kernel-Epilog, bis der generationengepruefte Execution-Pin geloest und
+die exakte Scheduler-Task-Generation vollstaendig entfernt ist. Der bereits
+geweckte Programm-Reaper darf einen solchen `exited`-Thread waehrend dieser
+Uebergabe weder hart beenden noch zur Freigabe beanspruchen. Erst nach dem
+terminalen Kontextwechsel und der unabhaengigen Task-Freigabe folgen
+ProgramThread-, I/O- und Payload-Abbau; hart beendete Threads bleiben
+Programm-Reaper-Besitz. Damit konkurrieren nicht mehr zwei Reaper um denselben
+terminalen Task-Uebergang.
+
+Die feste Stream-Slot-Tabelle veroeffentlicht unter der IRQ-/SMP-Grenze eine
+kleine generationengepruefte Besitzer- und Volume-Projektion. Die Freigabe
+eines ProgramThreads beziehungsweise Programms benoetigt ohne eigene
+Stream-Lease keine Dateisystem-Sperre. Andernfalls versucht der Programm-Reaper
+nur die tatsaechlich betroffenen Volume-Spuren einzeln und ohne Warten
+aufzunehmen. Eine belegte relevante Spur stellt den Abbau zurueck; fremde
+Dateisystemarbeit auf anderen Volumes kann ihn nicht mehr aufhalten. Dieselbe
+Projektion serialisiert die Reservierung der 16 festen Slots auch zwischen
+gleichzeitigen Stream-Starts auf verschiedenen Volumes.
+
+Beide Zeilen werden bei jeder Aenderung vollstaendig geloescht und mit dem
+eingebauten 8x8-Font neu gezeichnet. Hoechstens 32 druckbare ASCII-Bytes,
+Breitenclipping sowie eine skalierte grosse und eine unskalierte kleine
+Geometrie verhindern Ueberlagerungen und Zeichenreste. Der Pfad reserviert
+keinen Speicher und benoetigt weder Dateisystem noch Dienst oder Desktop.
+Bootlog, Fatalbehandlung und Crashscreen behalten ihre vollstaendige Diagnose-
+und Anzeigesemantik; bei der Shellbereitschaft wird der Bootrenderer wie
+bisher ohne Uebermalen der ersten nutzbaren Ausgabe abgegeben.
+
 Build
 -----
 
@@ -80,6 +151,15 @@ traegt auch der Link-TRB das Chain-Bit, und Fehler auf jedem Segment werden
 dem exakten Transfer zugeordnet. Timeout, Stall/Clear-Halt, Reset, Hotplug und
 Unload beseitigen nur die zugehoerigen Generationen. Ein nicht haltbarer
 Controller vetoisiert den Unload und behaelt seine Ressourcen.
+
+Eine USB-Bootdeadline behaelt die globale IRQ-/SMP-Serialisierung nur fuer
+die atomare Uhrabfrage und gibt sie vor jedem moeglichen Parken des
+Block-Workers wieder frei. Nach dem Aufbau der Task-Runtime aktiviert der
+bereits laufende `kernel-main`-Task Interrupts ausdruecklich; anders als neu
+erzeugte Tasks durchlaeuft er keinen Task-Trampolin, der diesen Schritt fuer
+ihn uebernehmen koennte. Damit koennen zeitgesteuerte USB-Completions und
+Watchdogs auch dann fortschreiten, wenn der Launcher als einziger anderer
+Task aktiv ist.
 
 Kanonischer Display-Presentpfad seit 0.69.48
 --------------------------------------------

@@ -1,6 +1,7 @@
 const boot_config = @import("boot_config.zig");
 const audio_boot = @import("audio_boot.zig");
 const bootlog = @import("bootlog.zig");
+const bootscreen = @import("bootscreen.zig");
 const keyboard = @import("../driver/input/keyboard.zig");
 const mouse = @import("../driver/input/mouse.zig");
 const driver_registry = @import("../driver/registry.zig");
@@ -145,6 +146,7 @@ fn addIfNotDisabled(name: []const u8, config: *const boot_config.Config) void {
 }
 
 fn loadPlanned(name: []const u8) void {
+    bootscreen.setDriver(name);
     bootlog.puts("[PLAN] load ");
     bootlog.puts(name);
     bootlog.puts("\r\n");
@@ -169,6 +171,14 @@ fn loadPlanned(name: []const u8) void {
     recordLoadResult(result);
     reportAudioR4dPlan(name, result);
     if (!r4d.runtimeLoadSucceeded(result)) {
+        switch (result) {
+            // A configured optional driver may report init-failed simply
+            // because its device is absent. File/format/load failures are
+            // different: they are actionable boot-image errors and belong
+            // in the second bootscreen row.
+            .name_invalid, .file_missing, .invalid_file, .load_failed => bootscreen.setDriverError(name),
+            .init_failed, .loaded, .already_active => {},
+        }
         bootlog.puts("[PLAN][WARN] load failed ");
         bootlog.puts(name);
         bootlog.puts(" result=");

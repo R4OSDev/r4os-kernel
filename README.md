@@ -4,6 +4,29 @@ This repository contains the x86_64 R4OS kernel, Limine boot integration,
 required built-in facilities, and kernel-specific tests. The kernel consumes
 the separate platform Contract and does not define optional Runtime-R4L APIs.
 
+The early framebuffer boot screen reserves two bounded status rows below its
+progress bar. Row one is updated before each potentially blocking boot step
+and names every configured R4D before load and initialization. Row two stays
+blank outside service autostart, where it transiently names the service being
+started and can distinguish path validation, R4X loading, successful spawn and
+the completed service plan. Bounded ServiceManager lifecycle markers then
+cover foreground program return through handback to the boot launcher. The
+configured shell launch also reports path, loader, stack, registry, task,
+publication and R4XStart boundaries. The first recognized actionable error
+replaces that detail and is preserved. Both rows are fully cleared on every
+redraw; fatal reports and the crash screen retain ownership of the complete
+failure diagnosis.
+
+Shell path resolution distinguishes `FS-Sperre wartet` (another request owns
+the boot-volume lane) from `Dateipfad suchen` (the VFS/NTFS lookup is active).
+The immediate probe is observational; normal bounded gate acquisition and
+launch behavior remain unchanged.
+
+An occupied lane is attributed only after pinning its exact task generation.
+The visible `MODULE: ACTIVITY` names the R4X owner and preferably its scheduler
+wait reason; `FS-Halter fehlt` denotes an owner generation that cannot be
+pinned. Numeric owner and request-kind evidence remains in the boot log.
+
 ## Build and validation
 
 On Windows:
@@ -63,6 +86,13 @@ pending HID transfer and storage transfer to coexist; the event ring wakes by
 INTx when routed and retains bounded polling as fallback. Bulk TDs span up to
 64 KiB in page-bounded TRBs, including a chained ring wrap. Failed controller
 halt vetoes unload.
+
+A USB boot deadline holds the global IRQ/SMP serialization only while
+sampling its clocks and releases it before the block worker can park. Once the
+task runtime is complete, the already-running `kernel-main` task explicitly
+enables interrupts because it does not pass through the trampoline used by
+new tasks. Timer-driven USB completions and watchdog wakes therefore continue
+while the launcher is the only other runnable task.
 
 DriverApi v22 admits one owner-bound synchronous display-blit backend.
 R4DRAW normalizes complete XRGB32 generations with at most eight regions
@@ -143,6 +173,20 @@ requests rescheduling, but a switch is consumed only after queue and owner
 state is published, either at a lock-safe synchronous return point or at the
 existing post-handler/EOI IRQ boundary. Bounded mutex role donation covers
 short inversions without creating an unbounded high-priority lane.
+
+A naturally returned ProgramThread transfers Task storage to the scheduler
+reaper through `exitCurrentAndRetire`. It keeps ownership of its kernel exit
+epilogue until it has released the generation-checked execution pin and that
+reaper has removed the exact Task generation. The program reaper waits instead
+of killing or claiming the `exited` owner while either boundary remains;
+hard-killed threads remain program-reaper-owned. This separates Task release
+from ProgramThread and payload teardown across the terminal context switch.
+The fixed stream-slot table publishes a generation-checked owner-to-volume
+projection. Stream teardown therefore takes no filesystem gate for an owner
+without leases and tries only each volume that actually contains one of its
+slots. A busy relevant lane defers retirement without blocking the program
+reaper; unrelated filesystem work no longer participates. The same projection
+serializes fixed-slot reservation across concurrent volumes.
 
 Console input can use an optional generation-bound wait while legacy key polls
 and bulk reads remain available. Console output is retained in sealed source

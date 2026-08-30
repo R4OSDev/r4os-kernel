@@ -203,7 +203,7 @@ var file_delete_if_match_buffer: [32768]u8 = undefined;
 // A legal public path contains at most this many Unicode characters and can
 // therefore never contain more directory components.  Keeping the complete
 // ancestor chain bounded here lets directory mutations fail closed instead of
-// falling back to an unbounded allocation while the global filesystem gate is
+// falling back to an unbounded allocation while the owning volume gate is
 // held.
 const max_stream_ancestors: usize = @as(usize, r4x_api.file_path_max_chars);
 
@@ -286,6 +286,24 @@ const OwnedCreateOnlyState = enum(u8) {
 
 var stream_slots: [max_stream_slots]StreamSlot = .{StreamSlot{}} ** max_stream_slots;
 var stream_generation: u32 = 1;
+
+// The filesystem request gates are volume-local, while StreamSlot storage is
+// shared by every volume. Keep the small allocation/owner projection behind
+// the kernel's IRQ/SMP serialization boundary. Lifecycle cleanup can then
+// discover the exact occupied volume lanes without reading mutable slot
+// payloads from unrelated lanes or acquiring all 26 filesystem gates.
+const StreamSlotOwnership = struct {
+    reserved: bool = false,
+    drive_letter: u8 = 0,
+    owner_kind: StreamOwner.Kind = .kernel_task,
+    owner_id: u32 = 0,
+    owner_generation: u64 = 0,
+    owner_program_id: u32 = 0,
+    owner_program_generation: u64 = 0,
+};
+
+var stream_slot_ownership: [max_stream_slots]StreamSlotOwnership =
+    .{StreamSlotOwnership{}} ** max_stream_slots;
 
 pub const boot_log_flag_wrapped = r4x_api.boot_log_flag_wrapped;
 
@@ -1327,8 +1345,19 @@ pub fn fileStreamBegin(path_ptr: [*:0]const u8, flags: u32) callconv(.c) i32 {
     // Slash variants, case variants and relative paths can otherwise open two
     // logical owners for the same file.
     // Never evict an unrelated active stream when the bounded table is full.
-    const reserved_slot = freeStreamSlot() orelse return file_stream_error_io;
-    rememberStreamSlot(reserved_slot, target.path, target.drive_ref.letter, targetOnBootVolume(target), parent, entry_name, flags);
+    const owner = currentStreamOwner();
+    const reserved_slot = reserveStreamSlot(target.drive_ref.letter, owner) orelse
+        return file_stream_error_io;
+    rememberStreamSlot(
+        reserved_slot,
+        target.path,
+        target.drive_ref.letter,
+        targetOnBootVolume(target),
+        parent,
+        entry_name,
+        flags,
+        owner,
+    );
     // Resolve and bind the complete physical ancestor chain before the first
     // namespace mutation. Overflow, a missing component or an I/O ambiguity
     // therefore leaves neither a half-described slot nor a newly-created file.
@@ -1406,7 +1435,7 @@ pub fn fileStreamWrite(path_ptr: [*:0]const u8, offset: u64, data_ptr: [*]const 
         return file_stream_error_io;
     if (entry == null) return file_stream_error_not_found;
 
-    // Slot discovery must happen while the global filesystem gate is held.
+    // Slot discovery must happen while the matching volume gate is held.
     // Looking up a raw slot pointer and then blocking on the gate allowed an
     // abort/delete to clear and reuse that storage for another stream (ABA).
     if (findOwnedStreamSlotForResolved(target.drive_ref.letter, targetOnBootVolume(target), parent, entry, baseName(target.path))) |slot| {
@@ -2926,9 +2955,17 @@ fn copyFixedZ(out: []u8, value: []const u8) void {
     if (count > 0) @memcpy(out[0..count], value[0..count]);
 }
 
-fn rememberStreamSlot(slot: *StreamSlot, raw_path: []const u8, drive_letter: u8, on_boot_volume: bool, parent_node: vfs.NodeRef, entry_name: []const u8, flags: u32) void {
+fn rememberStreamSlot(
+    slot: *StreamSlot,
+    raw_path: []const u8,
+    drive_letter: u8,
+    on_boot_volume: bool,
+    parent_node: vfs.NodeRef,
+    entry_name: []const u8,
+    flags: u32,
+    owner: ?StreamOwner,
+) void {
     if (raw_path.len > max_api_path or entry_name.len > max_api_path) return;
-    const owner = currentStreamOwner();
     slot.* = .{
         .active = true,
         .ready = false,
@@ -2956,7 +2993,7 @@ fn rememberStreamSlot(slot: *StreamSlot, raw_path: []const u8, drive_letter: u8,
 /// Lexical "."/".." components are normalized before each prefix is resolved,
 /// so traversed-but-popped directories do not become false ancestors.  Entry
 /// resolution preserves FAT long/short-name aliasing and NTFS record
-/// generations. The caller holds the global filesystem request gate.
+/// generations. The caller holds the matching volume request gate.
 fn bindStreamSlotAncestors(
     slot: *StreamSlot,
     volume: vfs.Volume,
@@ -3007,7 +3044,7 @@ fn bindStreamSlotAncestors(
     if (slot.ancestor_count == 0) return expected_parent == volume.rootNode();
     // Resolve each component exactly once from its already-proven parent.
     // Re-resolving every growing prefix would turn a deep Begin into quadratic
-    // directory walks while holding the global filesystem gate.
+    // directory walks while holding the matching volume gate.
     var current_parent = volume.rootNode();
     var index: usize = 0;
     while (index < slot.ancestor_count) : (index += 1) {
@@ -3385,12 +3422,35 @@ fn reapDeadStreamSlots() void {
     }
 }
 
-fn freeStreamSlot() ?*StreamSlot {
+fn reserveStreamSlot(drive_letter: u8, owner: ?StreamOwner) ?*StreamSlot {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
     var i: usize = 0;
     while (i < stream_slots.len) : (i += 1) {
-        if (!stream_slots[i].active) return &stream_slots[i];
+        if (stream_slot_ownership[i].reserved) continue;
+        stream_slot_ownership[i] = .{
+            .reserved = true,
+            .drive_letter = drive_letter,
+            .owner_kind = if (owner) |current| current.kind else .kernel_task,
+            .owner_id = if (owner) |current| current.id else 0,
+            .owner_generation = if (owner) |current| current.generation else 0,
+            .owner_program_id = if (owner) |current| current.program_id else 0,
+            .owner_program_generation = if (owner) |current| current.program_generation else 0,
+        };
+        return &stream_slots[i];
     }
     return null;
+}
+
+fn releaseStreamSlotOwnership(slot: *StreamSlot) void {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    var i: usize = 0;
+    while (i < stream_slots.len) : (i += 1) {
+        if (&stream_slots[i] != slot) continue;
+        stream_slot_ownership[i] = .{};
+        return;
+    }
 }
 
 fn nextStreamGeneration() u32 {
@@ -3441,37 +3501,146 @@ fn clearStreamSlot(slot: *StreamSlot) void {
     slot.owner_generation = 0;
     slot.owner_program_id = 0;
     slot.owner_program_generation = 0;
+    // Publish the entry as reusable only after every payload field has been
+    // cleared. A StreamBegin on another volume can otherwise reserve and
+    // initialize the same fixed slot while this owner is still wiping it.
+    releaseStreamSlotOwnership(slot);
+}
+
+const StreamCleanupOwner = struct {
+    program_id: u32,
+    program_generation: u64,
+    task_id: u32 = 0,
+    task_generation: u64 = 0,
+    task_scoped: bool = false,
+};
+
+const StreamCleanupPlan = struct {
+    slots_by_lane: [fs_request.drive_gate_count]u16 =
+        .{0} ** fs_request.drive_gate_count,
+    invalid_drive: bool = false,
+
+    fn hasSlots(self: *const StreamCleanupPlan) bool {
+        for (self.slots_by_lane) |slot_mask| {
+            if (slot_mask != 0) return true;
+        }
+        return false;
+    }
+};
+
+fn streamDriveLane(drive_letter: u8) ?u8 {
+    const upper = if (drive_letter >= 'a' and drive_letter <= 'z')
+        drive_letter - ('a' - 'A')
+    else
+        drive_letter;
+    if (upper < 'A' or upper > 'Z') return null;
+    return upper - 'A';
+}
+
+fn streamOwnershipMatches(owner: *const StreamSlotOwnership, cleanup: StreamCleanupOwner) bool {
+    if (!owner.reserved or
+        owner.owner_kind != .program or
+        owner.owner_program_id != cleanup.program_id or
+        owner.owner_program_generation != cleanup.program_generation)
+        return false;
+    return !cleanup.task_scoped or
+        (owner.owner_id == cleanup.task_id and
+            owner.owner_generation == cleanup.task_generation);
+}
+
+fn streamSlotMatchesCleanup(slot: *const StreamSlot, cleanup: StreamCleanupOwner) bool {
+    if (!slot.active or
+        slot.owner_kind != .program or
+        slot.owner_program_id != cleanup.program_id or
+        slot.owner_program_generation != cleanup.program_generation)
+        return false;
+    return !cleanup.task_scoped or
+        (slot.owner_id == cleanup.task_id and
+            slot.owner_generation == cleanup.task_generation);
+}
+
+fn streamCleanupPlan(cleanup: StreamCleanupOwner) StreamCleanupPlan {
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    var plan: StreamCleanupPlan = .{};
+    var i: usize = 0;
+    while (i < stream_slot_ownership.len) : (i += 1) {
+        const owner = &stream_slot_ownership[i];
+        if (!streamOwnershipMatches(owner, cleanup)) continue;
+        const lane = streamDriveLane(owner.drive_letter) orelse {
+            plan.invalid_drive = true;
+            continue;
+        };
+        plan.slots_by_lane[lane] |= @as(u16, 1) << @intCast(i);
+    }
+    return plan;
+}
+
+fn streamOwnershipStillMatches(index: usize, lane: u8, cleanup: StreamCleanupOwner) bool {
+    if (index >= stream_slot_ownership.len) return false;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    const owner = &stream_slot_ownership[index];
+    return streamOwnershipMatches(owner, cleanup) and
+        streamDriveLane(owner.drive_letter) == lane;
+}
+
+fn releaseStreamSlotsForOwner(cleanup: StreamCleanupOwner) bool {
+    const plan = streamCleanupPlan(cleanup);
+    if (plan.invalid_drive) return false;
+    if (!plan.hasSlots()) return true;
+
+    var lane_index: usize = 0;
+    while (lane_index < plan.slots_by_lane.len) : (lane_index += 1) {
+        const slot_mask = plan.slots_by_lane[lane_index];
+        if (slot_mask == 0) continue;
+        const lane: u8 = @intCast(lane_index);
+        var req = fs_request.tryBegin(.stream_abort, 'A' + lane) orelse return false;
+        var lane_released = true;
+        var slot_index: usize = 0;
+        while (slot_index < stream_slots.len) : (slot_index += 1) {
+            const slot_bit = @as(u16, 1) << @intCast(slot_index);
+            if ((slot_mask & slot_bit) == 0 or
+                !streamOwnershipStillMatches(slot_index, lane, cleanup))
+                continue;
+            const slot = &stream_slots[slot_index];
+            if (!streamSlotMatchesCleanup(slot, cleanup)) {
+                lane_released = false;
+                continue;
+            }
+            if (slot.publish_started and !settlePublishStreamSlot(slot)) {
+                lane_released = false;
+                continue;
+            }
+            if (!slot.active) continue;
+            clearStreamSlot(slot);
+        }
+        fs_request.finish(&req, lane_released);
+        if (!lane_released) return false;
+    }
+
+    const remaining = streamCleanupPlan(cleanup);
+    return !remaining.invalid_drive and !remaining.hasSlots();
 }
 
 /// R4X calls this after all ProgramThreads and async-I/O workers belonging to
-/// the exact process generation have drained. Acquiring the normal FS gate
-/// keeps slot reclamation serialized with Begin/Write/Finish/Abort.
+/// the exact process generation have drained. The immutable owner projection
+/// identifies only volumes that contain matching stream leases; each volume
+/// is acquired independently and without blocking the lifecycle reaper.
 pub fn releaseStreamSlotsForProgram(instance_id: u32, instance_generation: u64) bool {
     if (instance_id == 0 or instance_generation == 0) return true;
-    var req = fs_request.begin(.stream_abort, 0) orelse return false;
-    var all_released = true;
-    defer fs_request.finish(&req, all_released);
-    var i: usize = 0;
-    while (i < stream_slots.len) : (i += 1) {
-        const slot = &stream_slots[i];
-        if (!slot.active or
-            slot.owner_kind != .program or
-            slot.owner_program_id != instance_id or
-            slot.owner_program_generation != instance_generation)
-            continue;
-        if (slot.publish_started and !settlePublishStreamSlot(slot)) {
-            all_released = false;
-            continue;
-        }
-        if (!slot.active) continue;
-        clearStreamSlot(slot);
-    }
-    return all_released;
+    return releaseStreamSlotsForOwner(.{
+        .program_id = instance_id,
+        .program_generation = instance_generation,
+    });
 }
 
 /// Releases streams owned by one exact logical ProgramThread. The R4X
 /// lifecycle calls this only after all caller-bound async requests are gone
 /// (or have been cancelled and physically detached during process retire).
+/// As with process-wide cleanup, only volume lanes containing matching leases
+/// participate. A busy relevant lane defers retirement and never parks the
+/// lifecycle reaper; a thread without streams needs no filesystem gate.
 pub fn releaseStreamSlotsForProgramThread(
     instance_id: u32,
     instance_generation: u64,
@@ -3479,29 +3648,13 @@ pub fn releaseStreamSlotsForProgramThread(
     task_generation: u64,
 ) bool {
     if (instance_id == 0 or instance_generation == 0 or task_id == 0 or task_generation == 0) return true;
-    var req = fs_request.begin(.stream_abort, 0) orelse return false;
-    var all_released = true;
-    defer fs_request.finish(&req, all_released);
-    var i: usize = 0;
-    while (i < stream_slots.len) : (i += 1) {
-        const slot = &stream_slots[i];
-        if (!slot.active or
-            slot.owner_kind != .program or
-            slot.owner_program_id != instance_id or
-            slot.owner_program_generation != instance_generation or
-            slot.owner_id != task_id or
-            slot.owner_generation != task_generation)
-            continue;
-        if (slot.publish_started and !settlePublishStreamSlot(slot)) {
-            all_released = false;
-            continue;
-        }
-        if (!slot.active) continue;
-        // As in process retirement, leave any caller-owned partial file in
-        // place for diagnosis; only the in-memory lease is retired.
-        clearStreamSlot(slot);
-    }
-    return all_released;
+    return releaseStreamSlotsForOwner(.{
+        .program_id = instance_id,
+        .program_generation = instance_generation,
+        .task_id = task_id,
+        .task_generation = task_generation,
+        .task_scoped = true,
+    });
 }
 
 fn hasActiveStreamInSubtree(

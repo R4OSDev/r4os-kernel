@@ -780,9 +780,9 @@ pub fn exitCurrent() noreturn {
     exitCurrentImpl(false);
 }
 
-// The boot owner has no external lifecycle reaper. Mark it for deferred
-// release before the terminal context switch so it cannot remain in the
-// runtime registry after its successful handoff.
+// A task that completes its own epilogue may transfer Task storage to the
+// scheduler reaper before the terminal switch. Any external execution-owner
+// record remains stable until the exact Task generation has disappeared.
 pub fn exitCurrentAndRetire() noreturn {
     exitCurrentImpl(true);
 }

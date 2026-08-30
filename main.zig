@@ -54,7 +54,7 @@ export fn kmain() callconv(.c) noreturn {
     _ = boot_info.init();
     _ = boot_display.init();
     boot_status.beginBootLogRedirect();
-    bootscreen.setPhase(.framebuffer);
+    beginBootStep(.framebuffer, "Startbild");
     if (config.enable_kernel_fatal_test) fatal.kernelFatal(.entry, "Kernel fatal crash test");
     if (config.enable_zig_panic_test) @panic("Zig panic crash test");
     if (config.enable_crash_screen_test) {
@@ -84,77 +84,80 @@ export fn kmain() callconv(.c) noreturn {
         interrupts.haltForever();
     }
     fatal.setBootPhase(.cpu);
-    bootscreen.setPhase(.cpu);
+    beginBootStep(.cpu, "CPU initialisieren");
     cpu_boot.init();
     fatal.setBootPhase(.timer);
-    bootscreen.setPhase(.timer);
+    beginBootStep(.timer, "Timer initialisieren");
     timer_boot.init();
     fatal.setBootPhase(.driver);
-    bootscreen.setPhase(.driver);
+    beginBootStep(.driver, "Basistreiber laden");
     driver_boot.init();
     fatal.setBootPhase(.input);
-    bootscreen.setPhase(.input);
+    beginBootStep(.input, "Eingabe initialisieren");
     input_boot.initKeyboard();
     input_boot.initMouse();
     input_boot.completePs2();
     fatal.setBootPhase(.entry);
-    bootscreen.setPhase(.intro);
+    beginBootStep(.intro, "Startinfo laden");
     requireBootStep(boot_intro.init(), .entry, "Boot intro failed");
     fatal.setBootPhase(.memory);
-    bootscreen.setPhase(.memory);
+    beginBootStep(.memory, "Speicher initialisieren");
     requireBootStep(memory_boot.initCore(), .memory, "Memory boot failed");
     memory_boot.dumpBlockSummary();
     fatal.setBootPhase(.storage);
-    bootscreen.setPhase(.storage_foundation);
+    beginBootStep(.storage_foundation, "Laufwerke vorbereiten");
     requireBootStep(storage_boot.initFoundation(), .storage, "Storage foundation failed");
     fatal.setBootPhase(.module);
-    bootscreen.setPhase(.module);
+    beginBootStep(.module, "Module laden");
     module_boot.init();
     fatal.setBootPhase(.platform);
-    bootscreen.setPhase(.platform);
+    beginBootStep(.platform, "Plattform erfassen");
     requireBootStep(platform_boot.initDeviceMappings(), .platform, "Platform boot failed");
     fatal.setBootPhase(.usb);
-    bootscreen.setPhase(.usb_preload);
+    beginBootStep(.usb_preload, "USB-Protokolle laden");
     requireBootStep(usb_protocol_preload_boot.init(), .usb, "USB protocol preload failed");
     fatal.setBootPhase(.service);
-    bootscreen.setPhase(.service);
+    beginBootStep(.service, "Dienste vorbereiten");
     service_boot.init();
     fatal.setBootPhase(.platform);
     const pcie_status = platform_boot.pcieStatus() orelse fatal.kernelFatal(.platform, "PCIe status missing after platform boot");
     fatal.setBootPhase(.storage);
-    bootscreen.setPhase(.storage_controllers);
+    beginBootStep(.storage_controllers, "Controller starten");
     requireBootStep(storage_boot.initControllers(pcie_status), .storage, "Storage controller boot failed");
     fatal.setBootPhase(.loader);
-    bootscreen.setPhase(.loader);
+    beginBootStep(.loader, "System laden");
     requireBootStep(loader_boot.initFilesystemLoader(), .loader, "Loader boot failed");
     requireBootStep(system_update_recovery_boot.recoverBeforeRuntime(), .loader, "System update recovery failed");
     requireBootStep(upload_claim_boot.recoverBeforeRuntime(), .loader, "Upload publish claim recovery failed");
     fatal.setBootPhase(.irq);
-    bootscreen.setPhase(.irq);
+    beginBootStep(.irq, "Interrupts starten");
     requireBootStep(platform_irq_boot.init(), .irq, "Platform IRQ boot failed");
     fatal.setBootPhase(.audio);
-    bootscreen.setPhase(.audio);
+    beginBootStep(.audio, "Audio vorbereiten");
     requireBootStep(audio_boot.init(), .audio, "Audio boot failed");
     fatal.setBootPhase(.network);
-    bootscreen.setPhase(.network);
+    beginBootStep(.network, "Netzwerk vorbereiten");
     requireBootStep(network_boot.init(), .network, "Network boot failed");
     fatal.setBootPhase(.usb);
-    bootscreen.setPhase(.usb_hid);
+    beginBootStep(.usb_hid, "USB-Eingabe starten");
     requireBootStep(usb_hid_boot.init(), .usb, "USB-HID boot failed");
     fatal.setBootPhase(.task_runtime);
-    bootscreen.setPhase(.task_runtime);
+    beginBootStep(.task_runtime, "Task-Runtime starten");
     requireBootStep(runtime_boot.initTaskRuntime(), .task_runtime, "Task runtime boot failed");
     fatal.setBootPhase(.driver_policy);
-    bootscreen.setPhase(.driver_policy);
+    beginBootStep(.driver_policy, "Treiberplan erstellen");
     requireBootStep(driver_policy_boot.init(), .driver_policy, "Driver policy boot failed");
     fatal.setBootPhase(.runtime);
-    bootscreen.setPhase(.runtime);
+    beginBootStep(.runtime, "Runtime vorbereiten");
+    bootscreen.setStatus("SMP pruefen");
     _ = smp.runAcceptanceProbeIfEnabled();
     // 0.56.2: Hintergrund-RX-Task - NACH initTaskRuntime (sonst von
     // task.init() gewischt) und NACH driver_policy_boot (NIC geladen).
+    bootscreen.setStatus("Netzwerk-Task starten");
     _ = net_core.startRxTask();
     // 0.59.13: DHCP acquisition follows the real R4D link in its own task.
     // It must start after the NIC modules and scheduler, just like net-rx.
+    bootscreen.setStatus("DHCP starten");
     _ = net_core.startDhcpTask();
     // Invasive correctness workloads are excluded from every normal kernel
     // artifact. The explicit -Dboot-selftests diagnostic kernel preserves
@@ -167,6 +170,7 @@ export fn kmain() callconv(.c) noreturn {
     }
     // 0.56.17: Autonomer Input-Poll-Task - NACH initTaskRuntime (sonst von
     // task.init() gewischt); pollt USB-HID im 10-ms-Takt ohne Konsumenten.
+    bootscreen.setStatus("USB-Polling starten");
     _ = usb_hid_boot.startPollTask();
     if (comptime config.enable_boot_selftests) {
         if (!sched_scheduler.prioritySelfTest()) fatal.kernelFatal(.runtime, "Boot scheduler priority selftest failed");
@@ -177,6 +181,7 @@ export fn kmain() callconv(.c) noreturn {
     // 0.59.10: Nur mit OPTION TASKREGISTRY selftest=yes. Die echte QEMU-
     // Abnahme belastet die dynamische Task-/Wait-/Stack-/Reserve-Linie;
     // normale Produktionsboots fuehren hier keinen Zusatztest aus.
+    bootscreen.setStatus("Task-Registry pruefen");
     _ = task_registry_selftest.runIfEnabled();
     // 0.56.15: Absichtlicher Kernel-Stack-Overflow (nur -Dstack-guard-test):
     // der Thread rennt in seine Guard-Page, erwartet wird ein sauberer
@@ -184,7 +189,13 @@ export fn kmain() callconv(.c) noreturn {
     if (comptime config.enable_stack_guard_test) {
         _ = sched_task.createKernelThread("st-overflow", stackGuardTestMain);
     }
+    bootscreen.setStatus("Runtime starten");
     return runtime_boot.start();
+}
+
+fn beginBootStep(phase: bootscreen.Phase, status: []const u8) void {
+    bootscreen.setPhase(phase);
+    bootscreen.setStatus(status);
 }
 
 fn stackGuardTestMain() callconv(.c) void {

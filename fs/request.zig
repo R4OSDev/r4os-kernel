@@ -84,6 +84,15 @@ pub const Guard = struct {
     active: bool = false,
 };
 
+pub const GateSnapshot = struct {
+    owner_task_id: u32 = 0,
+    owner_task_generation: u64 = 0,
+    kind: Kind = .file_info,
+    drive: u8 = 0,
+    depth: u32 = 0,
+    active_depth: u32 = 0,
+};
+
 const LaneState = struct {
     kind: Kind = .file_info,
     drive: u8 = 0,
@@ -132,22 +141,72 @@ pub fn summary() Summary {
     return out;
 }
 
+/// Returns the exact runtime owner of one occupied volume lane without
+/// acquiring it. Boot diagnostics use the generation to pin the Task before
+/// dereferencing its execution owner. A changing or boot-only owner is
+/// deliberately reported as unavailable rather than guessed.
+pub fn gateSnapshot(drive_letter: u8) ?GateSnapshot {
+    const plan = request_scope.single(drive_letter);
+    if (plan.count != 1) return null;
+    const lane = plan.lanes[0];
+    const gate = &request_gates[lane];
+    const owner_task_id = gate.owner;
+    const owner_task_generation = gate.owner_generation;
+    const depth = gate.depth;
+    if (owner_task_id == 0 or owner_task_generation == 0 or depth == 0 or gate.boot_owner) return null;
+    const state = lane_states[lane];
+    if (gate.owner != owner_task_id or
+        gate.owner_generation != owner_task_generation or
+        gate.depth != depth)
+        return null;
+    return .{
+        .owner_task_id = owner_task_id,
+        .owner_task_generation = owner_task_generation,
+        .kind = state.kind,
+        .drive = state.drive,
+        .depth = depth,
+        .active_depth = state.active_depth,
+    };
+}
+
 pub fn begin(kind: Kind, drive_letter: u8) ?Guard {
-    return beginPlan(kind, drive_letter, 0, request_scope.single(drive_letter));
+    return beginPlan(kind, drive_letter, 0, request_scope.single(drive_letter), .bounded_wait);
+}
+
+/// Starts a request only when every lane in its scope is immediately
+/// available. Lifecycle reapers use this form so ownership-free cleanup can
+/// be deferred without parking the reaper behind an unrelated volume owner.
+pub fn tryBegin(kind: Kind, drive_letter: u8) ?Guard {
+    return beginPlan(kind, drive_letter, 0, request_scope.single(drive_letter), .immediate);
 }
 
 pub fn beginPair(kind: Kind, first_drive: u8, second_drive: u8) ?Guard {
-    return beginPlan(kind, first_drive, second_drive, request_scope.pair(first_drive, second_drive));
+    return beginPlan(kind, first_drive, second_drive, request_scope.pair(first_drive, second_drive), .bounded_wait);
 }
 
-fn beginPlan(kind: Kind, drive_letter: u8, second_drive: u8, plan: request_scope.Plan) ?Guard {
+const GateAcquireMode = enum {
+    bounded_wait,
+    immediate,
+};
+
+fn beginPlan(
+    kind: Kind,
+    drive_letter: u8,
+    second_drive: u8,
+    plan: request_scope.Plan,
+    acquire_mode: GateAcquireMode,
+) ?Guard {
     var acquired_count: u8 = 0;
     const runtime_owned = scheduler.currentId() != null;
     if (runtime_owned) {
         while (acquired_count < plan.count) : (acquired_count += 1) {
             const lane = plan.lanes[acquired_count];
-            if (!acquireGate(lane)) {
-                stats.lock_timeouts +%= 1;
+            const acquired = switch (acquire_mode) {
+                .bounded_wait => acquireGate(lane),
+                .immediate => request_gates[lane].tryEnter(),
+            };
+            if (!acquired) {
+                if (acquire_mode == .bounded_wait) stats.lock_timeouts +%= 1;
                 releasePlan(plan, acquired_count);
                 return null;
             }

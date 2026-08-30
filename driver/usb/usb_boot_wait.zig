@@ -102,6 +102,11 @@ pub const Deadline = struct {
             .duration_tsc = duration_tsc,
             .fallback_tsc = fallback_tsc,
         };
+        // The sampled clocks need one short IRQ/SMP critical section, but the
+        // deadline lifetime must not own it. Runtime waits may park the block
+        // worker; carrying the legacy serialization token into that sleep
+        // would make the scheduler context switch recursively enter it.
+        interrupts.restore(flags);
         if (may_enable) interrupts.enable();
         return out;
     }
@@ -195,7 +200,14 @@ pub const Deadline = struct {
     }
 
     pub fn finish(self: *const Deadline) void {
-        interrupts.restore(self.flags);
+        // begin() already released its serialization token. Only restore the
+        // caller's interrupt-enable state here; restore() would incorrectly
+        // release a critical section owned by an enclosing caller.
+        if (interrupts.wereEnabled(self.flags)) {
+            interrupts.enable();
+        } else {
+            interrupts.disable();
+        }
     }
 };
 

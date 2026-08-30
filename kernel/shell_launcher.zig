@@ -1,6 +1,7 @@
 const boot_config = @import("boot_config.zig");
 const boot_perf = @import("boot_perf.zig");
 const bootlog = @import("bootlog.zig");
+const bootscreen = @import("bootscreen.zig");
 const drive = @import("../fs/drive.zig");
 const fatal = @import("fatal.zig");
 const k = @import("log.zig");
@@ -25,14 +26,17 @@ pub fn start(config: *const boot_config.Config, usable_bytes: u64) noreturn {
 
     if (drive.get('C')) |boot_drive| {
         const working_drive = drive.current() orelse boot_drive;
+        bootscreen.setStatus("Dienste starten");
         startServiceManagerBoot(boot_drive, working_drive);
 
+        bootscreen.setStatus("Desktop starten");
         switch (tryStartConfigured(boot_drive, working_drive, configured_path, configured_args)) {
             .ran => retireBootTaskAfterLaunch(),
             .not_found, .failed => {},
         }
 
         if (!samePath(configured_path, TERMINAL_FALLBACK_PATH)) {
+            bootscreen.setStatus("Terminal starten");
             switch (tryStartTerminalFallback(boot_drive, working_drive)) {
                 .ran => retireBootTaskAfterLaunch(),
                 .not_found => {
@@ -68,8 +72,10 @@ fn startServiceManagerBoot(boot_drive: *drive.Drive, working_drive: *drive.Drive
     bootlog.puts(SERVICE_MANAGER_BOOT_ARGS);
     bootlog.puts("\r\n");
 
+    bootscreen.setDetail("Dienstplan laden");
     const perf_start = loader_perf.beginServiceBoot();
     const result = r4x.runPath(boot_drive, SERVICE_MANAGER_BOOT_PATH, SERVICE_MANAGER_BOOT_ARGS, working_drive);
+    bootscreen.clearDetail();
     switch (result) {
         .ran => {
             loader_perf.finishServiceBoot(perf_start, loader_perf.service_boot_ran);
@@ -148,6 +154,7 @@ fn startRecoveryFallbacks(boot_drive: *drive.Drive, working_drive: *drive.Drive,
 }
 
 fn tryStartRecoveryFallback(boot_drive: *drive.Drive, working_drive: *drive.Drive, path: []const u8) r4x.RunResult {
+    bootscreen.setStatus("Recovery starten");
     bootlog.puts("[LAUNCH] external recovery shell=");
     bootlog.puts(path);
     bootlog.puts("\r\n");

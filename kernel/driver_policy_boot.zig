@@ -2,6 +2,7 @@
 
 const boot_config = @import("boot_config.zig");
 const bootlog = @import("bootlog.zig");
+const bootscreen = @import("bootscreen.zig");
 const driver_plan = @import("driver_plan.zig");
 const driver_registry = @import("../driver/registry.zig");
 const fatal = @import("fatal.zig");
@@ -159,6 +160,7 @@ fn runPolicy(loaded_config: *const boot_config.Config) void {
     else
         "driver policy applied with warnings";
 
+    bootscreen.setStatus("Treiber abschliessen");
     driver_registry.logRegistryToBootlog();
     current.registry_dumped = true;
     current.summary = driver_plan.lastSummary();

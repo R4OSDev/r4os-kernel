@@ -1,5 +1,6 @@
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const boot_status = @import("boot_status.zig");
+const bootscreen = @import("bootscreen.zig");
 const boot_perf = @import("boot_perf.zig");
 const crash = @import("crash.zig");
 const crash_screen = @import("crash_screen.zig");
@@ -40,6 +41,7 @@ pub fn recordFailure(phase: crash.BootPhase, message: []const u8) void {
         .message = .{},
     };
     pending_failure.message.set(message);
+    bootscreen.setError(message);
     boot_status.disableForCrash();
 }
 
@@ -54,12 +56,14 @@ pub fn haltPendingOrMessage(phase: crash.BootPhase, fallback_message: []const u8
 pub fn kernelFatal(phase: crash.BootPhase, message: []const u8) noreturn {
     current_phase = phase;
     boot_perf.failFatal();
+    bootscreen.setError(message);
     var report = crash.fromKernelFatal(phase, timer.tickCount(), message);
     renderAndHalt(&report);
 }
 
 pub fn zigPanic(message: []const u8) noreturn {
     boot_perf.failFatal();
+    bootscreen.setError(message);
     var report = crash.fromZigPanic(current_phase, timer.tickCount(), message);
     renderAndHalt(&report);
 }
