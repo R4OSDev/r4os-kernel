@@ -33,14 +33,17 @@ const GDT_OFFSET: usize = 0x900;
 const AP_STACK_SIZE: usize = 64 * 1024;
 const IA32_EFER: u32 = 0xC000_0080;
 const EFER_LME: u64 = 1 << 8;
+const EFER_LMA: u64 = 1 << 10;
 const AP_START_TIMEOUT_NS: u64 = 250_000_000;
 const AP_STOP_TIMEOUT_NS: u64 = 100_000_000;
 const ACCEPTANCE_TIMEOUT_NS: u64 = 10_000_000_000;
 const ACCEPTANCE_ITERATIONS: u64 = 4_000_000;
 const ACCEPTANCE_MIN_SPEEDUP_MILLI: u64 = 1050;
 const TRANSITION_CODE_SELECTOR: u16 = 0x08;
+const TRANSITION_PROTECTED_SELECTOR: u16 = 0x18;
 
 extern const r4os_ap_trampoline_start: u8;
+extern const r4os_ap_trampoline_protected_mode: u8;
 extern const r4os_ap_trampoline_long_mode: u8;
 extern const r4os_ap_trampoline_end: u8;
 extern fn r4os_read_cr0() callconv(.c) u64;
@@ -61,7 +64,17 @@ const TrampolineConfig = packed struct {
     far_padding: u16,
     gdt_limit: u16,
     gdt_base: u32,
+    progress: u8,
+    progress_padding: u8,
+    protected_offset: u32,
+    protected_selector: u16,
+    protected_padding: u16,
 };
+
+comptime {
+    std.debug.assert(@offsetOf(TrampolineConfig, "progress") == 0x4E);
+    std.debug.assert(@offsetOf(TrampolineConfig, "protected_offset") == 0x50);
+}
 
 pub const Status = struct {
     initialized: bool = false,
@@ -365,6 +378,7 @@ pub export fn r4os_ap_entry(index_raw: u64) callconv(.c) noreturn {
 
 fn prepareTrampoline(index: u32) ?u64 {
     const start = @intFromPtr(&r4os_ap_trampoline_start);
+    const protected_mode = @intFromPtr(&r4os_ap_trampoline_protected_mode);
     const long_mode = @intFromPtr(&r4os_ap_trampoline_long_mode);
     const end = @intFromPtr(&r4os_ap_trampoline_end);
     if (end <= start or end - start >= CONFIG_OFFSET) {
@@ -387,12 +401,13 @@ fn prepareTrampoline(index: u32) ?u64 {
     const source: [*]const u8 = @ptrFromInt(start);
     @memcpy(page[0 .. end - start], source[0 .. end - start]);
 
-    const transition_gdt = [3]u64{
+    const transition_gdt = [4]u64{
         0,
         0x00AF_9A00_0000_FFFF,
         0x00CF_9200_0000_FFFF,
+        0x00CF_9A00_0000_FFFF,
     };
-    const gdt_dest: *align(1) [3]u64 = @ptrFromInt(phys.physToVirt(low_page) + GDT_OFFSET);
+    const gdt_dest: *align(1) [4]u64 = @ptrFromInt(phys.physToVirt(low_page) + GDT_OFFSET);
     gdt_dest.* = transition_gdt;
     const slot: usize = @intCast(index);
     const stack_top = @intFromPtr(&ap_boot_stacks[slot]) + AP_STACK_SIZE;
@@ -402,7 +417,10 @@ fn prepareTrampoline(index: u32) ?u64 {
         .cr3 = r4os_read_cr3(),
         .cr0 = r4os_read_cr0(),
         .cr4 = r4os_read_cr4(),
-        .efer = msr.read(IA32_EFER) | EFER_LME,
+        // LMA reports the current CPU's active long-mode state and is
+        // read-only.  Copying the BSP's set bit into the AP's real-mode
+        // WRMSR faults on hardware/KVM even though TCG accepts it.
+        .efer = (msr.read(IA32_EFER) & ~EFER_LMA) | EFER_LME,
         .entry = @intFromPtr(&r4os_ap_entry),
         .stack = stack_top,
         .cpu_index = index,
@@ -411,6 +429,11 @@ fn prepareTrampoline(index: u32) ?u64 {
         .far_padding = 0,
         .gdt_limit = @sizeOf(@TypeOf(transition_gdt)) - 1,
         .gdt_base = @intCast(low_page + GDT_OFFSET),
+        .progress = 0,
+        .progress_padding = 0,
+        .protected_offset = @intCast(low_page + (protected_mode - start)),
+        .protected_selector = TRANSITION_PROTECTED_SELECTOR,
+        .protected_padding = 0,
     };
     return low_page;
 }
@@ -443,7 +466,21 @@ fn failAp(index: u32, timeout: bool, reason: []const u8) void {
     k.putDec(percpu.apicId(index) orelse 0);
     k.puts(" failed=");
     k.puts(reason);
+    if (timeout) {
+        k.puts(" progress=");
+        k.putDec(trampolineProgress(index));
+    }
     k.puts("\r\n");
+}
+
+fn trampolineProgress(index: u32) u8 {
+    if (index >= trampoline_phys.len) return 0;
+    const low_page = trampoline_phys[index];
+    if (low_page == 0) return 0;
+    const progress_ptr: *volatile u8 = @ptrFromInt(
+        phys.physToVirt(low_page) + CONFIG_OFFSET + @offsetOf(TrampolineConfig, "progress"),
+    );
+    return progress_ptr.*;
 }
 
 fn logSummary(stage: []const u8) void {
