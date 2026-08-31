@@ -153,7 +153,10 @@ the moving guard and 64-KiB commit growth. Profile/role aggregates update
 atomically on SMP. The instrumented R4BASIC acceptance emits bounded
 `[R4XSTACK]` records with owner, module, profile, reserve, commit, high-water,
 cycles, cache and critical occupancy at normal return and common teardown;
-ordinary launches do not add serial traffic.
+ordinary launches do not add serial traffic. Virtual-range IDs are monotonic
+for the boot, so an ownership-preserving stack-release retry treats `NotFound`
+as acknowledgement of an already completed release instead of requeueing the
+same retirement forever.
 
 The stable task registry is an ownership and inventory index, not a run queue.
 Ready selection, timed wakeups, and deferred reaping use separate intrusive

@@ -8087,6 +8087,12 @@ fn freeProgramStack(stack: *ProgramStack) bool {
             // fallback also cannot finish, keep this ProgramStack unchanged
             // in its owning ProgramThread/ProgramResources record.
             mem_virt.release(stack.range_id) catch |release_err| {
+                // Virtual-range IDs are monotonic for the lifetime of this
+                // boot. NotFound therefore proves that an earlier attempt
+                // crossed the release point and only lost its acknowledgement;
+                // retaining the stale stack would retry forever.
+                if (release_err == error.NotFound)
+                    return finishProgramStackRelease(stack, committed_bytes, release_started_tick, release_started_cycles);
                 k.puts("Program stack deferred release failed: ");
                 k.puts(@errorName(release_err));
                 k.puts("\r\n");
@@ -8097,6 +8103,8 @@ fn freeProgramStack(stack: *ProgramStack) bool {
         stack.committed_size = 0;
     }
     mem_virt.release(stack.range_id) catch |err| {
+        if (err == error.NotFound)
+            return finishProgramStackRelease(stack, committed_bytes, release_started_tick, release_started_cycles);
         k.puts("Program stack release failed: ");
         k.puts(@errorName(err));
         k.puts("\r\n");

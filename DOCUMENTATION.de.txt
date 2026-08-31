@@ -357,6 +357,11 @@ und des historischen echten net-rx-Ueberlaufs bei 32 KiB bleibt der
 64-KiB-Kernelstack unveraendert. Auch der reclaimbare Cache von acht und die
 vier kritischen Reservestacks bleiben bestehen. Messung und Freigabe halten
 keinen Scheduler-, Registry- oder Ressourcenlock ueber den Speicherabbau.
+Virtuelle Range-IDs sind waehrend eines Boots monoton. Meldet ein
+besitzwahrender Stack-Freigaberetry `NotFound`, gilt deshalb die zuvor bereits
+erfolgte Freigabe als bestaetigt; derselbe Retirement-Schritt wird nicht
+endlos erneut eingeordnet. Alle anderen Fehler behalten Stack und Besitzer
+fuer einen spaeteren Retry.
 
 R4DEV `performance_boot_summary` liest dafuer nur den kleinen festen
 Bootdatensatz; breite Subsystem-Summaries oder aktive Diagnoseprobes gehoeren
