@@ -1162,6 +1162,7 @@ fn validTarget(path: []const u8) bool {
     if (startsWithIgnoreCase(path, "C:\\R4OS\\PROTOCOLS\\") and endsWithIgnoreCase(path, ".R4P")) return true;
     if (startsWithIgnoreCase(path, "C:\\R4OS\\SERVICES\\") and endsWithIgnoreCase(path, ".R4X")) return true;
     if (startsWithIgnoreCase(path, "C:\\R4OS\\SOFTWARE\\")) return true;
+    if (startsWithIgnoreCase(path, "C:\\R4OS\\SUBSYSTEMS\\") and endsWithIgnoreCase(path, ".R4X")) return true;
     if (startsWithIgnoreCase(path, "C:\\R4OS\\FONTS\\") and endsWithIgnoreCase(path, ".R4F")) return true;
     if (startsWithIgnoreCase(path, "C:\\R4OS\\CONFIG\\")) return true;
     if (startsWithIgnoreCase(path, "C:\\R4OS\\SDK\\")) return true;
@@ -1660,6 +1661,15 @@ test "an ASCII target set stays acceptable" {
     var journal: TransactionJournal = undefined;
     testJournalWithTarget(&journal, "C:\\R4OS\\SERVICES\\SSHD.R4X");
     try testing.expect(journalPathsValid(&journal));
+}
+
+test "a subsystem R4X target is durable recovery state but subsystem data is not" {
+    var journal: TransactionJournal = undefined;
+    testJournalWithTarget(&journal, "C:\\R4OS\\SUBSYSTEMS\\r4os.gb\\R4GB.R4X");
+    try testing.expect(journalPathsValid(&journal));
+
+    testJournalWithTarget(&journal, "C:\\R4OS\\SUBSYSTEMS\\r4os.gb\\SAVE\\GAME.SAV");
+    try testing.expect(!journalPathsValid(&journal));
 }
 
 test "a non-ASCII target is installable again now that collation is backend-exact" {

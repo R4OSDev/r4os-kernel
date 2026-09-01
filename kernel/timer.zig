@@ -302,7 +302,7 @@ pub fn leaveIdleDeadline() bool {
     disarmOneShotBackend();
     armed_deadline = NO_DEADLINE;
     const resumed = switch (backend) {
-        .hpet => hpet.startLegacyIrqTimer(logical_hz),
+        .hpet => hpet.resumeLegacyIrqTimer(logical_hz),
         .lapic => lapic.resumePeriodicTimer(),
         .pit => true,
     };

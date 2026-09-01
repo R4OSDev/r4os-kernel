@@ -152,6 +152,17 @@ pub fn elapsedMainCounter(start: u64, end: u64) u64 {
 }
 
 pub fn startLegacyIrqTimer(requested_hz: u32) bool {
+    return configureLegacyIrqTimer(requested_hz, true);
+}
+
+/// Restores the already selected periodic backend after a tickless idle
+/// one-shot. This path can run for every idle cycle and must not flood the
+/// bounded boot log with an unchanged hardware status record.
+pub fn resumeLegacyIrqTimer(requested_hz: u32) bool {
+    return configureLegacyIrqTimer(requested_hz, false);
+}
+
+fn configureLegacyIrqTimer(requested_hz: u32, log_status: bool) bool {
     if (!current.mapped or current.frequency_hz == 0 or current.comparator_count == 0) {
         current.reason = "HPET timer unavailable";
         return false;
@@ -196,7 +207,7 @@ pub fn startLegacyIrqTimer(requested_hz: u32) bool {
         "HPET comparator 0 periodic legacy IRQ0 active"
     else
         "HPET comparator 0 setup incomplete";
-    logStatus();
+    if (log_status) logStatus();
     return current.timer0_irq_active;
 }
 
