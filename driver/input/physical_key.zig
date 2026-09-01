@@ -265,6 +265,32 @@ test "set one conversion distinguishes modifier sides and cursor keys" {
     try std.testing.expectEqual(@as(?u16, 0x4F), set1Usage(0x4D, true));
 }
 
+test "keypad make break repeat and Num Lock stay distinct from navigation" {
+    const keypad = [_]struct { scan: u8, usage: u16 }{
+        .{ .scan = 0x50, .usage = 0x5A },
+        .{ .scan = 0x4B, .usage = 0x5C },
+        .{ .scan = 0x4D, .usage = 0x5E },
+        .{ .scan = 0x47, .usage = 0x5F },
+        .{ .scan = 0x48, .usage = 0x60 },
+        .{ .scan = 0x49, .usage = 0x61 },
+    };
+    for (keypad) |entry| {
+        try std.testing.expectEqual(@as(?u16, entry.usage), set1Usage(entry.scan, false));
+        try std.testing.expect(set1Usage(entry.scan, true).? != entry.usage);
+    }
+    try std.testing.expectEqual(@as(?u16, 0x53), set1Usage(0x45, false));
+
+    var queue = Queue.init();
+    try std.testing.expect(queue.transition(0x60, true, 1));
+    try std.testing.expect(queue.transition(0x60, true, 2));
+    try std.testing.expect(queue.transition(0x60, false, 3));
+    try std.testing.expectEqual(Kind.down, queue.pop().?.kind);
+    const repeated = queue.pop().?;
+    try std.testing.expectEqual(Kind.down, repeated.kind);
+    try std.testing.expectEqual(flag_repeat, repeated.flags);
+    try std.testing.expectEqual(Kind.up, queue.pop().?.kind);
+}
+
 test "ordered transitions publish post-transition side-specific modifiers" {
     var queue = Queue.init();
     try std.testing.expect(queue.transition(0xE2, true, 10));

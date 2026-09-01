@@ -2,6 +2,7 @@ const protocol_api = @import("../../kernel/protocol_api.zig");
 const r4p = @import("../../program/r4p.zig");
 const r4p_contract = @import("../../net/r4p_contract.zig");
 const keyboard = @import("../input/keyboard.zig");
+const hid_set1 = @import("../input/hid_set1.zig");
 const timer_core = @import("../../kernel/timer.zig");
 const hid_poll_idle_ticks: u64 = @max(1, (10 * @as(u64, timer_core.DEFAULT_HZ)) / 1000);
 const mouse = @import("../input/mouse.zig");
@@ -16,10 +17,10 @@ const scheduler = @import("../../sched/scheduler.zig");
 const MOUSE_POLL_BUDGET: usize = 8;
 const REPORT_BUFFER_LEN: usize = 32;
 const REPORT_DESCRIPTOR_MAX: usize = 512;
-// One boot-keyboard report can publish all decoded usages plus both GUI
-// transitions. Polling pauses before taking ownership of such a report unless
-// the canonical keyboard queue can accept the complete worst-case burst.
-const KEYBOARD_REPORT_QUEUE_RESERVE: u32 = r4p_contract.USB_HID_BOOT_MAX_KEYS + 2;
+// One boot-keyboard report can replace six old usages with six new usages and
+// change all eight modifiers. Polling pauses before taking ownership unless
+// the canonical queue can accept that complete worst-case transition burst.
+const KEYBOARD_REPORT_QUEUE_RESERVE: u32 = (r4p_contract.USB_HID_BOOT_MAX_KEYS * 2) + 8;
 
 const HidKind = enum {
     keyboard,
@@ -775,12 +776,13 @@ fn decodeKeyboardReportR4p(binding: *HidBinding, report: []const u8) bool {
     }
     handleModifiers(op.old_modifiers, op.new_modifiers);
     current.last_modifiers = op.new_modifiers;
+    injectReleasedUsages(&op);
     var i: usize = 0;
     while (i < op.key_count and i < op.keys.len) : (i += 1) {
         const usage = op.keys[i];
         if (usage == 0) continue;
         current.last_usage = usage;
-        if (injectUsage(usage)) {
+        if (injectUsage(usage, true)) {
             current.decoded_keys += 1;
         } else {
             current.drops += 1;
@@ -807,117 +809,46 @@ fn decodeMouseReportR4p(report: []const u8) bool {
 }
 
 fn handleModifiers(old_mods: u8, new_mods: u8) void {
-    updateModifier(old_mods, new_mods, 0x02, 0x2A, 0xAA); // left shift
-    updateModifier(old_mods, new_mods, 0x20, 0x36, 0xB6); // right shift
-    updateModifier(old_mods, new_mods, 0x01, 0x1D, 0x9D); // left ctrl
-    updateModifier(old_mods, new_mods, 0x10, 0x1D, 0x9D); // right ctrl
-    updateModifier(old_mods, new_mods, 0x04, 0x38, 0xB8); // left alt
-    updateModifier(old_mods, new_mods, 0x40, 0x38, 0xB8); // right alt
-    updateExtendedModifier(old_mods, new_mods, 0x08, 0x5B, 0xDB); // left GUI / Windows
-    updateExtendedModifier(old_mods, new_mods, 0x80, 0x5C, 0xDC); // right GUI / Windows
-}
-
-fn updateModifier(old_mods: u8, new_mods: u8, bit: u8, make: u8, break_code: u8) void {
-    const was = (old_mods & bit) != 0;
-    const is = (new_mods & bit) != 0;
-    if (was == is) return;
-    keyboard.injectScancode(if (is) make else break_code);
-}
-
-fn updateExtendedModifier(old_mods: u8, new_mods: u8, bit: u8, make: u8, break_code: u8) void {
-    const was = (old_mods & bit) != 0;
-    const is = (new_mods & bit) != 0;
-    if (was == is) return;
-    keyboard.injectScancode(0xE0);
-    keyboard.injectScancode(if (is) make else break_code);
-}
-
-fn injectUsage(usage: u8) bool {
-    if (usageToSet1(usage)) |scancode| {
-        keyboard.injectScancode(scancode);
-        return true;
+    const bits = [_]u8{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
+    for (bits) |bit| {
+        const was = (old_mods & bit) != 0;
+        const is = (new_mods & bit) != 0;
+        if (was == is) continue;
+        injectCode(hid_set1.modifierToCode(bit).?, is);
     }
-    if (usageToExtendedSet1(usage)) |scancode| {
-        keyboard.injectScancode(0xE0);
-        keyboard.injectScancode(scancode);
-        return true;
+}
+
+fn injectUsage(usage: u8, down: bool) bool {
+    const code = hid_set1.usageToCode(usage) orelse return false;
+    injectCode(code, down);
+    return true;
+}
+
+fn injectCode(code: hid_set1.Code, down: bool) void {
+    if (code.extended) keyboard.injectScancode(0xE0);
+    keyboard.injectScancode(if (down) code.make else code.make | 0x80);
+}
+
+fn injectReleasedUsages(op: *const r4p_contract.UsbHidBootOp) void {
+    const previous_len: usize = @min(op.previous_len, op.previous.len);
+    const report_len: usize = @min(op.report_len, op.report.len);
+    const previous_offset: usize = @min(@as(usize, op.previous_offset), previous_len);
+    const report_offset: usize = @min(@as(usize, op.report_offset), report_len);
+    var released: [r4p_contract.USB_HID_BOOT_MAX_KEYS]u8 = undefined;
+    const released_count = hid_set1.collectReleasedUsages(
+        op.previous[0..previous_len],
+        previous_offset,
+        op.report[0..report_len],
+        report_offset,
+        released[0..],
+    );
+    for (released[0..released_count]) |usage| {
+        if (injectUsage(usage, false)) {
+            current.decoded_keys += 1;
+        } else {
+            current.drops += 1;
+        }
     }
-    return false;
-}
-
-fn usageToSet1(usage: u8) ?u8 {
-    return switch (usage) {
-        0x04 => 0x1E, // A
-        0x05 => 0x30,
-        0x06 => 0x2E,
-        0x07 => 0x20,
-        0x08 => 0x12,
-        0x09 => 0x21,
-        0x0A => 0x22,
-        0x0B => 0x23,
-        0x0C => 0x17,
-        0x0D => 0x24,
-        0x0E => 0x25,
-        0x0F => 0x26,
-        0x10 => 0x32,
-        0x11 => 0x31,
-        0x12 => 0x18,
-        0x13 => 0x19,
-        0x14 => 0x10,
-        0x15 => 0x13,
-        0x16 => 0x1F,
-        0x17 => 0x14,
-        0x18 => 0x16,
-        0x19 => 0x2F,
-        0x1A => 0x11,
-        0x1B => 0x2D,
-        0x1C => 0x15,
-        0x1D => 0x2C, // Z
-        0x1E => 0x02, // 1
-        0x1F => 0x03,
-        0x20 => 0x04,
-        0x21 => 0x05,
-        0x22 => 0x06,
-        0x23 => 0x07,
-        0x24 => 0x08,
-        0x25 => 0x09,
-        0x26 => 0x0A,
-        0x27 => 0x0B, // 0
-        0x28 => 0x1C, // Enter
-        0x29 => 0x01, // Escape
-        0x2A => 0x0E, // Backspace
-        0x2B => 0x0F, // Tab
-        0x2C => 0x39, // Space
-        0x2D => 0x0C,
-        0x2E => 0x0D,
-        0x2F => 0x1A,
-        0x30 => 0x1B,
-        0x31 => 0x2B,
-        0x33 => 0x27,
-        0x34 => 0x28,
-        0x35 => 0x29,
-        0x36 => 0x33,
-        0x37 => 0x34,
-        0x38 => 0x35,
-        0x3C => 0x3D, // F3
-        0x3D => 0x3E, // F4
-        else => null,
-    };
-}
-
-fn usageToExtendedSet1(usage: u8) ?u8 {
-    return switch (usage) {
-        0x4F => 0x4D, // right
-        0x50 => 0x4B, // left
-        0x51 => 0x50, // down
-        0x52 => 0x48, // up
-        0x4A => 0x47, // home
-        0x4D => 0x4F, // end
-        0x4B => 0x49, // page up
-        0x4E => 0x51, // page down
-        0x4C => 0x53, // delete
-        else => null,
-    };
 }
 
 fn refreshAggregateStatus() void {

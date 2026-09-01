@@ -183,6 +183,7 @@ pub fn build(b: *std.Build) void {
         "audio/mixer.zig",
         "driver/input/codepoint_queue.zig",
         "driver/input/key_layout.zig",
+        "driver/input/hid_set1.zig",
         "driver/usb/usb_boot_timing.zig",
         "driver/usb/usb_msc_retry.zig",
         "usb_host_controller_tests.zig",
