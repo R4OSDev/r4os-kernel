@@ -6,6 +6,8 @@
 const ahci = @import("../driver/storage/ahci.zig");
 const block = @import("../storage/block.zig");
 const boot_status = @import("boot_status.zig");
+const diag_screen = @import("diag_screen.zig");
+const driver_api = @import("driver_api.zig");
 const driver_registry = @import("../driver/registry.zig");
 const drive = @import("../fs/drive.zig");
 const vfs = @import("../fs/vfs.zig");
@@ -19,10 +21,22 @@ const xhci = @import("../driver/usb/xhci.zig");
 const usb_host = @import("../driver/usb/host_controller.zig");
 const k = @import("log.zig");
 
+const MAX_SCAN_EVIDENCE: usize = 8;
+
+const ScanEvidence = struct {
+    device_index: usize = 0,
+    driver_name: []const u8 = "",
+    report: mbr.ScanReport = .{},
+};
+
 var foundation_initialized = false;
 var controllers_initialized = false;
 var mbr_scan_count: usize = 0;
 var mbr_success_count: usize = 0;
+var scan_evidence: [MAX_SCAN_EVIDENCE]ScanEvidence = .{ScanEvidence{}} ** MAX_SCAN_EVIDENCE;
+var scan_evidence_count: usize = 0;
+var detected_ahci_count: u32 = 0;
+var detected_nvme_count: u32 = 0;
 
 pub fn initFoundation() bool {
     if (foundation_initialized) return true;
@@ -56,6 +70,10 @@ pub fn initControllers(pcie_status: anytype) bool {
 
     mbr_scan_count = 0;
     mbr_success_count = 0;
+    scan_evidence = .{ScanEvidence{}} ** MAX_SCAN_EVIDENCE;
+    scan_evidence_count = 0;
+    detected_ahci_count = pcie_status.ahci_count;
+    detected_nvme_count = pcie_status.nvme_count;
 
     probeXhci(pcie_status);
     probeUsbMsc();
@@ -81,6 +99,128 @@ pub fn mbrScans() usize {
 
 pub fn mbrSuccesses() usize {
     return mbr_success_count;
+}
+
+/// Retains the partition-scan outcome until shell admission. If C: is still
+/// absent, the fatal screen can distinguish controller, media, table and
+/// filesystem failures without requiring a serial cable on real hardware.
+pub fn renderMountDiagnostics() void {
+    diag_screen.beginIncident();
+    diag_screen.write("[STORAGE] C: missing blocks=");
+    diag_screen.writeDec(block.count());
+    diag_screen.write(" scans=");
+    diag_screen.writeDec(mbr_scan_count);
+    diag_screen.write(" pci-ahci=");
+    diag_screen.writeDec(detected_ahci_count);
+    diag_screen.write(" pci-nvme=");
+    diag_screen.writeDec(detected_nvme_count);
+    diag_screen.endLine();
+
+    if (scan_evidence_count == 0) {
+        diag_screen.line("[STORAGE] no registered block device was scanned");
+        return;
+    }
+
+    var index: usize = 0;
+    while (index < scan_evidence_count) : (index += 1) {
+        const evidence = scan_evidence[index];
+        const device = block.get(evidence.device_index) orelse {
+            diag_screen.write("dev#");
+            diag_screen.writeDec(evidence.device_index);
+            diag_screen.line(" unavailable after scan");
+            continue;
+        };
+
+        diag_screen.write("dev#");
+        diag_screen.writeDec(evidence.device_index);
+        diag_screen.write(" ");
+        diag_screen.write(device.name);
+        diag_screen.write(" scan=");
+        diag_screen.write(evidence.driver_name);
+        diag_screen.write(" bus=");
+        diag_screen.write(@tagName(device.bus));
+        diag_screen.write(" src=");
+        diag_screen.write(@tagName(device.source));
+        diag_screen.write(" state=");
+        diag_screen.write(@tagName(device.state));
+        diag_screen.endLine();
+
+        diag_screen.write("  sector-size=");
+        diag_screen.writeDec(device.sector_size);
+        diag_screen.write(" sectors=");
+        diag_screen.writeDec(device.sector_count);
+        diag_screen.write(" table=");
+        diag_screen.write(@tagName(evidence.report.table));
+        diag_screen.endLine();
+
+        diag_screen.write("  result=");
+        diag_screen.write(@tagName(evidence.report.result));
+        diag_screen.write(" parts=");
+        diag_screen.writeDec(evidence.report.partition_count);
+        diag_screen.write(" candidates=");
+        diag_screen.writeDec(evidence.report.mountable_count);
+        diag_screen.write(" fs=");
+        diag_screen.writeDec(evidence.report.filesystem_count);
+        diag_screen.write(" score=");
+        diag_screen.writeDec(evidence.report.best_system_score);
+        diag_screen.write("/6");
+        diag_screen.write(" markers=");
+        diag_screen.writeHex(evidence.report.marker_found_mask);
+        diag_screen.write(" marker-io=");
+        diag_screen.writeHex(evidence.report.marker_io_mask);
+        diag_screen.endLine();
+
+        if (evidence.report.detail.len != 0 or
+            evidence.report.mbr_type != 0 or
+            device.stats.read_failures != 0)
+        {
+            diag_screen.write("  detail=");
+            diag_screen.write(if (evidence.report.detail.len != 0) evidence.report.detail else "none");
+            if (evidence.report.mbr_type != 0) {
+                diag_screen.write(" mbr-type=");
+                diag_screen.writeHex(evidence.report.mbr_type);
+            }
+            if (device.stats.read_failures != 0) {
+                diag_screen.write(" read-failures=");
+                diag_screen.writeDec(device.stats.read_failures);
+                diag_screen.write(" last-io=");
+                diag_screen.write(@tagName(device.stats.last_error));
+            }
+            diag_screen.endLine();
+        }
+
+        diag_screen.write("  reads=");
+        diag_screen.writeDec(device.stats.read_ops);
+        diag_screen.write(" sectors=");
+        diag_screen.writeDec(device.stats.read_sectors);
+        diag_screen.write(" last-lba=");
+        diag_screen.writeDec(device.stats.last_request.lba);
+        diag_screen.write(" n=");
+        diag_screen.writeDec(device.stats.last_request.sectors);
+        diag_screen.write(" ticks=");
+        diag_screen.writeDec(device.stats.completion_last_ticks);
+        diag_screen.endLine();
+
+        var backend_status = driver_api.StorageBackendStatus{
+            .state = 0,
+            .last_error = 0,
+            .last_lba = 0,
+            .last_sectors = 0,
+            .recoveries = 0,
+            .recovery_failures = 0,
+        };
+        if (driver_api.queryStorageBackendStatus(evidence.device_index, &backend_status)) {
+            diag_screen.write("  backend-state=");
+            diag_screen.writeDec(backend_status.state);
+            diag_screen.write(" error=");
+            diag_screen.writeHex(backend_status.last_error);
+            diag_screen.write(" recoveries=");
+            diag_screen.writeDec(backend_status.recoveries);
+            diag_screen.write(" failed=");
+            diag_screen.writeDec(backend_status.recovery_failures);
+            diag_screen.endLine();
+        }
+    }
 }
 
 fn probeXhci(pcie_status: anytype) void {
@@ -252,7 +392,16 @@ fn scanBlockDevice(scanned: *[16]bool, device_index: usize, driver_name: []const
     k.puts("\r\n");
 
     mbr_scan_count += 1;
-    if (mbr.scan(device_index)) mbr_success_count += 1;
+    const report = mbr.scan(device_index);
+    if (report.table_valid) mbr_success_count += 1;
+    if (scan_evidence_count < scan_evidence.len) {
+        scan_evidence[scan_evidence_count] = .{
+            .device_index = device_index,
+            .driver_name = driver_name,
+            .report = report,
+        };
+        scan_evidence_count += 1;
+    }
 }
 
 fn applyLegacyDataDriveLayoutPolicy() void {

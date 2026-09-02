@@ -630,6 +630,28 @@ pub fn cleanupOwner(owner: u32) bool {
     return commitOwnerCleanup(&token);
 }
 
+/// Snapshot the owner-provided status for a registered R4D block backend.
+/// This is an internal diagnostic projection: it neither changes backend
+/// admission nor exposes another public ABI surface.
+pub fn queryStorageBackendStatus(block_index: usize, out: *StorageBackendStatus) bool {
+    out.* = .{
+        .state = 0,
+        .last_error = 0,
+        .last_lba = 0,
+        .last_sectors = 0,
+        .recoveries = 0,
+        .recovery_failures = 0,
+    };
+    for (&r4d_storage_backends) |*backend| {
+        if (!backend.used or backend.block_index != block_index) continue;
+        const status = backend.descriptor.status orelse return false;
+        const callback = enterStorageCallback(backend.owner) orelse return false;
+        defer leaveStorageCallback(callback);
+        return status(backend.descriptor.context, out) == 0;
+    }
+    return false;
+}
+
 pub const Table = extern struct {
     magic: u32,
     version: u32,

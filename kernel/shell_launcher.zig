@@ -9,6 +9,7 @@ const loader_perf = @import("loader_perf.zig");
 const r4x = @import("../program/r4x.zig");
 const usb_msc = @import("../driver/usb/msc.zig");
 const scheduler = @import("../sched/scheduler.zig");
+const storage_boot = @import("storage_boot.zig");
 
 const TERMINAL_FALLBACK_PATH = "/R4OS/SOFTWARE/TERMINAL/TERMINAL.R4X";
 const SERVICE_MANAGER_BOOT_PATH = "/R4OS/SOFTWARE/TERMINAL/SERVMAN.R4X";
@@ -217,6 +218,8 @@ fn noExternalShellCrash(configured_path: []const u8) noreturn {
         bootlog.puts(" ");
     }
     bootlog.puts("\r\n");
+
+    if (drive.get('C') == null) storage_boot.renderMountDiagnostics();
 
     const msc = usb_msc.status();
     if (msc.present and !msc.block_registered) {
