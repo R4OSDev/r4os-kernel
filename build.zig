@@ -218,6 +218,7 @@ pub fn build(b: *std.Build) void {
         "sched/wait_node.zig",
         "storage/block_dispatch.zig",
         "storage/block_split.zig",
+        "storage/gpt.zig",
     };
     for (unit_tests) |path| addUnitTest(b, test_step, path);
     addBootscreenUnitTest(b, test_step);
