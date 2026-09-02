@@ -1999,15 +1999,16 @@ fn tcpCloseResult(out: *TcpServiceResult, payload: []const u8, client_id: u16) [
     out.conn_id = conn_id;
     out.flags |= TCP_FLAG_HANDLE_VALID | TCP_FLAG_CONN_VALID;
     const result = net.tcpClose(conn_id);
-    releaseTcpHandle(out.handle);
     out.result = result;
     if (result >= 0) {
+        releaseTcpHandle(out.handle);
         out.result = 0;
         out.flags |= TCP_FLAG_OK;
         setTcpServiceStatus(out, .ok);
-        setTcpLifecycle(out, SOCKET_LIFECYCLE_LOCAL_CLOSE_PUBLIC);
+        setTcpLifecycle(out, SOCKET_LIFECYCLE_PENDING_CLOSE_PUBLIC);
         recordServiceClose(.ok);
     } else if (!tcpConnectionUsableForHandle(conn_id)) {
+        releaseTcpHandle(out.handle);
         out.result = 0;
         out.flags |= TCP_FLAG_OK;
         setTcpServiceStatus(out, .cancelled);

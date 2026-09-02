@@ -5,6 +5,16 @@ Dieses Repository enthaelt den R4OS-Kernel fuer x86_64, seine Limine-
 Bootintegration, den Linker, zwingend eingebaute Bestandteile und kernelnahe
 Tests. Der Kernel wird fest in ReleaseSafe und ohne SIMD gebaut.
 
+Nicht blockierender TCP-FIN-Abschluss seit 0.74.3
+-------------------------------------------------
+
+`R4NET.tcp_close` invalidiert den Aufruferhandle weiterhin sofort und blockiert
+nicht auf den Peer. Der TCP-Verbindungszustand bleibt jedoch so lange im
+Kernelbesitz, bis das letzte Nutzdatensegment bestaetigt wurde. Danach sendet
+der Netzwerk-Task FIN, retransmittiert bei Bedarf und raeumt einen verwaisten
+Close nach einer festen Frist auf. Ein regulaerer Close verwirft damit weder
+das letzte Segment noch beendet er kompatible Clients mit RST.
+
 Zweizeiliger frueher Bootstatus seit 0.71.11
 ---------------------------------------------
 

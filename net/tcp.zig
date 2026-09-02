@@ -128,6 +128,7 @@ const Connection = struct {
     tx_ack: u32 = 0,
     rx_drops: u32 = 0,
     accepted_claimed: bool = false,
+    close_requested: bool = false,
     time_wait_until: u64 = 0,
     rx_head: usize = 0,
     rx_len: usize = 0,
@@ -379,6 +380,29 @@ pub fn established(conn_id: u32) bool {
     return c.state == .established;
 }
 
+pub fn requestClose(conn_id: u32) bool {
+    const c = byId(conn_id) orelse return false;
+    switch (c.state) {
+        .established => {
+            c.close_requested = true;
+            stats.last_error = "close-pending";
+            return true;
+        },
+        .fin_wait, .last_ack, .time_wait, .closed => return true,
+        else => return false,
+    }
+}
+
+pub fn closeReady(conn_id: u32) bool {
+    const c = byId(conn_id) orelse return false;
+    return c.state == .established and c.close_requested and c.sent.count() == 0;
+}
+
+pub fn finWaiting(conn_id: u32) bool {
+    const c = byId(conn_id) orelse return false;
+    return c.state == .fin_wait;
+}
+
 pub fn connectionIdentity(conn_id: u32) ?ConnectionIdentity {
     var slot: usize = 0;
     while (slot < connections.len) : (slot += 1) {
@@ -479,7 +503,7 @@ pub fn planSend(conn_id: u32) ?SendPlan {
 
 pub fn sendAllowance(conn_id: u32, requested: usize) usize {
     const c = byId(conn_id) orelse return 0;
-    if (c.state != .established) return 0;
+    if (c.state != .established or c.close_requested) return 0;
     return tcp_runtime.sendAllowance(c.tx_window, requested, c.sent.hasCapacity());
 }
 
@@ -544,6 +568,7 @@ pub fn commitSent(conn_id: u32, flags: u16, payload: []const u8, sent_tick: u64)
     }
     if ((flags & FLAG_FIN) != 0) {
         c.seq +%= 1;
+        c.close_requested = false;
         c.state = .fin_wait;
         stats.fin_tx += 1;
         stats.last_error = "fin";
@@ -1200,6 +1225,7 @@ fn resetConnectionSlot(c: *Connection) void {
     c.tx_ack = 0;
     c.rx_drops = 0;
     c.accepted_claimed = false;
+    c.close_requested = false;
     c.time_wait_until = 0;
     c.rx_head = 0;
     c.rx_len = 0;
@@ -1237,7 +1263,7 @@ pub fn reapTimeWait(now: u64) u32 {
             }
             continue;
         }
-        if (c.state != .fin_wait) continue;
+        if (c.state != .fin_wait and !(c.state == .established and c.close_requested)) continue;
         if (c.time_wait_until == 0) {
             c.time_wait_until = now +% TIME_WAIT_TICKS;
             continue;
@@ -1389,6 +1415,54 @@ pub fn wraparoundProbe() bool {
     };
     _ = applyRxView(fin) orelse return false;
     return c.ack == 3 and c.state == .closed;
+}
+
+// Ein nicht blockierender Close darf das letzte Datensegment nicht durch
+// einen sofortigen Hard-Close verlieren. Die State-Machine haelt den Close
+// deshalb bis zum ACK zurueck, sperrt weitere Writes und wechselt erst mit
+// dem gesendeten FIN nach fin_wait.
+pub fn gracefulCloseProbe() bool {
+    const remote: [4]u8 = .{ 198, 51, 100, 94 };
+    const local: [4]u8 = .{ 192, 0, 2, 2 };
+    const conn = selfTestConnect(remote, 65094);
+    if (conn <= 0) return false;
+    const conn_id: u32 = @intCast(conn);
+    defer _ = close(conn_id);
+    const c = byId(conn_id) orelse return false;
+
+    if (!commitSent(conn_id, FLAG_ACK | FLAG_PSH, "last", 1)) return false;
+    if (!requestClose(conn_id) or closeReady(conn_id)) return false;
+    if (sendAllowance(conn_id, 1) != 0) return false;
+
+    const data_ack = SegmentView{
+        .source_ip = remote,
+        .dest_ip = local,
+        .source_port = c.remote_port,
+        .dest_port = c.local_port,
+        .seq = c.ack,
+        .ack = c.seq,
+        .flags = FLAG_ACK,
+        .window = MAX_ADVERTISED_WINDOW,
+        .payload = "",
+    };
+    _ = applyRxView(data_ack) orelse return false;
+    if (!closeReady(conn_id)) return false;
+    if (!commitSent(conn_id, FLAG_ACK | FLAG_FIN, "", 2)) return false;
+    if (!finWaiting(conn_id) or closeReady(conn_id)) return false;
+
+    const fin_ack = SegmentView{
+        .source_ip = remote,
+        .dest_ip = local,
+        .source_port = c.remote_port,
+        .dest_port = c.local_port,
+        .seq = c.ack,
+        .ack = c.seq,
+        .flags = FLAG_ACK,
+        .window = MAX_ADVERTISED_WINDOW,
+        .payload = "",
+    };
+    _ = applyRxView(fin_ack) orelse return false;
+    return connectionIdentity(conn_id) == null;
 }
 const tcp_runtime = @import("tcp_runtime.zig");
 const r4x_api = @import("../program/r4x_api.zig");

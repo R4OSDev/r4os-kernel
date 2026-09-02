@@ -4433,6 +4433,9 @@ pub fn runLimitContractProbe() bool {
     if (!tcp.wraparoundProbe()) return false;
     passed += 1;
 
+    if (!tcp.gracefulCloseProbe()) return false;
+    passed += 1;
+
     limit_contract_tests += 1;
     limit_contract_cases += passed;
     return true;
@@ -5385,8 +5388,9 @@ fn rxTaskMain() callconv(.c) void {
         // TCP-Fristen verwenden ausschliesslich dieselbe monotone Tick-Domain
         // wie ihre Sendestempel. iterations bleibt nur der Log-Zaehler.
         const now = time_core.monotonicTicks();
-        _ = tcp.reapTimeWait(now);
         proactiveRetransmitSweep(now);
+        proactiveCloseSweep();
+        _ = tcp.reapTimeWait(now);
         retryDhcpTaskStartIfDue();
         if (rx_task_iterations % RX_TASK_LOG_INTERVAL == 0) logRxTaskStatus();
     }
@@ -6738,27 +6742,26 @@ pub fn tcpAcceptPollOnListener(port: u16, conn_id_out: *u32) i32 {
 
 pub fn tcpClose(conn_id: u32) i32 {
     const closing_identity = tcp.connectionIdentity(conn_id);
-    defer if (closing_identity) |identity| tcp_rto.release(identity);
-    // 0.56.20-Nachfix: Nach Peer-FIN (closed() deckt last_ack/time_wait)
-    // ist die Gegenseite fertig - ein eigener FIN+Warte-Zyklus blockierte
-    // nur den Aufrufer (FTPSVC-Stall nach STOR: SIZE-Antwort blieb im
-    // Gate-Budget aus; auf freiem Host reproduziert). ACK aufs Peer-FIN
-    // senden und hart schliessen (Alt-Verhalten fuer den Aufrufer).
+    // Nach Peer-FIN ist die Gegenseite bereits fertig. Den verbliebenen
+    // Slot samt RTO-Besitz koennen wir unmittelbar freigeben.
     if (tcp.closed(conn_id)) {
         _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
-        return tcp.close(conn_id);
+        const result = tcp.close(conn_id);
+        if (closing_identity) |identity| tcp_rto.release(identity);
+        return result;
     }
-    if (sendTcpForConnection(conn_id, tcp.FLAG_ACK | tcp.FLAG_FIN, "")) |result| {
-        if (result != .ok) return tcp.close(conn_id);
-        var retransmits: u8 = 0;
-        while (!waitForTcpClosed(conn_id, rtoBackoff(conn_id, retransmits))) {
-            if (retransmits >= TCP_MAX_RETRANSMITS) break;
-            if (retransmitTcpFin(conn_id) != .ok) break;
-            retransmits += 1;
-        }
-        if (tcp.closed(conn_id)) return 0;
+
+    // R4NET.tcp_close ist laut Plattformvertrag nicht blockierend. Der
+    // Verbindungszustand behaelt deshalb ausstehende Nutzdaten und FIN im
+    // Kernelbesitz, waehrend der Aufruferhandle sofort ungueltig werden
+    // darf. Der net-rx-Task sendet FIN erst nach dem letzten Daten-ACK und
+    // uebernimmt Retransmit sowie begrenztes Reaping.
+    if (!tcp.requestClose(conn_id)) {
+        abortTcpConnection(conn_id, "close-state");
+        return r4p_contract.TCP_RESULT_BAD_STATE;
     }
-    return tcp.close(conn_id);
+    _ = drivePendingTcpClose(conn_id);
+    return r4p_contract.TCP_RESULT_OK;
 }
 
 pub fn tcpAbort(conn_id: u32) i32 {
@@ -6894,8 +6897,9 @@ fn rtoBackoff(conn_id: u32, retransmits: u8) u64 {
     return t;
 }
 
-// Der net-rx-Task retransmittiert das aelteste unbestaetigte Datensegment.
-// SYN und FIN bleiben Eigentum ihrer synchronen Connect-/Close-Schleifen.
+// Der net-rx-Task retransmittiert das aelteste unbestaetigte Daten- oder
+// FIN-Segment. SYN bleibt Eigentum der synchronen Connect-Schleife; FIN
+// gehoert nach dem nicht blockierenden tcpClose dem Kernelzustand.
 const PROACTIVE_MAX_RESEND: u8 = 5;
 
 fn proactiveRetransmitSweep(now: u64) void {
@@ -6905,8 +6909,8 @@ fn proactiveRetransmitSweep(now: u64) void {
             tcp_rto.releaseSlot(slot);
             continue;
         };
-        if (!tcp.established(identity.connection_id)) continue;
-        const outstanding = tcp.outstandingInfo(identity.connection_id, .data) orelse continue;
+        const kind: tcp.RetransmitKind = if (tcp.finWaiting(identity.connection_id)) .fin else if (tcp.established(identity.connection_id)) .data else continue;
+        const outstanding = tcp.outstandingInfo(identity.connection_id, kind) orelse continue;
         if (outstanding.retransmits >= PROACTIVE_MAX_RESEND) continue;
         const st = tcp_rto.bind(identity) orelse continue;
         if (st.sent_tick == 0 or st.sent_tick != outstanding.sent_tick) {
@@ -6916,8 +6920,27 @@ fn proactiveRetransmitSweep(now: u64) void {
         const rto = rtoBackoff(identity.connection_id, outstanding.retransmits);
         if (!tcp_runtime.deadlineReached(now, st.sent_tick +% rto)) continue;
         if (tcp.txAckOf(identity.connection_id) != st.sent_tx_ack) continue;
-        if (retransmitTcpData(identity.connection_id) != .ok) continue;
+        const retransmit = switch (kind) {
+            .data => retransmitTcpData(identity.connection_id),
+            .fin => retransmitTcpFin(identity.connection_id),
+            else => .backend_error,
+        };
+        if (retransmit != .ok) continue;
         tcp_proactive_retransmits +%= 1;
+    }
+}
+
+fn drivePendingTcpClose(conn_id: u32) bool {
+    if (!tcp.closeReady(conn_id)) return false;
+    const result = sendTcpForConnection(conn_id, tcp.FLAG_ACK | tcp.FLAG_FIN, "") orelse return false;
+    return result == .ok;
+}
+
+fn proactiveCloseSweep() void {
+    var slot: usize = 0;
+    while (slot < tcp.MAX_CONNECTIONS) : (slot += 1) {
+        const identity = tcp.connectionIdentityAt(slot) orelse continue;
+        _ = drivePendingTcpClose(identity.connection_id);
     }
 }
 
