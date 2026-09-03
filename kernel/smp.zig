@@ -99,6 +99,11 @@ var acceptance_done: u32 = 0;
 var acceptance_failures: u32 = 0;
 var acceptance_cpu_mask: u64 = 0;
 var acceptance_results: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
+var acceptance_clock_starts: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
+var acceptance_clock_ends: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
+var acceptance_tick_starts: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
+var acceptance_tick_ends: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
+var acceptance_clock_regressions: u32 = 0;
 
 pub fn initBsp() void {
     percpu.initBsp(platform_cpu.bootApicId());
@@ -178,6 +183,9 @@ pub fn startApplicationProcessors(info: acpi.Info) bool {
             failAp(index, true, "startup-timeout");
             continue;
         }
+        // A clock-qualification failure does not discard a healthy AP. The
+        // shared clocksource instead demotes every CPU to HPET atomically.
+        _ = monotonic.finalizeCpuRegistration(index);
         current.started += 1;
     }
     logSummary("parked");
@@ -230,9 +238,14 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     };
 
     acceptance_results = .{0} ** percpu.max_cpus;
+    acceptance_clock_starts = .{0} ** percpu.max_cpus;
+    acceptance_clock_ends = .{0} ** percpu.max_cpus;
+    acceptance_tick_starts = .{0} ** percpu.max_cpus;
+    acceptance_tick_ends = .{0} ** percpu.max_cpus;
     @atomicStore(u8, &acceptance_release, 0, .release);
     @atomicStore(u32, &acceptance_done, 0, .release);
     @atomicStore(u32, &acceptance_failures, 0, .release);
+    @atomicStore(u32, &acceptance_clock_regressions, 0, .release);
     @atomicStore(u64, &acceptance_cpu_mask, 0, .release);
 
     var workers: [percpu.max_cpus]?*task.Task = .{null} ** percpu.max_cpus;
@@ -258,6 +271,7 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     }
 
     const parallel_start = monotonic.capture();
+    const deadline_before = timer.deadlineStats();
     @atomicStore(u8, &acceptance_release, 1, .release);
     cpu_index = 1;
     while (cpu_index < percpu.max_cpus) : (cpu_index += 1) {
@@ -283,11 +297,28 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     }
     const observed_mask = @atomicLoad(u64, &acceptance_cpu_mask, .acquire);
     const failures = @atomicLoad(u32, &acceptance_failures, .acquire);
+    const clock_regressions = @atomicLoad(u32, &acceptance_clock_regressions, .acquire);
+    const deadline_after = timer.deadlineStats();
+    const clock_status = monotonic.hardwareStatus();
+    var clock_samples_ok = true;
+    cpu_index = 0;
+    while (cpu_index < percpu.max_cpus) : (cpu_index += 1) {
+        if ((online_mask & (@as(u64, 1) << @intCast(cpu_index))) == 0) continue;
+        clock_samples_ok = clock_samples_ok and
+            acceptance_clock_starts[cpu_index] != 0 and
+            acceptance_clock_ends[cpu_index] > acceptance_clock_starts[cpu_index] and
+            acceptance_tick_ends[cpu_index] >= acceptance_tick_starts[cpu_index];
+    }
+    const clock_registration_ok =
+        (clock_status.registered_cpu_mask & online_mask) == online_mask;
+    const irq_delta = deadline_after.timer_irqs -% deadline_before.timer_irqs;
+    const clock_ok = clock_status.source != .unavailable and clock_samples_ok and
+        clock_registration_ok and clock_regressions == 0 and irq_delta != 0;
     const speedup_milli: u64 = if (parallel_ns == 0)
         0
     else
         @intCast((@as(u128, sequential_ns) * 1000) / parallel_ns);
-    const ok = failures == 0 and placement_mask == online_mask and observed_mask == online_mask and
+    const ok = failures == 0 and clock_ok and placement_mask == online_mask and observed_mask == online_mask and
         actual_checksum == expected_checksum and speedup_milli >= ACCEPTANCE_MIN_SPEEDUP_MILLI;
 
     probePuts("[SMPPROBE] result=");
@@ -306,6 +337,31 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     probePutHex(observed_mask, 8);
     probePuts(" failures=");
     probePutDec(failures);
+    probePuts("\r\n");
+    probePuts("[CLOCKPROBE] result=");
+    probePuts(if (clock_ok) "OK" else "FAILED");
+    probePuts(" source=");
+    probePuts(switch (clock_status.source) {
+        .unavailable => "unavailable",
+        .tsc => "TSC",
+        .hpet => "HPET",
+    });
+    probePuts(" cpus=");
+    probePutDec(online_count);
+    probePuts(" registered_mask=0x");
+    probePutHex(clock_status.registered_cpu_mask, 8);
+    probePuts(" regressions=");
+    probePutDec(clock_regressions);
+    probePuts(" irq_delta=");
+    probePutDec(irq_delta);
+    probePuts(" generation=");
+    probePutDec(clock_status.generation);
+    probePuts(" max_skew_ns=");
+    probePutDec(clock_status.max_cpu_skew_ns);
+    probePuts(" calibration_ppm=");
+    probePutDec(clock_status.calibration_error_ppm);
+    probePuts(" fallback=");
+    probePuts(monotonic.hardwareFallbackReasonName(clock_status.fallback_reason));
     probePuts("\r\n");
     return ok;
 }
@@ -359,6 +415,7 @@ pub export fn r4os_ap_entry(index_raw: u64) callconv(.c) noreturn {
         _ = percpu.setState(index, .failed);
         interrupts.haltForever();
     }
+    _ = monotonic.registerCurrentCpu(index);
     _ = percpu.setState(index, .parked);
     while (!@atomicLoad(bool, &release_aps, .acquire)) {
         if (percpu.state(index) == .stopping) {
@@ -510,7 +567,30 @@ fn acceptanceWorkerMain() callconv(.c) void {
         if ((previous & bit) != 0) {
             _ = @atomicRmw(u32, &acceptance_failures, .Add, 1, .acq_rel);
         } else {
+            const start_ns = monotonic.nowNanoseconds() orelse 0;
+            const start_tick = timer.tickCount();
+            var prior_ns = start_ns;
+            var clock_reads: u32 = 0;
+            while (clock_reads < 256) : (clock_reads += 1) {
+                const current_ns = monotonic.nowNanoseconds() orelse 0;
+                if (current_ns < prior_ns) {
+                    _ = @atomicRmw(u32, &acceptance_clock_regressions, .Add, 1, .acq_rel);
+                }
+                prior_ns = current_ns;
+            }
             acceptance_results[cpu_index] = acceptanceWork(cpu_index);
+            const end_tick = timer.tickCount();
+            const end_ns = monotonic.nowNanoseconds() orelse 0;
+            acceptance_clock_starts[cpu_index] = start_ns;
+            acceptance_clock_ends[cpu_index] = end_ns;
+            acceptance_tick_starts[cpu_index] = start_tick;
+            acceptance_tick_ends[cpu_index] = end_tick;
+            const deadline = timer.deadlineAfter(start_tick, 2);
+            if (start_ns == 0 or end_ns <= start_ns or end_tick < start_tick or
+                deadline <= start_tick or timer.remainingUntil(start_tick, deadline) != 2)
+            {
+                _ = @atomicRmw(u32, &acceptance_failures, .Add, 1, .acq_rel);
+            }
         }
     }
     _ = @atomicRmw(u32, &acceptance_done, .Add, 1, .release);

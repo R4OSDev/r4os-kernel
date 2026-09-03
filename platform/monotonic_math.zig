@@ -6,6 +6,89 @@ pub const Rate = struct {
     denominator: u64,
 };
 
+/// Precomputed floor conversion for hot clock paths. Construction may divide;
+/// applying the scale uses only one 64x64->128 multiply and a shift.
+pub const FixedScale = struct {
+    multiplier: u64 = 0,
+    shift: u8 = 0,
+
+    pub fn initFloor(numerator: u64, denominator: u64) FixedScale {
+        if (numerator == 0 or denominator == 0) return .{};
+        var candidate_shift: u8 = 63;
+        while (true) {
+            const scaled = (@as(u128, numerator) << @intCast(candidate_shift)) / denominator;
+            if (scaled != 0 and scaled <= std.math.maxInt(u64)) {
+                return .{ .multiplier = @intCast(scaled), .shift = candidate_shift };
+            }
+            if (candidate_shift == 0) return .{};
+            candidate_shift -= 1;
+        }
+    }
+
+    pub fn valid(self: FixedScale) bool {
+        return self.multiplier != 0;
+    }
+
+    pub fn apply(self: FixedScale, value: u64) u64 {
+        if (!self.valid() or value == 0) return 0;
+        const result = (@as(u128, value) * self.multiplier) >> @intCast(self.shift);
+        return if (result > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(result);
+    }
+};
+
+pub const HardwareClockChoice = enum {
+    unavailable,
+    tsc,
+    hpet,
+};
+
+/// A non-invariant TSC is accepted only after an independent HPET calibration.
+/// Any failed per-CPU qualification demotes the whole clock to the common HPET.
+pub fn chooseHardwareClock(
+    tsc_present: bool,
+    tsc_frequency_valid: bool,
+    invariant_tsc: bool,
+    hpet_valid: bool,
+    hpet_calibration_valid: bool,
+    cpu_offsets_valid: bool,
+) HardwareClockChoice {
+    if (tsc_present and tsc_frequency_valid and cpu_offsets_valid and
+        (invariant_tsc or hpet_calibration_valid)) return .tsc;
+    if (hpet_valid) return .hpet;
+    return .unavailable;
+}
+
+pub fn frequencyErrorPpm(measured_hz: u64, expected_hz: u64) u64 {
+    if (expected_hz == 0) return std.math.maxInt(u64);
+    const difference = if (measured_hz >= expected_hz)
+        measured_hz - expected_hz
+    else
+        expected_hz - measured_hz;
+    const result = (@as(u128, difference) * 1_000_000) / expected_hz;
+    return if (result > std.math.maxInt(u64)) std.math.maxInt(u64) else @intCast(result);
+}
+
+pub fn signedCounterCorrection(expected: u64, observed: u64) ?i64 {
+    const difference = @as(i128, expected) - @as(i128, observed);
+    if (difference < std.math.minInt(i64) or difference > std.math.maxInt(i64)) return null;
+    return @intCast(difference);
+}
+
+pub fn applySignedCorrection(raw: u64, correction: i64) u64 {
+    if (correction >= 0) return raw +% @as(u64, @intCast(correction));
+    return raw -% @as(u64, @intCast(-@as(i128, correction)));
+}
+
+pub fn absoluteCorrection(correction: i64) u64 {
+    return @intCast(if (correction >= 0) @as(i128, correction) else -@as(i128, correction));
+}
+
+/// Accepts a normal forward sample and the one legitimate 64-bit wrap, while
+/// rejecting a small backwards discontinuity.
+pub fn counterAdvanced(previous: u64, current: u64) bool {
+    return current -% previous < (@as(u64, 1) << 63);
+}
+
 pub fn scaleFloor(value: u64, numerator: u64, denominator: u64) u64 {
     if (value == 0 or numerator == 0 or denominator == 0) return 0;
     const result = (@as(u128, value) * numerator) / denominator;
@@ -105,6 +188,40 @@ pub fn extendCounter32(published: u64, low: u32) u64 {
 test "cycle conversion keeps sub-millisecond spans" {
     try std.testing.expectEqual(@as(u64, 250), cyclesToNanoseconds(750, 3_000_000_000));
     try std.testing.expectEqual(@as(u64, 1_000_000), cyclesToNanoseconds(3_000_000, 3_000_000_000));
+}
+
+test "fixed scale tracks exact floor without runtime division" {
+    const scale = FixedScale.initFloor(nanoseconds_per_second, 3_000_000_000);
+    try std.testing.expect(scale.valid());
+    const samples = [_]u64{ 1, 750, 3_000_000, 3_000_000_000, 9_000_000_000_000 };
+    for (samples) |sample| {
+        const exact = cyclesToNanoseconds(sample, 3_000_000_000);
+        const fixed = scale.apply(sample);
+        try std.testing.expect(fixed <= exact);
+        try std.testing.expect(exact - fixed <= 1);
+    }
+}
+
+test "clock qualification falls back instead of trusting an unsafe TSC" {
+    try std.testing.expectEqual(HardwareClockChoice.tsc, chooseHardwareClock(true, true, true, false, false, true));
+    try std.testing.expectEqual(HardwareClockChoice.tsc, chooseHardwareClock(true, true, false, true, true, true));
+    try std.testing.expectEqual(HardwareClockChoice.hpet, chooseHardwareClock(true, true, false, true, false, true));
+    try std.testing.expectEqual(HardwareClockChoice.hpet, chooseHardwareClock(true, true, true, true, true, false));
+    try std.testing.expectEqual(HardwareClockChoice.unavailable, chooseHardwareClock(false, false, false, false, false, false));
+}
+
+test "frequency error and signed CPU correction are bounded" {
+    try std.testing.expectEqual(@as(u64, 500), frequencyErrorPpm(2_398_800_000, 2_400_000_000));
+    const correction = signedCounterCorrection(1_000_000, 1_000_125) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, -125), correction);
+    try std.testing.expectEqual(@as(u64, 1_000_000), applySignedCorrection(1_000_125, correction));
+    try std.testing.expectEqual(@as(u64, 125), absoluteCorrection(correction));
+}
+
+test "counter progress distinguishes wrap from a backwards jump" {
+    try std.testing.expect(counterAdvanced(0xFFFF_FFFF_FFFF_FFF0, 0x20));
+    try std.testing.expect(counterAdvanced(10, 11));
+    try std.testing.expect(!counterAdvanced(1000, 900));
 }
 
 test "event rate preserves effective rational frequency" {

@@ -41,12 +41,17 @@ On Linux or macOS:
 build is ReleaseSafe and does not enable SIMD.
 
 The platform exposes a continuous nanosecond clock independently from the
-scheduler event source. Exact invariant-TSC and free-running HPET sources are
-preferred. On the modern timer path, logical scheduler ticks continue from the
-HPET main counter while active work uses periodic HPET or LAPIC delivery. True
-idle programs only the earliest finite wait as an HPET or calibrated-LAPIC
-one-shot; no pending deadline disarms the event source. PIT remains the
-explicitly degraded periodic fallback.
+scheduler event source. A common clocksource uses an invariant TSC with an
+exact CPUID frequency, or an independently HPET-calibrated and watched TSC.
+Per-CPU HPET correlations compensate bounded TSC offsets; an unstable
+frequency, excessive CPU skew, or a later discontinuity demotes every CPU to
+the free-running HPET source. A global monotonic clamp protects concurrent
+readers. Logical scheduler ticks use the same nanosecond epoch and a
+precomputed multiply/shift conversion, so the normal TSC path performs no
+HPET MMIO access or division. Periodic HPET/LAPIC delivery and their one-shot
+idle modes remain event sources; PIT remains the explicitly degraded periodic
+fallback. R4OS currently has no suspend/resume lifecycle; adding one requires
+clocksource requalification before tasks resume.
 
 PCI and PCIe devices are enumerated once through a canonical inventory.
 Mapped segment-0 ECAM coverage is preferred; legacy CF8/CFC access is retained

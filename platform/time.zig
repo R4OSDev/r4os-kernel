@@ -128,6 +128,17 @@ pub fn logStatus() void {
     });
     bootlog.puts(" event=");
     bootlog.puts(timer.backendName());
+    const hardware = monotonic.hardwareStatus();
+    bootlog.puts(" source_hz=");
+    bootlog.putDec(hardware.frequency_hz);
+    bootlog.puts(" tsc_invariant=");
+    bootlog.puts(if (hardware.tsc_invariant) "yes" else "no");
+    bootlog.puts(" hpet_calibrated=");
+    bootlog.puts(if (hardware.tsc_hpet_calibrated) "yes" else "no");
+    bootlog.puts(" calibration_ppm=");
+    bootlog.putDec(hardware.calibration_error_ppm);
+    bootlog.puts(" fallback=");
+    bootlog.puts(monotonic.hardwareFallbackReasonName(hardware.fallback_reason));
     bootlog.puts("\r\n");
 }
 

@@ -4,6 +4,7 @@ const hpet = @import("../arch/x86_64/hpet.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const ioapic = @import("../arch/x86_64/ioapic.zig");
 const pit = @import("../arch/x86_64/pit.zig");
+const clocksource = @import("../platform/clocksource.zig");
 const monotonic_math = @import("../platform/monotonic_math.zig");
 
 pub const Backend = enum {
@@ -55,8 +56,9 @@ var tick_origin: u64 = 0;
 var event_epoch_ns: u64 = 0;
 var event_origin: u64 = 0;
 var logical_hz: u32 = DEFAULT_HZ;
-var modern_counter_origin: u64 = 0;
+var modern_clock_origin_ns: u64 = 0;
 var modern_counter_frequency_hz: u64 = 0;
+var modern_tick_scale: monotonic_math.FixedScale = .{};
 var deadline_enabled = false;
 var deadline_mode: Mode = .periodic;
 var armed_deadline: u64 = NO_DEADLINE;
@@ -77,8 +79,9 @@ pub fn initPit(requested_hz: u32) void {
     logical_hz = if (requested_hz == 0) DEFAULT_HZ else requested_hz;
     pit.init(logical_hz);
     backend = .pit;
-    modern_counter_origin = 0;
+    modern_clock_origin_ns = 0;
     modern_counter_frequency_hz = 0;
+    modern_tick_scale = .{};
     deadline_enabled = false;
     deadline_mode = .periodic;
     armed_deadline = NO_DEADLINE;
@@ -113,8 +116,9 @@ pub fn fallbackToPit() void {
     if (ioapic.isRoutingActive()) _ = ioapic.setLegacyIrqMasked(PIT_IRQ, false);
     pit.init(logical_hz);
     backend = .pit;
-    modern_counter_origin = 0;
+    modern_clock_origin_ns = 0;
     modern_counter_frequency_hz = 0;
+    modern_tick_scale = .{};
     deadline_enabled = false;
     deadline_mode = .periodic;
     armed_deadline = NO_DEADLINE;
@@ -134,6 +138,7 @@ pub fn onIrq() u64 {
         .lapic => _ = lapic.onTimerIrq(),
     }
     timer_irq_count +%= 1;
+    if ((timer_irq_count & 0x3FF) == 0) _ = clocksource.periodicValidate();
     const now = tickCount();
     last_irq_tick = now;
     if (deadline_mode == .one_shot_idle) {
@@ -202,18 +207,16 @@ fn rawTickCount() u64 {
 }
 
 fn modernTickCount() u64 {
-    if (modern_counter_frequency_hz == 0) return 0;
-    return monotonic_math.counterToTicks(
-        hpet.readExtendedMainCounter() -% modern_counter_origin,
-        modern_counter_frequency_hz,
-        logical_hz,
-    );
+    if (modern_counter_frequency_hz == 0 or !modern_tick_scale.valid()) return 0;
+    const now_ns = clocksource.nowNanoseconds() orelse return 0;
+    return modern_tick_scale.apply(now_ns -% modern_clock_origin_ns);
 }
 
 fn activateModernCounter() void {
-    const status = hpet.status();
-    modern_counter_frequency_hz = status.frequency_hz;
-    modern_counter_origin = hpet.readExtendedMainCounter();
+    const source = clocksource.status();
+    modern_counter_frequency_hz = source.frequency_hz;
+    modern_tick_scale = monotonic_math.FixedScale.initFloor(logical_hz, monotonic_math.nanoseconds_per_second);
+    modern_clock_origin_ns = clocksource.nowNanoseconds() orelse 0;
 }
 
 fn rebaseActiveClock() void {

@@ -294,16 +294,25 @@ Herkunft und die Migrationsgrenze stehen in `PROVENANCE.txt`.
 Monotone Plattformzeit
 ----------------------
 
-`platform/monotonic.zig` besitzt die kontinuierliche Nanosekundenepoche. Eine
-exakt ueber CPUID.15 kalibrierte invariante TSC ist der bevorzugte fruehe und
-guenstige Zeitgeber; andernfalls dient der freilaufende HPET-Hauptzaehler als
-IRQ-unabhaengige Quelle. Fehlen beide, bleibt ein ausdruecklich degradiertes
-periodisches Ereignismodell verfuegbar. Auf dem modernen Timerpfad leitet der
-Kernel seine logischen Scheduler-Ticks kontinuierlich aus dem HPET-
-Hauptzaehler ab. Bei aktiver Arbeit liefern HPET oder LAPIC weiterhin
-periodische Praeemption; im echten Idle programmiert der Scheduler nur die
-frueheste endliche Frist als HPET- beziehungsweise kalibrierten LAPIC-One-Shot.
-Ohne Frist bleibt die Quelle disarmed. PIT ist der periodische Fallback.
+`platform/clocksource.zig` besitzt die gemeinsame kontinuierliche
+Nanosekundenepoche; `platform/monotonic.zig` stellt sie den Kernelverbrauchern
+bereit. Bevorzugt wird eine invariante TSC mit exakter CPUID.15-Frequenz oder
+eine gegen HPET mehrfach kalibrierte und danach periodisch ueberwachte TSC.
+Begrenzte HPET-Korrelationen bestimmen vor der Freigabe jedes AP dessen
+TSC-Korrektur. Instabile Kalibrierung, zu grosse CPU-Abweichung oder eine
+spaetere Rueckwaertsbewegung beziehungsweise Drift schalten alle CPUs auf den
+freilaufenden HPET-Hauptzaehler um. Ein atomarer Clamp verhindert auch bei
+gleichzeitigen Lesern eine Rueckwaertsbewegung.
+
+Auf dem modernen Timerpfad entstehen logische Scheduler-Ticks aus derselben
+Nanosekundenepoche und einer vorab berechneten Multiply-/Shift-Skalierung. Der
+normale TSC-Lesepfad benoetigt dadurch weder HPET-MMIO noch Division. HPET und
+LAPIC bleiben davon getrennte periodische beziehungsweise One-Shot-
+Ereignisquellen. Fehlen TSC und HPET, bleibt das ausdruecklich degradierte
+periodische Modell; PIT ist der Ereignisfallback. R4OS besitzt derzeit keinen
+Suspend-/Resume-Lebenszyklus. Eine spaetere Implementierung muss die Clocksource
+vor erneuter Taskfreigabe qualifizieren; heutiges Idle wird durch Invarianz
+beziehungsweise HPET-Watchdog abgesichert.
 
 R4SYS stellt Instant und Clockmetadaten additiv bereit. R4DEV liefert darauf
 aufbauende Bootphasen- und IRQ-Zeitaufzeichnungen. Historische Spannen werden
