@@ -32,7 +32,7 @@ pub const NAME_UNITS_MAX: usize = 255;
 pub const NAME_MAX: usize = 768;
 pub const MAX_MFT_RUNS: usize = 64;
 pub const MAX_ATTR_RUNS: usize = 256;
-pub const METADATA_CACHE_VERSION: u32 = 1;
+pub const METADATA_CACHE_VERSION: u32 = 2;
 pub const METADATA_RECORD_CAPACITY: usize = 8;
 pub const METADATA_ATTRIBUTE_CAPACITY: usize = 4;
 pub const METADATA_INDEX_CAPACITY: usize = 2;
@@ -245,12 +245,33 @@ fn readSectors(v: *const Volume, lba: u64, count: u32, out: []u8) bool {
     return v.device.read_sectors(v.device.ctx, lba, count, out);
 }
 
-fn writeSectors(v: *const Volume, lba: u64, count: u32, data: []const u8) bool {
+const MetadataMutation = union(enum) {
+    /// File bytes changed without changing any decoded metadata.
+    payload,
+    /// One MFT record and every decoded view derived from it changed.
+    record: u64,
+    /// One non-resident attribute payload changed; its decoded descriptor is
+    /// discarded without touching unrelated records or paths.
+    attribute: struct {
+        record_number: u64,
+        attr_type: ntfs.AttrType,
+    },
+    /// One non-resident directory index changed; the directory record did not.
+    directory: u64,
+    /// Cache-independent, fully classified system metadata such as $MFTMirr.
+    system,
+    /// A mutation whose cache dependencies cannot be proven.
+    unknown,
+    /// Recovery and ambiguous rollback paths deliberately remain global.
+    recovery,
+};
+
+fn writeSectors(v: *const Volume, lba: u64, count: u32, data: []const u8, mutation: MetadataMutation) bool {
     if (!sectorIoRangeValid(v, lba, count, data.len)) return false;
-    // Invalidate decoded metadata before any physical write can become
-    // visible. This deliberately covers data, namespace, recovery and
-    // partial-failure paths with one correctness boundary.
-    if (count != 0) if (v.metadata_cache) |cache| cache.invalidateMutation();
+    // Publish the semantic invalidation before any physical write can become
+    // visible. Payload and cache-independent system writes retain decoded
+    // metadata; unknown and recovery writes remain conservative and global.
+    if (count != 0) if (v.metadata_cache) |cache| cache.invalidateMutation(mutation);
     return v.device.write_sectors(v.device.ctx, lba, count, data);
 }
 
@@ -264,13 +285,11 @@ fn readLcnBytes(v: *const Volume, lcn: u64, byte_offset: u64, out: []u8) bool {
 }
 
 /// Writes bytes addressed inside one extent starting at `lcn`.
-fn writeLcnBytes(v: *const Volume, lcn: u64, byte_offset: u64, data: []const u8) bool {
-    return lcnByteIo(v, lcn, byte_offset, @constCast(data), .write);
+fn writeLcnBytes(v: *const Volume, lcn: u64, byte_offset: u64, data: []const u8, mutation: MetadataMutation) bool {
+    return lcnByteIo(v, lcn, byte_offset, @constCast(data), mutation);
 }
 
-const IoDir = enum { write };
-
-fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, dir: ?IoDir) bool {
+fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, mutation: ?MetadataMutation) bool {
     if (v.cluster_bytes == 0 or v.cluster_bytes % SECTOR_SIZE != 0) return false;
     const total_clusters = v.totalClusters();
     if (lcn >= total_clusters) return false;
@@ -299,7 +318,10 @@ fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, dir: ?I
             const whole = remaining / SECTOR_SIZE;
             const chunk: u32 = @intCast(@min(whole, 64));
             const span = buffer[pos .. pos + @as(usize, chunk) * SECTOR_SIZE];
-            const ok = if (dir == null) readSectors(v, lba, chunk, span) else writeSectors(v, lba, chunk, span);
+            const ok = if (mutation) |kind|
+                writeSectors(v, lba, chunk, span, kind)
+            else
+                readSectors(v, lba, chunk, span);
             if (!ok) return false;
             pos += span.len;
             offset += span.len;
@@ -309,11 +331,11 @@ fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, dir: ?I
         const sector = v.scratch.sector[0..];
         if (!readSectors(v, lba, 1, sector)) return false;
         const take = @min(SECTOR_SIZE - in_sector, remaining);
-        if (dir == null) {
+        if (mutation == null) {
             @memcpy(buffer[pos .. pos + take], sector[in_sector .. in_sector + take]);
         } else {
             @memcpy(sector[in_sector .. in_sector + take], buffer[pos .. pos + take]);
-            if (!writeSectors(v, lba, 1, sector)) return false;
+            if (!writeSectors(v, lba, 1, sector, mutation.?)) return false;
         }
         pos += take;
         offset += take;
@@ -329,11 +351,11 @@ fn readRunBytes(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, out:
 }
 
 /// Writes a byte range in the VCN space of a runlist (sparse runs fail).
-fn writeRunBytes(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, data: []const u8) bool {
-    return runByteIo(v, runs, byte_offset, @constCast(data), .write);
+fn writeRunBytes(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, data: []const u8, mutation: MetadataMutation) bool {
+    return runByteIo(v, runs, byte_offset, @constCast(data), mutation);
 }
 
-fn runByteIo(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, buffer: []u8, dir: ?IoDir) bool {
+fn runByteIo(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, buffer: []u8, mutation: ?MetadataMutation) bool {
     const cluster: u64 = v.cluster_bytes;
     if (cluster == 0 or !runlistPhysicalRangeValid(v, runs)) return false;
     var want_start = byte_offset;
@@ -351,9 +373,12 @@ fn runByteIo(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, buffer:
             if (take > want_len) take = want_len;
             const span = buffer[buf_pos .. buf_pos + @as(usize, @intCast(take))];
             if (run.lcn) |lcn| {
-                const ok = if (dir == null) readLcnBytes(v, lcn, inside, span) else writeLcnBytes(v, lcn, inside, span);
+                const ok = if (mutation) |kind|
+                    writeLcnBytes(v, lcn, inside, span, kind)
+                else
+                    readLcnBytes(v, lcn, inside, span);
                 if (!ok) return false;
-            } else if (dir != null) {
+            } else if (mutation != null) {
                 return false; // writing into a sparse hole needs allocation
             }
             buf_pos += span.len;
@@ -480,11 +505,11 @@ pub fn mount(device: Device, partition_lba: u32, scratch: *Scratch, runs_out: []
     };
 }
 
-fn mftByteIo(v: *const Volume, byte_offset: u64, buffer: []u8, dir: ?IoDir) bool {
+fn mftByteIo(v: *const Volume, byte_offset: u64, buffer: []u8, mutation: ?MetadataMutation) bool {
     if (v.mft_run_count.* > v.mft_runs_buf.len) return false;
     const runs = v.mft_runs_buf[0..v.mft_run_count.*];
-    if (dir == null) return readRunBytes(v, runs, byte_offset, buffer);
-    return writeRunBytes(v, runs, byte_offset, buffer);
+    if (mutation == null) return readRunBytes(v, runs, byte_offset, buffer);
+    return writeRunBytes(v, runs, byte_offset, buffer, mutation.?);
 }
 
 /// Loads MFT record `number` into `buf`, removes fixups, parses the header.
@@ -520,7 +545,7 @@ fn storeRecord(v: *const Volume, number: u64, buf: []u8) bool {
     const usn = if (record.len >= 0x32) readLe16(record, readLe16(record, 4)) else 0;
     if (ntfs.installFixups(record, usn) != .ok) return false;
     const byte_offset = checkedMulU64(number, @as(u64, v.record_bytes)) orelse return false;
-    if (!mftByteIo(v, byte_offset, record, .write)) return false;
+    if (!mftByteIo(v, byte_offset, record, .{ .record = number })) return false;
     if (number < 4) {
         if (!syncMirror(v)) return false;
     }
@@ -542,7 +567,7 @@ fn syncMirror(v: *const Volume) bool {
     const attr = &v.scratch.attr_mirror;
     if (!collectAttribute(v, ntfs.MFT_RECORD_MFTMIRR, .data, &[_]u8{}, attr)) return false;
     if (attr.resident or attr.count == 0) return false;
-    return writeRunBytes(v, attr.runs[0..attr.count], 0, mirr[0..four]);
+    return writeRunBytes(v, attr.runs[0..attr.count], 0, mirr[0..four], .system);
 }
 
 fn readLe16(bytes: []const u8, offset: usize) u16 {
@@ -860,6 +885,18 @@ pub const MetadataCacheSummary = struct {
     mutation_invalidations: u64 = 0,
     external_invalidations: u64 = 0,
     invalidated_entries: u64 = 0,
+    payload_write_retentions: u64 = 0,
+    system_write_retentions: u64 = 0,
+    targeted_invalidations: u64 = 0,
+    targeted_record_invalidations: u64 = 0,
+    targeted_attribute_invalidations: u64 = 0,
+    targeted_directory_invalidations: u64 = 0,
+    global_mutation_invalidations: u64 = 0,
+    recovery_invalidations: u64 = 0,
+    mutation_invalidated_record_entries: u64 = 0,
+    mutation_invalidated_attribute_entries: u64 = 0,
+    mutation_invalidated_index_entries: u64 = 0,
+    mutation_invalidated_path_entries: u64 = 0,
     reclaim_requests: u64 = 0,
     reclaim_scans: u64 = 0,
     reclaimed_entries: u64 = 0,
@@ -928,6 +965,17 @@ const PathCacheLookup = enum {
     negative,
 };
 
+const MutationInvalidationCounts = struct {
+    records: u32 = 0,
+    attributes: u32 = 0,
+    indices: u32 = 0,
+    paths: u32 = 0,
+
+    fn total(self: MutationInvalidationCounts) u32 {
+        return self.records + self.attributes + self.indices + self.paths;
+    }
+};
+
 /// Fixed, caller-owned cache of decoded NTFS metadata. It never owns sector
 /// payloads and never grows: every replacement and reclaim pass is bounded by
 /// the capacities above. The filesystem request owner serializes mutations;
@@ -960,12 +1008,51 @@ pub const MetadataCache = struct {
         self.counters.invalidated_entries +%= invalidated;
     }
 
-    fn invalidateMutation(self: *MetadataCache) void {
-        const invalidated = self.clearEntries();
+    fn invalidateMutation(self: *MetadataCache, mutation: MetadataMutation) void {
+        switch (mutation) {
+            .payload => {
+                self.counters.payload_write_retentions +%= 1;
+            },
+            .record => |number| {
+                self.counters.targeted_invalidations +%= 1;
+                self.counters.targeted_record_invalidations +%= 1;
+                self.noteMutationInvalidation(self.clearRecordDependencies(number), false);
+            },
+            .attribute => |identity| {
+                self.counters.targeted_invalidations +%= 1;
+                self.counters.targeted_attribute_invalidations +%= 1;
+                self.noteMutationInvalidation(self.clearAttributeDependencies(identity.record_number, identity.attr_type), false);
+            },
+            .directory => |directory_record| {
+                self.counters.targeted_invalidations +%= 1;
+                self.counters.targeted_directory_invalidations +%= 1;
+                self.noteMutationInvalidation(self.clearDirectoryDependencies(directory_record), false);
+            },
+            .system => {
+                self.counters.system_write_retentions +%= 1;
+            },
+            .unknown => {
+                self.counters.global_mutation_invalidations +%= 1;
+                self.noteMutationInvalidation(self.clearEntriesCounted(), true);
+            },
+            .recovery => {
+                self.counters.global_mutation_invalidations +%= 1;
+                self.counters.recovery_invalidations +%= 1;
+                self.noteMutationInvalidation(self.clearEntriesCounted(), true);
+            },
+        }
+    }
+
+    fn noteMutationInvalidation(self: *MetadataCache, counts: MutationInvalidationCounts, global: bool) void {
+        const invalidated = counts.total();
         if (invalidated == 0) return;
-        self.generation = nextGeneration(self.generation);
+        if (global) self.generation = nextGeneration(self.generation);
         self.counters.mutation_invalidations +%= 1;
         self.counters.invalidated_entries +%= invalidated;
+        self.counters.mutation_invalidated_record_entries +%= counts.records;
+        self.counters.mutation_invalidated_attribute_entries +%= counts.attributes;
+        self.counters.mutation_invalidated_index_entries +%= counts.indices;
+        self.counters.mutation_invalidated_path_entries +%= counts.paths;
     }
 
     fn touch(self: *MetadataCache) u64 {
@@ -1295,25 +1382,77 @@ pub const MetadataCache = struct {
         return out;
     }
 
+    fn clearRecordDependencies(self: *MetadataCache, number: u64) MutationInvalidationCounts {
+        var counts = MutationInvalidationCounts{};
+        for (&self.records) |*entry| if (entry.valid and entry.number == number) {
+            entry.valid = false;
+            counts.records += 1;
+        };
+        for (&self.attributes) |*entry| if (entry.valid and entry.record_number == number) {
+            entry.valid = false;
+            counts.attributes += 1;
+        };
+        for (&self.indices) |*entry| if (entry.valid and entry.directory_record == number) {
+            entry.valid = false;
+            counts.indices += 1;
+        };
+        for (&self.paths) |*entry| if (entry.valid and
+            (entry.directory_record == number or (!entry.negative and entry.result.record == number)))
+        {
+            entry.valid = false;
+            counts.paths += 1;
+        };
+        return counts;
+    }
+
+    fn clearAttributeDependencies(self: *MetadataCache, record_number: u64, attr_type: ntfs.AttrType) MutationInvalidationCounts {
+        var counts = MutationInvalidationCounts{};
+        for (&self.attributes) |*entry| if (entry.valid and
+            entry.record_number == record_number and
+            entry.attr_type == @intFromEnum(attr_type))
+        {
+            entry.valid = false;
+            counts.attributes += 1;
+        };
+        return counts;
+    }
+
+    fn clearDirectoryDependencies(self: *MetadataCache, directory_record: u64) MutationInvalidationCounts {
+        var counts = MutationInvalidationCounts{};
+        for (&self.indices) |*entry| if (entry.valid and entry.directory_record == directory_record) {
+            entry.valid = false;
+            counts.indices += 1;
+        };
+        for (&self.paths) |*entry| if (entry.valid and entry.directory_record == directory_record) {
+            entry.valid = false;
+            counts.paths += 1;
+        };
+        return counts;
+    }
+
     fn clearEntries(self: *MetadataCache) u32 {
-        var cleared: u32 = 0;
+        return self.clearEntriesCounted().total();
+    }
+
+    fn clearEntriesCounted(self: *MetadataCache) MutationInvalidationCounts {
+        var counts = MutationInvalidationCounts{};
         for (&self.records) |*entry| if (entry.valid) {
             entry.valid = false;
-            cleared += 1;
+            counts.records += 1;
         };
         for (&self.attributes) |*entry| if (entry.valid) {
             entry.valid = false;
-            cleared += 1;
+            counts.attributes += 1;
         };
         for (&self.indices) |*entry| if (entry.valid) {
             entry.valid = false;
-            cleared += 1;
+            counts.indices += 1;
         };
         for (&self.paths) |*entry| if (entry.valid) {
             entry.valid = false;
-            cleared += 1;
+            counts.paths += 1;
         };
-        return cleared;
+        return counts;
     }
 
     fn clearSlot(self: *MetadataCache, slot: usize) bool {
@@ -1404,12 +1543,12 @@ fn loadIndexBlockCached(v: *const Volume, directory_record: u64, alloc_runs: []c
     return true;
 }
 
-fn storeIndexBlock(v: *const Volume, alloc_runs: []const ntfs.Run, vcn: u64) bool {
+fn storeIndexBlock(v: *const Volume, directory_record: u64, alloc_runs: []const ntfs.Run, vcn: u64) bool {
     const block = v.scratch.block[0..v.index_block_bytes];
     const usn = readLe16(block, readLe16(block, 4));
     if (ntfs.installFixups(block, usn) != .ok) return false;
     const byte_offset = clusterByteOffset(v, vcn) orelse return false;
-    if (!writeRunBytes(v, alloc_runs, byte_offset, block)) return false;
+    if (!writeRunBytes(v, alloc_runs, byte_offset, block, .{ .directory = directory_record })) return false;
     _ = ntfs.applyFixups(block);
     return true;
 }
@@ -2130,7 +2269,7 @@ fn setBitmapRange(v: *const Volume, bitmap_attr: *const AttrScratch, lcn: u64, c
                 sector_buf[byte_index] &= ~mask;
             }
         }
-        if (!writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..])) return false;
+        if (!writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..], .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_BITMAP, .attr_type = .data } })) return false;
     }
     return true;
 }
@@ -2192,7 +2331,7 @@ fn allocateRecord(v: *const Volume) ?struct { number: u64, sequence: u16 } {
     if (bitmap_attr.resident) return null;
     sector_buf[@intCast((number / 8) % SECTOR_SIZE)] |= @as(u8, 1) << @intCast(number % 8);
     const bitmap_offset = sectorByteOffset(number / 8 / SECTOR_SIZE) orelse return null;
-    if (!writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..])) return null;
+    if (!writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..], .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_MFT, .attr_type = .bitmap } })) return null;
     return .{ .number = number, .sequence = sequence };
 }
 
@@ -2231,7 +2370,7 @@ fn growMft(v: *const Volume) bool {
         var written: u64 = 0;
         const run_bytes = checkedMulU64(run.length_clusters, @as(u64, v.cluster_bytes)) orelse return false;
         while (written < run_bytes) : (written += SECTOR_SIZE) {
-            if (!writeLcnBytes(v, lcn, written, zeros[0..])) return false;
+            if (!writeLcnBytes(v, lcn, written, zeros[0..], .payload)) return false;
         }
     }
 
@@ -2293,7 +2432,7 @@ fn releaseRecord(v: *const Volume, number: u64) bool {
     const bitmap_offset = sectorByteOffset(sector_index) orelse return false;
     if (!readRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..])) return false;
     sector_buf[@intCast((number / 8) % SECTOR_SIZE)] &= ~(@as(u8, 1) << @intCast(number % 8));
-    return writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..]);
+    return writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..], .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_MFT, .attr_type = .bitmap } });
 }
 
 // ---------------------------------------------------------------------------
@@ -2766,12 +2905,12 @@ fn loadIndexBlockInto(v: *const Volume, alloc_runs: []const ntfs.Run, vcn: u64, 
     return ntfs.applyFixups(block) == .ok;
 }
 
-fn storeIndexBlockFrom(v: *const Volume, alloc_runs: []const ntfs.Run, vcn: u64, buf: []u8) bool {
+fn storeIndexBlockFrom(v: *const Volume, directory_record: u64, alloc_runs: []const ntfs.Run, vcn: u64, buf: []u8) bool {
     const block = buf[0..v.index_block_bytes];
     const usn = readLe16(block, readLe16(block, 4));
     if (ntfs.installFixups(block, usn) != .ok) return false;
     const byte_offset = clusterByteOffset(v, vcn) orelse return false;
-    if (!writeRunBytes(v, alloc_runs, byte_offset, block)) return false;
+    if (!writeRunBytes(v, alloc_runs, byte_offset, block, .{ .directory = directory_record })) return false;
     _ = ntfs.applyFixups(block);
     return true;
 }
@@ -3025,7 +3164,7 @@ fn pushRootDown(v: *const Volume, dir_record: u64) WriteStatus {
         pos += entryLenAt(block2, pos);
     }
     writeIndxHeaderLocal(v, block2, new_vcn, 0x40 + copy_len, has_children);
-    if (!storeIndexBlockFrom(v, alloc.runs[0..alloc.count], new_vcn, v.scratch.block2[0..])) return .io;
+    if (!storeIndexBlockFrom(v, dir_record, alloc.runs[0..alloc.count], new_vcn, v.scratch.block2[0..])) return .io;
 
     // Rebuild the root value: IndexRoot head + header + END(child=new_vcn).
     var root_value: [0x38]u8 = .{0} ** 0x38;
@@ -3092,7 +3231,7 @@ fn fitsIndexBlock(v: *const Volume) bool {
 /// Splits the overflowed scratch.block (at `vcn`): smaller half moves into a
 /// new block at `new_vcn`, the median is left in scratch.entry_a as an
 /// interior entry pointing at the new block.  Both blocks are stored.
-fn splitOverflowedBlock(v: *const Volume, alloc_runs: []const ntfs.Run, vcn: u64, new_vcn: u64) bool {
+fn splitOverflowedBlock(v: *const Volume, directory_record: u64, alloc_runs: []const ntfs.Run, vcn: u64, new_vcn: u64) bool {
     const block = v.scratch.block[0..];
     const header_at: usize = 0x18;
     const entries_at = header_at + readLe32(block, header_at + 0x00);
@@ -3141,7 +3280,7 @@ fn splitOverflowedBlock(v: *const Volume, alloc_runs: []const ntfs.Run, vcn: u64
     if (median_child) |c| writeLe64(block2, off + end2_len - 8, c);
     off += end2_len;
     writeIndxHeaderLocal(v, block2, new_vcn, off, has_children);
-    if (!storeIndexBlockFrom(v, alloc_runs, new_vcn, v.scratch.block2[0..])) return false;
+    if (!storeIndexBlockFrom(v, directory_record, alloc_runs, new_vcn, v.scratch.block2[0..])) return false;
 
     // Promote the median as an interior entry pointing at the new block.
     const fn_len: usize = readLe16(block, median_pos + 10);
@@ -3161,7 +3300,7 @@ fn splitOverflowedBlock(v: *const Volume, alloc_runs: []const ntfs.Run, vcn: u64
     const rest_len = entries_end - rest_start;
     for (block[rest_start..entries_end], 0..) |b, i| block[entries_at + i] = b;
     writeLe32(block, header_at + 0x04, @intCast(entries_at - header_at + rest_len));
-    return storeIndexBlock(v, alloc_runs, vcn);
+    return storeIndexBlock(v, directory_record, alloc_runs, vcn);
 }
 
 // ---- insert ----------------------------------------------------------------
@@ -3254,7 +3393,7 @@ fn insertPreparedEntry(v: *const Volume, dir_record: u64, entry_len: usize) Writ
         if (!loadIndexBlock(v, alloc.runs[0..alloc.count], path[level])) return .io;
         insertEntryIntoBlockSlack(v, v.scratch.entry_a[0..current_len]);
         if (fitsIndexBlock(v)) {
-            if (!storeIndexBlock(v, alloc.runs[0..alloc.count], path[level])) return .io;
+            if (!storeIndexBlock(v, dir_record, alloc.runs[0..alloc.count], path[level])) return .io;
             return .ok;
         }
         // Split; scratch.block holds the overflowed node, so the fresh VCN
@@ -3262,7 +3401,7 @@ fn insertPreparedEntry(v: *const Volume, dir_record: u64, entry_len: usize) Writ
         // only uses record/part_record scratch).
         const new_vcn = allocateIndexBlockVcn(v, dir_record) orelse return .no_space;
         if (!collectAttribute(v, dir_record, .index_allocation, &ntfs.I30_NAME_UTF16, alloc)) return .io;
-        if (!splitOverflowedBlock(v, alloc.runs[0..alloc.count], path[level], new_vcn)) return .io;
+        if (!splitOverflowedBlock(v, dir_record, alloc.runs[0..alloc.count], path[level], new_vcn)) return .io;
         current_len = promotedLen(v);
 
         if (level == 0) {
@@ -3275,7 +3414,7 @@ fn insertPreparedEntry(v: *const Volume, dir_record: u64, entry_len: usize) Writ
             if (!loadIndexBlock(v, alloc.runs[0..alloc.count], child)) return .io;
             insertEntryIntoBlockSlack(v, v.scratch.entry_a[0..current_len]);
             if (!fitsIndexBlock(v)) return .io; // cannot happen: root was small
-            if (!storeIndexBlock(v, alloc.runs[0..alloc.count], child)) return .io;
+            if (!storeIndexBlock(v, dir_record, alloc.runs[0..alloc.count], child)) return .io;
             return .ok;
         }
         level -= 1;
@@ -3429,7 +3568,7 @@ fn removeEntryFromBlock(v: *const Volume, dir_record: u64, alloc_runs: []const n
             for (block[tail_start..entries_end], 0..) |b, i| block[pos + i] = b;
             writeLe32(block, header_at + 0x04, index_length - @as(u32, @intCast(len)));
             const now_empty = !blockHasRealEntries(block[0..v.index_block_bytes]);
-            if (!storeIndexBlock(v, alloc_runs, vcn)) return .io;
+            if (!storeIndexBlock(v, dir_record, alloc_runs, vcn)) return .io;
             if (now_empty) return eliminateEmptyBlock(v, dir_record, vcn);
             return .ok;
         }
@@ -3523,7 +3662,7 @@ fn eliminateEmptyBlock(v: *const Volume, dir_record: u64, first_vcn: u64) WriteS
             } else {
                 if (!loadIndexBlock(v, alloc.runs[0..alloc.count], referrer.node_vcn)) return .io;
                 setEntryChildAt(v.scratch.block[0..], referrer.entry_pos, child);
-                if (!storeIndexBlock(v, alloc.runs[0..alloc.count], referrer.node_vcn)) return .io;
+                if (!storeIndexBlock(v, dir_record, alloc.runs[0..alloc.count], referrer.node_vcn)) return .io;
             }
             if (!freeIndexBlocks(v, dir_record, &[_]u64{vcn})) return .io;
             return .ok;
@@ -3550,7 +3689,7 @@ fn eliminateEmptyBlock(v: *const Volume, dir_record: u64, first_vcn: u64) WriteS
             const st = if (referrer.in_root)
                 removeEntryFromRoot(v, dir_record, name_copy[0..nm.len])
             else
-                removeEntryWithChildFromBlockByName(v, alloc.runs[0..alloc.count], referrer.node_vcn, name_copy[0..nm.len]);
+                removeEntryWithChildFromBlockByName(v, dir_record, alloc.runs[0..alloc.count], referrer.node_vcn, name_copy[0..nm.len]);
             if (st != .ok) return st;
             if (!freeIndexBlocks(v, dir_record, &[_]u64{vcn})) return .io;
             const plain_len = entryLenAt(v.scratch.entry_a[0..], 0);
@@ -3585,7 +3724,7 @@ fn eliminateEmptyBlock(v: *const Volume, dir_record: u64, first_vcn: u64) WriteS
         writeLe16(v.scratch.block[0..], end_pos + 12, ntfs.INDEX_ENTRY_END);
         writeLe32(v.scratch.block[0..], header_at + 0x04, readLe32(pblock, header_at + 0x04) - 8);
         v.scratch.block[0x24] = 0; // no longer has children
-        if (!storeIndexBlock(v, alloc.runs[0..alloc.count], referrer.node_vcn)) return .io;
+        if (!storeIndexBlock(v, dir_record, alloc.runs[0..alloc.count], referrer.node_vcn)) return .io;
         if (!freeIndexBlocks(v, dir_record, &[_]u64{vcn})) return .io;
         vcn = referrer.node_vcn;
     }
@@ -3609,7 +3748,7 @@ fn copyEntryPlain(v: *const Volume, buf: []const u8, pos: usize) bool {
 
 /// Generic by-name removal from a block that also handles entries WITH a
 /// child (the caller has already rescued the child linkage).
-fn removeEntryWithChildFromBlockByName(v: *const Volume, alloc_runs: []const ntfs.Run, vcn: u64, target: []const u8) WriteStatus {
+fn removeEntryWithChildFromBlockByName(v: *const Volume, dir_record: u64, alloc_runs: []const ntfs.Run, vcn: u64, target: []const u8) WriteStatus {
     if (!loadIndexBlock(v, alloc_runs, vcn)) return .io;
     const block = v.scratch.block[0..];
     const header_at: usize = 0x18;
@@ -3624,7 +3763,7 @@ fn removeEntryWithChildFromBlockByName(v: *const Volume, alloc_runs: []const ntf
             const tail_start = pos + len;
             for (block[tail_start..entries_end], 0..) |b, i| block[pos + i] = b;
             writeLe32(block, header_at + 0x04, index_length - @as(u32, @intCast(len)));
-            if (!storeIndexBlock(v, alloc_runs, vcn)) return .io;
+            if (!storeIndexBlock(v, dir_record, alloc_runs, vcn)) return .io;
             return .ok;
         }
         pos += entryLenAt(block, pos);
@@ -3695,7 +3834,7 @@ fn rotateEndFromBlock(v: *const Volume, dir_record: u64, node_vcn: u64, leaf_vcn
     for (block[tail_start..entries_end], 0..) |b, i| block[q_at + i] = b;
     writeLe32(block, header_at + 0x04, index_length - @as(u32, @intCast(q_len)));
     setEntryChildAt(v.scratch.block[0..], q_at, q_child);
-    if (!storeIndexBlock(v, alloc.runs[0..alloc.count], node_vcn)) return .io;
+    if (!storeIndexBlock(v, dir_record, alloc.runs[0..alloc.count], node_vcn)) return .io;
     if (!freeIndexBlocks(v, dir_record, &[_]u64{leaf_vcn})) return .io;
     const plain_len = entryLenAt(v.scratch.entry_a[0..], 0);
     return insertPreparedEntry(v, dir_record, plain_len);
@@ -3810,7 +3949,7 @@ fn interiorRemove(v: *const Volume, dir_record: u64, e_in_root: bool, e_vcn: u64
         setEntryChildAt(kblock[0..], end_at, q_child orelse return .io);
     }
     const k_now_empty = !blockHasRealEntries(kblock[0..v.index_block_bytes]);
-    if (!storeIndexBlock(v, alloc.runs[0..alloc.count], k_vcn.?)) return .io;
+    if (!storeIndexBlock(v, dir_record, alloc.runs[0..alloc.count], k_vcn.?)) return .io;
     if (!k_is_leaf) {
         if (!freeIndexBlocks(v, dir_record, chain[0..chain_len])) return .io;
     }
@@ -3925,13 +4064,13 @@ fn replaceInteriorEntry(v: *const Volume, dir_record: u64, in_root: bool, vcn: u
             const delta_new = @as(i64, @intCast(new_len)) - @as(i64, @intCast(old_len));
             writeLe32(block, header_at + 0x04, @intCast(@as(i64, @intCast(index_length)) + delta_new));
             if (fitsIndexBlock(v)) {
-                if (!storeIndexBlock(v, alloc.runs[0..alloc.count], vcn)) return .io;
+                if (!storeIndexBlock(v, dir_record, alloc.runs[0..alloc.count], vcn)) return .io;
                 return .ok;
             }
             // Overflow: split this node and promote via the insert machinery.
             const new_vcn = allocateIndexBlockVcn(v, dir_record) orelse return .no_space;
             if (!collectAttribute(v, dir_record, .index_allocation, &ntfs.I30_NAME_UTF16, alloc)) return .io;
-            if (!splitOverflowedBlock(v, alloc.runs[0..alloc.count], vcn, new_vcn)) return .io;
+            if (!splitOverflowedBlock(v, dir_record, alloc.runs[0..alloc.count], vcn, new_vcn)) return .io;
             return promoteIntoParentOf(v, dir_record, vcn);
         }
         pos += entryLenAt(block, pos);
@@ -4006,7 +4145,7 @@ fn updateIndexEntrySizes(v: *const Volume, dir_record: u64, name: []const u8, al
             if (order == .eq) {
                 patchDupAt(block, bpos, alloc_size, data_size, mtime);
                 last_append_diagnostic_stage = 178; // index block store
-                return storeIndexBlock(v, alloc.runs[0..alloc.count], cur);
+                return storeIndexBlock(v, dir_record, alloc.runs[0..alloc.count], cur);
             }
             if (order == .lt) {
                 bnext = entryChildAt(block, bpos);
@@ -4166,7 +4305,7 @@ pub fn createFile(v: *const Volume, parent_record: u64, name: []const u8, data: 
 
     // Write payload before the record references it.
     if (!resident and data.len > 0) {
-        if (!writeRunBytes(v, runs[0..run_count], 0, data)) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
+        if (!writeRunBytes(v, runs[0..run_count], 0, data, .payload)) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
         // Zero the slack in the last cluster.
         const tail = alloc_size - data.len;
         if (tail > 0) {
@@ -4174,7 +4313,7 @@ pub fn createFile(v: *const Volume, parent_record: u64, name: []const u8, data: 
             var written: u64 = 0;
             while (written < tail) {
                 const chunk = @min(tail - written, zeros.len);
-                if (!writeRunBytes(v, runs[0..run_count], data.len + written, zeros[0..@intCast(chunk)])) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
+                if (!writeRunBytes(v, runs[0..run_count], data.len + written, zeros[0..@intCast(chunk)], .payload)) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
                 written += chunk;
             }
         }
@@ -4468,6 +4607,10 @@ pub fn deleteRecoveryEntryIfIdentity(
     // The name was just resolved, so a zero count is corrupt metadata rather
     // than an absence.
     if (alias_count == 0) return .io;
+
+    // Recovery starts from an on-disk half-state. Even with exact object and
+    // directory identities, retain no decoded view across the first write.
+    if (v.metadata_cache) |cache| cache.invalidateMutation(.recovery);
 
     if (alias_count > 1) {
         if (!setDirty(v, true)) return .io;
@@ -4975,7 +5118,7 @@ fn appendFileAtOffsetImpl(v: *const Volume, parent_record: u64, name: []const u8
     if (total <= attr.alloc_size) {
         // Fits into existing allocation slack.
         last_append_diagnostic_stage = 9; // slack payload
-        if (!writeRunBytes(v, attr.runs[0..attr.count], attr.data_size, data)) return .io;
+        if (!writeRunBytes(v, attr.runs[0..attr.count], attr.data_size, data, .payload)) return .io;
         if (durable and !budgetedFlush(v)) return .io;
         last_append_diagnostic_stage = 10; // slack runlist
         const commit = commitDataRunlist(v, found.record, attr.runs[0..attr.count], total, total, attr.alloc_size);
@@ -5043,7 +5186,7 @@ fn appendFileAtOffsetImpl(v: *const Volume, parent_record: u64, name: []const u8
         return abortWriteFreeing(v, new_runs[0..produced], .io);
     };
     last_append_diagnostic_stage = 14; // extended payload
-    if (!writeRunBytes(v, attr.runs[0..total_runs], attr.data_size, data)) return abortWriteFreeing(v, new_runs[0..produced], .io);
+    if (!writeRunBytes(v, attr.runs[0..total_runs], attr.data_size, data, .payload)) return abortWriteFreeing(v, new_runs[0..produced], .io);
     if (durable and !budgetedFlush(v)) return abortWriteFreeing(v, new_runs[0..produced], .io);
     last_append_diagnostic_stage = 15; // extended runlist
     const commit = commitDataRunlist(v, found.record, attr.runs[0..total_runs], total, total, new_alloc);
@@ -5095,9 +5238,9 @@ fn convertResidentAndAppend(v: *const Volume, parent_record: u64, name: []const 
 
     // Old resident payload + new data into the fresh clusters.
     if (attr.resident_len > 0) {
-        if (!writeRunBytes(v, runs[0..produced], 0, attr.resident_copy[0..attr.resident_len])) return abortWriteFreeing(v, runs[0..produced], .io);
+        if (!writeRunBytes(v, runs[0..produced], 0, attr.resident_copy[0..attr.resident_len], .payload)) return abortWriteFreeing(v, runs[0..produced], .io);
     }
-    if (!writeRunBytes(v, runs[0..produced], attr.resident_len, data)) return abortWriteFreeing(v, runs[0..produced], .io);
+    if (!writeRunBytes(v, runs[0..produced], attr.resident_len, data, .payload)) return abortWriteFreeing(v, runs[0..produced], .io);
     if (durable and !budgetedFlush(v)) return abortWriteFreeing(v, runs[0..produced], .io);
 
     // Swap the record's $DATA to a non-resident stub with the new runlist.
@@ -6002,7 +6145,7 @@ fn zeroRunClusters(v: *const Volume, run: ntfs.Run) bool {
     var pos: u64 = 0;
     while (pos < total) {
         const take = @min(total - pos, ZERO_CHUNK.len);
-        if (!writeLcnBytes(v, lcn, pos, ZERO_CHUNK[0..@intCast(take)])) return false;
+        if (!writeLcnBytes(v, lcn, pos, ZERO_CHUNK[0..@intCast(take)], .payload)) return false;
         pos += take;
     }
     return true;
@@ -6025,7 +6168,7 @@ fn zeroMappedRange(v: *const Volume, runs: []const ntfs.Run, from: u64, to: u64)
                 const stop = if (run_end < to) run_end else to;
                 while (pos < stop) {
                     const take = @min(stop - pos, ZERO_CHUNK.len);
-                    if (!writeLcnBytes(v, lcn, pos - run_start, ZERO_CHUNK[0..@intCast(take)])) return false;
+                    if (!writeLcnBytes(v, lcn, pos - run_start, ZERO_CHUNK[0..@intCast(take)], .payload)) return false;
                     pos += take;
                 }
             }
@@ -6173,7 +6316,7 @@ pub fn writeFileAt(v: *const Volume, record_number: u64, offset: u64, data: []co
     const needs_metadata = is_sparse and
         (overlaps_hole or write_end > attr.initialized_size);
     if (!needs_metadata) {
-        if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data)) return .io;
+        if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data, .payload)) return .io;
         // Pure data writes stay lazy: no metadata changed, the page-cache
         // writeback worker drains the dirty pages.  A device flush per random
         // write made the pager/tooling paths measurably too slow.
@@ -6190,7 +6333,7 @@ pub fn writeFileAt(v: *const Volume, record_number: u64, offset: u64, data: []co
     if (offset > attr.initialized_size) {
         if (!zeroMappedRange(v, attr.runs[0..attr.count], attr.initialized_size, offset)) return .io;
     }
-    if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data)) return .io;
+    if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data, .payload)) return .io;
     if (!budgetedFlush(v)) return .io;
     const new_init = if (write_end > attr.initialized_size) write_end else attr.initialized_size;
     const commit = commitDataRunlist(v, record_number, attr.runs[0..attr.count], attr.data_size, new_init, attr.alloc_size);
@@ -6242,6 +6385,7 @@ pub fn storeRecordForTest(v: *const Volume, number: u64) bool {
 
 fn abortWrite(v: *const Volume, status: WriteStatus) WriteStatus {
     if (status == .cleanup_failed) return status;
+    if (v.metadata_cache) |cache| cache.invalidateMutation(.recovery);
     if (!setDirty(v, false)) return .cleanup_failed;
     return status;
 }
@@ -6250,12 +6394,16 @@ fn abortWriteAfterCommitFailure(v: *const Volume, status: WriteStatus) WriteStat
     // A store returning I/O may have reached media before its completion was
     // lost.  Keep the dirty bracket in that ambiguous state; clearing it
     // would falsely certify a runlist whose visibility is unknown.
-    if (status == .io or status == .cleanup_failed) return status;
+    if (status == .io or status == .cleanup_failed) {
+        if (v.metadata_cache) |cache| cache.invalidateMutation(.recovery);
+        return status;
+    }
     return abortWrite(v, status);
 }
 
 fn abortWriteFreeing(v: *const Volume, runs: []const ntfs.Run, status: WriteStatus) WriteStatus {
     if (status == .cleanup_failed) return status;
+    if (v.metadata_cache) |cache| cache.invalidateMutation(.recovery);
     // If cluster release fails, the dirty bit is deliberately retained.  A
     // successful dirty clear must never hide incomplete allocation cleanup.
     if (runs.len != 0 and !freeClusters(v, runs)) return .cleanup_failed;
@@ -6270,6 +6418,7 @@ fn abortWriteReleasingRecord(
     status: WriteStatus,
 ) WriteStatus {
     if (status == .cleanup_failed) return status;
+    if (v.metadata_cache) |cache| cache.invalidateMutation(.recovery);
     // A stored record is made non-live before its MFT bitmap bit and owned
     // clusters are released.  Stopping on the first failure avoids freeing
     // storage that an on-disk record may still reference.
@@ -6279,6 +6428,7 @@ fn abortWriteReleasingRecord(
 }
 
 fn rollbackUnpublishedRecord(v: *const Volume, record_number: u64, record_stored: bool, status: WriteStatus) WriteStatus {
+    if (v.metadata_cache) |cache| cache.invalidateMutation(.recovery);
     if (record_stored and !markRecordFree(v, record_number)) return .cleanup_failed;
     if (!releaseRecord(v, record_number)) return .cleanup_failed;
     return status;
@@ -6302,7 +6452,7 @@ pub fn abortWriteFreeingForTest(v: *const Volume, runs: []const ntfs.Run, status
     return abortWriteFreeing(v, runs, status);
 }
 
-test "metadata cache generation invalidates every decoded cache kind" {
+test "metadata mutations retain payload reads and invalidate exact dependencies" {
     const testing = @import("std").testing;
     var cache = MetadataCache{};
     cache.beginMount(100);
@@ -6346,12 +6496,58 @@ test "metadata cache generation invalidates every decoded cache kind" {
     try testing.expectEqual(@as(u32, 1), before.index_entries);
     try testing.expectEqual(@as(u32, 1), before.path_entries);
 
-    cache.invalidateMutation();
-    const after = cache.summary();
-    try testing.expectEqual(@as(u32, 0), after.record_entries + after.attribute_entries + after.index_entries + after.path_entries);
-    try testing.expectEqual(@as(u64, 1), after.mutation_invalidations);
-    try testing.expectEqual(@as(u64, 4), after.invalidated_entries);
+    cache.invalidateMutation(.payload);
+    var after = cache.summary();
+    try testing.expectEqual(@as(u32, 4), after.record_entries + after.attribute_entries + after.index_entries + after.path_entries);
+    try testing.expectEqual(@as(u64, 1), after.payload_write_retentions);
+
+    cache.invalidateMutation(.system);
+    after = cache.summary();
+    try testing.expectEqual(@as(u32, 4), after.record_entries + after.attribute_entries + after.index_entries + after.path_entries);
+    try testing.expectEqual(@as(u64, 1), after.system_write_retentions);
+
+    cache.invalidateMutation(.{ .attribute = .{ .record_number = 17, .attr_type = .data } });
+    after = cache.summary();
+    try testing.expectEqual(@as(u32, 0), after.attribute_entries);
+    try testing.expectEqual(@as(u32, 1), after.record_entries);
+    try testing.expectEqual(@as(u32, 1), after.index_entries);
+    try testing.expectEqual(@as(u32, 1), after.path_entries);
+    cache.storeAttribute(17, .data, &[_]u8{}, &attribute);
+
+    cache.invalidateMutation(.{ .record = 17 });
+    after = cache.summary();
+    try testing.expectEqual(@as(u32, 0), after.record_entries);
+    try testing.expectEqual(@as(u32, 0), after.attribute_entries);
+    try testing.expectEqual(@as(u32, 1), after.index_entries);
+    try testing.expectEqual(@as(u32, 0), after.path_entries);
     try testing.expect(!cache.lookupRecord(17, record_out[0..]));
+    try testing.expect(cache.lookupIndex(5, 2, block_out[0..]));
+
+    cache.storeRecord(17, record[0..]);
+    cache.storeAttribute(17, .data, &[_]u8{}, &attribute);
+    cache.storePath(5, name[0..name_len], .found, &found, 20);
+    cache.invalidateMutation(.{ .directory = 5 });
+    after = cache.summary();
+    try testing.expectEqual(@as(u32, 1), after.record_entries);
+    try testing.expectEqual(@as(u32, 1), after.attribute_entries);
+    try testing.expectEqual(@as(u32, 0), after.index_entries);
+    try testing.expectEqual(@as(u32, 0), after.path_entries);
+
+    cache.invalidateMutation(.recovery);
+    after = cache.summary();
+    try testing.expectEqual(@as(u32, 0), after.record_entries + after.attribute_entries + after.index_entries + after.path_entries);
+    try testing.expectEqual(@as(u64, 3), after.targeted_invalidations);
+    try testing.expectEqual(@as(u64, 1), after.targeted_record_invalidations);
+    try testing.expectEqual(@as(u64, 1), after.targeted_attribute_invalidations);
+    try testing.expectEqual(@as(u64, 1), after.targeted_directory_invalidations);
+    try testing.expectEqual(@as(u64, 1), after.global_mutation_invalidations);
+    try testing.expectEqual(@as(u64, 1), after.recovery_invalidations);
+    try testing.expectEqual(@as(u64, 4), after.mutation_invalidations);
+    try testing.expectEqual(@as(u64, 8), after.invalidated_entries);
+    try testing.expectEqual(@as(u64, 2), after.mutation_invalidated_record_entries);
+    try testing.expectEqual(@as(u64, 3), after.mutation_invalidated_attribute_entries);
+    try testing.expectEqual(@as(u64, 1), after.mutation_invalidated_index_entries);
+    try testing.expectEqual(@as(u64, 2), after.mutation_invalidated_path_entries);
 }
 
 test "negative path cache expires and external generation rejects stale results" {

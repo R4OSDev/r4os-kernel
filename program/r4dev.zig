@@ -1444,10 +1444,13 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v10_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_policy_version");
     const v11_size: usize = @offsetOf(ProgramPerformanceSummary, "ntfs_metadata_cache_version");
     const v12_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_capacity_min_pages");
-    const v13_size: usize = @sizeOf(ProgramPerformanceSummary);
+    const v13_size: usize = @offsetOf(ProgramPerformanceSummary, "ntfs_metadata_payload_write_retentions");
+    const v14_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v13_size)
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v14_size)
         performance_snapshot_version
+    else if (caller_version >= 13 and caller_size >= v13_size)
+        13
     else if (caller_version >= 12 and caller_size >= v12_size)
         12
     else if (caller_version >= 11 and caller_size >= v11_size)
@@ -1485,7 +1488,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         10 => v10_size,
         11 => v11_size,
         12 => v12_size,
-        else => v13_size,
+        13 => v13_size,
+        else => v14_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -2125,6 +2129,18 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .fs_cache_read_ahead_pages_scheduled = fs_cache.read_ahead_pages_scheduled,
         .fs_cache_read_ahead_pages_issued = fs_cache.read_ahead_pages_issued,
         .fs_cache_read_ahead_random_resets = fs_cache.read_ahead_random_resets,
+        .ntfs_metadata_payload_write_retentions = ntfs_metadata.payload_write_retentions,
+        .ntfs_metadata_system_write_retentions = ntfs_metadata.system_write_retentions,
+        .ntfs_metadata_targeted_invalidations = ntfs_metadata.targeted_invalidations,
+        .ntfs_metadata_targeted_record_invalidations = ntfs_metadata.targeted_record_invalidations,
+        .ntfs_metadata_targeted_attribute_invalidations = ntfs_metadata.targeted_attribute_invalidations,
+        .ntfs_metadata_targeted_directory_invalidations = ntfs_metadata.targeted_directory_invalidations,
+        .ntfs_metadata_global_mutation_invalidations = ntfs_metadata.global_mutation_invalidations,
+        .ntfs_metadata_recovery_invalidations = ntfs_metadata.recovery_invalidations,
+        .ntfs_metadata_mutation_invalidated_record_entries = ntfs_metadata.mutation_invalidated_record_entries,
+        .ntfs_metadata_mutation_invalidated_attribute_entries = ntfs_metadata.mutation_invalidated_attribute_entries,
+        .ntfs_metadata_mutation_invalidated_index_entries = ntfs_metadata.mutation_invalidated_index_entries,
+        .ntfs_metadata_mutation_invalidated_path_entries = ntfs_metadata.mutation_invalidated_path_entries,
         .fs_cache_clean_reclaimable_entries = fs_cache.clean_reclaimable_entries,
         .fs_cache_dirty_non_reclaimable_entries = fs_cache.dirty_non_reclaimable_entries,
         .fs_cache_pagefile_ready = 0,
