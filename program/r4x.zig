@@ -43,18 +43,9 @@ const MAX_API_PATH: usize = r4api.r4sys.max_api_path;
 // (1024) das Payload-Budget sinnlos spraengen wuerde.
 const MODULE_ORIGIN_MAX: usize = 128;
 const MAX_API_ARGS: usize = 128;
-const R4M_HEADER_SIZE: usize = 64;
-const R4M_SECTION_SIZE: usize = 32;
-const R4M_ENTRY_SIZE: usize = 16;
-const R4M_IMPORT_SIZE: usize = 16;
-const R4M_EXPORT_SIZE: usize = 16;
-const R4M_RELOCATION_SIZE: usize = 24;
-const R4M_VERSION: u16 = 1;
-const R4M_KIND_R4X: u16 = 1;
 const R4M_ENTRY_KIND_R4X: u32 = 1;
 const DEFAULT_CONSOLE_FG: u32 = 0xD8D8D8;
 const DEFAULT_CONSOLE_BG: u32 = 0x000000;
-const ARCH_X86_64: u16 = 1;
 const R4X_FLAG_APP_CLASS_CONSOLE: u32 = 0x00000001;
 const R4X_FLAG_APP_CLASS_GUI: u32 = 0x00000002;
 const R4X_FLAG_APP_CLASS_SERVICE: u32 = 0x00000004;
@@ -402,37 +393,6 @@ pub const ConsoleState = r4x_api.ConsoleState;
 pub const OutputCaptureResult = struct {
     len: usize,
     truncated: bool,
-};
-
-const Header = struct {
-    version: u16,
-    arch: u16,
-    header_size: u32,
-    code_offset: u32,
-    code_size: u32,
-    entry_offset: u32,
-    flags: u32,
-    reserved: u32,
-};
-
-const R4MHeader = struct {
-    version: u16,
-    arch: u16,
-    kind: u16,
-    header_size: u16,
-    flags: u32,
-    section_off: u32,
-    section_count: u32,
-    import_off: u32,
-    import_count: u32,
-    export_off: u32,
-    export_count: u32,
-    reloc_off: u32,
-    reloc_count: u32,
-    entry_off: u32,
-    entry_count: u32,
-    meta_off: u32,
-    meta_size: u32,
 };
 
 const R4MSection = struct {
@@ -7030,7 +6990,10 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
     }
     const instance_id = reservation.id;
     reportBootLaunchStage(options.report_boot_launch, "Header laden");
-    const header = readProgramHeader(file) orelse {
+    const source = programModuleFileSource(file);
+    const file_size: usize = @intCast(file.entry.size);
+    var module_reader = module_r4m.Reader.init(source, file_size);
+    const r4m_header = readR4MProgramHeaderFromReader(&module_reader, "r4x-image-header", true) orelse {
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_LOAD_FAILED);
         return .failed;
     };
@@ -7038,14 +7001,14 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_TASK_FAILED);
         return .failed;
     }
-    const app_class = resolveAppClass(policy, header.flags);
+    const app_class = resolveAppClass(policy, r4m_header.flags);
     if (shell_host != .none and app_class != .console) {
         k.puts("Console host requires a console program\r\n");
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_INVALID);
         return .failed;
     }
     reportBootLaunchStage(options.report_boot_launch, "Image laden");
-    var loaded = loadProgramImage(file, header, instance_id, app_class) orelse {
+    var loaded = loadR4MProgramImage(file, instance_id, app_class, &module_reader, r4m_header) orelse {
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_LOAD_FAILED);
         return .failed;
     };
@@ -7094,162 +7057,67 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
     };
 }
 
-fn readProgramHeader(file: ProgramFile) ?Header {
-    if (file.entry.size < 4) {
-        k.puts("Bad R4X file\r\n");
-        return null;
-    }
-    var raw: [R4M_HEADER_SIZE]u8 = .{0} ** R4M_HEADER_SIZE;
-    const want: usize = if (file.entry.size >= R4M_HEADER_SIZE) R4M_HEADER_SIZE else @intCast(file.entry.size);
-    var req = fs_request.begin(.loader_read, file.drive_letter) orelse return null;
-    var ok = false;
-    const len = vfs.readFileRange(file.volume, file.entry, 0, raw[0..want]) orelse {
-        fs_request.finish(&req, ok);
-        k.puts("Program header read failed\r\n");
-        return null;
-    };
-    if (len != want) {
-        fs_request.finish(&req, ok);
-        k.puts("Program header short read\r\n");
-        return null;
-    }
-    ok = true;
-    fs_request.finish(&req, ok);
-    return parseHeader(raw[0..want], @intCast(file.entry.size), true);
-}
-
-fn parseHeader(raw: []const u8, file_size: usize, verbose: bool) ?Header {
-    if (raw.len >= 4 and stdMemEql(raw[0..4], "R4X0")) {
-        if (verbose) k.puts("Legacy module format not supported\r\n");
-        return null;
-    }
-    if (raw.len < R4M_HEADER_SIZE) {
-        if (verbose) k.puts("Bad R4X file\r\n");
-        return null;
-    }
-    if (stdMemEql(raw[0..4], "R4M0")) {
-        const r4m = parseR4MHeader(raw[0..R4M_HEADER_SIZE]) orelse {
-            if (verbose) k.puts("Bad R4M0 header\r\n");
-            return null;
-        };
-        if (!validateR4MHeader(r4m, file_size, verbose)) return null;
-        return .{
-            .version = r4m.version,
-            .arch = r4m.arch,
-            .header_size = @intCast(r4m.header_size),
-            .code_offset = 0,
-            .code_size = @intCast(file_size),
-            .entry_offset = 0,
-            .flags = r4m.flags,
-            .reserved = 0,
-        };
-    }
-    if (verbose) k.puts("Bad R4X magic\r\n");
-    return null;
-}
-
 fn rejectHeader(message: []const u8, verbose: bool) bool {
     if (verbose) k.puts(message);
     return false;
 }
 
-fn readProgramHeaderQuiet(file: ProgramFile) ?Header {
-    if (file.entry.size < 4) return null;
-    var raw: [R4M_HEADER_SIZE]u8 = .{0} ** R4M_HEADER_SIZE;
-    const want: usize = if (file.entry.size >= R4M_HEADER_SIZE) R4M_HEADER_SIZE else @intCast(file.entry.size);
-    var req = fs_request.begin(.loader_read, file.drive_letter) orelse return null;
-    var ok = false;
-    const len = vfs.readFileRange(file.volume, file.entry, 0, raw[0..want]) orelse {
-        fs_request.finish(&req, ok);
-        return null;
-    };
-    if (len != want) {
-        fs_request.finish(&req, ok);
-        return null;
+const R4XExportContract = struct {
+    has_start_v1: bool = false,
+    has_start_v2_or_newer: bool = false,
+
+    fn hasExactStartV1(self: R4XExportContract) bool {
+        return self.has_start_v1 and !self.has_start_v2_or_newer;
     }
-    ok = true;
-    fs_request.finish(&req, ok);
-    return parseHeader(raw[0..want], @intCast(file.entry.size), false);
-}
+};
 
-fn readValidatedProgramMemoryContractFromRanges(file: ProgramFile, app_class: AppClass, verbose: bool) ?ProgramMemoryContract {
-    const source = programModuleFileSource(file);
-    const file_size: usize = @intCast(file.entry.size);
-    const r4m = readR4MProgramHeaderFromRanges(source, file_size, "r4x-contract-probe", verbose) orelse return null;
-
+fn readValidatedProgramMemoryContractFromReader(reader: *module_r4m.Reader, r4m: module_r4m.Header, app_class: AppClass, export_contract: R4XExportContract, verbose: bool) ?ProgramMemoryContract {
     var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
-    const meta = module_r4m.readMetadata(.{
-        .source = source,
-        .header = r4m,
-        .out = meta_buf[0..],
-        .name = "r4x-metadata-probe",
-        .verbose = verbose,
-    }) orelse return null;
-
-    var export_name_buf: [MAX_R4M_SYMBOL_PROBE]u8 = .{0} ** MAX_R4M_SYMBOL_PROBE;
-    const has_r4xstart_export_v1 = module_r4m.hasExport(.{
-        .source = source,
-        .file_size = file_size,
-        .header = r4m,
-        .symbol = "R4XStart",
-        .min_version = 1,
-        .scratch = export_name_buf[0..],
-        .name = "r4x-start-export-probe",
-        .verbose = verbose,
-    });
-    const has_r4xstart_export_v2_or_newer = module_r4m.hasExport(.{
-        .source = source,
-        .file_size = file_size,
-        .header = r4m,
-        .symbol = "R4XStart",
-        .min_version = 2,
-        .scratch = export_name_buf[0..],
-        .name = "r4x-start-newer-export-probe",
-        .verbose = verbose,
-    });
-    const has_exact_r4xstart_export_v1 = has_r4xstart_export_v1 and !has_r4xstart_export_v2_or_newer;
-    if (!r4x_start.accepts(meta, has_exact_r4xstart_export_v1, r4m.export_count)) return null;
+    const meta = reader.readMetadata(r4m, meta_buf[0..], "r4x-metadata-probe", verbose) orelse return null;
+    if (!r4x_start.accepts(meta, export_contract.hasExactStartV1(), r4m.export_count)) return null;
     return resolveProgramMemoryContractMetadata(meta, app_class);
 }
 
-fn readR4MProgramHeaderFromRanges(source: module_file.FileSource, file_size: usize, name: []const u8, verbose: bool) ?module_r4m.Header {
-    const r4m = module_r4m.readHeader(.{
-        .source = source,
-        .file_size = file_size,
-        .expected_kind = .r4x,
-        .limits = .{
-            .max_sections = MAX_R4M_SECTIONS,
-            .max_imports = MAX_R4M_IMPORTS,
-            .max_exports = MAX_R4M_EXPORTS,
-        },
-        .name = name,
-        .verbose = verbose,
-    }) orelse return null;
+fn readR4MProgramHeaderFromReader(reader: *module_r4m.Reader, name: []const u8, verbose: bool) ?module_r4m.Header {
+    const r4m = reader.readHeader(.r4x, .{
+        .max_sections = MAX_R4M_SECTIONS,
+        .max_imports = MAX_R4M_IMPORTS,
+        .max_exports = MAX_R4M_EXPORTS,
+    }, name, verbose) orelse return null;
     if (!validateR4MRangeHeader(r4m, verbose)) return null;
     return r4m;
 }
 
-fn loadProgramImage(file: ProgramFile, header: Header, owner_id: u32, app_class: AppClass) ?LoadedProgram {
-    _ = header;
-    return loadR4MProgramImage(file, owner_id, app_class);
+fn scanR4XStartExports(reader: *module_r4m.Reader, header: module_r4m.Header, verbose: bool) ?R4XExportContract {
+    var contract = R4XExportContract{};
+    var i: usize = 0;
+    while (i < header.export_count) : (i += 1) {
+        const exp = reader.readExportRecord(header, i, "r4x-export-table", verbose) orelse return null;
+        var name_buf: [MAX_R4M_SYMBOL_PROBE]u8 = .{0} ** MAX_R4M_SYMBOL_PROBE;
+        const name = reader.readZString(exp.name_offset, name_buf[0..], "r4x-export-name", verbose) orelse return null;
+        if (!stdMemEql(name, "R4XStart")) continue;
+        if (exp.version >= 1) contract.has_start_v1 = true;
+        if (exp.version >= 2) contract.has_start_v2_or_newer = true;
+    }
+    return contract;
 }
 
-fn loadR4MProgramImage(file: ProgramFile, owner_id: u32, app_class: AppClass) ?LoadedProgram {
+fn loadR4MProgramImage(file: ProgramFile, owner_id: u32, app_class: AppClass, reader: *module_r4m.Reader, r4m: module_r4m.Header) ?LoadedProgram {
     const source = programModuleFileSource(file);
     const file_size: usize = @intCast(file.entry.size);
-    const r4m = readR4MProgramHeaderFromRanges(source, file_size, "r4x-image-header", true) orelse return null;
-    const memory_contract = readValidatedProgramMemoryContractFromRanges(file, app_class, true) orelse return null;
 
     var sections: [MAX_R4M_SECTIONS]R4MSection = undefined;
-    if (!readR4MSectionsFromRanges(source, file_size, r4m, sections[0..])) {
+    if (!readR4MSectionsFromReader(reader, file_size, r4m, sections[0..])) {
         k.puts("Invalid R4M0 sections\r\n");
         return null;
     }
     const section_count: usize = @intCast(r4m.section_count);
-    if (!validateR4MExportsFromRanges(source, file_size, r4m, sections[0..section_count])) {
+    var export_contract = R4XExportContract{};
+    if (!validateR4MExportsFromReader(reader, r4m, sections[0..section_count], &export_contract)) {
         k.puts("Invalid R4M0 exports\r\n");
         return null;
     }
+    const memory_contract = readValidatedProgramMemoryContractFromReader(reader, r4m, app_class, export_contract, true) orelse return null;
     var section_offsets: [MAX_R4M_SECTIONS]usize = .{0} ** MAX_R4M_SECTIONS;
     const image_size = layoutR4MSections(sections[0..section_count], section_offsets[0..]) orelse {
         k.puts("Invalid R4M0 image layout\r\n");
@@ -7267,24 +7135,19 @@ fn loadR4MProgramImage(file: ProgramFile, owner_id: u32, app_class: AppClass) ?L
     }
 
     var resolved_imports: [MAX_R4M_IMPORTS]ResolvedR4MImport = .{ResolvedR4MImport{}} ** MAX_R4M_IMPORTS;
-    const import_count: usize = @intCast(r4m.import_count);
-    if (!resolveR4MImportsFromRanges(source, file_size, r4m, resolved_imports[0..])) {
-        freeProgramImage(image);
-        return null;
-    }
     var r4xstart_imports: [MAX_R4M_IMPORTS]R4XStartImportSeed = .{R4XStartImportSeed{}} ** MAX_R4M_IMPORTS;
-    if (!buildR4XStartImportsFromRanges(source, file_size, r4m, resolved_imports[0..import_count], r4xstart_imports[0..])) {
-        k.puts("Invalid R4XStart imports\r\n");
+    const import_count: usize = @intCast(r4m.import_count);
+    if (!resolveR4MImportsFromReader(reader, r4m, resolved_imports[0..], r4xstart_imports[0..])) {
         freeProgramImage(image);
         return null;
     }
     const r4xstart_import_count = r4m.import_count;
-    if (!applyR4MRelocationsFromRanges(source, r4m, sections[0..section_count], section_offsets[0..], image.code, resolved_imports[0..import_count])) {
+    if (!applyR4MRelocationsFromReader(reader, r4m, sections[0..section_count], section_offsets[0..], image.code, resolved_imports[0..import_count])) {
         freeProgramImage(image);
         return null;
     }
 
-    const entry_record = readR4MEntryFromRanges(source, r4m, 0) orelse {
+    const entry_record = readR4MEntryFromReader(reader, r4m, 0) orelse {
         k.puts("Invalid R4M0 entry\r\n");
         freeProgramImage(image);
         return null;
@@ -7326,52 +7189,6 @@ fn programModuleFileSource(file: ProgramFile) module_file.FileSource {
     };
 }
 
-fn parseR4MHeader(raw: []const u8) ?R4MHeader {
-    if (raw.len < R4M_HEADER_SIZE) return null;
-    if (!stdMemEql(raw[0..4], "R4M0")) return null;
-    return .{
-        .version = readLe16(raw[4..6]),
-        .arch = readLe16(raw[6..8]),
-        .kind = readLe16(raw[8..10]),
-        .header_size = readLe16(raw[10..12]),
-        .flags = readLe32(raw[12..16]),
-        .section_off = readLe32(raw[16..20]),
-        .section_count = readLe32(raw[20..24]),
-        .import_off = readLe32(raw[24..28]),
-        .import_count = readLe32(raw[28..32]),
-        .export_off = readLe32(raw[32..36]),
-        .export_count = readLe32(raw[36..40]),
-        .reloc_off = readLe32(raw[40..44]),
-        .reloc_count = readLe32(raw[44..48]),
-        .entry_off = readLe32(raw[48..52]),
-        .entry_count = readLe32(raw[52..56]),
-        .meta_off = readLe32(raw[56..60]),
-        .meta_size = readLe32(raw[60..64]),
-    };
-}
-
-fn validateR4MHeader(header: R4MHeader, file_size: usize, verbose: bool) bool {
-    if (header.version != R4M_VERSION) return rejectHeader("Unsupported R4M0 file\r\n", verbose);
-    if (header.arch != ARCH_X86_64) return rejectHeader("Unsupported R4M0 architecture\r\n", verbose);
-    if (header.kind != R4M_KIND_R4X) return rejectHeader("Unsupported R4M0 kind\r\n", verbose);
-    if (header.header_size != R4M_HEADER_SIZE) return rejectHeader("Invalid R4M0 header size\r\n", verbose);
-    if ((header.flags & ~R4X_KNOWN_FLAGS) != 0) return rejectHeader("Unsupported R4M0 flags\r\n", verbose);
-    if (appClassFlagCount(header.flags) > 1) {
-        return rejectHeader("Conflicting R4M0 app class flags\r\n", verbose);
-    }
-    if (header.section_count == 0 or header.section_count > MAX_R4M_SECTIONS) return rejectHeader("Invalid R4M0 section count\r\n", verbose);
-    if (header.import_count > MAX_R4M_IMPORTS) return rejectHeader("Invalid R4M0 import count\r\n", verbose);
-    if (header.export_count > MAX_R4M_EXPORTS) return rejectHeader("Invalid R4M0 export count\r\n", verbose);
-    if (header.entry_count == 0) return rejectHeader("Invalid R4M0 entry count\r\n", verbose);
-    if (!checkR4MTable(file_size, header.section_off, header.section_count, R4M_SECTION_SIZE, true)) return rejectHeader("Invalid R4M0 section table\r\n", verbose);
-    if (!checkR4MTable(file_size, header.entry_off, header.entry_count, R4M_ENTRY_SIZE, true)) return rejectHeader("Invalid R4M0 entry table\r\n", verbose);
-    if (!checkR4MTable(file_size, header.import_off, header.import_count, R4M_IMPORT_SIZE, false)) return rejectHeader("Invalid R4M0 import table\r\n", verbose);
-    if (!checkR4MTable(file_size, header.export_off, header.export_count, R4M_EXPORT_SIZE, false)) return rejectHeader("Invalid R4M0 export table\r\n", verbose);
-    if (!checkR4MTable(file_size, header.reloc_off, header.reloc_count, R4M_RELOCATION_SIZE, false)) return rejectHeader("Invalid R4M0 relocation table\r\n", verbose);
-    if (header.meta_size != 0 and !checkR4MRangeU32(file_size, header.meta_off, header.meta_size)) return rejectHeader("Invalid R4M0 metadata\r\n", verbose);
-    return true;
-}
-
 fn validateR4MRangeHeader(header: module_r4m.Header, verbose: bool) bool {
     if ((header.flags & ~R4X_KNOWN_FLAGS) != 0) return rejectHeader("Unsupported R4M0 flags\r\n", verbose);
     if (appClassFlagCount(header.flags) > 1) {
@@ -7381,12 +7198,12 @@ fn validateR4MRangeHeader(header: module_r4m.Header, verbose: bool) bool {
     return true;
 }
 
-fn readR4MSectionsFromRanges(source: module_file.FileSource, file_size: usize, header: module_r4m.Header, out: []R4MSection) bool {
+fn readR4MSectionsFromReader(reader: *module_r4m.Reader, file_size: usize, header: module_r4m.Header, out: []R4MSection) bool {
     if (header.section_count > out.len) return false;
     var non_alloc_seen = false;
     var i: usize = 0;
     while (i < header.section_count) : (i += 1) {
-        const record = module_r4m.readSectionRecord(source, header, i, "r4x-section-table", true) orelse return false;
+        const record = reader.readSectionRecord(header, i, "r4x-section-table", true) orelse return false;
         const section = R4MSection{
             .flags = record.flags,
             .file_off = record.file_off,
@@ -7415,12 +7232,17 @@ fn readR4MSectionsFromRanges(source: module_file.FileSource, file_size: usize, h
     return true;
 }
 
-fn validateR4MExportsFromRanges(source: module_file.FileSource, file_size: usize, header: module_r4m.Header, sections: []const R4MSection) bool {
+fn validateR4MExportsFromReader(reader: *module_r4m.Reader, header: module_r4m.Header, sections: []const R4MSection, contract: *R4XExportContract) bool {
+    contract.* = .{};
     var i: usize = 0;
     while (i < header.export_count) : (i += 1) {
-        const exp = module_r4m.readExportRecord(source, header, i, "r4x-export-table", true) orelse return false;
+        const exp = reader.readExportRecord(header, i, "r4x-export-table", true) orelse return false;
         var name_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        _ = module_r4m.readZString(source, file_size, exp.name_offset, name_buf[0..], "r4x-export-name", true) orelse return false;
+        const name = reader.readZString(exp.name_offset, name_buf[0..], "r4x-export-name", true) orelse return false;
+        if (stdMemEql(name, "R4XStart")) {
+            if (exp.version >= 1) contract.has_start_v1 = true;
+            if (exp.version >= 2) contract.has_start_v2_or_newer = true;
+        }
         const section_index: usize = @intCast(exp.section);
         const section_offset = exp.offset;
         if (section_index >= sections.len) return false;
@@ -7636,13 +7458,21 @@ fn readR4MSectionsIntoImage(source: module_file.FileSource, sections: []const R4
     return true;
 }
 
-fn resolveR4MImportsFromRanges(source: module_file.FileSource, file_size: usize, header: module_r4m.Header, out: []ResolvedR4MImport) bool {
-    if (header.import_count > out.len) return false;
+fn resolveR4MImportsFromReader(reader: *module_r4m.Reader, header: module_r4m.Header, resolved_out: []ResolvedR4MImport, start_out: []R4XStartImportSeed) bool {
+    if (header.import_count > resolved_out.len or header.import_count > start_out.len) return false;
     var i: usize = 0;
     while (i < header.import_count) : (i += 1) {
         var module_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
         var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const import = readR4MImportFromRanges(source, file_size, header, i, module_buf[0..], symbol_buf[0..]) orelse return false;
+        const record = reader.readImportRecord(header, i, "r4x-import-table", true) orelse return false;
+        const module_name = reader.readZString(record.module_offset, module_buf[0..], "r4x-import-module", true) orelse return false;
+        const symbol_name = reader.readZString(record.symbol_offset, symbol_buf[0..], "r4x-import-symbol", true) orelse return false;
+        const import = R4MImport{
+            .module = module_name,
+            .symbol = symbol_name,
+            .min_version = record.min_version,
+            .flags = record.flags,
+        };
         const resolved = modules.resolveExportInfo(import.module, import.symbol, import.min_version) orelse {
             k.puts("Unresolved R4M0 import ");
             k.puts(import.module);
@@ -7651,18 +7481,7 @@ fn resolveR4MImportsFromRanges(source: module_file.FileSource, file_size: usize,
             k.puts("\r\n");
             return false;
         };
-        out[i] = .{ .address = resolved.address, .version = resolved.version, .generation = resolved.generation };
-    }
-    return true;
-}
-
-fn buildR4XStartImportsFromRanges(source: module_file.FileSource, file_size: usize, header: module_r4m.Header, resolved_imports: []const ResolvedR4MImport, out: []R4XStartImportSeed) bool {
-    if (header.import_count > out.len or header.import_count > resolved_imports.len) return false;
-    var i: usize = 0;
-    while (i < header.import_count) : (i += 1) {
-        var module_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const import = readR4MImportFromRanges(source, file_size, header, i, module_buf[0..], symbol_buf[0..]) orelse return false;
+        resolved_out[i] = .{ .address = resolved.address, .version = resolved.version, .generation = resolved.generation };
         // Gruppen-IDs gehoeren ausschliesslich zu den sechs fest eingebauten
         // Plattform-APIs. Jeder Runtime-R4L-Export wird als benanntes
         // Interface mit group_id=0 transportiert.
@@ -7671,9 +7490,9 @@ fn buildR4XStartImportsFromRanges(source: module_file.FileSource, file_size: usi
         var seed = R4XStartImportSeed{
             .group_id = group_id,
             .min_version = import.min_version,
-            .resolved_version = resolved_imports[i].version,
+            .resolved_version = resolved.version,
             .flags = 0,
-            .table = resolved_imports[i].address,
+            .table = resolved.address,
         };
         if (!copyR4XStartName(import.module, seed.module_name[0..], &seed.module_name_len)) return false;
         if (!copyR4XStartName(import.symbol, seed.symbol_name[0..], &seed.symbol_name_len)) return false;
@@ -7691,12 +7510,12 @@ fn buildR4XStartImportsFromRanges(source: module_file.FileSource, file_size: usi
             k.puts(" need=");
             k.putDec(import.min_version);
             k.puts(" have=");
-            k.putDec(resolved_imports[i].version);
+            k.putDec(resolved.version);
             k.puts(" generation=");
-            k.putDec(resolved_imports[i].generation);
+            k.putDec(resolved.generation);
             k.puts("\r\n");
         }
-        out[i] = seed;
+        start_out[i] = seed;
     }
     return true;
 }
@@ -7722,11 +7541,11 @@ fn copyR4XStartName(src: []const u8, dest: []u8, out_len: *usize) bool {
     return true;
 }
 
-fn applyR4MRelocationsFromRanges(source: module_file.FileSource, header: module_r4m.Header, sections: []const R4MSection, section_offsets: []const usize, image: []u8, resolved_imports: []const ResolvedR4MImport) bool {
-    var reader = module_r4m.RelocationWindowReader.init(source, header, "r4x-relocation-table", true);
+fn applyR4MRelocationsFromReader(reader: *module_r4m.Reader, header: module_r4m.Header, sections: []const R4MSection, section_offsets: []const usize, image: []u8, resolved_imports: []const ResolvedR4MImport) bool {
+    var reloc_reader = module_r4m.RelocationWindowReader.init(reader, header, "r4x-relocation-table", true);
     var i: usize = 0;
     while (i < header.reloc_count) : (i += 1) {
-        const record = reader.next() orelse return false;
+        const record = reloc_reader.next() orelse return false;
         const reloc = R4MRelocation{
             .kind = record.kind,
             .patch_section = record.patch_section,
@@ -7794,24 +7613,12 @@ fn r4mTargetAddress(reloc: R4MRelocation, sections: []const R4MSection, section_
     return image_base + @as(u64, @intCast(section_offsets[section_index])) + reloc.target_offset;
 }
 
-fn readR4MEntryFromRanges(source: module_file.FileSource, header: module_r4m.Header, index: usize) ?R4MEntry {
-    const record = module_r4m.readEntryRecord(source, header, index, "r4x-entry-table", true) orelse return null;
+fn readR4MEntryFromReader(reader: *module_r4m.Reader, header: module_r4m.Header, index: usize) ?R4MEntry {
+    const record = reader.readEntryRecord(header, index, "r4x-entry-table", true) orelse return null;
     return .{
         .kind = record.kind,
         .section = record.section,
         .offset = record.offset,
-        .flags = record.flags,
-    };
-}
-
-fn readR4MImportFromRanges(source: module_file.FileSource, file_size: usize, header: module_r4m.Header, index: usize, module_buf: []u8, symbol_buf: []u8) ?R4MImport {
-    const record = module_r4m.readImportRecord(source, header, index, "r4x-import-table", true) orelse return null;
-    const module_name = module_r4m.readZString(source, file_size, record.module_offset, module_buf, "r4x-import-module", true) orelse return null;
-    const symbol_name = module_r4m.readZString(source, file_size, record.symbol_offset, symbol_buf, "r4x-import-symbol", true) orelse return null;
-    return .{
-        .module = module_name,
-        .symbol = symbol_name,
-        .min_version = record.min_version,
         .flags = record.flags,
     };
 }
@@ -15143,9 +14950,12 @@ fn appClassFlagCount(flags: u32) u8 {
 }
 
 fn classifyProgramFile(file: ProgramFile, policy: LaunchPolicy) ?AppClass {
-    const header = readProgramHeaderQuiet(file) orelse return null;
+    const source = programModuleFileSource(file);
+    var reader = module_r4m.Reader.init(source, @intCast(file.entry.size));
+    const header = readR4MProgramHeaderFromReader(&reader, "r4x-classify-header", false) orelse return null;
     const app_class = resolveAppClass(policy, header.flags);
-    _ = readValidatedProgramMemoryContractFromRanges(file, app_class, false) orelse return null;
+    const export_contract = scanR4XStartExports(&reader, header, false) orelse return null;
+    _ = readValidatedProgramMemoryContractFromReader(&reader, header, app_class, export_contract, false) orelse return null;
     return app_class;
 }
 

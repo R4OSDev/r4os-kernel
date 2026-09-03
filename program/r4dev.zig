@@ -1445,10 +1445,13 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v11_size: usize = @offsetOf(ProgramPerformanceSummary, "ntfs_metadata_cache_version");
     const v12_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_capacity_min_pages");
     const v13_size: usize = @offsetOf(ProgramPerformanceSummary, "ntfs_metadata_payload_write_retentions");
-    const v14_size: usize = @sizeOf(ProgramPerformanceSummary);
+    const v14_size: usize = @offsetOf(ProgramPerformanceSummary, "loader_file_range_read_bytes");
+    const v15_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v14_size)
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v15_size)
         performance_snapshot_version
+    else if (caller_version >= 14 and caller_size >= v14_size)
+        14
     else if (caller_version >= 13 and caller_size >= v13_size)
         13
     else if (caller_version >= 12 and caller_size >= v12_size)
@@ -1489,7 +1492,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         11 => v11_size,
         12 => v12_size,
         13 => v13_size,
-        else => v14_size,
+        14 => v14_size,
+        else => v15_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -1935,6 +1939,16 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .loader_file_pressure_reclaim_attempts = loader_file_stats.pressure_reclaim_attempts,
         .loader_file_pressure_reclaimed_frames = loader_file_stats.pressure_reclaimed_frames,
         .loader_file_pressure_failures = loader_file_stats.pressure_failures,
+        .loader_file_range_read_bytes = loader_file_stats.range_read_bytes,
+        .loader_metadata_reader_initializations = loader_file_stats.metadata_reader_initializations,
+        .loader_metadata_logical_reads = loader_file_stats.metadata_logical_reads,
+        .loader_metadata_logical_bytes = loader_file_stats.metadata_logical_bytes,
+        .loader_metadata_window_hits = loader_file_stats.metadata_window_hits,
+        .loader_metadata_window_fills = loader_file_stats.metadata_window_fills,
+        .loader_metadata_window_fill_bytes = loader_file_stats.metadata_window_fill_bytes,
+        .loader_metadata_direct_reads = loader_file_stats.metadata_direct_reads,
+        .loader_metadata_direct_bytes = loader_file_stats.metadata_direct_bytes,
+        .loader_metadata_window_capacity_bytes = module_file.metadata_window_capacity_bytes,
         .wait_object_waits = sched.object_waits,
         .wait_object_wakes = sched.object_wakes,
         .wait_object_timeouts = sched.object_timeouts,

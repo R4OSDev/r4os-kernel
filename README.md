@@ -115,12 +115,15 @@ changing the v1 prefix. The BSP implementation selects one queue and only
 validated RX TCP/UDP checksums. Every metadata packet still carries canonical
 flat bytes; unknown or rejected fields take the byte-identical software path.
 
-File-backed R4M0 relocation tables are streamed in record-aligned 4,080-byte
-windows while preserving record and error order. Installed disk R4P modules
-are catalogued from header and metadata only; their complete image,
-relocations, ABI checks, dependencies, and initialization run on the first
-actual role use. Required USB boot protocols retain their explicit eager
-preload path.
+File-backed R4M0 loads use one allocation-free reader with two 4-KiB metadata
+windows. Header, tables, names, metadata and relocation records share this
+fixed 8-KiB budget while section payloads stream directly into their final
+image. Validated imports and exports are retained in the load plan, eliminating
+duplicate table and string reads without changing record, error or publication
+order. Installed disk R4P modules are still catalogued from header and metadata
+only; their complete image, relocations, ABI checks, dependencies, and
+initialization run on the first actual role use. Required USB boot protocols
+retain their explicit eager preload path.
 
 R4SYS retains a validated R4R1 hive view for its complete file generation.
 Ordinary Registry reads use the resident immutable bytes without heap churn,

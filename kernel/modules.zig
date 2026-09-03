@@ -125,12 +125,43 @@ pub const Export = struct {
     section_offset: u32 = 0,
 };
 
+const FileImport = struct {
+    module: [MAX_NAME]u8 = .{0} ** MAX_NAME,
+    module_len: usize = 0,
+    symbol: [MAX_NAME]u8 = .{0} ** MAX_NAME,
+    symbol_len: usize = 0,
+    min_version: u32 = 0,
+    flags: u32 = 0,
+
+    fn view(self: *const FileImport) ImportRecord {
+        return .{
+            .module = self.module[0..self.module_len],
+            .symbol = self.symbol[0..self.symbol_len],
+            .min_version = self.min_version,
+            .flags = self.flags,
+        };
+    }
+};
+
+const ValidatedFileTables = struct {
+    header: Header,
+    sections: [MAX_SECTIONS]SectionHeader = undefined,
+    imports: [MAX_IMPORTS_PER_MODULE]FileImport = .{FileImport{}} ** MAX_IMPORTS_PER_MODULE,
+    exports: [MAX_EXPORTS_PER_MODULE]Export = .{Export{}} ** MAX_EXPORTS_PER_MODULE,
+    module_name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
+    module_name_len: usize = 0,
+
+    fn name(self: *const ValidatedFileTables, fallback_name: []const u8) []const u8 {
+        if (self.module_name_len != 0) return self.module_name[0..self.module_name_len];
+        return fallbackModuleName(fallback_name);
+    }
+};
+
 const PendingLibrary = struct {
     used: bool = false,
     state: PendingState = .empty,
     source: module_file.FileSource = undefined,
     file_size: usize = 0,
-    header: Header = undefined,
     file_name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
     file_name_len: usize = 0,
     module_name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
@@ -140,7 +171,6 @@ const PendingLibrary = struct {
 };
 
 const PendingLibraryProbe = struct {
-    header: Header = undefined,
     module_name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
     module_name_len: usize = 0,
 };
@@ -420,7 +450,6 @@ fn collectPendingLibrary(volume: vfs.Volume, file_entry: vfs.Entry, file_name: [
             .drive_letter = 'C',
         },
         .file_size = @intCast(file_entry.size),
-        .header = probe.header,
     };
     out.file_name_len = copyBytes(file_name, out.file_name[0..]);
     out.module_name_len = copyBytes(probe_module_name, out.module_name[0..]);
@@ -430,31 +459,18 @@ fn collectPendingLibrary(volume: vfs.Volume, file_entry: vfs.Entry, file_name: [
 
 fn readPendingLibraryProbe(volume: vfs.Volume, file_entry: vfs.Entry, file_name: []const u8) ?PendingLibraryProbe {
     var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
-    const header = module_r4m.readHeader(.{
-        .source = .{
-            .volume = volume,
-            .entry = file_entry,
-            .drive_letter = 'C',
-        },
-        .file_size = @intCast(file_entry.size),
-        .expected_kind = .r4l,
-        .limits = .{
-            .max_sections = MAX_SECTIONS,
-            .max_imports = MAX_IMPORTS_PER_MODULE,
-            .max_exports = MAX_EXPORTS_PER_MODULE,
-        },
-        .name = "r4l-metadata-probe",
-    }) orelse return null;
-    const meta = module_r4m.readMetadata(.{
-        .source = .{
-            .volume = volume,
-            .entry = file_entry,
-            .drive_letter = 'C',
-        },
-        .header = header,
-        .out = meta_buf[0..],
-        .name = "r4l-metadata-probe",
-    }) orelse return null;
+    const source = module_file.FileSource{
+        .volume = volume,
+        .entry = file_entry,
+        .drive_letter = 'C',
+    };
+    var reader = module_r4m.Reader.init(source, @intCast(file_entry.size));
+    const header = reader.readHeader(.r4l, .{
+        .max_sections = MAX_SECTIONS,
+        .max_imports = MAX_IMPORTS_PER_MODULE,
+        .max_exports = MAX_EXPORTS_PER_MODULE,
+    }, "r4l-metadata-probe", true) orelse return null;
+    const meta = reader.readMetadata(header, meta_buf[0..], "r4l-metadata-probe", true) orelse return null;
     const module_name = module_r4m.firstMetadataItem(meta) orelse fallbackModuleName(file_name);
     if (!validModuleName(module_name)) {
         k.puts("[MOD] invalid R4L module name file=");
@@ -463,7 +479,6 @@ fn readPendingLibraryProbe(volume: vfs.Volume, file_entry: vfs.Entry, file_name:
         return null;
     }
     var probe = PendingLibraryProbe{};
-    probe.header = header;
     probe.module_name_len = copyBytes(module_name, probe.module_name[0..]);
     return probe;
 }
@@ -510,22 +525,20 @@ fn resolveAndLoadPending(pending: []PendingLibrary, index: usize) bool {
         },
         .pending => blk: {
             p.state = .loading;
+            const tables = readValidatedFileTables(p.source, p.file_size, .r4l, p.file_name[0..p.file_name_len]) orelse {
+                p.state = .failed;
+                break :blk false;
+            };
             var resolved_buf: [MAX_IMPORTS_PER_MODULE]ResolvedImport = .{ResolvedImport{}} ** MAX_IMPORTS_PER_MODULE;
-            if (p.header.import_count > resolved_buf.len) {
+            if (tables.header.import_count > resolved_buf.len) {
                 p.state = .failed;
                 unresolved_import_errors += 1;
                 break :blk false;
             }
 
             var import_index: usize = 0;
-            while (import_index < p.header.import_count) : (import_index += 1) {
-                var module_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-                var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-                const import = readImportFromFile(p.source, p.file_size, p.header, import_index, module_buf[0..], symbol_buf[0..]) orelse {
-                    p.state = .failed;
-                    unresolved_import_errors += 1;
-                    break :blk false;
-                };
+            while (import_index < tables.header.import_count) : (import_index += 1) {
+                const import = tables.imports[import_index].view();
                 const resolved = resolveImport(pending, index, import) orelse {
                     if (p.state == .loading) p.state = .failed;
                     break :blk false;
@@ -538,11 +551,11 @@ fn resolveAndLoadPending(pending: []PendingLibrary, index: usize) bool {
             if (loadR4MFile(
                 p.source,
                 p.file_size,
-                p.header,
+                &tables,
                 .r4l,
                 p.file_name[0..p.file_name_len],
                 p.path[0..p.path_len],
-                resolved_buf[0..@intCast(p.header.import_count)],
+                resolved_buf[0..@intCast(tables.header.import_count)],
             ) != null) {
                 loader_perf.addR4lLoadTicks(load_start);
                 p.state = .loaded;
@@ -631,12 +644,13 @@ pub fn loadResolvedFile(source: module_file.FileSource, expected_kind: Kind, fal
         return null;
     }
     const file_size: usize = @intCast(source.entry.size);
-    const header = readR4MHeaderFromFile(source, file_size, expected_kind, "r4m-module-header") orelse {
+    const tables = readValidatedFileTables(source, file_size, expected_kind, fallback_name) orelse {
         k.puts("[MOD] bad R4M0 header: ");
         k.puts(fallback_name);
         k.puts("\r\n");
         return null;
     };
+    const header = tables.header;
     const kind = header.kind() orelse {
         k.puts("[MOD] unknown ModuleKind: ");
         k.puts(fallback_name);
@@ -649,15 +663,7 @@ pub fn loadResolvedFile(source: module_file.FileSource, expected_kind: Kind, fal
         k.puts("\r\n");
         return null;
     }
-    if (!validateModuleTablesFromFile(source, file_size, header, fallback_name)) {
-        k.puts("[MOD] invalid R4M0 tables: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    }
-
-    var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
-    const importer_name = moduleNameFromFile(source, header, meta_buf[0..]) orelse fallbackModuleName(fallback_name);
+    const importer_name = tables.name(fallback_name);
 
     var resolved_buf: [MAX_IMPORTS_PER_MODULE]ResolvedImport = .{ResolvedImport{}} ** MAX_IMPORTS_PER_MODULE;
     if (header.import_count > resolved_buf.len) {
@@ -670,15 +676,7 @@ pub fn loadResolvedFile(source: module_file.FileSource, expected_kind: Kind, fal
 
     var import_index: usize = 0;
     while (import_index < header.import_count) : (import_index += 1) {
-        var module_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const import = readImportFromFile(source, file_size, header, import_index, module_buf[0..], symbol_buf[0..]) orelse {
-            unresolved_import_errors += 1;
-            k.puts("[MOD] bad import importer=");
-            k.puts(importer_name);
-            k.puts("\r\n");
-            return null;
-        };
+        const import = tables.imports[import_index].view();
         const provider_slot = findByName(import.module) orelse {
             missing_dependency_errors += 1;
             k.puts("[MOD] resolver missing module=");
@@ -692,7 +690,7 @@ pub fn loadResolvedFile(source: module_file.FileSource, expected_kind: Kind, fal
         resolved_buf[import_index] = resolved;
     }
 
-    return loadR4MFile(source, file_size, header, expected_kind, fallback_name, path, resolved_buf[0..@intCast(header.import_count)]);
+    return loadR4MFile(source, file_size, &tables, expected_kind, fallback_name, path, resolved_buf[0..@intCast(header.import_count)]);
 }
 
 pub fn exportAddress(slot: usize, symbol: []const u8, min_version: u32) ?u64 {
@@ -808,7 +806,8 @@ fn resolveImportFromEntry(provider: *const Entry, import: ImportRecord, importer
     return resolved;
 }
 
-fn loadR4MFile(source: module_file.FileSource, file_size: usize, header: Header, expected_kind: Kind, fallback_name: []const u8, path: []const u8, resolved_imports: []const ResolvedImport) ?usize {
+fn loadR4MFile(source: module_file.FileSource, file_size: usize, tables: *const ValidatedFileTables, expected_kind: Kind, fallback_name: []const u8, path: []const u8, resolved_imports: []const ResolvedImport) ?usize {
+    const header = tables.header;
     const kind = header.kind() orelse {
         k.puts("[MOD] unknown ModuleKind: ");
         k.puts(fallback_name);
@@ -821,23 +820,10 @@ fn loadR4MFile(source: module_file.FileSource, file_size: usize, header: Header,
         k.puts("\r\n");
         return null;
     }
-    if (!validateModuleTablesFromFile(source, file_size, header, fallback_name)) {
-        k.puts("[MOD] invalid R4M0 tables: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    }
-
-    var section_headers: [MAX_SECTIONS]SectionHeader = undefined;
-    if (!readSectionsFromFile(source, file_size, header, section_headers[0..])) {
-        k.puts("[MOD] invalid R4M0 sections: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    }
+    const section_headers = tables.sections[0..@intCast(header.section_count)];
 
     var section_offsets: [MAX_SECTIONS]usize = .{0} ** MAX_SECTIONS;
-    const image_size = layoutSections(section_headers[0..@intCast(header.section_count)], section_offsets[0..]) orelse {
+    const image_size = layoutSections(section_headers, section_offsets[0..]) orelse {
         k.puts("[MOD] R4M0 image layout failed: ");
         k.puts(fallback_name);
         k.puts("\r\n");
@@ -857,8 +843,7 @@ fn loadR4MFile(source: module_file.FileSource, file_size: usize, header: Header,
         return null;
     };
 
-    var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
-    const module_name = moduleNameFromFile(source, header, meta_buf[0..]) orelse fallbackModuleName(fallback_name);
+    const module_name = tables.name(fallback_name);
     var bss_zeroed = true;
     var sections: [MAX_SECTIONS]Section = .{Section{}} ** MAX_SECTIONS;
     var i: usize = 0;
@@ -892,11 +877,12 @@ fn loadR4MFile(source: module_file.FileSource, file_size: usize, header: Header,
         };
     }
 
-    const reloc_stats = applyRelocationsFromFile(source, header, section_headers[0..@intCast(header.section_count)], section_offsets[0..], image, fallback_name, resolved_imports) orelse {
+    var reader = module_r4m.Reader.init(source, file_size);
+    const reloc_stats = applyRelocationsFromFile(&reader, header, section_headers, section_offsets[0..], image, fallback_name, resolved_imports) orelse {
         _ = heap.free(image);
         return null;
     };
-    if (kind == .r4l and !validateLoadedExportsFromFile(source, file_size, header, section_headers[0..@intCast(header.section_count)], section_offsets[0..], image, fallback_name)) {
+    if (kind == .r4l and !validateLoadedExportsFromTables(tables, section_headers, section_offsets[0..], image, fallback_name)) {
         _ = heap.free(image);
         return null;
     }
@@ -927,7 +913,7 @@ fn loadR4MFile(source: module_file.FileSource, file_size: usize, header: Header,
     };
     e.name_len = copyBytes(module_name, e.name[0..]);
     e.path_len = copyBytes(path, e.path[0..]);
-    fillExportsFromFile(e, source, file_size, header);
+    fillExportsFromTables(e, tables);
 
     k.puts("[MOD] load ");
     k.puts(e.name[0..e.name_len]);
@@ -1179,34 +1165,98 @@ fn readSections(header: Header, bytes: []const u8, out: []SectionHeader) bool {
     return true;
 }
 
-fn readR4MHeaderFromFile(source: module_file.FileSource, file_size: usize, expected_kind: Kind, name: []const u8) ?Header {
-    return module_r4m.readHeader(.{
-        .source = source,
-        .file_size = file_size,
-        .expected_kind = expected_kind,
-        .limits = .{
-            .max_sections = MAX_SECTIONS,
-            .max_imports = MAX_IMPORTS_PER_MODULE,
-            .max_exports = MAX_EXPORTS_PER_MODULE,
-        },
-        .name = name,
-    });
+fn readValidatedFileTables(source: module_file.FileSource, file_size: usize, expected_kind: Kind, fallback_name: []const u8) ?ValidatedFileTables {
+    var reader = module_r4m.Reader.init(source, file_size);
+    const header = reader.readHeader(expected_kind, .{
+        .max_sections = MAX_SECTIONS,
+        .max_imports = MAX_IMPORTS_PER_MODULE,
+        .max_exports = MAX_EXPORTS_PER_MODULE,
+    }, "r4m-module-header", true) orelse return null;
+    var tables = ValidatedFileTables{ .header = header };
+    if (!readSectionsFromReader(&reader, file_size, header, tables.sections[0..])) return null;
+    const sections = tables.sections[0..@intCast(header.section_count)];
+
+    var entry_index: usize = 0;
+    while (entry_index < header.entry_count) : (entry_index += 1) {
+        const entry = reader.readEntryRecord(header, entry_index, "r4m-entry-table", true) orelse return null;
+        if (entry.section >= sections.len) return null;
+        if (entry.offset >= sections[@intCast(entry.section)].mem_size) return null;
+    }
+
+    var import_index: usize = 0;
+    while (import_index < header.import_count) : (import_index += 1) {
+        const record = reader.readImportRecord(header, import_index, "r4m-import-table", true) orelse return null;
+        var module_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
+        var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
+        const module_name = reader.readZString(record.module_offset, module_buf[0..], "r4m-import-module", true) orelse return null;
+        const symbol_name = reader.readZString(record.symbol_offset, symbol_buf[0..], "r4m-import-symbol", true) orelse return null;
+        if (!validImportModuleName(module_name) or !validSymbolName(symbol_name) or record.min_version == 0) {
+            k.puts("[MOD] malformed import module=");
+            k.puts(module_name);
+            k.puts(" symbol=");
+            k.puts(symbol_name);
+            k.puts(" importer=");
+            k.puts(fallback_name);
+            k.puts("\r\n");
+            return null;
+        }
+        var file_import = &tables.imports[import_index];
+        file_import.module_len = copyBytes(module_name, file_import.module[0..]);
+        file_import.symbol_len = copyBytes(symbol_name, file_import.symbol[0..]);
+        file_import.min_version = record.min_version;
+        file_import.flags = record.flags;
+    }
+
+    var export_index: usize = 0;
+    while (export_index < header.export_count) : (export_index += 1) {
+        const record = reader.readExportRecord(header, export_index, "r4m-export-table", true) orelse return null;
+        var name_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
+        const export_name = reader.readZString(record.name_offset, name_buf[0..], "r4m-export-name", true) orelse return null;
+        if (!validSymbolName(export_name) or record.version == 0) {
+            k.puts("[MOD] malformed export module=");
+            k.puts(fallback_name);
+            k.puts(" symbol=");
+            k.puts(export_name);
+            k.puts("\r\n");
+            return null;
+        }
+        if (record.section >= sections.len or record.offset >= sections[@intCast(record.section)].mem_size) return null;
+        var prior_index: usize = 0;
+        while (prior_index < export_index) : (prior_index += 1) {
+            const prior = &tables.exports[prior_index];
+            if (nameEq(export_name, prior.name[0..prior.name_len])) {
+                k.puts("[MOD] duplicate export module=");
+                k.puts(fallback_name);
+                k.puts(" symbol=");
+                k.puts(export_name);
+                k.puts("\r\n");
+                return null;
+            }
+        }
+        var planned_export = &tables.exports[export_index];
+        planned_export.used = true;
+        planned_export.name_len = copyBytes(export_name, planned_export.name[0..]);
+        planned_export.version = record.version;
+        planned_export.section_index = record.section;
+        planned_export.section_offset = record.offset;
+    }
+
+    if (header.meta_size <= MAX_R4M_METADATA_PROBE) {
+        var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
+        if (reader.readMetadata(header, meta_buf[0..], "r4m-module-name", true)) |meta| {
+            if (module_r4m.firstMetadataItem(meta)) |module_name| {
+                tables.module_name_len = copyBytes(module_name, tables.module_name[0..]);
+            }
+        }
+    }
+    return tables;
 }
 
-fn validateModuleTablesFromFile(source: module_file.FileSource, file_size: usize, header: Header, fallback_name: []const u8) bool {
-    var section_headers: [MAX_SECTIONS]SectionHeader = undefined;
-    if (!readSectionsFromFile(source, file_size, header, section_headers[0..])) return false;
-    if (!validateEntriesFromFile(source, header, section_headers[0..@intCast(header.section_count)])) return false;
-    if (!validateImportsFromFile(source, file_size, header, fallback_name)) return false;
-    if (!validateExportsFromFile(source, file_size, header, section_headers[0..@intCast(header.section_count)], fallback_name)) return false;
-    return true;
-}
-
-fn readSectionsFromFile(source: module_file.FileSource, file_size: usize, header: Header, out: []SectionHeader) bool {
+fn readSectionsFromReader(reader: *module_r4m.Reader, file_size: usize, header: Header, out: []SectionHeader) bool {
     if (header.section_count > out.len) return false;
     var i: usize = 0;
     while (i < header.section_count) : (i += 1) {
-        const record = module_r4m.readSectionRecord(source, header, i, "r4m-section-table", true) orelse return false;
+        const record = reader.readSectionRecord(header, i, "r4m-section-table", true) orelse return false;
         const name_len = fixedNameLen(record.name[0..]);
         if (name_len == 0 or record.mem_size < record.file_size) return false;
         if (record.alignment == 0 or !isPowerOfTwo(record.alignment)) return false;
@@ -1224,91 +1274,17 @@ fn readSectionsFromFile(source: module_file.FileSource, file_size: usize, header
     return true;
 }
 
-fn validateEntriesFromFile(source: module_file.FileSource, header: Header, sections: []const SectionHeader) bool {
-    if (header.entry_count == 0) return false;
-    var i: usize = 0;
-    while (i < header.entry_count) : (i += 1) {
-        const entry = module_r4m.readEntryRecord(source, header, i, "r4m-entry-table", true) orelse return false;
-        if (entry.section >= sections.len) return false;
-        if (entry.offset >= sections[@intCast(entry.section)].mem_size) return false;
-    }
-    return true;
-}
-
-fn validateImportsFromFile(source: module_file.FileSource, file_size: usize, header: Header, fallback_name: []const u8) bool {
-    var i: usize = 0;
-    while (i < header.import_count) : (i += 1) {
-        var module_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const import = readImportFromFile(source, file_size, header, i, module_buf[0..], symbol_buf[0..]) orelse {
-            k.puts("[MOD] invalid import table: ");
-            k.puts(fallback_name);
-            k.puts("\r\n");
-            return false;
-        };
-        if (!validImportModuleName(import.module) or !validSymbolName(import.symbol) or import.min_version == 0) {
-            k.puts("[MOD] malformed import module=");
-            k.puts(import.module);
-            k.puts(" symbol=");
-            k.puts(import.symbol);
-            k.puts(" importer=");
-            k.puts(fallback_name);
-            k.puts("\r\n");
-            return false;
-        }
-    }
-    return true;
-}
-
-fn validateExportsFromFile(source: module_file.FileSource, file_size: usize, header: Header, sections: []const SectionHeader, fallback_name: []const u8) bool {
-    var i: usize = 0;
-    while (i < header.export_count) : (i += 1) {
-        const exp = module_r4m.readExportRecord(source, header, i, "r4m-export-table", true) orelse return false;
-        var name_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const name = module_r4m.readZString(source, file_size, exp.name_offset, name_buf[0..], "r4m-export-name", true) orelse return false;
-        if (!validSymbolName(name) or exp.version == 0) {
-            k.puts("[MOD] malformed export module=");
-            k.puts(fallback_name);
-            k.puts(" symbol=");
-            k.puts(name);
-            k.puts("\r\n");
-            return false;
-        }
-        if (exp.section >= sections.len) return false;
-        if (exp.offset >= sections[@intCast(exp.section)].mem_size) return false;
-        var prior_index: usize = 0;
-        while (prior_index < i) : (prior_index += 1) {
-            const prior = module_r4m.readExportRecord(source, header, prior_index, "r4m-export-table", true) orelse return false;
-            var prior_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-            const prior_name = module_r4m.readZString(source, file_size, prior.name_offset, prior_buf[0..], "r4m-export-name", true) orelse return false;
-            if (nameEq(name, prior_name)) {
-                k.puts("[MOD] duplicate export module=");
-                k.puts(fallback_name);
-                k.puts(" symbol=");
-                k.puts(name);
-                k.puts("\r\n");
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-fn validateLoadedExportsFromFile(
-    source: module_file.FileSource,
-    file_size: usize,
-    header: Header,
+fn validateLoadedExportsFromTables(
+    tables: *const ValidatedFileTables,
     sections: []const SectionHeader,
     section_offsets: []const usize,
     image: []const u8,
     module_name: []const u8,
 ) bool {
     var i: usize = 0;
-    while (i < header.export_count) : (i += 1) {
-        const exp = module_r4m.readExportRecord(source, header, i, "r4m-export-table", true) orelse return false;
-        var name_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const name = module_r4m.readZString(source, file_size, exp.name_offset, name_buf[0..], "r4m-export-name", true) orelse return false;
-        if (!validateLoadedExport(name, exp.version, exp.section, exp.offset, sections, section_offsets, image, module_name)) return false;
+    while (i < tables.header.export_count) : (i += 1) {
+        const exp = &tables.exports[i];
+        if (!validateLoadedExport(exp.name[0..exp.name_len], exp.version, exp.section_index, exp.section_offset, sections, section_offsets, image, module_name)) return false;
     }
     return true;
 }
@@ -1505,12 +1481,12 @@ fn applyRelocations(bytes: []const u8, header: Header, sections: []const Section
     return stats;
 }
 
-fn applyRelocationsFromFile(source: module_file.FileSource, header: Header, sections: []const SectionHeader, section_offsets: []const usize, image: []u8, module_name: []const u8, resolved_imports: []const ResolvedImport) ?RelocStats {
+fn applyRelocationsFromFile(reader: *module_r4m.Reader, header: Header, sections: []const SectionHeader, section_offsets: []const usize, image: []u8, module_name: []const u8, resolved_imports: []const ResolvedImport) ?RelocStats {
     var stats: RelocStats = .{};
-    var reader = module_r4m.RelocationWindowReader.init(source, header, "r4m-relocation-table", true);
+    var reloc_reader = module_r4m.RelocationWindowReader.init(reader, header, "r4m-relocation-table", true);
     var i: usize = 0;
     while (i < header.reloc_count) : (i += 1) {
-        const record = reader.next() orelse return null;
+        const record = reloc_reader.next() orelse return null;
         const reloc = Relocation{
             .kind = record.kind,
             .patch_section = record.patch_section,
@@ -1637,18 +1613,6 @@ fn readImport(bytes: []const u8, header: Header, index: usize) ?ImportRecord {
     };
 }
 
-fn readImportFromFile(source: module_file.FileSource, file_size: usize, header: Header, index: usize, module_buf: []u8, symbol_buf: []u8) ?ImportRecord {
-    const record = module_r4m.readImportRecord(source, header, index, "r4m-import-table", true) orelse return null;
-    const module_name = module_r4m.readZString(source, file_size, record.module_offset, module_buf, "r4m-import-module", true) orelse return null;
-    const symbol_name = module_r4m.readZString(source, file_size, record.symbol_offset, symbol_buf, "r4m-import-symbol", true) orelse return null;
-    return .{
-        .module = module_name,
-        .symbol = symbol_name,
-        .min_version = record.min_version,
-        .flags = record.flags,
-    };
-}
-
 fn relocationPatchSize(kind: u32) u32 {
     return switch (kind) {
         R4M_RELOC_REL32 => 4,
@@ -1751,24 +1715,22 @@ fn fillExports(e: *Entry, bytes: []const u8, header: Header) void {
     }
 }
 
-fn fillExportsFromFile(e: *Entry, source: module_file.FileSource, file_size: usize, header: Header) void {
+fn fillExportsFromTables(e: *Entry, tables: *const ValidatedFileTables) void {
     var i: usize = 0;
-    while (i < header.export_count and i < e.exports.len) : (i += 1) {
-        const record = module_r4m.readExportRecord(source, header, i, "r4m-export-table", true) orelse continue;
-        var name_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const name = module_r4m.readZString(source, file_size, record.name_offset, name_buf[0..], "r4m-export-name", true) orelse continue;
-        if (record.section >= e.section_count or record.section >= e.sections.len) continue;
-        const section = &e.sections[@intCast(record.section)];
-        if (!section.used or record.offset >= section.mem_size) continue;
+    while (i < tables.header.export_count and i < e.exports.len) : (i += 1) {
+        const planned = &tables.exports[i];
+        if (planned.section_index >= e.section_count or planned.section_index >= e.sections.len) continue;
+        const section = &e.sections[@intCast(planned.section_index)];
+        if (!section.used or planned.section_offset >= section.mem_size) continue;
 
         e.exports[i] = .{
             .used = true,
-            .version = record.version,
-            .address = section.runtime_base + record.offset,
-            .section_index = record.section,
-            .section_offset = record.offset,
+            .version = planned.version,
+            .address = section.runtime_base + planned.section_offset,
+            .section_index = planned.section_index,
+            .section_offset = planned.section_offset,
         };
-        e.exports[i].name_len = copyBytes(name, e.exports[i].name[0..]);
+        e.exports[i].name_len = copyBytes(planned.name[0..planned.name_len], e.exports[i].name[0..]);
     }
 }
 
@@ -1804,16 +1766,6 @@ fn findPendingByName(pending: []PendingLibrary, name: []const u8) ?usize {
 fn moduleName(bytes: []const u8, header: Header) ?[]const u8 {
     if (header.meta_size == 0) return null;
     return zString(bytes, header.meta_off);
-}
-
-fn moduleNameFromFile(source: module_file.FileSource, header: Header, out: []u8) ?[]const u8 {
-    const meta = module_r4m.readMetadata(.{
-        .source = source,
-        .header = header,
-        .out = out,
-        .name = "r4m-module-name",
-    }) orelse return null;
-    return module_r4m.firstMetadataItem(meta);
 }
 
 fn fallbackModuleName(file_name: []const u8) []const u8 {

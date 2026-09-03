@@ -802,26 +802,14 @@ fn parseR4MDriverInfo(bytes: []const u8, fallback_name: []const u8) ?R4MDriverIn
 
 fn readR4MDriverInfoFromFile(volume: vfs.Volume, entry: vfs.Entry, fallback_name: []const u8) ?R4MDriverInfo {
     var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
-    const header = module_r4m.readHeader(.{
-        .source = .{
-            .volume = volume,
-            .entry = entry,
-            .drive_letter = 'C',
-        },
-        .file_size = @intCast(entry.size),
-        .expected_kind = .r4d,
-        .name = "r4d-metadata-probe",
-    }) orelse return null;
-    const meta = module_r4m.readMetadata(.{
-        .source = .{
-            .volume = volume,
-            .entry = entry,
-            .drive_letter = 'C',
-        },
-        .header = header,
-        .out = meta_buf[0..],
-        .name = "r4d-metadata-probe",
-    }) orelse return null;
+    const source = module_file.FileSource{
+        .volume = volume,
+        .entry = entry,
+        .drive_letter = 'C',
+    };
+    var reader = module_r4m.Reader.init(source, @intCast(entry.size));
+    const header = reader.readHeader(.r4d, .{}, "r4d-metadata-probe", true) orelse return null;
+    const meta = reader.readMetadata(header, meta_buf[0..], "r4d-metadata-probe", true) orelse return null;
     return parseR4MDriverInfoMeta(meta, fallback_name);
 }
 
