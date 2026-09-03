@@ -202,6 +202,7 @@ pub fn build(b: *std.Build) void {
         "memory/page_batch.zig",
         "kernel/bootscreen_r4b_format.zig",
         "kernel/dma_segments.zig",
+        "kernel/pci_interrupt_policy.zig",
         "kernel/driver_work_deadline.zig",
         "kernel/driver_work_queue.zig",
         "driver/com_tx_policy.zig",

@@ -329,9 +329,13 @@ fn firstRemoteCpu(mask: u64) ?u32 {
 // fixed integer work once on the BSP and once as one permanently placed
 // internal worker per online CPU.  This is an acceptance probe, not the
 // release benchmark and not a public affinity interface.
+pub fn acceptanceProbeEnabled() bool {
+    const value = boot_config.optionValue(boot_config.get(), "SMP", "selftest") orelse return false;
+    return std.ascii.eqlIgnoreCase(value, "yes");
+}
+
 pub fn runAcceptanceProbeIfEnabled(usable_bytes: u64) bool {
-    const value = boot_config.optionValue(boot_config.get(), "SMP", "selftest") orelse return true;
-    if (!std.ascii.eqlIgnoreCase(value, "yes")) return true;
+    if (!acceptanceProbeEnabled()) return true;
 
     const online_mask = percpu.schedulableMask();
     const online_count: u32 = @intCast(@popCount(online_mask));

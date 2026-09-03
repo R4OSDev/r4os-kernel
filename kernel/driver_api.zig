@@ -9,6 +9,7 @@ const log_event = @import("log_event.zig");
 const net = @import("../net/core.zig");
 const net_backend = @import("../net/backend_contract.zig");
 const pci_inventory = @import("../platform/pci_inventory.zig");
+const pci_interrupt_policy = @import("pci_interrupt_policy.zig");
 const smp = @import("smp.zig");
 const paging = @import("../memory/paging.zig");
 const phys = @import("../memory/phys.zig");
@@ -381,8 +382,14 @@ const DmaMappingRecord = struct {
     segments: dma_segments.SegmentList = .{},
 };
 
+const MsiKind = enum(u8) {
+    msi,
+    msix,
+};
+
 const MsiAllocation = struct {
     used: bool = false,
+    kind: MsiKind = .msi,
     owner: u32 = 0,
     bus_kind: u8 = 0,
     bus: u8 = 0,
@@ -392,6 +399,11 @@ const MsiAllocation = struct {
     capability: u16 = 0,
     original_control: u16 = 0,
     original_command: u16 = 0,
+    msix_table_virt: u64 = 0,
+    msix_original_address_low: u32 = 0,
+    msix_original_address_high: u32 = 0,
+    msix_original_data: u32 = 0,
+    msix_original_vector_control: u32 = 0,
 };
 
 const MsiOwnerCleanupResult = struct {
@@ -1263,7 +1275,14 @@ fn releaseIrq(irq: u8) callconv(.c) i32 {
 }
 
 fn irqRegister(irq: u8, handler: IrqHandler, context: usize, flags: u32) callconv(.c) i32 {
-    return irq_router.register(irq, handler, context, flags, activeOwner());
+    const owner = activeOwner();
+    const registered = irq_router.register(irq, handler, context, flags, owner);
+    if (registered != 0) return registered;
+    if ((flags & irq_router.IRQ_FLAG_MSI) != 0 and !unmaskRegisteredMsix(owner, irq)) {
+        _ = irq_router.unregister(irq, handler, context);
+        return -5;
+    }
+    return 0;
 }
 
 fn irqUnregister(irq: u8, handler: IrqHandler, context: usize) callconv(.c) i32 {
@@ -1395,28 +1414,42 @@ fn pciEnableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i3
     const status_command = pciReadConfig32(bus_kind, bus, device, function, 0x04);
     if (status_command == 0xFFFF_FFFF or (status_command & (@as(u32, 1) << 20)) == 0) return -1;
 
-    // Begrenzter, zyklussicherer Capability-Walk nach Cap-ID 0x05.
+    // Begrenzter, zyklussicherer Capability-Walk. Die bestehende Funktion
+    // bevorzugt weiterhin MSI (0x05), akzeptiert fuer NVMe und andere moderne
+    // Endpunkte aber auch genau einen MSI-X-Tabelleneintrag (0x11).
     var offset: u16 = @as(u16, @as(u8, @truncate(pciReadConfig32(bus_kind, bus, device, function, 0x34)))) & 0xFC;
     var cap: u16 = 0;
+    var msix_cap: u16 = 0;
+    var visited: u64 = 0;
     var steps: u8 = 0;
     while (offset >= 0x40 and offset <= 0xFC and steps < 48) : (steps += 1) {
+        const visited_index: u6 = @intCast((offset - 0x40) / 4);
+        const visited_bit = @as(u64, 1) << visited_index;
+        if ((visited & visited_bit) != 0) return -1;
+        visited |= visited_bit;
         const header = pciReadConfig32(bus_kind, bus, device, function, offset);
         if (header == 0xFFFF_FFFF) return -1;
-        if (@as(u8, @truncate(header)) == 0x05) {
+        const capability_id: u8 = @truncate(header);
+        if (capability_id == 0x05) {
             cap = offset;
             break;
         }
+        if (capability_id == 0x11 and msix_cap == 0) msix_cap = offset;
         const next = @as(u16, @as(u8, @truncate(header >> 8))) & 0xFC;
         if (next == 0 or next == offset) break;
         offset = next;
     }
-    if (cap == 0) return -2;
+    if (cap == 0 and msix_cap == 0) return -2;
 
     var slot: u8 = 0;
     while (slot < MSI_IRQ_COUNT and msi_allocations[slot].used) : (slot += 1) {}
     if (slot >= MSI_IRQ_COUNT) return -3;
     const irq: u8 = MSI_IRQ_BASE + slot;
     const vector: u32 = IDT_IRQ_VECTOR_BASE + irq;
+
+    if (cap == 0) {
+        return enableMsix(bus_kind, bus, device, function, owner, slot, irq, vector, msix_cap, status_command);
+    }
 
     const cap_header = pciReadConfig32(bus_kind, bus, device, function, cap);
     if (cap_header == 0xFFFF_FFFF) return -1;
@@ -1464,6 +1497,7 @@ fn pciEnableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i3
 
     msi_allocations[slot] = .{
         .used = true,
+        .kind = .msi,
         .owner = owner,
         .bus_kind = bus_kind,
         .bus = bus,
@@ -1482,6 +1516,143 @@ fn pciEnableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i3
     return @intCast(irq);
 }
 
+fn enableMsix(
+    bus_kind: u8,
+    bus: u8,
+    device: u8,
+    function: u8,
+    owner: u32,
+    slot: u8,
+    irq: u8,
+    vector: u32,
+    capability: u16,
+    status_command: u32,
+) i32 {
+    const cap_header = pciReadConfig32(bus_kind, bus, device, function, capability);
+    if (cap_header == 0xFFFF_FFFF) return -1;
+    const control: u16 = @truncate(cap_header >> 16);
+    const msix_enable: u16 = 1 << 15;
+    const function_mask: u16 = 1 << 14;
+    if ((control & msix_enable) != 0) return -7;
+
+    const table_descriptor = pciReadConfig32(bus_kind, bus, device, function, capability + 0x04);
+    if (table_descriptor == 0xFFFF_FFFF) return -1;
+    const geometry = pci_interrupt_policy.msixTableGeometry(table_descriptor, MAX_MMIO_MAP_BYTES) orelse return -8;
+    var region: MmioRegion = .{};
+    if (pciMapBar(
+        bus_kind,
+        bus,
+        device,
+        function,
+        geometry.bir,
+        geometry.mapping_bytes,
+        0,
+        &region,
+    ) != 0) return -8;
+
+    const table_virt = region.virt_addr + geometry.offset;
+    const candidate = MsiAllocation{
+        .used = true,
+        .kind = .msix,
+        .owner = owner,
+        .bus_kind = bus_kind,
+        .bus = bus,
+        .device = device,
+        .function = function,
+        .irq = irq,
+        .capability = capability,
+        .original_control = control,
+        .original_command = @truncate(status_command),
+        .msix_table_virt = table_virt,
+        .msix_original_address_low = msixTableRead32(table_virt, 0),
+        .msix_original_address_high = msixTableRead32(table_virt, 4),
+        .msix_original_data = msixTableRead32(table_virt, 8),
+        .msix_original_vector_control = msixTableRead32(table_virt, 12),
+    };
+
+    // Keep the whole function and entry zero masked until its destination is
+    // complete. The DriverApi deliberately exposes one message only.
+    const masked_control = (control & ~msix_enable) | function_mask;
+    if (!writeMsixControl(bus_kind, bus, device, function, capability, cap_header, masked_control)) return -4;
+    msixTableWrite32(table_virt, 12, candidate.msix_original_vector_control | 1);
+    const msi_target = smp.irqTarget(slot + 1);
+    msixTableWrite32(table_virt, 0, 0xFEE0_0000 | (msi_target << 12));
+    msixTableWrite32(table_virt, 4, 0);
+    msixTableWrite32(table_virt, 8, vector);
+    asm volatile ("mfence" ::: .{ .memory = true });
+
+    if (!writeMsixControl(bus_kind, bus, device, function, capability, cap_header, masked_control | msix_enable)) {
+        _ = restoreMsixHardware(&candidate);
+        return -4;
+    }
+    // Keep entry zero masked until irq_register has published its handler.
+    // This closes the enable-before-register window imposed by the historical
+    // DriverApi call order without changing the public ABI.
+    if (!writeMsixControl(bus_kind, bus, device, function, capability, cap_header, (control | msix_enable) & ~function_mask)) {
+        _ = restoreMsixHardware(&candidate);
+        return -4;
+    }
+
+    const verified_header = pciReadConfig32(bus_kind, bus, device, function, capability);
+    const verified_entry = msixTableRead32(table_virt, 12);
+    if (verified_header == 0xFFFF_FFFF or
+        ((verified_header >> 16) & msix_enable) == 0 or
+        ((verified_header >> 16) & function_mask) != 0 or
+        (verified_entry & 1) == 0)
+    {
+        _ = restoreMsixHardware(&candidate);
+        return -5;
+    }
+
+    // MSI-X and legacy INTx must not be active at the same endpoint.
+    const command_raw = pciReadConfig32(bus_kind, bus, device, function, 0x04);
+    if (command_raw == 0xFFFF_FFFF or
+        pciWriteConfig32(bus_kind, bus, device, function, 0x04, (command_raw & 0x0000_FFFF) | (@as(u32, 1) << 10)) != 0)
+    {
+        _ = restoreMsixHardware(&candidate);
+        return -4;
+    }
+    const command_verify = pciReadConfig32(bus_kind, bus, device, function, 0x04);
+    if (command_verify == 0xFFFF_FFFF or (command_verify & (@as(u32, 1) << 10)) == 0) {
+        _ = restoreMsixHardware(&candidate);
+        return -5;
+    }
+
+    msi_allocations[slot] = candidate;
+    bootlog.puts("[R4D] MSI-X prepared irq=");
+    bootlog.putDec(irq);
+    bootlog.puts(" vector=");
+    bootlog.putDec(vector);
+    bootlog.puts("\r\n");
+    return @intCast(irq);
+}
+
+fn writeMsixControl(bus_kind: u8, bus: u8, device: u8, function: u8, capability: u16, header: u32, control: u16) bool {
+    const value = (header & 0x0000_FFFF) | (@as(u32, control) << 16);
+    return pciWriteConfig32(bus_kind, bus, device, function, capability, value) == 0;
+}
+
+fn msixTableRead32(table_virt: u64, offset: u32) u32 {
+    const value: *const volatile u32 = @ptrFromInt(table_virt + offset);
+    return value.*;
+}
+
+fn msixTableWrite32(table_virt: u64, offset: u32, value: u32) void {
+    const target: *volatile u32 = @ptrFromInt(table_virt + offset);
+    target.* = value;
+}
+
+fn unmaskRegisteredMsix(owner: u32, irq: u8) bool {
+    for (&msi_allocations) |*allocation| {
+        if (!allocation.used or allocation.kind != .msix or allocation.owner != owner or allocation.irq != irq) continue;
+        const control = msixTableRead32(allocation.msix_table_virt, 12);
+        msixTableWrite32(allocation.msix_table_virt, 12, control & ~@as(u32, 1));
+        asm volatile ("mfence" ::: .{ .memory = true });
+        return (msixTableRead32(allocation.msix_table_virt, 12) & 1) == 0;
+    }
+    return true;
+}
+
 fn pciDisableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i32 {
     const owner = activeOwner();
     for (&msi_allocations) |*allocation| {
@@ -1495,15 +1666,98 @@ fn pciDisableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i
 }
 
 fn restoreMsiAllocation(allocation: *const MsiAllocation) bool {
-    return restoreMsiHardware(
+    return switch (allocation.kind) {
+        .msi => restoreMsiHardware(
+            allocation.bus_kind,
+            allocation.bus,
+            allocation.device,
+            allocation.function,
+            allocation.capability,
+            allocation.original_control,
+            allocation.original_command,
+        ),
+        .msix => restoreMsixHardware(allocation),
+    };
+}
+
+fn restoreMsixHardware(allocation: *const MsiAllocation) bool {
+    const current_header = pciReadConfig32(
         allocation.bus_kind,
         allocation.bus,
         allocation.device,
         allocation.function,
         allocation.capability,
-        allocation.original_control,
-        allocation.original_command,
     );
+    if (current_header == 0xFFFF_FFFF or allocation.msix_table_virt == 0) return false;
+    const msix_enable: u16 = 1 << 15;
+    const function_mask: u16 = 1 << 14;
+    const current_control: u16 = @truncate(current_header >> 16);
+    if (!writeMsixControl(
+        allocation.bus_kind,
+        allocation.bus,
+        allocation.device,
+        allocation.function,
+        allocation.capability,
+        current_header,
+        (current_control & ~msix_enable) | function_mask,
+    )) return false;
+
+    msixTableWrite32(allocation.msix_table_virt, 12, msixTableRead32(allocation.msix_table_virt, 12) | 1);
+    asm volatile ("mfence" ::: .{ .memory = true });
+    msixTableWrite32(allocation.msix_table_virt, 0, allocation.msix_original_address_low);
+    msixTableWrite32(allocation.msix_table_virt, 4, allocation.msix_original_address_high);
+    msixTableWrite32(allocation.msix_table_virt, 8, allocation.msix_original_data);
+    msixTableWrite32(allocation.msix_table_virt, 12, allocation.msix_original_vector_control);
+    asm volatile ("mfence" ::: .{ .memory = true });
+    if (!writeMsixControl(
+        allocation.bus_kind,
+        allocation.bus,
+        allocation.device,
+        allocation.function,
+        allocation.capability,
+        current_header,
+        allocation.original_control,
+    )) return false;
+
+    const current_command = pciReadConfig32(
+        allocation.bus_kind,
+        allocation.bus,
+        allocation.device,
+        allocation.function,
+        0x04,
+    );
+    if (current_command == 0xFFFF_FFFF) return false;
+    const intx_mask: u32 = @as(u32, 1) << 10;
+    const restored_command = (current_command & 0x0000_FFFF & ~intx_mask) |
+        (@as(u32, allocation.original_command) & intx_mask);
+    if (pciWriteConfig32(
+        allocation.bus_kind,
+        allocation.bus,
+        allocation.device,
+        allocation.function,
+        0x04,
+        restored_command,
+    ) != 0) return false;
+
+    const final_header = pciReadConfig32(
+        allocation.bus_kind,
+        allocation.bus,
+        allocation.device,
+        allocation.function,
+        allocation.capability,
+    );
+    const final_command = pciReadConfig32(
+        allocation.bus_kind,
+        allocation.bus,
+        allocation.device,
+        allocation.function,
+        0x04,
+    );
+    return final_header != 0xFFFF_FFFF and
+        (@as(u16, @truncate(final_header >> 16)) & (msix_enable | function_mask)) ==
+            (allocation.original_control & (msix_enable | function_mask)) and
+        final_command != 0xFFFF_FFFF and
+        (final_command & intx_mask) == (@as(u32, allocation.original_command) & intx_mask);
 }
 
 fn restoreMsiHardware(bus_kind: u8, bus: u8, device: u8, function: u8, capability: u16, original_control: u16, original_command: u16) bool {

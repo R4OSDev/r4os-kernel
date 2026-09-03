@@ -297,6 +297,11 @@ pub fn enterIdleDeadline(requested_deadline: u64) bool {
 }
 
 pub fn leaveIdleDeadline() bool {
+    // Productive scheduler observations call this defensively.  The deadline
+    // backend is owned by the BSP, so keep the overwhelmingly common periodic
+    // path to one local branch instead of nesting the runtime owner on every
+    // cooperative yield.
+    if (deadline_mode != .one_shot_idle) return backend != .pit;
     const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     if (deadline_mode != .one_shot_idle) return backend != .pit;

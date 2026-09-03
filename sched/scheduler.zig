@@ -532,6 +532,11 @@ pub fn yield() void {
         interrupts.restore(irq_flags);
         return;
     };
+    // A productive BSP can observe the scheduler without switching tasks.
+    // Such a no-op yield must still close a delayed idle one-shot handoff;
+    // otherwise the single event expires and later timed waits never get a
+    // periodic IRQ.
+    if (old.state == .running) restoreProductiveTimer(old);
     task.recordYield(old, now);
     const priority_wakeup = state.reschedule_requested and task.hasMoreUrgentReady(percpu.currentIndex(), old);
     const selected = nextReadyTask(priority_wakeup);
@@ -704,6 +709,32 @@ pub fn wakeTask(target: *task.Task, result: task.WaitResult) bool {
         .cancelled => object_cancel_count +%= 1,
         else => {},
     }
+    const target_cpu: u32 = target.home_cpu;
+    const target_state = cpuState(target_cpu);
+    if (target_cpu != percpu.currentIndex() and percpu.isSchedulable(target_cpu)) {
+        target_state.reschedule_requested = true;
+        wakeup_reschedule_request_count +%= 1;
+        sendRescheduleToCpu(target_cpu);
+    } else if (target_state.current_task) |running| {
+        if (running.state == .running and task.dispatchRank(target) < task.dispatchRank(running)) {
+            target_state.reschedule_requested = true;
+            wakeup_reschedule_request_count +%= 1;
+        }
+    }
+    return true;
+}
+
+// Publish a fully constructed blocked task and notify its selected CPU. This
+// is distinct from wakeTask(): the task has never entered a WaitQueue and
+// therefore has no wait result to complete. Remote notification is required
+// because an AP may already be sleeping with an idle one-shot timer.
+pub fn publishCreatedTask(target: *task.Task) bool {
+    const irq_flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(irq_flags);
+    preemptDisable();
+    defer preemptEnable();
+    if (target.state != .blocked or target.wait_object != 0 or target.wake_tick != 0) return false;
+    task.markReady(target, timer.tickCount());
     const target_cpu: u32 = target.home_cpu;
     const target_state = cpuState(target_cpu);
     if (target_cpu != percpu.currentIndex() and percpu.isSchedulable(target_cpu)) {
@@ -893,6 +924,10 @@ pub fn onTick(now: u64, preemptible_instruction_pointer: bool) bool {
     if (initialized and state.initialized) {
         if (state.current_task) |running| {
             if (running.state == .running) {
+                // A one-shot may fire after IRQ dispatch has already handed
+                // the BSP to productive work. Restore the periodic source in
+                // the IRQ that consumes that final one-shot event.
+                restoreProductiveTimer(running);
                 const run_ticks = task.recordRunTick(running, now);
                 recordRunWindow(run_ticks);
                 recordQuantumOverrun(run_ticks);
@@ -1253,6 +1288,7 @@ fn sendRescheduleToCpu(cpu_index: u32) void {
 }
 
 fn noteProductiveTask(selected: *const task.Task) void {
+    restoreProductiveTimer(selected);
     if (!selected.smp_eligible or selected.cpu_idle) return;
     const cpu_index = percpu.currentIndex();
     if (!percpu.noteProductive(cpu_index, selected.smp_r4x_work)) return;
@@ -1267,6 +1303,16 @@ fn noteProductiveTask(selected: *const task.Task) void {
     k.puts(" class=");
     k.puts("r4x");
     k.puts("\r\n");
+}
+
+fn restoreProductiveTimer(selected: *const task.Task) void {
+    // A BSP idle wait temporarily changes the shared HPET/LAPIC backend to a
+    // one-shot. Every path that hands or retains the BSP for real work must
+    // restore periodic delivery before that work can rely on scheduler
+    // timeouts. leaveIdleDeadline() has a cheap idempotent periodic fast path.
+    if (percpu.currentIndex() == 0 and !selected.cpu_idle) {
+        _ = timer.leaveIdleDeadline();
+    }
 }
 
 export fn taskEntryTrampoline() callconv(.c) noreturn {

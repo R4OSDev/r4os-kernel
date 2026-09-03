@@ -876,6 +876,60 @@ pub fn readDirect(index: usize, lba: u64, sectors: u16, out: []u8) bool {
     return readWithPolicy(index, lba, sectors, out, true);
 }
 
+/// Test-profile-only, read-only proof that one canonical NVMe request crosses
+/// the runtime block worker and asynchronous backend boundary. The NVME.R4D
+/// emits the companion `[NVMEIRQ]` marker only after an MSI/MSI-X-triggered CQ
+/// drain with no polling fallback.
+pub fn nvmeInterruptAcceptanceProbe() bool {
+    var device_index: usize = 0;
+    while (device_index < maxDevices()) : (device_index += 1) {
+        const device = get(device_index) orelse continue;
+        if (device.bus != .nvme) continue;
+        const sector_size: usize = @intCast(device.sector_size);
+        if (sector_size == 0 or sector_size > 4096) return nvmeProbeFailure("sector-size");
+        const before = snapshotDeviceStats(device_index) orelse return nvmeProbeFailure("stats-before");
+        var sector: [4096]u8 align(64) = undefined;
+        if (!readDirect(device_index, 0, 1, sector[0..sector_size])) return nvmeProbeFailure("read");
+        const after = snapshotDeviceStats(device_index) orelse return nvmeProbeFailure("stats-after");
+        const worker_requests = after.worker_requests -% before.worker_requests;
+        const worker_completions = after.worker_completions -% before.worker_completions;
+        const async_submissions = after.async_submissions -% before.async_submissions;
+        const async_completions = after.async_completions -% before.async_completions;
+        if (worker_requests == 0 or worker_completions == 0 or
+            async_submissions == 0 or async_completions == 0 or
+            after.timeout_failures != before.timeout_failures)
+        {
+            return nvmeProbeFailure("runtime-counters");
+        }
+        k.puts("[NVMEIRQPROBE] result=OK worker_requests=");
+        k.putDec(worker_requests);
+        k.puts(" worker_completions=");
+        k.putDec(worker_completions);
+        k.puts(" async_submissions=");
+        k.putDec(async_submissions);
+        k.puts(" async_completions=");
+        k.putDec(async_completions);
+        k.puts("\r\n");
+        return true;
+    }
+    return nvmeProbeFailure("device-missing");
+}
+
+fn snapshotDeviceStats(index: usize) ?Stats {
+    var pin = pinDevice(index) orelse return null;
+    defer unpinDevice(&pin);
+    const locked = lockDevice(pin.device);
+    defer unlockDevice(pin.device, locked);
+    return pin.device.stats;
+}
+
+fn nvmeProbeFailure(reason: []const u8) bool {
+    k.puts("[NVMEIRQPROBE] result=FAILED reason=");
+    k.puts(reason);
+    k.puts("\r\n");
+    return false;
+}
+
 fn readWithPolicy(index: usize, lba: u64, sectors: u16, out: []u8, trusted_resident: bool) bool {
     var pin = pinDevice(index) orelse return false;
     defer unpinDevice(&pin);

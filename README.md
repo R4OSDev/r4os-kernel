@@ -57,6 +57,12 @@ PCI and PCIe devices are enumerated once through a canonical inventory.
 Mapped segment-0 ECAM coverage is preferred; legacy CF8/CFC access is retained
 only as a bounded fallback for missing or uncovered buses. Stored class fields
 serve inventory searches without additional configuration-space reads.
+The existing owner-bound `pci_enable_msi` operation prefers conventional MSI
+and now falls back to exactly one MSI-X table entry when that is the only
+message-signalled capability. Table geometry is bounded by the six PCI BARs
+and the 16-MiB MMIO policy; disable and owner cleanup restore both the original
+entry and endpoint control state. This does not introduce a public affinity or
+multi-vector contract.
 
 Normal kernel artifacts perform only the non-mutating heap structure check
 and the required kernel-space page-table dry run. The invasive heap,
@@ -172,8 +178,10 @@ projections, so their hot paths scale with the relevant work set. Finite waits
 form a stable ordered deadline queue; one timer IRQ publishes at most 64 due
 wakes and leaves a visible backlog for the next delivery. Equal deadlines keep
 enrollment order, cancellation unlinks the exact waiter, and hardware horizons
-are crossed through bounded one-shot checkpoints. R4X tasks also carry an
-immutable direct execution-owner binding; timer IRQ attribution does not scan
+are crossed through bounded one-shot checkpoints. A productive BSP restores
+periodic delivery on task handoff, no-op yield, and a final idle one-shot IRQ,
+so a suspended idle continuation cannot strand later timed waits. R4X tasks
+also carry an immutable direct execution-owner binding; timer IRQ attribution does not scan
 ProgramThread or asynchronous-I/O registries. Kernel owners assign the internal
 roles input, short completion, interactive, and batch; applications cannot
 select scheduler policy. Input and completion boosts have per-activation tick

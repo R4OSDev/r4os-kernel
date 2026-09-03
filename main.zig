@@ -14,6 +14,7 @@ const com_debug_boot = @import("kernel/com_debug_boot.zig");
 const cpu_boot = @import("kernel/cpu_boot.zig");
 const timer_boot = @import("kernel/timer_boot.zig");
 const driver_boot = @import("kernel/driver_boot.zig");
+const driver_api = @import("kernel/driver_api.zig");
 const input_boot = @import("kernel/input_boot.zig");
 const memory_boot = @import("kernel/memory_boot.zig");
 const storage_boot = @import("kernel/storage_boot.zig");
@@ -150,7 +151,15 @@ export fn kmain() callconv(.c) noreturn {
     fatal.setBootPhase(.runtime);
     beginBootStep(.runtime, "Runtime vorbereiten");
     bootscreen.setStatus("SMP pruefen");
+    const quick_acceptance = smp.acceptanceProbeEnabled();
+    // Keep the scheduler/preemption witness isolated from device IRQ work.
+    // The NVMe proof follows it and a final marker tells the host that both
+    // bounded probes have emitted their complete diagnostics.
     _ = smp.runAcceptanceProbeIfEnabled(memory_boot.usableBytes());
+    if (quick_acceptance) {
+        _ = runNvmeInterruptAcceptanceProbe();
+        log.puts("[QUICKPROBE] result=DONE\r\n");
+    }
     // 0.56.2: Hintergrund-RX-Task - NACH initTaskRuntime (sonst von
     // task.init() gewischt) und NACH driver_policy_boot (NIC geladen).
     bootscreen.setStatus("Netzwerk-Task starten");
@@ -191,6 +200,39 @@ export fn kmain() callconv(.c) noreturn {
     }
     bootscreen.setStatus("Runtime starten");
     return runtime_boot.start();
+}
+
+fn runNvmeInterruptAcceptanceProbe() bool {
+    if (!block_storage.nvmeInterruptAcceptanceProbe()) return false;
+    const required: u32 = (1 << 0) | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12);
+    const forbidden: u32 = (1 << 13) | (1 << 14) | (1 << 15);
+    var index: usize = 0;
+    while (index < block_storage.maxDevices()) : (index += 1) {
+        const device = block_storage.get(index) orelse continue;
+        if (device.bus != .nvme) continue;
+        var status = driver_api.StorageBackendStatus{
+            .state = 0,
+            .last_error = 0,
+            .last_lba = 0,
+            .last_sectors = 0,
+            .recoveries = 0,
+            .recovery_failures = 0,
+        };
+        if (driver_api.queryStorageBackendStatus(index, &status) and
+            (status.state & required) == required and (status.state & forbidden) == 0)
+        {
+            log.puts("[NVMEIRQ] result=OK mode=");
+            log.puts(if ((status.state & (1 << 16)) != 0) "msix" else "msi");
+            log.puts(" irq=nonzero work=nonzero completions=nonzero poll_fallback=0\r\n");
+            return true;
+        }
+        log.puts("[NVMEIRQ] result=FAILED state=0x");
+        log.putHex(status.state, 8);
+        log.puts("\r\n");
+        return false;
+    }
+    log.puts("[NVMEIRQ] result=FAILED reason=device-missing\r\n");
+    return false;
 }
 
 fn beginBootStep(phase: bootscreen.Phase, status: []const u8) void {

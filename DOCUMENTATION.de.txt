@@ -356,6 +356,13 @@ Suspend-/Resume-Lebenszyklus. Eine spaetere Implementierung muss die Clocksource
 vor erneuter Taskfreigabe qualifizieren; heutiges Idle wird durch Invarianz
 beziehungsweise HPET-Watchdog abgesichert.
 
+Wechselt der BSP aus einem Idle-One-Shot zu produktiver Arbeit, stellt der
+Scheduler die periodische Ereignisquelle sowohl beim Taskwechsel als auch bei
+einem Yield ohne Wechsel und beim letzten One-Shot-IRQ wieder her. Ein noch
+angehaltener AP wird bei der erstmaligen Ready-Publikation eines vollstaendig
+aufgebauten AP-Tasks gezielt per Reschedule-IPI benachrichtigt. Damit bleiben
+kurze globale Timeout-Waits auch ueber verzoegerte Idle-Epiloge hinweg bedient.
+
 R4SYS stellt Instant und Clockmetadaten additiv bereit. R4DEV liefert darauf
 aufbauende Bootphasen- und IRQ-Zeitaufzeichnungen. Historische Spannen werden
 nur aufgeloest, wenn ihre Quelle spaeter exakt kalibriert werden konnte;
@@ -531,3 +538,10 @@ Quellen-, Zugriffs-, Mapping-, Kapazitaets- und Zeitzaehler append-only als
 innerhalb eines noch groben periodischen Takts, bleibt der Zeitwert null und
 `timing_unavailable` weist die nicht aufloesbare Gesamt-/Teilspanne explizit
 aus.
+
+Die bestehende ownergebundene Operation `pci_enable_msi` bevorzugt klassisches
+MSI und verwendet genau einen MSI-X-Tabelleneintrag, wenn der Endpunkt nur
+MSI-X anbietet. BIR, Tabellenoffset und die 16-MiB-MMIO-Grenze werden vor der
+Abbildung geprueft. Disable und Owner-Cleanup stellen Eintrag, Capability und
+INTx-Zustand wieder her. Daraus entsteht weder eine oeffentliche Affinitaets-
+noch eine Multivektor-ABI.

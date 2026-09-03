@@ -8612,7 +8612,24 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
         guiPayload(instance).start_attach_pending = true;
     }
     if (options.out_handle) |out_handle| out_handle.* = handle;
-    task.markReady(program_task, timer.tickCount());
+    const published = scheduler.publishCreatedTask(program_task);
+    if (!published) {
+        // Publication is the final infallible construction boundary under
+        // the task-runtime contract. Keep a loud guard here rather than
+        // silently stranding a committed program generation.
+        k.puts("Program task publication failed\r\n");
+        while (!programCompletionIsReady(handle) and
+            !beginProgramExit(handle, THREAD_ERROR_INVALID, PROGRAM_EXIT_REASON_KILLED))
+        {
+            scheduler.yield();
+        }
+        last_exit_code = 1;
+        setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_TASK_FAILED);
+        return .failed;
+    }
+    // A freshly published R4X may target a CPU whose idle timer is quiescent.
+    // publishCreatedTask wakes it after the complete registry and task commit;
+    // this does not replace timer preemption once user code is running.
     return .ran;
 }
 
@@ -8712,7 +8729,13 @@ fn runR4lPreemptionScenario(
     // the R4L loop is active; publishing it without a reschedule request then
     // forces the AP's periodic quantum path to perform the switch.
     if (mode == .reschedule_ipi) {
-        task.markReady(witness, timer.tickCount());
+        if (!scheduler.publishCreatedTask(witness)) {
+            _ = releaseCreatedProgramTask(witness);
+            return .{};
+        }
+        // Initial publication is setup, not the measured wake. Ensure the
+        // remote worker reaches its blocking Event before LSTRX starts; the
+        // later Event signal remains the one measured reschedule IPI.
         while (@atomicLoad(u8, &r4l_preemption_witness_started, .acquire) == 0) {
             if (r4lPreemptionDeadlineExpired(start, start_tick)) {
                 abortR4lPreemptionWitness();
