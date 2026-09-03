@@ -36,6 +36,7 @@ const page_cache_policy = @import("page_cache_policy.zig");
 const sync = @import("../sched/sync.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const sched_task = @import("../sched/task.zig");
+const std = @import("std");
 const task_context = @import("../sched/task_context.zig");
 
 pub const SECTOR_SIZE: usize = 512;
@@ -55,15 +56,25 @@ const FULL_MASK: u8 = 0xFF;
 // 0.56.40: hz-neutral (3600 s Wachhund; bei 100 Hz wie zuvor 360000).
 const LOCK_TIMEOUT_TICKS: u64 = 3600 * @as(u64, timer.DEFAULT_HZ);
 const BUSY_WAIT_LIMIT_TICKS: usize = 5 * @as(usize, timer.DEFAULT_HZ);
-const POLICY_VERSION: u32 = 1;
+const POLICY_VERSION: u32 = 2;
 const BACKGROUND_INTERVAL_TICKS: u64 = @max(1, @as(u64, timer.DEFAULT_HZ) / 4);
 const BACKGROUND_REQUEUE_TICKS: u64 = @max(1, @as(u64, timer.DEFAULT_HZ) / 100);
 const BACKGROUND_FAILURE_BACKOFF_TICKS: u64 = @as(u64, timer.DEFAULT_HZ);
 const MAX_DIRTY_AGE_TICKS: u64 = 2 * @as(u64, timer.DEFAULT_HZ);
 const BACKGROUND_PAGE_BUDGET: usize = 4;
+// 0.75.6 deliberately limits demand coalescing to the two-page shape covered
+// by the filesystem diagnostic. Larger runs interacted intermittently with
+// the long subsystem/AUTOEXEC workload and are not shipped without proof.
+const MAX_CONTIGUOUS_FILL_PAGES: u16 = 2;
+// 0.75.6: Every tested speculative variant (adaptive multi-page down to the
+// former single-page request) reproducibly stalled the subsystem/AUTOEXEC
+// workload once contiguous demand fills were enabled. Keep speculation
+// explicitly off; the safe demand coalescing remains independently active.
+const SPECULATIVE_READ_AHEAD_ENABLED: bool = false;
 const READ_AHEAD_TRIGGER_SECTORS: u32 = PAGE_SECTORS * 2;
-const READ_AHEAD_RESIDENT_PAGES_PER_DEVICE: u16 = 2;
-const READ_AHEAD_FREE_FLOOR: u16 = 32;
+const READ_AHEAD_RESIDENT_LIMIT: u16 = 2;
+const READ_AHEAD_FREE_FLOOR_MAX: u16 = 32;
+const READ_AHEAD_FREE_FLOOR_MIN: u16 = 8;
 
 comptime {
     if (MAX_ENTRIES != page_cache_policy.max_entries) @compileError("page-cache policy entry capacity mismatch");
@@ -150,6 +161,32 @@ pub const Summary = struct {
     read_ahead_hits: u64 = 0,
     read_ahead_cancellations: u64 = 0,
     read_ahead_budget_skips: u64 = 0,
+    capacity_min_pages: u32 = page_cache_policy.min_capacity_pages,
+    capacity_max_pages: u32 = page_cache_policy.max_capacity_pages,
+    capacity_ram_limit_pages: u32 = page_cache_policy.min_capacity_pages,
+    capacity_active_limit_pages: u32 = page_cache_policy.min_capacity_pages,
+    capacity_pressure_level: u32 = 0,
+    read_ahead_window_pages: u32 = 0,
+    read_ahead_window_max_pages: u32 = 0,
+    capacity_reserved0: u32 = 0,
+    fill_run_requests: u64 = 0,
+    fill_run_backend_requests: u64 = 0,
+    fill_run_pages: u64 = 0,
+    fill_run_sectors: u64 = 0,
+    fill_run_bytes: u64 = 0,
+    fill_run_failures: u64 = 0,
+    fill_run_retries: u64 = 0,
+    fill_run_max_pages: u64 = 0,
+    fill_scatter_copy_bytes: u64 = 0,
+    read_staging_copy_bytes: u64 = 0,
+    read_caller_copy_bytes: u64 = 0,
+    read_publish_lock_drops: u64 = 0,
+    fill_lock_drops: u64 = 0,
+    capacity_reductions: u64 = 0,
+    capacity_trimmed_pages: u64 = 0,
+    read_ahead_pages_scheduled: u64 = 0,
+    read_ahead_pages_issued: u64 = 0,
+    read_ahead_random_resets: u64 = 0,
 };
 
 /// Identifies the dirty sectors produced by one filesystem mutation.  Zero is
@@ -215,6 +252,13 @@ var background_failure_until: [MAX_DEVICES]u64 = .{0} ** MAX_DEVICES;
 var read_ahead_states: [MAX_DEVICES]page_cache_policy.ReadAhead =
     .{page_cache_policy.ReadAhead{}} ** MAX_DEVICES;
 var read_ahead_device_cursor: u8 = 0;
+var capacity_reference_frames: u64 = 0;
+var capacity_state: page_cache_policy.Capacity = .{
+    .ram_pages = page_cache_policy.min_capacity_pages,
+    .active_pages = page_cache_policy.min_capacity_pages,
+    .pressure_level = 0,
+    .read_ahead_pages = 1,
+};
 var cache_lock: sync.Mutex = .{};
 
 pub fn init() void {
@@ -249,6 +293,15 @@ pub fn init() void {
     background_failure_until = .{0} ** MAX_DEVICES;
     read_ahead_states = .{page_cache_policy.ReadAhead{}} ** MAX_DEVICES;
     read_ahead_device_cursor = 0;
+    capacity_reference_frames = mem_phys.stats().free_frames;
+    capacity_state = page_cache_policy.capacityForMemory(
+        capacity_reference_frames,
+        capacity_reference_frames,
+    );
+    stats.capacity_ram_limit_pages = capacity_state.ram_pages;
+    stats.capacity_active_limit_pages = capacity_state.active_pages;
+    stats.capacity_pressure_level = capacity_state.pressure_level;
+    stats.read_ahead_window_max_pages = if (SPECULATIVE_READ_AHEAD_ENABLED) capacity_state.read_ahead_pages else 0;
     cache_lock = sync.Mutex.initClass("fs-page-cache", sync.LockRank.fs_page_cache, .sleepable);
 }
 
@@ -306,6 +359,18 @@ pub fn summary() Summary {
     out.policy_worker_task_id = policy_worker_task_id;
     out.policy_clean_device_probes = policy_index.clean_device_probes;
     out.policy_dirty_device_probes = policy_index.dirty_device_probes;
+    const capacity = refreshCapacityLocked();
+    out.capacity_ram_limit_pages = capacity.ram_pages;
+    out.capacity_active_limit_pages = capacity.active_pages;
+    out.capacity_pressure_level = capacity.pressure_level;
+    out.read_ahead_window_max_pages = if (SPECULATIVE_READ_AHEAD_ENABLED) capacity.read_ahead_pages else 0;
+    var current_window: u16 = 0;
+    if (SPECULATIVE_READ_AHEAD_ENABLED) {
+        for (read_ahead_states) |state| {
+            if (state.sequential.window_pages > current_window) current_window = state.sequential.window_pages;
+        }
+    }
+    out.read_ahead_window_pages = current_window;
     var device_high_water: u16 = 0;
     for (policy_index.devices) |device| {
         if (device.dirty_high_water > device_high_water) device_high_water = device.dirty_high_water;
@@ -410,6 +475,9 @@ pub fn readSector(device_index: usize, lba: u64, out: []u8) bool {
             // evicted during the preceding cache/backend wait and fault back
             // into this same io_busy entry.
             @memcpy(caller_copy[0..], frame[off .. off + SECTOR_SIZE]);
+            stats.read_staging_copy_bytes +%= SECTOR_SIZE;
+            stats.read_caller_copy_bytes +%= SECTOR_SIZE;
+            stats.read_publish_lock_drops +%= 1;
             if (counted_miss) {
                 // Miss + erfolgreicher Fill: bleibt ein Miss.
             } else {
@@ -450,12 +518,27 @@ pub fn readSectors(device_index: usize, lba: u64, count: u32, out: []u8) bool {
         stats.read_errors +%= 1;
         return false;
     }
+    const end_lba = lba +% @as(u64, count);
+    if (end_lba <= lba) {
+        stats.read_errors +%= 1;
+        return false;
+    }
+    const final_page = pageLba(end_lba - 1);
     var caller_copy: [PAGE_BYTES]u8 = undefined;
+    // Allocated only after the first multi-page miss is observed. The defer
+    // is registered before the cache-lock defer, so resident staging is
+    // always freed after metadata ownership has been released.
+    var fill_buffer: ?[]u8 = null;
+    defer {
+        if (fill_buffer) |memory| _ = heap.free(memory);
+    }
+    var fill_buffer_unavailable = false;
     const guard = acquireLock() orelse {
         stats.read_errors +%= 1;
         return false;
     };
-    defer releaseLock(guard);
+    var locked = true;
+    defer if (locked) releaseLock(guard);
     const unwind = enterOperation() orelse {
         stats.read_errors +%= 1;
         return false;
@@ -475,6 +558,7 @@ pub fn readSectors(device_index: usize, lba: u64, count: u32, out: []u8) bool {
         var busy_conflict = false;
         var cache_failure = false;
         var busy_guard: usize = 0;
+        var miss_counted = false;
         while (!served) {
             const index = findEntry(device_index, page) orelse
                 createEntry(device_index, page) orelse {
@@ -521,8 +605,40 @@ pub fn readSectors(device_index: usize, lba: u64, count: u32, out: []u8) bool {
                 continue;
             }
             if (!maskCovers(entries[index].valid_mask, first_in_page, span)) {
-                stats.misses +%= span;
-                if (!fillEntryWithBackendPolicy(guard, index)) {
+                if (!miss_counted) {
+                    stats.misses +%= span;
+                    miss_counted = true;
+                }
+                const requested_pages_u64 = (final_page - page) / PAGE_SECTORS + 1;
+                const requested_pages: u16 = @intCast(@min(
+                    @as(u64, MAX_ENTRIES),
+                    requested_pages_u64,
+                ));
+                const run_pages = fillRunPageLimitLocked(device_index, requested_pages);
+                if (run_pages >= 2 and fill_buffer == null and !fill_buffer_unavailable) {
+                    // Heap growth can commit/reclaim and must never run under
+                    // cache_lock. No identity is pinned yet, so re-evaluate
+                    // the page after reacquiring the lock.
+                    releaseLock(guard);
+                    locked = false;
+                    fill_buffer = heap.alloc(@as(usize, run_pages) * PAGE_BYTES, 16);
+                    if (fill_buffer == null) fill_buffer_unavailable = true;
+                    relock(guard);
+                    locked = true;
+                    continue;
+                }
+                const fill_ok = if (run_pages >= 2 and fill_buffer != null)
+                    fillContiguousRunLocked(
+                        guard,
+                        device_index,
+                        page,
+                        run_pages,
+                        fill_buffer.?,
+                        false,
+                    ).ok
+                else
+                    fillEntryWithBackendPolicy(guard, index);
+                if (!fill_ok) {
                     cache_failure = true;
                     break;
                 }
@@ -539,11 +655,16 @@ pub fn readSectors(device_index: usize, lba: u64, count: u32, out: []u8) bool {
                 const off_f = first_in_page * SECTOR_SIZE;
                 const copy_bytes = span * SECTOR_SIZE;
                 @memcpy(caller_copy[0..copy_bytes], frame_f[off_f .. off_f + copy_bytes]);
+                stats.read_staging_copy_bytes +%= copy_bytes;
+                stats.read_caller_copy_bytes +%= copy_bytes;
+                stats.read_publish_lock_drops +%= 1;
                 entries[index].last_use = nextClock();
                 noteDemandHitLocked(index);
                 releaseLock(guard);
+                locked = false;
                 @memcpy(out[@as(usize, done) * SECTOR_SIZE ..][0..copy_bytes], caller_copy[0..copy_bytes]);
                 relock(guard);
+                locked = true;
                 served = true;
                 break;
             }
@@ -554,12 +675,17 @@ pub fn readSectors(device_index: usize, lba: u64, count: u32, out: []u8) bool {
             const off = first_in_page * SECTOR_SIZE;
             const copy_bytes = span * SECTOR_SIZE;
             @memcpy(caller_copy[0..copy_bytes], frame[off .. off + copy_bytes]);
+            stats.read_staging_copy_bytes +%= copy_bytes;
+            stats.read_caller_copy_bytes +%= copy_bytes;
+            stats.read_publish_lock_drops +%= 1;
             entries[index].last_use = nextClock();
             noteDemandHitLocked(index);
-            stats.hits +%= span;
+            if (!miss_counted) stats.hits +%= span;
             releaseLock(guard);
+            locked = false;
             @memcpy(out[@as(usize, done) * SECTOR_SIZE ..][0..copy_bytes], caller_copy[0..copy_bytes]);
             relock(guard);
+            locked = true;
             served = true;
         }
         if (busy_conflict or cache_failure) {
@@ -1228,8 +1354,253 @@ fn fillEntryUnlocked(guard: bool, index: usize) bool {
     return ok;
 }
 
+const FillRunOutcome = struct {
+    ok: bool = false,
+    pages: u16 = 0,
+    sectors: u16 = 0,
+};
+
+fn fillRunPageLimitLocked(device_index: usize, requested_pages: u16) u16 {
+    const device = block.get(device_index) orelse return 0;
+    if (device.sector_size != SECTOR_SIZE) return 0;
+    const capacity = refreshCapacityLocked();
+    return page_cache_policy.fillRunPageLimit(
+        @min(requested_pages, MAX_CONTIGUOUS_FILL_PAGES),
+        device.max_sectors_per_request,
+        PAGE_SECTORS,
+        capacity.active_pages,
+    );
+}
+
+/// Pins a contiguous set of absent or partially valid cache pages, submits
+/// one backend-sized read into resident heap staging, and scatters only the
+/// sectors that were missing at reservation time. Dirty/valid bytes are
+/// therefore never replaced by stale media contents. Publication is
+/// all-or-nothing because readDirect has no partial-read success contract.
+fn fillContiguousRunLocked(
+    guard: bool,
+    device_index: usize,
+    first_page: u64,
+    requested_pages: u16,
+    staging: []u8,
+    speculative: bool,
+) FillRunOutcome {
+    const device = block.get(device_index) orelse return .{};
+    if (device.sector_size != SECTOR_SIZE) return .{};
+    const device_sectors = device.sector_count;
+    const owns_transport_retry = device.owns_transport_retry;
+    const staging_pages: u16 = @intCast(@min(
+        @as(usize, MAX_ENTRIES),
+        staging.len / PAGE_BYTES,
+    ));
+    const page_limit = @min(
+        staging_pages,
+        fillRunPageLimitLocked(device_index, requested_pages),
+    );
+    if (page_limit < 2) return .{};
+
+    var indices: [MAX_ENTRIES]u16 = undefined;
+    var masks_before: [MAX_ENTRIES]u8 = undefined;
+    var reserved: usize = 0;
+    var total_sectors: u16 = 0;
+    var page = first_page;
+    while (reserved < page_limit) {
+        if (device_sectors != 0 and page >= device_sectors) break;
+        const readable: usize = if (device_sectors == 0)
+            PAGE_SECTORS
+        else
+            @intCast(@min(@as(u64, PAGE_SECTORS), device_sectors - page));
+        const readable_mask = readableMask(readable);
+        const existing = findEntry(device_index, page);
+        if (speculative and existing != null) break;
+        const index = existing orelse if (speculative)
+            createReadAheadEntryLocked(device_index, page) orelse break
+        else
+            createEntry(device_index, page) orelse break;
+        if (entries[index].io_busy or
+            (entries[index].valid_mask & readable_mask) == readable_mask)
+        {
+            break;
+        }
+        if (!policy_index.pin(index)) break;
+        entries[index].io_busy = true;
+        if (!speculative) dropReadAheadResidencyLocked(index);
+        indices[reserved] = @intCast(index);
+        masks_before[reserved] = entries[index].valid_mask;
+        reserved += 1;
+        total_sectors += @intCast(readable);
+        if (readable != PAGE_SECTORS or page > std.math.maxInt(u64) - PAGE_SECTORS) break;
+        page += PAGE_SECTORS;
+    }
+
+    // If contention or capacity left only one page, retain the established
+    // single-frame direct path: it avoids allocating/scattering for no I/O
+    // reduction and preserves the existing retry rule.
+    if (reserved < 2) {
+        if (reserved == 0) return .{};
+        const index: usize = indices[0];
+        entries[index].io_busy = false;
+        _ = policy_index.unpin(index, entries[index].dirty_mask != 0);
+        return .{
+            .ok = fillEntryWithBackendPolicy(guard, index),
+            .pages = 1,
+            .sectors = @intCast(@min(@as(usize, PAGE_SECTORS), total_sectors)),
+        };
+    }
+
+    const byte_count = @as(usize, total_sectors) * SECTOR_SIZE;
+    stats.fill_run_requests +%= 1;
+    stats.fill_run_pages +%= reserved;
+    stats.fill_run_sectors +%= total_sectors;
+    stats.fill_run_bytes +%= byte_count;
+    if (reserved > stats.fill_run_max_pages) stats.fill_run_max_pages = reserved;
+    stats.fill_lock_drops +%= 1;
+    releaseLock(guard);
+
+    var ok = false;
+    var attempts: usize = 0;
+    var backend_requests: u64 = 0;
+    var retries: u64 = 0;
+    const max_attempts: usize = page_cache_policy.fillAttemptLimit(owns_transport_retry);
+    while (attempts < max_attempts) : (attempts += 1) {
+        backend_requests +%= 1;
+        if (block.readDirect(
+            device_index,
+            first_page,
+            total_sectors,
+            staging[0..byte_count],
+        )) {
+            ok = true;
+            break;
+        }
+        if (attempts + 1 < max_attempts) retries +%= 1;
+    }
+
+    relock(guard);
+    stats.fill_run_backend_requests +%= backend_requests;
+    stats.fill_run_retries +%= retries;
+    var slot: usize = 0;
+    while (slot < reserved) : (slot += 1) {
+        const index: usize = indices[slot];
+        const expected_page = first_page + @as(u64, slot) * PAGE_SECTORS;
+        if (!entries[index].valid or
+            entries[index].device_index != device_index or
+            entries[index].page_lba != expected_page or
+            !entries[index].io_busy or
+            payloadFrame(index) == null)
+        {
+            ok = false;
+        }
+    }
+    if (!ok) stats.fill_run_failures +%= 1;
+    var offset_sectors: usize = 0;
+    slot = 0;
+    while (slot < reserved) : (slot += 1) {
+        const index: usize = indices[slot];
+        const expected_page = first_page + @as(u64, slot) * PAGE_SECTORS;
+        const identity_ok = entries[index].valid and
+            entries[index].device_index == device_index and
+            entries[index].page_lba == expected_page and
+            entries[index].io_busy;
+        if (!identity_ok) {
+            ok = false;
+            continue;
+        }
+        const readable: usize = if (device_sectors == 0)
+            PAGE_SECTORS
+        else
+            @intCast(@min(@as(u64, PAGE_SECTORS), device_sectors - expected_page));
+        const readable_mask = readableMask(readable);
+        if (ok) {
+            const frame = payloadFrame(index).?;
+            var sector: usize = 0;
+            while (sector < readable) : (sector += 1) {
+                const bit = @as(u8, 1) << @as(u3, @intCast(sector));
+                if ((page_cache_policy.fillMissingMask(masks_before[slot], readable_mask) & bit) == 0) continue;
+                const source_offset = (offset_sectors + sector) * SECTOR_SIZE;
+                const target_offset = sector * SECTOR_SIZE;
+                @memcpy(
+                    frame[target_offset .. target_offset + SECTOR_SIZE],
+                    staging[source_offset .. source_offset + SECTOR_SIZE],
+                );
+                stats.fill_scatter_copy_bytes +%= SECTOR_SIZE;
+            }
+            entries[index].valid_mask = page_cache_policy.fillPublishedMask(
+                masks_before[slot],
+                readable_mask,
+                true,
+            );
+            entries[index].last_use = nextClock();
+            stats.fills +%= 1;
+        }
+        offset_sectors += readable;
+        entries[index].io_busy = false;
+        _ = policy_index.unpin(index, !ok or entries[index].dirty_mask != 0);
+        if (!ok and entries[index].valid_mask == 0 and entries[index].dirty_mask == 0) {
+            clearEntry(index, false);
+        }
+    }
+    return .{
+        .ok = ok,
+        .pages = @intCast(reserved),
+        .sectors = total_sectors,
+    };
+}
+
+fn readableMask(sectors: usize) u8 {
+    if (sectors >= PAGE_SECTORS) return FULL_MASK;
+    if (sectors == 0) return 0;
+    return (@as(u8, 1) << @as(u3, @intCast(sectors))) - 1;
+}
+
+fn refreshCapacityLocked() page_cache_policy.Capacity {
+    const next = page_cache_policy.capacityForMemory(
+        capacity_reference_frames,
+        mem_phys.stats().free_frames,
+    );
+    if (next.active_pages < capacity_state.active_pages) {
+        stats.capacity_reductions +%= 1;
+    }
+    if (next.read_ahead_pages < capacity_state.read_ahead_pages) {
+        for (&read_ahead_states) |*state| {
+            if (state.pending or state.inflight) {
+                if (state.cancelAll()) stats.read_ahead_cancellations +%= 1;
+            } else if (next.read_ahead_pages == 0) {
+                state.sequential.reset();
+            }
+        }
+    }
+    capacity_state = next;
+    stats.capacity_ram_limit_pages = next.ram_pages;
+    stats.capacity_active_limit_pages = next.active_pages;
+    stats.capacity_pressure_level = next.pressure_level;
+    stats.read_ahead_window_max_pages = if (SPECULATIVE_READ_AHEAD_ENABLED) next.read_ahead_pages else 0;
+    return next;
+}
+
+fn capacityOverLimitLocked() bool {
+    return policy_index.entryCount() > refreshCapacityLocked().active_pages;
+}
+
+fn trimCapacityOne() bool {
+    const guard = acquireLock() orelse return false;
+    defer releaseLock(guard);
+    const unwind = enterOperation() orelse return false;
+    defer _ = task_context.leaveUnwind(unwind);
+    if (!capacityOverLimitLocked()) return false;
+    const slot = selectCleanPayloadSlot() orelse return false;
+    stats.evictions +%= 1;
+    stats.reclaim_clean_entries +%= 1;
+    stats.capacity_trimmed_pages +%= 1;
+    clearEntry(slot, true);
+    return true;
+}
+
 fn selectWritableSlot(preferred_device: usize) ?usize {
-    if (policy_index.claimFree()) |index| return index;
+    const capacity = refreshCapacityLocked();
+    if (policy_index.entryCount() < capacity.active_pages) {
+        if (policy_index.claimFree()) |index| return index;
+    }
     stats.reclaim_scans +%= 1;
     const slot = policy_index.cleanVictim(preferred_device) orelse {
         // Alles dirty oder gepinnt: KEIN Writeback hier - der wuerde
@@ -1743,9 +2114,9 @@ fn policyWorkerMain() callconv(.c) void {
             }
         }
 
-        // Dirty progress owns priority. Speculation runs only when this wake
-        // found no eligible pressure/age page and consumes at most one page.
-        if (pages == 0 and !failed) _ = readAheadOne();
+        // Dirty progress owns priority. With speculation disabled, an idle
+        // pass performs at most one bounded capacity trim.
+        if (pages == 0 and !failed) _ = trimCapacityOne();
 
         if (pages == BACKGROUND_PAGE_BUDGET and backgroundNeedsPromptWake()) {
             scheduler.sleepTicksWithReason(BACKGROUND_REQUEUE_TICKS, "pgcache-policy-yield");
@@ -1792,6 +2163,7 @@ fn backgroundWritebackOne() BackgroundOutcome {
 }
 
 fn selectBackgroundDirtyLocked(now: u64) ?BackgroundSelection {
+    const over_capacity = capacityOverLimitLocked();
     var visited: u8 = 0;
     var probes: usize = 0;
     while (probes < MAX_DEVICES) : (probes += 1) {
@@ -1801,7 +2173,7 @@ fn selectBackgroundDirtyLocked(now: u64) ?BackgroundSelection {
         visited |= bit;
         if (now < background_failure_until[device_index]) continue;
         const index = policy_index.dirtyHead(device_index) orelse continue;
-        const reason: BackgroundReason = if (policy_index.devices[device_index].pressure_active)
+        const reason: BackgroundReason = if (policy_index.devices[device_index].pressure_active or over_capacity)
             .pressure
         else if (page_cache_policy.ageDue(now, entries[index].dirty_since_tick, MAX_DIRTY_AGE_TICKS))
             .age
@@ -1815,6 +2187,7 @@ fn selectBackgroundDirtyLocked(now: u64) ?BackgroundSelection {
 fn backgroundNeedsPromptWake() bool {
     const guard = acquireLock() orelse return false;
     defer releaseLock(guard);
+    if (capacityOverLimitLocked()) return true;
     const now = timer.tickCount();
     var device_index: usize = 0;
     while (device_index < MAX_DEVICES) : (device_index += 1) {
@@ -1828,7 +2201,7 @@ fn backgroundNeedsPromptWake() bool {
 
 fn noteDemandStartLocked(device_index: usize, page_lba: u64) void {
     if (device_index >= MAX_DEVICES) return;
-    if (read_ahead_states[device_index].demand(page_lba)) {
+    if (read_ahead_states[device_index].demand(page_lba / PAGE_SECTORS)) {
         stats.read_ahead_cancellations +%= 1;
     }
 }
@@ -1843,31 +2216,57 @@ fn noteDemandHitLocked(index: usize) void {
 }
 
 fn scheduleReadAheadLocked(device_index: usize, lba: u64, count: u32) void {
-    if (!policy_worker_started or device_index >= MAX_DEVICES or count < READ_AHEAD_TRIGGER_SECTORS) return;
+    if (!SPECULATIVE_READ_AHEAD_ENABLED or
+        !policy_worker_started or
+        device_index >= MAX_DEVICES or
+        count < READ_AHEAD_TRIGGER_SECTORS) return;
     const count_u64: u64 = count;
     const end_lba = lba +% count_u64;
     if (end_lba < lba or end_lba == 0) return;
     const last_page = pageLba(end_lba - 1);
-    const next_page = last_page +% PAGE_SECTORS;
-    if (next_page <= last_page) return;
+    const next_page_lba = last_page +% PAGE_SECTORS;
+    if (next_page_lba <= last_page) return;
     const device = block.get(device_index) orelse return;
     if (device.sector_size != SECTOR_SIZE) return;
-    if (device.sector_count != 0 and next_page >= device.sector_count) return;
-
-    stats.read_ahead_requests +%= 1;
-    if (findEntry(device_index, next_page) != null) {
+    const capacity = refreshCapacityLocked();
+    if (capacity.read_ahead_pages == 0) return;
+    if (device.sector_count != 0 and next_page_lba >= device.sector_count) return;
+    const resident_budget = readAheadResidentBudget(capacity);
+    if (resident_budget == 0 or
+        read_ahead_states[device_index].resident_pages >= resident_budget)
+    {
         stats.read_ahead_budget_skips +%= 1;
         return;
     }
-    if (read_ahead_states[device_index].schedule(next_page)) {
+
+    stats.read_ahead_requests +%= 1;
+    if (findEntry(device_index, next_page_lba) != null) {
+        stats.read_ahead_budget_skips +%= 1;
+        return;
+    }
+    if (read_ahead_states[device_index].schedule(next_page_lba / PAGE_SECTORS, 1)) {
         stats.read_ahead_cancellations +%= 1;
     }
+    stats.read_ahead_pages_scheduled +%= 1;
     policy_event.signal();
+}
+
+fn readAheadResidentBudget(capacity: page_cache_policy.Capacity) u16 {
+    if (capacity.read_ahead_pages == 0) return 0;
+    return @min(READ_AHEAD_RESIDENT_LIMIT, capacity.read_ahead_pages);
+}
+
+fn readAheadFreeFloor(capacity: page_cache_policy.Capacity) u16 {
+    return @max(
+        READ_AHEAD_FREE_FLOOR_MIN,
+        @min(READ_AHEAD_FREE_FLOOR_MAX, capacity.active_pages / 8),
+    );
 }
 
 fn readAheadOne() bool {
     const guard = acquireLock() orelse return false;
-    defer releaseLock(guard);
+    var locked = true;
+    defer if (locked) releaseLock(guard);
     const unwind = enterOperation() orelse return false;
     defer _ = task_context.leaveUnwind(unwind);
 
@@ -1878,31 +2277,76 @@ fn readAheadOne() bool {
         if (!state.pending or state.inflight) continue;
         read_ahead_device_cursor = @intCast((device_index + 1) % MAX_DEVICES);
         const request = state.begin() orelse continue;
-        if (state.resident_pages >= READ_AHEAD_RESIDENT_PAGES_PER_DEVICE or
-            policy_index.free_count <= READ_AHEAD_FREE_FLOOR)
+        const capacity = refreshCapacityLocked();
+        const resident_budget = readAheadResidentBudget(capacity);
+        if (resident_budget == 0 or
+            request.pages == 0 or
+            request.pages > resident_budget -| state.resident_pages or
+            policy_index.entryCount() + request.pages > capacity.active_pages or
+            policy_index.free_count <= readAheadFreeFloor(capacity))
         {
             _ = state.complete(request, false);
             stats.read_ahead_budget_skips +%= 1;
             continue;
         }
-        if (findEntry(device_index, request.page) != null) {
+        const first_page_lba = request.page * PAGE_SECTORS;
+        if (findEntry(device_index, first_page_lba) != null) {
             _ = state.complete(request, false);
             stats.read_ahead_budget_skips +%= 1;
             continue;
         }
-        const index = createReadAheadEntryLocked(device_index, request.page) orelse {
-            _ = state.complete(request, false);
-            stats.read_ahead_budget_skips +%= 1;
-            continue;
-        };
-        const ok = fillEntryWithBackendPolicy(guard, index);
-        const publish = state.complete(request, ok);
+
+        var staging: ?[]u8 = null;
+        if (request.pages >= 2) {
+            releaseLock(guard);
+            locked = false;
+            staging = heap.alloc(@as(usize, request.pages) * PAGE_BYTES, 16);
+            relock(guard);
+            locked = true;
+        }
+        var outcome: FillRunOutcome = .{};
+        if (request.pages >= 2 and staging != null) {
+            outcome = fillContiguousRunLocked(
+                guard,
+                device_index,
+                first_page_lba,
+                request.pages,
+                staging.?,
+                true,
+            );
+        } else if (request.pages == 1) {
+            const index = createReadAheadEntryLocked(device_index, first_page_lba);
+            if (index) |slot| {
+                outcome = .{
+                    .ok = fillEntryWithBackendPolicy(guard, slot),
+                    .pages = 1,
+                    .sectors = PAGE_SECTORS,
+                };
+            }
+        }
+        const publish = state.complete(request, outcome.ok);
         if (publish) {
-            entries[index].read_ahead = true;
-            state.resident_pages += 1;
-            stats.read_ahead_issued +%= 1;
-        } else if (entries[index].valid and !entries[index].io_busy and entries[index].dirty_mask == 0) {
-            clearEntry(index, false);
+            var page_offset: u16 = 0;
+            while (page_offset < outcome.pages) : (page_offset += 1) {
+                const page_lba = first_page_lba + @as(u64, page_offset) * PAGE_SECTORS;
+                const index = findEntry(device_index, page_lba) orelse continue;
+                if (!entries[index].read_ahead) {
+                    entries[index].read_ahead = true;
+                    state.resident_pages += 1;
+                    stats.read_ahead_issued +%= 1;
+                    stats.read_ahead_pages_issued +%= 1;
+                }
+            }
+        } else {
+            discardReadAheadRunLocked(device_index, first_page_lba, outcome.pages);
+            if (staging == null and request.pages >= 2) stats.read_ahead_budget_skips +%= 1;
+        }
+        if (staging) |memory| {
+            releaseLock(guard);
+            locked = false;
+            _ = heap.free(memory);
+            relock(guard);
+            locked = true;
         }
         return true;
     }
@@ -1910,7 +2354,9 @@ fn readAheadOne() bool {
 }
 
 fn createReadAheadEntryLocked(device_index: usize, page_lba_value: u64) ?usize {
-    if (policy_index.free_count <= READ_AHEAD_FREE_FLOOR) return null;
+    const capacity = refreshCapacityLocked();
+    if (policy_index.entryCount() >= capacity.active_pages or
+        policy_index.free_count <= readAheadFreeFloor(capacity)) return null;
     const index = policy_index.claimFree() orelse return null;
     const kept_phys = entries[index].phys_addr;
     entries[index] = .{
@@ -1938,6 +2384,15 @@ fn createReadAheadEntryLocked(device_index: usize, page_lba_value: u64) ?usize {
     }
     linkEntry(index);
     return index;
+}
+
+fn discardReadAheadRunLocked(device_index: usize, first_page_lba: u64, pages: u16) void {
+    var page_offset: u16 = 0;
+    while (page_offset < pages) : (page_offset += 1) {
+        const page_lba = first_page_lba + @as(u64, page_offset) * PAGE_SECTORS;
+        const index = findEntry(device_index, page_lba) orelse continue;
+        if (!entries[index].io_busy and entries[index].dirty_mask == 0) clearEntry(index, false);
+    }
 }
 
 fn dropReadAheadResidencyLocked(index: usize) void {

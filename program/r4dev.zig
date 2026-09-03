@@ -1443,10 +1443,13 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const v9_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_bulk_write_requests");
     const v10_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_policy_version");
     const v11_size: usize = @offsetOf(ProgramPerformanceSummary, "ntfs_metadata_cache_version");
-    const v12_size: usize = @sizeOf(ProgramPerformanceSummary);
+    const v12_size: usize = @offsetOf(ProgramPerformanceSummary, "fs_cache_capacity_min_pages");
+    const v13_size: usize = @sizeOf(ProgramPerformanceSummary);
     if (caller_version == 0 or caller_size < @offsetOf(ProgramPerformanceSummary, "flags")) return -1;
-    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v12_size)
+    const negotiated_version: u32 = if (caller_version >= performance_snapshot_version and caller_size >= v13_size)
         performance_snapshot_version
+    else if (caller_version >= 12 and caller_size >= v12_size)
+        12
     else if (caller_version >= 11 and caller_size >= v11_size)
         11
     else if (caller_version >= 10 and caller_size >= v10_size)
@@ -1481,7 +1484,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         9 => v9_size,
         10 => v10_size,
         11 => v11_size,
-        else => v12_size,
+        12 => v12_size,
+        else => v13_size,
     };
     const copy_size = @min(caller_size, version_capacity);
     const sched = scheduler.stats();
@@ -2095,6 +2099,32 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .ntfs_metadata_reclaim_requests = ntfs_metadata.reclaim_requests,
         .ntfs_metadata_reclaim_scans = ntfs_metadata.reclaim_scans,
         .ntfs_metadata_reclaimed_entries = ntfs_metadata.reclaimed_entries,
+        .fs_cache_capacity_min_pages = fs_cache.capacity_min_pages,
+        .fs_cache_capacity_max_pages = fs_cache.capacity_max_pages,
+        .fs_cache_capacity_ram_limit_pages = fs_cache.capacity_ram_limit_pages,
+        .fs_cache_capacity_active_limit_pages = fs_cache.capacity_active_limit_pages,
+        .fs_cache_capacity_pressure_level = fs_cache.capacity_pressure_level,
+        .fs_cache_read_ahead_window_pages = fs_cache.read_ahead_window_pages,
+        .fs_cache_read_ahead_window_max_pages = fs_cache.read_ahead_window_max_pages,
+        .fs_cache_capacity_reserved0 = fs_cache.capacity_reserved0,
+        .fs_cache_fill_run_requests = fs_cache.fill_run_requests,
+        .fs_cache_fill_run_backend_requests = fs_cache.fill_run_backend_requests,
+        .fs_cache_fill_run_pages = fs_cache.fill_run_pages,
+        .fs_cache_fill_run_sectors = fs_cache.fill_run_sectors,
+        .fs_cache_fill_run_bytes = fs_cache.fill_run_bytes,
+        .fs_cache_fill_run_failures = fs_cache.fill_run_failures,
+        .fs_cache_fill_run_retries = fs_cache.fill_run_retries,
+        .fs_cache_fill_run_max_pages = fs_cache.fill_run_max_pages,
+        .fs_cache_fill_scatter_copy_bytes = fs_cache.fill_scatter_copy_bytes,
+        .fs_cache_read_staging_copy_bytes = fs_cache.read_staging_copy_bytes,
+        .fs_cache_read_caller_copy_bytes = fs_cache.read_caller_copy_bytes,
+        .fs_cache_read_publish_lock_drops = fs_cache.read_publish_lock_drops,
+        .fs_cache_fill_lock_drops = fs_cache.fill_lock_drops,
+        .fs_cache_capacity_reductions = fs_cache.capacity_reductions,
+        .fs_cache_capacity_trimmed_pages = fs_cache.capacity_trimmed_pages,
+        .fs_cache_read_ahead_pages_scheduled = fs_cache.read_ahead_pages_scheduled,
+        .fs_cache_read_ahead_pages_issued = fs_cache.read_ahead_pages_issued,
+        .fs_cache_read_ahead_random_resets = fs_cache.read_ahead_random_resets,
         .fs_cache_clean_reclaimable_entries = fs_cache.clean_reclaimable_entries,
         .fs_cache_dirty_non_reclaimable_entries = fs_cache.dirty_non_reclaimable_entries,
         .fs_cache_pagefile_ready = 0,

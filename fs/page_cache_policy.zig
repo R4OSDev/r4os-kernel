@@ -11,6 +11,146 @@ pub const no_device: u8 = 0xFF;
 pub const dirty_high_pages: u16 = 64;
 pub const dirty_low_pages: u16 = 32;
 
+// Metadata stays fixed and bounded, while committed payload capacity follows
+// the RAM available at boot and contracts under current PMM pressure. The
+// thresholds deliberately leave substantially more free memory than the
+// cache can consume itself.
+pub const min_capacity_pages: u16 = 64;
+pub const max_capacity_pages: u16 = @intCast(max_entries);
+pub const capacity_ram_divisor_frames: u64 = 128;
+pub const pressure_critical_free_frames: u64 = 1024;
+pub const pressure_low_free_frames: u64 = 4096;
+pub const pressure_moderate_free_frames: u64 = 8192;
+pub const read_ahead_max_pages: u16 = 16;
+
+pub const Capacity = struct {
+    ram_pages: u16,
+    active_pages: u16,
+    pressure_level: u8,
+    read_ahead_pages: u16,
+};
+
+pub fn capacityForMemory(reference_free_frames: u64, current_free_frames: u64) Capacity {
+    const raw_pages = reference_free_frames / capacity_ram_divisor_frames;
+    const ram_pages: u16 = @intCast(@min(
+        @as(u64, max_capacity_pages),
+        @max(@as(u64, min_capacity_pages), raw_pages),
+    ));
+
+    var active_pages = ram_pages;
+    var pressure_level: u8 = 0;
+    if (current_free_frames <= pressure_critical_free_frames) {
+        active_pages = @min(ram_pages, min_capacity_pages);
+        pressure_level = 3;
+    } else if (current_free_frames <= pressure_low_free_frames) {
+        active_pages = @min(ram_pages, 128);
+        pressure_level = 2;
+    } else if (current_free_frames <= pressure_moderate_free_frames) {
+        active_pages = @min(ram_pages, 256);
+        pressure_level = 1;
+    }
+
+    const unconstrained_window = @max(
+        @as(u16, 1),
+        @min(read_ahead_max_pages, active_pages / 32),
+    );
+    const read_ahead_pages: u16 = switch (pressure_level) {
+        3 => 0,
+        2 => 1,
+        1 => @min(unconstrained_window, 4),
+        else => unconstrained_window,
+    };
+    return .{
+        .ram_pages = ram_pages,
+        .active_pages = active_pages,
+        .pressure_level = pressure_level,
+        .read_ahead_pages = read_ahead_pages,
+    };
+}
+
+/// Bounds one contiguous page fill by demand, the backend's sector limit and
+/// the currently admitted cache capacity. A backend limit below one cache
+/// page still admits one page; block.zig then performs its required splits.
+pub fn fillRunPageLimit(
+    requested_pages: u16,
+    max_sectors_per_request: u16,
+    page_sectors: u16,
+    capacity_pages: u16,
+) u16 {
+    if (requested_pages == 0 or page_sectors == 0 or capacity_pages == 0) return 0;
+    var device_pages = requested_pages;
+    if (max_sectors_per_request != 0) {
+        device_pages = @max(@as(u16, 1), max_sectors_per_request / page_sectors);
+    }
+    return @min(requested_pages, @min(device_pages, capacity_pages));
+}
+
+/// USB mass storage owns its exact transport retry below the cache. Other
+/// backends retain one cache-level retry after an unsuccessful first attempt.
+pub fn fillAttemptLimit(owns_transport_retry: bool) u8 {
+    return if (owns_transport_retry) 1 else 2;
+}
+
+/// A contiguous media read may update only sectors that were absent when the
+/// cache identities were pinned. Existing valid sectors include dirty data
+/// and must never be replaced by the staging image.
+pub fn fillMissingMask(valid_before: u8, readable_mask: u8) u8 {
+    return readable_mask & ~valid_before;
+}
+
+/// Publication is atomic at run level: success exposes every readable sector,
+/// while failure preserves the exact pre-I/O validity mask.
+pub fn fillPublishedMask(valid_before: u8, readable_mask: u8, success: bool) u8 {
+    return if (success) valid_before | readable_mask else valid_before;
+}
+
+pub const SequentialDecision = struct {
+    next_page: u64 = 0,
+    pages: u16 = 0,
+    random_reset: bool = false,
+};
+
+pub const Sequential = struct {
+    have_last: bool = false,
+    last_end_page: u64 = 0,
+    window_pages: u16 = 0,
+
+    /// Observes a completed half-open demand range in cache-page units.
+    /// Adjacent reads double the bounded window. A first observation and a
+    /// random jump merely establish a new cursor: neither is sufficient
+    /// evidence for speculative I/O.
+    pub fn observe(self: *Sequential, first_page: u64, end_page: u64, max_window: u16) SequentialDecision {
+        if (end_page <= first_page) return .{};
+        const random_reset = self.have_last and first_page != self.last_end_page;
+        const sequential = self.have_last and first_page == self.last_end_page;
+        const demand_pages = end_page - first_page;
+
+        if (max_window == 0) {
+            self.window_pages = 0;
+        } else if (sequential) {
+            const grown = if (self.window_pages == 0)
+                @as(u16, 1)
+            else
+                self.window_pages *| 2;
+            self.window_pages = @min(max_window, grown);
+        } else {
+            _ = demand_pages;
+            self.window_pages = 0;
+        }
+        self.have_last = true;
+        self.last_end_page = end_page;
+        return .{
+            .next_page = end_page,
+            .pages = self.window_pages,
+            .random_reset = random_reset,
+        };
+    }
+
+    pub fn reset(self: *Sequential) void {
+        self.* = .{};
+    }
+};
+
 pub const Queue = enum(u8) {
     detached,
     free,
@@ -42,6 +182,7 @@ pub const Device = struct {
 
 pub const ReadAheadRequest = struct {
     page: u64,
+    pages: u16,
     generation: u64,
 };
 
@@ -49,20 +190,26 @@ pub const ReadAhead = struct {
     generation: u64 = 1,
     pending: bool = false,
     pending_page: u64 = 0,
+    pending_pages: u16 = 0,
     inflight: bool = false,
     inflight_page: u64 = 0,
+    inflight_pages: u16 = 0,
     resident_pages: u16 = 0,
+    sequential: Sequential = .{},
 
     // Returns true when an older pending/in-flight request was superseded.
-    pub fn schedule(self: *ReadAhead, page: u64) bool {
-        if ((self.pending and self.pending_page == page) or
-            (self.inflight and self.inflight_page == page)) return false;
+    pub fn schedule(self: *ReadAhead, page: u64, pages: u16) bool {
+        if (pages == 0) return false;
+        if ((self.pending and self.pending_page == page and self.pending_pages == pages) or
+            (self.inflight and self.inflight_page == page and self.inflight_pages == pages)) return false;
         var cancelled = false;
-        if (self.pending and self.pending_page != page) cancelled = true;
-        if (self.inflight and self.inflight_page != page) cancelled = true;
+        if (self.pending) cancelled = true;
+        if (self.inflight and
+            (self.inflight_page != page or self.inflight_pages != pages)) cancelled = true;
         if (cancelled) self.bumpGeneration();
         self.pending = true;
         self.pending_page = page;
+        self.pending_pages = pages;
         return cancelled;
     }
 
@@ -72,9 +219,10 @@ pub const ReadAhead = struct {
         var cancelled = false;
         if (self.pending) {
             self.pending = false;
+            self.pending_pages = 0;
             cancelled = true;
         }
-        if (self.inflight and self.inflight_page != page) {
+        if (self.inflight and !containsPage(self.inflight_page, self.inflight_pages, page)) {
             cancelled = true;
             self.bumpGeneration();
         }
@@ -84,7 +232,9 @@ pub const ReadAhead = struct {
     pub fn cancelAll(self: *ReadAhead) bool {
         const cancelled = self.pending or self.inflight;
         self.pending = false;
+        self.pending_pages = 0;
         if (self.inflight) self.bumpGeneration();
+        self.sequential.reset();
         return cancelled;
     }
 
@@ -93,7 +243,13 @@ pub const ReadAhead = struct {
         self.pending = false;
         self.inflight = true;
         self.inflight_page = self.pending_page;
-        return .{ .page = self.inflight_page, .generation = self.generation };
+        self.inflight_pages = self.pending_pages;
+        self.pending_pages = 0;
+        return .{
+            .page = self.inflight_page,
+            .pages = self.inflight_pages,
+            .generation = self.generation,
+        };
     }
 
     // True means the completed page still belongs to the current plan and
@@ -101,8 +257,12 @@ pub const ReadAhead = struct {
     pub fn complete(self: *ReadAhead, request: ReadAheadRequest, success: bool) bool {
         const current = self.inflight and
             self.inflight_page == request.page and
+            self.inflight_pages == request.pages and
             self.generation == request.generation;
-        if (self.inflight and self.inflight_page == request.page) self.inflight = false;
+        if (self.inflight and self.inflight_page == request.page) {
+            self.inflight = false;
+            self.inflight_pages = 0;
+        }
         return current and success;
     }
 
@@ -113,6 +273,11 @@ pub const ReadAhead = struct {
     fn bumpGeneration(self: *ReadAhead) void {
         self.generation +%= 1;
         if (self.generation == 0) self.generation = 1;
+    }
+
+    fn containsPage(first: u64, pages: u16, page: u64) bool {
+        if (pages == 0 or page < first) return false;
+        return page - first < pages;
     }
 };
 
@@ -519,21 +684,79 @@ test "dirty age threshold is monotone and wrap-safe by refusal" {
 
 test "read-ahead is replaceable, demand-cancellable, and generation bound" {
     var state = ReadAhead{};
-    try std.testing.expect(!state.schedule(80));
+    try std.testing.expect(!state.schedule(80, 2));
     const first = state.begin().?;
     try std.testing.expectEqual(@as(u64, 80), first.page);
-    try std.testing.expect(state.schedule(160));
+    try std.testing.expectEqual(@as(u16, 2), first.pages);
+    try std.testing.expect(state.schedule(160, 4));
     try std.testing.expect(!state.complete(first, true));
     const second = state.begin().?;
     try std.testing.expectEqual(@as(u64, 160), second.page);
     try std.testing.expect(state.demand(24));
     try std.testing.expect(!state.complete(second, true));
 
-    try std.testing.expect(!state.schedule(240));
+    try std.testing.expect(!state.schedule(240, 3));
     const matching = state.begin().?;
-    try std.testing.expect(!state.demand(240));
+    try std.testing.expect(!state.demand(242));
     try std.testing.expect(state.complete(matching, true));
     state.resident_pages = 1;
     state.consumeResident();
     try std.testing.expectEqual(@as(u16, 0), state.resident_pages);
+}
+
+test "RAM and pressure bound active capacity and speculation" {
+    const abundant = capacityForMemory(256 * 1024, 200 * 1024);
+    try std.testing.expectEqual(max_capacity_pages, abundant.ram_pages);
+    try std.testing.expectEqual(max_capacity_pages, abundant.active_pages);
+    try std.testing.expectEqual(read_ahead_max_pages, abundant.read_ahead_pages);
+
+    const moderate = capacityForMemory(256 * 1024, pressure_moderate_free_frames);
+    try std.testing.expectEqual(@as(u16, 256), moderate.active_pages);
+    try std.testing.expectEqual(@as(u8, 1), moderate.pressure_level);
+    try std.testing.expectEqual(@as(u16, 4), moderate.read_ahead_pages);
+
+    const critical = capacityForMemory(256 * 1024, pressure_critical_free_frames);
+    try std.testing.expectEqual(min_capacity_pages, critical.active_pages);
+    try std.testing.expectEqual(@as(u8, 3), critical.pressure_level);
+    try std.testing.expectEqual(@as(u16, 0), critical.read_ahead_pages);
+
+    const small = capacityForMemory(4096, 4096);
+    try std.testing.expectEqual(min_capacity_pages, small.ram_pages);
+    try std.testing.expectEqual(min_capacity_pages, small.active_pages);
+}
+
+test "backend and cache budgets bound contiguous fill runs" {
+    try std.testing.expectEqual(@as(u16, 16), fillRunPageLimit(32, 128, 8, 512));
+    try std.testing.expectEqual(@as(u16, 32), fillRunPageLimit(32, 0, 8, 512));
+    try std.testing.expectEqual(@as(u16, 1), fillRunPageLimit(32, 4, 8, 512));
+    try std.testing.expectEqual(@as(u16, 6), fillRunPageLimit(32, 128, 8, 6));
+    try std.testing.expectEqual(@as(u16, 0), fillRunPageLimit(0, 128, 8, 512));
+}
+
+test "fill publication preserves dirty-valid sectors and rolls back failure" {
+    const valid_before: u8 = 0b0010_0101;
+    const readable: u8 = 0b1111_1111;
+    try std.testing.expectEqual(@as(u8, 0b1101_1010), fillMissingMask(valid_before, readable));
+    try std.testing.expectEqual(readable, fillPublishedMask(valid_before, readable, true));
+    try std.testing.expectEqual(valid_before, fillPublishedMask(valid_before, readable, false));
+    try std.testing.expectEqual(@as(u8, 1), fillAttemptLimit(true));
+    try std.testing.expectEqual(@as(u8, 2), fillAttemptLimit(false));
+}
+
+test "sequential window grows and random access resets it" {
+    var sequence = Sequential{};
+    const bulk = sequence.observe(0, 2, 16);
+    try std.testing.expectEqual(@as(u16, 0), bulk.pages);
+    try std.testing.expect(!bulk.random_reset);
+    const adjacent = sequence.observe(2, 4, 16);
+    try std.testing.expectEqual(@as(u16, 1), adjacent.pages);
+    const grown = sequence.observe(4, 6, 16);
+    try std.testing.expectEqual(@as(u16, 2), grown.pages);
+    const random = sequence.observe(30, 31, 16);
+    try std.testing.expect(random.random_reset);
+    try std.testing.expectEqual(@as(u16, 0), random.pages);
+    const resumed = sequence.observe(31, 32, 2);
+    try std.testing.expectEqual(@as(u16, 1), resumed.pages);
+    const bounded = sequence.observe(32, 33, 2);
+    try std.testing.expectEqual(@as(u16, 2), bounded.pages);
 }
