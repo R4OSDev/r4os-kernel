@@ -34,6 +34,8 @@ var preemption_deferred_kernel_ip_count: u64 = 0;
 var preemption_switch_tick_count: u64 = 0;
 var preemption_quantum_expired_count: u64 = 0;
 var preemption_app_code_tick_count: u64 = 0;
+var timer_preemption_switches_by_cpu: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
+var reschedule_ipi_switches_by_cpu: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
 var long_running_warning_count: u64 = 0;
 var starvation_warning_count: u64 = 0;
 var ready_latency_sample_count: u64 = 0;
@@ -159,6 +161,20 @@ pub const Stats = struct {
     safe_reschedule_deferred_owner: u64 = 0,
 };
 
+pub const CpuPreemptionStats = struct {
+    timer_switches: u64 = 0,
+    reschedule_ipi_switches: u64 = 0,
+};
+
+pub fn cpuPreemptionStats(cpu_index: u32) CpuPreemptionStats {
+    if (cpu_index >= percpu.max_cpus) return .{};
+    const index: usize = @intCast(cpu_index);
+    return .{
+        .timer_switches = timer_preemption_switches_by_cpu[index],
+        .reschedule_ipi_switches = reschedule_ipi_switches_by_cpu[index],
+    };
+}
+
 pub fn init() bool {
     task_context.clear();
     if (task.count() == 0) return false;
@@ -192,6 +208,8 @@ pub fn init() bool {
     preemption_switch_tick_count = 0;
     preemption_quantum_expired_count = 0;
     preemption_app_code_tick_count = 0;
+    timer_preemption_switches_by_cpu = .{0} ** percpu.max_cpus;
+    reschedule_ipi_switches_by_cpu = .{0} ** percpu.max_cpus;
     long_running_warning_count = 0;
     starvation_warning_count = 0;
     ready_latency_sample_count = 0;
@@ -900,7 +918,6 @@ pub fn onTick(now: u64, preemptible_instruction_pointer: bool) bool {
 }
 
 pub fn onSecondaryTick(now: u64, preemptible_instruction_pointer: bool) bool {
-    _ = preemptible_instruction_pointer;
     const state = localState();
     if (!initialized or !state.initialized) return false;
     if (state.current_task) |running| {
@@ -910,19 +927,19 @@ pub fn onSecondaryTick(now: u64, preemptible_instruction_pointer: bool) bool {
             recordQuantumOverrun(run_ticks);
         }
     }
+    const should_preempt = runTimerPreemption(now, preemptible_instruction_pointer);
     recordRuntimeWarnings(now);
-    // The initial SMP contract keeps AP context switches at explicit
-    // scheduler boundaries. Interrupt-frame preemption remains owned by the
-    // proven BSP path until the AP interrupt-return path has its own audited
-    // continuation contract.
-    return false;
+    return should_preempt;
 }
 
 pub fn onRescheduleIpi(preemptible_instruction_pointer: bool) void {
-    if (percpu.currentIndex() != 0) return;
     const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
-    if (preemptPendingWake(preemptible_instruction_pointer)) preemptFromIrq();
+    if (preemptPendingWake(preemptible_instruction_pointer)) {
+        const cpu_index: usize = @intCast(percpu.currentIndex());
+        reschedule_ipi_switches_by_cpu[cpu_index] +%= 1;
+        preemptFromIrq();
+    }
 }
 
 pub fn dumpCurrent() void {
@@ -1084,6 +1101,7 @@ fn runTimerPreemption(now: u64, preemptible_instruction_pointer: bool) bool {
     }
 
     preemption_switch_tick_count +%= 1;
+    timer_preemption_switches_by_cpu[@intCast(percpu.currentIndex())] +%= 1;
     return true;
 }
 

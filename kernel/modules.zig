@@ -34,6 +34,7 @@ const R4M_VERSION: u16 = 1;
 const ARCH_X86_64: u16 = 1;
 
 const R4M_SECTION_FLAG_BSS: u32 = 0x00000008;
+const R4M_SECTION_FLAG_EXEC: u32 = 0x00000002;
 const R4M_RELOC_ABS64: u32 = 1;
 const R4M_RELOC_REL32: u32 = 2;
 const R4M_RELOC_BASE_REL64: u32 = 3;
@@ -703,6 +704,8 @@ pub const ExportInfo = struct {
     version: u32,
     available_size: u32,
     generation: u32,
+    module_slot: u8,
+    kind: Kind,
 };
 
 pub fn exportInfo(slot: usize, symbol: []const u8, min_version: u32) ?ExportInfo {
@@ -714,6 +717,8 @@ pub fn exportInfo(slot: usize, symbol: []const u8, min_version: u32) ?ExportInfo
         .version = exp.version,
         .available_size = r4x_api.r4l_query_struct_size,
         .generation = entries[slot].generation,
+        .module_slot = @intCast(slot),
+        .kind = entries[slot].kind,
     };
     if (exp.section_index >= entries[slot].section_count or exp.section_index >= entries[slot].sections.len) return null;
     const section = entries[slot].sections[@intCast(exp.section_index)];
@@ -723,7 +728,30 @@ pub fn exportInfo(slot: usize, symbol: []const u8, min_version: u32) ?ExportInfo
         .version = exp.version,
         .available_size = section.mem_size - exp.section_offset,
         .generation = entries[slot].generation,
+        .module_slot = @intCast(slot),
+        .kind = entries[slot].kind,
     };
+}
+
+// IRQ-time executable ownership lookup. Runtime R4Ls are boot-generation
+// pinned today, but callers retain the exact slot+generation so a later
+// unload/reload implementation cannot accidentally make a stale program
+// binding preemptible. Only explicitly executable sections qualify; data,
+// BSS, other module kinds and overflowed ranges fail closed.
+pub fn isExecutableAddress(module_slot: u8, generation: u32, address: u64) bool {
+    const slot: usize = module_slot;
+    if (slot >= entries.len or generation == 0) return false;
+    const entry = &entries[slot];
+    if (!entry.used or entry.state != .loaded or entry.kind != .r4l or entry.generation != generation) return false;
+
+    const section_count: usize = @min(@as(usize, @intCast(entry.section_count)), entry.sections.len);
+    for (entry.sections[0..section_count]) |section| {
+        if (!section.used or (section.flags & R4M_SECTION_FLAG_EXEC) == 0 or section.mem_size == 0) continue;
+        const end = section.runtime_base +% @as(u64, section.mem_size);
+        if (end < section.runtime_base) continue;
+        if (address >= section.runtime_base and address < end) return true;
+    }
+    return false;
 }
 
 pub fn resolveExportAddress(module_name: []const u8, symbol: []const u8, min_version: u32) ?u64 {
@@ -2030,4 +2058,51 @@ test "built-in platform APIs own the six reserved Query providers" {
     }
     try testing.expectEqual(@as(?u32, 6), platformApiGroupId("r4dev"));
     try testing.expectEqual(@as(?u32, null), platformApiGroupId("R4STD"));
+}
+
+test "Runtime-R4L executable ownership is exact and generation safe" {
+    const std = @import("std");
+    const testing = std.testing;
+
+    init();
+    const slot = r4x_api.r4_platform_apis.len;
+    entries[slot] = .{
+        .used = true,
+        .kind = .r4l,
+        .state = .loaded,
+        .generation = 7,
+        .pinned = true,
+        .section_count = 3,
+    };
+    entries[slot].sections[0] = .{
+        .used = true,
+        .flags = R4M_SECTION_FLAG_EXEC,
+        .mem_size = 0x40,
+        .runtime_base = 0x1000,
+    };
+    entries[slot].sections[1] = .{
+        .used = true,
+        .flags = 0,
+        .mem_size = 0x40,
+        .runtime_base = 0x2000,
+    };
+    entries[slot].sections[2] = .{
+        .used = true,
+        .flags = R4M_SECTION_FLAG_EXEC,
+        .mem_size = 0x40,
+        .runtime_base = std.math.maxInt(u64) - 0x1f,
+    };
+
+    try testing.expect(isExecutableAddress(@intCast(slot), 7, 0x1000));
+    try testing.expect(isExecutableAddress(@intCast(slot), 7, 0x103f));
+    try testing.expect(!isExecutableAddress(@intCast(slot), 7, 0x1040));
+    try testing.expect(!isExecutableAddress(@intCast(slot), 7, 0x2000));
+    try testing.expect(!isExecutableAddress(@intCast(slot), 6, 0x1000));
+    try testing.expect(!isExecutableAddress(@intCast(slot), 7, std.math.maxInt(u64)));
+
+    entries[slot].kind = .r4d;
+    try testing.expect(!isExecutableAddress(@intCast(slot), 7, 0x1000));
+    entries[slot].kind = .r4l;
+    entries[slot].state = .failed;
+    try testing.expect(!isExecutableAddress(@intCast(slot), 7, 0x1000));
 }

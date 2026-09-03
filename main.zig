@@ -150,7 +150,7 @@ export fn kmain() callconv(.c) noreturn {
     fatal.setBootPhase(.runtime);
     beginBootStep(.runtime, "Runtime vorbereiten");
     bootscreen.setStatus("SMP pruefen");
-    _ = smp.runAcceptanceProbeIfEnabled();
+    _ = smp.runAcceptanceProbeIfEnabled(memory_boot.usableBytes());
     // 0.56.2: Hintergrund-RX-Task - NACH initTaskRuntime (sonst von
     // task.init() gewischt) und NACH driver_policy_boot (NIC geladen).
     bootscreen.setStatus("Netzwerk-Task starten");

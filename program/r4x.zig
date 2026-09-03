@@ -5,6 +5,7 @@ const drive = @import("../fs/drive.zig");
 const vfs = @import("../fs/vfs.zig");
 const fs_request = @import("../fs/request.zig");
 const paging = @import("../memory/paging.zig");
+const percpu = @import("../arch/x86_64/percpu.zig");
 const heap = @import("../memory/heap.zig");
 const mem_blocks = @import("../memory/blocks.zig");
 const mem_backing_store = @import("../memory/backing_store.zig");
@@ -21,6 +22,7 @@ const bootlog = @import("../kernel/bootlog.zig");
 const boot_config = @import("../kernel/boot_config.zig");
 const k = @import("../kernel/log.zig");
 const time_core = @import("../platform/time.zig");
+const monotonic = @import("../platform/monotonic.zig");
 const timer = @import("../kernel/timer.zig");
 const owner_locks = @import("../memory/owner_locks.zig");
 const scheduler = @import("../sched/scheduler.zig");
@@ -134,6 +136,10 @@ const GUI_TEXT_SIZE: usize = 512;
 const GUI_COMMAND_BLOCK_INITIAL_CAPACITY: u32 = 8;
 const GUI_COMMAND_BLOCK_TARGET_CAPACITY: u32 = 128;
 const GUI_RESOURCE_BLOCK_TARGET_BYTES: usize = 64 * 1024;
+// Immutable GUI snapshots and unpublished clones may be copied cooperatively.
+// Keep the boundary equal to the normal resource-node target so large legacy
+// blobs cannot monopolize a CPU while no frame-state or allocator lock is held.
+const GUI_COPY_RESCHEDULE_BYTES: usize = 64 * 1024;
 // The old NUL-pointer text ABI has no caller-supplied length.  Bound that one
 // scan to 1 MB for technical stability.  Explicit-length frame resources and
 // the aggregate frame have no corresponding fixed capacity.
@@ -456,12 +462,21 @@ const ResolvedR4MImport = struct {
     generation: u32 = 0,
 };
 
+const R4LCodeBinding = struct {
+    module_slot: u8 = 0,
+    reserved: [3]u8 = .{0} ** 3,
+    generation: u32 = 0,
+};
+
 const R4XStartImportSeed = struct {
     group_id: u32 = 0,
     min_version: u32 = 0,
     resolved_version: u32 = 0,
     flags: u32 = 0,
     table: u64 = 0,
+    r4l_binding_valid: bool = false,
+    r4l_module_slot: u8 = 0,
+    r4l_generation: u32 = 0,
     module_name: [R4XSTART_IMPORT_NAME_BYTES]u8 = .{0} ** R4XSTART_IMPORT_NAME_BYTES,
     module_name_len: usize = 0,
     symbol_name: [R4XSTART_IMPORT_NAME_BYTES]u8 = .{0} ** R4XSTART_IMPORT_NAME_BYTES,
@@ -759,6 +774,8 @@ const ProgramRuntimePayload = struct {
     r4xstart_import_count: u32 = 0,
     r4xstart_import_module_names: [MAX_R4M_IMPORTS][R4XSTART_IMPORT_NAME_BYTES]u8 = .{.{0} ** R4XSTART_IMPORT_NAME_BYTES} ** MAX_R4M_IMPORTS,
     r4xstart_import_symbol_names: [MAX_R4M_IMPORTS][R4XSTART_IMPORT_NAME_BYTES]u8 = .{.{0} ** R4XSTART_IMPORT_NAME_BYTES} ** MAX_R4M_IMPORTS,
+    r4l_code_bindings: [MAX_R4M_IMPORTS]R4LCodeBinding = .{R4LCodeBinding{}} ** MAX_R4M_IMPORTS,
+    r4l_code_binding_count: u8 = 0,
     module_path: [MODULE_ORIGIN_MAX]u8 = .{0} ** MODULE_ORIGIN_MAX,
     module_path_len: u32 = 0,
 };
@@ -3904,6 +3921,23 @@ fn linkClonedGuiResource(frame: *ProgramGuiFramePayload, payload: *ProgramGuiRes
     }
 }
 
+fn copyGuiBytesCooperatively(destination: []u8, source: []const u8) void {
+    std.debug.assert(destination.len == source.len);
+    if (source.len <= GUI_COPY_RESCHEDULE_BYTES) {
+        @memcpy(destination, source);
+        return;
+    }
+
+    var offset: usize = 0;
+    while (offset < source.len) {
+        const chunk = @min(source.len - offset, GUI_COPY_RESCHEDULE_BYTES);
+        const end = offset + chunk;
+        @memcpy(destination[offset..end], source[offset..end]);
+        offset = end;
+        _ = scheduler.safeReschedulePoint();
+    }
+}
+
 fn cloneGuiFrame(instance: *ProgramInstance, source: *const ProgramGuiFramePayload) ?*ProgramGuiFramePayload {
     const clone = allocateGuiFramePayload(instance.id, false) orelse return null;
     var chain: [r4x_api.gui_frame_max_delta_chain]*const ProgramGuiFramePayload = undefined;
@@ -3943,6 +3977,7 @@ fn cloneGuiFrame(instance: *ProgramInstance, source: *const ProgramGuiFramePaylo
                 if (command.resource_kind == .xrgb32 or command.resource_kind == .alpha8) command.raster_word_offset += raster_base;
             }
             linkClonedGuiCommand(clone, payload);
+            _ = scheduler.safeReschedulePoint();
         }
         var resource_cursor = source_frame.resource_payload;
         while (resource_cursor) |source_payload| : (resource_cursor = source_payload.next) {
@@ -3960,8 +3995,9 @@ fn cloneGuiFrame(instance: *ProgramInstance, source: *const ProgramGuiFramePaylo
                 _ = releaseGuiFrame(clone, instance.id);
                 return null;
             };
-            @memcpy(guiResourcePayloadData(payload), guiResourcePayloadDataConst(source_payload));
+            copyGuiBytesCooperatively(guiResourcePayloadData(payload), guiResourcePayloadDataConst(source_payload));
             linkClonedGuiResource(clone, payload);
+            _ = scheduler.safeReschedulePoint();
         }
         // Batch APPEND stores XRGB/Alpha resources in generic byte nodes. The
         // command semantics remain authoritative for the flattened legacy
@@ -4710,6 +4746,33 @@ var program_retire_head: ?*ProgramRegistrySlot = null;
 var program_retire_tail: ?*ProgramRegistrySlot = null;
 var program_reaper_event = sync.Event.initMode(false, .auto_reset);
 var program_reaper_started: bool = false;
+var runtime_initialized: bool = false;
+
+const R4L_PREEMPTION_PATH = "/R4OS/SOFTWARE/TERMINAL/DIAG/LSTRX.R4X";
+const R4L_PREEMPTION_MODULE = "EXTMATH";
+const R4L_PREEMPTION_FLAG_EXPORT = "PREEMPT_FLAG";
+const R4L_PREEMPTION_TIMEOUT_NS: u64 = 5_000_000_000;
+
+const R4LPreemptionMode = enum(u8) {
+    timer,
+    reschedule_ipi,
+};
+
+const R4LPreemptionScenario = struct {
+    ok: bool = false,
+    exit_code: i32 = -1,
+    timer_switches: u64 = 0,
+    reschedule_ipi_switches: u64 = 0,
+};
+
+var r4l_preemption_flag: ?*u64 = null;
+var r4l_preemption_mode: R4LPreemptionMode = .timer;
+var r4l_preemption_event = sync.Event.init(false);
+var r4l_preemption_witness_started: u8 = 0;
+var r4l_preemption_witness_done: u8 = 0;
+var r4l_preemption_witness_abort: u8 = 0;
+var r4l_preemption_witness_failures: u32 = 0;
+var r4l_preemption_witness_cpu: u32 = std.math.maxInt(u32);
 var program_thread_head: ?*ProgramThread = null;
 var program_thread_tail: ?*ProgramThread = null;
 var program_thread_count: usize = 0;
@@ -5736,6 +5799,8 @@ const api_allocator_vtable = ProgramAllocatorVTable{
 };
 
 pub fn initializeRuntime(usable_bytes: u64) void {
+    if (runtime_initialized) return;
+    runtime_initialized = true;
     async_io_retire_retry_test_armed = taskRegistryAsyncRetireRetryTestAllowed();
     async_io_retire_retry_test_consumed = false;
     async_io_retire_retry_test_remaining = if (async_io_retire_retry_test_armed) ASYNC_IO_RETIRE_RETRY_TEST_ATTEMPTS else 0;
@@ -6795,6 +6860,9 @@ const ProgramLaunchOptions = struct {
     // the established RunResult-only contract.
     error_out: ?*i32 = null,
     report_boot_launch: bool = false,
+    // Test-profile-only construction seam used by the AP preemption proof.
+    // It is accepted solely for the internal audited R4X allow-list.
+    forced_cpu: ?u8 = null,
 };
 
 const SubsystemTrace = struct {
@@ -7493,6 +7561,9 @@ fn resolveR4MImportsFromReader(reader: *module_r4m.Reader, header: module_r4m.He
             .resolved_version = resolved.version,
             .flags = 0,
             .table = resolved.address,
+            .r4l_binding_valid = resolved.kind == .r4l,
+            .r4l_module_slot = resolved.module_slot,
+            .r4l_generation = resolved.generation,
         };
         if (!copyR4XStartName(import.module, seed.module_name[0..], &seed.module_name_len)) return false;
         if (!copyR4XStartName(import.symbol, seed.symbol_name[0..], &seed.symbol_name_len)) return false;
@@ -8498,6 +8569,17 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_TASK_FAILED);
         return .failed;
     }
+    if (options.forced_cpu) |forced_cpu| {
+        if (!smp_audited or !task.bindBlockedHomeCpu(program_task, forced_cpu)) {
+            _ = releaseCreatedProgramTask(program_task);
+            rollbackReservedProgramInstance(reservation);
+            reservation_active.* = false;
+            k.puts("Program task CPU placement failed\r\n");
+            last_exit_code = 1;
+            setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_TASK_FAILED);
+            return .failed;
+        }
+    }
     instance.task_id = program_task.id;
     if (registerMainThread(instance, program_task) == null) {
         _ = releaseCreatedProgramTask(program_task);
@@ -8537,6 +8619,235 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
 fn isSmpAuditedBackgroundR4x(loaded: LoadedProgram) bool {
     const origin = loaded.origin[0..loaded.origin_len];
     return std.ascii.eqlIgnoreCase(origin, "C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG\\LSTRX.R4X");
+}
+
+fn r4lPreemptionDeadlineExpired(start: monotonic.Stamp, start_tick: u64) bool {
+    if (monotonic.elapsedNanoseconds(start, monotonic.capture())) |elapsed| {
+        return elapsed >= R4L_PREEMPTION_TIMEOUT_NS;
+    }
+    return timer.tickCount() -% start_tick >= 5 * @as(u64, timer.DEFAULT_HZ);
+}
+
+fn abortR4lPreemptionWitness() void {
+    @atomicStore(u8, &r4l_preemption_witness_abort, 1, .release);
+    if (r4l_preemption_flag) |flag| @atomicStore(u64, flag, 2, .release);
+    r4l_preemption_event.signal();
+}
+
+fn waitForR4lPreemptionWitness(start: monotonic.Stamp, start_tick: u64) bool {
+    while (@atomicLoad(u8, &r4l_preemption_witness_done, .acquire) == 0) {
+        if (r4lPreemptionDeadlineExpired(start, start_tick)) return false;
+        scheduler.yield();
+    }
+    return true;
+}
+
+fn r4lPreemptionWitnessMain() callconv(.c) void {
+    @atomicStore(u32, &r4l_preemption_witness_cpu, percpu.currentIndex(), .release);
+    @atomicStore(u8, &r4l_preemption_witness_started, 1, .release);
+
+    const flag = r4l_preemption_flag orelse {
+        _ = @atomicRmw(u32, &r4l_preemption_witness_failures, .Add, 1, .acq_rel);
+        @atomicStore(u8, &r4l_preemption_witness_done, 1, .release);
+        scheduler.exitCurrentAndRetire();
+    };
+
+    switch (r4l_preemption_mode) {
+        .timer => {
+            while (@atomicLoad(u64, flag, .acquire) != 1 and
+                @atomicLoad(u8, &r4l_preemption_witness_abort, .acquire) == 0)
+            {
+                scheduler.yield();
+            }
+        },
+        .reschedule_ipi => {
+            if (r4l_preemption_event.waitResult(scheduler.WAIT_FOREVER) != .signaled) {
+                _ = @atomicRmw(u32, &r4l_preemption_witness_failures, .Add, 1, .acq_rel);
+            }
+        },
+    }
+
+    if (@atomicLoad(u8, &r4l_preemption_witness_abort, .acquire) == 0 and
+        @atomicLoad(u64, flag, .acquire) == 1)
+    {
+        @atomicStore(u64, flag, 2, .release);
+    } else if (@atomicLoad(u8, &r4l_preemption_witness_abort, .acquire) == 0) {
+        _ = @atomicRmw(u32, &r4l_preemption_witness_failures, .Add, 1, .acq_rel);
+    }
+    @atomicStore(u8, &r4l_preemption_witness_done, 1, .release);
+    scheduler.exitCurrentAndRetire();
+}
+
+fn runR4lPreemptionScenario(
+    file: ProgramFile,
+    working_drive: *drive.Drive,
+    target_cpu: u32,
+    mode: R4LPreemptionMode,
+) R4LPreemptionScenario {
+    const flag = r4l_preemption_flag orelse return .{};
+    const before = scheduler.cpuPreemptionStats(target_cpu);
+    const start = monotonic.capture();
+    const start_tick = timer.tickCount();
+
+    r4l_preemption_mode = mode;
+    r4l_preemption_event = sync.Event.init(false);
+    @atomicStore(u8, &r4l_preemption_witness_started, 0, .release);
+    @atomicStore(u8, &r4l_preemption_witness_done, 0, .release);
+    @atomicStore(u8, &r4l_preemption_witness_abort, 0, .release);
+    @atomicStore(u32, &r4l_preemption_witness_failures, 0, .release);
+    @atomicStore(u32, &r4l_preemption_witness_cpu, std.math.maxInt(u32), .release);
+    @atomicStore(u64, flag, 3, .release);
+
+    const witness = task.createParallelWorkerBlockedWithRole(
+        "r4l-preempt-witness",
+        r4lPreemptionWitnessMain,
+        .input,
+    ) orelse return .{};
+    if (!task.bindBlockedHomeCpu(witness, target_cpu)) {
+        _ = releaseCreatedProgramTask(witness);
+        return .{};
+    }
+    // The IPI witness must first block on its event so the later signal owns
+    // the remote wake. The timer witness deliberately remains blocked until
+    // the R4L loop is active; publishing it without a reschedule request then
+    // forces the AP's periodic quantum path to perform the switch.
+    if (mode == .reschedule_ipi) {
+        task.markReady(witness, timer.tickCount());
+        while (@atomicLoad(u8, &r4l_preemption_witness_started, .acquire) == 0) {
+            if (r4lPreemptionDeadlineExpired(start, start_tick)) {
+                abortR4lPreemptionWitness();
+                _ = waitForR4lPreemptionWitness(start, start_tick);
+                return .{};
+            }
+            scheduler.yield();
+        }
+    }
+
+    var handle: ProgramProcessHandle = .{};
+    const launch = runProgramFile(file, .background, .auto, "", working_drive, .none, .{
+        .owner = true,
+        .owner_handle = ProgramProcessHandle{},
+        .out_handle = &handle,
+        .forced_cpu = @intCast(target_cpu),
+    });
+    if (launch != .ran) {
+        if (mode == .timer) {
+            _ = releaseCreatedProgramTask(witness);
+        } else {
+            abortR4lPreemptionWitness();
+            _ = waitForR4lPreemptionWitness(start, start_tick);
+        }
+        return .{};
+    }
+
+    var expired = false;
+    if (mode == .timer) {
+        while (@atomicLoad(u64, flag, .acquire) != 1 and !programCompletionIsReady(handle)) {
+            if (r4lPreemptionDeadlineExpired(start, start_tick)) {
+                expired = true;
+                break;
+            }
+            scheduler.yield();
+        }
+        if (@atomicLoad(u64, flag, .acquire) != 1) {
+            expired = true;
+            abortR4lPreemptionWitness();
+        }
+        task.markReady(witness, timer.tickCount());
+    } else {
+        while (@atomicLoad(u64, flag, .acquire) != 1 and !programCompletionIsReady(handle)) {
+            if (r4lPreemptionDeadlineExpired(start, start_tick)) {
+                expired = true;
+                break;
+            }
+            scheduler.yield();
+        }
+        if (!expired and @atomicLoad(u64, flag, .acquire) == 1) {
+            r4l_preemption_event.signal();
+        }
+    }
+
+    while (!expired and !programCompletionIsReady(handle)) {
+        if (r4lPreemptionDeadlineExpired(start, start_tick)) {
+            expired = true;
+            break;
+        }
+        scheduler.yield();
+    }
+    if (expired) abortR4lPreemptionWitness();
+
+    // The fixture loop is intrinsically bounded. Once abort publishes flag=2
+    // it also has a direct escape, so cleanup remains short even on a failed
+    // preemption assertion.
+    const cleanup_start = monotonic.capture();
+    const cleanup_tick = timer.tickCount();
+    while (!programCompletionIsReady(handle) and !r4lPreemptionDeadlineExpired(cleanup_start, cleanup_tick)) scheduler.yield();
+
+    var completion: ProgramProcessCompletion = .{};
+    const completion_ok = consumeProgramCompletion(handle, &completion) == PROGRAM_HANDLE_OK;
+    if (@atomicLoad(u8, &r4l_preemption_witness_done, .acquire) == 0) abortR4lPreemptionWitness();
+    const witness_ok = waitForR4lPreemptionWitness(cleanup_start, cleanup_tick);
+    const after = scheduler.cpuPreemptionStats(target_cpu);
+    const timer_switches = after.timer_switches -% before.timer_switches;
+    const ipi_switches = after.reschedule_ipi_switches -% before.reschedule_ipi_switches;
+    const switch_ok = switch (mode) {
+        .timer => timer_switches != 0,
+        .reschedule_ipi => ipi_switches != 0,
+    };
+    const exit_code = if (completion_ok) completion.exit_code else -1;
+    return .{
+        .ok = !expired and completion_ok and exit_code == 0 and witness_ok and
+            @atomicLoad(u32, &r4l_preemption_witness_failures, .acquire) == 0 and
+            @atomicLoad(u32, &r4l_preemption_witness_cpu, .acquire) == target_cpu and
+            @atomicLoad(u64, flag, .acquire) == 2 and switch_ok,
+        .exit_code = exit_code,
+        .timer_switches = timer_switches,
+        .reschedule_ipi_switches = ipi_switches,
+    };
+}
+
+// Short Test-profile acceptance: two bounded LSTRX invocations exercise an
+// imported R4L code range on one AP. No subsystem, browser or manual visual
+// workload is involved.
+pub fn runR4lPreemptionAcceptance(target_cpu: u32, usable_bytes: u64) bool {
+    initializeRuntime(usable_bytes);
+    var timer_result = R4LPreemptionScenario{};
+    var ipi_result = R4LPreemptionScenario{};
+    var generation: u32 = 0;
+
+    if (target_cpu != 0 and target_cpu < percpu.max_cpus and percpu.isSchedulable(target_cpu)) probe: {
+        const boot_drive = drive.get('C') orelse break :probe;
+        const working_drive = drive.current() orelse boot_drive;
+        const file = resolveProgramFile(boot_drive, R4L_PREEMPTION_PATH) orelse break :probe;
+        const flag_info = modules.resolveExportInfo(R4L_PREEMPTION_MODULE, R4L_PREEMPTION_FLAG_EXPORT, 1) orelse break :probe;
+        if (flag_info.kind != .r4l or flag_info.available_size < @sizeOf(u64) or
+            (flag_info.address & (@alignOf(u64) - 1)) != 0)
+            break :probe;
+        generation = flag_info.generation;
+        r4l_preemption_flag = @ptrFromInt(flag_info.address);
+        timer_result = runR4lPreemptionScenario(file, working_drive, target_cpu, .timer);
+        ipi_result = runR4lPreemptionScenario(file, working_drive, target_cpu, .reschedule_ipi);
+        if (r4l_preemption_flag) |flag| @atomicStore(u64, flag, 0, .release);
+        r4l_preemption_flag = null;
+    }
+
+    const ok = timer_result.ok and ipi_result.ok;
+    k.puts("[R4LPREEMPT] result=");
+    k.puts(if (ok) "OK" else "FAILED");
+    k.puts(" cpu=");
+    k.putDec(target_cpu);
+    k.puts(" timer_switches=");
+    k.putDec(timer_result.timer_switches);
+    k.puts(" ipi_switches=");
+    k.putDec(ipi_result.reschedule_ipi_switches);
+    k.puts(" timer_exit=");
+    k.putDec(@bitCast(@as(i64, timer_result.exit_code)));
+    k.puts(" ipi_exit=");
+    k.putDec(@bitCast(@as(i64, ipi_result.exit_code)));
+    k.puts(" generation=");
+    k.putDec(generation);
+    k.puts("\r\n");
+    return ok;
 }
 
 fn programTaskMain() callconv(.c) void {
@@ -13382,7 +13693,7 @@ fn copyGuiFrameLocalResourceBytes(frame: *const ProgramGuiFramePayload, start: u
         const source_start: usize = @intCast(if (start + copied > payload.logical_offset) start + copied - payload.logical_offset else 0);
         const bytes = guiResourcePayloadDataConst(payload);
         const chunk = @min(wanted - copied, bytes.len - source_start);
-        @memcpy(out[copied .. copied + chunk], bytes[source_start .. source_start + chunk]);
+        copyGuiBytesCooperatively(out[copied .. copied + chunk], bytes[source_start .. source_start + chunk]);
         copied += chunk;
         if (copied == wanted) break;
     }
@@ -13496,6 +13807,10 @@ fn copyGuiLocalRasterWords(frame: *const ProgramGuiFramePayload, start: u64, out
                     (@as(u32, encoded[2]) << 16) |
                     (@as(u32, encoded[3]) << 24);
             }
+            // One legacy raster command is at most one 128x128 tile.  The
+            // committed frame is reader-pinned here, so this is a safe owner-
+            // free boundary between tiles, never inside a visible generation.
+            _ = scheduler.safeReschedulePoint();
             if (copied == wanted) return copied;
         }
     }
@@ -13696,6 +14011,7 @@ fn copyGuiFrameLocalCommands(frame: *const ProgramGuiFramePayload, resource_base
             out[copied] = externalGuiFrameCommandWithBase(command, resource_base);
             copied += 1;
         }
+        _ = scheduler.safeReschedulePoint();
     }
     return copied;
 }
@@ -15122,6 +15438,7 @@ fn copyR4XStartImportsInto(instance: *ProgramInstance, seeds: []const R4XStartIm
     const runtime = runtimePayload(instance);
     const count = if (seeds.len > MAX_R4M_IMPORTS) MAX_R4M_IMPORTS else seeds.len;
     runtime.r4xstart_import_count = @intCast(count);
+    runtime.r4l_code_binding_count = 0;
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const seed = seeds[i];
@@ -15138,6 +15455,24 @@ fn copyR4XStartImportsInto(instance: *ProgramInstance, seeds: []const R4XStartIm
             .symbol_name = @intFromPtr(&runtime.r4xstart_import_symbol_names[i]),
             .table = @intCast(seed.table),
         };
+        if (seed.r4l_binding_valid and seed.r4l_generation != 0) {
+            var duplicate = false;
+            var binding_index: usize = 0;
+            while (binding_index < runtime.r4l_code_binding_count) : (binding_index += 1) {
+                const binding = runtime.r4l_code_bindings[binding_index];
+                if (binding.module_slot == seed.r4l_module_slot and binding.generation == seed.r4l_generation) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate and runtime.r4l_code_binding_count < runtime.r4l_code_bindings.len) {
+                runtime.r4l_code_bindings[runtime.r4l_code_binding_count] = .{
+                    .module_slot = seed.r4l_module_slot,
+                    .generation = seed.r4l_generation,
+                };
+                runtime.r4l_code_binding_count += 1;
+            }
+        }
     }
 }
 
@@ -16026,7 +16361,13 @@ fn resolveR4SysStreamOwner() ?r4api.r4sys.StreamOwner {
 
 pub fn isPreemptibleInstructionPointer(rip: u64) bool {
     const instance = currentExecutionInstanceNoRegistry() orelse return false;
-    return instructionPointerInInstance(instance, rip);
+    if (instructionPointerInInstance(instance, rip)) return true;
+    const runtime = instance.runtime_payload orelse return false;
+    const binding_count: usize = @min(@as(usize, runtime.r4l_code_binding_count), runtime.r4l_code_bindings.len);
+    for (runtime.r4l_code_bindings[0..binding_count]) |binding| {
+        if (modules.isExecutableAddress(binding.module_slot, binding.generation, rip)) return true;
+    }
+    return false;
 }
 
 pub fn crashContextForInstructionPointer(rip: u64) crash.ExecutionContext {

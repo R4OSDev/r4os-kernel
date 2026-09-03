@@ -27,6 +27,7 @@ const platform_cpu = @import("../platform/cpu.zig");
 const monotonic = @import("../platform/monotonic.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const task = @import("../sched/task.zig");
+const r4x = @import("../program/r4x.zig");
 const timer = @import("timer.zig");
 const virt = @import("../memory/virt.zig");
 const policy = @import("smp_policy.zig");
@@ -328,7 +329,7 @@ fn firstRemoteCpu(mask: u64) ?u32 {
 // fixed integer work once on the BSP and once as one permanently placed
 // internal worker per online CPU.  This is an acceptance probe, not the
 // release benchmark and not a public affinity interface.
-pub fn runAcceptanceProbeIfEnabled() bool {
+pub fn runAcceptanceProbeIfEnabled(usable_bytes: u64) bool {
     const value = boot_config.optionValue(boot_config.get(), "SMP", "selftest") orelse return true;
     if (!std.ascii.eqlIgnoreCase(value, "yes")) return true;
 
@@ -520,12 +521,16 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     const serial_ok = serial_stats.bulk_calls != 0 and serial_stats.max_span > 1 and
         serial_stats.lock_acquisitions == serial_stats.write_calls and
         serial_stats.uart_status_reads < serial_stats.ring_bytes and serial_stats.dropped_bytes == 0;
+    const r4l_preemption_ok = if (firstRemoteCpu(online_mask)) |target_cpu|
+        r4x.runR4lPreemptionAcceptance(target_cpu, usable_bytes)
+    else
+        false;
     const tlb_ok = tlb_runtime_ok and tlb_cleanup_ok and tlb_worker_failures == 0 and
         (tlb_ready_mask & online_mask) == online_mask and (tlb_updated_mask & online_mask) == online_mask and
         tlb_stats.timeouts == tlb_stats.expected_timeouts and tlb_stats.successes != 0;
     const ok = failures == 0 and clock_ok and placement_mask == online_mask and observed_mask == online_mask and
         actual_checksum == expected_checksum and speedup_milli >= ACCEPTANCE_MIN_SPEEDUP_MILLI and heap_probe.ok and
-        tlb_ok and lock_ok and serial_ok;
+        tlb_ok and lock_ok and serial_ok and r4l_preemption_ok;
 
     probePuts("[SMPPROBE] result=");
     probePuts(if (ok) "OK" else "FAILED");

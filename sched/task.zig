@@ -1417,6 +1417,11 @@ pub fn createParallelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
     return createTask(name, .blocked, false, entry, .interactive, true, false, &failure);
 }
 
+pub fn createParallelWorkerBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
+    var failure: CreateFailure = .none;
+    return createTask(name, .blocked, false, entry, role, true, false, &failure);
+}
+
 pub fn createCpuIdleTask(cpu_index: u32) ?*Task {
     if (cpu_index == 0 or cpu_index >= percpu.max_cpus) return null;
     var failure: CreateFailure = .none;
@@ -1953,6 +1958,21 @@ pub fn bindExecutionOwner(t: *Task, kind: ExecutionOwnerKind, context: *anyopaqu
     if (!containsTaskLocked(t) or t.state != .blocked or t.execution_owner_context != null) return false;
     t.execution_owner_kind = kind;
     t.execution_owner_context = context;
+    return true;
+}
+
+// Internal construction-time placement seam. It deliberately accepts only
+// an unpublished, SMP-eligible blocked task and an already schedulable CPU;
+// normal tasks continue to use the balanced first-placement policy.
+pub fn bindBlockedHomeCpu(t: *Task, cpu_index: u32) bool {
+    if (cpu_index >= percpu.max_cpus or !percpu.isSchedulable(cpu_index)) return false;
+    const irq_flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(irq_flags);
+    if (!containsTaskLocked(t) or t.state != .blocked or !t.smp_eligible or
+        t.ready_linked or t.timeout_linked or t.running_cpu != 0xFF)
+        return false;
+    t.home_cpu = @intCast(cpu_index);
+    t.home_cpu_bound = true;
     return true;
 }
 
