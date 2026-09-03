@@ -297,7 +297,7 @@ fn reallocInPlace(mem: []u8, new_size: usize, align_value: usize) InPlaceResult 
 }
 
 pub fn stats() Stats {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.memory);
     defer interrupts.restore(irq_flags);
     var s: Stats = .{
         .pages = control.committed_pages,
@@ -342,7 +342,7 @@ pub fn metadataRange() MetadataRange {
 // Allocation, error-injection, alignment, and churn probes belong to the
 // explicit -Dboot-selftests diagnostic kernel.
 pub fn bootInvariant() bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.memory);
     defer interrupts.restore(irq_flags);
     if (!control.initialized or control.range_id == 0) return false;
     if (control.committed_pages < MIN_COMMITTED_PAGES or control.committed_pages > control.cap_pages) return false;
@@ -1087,7 +1087,7 @@ const HeapGuard = struct {
 };
 
 fn enterHeap() ?HeapGuard {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.memory);
     const unwind = task_context.enterUnwind();
     if (!unwind.admitted()) {
         control.reentry_errors += 1;

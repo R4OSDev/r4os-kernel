@@ -366,20 +366,20 @@ fn recordStackRelease(role: Role, high_water_bytes: u64, cycles: u64) void {
 }
 
 pub fn createFailureStats() CreateFailureStats {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     return create_failure_stats;
 }
 
 pub fn killHeldLockDeferrals() u64 {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     return kill_held_lock_deferrals;
 }
 
 pub fn noteCreateFailure(failure: CreateFailure) void {
     if (failure == .none) return;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     create_failure_stats.last = failure;
     switch (failure) {
@@ -403,7 +403,7 @@ fn recordCreateFailure(failure_out: *CreateFailure, failure: CreateFailure) void
 // rejected. Production paths never arm it.
 pub fn armNextCreateFailureForTest(failure: CreateFailure) bool {
     if (failure == .none) return false;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (forced_next_create_failure != .none) return false;
     forced_next_create_failure = failure;
@@ -411,7 +411,7 @@ pub fn armNextCreateFailureForTest(failure: CreateFailure) bool {
 }
 
 fn takeForcedCreateFailure() CreateFailure {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     const failure = forced_next_create_failure;
     forced_next_create_failure = .none;
@@ -589,7 +589,7 @@ fn createTask(
     };
     configureRoleFields(new_task, role);
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     const id = allocateTaskIdLocked() orelse {
         recordCreateFailure(failure_out, .memory);
         interrupts.restore(irq_flags);
@@ -641,7 +641,7 @@ fn releaseUnpublishedResources(t: *Task) bool {
 }
 
 fn enqueueRollbackRetry(t: *Task) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     t.release_in_progress = false;
     if (!t.rollback_pending) {
         t.rollback_pending = true;
@@ -658,7 +658,7 @@ fn retryOneUnpublishedRollback() bool {
     if (!unwind.admitted()) return false;
     defer _ = task_context.leaveUnwind(unwind);
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     var candidate: ?*Task = null;
     var cursor = rollback_retry_head;
     while (cursor) |pending| : (cursor = pending.rollback_next) {
@@ -672,13 +672,13 @@ fn retryOneUnpublishedRollback() bool {
 
     const t = candidate orelse return false;
     if (!releaseUnpublishedResources(t)) {
-        const retry_flags = interrupts.saveAndDisable();
+        const retry_flags = interrupts.saveAndDisableFor(.task);
         t.release_in_progress = false;
         interrupts.restore(retry_flags);
         return false;
     }
 
-    const unlink_flags = interrupts.saveAndDisable();
+    const unlink_flags = interrupts.saveAndDisableFor(.task);
     if (!unlinkRollbackRetryLocked(t)) {
         t.release_in_progress = false;
         interrupts.restore(unlink_flags);
@@ -713,7 +713,7 @@ fn unlinkRollbackRetryLocked(t: *Task) bool {
 }
 
 pub fn unpublishedRollbackPending() u32 {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     return @intCast(@min(rollback_retry_count, @as(usize, 0xFFFF_FFFF)));
 }
@@ -1027,7 +1027,7 @@ fn bumpInventoryMutationEpochLocked() void {
 }
 
 fn bumpInventoryMutationEpoch() void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     bumpInventoryMutationEpochLocked();
     interrupts.restore(irq_flags);
 }
@@ -1118,7 +1118,7 @@ pub fn stackCacheStats() struct { cached: u64, hits: u64, misses: u64, reclaims:
 }
 
 fn allocGuardedStack(retry_owner: *Task) ?GuardedStack {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     var reusable_index: ?usize = null;
     var scan = stack_cache_count;
     while (scan > 0) {
@@ -1239,7 +1239,7 @@ pub fn reclaimStackCache(requested_stacks_raw: u32) u32 {
     const requested_stacks: usize = if (requested_stacks_raw == 0) stack_cache.len else @intCast(requested_stacks_raw);
     var reclaimed: u32 = 0;
     while (@as(usize, reclaimed) < requested_stacks) {
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.task);
         if (stack_cache_count == 0) {
             interrupts.restore(irq_flags);
             break;
@@ -1262,7 +1262,7 @@ pub fn reclaimStackCache(requested_stacks_raw: u32) u32 {
         interrupts.restore(irq_flags);
 
         if (!releaseGuardedStackDirect(stack)) {
-            const retry_flags = interrupts.saveAndDisable();
+            const retry_flags = interrupts.saveAndDisableFor(.task);
             const retry_index = findCachedStackLocked(stack.range_id);
             if (retry_index) |found| {
                 stack_cache[found].release_pending = true;
@@ -1273,7 +1273,7 @@ pub fn reclaimStackCache(requested_stacks_raw: u32) u32 {
             k.puts("Task stack cache release pending retry\r\n");
             break;
         }
-        const commit_flags = interrupts.saveAndDisable();
+        const commit_flags = interrupts.saveAndDisableFor(.task);
         const commit_index = findCachedStackLocked(stack.range_id) orelse {
             interrupts.restore(commit_flags);
             k.puts("Task stack cache release anchor missing\r\n");
@@ -1306,7 +1306,7 @@ pub const GuardHit = struct {
 };
 
 pub fn stackGuardHit(addr: u64) ?GuardHit {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     var cursor = registry_head;
     while (cursor) |t| : (cursor = t.registry_next) {
@@ -1421,7 +1421,7 @@ pub fn createCpuIdleTask(cpu_index: u32) ?*Task {
     if (cpu_index == 0 or cpu_index >= percpu.max_cpus) return null;
     var failure: CreateFailure = .none;
     const idle = createTask("cpu-idle", .blocked, false, null, .batch, false, false, &failure) orelse return null;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     idle.home_cpu = @intCast(cpu_index);
     idle.cpu_idle = true;
     interrupts.restore(irq_flags);
@@ -1454,7 +1454,7 @@ fn createCriticalTask(name: []const u8, state: State, entry: Entry, role: Role, 
     }
     const create_started_cycles = readTimestampCounter();
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     var selected_index: ?usize = null;
     for (&critical_reserve, 0..) |*bundle, index| {
         if (!bundle.in_use) {
@@ -1530,13 +1530,13 @@ fn resetCriticalTaskLocked(bundle: *CriticalBundle, index: usize) void {
 }
 
 pub fn count() usize {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     return task_count;
 }
 
 pub fn summary() Summary {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     var out = Summary{ .total = @intCast(@min(task_count, @as(usize, 0xFFFF_FFFF))) };
     var cursor = registry_head;
@@ -1554,13 +1554,13 @@ pub fn summary() Summary {
 }
 
 pub fn inventoryEpoch() u64 {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     return inventory_mutation_epoch;
 }
 
 pub fn inventoryPeak() u32 {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     return @intCast(@min(task_peak, @as(usize, 0xFFFF_FFFF)));
 }
@@ -1624,7 +1624,7 @@ fn sortInventorySnapshotsByGeneration(items: []InventorySnapshot) void {
 /// inventory impossible under normal load.
 pub fn inventoryPage(after_generation: u64, out: []InventorySnapshot) InventoryPage {
     if (out.len == 0) return .{};
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     const epoch = inventory_mutation_epoch;
     var total: u32 = 0;
     var eligible: u32 = 0;
@@ -1656,7 +1656,7 @@ pub fn inventoryPage(after_generation: u64, out: []InventorySnapshot) InventoryP
 }
 
 pub fn pinByOrdinal(index: usize) ?*Task {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     var ordinal: usize = 0;
     var cursor = registry_head;
@@ -1759,7 +1759,7 @@ pub const QueueSnapshot = struct {
 // scheduler list is an exact projection of the stable ownership registry;
 // production dispatch itself never calls this registry traversal.
 pub fn queueSnapshot() QueueSnapshot {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
 
     var out: QueueSnapshot = .{};
@@ -1867,7 +1867,7 @@ pub fn queueSnapshot() QueueSnapshot {
 }
 
 pub fn assignRole(t: *Task, role: Role) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (!containsTaskLocked(t) or t.state == .unused or t.state == .dead) return false;
     if (t.role == role) return true;
@@ -1887,7 +1887,7 @@ pub const RoleStats = struct {
 };
 
 pub fn roleStats() RoleStats {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     return .{
         .activations = role_activation_counts,
@@ -1904,7 +1904,7 @@ const DONATION_DISPATCH_BUDGET: u16 = 4;
 
 pub fn addDispatchDonationByIdentity(id: u32, generation: u64, rank: u8) bool {
     if (rank >= role_count) return false;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     donation_request_count +%= 1;
     const target = findByIdentityLocked(id, generation) orelse return false;
@@ -1926,7 +1926,7 @@ pub fn addDispatchDonationByIdentity(id: u32, generation: u64, rank: u8) bool {
 
 pub fn removeDispatchDonation(t: *Task, rank: u8) bool {
     if (rank >= role_count) return false;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (!containsTaskLocked(t) or t.state == .unused) return false;
     const index: usize = rank;
@@ -1948,7 +1948,7 @@ pub fn removeDispatchDonation(t: *Task, rank: u8) bool {
 // ProgramThread or AsyncIoRequest storage.
 pub fn bindExecutionOwner(t: *Task, kind: ExecutionOwnerKind, context: *anyopaque) bool {
     if (kind == .none) return false;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (!containsTaskLocked(t) or t.state != .blocked or t.execution_owner_context != null) return false;
     t.execution_owner_kind = kind;
@@ -1957,7 +1957,7 @@ pub fn bindExecutionOwner(t: *Task, kind: ExecutionOwnerKind, context: *anyopaqu
 }
 
 pub fn clearExecutionOwner(t: *Task, context: *const anyopaque) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (!containsTaskLocked(t) or t.state != .blocked or t.execution_owner_context != @constCast(context)) return false;
     t.execution_owner_kind = .none;
@@ -1973,7 +1973,7 @@ pub fn executionOwner(t: *const Task) ExecutionOwner {
 }
 
 pub fn ordinalOf(wanted: *const Task) ?usize {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     var ordinal: usize = 0;
     var cursor = registry_head;
@@ -2006,7 +2006,7 @@ pub fn restoreFpuState(t: *Task) void {
 }
 
 pub fn validFpuStateCount() u32 {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     var count_valid: u32 = 0;
     var cursor = registry_head;
@@ -2019,7 +2019,7 @@ pub fn validFpuStateCount() u32 {
 }
 
 pub fn markReady(t: *Task, now: u64) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (t.state == .unused or t.state == .dead) return;
     const was_durably_blocked = t.state == .blocked;
@@ -2034,7 +2034,7 @@ pub fn markReady(t: *Task, now: u64) void {
 }
 
 pub fn markRunning(t: *Task) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (t.state == .unused or t.state == .dead) return;
     const was_durably_blocked = t.state == .blocked;
@@ -2050,7 +2050,7 @@ pub fn markRunning(t: *Task) void {
 }
 
 pub fn parkCpuIdle(t: *Task) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (!t.cpu_idle or t.state == .dead or t.state == .unused) return;
     unlinkReadyLocked(t);
@@ -2061,7 +2061,7 @@ pub fn parkCpuIdle(t: *Task) void {
 }
 
 pub fn noteSwitchedOut(t: *Task) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (t.state == .running) return;
     t.running_cpu = 0xFF;
@@ -2166,7 +2166,7 @@ fn containsTaskLocked(wanted: *const Task) bool {
 }
 
 pub fn pin(t: *Task) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (!containsTaskLocked(t) or t.state == .unused or t.release_in_progress) return false;
     if (t.pin_count == 0xFFFF_FFFF) {
@@ -2178,7 +2178,7 @@ pub fn pin(t: *Task) bool {
 }
 
 pub fn pinByIdentity(id: u32, generation: u64) ?*Task {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     const target = findByIdentityLocked(id, generation) orelse return null;
     if (target.state == .unused or target.release_in_progress or target.pin_count == 0xFFFF_FFFF) return null;
@@ -2187,7 +2187,7 @@ pub fn pinByIdentity(id: u32, generation: u64) ?*Task {
 }
 
 pub fn pinById(id: u32) ?*Task {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     const target = findByIdLocked(id) orelse return null;
     if (target.state == .unused or target.release_in_progress or target.pin_count == 0xFFFF_FFFF) return null;
@@ -2196,7 +2196,7 @@ pub fn pinById(id: u32) ?*Task {
 }
 
 pub fn unpin(t: *Task) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     if (!containsTaskLocked(t) or t.pin_count == 0) {
         interrupts.restore(irq_flags);
         return false;
@@ -2230,7 +2230,7 @@ fn transitionToDeadLocked(t: *Task, result: WaitResult, retire: bool) void {
 }
 
 pub fn finishCurrentForExit(t: *Task, retire: bool) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     if (!containsTaskLocked(t) or t.state == .unused or t.state == .dead) return false;
     if (t.held_lock_count != 0 or t.unwind_guard_count != 0) return false;
@@ -2239,7 +2239,7 @@ pub fn finishCurrentForExit(t: *Task, retire: bool) bool {
 }
 
 pub fn kill(id: u32) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     const target = findByIdLocked(id) orelse return false;
     if (target.state == .unused or target.state == .dead) return false;
@@ -2262,7 +2262,7 @@ pub fn kill(id: u32) bool {
 }
 
 pub fn killIdentity(id: u32, generation: u64) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     const target = findByIdentityLocked(id, generation) orelse return false;
     if (target.state == .unused or target.state == .dead) return false;
@@ -2282,14 +2282,14 @@ pub fn detachWait(t: *Task) bool {
 }
 
 pub fn isAlive(id: u32) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     const target = findByIdLocked(id) orelse return false;
     return target.state != .unused and target.state != .dead;
 }
 
 pub fn isAliveIdentity(id: u32, generation: u64) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     const target = findByIdentityLocked(id, generation) orelse return false;
     return target.state != .unused and target.state != .dead;
@@ -2300,14 +2300,14 @@ pub fn isAliveIdentity(id: u32, generation: u64) bool {
 /// exact generation. External owner registries use this boundary before
 /// freeing raw execution-owner context.
 pub fn existsIdentity(id: u32, generation: u64) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     const target = findByIdentityLocked(id, generation) orelse return false;
     return target.state != .unused;
 }
 
 pub fn releaseDead(id: u32) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     const target = findByIdLocked(id) orelse {
         interrupts.restore(irq_flags);
         return false;
@@ -2343,7 +2343,7 @@ pub fn releaseDead(id: u32) bool {
 }
 
 pub fn releaseDeadIdentity(id: u32, generation: u64) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     const target = findByIdentityLocked(id, generation) orelse {
         interrupts.restore(irq_flags);
         return false;
@@ -2381,7 +2381,7 @@ pub fn releaseDeadIdentity(id: u32, generation: u64) bool {
 // resource release remains anchored by retire_pending/release_in_progress.
 pub fn retireIdentity(id: u32, generation: u64) RetireResult {
     if (id == 0 or generation == 0) return .gone;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     const target = findByIdentityLocked(id, generation) orelse {
         interrupts.restore(irq_flags);
         return .gone;
@@ -2454,11 +2454,11 @@ fn claimTaskReleaseLocked(t: *Task) ?task_context.UnwindToken {
 pub fn reapDeferred() u32 {
     var reaped: u32 = 0;
     reap_pass_count +%= 1;
-    const snapshot_flags = interrupts.saveAndDisable();
+    const snapshot_flags = interrupts.saveAndDisableFor(.task);
     var remaining = reap_count;
     interrupts.restore(snapshot_flags);
     while (remaining != 0) : (remaining -= 1) {
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.task);
         var victim: ?*Task = null;
         var release_token: ?task_context.UnwindToken = null;
         if (reap_head) |candidate| {
@@ -2501,7 +2501,7 @@ fn completeTaskRelease(t: *Task, release_token: task_context.UnwindToken) bool {
     const released_role = t.role;
     const released_high_water = t.stack_high_water_bytes;
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     if (!containsTaskLocked(t) or !t.release_in_progress or !releaseEligibleLocked(t)) {
         if (containsTaskLocked(t)) {
             t.release_in_progress = false;
@@ -2547,7 +2547,7 @@ fn completeTaskRelease(t: *Task, release_token: task_context.UnwindToken) bool {
         return true;
     }
 
-    const retry_flags = interrupts.saveAndDisable();
+    const retry_flags = interrupts.saveAndDisableFor(.task);
     t.release_in_progress = false;
     t.retire_pending = true;
     linkRegistryLocked(t);
@@ -2557,7 +2557,7 @@ fn completeTaskRelease(t: *Task, release_token: task_context.UnwindToken) bool {
 }
 
 fn clearTaskReleaseClaim(t: *Task) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     if (containsTaskLocked(t)) {
         t.release_in_progress = false;
         t.retire_pending = true;
@@ -2609,7 +2609,7 @@ fn releaseTaskStack(t: *Task) bool {
         .base = t.stack_base,
         .top = t.stack_top,
     };
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     if (stack_cache_count < stack_cache.len) {
         stack_cache[stack_cache_count] = stack;
         stack_cache_count += 1;
@@ -2634,7 +2634,7 @@ pub fn minWakeTick() u64 {
 }
 
 pub fn beginWait(t: *Task, wake_tick: u64, reason: []const u8, object: u64) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     unlinkReadyLocked(t);
     unlinkTimeoutLocked(t);
@@ -2650,7 +2650,7 @@ pub fn beginWait(t: *Task, wake_tick: u64, reason: []const u8, object: u64) void
 }
 
 pub fn finishWait(t: *Task, result: WaitResult) u64 {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
     _ = wait_node.detach(&t.wait_node);
     const now = timer.tickCount();
@@ -2711,7 +2711,7 @@ pub const DeadmanSnapshot = struct {
 /// hard-kill deferrals and deliberately span normal storage and network waits;
 /// they remain informational in the snapshot but never trigger the deadman.
 pub fn captureDeadmanSnapshot(now: u64, threshold: u64) DeadmanSnapshot {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.task);
     defer interrupts.restore(irq_flags);
 
     var out = DeadmanSnapshot{ .captured_tick = now };

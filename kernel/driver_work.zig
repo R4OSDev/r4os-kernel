@@ -1427,7 +1427,7 @@ fn isFinal(state: work_queue.State) bool {
 
 fn enterCritical() CriticalGuard {
     const from_irq = irq_router.inDispatch();
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.driver);
     return .{
         .irq_flags = irq_flags,
         .started_at = monotonic.capture(),

@@ -464,7 +464,7 @@ pub fn timeSetState(request: *const time_core.State) callconv(.c) i32 {
 }
 
 pub fn bootLogInfo(out: *BootLogInfo) callconv(.c) i32 {
-    const flags = interrupts.saveAndDisable();
+    const flags = interrupts.saveAndDisableFor(.program);
     defer interrupts.restore(flags);
     out.* = .{
         .capacity = @intCast(bootlog.capacity()),
@@ -478,7 +478,7 @@ pub fn bootLogInfo(out: *BootLogInfo) callconv(.c) i32 {
 }
 
 pub fn bootLogRead(offset: u32, out: [*]u8, capacity_value: u32) callconv(.c) i32 {
-    const flags = interrupts.saveAndDisable();
+    const flags = interrupts.saveAndDisableFor(.program);
     defer interrupts.restore(flags);
     if (capacity_value == 0) return 0;
     const len = bootlog.length();
@@ -3423,7 +3423,7 @@ fn reapDeadStreamSlots() void {
 }
 
 fn reserveStreamSlot(drive_letter: u8, owner: ?StreamOwner) ?*StreamSlot {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.program);
     defer interrupts.restore(irq_flags);
     var i: usize = 0;
     while (i < stream_slots.len) : (i += 1) {
@@ -3443,7 +3443,7 @@ fn reserveStreamSlot(drive_letter: u8, owner: ?StreamOwner) ?*StreamSlot {
 }
 
 fn releaseStreamSlotOwnership(slot: *StreamSlot) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.program);
     defer interrupts.restore(irq_flags);
     var i: usize = 0;
     while (i < stream_slots.len) : (i += 1) {
@@ -3560,7 +3560,7 @@ fn streamSlotMatchesCleanup(slot: *const StreamSlot, cleanup: StreamCleanupOwner
 }
 
 fn streamCleanupPlan(cleanup: StreamCleanupOwner) StreamCleanupPlan {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.program);
     defer interrupts.restore(irq_flags);
     var plan: StreamCleanupPlan = .{};
     var i: usize = 0;
@@ -3578,7 +3578,7 @@ fn streamCleanupPlan(cleanup: StreamCleanupOwner) StreamCleanupPlan {
 
 fn streamOwnershipStillMatches(index: usize, lane: u8, cleanup: StreamCleanupOwner) bool {
     if (index >= stream_slot_ownership.len) return false;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.program);
     defer interrupts.restore(irq_flags);
     const owner = &stream_slot_ownership[index];
     return streamOwnershipMatches(owner, cleanup) and

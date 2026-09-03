@@ -139,7 +139,7 @@ pub fn sendMessage(payload: []const u8) bool {
 }
 
 pub fn snapshot(out: *Snapshot) void {
-    const flags = interrupts.saveAndDisable();
+    const flags = interrupts.saveAndDisableFor(.network);
     defer interrupts.restore(flags);
     out.* = .{
         .present = state.present,
@@ -177,7 +177,7 @@ pub fn snapshot(out: *Snapshot) void {
 }
 
 pub fn takeMessage(out: *Message) bool {
-    const flags = interrupts.saveAndDisable();
+    const flags = interrupts.saveAndDisableFor(.network);
     defer interrupts.restore(flags);
     return state.message_queue.pop(out);
 }
@@ -288,7 +288,7 @@ fn applyR4slFrame(op: r4p_contract.R4slOp) void {
     state.last_payload_len = @intCast(payload_len);
     if (payload_len != 0) @memcpy(state.last_payload[0..payload_len], op.payload[0..payload_len]);
     if (op.frame_type == TYPE_MESSAGE) {
-        const flags = interrupts.saveAndDisable();
+        const flags = interrupts.saveAndDisableFor(.network);
         state.message_rx +%= 1;
         state.last_message_len = @intCast(payload_len);
         if (payload_len != 0) @memcpy(state.last_message[0..payload_len], op.payload[0..payload_len]);

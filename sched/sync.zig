@@ -350,7 +350,7 @@ pub const WaitQueue = struct {
 
     fn enterCritical(self: *WaitQueue) u64 {
         _ = self;
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.synchronization);
         scheduler.preemptDisable();
         return irq_flags;
     }
@@ -597,7 +597,7 @@ pub const Semaphore = struct {
 
     fn claimHandoffGuard(unwind: *task_context.UnwindToken) bool {
         const current_task = scheduler.current() orelse return false;
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.synchronization);
         scheduler.preemptDisable();
         defer {
             scheduler.preemptEnable();
@@ -664,7 +664,7 @@ pub const Mutex = struct {
         const current_task = scheduler.current() orelse return false;
         const current_id = current_task.id;
         const current_generation = current_task.generation;
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.synchronization);
         scheduler.preemptDisable();
         defer {
             scheduler.preemptEnable();
@@ -728,7 +728,7 @@ pub const Mutex = struct {
         const current_generation = current_task.generation;
         var wake_waiter = false;
 
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.synchronization);
         scheduler.preemptDisable();
         defer {
             // A selected waiter does not own the mutex yet. If it is hard-
@@ -792,7 +792,7 @@ pub const Mutex = struct {
     fn donateCurrentWaiter(self: *Mutex) void {
         const waiter = scheduler.current() orelse return;
         const desired_rank = task.dispatchRank(waiter);
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.synchronization);
         scheduler.preemptDisable();
         defer {
             scheduler.preemptEnable();
@@ -845,7 +845,7 @@ pub const UnwindGuard = struct {
 
     pub fn tryEnter(self: *UnwindGuard) bool {
         const current_task = scheduler.current() orelse return self.tryEnterBoot();
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.synchronization);
         scheduler.preemptDisable();
         defer {
             scheduler.preemptEnable();
@@ -890,7 +890,7 @@ pub const UnwindGuard = struct {
     pub fn leave(self: *UnwindGuard) bool {
         const current_task = scheduler.current() orelse return self.leaveBoot();
         var wake_waiter = false;
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.synchronization);
         scheduler.preemptDisable();
         defer {
             // As with Mutex, a signalled task has not acquired the guard yet.
@@ -1021,7 +1021,7 @@ fn heldDepthFor(owner_task: *const task.Task) u32 {
 }
 
 fn countHeldSlots() u32 {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.synchronization);
     scheduler.preemptDisable();
     defer {
         scheduler.preemptEnable();
@@ -1099,10 +1099,10 @@ fn stIfEventPartnerMain() callconv(.c) void {
 }
 
 fn stSleepPreservesInterruptState(enabled: bool) bool {
-    const original_flags = interrupts.saveAndDisable();
+    const original_flags = interrupts.saveAndDisableFor(.synchronization);
     if (enabled) interrupts.enable();
     scheduler.sleepTicksWithReason(1, if (enabled) "sync-st-if-sleep-on" else "sync-st-if-sleep-off");
-    const after_flags = interrupts.saveAndDisable();
+    const after_flags = interrupts.saveAndDisableFor(.synchronization);
     interrupts.restore(original_flags);
     return interrupts.wereEnabled(after_flags) == enabled;
 }
@@ -1112,10 +1112,10 @@ fn stEventPreservesInterruptState(enabled: bool) bool {
     st_if_partner_done = false;
     if (task.createKernelThread("sync-st-if-evt", stIfEventPartnerMain) == null) return false;
 
-    const original_flags = interrupts.saveAndDisable();
+    const original_flags = interrupts.saveAndDisableFor(.synchronization);
     if (enabled) interrupts.enable();
     const result = st_if_event.waitResult(200);
-    const after_flags = interrupts.saveAndDisable();
+    const after_flags = interrupts.saveAndDisableFor(.synchronization);
     interrupts.restore(original_flags);
     return result == .signaled and
         @as(*volatile bool, &st_if_partner_done).* and

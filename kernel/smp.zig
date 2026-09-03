@@ -17,14 +17,17 @@ const interrupts = @import("../arch/x86_64/interrupts.zig");
 const lapic = @import("../arch/x86_64/lapic.zig");
 const msr = @import("../arch/x86_64/msr.zig");
 const heap = @import("../memory/heap.zig");
+const owner_locks = @import("../memory/owner_locks.zig");
 const paging = @import("../memory/paging.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const phys = @import("../memory/phys.zig");
+const tlb = @import("../arch/x86_64/tlb_shootdown.zig");
 const platform_cpu = @import("../platform/cpu.zig");
 const monotonic = @import("../platform/monotonic.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const task = @import("../sched/task.zig");
 const timer = @import("timer.zig");
+const virt = @import("../memory/virt.zig");
 const policy = @import("smp_policy.zig");
 const k = @import("log.zig");
 
@@ -40,6 +43,8 @@ const AP_STOP_TIMEOUT_NS: u64 = 100_000_000;
 const ACCEPTANCE_TIMEOUT_NS: u64 = 10_000_000_000;
 const ACCEPTANCE_ITERATIONS: u64 = 4_000_000;
 const ACCEPTANCE_MIN_SPEEDUP_MILLI: u64 = 1050;
+const TLB_PROBE_OLD: u64 = 0x544C_422D_4F4C_4421;
+const TLB_PROBE_NEW: u64 = 0x544C_422D_4E45_5721;
 const TRANSITION_CODE_SELECTOR: u16 = 0x08;
 const TRANSITION_PROTECTED_SELECTOR: u16 = 0x18;
 
@@ -105,6 +110,12 @@ var acceptance_clock_ends: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
 var acceptance_tick_starts: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
 var acceptance_tick_ends: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
 var acceptance_clock_regressions: u32 = 0;
+var acceptance_tlb_address: u64 = 0;
+var acceptance_tlb_phase: u8 = 0;
+var acceptance_tlb_ready_mask: u64 = 0;
+var acceptance_tlb_updated_mask: u64 = 0;
+var acceptance_tlb_failures: u32 = 0;
+var acceptance_retire_release: u8 = 0;
 
 pub fn initBsp() void {
     percpu.initBsp(platform_cpu.bootApicId());
@@ -195,6 +206,7 @@ pub fn startApplicationProcessors(info: acpi.Info) bool {
 
 pub fn activate() void {
     if (!current.initialized or current.activated) return;
+    tlb.registerSender(sendTlbIpi);
     @atomicStore(bool, &release_aps, true, .release);
     var index: u32 = 1;
     while (index < topology.count) : (index += 1) {
@@ -211,6 +223,103 @@ pub fn activate() void {
     logSummary("active");
 }
 
+const TlbAcceptanceProbe = struct {
+    range_id: u32,
+    address: u64,
+    old_frame: u64,
+    new_frame: u64,
+    mapped_frame: u64,
+};
+
+fn prepareTlbAcceptanceProbe() ?TlbAcceptanceProbe {
+    const range_id = virt.reserve(.{
+        .window = .temp_kernel,
+        .len = PAGE_SIZE,
+        .kind = .virtual_range,
+        .owner = .kernel,
+        .owner_id = 0,
+        .name = "tlb-acceptance",
+        .flags = paging.WRITABLE | paging.NO_EXECUTE,
+    }) catch return null;
+    const range = virt.rangeInfo(range_id) orelse {
+        virt.release(range_id) catch {};
+        return null;
+    };
+    const old_frame = claimTlbProbeFrame("tlb-probe-old") orelse {
+        virt.release(range_id) catch {};
+        return null;
+    };
+    const new_frame = claimTlbProbeFrame("tlb-probe-new") orelse {
+        _ = releaseTlbProbeFrame(old_frame);
+        virt.release(range_id) catch {};
+        return null;
+    };
+    const old_word: *volatile u64 = @ptrFromInt(phys.physToVirt(old_frame));
+    const new_word: *volatile u64 = @ptrFromInt(phys.physToVirt(new_frame));
+    old_word.* = TLB_PROBE_OLD;
+    new_word.* = TLB_PROBE_NEW;
+    if (!paging.mapPage(range.base, old_frame, paging.WRITABLE | paging.NO_EXECUTE)) {
+        _ = releaseTlbProbeFrame(old_frame);
+        _ = releaseTlbProbeFrame(new_frame);
+        virt.release(range_id) catch {};
+        return null;
+    }
+    return .{
+        .range_id = range_id,
+        .address = range.base,
+        .old_frame = old_frame,
+        .new_frame = new_frame,
+        .mapped_frame = old_frame,
+    };
+}
+
+fn claimTlbProbeFrame(name: []const u8) ?u64 {
+    const frame = phys.allocFrame() orelse return null;
+    _ = blocks.claimPhysicalRange(frame, PAGE_SIZE, .kernel, .kernel, 0, name) catch {
+        phys.freeFrame(frame);
+        return null;
+    };
+    return frame;
+}
+
+fn releaseTlbProbeFrame(frame: u64) bool {
+    var plan: blocks.PhysicalReleasePlan = undefined;
+    blocks.preparePhysicalRangeRelease(frame, PAGE_SIZE, &plan) catch return false;
+    defer blocks.cancelPhysicalRangeRelease(&plan);
+    phys.freeFrame(frame);
+    blocks.commitPhysicalRangeRelease(&plan);
+    return true;
+}
+
+fn cleanupTlbAcceptanceProbe(probe: *TlbAcceptanceProbe) bool {
+    var ok = true;
+    if (probe.mapped_frame != 0) {
+        if (paging.mappedFrame(probe.address) == probe.mapped_frame and paging.unmapPage(probe.address)) {
+            probe.mapped_frame = 0;
+        } else {
+            ok = false;
+        }
+    }
+    if (probe.mapped_frame != probe.old_frame) ok = releaseTlbProbeFrame(probe.old_frame) and ok;
+    if (probe.mapped_frame != probe.new_frame) ok = releaseTlbProbeFrame(probe.new_frame) and ok;
+    if (probe.mapped_frame == 0) {
+        virt.release(probe.range_id) catch {
+            ok = false;
+        };
+    }
+    return ok;
+}
+
+fn firstRemoteCpu(mask: u64) ?u32 {
+    const current_cpu = percpu.currentIndex();
+    var index: u32 = 0;
+    while (index < percpu.max_cpus) : (index += 1) {
+        if (index == current_cpu) continue;
+        if ((mask & (@as(u64, 1) << @intCast(index))) != 0) return index;
+    }
+    return null;
+}
+
 // Test-profile-only proof for the new execution boundary.  It runs identical
 // fixed integer work once on the BSP and once as one permanently placed
 // internal worker per online CPU.  This is an acceptance probe, not the
@@ -225,6 +334,12 @@ pub fn runAcceptanceProbeIfEnabled() bool {
         probePuts("[SMPPROBE] result=SKIPPED cpus=1 reason=single-cpu\r\n");
         return true;
     }
+
+    var tlb_probe = prepareTlbAcceptanceProbe() orelse return acceptanceFail("tlb-setup");
+    var tlb_cleanup_pending = true;
+    defer if (tlb_cleanup_pending) {
+        _ = cleanupTlbAcceptanceProbe(&tlb_probe);
+    };
 
     var expected_checksum: u64 = 0;
     const sequential_start = monotonic.capture();
@@ -248,6 +363,13 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     @atomicStore(u32, &acceptance_failures, 0, .release);
     @atomicStore(u32, &acceptance_clock_regressions, 0, .release);
     @atomicStore(u64, &acceptance_cpu_mask, 0, .release);
+    @atomicStore(u64, &acceptance_tlb_address, tlb_probe.address, .release);
+    @atomicStore(u8, &acceptance_tlb_phase, 1, .release);
+    @atomicStore(u64, &acceptance_tlb_ready_mask, 0, .release);
+    @atomicStore(u64, &acceptance_tlb_updated_mask, 0, .release);
+    @atomicStore(u32, &acceptance_tlb_failures, 0, .release);
+    @atomicStore(u8, &acceptance_retire_release, 0, .release);
+    defer @atomicStore(u8, &acceptance_retire_release, 1, .release);
 
     var workers: [percpu.max_cpus]?*task.Task = .{null} ** percpu.max_cpus;
     var worker_count: u32 = 0;
@@ -271,13 +393,68 @@ pub fn runAcceptanceProbeIfEnabled() bool {
         placement_mask |= bit;
     }
 
-    const parallel_start = monotonic.capture();
-    const deadline_before = timer.deadlineStats();
+    const tlb_probe_start = monotonic.capture();
     @atomicStore(u8, &acceptance_release, 1, .release);
     cpu_index = 1;
     while (cpu_index < percpu.max_cpus) : (cpu_index += 1) {
         if ((online_mask & (@as(u64, 1) << @intCast(cpu_index))) != 0) sendReschedule(cpu_index);
     }
+
+    var tlb_runtime_ok = true;
+    while ((@atomicLoad(u64, &acceptance_tlb_ready_mask, .acquire) & online_mask) != online_mask) {
+        scheduler.yield();
+        const elapsed = monotonic.elapsedNanoseconds(tlb_probe_start, monotonic.capture()) orelse 0;
+        if (elapsed >= ACCEPTANCE_TIMEOUT_NS) {
+            tlb_runtime_ok = false;
+            break;
+        }
+    }
+
+    if (paging.unmapPage(tlb_probe.address)) {
+        tlb_probe.mapped_frame = 0;
+        if (paging.mapPage(tlb_probe.address, tlb_probe.new_frame, paging.WRITABLE | paging.NO_EXECUTE)) {
+            tlb_probe.mapped_frame = tlb_probe.new_frame;
+        } else {
+            tlb_runtime_ok = false;
+            if (paging.mapPage(tlb_probe.address, tlb_probe.old_frame, paging.WRITABLE | paging.NO_EXECUTE)) {
+                tlb_probe.mapped_frame = tlb_probe.old_frame;
+            }
+        }
+    } else {
+        tlb_runtime_ok = false;
+    }
+    @atomicStore(u8, &acceptance_tlb_phase, 2, .release);
+
+    while ((@atomicLoad(u64, &acceptance_tlb_updated_mask, .acquire) & online_mask) != online_mask) {
+        scheduler.yield();
+        const elapsed = monotonic.elapsedNanoseconds(tlb_probe_start, monotonic.capture()) orelse 0;
+        if (elapsed >= ACCEPTANCE_TIMEOUT_NS) {
+            tlb_runtime_ok = false;
+            break;
+        }
+    }
+
+    const timeout_before = tlb.stats();
+    var timeout_rejected = false;
+    var frame_retained = false;
+    if (tlb_probe.mapped_frame == tlb_probe.new_frame) {
+        if (firstRemoteCpu(online_mask)) |target_cpu| {
+            if (tlb.armDiagnosticMissingAck(target_cpu)) {
+                timeout_rejected = !paging.unmapPage(tlb_probe.address);
+                tlb.disarmDiagnosticMissingAck();
+                frame_retained = paging.mappedFrame(tlb_probe.address) == tlb_probe.new_frame and
+                    blocks.claimedPhysicalPrefix(tlb_probe.new_frame, PAGE_SIZE) == PAGE_SIZE;
+            }
+        }
+    }
+    const timeout_after = tlb.stats();
+    tlb_runtime_ok = tlb_runtime_ok and timeout_rejected and frame_retained and
+        timeout_after.timeouts == timeout_before.timeouts + 1 and
+        timeout_after.expected_timeouts == timeout_before.expected_timeouts + 1;
+
+    const deadline_before = timer.deadlineStats();
+    const parallel_start = monotonic.capture();
+    @atomicStore(u8, &acceptance_tlb_phase, 3, .release);
 
     while (@atomicLoad(u32, &acceptance_done, .acquire) < online_count) {
         scheduler.yield();
@@ -320,8 +497,22 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     else
         @intCast((@as(u128, sequential_ns) * 1000) / parallel_ns);
     const heap_probe = heap.acceptanceProbe();
+    const tlb_worker_failures = @atomicLoad(u32, &acceptance_tlb_failures, .acquire);
+    const tlb_ready_mask = @atomicLoad(u64, &acceptance_tlb_ready_mask, .acquire);
+    const tlb_updated_mask = @atomicLoad(u64, &acceptance_tlb_updated_mask, .acquire);
+    const tlb_cleanup_ok = cleanupTlbAcceptanceProbe(&tlb_probe);
+    tlb_cleanup_pending = false;
+    @atomicStore(u8, &acceptance_retire_release, 1, .release);
+    const tlb_stats = tlb.stats();
+    const legacy_stats = interrupts.legacyStats();
+    const owner_stats = owner_locks.combinedStats();
+    const lock_ok = legacy_stats.unclassified_acquisitions == 0 and owner_stats.order_violations == 0;
+    const tlb_ok = tlb_runtime_ok and tlb_cleanup_ok and tlb_worker_failures == 0 and
+        (tlb_ready_mask & online_mask) == online_mask and (tlb_updated_mask & online_mask) == online_mask and
+        tlb_stats.timeouts == tlb_stats.expected_timeouts and tlb_stats.successes != 0;
     const ok = failures == 0 and clock_ok and placement_mask == online_mask and observed_mask == online_mask and
-        actual_checksum == expected_checksum and speedup_milli >= ACCEPTANCE_MIN_SPEEDUP_MILLI and heap_probe.ok;
+        actual_checksum == expected_checksum and speedup_milli >= ACCEPTANCE_MIN_SPEEDUP_MILLI and heap_probe.ok and
+        tlb_ok and lock_ok;
 
     probePuts("[SMPPROBE] result=");
     probePuts(if (ok) "OK" else "FAILED");
@@ -366,6 +557,60 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     probePutDec(heap_probe.unmap_batches);
     probePuts(" pressure=");
     probePuts(if (heap_probe.under_pressure) "yes" else "no");
+    probePuts("\r\n");
+    probePuts("[TLBPROBE] result=");
+    probePuts(if (tlb_ok) "OK" else "FAILED");
+    probePuts(" cpus=");
+    probePutDec(online_count);
+    probePuts(" ready_mask=0x");
+    probePutHex(tlb_ready_mask, 8);
+    probePuts(" updated_mask=0x");
+    probePutHex(tlb_updated_mask, 8);
+    probePuts(" stale_failures=");
+    probePutDec(tlb_worker_failures);
+    probePuts(" timeout_rejected=");
+    probePutDec(@intFromBool(timeout_rejected));
+    probePuts(" frame_retained=");
+    probePutDec(@intFromBool(frame_retained));
+    probePuts(" requests=");
+    probePutDec(tlb_stats.requests);
+    probePuts(" ipis=");
+    probePutDec(tlb_stats.ipis_sent);
+    probePuts(" acks=");
+    probePutDec(tlb_stats.acknowledgements);
+    probePuts(" timeouts=");
+    probePutDec(tlb_stats.timeouts);
+    probePuts(" expected_timeouts=");
+    probePutDec(tlb_stats.expected_timeouts);
+    probePuts(" generation=");
+    probePutDec(tlb_stats.generation);
+    probePuts(" cleanup=");
+    probePuts(if (tlb_cleanup_ok) "yes" else "no");
+    probePuts("\r\n");
+    probePuts("[LOCKPROBE] result=");
+    probePuts(if (lock_ok) "OK" else "FAILED");
+    probePuts(" legacy_acquisitions=");
+    probePutDec(legacy_stats.acquisitions);
+    probePuts(" nested=");
+    probePutDec(legacy_stats.nested_acquisitions);
+    probePuts(" collisions=");
+    probePutDec(legacy_stats.collisions);
+    probePuts(" cpu_collisions=");
+    probePutDec(legacy_stats.cpu_collisions);
+    probePuts(" wait_spins=");
+    probePutDec(legacy_stats.wait_spins);
+    probePuts(" max_wait=");
+    probePutDec(legacy_stats.max_wait_spins);
+    probePuts(" max_hold_cycles=");
+    probePutDec(legacy_stats.max_hold_cycles);
+    probePuts(" unclassified=");
+    probePutDec(legacy_stats.unclassified_acquisitions);
+    probePuts(" classified_classes=11 owner_classes=3 owner_acquisitions=");
+    probePutDec(owner_stats.acquisitions);
+    probePuts(" owner_collisions=");
+    probePutDec(owner_stats.collisions);
+    probePuts(" order_violations=");
+    probePutDec(owner_stats.order_violations);
     probePuts("\r\n");
     probePuts("[CLOCKPROBE] result=");
     probePuts(if (clock_ok) "OK" else "FAILED");
@@ -420,6 +665,12 @@ pub fn sendReschedule(cpu_index: u32) void {
     if (cpu_index == percpu.currentIndex() or !percpu.isSchedulable(cpu_index)) return;
     const apic_id = percpu.apicId(cpu_index) orelse return;
     _ = lapic.sendReschedule(apic_id, idt.RESCHEDULE_VECTOR);
+}
+
+fn sendTlbIpi(cpu_index: u32, vector: u8) bool {
+    if (cpu_index == percpu.currentIndex() or percpu.state(cpu_index) != .online) return false;
+    const apic_id = percpu.apicId(cpu_index) orelse return false;
+    return lapic.sendIpi(apic_id, vector);
 }
 
 pub fn irqTarget(ordinal: u32) u32 {
@@ -596,6 +847,18 @@ fn acceptanceWorkerMain() callconv(.c) void {
         if ((previous & bit) != 0) {
             _ = @atomicRmw(u32, &acceptance_failures, .Add, 1, .acq_rel);
         } else {
+            const probe_address = @atomicLoad(u64, &acceptance_tlb_address, .acquire);
+            const probe_word: *const volatile u64 = @ptrFromInt(probe_address);
+            if (@atomicLoad(u8, &acceptance_tlb_phase, .acquire) != 1 or probe_word.* != TLB_PROBE_OLD) {
+                _ = @atomicRmw(u32, &acceptance_tlb_failures, .Add, 1, .acq_rel);
+            }
+            _ = @atomicRmw(u64, &acceptance_tlb_ready_mask, .Or, bit, .acq_rel);
+            while (@atomicLoad(u8, &acceptance_tlb_phase, .acquire) < 2) scheduler.yield();
+            if (probe_word.* != TLB_PROBE_NEW) {
+                _ = @atomicRmw(u32, &acceptance_tlb_failures, .Add, 1, .acq_rel);
+            }
+            _ = @atomicRmw(u64, &acceptance_tlb_updated_mask, .Or, bit, .acq_rel);
+            while (@atomicLoad(u8, &acceptance_tlb_phase, .acquire) < 3) scheduler.yield();
             const start_ns = monotonic.nowNanoseconds() orelse 0;
             const start_tick = timer.tickCount();
             var prior_ns = start_ns;
@@ -623,6 +886,7 @@ fn acceptanceWorkerMain() callconv(.c) void {
         }
     }
     _ = @atomicRmw(u32, &acceptance_done, .Add, 1, .release);
+    while (@atomicLoad(u8, &acceptance_retire_release, .acquire) == 0) scheduler.yield();
 }
 
 fn acceptanceWork(cpu_index: u32) u64 {

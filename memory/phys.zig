@@ -2,6 +2,7 @@ const std = @import("std");
 const boot_info = @import("../bootloader/boot_info.zig");
 const blocks = @import("blocks.zig");
 const mem_map = @import("map.zig");
+const owner_locks = @import("owner_locks.zig");
 const k = @import("../kernel/log.zig");
 
 pub const FRAME_SIZE: u64 = 4096;
@@ -60,6 +61,8 @@ var hhdm_offset: u64 = 0;
 var initialized = false;
 
 pub fn init() bool {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     const entries = boot_info.memoryMap();
     if (entries.len == 0) return false;
     hhdm_offset = boot_info.hhdmOffset() orelse return false;
@@ -120,6 +123,8 @@ fn wordCount() u64 {
 }
 
 pub fn allocFrame() ?u64 {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return null;
     const words = bitmapWords() orelse return allocFrameLinear();
 
@@ -161,6 +166,8 @@ pub fn allocFrame() ?u64 {
 /// following free bitmap bits. This captures natural locality without the
 /// unbounded search performed by allocContiguousFrames().
 pub fn allocFrameExtent(max_count: u64) ?FrameExtent {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (max_count == 0) return null;
     const base = allocFrame() orelse return null;
     const start = base / FRAME_SIZE;
@@ -197,10 +204,14 @@ fn allocFrameLinear() ?u64 {
 }
 
 pub fn allocContiguousFrames(count: u64) ?u64 {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     return allocContiguousFramesBelow(count, std.math.maxInt(u64));
 }
 
 pub fn allocContiguousFramesBelow(count: u64, max_phys_addr: u64) ?u64 {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized or count == 0) return null;
     const addressable_frames = if (max_phys_addr == std.math.maxInt(u64))
         total_frames
@@ -232,6 +243,8 @@ pub fn allocContiguousFramesBelow(count: u64, max_phys_addr: u64) ?u64 {
 }
 
 pub fn freeContiguousFrames(addr: u64, count: u64) void {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized or addr % FRAME_SIZE != 0 or count == 0) return;
     const start = addr / FRAME_SIZE;
     if (start + count > total_frames) return;
@@ -246,6 +259,8 @@ pub fn freeContiguousFrames(addr: u64, count: u64) void {
 }
 
 pub fn freeFrameExtent(extent: FrameExtent) void {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (extent.count == 0) return;
     freeContiguousFrames(extent.base, extent.count);
     extent_frees +%= 1;
@@ -253,6 +268,8 @@ pub fn freeFrameExtent(extent: FrameExtent) void {
 }
 
 pub fn freeFrame(addr: u64) void {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return;
     if (addr % FRAME_SIZE != 0) {
         bad_free_errors +%= 1;
@@ -276,6 +293,8 @@ pub fn freeFrame(addr: u64) void {
 }
 
 pub fn stats() Stats {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     return .{
         .total_frames = total_frames,
         .free_frames = free_frames,

@@ -413,7 +413,7 @@ fn runDeadlineProbe() bool {
     const before = timer.deadlineStats();
     if (!before.enabled or !before.capable or timer.activeBackend() == .pit) return false;
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.@"test");
     scheduler.preemptDisable();
 
     var ok = timer.enterIdleDeadline(timer.MAX_FINITE_DEADLINE);
@@ -478,7 +478,7 @@ fn runDeadlineStormProbe() bool {
     // the periodic source cannot drain a partial enrollment. Deadline 1 is
     // older than every runtime wait at this boot phase and makes FIFO order
     // directly observable at the projection head.
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.@"test");
     for (probes) |created| {
         task.beginWait(created.?, 1, "taskreg-deadline-storm", scheduler.timer_wait_object);
     }

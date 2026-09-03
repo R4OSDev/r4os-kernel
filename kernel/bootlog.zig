@@ -9,19 +9,19 @@ var wrapped: bool = false;
 var total_written: u64 = 0;
 
 pub fn puts(text: []const u8) void {
-    const irq_state = interrupts.saveAndDisable();
+    const irq_state = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_state);
     append(text);
 }
 
 pub fn putc(ch: u8) void {
-    const irq_state = interrupts.saveAndDisable();
+    const irq_state = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_state);
     appendByte(ch);
 }
 
 pub fn putDec(value: u64) void {
-    const irq_state = interrupts.saveAndDisable();
+    const irq_state = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_state);
     var tmp: [20]u8 = undefined;
     var n = value;
@@ -41,7 +41,7 @@ pub fn putDec(value: u64) void {
 }
 
 pub fn putHex(value: u64, width: usize) void {
-    const irq_state = interrupts.saveAndDisable();
+    const irq_state = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_state);
     const digits = "0123456789ABCDEF";
     var i = width;
@@ -54,7 +54,7 @@ pub fn putHex(value: u64, width: usize) void {
 }
 
 pub fn snapshot(out: []u8) usize {
-    const irq_state = interrupts.saveAndDisable();
+    const irq_state = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_state);
     if (!wrapped) {
         const len = if (cursor < out.len) cursor else out.len;
@@ -81,31 +81,31 @@ pub fn capacity() usize {
 }
 
 pub fn length() usize {
-    const irq_state = interrupts.saveAndDisable();
+    const irq_state = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_state);
     return if (wrapped) BUFFER_SIZE else cursor;
 }
 
 pub fn flags() u32 {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_flags);
     return if (wrapped) FLAG_WRAPPED else 0;
 }
 
 pub fn totalWritten() u64 {
-    const irq_state = interrupts.saveAndDisable();
+    const irq_state = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_state);
     return total_written;
 }
 
 pub fn droppedBytes() u64 {
-    const irq_state = interrupts.saveAndDisable();
+    const irq_state = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_state);
     return if (total_written > BUFFER_SIZE) total_written - BUFFER_SIZE else 0;
 }
 
 pub fn read(offset: usize, out: []u8) usize {
-    const irq_state = interrupts.saveAndDisable();
+    const irq_state = interrupts.saveAndDisableFor(.logging);
     defer interrupts.restore(irq_state);
     const len = if (wrapped) BUFFER_SIZE else cursor;
     if (offset >= len or out.len == 0) return 0;

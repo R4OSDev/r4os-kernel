@@ -234,6 +234,11 @@ pub fn sendStop(apic_id: u32, vector: u8) bool {
     return writeIcr(apic_id, vector) and waitIcrIdle();
 }
 
+pub fn sendIpi(apic_id: u32, vector: u8) bool {
+    if (!isEnabled() or vector < 0x20) return false;
+    return writeIcr(apic_id, vector) and waitIcrIdle();
+}
+
 pub fn initTimerFromHpet(requested_hz: u32) bool {
     if (!isEnabled()) {
         current.timer_reason = "LAPIC not enabled";

@@ -1,7 +1,9 @@
 const blocks = @import("blocks.zig");
 const layout = @import("layout.zig");
+const owner_locks = @import("owner_locks.zig");
 const page_batch = @import("page_batch.zig");
 const phys = @import("phys.zig");
+const tlb = @import("../arch/x86_64/tlb_shootdown.zig");
 const k = @import("../kernel/log.zig");
 
 const ENTRIES: usize = 512;
@@ -54,6 +56,9 @@ pub const Stats = struct {
     unmap_batches: u64 = 0,
     unmap_batch_pages: u64 = 0,
     unmap_batch_max_pages: u64 = 0,
+    shootdown_failures: u64 = 0,
+    rollback_restores: u64 = 0,
+    rollback_restore_failures: u64 = 0,
     root_mismatches: u64 = 0,
 };
 
@@ -63,6 +68,8 @@ var root_owner: RootOwner = .unknown;
 var stats_value: Stats = .{};
 
 pub fn init() bool {
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
     stats_value.init_runs += 1;
     pml4_phys = r4os_read_cr3() & ADDR_MASK;
     initialized = pml4_phys != 0;
@@ -71,10 +78,26 @@ pub fn init() bool {
 }
 
 pub fn rootPhys() u64 {
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
     return pml4_phys;
 }
 
+pub fn acquireMutation() owner_locks.Token {
+    return owner_locks.page_tables.acquire();
+}
+
+pub fn releaseMutation(token: owner_locks.Token) void {
+    owner_locks.page_tables.release(token);
+}
+
+pub fn shootdownStats() tlb.Stats {
+    return tlb.stats();
+}
+
 pub fn adoptRootPhys(root_phys: u64, owner: RootOwner) bool {
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
     if (root_phys == 0 or !isAligned(root_phys)) return false;
     pml4_phys = root_phys & ADDR_MASK;
     root_owner = owner;
@@ -84,7 +107,14 @@ pub fn adoptRootPhys(root_phys: u64, owner: RootOwner) bool {
 }
 
 pub fn mapPage(virt: u64, frame_phys: u64, flags: u64) bool {
-    if (!readyForPageTableMutation() or !isAligned(virt) or !isAligned(frame_phys)) return failMap();
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    return mapPageLocked(virt, frame_phys, flags);
+}
+
+pub fn mapPageLocked(virt: u64, frame_phys: u64, flags: u64) bool {
+    if (!owner_locks.page_tables.heldByCurrent() or
+        !readyForPageTableMutationLocked() or !isAligned(virt) or !isAligned(frame_phys)) return failMap();
     const pt = getOrCreateTable(virt) orelse return false;
     const pti = index(virt, 12);
     if ((pt[pti] & PRESENT) != 0) return failMap();
@@ -95,33 +125,54 @@ pub fn mapPage(virt: u64, frame_phys: u64, flags: u64) bool {
 }
 
 pub fn unmapPage(virt: u64) bool {
-    if (!readyForPageTableMutation() or !isAligned(virt)) return failUnmap();
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    return unmapPageLocked(virt);
+}
+
+pub fn unmapPageLocked(virt: u64) bool {
+    if (!owner_locks.page_tables.heldByCurrent() or
+        !readyForPageTableMutationLocked() or !isAligned(virt)) return failUnmap();
     const pt = getTable(virt) orelse return failUnmap();
     const pti = index(virt, 12);
     if ((pt[pti] & PRESENT) == 0) return failUnmap();
+    const previous = pt[pti];
     pt[pti] = 0;
+    const shootdown = tlb.invalidateRange(virt, 1);
+    if (!shootdown.ok) {
+        stats_value.shootdown_failures +%= 1;
+        pt[pti] = previous;
+        stats_value.rollback_restores +%= 1;
+        if (!tlb.invalidateRange(virt, 1).ok) stats_value.rollback_restore_failures +%= 1;
+        return failUnmap();
+    }
     stats_value.unmap_pages += 1;
-    flushPage(virt);
     return true;
 }
 
 /// Maps a small, naturally contiguous physical extent into an equally
-/// contiguous virtual range. Page-table allocation can still fail; all PTEs
-/// installed by this call are removed before failure is returned.
+/// contiguous virtual range. Every required table and empty leaf is checked
+/// before the first PTE is published.
 pub fn mapContiguousPages(virt_base: u64, phys_base: u64, page_count: u64, flags: u64) bool {
-    if (!validBatchRange(virt_base, phys_base, page_count)) return failMap();
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    if (!readyForPageTableMutationLocked() or !validBatchRange(virt_base, phys_base, page_count)) return failMap();
+
+    // Allocate and validate every required table before publishing any leaf.
+    // The second phase is then infallible and needs no unsafe partial rollback.
+    var checked: u64 = 0;
+    while (checked < page_count) : (checked += 1) {
+        const virt = virt_base + checked * PAGE_SIZE;
+        const pt = getOrCreateTable(virt) orelse return failMap();
+        if ((pt[index(virt, 12)] & PRESENT) != 0) return failMap();
+    }
     var mapped: u64 = 0;
     while (mapped < page_count) : (mapped += 1) {
-        const offset = mapped * PAGE_SIZE;
-        if (!mapPage(virt_base + offset, phys_base + offset, flags)) {
-            var rollback = mapped;
-            while (rollback != 0) {
-                rollback -= 1;
-                _ = unmapPage(virt_base + rollback * PAGE_SIZE);
-            }
-            stats_value.map_batch_rollbacks +%= 1;
-            return false;
-        }
+        const virt = virt_base + mapped * PAGE_SIZE;
+        const pt = getTable(virt) orelse unreachable;
+        pt[index(virt, 12)] = ((phys_base + mapped * PAGE_SIZE) & ADDR_MASK) | flags | PRESENT;
+        stats_value.map_pages +%= 1;
+        flushPage(virt);
     }
     stats_value.map_batches +%= 1;
     stats_value.map_batch_pages +%= page_count;
@@ -133,12 +184,21 @@ pub fn mapContiguousPages(virt_base: u64, phys_base: u64, page_count: u64, flags
 /// The mutation phase is therefore infallible and cannot expose a partially
 /// unmapped range to its caller.
 pub fn unmapContiguousPages(virt_base: u64, phys_base: u64, page_count: u64) bool {
-    if (!readyForPageTableMutation() or !validBatchRange(virt_base, phys_base, page_count)) return failUnmap();
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    return unmapContiguousPagesLocked(virt_base, phys_base, page_count);
+}
+
+pub fn unmapContiguousPagesLocked(virt_base: u64, phys_base: u64, page_count: u64) bool {
+    if (!owner_locks.page_tables.heldByCurrent() or
+        !readyForPageTableMutationLocked() or !validBatchRange(virt_base, phys_base, page_count)) return failUnmap();
+    var previous_entries: [64]u64 = undefined;
     var checked: u64 = 0;
     while (checked < page_count) : (checked += 1) {
         const offset = checked * PAGE_SIZE;
         const leaf = getLeaf(virt_base + offset) orelse return failUnmap();
         if (leaf.huge or (leaf.entry.* & ADDR_MASK) != phys_base + offset) return failUnmap();
+        previous_entries[@intCast(checked)] = leaf.entry.*;
     }
 
     var unmapped: u64 = 0;
@@ -146,9 +206,20 @@ pub fn unmapContiguousPages(virt_base: u64, phys_base: u64, page_count: u64) boo
         const virt = virt_base + unmapped * PAGE_SIZE;
         const leaf = getLeaf(virt) orelse unreachable;
         leaf.entry.* = 0;
-        stats_value.unmap_pages +%= 1;
-        flushPage(virt);
     }
+    const shootdown = tlb.invalidateRange(virt_base, page_count);
+    if (!shootdown.ok) {
+        stats_value.shootdown_failures +%= 1;
+        var restore: u64 = 0;
+        while (restore < page_count) : (restore += 1) {
+            const pt = getTable(virt_base + restore * PAGE_SIZE) orelse unreachable;
+            pt[index(virt_base + restore * PAGE_SIZE, 12)] = previous_entries[@intCast(restore)];
+        }
+        stats_value.rollback_restores +%= page_count;
+        if (!tlb.invalidateRange(virt_base, page_count).ok) stats_value.rollback_restore_failures +%= 1;
+        return failUnmap();
+    }
+    stats_value.unmap_pages +%= page_count;
     stats_value.unmap_batches +%= 1;
     stats_value.unmap_batch_pages +%= page_count;
     if (page_count > stats_value.unmap_batch_max_pages) stats_value.unmap_batch_max_pages = page_count;
@@ -156,26 +227,39 @@ pub fn unmapContiguousPages(virt_base: u64, phys_base: u64, page_count: u64) boo
 }
 
 pub fn isMapped(virt: u64) bool {
-    if (!activeRootMatchesHardware()) return false;
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    if (!activeRootMatchesHardwareLocked()) return false;
     return getLeaf(virt) != null;
 }
 
 pub fn mappedFrame(virt: u64) ?u64 {
-    if (!activeRootMatchesHardware() or !isAligned(virt)) return null;
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    return mappedFrameLocked(virt);
+}
+
+pub fn mappedFrameLocked(virt: u64) ?u64 {
+    if (!owner_locks.page_tables.heldByCurrent() or
+        !activeRootMatchesHardwareLocked() or !isAligned(virt)) return null;
     const leaf = getLeaf(virt) orelse return null;
     if (leaf.huge) return null;
     return leaf.entry.* & ADDR_MASK;
 }
 
 pub fn pageDirty(virt: u64) bool {
-    if (!activeRootMatchesHardware() or !isAligned(virt)) return false;
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    if (!activeRootMatchesHardwareLocked() or !isAligned(virt)) return false;
     const leaf = getLeaf(virt) orelse return false;
     if (leaf.huge) return false;
     return (leaf.entry.* & DIRTY) != 0;
 }
 
 pub fn markDirty(virt: u64) bool {
-    if (!readyForPageTableMutation() or !isAligned(virt)) return false;
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    if (!readyForPageTableMutationLocked() or !isAligned(virt)) return false;
     const leaf = getLeaf(virt) orelse return false;
     if (leaf.huge) return false;
     leaf.entry.* |= DIRTY | ACCESSED;
@@ -184,37 +268,70 @@ pub fn markDirty(virt: u64) bool {
 }
 
 pub fn clearDirty(virt: u64) bool {
-    if (!readyForPageTableMutation() or !isAligned(virt)) return false;
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    if (!readyForPageTableMutationLocked() or !isAligned(virt)) return false;
     const leaf = getLeaf(virt) orelse return false;
     if (leaf.huge) return false;
+    const previous = leaf.entry.*;
     leaf.entry.* &= ~DIRTY;
-    flushPage(virt);
-    return true;
+    if (tlb.invalidateRange(virt, 1).ok) return true;
+    stats_value.shootdown_failures +%= 1;
+    leaf.entry.* = previous;
+    stats_value.rollback_restores +%= 1;
+    if (!tlb.invalidateRange(virt, 1).ok) stats_value.rollback_restore_failures +%= 1;
+    return false;
 }
 
 pub fn setWriteCombiningRange(virt_base: u64, byte_len: u64) bool {
-    if (!readyForPageTableMutation() or byte_len == 0) return false;
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    if (!readyForPageTableMutationLocked() or byte_len == 0 or virt_base +% byte_len < virt_base) return false;
     const start = alignDown(virt_base, PAGE_SIZE);
     const end = alignUp(virt_base + byte_len, PAGE_SIZE);
-    var virt = start;
-    while (virt < end) : (virt += PAGE_SIZE) {
-        const leaf = getLeaf(virt) orelse return false;
-        var entry = leaf.entry.*;
-        entry &= ~CACHE_DISABLE;
-        entry |= WRITE_THROUGH;
-        if (leaf.huge) {
-            entry |= HUGE_PAGE_PAT;
-        } else {
-            entry |= PAGE_ATTRIBUTE_TABLE;
+    var chunk_base = start;
+    while (chunk_base < end) {
+        const remaining_pages = (end - chunk_base) / PAGE_SIZE;
+        const chunk_pages = page_batch.boundedPageCount(remaining_pages);
+        var previous_entries: [64]u64 = undefined;
+        var page: u64 = 0;
+        while (page < chunk_pages) : (page += 1) {
+            const leaf = getLeaf(chunk_base + page * PAGE_SIZE) orelse return false;
+            previous_entries[@intCast(page)] = leaf.entry.*;
         }
-        leaf.entry.* = entry;
-        stats_value.write_combining_pages += 1;
-        flushPage(virt);
+        page = 0;
+        while (page < chunk_pages) : (page += 1) {
+            const leaf = getLeaf(chunk_base + page * PAGE_SIZE) orelse unreachable;
+            var entry = leaf.entry.*;
+            entry &= ~CACHE_DISABLE;
+            entry |= WRITE_THROUGH;
+            if (leaf.huge) entry |= HUGE_PAGE_PAT else entry |= PAGE_ATTRIBUTE_TABLE;
+            leaf.entry.* = entry;
+        }
+        if (!tlb.invalidateRange(chunk_base, chunk_pages).ok) {
+            stats_value.shootdown_failures +%= 1;
+            page = 0;
+            while (page < chunk_pages) : (page += 1) {
+                const leaf = getLeaf(chunk_base + page * PAGE_SIZE) orelse unreachable;
+                leaf.entry.* = previous_entries[@intCast(page)];
+            }
+            stats_value.rollback_restores +%= chunk_pages;
+            if (!tlb.invalidateRange(chunk_base, chunk_pages).ok) stats_value.rollback_restore_failures +%= 1;
+            return false;
+        }
+        stats_value.write_combining_pages +%= chunk_pages;
+        chunk_base += chunk_pages * PAGE_SIZE;
     }
     return true;
 }
 
 pub fn activeRootMatchesHardware() bool {
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    return activeRootMatchesHardwareLocked();
+}
+
+fn activeRootMatchesHardwareLocked() bool {
     if (!initialized or pml4_phys == 0) return false;
     const hardware = r4os_read_cr3() & ADDR_MASK;
     const ok = hardware == pml4_phys;
@@ -223,10 +340,14 @@ pub fn activeRootMatchesHardware() bool {
 }
 
 pub fn activeRootIsR4os() bool {
-    return root_owner == .r4os and activeRootMatchesHardware();
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    return root_owner == .r4os and activeRootMatchesHardwareLocked();
 }
 
 pub fn stats() Stats {
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
     var s = stats_value;
     s.initialized = initialized;
     s.root_owner = root_owner;
@@ -238,6 +359,8 @@ pub fn stats() Stats {
 }
 
 pub fn dumpStats() void {
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
     dumpRuntimeStatus();
     k.puts("  Paging mutations: map=");
     k.putDec(stats_value.map_pages);
@@ -265,6 +388,13 @@ pub fn dumpStats() void {
     k.puts(" max=");
     k.putDec(stats_value.unmap_batch_max_pages);
     k.puts("\r\n");
+    k.puts("  Paging shootdown failures=");
+    k.putDec(stats_value.shootdown_failures);
+    k.puts(" restores=");
+    k.putDec(stats_value.rollback_restores);
+    k.puts(" restore-failures=");
+    k.putDec(stats_value.rollback_restore_failures);
+    k.puts("\r\n");
     k.puts("  Paging root mismatches=");
     k.putDec(stats_value.root_mismatches);
     k.puts("\r\n");
@@ -272,6 +402,8 @@ pub fn dumpStats() void {
 }
 
 pub fn dumpRuntimeStatus() void {
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
     const s = stats();
     k.puts("  Paging root CR3: 0x");
     k.putHex(s.active_root_phys, 16);
@@ -365,8 +497,8 @@ fn tableFromPhys(addr: u64) *PageTable {
     return @ptrFromInt(phys.physToVirt(addr));
 }
 
-fn readyForPageTableMutation() bool {
-    return activeRootMatchesHardware();
+fn readyForPageTableMutationLocked() bool {
+    return activeRootMatchesHardwareLocked();
 }
 
 fn flushPage(virt: u64) void {

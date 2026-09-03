@@ -86,6 +86,23 @@ Bootlog, Fatalbehandlung und Crashscreen behalten ihre vollstaendige Diagnose-
 und Anzeigesemantik; bei der Shellbereitschaft wird der Bootrenderer wie
 bisher ohne Uebermalen der ersten nutzbaren Ausgabe abgegeben.
 
+SMP-TLB- und Speicherbesitz seit 0.75.11
+-----------------------------------------
+
+Aktive Seitentabellen verwenden einen eigenen Owner-Lock und invalidieren
+entfernte oder semantisch geaenderte Eintraege mit dem IPI-Vektor F2 auf allen
+anderen Online-CPUs. Jede Anforderung besitzt eine Generation, einen
+Adressbereich und pro CPU ein generationstreues Ack. Ein Timeout stellt die
+alten PTEs wieder her und behaelt den physischen Frame; Wiederverwendung vor
+vollstaendiger Bestaetigung ist ausgeschlossen.
+
+Die feste Sperrreihenfolge lautet VM -> Seitentabellen -> physische
+PMM-/MemoryBlock-Metadaten. Die uebrigen Legacy-Besitzer sind elf Quellklassen
+zugeordnet und liefern Warte-, Halte-, Kollisions- und Klassenzaehler ohne
+rekursives Logging. Der kurze SMP4-Smoke prueft echte stale-TLB-Ersetzung,
+einen absichtlich fehlenden Ack samt sicherem Rollback sowie die
+Sperrreihenfolge, bevor Userland oder Subsysteme gestartet werden.
+
 Build
 -----
 

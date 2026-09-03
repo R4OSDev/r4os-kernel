@@ -5,7 +5,7 @@ const page_batch = @import("page_batch.zig");
 const paging = @import("paging.zig");
 const phys = @import("phys.zig");
 const reclaim = @import("reclaim.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
+const owner_locks = @import("owner_locks.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const k = @import("../kernel/log.zig");
 const r4sys_api = @import("../program/r4sys.zig");
@@ -511,8 +511,8 @@ pub fn init() bool {
 }
 
 pub fn reserve(req: ReserveRequest) Error!u32 {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(req.len) catch |err| return err;
     const alignment = normalizeAlignment(req.alignment) catch |err| return err;
@@ -530,8 +530,8 @@ pub fn reserve(req: ReserveRequest) Error!u32 {
 }
 
 pub fn reserveAt(req: ReserveAtRequest) Error!u32 {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(req.len) catch |err| return err;
     if (!isAligned(req.base, paging.PAGE_SIZE)) return Error.BadAlignment;
@@ -548,8 +548,8 @@ pub fn reserveAt(req: ReserveAtRequest) Error!u32 {
 }
 
 pub fn commit(id: u32, offset: u64, len_raw: u64) Error!void {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(len_raw) catch |err| return err;
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
@@ -609,7 +609,7 @@ fn allocClaimedExtent(range: Range, requested_pages: u64, reclaim_reason: reclai
         const acquired = phys.allocFrameExtent(wanted) orelse {
             if (!reclaimed) {
                 reclaimed = true;
-                if (interrupts.inLegacyCriticalSection()) return Error.OutOfMemory;
+                if (owner_locks.virtual_memory.heldByCurrent()) return Error.OutOfMemory;
                 if (reclaim.reclaimFrames(reclaim_reason, @intCast(wanted)).returned_frames > 0) continue;
             }
             return Error.OutOfMemory;
@@ -686,7 +686,7 @@ fn allocClaimedFrame(range: Range, reclaim_reason: reclaim.Reason) Error!u64 {
                 // transitional SMP owner boundary is deliberately no-sleep;
                 // callers holding it fail with controlled OOM instead of
                 // lending the global owner lock across a context switch.
-                if (interrupts.inLegacyCriticalSection()) return Error.OutOfMemory;
+                if (owner_locks.virtual_memory.heldByCurrent()) return Error.OutOfMemory;
                 if (reclaim.reclaimFrames(reclaim_reason, 1).returned_frames > 0) {
                     attempts = 0;
                     continue;
@@ -715,9 +715,9 @@ fn releaseClaimedFrame(frame: u64) void {
 }
 
 pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_id: u64) bool {
-    const owner_irq_flags = interrupts.saveAndDisable();
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
     var owner_locked = true;
-    defer if (owner_locked) interrupts.restore(owner_irq_flags);
+    defer if (owner_locked) owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return false;
     if ((error_code & PAGE_FAULT_PRESENT) != 0) return false;
     const fault_page = alignDownValue(addr, paging.PAGE_SIZE);
@@ -749,7 +749,7 @@ pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_
                 return false;
             }
             owner_locked = false;
-            interrupts.restore(owner_irq_flags);
+            owner_locks.virtual_memory.release(owner_irq_flags);
             return handlePageInFault(range, fault_page, page_index, fault_state);
         }
     }
@@ -773,8 +773,8 @@ pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_
 }
 
 pub fn uncommit(id: u32, offset: u64, len_raw: u64) Error!void {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(len_raw) catch |err| return err;
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
@@ -801,8 +801,8 @@ pub fn uncommit(id: u32, offset: u64, len_raw: u64) Error!void {
 }
 
 pub fn release(id: u32) Error!void {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const idx = indexById(id) orelse return Error.NotFound;
     var range = &ranges[idx];
@@ -825,9 +825,9 @@ pub fn release(id: u32) Error!void {
     // Once the public ID index is removed there is no lookup path for a
     // retry. Keep block release, ID tombstone and Range retirement in one
     // IRQ-atomic no-yield publication boundary.
-    const release_irq_flags = interrupts.saveAndDisable();
+    const release_irq_flags = owner_locks.virtual_memory.acquire();
     blocks.release(range.block_id) catch |err| {
-        interrupts.restore(release_irq_flags);
+        owner_locks.virtual_memory.release(release_irq_flags);
         return convertBlockError(err);
     };
     removeCommitSpansForRange(range.id);
@@ -847,12 +847,12 @@ pub fn release(id: u32) Error!void {
     range.partial_uncommit_cursor = 0;
     range.partial_uncommit_accounted = false;
     next_free_range_slot = idx;
-    interrupts.restore(release_irq_flags);
+    owner_locks.virtual_memory.release(release_irq_flags);
 }
 
 pub fn releaseOwner(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) u64 {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return 0;
     var released: u64 = 0;
     while (true) {
@@ -864,8 +864,8 @@ pub fn releaseOwner(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) u64 
 }
 
 pub fn protectGuard(id: u32, offset: u64, len_raw: u64) Error!void {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(len_raw) catch |err| return err;
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
@@ -879,8 +879,8 @@ pub fn protectGuard(id: u32, offset: u64, len_raw: u64) Error!void {
 }
 
 pub fn clearGuard(id: u32) Error!void {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const idx = indexById(id) orelse return Error.NotFound;
     ranges[idx].guard_base = 0;
@@ -888,8 +888,8 @@ pub fn clearGuard(id: u32) Error!void {
 }
 
 pub fn rangeInfo(id: u32) ?RangeInfo {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return null;
     const idx = indexById(id) orelse return null;
     const range = ranges[idx];
@@ -898,8 +898,8 @@ pub fn rangeInfo(id: u32) ?RangeInfo {
 }
 
 pub fn pageStateProbe(input: PageStateInput) PageStateResult {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     var result = makePageStateResult(input);
     if (!validatePageStateInput(input, &result)) {
         recordPageState(&result);
@@ -950,8 +950,8 @@ pub fn pageStateProbe(input: PageStateInput) PageStateResult {
 }
 
 pub fn applyPageIoState(input: PageStateInput, page_out: bool) PageStateResult {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     var adjusted = input;
     adjusted.operation = if (page_out) page_state_operation_bind_slot else page_state_operation_query;
     var result = pageStateProbe(adjusted);
@@ -968,16 +968,16 @@ pub fn applyPageIoState(input: PageStateInput, page_out: bool) PageStateResult {
 }
 
 pub fn pageStateSummary() PageStateSummary {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     var summary = page_state_summary;
     summary.span_count = activePageStateSpanCount();
     return summary;
 }
 
 pub fn recordPagerPolicyFailure(input: PageStateInput, page_out: bool) void {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (input.page_count == 0) return;
     const idx = indexById(input.region_id) orelse return;
     const range = ranges[idx];
@@ -1009,8 +1009,8 @@ pub fn recordPagerPolicyFailure(input: PageStateInput, page_out: bool) void {
 }
 
 pub fn stats() Stats {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     var s: Stats = .{};
     if (!initialized) return s;
 
@@ -1046,8 +1046,8 @@ pub fn stats() Stats {
 }
 
 pub fn ownerStats(owner: blocks.Owner, owner_id: u64, window_filter: ?Window, kind_filter: ?blocks.Kind) OwnerStats {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     var s: OwnerStats = .{};
     if (!initialized) return s;
 
@@ -1074,8 +1074,8 @@ pub fn ownerStats(owner: blocks.Owner, owner_id: u64, window_filter: ?Window, ki
 }
 
 pub fn dumpStats() void {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     const s = stats();
     k.puts("  Virtual ranges: active=");
     k.putDec(s.active_ranges);
@@ -1229,29 +1229,29 @@ fn uncommitSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) Error!
 // timer hard-kill may happen between pages, but can never observe a torn
 // base/length/accounted tuple.
 fn publishPartialUncommit(range: *Range, base: u64, len: u64, reset_accounted: bool) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = owner_locks.virtual_memory.acquire();
     range.partial_uncommit_base = base;
     range.partial_uncommit_len = len;
     if (reset_accounted) {
         range.partial_uncommit_cursor = base;
         range.partial_uncommit_accounted = false;
     }
-    interrupts.restore(irq_flags);
+    owner_locks.virtual_memory.release(irq_flags);
 }
 
 fn advancePartialUncommitCursor(range: *Range, cursor: u64) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = owner_locks.virtual_memory.acquire();
     range.partial_uncommit_cursor = cursor;
-    interrupts.restore(irq_flags);
+    owner_locks.virtual_memory.release(irq_flags);
 }
 
 fn clearPartialUncommit(range: *Range) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = owner_locks.virtual_memory.acquire();
     range.partial_uncommit_base = 0;
     range.partial_uncommit_len = 0;
     range.partial_uncommit_cursor = 0;
     range.partial_uncommit_accounted = false;
-    interrupts.restore(irq_flags);
+    owner_locks.virtual_memory.release(irq_flags);
 }
 
 fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) Error!void {
@@ -1277,7 +1277,7 @@ fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) 
 
     try removeCommitSpanReserved(range.id, start, len, &commit_split);
     try removePageStateRangeReserved(range, first_page, end_page, &page_splits);
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = owner_locks.virtual_memory.acquire();
     if (!range.partial_uncommit_accounted) {
         if (skip_unmapped and len > range.committed_bytes) {
             range.committed_bytes = 0;
@@ -1288,20 +1288,21 @@ fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) 
         }
         range.partial_uncommit_accounted = true;
     }
-    interrupts.restore(irq_flags);
+    owner_locks.virtual_memory.release(irq_flags);
 }
 
 fn uncommitPage(range: *Range, virt: u64, count_logical_commit: bool) Error!void {
-    const frame = paging.mappedFrame(virt) orelse return Error.NotCommitted;
+    const page_table_token = paging.acquireMutation();
+    defer paging.releaseMutation(page_table_token);
+    const frame = paging.mappedFrameLocked(virt) orelse return Error.NotCommitted;
     var release_plan: blocks.PhysicalReleasePlan = undefined;
     blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE, &release_plan) catch |err| return convertBlockError(err);
     defer blocks.cancelPhysicalRangeRelease(&release_plan);
-    if (!paging.unmapPage(virt)) {
+    if (!paging.unmapPageLocked(virt)) {
         return Error.MapFailed;
     }
-    // The plan keeps interrupts disabled. Free the PMM frame before the
-    // no-fail metadata commit restores IF, otherwise a hard kill in the tiny
-    // gap could strand an unmapped frame as permanently used.
+    // Page-table -> physical-metadata is the canonical order.  The frame is
+    // reusable only after every online CPU acknowledged the invalidation.
     phys.freeFrame(frame);
     if (range.resident_bytes >= paging.PAGE_SIZE) {
         range.resident_bytes -= paging.PAGE_SIZE;
@@ -1321,10 +1322,12 @@ fn uncommitPage(range: *Range, virt: u64, count_logical_commit: bool) Error!void
 fn uncommitExtent(range: *Range, virt: u64, extent: phys.FrameExtent, count_logical_commit: bool) Error!void {
     if (extent.count == 0) return Error.NotCommitted;
     const bytes = extent.count * paging.PAGE_SIZE;
+    const page_table_token = paging.acquireMutation();
+    defer paging.releaseMutation(page_table_token);
     var release_plan: blocks.PhysicalReleasePlan = undefined;
     blocks.preparePhysicalRangeRelease(extent.base, bytes, &release_plan) catch |err| return convertBlockError(err);
     defer blocks.cancelPhysicalRangeRelease(&release_plan);
-    if (!paging.unmapContiguousPages(virt, extent.base, extent.count)) return Error.MapFailed;
+    if (!paging.unmapContiguousPagesLocked(virt, extent.base, extent.count)) return Error.MapFailed;
     phys.freeFrameExtent(extent);
     if (range.resident_bytes >= bytes) {
         range.resident_bytes -= bytes;
@@ -1752,12 +1755,14 @@ fn handlePageInFault(range: *Range, fault_page: u64, page_index: u64, fault_stat
     complete_input.io_bytes = io_bytes;
     const completed = backing_store.pageIoComplete(complete_input);
     if (completed.status != backing_store.page_io_status_page_in_ok) {
+        const page_table_token = paging.acquireMutation();
+        defer paging.releaseMutation(page_table_token);
         var release_plan: blocks.PhysicalReleasePlan = undefined;
         blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE, &release_plan) catch {
             return recordPageInFaultFailure(range, page_index, true);
         };
         defer blocks.cancelPhysicalRangeRelease(&release_plan);
-        if (!paging.unmapPage(fault_page)) return recordPageInFaultFailure(range, page_index, true);
+        if (!paging.unmapPageLocked(fault_page)) return recordPageInFaultFailure(range, page_index, true);
         phys.freeFrame(frame);
         blocks.commitPhysicalRangeRelease(&release_plan);
         return recordPageInFaultFailure(range, page_index, true);
@@ -1865,8 +1870,8 @@ pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32) rec
 }
 
 pub fn evictableBytes() u64 {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized or backing_store.activeBackingResult() == null) return 0;
     var bytes: u64 = 0;
     var range_pos: usize = 0;
@@ -1885,8 +1890,8 @@ pub fn evictableBytes() u64 {
 }
 
 pub fn evictableDirtyBytes() u64 {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized or backing_store.activeBackingResult() == null) return 0;
     var bytes: u64 = 0;
     var range_pos: usize = 0;
@@ -3019,8 +3024,8 @@ fn recordPageStateSpanSteps(steps: usize) void {
 }
 
 pub fn hotPathStats() HotPathStats {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     var out = hot_path_stats;
     out.range_index_capacity = @intCast(RANGE_ID_INDEX_CAPACITY);
     out.range_index_entries = @intCast(@min(range_id_index_entries, std.math.maxInt(u32)));
@@ -3032,8 +3037,8 @@ pub fn hotPathStats() HotPathStats {
 }
 
 pub fn metadataInvariant() bool {
-    const owner_irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(owner_irq_flags);
+    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized or range_address_count != range_id_index_entries) return false;
     var commit_seen: [MAX_COMMIT_SPANS / 64]u64 = .{0} ** (MAX_COMMIT_SPANS / 64);
     var page_seen: [MAX_PAGE_STATE_SPANS / 64]u64 = .{0} ** (MAX_PAGE_STATE_SPANS / 64);

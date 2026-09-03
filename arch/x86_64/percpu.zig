@@ -150,6 +150,18 @@ pub fn schedulableCount() u32 {
     return @popCount(schedulableMask());
 }
 
+/// CPUs which can currently execute the shared kernel address space.  TLB
+/// shootdowns use lifecycle state rather than the scheduling mask so a CPU
+/// is not skipped merely because its run queue is temporarily disabled.
+pub fn onlineMask() u64 {
+    var mask: u64 = 0;
+    var index: u32 = 0;
+    while (index < max_cpus) : (index += 1) {
+        if (state(index) == .online) mask |= @as(u64, 1) << @intCast(index);
+    }
+    return mask;
+}
+
 pub fn noteProductive(index: u32, r4x_work: bool) bool {
     if (index >= max_cpus) return false;
     const mask = @as(u64, 1) << @intCast(index);

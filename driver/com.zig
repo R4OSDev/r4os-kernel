@@ -127,7 +127,7 @@ pub fn logPutc(c: u8) void {
         }
         return;
     }
-    const flags = interrupts.saveAndDisable();
+    const flags = interrupts.saveAndDisableFor(.driver);
     defer interrupts.restore(flags);
     if (tx_head -% tx_tail >= TX_RING_SIZE) {
         // Normaler Runtime-Log darf niemals mit deaktivierten IRQs auf
@@ -149,7 +149,7 @@ pub fn logPutc(c: u8) void {
 // Opportunistischer Drain fuer Timer-Tick/Idle: nicht blockierend.
 pub fn logDrain() void {
     if (tx_tail == tx_head) return;
-    const flags = interrupts.saveAndDisable();
+    const flags = interrupts.saveAndDisableFor(.driver);
     defer interrupts.restore(flags);
     drainLocked();
 }
@@ -157,7 +157,7 @@ pub fn logDrain() void {
 // Synchron leeren (Poweroff-/Abschluss-Pfad), solange der UART fortschreitet.
 // Ein einmal erkannter Hardwarestillstand verwirft den Rest statt zu haengen.
 pub fn logFlushSync() void {
-    const flags = interrupts.saveAndDisable();
+    const flags = interrupts.saveAndDisableFor(.driver);
     defer interrupts.restore(flags);
     while (tx_tail != tx_head) {
         if (!drainSyncBurst()) {

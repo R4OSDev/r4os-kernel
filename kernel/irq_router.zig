@@ -106,7 +106,7 @@ pub fn register(irq: u8, handler: IrqHandler, context: usize, flags: u32, owner:
         return -4;
     }
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
     defer interrupts.restore(irq_flags);
 
     const shared = (flags & IRQ_FLAG_SHARED) != 0;
@@ -143,7 +143,7 @@ pub fn register(irq: u8, handler: IrqHandler, context: usize, flags: u32, owner:
 pub fn cleanupOwner(owner: u32) u32 {
     if (owner == 0) return 0;
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
     defer interrupts.restore(irq_flags);
 
     var removed: u32 = 0;
@@ -167,7 +167,7 @@ pub fn cleanupOwner(owner: u32) u32 {
 pub fn unregister(irq: u8, handler: IrqHandler, context: usize) i32 {
     if (irq >= MAX_IRQS) return -1;
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
     defer interrupts.restore(irq_flags);
 
     const irq_index: usize = @intCast(irq);
@@ -183,7 +183,7 @@ pub fn unregister(irq: u8, handler: IrqHandler, context: usize) i32 {
 
 pub fn stats(irq: u8, out: *IrqStats) i32 {
     if (irq >= MAX_IRQS) return -1;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
     defer interrupts.restore(irq_flags);
     out.* = stats_table[@intCast(irq)];
     return 0;
@@ -191,7 +191,7 @@ pub fn stats(irq: u8, out: *IrqStats) i32 {
 
 pub fn timingStats(irq: u8, out: *IrqTimingStats) i32 {
     if (irq >= MAX_IRQS) return -1;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
     defer interrupts.restore(irq_flags);
     out.* = timing_table[@intCast(irq)];
     return 0;

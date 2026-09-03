@@ -1824,7 +1824,7 @@ var net_loss_counter: u64 = 0;
 var net_loss_drops: u64 = 0;
 
 fn rxEnterCritical() u64 {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.network);
     scheduler.preemptDisable();
     return irq_flags;
 }

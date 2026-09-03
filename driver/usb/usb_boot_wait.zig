@@ -39,7 +39,7 @@ pub const Deadline = struct {
     fallback_tsc: bool,
 
     pub fn begin(milliseconds_value: u32) Deadline {
-        const flags = interrupts.saveAndDisable();
+        const flags = interrupts.saveAndDisableFor(.driver);
         const may_enable = interrupts.wereEnabled(flags) or scheduler.current() == null;
         const start_monotonic = monotonic.capture();
         const monotonic_clock = monotonic.snapshot();

@@ -8,6 +8,7 @@ const irq_router = @import("../../kernel/irq_router.zig");
 const scheduler = @import("../../sched/scheduler.zig");
 const timer = @import("../../kernel/timer.zig");
 const tss = @import("tss.zig");
+const tlb = @import("tlb_shootdown.zig");
 const keyboard = @import("../../driver/input/keyboard.zig");
 const mouse = @import("../../driver/input/mouse.zig");
 const ps2_controller = @import("../../driver/input/i8042.zig");
@@ -21,6 +22,7 @@ const IDT_ENTRIES = 256;
 const INTERRUPT_GATE: u8 = 0x8E;
 pub const RESCHEDULE_VECTOR: u8 = 0xF0;
 pub const STOP_VECTOR: u8 = 0xF1;
+pub const TLB_VECTOR: u8 = tlb.VECTOR;
 
 const DescriptorTablePointer = packed struct {
     limit: u16,
@@ -139,6 +141,7 @@ extern fn irq30() callconv(.c) void;
 extern fn irq31() callconv(.c) void;
 extern fn ipi_reschedule() callconv(.c) void;
 extern fn ipi_stop() callconv(.c) void;
+extern fn ipi_tlb() callconv(.c) void;
 
 var idt: [IDT_ENTRIES]IdtEntry align(16) = .{IdtEntry{}} ** IDT_ENTRIES;
 
@@ -174,6 +177,7 @@ pub fn init() void {
 
     idt[RESCHEDULE_VECTOR].set(@ptrCast(&ipi_reschedule), gdt.codeSelector(), INTERRUPT_GATE, 0);
     idt[STOP_VECTOR].set(@ptrCast(&ipi_stop), gdt.codeSelector(), INTERRUPT_GATE, 0);
+    idt[TLB_VECTOR].set(@ptrCast(&ipi_tlb), gdt.codeSelector(), INTERRUPT_GATE, 0);
 
     loadCurrent();
     k.puts("  IDT loaded ");
@@ -189,7 +193,7 @@ pub fn loadCurrent() void {
 }
 
 pub export fn irqDispatch(frame: *const InterruptFrame) callconv(.c) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
     defer interrupts.restore(irq_flags);
     const vector = frame.vector;
     if (vector < pic.MASTER_OFFSET or vector >= pic.MASTER_OFFSET + irq_handlers.len) return;
@@ -240,6 +244,10 @@ pub export fn ipiDispatch(frame: *const InterruptFrame) callconv(.c) void {
             percpu.setSchedulable(index, false);
             _ = percpu.setState(index, .offline);
             interrupts.haltForever();
+        },
+        TLB_VECTOR => {
+            tlb.handleIpi();
+            lapic.endOfInterrupt();
         },
         else => lapic.endOfInterrupt(),
     }

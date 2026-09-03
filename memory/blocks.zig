@@ -1,7 +1,7 @@
 const std = @import("std");
 const boot_info = @import("../bootloader/boot_info.zig");
 const k = @import("../kernel/log.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
+const owner_locks = @import("owner_locks.zig");
 
 pub const MAX_BLOCKS: usize = 8192;
 pub const KIND_COUNT: usize = 14;
@@ -179,7 +179,7 @@ pub const PhysicalReleasePlan = struct {
     merge_secondary_index: ?usize = null,
     merge_secondary_released: MemoryBlock = .{},
     next_id_after: u32,
-    irq_flags: u64 = 0,
+    lock_token: owner_locks.Token = .{},
     active: bool = false,
 };
 
@@ -1343,6 +1343,8 @@ var table: Table = .{ .entries = storage[0..] };
 var initialized = false;
 
 pub fn initFromBootInfo() bool {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     table.reset();
     initialized = true;
 
@@ -1357,6 +1359,8 @@ pub fn initFromBootInfo() bool {
 }
 
 pub fn register(req: RegisterRequest) Error!u32 {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return Error.NotInitialized;
     return table.register(req);
 }
@@ -1370,8 +1374,8 @@ pub fn claimPhysicalRange(
     name: []const u8,
 ) Error!u32 {
     if (!initialized) return Error.NotInitialized;
-    const irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(irq_flags);
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     return table.claimPhysicalRange(base, len, kind, owner, owner_id, name);
 }
 
@@ -1380,8 +1384,8 @@ pub fn claimPhysicalRange(
 /// keep a PMM batch inside the same metadata transaction.
 pub fn freePhysicalPrefix(base: u64, max_len: u64) u64 {
     if (!initialized) return 0;
-    const irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(irq_flags);
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     return table.freePhysicalPrefix(base, max_len);
 }
 
@@ -1390,8 +1394,8 @@ pub fn freePhysicalPrefix(base: u64, max_len: u64) u64 {
 /// walk for each page.
 pub fn claimedPhysicalPrefix(base: u64, max_len: u64) u64 {
     if (!initialized) return 0;
-    const irq_flags = interrupts.saveAndDisable();
-    defer interrupts.restore(irq_flags);
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     return table.claimedPhysicalPrefix(base, max_len);
 }
 
@@ -1403,20 +1407,20 @@ pub fn releasePhysicalRange(base: u64, len: u64) Error!void {
 
 pub fn preparePhysicalRangeRelease(base: u64, len: u64, plan: *PhysicalReleasePlan) Error!void {
     if (!initialized) return Error.NotInitialized;
-    const irq_flags = interrupts.saveAndDisable();
+    const lock_token = owner_locks.physical_memory.acquire();
     table.preparePhysicalRangeRelease(base, len, plan) catch |err| {
-        interrupts.restore(irq_flags);
+        owner_locks.physical_memory.release(lock_token);
         return err;
     };
-    plan.irq_flags = irq_flags;
+    plan.lock_token = lock_token;
     plan.active = true;
 }
 
 // Applies a previously validated plan after the caller has unmapped the PTE.
 // There are deliberately no failure paths here: every output slot, merge and
-// block ID is protected by the interrupt-disabled UP transaction begun in
-// preparePhysicalRangeRelease(). SMP will replace this token with a table
-// spinlock while retaining the same prepare/cancel/commit boundary.
+// block ID is protected by the physical-metadata owner lock acquired in
+// preparePhysicalRangeRelease().  The token deliberately spans the external
+// PTE mutation, so no competing allocation can observe half a release.
 pub fn commitPhysicalRangeRelease(plan: *PhysicalReleasePlan) void {
     finishPhysicalRangeRelease(plan, false);
 }
@@ -1424,14 +1428,14 @@ pub fn commitPhysicalRangeRelease(plan: *PhysicalReleasePlan) void {
 pub fn cancelPhysicalRangeRelease(plan: *PhysicalReleasePlan) void {
     if (!plan.active) return;
     plan.active = false;
-    interrupts.restore(plan.irq_flags);
+    owner_locks.physical_memory.release(plan.lock_token);
 }
 
 fn finishPhysicalRangeRelease(plan: *PhysicalReleasePlan, coalesce_now: bool) void {
     if (!plan.active) unreachable;
     table.commitPhysicalRangeRelease(plan.*, coalesce_now);
     plan.active = false;
-    interrupts.restore(plan.irq_flags);
+    owner_locks.physical_memory.release(plan.lock_token);
 }
 
 // Compatibility entrypoint for callers that do not need to hold the plan
@@ -1445,6 +1449,8 @@ pub fn releasePhysicalRangeDeferred(base: u64, len: u64) Error!void {
 
 pub fn coalescePhysicalRanges() void {
     if (!initialized) return;
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     table.coalescePhysical();
 }
 
@@ -1457,66 +1463,92 @@ pub fn retagPhysicalRange(
     status: Status,
     name: []const u8,
 ) Error!u32 {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return Error.NotInitialized;
     return table.retagPhysicalRange(base, len, kind, owner, owner_id, status, name);
 }
 
 pub fn update(id: u32, req: UpdateRequest) Error!void {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return Error.NotInitialized;
     return table.update(id, req);
 }
 
 pub fn setCommitted(id: u32, bytes: u64) Error!void {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return Error.NotInitialized;
     return table.setCommitted(id, bytes);
 }
 
 pub fn commit(id: u32, bytes: u64) Error!void {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return Error.NotInitialized;
     return table.commit(id, bytes);
 }
 
 pub fn uncommit(id: u32, bytes: u64) Error!void {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return Error.NotInitialized;
     return table.uncommit(id, bytes);
 }
 
 pub fn release(id: u32) Error!void {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return Error.NotInitialized;
     return table.release(id);
 }
 
 pub fn snapshot(out: []MemoryBlock) SnapshotResult {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return .{};
     return table.snapshot(out);
 }
 
 pub fn firstByOwner(owner: Owner, owner_id: u64) ?MemoryBlock {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return null;
     return table.firstByOwner(owner, owner_id);
 }
 
 pub fn firstContainingVirtual(addr: u64) ?MemoryBlock {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return null;
     return table.firstContainingVirtual(addr);
 }
 
 pub fn countByOwner(owner: Owner, owner_id: u64) u64 {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return 0;
     return table.countByOwner(owner, owner_id);
 }
 
 pub fn activeAt(active_index: u32) ?MemoryBlock {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return null;
     return table.activeAt(active_index);
 }
 
 pub fn summary() Summary {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return .{};
     return table.summary();
 }
 
 pub fn hotPathStats() HotPathStats {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     if (!initialized) return .{};
     var result = table.hot_path_stats;
     result.physical_index_entries = table.physical_entry_count;
@@ -1525,6 +1557,8 @@ pub fn hotPathStats() HotPathStats {
 }
 
 pub fn indexInvariant() bool {
+    const lock_token = owner_locks.physical_memory.acquire();
+    defer owner_locks.physical_memory.release(lock_token);
     return initialized and table.indexInvariant();
 }
 

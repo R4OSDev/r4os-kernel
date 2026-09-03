@@ -109,6 +109,7 @@ IRQ 31
 
 IPI ipi_reschedule, 0xF0
 IPI ipi_stop,       0xF1
+IPI ipi_tlb,        0xF2
 
 .global isr_common
 .type isr_common, @function

@@ -464,7 +464,7 @@ fn startControllerWorker(lane: u8, critical: bool) bool {
 }
 
 pub fn register(device: Device) ?usize {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     const result = registerLocked(device);
     const controller_lane = if (result) |index| devices[index].device.controller_lane else block_dispatch.no_lane;
     interrupts.restore(irq_flags);
@@ -582,7 +582,7 @@ pub fn cancelUnregister(token: *UnregisterToken) bool {
 }
 
 fn preparedSlot(index: usize, generation: u64) ?*DeviceSlot {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     defer interrupts.restore(irq_flags);
     if (index >= device_slot_count) return null;
     const slot = &devices[index];
@@ -591,7 +591,7 @@ fn preparedSlot(index: usize, generation: u64) ?*DeviceSlot {
 }
 
 fn beginRetirement(index: usize) ?*DeviceSlot {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     defer interrupts.restore(irq_flags);
     if (index >= device_slot_count) return null;
     const slot = &devices[index];
@@ -611,13 +611,13 @@ fn beginRetirement(index: usize) ?*DeviceSlot {
 }
 
 fn cancelRetirement(slot: *DeviceSlot) void {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     defer interrupts.restore(irq_flags);
     if (slot.used) slot.retiring = false;
 }
 
 fn commitRetirement(slot: *DeviceSlot) bool {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     defer interrupts.restore(irq_flags);
     if (!slot.used or !slot.retiring or slot.pin_count != 0) return false;
     const retired_lane = slot.device.controller_lane;
@@ -655,7 +655,7 @@ fn hasMountedDrive(block_index: usize) bool {
 }
 
 pub fn findByName(name: []const u8) ?usize {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     defer interrupts.restore(irq_flags);
     return findByNameLocked(name);
 }
@@ -682,7 +682,7 @@ pub fn maxDevices() usize {
 }
 
 pub fn get(index: usize) ?*const Device {
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     defer interrupts.restore(irq_flags);
     if (index >= device_slot_count or !devices[index].used or devices[index].retiring) return null;
     return &devices[index].device;
@@ -692,7 +692,7 @@ fn pinDevice(index: usize) ?DevicePin {
     const unwind = task_context.enterUnwind();
     if (!unwind.admitted()) return null;
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     if (index >= device_slot_count or
         !devices[index].used or
         devices[index].retiring or
@@ -711,7 +711,7 @@ fn pinDevice(index: usize) ?DevicePin {
 
 fn unpinDevice(pin: *DevicePin) void {
     if (!pin.active) return;
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     if (pin.slot.pin_count != 0) pin.slot.pin_count -= 1;
     pin.active = false;
     interrupts.restore(irq_flags);
@@ -1195,7 +1195,7 @@ fn takeReadyCompletion(device: *Device) ?ReadyCompletion {
     while (index < device.request_slots.len) : (index += 1) {
         const slot = &device.request_slots[index];
         if (slot.state != .active or slot.backend_handle == 0) continue;
-        const irq_flags = interrupts.saveAndDisable();
+        const irq_flags = interrupts.saveAndDisableFor(.storage);
         const completion = slot.completion_latch.take();
         interrupts.restore(irq_flags);
         if (completion) |value| {
@@ -1233,7 +1233,7 @@ fn submitAsyncRequest(device: *Device, request: RequestExecution, submit: AsyncS
     // A backend may complete inline before returning. Completion owns the
     // terminal result in that race; otherwise the nonzero submit result means
     // hardware never acquired the request or its buffer.
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     const rejected = if (request.slot_index < device.request_slots.len)
         device.request_slots[request.slot_index].completion_latch.rejectSubmission(request.backend_handle)
     else
@@ -1393,7 +1393,7 @@ pub fn asyncBackendComplete(handle: u64, result: i32, bytes: u32) callconv(.c) v
         return;
     }
 
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     const device_slot = &devices[device_index];
     if (!device_slot.used) {
         runtime_summary.late_completions +%= 1;
@@ -1461,7 +1461,7 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
         unlockDevice(device, locked);
         return;
     }
-    const irq_flags = interrupts.saveAndDisable();
+    const irq_flags = interrupts.saveAndDisableFor(.storage);
     slot.completion_latch.invalidate();
     interrupts.restore(irq_flags);
     // Only the exact live execution owns one active count. A stale or double
