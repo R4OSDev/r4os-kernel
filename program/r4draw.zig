@@ -28,6 +28,7 @@ pub const DisplayPresentResult = r4x_api.DisplayPresentResult;
 var display_used_hook: ?MarkDisplayUsedFn = null;
 var font_catalog_changed_hook: ?FontCatalogChangedFn = null;
 var display_revision: u32 = 0;
+var font_revision: u32 = 1;
 
 pub fn setDisplayUsedHook(hook: MarkDisplayUsedFn) void {
     display_used_hook = hook;
@@ -291,8 +292,17 @@ pub fn fontGlyphBitmap(font_id: u32, codepoint: u32, out: *GuiGlyphBitmap) callc
 pub fn fontReload() callconv(.c) i32 {
     const result = font_catalog.reloadInstalled();
     if (result.unavailable) return -1;
+    font_revision +%= 1;
+    if (font_revision == 0) font_revision = 1;
     if (font_catalog_changed_hook) |hook| hook();
     return @intCast(result.registered);
+}
+
+/// Font ids are positions in a live catalogue and may be reused by a reload.
+/// Consumers keying decoded glyphs therefore pair the id with this non-zero
+/// generation and discard their bounded caches whenever it advances.
+pub fn fontRevision() callconv(.c) u32 {
+    return font_revision;
 }
 
 pub fn textFont(font_id: u32, x: i32, y: i32, value: [*:0]const u8, fg: u32, bg: u32) callconv(.c) void {
