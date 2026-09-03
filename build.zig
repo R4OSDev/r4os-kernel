@@ -221,6 +221,7 @@ pub fn build(b: *std.Build) void {
         "storage/gpt.zig",
     };
     for (unit_tests) |path| addUnitTest(b, test_step, path);
+    addFontUnitTest(b, test_step);
     addBootscreenUnitTest(b, test_step);
     addContractUnitTest(b, test_step, contract, config, "services_tests.zig");
     addLoaderTests(b, test_step, contract, config);
@@ -265,6 +266,22 @@ fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, path: []const u8) void
             .optimize = .ReleaseSafe,
         }),
     });
+    const run = b.addRunArtifact(tests);
+    test_step.dependOn(&run.step);
+}
+
+fn addFontUnitTest(b: *std.Build, test_step: *std.Build.Step) void {
+    const root = b.createModule(.{
+        .root_source_file = b.path("kernel/font.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    root.addImport("r4f_format", b.createModule(.{
+        .root_source_file = b.path("kernel/font_format.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }));
+    const tests = b.addTest(.{ .root_module = root });
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
 }

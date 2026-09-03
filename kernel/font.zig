@@ -28,6 +28,22 @@ pub const MAX_STATUS_TEXT: usize = 48;
 pub const BUILTIN_FONT_ID: u32 = 0;
 const INVALID_CODEPOINT: u32 = 0xFFFFFFFF;
 
+const GlyphIndex = struct {
+    count: u16 = 0,
+    codepoints: [MAX_GLYPHS]u32 = .{INVALID_CODEPOINT} ** MAX_GLYPHS,
+    glyph_ids: [MAX_GLYPHS]u16 = .{0} ** MAX_GLYPHS,
+};
+
+pub const GlyphBitmap = struct {
+    width: u32 = GLYPH_W,
+    height: u32 = GLYPH_H,
+    advance: u32 = GLYPH_W,
+    line_height: u32 = GLYPH_H,
+    baseline: i16 = GLYPH_H - 1,
+    fallback: bool = false,
+    rows: [MAX_GLYPH_H]u64 = .{0} ** MAX_GLYPH_H,
+};
+
 pub const FontKind = enum(u16) {
     builtin = 0,
     bitmap = r4f.FONT_KIND_BITMAP,
@@ -143,6 +159,7 @@ const CachedFont = struct {
     widths: [MAX_GLYPHS]u8 = .{GLYPH_W} ** MAX_GLYPHS,
     advances: [MAX_GLYPHS]u8 = .{GLYPH_W} ** MAX_GLYPHS,
     codepoints: [MAX_GLYPHS]u32 = .{INVALID_CODEPOINT} ** MAX_GLYPHS,
+    index: GlyphIndex = .{},
 };
 
 var catalog: [MAX_CATALOG_FONTS]CatalogEntry = .{CatalogEntry{}} ** MAX_CATALOG_FONTS;
@@ -154,7 +171,7 @@ var active_font_id: u32 = BUILTIN_FONT_ID;
 var active_glyphs: [MAX_GLYPHS][MAX_GLYPH_H][MAX_BYTES_PER_ROW]u8 = .{.{.{0} ** MAX_BYTES_PER_ROW} ** MAX_GLYPH_H} ** MAX_GLYPHS;
 var active_glyph_widths: [MAX_GLYPHS]u8 = .{GLYPH_W} ** MAX_GLYPHS;
 var active_glyph_advances: [MAX_GLYPHS]u8 = .{GLYPH_W} ** MAX_GLYPHS;
-var active_codepoints: [MAX_GLYPHS]u32 = .{INVALID_CODEPOINT} ** MAX_GLYPHS;
+var active_index: GlyphIndex = .{};
 
 pub fn glyph(c: u8) [8]u8 {
     return builtinGlyphForCodepoint(c);
@@ -392,6 +409,75 @@ pub fn glyphPixelForFont(font_id: u32, codepoint: u32, row: u32, col: u32) bool 
     if (row >= GLYPH_H or col >= GLYPH_W) return false;
     const shift: u3 = @intCast(GLYPH_W - 1 - col);
     return ((builtinGlyphForCodepoint(codepoint)[row] >> shift) & 1) == 1;
+}
+
+/// Returns one rendered row as a least-significant-bit-first mask.  The
+/// bounded codepoint index is resolved exactly once for the complete row.
+pub fn glyphRowMaskForFont(font_id: u32, codepoint: u32, row: u32) u64 {
+    if (cachedFont(font_id)) |f| {
+        if (row >= f.height) return 0;
+        if (cachedGlyphId(f, codepoint)) |glyph_id| return cachedGlyphRowMask(f, glyph_id, row);
+    }
+    return builtinGlyphRowMask(codepoint, row);
+}
+
+/// Materializes every rendered row after one bounded index lookup.  Missing
+/// codepoints retain the historical builtin fallback and the selected font's
+/// line metrics; no persistent R4F bytes leave the kernel cache.
+pub fn glyphBitmapForFont(font_id: u32, codepoint: u32) GlyphBitmap {
+    if (cachedFont(font_id)) |f| {
+        var result = GlyphBitmap{
+            .height = f.height,
+            .line_height = f.line_height,
+            .baseline = f.baseline,
+        };
+        if (cachedGlyphId(f, codepoint)) |glyph_id| {
+            result.width = f.widths[glyph_id];
+            result.advance = f.advances[glyph_id];
+            var row: u32 = 0;
+            while (row < f.height) : (row += 1) result.rows[row] = cachedGlyphRowMask(f, glyph_id, row);
+            return result;
+        }
+        result.fallback = true;
+        var row: u32 = 0;
+        while (row < @min(@as(u32, f.height), @as(u32, GLYPH_H))) : (row += 1) {
+            result.rows[row] = builtinGlyphRowMask(codepoint, row);
+        }
+        return result;
+    }
+
+    var result = GlyphBitmap{};
+    var row: u32 = 0;
+    while (row < GLYPH_H) : (row += 1) result.rows[row] = builtinGlyphRowMask(codepoint, row);
+    return result;
+}
+
+fn cachedGlyphRowMask(cached: *const CachedFont, glyph_id: usize, row: u32) u64 {
+    if (glyph_id >= MAX_GLYPHS or row >= cached.height) return 0;
+    const width: u32 = @min(@as(u32, cached.widths[glyph_id]), @as(u32, MAX_GLYPH_W));
+    var result: u64 = 0;
+    var column: u32 = 0;
+    while (column < width) : (column += 1) {
+        const byte_index: usize = @intCast(column / 8);
+        if (byte_index >= cached.bytes_per_row or byte_index >= MAX_BYTES_PER_ROW) break;
+        const shift: u3 = @intCast(7 - (column & 7));
+        if (((cached.glyphs[glyph_id][row][byte_index] >> shift) & 1) == 1) {
+            result |= @as(u64, 1) << @intCast(column);
+        }
+    }
+    return result;
+}
+
+fn builtinGlyphRowMask(codepoint: u32, row: u32) u64 {
+    if (row >= GLYPH_H) return 0;
+    const source = builtinGlyphForCodepoint(codepoint)[row];
+    var result: u64 = 0;
+    var column: u32 = 0;
+    while (column < GLYPH_W) : (column += 1) {
+        const shift: u3 = @intCast(GLYPH_W - 1 - column);
+        if (((source >> shift) & 1) == 1) result |= @as(u64, 1) << @intCast(column);
+    }
+    return result;
 }
 
 pub fn measure(text: []const u8) TextMetrics {
@@ -741,14 +827,14 @@ fn fillCachedFont(parsed: ParsedFont, cached: *CachedFont) bool {
     if (!loadGlyphMetrics(parsed.metric_table.data, parsed.glyph_count, parsed.width, parsed.max_advance, &cached.widths, &cached.advances)) return false;
     if (!loadBitmapGlyphs(parsed.bitmap_table.data, parsed.strike_id, parsed.height, parsed.bytes_per_row, parsed.glyph_count, &cached.glyphs)) return false;
     if (!loadGlyphMap(parsed.map_table.data, parsed.glyph_count, &cached.codepoints)) return false;
-    return true;
+    return buildGlyphIndex(&cached.codepoints, &cached.index);
 }
 
 fn activateFont(cached: *const CachedFont, family: []const u8, face: []const u8, path: []const u8) void {
     active_glyphs = cached.glyphs;
     active_glyph_widths = cached.widths;
     active_glyph_advances = cached.advances;
-    active_codepoints = cached.codepoints;
+    active_index = cached.index;
     var next_active = ActiveFont{
         .width = cached.width,
         .height = cached.height,
@@ -833,19 +919,51 @@ fn cachedFont(font_id: u32) ?*const CachedFont {
 }
 
 fn activeGlyphId(codepoint: u32) ?usize {
-    var glyph_id: usize = 0;
-    while (glyph_id < active_codepoints.len) : (glyph_id += 1) {
-        if (active_codepoints[glyph_id] == codepoint) return glyph_id;
-    }
-    return null;
+    return indexedGlyphId(&active_index, codepoint, null);
 }
 
 fn cachedGlyphId(cached: *const CachedFont, codepoint: u32) ?usize {
+    return indexedGlyphId(&cached.index, codepoint, null);
+}
+
+fn buildGlyphIndex(codepoints: *const [MAX_GLYPHS]u32, out: *GlyphIndex) bool {
+    out.* = .{};
     var glyph_id: usize = 0;
-    while (glyph_id < cached.codepoints.len) : (glyph_id += 1) {
-        if (cached.codepoints[glyph_id] == codepoint) return glyph_id;
+    while (glyph_id < codepoints.len) : (glyph_id += 1) {
+        const codepoint = codepoints[glyph_id];
+        if (codepoint == INVALID_CODEPOINT) continue;
+        var insertion: usize = @intCast(out.count);
+        while (insertion > 0) {
+            const previous = insertion - 1;
+            const previous_codepoint = out.codepoints[previous];
+            const previous_glyph_id = out.glyph_ids[previous];
+            if (previous_codepoint < codepoint or
+                (previous_codepoint == codepoint and @as(usize, previous_glyph_id) <= glyph_id)) break;
+            out.codepoints[insertion] = previous_codepoint;
+            out.glyph_ids[insertion] = previous_glyph_id;
+            insertion = previous;
+        }
+        out.codepoints[insertion] = codepoint;
+        out.glyph_ids[insertion] = @intCast(glyph_id);
+        out.count += 1;
     }
-    return null;
+    return out.count != 0;
+}
+
+fn indexedGlyphId(index: *const GlyphIndex, codepoint: u32, probe_count: ?*u16) ?usize {
+    var low: usize = 0;
+    var high: usize = @intCast(index.count);
+    while (low < high) {
+        if (probe_count) |count| count.* +%= 1;
+        const middle = low + (high - low) / 2;
+        if (index.codepoints[middle] < codepoint) {
+            low = middle + 1;
+        } else {
+            high = middle;
+        }
+    }
+    if (low >= @as(usize, index.count) or index.codepoints[low] != codepoint) return null;
+    return index.glyph_ids[low];
 }
 
 const DecodedScalar = struct {
@@ -1136,4 +1254,101 @@ test "builtin fallback contains western glyphs" {
     const std = @import("std");
     try std.testing.expect(!std.mem.eql(u8, &builtinGlyphForCodepoint(0xE4), &builtinGlyphForCodepoint('?')));
     try std.testing.expect(!std.mem.eql(u8, &builtinGlyphForCodepoint(0xDF), &builtinGlyphForCodepoint('?')));
+}
+
+test "bounded glyph index matches the former linear lookup" {
+    const std = @import("std");
+    var codepoints: [MAX_GLYPHS]u32 = .{INVALID_CODEPOINT} ** MAX_GLYPHS;
+    var glyph_id: usize = 0;
+    while (glyph_id < codepoints.len) : (glyph_id += 1) {
+        codepoints[glyph_id] = if (glyph_id == 255)
+            0x1F642
+        else
+            @as(u32, 0x1000) + @as(u32, @intCast(254 - @min(glyph_id, 254)));
+    }
+    // The old scan selected the lowest glyph ID for duplicate codepoints.
+    codepoints[17] = codepoints[93];
+
+    var index: GlyphIndex = .{};
+    try std.testing.expect(buildGlyphIndex(&codepoints, &index));
+    try std.testing.expectEqual(@as(u16, MAX_GLYPHS), index.count);
+
+    for (codepoints) |codepoint| {
+        var expected: ?usize = null;
+        for (codepoints, 0..) |candidate, candidate_id| {
+            if (candidate == codepoint) {
+                expected = candidate_id;
+                break;
+            }
+        }
+        var probes: u16 = 0;
+        try std.testing.expectEqual(expected, indexedGlyphId(&index, codepoint, &probes));
+        try std.testing.expect(probes <= 9);
+    }
+
+    var missing_probes: u16 = 0;
+    try std.testing.expectEqual(@as(?usize, null), indexedGlyphId(&index, 0x10FFFF, &missing_probes));
+    try std.testing.expect(missing_probes <= 9);
+    try std.testing.expectEqual(@as(?usize, 255), indexedGlyphId(&index, 0x1F642, null));
+
+    const invalid_map: [MAX_GLYPHS]u32 = .{INVALID_CODEPOINT} ** MAX_GLYPHS;
+    try std.testing.expect(!buildGlyphIndex(&invalid_map, &index));
+    try std.testing.expectEqual(@as(u16, 0), index.count);
+}
+
+test "bulk glyph rows equal indexed row and pixel references" {
+    const std = @import("std");
+    resetCatalog();
+    defer resetCatalog();
+
+    catalog_entries = 1;
+    catalog[0] = .{ .used = true, .renderable = true, .width = 5, .height = 3, .max_advance = 6, .line_height = 4, .baseline = 2 };
+    cached_fonts[0] = .{
+        .used = true,
+        .width = 5,
+        .height = 3,
+        .bytes_per_row = 1,
+        .max_advance = 6,
+        .line_height = 4,
+        .baseline = 2,
+    };
+    const cached = &cached_fonts[0];
+    cached.codepoints[7] = 0x1F642;
+    cached.widths[7] = 5;
+    cached.advances[7] = 6;
+    cached.glyphs[7][0][0] = 0b10101000;
+    cached.glyphs[7][1][0] = 0b01010000;
+    cached.glyphs[7][2][0] = 0b11111000;
+    try std.testing.expect(buildGlyphIndex(&cached.codepoints, &cached.index));
+
+    const bitmap = glyphBitmapForFont(1, 0x1F642);
+    try std.testing.expectEqual(@as(u32, 5), bitmap.width);
+    try std.testing.expectEqual(@as(u32, 3), bitmap.height);
+    try std.testing.expectEqual(@as(u32, 6), bitmap.advance);
+    try std.testing.expectEqual(@as(u32, 4), bitmap.line_height);
+    try std.testing.expectEqual(@as(i16, 2), bitmap.baseline);
+    try std.testing.expect(!bitmap.fallback);
+    try std.testing.expectEqual(@as(u32, 6), measureWithFont(1, "\xF0\x9F\x99\x82").width);
+
+    var row: u32 = 0;
+    while (row < MAX_GLYPH_H) : (row += 1) {
+        const row_mask = glyphRowMaskForFont(1, 0x1F642, row);
+        try std.testing.expectEqual(row_mask, bitmap.rows[row]);
+        var column: u32 = 0;
+        while (column < MAX_GLYPH_W) : (column += 1) {
+            const expected = (row_mask & (@as(u64, 1) << @intCast(column))) != 0;
+            try std.testing.expectEqual(expected, glyphPixelForFont(1, 0x1F642, row, column));
+        }
+    }
+
+    const fallback = glyphBitmapForFont(1, 0x10FFFF);
+    try std.testing.expect(fallback.fallback);
+    try std.testing.expectEqual(@as(u32, 3), fallback.height);
+    row = 0;
+    while (row < MAX_GLYPH_H) : (row += 1) {
+        try std.testing.expectEqual(glyphRowMaskForFont(1, 0x10FFFF, row), fallback.rows[row]);
+    }
+
+    resetCatalog();
+    try std.testing.expect(!isRenderableFontId(1));
 }

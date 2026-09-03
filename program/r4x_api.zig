@@ -1704,6 +1704,7 @@ pub const GuiShapeResource = generated.GuiShapeResource;
 pub const GuiFrameInfo = generated.GuiFrameInfo;
 pub const GuiIndexed8Resource = generated.GuiIndexed8Resource;
 pub const GuiFontInfo = generated.GuiFontInfo;
+pub const GuiGlyphBitmap = generated.GuiGlyphBitmap;
 pub const GuiTextMetrics = generated.GuiTextMetrics;
 pub const ClipboardInfo = generated.ClipboardInfo;
 pub const RemoteFrameInfo = generated.RemoteFrameInfo;

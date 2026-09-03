@@ -6035,6 +6035,7 @@ fn configureR4XStartR4DrawTable() void {
         .gui_frame_begin_damage = &apiGuiFrameBeginDamage,
         .gui_frame_generation_info = &apiGuiFrameGenerationInfo,
         .gui_frame_generation_read = &apiGuiFrameGenerationRead,
+        .font_glyph_bitmap = &r4api.r4draw.fontGlyphBitmap,
     });
 }
 

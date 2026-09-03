@@ -16,6 +16,7 @@ pub const MarkDisplayUsedFn = *const fn () void;
 pub const FontCatalogChangedFn = *const fn () void;
 
 pub const GuiFontInfo = r4x_api.GuiFontInfo;
+pub const GuiGlyphBitmap = r4x_api.GuiGlyphBitmap;
 
 pub const GuiTextMetrics = r4x_api.GuiTextMetrics;
 pub const DisplayDamageRect = r4x_api.DisplayDamageRect;
@@ -261,15 +262,27 @@ pub fn fontMeasure(font_id: u32, value: [*:0]const u8, out: *GuiTextMetrics) cal
 /// exposes rendered cache pixels only; installed font files stay on C:.
 pub fn fontGlyphRow(font_id: u32, codepoint: u32, row: u32) callconv(.c) u64 {
     if (codepoint > 0x10FFFF or row >= font.MAX_GLYPH_H or !font.isRenderableFontId(font_id)) return 0;
-    const glyph_width = @min(font.glyphBitmapWidthForFont(font_id, codepoint), @as(u32, 64));
-    var result: u64 = 0;
-    var column: u32 = 0;
-    while (column < glyph_width) : (column += 1) {
-        if (font.glyphPixelForFont(font_id, codepoint, row, column)) {
-            result |= @as(u64, 1) << @intCast(column);
-        }
-    }
-    return result;
+    return font.glyphRowMaskForFont(font_id, codepoint, row);
+}
+
+/// Copies one complete rendered glyph after a single bounded codepoint-index
+/// lookup.  This append-only bulk operation retains fontGlyphRow for older
+/// callers while avoiding one ABI call and one glyph lookup per bitmap row.
+pub fn fontGlyphBitmap(font_id: u32, codepoint: u32, out: *GuiGlyphBitmap) callconv(.c) i32 {
+    if (@intFromPtr(out) == 0 or codepoint > 0x10FFFF) return -1;
+    if (!font.isRenderableFontId(font_id)) return -2;
+
+    const bitmap = font.glyphBitmapForFont(font_id, codepoint);
+    out.* = .{
+        .width = bitmap.width,
+        .height = bitmap.height,
+        .advance = bitmap.advance,
+        .line_height = bitmap.line_height,
+        .baseline = bitmap.baseline,
+        .reserved0 = 0,
+        .rows = bitmap.rows,
+    };
+    return 0;
 }
 
 /// Rescans C:\R4OS\FONTS.  R4F files are read only long enough to populate
