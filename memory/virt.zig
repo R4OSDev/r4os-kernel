@@ -1,6 +1,7 @@
 const std = @import("std");
 const blocks = @import("blocks.zig");
 const backing_store = @import("backing_store.zig");
+const page_batch = @import("page_batch.zig");
 const paging = @import("paging.zig");
 const phys = @import("phys.zig");
 const reclaim = @import("reclaim.zig");
@@ -575,25 +576,102 @@ pub fn commit(id: u32, offset: u64, len_raw: u64) Error!void {
     if (!canCommitPages(range.*, pages)) return Error.OutOfMemory;
 
     var done: u64 = 0;
-    while (done < pages) : (done += 1) {
+    while (done < pages) {
         const virt = range.base + offset + done * paging.PAGE_SIZE;
-        const frame = allocClaimedFrame(range.*, .vm_commit) catch |err| {
+        const extent = allocClaimedExtent(range.*, pages - done, .vm_commit) catch |err| {
             rollbackCommit(range, range.base + offset, done);
             return err;
         };
-        if (!paging.mapPage(virt, frame, range.flags)) {
-            releaseClaimedFrame(frame);
+        if (!paging.mapContiguousPages(virt, extent.base, extent.count, range.flags)) {
+            releaseClaimedExtent(extent);
             rollbackCommit(range, range.base + offset, done);
             return Error.MapFailed;
         }
         const mem: [*]u8 = @ptrFromInt(virt);
-        @memset(mem[0..@intCast(paging.PAGE_SIZE)], 0);
-        range.committed_bytes += paging.PAGE_SIZE;
-        recordResident(range, paging.PAGE_SIZE);
+        const extent_bytes = extent.count * paging.PAGE_SIZE;
+        @memset(mem[0..@intCast(extent_bytes)], 0);
+        range.committed_bytes += extent_bytes;
+        recordResident(range, extent_bytes);
+        done += extent.count;
     }
 
     range.status = .committed;
     blocks.setCommitted(range.block_id, range.committed_bytes) catch |err| return convertBlockError(err);
+}
+
+fn allocClaimedExtent(range: Range, requested_pages: u64, reclaim_reason: reclaim.Reason) Error!phys.FrameExtent {
+    const wanted = page_batch.boundedPageCount(requested_pages);
+    if (wanted == 0) return Error.OutOfMemory;
+    const max_attempts = phys.stats().total_frames;
+    var attempts: u64 = 0;
+    var reclaimed = false;
+    while (attempts < max_attempts) {
+        const acquired = phys.allocFrameExtent(wanted) orelse {
+            if (!reclaimed) {
+                reclaimed = true;
+                if (interrupts.inLegacyCriticalSection()) return Error.OutOfMemory;
+                if (reclaim.reclaimFrames(reclaim_reason, @intCast(wanted)).returned_frames > 0) continue;
+            }
+            return Error.OutOfMemory;
+        };
+        attempts +|= acquired.count;
+
+        const acquired_bytes = acquired.count * paging.PAGE_SIZE;
+        const free_bytes = blocks.freePhysicalPrefix(acquired.base, acquired_bytes);
+        const claim_pages = free_bytes / paging.PAGE_SIZE;
+        if (claim_pages == 0) {
+            returnUnclaimedExtent(acquired);
+            continue;
+        }
+        const claim = phys.FrameExtent{ .base = acquired.base, .count = claim_pages };
+        if (claim_pages < acquired.count) {
+            returnUnclaimedExtent(.{
+                .base = acquired.base + claim_pages * paging.PAGE_SIZE,
+                .count = acquired.count - claim_pages,
+            });
+        }
+        _ = blocks.claimPhysicalRange(
+            claim.base,
+            claim.count * paging.PAGE_SIZE,
+            range.kind,
+            range.owner,
+            range.owner_id,
+            range.name,
+        ) catch |err| {
+            returnUnclaimedExtent(claim);
+            if (err == error.NotFree) continue;
+            return convertBlockError(err);
+        };
+        return claim;
+    }
+    return Error.OutOfMemory;
+}
+
+// A PMM/MemoryBlock discrepancy must never make a frame owned by another
+// block allocatable. Return only subranges which the block tree still marks
+// canonical-free; inconsistent pages stay conservatively used.
+fn returnUnclaimedExtent(extent: phys.FrameExtent) void {
+    var cursor = extent.base;
+    const end = extent.base + extent.count * paging.PAGE_SIZE;
+    while (cursor < end) {
+        const free_bytes = blocks.freePhysicalPrefix(cursor, end - cursor);
+        if (free_bytes >= paging.PAGE_SIZE) {
+            const pages = free_bytes / paging.PAGE_SIZE;
+            phys.freeFrameExtent(.{ .base = cursor, .count = pages });
+            cursor += pages * paging.PAGE_SIZE;
+        } else {
+            cursor += paging.PAGE_SIZE;
+        }
+    }
+}
+
+fn releaseClaimedExtent(extent: phys.FrameExtent) void {
+    if (extent.count == 0) return;
+    var release_plan: blocks.PhysicalReleasePlan = undefined;
+    blocks.preparePhysicalRangeRelease(extent.base, extent.count * paging.PAGE_SIZE, &release_plan) catch return;
+    defer blocks.cancelPhysicalRangeRelease(&release_plan);
+    phys.freeFrameExtent(extent);
+    blocks.commitPhysicalRangeRelease(&release_plan);
 }
 
 fn allocClaimedFrame(range: Range, reclaim_reason: reclaim.Reason) Error!u64 {
@@ -1122,16 +1200,28 @@ fn uncommitSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) Error!
         range.partial_uncommit_cursor
     else
         start;
-    while (virt < end) : (virt += paging.PAGE_SIZE) {
-        if (!paging.isMapped(virt)) {
+    while (virt < end) {
+        const first_frame = paging.mappedFrame(virt) orelse {
             if (skip_unmapped) {
-                advancePartialUncommitCursor(range, virt + paging.PAGE_SIZE);
+                virt += paging.PAGE_SIZE;
+                advancePartialUncommitCursor(range, virt);
                 continue;
             }
             return Error.NotCommitted;
+        };
+        const remaining_pages = (end - virt) / paging.PAGE_SIZE;
+        const max_pages = page_batch.boundedPageCount(remaining_pages);
+        const claimed_pages = blocks.claimedPhysicalPrefix(first_frame, max_pages * paging.PAGE_SIZE) / paging.PAGE_SIZE;
+        if (claimed_pages == 0) return Error.NotCommitted;
+
+        var run_pages: u64 = 1;
+        while (run_pages < claimed_pages) : (run_pages += 1) {
+            const mapped = paging.mappedFrame(virt + run_pages * paging.PAGE_SIZE) orelse break;
+            if (mapped != first_frame + run_pages * paging.PAGE_SIZE) break;
         }
-        try uncommitPage(range, virt, true);
-        advancePartialUncommitCursor(range, virt + paging.PAGE_SIZE);
+        try uncommitExtent(range, virt, .{ .base = first_frame, .count = run_pages }, true);
+        virt += run_pages * paging.PAGE_SIZE;
+        advancePartialUncommitCursor(range, virt);
     }
 }
 
@@ -1221,6 +1311,29 @@ fn uncommitPage(range: *Range, virt: u64, count_logical_commit: bool) Error!void
     if (count_logical_commit) {
         if (range.committed_bytes >= paging.PAGE_SIZE) {
             range.committed_bytes -= paging.PAGE_SIZE;
+        } else {
+            range.committed_bytes = 0;
+        }
+    }
+    blocks.commitPhysicalRangeRelease(&release_plan);
+}
+
+fn uncommitExtent(range: *Range, virt: u64, extent: phys.FrameExtent, count_logical_commit: bool) Error!void {
+    if (extent.count == 0) return Error.NotCommitted;
+    const bytes = extent.count * paging.PAGE_SIZE;
+    var release_plan: blocks.PhysicalReleasePlan = undefined;
+    blocks.preparePhysicalRangeRelease(extent.base, bytes, &release_plan) catch |err| return convertBlockError(err);
+    defer blocks.cancelPhysicalRangeRelease(&release_plan);
+    if (!paging.unmapContiguousPages(virt, extent.base, extent.count)) return Error.MapFailed;
+    phys.freeFrameExtent(extent);
+    if (range.resident_bytes >= bytes) {
+        range.resident_bytes -= bytes;
+    } else if (range.resident_bytes != 0) {
+        range.resident_bytes = 0;
+    }
+    if (count_logical_commit) {
+        if (range.committed_bytes >= bytes) {
+            range.committed_bytes -= bytes;
         } else {
             range.committed_bytes = 0;
         }

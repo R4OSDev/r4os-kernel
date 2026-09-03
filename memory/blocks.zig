@@ -816,6 +816,30 @@ const Table = struct {
         return null;
     }
 
+    fn freePhysicalPrefix(self: *Table, base: u64, max_len: u64) u64 {
+        if (max_len == 0) return 0;
+        const index = self.physicalFloor(base) orelse return 0;
+        const block = self.entries[index];
+        if (!isCanonicalFree(block) or base < block.phys_base) return 0;
+        const block_end = checkedEnd(block.phys_base, block.phys_len) orelse return 0;
+        if (base >= block_end) return 0;
+        return @min(max_len, block_end - base);
+    }
+
+    fn claimedPhysicalPrefix(self: *Table, base: u64, max_len: u64) u64 {
+        if (max_len == 0) return 0;
+        const index = self.physicalFloor(base) orelse return 0;
+        const block = self.entries[index];
+        if (!block.active() or block.kind == .free or block.status == .free or
+            block.phys_len == 0 or base < block.phys_base)
+        {
+            return 0;
+        }
+        const block_end = checkedEnd(block.phys_base, block.phys_len) orelse return 0;
+        if (base >= block_end) return 0;
+        return @min(max_len, block_end - base);
+    }
+
     fn overlapsActive(self: *Table, base: u64, len: u64, physical: bool, ignore_id: u32) bool {
         if (len == 0) return false;
         const end = checkedEnd(base, len) orelse return true;
@@ -1349,6 +1373,26 @@ pub fn claimPhysicalRange(
     const irq_flags = interrupts.saveAndDisable();
     defer interrupts.restore(irq_flags);
     return table.claimPhysicalRange(base, len, kind, owner, owner_id, name);
+}
+
+/// Returns the prefix, starting at `base`, which belongs to one canonical
+/// free physical block. VM extent allocation uses this read-only preflight to
+/// keep a PMM batch inside the same metadata transaction.
+pub fn freePhysicalPrefix(base: u64, max_len: u64) u64 {
+    if (!initialized) return 0;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    return table.freePhysicalPrefix(base, max_len);
+}
+
+/// Returns the prefix, starting at `base`, which belongs to one claimed
+/// physical block. This bounds range release plans without a second tree
+/// walk for each page.
+pub fn claimedPhysicalPrefix(base: u64, max_len: u64) u64 {
+    if (!initialized) return 0;
+    const irq_flags = interrupts.saveAndDisable();
+    defer interrupts.restore(irq_flags);
+    return table.claimedPhysicalPrefix(base, max_len);
 }
 
 pub fn releasePhysicalRange(base: u64, len: u64) Error!void {

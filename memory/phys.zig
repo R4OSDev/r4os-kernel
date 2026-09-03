@@ -14,6 +14,16 @@ pub const Stats = struct {
     bitmap_base: u64 = 0,
     double_free_errors: u64 = 0,
     bad_free_errors: u64 = 0,
+    extent_allocations: u64 = 0,
+    extent_allocated_frames: u64 = 0,
+    extent_max_frames: u64 = 0,
+    extent_frees: u64 = 0,
+    extent_freed_frames: u64 = 0,
+};
+
+pub const FrameExtent = struct {
+    base: u64,
+    count: u64,
 };
 
 // 0.56.9: PMM-Wachhunde. Ein Double-Free markiert einen IN BENUTZUNG
@@ -25,6 +35,11 @@ pub const Stats = struct {
 var double_free_errors: u64 = 0;
 var bad_free_errors: u64 = 0;
 var pmm_fault_reported: bool = false;
+var extent_allocations: u64 = 0;
+var extent_allocated_frames: u64 = 0;
+var extent_max_frames: u64 = 0;
+var extent_frees: u64 = 0;
+var extent_freed_frames: u64 = 0;
 
 fn reportPmmFault(kind: []const u8, addr: u64) void {
     if (pmm_fault_reported) return;
@@ -64,6 +79,14 @@ pub fn init() bool {
     @memset(bitmap[0..@intCast(bitmap_bytes)], 0xFF);
     free_frames = 0;
     next_hint = 0;
+    double_free_errors = 0;
+    bad_free_errors = 0;
+    pmm_fault_reported = false;
+    extent_allocations = 0;
+    extent_allocated_frames = 0;
+    extent_max_frames = 0;
+    extent_frees = 0;
+    extent_freed_frames = 0;
 
     var i: usize = 0;
     while (i < entries.len) : (i += 1) {
@@ -132,6 +155,25 @@ pub fn allocFrame() ?u64 {
         start_bit = 0;
     }
     return null;
+}
+
+/// Acquires one normal frame and then extends only across immediately
+/// following free bitmap bits. This captures natural locality without the
+/// unbounded search performed by allocContiguousFrames().
+pub fn allocFrameExtent(max_count: u64) ?FrameExtent {
+    if (max_count == 0) return null;
+    const base = allocFrame() orelse return null;
+    const start = base / FRAME_SIZE;
+    var count: u64 = 1;
+    while (count < max_count and start + count < total_frames and !isUsed(start + count)) : (count += 1) {
+        setUsed(start + count, true);
+        free_frames -= 1;
+    }
+    next_hint = start + count;
+    extent_allocations +%= 1;
+    extent_allocated_frames +%= count;
+    if (count > extent_max_frames) extent_max_frames = count;
+    return .{ .base = base, .count = count };
 }
 
 fn allocFrameLinear() ?u64 {
@@ -203,6 +245,13 @@ pub fn freeContiguousFrames(addr: u64, count: u64) void {
     if (start < next_hint) next_hint = start;
 }
 
+pub fn freeFrameExtent(extent: FrameExtent) void {
+    if (extent.count == 0) return;
+    freeContiguousFrames(extent.base, extent.count);
+    extent_frees +%= 1;
+    extent_freed_frames +%= extent.count;
+}
+
 pub fn freeFrame(addr: u64) void {
     if (!initialized) return;
     if (addr % FRAME_SIZE != 0) {
@@ -235,6 +284,11 @@ pub fn stats() Stats {
         .bitmap_base = if (initialized) virtToPhys(@intFromPtr(bitmap)) else 0,
         .double_free_errors = double_free_errors,
         .bad_free_errors = bad_free_errors,
+        .extent_allocations = extent_allocations,
+        .extent_allocated_frames = extent_allocated_frames,
+        .extent_max_frames = extent_max_frames,
+        .extent_frees = extent_frees,
+        .extent_freed_frames = extent_freed_frames,
     };
 }
 
@@ -246,6 +300,17 @@ pub fn dumpStats() void {
     k.putDec(s.free_frames);
     k.puts(" used=");
     k.putDec(s.used_frames);
+    k.puts("\r\n");
+    k.puts("  Physical extents: alloc=");
+    k.putDec(s.extent_allocations);
+    k.puts(" frames=");
+    k.putDec(s.extent_allocated_frames);
+    k.puts(" max=");
+    k.putDec(s.extent_max_frames);
+    k.puts(" free=");
+    k.putDec(s.extent_frees);
+    k.puts(" returned=");
+    k.putDec(s.extent_freed_frames);
     k.puts("\r\n");
     k.puts("  PMM bitmap: base=0x");
     k.putHex(s.bitmap_base, 16);

@@ -10,8 +10,8 @@
 //   - Committed waechst bedarfsweise (virt.commit) und ist RAM-abhaengig
 //     gedeckelt (usable/4, min 32 MB, max Fenstergroesse 1 GB) statt der
 //     alten harten 32-MB-Grenze.
-//   - Trailing-Release gibt freie Seiten am Heap-Ende zurueck, behaelt aber
-//     RELEASE_KEEP_PAGES als Hysterese gegen Commit/Uncommit-Thrash.
+//   - Geometrisches Commit und RAM-/druckabhaengige Trailing-Hysterese
+//     vermeiden Commit/Uncommit-Thrash bei begrenztem freien Randbestand.
 //
 // SMP-INVARIANTE: Der Heap yieldet und blockiert weiterhin nicht. Seine
 // Metadaten werden jedoch ueber die reentrant globale IRQ-/Legacy-Grenze
@@ -31,6 +31,9 @@
 const paging = @import("paging.zig");
 const virt = @import("virt.zig");
 const map = @import("map.zig");
+const blocks = @import("blocks.zig");
+const heap_policy = @import("heap_policy.zig");
+const phys = @import("phys.zig");
 const k = @import("../kernel/log.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const task_context = @import("../sched/task_context.zig");
@@ -40,7 +43,6 @@ const PAGE_SIZE: usize = 4096;
 const WINDOW_BYTES: usize = 1024 * 1024 * 1024;
 const CAP_MIN_BYTES: usize = 32 * 1024 * 1024;
 const MIN_COMMITTED_PAGES: usize = 1;
-const RELEASE_KEEP_PAGES: usize = 16;
 
 const GRANULE: usize = 16;
 const HEADER_SIZE: usize = 16;
@@ -76,6 +78,17 @@ pub const Stats = struct {
     size_mismatch_errors: u64 = 0,
     oom_errors: u64 = 0,
     reentry_errors: u64 = 0,
+    next_growth_pages: usize = heap_policy.min_growth_pages,
+    commit_calls: u64 = 0,
+    commit_failures: u64 = 0,
+    committed_pages_total: u64 = 0,
+    uncommit_calls: u64 = 0,
+    uncommit_failures: u64 = 0,
+    uncommitted_pages_total: u64 = 0,
+    release_suppressed: u64 = 0,
+    pressure_releases: u64 = 0,
+    poison_bytes: u64 = 0,
+    retained_tail_pages: usize = 0,
     fragmentation_hint: bool = false,
     bootstrap_bump_active: bool = false,
 };
@@ -104,6 +117,16 @@ const Control = struct {
     size_mismatch_errors: u64 = 0,
     oom_errors: u64 = 0,
     reentry_errors: u64 = 0,
+    next_growth_pages: usize = heap_policy.min_growth_pages,
+    commit_calls: u64 = 0,
+    commit_failures: u64 = 0,
+    committed_pages_total: u64 = 0,
+    uncommit_calls: u64 = 0,
+    uncommit_failures: u64 = 0,
+    uncommitted_pages_total: u64 = 0,
+    release_suppressed: u64 = 0,
+    pressure_releases: u64 = 0,
+    poison_bytes: u64 = 0,
 };
 
 var control: Control = .{};
@@ -291,6 +314,17 @@ pub fn stats() Stats {
         .size_mismatch_errors = control.size_mismatch_errors,
         .oom_errors = control.oom_errors,
         .reentry_errors = control.reentry_errors,
+        .next_growth_pages = control.next_growth_pages,
+        .commit_calls = control.commit_calls,
+        .commit_failures = control.commit_failures,
+        .committed_pages_total = control.committed_pages_total,
+        .uncommit_calls = control.uncommit_calls,
+        .uncommit_failures = control.uncommit_failures,
+        .uncommitted_pages_total = control.uncommitted_pages_total,
+        .release_suppressed = control.release_suppressed,
+        .pressure_releases = control.pressure_releases,
+        .poison_bytes = control.poison_bytes,
+        .retained_tail_pages = heap_policy.retainedTailPages(control.next_growth_pages, control.cap_pages, memoryUnderPressure()),
     };
     s.largest_free = largestFreeBlock();
     s.fragmentation_hint = s.free_blocks > 1 and s.free_bytes > s.largest_free;
@@ -337,6 +371,28 @@ pub fn dumpStats() void {
     k.putDec(@intCast(s.committed_bytes));
     k.puts(" cap=");
     k.putDec(@intCast(s.reserved_bytes));
+    k.puts("\r\n");
+
+    k.puts("  Kernel heap VM: commit_calls=");
+    k.putDec(s.commit_calls);
+    k.puts(" pages=");
+    k.putDec(s.committed_pages_total);
+    k.puts(" failures=");
+    k.putDec(s.commit_failures);
+    k.puts(" uncommit_calls=");
+    k.putDec(s.uncommit_calls);
+    k.puts(" pages=");
+    k.putDec(s.uncommitted_pages_total);
+    k.puts(" failures=");
+    k.putDec(s.uncommit_failures);
+    k.puts(" retained=");
+    k.putDec(@intCast(s.retained_tail_pages));
+    k.puts(" suppressed=");
+    k.putDec(s.release_suppressed);
+    k.puts(" pressure=");
+    k.putDec(s.pressure_releases);
+    k.puts(" poison_bytes=");
+    k.putDec(s.poison_bytes);
     k.puts("\r\n");
 
     k.puts("  Kernel heap blocks: active=");
@@ -468,7 +524,9 @@ fn releaseBlock(offset_in: usize, size_in: usize) void {
     // statt zufaellig weiterzulaufen. Kostet einen memset pro Free.
     if (size >= OVERHEAD + GRANULE) {
         const body: [*]u8 = @ptrFromInt(HEAP_BASE + @as(u64, offset) + HEADER_SIZE);
-        @memset(body[0 .. size - OVERHEAD], 0xDD);
+        const poison_len = size - OVERHEAD;
+        @memset(body[0..poison_len], 0xDD);
+        control.poison_bytes +%= poison_len;
     }
 
     const next_off = offset + size;
@@ -626,10 +684,16 @@ fn growCommitted(min_extra_bytes: usize) bool {
     if (control.committed_pages + extra_pages_min > control.cap_pages) return false;
 
     const start = committedBytes();
-    const extra_bytes = extra_pages_min * PAGE_SIZE;
-    virt.commit(control.range_id, @intCast(start), @intCast(extra_bytes)) catch return false;
-    control.committed_pages += extra_pages_min;
+    const remaining_pages = control.cap_pages - control.committed_pages;
+    var extra_pages = heap_policy.growthPages(extra_pages_min, control.next_growth_pages, remaining_pages);
+    if (!commitAdditionalPages(start, extra_pages)) {
+        if (extra_pages == extra_pages_min or !commitAdditionalPages(start, extra_pages_min)) return false;
+        extra_pages = extra_pages_min;
+    }
+    const extra_bytes = extra_pages * PAGE_SIZE;
+    control.committed_pages += extra_pages;
     control.heap_top = committedBytes();
+    control.next_growth_pages = heap_policy.nextGrowthHint(extra_pages);
 
     // Neues Freistueck mit einem freien Vorgaenger am alten Heap-Ende
     // verschmelzen, damit die Kein-Nachbar-frei-Invariante haelt.
@@ -649,22 +713,45 @@ fn growCommitted(min_extra_bytes: usize) bool {
     return true;
 }
 
+fn commitAdditionalPages(start: usize, pages: usize) bool {
+    if (pages == 0) return true;
+    control.commit_calls +%= 1;
+    virt.commit(control.range_id, @intCast(start), @intCast(pages * PAGE_SIZE)) catch {
+        control.commit_failures +%= 1;
+        return false;
+    };
+    control.committed_pages_total +%= pages;
+    return true;
+}
+
 fn releaseTrailingPages() void {
-    const keep_min = keepMinBytes();
-    if (control.heap_top <= keep_min) return;
+    const floor_bytes = MIN_COMMITTED_PAGES * PAGE_SIZE;
+    if (control.heap_top <= floor_bytes) return;
     const last_footer = word(control.heap_top - FOOTER_SIZE).*;
     if ((last_footer & 1) != 0) return;
     const last_size = blockSize(last_footer);
     const last_start = control.heap_top - last_size;
 
-    var uncommit_start = alignUp(last_start, PAGE_SIZE) orelse return;
+    const first_releasable = alignUp(last_start, PAGE_SIZE) orelse return;
+    if (first_releasable >= control.heap_top) return;
+    const free_tail_pages = (control.heap_top - first_releasable) / PAGE_SIZE;
+    const under_pressure = memoryUnderPressure();
+    const retained_pages = heap_policy.retainedTailPages(control.next_growth_pages, control.cap_pages, under_pressure);
+    if (!heap_policy.shouldReleaseTail(free_tail_pages, retained_pages, under_pressure)) {
+        control.release_suppressed +%= 1;
+        return;
+    }
+
+    const retained_bytes = retained_pages * PAGE_SIZE;
+    const retained_end = checkedAdd(last_start, retained_bytes) orelse return;
+    var uncommit_start = alignUp(retained_end, PAGE_SIZE) orelse return;
     var remainder = uncommit_start - last_start;
     if (remainder != 0 and remainder < MIN_BLOCK) {
         uncommit_start += PAGE_SIZE;
         remainder += PAGE_SIZE;
     }
-    if (uncommit_start < keep_min) {
-        uncommit_start = keep_min;
+    if (uncommit_start < floor_bytes) {
+        uncommit_start = floor_bytes;
         remainder = uncommit_start - last_start;
         if (remainder != 0 and remainder < MIN_BLOCK) {
             uncommit_start += PAGE_SIZE;
@@ -675,19 +762,25 @@ fn releaseTrailingPages() void {
 
     unlinkFree(last_start, last_size);
     const bytes = control.heap_top - uncommit_start;
+    control.uncommit_calls +%= 1;
     virt.uncommit(control.range_id, @intCast(uncommit_start), @intCast(bytes)) catch {
+        control.uncommit_failures +%= 1;
         insertFree(last_start, last_size);
         return;
     };
+    control.uncommitted_pages_total +%= bytes / PAGE_SIZE;
+    if (under_pressure) control.pressure_releases +%= 1;
     control.committed_pages = uncommit_start / PAGE_SIZE;
     control.heap_top = uncommit_start;
     if (remainder != 0) insertFree(last_start, remainder);
 }
 
-fn keepMinBytes() usize {
-    const keep = RELEASE_KEEP_PAGES * PAGE_SIZE;
-    const floor = MIN_COMMITTED_PAGES * PAGE_SIZE;
-    return if (keep < floor) floor else keep;
+fn memoryUnderPressure() bool {
+    const frame_stats = phys.stats();
+    if (frame_stats.total_frames == 0) return false;
+    const pressure_floor: u64 = 512;
+    const pressure_threshold = @max(frame_stats.total_frames / 32, pressure_floor);
+    return frame_stats.free_frames <= pressure_threshold;
 }
 
 fn largestFreeBlock() usize {
@@ -775,6 +868,92 @@ fn classifyByWalk(target: usize) ?Validation {
         off += size;
     }
     return null;
+}
+
+pub const AcceptanceProbe = struct {
+    ok: bool = false,
+    iterations: u64 = 0,
+    commit_calls: u64 = 0,
+    commit_pages: u64 = 0,
+    uncommit_calls: u64 = 0,
+    release_suppressed: u64 = 0,
+    poison_bytes: u64 = 0,
+    retained_pages: u64 = 0,
+    block_claims: u64 = 0,
+    extent_allocations: u64 = 0,
+    map_batches: u64 = 0,
+    unmap_batches: u64 = 0,
+    under_pressure: bool = false,
+};
+
+/// Short SMP-profile acceptance workload for the grow/release policy. It
+/// deliberately keeps only one medium allocation live at a time, modelling
+/// the former exact-grow/exact-trim churn without becoming a long-run test.
+pub fn acceptanceProbe() AcceptanceProbe {
+    const iterations: u64 = 16;
+    const request_bytes: usize = 192 * 1024;
+    const before = stats();
+    const blocks_before = blocks.hotPathStats();
+    const phys_before = phys.stats();
+    const paging_before = paging.stats();
+    var completed: u64 = 0;
+    while (completed < iterations) : (completed += 1) {
+        const mem = alloc(request_bytes, GRANULE) orelse break;
+        @memset(mem, @as(u8, @truncate(0x51 + completed)));
+        if (mem[0] != @as(u8, @truncate(0x51 + completed)) or
+            mem[mem.len - 1] != @as(u8, @truncate(0x51 + completed)))
+        {
+            _ = free(mem);
+            break;
+        }
+        if (free(mem) != .ok) break;
+    }
+    const after = stats();
+    const blocks_after = blocks.hotPathStats();
+    const phys_after = phys.stats();
+    const paging_after = paging.stats();
+    const commit_delta = after.commit_calls -| before.commit_calls;
+    const commit_pages_delta = after.committed_pages_total -| before.committed_pages_total;
+    const uncommit_delta = after.uncommit_calls -| before.uncommit_calls;
+    const suppressed_delta = after.release_suppressed -| before.release_suppressed;
+    const poison_delta = after.poison_bytes -| before.poison_bytes;
+    const pressure = after.retained_tail_pages == 0;
+    const block_claim_delta = blocks_after.claim_transactions -| blocks_before.claim_transactions;
+    const extent_allocation_delta = phys_after.extent_allocations -| phys_before.extent_allocations;
+    const map_batch_delta = paging_after.map_batches -| paging_before.map_batches;
+    const unmap_batch_delta = paging_after.unmap_batches -| paging_before.unmap_batches;
+    const state_restored = after.used_bytes == before.used_bytes and
+        after.active_blocks == before.active_blocks;
+    const bounded_retention = after.pages <= before.pages + heap_policy.max_growth_pages;
+    const churn_bounded = if (pressure)
+        commit_delta <= iterations and uncommit_delta <= iterations
+    else
+        commit_delta <= 2 and uncommit_delta <= 1 and suppressed_delta + uncommit_delta >= iterations;
+    const batch_accounting = paging_after.map_batch_rollbacks == paging_before.map_batch_rollbacks and
+        blocks_after.claim_rollbacks == blocks_before.claim_rollbacks and
+        ((commit_pages_delta == 0 and extent_allocation_delta == 0 and map_batch_delta == 0) or
+            (commit_pages_delta > 0 and extent_allocation_delta > 0 and map_batch_delta > 0 and
+                block_claim_delta <= commit_pages_delta));
+    const ok = completed == iterations and state_restored and bounded_retention and churn_bounded and
+        batch_accounting and
+        after.commit_failures == before.commit_failures and
+        after.uncommit_failures == before.uncommit_failures and
+        poison_delta >= @as(u64, @intCast(request_bytes)) * iterations;
+    return .{
+        .ok = ok,
+        .iterations = completed,
+        .commit_calls = commit_delta,
+        .commit_pages = commit_pages_delta,
+        .uncommit_calls = uncommit_delta,
+        .release_suppressed = suppressed_delta,
+        .poison_bytes = poison_delta,
+        .retained_pages = after.retained_tail_pages,
+        .block_claims = block_claim_delta,
+        .extent_allocations = extent_allocation_delta,
+        .map_batches = map_batch_delta,
+        .unmap_batches = unmap_batch_delta,
+        .under_pressure = pressure,
+    };
 }
 
 // ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ const idt = @import("../arch/x86_64/idt.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const lapic = @import("../arch/x86_64/lapic.zig");
 const msr = @import("../arch/x86_64/msr.zig");
+const heap = @import("../memory/heap.zig");
 const paging = @import("../memory/paging.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const phys = @import("../memory/phys.zig");
@@ -318,8 +319,9 @@ pub fn runAcceptanceProbeIfEnabled() bool {
         0
     else
         @intCast((@as(u128, sequential_ns) * 1000) / parallel_ns);
+    const heap_probe = heap.acceptanceProbe();
     const ok = failures == 0 and clock_ok and placement_mask == online_mask and observed_mask == online_mask and
-        actual_checksum == expected_checksum and speedup_milli >= ACCEPTANCE_MIN_SPEEDUP_MILLI;
+        actual_checksum == expected_checksum and speedup_milli >= ACCEPTANCE_MIN_SPEEDUP_MILLI and heap_probe.ok;
 
     probePuts("[SMPPROBE] result=");
     probePuts(if (ok) "OK" else "FAILED");
@@ -337,6 +339,33 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     probePutHex(observed_mask, 8);
     probePuts(" failures=");
     probePutDec(failures);
+    probePuts("\r\n");
+    probePuts("[HEAPPROBE] result=");
+    probePuts(if (heap_probe.ok) "OK" else "FAILED");
+    probePuts(" iterations=");
+    probePutDec(heap_probe.iterations);
+    probePuts(" commit_calls=");
+    probePutDec(heap_probe.commit_calls);
+    probePuts(" commit_pages=");
+    probePutDec(heap_probe.commit_pages);
+    probePuts(" uncommit_calls=");
+    probePutDec(heap_probe.uncommit_calls);
+    probePuts(" release_suppressed=");
+    probePutDec(heap_probe.release_suppressed);
+    probePuts(" poison_bytes=");
+    probePutDec(heap_probe.poison_bytes);
+    probePuts(" retained_pages=");
+    probePutDec(heap_probe.retained_pages);
+    probePuts(" block_claims=");
+    probePutDec(heap_probe.block_claims);
+    probePuts(" extent_allocations=");
+    probePutDec(heap_probe.extent_allocations);
+    probePuts(" map_batches=");
+    probePutDec(heap_probe.map_batches);
+    probePuts(" unmap_batches=");
+    probePutDec(heap_probe.unmap_batches);
+    probePuts(" pressure=");
+    probePuts(if (heap_probe.under_pressure) "yes" else "no");
     probePuts("\r\n");
     probePuts("[CLOCKPROBE] result=");
     probePuts(if (clock_ok) "OK" else "FAILED");

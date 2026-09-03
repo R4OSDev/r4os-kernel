@@ -1,5 +1,6 @@
 const blocks = @import("blocks.zig");
 const layout = @import("layout.zig");
+const page_batch = @import("page_batch.zig");
 const phys = @import("phys.zig");
 const k = @import("../kernel/log.zig");
 
@@ -46,6 +47,13 @@ pub const Stats = struct {
     invlpg_flushes: u64 = 0,
     map_failures: u64 = 0,
     unmap_failures: u64 = 0,
+    map_batches: u64 = 0,
+    map_batch_pages: u64 = 0,
+    map_batch_max_pages: u64 = 0,
+    map_batch_rollbacks: u64 = 0,
+    unmap_batches: u64 = 0,
+    unmap_batch_pages: u64 = 0,
+    unmap_batch_max_pages: u64 = 0,
     root_mismatches: u64 = 0,
 };
 
@@ -94,6 +102,56 @@ pub fn unmapPage(virt: u64) bool {
     pt[pti] = 0;
     stats_value.unmap_pages += 1;
     flushPage(virt);
+    return true;
+}
+
+/// Maps a small, naturally contiguous physical extent into an equally
+/// contiguous virtual range. Page-table allocation can still fail; all PTEs
+/// installed by this call are removed before failure is returned.
+pub fn mapContiguousPages(virt_base: u64, phys_base: u64, page_count: u64, flags: u64) bool {
+    if (!validBatchRange(virt_base, phys_base, page_count)) return failMap();
+    var mapped: u64 = 0;
+    while (mapped < page_count) : (mapped += 1) {
+        const offset = mapped * PAGE_SIZE;
+        if (!mapPage(virt_base + offset, phys_base + offset, flags)) {
+            var rollback = mapped;
+            while (rollback != 0) {
+                rollback -= 1;
+                _ = unmapPage(virt_base + rollback * PAGE_SIZE);
+            }
+            stats_value.map_batch_rollbacks +%= 1;
+            return false;
+        }
+    }
+    stats_value.map_batches +%= 1;
+    stats_value.map_batch_pages +%= page_count;
+    if (page_count > stats_value.map_batch_max_pages) stats_value.map_batch_max_pages = page_count;
+    return true;
+}
+
+/// Unmaps a contiguous virtual/physical extent after a complete preflight.
+/// The mutation phase is therefore infallible and cannot expose a partially
+/// unmapped range to its caller.
+pub fn unmapContiguousPages(virt_base: u64, phys_base: u64, page_count: u64) bool {
+    if (!readyForPageTableMutation() or !validBatchRange(virt_base, phys_base, page_count)) return failUnmap();
+    var checked: u64 = 0;
+    while (checked < page_count) : (checked += 1) {
+        const offset = checked * PAGE_SIZE;
+        const leaf = getLeaf(virt_base + offset) orelse return failUnmap();
+        if (leaf.huge or (leaf.entry.* & ADDR_MASK) != phys_base + offset) return failUnmap();
+    }
+
+    var unmapped: u64 = 0;
+    while (unmapped < page_count) : (unmapped += 1) {
+        const virt = virt_base + unmapped * PAGE_SIZE;
+        const leaf = getLeaf(virt) orelse unreachable;
+        leaf.entry.* = 0;
+        stats_value.unmap_pages +%= 1;
+        flushPage(virt);
+    }
+    stats_value.unmap_batches +%= 1;
+    stats_value.unmap_batch_pages +%= page_count;
+    if (page_count > stats_value.unmap_batch_max_pages) stats_value.unmap_batch_max_pages = page_count;
     return true;
 }
 
@@ -191,6 +249,21 @@ pub fn dumpStats() void {
     k.putDec(stats_value.invlpg_flushes);
     k.puts(" failures=");
     k.putDec(stats_value.map_failures + stats_value.unmap_failures);
+    k.puts("\r\n");
+    k.puts("  Paging batches: map=");
+    k.putDec(stats_value.map_batches);
+    k.puts(" pages=");
+    k.putDec(stats_value.map_batch_pages);
+    k.puts(" max=");
+    k.putDec(stats_value.map_batch_max_pages);
+    k.puts(" rollback=");
+    k.putDec(stats_value.map_batch_rollbacks);
+    k.puts(" unmap=");
+    k.putDec(stats_value.unmap_batches);
+    k.puts(" pages=");
+    k.putDec(stats_value.unmap_batch_pages);
+    k.puts(" max=");
+    k.putDec(stats_value.unmap_batch_max_pages);
     k.puts("\r\n");
     k.puts("  Paging root mismatches=");
     k.putDec(stats_value.root_mismatches);
@@ -309,6 +382,16 @@ fn failMap() bool {
 fn failUnmap() bool {
     stats_value.unmap_failures += 1;
     return false;
+}
+
+fn validBatchRange(virt_base: u64, phys_base: u64, page_count: u64) bool {
+    if (page_count == 0 or page_count > page_batch.max_extent_pages or
+        !isAligned(virt_base) or !isAligned(phys_base))
+    {
+        return false;
+    }
+    const last_offset = (page_count - 1) * PAGE_SIZE;
+    return virt_base +% last_offset >= virt_base and phys_base +% last_offset >= phys_base;
 }
 
 fn rootOwnerName(owner: RootOwner) []const u8 {

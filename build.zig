@@ -197,6 +197,8 @@ pub fn build(b: *std.Build) void {
         "fs/request_scope.zig",
         "fs/page_cache_batch.zig",
         "fs/page_cache_policy.zig",
+        "memory/heap_policy.zig",
+        "memory/page_batch.zig",
         "kernel/bootscreen_r4b_format.zig",
         "kernel/dma_segments.zig",
         "kernel/driver_work_deadline.zig",
