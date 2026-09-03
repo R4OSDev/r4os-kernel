@@ -193,7 +193,7 @@ pub fn loadCurrent() void {
 }
 
 pub export fn irqDispatch(frame: *const InterruptFrame) callconv(.c) void {
-    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     const vector = frame.vector;
     if (vector < pic.MASTER_OFFSET or vector >= pic.MASTER_OFFSET + irq_handlers.len) return;

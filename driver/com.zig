@@ -1,7 +1,8 @@
 // 16550-kompatibler UART (PC COM-Ports).
 
 const io = @import("../arch/x86_64/io.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
+const owner_locks = @import("../memory/owner_locks.zig");
+const tx_policy = @import("com_tx_policy.zig");
 
 pub const COM1: u16 = 0x3F8;
 pub const COM2: u16 = 0x2F8;
@@ -71,7 +72,7 @@ pub fn init() void {
 pub fn puts(s: []const u8) void {
     // Ueber den TX-Ring, damit Direktnutzer die Ring-Reihenfolge nicht
     // ueberholen (COM1-Log ist EIN Strom).
-    for (s) |c| logPutc(c);
+    logWrite(s);
 }
 
 // --- COM1 TX-Ring fuer den Kernel-Log-Pfad (0.56.15) ---
@@ -92,6 +93,12 @@ var tx_full_stalls: u64 = 0;
 var tx_dropped_bytes: u64 = 0;
 var tx_sync_failures: u64 = 0;
 var tx_sync_uart_available: bool = true;
+var tx_write_calls: u64 = 0;
+var tx_bulk_calls: u64 = 0;
+var tx_lock_acquisitions: u64 = 0;
+var tx_uart_status_reads: u64 = 0;
+var tx_drain_calls: u64 = 0;
+var tx_max_span: u64 = 0;
 
 pub const LogTxStats = struct {
     ring_size: u64 = TX_RING_SIZE,
@@ -103,9 +110,17 @@ pub const LogTxStats = struct {
     sync_failures: u64 = 0,
     sync_mode: bool = false,
     sync_uart_available: bool = true,
+    write_calls: u64 = 0,
+    bulk_calls: u64 = 0,
+    lock_acquisitions: u64 = 0,
+    uart_status_reads: u64 = 0,
+    drain_calls: u64 = 0,
+    max_span: u64 = 0,
 };
 
 pub fn logTxStats() LogTxStats {
+    const token = owner_locks.serial_output.acquire();
+    defer owner_locks.serial_output.release(token);
     return .{
         .pending = tx_head -% tx_tail,
         .ring_bytes = tx_ring_bytes,
@@ -115,50 +130,78 @@ pub fn logTxStats() LogTxStats {
         .sync_failures = tx_sync_failures,
         .sync_mode = tx_sync_mode,
         .sync_uart_available = tx_sync_uart_available,
+        .write_calls = tx_write_calls,
+        .bulk_calls = tx_bulk_calls,
+        .lock_acquisitions = tx_lock_acquisitions,
+        .uart_status_reads = tx_uart_status_reads,
+        .drain_calls = tx_drain_calls,
+        .max_span = tx_max_span,
     };
 }
 
 pub fn logPutc(c: u8) void {
+    const byte = [1]u8{c};
+    logWrite(byte[0..]);
+}
+
+// Normal runtime strings enter the serial owner once, append the complete
+// memory span and perform at most one opportunistic FIFO drain.  The UART
+// line-status register is therefore sampled per span instead of per byte.
+pub fn logWrite(data: []const u8) void {
+    if (data.len == 0) return;
+    const flags = owner_locks.serial_output.acquire();
+    defer owner_locks.serial_output.release(flags);
+    tx_write_calls +%= 1;
+    if (data.len > 1) tx_bulk_calls +%= 1;
+    tx_lock_acquisitions +%= 1;
+    tx_max_span = @max(tx_max_span, @as(u64, @intCast(data.len)));
     if (tx_sync_mode) {
-        if (writeSyncByte(c)) {
-            tx_sync_bytes +%= 1;
-        } else {
-            tx_dropped_bytes +%= 1;
+        for (data) |byte| {
+            if (writeSyncByte(byte)) {
+                tx_sync_bytes +%= 1;
+            } else {
+                tx_dropped_bytes +%= 1;
+            }
         }
         return;
     }
-    const flags = interrupts.saveAndDisableFor(.driver);
-    defer interrupts.restore(flags);
-    if (tx_head -% tx_tail >= TX_RING_SIZE) {
-        // Normaler Runtime-Log darf niemals mit deaktivierten IRQs auf
-        // Hardware warten. Erst genau einen nichtblockierenden Drain
-        // versuchen, dann bei weiter voller Queue das aelteste Byte opfern.
-        tx_full_stalls +%= 1;
+
+    // Make one bounded attempt before admitting the span.  If the producer
+    // outruns the fixed ring, preserve the newest byte stream exactly as the
+    // former byte path did, while accounting every overwritten byte.
+    var drained = false;
+    if (data.len > TX_RING_SIZE -| (tx_head -% tx_tail)) {
         drainLocked();
-        if (tx_head -% tx_tail >= TX_RING_SIZE) {
-            tx_tail +%= 1;
-            tx_dropped_bytes +%= 1;
-        }
+        drained = true;
     }
-    tx_ring[tx_head & (TX_RING_SIZE - 1)] = c;
-    tx_head +%= 1;
-    tx_ring_bytes +%= 1;
-    drainLocked();
+    const admission = tx_policy.planAdmission(tx_head -% tx_tail, TX_RING_SIZE, data.len);
+    const dropped = admission.dropped();
+    if (dropped != 0) {
+        tx_full_stalls +%= dropped;
+        tx_dropped_bytes +%= dropped;
+        tx_tail +%= admission.drop_existing;
+    }
+    for (data[admission.skip_input..]) |byte| {
+        tx_ring[tx_head & (TX_RING_SIZE - 1)] = byte;
+        tx_head +%= 1;
+        tx_ring_bytes +%= 1;
+    }
+    if (!drained) drainLocked();
 }
 
 // Opportunistischer Drain fuer Timer-Tick/Idle: nicht blockierend.
 pub fn logDrain() void {
     if (tx_tail == tx_head) return;
-    const flags = interrupts.saveAndDisableFor(.driver);
-    defer interrupts.restore(flags);
+    const flags = owner_locks.serial_output.acquire();
+    defer owner_locks.serial_output.release(flags);
     drainLocked();
 }
 
 // Synchron leeren (Poweroff-/Abschluss-Pfad), solange der UART fortschreitet.
 // Ein einmal erkannter Hardwarestillstand verwirft den Rest statt zu haengen.
 pub fn logFlushSync() void {
-    const flags = interrupts.saveAndDisableFor(.driver);
-    defer interrupts.restore(flags);
+    const flags = owner_locks.serial_output.acquire();
+    defer owner_locks.serial_output.release(flags);
     while (tx_tail != tx_head) {
         if (!drainSyncBurst()) {
             tx_dropped_bytes +%= tx_head -% tx_tail;
@@ -170,15 +213,20 @@ pub fn logFlushSync() void {
 
 // Crash-Pfad: erst Ring leeren, danach jede Ausgabe direkt/synchron.
 pub fn logEnterSyncMode() void {
+    const flags = owner_locks.serial_output.acquire();
+    defer owner_locks.serial_output.release(flags);
     tx_sync_mode = true;
     logFlushSync();
 }
 
 fn drainLocked() void {
+    tx_drain_calls +%= 1;
     if (tx_tail == tx_head) return;
+    tx_uart_status_reads +%= 1;
     if ((io.inb(COM1 + 5) & 0x20) == 0) return; // THR nicht frei
+    const count = tx_policy.drainCount(tx_head -% tx_tail, true, UART_FIFO_DEPTH);
     var burst: usize = 0;
-    while (burst < UART_FIFO_DEPTH and tx_tail != tx_head) : (burst += 1) {
+    while (burst < count) : (burst += 1) {
         io.outb(COM1, tx_ring[tx_tail & (TX_RING_SIZE - 1)]);
         tx_tail +%= 1;
     }
@@ -187,6 +235,7 @@ fn drainLocked() void {
 fn drainSyncBurst() bool {
     if (!tx_sync_uart_available) return false;
     var spins: usize = 0;
+    tx_uart_status_reads +%= 1;
     while ((io.inb(COM1 + 5) & 0x20) == 0) : (spins += 1) {
         if (spins >= TX_READY_TIMEOUT) {
             tx_sync_uart_available = false;
@@ -205,6 +254,7 @@ fn drainSyncBurst() bool {
 fn writeSyncByte(c: u8) bool {
     if (!tx_sync_uart_available) return false;
     var spins: usize = 0;
+    tx_uart_status_reads +%= 1;
     while ((io.inb(COM1 + 5) & 0x20) == 0) : (spins += 1) {
         if (spins >= TX_READY_TIMEOUT) {
             tx_sync_uart_available = false;

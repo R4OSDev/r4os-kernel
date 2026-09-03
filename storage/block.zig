@@ -3,7 +3,7 @@ const block_dispatch = @import("block_dispatch.zig");
 const block_split = @import("block_split.zig");
 const drive = @import("../fs/drive.zig");
 const heap = @import("../memory/heap.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
+const owner_locks = @import("../memory/owner_locks.zig");
 const k = @import("../kernel/log.zig");
 const std = @import("std");
 const scheduler = @import("../sched/scheduler.zig");
@@ -464,10 +464,10 @@ fn startControllerWorker(lane: u8, critical: bool) bool {
 }
 
 pub fn register(device: Device) ?usize {
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
+    const irq_flags = owner_locks.storage.acquire();
     const result = registerLocked(device);
     const controller_lane = if (result) |index| devices[index].device.controller_lane else block_dispatch.no_lane;
-    interrupts.restore(irq_flags);
+    owner_locks.storage.release(irq_flags);
     if (result != null) {
         if (runtimeWorkerIdentityAlive() and !controllerWorkerAlive(controller_lane)) {
             if (!startControllerWorker(controller_lane, false)) {
@@ -582,8 +582,8 @@ pub fn cancelUnregister(token: *UnregisterToken) bool {
 }
 
 fn preparedSlot(index: usize, generation: u64) ?*DeviceSlot {
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(irq_flags);
     if (index >= device_slot_count) return null;
     const slot = &devices[index];
     if (!slot.used or !slot.retiring or slot.retire_generation != generation) return null;
@@ -591,8 +591,8 @@ fn preparedSlot(index: usize, generation: u64) ?*DeviceSlot {
 }
 
 fn beginRetirement(index: usize) ?*DeviceSlot {
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(irq_flags);
     if (index >= device_slot_count) return null;
     const slot = &devices[index];
     if (!slot.used or slot.retiring) return null;
@@ -611,14 +611,14 @@ fn beginRetirement(index: usize) ?*DeviceSlot {
 }
 
 fn cancelRetirement(slot: *DeviceSlot) void {
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(irq_flags);
     if (slot.used) slot.retiring = false;
 }
 
 fn commitRetirement(slot: *DeviceSlot) bool {
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(irq_flags);
     if (!slot.used or !slot.retiring or slot.pin_count != 0) return false;
     const retired_lane = slot.device.controller_lane;
     slot.used = false;
@@ -655,8 +655,8 @@ fn hasMountedDrive(block_index: usize) bool {
 }
 
 pub fn findByName(name: []const u8) ?usize {
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(irq_flags);
     return findByNameLocked(name);
 }
 
@@ -682,8 +682,8 @@ pub fn maxDevices() usize {
 }
 
 pub fn get(index: usize) ?*const Device {
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(irq_flags);
     if (index >= device_slot_count or !devices[index].used or devices[index].retiring) return null;
     return &devices[index].device;
 }
@@ -692,29 +692,29 @@ fn pinDevice(index: usize) ?DevicePin {
     const unwind = task_context.enterUnwind();
     if (!unwind.admitted()) return null;
 
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
+    const irq_flags = owner_locks.storage.acquire();
     if (index >= device_slot_count or
         !devices[index].used or
         devices[index].retiring or
         devices[index].pin_count == 0xFFFF_FFFF)
     {
-        interrupts.restore(irq_flags);
+        owner_locks.storage.release(irq_flags);
         _ = task_context.leaveUnwind(unwind);
         return null;
     }
     const slot = &devices[index];
     slot.pin_count += 1;
     const device = &slot.device;
-    interrupts.restore(irq_flags);
+    owner_locks.storage.release(irq_flags);
     return .{ .slot = slot, .device = device, .unwind = unwind };
 }
 
 fn unpinDevice(pin: *DevicePin) void {
     if (!pin.active) return;
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
+    const irq_flags = owner_locks.storage.acquire();
     if (pin.slot.pin_count != 0) pin.slot.pin_count -= 1;
     pin.active = false;
-    interrupts.restore(irq_flags);
+    owner_locks.storage.release(irq_flags);
     _ = task_context.leaveUnwind(pin.unwind);
 }
 
@@ -1195,9 +1195,9 @@ fn takeReadyCompletion(device: *Device) ?ReadyCompletion {
     while (index < device.request_slots.len) : (index += 1) {
         const slot = &device.request_slots[index];
         if (slot.state != .active or slot.backend_handle == 0) continue;
-        const irq_flags = interrupts.saveAndDisableFor(.storage);
+        const irq_flags = owner_locks.storage.acquire();
         const completion = slot.completion_latch.take();
-        interrupts.restore(irq_flags);
+        owner_locks.storage.release(irq_flags);
         if (completion) |value| {
             const request = executionFromSlot(index, slot.*);
             unlockDevice(device, locked);
@@ -1233,12 +1233,12 @@ fn submitAsyncRequest(device: *Device, request: RequestExecution, submit: AsyncS
     // A backend may complete inline before returning. Completion owns the
     // terminal result in that race; otherwise the nonzero submit result means
     // hardware never acquired the request or its buffer.
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
+    const irq_flags = owner_locks.storage.acquire();
     const rejected = if (request.slot_index < device.request_slots.len)
         device.request_slots[request.slot_index].completion_latch.rejectSubmission(request.backend_handle)
     else
         false;
-    interrupts.restore(irq_flags);
+    owner_locks.storage.release(irq_flags);
     if (!rejected) return;
     finishRequest(device, request, false, if (submit_result > 0) .busy else backendErrorForKind(request.kind));
 }
@@ -1393,11 +1393,11 @@ pub fn asyncBackendComplete(handle: u64, result: i32, bytes: u32) callconv(.c) v
         return;
     }
 
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
+    const irq_flags = owner_locks.storage.acquire();
     const device_slot = &devices[device_index];
     if (!device_slot.used) {
         runtime_summary.late_completions +%= 1;
-        interrupts.restore(irq_flags);
+        owner_locks.storage.release(irq_flags);
         return;
     }
     const device = &device_slot.device;
@@ -1405,17 +1405,17 @@ pub fn asyncBackendComplete(handle: u64, result: i32, bytes: u32) callconv(.c) v
     if (slot.state != .active or slot.backend_handle != handle) {
         device.stats.late_completions +%= 1;
         runtime_summary.late_completions +%= 1;
-        interrupts.restore(irq_flags);
+        owner_locks.storage.release(irq_flags);
         return;
     }
     if (!slot.completion_latch.publish(handle, result, bytes)) {
         device.stats.duplicate_completions +%= 1;
         runtime_summary.duplicate_completions +%= 1;
-        interrupts.restore(irq_flags);
+        owner_locks.storage.release(irq_flags);
         return;
     }
     const lane = effectiveWorkerLane(device.controller_lane);
-    interrupts.restore(irq_flags);
+    owner_locks.storage.release(irq_flags);
     if (lane != block_dispatch.no_lane) {
         runtime_summary.worker_wakeups +%= 1;
         controller_runtime[lane].event.signal();
@@ -1461,9 +1461,9 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
         unlockDevice(device, locked);
         return;
     }
-    const irq_flags = interrupts.saveAndDisableFor(.storage);
+    const irq_flags = owner_locks.storage.acquire();
     slot.completion_latch.invalidate();
-    interrupts.restore(irq_flags);
+    owner_locks.storage.release(irq_flags);
     // Only the exact live execution owns one active count. A stale or double
     // completion must not make quiescence visible while real I/O still runs.
     if (device.active_executions != 0) device.active_executions -= 1;

@@ -23,6 +23,7 @@ const protocol_registry = @import("../protocol/registry.zig");
 const r4p = @import("../program/r4p.zig");
 const r4p_contract = @import("r4p_contract.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
+const owner_locks = @import("../memory/owner_locks.zig");
 const pci_inventory = @import("../platform/pci_inventory.zig");
 const time_core = @import("../platform/time.zig");
 const kernel_config = @import("config");
@@ -1823,15 +1824,15 @@ const NET_LOSS_EVERY_N: u64 = 64;
 var net_loss_counter: u64 = 0;
 var net_loss_drops: u64 = 0;
 
-fn rxEnterCritical() u64 {
-    const irq_flags = interrupts.saveAndDisableFor(.network);
+fn rxEnterCritical() owner_locks.Token {
+    const irq_flags = owner_locks.network.acquire();
     scheduler.preemptDisable();
     return irq_flags;
 }
 
-fn rxLeaveCritical(irq_flags: u64) void {
+fn rxLeaveCritical(irq_flags: owner_locks.Token) void {
     scheduler.preemptEnable();
-    interrupts.restore(irq_flags);
+    owner_locks.network.release(irq_flags);
 }
 
 /// Announces device-owned RX work without touching a packet buffer. This is

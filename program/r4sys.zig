@@ -10,6 +10,7 @@ const upc = @import("upload_publish_claim");
 const bootlog = @import("../kernel/bootlog.zig");
 const heap = @import("../memory/heap.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
+const owner_locks = @import("../memory/owner_locks.zig");
 const k = @import("../kernel/log.zig");
 const power = @import("../arch/x86_64/power.zig");
 const reset = @import("../arch/x86_64/reset.zig");
@@ -289,7 +290,7 @@ var stream_generation: u32 = 1;
 
 // The filesystem request gates are volume-local, while StreamSlot storage is
 // shared by every volume. Keep the small allocation/owner projection behind
-// the kernel's IRQ/SMP serialization boundary. Lifecycle cleanup can then
+// the program-state owner. Lifecycle cleanup can then
 // discover the exact occupied volume lanes without reading mutable slot
 // payloads from unrelated lanes or acquiring all 26 filesystem gates.
 const StreamSlotOwnership = struct {
@@ -464,8 +465,8 @@ pub fn timeSetState(request: *const time_core.State) callconv(.c) i32 {
 }
 
 pub fn bootLogInfo(out: *BootLogInfo) callconv(.c) i32 {
-    const flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(flags);
+    const flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(flags);
     out.* = .{
         .capacity = @intCast(bootlog.capacity()),
         .length = @intCast(bootlog.length()),
@@ -478,8 +479,8 @@ pub fn bootLogInfo(out: *BootLogInfo) callconv(.c) i32 {
 }
 
 pub fn bootLogRead(offset: u32, out: [*]u8, capacity_value: u32) callconv(.c) i32 {
-    const flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(flags);
+    const flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(flags);
     if (capacity_value == 0) return 0;
     const len = bootlog.length();
     const offset_usize: usize = @intCast(offset);
@@ -3423,8 +3424,8 @@ fn reapDeadStreamSlots() void {
 }
 
 fn reserveStreamSlot(drive_letter: u8, owner: ?StreamOwner) ?*StreamSlot {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     var i: usize = 0;
     while (i < stream_slots.len) : (i += 1) {
         if (stream_slot_ownership[i].reserved) continue;
@@ -3443,8 +3444,8 @@ fn reserveStreamSlot(drive_letter: u8, owner: ?StreamOwner) ?*StreamSlot {
 }
 
 fn releaseStreamSlotOwnership(slot: *StreamSlot) void {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     var i: usize = 0;
     while (i < stream_slots.len) : (i += 1) {
         if (&stream_slots[i] != slot) continue;
@@ -3560,8 +3561,8 @@ fn streamSlotMatchesCleanup(slot: *const StreamSlot, cleanup: StreamCleanupOwner
 }
 
 fn streamCleanupPlan(cleanup: StreamCleanupOwner) StreamCleanupPlan {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     var plan: StreamCleanupPlan = .{};
     var i: usize = 0;
     while (i < stream_slot_ownership.len) : (i += 1) {
@@ -3578,8 +3579,8 @@ fn streamCleanupPlan(cleanup: StreamCleanupOwner) StreamCleanupPlan {
 
 fn streamOwnershipStillMatches(index: usize, lane: u8, cleanup: StreamCleanupOwner) bool {
     if (index >= stream_slot_ownership.len) return false;
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     const owner = &stream_slot_ownership[index];
     return streamOwnershipMatches(owner, cleanup) and
         streamDriveLane(owner.drive_letter) == lane;

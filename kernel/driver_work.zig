@@ -1,5 +1,5 @@
-const interrupts = @import("../arch/x86_64/interrupts.zig");
 const monotonic = @import("../platform/monotonic.zig");
+const owner_locks = @import("../memory/owner_locks.zig");
 const irq_router = @import("irq_router.zig");
 const sched_task = @import("../sched/task.zig");
 const scheduler = @import("../sched/scheduler.zig");
@@ -302,7 +302,7 @@ const WorkItem = struct {
 const OwnerCurrent = work_queue.OwnerBookkeeping;
 
 const CriticalGuard = struct {
-    irq_flags: u64,
+    lock_token: owner_locks.Token,
     started_at: monotonic.Stamp,
     from_irq: bool,
 };
@@ -1427,9 +1427,9 @@ fn isFinal(state: work_queue.State) bool {
 
 fn enterCritical() CriticalGuard {
     const from_irq = irq_router.inDispatch();
-    const irq_flags = interrupts.saveAndDisableFor(.driver);
+    const irq_flags = owner_locks.driver_work.acquire();
     return .{
-        .irq_flags = irq_flags,
+        .lock_token = irq_flags,
         .started_at = monotonic.capture(),
         .from_irq = from_irq,
     };
@@ -1447,7 +1447,7 @@ fn leaveCritical(guard: CriticalGuard, owner: u32) void {
     } else {
         addMetric(owner, "critical_timing_unavailable", 1);
     }
-    interrupts.restore(guard.irq_flags);
+    owner_locks.driver_work.release(guard.lock_token);
 }
 
 fn elapsedTicks(start: u64, end: u64) u64 {

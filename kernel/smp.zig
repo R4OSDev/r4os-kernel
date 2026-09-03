@@ -12,6 +12,7 @@ const boot_config = @import("boot_config.zig");
 const config = @import("config");
 const fpu = @import("../arch/x86_64/fpu.zig");
 const gdt = @import("../arch/x86_64/gdt.zig");
+const com = @import("../driver/com.zig");
 const idt = @import("../arch/x86_64/idt.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const lapic = @import("../arch/x86_64/lapic.zig");
@@ -43,6 +44,7 @@ const AP_STOP_TIMEOUT_NS: u64 = 100_000_000;
 const ACCEPTANCE_TIMEOUT_NS: u64 = 10_000_000_000;
 const ACCEPTANCE_ITERATIONS: u64 = 4_000_000;
 const ACCEPTANCE_MIN_SPEEDUP_MILLI: u64 = 1050;
+const OWNER_STRESS_ITERATIONS: u64 = 64;
 const TLB_PROBE_OLD: u64 = 0x544C_422D_4F4C_4421;
 const TLB_PROBE_NEW: u64 = 0x544C_422D_4E45_5721;
 const TRANSITION_CODE_SELECTOR: u16 = 0x08;
@@ -115,6 +117,8 @@ var acceptance_tlb_phase: u8 = 0;
 var acceptance_tlb_ready_mask: u64 = 0;
 var acceptance_tlb_updated_mask: u64 = 0;
 var acceptance_tlb_failures: u32 = 0;
+var acceptance_owner_done_mask: u64 = 0;
+var acceptance_owner_failures: u32 = 0;
 var acceptance_retire_release: u8 = 0;
 
 pub fn initBsp() void {
@@ -165,7 +169,7 @@ pub fn startApplicationProcessors(info: acpi.Info) bool {
         .disabled = topology.disabled,
     };
     @atomicStore(bool, &release_aps, false, .release);
-    if (topology.count > 1) interrupts.enableLegacySerialization();
+    if (topology.count > 1) interrupts.enableRuntimeSerialization();
 
     var index: u32 = 1;
     while (index < topology.count) : (index += 1) {
@@ -368,6 +372,8 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     @atomicStore(u64, &acceptance_tlb_ready_mask, 0, .release);
     @atomicStore(u64, &acceptance_tlb_updated_mask, 0, .release);
     @atomicStore(u32, &acceptance_tlb_failures, 0, .release);
+    @atomicStore(u64, &acceptance_owner_done_mask, 0, .release);
+    @atomicStore(u32, &acceptance_owner_failures, 0, .release);
     @atomicStore(u8, &acceptance_retire_release, 0, .release);
     defer @atomicStore(u8, &acceptance_retire_release, 1, .release);
 
@@ -504,15 +510,22 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     tlb_cleanup_pending = false;
     @atomicStore(u8, &acceptance_retire_release, 1, .release);
     const tlb_stats = tlb.stats();
-    const legacy_stats = interrupts.legacyStats();
+    const runtime_stats = interrupts.runtimeStats();
     const owner_stats = owner_locks.combinedStats();
-    const lock_ok = legacy_stats.unclassified_acquisitions == 0 and owner_stats.order_violations == 0;
+    const owner_done_mask = @atomicLoad(u64, &acceptance_owner_done_mask, .acquire);
+    const owner_failures = @atomicLoad(u32, &acceptance_owner_failures, .acquire);
+    const lock_ok = runtime_stats.legacy_global_acquisitions == 0 and owner_stats.order_violations == 0 and
+        owner_failures == 0 and (owner_done_mask & online_mask) == online_mask;
+    const serial_stats = com.logTxStats();
+    const serial_ok = serial_stats.bulk_calls != 0 and serial_stats.max_span > 1 and
+        serial_stats.lock_acquisitions == serial_stats.write_calls and
+        serial_stats.uart_status_reads < serial_stats.ring_bytes and serial_stats.dropped_bytes == 0;
     const tlb_ok = tlb_runtime_ok and tlb_cleanup_ok and tlb_worker_failures == 0 and
         (tlb_ready_mask & online_mask) == online_mask and (tlb_updated_mask & online_mask) == online_mask and
         tlb_stats.timeouts == tlb_stats.expected_timeouts and tlb_stats.successes != 0;
     const ok = failures == 0 and clock_ok and placement_mask == online_mask and observed_mask == online_mask and
         actual_checksum == expected_checksum and speedup_milli >= ACCEPTANCE_MIN_SPEEDUP_MILLI and heap_probe.ok and
-        tlb_ok and lock_ok;
+        tlb_ok and lock_ok and serial_ok;
 
     probePuts("[SMPPROBE] result=");
     probePuts(if (ok) "OK" else "FAILED");
@@ -589,28 +602,53 @@ pub fn runAcceptanceProbeIfEnabled() bool {
     probePuts("\r\n");
     probePuts("[LOCKPROBE] result=");
     probePuts(if (lock_ok) "OK" else "FAILED");
-    probePuts(" legacy_acquisitions=");
-    probePutDec(legacy_stats.acquisitions);
+    probePuts(" runtime_acquisitions=");
+    probePutDec(runtime_stats.acquisitions);
     probePuts(" nested=");
-    probePutDec(legacy_stats.nested_acquisitions);
+    probePutDec(runtime_stats.nested_acquisitions);
     probePuts(" collisions=");
-    probePutDec(legacy_stats.collisions);
+    probePutDec(runtime_stats.collisions);
     probePuts(" cpu_collisions=");
-    probePutDec(legacy_stats.cpu_collisions);
+    probePutDec(runtime_stats.cpu_collisions);
     probePuts(" wait_spins=");
-    probePutDec(legacy_stats.wait_spins);
+    probePutDec(runtime_stats.wait_spins);
     probePuts(" max_wait=");
-    probePutDec(legacy_stats.max_wait_spins);
+    probePutDec(runtime_stats.max_wait_spins);
     probePuts(" max_hold_cycles=");
-    probePutDec(legacy_stats.max_hold_cycles);
-    probePuts(" unclassified=");
-    probePutDec(legacy_stats.unclassified_acquisitions);
-    probePuts(" classified_classes=11 owner_classes=3 owner_acquisitions=");
+    probePutDec(runtime_stats.max_hold_cycles);
+    probePuts(" legacy_global=");
+    probePutDec(runtime_stats.legacy_global_acquisitions);
+    probePuts(" runtime_owner_classes=1 owner_classes=");
+    probePutDec(owner_locks.class_count);
+    probePuts(" owner_acquisitions=");
     probePutDec(owner_stats.acquisitions);
     probePuts(" owner_collisions=");
     probePutDec(owner_stats.collisions);
     probePuts(" order_violations=");
     probePutDec(owner_stats.order_violations);
+    probePuts(" stress_iterations=");
+    probePutDec(OWNER_STRESS_ITERATIONS * @as(u64, online_count));
+    probePuts(" stress_mask=0x");
+    probePutHex(owner_done_mask, 8);
+    probePuts(" stress_failures=");
+    probePutDec(owner_failures);
+    probePuts("\r\n");
+    probePuts("[SERIALPROBE] result=");
+    probePuts(if (serial_ok) "OK" else "FAILED");
+    probePuts(" write_calls=");
+    probePutDec(serial_stats.write_calls);
+    probePuts(" bulk_calls=");
+    probePutDec(serial_stats.bulk_calls);
+    probePuts(" lock_acquisitions=");
+    probePutDec(serial_stats.lock_acquisitions);
+    probePuts(" status_reads=");
+    probePutDec(serial_stats.uart_status_reads);
+    probePuts(" ring_bytes=");
+    probePutDec(serial_stats.ring_bytes);
+    probePuts(" max_span=");
+    probePutDec(serial_stats.max_span);
+    probePuts(" dropped=");
+    probePutDec(serial_stats.dropped_bytes);
     probePuts("\r\n");
     probePuts("[CLOCKPROBE] result=");
     probePuts(if (clock_ok) "OK" else "FAILED");
@@ -859,6 +897,7 @@ fn acceptanceWorkerMain() callconv(.c) void {
             }
             _ = @atomicRmw(u64, &acceptance_tlb_updated_mask, .Or, bit, .acq_rel);
             while (@atomicLoad(u8, &acceptance_tlb_phase, .acquire) < 3) scheduler.yield();
+            runOwnerStress(cpu_index, bit);
             const start_ns = monotonic.nowNanoseconds() orelse 0;
             const start_tick = timer.tickCount();
             var prior_ns = start_ns;
@@ -889,6 +928,26 @@ fn acceptanceWorkerMain() callconv(.c) void {
     while (@atomicLoad(u8, &acceptance_retire_release, .acquire) == 0) scheduler.yield();
 }
 
+fn runOwnerStress(cpu_index: u32, bit: u64) void {
+    var iteration: u64 = 0;
+    while (iteration < OWNER_STRESS_ITERATIONS) : (iteration += 1) {
+        const size: usize = @intCast(64 + ((iteration + cpu_index) & 7) * 32);
+        const memory = heap.alloc(size, 16) orelse {
+            _ = @atomicRmw(u32, &acceptance_owner_failures, .Add, 1, .acq_rel);
+            continue;
+        };
+        const witness: u8 = @truncate(iteration ^ cpu_index);
+        memory[0] = witness;
+        memory[memory.len - 1] = ~witness;
+        const content_ok = memory[0] == witness and memory[memory.len - 1] == ~witness;
+        const free_result = heap.free(memory);
+        if (!content_ok or free_result != .ok) {
+            _ = @atomicRmw(u32, &acceptance_owner_failures, .Add, 1, .acq_rel);
+        }
+    }
+    _ = @atomicRmw(u64, &acceptance_owner_done_mask, .Or, bit, .acq_rel);
+}
+
 fn acceptanceWork(cpu_index: u32) u64 {
     var value = @as(u64, cpu_index) *% 0x9E37_79B9_7F4A_7C15 +% 0xD1B5_4A32_D192_ED03;
     var iteration: u64 = 0;
@@ -914,7 +973,7 @@ fn acceptanceFail(reason: []const u8) bool {
 // fixed public 64-KiB bootlog ring whose early loader diagnostics are queried
 // later by LOADERD.
 fn probePuts(text: []const u8) void {
-    for (text) |ch| k.serialPutcRaw(ch);
+    k.serialWriteRaw(text);
 }
 
 fn probePutDec(value: u64) void {

@@ -1,5 +1,5 @@
 const serial = @import("../driver/com.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
+const owner_locks = @import("../memory/owner_locks.zig");
 const protocol_api = @import("../kernel/protocol_api.zig");
 const time_core = @import("../platform/time.zig");
 const r4p = @import("../program/r4p.zig");
@@ -139,8 +139,8 @@ pub fn sendMessage(payload: []const u8) bool {
 }
 
 pub fn snapshot(out: *Snapshot) void {
-    const flags = interrupts.saveAndDisableFor(.network);
-    defer interrupts.restore(flags);
+    const flags = owner_locks.network.acquire();
+    defer owner_locks.network.release(flags);
     out.* = .{
         .present = state.present,
         .initialized = state.initialized,
@@ -177,8 +177,8 @@ pub fn snapshot(out: *Snapshot) void {
 }
 
 pub fn takeMessage(out: *Message) bool {
-    const flags = interrupts.saveAndDisableFor(.network);
-    defer interrupts.restore(flags);
+    const flags = owner_locks.network.acquire();
+    defer owner_locks.network.release(flags);
     return state.message_queue.pop(out);
 }
 
@@ -288,12 +288,12 @@ fn applyR4slFrame(op: r4p_contract.R4slOp) void {
     state.last_payload_len = @intCast(payload_len);
     if (payload_len != 0) @memcpy(state.last_payload[0..payload_len], op.payload[0..payload_len]);
     if (op.frame_type == TYPE_MESSAGE) {
-        const flags = interrupts.saveAndDisableFor(.network);
+        const flags = owner_locks.network.acquire();
         state.message_rx +%= 1;
         state.last_message_len = @intCast(payload_len);
         if (payload_len != 0) @memcpy(state.last_message[0..payload_len], op.payload[0..payload_len]);
         const queued = state.message_queue.push(op.payload[0..payload_len]);
-        interrupts.restore(flags);
+        owner_locks.network.release(flags);
         if (!queued) {
             state.overflows +%= 1;
             state.last_error = "message-queue-full";

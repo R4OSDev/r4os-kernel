@@ -242,7 +242,7 @@ pub fn frequency() u32 {
 }
 
 pub fn enableDeadlineScheduling() bool {
-    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     deadline_enabled = backend != .pit and modern_counter_frequency_hz != 0;
     deadline_mode = .periodic;
@@ -251,7 +251,7 @@ pub fn enableDeadlineScheduling() bool {
 }
 
 pub fn enterIdleDeadline(requested_deadline: u64) bool {
-    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     if (!deadline_enabled or backend == .pit) return false;
 
@@ -297,7 +297,7 @@ pub fn enterIdleDeadline(requested_deadline: u64) bool {
 }
 
 pub fn leaveIdleDeadline() bool {
-    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     if (deadline_mode != .one_shot_idle) return backend != .pit;
 
@@ -328,7 +328,7 @@ fn disarmOneShotBackend() void {
 }
 
 pub fn deadlineStats() DeadlineStats {
-    const irq_flags = interrupts.saveAndDisableFor(.interrupt);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     return .{
         .enabled = deadline_enabled,

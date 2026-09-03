@@ -683,9 +683,9 @@ fn allocClaimedFrame(range: Range, reclaim_reason: reclaim.Reason) Error!u64 {
             if (!reclaimed) {
                 reclaimed = true;
                 // Reclaimers may reach filesystem/block I/O and yield.  The
-                // transitional SMP owner boundary is deliberately no-sleep;
-                // callers holding it fail with controlled OOM instead of
-                // lending the global owner lock across a context switch.
+                // VM owner boundary is deliberately no-sleep; callers
+                // holding it fail with controlled OOM instead of lending the
+                // owner across a context switch.
                 if (owner_locks.virtual_memory.heldByCurrent()) return Error.OutOfMemory;
                 if (reclaim.reclaimFrames(reclaim_reason, 1).returned_frames > 0) {
                     attempts = 0;
@@ -742,8 +742,8 @@ pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_
     if (pageStateForFaultInRange(range, page_index)) |fault_state| {
         if ((fault_state.flags & page_state_flag_slot_bound) != 0) {
             // Backing I/O may sleep. Pageable VM remains a BSP owner in the
-            // SMP foundation; release the transitional no-sleep boundary and
-            // retain the existing busy/generation/lifecycle transaction.
+            // SMP foundation; release the VM owner and retain the existing
+            // busy/generation/lifecycle transaction.
             if (percpu.currentIndex() != 0) {
                 recordDemandFaultFailure(range);
                 return false;
@@ -1812,7 +1812,7 @@ pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32) rec
     var result = reclaim.SourceResult{};
     if (!initialized) return result;
     // The pager transaction intentionally spans filesystem/block waits and
-    // therefore cannot hold the transitional saveAndDisable owner lock.
+    // therefore cannot hold the VM owner.
     // Normal VM and lifecycle work remains BSP-owned; AP callers fail closed.
     if (percpu.currentIndex() != 0) {
         result.failures = 1;

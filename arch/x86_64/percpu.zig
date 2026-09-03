@@ -25,7 +25,7 @@ pub const CpuLocal = extern struct {
     apic_id: u32 = 0,
     state: u8 = @intFromEnum(State.absent),
     reserved0: [3]u8 = .{0} ** 3,
-    legacy_critical_depth: u32 = 0,
+    runtime_critical_depth: u32 = 0,
     scheduler_ready: u8 = 0,
     work_active: u8 = 0,
     reserved: [46]u8 = .{0} ** 46,
@@ -183,6 +183,6 @@ pub fn productiveR4xMask() u64 {
     return @atomicLoad(u64, &productive_r4x_mask, .acquire);
 }
 
-pub fn legacyCriticalDepth() *u32 {
-    return &current().legacy_critical_depth;
+pub fn runtimeCriticalDepth() *u32 {
+    return &current().runtime_critical_depth;
 }

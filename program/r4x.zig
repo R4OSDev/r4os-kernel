@@ -22,7 +22,7 @@ const boot_config = @import("../kernel/boot_config.zig");
 const k = @import("../kernel/log.zig");
 const time_core = @import("../platform/time.zig");
 const timer = @import("../kernel/timer.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
+const owner_locks = @import("../memory/owner_locks.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const sync = @import("../sched/sync.zig");
 const task = @import("../sched/task.zig");
@@ -9077,8 +9077,8 @@ fn consumeAsyncIoRetireRetryForTest(req: *const AsyncIoRequest) AsyncIoRetireRet
     if (req.kind != .file_write or
         !equalsIgnoreCase(fixedZSpan(req.path[0..]), "C:\\TEMP\\ASYNIOR.TXT")) return .none;
     if (!taskRegistryAsyncRetireRetryTestAllowed()) return .none;
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     if (!async_io_retire_retry_test_armed) {
         if (async_io_retire_retry_test_consumed) return .none;
         async_io_retire_retry_test_armed = true;
@@ -9096,8 +9096,8 @@ fn consumeAsyncIoRetireRetryForTest(req: *const AsyncIoRequest) AsyncIoRetireRet
 }
 
 fn finishAsyncIoRetireRetryTest(request_id: u32) bool {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     if (request_id == 0 or request_id != async_io_retire_retry_test_request_id) return false;
     async_io_retire_retry_test_request_id = 0;
     return true;
@@ -9737,9 +9737,9 @@ fn apiThreadCreateHandle(entry: RawEntryFn, arg: u64, stack_reserve_bytes: u64, 
 }
 
 fn recordProgramThreadCreateFailure() void {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
+    const irq_flags = owner_locks.program_state.acquire();
     program_thread_create_failures +%= 1;
-    interrupts.restore(irq_flags);
+    owner_locks.program_state.release(irq_flags);
 }
 
 fn threadCreateErrorForTaskFailure(failure: task.CreateFailure) i32 {
@@ -9791,8 +9791,8 @@ fn claimProgramThreadJoin(
     owner_task_id: u32,
     owner_task_generation: u64,
 ) ProgramThreadJoinClaim {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     const target = programThreadByIdLocked(thread_id) orelse return .{ .failure = THREAD_ERROR_NOT_FOUND };
     if (!target.used or target.retire_pending or target.retire_in_progress or
         target.instance_id != instance_id or target.instance_generation != instance_generation or
@@ -9826,9 +9826,9 @@ fn releaseJoinLeaseLocked(target: *ProgramThread, owner_task_id: u32, owner_task
 }
 
 fn releaseJoinLease(target: *ProgramThread, owner_task_id: u32, owner_task_generation: u64) void {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
+    const irq_flags = owner_locks.program_state.acquire();
     if (containsProgramThreadLocked(target)) _ = releaseJoinLeaseLocked(target, owner_task_id, owner_task_generation);
-    interrupts.restore(irq_flags);
+    owner_locks.program_state.release(irq_flags);
 }
 
 fn apiThreadJoin(thread_id: u32, timeout_ticks: u64, out_exit_code: *i32) callconv(.c) i32 {
@@ -9870,37 +9870,37 @@ fn joinProgramThread(thread_id: u32, exact: ?ProgramJoinHandle, timeout_ticks: u
         .failure => |status| return status,
     };
     if (target.state == .ready or target.state == .running) {
-        const begin_flags = interrupts.saveAndDisableFor(.program);
+        const begin_flags = owner_locks.program_state.acquire();
         if (!containsProgramThreadLocked(target) or
             !target.join_lease_active or
             target.join_owner_task_id != current_task_id or
             target.join_owner_task_generation != current_task_generation or
             target.join_waiter_refs == std.math.maxInt(u32))
         {
-            interrupts.restore(begin_flags);
+            owner_locks.program_state.release(begin_flags);
             releaseJoinLease(target, current_task_id, current_task_generation);
             return THREAD_ERROR_BUSY;
         }
         target.join_waiter_refs += 1;
-        interrupts.restore(begin_flags);
+        owner_locks.program_state.release(begin_flags);
         const queue = &target.join_queue;
         // The completion predicate and waiter enrollment must share the
         // WaitQueue critical section. Otherwise a worker can exit after the
         // state check above but before enrollment, send its wake to an empty
         // queue, and leave this join blocked forever.
         const result = queue.waitUnless(timeout_ticks, "thread_join", programThreadJoinStillNeeded, target);
-        const end_flags = interrupts.saveAndDisableFor(.program);
+        const end_flags = owner_locks.program_state.acquire();
         if (!containsProgramThreadLocked(target) or
             !target.join_lease_active or
             target.join_owner_task_id != current_task_id or
             target.join_owner_task_generation != current_task_generation)
         {
-            interrupts.restore(end_flags);
+            owner_locks.program_state.release(end_flags);
             return THREAD_ERROR_NOT_FOUND;
         }
         if (target.join_waiter_refs != 0) target.join_waiter_refs -= 1;
         const completed = target.state == .exited or target.state == .killed;
-        interrupts.restore(end_flags);
+        owner_locks.program_state.release(end_flags);
         if (result == .timeout and !completed) {
             releaseJoinLease(target, current_task_id, current_task_generation);
             return THREAD_ERROR_TIMEOUT;
@@ -9928,7 +9928,7 @@ fn finishJoinedThread(target: *ProgramThread, owner_task_id: u32, owner_task_gen
         releaseJoinLease(target, owner_task_id, owner_task_generation);
         return THREAD_ERROR_BUSY;
     }
-    const irq_flags = interrupts.saveAndDisableFor(.program);
+    const irq_flags = owner_locks.program_state.acquire();
     if (!containsProgramThreadLocked(target) or
         !target.join_lease_active or
         target.join_owner_task_id != owner_task_id or
@@ -9939,7 +9939,7 @@ fn finishJoinedThread(target: *ProgramThread, owner_task_id: u32, owner_task_gen
         (target.state != .exited and target.state != .killed))
     {
         if (containsProgramThreadLocked(target)) _ = releaseJoinLeaseLocked(target, owner_task_id, owner_task_generation);
-        interrupts.restore(irq_flags);
+        owner_locks.program_state.release(irq_flags);
         _ = task_context.leaveUnwind(release_token);
         return THREAD_ERROR_BUSY;
     }
@@ -9948,7 +9948,7 @@ fn finishJoinedThread(target: *ProgramThread, owner_task_id: u32, owner_task_gen
     target.retire_pending = true;
     target.retire_in_progress = true;
     bumpProgramThreadInventoryEpochLocked();
-    interrupts.restore(irq_flags);
+    owner_locks.program_state.release(irq_flags);
     if (!completeProgramThreadRetire(target, release_token, false)) {
         k.puts("[R4XTHREAD] join cleanup deferred thread=");
         k.putDec(target_id);
@@ -10069,8 +10069,8 @@ fn allocateThreadGenerationLocked() ?u64 {
 }
 
 fn publishProgramThread(thread_ctx: *ProgramThread) bool {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     const thread_id = allocateThreadIdLocked() orelse return false;
     const thread_generation = allocateThreadGenerationLocked() orelse return false;
     thread_ctx.id = thread_id;
@@ -10104,18 +10104,18 @@ fn bumpProgramThreadInventoryEpochLocked() void {
 }
 
 fn bumpProgramThreadInventoryEpoch() void {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
+    const irq_flags = owner_locks.program_state.acquire();
     bumpProgramThreadInventoryEpochLocked();
-    interrupts.restore(irq_flags);
+    owner_locks.program_state.release(irq_flags);
 }
 
 fn markProgramThreadRunning(thread_ctx: *ProgramThread) void {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
+    const irq_flags = owner_locks.program_state.acquire();
     if (containsProgramThreadLocked(thread_ctx) and thread_ctx.used and thread_ctx.state == .ready) {
         thread_ctx.state = .running;
         bumpProgramThreadInventoryEpochLocked();
     }
-    interrupts.restore(irq_flags);
+    owner_locks.program_state.release(irq_flags);
 }
 
 fn freeProgramThreadMemory(thread_ctx: *ProgramThread) bool {
@@ -10160,8 +10160,8 @@ fn containsProgramThreadLocked(wanted: *const ProgramThread) bool {
 }
 
 fn pinProgramThreadById(id: u32, allow_retiring: bool) ?*ProgramThread {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     const thread_ctx = programThreadByIdLocked(id) orelse return null;
     if (!thread_ctx.used or
         (!allow_retiring and (thread_ctx.retire_pending or thread_ctx.retire_in_progress)) or
@@ -10171,8 +10171,8 @@ fn pinProgramThreadById(id: u32, allow_retiring: bool) ?*ProgramThread {
 }
 
 fn pinProgramThreadByHandle(handle: ProgramJoinHandle, allow_retiring: bool) ?*ProgramThread {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     const thread_ctx = programThreadByIdentityLocked(
         handle.thread_id,
         handle.instance_id,
@@ -10187,24 +10187,24 @@ fn pinProgramThreadByHandle(handle: ProgramJoinHandle, allow_retiring: bool) ?*P
 }
 
 fn unpinProgramThread(thread_ctx: *ProgramThread) bool {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     if (!containsProgramThreadLocked(thread_ctx) or thread_ctx.pin_count == 0) return false;
     thread_ctx.pin_count -= 1;
     return true;
 }
 
 fn markProgramThreadDone(thread_ctx: *ProgramThread, exit_code: i32) void {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
+    const irq_flags = owner_locks.program_state.acquire();
     if (!containsProgramThreadLocked(thread_ctx) or !thread_ctx.used or thread_ctx.state == .exited or thread_ctx.state == .killed) {
-        interrupts.restore(irq_flags);
+        owner_locks.program_state.release(irq_flags);
         return;
     }
     thread_ctx.exit_code = exit_code;
     thread_ctx.state = .exited;
     thread_ctx.finished_tick = timer.tickCount();
     bumpProgramThreadInventoryEpochLocked();
-    interrupts.restore(irq_flags);
+    owner_locks.program_state.release(irq_flags);
     _ = thread_ctx.join_queue.wakeAll();
 }
 
@@ -10215,8 +10215,8 @@ fn terminateProgramThreads(instance_id: u32, exit_code: i32, skip_task_id: ?u32)
 
 fn terminateProgramThreadsForHandle(handle: ProgramProcessHandle, exit_code: i32, skip_task_id: ?u32) void {
     const now = timer.tickCount();
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     var inventory_changed = false;
     var cursor = program_thread_head;
     while (cursor) |thread_ctx| : (cursor = thread_ctx.registry_next) {
@@ -10303,8 +10303,8 @@ fn programThreadRetirePendingDetail(reason: ProgramThreadRetirePendingReason) []
 }
 
 fn claimProgramThreadRetireForHandle(handle: ProgramProcessHandle) ProgramThreadRetireClaim {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     var pending_reason: ?ProgramThreadRetirePendingReason = null;
     var inventory_changed = false;
     var cursor = program_thread_head;
@@ -10363,8 +10363,8 @@ fn claimProgramThreadRetireForHandle(handle: ProgramProcessHandle) ProgramThread
 }
 
 fn clearProgramThreadRetireClaim(thread_ctx: *ProgramThread) void {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     if (!containsProgramThreadLocked(thread_ctx) or !thread_ctx.retire_in_progress) return;
     thread_ctx.retire_in_progress = false;
     if (!thread_ctx.retire_for_instance) thread_ctx.retire_pending = false;
@@ -10462,7 +10462,7 @@ fn completeProgramThreadRetire(
         return false;
     }
 
-    const irq_flags = interrupts.saveAndDisableFor(.program);
+    const irq_flags = owner_locks.program_state.acquire();
     if (!containsProgramThreadLocked(thread_ctx) or
         !thread_ctx.retire_pending or
         !thread_ctx.retire_in_progress or
@@ -10472,14 +10472,14 @@ fn completeProgramThreadRetire(
         thread_ctx.join_waiter_refs != 0 or
         thread_ctx.join_queue.hasWaiters())
     {
-        interrupts.restore(irq_flags);
+        owner_locks.program_state.release(irq_flags);
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Thread wartet");
         clearProgramThreadRetireClaim(thread_ctx);
         return false;
     }
     thread_ctx.flags |= THREAD_FLAG_JOINED;
     unlinkProgramThreadLocked(thread_ctx);
-    interrupts.restore(irq_flags);
+    owner_locks.program_state.release(irq_flags);
 
     if (freeProgramThreadMemory(thread_ctx)) {
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Thread frei");
@@ -10488,7 +10488,7 @@ fn completeProgramThreadRetire(
 
     reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Speicher wartet");
 
-    const retry_flags = interrupts.saveAndDisableFor(.program);
+    const retry_flags = owner_locks.program_state.acquire();
     linkProgramThreadLocked(thread_ctx);
     thread_ctx.retire_in_progress = false;
     if (!thread_ctx.retire_for_instance) thread_ctx.retire_pending = false;
@@ -10497,7 +10497,7 @@ fn completeProgramThreadRetire(
     } else if (thread_ctx.pin_count != 0) {
         thread_ctx.pin_count -= 1;
     }
-    interrupts.restore(retry_flags);
+    owner_locks.program_state.release(retry_flags);
     return false;
 }
 
@@ -11623,8 +11623,8 @@ fn tryProgramInventoryEpoch() ?u64 {
 }
 
 fn threadInventoryStats() ThreadInventoryStats {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     var out = ThreadInventoryStats{
         .epoch = program_thread_mutation_epoch,
         .total = @intCast(@min(program_thread_count, @as(usize, std.math.maxInt(u32)))),
@@ -11644,8 +11644,8 @@ fn threadInventoryStats() ThreadInventoryStats {
 }
 
 fn allocateInventorySnapshotGeneration() u64 {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     const generation = next_inventory_snapshot_generation;
     next_inventory_snapshot_generation +%= 1;
     if (next_inventory_snapshot_generation == 0) next_inventory_snapshot_generation = 1;
@@ -11787,14 +11787,14 @@ fn apiProgramInventoryPrograms(cursor: *ProgramInventoryCursor, out: [*]ProgramI
 }
 
 fn threadInventoryEpoch() u64 {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     return program_thread_mutation_epoch;
 }
 
 fn populateProgramTaskOwners(entries: []ProgramTaskSnapshot, expected_thread_epoch: u64) bool {
-    const irq_flags = interrupts.saveAndDisableFor(.program);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(irq_flags);
     if (program_thread_mutation_epoch != expected_thread_epoch) return false;
     var thread_cursor = program_thread_head;
     while (thread_cursor) |thread_ctx| : (thread_cursor = thread_ctx.registry_next) {
@@ -11861,10 +11861,10 @@ fn apiProgramInventoryTasks(cursor: *ProgramInventoryCursor, out: [*]ProgramTask
     // Final epoch validation and the bounded caller-buffer publication share
     // one short IRQ boundary. Restart never advances the cursor or publishes
     // a partially mixed page.
-    const publish_flags = interrupts.saveAndDisableFor(.program);
+    const publish_flags = owner_locks.program_state.acquire();
     if (task.inventoryEpoch() != cursor.task_epoch or program_thread_mutation_epoch != cursor.thread_epoch) {
         out_page.status = r4x_api.program_inventory_status_restart;
-        interrupts.restore(publish_flags);
+        owner_locks.program_state.release(publish_flags);
         return PROGRAM_HANDLE_OK;
     }
     index = 0;
@@ -11882,7 +11882,7 @@ fn apiProgramInventoryTasks(cursor: *ProgramInventoryCursor, out: [*]ProgramTask
         .kind = r4x_api.program_inventory_kind_task,
         .status = if (raw_page.has_more) r4x_api.program_inventory_status_more else r4x_api.program_inventory_status_complete,
     };
-    interrupts.restore(publish_flags);
+    owner_locks.program_state.release(publish_flags);
     return PROGRAM_HANDLE_OK;
 }
 
@@ -11936,10 +11936,10 @@ fn apiProgramInventoryThreads(cursor: *ProgramInventoryCursor, out: [*]ProgramTh
     var returned: usize = 0;
     var eligible: u32 = 0;
     var total: u32 = 0;
-    const capture_flags = interrupts.saveAndDisableFor(.program);
+    const capture_flags = owner_locks.program_state.acquire();
     if (program_thread_mutation_epoch != cursor.thread_epoch) {
         out_page.status = r4x_api.program_inventory_status_restart;
-        interrupts.restore(capture_flags);
+        owner_locks.program_state.release(capture_flags);
         return PROGRAM_HANDLE_OK;
     }
     var scan = program_thread_head;
@@ -11971,13 +11971,13 @@ fn apiProgramInventoryThreads(cursor: *ProgramInventoryCursor, out: [*]ProgramTh
             threadInventorySnapshotSiftDown(staged[0..returned], 0);
         }
     }
-    interrupts.restore(capture_flags);
+    owner_locks.program_state.release(capture_flags);
     sortThreadInventorySnapshots(staged[0..returned]);
 
-    const publish_flags = interrupts.saveAndDisableFor(.program);
+    const publish_flags = owner_locks.program_state.acquire();
     if (program_thread_mutation_epoch != cursor.thread_epoch) {
         out_page.status = r4x_api.program_inventory_status_restart;
-        interrupts.restore(publish_flags);
+        owner_locks.program_state.release(publish_flags);
         return PROGRAM_HANDLE_OK;
     }
     var index: usize = 0;
@@ -11999,7 +11999,7 @@ fn apiProgramInventoryThreads(cursor: *ProgramInventoryCursor, out: [*]ProgramTh
         .kind = r4x_api.program_inventory_kind_thread,
         .status = if (has_more) r4x_api.program_inventory_status_more else r4x_api.program_inventory_status_complete,
     };
-    interrupts.restore(publish_flags);
+    owner_locks.program_state.release(publish_flags);
     return PROGRAM_HANDLE_OK;
 }
 

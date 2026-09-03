@@ -4,6 +4,7 @@
 // Before `setConsoleSink()`, output only goes to a configured serial sink.
 
 pub const SerialSink = *const fn (u8) callconv(.c) void;
+pub const SerialBulkSink = *const fn ([*]const u8, usize) callconv(.c) void;
 pub const OutputHook = *const fn (u8) callconv(.c) bool;
 
 pub const ConsoleSink = struct {
@@ -23,6 +24,7 @@ pub const ConsoleSink = struct {
 pub const SerialControlHook = *const fn () callconv(.c) void;
 
 var serial_sink: ?SerialSink = null;
+var serial_bulk_sink: ?SerialBulkSink = null;
 var console_sink: ?ConsoleSink = null;
 var output_hook: ?OutputHook = null;
 var output_hook_intercepts_serial: bool = false;
@@ -31,6 +33,10 @@ var serial_sync_hook: ?SerialControlHook = null;
 
 pub fn setSerialSink(sink: ?SerialSink) void {
     serial_sink = sink;
+}
+
+pub fn setSerialBulkSink(sink: ?SerialBulkSink) void {
+    serial_bulk_sink = sink;
 }
 
 // 0.56.15: COM1-TX-Ring-Steuerung ohne direkten com.zig-Import.
@@ -60,6 +66,14 @@ pub fn setConsoleSink(sink: ?ConsoleSink) void {
 
 pub fn serialPutcRaw(ch: u8) void {
     if (serial_sink) |sink| sink(ch);
+}
+
+pub fn serialWriteRaw(text: []const u8) void {
+    if (serial_bulk_sink) |sink| {
+        sink(text.ptr, text.len);
+    } else if (serial_sink) |sink| {
+        for (text) |ch| sink(ch);
+    }
 }
 
 pub fn consolePutcRaw(ch: u8) void {
@@ -128,12 +142,20 @@ pub fn putc(ch: u8) void {
 }
 
 pub fn puts(s: []const u8) void {
-    if (output_hook != null) {
+    if (output_hook_intercepts_serial) {
         for (s) |ch| putc(ch);
         return;
     }
-    if (serial_sink) |sink| {
-        for (s) |ch| sink(ch);
+    serialWriteRaw(s);
+    if (output_hook) |hook| {
+        if (console_sink) |sink| {
+            for (s) |ch| {
+                if (!hook(ch)) sink.putc(sink.context, ch);
+            }
+        } else {
+            for (s) |ch| _ = hook(ch);
+        }
+        return;
     }
     if (console_sink) |sink| sink.puts(sink.context, s);
 }

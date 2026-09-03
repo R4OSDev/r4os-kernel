@@ -39,7 +39,7 @@ pub const Deadline = struct {
     fallback_tsc: bool,
 
     pub fn begin(milliseconds_value: u32) Deadline {
-        const flags = interrupts.saveAndDisableFor(.driver);
+        const flags = interrupts.saveAndDisableLocal();
         const may_enable = interrupts.wereEnabled(flags) or scheduler.current() == null;
         const start_monotonic = monotonic.capture();
         const monotonic_clock = monotonic.snapshot();
@@ -102,11 +102,10 @@ pub const Deadline = struct {
             .duration_tsc = duration_tsc,
             .fallback_tsc = fallback_tsc,
         };
-        // The sampled clocks need one short IRQ/SMP critical section, but the
-        // deadline lifetime must not own it. Runtime waits may park the block
-        // worker; carrying the legacy serialization token into that sleep
-        // would make the scheduler context switch recursively enter it.
-        interrupts.restore(flags);
+        // The sampled clocks need one short local IRQ guard, but the deadline
+        // lifetime must not own it. Runtime waits may park the block worker,
+        // so the guard is restored before returning the sampled deadline.
+        interrupts.restoreLocal(flags);
         if (may_enable) interrupts.enable();
         return out;
     }

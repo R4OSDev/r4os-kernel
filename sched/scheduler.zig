@@ -275,7 +275,7 @@ pub fn secondaryLoop() noreturn {
 }
 
 pub fn stats() Stats {
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     const state = localState();
     const diagnostic_ordinal = if (state.current_task) |running| task.ordinalOf(running) orelse 0 else 0;
@@ -351,7 +351,7 @@ pub fn current() ?*task.Task {
 // sofort yielden statt zu hlt'en, sonst bremst jeder Rotationsbesuch
 // das System um bis zu einen Tick.
 pub fn hasOtherReadyTask() bool {
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     return initialized and localState().initialized and task.readyCountForCpu(percpu.currentIndex()) != 0;
 }
@@ -371,7 +371,7 @@ pub const StructureStats = struct {
 };
 
 pub fn structureStats() StructureStats {
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     const state = localState();
     return .{
@@ -504,7 +504,7 @@ pub fn preemptEnable() void {
 pub fn yield() void {
     const state = localState();
     if (!initialized or !state.initialized) return;
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     yield_count +%= 1;
     const now = timer.tickCount();
 
@@ -593,8 +593,8 @@ pub fn preemptFromIrq() void {
 }
 
 fn requireSwitchBoundary(outgoing: *const task.Task) void {
-    if (!interrupts.legacySerializationEnabled()) return;
-    const depth = percpu.legacyCriticalDepth().*;
+    if (!interrupts.runtimeSerializationEnabled()) return;
+    const depth = percpu.runtimeCriticalDepth().*;
     if (depth == 1) return;
     k.puts("[SMP] switch boundary violation cpu=");
     k.putDec(percpu.currentIndex());
@@ -615,7 +615,7 @@ fn requireSwitchBoundary(outgoing: *const task.Task) void {
 // boundary: ready tasks cannot be selected remotely before their stack image
 // is complete.
 export fn r4os_finish_context_switch() callconv(.c) void {
-    if (!interrupts.releaseLegacyForContextSwitch()) interrupts.haltForever();
+    if (!interrupts.releaseRuntimeForContextSwitch()) interrupts.haltForever();
 }
 
 pub fn sleepTicks(ticks: u64) void {
@@ -635,7 +635,7 @@ pub fn sleepTicksWithReason(ticks: u64, reason: []const u8) void {
 pub fn blockCurrent(object: u64, timeout_ticks: u64, reason: []const u8) ?*task.Task {
     const state = localState();
     if (!initialized or !state.initialized) return null;
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     preemptDisable();
     defer preemptEnable();
@@ -654,7 +654,7 @@ pub fn parkBlocked(blocked_task: *task.Task) void {
     // it must not leak the trailing CLI to the resumed task. In particular,
     // the block worker services runtime USB I/O after Event.waitResult(); an
     // IF=0 leak there turns xHCI's tick deadline into its short CPU guard.
-    const park_irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const park_irq_flags = interrupts.saveAndDisableRuntime();
     interrupts.restore(park_irq_flags);
     defer interrupts.restore(park_irq_flags);
     while (blocked_task.state == .blocked) {
@@ -672,7 +672,7 @@ pub fn parkBlocked(blocked_task: *task.Task) void {
 }
 
 pub fn wakeTask(target: *task.Task, result: task.WaitResult) bool {
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     preemptDisable();
     defer preemptEnable();
@@ -749,7 +749,7 @@ pub fn safeReschedulePoint() bool {
     safe_reschedule_point_count +%= 1;
     if (!state.reschedule_requested or !initialized or !state.initialized or preemption_enabled == 0) return false;
 
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     if (!interrupts.wereEnabled(irq_flags)) {
         safe_reschedule_deferred_irq_count +%= 1;
         interrupts.restore(irq_flags);
@@ -788,7 +788,7 @@ pub fn exitCurrentAndRetire() noreturn {
 }
 
 fn exitCurrentImpl(retire: bool) noreturn {
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     preemptDisable();
     if (current()) |t| {
         if (t.held_lock_count != 0 or t.unwind_guard_count != 0) {
@@ -849,7 +849,7 @@ fn exitCurrentImpl(retire: bool) noreturn {
 }
 
 fn waitForInterruptUntilNextDeadline() void {
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     // Recheck after joining the cross-CPU owner boundary.  A remote producer
     // cannot publish work between this check and the lock release below; its
     // IPI is then consumed by the adjacent STI/HLT sequence.
@@ -859,11 +859,11 @@ fn waitForInterruptUntilNextDeadline() void {
     }
     const bsp = percpu.currentIndex() == 0;
     if (bsp) _ = timer.enterIdleDeadline(task.minWakeTick());
-    if (!interrupts.releaseLegacyForContextSwitch()) interrupts.haltForever();
+    if (!interrupts.releaseRuntimeForContextSwitch()) interrupts.haltForever();
     interrupts.enableAndWaitForInterrupt();
     interrupts.disable();
     if (bsp) {
-        const leave_flags = interrupts.saveAndDisableFor(.scheduler);
+        const leave_flags = interrupts.saveAndDisableRuntime();
         _ = timer.leaveIdleDeadline();
         interrupts.restore(leave_flags);
     }
@@ -920,7 +920,7 @@ pub fn onSecondaryTick(now: u64, preemptible_instruction_pointer: bool) bool {
 
 pub fn onRescheduleIpi(preemptible_instruction_pointer: bool) void {
     if (percpu.currentIndex() != 0) return;
-    const irq_flags = interrupts.saveAndDisableFor(.scheduler);
+    const irq_flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(irq_flags);
     if (preemptPendingWake(preemptible_instruction_pointer)) preemptFromIrq();
 }

@@ -97,11 +97,36 @@ alten PTEs wieder her und behaelt den physischen Frame; Wiederverwendung vor
 vollstaendiger Bestaetigung ist ausgeschlossen.
 
 Die feste Sperrreihenfolge lautet VM -> Seitentabellen -> physische
-PMM-/MemoryBlock-Metadaten. Die uebrigen Legacy-Besitzer sind elf Quellklassen
-zugeordnet und liefern Warte-, Halte-, Kollisions- und Klassenzaehler ohne
-rekursives Logging. Der kurze SMP4-Smoke prueft echte stale-TLB-Ersetzung,
+PMM-/MemoryBlock-Metadaten. 0.75.11 inventarisierte die damaligen
+Legacy-Besitzer in elf Quellklassen und machte Warte-, Halte- und
+Kollisionskosten sichtbar. Der kurze SMP4-Smoke prueft echte stale-TLB-Ersetzung,
 einen absichtlich fehlenden Ack samt sicherem Rollback sowie die
 Sperrreihenfolge, bevor Userland oder Subsysteme gestartet werden.
+
+Besitzertrennung und serielle Spannenausgabe seit 0.75.12
+---------------------------------------------------------
+
+Der fruehere globale Legacy-BKL und sein klassendisponierter
+`saveAndDisableFor`-Einstieg sind entfernt. Scheduler, Taskzustand,
+Wait-Queues und IRQ-seitige Praeemption behalten den fuer den
+Assembly-Kontextwechsel notwendigen gemeinsamen Runtime-Owner. Programm-
+Threadzustand, Storage, Netzwerk, Driver-Work, Heap, VM/Seitentabellen/PMM,
+Bootlog und Serialausgabe verwenden dagegen eigene geordnete No-Sleep-Owner.
+Service-Registry, Endpoints und Kanal-IPC bleiben auf ihren bestehenden
+gerankten Mutexen.
+
+Der kurze SMP4-Nachweis fuehrt pro Online-CPU 64 echte Heap-
+Allocate/Write/Free-Zyklen aus. Er verlangt die Beteiligung aller CPUs,
+keine Inhalts-, Cleanup- oder Lockordnungsfehler und genau null Zugriffe auf
+den stillgelegten globalen BKL.
+
+Kernel-Strings erreichen COM1 nun ueber einen Bulk-Sink. Eine komplette
+Spanne nimmt den Serial-Owner einmal, wird in einem Zug in den TX-Ring
+uebernommen und loest hoechstens eine nichtblockierende FIFO-Drainoperation
+aus. Byteweises Verhalten bleibt fuer Einzelzeichen, Output-Hooks sowie den
+begrenzt synchronen Crashpfad erhalten. Schreib-, Bulk-, Lock-, UART-Status-,
+Drain-, Maximalspannen- und Dropzaehler machen Vollstaendigkeit und Aufwand
+maschinenpruefbar.
 
 Build
 -----

@@ -92,8 +92,8 @@ INTx when routed and retains bounded polling as fallback. Bulk TDs span up to
 64 KiB in page-bounded TRBs, including a chained ring wrap. Failed controller
 halt vetoes unload.
 
-A USB boot deadline holds the global IRQ/SMP serialization only while
-sampling its clocks and releases it before the block worker can park. Once the
+A USB boot deadline disables local interrupts only while sampling its clocks
+and restores them before the block worker can park. Once the
 task runtime is complete, the already-running `kernel-main` task explicitly
 enables interrupts because it does not pass through the trampoline used by
 new tasks. Timer-driven USB completions and watchdog wakes therefore continue

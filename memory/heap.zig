@@ -14,8 +14,8 @@
 //     vermeiden Commit/Uncommit-Thrash bei begrenztem freien Randbestand.
 //
 // SMP-INVARIANTE: Der Heap yieldet und blockiert weiterhin nicht. Seine
-// Metadaten werden jedoch ueber die reentrant globale IRQ-/Legacy-Grenze
-// serialisiert, weil lokales Nicht-Preemptieren mehrere CPUs nicht schuetzt.
+// Metadaten werden ueber den reentranten Heap-Owner serialisiert, weil
+// lokales Nicht-Preemptieren mehrere CPUs nicht schuetzt.
 // Der Reentry-Waechter (control.in_heap) erkennt damit nur noch echte
 // Rekursion auf derselben CPU und nicht erlaubte parallele Nutzung.
 //
@@ -34,8 +34,8 @@ const map = @import("map.zig");
 const blocks = @import("blocks.zig");
 const heap_policy = @import("heap_policy.zig");
 const phys = @import("phys.zig");
+const owner_locks = @import("owner_locks.zig");
 const k = @import("../kernel/log.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
 const task_context = @import("../sched/task_context.zig");
 
 const HEAP_BASE: u64 = virt.windowBase(.kernel_heap);
@@ -297,8 +297,8 @@ fn reallocInPlace(mem: []u8, new_size: usize, align_value: usize) InPlaceResult 
 }
 
 pub fn stats() Stats {
-    const irq_flags = interrupts.saveAndDisableFor(.memory);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.heap.acquire();
+    defer owner_locks.heap.release(irq_flags);
     var s: Stats = .{
         .pages = control.committed_pages,
         .capacity_bytes = committedBytes(),
@@ -342,8 +342,8 @@ pub fn metadataRange() MetadataRange {
 // Allocation, error-injection, alignment, and churn probes belong to the
 // explicit -Dboot-selftests diagnostic kernel.
 pub fn bootInvariant() bool {
-    const irq_flags = interrupts.saveAndDisableFor(.memory);
-    defer interrupts.restore(irq_flags);
+    const irq_flags = owner_locks.heap.acquire();
+    defer owner_locks.heap.release(irq_flags);
     if (!control.initialized or control.range_id == 0) return false;
     if (control.committed_pages < MIN_COMMITTED_PAGES or control.committed_pages > control.cap_pages) return false;
     if (control.heap_top != committedBytes() or control.heap_top < MIN_BLOCK) return false;
@@ -1083,15 +1083,15 @@ fn rdtsc() u64 {
 
 const HeapGuard = struct {
     unwind: task_context.UnwindToken,
-    irq_flags: u64,
+    lock_token: owner_locks.Token,
 };
 
 fn enterHeap() ?HeapGuard {
-    const irq_flags = interrupts.saveAndDisableFor(.memory);
+    const irq_flags = owner_locks.heap.acquire();
     const unwind = task_context.enterUnwind();
     if (!unwind.admitted()) {
         control.reentry_errors += 1;
-        interrupts.restore(irq_flags);
+        owner_locks.heap.release(irq_flags);
         return null;
     }
     if (control.in_heap) {
@@ -1100,18 +1100,18 @@ fn enterHeap() ?HeapGuard {
             control.reentry_reported = true;
             k.puts("HEAP REENTRY detected (non-preempt invariant violated)\r\n");
         }
-        interrupts.restore(irq_flags);
+        owner_locks.heap.release(irq_flags);
         _ = task_context.leaveUnwind(unwind);
         return null;
     }
     control.in_heap = true;
-    return .{ .unwind = unwind, .irq_flags = irq_flags };
+    return .{ .unwind = unwind, .lock_token = irq_flags };
 }
 
 fn leaveHeap(guard: HeapGuard) void {
     control.in_heap = false;
     _ = task_context.leaveUnwind(guard.unwind);
-    interrupts.restore(guard.irq_flags);
+    owner_locks.heap.release(guard.lock_token);
 }
 
 fn committedBytes() usize {

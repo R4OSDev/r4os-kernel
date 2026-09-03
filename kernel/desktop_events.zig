@@ -5,8 +5,9 @@
 // mit desktopActivityWait statt in einem festen Sleep-Poll-Raster.
 // Sequenznummer + waitUnless-Praedikat machen den Wait Lost-Wakeup-
 // sicher (Muster 0.56.19/0.56.22). signal() ist IRQ-tauglich:
-// WaitQueue.wakeAll arbeitet unter saveAndDisable und weckt den durch seinen
-// intrusiven WaitNode generationstreu gebundenen Task wie der Timer-Tick.
+// WaitQueue.wakeAll arbeitet unter dem Scheduler-Runtime-Owner und weckt den
+// durch seinen intrusiven WaitNode generationstreu gebundenen Task wie der
+// Timer-Tick.
 const sync = @import("../sched/sync.zig");
 const timer = @import("timer.zig");
 
