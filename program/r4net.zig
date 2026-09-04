@@ -19,6 +19,8 @@ pub const TcpSummary = r4x_api.TcpSummary;
 
 pub const TcpConnectionInfo = r4x_api.TcpConnectionInfo;
 
+pub const TcpPerformanceInfo = r4x_api.TcpPerformanceInfo;
+
 pub const TcpAcceptResult = r4x_api.TcpAcceptResult;
 
 pub const NetIpv4Packet = r4x_api.NetIpv4Packet;
@@ -359,6 +361,56 @@ pub fn tcpConnection(index: u32, out: *TcpConnectionInfo) callconv(.c) i32 {
     if (result <= 0) return result;
     fillTcpConnectionInfo(out, info);
     return result;
+}
+
+pub fn tcpPerformance(out: *TcpPerformanceInfo) callconv(.c) i32 {
+    const caller_version = out.version;
+    const caller_size: usize = out.size;
+    const header_size: usize = @offsetOf(TcpPerformanceInfo, "local_mss");
+    const required_size: usize = @sizeOf(TcpPerformanceInfo);
+    if (caller_version == 0 or caller_size < header_size) return -1;
+    if (caller_size < required_size) {
+        out.version = 1;
+        out.size = @intCast(required_size);
+        return -1;
+    }
+
+    var s: net.TcpPerformance = .{};
+    net.tcpPerformance(&s);
+    out.* = .{
+        .version = 1,
+        .size = @intCast(required_size),
+        .local_mss = s.local_mss,
+        .catalog_capacity = s.catalog_capacity,
+        .delayed_ack_ms = s.delayed_ack_ms,
+        .local_window_scale = s.local_window_scale,
+        .outstanding_segments = s.outstanding_segments,
+        .outstanding_bytes = s.outstanding_bytes,
+        .outstanding_segments_peak = s.outstanding_segments_peak,
+        .outstanding_bytes_peak = s.outstanding_bytes_peak,
+        .write_calls = s.write_calls,
+        .write_requested_bytes = s.write_requested_bytes,
+        .write_completed_bytes = s.write_completed_bytes,
+        .write_segments = s.write_segments,
+        .write_partial = s.write_partial,
+        .remote_window_stalls = s.remote_window_stalls,
+        .catalog_stalls = s.catalog_stalls,
+        .backend_busy_stalls = s.backend_busy_stalls,
+        .pure_ack_tx = s.pure_ack_tx,
+        .delayed_ack_requests = s.delayed_ack_requests,
+        .delayed_ack_tx = s.delayed_ack_tx,
+        .immediate_ack_tx = s.immediate_ack_tx,
+        .ack_coalesced = s.ack_coalesced,
+        .ack_piggybacked = s.ack_piggybacked,
+        .window_update_tx = s.window_update_tx,
+        .adapter_poll_rounds = s.adapter_poll_rounds,
+        .service_poll_requests = s.service_poll_requests,
+        .service_poll_skips = s.service_poll_skips,
+        .retransmits = s.retransmits,
+        .mss_negotiated = s.mss_negotiated,
+        .window_scale_negotiated = s.window_scale_negotiated,
+    };
+    return 1;
 }
 
 pub fn netIpv4Send(a: u8, b: u8, c: u8, d: u8, protocol: u8, payload: [*]const u8, len: u32) callconv(.c) i32 {

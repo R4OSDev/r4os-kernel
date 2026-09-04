@@ -4,6 +4,10 @@ pub const MAX_CONNECTIONS: usize = tcp_runtime.CONNECTION_CAPACITY;
 pub const MAX_LISTENERS: usize = 4;
 pub const BUFFER_SIZE: usize = 256 * 1024;
 pub const MAX_ADVERTISED_WINDOW: u16 = 0xFFFF;
+pub const LOCAL_MSS: u16 = 1460;
+pub const DEFAULT_PEER_MSS: u16 = 536;
+pub const LOCAL_WINDOW_SCALE: u8 = 2;
+pub const MAX_WINDOW_SCALE: u8 = 14;
 pub const OUT_OF_ORDER_SLOT_COUNT: usize = 48;
 pub const OUT_OF_ORDER_SLOT_SIZE: usize = 2048;
 pub const SENT_SEGMENT_CAPACITY: usize = tcp_runtime.SENT_SEGMENT_CAPACITY;
@@ -21,6 +25,30 @@ pub const FLAG_SYN: u16 = tcp_runtime.FLAG_SYN;
 pub const FLAG_RST: u16 = 0x004;
 pub const FLAG_PSH: u16 = 0x008;
 pub const FLAG_ACK: u16 = 0x010;
+
+// TcpOp.index transports compact parser/builder metadata across the private
+// kernel <-> NETTCP.R4P dispatch without changing the fixed TcpOp layout.
+const OPTION_MSS_MASK: u32 = 0x0000_FFFF;
+const OPTION_WINDOW_SCALE_PRESENT: u32 = 1 << 16;
+const OPTION_WINDOW_SCALE_SHIFT: u5 = 17;
+
+pub fn optionMetadata(mss: u16, window_scale: ?u8) u32 {
+    var result: u32 = mss;
+    if (window_scale) |scale| {
+        result |= OPTION_WINDOW_SCALE_PRESENT;
+        result |= @as(u32, @min(scale, MAX_WINDOW_SCALE)) << OPTION_WINDOW_SCALE_SHIFT;
+    }
+    return result;
+}
+
+pub fn optionMss(metadata: u32) u16 {
+    return @truncate(metadata & OPTION_MSS_MASK);
+}
+
+pub fn optionWindowScale(metadata: u32) ?u8 {
+    if ((metadata & OPTION_WINDOW_SCALE_PRESENT) == 0) return null;
+    return @truncate((metadata >> OPTION_WINDOW_SCALE_SHIFT) & 0x0F);
+}
 
 pub const State = enum(u8) {
     closed = 0,
@@ -42,7 +70,23 @@ pub const SegmentView = struct {
     ack: u32,
     flags: u16,
     window: u16,
+    mss: u16 = 0,
+    window_scale: u8 = 0,
+    window_scale_present: bool = false,
     payload: []const u8,
+};
+
+pub const AckRequest = enum {
+    none,
+    delayed,
+    immediate,
+};
+
+pub const WriteBlockReason = enum {
+    none,
+    remote_window,
+    catalog,
+    state,
 };
 
 pub const ConnectionInfo = r4x_api.TcpConnectionInfo;
@@ -74,6 +118,27 @@ pub const Stats = struct {
     checksum_errors: u64 = 0,
     timeouts: u64 = 0,
     self_tests: u64 = 0,
+    write_calls: u64 = 0,
+    write_requested_bytes: u64 = 0,
+    write_completed_bytes: u64 = 0,
+    write_segments: u64 = 0,
+    write_partial: u64 = 0,
+    remote_window_stalls: u64 = 0,
+    catalog_stalls: u64 = 0,
+    backend_busy_stalls: u64 = 0,
+    pure_ack_tx: u64 = 0,
+    delayed_ack_requests: u64 = 0,
+    delayed_ack_tx: u64 = 0,
+    immediate_ack_tx: u64 = 0,
+    ack_coalesced: u64 = 0,
+    ack_piggybacked: u64 = 0,
+    window_update_tx: u64 = 0,
+    outstanding_segments_peak: u32 = 0,
+    outstanding_bytes_peak: u32 = 0,
+    outstanding_segments_current: u32 = 0,
+    outstanding_bytes_current: u32 = 0,
+    mss_negotiated: u64 = 0,
+    window_scale_negotiated: u64 = 0,
     last_flags: u16 = 0,
     last_source_port: u16 = 0,
     last_dest_port: u16 = 0,
@@ -90,6 +155,7 @@ pub const SendPlan = struct {
     seq: u32,
     ack: u32,
     rx_window: u16,
+    options: u32,
 };
 
 pub const RetransmitPlan = struct {
@@ -100,6 +166,7 @@ pub const RetransmitPlan = struct {
     ack: u32,
     flags: u16,
     rx_window: u16,
+    options: u32,
     payload: []const u8,
     token: u64,
     sent_tick: u64,
@@ -126,6 +193,18 @@ const Connection = struct {
     retransmits: u32 = 0,
     tx_window: u32 = 0,
     tx_ack: u32 = 0,
+    peer_mss: u16 = DEFAULT_PEER_MSS,
+    peer_window_scale: u8 = 0,
+    window_scale_offered: bool = false,
+    window_scale_received: bool = false,
+    window_scale_active: bool = false,
+    negotiation_counted: bool = false,
+    last_advertised_window: u16 = 0,
+    delayed_ack_pending: bool = false,
+    delayed_ack_immediate: bool = false,
+    delayed_ack_segments: u8 = 0,
+    delayed_ack_deadline: u64 = 0,
+    window_update_pending: bool = false,
     rx_drops: u32 = 0,
     accepted_claimed: bool = false,
     close_requested: bool = false,
@@ -162,7 +241,10 @@ var next_port: u16 = 49152;
 
 pub fn reset() void {
     stats = .{};
-    connections = .{Connection{}} ** MAX_CONNECTIONS;
+    // Do not materialize the multi-megabyte connection table on a task
+    // stack. Payload bytes are irrelevant once their ownership flags and
+    // lengths have been cleared by resetConnectionSlot.
+    for (&connections) |*connection| resetConnectionSlot(connection);
     slot_generations = .{0} ** MAX_CONNECTIONS;
     listeners = .{Listener{}} ** MAX_LISTENERS;
     next_id = 1;
@@ -171,6 +253,31 @@ pub fn reset() void {
 
 pub fn getStats() Stats {
     return stats;
+}
+
+pub fn recordWriteStart(requested: usize) void {
+    stats.write_calls +%= 1;
+    stats.write_requested_bytes +%= requested;
+}
+
+pub fn recordWriteFinish(requested: usize, written: usize, segments: usize, block: WriteBlockReason) void {
+    stats.write_completed_bytes +%= written;
+    stats.write_segments +%= segments;
+    if (written < requested) stats.write_partial +%= 1;
+    switch (block) {
+        .remote_window => stats.remote_window_stalls +%= 1,
+        .catalog => stats.catalog_stalls +%= 1,
+        .none, .state => {},
+    }
+}
+
+pub fn recordBackendBusy() void {
+    stats.backend_busy_stalls +%= 1;
+}
+
+pub fn outstandingTotals(segment_count: *u32, byte_count: *u32) void {
+    segment_count.* = stats.outstanding_segments_current;
+    byte_count.* = stats.outstanding_bytes_current;
 }
 
 pub fn summary(out: *Summary) void {
@@ -238,16 +345,15 @@ pub fn connectionInfo(index: u32, out: *ConnectionInfo) i32 {
 pub fn selfTestConnect(remote_ip: [4]u8, remote_port: u16) i32 {
     const idx = allocConnection() orelse return -1;
     const c = &connections[idx];
-    c.* = .{
-        .used = true,
-        .id = next_id,
-        .generation = nextSlotGeneration(idx),
-        .state = .syn_sent,
-        .local_port = next_port,
-        .remote_port = remote_port,
-        .remote_ip = remote_ip,
-        .seq = 0x1000 + next_id,
-    };
+    resetConnectionSlot(c);
+    c.used = true;
+    c.id = next_id;
+    c.generation = nextSlotGeneration(idx);
+    c.state = .syn_sent;
+    c.local_port = next_port;
+    c.remote_port = remote_port;
+    c.remote_ip = remote_ip;
+    c.seq = 0x1000 + next_id;
     next_id +%= 1;
     next_port +%= 1;
     stats.syn_tx += 1;
@@ -264,18 +370,16 @@ pub fn beginLiveConnect(remote_ip: [4]u8, remote_port: u16, initial_seq: u32) i3
         return -1;
     };
     const c = &connections[idx];
-    c.* = .{
-        .used = true,
-        .id = next_id,
-        .generation = nextSlotGeneration(idx),
-        .state = .syn_sent,
-        .local_port = next_port,
-        .remote_port = remote_port,
-        .remote_ip = remote_ip,
-        .seq = initial_seq,
-        .ack = 0,
-        .tx_window = 0,
-    };
+    resetConnectionSlot(c);
+    c.used = true;
+    c.id = next_id;
+    c.generation = nextSlotGeneration(idx);
+    c.state = .syn_sent;
+    c.local_port = next_port;
+    c.remote_port = remote_port;
+    c.remote_ip = remote_ip;
+    c.seq = initial_seq;
+    c.window_scale_offered = true;
     next_id +%= 1;
     if (next_id == 0) next_id = 1;
     next_port +%= 1;
@@ -330,18 +434,22 @@ pub fn acceptInbound(view: SegmentView, initial_seq: u32) ?u32 {
         return null;
     };
     const c = &connections[idx];
-    c.* = .{
-        .used = true,
-        .id = next_id,
-        .generation = nextSlotGeneration(idx),
-        .state = .syn_received,
-        .local_port = view.dest_port,
-        .remote_port = view.source_port,
-        .remote_ip = view.source_ip,
-        .seq = initial_seq,
-        .ack = view.seq +% 1,
-        .tx_window = view.window,
-    };
+    resetConnectionSlot(c);
+    c.used = true;
+    c.id = next_id;
+    c.generation = nextSlotGeneration(idx);
+    c.state = .syn_received;
+    c.local_port = view.dest_port;
+    c.remote_port = view.source_port;
+    c.remote_ip = view.source_ip;
+    c.seq = initial_seq;
+    c.ack = view.seq +% 1;
+    c.tx_window = view.window;
+    c.peer_mss = sanitizedPeerMss(view.mss);
+    c.peer_window_scale = if (view.window_scale_present) @min(view.window_scale, MAX_WINDOW_SCALE) else 0;
+    c.window_scale_offered = view.window_scale_present;
+    c.window_scale_received = view.window_scale_present;
+    c.window_scale_active = view.window_scale_present;
     next_id +%= 1;
     if (next_id == 0) next_id = 1;
     stats.listen_syn_rx += 1;
@@ -351,6 +459,7 @@ pub fn acceptInbound(view: SegmentView, initial_seq: u32) ?u32 {
 
 pub fn abort(conn_id: u32, reason: []const u8) void {
     const c = byId(conn_id) orelse return;
+    discardCatalog(c);
     c.state = .closed;
     c.used = false;
     stats.last_error = reason;
@@ -488,28 +597,38 @@ pub fn abortAll(reason: []const u8) CleanupResult {
     return result;
 }
 
-pub fn planSend(conn_id: u32) ?SendPlan {
+pub fn planSend(conn_id: u32, flags: u16) ?SendPlan {
     const c = byId(conn_id) orelse return null;
-    if (c.state == .closed) return null;
     return .{
         .local_port = c.local_port,
         .remote_port = c.remote_port,
         .remote_ip = c.remote_ip,
         .seq = c.seq,
         .ack = c.ack,
-        .rx_window = advertisedWindow(c),
+        .rx_window = advertisedWindowForFlags(c, flags),
+        .options = optionsForFlags(c, flags),
     };
 }
 
 pub fn sendAllowance(conn_id: u32, requested: usize) usize {
     const c = byId(conn_id) orelse return 0;
     if (c.state != .established or c.close_requested) return 0;
-    return tcp_runtime.sendAllowance(c.tx_window, requested, c.sent.hasCapacity());
+    const segment_request = @min(requested, @as(usize, c.peer_mss));
+    return tcp_runtime.sendAllowance(c.tx_window, segment_request, c.sent.hasCapacity());
+}
+
+pub fn writeBlockReason(conn_id: u32) WriteBlockReason {
+    const c = byId(conn_id) orelse return .state;
+    if (c.state != .established or c.close_requested) return .state;
+    if (c.tx_window == 0) return .remote_window;
+    if (!c.sent.hasCapacity()) return .catalog;
+    return .none;
 }
 
 pub fn canTrackSend(conn_id: u32, flags: u16, payload_len: usize) bool {
     const c = byId(conn_id) orelse return false;
-    if (c.state == .closed) return false;
+    const ack_only = flags == FLAG_ACK and payload_len == 0;
+    if (c.state == .closed and !ack_only) return false;
     if (!tcp_runtime.needsTracking(flags, payload_len)) return true;
     return payload_len <= SENT_PAYLOAD_CAPACITY and c.sent.hasCapacity();
 }
@@ -525,7 +644,8 @@ pub fn planRetransmit(conn_id: u32, kind: RetransmitKind) ?RetransmitPlan {
         .seq = segment.seq,
         .ack = segment.ack,
         .flags = segment.flags,
-        .rx_window = advertisedWindow(c),
+        .rx_window = advertisedWindowForFlags(c, segment.flags),
+        .options = optionsForFlags(c, segment.flags),
         .payload = segment.payloadSlice(),
         .token = segment.token,
         .sent_tick = segment.sent_tick,
@@ -544,6 +664,11 @@ pub fn outstandingCount(conn_id: u32) usize {
     return c.sent.count();
 }
 
+pub fn outstandingBytes(conn_id: u32) usize {
+    const c = byId(conn_id) orelse return 0;
+    return c.sent.outstandingBytes();
+}
+
 pub fn commitSent(conn_id: u32, flags: u16, payload: []const u8, sent_tick: u64) bool {
     const c = byId(conn_id) orelse return false;
     if (!rememberSent(c, flags, payload, sent_tick)) return false;
@@ -558,7 +683,10 @@ pub fn commitSent(conn_id: u32, flags: u16, payload: []const u8, sent_tick: u64)
         }
         return true;
     }
-    if ((flags & FLAG_ACK) != 0) stats.ack_tx += 1;
+    if ((flags & FLAG_ACK) != 0) {
+        stats.ack_tx += 1;
+        if (payload_len == 0 and (flags & (FLAG_SYN | FLAG_FIN | FLAG_RST)) == 0) stats.pure_ack_tx += 1;
+    }
     if (payload_len != 0) {
         c.seq +%= @intCast(payload_len);
         c.tx_window -|= @intCast(payload_len);
@@ -593,6 +721,80 @@ pub fn recordRetransmit(conn_id: u32, token: u64, sent_tick: u64, reason: []cons
 pub fn txAckOf(conn_id: u32) u32 {
     const c = byId(conn_id) orelse return 0;
     return c.tx_ack;
+}
+
+pub fn rxAckOf(conn_id: u32) u32 {
+    const c = byId(conn_id) orelse return 0;
+    return c.ack;
+}
+
+pub fn requestAck(conn_id: u32, previous_ack: u32, view: SegmentView, now: u64, delay_ticks: u64) AckRequest {
+    const c = byId(conn_id) orelse return .none;
+    if (view.payload.len == 0 and (view.flags & FLAG_FIN) == 0) return .none;
+
+    const advanced = c.ack != previous_ack;
+    const in_order = view.seq == previous_ack;
+    const immediate_exception = (view.flags & FLAG_FIN) != 0 or
+        !advanced or
+        !in_order or
+        rxFree(c) == 0;
+
+    if (c.delayed_ack_pending) {
+        c.delayed_ack_segments +|= 1;
+        c.delayed_ack_immediate = true;
+        c.delayed_ack_deadline = now;
+        stats.ack_coalesced +%= 1;
+        return .immediate;
+    }
+
+    c.delayed_ack_pending = true;
+    c.delayed_ack_segments = 1;
+    c.delayed_ack_immediate = immediate_exception;
+    c.delayed_ack_deadline = if (immediate_exception) now else now +| @max(@as(u64, 1), delay_ticks);
+    if (immediate_exception) return .immediate;
+    stats.delayed_ack_requests +%= 1;
+    return .delayed;
+}
+
+pub fn delayedAckDue(slot: usize, now: u64) ?u32 {
+    if (slot >= connections.len) return null;
+    const c = &connections[slot];
+    if (!c.used or !c.delayed_ack_pending) return null;
+    if (!c.delayed_ack_immediate and !tcp_runtime.deadlineReached(now, c.delayed_ack_deadline)) return null;
+    return c.id;
+}
+
+pub fn noteAckSent(conn_id: u32, piggybacked: bool, advertised_window: u16) void {
+    const c = byId(conn_id) orelse return;
+    c.last_advertised_window = advertised_window;
+    if (c.window_update_pending) {
+        c.window_update_pending = false;
+        stats.window_update_tx +%= 1;
+    }
+    if (!c.delayed_ack_pending) return;
+    if (piggybacked) {
+        stats.ack_piggybacked +%= 1;
+    } else if (c.delayed_ack_immediate) {
+        stats.immediate_ack_tx +%= 1;
+    } else {
+        stats.delayed_ack_tx +%= 1;
+    }
+    c.delayed_ack_pending = false;
+    c.delayed_ack_immediate = false;
+    c.delayed_ack_segments = 0;
+    c.delayed_ack_deadline = 0;
+}
+
+pub fn windowUpdateRequired(conn_id: u32) bool {
+    const c = byId(conn_id) orelse return false;
+    if (c.delayed_ack_pending) return true;
+    const current = advertisedWindow(c);
+    if (current <= c.last_advertised_window) return false;
+    const shift: u4 = if (c.window_scale_active) @intCast(LOCAL_WINDOW_SCALE) else 0;
+    const wire_mss: u16 = @max(@as(u16, 1), LOCAL_MSS >> shift);
+    if (c.last_advertised_window != 0 and current - c.last_advertised_window < wire_mss) return false;
+    c.window_update_pending = true;
+    return true;
 }
 
 pub fn readable(conn_id: u32) bool {
@@ -648,6 +850,7 @@ pub fn read(conn_id: u32, out: []u8) i32 {
         // oder der Konsument explizit schliesst (FTPSVC
         // finishDataConnection ruft closeTcpHandle).
     } else if (c.state == .closed) {
+        discardCatalog(c);
         c.used = false;
         return -1;
     }
@@ -657,6 +860,7 @@ pub fn read(conn_id: u32, out: []u8) i32 {
 pub fn close(conn_id: u32) i32 {
     const c = byId(conn_id) orelse return -1;
     if (c.state == .closed) {
+        discardCatalog(c);
         c.used = false;
         return 0;
     }
@@ -665,6 +869,7 @@ pub fn close(conn_id: u32) i32 {
         stats.fin_tx += 1;
     }
     c.state = .closed;
+    discardCatalog(c);
     c.used = false;
     return 0;
 }
@@ -842,6 +1047,7 @@ pub fn applyRxView(view: SegmentView) ?SegmentView {
                 stats.last_error = "rst-stale";
                 return view;
             }
+            discardCatalog(c);
             c.state = .closed;
             c.used = false;
         }
@@ -850,16 +1056,19 @@ pub fn applyRxView(view: SegmentView) ?SegmentView {
     }
     if (matchConnection(view)) |c| {
         if (c.state == .syn_sent and (view.flags & (FLAG_SYN | FLAG_ACK)) == (FLAG_SYN | FLAG_ACK) and view.ack == c.seq +% 1) {
+            applyPeerHandshakeOptions(c, view);
             c.seq +%= 1;
             c.ack = view.seq +% 1;
             c.state = .established;
             updateTxWindow(c, view);
+            countNegotiation(c);
             stats.synack_rx += 1;
             stats.last_error = "synack";
         } else if (c.state == .syn_received and (view.flags & FLAG_ACK) != 0 and view.ack == c.seq +% 1) {
             c.seq +%= 1;
             c.state = .established;
             updateTxWindow(c, view);
+            countNegotiation(c);
             stats.accepts += 1;
             stats.last_error = "accepted";
         } else if (c.state == .established) {
@@ -888,7 +1097,10 @@ pub fn applyRxView(view: SegmentView) ?SegmentView {
             updateTxWindow(c, view);
             if ((view.flags & FLAG_FIN) != 0 and view.seq == c.ack) c.ack +%= 1;
             c.state = .closed;
-            c.used = false;
+            if ((view.flags & FLAG_FIN) == 0) {
+                discardCatalog(c);
+                c.used = false;
+            }
             stats.last_error = "closed";
         }
     }
@@ -1079,7 +1291,7 @@ fn findFlushableOutOfOrder(c: *const Connection) ?usize {
 
 fn outOfOrderCount(c: *const Connection) usize {
     var count_slots: usize = 0;
-    for (c.out_of_order) |slot| {
+    for (&c.out_of_order) |*slot| {
         if (slot.valid) count_slots += 1;
     }
     return count_slots;
@@ -1105,7 +1317,7 @@ fn reapClosedConnectionSlots() u32 {
     var i: usize = 0;
     while (i < connections.len) : (i += 1) {
         if (!connections[i].used or connections[i].state != .closed) continue;
-        connections[i] = .{};
+        resetConnectionSlot(&connections[i]);
         count += 1;
     }
     if (count != 0) stats.last_error = "closed-reap";
@@ -1139,6 +1351,7 @@ fn activeCount() u32 {
 fn rememberSent(c: *Connection, flags: u16, payload: []const u8, sent_tick: u64) bool {
     if (!tcp_runtime.needsTracking(flags, payload.len)) return true;
     if (c.sent.track(c.seq, c.ack, flags, payload, sent_tick) == null) return false;
+    noteCatalogAdded(payload.len);
     c.last_seq = c.seq;
     c.last_ack = c.ack;
     c.last_flags = flags;
@@ -1147,15 +1360,23 @@ fn rememberSent(c: *Connection, flags: u16, payload: []const u8, sent_tick: u64)
 }
 
 fn updateTxWindow(c: *Connection, view: SegmentView) void {
+    const shift: u5 = if (c.window_scale_active and (view.flags & FLAG_SYN) == 0)
+        @intCast(@min(c.peer_window_scale, MAX_WINDOW_SCALE))
+    else
+        0;
+    const advertised: u32 = @as(u32, view.window) << shift;
     if ((view.flags & FLAG_ACK) == 0) {
-        c.tx_window = view.window;
+        c.tx_window = advertised;
         return;
     }
     if (c.tx_ack == 0 or seqAfter(view.ack, c.tx_ack)) {
         c.tx_ack = view.ack;
     }
+    const before_segments = c.sent.count();
+    const before_bytes = c.sent.outstandingBytes();
     _ = c.sent.acknowledge(view.ack);
-    const right_edge = view.ack +% @as(u32, view.window);
+    noteCatalogReduced(before_segments, before_bytes, c.sent.count(), c.sent.outstandingBytes());
+    const right_edge = view.ack +% advertised;
     c.tx_window = if (seqAfter(right_edge, c.seq)) right_edge -% c.seq else 0;
 }
 
@@ -1209,6 +1430,7 @@ fn segmentSeqAcceptable(c: *const Connection, view: SegmentView) bool {
 // das Default-Init memsettet sonst rx + out_of_order (>350 KB pro Slot).
 // Die Pufferinhalte sind ohne used/rx_len/valid-Flags bedeutungslos.
 fn resetConnectionSlot(c: *Connection) void {
+    discardCatalog(c);
     c.used = false;
     c.id = 0;
     c.generation = 0;
@@ -1223,6 +1445,18 @@ fn resetConnectionSlot(c: *Connection) void {
     c.retransmits = 0;
     c.tx_window = 0;
     c.tx_ack = 0;
+    c.peer_mss = DEFAULT_PEER_MSS;
+    c.peer_window_scale = 0;
+    c.window_scale_offered = false;
+    c.window_scale_received = false;
+    c.window_scale_active = false;
+    c.negotiation_counted = false;
+    c.last_advertised_window = 0;
+    c.delayed_ack_pending = false;
+    c.delayed_ack_immediate = false;
+    c.delayed_ack_segments = 0;
+    c.delayed_ack_deadline = 0;
+    c.window_update_pending = false;
     c.rx_drops = 0;
     c.accepted_claimed = false;
     c.close_requested = false;
@@ -1233,7 +1467,6 @@ fn resetConnectionSlot(c: *Connection) void {
     c.last_ack = 0;
     c.last_flags = 0;
     c.last_len = 0;
-    c.sent.reset();
     for (&c.out_of_order) |*slot| slot.valid = false;
 }
 
@@ -1278,7 +1511,65 @@ pub fn reapTimeWait(now: u64) u32 {
 
 fn advertisedWindow(c: *const Connection) u16 {
     const free = rxFree(c);
-    return if (free > MAX_ADVERTISED_WINDOW) MAX_ADVERTISED_WINDOW else @intCast(free);
+    const scaled = if (c.window_scale_active) free >> LOCAL_WINDOW_SCALE else free;
+    return if (scaled > MAX_ADVERTISED_WINDOW) MAX_ADVERTISED_WINDOW else @intCast(scaled);
+}
+
+fn advertisedWindowForFlags(c: *const Connection, flags: u16) u16 {
+    // RFC 7323: the window field in SYN/SYN-ACK itself is never scaled.
+    if ((flags & FLAG_SYN) != 0) {
+        const free = rxFree(c);
+        return if (free > MAX_ADVERTISED_WINDOW) MAX_ADVERTISED_WINDOW else @intCast(free);
+    }
+    return advertisedWindow(c);
+}
+
+fn sanitizedPeerMss(value: u16) u16 {
+    if (value == 0) return DEFAULT_PEER_MSS;
+    // The peer's explicit limit is authoritative even when unusually small;
+    // catalog capacity still provides the hard per-call packet-work bound.
+    return @min(LOCAL_MSS, value);
+}
+
+fn applyPeerHandshakeOptions(c: *Connection, view: SegmentView) void {
+    c.peer_mss = sanitizedPeerMss(view.mss);
+    c.window_scale_received = view.window_scale_present;
+    c.peer_window_scale = if (view.window_scale_present) @min(view.window_scale, MAX_WINDOW_SCALE) else 0;
+    c.window_scale_active = c.window_scale_offered and c.window_scale_received;
+}
+
+fn countNegotiation(c: *Connection) void {
+    if (c.negotiation_counted) return;
+    c.negotiation_counted = true;
+    if (c.peer_mss != DEFAULT_PEER_MSS) stats.mss_negotiated += 1;
+    if (c.window_scale_active) stats.window_scale_negotiated += 1;
+}
+
+fn optionsForFlags(c: *const Connection, flags: u16) u32 {
+    if ((flags & FLAG_SYN) == 0) return 0;
+    const scale: ?u8 = if (c.window_scale_offered) LOCAL_WINDOW_SCALE else null;
+    return optionMetadata(LOCAL_MSS, scale);
+}
+
+fn noteCatalogAdded(payload_len: usize) void {
+    stats.outstanding_segments_current +%= 1;
+    stats.outstanding_bytes_current +%= @intCast(payload_len);
+    if (stats.outstanding_segments_current > stats.outstanding_segments_peak) {
+        stats.outstanding_segments_peak = stats.outstanding_segments_current;
+    }
+    if (stats.outstanding_bytes_current > stats.outstanding_bytes_peak) {
+        stats.outstanding_bytes_peak = stats.outstanding_bytes_current;
+    }
+}
+
+fn noteCatalogReduced(before_segments: usize, before_bytes: usize, after_segments: usize, after_bytes: usize) void {
+    if (before_segments > after_segments) stats.outstanding_segments_current -|= @intCast(before_segments - after_segments);
+    if (before_bytes > after_bytes) stats.outstanding_bytes_current -|= @intCast(before_bytes - after_bytes);
+}
+
+fn discardCatalog(c: *Connection) void {
+    noteCatalogReduced(c.sent.count(), c.sent.outstandingBytes(), 0, 0);
+    c.sent.reset();
 }
 
 fn listenerCount() u32 {
@@ -1463,6 +1754,125 @@ pub fn gracefulCloseProbe() bool {
     };
     _ = applyRxView(fin_ack) orelse return false;
     return connectionIdentity(conn_id) == null;
+}
+
+// Verifies the pure TCP state behind the 0.75.18 burst path without a NIC:
+// append-only SYN options, a 4,068-byte three-MSS burst, cumulative/partial
+// ACK ownership, a zero-window stop and the RFC delayed-ACK second-segment
+// exception. Wire serialization remains owned by NETTCP.R4P's module build.
+pub fn performanceContractProbe() bool {
+    const remote: [4]u8 = .{ 198, 51, 100, 95 };
+    const local: [4]u8 = .{ 192, 0, 2, 2 };
+    const initial_seq: u32 = 0x6000;
+    const remote_seq: u32 = 0x7000;
+    const before_mss = stats.mss_negotiated;
+    const before_scale = stats.window_scale_negotiated;
+    const before_coalesced = stats.ack_coalesced;
+
+    const conn = beginLiveConnect(remote, 65095, initial_seq);
+    if (conn <= 0) return false;
+    const conn_id: u32 = @intCast(conn);
+    defer abort(conn_id, "performance-probe");
+
+    const syn_plan = planSend(conn_id, FLAG_SYN) orelse return false;
+    if (syn_plan.rx_window != MAX_ADVERTISED_WINDOW or
+        optionMss(syn_plan.options) != LOCAL_MSS or
+        optionWindowScale(syn_plan.options) != LOCAL_WINDOW_SCALE)
+    {
+        return false;
+    }
+    if (!commitSent(conn_id, FLAG_SYN, "", 1)) return false;
+
+    const c = byId(conn_id) orelse return false;
+    const syn_ack = SegmentView{
+        .source_ip = remote,
+        .dest_ip = local,
+        .source_port = c.remote_port,
+        .dest_port = c.local_port,
+        .seq = remote_seq,
+        .ack = initial_seq +% 1,
+        .flags = FLAG_SYN | FLAG_ACK,
+        .window = MAX_ADVERTISED_WINDOW,
+        .mss = LOCAL_MSS,
+        .window_scale = 3,
+        .window_scale_present = true,
+        .payload = "",
+    };
+    _ = applyRxView(syn_ack) orelse return false;
+    if (!established(conn_id) or c.peer_mss != LOCAL_MSS or !c.window_scale_active) return false;
+    if (stats.mss_negotiated != before_mss +% 1 or stats.window_scale_negotiated != before_scale +% 1) return false;
+    if (sanitizedPeerMss(0) != DEFAULT_PEER_MSS or sanitizedPeerMss(4096) != LOCAL_MSS) return false;
+
+    const requested: usize = 4068;
+    const probe_payload = [_]u8{0x5A} ** LOCAL_MSS;
+    var written: usize = 0;
+    var segments: usize = 0;
+    while (written < requested) {
+        const allowed = sendAllowance(conn_id, requested - written);
+        if (allowed == 0) return false;
+        const flags = FLAG_ACK | (if (written + allowed == requested) FLAG_PSH else 0);
+        if (!commitSent(conn_id, flags, probe_payload[0..allowed], @intCast(2 + segments))) return false;
+        written += allowed;
+        segments += 1;
+    }
+    if (segments != 3 or outstandingCount(conn_id) != 3 or outstandingBytes(conn_id) != requested) return false;
+
+    const data_seq = initial_seq +% 1;
+    const partial_ack_value = data_seq +% LOCAL_MSS +% 100;
+    const partial_ack = SegmentView{
+        .source_ip = remote,
+        .dest_ip = local,
+        .source_port = c.remote_port,
+        .dest_port = c.local_port,
+        .seq = c.ack,
+        .ack = partial_ack_value,
+        .flags = FLAG_ACK,
+        .window = MAX_ADVERTISED_WINDOW,
+        .payload = "",
+    };
+    _ = applyRxView(partial_ack) orelse return false;
+    const retransmit = planRetransmit(conn_id, .data) orelse return false;
+    if (outstandingCount(conn_id) != 2 or outstandingBytes(conn_id) != requested - LOCAL_MSS - 100 or
+        retransmit.seq != partial_ack_value)
+    {
+        return false;
+    }
+
+    var zero_window = partial_ack;
+    zero_window.window = 0;
+    _ = applyRxView(zero_window) orelse return false;
+    if (sendAllowance(conn_id, 1) != 0 or writeBlockReason(conn_id) != .remote_window) return false;
+
+    const first_previous_ack = c.ack;
+    const first_data = SegmentView{
+        .source_ip = remote,
+        .dest_ip = local,
+        .source_port = c.remote_port,
+        .dest_port = c.local_port,
+        .seq = first_previous_ack,
+        .ack = partial_ack_value,
+        .flags = FLAG_ACK | FLAG_PSH,
+        .window = MAX_ADVERTISED_WINDOW,
+        .payload = "A",
+    };
+    _ = applyRxView(first_data) orelse return false;
+    if (requestAck(conn_id, first_previous_ack, first_data, 100, 5) != .delayed) return false;
+    const identity = connectionIdentity(conn_id) orelse return false;
+    if (delayedAckDue(identity.slot, 104) != null) return false;
+
+    const second_previous_ack = c.ack;
+    var second_data = first_data;
+    second_data.seq = second_previous_ack;
+    second_data.payload = "B";
+    _ = applyRxView(second_data) orelse return false;
+    if (requestAck(conn_id, second_previous_ack, second_data, 101, 5) != .immediate) return false;
+    if (delayedAckDue(identity.slot, 101) != conn_id or stats.ack_coalesced != before_coalesced +% 1) return false;
+    const ack_plan = planSend(conn_id, FLAG_ACK) orelse return false;
+    noteAckSent(conn_id, false, ack_plan.rx_window);
+    if (delayedAckDue(identity.slot, 200) != null) return false;
+
+    stats.self_tests +%= 1;
+    return true;
 }
 const tcp_runtime = @import("tcp_runtime.zig");
 const r4x_api = @import("../program/r4x_api.zig");

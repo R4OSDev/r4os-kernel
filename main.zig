@@ -158,6 +158,12 @@ export fn kmain() callconv(.c) noreturn {
     _ = smp.runAcceptanceProbeIfEnabled(memory_boot.usableBytes());
     if (quick_acceptance) {
         _ = runNvmeInterruptAcceptanceProbe();
+        if (net_core.runTcpPerformanceContractProbe()) {
+            log.puts("[TCPBURSTPROBE] result=OK write_bytes=4068 segments=3 catalog=48 delayed_ack_ms=40\r\n");
+        } else {
+            log.puts("[TCPBURSTPROBE] result=FAILED\r\n");
+            fatal.kernelFatal(.runtime, "TCP burst probe failed");
+        }
         log.puts("[QUICKPROBE] result=DONE\r\n");
     }
     // 0.56.2: Hintergrund-RX-Task - NACH initTaskRuntime (sonst von

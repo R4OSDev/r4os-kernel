@@ -7369,6 +7369,7 @@ fn configureR4XStartR4NetTable() void {
         .serial_link_inbox = &r4api.r4net.serialLinkInbox,
         .net_service_request = &r4api.r4net.netServiceRequest,
         .ipc_performance = &r4api.r4net.ipcPerformance,
+        .tcp_performance = &r4api.r4net.tcpPerformance,
     });
 }
 

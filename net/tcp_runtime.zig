@@ -1,6 +1,10 @@
 pub const CONNECTION_CAPACITY: usize = 16;
-pub const SENT_SEGMENT_CAPACITY: usize = 8;
-pub const SENT_PAYLOAD_CAPACITY: usize = 2048;
+// One bounded catalog can cover a complete unscaled TCP receive window.
+// 48 * 1460 = 70,080 bytes, so a sender is no longer artificially stopped
+// after the historical eight MSS while ownership of every retransmittable
+// byte remains explicit and bounded.
+pub const SENT_SEGMENT_CAPACITY: usize = 48;
+pub const SENT_PAYLOAD_CAPACITY: usize = 1460;
 
 pub const FLAG_FIN: u16 = 0x001;
 pub const FLAG_SYN: u16 = 0x002;
@@ -73,7 +77,9 @@ pub const SendCatalog = struct {
     }
 
     pub fn hasCapacity(self: *const SendCatalog) bool {
-        for (self.segments) |segment| {
+        // Iterate through the owner in place. Copying this bounded catalog to
+        // a task stack costs about 70 KB at the current 48-segment limit.
+        for (&self.segments) |*segment| {
             if (!segment.valid) return true;
         }
         return false;
@@ -81,8 +87,20 @@ pub const SendCatalog = struct {
 
     pub fn count(self: *const SendCatalog) usize {
         var result: usize = 0;
-        for (self.segments) |segment| {
+        for (&self.segments) |*segment| {
             if (segment.valid) result += 1;
+        }
+        return result;
+    }
+
+    pub fn freeCount(self: *const SendCatalog) usize {
+        return SENT_SEGMENT_CAPACITY - self.count();
+    }
+
+    pub fn outstandingBytes(self: *const SendCatalog) usize {
+        var result: usize = 0;
+        for (&self.segments) |*segment| {
+            if (segment.valid) result += segment.payload_len;
         }
         return result;
     }
@@ -260,6 +278,27 @@ test "remote window and catalog capacity bound each write" {
     try testing.expectEqual(@as(usize, 0), sendAllowance(1460, 1460, false));
     try testing.expectEqual(@as(usize, 512), sendAllowance(512, 1460, true));
     try testing.expectEqual(@as(usize, 1460), sendAllowance(4096, 1460, true));
+}
+
+test "bounded catalog spans more than one unscaled receive window burst" {
+    const testing = @import("std").testing;
+    try testing.expect(SENT_SEGMENT_CAPACITY * SENT_PAYLOAD_CAPACITY >= 65_535);
+
+    var catalog: SendCatalog = .{};
+    var seq: u32 = 1000;
+    var payload: [SENT_PAYLOAD_CAPACITY]u8 = .{0x5A} ** SENT_PAYLOAD_CAPACITY;
+    var index: usize = 0;
+    while (index < SENT_SEGMENT_CAPACITY) : (index += 1) {
+        _ = catalog.track(seq, 500, 0x018, payload[0..], @intCast(index + 1)) orelse return error.TestUnexpectedResult;
+        seq +%= SENT_PAYLOAD_CAPACITY;
+    }
+    try testing.expectEqual(SENT_SEGMENT_CAPACITY, catalog.count());
+    try testing.expectEqual(@as(usize, 0), catalog.freeCount());
+    try testing.expectEqual(SENT_SEGMENT_CAPACITY * SENT_PAYLOAD_CAPACITY, catalog.outstandingBytes());
+    try testing.expect(catalog.track(seq, 500, 0x018, payload[0..], 99) == null);
+
+    _ = catalog.acknowledge(1000 + 9 * SENT_PAYLOAD_CAPACITY);
+    try testing.expectEqual(@as(usize, 9), catalog.freeCount());
 }
 
 test "loss recovery retains every segment and advances on cumulative and partial ACKs" {

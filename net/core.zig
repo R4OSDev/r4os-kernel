@@ -81,6 +81,8 @@ const TCP_MAX_RETRANSMITS: u8 = 5;
 // 0.56.23: adaptiver RTO - SRTT-Glaettung, geklemmt auf 50 ms..1,5 s.
 const TCP_RTO_MIN_TICKS: u64 = timing.msToTicks(50);
 const TCP_RTO_MAX_TICKS: u64 = timing.msToTicks(1_500);
+pub const TCP_DELAYED_ACK_MS: u32 = 40;
+const TCP_DELAYED_ACK_TICKS: u64 = @max(1, timing.msToTicks(TCP_DELAYED_ACK_MS));
 // 0.56.23: 512 -> 32; seit net-rx-Task (0.56.2) und NIC-IRQ (0.56.21)
 // ist das Poll hier nur noch Opportunismus, kein Antrieb.
 const TCP_POLL_ROUNDS: usize = 32;
@@ -93,6 +95,38 @@ pub const TcpSummary = r4x_api.TcpSummary;
 pub const TcpConnectionInfo = r4x_api.TcpConnectionInfo;
 pub const TCP_BUFFER_SIZE: usize = tcp.BUFFER_SIZE;
 pub const TimingStatus = timing.Status;
+
+pub const TcpPerformance = struct {
+    local_mss: u32 = tcp.LOCAL_MSS,
+    catalog_capacity: u32 = tcp.SENT_SEGMENT_CAPACITY,
+    delayed_ack_ms: u32 = TCP_DELAYED_ACK_MS,
+    local_window_scale: u32 = tcp.LOCAL_WINDOW_SCALE,
+    outstanding_segments: u32 = 0,
+    outstanding_bytes: u32 = 0,
+    outstanding_segments_peak: u32 = 0,
+    outstanding_bytes_peak: u32 = 0,
+    write_calls: u64 = 0,
+    write_requested_bytes: u64 = 0,
+    write_completed_bytes: u64 = 0,
+    write_segments: u64 = 0,
+    write_partial: u64 = 0,
+    remote_window_stalls: u64 = 0,
+    catalog_stalls: u64 = 0,
+    backend_busy_stalls: u64 = 0,
+    pure_ack_tx: u64 = 0,
+    delayed_ack_requests: u64 = 0,
+    delayed_ack_tx: u64 = 0,
+    immediate_ack_tx: u64 = 0,
+    ack_coalesced: u64 = 0,
+    ack_piggybacked: u64 = 0,
+    window_update_tx: u64 = 0,
+    adapter_poll_rounds: u64 = 0,
+    service_poll_requests: u64 = 0,
+    service_poll_skips: u64 = 0,
+    retransmits: u64 = 0,
+    mss_negotiated: u64 = 0,
+    window_scale_negotiated: u64 = 0,
+};
 
 pub const RxAdmission = enum {
     accepted,
@@ -629,6 +663,9 @@ var tcp_r4p_build: u64 = 0;
 var tcp_dispatch_failures: u64 = 0;
 var tcp_last_flags: u16 = 0;
 var tcp_last_error: []const u8 = "none";
+var adapter_poll_rounds: u64 = 0;
+var tcp_service_poll_requests: u64 = 0;
+var tcp_service_poll_skips: u64 = 0;
 var packet_corpus_tests: u64 = 0;
 var packet_corpus_cases: u64 = 0;
 var negative_path_tests: u64 = 0;
@@ -763,6 +800,9 @@ pub fn init() void {
     tcp_dispatch_failures = 0;
     tcp_last_flags = 0;
     tcp_last_error = "none";
+    adapter_poll_rounds = 0;
+    tcp_service_poll_requests = 0;
+    tcp_service_poll_skips = 0;
     packet_corpus_tests = 0;
     packet_corpus_cases = 0;
     negative_path_tests = 0;
@@ -3663,14 +3703,18 @@ fn tcpHandleRxMetadata(ip_view: ipv4.PacketView, l4_checksum_valid: bool) void {
     // Vor applyRxView sichern: RST/FIN duerfen den Slot im selben Aufruf
     // schliessen, der RTO-Zustand gehoert trotzdem genau dieser Generation.
     const rx_identity = tcp.connectionIdentityForSegment(view);
+    const rx_conn_id: ?u32 = if (rx_identity) |identity| identity.connection_id else tcp.connectionIdForSegment(view);
+    const previous_rx_ack: u32 = if (rx_conn_id) |conn_id| tcp.rxAckOf(conn_id) else 0;
     if (tcp.applyRxView(view)) |parsed| {
         if ((parsed.flags & tcp.FLAG_SYN) != 0 and (parsed.flags & tcp.FLAG_ACK) == 0) {
             if (tcp.acceptInbound(parsed, nextTcpSeq(parsed.source_ip, parsed.source_port))) |conn_id| {
                 _ = sendTcpForConnection(conn_id, tcp.FLAG_SYN | tcp.FLAG_ACK, "");
             }
-        } else if (parsed.payload.len != 0 and (parsed.flags & tcp.FLAG_RST) == 0) {
-            if (tcp.connectionIdForSegment(parsed)) |conn_id| {
-                _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
+        } else if ((parsed.payload.len != 0 or (parsed.flags & tcp.FLAG_FIN) != 0) and (parsed.flags & tcp.FLAG_RST) == 0) {
+            if (rx_conn_id) |conn_id| {
+                if (tcp.requestAck(conn_id, previous_rx_ack, parsed, time_core.monotonicTicks(), TCP_DELAYED_ACK_TICKS) == .immediate) {
+                    _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
+                }
             }
         }
         // ACK-Fortschritt wird gegen die vor dem Zustandswechsel gebundene
@@ -3724,11 +3768,14 @@ fn tcpViewFromOp(op: r4p_contract.TcpOp, ip_view: ipv4.PacketView) ?tcp.SegmentV
         .ack = op.ack,
         .flags = op.flags,
         .window = op.reserved,
+        .mss = tcp.optionMss(op.index),
+        .window_scale = tcp.optionWindowScale(op.index) orelse 0,
+        .window_scale_present = tcp.optionWindowScale(op.index) != null,
         .payload = op.payload[0..payload_len],
     };
 }
 
-fn tcpBuildSegment(out: []u8, source_ip: [4]u8, dest_ip: [4]u8, source_port: u16, dest_port: u16, seq: u32, ack: u32, flags: u16, payload: []const u8, window: u16) ?[]u8 {
+fn tcpBuildSegment(out: []u8, source_ip: [4]u8, dest_ip: [4]u8, source_port: u16, dest_port: u16, seq: u32, ack: u32, flags: u16, payload: []const u8, window: u16, options: u32) ?[]u8 {
     var op = newTcpOp() orelse {
         tcp_dispatch_failures += 1;
         tcp_last_error = "r4p-required";
@@ -3742,6 +3789,7 @@ fn tcpBuildSegment(out: []u8, source_ip: [4]u8, dest_ip: [4]u8, source_port: u16
     op.ack = ack;
     op.flags = flags;
     op.reserved = window;
+    op.index = options;
     if (!setTcpPayload(&op, payload) or !tcpDispatch(r4p_contract.TCP_OP_BUILD_SEGMENT, &op)) {
         tcp_last_error = "r4p-dispatch";
         return null;
@@ -4436,10 +4484,16 @@ pub fn runLimitContractProbe() bool {
 
     if (!tcp.gracefulCloseProbe()) return false;
     passed += 1;
+    if (!runTcpPerformanceContractProbe()) return false;
+    passed += 1;
 
     limit_contract_tests += 1;
     limit_contract_cases += passed;
     return true;
+}
+
+pub fn runTcpPerformanceContractProbe() bool {
+    return tcp.performanceContractProbe();
 }
 
 fn limitTxTooLarge() bool {
@@ -4652,7 +4706,7 @@ fn negativeTcpResetClosedPort() bool {
     }
 
     var segment_buf: [64]u8 = .{0} ** 64;
-    const segment = tcpBuildSegment(segment_buf[0..], remote_ip, net_config.localIp(), info.remote_port, info.local_port, 1, info.seq +% 1, tcp.FLAG_ACK | tcp.FLAG_RST, "", tcp.MAX_ADVERTISED_WINDOW) orelse {
+    const segment = tcpBuildSegment(segment_buf[0..], remote_ip, net_config.localIp(), info.remote_port, info.local_port, 1, info.seq +% 1, tcp.FLAG_ACK | tcp.FLAG_RST, "", tcp.MAX_ADVERTISED_WINDOW, 0) orelse {
         tcp.abort(conn_id, "negative-rst-build");
         return false;
     };
@@ -4890,7 +4944,7 @@ fn corpusTcp() bool {
     var before_summary: tcp.Summary = .{};
     tcpSummary(&before_summary);
     var segment_buf: [64]u8 = .{0} ** 64;
-    const segment = tcpBuildSegment(segment_buf[0..], source_ip, dest_ip, 80, 49152, 1, 0, tcp.FLAG_ACK, "BAD", tcp.MAX_ADVERTISED_WINDOW) orelse return false;
+    const segment = tcpBuildSegment(segment_buf[0..], source_ip, dest_ip, 80, 49152, 1, 0, tcp.FLAG_ACK, "BAD", tcp.MAX_ADVERTISED_WINDOW, 0) orelse return false;
     segment_buf[tcp.HEADER_SIZE] ^= 1;
     const packet_checksum = ipv4.PacketView{ .protocol = tcp.IPV4_PROTOCOL, .source_ip = source_ip, .dest_ip = dest_ip, .payload = segment };
     tcpHandleRx(packet_checksum);
@@ -4909,6 +4963,40 @@ fn refreshIpv4HeaderChecksum(frame: []u8) void {
 
 pub fn tcpStats() tcp.Stats {
     return tcp.getStats();
+}
+
+pub fn tcpPerformance(out: *TcpPerformance) void {
+    const stats = tcp.getStats();
+    var outstanding_segments: u32 = 0;
+    var outstanding_bytes: u32 = 0;
+    tcp.outstandingTotals(&outstanding_segments, &outstanding_bytes);
+    out.* = .{
+        .outstanding_segments = outstanding_segments,
+        .outstanding_bytes = outstanding_bytes,
+        .outstanding_segments_peak = stats.outstanding_segments_peak,
+        .outstanding_bytes_peak = stats.outstanding_bytes_peak,
+        .write_calls = stats.write_calls,
+        .write_requested_bytes = stats.write_requested_bytes,
+        .write_completed_bytes = stats.write_completed_bytes,
+        .write_segments = stats.write_segments,
+        .write_partial = stats.write_partial,
+        .remote_window_stalls = stats.remote_window_stalls,
+        .catalog_stalls = stats.catalog_stalls,
+        .backend_busy_stalls = stats.backend_busy_stalls,
+        .pure_ack_tx = stats.pure_ack_tx,
+        .delayed_ack_requests = stats.delayed_ack_requests,
+        .delayed_ack_tx = stats.delayed_ack_tx,
+        .immediate_ack_tx = stats.immediate_ack_tx,
+        .ack_coalesced = stats.ack_coalesced,
+        .ack_piggybacked = stats.ack_piggybacked,
+        .window_update_tx = stats.window_update_tx,
+        .adapter_poll_rounds = adapter_poll_rounds,
+        .service_poll_requests = tcp_service_poll_requests,
+        .service_poll_skips = tcp_service_poll_skips,
+        .retransmits = stats.retransmits,
+        .mss_negotiated = stats.mss_negotiated,
+        .window_scale_negotiated = stats.window_scale_negotiated,
+    };
 }
 
 pub fn arpCacheAgeTicks() u64 {
@@ -5064,6 +5152,11 @@ pub fn pollAdapters(rounds: usize) void {
     pollAdapterMask(rounds, ALL_ADAPTER_MASK);
 }
 
+fn pollAdaptersWithoutRxTask(rounds: usize) void {
+    if (rx_task_started) return;
+    pollAdapters(rounds);
+}
+
 fn pollAdapterMask(rounds: usize, adapter_mask: u16) void {
     if (!enterBackendCallback()) return;
     defer leaveBackendCallback();
@@ -5104,7 +5197,10 @@ fn pollAdaptersInner(rounds: usize, adapter_mask: u16) void {
     while (index < adapter_count) : (index += 1) {
         const bit = @as(u16, 1) << @intCast(index);
         if ((adapter_mask & bit) == 0) continue;
-        if (adapters[index].ops.poll) |poll| poll(index);
+        if (adapters[index].ops.poll) |poll| {
+            adapter_poll_rounds +%= 1;
+            poll(index);
+        }
     }
 }
 
@@ -5389,6 +5485,7 @@ fn rxTaskMain() callconv(.c) void {
         // TCP-Fristen verwenden ausschliesslich dieselbe monotone Tick-Domain
         // wie ihre Sendestempel. iterations bleibt nur der Log-Zaehler.
         const now = time_core.monotonicTicks();
+        flushDelayedAcks(now);
         proactiveRetransmitSweep(now);
         proactiveCloseSweep();
         _ = tcp.reapTimeWait(now);
@@ -6182,7 +6279,7 @@ pub fn sendIpv4Payload(target_ip: [4]u8, protocol: u8, payload: []const u8) TxRe
     var frame: [MAX_PACKET_SIZE]u8 = .{0} ** MAX_PACKET_SIZE;
     const ip_frame = ipv4BuildPacket(frame[0..], adapters[0].mac, dest_mac, target_ip, protocol, payload) orelse return rejectIpv4TxTooLarge(protocol, target_ip, "tx-build");
     const result = transmit(0, ip_frame);
-    if (result == .ok) pollAdapters(TCP_POLL_ROUNDS); // 0.56.23: 32768-Exzess entfernt
+    if (result == .ok) pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
     return result;
 }
 
@@ -6472,7 +6569,7 @@ pub fn icmpEchoTarget(target_ip: [4]u8) TxResult {
     var frame: [ethernet.MIN_FRAME_SIZE]u8 = .{0} ** ethernet.MIN_FRAME_SIZE;
     const ip_frame = ipv4BuildPacket(frame[0..], adapters[0].mac, dest_mac, target_ip, icmp.IPV4_PROTOCOL, echo) orelse return .too_large;
     const result = transmit(0, ip_frame);
-    if (result == .ok) pollAdapters(TCP_POLL_ROUNDS); // 0.56.23: 32768-Exzess entfernt
+    if (result == .ok) pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
     return result;
 }
 
@@ -6525,20 +6622,46 @@ pub fn tcpConnectUntil(remote_ip: [4]u8, port: u16, request_deadline_tick: ?u64)
 }
 
 pub fn tcpWrite(conn_id: u32, data: []const u8) i32 {
-    if (!tcp.established(conn_id) or data.len > MAX_PACKET_SIZE - tcp.HEADER_SIZE) return r4p_contract.TCP_RESULT_BAD_STATE;
-    const allowed = tcp.sendAllowance(conn_id, data.len);
-    if (allowed == 0) return 0;
-    const result = sendTcpForConnection(conn_id, tcp.FLAG_ACK | tcp.FLAG_PSH, data[0..allowed]) orelse return r4p_contract.TCP_RESULT_NO_CONNECTION;
-    if (result == .busy) return 0;
-    if (result != .ok) return r4p_contract.TCP_RESULT_BAD_STATE;
-    return @intCast(allowed);
+    if (!tcp.established(conn_id)) return r4p_contract.TCP_RESULT_BAD_STATE;
+    if (data.len == 0) return 0;
+    tcp.recordWriteStart(data.len);
+
+    var total: usize = 0;
+    var segments: usize = 0;
+    var hard_error = false;
+    while (total < data.len) {
+        const allowed = tcp.sendAllowance(conn_id, data.len - total);
+        if (allowed == 0) break;
+        const final_segment = total + allowed == data.len;
+        const flags: u16 = tcp.FLAG_ACK | (if (final_segment) tcp.FLAG_PSH else 0);
+        const result = sendTcpForConnection(conn_id, flags, data[total .. total + allowed]) orelse {
+            hard_error = true;
+            break;
+        };
+        if (result == .busy) {
+            tcp.recordBackendBusy();
+            break;
+        }
+        if (result != .ok) {
+            hard_error = true;
+            break;
+        }
+        total += allowed;
+        segments += 1;
+    }
+
+    const block = if (total < data.len) tcp.writeBlockReason(conn_id) else .none;
+    tcp.recordWriteFinish(data.len, total, segments, block);
+    if (total != 0) return @intCast(total);
+    if (hard_error) return r4p_contract.TCP_RESULT_BAD_STATE;
+    return 0;
 }
 
 pub fn tcpRead(conn_id: u32, out: []u8) i32 {
-    pollAdapters(TCP_POLL_ROUNDS);
+    pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
     const immediate = tcp.read(conn_id, out);
     if (immediate > 0) {
-        _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
+        if (tcp.windowUpdateRequired(conn_id)) _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
         return immediate;
     }
     if (immediate != 0) return immediate;
@@ -6551,14 +6674,10 @@ pub fn tcpRead(conn_id: u32, out: []u8) i32 {
 
 pub fn tcpReadAvailable(conn_id: u32, out: []u8) i32 {
     if (out.len == 0) return 0;
-    pollAdapters(TCP_POLL_ROUNDS);
-    var immediate = tcp.read(conn_id, out);
-    if (immediate == 0) {
-        pollAdapters(TCP_POLL_ROUNDS);
-        immediate = tcp.read(conn_id, out);
-    }
+    pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
+    const immediate = tcp.read(conn_id, out);
     if (immediate > 0) {
-        _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
+        if (tcp.windowUpdateRequired(conn_id)) _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
     }
     return immediate;
 }
@@ -6572,6 +6691,11 @@ pub fn tcpHasListener(port: u16) bool {
 }
 
 pub fn tcpPollService() void {
+    tcp_service_poll_requests +%= 1;
+    if (rx_task_started) {
+        tcp_service_poll_skips +%= 1;
+        return;
+    }
     pollAdapters(TCP_POLL_ROUNDS);
 }
 
@@ -6595,12 +6719,12 @@ pub fn tcpEchoListenOnce(port: u16, out: []u8) i32 {
     const deadline = timing.Deadline.start(TCP_LISTEN_TIMEOUT_TICKS, 0);
     var loops: usize = 0;
     while (!deadline.loopLimitReached(loops)) : (loops += 1) {
-        pollAdapters(TCP_POLL_ROUNDS);
+        pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
         if (tcp.connectionWithDataOnPort(port)) |conn_id| {
             const got = tcp.read(conn_id, out);
             if (got > 0) {
                 const len: usize = @intCast(got);
-                _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
+                if (tcp.windowUpdateRequired(conn_id)) _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
                 _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK | tcp.FLAG_PSH, out[0..len]);
                 _ = tcpClose(conn_id);
                 tcp.closeListener(port);
@@ -6630,13 +6754,13 @@ pub fn tcpAcceptReadOnce(port: u16, out: []u8, conn_id_out: *u32) i32 {
     const deadline = timing.Deadline.start(TCP_LISTEN_TIMEOUT_TICKS, 0);
     var loops: usize = 0;
     while (!deadline.loopLimitReached(loops)) : (loops += 1) {
-        pollAdapters(TCP_POLL_ROUNDS);
+        pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
         if (tcp.connectionWithDataOnPort(port)) |conn_id| {
             const got = tcp.read(conn_id, out);
             if (got > 0) {
                 conn_id_out.* = conn_id;
                 _ = tcp.claimAccepted(conn_id);
-                _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
+                if (tcp.windowUpdateRequired(conn_id)) _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
                 tcp.closeListener(port);
                 return got;
             }
@@ -6667,13 +6791,13 @@ pub fn tcpAcceptReadOnListener(port: u16, out: []u8, conn_id_out: *u32) i32 {
     const deadline = timing.Deadline.start(TCP_LISTEN_TIMEOUT_TICKS, 0);
     var loops: usize = 0;
     while (!deadline.loopLimitReached(loops)) : (loops += 1) {
-        pollAdapters(TCP_POLL_ROUNDS);
+        pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
         if (tcp.connectionWithDataOnPort(port)) |conn_id| {
             const got = tcp.read(conn_id, out);
             if (got > 0) {
                 conn_id_out.* = conn_id;
                 _ = tcp.claimAccepted(conn_id);
-                _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
+                if (tcp.windowUpdateRequired(conn_id)) _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
                 return got;
             }
         }
@@ -6701,7 +6825,7 @@ pub fn tcpAcceptOnListener(port: u16, conn_id_out: *u32) i32 {
     const deadline = timing.Deadline.start(TCP_LISTEN_TIMEOUT_TICKS, 0);
     var loops: usize = 0;
     while (!deadline.loopLimitReached(loops)) : (loops += 1) {
-        pollAdapters(TCP_POLL_ROUNDS);
+        pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
         if (tcp.connectionOnPort(port)) |conn_id| {
             conn_id_out.* = conn_id;
             _ = tcp.claimAccepted(conn_id);
@@ -6729,7 +6853,7 @@ pub fn tcpAcceptPollOnListener(port: u16, conn_id_out: *u32) i32 {
         return 0;
     }
 
-    pollAdapters(TCP_POLL_ROUNDS);
+    pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
     if (tcp.connectionOnPort(port)) |conn_id| {
         conn_id_out.* = conn_id;
         _ = tcp.claimAccepted(conn_id);
@@ -6803,7 +6927,7 @@ fn sendTcpForConnection(conn_id: u32, flags: u16, payload: []const u8) ?TxResult
     // Der Katalogplatz wird vor dem Drahtzugriff reservierbar geprueft. So
     // kann kein erfolgreich gesendetes Segment ohne Retransmitbesitz enden.
     if (!tcp.canTrackSend(conn_id, flags, payload.len)) return .busy;
-    const plan = tcp.planSend(conn_id) orelse return null;
+    const plan = tcp.planSend(conn_id, flags) orelse return null;
     var result = sendTcpFromPlan(plan, flags, payload);
     // 0.56.7: .busy = TX-Ring voll (alle 4 Slots in Flight, z.B. kurzer
     // SLIRP-Stau). NUR Payload-Segmente kurz mit yield nachsetzen:
@@ -6825,6 +6949,7 @@ fn sendTcpForConnection(conn_id: u32, flags: u16, payload: []const u8) ?TxResult
     if (result == .ok) {
         const sent_tick = time_core.monotonicTicks();
         if (!tcp.commitSent(conn_id, flags, payload, sent_tick)) return .backend_error;
+        if ((flags & tcp.FLAG_ACK) != 0) tcp.noteAckSent(conn_id, payload.len != 0, plan.rx_window);
         if (tcp_runtime.needsTracking(flags, payload.len)) rtoStampSend(conn_id);
     }
     return result;
@@ -6832,14 +6957,14 @@ fn sendTcpForConnection(conn_id: u32, flags: u16, payload: []const u8) ?TxResult
 
 fn sendTcpFromPlan(plan: tcp.SendPlan, flags: u16, payload: []const u8) TxResult {
     var segment_buf: [MAX_PACKET_SIZE]u8 = .{0} ** MAX_PACKET_SIZE;
-    const segment = tcpBuildSegment(segment_buf[0..], net_config.localIp(), plan.remote_ip, plan.local_port, plan.remote_port, plan.seq, plan.ack, flags, payload, plan.rx_window) orelse return .too_large;
+    const segment = tcpBuildSegment(segment_buf[0..], net_config.localIp(), plan.remote_ip, plan.local_port, plan.remote_port, plan.seq, plan.ack, flags, payload, plan.rx_window, plan.options) orelse return .too_large;
     return sendIpv4Payload(plan.remote_ip, tcp.IPV4_PROTOCOL, segment);
 }
 
 fn retransmitTcpConnection(conn_id: u32, kind: tcp.RetransmitKind, reason: []const u8) TxResult {
     const plan = tcp.planRetransmit(conn_id, kind) orelse return .backend_error;
     var segment_buf: [MAX_PACKET_SIZE]u8 = .{0} ** MAX_PACKET_SIZE;
-    const segment = tcpBuildSegment(segment_buf[0..], net_config.localIp(), plan.remote_ip, plan.local_port, plan.remote_port, plan.seq, plan.ack, plan.flags, plan.payload, plan.rx_window) orelse return .too_large;
+    const segment = tcpBuildSegment(segment_buf[0..], net_config.localIp(), plan.remote_ip, plan.local_port, plan.remote_port, plan.seq, plan.ack, plan.flags, plan.payload, plan.rx_window, plan.options) orelse return .too_large;
     const result = sendIpv4Payload(plan.remote_ip, tcp.IPV4_PROTOCOL, segment);
     if (result == .ok) {
         const sent_tick = time_core.monotonicTicks();
@@ -6902,6 +7027,14 @@ fn rtoBackoff(conn_id: u32, retransmits: u8) u64 {
 // FIN-Segment. SYN bleibt Eigentum der synchronen Connect-Schleife; FIN
 // gehoert nach dem nicht blockierenden tcpClose dem Kernelzustand.
 const PROACTIVE_MAX_RESEND: u8 = 5;
+
+fn flushDelayedAcks(now: u64) void {
+    var slot: usize = 0;
+    while (slot < tcp.MAX_CONNECTIONS) : (slot += 1) {
+        const conn_id = tcp.delayedAckDue(slot, now) orelse continue;
+        _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
+    }
+}
 
 fn proactiveRetransmitSweep(now: u64) void {
     var slot: usize = 0;
@@ -7032,7 +7165,7 @@ fn predStillWaitPortConn(raw: *anyopaque) bool {
 }
 
 fn waitForTcpEstablishedUntil(conn_id: u32, deadline_tick: u64) bool {
-    pollAdapters(TCP_POLL_ROUNDS);
+    pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
     var ctx = TcpWaitCtx{ .conn_id = conn_id };
     while (true) {
         if (tcp.established(conn_id)) return true;
@@ -7044,13 +7177,13 @@ fn waitForTcpEstablishedUntil(conn_id: u32, deadline_tick: u64) bool {
 }
 
 fn waitForTcpRead(conn_id: u32, out: []u8, timeout_ticks: u64) ?i32 {
-    pollAdapters(TCP_POLL_ROUNDS);
+    pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
     const deadline = timing.Deadline.start(timeout_ticks, 1);
     var ctx = TcpWaitCtx{ .conn_id = conn_id };
     while (true) {
         const got = tcp.read(conn_id, out);
         if (got > 0) {
-            _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
+            if (tcp.windowUpdateRequired(conn_id)) _ = sendTcpForConnection(conn_id, tcp.FLAG_ACK, "");
             return got;
         }
         if (got != 0) return got;
@@ -7060,7 +7193,7 @@ fn waitForTcpRead(conn_id: u32, out: []u8, timeout_ticks: u64) ?i32 {
 }
 
 fn waitForTcpClosed(conn_id: u32, timeout_ticks: u64) bool {
-    pollAdapters(TCP_POLL_ROUNDS);
+    pollAdaptersWithoutRxTask(TCP_POLL_ROUNDS);
     const deadline = timing.Deadline.start(timeout_ticks, 1);
     var ctx = TcpWaitCtx{ .conn_id = conn_id };
     while (true) {

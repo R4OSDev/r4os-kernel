@@ -63,13 +63,6 @@ const TCP_SERVICE_HANDLES: usize = 16;
 const TCP_STALE_HANDLE_TOMBSTONES: usize = 16;
 const TCP_MESSAGE_PAYLOAD_MAX: usize = ipc.MAX_MESSAGE_SIZE - HEADER_SIZE;
 const TCP_WRITE_PAYLOAD_MAX: usize = TCP_MESSAGE_PAYLOAD_MAX - 4;
-// 0.56.37: Draht-sichere Segmentgroesse fuer die kernelseitige
-// Zerlegung grosser IPC-Writes (MTU 1500 - 20 IP - 20 TCP = 1460;
-// tcpWrite baut genau EIN Segment pro Aufruf). Der erste Verdacht
-// "1514-Byte-Frames brechen" war falsch - der echte Bruch war der
-// unguarded RTL8139-transmit unter dem erstmals feuernden
-// net-rx-Retransmit (TX-Lock im Treiber, siehe RTL8139.R4D 0.56.37).
-const TCP_WIRE_SEGMENT_MAX: usize = 1460;
 const DHCP_STATUS_MAGIC: u32 = 0x53504844;
 const DHCP_STATUS_VERSION: u16 = 1;
 const DHCP_RESULT_MAGIC: u32 = 0x50514844;
@@ -1907,28 +1900,12 @@ fn tcpWriteResult(out: *TcpServiceResult, payload: []const u8, client_id: u16) [
     out.flags |= TCP_FLAG_HANDLE_VALID | TCP_FLAG_CONN_VALID;
     const data = payload[4..];
     out.requested_bytes = @intCast(data.len);
-    // 0.56.37: Seit ipc_max_message_size=4096 tragen Write-Requests bis
-    // ~4 KB Payload; net.tcpWrite baut aber genau EIN Draht-Segment pro
-    // Aufruf, und Chunks von 1461..1516 Bytes rutschen durch dessen
-    // groben Groessencheck (MAX_PACKET_SIZE-HEADER=1516) und sterben
-    // erst am MTU-Check in sendIpv4Payload (tx-mtu-Reject OHNE
-    // tx_large-Zaehler - Root-Cause der 0.56.37-Gate-FAILs, der
-    // Aufrufer retryte denselben Chunk endlos). Deshalb HIER in
-    // draht-sichere 1460er-Segmente zerlegen; bei Teilerfolg meldet
-    // bytes die real geschriebene Zahl (Partial-Write-Semantik, die
-    // SDK-Paced-Loops setzen den Rest fort).
-    var total: usize = 0;
-    var write_error: i32 = 0;
-    while (total < data.len) {
-        const chunk_len = @min(data.len - total, TCP_WIRE_SEGMENT_MAX);
-        const written = net.tcpWrite(conn_id, data[total .. total + chunk_len]);
-        if (written < 0) {
-            write_error = written;
-            break;
-        }
-        total += @intCast(written);
-        if (written != @as(i32, @intCast(chunk_len))) break;
-    }
+    // tcpWrite owns MSS segmentation and the bounded retransmit catalog.
+    // One IPC request therefore remains one measurable service write while
+    // partial progress is still reported exactly to the paced SDK loops.
+    const written = net.tcpWrite(conn_id, data);
+    const total: usize = if (written > 0) @intCast(written) else 0;
+    const write_error: i32 = if (written < 0) written else 0;
     if (total > 0 or data.len == 0) {
         out.result = 0;
         out.bytes = @intCast(total);
@@ -2369,24 +2346,9 @@ fn writeTcpWrite(w: *Writer, payload: []const u8, client_id: u16) void {
     }
     const conn_id = lookup.conn_id;
     const data = payload[4..];
-    // 0.56.37: IPC-Messages tragen jetzt bis ~4 KB Payload, tcpWrite
-    // sendet aber genau EIN Draht-Segment pro Aufruf (MTU 1500 =>
-    // 1460 Datenbytes). Grosse Service-Writes werden deshalb HIER in
-    // draht-sichere Segmente zerlegt; bei Teilerfolg wird die real
-    // geschriebene Byte-Zahl gemeldet und der Aufrufer setzt den Rest
-    // fort (gleiche Partial-Write-Semantik wie zuvor).
-    var total: usize = 0;
-    var write_error: i32 = 0;
-    while (total < data.len) {
-        const chunk_len = @min(data.len - total, TCP_WIRE_SEGMENT_MAX);
-        const written = net.tcpWrite(conn_id, data[total .. total + chunk_len]);
-        if (written < 0) {
-            write_error = written;
-            break;
-        }
-        total += @intCast(written);
-        if (written != @as(i32, @intCast(chunk_len))) break;
-    }
+    const written = net.tcpWrite(conn_id, data);
+    const total: usize = if (written > 0) @intCast(written) else 0;
+    const write_error: i32 = if (written < 0) written else 0;
     w.text("op=write result=");
     if (total > 0 or data.len == 0) {
         w.text("ok code=0 bytes=");

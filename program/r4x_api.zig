@@ -1777,6 +1777,7 @@ pub const IpcChannelInfo = generated.IpcChannelInfo;
 pub const IpcPerformanceSummary = generated.IpcPerformanceSummary;
 pub const TcpSummary = generated.TcpSummary;
 pub const TcpConnectionInfo = generated.TcpConnectionInfo;
+pub const TcpPerformanceInfo = generated.TcpPerformanceInfo;
 pub const TcpAcceptResult = generated.TcpAcceptResult;
 pub const NetIpv4Packet = generated.NetIpv4Packet;
 pub const NetConfigSnapshot = generated.NetConfigSnapshot;
