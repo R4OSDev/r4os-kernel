@@ -225,6 +225,25 @@ Backend oder kompatibles Zielformat oder meldet der Callback einen Fehler,
 kopiert der Kernel dieselbe komplette Generation ueber bootfb-cpu. Nur der
 DisplayManager fuehrt Presentstatistik, Generation und abgeschlossenen Fence.
 
+Ersetzende GUI-Rastergenerationen seit 0.75.16
+-----------------------------------------------
+
+R4DRAW v8 erweitert den transaktionalen GUI-Framevertrag append-only um
+vollstaendige Ersatzgenerationen. Ein erfolgreicher Commit publiziert genau
+einen eigenstaendigen neuen Zustand und loest die ueberdeckte alte Kette aus
+dem aktuellen Stream. Leserbesitz bleibt sicher: noch referenzierte Wurzeln
+werden bis zum letzten Release getrennt pensioniert, alle anderen sofort
+freigegeben. Fehler, OOM und Cancel lassen die letzte vollstaendige Generation
+unveraendert sichtbar.
+
+Der ebenfalls neue native XRGB32-Befehl traegt Quellkachel, Gastgeometrie,
+Viewport und Stride in einem validierten Ressourcenblock. Abmessungen,
+Abbildung, Bytes und das freie obere XRGB-Byte werden vor dem Commit geprueft.
+Streamtelemetrie trennt Ersatzcommits, ueberdeckte und koaleszierte
+Generationen, readerbedingt pensionierte Wurzeln, XRGB32-Befehle und aktuelle
+sowie maximale Framebytes. Normale Retained-Mode-Damageketten und alle alten
+Befehlsarten bleiben unveraendert.
+
 Begrenzter Netzwerk-RX-Handoff seit 0.69.49
 --------------------------------------------
 
