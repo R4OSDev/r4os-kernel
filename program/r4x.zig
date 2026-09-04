@@ -390,6 +390,12 @@ const GuiFrameInfo = r4x_api.GuiFrameInfo;
 const GuiFrameStreamInfo = r4x_api.GuiFrameStreamInfo;
 const GuiIndexed8Resource = r4x_api.GuiIndexed8Resource;
 const GuiXrgb32Resource = r4x_api.GuiXrgb32Resource;
+const GuiSharedRasterHandle = r4x_api.GuiSharedRasterHandle;
+const GuiSharedRasterCreateInfo = r4x_api.GuiSharedRasterCreateInfo;
+const GuiSharedRasterWriteMap = r4x_api.GuiSharedRasterWriteMap;
+const GuiSharedRasterLease = r4x_api.GuiSharedRasterLease;
+const GuiSharedRasterMap = r4x_api.GuiSharedRasterMap;
+const GuiSharedRasterResource = r4x_api.GuiSharedRasterResource;
 const DisplayDamageRect = r4x_api.DisplayDamageRect;
 const GuiPathSegment = r4x_api.GuiPathSegment;
 const GuiShapeResource = r4x_api.GuiShapeResource;
@@ -847,6 +853,13 @@ const ProgramGuiCommandResourceKind = enum(u16) {
     path = 4,
     indexed8 = 5,
     xrgb32_nearest = 6,
+    shared_raster = 7,
+};
+
+const ProgramGuiSharedRasterRef = struct {
+    handle: GuiSharedRasterHandle = .{},
+    raster_generation: u64 = 0,
+    data_bytes: u64 = 0,
 };
 
 // Kernel-owned display-list truth.  The legacy GuiCommand ABI is materialized
@@ -921,6 +934,7 @@ const ProgramGuiFramePayload = struct {
     damage_count: u32 = 0,
     chain_depth: u32 = 1,
     reader_refs: u32 = 0,
+    shared_raster_count: u32 = 0,
     build_failed: bool = false,
     explicit_build: bool = false,
     replacement: bool = false,
@@ -1250,6 +1264,712 @@ var gui_frame_release_trace_len: usize = 0;
 // aliasing a new frame after program-id reuse.  Zero means no committed frame.
 var gui_frame_generation_seed: u64 = 0;
 
+const SHARED_RASTER_RESOURCE_CAPACITY: usize = 32;
+const SHARED_RASTER_LEASE_CAPACITY: usize = 128;
+const SHARED_RASTER_FRAME_REF_CAPACITY: usize = 256;
+const SHARED_RASTER_STATS_CAPACITY: usize = 64;
+
+const SharedRasterBuffer = struct {
+    memory: ?[]u8 = null,
+    raster_generation: u64 = 0,
+    write_token: u64 = 0,
+    frame_refs: u32 = 0,
+    lease_refs: u32 = 0,
+};
+
+const SharedRasterResourceState = struct {
+    used: bool = false,
+    closing: bool = false,
+    owner: ProgramProcessHandle = .{},
+    handle: GuiSharedRasterHandle = .{},
+    info: GuiSharedRasterCreateInfo = .{},
+    buffers: [r4x_api.gui_shared_raster_buffer_count]SharedRasterBuffer =
+        .{SharedRasterBuffer{}} ** r4x_api.gui_shared_raster_buffer_count,
+};
+
+const SharedRasterLeaseRecord = struct {
+    used: bool = false,
+    consumer: ProgramProcessHandle = .{},
+    producer: ProgramProcessHandle = .{},
+    handle: GuiSharedRasterHandle = .{},
+    raster_generation: u64 = 0,
+    lease_token: u64 = 0,
+    buffer_index: u32 = 0,
+};
+
+const SharedRasterFrameRecord = struct {
+    used: bool = false,
+    frame: ?*ProgramGuiFramePayload = null,
+    reference: ProgramGuiSharedRasterRef = .{},
+};
+
+const SharedRasterStats = struct {
+    used: bool = false,
+    owner: ProgramProcessHandle = .{},
+    publish_count: u64 = 0,
+    acquire_count: u64 = 0,
+    release_count: u64 = 0,
+    backpressure_count: u64 = 0,
+    published_bytes: u64 = 0,
+    frame_bytes_avoided: u64 = 0,
+    acquired_bytes: u64 = 0,
+    live_bytes: u64 = 0,
+};
+
+const SharedRasterFreeSet = struct {
+    memories: [r4x_api.gui_shared_raster_buffer_count]?[]u8 =
+        .{null} ** r4x_api.gui_shared_raster_buffer_count,
+};
+
+var shared_raster_lock = sync.Mutex.initClass("r4x-shared-raster", sync.LockRank.program_instances, .no_sleep);
+var shared_raster_resources: [SHARED_RASTER_RESOURCE_CAPACITY]SharedRasterResourceState =
+    .{SharedRasterResourceState{}} ** SHARED_RASTER_RESOURCE_CAPACITY;
+var shared_raster_leases: [SHARED_RASTER_LEASE_CAPACITY]SharedRasterLeaseRecord =
+    .{SharedRasterLeaseRecord{}} ** SHARED_RASTER_LEASE_CAPACITY;
+var shared_raster_frame_refs: [SHARED_RASTER_FRAME_REF_CAPACITY]SharedRasterFrameRecord =
+    .{SharedRasterFrameRecord{}} ** SHARED_RASTER_FRAME_REF_CAPACITY;
+var shared_raster_stats: [SHARED_RASTER_STATS_CAPACITY]SharedRasterStats =
+    .{SharedRasterStats{}} ** SHARED_RASTER_STATS_CAPACITY;
+var shared_raster_handle_generation: u64 = 0;
+var shared_raster_generation: u64 = 0;
+var shared_raster_write_token: u64 = 0;
+var shared_raster_lease_token: u64 = 0;
+var shared_raster_failure_after: ?u32 = null;
+var shared_raster_failure_cursor: u32 = 0;
+
+fn configureSharedRasterFailureForTest(fail_after: ?u32) void {
+    shared_raster_failure_after = fail_after;
+    shared_raster_failure_cursor = 0;
+}
+
+fn lockSharedRasterState() void {
+    while (!shared_raster_lock.tryLock()) asm volatile ("pause");
+}
+
+fn sharedRasterNextCounterLocked(counter: *u64) ?u64 {
+    if (counter.* == std.math.maxInt(u64)) return null;
+    counter.* += 1;
+    return counter.*;
+}
+
+fn validSharedRasterHandle(handle: GuiSharedRasterHandle) bool {
+    return handle.id != 0 and handle.id <= SHARED_RASTER_RESOURCE_CAPACITY and handle.generation != 0;
+}
+
+fn sharedRasterHandleEqual(a: GuiSharedRasterHandle, b: GuiSharedRasterHandle) bool {
+    return a.id == b.id and a.generation == b.generation;
+}
+
+fn sharedRasterResourceLocked(handle: GuiSharedRasterHandle) ?*SharedRasterResourceState {
+    if (!validSharedRasterHandle(handle)) return null;
+    const index: usize = @intCast(handle.id - 1);
+    const resource = &shared_raster_resources[index];
+    if (!resource.used or !sharedRasterHandleEqual(resource.handle, handle)) return null;
+    return resource;
+}
+
+fn sharedRasterStatsLocked(owner: ProgramProcessHandle, create: bool) ?*SharedRasterStats {
+    for (&shared_raster_stats) |*item| {
+        if (item.used and programHandleEqual(item.owner, owner)) return item;
+    }
+    if (!create) return null;
+    for (&shared_raster_stats) |*item| {
+        if (item.used) continue;
+        item.* = .{ .used = true, .owner = owner };
+        return item;
+    }
+    return null;
+}
+
+fn sharedRasterResourceCanFreeLocked(resource: *const SharedRasterResourceState) bool {
+    if (!resource.closing) return false;
+    for (resource.buffers) |buffer| {
+        if (buffer.write_token != 0 or buffer.frame_refs != 0 or buffer.lease_refs != 0) return false;
+    }
+    return true;
+}
+
+fn sharedRasterClearResourceLocked(resource: *SharedRasterResourceState) SharedRasterFreeSet {
+    var result = SharedRasterFreeSet{};
+    for (resource.buffers, 0..) |buffer, index| result.memories[index] = buffer.memory;
+    if (sharedRasterStatsLocked(resource.owner, false)) |stats| {
+        const allocated = resource.info.data_bytes *| r4x_api.gui_shared_raster_buffer_count;
+        stats.live_bytes -|= allocated;
+    }
+    resource.* = .{};
+    return result;
+}
+
+fn sharedRasterFreeMemories(set: SharedRasterFreeSet) void {
+    for (set.memories) |memory| {
+        if (memory) |bytes| _ = heap.free(bytes);
+    }
+}
+
+fn sharedRasterValidCreateInfo(info: GuiSharedRasterCreateInfo) bool {
+    if (info.version != r4x_api.gui_shared_raster_create_info_version or
+        info.size != r4x_api.gui_shared_raster_create_info_size or info.width == 0 or info.height == 0 or
+        info.stride_bytes == 0 or info.flags != 0 or info.reserved0 != 0 or info.data_bytes == 0 or
+        info.data_bytes > r4x_api.gui_shared_raster_max_bytes) return false;
+    const row_bytes: u64 = switch (info.format) {
+        r4x_api.gui_shared_raster_format_xrgb32 => blk: {
+            if (info.data_offset != 0) return false;
+            break :blk std.math.mul(u64, info.width, @sizeOf(u32)) catch return false;
+        },
+        r4x_api.gui_shared_raster_format_indexed8 => blk: {
+            if (info.data_offset != 256 * @sizeOf(u32)) return false;
+            break :blk info.width;
+        },
+        r4x_api.gui_shared_raster_format_alpha8 => blk: {
+            if (info.data_offset != 0) return false;
+            break :blk info.width;
+        },
+        else => return false,
+    };
+    if (info.stride_bytes < row_bytes) return false;
+    if (info.format == r4x_api.gui_shared_raster_format_xrgb32 and (info.stride_bytes % @sizeOf(u32)) != 0) return false;
+    const rows = std.math.mul(u64, info.stride_bytes, info.height) catch return false;
+    const required = std.math.add(u64, info.data_offset, rows) catch return false;
+    return required == info.data_bytes and required <= std.math.maxInt(usize);
+}
+
+fn sharedRasterAllocate(bytes: usize) ?[]u8 {
+    if (shared_raster_failure_after) |target| {
+        const cursor = shared_raster_failure_cursor;
+        shared_raster_failure_cursor +%= 1;
+        if (cursor == target) return null;
+    }
+    const memory = heap.alloc(bytes, @alignOf(u64)) orelse return null;
+    @memset(memory, 0);
+    return memory;
+}
+
+fn sharedRasterCreate(owner: ProgramProcessHandle, info: GuiSharedRasterCreateInfo, out_handle: *GuiSharedRasterHandle) i32 {
+    if (!programHandleValid(owner) or !sharedRasterValidCreateInfo(info)) return r4x_api.gui_frame_error_invalid;
+    const byte_count: usize = @intCast(info.data_bytes);
+    var memories: [r4x_api.gui_shared_raster_buffer_count]?[]u8 =
+        .{null} ** r4x_api.gui_shared_raster_buffer_count;
+    for (&memories) |*slot| {
+        slot.* = sharedRasterAllocate(byte_count) orelse {
+            sharedRasterFreeMemories(.{ .memories = memories });
+            return r4x_api.gui_frame_error_oom;
+        };
+    }
+
+    lockSharedRasterState();
+    var free_index: ?usize = null;
+    for (&shared_raster_resources, 0..) |*resource, index| {
+        if (!resource.used) {
+            free_index = index;
+            break;
+        }
+    }
+    const index = free_index orelse {
+        _ = shared_raster_lock.unlock();
+        sharedRasterFreeMemories(.{ .memories = memories });
+        return r4x_api.gui_frame_error_unavailable;
+    };
+    const generation = sharedRasterNextCounterLocked(&shared_raster_handle_generation) orelse {
+        _ = shared_raster_lock.unlock();
+        sharedRasterFreeMemories(.{ .memories = memories });
+        return r4x_api.gui_frame_error_overflow;
+    };
+    const stats = sharedRasterStatsLocked(owner, true) orelse {
+        _ = shared_raster_lock.unlock();
+        sharedRasterFreeMemories(.{ .memories = memories });
+        return r4x_api.gui_frame_error_unavailable;
+    };
+    const handle = GuiSharedRasterHandle{ .id = index + 1, .generation = generation };
+    const resource = &shared_raster_resources[index];
+    resource.* = .{ .used = true, .owner = owner, .handle = handle, .info = info };
+    for (&resource.buffers, 0..) |*buffer, buffer_index| buffer.memory = memories[buffer_index];
+    stats.live_bytes +|= info.data_bytes *| r4x_api.gui_shared_raster_buffer_count;
+    out_handle.* = handle;
+    _ = shared_raster_lock.unlock();
+    return r4x_api.gui_frame_result_ok;
+}
+
+fn sharedRasterDestroy(owner: ProgramProcessHandle, handle: GuiSharedRasterHandle) i32 {
+    if (!programHandleValid(owner) or !validSharedRasterHandle(handle)) return r4x_api.gui_frame_error_invalid;
+    var free_set: ?SharedRasterFreeSet = null;
+    lockSharedRasterState();
+    const resource = sharedRasterResourceLocked(handle) orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_stale;
+    };
+    if (!programHandleEqual(resource.owner, owner)) {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_invalid;
+    }
+    resource.closing = true;
+    for (&resource.buffers) |*buffer| buffer.write_token = 0;
+    if (sharedRasterResourceCanFreeLocked(resource)) free_set = sharedRasterClearResourceLocked(resource);
+    _ = shared_raster_lock.unlock();
+    if (free_set) |set| sharedRasterFreeMemories(set);
+    return r4x_api.gui_frame_result_ok;
+}
+
+fn sharedRasterMapWrite(owner: ProgramProcessHandle, handle: GuiSharedRasterHandle, out_map: *GuiSharedRasterWriteMap) i32 {
+    lockSharedRasterState();
+    const resource = sharedRasterResourceLocked(handle) orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_stale;
+    };
+    if (!programHandleEqual(resource.owner, owner) or resource.closing) {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_invalid;
+    }
+    var selected: ?usize = null;
+    for (&resource.buffers, 0..) |*buffer, index| {
+        if (buffer.write_token == 0 and buffer.frame_refs == 0 and buffer.lease_refs == 0 and buffer.raster_generation == 0) {
+            selected = index;
+            break;
+        }
+    }
+    if (selected == null) {
+        for (&resource.buffers, 0..) |*buffer, index| {
+            if (buffer.write_token == 0 and buffer.frame_refs == 0 and buffer.lease_refs == 0) {
+                selected = index;
+                break;
+            }
+        }
+    }
+    const index = selected orelse {
+        if (sharedRasterStatsLocked(owner, false)) |stats| stats.backpressure_count +%= 1;
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_state;
+    };
+    const token = sharedRasterNextCounterLocked(&shared_raster_write_token) orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_overflow;
+    };
+    const buffer = &resource.buffers[index];
+    const memory = buffer.memory orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_unavailable;
+    };
+    buffer.raster_generation = 0;
+    buffer.write_token = token;
+    out_map.* = .{
+        .handle = handle,
+        .data_address = @intFromPtr(memory.ptr),
+        .byte_length = memory.len,
+        .write_token = token,
+        .buffer_index = @intCast(index),
+    };
+    _ = shared_raster_lock.unlock();
+    return r4x_api.gui_frame_result_ok;
+}
+
+fn sharedRasterPublish(owner: ProgramProcessHandle, map: GuiSharedRasterWriteMap, out_generation: *u64) i32 {
+    if (map.version != r4x_api.gui_shared_raster_write_map_version or map.size != r4x_api.gui_shared_raster_write_map_size or
+        map.write_token == 0 or map.buffer_index >= r4x_api.gui_shared_raster_buffer_count or map.reserved0 != 0)
+    {
+        return r4x_api.gui_frame_error_invalid;
+    }
+    lockSharedRasterState();
+    const resource = sharedRasterResourceLocked(map.handle) orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_stale;
+    };
+    if (!programHandleEqual(resource.owner, owner) or resource.closing) {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_invalid;
+    }
+    const buffer = &resource.buffers[map.buffer_index];
+    const memory = buffer.memory orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_unavailable;
+    };
+    if (buffer.write_token != map.write_token or map.data_address != @intFromPtr(memory.ptr) or map.byte_length != memory.len or
+        buffer.frame_refs != 0 or buffer.lease_refs != 0)
+    {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_stale;
+    }
+    const generation = sharedRasterNextCounterLocked(&shared_raster_generation) orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_overflow;
+    };
+    buffer.write_token = 0;
+    buffer.raster_generation = generation;
+    if (sharedRasterStatsLocked(owner, false)) |stats| {
+        stats.publish_count +%= 1;
+        stats.published_bytes +|= memory.len;
+    }
+    out_generation.* = generation;
+    _ = shared_raster_lock.unlock();
+    return r4x_api.gui_frame_result_ok;
+}
+
+fn sharedRasterPinExact(
+    owner: ProgramProcessHandle,
+    frame: *ProgramGuiFramePayload,
+    handle: GuiSharedRasterHandle,
+    raster_generation: u64,
+    expected_format: ?u32,
+    expected_width: ?u32,
+    expected_height: ?u32,
+    expected_data_bytes: ?u64,
+) ?ProgramGuiSharedRasterRef {
+    if (raster_generation == 0) return null;
+    lockSharedRasterState();
+    defer _ = shared_raster_lock.unlock();
+    for (&shared_raster_frame_refs) |*record| {
+        if (record.used and record.frame == frame and sharedRasterHandleEqual(record.reference.handle, handle) and
+            record.reference.raster_generation == raster_generation) return record.reference;
+    }
+    var free_record: ?*SharedRasterFrameRecord = null;
+    for (&shared_raster_frame_refs) |*record| {
+        if (!record.used) {
+            free_record = record;
+            break;
+        }
+    }
+    const record = free_record orelse return null;
+    const resource = sharedRasterResourceLocked(handle) orelse return null;
+    if (!programHandleEqual(resource.owner, owner) or resource.closing) return null;
+    if ((expected_format != null and resource.info.format != expected_format.?) or
+        (expected_width != null and resource.info.width != expected_width.?) or
+        (expected_height != null and resource.info.height != expected_height.?) or
+        (expected_data_bytes != null and resource.info.data_bytes != expected_data_bytes.?)) return null;
+    for (&resource.buffers) |*buffer| {
+        if (buffer.raster_generation != raster_generation or buffer.write_token != 0 or buffer.frame_refs == std.math.maxInt(u32)) continue;
+        buffer.frame_refs += 1;
+        const reference = ProgramGuiSharedRasterRef{ .handle = handle, .raster_generation = raster_generation, .data_bytes = resource.info.data_bytes };
+        record.* = .{ .used = true, .frame = frame, .reference = reference };
+        return reference;
+    }
+    return null;
+}
+
+fn sharedRasterPinFrame(owner: ProgramProcessHandle, frame: *ProgramGuiFramePayload, descriptor: GuiSharedRasterResource) ?ProgramGuiSharedRasterRef {
+    return sharedRasterPinExact(
+        owner,
+        frame,
+        descriptor.handle,
+        descriptor.raster_generation,
+        descriptor.format,
+        descriptor.guest_w,
+        descriptor.guest_h,
+        null,
+    );
+}
+
+fn sharedRasterCopyFrameReferences(owner: ProgramProcessHandle, source: *const ProgramGuiFramePayload, target: *ProgramGuiFramePayload) bool {
+    lockSharedRasterState();
+    var added_indices: [r4x_api.gui_shared_raster_max_frame_resources]usize = undefined;
+    var added_count: usize = 0;
+    var copied: u32 = 0;
+    const initial_count = target.shared_raster_count;
+    for (&shared_raster_frame_refs) |*source_record| {
+        if (!source_record.used or source_record.frame != source) continue;
+        var duplicate = false;
+        for (&shared_raster_frame_refs) |*target_record| {
+            if (target_record.used and target_record.frame == target and
+                sharedRasterHandleEqual(target_record.reference.handle, source_record.reference.handle) and
+                target_record.reference.raster_generation == source_record.reference.raster_generation)
+            {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            copied += 1;
+            continue;
+        }
+        var free_index: ?usize = null;
+        for (&shared_raster_frame_refs, 0..) |*candidate, index| {
+            if (!candidate.used) {
+                free_index = index;
+                break;
+            }
+        }
+        const target_index = free_index orelse break;
+        const target_record = &shared_raster_frame_refs[target_index];
+        const resource = sharedRasterResourceLocked(source_record.reference.handle) orelse break;
+        if (!programHandleEqual(resource.owner, owner) or resource.info.data_bytes != source_record.reference.data_bytes) break;
+        var pinned = false;
+        for (&resource.buffers) |*buffer| {
+            if (buffer.raster_generation != source_record.reference.raster_generation or buffer.write_token != 0 or
+                buffer.frame_refs == std.math.maxInt(u32)) continue;
+            buffer.frame_refs += 1;
+            pinned = true;
+            break;
+        }
+        if (!pinned) break;
+        target_record.* = .{ .used = true, .frame = target, .reference = source_record.reference };
+        added_indices[added_count] = target_index;
+        added_count += 1;
+        copied += 1;
+    }
+    if (copied != source.shared_raster_count) {
+        for (added_indices[0..added_count]) |index| {
+            const record = &shared_raster_frame_refs[index];
+            if (sharedRasterResourceLocked(record.reference.handle)) |resource| {
+                for (&resource.buffers) |*buffer| {
+                    if (buffer.raster_generation == record.reference.raster_generation and buffer.frame_refs != 0) {
+                        buffer.frame_refs -= 1;
+                        break;
+                    }
+                }
+            }
+            record.* = .{};
+        }
+        _ = shared_raster_lock.unlock();
+        return false;
+    }
+    _ = shared_raster_lock.unlock();
+    target.shared_raster_count = initial_count + @as(u32, @intCast(added_count));
+    return true;
+}
+
+fn sharedRasterMoveFrameReferences(source: *ProgramGuiFramePayload, target: *ProgramGuiFramePayload) bool {
+    lockSharedRasterState();
+    var moved: u32 = 0;
+    for (shared_raster_frame_refs) |record| {
+        if (record.used and record.frame == source) moved += 1;
+    }
+    if (moved != source.shared_raster_count or target.shared_raster_count + moved > r4x_api.gui_shared_raster_max_frame_resources) {
+        _ = shared_raster_lock.unlock();
+        return false;
+    }
+    for (&shared_raster_frame_refs) |*record| {
+        if (!record.used or record.frame != source) continue;
+        record.frame = target;
+    }
+    _ = shared_raster_lock.unlock();
+    target.shared_raster_count += moved;
+    source.shared_raster_count = 0;
+    return true;
+}
+
+fn sharedRasterReleaseFrameReferences(frame: *ProgramGuiFramePayload) bool {
+    var free_sets: [r4x_api.gui_shared_raster_max_frame_resources]SharedRasterFreeSet = undefined;
+    var free_count: usize = 0;
+    var released: u32 = 0;
+    lockSharedRasterState();
+    for (&shared_raster_frame_refs) |*record| {
+        if (!record.used or record.frame != frame) continue;
+        if (sharedRasterResourceLocked(record.reference.handle)) |resource| {
+            for (&resource.buffers) |*buffer| {
+                if (buffer.raster_generation != record.reference.raster_generation or buffer.frame_refs == 0) continue;
+                buffer.frame_refs -= 1;
+                released += 1;
+                break;
+            }
+            if (sharedRasterResourceCanFreeLocked(resource)) {
+                free_sets[free_count] = sharedRasterClearResourceLocked(resource);
+                free_count += 1;
+            }
+        }
+        record.* = .{};
+    }
+    _ = shared_raster_lock.unlock();
+    for (free_sets[0..free_count]) |set| sharedRasterFreeMemories(set);
+    const expected = frame.shared_raster_count;
+    frame.shared_raster_count = 0;
+    return released == expected;
+}
+
+fn sharedRasterFrameHasReference(frame: *const ProgramGuiFramePayload, handle: GuiSharedRasterHandle, raster_generation: u64) bool {
+    lockSharedRasterState();
+    defer _ = shared_raster_lock.unlock();
+    for (shared_raster_frame_refs) |record| {
+        if (record.used and record.frame == frame and sharedRasterHandleEqual(record.reference.handle, handle) and
+            record.reference.raster_generation == raster_generation) return true;
+    }
+    return false;
+}
+
+fn sharedRasterAcquire(
+    consumer: ProgramProcessHandle,
+    frame_owner: ProgramProcessHandle,
+    frame_generation: u64,
+    handle: GuiSharedRasterHandle,
+    raster_generation: u64,
+    out_map: *GuiSharedRasterMap,
+) i32 {
+    if (!programHandleValid(consumer) or !programHandleValid(frame_owner) or frame_generation == 0 or
+        !validSharedRasterHandle(handle) or raster_generation == 0)
+    {
+        return r4x_api.gui_frame_error_invalid;
+    }
+    lockSharedRasterState();
+    const resource = sharedRasterResourceLocked(handle) orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_stale;
+    };
+    if (!programHandleEqual(resource.owner, frame_owner)) {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_invalid;
+    }
+    var buffer_index: ?usize = null;
+    for (&resource.buffers, 0..) |*buffer, index| {
+        if (buffer.raster_generation == raster_generation and buffer.write_token == 0 and buffer.frame_refs != 0 and
+            buffer.lease_refs != std.math.maxInt(u32))
+        {
+            buffer_index = index;
+            break;
+        }
+    }
+    const index = buffer_index orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_stale;
+    };
+    var record: ?*SharedRasterLeaseRecord = null;
+    for (&shared_raster_leases) |*candidate| {
+        if (!candidate.used) {
+            record = candidate;
+            break;
+        }
+    }
+    const lease_record = record orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_unavailable;
+    };
+    const token = sharedRasterNextCounterLocked(&shared_raster_lease_token) orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_overflow;
+    };
+    const buffer = &resource.buffers[index];
+    const memory = buffer.memory orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_unavailable;
+    };
+    buffer.lease_refs += 1;
+    lease_record.* = .{
+        .used = true,
+        .consumer = consumer,
+        .producer = frame_owner,
+        .handle = handle,
+        .raster_generation = raster_generation,
+        .lease_token = token,
+        .buffer_index = @intCast(index),
+    };
+    if (sharedRasterStatsLocked(frame_owner, false)) |stats| {
+        stats.acquire_count +%= 1;
+        stats.acquired_bytes +|= memory.len;
+    }
+    out_map.* = .{
+        .frame_owner = frame_owner,
+        .frame_generation = frame_generation,
+        .lease = .{ .handle = handle, .raster_generation = raster_generation, .lease_token = token },
+        .data_address = @intFromPtr(memory.ptr),
+        .byte_length = memory.len,
+        .format = resource.info.format,
+        .width = resource.info.width,
+        .height = resource.info.height,
+        .stride_bytes = resource.info.stride_bytes,
+        .data_offset = resource.info.data_offset,
+    };
+    _ = shared_raster_lock.unlock();
+    return r4x_api.gui_frame_result_ok;
+}
+
+fn sharedRasterRelease(consumer: ProgramProcessHandle, lease: GuiSharedRasterLease) i32 {
+    if (lease.version != r4x_api.gui_shared_raster_lease_version or lease.size != r4x_api.gui_shared_raster_lease_size or
+        !validSharedRasterHandle(lease.handle) or lease.raster_generation == 0 or lease.lease_token == 0 or lease.reserved0 != 0)
+    {
+        return r4x_api.gui_frame_error_invalid;
+    }
+    var free_set: ?SharedRasterFreeSet = null;
+    lockSharedRasterState();
+    var found: ?*SharedRasterLeaseRecord = null;
+    for (&shared_raster_leases) |*record| {
+        if (record.used and record.lease_token == lease.lease_token) {
+            found = record;
+            break;
+        }
+    }
+    const record = found orelse {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_stale;
+    };
+    if (!programHandleEqual(record.consumer, consumer) or !sharedRasterHandleEqual(record.handle, lease.handle) or
+        record.raster_generation != lease.raster_generation)
+    {
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_invalid;
+    }
+    const producer = record.producer;
+    const resource = sharedRasterResourceLocked(record.handle) orelse {
+        record.* = .{};
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_stale;
+    };
+    const buffer = &resource.buffers[record.buffer_index];
+    if (buffer.raster_generation != record.raster_generation or buffer.lease_refs == 0) {
+        record.* = .{};
+        _ = shared_raster_lock.unlock();
+        return r4x_api.gui_frame_error_stale;
+    }
+    buffer.lease_refs -= 1;
+    record.* = .{};
+    if (sharedRasterStatsLocked(producer, false)) |stats| stats.release_count +%= 1;
+    if (sharedRasterResourceCanFreeLocked(resource)) free_set = sharedRasterClearResourceLocked(resource);
+    _ = shared_raster_lock.unlock();
+    if (free_set) |set| sharedRasterFreeMemories(set);
+    return r4x_api.gui_frame_result_ok;
+}
+
+fn sharedRasterReleaseProcess(handle: ProgramProcessHandle) void {
+    var free_sets: [SHARED_RASTER_RESOURCE_CAPACITY]SharedRasterFreeSet = undefined;
+    var free_count: usize = 0;
+    lockSharedRasterState();
+    for (&shared_raster_leases) |*record| {
+        if (!record.used or !programHandleEqual(record.consumer, handle)) continue;
+        if (sharedRasterResourceLocked(record.handle)) |resource| {
+            const buffer = &resource.buffers[record.buffer_index];
+            if (buffer.raster_generation == record.raster_generation and buffer.lease_refs != 0) buffer.lease_refs -= 1;
+            if (sharedRasterStatsLocked(record.producer, false)) |stats| stats.release_count +%= 1;
+        }
+        record.* = .{};
+    }
+    for (&shared_raster_resources) |*resource| {
+        if (resource.used and programHandleEqual(resource.owner, handle)) {
+            resource.closing = true;
+            for (&resource.buffers) |*buffer| buffer.write_token = 0;
+        }
+        if (resource.used and sharedRasterResourceCanFreeLocked(resource)) {
+            free_sets[free_count] = sharedRasterClearResourceLocked(resource);
+            free_count += 1;
+        }
+    }
+    for (&shared_raster_stats) |*stats| {
+        if (stats.used and programHandleEqual(stats.owner, handle)) stats.* = .{};
+    }
+    _ = shared_raster_lock.unlock();
+    for (free_sets[0..free_count]) |set| sharedRasterFreeMemories(set);
+}
+
+fn sharedRasterStatsSnapshot(owner: ProgramProcessHandle) SharedRasterStats {
+    lockSharedRasterState();
+    defer _ = shared_raster_lock.unlock();
+    if (sharedRasterStatsLocked(owner, false)) |stats| return stats.*;
+    return .{};
+}
+
+fn sharedRasterStateEmpty() bool {
+    lockSharedRasterState();
+    defer _ = shared_raster_lock.unlock();
+    for (shared_raster_resources) |resource| if (resource.used) return false;
+    for (shared_raster_leases) |lease| if (lease.used) return false;
+    for (shared_raster_frame_refs) |reference| if (reference.used) return false;
+    for (shared_raster_stats) |stats| if (stats.used) return false;
+    return true;
+}
+
+fn sharedRasterNoteFrameCommit(owner: ProgramProcessHandle, frame: *const ProgramGuiFramePayload) void {
+    lockSharedRasterState();
+    var avoided: u64 = 0;
+    for (shared_raster_frame_refs) |record| {
+        if (record.used and record.frame == frame) avoided +|= record.reference.data_bytes;
+    }
+    if (sharedRasterStatsLocked(owner, false)) |stats| stats.frame_bytes_avoided +|= avoided;
+    _ = shared_raster_lock.unlock();
+}
+
 pub fn configureInstanceStorageFailureForTest(fail_after: ?u32) void {
     instance_storage_failure_after = fail_after;
     instance_storage_failure_cursor = 0;
@@ -1371,7 +2091,7 @@ fn guiResourcePayloadWordsConst(payload: *const ProgramGuiResourcePayload) []con
 fn guiResourcePayloadKind(resource_kind: ProgramGuiCommandResourceKind) ?ProgramPayloadKind {
     return switch (resource_kind) {
         .xrgb32, .alpha8 => .gui_raster,
-        .utf8, .path, .indexed8, .xrgb32_nearest => .gui_frame_data,
+        .utf8, .path, .indexed8, .xrgb32_nearest, .shared_raster => .gui_frame_data,
         .none => null,
     };
 }
@@ -1732,6 +2452,10 @@ fn validateGuiFrameOwnership(frame: *const ProgramGuiFramePayload, owner_id: u32
         instance_storage_stats.header_errors +%= 1;
         return false;
     }
+    if (frame.shared_raster_count > r4x_api.gui_shared_raster_max_frame_resources) {
+        instance_storage_stats.header_errors +%= 1;
+        return false;
+    }
 
     if (frame.command_payload == null) {
         if (frame.command_tail != null or frame.command_count != 0) {
@@ -1894,6 +2618,7 @@ fn validateGuiFrame(frame: *const ProgramGuiFramePayload, owner_id: u32) bool {
                 => .path,
                 r4x_api.gui_frame_command_kind_indexed8 => .indexed8,
                 r4x_api.gui_frame_command_kind_xrgb32_nearest => .xrgb32_nearest,
+                r4x_api.gui_frame_command_kind_shared_raster => .shared_raster,
                 else => {
                     instance_storage_stats.header_errors +%= 1;
                     return false;
@@ -2106,6 +2831,7 @@ fn releaseGuiFrameLocal(frame: *ProgramGuiFramePayload, owner_id: u32) bool {
     frame.command_count = 0;
     frame.node_sequence = 0;
     frame.retired_next = null;
+    if (!sharedRasterReleaseFrameReferences(frame)) released = false;
     if (!releaseInstancePayload(ProgramGuiFramePayload, frame, owner_id, .gui_frame)) released = false;
     return released;
 }
@@ -2358,8 +3084,11 @@ fn detachProgramCompletionOutput(instance: *ProgramInstance, completion: *Progra
 }
 
 fn releaseProgramInstanceStorage(instance: *ProgramInstance, completion: *ProgramCompletionNode) bool {
-    _ = completion;
     if (instance.storage_teardown_blocked) return false;
+    // Idempotently closes producer resources and all leases owned by this
+    // exact process generation. Frame teardown below drops the remaining
+    // immutable frame references and performs the final backing frees.
+    sharedRasterReleaseProcess(completion.handle);
     // detachProgramCompletionOutput performed the all-or-nothing hierarchy
     // preflight before retirement entered this phase.  No new lease can be
     // acquired in .retire, so the remaining hierarchy cannot change here.
@@ -2435,6 +3164,8 @@ pub fn runInstanceStorageSelfTest() bool {
     const saved_self_test_peak = instance_storage_self_test_peak_payload_bytes;
     const saved_release_trace_enabled = gui_frame_release_trace_enabled;
     const saved_release_trace_len = gui_frame_release_trace_len;
+    const saved_shared_raster_failure_after = shared_raster_failure_after;
+    const saved_shared_raster_failure_cursor = shared_raster_failure_cursor;
     defer {
         instance_storage_failure_after = saved_failure_after;
         instance_storage_failure_cursor = saved_failure_cursor;
@@ -2442,10 +3173,13 @@ pub fn runInstanceStorageSelfTest() bool {
         instance_storage_self_test_peak_payload_bytes = saved_self_test_peak;
         gui_frame_release_trace_enabled = saved_release_trace_enabled;
         gui_frame_release_trace_len = saved_release_trace_len;
+        shared_raster_failure_after = saved_shared_raster_failure_after;
+        shared_raster_failure_cursor = saved_shared_raster_failure_cursor;
     }
 
     instance_storage_self_test_report = .{};
     configureInstanceStorageFailureForTest(null);
+    configureSharedRasterFailureForTest(null);
     if (!warmInstanceStorageSelfTest()) {
         instance_storage_self_test_report.failed_case = 1;
         return false;
@@ -2512,6 +3246,8 @@ pub fn runInstanceStorageSelfTest() bool {
     if (!testGuiDeltaIndexed8(0xFFFE_000D, heap_baseline, storage_baseline)) return failInstanceStorageSelfTest(case_id, heap_baseline, storage_baseline);
     case_id += 1;
     if (!testGuiReplacementXrgb32(0xFFFE_000E, heap_baseline, storage_baseline)) return failInstanceStorageSelfTest(case_id, heap_baseline, storage_baseline);
+    case_id += 1;
+    if (!testGuiSharedRasterLifecycle(heap_baseline, storage_baseline)) return failInstanceStorageSelfTest(case_id, heap_baseline, storage_baseline);
 
     instance_storage_self_test_report = .{
         .cases = case_id,
@@ -3428,6 +4164,162 @@ fn testGuiReplacementXrgb32(owner_id: u32, heap_baseline: heap.Stats, storage_ba
     return counters_ok and instanceStorageHeapBaselineEqual(heap_baseline, heap.stats()) and instanceStorageCurrentEqual(storage_baseline, instanceStorageStats());
 }
 
+fn testGuiSharedRasterLifecycleInner() bool {
+    const owner_a = ProgramProcessHandle{ .instance_id = 0xFFFD_0001, .generation = 101 };
+    const owner_b = ProgramProcessHandle{ .instance_id = 0xFFFD_0002, .generation = 102 };
+    const consumer_a = ProgramProcessHandle{ .instance_id = 0xFFFD_0011, .generation = 201 };
+    const consumer_b = ProgramProcessHandle{ .instance_id = 0xFFFD_0012, .generation = 202 };
+    var frames = [_]ProgramGuiFramePayload{.{}} ** 4;
+    defer {
+        configureSharedRasterFailureForTest(null);
+        for (&frames) |*frame| _ = sharedRasterReleaseFrameReferences(frame);
+        sharedRasterReleaseProcess(consumer_a);
+        sharedRasterReleaseProcess(consumer_b);
+        sharedRasterReleaseProcess(owner_a);
+        sharedRasterReleaseProcess(owner_b);
+    }
+
+    const info = GuiSharedRasterCreateInfo{
+        .format = r4x_api.gui_shared_raster_format_xrgb32,
+        .width = 4,
+        .height = 4,
+        .stride_bytes = 16,
+        .data_bytes = 64,
+    };
+    var invalid_info = info;
+    invalid_info.stride_bytes = 15;
+    var invalid_handle: GuiSharedRasterHandle = .{};
+    if (sharedRasterCreate(owner_a, invalid_info, &invalid_handle) != r4x_api.gui_frame_error_invalid) return false;
+
+    var fail_after: u32 = 0;
+    while (fail_after < r4x_api.gui_shared_raster_buffer_count) : (fail_after += 1) {
+        configureSharedRasterFailureForTest(fail_after);
+        if (sharedRasterCreate(owner_a, info, &invalid_handle) != r4x_api.gui_frame_error_oom) return false;
+    }
+    configureSharedRasterFailureForTest(null);
+
+    var handle: GuiSharedRasterHandle = .{};
+    if (sharedRasterCreate(owner_a, info, &handle) != r4x_api.gui_frame_result_ok) return false;
+    var write_map: GuiSharedRasterWriteMap = .{};
+    if (sharedRasterMapWrite(owner_a, handle, &write_map) != r4x_api.gui_frame_result_ok or write_map.byte_length != info.data_bytes) return false;
+    const write_pointer: [*]u8 = @ptrFromInt(write_map.data_address);
+    const write_bytes = write_pointer[0..@as(usize, @intCast(write_map.byte_length))];
+    for (write_bytes, 0..) |*byte, index| byte.* = @truncate(index * 13 + 7);
+    var raster_generation: u64 = 0;
+    if (sharedRasterPublish(owner_a, write_map, &raster_generation) != r4x_api.gui_frame_result_ok or raster_generation == 0 or
+        sharedRasterPublish(owner_a, write_map, &raster_generation) != r4x_api.gui_frame_error_stale)
+    {
+        return false;
+    }
+    const descriptor = GuiSharedRasterResource{
+        .handle = handle,
+        .raster_generation = raster_generation,
+        .format = info.format,
+        .source_w = info.width,
+        .source_h = info.height,
+        .guest_w = info.width,
+        .guest_h = info.height,
+        .viewport_w = info.width,
+        .viewport_h = info.height,
+    };
+    _ = sharedRasterPinFrame(owner_a, &frames[0], descriptor) orelse return false;
+    frames[0].shared_raster_count = 1;
+    if (sharedRasterPinFrame(owner_a, &frames[0], descriptor) == null or !sharedRasterFrameHasReference(&frames[0], handle, raster_generation)) return false;
+
+    var map_a: GuiSharedRasterMap = .{};
+    var map_b: GuiSharedRasterMap = .{};
+    if (sharedRasterAcquire(consumer_a, owner_a, 301, handle, raster_generation, &map_a) != r4x_api.gui_frame_result_ok or
+        sharedRasterAcquire(consumer_b, owner_a, 301, handle, raster_generation, &map_b) != r4x_api.gui_frame_result_ok or
+        map_a.data_address != write_map.data_address or map_b.data_address != write_map.data_address or map_a.byte_length != info.data_bytes)
+    {
+        return false;
+    }
+    const read_pointer: [*]const u8 = @ptrFromInt(map_a.data_address);
+    if (!std.mem.eql(u8, read_pointer[0..@as(usize, @intCast(map_a.byte_length))], write_bytes)) return false;
+    if (sharedRasterRelease(consumer_b, map_a.lease) != r4x_api.gui_frame_error_invalid or
+        sharedRasterRelease(consumer_a, map_a.lease) != r4x_api.gui_frame_result_ok or
+        sharedRasterRelease(consumer_a, map_a.lease) != r4x_api.gui_frame_error_stale)
+    {
+        return false;
+    }
+    if (sharedRasterDestroy(owner_a, handle) != r4x_api.gui_frame_result_ok or
+        sharedRasterMapWrite(owner_a, handle, &write_map) != r4x_api.gui_frame_error_invalid or
+        !sharedRasterReleaseFrameReferences(&frames[0]) or sharedRasterRelease(consumer_b, map_b.lease) != r4x_api.gui_frame_result_ok)
+    {
+        return false;
+    }
+    sharedRasterReleaseProcess(owner_a);
+
+    // Pin all three buffers to prove bounded producer backpressure without
+    // overwriting a generation still referenced by a frame.
+    if (sharedRasterCreate(owner_a, info, &handle) != r4x_api.gui_frame_result_ok) return false;
+    var index: usize = 0;
+    while (index < r4x_api.gui_shared_raster_buffer_count) : (index += 1) {
+        var mapped: GuiSharedRasterWriteMap = .{};
+        var generation: u64 = 0;
+        if (sharedRasterMapWrite(owner_a, handle, &mapped) != r4x_api.gui_frame_result_ok or
+            sharedRasterPublish(owner_a, mapped, &generation) != r4x_api.gui_frame_result_ok)
+        {
+            return false;
+        }
+        var buffer_descriptor = descriptor;
+        buffer_descriptor.handle = handle;
+        buffer_descriptor.raster_generation = generation;
+        _ = sharedRasterPinFrame(owner_a, &frames[index], buffer_descriptor) orelse return false;
+        frames[index].shared_raster_count = 1;
+    }
+    if (sharedRasterMapWrite(owner_a, handle, &write_map) != r4x_api.gui_frame_error_state) return false;
+    const backpressure_stats = sharedRasterStatsSnapshot(owner_a);
+    if (backpressure_stats.publish_count != r4x_api.gui_shared_raster_buffer_count or backpressure_stats.backpressure_count != 1 or
+        backpressure_stats.published_bytes != info.data_bytes * r4x_api.gui_shared_raster_buffer_count)
+    {
+        return false;
+    }
+    if (sharedRasterDestroy(owner_a, handle) != r4x_api.gui_frame_result_ok) return false;
+    for (frames[0..r4x_api.gui_shared_raster_buffer_count]) |*frame| if (!sharedRasterReleaseFrameReferences(frame)) return false;
+    sharedRasterReleaseProcess(owner_a);
+
+    // Consumer-process teardown acts as Desktop restart cleanup; producer
+    // teardown may precede the last frame release without invalidating bytes.
+    if (sharedRasterCreate(owner_b, info, &handle) != r4x_api.gui_frame_result_ok or
+        sharedRasterMapWrite(owner_b, handle, &write_map) != r4x_api.gui_frame_result_ok or
+        sharedRasterPublish(owner_b, write_map, &raster_generation) != r4x_api.gui_frame_result_ok)
+    {
+        return false;
+    }
+    var cleanup_descriptor = descriptor;
+    cleanup_descriptor.handle = handle;
+    cleanup_descriptor.raster_generation = raster_generation;
+    _ = sharedRasterPinFrame(owner_b, &frames[3], cleanup_descriptor) orelse return false;
+    frames[3].shared_raster_count = 1;
+    if (sharedRasterAcquire(consumer_a, owner_b, 302, handle, raster_generation, &map_a) != r4x_api.gui_frame_result_ok) return false;
+    sharedRasterReleaseProcess(consumer_a);
+    if (sharedRasterRelease(consumer_a, map_a.lease) != r4x_api.gui_frame_error_stale) return false;
+    sharedRasterReleaseProcess(owner_b);
+    if (!sharedRasterReleaseFrameReferences(&frames[3])) return false;
+
+    var handle_a: GuiSharedRasterHandle = .{};
+    var handle_b: GuiSharedRasterHandle = .{};
+    if (sharedRasterCreate(owner_a, info, &handle_a) != r4x_api.gui_frame_result_ok or
+        sharedRasterCreate(owner_b, info, &handle_b) != r4x_api.gui_frame_result_ok or
+        sharedRasterDestroy(owner_b, handle_a) != r4x_api.gui_frame_error_invalid or
+        sharedRasterDestroy(owner_a, handle_a) != r4x_api.gui_frame_result_ok or
+        sharedRasterDestroy(owner_b, handle_b) != r4x_api.gui_frame_result_ok)
+    {
+        return false;
+    }
+    sharedRasterReleaseProcess(owner_a);
+    sharedRasterReleaseProcess(owner_b);
+    return true;
+}
+
+fn testGuiSharedRasterLifecycle(heap_baseline: heap.Stats, storage_baseline: ProgramInstanceStorageStats) bool {
+    if (!sharedRasterStateEmpty()) return false;
+    const passed = testGuiSharedRasterLifecycleInner();
+    return passed and sharedRasterStateEmpty() and instanceStorageHeapBaselineEqual(heap_baseline, heap.stats()) and
+        instanceStorageCurrentEqual(storage_baseline, instanceStorageStats());
+}
+
 fn failInstanceStorageSelfTest(case_id: u32, heap_baseline: heap.Stats, storage_baseline: ProgramInstanceStorageStats) bool {
     const heap_ok = instanceStorageHeapBaselineEqual(heap_baseline, heap.stats());
     const storage_ok = instanceStorageCurrentEqual(storage_baseline, instanceStorageStats());
@@ -4129,7 +5021,48 @@ fn cloneGuiFrame(instance: *ProgramInstance, source: *const ProgramGuiFramePaylo
         // raster stream, so advance by the generation-local aggregate.
         clone.raster_words = raster_base + source_frame.raster_words;
     }
+    var shared_owner: ?ProgramProcessHandle = null;
+    var source_cursor: ?*const ProgramGuiFramePayload = source;
+    while (source_cursor) |source_frame| : (source_cursor = source_frame.base_frame) {
+        if (source_frame.shared_raster_count != 0) {
+            const owner = shared_owner orelse currentProgramHandle() orelse programHandleForInstance(instance) orelse {
+                _ = releaseGuiFrame(clone, instance.id);
+                return null;
+            };
+            shared_owner = owner;
+            if (!sharedRasterCopyFrameReferences(owner, source_frame, clone)) {
+                _ = releaseGuiFrame(clone, instance.id);
+                return null;
+            }
+        }
+    }
     return clone;
+}
+
+fn guiFrameHasSharedRasterRef(frame: *const ProgramGuiFramePayload, handle: GuiSharedRasterHandle, raster_generation: u64) bool {
+    return sharedRasterFrameHasReference(frame, handle, raster_generation);
+}
+
+fn guiFramePinBatchSharedRasters(
+    owner: ProgramProcessHandle,
+    building: *const ProgramGuiFramePayload,
+    delta: *ProgramGuiFramePayload,
+    commands: []const GuiFrameCommand,
+    resources: []const u8,
+) i32 {
+    for (commands) |*command| {
+        if (command.kind != r4x_api.gui_frame_command_kind_shared_raster) continue;
+        const resource = batchCommandResourceSlice(command, resources) orelse return r4x_api.gui_frame_error_invalid;
+        const descriptor = guiSharedRasterDescriptor(resource) orelse return r4x_api.gui_frame_error_invalid;
+        if (guiFrameHasSharedRasterRef(building, descriptor.handle, descriptor.raster_generation) or
+            guiFrameHasSharedRasterRef(delta, descriptor.handle, descriptor.raster_generation)) continue;
+        if (building.shared_raster_count + delta.shared_raster_count >= r4x_api.gui_shared_raster_max_frame_resources) {
+            return r4x_api.gui_frame_error_overflow;
+        }
+        _ = sharedRasterPinFrame(owner, delta, descriptor) orelse return r4x_api.gui_frame_error_stale;
+        delta.shared_raster_count += 1;
+    }
+    return r4x_api.gui_frame_result_ok;
 }
 
 fn batchCommandResourceKind(command: *const GuiFrameCommand) ?ProgramGuiCommandResourceKind {
@@ -4146,6 +5079,7 @@ fn batchCommandResourceKind(command: *const GuiFrameCommand) ?ProgramGuiCommandR
         => .path,
         r4x_api.gui_frame_command_kind_indexed8 => .indexed8,
         r4x_api.gui_frame_command_kind_xrgb32_nearest => .xrgb32_nearest,
+        r4x_api.gui_frame_command_kind_shared_raster => .shared_raster,
         else => null,
     };
 }
@@ -4168,6 +5102,67 @@ fn guiShapeReadU32(bytes: []const u8, offset: usize) ?u32 {
 
 fn guiShapeField(bytes: []const u8, comptime name: []const u8) ?u32 {
     return guiShapeReadU32(bytes, @offsetOf(GuiShapeResource, name));
+}
+
+fn guiSharedRasterDescriptor(resource: []const u8) ?GuiSharedRasterResource {
+    if (resource.len != @sizeOf(GuiSharedRasterResource)) return null;
+    var descriptor: GuiSharedRasterResource = .{};
+    @memcpy(std.mem.asBytes(&descriptor), resource);
+    return descriptor;
+}
+
+fn validateGuiSharedRasterResource(command: *const GuiFrameCommand, resource: []const u8) bool {
+    if (command.w == 0 or command.h == 0 or command.w > GUI_RASTER_MAX_WIDTH or command.h > GUI_RASTER_MAX_HEIGHT or
+        command.fg != 0 or command.bg != 0 or command.font_id != 0 or command.text_w != 0 or command.text_h != 0 or
+        command.baseline != 0 or command.line_height != 0 or command.parameter0 != 0 or command.parameter1 != 0 or
+        command.resource_bytes != r4x_api.gui_shared_raster_resource_size)
+    {
+        return false;
+    }
+    const descriptor = guiSharedRasterDescriptor(resource) orelse return false;
+    if (descriptor.version != r4x_api.gui_shared_raster_resource_version or
+        descriptor.size != r4x_api.gui_shared_raster_resource_size or descriptor.handle.id == 0 or
+        descriptor.handle.generation == 0 or descriptor.raster_generation == 0 or descriptor.flags != 0 or
+        descriptor.source_w == 0 or descriptor.source_h == 0 or descriptor.guest_w == 0 or descriptor.guest_h == 0 or
+        descriptor.viewport_w == 0 or descriptor.viewport_h == 0)
+    {
+        return false;
+    }
+    if (descriptor.format != r4x_api.gui_shared_raster_format_xrgb32 and
+        descriptor.format != r4x_api.gui_shared_raster_format_indexed8 and
+        descriptor.format != r4x_api.gui_shared_raster_format_alpha8) return false;
+    if (descriptor.format != r4x_api.gui_shared_raster_format_alpha8 and command.rgb != 0) return false;
+    const source_right = std.math.add(u64, descriptor.source_x, descriptor.source_w) catch return false;
+    const source_bottom = std.math.add(u64, descriptor.source_y, descriptor.source_h) catch return false;
+    if (source_right > descriptor.guest_w or source_bottom > descriptor.guest_h) return false;
+
+    const command_left: i64 = command.x;
+    const command_top: i64 = command.y;
+    const command_right = std.math.add(i64, command_left, command.w) catch return false;
+    const command_bottom = std.math.add(i64, command_top, command.h) catch return false;
+    const viewport_left: i64 = descriptor.viewport_x;
+    const viewport_top: i64 = descriptor.viewport_y;
+    const viewport_right = std.math.add(i64, viewport_left, descriptor.viewport_w) catch return false;
+    const viewport_bottom = std.math.add(i64, viewport_top, descriptor.viewport_h) catch return false;
+    if (command_left < viewport_left or command_top < viewport_top or command_right > viewport_right or command_bottom > viewport_bottom) return false;
+
+    if (descriptor.format == r4x_api.gui_shared_raster_format_alpha8) {
+        return descriptor.viewport_w == descriptor.guest_w and descriptor.viewport_h == descriptor.guest_h and
+            command_left == viewport_left + descriptor.source_x and
+            command_top == viewport_top + descriptor.source_y and
+            command.w == descriptor.source_w and command.h == descriptor.source_h;
+    }
+
+    const local_left: u64 = @intCast(command_left - viewport_left);
+    const local_top: u64 = @intCast(command_top - viewport_top);
+    const local_right: u64 = @intCast(command_right - viewport_left);
+    const local_bottom: u64 = @intCast(command_bottom - viewport_top);
+    const mapped_left = (local_left * descriptor.guest_w) / descriptor.viewport_w;
+    const mapped_top = (local_top * descriptor.guest_h) / descriptor.viewport_h;
+    const mapped_right = ((local_right - 1) * descriptor.guest_w) / descriptor.viewport_w;
+    const mapped_bottom = ((local_bottom - 1) * descriptor.guest_h) / descriptor.viewport_h;
+    return mapped_left >= descriptor.source_x and mapped_top >= descriptor.source_y and
+        mapped_right < source_right and mapped_bottom < source_bottom;
 }
 
 fn validateGuiIndexed8Resource(command: *const GuiFrameCommand, resource: []const u8) bool {
@@ -4468,6 +5463,9 @@ fn validateGuiFrameBatchCommand(command: *const GuiFrameCommand, resources: []co
         r4x_api.gui_frame_command_kind_xrgb32_nearest => {
             return resource_kind == .xrgb32_nearest and validateGuiXrgb32Resource(command, resource);
         },
+        r4x_api.gui_frame_command_kind_shared_raster => {
+            return resource_kind == .shared_raster and validateGuiSharedRasterResource(command, resource);
+        },
         r4x_api.gui_frame_command_kind_path_fill,
         r4x_api.gui_frame_command_kind_path_stroke,
         r4x_api.gui_frame_command_kind_rounded_rect,
@@ -4553,6 +5551,7 @@ fn spliceGuiFrameDelta(gui: *ProgramGuiPayload, building: *ProgramGuiFramePayloa
     building.resource_len += delta.resource_len;
     building.raster_words += delta.raster_words;
     building.node_sequence += delta.node_sequence;
+    std.debug.assert(sharedRasterMoveFrameReferences(delta, building));
 
     delta.command_payload = null;
     delta.command_tail = null;
@@ -4575,6 +5574,15 @@ fn guiFrameAppendBatch(instance: *ProgramInstance, commands: []const GuiFrameCom
             building.build_failed = true;
             return setGuiFrameResult(gui, r4x_api.gui_frame_error_invalid);
         }
+    }
+    var contains_shared_raster = false;
+    for (commands) |command| if (command.kind == r4x_api.gui_frame_command_kind_shared_raster) {
+        contains_shared_raster = true;
+        break;
+    };
+    if (contains_shared_raster and !building.replacement and building.damage_count != 0) {
+        building.build_failed = true;
+        return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
     }
     if (commands.len == 0 and resources.len == 0) return setGuiFrameResult(gui, r4x_api.gui_frame_result_ok);
 
@@ -4620,6 +5628,17 @@ fn guiFrameAppendBatch(instance: *ProgramInstance, commands: []const GuiFrameCom
     if (!validateGuiFrame(delta, instance.id)) {
         building.build_failed = true;
         return setGuiFrameResult(gui, r4x_api.gui_frame_error_invalid);
+    }
+    if (contains_shared_raster) {
+        const owner = currentProgramHandle() orelse programHandleForInstance(instance) orelse {
+            building.build_failed = true;
+            return setGuiFrameResult(gui, r4x_api.gui_frame_error_unavailable);
+        };
+        const pin_result = guiFramePinBatchSharedRasters(owner, building, delta, commands, resources);
+        if (pin_result != r4x_api.gui_frame_result_ok) {
+            building.build_failed = true;
+            return setGuiFrameResult(gui, pin_result);
+        }
     }
     _ = std.math.add(u64, building.command_count, delta.command_count) catch {
         building.build_failed = true;
@@ -4914,6 +5933,9 @@ fn guiFrameCommit(instance: *ProgramInstance) i32 {
     refreshGuiFrameOwnerPeak(gui);
     _ = gui.frame_lock.unlock();
     if (release_old) |frame| _ = releaseGuiFrame(frame, instance.id);
+    if (building.shared_raster_count != 0) {
+        if (currentProgramHandle() orelse programHandleForInstance(instance)) |owner| sharedRasterNoteFrameCommit(owner, building);
+    }
     bumpGuiRevision(instance);
     return 0;
 }
@@ -6300,6 +7322,12 @@ fn configureR4XStartR4DrawTable() void {
         .font_revision = &r4api.r4draw.fontRevision,
         .gui_frame_begin_replace = &apiGuiFrameBeginReplace,
         .gui_frame_stream_info = &apiGuiFrameStreamInfo,
+        .gui_shared_raster_create = &apiGuiSharedRasterCreate,
+        .gui_shared_raster_destroy = &apiGuiSharedRasterDestroy,
+        .gui_shared_raster_map_write = &apiGuiSharedRasterMapWrite,
+        .gui_shared_raster_publish = &apiGuiSharedRasterPublish,
+        .gui_shared_raster_acquire = &apiGuiSharedRasterAcquire,
+        .gui_shared_raster_release = &apiGuiSharedRasterRelease,
     });
 }
 
@@ -14023,7 +15051,7 @@ fn materializeLegacyGuiCommandAt(location: GuiFrameCommandLocation, out: *GuiCom
             out.bg = @intCast(packed_words);
             out.flags = 1;
         },
-        .path, .indexed8, .xrgb32_nearest => return false,
+        .path, .indexed8, .xrgb32_nearest, .shared_raster => return false,
     }
     return true;
 }
@@ -14489,6 +15517,12 @@ fn guiFrameContainsIndexed8(frame: *const ProgramGuiFramePayload) bool {
     return false;
 }
 
+fn guiFrameContainsSharedRaster(frame: *const ProgramGuiFramePayload) bool {
+    var cursor: ?*const ProgramGuiFramePayload = frame;
+    while (cursor) |item| : (cursor = item.base_frame) if (item.shared_raster_count != 0) return true;
+    return false;
+}
+
 fn fillGuiFrameGenerationInfo(gui: *const ProgramGuiPayload, owner: ProgramProcessHandle, frame: *const ProgramGuiFramePayload, out: *GuiFrameGenerationInfo) void {
     var flags: u32 = if (frame.base_frame == null)
         r4x_api.gui_frame_generation_flag_full
@@ -14496,6 +15530,7 @@ fn fillGuiFrameGenerationInfo(gui: *const ProgramGuiPayload, owner: ProgramProce
         r4x_api.gui_frame_generation_flag_delta;
     if (frame.replacement) flags |= r4x_api.gui_frame_generation_flag_replacement;
     if (guiFrameContainsIndexed8(frame)) flags |= r4x_api.gui_frame_generation_flag_indexed8;
+    if (guiFrameContainsSharedRaster(frame)) flags |= r4x_api.gui_frame_generation_flag_shared_raster;
     out.* = .{
         .flags = flags,
         .damage_count = frame.damage_count,
@@ -14517,7 +15552,8 @@ fn fillGuiFrameGenerationInfo(gui: *const ProgramGuiPayload, owner: ProgramProce
 }
 
 fn validGuiFrameStreamInfoOutput(out: *const GuiFrameStreamInfo) bool {
-    return out.version >= r4x_api.gui_frame_stream_info_version and out.size >= r4x_api.gui_frame_stream_info_size;
+    return (out.version == 1 and out.size >= 112) or
+        (out.version >= r4x_api.gui_frame_stream_info_version and out.size >= r4x_api.gui_frame_stream_info_size);
 }
 
 fn fillGuiFrameStreamInfo(gui: *const ProgramGuiPayload, owner: ProgramProcessHandle, out: *GuiFrameStreamInfo) void {
@@ -14537,28 +15573,107 @@ fn fillGuiFrameStreamInfo(gui: *const ProgramGuiPayload, owner: ProgramProcessHa
     };
 }
 
+fn writeGuiFrameStreamInfoOutput(out: *GuiFrameStreamInfo, caller_version: u32, value: GuiFrameStreamInfo) void {
+    var response = value;
+    const response_size: usize = if (caller_version == 1) 112 else @sizeOf(GuiFrameStreamInfo);
+    response.version = if (caller_version == 1) 1 else r4x_api.gui_frame_stream_info_version;
+    response.size = @intCast(response_size);
+    const destination: [*]u8 = @ptrCast(out);
+    @memcpy(destination[0..response_size], std.mem.asBytes(&response)[0..response_size]);
+}
+
 fn apiGuiFrameStreamInfo(handle_ptr: *const ProgramProcessHandle, out: *GuiFrameStreamInfo) callconv(.c) i32 {
     if (@intFromPtr(handle_ptr) == 0 or @intFromPtr(out) == 0) return r4x_api.gui_frame_error_invalid;
     if (!validGuiFrameStreamInfoOutput(out)) return r4x_api.gui_frame_error_invalid;
+    const caller_version = out.version;
     const handle = handle_ptr.*;
     if (!programHandleValid(handle)) {
-        out.* = .{ .owner = handle };
+        writeGuiFrameStreamInfoOutput(out, caller_version, .{ .owner = handle });
         return r4x_api.gui_frame_error_invalid;
     }
     const lease_value = pinProgramHandle(handle, false) orelse {
-        out.* = .{ .owner = handle };
+        writeGuiFrameStreamInfoOutput(out, caller_version, .{ .owner = handle });
         return r4x_api.gui_frame_error_invalid;
     };
     var lease = lease_value;
     defer unpinProgramInstance(&lease);
     const gui = lease.instance.gui_payload orelse {
-        out.* = .{ .owner = handle };
+        writeGuiFrameStreamInfoOutput(out, caller_version, .{ .owner = handle });
         return r4x_api.gui_frame_error_unavailable;
     };
+    var result: GuiFrameStreamInfo = .{};
     lockGuiFrameState(gui);
-    fillGuiFrameStreamInfo(gui, handle, out);
+    fillGuiFrameStreamInfo(gui, handle, &result);
     _ = gui.frame_lock.unlock();
+    const shared = sharedRasterStatsSnapshot(handle);
+    result.shared_publish_count = shared.publish_count;
+    result.shared_acquire_count = shared.acquire_count;
+    result.shared_release_count = shared.release_count;
+    result.shared_backpressure_count = shared.backpressure_count;
+    result.shared_published_bytes = shared.published_bytes;
+    result.shared_frame_bytes_avoided = shared.frame_bytes_avoided;
+    result.shared_acquired_bytes = shared.acquired_bytes;
+    result.shared_live_bytes = shared.live_bytes;
+    writeGuiFrameStreamInfoOutput(out, caller_version, result);
     return r4x_api.gui_frame_result_ok;
+}
+
+fn apiGuiSharedRasterCreate(info: *const GuiSharedRasterCreateInfo, out_handle: *GuiSharedRasterHandle) callconv(.c) i32 {
+    if (@intFromPtr(info) == 0 or @intFromPtr(out_handle) == 0) return r4x_api.gui_frame_error_invalid;
+    const owner = currentProgramHandle() orelse return r4x_api.gui_frame_error_unavailable;
+    return sharedRasterCreate(owner, info.*, out_handle);
+}
+
+fn apiGuiSharedRasterDestroy(handle: *const GuiSharedRasterHandle) callconv(.c) i32 {
+    if (@intFromPtr(handle) == 0) return r4x_api.gui_frame_error_invalid;
+    const owner = currentProgramHandle() orelse return r4x_api.gui_frame_error_unavailable;
+    return sharedRasterDestroy(owner, handle.*);
+}
+
+fn apiGuiSharedRasterMapWrite(handle: *const GuiSharedRasterHandle, out_map: *GuiSharedRasterWriteMap) callconv(.c) i32 {
+    if (@intFromPtr(handle) == 0 or @intFromPtr(out_map) == 0) return r4x_api.gui_frame_error_invalid;
+    if (out_map.version < r4x_api.gui_shared_raster_write_map_version or out_map.size < r4x_api.gui_shared_raster_write_map_size) {
+        return r4x_api.gui_frame_error_invalid;
+    }
+    const owner = currentProgramHandle() orelse return r4x_api.gui_frame_error_unavailable;
+    return sharedRasterMapWrite(owner, handle.*, out_map);
+}
+
+fn apiGuiSharedRasterPublish(map: *const GuiSharedRasterWriteMap, out_generation: *u64) callconv(.c) i32 {
+    if (@intFromPtr(map) == 0 or @intFromPtr(out_generation) == 0) return r4x_api.gui_frame_error_invalid;
+    const owner = currentProgramHandle() orelse return r4x_api.gui_frame_error_unavailable;
+    return sharedRasterPublish(owner, map.*, out_generation);
+}
+
+fn apiGuiSharedRasterAcquire(
+    frame_owner_ptr: *const ProgramProcessHandle,
+    frame_generation: u64,
+    raster_handle_ptr: *const GuiSharedRasterHandle,
+    raster_generation: u64,
+    out_map: *GuiSharedRasterMap,
+) callconv(.c) i32 {
+    if (@intFromPtr(frame_owner_ptr) == 0 or @intFromPtr(raster_handle_ptr) == 0 or @intFromPtr(out_map) == 0 or
+        frame_generation == 0 or raster_generation == 0) return r4x_api.gui_frame_error_invalid;
+    if (out_map.version < r4x_api.gui_shared_raster_map_version or out_map.size < r4x_api.gui_shared_raster_map_size) {
+        return r4x_api.gui_frame_error_invalid;
+    }
+    const consumer = currentProgramHandle() orelse return r4x_api.gui_frame_error_unavailable;
+    const frame_owner = frame_owner_ptr.*;
+    const raster_handle = raster_handle_ptr.*;
+    if (!programHandleValid(frame_owner) or !validSharedRasterHandle(raster_handle)) return r4x_api.gui_frame_error_invalid;
+    const program_lease_value = pinProgramHandle(frame_owner, false) orelse return r4x_api.gui_frame_error_stale;
+    var program_lease = program_lease_value;
+    defer unpinProgramInstance(&program_lease);
+    var capture = captureCommittedGuiFrame(program_lease.instance, frame_generation) orelse return r4x_api.gui_frame_error_stale;
+    defer releaseCapturedGuiFrame(program_lease.instance, &capture);
+    if (!guiFrameHasSharedRasterRef(capture.frame, raster_handle, raster_generation)) return r4x_api.gui_frame_error_invalid;
+    return sharedRasterAcquire(consumer, frame_owner, frame_generation, raster_handle, raster_generation, out_map);
+}
+
+fn apiGuiSharedRasterRelease(lease: *const GuiSharedRasterLease) callconv(.c) i32 {
+    if (@intFromPtr(lease) == 0) return r4x_api.gui_frame_error_invalid;
+    const consumer = currentProgramHandle() orelse return r4x_api.gui_frame_error_unavailable;
+    return sharedRasterRelease(consumer, lease.*);
 }
 
 fn apiGuiFrameGenerationInfo(handle_ptr: *const ProgramProcessHandle, generation: u64, out: *GuiFrameGenerationInfo) callconv(.c) i32 {
