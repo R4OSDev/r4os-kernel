@@ -7940,6 +7940,10 @@ fn resolveProgramFile(d: *drive.Drive, path: []const u8) ?ProgramFile {
 }
 
 fn resolveProgramFileWithBootReport(d: *drive.Drive, path: []const u8, report_boot_launch: bool) ?ProgramFile {
+    if (!module_file.executionDriveAllowed(d.letter)) {
+        k.puts("Module start requires the running RAM volume\r\n");
+        return null;
+    }
     const volume = vfs.volumeForDrive(d.letter) orelse return null;
     reportBootLaunchStage(report_boot_launch, "FS-Sperre pruefen");
     var req = fs_request.tryBegin(.loader_read, d.letter) orelse blk: {

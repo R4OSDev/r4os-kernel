@@ -1,6 +1,21 @@
 const vfs = @import("../fs/vfs.zig");
 const fs_request = @import("../fs/request.zig");
 const k = @import("log.zig");
+const drive = @import("../fs/drive.zig");
+
+var execution_drive: ?u8 = null;
+
+/// Boot-only admission policy, installed before userland starts. Normal R4OS
+/// leaves it unset; a RAM runtime can restrict executable sources to itself.
+pub fn restrictExecutionToDrive(letter: u8) void {
+    execution_drive = letter;
+}
+
+pub fn executionDriveAllowed(letter: u8) bool {
+    const required = execution_drive orelse return true;
+    const mounted = drive.get(letter) orelse return false;
+    return letter == required and mounted.role == .ram;
+}
 
 pub const FileSource = struct {
     volume: vfs.Volume,

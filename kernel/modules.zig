@@ -835,6 +835,7 @@ fn resolveImportFromEntry(provider: *const Entry, import: ImportRecord, importer
 }
 
 fn loadR4MFile(source: module_file.FileSource, file_size: usize, tables: *const ValidatedFileTables, expected_kind: Kind, fallback_name: []const u8, path: []const u8, resolved_imports: []const ResolvedImport) ?usize {
+    if (!module_file.executionDriveAllowed(source.drive_letter)) return null;
     const header = tables.header;
     const kind = header.kind() orelse {
         k.puts("[MOD] unknown ModuleKind: ");
