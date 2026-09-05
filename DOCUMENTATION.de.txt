@@ -669,3 +669,20 @@ Ready-Publikation an die jeweiligen Online-CPUs. Wechselnde Runtime-Lasten
 waehrend der Stackanlage duerfen die fuer den Skalierungs- und TLB-Nachweis
 erforderliche Eins-zu-eins-Verteilung nicht veraendern. Der normale Scheduler
 behaelt seine lastabhaengige Platzierung fuer produktive Programme.
+
+0.76.10: Partitionsidentitaet nach Verwaltungsoperationen
+---------------------------------------------------------
+Storage-Claimabschluss stellt nur noch ueberlebende Mountidentitaeten wieder
+her: Datentraeger-GUID/MBR-ID, Partitionsnummer, Grenzen, Partitions-GUID und
+Typ muessen uebereinstimmen. Absichtliches Loeschen oder Umkennzeichnen
+liefert keinen falschen Remountfehler und erbt weder Laufwerksbuchstaben
+noch Installationsrolle. Bei gleicher Identitaet bleiben Dateisystemfehler
+echte Remountfehler. R4PART OFFLINE verwendet KEEP_UNMOUNTED; ONLINE bindet
+erneut explizit ein. Das ist gemeinsamer Mountzustand, keine Geraeteabschaltung.
+
+Der als primaere Shell gestartete Vollbild-Terminalhost und seine Kinder
+lesen die physische Tastatur zusaetzlich zur eigenen Konsolenqueue. InputWait
+wartet auf die zugehoerige Keyboard-Generation; Queue-Injektion und Close
+signalisieren denselben Wartepfad. SSH-, Fenster- und Recovery-Menue-Hosts
+bleiben bei ihren getrennten Konsolenqueues. So funktioniert R4PART auch
+im regulaeren lokalen Terminal und greift keiner Remote-Sitzung Tasten ab.

@@ -32,6 +32,8 @@ const SavedMount = struct {
     reference: access.MountRef,
     region: access.Region,
     partition: table.Partition,
+    disk_guid: table.guid.Guid,
+    mbr_disk_id: u32,
     kind: drive.Kind,
     role: drive.Role,
     bytes: usize,
@@ -280,7 +282,7 @@ fn rememberMounts(operation: *Operation) Error!void {
             part = candidate;
             break;
         };
-        var saved = SavedMount{ .slot = @intCast(i), .reference = ref, .region = mounted.region, .partition = part orelse return error.Incomplete, .kind = d.kind, .role = d.role, .bytes = d.bytes, .name = .{0} ** 32 };
+        var saved = SavedMount{ .slot = @intCast(i), .reference = ref, .region = mounted.region, .partition = part orelse return error.Incomplete, .disk_guid = record.layout.disk_guid, .mbr_disk_id = record.layout.mbr_disk_id, .kind = d.kind, .role = d.role, .bytes = d.bytes, .name = .{0} ** 32 };
         copyText(&saved.name, d.name);
         operation.saved[operation.saved_count] = saved;
         operation.saved_count += 1;
@@ -380,16 +382,21 @@ fn publishMount(record: *Record, index: usize, letter: u8, role: drive.Role, nam
 fn restore(saved: SavedMount) Error!void {
     const record = &records[saved.region.device.slot];
     if (!record.layout.valid) return error.Remount;
+    // A deliberately deleted/reidentified volume no longer owns its former
+    // letter or installation role. Restore only surviving exact identities;
+    // a matching identity with an unreadable filesystem is still an error.
+    if (!table.guid.eql(saved.disk_guid, record.layout.disk_guid) or saved.mbr_disk_id != record.layout.mbr_disk_id) return;
     for (record.layout.items(), 0..) |part, i| {
         if (part.number != saved.partition.number or part.first_lba != saved.partition.first_lba or
-            part.sector_count != saved.partition.sector_count or !table.guid.eql(part.unique_guid, saved.partition.unique_guid)) continue;
+            part.sector_count != saved.partition.sector_count or !table.guid.eql(part.unique_guid, saved.partition.unique_guid) or
+            !table.guid.eql(part.type_guid, saved.partition.type_guid) or part.mbr_type != saved.partition.mbr_type) continue;
         _ = publishMount(record, i, @intCast('A' + saved.slot), saved.role, span(&record.identity.name)) catch |err| {
             record.errors[i] = code(err);
             return err;
         };
         return;
     }
-    return error.Remount;
+    return;
 }
 
 fn finish(operation: *Operation, keep_unmounted: bool) Error!void {

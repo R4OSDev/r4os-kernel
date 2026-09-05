@@ -12672,6 +12672,10 @@ fn readInputCodepoint() ?u32 {
     if (currentInstance()) |instance| {
         if (currentConsoleInstance()) |console_instance| {
             if (popInput(console_instance)) |ch| return ch;
+            // The primary fullscreen Terminal owns the physical keyboard.
+            // Its children inherit this console. Remote and window hosts
+            // continue to receive input only through their separate queues.
+            if (isRawFullscreenPresenter(console_instance)) return keyboard.readCodepoint();
             const current_console = consolePayloadConst(instance);
             const target_window_id = if (console_instance.gui_payload) |gui| gui.window_id else -1;
             if (current_console.io_target_id != 0 or target_window_id >= 0 or consolePayloadConst(console_instance).host != .none) return null;
@@ -16116,7 +16120,10 @@ fn pushConsoleInput(instance: *ProgramInstance, data: []const u8) usize {
     const console = consolePayload(instance);
     console_input_bytes_attempted +%= @as(u64, @intCast(data.len));
     if (!console.input_lock.lock(sync.WAIT_FOREVER)) return 0;
-    defer _ = console.input_lock.unlock();
+    defer {
+        _ = console.input_lock.unlock();
+        if (isRawFullscreenPresenter(instance)) keyboard.signalInputActivity();
+    }
     var accepted: usize = 0;
     while (accepted < data.len) : (accepted += 1) {
         const next_head = (console.input_head + 1) % INPUT_QUEUE_SIZE;
@@ -16216,6 +16223,21 @@ fn apiConsoleInputWait(last_generation: u64, timeout_ticks: u64, out_generation:
 
     if (input_lease) |lease| {
         const console = consolePayload(lease.instance);
+        if (isRawFullscreenPresenter(lease.instance)) {
+            const generation = keyboard.inputGeneration();
+            out_generation.* = generation;
+            if (source.close_requested) return r4x_api.console_input_wait_error_closed;
+            if (!console.input_lock.lock(sync.WAIT_FOREVER)) return r4x_api.console_input_wait_error_failed;
+            const queued = console.input_head != console.input_tail;
+            _ = console.input_lock.unlock();
+            if (queued or keyboard.pending() or generation != last_generation) {
+                console_wait_immediate +%= 1;
+                return r4x_api.console_input_wait_ready;
+            }
+            if (timeout_ticks == 0) return r4x_api.console_input_wait_timeout;
+            console_wait_blocks +%= 1;
+            return mapConsoleInputWaitResult(keyboard.waitInput(last_generation, timeout_ticks, out_generation));
+        }
         if (!console.input_lock.lock(sync.WAIT_FOREVER)) return r4x_api.console_input_wait_error_failed;
         const current_generation = console.input_generation;
         if (source.close_requested) {
@@ -16282,6 +16304,7 @@ fn signalConsoleInputForInstance(source: *ProgramInstance) void {
         };
         if (pinProgramHandle(handle, false)) |target| {
             signalConsoleInputPayload(consolePayload(target.instance));
+            if (isRawFullscreenPresenter(target.instance)) keyboard.signalInputActivity();
             var lease = target;
             unpinProgramInstance(&lease);
         }
@@ -16289,6 +16312,7 @@ fn signalConsoleInputForInstance(source: *ProgramInstance) void {
     }
     if (source.role == .background or (source.role == .shell and source_console.host != .none)) {
         signalConsoleInputPayload(source_console);
+        if (isRawFullscreenPresenter(source)) keyboard.signalInputActivity();
     } else {
         keyboard.signalInputActivity();
     }
