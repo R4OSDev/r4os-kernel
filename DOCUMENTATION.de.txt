@@ -607,3 +607,12 @@ USB-Speichersichtbarkeit und HID-Bindung sind voneinander unabhaengig.
 Der Build-Step input-test buendelt die schon vorhandenen begrenzten
 Controller-, Queue-, Layout-, HID-Set1-, USB-Host- und Eventroutertests;
 der volle test-Step fuehrt diese Tests weiterhin genau einmal aus.
+
+FAT32-Vollstaendiglesen (0.76.6)
+-------------------------------
+
+readFile begrenzt den Clusterlauf durch Dateigroesse und Volume-Geometrie.
+Die fruehere feste 4096-Cluster-Grenze kuerzte Dateien bei 512-Byte-Clustern
+auf 2 MB. Ungueltige Cluster und vorzeitiges Kettenende ergeben einen Fehler
+statt eines scheinbar erfolgreichen Teilinhalts. Das Recovery-Hintergrundbild
+mit 4720110 Bytes dient als realer Gastnachweis ueber den regulaeren Datei-API-Pfad.

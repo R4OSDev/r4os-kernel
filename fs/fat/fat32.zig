@@ -1031,6 +1031,12 @@ pub fn readFile(volume: Volume, entry: Entry, out: []u8) ?usize {
 
     if (entry.isDir()) return null;
     if (out.len < entry.size) return null;
+    const cluster_bytes = volume.clusterBytes();
+    if (cluster_bytes == 0) return null;
+    // A full read is bounded by the file and volume geometry, not an
+    // arbitrary 4096-cluster cap (only 2 MB with 512-byte clusters).
+    const needed_clusters = fileClusterCount(entry, cluster_bytes);
+    if (needed_clusters > volume.totalClusters()) return null;
     var cluster = entry.first_cluster;
     var remaining: usize = entry.size;
     var copied: usize = 0;
@@ -1038,7 +1044,8 @@ pub fn readFile(volume: Volume, entry: Entry, out: []u8) ?usize {
     var guard: usize = 0;
     var coop_steps: u32 = 0;
 
-    while (cluster >= 2 and cluster < EOC and remaining > 0 and guard < 4096) : (guard += 1) {
+    while (remaining > 0 and guard < needed_clusters) : (guard += 1) {
+        if (!validDataCluster(volume, cluster)) return null;
         var i: u8 = 0;
         while (i < volume.sectors_per_cluster and remaining > 0) : (i += 1) {
             if (!readSector(volume.device_index, volume.clusterLba(cluster) + i, 1, sector[0..])) return null;
@@ -1055,6 +1062,8 @@ pub fn readFile(volume: Volume, entry: Entry, out: []u8) ?usize {
         cluster = next;
     }
 
+    // A broken/short chain must not look like a successful partial read.
+    if (remaining != 0) return null;
     ok = true;
     return copied;
 }
