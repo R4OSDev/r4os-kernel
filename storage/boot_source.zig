@@ -29,6 +29,8 @@ pub const Source = struct {
     disk_guid: guid.Guid = guid.zero,
     boot_guid: guid.Guid = guid.zero,
     recovery_guid: guid.Guid = guid.zero,
+    system_guid: guid.Guid = guid.zero,
+    data_guid: guid.Guid = guid.zero,
 
     pub fn permitsInstall(self: Source, device_index: usize) bool {
         return self.confirmed and !(self.usb and self.device_index == device_index);
@@ -42,10 +44,20 @@ pub const Source = struct {
 };
 
 pub fn resolve(identity: Identity, devices: []const DeviceView) Source {
+    return resolveLoaded(identity, devices, false);
+}
+
+pub fn resolveNormal(identity: Identity, devices: []const DeviceView) Source {
+    return resolveLoaded(identity, devices, true);
+}
+
+fn resolveLoaded(identity: Identity, devices: []const DeviceView, normal: bool) Source {
     var result = Source{};
     if (!identity.present or identity.path_truncated or !identity.generic_media or guid.isZero(identity.disk_guid) or guid.isZero(identity.partition_guid)) return result;
     result.reason = "unknown-loaded-path";
-    if (std.ascii.eqlIgnoreCase(identity.path, "/CURRENT/recovery.elf")) result.slot = .current else if (std.ascii.eqlIgnoreCase(identity.path, "/PREVIOUS/recovery.elf")) result.slot = .previous else return result;
+    if (normal) {
+        if (!std.ascii.eqlIgnoreCase(identity.path, "/boot/r4os.elf") and !std.ascii.eqlIgnoreCase(identity.path, "/boot/r4os-prev.elf")) return result;
+    } else if (std.ascii.eqlIgnoreCase(identity.path, "/CURRENT/recovery.elf")) result.slot = .current else if (std.ascii.eqlIgnoreCase(identity.path, "/PREVIOUS/recovery.elf")) result.slot = .previous else return result;
     result.reason = "source-not-found";
     var selected: ?DeviceView = null;
     var disk_matches: usize = 0;
@@ -67,7 +79,11 @@ pub fn resolve(identity: Identity, devices: []const DeviceView) Source {
         result.reason = "installation-conflict";
         return result;
     }
-    if (!guid.eql(manifest.part(.RECOVERY).partition_guid, identity.partition_guid)) {
+    if (!installation.matches(manifest, device.table, manifest.part(.BOOT).partition_guid)) {
+        result.reason = "installation-table-mismatch";
+        return result;
+    }
+    if (!guid.eql(manifest.part(if (normal) .BOOT else .RECOVERY).partition_guid, identity.partition_guid)) {
         result.reason = "loaded-partition-mismatch";
         return result;
     }
@@ -90,5 +106,7 @@ pub fn resolve(identity: Identity, devices: []const DeviceView) Source {
     result.disk_guid = manifest.disk_guid;
     result.boot_guid = manifest.part(.BOOT).partition_guid;
     result.recovery_guid = manifest.part(.RECOVERY).partition_guid;
+    result.system_guid = manifest.part(.SYSTEM).partition_guid;
+    result.data_guid = manifest.part(.DATA).partition_guid;
     return result;
 }

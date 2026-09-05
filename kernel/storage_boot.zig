@@ -15,6 +15,7 @@ const page_cache = @import("../fs/page_cache.zig");
 const fs_request = @import("../fs/request.zig");
 const fatal = @import("fatal.zig");
 const mbr = @import("../storage/mbr.zig");
+const normal_boot = @import("../storage/normal_boot.zig");
 const memory_boot = @import("memory_boot.zig");
 const usb_msc = @import("../driver/usb/msc.zig");
 const xhci = @import("../driver/usb/xhci.zig");
@@ -81,7 +82,11 @@ pub fn initControllers(pcie_status: anytype) bool {
     probeAhci(pcie_status);
     probeNvme(pcie_status);
 
-    scanRegisteredBlockDevices();
+    switch (normal_boot.mount()) {
+        .managed => {},
+        .legacy => |disk| scanRegisteredBlockDevices(disk),
+        .rejected => |reason| return fail(reason),
+    }
     applyLegacyDataDriveLayoutPolicy();
 
     controllers_initialized = true;
@@ -338,8 +343,10 @@ fn probeNvme(pcie_status: anytype) void {
     k.puts("[NVME][WARN] canonical preload R4D missing; no built-in controller fallback\r\n");
 }
 
-fn scanRegisteredBlockDevices() void {
+fn scanRegisteredBlockDevices(boot_device: usize) void {
     var scanned: [16]bool = .{false} ** 16;
+
+    scanBlockDevice(&scanned, boot_device, "BOOT-MBR");
 
     if (usb_msc.deviceIndex()) |disk| {
         _ = usb_msc.reselectActiveDevice();
@@ -405,6 +412,8 @@ fn scanBlockDevice(scanned: *[16]bool, device_index: usize, driver_name: []const
 }
 
 fn applyLegacyDataDriveLayoutPolicy() void {
+    const data_drive = drive.get('D') orelse return;
+    if (data_drive.role != .data) return;
     const volume = vfs.volumeForDrive('D') orelse return;
     const root = vfs.resolvePath(volume, "\\") orelse return;
     ensureDataDirectory(volume, root, "DOCS");

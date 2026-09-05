@@ -181,3 +181,44 @@ test "foreign MBR partitions remain enumerable without a mounted filesystem" {
     tables.scan(f.reader(), &t);
     try std.testing.expect(!t.valid);
 }
+
+test "normal boot binds the loaded BOOT identity to its own SYSTEM and DATA" {
+    var f = Fixture.init();
+    var t = tables.Table{};
+    tables.scan(f.reader(), &t);
+    const json = try manifestJson(&t);
+    defer a.free(json);
+    const m = try installation.parse(a, json);
+    var foreign = t;
+    foreign.disk_guid[0] += 1;
+    for (foreign.partitions[0..foreign.count]) |*part| part.unique_guid[0] += 20;
+    var other = m;
+    other.disk_guid = foreign.disk_guid;
+    other.installation_id[0] += 1;
+    for (&other.partitions, 0..) |*part, i| part.partition_guid = foreign.partitions[i].unique_guid;
+    const devices = [_]source.DeviceView{
+        .{ .index = 2, .usb = true, .local = false, .table = &foreign, .installation = &other },
+        .{ .index = 7, .usb = false, .local = true, .table = &t, .installation = &m },
+    };
+    var identity = source.Identity{ .present = true, .generic_media = true, .path = "/boot/r4os.elf", .disk_guid = t.disk_guid, .partition_guid = t.partitions[1].unique_guid };
+    var result = source.resolveNormal(identity, &devices);
+    try std.testing.expect(result.confirmed and result.device_index == 7);
+    try std.testing.expect(guid.eql(result.system_guid, m.part(.SYSTEM).partition_guid));
+    try std.testing.expect(guid.eql(result.data_guid, m.part(.DATA).partition_guid));
+    try std.testing.expect(!source.resolve(identity, &devices).confirmed);
+    identity.disk_guid = foreign.disk_guid;
+    identity.partition_guid = foreign.partitions[1].unique_guid;
+    result = source.resolveNormal(identity, &devices);
+    try std.testing.expect(result.confirmed and result.device_index == 2);
+    var missing = devices;
+    missing[0].installation = null;
+    try std.testing.expect(!source.resolveNormal(identity, &missing).confirmed);
+    missing = devices;
+    missing[0].installation_conflict = true;
+    try std.testing.expect(!source.resolveNormal(identity, &missing).confirmed);
+    identity.partition_guid = foreign.partitions[2].unique_guid;
+    try std.testing.expect(!source.resolveNormal(identity, &devices).confirmed);
+    identity.partition_guid = foreign.partitions[1].unique_guid;
+    other.partitions[2].first_lba += 1;
+    try std.testing.expect(!source.resolveNormal(identity, &devices).confirmed);
+}
