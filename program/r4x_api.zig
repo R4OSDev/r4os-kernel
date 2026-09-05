@@ -4,6 +4,7 @@
 
 // R4OS-KERNEL-API-GENERATED-EXPORTS:BEGIN
 const generated = @import("r4os_kernel_contract");
+pub const file_update_atomic_checked_flag_long_stage = generated.file_update_atomic_checked_flag_long_stage;
 pub const arch_x86_64 = generated.arch_x86_64;
 pub const arp_flag_reply = generated.arp_flag_reply;
 pub const arp_flag_request = generated.arp_flag_request;

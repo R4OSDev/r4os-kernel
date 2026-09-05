@@ -1112,7 +1112,7 @@ pub fn readFileRange(volume: Volume, entry: Entry, offset: usize, out: []u8) ?us
     var skip_clusters = target_cluster_index - cluster_index;
     var guard: usize = 0;
     var coop_steps: u32 = 0;
-    while (skip_clusters > 0 and cluster >= 2 and cluster < EOC and guard < 4096) : (guard += 1) {
+    while (skip_clusters > 0 and cluster >= 2 and cluster < EOC and guard < volume.totalClusters()) : (guard += 1) {
         if (contiguous_remaining > 1) {
             const step = @min(skip_clusters, contiguous_remaining - 1);
             cluster += @intCast(step);
@@ -1128,7 +1128,7 @@ pub fn readFileRange(volume: Volume, entry: Entry, offset: usize, out: []u8) ?us
             cooperate(&coop_steps);
         }
     }
-    if (cluster < 2 or cluster >= EOC) return null;
+    if (skip_clusters != 0 or cluster < 2 or cluster >= allocClusterEnd(volume)) return null;
     if (contiguous_remaining <= 1) {
         contiguous_remaining = cacheReadRangeExtentFrom(volume, entry, file_clusters, cluster_index, cluster, &coop_steps);
     }
@@ -1137,7 +1137,7 @@ pub fn readFileRange(volume: Volume, entry: Entry, offset: usize, out: []u8) ?us
     var copied: usize = 0;
     var sector: [SECTOR_SIZE]u8 = undefined;
     guard = 0;
-    while (copied < wanted and cluster >= 2 and cluster < EOC and guard < 4096) : (guard += 1) {
+    while (copied < wanted and cluster >= 2 and cluster < allocClusterEnd(volume) and guard < volume.totalClusters()) : (guard += 1) {
         var sector_index: u8 = @intCast(in_cluster / SECTOR_SIZE);
         var sector_offset = in_cluster % SECTOR_SIZE;
         while (sector_index < volume.sectors_per_cluster and copied < wanted) {
@@ -1175,6 +1175,7 @@ pub fn readFileRange(volume: Volume, entry: Entry, offset: usize, out: []u8) ?us
         in_cluster = 0;
     }
 
+    if (copied != wanted) return null;
     ok = true;
     return copied;
 }
@@ -1224,17 +1225,17 @@ pub fn writeFile(original_volume: Volume, parent_cluster: u32, name: []const u8,
 
     const first_cluster = if (data.len == 0) 0 else allocateChain(volume, clustersForBytes(volume, data.len)) orelse return false;
     if (first_cluster != 0 and !writeClusterData(volume, first_cluster, data)) {
-        freeChain(volume, first_cluster);
+        _ = freeChain(volume, first_cluster);
         return false;
     }
 
     var raw_entries: [MAX_DIR_ENTRIES_PER_NAME * 32]u8 = undefined;
     const entries = buildNameDirectoryEntries(volume, parent_cluster, name, ATTR_ARCHIVE, first_cluster, @intCast(data.len), raw_entries[0..]) orelse {
-        if (first_cluster != 0) freeChain(volume, first_cluster);
+        if (first_cluster != 0) _ = freeChain(volume, first_cluster);
         return false;
     };
     if (!writeDirectoryEntries(volume, parent_cluster, entries)) {
-        if (first_cluster != 0) freeChain(volume, first_cluster);
+        if (first_cluster != 0) _ = freeChain(volume, first_cluster);
         return false;
     }
     ok = flushMutation(volume);
@@ -1331,7 +1332,7 @@ fn appendFileInternal(original_volume: Volume, parent_cluster: u32, name: []cons
             first_cluster = added.first;
         } else {
             if (!writeFatEntryAll(volume, last_existing_cluster, added.first)) {
-                freeChain(volume, added.first);
+                _ = freeChain(volume, added.first);
                 return .io;
             }
         }
@@ -1387,17 +1388,17 @@ fn copyFileWithMode(src_volume: Volume, original_dst_volume: Volume, src_entry: 
     const file_size: usize = @intCast(src_entry.size);
     const first_cluster = if (file_size == 0) 0 else allocateChain(dst_volume, clustersForBytes(dst_volume, file_size)) orelse return false;
     if (first_cluster != 0 and !copyClusterData(src_volume, dst_volume, src_entry, first_cluster)) {
-        freeChain(dst_volume, first_cluster);
+        _ = freeChain(dst_volume, first_cluster);
         return false;
     }
 
     var raw_entries: [MAX_DIR_ENTRIES_PER_NAME * 32]u8 = undefined;
     const entries = buildNameDirectoryEntries(dst_volume, dst_parent_cluster, dst_name, ATTR_ARCHIVE, first_cluster, @intCast(file_size), raw_entries[0..]) orelse {
-        if (first_cluster != 0) freeChain(dst_volume, first_cluster);
+        if (first_cluster != 0) _ = freeChain(dst_volume, first_cluster);
         return false;
     };
     if (!writeDirectoryEntries(dst_volume, dst_parent_cluster, entries)) {
-        if (first_cluster != 0) freeChain(dst_volume, first_cluster);
+        if (first_cluster != 0) _ = freeChain(dst_volume, first_cluster);
         return false;
     }
     ok = flushMutation(dst_volume);
@@ -1422,17 +1423,17 @@ pub fn makeDirectory(original_volume: Volume, parent_cluster: u32, name: []const
 
     const new_cluster = allocateChain(volume, 1) orelse return false;
     if (!initDirectoryCluster(volume, new_cluster, parent_cluster)) {
-        freeChain(volume, new_cluster);
+        _ = freeChain(volume, new_cluster);
         return false;
     }
 
     var raw_entries: [MAX_DIR_ENTRIES_PER_NAME * 32]u8 = undefined;
     const entries = buildNameDirectoryEntries(volume, parent_cluster, name, ATTR_DIRECTORY, new_cluster, 0, raw_entries[0..]) orelse {
-        freeChain(volume, new_cluster);
+        _ = freeChain(volume, new_cluster);
         return false;
     };
     if (!writeDirectoryEntries(volume, parent_cluster, entries)) {
-        freeChain(volume, new_cluster);
+        _ = freeChain(volume, new_cluster);
         return false;
     }
     ok = flushMutation(volume);
@@ -1530,7 +1531,9 @@ pub fn validateShortName83(name: []const u8) bool {
 /// freeing its now target-owned chain.  Re-entering after any flush boundary
 /// is safe and finishes the same ownership transfer.
 ///
-/// Stage and backup must be 8.3 siblings in `parent_cluster`.  The target may
+/// Backup must be an 8.3 sibling in `parent_cluster`. A checked caller may
+/// permit an already durable long stage; its short entry is detached and
+/// flushed before its orphaned LFN prefix is reclaimed. The target may
 /// use an existing LFN run: only its already durable short directory entry is
 /// updated at the visibility point, so the LFN slots remain untouched.  A new
 /// long target is rejected because publishing a fresh multi-entry LFN run is
@@ -1548,7 +1551,7 @@ pub fn replaceFileAtomic(
     invalidateAppendCache();
     invalidateReadRangeCache();
     if (!consume_stage) return .not_atomic;
-    if (!validInputName(target_name) or !validateShortName83(staged_name) or !validateShortName83(backup_name)) return .invalid;
+    if (!validInputName(target_name) or !validInputName(staged_name) or !validateShortName83(backup_name)) return .invalid;
     if (entryNameEqualAscii(target_name, staged_name) or entryNameEqualAscii(target_name, backup_name) or entryNameEqualAscii(staged_name, backup_name)) return .alias;
 
     const target_is_short = validateShortName83(target_name);
@@ -1704,11 +1707,20 @@ fn createOwnershipAlias(volume: Volume, parent_cluster: u32, name: []const u8, s
 }
 
 fn detachEntryNoFree(volume: Volume, loc: EntryLocation) bool {
-    var slot_index: usize = 0;
-    while (slot_index < loc.lfn_slot_count) : (slot_index += 1) {
-        if (!markDirectorySlotDeleted(volume, loc.lfn_slots[slot_index])) return false;
+    // The short entry alone owns the cluster chain. Persist its tombstone
+    // before removing LFN slots; never leave a live short alias whose long
+    // name vanished. Remove the LFN suffix backwards with ordered flushes.
+    // Every interrupted prefix remains a valid LFN prefix ending at a deleted
+    // slot, which both strict lookup paths below discard without ambiguity.
+    if (!markDirectorySlotDeleted(volume, .{ .lba = loc.lba, .offset = loc.offset })) return false;
+    if (loc.lfn_slot_count == 0) return true;
+    if (!flushVolume(volume)) return false;
+    var remaining = loc.lfn_slot_count;
+    while (remaining > 0) {
+        remaining -= 1;
+        if (!markDirectorySlotDeleted(volume, loc.lfn_slots[remaining]) or !flushVolume(volume)) return false;
     }
-    return markDirectorySlotDeleted(volume, .{ .lba = loc.lba, .offset = loc.offset });
+    return true;
 }
 
 fn sameFileOwnership(a: Entry, b: Entry) bool {
@@ -1963,9 +1975,14 @@ fn findEntryInClusterStatus(volume: Volume, cluster: u32, name: []const u8, out:
             stats.dir_entries_scanned +%= 1;
             cooperate(&coop_steps);
             const entry = sector[off .. off + 32];
-            if (entry[0] == 0x00) return if (lfn_state.active) .io else .end_directory;
+            if (entry[0] == 0x00) {
+                // A valid LFN prefix without a short owner is an interrupted
+                // creation, never a live file. Keep read-only lookup possible.
+                lfn_state.reset();
+                return .end_directory;
+            }
             if (entry[0] == 0xE5) {
-                if (lfn_state.active) return .io;
+                lfn_state.reset();
                 continue;
             }
             if (entry[11] == ATTR_LONG_NAME) {
@@ -2033,9 +2050,10 @@ fn findEntryLocationStatus(volume: Volume, start_cluster: u32, name: []const u8,
                 stats.dir_entries_scanned +%= 1;
                 cooperate(&coop_steps);
                 const raw = sector[off .. off + 32];
-                if (raw[0] == 0x00) return if (lfn_state.active) .io else .not_found;
+                if (raw[0] == 0x00) return .not_found;
                 if (raw[0] == 0xE5) {
-                    if (lfn_state.active) return .io;
+                    lfn_state.reset();
+                    lfn_slot_count = 0;
                     continue;
                 }
                 if (raw[11] == ATTR_LONG_NAME) {
@@ -2410,6 +2428,7 @@ fn min3(a: usize, b: usize, c: usize) usize {
 
 fn writeDirectoryEntry(volume: Volume, directory_cluster: u32, raw_entry: []const u8) bool {
     stats.dir_scans +%= 1;
+    var lfn_guard = DirectoryLfnGuard{};
     var coop_steps: u32 = 0;
     var chain = DirChainIterator.init(volume, directory_cluster);
     while (chain.next()) |cluster| {
@@ -2423,7 +2442,10 @@ fn writeDirectoryEntry(volume: Volume, directory_cluster: u32, raw_entry: []cons
             while (off < SECTOR_SIZE) : (off += 32) {
                 stats.dir_entries_scanned +%= 1;
                 cooperate(&coop_steps);
+                if (!lfn_guard.visit(volume, sector[off..][0..32], .{ .lba = lba, .offset = off })) return false;
                 if (sector[off] == 0x00 or sector[off] == 0xE5) {
+                    // The guard may have cleared a prefix in this sector.
+                    if (!readSector(volume.device_index, lba, 1, sector[0..])) return false;
                     @memcpy(sector[off .. off + 32], raw_entry[0..32]);
                     if (!writeSector(volume, lba, 1, sector[0..])) return false;
                     stats.dir_entry_updates +%= 1;
@@ -2440,6 +2462,35 @@ const DirectorySlot = struct {
     offset: usize,
 };
 
+/// Reclaim an interrupted LFN creation/deletion before its unused short slot is reused.
+/// Without this, a new file could inherit an orphaned long-name prefix.
+const DirectoryLfnGuard = struct {
+    state: LfnState = .{},
+    slots: [MAX_LFN_ENTRIES]DirectorySlot = undefined,
+    count: usize = 0,
+
+    fn visit(self: *DirectoryLfnGuard, volume: Volume, raw: []const u8, slot: DirectorySlot) bool {
+        if (raw[0] == 0xE5 or raw[0] == 0) {
+            while (self.count > 0) {
+                self.count -= 1;
+                if (!markDirectorySlotDeleted(volume, self.slots[self.count]) or !flushVolume(volume)) return false;
+            }
+            self.state.reset();
+            return true;
+        }
+        if (raw[11] == ATTR_LONG_NAME) {
+            if (!self.state.consume(raw) or self.count == self.slots.len) return false;
+            self.slots[self.count] = slot;
+            self.count += 1;
+            return true;
+        }
+        if (self.state.active and !self.state.completeFor(raw)) return false;
+        self.state.reset();
+        self.count = 0;
+        return true;
+    }
+};
+
 fn writeDirectoryEntries(volume: Volume, directory_cluster: u32, raw_entries: []const u8) bool {
     if (raw_entries.len == 0 or raw_entries.len % 32 != 0) return false;
     const needed = raw_entries.len / 32;
@@ -2448,6 +2499,7 @@ fn writeDirectoryEntries(volume: Volume, directory_cluster: u32, raw_entries: []
     stats.dir_scans +%= 1;
     var slots: [MAX_DIR_ENTRIES_PER_NAME]DirectorySlot = undefined;
     var run_count: usize = 0;
+    var lfn_guard = DirectoryLfnGuard{};
     var coop_steps: u32 = 0;
     var chain = DirChainIterator.init(volume, directory_cluster);
     while (chain.next()) |cluster| {
@@ -2461,6 +2513,7 @@ fn writeDirectoryEntries(volume: Volume, directory_cluster: u32, raw_entries: []
             while (off < SECTOR_SIZE) : (off += 32) {
                 stats.dir_entries_scanned +%= 1;
                 cooperate(&coop_steps);
+                if (!lfn_guard.visit(volume, sector[off..][0..32], .{ .lba = lba, .offset = off })) return false;
                 if (sector[off] == 0x00 or sector[off] == 0xE5) {
                     slots[run_count] = .{ .lba = lba, .offset = off };
                     run_count += 1;
@@ -2670,13 +2723,8 @@ fn rawShortEquals(raw: []const u8, short: [11]u8) bool {
 }
 
 fn deleteAt(volume: Volume, loc: EntryLocation) bool {
-    var slot_index: usize = 0;
-    while (slot_index < loc.lfn_slot_count) : (slot_index += 1) {
-        if (!markDirectorySlotDeleted(volume, loc.lfn_slots[slot_index])) return false;
-    }
-    if (!markDirectorySlotDeleted(volume, .{ .lba = loc.lba, .offset = loc.offset })) return false;
-    if (loc.entry.first_cluster >= 2) freeChain(volume, loc.entry.first_cluster);
-    return true;
+    if (!detachEntryNoFree(volume, loc) or !flushVolume(volume)) return false;
+    return loc.entry.first_cluster == 0 or freeChain(volume, loc.entry.first_cluster);
 }
 
 fn markDirectorySlotDeleted(volume: Volume, slot: DirectorySlot) bool {
@@ -3030,15 +3078,16 @@ fn appendCacheMatches(volume: Volume, parent_cluster: u32, name: []const u8) boo
 }
 
 fn nthCluster(volume: Volume, start_cluster: u32, index: usize) ?u32 {
+    if (index >= volume.totalClusters()) return null;
     var cluster = start_cluster;
     var i: usize = 0;
     var coop_steps: u32 = 0;
-    while (i < index and cluster >= 2 and cluster < EOC and i < 4096) : (i += 1) {
+    while (i < index and cluster >= 2 and cluster < allocClusterEnd(volume)) : (i += 1) {
         cluster = readFatEntry(volume, cluster) orelse return null;
         stats.cluster_walk_steps +%= 1;
         cooperate(&coop_steps);
     }
-    if (cluster < 2 or cluster >= EOC) return null;
+    if (i != index or cluster < 2 or cluster >= allocClusterEnd(volume)) return null;
     return cluster;
 }
 
@@ -3051,7 +3100,7 @@ fn writeRangeInChain(volume: Volume, start_cluster: u32, offset: usize, data: []
     var guard: usize = 0;
     var coop_steps: u32 = 0;
 
-    while (written < data.len and cluster >= 2 and cluster < EOC and guard < 4096) : (guard += 1) {
+    while (written < data.len and cluster >= 2 and cluster < allocClusterEnd(volume) and guard < volume.totalClusters()) : (guard += 1) {
         var sector_index: u8 = @intCast(in_cluster / SECTOR_SIZE);
         var sector_offset = in_cluster % SECTOR_SIZE;
         while (sector_index < volume.sectors_per_cluster and written < data.len) {
@@ -3100,7 +3149,7 @@ fn writeRangeFromCluster(volume: Volume, start_cluster: u32, in_cluster_offset: 
     var guard: usize = 0;
     var coop_steps: u32 = 0;
 
-    while (written < data.len and cluster >= 2 and cluster < EOC and guard < 4096) : (guard += 1) {
+    while (written < data.len and cluster >= 2 and cluster < allocClusterEnd(volume) and guard < volume.totalClusters()) : (guard += 1) {
         var sector_index: u8 = @intCast(in_cluster / SECTOR_SIZE);
         var sector_offset = in_cluster % SECTOR_SIZE;
         while (sector_index < volume.sectors_per_cluster and written < data.len) {
@@ -3165,20 +3214,20 @@ fn allocateChainFrom(volume: Volume, count: usize, start_cluster: u32) ?ChainAll
     while (allocated < count) {
         const remaining = count - allocated;
         const run = findFreeClusterRun(volume, search_start, remaining) orelse {
-            if (first >= 2) freeChain(volume, first);
+            if (first >= 2) _ = freeChain(volume, first);
             return null;
         };
         if (run.first < 2 or run.count == 0) {
-            if (first >= 2) freeChain(volume, first);
+            if (first >= 2) _ = freeChain(volume, first);
             return null;
         }
         if (!writeFatChainRunAll(volume, run.first, run.count, EOC_MARK)) {
-            if (first >= 2) freeChain(volume, first);
+            if (first >= 2) _ = freeChain(volume, first);
             return null;
         }
         if (prev >= 2 and !writeFatEntryAll(volume, prev, run.first)) {
-            freeChain(volume, first);
-            freeChain(volume, run.first);
+            _ = freeChain(volume, first);
+            _ = freeChain(volume, run.first);
             return null;
         }
         if (first == 0) first = run.first;
@@ -3191,26 +3240,30 @@ fn allocateChainFrom(volume: Volume, count: usize, start_cluster: u32) ?ChainAll
     }
     stats.alloc_clusters +%= @intCast(count);
     if (!writeRuntimeFsInfo(volume)) {
-        if (first >= 2) freeChain(volume, first);
+        if (first >= 2) _ = freeChain(volume, first);
         return null;
     }
     return .{ .first = first, .last = prev };
 }
 
-fn freeChain(volume: Volume, start_cluster: u32) void {
+fn freeChain(volume: Volume, start_cluster: u32) bool {
+    // File chains can span the entire volume. A fixed 4096-cluster guard
+    // leaked every larger file tail and still reported successful deletion.
+    // Keep the physical bound and propagate every FAT/FSInfo write failure.
     var cluster = start_cluster;
     var guard: usize = 0;
     var coop_steps: u32 = 0;
-    while (cluster >= 2 and cluster < EOC and guard < 4096) : (guard += 1) {
-        const next = readFatEntry(volume, cluster) orelse EOC_MARK;
-        _ = writeFatEntryAll(volume, cluster, 0);
+    while (cluster >= 2 and cluster < allocClusterEnd(volume) and guard < volume.totalClusters()) : (guard += 1) {
+        const next = readFatEntry(volume, cluster) orelse return false;
+        if (next < EOC and (next < 2 or next >= allocClusterEnd(volume))) return false;
+        if (!writeFatEntryAll(volume, cluster, 0)) return false;
         rememberFreeCluster(volume, cluster);
         cooperate(&coop_steps);
-        if (next >= EOC) break;
+        if (next >= EOC) return writeRuntimeFsInfo(volume);
         stats.cluster_walk_steps +%= 1;
         cluster = next;
     }
-    _ = writeRuntimeFsInfo(volume);
+    return false;
 }
 
 fn findFreeCluster(volume: Volume, start_cluster: u32) ?u32 {

@@ -146,11 +146,13 @@ pub const file_update_atomic_checked_flag_forward: u32 = 1 << 0;
 pub const file_update_atomic_checked_flag_rollback: u32 = 1 << 1;
 pub const file_update_atomic_checked_flag_target_existed: u32 = 1 << 2;
 pub const file_update_atomic_checked_flag_old_known: u32 = 1 << 3;
+pub const file_update_atomic_checked_flag_long_stage = r4x_api.file_update_atomic_checked_flag_long_stage;
 const file_update_atomic_checked_supported_flags: u32 =
     file_update_atomic_checked_flag_forward |
     file_update_atomic_checked_flag_rollback |
     file_update_atomic_checked_flag_target_existed |
-    file_update_atomic_checked_flag_old_known;
+    file_update_atomic_checked_flag_old_known |
+    file_update_atomic_checked_flag_long_stage;
 /// Maps the public protocol code onto the claim's protocol tag.  An unknown
 /// code is refused rather than silently attributed to SFTP.
 fn publishProtocolFromCode(raw: u32) ?upc.Protocol {
@@ -1989,7 +1991,8 @@ pub fn fileUpdateAtomicChecked(
     const rollback = (flags & file_update_atomic_checked_flag_rollback) != 0;
     const target_existed = (flags & file_update_atomic_checked_flag_target_existed) != 0;
     const old_known = (flags & file_update_atomic_checked_flag_old_known) != 0;
-    if (forward == rollback or (old_known and !target_existed))
+    const long_stage = (flags & file_update_atomic_checked_flag_long_stage) != 0;
+    if (forward == rollback or (old_known and !target_existed) or (long_stage and !forward))
         return file_update_atomic_checked_error_invalid;
 
     var target_buf: [max_api_path]u8 = undefined;
@@ -2034,7 +2037,7 @@ pub fn fileUpdateAtomicChecked(
     const target_name = baseName(target.path);
     const staged_name = baseName(staged.path);
     const backup_name = baseName(backup.path);
-    if (!vfs.validateShortName83(staged_name) or !vfs.validateShortName83(backup_name))
+    if ((!vfs.validateShortName83(staged_name) and !long_stage) or !vfs.validateShortName83(backup_name) or (long_stage and volume != .fat32))
         return file_update_atomic_checked_error_not_atomic;
 
     var req = fs_request.beginVolume(.file_update_atomic_checked, target.drive_ref.letter, volume) orelse
@@ -2107,6 +2110,7 @@ pub fn fileUpdateAtomicChecked(
             .new_checksum = new_checksum,
             .old_size = old_size,
             .old_checksum = old_checksum,
+            .long_stage = long_stage,
         },
     );
     ok = result == .ok;

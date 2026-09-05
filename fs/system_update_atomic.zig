@@ -25,6 +25,7 @@ pub const Result = enum(u8) {
 };
 
 pub const Spec = struct {
+    long_stage: bool = false,
     target_existed: bool,
     old_known: bool,
     new_size: u64,
@@ -57,11 +58,12 @@ pub fn transition(
     spec: Spec,
 ) Result {
     if (target_name.len == 0 or stage_name.len == 0 or backup_name.len == 0 or
-        !vfs.validateShortName83(stage_name) or
+        (!vfs.validateShortName83(stage_name) and !spec.long_stage) or
         !vfs.validateShortName83(backup_name))
     {
         return .conflict;
     }
+    if (spec.long_stage and (direction != .forward or volume != .fat32)) return .not_atomic;
     if (nameEqual(target_name, stage_name) or
         nameEqual(target_name, backup_name) or
         nameEqual(stage_name, backup_name))
