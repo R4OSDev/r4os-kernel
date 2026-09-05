@@ -34,6 +34,7 @@ const FSINFO_TRAIL_SIGNATURE: u32 = 0xAA55_0000;
 const FSINFO_UNKNOWN: u32 = 0xFFFF_FFFF;
 
 pub const Volume = struct {
+    mount_ref: ?@import("../../storage/access_state.zig").MountRef = null,
     device_index: usize,
     partition_lba: u32,
     bytes_per_sector: u16,
@@ -243,6 +244,20 @@ var read_range_extents: [READ_RANGE_EXTENT_CACHE_SLOTS]ReadRangeExtent = .{ReadR
 var read_range_cache_clock: u64 = 0;
 var allocation_hints: [MAX_MOUNTED_VOLUMES]VolumeAllocationHint = .{VolumeAllocationHint{}} ** MAX_MOUNTED_VOLUMES;
 var volume_states: [MAX_MOUNTED_VOLUMES]VolumeRuntimeState = .{VolumeRuntimeState{}} ** MAX_MOUNTED_VOLUMES;
+
+// Only after all aliases of this physical volume have drained and unmounted.
+pub fn forgetStorage(device: usize, first: u64, count: u64) void {
+    for (&volume_states) |*state| if (state.valid and state.device_index == device and state.partition_lba >= first and state.partition_lba - first < count) {
+        state.valid = false;
+    };
+    for (&allocation_hints) |*hint| if (hint.valid and hint.device_index == device and hint.partition_lba >= first and hint.partition_lba - first < count) {
+        hint.valid = false;
+    };
+    for (&read_range_extents) |*extent| if (extent.valid and extent.device_index == device and extent.partition_lba >= first and extent.partition_lba - first < count) {
+        extent.valid = false;
+    };
+    if (append_cache.valid and append_cache.device_index == device and append_cache.partition_lba >= first and append_cache.partition_lba - first < count) append_cache.valid = false;
+}
 
 pub const Operation = enum(u32) {
     none = 0,

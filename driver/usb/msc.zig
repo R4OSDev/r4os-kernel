@@ -112,6 +112,7 @@ pub const Status = struct {
     command_failures: u64 = 0,
     transport_failures: u64 = 0,
     transport_faulted: bool = false,
+    media_changed: bool = false,
     last_failure_transport: bool = false,
     last_recovery_ok: bool = false,
     invalid_csw: u64 = 0,
@@ -483,6 +484,12 @@ fn flushBlock(ctx: ?*anyopaque) bool {
 }
 
 fn ensureSelected() bool {
+    if (current.media_changed or (current.block_registered and !xhci.deviceHandleCurrent(current.device))) {
+        current.media_changed = true;
+        current.failures += 1;
+        current.reason = "USBMSC medium identity changed; old registration retired from I/O";
+        return false;
+    }
     if (current.transport_faulted) {
         current.failures += 1;
         current.reason = "USBMSC transport recovery incomplete";
@@ -815,6 +822,12 @@ fn parseScsiSenseR4p(data: []const u8, failed_opcode: u8) bool {
     current.sense_key = op.sense_key;
     current.sense_asc = op.sense_asc;
     current.sense_ascq = op.sense_ascq;
+    // Media-change/medium-absent/capacity-change is not a transport retry.
+    // Keep the old registration unusable until its owner is removed; never
+    // replay a failed write against a newly inserted LUN behind the same USB
+    // bridge. Initial power-on unit attention (ASC 29) retains its boot policy.
+    if (current.block_registered and (op.sense_asc == 0x28 or op.sense_asc == 0x3a or
+        (op.sense_asc == 0x2a and op.sense_ascq == 0x09))) current.media_changed = true;
     classifySense();
     if (current.block_index) |idx| {
         block.recordSense(idx, current.sense_for_opcode, current.sense_key, current.sense_asc, current.sense_ascq);
@@ -892,7 +905,7 @@ fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u
     defer resolveTransportIncident();
     current.last_failure_transport = false;
     current.last_recovery_ok = false;
-    if (current.transport_faulted) {
+    if (current.transport_faulted or current.media_changed) {
         current.last_failure_transport = true;
         current.reason = "USBMSC transport recovery incomplete";
         return false;

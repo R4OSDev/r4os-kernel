@@ -290,6 +290,7 @@ const ControlRequest = struct {
 
 const DeviceRuntime = struct {
     active: bool = false,
+    generation: u64 = 0,
     slot_id: u8 = 0,
     port: u8 = 0,
     speed: u8 = 0,
@@ -362,6 +363,7 @@ pub const EndpointKind = enum {
 };
 
 pub const DeviceHandle = struct {
+    generation: u64 = 0,
     controller: []const u8 = "xhci",
     port: u8 = 0,
     slot_id: u8 = 0,
@@ -730,6 +732,9 @@ var first_bulk_out_ring_virt: u64 = 0;
 var first_bulk_buffer_virt: u64 = 0;
 var first_descriptor_virt: u64 = 0;
 var runtimes: [MAX_USB_DEVICES]DeviceRuntime = .{DeviceRuntime{}} ** MAX_USB_DEVICES;
+// Never reset during controller recovery: a reused slot/port must not revive
+// an old storage handle, even when USB vendor/product identifiers match.
+var runtime_generation: u64 = 0;
 var active_runtime_index: ?usize = null;
 var deferred_events = event_router.Mailbox.init();
 var pending_port_changes = event_router.PortChanges.init();
@@ -1365,6 +1370,7 @@ fn hostStatus(_: ?*anyopaque, out: *usb_host.Status) callconv(.c) i32 {
 
 pub fn deviceHandleFromCore(dev: *const usb_core.Device) DeviceHandle {
     return .{
+        .generation = if (runtimeIndexForIdentity(dev.slot_id, dev.port)) |i| runtimes[i].generation else 0,
         .controller = dev.controller,
         .port = dev.port,
         .slot_id = dev.slot_id,
@@ -1420,6 +1426,10 @@ pub fn selectDeviceHandle(handle: *DeviceHandle) bool {
     }
     if (!portIsConnected(handle.port)) return false;
     if (handle.slot_id != 0) {
+        if (handle.generation != 0) {
+            const i = runtimeIndexForIdentity(handle.slot_id, handle.port) orelse return false;
+            if (runtimes[i].generation != handle.generation) return false;
+        }
         if (!activateRuntimeByIdentity(handle.slot_id, handle.port)) return false;
         if (current.addressed_slot_id != handle.slot_id or current.addressed_port != handle.port) return false;
         refreshHandleFromCurrent(handle);
@@ -1431,6 +1441,7 @@ pub fn selectDeviceHandle(handle: *DeviceHandle) bool {
 }
 
 fn refreshHandleFromCurrent(handle: *DeviceHandle) void {
+    handle.generation = if (runtimeIndexForIdentity(current.addressed_slot_id, current.addressed_port)) |i| runtimes[i].generation else 0;
     handle.controller = "xhci";
     handle.slot_id = current.addressed_slot_id;
     handle.port = current.addressed_port;
@@ -1442,7 +1453,17 @@ fn refreshHandleFromCurrent(handle: *DeviceHandle) void {
 
 fn sameDeviceTarget(a: DeviceHandle, b: DeviceHandle) bool {
     if (a.port == 0 or b.port == 0 or a.slot_id == 0 or b.slot_id == 0) return false;
-    return a.port == b.port and a.slot_id == b.slot_id;
+    return a.port == b.port and a.slot_id == b.slot_id and
+        (a.generation == 0 or b.generation == 0 or a.generation == b.generation);
+}
+
+pub fn deviceHandleCurrent(handle: DeviceHandle) bool {
+    if (handle.generation == 0 or handle.port == 0 or handle.port > current.port_count_seen) return false;
+    refreshPortSnapshotByNumber(handle.port);
+    const port = current.first_ports[handle.port - 1];
+    if (!port.connected or (port.change_bits & PORTSC_CSC) != 0) return false;
+    const index = runtimeIndexForIdentity(handle.slot_id, handle.port) orelse return false;
+    return runtimes[index].generation == handle.generation;
 }
 
 fn enablePciMemoryAndBusMaster() void {
@@ -2412,9 +2433,12 @@ fn allocateRuntime(slot_id: u8, port: u8, speed: u8) ?usize {
     var i: usize = 0;
     while (i < runtimes.len) : (i += 1) {
         if (runtimes[i].active) continue;
+        if (runtime_generation == 0xffff_ffff_ffff_ffff) return null;
+        runtime_generation += 1;
         var rt = &runtimes[i];
         rt.* = .{
             .active = true,
+            .generation = runtime_generation,
             .slot_id = slot_id,
             .port = port,
             .speed = speed,

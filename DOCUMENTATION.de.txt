@@ -626,3 +626,46 @@ Recovery setzt C: vor dem ersten Library-Import; offline eingebundene Module
 bleiben als Dateien lesbar und reparierbar, starten aber nicht von dort.
 Dies ist eine Laufzeit-/Kompatibilitaetsvorgabe im vertrauten Single-User-OS,
 kein Benutzer- oder Sandboxmodell.
+
+0.76.8: Exklusive physische Storageoperationen
+--------------------------------------------
+storage/access_state und access_runtime binden Geraete, Mounts, Datei-/Transfer-
+Nutzungen und exklusive Regionen an Generationen und den logischen
+ProgramThread. Der kurze Storage-Owner schuetzt nur Metadaten. operations
+koordiniert die additive R4SYS-API fuer Inventar, Raw-I/O, Flush, Mount,
+Unmount, Rescan und Laufwerkszuordnung; Partitions-/Formatierungsregeln
+gehoeren weiterhin externen Werkzeugen.
+
+Dateiaufrufe pinnen das wirkliche Zielvolume vor dem FS-Queue-Warten;
+Stream-Slots halten es bis Abschluss/Abbruch. Ein belegtes Ziel wird vor
+Schreibarbeiten abgewiesen. Angenommene Claims schliessen neue Zugriffe,
+drainieren/flushen/invalideren betroffene Caches und haengen Mounts aus.
+Nach Abschluss werden Tabellen und passende vorherige Mounts neu erkannt;
+alte Referenzen bleiben ungueltig. Fehlgeschlagene Ziele bleiben sichtbar.
+Aufgaben-/Programmende baut nach dem bestehenden I/O-/Streamdrain zuerst
+Uses und dann Claims ueber den asynchronen Cleanup-Worker ab.
+
+xHCI-Inkarnationen und SCSI-Medienwechsel verhindern, dass ein bestehender
+USB-BOT-Blockslot nach Abziehen/Ersetzen auf das neue Medium schreibt.
+Build.sh storage-test enthaelt die begrenzten Zustands-/Generationsfaelle;
+Recovery -Mode StorageAccessTest nutzt die echte oeffentliche API und reale
+lokale/SSH/FTP-Nutzungen mit Backend-/Remountfehlern.
+
+NTFS-Mount und Invalidierung verwenden Cache-Owner per Referenz; grosse
+VolumeState-/Cachekopien duerfen den 64-KB-Kernelstack des Cleanup-Workers
+nicht beanspruchen. beginMount/invalidateExternal erhalten Generationen.
+
+0.76.8: Rechtzeitige Interruptfreigabe im normalen Boot
+-------------------------------------------------------
+initTaskRuntime aktiviert IF nach erfolgreicher Einrichtung aller Runtime-
+Worker. Der normale Boot-Thread erreicht damit schon Treiber-Policy und
+SMP-/R4L-Abnahme mit Timerzustellung. Der bisherige spaetere Uebergang in
+start() konnte einen zurueckgestellten Programm-Reaper mit ueberfaelligen
+Fristen blockieren; die Fehlerdiagnose zeigte IF=0 trotz aktivem HPET.
+Die Schedulerregeln fuer absichtlich gesperrte Aufrufer bleiben bestehen.
+
+Die bestehende SMP-Abnahme bindet ihre vier internen Rechenarbeiter vor der
+Ready-Publikation an die jeweiligen Online-CPUs. Wechselnde Runtime-Lasten
+waehrend der Stackanlage duerfen die fuer den Skalierungs- und TLB-Nachweis
+erforderliche Eins-zu-eins-Verteilung nicht veraendern. Der normale Scheduler
+behaelt seine lastabhaengige Platzierung fuer produktive Programme.

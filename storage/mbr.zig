@@ -434,7 +434,10 @@ fn mountPartition(
     // unlettered by design.  MBR's active flag, the GPT ESP type or GPT's
     // legacy-boot attribute supplies the scheme-specific boot indication.
     if (isBootPartition(volume, boot_candidate, system_score)) {
-        vfs.mountBootVolume(volume);
+        if (!vfs.mountBootVolume(volume)) {
+            report.note(.mount_rejected, "boot-mount-generation");
+            return;
+        }
         k.puts("      boot partition (Limine): internal mount, unlettered by design\r\n");
         report.note(.boot_volume_only, "limine-volume");
         return;
@@ -463,7 +466,11 @@ fn mountPartition(
     const role = roleFor(system_score);
     if (drive.mountBlockRole(letter, kind, role, type_name, @intCast(byte_count), device_index)) {
         if (letter == 'C') _ = drive.setCurrent('C');
-        vfs.mountForDrive(letter, volume);
+        if (!vfs.mountForDrive(letter, volume)) {
+            drive.unmountLocked(letter); // Boot scan runs before user admission.
+            report.note(.mount_rejected, "mount-generation");
+            return;
+        }
         k.puts("    mounted as ");
         k.putc(letter);
         k.puts(":\\ role=");

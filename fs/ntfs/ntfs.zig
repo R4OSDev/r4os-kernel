@@ -68,6 +68,7 @@ pub const RecoveryDeleteResult = enum(u8) {
 };
 
 pub const Volume = struct {
+    mount_ref: ?@import("../../storage/access_state.zig").MountRef = null,
     state_slot: u8,
     cluster_bytes: u32,
     total_sectors: u64,
@@ -109,6 +110,25 @@ const VolumeState = struct {
 var states: [MAX_VOLUMES]VolumeState = .{VolumeState{}} ** MAX_VOLUMES;
 var scratch: nv.Scratch = .{};
 var metadata_reclaim_volume_cursor: usize = 0;
+
+pub const StorageLocation = struct { device: usize, first: u64, count: u64 };
+pub fn storageLocation(volume: Volume) ?StorageLocation {
+    if (volume.state_slot >= states.len) return null;
+    const state = &states[volume.state_slot];
+    if (!state.in_use) return null;
+    return .{ .device = state.device_index, .first = state.partition_lba, .count = state.total_sectors };
+}
+
+// Storage orchestration calls this after the last mount alias is gone.
+pub fn forgetStorage(device: usize, first: u64, count: u64) void {
+    for (&states) |*state| {
+        if (!state.in_use or state.device_index != device or state.partition_lba < first or state.partition_lba - first >= count) continue;
+        if (state.upcase) |memory| _ = heap.free(memory);
+        state.upcase = null;
+        state.in_use = false;
+        state.metadata_cache.invalidateExternal();
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Page-cache device seam
@@ -229,7 +249,9 @@ pub fn inspectBounded(device_index: usize, first_lba: u32, partition_sectors: u6
     const physical = block.get(device_index) orelse return null;
     if (physical.sector_size != SECTOR_SIZE or first_lba >= physical.sector_count or partition_sectors > physical.sector_count - first_lba) return null;
     var slot_index: usize = MAX_VOLUMES;
-    for (states, 0..) |state, i| {
+    // Metadata caches are large; inspect their owners by reference. A mount
+    // can run on the bounded storage-cleanup kernel stack after program exit.
+    for (&states, 0..) |*state, i| {
         if (state.in_use and state.device_index == device_index and state.partition_lba == first_lba) {
             slot_index = i;
             break;

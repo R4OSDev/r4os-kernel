@@ -1003,6 +1003,55 @@ pub fn flushDevice(device_index: usize) bool {
     return true;
 }
 
+// Storage maintenance has closed filesystem admission for this range. Drain
+// already-pinned fills/writeback as well as dirty sectors, retaining every
+// unrelated sector even when a foreign partition shares the same cache page.
+pub fn flushInvalidateRange(device_index: usize, first: u64, count: u64) bool {
+    const device = block.get(device_index) orelse return false;
+    if (count == 0 or first >= device.sector_count or count > device.sector_count - first) return false;
+    const guard = acquireLock() orelse return false;
+    defer releaseLock(guard);
+    const unwind = enterOperation() orelse return false;
+    defer _ = task_context.leaveUnwind(unwind);
+    while (true) {
+        var restart = false;
+        for (&entries, 0..) |*entry, i| {
+            if (!entry.valid or entry.device_index != device_index) continue;
+            const mask = rangeMask(entry.page_lba, first, count);
+            if (mask == 0) continue;
+            if (entry.io_busy) {
+                if (!guard or !waitBusy(guard)) return false;
+                restart = true;
+                break;
+            }
+            if (entry.dirty_mask & mask != 0) {
+                if (!writebackEntryMaskUnlocked(guard, i, null, mask)) return false;
+                restart = true;
+                break;
+            }
+            entry.valid_mask &= ~mask;
+            stats.invalidations +%= 1;
+            if (entry.valid_mask == 0) clearEntry(i, false);
+        }
+        if (!restart) break;
+    }
+    releaseLock(guard);
+    const durable = block.flush(device_index);
+    relock(guard);
+    if (!durable) stats.writeback_errors +%= 1;
+    return durable;
+}
+
+fn rangeMask(page: u64, first: u64, count: u64) u8 {
+    var mask: u8 = 0;
+    for (0..PAGE_SECTORS) |i| {
+        if (page > std.math.maxInt(u64) - i) break;
+        const lba = page + i;
+        if (lba >= first and lba - first < count) mask |= @as(u8, 1) << @intCast(i);
+    }
+    return mask;
+}
+
 /// Commits only dirty sectors tagged with `batch`, then issues the same
 /// backend durability barrier as flushDevice(). Dirty sectors from earlier or
 /// concurrent operations remain cached, including when they share a 4-KB
@@ -1750,6 +1799,10 @@ fn writebackEntryBatchUnlocked(guard: bool, index: usize, batch: WriteBatch) boo
 }
 
 fn writebackEntrySelectedUnlocked(guard: bool, index: usize, batch: ?WriteBatch) bool {
+    return writebackEntryMaskUnlocked(guard, index, batch, FULL_MASK);
+}
+
+fn writebackEntryMaskUnlocked(guard: bool, index: usize, batch: ?WriteBatch, selected: u8) bool {
     if (index >= entries.len) return true;
     while (entries[index].valid and entries[index].io_busy) {
         if (!waitBusy(guard)) return false;
@@ -1758,10 +1811,10 @@ fn writebackEntrySelectedUnlocked(guard: bool, index: usize, batch: ?WriteBatch)
         // immer korrekt, die Drain-Schleifen re-scannen ohnehin.
     }
     if (!entries[index].valid) return true;
-    const dirty_snapshot = if (batch) |owner|
+    const dirty_snapshot = (if (batch) |owner|
         dirtyMaskForBatch(&entries[index], owner)
     else
-        entries[index].dirty_mask;
+        entries[index].dirty_mask) & selected;
     if (dirty_snapshot == 0) return true;
     const device = entries[index].device_index;
     const page = entries[index].page_lba;

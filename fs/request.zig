@@ -4,6 +4,9 @@ const scheduler = @import("../sched/scheduler.zig");
 const sync = @import("../sched/sync.zig");
 const timer = @import("../kernel/timer.zig");
 const request_scope = @import("request_scope.zig");
+const access = @import("../storage/access_runtime.zig");
+const task_context = @import("../sched/task_context.zig");
+const vfs = @import("vfs.zig");
 
 pub const drive_gate_count: usize = request_scope.lane_count;
 
@@ -82,6 +85,8 @@ pub const Guard = struct {
     gates_locked: bool = false,
     start_tick: u64 = 0,
     active: bool = false,
+    uses: [drive_gate_count]?access.UseToken = .{null} ** drive_gate_count,
+    unwind: task_context.UnwindToken = .{},
 };
 
 pub const GateSnapshot = struct {
@@ -170,18 +175,33 @@ pub fn gateSnapshot(drive_letter: u8) ?GateSnapshot {
 }
 
 pub fn begin(kind: Kind, drive_letter: u8) ?Guard {
-    return beginPlan(kind, drive_letter, 0, request_scope.single(drive_letter), .bounded_wait);
+    return beginPlan(kind, drive_letter, 0, request_scope.single(drive_letter), .bounded_wait, null);
+}
+
+pub fn beginVolume(kind: Kind, letter: u8, volume: vfs.Volume) ?Guard {
+    if (scheduler.currentId() != null and volume.accessReference() == null) return null;
+    return beginPlan(kind, letter, 0, request_scope.single(letter), .bounded_wait, &.{volume.accessReference()});
+}
+
+pub fn tryBeginVolume(kind: Kind, letter: u8, volume: vfs.Volume) ?Guard {
+    if (scheduler.currentId() != null and volume.accessReference() == null) return null;
+    return beginPlan(kind, letter, 0, request_scope.single(letter), .immediate, &.{volume.accessReference()});
+}
+
+pub fn beginPairVolumes(kind: Kind, first: u8, second: u8, a: vfs.Volume, b: vfs.Volume) ?Guard {
+    if (scheduler.currentId() != null and (a.accessReference() == null or b.accessReference() == null)) return null;
+    return beginPlan(kind, first, second, request_scope.pair(first, second), .bounded_wait, &.{ a.accessReference(), b.accessReference() });
 }
 
 /// Starts a request only when every lane in its scope is immediately
 /// available. Lifecycle reapers use this form so ownership-free cleanup can
 /// be deferred without parking the reaper behind an unrelated volume owner.
 pub fn tryBegin(kind: Kind, drive_letter: u8) ?Guard {
-    return beginPlan(kind, drive_letter, 0, request_scope.single(drive_letter), .immediate);
+    return beginPlan(kind, drive_letter, 0, request_scope.single(drive_letter), .immediate, null);
 }
 
 pub fn beginPair(kind: Kind, first_drive: u8, second_drive: u8) ?Guard {
-    return beginPlan(kind, first_drive, second_drive, request_scope.pair(first_drive, second_drive), .bounded_wait);
+    return beginPlan(kind, first_drive, second_drive, request_scope.pair(first_drive, second_drive), .bounded_wait, null);
 }
 
 const GateAcquireMode = enum {
@@ -195,10 +215,32 @@ fn beginPlan(
     second_drive: u8,
     plan: request_scope.Plan,
     acquire_mode: GateAcquireMode,
+    bound_refs: ?[]const ?access.MountRef,
 ) ?Guard {
+    // Cover admission and queued waits as well as the backend call itself.
+    // A forced task termination may not skip release of either kind of owner.
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return null;
+    var uses: [drive_gate_count]?access.UseToken = .{null} ** drive_gate_count;
+    var transferred = false;
+    defer if (!transferred) {
+        for (uses) |token| if (token) |use| access.endUse(use) catch {};
+        _ = task_context.leaveUnwind(unwind);
+    };
     var acquired_count: u8 = 0;
     const runtime_owned = scheduler.currentId() != null;
     if (runtime_owned) {
+        if (bound_refs) |refs| {
+            if (refs.len > uses.len) return null;
+            for (refs, 0..) |ref, i| if (ref) |mount| {
+                uses[i] = access.beginUse(mount, .request) catch return null;
+            };
+        } else {
+            for (plan.lanes[0..plan.count], 0..) |lane, i| {
+                const volume = vfs.volumeForDrive('A' + lane) orelse continue;
+                uses[i] = access.beginUse(volume.accessReference() orelse return null, .request) catch return null;
+            }
+        }
         while (acquired_count < plan.count) : (acquired_count += 1) {
             const lane = plan.lanes[acquired_count];
             const acquired = switch (acquire_mode) {
@@ -247,6 +289,7 @@ fn beginPlan(
         state.progress_sequence +%= 1;
     }
 
+    transferred = true;
     return .{
         .kind = kind,
         .drive = drive_letter,
@@ -256,6 +299,8 @@ fn beginPlan(
         .gates_locked = runtime_owned,
         .start_tick = timer.tickCount(),
         .active = true,
+        .uses = uses,
+        .unwind = unwind,
     };
 }
 
@@ -289,6 +334,11 @@ pub fn finish(guard: *Guard, ok: bool) void {
         if (guard.gates_locked) _ = request_gates[lane].leave();
     }
     guard.active = false;
+    for (&guard.uses) |*token| if (token.*) |use| {
+        access.endUse(use) catch {};
+        token.* = null;
+    };
+    _ = task_context.leaveUnwind(guard.unwind);
 }
 
 pub fn kindCode(kind: Kind) u32 {

@@ -384,10 +384,18 @@ pub fn runAcceptanceProbeIfEnabled(usable_bytes: u64) bool {
 
     var workers: [percpu.max_cpus]?*task.Task = .{null} ** percpu.max_cpus;
     var worker_count: u32 = 0;
-    while (worker_count < online_count) : (worker_count += 1) {
-        workers[worker_count] = task.createParallelWorkerBlocked("smp-kwork", acceptanceWorkerMain) orelse {
+    cpu_index = 0;
+    while (cpu_index < percpu.max_cpus) : (cpu_index += 1) {
+        if ((online_mask & (@as(u64, 1) << @intCast(cpu_index))) == 0) continue;
+        const worker = task.createParallelWorkerBlocked("smp-kwork", acceptanceWorkerMain) orelse {
             return acceptanceFail("worker-create");
         };
+        // This probe compares one fixed work item per online CPU. Runtime
+        // IRQs can change Ready loads while stacks are allocated, so the
+        // ordinary load balancer cannot guarantee that test placement.
+        if (!task.bindBlockedHomeCpu(worker, cpu_index)) return acceptanceFail("worker-bind");
+        workers[worker_count] = worker;
+        worker_count += 1;
     }
 
     const ready_tick = timer.tickCount();

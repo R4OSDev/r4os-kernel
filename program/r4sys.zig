@@ -4,6 +4,7 @@ const drive = @import("../fs/drive.zig");
 const vfs = @import("../fs/vfs.zig");
 const page_cache = @import("../fs/page_cache.zig");
 const fs_request = @import("../fs/request.zig");
+const storage_access = @import("../storage/access_runtime.zig");
 const system_update_atomic = @import("../fs/system_update_atomic.zig");
 const upload_claim_store = @import("../fs/upload_claim_store.zig");
 const upc = @import("upload_publish_claim");
@@ -209,6 +210,7 @@ var file_delete_if_match_buffer: [32768]u8 = undefined;
 const max_stream_ancestors: usize = @as(usize, r4x_api.file_path_max_chars);
 
 const StreamSlot = struct {
+    volume_use: ?storage_access.UseToken = null,
     active: bool = false,
     // Published before the mutating Begin so an ambiguous create can still
     // be aborted. Write/Finish accept only a fully ready slot.
@@ -894,7 +896,7 @@ pub fn driveInfo(index: u32, out: *DriveInfo) callconv(.c) i32 {
     copyFixedZ(out.name[0..], d.name);
     {
         if (vfs.volumeForDrive(d.letter)) |volume| {
-            var req = fs_request.begin(.drive_info, d.letter) orelse return -2;
+            var req = fs_request.beginVolume(.drive_info, d.letter, volume) orelse return -2;
             var ok = false;
             defer fs_request.finish(&req, ok);
             const cluster_bytes = volume.clusterBytes();
@@ -1043,6 +1045,12 @@ fn resolveModuleFile(path_ptr: [*:0]const u8, status: *i32) ?ResolvedModuleFile 
         status.* = module_resource_error_volume;
         return null;
     };
+    var req = fs_request.beginVolume(.file_info, target.drive_ref.letter, volume) orelse {
+        status.* = module_resource_error_io;
+        return null;
+    };
+    var ok = false;
+    defer fs_request.finish(&req, ok);
     var entry: vfs.Entry = undefined;
     switch (vfs.resolveEntryStatus(volume, target.path, &entry)) {
         .found => {},
@@ -1059,6 +1067,7 @@ fn resolveModuleFile(path_ptr: [*:0]const u8, status: *i32) ?ResolvedModuleFile 
         status.* = module_resource_error_not_found;
         return null;
     }
+    ok = true;
     return .{ .volume = volume, .entry = entry, .letter = target.drive_ref.letter };
 }
 
@@ -1078,7 +1087,7 @@ pub fn moduleResourceStat(path_ptr: [*:0]const u8, resource_type: u32, resource_
     var name_buf: [rsrc_max_name + 1]u8 = undefined;
     const resource_name = moduleResourceNameSlice(name_ptr, name_buf[0..]);
     if (resource_name != null and resource_name.?.len == 0) return module_resource_error_invalid;
-    var req = fs_request.begin(.file_read, file.letter) orelse return module_resource_error_io;
+    var req = fs_request.beginVolume(.file_read, file.letter, file.volume) orelse return module_resource_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var located: LocatedResource = undefined;
@@ -1099,7 +1108,7 @@ pub fn moduleResourceRead(path_ptr: [*:0]const u8, resource_type: u32, resource_
     var name_buf: [rsrc_max_name + 1]u8 = undefined;
     const resource_name = moduleResourceNameSlice(name_ptr, name_buf[0..]);
     if (resource_name != null and resource_name.?.len == 0) return module_resource_error_invalid;
-    var req = fs_request.begin(.file_read, file.letter) orelse return module_resource_error_io;
+    var req = fs_request.beginVolume(.file_read, file.letter, file.volume) orelse return module_resource_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var located: LocatedResource = undefined;
@@ -1119,7 +1128,7 @@ pub fn fileRead(path_ptr: [*:0]const u8, out_ptr: [*]u8, max_len: u32) callconv(
     var resolved_buf: [max_api_path]u8 = undefined;
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
     const volume = targetVolume(target) orelse return -2;
-    var req = fs_request.begin(.file_read, target.drive_ref.letter) orelse return -7;
+    var req = fs_request.beginVolume(.file_read, target.drive_ref.letter, volume) orelse return -7;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var entry: vfs.Entry = undefined;
@@ -1142,7 +1151,7 @@ pub fn fileWrite(path_ptr: [*:0]const u8, data_ptr: [*]const u8, len: u32) callc
     var resolved_buf: [max_api_path]u8 = undefined;
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
     const volume = targetVolume(target) orelse return -2;
-    var req = fs_request.begin(.file_write, target.drive_ref.letter) orelse return -5;
+    var req = fs_request.beginVolume(.file_write, target.drive_ref.letter, volume) orelse return -5;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -1179,7 +1188,7 @@ pub fn rewriteFileUnderGate(
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
     const volume = targetVolume(target) orelse return -2;
     if (isRootPath(target.path)) return -3;
-    var req = fs_request.begin(.config_write, target.drive_ref.letter) orelse return -5;
+    var req = fs_request.beginVolume(.config_write, target.drive_ref.letter, volume) orelse return -5;
     var ok = false;
     defer fs_request.finish(&req, ok);
 
@@ -1225,7 +1234,7 @@ pub fn fileReadAt64(path_ptr: [*:0]const u8, offset: u64, out_ptr: [*]u8, max_le
     var resolved_buf: [max_api_path]u8 = undefined;
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
     const volume = targetVolume(target) orelse return -2;
-    var req = fs_request.begin(.file_read_at, target.drive_ref.letter) orelse return -7;
+    var req = fs_request.beginVolume(.file_read_at, target.drive_ref.letter, volume) orelse return -7;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var entry: vfs.Entry = undefined;
@@ -1257,7 +1266,7 @@ pub fn fileWriteAt(path_ptr: [*:0]const u8, offset: u64, data_ptr: [*]const u8, 
     var resolved_buf: [max_api_path]u8 = undefined;
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
     const volume = targetVolume(target) orelse return -2;
-    var req = fs_request.begin(.file_write_at, target.drive_ref.letter) orelse return -7;
+    var req = fs_request.beginVolume(.file_write_at, target.drive_ref.letter, volume) orelse return -7;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -1283,7 +1292,7 @@ pub fn fileAppend(path_ptr: [*:0]const u8, data_ptr: [*]const u8, len: u32) call
     var resolved_buf: [max_api_path]u8 = undefined;
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
     const volume = targetVolume(target) orelse return -2;
-    var req = fs_request.begin(.file_append, target.drive_ref.letter) orelse return -5;
+    var req = fs_request.beginVolume(.file_append, target.drive_ref.letter, volume) orelse return -5;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -1310,7 +1319,7 @@ pub fn fileStreamBegin(path_ptr: [*:0]const u8, flags: u32) callconv(.c) i32 {
     const target = resolveTarget(raw_path, &resolved_buf) orelse return file_stream_error_invalid;
     const volume = targetVolume(target) orelse return file_stream_error_io;
     if (isRootPath(target.path)) return file_stream_error_io;
-    var req = fs_request.begin(.stream_begin, target.drive_ref.letter) orelse return file_stream_error_io;
+    var req = fs_request.beginVolume(.stream_begin, target.drive_ref.letter, volume) orelse return file_stream_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
 
@@ -1359,6 +1368,15 @@ pub fn fileStreamBegin(path_ptr: [*:0]const u8, flags: u32) callconv(.c) i32 {
         flags,
         owner,
     );
+    if (volume.accessReference()) |ref| {
+        reserved_slot.volume_use = storage_access.beginUse(ref, .lease) catch {
+            clearStreamSlot(reserved_slot);
+            return file_stream_error_io;
+        };
+    } else if (scheduler.currentId() != null) {
+        clearStreamSlot(reserved_slot);
+        return file_stream_error_io;
+    }
     // Resolve and bind the complete physical ancestor chain before the first
     // namespace mutation. Overflow, a missing component or an I/O ambiguity
     // therefore leaves neither a half-described slot nor a newly-created file.
@@ -1415,6 +1433,29 @@ pub fn fileStreamBegin(path_ptr: [*:0]const u8, flags: u32) callconv(.c) i32 {
     return file_stream_result_ok;
 }
 
+pub fn storageUseBegin(path: [*:0]const u8, out: *u64) callconv(.c) i32 {
+    out.* = 0;
+    const unwind = @import("../sched/task_context.zig").enterUnwind();
+    if (!unwind.admitted()) return r4x_api_storage.storage_error_capacity;
+    defer _ = @import("../sched/task_context.zig").leaveUnwind(unwind);
+    var path_buf: [max_api_path]u8 = undefined;
+    const raw = copyZ(path, &path_buf) orelse return r4x_api_storage.storage_error_invalid;
+    var resolved: [max_api_path]u8 = undefined;
+    const target = resolveTarget(raw, &resolved) orelse return r4x_api_storage.storage_error_invalid;
+    const volume = targetVolume(target) orelse return r4x_api_storage.storage_error_not_found;
+    const ref = volume.accessReference() orelse return r4x_api_storage.storage_error_stale;
+    const use = storage_access.beginUse(ref, .lease) catch |err| return switch (err) {
+        error.Busy => r4x_api_storage.storage_error_busy,
+        error.Stale => r4x_api_storage.storage_error_stale,
+        error.Capacity => r4x_api_storage.storage_error_capacity,
+        else => r4x_api_storage.storage_error_invalid,
+    };
+    out.* = use.id;
+    return r4x_api_storage.storage_result_ok;
+}
+
+const r4x_api_storage = @import("r4os_kernel_contract");
+
 pub fn fileStreamWrite(path_ptr: [*:0]const u8, offset: u64, data_ptr: [*]const u8, len: u32, flags: u32) callconv(.c) i32 {
     if (flags != 0) return file_stream_error_unsupported;
     const len64: u64 = @intCast(len);
@@ -1425,7 +1466,7 @@ pub fn fileStreamWrite(path_ptr: [*:0]const u8, offset: u64, data_ptr: [*]const 
     var resolved_buf: [max_api_path]u8 = undefined;
     const target = resolveTarget(raw_path, &resolved_buf) orelse return file_stream_error_invalid;
     const volume = targetVolume(target) orelse return file_stream_error_io;
-    var req = fs_request.begin(.stream_write, target.drive_ref.letter) orelse return file_stream_error_io;
+    var req = fs_request.beginVolume(.stream_write, target.drive_ref.letter, volume) orelse return file_stream_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -1500,7 +1541,7 @@ pub fn fileStreamFinish(path_ptr: [*:0]const u8, expected_size: u64, flags: u32)
     var resolved_buf: [max_api_path]u8 = undefined;
     const target = resolveTarget(raw_path, &resolved_buf) orelse return file_stream_error_invalid;
     const volume = targetVolume(target) orelse return file_stream_error_io;
-    var req = fs_request.begin(.stream_finish, target.drive_ref.letter) orelse return file_stream_error_io;
+    var req = fs_request.beginVolume(.stream_finish, target.drive_ref.letter, volume) orelse return file_stream_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -1541,7 +1582,7 @@ pub fn fileStreamAbort(path_ptr: [*:0]const u8) callconv(.c) i32 {
     const target = resolveTarget(raw_path, &resolved_buf) orelse return file_stream_error_invalid;
     const volume = targetVolume(target) orelse return file_stream_error_io;
     if (isRootPath(target.path)) return file_stream_error_io;
-    var req = fs_request.begin(.stream_abort, target.drive_ref.letter) orelse return file_stream_error_io;
+    var req = fs_request.beginVolume(.stream_abort, target.drive_ref.letter, volume) orelse return file_stream_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -1628,7 +1669,7 @@ pub fn dirList(path_ptr: [*:0]const u8, out_ptr: [*]u8, max_len: u32) callconv(.
     var resolved_buf: [max_api_path]u8 = undefined;
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -2;
     const volume = targetVolume(target) orelse return -3;
-    var req = fs_request.begin(.dir_list, target.drive_ref.letter) orelse return -6;
+    var req = fs_request.beginVolume(.dir_list, target.drive_ref.letter, volume) orelse return -6;
     var ok = false;
     defer fs_request.finish(&req, ok);
     const cluster = vfs.resolvePath(volume, target.path) orelse return -4;
@@ -1656,7 +1697,7 @@ pub fn dirEntry(path_ptr: [*:0]const u8, index: u32, out_ptr: [*]u8, max_len: u3
         return 1;
     }
     const volume = targetVolume(target) orelse return -3;
-    var req = fs_request.begin(.dir_entry, target.drive_ref.letter) orelse return -8;
+    var req = fs_request.beginVolume(.dir_entry, target.drive_ref.letter, volume) orelse return -8;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var cluster: vfs.NodeRef = undefined;
@@ -1692,7 +1733,7 @@ pub fn fileInfo(path_ptr: [*:0]const u8, out: *FileInfo) callconv(.c) i32 {
     out.drive = target.drive_ref.letter;
     copyFixedZ(out.name[0..], baseName(target.path));
     const volume = targetVolume(target) orelse return -2;
-    var req = fs_request.begin(.file_info, target.drive_ref.letter) orelse return -3;
+    var req = fs_request.beginVolume(.file_info, target.drive_ref.letter, volume) orelse return -3;
     var ok = false;
     defer fs_request.finish(&req, ok);
     if (isRootPath(target.path)) {
@@ -1738,7 +1779,7 @@ pub fn fileDelete(path_ptr: [*:0]const u8) callconv(.c) i32 {
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
     const volume = targetVolume(target) orelse return -2;
     if (isRootPath(target.path)) return -3;
-    var req = fs_request.begin(.file_delete, target.drive_ref.letter) orelse return -5;
+    var req = fs_request.beginVolume(.file_delete, target.drive_ref.letter, volume) orelse return -5;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -1809,7 +1850,7 @@ pub fn fileDeleteIfMatch(
         return file_delete_if_match_error_unsupported;
     if (isRootPath(target.path)) return file_delete_if_match_error_invalid;
 
-    var req = fs_request.begin(.file_delete_if_match, target.drive_ref.letter) orelse
+    var req = fs_request.beginVolume(.file_delete_if_match, target.drive_ref.letter, volume) orelse
         return file_delete_if_match_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
@@ -1953,7 +1994,7 @@ pub fn fileUpdateAtomicChecked(
     if (!vfs.validateShortName83(staged_name) or !vfs.validateShortName83(backup_name))
         return file_update_atomic_checked_error_not_atomic;
 
-    var req = fs_request.begin(.file_update_atomic_checked, target.drive_ref.letter) orelse
+    var req = fs_request.beginVolume(.file_update_atomic_checked, target.drive_ref.letter, volume) orelse
         return file_update_atomic_checked_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
@@ -2093,7 +2134,7 @@ pub fn fileStreamDeclarePublish(
     if (!vfs.validateShortName83(staged_name) or !vfs.validateShortName83(backup_name))
         return file_stream_declare_publish_error_not_atomic;
 
-    var req = fs_request.begin(.stream_begin, staged.drive_ref.letter) orelse
+    var req = fs_request.beginVolume(.stream_begin, staged.drive_ref.letter, volume) orelse
         return file_stream_declare_publish_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
@@ -2304,7 +2345,7 @@ pub fn fileUpdateCleanupChecked(
     if (!vfs.validateShortName83(staged_name) or !vfs.validateShortName83(backup_name))
         return file_update_cleanup_checked_error_not_atomic;
 
-    var req = fs_request.begin(.file_update_atomic_checked, target.drive_ref.letter) orelse
+    var req = fs_request.beginVolume(.file_update_atomic_checked, target.drive_ref.letter, volume) orelse
         return file_update_cleanup_checked_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
@@ -2382,7 +2423,7 @@ pub fn dirCreate(path_ptr: [*:0]const u8) callconv(.c) i32 {
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
     const volume = targetVolume(target) orelse return -2;
     if (isRootPath(target.path)) return -3;
-    var req = fs_request.begin(.dir_create, target.drive_ref.letter) orelse return -5;
+    var req = fs_request.beginVolume(.dir_create, target.drive_ref.letter, volume) orelse return -5;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -2427,7 +2468,7 @@ pub fn dirDelete(path_ptr: [*:0]const u8) callconv(.c) i32 {
     const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
     const volume = targetVolume(target) orelse return -2;
     if (isRootPath(target.path)) return -3;
-    var req = fs_request.begin(.dir_delete, target.drive_ref.letter) orelse return -5;
+    var req = fs_request.beginVolume(.dir_delete, target.drive_ref.letter, volume) orelse return -5;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -2483,7 +2524,7 @@ pub fn fileRename(old_ptr: [*:0]const u8, new_ptr: [*:0]const u8) callconv(.c) i
     const old_parent_path = parentPath(old_target.path);
     const new_parent_path = parentPath(new_target.path);
     if (!stdMemEql(old_parent_path, new_parent_path)) return -5;
-    var req = fs_request.begin(.file_rename, old_target.drive_ref.letter) orelse return -7;
+    var req = fs_request.beginVolume(.file_rename, old_target.drive_ref.letter, volume) orelse return -7;
     var ok = false;
     defer fs_request.finish(&req, ok);
     var parent: vfs.NodeRef = undefined;
@@ -2625,7 +2666,7 @@ pub fn fileReplaceAtomic(target_ptr: [*:0]const u8, staged_ptr: [*:0]const u8, b
     const backup_name = baseName(backup.path);
     if (!vfs.validateShortName83(staged_name) or !vfs.validateShortName83(backup_name)) return file_replace_atomic_error_not_atomic;
 
-    var req = fs_request.begin(.file_replace_atomic, target.drive_ref.letter) orelse return file_replace_atomic_error_io;
+    var req = fs_request.beginVolume(.file_replace_atomic, target.drive_ref.letter, volume) orelse return file_replace_atomic_error_io;
     var ok = false;
     defer fs_request.finish(&req, ok);
     // An atomic publish only invalidates streams whose exact names it owns.
@@ -2809,10 +2850,12 @@ pub fn fileCopy(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
     if (isRootPath(src_target.path) or isRootPath(dst_target.path)) return -3;
     if (src_target.drive_ref.letter == dst_target.drive_ref.letter and stdMemEql(src_target.path, dst_target.path)) return -8;
 
-    var req = fs_request.beginPair(
+    var req = fs_request.beginPairVolumes(
         .file_copy,
         src_target.drive_ref.letter,
         dst_target.drive_ref.letter,
+        src_volume,
+        dst_volume,
     ) orelse return -10;
     var ok = false;
     defer fs_request.finish(&req, ok);
@@ -2854,10 +2897,12 @@ pub fn fileMove(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
     if (isRootPath(src_target.path) or isRootPath(dst_target.path)) return -3;
     if (src_target.drive_ref.letter == dst_target.drive_ref.letter and stdMemEql(src_target.path, dst_target.path)) return -8;
 
-    var req = fs_request.beginPair(
+    var req = fs_request.beginPairVolumes(
         .file_move,
         src_target.drive_ref.letter,
         dst_target.drive_ref.letter,
+        src_volume,
+        dst_volume,
     ) orelse return -12;
     var ok = false;
     defer fs_request.finish(&req, ok);
@@ -3465,6 +3510,8 @@ fn streamSlotName(slot: *const StreamSlot) []const u8 {
 }
 
 fn clearStreamSlot(slot: *StreamSlot) void {
+    if (slot.volume_use) |use| storage_access.endUse(use) catch {};
+    slot.volume_use = null;
     slot.active = false;
     slot.ready = false;
     slot.finished = false;

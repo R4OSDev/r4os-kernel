@@ -85,6 +85,13 @@ pub fn initTaskRuntime() bool {
     log.puts("[OK]\r\n");
 
     task_runtime_initialized = true;
+    // The platform timer handoff leaves the boot stack with IF=0. New tasks
+    // enable interrupts in their trampoline, but kernel-main needs the same
+    // transition as soon as the scheduler and runtime workers are ready.
+    // Driver-policy I/O, preemption acceptance and protocol loading below
+    // may already await timed work; deferring this to start() strands those
+    // waits whenever only kernel-main remains runnable on the BSP.
+    interrupts.enable();
     return true;
 }
 
@@ -100,14 +107,6 @@ pub fn start() noreturn {
     if (!initTaskRuntime()) {
         fatal.kernelFatal(.runtime, "Task runtime init failed");
     }
-
-    // The platform timer handoff deliberately returns to the single-threaded
-    // boot path with IF=0. Newly created tasks enable interrupts in their
-    // trampoline, but kernel-main keeps executing on its original stack and
-    // therefore needs an explicit runtime boundary. Without this transition,
-    // a USB block worker can correctly park for one timer tick while the
-    // launcher spins with IF=0, preventing the very wakeup it is waiting for.
-    interrupts.enable();
 
     if (config.enable_page_fault_test) triggerPageFaultTest();
 

@@ -88,6 +88,14 @@ pub fn setCurrent(letter: u8) bool {
     return true;
 }
 
+// Called only as part of the VFS storage-owner publication after I/O drains.
+pub fn unmountLocked(letter: u8) void {
+    if (letter < 'A' or letter > 'Z') return;
+    const index = letterToIndex(letter);
+    drives[index] = .{};
+    if (current_index == index) current_index = letterToIndex('C');
+}
+
 pub fn current() ?*Drive {
     if (!initialized or !drives[current_index].mounted) return null;
     return &drives[current_index];

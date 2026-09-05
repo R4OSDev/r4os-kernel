@@ -1,6 +1,7 @@
 const diag_screen = @import("../kernel/diag_screen.zig");
 const block_dispatch = @import("block_dispatch.zig");
 const block_split = @import("block_split.zig");
+const access = @import("access_runtime.zig");
 const drive = @import("../fs/drive.zig");
 const heap = @import("../memory/heap.zig");
 const owner_locks = @import("../memory/owner_locks.zig");
@@ -266,6 +267,8 @@ pub const RuntimeSummary = struct {
 };
 
 pub const Device = struct {
+    // Assigned by the registry; never supplied by a driver or reused after retirement.
+    access_ref: access.DeviceRef = .{ .slot = 0, .generation = 0 },
     name: []const u8,
     // Hardware-provided text when available; distinct from the registry name.
     model: []const u8 = "",
@@ -359,6 +362,7 @@ var runtime_summary: RuntimeSummary = .{};
 var next_backend_handle_sequence: u64 = 0;
 
 pub fn init() void {
+    access.initForBoot();
     devices = .{DeviceSlot{}} ** MAX_DEVICES;
     device_count = 0;
     device_slot_count = 0;
@@ -500,6 +504,7 @@ fn registerLocked(device: Device) ?usize {
     // adapted through one execution lane even if an old descriptor advertised
     // a larger software queue.
     if (normalized.async_submit_fn == null) normalized.queue_depth = 1;
+    normalized.access_ref = access.registerDeviceLocked(@intCast(target_index), device.sector_count) catch return null;
     normalized.state = .registered;
     normalized.resetting = false;
     normalized.slot_index = @intCast(target_index);
@@ -603,6 +608,7 @@ fn beginRetirement(index: usize) ?*DeviceSlot {
     const slot = &devices[index];
     if (!slot.used or slot.retiring) return null;
     if (slot.retire_generation == 0xFFFF_FFFF_FFFF_FFFF) return null;
+    access.beginRetirementLocked(slot.device.access_ref) catch return null;
 
     // Admission is stopped before the pin snapshot. A live operation makes
     // unregister a non-destructive retryable failure; it can then unwind its
@@ -611,6 +617,7 @@ fn beginRetirement(index: usize) ?*DeviceSlot {
     slot.retire_generation += 1;
     if (slot.pin_count != 0) {
         slot.retiring = false;
+        access.cancelRetirementLocked(slot.device.access_ref);
         return null;
     }
     return slot;
@@ -619,13 +626,17 @@ fn beginRetirement(index: usize) ?*DeviceSlot {
 fn cancelRetirement(slot: *DeviceSlot) void {
     const irq_flags = owner_locks.storage.acquire();
     defer owner_locks.storage.release(irq_flags);
-    if (slot.used) slot.retiring = false;
+    if (slot.used) {
+        slot.retiring = false;
+        access.cancelRetirementLocked(slot.device.access_ref);
+    }
 }
 
 fn commitRetirement(slot: *DeviceSlot) bool {
     const irq_flags = owner_locks.storage.acquire();
     defer owner_locks.storage.release(irq_flags);
     if (!slot.used or !slot.retiring or slot.pin_count != 0) return false;
+    access.retireDeviceLocked(slot.device.access_ref) catch return false;
     const retired_lane = slot.device.controller_lane;
     slot.used = false;
     slot.retiring = false;
@@ -720,6 +731,38 @@ pub fn slotCount() usize {
 
 pub fn maxDevices() usize {
     return MAX_DEVICES;
+}
+
+pub const Identity = struct {
+    reference: access.DeviceRef,
+    sectors: u64,
+    sector_bytes: u32,
+    writable: bool,
+    bus: Bus,
+    name: [32]u8 = .{0} ** 32,
+    model: [64]u8 = .{0} ** 64,
+    driver: [32]u8 = .{0} ** 32,
+};
+
+// Copy under the registry owner; no pointer into a driver-owned string or a
+// reusable DeviceSlot crosses the public inventory boundary.
+pub fn identity(index: usize) ?Identity {
+    const guard = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(guard);
+    if (index >= device_slot_count) return null;
+    const slot = &devices[index];
+    if (!slot.used or slot.retiring or busExcluded(slot.device.bus)) return null;
+    const d = &slot.device;
+    var result: Identity = .{ .reference = d.access_ref, .sectors = d.sector_count, .sector_bytes = d.sector_size, .writable = d.writable, .bus = d.bus };
+    copyIdentityText(&result.name, d.name);
+    copyIdentityText(&result.model, d.model);
+    copyIdentityText(&result.driver, d.driver);
+    return result;
+}
+
+fn copyIdentityText(out: []u8, value: []const u8) void {
+    const len = @min(out.len - 1, value.len);
+    @memcpy(out[0..len], value[0..len]);
 }
 
 pub fn get(index: usize) ?*const Device {

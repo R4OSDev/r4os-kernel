@@ -74,7 +74,7 @@ pub fn stats() Stats {
 
 pub fn readRange(req: RangeReadRequest) ?usize {
     if (req.out.len == 0) return 0;
-    var fs_req = fs_request.begin(.loader_read, req.source.drive_letter) orelse {
+    var fs_req = fs_request.beginVolume(.loader_read, req.source.drive_letter, req.source.volume) orelse {
         stats_state.read_failures += 1;
         logFailure(req.verbose, req.name, "request");
         return null;

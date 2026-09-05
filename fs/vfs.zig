@@ -14,6 +14,9 @@
 
 const fat32 = @import("fat/fat32.zig");
 const ntfs_fs = @import("ntfs/ntfs.zig");
+const access = @import("../storage/access_runtime.zig");
+const locks = @import("../memory/owner_locks.zig");
+const drive = @import("drive.zig");
 
 /// Windows-parity component limit (0.60.19): 255 characters, UTF-8 (BMP)
 /// worst case 765 bytes, buffered as 768.
@@ -124,6 +127,27 @@ pub const Volume = union(enum) {
     fat32: fat32.Volume,
     ntfs: ntfs_fs.Volume,
 
+    pub fn accessReference(self: Volume) ?access.MountRef {
+        return switch (self) {
+            inline else => |v| v.mount_ref,
+        };
+    }
+
+    pub fn storageRegion(self: Volume) ?access.Region {
+        if (self.accessReference()) |ref| return (access.mountSnapshot(ref) catch return null).region;
+        const location: ntfs_fs.StorageLocation = switch (self) {
+            .fat32 => |v| .{ .device = v.device_index, .first = @as(u64, v.partition_lba), .count = @as(u64, v.total_sectors) },
+            .ntfs => |v| ntfs_fs.storageLocation(v) orelse return null,
+        };
+        return .{ .device = access.deviceReference(@intCast(location.device)) orelse return null, .first = location.first, .count = location.count };
+    }
+
+    fn bind(self: *Volume, ref: access.MountRef) void {
+        switch (self.*) {
+            inline else => |*v| v.mount_ref = ref,
+        }
+    }
+
     pub fn clusterBytes(self: Volume) u32 {
         return switch (self) {
             .fat32 => |v| v.clusterBytes(),
@@ -168,22 +192,53 @@ pub fn init() void {
     boot_volume_slot = null;
 }
 
-pub fn mountBootVolume(volume: Volume) void {
-    if (boot_volume_slot == null) boot_volume_slot = volume;
+pub fn mountBootVolume(volume: Volume) bool {
+    const region = volume.storageRegion() orelse return false;
+    const guard = locks.storage.acquire();
+    defer locks.storage.release(guard);
+    if (boot_volume_slot != null) return false;
+    var bound = volume;
+    bound.bind(access.bindMountLocked(26, region, true) catch return false);
+    boot_volume_slot = bound;
+    return true;
 }
 
 pub fn bootVolume() ?Volume {
+    const guard = locks.storage.acquire();
+    defer locks.storage.release(guard);
     return boot_volume_slot;
 }
 
-pub fn mountForDrive(letter: u8, volume: Volume) void {
-    const index = driveIndex(letter) orelse return;
-    mounted_volumes[index] = volume;
+pub fn mountForDrive(letter: u8, volume: Volume) bool {
+    const index = driveIndex(letter) orelse return false;
+    const region = volume.storageRegion() orelse return false;
+    const guard = locks.storage.acquire();
+    defer locks.storage.release(guard);
+    if (mounted_volumes[index] != null) return false;
+    var bound = volume;
+    bound.bind(access.bindMountLocked(@intCast(index), region, index == 'C' - 'A') catch return false);
+    mounted_volumes[index] = bound;
+    return true;
 }
 
 pub fn volumeForDrive(letter: u8) ?Volume {
     const index = driveIndex(letter) orelse return null;
+    const guard = locks.storage.acquire();
+    defer locks.storage.release(guard);
     return mounted_volumes[index];
+}
+
+// The storage transaction has already stopped admissions and drained I/O.
+// Generation invalidation and removal are one short metadata publication.
+pub fn unmount(ref: access.MountRef) bool {
+    const guard = locks.storage.acquire();
+    defer locks.storage.release(guard);
+    access.unbindMountLocked(ref) catch return false;
+    if (ref.slot == 26) boot_volume_slot = null else {
+        mounted_volumes[ref.slot] = null;
+        drive.unmountLocked(@intCast('A' + ref.slot));
+    }
+    return true;
 }
 
 pub fn resolvePathStatus(volume: Volume, path: []const u8, out: *NodeRef) LookupStatus {

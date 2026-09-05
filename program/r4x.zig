@@ -7075,6 +7075,7 @@ pub fn initializeRuntime(usable_bytes: u64) void {
 fn configureApiGroups() void {
     r4api.r4sys.setPathResolver(resolveApiTarget);
     r4api.r4sys.setStreamOwnerResolver(resolveR4SysStreamOwner);
+    @import("../storage/access_runtime.zig").setOwnerResolver(resolveStorageOwner);
     r4api.r4sys.setProgramModuleRunningProvider(programModuleRunningByPath);
     r4api.r4draw.setDisplayUsedHook(noteDisplayUsed);
     r4api.r4draw.setFontCatalogChangedHook(broadcastGuiFontCatalogChanged);
@@ -7211,6 +7212,21 @@ fn configureR4XStartR4SysTable() void {
         .io_file_write_at = &apiIoFileWriteAt,
         .io_file_info = &apiIoFileInfo,
         .io_file_lock = &apiIoFileLock,
+        .storage_inventory = &@import("../storage/operations.zig").inventory,
+        .storage_device = &@import("../storage/operations.zig").deviceInfo,
+        .storage_partition = &@import("../storage/operations.zig").partitionInfo,
+        .storage_volume = &@import("../storage/operations.zig").volumeInfo,
+        .storage_claim_begin = &@import("../storage/operations.zig").claimBegin,
+        .storage_claim_end = &@import("../storage/operations.zig").claimEnd,
+        .storage_read = &@import("../storage/operations.zig").read,
+        .storage_claim_read = &@import("../storage/operations.zig").claimRead,
+        .storage_claim_write = &@import("../storage/operations.zig").claimWrite,
+        .storage_claim_flush = &@import("../storage/operations.zig").claimFlush,
+        .storage_rescan = &@import("../storage/operations.zig").rescan,
+        .storage_mount = &@import("../storage/operations.zig").mount,
+        .storage_unmount = &@import("../storage/operations.zig").unmount,
+        .storage_use_begin = &r4api.r4sys.storageUseBegin,
+        .storage_use_end = &@import("../storage/operations.zig").useEnd,
     });
 }
 
@@ -7946,12 +7962,12 @@ fn resolveProgramFileWithBootReport(d: *drive.Drive, path: []const u8, report_bo
     }
     const volume = vfs.volumeForDrive(d.letter) orelse return null;
     reportBootLaunchStage(report_boot_launch, "FS-Sperre pruefen");
-    var req = fs_request.tryBegin(.loader_read, d.letter) orelse blk: {
+    var req = fs_request.tryBeginVolume(.loader_read, d.letter, volume) orelse blk: {
         // Preserve the normal bounded wait after an immediate, observation-
         // only probe.  The persistent marker distinguishes a foreign volume
         // owner from a stall in the following path lookup on real hardware.
         reportBootFilesystemWait(report_boot_launch, d.letter);
-        break :blk fs_request.begin(.loader_read, d.letter) orelse return null;
+        break :blk fs_request.beginVolume(.loader_read, d.letter, volume) orelse return null;
     };
     var ok = false;
     defer fs_request.finish(&req, ok);
@@ -9976,6 +9992,8 @@ fn runR4lPreemptionScenario(
     const before = scheduler.cpuPreemptionStats(target_cpu);
     const start = monotonic.capture();
     const start_tick = timer.tickCount();
+    const entry_flags = @import("../arch/x86_64/io.zig").readRflags();
+    const entry_timer = timer.deadlineStats();
 
     r4l_preemption_mode = mode;
     r4l_preemption_event = sync.Event.init(false);
@@ -10079,6 +10097,29 @@ fn runR4lPreemptionScenario(
 
     var completion: ProgramProcessCompletion = .{};
     const completion_ok = consumeProgramCompletion(handle, &completion) == PROGRAM_HANDLE_OK;
+    if (!completion_ok) {
+        var detail: [6]u64 = .{0} ** 6;
+        if (lockProgramRegistry()) {
+            if (lookupProgramRegistryHandleLocked(handle, true)) |slot| {
+                detail = .{ @intFromEnum(slot.state), @intFromEnum(slot.retire_phase), slot.pin_count, slot.retire_attempts, @intFromBool(slot.retire_in_progress), @intFromBool(program_reaper_started) };
+            }
+            unlockProgramRegistry();
+        }
+        k.puts("[R4LPREEMPT] incomplete state/phase/pins/retries/owner/reaper=");
+        for (detail) |value| {
+            k.putDec(value);
+            k.puts(" ");
+        }
+        k.puts("\r\n");
+        const failed_flags = @import("../arch/x86_64/io.zig").readRflags();
+        const failed_timer = timer.deadlineStats();
+        k.puts("[R4LPREEMPT] flags/irq_delta/last_irq/now/mode=");
+        for ([_]u64{ entry_flags, failed_flags, failed_timer.timer_irqs -% entry_timer.timer_irqs, failed_timer.last_irq_tick, timer.tickCount(), @intFromEnum(failed_timer.mode) }) |value| {
+            k.putDec(value);
+            k.puts(" ");
+        }
+        k.puts("\r\n");
+    }
     if (@atomicLoad(u8, &r4l_preemption_witness_done, .acquire) == 0) abortR4lPreemptionWitness();
     const witness_ok = waitForR4lPreemptionWitness(cleanup_start, cleanup_tick);
     const after = scheduler.cpuPreemptionStats(target_cpu);
@@ -12042,6 +12083,10 @@ fn completeProgramThreadRetire(
         owner_task_generation,
     )) {
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Streams warten");
+        clearProgramThreadRetireClaim(thread_ctx);
+        return false;
+    }
+    if (!@import("../storage/operations.zig").releaseOwner(thread_ctx.instance_id, thread_ctx.instance_generation, owner_task_id, owner_task_generation)) {
         clearProgramThreadRetireClaim(thread_ctx);
         return false;
     }
@@ -17465,6 +17510,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                 if (!purgeCancelledAsyncIoRequestsForHandle(handle)) return deferProgramRetire(handle);
                 if (!releaseFileRangeLocksForHandle(handle)) return deferProgramRetire(handle);
                 if (!r4api.r4sys.releaseStreamSlotsForProgram(handle.instance_id, handle.generation)) return deferProgramRetire(handle);
+                if (!@import("../storage/operations.zig").releaseOwner(handle.instance_id, handle.generation, 0, 0)) return deferProgramRetire(handle);
                 if (!audio.closeStreamsForOwner(.{
                     .instance_id = handle.instance_id,
                     .generation = handle.generation,
@@ -17759,6 +17805,11 @@ fn currentProgramHandle() ?ProgramProcessHandle {
         return if (programHandleValid(handle)) handle else null;
     }
     return null;
+}
+
+fn resolveStorageOwner() ?@import("../storage/access_runtime.zig").Owner {
+    const owner = resolveR4SysStreamOwner() orelse return null;
+    return .{ .task = owner.id, .task_generation = owner.generation, .program = owner.program_id, .program_generation = owner.program_generation };
 }
 
 fn resolveR4SysStreamOwner() ?r4api.r4sys.StreamOwner {
