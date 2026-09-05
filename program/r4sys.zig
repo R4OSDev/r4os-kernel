@@ -1466,12 +1466,49 @@ pub fn fileStreamWrite(path_ptr: [*:0]const u8, offset: u64, data_ptr: [*]const 
     var resolved_buf: [max_api_path]u8 = undefined;
     const target = resolveTarget(raw_path, &resolved_buf) orelse return file_stream_error_invalid;
     const volume = targetVolume(target) orelse return file_stream_error_io;
-    var req = fs_request.beginVolume(.stream_write, target.drive_ref.letter, volume) orelse return file_stream_error_io;
+    var req = fs_request.beginVolume(.stream_write, target.drive_ref.letter, volume) orelse {
+        k.puts("[FSSTREAM] write admission failed\r\n");
+        return file_stream_error_io;
+    };
     var ok = false;
     defer fs_request.finish(&req, ok);
+    var phase: u32 = 1;
+    defer if (!ok) {
+        // Error-only context distinguishes namespace/ownership failures from
+        // backend writes. The existing shared NTFS stage is observational;
+        // another volume may advance it concurrently.
+        k.puts("[FSSTREAM] write failed drive=");
+        k.putc(target.drive_ref.letter);
+        k.puts(" phase=");
+        k.putDec(phase);
+        k.puts(" offset=");
+        k.putDec(offset);
+        k.puts(" bytes=");
+        k.putDec(len);
+        k.puts(" lookup=");
+        k.putDec(vfs.lookupDiagnosticStage(volume));
+        if (volume == .ntfs) {
+            k.puts(" append=");
+            k.putDec(@import("../fs/ntfs/ntfs.zig").appendDiagnosticStage());
+        }
+        k.puts("\r\n");
+        const cache = page_cache.summary();
+        k.puts("[FSSTREAM] cache read/write/writeback/alloc/lock failures=");
+        k.putDec(cache.read_errors);
+        k.puts("/");
+        k.putDec(cache.write_errors);
+        k.puts("/");
+        k.putDec(cache.writeback_errors);
+        k.puts("/");
+        k.putDec(cache.payload_allocation_failures);
+        k.puts("/");
+        k.putDec(cache.lock_timeouts);
+        k.puts("\r\n");
+    };
     var parent: vfs.NodeRef = undefined;
     if (vfs.resolvePathStatus(volume, parentPath(target.path), &parent) != .found)
         return file_stream_error_io;
+    phase = 2;
     var entry: ?vfs.Entry = null;
     if (resolveOptionalEntryStatus(volume, target.path, &entry) == .io)
         return file_stream_error_io;
@@ -1480,7 +1517,9 @@ pub fn fileStreamWrite(path_ptr: [*:0]const u8, offset: u64, data_ptr: [*]const 
     // Slot discovery must happen while the matching volume gate is held.
     // Looking up a raw slot pointer and then blocking on the gate allowed an
     // abort/delete to clear and reuse that storage for another stream (ABA).
+    phase = 3;
     if (findOwnedStreamSlotForResolved(target.drive_ref.letter, targetOnBootVolume(target), parent, entry, baseName(target.path))) |slot| {
+        phase = 4;
         if (!slot.ready or slot.finished) return file_stream_error_io;
         bindStreamSlotToEntry(slot, entry.?);
         if (slot.size != offset) return file_stream_error_offset_mismatch;
@@ -1488,7 +1527,9 @@ pub fn fileStreamWrite(path_ptr: [*:0]const u8, offset: u64, data_ptr: [*]const 
             ok = true;
             return 0;
         }
+        phase = 5;
         const slot_volume = streamSlotVolume(slot) orelse return file_stream_error_io;
+        phase = 6;
         const status = vfs.appendFileAtOffsetStatusDeferred(slot_volume, slot.parent_node, streamSlotName(slot), @intCast(offset), data_ptr[0..@intCast(len)]);
         switch (status) {
             .ok => {},
@@ -1507,9 +1548,11 @@ pub fn fileStreamWrite(path_ptr: [*:0]const u8, offset: u64, data_ptr: [*]const 
         const needs_identity_refresh = slot.file_node == 0 and slot.file_node_generation == 0;
         slot.size += len64;
         slot.identity_refresh_pending = needs_identity_refresh;
+        phase = 7;
         var updated: vfs.Entry = undefined;
         switch (vfs.lookupEntryStatus(slot_volume, slot.parent_node, streamSlotName(slot), &updated)) {
             .found => {
+                phase = 8;
                 if (updated.isDir() or updated.size != slot.size) return file_stream_error_io;
                 bindStreamSlotToEntry(slot, updated);
                 // An empty FAT32 stage had no cluster identity when its claim
