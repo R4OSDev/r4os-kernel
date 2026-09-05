@@ -4,9 +4,9 @@
 // owns mount state, the page-cache device seam and the VFS vocabulary; all
 // on-disk parsing, tree walks and write ordering live in ntfs_volume.
 //
-// Concurrency: every operation runs under the fs-request gate (or the
-// single-threaded boot path).  The module-level scratch and volume construction
-// rely on that serialization.
+// Concurrency: every operation runs under its volume's fs-request gate (or
+// the single-threaded boot path). Different volumes may run concurrently, so
+// each mounted volume owns its scratch as well as its cache and MFT runlist.
 
 const ntfs = @import("ntfs_format");
 const nv = @import("ntfs_volume");
@@ -104,11 +104,24 @@ const VolumeState = struct {
     mft_runs: [MAX_MFT_RUNS]ntfs.Run = undefined,
     mft_run_count: usize = 0,
     upcase: ?[]u8 = null,
+    scratch: ?[]u8 = null,
     metadata_cache: nv.MetadataCache = .{},
+
+    fn scratchBuffer(self: *VolumeState) *nv.Scratch {
+        return @ptrCast(@alignCast(self.scratch.?.ptr));
+    }
+
+    fn release(self: *VolumeState) void {
+        if (self.upcase) |memory| _ = heap.free(memory);
+        if (self.scratch) |memory| _ = heap.free(memory);
+        self.upcase = null;
+        self.scratch = null;
+        self.in_use = false;
+        self.metadata_cache.invalidateExternal();
+    }
 };
 
 var states: [MAX_VOLUMES]VolumeState = .{VolumeState{}} ** MAX_VOLUMES;
-var scratch: nv.Scratch = .{};
 var metadata_reclaim_volume_cursor: usize = 0;
 
 pub const StorageLocation = struct { device: usize, first: u64, count: u64 };
@@ -123,10 +136,7 @@ pub fn storageLocation(volume: Volume) ?StorageLocation {
 pub fn forgetStorage(device: usize, first: u64, count: u64) void {
     for (&states) |*state| {
         if (!state.in_use or state.device_index != device or state.partition_lba < first or state.partition_lba - first >= count) continue;
-        if (state.upcase) |memory| _ = heap.free(memory);
-        state.upcase = null;
-        state.in_use = false;
-        state.metadata_cache.invalidateExternal();
+        state.release();
     }
 }
 
@@ -203,7 +213,7 @@ fn buildVolume(volume: Volume) nv.Volume {
         .mft_runs_buf = state.mft_runs[0..],
         .mft_run_count = &state.mft_run_count,
         .upcase = state.upcase orelse &[_]u8{},
-        .scratch = &scratch,
+        .scratch = state.scratchBuffer(),
         .now_filetime = nowFiletime(),
         .metadata_cache = &state.metadata_cache,
         .metadata_cache_now_ticks = timer.tickCount(),
@@ -263,6 +273,28 @@ pub fn inspectBounded(device_index: usize, first_lba: u32, partition_sectors: u6
         return null;
     }
 
+    const state = &states[slot_index];
+    // A second alias shares the existing mount state; probing it again would
+    // overwrite live runlists and scratch under another letter's request gate.
+    // Storage replacement must drain all aliases and forget the old mount first.
+    if (state.in_use) {
+        if (state.total_sectors > partition_sectors) return null;
+        return .{
+            .state_slot = @intCast(slot_index),
+            .cluster_bytes = state.cluster_bytes,
+            .total_sectors = state.total_sectors,
+        };
+    }
+    state.scratch = heap.alloc(@sizeOf(nv.Scratch), @alignOf(nv.Scratch)) orelse {
+        k.puts("      NTFS mount failed: scratch alloc\r\n");
+        return null;
+    };
+    // Initialize directly in the allocation: a Scratch temporary exceeds the
+    // bounded storage-cleanup stack. Unmounted slots consume no scratch RAM.
+    @memset(state.scratch.?, 0);
+    var mounted = false;
+    defer if (!mounted) state.release();
+
     const ctx = &device_ctxs[slot_index];
     ctx.device_index = device_index;
     ctx.first_lba = first_lba;
@@ -274,8 +306,7 @@ pub fn inspectBounded(device_index: usize, first_lba: u32, partition_sectors: u6
         .flush = seamFlush,
     };
 
-    const state = &states[slot_index];
-    const info = nv.mount(device, first_lba, &scratch, state.mft_runs[0..]) orelse {
+    const info = nv.mount(device, first_lba, state.scratchBuffer(), state.mft_runs[0..]) orelse {
         k.puts("      NTFS: mount failed (invalid boot sector or unsupported layout)\r\n");
         return null;
     };
@@ -320,6 +351,7 @@ pub fn inspectBounded(device_index: usize, first_lba: u32, partition_sectors: u6
     k.puts(" mft_runs=");
     k.putDec(info.mft_run_count);
     k.puts(" read-write\r\n");
+    mounted = true;
     _ = &volume;
     return volume;
 }
@@ -328,11 +360,8 @@ fn failInspect(state: *VolumeState, reason: []const u8) ?Volume {
     k.puts("      NTFS mount failed: ");
     k.puts(reason);
     k.puts("\r\n");
-    if (state.upcase) |buf| {
-        _ = heap.free(buf);
-        state.upcase = null;
-    }
-    state.in_use = false;
+    // inspectBounded's deferred rollback owns all mount allocations.
+    _ = state;
     return null;
 }
 
