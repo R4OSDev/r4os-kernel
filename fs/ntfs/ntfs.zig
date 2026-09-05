@@ -15,6 +15,7 @@ const heap = @import("../../memory/heap.zig");
 const timer = @import("../../kernel/timer.zig");
 const time_core = @import("../../platform/time.zig");
 const k = @import("../../kernel/log.zig");
+const block = @import("../../storage/block.zig");
 
 const SECTOR_SIZE: usize = 512;
 // Bound staging ownership while still preserving normal 1/2-MB NTFS extents
@@ -22,7 +23,9 @@ const SECTOR_SIZE: usize = 512;
 // calls. The block core still splits each submission at the backend limit.
 const MAX_DIRECT_WRITE_SECTORS: u32 = 2048;
 const NAME_MAX: usize = 768; // matches vfs.NAME_MAX / nv.NAME_MAX (0.60.19)
-const MAX_VOLUMES: usize = 4;
+// Match the VFS letter capacity: three installations already need six NTFS
+// volumes, independently of Recovery's RAM and FAT32 volumes.
+const MAX_VOLUMES: usize = 26;
 const MAX_MFT_RUNS: usize = nv.MAX_MFT_RUNS;
 const METADATA_NEGATIVE_TTL_TICKS: u64 = timer.DEFAULT_HZ;
 const METADATA_RECLAIM_ENTRY_BUDGET: u32 = 8;
@@ -111,16 +114,25 @@ var metadata_reclaim_volume_cursor: usize = 0;
 // Page-cache device seam
 // ---------------------------------------------------------------------------
 
-const DeviceCtx = struct { device_index: usize = 0 };
+const DeviceCtx = struct {
+    device_index: usize = 0,
+    first_lba: u64 = 0,
+    end_lba: u64 = 0,
+    fn contains(self: *const DeviceCtx, lba: u64, count: u32) bool {
+        return lba >= self.first_lba and lba <= self.end_lba and count <= self.end_lba - lba;
+    }
+};
 var device_ctxs: [MAX_VOLUMES]DeviceCtx = .{DeviceCtx{}} ** MAX_VOLUMES;
 
 fn seamRead(ctx: *anyopaque, lba: u64, count: u32, out: []u8) bool {
     const c: *DeviceCtx = @ptrCast(@alignCast(ctx));
+    if (!c.contains(lba, count)) return false;
     return page_cache.readSectors(c.device_index, lba, count, out);
 }
 
 fn seamWrite(ctx: *anyopaque, lba: u64, count: u32, data: []const u8) bool {
     const c: *DeviceCtx = @ptrCast(@alignCast(ctx));
+    if (!c.contains(lba, count)) return false;
     if (count == 0) return true;
     const total_bytes = @as(usize, count) * SECTOR_SIZE;
     if (data.len < total_bytes) return false;
@@ -208,6 +220,14 @@ fn daysFromCivil(year: u16, month: u8, day: u8) i64 {
 // ---------------------------------------------------------------------------
 
 pub fn inspect(device_index: usize, first_lba: u32) ?Volume {
+    const device = block.get(device_index) orelse return null;
+    if (first_lba >= device.sector_count) return null;
+    return inspectBounded(device_index, first_lba, device.sector_count - first_lba);
+}
+
+pub fn inspectBounded(device_index: usize, first_lba: u32, partition_sectors: u64) ?Volume {
+    const physical = block.get(device_index) orelse return null;
+    if (physical.sector_size != SECTOR_SIZE or first_lba >= physical.sector_count or partition_sectors > physical.sector_count - first_lba) return null;
     var slot_index: usize = MAX_VOLUMES;
     for (states, 0..) |state, i| {
         if (state.in_use and state.device_index == device_index and state.partition_lba == first_lba) {
@@ -223,6 +243,8 @@ pub fn inspect(device_index: usize, first_lba: u32) ?Volume {
 
     const ctx = &device_ctxs[slot_index];
     ctx.device_index = device_index;
+    ctx.first_lba = first_lba;
+    ctx.end_lba = @as(u64, first_lba) + partition_sectors;
     const device = nv.Device{
         .ctx = ctx,
         .read_sectors = seamRead,
@@ -235,7 +257,9 @@ pub fn inspect(device_index: usize, first_lba: u32) ?Volume {
         k.puts("      NTFS: mount failed (invalid boot sector or unsupported layout)\r\n");
         return null;
     };
-    if (info.cluster_bytes / SECTOR_SIZE == 0) return null;
+    if (info.cluster_bytes / SECTOR_SIZE == 0 or info.total_sectors > partition_sectors or
+        info.total_sectors / (info.cluster_bytes / SECTOR_SIZE) > 0xffff_ffff) return null;
+    ctx.end_lba = @as(u64, first_lba) + info.total_sectors;
 
     state.device_index = device_index;
     state.partition_lba = first_lba;

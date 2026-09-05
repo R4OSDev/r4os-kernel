@@ -360,7 +360,7 @@ fn scanExternalStorageBackends(scanned: *[16]bool) void {
     var index: usize = 0;
     while (index < block.slotCount()) : (index += 1) {
         const device = block.get(index) orelse continue;
-        if (device.source == .builtin) continue;
+        if (device.source == .builtin and device.bus != .usb) continue;
         const name = switch (device.bus) {
             .nvme => "NVME.R4D",
             .ahci => "AHCI.R4D",

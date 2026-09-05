@@ -3,6 +3,7 @@ const page_cache = @import("../page_cache.zig");
 const scheduler = @import("../../sched/scheduler.zig");
 const timer = @import("../../kernel/timer.zig");
 const time_core = @import("../../platform/time.zig");
+const block = @import("../../storage/block.zig");
 
 const SECTOR_SIZE: usize = 512;
 pub const ATTR_READ_ONLY: u8 = 0x01;
@@ -425,6 +426,16 @@ pub fn inspect(device_index: usize, first_lba: u32) ?Volume {
 }
 
 pub fn parse(device_index: usize, first_lba: u32) ?Volume {
+    const device = block.get(device_index) orelse return null;
+    if (first_lba >= device.sector_count) return null;
+    return parseBounded(device_index, first_lba, device.sector_count - first_lba);
+}
+
+/// Admit a filesystem only within the selected partition. FAT32's current
+/// address calculations are u32; reject incompatible geometry before use.
+pub fn parseBounded(device_index: usize, first_lba: u32, partition_sectors: u64) ?Volume {
+    const device = block.get(device_index) orelse return null;
+    if (device.sector_size != SECTOR_SIZE or first_lba >= device.sector_count or partition_sectors > device.sector_count - first_lba) return null;
     var sector: [SECTOR_SIZE]u8 = undefined;
     if (!readSector(device_index, first_lba, 1, sector[0..])) {
         k.puts("      FAT BPB: read failed\r\n");
@@ -472,6 +483,14 @@ pub fn parse(device_index: usize, first_lba: u32) ?Volume {
         .fs_info_sector = fs_info_sector,
         .backup_boot_sector = backup_boot_sector,
     };
+    const metadata = @as(u64, reserved_sectors) + @as(u64, fat_count) * fat_sectors_32;
+    if (sectors_per_cluster > 128 or (sectors_per_cluster & (sectors_per_cluster - 1)) != 0 or
+        reserved_sectors == 0 or fat_count > 2 or metadata >= total_sectors or
+        total_sectors > partition_sectors or @as(u64, first_lba) + total_sectors > 0x1_0000_0000) return null;
+    const clusters = volume.totalClusters();
+    if (clusters < 65525 or clusters >= FAT_RESERVED_START - 2 or root_cluster < 2 or root_cluster >= clusters + 2 or
+        (@as(u64, clusters) + 2) * 4 > @as(u64, fat_sectors_32) * SECTOR_SIZE) return null;
+    if (runtimeStateFor(volume, true) == null) return null;
     initializeVolumeState(volume);
     return volume;
 }
@@ -625,7 +644,7 @@ fn runtimeStateFor(volume: Volume, create: bool) ?*VolumeRuntimeState {
         if (!state.valid and fallback == null) fallback = state;
     }
     if (!create) return null;
-    return fallback orelse &volume_states[0];
+    return fallback;
 }
 
 fn fsInfoSectorValid(volume: Volume) bool {

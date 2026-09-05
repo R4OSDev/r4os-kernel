@@ -564,3 +564,33 @@ MSI-X anbietet. BIR, Tabellenoffset und die 16-MiB-MMIO-Grenze werden vor der
 Abbildung geprueft. Disable und Owner-Cleanup stellen Eintrag, Capability und
 INTx-Zustand wieder her. Daraus entsteht weder eine oeffentliche Affinitaets-
 noch eine Multivektor-ABI.
+
+Storage-Bootgrundlagen fuer Recovery (0.76.4)
+-------------------------------------------
+
+bootloader/boot_info.zig sichert den tatsaechlichen Limine-ExecutableFile-
+Datentraeger, dessen Partition und geladenen Pfad als kopierte Bootidentitaet.
+Die neuen storage/partition_table.zig, installation.zig und boot_source.zig
+pruefen GPT-/MBR-Inventare und den versionierten Installationsvertrag ohne
+Schreibzugriffe. media_inventory.zig bindet diese Logik an die bestehenden
+Block-/FAT32-/NTFS-Besitzer. Recovery verwendet diese Grundlage schon; die
+Umstellung der normalen SYSTEM-/DATA-Bootauswahl folgt in 0.76.17.
+
+USB-MSC verwaltet bis zu 16 eigene Medienkontexte unter dem gemeinsamen
+xHCI-Transportowner. Der Blockkatalog besitzt 16 Slots, davon benoetigt
+Recovery einen fuer RAM. Eine vor den Mounts gesetzte Busausnahme gilt fuer
+Enumeration und neue I/O-Pins, sowie fuer das Geraeteinventar; HID ist kein
+Blockgeraet und bleibt unabhaengig. Modelltexte sind optional und werden
+nur aus echten Backenddaten uebernommen (aktuell USB-SCSI INQUIRY).
+
+NTFS besitzt 26 statt vier Volume-Slots und begrenzt seine I/O-Seam auf das
+ausgewaehlte Volume. FAT32 prueft BPB, FAT-/Clustergeometrie und Grenzen vor
+Aufnahme; bei vollen Mountslots bleibt bestehender Zustand erhalten.
+Partitionstabellen nutzen u64-LBAs, die vorhandenen Dateisystembasen bleiben
+u32; Recovery meldet nicht unterstuetzte Geometrie, bevor sie verwendet wird.
+512-Byte-Sektoren bleiben der freigegebene Vertrag.
+
+Build.sh storage-test beziehungsweise Build.bat storage-test fuehrt die
+begrenzten Besitzerpruefungen fuer GUIDs, beide GPT-Kopien, fremdes MBR,
+Installationsbeschreibung, CURRENT/PREVIOUS und Medienregeln aus. Dieser
+Step ist auch Bestandteil des regulaeren Kernel-test-Steps.

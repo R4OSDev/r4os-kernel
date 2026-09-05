@@ -52,11 +52,31 @@ pub const BootModule = struct {
     valid: bool = false,
 };
 
+/// Copy identity before bootloader memory can be reclaimed. This identifies
+/// the actual executable; it does not infer a disk from labels or modules.
+pub const ExecutableSource = struct {
+    present: bool = false,
+    media_type: u32 = 0,
+    partition_index: u32 = 0,
+    mbr_disk_id: u32 = 0,
+    disk_guid: [16]u8 = .{0} ** 16,
+    partition_guid: [16]u8 = .{0} ** 16,
+    filesystem_uuid: [16]u8 = .{0} ** 16,
+    path_bytes: [256]u8 = .{0} ** 256,
+    path_len: usize = 0,
+    path_truncated: bool = false,
+
+    pub fn path(self: *const ExecutableSource) []const u8 {
+        return self.path_bytes[0..self.path_len];
+    }
+};
+
 pub const Info = struct {
     initialized: bool = false,
     bootloader_name: []const u8 = "Limine",
     memory_map_entries: []const MemoryMapEntry = &.{},
     boot_modules: []const BootModule = &.{},
+    executable_source: ExecutableSource = .{},
     memory_map_truncated: bool = false,
     memory_map_invalid_entries: u64 = 0,
     hhdm_offset: ?u64 = null,
@@ -100,6 +120,7 @@ pub fn init() bool {
     current.memory_map_invalid_entries = invalid;
     current.hhdm_offset = limine.hhdmOffset() orelse return false;
     current.boot_modules = collectBootModules();
+    current.executable_source = collectExecutableSource();
 
     if (limine.firstFramebuffer()) |src| {
         boot_framebuffer = .{
@@ -221,8 +242,26 @@ fn collectBootModules() []const BootModule {
 fn zSlice(value: ?[*:0]const u8) []const u8 {
     const ptr = value orelse return "";
     var len: usize = 0;
-    while (ptr[len] != 0 and len < 256) : (len += 1) {}
+    while (len < 256 and ptr[len] != 0) : (len += 1) {}
     return ptr[0..len];
+}
+
+fn collectExecutableSource() ExecutableSource {
+    const file = limine.executableFile() orelse return .{};
+    var result = ExecutableSource{
+        .present = true,
+        .media_type = file.media_type,
+        .partition_index = file.partition_index,
+        .mbr_disk_id = file.mbr_disk_id,
+        .disk_guid = file.gpt_disk_uuid.bytes(),
+        .partition_guid = file.gpt_part_uuid.bytes(),
+        .filesystem_uuid = file.part_uuid.bytes(),
+    };
+    const path = zSlice(file.path);
+    result.path_truncated = path.len == result.path_bytes.len;
+    result.path_len = path.len;
+    @memcpy(result.path_bytes[0..path.len], path);
+    return result;
 }
 
 fn maxUsize() u64 {

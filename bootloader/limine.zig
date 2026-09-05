@@ -27,6 +27,7 @@ pub fn keepRequests() void {
     touchU64(&framebuffer_request.id[0]);
     touchU64(&memory_map_request.id[0]);
     touchU64(&module_request.id[0]);
+    touchU64(&executable_file_request.id[0]);
     touchU64(&rsdp_request.id[0]);
     touchU64(&hhdm_request.id[0]);
     touchU64(&requests_end_marker[0]);
@@ -122,13 +123,60 @@ pub fn memoryMap() ?*MemoryMapResponse {
 }
 
 // --- Modules --------------------------------------------------------------
+// Protocol reference: https://raw.githubusercontent.com/limine-bootloader/limine-protocol/617369cb577108e483c096e373c4f2ecc9d2081d/include/limine.h
+// 0BSD, Copyright (C) 2022-2026 Mintsuki and contributors.
+// The UUID fields have the same little-endian field layout as GPT on x86_64.
+pub const Uuid = extern struct {
+    a: u32,
+    b: u16,
+    c: u16,
+    d: [8]u8,
+
+    pub fn bytes(self: Uuid) [16]u8 {
+        return @bitCast(self);
+    }
+};
+
 pub const File = extern struct {
     revision: u64,
     address: ?[*]const u8,
     size: u64,
     path: ?[*:0]const u8,
     cmdline: ?[*:0]const u8,
+    media_type: u32,
+    unused: u32,
+    tftp_ipv4: [4]u8,
+    tftp_port: u32,
+    partition_index: u32,
+    mbr_disk_id: u32,
+    gpt_disk_uuid: Uuid,
+    gpt_part_uuid: Uuid,
+    part_uuid: Uuid,
 };
+
+comptime {
+    if (@sizeOf(File) != 112 or @offsetOf(File, "gpt_disk_uuid") != 64 or
+        @offsetOf(File, "gpt_part_uuid") != 80) @compileError("Limine file ABI mismatch");
+}
+
+pub const ExecutableFileResponse = extern struct { revision: u64, file: *const File };
+pub const ExecutableFileRequest = extern struct {
+    id: [4]u64,
+    revision: u64,
+    response: ?*ExecutableFileResponse,
+};
+
+pub export var executable_file_request: ExecutableFileRequest linksection(".limine_reqs_m_data") = .{
+    .id = .{ MAGIC_0, MAGIC_1, 0xad97e90e83f1ed67, 0x31eb5d1c5ff23b69 },
+    .revision = 0,
+    .response = null,
+};
+
+pub fn executableFile() ?*const File {
+    const ptr: *volatile ?*ExecutableFileResponse = &executable_file_request.response;
+    const response = ptr.* orelse return null;
+    return response.file;
+}
 
 pub const ModuleResponse = extern struct {
     revision: u64,

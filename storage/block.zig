@@ -12,7 +12,7 @@ const sched_task = @import("../sched/task.zig");
 const task_context = @import("../sched/task_context.zig");
 const timer = @import("../kernel/timer.zig");
 
-const MAX_DEVICES: usize = 8;
+const MAX_DEVICES: usize = 16;
 pub const MAX_REQUEST_QUEUE_DEPTH: usize = 16;
 
 pub const ReadFn = *const fn (ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool;
@@ -267,6 +267,8 @@ pub const RuntimeSummary = struct {
 
 pub const Device = struct {
     name: []const u8,
+    // Hardware-provided text when available; distinct from the registry name.
+    model: []const u8 = "",
     driver: []const u8 = "unknown",
     bus: Bus = .unknown,
     controller: []const u8 = "unknown",
@@ -333,6 +335,9 @@ pub const UnregisterToken = struct {
 var devices: [MAX_DEVICES]DeviceSlot = .{DeviceSlot{}} ** MAX_DEVICES;
 var device_count: usize = 0;
 var device_slot_count: usize = 0;
+// Session-wide media policy, applied before physical volumes are admitted.
+// Hardware/USB HID owners are independent of block-device visibility.
+var excluded_bus: ?Bus = null;
 var runtime_worker_started = false;
 var runtime_worker_task_id: u32 = 0;
 var runtime_worker_task_generation: u64 = 0;
@@ -357,6 +362,7 @@ pub fn init() void {
     devices = .{DeviceSlot{}} ** MAX_DEVICES;
     device_count = 0;
     device_slot_count = 0;
+    excluded_bus = null;
     runtime_worker_started = false;
     runtime_worker_task_id = 0;
     runtime_worker_task_generation = 0;
@@ -663,14 +669,49 @@ pub fn findByName(name: []const u8) ?usize {
 fn findByNameLocked(name: []const u8) ?usize {
     var index: usize = 0;
     while (index < device_slot_count) : (index += 1) {
-        if (!devices[index].used) continue;
+        if (!devices[index].used or busExcluded(devices[index].device.bus)) continue;
         if (strEqIgnoreCase(devices[index].device.name, name)) return index;
     }
     return null;
 }
 
 pub fn count() usize {
-    return device_count;
+    const flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(flags);
+    var visible: usize = 0;
+    for (devices[0..device_slot_count]) |*slot| {
+        if (slot.used and !slot.retiring and !busExcluded(slot.device.bus)) visible += 1;
+    }
+    return visible;
+}
+
+pub fn excludeBusBeforeMount(bus: Bus) bool {
+    if (bus == .ram) return false;
+    // This is a boot policy, never an unmount/revocation substitute.
+    for (0..drive.DRIVE_COUNT) |i| if (drive.atIndex(i)) |mounted| {
+        if (mounted.block_device_index) |index| {
+            const device = get(index) orelse continue;
+            if (device.bus == bus) return false;
+        }
+    };
+    const flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(flags);
+    if (excluded_bus != null) return excluded_bus.? == bus;
+    for (devices[0..device_slot_count]) |*slot| {
+        if (slot.used and slot.device.bus == bus and (slot.pin_count != 0 or slot.device.active_executions != 0)) return false;
+    }
+    excluded_bus = bus;
+    return true;
+}
+
+fn busExcluded(bus: Bus) bool {
+    return excluded_bus != null and excluded_bus.? == bus;
+}
+
+pub fn isBusVisible(bus: Bus) bool {
+    const flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(flags);
+    return !busExcluded(bus);
 }
 
 pub fn slotCount() usize {
@@ -684,7 +725,7 @@ pub fn maxDevices() usize {
 pub fn get(index: usize) ?*const Device {
     const irq_flags = owner_locks.storage.acquire();
     defer owner_locks.storage.release(irq_flags);
-    if (index >= device_slot_count or !devices[index].used or devices[index].retiring) return null;
+    if (index >= device_slot_count or !devices[index].used or devices[index].retiring or busExcluded(devices[index].device.bus)) return null;
     return &devices[index].device;
 }
 
@@ -696,6 +737,7 @@ fn pinDevice(index: usize) ?DevicePin {
     if (index >= device_slot_count or
         !devices[index].used or
         devices[index].retiring or
+        busExcluded(devices[index].device.bus) or
         devices[index].pin_count == 0xFFFF_FFFF)
     {
         owner_locks.storage.release(irq_flags);

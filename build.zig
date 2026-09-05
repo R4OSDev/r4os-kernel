@@ -174,6 +174,9 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(kernel);
 
     const test_step = b.step("test", "Build the kernel and run kernel-owned host tests");
+    const storage_test_step = b.step("storage-test", "Bounded partition identity and installation boot tests");
+    addUnitTest(b, storage_test_step, "storage_boot_tests.zig");
+    test_step.dependOn(storage_test_step);
     test_step.dependOn(&kernel.step);
     const unit_tests = [_][]const u8{
         "display/console_scroll_buffer.zig",

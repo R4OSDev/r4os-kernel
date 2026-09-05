@@ -59,6 +59,8 @@ pub const Status = struct {
     max_lun: u8 = 0,
     uas_supported: bool = false,
     inquiry_ok: bool = false,
+    model: [32]u8 = .{0} ** 32,
+    model_len: usize = 0,
     inquiry_retries: u64 = 0,
     inquiry_wait_elapsed_ns: u64 = 0,
     test_unit_ready_ok: bool = false,
@@ -135,9 +137,16 @@ pub const Status = struct {
     scsi_last_result: i32 = 0,
     protocol_required_missing: u64 = 0,
     reason: []const u8 = "not initialized",
+    reason_storage: [128]u8 = .{0} ** 128,
+    transport_incident: diag_screen.IncidentToken = .{},
 };
 
-var current: Status = .{};
+const MAX_MSC_DEVICES = 16;
+var media: [MAX_MSC_DEVICES]Status = .{Status{}} ** MAX_MSC_DEVICES;
+var current: *Status = &media[0];
+var media_count: usize = 0;
+const media_names = [_][]const u8{ "usb0", "usb1", "usb2", "usb3", "usb4", "usb5", "usb6", "usb7", "usb8", "usb9", "usb10", "usb11", "usb12", "usb13", "usb14", "usb15" };
+var current_index: usize = 0;
 var data_buf: [DATA_BUF_LEN]u8 = .{0} ** DATA_BUF_LEN;
 var bot_r4p_build: u64 = 0;
 var bot_r4p_csw: u64 = 0;
@@ -149,78 +158,84 @@ var scsi_dispatch_failures: u64 = 0;
 var scsi_last_result: i32 = 0;
 var block_source: block.Source = .builtin;
 var external_owner: bool = false;
-var reason_buffer: [128]u8 = .{0} ** 128;
-var last_transport_incident: diag_screen.IncidentToken = .{};
 
 pub fn init() bool {
     if (!xhci.acquireControllerOwnership()) return false;
     defer xhci.releaseControllerOwnership();
-    resolveTransportIncident();
-    current = .{ .initialized = true, .reason = "no USB mass storage device found" };
-    bot_r4p_build = 0;
-    bot_r4p_csw = 0;
-    bot_dispatch_failures = 0;
-    bot_last_result = 0;
-    scsi_r4p_build = 0;
-    scsi_r4p_parse = 0;
-    scsi_dispatch_failures = 0;
-    scsi_last_result = 0;
-    last_transport_incident = .{};
-    @memset(reason_buffer[0..], 0);
-
+    // Boot admission is idempotent; do not orphan registered block contexts.
+    if (media_count != 0) return blockDeviceCount() != 0;
     var index: usize = 0;
     while (usb_core.deviceAt(index)) |dev| : (index += 1) {
         if (dev.first_interface_class != 0x08 or dev.first_interface_subclass != 0x06 or dev.first_interface_protocol != 0x50) continue;
-        current.present = true;
-        current.port = dev.port;
-        current.device = xhci.deviceHandleFromCore(dev);
-        current.bulk_in_handle = xhci.bulkInHandleFromCore(dev);
-        current.bulk_out_handle = xhci.bulkOutHandleFromCore(dev);
-        current.interface_number = dev.first_interface_number;
-        current.bulk_in = dev.bulk_in_endpoint_address;
-        current.bulk_out = dev.bulk_out_endpoint_address;
-        current.bulk_in_max_packet = dev.bulk_in_endpoint_max_packet;
-        current.bulk_out_max_packet = dev.bulk_out_endpoint_max_packet;
-        if (current.bulk_in == 0 or current.bulk_out == 0) {
-            current.failures += 1;
-            current.reason = "bulk endpoints missing";
-            return false;
+        if (media_count == media.len) {
+            k.puts("[USBMSC] device capacity reached\r\n");
+            break;
         }
-        if (!requireMscProtocolRoles()) return false;
-        if (!ensureSelected()) return false;
-        current.bound = true;
-        // Probe the actual device state immediately. Ready media no longer
-        // pays a blind settle second; transient command/Sense states own the
-        // bounded waits below.
-        current.inquiry_ok = scsiInquiryWithRetry();
-        if (!current.inquiry_ok) {
-            return false;
-        }
-        current.test_unit_ready_ok = waitForScsiReady();
-        if (!current.test_unit_ready_ok) {
-            current.reason = "SCSI device not ready after retry window";
-            return false;
-        }
-        current.read_capacity_ok = scsiReadCapacityWithRetry();
-        if (!current.read_capacity_ok) {
-            current.reason = "SCSI READ CAPACITY failed";
-            return false;
-        }
-        current.mode_sense_ok = scsiModeSense6();
-        if (!validLogicalBlockSize(current.sector_size)) {
-            current.reason = "unsupported logical block size";
-            return false;
-        }
-        current.max_sectors_per_request = maxSectorsForBlockSize(current.sector_size);
-        registerBlockDevice();
-        current.reason = if (current.block_registered) "USB mass storage block device active" else "block register failed";
-        return current.block_registered;
+        current_index = media_count;
+        current = &media[media_count];
+        current.* = .{ .initialized = true };
+        media_count += 1;
+        _ = initializeMedium(dev);
     }
-    return false;
+    current_index = 0;
+    current = &media[0];
+    return blockDeviceCount() != 0;
+}
+
+fn initializeMedium(dev: *const usb_core.Device) bool {
+    current.present = true;
+    current.port = dev.port;
+    current.device = xhci.deviceHandleFromCore(dev);
+    current.bulk_in_handle = xhci.bulkInHandleFromCore(dev);
+    current.bulk_out_handle = xhci.bulkOutHandleFromCore(dev);
+    current.interface_number = dev.first_interface_number;
+    current.bulk_in = dev.bulk_in_endpoint_address;
+    current.bulk_out = dev.bulk_out_endpoint_address;
+    current.bulk_in_max_packet = dev.bulk_in_endpoint_max_packet;
+    current.bulk_out_max_packet = dev.bulk_out_endpoint_max_packet;
+    if (current.bulk_in == 0 or current.bulk_out == 0) {
+        current.failures += 1;
+        current.reason = "bulk endpoints missing";
+        return false;
+    }
+    if (!requireMscProtocolRoles()) return false;
+    if (!ensureSelected()) return false;
+    current.bound = true;
+    // Probe the actual device state immediately. Ready media no longer
+    // pays a blind settle second; transient command/Sense states own the
+    // bounded waits below.
+    current.inquiry_ok = scsiInquiryWithRetry();
+    if (!current.inquiry_ok) {
+        return false;
+    }
+    current.test_unit_ready_ok = waitForScsiReady();
+    if (!current.test_unit_ready_ok) {
+        current.reason = "SCSI device not ready after retry window";
+        return false;
+    }
+    current.read_capacity_ok = scsiReadCapacityWithRetry();
+    if (!current.read_capacity_ok) {
+        current.reason = "SCSI READ CAPACITY failed";
+        return false;
+    }
+    current.mode_sense_ok = scsiModeSense6();
+    if (!validLogicalBlockSize(current.sector_size)) {
+        current.reason = "unsupported logical block size";
+        return false;
+    }
+    current.max_sectors_per_request = maxSectorsForBlockSize(current.sector_size);
+    registerBlockDevice();
+    current.reason = if (current.block_registered) "USB mass storage block device active" else "block register failed";
+    return current.block_registered;
 }
 
 pub fn setPreloadOwner() void {
     block_source = .preload;
+    external_owner = true;
+}
+
+pub fn setRuntimeOwner() void {
+    block_source = .disk;
     external_owner = true;
 }
 
@@ -244,7 +259,7 @@ pub fn status() Status {
     current.scsi_r4p_parse = scsi_r4p_parse;
     current.scsi_dispatch_failures = scsi_dispatch_failures;
     current.scsi_last_result = scsi_last_result;
-    return current;
+    return current.*;
 }
 
 fn requireMscProtocolRoles() bool {
@@ -267,18 +282,26 @@ fn missingProtocolReason() []const u8 {
 }
 
 pub fn blockDeviceCount() usize {
-    return if (current.block_registered) 1 else 0;
+    var count: usize = 0;
+    for (media[0..media_count]) |device| if (device.block_registered) {
+        count += 1;
+    };
+    return count;
 }
 
 pub fn deviceIndex() ?usize {
-    return current.block_index;
+    for (media[0..media_count]) |device| if (device.block_registered) return device.block_index;
+    return null;
 }
 
 pub fn reselectActiveDevice() bool {
-    if (!current.block_registered) return false;
     if (!xhci.acquireControllerOwnership()) return false;
     defer xhci.releaseControllerOwnership();
-    return ensureSelected();
+    for (media[0..media_count]) |*device| if (device.block_registered) {
+        current = device;
+        return ensureSelected();
+    };
+    return false;
 }
 
 fn validLogicalBlockSize(bytes: u32) bool {
@@ -298,7 +321,8 @@ fn usesReadWrite16(lba: u64, sectors: u16) bool {
 
 fn registerBlockDevice() void {
     const index = block.register(.{
-        .name = "usb0",
+        .name = media_names[current_index],
+        .model = current.model[0..current.model_len],
         .driver = "USBMSC",
         .bus = .usb,
         .controller = "xhci",
@@ -311,7 +335,7 @@ fn registerBlockDevice() void {
         .writable = !current.write_protected,
         .owns_transport_retry = true,
         .source = block_source,
-        .ctx = null,
+        .ctx = current,
         .read_fn = readBlock,
         .write_fn = if (current.write_protected) null else writeBlock,
         .flush_fn = flushBlock,
@@ -321,12 +345,10 @@ fn registerBlockDevice() void {
     current.block_registered = true;
 }
 
-fn readBlock(_: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
-    if (!xhci.acquireControllerOwnership()) {
-        current.read_failures += 1;
-        return false;
-    }
+fn readBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
+    if (!xhci.acquireControllerOwnership()) return false;
     defer xhci.releaseControllerOwnership();
+    current = @ptrCast(@alignCast(ctx orelse return false));
     if (sectors == 0 or sectors > current.max_sectors_per_request) {
         current.read_failures += 1;
         return false;
@@ -372,12 +394,10 @@ fn readBlock(_: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
     return true;
 }
 
-fn writeBlock(_: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
-    if (!xhci.acquireControllerOwnership()) {
-        current.write_failures += 1;
-        return false;
-    }
+fn writeBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
+    if (!xhci.acquireControllerOwnership()) return false;
     defer xhci.releaseControllerOwnership();
+    current = @ptrCast(@alignCast(ctx orelse return false));
     if (sectors == 0 or sectors > current.max_sectors_per_request) {
         current.write_failures += 1;
         return false;
@@ -418,12 +438,10 @@ fn writeBlock(_: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
     return true;
 }
 
-fn flushBlock(_: ?*anyopaque) bool {
-    if (!xhci.acquireControllerOwnership()) {
-        current.flush_failures += 1;
-        return false;
-    }
+fn flushBlock(ctx: ?*anyopaque) bool {
+    if (!xhci.acquireControllerOwnership()) return false;
     defer xhci.releaseControllerOwnership();
+    current = @ptrCast(@alignCast(ctx orelse return false));
     if (!ensureSelected()) {
         current.flush_failures += 1;
         return false;
@@ -526,6 +544,20 @@ fn scsiInquiry() bool {
     if (actual < declared) {
         setDataLengthReason("inquiry-truncated", current.last_data_actual_len);
         return failCommand();
+    }
+    // Standard INQUIRY supplies an 8-byte vendor and 16-byte product name.
+    // Short valid replies may omit them; leave the model empty in that case.
+    current.model_len = 0;
+    if (actual >= 32 and declared >= 32) {
+        for (data_buf[8..32]) |byte| {
+            if (byte < 32 or byte > 126) {
+                current.model_len = 0;
+                break;
+            }
+            current.model[current.model_len] = byte;
+            current.model_len += 1;
+        }
+        while (current.model_len != 0 and current.model[current.model_len - 1] == ' ') current.model_len -= 1;
     }
     return true;
 }
@@ -1071,15 +1103,15 @@ fn failTransport() bool {
     current.transport_failures += 1;
     const transfer_incident = xhci.takeLastSyncTransferIncidentToken();
     if (transfer_incident.valid()) {
-        if (last_transport_incident.valid() and
-            last_transport_incident.generation != transfer_incident.generation)
+        if (current.transport_incident.valid() and
+            current.transport_incident.generation != transfer_incident.generation)
         {
-            _ = diag_screen.resolveIncident(last_transport_incident);
+            _ = diag_screen.resolveIncident(current.transport_incident);
         }
-        last_transport_incident = transfer_incident;
+        current.transport_incident = transfer_incident;
     }
-    if (!last_transport_incident.valid()) {
-        last_transport_incident = diag_screen.beginResolvableIncident();
+    if (!current.transport_incident.valid()) {
+        current.transport_incident = diag_screen.beginResolvableIncident();
     }
     // Publish the immutable root diagnosis before STOP/RESET/CLEAR_FEATURE
     // can itself timeout or overwrite the most useful transport state.
@@ -1109,8 +1141,8 @@ fn failTransportAt(stage: []const u8) bool {
 }
 
 fn resolveTransportIncident() void {
-    _ = diag_screen.resolveIncident(last_transport_incident);
-    last_transport_incident = .{};
+    _ = diag_screen.resolveIncident(current.transport_incident);
+    current.transport_incident = .{};
 }
 
 fn opcodeName(opcode: u8) []const u8 {
@@ -1131,9 +1163,9 @@ fn opcodeName(opcode: u8) []const u8 {
 }
 
 fn appendReason(cursor: *usize, text: []const u8) void {
-    const available = reason_buffer.len - @min(cursor.*, reason_buffer.len);
+    const available = current.reason_storage.len - @min(cursor.*, current.reason_storage.len);
     const count = @min(available, text.len);
-    if (count != 0) @memcpy(reason_buffer[cursor.* .. cursor.* + count], text[0..count]);
+    if (count != 0) @memcpy(current.reason_storage[cursor.* .. cursor.* + count], text[0..count]);
     cursor.* += count;
 }
 
@@ -1154,11 +1186,11 @@ fn appendReasonU32(cursor: *usize, value_input: u32) void {
 }
 
 fn publishReason(cursor: usize) void {
-    current.reason = reason_buffer[0..@min(cursor, reason_buffer.len)];
+    current.reason = current.reason_storage[0..@min(cursor, current.reason_storage.len)];
 }
 
 fn beginProtocolReason() usize {
-    @memset(reason_buffer[0..], 0);
+    @memset(current.reason_storage[0..], 0);
     var cursor: usize = 0;
     appendReason(&cursor, "SCSI ");
     appendReason(&cursor, opcodeName(current.last_opcode));

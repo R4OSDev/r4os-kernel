@@ -184,6 +184,7 @@ fn addUsbDeviceRecords(s: *Snapshot) void {
     var index: usize = 0;
     while (usb_core.deviceAt(index)) |d| : (index += 1) {
         const class_code = if (d.first_interface_class != 0) d.first_interface_class else d.device_class;
+        if (class_code == 0x08 and !block.isBusVisible(.usb)) continue;
         const subclass = if (d.first_interface_class != 0) d.first_interface_subclass else d.device_subclass;
         const protocol = if (d.first_interface_class != 0) d.first_interface_protocol else d.device_protocol;
         s.add(.{

@@ -20,6 +20,7 @@ const microsoft_basic_data_guid = [16]u8{
 };
 
 pub const Header = struct {
+    disk_guid: [16]u8 = .{0} ** 16,
     current_lba: u64,
     backup_lba: u64,
     first_usable_lba: u64,
@@ -45,6 +46,9 @@ pub const PartitionType = enum {
 };
 
 pub const Partition = struct {
+    type_guid: [16]u8 = .{0} ** 16,
+    unique_guid: [16]u8 = .{0} ** 16,
+    name_utf16: [36]u16 = .{0} ** 36,
     partition_type: PartitionType,
     first_lba: u64,
     last_lba: u64,
@@ -111,6 +115,7 @@ pub fn parseHeader(sector: []const u8, header_lba: u64, device_sector_count: u64
     }
 
     const header = Header{
+        .disk_guid = sector[56..72].*,
         .current_lba = current_lba,
         .backup_lba = backup_lba,
         .first_usable_lba = first_usable_lba,
@@ -158,7 +163,12 @@ pub fn parsePartition(raw: []const u8, header: Header) ParseError!?Partition {
         return error.BadPartitionRange;
     }
 
+    var name: [36]u16 = undefined;
+    for (&name, 0..) |*unit, i| unit.* = std.mem.readInt(u16, raw[56 + i * 2 ..][0..2], .little);
     return .{
+        .type_guid = raw[0..16].*,
+        .unique_guid = raw[16..32].*,
+        .name_utf16 = name,
         .partition_type = classifyType(type_guid),
         .first_lba = first_lba,
         .last_lba = last_lba,
