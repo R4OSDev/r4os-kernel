@@ -1990,7 +1990,9 @@ fn findEntryInClusterStatus(volume: Volume, cluster: u32, name: []const u8, out:
                 continue;
             }
             if ((entry[11] & ATTR_LONG_NAME) == ATTR_LONG_NAME) return .io;
-            if (entry[0] == '.') {
+            // Volume labels share the short-entry layout but never name a
+            // file. In particular, label BOOT must not shadow directory boot.
+            if (entry[0] == '.' or (entry[11] & 0x08) != 0) {
                 if (lfn_state.active) return .io;
                 continue;
             }
@@ -2063,7 +2065,7 @@ fn findEntryLocationStatus(volume: Volume, start_cluster: u32, name: []const u8,
                     continue;
                 }
                 if ((raw[11] & ATTR_LONG_NAME) == ATTR_LONG_NAME) return .io;
-                if (raw[0] == '.') {
+                if (raw[0] == '.' or (raw[11] & 0x08) != 0) {
                     if (lfn_state.active) return .io;
                     continue;
                 }
@@ -2119,6 +2121,10 @@ fn listDirectorySectorRange(volume: Volume, cluster: u32, printed: *usize, max_e
                 readLfnEntry(entry, &lfn, &lfn_len);
                 continue;
             }
+            if ((entry[11] & 0x08) != 0) {
+                lfn_len = 0;
+                continue;
+            }
 
             const parsed = makeEntry(entry, &lfn, lfn_len);
             lfn_len = 0;
@@ -2155,7 +2161,7 @@ fn readDirectorySectorRange(volume: Volume, cluster: u32, out: []u8, cursor: *us
                 readLfnEntry(raw, &lfn, &lfn_len);
                 continue;
             }
-            if (raw[0] == '.') {
+            if (raw[0] == '.' or (raw[11] & 0x08) != 0) {
                 lfn_len = 0;
                 continue;
             }
@@ -2202,7 +2208,7 @@ fn readDirectoryEntrySectorRangeStatus(
                 readLfnEntry(raw, &lfn, &lfn_len);
                 continue;
             }
-            if (raw[0] == '.') {
+            if (raw[0] == '.' or (raw[11] & 0x08) != 0) {
                 lfn_len = 0;
                 continue;
             }

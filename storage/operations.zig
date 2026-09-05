@@ -55,6 +55,20 @@ var records: [core.max_devices]Record = .{Record{}} ** core.max_devices;
 var operations: [core.max_claims]Operation = .{Operation{}} ** core.max_claims;
 var scan_scratch: table.Table = .{};
 var cleanup_started = false;
+var recovery_cache_device: ?access.DeviceRef = null;
+
+/// Boot-only registration after Recovery resolved its real Limine source
+/// and mounted C: from RAM and R: from that physical device. It reserves a
+/// device incarnation, not old GPT IDs, for explicit post-install remount.
+pub fn reserveRecoveryCacheBoot(index: usize) bool {
+    if (recovery_cache_device != null) return false;
+    const runtime = drive.get('C') orelse return false;
+    const cache_drive = drive.get('R') orelse return false;
+    if (runtime.role != .ram or cache_drive.block_device_index != index or cache_drive.kind != .fat32) return false;
+    const identity = block.identity(index) orelse return false;
+    recovery_cache_device = identity.reference;
+    return true;
+}
 
 fn enter() bool {
     return gate.enter(2000);
@@ -521,7 +535,12 @@ pub fn mount(target: *const api.StorageTarget, letter_arg: u32, out: *api.Storag
         letter = 'D';
         while (letter <= 'Z' and (letter == 'R' or drive.get(@intCast(letter)) != null)) : (letter += 1) {}
     }
-    if (letter < 'D' or letter > 'Z' or letter == 'R') return api.storage_error_protected;
+    if (letter < 'D' or letter > 'Z') return api.storage_error_protected;
+    if (letter == 'R') {
+        const reserved = recovery_cache_device orelse return api.storage_error_protected;
+        const runtime = drive.get('C') orelse return api.storage_error_protected;
+        if (!std.meta.eql(reserved, region.device) or runtime.role != .ram) return api.storage_error_protected;
+    }
     if (drive.get(@intCast(letter)) != null) return api.storage_error_busy;
     for (0..core.max_mounts) |i| {
         const ref = access.mountReference(@intCast(i)) orelse continue;
@@ -536,6 +555,7 @@ pub fn mount(target: *const api.StorageTarget, letter_arg: u32, out: *api.Storag
     }
     const record = &records[region.device.slot];
     for (record.layout.items(), 0..) |part, i| if (part.number == target.partition_number) {
+        if (letter == 'R' and record.hints[i] != api.storage_filesystem_fat32) return api.storage_error_protected;
         const ref = publishMount(record, i, @intCast(letter), .none, span(&record.identity.name)) catch |err| {
             record.errors[i] = code(err);
             record.last_error = code(err);
