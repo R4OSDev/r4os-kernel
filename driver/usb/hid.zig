@@ -143,9 +143,21 @@ var boot_r4p_mouse: u64 = 0;
 var boot_dispatch_failures: u64 = 0;
 var boot_last_result: i32 = 0;
 
+pub const Options = struct {
+    bind_mouse: bool = true,
+};
+var options: Options = .{};
+
 pub fn init() bool {
+    return initWithOptions(.{});
+}
+
+// Boot environments choose their admitted input classes once. Topology
+// reconciliation keeps the same choice when devices appear later.
+pub fn initWithOptions(selected: Options) bool {
     if (!xhci.acquireControllerOwnership()) return false;
     defer xhci.releaseControllerOwnership();
+    options = selected;
     current = .{ .initialized = true, .reason = "no USB HID boot device found" };
     keyboard_binding = .{};
     mouse_binding = .{};
@@ -262,6 +274,7 @@ fn chooseInterruptEndpoint(interrupt_in: u8, first_address: u8, first_attributes
 
 fn handleCandidate(dev: *const usb_core.Device, candidate: HidInterfaceCandidate) void {
     if (candidate.class_code != 0x03) return;
+    if (!options.bind_mouse and candidate.subclass == 0x01 and candidate.protocol == 0x02) return;
     const kind = classifyCandidate(candidate) orelse {
         if (candidate.subclass == 0x01 and !candidateHasInterruptEndpoint(candidate)) {
             current.missing_endpoint_hid += 1;
@@ -285,6 +298,7 @@ fn handleCandidate(dev: *const usb_core.Device, candidate: HidInterfaceCandidate
         return;
     }
     if (kind == .mouse) {
+        if (!options.bind_mouse) return;
         if (mouse_binding.bound) return;
         current.mouse_present = true;
         fillBinding(&mouse_binding, dev, candidate);

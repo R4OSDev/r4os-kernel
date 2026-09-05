@@ -177,23 +177,27 @@ pub fn build(b: *std.Build) void {
     const storage_test_step = b.step("storage-test", "Bounded partition identity and installation boot tests");
     addUnitTest(b, storage_test_step, "storage_boot_tests.zig");
     test_step.dependOn(storage_test_step);
+    const input_test_step = b.step("input-test", "Run the existing bounded input and USB owner tests");
+    for ([_][]const u8{
+        "input_controller_tests.zig",
+        "driver/input/codepoint_queue.zig",
+        "driver/input/key_layout.zig",
+        "driver/input/hid_set1.zig",
+        "usb_host_controller_tests.zig",
+        "driver/usb/xhci_event_router.zig",
+    }) |path| addUnitTest(b, input_test_step, path);
+    test_step.dependOn(input_test_step);
     test_step.dependOn(&kernel.step);
     const unit_tests = [_][]const u8{
         "display/console_scroll_buffer.zig",
         "display/framebuffer.zig",
-        "input_controller_tests.zig",
         "audio/backend_contract.zig",
         "audio/mixer.zig",
-        "driver/input/codepoint_queue.zig",
-        "driver/input/key_layout.zig",
-        "driver/input/hid_set1.zig",
         "driver/usb/usb_boot_timing.zig",
         "driver/usb/usb_msc_retry.zig",
-        "usb_host_controller_tests.zig",
         "driver/usb/xhci_bulk_completion.zig",
         "driver/usb/xhci_endpoint_context.zig",
         "driver/usb/xhci_endpoint_recovery.zig",
-        "driver/usb/xhci_event_router.zig",
         "driver/usb/xhci_ring_cycle.zig",
         "driver/usb/xhci_trb_chain.zig",
         "driver/usb/xhci_transfer_pool.zig",

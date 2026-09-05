@@ -594,3 +594,16 @@ Build.sh storage-test beziehungsweise Build.bat storage-test fuehrt die
 begrenzten Besitzerpruefungen fuer GUIDs, beide GPT-Kopien, fremdes MBR,
 Installationsbeschreibung, CURRENT/PREVIOUS und Medienregeln aus. Dieser
 Step ist auch Bestandteil des regulaeren Kernel-test-Steps.
+
+Recovery-Tastatureingabe (0.76.5)
+--------------------------------
+
+Der USB-HID-Besitzer stellt initWithOptions bereit. bind_mouse=false nimmt
+nur Boot-Tastaturen auf und gilt auch fuer spaetere Topologieabgleiche.
+init() behaelt fuer normales R4OS die bisherige Tastatur-/Mausaufnahme.
+Recovery verwendet die vorhandenen PS/2-IRQ-, Scancode-, Unicode- und
+Layoutbesitzer sowie unveraenderte USBHID-/HIDREPORT-Protokollmodule.
+USB-Speichersichtbarkeit und HID-Bindung sind voneinander unabhaengig.
+Der Build-Step input-test buendelt die schon vorhandenen begrenzten
+Controller-, Queue-, Layout-, HID-Set1-, USB-Host- und Eventroutertests;
+der volle test-Step fuehrt diese Tests weiterhin genau einmal aus.
