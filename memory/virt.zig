@@ -599,6 +599,63 @@ pub fn commit(id: u32, offset: u64, len_raw: u64) Error!void {
     blocks.setCommitted(range.block_id, range.committed_bytes) catch |err| return convertBlockError(err);
 }
 
+// Bounded physical preparation for callers which must survive loss of their
+// backing disk. The VM owner covers metadata, mapping and zeroing, never I/O
+// or reclaim. Pinning is part of the same operation, so no page can be evicted
+// between preparation and the caller's destructive operation.
+// On rollback failure the normal partial-uncommit state retains mappings and
+// frames until a later release obtains the required TLB acknowledgements.
+pub fn commitResident(id: u32, offset: u64, len_raw: u64) Error!void {
+    const irq_flags = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(irq_flags);
+    if (!initialized) return Error.NotInitialized;
+    const len = try normalizeLen(len_raw);
+    if (len > 64 * paging.PAGE_SIZE) return Error.OutsideWindow;
+    if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
+    const idx = indexById(id) orelse return Error.NotFound;
+    const range = &ranges[idx];
+    if (range.window != .r4x_vm or range.kind != .virtual_range) return Error.OutsideWindow;
+    if (range.partial_uncommit_len != 0) return Error.NotCommitted;
+    try validateInside(range.*, offset, len);
+    const start = range.base + offset;
+    try validateNotGuard(range.*, start, len);
+    try validateUncommitted(range.*, start, len);
+    const pages = len / paging.PAGE_SIZE;
+    if (!canCommitPages(range.*, pages)) return Error.OutOfMemory;
+    const next_committed = checkedAdd(range.committed_bytes, len) orelse return Error.Overflow;
+    try addCommitSpan(id, start, len);
+    addPageStateSpan(id, offset / paging.PAGE_SIZE, pages, page_state_flag_committed | page_state_flag_pinned, 0, 0, 0) catch |err| {
+        removeCommitSpan(id, start, len) catch {};
+        return err;
+    };
+    range.committed_bytes = next_committed;
+    range.status = .committed;
+    errdefer {
+        publishPartialUncommit(range, start, len, true);
+        if (uncommitSpan(range, start, len, false)) |_| {
+            clearPartialUncommit(range);
+        } else |_| {}
+        range.status = if (range.committed_bytes == 0) .reserved else .committed;
+        blocks.setCommitted(range.block_id, range.committed_bytes) catch {};
+    }
+    var done: u64 = 0;
+    while (done < pages) {
+        const virt = start + done * paging.PAGE_SIZE;
+        const extent = try allocClaimedExtent(range.*, pages - done, .vm_commit);
+        if (!paging.mapContiguousPages(virt, extent.base, extent.count, range.flags)) {
+            releaseClaimedExtent(extent);
+            return Error.MapFailed;
+        }
+        const extent_bytes = extent.count * paging.PAGE_SIZE;
+        const memory: [*]u8 = @ptrFromInt(virt);
+        @memset(memory[0..@intCast(extent_bytes)], 0);
+        recordResident(range, extent_bytes);
+        done += extent.count;
+    }
+    try pageStateSet(id, offset / paging.PAGE_SIZE, pages, page_state_flag_resident, 0, null, true);
+    blocks.setCommitted(range.block_id, range.committed_bytes) catch |err| return convertBlockError(err);
+}
+
 fn allocClaimedExtent(range: Range, requested_pages: u64, reclaim_reason: reclaim.Reason) Error!phys.FrameExtent {
     const wanted = page_batch.boundedPageCount(requested_pages);
     if (wanted == 0) return Error.OutOfMemory;
@@ -1268,11 +1325,26 @@ fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) 
         range.partial_uncommit_cursor
     else
         start;
-    while (virt < end) : (virt += paging.PAGE_SIZE) {
-        if (paging.isMapped(virt)) {
-            try uncommitPage(range, virt, false);
+    while (virt < end) {
+        const frame = paging.mappedFrame(virt) orelse {
+            virt += paging.PAGE_SIZE;
+            advancePartialUncommitCursor(range, virt);
+            continue;
+        };
+        // Eager resident buffers commonly contain contiguous extents. Use
+        // the same bounded, acknowledged unmap as other VM, retaining both
+        // PTEs and frames if invalidation fails. Sparse holes remain valid.
+        const max_pages = page_batch.boundedPageCount((end - virt) / paging.PAGE_SIZE);
+        const claimed_pages = blocks.claimedPhysicalPrefix(frame, max_pages * paging.PAGE_SIZE) / paging.PAGE_SIZE;
+        if (claimed_pages == 0) return Error.NotCommitted;
+        var run_pages: u64 = 1;
+        while (run_pages < claimed_pages) : (run_pages += 1) {
+            const next = paging.mappedFrame(virt + run_pages * paging.PAGE_SIZE) orelse break;
+            if (next != frame + run_pages * paging.PAGE_SIZE) break;
         }
-        advancePartialUncommitCursor(range, virt + paging.PAGE_SIZE);
+        try uncommitExtent(range, virt, .{ .base = frame, .count = run_pages }, false);
+        virt += run_pages * paging.PAGE_SIZE;
+        advancePartialUncommitCursor(range, virt);
     }
 
     try removeCommitSpanReserved(range.id, start, len, &commit_split);

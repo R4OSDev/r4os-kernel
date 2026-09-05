@@ -12518,14 +12518,20 @@ fn apiVmReserve(size: u64, alignment_raw: u64, flags: u64, out: *ProgramVmRegion
 }
 
 fn apiVmCommit(region_id: u32, offset: u64, len: u64, flags: u64) callconv(.c) i32 {
-    if (flags != 0) return VM_ERROR_UNSUPPORTED_FLAGS;
+    if (flags != 0 and flags != r4x_api.vm_commit_flag_resident) return VM_ERROR_UNSUPPORTED_FLAGS;
     const lookup = lookupCurrentVmRegion(region_id);
     if (lookup.code != VM_OK) return lookup.code;
     const commit_len = pageAlignU64(len) orelse return VM_ERROR_INVALID_RANGE;
     const instance = currentInstance() orelse return VM_ERROR_NO_INSTANCE;
     if (!vmCommitWithinProfile(instance, commit_len)) return VM_ERROR_LIMIT_EXCEEDED;
     if (!systemCommitLimitAllows(commit_len)) return VM_ERROR_LIMIT_EXCEEDED;
-    mem_virt.commit(region_id, offset, len) catch |err| return vmErrorCode(err);
+    if (flags == r4x_api.vm_commit_flag_resident) {
+        if (commit_len > r4x_api.vm_commit_resident_max_bytes) return VM_ERROR_INVALID_RANGE;
+        if (!vmResidentWithinProfile(instance, commit_len)) return VM_ERROR_LIMIT_EXCEEDED;
+        mem_virt.commitResident(region_id, offset, len) catch |err| return vmErrorCode(err);
+    } else {
+        mem_virt.commit(region_id, offset, len) catch |err| return vmErrorCode(err);
+    }
     return VM_OK;
 }
 
