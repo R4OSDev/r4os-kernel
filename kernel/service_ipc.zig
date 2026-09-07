@@ -87,6 +87,7 @@ const Channel = struct {
     drops: u64 = 0,
     service_name: []const u8 = "",
     handler: ?ServiceHandler = null,
+    handler_owner: u32 = 0,
     queue: [QUEUE_DEPTH]Message = .{Message{}} ** QUEUE_DEPTH,
     lifetime: Lifetime = .{},
 };
@@ -197,12 +198,18 @@ const WorkerTarget = struct {
 var initialized = false;
 var worker_started = false;
 var worker_task_id: u32 = 0;
-var worker_cursor: usize = 0;
-var worker_event = sync.EventV2.initMode(false, .auto_reset);
-// Genau ein ipc-worker bearbeitet Handlerziele. Sein Antwortpuffer bleibt
-// deshalb worker-eigen, muss aber nicht bei jeder tiefen Netzantwort 4 KB des
-// begrenzten Kernel-Task-Stacks belegen.
-var worker_response: [MAX_MESSAGE_SIZE]u8 = undefined;
+// Echo, DHCP, DNS, TCP and UDP each have an independent BSP worker. Further
+// channels share these five bounded lanes; each channel still has exactly
+// one serial handler owner. A waiting network operation cannot consume the
+// worker of a different network channel.
+const WORKER_COUNT = 5;
+const Worker = struct {
+    task_id: u32 = 0,
+    cursor: usize = 0,
+    event: sync.EventV2 = sync.EventV2.initMode(false, .auto_reset),
+    response: [MAX_MESSAGE_SIZE]u8 = undefined,
+};
+var workers: [WORKER_COUNT]Worker = .{Worker{}} ** WORKER_COUNT;
 var channels: [MAX_CHANNELS]Channel = .{Channel{}} ** MAX_CHANNELS;
 var total_sends: u64 = 0;
 var total_receives: u64 = 0;
@@ -221,8 +228,13 @@ pub fn init() void {
 
 pub fn startRuntimeWorker() bool {
     if (worker_started) return true;
-    const worker = sched_task.createKernelThreadWithRole("ipc-worker", workerMain, .short_completion) orelse return false;
-    worker_task_id = worker.id;
+    for (&workers) |*lane| {
+        if (lane.task_id != 0) continue;
+        const worker = sched_task.createKernelWorkerBlockedWithRole("ipc-worker", workerMain, .short_completion) orelse return false;
+        lane.task_id = worker.id;
+        sched_task.markReady(worker, timer.tickCount());
+    }
+    worker_task_id = workers[0].task_id;
     worker_started = true;
     return true;
 }
@@ -533,7 +545,7 @@ fn submitHandler(
     defer {
         if (admission.unwind.active) _ = task_context.leaveUnwind(admission.unwind);
     }
-    worker_event.signal();
+    workers[admission.target.channel_index % WORKER_COUNT].event.signal();
 
     const wait_ticks = remainingTicks(admission.target.deadline, admission.target.forever);
     const wait_result = admission.target.completion.wait(wait_ticks);
@@ -771,6 +783,15 @@ fn invokeHandlerDirect(channel_id: u32, payload: []const u8, response: []u8, cou
         unlockChannel(&guard);
         return fail();
     };
+    const caller = scheduler.currentId() orelse 0;
+    const previous_owner = ch.handler_owner;
+    // Nested calls retain the old direct path, but must never reenter a
+    // singleton handler currently suspended on another worker.
+    if (previous_owner != 0 and previous_owner != caller) {
+        unlockChannel(&guard);
+        return fail();
+    }
+    ch.handler_owner = caller;
     const generation = ch.generation;
     ch.lifetime.handler_direct +%= 1;
     ch.lifetime.handler_started +%= 1;
@@ -784,6 +805,7 @@ fn invokeHandlerDirect(channel_id: u32, payload: []const u8, response: []u8, cou
 
     guard = lockChannel(&channels[idx]) orelse return fail();
     const result_ch = guard.channel;
+    result_ch.handler_owner = previous_owner;
     result_ch.lifetime.handler_completed +%= 1;
     noteDuration(&result_ch.lifetime, started, completed, .run);
     noteDuration(&result_ch.lifetime, started, completed, .e2e);
@@ -794,27 +816,35 @@ fn invokeHandlerDirect(channel_id: u32, payload: []const u8, response: []u8, cou
         result_ch.lifetime.handler_failures +%= 1;
     }
     unlockChannel(&guard);
+    if (previous_owner == 0) workers[idx % WORKER_COUNT].event.signal();
     return if (valid) produced else fail();
 }
 
 fn workerMain() callconv(.c) void {
+    const worker = currentWorker() orelse return;
     while (true) {
-        if (takeNextWorkerTarget()) |target| {
-            runWorkerTarget(target);
+        if (takeNextWorkerTarget(worker)) |target| {
+            runWorkerTarget(worker, target);
             continue;
         }
         atomicAdd(&worker_idle_waits, 1);
-        const result = worker_event.waitResult(WAIT_FOREVER);
+        const result = worker.event.waitResult(WAIT_FOREVER);
         if (result == .signaled) atomicAdd(&worker_wakes, 1);
     }
 }
 
-fn takeNextWorkerTarget() ?WorkerTarget {
+fn takeNextWorkerTarget(worker: *Worker) ?WorkerTarget {
+    const lane = (@intFromPtr(worker) - @intFromPtr(&workers[0])) / @sizeOf(Worker);
     var offset: usize = 0;
     while (offset < channels.len) : (offset += 1) {
-        const idx = (worker_cursor + offset) % channels.len;
+        const idx = (worker.cursor + offset) % channels.len;
+        if (idx % WORKER_COUNT != lane) continue;
         var guard = lockChannel(&channels[idx]) orelse continue;
         const ch = guard.channel;
+        if (ch.handler_owner != 0) {
+            unlockChannel(&guard);
+            continue;
+        }
         const selection = queue_model.oldestQueued(&ch.queue) orelse {
             unlockChannel(&guard);
             continue;
@@ -832,7 +862,8 @@ fn takeNextWorkerTarget() ?WorkerTarget {
         slot.started_at = monotonic.capture();
         ch.lifetime.handler_started +%= 1;
         noteDuration(&ch.lifetime, slot.submitted_at, slot.started_at, .queue);
-        worker_cursor = (idx + 1) % channels.len;
+        worker.cursor = (idx + 1) % channels.len;
+        ch.handler_owner = worker.task_id;
         const target = WorkerTarget{
             .channel_index = idx,
             .channel_generation = slot.channel_generation,
@@ -846,18 +877,19 @@ fn takeNextWorkerTarget() ?WorkerTarget {
     return null;
 }
 
-fn runWorkerTarget(target: WorkerTarget) void {
+fn runWorkerTarget(worker: *Worker, target: WorkerTarget) void {
     const message = &channels[target.channel_index].queue[target.slot_index];
     const request_len: usize = @intCast(message.meta.len);
     const produced = target.handler(
         channels[target.channel_index].id,
         message.data[0..request_len],
-        worker_response[0..],
+        worker.response[0..],
     );
     const completed_at = monotonic.capture();
 
     var guard = lockChannel(&channels[target.channel_index]) orelse return;
     const ch = guard.channel;
+    ch.handler_owner = 0;
     const slot = &ch.queue[target.slot_index];
     if (!queue_model.matches(slot.meta, target.slot_generation, .handler_running)) {
         ch.lifetime.stale_drops +%= 1;
@@ -874,7 +906,7 @@ fn runWorkerTarget(target: WorkerTarget) void {
     if (valid) {
         const len: usize = @intCast(produced);
         if (len != 0) {
-            @memcpy(slot.data[0..len], worker_response[0..len]);
+            @memcpy(slot.data[0..len], worker.response[0..len]);
             ch.lifetime.payload_copy_bytes +%= len;
         }
         slot.meta.len = @intCast(len);
@@ -1004,8 +1036,15 @@ fn remainingTicks(deadline: u64, forever: bool) u64 {
 }
 
 fn currentIsWorker() bool {
-    const current = scheduler.current() orelse return false;
-    return worker_started and current.id == worker_task_id;
+    return currentWorker() != null;
+}
+
+fn currentWorker() ?*Worker {
+    const current = scheduler.current() orelse return null;
+    for (&workers) |*worker| {
+        if (worker.task_id == current.id) return worker;
+    }
+    return null;
 }
 
 fn denyIrq() bool {

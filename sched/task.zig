@@ -1950,7 +1950,8 @@ pub fn removeDispatchDonation(t: *Task, rank: u8) bool {
 
 // Binding is only accepted before a task can execute. The owner object must
 // outlive the task; R4X retirement already releases the Task before freeing
-// ProgramThread or AsyncIoRequest storage.
+// ProgramThread storage. Async I/O instead binds a permanent pool worker;
+// that worker detaches its current request before publishing completion.
 pub fn bindExecutionOwner(t: *Task, kind: ExecutionOwnerKind, context: *anyopaque) bool {
     if (kind == .none) return false;
     const irq_flags = interrupts.saveAndDisableRuntime();
