@@ -12938,6 +12938,9 @@ fn apiProgramHandleRequestClose(handle_ptr: *const ProgramProcessHandle) callcon
     }
     unlockProgramRegistry();
     signalConsoleInputForHandle(handle);
+    // GUI event loops can wait indefinitely without a console payload.
+    // Publish the close flag before waking their shared activity queue.
+    desktop_events.signal();
     requestConsoleClientsClose(handle);
     return PROGRAM_HANDLE_OK;
 }
