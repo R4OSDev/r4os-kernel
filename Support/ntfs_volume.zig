@@ -23,7 +23,10 @@
 // allocated (valid NTFS); their space returns when the directory shrinks
 // structurally or is removed.
 
-const ntfs = @import("ntfs_format");
+// Callers already using the SDK namespace pass its shared format type.
+// Standalone kernel/host owners keep their existing named format module.
+const format_provider = @import("ntfs_format");
+const ntfs = if (@hasDecl(format_provider, "shared_format")) format_provider.shared_format else format_provider;
 const work_counters_enabled = @import("builtin").is_test or
     (@hasDecl(@import("root"), "ntfs_work_counters") and @import("root").ntfs_work_counters);
 
@@ -1016,8 +1019,20 @@ pub const MetadataCache = struct {
     access_clock: u64 = 0,
     reclaim_cursor: usize = 0,
     counters: MetadataCacheSummary = .{},
+    free_cluster_count: ?u64 = null,
+    free_cluster_total: u64 = 0,
+
+    fn freeClustersFor(self: *const MetadataCache, total: u64) ?u64 {
+        return if (self.free_cluster_total == total) self.free_cluster_count else null;
+    }
+
+    fn storeFreeClusters(self: *MetadataCache, total: u64, free: u64) void {
+        self.free_cluster_total = total;
+        self.free_cluster_count = if (free <= total) free else null;
+    }
 
     pub fn beginMount(self: *MetadataCache, negative_ttl_ticks: u64) void {
+        self.free_cluster_count = null;
         const invalidated = self.clearEntries();
         self.mount_generation = nextGeneration(self.mount_generation);
         self.generation = nextGeneration(self.generation);
@@ -1027,6 +1042,7 @@ pub const MetadataCache = struct {
     }
 
     pub fn invalidateExternal(self: *MetadataCache) void {
+        self.free_cluster_count = null;
         const invalidated = self.clearEntries();
         self.generation = nextGeneration(self.generation);
         self.counters.external_invalidations +%= 1;
@@ -1039,11 +1055,13 @@ pub const MetadataCache = struct {
                 self.counters.payload_write_retentions +%= 1;
             },
             .record => |number| {
+                if (number == ntfs.MFT_RECORD_BITMAP) self.free_cluster_count = null;
                 self.counters.targeted_invalidations +%= 1;
                 self.counters.targeted_record_invalidations +%= 1;
                 self.noteMutationInvalidation(self.clearRecordDependencies(number), false);
             },
             .attribute => |identity| {
+                if (identity.record_number == ntfs.MFT_RECORD_BITMAP) self.free_cluster_count = null;
                 self.counters.targeted_invalidations +%= 1;
                 self.counters.targeted_attribute_invalidations +%= 1;
                 self.noteMutationInvalidation(self.clearAttributeDependencies(identity.record_number, identity.attr_type), false);
@@ -1057,10 +1075,12 @@ pub const MetadataCache = struct {
                 self.counters.system_write_retentions +%= 1;
             },
             .unknown => {
+                self.free_cluster_count = null;
                 self.counters.global_mutation_invalidations +%= 1;
                 self.noteMutationInvalidation(self.clearEntriesCounted(), true);
             },
             .recovery => {
+                self.free_cluster_count = null;
                 self.counters.global_mutation_invalidations +%= 1;
                 self.counters.recovery_invalidations +%= 1;
                 self.noteMutationInvalidation(self.clearEntriesCounted(), true);
@@ -2307,16 +2327,29 @@ fn setBitmapRange(v: *const Volume, bitmap_attr: *const AttrScratch, lcn: u64, c
         const sector_index = (cluster / 8) / SECTOR_SIZE;
         const bitmap_offset = sectorByteOffset(sector_index) orelse return false;
         if (!readRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..])) return false;
+        var changed: u64 = 0;
         while (cluster < end and (cluster / 8) / SECTOR_SIZE == sector_index) : (cluster += 1) {
             const byte_index: usize = @intCast((cluster / 8) % SECTOR_SIZE);
             const mask = @as(u8, 1) << @intCast(cluster % 8);
+            if (((sector_buf[byte_index] & mask) != 0) != set) changed += 1;
             if (set) {
                 sector_buf[byte_index] |= mask;
             } else {
                 sector_buf[byte_index] &= ~mask;
             }
         }
+        const previous_free = if (v.metadata_cache) |cache| cache.freeClustersFor(total_clusters) else null;
         if (!writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..], .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_BITMAP, .attr_type = .data } })) return false;
+        // The classified write invalidates the old value before I/O. Only a
+        // confirmed write may publish its exact bit delta; ambiguous failures
+        // and their recovery paths leave the count invalid for a fresh scan.
+        if (previous_free) |free| {
+            if (set) {
+                if (changed <= free) v.metadata_cache.?.storeFreeClusters(total_clusters, free - changed);
+            } else if (changed <= total_clusters - free) {
+                v.metadata_cache.?.storeFreeClusters(total_clusters, free + changed);
+            }
+        }
     }
     return true;
 }
@@ -6380,8 +6413,14 @@ pub fn writeFileAt(v: *const Volume, record_number: u64, offset: u64, data: []co
     const overlaps_hole = rangeOverlapsHole(v, attr.runs[0..attr.count], offset, data_len) orelse return .io;
     const needs_metadata = is_sparse and
         (overlaps_hole or write_end > attr.initialized_size);
+    // A direct write to $Bitmap is metadata even through the ordinary file
+    // interface; its bit delta is unknown to the cluster allocator.
+    const mutation: MetadataMutation = if (record_number == ntfs.MFT_RECORD_BITMAP)
+        .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_BITMAP, .attr_type = .data } }
+    else
+        .payload;
     if (!needs_metadata) {
-        if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data, .payload)) return .io;
+        if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data, mutation)) return .io;
         // Pure data writes stay lazy: no metadata changed, the page-cache
         // writeback worker drains the dirty pages.  A device flush per random
         // write made the pager/tooling paths measurably too slow.
@@ -6398,7 +6437,7 @@ pub fn writeFileAt(v: *const Volume, record_number: u64, offset: u64, data: []co
     if (offset > attr.initialized_size) {
         if (!zeroMappedRange(v, attr.runs[0..attr.count], attr.initialized_size, offset)) return .io;
     }
-    if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data, .payload)) return .io;
+    if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data, mutation)) return .io;
     if (!budgetedFlush(v)) return .io;
     const new_init = if (write_end > attr.initialized_size) write_end else attr.initialized_size;
     const commit = commitDataRunlist(v, record_number, attr.runs[0..attr.count], attr.data_size, new_init, attr.alloc_size);
@@ -6408,25 +6447,44 @@ pub fn writeFileAt(v: *const Volume, record_number: u64, offset: u64, data: []co
     return .ok;
 }
 
-/// Counts free clusters by scanning $Bitmap (used for free-space display).
+/// Exact mount-owned free-space count. The first query reads $Bitmap in
+/// bounded blocks; classified allocation writes maintain the result, while
+/// remount, raw metadata changes and uncertain writes force a new scan.
 pub fn freeClusterCount(v: *const Volume) ?u64 {
+    const total = v.totalClusters();
+    if (v.metadata_cache) |cache| if (cache.freeClustersFor(total)) |free| return free;
     const bitmap_attr = &v.scratch.attr_cluster;
     if (!collectAttribute(v, ntfs.MFT_RECORD_BITMAP, .data, &[_]u8{}, bitmap_attr)) return null;
     if (bitmap_attr.resident) return null;
-    const total = v.totalClusters();
+    const bitmap_bytes = total / 8 + @intFromBool(total % 8 != 0);
+    if (bitmap_bytes > bitmap_attr.data_size or bitmap_bytes > bitmap_attr.initialized_size) return null;
+    // $Bitmap is read directly, without decompression. Reuse the volume-owned
+    // scratch instead of adding a large kernel stack buffer or allocation.
+    const buffer = v.scratch.comp_in[0..];
     var free: u64 = 0;
-    var sector_buf: [SECTOR_SIZE]u8 = undefined;
     var cluster: u64 = 0;
     while (cluster < total) {
-        const sector_index = (cluster / 8) / SECTOR_SIZE;
-        const bitmap_offset = sectorByteOffset(sector_index) orelse return null;
-        if (!readRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..])) return null;
-        while (cluster < total and (cluster / 8) / SECTOR_SIZE == sector_index) : (cluster += 1) {
-            const bit = (sector_buf[@intCast((cluster / 8) % SECTOR_SIZE)] >> @intCast(cluster % 8)) & 1;
-            if (bit == 0) free += 1;
-        }
+        const bits = @min(total - cluster, buffer.len * 8);
+        const bytes: usize = @intCast(bits / 8 + @intFromBool(bits % 8 != 0));
+        if (!readRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], cluster / 8, buffer[0..bytes])) return null;
+        free += countFreeBitmapBits(buffer[0..bytes], bits);
+        cluster += bits;
     }
+    if (v.metadata_cache) |cache| cache.storeFreeClusters(total, free);
     return free;
+}
+
+fn countFreeBitmapBits(bytes: []const u8, bits: u64) u64 {
+    const full_bytes: usize = @intCast(bits / 8);
+    var used: u64 = 0;
+    var index: usize = 0;
+    while (full_bytes - index >= 8) : (index += 8) {
+        used += @popCount(@as(u64, @bitCast(bytes[index..][0..8].*)));
+    }
+    while (index < full_bytes) : (index += 1) used += @popCount(bytes[index]);
+    const tail: u3 = @intCast(bits % 8);
+    if (tail != 0) used += @popCount(bytes[full_bytes] & ((@as(u8, 1) << tail) - 1));
+    return bits - used;
 }
 
 /// Test seams for host models that need raw record access (synthetic
@@ -6515,6 +6573,115 @@ pub fn abortWriteForTest(v: *const Volume, status: WriteStatus) WriteStatus {
 
 pub fn abortWriteFreeingForTest(v: *const Volume, runs: []const ntfs.Run, status: WriteStatus) WriteStatus {
     return abortWriteFreeing(v, runs, status);
+}
+
+test "free-space count caches exact bitmap deltas and discards uncertain state" {
+    const std = @import("std");
+    const testing = std.testing;
+    const Memory = struct {
+        bytes: [1024]u8 = .{0} ** 1024,
+        reads: u32 = 0,
+        fail_read: bool = false,
+        fail_write: bool = false,
+        fn read(ctx: *anyopaque, lba: u64, count: u32, out: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.reads += 1;
+            if (self.fail_read or lba < 1 or lba - 1 + count > 2) return false;
+            @memcpy(out, self.bytes[@intCast((lba - 1) * 512)..][0..out.len]);
+            return true;
+        }
+        fn write(ctx: *anyopaque, lba: u64, count: u32, data: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (lba < 1 or lba - 1 + count > 2) return false;
+            @memcpy(self.bytes[@intCast((lba - 1) * 512)..][0..data.len], data);
+            return !self.fail_write; // failure may follow an actual media write
+        }
+        fn flush(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var memory = Memory{};
+    memory.bytes[0] = 0x85; // three allocated clusters
+    memory.bytes[512] = 0xfd; // one free of the final three valid bits
+    const scratch = try testing.allocator.create(Scratch);
+    defer testing.allocator.destroy(scratch);
+    scratch.* = .{};
+    const cache = try testing.allocator.create(MetadataCache);
+    defer testing.allocator.destroy(cache);
+    cache.* = .{};
+    var run_count: usize = 0;
+    var v = Volume{
+        .device = .{ .ctx = &memory, .read_sectors = Memory.read, .write_sectors = Memory.write, .flush = Memory.flush },
+        .partition_lba = 0,
+        .cluster_bytes = 512,
+        .record_bytes = 1024,
+        .index_block_bytes = 4096,
+        .total_sectors = 4099,
+        .mft_runs_buf = &.{},
+        .mft_run_count = &run_count,
+        .upcase = &.{},
+        .scratch = scratch,
+        .metadata_cache = cache,
+    };
+    var attr = AttrScratch{ .count = 1, .data_size = 513, .initialized_size = 513, .alloc_size = 1024 };
+    attr.runs[0] = .{ .lcn = 1, .length_clusters = 2 };
+    cache.storeAttribute(ntfs.MFT_RECORD_BITMAP, .data, &.{}, &attr);
+    try testing.expectEqual(@as(?u64, 4094), freeClusterCount(&v));
+    const reads = memory.reads;
+    try testing.expectEqual(@as(?u64, 4094), freeClusterCount(&v));
+    try testing.expectEqual(reads, memory.reads);
+
+    try testing.expectEqual(WriteStatus.ok, writeFileAt(&v, ntfs.MFT_RECORD_BITMAP, 0, &.{0}));
+    try testing.expectEqual(@as(?u64, null), cache.freeClustersFor(4099));
+    cache.storeAttribute(ntfs.MFT_RECORD_BITMAP, .data, &.{}, &attr);
+    try testing.expectEqual(@as(?u64, 4097), freeClusterCount(&v));
+    try testing.expectEqual(WriteStatus.ok, writeFileAt(&v, ntfs.MFT_RECORD_BITMAP, 0, &.{0x85}));
+    cache.storeAttribute(ntfs.MFT_RECORD_BITMAP, .data, &.{}, &attr);
+    try testing.expectEqual(@as(?u64, 4094), freeClusterCount(&v));
+
+    // Includes already-set bits: count actual transitions, not range length.
+    try testing.expect(setBitmapRange(&v, &attr, 0, 10, true));
+    try testing.expectEqual(@as(?u64, 4087), freeClusterCount(&v));
+    try testing.expect(setBitmapRange(&v, &attr, 0, 10, true));
+    try testing.expectEqual(@as(?u64, 4087), freeClusterCount(&v));
+    try testing.expect(setBitmapRange(&v, &attr, 0, 10, false));
+    try testing.expectEqual(@as(?u64, 4097), freeClusterCount(&v));
+    cache.invalidateMutation(.payload);
+    cache.invalidateMutation(.{ .record = 42 });
+    try testing.expectEqual(@as(?u64, 4097), freeClusterCount(&v));
+
+    memory.fail_write = true;
+    try testing.expect(!setBitmapRange(&v, &attr, 4094, 5, true));
+    try testing.expectEqual(@as(?u64, null), cache.freeClustersFor(4099));
+    memory.fail_write = false;
+    cache.storeAttribute(ntfs.MFT_RECORD_BITMAP, .data, &.{}, &attr);
+    memory.fail_read = true;
+    try testing.expectEqual(@as(?u64, null), freeClusterCount(&v));
+    try testing.expectEqual(@as(?u64, null), cache.freeClustersFor(4099));
+    memory.fail_read = false;
+    try testing.expectEqual(@as(?u64, 4095), freeClusterCount(&v));
+
+    cache.invalidateMutation(.{ .record = ntfs.MFT_RECORD_BITMAP });
+    try testing.expectEqual(@as(?u64, null), cache.freeClustersFor(4099));
+    cache.storeAttribute(ntfs.MFT_RECORD_BITMAP, .data, &.{}, &attr);
+    attr.initialized_size = 512;
+    cache.storeAttribute(ntfs.MFT_RECORD_BITMAP, .data, &.{}, &attr);
+    try testing.expectEqual(@as(?u64, null), freeClusterCount(&v));
+    attr.initialized_size = 513;
+    cache.storeAttribute(ntfs.MFT_RECORD_BITMAP, .data, &.{}, &attr);
+    try testing.expectEqual(@as(?u64, 4095), freeClusterCount(&v));
+    v.total_sectors = 4096; // a different geometry cannot reuse the old count
+    try testing.expectEqual(@as(?u64, 4094), freeClusterCount(&v));
+    cache.beginMount(100);
+    try testing.expectEqual(@as(?u64, null), cache.freeClustersFor(4096));
+    cache.storeFreeClusters(4096, 100);
+    cache.invalidateExternal();
+    try testing.expectEqual(@as(?u64, null), cache.freeClustersFor(4096));
+    for ([_]MetadataMutation{ .unknown, .recovery }) |mutation| {
+        cache.storeFreeClusters(4096, 100);
+        cache.invalidateMutation(mutation);
+        try testing.expectEqual(@as(?u64, null), cache.freeClustersFor(4096));
+    }
 }
 
 test "range reads zero only holes and uninitialized tails, preserve short results and errors" {

@@ -33,3 +33,12 @@ Absichtliche Grenzaenderungen:
   die spaetere Distribution entscheidet ueber ihre konkrete Imagebelegung.
 - Caches, `zig-out`, fertige Kernelartefakte und Distributionsausgaben bleiben
   unversioniert.
+
+Besitzerabgleich Kernel 0.1.103 (2026-09-07)
+------------------------------------------
+Support/ntfs_volume.zig uebernimmt den im SDK entwickelten exakten
+Free-Space-Zaehler mit begrenztem Bitmap-Lesen und bestaetigten Bitdeltas.
+Der Quelltext ist bytegleich mit Repositories/SDK/r4os/ntfs_volume.zig;
+der gemeinsame Importvorspann waehlt im Kernel weiterhin ntfs_format.
+Die Quelle bleibt beim SDK; die
+eigenstaendige Recovery wird dadurch nicht automatisch veraendert.
