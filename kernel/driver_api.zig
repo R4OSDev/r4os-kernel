@@ -25,6 +25,7 @@ const storage = @import("../storage/block.zig");
 const timer = @import("timer.zig");
 const usb_host = @import("../driver/usb/host_controller.zig");
 const xhci = @import("../driver/usb/xhci.zig");
+const outputs_contract = @import("r4os_kernel_contract");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
 // Version 24 (0.69.50): append-only um ausgehandelte Netzwerkfaehigkeiten
@@ -63,7 +64,7 @@ const MAX_R4D_NET_NAME: usize = 32;
 const MAX_R4D_STORAGE_BACKENDS: usize = 8;
 const MAX_R4D_STORAGE_NAME: usize = 32;
 const STORAGE_CALLBACK_OWNER_CAPACITY: usize = 8;
-const MAX_R4D_AUDIO_BACKENDS: usize = 4;
+const MAX_R4D_AUDIO_BACKENDS: usize = 8;
 const MAX_R4D_AUDIO_NAME: usize = 32;
 // Eight block backends can each expose the block core's full asynchronous
 // depth. Segment mappings are therefore capacity-matched to 8 * 16 rather
@@ -196,6 +197,16 @@ pub const AudioBackendDescriptor = extern struct {
     shutdown: ?*const fn (?*anyopaque) callconv(.c) i32,
     status: ?audio.StatusCtxFn,
 };
+
+const AudioOutputsDescriptor = extern struct {
+    base: AudioBackendDescriptor,
+    outputs: outputs_contract.AudioOutputExtension,
+};
+
+comptime {
+    if (@sizeOf(AudioBackendDescriptor) != 72 or @offsetOf(AudioOutputsDescriptor, "outputs") != 72 or @sizeOf(AudioOutputsDescriptor) != 96)
+        @compileError("audio output backend prefix drift");
+}
 
 pub const SynthEngineDescriptor = extern struct {
     version: u32,
@@ -1921,10 +1932,22 @@ fn registerAudioOutputBackend(name: [*:0]const u8, backend: *const anyopaque) ca
         .min_rate = descriptor.min_rate,
         .max_rate = descriptor.max_rate,
         .max_channels = descriptor.max_channels,
-    }, descriptor.context, descriptor.write_pcm.?, descriptor.stop, descriptor.status);
+    }, slot, audioWriteCallback, audioStopCallback, audioStatusCallback);
     if (result != 0) {
         slot.* = R4DAudioBackend{};
         return -3;
+    }
+
+    if (descriptor.version == outputs_contract.audio_backend_outputs_version) {
+        if (!audio.registerExternalAudioOutputs(slot.name[0..slot.name_len], .{
+            .query = audioOutputQueryCallback,
+            .select = audioOutputSelectCallback,
+            .active = audioOutputActiveCallback,
+        })) {
+            _ = audio.unregisterAudioBackendZ(name);
+            slot.* = .{};
+            return -3;
+        }
     }
 
     bootlog.puts("[R4D] register audio backend ");
@@ -1944,6 +1967,63 @@ fn unregisterAudioBackend(name: [*:0]const u8) callconv(.c) i32 {
         return 0;
     }
     return 0;
+}
+
+// Audio callbacks use the existing task-local device-callback owner ledger.
+// Keeping that identity through a wait also makes DMA/work completion calls
+// belong to the actual R4D instead of the caller's program or owner zero.
+fn audioWriteCallback(raw: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, channels: u16, format: u16) callconv(.c) i32 {
+    const slot: *R4DAudioBackend = @ptrCast(@alignCast(raw orelse return -1));
+    if (!slot.used) return -1;
+    const token = enterStorageCallback(slot.owner) orelse return -1;
+    defer leaveStorageCallback(token);
+    return slot.descriptor.write_pcm.?(slot.descriptor.context, data, len, rate, channels, format);
+}
+
+fn audioStopCallback(raw: ?*anyopaque) callconv(.c) i32 {
+    const slot: *R4DAudioBackend = @ptrCast(@alignCast(raw orelse return -1));
+    if (!slot.used) return -1;
+    const callback = slot.descriptor.stop orelse return 0;
+    const token = enterStorageCallback(slot.owner) orelse return -1;
+    defer leaveStorageCallback(token);
+    return callback(slot.descriptor.context);
+}
+
+fn audioStatusCallback(raw: ?*anyopaque, out: *AudioBackendStatus) callconv(.c) i32 {
+    const slot: *R4DAudioBackend = @ptrCast(@alignCast(raw orelse return -1));
+    if (!slot.used) return -1;
+    const callback = slot.descriptor.status orelse {
+        out.* = .{ .active = 1 };
+        return 0;
+    };
+    const token = enterStorageCallback(slot.owner) orelse return -1;
+    defer leaveStorageCallback(token);
+    return callback(slot.descriptor.context, out);
+}
+
+fn audioOutputQueryCallback(raw: u64, index: u32, out: *outputs_contract.AudioOutputInfo) callconv(.c) i32 {
+    const slot: *R4DAudioBackend = @ptrFromInt(raw);
+    if (!slot.used or slot.descriptor.version != outputs_contract.audio_backend_outputs_version) return -1;
+    const descriptor: *const AudioOutputsDescriptor = @ptrCast(slot.descriptor);
+    const token = enterStorageCallback(slot.owner) orelse return -1;
+    defer leaveStorageCallback(token);
+    return descriptor.outputs.query(@intFromPtr(descriptor.base.context), index, out);
+}
+
+fn audioOutputSelectCallback(raw: u64, index: u32) callconv(.c) i32 {
+    const slot: *R4DAudioBackend = @ptrFromInt(raw);
+    if (!slot.used or slot.descriptor.version != outputs_contract.audio_backend_outputs_version) return -1;
+    const descriptor: *const AudioOutputsDescriptor = @ptrCast(slot.descriptor);
+    const token = enterStorageCallback(slot.owner) orelse return -1;
+    defer leaveStorageCallback(token);
+    return descriptor.outputs.select(@intFromPtr(descriptor.base.context), index);
+}
+
+fn audioOutputActiveCallback(raw: u64) callconv(.c) i32 {
+    const slot: *R4DAudioBackend = @ptrFromInt(raw);
+    if (!slot.used or slot.descriptor.version != outputs_contract.audio_backend_outputs_version) return -1;
+    const descriptor: *const AudioOutputsDescriptor = @ptrCast(slot.descriptor);
+    return descriptor.outputs.active(@intFromPtr(descriptor.base.context));
 }
 
 fn registerStorageBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
@@ -2159,7 +2239,7 @@ fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.
 }
 
 fn validAudioBackend(descriptor: *const AudioBackendDescriptor) bool {
-    if (descriptor.version != AUDIO_BACKEND_VERSION) {
+    if (descriptor.version != AUDIO_BACKEND_VERSION and descriptor.version != outputs_contract.audio_backend_outputs_version) {
         bootlog.puts("[R4D][ERROR] audio backend version mismatch\r\n");
         return false;
     }
@@ -2167,6 +2247,7 @@ fn validAudioBackend(descriptor: *const AudioBackendDescriptor) bool {
         bootlog.puts("[R4D][ERROR] audio backend descriptor too small\r\n");
         return false;
     }
+    if (descriptor.version == outputs_contract.audio_backend_outputs_version and descriptor.size < @sizeOf(AudioOutputsDescriptor)) return false;
     if (descriptor.write_pcm == null) {
         bootlog.puts("[R4D][ERROR] audio backend missing write_pcm\r\n");
         return false;

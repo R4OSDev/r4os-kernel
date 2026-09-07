@@ -1,4 +1,5 @@
 const bootlog = @import("../kernel/bootlog.zig");
+const std = @import("std");
 const heap = @import("../memory/heap.zig");
 const phys = @import("../memory/phys.zig");
 const sync = @import("../sched/sync.zig");
@@ -11,6 +12,9 @@ const k = @import("../kernel/log.zig");
 const backend_contract = @import("backend_contract.zig");
 const mixer = @import("mixer.zig");
 const pcm = @import("pcm.zig");
+const outputs_contract = @import("r4os_kernel_contract");
+pub const AudioOutputInfo = outputs_contract.AudioOutputInfo;
+pub const AudioOutputExtension = outputs_contract.AudioOutputExtension;
 
 pub const FORMAT_S16LE: u16 = backend_contract.FORMAT_S16LE;
 pub const FORMAT_U8: u16 = backend_contract.FORMAT_U8;
@@ -19,7 +23,7 @@ pub const DEFAULT_CHANNELS: u16 = 2;
 pub const RING_BYTES: usize = 16 * 1024;
 const MAX_STREAMS: usize = 8;
 const MAX_NAME: usize = 32;
-const MAX_AUDIO_BACKENDS: usize = 4;
+const MAX_AUDIO_BACKENDS: usize = 8;
 const MAX_SYNTH_ENGINES: usize = 8;
 const SID_REGISTER_COUNT: u8 = 25;
 const SID_RENDER_BYTES: usize = 3840;
@@ -193,6 +197,7 @@ const AudioBackend = struct {
     stop_pcm_ctx: ?StopPcmCtxFn = null,
     status_ctx: ?StatusCtxFn = null,
     pcm_limits: ?BackendPcmLimits = null,
+    outputs: ?AudioOutputExtension = null,
 };
 
 var empty_ring: [0]u8 = .{};
@@ -202,6 +207,7 @@ var mix_scratch: [MIX_QUANTUM_BYTES]u8 = .{0} ** MIX_QUANTUM_BYTES;
 var next_stream_id: u32 = 1;
 var audio_backends: [MAX_AUDIO_BACKENDS]AudioBackend = .{AudioBackend{}} ** MAX_AUDIO_BACKENDS;
 var active_audio_slot: ?usize = null;
+var initial_output_pending: bool = false;
 var mixer_backend: NamedBackend = .{};
 var synth_engines: [MAX_SYNTH_ENGINES]SynthEngine = .{SynthEngine{}} ** MAX_SYNTH_ENGINES;
 var active_midi_synth_slot: ?usize = null;
@@ -835,6 +841,117 @@ pub fn registerExternalAudioBackendZ(name: [*:0]const u8, limits: BackendPcmLimi
     return if (registerAudioBackendInternal(name_slice, null, null, null, context, write_pcm, stop_pcm, status, limits)) 0 else -2;
 }
 
+pub fn registerExternalAudioOutputs(name: []const u8, outputs: AudioOutputExtension) bool {
+    const slot = findAudioBackend(name) orelse return false;
+    audio_backends[slot].outputs = outputs;
+    initial_output_pending = true;
+    return true;
+}
+
+fn outputRecordLocked(slot: usize, index: u32, out: *AudioOutputInfo) i32 {
+    const backend = &audio_backends[slot];
+    out.* = .{};
+    if (!backend.registered or !audioBackendHasOutput(backend.name[0..backend.name_len])) return 0;
+    if (backend.outputs) |outputs| {
+        const result = outputs.query(@intFromPtr(backend.context), index, out);
+        if (result != 1) return result;
+        if (out.version != 1 or out.size != @sizeOf(AudioOutputInfo) or
+            std.mem.indexOfScalar(u8, &out.id, 0) == null or std.mem.indexOfScalar(u8, &out.name, 0) == null) return -1;
+        out.flags &= ~outputs_contract.audio_output_flag_active;
+        if (active_audio_slot == slot and outputs.active(@intFromPtr(backend.context)) == @as(i32, @intCast(index))) out.flags |= outputs_contract.audio_output_flag_active;
+        return 1;
+    }
+    if (index != 0) return 0;
+    @memcpy(out.id[0..backend.name_len], backend.name[0..backend.name_len]);
+    @memcpy(out.name[0..backend.name_len], backend.name[0..backend.name_len]);
+    out.availability = outputs_contract.audio_output_available;
+    if (backend.status_ctx) |status| {
+        var value: BackendStatus = .{};
+        if (status(backend.context, &value) < 0 or value.active == 0) out.availability = outputs_contract.audio_output_unavailable;
+    }
+    if (active_audio_slot == slot) out.flags = outputs_contract.audio_output_flag_active;
+    out.preferred_rate = DEFAULT_RATE;
+    out.channels = DEFAULT_CHANNELS;
+    out.format = FORMAT_S16LE;
+    return 1;
+}
+
+pub fn audioOutputInfo(index: u32, out: *AudioOutputInfo) i32 {
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
+    defer _ = stream_lock.unlock();
+    var ordinal: u32 = 0;
+    for (0..audio_backends.len) |slot| {
+        for (0..32) |local| {
+            const result = outputRecordLocked(slot, @intCast(local), out);
+            if (result < 0) return result;
+            if (result == 0) break;
+            if (ordinal == index) return 1;
+            ordinal += 1;
+        }
+    }
+    out.* = .{};
+    return 0;
+}
+
+fn selectOutputLocked(slot: usize, local: u32) i32 {
+    const backend = &audio_backends[slot];
+    if (backend.outputs) |outputs| {
+        const result = outputs.select(@intFromPtr(backend.context), local);
+        if (result < 0) return result;
+    }
+    if (active_audio_slot != slot) {
+        const stopped = stopActivePcmResult();
+        if (stopped < 0) return stopped;
+        setActiveAudioBackend(slot);
+    }
+    return 0;
+}
+
+pub fn audioSelectOutput(id: []const u8) i32 {
+    if (id.len == 0 or id.len >= 64) return r4x_api.service_api_result_invalid;
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
+    defer _ = stream_lock.unlock();
+    var record: AudioOutputInfo = .{};
+    for (0..audio_backends.len) |slot| {
+        for (0..32) |local| {
+            const result = outputRecordLocked(slot, @intCast(local), &record);
+            if (result < 0) return result;
+            if (result == 0) break;
+            const len = std.mem.indexOfScalar(u8, &record.id, 0) orelse return -1;
+            if (!std.mem.eql(u8, id, record.id[0..len])) continue;
+            if (record.availability != outputs_contract.audio_output_available) return r4x_api.service_api_result_no_endpoint;
+            const selected = selectOutputLocked(slot, @intCast(local));
+            if (selected == 0) initial_output_pending = false;
+            return selected;
+        }
+    }
+    return r4x_api.service_api_result_no_endpoint;
+}
+
+fn resolveInitialOutputLocked() void {
+    if (!initial_output_pending) return;
+    var best_slot: ?usize = null;
+    var best_local: u32 = 0;
+    var best_score: u32 = 0;
+    var record: AudioOutputInfo = .{};
+    for (0..audio_backends.len) |slot| {
+        for (0..32) |local| {
+            const result = outputRecordLocked(slot, @intCast(local), &record);
+            if (result < 0) return; // Retry the complete snapshot later.
+            if (result == 0) break;
+            if (record.availability != outputs_contract.audio_output_available) continue;
+            const score: u32 = if (record.kind == outputs_contract.audio_output_kind_hdmi) 100 else if (audio_backends[slot].outputs != null and audio_backends[slot].outputs.?.active(@intFromPtr(audio_backends[slot].context)) == @as(i32, @intCast(local))) 20 else 1;
+            if (score <= best_score) continue;
+            best_score = score;
+            best_slot = slot;
+            best_local = @intCast(local);
+        }
+    }
+    if (best_slot) |slot| {
+        if (selectOutputLocked(slot, best_local) == 0) initial_output_pending = false;
+    }
+}
+
 pub fn registerExternalSynthEngineZ(name: [*:0]const u8, flags: u32, context: ?*anyopaque, send_midi: ?SynthMidiSendCtxFn, render: ?SynthRenderCtxFn, stop: ?SynthStopCtxFn, status: ?SynthStatusCtxFn, opl3_reset: ?SynthOpl3ResetCtxFn, opl3_write_register: ?SynthOpl3WriteRegisterCtxFn, sid_acquire: ?SynthSidAcquireCtxFn, sid_release: ?SynthSidReleaseCtxFn, sid_set_model: ?SynthSidSetModelCtxFn, sid_write_register: ?SynthSidWriteRegisterCtxFn, sid_load_data: ?SynthSidLoadDataCtxFn, sid_init: ?SynthSidInitCtxFn, sid_play_frame: ?SynthSidPlayFrameCtxFn, sid_render_pcm: ?SynthSidRenderPcmCtxFn, render_pcm: ?SynthRenderPcmCtxFn) i32 {
     var buf: [MAX_NAME]u8 = undefined;
     const name_slice = copyZ(name, buf[0..]) orelse return -1;
@@ -934,7 +1051,7 @@ pub fn selectAudioBackend(name: []const u8) bool {
         bootlog.puts("\r\n");
         return false;
     };
-    if (audio_backends[slot].write_pcm == null) {
+    if (audio_backends[slot].write_pcm == null and audio_backends[slot].write_pcm_ctx == null) {
         bootlog.puts("[AUDIO][WARN] audio backend has no PCM output ");
         bootlog.puts(name);
         bootlog.puts("\r\n");
@@ -1487,6 +1604,7 @@ fn setActiveAudioBackend(slot: usize) void {
 }
 
 fn writeActivePcm(data: []const u8, rate: u32, channels: u16, format: u16) ?i32 {
+    resolveInitialOutputLocked();
     const slot = active_audio_slot orelse return null;
     const backend = &audio_backends[slot];
     if (backend.pcm_limits) |limits| {

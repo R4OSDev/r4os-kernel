@@ -7428,6 +7428,8 @@ fn configureR4XStartR4AudioTable() void {
         .opl3_reset = &r4api.r4audio.opl3Reset,
         .opl3_render_block = &r4api.r4audio.opl3RenderBlock,
         .opl3_stop = &r4api.r4audio.opl3Stop,
+        .audio_output_info = &apiAudioOutputInfo,
+        .audio_select_output = &apiAudioSelectOutput,
     });
 }
 
@@ -7437,6 +7439,15 @@ fn apiAudioOpenStream(rate: u32, channels: u16, format: u16) callconv(.c) i32 {
         .instance_id = handle.instance_id,
         .generation = handle.generation,
     }, rate, channels, format);
+}
+
+fn apiAudioOutputInfo(index: u32, out: *audio.AudioOutputInfo) callconv(.c) i32 {
+    return audio.audioOutputInfo(index, out);
+}
+
+fn apiAudioSelectOutput(id: *const [64]u8) callconv(.c) i32 {
+    const len = std.mem.indexOfScalar(u8, id, 0) orelse return r4x_api.service_api_result_invalid;
+    return audio.audioSelectOutput(id[0..len]);
 }
 
 fn apiAudioWrite(stream_id: u32, data_ptr: [*]const u8, byte_count: u32) callconv(.c) i32 {
