@@ -1,4 +1,31 @@
 const std = @import("std");
+const count_work = @import("builtin").is_test or
+    (@hasDecl(@import("root"), "audio_work_counters") and @import("root").audio_work_counters);
+pub const Work = struct { accumulations: u64 = 0, sample_writes: u64 = 0, direct_bytes: u64 = 0 };
+pub var work: Work = .{};
+
+pub const Source = struct { ring: []const u8, read_pos: usize, volume: u32 };
+
+/// Sources already own at least output.len bytes; the stream owner retains
+/// them until the backend acknowledges the complete mixed block.
+pub fn mix(sources: []const Source, output: []u8) void {
+    if (sources.len == 1 and sources[0].volume == 65_536) {
+        const source = sources[0];
+        const first = @min(output.len, source.ring.len - source.read_pos);
+        @memcpy(output[0..first], source.ring[source.read_pos..][0..first]);
+        @memcpy(output[first..], source.ring[0 .. output.len - first]);
+        if (count_work) work.direct_bytes += output.len;
+        return;
+    }
+    var byte_offset: usize = 0;
+    while (byte_offset < output.len) : (byte_offset += 2) {
+        var total: i64 = 0;
+        for (sources) |source| {
+            total = accumulateSample(total, ringReadS16(source.ring, source.read_pos, byte_offset), source.volume);
+        }
+        writeS16(output, byte_offset, clampSample(total));
+    }
+}
 
 pub const Owner = struct {
     instance_id: u32 = 0,
@@ -41,6 +68,7 @@ pub fn ringConsume(ring_len: usize, read_pos: *usize, used: *usize, byte_count: 
 }
 
 pub fn accumulateSample(total: i64, sample: i16, volume_fixed: u32) i64 {
+    if (count_work) work.accumulations += 1;
     return total + @divTrunc(@as(i64, sample) * @as(i64, volume_fixed), 65_536);
 }
 
@@ -51,6 +79,7 @@ pub fn clampSample(total: i64) i16 {
 }
 
 pub fn writeS16(out: []u8, offset: usize, sample: i16) void {
+    if (count_work) work.sample_writes += 1;
     const word: u16 = @bitCast(sample);
     out[offset] = @truncate(word);
     out[offset + 1] = @truncate(word >> 8);
@@ -89,4 +118,30 @@ test "fixed point volume participates in saturating mix" {
     var out: [2]u8 = undefined;
     writeS16(out[0..], 0, -12_345);
     try std.testing.expectEqual(@as(i16, -12_345), ringReadS16(out[0..], 0, 0));
+}
+
+test "mix keeps unity PCM bit exact across wrap, and still scales and saturates multiple streams" {
+    var ring: [16]u8 = undefined;
+    for (&ring, 0..) |*b, i| b.* = @truncate(i * 31 + 17);
+    const source = Source{ .ring = &ring, .read_pos = 12, .volume = 65536 };
+    var out: [12]u8 = undefined;
+    work = .{};
+    mix(&.{source}, &out);
+    for (0..6) |i| try std.testing.expectEqual(ringReadS16(&ring, 12, i * 2), ringReadS16(&out, 0, i * 2));
+    try std.testing.expectEqual(@as(u64, 0), work.accumulations);
+    try std.testing.expectEqual(@as(u64, 12), work.direct_bytes);
+    for ([_]u32{ 0, 32768, 65536, 131072 }) |volume| {
+        var scaled = source;
+        scaled.volume = volume;
+        mix(&.{scaled}, &out);
+        for (0..6) |i| {
+            const expected = clampSample(@divTrunc(@as(i64, ringReadS16(&ring, 12, i * 2)) * volume, 65536));
+            try std.testing.expectEqual(expected, ringReadS16(&out, 0, i * 2));
+        }
+        mix(&.{ source, scaled }, &out);
+        for (0..6) |i| {
+            const a: i64 = ringReadS16(&ring, 12, i * 2);
+            try std.testing.expectEqual(clampSample(a + @divTrunc(a * volume, 65536)), ringReadS16(&out, 0, i * 2));
+        }
+    }
 }

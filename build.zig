@@ -194,6 +194,7 @@ pub fn build(b: *std.Build) void {
         "display/framebuffer.zig",
         "audio/backend_contract.zig",
         "audio/mixer.zig",
+        "audio/pcm.zig",
         "driver/usb/usb_boot_timing.zig",
         "driver/usb/usb_msc_retry.zig",
         "driver/usb/xhci_bulk_completion.zig",

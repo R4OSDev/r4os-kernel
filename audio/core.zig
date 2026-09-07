@@ -469,7 +469,12 @@ pub fn writeStreamForOwner(owner: StreamOwner, id: u32, ptr: [*]const u8, byte_c
     const input = ptr[0..accepted_bytes];
     const was_empty = stream.available == 0;
     stream.resampler.beginChunk(stream.rate, stream.channels, stream.format);
-    while (!stream.resampler.chunk_done) {
+    if (pcm.takeDirectChunk(&stream.resampler, input, stream.rate, stream.channels, stream.format, accepted_bytes)) |direct| {
+        if (mixer.ringWrite(stream.ring, &stream.write_pos, &stream.available, direct) != direct.len or !stream.resampler.chunk_done) {
+            recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
+            return r4x_api.service_api_result_busy;
+        }
+    } else while (!stream.resampler.chunk_done) {
         const produced = pcm.convertStreamingToStereoS16(
             &stream.resampler,
             input,
@@ -1793,19 +1798,14 @@ fn pumpAvailableLocked(force: bool) i32 {
 
         chunk_bytes -= chunk_bytes % pcm.TARGET_FRAME_BYTES;
         if (chunk_bytes == 0) return 0;
-        var byte_offset: usize = 0;
-        while (byte_offset < chunk_bytes) : (byte_offset += 2) {
-            var total: i64 = 0;
-            for (&streams, 0..) |*stream, index| {
-                if (!selected[index]) continue;
-                total = mixer.accumulateSample(
-                    total,
-                    mixer.ringReadS16(stream.ring, stream.read_pos, byte_offset),
-                    stream.volume,
-                );
-            }
-            mixer.writeS16(mix_scratch[0..], byte_offset, mixer.clampSample(total));
+        var sources: [MAX_STREAMS]mixer.Source = undefined;
+        var source_count: usize = 0;
+        for (&streams, 0..) |*stream, index| {
+            if (!selected[index]) continue;
+            sources[source_count] = .{ .ring = stream.ring, .read_pos = stream.read_pos, .volume = stream.volume };
+            source_count += 1;
         }
+        mixer.mix(sources[0..source_count], mix_scratch[0..chunk_bytes]);
 
         const backend_start = timer.tickCount();
         const result = writeActivePcm(
