@@ -2981,8 +2981,25 @@ pub fn fileMove(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
         dst_entry,
         baseName(dst_target.path),
     )) return -9;
-    if (!vfs.copyFile(src_volume, dst_volume, entry, dst_parent, baseName(dst_target.path))) return -9;
-    if (!vfs.deleteFile(src_volume, src_parent, baseName(src_target.path))) return -10;
+    // Both namespace lookups and the metadata transition stay under the same
+    // volume request. Existing destinations retain the copy/replace contract.
+    var renamed = false;
+    if (dst_entry == null and vfs.sameVolume(src_volume, dst_volume) and src_parent == dst_parent) {
+        switch (vfs.renameEntryStatus(src_volume, src_parent, baseName(src_target.path), baseName(dst_target.path))) {
+            .ok => renamed = true,
+            .not_found, .conflict => return 0,
+            // FAT's LFN rejection occurs before any namespace write. NTFS
+            // maps every potentially partial failure to .io instead.
+            .not_atomic => {},
+            .io => return -9,
+        }
+    }
+    if (!renamed) {
+        if (!vfs.copyFile(src_volume, dst_volume, entry, dst_parent, baseName(dst_target.path))) return -9;
+        if (!vfs.deleteFile(src_volume, src_parent, baseName(src_target.path))) return -10;
+    }
+    invalidateRegistryCacheIfHivePath(raw_src);
+    invalidateRegistryCacheIfHivePath(raw_dst);
     ok = true;
     return 1;
 }

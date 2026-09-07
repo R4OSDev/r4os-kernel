@@ -24,6 +24,14 @@
 // structurally or is removed.
 
 const ntfs = @import("ntfs_format");
+const work_counters_enabled = @import("builtin").is_test or
+    (@hasDecl(@import("root"), "ntfs_work_counters") and @import("root").ntfs_work_counters);
+
+pub const WorkStats = struct {
+    cluster_bitmap_probes: u64 = 0,
+    record_bitmap_probes: u64 = 0,
+    read_zero_bytes: u64 = 0,
+};
 
 pub const SECTOR_SIZE: usize = 512;
 /// Windows-parity name limits (0.60.19): NTFS names carry at most 255
@@ -59,13 +67,25 @@ pub const Device = struct {
     read_sectors: *const fn (ctx: *anyopaque, lba: u64, count: u32, out: []u8) bool,
     write_sectors: *const fn (ctx: *anyopaque, lba: u64, count: u32, data: []const u8) bool,
     flush: *const fn (ctx: *anyopaque) bool,
+    /// Compatibility default for older seams. Zero accepts the owner's full
+    /// bounded chunk; smaller transports may publish their sector limit.
+    max_transfer_sectors: u32 = 64,
 };
+
+// 128 KB occupies at most 33 cache pages when unaligned: comfortably below
+// the kernel cache's 64-page floor. It also bounds staging and one owner call.
+pub const MAX_TRANSFER_SECTORS: u32 = 256;
 
 /// Maximum on-disk index entry size (0x10 header + 0x42 + 255 UTF-16 chars
 /// + child VCN, 8-aligned).
 const ENTRY_MAX: usize = 0x10 + 0x42 + 510 + 8 + 8;
 
 pub const Scratch = struct {
+    work: WorkStats = .{},
+    // Persistent, caller-owned mount hints, shared by transient Volume views.
+    // Only bitmap contents establish allocation ownership.
+    cluster_search_start: u64 = 0,
+    record_search_start: u64 = ntfs.MFT_FIRST_NORMAL,
     attr: AttrScratch = .{},
     record: [4096]u8 = undefined,
     part_record: [4096]u8 = undefined,
@@ -316,7 +336,8 @@ fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, mutatio
         const in_sector: usize = @intCast(offset % SECTOR_SIZE);
         if (in_sector == 0 and remaining >= SECTOR_SIZE) {
             const whole = remaining / SECTOR_SIZE;
-            const chunk: u32 = @intCast(@min(whole, 64));
+            const seam_limit = if (v.device.max_transfer_sectors == 0) MAX_TRANSFER_SECTORS else v.device.max_transfer_sectors;
+            const chunk: u32 = @intCast(@min(whole, @min(seam_limit, MAX_TRANSFER_SECTORS)));
             const span = buffer[pos .. pos + @as(usize, chunk) * SECTOR_SIZE];
             const ok = if (mutation) |kind|
                 writeSectors(v, lba, chunk, span, kind)
@@ -346,7 +367,6 @@ fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, mutatio
 
 /// Reads a byte range in the VCN space of a runlist (sparse reads zeros).
 fn readRunBytes(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, out: []u8) bool {
-    @memset(out, 0);
     return runByteIo(v, runs, byte_offset, out, null);
 }
 
@@ -380,6 +400,9 @@ fn runByteIo(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, buffer:
                 if (!ok) return false;
             } else if (mutation != null) {
                 return false; // writing into a sparse hole needs allocation
+            } else {
+                @memset(span, 0);
+                if (work_counters_enabled) v.scratch.work.read_zero_bytes += span.len;
             }
             buf_pos += span.len;
             want_start += take;
@@ -494,6 +517,8 @@ pub fn mount(device: Device, partition_lba: u32, scratch: *Scratch, runs_out: []
     }
     @memcpy(runs_out[0..collected.count], collected.runs[0..collected.count]);
     const run_count = collected.count;
+    scratch.cluster_search_start = 0;
+    scratch.record_search_start = ntfs.MFT_FIRST_NORMAL;
     return .{
         .cluster_bytes = boot.cluster_bytes,
         .record_bytes = boot.file_record_bytes,
@@ -2072,13 +2097,11 @@ fn readAttrRange(v: *const Volume, attr: *AttrScratch, offset: usize, out: []u8)
         if (!readCompressedRange(v, attr, offset_u64, out[0..want_len])) return null;
         return want_len;
     }
-    if (!readRunBytes(v, attr.runs[0..attr.count], offset_u64, out[0..want_len])) return null;
-    if (want > attr.initialized_size -| offset_u64) {
-        const first_zero = if (attr.initialized_size > offset_u64)
-            @as(usize, @intCast(attr.initialized_size - offset_u64))
-        else
-            0;
-        @memset(out[first_zero..want_len], 0);
+    const initialized: usize = @intCast(@min(want, attr.initialized_size -| offset_u64));
+    if (!readRunBytes(v, attr.runs[0..attr.count], offset_u64, out[0..initialized])) return null;
+    if (initialized < want_len) {
+        @memset(out[initialized..want_len], 0);
+        if (work_counters_enabled) v.scratch.work.read_zero_bytes += want_len - initialized;
     }
     return want_len;
 }
@@ -2170,19 +2193,14 @@ fn allocateClusters(v: *const Volume, count: u64, runs_out: []ntfs.Run) Allocati
     if (count == 0) return .{ .status = .ok };
     const total = v.totalClusters();
 
-    var produced: usize = 0;
-    var needed = count;
-    var search_start: u64 = 0;
-    while (needed > 0) {
-        if (produced >= runs_out.len) return .{ .status = .record_full };
-        const found = findFreeRun(v, bitmap_attr, total, search_start, needed);
-        if (found.status != .ok) return .{ .status = found.status };
-        const run = found.run;
-        runs_out[produced] = run;
-        produced += 1;
-        needed -= run.length_clusters;
-        search_start = checkedAddU64(run.lcn.?, run.length_clusters) orelse return .{ .status = .io };
-    }
+    const start = if (v.scratch.cluster_search_start < total) v.scratch.cluster_search_start else 0;
+    var planned = planClusters(v, bitmap_attr, total, start, count, runs_out);
+    // A hint must not turn one physical extent into a false run-capacity
+    // failure at its wrap boundary. No bits have been changed at this point.
+    if (planned.status == .record_full and start != 0)
+        planned = planClusters(v, bitmap_attr, total, 0, count, runs_out);
+    if (planned.status != .ok) return planned;
+    const produced = planned.produced;
 
     var marked: usize = 0;
     while (marked < produced) : (marked += 1) {
@@ -2193,6 +2211,33 @@ fn allocateClusters(v: *const Volume, count: u64, runs_out: []ntfs.Run) Allocati
             const rollback_ok = rollbackClusterRanges(v, bitmap_attr, runs_out[0 .. marked + 1]);
             return .{ .status = if (rollback_ok) .io else .cleanup_failed };
         }
+    }
+    const last = runs_out[produced - 1];
+    const next = last.lcn.? + last.length_clusters;
+    v.scratch.cluster_search_start = if (next < total) next else 0;
+    return .{ .status = .ok, .produced = produced };
+}
+
+fn planClusters(v: *const Volume, bitmap: *const AttrScratch, total: u64, start: u64, count: u64, out: []ntfs.Run) AllocationResult {
+    var needed = count;
+    var from = start;
+    var end = total;
+    var wrapped = start == 0;
+    var produced: usize = 0;
+    while (needed != 0) {
+        if (produced == out.len) return .{ .status = .record_full };
+        const found = findFreeRun(v, bitmap, end, from, needed);
+        if (found.status == .no_space and !wrapped) {
+            from = 0;
+            end = start;
+            wrapped = true;
+            continue;
+        }
+        if (found.status != .ok) return .{ .status = found.status };
+        out[produced] = found.run;
+        produced += 1;
+        needed -= found.run.length_clusters;
+        from = found.run.lcn.? + found.run.length_clusters;
     }
     return .{ .status = .ok, .produced = produced };
 }
@@ -2215,6 +2260,7 @@ fn freeClusters(v: *const Volume, runs: []const ntfs.Run) bool {
     for (runs) |run| {
         const lcn = run.lcn orelse continue;
         if (!setBitmapRange(v, bitmap_attr, lcn, run.length_clusters, false)) return false;
+        v.scratch.cluster_search_start = @min(v.scratch.cluster_search_start, lcn);
     }
     return true;
 }
@@ -2227,6 +2273,7 @@ fn findFreeRun(v: *const Volume, bitmap_attr: *const AttrScratch, total: u64, fr
     var cluster: u64 = from;
     var loaded_sector: u64 = ~@as(u64, 0);
     while (cluster < total) : (cluster += 1) {
+        if (work_counters_enabled) v.scratch.work.cluster_bitmap_probes += 1;
         const byte_index = cluster / 8;
         const sector_index = byte_index / SECTOR_SIZE;
         if (sector_index != loaded_sector) {
@@ -2284,9 +2331,24 @@ fn allocateRecord(v: *const Volume) ?struct { number: u64, sequence: u16 } {
     const record_count = data_attr.data_size / v.record_bytes;
 
     var sector_buf: [SECTOR_SIZE]u8 = undefined;
-    var number: u64 = ntfs.MFT_FIRST_NORMAL;
+    const hint = v.scratch.record_search_start;
+    const start = if (hint >= ntfs.MFT_FIRST_NORMAL and hint < record_count) hint else ntfs.MFT_FIRST_NORMAL;
+    var number: u64 = start;
+    var end = record_count;
+    var wrapped = start == ntfs.MFT_FIRST_NORMAL;
     var loaded_sector: u64 = ~@as(u64, 0);
-    while (number < record_count) : (number += 1) {
+    while (true) : (number += 1) {
+        if (number >= end) {
+            if (wrapped) {
+                number = record_count;
+                break;
+            }
+            number = ntfs.MFT_FIRST_NORMAL;
+            end = start;
+            wrapped = true;
+            loaded_sector = ~@as(u64, 0);
+        }
+        if (work_counters_enabled) v.scratch.work.record_bitmap_probes += 1;
         const byte_index = number / 8;
         const sector_index = byte_index / SECTOR_SIZE;
         if (sector_index != loaded_sector) {
@@ -2332,6 +2394,7 @@ fn allocateRecord(v: *const Volume) ?struct { number: u64, sequence: u16 } {
     sector_buf[@intCast((number / 8) % SECTOR_SIZE)] |= @as(u8, 1) << @intCast(number % 8);
     const bitmap_offset = sectorByteOffset(number / 8 / SECTOR_SIZE) orelse return null;
     if (!writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..], .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_MFT, .attr_type = .bitmap } })) return null;
+    v.scratch.record_search_start = number + 1;
     return .{ .number = number, .sequence = sequence };
 }
 
@@ -2432,7 +2495,9 @@ fn releaseRecord(v: *const Volume, number: u64) bool {
     const bitmap_offset = sectorByteOffset(sector_index) orelse return false;
     if (!readRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..])) return false;
     sector_buf[@intCast((number / 8) % SECTOR_SIZE)] &= ~(@as(u8, 1) << @intCast(number % 8));
-    return writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..], .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_MFT, .attr_type = .bitmap } });
+    if (!writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..], .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_MFT, .attr_type = .bitmap } })) return false;
+    v.scratch.record_search_start = @min(v.scratch.record_search_start, number);
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -6450,6 +6515,136 @@ pub fn abortWriteForTest(v: *const Volume, status: WriteStatus) WriteStatus {
 
 pub fn abortWriteFreeingForTest(v: *const Volume, runs: []const ntfs.Run, status: WriteStatus) WriteStatus {
     return abortWriteFreeing(v, runs, status);
+}
+
+test "range reads zero only holes and uninitialized tails, preserve short results and errors" {
+    const std = @import("std");
+    const Memory = struct {
+        bytes: [2048]u8 = .{0xa7} ** 2048,
+        calls: u32 = 0,
+        fail: bool = false,
+        fn read(ctx: *anyopaque, lba: u64, count: u32, out: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            if (self.fail or lba + count > 4) return false;
+            @memcpy(out, self.bytes[@intCast(lba * 512)..][0..out.len]);
+            return true;
+        }
+        fn write(_: *anyopaque, _: u64, _: u32, _: []const u8) bool {
+            return false;
+        }
+        fn flush(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    var memory = Memory{};
+    const scratch = try std.testing.allocator.create(Scratch);
+    defer std.testing.allocator.destroy(scratch);
+    scratch.* = .{};
+    var run_count: usize = 0;
+    const v = Volume{
+        .device = .{ .ctx = &memory, .read_sectors = Memory.read, .write_sectors = Memory.write, .flush = Memory.flush },
+        .partition_lba = 0,
+        .cluster_bytes = 512,
+        .record_bytes = 1024,
+        .index_block_bytes = 4096,
+        .total_sectors = 4,
+        .mft_runs_buf = &.{},
+        .mft_run_count = &run_count,
+        .upcase = &.{},
+        .scratch = scratch,
+    };
+    var attr = AttrScratch{ .count = 3, .data_size = 1536, .initialized_size = 1280 };
+    attr.runs[0] = .{ .lcn = 1, .length_clusters = 1 };
+    attr.runs[1] = .{ .lcn = null, .length_clusters = 1 };
+    attr.runs[2] = .{ .lcn = 3, .length_clusters = 1 };
+    var out: [1600]u8 = .{0xcc} ** 1600;
+    try std.testing.expectEqual(@as(?usize, 1536), readAttrRange(&v, &attr, 0, &out));
+    try std.testing.expectEqualSlices(u8, memory.bytes[0..512], out[0..512]);
+    for (out[512..1024]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (out[1024..1280]) |byte| try std.testing.expectEqual(@as(u8, 0xa7), byte);
+    for (out[1280..1536]) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
+    for (out[1536..]) |byte| try std.testing.expectEqual(@as(u8, 0xcc), byte);
+    try std.testing.expectEqual(@as(u64, 768), scratch.work.read_zero_bytes);
+    const before = memory.calls;
+    try std.testing.expectEqual(@as(?usize, 256), readAttrRange(&v, &attr, 1280, &out));
+    try std.testing.expectEqual(before, memory.calls); // uninitialized tail never reaches the device
+    try std.testing.expectEqual(@as(?usize, 0), readAttrRange(&v, &attr, 1536, &out));
+    memory.fail = true;
+    @memset(&out, 0xcc);
+    try std.testing.expectEqual(@as(?usize, null), readAttrRange(&v, &attr, 0, &out));
+    for (out) |byte| try std.testing.expectEqual(@as(u8, 0xcc), byte);
+    memory.fail = false;
+    attr.count = 1; // malformed missing run: partial bytes do not become a successful read
+    try std.testing.expectEqual(@as(?usize, null), readAttrRange(&v, &attr, 0, &out));
+}
+
+test "extent transfers honor transport caps and preserve partial-sector neighbors" {
+    const std = @import("std");
+    const Memory = struct {
+        bytes: [300 * 512]u8 = .{0xa7} ** (300 * 512),
+        limit: u32 = 256,
+        maximum: u32 = 0,
+        calls: u32 = 0,
+        fail_at: u32 = 0,
+        fn read(ctx: *anyopaque, lba: u64, count: u32, out: []u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.maximum = @max(self.maximum, count);
+            if (count > self.limit or self.calls == self.fail_at) return false;
+            @memcpy(out, self.bytes[@intCast(lba * 512)..][0..out.len]);
+            return true;
+        }
+        fn write(ctx: *anyopaque, lba: u64, count: u32, bytes: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.calls += 1;
+            self.maximum = @max(self.maximum, count);
+            if (count > self.limit or self.calls == self.fail_at) return false;
+            @memcpy(self.bytes[@intCast(lba * 512)..][0..bytes.len], bytes);
+            return true;
+        }
+        fn flush(_: *anyopaque) bool {
+            return true;
+        }
+    };
+    const memory = try std.testing.allocator.create(Memory);
+    defer std.testing.allocator.destroy(memory);
+    memory.* = .{};
+    const scratch = try std.testing.allocator.create(Scratch);
+    defer std.testing.allocator.destroy(scratch);
+    scratch.* = .{};
+    var run_count: usize = 0;
+    var v = Volume{
+        .device = .{ .ctx = memory, .read_sectors = Memory.read, .write_sectors = Memory.write, .flush = Memory.flush, .max_transfer_sectors = 0 },
+        .partition_lba = 0,
+        .cluster_bytes = 512,
+        .record_bytes = 1024,
+        .index_block_bytes = 4096,
+        .total_sectors = 300,
+        .mft_runs_buf = &.{},
+        .mft_run_count = &run_count,
+        .upcase = &.{},
+        .scratch = scratch,
+    };
+    const out = try std.testing.allocator.alloc(u8, 280 * 512);
+    defer std.testing.allocator.free(out);
+    for ([_]u32{ 0, 7, 1 }) |limit| {
+        v.device.max_transfer_sectors = limit;
+        memory.limit = if (limit == 0) 256 else limit;
+        memory.maximum = 0;
+        @memset(out, 0x79);
+        try std.testing.expect(writeLcnBytes(&v, 0, 13, out, .payload));
+        try std.testing.expectEqual(@as(u8, 0xa7), memory.bytes[12]);
+        try std.testing.expectEqual(@as(u8, 0xa7), memory.bytes[13 + out.len]);
+        @memset(out, 0xcc);
+        try std.testing.expect(readLcnBytes(&v, 0, 13, out));
+        for (out) |byte| try std.testing.expectEqual(@as(u8, 0x79), byte);
+        try std.testing.expectEqual(memory.limit, memory.maximum);
+    }
+    memory.fail_at = memory.calls + 2;
+    try std.testing.expect(!readLcnBytes(&v, 0, 0, out));
+    memory.fail_at = memory.calls + 2;
+    try std.testing.expect(!writeLcnBytes(&v, 0, 0, out, .payload));
 }
 
 test "metadata mutations retain payload reads and invalidate exact dependencies" {

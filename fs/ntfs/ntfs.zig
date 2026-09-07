@@ -204,6 +204,7 @@ fn buildVolume(volume: Volume) nv.Volume {
             .read_sectors = seamRead,
             .write_sectors = seamWrite,
             .flush = seamFlush,
+            .max_transfer_sectors = 0, // shared core bounds staging; block core splits per backend
         },
         .partition_lba = state.partition_lba,
         .cluster_bytes = state.cluster_bytes,
@@ -304,6 +305,7 @@ pub fn inspectBounded(device_index: usize, first_lba: u32, partition_sectors: u6
         .read_sectors = seamRead,
         .write_sectors = seamWrite,
         .flush = seamFlush,
+        .max_transfer_sectors = 0,
     };
 
     const info = nv.mount(device, first_lba, state.scratchBuffer(), state.mft_runs[0..]) orelse {
