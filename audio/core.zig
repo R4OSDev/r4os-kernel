@@ -489,7 +489,9 @@ pub fn writeStreamForOwner(owner: StreamOwner, id: u32, ptr: [*]const u8, byte_c
             stream.format,
             mix_scratch[0..],
         );
-        if (produced == 0 or mixer.ringWrite(stream.ring, &stream.write_pos, &stream.available, mix_scratch[0..produced]) != produced) {
+        if ((produced == 0 and !stream.resampler.chunk_done) or
+            mixer.ringWrite(stream.ring, &stream.write_pos, &stream.available, mix_scratch[0..produced]) != produced)
+        {
             recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
             return r4x_api.service_api_result_busy;
         }
@@ -500,7 +502,6 @@ pub fn writeStreamForOwner(owner: StreamOwner, id: u32, ptr: [*]const u8, byte_c
     total_stream_writes +%= 1;
     if (accepted_bytes < requested_bytes) {
         stream_write_truncations +%= 1;
-        stream_dropped_bytes +%= requested_bytes - accepted_bytes;
     }
 
     _ = pumpAvailableLocked(false);
@@ -517,6 +518,8 @@ pub fn closeStreamForOwner(owner: StreamOwner, id: u32) i32 {
     if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
     defer _ = stream_lock.unlock();
     const stream = streamByOwnerLocked(owner, id) orelse return r4x_api.service_api_result_not_found;
+    const finish_result = finishStreamPcmLocked(stream);
+    if (finish_result < 0) return finish_result;
     const pump_result = pumpAvailableLocked(true);
     if (pump_result < 0) return pump_result;
     if (openStreamCountLocked() == 1 and !sid_acquired and !midi_acquired) {
@@ -539,6 +542,7 @@ pub fn closeStreamsForOwner(owner: StreamOwner) bool {
     var owner_queued = false;
     for (&streams) |*stream| {
         if (stream.state != .open or !mixer.sameOwner(stream.owner, owner)) continue;
+        if (finishStreamPcmLocked(stream) < 0) return false;
         matching += 1;
         owner_queued = owner_queued or stream.available != 0;
     }
@@ -564,7 +568,7 @@ pub fn closeAllStreams() void {
     _ = stopActivePcmResult();
     for (&streams) |*stream| {
         if (stream.state != .open) continue;
-        stream_dropped_bytes +%= stream.available;
+        stream_dropped_bytes +%= stream.available + pcm.pendingTailBytes(&stream.resampler);
         stream.available = 0;
         _ = releaseStreamLocked(stream);
     }
@@ -1877,6 +1881,22 @@ fn releaseStreamLocked(stream: *Stream) bool {
     const reusable_ring = stream.ring;
     stream.* = .{ .state = .closed, .id = id, .ring = reusable_ring };
     return true;
+}
+
+// Only a confirmed end of this stream extends its final interpolation sample.
+// Keep pending PCM and phase owned if backend backpressure interrupts close.
+fn finishStreamPcmLocked(stream: *Stream) i32 {
+    while (stream.resampler.previous_valid) {
+        if (!stream.resampler.chunk_done) return r4x_api.service_api_result_busy;
+        const free_bytes = stream.ring.len - stream.available;
+        const produced = pcm.finishStreamingToStereoS16(&stream.resampler, mix_scratch[0..@min(free_bytes, mix_scratch.len)]);
+        if (mixer.ringWrite(stream.ring, &stream.write_pos, &stream.available, mix_scratch[0..produced]) != produced)
+            return r4x_api.service_api_result_busy;
+        if (!stream.resampler.previous_valid) return 0;
+        const pump_result = pumpAvailableLocked(true);
+        if (pump_result < 0) return pump_result;
+    }
+    return 0;
 }
 
 fn pumpAvailableLocked(force: bool) i32 {
