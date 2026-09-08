@@ -42,3 +42,11 @@ Der Quelltext ist bytegleich mit Repositories/SDK/r4os/ntfs_volume.zig;
 der gemeinsame Importvorspann waehlt im Kernel weiterhin ntfs_format.
 Die Quelle bleibt beim SDK; die
 eigenstaendige Recovery wird dadurch nicht automatisch veraendert.
+
+
+Besitzerabgleich 0.78.73
+----------------------
+Support/ntfs_format.zig und Support/ntfs_volume.zig sind bytegleich mit den
+kanonischen SDK-Dateien. Die vorhandene 24-Komponenten-Pfadgrenze verwendet
+nun die gemeinsame Konstante. Der Kontrollbuild ist bytegleich zum vorherigen
+r4os.elf; Kernelversion 0.1.130 bleibt deshalb unveraendert.

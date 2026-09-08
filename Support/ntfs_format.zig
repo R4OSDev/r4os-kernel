@@ -24,6 +24,10 @@ pub const END_MARKER: u32 = 0xFFFFFFFF;
 pub const UPCASE_ENTRIES: usize = 65536;
 pub const UPCASE_BYTES: usize = UPCASE_ENTRIES * 2;
 
+/// R4OS volume API policy, including the final file component; not an
+/// on-disk NTFS format limit. Builders and verifiers share this boundary.
+pub const R4OS_PATH_SEGMENTS_MAX: usize = 24;
+
 // Well-known MFT record numbers.
 pub const MFT_RECORD_MFT: u64 = 0;
 pub const MFT_RECORD_MFTMIRR: u64 = 1;
