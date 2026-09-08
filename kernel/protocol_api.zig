@@ -93,8 +93,10 @@ fn alloc(bytes: u32, alignment: u32) callconv(.c) ?*anyopaque {
 }
 
 fn free(ptr: ?*anyopaque, bytes: u32) callconv(.c) void {
-    _ = ptr;
-    _ = bytes;
+    const address = ptr orelse return;
+    if (bytes == 0) return;
+    const mem: [*]u8 = @ptrCast(address);
+    _ = heap.free(mem[0..bytes]);
 }
 
 fn fileRead(path: [*:0]const u8, out: [*]u8, max_len: u32) callconv(.c) i32 {
