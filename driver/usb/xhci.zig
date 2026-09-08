@@ -40,11 +40,10 @@ const TimeoutClock = enum { ticks, hpet, tsc, tsc_fallback, recovery_budget, cpu
 const COMMAND_TRB_COUNT: usize = 256;
 const EVENT_TRB_COUNT: usize = 256;
 
-// `current`, the active runtime's mapped rings, the shared event ring and the
-// command owner are one controller transaction domain. USBMSC runs in the
-// block worker while HID runs in a high-priority poll task, so timer
-// preemption must not let either task switch the active runtime halfway
-// through the other's CBW/data/CSW or endpoint-recovery sequence.
+// Runtime selection, mapped rings and event routing share this controller
+// owner. A device BOT transaction has a separate class owner and pins its
+// exact runtime; a parked wait may hand the controller to HID and restore
+// the pinned runtime before accessing its transfer state again.
 //
 // UnwindGuard is recursive (the protocol layers call nested xHCI helpers),
 // generation-safe, usable during single-threaded boot and prevents hard kill
@@ -291,6 +290,10 @@ const ControlRequest = struct {
 const DeviceRuntime = struct {
     active: bool = false,
     generation: u64 = 0,
+    transaction_active: bool = false,
+    transaction_task_id: u32 = 0,
+    transaction_task_generation: u64 = 0,
+    detach_pending: bool = false,
     slot_id: u8 = 0,
     port: u8 = 0,
     speed: u8 = 0,
@@ -353,6 +356,24 @@ const DeviceRuntime = struct {
     bulk_out_enqueue: u16 = 0,
     bulk_out_cycle: u8 = 1,
     bulk_out_link_update_pending: bool = false,
+    // Per-device synchronous result state survives controller handoff.
+    last_control_request_type: u8 = 0,
+    last_control_request: u8 = 0,
+    last_control_value: u16 = 0,
+    last_control_index: u16 = 0,
+    last_control_length: u16 = 0,
+    last_control_direction: []const u8 = "none",
+    last_control_completion_code: u8 = 0,
+    last_control_residue: u32 = 0,
+    last_control_ok: bool = false,
+    last_bulk_direction: []const u8 = "none",
+    last_bulk_result: []const u8 = "none",
+    last_bulk_request_len: u32 = 0,
+    last_bulk_residue: u32 = 0,
+    last_bulk_actual_len: u32 = 0,
+    last_bulk_completion_code: u8 = 0,
+    last_wait_cancelled: bool = false,
+    sync_transfer_incident: diag_screen.IncidentToken = .{},
 };
 
 pub const EndpointKind = enum {
@@ -382,6 +403,107 @@ pub const EndpointHandle = struct {
     max_burst: u8 = 0,
     interval: u8 = 0,
 };
+
+pub const DeviceTransaction = struct {
+    runtime_index: usize,
+    generation: u64,
+};
+
+// The class owner must retain its own UnwindGuard until endDeviceTransaction.
+// This pin spans CBW/data/CSW, recovery and retry pauses without retaining the
+// shared controller owner. No detached/reused runtime can enter a new BOT.
+pub fn beginDeviceTransaction(handle: *DeviceHandle) ?DeviceTransaction {
+    if (scheduler.current()) |task| {
+        const controller_guard: u32 = if (controller_ownership.ownedByCurrent()) 1 else 0;
+        if (task.unwind_guard_count <= controller_guard) return null;
+    }
+    if (!acquireControllerOwnership()) return null;
+    defer releaseControllerOwnership();
+    if (!selectDeviceHandle(handle) or !deviceHandleCurrent(handle.*)) return null;
+    const index = active_runtime_index orelse return null;
+    const rt = &runtimes[index];
+    if (rt.transaction_active or rt.detach_pending) return null;
+    const task = scheduler.current();
+    rt.transaction_active = true;
+    rt.transaction_task_id = if (task) |owner| owner.id else 0;
+    rt.transaction_task_generation = if (task) |owner| owner.generation else 0;
+    return .{ .runtime_index = index, .generation = rt.generation };
+}
+
+pub fn endDeviceTransaction(transaction: DeviceTransaction) void {
+    restoreControllerOwnership(1);
+    defer releaseControllerOwnership();
+    const rt = &runtimes[transaction.runtime_index];
+    if (!rt.active or rt.generation != transaction.generation or !transactionOwnedByCurrent(rt))
+        @panic("xHCI device transaction ownership mismatch");
+    rt.transaction_active = false;
+    rt.transaction_task_id = 0;
+    rt.transaction_task_generation = 0;
+    if (rt.detach_pending) pending_port_changes.retry(rt.port);
+}
+
+fn transactionOwnedByCurrent(rt: *const DeviceRuntime) bool {
+    if (!rt.transaction_active) return false;
+    const task = scheduler.current();
+    return rt.transaction_task_id == (if (task) |owner| owner.id else @as(u32, 0)) and
+        rt.transaction_task_generation == (if (task) |owner| owner.generation else @as(u64, 0));
+}
+
+fn selectedDeviceAllowsMutation() bool {
+    const index = active_runtime_index orelse return true;
+    const rt = &runtimes[index];
+    return !rt.detach_pending and (!rt.transaction_active or transactionOwnedByCurrent(rt));
+}
+
+fn restoreControllerOwnership(depth: u32) void {
+    if (!controller_ownership.enter(sync.WAIT_FOREVER))
+        @panic("xHCI retained transaction could not restore controller ownership");
+    var restored: u32 = 1;
+    while (restored < depth) : (restored += 1) {
+        if (!controller_ownership.tryEnter()) @panic("xHCI controller nesting mismatch");
+    }
+}
+
+fn idleDeviceWait(wait: *usb_wait.Wait) void {
+    const index = active_runtime_index orelse {
+        wait.idle();
+        return;
+    };
+    if (scheduler.current() == null or !transactionOwnedByCurrent(&runtimes[index])) {
+        wait.idle();
+        return;
+    }
+    if (!wait.mayBlockOnIdle()) {
+        wait.pollOnce();
+        return;
+    }
+    const generation = runtimes[index].generation;
+    const depth = controller_ownership.depth;
+    if (depth == 0 or !controller_ownership.ownedByCurrent()) @panic("xHCI wait without controller ownership");
+    persistActiveRuntime();
+    var released: u32 = 0;
+    while (released < depth) : (released += 1) releaseControllerOwnership();
+    wait.idle();
+    restoreControllerOwnership(depth);
+    if (!runtimes[index].active or runtimes[index].generation != generation or !activateRuntime(index))
+        @panic("xHCI pinned runtime changed during wait");
+}
+
+pub fn statusForDevice(handle: DeviceHandle) ?Status {
+    if (!acquireControllerOwnership()) return null;
+    defer releaseControllerOwnership();
+    const index = runtimeIndexForIdentity(handle.slot_id, handle.port) orelse return null;
+    if (runtimes[index].generation != handle.generation or !activateRuntime(index)) return null;
+    return status();
+}
+
+pub fn takeSyncTransferIncidentForDevice(handle: DeviceHandle) diag_screen.IncidentToken {
+    if (!acquireControllerOwnership()) return .{};
+    defer releaseControllerOwnership();
+    const index = runtimeIndexForIdentity(handle.slot_id, handle.port) orelse return .{};
+    if (runtimes[index].generation != handle.generation or !activateRuntime(index)) return .{};
+    return takeLastSyncTransferIncidentToken();
+}
 
 pub const Status = struct {
     probed: bool = false,
@@ -713,6 +835,7 @@ pub const Status = struct {
     failures: u64 = 0,
     timeouts: u64 = 0,
     reason: []const u8 = "not initialized",
+    last_wait_cancelled: bool = false,
 };
 
 var current: Status = .{};
@@ -1242,6 +1365,7 @@ fn hostConfigureDevice(_: ?*anyopaque, raw: *const usb_host.DeviceHandle, config
     defer releaseControllerOwnership();
     var handle = deviceFromUsbHost(raw);
     if (!selectDeviceHandle(&handle)) return -2;
+    if (!selectedDeviceAllowsMutation()) return -2;
     if (configuration != 0) current.config_value = configuration;
     return if (setFirstConfiguration()) 0 else -3;
 }
@@ -1251,6 +1375,7 @@ fn hostControlTransfer(_: ?*anyopaque, raw_device: *const usb_host.DeviceHandle,
     defer releaseControllerOwnership();
     var device = deviceFromUsbHost(raw_device);
     if (!selectDeviceHandle(&device) or first_descriptor_virt == 0) return -2;
+    if (!selectedDeviceAllowsMutation()) return -2;
     if (raw_request.length > len or raw_request.length > DESCRIPTOR_BYTES) return -3;
     const direction: ControlDirection = switch (raw_request.direction) {
         0 => .none,
@@ -1331,7 +1456,6 @@ fn hostPoll(_: ?*anyopaque) callconv(.c) i32 {
 fn hostShutdown(_: ?*anyopaque) callconv(.c) i32 {
     if (!acquireControllerOwnership()) return -1;
     defer releaseControllerOwnership();
-    port_task_stop = true;
     const ok = teardownForReprobe();
     if (ok) {
         current.probed = false;
@@ -1339,7 +1463,7 @@ fn hostShutdown(_: ?*anyopaque) callconv(.c) i32 {
         current.present = false;
         current.reason = "xHCI backend unloaded";
     } else {
-        current.reason = "xHCI unload halt failed; resources retained";
+        current.reason = "xHCI unload deferred or halt failed; resources retained";
     }
     return if (ok) 0 else -2;
 }
@@ -1426,10 +1550,9 @@ pub fn selectDeviceHandle(handle: *DeviceHandle) bool {
     }
     if (!portIsConnected(handle.port)) return false;
     if (handle.slot_id != 0) {
-        if (handle.generation != 0) {
-            const i = runtimeIndexForIdentity(handle.slot_id, handle.port) orelse return false;
-            if (runtimes[i].generation != handle.generation) return false;
-        }
+        const i = runtimeIndexForIdentity(handle.slot_id, handle.port) orelse return false;
+        if (runtimes[i].detach_pending or
+            (handle.generation != 0 and runtimes[i].generation != handle.generation)) return false;
         if (!activateRuntimeByIdentity(handle.slot_id, handle.port)) return false;
         if (current.addressed_slot_id != handle.slot_id or current.addressed_port != handle.port) return false;
         refreshHandleFromCurrent(handle);
@@ -1463,7 +1586,7 @@ pub fn deviceHandleCurrent(handle: DeviceHandle) bool {
     const port = current.first_ports[handle.port - 1];
     if (!port.connected or (port.change_bits & PORTSC_CSC) != 0) return false;
     const index = runtimeIndexForIdentity(handle.slot_id, handle.port) orelse return false;
-    return runtimes[index].generation == handle.generation;
+    return runtimes[index].generation == handle.generation and !runtimes[index].detach_pending;
 }
 
 fn enablePciMemoryAndBusMaster() void {
@@ -1616,6 +1739,7 @@ fn allocControllerMemory() bool {
 
 fn teardownForReprobe() bool {
     if (!current.probed) return true;
+    for (&runtimes) |*rt| if (rt.transaction_active) return false;
     port_task_stop = true;
     stopEventIrq();
     persistActiveRuntime();
@@ -1956,6 +2080,9 @@ fn ensurePortPower(index: usize, p: *PortStatus) bool {
 }
 
 fn resetPort(index_value: u8) bool {
+    if (runtimeIndexForPort(index_value +| 1)) |index| {
+        if (runtimes[index].transaction_active) return false;
+    }
     const base = OP_PORT_BASE + (@as(u64, index_value) * OP_PORT_STRIDE);
     const before = readOp32(base);
     _ = clearPortChanges(@intCast(index_value));
@@ -1981,6 +2108,9 @@ fn resetPort(index_value: u8) bool {
 }
 
 fn warmResetPort(index_value: u8) bool {
+    if (runtimeIndexForPort(index_value +| 1)) |index| {
+        if (runtimes[index].transaction_active) return false;
+    }
     const base = OP_PORT_BASE + (@as(u64, index_value) * OP_PORT_STRIDE);
     const before = readOp32(base);
     _ = clearPortChanges(@intCast(index_value));
@@ -2367,6 +2497,9 @@ fn disableCurrentSlotForScan() void {
     if (current.addressed_slot_id == 0) return;
     const slot = current.addressed_slot_id;
     const port = current.addressed_port;
+    if (runtimeIndexForSlot(slot)) |index| {
+        if (deferRuntimeDetach(&runtimes[index])) return;
+    }
     if (!disableSlot(slot)) return;
     if (port != 0) _ = usb_core.removeByPort("xhci", port);
     releaseRuntimeBySlot(slot);
@@ -2598,6 +2731,8 @@ fn persistActiveRuntime() void {
     rt.bulk_out_enqueue = current.bulk_out_enqueue;
     rt.bulk_out_cycle = current.bulk_out_cycle;
     rt.bulk_out_link_update_pending = current.bulk_out_link_update_pending;
+    inline for (.{ "last_control_request_type", "last_control_request", "last_control_value", "last_control_index", "last_control_length", "last_control_direction", "last_control_completion_code", "last_control_residue", "last_control_ok", "last_bulk_direction", "last_bulk_result", "last_bulk_request_len", "last_bulk_residue", "last_bulk_actual_len", "last_bulk_completion_code", "last_wait_cancelled" }) |field| @field(rt, field) = @field(current, field);
+    rt.sync_transfer_incident = last_sync_transfer_incident;
 }
 
 fn loadRuntime(index_value: usize) void {
@@ -2665,15 +2800,23 @@ fn loadRuntime(index_value: usize) void {
     current.bulk_out_enqueue = rt.bulk_out_enqueue;
     current.bulk_out_cycle = rt.bulk_out_cycle;
     current.bulk_out_link_update_pending = rt.bulk_out_link_update_pending;
+    inline for (.{ "last_control_request_type", "last_control_request", "last_control_value", "last_control_index", "last_control_length", "last_control_direction", "last_control_completion_code", "last_control_residue", "last_control_ok", "last_bulk_direction", "last_bulk_result", "last_bulk_request_len", "last_bulk_residue", "last_bulk_actual_len", "last_bulk_completion_code", "last_wait_cancelled" }) |field| @field(current, field) = @field(rt, field);
+    last_sync_transfer_incident = rt.sync_transfer_incident;
 }
 
 fn releaseRuntimeBySlot(slot_id: u8) void {
+    if (runtimeIndexForSlot(slot_id)) |index| {
+        if (deferRuntimeDetach(&runtimes[index])) return;
+    }
     _ = deferred_events.purgeSlot(slot_id);
-    if (transfer_objects.purgeSlot(slot_id) != 0) closeLastSyncTransferIncident();
+    _ = transfer_objects.purgeSlot(slot_id);
     var i: usize = 0;
     while (i < runtimes.len) : (i += 1) {
         if (!runtimes[i].active or runtimes[i].slot_id != slot_id) continue;
         const was_active = active_runtime_index != null and active_runtime_index.? == i;
+        if (was_active) closeLastSyncTransferIncident() else {
+            _ = diag_screen.resolveIncident(runtimes[i].sync_transfer_incident);
+        }
         freeRuntimeFrames(&runtimes[i]);
         if (current.retained_slots > 0) current.retained_slots -= 1;
         if (was_active) {
@@ -2704,6 +2847,13 @@ fn freeAllRuntimes() void {
     active_runtime_index = null;
     current.retained_slots = 0;
     clearCurrentRuntimeSelection(current.addressed_slot_id);
+}
+
+fn deferRuntimeDetach(rt: *DeviceRuntime) bool {
+    if (!rt.transaction_active) return false;
+    rt.detach_pending = true;
+    pending_port_changes.retry(rt.port);
+    return true;
 }
 
 fn freeDmaFrame(frame: *u64) void {
@@ -2782,6 +2932,7 @@ fn reclaimDisconnectedRuntimes() void {
         const slot = runtimes[i].slot_id;
         const port = runtimes[i].port;
         if (slot == 0 or port == 0 or portIsConnected(port)) continue;
+        if (deferRuntimeDetach(&runtimes[i])) continue;
         current.port_disconnects += 1;
         if (!disableSlot(slot)) continue;
         _ = usb_core.removeByPort("xhci", port);
@@ -2899,6 +3050,7 @@ fn runtimeIndexForPort(port: u8) ?usize {
 
 fn reclaimRuntimeForPort(runtime_index: usize, port: u8) bool {
     if (runtime_index >= runtimes.len or !runtimes[runtime_index].active) return true;
+    if (deferRuntimeDetach(&runtimes[runtime_index])) return false;
     persistActiveRuntime();
     const slot = runtimes[runtime_index].slot_id;
     if (slot == 0 or runtimes[runtime_index].port != port) return false;
@@ -3210,6 +3362,7 @@ fn encodeInterruptInterval(speed: u8, descriptor_interval: u8) u8 {
 }
 
 pub fn configureFirstInterruptInEndpoint(endpoint_address: u8, max_packet: u16, interval: u8) bool {
+    if (!selectedDeviceAllowsMutation()) return false;
     if (!current.get_config_ok or current.addressed_slot_id == 0 or first_input_virt == 0 or first_interrupt_ring_virt == 0) return false;
     if (current.interrupt_endpoint_faulted) return false;
     if ((endpoint_address & 0x80) == 0) return false;
@@ -3286,6 +3439,7 @@ pub fn configureFirstBulkEndpoints(
     out_max_packet: u16,
     out_max_burst: u8,
 ) bool {
+    if (!selectedDeviceAllowsMutation()) return false;
     if (!current.get_config_ok or current.addressed_slot_id == 0 or first_input_virt == 0) return false;
     if (current.bulk_endpoints_faulted) return false;
     if (first_bulk_in_ring_virt == 0 or first_bulk_out_ring_virt == 0) return false;
@@ -3508,6 +3662,7 @@ pub fn setConfigurationForHandle(handle: *DeviceHandle) bool {
 }
 
 pub fn setFirstConfiguration() bool {
+    if (!selectedDeviceAllowsMutation()) return false;
     current.set_configuration_attempted = true;
     current.set_configuration_ok = submitControlNoData(0x00, USB_REQ_SET_CONFIGURATION, current.config_value, 0);
     return current.set_configuration_ok;
@@ -3539,6 +3694,9 @@ fn selectExistingRuntimeForRecovery(
         if (budget.expiredAny()) return false;
     }
     const index_value = runtimeIndexForIdentity(handle.slot_id, handle.port) orelse return false;
+    if (runtimes[index_value].detach_pending or
+        (handle.generation != 0 and runtimes[index_value].generation != handle.generation)) return false;
+    if (runtimes[index_value].transaction_active and !transactionOwnedByCurrent(&runtimes[index_value])) return false;
     if (!recoveryPortReady(handle.port)) return false;
     if (recovery_budget) |budget| {
         if (budget.expiredAny()) return false;
@@ -3814,6 +3972,7 @@ fn recoverEndpointDci(
     fault_class: EndpointFaultClass,
     recovery_budget: ?*const usb_wait.Deadline,
 ) bool {
+    if (!selectedDeviceAllowsMutation()) return false;
     if (dci == 0 or dci >= 32) return false;
     const ep_field = @as(u32, dci) << 16;
     const slot_field = @as(u32, current.addressed_slot_id) << 24;
@@ -3880,6 +4039,7 @@ pub fn setFirstHidIdle(interface_number: u8) bool {
 
 pub fn getHidReportDescriptorForHandle(handle: *DeviceHandle, interface_number: u8, expected_len: u16, out: []u8) ?usize {
     if (!selectDeviceHandle(handle)) return null;
+    if (!selectedDeviceAllowsMutation()) return null;
     if (expected_len == 0 or out.len == 0 or first_descriptor_virt == 0) return null;
     var len: u16 = expected_len;
     if (len > DESCRIPTOR_BYTES) len = @intCast(DESCRIPTOR_BYTES);
@@ -4052,6 +4212,7 @@ pub fn pollInterruptInReportStatus(handle: *EndpointHandle, out: []u8) Interrupt
 }
 
 pub fn bulkOut(data: []const u8) bool {
+    if (!selectedDeviceAllowsMutation()) return false;
     beginBulkRecord(false, data.len);
     if (!current.bulk_endpoints_configured or current.bulk_endpoints_faulted or first_bulk_out_ring_virt == 0 or first_bulk_buffer_virt == 0) {
         current.last_bulk_result = "not-ready";
@@ -4087,7 +4248,7 @@ pub fn bulkOut(data: []const u8) bool {
         _ = transfer_objects.markTimeout(transfer_handle);
         retain_transfer = true;
         current.bulk_failures += 1;
-        current.last_bulk_result = "timeout";
+        current.last_bulk_result = if (current.last_wait_cancelled) "device-detached" else "timeout";
         return false;
     };
     _ = transfer_objects.complete(transfer_handle, completion);
@@ -4109,6 +4270,7 @@ pub fn bulkOutForHandle(handle: *EndpointHandle, data: []const u8) bool {
 }
 
 pub fn bulkIn(out: []u8) bool {
+    if (!selectedDeviceAllowsMutation()) return false;
     beginBulkRecord(true, out.len);
     if (!current.bulk_endpoints_configured or current.bulk_endpoints_faulted or first_bulk_in_ring_virt == 0 or first_bulk_buffer_virt == 0) {
         current.last_bulk_result = "not-ready";
@@ -4144,7 +4306,7 @@ pub fn bulkIn(out: []u8) bool {
         _ = transfer_objects.markTimeout(transfer_handle);
         retain_transfer = true;
         current.bulk_failures += 1;
-        current.last_bulk_result = "timeout";
+        current.last_bulk_result = if (current.last_wait_cancelled) "device-detached" else "timeout";
         return false;
     };
     _ = transfer_objects.complete(transfer_handle, completion);
@@ -4289,6 +4451,7 @@ fn submitControlWithin(
     req: ControlRequest,
     recovery_budget: ?*const usb_wait.Deadline,
 ) bool {
+    if (!selectedDeviceAllowsMutation()) return false;
     // Starting another synchronous transfer abandons an unclaimed earlier
     // timeout token. USBMSC takes its token before entering BOT recovery.
     closeLastSyncTransferIncident();
@@ -4339,9 +4502,9 @@ fn submitControlWithin(
         _ = transfer_objects.markTimeout(transfer_handle);
         retain_transfer = true;
         current.last_control_completion_code = 0xFF;
-        current.control_timeouts += 1;
+        if (!current.last_wait_cancelled) current.control_timeouts += 1;
         current.control_failures += 1;
-        _ = recoverControlEndpoint(recovery_budget);
+        if (!current.last_wait_cancelled) _ = recoverControlEndpoint(recovery_budget);
         // EP0 has no protocol-layer timeout owner. The recovery diagnostics
         // have already joined this generation, so retain their evidence and
         // close it at the control-operation boundary.
@@ -4569,8 +4732,8 @@ fn waitTransferCompletionWithin(
     recovery_budget: ?*const usb_wait.Deadline,
 ) ?XhciEvent {
     if (waitMatchingEventWithin(expected, recovery_budget)) |event| return event;
-    current.timeouts += 1;
-    current.reason = "timeout waiting for xHCI transfer event";
+    if (!current.last_wait_cancelled) current.timeouts += 1;
+    current.reason = if (current.last_wait_cancelled) "USB device detached during transfer" else "timeout waiting for xHCI transfer event";
     return null;
 }
 
@@ -4976,6 +5139,7 @@ fn waitMatchingEventWithin(
     expected: event_router.Match,
     recovery_budget: ?*const usb_wait.Deadline,
 ) ?XhciEvent {
+    current.last_wait_cancelled = false;
     if (deferred_events.take(expected)) |event| return event;
     if (drainEventBatch(expected)) |event| return event;
     var wait = usb_wait.Wait.begin(
@@ -4999,6 +5163,13 @@ fn waitMatchingEventWithin(
     var guard: u32 = 0;
     var timeout_clock: TimeoutClock = .cpu_guard;
     while (true) : (guard +%= 1) {
+        if (active_runtime_index) |index| {
+            if (transactionOwnedByCurrent(&runtimes[index]) and runtimes[index].detach_pending) {
+                current.last_wait_cancelled = true;
+                _ = wait.finish(false);
+                return null;
+            }
+        }
         if (recovery_budget) |budget| {
             if (budget.expiredAny()) {
                 timeout_clock = .recovery_budget;
@@ -5029,7 +5200,7 @@ fn waitMatchingEventWithin(
             timeout_clock = .cpu_guard;
             break;
         }
-        wait.idle();
+        idleDeviceWait(&wait);
     }
     const elapsed_ticks = deadline.elapsedTicks();
     const elapsed_hpet = deadline.elapsedHpet();
@@ -5291,8 +5462,8 @@ fn waitCommandCompletionWithin(
     recovery_budget: ?*const usb_wait.Deadline,
 ) ?XhciEvent {
     if (waitMatchingEventWithin(expected, recovery_budget)) |event| return event;
-    current.timeouts += 1;
-    current.reason = "timeout waiting for xHCI command completion";
+    if (!current.last_wait_cancelled) current.timeouts += 1;
+    current.reason = if (current.last_wait_cancelled) "USB device detached during command" else "timeout waiting for xHCI command completion";
     return null;
 }
 

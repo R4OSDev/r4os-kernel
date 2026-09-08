@@ -1,3 +1,6 @@
+const std = @import("std");
+const sync = @import("../../sched/sync.zig");
+const timer = @import("../../kernel/timer.zig");
 const block = @import("../../storage/block.zig");
 const diag_screen = @import("../../kernel/diag_screen.zig");
 const k = @import("../../kernel/log.zig");
@@ -143,52 +146,70 @@ pub const Status = struct {
 };
 
 const MAX_MSC_DEVICES = 16;
-var media: [MAX_MSC_DEVICES]Status = .{Status{}} ** MAX_MSC_DEVICES;
-var current: *Status = &media[0];
+const Medium = struct {
+    state: Status = .{},
+    index: usize = 0,
+    ownership: sync.UnwindGuard = sync.UnwindGuard.init("usbmsc-device-bot"),
+    data_buffer: [DATA_BUF_LEN]u8 = .{0} ** DATA_BUF_LEN,
+};
+const DeviceBinding = struct {
+    descriptor: usb_core.Device,
+    device: xhci.DeviceHandle,
+    bulk_in: xhci.EndpointHandle,
+    bulk_out: xhci.EndpointHandle,
+};
+var media: [MAX_MSC_DEVICES]Medium = .{Medium{}} ** MAX_MSC_DEVICES;
+var registry_ownership = sync.UnwindGuard.init("usbmsc-registry");
+var last_medium = std.atomic.Value(usize).init(0);
+const OWNERSHIP_TIMEOUT_TICKS = 15 * @as(u64, timer.DEFAULT_HZ);
 var media_count: usize = 0;
 const media_names = [_][]const u8{ "usb0", "usb1", "usb2", "usb3", "usb4", "usb5", "usb6", "usb7", "usb8", "usb9", "usb10", "usb11", "usb12", "usb13", "usb14", "usb15" };
-var current_index: usize = 0;
-var data_buf: [DATA_BUF_LEN]u8 = .{0} ** DATA_BUF_LEN;
-var bot_r4p_build: u64 = 0;
-var bot_r4p_csw: u64 = 0;
-var bot_dispatch_failures: u64 = 0;
-var bot_last_result: i32 = 0;
-var scsi_r4p_build: u64 = 0;
-var scsi_r4p_parse: u64 = 0;
-var scsi_dispatch_failures: u64 = 0;
-var scsi_last_result: i32 = 0;
+var bot_r4p_build = std.atomic.Value(u64).init(0);
+var bot_r4p_csw = std.atomic.Value(u64).init(0);
+var bot_dispatch_failures = std.atomic.Value(u64).init(0);
+var bot_last_result = std.atomic.Value(i32).init(0);
+var scsi_r4p_build = std.atomic.Value(u64).init(0);
+var scsi_r4p_parse = std.atomic.Value(u64).init(0);
+var scsi_dispatch_failures = std.atomic.Value(u64).init(0);
+var scsi_last_result = std.atomic.Value(i32).init(0);
 var block_source: block.Source = .builtin;
 var external_owner: bool = false;
 
 pub fn init() bool {
-    if (!xhci.acquireControllerOwnership()) return false;
-    defer xhci.releaseControllerOwnership();
-    // Boot admission is idempotent; do not orphan registered block contexts.
+    if (!registry_ownership.enter(OWNERSHIP_TIMEOUT_TICKS)) return false;
+    defer _ = registry_ownership.leave();
     if (media_count != 0) return blockDeviceCount() != 0;
     var index: usize = 0;
-    while (usb_core.deviceAt(index)) |dev| : (index += 1) {
+    while (true) : (index += 1) {
+        if (!xhci.acquireControllerOwnership()) return false;
+        const binding: ?DeviceBinding = if (usb_core.deviceAt(index)) |dev| .{
+            .descriptor = dev.*,
+            .device = xhci.deviceHandleFromCore(dev),
+            .bulk_in = xhci.bulkInHandleFromCore(dev),
+            .bulk_out = xhci.bulkOutHandleFromCore(dev),
+        } else null;
+        xhci.releaseControllerOwnership();
+        const selected = binding orelse break;
+        const dev = &selected.descriptor;
         if (dev.first_interface_class != 0x08 or dev.first_interface_subclass != 0x06 or dev.first_interface_protocol != 0x50) continue;
-        if (media_count == media.len) {
-            k.puts("[USBMSC] device capacity reached\r\n");
-            break;
-        }
-        current_index = media_count;
-        current = &media[media_count];
+        if (media_count == media.len) break;
+        const item = &media[media_count];
+        item.index = media_count;
+        const current = &item.state;
         current.* = .{ .initialized = true };
+        _ = initializeMedium(current, &selected);
         media_count += 1;
-        _ = initializeMedium(dev);
     }
-    current_index = 0;
-    current = &media[0];
     return blockDeviceCount() != 0;
 }
 
-fn initializeMedium(dev: *const usb_core.Device) bool {
+fn initializeMedium(current: *Status, binding: *const DeviceBinding) bool {
+    const dev = &binding.descriptor;
     current.present = true;
     current.port = dev.port;
-    current.device = xhci.deviceHandleFromCore(dev);
-    current.bulk_in_handle = xhci.bulkInHandleFromCore(dev);
-    current.bulk_out_handle = xhci.bulkOutHandleFromCore(dev);
+    current.device = binding.device;
+    current.bulk_in_handle = binding.bulk_in;
+    current.bulk_out_handle = binding.bulk_out;
     current.interface_number = dev.first_interface_number;
     current.bulk_in = dev.bulk_in_endpoint_address;
     current.bulk_out = dev.bulk_out_endpoint_address;
@@ -199,33 +220,35 @@ fn initializeMedium(dev: *const usb_core.Device) bool {
         current.reason = "bulk endpoints missing";
         return false;
     }
-    if (!requireMscProtocolRoles()) return false;
-    if (!ensureSelected()) return false;
+    const transaction = beginMediumOperation(current) orelse return false;
+    defer endMediumOperation(current, transaction);
+    if (!requireMscProtocolRoles(current)) return false;
+    if (!ensureSelected(current)) return false;
     current.bound = true;
     // Probe the actual device state immediately. Ready media no longer
     // pays a blind settle second; transient command/Sense states own the
     // bounded waits below.
-    current.inquiry_ok = scsiInquiryWithRetry();
+    current.inquiry_ok = scsiInquiryWithRetry(current);
     if (!current.inquiry_ok) {
         return false;
     }
-    current.test_unit_ready_ok = waitForScsiReady();
+    current.test_unit_ready_ok = waitForScsiReady(current);
     if (!current.test_unit_ready_ok) {
         current.reason = "SCSI device not ready after retry window";
         return false;
     }
-    current.read_capacity_ok = scsiReadCapacityWithRetry();
+    current.read_capacity_ok = scsiReadCapacityWithRetry(current);
     if (!current.read_capacity_ok) {
         current.reason = "SCSI READ CAPACITY failed";
         return false;
     }
-    current.mode_sense_ok = scsiModeSense6();
+    current.mode_sense_ok = scsiModeSense6(current);
     if (!validLogicalBlockSize(current.sector_size)) {
         current.reason = "unsupported logical block size";
         return false;
     }
     current.max_sectors_per_request = maxSectorsForBlockSize(current.sector_size);
-    registerBlockDevice();
+    registerBlockDevice(current);
     current.reason = if (current.block_registered) "USB mass storage block device active" else "block register failed";
     return current.block_registered;
 }
@@ -250,20 +273,24 @@ pub fn hasExternalOwner() bool {
 }
 
 pub fn status() Status {
+    const item = &media[last_medium.load(.acquire)];
+    if (!item.ownership.enter(OWNERSHIP_TIMEOUT_TICKS)) return .{ .reason = "USBMSC device transaction busy" };
+    defer _ = item.ownership.leave();
+    const current = &item.state;
     current.bot_source = r4p.requiredSourceName("usb.msc_bot");
-    current.bot_r4p_build = bot_r4p_build;
-    current.bot_r4p_csw = bot_r4p_csw;
-    current.bot_dispatch_failures = bot_dispatch_failures;
-    current.bot_last_result = bot_last_result;
+    current.bot_r4p_build = bot_r4p_build.load(.monotonic);
+    current.bot_r4p_csw = bot_r4p_csw.load(.monotonic);
+    current.bot_dispatch_failures = bot_dispatch_failures.load(.monotonic);
+    current.bot_last_result = bot_last_result.load(.monotonic);
     current.scsi_source = r4p.requiredSourceName("usb.scsi_block");
-    current.scsi_r4p_build = scsi_r4p_build;
-    current.scsi_r4p_parse = scsi_r4p_parse;
-    current.scsi_dispatch_failures = scsi_dispatch_failures;
-    current.scsi_last_result = scsi_last_result;
+    current.scsi_r4p_build = scsi_r4p_build.load(.monotonic);
+    current.scsi_r4p_parse = scsi_r4p_parse.load(.monotonic);
+    current.scsi_dispatch_failures = scsi_dispatch_failures.load(.monotonic);
+    current.scsi_last_result = scsi_last_result.load(.monotonic);
     return current.*;
 }
 
-fn requireMscProtocolRoles() bool {
+fn requireMscProtocolRoles(current: *Status) bool {
     if (mscProtocolRolesReady()) return true;
     current.protocol_required_missing +%= 1;
     current.reason = missingProtocolReason();
@@ -284,23 +311,23 @@ fn missingProtocolReason() []const u8 {
 
 pub fn blockDeviceCount() usize {
     var count: usize = 0;
-    for (media[0..media_count]) |device| if (device.block_registered) {
+    for (media[0..media_count]) |device| if (device.state.block_registered) {
         count += 1;
     };
     return count;
 }
 
 pub fn deviceIndex() ?usize {
-    for (media[0..media_count]) |device| if (device.block_registered) return device.block_index;
+    for (media[0..media_count]) |device| if (device.state.block_registered) return device.state.block_index;
     return null;
 }
 
 pub fn reselectActiveDevice() bool {
-    if (!xhci.acquireControllerOwnership()) return false;
-    defer xhci.releaseControllerOwnership();
-    for (media[0..media_count]) |*device| if (device.block_registered) {
-        current = device;
-        return ensureSelected();
+    for (media[0..media_count]) |*item| if (item.state.block_registered) {
+        const current = &item.state;
+        const transaction = beginMediumOperation(current) orelse return false;
+        defer endMediumOperation(current, transaction);
+        return ensureSelected(current);
     };
     return false;
 }
@@ -320,9 +347,9 @@ fn usesReadWrite16(lba: u64, sectors: u16) bool {
     return @as(u64, sectors - 1) > 0xFFFF_FFFF - lba;
 }
 
-fn registerBlockDevice() void {
+fn registerBlockDevice(current: *Status) void {
     const index = block.register(.{
-        .name = media_names[current_index],
+        .name = media_names[medium(current).index],
         .model = current.model[0..current.model_len],
         .driver = "USBMSC",
         .bus = .usb,
@@ -347,9 +374,9 @@ fn registerBlockDevice() void {
 }
 
 fn readBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
-    if (!xhci.acquireControllerOwnership()) return false;
-    defer xhci.releaseControllerOwnership();
-    current = @ptrCast(@alignCast(ctx orelse return false));
+    const current: *Status = @ptrCast(@alignCast(ctx orelse return false));
+    const transaction = beginMediumOperation(current) orelse return false;
+    defer endMediumOperation(current, transaction);
     if (sectors == 0 or sectors > current.max_sectors_per_request) {
         current.read_failures += 1;
         return false;
@@ -358,12 +385,12 @@ fn readBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
         current.read_failures += 1;
         return false;
     }
-    if (!ensureSelected()) {
+    if (!ensureSelected(current)) {
         current.read_failures += 1;
         return false;
     }
     const len = @as(usize, sectors) * current.sector_size;
-    if (!scsiRead(lba, sectors, out[0..len])) {
+    if (!scsiRead(current, lba, sectors, out[0..len])) {
         // A completed BOT reset plus xHCI endpoint recovery restores the
         // transport, but the failed READ itself has not happened again.
         // Retry that idempotent read exactly once.  This is especially
@@ -375,11 +402,11 @@ fn readBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
             0,
         )) {
             current.read_transport_retries += 1;
-            retryDelay("usbmsc-read-retry", if (usesReadWrite16(lba, sectors)) 0x88 else 0x28, 1);
-            if (ensureSelected() and scsiRead(lba, sectors, out[0..len])) {
+            retryDelay(current, "usbmsc-read-retry", if (usesReadWrite16(lba, sectors)) 0x88 else 0x28, 1);
+            if (ensureSelected(current) and scsiRead(current, lba, sectors, out[0..len])) {
                 current.read_transport_retry_successes += 1;
                 current.reads += 1;
-                // command() has already resolved the generation-bound direct
+                // command(current) has already resolved the generation-bound direct
                 // diagnostic incident after receiving a valid CSW.  Logging
                 // this success through diag_screen would create a new,
                 // non-resolvable blue incident after recovery.
@@ -387,7 +414,7 @@ fn readBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
                 return true;
             }
         }
-        if (!current.last_failure_transport) _ = scsiRequestSense();
+        if (!current.last_failure_transport) _ = scsiRequestSense(current);
         current.read_failures += 1;
         return false;
     }
@@ -396,9 +423,9 @@ fn readBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
 }
 
 fn writeBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
-    if (!xhci.acquireControllerOwnership()) return false;
-    defer xhci.releaseControllerOwnership();
-    current = @ptrCast(@alignCast(ctx orelse return false));
+    const current: *Status = @ptrCast(@alignCast(ctx orelse return false));
+    const transaction = beginMediumOperation(current) orelse return false;
+    defer endMediumOperation(current, transaction);
     if (sectors == 0 or sectors > current.max_sectors_per_request) {
         current.write_failures += 1;
         return false;
@@ -407,12 +434,12 @@ fn writeBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
         current.write_failures += 1;
         return false;
     }
-    if (!ensureSelected()) {
+    if (!ensureSelected(current)) {
         current.write_failures += 1;
         return false;
     }
     const len = @as(usize, sectors) * current.sector_size;
-    if (!scsiWrite(lba, sectors, data[0..len])) {
+    if (!scsiWrite(current, lba, sectors, data[0..len])) {
         // Reissuing the exact same sector range with the same bytes is
         // idempotent even if the original CSW was lost after the device had
         // accepted some or all data. Recovery only repairs BOT/xHCI; replay
@@ -423,15 +450,15 @@ fn writeBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
             0,
         )) {
             current.write_transport_retries += 1;
-            retryDelay("usbmsc-write-retry", if (usesReadWrite16(lba, sectors)) 0x8A else 0x2A, 1);
-            if (ensureSelected() and scsiWrite(lba, sectors, data[0..len])) {
+            retryDelay(current, "usbmsc-write-retry", if (usesReadWrite16(lba, sectors)) 0x8A else 0x2A, 1);
+            if (ensureSelected(current) and scsiWrite(current, lba, sectors, data[0..len])) {
                 current.write_transport_retry_successes += 1;
                 current.writes += 1;
                 k.puts("[USBMSC] WRITE transport retry recovered\n");
                 return true;
             }
         }
-        if (!current.last_failure_transport) _ = scsiRequestSense();
+        if (!current.last_failure_transport) _ = scsiRequestSense(current);
         current.write_failures += 1;
         return false;
     }
@@ -440,14 +467,14 @@ fn writeBlock(ctx: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
 }
 
 fn flushBlock(ctx: ?*anyopaque) bool {
-    if (!xhci.acquireControllerOwnership()) return false;
-    defer xhci.releaseControllerOwnership();
-    current = @ptrCast(@alignCast(ctx orelse return false));
-    if (!ensureSelected()) {
+    const current: *Status = @ptrCast(@alignCast(ctx orelse return false));
+    const transaction = beginMediumOperation(current) orelse return false;
+    defer endMediumOperation(current, transaction);
+    if (!ensureSelected(current)) {
         current.flush_failures += 1;
         return false;
     }
-    if (!scsiSynchronizeCache10()) {
+    if (!scsiSynchronizeCache10(current)) {
         // SYNCHRONIZE CACHE is idempotent. As with READ/WRITE, a completed
         // transport recovery has not replayed the command itself.
         if (retry_policy.shouldRetryTransport(
@@ -456,8 +483,8 @@ fn flushBlock(ctx: ?*anyopaque) bool {
             0,
         )) {
             current.flush_transport_retries += 1;
-            retryDelay("usbmsc-flush-retry", 0x35, 1);
-            if (ensureSelected() and scsiSynchronizeCache10()) {
+            retryDelay(current, "usbmsc-flush-retry", 0x35, 1);
+            if (ensureSelected(current) and scsiSynchronizeCache10(current)) {
                 current.flush_transport_retry_successes += 1;
                 current.flushes += 1;
                 k.puts("[USBMSC] SYNC-CACHE transport retry recovered\n");
@@ -465,7 +492,7 @@ fn flushBlock(ctx: ?*anyopaque) bool {
             }
         }
         if (!current.last_failure_transport) {
-            const sense_ok = scsiRequestSense();
+            const sense_ok = scsiRequestSense(current);
             if (sense_ok and
                 current.sense_valid and
                 current.sense_for_opcode == 0x35 and
@@ -483,7 +510,9 @@ fn flushBlock(ctx: ?*anyopaque) bool {
     return true;
 }
 
-fn ensureSelected() bool {
+fn ensureSelected(current: *Status) bool {
+    if (!xhci.acquireControllerOwnership()) return false;
+    defer xhci.releaseControllerOwnership();
     if (current.media_changed or (current.block_registered and !xhci.deviceHandleCurrent(current.device))) {
         current.media_changed = true;
         current.failures += 1;
@@ -536,27 +565,27 @@ fn ensureSelected() bool {
     return true;
 }
 
-fn scsiInquiry() bool {
-    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_INQUIRY, 0, 0) orelse {
+fn scsiInquiry(current: *Status) bool {
+    const cmd = buildScsiCommand(current, r4p_contract.USB_SCSI_OP_BUILD_INQUIRY, 0, 0) orelse {
         current.reason = "SCSI INQUIRY command build failed";
-        return failCommand();
+        return failCommand(current);
     };
-    if (!command(cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, data_buf[0..cmd.transfer_len])) return false;
+    if (!command(current, cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, medium(current).data_buffer[0..cmd.transfer_len])) return false;
     const actual: usize = @intCast(current.last_data_actual_len);
     if (actual < 5) {
-        setDataLengthReason("inquiry-short", current.last_data_actual_len);
-        return failCommand();
+        setDataLengthReason(current, "inquiry-short", current.last_data_actual_len);
+        return failCommand(current);
     }
-    const declared = @min(@as(usize, cmd.transfer_len), @as(usize, data_buf[4]) + 5);
+    const declared = @min(@as(usize, cmd.transfer_len), @as(usize, medium(current).data_buffer[4]) + 5);
     if (actual < declared) {
-        setDataLengthReason("inquiry-truncated", current.last_data_actual_len);
-        return failCommand();
+        setDataLengthReason(current, "inquiry-truncated", current.last_data_actual_len);
+        return failCommand(current);
     }
     // Standard INQUIRY supplies an 8-byte vendor and 16-byte product name.
     // Short valid replies may omit them; leave the model empty in that case.
     current.model_len = 0;
     if (actual >= 32 and declared >= 32) {
-        for (data_buf[8..32]) |byte| {
+        for (medium(current).data_buffer[8..32]) |byte| {
             if (byte < 32 or byte > 126) {
                 current.model_len = 0;
                 break;
@@ -569,7 +598,7 @@ fn scsiInquiry() bool {
     return true;
 }
 
-fn scsiInquiryWithRetry() bool {
+fn scsiInquiryWithRetry(current: *Status) bool {
     var budget = usb_wait.Deadline.begin(usb_timing.SCSI_INQUIRY_BUDGET_MS);
     defer {
         current.inquiry_wait_elapsed_ns = budget.elapsedNanoseconds();
@@ -577,25 +606,25 @@ fn scsiInquiryWithRetry() bool {
     }
     var attempt: u8 = 0;
     while (attempt < usb_timing.SCSI_INQUIRY_ATTEMPTS) : (attempt += 1) {
-        if (scsiInquiry()) return true;
+        if (scsiInquiry(current)) return true;
         if (attempt + 1 >= usb_timing.SCSI_INQUIRY_ATTEMPTS) break;
         if (budget.expiredAny()) {
             current.retry_budget_timeouts += 1;
             break;
         }
-        if (!shouldRetryScsiFailure(attempt)) break;
+        if (!shouldRetryScsiFailure(current, attempt)) break;
         current.inquiry_retries += 1;
-        retryDelay("usbmsc-inquiry-retry", 0x12, attempt + 1);
+        retryDelay(current, "usbmsc-inquiry-retry", 0x12, attempt + 1);
     }
     return false;
 }
 
-fn scsiTestUnitReady() bool {
-    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_TEST_UNIT_READY, 0, 0) orelse return failCommand();
-    return command(cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, data_buf[0..cmd.transfer_len]);
+fn scsiTestUnitReady(current: *Status) bool {
+    const cmd = buildScsiCommand(current, r4p_contract.USB_SCSI_OP_BUILD_TEST_UNIT_READY, 0, 0) orelse return failCommand(current);
+    return command(current, cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, medium(current).data_buffer[0..cmd.transfer_len]);
 }
 
-fn waitForScsiReady() bool {
+fn waitForScsiReady(current: *Status) bool {
     var budget = usb_wait.Deadline.begin(usb_timing.SCSI_READY_BUDGET_MS);
     defer {
         current.ready_wait_elapsed_ns = budget.elapsedNanoseconds();
@@ -603,38 +632,38 @@ fn waitForScsiReady() bool {
     }
     var attempt: u8 = 0;
     while (attempt < usb_timing.SCSI_READY_ATTEMPTS) : (attempt += 1) {
-        if (scsiTestUnitReady()) return true;
+        if (scsiTestUnitReady(current)) return true;
         if (attempt + 1 >= usb_timing.SCSI_READY_ATTEMPTS) break;
         if (budget.expiredAny()) {
             current.retry_budget_timeouts += 1;
             break;
         }
-        if (!shouldRetryScsiFailure(attempt)) break;
+        if (!shouldRetryScsiFailure(current, attempt)) break;
         current.test_unit_ready_retries += 1;
-        retryDelay("usbmsc-ready-retry", 0x00, attempt + 1);
+        retryDelay(current, "usbmsc-ready-retry", 0x00, attempt + 1);
     }
     return false;
 }
 
-fn scsiRequestSense() bool {
+fn scsiRequestSense(current: *Status) bool {
     const failed_opcode = current.last_opcode;
-    invalidateSense();
-    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_REQUEST_SENSE, 0, 0) orelse return failCommand();
+    invalidateSense(current);
+    const cmd = buildScsiCommand(current, r4p_contract.USB_SCSI_OP_BUILD_REQUEST_SENSE, 0, 0) orelse return failCommand(current);
     current.sense_requests += 1;
-    if (!command(cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, data_buf[0..cmd.transfer_len])) {
+    if (!command(current, cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, medium(current).data_buffer[0..cmd.transfer_len])) {
         current.last_opcode = failed_opcode;
         return false;
     }
     current.last_opcode = failed_opcode;
     const actual: usize = @intCast(current.last_data_actual_len);
-    if (!parseScsiSense(data_buf[0..actual], failed_opcode)) {
-        setDataLengthReason("sense-short-or-invalid", current.last_data_actual_len);
-        return failCommand();
+    if (!parseScsiSense(current, medium(current).data_buffer[0..actual], failed_opcode)) {
+        setDataLengthReason(current, "sense-short-or-invalid", current.last_data_actual_len);
+        return failCommand(current);
     }
     return true;
 }
 
-fn invalidateSense() void {
+fn invalidateSense(current: *Status) void {
     current.sense_valid = false;
     current.sense_for_opcode = 0;
     current.sense_key = 0;
@@ -642,7 +671,7 @@ fn invalidateSense() void {
     current.sense_ascq = 0;
 }
 
-fn classifySense() void {
+fn classifySense(current: *Status) void {
     switch (current.sense_key) {
         0x02 => current.sense_not_ready += 1,
         0x05 => current.sense_illegal_request += 1,
@@ -652,36 +681,36 @@ fn classifySense() void {
     }
 }
 
-fn scsiReadCapacity10() bool {
-    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_READ_CAPACITY10, 0, 0) orelse return failCommand();
-    if (!command(cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, data_buf[0..cmd.transfer_len])) return false;
+fn scsiReadCapacity10(current: *Status) bool {
+    const cmd = buildScsiCommand(current, r4p_contract.USB_SCSI_OP_BUILD_READ_CAPACITY10, 0, 0) orelse return failCommand(current);
+    if (!command(current, cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, medium(current).data_buffer[0..cmd.transfer_len])) return false;
     const actual: usize = @intCast(current.last_data_actual_len);
-    if (!parseScsiCapacity(data_buf[0..actual])) {
-        setDataLengthReason("capacity-short-or-invalid", current.last_data_actual_len);
-        return failCommand();
+    if (!parseScsiCapacity(current, medium(current).data_buffer[0..actual])) {
+        setDataLengthReason(current, "capacity-short-or-invalid", current.last_data_actual_len);
+        return failCommand(current);
     }
     return true;
 }
 
-fn scsiReadCapacity16() bool {
-    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_READ_CAPACITY16, 0, 0) orelse return failCommand();
-    if (!command(cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, data_buf[0..cmd.transfer_len])) return false;
+fn scsiReadCapacity16(current: *Status) bool {
+    const cmd = buildScsiCommand(current, r4p_contract.USB_SCSI_OP_BUILD_READ_CAPACITY16, 0, 0) orelse return failCommand(current);
+    if (!command(current, cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, medium(current).data_buffer[0..cmd.transfer_len])) return false;
     const actual: usize = @intCast(current.last_data_actual_len);
-    if (!parseScsiCapacity16(data_buf[0..actual])) {
-        setDataLengthReason("capacity16-short-or-invalid", current.last_data_actual_len);
-        return failCommand();
+    if (!parseScsiCapacity16(current, medium(current).data_buffer[0..actual])) {
+        setDataLengthReason(current, "capacity16-short-or-invalid", current.last_data_actual_len);
+        return failCommand(current);
     }
     current.capacity16_used = true;
     return true;
 }
 
-fn scsiReadCapacity() bool {
-    if (!scsiReadCapacity10()) return false;
+fn scsiReadCapacity(current: *Status) bool {
+    if (!scsiReadCapacity10(current)) return false;
     if (current.sector_count != 0) return true;
-    return scsiReadCapacity16();
+    return scsiReadCapacity16(current);
 }
 
-fn scsiReadCapacityWithRetry() bool {
+fn scsiReadCapacityWithRetry(current: *Status) bool {
     var budget = usb_wait.Deadline.begin(usb_timing.SCSI_CAPACITY_BUDGET_MS);
     defer {
         current.capacity_wait_elapsed_ns = budget.elapsedNanoseconds();
@@ -689,20 +718,20 @@ fn scsiReadCapacityWithRetry() bool {
     }
     var attempt: u8 = 0;
     while (attempt < usb_timing.SCSI_CAPACITY_ATTEMPTS) : (attempt += 1) {
-        if (scsiReadCapacity()) return true;
+        if (scsiReadCapacity(current)) return true;
         if (attempt + 1 >= usb_timing.SCSI_CAPACITY_ATTEMPTS) break;
         if (budget.expiredAny()) {
             current.retry_budget_timeouts += 1;
             break;
         }
-        if (!shouldRetryScsiFailure(attempt)) break;
+        if (!shouldRetryScsiFailure(current, attempt)) break;
         current.read_capacity_retries += 1;
-        retryDelay("usbmsc-capacity-retry", 0x25, attempt + 1);
+        retryDelay(current, "usbmsc-capacity-retry", 0x25, attempt + 1);
     }
     return false;
 }
 
-fn shouldRetryScsiFailure(retries: u8) bool {
+fn shouldRetryScsiFailure(current: *Status, retries: u8) bool {
     if (current.last_failure_transport) {
         return retry_policy.shouldRetryScsiFailure(
             true,
@@ -715,7 +744,7 @@ fn shouldRetryScsiFailure(retries: u8) bool {
         );
     }
 
-    _ = scsiRequestSense();
+    _ = scsiRequestSense(current);
     const retry = retry_policy.shouldRetryScsiFailure(
         current.last_failure_transport,
         current.last_recovery_ok,
@@ -737,50 +766,50 @@ fn shouldRetryScsiFailure(retries: u8) bool {
     return retry;
 }
 
-fn retryDelay(reason: []const u8, opcode: u8, retry: u8) void {
+fn retryDelay(current: *Status, reason: []const u8, opcode: u8, retry: u8) void {
     current.retry_delay_calls += 1;
     current.last_retry_opcode = opcode;
     current.last_retry_number = retry;
     _ = usb_wait.millisecondsWithReason(usb_timing.SCSI_RETRY_DELAY_MS, reason, retry);
 }
 
-fn scsiModeSense6() bool {
-    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_MODE_SENSE6, 0, 0) orelse return failCommand();
-    if (!command(cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, data_buf[0..cmd.transfer_len])) return false;
+fn scsiModeSense6(current: *Status) bool {
+    const cmd = buildScsiCommand(current, r4p_contract.USB_SCSI_OP_BUILD_MODE_SENSE6, 0, 0) orelse return failCommand(current);
+    if (!command(current, cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, medium(current).data_buffer[0..cmd.transfer_len])) return false;
     const actual: usize = @intCast(current.last_data_actual_len);
-    if (!parseScsiModeSense(data_buf[0..actual])) {
-        setDataLengthReason("mode-sense-short-or-invalid", current.last_data_actual_len);
-        return failCommand();
+    if (!parseScsiModeSense(current, medium(current).data_buffer[0..actual])) {
+        setDataLengthReason(current, "mode-sense-short-or-invalid", current.last_data_actual_len);
+        return failCommand(current);
     }
     return true;
 }
 
-fn scsiRead(lba: u64, sectors: u16, out: []u8) bool {
+fn scsiRead(current: *Status, lba: u64, sectors: u16, out: []u8) bool {
     const use16 = usesReadWrite16(lba, sectors);
     const opcode = if (use16) r4p_contract.USB_SCSI_OP_BUILD_READ16 else r4p_contract.USB_SCSI_OP_BUILD_READ10;
-    const cmd = buildScsiCommand(opcode, lba, sectors) orelse return failCommand();
+    const cmd = buildScsiCommand(current, opcode, lba, sectors) orelse return failCommand(current);
     if (use16) current.read16_commands +%= 1 else current.read10_commands +%= 1;
-    return command(cmd.cdb[0..cmd.len], cmd.direction, @intCast(out.len), out);
+    return command(current, cmd.cdb[0..cmd.len], cmd.direction, @intCast(out.len), out);
 }
 
-fn scsiWrite(lba: u64, sectors: u16, data: []const u8) bool {
+fn scsiWrite(current: *Status, lba: u64, sectors: u16, data: []const u8) bool {
     const use16 = usesReadWrite16(lba, sectors);
     const opcode = if (use16) r4p_contract.USB_SCSI_OP_BUILD_WRITE16 else r4p_contract.USB_SCSI_OP_BUILD_WRITE10;
-    const cmd = buildScsiCommand(opcode, lba, sectors) orelse return failCommand();
+    const cmd = buildScsiCommand(current, opcode, lba, sectors) orelse return failCommand(current);
     if (use16) current.write16_commands +%= 1 else current.write10_commands +%= 1;
-    return command(cmd.cdb[0..cmd.len], cmd.direction, @intCast(data.len), @constCast(data));
+    return command(current, cmd.cdb[0..cmd.len], cmd.direction, @intCast(data.len), @constCast(data));
 }
 
-fn scsiSynchronizeCache10() bool {
-    const cmd = buildScsiCommand(r4p_contract.USB_SCSI_OP_BUILD_SYNC_CACHE10, 0, 0) orelse return failCommand();
-    return command(cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, data_buf[0..cmd.transfer_len]);
+fn scsiSynchronizeCache10(current: *Status) bool {
+    const cmd = buildScsiCommand(current, r4p_contract.USB_SCSI_OP_BUILD_SYNC_CACHE10, 0, 0) orelse return failCommand(current);
+    return command(current, cmd.cdb[0..cmd.len], cmd.direction, cmd.transfer_len, medium(current).data_buffer[0..cmd.transfer_len]);
 }
 
-fn buildScsiCommand(opcode: u32, lba: u64, sectors: u16) ?ScsiCommand {
-    return buildScsiCommandR4p(opcode, lba, sectors);
+fn buildScsiCommand(current: *Status, opcode: u32, lba: u64, sectors: u16) ?ScsiCommand {
+    return buildScsiCommandR4p(current, opcode, lba, sectors);
 }
 
-fn buildScsiCommandR4p(opcode: u32, lba: u64, sectors: u16) ?ScsiCommand {
+fn buildScsiCommandR4p(current: *Status, opcode: u32, lba: u64, sectors: u16) ?ScsiCommand {
     if (!r4p.hasActiveR4p("usb.scsi_block")) return null;
     var op: r4p_contract.UsbScsiBlockOp = .{
         .lba = @truncate(lba),
@@ -801,15 +830,15 @@ fn buildScsiCommandR4p(opcode: u32, lba: u64, sectors: u16) ?ScsiCommand {
         .transfer_len = op.transfer_len,
     };
     @memcpy(cmd.cdb[0..op.cdb_len], op.cdb[0..op.cdb_len]);
-    scsi_r4p_build +%= 1;
+    _ = scsi_r4p_build.fetchAdd(1, .monotonic);
     return cmd;
 }
 
-fn parseScsiSense(data: []const u8, failed_opcode: u8) bool {
-    return parseScsiSenseR4p(data, failed_opcode);
+fn parseScsiSense(current: *Status, data: []const u8, failed_opcode: u8) bool {
+    return parseScsiSenseR4p(current, data, failed_opcode);
 }
 
-fn parseScsiSenseR4p(data: []const u8, failed_opcode: u8) bool {
+fn parseScsiSenseR4p(current: *Status, data: []const u8, failed_opcode: u8) bool {
     if (!r4p.hasActiveR4p("usb.scsi_block") or data.len > r4p_contract.USB_SCSI_MAX_DATA) return false;
     var op: r4p_contract.UsbScsiBlockOp = .{
         .allocation_len = @intCast(data.len),
@@ -828,19 +857,19 @@ fn parseScsiSenseR4p(data: []const u8, failed_opcode: u8) bool {
     // bridge. Initial power-on unit attention (ASC 29) retains its boot policy.
     if (current.block_registered and (op.sense_asc == 0x28 or op.sense_asc == 0x3a or
         (op.sense_asc == 0x2a and op.sense_ascq == 0x09))) current.media_changed = true;
-    classifySense();
+    classifySense(current);
     if (current.block_index) |idx| {
         block.recordSense(idx, current.sense_for_opcode, current.sense_key, current.sense_asc, current.sense_ascq);
     }
-    scsi_r4p_parse +%= 1;
+    _ = scsi_r4p_parse.fetchAdd(1, .monotonic);
     return true;
 }
 
-fn parseScsiCapacity(data: []const u8) bool {
-    return parseScsiCapacityR4p(data);
+fn parseScsiCapacity(current: *Status, data: []const u8) bool {
+    return parseScsiCapacityR4p(current, data);
 }
 
-fn parseScsiCapacityR4p(data: []const u8) bool {
+fn parseScsiCapacityR4p(current: *Status, data: []const u8) bool {
     if (!r4p.hasActiveR4p("usb.scsi_block") or data.len > r4p_contract.USB_SCSI_MAX_DATA) return false;
     var op: r4p_contract.UsbScsiBlockOp = .{ .allocation_len = @intCast(data.len) };
     @memcpy(op.data[0..data.len], data);
@@ -848,11 +877,11 @@ fn parseScsiCapacityR4p(data: []const u8) bool {
     current.sector_count = op.sector_count;
     current.sector_size = op.sector_size;
     current.capacity_format = op.capacity_format;
-    scsi_r4p_parse +%= 1;
+    _ = scsi_r4p_parse.fetchAdd(1, .monotonic);
     return true;
 }
 
-fn parseScsiCapacity16(data: []const u8) bool {
+fn parseScsiCapacity16(current: *Status, data: []const u8) bool {
     if (!r4p.hasActiveR4p("usb.scsi_block") or data.len > r4p_contract.USB_SCSI_MAX_DATA) return false;
     var op: r4p_contract.UsbScsiBlockOp = .{ .allocation_len = @intCast(data.len) };
     @memcpy(op.data[0..data.len], data);
@@ -860,22 +889,22 @@ fn parseScsiCapacity16(data: []const u8) bool {
     current.sector_count = op.sector_count;
     current.sector_size = op.sector_size;
     current.capacity_format = op.capacity_format;
-    scsi_r4p_parse +%= 1;
+    _ = scsi_r4p_parse.fetchAdd(1, .monotonic);
     return true;
 }
 
-fn parseScsiModeSense(data: []const u8) bool {
-    return parseScsiModeSenseR4p(data);
+fn parseScsiModeSense(current: *Status, data: []const u8) bool {
+    return parseScsiModeSenseR4p(current, data);
 }
 
-fn parseScsiModeSenseR4p(data: []const u8) bool {
+fn parseScsiModeSenseR4p(current: *Status, data: []const u8) bool {
     if (!r4p.hasActiveR4p("usb.scsi_block") or data.len > r4p_contract.USB_SCSI_MAX_DATA) return false;
     var op: r4p_contract.UsbScsiBlockOp = .{ .allocation_len = @intCast(data.len) };
     @memcpy(op.data[0..data.len], data);
     if (!dispatchScsi(r4p_contract.USB_SCSI_OP_PARSE_MODE_SENSE6, &op) or op.result != r4p_contract.USB_SCSI_RESULT_OK) return false;
     current.write_protected_known = op.write_protected_known != 0;
     current.write_protected = op.write_protected != 0;
-    scsi_r4p_parse +%= 1;
+    _ = scsi_r4p_parse.fetchAdd(1, .monotonic);
     return true;
 }
 
@@ -889,20 +918,20 @@ fn dispatchScsi(opcode: u32, op: *r4p_contract.UsbScsiBlockOp) bool {
     };
     var out: protocol_api.ProtocolBuffer = .{};
     const result = r4p.dispatch("usb.scsi_block", opcode, &buffer, &out);
-    scsi_last_result = result;
+    scsi_last_result.store(result, .monotonic);
     if (result != r4p_contract.USB_SCSI_RESULT_OK) {
-        scsi_dispatch_failures +%= 1;
+        _ = scsi_dispatch_failures.fetchAdd(1, .monotonic);
         return false;
     }
     return true;
 }
 
-fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u8) bool {
+fn command(current: *Status, cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u8) bool {
     // The complete CBW/data/CSW attempt plus its bounded BOT/xHCI recovery is
     // one diagnostic lifetime. Retained evidence and framebuffer pixels stay
     // intact after resolve, while no failed command can orphan the generation
     // merely because its caller decides not to retry.
-    defer resolveTransportIncident();
+    defer resolveTransportIncident(current);
     current.last_failure_transport = false;
     current.last_recovery_ok = false;
     if (current.transport_faulted or current.media_changed) {
@@ -912,15 +941,15 @@ fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u
     }
     if (cdb.len == 0 or cdb.len > 16) {
         current.reason = "SCSI invalid CDB length";
-        return failCommand();
+        return failCommand(current);
     }
     if (@as(usize, transfer_len) > buffer.len) {
         current.reason = "SCSI transfer buffer too small";
-        return failCommand();
+        return failCommand(current);
     }
-    if (cdb[0] != 0x03) invalidateSense();
+    if (cdb[0] != 0x03) invalidateSense(current);
     var cbw: [CBW_LEN]u8 = .{0} ** CBW_LEN;
-    const tag = nextTag();
+    const tag = nextTag(current);
     current.last_opcode = cdb[0];
     current.last_transfer_len = transfer_len;
     current.last_data_actual_len = 0;
@@ -929,31 +958,31 @@ fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u
     current.last_csw_status = 0xFF;
     if (buildCbw(cdb, direction, transfer_len, tag, cbw[0..]) == null) {
         current.reason = "SCSI BOT CBW build failed";
-        return failCommand();
+        return failCommand(current);
     }
 
-    _ = hostBulkOut(&current.bulk_out_handle, cbw[0..]) orelse return failTransportAt("cbw-out");
+    _ = hostBulkOut(&current.bulk_out_handle, cbw[0..]) orelse return failTransportAt(current, "cbw-out");
     var data_actual_len: u32 = 0;
     if (transfer_len != 0) {
         const data = buffer[0..@intCast(transfer_len)];
         switch (direction) {
             .in => {
-                data_actual_len = hostBulkIn(&current.bulk_in_handle, data) orelse return failTransportAt("data-in");
+                data_actual_len = hostBulkIn(&current.bulk_in_handle, data) orelse return failTransportAt(current, "data-in");
             },
             .out => {
-                data_actual_len = hostBulkOut(&current.bulk_out_handle, data) orelse return failTransportAt("data-out");
+                data_actual_len = hostBulkOut(&current.bulk_out_handle, data) orelse return failTransportAt(current, "data-out");
             },
             .none => {
                 current.reason = "SCSI data direction missing";
-                return failCommand();
+                return failCommand(current);
             },
         }
         current.last_data_actual_len = data_actual_len;
     }
     var csw: [CSW_LEN]u8 = .{0} ** CSW_LEN;
-    const csw_actual = hostBulkIn(&current.bulk_in_handle, csw[0..]) orelse return failTransportAt("csw-in");
-    if (csw_actual != CSW_LEN) return failTransportAt("csw-short");
-    const csw_result = parseCsw(csw[0..], tag, transfer_len);
+    const csw_actual = hostBulkIn(&current.bulk_in_handle, csw[0..]) orelse return failTransportAt(current, "csw-in");
+    if (csw_actual != CSW_LEN) return failTransportAt(current, "csw-short");
+    const csw_result = parseCsw(current, csw[0..], tag, transfer_len);
     current.commands += 1;
 
     // For an IN phase, xHCI's actual byte count and BOT's dCSWDataResidue
@@ -969,8 +998,8 @@ fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u
             transfer_len - data_actual_len != current.last_csw_residue)
         {
             current.csw_residue_errors += 1;
-            setDataLengthReason("data-residue-mismatch", data_actual_len);
-            return failTransport();
+            setDataLengthReason(current, "data-residue-mismatch", data_actual_len);
+            return failTransport(current);
         }
     }
 
@@ -982,46 +1011,46 @@ fn command(cdb: []const u8, direction: Direction, transfer_len: u32, buffer: []u
         (data_actual_len != transfer_len or current.last_csw_residue != 0))
     {
         current.short_data_errors += 1;
-        setDataLengthReason("short-fixed-data", data_actual_len);
-        return failTransport();
+        setDataLengthReason(current, "short-fixed-data", data_actual_len);
+        return failTransport(current);
     }
 
     switch (csw_result) {
         r4p_contract.USB_MSC_BOT_RESULT_OK => {
-            resolveTransportIncident();
+            resolveTransportIncident(current);
             return true;
         },
         r4p_contract.USB_MSC_BOT_RESULT_COMMAND_FAILED => {
             // A valid command-failed CSW still proves that the BOT transport
             // has completed a full CBW/data/CSW exchange.
-            resolveTransportIncident();
-            setProtocolReason("command-failed");
-            return failCommand();
+            resolveTransportIncident(current);
+            setProtocolReason(current, "command-failed");
+            return failCommand(current);
         },
         r4p_contract.USB_MSC_BOT_RESULT_BAD_CSW => {
             current.invalid_csw += 1;
-            setProtocolReason("bad-csw");
-            return failTransport();
+            setProtocolReason(current, "bad-csw");
+            return failTransport(current);
         },
         r4p_contract.USB_MSC_BOT_RESULT_TAG_MISMATCH => {
             current.csw_tag_mismatches += 1;
-            setProtocolReason("tag-mismatch");
-            return failTransport();
+            setProtocolReason(current, "tag-mismatch");
+            return failTransport(current);
         },
         r4p_contract.USB_MSC_BOT_RESULT_RESIDUE => {
             current.csw_residue_errors += 1;
-            setProtocolReason("invalid-residue");
-            return failTransport();
+            setProtocolReason(current, "invalid-residue");
+            return failTransport(current);
         },
         r4p_contract.USB_MSC_BOT_RESULT_PHASE_ERROR => {
             current.csw_phase_errors += 1;
-            setProtocolReason("phase-error");
-            return failTransport();
+            setProtocolReason(current, "phase-error");
+            return failTransport(current);
         },
         else => {
             current.invalid_csw += 1;
-            setProtocolReason("unsupported-csw");
-            return failTransport();
+            setProtocolReason(current, "unsupported-csw");
+            return failTransport(current);
         },
     }
 }
@@ -1059,16 +1088,16 @@ fn buildCbwR4p(cdb: []const u8, direction: Direction, transfer_len: u32, tag: u3
     if (!dispatchBot(r4p_contract.USB_MSC_BOT_OP_BUILD_CBW, &op)) return false;
     if (op.result != r4p_contract.USB_MSC_BOT_RESULT_OK) return false;
     @memcpy(out[0..CBW_LEN], op.cbw[0..CBW_LEN]);
-    bot_r4p_build +%= 1;
+    _ = bot_r4p_build.fetchAdd(1, .monotonic);
     return true;
 }
 
-fn parseCsw(csw: []const u8, tag: u32, transfer_len: u32) i32 {
-    if (parseCswR4p(csw, tag, transfer_len)) |result| return result;
+fn parseCsw(current: *Status, csw: []const u8, tag: u32, transfer_len: u32) i32 {
+    if (parseCswR4p(current, csw, tag, transfer_len)) |result| return result;
     return r4p_contract.USB_MSC_BOT_RESULT_BAD_CSW;
 }
 
-fn parseCswR4p(csw: []const u8, tag: u32, transfer_len: u32) ?i32 {
+fn parseCswR4p(current: *Status, csw: []const u8, tag: u32, transfer_len: u32) ?i32 {
     if (!r4p.hasActiveR4p("usb.msc_bot") or csw.len < CSW_LEN) return null;
     var op: r4p_contract.UsbMscBotOp = .{
         .tag = tag,
@@ -1079,7 +1108,7 @@ fn parseCswR4p(csw: []const u8, tag: u32, transfer_len: u32) ?i32 {
     current.last_csw_tag = op.csw_tag;
     current.last_csw_residue = op.residue;
     current.last_csw_status = op.status;
-    bot_r4p_csw +%= 1;
+    _ = bot_r4p_csw.fetchAdd(1, .monotonic);
     return op.result;
 }
 
@@ -1093,15 +1122,15 @@ fn dispatchBot(opcode: u32, op: *r4p_contract.UsbMscBotOp) bool {
     };
     var out: protocol_api.ProtocolBuffer = .{};
     const result = r4p.dispatch("usb.msc_bot", opcode, &buffer, &out);
-    bot_last_result = result;
+    bot_last_result.store(result, .monotonic);
     if (result != r4p_contract.USB_MSC_BOT_RESULT_OK and result != r4p_contract.USB_MSC_BOT_RESULT_COMMAND_FAILED) {
-        bot_dispatch_failures +%= 1;
+        _ = bot_dispatch_failures.fetchAdd(1, .monotonic);
         return false;
     }
     return true;
 }
 
-fn failCommand() bool {
+fn failCommand(current: *Status) bool {
     current.last_failure_transport = false;
     current.last_recovery_ok = false;
     current.failures += 1;
@@ -1109,12 +1138,12 @@ fn failCommand() bool {
     return false;
 }
 
-fn failTransport() bool {
+fn failTransport(current: *Status) bool {
     current.last_failure_transport = true;
     current.transport_faulted = true;
     current.failures += 1;
     current.transport_failures += 1;
-    const transfer_incident = xhci.takeLastSyncTransferIncidentToken();
+    const transfer_incident = xhci.takeSyncTransferIncidentForDevice(current.device);
     if (transfer_incident.valid()) {
         if (current.transport_incident.valid() and
             current.transport_incident.generation != transfer_incident.generation)
@@ -1141,19 +1170,19 @@ fn failTransport() bool {
     diag_screen.write("/");
     diag_screen.writeDec(current.last_transfer_len);
     diag_screen.endLine();
-    current.last_recovery_ok = recoverTransport();
+    current.last_recovery_ok = recoverTransport(current);
     diag_screen.write("[USBMSC] transport recovery=");
     diag_screen.write(if (current.last_recovery_ok) "ok" else "failed");
     diag_screen.endLine();
     return false;
 }
 
-fn failTransportAt(stage: []const u8) bool {
-    setTransportReason(stage);
-    return failTransport();
+fn failTransportAt(current: *Status, stage: []const u8) bool {
+    setTransportReason(current, stage);
+    return failTransport(current);
 }
 
-fn resolveTransportIncident() void {
+fn resolveTransportIncident(current: *Status) void {
     _ = diag_screen.resolveIncident(current.transport_incident);
     current.transport_incident = .{};
 }
@@ -1175,14 +1204,14 @@ fn opcodeName(opcode: u8) []const u8 {
     };
 }
 
-fn appendReason(cursor: *usize, text: []const u8) void {
+fn appendReason(current: *Status, cursor: *usize, text: []const u8) void {
     const available = current.reason_storage.len - @min(cursor.*, current.reason_storage.len);
     const count = @min(available, text.len);
     if (count != 0) @memcpy(current.reason_storage[cursor.* .. cursor.* + count], text[0..count]);
     cursor.* += count;
 }
 
-fn appendReasonU32(cursor: *usize, value_input: u32) void {
+fn appendReasonU32(current: *Status, cursor: *usize, value_input: u32) void {
     var digits: [10]u8 = undefined;
     var value = value_input;
     var count: usize = 0;
@@ -1194,57 +1223,59 @@ fn appendReasonU32(cursor: *usize, value_input: u32) void {
     }
     while (count != 0) {
         count -= 1;
-        appendReason(cursor, digits[count .. count + 1]);
+        appendReason(current, cursor, digits[count .. count + 1]);
     }
 }
 
-fn publishReason(cursor: usize) void {
+fn publishReason(current: *Status, cursor: usize) void {
     current.reason = current.reason_storage[0..@min(cursor, current.reason_storage.len)];
 }
 
-fn beginProtocolReason() usize {
+fn beginProtocolReason(current: *Status) usize {
     @memset(current.reason_storage[0..], 0);
     var cursor: usize = 0;
-    appendReason(&cursor, "SCSI ");
-    appendReason(&cursor, opcodeName(current.last_opcode));
-    appendReason(&cursor, " ");
+    appendReason(current, &cursor, "SCSI ");
+    appendReason(current, &cursor, opcodeName(current.last_opcode));
+    appendReason(current, &cursor, " ");
     return cursor;
 }
 
-fn setProtocolReason(detail: []const u8) void {
-    var cursor = beginProtocolReason();
-    appendReason(&cursor, detail);
-    publishReason(cursor);
+fn setProtocolReason(current: *Status, detail: []const u8) void {
+    var cursor = beginProtocolReason(current);
+    appendReason(current, &cursor, detail);
+    publishReason(current, cursor);
 }
 
-fn setTransportReason(stage: []const u8) void {
-    const xs = xhci.status();
-    var cursor = beginProtocolReason();
-    appendReason(&cursor, stage);
-    appendReason(&cursor, " xHCI=");
-    appendReason(&cursor, xs.last_bulk_result);
-    appendReason(&cursor, " cc=");
-    appendReasonU32(&cursor, xs.last_bulk_completion_code);
-    appendReason(&cursor, " bytes=");
-    appendReasonU32(&cursor, xs.last_bulk_actual_len);
-    appendReason(&cursor, "/");
-    appendReasonU32(&cursor, xs.last_bulk_request_len);
-    publishReason(cursor);
+fn setTransportReason(current: *Status, stage: []const u8) void {
+    const xs = xhci.statusForDevice(current.device) orelse return;
+    var cursor = beginProtocolReason(current);
+    appendReason(current, &cursor, stage);
+    appendReason(current, &cursor, " xHCI=");
+    appendReason(current, &cursor, xs.last_bulk_result);
+    appendReason(current, &cursor, " cc=");
+    appendReasonU32(current, &cursor, xs.last_bulk_completion_code);
+    appendReason(current, &cursor, " bytes=");
+    appendReasonU32(current, &cursor, xs.last_bulk_actual_len);
+    appendReason(current, &cursor, "/");
+    appendReasonU32(current, &cursor, xs.last_bulk_request_len);
+    publishReason(current, cursor);
 }
 
-fn setDataLengthReason(detail: []const u8, actual_len: u32) void {
-    var cursor = beginProtocolReason();
-    appendReason(&cursor, detail);
-    appendReason(&cursor, " bytes=");
-    appendReasonU32(&cursor, actual_len);
-    appendReason(&cursor, "/");
-    appendReasonU32(&cursor, current.last_transfer_len);
-    appendReason(&cursor, " residue=");
-    appendReasonU32(&cursor, current.last_csw_residue);
-    publishReason(cursor);
+fn setDataLengthReason(current: *Status, detail: []const u8, actual_len: u32) void {
+    var cursor = beginProtocolReason(current);
+    appendReason(current, &cursor, detail);
+    appendReason(current, &cursor, " bytes=");
+    appendReasonU32(current, &cursor, actual_len);
+    appendReason(current, &cursor, "/");
+    appendReasonU32(current, &cursor, current.last_transfer_len);
+    appendReason(current, &cursor, " residue=");
+    appendReasonU32(current, &cursor, current.last_csw_residue);
+    publishReason(current, cursor);
 }
 
-fn recoverTransport() bool {
+fn recoverTransport(current: *Status) bool {
+    if (!xhci.acquireControllerOwnership()) return false;
+    defer xhci.releaseControllerOwnership();
     current.recoveries += 1;
     // Admission stays closed from the first ambiguous transport result until
     // BOT reset, both device-side ClearFeature requests, and the host-side
@@ -1319,8 +1350,28 @@ fn recoverTransport() bool {
     return true;
 }
 
-fn nextTag() u32 {
+fn nextTag(current: *Status) u32 {
     current.tags +%= 1;
     if (current.tags == 0) current.tags = 1;
     return current.tags;
+}
+
+fn medium(current: *Status) *Medium {
+    return @fieldParentPtr("state", current);
+}
+
+fn beginMediumOperation(current: *Status) ?xhci.DeviceTransaction {
+    const item = medium(current);
+    if (!item.ownership.enter(OWNERSHIP_TIMEOUT_TICKS)) return null;
+    const transaction = xhci.beginDeviceTransaction(&current.device) orelse {
+        _ = item.ownership.leave();
+        return null;
+    };
+    last_medium.store(item.index, .release);
+    return transaction;
+}
+
+fn endMediumOperation(current: *Status, transaction: xhci.DeviceTransaction) void {
+    xhci.endDeviceTransaction(transaction);
+    _ = medium(current).ownership.leave();
 }

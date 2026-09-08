@@ -4,6 +4,7 @@ const timer = @import("../../kernel/timer.zig");
 const platform_cpu = @import("../../platform/cpu.zig");
 const monotonic = @import("../../platform/monotonic.zig");
 const scheduler = @import("../../sched/scheduler.zig");
+const owner_locks = @import("../../memory/owner_locks.zig");
 const timing = @import("usb_boot_timing.zig");
 const std = @import("std");
 
@@ -248,12 +249,20 @@ pub const Metrics = struct {
 };
 
 var current_metrics: Metrics = .{};
+// Independent device transactions may finish or inspect waits concurrently.
+// Only this small RAM snapshot is covered; no clock, wait or callback runs
+// while the metrics owner is held.
+var metrics_owner: owner_locks.Lock = .{ .class = .driver_work, .rank = 2 };
 
 pub fn resetMetrics() void {
+    const token = metrics_owner.acquire();
+    defer metrics_owner.release(token);
     current_metrics = .{};
 }
 
 pub fn metrics() Metrics {
+    const token = metrics_owner.acquire();
+    defer metrics_owner.release(token);
     return current_metrics;
 }
 
@@ -296,6 +305,22 @@ pub const Wait = struct {
         if (self.deadline.waitStep(self.reason)) self.blocked_ticks +%= 1;
     }
 
+    // Let a caller release shared state only when idle may actually park,
+    // preserving the short polling grace for ordinary fast completions.
+    pub fn mayBlockOnIdle(self: *const Wait) bool {
+        if (!self.deadline.canBlock()) return false;
+        return self.phase != .runtime or !self.runtime_poll_grace or
+            self.runtimePollGraceExpired() or
+            self.iterations +| 1 >= RUNTIME_POLL_FALLBACK_ITERATIONS;
+    }
+
+    // Preserve a nonblocking decision even if the grace expires between the
+    // caller checking it and reaching this step with shared state still held.
+    pub fn pollOnce(self: *Wait) void {
+        self.iterations +%= 1;
+        asm volatile ("pause");
+    }
+
     fn runtimePollGraceExpired(self: *const Wait) bool {
         const elapsed_ns = self.deadline.elapsedNanoseconds();
         if (elapsed_ns != 0) return elapsed_ns >= RUNTIME_POLL_GRACE_NS;
@@ -320,6 +345,8 @@ pub const Wait = struct {
 };
 
 fn record(result: WaitResult) void {
+    const token = metrics_owner.acquire();
+    defer metrics_owner.release(token);
     current_metrics.calls +%= 1;
     if (result.success) {
         current_metrics.successes +%= 1;
