@@ -1002,7 +1002,7 @@ fn parseR4F(bytes: []const u8) ?ParsedFont {
     const strike_count = readLe16(bytes[24..26]);
     const glyph_count = readLe32(bytes[28..32]);
     if (version != r4f.VERSION or header_size < r4f.HEADER_SIZE) return null;
-    if (file_size < r4f.HEADER_SIZE or file_size > bytes.len) return null;
+    if (file_size < header_size or file_size > bytes.len) return null;
     if (table_dir_offset < header_size) return null;
     if (!rangeValid(file_size, table_dir_offset, @as(u32, table_count) * @as(u32, @intCast(r4f.TABLE_ENTRY_SIZE)))) return null;
 
@@ -1133,8 +1133,9 @@ fn loadBitmapGlyphs(table: []const u8, strike_id: u16, height: u8, bytes_per_row
     const record_count = readLe32(table[0..4]);
     const payload_start = readLe32(table[4..8]);
     if (record_count < glyph_count) return false;
-    if (!rangeValid(@intCast(table.len), 8, record_count * @as(u32, @intCast(r4f.BITMAP_GLYPH_RECORD_SIZE)))) return false;
-    if (payload_start > table.len) return false;
+    if (!recordsFit(table.len, 8, record_count, r4f.BITMAP_GLYPH_RECORD_SIZE)) return false;
+    const records_end = 8 + @as(usize, record_count) * r4f.BITMAP_GLYPH_RECORD_SIZE;
+    if (payload_start < records_end or payload_start > table.len) return false;
     var loaded: u32 = 0;
     var i: u32 = 0;
     while (i < record_count) : (i += 1) {
@@ -1147,7 +1148,7 @@ fn loadBitmapGlyphs(table: []const u8, strike_id: u16, height: u8, bytes_per_row
         if (rec_strike_id != strike_id) continue;
         if (format != r4f.BITMAP_FORMAT_MONO1_MSB) return false;
         const needed = @as(u32, height) * @as(u32, bytes_per_row);
-        if (glyph_id >= MAX_GLYPHS or data_size < needed) return false;
+        if (glyph_id >= glyph_count or glyph_id >= MAX_GLYPHS or data_size < needed) return false;
         if (data_offset < payload_start or !rangeValid(@intCast(table.len), data_offset, data_size)) return false;
         var row: u8 = 0;
         while (row < height) : (row += 1) {
@@ -1164,7 +1165,7 @@ fn loadBitmapGlyphs(table: []const u8, strike_id: u16, height: u8, bytes_per_row
 fn loadGlyphMetrics(table: []const u8, glyph_count: u32, fallback_width: u8, fallback_advance: u8, widths: *[MAX_GLYPHS]u8, advances: *[MAX_GLYPHS]u8) bool {
     if (table.len < 4) return false;
     const record_count = readLe32(table[0..4]);
-    if (!rangeValid(@intCast(table.len), 4, record_count * @as(u32, @intCast(r4f.GLYPH_METRIC_RECORD_SIZE)))) return false;
+    if (!recordsFit(table.len, 4, record_count, r4f.GLYPH_METRIC_RECORD_SIZE)) return false;
     var i: u32 = 0;
     while (i < record_count) : (i += 1) {
         const off: usize = 4 + @as(usize, i) * r4f.GLYPH_METRIC_RECORD_SIZE;
@@ -1173,7 +1174,8 @@ fn loadGlyphMetrics(table: []const u8, glyph_count: u32, fallback_width: u8, fal
         const advance = readLeI16(table[off + 4 .. off + 6]);
         const x0 = readLeI16(table[off + 12 .. off + 14]);
         const x1 = readLeI16(table[off + 16 .. off + 18]);
-        const width_i = x1 - x0;
+        const width_i = @as(i32, x1) - @as(i32, x0);
+        if (width_i < 0 or width_i > MAX_GLYPH_W) return false;
         widths[glyph_id] = clampMetric(width_i, fallback_width);
         advances[glyph_id] = clampMetric(advance, fallback_advance);
     }
@@ -1183,7 +1185,7 @@ fn loadGlyphMetrics(table: []const u8, glyph_count: u32, fallback_width: u8, fal
 fn loadGlyphMap(table: []const u8, glyph_count: u32, out: *[MAX_GLYPHS]u32) bool {
     if (table.len < 4) return false;
     const record_count = readLe32(table[0..4]);
-    if (!rangeValid(@intCast(table.len), 4, record_count * @as(u32, @intCast(r4f.GLYPH_MAP_RECORD_SIZE)))) return false;
+    if (!recordsFit(table.len, 4, record_count, r4f.GLYPH_MAP_RECORD_SIZE)) return false;
     var mapped: u32 = 0;
     var i: u32 = 0;
     while (i < record_count) : (i += 1) {
@@ -1223,6 +1225,10 @@ fn rangeValid(total: u32, offset: u32, size: u32) bool {
     if (offset > total) return false;
     if (size > total - offset) return false;
     return true;
+}
+
+fn recordsFit(total: usize, offset: usize, count: u32, stride: usize) bool {
+    return offset <= total and stride != 0 and count <= (total - offset) / stride;
 }
 
 fn pathEquals(a: []const u8, b: []const u8) bool {
@@ -1362,7 +1368,7 @@ pub fn kindName(kind: FontKind) []const u8 {
     };
 }
 
-fn clampMetric(value: i16, fallback: u8) u8 {
+fn clampMetric(value: i32, fallback: u8) u8 {
     if (value <= 0) return fallback;
     if (value > MAX_GLYPH_W) return MAX_GLYPH_W;
     return @intCast(value);
