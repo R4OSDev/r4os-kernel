@@ -3142,7 +3142,12 @@ fn udpSendDhcpFromAdapter(handle: u32, adapter_index: usize, source_ip: [4]u8, d
         return .too_large;
     };
     var frame: [MAX_PACKET_SIZE]u8 = .{0} ** MAX_PACKET_SIZE;
-    const ip_frame = ipv4BuildPacketFrom(frame[0..], adapters[adapter_index].mac, DHCP_BROADCAST_MAC, source_ip, dest_ip, udp.IPV4_PROTOCOL, datagram) orelse {
+    var dest_mac = DHCP_BROADCAST_MAC;
+    if (!isLimitedBroadcastIp(dest_ip)) {
+        const route_result = resolveIpv4DestMacForAdapter(adapter_index, dest_ip, &dest_mac);
+        if (route_result != .ok) return route_result;
+    }
+    const ip_frame = ipv4BuildPacketFrom(frame[0..], adapters[adapter_index].mac, dest_mac, source_ip, dest_ip, udp.IPV4_PROTOCOL, datagram) orelse {
         udp_stats.last_error = "send-build";
         return .too_large;
     };
@@ -3327,7 +3332,9 @@ fn dhcpBuildDiscover(out: []u8, xid: u32, mac: [6]u8) ?[]u8 {
     return out[0..len];
 }
 
-fn dhcpBuildRequest(out: []u8, xid: u32, mac: [6]u8, requested_ip: [4]u8, server_ip: [4]u8) ?[]u8 {
+const DhcpRequestState = enum { selecting, renew, rebind };
+
+fn dhcpBuildRequest(out: []u8, xid: u32, mac: [6]u8, requested_ip: [4]u8, server_ip: [4]u8, state: DhcpRequestState) ?[]u8 {
     var op = newDhcpOp() orelse {
         dhcp_dispatch_failures += 1;
         dhcp_stats.last_error = "r4p-required";
@@ -3337,6 +3344,7 @@ fn dhcpBuildRequest(out: []u8, xid: u32, mac: [6]u8, requested_ip: [4]u8, server
     op.mac = mac;
     op.requested_ip = requested_ip;
     op.server_ip = server_ip;
+    op.client_ip = if (state == .selecting) DHCP_ZERO_IP else requested_ip;
     if (!dhcpDispatch(r4p_contract.DHCP_OP_BUILD_REQUEST, &op)) {
         dhcp_stats.last_error = "r4p-dispatch";
         return null;
@@ -3517,6 +3525,11 @@ fn applyDhcpRxResult(op: r4p_contract.DhcpOp) void {
                 dhcp_stats.lease.rebind_seconds = op.rebind_seconds;
                 dhcp_stats.last_error = "offer";
             } else if ((op.flags & r4p_contract.DHCP_FLAG_ACK) != 0) {
+                if (op.lease_seconds == 0 or isZeroIp(op.offered_ip)) {
+                    dhcp_stats.malformed += 1;
+                    dhcp_stats.last_error = "invalid-lease";
+                    return;
+                }
                 dhcp_stats.ack_rx += 1;
                 dhcp_stats.lease.bound = (op.flags & r4p_contract.DHCP_FLAG_BOUND) != 0;
                 dhcp_stats.lease.xid = op.xid;
@@ -4174,8 +4187,16 @@ pub fn dhcpRuntimeStateName(state: dhcp_runtime.State) []const u8 {
 }
 
 pub fn dhcpLeaseTiming() DhcpLeaseTiming {
-    if (!dhcp_stats.lease.bound or dhcp_stats.lease_acquired_tick == 0) return .{};
+    if (!dhcp_stats.lease.bound) return .{};
     const elapsed = elapsedSecondsSince(dhcp_stats.lease_acquired_tick);
+    if (dhcp_stats.lease.lease_seconds == dhcp.INFINITE_SECONDS) return .{
+        .bound = true,
+        .acquired_tick = dhcp_stats.lease_acquired_tick,
+        .elapsed_seconds = elapsed,
+        .remaining_seconds = dhcp.INFINITE_SECONDS,
+        .renew_in_seconds = dhcp.INFINITE_SECONDS,
+        .rebind_in_seconds = dhcp.INFINITE_SECONDS,
+    };
     return .{
         .bound = true,
         .acquired_tick = dhcp_stats.lease_acquired_tick,
@@ -5387,9 +5408,10 @@ fn driveDhcpCoordinator() void {
     const lease_timing = dhcpLeaseTiming();
     const lease_bound = dhcp_stats.lease.bound and net_config.dhcpBound();
     const elapsed = lease_timing.elapsed_seconds;
-    const renew_due = lease_bound and dhcp_stats.lease.renew_seconds != 0 and elapsed >= dhcp_stats.lease.renew_seconds;
-    const rebind_due = lease_bound and dhcp_stats.lease.rebind_seconds != 0 and elapsed >= dhcp_stats.lease.rebind_seconds;
-    const lease_expired = lease_bound and dhcp_stats.lease.lease_seconds != 0 and elapsed >= dhcp_stats.lease.lease_seconds;
+    const finite_lease = lease_bound and dhcp_stats.lease.lease_seconds != dhcp.INFINITE_SECONDS;
+    const renew_due = finite_lease and dhcp_stats.lease.renew_seconds != 0 and elapsed >= dhcp_stats.lease.renew_seconds;
+    const rebind_due = finite_lease and dhcp_stats.lease.rebind_seconds != 0 and elapsed >= dhcp_stats.lease.rebind_seconds;
+    const lease_expired = finite_lease and dhcp_stats.lease.lease_seconds != 0 and elapsed >= dhcp_stats.lease.lease_seconds;
     const before_state = dhcp_coordinator.state;
     const action = dhcp_coordinator.observe(.{
         .now = now,
@@ -5908,7 +5930,7 @@ fn dhcpAcquireOperation(adapter_index: usize, deadline_tick: ?u64) TxResult {
     }
 
     dhcp_stats.last_error = "request";
-    const request = dhcpBuildRequest(dhcp_payload[0..], xid, adapters[adapter_index].mac, dhcp_stats.lease.offered_ip, dhcp_stats.lease.server_ip) orelse {
+    const request = dhcpBuildRequest(dhcp_payload[0..], xid, adapters[adapter_index].mac, dhcp_stats.lease.offered_ip, dhcp_stats.lease.server_ip, .selecting) orelse {
         dhcp_stats.last_error = "request-build";
         return .too_large;
     };
@@ -5943,13 +5965,35 @@ pub fn dhcpRenewUntil(adapter_index: usize, deadline_tick: ?u64) TxResult {
         return .backend_error;
     }
     if (dhcpDeadlineExpired(deadline_tick)) return dhcpDeadlineResult("renew-timeout");
-    if (!beginDhcpOperation("renew", .renew)) return .busy;
-    const result = dhcpRenewOperation(adapter_index, deadline_tick);
+    const elapsed = dhcpLeaseTiming().elapsed_seconds;
+    const lease = dhcp_stats.lease;
+    if (lease.lease_seconds != dhcp.INFINITE_SECONDS and elapsed >= lease.lease_seconds) {
+        // The coordinator owns expiry; this unlocked admission check must
+        // not clear a lease another serialized operation may have renewed.
+        dhcp_stats.last_error = "lease-expired";
+        return .backend_error;
+    }
+    const state: DhcpRequestState = if (isZeroIp(lease.server_ip) or
+        (lease.lease_seconds != dhcp.INFINITE_SECONDS and lease.rebind_seconds != 0 and elapsed >= lease.rebind_seconds))
+        .rebind
+    else
+        .renew;
+    const limit = dhcpRenewDeadline(state, deadline_tick);
+    if (!beginDhcpOperation(if (state == .rebind) "rebind" else "renew", if (state == .rebind) .rebind else .renew)) return .busy;
+    const result = dhcpRenewOperation(adapter_index, limit, state);
     finishDhcpOperation(result, true);
     return result;
 }
 
-fn dhcpRenewOperation(adapter_index: usize, deadline_tick: ?u64) TxResult {
+fn dhcpRenewDeadline(state: DhcpRequestState, requested: ?u64) ?u64 {
+    const lease = dhcp_stats.lease;
+    if (lease.lease_seconds == dhcp.INFINITE_SECONDS) return requested;
+    const seconds = if (state == .renew and lease.rebind_seconds != 0) lease.rebind_seconds else lease.lease_seconds;
+    const boundary = dhcp_stats.lease_acquired_tick +| (@as(u64, seconds) *| time_core.monotonicFrequency());
+    return if (requested) |limit| @min(limit, boundary) else boundary;
+}
+
+fn dhcpRenewOperation(adapter_index: usize, deadline_tick: ?u64, state: DhcpRequestState) TxResult {
     const socket_raw = bindDhcpClientSocket() orelse return .backend_error;
     const socket: u32 = @intCast(socket_raw);
     defer _ = udpClose(socket);
@@ -5961,13 +6005,14 @@ fn dhcpRenewOperation(adapter_index: usize, deadline_tick: ?u64) TxResult {
     dhcp_stats.last_error = "renew";
 
     var dhcp_payload: [MAX_PACKET_SIZE]u8 = .{0} ** MAX_PACKET_SIZE;
-    const request = dhcpBuildRequest(dhcp_payload[0..], xid, adapters[adapter_index].mac, previous_lease.offered_ip, previous_lease.server_ip) orelse {
+    const request = dhcpBuildRequest(dhcp_payload[0..], xid, adapters[adapter_index].mac, previous_lease.offered_ip, previous_lease.server_ip, state) orelse {
         dhcp_stats.last_error = "renew-build";
         return .too_large;
     };
     setDhcpResponseExpectation(.ack_or_nak, xid, adapters[adapter_index].mac);
     const nak_before = dhcp_stats.nak_rx;
-    const result = sendDhcpWithAckRetryFrom(adapter_index, socket, DHCP_ZERO_IP, DHCP_BROADCAST_IP, request, "renew-timeout", deadline_tick);
+    const dest_ip = if (state == .rebind) DHCP_BROADCAST_IP else previous_lease.server_ip;
+    const result = sendDhcpWithAckRetryFrom(adapter_index, socket, previous_lease.offered_ip, dest_ip, request, "renew-timeout", deadline_tick);
     if (result != .ok) {
         if (dhcp_stats.nak_rx <= nak_before) {
             dhcp_stats.lease = previous_lease;
@@ -6213,14 +6258,25 @@ fn drainDhcpSocket(socket: u32) void {
 fn normalizeDhcpLease(lease_in: dhcp.Lease) dhcp.Lease {
     var lease = lease_in;
     if (isZeroIp(lease.netmask)) lease.netmask = .{ 255, 255, 255, 0 };
-    if (isZeroIp(lease.gateway_ip)) lease.gateway_ip = lease.server_ip;
-    if (!lease.dns_configured and !isZeroIp(lease.server_ip)) {
-        lease.dns_ip = lease.server_ip;
-        lease.dns_configured = true;
-    }
-    if (lease.lease_seconds > 0) {
-        if (lease.renew_seconds == 0) lease.renew_seconds = lease.lease_seconds / 2;
-        if (lease.rebind_seconds == 0) lease.rebind_seconds = (lease.lease_seconds * 7) / 8;
+    // Each successful ACK supplies the current router/DNS configuration.
+    // Absence clears it; an unsuccessful renewal restores the prior lease.
+    if (lease.lease_seconds == dhcp.INFINITE_SECONDS) {
+        lease.renew_seconds = dhcp.INFINITE_SECONDS;
+        lease.rebind_seconds = dhcp.INFINITE_SECONDS;
+    } else if (lease.lease_seconds >= 3) {
+        const default_renew = lease.lease_seconds / 2;
+        const default_rebind: u32 = @intCast((@as(u64, lease.lease_seconds) * 7) / 8);
+        if (lease.renew_seconds == 0) lease.renew_seconds = default_renew;
+        if (lease.rebind_seconds == 0) lease.rebind_seconds = default_rebind;
+        if (lease.renew_seconds >= lease.rebind_seconds or lease.rebind_seconds >= lease.lease_seconds) {
+            lease.renew_seconds = default_renew;
+            lease.rebind_seconds = default_rebind;
+        }
+    } else {
+        // No two positive whole-second deadlines fit inside a 1/2-second
+        // lease. Retain its exact expiry without an immediate retry loop.
+        lease.renew_seconds = 0;
+        lease.rebind_seconds = 0;
     }
     return lease;
 }
@@ -7227,6 +7283,10 @@ fn nextTcpSeq(remote_ip: [4]u8, port: u16) u32 {
 }
 
 fn resolveIpv4DestMac(target_ip: [4]u8, out_mac: *[6]u8) TxResult {
+    return resolveIpv4DestMacForAdapter(0, target_ip, out_mac);
+}
+
+fn resolveIpv4DestMacForAdapter(adapter_index: usize, target_ip: [4]u8, out_mac: *[6]u8) TxResult {
     const route = routeIpv4Target(target_ip);
     if (route.result != .ok) {
         arp_stats.last_error = route.last_error;
@@ -7248,7 +7308,7 @@ fn resolveIpv4DestMac(target_ip: [4]u8, out_mac: *[6]u8) TxResult {
     var attempt: usize = 0;
     while (attempt < ARP_RESOLVE_ATTEMPTS) : (attempt += 1) {
         arp_stats.resolve_attempts += 1;
-        const arp_result = sendArpRequest(0, route.next_hop_ip);
+        const arp_result = sendArpRequest(adapter_index, route.next_hop_ip);
         if (arp_result != .ok) {
             arp_stats.pending_drops += 1;
             return arp_result;

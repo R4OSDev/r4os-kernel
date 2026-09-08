@@ -1,3 +1,6 @@
+// RFC 2131: this wire value is not a finite countdown.
+pub const INFINITE_SECONDS: u32 = 0xffff_ffff;
+
 pub const CLIENT_PORT: u16 = 68;
 pub const SERVER_PORT: u16 = 67;
 
