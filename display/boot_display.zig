@@ -3,6 +3,8 @@ const log = @import("../kernel/log.zig");
 const bootscreen = @import("../kernel/bootscreen.zig");
 const fb = @import("../display/framebuffer.zig");
 const Console = @import("console.zig").Console;
+const scroll_buffer = @import("console_scroll_buffer.zig");
+const heap = @import("../memory/heap.zig");
 const display = @import("../display/display.zig");
 const surface_pipeline = @import("../display/surface_pipeline.zig");
 
@@ -41,6 +43,20 @@ pub fn init() ?State {
 
 pub fn get() ?State {
     return state_storage;
+}
+
+// Called once after heap initialization, outside the boot-log owner. Storage
+// stays resident for later console/fatal use; sink callbacks never allocate.
+pub fn prepareConsolePixelBacking(memory_budget: u64) bool {
+    if (state_storage == null) return false;
+    if (console_storage.pixel_backing != null) return true;
+    const bytes = scroll_buffer.requiredPixelBytes(framebuffer_storage.width, framebuffer_storage.height) orelse return false;
+    if (bytes > memory_budget) return false;
+    const memory = heap.alloc(bytes, @alignOf(u32)) orelse return false;
+    const pointer: [*]u32 = @ptrCast(@alignCast(memory.ptr));
+    if (console_storage.attachPixelBacking(pointer[0 .. bytes / 4])) return true;
+    _ = heap.free(memory);
+    return false;
 }
 
 pub fn invalidateConsoleBackingForExternalDisplay() void {

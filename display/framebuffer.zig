@@ -69,6 +69,28 @@ pub fn putPacked32(fb: *Framebuffer, x: u64, y: u64, color32: u32) void {
     writePixel32(fb.address + y * fb.pitch + x * 4, color32);
 }
 
+// Present already packed RAM pixels without reading the device framebuffer.
+// Source rows may be wider than the copied rectangle; device pitch and unusual
+// destination alignment remain properties of the framebuffer.
+pub fn blitPacked32(fb: *Framebuffer, x: u64, y: u64, w: u64, h: u64, source: []const u32, stride: usize) bool {
+    if (!supportsRgb32(fb) or w == 0 or h == 0 or x >= fb.width or y >= fb.height) return false;
+    const width = @min(w, fb.width - x);
+    const height = @min(h, fb.height - y);
+    if (stride < width or source.len < width or height - 1 > (source.len - width) / stride) return false;
+    var row: usize = 0;
+    while (row < height) : (row += 1) {
+        const dst = fb.address + (y + row) * fb.pitch + x * 4;
+        const src = source[row * stride ..][0..@intCast(width)];
+        if ((@intFromPtr(dst) & 3) == 0) {
+            const words: [*]volatile u32 = @ptrCast(@alignCast(dst));
+            for (src, 0..) |pixel_value, col| words[col] = pixel_value;
+        } else {
+            for (src, 0..) |pixel_value, col| writePixel32(dst + col * 4, pixel_value);
+        }
+    }
+    return true;
+}
+
 // Verschiebt eine 32-bpp-Framebuffer-Region nach oben. Der Vorwaertslauf ist
 // wegen src_y > dst_y ueberlappungssicher. Auf normal ausgerichteten linearen
 // Framebuffern werden 64-/32-Bit-Transfers statt einzelner volatiler Bytes

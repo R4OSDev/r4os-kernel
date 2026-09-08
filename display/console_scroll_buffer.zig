@@ -16,6 +16,30 @@ pub fn fill(cells: []Cell, value: Cell) void {
     for (cells) |*cell| cell.* = value;
 }
 
+pub const MAX_PIXEL_BYTES: usize = 64 * 1024 * 1024;
+
+pub fn requiredPixelBytes(width: u64, height: u64) ?usize {
+    if (width == 0 or height == 0 or width > MAX_PIXEL_BYTES / 4 or
+        height > MAX_PIXEL_BYTES / 4 / width) return null;
+    return @intCast(width * height * 4);
+}
+
+// The packed shadow is ordinary RAM. Move forwards through overlapping rows,
+// then fill the newly exposed line; neither operation evaluates a glyph.
+pub fn scrollPixelsUp(pixels: []u32, stride: usize, left: usize, top: usize, width: usize, height: usize, rows_up: usize, blank: u32) void {
+    const std = @import("std");
+    var row: usize = 0;
+    while (row + rows_up < height) : (row += 1) {
+        const dst = (top + row) * stride + left;
+        const src = (top + row + rows_up) * stride + left;
+        std.mem.copyForwards(u32, pixels[dst .. dst + width], pixels[src .. src + width]);
+    }
+    while (row < height) : (row += 1) {
+        const dst = (top + row) * stride + left;
+        @memset(pixels[dst .. dst + width], blank);
+    }
+}
+
 // Verschiebt eine rechteckige Zellregion um genau eine Textzeile nach oben.
 // Top-to-bottom ist fuer die ueberlappenden Quell-/Zielzeilen absichtlich die
 // sichere Richtung. Linker/rechter Rand und Zellen ausserhalb der Region
@@ -92,6 +116,11 @@ test "invalid scroll geometry leaves the grid untouched" {
     try testing.expect(!scrollUp(cells[0..], 3, 2, 0, 0, 4, 2, .{}));
     var i: usize = 0;
     while (i < cells.len) : (i += 1) try expectCell(testing, cells[i], before[i]);
+    try testing.expectEqual(@as(?usize, 1920 * 1080 * 4), requiredPixelBytes(1920, 1080));
+    try testing.expectEqual(@as(?usize, 3840 * 2160 * 4), requiredPixelBytes(3840, 2160));
+    try testing.expectEqual(@as(?usize, null), requiredPixelBytes(0, 1080));
+    try testing.expectEqual(@as(?usize, null), requiredPixelBytes(8192, 8192));
+    try testing.expectEqual(@as(?usize, null), requiredPixelBytes(~@as(u64, 0), ~@as(u64, 0)));
 }
 
 fn expectCell(testing: type, actual: Cell, expected: Cell) !void {

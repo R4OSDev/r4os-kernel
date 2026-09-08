@@ -5,6 +5,7 @@
 // boot order; memory domain logic stays in the modules under Code/Kernel/memory/.
 
 const display = @import("../display/display.zig");
+const boot_display = @import("../display/boot_display.zig");
 const config = @import("config");
 const blocks = @import("../memory/blocks.zig");
 const heap = @import("../memory/heap.zig");
@@ -37,6 +38,13 @@ pub fn initCore() bool {
     if (!initVirtualRanges()) return false;
     initFramebufferWriteCombining();
     if (!initKernelHeap()) return false;
+    // Optional acceleration, capped at 1/32 of usable RAM and 64 MB. A
+    // failure retains the existing cell-based console and is not a boot error.
+    if (boot_display.prepareConsolePixelBacking(cached_usable_bytes / 32)) {
+        endPhase("Console pixel backing");
+    } else {
+        skipPhase("Console pixel backing");
+    }
 
     boot_status.statusLine("  Memory [OK]\r\n");
     core_initialized = true;

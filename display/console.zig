@@ -28,6 +28,10 @@ pub const Console = struct {
     backing_cols: u32 = 0,
     backing_rows: u32 = 0,
     backing_valid: bool = false,
+    pixel_backing: ?[]u32 = null,
+    pixel_backing_valid: bool = false,
+    pixel_backing_width: u64 = 0,
+    pixel_backing_height: u64 = 0,
 
     pub fn init(framebuffer: *fb.Framebuffer) Console {
         const scale: u32 = 2;
@@ -46,9 +50,19 @@ pub const Console = struct {
     pub fn setFontScale(self: *Console, scale: u32) void {
         self.scale = if (scale == 0) 1 else scale;
         self.recalculateGeometry();
-        // Die vorhandenen Pixel besitzen noch die alte Zellgeometrie. Bis
-        // zum naechsten expliziten clear bleibt deshalb nur der FB-Fallback.
-        self.invalidateBacking();
+        // Existing packed pixels stay authoritative across a scale change;
+        // only the cell interpretation must wait for the next clear.
+        self.invalidateCellBacking();
+    }
+
+    // Caller supplies resident, aligned storage for the console's lifetime.
+    // A clear establishes its contents; attaching never reads device pixels.
+    pub fn attachPixelBacking(self: *Console, pixels: []u32) bool {
+        const bytes = scroll_buffer.requiredPixelBytes(self.framebuffer.width, self.framebuffer.height) orelse return false;
+        if (pixels.len < bytes / 4) return false;
+        self.pixel_backing = pixels;
+        self.pixel_backing_valid = false;
+        return true;
     }
 
     pub fn setColors(self: *Console, fg: u32, bg: u32) void {
@@ -88,6 +102,7 @@ pub const Console = struct {
         self.cur_x = self.margin_left;
         self.cur_y = self.margin_top;
         self.resetBacking(self.bg, self.bg, false);
+        self.resetPixelBacking(self.bg, self.bg, false);
     }
 
     pub fn clearFramed(self: *Console, border: u32, inner: u32) void {
@@ -104,6 +119,7 @@ pub const Console = struct {
         self.cur_x = self.margin_left;
         self.cur_y = self.margin_top;
         self.resetBacking(border, inner, true);
+        self.resetPixelBacking(border, inner, true);
     }
 
     pub fn invalidateBackingForExternalDisplay(self: *Console) void {
@@ -188,6 +204,8 @@ pub const Console = struct {
         const fg = fb.packRgb(self.framebuffer, self.fg);
         const bg = fb.packRgb(self.framebuffer, self.bg);
         self.rememberCell(self.cur_x, self.cur_y, c, fg, bg);
+        var shadow = self.pixelFramebuffer();
+        const target = if (shadow) |*frame| frame else self.framebuffer;
         var row: u32 = 0;
         while (row < glyph_h) : (row += 1) {
             const bits = font.glyphRow(c, row);
@@ -202,7 +220,7 @@ pub const Console = struct {
                     var sx: u32 = 0;
                     while (sx < self.scale) : (sx += 1) {
                         fb.putPacked32(
-                            self.framebuffer,
+                            target,
                             px + col * self.scale + sx,
                             py + row * self.scale + sy,
                             color,
@@ -211,6 +229,7 @@ pub const Console = struct {
                 }
             }
         }
+        if (shadow != null) self.presentPixelRect(px, py, glyph_w * self.scale, glyph_h * self.scale);
     }
 
     fn scroll(self: *Console) void {
@@ -224,10 +243,10 @@ pub const Console = struct {
         const dst_y0: u64 = @as(u64, self.margin_top) * line_h;
         const move_h: u64 = visible_h - line_h;
 
-        // 0.59.4: Der Normalpfad liest keine PAT-WC-/GPU-Framebufferpixel
-        // mehr zurueck. Zellinhalt und pro Zelle wirksame Farben wandern im
-        // normalen RAM; danach wird der Textbereich streng zeilenweise neu
-        // geschrieben, damit Write-Combining auf echter Hardware greifen kann.
+        // Keep the logical cells in sync even when packed RAM pixels provide
+        // the scroll output. The cell path remains available before heap init
+        // and when a bounded pixel allocation is not possible.
+        var moved_cells = false;
         if (self.backingSlice()) |cells| {
             const blank = self.cell(' ');
             if (scroll_buffer.scrollUp(
@@ -240,10 +259,20 @@ pub const Console = struct {
                 self.textBottom(),
                 blank,
             )) {
-                self.redrawTextAreaFromBacking();
-                return;
+                moved_cells = true;
+            } else {
+                self.invalidateBacking();
             }
-            self.invalidateBacking();
+        }
+
+        if (self.pixelFramebuffer() != null) {
+            scroll_buffer.scrollPixelsUp(self.pixel_backing.?, @intCast(f.width), @intCast(x0), @intCast(dst_y0), @intCast(visible_w), @intCast(visible_h), line_h, fb.packRgb(f, self.bg));
+            self.presentPixelRect(x0, dst_y0, visible_w, visible_h);
+            return;
+        }
+        if (moved_cells) {
+            self.redrawTextAreaFromBacking();
+            return;
         }
 
         // Geometriewechsel oder ein Modus oberhalb des statischen Zelllimits:
@@ -286,9 +315,48 @@ pub const Console = struct {
     }
 
     fn invalidateBacking(self: *Console) void {
+        self.invalidateCellBacking();
+        self.pixel_backing_valid = false;
+    }
+
+    fn invalidateCellBacking(self: *Console) void {
         self.backing_valid = false;
         self.backing_cols = 0;
         self.backing_rows = 0;
+    }
+
+    fn pixelFramebuffer(self: *Console) ?fb.Framebuffer {
+        if (!self.pixel_backing_valid or self.pixel_backing_width != self.framebuffer.width or
+            self.pixel_backing_height != self.framebuffer.height) return null;
+        const pixels = self.pixel_backing orelse return null;
+        var frame = self.framebuffer.*;
+        frame.address = @ptrCast(pixels.ptr);
+        frame.pitch = frame.width * 4;
+        return frame;
+    }
+
+    fn resetPixelBacking(self: *Console, outer: u32, inner: u32, framed: bool) void {
+        self.pixel_backing_valid = false;
+        const pixels = self.pixel_backing orelse return;
+        const bytes = scroll_buffer.requiredPixelBytes(self.framebuffer.width, self.framebuffer.height) orelse return;
+        if (pixels.len < bytes / 4) return;
+        self.pixel_backing_width = self.framebuffer.width;
+        self.pixel_backing_height = self.framebuffer.height;
+        @memset(pixels[0 .. bytes / 4], fb.packRgb(self.framebuffer, outer));
+        self.pixel_backing_valid = true;
+        if (framed) {
+            var frame = self.pixelFramebuffer().?;
+            const cell_w = font.glyphWidth() * self.scale;
+            const cell_h = font.glyphHeight() * self.scale;
+            fb.rect(&frame, self.margin_left * cell_w, self.margin_top * cell_h, self.textCols() * cell_w, self.textRows() * cell_h, inner);
+        }
+    }
+
+    fn presentPixelRect(self: *Console, x: u64, y: u64, w: u64, h: u64) void {
+        const frame = self.pixelFramebuffer() orelse return;
+        if (x >= frame.width or y >= frame.height) return;
+        const offset: usize = @intCast(y * frame.width + x);
+        _ = fb.blitPacked32(self.framebuffer, x, y, w, h, self.pixel_backing.?[offset..], @intCast(frame.width));
     }
 
     fn backingSlice(self: *Console) ?[]scroll_buffer.Cell {
@@ -387,3 +455,65 @@ pub const Console = struct {
         return self.rows - self.margin_bottom;
     }
 };
+
+test "console pixel scrolling matches cell redraw through geometry and display changes" {
+    const testing = @import("std").testing;
+    for ([_]usize{ 0, 1 }) |alignment_offset| {
+        const reference = try consoleScrollSnapshots(false, alignment_offset);
+        const accelerated = try consoleScrollSnapshots(true, alignment_offset);
+        for (reference, accelerated) |expected, actual| try testing.expectEqualSlices(u8, &expected, &actual);
+    }
+}
+
+fn consoleScrollSnapshots(use_shadow: bool, alignment_offset: usize) ![5][404 * 82]u8 {
+    const std = @import("std");
+    var memory: [404 * 82 + 1]u8 align(8) = .{0xA5} ** (404 * 82 + 1);
+    var frame: fb.Framebuffer = .{
+        .address = memory[alignment_offset..].ptr,
+        .width = 98,
+        .height = 82,
+        .pitch = 404,
+        .bpp = 32,
+        .memory_model = 1,
+        .red_mask_size = 8,
+        .red_mask_shift = 0,
+        .green_mask_size = 8,
+        .green_mask_shift = 8,
+        .blue_mask_size = 8,
+        .blue_mask_shift = 16,
+        .unused = .{0} ** 5,
+        .edid_size = 0,
+        .edid = null,
+    };
+    var shadow: [98 * 82]u32 = undefined;
+    var console = Console.init(&frame);
+    try std.testing.expect(!console.attachPixelBacking(shadow[0..1]));
+    if (use_shadow) try std.testing.expect(console.attachPixelBacking(&shadow));
+    var snapshots: [5][404 * 82]u8 = undefined;
+    console.setMargins(1, 1, 1, 1);
+    console.clearFramed(0x125678, 0x234567);
+    for (0..9) |i| {
+        console.setColors(0xABCDEF + @as(u32, @intCast(i)), 0x112200 + @as(u32, @intCast(i)));
+        console.puts("Ab\tC\x08D\n");
+    }
+    @memcpy(&snapshots[0], memory[alignment_offset..][0..snapshots[0].len]);
+    try std.testing.expectEqual(console.margin_left, console.cur_x);
+    try std.testing.expectEqual(console.textBottom() - 1, console.cur_y);
+    console.setMargins(0, 0, 0, 0);
+    console.puts("a\nb\nc\nd\ne\nf\ng\n");
+    @memcpy(&snapshots[1], memory[alignment_offset..][0..snapshots[1].len]);
+    console.setFontScale(1);
+    try std.testing.expect(!console.backing_valid);
+    try std.testing.expectEqual(use_shadow, console.pixel_backing_valid);
+    console.puts("0\n1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n");
+    @memcpy(&snapshots[2], memory[alignment_offset..][0..snapshots[2].len]);
+    console.clear();
+    console.puts("A\nB\nC\nD\nE\nF\nG\nH\nI\nJ\nK\nL\n");
+    @memcpy(&snapshots[3], memory[alignment_offset..][0..snapshots[3].len]);
+    fb.rect(&frame, 1, 1, 35, 48, 0x56789A);
+    console.invalidateBackingForExternalDisplay();
+    try std.testing.expect(!console.pixel_backing_valid and !console.backing_valid);
+    console.puts("external\nsecond\nthird\n");
+    @memcpy(&snapshots[4], memory[alignment_offset..][0..snapshots[4].len]);
+    return snapshots;
+}
