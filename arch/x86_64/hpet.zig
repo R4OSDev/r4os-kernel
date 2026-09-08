@@ -23,6 +23,7 @@ const TIMER_SET_ACCUMULATOR: u64 = 1 << 6;
 const TIMER_32BIT_MODE: u64 = 1 << 8;
 const TIMER_ROUTE_MASK: u64 = 0x1F << 9;
 const TIMER_FSB_ENABLE: u64 = 1 << 14;
+const counter_progress_max_polls: u32 = 65_536;
 const FEMTOSECONDS_PER_SECOND: u64 = 1_000_000_000_000_000;
 
 pub const Status = struct {
@@ -103,9 +104,41 @@ pub fn initFromAcpi(info: acpi.Info) Status {
     }
     current.counter = readMainCounter();
     @atomicStore(u64, &counter_extension_state, current.counter & 0xFFFF_FFFF, .release);
-    current.reason = "MMIO mapped, main counter enabled, interrupts disabled";
+    if (!counterAdvances()) {
+        disableUnusableCounter();
+    } else {
+        current.reason = "MMIO mapped, main counter enabled, interrupts disabled";
+    }
     logStatus();
     return current;
+}
+
+// A read-back enable bit alone does not qualify a usable timer. This bound
+// needs neither HPET elapsed time nor a calibrated CPU clock to terminate.
+fn counterAdvances() bool {
+    if (!current.mapped or !current.enabled or current.frequency_hz == 0) return false;
+    const start = readMainCounter();
+    var polls: u32 = 0;
+    while (polls < counter_progress_max_polls) : (polls += 1) {
+        const delta = elapsedMainCounter(start, readMainCounter());
+        const half_range: u64 = if (current.counter_64bit) 0x7FFF_FFFF_FFFF_FFFF else 0x7FFF_FFFF;
+        if (delta != 0 and delta <= half_range) return true;
+        asm volatile ("pause");
+    }
+    return false;
+}
+
+pub fn disableUnusableCounter() void {
+    if (current.mapped) {
+        const config = read64(REG_CONFIG) & ~(CONFIG_ENABLE | CONFIG_LEGACY_REPLACEMENT);
+        write64(REG_CONFIG, config);
+        current.config = read64(REG_CONFIG);
+    }
+    current.enabled = false;
+    current.frequency_hz = 0;
+    current.timer0_irq_active = false;
+    current.timer0_one_shot = false;
+    current.reason = "HPET main counter did not advance within bounded qualification";
 }
 
 pub fn status() Status {

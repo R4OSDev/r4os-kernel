@@ -59,6 +59,7 @@ const min_plausible_tsc_hz: u64 = 1_000_000;
 const max_plausible_tsc_hz: u64 = 10_000_000_000;
 const calibration_samples: usize = 3;
 const calibration_hpet_divisor: u64 = 200; // 5 ms per sample.
+const calibration_max_polls: u32 = 1_000_000; // Independent of both clocks.
 const calibration_tolerance_ppm: u64 = 20_000;
 const cpu_offset_samples: usize = 5;
 const max_cpu_offset_ns: u64 = 1_000_000_000;
@@ -181,6 +182,15 @@ pub fn attachHpetClock(prior_ns: u64) void {
             }
         } else {
             setFallbackReason(calibration.failure);
+            if (calibration.failure == .hpet_unavailable) {
+                hpet_configured = false;
+                tsc_hpet_calibrated = false;
+                hpet.disableUnusableCounter();
+                // Keep an independently qualified invariant TSC. Otherwise
+                // the monotonic wrapper continues on the periodic PIT epoch.
+                if (!tsc_invariant or !tsc_scale.valid()) activate(.unavailable);
+                return;
+            }
         }
     } else {
         setFallbackReason(.no_tsc);
@@ -300,12 +310,12 @@ pub fn capture() Stamp {
 pub fn resolve(stamp: Stamp) ?u64 {
     return switch (stamp.kind) {
         .unavailable => null,
-        .tsc => if (tsc_scale.valid())
-            tsc_scale.apply(stamp.raw -% early_tsc_origin)
+        .tsc => if (tsc_scale.valid() and stamp.raw >= early_tsc_origin)
+            tsc_scale.apply(stamp.raw - early_tsc_origin)
         else
             null,
-        .hpet => if (hpet_configured)
-            hpet_epoch_ns +| hpet_scale.apply(stamp.raw -% hpet_origin_raw)
+        .hpet => if (hpet_configured and stamp.raw >= hpet_origin_raw)
+            hpet_epoch_ns +| hpet_scale.apply(stamp.raw - hpet_origin_raw)
         else
             null,
     };
@@ -313,7 +323,13 @@ pub fn resolve(stamp: Stamp) ?u64 {
 
 pub fn nowNanoseconds() ?u64 {
     const candidate = switch (activeSource()) {
-        .tsc => tsc_scale.apply(adjustedTscRaw() -% early_tsc_origin),
+        .tsc => blk: {
+            const raw = adjustedTscRaw();
+            // The watchdog will demote a discontinuous TSC. Do not publish
+            // an unsigned-wrap timestamp if an ordinary read reaches it first.
+            if (raw < early_tsc_origin) return lastPublishedNanoseconds();
+            break :blk tsc_scale.apply(raw - early_tsc_origin);
+        },
         .hpet => hpet_epoch_ns +| hpet_scale.apply(hpet.readExtendedMainCounter() -% hpet_origin_raw),
         .unavailable => return null,
     };
@@ -396,7 +412,9 @@ fn activate(source: Source) void {
 }
 
 fn fallbackToHpet(reason: FallbackReason) void {
-    const prior = nowNanoseconds() orelse lastPublishedNanoseconds();
+    // The caller has rejected the TSC. Reading it again would publish that
+    // very sample through the monotonic maximum before selecting HPET.
+    const prior = lastPublishedNanoseconds();
     setFallbackReason(reason);
     if (hpet_configured) {
         hpet_origin_raw = hpet.readExtendedMainCounter();
@@ -416,13 +434,20 @@ fn calibrateTsc(exact_frequency_hz: u64) Calibration {
     var index: usize = 0;
     while (index < calibration_samples) : (index += 1) {
         const start = correlatedSample();
-        while (hpet.readExtendedMainCounter() -% start.hpet_raw < target_hpet_ticks) {
+        var polls: u32 = 0;
+        while (polls < calibration_max_polls) : (polls += 1) {
+            const current = hpet.readExtendedMainCounter();
+            if (current < start.hpet_raw) return .{ .failure = .hpet_unavailable };
+            if (current - start.hpet_raw >= target_hpet_ticks) break;
             asm volatile ("pause");
         }
+        if (polls == calibration_max_polls) return .{ .failure = .hpet_unavailable };
         const finish = correlatedSample();
-        const hpet_delta = finish.hpet_raw -% start.hpet_raw;
-        const tsc_delta = finish.tsc_raw -% start.tsc_raw;
-        if (hpet_delta == 0 or tsc_delta == 0) return .{};
+        if (finish.hpet_raw <= start.hpet_raw) return .{ .failure = .hpet_unavailable };
+        if (finish.tsc_raw <= start.tsc_raw or start.bracket_cycles == std.math.maxInt(u64) or
+            finish.bracket_cycles == std.math.maxInt(u64)) return .{};
+        const hpet_delta = finish.hpet_raw - start.hpet_raw;
+        const tsc_delta = finish.tsc_raw - start.tsc_raw;
         frequencies[index] = math.scaleFloor(tsc_delta, hpet_frequency_hz, hpet_delta);
         if (index == 0 or finish.bracket_cycles < best_reference.bracket_cycles) best_reference = finish;
     }
@@ -453,7 +478,8 @@ fn correlatedSample() Correlation {
     const before = readTsc();
     const hpet_raw = hpet.readExtendedMainCounter();
     const after = readTsc();
-    const bracket = after -% before;
+    if (after < before) return .{ .hpet_raw = hpet_raw, .tsc_raw = after, .bracket_cycles = std.math.maxInt(u64) };
+    const bracket = after - before;
     return .{
         .hpet_raw = hpet_raw,
         .tsc_raw = before +% bracket / 2,
