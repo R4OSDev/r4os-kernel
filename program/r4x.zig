@@ -14022,6 +14022,7 @@ fn apiEnvGet(name_ptr: [*:0]const u8, out_ptr: [*]u8, capacity: u32) callconv(.c
     var name_buf: [ENVIRONMENT_NAME_MAX + 1]u8 = undefined;
     const name = copyZ(name_ptr, name_buf[0..]) orelse return ENV_ERROR_INVALID;
     if (!environmentNameValid(name)) return ENV_ERROR_INVALID;
+    if (equalsIgnoreCase(name, "CWD")) return workingDirectoryGet(instance, out_ptr, capacity);
     return environmentGet(instance, name, out_ptr, capacity);
 }
 
@@ -14032,6 +14033,7 @@ fn apiEnvSet(name_ptr: [*:0]const u8, value_ptr: [*]const u8, value_len: u32) ca
     if (!environmentNameValid(name)) return ENV_ERROR_INVALID;
     const value_count: usize = @intCast(value_len);
     if (value_count > ENVIRONMENT_VALUE_MAX) return ENV_ERROR_TOO_LONG;
+    if (equalsIgnoreCase(name, "CWD")) return workingDirectorySet(instance, value_ptr[0..value_count]);
     return environmentSet(instance, name, value_ptr[0..value_count]);
 }
 
@@ -17118,7 +17120,7 @@ fn createInstance(
         };
         copyArgsInto(instance, args);
         inheritEnvironmentInto(instance, parent);
-        copyWorkingDirectoryInto(instance, working_drive);
+        if (!copyWorkingDirectoryInto(instance, parent, working_drive)) return null;
         {
             const runtime = runtimePayload(instance);
             const n = if (module_origin.len > runtime.module_path.len) runtime.module_path.len else module_origin.len;
@@ -18245,17 +18247,65 @@ fn copySliceZ(out: []u8, value: []const u8) void {
     if (count > 0) @memcpy(out[0..count], value[0..count]);
 }
 
-fn copyWorkingDirectoryInto(instance: *ProgramInstance, d: *drive.Drive) void {
+// CWD is a view of the process path context, never a second environment value.
+fn workingDirectoryGet(instance: *const ProgramInstance, out: [*]u8, capacity: u32) i32 {
+    if (!lockProgramRegistry()) return ENV_ERROR_UNSUPPORTED;
+    defer unlockProgramRegistry();
+    const process = processPayloadConst(instance);
+    const len = process.work_cwd_len + 2;
+    if (capacity < len) return ENV_ERROR_BUFFER_TOO_SMALL;
+    out[0] = process.work_drive_letter;
+    out[1] = ':';
+    @memcpy(out[2..len], process.work_cwd[0..process.work_cwd_len]);
+    if (capacity > len) out[len] = 0;
+    return @intCast(len);
+}
+
+fn workingDirectorySet(instance: *ProgramInstance, value: []const u8) i32 {
+    if (value.len < 3 or !isAlpha(value[0]) or value[1] != ':') return ENV_ERROR_INVALID;
+    for (value) |byte| if (byte == 0) return ENV_ERROR_INVALID;
+    var normalized: [MAX_API_PATH]u8 = undefined;
+    const path = canonicalizeApiVolumePath(value[2..], &normalized) orelse return ENV_ERROR_INVALID;
+    if (path.len >= drive.MAX_PATH or path.len + 2 >= MAX_API_PATH) return ENV_ERROR_TOO_LONG;
+    var absolute: [MAX_API_PATH:0]u8 = .{0} ** MAX_API_PATH;
+    const letter = if (value[0] >= 'a' and value[0] <= 'z') value[0] - 32 else value[0];
+    absolute[0] = letter;
+    absolute[1] = ':';
+    @memcpy(absolute[2 .. 2 + path.len], path);
+    var info: r4x_api.FileInfo = .{};
+    // Complete filesystem work before acquiring the process-state owner.
+    if (r4api.r4sys.fileInfo(&absolute, &info) != 1 or info.exists == 0 or info.is_dir == 0) return ENV_ERROR_INVALID;
+    if (!lockProgramRegistry()) return ENV_ERROR_UNSUPPORTED;
+    defer unlockProgramRegistry();
     const process = processPayload(instance);
+    process.work_drive_letter = letter;
+    @memcpy(process.work_cwd[0..path.len], path);
+    process.work_cwd[path.len] = 0;
+    process.work_cwd_len = path.len;
+    return ENV_OK;
+}
+
+fn copyWorkingDirectoryInto(instance: *ProgramInstance, parent: ?*const ProgramInstance, d: *drive.Drive) bool {
+    const process = processPayload(instance);
+    if (parent) |source| {
+        if (!lockProgramRegistry()) return false;
+        defer unlockProgramRegistry();
+        const source_process = processPayloadConst(source);
+        process.work_drive_letter = source_process.work_drive_letter;
+        process.work_cwd_len = source_process.work_cwd_len;
+        @memcpy(process.work_cwd[0..], source_process.work_cwd[0..]);
+        return true;
+    }
     process.work_drive_letter = d.letter;
     @memset(process.work_cwd[0..], 0);
     process.work_cwd_len = d.cwd_len;
     if (process.work_cwd_len == 0 or process.work_cwd_len > process.work_cwd.len) {
         process.work_cwd[0] = '\\';
         process.work_cwd_len = 1;
-        return;
+        return true;
     }
     @memcpy(process.work_cwd[0..process.work_cwd_len], d.cwd[0..process.work_cwd_len]);
+    return true;
 }
 
 fn markDisplayUsed() void {
@@ -18273,7 +18323,19 @@ fn resolveApiTarget(raw: []const u8, out: *[MAX_API_PATH]u8) ?ApiTarget {
     if (raw.len == 0) return null;
 
     const ctx = currentInstance();
-    const current_drive = if (ctx) |instance| processPayloadConst(instance).work_drive_letter else work_drive_letter;
+    var current_drive = work_drive_letter;
+    var cwd_copy: [drive.MAX_PATH]u8 = undefined;
+    var cwd_len = work_cwd_len;
+    if (ctx) |instance| {
+        if (!lockProgramRegistry()) return null;
+        const process = processPayloadConst(instance);
+        current_drive = process.work_drive_letter;
+        cwd_len = process.work_cwd_len;
+        @memcpy(cwd_copy[0..cwd_len], process.work_cwd[0..cwd_len]);
+        unlockProgramRegistry();
+    } else {
+        @memcpy(cwd_copy[0..cwd_len], work_cwd[0..cwd_len]);
+    }
     var d = drive.get(current_drive) orelse return null;
     var rest = raw;
     if (raw.len >= 2 and raw[1] == ':' and isAlpha(raw[0])) {
@@ -18281,10 +18343,7 @@ fn resolveApiTarget(raw: []const u8, out: *[MAX_API_PATH]u8) ?ApiTarget {
         rest = raw[2..];
     }
 
-    const cwd = if (ctx) |instance| blk: {
-        const process = processPayloadConst(instance);
-        break :blk if (d.letter == process.work_drive_letter) process.work_cwd[0..process.work_cwd_len] else d.cwd[0..d.cwd_len];
-    } else if (d.letter == work_drive_letter) work_cwd[0..work_cwd_len] else d.cwd[0..d.cwd_len];
+    const cwd = if (d.letter == current_drive) cwd_copy[0..cwd_len] else d.cwd[0..d.cwd_len];
     const path = buildApiPath(cwd, rest, out) orelse return null;
     return .{ .drive_ref = d, .path = path };
 }
