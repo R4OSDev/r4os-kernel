@@ -352,7 +352,7 @@ pub fn inspectBounded(device_index: usize, first_lba: u32, partition_sectors: u6
     k.putDec(info.record_bytes);
     k.puts(" mft_runs=");
     k.putDec(info.mft_run_count);
-    k.puts(" read-write\r\n");
+    k.puts(if (info.used_mft_mirror) " read-only (MFT mirror bootstrap; repair required)\r\n" else " read-write\r\n");
     mounted = true;
     _ = &volume;
     return volume;

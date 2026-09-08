@@ -92,6 +92,9 @@ pub const Scratch = struct {
     // A failed rollback or an uncertain in-place write must not be certified
     // clean by a later unrelated operation on this mount.
     repair_required: bool = false,
+    // A mirror bootstrap exposes metadata for reading; it does not repair
+    // the primary MFT or authorize any write to this mounted volume.
+    mft_mirror_bootstrap_lcn: ?u64 = null,
     rollback_record: [4096]u8 = undefined,
     attr: AttrScratch = .{},
     record: [4096]u8 = undefined,
@@ -246,6 +249,7 @@ pub const MountInfo = struct {
     mft_lcn: u64,
     mftmirr_lcn: u64,
     mft_run_count: usize,
+    used_mft_mirror: bool = false,
 };
 
 // ---------------------------------------------------------------------------
@@ -302,6 +306,7 @@ const MetadataMutation = union(enum) {
 };
 
 fn writeSectors(v: *const Volume, lba: u64, count: u32, data: []const u8, mutation: MetadataMutation) bool {
+    if (v.scratch.mft_mirror_bootstrap_lcn != null) return false;
     if (!sectorIoRangeValid(v, lba, count, data.len)) return false;
     // Publish the semantic invalidation before any physical write can become
     // visible. Payload and cache-independent system writes retain decoded
@@ -499,8 +504,36 @@ pub fn mount(device: Device, partition_lba: u32, scratch: *Scratch, runs_out: []
         .upcase = &[_]u8{},
         .scratch = scratch,
     };
-    const record = scratch.record[0..boot.file_record_bytes];
-    if (!readLcnBytes(&probe, boot.mft_lcn, 0, record)) return null;
+    // A fresh probe must not inherit the previous source selection. Failed
+    // probes publish neither a usable run count nor a mirror-backed mount.
+    scratch.mft_mirror_bootstrap_lcn = null;
+    var used_mirror = false;
+    const run_count = bootstrapMft(&probe, boot.mft_lcn, boot.mft_lcn) orelse retry: {
+        const count = bootstrapMft(&probe, boot.mftmirr_lcn, boot.mft_lcn) orelse return null;
+        used_mirror = true;
+        break :retry count;
+    };
+    if (used_mirror) scratch.mft_mirror_bootstrap_lcn = boot.mftmirr_lcn;
+    scratch.cluster_search_start = 0;
+    scratch.record_search_start = ntfs.MFT_FIRST_NORMAL;
+    return .{
+        .cluster_bytes = boot.cluster_bytes,
+        .record_bytes = boot.file_record_bytes,
+        .index_block_bytes = boot.index_block_bytes,
+        .total_sectors = boot.total_sectors,
+        .mft_lcn = boot.mft_lcn,
+        .mftmirr_lcn = boot.mftmirr_lcn,
+        .mft_run_count = run_count,
+        .used_mft_mirror = used_mirror,
+    };
+}
+
+/// Apply identical validation to each candidate before publishing its runlist.
+fn bootstrapMft(probe: *const Volume, source_lcn: u64, primary_lcn: u64) ?usize {
+    const scratch = probe.scratch;
+    const runs_out = probe.mft_runs_buf;
+    const record = scratch.record[0..probe.record_bytes];
+    if (!readLcnBytes(probe, source_lcn, 0, record)) return null;
     if (ntfs.applyFixups(record) != .ok) return null;
     const header = ntfs.FileRecordHeader.parse(record) orelse return null;
     if (!header.inUse() or header.record_number != ntfs.MFT_RECORD_MFT or
@@ -520,7 +553,7 @@ pub fn mount(device: Device, partition_lba: u32, scratch: *Scratch, runs_out: []
             continue;
         }
         if (!attribute.non_resident or
-            !captureAttribute(&probe, attribute, collected, &geometry))
+            !captureAttribute(probe, attribute, collected, &geometry))
         {
             return null;
         }
@@ -532,19 +565,13 @@ pub fn mount(device: Device, partition_lba: u32, scratch: *Scratch, runs_out: []
     {
         return null;
     }
+    // Record 0 must describe the primary MFT starting at VCN 0. The mirror
+    // provides its bootstrap record, never a replacement data-stream extent.
+    if (collected.data_size < probe.record_bytes or
+        collected.initialized_size < probe.record_bytes or
+        collected.runs[0].lcn != primary_lcn) return null;
     @memcpy(runs_out[0..collected.count], collected.runs[0..collected.count]);
-    const run_count = collected.count;
-    scratch.cluster_search_start = 0;
-    scratch.record_search_start = ntfs.MFT_FIRST_NORMAL;
-    return .{
-        .cluster_bytes = boot.cluster_bytes,
-        .record_bytes = boot.file_record_bytes,
-        .index_block_bytes = boot.index_block_bytes,
-        .total_sectors = boot.total_sectors,
-        .mft_lcn = boot.mft_lcn,
-        .mftmirr_lcn = boot.mftmirr_lcn,
-        .mft_run_count = run_count,
-    };
+    return collected.count;
 }
 
 fn mftByteIo(v: *const Volume, byte_offset: u64, buffer: []u8, mutation: ?MetadataMutation) bool {
@@ -558,10 +585,9 @@ fn mftByteIo(v: *const Volume, byte_offset: u64, buffer: []u8, mutation: ?Metada
 pub fn loadRecord(v: *const Volume, number: u64, buf: []u8) ?ntfs.FileRecordHeader {
     if (v.record_bytes == 0 or v.record_bytes > buf.len) return null;
     const record = buf[0..v.record_bytes];
-    const byte_offset = checkedMulU64(number, @as(u64, v.record_bytes)) orelse return null;
     const cached = if (v.metadata_cache) |cache| cache.lookupRecord(number, record) else false;
     if (!cached) {
-        if (!mftByteIo(v, byte_offset, record, null)) return null;
+        if (!loadRecordRaw(v, number, record)) return null;
         if (ntfs.applyFixups(record) != .ok) return null;
     }
     const header = ntfs.FileRecordHeader.parse(record) orelse return null;
@@ -575,6 +601,9 @@ pub fn loadRecord(v: *const Volume, number: u64, buf: []u8) ?ntfs.FileRecordHead
 fn loadRecordRaw(v: *const Volume, number: u64, buf: []u8) bool {
     if (v.record_bytes == 0 or v.record_bytes > buf.len) return false;
     const record = buf[0..v.record_bytes];
+    if (number == ntfs.MFT_RECORD_MFT) {
+        if (v.scratch.mft_mirror_bootstrap_lcn) |lcn| return readLcnBytes(v, lcn, 0, record);
+    }
     const byte_offset = checkedMulU64(number, @as(u64, v.record_bytes)) orelse return false;
     return mftByteIo(v, byte_offset, record, null);
 }
@@ -582,6 +611,7 @@ fn loadRecordRaw(v: *const Volume, number: u64, buf: []u8) bool {
 /// Installs fresh fixups and writes record `number`; mirrors records 0-3
 /// into $MFTMirr afterwards.
 fn storeRecord(v: *const Volume, number: u64, buf: []u8) bool {
+    if (v.scratch.mft_mirror_bootstrap_lcn != null) return false;
     if (v.record_bytes == 0 or v.record_bytes > buf.len) return false;
     const record = buf[0..v.record_bytes];
     const usn = if (record.len >= 0x32) readLe16(record, readLe16(record, 4)) else 0;
@@ -2588,7 +2618,7 @@ fn releaseRecord(v: *const Volume, number: u64) bool {
 // ---------------------------------------------------------------------------
 
 pub fn setDirty(v: *const Volume, dirty: bool) bool {
-    if (v.scratch.repair_required) return false;
+    if (v.scratch.repair_required or v.scratch.mft_mirror_bootstrap_lcn != null) return false;
     const header = loadRecord(v, ntfs.MFT_RECORD_VOLUME, v.scratch.write_record[0..]) orelse return false;
     const record = v.scratch.write_record[0..v.record_bytes];
     const attr = ntfs.findAttribute(record, header, .volume_information, &[_]u8{}) orelse return false;
@@ -2613,7 +2643,7 @@ pub fn setDirty(v: *const Volume, dirty: bool) bool {
 /// $Volume record must flush again: the previous device completion may have
 /// been lost after the write reached media.
 fn ensureDirtyDurable(v: *const Volume) bool {
-    if (v.scratch.repair_required) return false;
+    if (v.scratch.repair_required or v.scratch.mft_mirror_bootstrap_lcn != null) return false;
     const already_dirty = isDirty(v) orelse return false;
     if (already_dirty) return deviceFlush(v);
     return setDirty(v, true);
@@ -6446,6 +6476,7 @@ pub fn writeFileAt(v: *const Volume, record_number: u64, offset: u64, data: []co
 /// record mutations: save the original, open a durable dirty bracket, and
 /// restore the complete record if its write fails.
 pub fn writeFileAtProgress(v: *const Volume, record_number: u64, offset: u64, data: []const u8) WriteProgress {
+    if (v.scratch.mft_mirror_bootstrap_lcn != null) return .{ .status = .unsupported };
     if (v.scratch.repair_required) return .{ .status = .cleanup_failed, .uncertain = true };
     if (data.len == 0) return .{ .status = .ok };
     const data_len: u64 = @intCast(data.len);

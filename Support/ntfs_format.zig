@@ -234,6 +234,7 @@ pub fn applyFixups(record: []u8) FixupError {
     if (usa_count < 2) return .bad_offsets;
     const sectors = @as(usize, usa_count) - 1;
     if (record.len < sectors * SECTOR_SIZE) return .too_short;
+    if (record.len != sectors * SECTOR_SIZE) return .bad_offsets;
     if (@as(usize, usa_ofs) + @as(usize, usa_count) * 2 > record.len) return .bad_offsets;
 
     const usn = le16(record, usa_ofs);
@@ -257,6 +258,7 @@ pub fn installFixups(record: []u8, previous_usn: u16) FixupError {
     if (usa_count < 2) return .bad_offsets;
     const sectors = @as(usize, usa_count) - 1;
     if (record.len < sectors * SECTOR_SIZE) return .too_short;
+    if (record.len != sectors * SECTOR_SIZE) return .bad_offsets;
     if (@as(usize, usa_ofs) + @as(usize, usa_count) * 2 > record.len) return .bad_offsets;
 
     var usn = previous_usn +% 1;
