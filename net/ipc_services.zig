@@ -63,6 +63,10 @@ const TCP_SERVICE_HANDLES: usize = 16;
 const TCP_STALE_HANDLE_TOMBSTONES: usize = 16;
 const TCP_MESSAGE_PAYLOAD_MAX: usize = ipc.MAX_MESSAGE_SIZE - HEADER_SIZE;
 const TCP_WRITE_PAYLOAD_MAX: usize = TCP_MESSAGE_PAYLOAD_MAX - 4;
+// Text replies reserve room for fixed labels, decimal IDs and bounded errors.
+// Request-owned scratch stays below 4 KB, including while the TCP call waits.
+const TCP_TEXT_METADATA_MAX: usize = 256;
+const TCP_TEXT_DATA_MAX: usize = TCP_MESSAGE_PAYLOAD_MAX - TCP_TEXT_METADATA_MAX;
 const DHCP_STATUS_MAGIC: u32 = 0x53504844;
 const DHCP_STATUS_VERSION: u16 = 1;
 const DHCP_RESULT_MAGIC: u32 = 0x50514844;
@@ -2365,7 +2369,7 @@ fn writeTcpWrite(w: *Writer, payload: []const u8, client_id: u16) void {
     w.text(net.tcpStats().last_error);
 }
 
-fn writeTcpRead(w: *Writer, payload: []const u8, client_id: u16) void {
+noinline fn writeTcpRead(w: *Writer, payload: []const u8, client_id: u16) void {
     if (payload.len < 6) {
         w.text("op=read result=bad-request code=-1");
         return;
@@ -2384,8 +2388,8 @@ fn writeTcpRead(w: *Writer, payload: []const u8, client_id: u16) void {
         return;
     }
     const conn_id = lookup.conn_id;
-    const max_len = @min(@as(usize, readU16(payload, 4)), net.TCP_BUFFER_SIZE);
-    var buf: [net.TCP_BUFFER_SIZE]u8 = undefined;
+    const max_len = @min(@as(usize, readU16(payload, 4)), @min(TCP_TEXT_DATA_MAX, w.out.len -| w.pos -| TCP_TEXT_METADATA_MAX));
+    var buf: [TCP_TEXT_DATA_MAX]u8 = undefined;
     const got = net.tcpRead(conn_id, buf[0..max_len]);
     w.text("op=read result=");
     if (got >= 0) {
@@ -2393,7 +2397,7 @@ fn writeTcpRead(w: *Writer, payload: []const u8, client_id: u16) void {
         w.num(@as(u32, @intCast(got)));
         if (got > 0) {
             w.text(" data=");
-            w.text(buf[0..@as(usize, @intCast(got))]);
+            w.bytes(buf[0..@as(usize, @intCast(got))]);
         }
     } else {
         w.text("failed code=");
@@ -2404,7 +2408,8 @@ fn writeTcpRead(w: *Writer, payload: []const u8, client_id: u16) void {
     w.text(" conn=");
     w.num(conn_id);
     w.text(" last=");
-    w.text(net.tcpStats().last_error);
+    const last_error = net.tcpStats().last_error;
+    w.text(last_error[0..@min(last_error.len, 32)]);
 }
 
 fn writeTcpClose(w: *Writer, payload: []const u8, client_id: u16) void {
@@ -2478,19 +2483,19 @@ fn writeTcpListen(w: *Writer, payload: []const u8) void {
     w.text(net.tcpStats().last_error);
 }
 
-fn writeTcpAcceptRead(w: *Writer, payload: []const u8, client_id: u16) void {
+noinline fn writeTcpAcceptRead(w: *Writer, payload: []const u8, client_id: u16) void {
     if (payload.len < 4) {
         w.text("op=acceptread result=bad-request code=-1");
         return;
     }
     const port = readU16(payload, 0);
-    const max_len = @min(@as(usize, readU16(payload, 2)), net.TCP_BUFFER_SIZE);
+    const max_len = @min(@as(usize, readU16(payload, 2)), @min(TCP_TEXT_DATA_MAX, w.out.len -| w.pos -| TCP_TEXT_METADATA_MAX));
     if (port == 0 or max_len == 0) {
         w.text("op=acceptread result=bad-request code=-1");
         return;
     }
     var conn_id: u32 = 0;
-    var buf: [net.TCP_BUFFER_SIZE]u8 = undefined;
+    var buf: [TCP_TEXT_DATA_MAX]u8 = undefined;
     const persistent_listener = net.tcpHasListener(port);
     const got = if (persistent_listener)
         net.tcpAcceptReadOnListener(port, buf[0..max_len], &conn_id)
@@ -2514,7 +2519,7 @@ fn writeTcpAcceptRead(w: *Writer, payload: []const u8, client_id: u16) void {
         w.text(" conn=");
         w.num(conn_id);
         w.text(" data=");
-        w.text(buf[0..@as(usize, @intCast(got))]);
+        w.bytes(buf[0..@as(usize, @intCast(got))]);
     } else if (got == 0) {
         w.text("timeout code=0 bytes=0 conn=0");
     } else {
@@ -2526,7 +2531,8 @@ fn writeTcpAcceptRead(w: *Writer, payload: []const u8, client_id: u16) void {
     w.text(" port=");
     w.num(port);
     w.text(" last=");
-    w.text(net.tcpStats().last_error);
+    const last_error = net.tcpStats().last_error;
+    w.text(last_error[0..@min(last_error.len, 32)]);
 }
 
 fn writeTcpAccept(w: *Writer, payload: []const u8, client_id: u16) void {
@@ -3213,6 +3219,10 @@ const Writer = struct {
 
     fn text(self: *Writer, value: []const u8) void {
         for (value) |ch| if (ch != 0) self.put(ch);
+    }
+
+    fn bytes(self: *Writer, value: []const u8) void {
+        for (value) |ch| self.put(ch);
     }
 
     fn slice(self: *const Writer) []const u8 {
