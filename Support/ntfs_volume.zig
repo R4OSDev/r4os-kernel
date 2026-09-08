@@ -89,6 +89,10 @@ pub const Scratch = struct {
     // Only bitmap contents establish allocation ownership.
     cluster_search_start: u64 = 0,
     record_search_start: u64 = ntfs.MFT_FIRST_NORMAL,
+    // A failed rollback or an uncertain in-place write must not be certified
+    // clean by a later unrelated operation on this mount.
+    repair_required: bool = false,
+    rollback_record: [4096]u8 = undefined,
     attr: AttrScratch = .{},
     record: [4096]u8 = undefined,
     part_record: [4096]u8 = undefined,
@@ -217,6 +221,14 @@ pub const WriteStatus = enum(u8) {
     cleanup_failed,
 };
 
+/// Confirmed complete device-callback prefix. A failed callback may have
+/// changed additional bytes, so `completed` is a lower bound on failure.
+pub const WriteProgress = struct {
+    status: WriteStatus,
+    completed: usize = 0,
+    uncertain: bool = false,
+};
+
 /// Result of a name/path lookup.  `not_found` is reserved for a completely
 /// and validly walked index/path.  Any malformed metadata, stale
 /// FileReference or device failure is `io`, never an apparent absence.
@@ -304,15 +316,15 @@ fn deviceFlush(v: *const Volume) bool {
 
 /// Reads bytes addressed inside one extent starting at `lcn`.
 fn readLcnBytes(v: *const Volume, lcn: u64, byte_offset: u64, out: []u8) bool {
-    return lcnByteIo(v, lcn, byte_offset, out, null);
+    return lcnByteIo(v, lcn, byte_offset, out, null, null);
 }
 
 /// Writes bytes addressed inside one extent starting at `lcn`.
 fn writeLcnBytes(v: *const Volume, lcn: u64, byte_offset: u64, data: []const u8, mutation: MetadataMutation) bool {
-    return lcnByteIo(v, lcn, byte_offset, @constCast(data), mutation);
+    return lcnByteIo(v, lcn, byte_offset, @constCast(data), mutation, null);
 }
 
-fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, mutation: ?MetadataMutation) bool {
+fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, mutation: ?MetadataMutation, progress: ?*usize) bool {
     if (v.cluster_bytes == 0 or v.cluster_bytes % SECTOR_SIZE != 0) return false;
     const total_clusters = v.totalClusters();
     if (lcn >= total_clusters) return false;
@@ -347,6 +359,7 @@ fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, mutatio
             else
                 readSectors(v, lba, chunk, span);
             if (!ok) return false;
+            if (progress) |done| done.* += span.len;
             pos += span.len;
             offset += span.len;
             remaining -= span.len;
@@ -361,6 +374,7 @@ fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, mutatio
             @memcpy(sector[in_sector .. in_sector + take], buffer[pos .. pos + take]);
             if (!writeSectors(v, lba, 1, sector, mutation.?)) return false;
         }
+        if (progress) |done| done.* += take;
         pos += take;
         offset += take;
         remaining -= take;
@@ -370,15 +384,19 @@ fn lcnByteIo(v: *const Volume, lcn: u64, byte_offset: u64, buffer: []u8, mutatio
 
 /// Reads a byte range in the VCN space of a runlist (sparse reads zeros).
 fn readRunBytes(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, out: []u8) bool {
-    return runByteIo(v, runs, byte_offset, out, null);
+    return runByteIo(v, runs, byte_offset, out, null, null);
 }
 
 /// Writes a byte range in the VCN space of a runlist (sparse runs fail).
 fn writeRunBytes(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, data: []const u8, mutation: MetadataMutation) bool {
-    return runByteIo(v, runs, byte_offset, @constCast(data), mutation);
+    return runByteIo(v, runs, byte_offset, @constCast(data), mutation, null);
 }
 
-fn runByteIo(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, buffer: []u8, mutation: ?MetadataMutation) bool {
+fn writeRunBytesProgress(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, data: []const u8, mutation: MetadataMutation, progress: *usize) bool {
+    return runByteIo(v, runs, byte_offset, @constCast(data), mutation, progress);
+}
+
+fn runByteIo(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, buffer: []u8, mutation: ?MetadataMutation, progress: ?*usize) bool {
     const cluster: u64 = v.cluster_bytes;
     if (cluster == 0 or !runlistPhysicalRangeValid(v, runs)) return false;
     var want_start = byte_offset;
@@ -396,11 +414,7 @@ fn runByteIo(v: *const Volume, runs: []const ntfs.Run, byte_offset: u64, buffer:
             if (take > want_len) take = want_len;
             const span = buffer[buf_pos .. buf_pos + @as(usize, @intCast(take))];
             if (run.lcn) |lcn| {
-                const ok = if (mutation) |kind|
-                    writeLcnBytes(v, lcn, inside, span, kind)
-                else
-                    readLcnBytes(v, lcn, inside, span);
-                if (!ok) return false;
+                if (!lcnByteIo(v, lcn, inside, span, mutation, progress)) return false;
             } else if (mutation != null) {
                 return false; // writing into a sparse hole needs allocation
             } else {
@@ -2356,11 +2370,18 @@ fn setBitmapRange(v: *const Volume, bitmap_attr: *const AttrScratch, lcn: u64, c
 
 /// Allocates a free MFT record: scans $MFT/$BITMAP, marks the bit, returns
 /// the record number with its next sequence number.
-fn allocateRecord(v: *const Volume) ?struct { number: u64, sequence: u16 } {
+const RecordAllocation = struct {
+    status: WriteStatus,
+    number: u64 = 0,
+    sequence: u16 = 0,
+};
+
+fn allocateRecord(v: *const Volume) RecordAllocation {
+    if (v.record_bytes == 0) return .{ .status = .io };
     const bitmap_attr = &v.scratch.attr_mgmt_a;
-    if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .bitmap, &[_]u8{}, bitmap_attr)) return null;
+    if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .bitmap, &[_]u8{}, bitmap_attr)) return .{ .status = .io };
     const data_attr = &v.scratch.attr_mgmt_b;
-    if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .data, &[_]u8{}, data_attr)) return null;
+    if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .data, &[_]u8{}, data_attr)) return .{ .status = .io };
     const record_count = data_attr.data_size / v.record_bytes;
 
     var sector_buf: [SECTOR_SIZE]u8 = undefined;
@@ -2385,12 +2406,12 @@ fn allocateRecord(v: *const Volume) ?struct { number: u64, sequence: u16 } {
         const byte_index = number / 8;
         const sector_index = byte_index / SECTOR_SIZE;
         if (sector_index != loaded_sector) {
-            const bitmap_offset = sectorByteOffset(sector_index) orelse return null;
+            const bitmap_offset = sectorByteOffset(sector_index) orelse return .{ .status = .io };
             const io_ok = if (bitmap_attr.resident)
                 copyResident(bitmap_attr, bitmap_offset, sector_buf[0..])
             else
                 readRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..]);
-            if (!io_ok) return null;
+            if (!io_ok) return .{ .status = .io };
             loaded_sector = sector_index;
         }
         const bit = (sector_buf[@intCast(byte_index % SECTOR_SIZE)] >> @intCast(number % 8)) & 1;
@@ -2399,22 +2420,24 @@ fn allocateRecord(v: *const Volume) ?struct { number: u64, sequence: u16 } {
     if (number >= record_count) {
         // Grow the MFT and take the first freshly added record.  growMft
         // reuses the management scratch slots, so re-collect the bitmap.
-        if (!growMft(v)) return null;
+        const growth = growMft(v);
+        if (growth != .ok) return .{ .status = growth };
         number = record_count;
-        if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .bitmap, &[_]u8{}, bitmap_attr)) return null;
+        if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .bitmap, &[_]u8{}, bitmap_attr)) return .{ .status = .io };
         const sector_index = (number / 8) / SECTOR_SIZE;
-        const bitmap_offset = sectorByteOffset(sector_index) orelse return null;
+        const bitmap_offset = sectorByteOffset(sector_index) orelse return .{ .status = .io };
         const io_ok = if (bitmap_attr.resident)
             copyResident(bitmap_attr, bitmap_offset, sector_buf[0..])
         else
             readRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..]);
-        if (!io_ok) return null;
+        if (!io_ok) return .{ .status = .io };
         loaded_sector = sector_index;
     }
 
     // Old sequence from the (possibly zeroed) record.
     var sequence: u16 = 1;
-    if (loadRecordRaw(v, number, v.scratch.write_record[0..])) {
+    if (!loadRecordRaw(v, number, v.scratch.write_record[0..])) return .{ .status = .io };
+    {
         const raw = v.scratch.write_record[0..v.record_bytes];
         if (readLe32(raw, 0) == ntfs.FILE_MAGIC) {
             const old_seq = readLe16(raw, 0x10);
@@ -2423,50 +2446,61 @@ fn allocateRecord(v: *const Volume) ?struct { number: u64, sequence: u16 } {
     }
 
     // Mark the bit durable before the record is initialized.
-    if (bitmap_attr.resident) return null;
+    if (bitmap_attr.resident) return .{ .status = .io };
     sector_buf[@intCast((number / 8) % SECTOR_SIZE)] |= @as(u8, 1) << @intCast(number % 8);
-    const bitmap_offset = sectorByteOffset(number / 8 / SECTOR_SIZE) orelse return null;
-    if (!writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..], .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_MFT, .attr_type = .bitmap } })) return null;
+    const bitmap_offset = sectorByteOffset(number / 8 / SECTOR_SIZE) orelse return .{ .status = .io };
+    if (!writeRunBytes(v, bitmap_attr.runs[0..bitmap_attr.count], bitmap_offset, sector_buf[0..], .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_MFT, .attr_type = .bitmap } })) {
+        // The failed callback can have set the bit before losing completion.
+        if (!releaseRecord(v, number) or !deviceFlush(v)) {
+            _ = markWriteUncertain(v);
+            return .{ .status = .cleanup_failed };
+        }
+        return .{ .status = .io };
+    }
     v.scratch.record_search_start = number + 1;
-    return .{ .number = number, .sequence = sequence };
+    return .{ .status = .ok, .number = number, .sequence = sequence };
 }
 
 /// Extends $MFT by 64 records: allocates clusters (bits durable first),
 /// zeroes the new area, then updates record 0 (auto-synced into $MFTMirr)
 /// and the in-memory runlist so the same operation can use the new records.
-fn growMft(v: *const Volume) bool {
+fn growMft(v: *const Volume) WriteStatus {
     const grow_records: u64 = 64;
     const data_attr = &v.scratch.attr_mgmt_b;
-    if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .data, &[_]u8{}, data_attr)) return false;
-    if (data_attr.resident) return false;
+    if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .data, &[_]u8{}, data_attr)) return .io;
+    if (data_attr.resident) return .io;
     const bitmap_attr = &v.scratch.attr_mgmt_a;
-    if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .bitmap, &[_]u8{}, bitmap_attr)) return false;
+    if (!collectAttribute(v, ntfs.MFT_RECORD_MFT, .bitmap, &[_]u8{}, bitmap_attr)) return .io;
     const cur_records = data_attr.data_size / v.record_bytes;
     // The MFT bitmap keeps its formatted size; growth must stay within it.
-    const grown_records = checkedAddU64(cur_records, grow_records) orelse return false;
-    const rounded_records = checkedAddU64(grown_records, 7) orelse return false;
-    if (rounded_records / 8 > bitmap_attr.data_size) return false;
+    const grown_records = checkedAddU64(cur_records, grow_records) orelse return .io;
+    const rounded_records = checkedAddU64(grown_records, 7) orelse return .io;
+    if (rounded_records / 8 > bitmap_attr.data_size) return .no_space;
 
-    const add_bytes = checkedMulU64(grow_records, @as(u64, v.record_bytes)) orelse return false;
-    if (v.cluster_bytes == 0 or add_bytes % v.cluster_bytes != 0) return false;
+    const add_bytes = checkedMulU64(grow_records, @as(u64, v.record_bytes)) orelse return .io;
+    if (v.cluster_bytes == 0 or add_bytes % v.cluster_bytes != 0) return .io;
     const add_clusters = add_bytes / v.cluster_bytes;
-    if (add_clusters == 0) return false;
-    if (data_attr.count + 8 > data_attr.runs.len) return false;
+    if (add_clusters == 0) return .io;
+    if (data_attr.count + 8 > data_attr.runs.len) return .record_full;
 
     var new_runs: [8]ntfs.Run = undefined;
     const allocation = allocateClusters(v, add_clusters, new_runs[0..]);
-    if (allocation.status != .ok) return false;
+    if (allocation.status != .ok) {
+        if (allocation.status == .cleanup_failed) _ = markWriteUncertain(v);
+        return allocation.status;
+    }
     const produced = allocation.produced;
+    if (!deviceFlush(v)) return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
 
     // Zero the fresh area before record 0 references it (free records are
     // zeroed, matching the formatter's layout that chkdsk accepts).
     var zeros: [SECTOR_SIZE]u8 = .{0} ** SECTOR_SIZE;
     for (new_runs[0..produced]) |run| {
-        const lcn = run.lcn orelse return false;
+        const lcn = run.lcn orelse return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
         var written: u64 = 0;
-        const run_bytes = checkedMulU64(run.length_clusters, @as(u64, v.cluster_bytes)) orelse return false;
+        const run_bytes = checkedMulU64(run.length_clusters, @as(u64, v.cluster_bytes)) orelse return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
         while (written < run_bytes) : (written += SECTOR_SIZE) {
-            if (!writeLcnBytes(v, lcn, written, zeros[0..], .payload)) return false;
+            if (!writeLcnBytes(v, lcn, written, zeros[0..], .payload)) return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
         }
     }
 
@@ -2478,36 +2512,52 @@ fn growMft(v: *const Volume) bool {
             (checkedAddU64(
                 data_attr.runs[total_runs - 1].lcn.?,
                 data_attr.runs[total_runs - 1].length_clusters,
-            ) orelse return false) == run.lcn.?
+            ) orelse return rollbackMftGrowth(v, new_runs[0..produced], false, .io)) == run.lcn.?
         else
             false;
         if (adjacent) {
             data_attr.runs[total_runs - 1].length_clusters = checkedAddU64(
                 data_attr.runs[total_runs - 1].length_clusters,
                 run.length_clusters,
-            ) orelse return false;
+            ) orelse return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
         } else {
-            if (total_runs >= data_attr.runs.len) return false;
+            if (total_runs >= data_attr.runs.len) return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
             data_attr.runs[total_runs] = run;
             total_runs += 1;
         }
     }
-    if (total_runs > v.mft_runs_buf.len) return false;
-    if (!runlistPhysicalRangeValid(v, data_attr.runs[0..total_runs])) return false;
-    const new_bytes = checkedAddU64(data_attr.data_size, add_bytes) orelse return false;
-    var header = loadRecord(v, ntfs.MFT_RECORD_MFT, v.scratch.write_record[0..]) orelse return false;
+    if (total_runs > v.mft_runs_buf.len) return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
+    if (!runlistPhysicalRangeValid(v, data_attr.runs[0..total_runs])) return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
+    const new_bytes = checkedAddU64(data_attr.data_size, add_bytes) orelse return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
+    var header = loadRecord(v, ntfs.MFT_RECORD_MFT, v.scratch.write_record[0..]) orelse return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
     const record = v.scratch.write_record[0..v.record_bytes];
+    @memcpy(v.scratch.rollback_record[0..v.record_bytes], record);
     if (!updateNonResident(record, &header, .data, &[_]u8{}, data_attr.runs[0..total_runs], new_bytes, new_bytes, new_bytes)) {
-        if (!freeClusters(v, new_runs[0..produced])) return false;
-        return false;
+        return rollbackMftGrowth(v, new_runs[0..produced], false, .record_full);
     }
-    if (!updateFileNameDup(record, header, new_bytes, new_bytes, 0)) return false;
-    if (!storeRecord(v, ntfs.MFT_RECORD_MFT, record)) return false;
+    if (!updateFileNameDup(record, header, new_bytes, new_bytes, 0)) return rollbackMftGrowth(v, new_runs[0..produced], false, .io);
+    if (!storeRecord(v, ntfs.MFT_RECORD_MFT, record) or !deviceFlush(v))
+        return rollbackMftGrowth(v, new_runs[0..produced], true, .io);
 
     // Refresh the in-memory runlist for the remainder of this operation.
     @memcpy(v.mft_runs_buf[0..total_runs], data_attr.runs[0..total_runs]);
     v.mft_run_count.* = total_runs;
-    return true;
+    return .ok;
+}
+
+/// Never release clusters while record 0 may still refer to them. Restore
+/// both record and mirror, flush that restoration, then retire the allocation.
+fn rollbackMftGrowth(v: *const Volume, runs: []const ntfs.Run, published: bool, status: WriteStatus) WriteStatus {
+    if (v.metadata_cache) |cache| cache.invalidateMutation(.recovery);
+    if (published and (!storeRecord(v, ntfs.MFT_RECORD_MFT, v.scratch.rollback_record[0..v.record_bytes]) or !deviceFlush(v))) {
+        _ = markWriteUncertain(v);
+        return .cleanup_failed;
+    }
+    if (!freeClusters(v, runs) or !deviceFlush(v)) {
+        _ = markWriteUncertain(v);
+        return .cleanup_failed;
+    }
+    return status;
 }
 
 fn copyResident(attr: *const AttrScratch, offset: u64, out: []u8) bool {
@@ -2538,6 +2588,7 @@ fn releaseRecord(v: *const Volume, number: u64) bool {
 // ---------------------------------------------------------------------------
 
 pub fn setDirty(v: *const Volume, dirty: bool) bool {
+    if (v.scratch.repair_required) return false;
     const header = loadRecord(v, ntfs.MFT_RECORD_VOLUME, v.scratch.write_record[0..]) orelse return false;
     const record = v.scratch.write_record[0..v.record_bytes];
     const attr = ntfs.findAttribute(record, header, .volume_information, &[_]u8{}) orelse return false;
@@ -2562,6 +2613,7 @@ pub fn setDirty(v: *const Volume, dirty: bool) bool {
 /// $Volume record must flush again: the previous device completion may have
 /// been lost after the write reached media.
 fn ensureDirtyDurable(v: *const Volume) bool {
+    if (v.scratch.repair_required) return false;
     const already_dirty = isDirty(v) orelse return false;
     if (already_dirty) return deviceFlush(v);
     return setDirty(v, true);
@@ -4398,7 +4450,8 @@ pub fn createFile(v: *const Volume, parent_record: u64, name: []const u8, data: 
         if (!budgetedFlush(v)) return abortWriteFreeing(v, runs[0..run_count], .io);
     }
 
-    const slot = allocateRecord(v) orelse return abortWriteFreeing(v, runs[0..run_count], .no_space);
+    const slot = allocateRecord(v);
+    if (slot.status != .ok) return abortWriteFreeing(v, runs[0..run_count], slot.status);
     if (!budgetedFlush(v)) return abortWriteReleasingRecord(v, slot.number, false, runs[0..run_count], .io);
 
     // Write payload before the record references it.
@@ -4998,7 +5051,8 @@ fn attributeInstance(record: []const u8, header: ntfs.FileRecordHeader, attr_typ
 /// the $MFTMirr stay consistent.
 fn spillDataToExtension(v: *const Volume, base_number: u64, runs: []const ntfs.Run, data_size: u64, init_size: u64, alloc_size: u64) WriteStatus {
     const base_sequence = seqOf(v, base_number) orelse return .io;
-    const alloc = allocateRecord(v) orelse return .no_space;
+    const alloc = allocateRecord(v);
+    if (alloc.status != .ok) return alloc.status;
     const ext_number = alloc.number;
     const ext_seq = alloc.sequence;
 
@@ -5437,7 +5491,8 @@ pub fn createDirectory(v: *const Volume, parent_record: u64, name: []const u8) W
     const parent_sequence = seqOf(v, parent_record) orelse return .io;
 
     if (!setDirty(v, true)) return .io;
-    const slot = allocateRecord(v) orelse return abortWrite(v, .no_space);
+    const slot = allocateRecord(v);
+    if (slot.status != .ok) return abortWrite(v, slot.status);
     if (!budgetedFlush(v)) return abortWriteReleasingRecord(v, slot.number, false, &.{}, .io);
 
     if (buildDirRecord(v, slot.number, slot.sequence, parent_record, parent_sequence, name) == 0) {
@@ -6379,72 +6434,92 @@ fn fillHolesInRuns(v: *const Volume, attr: *AttrScratch, offset: u64, len: u64) 
     return .ok;
 }
 
-/// In-place range write inside the existing file content (no size change):
-/// the pager and random-access writers patch bytes without touching any
-/// metadata, so no dirty bracket is needed.  Writes beyond the initialized
-/// content are refused (extension goes through appendFileAtOffset); on a
-/// sparse file they are allowed up to data_size and raise initialized_size
-/// (0.60.17), and writes into holes allocate + split inside a dirty bracket.
+/// Compatibility status view; progress-aware filesystem adapters use the
+/// result below so a confirmed prefix is not hidden by a later I/O failure.
 pub fn writeFileAt(v: *const Volume, record_number: u64, offset: u64, data: []const u8) WriteStatus {
-    if (data.len == 0) return .ok;
+    return writeFileAtProgress(v, record_number, offset, data).status;
+}
+
+/// Random in-place writes retain lazy successful payload I/O. A failed
+/// callback reports only its confirmed predecessors and durably marks the
+/// volume dirty if the device still accepts metadata. Resident values are
+/// record mutations: save the original, open a durable dirty bracket, and
+/// restore the complete record if its write fails.
+pub fn writeFileAtProgress(v: *const Volume, record_number: u64, offset: u64, data: []const u8) WriteProgress {
+    if (v.scratch.repair_required) return .{ .status = .cleanup_failed, .uncertain = true };
+    if (data.len == 0) return .{ .status = .ok };
     const data_len: u64 = @intCast(data.len);
-    const write_end = checkedAddU64(offset, data_len) orelse return .offset_mismatch;
+    const write_end = checkedAddU64(offset, data_len) orelse return .{ .status = .offset_mismatch };
     const attr = &v.scratch.attr_op;
-    if (!collectAttribute(v, record_number, .data, &[_]u8{}, attr)) return .io;
-    if ((attr.flags & (ntfs.ATTR_FLAG_COMPRESSED | ntfs.ATTR_FLAG_ENCRYPTED)) != 0) return .unsupported;
-    if (write_end > attr.data_size) return .offset_mismatch;
+    if (!collectAttribute(v, record_number, .data, &[_]u8{}, attr)) return .{ .status = .io };
+    if ((attr.flags & (ntfs.ATTR_FLAG_COMPRESSED | ntfs.ATTR_FLAG_ENCRYPTED)) != 0) return .{ .status = .unsupported };
+    if (write_end > attr.data_size) return .{ .status = .offset_mismatch };
 
     if (attr.resident) {
-        // Patch the resident value inside the record.
-        var header = loadRecord(v, record_number, v.scratch.write_record[0..]) orelse return .io;
+        const previously_dirty = isDirty(v) orelse return .{ .status = .io };
+        if (!ensureDirtyDurable(v)) return .{ .status = markWriteUncertain(v), .uncertain = true };
+        var header = loadRecord(v, record_number, v.scratch.write_record[0..]) orelse return .{ .status = .io };
         const record = v.scratch.write_record[0..v.record_bytes];
+        @memcpy(v.scratch.rollback_record[0..v.record_bytes], record);
         var value: [RESIDENT_DATA_MAX]u8 = undefined;
-        if (attr.resident_len > value.len) return .io;
+        if (attr.resident_len > value.len) return .{ .status = .io };
         @memcpy(value[0..attr.resident_len], attr.resident_copy[0..attr.resident_len]);
         @memcpy(value[@intCast(offset)..@intCast(write_end)], data);
-        if (!updateResident(record, &header, .data, &[_]u8{}, value[0..attr.resident_len])) return .io;
-        if (!storeRecord(v, record_number, record)) return .io;
-        return .ok;
+        if (!updateResident(record, &header, .data, &[_]u8{}, value[0..attr.resident_len])) return .{ .status = .io };
+        if (!storeRecord(v, record_number, record) or !deviceFlush(v)) {
+            if (!storeRecord(v, record_number, v.scratch.rollback_record[0..v.record_bytes]) or !deviceFlush(v)) {
+                _ = markWriteUncertain(v);
+                return .{ .status = .cleanup_failed, .uncertain = true };
+            }
+            if (!previously_dirty and !setDirty(v, false)) return .{ .status = markWriteUncertain(v), .uncertain = true };
+            return .{ .status = .io };
+        }
+        if (!previously_dirty and !setDirty(v, false)) return .{ .status = markWriteUncertain(v), .completed = data.len, .uncertain = true };
+        return .{ .status = .ok, .completed = data.len };
     }
 
     const is_sparse = (attr.flags & ntfs.ATTR_FLAG_SPARSE) != 0;
-    if (write_end > attr.initialized_size and !is_sparse) return .offset_mismatch;
-
-    const overlaps_hole = rangeOverlapsHole(v, attr.runs[0..attr.count], offset, data_len) orelse return .io;
-    const needs_metadata = is_sparse and
-        (overlaps_hole or write_end > attr.initialized_size);
-    // A direct write to $Bitmap is metadata even through the ordinary file
-    // interface; its bit delta is unknown to the cluster allocator.
+    if (write_end > attr.initialized_size and !is_sparse) return .{ .status = .offset_mismatch };
+    const overlaps_hole = rangeOverlapsHole(v, attr.runs[0..attr.count], offset, data_len) orelse return .{ .status = .io };
+    const needs_metadata = is_sparse and (overlaps_hole or write_end > attr.initialized_size);
     const mutation: MetadataMutation = if (record_number == ntfs.MFT_RECORD_BITMAP)
         .{ .attribute = .{ .record_number = ntfs.MFT_RECORD_BITMAP, .attr_type = .data } }
     else
         .payload;
+    var completed: usize = 0;
     if (!needs_metadata) {
-        if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data, mutation)) return .io;
-        // Pure data writes stay lazy: no metadata changed, the page-cache
-        // writeback worker drains the dirty pages.  A device flush per random
-        // write made the pager/tooling paths measurably too slow.
-        return .ok;
+        if (!writeRunBytesProgress(v, attr.runs[0..attr.count], offset, data, mutation, &completed))
+            return .{ .status = markWriteUncertain(v), .completed = completed, .uncertain = true };
+        return .{ .status = .ok, .completed = completed };
     }
 
-    // Sparse metadata path: dirty -> bitmap+zero (fill) -> init gap zero ->
-    // payload -> record (runlist + initialized_size) -> clear dirty.  A crash
-    // before the record commit leaves the old view (holes read as zeros).
-    if (!setDirty(v, true)) return .io;
+    if (!ensureDirtyDurable(v)) return .{ .status = markWriteUncertain(v), .uncertain = true };
     const fill = fillHolesInRuns(v, attr, offset, data.len);
-    if (fill != .ok) return abortWrite(v, fill);
-    if (!budgetedFlush(v)) return .io;
+    if (fill != .ok) return .{ .status = abortWrite(v, fill) };
+    if (!budgetedFlush(v)) return .{ .status = markWriteUncertain(v), .uncertain = true };
     if (offset > attr.initialized_size) {
-        if (!zeroMappedRange(v, attr.runs[0..attr.count], attr.initialized_size, offset)) return .io;
+        if (!zeroMappedRange(v, attr.runs[0..attr.count], attr.initialized_size, offset)) return .{ .status = markWriteUncertain(v), .uncertain = true };
     }
-    if (!writeRunBytes(v, attr.runs[0..attr.count], offset, data, mutation)) return .io;
-    if (!budgetedFlush(v)) return .io;
-    const new_init = if (write_end > attr.initialized_size) write_end else attr.initialized_size;
+    if (!writeRunBytesProgress(v, attr.runs[0..attr.count], offset, data, mutation, &completed))
+        return .{ .status = markWriteUncertain(v), .uncertain = true };
+    // A sparse payload is not visible until the runlist/init size commits;
+    // no logical prefix can be acknowledged before that metadata succeeds.
+    if (!budgetedFlush(v)) return .{ .status = markWriteUncertain(v), .uncertain = true };
+    const new_init = @max(write_end, attr.initialized_size);
     const commit = commitDataRunlist(v, record_number, attr.runs[0..attr.count], attr.data_size, new_init, attr.alloc_size);
-    if (commit != .ok) return abortWriteAfterCommitFailure(v, commit);
-    if (!budgetedFlush(v)) return .io;
-    if (!setDirty(v, false)) return .io;
-    return .ok;
+    if (commit != .ok) {
+        _ = markWriteUncertain(v);
+        return .{ .status = commit, .uncertain = true };
+    }
+    if (!budgetedFlush(v) or !setDirty(v, false)) return .{ .status = markWriteUncertain(v), .uncertain = true };
+    return .{ .status = .ok, .completed = data.len };
+}
+
+fn markWriteUncertain(v: *const Volume) WriteStatus {
+    if (v.metadata_cache) |cache| cache.invalidateMutation(.recovery);
+    const marked = ensureDirtyDurable(v);
+    v.scratch.repair_required = true;
+    return if (marked) .io else .cleanup_failed;
 }
 
 /// Exact mount-owned free-space count. The first query reads $Bitmap in
@@ -6509,7 +6584,10 @@ pub fn storeRecordForTest(v: *const Volume, number: u64) bool {
 fn abortWrite(v: *const Volume, status: WriteStatus) WriteStatus {
     if (status == .cleanup_failed) return status;
     if (v.metadata_cache) |cache| cache.invalidateMutation(.recovery);
-    if (!setDirty(v, false)) return .cleanup_failed;
+    if (!deviceFlush(v) or !setDirty(v, false)) {
+        _ = markWriteUncertain(v);
+        return .cleanup_failed;
+    }
     return status;
 }
 

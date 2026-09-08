@@ -901,33 +901,44 @@ pub fn childSize(volume: Volume, parent: u64, name: []const u8) u64 {
 /// the exact end, or replacing from offset 0 when the write extends past
 /// the end.
 pub fn writeFileRangeStatus(volume: Volume, entry: Entry, offset: usize, data: []const u8) WriteStatus {
-    if (entry.isDir()) return .directory;
+    return writeFileRangeProgress(volume, entry, offset, data).status;
+}
+
+fn writeFileRangeProgress(volume: Volume, entry: Entry, offset: usize, data: []const u8) nv.WriteProgress {
+    if (entry.isDir()) return .{ .status = .directory };
     var v = buildVolume(volume);
-    if (nv.recordIdentityStatus(&v, entry.record, entry.sequence, false) != .found) return .io;
+    if (nv.recordIdentityStatus(&v, entry.record, entry.sequence, false) != .found) return .{ .status = .io };
     const offset_u64: u64 = @intCast(offset);
     const data_len_u64: u64 = @intCast(data.len);
-    if (data_len_u64 > ~@as(u64, 0) - offset_u64) return .offset_mismatch;
+    if (data_len_u64 > ~@as(u64, 0) - offset_u64) return .{ .status = .offset_mismatch };
     if (offset_u64 + data_len_u64 <= entry.size) {
         // A hard link intentionally shares this data stream.  Pure in-place
         // writes which do not change its size therefore remain supported.
-        return nv.writeFileAt(&v, entry.record, offset_u64, data);
+        return nv.writeFileAtProgress(&v, entry.record, offset_u64, data);
     }
 
     // Append/growth and whole-object replacement need one canonical
     // parent/name.  Preserve `.unsupported` at this adapter boundary rather
     // than silently choosing one name of a hard-linked record.
     const link_status = nv.requireSingleLinkStatus(&v, entry.record, entry.sequence);
-    if (link_status != .ok) return link_status;
-    const loc = nv.recordParentAndName(&v, entry.record) orelse return .io;
+    if (link_status != .ok) return .{ .status = link_status };
+    const loc = nv.recordParentAndName(&v, entry.record) orelse return .{ .status = .io };
     if (offset_u64 == entry.size) {
-        return nv.appendFileAtOffset(&v, loc.parent, loc.name[0..loc.name_len], offset_u64, data);
+        return wholeWriteProgress(nv.appendFileAtOffset(&v, loc.parent, loc.name[0..loc.name_len], offset_u64, data), data.len);
     }
-    if (offset == 0) return nv.writeFile(&v, loc.parent, loc.name[0..loc.name_len], data);
-    return .offset_mismatch;
+    if (offset == 0) return wholeWriteProgress(nv.writeFile(&v, loc.parent, loc.name[0..loc.name_len], data), data.len);
+    return .{ .status = .offset_mismatch };
+}
+
+fn wholeWriteProgress(status: WriteStatus, length: usize) nv.WriteProgress {
+    return .{ .status = status, .completed = if (status == .ok) length else 0, .uncertain = status == .io or status == .cleanup_failed };
 }
 
 pub fn writeFileRange(volume: Volume, entry: Entry, offset: usize, data: []const u8) ?usize {
-    // The legacy VFS surface has no status channel.  All non-OK results,
-    // including the explicit hard-link `.unsupported`, fail closed here.
-    return if (writeFileRangeStatus(volume, entry, offset, data) == .ok) data.len else null;
+    const result = writeFileRangeProgress(volume, entry, offset, data);
+    if (result.status == .ok) return result.completed;
+    // The existing byte-count API can report a short confirmed prefix. Do
+    // not turn a final metadata failure after all bytes into full success.
+    if (result.completed != 0 and result.completed < data.len) return result.completed;
+    return null;
 }
