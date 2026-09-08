@@ -17,6 +17,7 @@ const ntfs_fs = @import("ntfs/ntfs.zig");
 const access = @import("../storage/access_runtime.zig");
 const locks = @import("../memory/owner_locks.zig");
 const drive = @import("drive.zig");
+const heap = @import("../memory/heap.zig");
 const directory_changes = @import("directory_changes.zig");
 
 /// Windows-parity component limit (0.60.19): 255 characters, UTF-8 (BMP)
@@ -102,6 +103,8 @@ pub const Entry = struct {
     // sequence here so a recycled record can never satisfy an ownership
     // check. FAT32 has no corresponding generation and leaves it zero.
     node_generation: u16 = 0,
+    fat_directory_lba: ?u64 = null,
+    fat_directory_offset: u16 = 0,
     // Internal traversal/read guard; not part of any public R4SYS payload.
     reparse: bool = false,
     size: u64 = 0,
@@ -342,6 +345,15 @@ pub fn sameFileIdentity(volume: Volume, left: Entry, right: Entry) bool {
     };
 }
 
+/// Copy preflight uses the live FAT directory location for empty files.
+/// It does not change the stronger ownership rules of recovery operations.
+pub fn sameFileForCopy(volume: Volume, left: Entry, right: Entry) bool {
+    return switch (volume) {
+        .fat32 => fat32.sameFileForCopy(entryToFat32(left), entryToFat32(right)),
+        .ntfs => sameFileIdentity(volume, left, right),
+    };
+}
+
 /// Recovery-only alias identity. Empty FAT files have no cluster identity, but
 /// an ownership alias copies the complete short-entry metadata. SYSUPD holds
 /// the namespace gate and uses generation-private stage/backup names, so this
@@ -472,35 +484,56 @@ pub fn copyFileNoReplace(src_volume: Volume, dst_volume: Volume, src_entry: Entr
     };
 }
 
-/// FS-neutral copy used whenever at least one side is not FAT32: chunked
-/// read + append through the generic volume interfaces.  Module-owned
-/// buffer (never on a kernel task stack); callers are serialized by the
-/// fs-request gate.
-var copy_chunk: [32768]u8 = undefined;
+pub const CopyProgress = struct {
+    bytes: u64 = 0,
+    source_size: u64 = 0,
+    chunks: u32 = 0,
+    max_chunk: u32 = 0,
+};
 
+/// Callers hold the paired filesystem request (including its unwind guard).
+/// Each operation owns its buffer across all I/O waits; disjoint volume
+/// requests deliberately remain independent. Allocate before changing a name.
 fn copyFileGeneric(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent: NodeRef, dst_name: []const u8, replace: bool) bool {
-    if (src_entry.isDir()) return false;
+    const chunk = heap.allocBytes(32768) orelse return false;
+    defer _ = heap.free(chunk);
+    var progress: CopyProgress = .{};
+    return copyFileBuffered(src_volume, dst_volume, src_entry, dst_parent, dst_name, replace, chunk, &progress);
+}
+
+/// The caller exclusively owns the bounded buffer until this call returns.
+/// Progress counts completed appends; an I/O error may leave a partial target.
+pub fn copyFileBuffered(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent: NodeRef, dst_name: []const u8, replace: bool, chunk: []u8, progress: *CopyProgress) bool {
+    progress.* = .{ .source_size = src_entry.size };
+    if (src_entry.isDir() or chunk.len == 0 or src_entry.size > 0xFFFF_FFFF) return false;
     var existing: Entry = undefined;
     switch (lookupEntryStatus(dst_volume, dst_parent, dst_name, &existing)) {
         .found => {
-            if (!replace) return false;
-            if (existing.isDir()) return false;
+            if (!replace or existing.isDir() or existing.isReadOnly()) return false;
+            if (sameVolume(src_volume, dst_volume) and sameFileForCopy(src_volume, src_entry, existing)) return false;
             if (!deleteFile(dst_volume, dst_parent, dst_name)) return false;
         },
         .not_found => {},
         .io => return false,
     }
-    if (!writeFile(dst_volume, dst_parent, dst_name, copy_chunk[0..0])) return false;
-
-    var offset: u64 = 0;
-    while (offset < src_entry.size) {
-        const want: usize = @intCast(@min(src_entry.size - offset, copy_chunk.len));
-        const got = readFileRange(src_volume, src_entry, @intCast(offset), copy_chunk[0..want]) orelse return false;
+    var completed = false;
+    // Match stream-copy abort: retire our incomplete destination while the
+    // namespace request still excludes another writer. Cleanup I/O can fail.
+    defer if (!completed) {
+        _ = deleteFile(dst_volume, dst_parent, dst_name);
+    };
+    if (!writeFile(dst_volume, dst_parent, dst_name, chunk[0..0])) return false;
+    while (progress.bytes < src_entry.size) {
+        const want: usize = @intCast(@min(src_entry.size - progress.bytes, chunk.len));
+        const got = readFileRange(src_volume, src_entry, @intCast(progress.bytes), chunk[0..want]) orelse return false;
         if (got != want) return false;
-        if (appendFileAtOffsetStatus(dst_volume, dst_parent, dst_name, offset, copy_chunk[0..want]) != .ok) return false;
-        offset += want;
+        if (appendFileAtOffsetStatusDeferred(dst_volume, dst_parent, dst_name, progress.bytes, chunk[0..want]) != .ok) return false;
+        progress.bytes += want;
+        progress.chunks += 1;
+        progress.max_chunk = @max(progress.max_chunk, @as(u32, @intCast(want)));
     }
-    return true;
+    completed = flushVolume(dst_volume);
+    return completed;
 }
 
 pub fn makeDirectory(volume: Volume, parent: NodeRef, name: []const u8) bool {
@@ -759,6 +792,8 @@ fn entryFromFat32(entry: fat32.Entry) Entry {
         .name_len = entry.name_len,
         .attr = entry.attr,
         .node = entry.first_cluster,
+        .fat_directory_lba = entry.directory_lba,
+        .fat_directory_offset = entry.directory_offset,
         .size = entry.size,
         .created_time = entry.created_time,
         .created_date = entry.created_date,
@@ -775,6 +810,8 @@ fn entryToFat32(entry: Entry) fat32.Entry {
         .name_len = entry.name_len,
         .attr = entry.attr,
         .first_cluster = @intCast(entry.node),
+        .directory_lba = entry.fat_directory_lba,
+        .directory_offset = entry.fat_directory_offset,
         .size = @intCast(entry.size),
         .created_time = entry.created_time,
         .created_date = entry.created_date,

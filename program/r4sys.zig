@@ -2914,6 +2914,29 @@ pub fn fileReplaceAtomic(target_ptr: [*:0]const u8, staged_ptr: [*:0]const u8, b
 }
 
 pub fn fileCopy(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32 {
+    return fileCopyWithProgress(src_ptr, dst_ptr, null, null);
+}
+
+pub fn fileCopyBuffered(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8, buffer: [*]u8, length: u32, out: *r4x_api.FileCopyProgress) callconv(.c) i32 {
+    if (out.version != 1 or out.size < @sizeOf(r4x_api.FileCopyProgress)) return file_stream_error_invalid;
+    out.* = .{};
+    if (length == 0) return file_stream_error_invalid;
+    var progress: vfs.CopyProgress = .{};
+    const result = fileCopyWithProgress(src_ptr, dst_ptr, buffer[0..length], &progress);
+    out.bytes = progress.bytes;
+    out.source_size = progress.source_size;
+    out.chunks = progress.chunks;
+    out.max_chunk = progress.max_chunk;
+    return switch (result) {
+        1 => file_stream_result_ok,
+        0, -5 => file_stream_error_not_found,
+        -1, -3, -4, -8 => file_stream_error_invalid,
+        -13 => file_stream_error_too_large,
+        else => file_stream_error_io,
+    };
+}
+
+fn fileCopyWithProgress(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8, buffer: ?[]u8, progress: ?*vfs.CopyProgress) i32 {
     var src_buf: [max_api_path]u8 = undefined;
     var dst_buf: [max_api_path]u8 = undefined;
     const raw_src = copyZ(src_ptr, src_buf[0..]) orelse return -1;
@@ -2942,11 +2965,16 @@ pub fn fileCopy(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
         .not_found => return 0,
         .io => return -9,
     }
+    if (progress) |p| p.source_size = entry.size;
     if (entry.isDir()) return -4;
+    if (buffer != null and entry.size > 0xFFFF_FFFF) return -13;
     var dst_parent: vfs.NodeRef = undefined;
     if (vfs.resolvePathStatus(dst_volume, parentPath(dst_target.path), &dst_parent) != .found) return -5;
     var dst_entry: ?vfs.Entry = null;
     if (resolveOptionalEntryStatus(dst_volume, dst_target.path, &dst_entry) == .io) return -9;
+    if (dst_entry) |destination| {
+        if (vfs.sameVolume(src_volume, dst_volume) and vfs.sameFileForCopy(src_volume, entry, destination)) return -8;
+    }
     if (!invalidateStreamSlotsForResolved(
         dst_target.drive_ref.letter,
         targetOnBootVolume(dst_target),
@@ -2954,7 +2982,11 @@ pub fn fileCopy(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
         dst_entry,
         baseName(dst_target.path),
     )) return -9;
-    if (!vfs.copyFile(src_volume, dst_volume, entry, dst_parent, baseName(dst_target.path))) return -9;
+    if (buffer) |chunk| {
+        if (!vfs.copyFileBuffered(src_volume, dst_volume, entry, dst_parent, baseName(dst_target.path), true, chunk, progress.?)) return -9;
+    } else {
+        if (!vfs.copyFile(src_volume, dst_volume, entry, dst_parent, baseName(dst_target.path))) return -9;
+    }
     invalidateRegistryCacheIfHivePath(raw_dst);
     ok = true;
     return 1;
@@ -2997,6 +3029,9 @@ pub fn fileMove(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
     if (vfs.resolvePathStatus(src_volume, parentPath(src_target.path), &src_parent) != .found) return -6;
     var dst_entry: ?vfs.Entry = null;
     if (resolveOptionalEntryStatus(dst_volume, dst_target.path, &dst_entry) == .io) return -9;
+    if (dst_entry) |destination| {
+        if (vfs.sameVolume(src_volume, dst_volume) and vfs.sameFileForCopy(src_volume, entry, destination)) return -8;
+    }
     if (!invalidateStreamSlotsForResolved(
         src_target.drive_ref.letter,
         targetOnBootVolume(src_target),

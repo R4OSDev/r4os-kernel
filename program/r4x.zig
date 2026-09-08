@@ -7115,6 +7115,7 @@ fn configureR4XStartR4SysTable() void {
         .dir_entry = &r4api.r4sys.dirEntry,
         .directory_change_begin = &r4api.r4sys.directoryChangeBegin,
         .directory_change_poll = &r4api.r4sys.directoryChangePoll,
+        .file_copy_buffered = &r4api.r4sys.fileCopyBuffered,
         .program_should_close = &apiProgramShouldClose,
         .program_class = &apiProgramClass,
         .program_instance = &apiProgramInstance,

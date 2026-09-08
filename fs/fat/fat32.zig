@@ -83,6 +83,10 @@ pub const Entry = struct {
     name_len: usize = 0,
     attr: u8 = 0,
     first_cluster: u32 = 0,
+    // Short directory-entry location observed under the filesystem gate.
+    // Unlike cluster zero, it distinguishes empty files and their aliases.
+    directory_lba: ?u64 = null,
+    directory_offset: u16 = 0,
     size: u32 = 0,
     created_time: u16 = 0,
     created_date: u16 = 0,
@@ -1365,25 +1369,36 @@ pub fn copyFileNoReplace(src_volume: Volume, dst_volume: Volume, src_entry: Entr
     return copyFileWithMode(src_volume, dst_volume, src_entry, dst_parent_cluster, dst_name, false);
 }
 
+/// Same live source under one volume request. A shared nonempty chain is
+/// also rejected, even if two distinct directory entries refer to it.
+pub fn sameFileForCopy(left: Entry, right: Entry) bool {
+    if (left.isDir() or right.isDir()) return false;
+    if (left.directory_lba != null and left.directory_lba == right.directory_lba and
+        left.directory_offset == right.directory_offset) return true;
+    return left.first_cluster >= 2 and left.first_cluster == right.first_cluster;
+}
+
 fn copyFileWithMode(src_volume: Volume, original_dst_volume: Volume, src_entry: Entry, dst_parent_cluster: u32, dst_name: []const u8, replace_existing: bool) bool {
     const start_tick = beginOperation(.copy_file);
     var ok = false;
     defer finishOperation(.copy_file, start_tick, ok);
-    const dst_volume = beginMutation(original_dst_volume) orelse return false;
-
-    invalidateAppendCache();
     if (src_entry.isDir() or !validInputName(dst_name)) return false;
     var existing: EntryLocation = undefined;
-    switch (findEntryLocationStatus(dst_volume, dst_parent_cluster, dst_name, &existing)) {
+    const status = findEntryLocationStatus(original_dst_volume, dst_parent_cluster, dst_name, &existing);
+    switch (status) {
         .found => {
-            if (!replace_existing) return false;
-            if (existing.entry.isDir()) return false;
-            if (existing.entry.isReadOnly()) return false;
-            if (!deleteAt(dst_volume, existing)) return false;
+            if (!replace_existing or existing.entry.isDir() or existing.entry.isReadOnly()) return false;
+            if (src_volume.device_index == original_dst_volume.device_index and
+                src_volume.partition_lba == original_dst_volume.partition_lba and
+                sameFileForCopy(src_entry, existing.entry)) return false;
         },
         .not_found => {},
         .io => return false,
     }
+    // The identity decision precedes even the destination mutation batch.
+    const dst_volume = beginMutation(original_dst_volume) orelse return false;
+    invalidateAppendCache();
+    if (status == .found and !deleteAt(dst_volume, existing)) return false;
 
     const file_size: usize = @intCast(src_entry.size);
     const first_cluster = if (file_size == 0) 0 else allocateChain(dst_volume, clustersForBytes(dst_volume, file_size)) orelse return false;
@@ -2001,7 +2016,7 @@ fn findEntryInClusterStatus(volume: Volume, cluster: u32, name: []const u8, out:
                 if (!lfn_state.completeFor(entry)) return .io;
                 break :blk lfn_state.len;
             } else 0;
-            const found = makeEntry(entry, &lfn_state.units, lfn_len);
+            const found = makeEntry(entry, &lfn_state.units, lfn_len, lba, @intCast(off));
             if (!entryClusterValid(volume, found)) return .io;
             lfn_state.reset();
             if (entryNameEquals(found, name) or shortNameEquals(entry[0..11], name)) {
@@ -2074,7 +2089,7 @@ fn findEntryLocationStatus(volume: Volume, start_cluster: u32, name: []const u8,
                     if (!lfn_state.completeFor(raw) or lfn_slot_count != @as(usize, lfn_state.total)) return .io;
                     break :blk lfn_state.len;
                 } else 0;
-                const found = makeEntry(raw, &lfn_state.units, lfn_len);
+                const found = makeEntry(raw, &lfn_state.units, lfn_len, lba, @intCast(off));
                 if (!entryClusterValid(volume, found)) return .io;
                 if (entryNameEquals(found, name) or shortNameEquals(raw[0..11], name)) {
                     var found_lfn_slots: [MAX_LFN_ENTRIES]DirectorySlot = undefined;
@@ -2126,7 +2141,7 @@ fn listDirectorySectorRange(volume: Volume, cluster: u32, printed: *usize, max_e
                 continue;
             }
 
-            const parsed = makeEntry(entry, &lfn, lfn_len);
+            const parsed = makeEntry(entry, &lfn, lfn_len, lba, @intCast(off));
             lfn_len = 0;
             printEntry(parsed);
             printed.* += 1;
@@ -2166,7 +2181,7 @@ fn readDirectorySectorRange(volume: Volume, cluster: u32, out: []u8, cursor: *us
                 continue;
             }
 
-            const parsed = makeEntry(raw, &lfn, lfn_len);
+            const parsed = makeEntry(raw, &lfn, lfn_len, lba, @intCast(off));
             lfn_len = 0;
             if (!appendDirectoryEntry(out, cursor, parsed)) return false;
             copied.* += 1;
@@ -2213,7 +2228,7 @@ fn readDirectoryEntrySectorRangeStatus(
                 continue;
             }
 
-            const parsed = makeEntry(raw, &lfn, lfn_len);
+            const parsed = makeEntry(raw, &lfn, lfn_len, lba, @intCast(off));
             lfn_len = 0;
             if (seen.* == wanted) {
                 if (!copyEntryName(out, parsed)) return .io;
@@ -2265,9 +2280,11 @@ fn copyEntryName(out: []u8, entry: Entry) bool {
     return true;
 }
 
-fn makeEntry(raw: []const u8, lfn: *const [NAME_UNITS_MAX]u16, lfn_len: usize) Entry {
+fn makeEntry(raw: []const u8, lfn: *const [NAME_UNITS_MAX]u16, lfn_len: usize, lba: u64, offset: u16) Entry {
     var entry: Entry = .{
         .attr = raw[11],
+        .directory_lba = lba,
+        .directory_offset = offset,
         .first_cluster = firstCluster(raw),
         .size = readLe32(raw[28..32]),
         .created_time = readLe16(raw[14..16]),
