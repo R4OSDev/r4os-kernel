@@ -161,6 +161,7 @@ pub const Entry = struct {
     state: State = .empty,
     start_mode: StartMode = .manual,
     instance_id: u32 = 0,
+    start_generation: u64 = 0,
     exit_code: i32 = 0,
     start_tick: u64 = 0,
     restart_count: u32 = 0,
@@ -300,6 +301,7 @@ var registry_lock_timing: [SERVICE_LOCK_FAMILY_COUNT]LockTiming = .{LockTiming{}
 var api_index_slots: [MAX_SERVICES]u8 = .{API_INDEX_INVALID_SLOT} ** MAX_SERVICES;
 var api_index_count: u32 = 0;
 var registry_generation: u64 = 1;
+var next_start_generation: u64 = 0;
 var registry_enumeration_performance: RegistryEnumerationPerformance = .{};
 
 fn lockFamilyIndex(family: LockFamily) usize {
@@ -607,6 +609,9 @@ fn unlockEndpoint(lease: *EndpointLease) void {
 }
 
 fn markEntryStarting(entry: *Entry) void {
+    next_start_generation +%= 1;
+    if (next_start_generation == 0) next_start_generation = 1;
+    entry.start_generation = next_start_generation;
     entry.state = .starting;
     entry.instance_id = 0;
     entry.exit_code = 0;
@@ -616,6 +621,7 @@ fn markEntryStarting(entry: *Entry) void {
 fn disableEntry(entry: *Entry) void {
     entry.start_mode = .disabled;
     entry.state = .disabled;
+    entry.start_generation = 0;
     entry.instance_id = 0;
     entry.start_tick = 0;
 }
@@ -656,6 +662,7 @@ fn finishServiceState(name: []const u8, stateFor: *const fn (*const Entry) State
 
 fn finishEntryState(entry: *Entry, stateFor: *const fn (*const Entry) State, exit_code: i32, error_text: []const u8) void {
     entry.state = stateFor(entry);
+    entry.start_generation = 0;
     entry.instance_id = 0;
     entry.exit_code = exit_code;
     entry.start_tick = 0;
@@ -746,16 +753,26 @@ pub fn setState(name: []const u8, state: State, instance_id: u32, exit_code: i32
     }
 }
 
-pub fn markStarting(name: []const u8) i32 {
+pub const StartReservation = struct {
+    slot: usize = 0,
+    generation: u64 = 0,
+    entry: Entry = .{},
+};
+
+pub fn beginStart(name: []const u8, out: *StartReservation) i32 {
     while (true) {
         var registry_guard = lockRegistry(.registry_control);
         const slot = findByNameIn(&entries, name) orelse {
             unlockRegistry(&registry_guard);
-            return ERR_NOT_FOUND;
+            return API_ERR_NOT_FOUND;
         };
         if (entries[slot].start_mode == .disabled) {
             unlockRegistry(&registry_guard);
-            return ERR_INVALID;
+            return API_ERR_DISABLED;
+        }
+        if (entries[slot].state == .running or entries[slot].state == .starting or entries[slot].state == .stopping) {
+            unlockRegistry(&registry_guard);
+            return API_ERR_BUSY;
         }
         switch (tryLifecycleEndpointForSlot(slot)) {
             .contended => |ep| {
@@ -771,9 +788,51 @@ pub fn markStarting(name: []const u8) i32 {
             },
             .none => markEntryStarting(&entries[slot]),
         }
+        out.* = .{ .slot = slot, .generation = entries[slot].start_generation, .entry = entries[slot] };
         unlockRegistry(&registry_guard);
-        return OK;
+        return API_OK;
     }
+}
+
+pub fn markStarting(name: []const u8) i32 {
+    var reservation: StartReservation = .{};
+    return if (beginStart(name, &reservation) == API_OK) OK else ERR_INVALID;
+}
+
+fn startEntryLocked(reservation: *const StartReservation) ?*Entry {
+    if (reservation.slot >= entries.len or reservation.generation == 0) return null;
+    const entry = &entries[reservation.slot];
+    if (!entry.used or entry.start_generation != reservation.generation or
+        entry.start_mode == .disabled or entry.state != .starting or entry.instance_id != 0) return null;
+    return entry;
+}
+
+pub fn completeStart(reservation: *const StartReservation, instance_id: u32, start_tick: u64) bool {
+    var guard = lockRegistry(.registry_control);
+    defer unlockRegistry(&guard);
+    const entry = startEntryLocked(reservation) orelse return false;
+    if (instance_id == 0) return false;
+    entry.state = .running;
+    entry.instance_id = instance_id;
+    entry.start_tick = start_tick;
+    entry.start_generation = 0;
+    return true;
+}
+
+pub fn failStart(reservation: *const StartReservation, exit_code: i32, error_text: []const u8) void {
+    var guard = lockRegistry(.registry_control);
+    defer unlockRegistry(&guard);
+    const entry = startEntryLocked(reservation) orelse return;
+    finishEntryState(entry, alwaysFailed, exit_code, error_text);
+}
+
+pub fn cancelStarting(name: []const u8, generation: u64) void {
+    var guard = lockRegistry(.registry_control);
+    defer unlockRegistry(&guard);
+    const slot = findByNameIn(&entries, name) orelse return;
+    const entry = &entries[slot];
+    if (generation == 0 or entry.start_generation != generation or entry.state != .starting or entry.instance_id != 0) return;
+    finishEntryState(entry, ifEntryDisabledElseStopped, 0, "");
 }
 
 pub fn markRunning(name: []const u8, instance_id: u32, start_tick: u64) i32 {
@@ -783,6 +842,7 @@ pub fn markRunning(name: []const u8, instance_id: u32, start_tick: u64) i32 {
     var e = &entries[slot];
     if (e.start_mode == .disabled or instance_id == 0) return ERR_INVALID;
     e.state = .running;
+    e.start_generation = 0;
     e.instance_id = instance_id;
     e.exit_code = 0;
     e.start_tick = start_tick;
@@ -912,6 +972,10 @@ pub fn setStartMode(name: []const u8, start_mode: StartMode) i32 {
             if (entries[slot].state == .disabled) entries[slot].state = .stopped;
             unlockRegistry(&registry_guard);
             return OK;
+        }
+        if (entries[slot].instance_id != 0) {
+            unlockRegistry(&registry_guard);
+            return ERR_INVALID;
         }
         switch (tryLifecycleEndpointForSlot(slot)) {
             .contended => |ep| {
@@ -1617,6 +1681,7 @@ fn setStateIn(table: *[MAX_SERVICES]Entry, name: []const u8, state: State, insta
     const slot = findByNameIn(table, name) orelse return ERR_NOT_FOUND;
     var e = &table[slot];
     e.state = state;
+    e.start_generation = 0;
     e.instance_id = instance_id;
     e.exit_code = exit_code;
     e.last_error_len = copy(error_text, e.last_error[0..]);
@@ -1628,6 +1693,7 @@ fn markRunningIn(table: *[MAX_SERVICES]Entry, name: []const u8, instance_id: u32
     var e = &table[slot];
     if (e.start_mode == .disabled or instance_id == 0) return ERR_INVALID;
     e.state = .running;
+    e.start_generation = 0;
     e.instance_id = instance_id;
     e.exit_code = 0;
     e.start_tick = start_tick;
@@ -1689,6 +1755,7 @@ fn resetRegistryState() void {
     api_index_slots = .{API_INDEX_INVALID_SLOT} ** MAX_SERVICES;
     api_index_count = 0;
     registry_generation = 1;
+    next_start_generation = 0;
     registry_enumeration_performance = .{};
     resetEndpoints();
 }

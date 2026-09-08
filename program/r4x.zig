@@ -7954,13 +7954,17 @@ pub fn activeShellInstanceId() u32 {
 // ALLE Programm-Starts ueber die gesamte Ladezeit (MEMSUITE pagerstress
 // sleep_under_lock, Report-Befund; Regression aus 0.55.46).
 pub fn spawnPath(d: *drive.Drive, path: []const u8, args: []const u8, working_drive: *drive.Drive) i32 {
-    const file = resolveProgramFile(d, path) orelse return -1;
     var handle: ProgramProcessHandle = .{};
+    return spawnPathWithHandle(d, path, args, working_drive, &handle);
+}
+
+fn spawnPathWithHandle(d: *drive.Drive, path: []const u8, args: []const u8, working_drive: *drive.Drive, handle: *ProgramProcessHandle) i32 {
+    const file = resolveProgramFile(d, path) orelse return -1;
     return switch (runProgramFile(file, .background, .auto, args, working_drive, .none, .{
         .owner = true,
         .owner_handle = ProgramProcessHandle{},
         .legacy_id = true,
-        .out_handle = &handle,
+        .out_handle = handle,
     })) {
         .ran => @intCast(handle.instance_id),
         .not_found => -1,
@@ -14590,6 +14594,8 @@ fn apiServiceSetStartMode(name_ptr: [*:0]const u8, start_mode_raw: u32, out: *Se
     serviceApiRefreshName(name);
     const entry = services.entryByName(name) orelse return services.API_ERR_NOT_FOUND;
     const service_name = entry.name[0..entry.name_len];
+    if (start_mode == .disabled and callerDescendsFromServiceInstance(entry.instance_id))
+        return services.API_ERR_SELF_RESTART;
     if (start_mode == .disabled and (entry.state == .running or entry.state == .starting or entry.state == .stopping)) {
         const stop_result = serviceApiStopByName(service_name, out, 40);
         if (stop_result < 0) return stop_result;
@@ -14657,44 +14663,48 @@ fn serviceApiStartByName(name: []const u8, out: *ServiceInfo) i32 {
     out.* = .{};
     reportBootService(name);
     serviceApiRefreshName(name);
-    const entry = services.entryByName(name) orelse {
+    const current = services.entryByName(name) orelse return services.API_ERR_NOT_FOUND;
+    if (current.state == .running) return services.apiStatus(name, out, r4api.r4sys.ticks());
+    // Protect reservation and eventual spawn rollback across loader waits.
+    const token = task_context.enterUnwind();
+    defer _ = task_context.leaveUnwind(token);
+    var reservation: services.StartReservation = .{};
+    const reserved = services.beginStart(name, &reservation);
+    if (reserved != services.API_OK) {
+        _ = services.apiStatus(name, out, r4api.r4sys.ticks());
         reportBootServiceError(name);
-        return services.API_ERR_NOT_FOUND;
-    };
+        return reserved;
+    }
+    const entry = &reservation.entry;
     const service_name = entry.name[0..entry.name_len];
-    if (entry.start_mode == .disabled or entry.state == .disabled) {
-        _ = services.apiStatus(service_name, out, r4api.r4sys.ticks());
-        reportBootServiceError(service_name);
-        return services.API_ERR_DISABLED;
-    }
-    if (entry.state == .running or entry.state == .starting or entry.state == .stopping) {
-        const status = services.apiStatus(service_name, out, r4api.r4sys.ticks());
-        if (status != services.API_OK) reportBootServiceError(service_name);
-        return status;
-    }
-
-    _ = services.markStarting(service_name);
     reportBootServiceStage(service_name, "Pfad pruefen");
     var path_buf: [MAX_API_PATH]u8 = undefined;
     const target = resolveServiceProgramTarget(entry.path[0..entry.path_len], &path_buf) orelse {
-        _ = services.markFailed(service_name, -1, "path invalid or not service R4X");
+        services.failStart(&reservation, -1, "path invalid or not service R4X");
         _ = services.apiStatus(service_name, out, r4api.r4sys.ticks());
         reportBootServiceError(service_name);
         return services.API_ERR_BAD_PATH;
     };
     reportBootServiceStage(service_name, "laden");
-    const raw_id = spawnPath(target.drive_ref, target.path, entry.args[0..entry.args_len], target.drive_ref);
+    var handle: ProgramProcessHandle = .{};
+    const raw_id = spawnPathWithHandle(target.drive_ref, target.path, entry.args[0..entry.args_len], target.drive_ref, &handle);
     if (raw_id <= 0) {
-        _ = services.markFailed(service_name, raw_id, "spawn failed");
+        services.failStart(&reservation, raw_id, "spawn failed");
         _ = services.apiStatus(service_name, out, r4api.r4sys.ticks());
         reportBootServiceError(service_name);
         return services.API_ERR_SPAWN_FAILED;
     }
+    if (!services.completeStart(&reservation, handle.instance_id, r4api.r4sys.ticks())) {
+        // Use the exact published handle; the numeric ID alone can be reused.
+        // Existing lifecycle cancellation arranges exit and asynchronous reaping.
+        cancelPublishedSpawn(handle);
+        abandonProgramCompletion(handle);
+        _ = services.apiStatus(service_name, out, r4api.r4sys.ticks());
+        reportBootServiceError(service_name);
+        return services.API_ERR_BUSY;
+    }
     reportBootServiceStage(service_name, "gestartet");
-    _ = services.markRunning(service_name, @intCast(raw_id), r4api.r4sys.ticks());
-    const status = services.apiStatus(service_name, out, r4api.r4sys.ticks());
-    if (status != services.API_OK) reportBootServiceError(service_name);
-    return status;
+    return services.apiStatus(service_name, out, r4api.r4sys.ticks());
 }
 
 fn serviceApiStopByName(name: []const u8, out: *ServiceInfo, timeout_ticks: u64) i32 {
@@ -14702,6 +14712,8 @@ fn serviceApiStopByName(name: []const u8, out: *ServiceInfo, timeout_ticks: u64)
     serviceApiRefreshName(name);
     const entry = services.entryByName(name) orelse return services.API_ERR_NOT_FOUND;
     const service_name = entry.name[0..entry.name_len];
+    if (entry.state == .starting and entry.instance_id == 0)
+        services.cancelStarting(service_name, entry.start_generation);
     if (entry.state == .disabled or entry.state == .stopped or entry.state == .failed or entry.instance_id == 0) {
         return services.apiStatus(service_name, out, r4api.r4sys.ticks());
     }
