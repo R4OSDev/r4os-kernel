@@ -241,12 +241,22 @@ pub const BuildKey = struct {
     parent: u32 = invalid_index,
     name: []const u8 = "",
     flat_index: u32 = invalid_index,
+    first_child: u32 = invalid_index,
+    last_child: u32 = invalid_index,
+    next_sibling: u32 = invalid_index,
+    child_count: u32 = 0,
+    value_count: u32 = 0,
+    value_first: u32 = 0,
+    value_cursor: u32 = 0,
 };
 
 pub const BuildScratch = struct {
     keys: []BuildKey,
     value_key_indices: []u32,
     flat_key_order: []u32,
+    /// Optional stable grouping workspace; old callers retain a no-allocation
+    /// fallback, while runtime mutation owners supply one index per value.
+    value_order: []u32 = &.{},
 };
 
 pub fn parseHive(bytes: []const u8) Error!HiveView {
@@ -320,6 +330,9 @@ pub fn buildHiveViewInto(out: []u8, scratch: BuildScratch, kind: HiveKind, gener
     if (scratch.keys.len == 0 or scratch.flat_key_order.len == 0) return Error.TooManyEntries;
     if (values.len > scratch.value_key_indices.len) return Error.TooManyEntries;
 
+    var key_buckets: [512]u32 = undefined;
+    const key_index_table = if (scratch.keys.len <= 256) key_buckets[0..bucketCount(scratch.keys.len)] else key_buckets[0..0];
+    @memset(key_index_table, invalid_index);
     var key_count: u32 = 1;
     scratch.keys[0] = .{ .parent = invalid_index, .name = "" };
 
@@ -328,15 +341,12 @@ pub fn buildHiveViewInto(out: []u8, scratch: BuildScratch, kind: HiveKind, gener
         const value = values[value_index];
         try validateValuePayload(value.value_type, value.data);
         if (!validValueName(value.name)) return Error.BadName;
-        const key_index = try ensureBuildKey(scratch.keys, kind, value.key_path, &key_count);
-        var prior: usize = 0;
-        while (prior < value_index) : (prior += 1) {
-            if (scratch.value_key_indices[prior] == key_index and asciiEqlIgnoreCase(values[prior].name, value.name)) {
-                return Error.DuplicateValue;
-            }
-        }
+        const key_index = try ensureBuildKey(scratch.keys, key_index_table, kind, value.key_path, &key_count);
         scratch.value_key_indices[value_index] = key_index;
+        scratch.keys[key_index].value_count += 1;
     }
+
+    try validateBuildDuplicates(values, scratch.value_key_indices);
 
     var flat_count: u32 = 0;
     scratch.flat_key_order[flat_count] = 0;
@@ -345,29 +355,34 @@ pub fn buildHiveViewInto(out: []u8, scratch: BuildScratch, kind: HiveKind, gener
     var cursor: u32 = 0;
     while (cursor < flat_count) : (cursor += 1) {
         const parent = scratch.flat_key_order[cursor];
-        var child: u32 = 1;
-        while (child < key_count) : (child += 1) {
-            if (scratch.keys[child].parent == parent) {
-                if (flat_count >= scratch.flat_key_order.len) return Error.TooManyEntries;
-                scratch.keys[child].flat_index = flat_count;
-                scratch.flat_key_order[flat_count] = child;
-                flat_count += 1;
-            }
+        var child = scratch.keys[parent].first_child;
+        while (child != invalid_index) : (child = scratch.keys[child].next_sibling) {
+            if (flat_count >= scratch.flat_key_order.len) return Error.TooManyEntries;
+            scratch.keys[child].flat_index = flat_count;
+            scratch.flat_key_order[flat_count] = child;
+            flat_count += 1;
         }
     }
 
     var string_heap_size: usize = 0;
     var data_heap_size: usize = 0;
-    var flat_i: u32 = 0;
-    while (flat_i < flat_count) : (flat_i += 1) {
-        const build_i = scratch.flat_key_order[flat_i];
-        string_heap_size += scratch.keys[build_i].name.len;
-        value_index = 0;
-        while (value_index < values.len) : (value_index += 1) {
-            if (scratch.value_key_indices[value_index] == build_i) {
-                string_heap_size += values[value_index].name.len;
-                data_heap_size += values[value_index].data.len;
-            }
+    var value_first: u32 = 0;
+    for (scratch.flat_key_order[0..flat_count]) |build_i| {
+        const key = &scratch.keys[build_i];
+        string_heap_size += key.name.len;
+        key.value_first = value_first;
+        value_first += key.value_count;
+    }
+    for (values) |value| {
+        string_heap_size += value.name.len;
+        data_heap_size += value.data.len;
+    }
+    const grouped = scratch.value_order.len >= values.len;
+    if (grouped) {
+        for (values, 0..) |_, index| {
+            const key = &scratch.keys[scratch.value_key_indices[index]];
+            scratch.value_order[key.value_first + key.value_cursor] = @intCast(index);
+            key.value_cursor += 1;
         }
     }
 
@@ -386,14 +401,13 @@ pub fn buildHiveViewInto(out: []u8, scratch: BuildScratch, kind: HiveKind, gener
     var string_cursor: usize = 0;
     var data_cursor: usize = 0;
     var flat_value_index: u32 = 0;
-    flat_i = 0;
+    var flat_i: u32 = 0;
     while (flat_i < flat_count) : (flat_i += 1) {
         const build_i = scratch.flat_key_order[flat_i];
         const key = scratch.keys[build_i];
         const name_offset = try appendBuildString(out, key.name, string_heap_offset, &string_cursor);
-        const child_info = childRangeForFlat(scratch.keys, build_i, key_count);
-        const value_info = valueRangeForBuild(values, scratch.value_key_indices, build_i);
-        const first_value = if (value_info.count == 0) invalid_index else flat_value_index;
+        const first_child = if (key.first_child == invalid_index) invalid_index else scratch.keys[key.first_child].flat_index;
+        const first_value = if (key.value_count == 0) invalid_index else flat_value_index;
         writeKeyRecord(
             out,
             key_table_offset + @as(usize, flat_i) * key_record_size,
@@ -401,15 +415,17 @@ pub fn buildHiveViewInto(out: []u8, scratch: BuildScratch, kind: HiveKind, gener
             name_offset,
             @intCast(key.name.len),
             first_value,
-            value_info.count,
-            child_info.first,
-            child_info.count,
+            key.value_count,
+            first_child,
+            key.child_count,
         );
 
         value_index = 0;
-        while (value_index < values.len) : (value_index += 1) {
-            if (scratch.value_key_indices[value_index] != build_i) continue;
-            const value = values[value_index];
+        const scan_count = if (grouped) key.value_count else values.len;
+        while (value_index < scan_count) : (value_index += 1) {
+            if (!grouped and scratch.value_key_indices[value_index] != build_i) continue;
+            const source = if (grouped) scratch.value_order[key.value_first + value_index] else value_index;
+            const value = values[source];
             const value_name_offset = try appendBuildString(out, value.name, string_heap_offset, &string_cursor);
             const data_offset = try appendBuildData(out, value.data, data_heap_offset, &data_cursor);
             writeValueRecord(
@@ -488,27 +504,47 @@ fn validate(view: HiveView) Error!void {
     try validateDuplicateValues(view);
 }
 
-fn ensureBuildKey(keys: []BuildKey, kind: HiveKind, path: []const u8, key_count: *u32) Error!u32 {
+fn ensureBuildKey(keys: []BuildKey, buckets: []u32, kind: HiveKind, path: []const u8, key_count: *u32) Error!u32 {
     const parsed = parseRoot(path) orelse return Error.InvalidPath;
     if (parsed.kind != kind) return Error.RootMismatch;
     var current: u32 = 0;
     var rest = parsed.rest;
     while (nextComponent(&rest)) |component| {
         if (!validKeyName(component)) return Error.BadName;
-        if (findBuildChild(keys, current, component, key_count.*)) |child| {
+        if (findBuildChild(keys, buckets, current, component, key_count.*)) |child| {
             current = child;
             continue;
         }
         if (key_count.* >= keys.len) return Error.TooManyEntries;
         const next_index = key_count.*;
         keys[next_index] = .{ .parent = current, .name = component };
+        if (keys[current].last_child != invalid_index) {
+            keys[keys[current].last_child].next_sibling = next_index;
+        } else keys[current].first_child = next_index;
+        keys[current].last_child = next_index;
+        keys[current].child_count += 1;
+        if (buckets.len != 0) {
+            var slot = @as(usize, nameHash(current, component)) & (buckets.len - 1);
+            while (buckets[slot] != invalid_index) slot = (slot + 1) & (buckets.len - 1);
+            buckets[slot] = next_index;
+        }
         key_count.* += 1;
         current = next_index;
     }
     return current;
 }
 
-fn findBuildChild(keys: []const BuildKey, parent: u32, name: []const u8, key_count: u32) ?u32 {
+fn findBuildChild(keys: []const BuildKey, buckets: []const u32, parent: u32, name: []const u8, key_count: u32) ?u32 {
+    if (buckets.len != 0) {
+        var slot = @as(usize, nameHash(parent, name)) & (buckets.len - 1);
+        while (buckets[slot] != invalid_index) : (slot = (slot + 1) & (buckets.len - 1)) {
+            const index = buckets[slot];
+            if (keys[index].parent == parent and asciiEqlIgnoreCase(keys[index].name, name)) return index;
+        }
+        return null;
+    }
+    // Preserve support for arbitrary caller capacities beyond the runtime
+    // fast-path bounds without allocating or changing accepted formats.
     var index: u32 = 1;
     while (index < key_count) : (index += 1) {
         if (keys[index].parent == parent and asciiEqlIgnoreCase(keys[index].name, name)) return index;
@@ -516,31 +552,40 @@ fn findBuildChild(keys: []const BuildKey, parent: u32, name: []const u8, key_cou
     return null;
 }
 
-const RangeInfo = struct {
-    first: u32,
-    count: u32,
-};
-
-fn childRangeForFlat(keys: []const BuildKey, build_index: u32, key_count: u32) RangeInfo {
-    var first: u32 = invalid_index;
-    var count: u32 = 0;
-    var index: u32 = 1;
-    while (index < key_count) : (index += 1) {
-        if (keys[index].parent == build_index) {
-            if (first == invalid_index) first = keys[index].flat_index;
-            count += 1;
-        }
-    }
-    return .{ .first = first, .count = count };
+fn bucketCount(count: usize) usize {
+    var capacity: usize = 2;
+    while (capacity < count * 2) capacity *= 2;
+    return capacity;
 }
 
-fn valueRangeForBuild(values: []const BuildValue, value_key_indices: []const u32, build_index: u32) RangeInfo {
-    var count: u32 = 0;
-    var index: usize = 0;
-    while (index < values.len) : (index += 1) {
-        if (value_key_indices[index] == build_index) count += 1;
+fn nameHash(owner: u32, name: []const u8) u32 {
+    var hash: u32 = 2166136261;
+    var index: u5 = 0;
+    while (true) {
+        hash = (hash ^ ((owner >> index) & 255)) *% 16777619;
+        if (index == 24) break;
+        index += 8;
     }
-    return .{ .first = invalid_index, .count = count };
+    for (name) |ch| hash = (hash ^ (if (ch >= 'a' and ch <= 'z') ch - ('a' - 'A') else ch)) *% 16777619;
+    return hash;
+}
+
+fn validateBuildDuplicates(values: []const BuildValue, owners: []const u32) Error!void {
+    var table: [1024]u32 = undefined;
+    const buckets = if (values.len <= 512) table[0..bucketCount(values.len)] else table[0..0];
+    @memset(buckets, invalid_index);
+    for (values, 0..) |value, index| {
+        if (buckets.len == 0) {
+            for (0..index) |prior| if (owners[prior] == owners[index] and asciiEqlIgnoreCase(values[prior].name, value.name)) return Error.DuplicateValue;
+            continue;
+        }
+        var slot = @as(usize, nameHash(owners[index], value.name)) & (buckets.len - 1);
+        while (buckets[slot] != invalid_index) : (slot = (slot + 1) & (buckets.len - 1)) {
+            const prior = buckets[slot];
+            if (owners[prior] == owners[index] and asciiEqlIgnoreCase(values[prior].name, value.name)) return Error.DuplicateValue;
+        }
+        buckets[slot] = @intCast(index);
+    }
 }
 
 fn appendBuildString(out: []u8, text: []const u8, heap_offset: usize, cursor: *usize) Error!u32 {
@@ -561,34 +606,44 @@ fn appendBuildData(out: []u8, data: []const u8, heap_offset: usize, cursor: *usi
 }
 
 fn validateDuplicateKeys(view: HiveView) Error!void {
-    var parent_index: u32 = 0;
-    while (parent_index < view.header.key_count) : (parent_index += 1) {
-        const parent = view.keyAt(parent_index);
-        var a: u32 = 0;
-        while (a < parent.child_count) : (a += 1) {
-            const key_a = view.keyAt(parent.first_child_index + a);
-            var b = a + 1;
-            while (b < parent.child_count) : (b += 1) {
-                const key_b = view.keyAt(parent.first_child_index + b);
-                if (asciiEqlIgnoreCase(view.keyName(key_a), view.keyName(key_b))) return Error.DuplicateKey;
-            }
-        }
+    var parent: u32 = 0;
+    while (parent < view.header.key_count) : (parent += 1) {
+        const key = view.keyAt(parent);
+        try validateNameRange(view, key.first_child_index, key.child_count, true);
     }
 }
 
 fn validateDuplicateValues(view: HiveView) Error!void {
-    var key_index: u32 = 0;
-    while (key_index < view.header.key_count) : (key_index += 1) {
-        const key = view.keyAt(key_index);
-        var a: u32 = 0;
-        while (a < key.value_count) : (a += 1) {
-            const value_a = view.valueAt(key.first_value_index + a);
-            var b = a + 1;
-            while (b < key.value_count) : (b += 1) {
-                const value_b = view.valueAt(key.first_value_index + b);
-                if (asciiEqlIgnoreCase(view.valueName(value_a), view.valueName(value_b))) return Error.DuplicateValue;
-            }
+    var owner: u32 = 0;
+    while (owner < view.header.key_count) : (owner += 1) {
+        const key = view.keyAt(owner);
+        try validateNameRange(view, key.first_value_index, key.value_count, false);
+    }
+}
+
+fn recordName(view: HiveView, index: u32, comptime key: bool) []const u8 {
+    return if (key) view.keyName(view.keyAt(index)) else view.valueName(view.valueAt(index));
+}
+
+fn validateNameRange(view: HiveView, first: u32, count: u32, comptime keys: bool) Error!void {
+    if (count < 2) return;
+    const duplicate = if (keys) Error.DuplicateKey else Error.DuplicateValue;
+    var table: [1024]u32 = undefined;
+    const buckets = if (count <= 512) table[0..bucketCount(count)] else table[0..0];
+    @memset(buckets, invalid_index);
+    var index: u32 = 0;
+    while (index < count) : (index += 1) {
+        const name = recordName(view, first + index, keys);
+        if (buckets.len == 0) {
+            var prior: u32 = 0;
+            while (prior < index) : (prior += 1) if (asciiEqlIgnoreCase(recordName(view, first + prior, keys), name)) return duplicate;
+            continue;
         }
+        var slot = @as(usize, nameHash(0, name)) & (buckets.len - 1);
+        while (buckets[slot] != invalid_index) : (slot = (slot + 1) & (buckets.len - 1)) {
+            if (asciiEqlIgnoreCase(recordName(view, first + buckets[slot], keys), name)) return duplicate;
+        }
+        buckets[slot] = index;
     }
 }
 

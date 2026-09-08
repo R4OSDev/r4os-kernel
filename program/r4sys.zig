@@ -338,6 +338,7 @@ const empty_registry_build_value: registry.BuildValue = .{ .key_path = "", .name
 const empty_registry_build_key: registry.BuildKey = .{};
 var registry_write_values: [registry_build_value_max]registry.BuildValue = [_]registry.BuildValue{empty_registry_build_value} ** registry_build_value_max;
 var registry_write_keys: [registry_build_key_max]registry.BuildKey = [_]registry.BuildKey{empty_registry_build_key} ** registry_build_key_max;
+var registry_value_order: [registry_build_value_max]u32 = undefined;
 var registry_value_key_indices: [registry_build_value_max]u32 = [_]u32{registry.invalid_index} ** registry_build_value_max;
 var registry_flat_key_order: [registry_build_key_max]u32 = [_]u32{registry.invalid_index} ** registry_build_key_max;
 var registry_write_path_pool: [registry_path_pool_max]u8 = .{0} ** registry_path_pool_max;
@@ -4390,6 +4391,7 @@ fn buildRegistryBatchCandidate(
     const view = registry.buildHiveViewInto(candidate_slot.bytes[0..], .{
         .keys = registry_write_keys[0..],
         .value_key_indices = registry_value_key_indices[0..],
+        .value_order = &registry_value_order,
         .flat_key_order = registry_flat_key_order[0..],
     }, .system, generation, list.items()) catch |err| return .{ .result = registryBuildError(err) };
     candidate_slot.valid = true;
@@ -4466,6 +4468,7 @@ fn buildRegistryMutationCandidate(kind: RegistryMutationKind, hive_kind: registr
     const view = registry.buildHiveViewInto(candidate_slot.bytes[0..], .{
         .keys = registry_write_keys[0..],
         .value_key_indices = registry_value_key_indices[0..],
+        .value_order = &registry_value_order,
         .flat_key_order = registry_flat_key_order[0..],
     }, hive_kind, generation, list.items()) catch |err| return .{ .result = registryBuildError(err) };
     candidate_slot.valid = true;
