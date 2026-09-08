@@ -208,6 +208,7 @@ pub const Input = struct {
 };
 
 pub const Result = struct {
+    path: [MAX_BACKING_PATH:0]u8 = .{0} ** MAX_BACKING_PATH,
     status: u32 = status_unavailable,
     flags: u32 = flag_reserve_only | flag_pager_disabled | flag_uses_fs_api | flag_no_second_io_path,
     blockers: u32 = 0,
@@ -424,6 +425,9 @@ pub const PageIoInput = struct {
     flags: u32 = 0,
     vm_region_exists: bool = false,
     vm_region_is_r4x: bool = false,
+    // Verified by the VM owner for this exact offset and transfer, not inferred
+    // from the sum of all committed spans.
+    commit_covered: bool = false,
     committed_bytes: u64 = 0,
     resident_bytes: u64 = 0,
     backing: Result = .{},
@@ -537,6 +541,9 @@ const SlotExtent = struct {
     start_slot: u64 = 0,
     slot_count: u64 = 0,
     state: u32 = 0,
+    // Stable for the reservation lifetime; resetting its content starts a new
+    // incarnation. Unrelated table changes and page I/O do not invalidate it.
+    generation: u64 = 0,
 };
 
 var state: Summary = .{};
@@ -615,7 +622,16 @@ pub fn probe(input: Input) Result {
     }
 
     result.status = status_ready;
-    rememberActivePath(input.path);
+    if (input.path) |path| {
+        const len = std.mem.len(path);
+        if (len >= result.path.len) {
+            result.status = status_invalid_request;
+            result.blockers |= blocker_invalid_request;
+            record(result);
+            return result;
+        }
+        @memcpy(result.path[0..len], path[0..len]);
+    }
     record(result);
     return result;
 }
@@ -633,6 +649,7 @@ pub fn activeBackingResult() ?Result {
     if (!active_backing_path_valid or active_capacity_slots == 0 or active_file_size == 0) return null;
     const available_bytes = active_capacity_slots * SLOT_BYTES;
     return .{
+        .path = active_backing_path,
         .status = status_ready,
         .flags = flag_file_backed |
             flag_existing_file |
@@ -1003,8 +1020,10 @@ fn record(result: Result) void {
 
 fn ensureSlotBacking(backing: Result, capacity_slots: u64) void {
     if (active_first_cluster == backing.first_cluster and
+        active_cluster_bytes == backing.cluster_bytes and
         active_file_size == backing.file_size and
-        active_capacity_slots == capacity_slots)
+        active_capacity_slots == capacity_slots and
+        std.ascii.eqlIgnoreCase(std.mem.sliceTo(&active_backing_path, 0), std.mem.sliceTo(&backing.path, 0)))
     {
         return;
     }
@@ -1014,6 +1033,7 @@ fn ensureSlotBacking(backing: Result, capacity_slots: u64) void {
     active_file_size = backing.file_size;
     active_cluster_bytes = backing.cluster_bytes;
     active_capacity_slots = capacity_slots;
+    rememberActivePath(if (backing.path[0] == 0) null else &backing.path);
     slot_generation +%= 1;
 }
 
@@ -1036,6 +1056,12 @@ fn rememberActivePath(path: ?[*:0]const u8) void {
     var clear = len + 1;
     while (clear < active_backing_path.len) : (clear += 1) active_backing_path[clear] = 0;
     active_backing_path_valid = true;
+}
+
+fn nextSlotGeneration() u64 {
+    slot_generation +%= 1;
+    if (slot_generation == 0) slot_generation = 1;
+    return slot_generation;
 }
 
 fn reserveSlots(input: SlotInput, result: *SlotResult) void {
@@ -1077,8 +1103,8 @@ fn reserveSlots(input: SlotInput, result: *SlotResult) void {
         .start_slot = first_slot,
         .slot_count = input.requested_slots,
         .state = extent_state_reserved,
+        .generation = nextSlotGeneration(),
     };
-    slot_generation +%= 1;
 
     result.status = slot_status_reserved;
     result.reservation_id = reservation_id;
@@ -1191,6 +1217,7 @@ fn recoverSlots(input: SlotInput, result: *SlotResult) void {
     }
 
     slot_extents[index].state = extent_state_reserved;
+    slot_extents[index].generation = nextSlotGeneration();
     const extent = slot_extents[index];
     result.status = slot_status_recovered;
     result.reservation_id = extent.reservation_id;
@@ -1228,7 +1255,12 @@ fn fillSlotCounts(result: *SlotResult) void {
     result.error_slots = errors;
     result.range_count = ranges;
     result.max_ranges = slot_table_max_ranges;
-    result.generation = slot_generation;
+    // A reservation result carries its lifetime token. A table-only probe
+    // still exposes the global change counter for inventory diagnostics.
+    result.generation = if (findExtentByReservation(result.reservation_id)) |slot|
+        slot_extents[slot].generation
+    else
+        slot_generation;
 }
 
 fn recordSlot(result: *SlotResult) void {
@@ -1269,7 +1301,7 @@ fn recordSlot(result: *SlotResult) void {
     slot_state.last_region_id = result.region_id;
     slot_state.last_first_slot = result.first_slot;
     slot_state.last_slot_count = result.slot_count;
-    slot_state.generation = result.generation;
+    slot_state.generation = slot_generation;
 }
 
 fn recordPagerGate(result: *PagerGateResult) void {
@@ -1393,8 +1425,7 @@ fn validatePageIo(input: PageIoInput, result: *PageIoResult) ?usize {
         result.blockers |= page_io_blocker_unaligned_region_offset;
         return null;
     }
-    const region_end = input.region_offset + transfer_bytes;
-    if (region_end < input.region_offset or region_end > input.committed_bytes) {
+    if (input.region_offset > std.math.maxInt(u64) - transfer_bytes or !input.commit_covered) {
         result.status = page_io_status_invalid_request;
         result.blockers |= page_io_blocker_region_offset_outside_commit;
         return null;
@@ -1414,19 +1445,18 @@ fn validatePageIo(input: PageIoInput, result: *PageIoResult) ?usize {
     }
 
     const capacity_slots = input.backing.available_bytes / SLOT_BYTES;
-    ensureSlotBacking(input.backing, capacity_slots);
+    if (active_first_cluster != input.backing.first_cluster or
+        active_file_size != input.backing.file_size or
+        active_cluster_bytes != input.backing.cluster_bytes or
+        active_capacity_slots != capacity_slots or
+        !std.ascii.eqlIgnoreCase(std.mem.sliceTo(&active_backing_path, 0), std.mem.sliceTo(&input.backing.path, 0)))
+    {
+        result.status = page_io_status_stale_generation;
+        result.blockers |= page_io_blocker_stale_generation;
+        return null;
+    }
     result.capacity_slots = active_capacity_slots;
     fillPageIoSlotState(result);
-
-    if (input.expected_generation != 0) {
-        result.flags |= page_io_flag_generation_checked;
-        if (input.expected_generation != slot_generation) {
-            result.status = page_io_status_stale_generation;
-            result.blockers |= page_io_blocker_stale_generation;
-            result.slot_generation = slot_generation;
-            return null;
-        }
-    }
 
     const extent_index = findExtentByReservation(input.reservation_id) orelse {
         result.status = page_io_status_reservation_not_found;
@@ -1443,7 +1473,27 @@ fn validatePageIo(input: PageIoInput, result: *PageIoResult) ?usize {
         return null;
     }
     result.flags |= page_io_flag_owner_matched;
+    if (input.expected_generation != 0) {
+        result.flags |= page_io_flag_generation_checked;
+        if (input.expected_generation != extent.generation) {
+            result.status = page_io_status_stale_generation;
+            result.blockers |= page_io_blocker_stale_generation;
+            result.slot_generation = extent.generation;
+            return null;
+        }
+    }
+
     if (input.slot_index >= extent.slot_count or input.page_count > extent.slot_count - input.slot_index) {
+        result.status = page_io_status_invalid_request;
+        result.blockers |= page_io_blocker_slot_index_out_of_range;
+        return null;
+    }
+    // Validity is tracked for the whole reservation. Its first write must
+    // initialize all slots before any subset can be read or rewritten.
+    if (input.operation == page_io_operation_page_out and
+        (extent.state & extent_state_valid) == 0 and
+        (input.slot_index != 0 or input.page_count != extent.slot_count))
+    {
         result.status = page_io_status_invalid_request;
         result.blockers |= page_io_blocker_slot_index_out_of_range;
         return null;
@@ -1483,12 +1533,12 @@ fn validatePageIo(input: PageIoInput, result: *PageIoResult) ?usize {
 
     result.backing_slot = backing_slot;
     result.backing_offset = backing_offset;
-    result.slot_generation = slot_generation;
+    result.slot_generation = extent.generation;
     return extent_index;
 }
 
 fn fillPageIoSlotState(result: *PageIoResult) void {
-    var slot_result = SlotResult{};
+    var slot_result = SlotResult{ .reservation_id = result.reservation_id };
     fillSlotCounts(&slot_result);
     result.capacity_slots = slot_result.capacity_slots;
     result.reserved_slots = slot_result.reserved_slots;
@@ -1721,7 +1771,7 @@ fn refreshSlotSummaryCounts() void {
     slot_state.error_slots = result.error_slots;
     slot_state.range_count = result.range_count;
     slot_state.max_ranges = result.max_ranges;
-    slot_state.generation = result.generation;
+    slot_state.generation = slot_generation;
 }
 
 fn findExtentByReservation(reservation_id: u32) ?usize {

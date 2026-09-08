@@ -17,6 +17,7 @@ const mem_blocks = @import("../memory/blocks.zig");
 const mem_phys = @import("../memory/phys.zig");
 const mem_backing_store = @import("../memory/backing_store.zig");
 const mem_reclaim = @import("../memory/reclaim.zig");
+const mem_owner_locks = @import("../memory/owner_locks.zig");
 const mem_virt = @import("../memory/virt.zig");
 const boot_info = @import("../bootloader/boot_info.zig");
 const boot_perf = @import("../kernel/boot_perf.zig");
@@ -846,17 +847,21 @@ pub fn memoryBackingStoreProbe(path_ptr: [*:0]const u8, requested_bytes: u64, fl
         fat32 = true;
     }
 
-    const result = mem_backing_store.probe(.{
-        .requested_bytes = requested_bytes,
-        .flags = flags,
-        .path = path_ptr,
-        .file_exists = file_rc > 0 and file_info.exists != 0,
-        .is_dir = file_info.is_dir != 0,
-        .fat32 = fat32,
-        .file_size = file_info.size,
-        .cluster_bytes = cluster_bytes,
-        .first_cluster = file_info.first_cluster,
-    });
+    const result = blk: {
+        const token = mem_owner_locks.virtual_memory.acquire();
+        defer mem_owner_locks.virtual_memory.release(token);
+        break :blk mem_backing_store.probe(.{
+            .requested_bytes = requested_bytes,
+            .flags = flags,
+            .path = path_ptr,
+            .file_exists = file_rc > 0 and file_info.exists != 0,
+            .is_dir = file_info.is_dir != 0,
+            .fat32 = fat32,
+            .file_size = file_info.size,
+            .cluster_bytes = cluster_bytes,
+            .first_cluster = file_info.first_cluster,
+        });
+    };
     const backing_summary = mem_backing_store.summary();
 
     out.* = .{
@@ -898,27 +903,35 @@ pub fn memoryBackingStoreSlotProbe(path_ptr: [*:0]const u8, backing_bytes: u64, 
         fat32 = true;
     }
 
-    const backing_result = mem_backing_store.probe(.{
-        .requested_bytes = backing_bytes,
-        .flags = 0,
-        .path = path_ptr,
-        .file_exists = file_rc > 0 and file_info.exists != 0,
-        .is_dir = file_info.is_dir != 0,
-        .fat32 = fat32,
-        .file_size = file_info.size,
-        .cluster_bytes = cluster_bytes,
-        .first_cluster = file_info.first_cluster,
-    });
-    const result = mem_backing_store.slotProbe(.{
-        .operation = operation,
-        .requested_slots = requested_slots,
-        .reservation_id = reservation_id,
-        .owner_kind = owner_kind,
-        .owner_id = owner_id,
-        .region_id = region_id,
-        .flags = flags,
-        .backing = backing_result,
-    });
+    const backing_result = blk: {
+        const token = mem_owner_locks.virtual_memory.acquire();
+        defer mem_owner_locks.virtual_memory.release(token);
+        break :blk mem_backing_store.probe(.{
+            .requested_bytes = backing_bytes,
+            .flags = 0,
+            .path = path_ptr,
+            .file_exists = file_rc > 0 and file_info.exists != 0,
+            .is_dir = file_info.is_dir != 0,
+            .fat32 = fat32,
+            .file_size = file_info.size,
+            .cluster_bytes = cluster_bytes,
+            .first_cluster = file_info.first_cluster,
+        });
+    };
+    const result = blk: {
+        const token = mem_owner_locks.virtual_memory.acquire();
+        defer mem_owner_locks.virtual_memory.release(token);
+        break :blk mem_backing_store.slotProbe(.{
+            .operation = operation,
+            .requested_slots = requested_slots,
+            .reservation_id = reservation_id,
+            .owner_kind = owner_kind,
+            .owner_id = owner_id,
+            .region_id = region_id,
+            .flags = flags,
+            .backing = backing_result,
+        });
+    };
 
     out.* = .{
         .version = memory_backing_store_slot_probe_version,
@@ -989,17 +1002,21 @@ pub fn memoryPagerGateProbe(path_ptr: [*:0]const u8, backing_bytes: u64, region_
         fat32 = true;
     }
 
-    const backing_result = mem_backing_store.probe(.{
-        .requested_bytes = backing_bytes,
-        .flags = 0,
-        .path = path_ptr,
-        .file_exists = file_rc > 0 and file_info.exists != 0,
-        .is_dir = file_info.is_dir != 0,
-        .fat32 = fat32,
-        .file_size = file_info.size,
-        .cluster_bytes = cluster_bytes,
-        .first_cluster = file_info.first_cluster,
-    });
+    const backing_result = blk: {
+        const token = mem_owner_locks.virtual_memory.acquire();
+        defer mem_owner_locks.virtual_memory.release(token);
+        break :blk mem_backing_store.probe(.{
+            .requested_bytes = backing_bytes,
+            .flags = 0,
+            .path = path_ptr,
+            .file_exists = file_rc > 0 and file_info.exists != 0,
+            .is_dir = file_info.is_dir != 0,
+            .fat32 = fat32,
+            .file_size = file_info.size,
+            .cluster_bytes = cluster_bytes,
+            .first_cluster = file_info.first_cluster,
+        });
+    };
 
     var vm_region_exists = false;
     var vm_region_is_r4x = false;
@@ -1018,19 +1035,23 @@ pub fn memoryPagerGateProbe(path_ptr: [*:0]const u8, backing_bytes: u64, region_
         failed_faults = range.failed_faults;
     }
 
-    const result = mem_backing_store.pagerGateProbe(.{
-        .requested_bytes = requested_bytes,
-        .region_id = region_id,
-        .owner_id = owner_id,
-        .flags = flags,
-        .vm_region_exists = vm_region_exists,
-        .vm_region_is_r4x = vm_region_is_r4x,
-        .committed_bytes = committed_bytes,
-        .resident_bytes = resident_bytes,
-        .fault_count = fault_count,
-        .failed_faults = failed_faults,
-        .backing = backing_result,
-    });
+    const result = blk: {
+        const token = mem_owner_locks.virtual_memory.acquire();
+        defer mem_owner_locks.virtual_memory.release(token);
+        break :blk mem_backing_store.pagerGateProbe(.{
+            .requested_bytes = requested_bytes,
+            .region_id = region_id,
+            .owner_id = owner_id,
+            .flags = flags,
+            .vm_region_exists = vm_region_exists,
+            .vm_region_is_r4x = vm_region_is_r4x,
+            .committed_bytes = committed_bytes,
+            .resident_bytes = resident_bytes,
+            .fault_count = fault_count,
+            .failed_faults = failed_faults,
+            .backing = backing_result,
+        });
+    };
 
     out.* = .{
         .version = memory_pager_gate_probe_version,
@@ -1106,17 +1127,21 @@ pub fn memoryPageIoProbe(
         fat32 = true;
     }
 
-    const backing_result = mem_backing_store.probe(.{
-        .requested_bytes = backing_bytes,
-        .flags = 0,
-        .path = path_ptr,
-        .file_exists = file_rc > 0 and file_info.exists != 0,
-        .is_dir = file_info.is_dir != 0,
-        .fat32 = fat32,
-        .file_size = file_info.size,
-        .cluster_bytes = cluster_bytes,
-        .first_cluster = file_info.first_cluster,
-    });
+    const backing_result = blk: {
+        const token = mem_owner_locks.virtual_memory.acquire();
+        defer mem_owner_locks.virtual_memory.release(token);
+        break :blk mem_backing_store.probe(.{
+            .requested_bytes = backing_bytes,
+            .flags = 0,
+            .path = path_ptr,
+            .file_exists = file_rc > 0 and file_info.exists != 0,
+            .is_dir = file_info.is_dir != 0,
+            .fat32 = fat32,
+            .file_size = file_info.size,
+            .cluster_bytes = cluster_bytes,
+            .first_cluster = file_info.first_cluster,
+        });
+    };
 
     var vm_region_exists = false;
     var vm_region_is_r4x = false;
@@ -1142,16 +1167,33 @@ pub fn memoryPageIoProbe(
         .flags = flags,
         .vm_region_exists = vm_region_exists,
         .vm_region_is_r4x = vm_region_is_r4x,
+        .commit_covered = mem_virt.commitCovers(region_id, region_offset, page_count),
         .committed_bytes = committed_bytes,
         .resident_bytes = resident_bytes,
         .backing = backing_result,
     };
 
-    const prepared = mem_backing_store.pageIoPrepare(page_io_input);
+    const prepared = blk: {
+        const token = mem_owner_locks.virtual_memory.acquire();
+        defer mem_owner_locks.virtual_memory.release(token);
+        break :blk mem_backing_store.pageIoPrepare(page_io_input);
+    };
     if (prepared.status != memory_page_io_status_ready) {
         recordVmPagerPolicyFailure(prepared);
         fillPageIoProbe(out, prepared);
         return 0;
+    }
+
+    var writeback: ?mem_virt.PageWriteback = null;
+    defer if (writeback) |*pending| mem_virt.endPageWriteback(pending);
+    if (operation == memory_page_io_operation_page_out and owner_kind == memory_backing_store_slot_owner_kind_vm_region) {
+        writeback = mem_virt.beginPageWriteback(region_id, region_offset, page_count, page_ptr) catch {
+            var failed = prepared;
+            failed.status = memory_page_io_status_invalid_request;
+            failed.blockers |= mem_backing_store.page_io_blocker_invalid_request;
+            fillPageIoProbe(out, failed);
+            return 0;
+        };
     }
 
     var io_status: i32 = 0;
@@ -1171,19 +1213,27 @@ pub fn memoryPageIoProbe(
     var complete_input = page_io_input;
     complete_input.io_status = io_status;
     complete_input.io_bytes = io_bytes;
-    const completed = mem_backing_store.pageIoComplete(complete_input);
+    var completed = blk: {
+        const token = mem_owner_locks.virtual_memory.acquire();
+        defer mem_owner_locks.virtual_memory.release(token);
+        break :blk mem_backing_store.pageIoComplete(complete_input);
+    };
     if (completed.status != memory_page_io_status_page_out_ok and completed.status != memory_page_io_status_page_in_ok) {
         recordVmPagerPolicyFailure(completed);
     }
     if (completed.status == memory_page_io_status_page_out_ok and completed.owner_kind == memory_backing_store_slot_owner_kind_vm_region) {
-        _ = mem_virt.applyPageIoState(.{
+        _ = mem_virt.completePageWriteback(&writeback.?, .{
             .region_id = completed.region_id,
             .region_offset = completed.region_offset,
             .page_count = completed.page_count,
             .slot_reservation_id = completed.reservation_id,
             .slot_index = completed.slot_index,
             .slot_generation = completed.slot_generation,
-        }, true);
+        }) catch {
+            completed.status = memory_page_io_status_invalid_request;
+            completed.blockers |= mem_backing_store.page_io_blocker_invalid_request;
+            recordVmPagerPolicyFailure(completed);
+        };
     }
     fillPageIoProbe(out, completed);
     return switch (completed.status) {

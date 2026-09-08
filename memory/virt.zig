@@ -8,6 +8,8 @@ const reclaim = @import("reclaim.zig");
 const owner_locks = @import("owner_locks.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const k = @import("../kernel/log.zig");
+const sync = @import("../sched/sync.zig");
+const task_context = @import("../sched/task_context.zig");
 const r4sys_api = @import("../program/r4sys.zig");
 
 pub const MAX_RANGES: usize = 1024;
@@ -113,6 +115,7 @@ pub const Error = error{
     GuardRange,
     OutOfMemory,
     MapFailed,
+    Busy,
     OutsideWindow,
 };
 
@@ -309,6 +312,7 @@ pub const PageStateSummary = struct {
     eviction_skipped_nonresident: u64 = 0,
     eviction_skipped_pinned: u64 = 0,
     eviction_skipped_busy: u64 = 0,
+    eviction_redirtied_pages: u64 = 0,
     eviction_skipped_error: u64 = 0,
     eviction_skipped_unmapped: u64 = 0,
     pager_failed_page_outs: u64 = 0,
@@ -413,6 +417,7 @@ const Range = struct {
     // metadata cannot be represented. Keep the exact operation so the same
     // caller can resume over already-unmapped pages without lying about the
     // current committed-byte count or losing the range as a retry anchor.
+    pager_io_count: u32 = 0,
     partial_uncommit_base: u64 = 0,
     partial_uncommit_len: u64 = 0,
     partial_uncommit_cursor: u64 = 0,
@@ -424,6 +429,9 @@ const Range = struct {
         return self.slot_used and self.status != .released;
     }
 };
+
+var pager_activity: sync.WaitQueue = sync.WaitQueue.init();
+var pager_sequence: u64 = 0;
 
 const RangeIdIndexState = enum(u8) {
     empty = 0,
@@ -772,61 +780,74 @@ fn releaseClaimedFrame(frame: u64) void {
 }
 
 pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_id: u64) bool {
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
-    var owner_locked = true;
-    defer if (owner_locked) owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return false;
-    if ((error_code & PAGE_FAULT_PRESENT) != 0) return false;
-    const fault_page = alignDownValue(addr, paging.PAGE_SIZE);
-    const range = rangeByAddress(fault_page) orelse return false;
-    if (range.window != .r4x_vm or range.owner != owner or range.owner_id != owner_id) return false;
-    if (range.kind != .virtual_range) return false;
-    if (range.guard_len != 0 and rangesOverlap(fault_page, paging.PAGE_SIZE, range.guard_base, range.guard_len)) {
-        recordDemandFaultFailure(range);
-        return false;
-    }
-    if (!commitSpanCoversForRange(range, fault_page, paging.PAGE_SIZE)) {
-        recordDemandFaultFailure(range);
-        return false;
-    }
-    if (paging.isMapped(fault_page)) return false;
-    if (!canCommitPages(range.*, 1)) {
-        recordDemandFaultFailure(range);
-        return false;
-    }
-
-    const page_index = (fault_page - range.base) / paging.PAGE_SIZE;
-    if (pageStateForFaultInRange(range, page_index)) |fault_state| {
-        if ((fault_state.flags & page_state_flag_slot_bound) != 0) {
-            // Backing I/O may sleep. Pageable VM remains a BSP owner in the
-            // SMP foundation; release the VM owner and retain the existing
-            // busy/generation/lifecycle transaction.
-            if (percpu.currentIndex() != 0) {
+    var waited_region: ?u32 = null;
+    while (true) {
+        const sequence = pager_activity.readSequence(&pager_sequence);
+        const owner_irq_flags = owner_locks.virtual_memory.acquire();
+        var owner_locked = true;
+        defer if (owner_locked) owner_locks.virtual_memory.release(owner_irq_flags);
+        if (!initialized) return false;
+        if ((error_code & PAGE_FAULT_PRESENT) != 0) return false;
+        const fault_page = alignDownValue(addr, paging.PAGE_SIZE);
+        const range = rangeByAddress(fault_page) orelse return false;
+        if (range.window != .r4x_vm or range.owner != owner or range.owner_id != owner_id) return false;
+        if (range.kind != .virtual_range or range.partial_uncommit_len != 0) return false;
+        if (waited_region) |id| if (range.id != id) return false;
+        if (range.guard_len != 0 and rangesOverlap(fault_page, paging.PAGE_SIZE, range.guard_base, range.guard_len)) {
+            recordDemandFaultFailure(range);
+            return false;
+        }
+        if (!commitSpanCoversForRange(range, fault_page, paging.PAGE_SIZE)) {
+            recordDemandFaultFailure(range);
+            return false;
+        }
+        const page_index = (fault_page - range.base) / paging.PAGE_SIZE;
+        if (pageStateForFaultInRange(range, page_index)) |fault_state| {
+            if ((fault_state.flags & page_state_flag_busy) != 0 and range.pager_io_count != 0 and !paging.isMapped(fault_page)) {
+                if (percpu.currentIndex() != 0) return false;
+                waited_region = range.id;
+                owner_locked = false;
+                owner_locks.virtual_memory.release(owner_irq_flags);
+                var wait = PagerWait{ .sequence = sequence };
+                if (pager_activity.waitUnless(sync.WAIT_FOREVER, "vm-page-in", pagerUnchanged, &wait) != .signaled) return false;
+                continue;
+            }
+            if (paging.isMapped(fault_page)) return waited_region != null;
+            if (!canCommitPages(range.*, 1)) {
                 recordDemandFaultFailure(range);
                 return false;
             }
-            owner_locked = false;
-            owner_locks.virtual_memory.release(owner_irq_flags);
-            return handlePageInFault(range, fault_page, page_index, fault_state);
+            if ((fault_state.flags & page_state_flag_slot_bound) != 0) {
+                if (percpu.currentIndex() != 0) {
+                    recordDemandFaultFailure(range);
+                    return false;
+                }
+                owner_locked = false;
+                return handlePageInFault(range, fault_page, page_index, owner_irq_flags);
+            }
         }
-    }
+        if (paging.isMapped(fault_page)) return waited_region != null;
+        if (!canCommitPages(range.*, 1)) {
+            recordDemandFaultFailure(range);
+            return false;
+        }
 
-    const frame = allocClaimedFrame(range.*, .vm_fault) catch {
-        recordDemandFaultFailure(range);
-        return false;
-    };
-    if (!paging.mapPage(fault_page, frame, range.flags)) {
-        releaseClaimedFrame(frame);
-        recordDemandFaultFailure(range);
-        return false;
-    }
+        const frame = allocClaimedFrame(range.*, .vm_fault) catch {
+            recordDemandFaultFailure(range);
+            return false;
+        };
+        const mem: [*]u8 = @ptrFromInt(phys.physToVirt(frame));
+        @memset(mem[0..@intCast(paging.PAGE_SIZE)], 0);
+        if (!paging.mapPage(fault_page, frame, range.flags)) {
+            releaseClaimedFrame(frame);
+            recordDemandFaultFailure(range);
+            return false;
+        }
 
-    const mem: [*]u8 = @ptrFromInt(fault_page);
-    @memset(mem[0..@intCast(paging.PAGE_SIZE)], 0);
-    _ = paging.clearDirty(fault_page);
-    recordDemandFaultSuccess(range);
-    pageStateSet(range.id, page_index, 1, page_state_flag_resident, page_state_flag_dirty, null, true) catch {};
-    return true;
+        recordDemandFaultSuccess(range);
+        pageStateSet(range.id, page_index, 1, page_state_flag_resident, page_state_flag_dirty, null, true) catch {};
+        return true;
+    }
 }
 
 pub fn uncommit(id: u32, offset: u64, len_raw: u64) Error!void {
@@ -837,6 +858,7 @@ pub fn uncommit(id: u32, offset: u64, len_raw: u64) Error!void {
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
     const idx = indexById(id) orelse return Error.NotFound;
     const range = &ranges[idx];
+    if (range.pager_io_count != 0) return Error.Busy;
     try validateInside(range.*, offset, len);
     const start = range.base + offset;
     try validateNotGuard(range.*, start, len);
@@ -863,6 +885,7 @@ pub fn release(id: u32) Error!void {
     if (!initialized) return Error.NotInitialized;
     const idx = indexById(id) orelse return Error.NotFound;
     var range = &ranges[idx];
+    if (range.pager_io_count != 0) return Error.Busy;
     if (range.window == .r4x_vm and range.owner == .r4x_instance and range.owner_id <= std.math.maxInt(u32)) {
         _ = backing_store.releaseVmRegion(@intCast(range.owner_id), range.id);
     }
@@ -973,6 +996,12 @@ pub fn pageStateProbe(input: PageStateInput) PageStateResult {
     if (range.window != .r4x_vm or range.kind != .virtual_range) {
         result.status = page_state_status_region_not_r4x;
         result.blockers |= page_state_blocker_region_not_r4x;
+        recordPageState(&result);
+        return result;
+    }
+    if (range.pager_io_count != 0 and input.operation != page_state_operation_query) {
+        result.status = page_state_status_invalid_request;
+        result.blockers |= page_state_blocker_invalid_request;
         recordPageState(&result);
         return result;
     }
@@ -1785,7 +1814,122 @@ fn pageStateForFaultInRange(range: *const Range, page_index: u64) ?FaultPageStat
     return null;
 }
 
-fn handlePageInFault(range: *Range, fault_page: u64, page_index: u64, fault_state: FaultPageState) bool {
+// A writeback keeps the region and source mappings alive across filesystem
+// waits. Writers may continue; a new dirty bit prevents final eviction.
+pub const PageWriteback = struct {
+    region_id: u32,
+    region_offset: u64,
+    page_count: u64,
+    unwind: task_context.UnwindToken,
+    active: bool = true,
+    completed: bool = false,
+};
+
+pub fn beginPageWriteback(region_id: u32, region_offset: u64, page_count: u64, page_ptr: [*]const u8) Error!PageWriteback {
+    const token = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(token);
+    if (percpu.currentIndex() != 0) return Error.Busy;
+    const idx = indexById(region_id) orelse return Error.NotFound;
+    const range = &ranges[idx];
+    const bytes = checkedMul(page_count, paging.PAGE_SIZE) orelse return Error.Overflow;
+    if (page_count == 0 or !isAligned(region_offset, paging.PAGE_SIZE)) return Error.BadAlignment;
+    try validateInside(range.*, region_offset, bytes);
+    if (range.window != .r4x_vm or range.partial_uncommit_len != 0 or range.pager_io_count != 0) return Error.Busy;
+    const start = range.base + region_offset;
+    if (@intFromPtr(page_ptr) != start) return Error.OutsideWindow;
+    if (!commitSpanCoversForRange(range, start, bytes)) return Error.NotCommitted;
+    const first = region_offset / paging.PAGE_SIZE;
+    for (0..@intCast(page_count)) |i| {
+        const state = pageStateForFaultInRange(range, first + i) orelse return Error.NotCommitted;
+        if ((state.flags & (page_state_flag_busy | page_state_flag_pinned)) != 0) return Error.Busy;
+        if ((state.flags & page_state_flag_resident) == 0 or !paging.isMapped(start + i * paging.PAGE_SIZE)) return Error.NotCommitted;
+    }
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return Error.Busy;
+    errdefer _ = task_context.leaveUnwind(unwind);
+    try pageStateSet(region_id, first, page_count, page_state_flag_busy, page_state_flag_dirty, null, true);
+    errdefer pageStateSet(region_id, first, page_count, page_state_flag_dirty, page_state_flag_busy, null, true) catch {};
+    for (0..@intCast(page_count)) |i| {
+        // The acknowledged invalidation starts a new hardware dirty epoch.
+        // If it fails, the original mapping and data remain owned.
+        if (!paging.clearDirty(start + i * paging.PAGE_SIZE)) return Error.MapFailed;
+    }
+    range.pager_io_count += 1;
+    return .{ .region_id = region_id, .region_offset = region_offset, .page_count = page_count, .unwind = unwind };
+}
+
+pub fn endPageWriteback(writeback: *PageWriteback) void {
+    if (!writeback.active) return;
+    const token = owner_locks.virtual_memory.acquire();
+    if (indexById(writeback.region_id)) |idx| {
+        const range = &ranges[idx];
+        pageStateSet(range.id, writeback.region_offset / paging.PAGE_SIZE, writeback.page_count, if (writeback.completed) 0 else page_state_flag_dirty, page_state_flag_busy, null, true) catch {};
+        std.debug.assert(range.pager_io_count != 0);
+        range.pager_io_count -= 1;
+    }
+    writeback.active = false;
+    owner_locks.virtual_memory.release(token);
+    _ = task_context.leaveUnwind(writeback.unwind);
+    _ = pager_activity.bumpSequenceAndWakeAll(&pager_sequence);
+}
+
+pub fn completePageWriteback(writeback: *PageWriteback, binding: PageStateInput) Error!u64 {
+    if (!writeback.active or binding.region_id != writeback.region_id or
+        binding.region_offset != writeback.region_offset or binding.page_count != writeback.page_count) return Error.NotFound;
+    const token = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(token);
+    const idx = indexById(binding.region_id) orelse return Error.NotFound;
+    const range = &ranges[idx];
+    const first = binding.region_offset / paging.PAGE_SIZE;
+    try pageStateSet(range.id, first, binding.page_count, page_state_flag_slot_bound, 0, .{
+        .reservation_id = binding.slot_reservation_id,
+        .slot_index = binding.slot_index,
+        .slot_generation = binding.slot_generation,
+    }, true);
+    page_state_summary.slot_binds +%= binding.page_count;
+    syncHardwareDirty(range.*, first, binding.page_count);
+    for (0..@intCast(binding.page_count)) |i| {
+        const state = pageStateForFaultInRange(range, first + i) orelse return Error.NotCommitted;
+        if ((state.flags & page_state_flag_dirty) != 0) {
+            // The file may contain an earlier or mixed snapshot. Keep the
+            // complete resident span dirty until a later quiet writeback.
+            try pageStateSet(range.id, first, binding.page_count, page_state_flag_dirty, 0, null, true);
+            page_state_summary.eviction_redirtied_pages +%= binding.page_count;
+            writeback.completed = true;
+            return 0;
+        }
+    }
+    const returned = try makePageRangeNonresident(range.id, binding.region_offset, binding.page_count);
+    page_state_summary.page_out_nonresident_pages +%= returned;
+    writeback.completed = true;
+    return returned;
+}
+
+pub fn commitCovers(region_id: u32, offset: u64, page_count: u64) bool {
+    const token = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(token);
+    const idx = indexById(region_id) orelse return false;
+    const range = &ranges[idx];
+    const bytes = checkedMul(page_count, paging.PAGE_SIZE) orelse return false;
+    if (page_count == 0 or !isAligned(offset, paging.PAGE_SIZE) or range.partial_uncommit_len != 0) return false;
+    validateInside(range.*, offset, bytes) catch return false;
+    return commitSpanCoversForRange(range, range.base + offset, bytes);
+}
+
+const PagerWait = struct { sequence: u64 };
+
+fn pagerUnchanged(raw: *anyopaque) bool {
+    const wait: *PagerWait = @ptrCast(@alignCast(raw));
+    return pager_sequence == wait.sequence;
+}
+
+fn handlePageInFault(range: *Range, fault_page: u64, page_index: u64, acquired: owner_locks.Token) bool {
+    // The demand-fault owner is handed over without an unlock gap.
+    var token = acquired;
+    defer owner_locks.virtual_memory.release(token);
+    if (paging.isMapped(fault_page)) return true;
+    if (!commitSpanCoversForRange(range, fault_page, paging.PAGE_SIZE) or range.partial_uncommit_len != 0) return false;
+    const fault_state = pageStateForFaultInRange(range, page_index) orelse return false;
     if (fault_state.slot_reservation_id == 0 or
         (fault_state.flags & (page_state_flag_busy | page_state_flag_pinned | page_state_flag_error)) != 0 or
         range.owner_id > std.math.maxInt(u32))
@@ -1794,12 +1938,27 @@ fn handlePageInFault(range: *Range, fault_page: u64, page_index: u64, fault_stat
     }
 
     const backing = backing_store.activeBackingResult() orelse return recordPageInFaultFailure(range, page_index, true);
-    const path = backing_store.activeBackingPath() orelse return recordPageInFaultFailure(range, page_index, true);
+    const active_path = backing_store.activeBackingPath() orelse return recordPageInFaultFailure(range, page_index, true);
+    var path: [backing_store.MAX_BACKING_PATH:0]u8 = .{0} ** backing_store.MAX_BACKING_PATH;
+    const path_len = std.mem.len(active_path);
+    if (path_len >= path.len) return recordPageInFaultFailure(range, page_index, true);
+    @memcpy(path[0..path_len], active_path[0..path_len]);
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return recordPageInFaultFailure(range, page_index, false);
+    defer _ = task_context.leaveUnwind(unwind);
     pageStateSet(range.id, page_index, 1, page_state_flag_busy, 0, null, true) catch {
         return recordPageInFaultFailure(range, page_index, true);
     };
+    range.pager_io_count += 1;
+    defer {
+        pageStateSet(range.id, page_index, 1, 0, page_state_flag_busy, null, true) catch {};
+        range.pager_io_count -= 1;
+        // Publish before waking and never enter a wait while holding VM.
+        owner_locks.virtual_memory.release(token);
+        _ = pager_activity.bumpSequenceAndWakeAll(&pager_sequence);
+        token = owner_locks.virtual_memory.acquire();
+    }
 
-    const owner_id_u32: u32 = @intCast(range.owner_id);
     const page_io_input = backing_store.PageIoInput{
         .operation = backing_store.page_io_operation_page_in,
         .region_id = range.id,
@@ -1808,52 +1967,39 @@ fn handlePageInFault(range: *Range, fault_page: u64, page_index: u64, fault_stat
         .slot_index = fault_state.slot_index,
         .page_count = 1,
         .owner_kind = backing_store.slot_owner_kind_vm_region,
-        .owner_id = owner_id_u32,
+        .owner_id = @intCast(range.owner_id),
         .expected_generation = fault_state.slot_generation,
         .vm_region_exists = true,
         .vm_region_is_r4x = true,
+        .commit_covered = true,
         .committed_bytes = range.committed_bytes,
         .resident_bytes = range.resident_bytes,
         .backing = backing,
     };
-
     const prepared = backing_store.pageIoPrepare(page_io_input);
-    if (prepared.status != backing_store.page_io_status_ready) {
-        return recordPageInFaultFailure(range, page_index, true);
-    }
+    if (prepared.status != backing_store.page_io_status_ready) return recordPageInFaultFailure(range, page_index, true);
 
-    const frame = allocClaimedFrame(range.*, .vm_fault) catch {
-        return recordPageInFaultFailure(range, page_index, false);
-    };
-    if (!paging.mapPage(fault_page, frame, range.flags)) {
-        releaseClaimedFrame(frame);
-        return recordPageInFaultFailure(range, page_index, false);
-    }
-
-    const mem: [*]u8 = @ptrFromInt(fault_page);
-    const transfer_len: u32 = @intCast(prepared.transfer_bytes);
-    const io_status = r4sys_api.fileReadAt64(path, prepared.backing_offset, mem, transfer_len);
-    const io_bytes: u32 = if (io_status > 0) @intCast(io_status) else 0;
+    // Keep the new physical page private in the permanent RAM direct map.
+    // No guest PTE exists until I/O and its reservation checks are complete.
+    const claim_owner = range.*;
+    owner_locks.virtual_memory.release(token);
+    const maybe_frame = allocClaimedFrame(claim_owner, .vm_fault);
+    token = owner_locks.virtual_memory.acquire();
+    const frame = maybe_frame catch return recordPageInFaultFailure(range, page_index, false);
+    var published = false;
+    defer if (!published) releaseClaimedFrame(frame);
+    const mem: [*]u8 = @ptrFromInt(phys.physToVirt(frame));
+    owner_locks.virtual_memory.release(token);
+    const io_status = r4sys_api.fileReadAt64(&path, prepared.backing_offset, mem, @intCast(prepared.transfer_bytes));
+    token = owner_locks.virtual_memory.acquire();
 
     var complete_input = page_io_input;
     complete_input.io_status = io_status;
-    complete_input.io_bytes = io_bytes;
+    complete_input.io_bytes = if (io_status > 0) @intCast(io_status) else 0;
     const completed = backing_store.pageIoComplete(complete_input);
-    if (completed.status != backing_store.page_io_status_page_in_ok) {
-        const page_table_token = paging.acquireMutation();
-        defer paging.releaseMutation(page_table_token);
-        var release_plan: blocks.PhysicalReleasePlan = undefined;
-        blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE, &release_plan) catch {
-            return recordPageInFaultFailure(range, page_index, true);
-        };
-        defer blocks.cancelPhysicalRangeRelease(&release_plan);
-        if (!paging.unmapPageLocked(fault_page)) return recordPageInFaultFailure(range, page_index, true);
-        phys.freeFrame(frame);
-        blocks.commitPhysicalRangeRelease(&release_plan);
-        return recordPageInFaultFailure(range, page_index, true);
-    }
-
-    _ = paging.clearDirty(fault_page);
+    if (completed.status != backing_store.page_io_status_page_in_ok) return recordPageInFaultFailure(range, page_index, true);
+    if (!paging.mapPage(fault_page, frame, range.flags)) return recordPageInFaultFailure(range, page_index, false);
+    published = true;
     recordDemandFaultSuccess(range);
     page_state_summary.fault_page_ins +%= 1;
     pageStateSet(range.id, page_index, 1, page_state_flag_resident, page_state_flag_dirty | page_state_flag_busy | page_state_flag_error, null, true) catch {};
@@ -1905,20 +2051,19 @@ pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32) rec
     }
 
     page_state_summary.eviction_attempts +%= 1;
-    const backing = backing_store.activeBackingResult() orelse {
+    const selected_backing = blk: {
+        const token = owner_locks.virtual_memory.acquire();
+        defer owner_locks.virtual_memory.release(token);
+        break :blk backing_store.activeBackingResult();
+    };
+    const backing = selected_backing orelse {
         page_state_summary.eviction_no_backing +%= 1;
         page_state_summary.eviction_failures +%= 1;
         page_state_summary.pager_disabled_eviction_gates +%= 1;
         result.failures = 1;
         return result;
     };
-    const path = backing_store.activeBackingPath() orelse {
-        page_state_summary.eviction_no_backing +%= 1;
-        page_state_summary.eviction_failures +%= 1;
-        page_state_summary.pager_disabled_eviction_gates +%= 1;
-        result.failures = 1;
-        return result;
-    };
+    const path: [*:0]const u8 = &backing.path;
 
     while (result.returned_frames < requested_frames) {
         const step = evictOneResidentPage(backing, path);
@@ -1995,6 +2140,9 @@ pub fn evictableDirtyBytes() u64 {
 }
 
 fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8) EvictionStep {
+    const token = owner_locks.virtual_memory.acquire();
+    var locked = true;
+    defer if (locked) owner_locks.virtual_memory.release(token);
     if (range_address_count == 0) return .{ .outcome = .skipped };
     var start_pos: usize = 0;
     var start_page: u64 = 0;
@@ -2014,7 +2162,7 @@ fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8) Evic
         hot_path_stats.reclaim_cursor_range_steps +%= 1;
         const page_floor = if (visited == 0) start_page else 0;
 
-        if (range.active() and range.window == .r4x_vm and range.owner == .r4x_instance and
+        if (range.active() and range.pager_io_count == 0 and range.partial_uncommit_len == 0 and range.window == .r4x_vm and range.owner == .r4x_instance and
             range.owner_id != 0 and range.owner_id <= std.math.maxInt(u32))
         {
             var span_cursor = range.page_state_span_head;
@@ -2076,7 +2224,10 @@ fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8) Evic
                     }
 
                     page_state_summary.eviction_candidates +%= 1;
-                    return evictResidentPage(range, page_index, state, backing, path);
+                    const id = range.id;
+                    locked = false;
+                    owner_locks.virtual_memory.release(token);
+                    return evictResidentPage(id, page_index, backing, path);
                 }
             }
         }
@@ -2109,50 +2260,64 @@ fn setReclaimCursorAfterPage(range_pos: usize, next_page: u64) void {
     reclaim_cursor_page = 0;
 }
 
-fn evictResidentPage(range: *Range, page_index: u64, state: FaultPageState, backing: backing_store.Result, path: [*:0]const u8) EvictionStep {
+fn evictResidentPage(region_id: u32, page_index: u64, backing: backing_store.Result, path: [*:0]const u8) EvictionStep {
+    var token = owner_locks.virtual_memory.acquire();
+    var locked = true;
+    defer if (locked) owner_locks.virtual_memory.release(token);
+    const idx = indexById(region_id) orelse return .{ .outcome = .skipped };
+    const range = &ranges[idx];
+    if (range.pager_io_count != 0 or range.partial_uncommit_len != 0) return .{ .outcome = .skipped };
+    const state = pageStateForFaultInRange(range, page_index) orelse return .{ .outcome = .skipped };
+    if ((state.flags & (page_state_flag_busy | page_state_flag_pinned | page_state_flag_error)) != 0) return .{ .outcome = .skipped };
     const virt = range.base + page_index * paging.PAGE_SIZE;
-    const region_offset = page_index * paging.PAGE_SIZE;
-    const dirty = ((state.flags & page_state_flag_dirty) != 0) or paging.pageDirty(virt);
-    pageStateSet(range.id, page_index, 1, page_state_flag_busy, 0, null, true) catch {
-        page_state_summary.eviction_failures +%= 1;
-        return .{ .outcome = .failed };
-    };
+    const dirty = (state.flags & page_state_flag_dirty) != 0 or paging.pageDirty(virt);
+    if ((state.flags & page_state_flag_slot_bound) != 0 and !dirty) return evictCleanSlotBoundPage(range, page_index, state, backing);
 
-    if ((state.flags & page_state_flag_slot_bound) != 0 and !dirty) {
-        return evictCleanSlotBoundPage(range, page_index, state, backing);
+    const page_ptr: [*]u8 = @ptrFromInt(virt);
+    var writeback = beginPageWriteback(region_id, page_index * paging.PAGE_SIZE, 1, page_ptr) catch return .{ .outcome = .failed, .dirty = dirty };
+    // This defer runs after the final VM owner release below.
+    owner_locks.virtual_memory.release(token);
+    locked = false;
+    defer endPageWriteback(&writeback);
+    token = owner_locks.virtual_memory.acquire();
+    locked = true;
+    defer {
+        owner_locks.virtual_memory.release(token);
+        locked = false;
     }
 
+    var owned_path: [backing_store.MAX_BACKING_PATH:0]u8 = .{0} ** backing_store.MAX_BACKING_PATH;
+    const path_len = std.mem.len(path);
+    if (path_len >= owned_path.len) return .{ .outcome = .failed, .dirty = dirty };
+    @memcpy(owned_path[0..path_len], path[0..path_len]);
     const owner_id: u32 = @intCast(range.owner_id);
     var reservation_id = state.slot_reservation_id;
     var slot_index = state.slot_index;
     var expected_generation = state.slot_generation;
     var reserved_new_slot = false;
-
     if ((state.flags & page_state_flag_slot_bound) == 0) {
-        const reserve_result = backing_store.slotProbe(.{
+        const reserved = backing_store.slotProbe(.{
             .operation = backing_store.slot_operation_reserve,
             .requested_slots = 1,
             .owner_kind = backing_store.slot_owner_kind_vm_region,
             .owner_id = owner_id,
-            .region_id = range.id,
+            .region_id = region_id,
             .backing = backing,
         });
-        if (reserve_result.status != backing_store.slot_status_reserved) {
-            clearEvictionBusy(range.id, page_index);
+        if (reserved.status != backing_store.slot_status_reserved) {
             page_state_summary.eviction_slot_failures +%= 1;
             recordPagerPageOutFailure(dirty);
-            return .{ .outcome = .failed };
+            return .{ .outcome = .failed, .dirty = dirty };
         }
-        reservation_id = reserve_result.reservation_id;
+        reservation_id = reserved.reservation_id;
         slot_index = 0;
-        expected_generation = reserve_result.generation;
+        expected_generation = reserved.generation;
         reserved_new_slot = true;
     }
-
     const input = backing_store.PageIoInput{
         .operation = backing_store.page_io_operation_page_out,
-        .region_id = range.id,
-        .region_offset = region_offset,
+        .region_id = region_id,
+        .region_offset = writeback.region_offset,
         .reservation_id = reservation_id,
         .slot_index = slot_index,
         .page_count = 1,
@@ -2162,67 +2327,46 @@ fn evictResidentPage(range: *Range, page_index: u64, state: FaultPageState, back
         .flags = backing_store.page_io_flag_eviction_request,
         .vm_region_exists = true,
         .vm_region_is_r4x = true,
+        .commit_covered = true,
         .committed_bytes = range.committed_bytes,
         .resident_bytes = range.resident_bytes,
         .backing = backing,
     };
-
     const prepared = backing_store.pageIoPrepare(input);
     if (prepared.status != backing_store.page_io_status_ready) {
-        if (reserved_new_slot) releaseEvictionSlot(backing, reservation_id, owner_id, range.id);
-        clearEvictionBusy(range.id, page_index);
+        if (reserved_new_slot) releaseEvictionSlot(backing, reservation_id, owner_id, region_id);
         page_state_summary.eviction_slot_failures +%= 1;
         recordPagerPageOutFailure(dirty);
         return .{ .outcome = .failed, .dirty = dirty };
     }
-
-    const page_ptr: [*]u8 = @ptrFromInt(virt);
-    const transfer_len: u32 = @intCast(prepared.transfer_bytes);
-    const io_status = r4sys_api.fileWriteAt(path, prepared.backing_offset, page_ptr, transfer_len);
-    const io_bytes: u32 = if (io_status > 0) @intCast(io_status) else 0;
-
+    owner_locks.virtual_memory.release(token);
+    const io_status = r4sys_api.fileWriteAt(&owned_path, prepared.backing_offset, page_ptr, @intCast(prepared.transfer_bytes));
+    token = owner_locks.virtual_memory.acquire();
     var complete_input = input;
     complete_input.io_status = io_status;
-    complete_input.io_bytes = io_bytes;
+    complete_input.io_bytes = if (io_status > 0) @intCast(io_status) else 0;
     const completed = backing_store.pageIoComplete(complete_input);
     if (completed.status != backing_store.page_io_status_page_out_ok) {
-        if (reserved_new_slot) releaseEvictionSlot(backing, reservation_id, owner_id, range.id);
-        markEvictionError(range.id, page_index);
+        if (reserved_new_slot) releaseEvictionSlot(backing, reservation_id, owner_id, region_id);
+        markEvictionError(region_id, page_index);
         page_state_summary.eviction_io_failures +%= 1;
         recordPagerPageOutFailure(dirty);
         return .{ .outcome = .failed, .dirty = dirty };
     }
-
-    const before_free = phys.stats().free_frames;
-    const applied = applyPageIoState(.{
-        .region_id = completed.region_id,
+    const returned = completePageWriteback(&writeback, .{
+        .region_id = region_id,
         .region_offset = completed.region_offset,
-        .page_count = completed.page_count,
+        .page_count = 1,
         .slot_reservation_id = completed.reservation_id,
         .slot_index = completed.slot_index,
         .slot_generation = completed.slot_generation,
-    }, true);
-    if (applied.status != page_state_status_ready) {
-        markEvictionError(range.id, page_index);
-        page_state_summary.eviction_failures +%= 1;
-        recordPagerPageOutFailure(dirty);
+    }) catch {
+        markEvictionError(region_id, page_index);
+        recordPagerPageOutFailure(true);
         return .{ .outcome = .failed, .dirty = dirty };
-    }
-    clearEvictionBusy(range.id, page_index);
-    const after_free = phys.stats().free_frames;
-    const returned_frames: u32 = if (after_free > before_free) @intCast(after_free - before_free) else 0;
-    if (returned_frames == 0) {
-        page_state_summary.eviction_failures +%= 1;
-        return .{ .outcome = .failed, .dirty = dirty };
-    }
-    page_state_summary.eviction_page_outs +%= 1;
-    return .{
-        .outcome = .returned,
-        .returned_frames = returned_frames,
-        .returned_bytes = @as(u64, returned_frames) * paging.PAGE_SIZE,
-        .page_outs = 1,
-        .dirty = dirty,
     };
+    page_state_summary.eviction_page_outs +%= 1;
+    return .{ .outcome = if (returned == 0) .skipped else .returned, .returned_frames = @intCast(returned), .returned_bytes = returned * paging.PAGE_SIZE, .page_outs = 1, .dirty = dirty };
 }
 
 fn evictCleanSlotBoundPage(range: *Range, page_index: u64, state: FaultPageState, backing: backing_store.Result) EvictionStep {
@@ -2239,6 +2383,7 @@ fn evictCleanSlotBoundPage(range: *Range, page_index: u64, state: FaultPageState
         .expected_generation = state.slot_generation,
         .vm_region_exists = true,
         .vm_region_is_r4x = true,
+        .commit_covered = commitSpanCoversForRange(range, range.base + page_index * paging.PAGE_SIZE, paging.PAGE_SIZE),
         .committed_bytes = range.committed_bytes,
         .resident_bytes = range.resident_bytes,
         .backing = backing,

@@ -12817,6 +12817,7 @@ fn vmErrorCode(err: mem_virt.Error) i32 {
         error.NotCommitted => VM_ERROR_NOT_COMMITTED,
         error.GuardRange => VM_ERROR_GUARD_RANGE,
         error.OutOfMemory => VM_ERROR_OUT_OF_MEMORY,
+        error.Busy => VM_ERROR_MAP_FAILED,
         error.MapFailed => VM_ERROR_MAP_FAILED,
         error.NotInitialized => VM_ERROR_INVALID_RANGE,
     };
