@@ -2,6 +2,7 @@ const r4x_api = @import("r4x_api.zig");
 const std = @import("std");
 const drive = @import("../fs/drive.zig");
 const vfs = @import("../fs/vfs.zig");
+const directory_changes = @import("../fs/directory_changes.zig");
 const page_cache = @import("../fs/page_cache.zig");
 const fs_request = @import("../fs/request.zig");
 const storage_access = @import("../storage/access_runtime.zig");
@@ -1282,6 +1283,7 @@ pub fn fileWriteAt(path_ptr: [*:0]const u8, offset: u64, data_ptr: [*]const u8, 
     if (!invalidateStreamSlotsForResolved(target.drive_ref.letter, targetOnBootVolume(target), parent, entry, baseName(target.path)))
         return -6;
     if (entry.isDir()) return -4;
+    defer vfs.notifyDirectoryChanged(volume, parent);
     const data = data_ptr[0..@intCast(len)];
     const written = vfs.writeFileRange(volume, entry, @intCast(offset), data) orelse return -6;
     ok = true;
@@ -1610,6 +1612,7 @@ pub fn fileStreamFinish(path_ptr: [*:0]const u8, expected_size: u64, flags: u32)
         } else {
             clearStreamSlot(slot);
         }
+        vfs.notifyDirectoryChanged(volume, parent);
         ok = true;
         return file_stream_result_ok;
     }
@@ -1722,6 +1725,32 @@ pub fn dirList(path_ptr: [*:0]const u8, out_ptr: [*]u8, max_len: u32) callconv(.
     const len = vfs.readDirectory(volume, cluster, out) orelse return -5;
     ok = true;
     return @intCast(len);
+}
+
+pub fn directoryChangeBegin(path_ptr: [*:0]const u8, cursor: *r4x_api.DirectoryChangeCursor) callconv(.c) i32 {
+    if (cursor.version != 1 or cursor.size != @sizeOf(r4x_api.DirectoryChangeCursor) or cursor.reserved != 0) return -1;
+    var path_buf: [max_api_path]u8 = undefined;
+    const raw_path = copyZ(path_ptr, &path_buf) orelse return -1;
+    var resolved_buf: [max_api_path]u8 = undefined;
+    const target = resolveTarget(raw_path, &resolved_buf) orelse return -1;
+    const volume = targetVolume(target) orelse return -3;
+    var req = fs_request.beginVolume(.dir_entry, target.drive_ref.letter, volume) orelse return -9;
+    var ok = false;
+    defer fs_request.finish(&req, ok);
+    var node: vfs.NodeRef = undefined;
+    switch (vfs.resolvePathStatus(volume, target.path, &node)) {
+        .found => {},
+        .not_found => return -3,
+        .io => return -9,
+    }
+    const mount = volume.accessReference() orelse return -3;
+    cursor.* = directory_changes.begin(mount, node);
+    ok = true;
+    return 0;
+}
+
+pub fn directoryChangePoll(cursor: *r4x_api.DirectoryChangeCursor) callconv(.c) i32 {
+    return directory_changes.poll(cursor);
 }
 
 pub fn dirEntry(path_ptr: [*:0]const u8, index: u32, out_ptr: [*]u8, max_len: u32) callconv(.c) i32 {

@@ -17,6 +17,7 @@ const ntfs_fs = @import("ntfs/ntfs.zig");
 const access = @import("../storage/access_runtime.zig");
 const locks = @import("../memory/owner_locks.zig");
 const drive = @import("drive.zig");
+const directory_changes = @import("directory_changes.zig");
 
 /// Windows-parity component limit (0.60.19): 255 characters, UTF-8 (BMP)
 /// worst case 765 bytes, buffered as 768.
@@ -231,6 +232,7 @@ pub fn volumeForDrive(letter: u8) ?Volume {
 // The storage transaction has already stopped admissions and drained I/O.
 // Generation invalidation and removal are one short metadata publication.
 pub fn unmount(ref: access.MountRef) bool {
+    defer @import("../kernel/desktop_events.zig").signal();
     const guard = locks.storage.acquire();
     defer locks.storage.release(guard);
     access.unbindMountLocked(ref) catch return false;
@@ -397,6 +399,13 @@ pub fn readFileRange(volume: Volume, entry: Entry, offset: usize, out: []u8) ?us
     };
 }
 
+// Advisory publication happens after the backend returns, including a
+// partially failed mutation. All consumers still re-enumerate under the
+// filesystem request gate; this does not promise an atomic disk snapshot.
+pub fn notifyDirectoryChanged(volume: Volume, parent: NodeRef) void {
+    if (volume.accessReference()) |mount| directory_changes.notify(mount, parent);
+}
+
 pub fn writeFileRange(volume: Volume, entry: Entry, offset: usize, data: []const u8) ?usize {
     return switch (volume) {
         .fat32 => |v| fat32.writeFileRange(v, entryToFat32(entry), offset, data),
@@ -405,6 +414,7 @@ pub fn writeFileRange(volume: Volume, entry: Entry, offset: usize, data: []const
 }
 
 pub fn writeFile(volume: Volume, parent: NodeRef, name: []const u8, data: []const u8) bool {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| fat32.writeFile(v, @intCast(parent), name, data),
         .ntfs => |v| ntfs_fs.writeFile(v, parent, name, data),
@@ -412,6 +422,7 @@ pub fn writeFile(volume: Volume, parent: NodeRef, name: []const u8, data: []cons
 }
 
 pub fn appendFile(volume: Volume, parent: NodeRef, name: []const u8, data: []const u8) bool {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| fat32.appendFile(v, @intCast(parent), name, data),
         .ntfs => |v| appendStatusFromNtfs(ntfs_fs.appendFileAtOffset(v, parent, name, ntfsCurrentSize(v, parent, name), data)) == .ok,
@@ -419,6 +430,7 @@ pub fn appendFile(volume: Volume, parent: NodeRef, name: []const u8, data: []con
 }
 
 pub fn appendFileAtOffsetStatus(volume: Volume, parent: NodeRef, name: []const u8, expected_size: u64, data: []const u8) AppendStatus {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| appendStatusFromFat32(fat32.appendFileAtOffsetStatus(v, @intCast(parent), name, @intCast(expected_size), data)),
         .ntfs => |v| appendStatusFromNtfs(ntfs_fs.appendFileAtOffset(v, parent, name, expected_size, data)),
@@ -426,6 +438,7 @@ pub fn appendFileAtOffsetStatus(volume: Volume, parent: NodeRef, name: []const u
 }
 
 pub fn appendFileAtOffsetStatusDeferred(volume: Volume, parent: NodeRef, name: []const u8, expected_size: u64, data: []const u8) AppendStatus {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| appendStatusFromFat32(fat32.appendFileAtOffsetStatusDeferred(v, @intCast(parent), name, @intCast(expected_size), data)),
         .ntfs => |v| appendStatusFromNtfs(ntfs_fs.appendFileAtOffsetDeferred(v, parent, name, expected_size, data)),
@@ -438,6 +451,7 @@ fn ntfsCurrentSize(v: ntfs_fs.Volume, parent: NodeRef, name: []const u8) u64 {
 }
 
 pub fn copyFile(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent: NodeRef, dst_name: []const u8) bool {
+    defer notifyDirectoryChanged(dst_volume, dst_parent);
     return switch (src_volume) {
         .fat32 => |sv| switch (dst_volume) {
             .fat32 => |dv| fat32.copyFile(sv, dv, entryToFat32(src_entry), @intCast(dst_parent), dst_name),
@@ -448,6 +462,7 @@ pub fn copyFile(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_pa
 }
 
 pub fn copyFileNoReplace(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent: NodeRef, dst_name: []const u8) bool {
+    defer notifyDirectoryChanged(dst_volume, dst_parent);
     return switch (src_volume) {
         .fat32 => |sv| switch (dst_volume) {
             .fat32 => |dv| fat32.copyFileNoReplace(sv, dv, entryToFat32(src_entry), @intCast(dst_parent), dst_name),
@@ -489,6 +504,7 @@ fn copyFileGeneric(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst
 }
 
 pub fn makeDirectory(volume: Volume, parent: NodeRef, name: []const u8) bool {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| fat32.makeDirectory(v, @intCast(parent), name),
         .ntfs => |v| ntfs_fs.makeDirectory(v, parent, name),
@@ -496,6 +512,7 @@ pub fn makeDirectory(volume: Volume, parent: NodeRef, name: []const u8) bool {
 }
 
 pub fn deleteFile(volume: Volume, parent: NodeRef, name: []const u8) bool {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| fat32.deleteFile(v, @intCast(parent), name),
         .ntfs => |v| ntfs_fs.deleteFile(v, parent, name),
@@ -510,6 +527,7 @@ pub fn deleteFileIfIdentity(
     name: []const u8,
     expected: Entry,
 ) DeleteIfMatchResult {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| switch (fat32.deleteFileIfIdentity(
             v,
@@ -553,6 +571,7 @@ pub fn deleteRecoveryEntryIfIdentity(
     name: []const u8,
     expected: Entry,
 ) RecoveryDeleteResult {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| switch (fat32.deleteFileIfIdentity(
             v,
@@ -599,6 +618,7 @@ pub fn namesEqualCollated(volume: Volume, a: []const u8, b: []const u8) ?bool {
 }
 
 pub fn removeDirectory(volume: Volume, parent: NodeRef, name: []const u8) bool {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| fat32.removeDirectory(v, @intCast(parent), name),
         .ntfs => |v| ntfs_fs.removeDirectory(v, parent, name),
@@ -610,6 +630,7 @@ pub fn renameEntry(volume: Volume, parent: NodeRef, old_name: []const u8, new_na
 }
 
 pub fn renameEntryStatus(volume: Volume, parent: NodeRef, old_name: []const u8, new_name: []const u8) RenameStatus {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| renameStatusFromFat32(fat32.renameEntryStatus(v, @intCast(parent), old_name, new_name)),
         .ntfs => |v| renameStatusFromNtfs(ntfs_fs.renameEntryStatus(v, parent, old_name, new_name)),
@@ -624,6 +645,7 @@ pub fn replaceFileAtomic(
     backup_name: []const u8,
     consume_stage: bool,
 ) AtomicReplaceResult {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| replaceResultFromFat32(fat32.replaceFileAtomic(v, @intCast(parent), target_name, staged_name, backup_name, consume_stage)),
         .ntfs => |v| replaceResultFromNtfs(ntfs_fs.replaceFileAtomic(v, parent, target_name, staged_name, backup_name, consume_stage)),
@@ -640,6 +662,7 @@ pub fn replaceFileAtomicCreateOnly(
     staged_name: []const u8,
     backup_name: []const u8,
 ) AtomicReplaceResult {
+    defer notifyDirectoryChanged(volume, parent);
     return switch (volume) {
         .fat32 => |v| replaceResultFromFat32(fat32.replaceFileAtomicCreateOnly(
             v,
