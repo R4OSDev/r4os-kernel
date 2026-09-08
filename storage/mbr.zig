@@ -371,9 +371,32 @@ fn mountPartition(
     type_name: []const u8,
     report: *ScanReport,
 ) void {
+    const device = block.get(device_index) orelse {
+        report.note(.device_missing, "partition-device");
+        return;
+    };
+    // A table entry is a bounded partition, never an implicit whole-device
+    // filesystem. Validate the range before even probing its first sector.
+    if (device.sector_size != SECTOR_SIZE or first_lba == 0 or sector_count == 0 or
+        first_lba >= device.sector_count or sector_count > device.sector_count - first_lba)
+    {
+        report.note(.partition_invalid, "partition-range");
+        return;
+    }
     if (first_lba > std.math.maxInt(u32)) {
         k.puts("      partition starts beyond current filesystem LBA limit; not mounted\r\n");
         report.note(.partition_lba_unsupported, "first-lba-u32");
+        return;
+    }
+    if (sector_count > std.math.maxInt(u64) / SECTOR_SIZE) {
+        k.puts("      partition byte size overflow; not mounted\r\n");
+        report.note(.partition_size_unsupported, "byte-overflow");
+        return;
+    }
+    const byte_count = sector_count * SECTOR_SIZE;
+    if (byte_count > std.math.maxInt(usize)) {
+        k.puts("      partition exceeds addressable drive size; not mounted\r\n");
+        report.note(.partition_size_unsupported, "address-space");
         return;
     }
     const first_lba32: u32 = @intCast(first_lba);
@@ -383,14 +406,14 @@ fn mountPartition(
         requested_hint;
 
     const volume: vfs.Volume = switch (hint) {
-        .fat32 => if (fat32.inspect(device_index, first_lba32)) |found|
+        .fat32 => if (fat32.inspectBounded(device_index, first_lba32, sector_count)) |found|
             .{ .fat32 = found }
         else {
             k.puts("      FAT32: not mounted (invalid BPB or unsupported layout)\r\n");
             report.note(.fat32_invalid, "fat32-inspect");
             return;
         },
-        .ntfs => if (ntfs_fs.inspect(device_index, first_lba32)) |found|
+        .ntfs => if (ntfs_fs.inspectBounded(device_index, first_lba32, sector_count)) |found|
             .{ .ntfs = found }
         else {
             k.puts("      NTFS: not mounted (invalid boot sector or unsupported layout)\r\n");
@@ -443,17 +466,6 @@ fn mountPartition(
         return;
     }
 
-    if (sector_count > std.math.maxInt(u64) / SECTOR_SIZE) {
-        k.puts("      partition byte size overflow; not mounted\r\n");
-        report.note(.partition_size_unsupported, "byte-overflow");
-        return;
-    }
-    const byte_count = sector_count * SECTOR_SIZE;
-    if (byte_count > std.math.maxInt(usize)) {
-        k.puts("      partition exceeds addressable drive size; not mounted\r\n");
-        report.note(.partition_size_unsupported, "address-space");
-        return;
-    }
     const kind: drive.Kind = switch (volume) {
         .fat32 => .fat32,
         .ntfs => .ntfs,

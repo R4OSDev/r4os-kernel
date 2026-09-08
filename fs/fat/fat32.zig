@@ -444,6 +444,14 @@ pub fn inspect(device_index: usize, first_lba: u32) ?Volume {
     return volume;
 }
 
+pub fn inspectBounded(device_index: usize, first_lba: u32, partition_sectors: u64) ?Volume {
+    const volume = parseBounded(device_index, first_lba, partition_sectors) orelse return null;
+    printInfo(volume);
+    return volume;
+}
+
+/// Explicit device-remainder probe; partition-table callers use parseBounded
+/// or inspectBounded with the actual partition length.
 pub fn parse(device_index: usize, first_lba: u32) ?Volume {
     const device = block.get(device_index) orelse return null;
     if (first_lba >= device.sector_count) return null;
