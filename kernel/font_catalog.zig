@@ -21,6 +21,12 @@ var file_buffer: [MAX_R4F_FILE_BYTES]u8 = undefined;
 
 pub fn reloadInstalled() ReloadResult {
     var result = ReloadResult{};
+    var replacement = font.beginCatalogReplacement(false) orelse {
+        result.unavailable = true;
+        return result;
+    };
+    defer replacement.abort();
+    const candidate = replacement.state();
     const volume = vfs.volumeForDrive('C') orelse {
         result.unavailable = true;
         return result;
@@ -37,7 +43,6 @@ pub fn reloadInstalled() ReloadResult {
         return result;
     };
 
-    font.resetCatalog();
     var index: usize = 0;
     var name_buffer: [vfs.NAME_MAX]u8 = .{0} ** vfs.NAME_MAX;
     while (true) : (index += 1) {
@@ -45,9 +50,17 @@ pub fn reloadInstalled() ReloadResult {
             result.unavailable = true;
             break;
         };
-        const maybe_entry = vfs.readDirectoryEntry(volume, dir, index, name_buffer[0..]);
-        fs_request.finish(&entry_request, maybe_entry != null);
-        const entry = maybe_entry orelse break;
+        var entry: vfs.Entry = undefined;
+        const status = vfs.readDirectoryEntryStatus(volume, dir, index, name_buffer[0..], &entry);
+        fs_request.finish(&entry_request, status != .io);
+        switch (status) {
+            .found => {},
+            .not_found => break,
+            .io => {
+                result.unavailable = true;
+                break;
+            },
+        }
         const name = zName(name_buffer[0..]);
         if (entry.isDir() or !hasR4fExtension(name)) continue;
         result.scanned += 1;
@@ -65,8 +78,8 @@ pub fn reloadInstalled() ReloadResult {
         const read_ok = got != null and got.? == want;
         fs_request.finish(&read_request, read_ok);
         if (!read_ok) {
-            result.rejected += 1;
-            continue;
+            result.unavailable = true;
+            break;
         }
 
         var path_buffer: [font.MAX_FONT_PATH]u8 = .{0} ** font.MAX_FONT_PATH;
@@ -74,12 +87,17 @@ pub fn reloadInstalled() ReloadResult {
             result.rejected += 1;
             continue;
         };
-        if (font.registerR4F(path, file_buffer[0..want])) {
+        if (candidate.catalogCount() == font.MAX_CATALOG_FONTS) {
+            result.unavailable = true;
+            break;
+        }
+        if (candidate.registerR4F(path, file_buffer[0..want])) {
             result.registered += 1;
         } else {
             result.rejected += 1;
         }
     }
+    if (!result.unavailable) replacement.commit();
     return result;
 }
 

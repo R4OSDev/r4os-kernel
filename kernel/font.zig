@@ -162,16 +162,703 @@ const CachedFont = struct {
     index: GlyphIndex = .{},
 };
 
-var catalog: [MAX_CATALOG_FONTS]CatalogEntry = .{CatalogEntry{}} ** MAX_CATALOG_FONTS;
-var catalog_entries: usize = 0;
-var cached_fonts: [MAX_CATALOG_FONTS]CachedFont = .{CachedFont{}} ** MAX_CATALOG_FONTS;
-var temp_cached_font: CachedFont = .{};
-var active: ?ActiveFont = null;
-var active_font_id: u32 = BUILTIN_FONT_ID;
-var active_glyphs: [MAX_GLYPHS][MAX_GLYPH_H][MAX_BYTES_PER_ROW]u8 = .{.{.{0} ** MAX_BYTES_PER_ROW} ** MAX_GLYPH_H} ** MAX_GLYPHS;
-var active_glyph_widths: [MAX_GLYPHS]u8 = .{GLYPH_W} ** MAX_GLYPHS;
-var active_glyph_advances: [MAX_GLYPHS]u8 = .{GLYPH_W} ** MAX_GLYPHS;
-var active_index: GlyphIndex = .{};
+pub const CatalogState = struct {
+    revision: u32 = 1,
+    catalog: [MAX_CATALOG_FONTS]CatalogEntry = .{CatalogEntry{}} ** MAX_CATALOG_FONTS,
+    catalog_entries: usize = 0,
+    cached_fonts: []CachedFont = &.{},
+    temp_cached_font: CachedFont = .{},
+    active: ?ActiveFont = null,
+    active_font_id: u32 = BUILTIN_FONT_ID,
+    active_glyphs: [MAX_GLYPHS][MAX_GLYPH_H][MAX_BYTES_PER_ROW]u8 = .{.{.{0} ** MAX_BYTES_PER_ROW} ** MAX_GLYPH_H} ** MAX_GLYPHS,
+    active_glyph_widths: [MAX_GLYPHS]u8 = .{GLYPH_W} ** MAX_GLYPHS,
+    active_glyph_advances: [MAX_GLYPHS]u8 = .{GLYPH_W} ** MAX_GLYPHS,
+    active_index: GlyphIndex = .{},
+
+    pub fn reset(self: *CatalogState) void {
+        self.active = null;
+        self.active_font_id = BUILTIN_FONT_ID;
+    }
+
+    pub fn resetCatalog(self: *CatalogState) void {
+        self.catalog = .{CatalogEntry{}} ** MAX_CATALOG_FONTS;
+        self.catalog_entries = 0;
+        self.active = null;
+        self.active_font_id = BUILTIN_FONT_ID;
+    }
+
+    pub fn glyphWidth(self: *const CatalogState) u32 {
+        if (self.active) |f| return f.max_advance;
+        return GLYPH_W;
+    }
+
+    pub fn glyphHeight(self: *const CatalogState) u32 {
+        if (self.active) |f| return f.line_height;
+        return GLYPH_H;
+    }
+
+    pub fn baseline(self: *const CatalogState) i16 {
+        if (self.active) |f| return f.baseline;
+        return GLYPH_H - 1;
+    }
+
+    pub fn catalogCount(self: *const CatalogState) usize {
+        return self.catalog_entries;
+    }
+
+    pub fn catalogEntry(self: *const CatalogState, index: usize) ?CatalogEntry {
+        if (index >= self.catalog_entries) return null;
+        return self.catalog[index];
+    }
+
+    pub fn fontCount(self: *const CatalogState) usize {
+        return 1 + self.catalog_entries;
+    }
+
+    pub fn fontIdForCatalogIndex(self: *const CatalogState, index: usize) u32 {
+        if (index >= self.catalog_entries) return BUILTIN_FONT_ID;
+        return @intCast(index + 1);
+    }
+
+    pub fn currentFontId(self: *const CatalogState) u32 {
+        if (self.isRenderableFontId(self.active_font_id)) return self.active_font_id;
+        return BUILTIN_FONT_ID;
+    }
+
+    pub fn isRenderableFontId(self: *const CatalogState, font_id: u32) bool {
+        if (font_id == BUILTIN_FONT_ID) return true;
+        const index = self.catalogIndexForFontId(font_id) orelse return false;
+        return self.catalog[index].renderable and self.cached_fonts[index].used;
+    }
+
+    pub fn normalizeFontId(self: *const CatalogState, font_id: u32) u32 {
+        return if (self.isRenderableFontId(font_id)) font_id else BUILTIN_FONT_ID;
+    }
+
+    pub fn catalogEntryForFontId(self: *const CatalogState, font_id: u32) ?CatalogEntry {
+        const index = self.catalogIndexForFontId(font_id) orelse return null;
+        return self.catalog[index];
+    }
+
+    pub fn glyphRow(self: *const CatalogState, c: u8, row: u32) u8 {
+        if (self.active) |f| {
+            if (row >= f.height) return 0;
+            if (self.activeGlyphId(c)) |glyph_id| {
+                return self.active_glyphs[glyph_id][row][0];
+            }
+        }
+        if (row >= GLYPH_H) return 0;
+        return glyph(c)[row];
+    }
+
+    pub fn glyphPixel(self: *const CatalogState, c: u8, row: u32, col: u32) bool {
+        if (self.active) |f| {
+            if (row >= f.height or col >= MAX_GLYPH_W) return false;
+            if (self.activeGlyphId(c)) |glyph_id| {
+                if (col >= self.active_glyph_widths[glyph_id]) return false;
+                const byte_index: usize = @intCast(col / 8);
+                if (byte_index >= f.bytes_per_row or byte_index >= MAX_BYTES_PER_ROW) return false;
+                const shift: u3 = @intCast(7 - (col & 7));
+                return ((self.active_glyphs[glyph_id][row][byte_index] >> shift) & 1) == 1;
+            }
+        }
+        if (row >= GLYPH_H or col >= GLYPH_W) return false;
+        const shift: u3 = @intCast(GLYPH_W - 1 - col);
+        return ((glyph(c)[row] >> shift) & 1) == 1;
+    }
+
+    pub fn glyphBitmapWidth(self: *const CatalogState, c: u8) u32 {
+        if (self.active != null) {
+            if (self.activeGlyphId(c)) |glyph_id| return self.active_glyph_widths[glyph_id];
+        }
+        return GLYPH_W;
+    }
+
+    pub fn glyphAdvance(self: *const CatalogState, c: u8) u32 {
+        if (self.active != null) {
+            if (self.activeGlyphId(c)) |glyph_id| return self.active_glyph_advances[glyph_id];
+        }
+        return GLYPH_W;
+    }
+
+    pub fn glyphHeightForFont(self: *const CatalogState, font_id: u32) u32 {
+        if (self.cachedFont(font_id)) |f| return f.line_height;
+        return GLYPH_H;
+    }
+
+    pub fn glyphAdvanceForFont(self: *const CatalogState, font_id: u32, codepoint: u32) u32 {
+        if (self.cachedFont(font_id)) |f| {
+            if (cachedGlyphId(f, codepoint)) |glyph_id| return f.advances[glyph_id];
+        }
+        return GLYPH_W;
+    }
+
+    pub fn glyphBitmapWidthForFont(self: *const CatalogState, font_id: u32, codepoint: u32) u32 {
+        if (self.cachedFont(font_id)) |f| {
+            if (cachedGlyphId(f, codepoint)) |glyph_id| return f.widths[glyph_id];
+        }
+        return GLYPH_W;
+    }
+
+    pub fn glyphPixelForFont(self: *const CatalogState, font_id: u32, codepoint: u32, row: u32, col: u32) bool {
+        if (self.cachedFont(font_id)) |f| {
+            if (row >= f.height or col >= MAX_GLYPH_W) return false;
+            if (cachedGlyphId(f, codepoint)) |glyph_id| {
+                if (col >= f.widths[glyph_id]) return false;
+                const byte_index: usize = @intCast(col / 8);
+                if (byte_index >= f.bytes_per_row or byte_index >= MAX_BYTES_PER_ROW) return false;
+                const shift: u3 = @intCast(7 - (col & 7));
+                return ((f.glyphs[glyph_id][row][byte_index] >> shift) & 1) == 1;
+            }
+        }
+        if (row >= GLYPH_H or col >= GLYPH_W) return false;
+        const shift: u3 = @intCast(GLYPH_W - 1 - col);
+        return ((builtinGlyphForCodepoint(codepoint)[row] >> shift) & 1) == 1;
+    }
+
+    pub fn glyphRowMaskForFont(self: *const CatalogState, font_id: u32, codepoint: u32, row: u32) u64 {
+        if (self.cachedFont(font_id)) |f| {
+            if (row >= f.height) return 0;
+            if (cachedGlyphId(f, codepoint)) |glyph_id| return cachedGlyphRowMask(f, glyph_id, row);
+        }
+        return builtinGlyphRowMask(codepoint, row);
+    }
+
+    pub fn glyphBitmapForFont(self: *const CatalogState, font_id: u32, codepoint: u32) GlyphBitmap {
+        if (self.cachedFont(font_id)) |f| {
+            var result = GlyphBitmap{
+                .height = f.height,
+                .line_height = f.line_height,
+                .baseline = f.baseline,
+            };
+            if (cachedGlyphId(f, codepoint)) |glyph_id| {
+                result.width = f.widths[glyph_id];
+                result.advance = f.advances[glyph_id];
+                var row: u32 = 0;
+                while (row < f.height) : (row += 1) result.rows[row] = cachedGlyphRowMask(f, glyph_id, row);
+                return result;
+            }
+            result.fallback = true;
+            var row: u32 = 0;
+            while (row < @min(@as(u32, f.height), @as(u32, GLYPH_H))) : (row += 1) {
+                result.rows[row] = builtinGlyphRowMask(codepoint, row);
+            }
+            return result;
+        }
+
+        var result = GlyphBitmap{};
+        var row: u32 = 0;
+        while (row < GLYPH_H) : (row += 1) result.rows[row] = builtinGlyphRowMask(codepoint, row);
+        return result;
+    }
+
+    pub fn measure(self: *const CatalogState, text: []const u8) TextMetrics {
+        return self.measureWithFont(self.currentFontId(), text);
+    }
+
+    pub fn measureZ(self: *const CatalogState, text_ptr: [*:0]const u8, max_bytes: usize) TextMetrics {
+        var len: usize = 0;
+        while (len < max_bytes and text_ptr[len] != 0) : (len += 1) {}
+        return self.measure(text_ptr[0..len]);
+    }
+
+    pub fn measureWithFont(self: *const CatalogState, font_id: u32, text: []const u8) TextMetrics {
+        var line_w: u32 = 0;
+        var max_w: u32 = 0;
+        var lines: u32 = 1;
+        var visible: usize = 0;
+        const safe_font_id = self.normalizeFontId(font_id);
+        var cursor: usize = 0;
+        while (cursor < text.len) {
+            const decoded = decodeUtf8Scalar(text, cursor);
+            cursor += decoded.consumed;
+            if (decoded.codepoint == '\r') continue;
+            if (decoded.codepoint == '\n') {
+                if (line_w > max_w) max_w = line_w;
+                line_w = 0;
+                lines += 1;
+                visible += decoded.consumed;
+                continue;
+            }
+            line_w += self.glyphAdvanceForFont(safe_font_id, decoded.codepoint);
+            visible += decoded.consumed;
+        }
+        if (line_w > max_w) max_w = line_w;
+        const lh = self.glyphHeightForFont(safe_font_id);
+        return .{
+            .width = max_w,
+            .height = lines * lh,
+            .baseline = self.baselineForFont(safe_font_id),
+            .line_height = lh,
+            .visible_bytes = visible,
+        };
+    }
+
+    pub fn measureZWithFont(self: *const CatalogState, font_id: u32, text_ptr: [*:0]const u8, max_bytes: usize) TextMetrics {
+        var len: usize = 0;
+        while (len < max_bytes and text_ptr[len] != 0) : (len += 1) {}
+        return self.measureWithFont(font_id, text_ptr[0..len]);
+    }
+
+    pub fn baselineForFont(self: *const CatalogState, font_id: u32) i16 {
+        if (self.cachedFont(font_id)) |f| return f.baseline;
+        return GLYPH_H - 1;
+    }
+
+    pub fn maxAdvanceForFont(self: *const CatalogState, font_id: u32) u32 {
+        if (self.cachedFont(font_id)) |f| return f.max_advance;
+        return GLYPH_W;
+    }
+
+    pub fn loadR4F(self: *CatalogState, bytes: []const u8) bool {
+        return self.loadR4FNamed("", bytes);
+    }
+
+    pub fn loadR4FNamed(self: *CatalogState, path: []const u8, bytes: []const u8) bool {
+        const parsed = parseR4F(bytes) orelse return false;
+        if (!parsed.renderable) return false;
+
+        if (!fillCachedFont(parsed, &self.temp_cached_font)) return false;
+        self.activateFont(&self.temp_cached_font, parsed.family, parsed.face, path);
+        self.markSelected(path);
+        self.active_font_id = self.fontIdForPath(path) orelse BUILTIN_FONT_ID;
+        return true;
+    }
+
+    pub fn registerR4F(self: *CatalogState, path: []const u8, bytes: []const u8) bool {
+        const parsed_opt = parseR4F(bytes);
+        var entry = CatalogEntry{};
+        copyField(entry.path[0..], &entry.path_len, path);
+        if (parsed_opt) |parsed| {
+            entry.used = true;
+            entry.kind = parsed.kind;
+            entry.weight = parsed.weight;
+            entry.style_flags = parsed.style_flags;
+            entry.charset_flags = parsed.charset_flags;
+            entry.face_count = parsed.face_count;
+            entry.strike_count = parsed.strike_count;
+            entry.glyph_count = parsed.glyph_count;
+            entry.renderable = parsed.renderable;
+            entry.width = parsed.width;
+            entry.height = parsed.height;
+            entry.max_advance = parsed.max_advance;
+            entry.ascent = parsed.ascent;
+            entry.descent = parsed.descent;
+            entry.line_height = parsed.line_height;
+            entry.baseline = parsed.baseline;
+            copyField(entry.family[0..], &entry.family_len, parsed.family);
+            copyField(entry.face[0..], &entry.face_len, parsed.face);
+            copyField(entry.style[0..], &entry.style_len, parsed.style);
+            copyField(entry.status[0..], &entry.status_len, parsed.reason);
+        } else {
+            entry.used = true;
+            entry.kind = .unknown;
+            entry.renderable = false;
+            copyField(entry.family[0..], &entry.family_len, "Invalid");
+            copyField(entry.face[0..], &entry.face_len, "Invalid R4F");
+            copyField(entry.style[0..], &entry.style_len, "Error");
+            copyField(entry.status[0..], &entry.status_len, "invalid R4F1");
+        }
+        const slot = self.addCatalogEntry(entry) orelse return false;
+        self.cached_fonts[slot].used = false;
+        if (parsed_opt) |parsed| {
+            if (parsed.renderable) {
+                if (!fillCachedFont(parsed, &self.cached_fonts[slot])) {
+                    self.cached_fonts[slot] = .{};
+                    self.catalog[slot].renderable = false;
+                    copyField(self.catalog[slot].status[0..], &self.catalog[slot].status_len, "cache failed");
+                }
+            }
+        }
+        return self.catalog[slot].renderable;
+    }
+
+    fn activateFont(self: *CatalogState, cached: *const CachedFont, family: []const u8, face: []const u8, path: []const u8) void {
+        self.active_glyphs = cached.glyphs;
+        self.active_glyph_widths = cached.widths;
+        self.active_glyph_advances = cached.advances;
+        self.active_index = cached.index;
+        var next_active = ActiveFont{
+            .width = cached.width,
+            .height = cached.height,
+            .bytes_per_row = cached.bytes_per_row,
+            .max_advance = cached.max_advance,
+            .ascent = cached.ascent,
+            .descent = cached.descent,
+            .line_height = cached.line_height,
+            .baseline = cached.baseline,
+        };
+        copyField(next_active.family[0..], &next_active.family_len, family);
+        copyField(next_active.face[0..], &next_active.face_len, face);
+        copyField(next_active.path[0..], &next_active.path_len, path);
+        self.active = next_active;
+    }
+
+    fn addCatalogEntry(self: *CatalogState, entry: CatalogEntry) ?usize {
+        if (self.catalog_entries >= self.catalog.len) return null;
+        const slot = self.catalog_entries;
+        self.catalog[self.catalog_entries] = entry;
+        self.catalog_entries += 1;
+        return slot;
+    }
+
+    fn markSelected(self: *CatalogState, path: []const u8) void {
+        var i: usize = 0;
+        while (i < self.catalog_entries) : (i += 1) {
+            self.catalog[i].selected = path.len != 0 and pathEquals(self.catalog[i].path[0..self.catalog[i].path_len], path);
+        }
+    }
+
+    fn fontIdForPath(self: *const CatalogState, path: []const u8) ?u32 {
+        if (path.len == 0) return null;
+        var i: usize = 0;
+        while (i < self.catalog_entries) : (i += 1) {
+            if (pathEquals(self.catalog[i].path[0..self.catalog[i].path_len], path)) return self.fontIdForCatalogIndex(i);
+        }
+        return null;
+    }
+
+    fn catalogIndexForFontId(self: *const CatalogState, font_id: u32) ?usize {
+        if (font_id == BUILTIN_FONT_ID) return null;
+        const raw = font_id - 1;
+        if (raw >= self.catalog_entries) return null;
+        return @intCast(raw);
+    }
+
+    fn cachedFont(self: *const CatalogState, font_id: u32) ?*const CachedFont {
+        const index = self.catalogIndexForFontId(font_id) orelse return null;
+        if (!self.cached_fonts[index].used) return null;
+        return &self.cached_fonts[index];
+    }
+
+    fn activeGlyphId(self: *const CatalogState, codepoint: u32) ?usize {
+        return indexedGlyphId(&self.active_index, codepoint, null);
+    }
+};
+
+// Two resident banks bound both preparation and retirement. Readers retain the
+// selected immutable bank; a replacement never overwrites a retained bank.
+// The writer flag reserves storage across filesystem waits, it is not a spin
+// lock. A competing reload or retained retired bank returns unavailable.
+const lifetime = if (@import("builtin").os.tag == .freestanding) @import("../sched/task_context.zig") else struct {
+    pub const UnwindToken = struct {
+        pub fn admitted(_: @This()) bool {
+            return true;
+        }
+    };
+    pub fn enterUnwind() UnwindToken {
+        return .{};
+    }
+    pub fn leaveUnwind(_: UnwindToken) bool {
+        return true;
+    }
+};
+const empty_catalog: CatalogState = .{};
+var catalog_banks: [2]CatalogState = .{ .{}, .{} };
+// Unpublished glyph payload needs no initialized on-disk kernel data. Every
+// registered slot sets used=false before a complete decode can publish it.
+var catalog_payloads: [2][MAX_CATALOG_FONTS]CachedFont = undefined;
+pub const catalog_bank_bytes = @sizeOf(CatalogState) + @sizeOf([MAX_CATALOG_FONTS]CachedFont);
+var current_bank: u8 = 0;
+var catalog_readers: [2]u32 = .{ 0, 0 };
+var catalog_writer: u8 = 0;
+
+pub const CatalogView = struct {
+    bank: ?u8 = null,
+    unwind: lifetime.UnwindToken = .{},
+
+    pub fn state(self: *const CatalogView) *const CatalogState {
+        return if (self.bank) |bank| &catalog_banks[bank] else &empty_catalog;
+    }
+    pub fn release(self: *CatalogView) void {
+        if (self.bank) |bank| {
+            _ = @atomicRmw(u32, &catalog_readers[bank], .Sub, 1, .release);
+            _ = lifetime.leaveUnwind(self.unwind);
+            self.bank = null;
+        }
+    }
+};
+
+pub fn acquireCatalog() CatalogView {
+    const unwind = lifetime.enterUnwind();
+    if (!unwind.admitted()) return .{};
+    while (true) {
+        const bank = @atomicLoad(u8, &current_bank, .acquire);
+        _ = @atomicRmw(u32, &catalog_readers[bank], .Add, 1, .seq_cst);
+        // A reader which raced publication must not access that retired bank.
+        // The second read pairs with the writer's retirement check; a late
+        // registration can inspect bytes only after a matching publication.
+        if (@atomicLoad(u8, &current_bank, .seq_cst) == bank) return .{ .bank = bank, .unwind = unwind };
+        _ = @atomicRmw(u32, &catalog_readers[bank], .Sub, 1, .release);
+    }
+}
+
+pub const CatalogReplacement = struct {
+    bank: u8,
+    unwind: lifetime.UnwindToken,
+    owned: bool = true,
+
+    pub fn state(self: *CatalogReplacement) *CatalogState {
+        @import("std").debug.assert(self.owned);
+        return &catalog_banks[self.bank];
+    }
+    pub fn commit(self: *CatalogReplacement) void {
+        if (!self.owned) return;
+        const old = @atomicLoad(u8, &current_bank, .acquire);
+        var revision = catalog_banks[old].revision +% 1;
+        if (revision == 0) revision = 1;
+        self.state().revision = revision;
+        @atomicStore(u8, &current_bank, self.bank, .seq_cst);
+        self.abort();
+    }
+    pub fn abort(self: *CatalogReplacement) void {
+        if (!self.owned) return;
+        self.owned = false;
+        @atomicStore(u8, &catalog_writer, 0, .release);
+        _ = lifetime.leaveUnwind(self.unwind);
+    }
+};
+
+pub fn beginCatalogReplacement(preserve: bool) ?CatalogReplacement {
+    const unwind = lifetime.enterUnwind();
+    if (!unwind.admitted()) return null;
+    if (@cmpxchgStrong(u8, &catalog_writer, 0, 1, .acquire, .monotonic) != null) {
+        _ = lifetime.leaveUnwind(unwind);
+        return null;
+    }
+    const old = @atomicLoad(u8, &current_bank, .acquire);
+    const next = old ^ 1;
+    if (@atomicLoad(u32, &catalog_readers[next], .seq_cst) != 0) {
+        @atomicStore(u8, &catalog_writer, 0, .release);
+        _ = lifetime.leaveUnwind(unwind);
+        return null;
+    }
+    // Copy directly between resident banks/constant data, never through a
+    // multi-megabyte stack temporary. No published payload is mutated.
+    const source = if (preserve) &catalog_banks[old] else &empty_catalog;
+    @memcpy(@as([*]u8, @ptrCast(&catalog_banks[next]))[0..@sizeOf(CatalogState)], @as([*]const u8, @ptrCast(source))[0..@sizeOf(CatalogState)]);
+    catalog_banks[next].cached_fonts = &catalog_payloads[next];
+    if (preserve and source.catalog_entries != 0) {
+        const bytes = source.catalog_entries * @sizeOf(CachedFont);
+        @memcpy(@as([*]u8, @ptrCast(catalog_payloads[next][0..].ptr))[0..bytes], @as([*]const u8, @ptrCast(source.cached_fonts.ptr))[0..bytes]);
+    }
+    return .{ .bank = next, .unwind = unwind };
+}
+
+pub fn catalogRevision() u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().revision;
+}
+
+pub fn reset() void {
+    var transaction = beginCatalogReplacement(true) orelse {
+        return;
+    };
+    defer transaction.abort();
+    transaction.state().reset();
+    transaction.commit();
+}
+
+pub fn resetCatalog() void {
+    var transaction = beginCatalogReplacement(false) orelse {
+        return;
+    };
+    defer transaction.abort();
+    transaction.commit();
+}
+
+pub fn glyphWidth() u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphWidth();
+}
+
+pub fn glyphHeight() u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphHeight();
+}
+
+pub fn baseline() i16 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().baseline();
+}
+
+pub fn catalogCount() usize {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().catalogCount();
+}
+
+pub fn catalogEntry(index: usize) ?CatalogEntry {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().catalogEntry(index);
+}
+
+pub fn fontCount() usize {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().fontCount();
+}
+
+pub fn fontIdForCatalogIndex(index: usize) u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().fontIdForCatalogIndex(index);
+}
+
+pub fn currentFontId() u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().currentFontId();
+}
+
+pub fn isRenderableFontId(font_id: u32) bool {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().isRenderableFontId(font_id);
+}
+
+pub fn normalizeFontId(font_id: u32) u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().normalizeFontId(font_id);
+}
+
+pub fn catalogEntryForFontId(font_id: u32) ?CatalogEntry {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().catalogEntryForFontId(font_id);
+}
+
+pub fn glyphRow(c: u8, row: u32) u8 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphRow(c, row);
+}
+
+pub fn glyphPixel(c: u8, row: u32, col: u32) bool {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphPixel(c, row, col);
+}
+
+pub fn glyphBitmapWidth(c: u8) u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphBitmapWidth(c);
+}
+
+pub fn glyphAdvance(c: u8) u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphAdvance(c);
+}
+
+pub fn glyphHeightForFont(font_id: u32) u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphHeightForFont(font_id);
+}
+
+pub fn glyphAdvanceForFont(font_id: u32, codepoint: u32) u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphAdvanceForFont(font_id, codepoint);
+}
+
+pub fn glyphBitmapWidthForFont(font_id: u32, codepoint: u32) u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphBitmapWidthForFont(font_id, codepoint);
+}
+
+pub fn glyphPixelForFont(font_id: u32, codepoint: u32, row: u32, col: u32) bool {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphPixelForFont(font_id, codepoint, row, col);
+}
+
+pub fn glyphRowMaskForFont(font_id: u32, codepoint: u32, row: u32) u64 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphRowMaskForFont(font_id, codepoint, row);
+}
+
+pub fn glyphBitmapForFont(font_id: u32, codepoint: u32) GlyphBitmap {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().glyphBitmapForFont(font_id, codepoint);
+}
+
+pub fn measure(text: []const u8) TextMetrics {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().measure(text);
+}
+
+pub fn measureZ(text_ptr: [*:0]const u8, max_bytes: usize) TextMetrics {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().measureZ(text_ptr, max_bytes);
+}
+
+pub fn measureWithFont(font_id: u32, text: []const u8) TextMetrics {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().measureWithFont(font_id, text);
+}
+
+pub fn measureZWithFont(font_id: u32, text_ptr: [*:0]const u8, max_bytes: usize) TextMetrics {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().measureZWithFont(font_id, text_ptr, max_bytes);
+}
+
+pub fn baselineForFont(font_id: u32) i16 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().baselineForFont(font_id);
+}
+
+pub fn maxAdvanceForFont(font_id: u32) u32 {
+    var view = acquireCatalog();
+    defer view.release();
+    return view.state().maxAdvanceForFont(font_id);
+}
+
+pub fn loadR4F(bytes: []const u8) bool {
+    var transaction = beginCatalogReplacement(true) orelse {
+        return false;
+    };
+    defer transaction.abort();
+    if (!transaction.state().loadR4F(bytes)) return false;
+    transaction.commit();
+    return true;
+}
+
+pub fn loadR4FNamed(path: []const u8, bytes: []const u8) bool {
+    var transaction = beginCatalogReplacement(true) orelse {
+        return false;
+    };
+    defer transaction.abort();
+    if (!transaction.state().loadR4FNamed(path, bytes)) return false;
+    transaction.commit();
+    return true;
+}
+
+pub fn registerR4F(path: []const u8, bytes: []const u8) bool {
+    var transaction = beginCatalogReplacement(true) orelse {
+        return false;
+    };
+    defer transaction.abort();
+    const renderable = transaction.state().registerR4F(path, bytes);
+    transaction.commit();
+    return renderable;
+}
 
 pub fn glyph(c: u8) [8]u8 {
     return builtinGlyphForCodepoint(c);
@@ -269,189 +956,11 @@ fn cedillaGlyph(base: u8) [8]u8 {
     return result;
 }
 
-pub fn reset() void {
-    active = null;
-    active_font_id = BUILTIN_FONT_ID;
-}
-
-pub fn resetCatalog() void {
-    catalog = .{CatalogEntry{}} ** MAX_CATALOG_FONTS;
-    cached_fonts = .{CachedFont{}} ** MAX_CATALOG_FONTS;
-    catalog_entries = 0;
-    active = null;
-    active_font_id = BUILTIN_FONT_ID;
-}
-
-pub fn glyphWidth() u32 {
-    if (active) |f| return f.max_advance;
-    return GLYPH_W;
-}
-
-pub fn glyphHeight() u32 {
-    if (active) |f| return f.line_height;
-    return GLYPH_H;
-}
-
-pub fn baseline() i16 {
-    if (active) |f| return f.baseline;
-    return GLYPH_H - 1;
-}
-
-pub fn catalogCount() usize {
-    return catalog_entries;
-}
-
-pub fn catalogEntry(index: usize) ?CatalogEntry {
-    if (index >= catalog_entries) return null;
-    return catalog[index];
-}
-
-pub fn fontCount() usize {
-    return 1 + catalog_entries;
-}
-
-pub fn fontIdForCatalogIndex(index: usize) u32 {
-    if (index >= catalog_entries) return BUILTIN_FONT_ID;
-    return @intCast(index + 1);
-}
-
-pub fn currentFontId() u32 {
-    if (isRenderableFontId(active_font_id)) return active_font_id;
-    return BUILTIN_FONT_ID;
-}
-
-pub fn isRenderableFontId(font_id: u32) bool {
-    if (font_id == BUILTIN_FONT_ID) return true;
-    const index = catalogIndexForFontId(font_id) orelse return false;
-    return catalog[index].renderable and cached_fonts[index].used;
-}
-
-pub fn normalizeFontId(font_id: u32) u32 {
-    return if (isRenderableFontId(font_id)) font_id else BUILTIN_FONT_ID;
-}
-
-pub fn catalogEntryForFontId(font_id: u32) ?CatalogEntry {
-    const index = catalogIndexForFontId(font_id) orelse return null;
-    return catalog[index];
-}
-
-pub fn glyphRow(c: u8, row: u32) u8 {
-    if (active) |f| {
-        if (row >= f.height) return 0;
-        if (activeGlyphId(c)) |glyph_id| {
-            return active_glyphs[glyph_id][row][0];
-        }
-    }
-    if (row >= GLYPH_H) return 0;
-    return glyph(c)[row];
-}
-
-pub fn glyphPixel(c: u8, row: u32, col: u32) bool {
-    if (active) |f| {
-        if (row >= f.height or col >= MAX_GLYPH_W) return false;
-        if (activeGlyphId(c)) |glyph_id| {
-            if (col >= active_glyph_widths[glyph_id]) return false;
-            const byte_index: usize = @intCast(col / 8);
-            if (byte_index >= f.bytes_per_row or byte_index >= MAX_BYTES_PER_ROW) return false;
-            const shift: u3 = @intCast(7 - (col & 7));
-            return ((active_glyphs[glyph_id][row][byte_index] >> shift) & 1) == 1;
-        }
-    }
-    if (row >= GLYPH_H or col >= GLYPH_W) return false;
-    const shift: u3 = @intCast(GLYPH_W - 1 - col);
-    return ((glyph(c)[row] >> shift) & 1) == 1;
-}
-
-pub fn glyphBitmapWidth(c: u8) u32 {
-    if (active != null) {
-        if (activeGlyphId(c)) |glyph_id| return active_glyph_widths[glyph_id];
-    }
-    return GLYPH_W;
-}
-
-pub fn glyphAdvance(c: u8) u32 {
-    if (active != null) {
-        if (activeGlyphId(c)) |glyph_id| return active_glyph_advances[glyph_id];
-    }
-    return GLYPH_W;
-}
-
-pub fn glyphHeightForFont(font_id: u32) u32 {
-    if (cachedFont(font_id)) |f| return f.line_height;
-    return GLYPH_H;
-}
-
-pub fn glyphAdvanceForFont(font_id: u32, codepoint: u32) u32 {
-    if (cachedFont(font_id)) |f| {
-        if (cachedGlyphId(f, codepoint)) |glyph_id| return f.advances[glyph_id];
-    }
-    return GLYPH_W;
-}
-
-pub fn glyphBitmapWidthForFont(font_id: u32, codepoint: u32) u32 {
-    if (cachedFont(font_id)) |f| {
-        if (cachedGlyphId(f, codepoint)) |glyph_id| return f.widths[glyph_id];
-    }
-    return GLYPH_W;
-}
-
-pub fn glyphPixelForFont(font_id: u32, codepoint: u32, row: u32, col: u32) bool {
-    if (cachedFont(font_id)) |f| {
-        if (row >= f.height or col >= MAX_GLYPH_W) return false;
-        if (cachedGlyphId(f, codepoint)) |glyph_id| {
-            if (col >= f.widths[glyph_id]) return false;
-            const byte_index: usize = @intCast(col / 8);
-            if (byte_index >= f.bytes_per_row or byte_index >= MAX_BYTES_PER_ROW) return false;
-            const shift: u3 = @intCast(7 - (col & 7));
-            return ((f.glyphs[glyph_id][row][byte_index] >> shift) & 1) == 1;
-        }
-    }
-    if (row >= GLYPH_H or col >= GLYPH_W) return false;
-    const shift: u3 = @intCast(GLYPH_W - 1 - col);
-    return ((builtinGlyphForCodepoint(codepoint)[row] >> shift) & 1) == 1;
-}
-
 /// Returns one rendered row as a least-significant-bit-first mask.  The
 /// bounded codepoint index is resolved exactly once for the complete row.
-pub fn glyphRowMaskForFont(font_id: u32, codepoint: u32, row: u32) u64 {
-    if (cachedFont(font_id)) |f| {
-        if (row >= f.height) return 0;
-        if (cachedGlyphId(f, codepoint)) |glyph_id| return cachedGlyphRowMask(f, glyph_id, row);
-    }
-    return builtinGlyphRowMask(codepoint, row);
-}
-
 /// Materializes every rendered row after one bounded index lookup.  Missing
 /// codepoints retain the historical builtin fallback and the selected font's
 /// line metrics; no persistent R4F bytes leave the kernel cache.
-pub fn glyphBitmapForFont(font_id: u32, codepoint: u32) GlyphBitmap {
-    if (cachedFont(font_id)) |f| {
-        var result = GlyphBitmap{
-            .height = f.height,
-            .line_height = f.line_height,
-            .baseline = f.baseline,
-        };
-        if (cachedGlyphId(f, codepoint)) |glyph_id| {
-            result.width = f.widths[glyph_id];
-            result.advance = f.advances[glyph_id];
-            var row: u32 = 0;
-            while (row < f.height) : (row += 1) result.rows[row] = cachedGlyphRowMask(f, glyph_id, row);
-            return result;
-        }
-        result.fallback = true;
-        var row: u32 = 0;
-        while (row < @min(@as(u32, f.height), @as(u32, GLYPH_H))) : (row += 1) {
-            result.rows[row] = builtinGlyphRowMask(codepoint, row);
-        }
-        return result;
-    }
-
-    var result = GlyphBitmap{};
-    var row: u32 = 0;
-    while (row < GLYPH_H) : (row += 1) result.rows[row] = builtinGlyphRowMask(codepoint, row);
-    return result;
-}
-
 fn cachedGlyphRowMask(cached: *const CachedFont, glyph_id: usize, row: u32) u64 {
     if (glyph_id >= MAX_GLYPHS or row >= cached.height) return 0;
     const width: u32 = @min(@as(u32, cached.widths[glyph_id]), @as(u32, MAX_GLYPH_W));
@@ -478,126 +987,6 @@ fn builtinGlyphRowMask(codepoint: u32, row: u32) u64 {
         if (((source >> shift) & 1) == 1) result |= @as(u64, 1) << @intCast(column);
     }
     return result;
-}
-
-pub fn measure(text: []const u8) TextMetrics {
-    return measureWithFont(currentFontId(), text);
-}
-
-pub fn measureZ(text_ptr: [*:0]const u8, max_bytes: usize) TextMetrics {
-    var len: usize = 0;
-    while (len < max_bytes and text_ptr[len] != 0) : (len += 1) {}
-    return measure(text_ptr[0..len]);
-}
-
-pub fn measureWithFont(font_id: u32, text: []const u8) TextMetrics {
-    var line_w: u32 = 0;
-    var max_w: u32 = 0;
-    var lines: u32 = 1;
-    var visible: usize = 0;
-    const safe_font_id = normalizeFontId(font_id);
-    var cursor: usize = 0;
-    while (cursor < text.len) {
-        const decoded = decodeUtf8Scalar(text, cursor);
-        cursor += decoded.consumed;
-        if (decoded.codepoint == '\r') continue;
-        if (decoded.codepoint == '\n') {
-            if (line_w > max_w) max_w = line_w;
-            line_w = 0;
-            lines += 1;
-            visible += decoded.consumed;
-            continue;
-        }
-        line_w += glyphAdvanceForFont(safe_font_id, decoded.codepoint);
-        visible += decoded.consumed;
-    }
-    if (line_w > max_w) max_w = line_w;
-    const lh = glyphHeightForFont(safe_font_id);
-    return .{
-        .width = max_w,
-        .height = lines * lh,
-        .baseline = baselineForFont(safe_font_id),
-        .line_height = lh,
-        .visible_bytes = visible,
-    };
-}
-
-pub fn measureZWithFont(font_id: u32, text_ptr: [*:0]const u8, max_bytes: usize) TextMetrics {
-    var len: usize = 0;
-    while (len < max_bytes and text_ptr[len] != 0) : (len += 1) {}
-    return measureWithFont(font_id, text_ptr[0..len]);
-}
-
-pub fn baselineForFont(font_id: u32) i16 {
-    if (cachedFont(font_id)) |f| return f.baseline;
-    return GLYPH_H - 1;
-}
-
-pub fn maxAdvanceForFont(font_id: u32) u32 {
-    if (cachedFont(font_id)) |f| return f.max_advance;
-    return GLYPH_W;
-}
-
-pub fn loadR4F(bytes: []const u8) bool {
-    return loadR4FNamed("", bytes);
-}
-
-pub fn loadR4FNamed(path: []const u8, bytes: []const u8) bool {
-    const parsed = parseR4F(bytes) orelse return false;
-    if (!parsed.renderable) return false;
-
-    if (!fillCachedFont(parsed, &temp_cached_font)) return false;
-    activateFont(&temp_cached_font, parsed.family, parsed.face, path);
-    markSelected(path);
-    active_font_id = fontIdForPath(path) orelse BUILTIN_FONT_ID;
-    return true;
-}
-
-pub fn registerR4F(path: []const u8, bytes: []const u8) bool {
-    const parsed_opt = parseR4F(bytes);
-    var entry = CatalogEntry{};
-    copyField(entry.path[0..], &entry.path_len, path);
-    if (parsed_opt) |parsed| {
-        entry.used = true;
-        entry.kind = parsed.kind;
-        entry.weight = parsed.weight;
-        entry.style_flags = parsed.style_flags;
-        entry.charset_flags = parsed.charset_flags;
-        entry.face_count = parsed.face_count;
-        entry.strike_count = parsed.strike_count;
-        entry.glyph_count = parsed.glyph_count;
-        entry.renderable = parsed.renderable;
-        entry.width = parsed.width;
-        entry.height = parsed.height;
-        entry.max_advance = parsed.max_advance;
-        entry.ascent = parsed.ascent;
-        entry.descent = parsed.descent;
-        entry.line_height = parsed.line_height;
-        entry.baseline = parsed.baseline;
-        copyField(entry.family[0..], &entry.family_len, parsed.family);
-        copyField(entry.face[0..], &entry.face_len, parsed.face);
-        copyField(entry.style[0..], &entry.style_len, parsed.style);
-        copyField(entry.status[0..], &entry.status_len, parsed.reason);
-    } else {
-        entry.used = true;
-        entry.kind = .unknown;
-        entry.renderable = false;
-        copyField(entry.family[0..], &entry.family_len, "Invalid");
-        copyField(entry.face[0..], &entry.face_len, "Invalid R4F");
-        copyField(entry.style[0..], &entry.style_len, "Error");
-        copyField(entry.status[0..], &entry.status_len, "invalid R4F1");
-    }
-    const slot = addCatalogEntry(entry) orelse return false;
-    if (parsed_opt) |parsed| {
-        if (parsed.renderable) {
-            if (!fillCachedFont(parsed, &cached_fonts[slot])) {
-                cached_fonts[slot] = .{};
-                catalog[slot].renderable = false;
-                copyField(catalog[slot].status[0..], &catalog[slot].status_len, "cache failed");
-            }
-        }
-    }
-    return catalog[slot].renderable;
 }
 
 fn parseR4F(bytes: []const u8) ?ParsedFont {
@@ -830,46 +1219,10 @@ fn fillCachedFont(parsed: ParsedFont, cached: *CachedFont) bool {
     return buildGlyphIndex(&cached.codepoints, &cached.index);
 }
 
-fn activateFont(cached: *const CachedFont, family: []const u8, face: []const u8, path: []const u8) void {
-    active_glyphs = cached.glyphs;
-    active_glyph_widths = cached.widths;
-    active_glyph_advances = cached.advances;
-    active_index = cached.index;
-    var next_active = ActiveFont{
-        .width = cached.width,
-        .height = cached.height,
-        .bytes_per_row = cached.bytes_per_row,
-        .max_advance = cached.max_advance,
-        .ascent = cached.ascent,
-        .descent = cached.descent,
-        .line_height = cached.line_height,
-        .baseline = cached.baseline,
-    };
-    copyField(next_active.family[0..], &next_active.family_len, family);
-    copyField(next_active.face[0..], &next_active.face_len, face);
-    copyField(next_active.path[0..], &next_active.path_len, path);
-    active = next_active;
-}
-
 fn rangeValid(total: u32, offset: u32, size: u32) bool {
     if (offset > total) return false;
     if (size > total - offset) return false;
     return true;
-}
-
-fn addCatalogEntry(entry: CatalogEntry) ?usize {
-    if (catalog_entries >= catalog.len) return null;
-    const slot = catalog_entries;
-    catalog[catalog_entries] = entry;
-    catalog_entries += 1;
-    return slot;
-}
-
-fn markSelected(path: []const u8) void {
-    var i: usize = 0;
-    while (i < catalog_entries) : (i += 1) {
-        catalog[i].selected = path.len != 0 and pathEquals(catalog[i].path[0..catalog[i].path_len], path);
-    }
 }
 
 fn pathEquals(a: []const u8, b: []const u8) bool {
@@ -894,32 +1247,6 @@ fn normalizedPathEquals(a: []const u8, b: []const u8) bool {
 fn stripDrive(path: []const u8) []const u8 {
     if (path.len >= 2 and path[1] == ':') return path[2..];
     return path;
-}
-
-fn fontIdForPath(path: []const u8) ?u32 {
-    if (path.len == 0) return null;
-    var i: usize = 0;
-    while (i < catalog_entries) : (i += 1) {
-        if (pathEquals(catalog[i].path[0..catalog[i].path_len], path)) return fontIdForCatalogIndex(i);
-    }
-    return null;
-}
-
-fn catalogIndexForFontId(font_id: u32) ?usize {
-    if (font_id == BUILTIN_FONT_ID) return null;
-    const raw = font_id - 1;
-    if (raw >= catalog_entries) return null;
-    return @intCast(raw);
-}
-
-fn cachedFont(font_id: u32) ?*const CachedFont {
-    const index = catalogIndexForFontId(font_id) orelse return null;
-    if (!cached_fonts[index].used) return null;
-    return &cached_fonts[index];
-}
-
-fn activeGlyphId(codepoint: u32) ?usize {
-    return indexedGlyphId(&active_index, codepoint, null);
 }
 
 fn cachedGlyphId(cached: *const CachedFont, codepoint: u32) ?usize {
@@ -1301,9 +1628,12 @@ test "bulk glyph rows equal indexed row and pixel references" {
     resetCatalog();
     defer resetCatalog();
 
-    catalog_entries = 1;
-    catalog[0] = .{ .used = true, .renderable = true, .width = 5, .height = 3, .max_advance = 6, .line_height = 4, .baseline = 2 };
-    cached_fonts[0] = .{
+    var preparation = beginCatalogReplacement(false).?;
+    defer preparation.abort();
+    const state = preparation.state();
+    state.catalog_entries = 1;
+    state.catalog[0] = .{ .used = true, .renderable = true, .width = 5, .height = 3, .max_advance = 6, .line_height = 4, .baseline = 2 };
+    state.cached_fonts[0] = .{
         .used = true,
         .width = 5,
         .height = 3,
@@ -1312,7 +1642,7 @@ test "bulk glyph rows equal indexed row and pixel references" {
         .line_height = 4,
         .baseline = 2,
     };
-    const cached = &cached_fonts[0];
+    const cached = &state.cached_fonts[0];
     cached.codepoints[7] = 0x1F642;
     cached.widths[7] = 5;
     cached.advances[7] = 6;
@@ -1321,6 +1651,7 @@ test "bulk glyph rows equal indexed row and pixel references" {
     cached.glyphs[7][2][0] = 0b11111000;
     try std.testing.expect(buildGlyphIndex(&cached.codepoints, &cached.index));
 
+    preparation.commit();
     const bitmap = glyphBitmapForFont(1, 0x1F642);
     try std.testing.expectEqual(@as(u32, 5), bitmap.width);
     try std.testing.expectEqual(@as(u32, 3), bitmap.height);

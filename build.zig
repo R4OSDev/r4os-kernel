@@ -287,7 +287,7 @@ fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, path: []const u8) void
 
 fn addFontUnitTest(b: *std.Build, test_step: *std.Build.Step) void {
     const root = b.createModule(.{
-        .root_source_file = b.path("kernel/font.zig"),
+        .root_source_file = b.path("font_test.zig"),
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     });

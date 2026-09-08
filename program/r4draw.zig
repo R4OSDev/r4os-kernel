@@ -28,7 +28,6 @@ pub const DisplayPresentResult = r4x_api.DisplayPresentResult;
 var display_used_hook: ?MarkDisplayUsedFn = null;
 var font_catalog_changed_hook: ?FontCatalogChangedFn = null;
 var display_revision: u32 = 0;
-var font_revision: u32 = 1;
 
 pub fn setDisplayUsedHook(hook: MarkDisplayUsedFn) void {
     display_used_hook = hook;
@@ -252,8 +251,10 @@ pub fn fontInfo(font_id: u32, out: *GuiFontInfo) callconv(.c) i32 {
 
 pub fn fontMeasure(font_id: u32, value: [*:0]const u8, out: *GuiTextMetrics) callconv(.c) i32 {
     if (@intFromPtr(value) == 0 or @intFromPtr(out) == 0) return -1;
-    if (!font.isRenderableFontId(font_id)) return -2;
-    const metrics = font.measureZWithFont(font_id, value, 4096);
+    var view = font.acquireCatalog();
+    defer view.release();
+    if (!view.state().isRenderableFontId(font_id)) return -2;
+    const metrics = view.state().measureZWithFont(font_id, value, 4096);
     out.* = guiMetrics(metrics);
     return 0;
 }
@@ -262,8 +263,11 @@ pub fn fontMeasure(font_id: u32, value: [*:0]const u8, out: *GuiTextMetrics) cal
 /// bits are packed least-significant-bit first by pixel column. It deliberately
 /// exposes rendered cache pixels only; installed font files stay on C:.
 pub fn fontGlyphRow(font_id: u32, codepoint: u32, row: u32) callconv(.c) u64 {
-    if (codepoint > 0x10FFFF or row >= font.MAX_GLYPH_H or !font.isRenderableFontId(font_id)) return 0;
-    return font.glyphRowMaskForFont(font_id, codepoint, row);
+    if (codepoint > 0x10FFFF or row >= font.MAX_GLYPH_H) return 0;
+    var view = font.acquireCatalog();
+    defer view.release();
+    if (!view.state().isRenderableFontId(font_id)) return 0;
+    return view.state().glyphRowMaskForFont(font_id, codepoint, row);
 }
 
 /// Copies one complete rendered glyph after a single bounded codepoint-index
@@ -271,9 +275,11 @@ pub fn fontGlyphRow(font_id: u32, codepoint: u32, row: u32) callconv(.c) u64 {
 /// callers while avoiding one ABI call and one glyph lookup per bitmap row.
 pub fn fontGlyphBitmap(font_id: u32, codepoint: u32, out: *GuiGlyphBitmap) callconv(.c) i32 {
     if (@intFromPtr(out) == 0 or codepoint > 0x10FFFF) return -1;
-    if (!font.isRenderableFontId(font_id)) return -2;
+    var view = font.acquireCatalog();
+    defer view.release();
+    if (!view.state().isRenderableFontId(font_id)) return -2;
 
-    const bitmap = font.glyphBitmapForFont(font_id, codepoint);
+    const bitmap = view.state().glyphBitmapForFont(font_id, codepoint);
     out.* = .{
         .width = bitmap.width,
         .height = bitmap.height,
@@ -292,8 +298,6 @@ pub fn fontGlyphBitmap(font_id: u32, codepoint: u32, out: *GuiGlyphBitmap) callc
 pub fn fontReload() callconv(.c) i32 {
     const result = font_catalog.reloadInstalled();
     if (result.unavailable) return -1;
-    font_revision +%= 1;
-    if (font_revision == 0) font_revision = 1;
     if (font_catalog_changed_hook) |hook| hook();
     return @intCast(result.registered);
 }
@@ -302,7 +306,7 @@ pub fn fontReload() callconv(.c) i32 {
 /// Consumers keying decoded glyphs therefore pair the id with this non-zero
 /// generation and discard their bounded caches whenever it advances.
 pub fn fontRevision() callconv(.c) u32 {
-    return font_revision;
+    return font.catalogRevision();
 }
 
 pub fn textFont(font_id: u32, x: i32, y: i32, value: [*:0]const u8, fg: u32, bg: u32) callconv(.c) void {
@@ -315,12 +319,14 @@ pub fn textFont(font_id: u32, x: i32, y: i32, value: [*:0]const u8, fg: u32, bg:
 }
 
 fn fillGuiFontInfo(font_id: u32, force_selected: bool, out: *GuiFontInfo) i32 {
+    var view = font.acquireCatalog();
+    defer view.release();
     out.* = .{};
     if (font_id == gui_font_builtin_id) {
         out.* = .{
             .id = gui_font_builtin_id,
             .kind = 0,
-            .flags = gui_font_flag_renderable | gui_font_flag_builtin | (if (force_selected or font.currentFontId() == gui_font_builtin_id) gui_font_flag_selected else 0),
+            .flags = gui_font_flag_renderable | gui_font_flag_builtin | (if (force_selected or view.state().currentFontId() == gui_font_builtin_id) gui_font_flag_selected else 0),
             .weight = 400,
             .style_flags = 0,
             .charset_flags = 0,
@@ -338,7 +344,7 @@ fn fillGuiFontInfo(font_id: u32, force_selected: bool, out: *GuiFontInfo) i32 {
         copyFixedZ(out.status[0..], "builtin fallback");
         return 1;
     }
-    const entry = font.catalogEntryForFontId(font_id) orelse return 0;
+    const entry = view.state().catalogEntryForFontId(font_id) orelse return 0;
     out.* = .{
         .id = font_id,
         .kind = @intFromEnum(entry.kind),
