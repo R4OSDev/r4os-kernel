@@ -133,6 +133,21 @@ pub const BoundedReader = struct {
         };
     }
 
+    /// Initialize private caller storage without a temporary copy of its
+    /// two windows. Bytes are read only after a successful window fill.
+    pub fn reset(self: *BoundedReader, source: FileSource, file_size: usize) void {
+        stats_state.metadata_reader_initializations +|= 1;
+        self.source = source;
+        self.file_size = file_size;
+        self.stamp = 0;
+        for (&self.windows) |*window| {
+            window.valid = false;
+            window.offset = 0;
+            window.len = 0;
+            window.stamp = 0;
+        }
+    }
+
     pub fn readExactAt(self: *BoundedReader, offset: usize, out: []u8, name: []const u8, verbose: bool) bool {
         stats_state.metadata_logical_reads +|= 1;
         stats_state.metadata_logical_bytes +|= out.len;

@@ -131,6 +131,10 @@ pub const Reader = struct {
         return .{ .file = module_file.BoundedReader.init(source, file_size) };
     }
 
+    pub fn reset(self: *Reader, source: module_file.FileSource, file_size: usize) void {
+        self.file.reset(source, file_size);
+    }
+
     pub fn readHeader(self: *Reader, expected_kind: ?Kind, limits: Limits, name: []const u8, verbose: bool) ?Header {
         if (self.file.file_size < HEADER_SIZE) {
             logFailure(verbose, name, "short-header");

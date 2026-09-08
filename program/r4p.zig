@@ -320,11 +320,12 @@ fn loadModuleBytesWithInfo(bytes: []const u8, info: R4MProtocolInfo, file_name: 
         k.puts("\r\n");
         return false;
     }
-    const loaded_module_slot = modsys.loadResolvedBytes(bytes, .r4p, file_name, path) orelse return false;
-    const init_addr = modsys.exportAddress(loaded_module_slot, "ProtocolInit", 1) orelse return missingExport("ProtocolInit");
-    const shutdown_addr = modsys.exportAddress(loaded_module_slot, "ProtocolShutdown", 1) orelse return missingExport("ProtocolShutdown");
-    const query_addr = modsys.exportAddress(loaded_module_slot, "ProtocolQuery", 1) orelse return missingExport("ProtocolQuery");
-    const dispatch_addr = modsys.exportAddress(loaded_module_slot, "ProtocolDispatch", 1) orelse return missingExport("ProtocolDispatch");
+    var prepared = modsys.prepareResolvedBytes(bytes, .r4p, file_name, path) orelse return false;
+    defer prepared.abort();
+    const init_addr = prepared.exportAddress("ProtocolInit", 1) orelse return missingExport("ProtocolInit");
+    const shutdown_addr = prepared.exportAddress("ProtocolShutdown", 1) orelse return missingExport("ProtocolShutdown");
+    const query_addr = prepared.exportAddress("ProtocolQuery", 1) orelse return missingExport("ProtocolQuery");
+    const dispatch_addr = prepared.exportAddress("ProtocolDispatch", 1) orelse return missingExport("ProtocolDispatch");
     const registry_slot = switch (source) {
         .preload => registry.beginLoadPreload(info_name, info_role, info.category, VERSION, protocol_api.VERSION),
         else => registry.beginLoadR4p(info_name, info_role, info.category, VERSION, protocol_api.VERSION),
@@ -335,6 +336,7 @@ fn loadModuleBytesWithInfo(bytes: []const u8, info: R4MProtocolInfo, file_name: 
         return false;
     };
 
+    const loaded_module_slot = prepared.commit() orelse return false;
     modules[module_slot] = .{
         .used = true,
         .source = source,
@@ -373,28 +375,30 @@ fn loadCatalogCandidate(candidate_index: usize) ?usize {
     k.puts(file_name);
     k.puts("\r\n");
     const read_start = loader_perf.now();
-    const loaded_module_slot = modsys.loadResolvedFile(file_source, .r4p, file_name, path) orelse {
+    var prepared = modsys.prepareResolvedFile(file_source, .r4p, file_name, path) orelse {
         loader_perf.addR4pReadTicks(read_start);
         return null;
     };
     loader_perf.addR4pReadTicks(read_start);
-    const init_addr = modsys.exportAddress(loaded_module_slot, "ProtocolInit", 1) orelse {
+    defer prepared.abort();
+    const init_addr = prepared.exportAddress("ProtocolInit", 1) orelse {
         _ = missingExport("ProtocolInit");
         return null;
     };
-    const shutdown_addr = modsys.exportAddress(loaded_module_slot, "ProtocolShutdown", 1) orelse {
+    const shutdown_addr = prepared.exportAddress("ProtocolShutdown", 1) orelse {
         _ = missingExport("ProtocolShutdown");
         return null;
     };
-    const query_addr = modsys.exportAddress(loaded_module_slot, "ProtocolQuery", 1) orelse {
+    const query_addr = prepared.exportAddress("ProtocolQuery", 1) orelse {
         _ = missingExport("ProtocolQuery");
         return null;
     };
-    const dispatch_addr = modsys.exportAddress(loaded_module_slot, "ProtocolDispatch", 1) orelse {
+    const dispatch_addr = prepared.exportAddress("ProtocolDispatch", 1) orelse {
         _ = missingExport("ProtocolDispatch");
         return null;
     };
 
+    const loaded_module_slot = prepared.commit() orelse return null;
     modules[module_slot] = .{
         .used = true,
         .source = .r4p,

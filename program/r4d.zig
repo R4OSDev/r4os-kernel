@@ -336,12 +336,13 @@ fn loadR4MDriverFile(source: module_file.FileSource, mode: LoadMode, fallback_na
     const info = readR4MDriverInfoFromFile(source.volume, source.entry, fallback_name) orelse return false;
     const info_name = driverInfoName(&info);
     const existing = findModuleDriver(info_name) orelse blk: {
-        const module_slot = modules.loadResolvedFile(source, .r4d, fallback_name, path) orelse return false;
-        const init_addr = modules.exportAddress(module_slot, "DriverInit", 1) orelse {
+        var prepared = modules.prepareResolvedFile(source, .r4d, fallback_name, path) orelse return false;
+        defer prepared.abort();
+        const init_addr = prepared.exportAddress("DriverInit", 1) orelse {
             k.puts("[R4D] missing DriverInit export\r\n");
             return false;
         };
-        const shutdown_addr = modules.exportAddress(module_slot, "DriverShutdown", 1) orelse {
+        const shutdown_addr = prepared.exportAddress("DriverShutdown", 1) orelse {
             k.puts("[R4D] missing DriverShutdown export\r\n");
             return false;
         };
@@ -349,6 +350,7 @@ fn loadR4MDriverFile(source: module_file.FileSource, mode: LoadMode, fallback_na
             k.puts("[R4D] module driver table full\r\n");
             return false;
         };
+        const module_slot = prepared.commit() orelse return false;
         storeModuleDriver(descriptor_slot, info_name, info.driver_type, module_slot, @ptrFromInt(init_addr), @ptrFromInt(shutdown_addr));
         break :blk descriptor_slot;
     };
@@ -366,12 +368,13 @@ fn loadR4MDriverFileRuntime(source: module_file.FileSource, fallback_name: []con
     const info = readR4MDriverInfoFromFile(source.volume, source.entry, fallback_name) orelse return .invalid_file;
     const info_name = driverInfoName(&info);
     const existing = findModuleDriver(info_name) orelse blk: {
-        const module_slot = modules.loadResolvedFile(source, .r4d, fallback_name, path) orelse return .load_failed;
-        const init_addr = modules.exportAddress(module_slot, "DriverInit", 1) orelse {
+        var prepared = modules.prepareResolvedFile(source, .r4d, fallback_name, path) orelse return .load_failed;
+        defer prepared.abort();
+        const init_addr = prepared.exportAddress("DriverInit", 1) orelse {
             k.puts("[R4D] missing DriverInit export\r\n");
             return .invalid_file;
         };
-        const shutdown_addr = modules.exportAddress(module_slot, "DriverShutdown", 1) orelse {
+        const shutdown_addr = prepared.exportAddress("DriverShutdown", 1) orelse {
             k.puts("[R4D] missing DriverShutdown export\r\n");
             return .invalid_file;
         };
@@ -379,6 +382,7 @@ fn loadR4MDriverFileRuntime(source: module_file.FileSource, fallback_name: []con
             k.puts("[R4D] module driver table full\r\n");
             return .load_failed;
         };
+        const module_slot = prepared.commit() orelse return .load_failed;
         storeModuleDriver(descriptor_slot, info_name, info.driver_type, module_slot, @ptrFromInt(init_addr), @ptrFromInt(shutdown_addr));
         break :blk descriptor_slot;
     };
@@ -390,12 +394,13 @@ fn loadR4MPreloadDriverBytes(bytes: []const u8, fallback_name: []const u8, path:
     const info = parseR4MDriverInfo(bytes, fallback_name) orelse return .invalid_file;
     const info_name = driverInfoName(&info);
     const existing = findModuleDriver(info_name) orelse blk: {
-        const module_slot = modules.loadResolvedBytes(bytes, .r4d, fallback_name, path) orelse return .load_failed;
-        const init_addr = modules.exportAddress(module_slot, "DriverInit", 1) orelse {
+        var prepared = modules.prepareResolvedBytes(bytes, .r4d, fallback_name, path) orelse return .load_failed;
+        defer prepared.abort();
+        const init_addr = prepared.exportAddress("DriverInit", 1) orelse {
             k.puts("[R4D] missing DriverInit export\r\n");
             return .invalid_file;
         };
-        const shutdown_addr = modules.exportAddress(module_slot, "DriverShutdown", 1) orelse {
+        const shutdown_addr = prepared.exportAddress("DriverShutdown", 1) orelse {
             k.puts("[R4D] missing DriverShutdown export\r\n");
             return .invalid_file;
         };
@@ -403,6 +408,7 @@ fn loadR4MPreloadDriverBytes(bytes: []const u8, fallback_name: []const u8, path:
             k.puts("[R4D] module driver table full\r\n");
             return .load_failed;
         };
+        const module_slot = prepared.commit() orelse return .load_failed;
         storeModuleDriver(descriptor_slot, info_name, info.driver_type, module_slot, @ptrFromInt(init_addr), @ptrFromInt(shutdown_addr));
         break :blk descriptor_slot;
     };
