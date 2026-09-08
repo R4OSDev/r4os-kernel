@@ -1076,6 +1076,7 @@ const ProgramRegistrySlot = struct {
     reclaim_pending: bool = false,
     retire_queued: bool = false,
     retire_in_progress: bool = false,
+    cancel_pending: bool = false,
     retire_phase: ProgramRetirePhase = .cancel_execution,
     retire_output_detached: bool = false,
     retire_storage_released: bool = false,
@@ -6649,6 +6650,7 @@ fn reserveProgramInstanceSlot() ProgramInstanceReservationResult {
             slot.reclaim_pending = false;
             slot.retire_queued = false;
             slot.retire_in_progress = false;
+            slot.cancel_pending = false;
             slot.retire_phase = .cancel_execution;
             slot.retire_output_detached = false;
             slot.retire_storage_released = false;
@@ -6686,6 +6688,7 @@ fn clearProgramRegistrySlotLocked(slot: *ProgramRegistrySlot) void {
     slot.reclaim_pending = false;
     slot.retire_queued = false;
     slot.retire_in_progress = false;
+    slot.cancel_pending = false;
     slot.retire_phase = .cancel_execution;
     slot.retire_output_detached = false;
     slot.retire_storage_released = false;
@@ -6707,20 +6710,84 @@ fn bumpProgramInventoryEpochLocked() void {
 }
 
 fn cancelProgramInstanceReservation(reservation: *const ProgramInstanceReservation) void {
-    var completion: ?*ProgramCompletionNode = null;
     const locked = lockProgramRegistry();
     if (!locked) return;
     const slot = reservation.slot;
-    if (slot.state == .create and slot.public_id == reservation.id and slot.generation == reservation.generation) {
-        completion = slot.completion;
-        slot.completion = null;
-        if (completion) |node| node.slot_attached = false;
-        clearProgramRegistrySlotLocked(slot);
-        program_registry_stats.rollback_count +%= 1;
+    if (slot.state != .create or slot.public_id != reservation.id or
+        slot.generation != reservation.generation or slot.cancel_pending or
+        slot.retire_queued or slot.retire_in_progress)
+    {
+        unlockProgramRegistry();
+        return;
     }
+    // Preserve this unpublished, stable slot as the owner of every range
+    // allocated during admission, including images not yet bound to instance.
+    slot.cancel_pending = true;
+    slot.retire_in_progress = true;
+    unlockProgramRegistry();
+    _ = finishCancelledProgramReservation(reservation);
+}
+
+fn finishCancelledProgramReservation(reservation: *const ProgramInstanceReservation) ProgramRetireResult {
+    const slot = reservation.slot;
+    const complete = cleanupCancelledProgramResources(&slot.instance);
+    const locked = lockProgramRegistry();
+    if (!locked) return .deferred;
+    if (slot.state != .create or slot.public_id != reservation.id or
+        slot.generation != reservation.generation or !slot.cancel_pending or
+        !slot.retire_in_progress)
+    {
+        unlockProgramRegistry();
+        return .idle;
+    }
+    if (!complete) {
+        slot.retire_in_progress = false;
+        slot.retire_attempts +%= 1;
+        program_registry_stats.retire_deferred +%= 1;
+        _ = enqueueProgramRetireLocked(slot);
+        unlockProgramRegistry();
+        program_reaper_event.signal();
+        return .deferred;
+    }
+    const completion = slot.completion;
+    slot.completion = null;
+    if (completion) |node| node.slot_attached = false;
+    clearProgramRegistrySlotLocked(slot);
+    program_registry_stats.rollback_count +%= 1;
     unlockProgramRegistry();
     if (completion) |node| freeProgramCompletionNodeMemory(node);
     shrinkProgramRegistry(false);
+    return .completed;
+}
+
+fn cleanupCancelledProgramResources(instance: *ProgramInstance) bool {
+    var resources = programResourcesFromInstance(instance);
+    if (instance.runtime_payload) |runtime| {
+        if (instance.process_payload) |process| {
+            var storage = ProgramInstanceStorage{
+                .runtime = runtime,
+                .process = process,
+                .console = instance.console_payload,
+                .gui = instance.gui_payload,
+            };
+            rollbackProgramInstanceStorage(instance.id, &storage);
+        }
+    }
+    instance.runtime_payload = null;
+    instance.process_payload = null;
+    instance.console_payload = null;
+    instance.gui_payload = null;
+    const complete = cleanupProgramResources(&resources);
+    writeStackToInstance(instance, resources.stack);
+    if (!complete) return false;
+    instance.program_image_range_id = 0;
+    instance.program_image_base = 0;
+    instance.program_image_size = 0;
+    // Earlier loader failures may not have bound an image/stack to instance.
+    // Their owner metadata is still present and must also finish before reuse.
+    _ = mem_virt.releaseOwner(.r4x_instance, instance.id, null) catch return false;
+    _ = mem_backing_store.releaseR4xOwner(instance.id);
+    return true;
 }
 
 fn publishProgramInstance(reservation: *const ProgramInstanceReservation) bool {
@@ -8403,19 +8470,19 @@ fn runProgramFile(file: ProgramFile, mode: RunMode, policy: LaunchPolicy, args: 
     loaded.origin = file.origin;
     loaded.origin_len = file.origin_len;
     if (programSpawnTransactionCancelled()) {
-        freeProgramImage(loaded.image);
+        _ = freeProgramImage(loaded.image);
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_TASK_FAILED);
         return .failed;
     }
     if (consumeProgramLifecycleFailure(.image)) {
-        freeProgramImage(loaded.image);
+        _ = freeProgramImage(loaded.image);
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_LOAD_FAILED);
         return .failed;
     }
     reportBootLaunchStage(options.report_boot_launch, "Stack anlegen");
     const stack = allocateProgramStack(instance_id, loaded.memory_contract, parseSubsystemTrace(args) != null) orelse {
         k.puts("Program stack allocation failed\r\n");
-        freeProgramImage(loaded.image);
+        _ = freeProgramImage(loaded.image);
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_NO_MEMORY);
         return .failed;
     };
@@ -8511,7 +8578,7 @@ fn loadR4MProgramImage(file: ProgramFile, owner_id: u32, app_class: AppClass, re
     @memset(image.code, 0);
 
     if (!readR4MSectionsIntoImage(source, sections[0..section_count], section_offsets[0..], image.code)) {
-        freeProgramImage(image);
+        _ = freeProgramImage(image);
         return null;
     }
 
@@ -8519,35 +8586,35 @@ fn loadR4MProgramImage(file: ProgramFile, owner_id: u32, app_class: AppClass, re
     var r4xstart_imports: [MAX_R4M_IMPORTS]R4XStartImportSeed = .{R4XStartImportSeed{}} ** MAX_R4M_IMPORTS;
     const import_count: usize = @intCast(r4m.import_count);
     if (!resolveR4MImportsFromReader(reader, r4m, resolved_imports[0..], r4xstart_imports[0..])) {
-        freeProgramImage(image);
+        _ = freeProgramImage(image);
         return null;
     }
     const r4xstart_import_count = r4m.import_count;
     if (!applyR4MRelocationsFromReader(reader, r4m, sections[0..section_count], section_offsets[0..], image.code, resolved_imports[0..import_count])) {
-        freeProgramImage(image);
+        _ = freeProgramImage(image);
         return null;
     }
 
     const entry_record = readR4MEntryFromReader(reader, r4m, 0) orelse {
         k.puts("Invalid R4M0 entry\r\n");
-        freeProgramImage(image);
+        _ = freeProgramImage(image);
         return null;
     };
     if (entry_record.kind != R4M_ENTRY_KIND_R4X) {
         k.puts("Unsupported R4M0 entry kind\r\n");
-        freeProgramImage(image);
+        _ = freeProgramImage(image);
         return null;
     }
     const entry_section: usize = @intCast(entry_record.section);
     if (entry_section >= section_count or !r4mSectionLoadable(sections[entry_section])) {
         k.puts("Invalid R4M0 entry section\r\n");
-        freeProgramImage(image);
+        _ = freeProgramImage(image);
         return null;
     }
     const entry_offset = section_offsets[entry_section] + @as(usize, @intCast(entry_record.offset));
     if (entry_offset >= image.code.len) {
         k.puts("Invalid R4M0 entry offset\r\n");
-        freeProgramImage(image);
+        _ = freeProgramImage(image);
         return null;
     }
     const entry: RawEntryFn = @ptrCast(@alignCast(image.code[entry_offset..].ptr));
@@ -9078,11 +9145,18 @@ fn pageAlignU64(value: u64) ?u64 {
     return (value + mask) & ~mask;
 }
 
-fn freeProgramImage(image: ProgramImage) void {
-    if (image.range_id == 0) return;
-    mem_virt.release(image.range_id) catch {
-        k.puts("Program image release failed\r\n");
+fn freeProgramImage(image: ProgramImage) bool {
+    return releaseProgramImageRange(image.range_id);
+}
+
+fn releaseProgramImageRange(range_id: u32) bool {
+    if (range_id == 0) return true;
+    mem_virt.release(range_id) catch |err| {
+        // Range IDs are never reused within one boot; NotFound acknowledges
+        // an earlier completed release whose caller lost the result.
+        return err == mem_virt.Error.NotFound;
     };
+    return true;
 }
 
 fn recordProgramStackCreate(profile: MemoryProfile, reserve_bytes: u64, initial_commit_bytes: u64, cycles: u64) void {
@@ -9354,14 +9428,7 @@ fn cleanupProgramResources(resources: *ProgramResources) bool {
     if (resources.stack.range_id != 0) {
         if (!freeProgramStack(&resources.stack)) return false;
     }
-    if (resources.image_range_id != 0 and resources.image_base != 0 and resources.image_size != 0) {
-        const ptr: [*]u8 = @ptrFromInt(resources.image_base);
-        freeProgramImage(.{
-            .range_id = resources.image_range_id,
-            .code = ptr[0..resources.image_size],
-            .owner_id = resources.image_owner_id,
-        });
-    }
+    if (!releaseProgramImageRange(resources.image_range_id)) return false;
     resources.image_range_id = 0;
     resources.image_base = 0;
     resources.image_size = 0;
@@ -17052,29 +17119,6 @@ fn createInstance(
 }
 
 fn rollbackReservedProgramInstance(reservation: *const ProgramInstanceReservation) void {
-    const instance = &reservation.slot.instance;
-    if (reservation.slot.state != .create or reservation.slot.generation != reservation.generation or reservation.slot.public_id != reservation.id) return;
-
-    var resources = programResourcesFromInstance(instance);
-    if (instance.runtime_payload) |runtime| {
-        if (instance.process_payload) |process| {
-            var storage = ProgramInstanceStorage{
-                .runtime = runtime,
-                .process = process,
-                .console = instance.console_payload,
-                .gui = instance.gui_payload,
-            };
-            rollbackProgramInstanceStorage(instance.id, &storage);
-        }
-    }
-    instance.runtime_payload = null;
-    instance.process_payload = null;
-    instance.console_payload = null;
-    instance.gui_payload = null;
-    _ = cleanupProgramResources(&resources);
-    _ = mem_virt.releaseOwner(.r4x_instance, reservation.id, .virtual_range);
-    _ = mem_backing_store.releaseR4xOwner(reservation.id);
-    instance.* = .{ .id = reservation.id };
     cancelProgramInstanceReservation(reservation);
 }
 
@@ -17636,6 +17680,11 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
     var phase: ProgramRetirePhase = .cancel_execution;
     const locked = lockProgramRegistry();
     if (!locked) return .deferred;
+    if (slot.state == .create and slot.cancel_pending and slot.retire_in_progress) {
+        const reservation = ProgramInstanceReservation{ .slot = slot, .id = slot.public_id, .generation = slot.generation };
+        unlockProgramRegistry();
+        return finishCancelledProgramReservation(&reservation);
+    }
     if (slot.state != .retire or
         !slot.retire_in_progress or
         slot.public_id == 0 or
@@ -17737,7 +17786,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                     slot.retire_image_stack_released = true;
                 }
                 if (!slot.retire_owner_released) {
-                    _ = mem_virt.releaseOwner(.r4x_instance, handle.instance_id, .virtual_range);
+                    _ = mem_virt.releaseOwner(.r4x_instance, handle.instance_id, null) catch return deferProgramRetire(handle);
                     _ = mem_backing_store.releaseR4xOwner(handle.instance_id);
                     slot.retire_owner_released = true;
                 }

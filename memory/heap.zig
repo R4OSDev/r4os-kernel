@@ -79,6 +79,7 @@ pub const Stats = struct {
     oom_errors: u64 = 0,
     reentry_errors: u64 = 0,
     next_growth_pages: usize = heap_policy.min_growth_pages,
+    pending_uncommit_bytes: usize = 0,
     commit_calls: u64 = 0,
     commit_failures: u64 = 0,
     committed_pages_total: u64 = 0,
@@ -118,6 +119,9 @@ const Control = struct {
     oom_errors: u64 = 0,
     reentry_errors: u64 = 0,
     next_growth_pages: usize = heap_policy.min_growth_pages,
+    pending_uncommit_start: usize = 0,
+    pending_uncommit_bytes: usize = 0,
+    pending_uncommit_pressure: bool = false,
     commit_calls: u64 = 0,
     commit_failures: u64 = 0,
     committed_pages_total: u64 = 0,
@@ -315,6 +319,7 @@ pub fn stats() Stats {
         .oom_errors = control.oom_errors,
         .reentry_errors = control.reentry_errors,
         .next_growth_pages = control.next_growth_pages,
+        .pending_uncommit_bytes = control.pending_uncommit_bytes,
         .commit_calls = control.commit_calls,
         .commit_failures = control.commit_failures,
         .committed_pages_total = control.committed_pages_total,
@@ -679,6 +684,7 @@ fn placeAligned(offset: usize, payload: usize, need: usize, requested: usize) ?[
 }
 
 fn growCommitted(min_extra_bytes: usize) bool {
+    if (!finishPendingTail()) return false;
     const extra_pages_min = pagesForBytes(min_extra_bytes);
     if (extra_pages_min == 0) return true;
     if (control.committed_pages + extra_pages_min > control.cap_pages) return false;
@@ -725,6 +731,7 @@ fn commitAdditionalPages(start: usize, pages: usize) bool {
 }
 
 fn releaseTrailingPages() void {
+    if (!finishPendingTail()) return;
     const floor_bytes = MIN_COMMITTED_PAGES * PAGE_SIZE;
     if (control.heap_top <= floor_bytes) return;
     const last_footer = word(control.heap_top - FOOTER_SIZE).*;
@@ -762,17 +769,32 @@ fn releaseTrailingPages() void {
 
     unlinkFree(last_start, last_size);
     const bytes = control.heap_top - uncommit_start;
-    control.uncommit_calls +%= 1;
-    virt.uncommit(control.range_id, @intCast(uncommit_start), @intCast(bytes)) catch {
-        control.uncommit_failures +%= 1;
-        insertFree(last_start, last_size);
-        return;
-    };
-    control.uncommitted_pages_total +%= bytes / PAGE_SIZE;
-    if (under_pressure) control.pressure_releases +%= 1;
+    // Retire the entire requested tail before the first destructive VM call.
+    // A failed call may already have removed a prefix, so neither its old
+    // footer nor any part of that tail may re-enter the allocation bins.
     control.committed_pages = uncommit_start / PAGE_SIZE;
     control.heap_top = uncommit_start;
     if (remainder != 0) insertFree(last_start, remainder);
+    control.pending_uncommit_start = uncommit_start;
+    control.pending_uncommit_bytes = bytes;
+    control.pending_uncommit_pressure = under_pressure;
+    _ = finishPendingTail();
+}
+
+fn finishPendingTail() bool {
+    const bytes = control.pending_uncommit_bytes;
+    if (bytes == 0) return true;
+    control.uncommit_calls +%= 1;
+    virt.uncommit(control.range_id, @intCast(control.pending_uncommit_start), @intCast(bytes)) catch {
+        control.uncommit_failures +%= 1;
+        return false;
+    };
+    control.uncommitted_pages_total +%= bytes / PAGE_SIZE;
+    if (control.pending_uncommit_pressure) control.pressure_releases +%= 1;
+    control.pending_uncommit_start = 0;
+    control.pending_uncommit_bytes = 0;
+    control.pending_uncommit_pressure = false;
+    return true;
 }
 
 fn memoryUnderPressure() bool {

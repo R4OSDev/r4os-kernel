@@ -907,14 +907,14 @@ pub fn release(id: u32) Error!void {
     owner_locks.virtual_memory.release(release_irq_flags);
 }
 
-pub fn releaseOwner(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) u64 {
+pub fn releaseOwner(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) Error!u64 {
     const owner_irq_flags = owner_locks.virtual_memory.acquire();
     defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return 0;
+    if (!initialized) return Error.NotInitialized;
     var released: u64 = 0;
     while (true) {
         const id = firstOwnedRange(owner, owner_id, kind) orelse break;
-        release(id) catch break;
+        try release(id);
         released += 1;
     }
     return released;
@@ -1325,7 +1325,20 @@ fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) 
         range.partial_uncommit_cursor
     else
         start;
+    var committed = range.commit_span_head;
     while (virt < end) {
+        // Commit metadata is ordered and remains intact until this request
+        // completes. Resume through its spans, jumping over reserved holes.
+        while (committed) |slot| {
+            const span = &commit_spans[slot];
+            if (span.base + span.len > virt) break;
+            committed = span.next;
+        }
+        const slot = committed orelse break;
+        const span = &commit_spans[slot];
+        virt = @max(virt, span.base);
+        if (virt >= end) break;
+        const span_end = @min(end, span.base + span.len);
         const frame = paging.mappedFrame(virt) orelse {
             virt += paging.PAGE_SIZE;
             advancePartialUncommitCursor(range, virt);
@@ -1334,7 +1347,7 @@ fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) 
         // Eager resident buffers commonly contain contiguous extents. Use
         // the same bounded, acknowledged unmap as other VM, retaining both
         // PTEs and frames if invalidation fails. Sparse holes remain valid.
-        const max_pages = page_batch.boundedPageCount((end - virt) / paging.PAGE_SIZE);
+        const max_pages = page_batch.boundedPageCount((span_end - virt) / paging.PAGE_SIZE);
         const claimed_pages = blocks.claimedPhysicalPrefix(frame, max_pages * paging.PAGE_SIZE) / paging.PAGE_SIZE;
         if (claimed_pages == 0) return Error.NotCommitted;
         var run_pages: u64 = 1;
