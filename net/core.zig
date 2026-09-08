@@ -491,6 +491,8 @@ pub const BackendStatus = extern struct {
 };
 
 pub const Adapter = struct {
+    // Stable during this boot, including when the enumeration array compacts.
+    registration_id: u32 = 0,
     name: []const u8 = "",
     driver: []const u8 = "",
     bus: Bus = .unknown,
@@ -544,6 +546,7 @@ const AppIpv4Queue = struct {
 
 var adapters: [MAX_ADAPTERS]Adapter = undefined;
 var adapter_count: usize = 0;
+var next_adapter_registration: u32 = 1;
 var system_transition_active: bool = false;
 var backend_admission_closed: bool = false;
 var backend_mutation_active: bool = false;
@@ -842,8 +845,10 @@ fn parseBoundedTestCount(value: ?[]const u8) u8 {
 }
 
 pub fn register(adapter: Adapter) ?usize {
-    if (adapter_count >= MAX_ADAPTERS) return null;
+    if (adapter_count >= MAX_ADAPTERS or next_adapter_registration > 0x7FFF_FFFF) return null;
     var normalized = adapter;
+    normalized.registration_id = next_adapter_registration;
+    next_adapter_registration += 1;
     const now = time_core.monotonicTicks();
     normalized.registered_tick = now;
     normalized.state_changed_tick = now;
@@ -851,6 +856,16 @@ pub fn register(adapter: Adapter) ?usize {
     adapters[adapter_count] = normalized;
     adapter_count += 1;
     return adapter_count - 1;
+}
+
+/// Registration IDs are never recycled within a boot; zero is not a handle.
+/// Callers resolving a driver reference hold a backend callback admission.
+pub fn indexForRegistration(registration: u32) ?usize {
+    if (registration == 0) return null;
+    for (adapters[0..adapter_count], 0..) |adapter, index| {
+        if (adapter.registration_id == registration) return index;
+    }
+    return null;
 }
 
 pub fn unregister(index: usize) bool {
@@ -1033,7 +1048,7 @@ fn drainBackendCallbacks(reason: []const u8) bool {
     return true;
 }
 
-fn enterBackendCallback() bool {
+pub fn enterBackendCallback() bool {
     if (@atomicLoad(bool, &backend_admission_closed, .acquire)) return false;
     _ = @atomicRmw(u32, &backend_callback_count, .Add, 1, .acq_rel);
     if (!@atomicLoad(bool, &backend_admission_closed, .acquire)) return true;
@@ -1041,7 +1056,7 @@ fn enterBackendCallback() bool {
     return false;
 }
 
-fn leaveBackendCallback() void {
+pub fn leaveBackendCallback() void {
     _ = @atomicRmw(u32, &backend_callback_count, .Sub, 1, .release);
 }
 

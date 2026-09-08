@@ -340,7 +340,7 @@ const R4DStorageBackend = struct {
 const R4DNetBackend = struct {
     used: bool = false,
     owner: u32 = 0,
-    adapter_index: usize = 0,
+    registration_id: u32 = 0,
     name: [MAX_R4D_NET_NAME]u8 = .{0} ** MAX_R4D_NET_NAME,
     name_len: usize = 0,
     descriptor: *const NetBackendDescriptor = undefined,
@@ -2181,6 +2181,8 @@ fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.
         bootlog.puts("\r\n");
         return -4;
     };
+    if (!net.beginBackendMutation()) return -5;
+    defer net.endBackendMutation();
     const slot_index = freeR4DNetBackendSlot() orelse {
         bootlog.puts("[R4D][ERROR] net backend table full\r\n");
         return -2;
@@ -2221,7 +2223,7 @@ fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.
         return -3;
     };
 
-    slot.adapter_index = adapter_index;
+    slot.registration_id = net.get(adapter_index).?.registration_id;
     bootlog.puts("[R4D] register net backend ");
     bootlog.puts(slot.name[0..slot.name_len]);
     bootlog.puts(" adapter=");
@@ -2235,7 +2237,7 @@ fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.
     bootlog.puts("/");
     bootlog.putDec(negotiation.tx_queue_count);
     bootlog.puts("\r\n");
-    return @intCast(adapter_index);
+    return @intCast(slot.registration_id);
 }
 
 fn validAudioBackend(descriptor: *const AudioBackendDescriptor) bool {
@@ -2491,9 +2493,12 @@ fn r4dNetStatus(adapter_index: usize, out: *net.BackendStatus) i32 {
 }
 
 fn netReceiveFrame(adapter_index: i32, frame: [*]const u8, len: u32) callconv(.c) i32 {
+    if (!net.enterBackendCallback()) return -3;
+    defer net.leaveBackendCallback();
     if (adapter_index < 0) return -1;
     if (len == 0 or len > net.MAX_PACKET_SIZE) return -2;
-    const index: usize = @intCast(adapter_index);
+    const backend = findR4DNetRegistration(adapter_index) orelse return -1;
+    const index = net.indexForRegistration(backend.registration_id) orelse return -1;
     const slice = frame[0..@intCast(len)];
     return switch (net.receiveFrame(index, slice)) {
         .accepted => 0,
@@ -2507,24 +2512,31 @@ fn netReceiveFrame(adapter_index: i32, frame: [*]const u8, len: u32) callconv(.c
 }
 
 fn netScheduleRx(adapter_index: i32) callconv(.c) i32 {
+    if (!net.enterBackendCallback()) return -3;
+    defer net.leaveBackendCallback();
     if (adapter_index < 0) return -1;
-    const index: usize = @intCast(adapter_index);
+    const backend = findR4DNetRegistration(adapter_index) orelse return -1;
+    const index = net.indexForRegistration(backend.registration_id) orelse return -1;
     if (index >= net.count()) return -1;
     return if (net.scheduleRxWork(index)) 0 else -3;
 }
 
 fn netBackendQuery(adapter_index: i32, out: *NetBackendNegotiation) callconv(.c) i32 {
+    if (!net.enterBackendCallback()) return -3;
+    defer net.leaveBackendCallback();
     if (adapter_index < 0) return -1;
     if (!net_backend.validNegotiationQuery(out)) return -2;
-    const backend = findR4DNetBackend(@intCast(adapter_index)) orelse return -1;
+    const backend = findR4DNetRegistration(adapter_index) orelse return -1;
     out.* = backend.negotiation;
     return 0;
 }
 
 fn netReceivePacket(adapter_index: i32, packet: *const NetPacket) callconv(.c) i32 {
+    if (!net.enterBackendCallback()) return -3;
+    defer net.leaveBackendCallback();
     if (adapter_index < 0) return -1;
-    const index: usize = @intCast(adapter_index);
-    const backend = findR4DNetBackend(index) orelse return -1;
+    const backend = findR4DNetRegistration(adapter_index) orelse return -1;
+    const index = net.indexForRegistration(backend.registration_id) orelse return -1;
     if (!net_backend.validRxPacket(packet, backend.negotiation, net.MAX_PACKET_SIZE)) return -2;
     const frame_ptr: [*]const u8 = @ptrFromInt(packet.fallback_addr);
     const frame = frame_ptr[0..@intCast(packet.fallback_bytes)];
@@ -2714,12 +2726,15 @@ fn cleanupNetOwner(owner: u32) NetOwnerCleanupResult {
                 continue;
             }
         }
-        const removed_adapter = net.unregister(backend.adapter_index);
+        const adapter_index = net.indexForRegistration(backend.registration_id) orelse {
+            result.failed = true;
+            continue;
+        };
+        const removed_adapter = net.unregister(adapter_index);
         if (!removed_adapter) {
             result.failed = true;
             continue;
         }
-        fixR4DNetAdapterIndexes(backend.adapter_index);
         backend.* = R4DNetBackend{};
         result.removed += 1;
     }
@@ -2733,15 +2748,6 @@ fn ownerHasNetBackend(owner: u32) bool {
     return false;
 }
 
-fn fixR4DNetAdapterIndexes(removed_index: usize) void {
-    var index: usize = 0;
-    while (index < r4d_net_backends.len) : (index += 1) {
-        const backend = &r4d_net_backends[index];
-        if (!backend.used or backend.adapter_index <= removed_index) continue;
-        backend.adapter_index -= 1;
-    }
-}
-
 fn findR4DStorageBackendByName(name: [*:0]const u8) ?*R4DStorageBackend {
     var index: usize = 0;
     while (index < r4d_storage_backends.len) : (index += 1) {
@@ -2752,9 +2758,14 @@ fn findR4DStorageBackendByName(name: [*:0]const u8) ?*R4DStorageBackend {
 }
 
 fn findR4DNetBackend(adapter_index: usize) ?*R4DNetBackend {
-    var index: usize = 0;
-    while (index < r4d_net_backends.len) : (index += 1) {
-        if (r4d_net_backends[index].used and r4d_net_backends[index].adapter_index == adapter_index) return &r4d_net_backends[index];
+    const adapter = net.get(adapter_index) orelse return null;
+    return findR4DNetRegistration(@intCast(adapter.registration_id));
+}
+
+fn findR4DNetRegistration(registration: i32) ?*R4DNetBackend {
+    if (registration <= 0) return null;
+    for (&r4d_net_backends) |*backend| {
+        if (backend.used and backend.registration_id == @as(u32, @intCast(registration))) return backend;
     }
     return null;
 }
