@@ -84,6 +84,9 @@ pub fn initTaskRuntime() bool {
     log.puts("  Page-cache policy worker ");
     log.puts("[OK]\r\n");
 
+    if (!audio.startProgressWorker()) return false;
+    log.puts("  Audio progress worker [OK]\r\n");
+
     task_runtime_initialized = true;
     // The platform timer handoff leaves the boot stack with IF=0. New tasks
     // enable interrupts in their trampoline, but kernel-main needs the same

@@ -3,6 +3,7 @@ const std = @import("std");
 const heap = @import("../memory/heap.zig");
 const phys = @import("../memory/phys.zig");
 const sync = @import("../sched/sync.zig");
+const sched_task = @import("../sched/task.zig");
 const timer = @import("../kernel/timer.zig");
 const protocol_api = @import("../kernel/protocol_api.zig");
 const r4p = @import("../program/r4p.zig");
@@ -203,6 +204,10 @@ const AudioBackend = struct {
 var empty_ring: [0]u8 = .{};
 var streams: [MAX_STREAMS]Stream = .{Stream{}} ** MAX_STREAMS;
 var stream_lock = sync.Mutex.initClass("audio-streams", sync.LockRank.audio_core, .sleepable);
+var progress_event = sync.EventV2.initMode(false, .auto_reset);
+var mix_progress_due: u64 = std.math.maxInt(u64);
+var backend_progress_due: u64 = std.math.maxInt(u64);
+var progress_worker_started = false;
 var mix_scratch: [MIX_QUANTUM_BYTES]u8 = .{0} ** MIX_QUANTUM_BYTES;
 var next_stream_id: u32 = 1;
 var audio_backends: [MAX_AUDIO_BACKENDS]AudioBackend = .{AudioBackend{}} ** MAX_AUDIO_BACKENDS;
@@ -305,6 +310,8 @@ pub const PerformanceSummary = struct {
 };
 
 pub fn init() void {
+    @atomicStore(u64, &mix_progress_due, std.math.maxInt(u64), .release);
+    @atomicStore(u64, &backend_progress_due, std.math.maxInt(u64), .release);
     for (&streams) |*stream| {
         const reusable_ring = stream.ring;
         stream.* = .{};
@@ -362,6 +369,68 @@ pub fn init() void {
     resetSidProtocolCounters();
     registerMixerBackend("SimpleKernelMixer", null);
     bootlog.puts("[AUDIO] core ready pcm u8/s16le mono/stereo\r\n");
+}
+
+// The kernel owns these stream rings and their backend callbacks. This worker
+// only completes pending output; it has no app policy and no idle polling.
+pub fn startProgressWorker() bool {
+    if (progress_worker_started) return true;
+    _ = sched_task.createKernelThreadWithRole("audio-progress", progressWorker, .short_completion) orelse return false;
+    progress_worker_started = true;
+    return true;
+}
+
+fn scheduleProgress(pending: *u64, milliseconds: u64) void {
+    const ticks = @max(@as(u64, 1), (milliseconds * timer.frequency() + 999) / 1000);
+    const due = timer.deadlineAfterNow(ticks);
+    var previous = @atomicLoad(u64, pending, .acquire);
+    while (due < previous) {
+        previous = @cmpxchgWeak(u64, pending, previous, due, .acq_rel, .acquire) orelse {
+            progress_event.signal();
+            return;
+        };
+    }
+}
+
+fn progressWorker() callconv(.c) void {
+    while (true) {
+        const now = timer.tickCount();
+        if (runProgressIfDue(now)) continue;
+        const due = nextProgressTick();
+        _ = progress_event.waitResult(if (due == std.math.maxInt(u64)) sync.WAIT_FOREVER else due -| now);
+    }
+}
+
+fn nextProgressTick() u64 {
+    return @min(@atomicLoad(u64, &mix_progress_due, .acquire), @atomicLoad(u64, &backend_progress_due, .acquire));
+}
+
+fn claimProgress(pending: *u64, now: u64) bool {
+    const due = @atomicLoad(u64, pending, .acquire);
+    return due != std.math.maxInt(u64) and now >= due and
+        @cmpxchgStrong(u64, pending, due, std.math.maxInt(u64), .acq_rel, .acquire) == null;
+}
+
+fn runProgressIfDue(now: u64) bool {
+    if (now < nextProgressTick()) return false;
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return false;
+    defer _ = stream_lock.unlock();
+    if (claimProgress(&mix_progress_due, now) and pumpAvailableLocked(true) == r4x_api.service_api_result_busy)
+        scheduleProgress(&mix_progress_due, 2);
+    if (claimProgress(&backend_progress_due, now)) serviceBackendProgressLocked();
+    return true;
+}
+
+fn serviceBackendProgressLocked() void {
+    // Drivers already advance their owned DMA queue in this bounded callback.
+    // A successful write gets one delayed observation even before the first
+    // completion interrupt; a contended driver explicitly requests a retry.
+    const slot = active_audio_slot orelse return;
+    const backend = &audio_backends[slot];
+    if (backend.status_ctx) |status| {
+        var value: BackendStatus = .{};
+        if (status(backend.context, &value) == r4x_api.service_api_result_busy) scheduleProgress(&backend_progress_due, 2);
+    }
 }
 
 pub fn configureSidModel(model: []const u8) void {
@@ -504,7 +573,7 @@ pub fn writeStreamForOwner(owner: StreamOwner, id: u32, ptr: [*]const u8, byte_c
         stream_write_truncations +%= 1;
     }
 
-    _ = pumpAvailableLocked(false);
+    if (pumpAvailableLocked(false) == r4x_api.service_api_result_busy) scheduleProgress(&mix_progress_due, 2);
     recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
     return @intCast(accepted_bytes);
 }
@@ -846,6 +915,8 @@ pub fn registerExternalAudioBackendZ(name: [*:0]const u8, limits: BackendPcmLimi
 }
 
 pub fn registerExternalAudioOutputs(name: []const u8, outputs: AudioOutputExtension) bool {
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return false;
+    defer _ = stream_lock.unlock();
     const slot = findAudioBackend(name) orelse return false;
     audio_backends[slot].outputs = outputs;
     initial_output_pending = true;
@@ -963,6 +1034,8 @@ pub fn registerExternalSynthEngineZ(name: [*:0]const u8, flags: u32, context: ?*
 }
 
 pub fn unregisterAudioBackendByName(name: []const u8) i32 {
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
+    defer _ = stream_lock.unlock();
     const slot = findAudioBackend(name) orelse return -1;
     const was_active = active_audio_slot == slot;
     if (was_active) stopActivePcm();
@@ -1564,6 +1637,8 @@ fn registerMixerBackend(name: []const u8, backend: ?*const anyopaque) void {
 }
 
 fn registerAudioBackendInternal(name: []const u8, backend: ?*const anyopaque, write_pcm: ?WritePcmFn, stop_pcm: ?StopPcmFn, context: ?*anyopaque, write_pcm_ctx: ?WritePcmCtxFn, stop_pcm_ctx: ?StopPcmCtxFn, status_ctx: ?StatusCtxFn, pcm_limits: ?BackendPcmLimits) bool {
+    if (!stream_lock.lock(sync.WAIT_FOREVER)) return false;
+    defer _ = stream_lock.unlock();
     const slot = findAudioBackend(name) orelse freeAudioBackendSlot() orelse {
         bootlog.puts("[AUDIO][WARN] audio backend registry full\r\n");
         return false;
@@ -1614,9 +1689,14 @@ fn writeActivePcm(data: []const u8, rate: u32, channels: u16, format: u16) ?i32 
     if (backend.pcm_limits) |limits| {
         if (!limits.accepts(rate, channels, format)) return r4x_api.service_api_result_invalid;
     }
-    if (backend.write_pcm) |write_pcm| return if (write_pcm(data, rate, channels, format)) 0 else -1;
-    if (backend.write_pcm_ctx) |write_pcm_ctx| return write_pcm_ctx(backend.context, data.ptr, @intCast(data.len), rate, channels, format);
-    return null;
+    const result = if (backend.write_pcm) |write_pcm|
+        if (write_pcm(data, rate, channels, format)) @as(i32, 0) else @as(i32, -1)
+    else if (backend.write_pcm_ctx) |write_pcm_ctx|
+        write_pcm_ctx(backend.context, data.ptr, @intCast(data.len), rate, channels, format)
+    else
+        return null;
+    if (result == 0) scheduleProgress(&backend_progress_due, 10);
+    return result;
 }
 
 fn stopActivePcm() void {
@@ -1922,6 +2002,7 @@ fn pumpAvailableLocked(force: bool) i32 {
             const stream = &streams[single_ready];
             if (open_count > 1 and !force and !stream.deferred_once) {
                 stream.deferred_once = true;
+                scheduleProgress(&mix_progress_due, 2);
                 return 0;
             }
             selected[single_ready] = true;
