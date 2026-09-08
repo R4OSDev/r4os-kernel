@@ -223,6 +223,9 @@ const Endpoint = struct {
     admission_timeouts: u64 = 0,
     requests_available: sync.WaitQueue = sync.WaitQueue.init(),
     slots_available: sync.Semaphore = sync.Semaphore.init(@intCast(API_ENDPOINT_QUEUE_DEPTH), @intCast(API_ENDPOINT_QUEUE_DEPTH)),
+    // Admission order is independent of payload-slot reuse and request-ID wrap.
+    queued_slots: [API_ENDPOINT_QUEUE_DEPTH]usize = undefined,
+    queued_count: usize = 0,
     queue: [API_ENDPOINT_QUEUE_DEPTH]RequestSlot = .{RequestSlot{}} ** API_ENDPOINT_QUEUE_DEPTH,
 };
 
@@ -1413,6 +1416,8 @@ fn publishRequestLocked(ep: *Endpoint, client_id: u32, op: u16, payload: []const
     }
     // Der Zustand wird zuletzt publiziert. Damit sind nur die neu gesetzten
     // Laengen sichtbar; alte Bytes hinter request_len bleiben unerreichbar.
+    ep.queued_slots[ep.queued_count] = slot_idx;
+    ep.queued_count += 1;
     slot.state = .queued;
     ep.requests +%= 1;
     noteQueueHighWater(ep);
@@ -1437,6 +1442,7 @@ pub fn recvRequest(handle: u32, header: *ApiMessageHeader, out: []u8) i32 {
         ep.lifetime.payload_copy_bytes +%= len;
     }
     fillMessageHeader(slot, header, slot.request_len, API_OK);
+    removeQueuedSlot(ep, slot);
     slot.state = .delivered;
     noteActiveWorkers(ep);
     return @intCast(len);
@@ -1730,23 +1736,24 @@ fn freeRequestSlot(ep: *Endpoint) ?usize {
 }
 
 fn queuedRequestSlot(ep: *Endpoint) ?usize {
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == .queued) {
-            noteQueueScan(ep, i + 1);
-            return i;
-        }
-    }
-    noteQueueScan(ep, ep.queue.len);
-    return null;
+    if (ep.queued_count == 0) return null;
+    noteQueueScan(ep, 1);
+    return ep.queued_slots[0];
 }
 
 fn hasQueuedRequest(ep: *const Endpoint) bool {
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == .queued) return true;
+    return ep.queued_count != 0;
+}
+
+fn removeQueuedSlot(ep: *Endpoint, slot: *const RequestSlot) void {
+    for (ep.queued_slots[0..ep.queued_count], 0..) |slot_index, index| {
+        if (&ep.queue[slot_index] != slot) continue;
+        noteQueueScan(ep, index + 1);
+        std.mem.copyForwards(usize, ep.queued_slots[index .. ep.queued_count - 1], ep.queued_slots[index + 1 .. ep.queued_count]);
+        ep.queued_count -= 1;
+        return;
     }
-    return false;
+    unreachable; // All callers hold the endpoint owner and remove a queued slot.
 }
 
 fn requestSlotById(ep: *Endpoint, request_id: u32) ?usize {
@@ -1812,6 +1819,7 @@ fn noteActiveWorkers(ep: *Endpoint) void {
 }
 
 fn clearRequestSlot(ep: *Endpoint, slot: *RequestSlot) void {
+    if (slot.state == .queued) removeQueuedSlot(ep, slot);
     _ = slot.response_available.close(.cancelled);
     resetRequestSlotMetadata(slot);
     ep.lifetime.slot_metadata_resets +%= 1;
@@ -1855,6 +1863,7 @@ fn resetEndpointMetadata(ep: *Endpoint, count_reset: bool) void {
     ep.targeted_response_wake_misses = 0;
     ep.admission_waits = 0;
     ep.admission_timeouts = 0;
+    ep.queued_count = 0;
     ep.requests_available = sync.WaitQueue.init();
     ep.slots_available = sync.Semaphore.init(@intCast(API_ENDPOINT_QUEUE_DEPTH), @intCast(API_ENDPOINT_QUEUE_DEPTH));
     for (&ep.queue) |*slot| resetRequestSlotMetadata(slot);
