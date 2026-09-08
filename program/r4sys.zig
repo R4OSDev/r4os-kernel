@@ -2707,6 +2707,10 @@ pub fn fileRename(old_ptr: [*:0]const u8, new_ptr: [*:0]const u8) callconv(.c) i
 /// FILE RENAME deliberately keeps its compatibility fallback; this API never
 /// calls it and reports `not_atomic` for every unsupported shape.
 pub fn fileReplaceAtomic(target_ptr: [*:0]const u8, staged_ptr: [*:0]const u8, backup_ptr: [*:0]const u8, flags: u32) callconv(.c) i32 {
+    return fileReplaceAtomicImpl(target_ptr, staged_ptr, backup_ptr, flags, true);
+}
+
+fn fileReplaceAtomicImpl(target_ptr: [*:0]const u8, staged_ptr: [*:0]const u8, backup_ptr: [*:0]const u8, flags: u32, external_registry_change: bool) i32 {
     if (flags == 0 or (flags & ~file_replace_atomic_supported_flags) != 0) return file_replace_atomic_error_invalid;
     const consume_stage = (flags & file_replace_atomic_flag_consume_stage) != 0;
     const require_target_absent = (flags & file_replace_atomic_flag_require_target_absent) != 0;
@@ -2900,6 +2904,14 @@ pub fn fileReplaceAtomic(target_ptr: [*:0]const u8, staged_ptr: [*:0]const u8, b
     }
     if (result == .ok) {
         if (owned_stage_slot) |slot| clearStreamSlot(slot);
+    }
+    // External hive replacement may have changed the disk even on an I/O
+    // failure. Internal registry commits publish their retained candidate
+    // themselves and must not invalidate it here.
+    if (external_registry_change) {
+        invalidateRegistryCacheIfHivePath(raw_target);
+        invalidateRegistryCacheIfHivePath(raw_staged);
+        invalidateRegistryCacheIfHivePath(raw_backup);
     }
     ok = result == .ok;
     return switch (result) {
@@ -4604,10 +4616,10 @@ fn commitRegistrySlotUnderTransaction(slot_index: u8, stage_prepared: bool) Regi
         }
     }
 
-    var replaced = fileReplaceAtomic(hive_path, tmp_path, bak_path, file_replace_atomic_flag_consume_stage);
+    var replaced = fileReplaceAtomicImpl(hive_path, tmp_path, bak_path, file_replace_atomic_flag_consume_stage, false);
     if (replaced == file_replace_atomic_error_io) {
         noteRegistryAtomicRetry();
-        replaced = fileReplaceAtomic(hive_path, tmp_path, bak_path, file_replace_atomic_flag_consume_stage);
+        replaced = fileReplaceAtomicImpl(hive_path, tmp_path, bak_path, file_replace_atomic_flag_consume_stage, false);
     }
     if (replaced != file_replace_atomic_result_ok) {
         return .{ .result = registry_api_result_io, .uncertain = replaced == file_replace_atomic_error_io };
