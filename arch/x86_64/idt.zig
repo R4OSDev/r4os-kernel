@@ -243,8 +243,7 @@ pub export fn ipiDispatch(frame: *const InterruptFrame) callconv(.c) void {
         STOP_VECTOR => {
             lapic.endOfInterrupt();
             const index = percpu.currentIndex();
-            percpu.setSchedulable(index, false);
-            _ = percpu.setState(index, .offline);
+            _ = percpu.transition(index, .stopping, .offline);
             interrupts.haltForever();
         },
         TLB_VECTOR => {

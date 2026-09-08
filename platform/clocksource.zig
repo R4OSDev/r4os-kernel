@@ -249,17 +249,17 @@ pub fn registerCurrentCpu(index: u32) bool {
     return true;
 }
 
-/// BSP-side publication barrier after an AP reaches `parked`. A failed AP
-/// clock qualification demotes all CPUs to HPET rather than rejecting the AP.
+/// BSP-side qualification after an AP reaches `parked`. A missing local
+/// correlation uses the shared HPET/periodic fallback where available;
+/// admission fails if an uncorrected TSC remains the only active source.
 pub fn finalizeCpuRegistration(index: u32) bool {
-    if (index >= percpu.max_cpus) return false;
+    if (index >= percpu.max_cpus or percpu.state(index) != .parked) return false;
     const bit = @as(u64, 1) << @intCast(index);
     if ((@atomicLoad(u64, &registered_cpu_mask, .acquire) & bit) != 0) return true;
     fallbackToHpet(.cpu_skew);
-    if (activeSource() == .hpet) {
-        _ = @atomicRmw(u64, &registered_cpu_mask, .Or, bit, .acq_rel);
-    }
-    return false;
+    if (activeSource() == .tsc) return false;
+    _ = @atomicRmw(u64, &registered_cpu_mask, .Or, bit, .acq_rel);
+    return true;
 }
 
 /// Low-frequency BSP watchdog. The timer owner calls this at a bounded IRQ
@@ -368,7 +368,7 @@ pub fn status() Status {
         .tsc_invariant = tsc_invariant,
         .tsc_hpet_calibrated = tsc_hpet_calibrated,
         .hpet_available = hpet_configured,
-        .registered_cpu_mask = @atomicLoad(u64, &registered_cpu_mask, .acquire),
+        .registered_cpu_mask = @atomicLoad(u64, &registered_cpu_mask, .acquire) & percpu.clockQualifiedMask(),
         .max_cpu_skew_ns = @atomicLoad(u64, &max_cpu_skew_ns, .acquire),
         .calibration_error_ppm = calibration_error_ppm,
         .fallback_reason = @enumFromInt(@atomicLoad(u32, &fallback_reason_raw, .acquire)),

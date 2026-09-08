@@ -3,6 +3,7 @@
 
 const msr = @import("msr.zig");
 const builtin = @import("builtin");
+const interrupts = @import("interrupts.zig");
 
 pub const max_cpus: usize = 32;
 
@@ -18,6 +19,8 @@ pub const State = enum(u8) {
     stopping,
     offline,
     failed,
+    // BSP completed clock registration; the AP may activate after release.
+    qualified,
 };
 
 pub const CpuLocal = extern struct {
@@ -82,18 +85,69 @@ pub fn at(index: u32) ?*CpuLocal {
     return &locals[index];
 }
 
-pub fn configure(index: u32, apic_id: u32, new_state: State) bool {
+/// Only the BSP configures previously absent slots, before sending INIT/SIPI.
+pub fn configure(index: u32, apic_id: u32) bool {
     const local = at(index) orelse return false;
+    const flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(flags);
+    if (state(index) != .absent) return false;
     local.index = index;
     local.apic_id = apic_id;
-    @atomicStore(u8, &local.state, @intFromEnum(new_state), .release);
+    @atomicStore(u8, &local.state, @intFromEnum(State.detected), .release);
     return true;
 }
 
-pub fn setState(index: u32, new_state: State) bool {
+/// The scheduler runtime owner serializes lifecycle and scheduling-mask
+/// publication. No hardware operation or wait is performed under this owner.
+pub fn transition(index: u32, from: State, to: State) bool {
+    if (!allowedTransition(from, to)) return false;
+    const flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(flags);
+    return transitionHeld(index, from, to);
+}
+
+/// Rejection competes with online publication, and can never retire an AP
+/// which already won admission. Repeated rejection remains idempotent.
+pub fn rejectStart(index: u32) bool {
+    const flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(flags);
+    const before = state(index);
+    if (before == .failed) return true;
+    if (!allowedTransition(before, .failed)) return false;
+    return transitionHeld(index, before, .failed);
+}
+
+fn allowedTransition(from: State, to: State) bool {
+    return switch (from) {
+        .detected => to == .starting or to == .failed,
+        .starting => to == .parked or to == .failed,
+        .parked => to == .qualified or to == .failed,
+        .qualified => to == .online or to == .failed,
+        .online => to == .stopping,
+        .stopping => to == .offline,
+        .absent, .offline, .failed => false,
+    };
+}
+
+fn transitionHeld(index: u32, from: State, to: State) bool {
     const local = at(index) orelse return false;
-    @atomicStore(u8, &local.state, @intFromEnum(new_state), .release);
+    if (@cmpxchgStrong(u8, &local.state, @intFromEnum(from), @intFromEnum(to), .acq_rel, .acquire) != null) return false;
+    setSchedulableHeld(index, to == .online);
     return true;
+}
+
+/// Prepared clock samples are visible as registered CPUs only after the BSP
+/// confirms them. Rejected and offline CPUs cannot reappear via a late sample.
+pub fn clockQualifiedMask() u64 {
+    var mask: u64 = 0;
+    var index: u32 = 0;
+    while (index < max_cpus) : (index += 1) {
+        switch (state(index)) {
+            .qualified, .online, .stopping => mask |= @as(u64, 1) << @intCast(index),
+            else => {},
+        }
+    }
+    return mask;
 }
 
 pub fn state(index: u32) State {
@@ -126,7 +180,7 @@ pub fn workActive(index: u32) bool {
     return @atomicLoad(u8, &local.work_active, .acquire) != 0;
 }
 
-pub fn setSchedulable(index: u32, enabled: bool) void {
+fn setSchedulableHeld(index: u32, enabled: bool) void {
     if (index >= max_cpus) return;
     const mask = @as(u64, 1) << @intCast(index);
     if (enabled) {

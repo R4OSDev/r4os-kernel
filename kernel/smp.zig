@@ -100,6 +100,7 @@ pub const Status = struct {
 
 var current: Status = .{};
 var release_aps: bool = false;
+var reported_failures: u64 = 0;
 var topology: policy.Plan = .{};
 var trampoline_phys: [percpu.max_cpus]u64 = .{0} ** percpu.max_cpus;
 var ap_boot_stacks: [percpu.max_cpus][AP_STACK_SIZE]u8 align(64) = undefined;
@@ -175,7 +176,7 @@ pub fn startApplicationProcessors(info: acpi.Info) bool {
     var index: u32 = 1;
     while (index < topology.count) : (index += 1) {
         const apic_id = topology.apic_ids[index];
-        _ = percpu.configure(index, apic_id, .detected);
+        if (!percpu.configure(index, apic_id)) continue;
         if (comptime config.smp_fail_ap_index != 0xFFFF_FFFF) {
             if (index == config.smp_fail_ap_index) {
                 failAp(index, false, "diagnostic-injection");
@@ -190,7 +191,7 @@ pub fn startApplicationProcessors(info: acpi.Info) bool {
             failAp(index, false, "idle-task");
             continue;
         }
-        _ = percpu.setState(index, .starting);
+        if (!percpu.transition(index, .detected, .starting)) continue;
         const vector: u8 = @intCast(low_page >> 12);
         if (!lapic.sendInitSipi(apic_id, vector)) {
             failAp(index, false, "init-sipi");
@@ -200,12 +201,18 @@ pub fn startApplicationProcessors(info: acpi.Info) bool {
             failAp(index, true, "startup-timeout");
             continue;
         }
-        // A clock-qualification failure does not discard a healthy AP. The
-        // shared clocksource instead demotes every CPU to HPET atomically.
-        _ = monotonic.finalizeCpuRegistration(index);
-        current.started += 1;
+        if (!qualifyParkedAp(index)) failAp(index, false, "clock-registration");
     }
     logSummary("parked");
+    return true;
+}
+
+/// A parked AP cannot use the global release until this BSP-side step
+/// completes. The clock owner may choose its existing shared fallback.
+fn qualifyParkedAp(index: u32) bool {
+    if (percpu.state(index) != .parked or !monotonic.finalizeCpuRegistration(index)) return false;
+    if (!percpu.transition(index, .parked, .qualified)) return false;
+    current.started += 1;
     return true;
 }
 
@@ -216,12 +223,11 @@ pub fn activate() void {
     var index: u32 = 1;
     while (index < topology.count) : (index += 1) {
         const before = percpu.state(index);
-        if (before == .online) {
-            current.online += 1;
-        } else if (before == .parked and waitForState(index, .online, AP_START_TIMEOUT_NS)) {
-            current.online += 1;
-        } else if (before == .parked) {
+        if (before == .qualified and !waitForState(index, .online, AP_START_TIMEOUT_NS)) {
+            // An online publication at the deadline wins over rejection.
             failAp(index, true, "activation-timeout");
+        } else if (before == .failed) {
+            failAp(index, false, "ap-init");
         }
     }
     current.activated = true;
@@ -696,16 +702,25 @@ pub fn runAcceptanceProbeIfEnabled(usable_bytes: u64) bool {
 }
 
 pub fn status() Status {
-    return current;
+    var result = current;
+    result.online = 0;
+    result.failed = 0;
+    var index: u32 = 0;
+    while (index < @max(topology.count, 1)) : (index += 1) {
+        switch (percpu.state(index)) {
+            .online => result.online += 1,
+            .failed => result.failed += 1,
+            else => {},
+        }
+    }
+    return result;
 }
 
 pub fn stopOthers() void {
     if (!current.initialized) return;
     var index: u32 = 1;
     while (index < topology.count) : (index += 1) {
-        if (percpu.state(index) != .online) continue;
-        _ = percpu.setState(index, .stopping);
-        percpu.setSchedulable(index, false);
+        if (!percpu.transition(index, .online, .stopping)) continue;
         const apic_id = percpu.apicId(index) orelse continue;
         _ = lapic.sendStop(apic_id, idt.STOP_VECTOR);
     }
@@ -742,29 +757,29 @@ pub fn irqTarget(ordinal: u32) u32 {
 }
 
 pub export fn r4os_ap_entry(index_raw: u64) callconv(.c) noreturn {
+    if (index_raw == 0 or index_raw >= percpu.max_cpus) interrupts.haltForever();
     const index: u32 = @intCast(index_raw);
     gdt.initCurrent(index);
     percpu.install(index);
     idt.loadCurrent();
+    if (percpu.state(index) != .starting) interrupts.haltForever();
     if (!fpu.initCurrentCpu() or !lapic.initCurrentCpu() or !scheduler.initSecondary(index)) {
-        _ = percpu.setState(index, .failed);
+        _ = percpu.rejectStart(index);
         interrupts.haltForever();
     }
     _ = monotonic.registerCurrentCpu(index);
-    _ = percpu.setState(index, .parked);
+    if (!percpu.transition(index, .starting, .parked)) interrupts.haltForever();
     while (!@atomicLoad(bool, &release_aps, .acquire)) {
-        if (percpu.state(index) == .stopping) {
-            _ = percpu.setState(index, .offline);
-            interrupts.haltForever();
-        }
+        const state_now = percpu.state(index);
+        if (state_now == .failed or state_now == .offline) interrupts.haltForever();
         asm volatile ("pause");
     }
+    if (percpu.state(index) != .qualified) interrupts.haltForever();
     if (!lapic.startSecondaryPeriodicTimer(timer.DEFAULT_HZ)) {
-        _ = percpu.setState(index, .failed);
+        _ = percpu.rejectStart(index);
         interrupts.haltForever();
     }
-    percpu.setSchedulable(index, true);
-    _ = percpu.setState(index, .online);
+    if (!percpu.transition(index, .qualified, .online)) interrupts.haltForever();
     scheduler.secondaryLoop();
 }
 
@@ -848,9 +863,10 @@ fn waitForState(index: u32, wanted: percpu.State, timeout_ns: u64) bool {
 }
 
 fn failAp(index: u32, timeout: bool, reason: []const u8) void {
-    percpu.setSchedulable(index, false);
-    _ = percpu.setState(index, .failed);
-    current.failed += 1;
+    if (!percpu.rejectStart(index)) return;
+    const bit = @as(u64, 1) << @intCast(index);
+    if ((reported_failures & bit) != 0) return;
+    reported_failures |= bit;
     if (timeout) current.startup_timeouts += 1;
     k.puts("[SMP] ap=");
     k.putDec(index);
@@ -876,18 +892,19 @@ fn trampolineProgress(index: u32) u8 {
 }
 
 fn logSummary(stage: []const u8) void {
+    const snapshot = status();
     k.puts("[SMP] stage=");
     k.puts(stage);
     k.puts(" discovered=");
-    k.putDec(current.discovered);
+    k.putDec(snapshot.discovered);
     k.puts(" started=");
-    k.putDec(current.started);
+    k.putDec(snapshot.started);
     k.puts(" online=");
-    k.putDec(current.online);
+    k.putDec(snapshot.online);
     k.puts(" failed=");
-    k.putDec(current.failed);
+    k.putDec(snapshot.failed);
     k.puts(" fallback=");
-    k.puts(if (current.online == 1) "1cpu" else "no");
+    k.puts(if (snapshot.online == 1) "1cpu" else "no");
     k.puts("\r\n");
 }
 
