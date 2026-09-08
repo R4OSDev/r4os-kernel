@@ -56,32 +56,30 @@ var current: Status = .{};
 var devices: [MAX_DEVICES]Device = .{Device{}} ** MAX_DEVICES;
 
 pub fn configure(info: acpi.Info) void {
-    const bus_count: u64 = if (info.mcfg_base != 0 and info.mcfg_start_bus <= info.mcfg_end_bus)
-        @as(u64, info.mcfg_end_bus) - @as(u64, info.mcfg_start_bus) + 1
-    else
-        0;
+    const window = pci_scan.ecamWindow(info.mcfg_base, info.mcfg_start_bus, info.mcfg_end_bus);
     current = .{
-        .available = info.mcfg_base != 0 and bus_count != 0,
+        .available = window != null,
         .mcfg_base = info.mcfg_base,
         .segment = info.mcfg_segment,
         .start_bus = info.mcfg_start_bus,
         .end_bus = info.mcfg_end_bus,
-        .aperture_bytes = bus_count << 20,
-        .reason = if (info.mcfg_base != 0 and bus_count != 0) "MCFG configured" else "MCFG ECAM missing",
+        .aperture_bytes = if (window) |mapped| mapped.bytes else 0,
+        .reason = if (window != null) "MCFG configured" else "MCFG ECAM missing or invalid",
     };
     @memset(devices[0..], Device{});
 }
 
 pub fn activateMappedAperture() bool {
+    current.aperture_ready = false;
     if (!current.available or current.aperture_bytes == 0) return false;
-    if (current.mcfg_base > ~@as(u64, 0) - (current.aperture_bytes - 1)) {
+    const window = pci_scan.ecamWindow(current.mcfg_base, current.start_bus, current.end_bus) orelse {
         current.invalid_accesses +%= 1;
         current.reason = "MCFG ECAM range overflow";
         return false;
-    }
-    const last = current.mcfg_base + current.aperture_bytes - 1;
+    };
+    const last = window.base + window.bytes - 1;
     current.mapping_checks +%= 2;
-    const first_mapped = paging.isMapped(phys.physToVirt(current.mcfg_base));
+    const first_mapped = paging.isMapped(phys.physToVirt(window.base));
     const last_mapped = paging.isMapped(phys.physToVirt(last));
     if (first_mapped) current.mapping_hits +%= 1 else current.mapping_misses +%= 1;
     if (last_mapped) current.mapping_hits +%= 1 else current.mapping_misses +%= 1;

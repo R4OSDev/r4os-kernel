@@ -1,5 +1,6 @@
 const boot_info = @import("../bootloader/boot_info.zig");
 const acpi = @import("../platform/acpi.zig");
+const pci_scan = @import("../platform/pci_scan.zig");
 const blocks = @import("blocks.zig");
 const heap = @import("heap.zig");
 const layout = @import("layout.zig");
@@ -830,9 +831,8 @@ fn mapPlatformMmio(info: acpi.Info) bool {
 fn mapPcieEcam(info: acpi.Info) bool {
     if (info.mcfg_base == 0) return true;
     if (info.mcfg_start_bus > info.mcfg_end_bus) return true;
-    const bus_count = @as(u64, info.mcfg_end_bus) - @as(u64, info.mcfg_start_bus) + 1;
-    const len = checkedMul(bus_count, layout.MiB) orelse return false;
-    return mapMmioWindow("pcie-ecam", info.mcfg_base, len, DEVICE_ECAM);
+    const window = pci_scan.ecamWindow(info.mcfg_base, info.mcfg_start_bus, info.mcfg_end_bus) orelse return false;
+    return mapMmioWindow("pcie-ecam", window.base, window.bytes, DEVICE_ECAM);
 }
 
 fn mapMmioWindow(name: []const u8, phys_base: u64, len: u64, bit: u32) bool {

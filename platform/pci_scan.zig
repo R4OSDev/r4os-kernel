@@ -127,10 +127,21 @@ pub fn findByClass(result: *const Result, class_code: u8, subclass: u8, start_in
 
 pub fn ecamOffset(start_bus: u8, bus: u8, device: u8, function: u8, offset: u16) ?u64 {
     if (bus < start_bus or device >= 32 or function >= 8 or offset > 0x0FFF) return null;
-    return ((@as(u64, bus) - @as(u64, start_bus)) << 20) |
+    // MCFG describes the base for bus zero, even for a partial bus window.
+    return (@as(u64, bus) << 20) |
         (@as(u64, device) << 15) |
         (@as(u64, function) << 12) |
         @as(u64, offset & 0x0FFC);
+}
+
+pub const EcamWindow = struct { base: u64, bytes: u64 };
+
+pub fn ecamWindow(base: u64, start_bus: u8, end_bus: u8) ?EcamWindow {
+    if (base == 0 or start_bus > end_bus) return null;
+    const start = @as(u64, start_bus) << 20;
+    const end = (@as(u64, end_bus) + 1) << 20;
+    if (base > ~@as(u64, 0) - end) return null;
+    return .{ .base = base + start, .bytes = end - start };
 }
 
 const ReadPurpose = enum {
@@ -254,11 +265,24 @@ test "scanner stops after first device beyond retained capacity" {
     try std.testing.expectEqual(@as(u64, 194), result.metrics.config_reads);
 }
 
-test "ECAM offsets are relative to the advertised start bus" {
+test "ECAM addresses and mapped window retain the bus-zero MCFG origin" {
     const std = @import("std");
-    try std.testing.expectEqual(@as(?u64, 0), ecamOffset(32, 32, 0, 0, 0));
-    try std.testing.expectEqual(@as(?u64, 0x0011_A0FC), ecamOffset(32, 33, 3, 2, 0x0FF));
+    try std.testing.expectEqual(@as(?u64, 0x0200_0000), ecamOffset(32, 32, 0, 0, 0));
+    try std.testing.expectEqual(@as(?u64, 0x0211_A0FC), ecamOffset(32, 33, 3, 2, 0x0FF));
     try std.testing.expectEqual(@as(?u64, null), ecamOffset(32, 31, 0, 0, 0));
     try std.testing.expectEqual(@as(?u64, null), ecamOffset(0, 0, 32, 0, 0));
     try std.testing.expectEqual(@as(?u64, null), ecamOffset(0, 0, 0, 8, 0));
+    try std.testing.expectEqual(@as(?u64, null), ecamOffset(0, 0, 0, 0, 0x1000));
+    const partial = ecamWindow(0xE000_0000, 32, 63).?;
+    try std.testing.expectEqual(@as(u64, 0xE200_0000), partial.base);
+    try std.testing.expectEqual(@as(u64, 0x0200_0000), partial.bytes);
+    const full = ecamWindow(0xE000_0000, 0, 255).?;
+    try std.testing.expectEqual(@as(u64, 0xE000_0000), full.base);
+    try std.testing.expectEqual(@as(u64, 0x1000_0000), full.bytes);
+    const last = ecamWindow(0xE000_0000, 255, 255).?;
+    try std.testing.expectEqual(@as(u64, 0xEFF0_0000), last.base);
+    try std.testing.expectEqual(@as(u64, 0x0010_0000), last.bytes);
+    try std.testing.expect(ecamWindow(0xE000_0000, 63, 32) == null);
+    try std.testing.expect(ecamWindow(0, 0, 255) == null);
+    try std.testing.expect(ecamWindow(~@as(u64, 0) - 0x0100_0000, 32, 63) == null);
 }

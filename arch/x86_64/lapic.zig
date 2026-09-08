@@ -25,7 +25,7 @@ const REG_TIMER_INITIAL_COUNT: u32 = 0x380;
 const REG_TIMER_CURRENT_COUNT: u32 = 0x390;
 const REG_TIMER_DIVIDE: u32 = 0x3E0;
 
-const SPURIOUS_VECTOR: u32 = 0xFF;
+pub const SPURIOUS_VECTOR: u8 = 0xFF;
 const SVR_ENABLE: u32 = 1 << 8;
 const TIMER_VECTOR: u8 = 0x20;
 const TIMER_MASKED: u32 = 1 << 16;

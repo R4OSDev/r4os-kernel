@@ -111,6 +111,14 @@ IPI ipi_reschedule, 0xF0
 IPI ipi_stop,       0xF1
 IPI ipi_tlb,        0xF2
 
+# The LAPIC spurious vector has no in-service interrupt to acknowledge.
+# Keep every register and the hardware frame intact; do not send an EOI.
+.global lapic_spurious
+.type lapic_spurious, @function
+lapic_spurious:
+    iretq
+.size lapic_spurious, .-lapic_spurious
+
 .global isr_common
 .type isr_common, @function
 isr_common:

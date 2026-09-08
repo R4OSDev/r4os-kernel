@@ -142,6 +142,7 @@ extern fn irq31() callconv(.c) void;
 extern fn ipi_reschedule() callconv(.c) void;
 extern fn ipi_stop() callconv(.c) void;
 extern fn ipi_tlb() callconv(.c) void;
+extern fn lapic_spurious() callconv(.c) void;
 
 var idt: [IDT_ENTRIES]IdtEntry align(16) = .{IdtEntry{}} ** IDT_ENTRIES;
 
@@ -178,6 +179,7 @@ pub fn init() void {
     idt[RESCHEDULE_VECTOR].set(@ptrCast(&ipi_reschedule), gdt.codeSelector(), INTERRUPT_GATE, 0);
     idt[STOP_VECTOR].set(@ptrCast(&ipi_stop), gdt.codeSelector(), INTERRUPT_GATE, 0);
     idt[TLB_VECTOR].set(@ptrCast(&ipi_tlb), gdt.codeSelector(), INTERRUPT_GATE, 0);
+    idt[lapic.SPURIOUS_VECTOR].set(@ptrCast(&lapic_spurious), gdt.codeSelector(), INTERRUPT_GATE, 0);
 
     loadCurrent();
     k.puts("  IDT loaded ");

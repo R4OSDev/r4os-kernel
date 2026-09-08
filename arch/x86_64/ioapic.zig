@@ -253,19 +253,14 @@ pub fn activateLegacyRoutes() bool {
 }
 
 pub fn routeForIrq(irq: u8) IrqRoute {
+    // Only these device vectors have installed IRQ handlers (0x20..0x3F).
+    if (irq >= 32) return .{ .irq = irq };
     return switch (irq) {
         0 => current.route0,
         1 => current.route1,
         2 => current.route2,
         12 => current.route12,
-        else => .{
-            .irq = irq,
-            .gsi = irq,
-            .vector = vectorForIrq(irq),
-            .target_lapic = lapic.status().id,
-            .present = current.mapped,
-            .in_range = gsiInRange(irq),
-        },
+        else => buildRoute(acpi.info(), irq),
     };
 }
 
