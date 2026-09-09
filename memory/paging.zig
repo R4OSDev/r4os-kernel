@@ -239,6 +239,26 @@ pub fn mappedFrame(virt: u64) ?u64 {
     return mappedFrameLocked(virt);
 }
 
+// Normalized PAT selector for an existing 4K or huge leaf. This is a read,
+// never an implicit cache-type transition on a live firmware/driver alias.
+pub fn cacheSelector(virt: u64) ?u3 {
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    if (!activeRootMatchesHardwareLocked()) return null;
+    const leaf = getLeaf(virt) orelse return null;
+    const flags = leaf.entry.*;
+    const pat: u3 = if ((flags & (if (leaf.huge) HUGE_PAGE_PAT else PAGE_ATTRIBUTE_TABLE)) != 0) 4 else 0;
+    return pat | @as(u3, if ((flags & CACHE_DISABLE) != 0) 2 else 0) | @as(u3, if ((flags & WRITE_THROUGH) != 0) 1 else 0);
+}
+
+pub fn physicalAddress(virt: u64) ?u64 {
+    const lock_token = owner_locks.page_tables.acquire();
+    defer owner_locks.page_tables.release(lock_token);
+    if (!activeRootMatchesHardwareLocked()) return null;
+    const leaf = getLeaf(virt) orelse return null;
+    return (leaf.entry.* & ADDR_MASK & ~(leaf.bytes - 1)) | (virt & (leaf.bytes - 1));
+}
+
 pub fn mappedFrameLocked(virt: u64) ?u64 {
     if (!owner_locks.page_tables.heldByCurrent() or
         !activeRootMatchesHardwareLocked() or !isAligned(virt)) return null;
@@ -450,6 +470,7 @@ fn getTable(virt: u64) ?*PageTable {
 const LeafEntry = struct {
     entry: *u64,
     huge: bool,
+    bytes: u64 = PAGE_SIZE,
 };
 
 fn getLeaf(virt: u64) ?LeafEntry {
@@ -460,12 +481,12 @@ fn getLeaf(virt: u64) ?LeafEntry {
 
     const pdpt_entry = &pdpt[index(virt, 30)];
     if ((pdpt_entry.* & PRESENT) == 0) return null;
-    if ((pdpt_entry.* & HUGE_PAGE) != 0) return .{ .entry = pdpt_entry, .huge = true };
+    if ((pdpt_entry.* & HUGE_PAGE) != 0) return .{ .entry = pdpt_entry, .huge = true, .bytes = 1 << 30 };
     const pd = tableFromPhys(pdpt_entry.* & ADDR_MASK);
 
     const pd_entry = &pd[index(virt, 21)];
     if ((pd_entry.* & PRESENT) == 0) return null;
-    if ((pd_entry.* & HUGE_PAGE) != 0) return .{ .entry = pd_entry, .huge = true };
+    if ((pd_entry.* & HUGE_PAGE) != 0) return .{ .entry = pd_entry, .huge = true, .bytes = 1 << 21 };
     const pt = tableFromPhys(pd_entry.* & ADDR_MASK);
 
     const pt_entry = &pt[index(virt, 12)];

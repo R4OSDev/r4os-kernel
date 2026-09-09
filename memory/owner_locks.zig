@@ -1,6 +1,7 @@
 const io = @import("../arch/x86_64/io.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const policy = @import("owner_lock_policy.zig");
+const layout = @import("layout.zig");
 
 const RFLAGS_IF: u64 = 1 << 9;
 
@@ -56,6 +57,7 @@ pub const Lock = struct {
     pub fn acquire(self: *Lock) Token {
         const flags = io.readRflags();
         io.cli();
+        prepareCurrentStack();
         const cpu_index = percpu.currentIndex();
         const slot: usize = @intCast(cpu_index);
         const owner: u8 = @intCast(cpu_index + 1);
@@ -158,6 +160,36 @@ pub const Lock = struct {
 };
 
 var held_rank: [percpu.max_cpus]u8 = .{0} ** percpu.max_cpus;
+
+pub const STACK_HEADROOM: u64 = 64 * layout.KiB;
+
+/// Page faults cannot reenter a half-mutated registry, heap, AVL tree or
+/// scheduler projection. Called at exception entry, before fault resolution
+/// acquires any of those owners itself.
+pub fn faultResolutionAllowed() bool {
+    return held_rank[percpu.currentIndex()] == 0 and percpu.runtimeCriticalDepth().* == 0;
+}
+
+/// R4X calls kernel APIs on its demand-grown execution stack. Prepare the
+/// same resident call budget as a kernel Task stack BEFORE taking the first
+/// no-sleep/runtime owner. IRQs are already disabled; a synchronous fault
+/// uses the separate resident IST stack and may safely finish the growth.
+/// Probe each page so a terminal guard cannot be skipped into another stack.
+/// Reads preserve stack canaries; nested owners neither probe nor allocate.
+pub fn prepareCurrentStack() void {
+    if (!faultResolutionAllowed()) return;
+    const rsp = asm volatile ("mov %%rsp, %[value]"
+        : [value] "=r" (-> u64),
+    );
+    if (rsp < layout.APP_STACK_BASE or rsp >= layout.APP_STACK_BASE + layout.APP_STACK_BYTES) return;
+    var offset: u64 = layout.PAGE_SIZE;
+    while (offset <= STACK_HEADROOM) : (offset += layout.PAGE_SIZE) {
+        const page: *const volatile u8 = @ptrFromInt(rsp - offset);
+        _ = page.*;
+    }
+    // Fault handlers may have updated stack metadata while a probe ran.
+    asm volatile ("" ::: .{ .memory = true });
+}
 
 // The small ranks are leaf-domain entry points.  They may call into the
 // heap/VM stack, while that stack never calls back into the originating

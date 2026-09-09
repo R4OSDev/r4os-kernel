@@ -33,6 +33,12 @@ pub const KERNEL_IMAGE_BASE: u64 = 0xffff_ffff_8000_0000;
 pub const KERNEL_IMAGE_WINDOW_BYTES: u64 = 512 * MiB;
 pub const KERNEL_IMAGE_WINDOW_END: u64 = KERNEL_IMAGE_BASE + KERNEL_IMAGE_WINDOW_BYTES;
 
+// Shared by the VM reservation table and the no-sleep stack preflight. Only
+// this window contains demand-grown execution stacks; boot, task and IST
+// stacks are resident and must never be probed below their fixed bounds.
+pub const APP_STACK_BASE: u64 = 0xffff_ff40_0000_0000;
+pub const APP_STACK_BYTES: u64 = 8 * GiB;
+
 pub const PageFlags = struct {
     pub const present: u64 = 1 << 0;
     pub const writable: u64 = 1 << 1;

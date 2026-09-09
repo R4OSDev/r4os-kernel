@@ -6,6 +6,7 @@ const paging = @import("paging.zig");
 const phys = @import("phys.zig");
 const reclaim = @import("reclaim.zig");
 const owner_locks = @import("owner_locks.zig");
+const address_layout = @import("layout.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const k = @import("../kernel/log.zig");
 const sync = @import("../sched/sync.zig");
@@ -15,7 +16,7 @@ const r4sys_api = @import("../program/r4sys.zig");
 pub const MAX_RANGES: usize = 1024;
 pub const MAX_COMMIT_SPANS: usize = 4096;
 pub const MAX_PAGE_STATE_SPANS: usize = 8192;
-pub const WINDOW_COUNT: usize = 8;
+pub const WINDOW_COUNT: usize = WINDOWS.len;
 pub const RANGE_ID_INDEX_CAPACITY: usize = MAX_RANGES * 2;
 const INVALID_RANGE_POSITION: u16 = std.math.maxInt(u16);
 
@@ -27,9 +28,10 @@ const TEMP_KERNEL_BASE: u64 = 0xFFFF_FF00_0000_0000;
 const KERNEL_HEAP_BASE: u64 = 0xFFFF_FF10_0000_0000;
 const PROGRAM_IMAGE_BASE: u64 = 0xFFFF_FF20_0000_0000;
 const APP_HEAP_BASE: u64 = 0xFFFF_FF30_0000_0000;
-const APP_STACK_BASE: u64 = 0xFFFF_FF40_0000_0000;
+const APP_STACK_BASE = address_layout.APP_STACK_BASE;
 const MMIO_BASE: u64 = 0xFFFF_FF50_0000_0000;
 const KERNEL_STACK_BASE: u64 = 0xFFFF_FF60_0000_0000;
+const GRAPHICS_BASE: u64 = 0xFFFF_FF70_0000_0000;
 const R4X_VM_BASE: u64 = 0xFFFF_FB00_0000_0000;
 
 const APP_SYSTEM_RESERVE_FRAMES: u64 = 384;
@@ -99,6 +101,7 @@ pub const Window = enum(u8) {
     r4x_vm = 6,
     // 0.56.15: Kernel-Task-Stacks mit Guard-Page (sched/task.zig).
     kernel_stack = 7,
+    graphics = 8,
 };
 
 pub const Error = error{
@@ -456,10 +459,13 @@ const WINDOWS = [_]WindowDef{
     // Eight GiB keeps the 8-MiB per-program-thread guard/reserve policy while
     // removing the old 128-thread virtual-address ceiling. The next window is
     // 64 GiB away, so this remains isolated with ample unmapped separation.
-    .{ .base = APP_STACK_BASE, .len = 8 * GB, .name = "app-stack" },
+    .{ .base = APP_STACK_BASE, .len = address_layout.APP_STACK_BYTES, .name = "app-stack" },
     .{ .base = MMIO_BASE, .len = 512 * MB, .name = "mmio" },
     .{ .base = R4X_VM_BASE, .len = 4 * TB, .name = "r4x-vm" },
     .{ .base = KERNEL_STACK_BASE, .len = 64 * MB, .name = "kernel-stack" },
+    // Dedicated resident BO address space. Admission budgets charge actual
+    // pages separately; this does not reserve 16 GB of physical RAM.
+    .{ .base = GRAPHICS_BASE, .len = 16 * GB, .name = "graphics" },
 };
 
 var ranges: [MAX_RANGES]Range = .{Range{}} ** MAX_RANGES;
@@ -1092,6 +1098,21 @@ pub fn recordPagerPolicyFailure(input: PageStateInput, page_out: bool) void {
         if (paging.isMapped(virt) and paging.pageDirty(virt)) dirty_pages +%= 1;
     }
     if (page_out) page_state_summary.pager_dirty_preserved_pages +%= dirty_pages;
+}
+
+pub const WindowUsage = struct { active_ranges: u32 = 0, committed_bytes: u64 = 0, reserved_bytes: u64 = 0 };
+
+pub fn windowUsage(window: Window) WindowUsage {
+    const token = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(token);
+    var result: WindowUsage = .{};
+    for (ranges) |range| {
+        if (!range.active() or range.window != window) continue;
+        result.active_ranges += 1;
+        result.committed_bytes += range.committed_bytes;
+        result.reserved_bytes += range.len;
+    }
+    return result;
 }
 
 pub fn stats() Stats {

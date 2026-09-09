@@ -1,5 +1,6 @@
 const io = @import("io.zig");
 const percpu = @import("percpu.zig");
+const owner_locks = @import("../../memory/owner_locks.zig");
 
 const RFLAGS_IF: u64 = 1 << 9;
 
@@ -53,6 +54,7 @@ pub fn restoreLocal(flags: u64) void {
 pub fn saveAndDisableRuntime() u64 {
     const flags = io.readRflags();
     io.cli();
+    owner_locks.prepareCurrentStack();
     acquireRuntimeSerialization(flags);
     return flags;
 }

@@ -4,6 +4,9 @@ const interrupts = @import("../arch/x86_64/interrupts.zig");
 const audio = @import("../audio/core.zig");
 const display_blit = @import("../display/blit_backend.zig");
 const display = @import("../display/display.zig");
+const gfx_buffers = @import("../memory/gfx_buffers.zig");
+const gfx_api = @import("../program/gfx_buffer_api.zig");
+const gfx_memory = @import("gfx_driver_memory.zig");
 const bootlog = @import("bootlog.zig");
 const boot_config = @import("boot_config.zig");
 const log_event = @import("log_event.zig");
@@ -29,9 +32,8 @@ const xhci = @import("../driver/usb/xhci.zig");
 const outputs_contract = @import("r4os_kernel_contract");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 24 (0.69.50): append-only um ausgehandelte Netzwerkfaehigkeiten
-// und Metadatenpakete mit kanonischem Flat-Fallback erweitert.
-pub const VERSION: u32 = 24;
+// Version 25 (0.79.5): optional graphics memory query after the stable v24 prefix.
+pub const VERSION: u32 = 25;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -513,6 +515,7 @@ pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
 }
 
 pub fn beginOwnerShutdown(token: *OwnerCleanupToken) void {
+    gfx_memory.beginClose(token.owner);
     token.shutdown_started = true;
 }
 
@@ -547,6 +550,12 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         finishOwnerNetMutation(token);
         if (token.display_blit_prepared) display_blit.cancelOwnerCleanup(owner);
         token.active = false;
+        return false;
+    }
+    // DriverShutdown gets the opportunity to stop engines and release its
+    // maps. A retained use afterwards vetoes every generic resource free.
+    if (gfx_memory.retained(owner)) {
+        _ = quarantineOwnerCleanup(token);
         return false;
     }
 
@@ -604,6 +613,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     }
     const work_count = work_cleanup.removed;
     const dma_count = cleanupDmaOwner(owner);
+    gfx_memory.finishOwner(owner);
     token.active = false;
 
     if (irq_count == 0 and
@@ -769,11 +779,14 @@ pub const Table = extern struct {
     // und RX-Metadaten mit verpflichtendem kanonischem Flat-Fallback.
     net_backend_query: *const fn (i32, *NetBackendNegotiation) callconv(.c) i32,
     net_receive_packet: *const fn (i32, *const NetPacket) callconv(.c) i32,
+    // v25: one optional versioned memory table; all previous offsets survive.
+    gfx_memory_query: *const fn (*outputs_contract.GfxDriverMemoryApi) callconv(.c) i32,
 };
 
 pub var table = Table{
     .magic = MAGIC,
     .version = VERSION,
+    .gfx_memory_query = gfxMemoryQuery,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -2972,4 +2985,95 @@ fn zEqSlice(z: [*:0]const u8, slice: []const u8) bool {
 fn upper(c: u8) u8 {
     if (c >= 'a' and c <= 'z') return c - ('a' - 'A');
     return c;
+}
+
+fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
+    if (current_owner == 0 or !current_owner_guard.ownedByCurrent()) return error.WrongOwner;
+    return gfx_memory.owner(current_owner, admission);
+}
+
+fn gfxBufferCreate(input: *const outputs_contract.GfxBufferDescriptor, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_api.create(identity, input, output);
+}
+
+fn gfxBufferDescribe(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferDescriptor) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return gfx_api.describe(identity, input, output);
+}
+
+fn gfxBufferImport(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_api.import(identity, input, output);
+}
+
+fn gfxBufferRelease(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return gfx_api.release(identity, input);
+}
+
+fn gfxBufferMap(input: *const outputs_contract.GfxBufferHandle, access: u32, offset: u64, bytes: u64, output: *outputs_contract.GfxBufferMap) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_api.map(identity, input, access, offset, bytes, output);
+}
+
+fn gfxBufferUnmap(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return gfx_api.unmap(identity, input);
+}
+
+fn gfxDeviceAcquire(reference: *const outputs_contract.GfxBufferHandle, request: *const outputs_contract.GfxDeviceRequest, output: *outputs_contract.GfxDeviceLease) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_memory.acquire(identity, reference, request, output);
+}
+
+fn gfxDeviceSegment(lease: *const outputs_contract.GfxDeviceLease, offset: u64, output: *outputs_contract.GfxDmaSegment) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return gfx_memory.segment(identity, lease, offset, output);
+}
+
+fn gfxDeviceRelease(lease: *const outputs_contract.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return gfx_memory.release(identity, lease, quiesced);
+}
+
+fn gfxMmioMap(request: *const outputs_contract.GfxMmioRequest, output: *outputs_contract.GfxMmioWindow) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_memory.mapWindow(identity, request, output);
+}
+
+fn gfxMmioUnmap(window: *const outputs_contract.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return gfx_memory.unmapWindow(identity, window, quiesced);
+}
+
+fn gfxCollect() callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return gfx_memory.collect(identity);
+}
+
+fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32 {
+    if (!gfx_api.validOutput(outputs_contract.GfxDriverMemoryApi, output)) return outputs_contract.gfx_buffer_error_invalid;
+    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    output.* = .{
+        .buffer_create = @intFromPtr(&gfxBufferCreate),
+        .buffer_describe = @intFromPtr(&gfxBufferDescribe),
+        .buffer_import = @intFromPtr(&gfxBufferImport),
+        .buffer_release = @intFromPtr(&gfxBufferRelease),
+        .buffer_map = @intFromPtr(&gfxBufferMap),
+        .buffer_unmap = @intFromPtr(&gfxBufferUnmap),
+        .device_acquire = @intFromPtr(&gfxDeviceAcquire),
+        .device_segment = @intFromPtr(&gfxDeviceSegment),
+        .device_release = @intFromPtr(&gfxDeviceRelease),
+        .mmio_map = @intFromPtr(&gfxMmioMap),
+        .mmio_unmap = @intFromPtr(&gfxMmioUnmap),
+        .collect = @intFromPtr(&gfxCollect),
+        .buffer_stats = @intFromPtr(&gfxMemoryStats),
+    };
+    return outputs_contract.gfx_buffer_result_ok;
+}
+
+fn gfxMemoryStats(output: *outputs_contract.GfxBufferStats) callconv(.c) i32 {
+    _ = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return gfx_api.stats(output);
 }
