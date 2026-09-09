@@ -54,20 +54,28 @@ r4os.elf; Kernelversion 0.1.130 bleibt deshalb unveraendert.
 
 Remote-Frame-Besitz ab 0.78.75
 -----------------------------
-R4DESK fuehrt Live-Puffer, Snapshots, Dirty-Historie, Publikation und den
-letzten Konsumenten-Release unter demselben UnwindGuard. Die Revision wird
-innerhalb dieses Besitzes veroeffentlicht; Wakeups folgen danach. Publikation
-prueft den Bedarf nach Eintritt erneut, damit ein zuvor erfolgter letzter
-Release keine verwaiste neue Allokation ausloest. Auch Neuanmeldung und
-Speicherabbau sind dadurch geordnet. Pufferwechsel/freigabe koennen keine
-laufende Kopie ueberholen; separate Sequenz-/Leser-/Retired-Listen entfallen.
+R4DESK fuehrt Live-Puffer, Snapshots, Dirty-Historie und Kopien unter einem
+UnwindGuard mit ausschliesslichem tryEnter. Alle nichtblockierenden APIs
+bleiben nichtblockierend. Ein kurzer SMP-Programmzustands-Owner ordnet
+Konsumentenzahl, Lebensdauergeneration und Veroeffentlichung der Revision.
 
-Info, Read und Map versuchen den Besitzer einmal und melden bei Kollision
-unavailable. Sie zeigen nur abgeschlossene Pixel samt passender Revision.
-Map erzeugt weiterhin zwei getrennte Snapshots; der bestehende Aufrufervertrag
-bleibt owner-thread-only, mit gehaltenem Konsumentenbezug bis nach Ende der
-Nutzung. Die Synchronisierung umfasst keine Netzwerkoperation und sperrt
-weder IRQs noch die Praeemption fuer die Dauer einer grossen Kopie.
+Der letzte Release entwertet die Generation und sichtbare Revision sofort.
+Er wartet nicht auf einen Publisher oder Leser und gibt dessen Speicher
+nicht frei. Der noch aktive Zugriff verwirft seinen veralteten Abschluss
+und leert den Puffer vor seinem Ownerende. Der abschliessende Retirement-
+Check und die Ownerfreigabe sind gemeinsam mit weiteren Releases geordnet;
+es bleibt keine Freigabe zwischen Pruefung und Ownerende liegen. Eine neue
+Anmeldung kann den alten Frame weder wiederbeleben noch dessen Abschluss
+als eigenen Stand erhalten. Heapfreigabe erfolgt ausserhalb des kurzen
+Programmzustands-Owners, aber unter dem Kopier-/Lebensdauerbesitzer.
+
+Info, Read, Map und Publikation melden eine Besitzerkollision als
+unavailable. Leser erhalten nur abgeschlossene Pixel samt passender
+Revision. Map liefert seine zwei getrennten Snapshots nur bei genau einem
+registrierten Konsumenten; mehrere Konsumenten verwenden die kopierende
+Read-API. RDPSVC hat diesen Ausweichpfad bereits. Der gehaltene Bezug und
+der bestehende owner-thread-only-Vertrag gelten bis nach Ende der Nutzung.
+Kein Netzwerk-I/O und keine lange IRQ-/Praeemptionssperre im Kopierbesitzer.
 
 Remote-Eingabequeue und Status verwenden fuer ihre kurzen Aenderungen den
 SMP-Programmzustands-Owner. Ein voller Puffer erhoeht dropped genau einmal;

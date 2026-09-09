@@ -100,10 +100,13 @@ var remote_frame_pixels: ?[]u32 = null;
 var remote_frame_capacity_pixels: usize = 0;
 var remote_frame_info: RemoteFrameInfo = .{};
 var remote_frame_ready: bool = false;
-// All live pixels, history, snapshot mutation and consumer transitions share
-// one unwind-aware owner. Copies/allocation remain preemptible; no network
-// I/O or returned mapping lifetime is covered by this guard.
+// Live pixels, history and snapshot mutation share an unwind-aware owner.
+// Consumer epochs retire its storage only after the last active access.
+// Copies/allocation remain preemptible; network I/O is outside this guard.
 var remote_frame_guard = sync.UnwindGuard.init("remote-frame");
+// Consumer transitions and these two lifecycle fields use program_state.
+var remote_frame_epoch: u64 = 1;
+var remote_frame_discard_pending: bool = false;
 var remote_frame_consumers_count: u32 = 0;
 var remote_frame_revision_counter: u32 = 0;
 var remote_frame_published_revision: u32 = 0;
@@ -257,8 +260,8 @@ pub fn remoteFrameInfo(out: *RemoteFrameInfo) callconv(.c) i32 {
 pub fn remoteFrameRead(offset_pixels: u32, out: [*]u32, pixel_count: u32, out_info: *RemoteFrameInfo) callconv(.c) i32 {
     if (pixel_count != 0 and @intFromPtr(out) == 0) return remote_frame_error_invalid;
     if (@intFromPtr(out_info) != 0) out_info.* = .{};
-    if (!remote_frame_guard.tryEnter()) return remote_frame_error_unavailable;
-    defer _ = remote_frame_guard.leave();
+    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
+    defer leaveRemoteFrame();
     if (!remote_frame_ready or remote_frame_pixels == null) return remote_frame_error_unavailable;
     const info = remote_frame_info;
     if (@intFromPtr(out_info) != 0) out_info.* = info;
@@ -305,31 +308,38 @@ pub fn desktopActivityWait(last_seq: u64, timeout_ticks: u64, out_seq: *u64) cal
 }
 
 pub fn remoteFrameAcquire() callconv(.c) i32 {
-    if (!remote_frame_guard.enter(sync.WAIT_FOREVER)) return remote_frame_error_unavailable;
+    const token = owner_locks.program_state.acquire();
     const current = remoteFrameConsumers();
     if (current >= 0x7fff_ffff) {
-        _ = remote_frame_guard.leave();
+        owner_locks.program_state.release(token);
         return remote_frame_error_invalid;
     }
     const next = current + 1;
     @atomicStore(u32, &remote_frame_consumers_count, next, .release);
-    _ = remote_frame_guard.leave();
+    owner_locks.program_state.release(token);
     if (current == 0) desktop_events.signal();
     return @intCast(next);
 }
 
 pub fn remoteFrameRelease() callconv(.c) i32 {
-    if (!remote_frame_guard.enter(sync.WAIT_FOREVER)) return remote_frame_error_unavailable;
+    const token = owner_locks.program_state.acquire();
     const current = remoteFrameConsumers();
     if (current == 0) {
-        _ = remote_frame_guard.leave();
+        owner_locks.program_state.release(token);
         return 0;
     }
     const next = current - 1;
     @atomicStore(u32, &remote_frame_consumers_count, next, .release);
-    if (next == 0) discardRemoteFrameStorage();
-    _ = remote_frame_guard.leave();
     if (next == 0) {
+        remote_frame_epoch +%= 1;
+        remote_frame_discard_pending = true;
+        @atomicStore(u32, &remote_frame_published_revision, 0, .release);
+    }
+    owner_locks.program_state.release(token);
+    if (next == 0) {
+        // Never wait for a publisher or reader. The last active access drains
+        // this retirement before leaving; a new epoch cannot reuse its frame.
+        if (enterRemoteFrame()) leaveRemoteFrame();
         _ = remote_frame_waitq.wakeAll();
         desktop_events.signal();
     }
@@ -354,14 +364,13 @@ pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32
     if (remoteFrameConsumers() == 0) return 0;
 
     const total_pixels: usize = @intCast(total_pixels_u64);
-    if (!remote_frame_guard.enter(sync.WAIT_FOREVER)) return remote_frame_error_unavailable;
-    // The last release may have completed between the demand hint and entry.
-    if (remoteFrameConsumers() == 0) {
-        _ = remote_frame_guard.leave();
+    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
+    const epoch = currentRemoteFrameEpoch() orelse {
+        leaveRemoteFrame();
         return 0;
-    }
+    };
     if (!ensureRemoteFrameCapacity(total_pixels)) {
-        _ = remote_frame_guard.leave();
+        leaveRemoteFrame();
         return remote_frame_error_oom;
     }
     const dest = remote_frame_pixels.?;
@@ -396,8 +405,7 @@ pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32
     };
     remote_frame_ready = true;
     remote_frame_history.record(revision, rect);
-    @atomicStore(u32, &remote_frame_published_revision, revision, .release);
-    _ = remote_frame_guard.leave();
+    if (!completeRemoteFrame(epoch, revision)) return 0;
     _ = remote_frame_waitq.wakeAll();
 
     const copied = @as(u64, rect.w) * @as(u64, rect.h);
@@ -442,14 +450,13 @@ pub fn remoteFramePublishRegions(
     if (remoteFrameConsumers() == 0) return 0;
 
     const total_pixels: usize = @intCast(total_pixels_u64);
-    if (!remote_frame_guard.enter(sync.WAIT_FOREVER)) return remote_frame_error_unavailable;
-    // The last release may have completed between the demand hint and entry.
-    if (remoteFrameConsumers() == 0) {
-        _ = remote_frame_guard.leave();
+    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
+    const epoch = currentRemoteFrameEpoch() orelse {
+        leaveRemoteFrame();
         return 0;
-    }
+    };
     if (!ensureRemoteFrameCapacity(total_pixels)) {
-        _ = remote_frame_guard.leave();
+        leaveRemoteFrame();
         return remote_frame_error_oom;
     }
     const dest = remote_frame_pixels.?;
@@ -488,8 +495,7 @@ pub fn remoteFramePublishRegions(
     };
     remote_frame_ready = true;
     remote_frame_history.record(revision, bounds);
-    @atomicStore(u32, &remote_frame_published_revision, revision, .release);
-    _ = remote_frame_guard.leave();
+    if (!completeRemoteFrame(epoch, revision)) return 0;
     _ = remote_frame_waitq.wakeAll();
     return if (copied_pixels > 0x7fff_ffff) 0x7fff_ffff else @intCast(copied_pixels);
 }
@@ -730,7 +736,7 @@ fn ensureRemoteFrameCapacity(pixel_count: usize) bool {
     return true;
 }
 
-// Called with remote_frame_guard held after the last consumer transition.
+// Called with remote_frame_guard held after an invalidated consumer epoch.
 fn discardRemoteFrameStorage() void {
     if (remote_frame_memory) |memory| _ = heap.free(memory);
     for (&remote_frame_snapshots) |*snapshot| {
@@ -772,8 +778,12 @@ fn ensureRemoteFrameSnapshotCapacity(index: usize, pixel_count: usize) bool {
 pub fn remoteFrameMap(out: *RemoteFrameMapInfo) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
     out.* = .{};
-    if (!remote_frame_guard.tryEnter()) return remote_frame_error_unavailable;
-    defer _ = remote_frame_guard.leave();
+    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
+    defer leaveRemoteFrame();
+    // A raw snapshot has no per-consumer release token. With multiple
+    // consumers, use remoteFrameRead's bounded copy instead of lending a
+    // slot that another consumer could recycle during network output.
+    if (remoteFrameConsumers() != 1) return remote_frame_error_unavailable;
     if (!remote_frame_ready or remote_frame_pixels == null or remote_frame_info.frame_pixels == 0)
         return remote_frame_error_unavailable;
     const info = remote_frame_info;
@@ -800,8 +810,8 @@ pub fn remoteFrameMap(out: *RemoteFrameMapInfo) callconv(.c) i32 {
 }
 
 fn captureRemoteFrameInfo(since_revision: ?u32, out: *RemoteFrameInfo) bool {
-    if (!remote_frame_guard.tryEnter()) return false;
-    defer _ = remote_frame_guard.leave();
+    if (!enterRemoteFrame()) return false;
+    defer leaveRemoteFrame();
     if (!remote_frame_ready) return false;
     var info = remote_frame_info;
     if (since_revision) |revision| {
@@ -815,6 +825,54 @@ fn captureRemoteFrameInfo(since_revision: ?u32, out: *RemoteFrameInfo) bool {
     }
     out.* = info;
     return true;
+}
+
+// The guard is only acquired with tryEnter: every public nonblocking
+// operation stays nonblocking even while a large copy is preempted.
+fn enterRemoteFrame() bool {
+    if (!remote_frame_guard.tryEnter()) return false;
+    discardPendingRemoteFrames();
+    return true;
+}
+
+fn leaveRemoteFrame() void {
+    while (true) {
+        const token = owner_locks.program_state.acquire();
+        if (remote_frame_discard_pending) {
+            remote_frame_discard_pending = false;
+            owner_locks.program_state.release(token);
+            discardRemoteFrameStorage();
+            continue;
+        }
+        // Publish the end of ownership together with the retirement check.
+        // A later last release can then acquire the guard and drain itself.
+        _ = remote_frame_guard.leave();
+        owner_locks.program_state.release(token);
+        return;
+    }
+}
+
+fn discardPendingRemoteFrames() void {
+    const token = owner_locks.program_state.acquire();
+    const pending = remote_frame_discard_pending;
+    remote_frame_discard_pending = false;
+    owner_locks.program_state.release(token);
+    if (pending) discardRemoteFrameStorage();
+}
+
+fn currentRemoteFrameEpoch() ?u64 {
+    const token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(token);
+    return if (remoteFrameConsumers() == 0 or remote_frame_discard_pending) null else remote_frame_epoch;
+}
+
+fn completeRemoteFrame(epoch: u64, revision: u32) bool {
+    const token = owner_locks.program_state.acquire();
+    const current = epoch == remote_frame_epoch and remoteFrameConsumers() != 0 and !remote_frame_discard_pending;
+    if (current) @atomicStore(u32, &remote_frame_published_revision, revision, .release);
+    owner_locks.program_state.release(token);
+    leaveRemoteFrame();
+    return current;
 }
 
 fn currentRemoteFrameRevision() u32 {
