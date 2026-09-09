@@ -50,3 +50,26 @@ Support/ntfs_format.zig und Support/ntfs_volume.zig sind bytegleich mit den
 kanonischen SDK-Dateien. Die vorhandene 24-Komponenten-Pfadgrenze verwendet
 nun die gemeinsame Konstante. Der Kontrollbuild ist bytegleich zum vorherigen
 r4os.elf; Kernelversion 0.1.130 bleibt deshalb unveraendert.
+
+
+Remote-Frame-Besitz ab 0.78.75
+-----------------------------
+R4DESK fuehrt Live-Puffer, Snapshots, Dirty-Historie, Publikation und den
+letzten Konsumenten-Release unter demselben UnwindGuard. Die Revision wird
+innerhalb dieses Besitzes veroeffentlicht; Wakeups folgen danach. Publikation
+prueft den Bedarf nach Eintritt erneut, damit ein zuvor erfolgter letzter
+Release keine verwaiste neue Allokation ausloest. Auch Neuanmeldung und
+Speicherabbau sind dadurch geordnet. Pufferwechsel/freigabe koennen keine
+laufende Kopie ueberholen; separate Sequenz-/Leser-/Retired-Listen entfallen.
+
+Info, Read und Map versuchen den Besitzer einmal und melden bei Kollision
+unavailable. Sie zeigen nur abgeschlossene Pixel samt passender Revision.
+Map erzeugt weiterhin zwei getrennte Snapshots; der bestehende Aufrufervertrag
+bleibt owner-thread-only, mit gehaltenem Konsumentenbezug bis nach Ende der
+Nutzung. Die Synchronisierung umfasst keine Netzwerkoperation und sperrt
+weder IRQs noch die Praeemption fuer die Dauer einer grossen Kopie.
+
+Remote-Eingabequeue und Status verwenden fuer ihre kurzen Aenderungen den
+SMP-Programmzustands-Owner. Ein voller Puffer erhoeht dropped genau einmal;
+pushed, polled und pending folgen der tatsaechlichen Aufnahme/Abholung.
+Der Desktop-Wakeup erfolgt erst nach Veroeffentlichung und Ownerfreigabe.
