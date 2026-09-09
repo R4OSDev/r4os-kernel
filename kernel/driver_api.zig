@@ -3,6 +3,7 @@ const io = @import("../arch/x86_64/io.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const audio = @import("../audio/core.zig");
 const display_blit = @import("../display/blit_backend.zig");
+const display = @import("../display/display.zig");
 const bootlog = @import("bootlog.zig");
 const boot_config = @import("boot_config.zig");
 const log_event = @import("log_event.zig");
@@ -482,6 +483,7 @@ pub fn leaveOwner() bool {
 
 pub fn prepareOwnerCleanup(owner: u32) ?OwnerCleanupToken {
     if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return null;
+    if (display.retainsDriverOwner(owner)) return null;
     var token = OwnerCleanupToken{ .owner = owner };
     if (!prepareStorageOwnerCleanup(owner, &token.storage_plan)) return null;
     if (ownerHasNetBackend(owner)) {

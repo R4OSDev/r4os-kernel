@@ -5,6 +5,7 @@ const diag_screen = @import("diag_screen.zig");
 const font = @import("font.zig");
 const log = @import("log.zig");
 const task = @import("../sched/task.zig");
+const firmware_access = @import("../display/firmware_access.zig");
 
 const BLUE: u32 = 0x0000AA;
 const WHITE: u32 = 0xFFFFFF;
@@ -19,6 +20,8 @@ pub const RenderResult = enum(u8) {
 pub fn render(report: *const crash.CrashReport) RenderResult {
     serialMirror(report);
 
+    const lease = firmware_access.acquire() orelse return .serial_only;
+    defer lease.release();
     var framebuf = bootFramebuffer() orelse return .serial_only;
     if (!fb.supportsRgb32(&framebuf)) return .serial_only;
 

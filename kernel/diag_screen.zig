@@ -16,6 +16,7 @@
 // lines are dropped until a new incident begins. It touches no lock/storage.
 
 const boot_info = @import("../bootloader/boot_info.zig");
+const firmware_access = @import("../display/firmware_access.zig");
 const fb = @import("../display/framebuffer.zig");
 const font = @import("font.zig");
 
@@ -191,6 +192,8 @@ fn ensureIncident() void {
 }
 
 fn prepareIncidentOverlay() void {
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     const f = framebuffer() orelse return;
     _ = prepareWrite(f);
 }
@@ -296,6 +299,8 @@ pub fn writeHex(value: u64) void {
 pub fn write(text: []const u8) void {
     ensureIncident();
     captureText(text);
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     const f = framebuffer() orelse return;
     if (!prepareWrite(f)) return;
     for (text) |ch| {
@@ -310,6 +315,8 @@ pub fn write(text: []const u8) void {
 pub fn endLine() void {
     ensureIncident();
     captureByte('\n');
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     const f = framebuffer() orelse return;
     if (!prepareWrite(f)) return;
     _ = newline();

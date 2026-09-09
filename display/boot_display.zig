@@ -7,6 +7,7 @@ const scroll_buffer = @import("console_scroll_buffer.zig");
 const heap = @import("../memory/heap.zig");
 const display = @import("../display/display.zig");
 const surface_pipeline = @import("../display/surface_pipeline.zig");
+const firmware_access = @import("firmware_access.zig");
 
 pub const ConsoleMetrics = struct {
     cols: u32 = 0,
@@ -164,34 +165,50 @@ fn sinkConsole(context: *anyopaque) *Console {
 }
 
 fn consoleSinkPutc(context: *anyopaque, ch: u8) void {
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     sinkConsole(context).putc(ch);
 }
 
 fn consoleSinkPuts(context: *anyopaque, s: []const u8) void {
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     sinkConsole(context).puts(s);
 }
 
 fn consoleSinkClear(context: *anyopaque) void {
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     sinkConsole(context).clear();
 }
 
 fn consoleSinkClearFramed(context: *anyopaque, border: u32, inner: u32) void {
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     sinkConsole(context).clearFramed(border, inner);
 }
 
 fn consoleSinkSetMargins(context: *anyopaque, left: u32, top: u32, right: u32, bottom: u32) void {
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     sinkConsole(context).setMargins(left, top, right, bottom);
 }
 
 fn consoleSinkSetColors(context: *anyopaque, fg: u32, bg: u32) void {
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     sinkConsole(context).setColors(fg, bg);
 }
 
 fn consoleSinkSetFontScale(context: *anyopaque, scale: u32) void {
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     sinkConsole(context).setFontScale(scale);
 }
 
 fn consoleSinkSetCursor(context: *anyopaque, x: u32, y: u32) void {
+    const lease = firmware_access.acquire() orelse return;
+    defer lease.release();
     sinkConsole(context).setCursor(x, y);
 }
 

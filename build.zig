@@ -59,6 +59,7 @@ pub fn build(b: *std.Build) void {
         "boot-selftests",
         "Run invasive heap, page-table, scheduler, and sync selftests during boot",
     ) orelse false;
+    const display_reject_test = b.option(bool, "display-reject-test", "Bounded native-display rejection probe; never programs hardware") orelse false;
     const block_dispatch_selftest = b.option(
         bool,
         "block-dispatch-selftest",
@@ -122,6 +123,7 @@ pub fn build(b: *std.Build) void {
     config.addOption(bool, "force_x2apic", force_x2apic);
     config.addOption(bool, "enable_stack_guard_test", stack_guard_test);
     config.addOption(bool, "enable_boot_selftests", boot_selftests);
+    config.addOption(bool, "display_reject_test", display_reject_test);
     config.addOption(bool, "enable_block_dispatch_selftest", block_dispatch_selftest);
     config.addOption(bool, "enable_net_loss_test", net_loss_test);
     config.addOption(u32, "smp_fail_ap_index", smp_fail_ap_index);
@@ -189,9 +191,10 @@ pub fn build(b: *std.Build) void {
     }) |path| addUnitTest(b, input_test_step, path);
     test_step.dependOn(input_test_step);
     test_step.dependOn(&kernel.step);
+    const display_test_step = b.step("display-test", "Bounded display ownership, fallback and firmware-writer tests");
+    addDisplayUnitTest(b, display_test_step, contract, config);
+    test_step.dependOn(display_test_step);
     const unit_tests = [_][]const u8{
-        "display/console_scroll_buffer.zig",
-        "display/framebuffer.zig",
         "audio/backend_contract.zig",
         "audio/mixer.zig",
         "audio/pcm.zig",
@@ -268,6 +271,16 @@ fn addBootscreenUnitTest(b: *std.Build, test_step: *std.Build.Step) void {
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     }));
+    const tests = b.addTest(.{ .root_module = root });
+    const run = b.addRunArtifact(tests);
+    test_step.dependOn(&run.step);
+}
+
+fn addDisplayUnitTest(b: *std.Build, test_step: *std.Build.Step, contract: *std.Build.Dependency, config: *std.Build.Step.Options) void {
+    const root = b.createModule(.{ .root_source_file = b.path("display_tests.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    root.addOptions("config", config);
+    root.addImport("r4os_kernel_contract", b.createModule(.{ .root_source_file = contract.path("Generated/Kernel/Zig/r4x_api_generated.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }));
+    root.addImport("r4f_format", b.createModule(.{ .root_source_file = b.path("kernel/font_format.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }));
     const tests = b.addTest(.{ .root_module = root });
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);

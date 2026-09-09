@@ -5,10 +5,13 @@ const blit_backend = @import("blit_backend.zig");
 const cpu = @import("../platform/cpu.zig");
 const paging = @import("../memory/paging.zig");
 const timer = @import("../kernel/timer.zig");
+pub const backend_state = @import("backend_state.zig");
+const firmware_access = @import("firmware_access.zig");
 
 pub const DeviceKind = enum(u8) {
     none = 0,
     bootfb = 1,
+    native = 2,
 };
 
 pub const DeviceFlags = struct {
@@ -77,6 +80,7 @@ pub const PresentCapabilities = struct {
 pub const MappingKind = enum(u8) {
     none = 0,
     bootloader_framebuffer = 1,
+    native_scanout = 2,
 };
 
 pub const CachePolicy = enum(u8) {
@@ -196,12 +200,197 @@ var present_generation: u64 = 0;
 var completed_fence: u64 = 0;
 var execution = ownership.Execution.init("display-present");
 var completed_stats: Stats = .{};
+var backend_manager: backend_state.Manager = .{};
+var completed_backend_state: backend_state.Snapshot = .{};
+var completed_boot_mode: Mode = .{};
+var completed_boot_mapping: Mapping = .{};
+var completed_firmware_writable: bool = true;
+var completed_output_name: [blit_backend.NAME_BYTES]u8 = .{0} ** blit_backend.NAME_BYTES;
+
+pub const BackendView = struct {
+    state: backend_state.Snapshot,
+    device: Stats,
+    boot_mode: Mode,
+    boot_mapping: Mapping,
+    firmware_writable: bool,
+    name: [blit_backend.NAME_BYTES]u8,
+};
+
+pub fn backendView() BackendView {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
+    return .{ .state = completed_backend_state, .device = completed_stats, .boot_mode = completed_boot_mode, .boot_mapping = completed_boot_mapping, .firmware_writable = completed_firmware_writable, .name = completed_output_name };
+}
+
+pub const BootSnapshot = struct {
+    mode: Mode,
+    mapping: Mapping,
+    framebuffer: fb.Framebuffer,
+};
+
+pub const CommitResult = enum { confirmed, old_preserved, output_lost };
+pub const NativeBackend = struct {
+    // adapter_id is the existing PCI inventory identity, never a second index.
+    owner: usize,
+    adapter_id: u32,
+    target: DisplayTarget,
+    context: usize = 0,
+    commit: *const fn (usize, u64, *const BootSnapshot) CommitResult,
+    // True confirms hardware quiescence AND restoration of the saved scanout.
+    restore: *const fn (usize, u64, *const BootSnapshot) bool,
+};
+
+pub const TransitionError = backend_state.Error || error{ Unavailable, RestoreFailed };
+var native_backend: ?NativeBackend = null;
+var native_device: Device = .{};
+var saved_boot: ?BootSnapshot = null;
+
+pub fn backendState() backend_state.Snapshot {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
+    return completed_backend_state;
+}
+
+pub fn retainsDriverOwner(owner: usize) bool {
+    const current = backendState();
+    return owner != 0 and (current.owner == owner or current.pending_owner == owner);
+}
+
+pub fn setBackendPolicy(policy: backend_state.Policy) bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
+    backend_manager.setPolicy(policy) catch return false;
+    publishStats();
+    return true;
+}
+
+pub fn rejectNativeBackend() void {
+    if (!execution.tryEnter()) return;
+    defer execution.leave();
+    backend_manager.reject(.backend_rejected);
+    publishStats();
+}
+
+// Kernel-side seam for the native R4D adapter. Preparation only publishes a
+// retained candidate; no callback may alter hardware before commitNative.
+// This first seam accepts CPU-addressable native scanout. GPU BO/submit and
+// virtual shadow upload capabilities are added by their subsequent owners.
+// Geometry and pixel layout remain fixed until the atomic output contract can
+// also rebuild the surface pipeline and notify all desktop consumers.
+pub fn prepareNative(backend: NativeBackend) TransitionError!u64 {
+    if (!execution.tryEnter()) return error.Busy;
+    defer execution.leave();
+    const boot = saved_boot orelse return error.Unavailable;
+    const target = backend.target;
+    const frame = target.framebuffer orelse return error.Invalid;
+    if (target.kind != .native or target.mapping.kind != .native_scanout or
+        target.name.len == 0 or target.name.len >= blit_backend.NAME_BYTES or
+        target.mode.width != boot.mode.width or target.mode.height != boot.mode.height or
+        target.mode.bpp != boot.mode.bpp or
+        target.mode.red_mask_size != boot.mode.red_mask_size or target.mode.red_mask_shift != boot.mode.red_mask_shift or
+        target.mode.green_mask_size != boot.mode.green_mask_size or target.mode.green_mask_shift != boot.mode.green_mask_shift or
+        target.mode.blue_mask_size != boot.mode.blue_mask_size or target.mode.blue_mask_shift != boot.mode.blue_mask_shift or
+        !fb.supportsRgb32(frame) or frame.width == 0 or frame.height == 0 or
+        frame.width != target.mode.width or frame.height != target.mode.height or
+        frame.pitch != target.mode.pitch or target.mode.bpp != 32 or
+        frame.red_mask_size != target.mode.red_mask_size or frame.red_mask_shift != target.mode.red_mask_shift or
+        frame.green_mask_size != target.mode.green_mask_size or frame.green_mask_shift != target.mode.green_mask_shift or
+        frame.blue_mask_size != target.mode.blue_mask_size or frame.blue_mask_shift != target.mode.blue_mask_shift or
+        (frame.pitch & 3) != 0 or (@intFromPtr(frame.address) & 3) != 0 or
+        target.mapping.virt_base != @intFromPtr(frame.address) or
+        frame.height > ~@as(u64, 0) / frame.pitch or
+        target.mapping.byte_len < frame.pitch * frame.height or
+        target.mapping.virt_base > ~@as(u64, 0) - target.mapping.byte_len or
+        (target.flags & DeviceFlags.cpu_present) == 0) return error.Invalid;
+    const generation = try backend_manager.begin(backend.owner, backend.adapter_id);
+    native_backend = backend;
+    native_device = .{
+        .name = "native",
+        .kind = .native,
+        .flags = target.flags,
+        .mode = target.mode,
+        .mapping = target.mapping,
+        .framebuffer = frame,
+        .ops = &bootfb_ops,
+    };
+    publishStats();
+    return generation;
+}
+
+pub fn abortNative(owner: usize, generation: u64) TransitionError!void {
+    if (!execution.tryEnter()) return error.Busy;
+    defer execution.leave();
+    try backend_manager.abort(owner, generation, .prepare_failed);
+    native_backend = null;
+    native_device = .{};
+    publishStats();
+}
+
+pub fn commitNative(owner: usize, generation: u64) TransitionError!CommitResult {
+    if (!execution.tryEnter()) return error.Busy;
+    defer execution.leave();
+    try backend_manager.checkPending(owner, generation);
+    const backend = native_backend orelse return error.Unavailable;
+    const boot = &(saved_boot orelse return error.Unavailable);
+    // The present guard excludes normal writers. Legacy console/fatal writers
+    // have their own nonblocking admission: never overtake their WC stores.
+    if (!firmware_access.gate.tryRevoke()) return error.Busy;
+    publishStats();
+    const result = backend.commit(backend.context, generation, boot);
+    switch (result) {
+        .confirmed => {
+            backend_manager.commit(owner, generation, true) catch unreachable;
+            primary_device = &native_device;
+        },
+        .old_preserved => {
+            backend_manager.abort(owner, generation, .commit_failed) catch unreachable;
+            native_backend = null;
+            native_device = .{};
+            firmware_access.gate.restore();
+        },
+        .output_lost => {
+            backend_manager.failCommit(owner, generation) catch unreachable;
+            primary_device = null;
+        },
+    }
+    publishStats();
+    return result;
+}
+
+pub fn restoreBootBackend(owner: usize, generation: u64) TransitionError!void {
+    if (!execution.tryEnter()) return error.Busy;
+    defer execution.leave();
+    const backend = native_backend orelse return error.Unavailable;
+    const boot = &(saved_boot orelse return error.Unavailable);
+    const recovery_generation = try backend_manager.beginRecovery(owner, generation);
+    primary_device = null;
+    publishStats();
+    // The callback runs under the wait-spanning execution guard, never under
+    // the program-state owner. A failed restore retains all driver resources.
+    if (!backend.restore(backend.context, recovery_generation, boot)) {
+        backend_manager.recoveryFailed(owner, recovery_generation) catch unreachable;
+        publishStats();
+        return error.RestoreFailed;
+    }
+    backend_manager.restoreBoot(owner, recovery_generation) catch |err| {
+        backend_manager.recoveryFailed(owner, recovery_generation) catch unreachable;
+        publishStats();
+        return err;
+    };
+    primary_device = &bootfb_device;
+    firmware_access.gate.restore();
+    native_backend = null;
+    native_device = .{};
+    publishStats();
+}
 
 pub fn registerBootBackend(target: DisplayTarget) void {
     if (!execution.tryEnter()) return;
     defer execution.leave();
     const token = ownership.enterState();
     defer ownership.leaveState(token);
+    // Boot registration cannot be used to bypass native takeover/recovery.
+    if (backend_manager.value.generation != 0) return;
     bootfb_device = .{
         .name = target.name,
         .kind = target.kind,
@@ -214,7 +403,13 @@ pub fn registerBootBackend(target: DisplayTarget) void {
     primary_device = &bootfb_device;
     present_generation = 0;
     completed_fence = 0;
+    backend_manager.initBoot();
+    if (target.framebuffer) |frame| saved_boot = .{ .mode = target.mode, .mapping = target.mapping, .framebuffer = frame.* };
+    completed_backend_state = backend_manager.value;
     completed_stats = captureStats();
+    completed_boot_mode = target.mode;
+    completed_boot_mapping = target.mapping;
+    copyName(&completed_output_name, target.name);
 }
 
 pub fn activeBackendRegistered() bool {
@@ -235,13 +430,6 @@ pub fn activeMapping() ?Mapping {
     return if (current.registered) current.mapping else null;
 }
 
-pub fn activeFramebufferForLegacy() ?*fb.Framebuffer {
-    const token = ownership.enterState();
-    defer ownership.leaveState(token);
-    const device = primary_device orelse return null;
-    return device.framebuffer;
-}
-
 pub fn enableFramebufferWriteCombining() bool {
     if (!execution.tryEnter()) return false;
     defer execution.leave();
@@ -260,11 +448,10 @@ pub fn enableFramebufferWriteCombining() bool {
         return false;
     }
     device.mapping.cache_policy = .pat_write_combining;
+    if (device.kind == .bootfb) {
+        if (saved_boot) |*snapshot| snapshot.mapping = device.mapping;
+    }
     return true;
-}
-
-pub fn framebuffer() ?*fb.Framebuffer {
-    return activeFramebufferForLegacy();
 }
 
 pub fn stats() Stats {
@@ -278,6 +465,17 @@ fn publishStats() void {
     const value = captureStats();
     const token = ownership.enterState();
     completed_stats = value;
+    completed_backend_state = backend_manager.value;
+    if (saved_boot) |boot| {
+        completed_boot_mode = boot.mode;
+        completed_boot_mapping = boot.mapping;
+    }
+    completed_firmware_writable = !firmware_access.gate.isRevoked();
+    const output_name = if (backend_manager.value.owner != 0)
+        (if (native_backend) |backend| backend.target.name else "none")
+    else
+        value.name;
+    copyName(&completed_output_name, output_name);
     ownership.leaveState(token);
 }
 
@@ -452,8 +650,8 @@ pub fn presentXrgb32Rect(x0: u64, y0: u64, w: u64, h: u64, src: []const u8, src_
 /// The sole productive XRGB32 present/statistics path. All regions are
 /// validated before the first visible write. The external backend is one
 /// synchronous optimization attempt; every absence, incompatibility or
-/// callback error falls back to the boot framebuffer copy for the complete
-/// generation.
+/// callback error falls back to the current owner's CPU scanout copy for the
+/// complete generation. A retired firmware framebuffer is never consulted.
 pub fn presentXrgb32Regions(
     source: [*]const u32,
     source_pixel_count: u32,
@@ -516,7 +714,7 @@ pub fn presentXrgb32Regions(
         outcome.fallback = true;
         outcome.fallback_regions = @intCast(regions.len);
         outcome.backend_error = if (external.attempted) external.result else 0;
-        copyName(outcome.backend_name[0..], "bootfb-cpu");
+        copyName(outcome.backend_name[0..], if (device.kind == .bootfb) "bootfb-cpu" else "native-cpu");
     }
 
     const completed_tick = timer.tickCount();
@@ -542,13 +740,16 @@ pub fn presentXrgb32Regions(
 }
 
 pub fn presentCapabilities() PresentCapabilities {
+    const current = stats();
+    if (!current.registered) return .{ .flags = 0, .formats = 0, .max_regions = 0, .backend_kind = 0 };
     var result = PresentCapabilities{
         .flags = 1 | 2 | 4,
+        .backend_kind = if (current.kind == .bootfb) 1 else 3,
     };
-    copyName(result.backend_name[0..], "bootfb-cpu");
-    copyName(result.fallback_name[0..], "bootfb-cpu");
+    const cpu_name: []const u8 = if (current.kind == .bootfb) "bootfb-cpu" else "native-cpu";
+    copyName(result.backend_name[0..], cpu_name);
+    copyName(result.fallback_name[0..], cpu_name);
     const external = blit_backend.snapshot();
-    const current = stats();
     const m = current.mode;
     const target_compatible = current.registered and m.bpp == 32 and m.red_mask_size == 8 and m.red_mask_shift == 16 and
         m.green_mask_size == 8 and m.green_mask_shift == 8 and m.blue_mask_size == 8 and m.blue_mask_shift == 0 and (m.pitch & 3) == 0;
@@ -569,6 +770,154 @@ pub fn highestCompletedFence() u64 {
     const token = ownership.enterState();
     defer ownership.leaveState(token);
     return completed_fence;
+}
+
+test "display takeover excludes firmware writers and retains uncertain hardware owners" {
+    const t = @import("std").testing;
+    const Probe = struct {
+        result: CommitResult = .old_preserved,
+        restores: bool = false,
+        commits: u32 = 0,
+        fn commit(raw: usize, _: u64, snapshot: *const BootSnapshot) CommitResult {
+            const self: *@This() = @ptrFromInt(raw);
+            self.commits += 1;
+            t.expect(firmware_access.gate.isRevoked()) catch unreachable;
+            t.expectEqual(@as(u32, 8), snapshot.mode.width) catch unreachable;
+            // Reentrant presentation must not enter the pending generation.
+            t.expect(!fill(0xDDDDDD)) catch unreachable;
+            return self.result;
+        }
+        fn restore(raw: usize, _: u64, _: *const BootSnapshot) bool {
+            const self: *@This() = @ptrFromInt(raw);
+            return self.restores;
+        }
+    };
+    var probe: Probe = .{};
+    var boot_pixels: [64]u32 align(32) = .{0x00112233} ** 64;
+    var native_pixels: [64]u32 align(32) = .{0x00445566} ** 64;
+    var boot_frame = testFrame(boot_pixels[0..].ptr);
+    var native_frame = testFrame(native_pixels[0..].ptr);
+    registerBootBackend(testTarget("test-bootfb", .bootfb, &boot_frame));
+    defer {
+        primary_device = null;
+        bootfb_device = .{ .ops = &bootfb_ops };
+        native_device = .{};
+        native_backend = null;
+        backend_manager = .{};
+        completed_backend_state = .{};
+        completed_stats = .{};
+        present_generation = 0;
+        completed_fence = 0;
+        saved_boot = null;
+        firmware_access.gate = .{};
+    }
+    const backend = NativeBackend{
+        .owner = 92,
+        .adapter_id = 4,
+        .target = testTarget("native-test", .native, &native_frame),
+        .context = @intFromPtr(&probe),
+        .commit = Probe.commit,
+        .restore = Probe.restore,
+    };
+    var malformed = backend;
+    malformed.target.mode.red_mask_shift = 8;
+    try t.expectError(error.Invalid, prepareNative(malformed));
+    malformed = backend;
+    malformed.owner = @as(usize, 1) << 32;
+    try t.expectError(error.Invalid, prepareNative(malformed));
+    malformed = backend;
+    malformed.target.mode.width = 4;
+    native_frame.width = 4;
+    try t.expectError(error.Invalid, prepareNative(malformed));
+    native_frame.width = 8;
+    try t.expect(setBackendPolicy(.software));
+    try t.expectError(error.Disabled, prepareNative(backend));
+    try t.expect(fill(0xABCDEF));
+    try t.expect(setBackendPolicy(.automatic));
+    rejectNativeBackend();
+    try t.expectEqual(backend_state.Reason.backend_rejected, backendState().reason);
+    const first = try prepareNative(backend);
+    try t.expect(firmware_access.gate.tryAcquire());
+    try t.expectError(error.Busy, commitNative(92, first));
+    try t.expectEqual(@as(u32, 0), probe.commits);
+    firmware_access.gate.release();
+    try t.expectEqual(CommitResult.old_preserved, try commitNative(92, first));
+    try t.expectEqual(backend_state.State.bootfb, backendState().state);
+    try t.expect(!retainsDriverOwner(92));
+    try t.expect(!firmware_access.gate.isRevoked());
+    const before = boot_pixels;
+    probe.result = .confirmed;
+    const second = try prepareNative(backend);
+    try t.expectError(error.Stale, commitNative(92, first));
+    try t.expectEqual(CommitResult.confirmed, try commitNative(92, second));
+    try t.expect(retainsDriverOwner(92));
+    try t.expectEqual(backend_state.State.software_native, backendState().state);
+    try t.expect(!firmware_access.gate.tryAcquire());
+    var source: [64]u32 = .{0x765432} ** 64;
+    const region = PresentRegion{ .dst_x = 2, .dst_y = 2, .src_x = 0, .src_y = 0, .w = 2, .h = 2 };
+    const presented = presentXrgb32Regions(&source, source.len, 8, (&region)[0..1], 71, 0, false);
+    try t.expect(presented.success);
+    try t.expectEqualSlices(u32, &before, &boot_pixels);
+    try t.expectEqual(@as(u32, 0x765432), native_pixels[18]);
+    try t.expectEqual(@as(u32, 0x00445566), native_pixels[17]);
+    try t.expectEqualStrings("native-cpu", nameSlice(&presented.backend_name));
+    try t.expectError(error.RestoreFailed, restoreBootBackend(92, second));
+    try t.expectEqual(@as(u64, 2), backendState().reset_generation);
+    try t.expect(!fill(0xAAAAAA));
+    try t.expectEqual(@as(u32, 0), presentCapabilities().flags);
+    try t.expect(retainsDriverOwner(92));
+    try t.expect(firmware_access.gate.isRevoked());
+    try t.expectError(error.Stale, restoreBootBackend(92, second));
+    probe.restores = true;
+    try restoreBootBackend(92, backendState().generation);
+    try t.expectEqual(@as(u64, 0), backendState().reset_generation);
+    try t.expect(backendState().generation > second);
+    try t.expect(!retainsDriverOwner(92));
+    try t.expect(!firmware_access.gate.isRevoked());
+    try t.expectEqualSlices(u32, &before, &boot_pixels);
+    try t.expect(fill(0x123456));
+    try t.expectEqual(@as(u32, 0x123456), boot_pixels[0]);
+}
+
+fn nameSlice(name: []const u8) []const u8 {
+    return name[0 .. @import("std").mem.indexOfScalar(u8, name, 0) orelse name.len];
+}
+
+// Included only by the explicit display-reject-test boot build. The candidate
+// never owns/programs hardware: its callback rejects the commit before writes.
+pub fn probeRejectedTakeover() bool {
+    const Probe = struct {
+        fn commit(_: usize, _: u64, _: *const BootSnapshot) CommitResult {
+            return .old_preserved;
+        }
+        fn restore(_: usize, _: u64, _: *const BootSnapshot) bool {
+            return false;
+        }
+    };
+    const boot = saved_boot orelse return false;
+    const before = backendState();
+    if (before.state != .bootfb or before.policy != .automatic) return false;
+    const owner = ~@as(u32, 0);
+    var frame = boot.framebuffer;
+    var mapping = boot.mapping;
+    mapping.kind = .native_scanout;
+    const candidate = NativeBackend{ .owner = owner, .adapter_id = ~@as(u32, 0), .target = .{ .name = "rejection-probe", .kind = .native, .flags = DeviceFlags.cpu_present, .framebuffer = &frame, .mode = boot.mode, .mapping = mapping }, .commit = Probe.commit, .restore = Probe.restore };
+    const generation = prepareNative(candidate) catch return false;
+    const result = commitNative(owner, generation) catch {
+        abortNative(owner, generation) catch {};
+        return false;
+    };
+    const after = backendState();
+    return result == .old_preserved and after.state == .bootfb and after.reason == .commit_failed and
+        after.generation == before.generation and !retainsDriverOwner(owner) and !firmware_access.gate.isRevoked();
+}
+
+fn testFrame(pixels: [*]u32) fb.Framebuffer {
+    return .{ .address = @ptrCast(pixels), .width = 8, .height = 8, .pitch = 32, .bpp = 32, .memory_model = 1, .red_mask_size = 8, .red_mask_shift = 16, .green_mask_size = 8, .green_mask_shift = 8, .blue_mask_size = 8, .blue_mask_shift = 0, .unused = .{0} ** 5, .edid_size = 0, .edid = null };
+}
+
+fn testTarget(name: []const u8, kind: DeviceKind, frame: *fb.Framebuffer) DisplayTarget {
+    return .{ .name = name, .kind = kind, .framebuffer = frame, .flags = DeviceFlags.visible | DeviceFlags.cpu_present | DeviceFlags.rgb32 | DeviceFlags.xrgb32, .mode = .{ .width = 8, .height = 8, .pitch = 32, .bpp = 32, .red_mask_size = 8, .red_mask_shift = 16, .green_mask_size = 8, .green_mask_shift = 8, .blue_mask_size = 8, .blue_mask_shift = 0 }, .mapping = .{ .kind = if (kind == .bootfb) .bootloader_framebuffer else .native_scanout, .virt_base = @intFromPtr(frame.address), .byte_len = 256, .volatile_cpu_writes = true } };
 }
 
 test "external blit error falls back once and preserves exact damage" {
@@ -609,6 +958,10 @@ test "external blit error falls back once and preserves exact damage" {
         bootfb_device = .{ .ops = &bootfb_ops };
         present_generation = 0;
         completed_fence = 0;
+        backend_manager = .{};
+        completed_backend_state = .{};
+        completed_stats = .{};
+        saved_boot = null;
     }
 
     const descriptor = blit_backend.Descriptor{
@@ -667,6 +1020,7 @@ pub fn mappingKindName(kind: MappingKind) []const u8 {
     return switch (kind) {
         .none => "none",
         .bootloader_framebuffer => "bootloader-framebuffer",
+        .native_scanout => "native-scanout",
     };
 }
 

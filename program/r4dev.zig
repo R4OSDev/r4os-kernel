@@ -1479,6 +1479,66 @@ pub fn displaySummary(out: *DisplaySummary) callconv(.c) i32 {
     return if (s.registered) 1 else 0;
 }
 
+pub fn displayState(out: *r4x_api.DisplayStateInfo) callconv(.c) i32 {
+    if (@intFromPtr(out) == 0 or out.version != 1 or out.size < @sizeOf(r4x_api.DisplayStateInfo)) return -1;
+    const view = display.backendView();
+    const current = view.state;
+    const device = view.device;
+    var capabilities: u32 = 0;
+    if (view.firmware_writable and view.boot_mode.width != 0) capabilities |= r4x_api.display_state_cap_firmware_writable;
+    if (device.registered) {
+        if ((device.flags & display.DeviceFlags.cpu_present) != 0 and (device.kind != .bootfb or view.firmware_writable)) {
+            capabilities |= r4x_api.display_state_cap_cpu_present | r4x_api.display_state_cap_software_fallback;
+        }
+        if (device.kind == .native) capabilities |= r4x_api.display_state_cap_native_scanout;
+    }
+    out.* = .{
+        .state = @intFromEnum(current.state),
+        .policy = @intFromEnum(current.policy),
+        .reason = @intFromEnum(current.reason),
+        .revision = current.revision,
+        .device_generation = current.generation,
+        .reset_generation = current.reset_generation,
+        .pending_generation = current.pending_generation,
+        .adapter_id = current.adapter_id,
+        .pending_adapter_id = current.pending_adapter_id,
+        .driver_owner = @intCast(current.owner),
+        .pending_driver_owner = @intCast(current.pending_owner),
+        .backend_kind = @intFromEnum(device.kind),
+        .capabilities = capabilities,
+        .width = device.mode.width,
+        .height = device.mode.height,
+        .pitch = device.mode.pitch,
+        .bpp = device.mode.bpp,
+        .cache_policy = @intFromEnum(device.mapping.cache_policy),
+        .mapping_kind = @intFromEnum(device.mapping.kind),
+        .boot_width = view.boot_mode.width,
+        .boot_height = view.boot_mode.height,
+        .boot_pitch = view.boot_mode.pitch,
+        .boot_bpp = view.boot_mode.bpp,
+        .boot_byte_length = view.boot_mapping.byte_len,
+        .byte_length = device.mapping.byte_len,
+        .backend_name = view.name,
+    };
+    if ((capabilities & r4x_api.display_state_cap_software_fallback) != 0) {
+        const fallback_label: []const u8 = if (device.kind == .bootfb) "bootfb-cpu" else "native-cpu";
+        @memcpy(out.fallback_name[0..fallback_label.len], fallback_label);
+    }
+    return 1;
+}
+
+comptime {
+    for (@typeInfo(display.backend_state.State).@"enum".fields) |field| {
+        if (field.value != @field(r4x_api, "display_state_" ++ field.name)) @compileError("display state contract mismatch");
+    }
+    for (@typeInfo(display.backend_state.Policy).@"enum".fields) |field| {
+        if (field.value != @field(r4x_api, "display_policy_" ++ field.name)) @compileError("display policy contract mismatch");
+    }
+    for (@typeInfo(display.backend_state.Reason).@"enum".fields) |field| {
+        if (field.value != @field(r4x_api, "display_fallback_" ++ field.name)) @compileError("display reason contract mismatch");
+    }
+}
+
 pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const caller_version = out.version;
     const caller_size: usize = out.size;

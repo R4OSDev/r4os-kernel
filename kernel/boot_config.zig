@@ -1,6 +1,7 @@
 const vfs = @import("../fs/vfs.zig");
 const bootlog = @import("bootlog.zig");
 const loader_perf = @import("loader_perf.zig");
+const graphics_policy = @import("graphics_boot_policy.zig");
 
 pub const MAX_DRIVERS: usize = 12;
 pub const MAX_DISABLED: usize = 8;
@@ -22,6 +23,7 @@ pub const Option = struct {
 };
 
 pub const Config = struct {
+    graphics: @import("../display/backend_state.zig").Policy = .automatic,
     auto_pci: bool = true,
     auto_acpi: bool = true,
     log_verbose: bool = false,
@@ -146,6 +148,13 @@ fn parseLine(line_raw: []const u8) void {
     const comment_pos = indexOf(line_raw, '#') orelse line_raw.len;
     const line = trim(line_raw[0..comment_pos]);
     if (line.len == 0) return;
+    if (startsWith(line, "GRAPHICS=")) {
+        current.graphics = graphics_policy.configValue(trim(line[9..])) orelse blk: {
+            bootlog.puts("[CONF][WARN] invalid GRAPHICS value, using SOFTWARE\r\n");
+            break :blk .software;
+        };
+        return;
+    }
     if (startsWith(line, "AUTO=")) {
         const value = line[5..];
         if (eqIgnoreCase(value, "PCI")) current.auto_pci = true;

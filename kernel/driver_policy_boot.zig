@@ -9,6 +9,9 @@ const fatal = @import("fatal.zig");
 const k = @import("log.zig");
 const loader_boot = @import("loader_boot.zig");
 const platform_irq_boot = @import("platform_irq_boot.zig");
+const display = @import("../display/display.zig");
+const graphics_policy = @import("graphics_boot_policy.zig");
+const boot_info = @import("../bootloader/boot_info.zig");
 
 pub const Phase = enum {
     not_started,
@@ -67,6 +70,15 @@ pub fn init() bool {
     }
     current.platform_irq_ready = true;
 
+    const graphics = graphics_policy.effective(loaded_config.graphics, boot_info.get().software_graphics_once);
+    if (!display.setBackendPolicy(graphics)) return failFatal("Graphics policy after display takeover", "display owner busy");
+    bootlog.puts("[GFX] policy=");
+    bootlog.puts(@tagName(graphics));
+    bootlog.puts("\r\n");
+    if (@import("config").display_reject_test) {
+        if (!display.probeRejectedTakeover()) return failFatal("Display rollback probe failed", "display rejection test failed");
+        k.puts("[GFX] rejected-takeover=OK old-owner=retained firmware-writers=open\r\n");
+    }
     runPolicy(loaded_config);
     return true;
 }

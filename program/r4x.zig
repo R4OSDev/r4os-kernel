@@ -7915,6 +7915,7 @@ fn configureR4XStartR4DevTable() void {
         .performance_driver_work = &r4api.r4dev.performanceDriverWork,
         .performance_pci_inventory = &r4api.r4dev.performancePciInventory,
         .performance_input = &r4api.r4dev.performanceInput,
+        .display_state = &r4api.r4dev.displayState,
     });
 }
 

@@ -77,6 +77,7 @@ pub const Info = struct {
     memory_map_entries: []const MemoryMapEntry = &.{},
     boot_modules: []const BootModule = &.{},
     executable_source: ExecutableSource = .{},
+    software_graphics_once: bool = false,
     memory_map_truncated: bool = false,
     memory_map_invalid_entries: u64 = 0,
     hhdm_offset: ?u64 = null,
@@ -121,6 +122,15 @@ pub fn init() bool {
     current.hhdm_offset = limine.hhdmOffset() orelse return false;
     current.boot_modules = collectBootModules();
     current.executable_source = collectExecutableSource();
+    if (limine.executableFile()) |file| {
+        if (file.cmdline) |text| {
+            // Copy the decision while bootloader-owned command-line memory is
+            // valid. Reject an unterminated/truncated option, never borrow it.
+            var len: usize = 0;
+            while (len < 512 and text[len] != 0) : (len += 1) {}
+            if (len < 512) current.software_graphics_once = @import("../kernel/graphics_boot_policy.zig").softwareOnce(text[0..len]);
+        }
+    }
 
     if (limine.firstFramebuffer()) |src| {
         boot_framebuffer = .{
