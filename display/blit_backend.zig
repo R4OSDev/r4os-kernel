@@ -4,6 +4,8 @@
 // synchronous, self-tested copy implementation, but never owns or retains the
 // framebuffer, source buffer, region list or a fence after the callback.
 
+const ownership = @import("ownership.zig");
+
 pub const VERSION: u32 = 1;
 pub const FLAG_XRGB32: u32 = 1 << 0;
 pub const FLAG_SYNCHRONOUS: u32 = 1 << 1;
@@ -67,28 +69,37 @@ const Registration = struct {
     busy: u32 = 0,
     owner: u32 = 0,
     name: [NAME_BYTES]u8 = .{0} ** NAME_BYTES,
-    descriptor: ?*const Descriptor = null,
+    generation: u64 = 0,
+    descriptor: ?Descriptor = null,
 };
 
 var registration: Registration = .{};
+var generation_counter: u64 = 0;
 
 pub fn register(owner: u32, name: []const u8, descriptor: *const Descriptor) i32 {
     if (owner == 0 or name.len == 0 or name.len >= NAME_BYTES) return -1;
     if (descriptor.version != VERSION or descriptor.size < @sizeOf(Descriptor)) return -2;
     if ((descriptor.flags & REQUIRED_FLAGS) != REQUIRED_FLAGS or descriptor.max_regions == 0) return -2;
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     if (registration.active) return -3;
+    generation_counter +%= 1;
+    if (generation_counter == 0) generation_counter = 1;
 
     registration = .{
         .active = true,
         .admissions_open = true,
         .owner = owner,
-        .descriptor = descriptor,
+        .generation = generation_counter,
+        .descriptor = descriptor.*,
     };
     @memcpy(registration.name[0..name.len], name);
     return 0;
 }
 
 pub fn unregister(owner: u32, name: []const u8) i32 {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     if (!registration.active or registration.owner != owner or !nameEqual(registration.name[0..], name)) return -1;
     if (registration.busy != 0) return -2;
     registration = .{};
@@ -96,6 +107,8 @@ pub fn unregister(owner: u32, name: []const u8) i32 {
 }
 
 pub fn snapshot() Snapshot {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     const descriptor = registration.descriptor orelse return .{};
     if (!registration.active or !registration.admissions_open) return .{};
     return .{
@@ -107,18 +120,41 @@ pub fn snapshot() Snapshot {
 }
 
 pub fn invoke(job: *const Job) InvokeResult {
-    const descriptor = registration.descriptor orelse return .{};
-    if (!registration.active or !registration.admissions_open or job.region_count > descriptor.max_regions) return .{};
-    registration.busy +%= 1;
-    defer registration.busy -%= 1;
-    return .{
-        .attempted = true,
-        .result = descriptor.present(descriptor.context, job),
-        .name = registration.name,
+    const call = ownership.retainCall();
+    if (!call.admitted()) return .{};
+    defer ownership.releaseCall(call);
+
+    const token = ownership.enterState();
+    const descriptor = registration.descriptor orelse {
+        ownership.leaveState(token);
+        return .{};
     };
+    if (!registration.active or !registration.admissions_open or
+        job.region_count > descriptor.max_regions or registration.busy == 0xffff_ffff)
+    {
+        ownership.leaveState(token);
+        return .{};
+    }
+    // Admission and the owner's in-flight reference are one transition.
+    registration.busy += 1;
+    const generation = registration.generation;
+    const owner = registration.owner;
+    const name = registration.name;
+    ownership.leaveState(token);
+
+    const result = descriptor.present(descriptor.context, job);
+    const finish = ownership.enterState();
+    // Cleanup cannot replace an admitted registration. Keep the generation
+    // check explicit so a stale completion never decrements a later owner.
+    if (registration.active and registration.owner == owner and registration.generation == generation and registration.busy != 0)
+        registration.busy -= 1;
+    ownership.leaveState(finish);
+    return .{ .attempted = true, .result = result, .name = name };
 }
 
 pub fn prepareOwnerCleanup(owner: u32) bool {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     if (!registration.active or registration.owner != owner) return true;
     if (registration.busy != 0) return false;
     registration.admissions_open = false;
@@ -126,10 +162,14 @@ pub fn prepareOwnerCleanup(owner: u32) bool {
 }
 
 pub fn cancelOwnerCleanup(owner: u32) void {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     if (registration.active and registration.owner == owner) registration.admissions_open = true;
 }
 
 pub fn cleanupOwner(owner: u32) u32 {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     if (!registration.active or registration.owner != owner) return 0;
     if (registration.busy != 0) return 0;
     registration = .{};

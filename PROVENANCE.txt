@@ -81,3 +81,37 @@ Remote-Eingabequeue und Status verwenden fuer ihre kurzen Aenderungen den
 SMP-Programmzustands-Owner. Ein voller Puffer erhoeht dropped genau einmal;
 pushed, polled und pending folgen der tatsaechlichen Aufnahme/Abholung.
 Der Desktop-Wakeup erfolgt erst nach Veroeffentlichung und Ownerfreigabe.
+
+
+Direkte Anzeige und geordnete Praesentation ab 0.78.76
+---------------------------------------------------
+clear, rect, text und text_font zeichnen ueber den DisplayManager auf die
+sichtbare Anzeige. Rechtecke und Glyphen werden einschliesslich negativer
+Startkoordinaten an deren Grenzen beschnitten. Text haelt einen Fontkatalog-
+Snapshot fuer den gesamten Aufruf; text verwendet den ausgewaehlten Font,
+text_font die angegebene ID mit vorhandener Normalisierung. UTF-8, Glyph-
+Advance, Zeilenumbruch und Vorder-/Hintergrundfarbe folgen dem Fontbesitzer.
+Erst eine ausgefuehrte Zeichnung schaltet die atomare display_revision weiter
+und meldet die Anzeige als benutzt. Gehostete GUI-Frames und die separate
+Boot-/Fatal-Konsole behalten ihre bisherigen Ziel- und Besitzgrenzen.
+
+Alle produktiven DisplayManager-Schreibpfade versuchen denselben
+praeemptiblen UnwindGuard einmal. Bei Kollision wartet ein Present-Aufruf
+nicht, schreibt keine Pixel und liefert keinen Erfolgs-Fence; der Aufrufer
+kann erneut praesentieren. Die direkten void-Basisoperationen setzen den
+bestehenden exklusiven Vollbildbesitz voraus und melden bei einer Kollision
+keine erfolgreiche Nutzung. Sie erhalten keinen neuen ABI-Rueckgabewert.
+WC-Pixelstores werden vor abgeschlossener Statistik/Fence-Veroeffentlichung
+und vor Besitzerfreigabe geordnet. Status liest einen kurzen SMP-geschuetzten
+Snapshot der letzten abgeschlossenen Operation; aktive Kopien laufen ohne
+No-Sleep-Owner. Eine erfolgreich abgeschlossene Regionspraesentation erhaelt
+genau die naechste von null verschiedene Generation und denselben Fence.
+Dies ist ein synchroner Kopierabschluss, keine Zusage ueber VBlank/Pageflip.
+
+DisplayBlit-Admission erhoeht den laufenden Besitzerbezug atomar mit der
+Pruefung der Registrierung. Der Descriptor wird kopiert; Name, Besitzer und
+Registrierungsgeneration bleiben dem konkreten Aufruf zugeordnet. Shutdown
+kann einen laufenden Callback nicht ueberholen. Der Callback selbst laeuft
+ausserhalb des kurzen SMP-Owners; sein Abschluss kann keinen busy-Zaehler
+einer spaeteren Registrierung veraendern. Die vorhandene R4D-Abbaufolge und
+der synchrone DISPBLIT-Treibervertrag werden damit wirksam abgesichert.

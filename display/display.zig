@@ -1,4 +1,6 @@
 const fb = @import("framebuffer.zig");
+const ownership = @import("ownership.zig");
+const font = @import("../kernel/font.zig");
 const blit_backend = @import("blit_backend.zig");
 const cpu = @import("../platform/cpu.zig");
 const paging = @import("../memory/paging.zig");
@@ -192,8 +194,14 @@ var bootfb_device: Device = .{ .ops = &bootfb_ops };
 var primary_device: ?*Device = null;
 var present_generation: u64 = 0;
 var completed_fence: u64 = 0;
+var execution = ownership.Execution.init("display-present");
+var completed_stats: Stats = .{};
 
 pub fn registerBootBackend(target: DisplayTarget) void {
+    if (!execution.tryEnter()) return;
+    defer execution.leave();
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     bootfb_device = .{
         .name = target.name,
         .kind = target.kind,
@@ -206,38 +214,38 @@ pub fn registerBootBackend(target: DisplayTarget) void {
     primary_device = &bootfb_device;
     present_generation = 0;
     completed_fence = 0;
+    completed_stats = captureStats();
 }
 
 pub fn activeBackendRegistered() bool {
-    return primary_device != null;
+    return stats().registered;
 }
-
 pub fn activeBackendName() []const u8 {
-    const device = primary_device orelse return "none";
-    return device.name;
+    return stats().name;
 }
-
 pub fn activeBackendKind() DeviceKind {
-    const device = primary_device orelse return .none;
-    return device.kind;
+    return stats().kind;
 }
-
 pub fn activeMode() ?Mode {
-    const device = primary_device orelse return null;
-    return device.mode;
+    const current = stats();
+    return if (current.registered) current.mode else null;
 }
-
 pub fn activeMapping() ?Mapping {
-    const device = primary_device orelse return null;
-    return device.mapping;
+    const current = stats();
+    return if (current.registered) current.mapping else null;
 }
 
 pub fn activeFramebufferForLegacy() ?*fb.Framebuffer {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     const device = primary_device orelse return null;
     return device.framebuffer;
 }
 
 pub fn enableFramebufferWriteCombining() bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
+    defer publishStats();
     const device = primary_device orelse return false;
     if (!cpu.writeCombiningBasisAvailable()) {
         device.mapping.cache_policy = .write_combining_unsupported;
@@ -260,6 +268,20 @@ pub fn framebuffer() ?*fb.Framebuffer {
 }
 
 pub fn stats() Stats {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
+    return completed_stats;
+}
+
+fn publishStats() void {
+    asm volatile ("sfence" ::: .{ .memory = true });
+    const value = captureStats();
+    const token = ownership.enterState();
+    completed_stats = value;
+    ownership.leaveState(token);
+}
+
+fn captureStats() Stats {
     const device = primary_device orelse return .{};
     return .{
         .registered = true,
@@ -291,41 +313,113 @@ pub fn stats() Stats {
 }
 
 pub fn fill(rgb: u32) bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.fill orelse return false;
     const start = timer.tickCount();
     const ok = op(device, rgb);
-    if (ok) recordPresentTiming(device, start);
+    if (ok) {
+        recordPresentTiming(device, start);
+        publishStats();
+    }
     return ok;
 }
 
 pub fn rect(x: i32, y: i32, w: u32, h: u32, rgb: u32) bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.rect orelse return false;
     const start = timer.tickCount();
     const ok = op(device, x, y, w, h, rgb);
-    if (ok) recordPresentTiming(device, start);
+    if (ok) {
+        recordPresentTiming(device, start);
+        publishStats();
+    }
     return ok;
 }
 
+pub fn textZ(font_id: ?u32, x: i32, y: i32, value: [*:0]const u8, fg: u32, bg: u32) bool {
+    if (@intFromPtr(value) == 0 or !execution.tryEnter()) return false;
+    defer execution.leave();
+    const device = primary_device orelse return false;
+    const f = device.framebuffer orelse return false;
+    if (!fb.supportsRgb32(f)) return false;
+    var length: usize = 0;
+    while (length < 4096 and value[length] != 0) : (length += 1) {}
+    var catalog = font.acquireCatalog();
+    defer catalog.release();
+    const state = catalog.state();
+    const selected = state.normalizeFontId(font_id orelse state.currentFontId());
+    const line_height = state.glyphHeightForFont(selected);
+    const packed_fg = fb.packRgb(f, fg);
+    const packed_bg = fb.packRgb(f, bg);
+    var pen_x: i64 = x;
+    var pen_y: i64 = y;
+    var offset: usize = 0;
+    var pixels: u64 = 0;
+    var bounds = Rect{};
+    const start = timer.tickCount();
+    while (offset < length) {
+        const scalar = font.decodeUtf8Scalar(value[0..length], offset);
+        offset += scalar.consumed;
+        if (scalar.codepoint == '\r') continue;
+        if (scalar.codepoint == '\n') {
+            pen_x = x;
+            pen_y += line_height;
+            continue;
+        }
+        const glyph = state.glyphBitmapForFont(selected, scalar.codepoint);
+        if (clipSignedRect(pen_x, pen_y, @max(glyph.width, glyph.advance), glyph.line_height, device.mode)) |clipped| {
+            bounds = if (pixels == 0) clipped else mergeRect(bounds, clipped);
+            pixels += @as(u64, clipped.w) * clipped.h;
+            for (0..clipped.h) |row| {
+                const gy: usize = @intCast(@as(i64, clipped.y) + @as(i64, @intCast(row)) - pen_y);
+                for (0..clipped.w) |column| {
+                    const gx: usize = @intCast(@as(i64, clipped.x) + @as(i64, @intCast(column)) - pen_x);
+                    const ink = gy < glyph.height and gy < glyph.rows.len and gx < glyph.width and gx < 64 and
+                        (glyph.rows[gy] & (@as(u64, 1) << @intCast(gx))) != 0;
+                    fb.putPacked32(f, clipped.x + column, clipped.y + row, if (ink) packed_fg else packed_bg);
+                }
+            }
+        }
+        pen_x += glyph.advance;
+    }
+    if (pixels == 0) return false;
+    recordPresentAggregate(device, .rect, bounds, pixels, false);
+    recordPresentTiming(device, start);
+    publishStats();
+    return true;
+}
+
 pub fn putPacked32(x: u64, y: u64, color32: u32) bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.put_packed32 orelse return false;
     return op(device, x, y, color32);
 }
 
 pub fn putXrgb32(x: u64, y: u64, rgb: u32) bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.put_xrgb32 orelse return false;
     return op(device, x, y, rgb);
 }
 
 pub fn presentPacked32Rect(x0: u64, y0: u64, w: u64, h: u64, src: []const u8, src_stride_pixels: u64) bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.present_packed32_rect orelse return false;
     const start = timer.tickCount();
     const ok = op(device, x0, y0, w, h, src, src_stride_pixels);
-    if (ok) recordPresentTiming(device, start);
+    if (ok) {
+        recordPresentTiming(device, start);
+        publishStats();
+    }
     return ok;
 }
 
@@ -370,6 +464,8 @@ pub fn presentXrgb32Regions(
     input_tick_valid: bool,
 ) PresentOutcome {
     var outcome = PresentOutcome{ .source_generation = source_generation };
+    if (!execution.tryEnter()) return outcome;
+    defer execution.leave();
     const device = primary_device orelse return outcome;
     const f = device.framebuffer orelse return outcome;
     if (!fb.supportsRgb32(f) or source_pixel_count == 0 or source_stride_pixels == 0 or
@@ -423,12 +519,17 @@ pub fn presentXrgb32Regions(
         copyName(outcome.backend_name[0..], "bootfb-cpu");
     }
 
-    present_generation +%= 1;
-    if (present_generation == 0) present_generation = 1;
-    completed_fence = present_generation;
     const completed_tick = timer.tickCount();
     recordPresentAggregate(device, .xrgb32_present, bounds, pixels_total, false);
     recordPresentTimingAt(device, start, completed_tick);
+    // Pixel stores precede the fence, including write-combining fallback.
+    asm volatile ("sfence" ::: .{ .memory = true });
+    const token = ownership.enterState();
+    present_generation +%= 1;
+    if (present_generation == 0) present_generation = 1;
+    completed_fence = present_generation;
+    completed_stats = captureStats();
+    ownership.leaveState(token);
     outcome.success = true;
     outcome.present_generation = present_generation;
     outcome.fence = present_generation;
@@ -447,10 +548,10 @@ pub fn presentCapabilities() PresentCapabilities {
     copyName(result.backend_name[0..], "bootfb-cpu");
     copyName(result.fallback_name[0..], "bootfb-cpu");
     const external = blit_backend.snapshot();
-    const target_compatible = if (primary_device) |device|
-        if (device.framebuffer) |frame| fb.isNativeXrgb32(frame) and (frame.pitch & 3) == 0 else false
-    else
-        false;
+    const current = stats();
+    const m = current.mode;
+    const target_compatible = current.registered and m.bpp == 32 and m.red_mask_size == 8 and m.red_mask_shift == 16 and
+        m.green_mask_size == 8 and m.green_mask_shift == 8 and m.blue_mask_size == 8 and m.blue_mask_shift == 0 and (m.pitch & 3) == 0;
     if (external.active and target_compatible) {
         result.flags |= 8 | 16;
         result.backend_kind = 2;
@@ -461,10 +562,12 @@ pub fn presentCapabilities() PresentCapabilities {
 }
 
 pub fn presentFenceCompleted(fence: u64) bool {
-    return fence != 0 and fence <= completed_fence;
+    return fence != 0 and fence <= highestCompletedFence();
 }
 
 pub fn highestCompletedFence() u64 {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     return completed_fence;
 }
 
@@ -584,15 +687,20 @@ fn bootfbFill(device: *Device, rgb: u32) bool {
     return true;
 }
 
+fn clipSignedRect(x: i64, y: i64, w: u32, h: u32, mode: Mode) ?Rect {
+    const left = @max(@as(i64, 0), x);
+    const top = @max(@as(i64, 0), y);
+    const right = @min(@as(i64, mode.width), x + w);
+    const bottom = @min(@as(i64, mode.height), y + h);
+    if (left >= right or top >= bottom) return null;
+    return .{ .x = @intCast(left), .y = @intCast(top), .w = @intCast(right - left), .h = @intCast(bottom - top) };
+}
+
 fn bootfbRect(device: *Device, x: i32, y: i32, w: u32, h: u32, rgb: u32) bool {
     const f = device.framebuffer orelse return false;
-    if (x < 0 or y < 0) return false;
-    const ux: u64 = @intCast(x);
-    const uy: u64 = @intCast(y);
-    fb.rect(f, ux, uy, w, h, rgb);
-    const clipped_w = if (ux >= f.width) 0 else @min(@as(u64, w), f.width - ux);
-    const clipped_h = if (uy >= f.height) 0 else @min(@as(u64, h), f.height - uy);
-    recordPresent(device, .rect, @intCast(ux), @intCast(uy), @intCast(clipped_w), @intCast(clipped_h), false);
+    const clipped = clipSignedRect(x, y, w, h, device.mode) orelse return false;
+    fb.rect(f, clipped.x, clipped.y, clipped.w, clipped.h, rgb);
+    recordPresent(device, .rect, clipped.x, clipped.y, clipped.w, clipped.h, false);
     return true;
 }
 

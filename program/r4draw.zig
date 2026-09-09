@@ -1,4 +1,5 @@
 const r4x_api = @import("r4x_api.zig");
+const display = @import("../display/display.zig");
 const surface_pipeline = @import("../display/surface_pipeline.zig");
 const presenter = @import("../display/presenter.zig");
 const surface = @import("../display/surface.zig");
@@ -38,8 +39,11 @@ pub fn setFontCatalogChangedHook(hook: FontCatalogChangedFn) void {
 }
 
 pub fn markDisplayUsed() void {
-    display_revision +%= 1;
-    if (display_revision == 0) display_revision = 1;
+    var previous = @atomicLoad(u32, &display_revision, .acquire);
+    while (true) {
+        const next = if (previous == 0xffff_ffff) 1 else previous + 1;
+        previous = @cmpxchgWeak(u32, &display_revision, previous, next, .acq_rel, .acquire) orelse break;
+    }
     if (display_used_hook) |hook| hook();
 }
 
@@ -52,27 +56,19 @@ pub fn screenHeight() callconv(.c) u32 {
 }
 
 pub fn clear(rgb: u32) callconv(.c) void {
-    _ = rgb;
+    if (display.fill(rgb)) markDisplayUsed();
 }
 
 pub fn rect(x: i32, y: i32, w: u32, h: u32, rgb: u32) callconv(.c) void {
-    _ = x;
-    _ = y;
-    _ = w;
-    _ = h;
-    _ = rgb;
+    if (display.rect(x, y, w, h, rgb)) markDisplayUsed();
 }
 
 pub fn text(x: i32, y: i32, value: [*:0]const u8, fg: u32, bg: u32) callconv(.c) void {
-    _ = x;
-    _ = y;
-    _ = value;
-    _ = fg;
-    _ = bg;
+    if (display.textZ(null, x, y, value, fg, bg)) markDisplayUsed();
 }
 
 pub fn displayRevision() callconv(.c) u32 {
-    return display_revision;
+    return @atomicLoad(u32, &display_revision, .acquire);
 }
 
 pub fn displayBeginFrame() callconv(.c) i32 {
@@ -209,12 +205,12 @@ pub fn displayPresentCapabilities(out: *DisplayPresentCapabilities) callconv(.c)
 
 pub fn displayPresentCompletion(fence: u64, out: *DisplayPresentCompletion) callconv(.c) i32 {
     if (@intFromPtr(out) == 0 or fence == 0) return r4x_api.display_present_error_invalid;
-    const display = @import("../display/display.zig");
-    const complete = display.presentFenceCompleted(fence);
+    const completed = display.highestCompletedFence();
+    const complete = fence <= completed;
     out.* = .{
         .flags = if (complete) r4x_api.display_present_completion_complete else 0,
         .fence = fence,
-        .completed_fence = display.highestCompletedFence(),
+        .completed_fence = completed,
         .result = if (complete) 0 else r4x_api.display_present_error_unavailable,
     };
     return out.result;
@@ -310,12 +306,7 @@ pub fn fontRevision() callconv(.c) u32 {
 }
 
 pub fn textFont(font_id: u32, x: i32, y: i32, value: [*:0]const u8, fg: u32, bg: u32) callconv(.c) void {
-    _ = font_id;
-    _ = x;
-    _ = y;
-    _ = value;
-    _ = fg;
-    _ = bg;
+    if (display.textZ(font_id, x, y, value, fg, bg)) markDisplayUsed();
 }
 
 fn fillGuiFontInfo(font_id: u32, force_selected: bool, out: *GuiFontInfo) i32 {

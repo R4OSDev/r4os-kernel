@@ -1,3 +1,4 @@
+const ownership = @import("ownership.zig");
 const display = @import("display.zig");
 
 const Target = struct {
@@ -36,6 +37,8 @@ pub fn initFromDisplayManager() void {
 }
 
 pub fn initTarget(new_target: Target) void {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     target = new_target;
     frame_active = false;
     frame_mode = .none;
@@ -43,14 +46,20 @@ pub fn initTarget(new_target: Target) void {
 }
 
 pub fn width() u32 {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     return @intCast(target.width);
 }
 
 pub fn height() u32 {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     return @intCast(target.height);
 }
 
 pub fn beginFrame() i32 {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     if (!target.valid()) return 0;
     frame_active = true;
     frame_mode = .explicit_full_frame;
@@ -58,6 +67,8 @@ pub fn beginFrame() i32 {
 }
 
 pub fn beginFrameRect(x: i32, y: i32, w: u32, h: u32) i32 {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     _ = x;
     _ = y;
     if (!target.valid() or w == 0 or h == 0) return 0;
@@ -67,6 +78,8 @@ pub fn beginFrameRect(x: i32, y: i32, w: u32, h: u32) i32 {
 }
 
 pub fn present() i32 {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
     if (!target.valid()) return 0;
     if (frame_mode != .none) last_frame_mode = frame_mode;
     frame_active = false;

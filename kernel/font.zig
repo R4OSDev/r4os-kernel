@@ -1304,7 +1304,7 @@ const DecodedScalar = struct {
     consumed: usize,
 };
 
-fn decodeUtf8Scalar(value: []const u8, start: usize) DecodedScalar {
+pub fn decodeUtf8Scalar(value: []const u8, start: usize) DecodedScalar {
     if (start >= value.len) return .{ .codepoint = 0xFFFD, .consumed = 0 };
     const first = value[start];
     if (first < 0x80) return .{ .codepoint = first, .consumed = 1 };
