@@ -3131,14 +3131,23 @@ fn semaphoreStats(output: *outputs_contract.DriverSemaphoreStats) callconv(.c) i
     return driver_semaphores.stats(runtimeOwner(), output);
 }
 fn threadQuery(output: *outputs_contract.DriverThreadApi) callconv(.c) i32 {
-    if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverThreadApi)) return outputs_contract.driver_thread_error_invalid;
-    output.* = .{};
+    if (output.version != 1 or output.size < outputs_contract.driver_thread_api_min_bytes) return outputs_contract.driver_thread_error_invalid;
+    const bytes: usize = if (output.size >= @sizeOf(outputs_contract.DriverThreadApi)) @sizeOf(outputs_contract.DriverThreadApi) else outputs_contract.driver_thread_api_min_bytes;
+    var service: outputs_contract.DriverThreadApi = .{ .size = @intCast(bytes) };
+    const destination = @as([*]u8, @ptrCast(output))[0..bytes];
+    @memcpy(destination, std.mem.asBytes(&service)[0..bytes]);
     const owner = heapOwner();
     if (owner == 0) return outputs_contract.driver_thread_error_owner;
     const result = driver_threads.query(owner);
     if (result != outputs_contract.driver_thread_ok) return result;
-    output.* = .{ .start = @intFromPtr(&threadStart), .stop = @intFromPtr(&threadStop), .join = @intFromPtr(&threadJoin), .release = @intFromPtr(&threadRelease), .status = @intFromPtr(&threadStatus), .current = @intFromPtr(&threadCurrent), .sleep_ticks = @intFromPtr(&threadSleepTicks), .stats = @intFromPtr(&threadStats) };
+    service = .{ .size = @intCast(bytes), .start = @intFromPtr(&threadStart), .stop = @intFromPtr(&threadStop), .join = @intFromPtr(&threadJoin), .release = @intFromPtr(&threadRelease), .status = @intFromPtr(&threadStatus), .current = @intFromPtr(&threadCurrent), .sleep_ticks = @intFromPtr(&threadSleepTicks), .stats = @intFromPtr(&threadStats), .abort_current = @intFromPtr(&threadAbortCurrent) };
+    @memcpy(destination, std.mem.asBytes(&service)[0..bytes]);
     return outputs_contract.driver_thread_ok;
+}
+fn threadAbortCurrent(result: i32) callconv(.c) i32 {
+    const owner = heapOwner();
+    if (owner == 0) return outputs_contract.driver_thread_error_owner;
+    return driver_threads.abortCurrent(owner, result);
 }
 fn threadStart(input: *const outputs_contract.DriverThreadRequest, output: *u64) callconv(.c) i32 {
     return driver_threads.start(heapOwner(), input, output);

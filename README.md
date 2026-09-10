@@ -287,3 +287,25 @@ to the BSP only for an earlier finite deadline, under the same publication
 owner. The existing STI/HLT-safe idle path rechecks the minimum and programs
 its own timer; APs never write the BSP timer. The regression retains its
 original five-second bound.
+
+Dedicated driver Tasks may opt into synchronous self-abort with flag 2.
+The version-1 DriverThreadApi adds `abort_current` at offset 72, size 80.
+Query accepts the full legacy 72-byte prefix, copies only 72 for capacities
+72..79, and copies 80 for larger buffers. Old callers' tails are untouched.
+DriverApi remains version 33/632 bytes. Flag 4 reports an accepted abort and
+is rejected as a start flag.
+
+`arch/x86_64/callback_abort.zig` implements one ordinary SysV call boundary,
+saving the caller stack, callee-saved GPRs and MXCSR/x87 control state. It
+clears DF before return and uses the target ABI on either build host. The
+live frame belongs to the actual Task, with no per-CPU identity guess or
+shared frame pool. This is original R4OS assembly, not a setjmp translation.
+
+`driver_threads.abortCurrent` admits only negative self-aborts on opted-in
+Tasks with interrupts enabled, no held kernel lock/runtime section, no wait
+lease and exactly their initial unwind guard. Runtime metadata publication
+ends before transfer. The normal threadMain epilogue still owns completion,
+waiter notification and retirement of the exact Task generation and stack.
+Module defers are bypassed; resource recovery remains the native owner's
+responsibility after peers quiesce. No arbitrary CPU exception, hung callback,
+kernel critical section or GPU failure is caught or forcibly terminated.

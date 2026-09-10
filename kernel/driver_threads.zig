@@ -10,6 +10,7 @@ const sync = @import("../sched/sync.zig");
 const heap = @import("../memory/heap.zig");
 const timer = @import("timer.zig");
 const ownership = @import("driver_thread_owner.zig");
+const callback_abort = @import("../arch/x86_64/callback_abort.zig");
 const Handler = *const fn (usize) callconv(.c) i32;
 const Payload = struct {
     handler: Handler,
@@ -24,6 +25,7 @@ const Payload = struct {
     completion: sync.WaitQueue = .{},
     sleep_queue: sync.WaitQueue = .{},
     waiting_on: ?*sync.WaitQueue = null,
+    abort_frame: ?*callback_abort.Frame = null,
 };
 const State = ownership.State(@import("../driver/registry.zig").MAX_DRIVERS, Payload);
 const Record = State.Record;
@@ -74,7 +76,7 @@ pub fn start(owner: u32, input: *const a.DriverThreadRequest, output: *u64) i32 
     output.* = 0;
     const request = input.*;
     if (!valid(a.DriverThreadRequest, &request) or request.handler == 0 or request.reserved != 0 or
-        request.flags & ~a.driver_thread_flag_parallel != 0) return a.driver_thread_error_invalid;
+        request.flags & ~(a.driver_thread_flag_parallel | a.driver_thread_flag_abortable) != 0) return a.driver_thread_error_invalid;
     if (!canSleep()) return a.driver_thread_error_context;
     const unwind = enterOperation() orelse return a.driver_thread_error_busy;
     defer leaveOperation(unwind);
@@ -131,6 +133,31 @@ pub fn stop(owner: u32, handle: u64) i32 {
     _ = state.stop(owner, handle) catch unreachable;
     cancelWaitLocked(record);
     return a.driver_thread_ok;
+}
+
+// Synchronous self-abort only. The record belongs to the actual executing
+// Task, never to a caller-supplied Task ID or a per-CPU guess. No kernel frame
+// owning a lock, wait lease or extra unwind token may be skipped.
+pub fn abortCurrent(owner: u32, result: i32) i32 {
+    if (result >= 0) return a.driver_thread_error_invalid;
+    if (!canSleep()) return a.driver_thread_error_context;
+    const frame = capture: {
+        const flags = interrupts.saveAndDisableRuntime();
+        defer interrupts.restore(flags);
+        const record = currentRecordLocked() orelse return a.driver_thread_error_context;
+        if (record.owner != owner) return a.driver_thread_error_owner;
+        const current_task = scheduler.current() orelse unreachable;
+        if (current_task.unwind_guard_count != 1 or record.payload.waiting_on != null)
+            return a.driver_thread_error_busy;
+        const frame = record.payload.abort_frame orelse return a.driver_thread_error_context;
+        if (record.payload.flags & a.driver_thread_flag_abortable == 0 or frame.rsp == 0)
+            return a.driver_thread_error_context;
+        record.payload.flags |= a.driver_thread_flag_aborted;
+        break :capture frame;
+    };
+    // The initial Task guard still retains the module, record, stack and FPU
+    // state. The normal threadMain epilogue owns completion and retirement.
+    callback_abort.returnToCaller(frame, result);
 }
 
 pub fn status(owner: u32, handle: u64, output: *a.DriverThreadStatus) i32 {
@@ -376,7 +403,15 @@ fn threadMain() callconv(.c) void {
         record.payload.cpu_index = percpu.currentIndex();
         break :enter state.enter(record) catch unreachable;
     };
-    const result = if (admitted) record.payload.handler(record.payload.context) else a.driver_thread_error_cancelled;
+    var abort_frame: callback_abort.Frame = .{};
+    const result = if (!admitted) a.driver_thread_error_cancelled else result: {
+        if (record.payload.flags & a.driver_thread_flag_abortable == 0)
+            break :result record.payload.handler(record.payload.context);
+        record.payload.abort_frame = &abort_frame;
+        const result = callback_abort.invoke(record.payload.handler, record.payload.context, &abort_frame);
+        record.payload.abort_frame = null;
+        break :result result;
+    };
     {
         const flags = interrupts.saveAndDisableRuntime();
         defer interrupts.restore(flags);

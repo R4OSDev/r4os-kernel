@@ -5,4 +5,5 @@ test {
     _ = @import("kernel/driver_memory_owner.zig");
     _ = @import("kernel/driver_thread_owner.zig");
     _ = @import("kernel/driver_semaphore_owner.zig");
+    _ = @import("arch/x86_64/callback_abort.zig");
 }
