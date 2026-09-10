@@ -277,6 +277,17 @@ pub const WaitQueue = struct {
         return self.core.count != 0;
     }
 
+    // Cancel only the exact leased Task's wait in this queue. The caller
+    // retains Task lifetime; this cannot interrupt an unrelated I/O/lock wait.
+    pub fn cancelTask(self: *WaitQueue, target: *task.Task, generation: u64) bool {
+        const flags = self.enterCritical();
+        defer self.leaveCritical(flags);
+        if (target.generation != generation or target.state != .blocked or
+            target.wait_node.queue != &self.core or target.wait_node.owner_generation != generation) return false;
+        if (!scheduler.wakeTask(target, .cancelled)) return false;
+        return true;
+    }
+
     fn objectId(self: *const WaitQueue) u64 {
         return @intFromPtr(self);
     }

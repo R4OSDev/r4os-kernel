@@ -8388,7 +8388,7 @@ fn reportBootFilesystemWait(enabled: bool, drive_letter: u8) void {
                 }
             }
         },
-        .none => {},
+        .none, .driver_thread => {},
     }
     if (owner_task.state == .blocked and owner_task.wait_reason.len != 0) {
         activity = owner_task.wait_reason;

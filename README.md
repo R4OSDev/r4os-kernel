@@ -245,3 +245,21 @@ drivers. kernel/monotonic_api.zig is the shared R4SYS/R4D mapping of the
 canonical monotonic source. The optional entry preserves the 608-byte prefix;
 no new clock, timer backend or scheduling policy is introduced. Reads do not
 acquire a driver lifecycle guard, allocate or wait.
+
+DriverApi32 appends a dedicated driver-task query to the preserved 616-byte
+prefix (total 624). kernel/driver_threads.zig owns scheduler integration;
+driver_thread_owner.zig owns the dynamic intrusive identity index. Tasks have
+guarded stacks, full module FPU state and an execution/unwind owner installed
+before publication. Default placement is BSP; audited module code may opt in
+to SMP. The service never acquires the global R4D lifecycle guard. Finite joins
+retain their target; cooperative stop wakes only service-owned waits.
+
+Parent close rejects starts, wakes sleepers/joiners and requires returned
+callbacks before generic backend/IRQ/work teardown. Completed Task generations
+and stacks retire before record backing is freed, then DMA/CPU cleanup may
+proceed. Failed construction/release retains ownership and vetoes unload.
+Heap and task operations occur outside runtime metadata sections. The small
+storage-callback identity projection also uses that boundary so parallel CPU
+callers can safely enforce the existing storage exclusion. Driver logs publish
+one bounded complete record with the actual callback owner. Legacy device and
+filesystem APIs gain no new parallel admission.

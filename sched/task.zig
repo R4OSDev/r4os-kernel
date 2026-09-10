@@ -107,6 +107,7 @@ pub const ExecutionOwnerKind = enum(u8) {
     none,
     program_thread,
     async_io,
+    driver_thread,
 };
 
 pub const ExecutionOwner = struct {
@@ -459,7 +460,7 @@ pub fn init() bool {
     if (!prepareCriticalReserve()) return false;
     initialized = true;
     var create_failure: CreateFailure = .none;
-    _ = createTask("kernel-main", .running, false, null, .interactive, false, false, &create_failure) orelse {
+    _ = createTask("kernel-main", .running, false, null, .interactive, false, false, &create_failure, .{}) orelse {
         initialized = false;
         cleanupCriticalReserve();
         return false;
@@ -484,7 +485,7 @@ pub fn createKernelTask(name: []const u8, state: State) ?*Task {
 }
 
 pub fn createKernelTaskWithFailure(name: []const u8, state: State, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, state, true, null, .interactive, false, false, failure_out);
+    return createTask(name, state, true, null, .interactive, false, false, failure_out, .{});
 }
 
 fn createTask(
@@ -496,6 +497,7 @@ fn createTask(
     smp_eligible: bool,
     smp_r4x_work: bool,
     failure_out: *CreateFailure,
+    execution_owner: ExecutionOwner,
 ) ?*Task {
     failure_out.* = .none;
     if (!initialized) {
@@ -604,6 +606,11 @@ fn createTask(
     };
     new_task.id = id;
     new_task.generation = generation;
+    // Dedicated R4D callbacks become kill-protected before registry/ready
+    // publication. Construction failures before this point own no context.
+    new_task.execution_owner_kind = execution_owner.kind;
+    new_task.execution_owner_context = execution_owner.context;
+    if (execution_owner.kind == .driver_thread) new_task.unwind_guard_count = 1;
     linkRegistryLocked(new_task);
     if (state == .ready or state == .running) resetRoleActivationLocked(new_task);
     interrupts.restore(irq_flags);
@@ -1350,17 +1357,17 @@ pub fn createKernelThread(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelThreadWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .ready, false, entry, .interactive, false, false, failure_out);
+    return createTask(name, .ready, false, entry, .interactive, false, false, failure_out, .{});
 }
 
 pub fn createKernelThreadWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .ready, false, entry, role, false, false, &failure);
+    return createTask(name, .ready, false, entry, role, false, false, &failure, .{});
 }
 
 pub fn createParallelKernelThreadWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .ready, false, entry, role, true, false, &failure);
+    return createTask(name, .ready, false, entry, role, true, false, &failure, .{});
 }
 
 pub fn createKernelThreadBlocked(name: []const u8, entry: Entry) ?*Task {
@@ -1369,21 +1376,43 @@ pub fn createKernelThreadBlocked(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelThreadBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .blocked, true, entry, .interactive, false, false, failure_out);
+    return createTask(name, .blocked, true, entry, .interactive, false, false, failure_out, .{});
 }
 
 pub fn createKernelThreadBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, true, entry, role, false, false, &failure);
+    return createTask(name, .blocked, true, entry, role, false, false, &failure, .{});
+}
+
+// Module-capable stack/FPU construction, independent of shared Driver Work.
+// The provider owns the initial unwind count until its callback epilogue.
+pub fn createDriverThreadBlocked(entry: Entry, context: *anyopaque, parallel: bool) ?*Task {
+    var failure: CreateFailure = .none;
+    return createTask("r4d-thread", .blocked, true, entry, .interactive, parallel, parallel, &failure, .{ .kind = .driver_thread, .context = context });
+}
+
+// Only an unpublished blocked driver Task may abandon its construction
+// guard. A published/running callback must return and release it itself.
+pub fn abandonDriverThread(id: u32, generation: u64, context: *const anyopaque) bool {
+    const flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(flags);
+    const target = findByIdentityLocked(id, generation) orelse return false;
+    if (target.state != .blocked or target.ready_linked or target.timeout_linked or target.running_cpu != 0xFF or
+        target.execution_owner_kind != .driver_thread or target.execution_owner_context != @constCast(context) or
+        target.unwind_guard_count != 1 or target.held_lock_count != 0) return false;
+    target.unwind_guard_count = 0;
+    target.execution_owner_kind = .none;
+    target.execution_owner_context = null;
+    return true;
 }
 
 pub fn createParallelThreadBlocked(name: []const u8, entry: Entry) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, true, entry, .interactive, true, true, &failure);
+    return createTask(name, .blocked, true, entry, .interactive, true, true, &failure, .{});
 }
 
 pub fn createParallelThreadBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .blocked, true, entry, .interactive, true, true, failure_out);
+    return createTask(name, .blocked, true, entry, .interactive, true, true, failure_out, .{});
 }
 
 // R4X owners that still depend on global singleton state remain on the BSP
@@ -1391,11 +1420,11 @@ pub fn createParallelThreadBlockedWithFailure(name: []const u8, entry: Entry, fa
 // ownership policy, not a public CPU-affinity ABI.
 pub fn createLegacyThreadBlocked(name: []const u8, entry: Entry) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, true, entry, .interactive, false, false, &failure);
+    return createTask(name, .blocked, true, entry, .interactive, false, false, &failure, .{});
 }
 
 pub fn createLegacyThreadBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .blocked, true, entry, .interactive, false, false, failure_out);
+    return createTask(name, .blocked, true, entry, .interactive, false, false, failure_out, .{});
 }
 
 pub fn createKernelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
@@ -1404,28 +1433,28 @@ pub fn createKernelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelWorkerBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .blocked, false, entry, .interactive, false, false, failure_out);
+    return createTask(name, .blocked, false, entry, .interactive, false, false, failure_out, .{});
 }
 
 pub fn createKernelWorkerBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, false, entry, role, false, false, &failure);
+    return createTask(name, .blocked, false, entry, role, false, false, &failure, .{});
 }
 
 pub fn createParallelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, false, entry, .interactive, true, false, &failure);
+    return createTask(name, .blocked, false, entry, .interactive, true, false, &failure, .{});
 }
 
 pub fn createParallelWorkerBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, false, entry, role, true, false, &failure);
+    return createTask(name, .blocked, false, entry, role, true, false, &failure, .{});
 }
 
 pub fn createCpuIdleTask(cpu_index: u32) ?*Task {
     if (cpu_index == 0 or cpu_index >= percpu.max_cpus) return null;
     var failure: CreateFailure = .none;
-    const idle = createTask("cpu-idle", .blocked, false, null, .batch, false, false, &failure) orelse return null;
+    const idle = createTask("cpu-idle", .blocked, false, null, .batch, false, false, &failure, .{}) orelse return null;
     const irq_flags = interrupts.saveAndDisableRuntime();
     idle.home_cpu = @intCast(cpu_index);
     idle.cpu_idle = true;

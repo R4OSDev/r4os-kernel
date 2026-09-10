@@ -1,4 +1,5 @@
 const bootlog = @import("bootlog.zig");
+const std = @import("std");
 
 pub const Severity = enum {
     info,
@@ -7,10 +8,14 @@ pub const Severity = enum {
 };
 
 pub fn driver(severity: Severity, owner: u32, text: [*:0]const u8) void {
-    writeHeader("Driver", severity);
-    bootlog.puts(" owner=");
-    bootlog.putDec(owner);
-    writeText(text);
+    // Parallel driver callbacks must publish one bounded log record, without
+    // interleaving headers, owner IDs and individual payload bytes.
+    var length: usize = 0;
+    while (length < 512 and text[length] != 0) : (length += 1) {}
+    const suffix: []const u8 = if (length == 512 and text[length] != 0) " [truncated]" else "";
+    var buffer: [640]u8 = undefined;
+    const line = std.fmt.bufPrint(&buffer, "[LOG1] source=Driver severity={s} owner={d} text={s}{s}\r\n", .{ severityName(severity), owner, text[0..length], suffix }) catch unreachable;
+    bootlog.puts(line);
 }
 
 pub fn protocol(severity: Severity, slot: u32, text: [*:0]const u8) void {

@@ -32,10 +32,11 @@ const xhci = @import("../driver/usb/xhci.zig");
 const outputs_contract = @import("r4os_kernel_contract");
 const driver_resources = @import("driver_resources.zig");
 const driver_heap = @import("driver_heap.zig");
+const driver_threads = @import("driver_threads.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
 // Version 30: resident CPU heap after the unchanged v29 resource tail.
-pub const VERSION: u32 = 31;
+pub const VERSION: u32 = 32;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -491,7 +492,12 @@ pub fn bindModuleResources(owner: u32, module_slot: usize) bool {
     if (module.kind != .r4d) return false;
     driver_resources.state.bind(owner, module_slot, module.generation) catch return false;
     const binding = driver_resources.state.current(owner) catch unreachable;
+    if (!driver_threads.bind(owner, binding.epoch)) {
+        driver_resources.state.finish(owner);
+        return false;
+    }
     if (!driver_heap.bind(owner, binding.epoch)) {
+        std.debug.assert(driver_threads.discardEmptyBinding(owner, binding.epoch));
         driver_resources.state.finish(owner);
         return false;
     }
@@ -532,6 +538,7 @@ pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
 pub fn beginOwnerShutdown(token: *OwnerCleanupToken) void {
     driver_resources.state.close(token.owner);
     driver_heap.beginClose(token.owner);
+    driver_threads.beginClose(token.owner);
     @import("../display/queue.zig").closingDriver(token.owner);
     gfx_memory.beginClose(token.owner);
     token.shutdown_started = true;
@@ -572,6 +579,12 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     }
     // DriverShutdown gets the opportunity to stop engines and release its
     // maps. A retained use afterwards vetoes every generic resource free.
+    if (!driver_threads.callbacksQuiesced(owner)) {
+        _ = quarantineOwnerCleanup(token);
+        var message: [128]u8 = undefined;
+        bootlog.puts(std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} thread-callbacks=active resources=quarantined\r\n", .{owner}) catch unreachable);
+        return false;
+    }
     if (gfx_memory.retained(owner) or @import("../display/queue.zig").retainsDriver(owner)) {
         _ = quarantineOwnerCleanup(token);
         return false;
@@ -630,6 +643,14 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         return false;
     }
     const work_count = work_cleanup.removed;
+    const thread_cleanup = driver_threads.cleanup(owner);
+    if (!thread_cleanup.quiesced) {
+        token.active = false;
+        bootlog.puts("[R4D] cleanup owner=");
+        bootlog.putDec(owner);
+        bootlog.puts(" threads=retained dma=retained cpu-heap=retained resources=quarantined\r\n");
+        return false;
+    }
     const dma_count = cleanupDmaOwner(owner);
     const cpu_cleanup = driver_heap.cleanup(owner);
     if (!cpu_cleanup.quiesced) {
@@ -645,6 +666,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
 
     if (irq_count == 0 and
         work_count == 0 and
+        thread_cleanup.released == 0 and
         dma_count == 0 and
         cpu_cleanup.released == 0 and
         msi_cleanup.removed == 0 and
@@ -662,7 +684,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     const entry = @import("../driver/registry.zig").get(owner - 1);
     const name = if (entry) |*item| item.name[0..item.name_len] else "unknown";
     var message: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} irq={d} work={d} dma={d} cpu-heap={d} cpu-bytes={d} msi={d} audio={d} storage={d} usb-host={d} display-blit={d} net={d} name={s} result=complete\r\n", .{ owner, irq_count, work_count, dma_count, cpu_cleanup.released, cpu_cleanup.bytes, msi_cleanup.removed, audio_count, storage_cleanup.removed, usb_host_cleanup.removed, display_blit_count, net_cleanup.removed, name }) catch unreachable;
+    const line = std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} irq={d} work={d} threads={d} dma={d} cpu-heap={d} cpu-bytes={d} msi={d} audio={d} storage={d} usb-host={d} display-blit={d} net={d} name={s} result=complete\r\n", .{ owner, irq_count, work_count, thread_cleanup.released, dma_count, cpu_cleanup.released, cpu_cleanup.bytes, msi_cleanup.removed, audio_count, storage_cleanup.removed, usb_host_cleanup.removed, display_blit_count, net_cleanup.removed, name }) catch unreachable;
     bootlog.puts(line);
     return true;
 }
@@ -802,12 +824,14 @@ pub const Table = extern struct {
     resource_query: *const fn (*outputs_contract.DriverResourceApi) callconv(.c) i32,
     heap_query: *const fn (*outputs_contract.DriverHeapApi) callconv(.c) i32,
     monotonic_clock: *const fn (*outputs_contract.MonotonicClockInfo) callconv(.c) i32,
+    thread_query: *const fn (*outputs_contract.DriverThreadApi) callconv(.c) i32,
 };
 
 comptime {
     if (VERSION != outputs_contract.driver_api_version or @offsetOf(Table, "resource_query") != 592 or
-        @offsetOf(Table, "heap_query") != 600 or @offsetOf(Table, "monotonic_clock") != 608 or @sizeOf(Table) != 616)
-        @compileError("DriverApi append-only v31 layout drift");
+        @offsetOf(Table, "heap_query") != 600 or @offsetOf(Table, "monotonic_clock") != 608 or
+        @offsetOf(Table, "thread_query") != 616 or @sizeOf(Table) != 624)
+        @compileError("DriverApi append-only v32 layout drift");
 }
 
 pub var table = Table{
@@ -820,6 +844,7 @@ pub var table = Table{
     .resource_query = resourceQuery,
     .heap_query = heapQuery,
     .monotonic_clock = @import("monotonic_api.zig").monotonicClock,
+    .thread_query = threadQuery,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -893,15 +918,15 @@ pub var table = Table{
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
-    log_event.driver(log_event.Severity.info, current_owner, text);
+    log_event.driver(log_event.Severity.info, runtimeOwner(), text);
 }
 
 fn logWarn(text: [*:0]const u8) callconv(.c) void {
-    log_event.driver(log_event.Severity.warn, current_owner, text);
+    log_event.driver(log_event.Severity.warn, runtimeOwner(), text);
 }
 
 fn logError(text: [*:0]const u8) callconv(.c) void {
-    log_event.driver(log_event.Severity.err, current_owner, text);
+    log_event.driver(log_event.Severity.err, runtimeOwner(), text);
 }
 
 fn portInb(port: u16) callconv(.c) u8 {
@@ -1392,8 +1417,21 @@ fn activeOwner() u32 {
     return 0;
 }
 
+// Dedicated tasks currently admit only the audited CPU heap, clock and
+// thread services. Do not silently extend legacy PCI/DMA/backend entrypoints
+// to parallel callers by changing activeOwner's admission contract.
+fn runtimeOwner() u32 {
+    if (irq_router.inDispatch()) return irq_router.currentOwner();
+    const storage_owner = currentStorageCallbackOwner();
+    if (storage_owner != 0) return storage_owner;
+    const thread_owner = driver_threads.currentOwner();
+    return if (thread_owner != 0) thread_owner else activeOwner();
+}
+
 fn enterStorageCallback(owner: u32) ?StorageCallbackToken {
     if (owner == 0) return null;
+    const flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(flags);
     // Before scheduler admission the boot path is the only execution owner;
     // task ID zero is therefore a unique and safe callback identity.
     const task_id = scheduler.currentId() orelse 0;
@@ -1419,6 +1457,8 @@ fn enterStorageCallback(owner: u32) ?StorageCallbackToken {
 }
 
 fn leaveStorageCallback(token: StorageCallbackToken) void {
+    const flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(flags);
     if (token.slot >= storage_callback_owners.len) return;
     const entry = &storage_callback_owners[token.slot];
     if (!entry.used or entry.task_id != token.task_id or entry.depth == 0) return;
@@ -1427,8 +1467,12 @@ fn leaveStorageCallback(token: StorageCallbackToken) void {
 }
 
 fn currentStorageCallbackOwner() u32 {
+    // Dedicated SMP callers inspect this exclusion too. Synchronize the
+    // small identity projection without changing storage I/O admission.
+    const flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(flags);
     const task_id = scheduler.currentId() orelse 0;
-    for (storage_callback_owners) |entry| {
+    for (&storage_callback_owners) |*entry| {
         if (entry.used and entry.task_id == task_id and entry.depth != 0) return entry.owner;
     }
     return 0;
@@ -3028,7 +3072,43 @@ fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
 const gfx_queue_api = @import("gfx_driver_queue.zig");
 fn heapOwner() u32 {
     if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return 0;
+    const thread_owner = driver_threads.currentOwner();
+    if (thread_owner != 0) return thread_owner;
     return activeOwner();
+}
+fn threadQuery(output: *outputs_contract.DriverThreadApi) callconv(.c) i32 {
+    if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverThreadApi)) return outputs_contract.driver_thread_error_invalid;
+    output.* = .{};
+    const owner = heapOwner();
+    if (owner == 0) return outputs_contract.driver_thread_error_owner;
+    const result = driver_threads.query(owner);
+    if (result != outputs_contract.driver_thread_ok) return result;
+    output.* = .{ .start = @intFromPtr(&threadStart), .stop = @intFromPtr(&threadStop), .join = @intFromPtr(&threadJoin), .release = @intFromPtr(&threadRelease), .status = @intFromPtr(&threadStatus), .current = @intFromPtr(&threadCurrent), .sleep_ticks = @intFromPtr(&threadSleepTicks), .stats = @intFromPtr(&threadStats) };
+    return outputs_contract.driver_thread_ok;
+}
+fn threadStart(input: *const outputs_contract.DriverThreadRequest, output: *u64) callconv(.c) i32 {
+    return driver_threads.start(heapOwner(), input, output);
+}
+fn threadStop(handle: u64) callconv(.c) i32 {
+    return driver_threads.stop(heapOwner(), handle);
+}
+fn threadJoin(handle: u64, timeout_ticks: u64, result: *i32) callconv(.c) i32 {
+    return driver_threads.join(heapOwner(), handle, timeout_ticks, result);
+}
+fn threadRelease(handle: u64) callconv(.c) i32 {
+    return driver_threads.release(heapOwner(), handle);
+}
+fn threadStatus(handle: u64, output: *outputs_contract.DriverThreadStatus) callconv(.c) i32 {
+    return driver_threads.status(heapOwner(), handle, output);
+}
+fn threadCurrent() callconv(.c) u64 {
+    return driver_threads.current(heapOwner());
+}
+fn threadSleepTicks(ticks: u64) callconv(.c) i32 {
+    return driver_threads.sleepTicks(heapOwner(), ticks);
+}
+fn threadStats(output: *outputs_contract.DriverThreadStats) callconv(.c) i32 {
+    return driver_threads.stats(heapOwner(), output);
 }
 fn heapQuery(output: *outputs_contract.DriverHeapApi) callconv(.c) i32 {
     if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverHeapApi)) return outputs_contract.driver_heap_error_invalid;
