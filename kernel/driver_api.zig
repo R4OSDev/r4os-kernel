@@ -30,10 +30,11 @@ const timer = @import("timer.zig");
 const usb_host = @import("../driver/usb/host_controller.zig");
 const xhci = @import("../driver/usb/xhci.zig");
 const outputs_contract = @import("r4os_kernel_contract");
+const driver_resources = @import("driver_resources.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 28: native display owner binding after all existing optional tails.
-pub const VERSION: u32 = 28;
+// Version 29: exact loaded-container resources after the unchanged v28 tail.
+pub const VERSION: u32 = 29;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -483,6 +484,14 @@ pub fn leaveOwner() bool {
     return current_owner_guard.leave();
 }
 
+pub fn bindModuleResources(owner: u32, module_slot: usize) bool {
+    if (current_owner != owner or !current_owner_guard.ownedByCurrent()) return false;
+    const module = @import("modules.zig").entryAt(module_slot) orelse return false;
+    if (module.kind != .r4d) return false;
+    driver_resources.state.bind(owner, module_slot, module.generation) catch return false;
+    return true;
+}
+
 pub fn prepareOwnerCleanup(owner: u32) ?OwnerCleanupToken {
     if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return null;
     if (display.retainsDriverOwner(owner) or @import("../display/native_driver.zig").retained(owner)) return null;
@@ -515,6 +524,7 @@ pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
 }
 
 pub fn beginOwnerShutdown(token: *OwnerCleanupToken) void {
+    driver_resources.state.close(token.owner);
     @import("../display/queue.zig").closingDriver(token.owner);
     gfx_memory.beginClose(token.owner);
     token.shutdown_started = true;
@@ -613,6 +623,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         return false;
     }
     const work_count = work_cleanup.removed;
+    driver_resources.state.finish(owner);
     const dma_count = cleanupDmaOwner(owner);
     gfx_memory.finishOwner(owner);
     token.active = false;
@@ -785,6 +796,7 @@ pub const Table = extern struct {
     gfx_queue_query: *const fn (*outputs_contract.GfxDriverQueueApi) callconv(.c) i32,
     gfx_output_query: *const fn (*outputs_contract.GfxDriverOutputApi) callconv(.c) i32,
     gfx_display_query: *const fn (*outputs_contract.GfxDriverDisplayApi) callconv(.c) i32,
+    resource_query: *const fn (*outputs_contract.DriverResourceApi) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -794,6 +806,7 @@ pub var table = Table{
     .gfx_queue_query = gfxQueueQuery,
     .gfx_output_query = gfxOutputQuery,
     .gfx_display_query = gfxDisplayQuery,
+    .resource_query = resourceQuery,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -3000,6 +3013,39 @@ fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
 }
 
 const gfx_queue_api = @import("gfx_driver_queue.zig");
+// Work callbacks already carry an authenticated owner, but must join the
+// lifecycle guard before resource I/O. Never wait here: another owner may
+// itself be waiting for this worker. The caller can reschedule on BUSY.
+fn enterResourceOwner() i32 {
+    if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return outputs_contract.driver_resource_error_owner;
+    const owner = activeOwner();
+    if (owner == 0) return outputs_contract.driver_resource_error_owner;
+    if (!enterOwnerBounded(owner, 0)) return outputs_contract.driver_resource_error_busy;
+    return @intCast(owner);
+}
+fn resourceQuery(output: *outputs_contract.DriverResourceApi) callconv(.c) i32 {
+    const owner = enterResourceOwner();
+    if (owner < 0) return owner;
+    defer _ = leaveOwner();
+    _ = driver_resources.state.current(@intCast(owner)) catch return outputs_contract.driver_resource_error_stale;
+    if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverResourceApi)) return outputs_contract.driver_resource_error_invalid;
+    output.* = .{ .stat = @intFromPtr(&resourceStat), .read_at = @intFromPtr(&resourceReadAt), .now_ns = @intFromPtr(&driver_resources.nowNs) };
+    return outputs_contract.driver_resource_ok;
+}
+fn resourceStat(name: [*]const u8, length: u32, output: *outputs_contract.DriverResourceInfo) callconv(.c) i32 {
+    const owner = enterResourceOwner();
+    if (owner < 0) return owner;
+    defer _ = leaveOwner();
+    if (length == 0 or length > 63) return outputs_contract.driver_resource_error_invalid;
+    return driver_resources.stat(@intCast(owner), name[0..length], output);
+}
+fn resourceReadAt(id: u64, offset: u64, output: [*]u8, length: u32, deadline_ns: u64) callconv(.c) i32 {
+    const owner = enterResourceOwner();
+    if (owner < 0) return owner;
+    defer _ = leaveOwner();
+    if (length == 0 or length > outputs_contract.driver_resource_max_read_bytes) return outputs_contract.driver_resource_error_invalid;
+    return driver_resources.readAt(@intCast(owner), id, offset, output[0..length], deadline_ns);
+}
 const native_display = @import("../display/native_driver.zig");
 fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i32 {
     _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);

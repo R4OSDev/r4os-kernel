@@ -4,6 +4,7 @@ const k = @import("log.zig");
 const loader_perf = @import("loader_perf.zig");
 const module_file = @import("module_file.zig");
 const module_r4m = @import("module_r4m.zig");
+const resources = @import("module_resources.zig");
 const r4x_api = @import("../program/r4x_api.zig");
 const task_context = @import("../sched/task_context.zig");
 
@@ -214,6 +215,8 @@ pub const Entry = struct {
     bss_zeroed: bool = true,
     generation: u32 = 0,
     pinned: bool = false,
+    resource_source: ?module_file.FileSource = null,
+    resource_file_offset: usize = 0,
     sections: [MAX_SECTIONS]Section = .{Section{}} ** MAX_SECTIONS,
     exports: [MAX_EXPORTS_PER_MODULE]Export = .{Export{}} ** MAX_EXPORTS_PER_MODULE,
 };
@@ -222,6 +225,34 @@ pub const Entry = struct {
 // The packed generation/state claim is shared by R4D, R4P and R4L callers.
 const ClaimState = enum(u32) { free, reserved, published, retiring, retained };
 var slot_claims: [MAX_MODULES]u64 = .{0} ** MAX_MODULES;
+// Each catalog follows its private module claim and becomes immutable at
+// publication. Bounded metadata only: no firmware or resource payload copy.
+var resource_catalogs: [MAX_MODULES]resources.Catalog = .{resources.Catalog{}} ** MAX_MODULES;
+
+pub const ResourceView = struct {
+    source: module_file.FileSource,
+    file_offset: usize,
+    catalog: *const resources.Catalog,
+};
+
+pub fn driverResourceView(slot: usize, generation: u32) ?ResourceView {
+    if (!published(slot)) return null;
+    const entry = &entries[slot];
+    if (entry.kind != .r4d or entry.generation != generation) return null;
+    return .{
+        .source = entry.resource_source orelse return null,
+        .file_offset = entry.resource_file_offset,
+        .catalog = &resource_catalogs[slot],
+    };
+}
+
+const ResourceCatalogReader = struct {
+    reader: *module_r4m.Reader,
+    base: usize,
+    pub fn read(self: *@This(), offset: usize, out: []u8) bool {
+        return self.reader.file.readExactAt(self.base + offset, out, "driver-resources", false);
+    }
+};
 
 fn claimValue(generation: u32, state: ClaimState) u64 {
     return (@as(u64, generation) << 32) | @intFromEnum(state);
@@ -1015,6 +1046,19 @@ fn loadR4MFile(load: *PreparedLoad, source: module_file.FileSource, tables: *con
         return false;
     }
     const section_headers = tables.sections[0..@intCast(header.section_count)];
+    resource_catalogs[load.slot].count = 0;
+    var resource_file_offset: usize = 0;
+    if (kind == .r4d) {
+        for (section_headers) |section| {
+            if (sectionLoadable(section)) continue;
+            var resource_reader: ResourceCatalogReader = .{ .reader = &load.scratch.?.reader, .base = section.file_off };
+            resource_catalogs[load.slot].parse(&resource_reader, section.file_size) catch {
+                k.puts("[MOD] invalid R4D resource catalog\r\n");
+                return false;
+            };
+            resource_file_offset = section.file_off;
+        }
+    }
 
     const section_offsets = &load.scratch.?.section_offsets;
     const image_size = layoutSections(section_headers, section_offsets[0..]) orelse {
@@ -1100,6 +1144,8 @@ fn loadR4MFile(load: *PreparedLoad, source: module_file.FileSource, tables: *con
         .resolver_status = .resolved,
         .bss_zeroed = bss_zeroed,
         .generation = load.generation,
+        .resource_source = if (kind == .r4d) source else null,
+        .resource_file_offset = resource_file_offset,
         .pinned = kind == .r4l,
         .sections = sections,
     };
