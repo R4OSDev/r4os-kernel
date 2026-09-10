@@ -72,6 +72,19 @@ pub fn current(owner: u32) u64 {
     return if (record.owner == owner) record.handle else 0;
 }
 
+// A thread-local binding derived from the actual executing Task. The start
+// request is immutable; status-only flags are not part of that request.
+pub fn currentRequest(owner: u32, output: *a.DriverThreadRequest) i32 {
+    if (!valid(a.DriverThreadRequest, output)) return a.driver_thread_error_invalid;
+    output.* = .{};
+    const flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(flags);
+    const record = currentRecordLocked() orelse return a.driver_thread_error_context;
+    if (record.owner != owner) return a.driver_thread_error_owner;
+    output.* = .{ .handler = @intFromPtr(record.payload.handler), .context = record.payload.context, .flags = record.payload.flags & (a.driver_thread_flag_parallel | a.driver_thread_flag_abortable) };
+    return a.driver_thread_ok;
+}
+
 pub fn start(owner: u32, input: *const a.DriverThreadRequest, output: *u64) i32 {
     output.* = 0;
     const request = input.*;
@@ -166,6 +179,8 @@ pub fn status(owner: u32, handle: u64, output: *a.DriverThreadStatus) i32 {
     const flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(flags);
     const record = publicRecord(owner, handle) catch |err| return code(err);
+    const sleeping = record.phase == .running and record.payload.waiting_on == &record.payload.sleep_queue and
+        record.payload.task_ptr != null and record.payload.task_ptr.?.state == .blocked;
     output.* = .{
         .handle = record.handle,
         .owner_epoch = record.epoch,
@@ -175,7 +190,7 @@ pub fn status(owner: u32, handle: u64, output: *a.DriverThreadStatus) i32 {
         .state = @intFromEnum(record.phase),
         .stop_requested = @intFromBool(state.stopping(record) catch unreachable),
         .result = record.result,
-        .flags = record.payload.flags,
+        .flags = record.payload.flags | (if (sleeping) a.driver_thread_flag_sleeping else @as(u32, 0)),
         .waiters = record.references,
     };
     return a.driver_thread_ok;

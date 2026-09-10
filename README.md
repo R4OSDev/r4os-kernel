@@ -289,9 +289,10 @@ its own timer; APs never write the BSP timer. The regression retains its
 original five-second bound.
 
 Dedicated driver Tasks may opt into synchronous self-abort with flag 2.
-The version-1 DriverThreadApi adds `abort_current` at offset 72, size 80.
-Query accepts the full legacy 72-byte prefix, copies only 72 for capacities
-72..79, and copies 80 for larger buffers. Old callers' tails are untouched.
+The version-1 DriverThreadApi has `abort_current` at offset 72 and
+`current_request` at offset 80, size 88. Query accepts the full legacy
+72-byte prefix, copies 72 for capacities 72..79, 80 for 80..87 and 88 from
+88 upward. Old callers' tails are untouched.
 DriverApi remains version 33/632 bytes. Flag 4 reports an accepted abort and
 is rejected as a start flag.
 
@@ -309,3 +310,13 @@ waiter notification and retirement of the exact Task generation and stack.
 Module defers are bypassed; resource recovery remains the native owner's
 responsibility after peers quiesce. No arbitrary CPU exception, hung callback,
 kernel critical section or GPU failure is caught or forcibly terminated.
+
+Kernel 0.1.146 derives `current_request` from the actual executing dedicated
+Task under the existing Runtime owner and verifies driver ownership. The
+immutable original handler/context and creation flags are returned without
+an allocation, wait or additional unwind guard. Status flag 8 is computed
+under that same owner from the backing Task's blocked state and membership
+in this service's sleep queue. It clears as the Task becomes runnable and
+is rejected as a creation flag. All callbacks and pointer lifetimes remain
+with their existing owners; no generic native invocation data enters the
+kernel. The NVIDIA driver owns its absolute phase deadlines.

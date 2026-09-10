@@ -3132,7 +3132,7 @@ fn semaphoreStats(output: *outputs_contract.DriverSemaphoreStats) callconv(.c) i
 }
 fn threadQuery(output: *outputs_contract.DriverThreadApi) callconv(.c) i32 {
     if (output.version != 1 or output.size < outputs_contract.driver_thread_api_min_bytes) return outputs_contract.driver_thread_error_invalid;
-    const bytes: usize = if (output.size >= @sizeOf(outputs_contract.DriverThreadApi)) @sizeOf(outputs_contract.DriverThreadApi) else outputs_contract.driver_thread_api_min_bytes;
+    const bytes: usize = if (output.size >= @sizeOf(outputs_contract.DriverThreadApi)) @sizeOf(outputs_contract.DriverThreadApi) else if (output.size >= @offsetOf(outputs_contract.DriverThreadApi, "current_request")) @offsetOf(outputs_contract.DriverThreadApi, "current_request") else outputs_contract.driver_thread_api_min_bytes;
     var service: outputs_contract.DriverThreadApi = .{ .size = @intCast(bytes) };
     const destination = @as([*]u8, @ptrCast(output))[0..bytes];
     @memcpy(destination, std.mem.asBytes(&service)[0..bytes]);
@@ -3140,9 +3140,12 @@ fn threadQuery(output: *outputs_contract.DriverThreadApi) callconv(.c) i32 {
     if (owner == 0) return outputs_contract.driver_thread_error_owner;
     const result = driver_threads.query(owner);
     if (result != outputs_contract.driver_thread_ok) return result;
-    service = .{ .size = @intCast(bytes), .start = @intFromPtr(&threadStart), .stop = @intFromPtr(&threadStop), .join = @intFromPtr(&threadJoin), .release = @intFromPtr(&threadRelease), .status = @intFromPtr(&threadStatus), .current = @intFromPtr(&threadCurrent), .sleep_ticks = @intFromPtr(&threadSleepTicks), .stats = @intFromPtr(&threadStats), .abort_current = @intFromPtr(&threadAbortCurrent) };
+    service = .{ .size = @intCast(bytes), .start = @intFromPtr(&threadStart), .stop = @intFromPtr(&threadStop), .join = @intFromPtr(&threadJoin), .release = @intFromPtr(&threadRelease), .status = @intFromPtr(&threadStatus), .current = @intFromPtr(&threadCurrent), .sleep_ticks = @intFromPtr(&threadSleepTicks), .stats = @intFromPtr(&threadStats), .abort_current = @intFromPtr(&threadAbortCurrent), .current_request = @intFromPtr(&threadCurrentRequest) };
     @memcpy(destination, std.mem.asBytes(&service)[0..bytes]);
     return outputs_contract.driver_thread_ok;
+}
+fn threadCurrentRequest(output: *outputs_contract.DriverThreadRequest) callconv(.c) i32 {
+    return driver_threads.currentRequest(heapOwner(), output);
 }
 fn threadAbortCurrent(result: i32) callconv(.c) i32 {
     const owner = heapOwner();
