@@ -168,9 +168,13 @@ pub fn retainsDriver(owner: u32) bool {
     defer unlock();
     // The loader's owner ID is reusable; the driver memory bridge supplies
     // a separate nonwrapping epoch. Any surviving driver use vetoes reuse.
-    for (&store.objects) |object| if (object.backing) |backing| if (backing.driver) |driver| {
-        if (driver.id == owner) return true;
-    };
+    for (&store.objects) |object| {
+        if ((object.phase == .releasing or object.phase == .destroying) and
+            object.producer.kind == .driver and object.producer.id == owner) return true;
+        if (object.backing) |backing| if (backing.driver) |driver| {
+            if (driver.id == owner) return true;
+        };
+    }
     for (&store.leases) |lease| {
         if (lease.handle.id != 0 and lease.owner.kind == .driver and lease.owner.id == owner) return true;
     }
@@ -178,4 +182,10 @@ pub fn retainsDriver(owner: u32) bool {
         if (reference.handle.id != 0 and reference.owner.kind == .driver and reference.owner.id == owner) return true;
     }
     return false;
+}
+
+pub fn pendingReleaseForOwner(owner: Owner) bool {
+    lock();
+    defer unlock();
+    return store.pendingReleaseForOwner(owner);
 }

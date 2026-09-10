@@ -241,5 +241,6 @@ pub fn unmapWindow(identity: Owner, input: *const abi.GfxBufferHandle, quiesced:
 }
 pub fn collect(identity: Owner) i32 {
     buffers.collect();
-    return if (mmio.collect(&backend, identity)) abi.gfx_buffer_result_ok else abi.gfx_buffer_error_busy;
+    const windows_released = mmio.collect(&backend, identity);
+    return if (windows_released and !buffers.pendingReleaseForOwner(identity)) abi.gfx_buffer_result_ok else abi.gfx_buffer_error_busy;
 }

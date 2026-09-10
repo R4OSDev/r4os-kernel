@@ -37,6 +37,29 @@ pub const Use = struct { lease: Handle, buffer: Handle, access: Access, backing:
 pub const Release = struct { buffer: Handle, backing: Backing, attempt: u64 };
 pub const Stats = struct { objects: usize = 0, references: usize = 0, leases: usize = 0, bytes: u64 = 0, retained_bytes: u64 = 0 };
 
+test "CPU backing release failure remains visible to the exact driver epoch without public references" {
+    const t = std.testing;
+    var store = Table(2, 2, 2){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
+    const owner: Owner = .{ .kind = .driver, .id = 8, .generation = 7 };
+    const next: Owner = .{ .kind = .driver, .id = 8, .generation = 8 };
+    const ticket = try store.begin(owner, .{ .bytes = 4096 });
+    // An incomplete CPU allocation still publishes its retained VM identity.
+    try store.publish(ticket, .{ .cookie = 31, .bytes = 4096 });
+    try t.expect(!store.pendingReleaseForOwner(owner));
+    try store.drop(ticket.reference, owner);
+    try t.expectEqual(@as(usize, 0), store.stats().references);
+    try t.expect(store.pendingReleaseForOwner(owner));
+    try t.expect(!store.pendingReleaseForOwner(next));
+    const release = store.pendingRelease().?;
+    try t.expect(store.pendingReleaseForOwner(owner));
+    try t.expectError(error.Busy, store.finishRelease(release, false));
+    try t.expect(store.pendingReleaseForOwner(owner));
+    try t.expectEqual(@as(u64, 4096), store.stats().retained_bytes);
+    try store.finishRelease(store.pendingRelease().?, true);
+    try t.expect(!store.pendingReleaseForOwner(owner));
+    try t.expectEqual(@as(u64, 0), store.stats().bytes);
+}
+
 pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize, comptime lease_capacity: usize) type {
     comptime {
         if (object_capacity > std.math.maxInt(u32) or reference_capacity > std.math.maxInt(u32) or lease_capacity > std.math.maxInt(u32)) @compileError("buffer handle capacity exceeds u32");
@@ -247,6 +270,13 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         // Returning a ticket does not release its budget or slot. The caller
         // must acknowledge successful VM/TLB or backend destruction outside
         // the metadata lock. Failure remains discoverable and retryable.
+        pub fn pendingReleaseForOwner(self: *const Self, producer: Owner) bool {
+            for (&self.objects) |object| {
+                if ((object.phase == .releasing or object.phase == .destroying) and object.producer.eql(producer)) return true;
+            }
+            return false;
+        }
+
         pub fn pendingRelease(self: *Self) ?Release {
             for (&self.objects) |*object| if (object.phase == .releasing) {
                 const backing = object.backing orelse continue;
