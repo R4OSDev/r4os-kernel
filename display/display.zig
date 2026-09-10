@@ -743,7 +743,7 @@ pub fn presentCapabilities() PresentCapabilities {
     const current = stats();
     if (!current.registered) return .{ .flags = 0, .formats = 0, .max_regions = 0, .backend_kind = 0 };
     var result = PresentCapabilities{
-        .flags = 1 | 2 | 4,
+        .flags = 1 | 2 | 4 | 32, // Ordered stores; never a VBlank claim.
         .backend_kind = if (current.kind == .bootfb) 1 else 3,
     };
     const cpu_name: []const u8 = if (current.kind == .bootfb) "bootfb-cpu" else "native-cpu";

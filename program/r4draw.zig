@@ -208,7 +208,7 @@ pub fn displayPresentCompletion(fence: u64, out: *DisplayPresentCompletion) call
     const completed = display.highestCompletedFence();
     const complete = fence <= completed;
     out.* = .{
-        .flags = if (complete) r4x_api.display_present_completion_complete else 0,
+        .flags = if (complete) r4x_api.display_present_completion_complete | r4x_api.display_present_completion_cpu_stores else 0,
         .fence = fence,
         .completed_fence = completed,
         .result = if (complete) 0 else r4x_api.display_present_error_unavailable,

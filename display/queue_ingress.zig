@@ -1,0 +1,72 @@
+// Per-fence IRQ mailbox, serialized solely by the existing IRQ/runtime owner.
+// No task mutex, allocation, callback, dependency walk or BO access is allowed.
+const std = @import("std");
+const queue = @import("queue_state.zig");
+pub const Ack = struct { fence: queue.Fence, result: queue.Result, instant: u64 };
+pub fn Ingress(comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+        const Entry = struct {
+            fence: queue.Fence = .{},
+            owner: u32 = 0,
+            active: bool = false,
+            pending: bool = false,
+            result: queue.Result = .pending,
+            instant: u64 = 0,
+        };
+        entries: [capacity]Entry = .{Entry{}} ** capacity,
+        pub fn arm(self: *Self, owner: u32, fence: queue.Fence) queue.Error!void {
+            if (owner == 0 or fence.slot == 0 or fence.slot > capacity or fence.binding.adapter == 0) return error.Invalid;
+            const entry = &self.entries[fence.slot - 1];
+            if (entry.active or entry.pending) return error.Busy;
+            entry.* = .{ .fence = fence, .owner = owner, .active = true };
+        }
+        pub fn acknowledge(self: *Self, owner: u32, fence: queue.Fence, result: queue.Result, quiesced: bool, instant: u64) queue.Error!void {
+            if (fence.slot == 0 or fence.slot > capacity or (result != .complete and result != .failed)) return error.Invalid;
+            const entry = &self.entries[fence.slot - 1];
+            if (!std.meta.eql(entry.fence, fence)) return error.Stale;
+            if (owner == 0 or entry.owner != owner) return error.WrongOwner;
+            if (!entry.active) return error.AlreadyCompleted;
+            if (!quiesced) return error.Busy;
+            entry.active = false;
+            entry.pending = true;
+            entry.result = result;
+            entry.instant = instant;
+        }
+        pub fn take(self: *Self, slot: usize) ?Ack {
+            const entry = &self.entries[slot];
+            if (!entry.pending) return null;
+            entry.pending = false;
+            return .{ .fence = entry.fence, .result = entry.result, .instant = entry.instant };
+        }
+        pub fn quiesce(self: *Self, fence: queue.Fence) void {
+            const entry = &self.entries[fence.slot - 1];
+            if (std.meta.eql(entry.fence, fence)) {
+                entry.active = false;
+                entry.pending = false;
+            }
+        }
+    };
+}
+test "IRQ mailbox rejects wrong owners and stale resets and retains a single exact acknowledgement" {
+    const t = std.testing;
+    var ingress = Ingress(2){};
+    const fence = queue.Fence{ .slot = 1, .timeline = 4, .point = 5, .binding = .{ .adapter = 9 } };
+    try ingress.arm(7, fence);
+    try t.expectError(error.Busy, ingress.acknowledge(7, fence, .complete, false, 1));
+    try t.expectError(error.WrongOwner, ingress.acknowledge(8, fence, .complete, true, 1));
+    var newer = fence;
+    newer.binding.reset_generation += 1;
+    try t.expectError(error.Stale, ingress.acknowledge(7, newer, .complete, true, 1));
+    try ingress.acknowledge(7, fence, .complete, true, 2);
+    try t.expectError(error.AlreadyCompleted, ingress.acknowledge(7, fence, .failed, true, 3));
+    try t.expectError(error.Busy, ingress.arm(7, newer));
+    const ack = ingress.take(0).?;
+    try t.expectEqualDeep(fence, ack.fence);
+    try t.expectEqual(@as(u64, 2), ack.instant);
+    try t.expect(ingress.take(0) == null);
+    try ingress.arm(7, newer);
+    try t.expectError(error.Stale, ingress.acknowledge(7, fence, .complete, true, 4));
+    ingress.quiesce(newer);
+    try t.expectError(error.AlreadyCompleted, ingress.acknowledge(7, newer, .complete, true, 4));
+}

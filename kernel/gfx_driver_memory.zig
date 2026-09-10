@@ -120,7 +120,7 @@ fn matching(identity: Owner, input: *const abi.GfxDeviceLease) ?*Device {
     for (&devices) |*item| if (item.descriptor.lease.id != 0 and item.owner.eql(identity) and std.meta.eql(item.descriptor, normalized)) return item;
     return null;
 }
-fn dmaSegment(use: buffers.lifetime.Use, offset: u64, mask: u64) buffers.Error!abi.GfxDmaSegment {
+pub fn dmaSegment(use: buffers.lifetime.Use, offset: u64, mask: u64) buffers.Error!abi.GfxDmaSegment {
     if (offset >= use.range.bytes or use.backing.cpu_address == 0 or use.backing.cache != .write_back or use.backing.driver != null) return error.Unsupported;
     const address = use.backing.cpu_address + use.range.offset + offset;
     const inside = address % paging.PAGE_SIZE;

@@ -30,7 +30,7 @@ pub const Backing = struct {
     cache: enum { unavailable, write_back, write_combining, uncached } = .unavailable,
     driver: ?Owner = null,
 };
-pub const Access = enum { cpu_read, cpu_write, device_read, device_write, scanout, device_mapping };
+pub const Access = enum { cpu_read, cpu_write, device_read, device_write, scanout, device_mapping, queue_read, queue_write };
 pub const Error = layout.Error || error{ Exhausted, Budget, Capacity, Stale, Busy, Closed, WrongOwner };
 pub const Create = struct { buffer: Handle, reference: Handle, bytes: u64 };
 pub const Use = struct { lease: Handle, buffer: Handle, access: Access, backing: Backing, range: layout.Range };
@@ -72,7 +72,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             const validated = try layout.validate(descriptor);
             if (self.committed_bytes > self.budget_bytes or validated.allocation_bytes > self.budget_bytes - self.committed_bytes) return error.Budget;
             var owner_bytes: u64 = 0;
-            for (self.objects) |object| {
+            for (&self.objects) |object| {
                 if (object.phase != .empty and object.producer.eql(producer)) owner_bytes += object.allocation_bytes;
             }
             if (owner_bytes > self.producer_budget_bytes or validated.allocation_bytes > self.producer_budget_bytes - owner_bytes) return error.Budget;
@@ -157,11 +157,11 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
 
         pub fn use(self: *Self, reference: Handle, owner: Owner, access: Access, offset: u64, bytes: u64) Error!Use {
             const ref_record = try self.findReference(reference, owner);
-            if (ref_record.read_only and (access == .cpu_write or access == .device_write)) return error.Unsupported;
+            if (ref_record.read_only and writes(access)) return error.Unsupported;
             const object = try self.referencedObject(reference, owner);
             if (object.phase != .live) return error.Closed;
-            if (access == .cpu_write or access == .device_write) {
-                for (self.references) |item| if (item.handle.id != 0 and item.buffer.eql(object.handle) and item.read_only) {
+            if (writes(access)) {
+                for (&self.references) |item| if (item.handle.id != 0 and item.buffer.eql(object.handle) and item.read_only) {
                     return error.Busy;
                 };
             }
@@ -170,15 +170,15 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             const required: u32 = switch (access) {
                 .cpu_read => layout.Usage.cpu_read,
                 .cpu_write => layout.Usage.cpu_write,
-                .device_read => layout.Usage.transfer_source,
-                .device_write => layout.Usage.transfer_target | layout.Usage.render,
+                .device_read, .queue_read => layout.Usage.transfer_source,
+                .device_write, .queue_write => layout.Usage.transfer_target | layout.Usage.render,
                 .scanout => layout.Usage.scanout,
                 .device_mapping => 0,
             };
             if (required != 0 and (object.descriptor.usage & required) == 0) return error.Unsupported;
             if ((access == .cpu_read or access == .cpu_write) and backing.cpu_address == 0) return error.Unsupported;
             if (access == .cpu_read and backing.cache == .write_combining) return error.Unsupported;
-            for (self.leases) |lease| {
+            for (&self.leases) |lease| {
                 if (lease.handle.id != 0 and lease.buffer.eql(object.handle) and conflicts(lease.access, access)) return error.Busy;
             }
             const slot = self.freeLease() orelse return error.Capacity;
@@ -186,6 +186,18 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             self.leases[slot] = .{ .handle = token, .buffer = object.handle, .owner = owner, .access = access, .range = .{ .offset = offset, .bytes = bytes } };
             object.leases += 1;
             return .{ .lease = token, .buffer = object.handle, .access = access, .backing = backing, .range = .{ .offset = offset, .bytes = bytes } };
+        }
+
+        // The queue owner must first validate ordering against every existing
+        // conflicting queue use while holding this same metadata lock. Queued
+        // uses may overlap each other, but exclude conflicting CPU/device maps.
+        // Ownership changes atomically with admission, before producer cleanup.
+        pub fn reserveQueued(self: *Self, reference: Handle, producer: Owner, queue_owner: Owner, write: bool, offset: u64, bytes: u64) Error!Use {
+            if (queue_owner.kind != .kernel or !queue_owner.valid()) return error.Invalid;
+            const result = try self.use(reference, producer, if (write) .queue_write else .queue_read, offset, bytes);
+            const lease = try self.findLease(result.lease, producer);
+            lease.owner = queue_owner;
+            return result;
         }
 
         // GPU/DMA/scanout leases need an engine/TLB completion or a proven
@@ -261,10 +273,10 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         }
 
         pub fn retainsDriver(self: *const Self, owner: Owner) bool {
-            for (self.objects) |object| if (object.backing) |backing| if (backing.driver) |driver| {
+            for (&self.objects) |object| if (object.backing) |backing| if (backing.driver) |driver| {
                 if (driver.eql(owner)) return true;
             };
-            for (self.leases) |lease| {
+            for (&self.leases) |lease| {
                 if (lease.handle.id != 0 and lease.owner.eql(owner) and isDevice(lease.access)) return true;
             }
             return false;
@@ -272,7 +284,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
 
         pub fn stats(self: *const Self) Stats {
             var result = Stats{ .bytes = self.committed_bytes };
-            for (self.objects) |object| {
+            for (&self.objects) |object| {
                 if (object.phase == .empty) continue;
                 result.objects += 1;
                 result.references += object.references;
@@ -314,19 +326,19 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             return item;
         }
         fn freeObject(self: *const Self) ?usize {
-            for (self.objects, 0..) |item, index| if (item.phase == .empty) {
+            for (&self.objects, 0..) |item, index| if (item.phase == .empty) {
                 return index;
             };
             return null;
         }
         fn freeReference(self: *const Self) ?usize {
-            for (self.references, 0..) |item, index| if (item.handle.id == 0) {
+            for (&self.references, 0..) |item, index| if (item.handle.id == 0) {
                 return index;
             };
             return null;
         }
         fn freeLease(self: *const Self) ?usize {
-            for (self.leases, 0..) |item, index| if (item.handle.id == 0) {
+            for (&self.leases, 0..) |item, index| if (item.handle.id == 0) {
                 return index;
             };
             return null;
@@ -339,7 +351,14 @@ fn isDevice(access: Access) bool {
 }
 fn conflicts(first: Access, second: Access) bool {
     if (first == .device_mapping or second == .device_mapping) return false;
-    return first == .cpu_write or second == .cpu_write or first == .device_write or second == .device_write;
+    if (queued(first) and queued(second)) return false;
+    return writes(first) or writes(second);
+}
+fn queued(access: Access) bool {
+    return access == .queue_read or access == .queue_write;
+}
+fn writes(access: Access) bool {
+    return access == .cpu_write or access == .device_write or access == .queue_write;
 }
 
 test "producer exit preserves imported pixels and outstanding scanout until explicit release" {

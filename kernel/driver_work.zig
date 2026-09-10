@@ -346,6 +346,7 @@ var normal_callback_owner: u32 = 0;
 var deadline_callback_owner: u32 = 0;
 
 pub fn init() bool {
+    if (!@import("../display/queue.zig").init()) return false;
     if (initialized and worker_started and deadline_worker_started) return true;
     initialized = true;
     summary_state.initialized = 1;

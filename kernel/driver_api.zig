@@ -33,7 +33,7 @@ const outputs_contract = @import("r4os_kernel_contract");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
 // Version 25 (0.79.5): optional graphics memory query after the stable v24 prefix.
-pub const VERSION: u32 = 25;
+pub const VERSION: u32 = 26;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -515,6 +515,7 @@ pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
 }
 
 pub fn beginOwnerShutdown(token: *OwnerCleanupToken) void {
+    @import("../display/queue.zig").closingDriver(token.owner);
     gfx_memory.beginClose(token.owner);
     token.shutdown_started = true;
 }
@@ -554,7 +555,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     }
     // DriverShutdown gets the opportunity to stop engines and release its
     // maps. A retained use afterwards vetoes every generic resource free.
-    if (gfx_memory.retained(owner)) {
+    if (gfx_memory.retained(owner) or @import("../display/queue.zig").retainsDriver(owner)) {
         _ = quarantineOwnerCleanup(token);
         return false;
     }
@@ -781,12 +782,14 @@ pub const Table = extern struct {
     net_receive_packet: *const fn (i32, *const NetPacket) callconv(.c) i32,
     // v25: one optional versioned memory table; all previous offsets survive.
     gfx_memory_query: *const fn (*outputs_contract.GfxDriverMemoryApi) callconv(.c) i32,
+    gfx_queue_query: *const fn (*outputs_contract.GfxDriverQueueApi) callconv(.c) i32,
 };
 
 pub var table = Table{
     .magic = MAGIC,
     .version = VERSION,
     .gfx_memory_query = gfxMemoryQuery,
+    .gfx_queue_query = gfxQueueQuery,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -2990,6 +2993,40 @@ fn upper(c: u8) u8 {
 fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
     if (current_owner == 0 or !current_owner_guard.ownedByCurrent()) return error.WrongOwner;
     return gfx_memory.owner(current_owner, admission);
+}
+
+const gfx_queue_api = @import("gfx_driver_queue.zig");
+fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
+    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    if (!gfx_api.validOutput(outputs_contract.GfxDriverQueueApi, output)) return outputs_contract.gfx_queue_error_invalid;
+    output.* = .{
+        .register_backend = @intFromPtr(&gfxQueueRegister),
+        .unregister_backend = @intFromPtr(&gfxQueueUnregister),
+        .take = @intFromPtr(&gfxQueueTake),
+        .complete = @intFromPtr(&gfxQueueComplete),
+        .reset = @intFromPtr(&gfxQueueReset),
+        .segment = @intFromPtr(&gfxQueueSegment),
+    };
+    return outputs_contract.gfx_queue_ok;
+}
+fn gfxQueueRegister(input: *const outputs_contract.GfxBackendRegistration, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_queue_api.register(identity, input, output);
+}
+fn gfxQueueUnregister(input: *const outputs_contract.GfxBackendBinding, quiesced: u32) callconv(.c) i32 {
+    return gfx_queue_api.unregister(activeOwner(), input, quiesced);
+}
+fn gfxQueueTake(input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverJob) callconv(.c) i32 {
+    return gfx_queue_api.take(activeOwner(), input, output);
+}
+fn gfxQueueComplete(input: *const outputs_contract.GfxFence, result: u32, quiesced: u32) callconv(.c) i32 {
+    return gfx_queue_api.complete(activeOwner(), input, result, quiesced);
+}
+fn gfxQueueReset(input: *const outputs_contract.GfxBackendBinding, quiesced: u32, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    return gfx_queue_api.reset(activeOwner(), input, quiesced, output);
+}
+fn gfxQueueSegment(input: *const outputs_contract.GfxFence, which: u32, offset: u64, mask: u64, output: *outputs_contract.GfxDmaSegment) callconv(.c) i32 {
+    return gfx_queue_api.segment(activeOwner(), input, which, offset, mask, output);
 }
 
 fn gfxBufferCreate(input: *const outputs_contract.GfxBufferDescriptor, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {

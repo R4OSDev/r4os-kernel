@@ -127,6 +127,7 @@ pub const display_present_cap_exact_regions = generated.display_present_cap_exac
 pub const display_present_cap_external_backend = generated.display_present_cap_external_backend;
 pub const display_present_cap_sync_fence = generated.display_present_cap_sync_fence;
 pub const display_present_completion_complete = generated.display_present_completion_complete;
+pub const display_present_completion_cpu_stores = generated.display_present_completion_cpu_stores;
 pub const display_present_error_invalid = generated.display_present_error_invalid;
 pub const display_present_error_out_of_range = generated.display_present_error_out_of_range;
 pub const display_present_error_unavailable = generated.display_present_error_unavailable;
