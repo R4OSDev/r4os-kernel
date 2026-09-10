@@ -1,5 +1,11 @@
 ﻿# R4OS Kernel
 
+Kernel 0.1.147 uses the boot configuration owner's driver capacity for its
+load plan. All twelve configured entries can reach normal driver admission;
+the former independent eight-entry plan skipped a ninth driver even when
+earlier optional entries had no matching hardware. Registry admission and
+per-driver initialization remain responsible for actual activation.
+
 This repository contains the x86_64 R4OS kernel, Limine boot integration,
 required built-in facilities, and kernel-specific tests. The kernel consumes
 the separate platform Contract and does not define optional Runtime-R4L APIs.

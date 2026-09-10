@@ -7,7 +7,10 @@ const mouse = @import("../driver/input/mouse.zig");
 const driver_registry = @import("../driver/registry.zig");
 const r4d = @import("../program/r4d.zig");
 
-const MAX_PLAN: usize = 8;
+// Every configured driver must be eligible for the load plan. In particular,
+// optional entries that find no hardware still occupy their configured slot.
+// Do not impose a second, smaller limit than the boot configuration owner.
+const MAX_PLAN: usize = boot_config.MAX_DRIVERS;
 const MAX_NAME: usize = 24;
 
 const PlannedDriver = struct {
