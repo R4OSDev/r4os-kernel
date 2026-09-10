@@ -32,8 +32,8 @@ const xhci = @import("../driver/usb/xhci.zig");
 const outputs_contract = @import("r4os_kernel_contract");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 27: optional output catalog after the v25 memory/v26 queue tails.
-pub const VERSION: u32 = 27;
+// Version 28: native display owner binding after all existing optional tails.
+pub const VERSION: u32 = 28;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -485,7 +485,7 @@ pub fn leaveOwner() bool {
 
 pub fn prepareOwnerCleanup(owner: u32) ?OwnerCleanupToken {
     if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return null;
-    if (display.retainsDriverOwner(owner)) return null;
+    if (display.retainsDriverOwner(owner) or @import("../display/native_driver.zig").retained(owner)) return null;
     var token = OwnerCleanupToken{ .owner = owner };
     if (!prepareStorageOwnerCleanup(owner, &token.storage_plan)) return null;
     if (ownerHasNetBackend(owner)) {
@@ -784,6 +784,7 @@ pub const Table = extern struct {
     gfx_memory_query: *const fn (*outputs_contract.GfxDriverMemoryApi) callconv(.c) i32,
     gfx_queue_query: *const fn (*outputs_contract.GfxDriverQueueApi) callconv(.c) i32,
     gfx_output_query: *const fn (*outputs_contract.GfxDriverOutputApi) callconv(.c) i32,
+    gfx_display_query: *const fn (*outputs_contract.GfxDriverDisplayApi) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -792,6 +793,7 @@ pub var table = Table{
     .gfx_memory_query = gfxMemoryQuery,
     .gfx_queue_query = gfxQueueQuery,
     .gfx_output_query = gfxOutputQuery,
+    .gfx_display_query = gfxDisplayQuery,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -2998,6 +3000,30 @@ fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
 }
 
 const gfx_queue_api = @import("gfx_driver_queue.zig");
+const native_display = @import("../display/native_driver.zig");
+fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i32 {
+    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    if (!gfx_api.validOutput(outputs_contract.GfxDriverDisplayApi, output)) return outputs_contract.gfx_output_error_invalid;
+    output.* = .{ .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule) };
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxDisplayBootInfo(output: *outputs_contract.GfxNativeBootInfo) callconv(.c) i32 {
+    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return native_display.bootInfo(output);
+}
+fn gfxDisplayPrepare(input: *const outputs_contract.GfxNativeRegistration, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return native_display.prepare(identity, input, output);
+}
+fn gfxDisplayTransition(generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return native_display.transition(@intCast(identity.id), generation, operation, output);
+}
+fn gfxDisplaySchedule(input: *const outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(outputs_contract.GfxBackendBinding)) return outputs_contract.gfx_queue_error_invalid;
+    @import("../display/queue.zig").wakeNative(activeOwner(), .{ .adapter = input.adapter_id, .device_generation = input.device_generation, .reset_generation = input.reset_generation }) catch |err| return @import("../program/gfx_queue_api.zig").errorCode(err);
+    return outputs_contract.gfx_queue_ok;
+}
 fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32 {
     _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
     if (!gfx_api.validOutput(outputs_contract.GfxDriverOutputApi, output)) return outputs_contract.gfx_output_error_invalid;

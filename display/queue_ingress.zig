@@ -3,6 +3,35 @@
 const std = @import("std");
 const queue = @import("queue_state.zig");
 pub const Ack = struct { fence: queue.Fence, result: queue.Result, instant: u64 };
+// One coalesced notification per registered backend, including idle display
+// changes. Runtime ownership protects this mailbox independently of BO locks.
+pub fn Wakeups(comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+        const Entry = struct { owner: u32 = 0, binding: queue.Binding = .{}, pending: bool = false };
+        entries: [capacity]Entry = .{Entry{}} ** capacity,
+        pub fn bind(self: *Self, slot: usize, owner: u32, binding: queue.Binding) void {
+            self.entries[slot] = .{ .owner = owner, .binding = binding };
+        }
+        pub fn close(self: *Self, slot: usize) void { self.entries[slot] = .{}; }
+        pub fn request(self: *Self, owner: u32, binding: queue.Binding) queue.Error!void {
+            if (owner == 0 or binding.adapter == 0) return error.Invalid;
+            for (&self.entries) |*entry| {
+                if (entry.owner == 0 or entry.binding.adapter != binding.adapter) continue;
+                if (entry.owner != owner) return error.WrongOwner;
+                if (!std.meta.eql(entry.binding, binding)) return error.Stale;
+                entry.pending = true;
+                return;
+            }
+            return error.Stale;
+        }
+        pub fn take(self: *Self, slot: usize) bool {
+            const pending = self.entries[slot].pending;
+            self.entries[slot].pending = false;
+            return pending;
+        }
+    };
+}
 pub fn Ingress(comptime capacity: usize) type {
     return struct {
         const Self = @This();
@@ -69,4 +98,18 @@ test "IRQ mailbox rejects wrong owners and stale resets and retains a single exa
     try t.expectError(error.Stale, ingress.acknowledge(7, fence, .complete, true, 4));
     ingress.quiesce(newer);
     try t.expectError(error.AlreadyCompleted, ingress.acknowledge(7, newer, .complete, true, 4));
+    var wake = Wakeups(2){};
+    wake.bind(0, 7, fence.binding);
+    try t.expectError(error.WrongOwner, wake.request(8, fence.binding));
+    try wake.request(7, fence.binding);
+    try wake.request(7, fence.binding);
+    try t.expect(wake.take(0) and !wake.take(0));
+    try wake.request(7, fence.binding); // Arrival while a prior callback runs.
+    try t.expect(wake.take(0));
+    wake.bind(0, 7, newer.binding);
+    try t.expectError(error.Stale, wake.request(7, fence.binding));
+    try wake.request(7, newer.binding);
+    wake.close(0);
+    try t.expect(!wake.take(0));
+    try t.expectError(error.Stale, wake.request(7, newer.binding));
 }

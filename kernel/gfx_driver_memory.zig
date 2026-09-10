@@ -53,9 +53,10 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
     const request = request_ptr.*;
     const ref = api.handle(reference.*) catch |err| return api.status(err);
     if (request.version != 1 or request.size < @sizeOf(abi.GfxDeviceRequest) or request.reserved0 != 0 or
-        request.adapter_id == 0 or request.device_generation == 0 or request.access > 3 or request.address_space > 1 or
+        request.adapter_id == 0 or request.device_generation == 0 or request.access > 4 or request.address_space > 1 or
         (request.address_space == 0 and (request.gpu_virtual_address != 0 or request.access == 3)) or
         (request.address_space == 1 and (request.gpu_virtual_address == 0 or request.gpu_virtual_address > std.math.maxInt(u64) - request.byte_length)) or
+        (request.access == 4 and request.address_space != 0) or
         (request.access == 3 and (request.byte_offset | request.byte_length | request.gpu_virtual_address) % paging.PAGE_SIZE != 0)) return abi.gfx_buffer_error_invalid;
     var free: ?*Device = null;
     for (&devices) |*item| if (item.descriptor.lease.id == 0) {
@@ -76,7 +77,7 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
         0 => .device_read,
         1 => .device_write,
         2 => .scanout,
-        3 => .device_mapping,
+        3, 4 => .device_mapping,
         else => unreachable,
     };
     const use = buffers.mapLocked(ref, identity, access, request.byte_offset, request.byte_length) catch |err| {
@@ -189,8 +190,11 @@ const Backend = struct {
     pub fn map(_: *@This(), address: u64, physical: u64, cache: windows.Policy) bool {
         const flags: u64 = switch (cache) {
             .uncached => blk: {
-                if (!cpu.patAvailable() or ((cpu.status().pat_msr >> 16) & 0xFF) != 0) return false;
-                break :blk paging.CACHE_DISABLE;
+                if (!cpu.patAvailable()) return false;
+                const selector = windows.cacheSelector(cpu.status().pat_msr, 0) orelse return false;
+                break :blk (if (selector & 1 != 0) paging.WRITE_THROUGH else @as(u64, 0)) |
+                    (if (selector & 2 != 0) paging.CACHE_DISABLE else @as(u64, 0)) |
+                    (if (selector & 4 != 0) paging.PAGE_ATTRIBUTE_TABLE else @as(u64, 0));
             },
             .write_combining => blk: {
                 if (!cpu.writeCombiningBasisAvailable()) return false;

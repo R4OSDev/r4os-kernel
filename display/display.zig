@@ -240,12 +240,44 @@ pub const NativeBackend = struct {
     commit: *const fn (usize, u64, *const BootSnapshot) CommitResult,
     // True confirms hardware quiescence AND restoration of the saved scanout.
     restore: *const fn (usize, u64, *const BootSnapshot) bool,
+    // Optional resident CPU shadow ownership. End completes its upload before
+    // normal presentation succeeds; false triggers the same proven recovery.
+    begin_cpu: ?*const fn (usize) bool = null,
+    end_cpu: ?*const fn (usize, bool, ?Rect) bool = null,
 };
 
 pub const TransitionError = backend_state.Error || error{ Unavailable, RestoreFailed };
 var native_backend: ?NativeBackend = null;
 var native_device: Device = .{};
 var saved_boot: ?BootSnapshot = null;
+pub fn bootSnapshot() ?BootSnapshot {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return saved_boot;
+}
+
+const CpuWrite = struct {
+    callback: ?*const fn (usize, bool, ?Rect) bool = null,
+    context: usize = 0,
+    active: bool = true,
+    damage: ?Rect = null,
+    fn finish(self: *CpuWrite, changed: bool) bool {
+        if (!self.active) return true;
+        self.active = false;
+        const callback = self.callback orelse return true;
+        if (callback(self.context, changed, self.damage)) return true;
+        if (native_backend) |backend| restoreBootLocked(backend.owner, backend_manager.value.generation) catch {};
+        return false;
+    }
+};
+fn beginCpuWrite(device: *const Device) ?CpuWrite {
+    if (device.kind != .native) return .{};
+    const backend = native_backend orelse return null;
+    if (backend.begin_cpu) |begin| {
+        if (backend.end_cpu == null or !begin(backend.context)) return null;
+        return .{ .callback = backend.end_cpu, .context = backend.context };
+    }
+    return if (backend.end_cpu == null) CpuWrite{} else null;
+}
 
 pub fn backendState() backend_state.Snapshot {
     const token = ownership.enterState();
@@ -285,6 +317,7 @@ pub fn prepareNative(backend: NativeBackend) TransitionError!u64 {
     const boot = saved_boot orelse return error.Unavailable;
     const target = backend.target;
     const frame = target.framebuffer orelse return error.Invalid;
+    if ((backend.begin_cpu == null) != (backend.end_cpu == null)) return error.Invalid;
     if (target.kind != .native or target.mapping.kind != .native_scanout or
         target.name.len == 0 or target.name.len >= blit_backend.NAME_BYTES or
         target.mode.width != boot.mode.width or target.mode.height != boot.mode.height or
@@ -362,6 +395,9 @@ pub fn commitNative(owner: usize, generation: u64) TransitionError!CommitResult 
 pub fn restoreBootBackend(owner: usize, generation: u64) TransitionError!void {
     if (!execution.tryEnter()) return error.Busy;
     defer execution.leave();
+    return restoreBootLocked(owner, generation);
+}
+fn restoreBootLocked(owner: usize, generation: u64) TransitionError!void {
     const backend = native_backend orelse return error.Unavailable;
     const boot = &(saved_boot orelse return error.Unavailable);
     const recovery_generation = try backend_manager.beginRecovery(owner, generation);
@@ -437,6 +473,8 @@ pub fn enableFramebufferWriteCombining() bool {
     defer execution.leave();
     defer publishStats();
     const device = primary_device orelse return false;
+    // Native system BO cache policy belongs to the common memory owner.
+    if (device.kind != .bootfb) return false;
     if (!cpu.writeCombiningBasisAvailable()) {
         device.mapping.cache_policy = .write_combining_unsupported;
         return false;
@@ -519,8 +557,12 @@ pub fn fill(rgb: u32) bool {
     defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.fill orelse return false;
+    var write = beginCpuWrite(device) orelse return false;
+    defer _ = write.finish(false);
     const start = timer.tickCount();
     const ok = op(device, rgb);
+    if (ok) write.damage = device.last_present_rect;
+    if (!write.finish(ok)) return false;
     if (ok) {
         recordPresentTiming(device, start);
         publishStats();
@@ -533,8 +575,12 @@ pub fn rect(x: i32, y: i32, w: u32, h: u32, rgb: u32) bool {
     defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.rect orelse return false;
+    var write = beginCpuWrite(device) orelse return false;
+    defer _ = write.finish(false);
     const start = timer.tickCount();
     const ok = op(device, x, y, w, h, rgb);
+    if (ok) write.damage = device.last_present_rect;
+    if (!write.finish(ok)) return false;
     if (ok) {
         recordPresentTiming(device, start);
         publishStats();
@@ -548,6 +594,8 @@ pub fn textZ(font_id: ?u32, x: i32, y: i32, value: [*:0]const u8, fg: u32, bg: u
     const device = primary_device orelse return false;
     const f = device.framebuffer orelse return false;
     if (!fb.supportsRgb32(f)) return false;
+    var write = beginCpuWrite(device) orelse return false;
+    defer _ = write.finish(false);
     var length: usize = 0;
     while (length < 4096 and value[length] != 0) : (length += 1) {}
     var catalog = font.acquireCatalog();
@@ -589,6 +637,8 @@ pub fn textZ(font_id: ?u32, x: i32, y: i32, value: [*:0]const u8, fg: u32, bg: u
         pen_x += glyph.advance;
     }
     if (pixels == 0) return false;
+    write.damage = bounds;
+    if (!write.finish(true)) return false;
     recordPresentAggregate(device, .rect, bounds, pixels, false);
     recordPresentTiming(device, start);
     publishStats();
@@ -600,7 +650,10 @@ pub fn putPacked32(x: u64, y: u64, color32: u32) bool {
     defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.put_packed32 orelse return false;
-    return op(device, x, y, color32);
+    var write = beginCpuWrite(device) orelse return false;
+    const ok = op(device, x, y, color32);
+    if (ok) write.damage = .{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 };
+    return write.finish(ok) and ok;
 }
 
 pub fn putXrgb32(x: u64, y: u64, rgb: u32) bool {
@@ -608,7 +661,10 @@ pub fn putXrgb32(x: u64, y: u64, rgb: u32) bool {
     defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.put_xrgb32 orelse return false;
-    return op(device, x, y, rgb);
+    var write = beginCpuWrite(device) orelse return false;
+    const ok = op(device, x, y, rgb);
+    if (ok) write.damage = .{ .x = @intCast(x), .y = @intCast(y), .w = 1, .h = 1 };
+    return write.finish(ok) and ok;
 }
 
 pub fn presentPacked32Rect(x0: u64, y0: u64, w: u64, h: u64, src: []const u8, src_stride_pixels: u64) bool {
@@ -616,8 +672,12 @@ pub fn presentPacked32Rect(x0: u64, y0: u64, w: u64, h: u64, src: []const u8, sr
     defer execution.leave();
     const device = primary_device orelse return false;
     const op = device.ops.present_packed32_rect orelse return false;
+    var write = beginCpuWrite(device) orelse return false;
+    defer _ = write.finish(false);
     const start = timer.tickCount();
     const ok = op(device, x0, y0, w, h, src, src_stride_pixels);
+    if (ok) write.damage = device.last_present_rect;
+    if (!write.finish(ok)) return false;
     if (ok) {
         recordPresentTiming(device, start);
         publishStats();
@@ -690,6 +750,8 @@ pub fn presentXrgb32Regions(
         }
     }
 
+    var write = beginCpuWrite(device) orelse return outcome;
+    defer _ = write.finish(false);
     const start = timer.tickCount();
     var external = blit_backend.InvokeResult{};
     if (fb.isNativeXrgb32(f) and (f.pitch & 3) == 0) {
@@ -721,6 +783,8 @@ pub fn presentXrgb32Regions(
         copyName(outcome.backend_name[0..], if (device.kind == .bootfb) "bootfb-cpu" else "native-cpu");
     }
 
+    write.damage = bounds;
+    if (!write.finish(true)) return outcome;
     const completed_tick = timer.tickCount();
     recordPresentAggregate(device, .xrgb32_present, bounds, pixels_total, false);
     recordPresentTimingAt(device, start, completed_tick);
@@ -782,6 +846,23 @@ test "display takeover excludes firmware writers and retains uncertain hardware 
         result: CommitResult = .old_preserved,
         restores: bool = false,
         commits: u32 = 0,
+        cpu_active: bool = false,
+        cpu_ok: bool = true,
+        cpu_frames: u32 = 0,
+        fn beginCpu(raw: usize) bool {
+            const self: *@This() = @ptrFromInt(raw);
+            t.expect(!self.cpu_active) catch unreachable;
+            self.cpu_active = true;
+            return true;
+        }
+        fn endCpu(raw: usize, changed: bool, damage: ?Rect) bool {
+            const self: *@This() = @ptrFromInt(raw);
+            t.expect(self.cpu_active) catch unreachable;
+            self.cpu_active = false;
+            if (changed) self.cpu_frames += 1;
+            if (changed and self.cpu_frames == 1) t.expectEqualDeep(Rect{ .x = 2, .y = 2, .w = 2, .h = 2 }, damage.?) catch unreachable;
+            return self.cpu_ok;
+        }
         fn commit(raw: usize, _: u64, snapshot: *const BootSnapshot) CommitResult {
             const self: *@This() = @ptrFromInt(raw);
             self.commits += 1;
@@ -822,6 +903,8 @@ test "display takeover excludes firmware writers and retains uncertain hardware 
         .context = @intFromPtr(&probe),
         .commit = Probe.commit,
         .restore = Probe.restore,
+        .begin_cpu = Probe.beginCpu,
+        .end_cpu = Probe.endCpu,
     };
     var malformed = backend;
     malformed.target.mode.red_mask_shift = 8;
@@ -865,7 +948,10 @@ test "display takeover excludes firmware writers and retains uncertain hardware 
     try t.expectEqual(@as(u32, 0x765432), native_pixels[18]);
     try t.expectEqual(@as(u32, 0x00445566), native_pixels[17]);
     try t.expectEqualStrings("native-cpu", nameSlice(&presented.backend_name));
-    try t.expectError(error.RestoreFailed, restoreBootBackend(92, second));
+    try t.expect(!probe.cpu_active and probe.cpu_frames == 1);
+    probe.cpu_ok = false;
+    try t.expect(!fill(0x112233)); // Failed upload triggers the same recovery.
+    try t.expect(!probe.cpu_active and probe.cpu_frames == 2);
     try t.expectEqual(@as(u64, 2), backendState().reset_generation);
     try t.expect(!fill(0xAAAAAA));
     try t.expectEqual(@as(u32, 0), presentCapabilities().flags);

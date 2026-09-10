@@ -18,6 +18,11 @@ var catalog: model.Store = .{};
 // A queue binding checked before that transition cannot publish afterwards.
 var owner_epoch: u64 = 1;
 var epoch_exhausted = false;
+var native_owner: u32 = 0;
+var native_port: abi.GfxOutputId = .{};
+fn samePort(left: abi.GfxOutputId, right: abi.GfxOutputId) bool {
+    return left.adapter_id == right.adapter_id and left.connector_id == right.connector_id and left.device_generation == right.device_generation;
+}
 
 pub fn initBoot(frame: *const @import("framebuffer.zig").Framebuffer) void {
     if (frame.width == 0 or frame.height == 0 or frame.width > 65536 or frame.height > 65536) return;
@@ -80,7 +85,10 @@ pub fn publish(owner: u32, input: *const abi.GfxOutputPublication) Error!abi.Gfx
     const identity = blk: {
         const token = ownership.enterState(); defer ownership.leaveState(token);
         if (epoch_exhausted or owner_epoch != epoch) return error.Stale;
-        break :blk try catalog.publish(owner, input.info, input.modes[0..input.info.mode_count], input.edid[0..input.info.edid_bytes]);
+        var info = input.info;
+        if (owner == native_owner and samePort(info.identity, native_port) and info.flags & abi.gfx_output_flag_connected != 0)
+            info.flags |= abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry;
+        break :blk try catalog.publish(owner, info, input.modes[0..info.mode_count], input.edid[0..info.edid_bytes]);
     };
     events.signal(); // Complete topology is visible before sequence + wake.
     return identity;
@@ -98,6 +106,7 @@ pub fn stoppedDriver(owner: u32) void {
     const changed = blk: {
         const token = ownership.enterState(); defer ownership.leaveState(token);
         if (owner_epoch == std.math.maxInt(u64)) epoch_exhausted = true else owner_epoch += 1;
+        if (native_owner == owner) { native_owner = 0; native_port = .{}; }
         break :blk catalog.stop(owner) catch {
             // Exhaustion is fail-closed: no stale receiver data survives.
             for (&catalog.entries) |*entry| if (entry.owner == owner) { entry.* = .{}; };
@@ -118,6 +127,45 @@ pub fn bootActive(active: bool) void {
         if (active) entry.info.flags |= abi.gfx_output_flag_active else entry.info.flags &= ~abi.gfx_output_flag_active;
         catalog.revision += 1;
         break :blk true;
+    };
+    if (changed) events.signal();
+}
+pub fn validateNative(owner: u32, backend: abi.GfxBackendBinding, identity: abi.GfxOutputId, width: u32, height: u32) Error!void {
+    try queue.validateOutputBinding(owner, backend);
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    if (epoch_exhausted) return error.Exhausted;
+    const entry = try catalog.find(identity);
+    if (owner == 0 or entry.owner != owner or identity.adapter_id != backend.adapter_id or
+        identity.device_generation != backend.device_generation or entry.info.flags & abi.gfx_output_flag_connected == 0) return error.Stale;
+    for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.width == width and mode.height == height) return;
+    return error.Unsupported;
+}
+pub fn nativeActive(owner: u32, identity: abi.GfxOutputId, active: bool) void {
+    const changed = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        if (owner == 0 or epoch_exhausted) break :blk false;
+        if (active) {
+            const found = catalog.find(identity) catch break :blk false;
+            if (found.owner != owner) break :blk false;
+            native_owner = owner; native_port = identity;
+        } else {
+            if (native_owner != owner or !samePort(native_port, identity)) break :blk false;
+            native_owner = 0; native_port = .{};
+        }
+        // Recovery uses the original registration; receiver refresh may have
+        // advanced its connection generation while the physical route stayed.
+        for (&catalog.entries) |*entry| {
+            if (entry.owner != owner or !samePort(entry.info.identity, identity)) continue;
+            const was = entry.info.flags & abi.gfx_output_flag_active != 0;
+            const enabled = active and entry.info.flags & abi.gfx_output_flag_connected != 0;
+            if (was == enabled) break :blk false;
+            if (catalog.revision == std.math.maxInt(u64)) { epoch_exhausted = true; break :blk false; }
+            if (enabled) entry.info.flags |= abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry else
+                entry.info.flags &= ~(abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry);
+            catalog.revision += 1;
+            break :blk true;
+        }
+        break :blk false;
     };
     if (changed) events.signal();
 }

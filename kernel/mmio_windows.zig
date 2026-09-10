@@ -11,6 +11,13 @@ pub const Extent = struct { physical: u64, bytes: u64 };
 pub const Error = error{ Invalid, Overflow, Unsupported, Busy, Capacity, Stale, Exhausted, MapFailed };
 pub const Window = struct { handle: Handle, cpu: u64, physical: u64, bytes: u64, policy: Policy, borrowed: bool };
 
+// PAT entries are platform state, not fixed meanings of the PCD/PWT bits.
+// UC-minus (7) is deliberately not accepted for register windows requiring UC.
+pub fn cacheSelector(pat: u64, memory_type: u8) ?u3 {
+    for (0..8) |index| if (@as(u8, @truncate(pat >> @as(u6, @intCast(index * 8)))) == memory_type) return @intCast(index);
+    return null;
+}
+
 pub fn validate(request: Request) Error!Extent {
     if (request.resource_base == 0 or request.resource_bytes == 0 or request.bytes == 0 or
         (request.resource_base | request.resource_bytes | request.offset | request.bytes) % page_size != 0 or
@@ -112,6 +119,9 @@ pub fn Manager(comptime Backend: type) type {
 }
 
 test "MMIO windows keep 64-bit offsets, reject cache aliases and retain failed TLB release" {
+    try std.testing.expectEqual(@as(?u3, 3), cacheSelector(0x0007_0406_0007_0406, 0));
+    try std.testing.expectEqual(@as(?u3, 2), cacheSelector(0x0606_0606_0600_0606, 0));
+    try std.testing.expectEqual(@as(?u3, null), cacheSelector(0x0707_0707_0707_0707, 0));
     const Fake = struct {
         entries: [8]?Policy = .{null} ** 8,
         fail_map_after: usize = 8,

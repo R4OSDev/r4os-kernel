@@ -47,8 +47,10 @@ const Backend = struct {
     closing: bool = false,
     notifying: bool = false,
     work_handle: u32 = 0,
+    display_timeline: u64 = 0,
 };
 var backends: [16]Backend = .{Backend{}} ** 16;
+var wakeups = @import("queue_ingress.zig").Wakeups(backends.len){};
 var backend_serial: u64 = 1;
 
 pub fn init() bool {
@@ -81,9 +83,12 @@ pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model
     defer buffers.unlock();
     if (backend_serial == std.math.maxInt(u64)) return error.Exhausted;
     for (&backends) |backend| if (backend.owner.id != 0 and backend.binding.adapter == config.adapter) return error.Busy;
-    for (&backends) |*backend| if (backend.owner.id == 0) {
+    for (&backends, 0..) |*backend, index| if (backend.owner.id == 0) {
         backend_serial += 1;
         backend.* = .{ .owner = identity, .binding = .{ .adapter = config.adapter, .device_generation = backend_serial, .reset_generation = 1 }, .milestone = config.milestone, .notify = config.notify, .context = config.context };
+        const flags = interrupts.saveAndDisableRuntime();
+        wakeups.bind(index, @intCast(identity.id), backend.binding);
+        interrupts.restore(flags);
         return backend.binding;
     };
     return error.Capacity;
@@ -111,6 +116,22 @@ pub fn nativeMilestone(id: u32, binding: model.Binding) Error!model.Milestone {
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
     return backend.milestone;
+}
+// The extra operation is private to the retained display producer. Old R4D
+// queue registrations cannot accidentally receive an operation they lack.
+pub fn bindDisplayQueue(id: u32, binding: model.Binding, timeline: u64) Error!void {
+    buffers.lock(); defer buffers.unlock();
+    const backend = try backendLocked(binding);
+    if (id == 0 or backend.owner.id != id) return error.WrongOwner;
+    if (backend.closing or backend.display_timeline != 0) return error.Busy;
+    const config = try state.configuration(timeline, resource_model.display_owner);
+    if (!std.meta.eql(config.binding, binding) or config.milestone != .device_execution) return error.Invalid;
+    backend.display_timeline = timeline;
+}
+pub fn unbindDisplayQueue(id: u32, binding: model.Binding, timeline: u64) void {
+    buffers.lock(); defer buffers.unlock();
+    const backend = backendLocked(binding) catch return;
+    if (id != 0 and backend.owner.id == id and backend.display_timeline == timeline) backend.display_timeline = 0;
 }
 pub fn validateOutputBinding(id: u32, input: @import("r4os_kernel_contract").GfxBackendBinding) Error!void {
     if (input.version != 1 or input.size < @sizeOf(@TypeOf(input)) or irq.inDispatch()) return error.Invalid;
@@ -161,6 +182,10 @@ pub fn completeNative(id: u32, fence: model.Fence, result: model.Result, quiesce
 }
 fn loseLocked(backend: *Backend, quiesced: bool, instant: u64) void {
     backend.closing = true;
+    const slot = (@intFromPtr(backend) - @intFromPtr(&backends)) / @sizeOf(Backend);
+    const wake_flags = interrupts.saveAndDisableRuntime();
+    wakeups.close(slot);
+    interrupts.restore(wake_flags);
     // Earlier reset generations also remain owned until a proven device stop.
     state.deviceLost(backend.binding, instant);
     if (quiesced) for (&state.jobs) |job| {
@@ -186,7 +211,12 @@ pub fn resetNative(id: u32, binding: model.Binding, quiesced: bool) Error!model.
         loseLocked(backend, quiesced, instant);
         if (!quiesced) break :blk @as(?model.Binding, null);
         backend.binding.reset_generation += 1;
+        backend.display_timeline = 0;
         backend.closing = false;
+        const slot = (@intFromPtr(backend) - @intFromPtr(&backends)) / @sizeOf(Backend);
+        const flags = interrupts.saveAndDisableRuntime();
+        wakeups.bind(slot, id, backend.binding);
+        interrupts.restore(flags);
         break :blk backend.binding;
     };
     worker_event.signal();
@@ -236,6 +266,12 @@ pub fn retainsDriver(id: u32) bool {
 
 // Calls into R4D go through the existing driver-work owner and its retained
 // completion. At most one notification per backend may be queued/running.
+pub fn wakeNative(id: u32, binding: model.Binding) Error!void {
+    const flags = interrupts.saveAndDisableRuntime();
+    wakeups.request(id, binding) catch |err| { interrupts.restore(flags); return err; };
+    interrupts.restore(flags);
+    worker_event.signal();
+}
 fn notifyNative() bool {
     var pending = false;
     for (0..backends.len) |i| {
@@ -260,6 +296,9 @@ fn notifyNative() bool {
         const backend = &backends[i];
         var ready = false;
         if (backend.owner.id != 0 and !backend.closing and !backend.notifying and backend.work_handle == 0) {
+            const flags = interrupts.saveAndDisableRuntime();
+            ready = wakeups.take(i);
+            interrupts.restore(flags);
             for (&state.jobs) |job| if (job.fence.slot != 0 and job.phase == .queued and std.meta.eql(job.fence.binding, backend.binding)) {
                 ready = true;
                 break;
@@ -270,15 +309,38 @@ fn notifyNative() bool {
         buffers.unlock();
         if (!ready) continue;
         var handle: u32 = 0;
-        const rc = work.submit(@intCast(selected.owner.id), selected.notify.?, selected.context, 0, &handle);
+        const rc = work.submit(@intCast(selected.owner.id), notifyDriver, i, 0, &handle);
         buffers.lock();
         std.debug.assert(backends[i].binding.device_generation == selected.binding.device_generation);
         backends[i].work_handle = if (rc == 0) handle else 0;
         backends[i].notifying = false;
+        if (rc != 0 and !backends[i].closing) {
+            const flags = interrupts.saveAndDisableRuntime();
+            wakeups.request(@intCast(selected.owner.id), selected.binding) catch {};
+            interrupts.restore(flags);
+        }
         buffers.unlock();
         pending = true;
     }
     return pending;
+}
+fn notifyDriver(index: usize) callconv(.c) i32 {
+    if (index >= backends.len) return -1;
+    const id = work.currentOwner();
+    if (id == 0) return -1;
+    if (!@import("../kernel/driver_api.zig").enterOwnerBounded(id, @as(u64, @max(@import("../kernel/timer.zig").frequency(), 1)) * 3)) {
+        buffers.lock(); const retry = backends[index]; buffers.unlock();
+        if (retry.owner.id == id and !retry.closing) wakeNative(id, retry.binding) catch {};
+        return -1;
+    }
+    defer _ = @import("../kernel/driver_api.zig").leaveOwner();
+    buffers.lock();
+    const selected = backends[index];
+    buffers.unlock();
+    if (selected.owner.id != id or selected.closing or selected.notify == null) return 0;
+    // Driver-work authenticates the caller; the bound DriverApi guard also
+    // serializes task callbacks against init, display restore and shutdown.
+    return selected.notify.?(selected.context);
 }
 pub fn submit(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request) Error!model.Status {
     if (!started or irq.inDispatch()) return error.Unavailable;
@@ -286,6 +348,12 @@ pub fn submit(owner: buffers.Owner, timeline: u64, request: model.Submission, tr
     const snapshot = blk: {
         buffers.lock();
         defer buffers.unlock();
+        if (transport.operation == .upload) {
+            if (!owner.eql(resource_model.display_owner)) return error.Unsupported;
+            const config = try state.configuration(timeline, owner);
+            const backend = try backendLocked(config.binding);
+            if (backend.closing or backend.display_timeline != timeline) return error.Unsupported;
+        }
         const accepted = try resources.submit(&state, &buffers.store, timeline, owner, request, transport, instant);
         completions[accepted.slot - 1] = sync.Event.init(false);
         releases[accepted.slot - 1] = sync.Event.init(false);

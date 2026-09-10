@@ -220,3 +220,13 @@ Detailed German migration notes are preserved in
 
 Original R4OS material is licensed under Apache License 2.0. See `LICENSE`,
 `NOTICE`, and `THIRD_PARTY_NOTICES.md`.
+
+DriverApi28 binds external native display drivers through
+`display/native_driver.zig`. Fixed boot geometry uses a retained common WB BO,
+explicit CPU-write leases, sparse source-upload reservations and the existing
+device-execution fence/worker. Driver-specific commands stay in R4D. A failed
+upload follows the same acknowledged boot restoration path; unknown physical
+completion retains ownership. An IRQ-safe, generation-bound notification
+mailbox can wake an idle native backend without acquiring BO metadata locks.
+MMIO UC mappings locate an actual PAT UC entry; the legacy boot-FB WC helper
+cannot change native BO cache policy.
