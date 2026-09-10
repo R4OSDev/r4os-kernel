@@ -32,8 +32,8 @@ const xhci = @import("../driver/usb/xhci.zig");
 const outputs_contract = @import("r4os_kernel_contract");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 25 (0.79.5): optional graphics memory query after the stable v24 prefix.
-pub const VERSION: u32 = 26;
+// Version 27: optional output catalog after the v25 memory/v26 queue tails.
+pub const VERSION: u32 = 27;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -783,6 +783,7 @@ pub const Table = extern struct {
     // v25: one optional versioned memory table; all previous offsets survive.
     gfx_memory_query: *const fn (*outputs_contract.GfxDriverMemoryApi) callconv(.c) i32,
     gfx_queue_query: *const fn (*outputs_contract.GfxDriverQueueApi) callconv(.c) i32,
+    gfx_output_query: *const fn (*outputs_contract.GfxDriverOutputApi) callconv(.c) i32,
 };
 
 pub var table = Table{
@@ -790,6 +791,7 @@ pub var table = Table{
     .version = VERSION,
     .gfx_memory_query = gfxMemoryQuery,
     .gfx_queue_query = gfxQueueQuery,
+    .gfx_output_query = gfxOutputQuery,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -2996,6 +2998,24 @@ fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
 }
 
 const gfx_queue_api = @import("gfx_driver_queue.zig");
+fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32 {
+    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    if (!gfx_api.validOutput(outputs_contract.GfxDriverOutputApi, output)) return outputs_contract.gfx_output_error_invalid;
+    output.* = .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw) };
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxOutputPublish(input: *const outputs_contract.GfxOutputPublication, output: *outputs_contract.GfxOutputId) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(output) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const value = input.*;
+    const identity = @import("../display/outputs.zig").publish(activeOwner(), &value) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+    output.* = identity;
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxOutputWithdraw(input: *const outputs_contract.GfxOutputId) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    @import("../display/outputs.zig").withdraw(activeOwner(), input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
 fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
     _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
     if (!gfx_api.validOutput(outputs_contract.GfxDriverQueueApi, output)) return outputs_contract.gfx_queue_error_invalid;

@@ -112,6 +112,14 @@ pub fn nativeMilestone(id: u32, binding: model.Binding) Error!model.Milestone {
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
     return backend.milestone;
 }
+pub fn validateOutputBinding(id: u32, input: @import("r4os_kernel_contract").GfxBackendBinding) Error!void {
+    if (input.version != 1 or input.size < @sizeOf(@TypeOf(input)) or irq.inDispatch()) return error.Invalid;
+    buffers.lock(); defer buffers.unlock();
+    const backend = try backendLocked(.{ .adapter = input.adapter_id, .device_generation = input.device_generation, .reset_generation = input.reset_generation });
+    if (id == 0 or backend.owner.id != id) return error.WrongOwner;
+    if (backend.closing) return error.DeviceLost;
+    if (@intFromEnum(backend.milestone) != input.milestone) return error.Invalid;
+}
 pub fn takeNative(id: u32, binding: model.Binding) Error!resource_model.Entry {
     if (irq.inDispatch()) return error.Unavailable;
     const instant = now();
@@ -182,6 +190,7 @@ pub fn resetNative(id: u32, binding: model.Binding, quiesced: bool) Error!model.
         break :blk backend.binding;
     };
     worker_event.signal();
+    @import("outputs.zig").stoppedDriver(id);
     return next orelse error.Busy;
 }
 fn retainedLocked(backend: Backend) bool {
@@ -207,6 +216,7 @@ pub fn unregisterNative(id: u32, binding: model.Binding, quiesced: bool) Error!v
     if (!busy) backend.* = .{};
     buffers.unlock();
     worker_event.signal();
+    @import("outputs.zig").stoppedDriver(id);
     if (busy) return error.Busy;
 }
 pub fn closingDriver(id: u32) void {
@@ -214,6 +224,7 @@ pub fn closingDriver(id: u32) void {
     buffers.lock();
     for (&backends) |*backend| if (backend.owner.id == id and id != 0) loseLocked(backend, false, instant);
     buffers.unlock();
+    @import("outputs.zig").stoppedDriver(id);
     worker_event.signal();
 }
 pub fn retainsDriver(id: u32) bool {

@@ -199,6 +199,8 @@ var primary_device: ?*Device = null;
 var present_generation: u64 = 0;
 var completed_fence: u64 = 0;
 var execution = ownership.Execution.init("display-present");
+pub fn beginOutputCommit() bool { return execution.tryEnter(); }
+pub fn endOutputCommit() void { execution.leave(); }
 var completed_stats: Stats = .{};
 var backend_manager: backend_state.Manager = .{};
 var completed_backend_state: backend_state.Snapshot = .{};
@@ -477,6 +479,8 @@ fn publishStats() void {
         value.name;
     copyName(&completed_output_name, output_name);
     ownership.leaveState(token);
+    if (@import("builtin").os.tag == .freestanding)
+        @import("outputs.zig").bootActive(value.registered and value.kind == .bootfb);
 }
 
 fn captureStats() Stats {

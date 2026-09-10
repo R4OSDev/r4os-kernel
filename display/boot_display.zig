@@ -32,6 +32,7 @@ pub fn init() ?State {
     console_storage = Console.init(framebuf);
     const boot_target = displayTargetFromBootFramebuffer(framebuf);
     display.registerBootBackend(boot_target);
+    @import("outputs.zig").initBoot(framebuf);
     surface_pipeline.initFromDisplayManager();
     console_storage.clear();
     _ = bootscreen.renderToFramebuffer(framebuf);

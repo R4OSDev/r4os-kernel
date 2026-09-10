@@ -14,6 +14,7 @@ const gfx_buffers = @import("../memory/gfx_buffers.zig");
 const gfx_buffer_api = @import("gfx_buffer_api.zig");
 const gfx_queue = @import("../display/queue.zig");
 const gfx_queue_api = @import("gfx_queue_api.zig");
+const gfx_output_api = @import("gfx_output_api.zig");
 const module_file = @import("../kernel/module_file.zig");
 const module_r4m = @import("../kernel/module_r4m.zig");
 const modules = @import("../kernel/modules.zig");
@@ -7668,6 +7669,12 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_fence_cancel = &apiGfxFenceCancel,
         .gfx_fence_release = &apiGfxFenceRelease,
         .gfx_queue_backend = &gfx_queue_api.backend,
+        .gfx_output_revision = &gfx_output_api.revision,
+        .gfx_output_info = &gfx_output_api.info,
+        .gfx_output_mode = &gfx_output_api.mode,
+        .gfx_output_edid = &gfx_output_api.edid,
+        .gfx_atomic_test = &apiGfxAtomicTest,
+        .gfx_atomic_commit = &apiGfxAtomicCommit,
     });
 }
 
@@ -16203,6 +16210,14 @@ fn apiGfxBufferCreate(input: *const r4x_api.GfxBufferDescriptor, output: *r4x_ap
 fn apiGfxQueueOpen(input: *const gfx_queue_api.abi.GfxQueueConfig, output: *gfx_queue_api.abi.GfxQueueHandle) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
     return gfx_queue_api.open(graphicsOwner(owner), input, output);
+}
+fn apiGfxAtomicTest(input: *const gfx_output_api.abi.GfxAtomicState, output: *gfx_output_api.abi.GfxAtomicResult) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
+    return gfx_output_api.atomic(graphicsOwner(owner), input, output, false);
+}
+fn apiGfxAtomicCommit(input: *const gfx_output_api.abi.GfxAtomicState, output: *gfx_output_api.abi.GfxAtomicResult) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
+    return gfx_output_api.atomic(graphicsOwner(owner), input, output, true);
 }
 fn apiGfxQueueClose(input: *const gfx_queue_api.abi.GfxQueueHandle) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
