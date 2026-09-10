@@ -35,7 +35,7 @@ const driver_heap = @import("driver_heap.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
 // Version 30: resident CPU heap after the unchanged v29 resource tail.
-pub const VERSION: u32 = 30;
+pub const VERSION: u32 = 31;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -801,12 +801,13 @@ pub const Table = extern struct {
     gfx_display_query: *const fn (*outputs_contract.GfxDriverDisplayApi) callconv(.c) i32,
     resource_query: *const fn (*outputs_contract.DriverResourceApi) callconv(.c) i32,
     heap_query: *const fn (*outputs_contract.DriverHeapApi) callconv(.c) i32,
+    monotonic_clock: *const fn (*outputs_contract.MonotonicClockInfo) callconv(.c) i32,
 };
 
 comptime {
     if (VERSION != outputs_contract.driver_api_version or @offsetOf(Table, "resource_query") != 592 or
-        @offsetOf(Table, "heap_query") != 600 or @sizeOf(Table) != 608)
-        @compileError("DriverApi append-only v30 layout drift");
+        @offsetOf(Table, "heap_query") != 600 or @offsetOf(Table, "monotonic_clock") != 608 or @sizeOf(Table) != 616)
+        @compileError("DriverApi append-only v31 layout drift");
 }
 
 pub var table = Table{
@@ -818,6 +819,7 @@ pub var table = Table{
     .gfx_display_query = gfxDisplayQuery,
     .resource_query = resourceQuery,
     .heap_query = heapQuery,
+    .monotonic_clock = @import("monotonic_api.zig").monotonicClock,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,

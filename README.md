@@ -239,3 +239,9 @@ use a cached table without joining the global driver lifecycle guard. Closing
 rejects new allocations; generic cleanup reclaims leftovers only after device
 callbacks, IRQ, work and DMA have quiesced. Failed release retains ownership
 and vetoes unload. The CPU addresses carry no DMA or GPU mapping promise.
+
+DriverApi31 also exposes the existing fixed MonotonicClockInfo snapshot to
+drivers. kernel/monotonic_api.zig is the shared R4SYS/R4D mapping of the
+canonical monotonic source. The optional entry preserves the 608-byte prefix;
+no new clock, timer backend or scheduling policy is introduced. Reads do not
+acquire a driver lifecycle guard, allocate or wait.
