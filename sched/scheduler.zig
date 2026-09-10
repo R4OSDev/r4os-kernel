@@ -665,7 +665,15 @@ pub fn blockCurrent(object: u64, timeout_ticks: u64, reason: []const u8) ?*task.
     const running = state.current_task orelse return null;
     const now = timer.tickCount();
     const wake_tick = if (timeout_ticks == WAIT_FOREVER) 0 else timer.deadlineAfter(now, timeout_ticks);
+    const previous_deadline = task.minWakeTick();
     task.beginWait(running, wake_tick, reason, object);
+    // Timed waits share the BSP-owned deadline source. An AP can insert an
+    // earlier timeout after the BSP has already armed a distant idle one-shot
+    // (or disarmed it). Wake the BSP through its existing STI/HLT-safe IPI
+    // path so it rechecks the current minimum. Never program the BSP's timer
+    // hardware from the AP. Publication and notification share this owner.
+    if (percpu.currentIndex() != 0 and wake_tick != 0 and wake_tick < previous_deadline)
+        sendRescheduleToCpu(0);
     sleep_count +%= 1;
     object_wait_count +%= 1;
     return running;

@@ -4,4 +4,5 @@ test {
     _ = @import("kernel/driver_resource_state.zig");
     _ = @import("kernel/driver_memory_owner.zig");
     _ = @import("kernel/driver_thread_owner.zig");
+    _ = @import("kernel/driver_semaphore_owner.zig");
 }

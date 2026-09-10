@@ -33,10 +33,11 @@ const outputs_contract = @import("r4os_kernel_contract");
 const driver_resources = @import("driver_resources.zig");
 const driver_heap = @import("driver_heap.zig");
 const driver_threads = @import("driver_threads.zig");
+const driver_semaphores = @import("driver_semaphores.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
 // Version 30: resident CPU heap after the unchanged v29 resource tail.
-pub const VERSION: u32 = 32;
+pub const VERSION: u32 = 33;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -496,7 +497,13 @@ pub fn bindModuleResources(owner: u32, module_slot: usize) bool {
         driver_resources.state.finish(owner);
         return false;
     }
+    if (!driver_semaphores.bind(owner, binding.epoch)) {
+        std.debug.assert(driver_threads.discardEmptyBinding(owner, binding.epoch));
+        driver_resources.state.finish(owner);
+        return false;
+    }
     if (!driver_heap.bind(owner, binding.epoch)) {
+        std.debug.assert(driver_semaphores.discardEmptyBinding(owner, binding.epoch));
         std.debug.assert(driver_threads.discardEmptyBinding(owner, binding.epoch));
         driver_resources.state.finish(owner);
         return false;
@@ -538,6 +545,7 @@ pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
 pub fn beginOwnerShutdown(token: *OwnerCleanupToken) void {
     driver_resources.state.close(token.owner);
     driver_heap.beginClose(token.owner);
+    driver_semaphores.beginClose(token.owner);
     driver_threads.beginClose(token.owner);
     @import("../display/queue.zig").closingDriver(token.owner);
     gfx_memory.beginClose(token.owner);
@@ -651,6 +659,14 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         bootlog.puts(" threads=retained dma=retained cpu-heap=retained resources=quarantined\r\n");
         return false;
     }
+    const semaphore_cleanup = driver_semaphores.cleanup(owner);
+    if (!semaphore_cleanup.quiesced) {
+        token.active = false;
+        bootlog.puts("[R4D] cleanup owner=");
+        bootlog.putDec(owner);
+        bootlog.puts(" semaphores=retained dma=retained cpu-heap=retained resources=quarantined\r\n");
+        return false;
+    }
     const dma_count = cleanupDmaOwner(owner);
     const cpu_cleanup = driver_heap.cleanup(owner);
     if (!cpu_cleanup.quiesced) {
@@ -667,6 +683,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     if (irq_count == 0 and
         work_count == 0 and
         thread_cleanup.released == 0 and
+        semaphore_cleanup.released == 0 and
         dma_count == 0 and
         cpu_cleanup.released == 0 and
         msi_cleanup.removed == 0 and
@@ -683,8 +700,8 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     // splice a different driver's text into the release accounting.
     const entry = @import("../driver/registry.zig").get(owner - 1);
     const name = if (entry) |*item| item.name[0..item.name_len] else "unknown";
-    var message: [512]u8 = undefined;
-    const line = std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} irq={d} work={d} threads={d} dma={d} cpu-heap={d} cpu-bytes={d} msi={d} audio={d} storage={d} usb-host={d} display-blit={d} net={d} name={s} result=complete\r\n", .{ owner, irq_count, work_count, thread_cleanup.released, dma_count, cpu_cleanup.released, cpu_cleanup.bytes, msi_cleanup.removed, audio_count, storage_cleanup.removed, usb_host_cleanup.removed, display_blit_count, net_cleanup.removed, name }) catch unreachable;
+    var message: [640]u8 = undefined;
+    const line = std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} irq={d} work={d} threads={d} semaphores={d} dma={d} cpu-heap={d} cpu-bytes={d} msi={d} audio={d} storage={d} usb-host={d} display-blit={d} net={d} name={s} result=complete\r\n", .{ owner, irq_count, work_count, thread_cleanup.released, semaphore_cleanup.released, dma_count, cpu_cleanup.released, cpu_cleanup.bytes, msi_cleanup.removed, audio_count, storage_cleanup.removed, usb_host_cleanup.removed, display_blit_count, net_cleanup.removed, name }) catch unreachable;
     bootlog.puts(line);
     return true;
 }
@@ -825,13 +842,14 @@ pub const Table = extern struct {
     heap_query: *const fn (*outputs_contract.DriverHeapApi) callconv(.c) i32,
     monotonic_clock: *const fn (*outputs_contract.MonotonicClockInfo) callconv(.c) i32,
     thread_query: *const fn (*outputs_contract.DriverThreadApi) callconv(.c) i32,
+    semaphore_query: *const fn (*outputs_contract.DriverSemaphoreApi) callconv(.c) i32,
 };
 
 comptime {
     if (VERSION != outputs_contract.driver_api_version or @offsetOf(Table, "resource_query") != 592 or
         @offsetOf(Table, "heap_query") != 600 or @offsetOf(Table, "monotonic_clock") != 608 or
-        @offsetOf(Table, "thread_query") != 616 or @sizeOf(Table) != 624)
-        @compileError("DriverApi append-only v32 layout drift");
+        @offsetOf(Table, "thread_query") != 616 or @offsetOf(Table, "semaphore_query") != 624 or @sizeOf(Table) != 632)
+        @compileError("DriverApi append-only v33 layout drift");
 }
 
 pub var table = Table{
@@ -845,6 +863,7 @@ pub var table = Table{
     .heap_query = heapQuery,
     .monotonic_clock = @import("monotonic_api.zig").monotonicClock,
     .thread_query = threadQuery,
+    .semaphore_query = semaphoreQuery,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -1418,7 +1437,7 @@ fn activeOwner() u32 {
 }
 
 // Dedicated tasks currently admit only the audited CPU heap, clock and
-// thread services. Do not silently extend legacy PCI/DMA/backend entrypoints
+// thread and semaphore services. Do not silently extend legacy PCI/DMA/backend entrypoints
 // to parallel callers by changing activeOwner's admission contract.
 fn runtimeOwner() u32 {
     if (irq_router.inDispatch()) return irq_router.currentOwner();
@@ -3075,6 +3094,41 @@ fn heapOwner() u32 {
     const thread_owner = driver_threads.currentOwner();
     if (thread_owner != 0) return thread_owner;
     return activeOwner();
+}
+fn semaphoreContextFlags() callconv(.c) u32 {
+    if (runtimeOwner() == 0) return 0;
+    if (irq_router.inDispatch()) return outputs_contract.driver_semaphore_context_irq;
+    return if (currentStorageCallbackOwner() == 0 and driver_semaphores.canSleep()) outputs_contract.driver_semaphore_context_sleepable else 0;
+}
+fn semaphoreQuery(output: *outputs_contract.DriverSemaphoreApi) callconv(.c) i32 {
+    if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverSemaphoreApi)) return outputs_contract.driver_semaphore_error_invalid;
+    output.* = .{};
+    const result = driver_semaphores.query(runtimeOwner());
+    if (result != 0) return result;
+    output.* = .{ .create = @intFromPtr(&semaphoreCreate), .acquire = @intFromPtr(&semaphoreAcquire), .release = @intFromPtr(&semaphoreRelease), .destroy = @intFromPtr(&semaphoreDestroy), .status = @intFromPtr(&semaphoreStatus), .stats = @intFromPtr(&semaphoreStats), .context_flags = @intFromPtr(&semaphoreContextFlags) };
+    return outputs_contract.driver_semaphore_ok;
+}
+fn semaphoreCreate(initial: u32, maximum: u32, handle: *u64) callconv(.c) i32 {
+    handle.* = 0;
+    if (semaphoreContextFlags() & outputs_contract.driver_semaphore_context_sleepable == 0) return outputs_contract.driver_semaphore_error_context;
+    return driver_semaphores.create(runtimeOwner(), initial, maximum, handle);
+}
+fn semaphoreAcquire(handle: u64, timeout_ticks: u64) callconv(.c) i32 {
+    if (timeout_ticks != 0 and semaphoreContextFlags() & outputs_contract.driver_semaphore_context_sleepable == 0) return outputs_contract.driver_semaphore_error_context;
+    return driver_semaphores.acquire(runtimeOwner(), handle, timeout_ticks);
+}
+fn semaphoreRelease(handle: u64) callconv(.c) i32 {
+    return driver_semaphores.release(runtimeOwner(), handle);
+}
+fn semaphoreDestroy(handle: u64) callconv(.c) i32 {
+    if (semaphoreContextFlags() & outputs_contract.driver_semaphore_context_sleepable == 0) return outputs_contract.driver_semaphore_error_context;
+    return driver_semaphores.destroy(runtimeOwner(), handle);
+}
+fn semaphoreStatus(handle: u64, output: *outputs_contract.DriverSemaphoreStatus) callconv(.c) i32 {
+    return driver_semaphores.status(runtimeOwner(), handle, output);
+}
+fn semaphoreStats(output: *outputs_contract.DriverSemaphoreStats) callconv(.c) i32 {
+    return driver_semaphores.stats(runtimeOwner(), output);
 }
 fn threadQuery(output: *outputs_contract.DriverThreadApi) callconv(.c) i32 {
     if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverThreadApi)) return outputs_contract.driver_thread_error_invalid;

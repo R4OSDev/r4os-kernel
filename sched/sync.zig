@@ -627,7 +627,11 @@ pub const Semaphore = struct {
     fn finishUnguardedAcquire(result: WaitResult) WaitResult {
         if (result != .signaled) return result;
         var unwind: task_context.UnwindToken = .{};
-        if (claimHandoffGuard(&unwind)) _ = task_context.leaveUnwind(unwind);
+        if (claimHandoffGuard(&unwind)) {
+            const flags = interrupts.saveAndDisableRuntime();
+            defer interrupts.restore(flags);
+            if (!task_context.leaveUnwind(unwind)) unreachable;
+        }
         return result;
     }
 };

@@ -263,3 +263,27 @@ storage-callback identity projection also uses that boundary so parallel CPU
 callers can safely enforce the existing storage exclusion. Driver logs publish
 one bounded complete record with the actual callback owner. Legacy device and
 filesystem APIs gain no new parallel admission.
+
+DriverApi33 adds resident counting semaphores at offset 624 (total 632).
+kernel/driver_semaphores.zig binds dynamic records to actual R4D starts and
+uses the existing scheduler Semaphore/WaitQueue FIFO handoff. Allocation,
+free and parking occur outside runtime metadata sections. Wait leases and
+unwind lifetime guards retain backing across actual waits; failed free keeps
+the same record. There is no fixed semaphore slot pool.
+
+Zero timeout is an IRQ-safe try; release grants exactly one permit. Blocking
+operations require a sleep-capable task. Parent close refuses creation but
+never fabricates permits or cancels uninterruptible waits. Existing operations
+remain available for ordered shutdown. Generic cleanup follows IRQ/work/task
+quiescence and precedes DMA/CPU heap cleanup. Semaphore ownership is a counter,
+not Task mutex ownership: drivers must quiesce every user before destruction.
+The existing semaphore handoff guard is now also dropped under the runtime
+owner. No legacy PCI/backend API gains parallel admission.
+
+The semaphore contention guest exposed missing AP-to-BSP deadline notification:
+AP waits could publish an earlier deadline while the BSP slept against a
+later one-shot. scheduler.blockCurrent now sends the existing reschedule IPI
+to the BSP only for an earlier finite deadline, under the same publication
+owner. The existing STI/HLT-safe idle path rechecks the minimum and programs
+its own timer; APs never write the BSP timer. The regression retains its
+original five-second bound.
