@@ -230,3 +230,12 @@ completion retains ownership. An IRQ-safe, generation-bound notification
 mailbox can wake an idle native backend without acquiring BO metadata locks.
 MMIO UC mappings locate an actual PAT UC entry; the legacy boot-FB WC helper
 cannot change native BO cache policy.
+
+DriverApi30 adds an optional resident CPU heap for external R4Ds. Allocation
+and release use the existing kernel heap outside the runtime section that
+protects per-start metadata. Intrusive allocation records grow with actual
+backing and provide expected logarithmic handle lookup. Worker callbacks can
+use a cached table without joining the global driver lifecycle guard. Closing
+rejects new allocations; generic cleanup reclaims leftovers only after device
+callbacks, IRQ, work and DMA have quiesced. Failed release retains ownership
+and vetoes unload. The CPU addresses carry no DMA or GPU mapping promise.

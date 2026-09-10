@@ -31,10 +31,11 @@ const usb_host = @import("../driver/usb/host_controller.zig");
 const xhci = @import("../driver/usb/xhci.zig");
 const outputs_contract = @import("r4os_kernel_contract");
 const driver_resources = @import("driver_resources.zig");
+const driver_heap = @import("driver_heap.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 29: exact loaded-container resources after the unchanged v28 tail.
-pub const VERSION: u32 = 29;
+// Version 30: resident CPU heap after the unchanged v29 resource tail.
+pub const VERSION: u32 = 30;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -489,6 +490,11 @@ pub fn bindModuleResources(owner: u32, module_slot: usize) bool {
     const module = @import("modules.zig").entryAt(module_slot) orelse return false;
     if (module.kind != .r4d) return false;
     driver_resources.state.bind(owner, module_slot, module.generation) catch return false;
+    const binding = driver_resources.state.current(owner) catch unreachable;
+    if (!driver_heap.bind(owner, binding.epoch)) {
+        driver_resources.state.finish(owner);
+        return false;
+    }
     return true;
 }
 
@@ -525,6 +531,7 @@ pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
 
 pub fn beginOwnerShutdown(token: *OwnerCleanupToken) void {
     driver_resources.state.close(token.owner);
+    driver_heap.beginClose(token.owner);
     @import("../display/queue.zig").closingDriver(token.owner);
     gfx_memory.beginClose(token.owner);
     token.shutdown_started = true;
@@ -623,14 +630,23 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         return false;
     }
     const work_count = work_cleanup.removed;
-    driver_resources.state.finish(owner);
     const dma_count = cleanupDmaOwner(owner);
+    const cpu_cleanup = driver_heap.cleanup(owner);
+    if (!cpu_cleanup.quiesced) {
+        token.active = false;
+        bootlog.puts("[R4D] cleanup owner=");
+        bootlog.putDec(owner);
+        bootlog.puts(" cpu-heap=retained resources=quarantined\r\n");
+        return false;
+    }
+    driver_resources.state.finish(owner);
     gfx_memory.finishOwner(owner);
     token.active = false;
 
     if (irq_count == 0 and
         work_count == 0 and
         dma_count == 0 and
+        cpu_cleanup.released == 0 and
         msi_cleanup.removed == 0 and
         audio_count == 0 and
         storage_cleanup.removed == 0 and
@@ -640,27 +656,14 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     {
         return true;
     }
-    bootlog.puts("[R4D] cleanup owner=");
-    bootlog.putDec(owner);
-    bootlog.puts(" irq=");
-    bootlog.putDec(irq_count);
-    bootlog.puts(" work=");
-    bootlog.putDec(work_count);
-    bootlog.puts(" dma=");
-    bootlog.putDec(dma_count);
-    bootlog.puts(" msi=");
-    bootlog.putDec(msi_cleanup.removed);
-    bootlog.puts(" audio=");
-    bootlog.putDec(audio_count);
-    bootlog.puts(" storage=");
-    bootlog.putDec(storage_cleanup.removed);
-    bootlog.puts(" usb-host=");
-    bootlog.putDec(usb_host_cleanup.removed);
-    bootlog.puts(" display-blit=");
-    bootlog.putDec(display_blit_count);
-    bootlog.puts(" net=");
-    bootlog.putDec(net_cleanup.removed);
-    bootlog.puts("\r\n");
+    // Name ties the generic owner result to the driver's diagnostic records.
+    // Publish one complete bounded line so concurrent log writers cannot
+    // splice a different driver's text into the release accounting.
+    const entry = @import("../driver/registry.zig").get(owner - 1);
+    const name = if (entry) |*item| item.name[0..item.name_len] else "unknown";
+    var message: [512]u8 = undefined;
+    const line = std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} irq={d} work={d} dma={d} cpu-heap={d} cpu-bytes={d} msi={d} audio={d} storage={d} usb-host={d} display-blit={d} net={d} name={s} result=complete\r\n", .{ owner, irq_count, work_count, dma_count, cpu_cleanup.released, cpu_cleanup.bytes, msi_cleanup.removed, audio_count, storage_cleanup.removed, usb_host_cleanup.removed, display_blit_count, net_cleanup.removed, name }) catch unreachable;
+    bootlog.puts(line);
     return true;
 }
 
@@ -797,7 +800,14 @@ pub const Table = extern struct {
     gfx_output_query: *const fn (*outputs_contract.GfxDriverOutputApi) callconv(.c) i32,
     gfx_display_query: *const fn (*outputs_contract.GfxDriverDisplayApi) callconv(.c) i32,
     resource_query: *const fn (*outputs_contract.DriverResourceApi) callconv(.c) i32,
+    heap_query: *const fn (*outputs_contract.DriverHeapApi) callconv(.c) i32,
 };
+
+comptime {
+    if (VERSION != outputs_contract.driver_api_version or @offsetOf(Table, "resource_query") != 592 or
+        @offsetOf(Table, "heap_query") != 600 or @sizeOf(Table) != 608)
+        @compileError("DriverApi append-only v30 layout drift");
+}
 
 pub var table = Table{
     .magic = MAGIC,
@@ -807,6 +817,7 @@ pub var table = Table{
     .gfx_output_query = gfxOutputQuery,
     .gfx_display_query = gfxDisplayQuery,
     .resource_query = resourceQuery,
+    .heap_query = heapQuery,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -3013,6 +3024,29 @@ fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
 }
 
 const gfx_queue_api = @import("gfx_driver_queue.zig");
+fn heapOwner() u32 {
+    if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return 0;
+    return activeOwner();
+}
+fn heapQuery(output: *outputs_contract.DriverHeapApi) callconv(.c) i32 {
+    if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverHeapApi)) return outputs_contract.driver_heap_error_invalid;
+    output.* = .{};
+    const owner = heapOwner();
+    if (owner == 0) return outputs_contract.driver_heap_error_owner;
+    const result = driver_heap.query(owner);
+    if (result != outputs_contract.driver_heap_ok) return result;
+    output.* = .{ .allocate = @intFromPtr(&heapAllocate), .release = @intFromPtr(&heapRelease), .stats = @intFromPtr(&heapStats) };
+    return outputs_contract.driver_heap_ok;
+}
+fn heapAllocate(bytes: u64, alignment: u32, output: *outputs_contract.DriverHeapAllocation) callconv(.c) i32 {
+    return driver_heap.allocate(heapOwner(), bytes, alignment, output);
+}
+fn heapRelease(handle: u64) callconv(.c) i32 {
+    return driver_heap.release(heapOwner(), handle);
+}
+fn heapStats(output: *outputs_contract.DriverHeapStats) callconv(.c) i32 {
+    return driver_heap.stats(heapOwner(), output);
+}
 // Work callbacks already carry an authenticated owner, but must join the
 // lifecycle guard before resource I/O. Never wait here: another owner may
 // itself be waiting for this worker. The caller can reschedule on BUSY.
