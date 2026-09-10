@@ -255,8 +255,8 @@ pub fn build(b: *std.Build) void {
         b,
         test_step,
         contract,
-        "Tests/Fixture/ProviderMissingFieldNegative.zig",
-        "missing struct field",
+        "Tests/Fixture/ProviderUnknownFieldNegative.zig",
+        "no field named",
     );
 }
 

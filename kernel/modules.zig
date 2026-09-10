@@ -34,6 +34,7 @@ const R4M_VERSION: u16 = 1;
 const ARCH_X86_64: u16 = 1;
 
 const R4M_SECTION_FLAG_BSS: u32 = 0x00000008;
+const R4M_SECTION_FLAG_ALLOC: u32 = 0x00000001;
 const R4M_SECTION_FLAG_EXEC: u32 = 0x00000002;
 const R4M_RELOC_ABS64: u32 = 1;
 const R4M_RELOC_REL32: u32 = 2;
@@ -886,7 +887,7 @@ pub fn exportInfo(slot: usize, symbol: []const u8, min_version: u32) ?ExportInfo
     };
     if (exp.section_index >= entries[slot].section_count or exp.section_index >= entries[slot].sections.len) return null;
     const section = entries[slot].sections[@intCast(exp.section_index)];
-    if (!section.used or exp.section_offset >= section.mem_size) return null;
+    if (!section.used or (section.flags & R4M_SECTION_FLAG_ALLOC) == 0 or exp.section_offset >= section.mem_size) return null;
     return .{
         .address = exp.address,
         .version = exp.version,
@@ -910,7 +911,7 @@ pub fn isExecutableAddress(module_slot: u8, generation: u32, address: u64) bool 
 
     const section_count: usize = @min(@as(usize, @intCast(entry.section_count)), entry.sections.len);
     for (entry.sections[0..section_count]) |section| {
-        if (!section.used or (section.flags & R4M_SECTION_FLAG_EXEC) == 0 or section.mem_size == 0) continue;
+        if (!section.used or (section.flags & (R4M_SECTION_FLAG_ALLOC | R4M_SECTION_FLAG_EXEC)) != (R4M_SECTION_FLAG_ALLOC | R4M_SECTION_FLAG_EXEC) or section.mem_size == 0) continue;
         const end = section.runtime_base +% @as(u64, section.mem_size);
         if (end < section.runtime_base) continue;
         if (address >= section.runtime_base and address < end) return true;
@@ -1043,7 +1044,8 @@ fn loadR4MFile(load: *PreparedLoad, source: module_file.FileSource, tables: *con
         const dst_off = section_offsets[i];
         const mem_size: usize = @intCast(sh.mem_size);
         const file_bytes: usize = @intCast(sh.file_size);
-        if (file_bytes != 0 and !module_file.readExact(.{
+        const loadable = sectionLoadable(sh);
+        if (loadable and file_bytes != 0 and !module_file.readExact(.{
             .source = source,
             .offset = @intCast(sh.file_off),
             .out = image[dst_off .. dst_off + file_bytes],
@@ -1051,7 +1053,7 @@ fn loadR4MFile(load: *PreparedLoad, source: module_file.FileSource, tables: *con
         })) {
             return false;
         }
-        if ((sh.flags & R4M_SECTION_FLAG_BSS) != 0 and !rangeIsZero(image[dst_off .. dst_off + mem_size])) {
+        if (loadable and (sh.flags & R4M_SECTION_FLAG_BSS) != 0 and !rangeIsZero(image[dst_off .. dst_off + mem_size])) {
             bss_zeroed = false;
         }
         sections[i] = .{
@@ -1063,7 +1065,7 @@ fn loadR4MFile(load: *PreparedLoad, source: module_file.FileSource, tables: *con
             .mem_size = sh.mem_size,
             .alignment = sh.alignment,
             .runtime_offset = dst_off,
-            .runtime_base = @intFromPtr(image.ptr) + @as(u64, @intCast(dst_off)),
+            .runtime_base = if (loadable) @intFromPtr(image.ptr) + @as(u64, @intCast(dst_off)) else 0,
         };
     }
 
@@ -1170,11 +1172,12 @@ fn loadR4M(load: *PreparedLoad, bytes: []const u8, expected_kind: Kind, fallback
         const dst_off = section_offsets[i];
         const mem_size: usize = @intCast(sh.mem_size);
         const file_size: usize = @intCast(sh.file_size);
-        if (file_size != 0) {
+        const loadable = sectionLoadable(sh);
+        if (loadable and file_size != 0) {
             const src_off: usize = @intCast(sh.file_off);
             @memcpy(image[dst_off .. dst_off + file_size], bytes[src_off .. src_off + file_size]);
         }
-        if ((sh.flags & R4M_SECTION_FLAG_BSS) != 0 and !rangeIsZero(image[dst_off .. dst_off + mem_size])) {
+        if (loadable and (sh.flags & R4M_SECTION_FLAG_BSS) != 0 and !rangeIsZero(image[dst_off .. dst_off + mem_size])) {
             bss_zeroed = false;
         }
         sections[i] = .{
@@ -1186,7 +1189,7 @@ fn loadR4M(load: *PreparedLoad, bytes: []const u8, expected_kind: Kind, fallback
             .mem_size = sh.mem_size,
             .alignment = sh.alignment,
             .runtime_offset = dst_off,
-            .runtime_base = @intFromPtr(image.ptr) + @as(u64, @intCast(dst_off)),
+            .runtime_base = if (loadable) @intFromPtr(image.ptr) + @as(u64, @intCast(dst_off)) else 0,
         };
     }
 
@@ -1296,6 +1299,28 @@ fn readSections(header: Header, bytes: []const u8, out: []SectionHeader) bool {
             .alignment = alignment,
         };
     }
+    return validateSectionKinds(out[0..@intCast(header.section_count)], header.kind() orelse return false);
+}
+
+fn sectionLoadable(section: SectionHeader) bool {
+    return (section.flags & R4M_SECTION_FLAG_ALLOC) != 0;
+}
+
+// R4M0 resources belong to the module file, never the executable image.
+// Both disk and preloaded-byte admission use this same section policy.
+fn validateSectionKinds(sections: []const SectionHeader, kind: Kind) bool {
+    var resources_seen = false;
+    for (sections) |section| {
+        const is_resource = memEql(section.name[0..section.name_len], ".rsrc");
+        if (sectionLoadable(section)) {
+            if (is_resource) return false;
+            continue;
+        }
+        if (kind == .r4l or resources_seen or !is_resource or section.flags != 0 or
+            section.alignment != 16 or (section.file_off & 15) != 0 or
+            section.file_size == 0 or section.mem_size != section.file_size) return false;
+        resources_seen = true;
+    }
     return true;
 }
 
@@ -1314,7 +1339,7 @@ fn readValidatedFileTables(reader: *module_r4m.Reader, tables: *ValidatedFileTab
     while (entry_index < header.entry_count) : (entry_index += 1) {
         const entry = reader.readEntryRecord(header, entry_index, "r4m-entry-table", true) orelse return false;
         if (entry.section >= sections.len) return false;
-        if (entry.offset >= sections[@intCast(entry.section)].mem_size) return false;
+        if (!sectionLoadable(sections[@intCast(entry.section)]) or entry.offset >= sections[@intCast(entry.section)].mem_size) return false;
     }
 
     var import_index: usize = 0;
@@ -1354,7 +1379,7 @@ fn readValidatedFileTables(reader: *module_r4m.Reader, tables: *ValidatedFileTab
             k.puts("\r\n");
             return false;
         }
-        if (record.section >= sections.len or record.offset >= sections[@intCast(record.section)].mem_size) return false;
+        if (record.section >= sections.len or !sectionLoadable(sections[@intCast(record.section)]) or record.offset >= sections[@intCast(record.section)].mem_size) return false;
         var prior_index: usize = 0;
         while (prior_index < export_index) : (prior_index += 1) {
             const prior = &tables.exports[prior_index];
@@ -1405,7 +1430,7 @@ fn readSectionsFromReader(reader: *module_r4m.Reader, file_size: usize, header: 
             .alignment = record.alignment,
         };
     }
-    return true;
+    return validateSectionKinds(out[0..@intCast(header.section_count)], header.kind() orelse return false);
 }
 
 fn validateLoadedExportsFromTables(
@@ -1556,6 +1581,10 @@ fn interfaceMajorFromName(name: []const u8) ?u16 {
 fn layoutSections(sections: []const SectionHeader, section_offsets: []usize) ?usize {
     var cursor: usize = 0;
     for (sections, 0..) |section, index| {
+        if (!sectionLoadable(section)) {
+            section_offsets[index] = 0;
+            continue;
+        }
         const section_align = if (section.alignment > PAGE_SIZE) @as(usize, @intCast(section.alignment)) else PAGE_SIZE;
         cursor = alignForward(cursor, section_align);
         section_offsets[index] = cursor;
@@ -1710,6 +1739,7 @@ fn patchSlice(reloc: Relocation, sections: []const SectionHeader, section_offset
     if (reloc.patch_section >= sections.len) return null;
     const size = relocationPatchSize(reloc.kind);
     const section = sections[@intCast(reloc.patch_section)];
+    if (!sectionLoadable(section)) return null;
     if (reloc.patch_offset > section.mem_size or size > section.mem_size - reloc.patch_offset) return null;
     const off = section_offsets[@intCast(reloc.patch_section)] + @as(usize, @intCast(reloc.patch_offset));
     if (off > image.len or size > image.len - off) return null;
@@ -1719,6 +1749,7 @@ fn patchSlice(reloc: Relocation, sections: []const SectionHeader, section_offset
 fn targetAddress(reloc: Relocation, sections: []const SectionHeader, section_offsets: []const usize, image_base: u64) ?u64 {
     if (reloc.target_section >= sections.len) return null;
     const section = sections[@intCast(reloc.target_section)];
+    if (!sectionLoadable(section)) return null;
     if (reloc.target_offset >= section.mem_size) return null;
     return image_base + @as(u64, @intCast(section_offsets[@intCast(reloc.target_section)])) + reloc.target_offset;
 }
@@ -1772,7 +1803,7 @@ fn validateEntries(header: Header, bytes: []const u8) bool {
     var i: usize = 0;
     while (i < header.section_count) : (i += 1) {
         const off = @as(usize, @intCast(header.section_off)) + i * R4M_SECTION_SIZE;
-        section_sizes[i] = readLe32(bytes[off + 20 .. off + 24]);
+        section_sizes[i] = if ((readLe32(bytes[off + 8 .. off + 12]) & R4M_SECTION_FLAG_ALLOC) == 0) 0 else readLe32(bytes[off + 20 .. off + 24]);
     }
     i = 0;
     while (i < header.entry_count) : (i += 1) {
@@ -1804,7 +1835,7 @@ fn validateExports(header: Header, bytes: []const u8) bool {
     var i: usize = 0;
     while (i < header.section_count) : (i += 1) {
         const off = @as(usize, @intCast(header.section_off)) + i * R4M_SECTION_SIZE;
-        section_sizes[i] = readLe32(bytes[off + 20 .. off + 24]);
+        section_sizes[i] = if ((readLe32(bytes[off + 8 .. off + 12]) & R4M_SECTION_FLAG_ALLOC) == 0) 0 else readLe32(bytes[off + 20 .. off + 24]);
     }
     i = 0;
     while (i < header.export_count) : (i += 1) {
@@ -1836,7 +1867,7 @@ fn fillExports(e: *Entry, bytes: []const u8, header: Header) void {
         const version = readLe32(bytes[off + 12 .. off + 16]);
         if (section_index >= e.section_count or section_index >= e.sections.len) continue;
         const section = &e.sections[@intCast(section_index)];
-        if (!section.used or section_offset >= section.mem_size) continue;
+        if (!section.used or (section.flags & R4M_SECTION_FLAG_ALLOC) == 0 or section_offset >= section.mem_size) continue;
 
         e.exports[i] = .{
             .used = true,
@@ -1855,7 +1886,7 @@ fn fillExportsFromTables(e: *Entry, tables: *const ValidatedFileTables) void {
         const planned = &tables.exports[i];
         if (planned.section_index >= e.section_count or planned.section_index >= e.sections.len) continue;
         const section = &e.sections[@intCast(planned.section_index)];
-        if (!section.used or planned.section_offset >= section.mem_size) continue;
+        if (!section.used or (section.flags & R4M_SECTION_FLAG_ALLOC) == 0 or planned.section_offset >= section.mem_size) continue;
 
         e.exports[i] = .{
             .used = true,
@@ -2101,6 +2132,86 @@ fn upper(c: u8) u8 {
     return c;
 }
 
+test "R4D resources do not consume executable image memory or relocation addresses" {
+    const std = @import("std");
+    const testing = std.testing;
+    const code = SectionHeader{ .name = ".text\x00\x00\x00".*, .name_len = 5, .flags = 3, .file_off = 256, .file_size = 16, .mem_size = 16, .alignment = 16 };
+    const resource = SectionHeader{ .name = ".rsrc\x00\x00\x00".*, .name_len = 5, .flags = 0, .file_off = 512, .file_size = 64 * 1024 * 1024, .mem_size = 64 * 1024 * 1024, .alignment = 16 };
+    const data = SectionHeader{ .name = ".data\x00\x00\x00".*, .name_len = 5, .flags = 5, .file_off = 272, .file_size = 16, .mem_size = 16, .alignment = 16 };
+    var sections = [_]SectionHeader{ code, resource, data };
+    var offsets: [3]usize = undefined;
+    try testing.expect(validateSectionKinds(&sections, .r4d));
+    try testing.expect(validateSectionKinds(&sections, .r4p));
+    try testing.expect(!validateSectionKinds(&sections, .r4l));
+    try testing.expectEqual(@as(?usize, 8192), layoutSections(&sections, &offsets));
+    try testing.expectEqualSlices(usize, &.{ 0, 0, 4096 }, &offsets);
+    var image: [8192]u8 = .{0xa5} ** 8192;
+    var relocation = Relocation{ .kind = R4M_RELOC_ABS64, .patch_section = 0, .patch_offset = 0, .target_section = 1, .target_offset = 0, .addend = 0 };
+    try testing.expectEqual(RelocApplyResult.bad_range, applyRelocation(relocation, &sections, &offsets, &image, &.{}));
+    relocation.patch_section = 1;
+    relocation.target_section = 0;
+    try testing.expectEqual(RelocApplyResult.bad_range, applyRelocation(relocation, &sections, &offsets, &image, &.{}));
+    for (image) |byte| try testing.expectEqual(@as(u8, 0xa5), byte);
+    relocation.patch_section = 2;
+    try testing.expectEqual(RelocApplyResult.ok, applyRelocation(relocation, &sections, &offsets, &image, &.{}));
+    try testing.expectEqual(@intFromPtr(&image), readLe64(image[4096..4104]));
+    sections[2] = resource;
+    try testing.expect(!validateSectionKinds(&sections, .r4d));
+    sections[2] = data;
+    inline for (.{ @as(u32, 1), @as(u32, 2), @as(u32, 8) }) |flags| {
+        sections[1].flags = flags;
+        try testing.expect(!validateSectionKinds(&sections, .r4d));
+    }
+    sections[1] = resource;
+    sections[1].alignment = 8;
+    try testing.expect(!validateSectionKinds(&sections, .r4d));
+    sections[1] = resource;
+    sections[1].file_off += 1;
+    try testing.expect(!validateSectionKinds(&sections, .r4d));
+    sections[1] = resource;
+    sections[1].name = ".other\x00\x00".*;
+    sections[1].name_len = 6;
+    try testing.expect(!validateSectionKinds(&sections, .r4d));
+}
+
+test "R4D byte admission rejects entries and exports into file resources" {
+    const std = @import("std");
+    const testing = std.testing;
+    var bytes = [_]u8{0} ** 1024;
+    var header = std.mem.zeroes(Header);
+    header.kind_raw = @intFromEnum(Kind.r4d);
+    header.section_off = 64;
+    header.section_count = 2;
+    header.entry_off = 128;
+    header.entry_count = 1;
+    header.export_off = 144;
+    header.export_count = 1;
+    @memcpy(bytes[64..69], ".text");
+    writeLe32(bytes[72..76], 3);
+    writeLe32(bytes[76..80], 256);
+    writeLe32(bytes[80..84], 16);
+    writeLe32(bytes[84..88], 16);
+    writeLe32(bytes[88..92], 16);
+    @memcpy(bytes[96..101], ".rsrc");
+    writeLe32(bytes[108..112], 512);
+    writeLe32(bytes[112..116], 32);
+    writeLe32(bytes[116..120], 32);
+    writeLe32(bytes[120..124], 16);
+    writeLe32(bytes[144..148], 192);
+    writeLe32(bytes[156..160], 1);
+    @memcpy(bytes[192..202], "DriverInit");
+    var sections: [2]SectionHeader = undefined;
+    try testing.expect(readSections(header, &bytes, &sections));
+    try testing.expect(validateEntries(header, &bytes));
+    try testing.expect(validateExports(header, &bytes));
+    writeLe32(bytes[132..136], 1);
+    writeLe32(bytes[148..152], 1);
+    try testing.expect(!validateEntries(header, &bytes));
+    try testing.expect(!validateExports(header, &bytes));
+    header.kind_raw = @intFromEnum(Kind.r4l);
+    try testing.expect(!readSections(header, &bytes, &sections));
+}
+
 test "Runtime-R4L identity parser fails closed" {
     const testing = @import("std").testing;
 
@@ -2174,7 +2285,7 @@ test "Runtime-R4L executable ownership is exact and generation safe" {
     };
     entries[slot].sections[0] = .{
         .used = true,
-        .flags = R4M_SECTION_FLAG_EXEC,
+        .flags = R4M_SECTION_FLAG_ALLOC | R4M_SECTION_FLAG_EXEC,
         .mem_size = 0x40,
         .runtime_base = 0x1000,
     };
@@ -2186,7 +2297,7 @@ test "Runtime-R4L executable ownership is exact and generation safe" {
     };
     entries[slot].sections[2] = .{
         .used = true,
-        .flags = R4M_SECTION_FLAG_EXEC,
+        .flags = R4M_SECTION_FLAG_ALLOC | R4M_SECTION_FLAG_EXEC,
         .mem_size = 0x40,
         .runtime_base = std.math.maxInt(u64) - 0x1f,
     };
