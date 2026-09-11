@@ -65,6 +65,17 @@ pub fn currentOwner() u32 {
     return record.owner;
 }
 
+// Pure admission for posting normal serialized Work from this exact Task.
+// This does not admit PCI, MMIO or DMA in the dedicated callback. Its active
+// execution lifetime also retains an in-flight enqueue through owner close.
+pub fn currentWorkOwner() u32 {
+    const flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(flags);
+    const record = currentRecordLocked() orelse return 0;
+    const owner = state.stats(record.owner) catch return 0;
+    return if (owner.epoch == record.epoch and !owner.closing and !record.stop_requested) record.owner else 0;
+}
+
 pub fn current(owner: u32) u64 {
     const flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(flags);

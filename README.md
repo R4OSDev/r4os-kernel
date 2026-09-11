@@ -1,5 +1,11 @@
 ﻿# R4OS Kernel
 
+Kernel 0.1.152 advertises DriverApi35 without changing its 648-byte layout.
+A live dedicated driver Task can post normal serialized Work with its exact
+owner and epoch; stopped or closing Tasks are rejected. Direct hardware APIs
+remain restricted to their existing contexts. The existing NVIDIA SMP4
+runtime probe checks the worker handoff and rejection during parent close.
+
 Kernel 0.1.151 includes display drivers in the warm-reset handoff. It drains
 presentation before driver shutdown, keeps output admission closed through
 restoration, and requires released graphics ownership and stopped callbacks.

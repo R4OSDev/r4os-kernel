@@ -37,8 +37,8 @@ const driver_threads = @import("driver_threads.zig");
 const driver_semaphores = @import("driver_semaphores.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
-// Version 30: resident CPU heap after the unchanged v29 resource tail.
-pub const VERSION: u32 = 34;
+// Version 35: owned Task-to-Work admission, unchanged v34 table layout.
+pub const VERSION: u32 = 35;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -878,7 +878,7 @@ comptime {
         @offsetOf(Table, "heap_query") != 600 or @offsetOf(Table, "monotonic_clock") != 608 or
         @offsetOf(Table, "thread_query") != 616 or @offsetOf(Table, "semaphore_query") != 624 or
         @offsetOf(Table, "dma_sync_range_for_device") != 632 or @offsetOf(Table, "dma_sync_range_for_cpu") != 640 or @sizeOf(Table) != 648)
-        @compileError("DriverApi append-only v34 layout drift");
+        @compileError("DriverApi v35 unchanged v34 layout drift");
 }
 
 pub var table = Table{
@@ -1441,6 +1441,16 @@ fn irqStats(irq: u8, out: *IrqStats) callconv(.c) i32 {
 }
 
 fn driverWorkSubmit(handler: DriverWorkHandler, context: usize, flags: u32, out_handle: *u32) callconv(.c) i32 {
+    // An interrupt/storage callback can run above a dedicated Task. Keep
+    // that actual callback's existing owner; never borrow the interrupted
+    // Task's identity or apply its stop/close state to another driver's IRQ.
+    if (!irq_router.inDispatch() and currentStorageCallbackOwner() == 0 and driver_threads.currentOwner() != 0) {
+        out_handle.* = 0;
+        if (flags != 0) return -3; // A dedicated task is never an IRQ producer.
+        const owner = driver_threads.currentWorkOwner();
+        if (owner == 0) return outputs_contract.driver_thread_error_closed;
+        return driver_work.submit(owner, handler, context, flags, out_handle);
+    }
     return driver_work.submit(activeOwner(), handler, context, flags, out_handle);
 }
 
@@ -1480,9 +1490,10 @@ fn activeOwner() u32 {
     return 0;
 }
 
-// Dedicated tasks currently admit only the audited CPU heap, clock and
-// thread and semaphore services. Do not silently extend legacy PCI/DMA/backend entrypoints
-// to parallel callers by changing activeOwner's admission contract.
+// Dedicated tasks admit the audited CPU heap, clock, thread and semaphore
+// services, plus the explicit normal-Work submission bridge above. Do not
+// extend legacy PCI/DMA/backend entrypoints to parallel callers by changing
+// activeOwner's admission contract.
 fn runtimeOwner() u32 {
     if (irq_router.inDispatch()) return irq_router.currentOwner();
     const storage_owner = currentStorageCallbackOwner();
