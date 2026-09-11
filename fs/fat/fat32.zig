@@ -4,6 +4,7 @@ const scheduler = @import("../../sched/scheduler.zig");
 const timer = @import("../../kernel/timer.zig");
 const time_core = @import("../../platform/time.zig");
 const block = @import("../../storage/block.zig");
+const directory_growth = @import("directory_growth.zig");
 
 const SECTOR_SIZE: usize = 512;
 pub const ATTR_READ_ONLY: u8 = 0x01;
@@ -1838,43 +1839,48 @@ pub fn setAttributes(original_volume: Volume, parent_cluster: u32, name: []const
 
 fn listDirectoryCluster(volume: Volume, start_cluster: u32, max_entries: usize) bool {
     var printed: usize = 0;
+    var lfn_state: LfnState = .{};
+    var ended = false;
     var chain = DirChainIterator.init(volume, start_cluster);
     while (chain.next()) |cluster| {
         if (chain.fat_error) return false;
-        if (!listDirectorySectorRange(volume, cluster, &printed, max_entries)) return false;
-        if (printed >= max_entries) return true;
+        if (!listDirectorySectorRange(volume, cluster, &printed, max_entries, &lfn_state, &ended)) return false;
+        if (ended or printed >= max_entries) return true;
     }
-    if (chain.fat_error) return false;
+    if (chain.fat_error or lfn_state.active) return false;
 
     return true;
 }
 
 fn readDirectoryCluster(volume: Volume, start_cluster: u32, out: []u8, cursor: *usize, max_entries: usize) bool {
     var copied: usize = 0;
+    var lfn_state: LfnState = .{};
+    var ended = false;
     var chain = DirChainIterator.init(volume, start_cluster);
     while (chain.next()) |cluster| {
         if (chain.fat_error) return false;
-        if (!readDirectorySectorRange(volume, cluster, out, cursor, &copied, max_entries)) return false;
-        if (copied >= max_entries) return true;
+        if (!readDirectorySectorRange(volume, cluster, out, cursor, &copied, max_entries, &lfn_state, &ended)) return false;
+        if (ended or copied >= max_entries) return true;
     }
-    if (chain.fat_error) return false;
+    if (chain.fat_error or lfn_state.active) return false;
 
     return true;
 }
 
 fn readDirectoryEntryClusterStatus(volume: Volume, start_cluster: u32, wanted: usize, out: []u8, entry_out: *Entry) LookupStatus {
     var seen: usize = 0;
+    var lfn_state: LfnState = .{};
     var chain = DirChainIterator.init(volume, start_cluster);
     while (chain.next()) |cluster| {
         if (chain.fat_error) return .io;
-        switch (readDirectoryEntrySectorRangeStatus(volume, cluster, wanted, &seen, out, entry_out)) {
+        switch (readDirectoryEntrySectorRangeStatus(volume, cluster, wanted, &seen, out, entry_out, &lfn_state)) {
             .found => return .found,
             .next_cluster => {},
             .end_directory => return .not_found,
             .io => return .io,
         }
     }
-    return if (chain.fat_error) .io else .not_found;
+    return if (chain.fat_error or lfn_state.active) .io else .not_found;
 }
 
 const ClusterLookupStatus = enum(u8) {
@@ -2119,11 +2125,9 @@ fn findEntryLocationStatus(volume: Volume, start_cluster: u32, name: []const u8,
     return if (chain.fat_error or lfn_state.active) .io else .not_found;
 }
 
-fn listDirectorySectorRange(volume: Volume, cluster: u32, printed: *usize, max_entries: usize) bool {
+fn listDirectorySectorRange(volume: Volume, cluster: u32, printed: *usize, max_entries: usize, lfn_state: *LfnState, ended: *bool) bool {
     stats.dir_scans +%= 1;
     var sector: [SECTOR_SIZE]u8 = undefined;
-    var lfn: [NAME_UNITS_MAX]u16 = .{0} ** NAME_UNITS_MAX;
-    var lfn_len: usize = 0;
     var i: u8 = 0;
     var coop_steps: u32 = 0;
     while (i < volume.sectors_per_cluster) : (i += 1) {
@@ -2135,22 +2139,27 @@ fn listDirectorySectorRange(volume: Volume, cluster: u32, printed: *usize, max_e
             stats.dir_entries_scanned +%= 1;
             cooperate(&coop_steps);
             const entry = sector[off .. off + 32];
-            if (entry[0] == 0x00) return true;
+            if (entry[0] == 0x00) {
+                lfn_state.reset();
+                ended.* = true;
+                return true;
+            }
             if (entry[0] == 0xE5) {
-                lfn_len = 0;
+                lfn_state.reset();
                 continue;
             }
             if (entry[11] == ATTR_LONG_NAME) {
-                readLfnEntry(entry, &lfn, &lfn_len);
+                if (!lfn_state.consume(entry)) return false;
                 continue;
             }
             if ((entry[11] & 0x08) != 0) {
-                lfn_len = 0;
+                if (lfn_state.active) return false;
                 continue;
             }
 
-            const parsed = makeEntry(entry, &lfn, lfn_len, lba, @intCast(off));
-            lfn_len = 0;
+            if (lfn_state.active and !lfn_state.completeFor(entry)) return false;
+            const parsed = makeEntry(entry, &lfn_state.units, lfn_state.len, lba, @intCast(off));
+            lfn_state.reset();
             printEntry(parsed);
             printed.* += 1;
             if (printed.* >= max_entries) return true;
@@ -2159,11 +2168,9 @@ fn listDirectorySectorRange(volume: Volume, cluster: u32, printed: *usize, max_e
     return true;
 }
 
-fn readDirectorySectorRange(volume: Volume, cluster: u32, out: []u8, cursor: *usize, copied: *usize, max_entries: usize) bool {
+fn readDirectorySectorRange(volume: Volume, cluster: u32, out: []u8, cursor: *usize, copied: *usize, max_entries: usize, lfn_state: *LfnState, ended: *bool) bool {
     stats.dir_scans +%= 1;
     var sector: [SECTOR_SIZE]u8 = undefined;
-    var lfn: [NAME_UNITS_MAX]u16 = .{0} ** NAME_UNITS_MAX;
-    var lfn_len: usize = 0;
     var i: u8 = 0;
     var coop_steps: u32 = 0;
     while (i < volume.sectors_per_cluster) : (i += 1) {
@@ -2175,22 +2182,27 @@ fn readDirectorySectorRange(volume: Volume, cluster: u32, out: []u8, cursor: *us
             stats.dir_entries_scanned +%= 1;
             cooperate(&coop_steps);
             const raw = sector[off .. off + 32];
-            if (raw[0] == 0x00) return true;
+            if (raw[0] == 0x00) {
+                lfn_state.reset();
+                ended.* = true;
+                return true;
+            }
             if (raw[0] == 0xE5) {
-                lfn_len = 0;
+                lfn_state.reset();
                 continue;
             }
             if (raw[11] == ATTR_LONG_NAME) {
-                readLfnEntry(raw, &lfn, &lfn_len);
+                if (!lfn_state.consume(raw)) return false;
                 continue;
             }
             if (raw[0] == '.' or (raw[11] & 0x08) != 0) {
-                lfn_len = 0;
+                if (lfn_state.active) return false;
                 continue;
             }
 
-            const parsed = makeEntry(raw, &lfn, lfn_len, lba, @intCast(off));
-            lfn_len = 0;
+            if (lfn_state.active and !lfn_state.completeFor(raw)) return false;
+            const parsed = makeEntry(raw, &lfn_state.units, lfn_state.len, lba, @intCast(off));
+            lfn_state.reset();
             if (!appendDirectoryEntry(out, cursor, parsed)) return false;
             copied.* += 1;
             if (copied.* >= max_entries) return true;
@@ -2206,11 +2218,10 @@ fn readDirectoryEntrySectorRangeStatus(
     seen: *usize,
     out: []u8,
     entry_out: *Entry,
+    lfn_state: *LfnState,
 ) ClusterLookupStatus {
     stats.dir_scans +%= 1;
     var sector: [SECTOR_SIZE]u8 = undefined;
-    var lfn: [NAME_UNITS_MAX]u16 = .{0} ** NAME_UNITS_MAX;
-    var lfn_len: usize = 0;
     var i: u8 = 0;
     var coop_steps: u32 = 0;
     while (i < volume.sectors_per_cluster) : (i += 1) {
@@ -2222,22 +2233,26 @@ fn readDirectoryEntrySectorRangeStatus(
             stats.dir_entries_scanned +%= 1;
             cooperate(&coop_steps);
             const raw = sector[off .. off + 32];
-            if (raw[0] == 0x00) return .end_directory;
+            if (raw[0] == 0x00) {
+                lfn_state.reset();
+                return .end_directory;
+            }
             if (raw[0] == 0xE5) {
-                lfn_len = 0;
+                lfn_state.reset();
                 continue;
             }
             if (raw[11] == ATTR_LONG_NAME) {
-                readLfnEntry(raw, &lfn, &lfn_len);
+                if (!lfn_state.consume(raw)) return .io;
                 continue;
             }
             if (raw[0] == '.' or (raw[11] & 0x08) != 0) {
-                lfn_len = 0;
+                if (lfn_state.active) return .io;
                 continue;
             }
 
-            const parsed = makeEntry(raw, &lfn, lfn_len, lba, @intCast(off));
-            lfn_len = 0;
+            if (lfn_state.active and !lfn_state.completeFor(raw)) return .io;
+            const parsed = makeEntry(raw, &lfn_state.units, lfn_state.len, lba, @intCast(off));
+            lfn_state.reset();
             if (seen.* == wanted) {
                 if (!copyEntryName(out, parsed)) return .io;
                 entry_out.* = parsed;
@@ -2358,23 +2373,6 @@ fn shortNameToBuffer(raw: []const u8, out: []u8) usize {
     return len;
 }
 
-fn readLfnEntry(raw: []const u8, out: *[NAME_UNITS_MAX]u16, len: *usize) void {
-    const seq = raw[0] & 0x1F;
-    if (seq == 0) return;
-    const start = @as(usize, seq - 1) * 13;
-    const slots = [_]usize{ 1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30 };
-    var i: usize = 0;
-    while (i < slots.len) : (i += 1) {
-        const ch = readLe16(raw[slots[i]..][0..2]);
-        if (ch == 0x0000 or ch == 0xFFFF) break;
-        const dst = start + i;
-        if (dst < out.len) {
-            out[dst] = ch;
-            if (dst + 1 > len.*) len.* = dst + 1;
-        }
-    }
-}
-
 // ---------------------------------------------------------------------------
 // UTF-8 <-> UTF-16 for long names (0.60.18): FAT LFN entries store UTF-16
 // units on disk; the VFS/API side speaks UTF-8 (BMP).  Malformed UTF-8,
@@ -2458,34 +2456,8 @@ fn min3(a: usize, b: usize, c: usize) usize {
 }
 
 fn writeDirectoryEntry(volume: Volume, directory_cluster: u32, raw_entry: []const u8) bool {
-    stats.dir_scans +%= 1;
-    var lfn_guard = DirectoryLfnGuard{};
-    var coop_steps: u32 = 0;
-    var chain = DirChainIterator.init(volume, directory_cluster);
-    while (chain.next()) |cluster| {
-        if (chain.fat_error) return false;
-        var sector: [SECTOR_SIZE]u8 = undefined;
-        var i: u8 = 0;
-        while (i < volume.sectors_per_cluster) : (i += 1) {
-            const lba = volume.clusterLba(cluster) + i;
-            if (!readSector(volume.device_index, lba, 1, sector[0..])) return false;
-            var off: usize = 0;
-            while (off < SECTOR_SIZE) : (off += 32) {
-                stats.dir_entries_scanned +%= 1;
-                cooperate(&coop_steps);
-                if (!lfn_guard.visit(volume, sector[off..][0..32], .{ .lba = lba, .offset = off })) return false;
-                if (sector[off] == 0x00 or sector[off] == 0xE5) {
-                    // The guard may have cleared a prefix in this sector.
-                    if (!readSector(volume.device_index, lba, 1, sector[0..])) return false;
-                    @memcpy(sector[off .. off + 32], raw_entry[0..32]);
-                    if (!writeSector(volume, lba, 1, sector[0..])) return false;
-                    stats.dir_entry_updates +%= 1;
-                    return true;
-                }
-            }
-        }
-    }
-    return false;
+    if (raw_entry.len != 32) return false;
+    return writeDirectoryEntries(volume, directory_cluster, raw_entry);
 }
 
 const DirectorySlot = struct {
@@ -2530,11 +2502,13 @@ fn writeDirectoryEntries(volume: Volume, directory_cluster: u32, raw_entries: []
     stats.dir_scans +%= 1;
     var slots: [MAX_DIR_ENTRIES_PER_NAME]DirectorySlot = undefined;
     var run_count: usize = 0;
+    var tail: u32 = 0;
     var lfn_guard = DirectoryLfnGuard{};
     var coop_steps: u32 = 0;
     var chain = DirChainIterator.init(volume, directory_cluster);
     while (chain.next()) |cluster| {
         if (chain.fat_error) return false;
+        tail = cluster;
         var sector: [SECTOR_SIZE]u8 = undefined;
         var i: u8 = 0;
         while (i < volume.sectors_per_cluster) : (i += 1) {
@@ -2555,8 +2529,67 @@ fn writeDirectoryEntries(volume: Volume, directory_cluster: u32, raw_entries: []
             }
         }
     }
+    // A failed/truncated scan or live incomplete LFN cannot prove a tail.
+    // Keep the trailing free run: skipping a 00 slot would hide the new name
+    // from normal enumeration even if it was written to the extension.
+    if (chain.fat_error or !fatValueIsEoc(chain.cluster) or lfn_guard.count != 0 or tail == 0) return false;
+    var io = DirectoryGrowthIo{ .volume = volume, .tail = tail };
+    const extension = directory_growth.extend(&io, volume.clusterBytes(), needed - run_count, DIR_CHAIN_MAX_CLUSTERS - chain.steps) catch return false;
+    var cluster = extension.first;
+    for (0..extension.count) |index| {
+        if (!validDataCluster(volume, cluster)) return false;
+        for (0..volume.sectors_per_cluster) |sector| {
+            const lba = volume.clusterLba(cluster) + @as(u32, @intCast(sector));
+            var offset: usize = 0;
+            while (offset < SECTOR_SIZE) : (offset += 32) {
+                slots[run_count] = .{ .lba = lba, .offset = offset };
+                run_count += 1;
+                if (run_count == needed) return writeDirectorySlots(volume, slots[0..needed], raw_entries);
+            }
+        }
+        if (index + 1 < extension.count) cluster = readFatEntry(volume, cluster) orelse return false;
+    }
     return false;
 }
+
+const DirectoryGrowthIo = struct {
+    volume: Volume,
+    tail: u32,
+    pub fn allocate(self: *const DirectoryGrowthIo, count: usize) ?u32 {
+        return (allocateChainPreferDetailed(self.volume, count, self.tail + 1) orelse return null).first;
+    }
+    pub fn initialize(self: *const DirectoryGrowthIo, first: u32, count: usize) bool {
+        var cluster = first;
+        var zero: [SECTOR_SIZE]u8 = .{0} ** SECTOR_SIZE;
+        var coop_steps: u32 = 0;
+        for (0..count) |index| {
+            if (!validDataCluster(self.volume, cluster)) return false;
+            for (0..self.volume.sectors_per_cluster) |sector| {
+                if (!writeSector(self.volume, self.volume.clusterLba(cluster) + @as(u32, @intCast(sector)), 1, &zero)) return false;
+                cooperate(&coop_steps);
+            }
+            const next = readFatEntry(self.volume, cluster) orelse return false;
+            if (index + 1 == count) return fatValueIsEoc(next);
+            cluster = next;
+        }
+        return false;
+    }
+    pub fn flush(self: *const DirectoryGrowthIo) bool {
+        return flushVolume(self.volume);
+    }
+    pub fn tailAvailable(self: *const DirectoryGrowthIo) bool {
+        return fatValueIsEoc(readFatEntry(self.volume, self.tail) orelse return false);
+    }
+    pub fn publish(self: *const DirectoryGrowthIo, first: u32) bool {
+        return writeFatEntryAll(self.volume, self.tail, first);
+    }
+    pub fn discard(self: *const DirectoryGrowthIo, first: u32) void {
+        // Only before any old-tail publication attempt. An uncertain linked
+        // extension stays allocated even if the enclosing mutation fails.
+        _ = freeChain(self.volume, first);
+        _ = flushVolume(self.volume);
+    }
+};
 
 fn writeDirectorySlots(volume: Volume, slots: []const DirectorySlot, raw_entries: []const u8) bool {
     var sector: [SECTOR_SIZE]u8 = undefined;
