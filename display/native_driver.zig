@@ -34,7 +34,7 @@ fn binding(value: abi.GfxBackendBinding) queue.model.Binding {
     return .{ .adapter = value.adapter_id, .device_generation = value.device_generation, .reset_generation = value.reset_generation };
 }
 pub fn retained(id: u32) bool { return id != 0 and bridge.driver_owner.id == id; }
-fn code(err: Error) i32 {
+pub fn code(err: Error) i32 {
     return switch (err) {
         error.Busy => abi.gfx_output_error_busy,
         error.Stale, error.WrongOwner => abi.gfx_output_error_stale,
@@ -44,7 +44,7 @@ fn code(err: Error) i32 {
         else => abi.gfx_output_error_invalid,
     };
 }
-fn bootDescription(generation: u64, saved: *const display.BootSnapshot) abi.GfxNativeBootInfo {
+pub fn bootDescription(generation: u64, saved: *const display.BootSnapshot) abi.GfxNativeBootInfo {
     const state = display.backendState();
     const base = paging.physicalAddress(saved.mapping.virt_base) orelse 0;
     var physical = base;
@@ -72,7 +72,7 @@ fn stateResult(id: u32, outcome: u32) abi.GfxNativeState {
         .state = @intFromEnum(state.state), .outcome = outcome,
         .retained = @intFromBool(display.retainsDriverOwner(id) or retained(id)) };
 }
-fn validAdapter(adapter: u32) bool {
+pub fn validAdapter(adapter: u32) bool {
     for (0..pci.count()) |index| {
         const item = pci.deviceAt(index) orelse return false;
         if (item.class_code == 3 and adapter == (0x0100_0000 | (@as(u32, item.bus) << 8) | (@as(u32, item.device) << 3) | item.function)) return true;

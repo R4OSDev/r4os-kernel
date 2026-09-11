@@ -250,6 +250,84 @@ pub const TransitionError = backend_state.Error || error{ Unavailable, RestoreFa
 var native_backend: ?NativeBackend = null;
 var native_device: Device = .{};
 var saved_boot: ?BootSnapshot = null;
+
+// Firmware bringup precedes output/queue discovery. This is a hold of the
+// existing boot display, not a fabricated native output or completion queue.
+pub const BootHolder = struct {
+    owner: usize,
+    adapter_id: u32,
+    expected_generation: u64,
+    context: usize,
+    capture: *const fn (usize, *const BootSnapshot) bool,
+    // True proves hardware quiescence and the original CPU scanout mapping,
+    // and restores its saved pixels. A timeout/INIT_DONE is not this proof.
+    restore: *const fn (usize, u64, *const BootSnapshot) bool,
+    release: *const fn (usize) bool,
+};
+const HeldBoot = struct { holder: BootHolder, captured: bool = false, effects: bool = false, restored: bool = false };
+var held_boot: ?HeldBoot = null;
+pub const BootHoldResult = struct { generation: u64, captured: bool, retained: bool };
+
+pub fn holdBoot(holder: BootHolder) TransitionError!BootHoldResult {
+    if (!execution.tryEnter()) return error.Busy;
+    defer execution.leave();
+    const boot = &(saved_boot orelse return error.Unavailable);
+    if (held_boot != null or native_backend != null) return error.Busy;
+    if (holder.expected_generation == 0 or holder.expected_generation != backend_manager.value.generation) return error.Stale;
+    const generation = try backend_manager.begin(holder.owner, holder.adapter_id);
+    if (!firmware_access.gate.tryRevoke()) {
+        backend_manager.abort(holder.owner, generation, .prepare_failed) catch unreachable;
+        publishStats();
+        return error.Busy;
+    }
+    held_boot = .{ .holder = holder };
+    primary_device = null;
+    publishStats();
+    if (holder.capture(holder.context, boot)) {
+        held_boot.?.captured = true;
+        return .{ .generation = generation, .captured = true, .retained = true };
+    }
+    // Capture cannot touch the GPU. Even a partial CPU allocation/lease has
+    // an exact owner, and failed cleanup can be retried through finishBoot.
+    const released = holder.release(holder.context);
+    if (released) releaseBootLocked(holder.owner, generation, .prepare_failed);
+    return .{ .generation = generation, .captured = false, .retained = !released };
+}
+
+// 0: abandon before any possible device effect; 1: latch BEFORE the first
+// possible effect; 2: recover using the retained hardware owner. No automatic
+// reopen/unload is allowed after operation 1, including callback/time errors.
+pub fn finishBoot(owner: usize, generation: u64, operation: u32) TransitionError!bool {
+    if (!execution.tryEnter()) return error.Busy;
+    defer execution.leave();
+    try backend_manager.checkPending(owner, generation);
+    const hold = if (held_boot) |*value| value else return error.Stale;
+    if (operation > 2) return error.Invalid;
+    if (operation == 1) {
+        if (!hold.captured) return error.Invalid;
+        if (hold.effects) return error.Busy;
+        hold.effects = true;
+        return false;
+    }
+    if (hold.effects and operation != 2) return error.Busy;
+    if (hold.effects and !hold.restored) {
+        const boot = &(saved_boot orelse return error.Unavailable);
+        if (!hold.holder.restore(hold.holder.context, generation, boot)) return error.RestoreFailed;
+        hold.restored = true;
+    }
+    if (!hold.holder.release(hold.holder.context)) return error.RestoreFailed;
+    releaseBootLocked(owner, generation, .none);
+    return true;
+}
+
+fn releaseBootLocked(owner: usize, generation: u64, reason: backend_state.Reason) void {
+    backend_manager.abort(owner, generation, reason) catch unreachable;
+    held_boot = null;
+    primary_device = &bootfb_device;
+    firmware_access.gate.restore();
+    publishStats();
+}
+
 pub fn bootSnapshot() ?BootSnapshot {
     const token = ownership.enterState(); defer ownership.leaveState(token);
     return saved_boot;
@@ -355,6 +433,7 @@ pub fn prepareNative(backend: NativeBackend) TransitionError!u64 {
 pub fn abortNative(owner: usize, generation: u64) TransitionError!void {
     if (!execution.tryEnter()) return error.Busy;
     defer execution.leave();
+    if (held_boot != null) return error.Busy;
     try backend_manager.abort(owner, generation, .prepare_failed);
     native_backend = null;
     native_device = .{};
@@ -364,6 +443,7 @@ pub fn abortNative(owner: usize, generation: u64) TransitionError!void {
 pub fn commitNative(owner: usize, generation: u64) TransitionError!CommitResult {
     if (!execution.tryEnter()) return error.Busy;
     defer execution.leave();
+    if (held_boot != null) return error.Busy;
     try backend_manager.checkPending(owner, generation);
     const backend = native_backend orelse return error.Unavailable;
     const boot = &(saved_boot orelse return error.Unavailable);
@@ -888,6 +968,7 @@ test "display takeover excludes firmware writers and retains uncertain hardware 
         bootfb_device = .{ .ops = &bootfb_ops };
         native_device = .{};
         native_backend = null;
+        held_boot = null;
         backend_manager = .{};
         completed_backend_state = .{};
         completed_stats = .{};
@@ -967,6 +1048,90 @@ test "display takeover excludes firmware writers and retains uncertain hardware 
     try t.expectEqualSlices(u32, &before, &boot_pixels);
     try t.expect(fill(0x123456));
     try t.expectEqual(@as(u32, 0x123456), boot_pixels[0]);
+    try exerciseBootHold(backend);
+}
+
+fn exerciseBootHold(native: NativeBackend) !void {
+    const t = @import("std").testing;
+    const Probe = struct {
+        capture_ok: bool = true,
+        release_ok: bool = true,
+        restore_ok: bool = false,
+        captures: u32 = 0,
+        restores: u32 = 0,
+        pixels: [64]u32 = undefined,
+        fn capture(raw: usize, saved: *const BootSnapshot) bool {
+            const self: *@This() = @ptrFromInt(raw);
+            self.captures += 1;
+            t.expect(firmware_access.gate.isRevoked() and !fill(0xAAAAAA)) catch unreachable;
+            t.expect(retainsDriverOwner(91)) catch unreachable;
+            const bytes: [*]volatile const u32 = @ptrCast(@alignCast(saved.framebuffer.address));
+            for (&self.pixels, 0..) |*pixel, index| pixel.* = bytes[index];
+            return self.capture_ok;
+        }
+        fn restore(raw: usize, _: u64, saved: *const BootSnapshot) bool {
+            const self: *@This() = @ptrFromInt(raw);
+            self.restores += 1;
+            t.expect(firmware_access.gate.isRevoked() and !fill(0xBBBBBB)) catch unreachable;
+            if (!self.restore_ok) return false;
+            const bytes: [*]volatile u32 = @ptrCast(@alignCast(saved.framebuffer.address));
+            for (self.pixels, 0..) |pixel, index| bytes[index] = pixel;
+            return true;
+        }
+        fn release(raw: usize) bool { return @as(*@This(), @ptrFromInt(raw)).release_ok; }
+    };
+    var probe: Probe = .{};
+    const before = backendState();
+    var holder = BootHolder{ .owner = 91, .adapter_id = 4, .expected_generation = before.generation,
+        .context = @intFromPtr(&probe), .capture = Probe.capture, .restore = Probe.restore, .release = Probe.release };
+    holder.expected_generation -= 1;
+    try t.expectError(error.Stale, holdBoot(holder));
+    holder.expected_generation = before.generation;
+    try t.expect(setBackendPolicy(.software_once));
+    try t.expectError(error.Disabled, holdBoot(holder));
+    try t.expect(setBackendPolicy(.automatic));
+    try t.expect(firmware_access.gate.tryAcquire());
+    try t.expectError(error.Busy, holdBoot(holder));
+    firmware_access.gate.release();
+    try t.expectEqual(@as(u32, 0), probe.captures);
+    probe.capture_ok = false;
+    const rejected = try holdBoot(holder);
+    try t.expect(!rejected.captured and !rejected.retained and !firmware_access.gate.isRevoked());
+    probe.release_ok = false;
+    const partial = try holdBoot(holder);
+    try t.expect(!partial.captured and partial.retained);
+    try t.expectError(error.RestoreFailed, finishBoot(91, partial.generation, 0));
+    probe.release_ok = true;
+    try t.expect(try finishBoot(91, partial.generation, 0));
+    probe.capture_ok = true;
+    const held = try holdBoot(holder);
+    try t.expect(held.captured and held.retained and !fill(0xCCCCCC));
+    try t.expect(!firmware_access.gate.tryAcquire());
+    try t.expectEqual(@as(u32, 0), presentCapabilities().flags);
+    try t.expectError(error.Busy, holdBoot(holder));
+    try t.expectError(error.Busy, prepareNative(native));
+    try t.expectError(error.Busy, abortNative(91, held.generation));
+    try t.expectError(error.Busy, commitNative(91, held.generation));
+    try t.expectError(error.Stale, finishBoot(92, held.generation, 0));
+    try t.expectError(error.Stale, finishBoot(91, rejected.generation, 0));
+    try t.expectError(error.Invalid, finishBoot(91, held.generation, 3));
+    try t.expect(!try finishBoot(91, held.generation, 1));
+    try t.expectError(error.Busy, finishBoot(91, held.generation, 1));
+    try t.expectError(error.Busy, finishBoot(91, held.generation, 0));
+    try t.expectError(error.RestoreFailed, finishBoot(91, held.generation, 2));
+    try t.expect(retainsDriverOwner(91) and firmware_access.gate.isRevoked());
+    probe.restore_ok = true;
+    probe.release_ok = false;
+    try t.expectError(error.RestoreFailed, finishBoot(91, held.generation, 2));
+    const calls = probe.restores;
+    probe.release_ok = true;
+    try t.expect(try finishBoot(91, held.generation, 2));
+    try t.expectEqual(calls, probe.restores); // Proven hardware restore is not replayed.
+    try t.expect(!retainsDriverOwner(91) and !firmware_access.gate.isRevoked());
+    try t.expectEqual(before.generation, backendState().generation);
+    try t.expectEqual(before.reset_generation, backendState().reset_generation);
+    try t.expectError(error.Stale, finishBoot(91, held.generation, 0));
+    try t.expect(fill(0x123456));
 }
 
 fn nameSlice(name: []const u8) []const u8 {

@@ -3250,9 +3250,24 @@ fn resourceReadAt(id: u64, offset: u64, output: [*]u8, length: u32, deadline_ns:
 const native_display = @import("../display/native_driver.zig");
 fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i32 {
     _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
-    if (!gfx_api.validOutput(outputs_contract.GfxDriverDisplayApi, output)) return outputs_contract.gfx_output_error_invalid;
-    output.* = .{ .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule) };
+    if (@intFromPtr(output) == 0 or output.version != 1 or output.size < 40) return outputs_contract.gfx_output_error_invalid;
+    // Version-1 consumers may still allocate exactly the original 40-byte
+    // prefix. Publish only complete slots within their actual capacity.
+    const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverDisplayApi));
+    const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes,
+        .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare),
+        .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule),
+        .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish) };
+    @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_output_ok;
+}
+fn gfxBootHold(input: *const outputs_contract.GfxBootHoldRequest, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return @import("../display/boot_driver.zig").hold(identity, input, output);
+}
+fn gfxBootFinish(generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return @import("../display/boot_driver.zig").finish(identity, generation, operation, output);
 }
 fn gfxDisplayBootInfo(output: *outputs_contract.GfxNativeBootInfo) callconv(.c) i32 {
     _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
