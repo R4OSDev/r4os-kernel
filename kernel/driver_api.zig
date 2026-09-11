@@ -544,13 +544,38 @@ pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
 }
 
 pub fn beginOwnerShutdown(token: *OwnerCleanupToken) void {
-    driver_resources.state.close(token.owner);
-    driver_heap.beginClose(token.owner);
-    driver_semaphores.beginClose(token.owner);
-    driver_threads.beginClose(token.owner);
-    @import("../display/queue.zig").closingDriver(token.owner);
-    gfx_memory.beginClose(token.owner);
+    closeOwnerAdmissions(token.owner);
     token.shutdown_started = true;
+}
+
+fn closeOwnerAdmissions(owner: u32) void {
+    driver_resources.state.close(owner);
+    driver_heap.beginClose(owner);
+    driver_semaphores.beginClose(owner);
+    driver_threads.beginClose(owner);
+    @import("../display/queue.zig").closingDriver(owner);
+    gfx_memory.beginClose(owner);
+}
+
+// Unlike unload, a terminal system transition must let DriverShutdown stop
+// an active or partially initialized GPU while its display and DMA remain
+// retained. This path never issues a generic memory/module cleanup permit.
+pub fn beginDisplaySystemTransition(owner: u32) bool {
+    if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return false;
+    if (!display_blit.prepareOwnerCleanup(owner)) return false;
+    closeOwnerAdmissions(owner);
+    return true;
+}
+
+// Called only after the driver's explicit successful hardware shutdown.
+// A remaining display, GPU job, mapping or dedicated callback vetoes warm
+// reset. Shared Work is cancelled/drained before it can restart the device.
+pub fn displaySystemTransitionQuiesced(owner: u32) bool {
+    if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return false;
+    if (display.retainsDriverOwner(owner) or @import("../display/native_driver.zig").retained(owner) or
+        gfx_memory.retained(owner) or @import("../display/queue.zig").retainsDriver(owner) or
+        !driver_threads.callbacksQuiesced(owner)) return false;
+    return driver_work.cleanupOwner(owner).quiesced;
 }
 
 pub fn quarantineOwnerCleanup(token: *OwnerCleanupToken) bool {
@@ -3270,7 +3295,9 @@ fn gfxBootFinish(generation: u64, operation: u32, output: *outputs_contract.GfxN
     return @import("../display/boot_driver.zig").finish(identity, generation, operation, output);
 }
 fn gfxDisplayBootInfo(output: *outputs_contract.GfxNativeBootInfo) callconv(.c) i32 {
-    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    // The already-bound table remains readable during owner close: drivers
+    // need the current display generation to perform their final rollback.
+    _ = currentGfxOwner(false) catch |err| return gfx_api.status(err);
     return native_display.bootInfo(output);
 }
 fn gfxDisplayPrepare(input: *const outputs_contract.GfxNativeRegistration, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {

@@ -29,8 +29,12 @@ pub const Execution = struct {
     }
 
     pub fn tryEnter(self: *Execution) bool {
+        return self.enter(0);
+    }
+
+    pub fn enter(self: *Execution, timeout_ticks: u64) bool {
         if (!kernel) return self.guard.tryLock();
-        if (!self.guard.tryEnter()) return false;
+        if (!self.guard.enter(timeout_ticks)) return false;
         // An interrupt or callback on the same task must not start a second
         // presentation inside an incomplete generation.
         if (self.guard.depth != 1) {

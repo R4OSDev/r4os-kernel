@@ -465,6 +465,14 @@ test "deadline and reset preserve results bindings and physical ownership" {
     try state.complete(running, .complete, true, 13);
     try testing.expectEqual(Result.timeout, (try state.query(running)).result);
     try testing.expectEqual(@as(u64, 2), state.terminal_publications);
+    const empty = try state.open(test_owner, .{ .binding = binding });
+    state.deviceLost(binding, 14);
+    try testing.expectError(error.Stale, state.close(empty, test_owner, 15));
+    const next = try state.open(test_owner, .{ .binding = binding });
+    try testing.expect(next > empty);
+    try testing.expectError(error.Stale, state.close(empty, test_owner, 16));
+    try testing.expectError(error.WrongOwner, state.close(next, .{ .kind = .program, .id = 9, .generation = 2 }, 16));
+    try state.close(next, test_owner, 16);
 }
 
 test "owner death and failed release retain resources without reusing destructor tickets" {

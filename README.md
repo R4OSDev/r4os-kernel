@@ -1,5 +1,11 @@
 ﻿# R4OS Kernel
 
+Kernel 0.1.151 includes display drivers in the warm-reset handoff. It drains
+presentation before driver shutdown, keeps output admission closed through
+restoration, and requires released graphics ownership and stopped callbacks.
+An unproven handoff enters poweroff (or halt if poweroff is unavailable); no
+retained GPU firmware memory is handed to a warm-started kernel.
+
 Kernel 0.1.147 uses the boot configuration owner's driver capacity for its
 load plan. All twelve configured entries can reach normal driver admission;
 the former independent eight-entry plan skipped a ninth driver even when

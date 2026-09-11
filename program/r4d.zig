@@ -519,7 +519,7 @@ pub fn runtimeLoadResultName(result: RuntimeLoadResult) []const u8 {
     };
 }
 
-pub fn shutdownNetworkForSystemTransition() bool {
+pub fn shutdownForSystemTransition() bool {
     if (!runtime_lifecycle_guard.enter(ownerHandoffTimeoutTicks())) {
         k.puts("[R4D] system-transition lifecycle timeout\r\n");
         return false;
@@ -529,9 +529,9 @@ pub fn shutdownNetworkForSystemTransition() bool {
     runtime_transition_active = true;
     var success = true;
     var stopped: usize = 0;
-    for (module_drivers) |driver| {
-        if (!driver.used or !driver.quarantined or driver.driver_type != @intFromEnum(DriverType.net)) continue;
-        k.puts("[R4D] system-transition quarantined network module blocks warm reset name=");
+    for (&module_drivers) |driver| {
+        if (!driver.used or !driver.quarantined or !needsSystemTransition(driver.driver_type)) continue;
+        k.puts("[R4D] system-transition quarantined module blocks warm reset name=");
         k.puts(driver.name[0..driver.name_len]);
         k.puts("\r\n");
         success = false;
@@ -540,7 +540,7 @@ pub fn shutdownNetworkForSystemTransition() bool {
     while (index != 0) {
         index -= 1;
         const driver = &runtime_drivers[index];
-        if (!driver.used or driver.driver_type != @intFromEnum(DriverType.net)) continue;
+        if (!driver.used or !needsSystemTransition(driver.driver_type)) continue;
         if (driver.quarantined) {
             success = false;
             continue;
@@ -569,6 +569,14 @@ pub fn shutdownNetworkForSystemTransition() bool {
             _ = driver_api.leaveOwner();
             continue;
         }
+        const is_display = driver.driver_type == @intFromEnum(DriverType.display);
+        if (is_display and !driver_api.beginDisplaySystemTransition(expected_owner)) {
+            quarantineRuntimeDriver(driver);
+            k.puts("[R4D] system-transition display admission failed\r\n");
+            success = false;
+            _ = driver_api.leaveOwner();
+            continue;
+        }
         driver_registry.setState(expected_registry_slot, .shutdown);
         k.puts("[R4D] system-transition shutdown name=");
         k.puts(driver.name[0..driver.name_len]);
@@ -576,12 +584,14 @@ pub fn shutdownNetworkForSystemTransition() bool {
         k.putDec(driver.owner);
         k.puts("\r\n");
         const result = if (driver.shutdown) |shutdown| shutdown() else -1;
-        if (result != 0) {
+        const quiesced = result == 0 and (!is_display or driver_api.displaySystemTransitionQuiesced(expected_owner));
+        if (!quiesced) {
             quarantineRuntimeDriver(driver);
             k.puts("[R4D] system-transition shutdown failed name=");
             k.puts(driver.name[0..driver.name_len]);
             k.puts(" code=");
             putSignedDec(result);
+            if (result == 0) k.puts(" retained-resources=active");
             k.puts("\r\n");
             success = false;
             _ = driver_api.leaveOwner();
@@ -593,10 +603,14 @@ pub fn shutdownNetworkForSystemTransition() bool {
         stopped += 1;
         _ = driver_api.leaveOwner();
     }
-    k.puts("[R4D] system-transition network shutdown stopped=");
+    k.puts("[R4D] system-transition network/display shutdown stopped=");
     k.putDec(stopped);
     k.puts(if (success) " result=OK\r\n" else " result=FAILED\r\n");
     return success;
+}
+
+fn needsSystemTransition(driver_type: u16) bool {
+    return driver_type == @intFromEnum(DriverType.net) or driver_type == @intFromEnum(DriverType.display);
 }
 
 fn shutdownAndCleanupFailedLoad(

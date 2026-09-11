@@ -14,6 +14,7 @@ const heap = @import("../memory/heap.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
 const owner_locks = @import("../memory/owner_locks.zig");
 const k = @import("../kernel/log.zig");
+const timer = @import("../kernel/timer.zig");
 const power = @import("../arch/x86_64/power.zig");
 const reset = @import("../arch/x86_64/reset.zig");
 const r4d = @import("r4d.zig");
@@ -474,16 +475,18 @@ pub fn systemReboot() callconv(.c) void {
     k.puts("System reboot.\r\n");
     flushRegistryWritebackForShutdown();
     flushPageCacheForShutdown();
-    // ACPI warm reset does not guarantee that a PCI NIC stops DMA. Quiesce
-    // runtime network drivers after durable writes and before the reset so the
-    // next kernel never inherits a live descriptor ring from the old kernel.
+    // ACPI warm reset does not guarantee that PCI DMA stops. Drain display
+    // callbacks before entering the R4D owner, then stop network and graphics
+    // drivers while their mappings and firmware memory are still retained.
+    const display_drained = @import("../display/display.zig").beginSystemTransition(@max(timer.frequency() / 4, 1));
     const callbacks_drained = net.beginSystemTransition("reboot");
-    const drivers_stopped = callbacks_drained and r4d.shutdownNetworkForSystemTransition();
-    if (!callbacks_drained or !drivers_stopped) {
+    const drivers_stopped = display_drained and callbacks_drained and r4d.shutdownForSystemTransition() and
+        @import("../display/display.zig").systemTransitionQuiesced();
+    if (!display_drained or !callbacks_drained or !drivers_stopped) {
         // Never cross a warm reset with an unproven callback/DMA handoff. A
         // real poweroff is the only safe fallback because it removes device
         // power instead of exposing retained hardware to the next kernel.
-        k.puts("[RESET][ERROR] network handoff unsafe; powering off instead of warm reset\r\n");
+        k.puts("[RESET][ERROR] device handoff unsafe; powering off instead of warm reset\r\n");
         k.serialFlush();
         power.poweroff();
     }

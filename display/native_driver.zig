@@ -237,7 +237,13 @@ fn discard() bool {
     }
     if (bridge.timeline != 0) {
         queue.unbindDisplayQueue(@intCast(bridge.driver_owner.id), binding(bridge.registration.backend), bridge.timeline);
-        queue.close(owner, bridge.timeline) catch return false;
+        queue.close(owner, bridge.timeline) catch |err| {
+            // Device loss may already retire an empty timeline before this
+            // bridge releases its CPU reference. Timeline IDs never wrap or
+            // repeat: Stale for our retained ID means that exact queue is gone.
+            // Every other failure, pending fence and CPU lease still vetoes.
+            if (err != error.Stale) return false;
+        };
         bridge.timeline = 0;
     }
     if (bridge.reference.id != 0) {
