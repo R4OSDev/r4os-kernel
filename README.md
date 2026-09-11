@@ -299,7 +299,7 @@ The version-1 DriverThreadApi has `abort_current` at offset 72 and
 `current_request` at offset 80, size 88. Query accepts the full legacy
 72-byte prefix, copies 72 for capacities 72..79, 80 for 80..87 and 88 from
 88 upward. Old callers' tails are untouched.
-DriverApi remains version 33/632 bytes. Flag 4 reports an accepted abort and
+This thread-service extension retains DriverApi33/632. Flag 4 reports an accepted abort and
 is rejected as a start flag.
 
 `arch/x86_64/callback_abort.zig` implements one ordinary SysV call boundary,
@@ -326,3 +326,14 @@ in this service's sleep queue. It clears as the Task becomes runnable and
 is rejected as a creation flag. All callbacks and pointer lifetimes remain
 with their existing owners; no generic native invocation data enters the
 kernel. The NVIDIA driver owns its absolute phase deadlines.
+
+Kernel 0.1.148 provides DriverApi34 byte-range DMA synchronization. The
+unchanged v33 prefix is followed by two callbacks at 632/640 (648 bytes total).
+`kernel/dma_sync_range.zig` copies only the requested bounce-buffer bytes and
+preserves the existing x86 ordering and direction rules; whole-map sync uses
+the same helper. The driver API validates real owner, descriptor and retained
+mapping bounds before dispatch. No allocation, wait or new parallel DMA
+admission is introduced. Callers own affected bytes, publication order and
+device quiescence. One owner test covers independent peer fields, invalid
+extents, copy directions and direct coherent mappings; the normal EXAMPLE
+fixture exercises the actual API in a short SMP4 boot.

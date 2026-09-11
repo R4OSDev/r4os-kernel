@@ -19,6 +19,7 @@ const paging = @import("../memory/paging.zig");
 const phys = @import("../memory/phys.zig");
 const memory_layout = @import("../memory/layout.zig");
 const dma_segments = @import("dma_segments.zig");
+const dma_sync_range = @import("dma_sync_range.zig");
 const protocol_api = @import("protocol_api.zig");
 const r4p = @import("../program/r4p.zig");
 const irq_router = @import("irq_router.zig");
@@ -37,7 +38,7 @@ const driver_semaphores = @import("driver_semaphores.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
 // Version 30: resident CPU heap after the unchanged v29 resource tail.
-pub const VERSION: u32 = 33;
+pub const VERSION: u32 = 34;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -843,13 +844,16 @@ pub const Table = extern struct {
     monotonic_clock: *const fn (*outputs_contract.MonotonicClockInfo) callconv(.c) i32,
     thread_query: *const fn (*outputs_contract.DriverThreadApi) callconv(.c) i32,
     semaphore_query: *const fn (*outputs_contract.DriverSemaphoreApi) callconv(.c) i32,
+    dma_sync_range_for_device: *const fn (*const DmaMapping, u32, u32) callconv(.c) i32,
+    dma_sync_range_for_cpu: *const fn (*const DmaMapping, u32, u32) callconv(.c) i32,
 };
 
 comptime {
     if (VERSION != outputs_contract.driver_api_version or @offsetOf(Table, "resource_query") != 592 or
         @offsetOf(Table, "heap_query") != 600 or @offsetOf(Table, "monotonic_clock") != 608 or
-        @offsetOf(Table, "thread_query") != 616 or @offsetOf(Table, "semaphore_query") != 624 or @sizeOf(Table) != 632)
-        @compileError("DriverApi append-only v33 layout drift");
+        @offsetOf(Table, "thread_query") != 616 or @offsetOf(Table, "semaphore_query") != 624 or
+        @offsetOf(Table, "dma_sync_range_for_device") != 632 or @offsetOf(Table, "dma_sync_range_for_cpu") != 640 or @sizeOf(Table) != 648)
+        @compileError("DriverApi append-only v34 layout drift");
 }
 
 pub var table = Table{
@@ -864,6 +868,8 @@ pub var table = Table{
     .monotonic_clock = @import("monotonic_api.zig").monotonicClock,
     .thread_query = threadQuery,
     .semaphore_query = semaphoreQuery,
+    .dma_sync_range_for_device = dmaSyncRangeForDevice,
+    .dma_sync_range_for_cpu = dmaSyncRangeForCpu,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -1188,6 +1194,26 @@ fn dmaSyncForCpu(mapping: *const DmaMapping) callconv(.c) i32 {
     return if (syncMappingForCpu(&dma_mappings[slot])) 0 else -3;
 }
 
+fn dmaSyncRangeForDevice(mapping: *const DmaMapping, offset: u32, bytes: u32) callconv(.c) i32 {
+    return dmaSyncRange(mapping, offset, bytes, .device);
+}
+
+fn dmaSyncRangeForCpu(mapping: *const DmaMapping, offset: u32, bytes: u32) callconv(.c) i32 {
+    return dmaSyncRange(mapping, offset, bytes, .cpu);
+}
+
+fn dmaSyncRange(mapping: *const DmaMapping, offset: u32, bytes: u32, phase: dma_sync_range.Phase) i32 {
+    // Preserve the audited init/shutdown/Driver Work admission. Dedicated
+    // tasks and IRQ/storage callbacks do not gain legacy DMA access here.
+    const owner = activeOwner();
+    if (owner == 0 or irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return -1;
+    if (mapping.version != DMA_ABI_VERSION or mapping.size < @sizeOf(DmaMapping) or mapping.handle == 0) return -2;
+    const slot = dmaMappingSlotForOwner(mapping.handle, owner) orelse return -3;
+    // Bounds/direction/backing come from the actual retained record, never
+    // from modifiable descriptor lengths, flags or caller-supplied addresses.
+    return if (syncMappingRange(&dma_mappings[slot], phase, offset, bytes)) 0 else -2;
+}
+
 fn dmaUnmap(mapping: *DmaMapping) callconv(.c) i32 {
     if (irq_router.inDispatch()) return -1;
     const slot = dmaMappingSlotForOwner(mapping.handle, activeOwner()) orelse return -2;
@@ -1317,30 +1343,23 @@ fn mappingDescriptor(handle: u64, mapping: *const DmaMappingRecord) DmaMapping {
 }
 
 fn syncMappingForDevice(mapping: *DmaMappingRecord) bool {
-    if (!mapping.used) return false;
-    if (mapping.bounce_virt != 0 and
-        (mapping.direction == DMA_DIRECTION_TO_DEVICE or mapping.direction == DMA_DIRECTION_BIDIRECTIONAL))
-    {
-        const source: [*]const u8 = @ptrFromInt(mapping.original_virt);
-        const target: [*]u8 = @ptrFromInt(mapping.bounce_virt);
-        @memcpy(target[0..mapping.requested_bytes], source[0..mapping.requested_bytes]);
-    }
-    asm volatile ("mfence" ::: .{ .memory = true });
-    mapping.device_owned = true;
-    return true;
+    return syncMappingRange(mapping, .device, 0, mapping.requested_bytes);
 }
 
 fn syncMappingForCpu(mapping: *DmaMappingRecord) bool {
+    return syncMappingRange(mapping, .cpu, 0, mapping.requested_bytes);
+}
+
+fn syncMappingRange(mapping: *DmaMappingRecord, phase: dma_sync_range.Phase, offset: u32, bytes: u32) bool {
     if (!mapping.used) return false;
-    asm volatile ("mfence" ::: .{ .memory = true });
-    if (mapping.bounce_virt != 0 and
-        (mapping.direction == DMA_DIRECTION_FROM_DEVICE or mapping.direction == DMA_DIRECTION_BIDIRECTIONAL))
-    {
-        const source: [*]const u8 = @ptrFromInt(mapping.bounce_virt);
-        const target: [*]u8 = @ptrFromInt(mapping.original_virt);
-        @memcpy(target[0..mapping.requested_bytes], source[0..mapping.requested_bytes]);
-    }
-    mapping.device_owned = false;
+    const original: [*]u8 = @ptrFromInt(mapping.original_virt);
+    const bounce: ?[]u8 = if (mapping.bounce_virt == 0) null else blk: {
+        const pointer: [*]u8 = @ptrFromInt(mapping.bounce_virt);
+        break :blk pointer[0..mapping.requested_bytes];
+    };
+    if (!dma_sync_range.synchronize(original[0..mapping.requested_bytes], bounce, @enumFromInt(mapping.direction), phase, offset, bytes)) return false;
+    // A partial transfer cannot label the whole mapping CPU/device-owned.
+    if (offset == 0 and bytes == mapping.requested_bytes) mapping.device_owned = phase == .device;
     return true;
 }
 
