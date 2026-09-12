@@ -3403,16 +3403,20 @@ fn gfxOutputWithdraw(input: *const outputs_contract.GfxOutputId) callconv(.c) i3
     return outputs_contract.gfx_output_ok;
 }
 fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
-    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
-    if (!gfx_api.validOutput(outputs_contract.GfxDriverQueueApi, output)) return outputs_contract.gfx_queue_error_invalid;
-    output.* = .{
+    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    if (@intFromPtr(output) == 0 or output.version != 1 or output.size < 56) return outputs_contract.gfx_queue_error_invalid;
+    const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverQueueApi));
+    const value: outputs_contract.GfxDriverQueueApi = .{
+        .size = bytes,
         .register_backend = @intFromPtr(&gfxQueueRegister),
         .unregister_backend = @intFromPtr(&gfxQueueUnregister),
         .take = @intFromPtr(&gfxQueueTake),
         .complete = @intFromPtr(&gfxQueueComplete),
         .reset = @intFromPtr(&gfxQueueReset),
         .segment = @intFromPtr(&gfxQueueSegment),
+        .retain_resource = @intFromPtr(&gfxQueueRetain),
     };
+    @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_queue_ok;
 }
 fn gfxQueueRegister(input: *const outputs_contract.GfxBackendRegistration, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
@@ -3433,6 +3437,10 @@ fn gfxQueueReset(input: *const outputs_contract.GfxBackendBinding, quiesced: u32
 }
 fn gfxQueueSegment(input: *const outputs_contract.GfxFence, which: u32, offset: u64, mask: u64, output: *outputs_contract.GfxDmaSegment) callconv(.c) i32 {
     return gfx_queue_api.segment(activeOwner(), input, which, offset, mask, output);
+}
+fn gfxQueueRetain(input: *const outputs_contract.GfxFence, which: u32, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_queue_api.retain(identity, input, which, output);
 }
 
 fn gfxBufferCreate(input: *const outputs_contract.GfxBufferDescriptor, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {

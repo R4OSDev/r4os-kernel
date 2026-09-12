@@ -69,3 +69,14 @@ pub fn segment(id: u32, input: *const abi.GfxFence, which: u32, offset: u64, mas
     output.* = value;
     return abi.gfx_queue_ok;
 }
+pub fn retain(identity: buffers.Owner, input: *const abi.GfxFence, which: u32, output: *abi.GfxBufferReference) i32 {
+    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxBufferReference, output)) return abi.gfx_queue_error_invalid;
+    const value = api.fence(input.*);
+    const call = @import("../sched/task_context.zig").enterUnwind();
+    if (!call.admitted()) return abi.gfx_queue_error_busy;
+    defer _ = @import("../sched/task_context.zig").leaveUnwind(call);
+    const retained = queue.retainNative(identity, value, which) catch |err| return api.errorCode(err);
+    // Pageable output is written after dropping the metadata owner.
+    output.* = .{ .reference = memory_api.publicHandle(retained.reference), .buffer = memory_api.publicHandle(retained.buffer), .flags = abi.gfx_buffer_reference_mapping_only };
+    return abi.gfx_queue_ok;
+}

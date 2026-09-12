@@ -80,6 +80,16 @@ pub fn Resources(comptime capacity: usize) type {
             return fence;
         }
 
+        pub fn retain(self: *Self, state: anytype, buffers: anytype, fence: queue.Fence, which: u32, driver: lifetime.Owner) Error!lifetime.Handle {
+            if (which > 1) return error.Invalid;
+            const status = try state.query(fence);
+            if (!status.device_active) return if (status.phase == .queued) error.Busy else error.AlreadyCompleted;
+            const entry = &self.entries[fence.slot - 1];
+            if (!std.meta.eql(entry.fence, fence)) return error.Stale;
+            const use = entry.uses[which] orelse return error.Invalid;
+            return buffers.retainQueued(use.lease, owner, driver);
+        }
+
         pub fn release(self: *Self, buffers: anytype, ticket: queue.Release) Error!void {
             if (ticket.fence.slot == 0 or ticket.fence.slot > capacity) return error.Invalid;
             const entry = &self.entries[ticket.fence.slot - 1];
@@ -108,13 +118,36 @@ test "queued dependencies reserve CPU ownership across producer death and physic
     const upload = try state.open(producer, .{});
     const render = try state.open(producer, .{});
     const first = try resources.submit(&state, &buffers, upload, producer, .{ .deadline_ns = 100 }, .{ .source = refs[0], .target = refs[1], .bytes = 4096 }, 0);
+    const driver = lifetime.Owner{ .kind = .driver, .id = 5, .generation = 17 };
+    try t.expectError(error.Busy, resources.retain(&state, &buffers, first, 0, driver));
     try t.expectError(error.Busy, resources.submit(&state, &buffers, render, producer, .{ .deadline_ns = 100 }, .{ .source = refs[1], .target = refs[2], .bytes = 4096 }, 0));
     const second = try resources.submit(&state, &buffers, render, producer, .{ .deadline_ns = 100, .dependencies = &.{first} }, .{ .source = refs[1], .target = refs[2], .bytes = 4096 }, 0);
     try t.expectError(error.Busy, buffers.use(refs[0], producer, .cpu_write, 0, 4096));
     try t.expectError(error.Busy, buffers.use(refs[1], producer, .cpu_read, 0, 4096));
     try t.expectEqualDeep(first, state.takeReady(0).?);
+    // Mapping retention must not freeze the source against later ordered
+    // writes, and it cannot manufacture an independent execution permission.
+    const source_mapping = try resources.retain(&state, &buffers, first, 0, driver);
+    const source_dma = try buffers.use(source_mapping, driver, .device_mapping, 0, 4096);
+    try t.expectError(error.Unsupported, buffers.share(source_mapping, producer));
+    for ([_]lifetime.Access{ .cpu_read, .cpu_write, .device_read, .device_write, .scanout, .queue_read, .queue_write }) |access|
+        try t.expectError(error.Unsupported, buffers.use(source_mapping, driver, access, 0, 4096));
+    const later_write = try buffers.reserveQueued(refs[0], producer, owner, true, 0, 4096);
+    try buffers.endUse(later_write.lease, owner, true);
     buffers.stoppedOwner(producer);
     state.stopped(producer, 1);
+    // Public imports remain closed, while the exact active job still owns
+    // this target and may hand its mapping to the authenticated driver.
+    const target_mapping = try resources.retain(&state, &buffers, first, 1, driver);
+    const target_object = try buffers.bufferFor(target_mapping, driver);
+    try t.expectError(error.Closed, buffers.import(target_object, driver));
+    try t.expect(try buffers.mappingOnly(target_mapping, driver));
+    const target_gpu = try buffers.use(target_mapping, driver, .device_mapping, 0, 4096);
+    var stale = first;
+    stale.binding.reset_generation += 1;
+    try t.expectError(error.Stale, resources.retain(&state, &buffers, stale, 0, driver));
+    try t.expectError(error.Invalid, resources.retain(&state, &buffers, first, 2, driver));
+    try t.expectError(error.Invalid, resources.retain(&state, &buffers, first, 0, producer));
     try t.expect(buffers.pendingRelease() == null);
     const queued = state.takeRelease().?;
     try t.expectEqualDeep(second, queued.fence);
@@ -125,9 +158,18 @@ test "queued dependencies reserve CPU ownership across producer death and physic
     try t.expect(buffers.pendingRelease() == null);
     try t.expectEqual(@as(u64, 8192), buffers.stats().bytes);
     try state.complete(first, .complete, true, 2);
+    try t.expectError(error.AlreadyCompleted, resources.retain(&state, &buffers, first, 0, driver));
     const active = state.takeRelease().?;
     try resources.release(&buffers, active);
     try state.released(active, true);
+    try t.expect(buffers.pendingRelease() == null);
+    try buffers.drop(source_mapping, driver);
+    try buffers.drop(target_mapping, driver);
+    try t.expectError(error.Busy, buffers.endUse(source_dma.lease, driver, false));
+    try t.expectError(error.Busy, buffers.endUse(target_gpu.lease, driver, false));
+    try t.expect(buffers.pendingRelease() == null);
+    try buffers.endUse(source_dma.lease, driver, true);
+    try buffers.endUse(target_gpu.lease, driver, true);
     while (buffers.pendingRelease()) |ticket| try buffers.finishRelease(ticket, true);
     try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
 }

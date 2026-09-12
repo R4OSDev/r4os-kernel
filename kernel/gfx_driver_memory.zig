@@ -50,6 +50,13 @@ pub fn owner(id: u32, admission: bool) buffers.Error!Owner {
     defer lifecycleUnlock(token);
     return state.owner(id, admission);
 }
+// Caller already holds the common BO metadata owner. Recheck admission in
+// the same critical section that creates retained driver resources.
+pub fn admitLocked(identity: Owner) buffers.Error!void {
+    if (identity.kind != .driver or identity.id > std.math.maxInt(u32)) return error.WrongOwner;
+    const current = try state.owner(@intCast(identity.id), true);
+    if (!current.eql(identity)) return error.Stale;
+}
 pub fn beginClose(id: u32) void {
     const token = lifecycleLock();
     defer lifecycleUnlock(token);

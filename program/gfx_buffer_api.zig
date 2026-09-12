@@ -31,7 +31,8 @@ pub fn referenceLocked(reference: buffers.Handle, owner: buffers.Owner) buffers.
     return .{
         .buffer = publicHandle(try buffers.store.bufferFor(reference, owner)),
         .reference = publicHandle(reference),
-        .flags = if (try buffers.store.readOnly(reference, owner)) abi.gfx_buffer_reference_immutable else 0,
+        .flags = (if (try buffers.store.readOnly(reference, owner)) abi.gfx_buffer_reference_immutable else @as(u32, 0)) |
+            (if (try buffers.store.mappingOnly(reference, owner)) abi.gfx_buffer_reference_mapping_only else @as(u32, 0)),
     };
 }
 fn descriptor(value: abi.GfxBufferDescriptor) buffers.Error!buffers.layout.Descriptor {

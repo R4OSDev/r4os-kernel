@@ -167,6 +167,18 @@ pub fn nativeSegment(id: u32, fence: model.Fence, which: u32, offset: u64, mask:
     // program -> paging lock order. Never allocates a page list in an IRQ.
     return @import("../kernel/gfx_driver_memory.zig").dmaSegment(use, offset, mask);
 }
+pub const RetainedResource = struct { reference: buffers.Handle, buffer: buffers.Handle };
+pub fn retainNative(identity: buffers.Owner, fence: model.Fence, which: u32) Error!RetainedResource {
+    if (irq.inDispatch() or which > 1) return error.Invalid;
+    buffers.lock();
+    defer buffers.unlock();
+    try @import("../kernel/gfx_driver_memory.zig").admitLocked(identity);
+    const backend = try backendLocked(fence.binding);
+    if (!backend.owner.eql(identity)) return error.WrongOwner;
+    if (backend.closing) return error.DeviceLost;
+    const reference = try resources.retain(&state, &buffers.store, fence, which, identity);
+    return .{ .reference = reference, .buffer = buffers.store.bufferFor(reference, identity) catch unreachable };
+}
 pub fn completeNative(id: u32, fence: model.Fence, result: model.Result, quiesced: bool) Error!void {
     const instant = now();
     buffers.visibility();

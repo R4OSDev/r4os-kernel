@@ -79,7 +79,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             leases: u32 = 0,
             release_attempt: u64 = 0,
         };
-        const Reference = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, read_only: bool = false };
+        const Reference = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, read_only: bool = false, mapping_only: bool = false };
         const Lease = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, access: Access = .cpu_read, range: layout.Range = .{ .offset = 0, .bytes = 0 } };
 
         objects: [object_capacity]Object = .{Object{}} ** object_capacity,
@@ -163,11 +163,16 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             if (handle.id == 0 or handle.id > reference_capacity or handle.generation == 0) return error.Stale;
             const item = self.references[handle.id - 1];
             if (!item.handle.eql(handle)) return error.Stale;
+            if (item.mapping_only) return error.Unsupported;
             return self.importMode(item.buffer, consumer, item.read_only);
         }
 
         pub fn readOnly(self: *Self, handle: Handle, owner: Owner) Error!bool {
             return (try self.findReference(handle, owner)).read_only;
+        }
+
+        pub fn mappingOnly(self: *Self, handle: Handle, owner: Owner) Error!bool {
+            return (try self.findReference(handle, owner)).mapping_only;
         }
 
         pub fn drop(self: *Self, handle: Handle, owner: Owner) Error!void {
@@ -180,6 +185,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
 
         pub fn use(self: *Self, reference: Handle, owner: Owner, access: Access, offset: u64, bytes: u64) Error!Use {
             const ref_record = try self.findReference(reference, owner);
+            if (ref_record.mapping_only and access != .device_mapping) return error.Unsupported;
             if (ref_record.read_only and writes(access)) return error.Unsupported;
             const object = try self.referencedObject(reference, owner);
             if (object.phase != .live) return error.Closed;
@@ -221,6 +227,24 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             const lease = try self.findLease(result.lease, producer);
             lease.owner = queue_owner;
             return result;
+        }
+
+        // Only a validated, active native job may hand its existing queue
+        // lease to a driver. Producer exit closes public imports, but cannot
+        // revoke backing already held by that job. The new reference retains
+        // the whole BO for address translation, never for CPU access, sharing
+        // or execution. Those permissions and extents remain with queue uses.
+        pub fn retainQueued(self: *Self, handle: Handle, queue_owner: Owner, driver: Owner) Error!Handle {
+            if (queue_owner.kind != .kernel or !queue_owner.valid() or driver.kind != .driver or !driver.valid()) return error.Invalid;
+            const lease = try self.findLease(handle, queue_owner);
+            if (!queued(lease.access)) return error.Unsupported;
+            const object = try self.findObject(lease.buffer);
+            if (object.phase != .live or object.backing == null) return error.Closed;
+            const slot = self.freeReference() orelse return error.Capacity;
+            const reference = try self.nextHandle(slot);
+            self.references[slot] = .{ .handle = reference, .buffer = object.handle, .owner = driver, .mapping_only = true };
+            object.references += 1;
+            return reference;
         }
 
         // GPU/DMA/scanout leases need an engine/TLB completion or a proven
