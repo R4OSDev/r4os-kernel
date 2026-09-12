@@ -35,9 +35,12 @@ pub const Error = layout.Error || error{ Exhausted, Budget, Capacity, Stale, Bus
 pub const Create = struct { buffer: Handle, reference: Handle, bytes: u64 };
 pub const Use = struct { lease: Handle, buffer: Handle, access: Access, backing: Backing, range: layout.Range };
 pub const Release = struct { buffer: Handle, backing: Backing, attempt: u64 };
+pub const OwnedCreate = struct { create: Create, cookie: u64, driver: Owner, binding: layout.Binding };
+pub const OwnedRelease = struct { release: Release, driver: Owner, binding: layout.Binding };
 pub const Stats = struct { objects: usize = 0, references: usize = 0, leases: usize = 0, bytes: u64 = 0, retained_bytes: u64 = 0 };
 
 test "CPU backing release failure remains visible to the exact driver epoch without public references" {
+    try ownedBackingLifetime();
     const t = std.testing;
     var store = Table(2, 2, 2){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
     const owner: Owner = .{ .kind = .driver, .id = 8, .generation = 7 };
@@ -60,6 +63,69 @@ test "CPU backing release failure remains visible to the exact driver epoch with
     try t.expectEqual(@as(u64, 0), store.stats().bytes);
 }
 
+fn ownedBackingLifetime() !void {
+    const t = std.testing;
+    var store = Table(4, 8, 8){ .budget_bytes = 16384, .producer_budget_bytes = 16384 };
+    const driver: Owner = .{ .kind = .driver, .id = 7, .generation = 4 };
+    const stale: Owner = .{ .kind = .driver, .id = 7, .generation = 5 };
+    const app: Owner = .{ .kind = .program, .id = 8, .generation = 1 };
+    const binding: layout.Binding = .{ .adapter = 2, .driver_owner = 7, .device_generation = 9 };
+    const desc: layout.Descriptor = .{ .bytes = 4091, .location = .device_local, .binding = binding, .usage = 12 };
+    const reserved = try store.beginOwned(driver, desc, 0x100000001);
+    try t.expect(store.retainsDriver(driver));
+    try t.expect(!store.retainsDriver(stale));
+    try t.expectError(error.Closed, store.share(reserved.create.reference, app));
+    try t.expectError(error.Busy, store.beginOwned(driver, desc, reserved.cookie));
+    try t.expectError(error.WrongOwner, store.commitOwned(reserved, stale));
+    var forged = reserved;
+    forged.create.bytes -= 1;
+    try t.expectError(error.Stale, store.abortOwned(forged, driver, true));
+    forged = reserved; forged.cookie += 1;
+    try t.expectError(error.Stale, store.commitOwned(forged, driver));
+    try t.expectError(error.Busy, store.abortOwned(reserved, driver, false));
+    try store.commitOwned(reserved, driver);
+    try t.expectError(error.Stale, store.commitOwned(reserved, driver));
+    try t.expectError(error.Unsupported, store.use(reserved.create.reference, driver, .cpu_read, 0, 1));
+    const imported = try store.share(reserved.create.reference, app);
+    const device = try store.use(reserved.create.reference, driver, .device_write, 0, 4091);
+    try store.drop(reserved.create.reference, driver);
+    try t.expectEqual(@as(?OwnedRelease, null), try store.takeOwnedRelease(driver, binding));
+    try store.drop(imported, app);
+    try t.expectEqual(@as(?OwnedRelease, null), try store.takeOwnedRelease(driver, binding));
+    try t.expectError(error.Busy, store.endUse(device.lease, driver, false));
+    try store.endUse(device.lease, driver, true);
+    // A native object in the first slot cannot stall unrelated VM teardown.
+    const cpu = try store.begin(app, .{ .bytes = 4096 });
+    try store.publish(cpu, .{ .cookie = 88, .bytes = 4096 });
+    try store.drop(cpu.reference, app);
+    const cpu_release = store.pendingSystemRelease().?;
+    try t.expect(cpu_release.buffer.eql(cpu.buffer));
+    try store.finishRelease(cpu_release, true);
+    try t.expectEqual(@as(?Release, null), store.pendingSystemRelease());
+    var wrong_binding = binding; wrong_binding.device_generation += 1;
+    try t.expectEqual(@as(?OwnedRelease, null), try store.takeOwnedRelease(driver, wrong_binding));
+    try t.expectEqual(@as(?OwnedRelease, null), try store.takeOwnedRelease(stale, binding));
+    const release = (try store.takeOwnedRelease(driver, binding)).?;
+    try t.expectEqual(@as(?OwnedRelease, null), try store.takeOwnedRelease(driver, binding));
+    try t.expectError(error.Busy, store.finishOwnedRelease(release, driver, false));
+    var bad = release; bad.release.backing.bytes += 4096;
+    try t.expectError(error.Stale, store.finishOwnedRelease(bad, driver, true));
+    bad = release; bad.release.attempt += 1;
+    try t.expectError(error.Stale, store.finishOwnedRelease(bad, driver, true));
+    try t.expectError(error.WrongOwner, store.finishOwnedRelease(release, stale, true));
+    try t.expectEqual(@as(u64, 4096), store.stats().bytes);
+    try store.finishOwnedRelease(release, driver, true);
+    try t.expectError(error.Stale, store.finishOwnedRelease(release, driver, true));
+    const incomplete = try store.beginOwned(driver, desc, reserved.cookie);
+    store.stoppedOwner(driver);
+    try t.expect(store.retainsDriver(driver));
+    try t.expect(store.pendingReleaseForOwner(driver));
+    try t.expectError(error.Closed, store.commitOwned(incomplete, driver));
+    try store.abortOwned(incomplete, driver, true);
+    try t.expect(!store.retainsDriver(driver));
+    try t.expectEqual(@as(u64, 0), store.stats().bytes);
+}
+
 pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize, comptime lease_capacity: usize) type {
     comptime {
         if (object_capacity > std.math.maxInt(u32) or reference_capacity > std.math.maxInt(u32) or lease_capacity > std.math.maxInt(u32)) @compileError("buffer handle capacity exceeds u32");
@@ -78,6 +144,8 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             references: u32 = 0,
             leases: u32 = 0,
             release_attempt: u64 = 0,
+            owned_cookie: u64 = 0,
+            owned_reference: Handle = .{},
         };
         const Reference = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, read_only: bool = false, mapping_only: bool = false };
         const Lease = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, access: Access = .cpu_read, range: layout.Range = .{ .offset = 0, .bytes = 0 } };
@@ -110,6 +178,43 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             self.references[reference_slot] = .{ .handle = reference, .buffer = handle, .owner = producer };
             self.committed_bytes += validated.allocation_bytes;
             return .{ .buffer = handle, .reference = reference, .bytes = validated.allocation_bytes };
+        }
+
+        // Reserve common lifetime/budget before the driver starts allocating.
+        // This cookie is opaque; it is never interpreted as a VM or GPU address.
+        pub fn beginOwned(self: *Self, driver: Owner, descriptor: layout.Descriptor, cookie: u64) Error!OwnedCreate {
+            if (!driver.valid() or driver.kind != .driver or driver.id > std.math.maxInt(u32) or cookie == 0) return error.Invalid;
+            if (descriptor.location != .device_local or descriptor.binding.portable() or
+                descriptor.binding.driver_owner != driver.id or
+                descriptor.usage & (layout.Usage.cpu_read | layout.Usage.cpu_write) != 0) return error.Unsupported;
+            for (&self.objects) |object| {
+                if (object.phase != .empty and object.producer.eql(driver) and object.owned_cookie == cookie and
+                    std.meta.eql(object.descriptor.binding, descriptor.binding)) return error.Busy;
+            }
+            const ticket = try self.begin(driver, descriptor);
+            const object = try self.findObject(ticket.buffer);
+            object.owned_cookie = cookie;
+            object.owned_reference = ticket.reference;
+            return .{ .create = ticket, .cookie = cookie, .driver = driver, .binding = descriptor.binding };
+        }
+        fn ownedCreation(self: *Self, ticket: OwnedCreate, driver: Owner) Error!*Object {
+            if (!ticket.driver.eql(driver)) return error.WrongOwner;
+            const object = try self.findObject(ticket.create.buffer);
+            if (!object.producer.eql(driver)) return error.WrongOwner;
+            if (object.phase != .allocating or object.owned_cookie == 0 or object.owned_cookie != ticket.cookie or
+                !object.owned_reference.eql(ticket.create.reference) or object.allocation_bytes != ticket.create.bytes or
+                !std.meta.eql(object.descriptor.binding, ticket.binding)) return error.Stale;
+            return object;
+        }
+        pub fn commitOwned(self: *Self, ticket: OwnedCreate, driver: Owner) Error!void {
+            const object = try self.ownedCreation(ticket, driver);
+            if (!object.producer_open or object.references == 0) return error.Closed;
+            try self.publish(ticket.create, .{ .cookie = ticket.cookie, .bytes = ticket.create.bytes, .driver = driver });
+        }
+        pub fn abortOwned(self: *Self, ticket: OwnedCreate, driver: Owner, quiesced: bool) Error!void {
+            _ = try self.ownedCreation(ticket, driver);
+            if (!quiesced) return error.Busy;
+            try self.abort(ticket.create);
         }
 
         pub fn publish(self: *Self, ticket: Create, backing: Backing) Error!void {
@@ -301,19 +406,51 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         pub fn pendingReleaseForOwner(self: *const Self, producer: Owner) bool {
             for (&self.objects) |object| {
                 if ((object.phase == .releasing or object.phase == .destroying) and object.producer.eql(producer)) return true;
+                if (object.phase == .allocating and object.owned_cookie != 0 and object.producer.eql(producer)) return true;
             }
             return false;
         }
 
         pub fn pendingRelease(self: *Self) ?Release {
+            return self.pendingFiltered(null, false);
+        }
+        pub fn pendingSystemRelease(self: *Self) ?Release {
+            return self.pendingFiltered(null, true);
+        }
+        pub fn takeOwnedRelease(self: *Self, driver: Owner, binding: layout.Binding) Error!?OwnedRelease {
+            if (!driver.valid() or driver.kind != .driver or !binding.valid() or binding.portable() or binding.driver_owner != driver.id) return error.Invalid;
+            const filter: OwnedRelease = .{ .release = undefined, .driver = driver, .binding = binding };
+            const ticket = self.pendingFiltered(filter, false) orelse return null;
+            return .{ .release = ticket, .driver = driver, .binding = binding };
+        }
+        fn pendingFiltered(self: *Self, owned: ?OwnedRelease, system_only: bool) ?Release {
             for (&self.objects) |*object| if (object.phase == .releasing) {
                 const backing = object.backing orelse continue;
+                if (system_only and backing.driver != null) continue;
+                if (owned) |filter| {
+                    const driver = backing.driver orelse continue;
+                    if (object.owned_cookie == 0 or !driver.eql(filter.driver) or !std.meta.eql(object.descriptor.binding, filter.binding)) continue;
+                }
                 if (object.release_attempt == std.math.maxInt(u64)) continue;
                 object.release_attempt += 1;
                 object.phase = .destroying;
                 return .{ .buffer = object.handle, .backing = backing, .attempt = object.release_attempt };
             };
             return null;
+        }
+
+        pub fn finishOwnedRelease(self: *Self, ticket: OwnedRelease, driver: Owner, quiesced: bool) Error!void {
+            if (!ticket.driver.eql(driver)) return error.WrongOwner;
+            const object = try self.findObject(ticket.release.buffer);
+            const backing = object.backing orelse return error.Stale;
+            if (backing.driver == null or !backing.driver.?.eql(driver)) return error.WrongOwner;
+            if (object.owned_cookie == 0 or !std.meta.eql(object.descriptor.binding, ticket.binding) or
+                !std.meta.eql(backing, ticket.release.backing) or object.release_attempt != ticket.release.attempt or
+                object.phase != .destroying) return error.Stale;
+            // Unlike the CPU retry collector, an unconfirmed hardware release
+            // keeps this exact claimed ticket. It cannot be issued twice.
+            if (!quiesced) return error.Busy;
+            try self.finishRelease(ticket.release, true);
         }
 
         pub fn finishRelease(self: *Self, ticket: Release, released: bool) Error!void {
@@ -331,6 +468,9 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         }
 
         pub fn retainsDriver(self: *const Self, owner: Owner) bool {
+            for (&self.objects) |object| {
+                if (object.phase != .empty and object.owned_cookie != 0 and object.producer.eql(owner)) return true;
+            }
             for (&self.objects) |object| if (object.backing) |backing| if (backing.driver) |driver| {
                 if (driver.eql(owner)) return true;
             };

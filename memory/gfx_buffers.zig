@@ -145,14 +145,12 @@ pub fn collect() void {
     var count: usize = 0;
     while (count < capacity) : (count += 1) {
         lock();
-        const ticket = store.pendingRelease() orelse {
+        const ticket = store.pendingSystemRelease() orelse {
             unlock();
             return;
         };
         unlock();
-        // Device-local destruction is supplied by its retained driver in
-        // the later backend registration; it must not look like a VM ID.
-        const released = if (ticket.backing.driver != null) false else blk: {
+        const released = blk: {
             virt.release(@intCast(ticket.backing.cookie)) catch break :blk false;
             break :blk true;
         };
@@ -169,6 +167,8 @@ pub fn retainsDriver(owner: u32) bool {
     // The loader's owner ID is reusable; the driver memory bridge supplies
     // the actual nonwrapping driver-start epoch. Any surviving driver use vetoes reuse.
     for (&store.objects) |object| {
+        if (object.phase != .empty and object.owned_cookie != 0 and
+            object.producer.kind == .driver and object.producer.id == owner) return true;
         if ((object.phase == .releasing or object.phase == .destroying) and
             object.producer.kind == .driver and object.producer.id == owner) return true;
         if (object.backing) |backing| if (backing.driver) |driver| {

@@ -35,7 +35,7 @@ pub fn referenceLocked(reference: buffers.Handle, owner: buffers.Owner) buffers.
             (if (try buffers.store.mappingOnly(reference, owner)) abi.gfx_buffer_reference_mapping_only else @as(u32, 0)),
     };
 }
-fn descriptor(value: abi.GfxBufferDescriptor) buffers.Error!buffers.layout.Descriptor {
+pub fn descriptor(value: abi.GfxBufferDescriptor) buffers.Error!buffers.layout.Descriptor {
     if (value.version != 1 or value.size < @sizeOf(abi.GfxBufferDescriptor) or value.reserved0 != 0) return error.Invalid;
     var result = buffers.layout.Descriptor{
         .bytes = value.byte_length,

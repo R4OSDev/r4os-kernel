@@ -3503,10 +3503,33 @@ fn gfxCollect() callconv(.c) i32 {
     return if (current_owner != 0 and current_owner_guard.ownedByCurrent()) gfx_memory.collect(identity) else gfx_memory.collectBuffers(identity);
 }
 
+fn gfxOwnedReserve(input: *const outputs_contract.GfxBufferDescriptor, cookie: u64, output: *outputs_contract.GfxOwnedBufferReservation) callconv(.c) i32 {
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return @import("gfx_owned_buffers.zig").reserve(identity, input, cookie, output);
+}
+fn gfxOwnedCommit(input: *const outputs_contract.GfxOwnedBufferReservation, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return @import("gfx_owned_buffers.zig").commit(identity, input, output);
+}
+fn gfxOwnedAbort(input: *const outputs_contract.GfxOwnedBufferReservation, quiesced: u32) callconv(.c) i32 {
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return @import("gfx_owned_buffers.zig").abort(identity, input, quiesced);
+}
+fn gfxOwnedTakeRelease(adapter: u32, generation: u64, output: *outputs_contract.GfxOwnedBufferRelease) callconv(.c) i32 {
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return @import("gfx_owned_buffers.zig").take(identity, adapter, generation, output);
+}
+fn gfxOwnedFinishRelease(input: *const outputs_contract.GfxOwnedBufferRelease, quiesced: u32) callconv(.c) i32 {
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return @import("gfx_owned_buffers.zig").finish(identity, input, quiesced);
+}
+
 fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32 {
-    if (!gfx_api.validOutput(outputs_contract.GfxDriverMemoryApi, output)) return outputs_contract.gfx_buffer_error_invalid;
+    if (@intFromPtr(output) == 0 or output.version != 1 or output.size < 112) return outputs_contract.gfx_buffer_error_invalid;
     _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    output.* = .{
+    const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverMemoryApi));
+    const value: outputs_contract.GfxDriverMemoryApi = .{
+        .size = bytes,
         .buffer_create = @intFromPtr(&gfxBufferCreate),
         .buffer_describe = @intFromPtr(&gfxBufferDescribe),
         .buffer_import = @intFromPtr(&gfxBufferImport),
@@ -3520,7 +3543,13 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
         .mmio_unmap = if (current_owner != 0 and current_owner_guard.ownedByCurrent()) @intFromPtr(&gfxMmioUnmap) else 0,
         .collect = @intFromPtr(&gfxCollect),
         .buffer_stats = @intFromPtr(&gfxMemoryStats),
+        .buffer_reserve = @intFromPtr(&gfxOwnedReserve),
+        .buffer_commit = @intFromPtr(&gfxOwnedCommit),
+        .buffer_abort = @intFromPtr(&gfxOwnedAbort),
+        .buffer_take_release = @intFromPtr(&gfxOwnedTakeRelease),
+        .buffer_finish_release = @intFromPtr(&gfxOwnedFinishRelease),
     };
+    @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_buffer_result_ok;
 }
 
