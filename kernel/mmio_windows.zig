@@ -46,7 +46,7 @@ pub fn Manager(comptime Backend: type) type {
             if (!backend.deviceSpan(extent.physical, extent.bytes)) return error.Unsupported;
             const cpu = backend.cpuAddress(extent.physical, extent.bytes) orelse return error.Overflow;
             var slot: ?usize = null;
-            for (self.records, 0..) |record, index| {
+            for (&self.records, 0..) |*record, index| {
                 if (!record.used) {
                     slot = slot orelse index;
                     continue;
@@ -100,7 +100,11 @@ pub fn Manager(comptime Backend: type) type {
             return all_released;
         }
         pub fn retains(self: *const Self, owner: Owner) bool {
-            for (self.records) |record| if (record.used and record.owner.eql(owner)) return true;
+            for (&self.records) |*record| if (record.used and record.owner.eql(owner)) return true;
+            return false;
+        }
+        pub fn pending(self: *const Self, owner: Owner) bool {
+            for (&self.records) |*record| if (record.used and record.retiring and record.owner.eql(owner)) return true;
             return false;
         }
         fn reclaim(self: *Self, backend: *Backend, record: *Record) bool {
@@ -153,15 +157,18 @@ test "MMIO windows keep 64-bit offsets, reject cache aliases and retain failed T
     var backend = Fake{};
     var manager = Manager(Fake){};
     const window = try manager.create(&backend, owner, request);
+    try t.expect(!manager.pending(owner));
     try t.expectEqual(@as(u64, 0x2_0000_1000), window.physical);
     try t.expect(window.cpu != window.physical);
     try t.expectError(error.Busy, manager.release(&backend, owner, window.handle, false));
     backend.fail_unmap = true;
     try t.expectError(error.Busy, manager.release(&backend, owner, window.handle, true));
+    try t.expect(manager.pending(owner));
     try t.expect(manager.retains(owner));
     try t.expectEqual(request.bytes, manager.charged);
     backend.fail_unmap = false;
     try t.expect(manager.collect(&backend, owner));
+    try t.expect(!manager.pending(owner));
     try t.expectEqual(@as(u64, 0), manager.charged);
     try t.expectError(error.Stale, manager.release(&backend, owner, window.handle, true));
     backend.entries = .{Policy.write_combining} ** 8;

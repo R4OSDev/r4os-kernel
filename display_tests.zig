@@ -13,4 +13,5 @@ test {
     _ = @import("memory/gfx_buffer_owner.zig");
     _ = @import("program/gfx_buffer_api.zig");
     _ = @import("kernel/mmio_windows.zig");
+    _ = @import("kernel/gfx_driver_memory_owner.zig");
 }

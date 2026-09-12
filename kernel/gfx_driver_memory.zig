@@ -1,5 +1,6 @@
-// Owner-authenticated memory operations behind DriverApi's optional v25
-// query. The enclosing DriverApi execution guard serializes this state.
+// Owner-authenticated memory operations in Init/Work/Shutdown. The shared
+// BO lock protects driver/device metadata; no page walk or external resource
+// operation spans it. MMIO alone retains its legacy execution guard.
 const std = @import("std");
 const abi = @import("r4os_kernel_contract");
 const buffers = @import("../memory/gfx_buffers.zig");
@@ -8,44 +9,67 @@ const paging = @import("../memory/paging.zig");
 const boot = @import("../bootloader/boot_info.zig");
 const cpu = @import("../platform/cpu.zig");
 const windows = @import("mmio_windows.zig");
+const ownership = @import("gfx_driver_memory_owner.zig");
+const task_context = @import("../sched/task_context.zig");
+const scheduler = @import("../sched/scheduler.zig");
+const interrupts = @import("../arch/x86_64/interrupts.zig");
 pub const Owner = buffers.Owner;
-const Epoch = struct { id: u32 = 0, generation: u64 = 0, closing: bool = false };
-var epochs: [128]Epoch = .{Epoch{}} ** 128;
-var serial: u64 = 0;
-const Device = struct { owner: Owner = .{ .kind = .driver, .id = 0, .generation = 0 }, descriptor: abi.GfxDeviceLease = .{} };
-var devices: [1024]Device = .{Device{}} ** 1024;
+var state: ownership.State(@import("../driver/registry.zig").MAX_DRIVERS, 1024) = .{};
 
+const LifecycleToken = union(enum) { boot: u64, task };
+fn lifecycleLock() LifecycleToken {
+    if (scheduler.current() == null) {
+        // Preloaded XHCI/storage drivers bind before Task/SMP admission.
+        // No BO operation is admitted here, and no worker can coexist.
+        const flags = interrupts.saveAndDisableLocal();
+        std.debug.assert(!interrupts.runtimeSerializationEnabled());
+        return .{ .boot = flags };
+    }
+    buffers.lock();
+    return .task;
+}
+fn lifecycleUnlock(token: LifecycleToken) void {
+    switch (token) {
+        .boot => |flags| interrupts.restoreLocal(flags),
+        .task => buffers.unlock(),
+    }
+}
+pub fn bind(id: u32, generation: u64) bool {
+    const token = lifecycleLock();
+    defer lifecycleUnlock(token);
+    return state.bind(id, generation);
+}
+// Only the loader's unpublished bind rollback may use this entrypoint.
+pub fn discardEmptyBinding(id: u32, generation: u64) bool {
+    const token = lifecycleLock();
+    defer lifecycleUnlock(token);
+    return state.retire(.{ .kind = .driver, .id = id, .generation = generation });
+}
 pub fn owner(id: u32, admission: bool) buffers.Error!Owner {
-    if (id == 0) return error.Invalid;
-    for (epochs) |epoch| if (epoch.id == id) {
-        if (admission and epoch.closing) return error.Closed;
-        return .{ .kind = .driver, .id = id, .generation = epoch.generation };
-    };
-    if (!admission) return error.Stale;
-    if (serial == std.math.maxInt(u64)) return error.Exhausted;
-    for (&epochs) |*epoch| if (epoch.id == 0) {
-        serial += 1;
-        epoch.* = .{ .id = id, .generation = serial };
-        return .{ .kind = .driver, .id = id, .generation = serial };
-    };
-    return error.Capacity;
+    const token = lifecycleLock();
+    defer lifecycleUnlock(token);
+    return state.owner(id, admission);
 }
 pub fn beginClose(id: u32) void {
-    for (&epochs) |*epoch| if (epoch.id == id) {
-        epoch.closing = true;
-    };
+    const token = lifecycleLock();
+    defer lifecycleUnlock(token);
+    state.close(id);
 }
 pub fn retained(id: u32) bool {
-    const identity = owner(id, false) catch return false;
-    for (devices) |item| if (item.descriptor.lease.id != 0 and item.owner.eql(identity)) return true;
-    return mmio.retains(identity) or buffers.retainsDriver(id);
+    const held = blk: {
+        const token = lifecycleLock();
+        defer lifecycleUnlock(token);
+        const identity = state.owner(id, false) catch return false;
+        break :blk state.retains(identity);
+    };
+    return held or (scheduler.current() != null and buffers.retainsDriver(id));
 }
 pub fn finishOwner(id: u32) void {
     const identity = owner(id, false) catch return;
-    buffers.stopped(identity);
-    for (&epochs) |*epoch| if (epoch.id == id) {
-        epoch.* = .{};
-    };
+    if (scheduler.current() != null) buffers.stopped(identity);
+    const token = lifecycleLock();
+    defer lifecycleUnlock(token);
+    std.debug.assert(state.retire(identity));
 }
 
 pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_ptr: *const abi.GfxDeviceRequest, output: *abi.GfxDeviceLease) i32 {
@@ -58,12 +82,9 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
         (request.address_space == 1 and (request.gpu_virtual_address == 0 or request.gpu_virtual_address > std.math.maxInt(u64) - request.byte_length)) or
         (request.access == 4 and request.address_space != 0) or
         (request.access == 3 and (request.byte_offset | request.byte_length | request.gpu_virtual_address) % paging.PAGE_SIZE != 0)) return abi.gfx_buffer_error_invalid;
-    var free: ?*Device = null;
-    for (&devices) |*item| if (item.descriptor.lease.id == 0) {
-        free = item;
-        break;
-    };
-    const record = free orelse return abi.gfx_buffer_error_capacity;
+    const call = task_context.enterUnwind();
+    if (!call.admitted()) return abi.gfx_buffer_error_busy;
+    defer _ = task_context.leaveUnwind(call);
     buffers.lock();
     const desc = buffers.store.describe(ref, identity) catch |err| {
         buffers.unlock();
@@ -84,22 +105,7 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
         buffers.unlock();
         return api.status(err);
     };
-    buffers.unlock();
-    // Admission retains the backing during this bounded page walk. No CPU
-    // pointer is ever published as a GPU VA or substituted for a DMA page.
-    if (request.address_space == 0) {
-        var offset: u64 = 0;
-        while (offset < request.byte_length) {
-            const piece = dmaSegment(use, offset, request.dma_mask) catch |err| {
-                buffers.lock();
-                buffers.store.endUse(use.lease, identity, true) catch unreachable;
-                buffers.unlock();
-                return api.status(err);
-            };
-            offset = piece.next_offset;
-        }
-    }
-    record.* = .{ .owner = identity, .descriptor = .{
+    const descriptor: abi.GfxDeviceLease = .{
         .lease = api.publicHandle(use.lease),
         .byte_offset = request.byte_offset,
         .byte_length = request.byte_length,
@@ -110,16 +116,40 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
         .access = request.access,
         .address_space = request.address_space,
         .dma_mask = request.dma_mask,
-    } };
-    output.* = record.descriptor;
+    };
+    const record = state.reserve(identity, descriptor) catch |err| {
+        buffers.store.endUse(use.lease, identity, true) catch unreachable;
+        buffers.unlock();
+        return api.status(err);
+    };
+    buffers.unlock();
+    // Both the backing and a busy device slot survive this page walk.
+    // Another admission cannot reuse the slot, even if this one fails.
+    if (request.address_space == 0) {
+        var offset: u64 = 0;
+        while (offset < request.byte_length) {
+            const piece = dmaSegment(use, offset, request.dma_mask) catch |err| {
+                buffers.lock();
+                buffers.store.endUse(use.lease, identity, true) catch unreachable;
+                record.* = .{};
+                buffers.unlock();
+                buffers.collect();
+                return api.status(err);
+            };
+            offset = piece.next_offset;
+        }
+    }
+    buffers.lock();
+    record.busy = false;
+    buffers.unlock();
+    output.* = descriptor;
     return abi.gfx_buffer_result_ok;
 }
-fn matching(identity: Owner, input: *const abi.GfxDeviceLease) ?*Device {
+fn leaseValue(input: *const abi.GfxDeviceLease) ?abi.GfxDeviceLease {
     if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(abi.GfxDeviceLease)) return null;
     var normalized = input.*;
     normalized.size = @sizeOf(abi.GfxDeviceLease);
-    for (&devices) |*item| if (item.descriptor.lease.id != 0 and item.owner.eql(identity) and std.meta.eql(item.descriptor, normalized)) return item;
-    return null;
+    return normalized;
 }
 pub fn dmaSegment(use: buffers.lifetime.Use, offset: u64, mask: u64) buffers.Error!abi.GfxDmaSegment {
     if (offset >= use.range.bytes or use.backing.cpu_address == 0 or use.backing.cache != .write_back or use.backing.driver != null) return error.Unsupported;
@@ -133,11 +163,12 @@ pub fn dmaSegment(use: buffers.lifetime.Use, offset: u64, mask: u64) buffers.Err
 }
 pub fn segment(identity: Owner, input: *const abi.GfxDeviceLease, offset: u64, output: *abi.GfxDmaSegment) i32 {
     if (!api.validOutput(abi.GfxDmaSegment, output)) return abi.gfx_buffer_error_invalid;
-    const record = matching(identity, input) orelse return abi.gfx_buffer_error_stale;
-    if (record.descriptor.address_space != 0) return abi.gfx_buffer_error_unsupported;
+    const descriptor = leaseValue(input) orelse return abi.gfx_buffer_error_stale;
     const value = blk: {
         buffers.lock();
         defer buffers.unlock();
+        const record = state.matching(identity, descriptor) catch |err| return api.status(err);
+        if (record.descriptor.address_space != 0) return abi.gfx_buffer_error_unsupported;
         const use = buffers.store.useInfo(api.handle(record.descriptor.lease) catch unreachable, identity) catch |err| return api.status(err);
         break :blk dmaSegment(use, offset, record.descriptor.dma_mask) catch |err| return api.status(err);
     };
@@ -145,9 +176,19 @@ pub fn segment(identity: Owner, input: *const abi.GfxDeviceLease, offset: u64, o
     return abi.gfx_buffer_result_ok;
 }
 pub fn release(identity: Owner, input: *const abi.GfxDeviceLease, quiesced: u32) i32 {
-    const record = matching(identity, input) orelse return abi.gfx_buffer_error_stale;
-    if (quiesced != 1) return if (quiesced == 0) abi.gfx_buffer_error_busy else abi.gfx_buffer_error_invalid;
+    const descriptor = leaseValue(input) orelse return abi.gfx_buffer_error_stale;
+    const call = task_context.enterUnwind();
+    if (!call.admitted()) return abi.gfx_buffer_error_busy;
+    defer _ = task_context.leaveUnwind(call);
     buffers.lock();
+    const record = state.matching(identity, descriptor) catch |err| {
+        buffers.unlock();
+        return api.status(err);
+    };
+    if (quiesced != 1) {
+        buffers.unlock();
+        return if (quiesced == 0) abi.gfx_buffer_error_busy else abi.gfx_buffer_error_invalid;
+    }
     buffers.visibility();
     buffers.store.endUse(api.handle(record.descriptor.lease) catch unreachable, identity, true) catch |err| {
         buffers.unlock();
@@ -229,6 +270,8 @@ pub fn mapWindow(identity: Owner, input: *const abi.GfxMmioRequest, output: *abi
         abi.gfx_buffer_cache_write_combining => .write_combining,
         else => return abi.gfx_buffer_error_unsupported,
     };
+    beginMmio(identity);
+    defer endMmio(identity);
     const result = mmio.create(&backend, identity, .{ .resource_base = input.resource_base, .resource_bytes = input.resource_bytes, .offset = input.byte_offset, .bytes = input.byte_length, .policy = cache, .prefetchable = (input.resource_flags & 1) != 0 }) catch |err| return windowStatus(err);
     output.* = .{ .handle = api.publicHandle(result.handle), .cpu_address = result.cpu, .physical_address = result.physical, .byte_length = result.bytes, .cache_policy = input.cache_policy, .flags = if (result.borrowed) 1 else 0 };
     return abi.gfx_buffer_result_ok;
@@ -236,11 +279,39 @@ pub fn mapWindow(identity: Owner, input: *const abi.GfxMmioRequest, output: *abi
 pub fn unmapWindow(identity: Owner, input: *const abi.GfxBufferHandle, quiesced: u32) i32 {
     if (@intFromPtr(input) == 0 or quiesced > 1) return abi.gfx_buffer_error_invalid;
     const handle = api.handle(input.*) catch |err| return api.status(err);
+    beginMmio(identity);
+    defer endMmio(identity);
     mmio.release(&backend, identity, handle, quiesced == 1) catch |err| return windowStatus(err);
     return abi.gfx_buffer_result_ok;
 }
 pub fn collect(identity: Owner) i32 {
+    // Only Init/Shutdown may invoke the MMIO manager. Publish its status
+    // for concurrent Work collectors without extending MMIO admission.
+    beginMmio(identity);
     buffers.collect();
     const windows_released = mmio.collect(&backend, identity);
+    endMmio(identity);
     return if (windows_released and !buffers.pendingReleaseForOwner(identity)) abi.gfx_buffer_result_ok else abi.gfx_buffer_error_busy;
+}
+pub fn collectBuffers(identity: Owner) i32 {
+    buffers.collect();
+    const pending = blk: {
+        buffers.lock();
+        defer buffers.unlock();
+        break :blk state.pendingMmio(identity);
+    };
+    return if (!pending and !buffers.pendingReleaseForOwner(identity)) abi.gfx_buffer_result_ok else abi.gfx_buffer_error_busy;
+}
+fn beginMmio(identity: Owner) void {
+    buffers.lock();
+    defer buffers.unlock();
+    state.beginMmio(identity);
+}
+fn endMmio(identity: Owner) void {
+    // The enclosing lifecycle guard owns these manager reads, too.
+    const held = mmio.retains(identity);
+    const pending = mmio.pending(identity);
+    buffers.lock();
+    defer buffers.unlock();
+    state.endMmio(identity, held, pending);
 }

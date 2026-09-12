@@ -503,7 +503,14 @@ pub fn bindModuleResources(owner: u32, module_slot: usize) bool {
         driver_resources.state.finish(owner);
         return false;
     }
+    if (!gfx_memory.bind(owner, binding.epoch)) {
+        std.debug.assert(driver_semaphores.discardEmptyBinding(owner, binding.epoch));
+        std.debug.assert(driver_threads.discardEmptyBinding(owner, binding.epoch));
+        driver_resources.state.finish(owner);
+        return false;
+    }
     if (!driver_heap.bind(owner, binding.epoch)) {
+        std.debug.assert(gfx_memory.discardEmptyBinding(owner, binding.epoch));
         std.debug.assert(driver_semaphores.discardEmptyBinding(owner, binding.epoch));
         std.debug.assert(driver_threads.discardEmptyBinding(owner, binding.epoch));
         driver_resources.state.finish(owner);
@@ -575,7 +582,9 @@ pub fn displaySystemTransitionQuiesced(owner: u32) bool {
     if (display.retainsDriverOwner(owner) or @import("../display/native_driver.zig").retained(owner) or
         gfx_memory.retained(owner) or @import("../display/queue.zig").retainsDriver(owner) or
         !driver_threads.callbacksQuiesced(owner)) return false;
-    return driver_work.cleanupOwner(owner).quiesced;
+    if (!driver_work.cleanupOwner(owner).quiesced) return false;
+    // An admission before close may finish while shared Work is draining.
+    return !gfx_memory.retained(owner) and !@import("../display/queue.zig").retainsDriver(owner);
 }
 
 pub fn quarantineOwnerCleanup(token: *OwnerCleanupToken) bool {
@@ -674,6 +683,14 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         bootlog.puts("[R4D] cleanup owner=");
         bootlog.putDec(owner);
         bootlog.puts(" work-quiesce=FAILED dma=retained resources=quarantined\r\n");
+        return false;
+    }
+    // Work now owns common BO operations. A call admitted before close can
+    // finish after the earlier retention check; recheck after quiescence,
+    // before any generic DMA/heap/module destruction.
+    if (gfx_memory.retained(owner) or @import("../display/queue.zig").retainsDriver(owner)) {
+        token.active = false;
+        bootlog.puts("[R4D] cleanup work=quiesced graphics=retained resources=quarantined\r\n");
         return false;
     }
     const work_count = work_cleanup.removed;
@@ -3140,13 +3157,23 @@ fn upper(c: u8) u8 {
 
 fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
     if (current_owner == 0 or !current_owner_guard.ownedByCurrent()) return error.WrongOwner;
-    return gfx_memory.owner(current_owner, admission);
+    return currentBufferOwner(admission);
+}
+
+// Common BOs support normal Work. The real driver-start binding is installed
+// before Init, closed under the same BO metadata owner and retired only after
+// work and hardware leases quiesce. A cached table conveys no caller identity.
+fn currentBufferOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
+    if (irq_router.inDispatch() or scheduler.current() == null or currentStorageCallbackOwner() != 0 or driver_threads.currentOwner() != 0) return error.WrongOwner;
+    const owner = activeOwner();
+    if (owner == 0) return error.WrongOwner;
+    return gfx_memory.owner(owner, admission);
 }
 
 // Receiver metadata supports authenticated Init/Work/Shutdown without the
 // wait-spanning lifecycle guard. Read the already-bound start epoch through
 // the resident runtime owner; do not widen PCI/DMA/display admission or use
-// the unsynchronized legacy graphics-memory epoch table from a worker.
+// any caller-supplied driver identity.
 fn currentReceiverOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
     if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0 or driver_threads.currentOwner() != 0) return error.WrongOwner;
     const owner = activeOwner();
@@ -3304,10 +3331,7 @@ fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i
     // Version-1 consumers may still allocate exactly the original 40-byte
     // prefix. Publish only complete slots within their actual capacity.
     const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverDisplayApi));
-    const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes,
-        .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare),
-        .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule),
-        .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish) };
+    const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes, .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule), .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish) };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_output_ok;
 }
@@ -3340,10 +3364,7 @@ fn gfxDisplaySchedule(input: *const outputs_contract.GfxBackendBinding) callconv
 }
 fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32 {
     _ = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
-    return @import("../display/output_state.zig").driverTable(output, .{
-        .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw),
-        .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace),
-        .close_source = @intFromPtr(&gfxReceiverClose) });
+    return @import("../display/output_state.zig").driverTable(output, .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw), .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace), .close_source = @intFromPtr(&gfxReceiverClose) });
 }
 fn gfxReceiverRegister(adapter: u32, output: *outputs_contract.GfxReceiverSource) callconv(.c) i32 {
     if (@intFromPtr(output) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
@@ -3415,47 +3436,47 @@ fn gfxQueueSegment(input: *const outputs_contract.GfxFence, which: u32, offset: 
 }
 
 fn gfxBufferCreate(input: *const outputs_contract.GfxBufferDescriptor, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
     return gfx_api.create(identity, input, output);
 }
 
 fn gfxBufferDescribe(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferDescriptor) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
     return gfx_api.describe(identity, input, output);
 }
 
 fn gfxBufferImport(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
     return gfx_api.import(identity, input, output);
 }
 
 fn gfxBufferRelease(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
     return gfx_api.release(identity, input);
 }
 
 fn gfxBufferMap(input: *const outputs_contract.GfxBufferHandle, access: u32, offset: u64, bytes: u64, output: *outputs_contract.GfxBufferMap) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
     return gfx_api.map(identity, input, access, offset, bytes, output);
 }
 
 fn gfxBufferUnmap(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
     return gfx_api.unmap(identity, input);
 }
 
 fn gfxDeviceAcquire(reference: *const outputs_contract.GfxBufferHandle, request: *const outputs_contract.GfxDeviceRequest, output: *outputs_contract.GfxDeviceLease) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
     return gfx_memory.acquire(identity, reference, request, output);
 }
 
 fn gfxDeviceSegment(lease: *const outputs_contract.GfxDeviceLease, offset: u64, output: *outputs_contract.GfxDmaSegment) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
     return gfx_memory.segment(identity, lease, offset, output);
 }
 
 fn gfxDeviceRelease(lease: *const outputs_contract.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
     return gfx_memory.release(identity, lease, quiesced);
 }
 
@@ -3470,13 +3491,13 @@ fn gfxMmioUnmap(window: *const outputs_contract.GfxBufferHandle, quiesced: u32) 
 }
 
 fn gfxCollect() callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    return gfx_memory.collect(identity);
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return if (current_owner != 0 and current_owner_guard.ownedByCurrent()) gfx_memory.collect(identity) else gfx_memory.collectBuffers(identity);
 }
 
 fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32 {
     if (!gfx_api.validOutput(outputs_contract.GfxDriverMemoryApi, output)) return outputs_contract.gfx_buffer_error_invalid;
-    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
     output.* = .{
         .buffer_create = @intFromPtr(&gfxBufferCreate),
         .buffer_describe = @intFromPtr(&gfxBufferDescribe),
@@ -3487,8 +3508,8 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
         .device_acquire = @intFromPtr(&gfxDeviceAcquire),
         .device_segment = @intFromPtr(&gfxDeviceSegment),
         .device_release = @intFromPtr(&gfxDeviceRelease),
-        .mmio_map = @intFromPtr(&gfxMmioMap),
-        .mmio_unmap = @intFromPtr(&gfxMmioUnmap),
+        .mmio_map = if (current_owner != 0 and current_owner_guard.ownedByCurrent()) @intFromPtr(&gfxMmioMap) else 0,
+        .mmio_unmap = if (current_owner != 0 and current_owner_guard.ownedByCurrent()) @intFromPtr(&gfxMmioUnmap) else 0,
         .collect = @intFromPtr(&gfxCollect),
         .buffer_stats = @intFromPtr(&gfxMemoryStats),
     };
@@ -3496,6 +3517,6 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
 }
 
 fn gfxMemoryStats(output: *outputs_contract.GfxBufferStats) callconv(.c) i32 {
-    _ = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    _ = currentBufferOwner(false) catch |err| return gfx_api.status(err);
     return gfx_api.stats(output);
 }
