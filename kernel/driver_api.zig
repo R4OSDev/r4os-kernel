@@ -3331,7 +3331,7 @@ fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i
     // Version-1 consumers may still allocate exactly the original 40-byte
     // prefix. Publish only complete slots within their actual capacity.
     const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverDisplayApi));
-    const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes, .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule), .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish) };
+    const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes, .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule), .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish), .prepare_held = @intFromPtr(&gfxDisplayPrepareHeld) };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_output_ok;
 }
@@ -3352,6 +3352,10 @@ fn gfxDisplayBootInfo(output: *outputs_contract.GfxNativeBootInfo) callconv(.c) 
 fn gfxDisplayPrepare(input: *const outputs_contract.GfxNativeRegistration, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
     const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
     return native_display.prepare(identity, input, output);
+}
+fn gfxDisplayPrepareHeld(input: *const outputs_contract.GfxNativeRegistration, generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return @import("../display/boot_driver.zig").prepareHeld(identity, input, generation, output);
 }
 fn gfxDisplayTransition(generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);

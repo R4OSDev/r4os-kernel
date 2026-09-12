@@ -4,6 +4,7 @@
 const std = @import("std");
 const abi = @import("r4os_kernel_contract");
 const display = @import("display.zig");
+const boot_driver = @import("boot_driver.zig");
 const framebuffer = @import("framebuffer.zig");
 const buffers = @import("../memory/gfx_buffers.zig");
 const buffer_api = @import("../program/gfx_buffer_api.zig");
@@ -27,13 +28,27 @@ const Bridge = struct {
     pending: ?queue.model.Fence = null,
     bytes: u64 = 0,
     frame: framebuffer.Framebuffer = undefined,
+    held_generation: u64 = 0,
+    generation: u64 = 0,
+    ready: bool = false,
+    cancelled: bool = false,
+    hardware_restored: bool = false,
+    pixels_restored: bool = false,
+    queue_stopped: bool = false,
 };
 var bridge: Bridge = .{};
+// Different R4D owners can call this global bridge concurrently. Callbacks
+// also enter from normal display presentation, outside a driver transition.
+// Reentrance is required for a transition's own commit/CPU/restore callbacks;
+// competing tasks get Busy. This guard permits waits and never holds an I/O
+// owner across the queue completion or the actual driver callback.
+var execution = @import("../sched/sync.zig").UnwindGuard.init("native-display-driver");
+var retained_owner: u32 = 0;
 
 fn binding(value: abi.GfxBackendBinding) queue.model.Binding {
     return .{ .adapter = value.adapter_id, .device_generation = value.device_generation, .reset_generation = value.reset_generation };
 }
-pub fn retained(id: u32) bool { return id != 0 and bridge.driver_owner.id == id; }
+pub fn retained(id: u32) bool { return id != 0 and @atomicLoad(u32, &retained_owner, .acquire) == id; }
 pub fn code(err: Error) i32 {
     return switch (err) {
         error.Busy => abi.gfx_output_error_busy,
@@ -68,7 +83,7 @@ pub fn bootInfo(output: *abi.GfxNativeBootInfo) i32 {
 }
 fn stateResult(id: u32, outcome: u32) abi.GfxNativeState {
     const state = display.backendState();
-    return .{ .generation = if (state.pending_owner == id) state.pending_generation else state.generation,
+    return .{ .generation = if (retained(id) and !bridge.ready) bridge.generation else if (state.pending_owner == id) state.pending_generation else state.generation,
         .state = @intFromEnum(state.state), .outcome = outcome,
         .retained = @intFromBool(display.retainsDriverOwner(id) or retained(id)) };
 }
@@ -80,12 +95,26 @@ pub fn validAdapter(adapter: u32) bool {
     return false;
 }
 pub fn prepare(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, output: *abi.GfxNativeState) i32 {
-    if (@intFromPtr(input) == 0 or irq.inDispatch() or !buffer_api.validOutput(abi.GfxNativeState, output)) return abi.gfx_output_error_invalid;
-    const result = prepareImpl(identity, input.*) catch |err| return code(err);
+    return prepareRequest(identity, input, 0, output);
+}
+pub fn prepareHeld(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, generation: u64, output: *abi.GfxNativeState) i32 {
+    if (generation == 0) return abi.gfx_output_error_stale;
+    return prepareRequest(identity, input, generation, output);
+}
+fn prepareRequest(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, held_generation: u64, output: *abi.GfxNativeState) i32 {
+    if (@intFromPtr(input) == 0 or irq.inDispatch() or input.version != 1 or input.size < @sizeOf(abi.GfxNativeRegistration) or
+        !buffer_api.validOutput(abi.GfxNativeState, output)) return abi.gfx_output_error_invalid;
+    if (!execution.enter(0)) return abi.gfx_output_error_busy;
+    defer _ = execution.leave();
+    const result = prepareImpl(identity, input.*, held_generation) catch |err| {
+        if (bridge.driver_owner.eql(identity) and !bridge.ready)
+            output.* = stateResult(@intCast(identity.id), abi.gfx_output_outcome_lost);
+        return code(err);
+    };
     output.* = result;
     return abi.gfx_output_ok;
 }
-fn prepareImpl(identity: buffers.Owner, request: abi.GfxNativeRegistration) Error!abi.GfxNativeState {
+fn prepareImpl(identity: buffers.Owner, request: abi.GfxNativeRegistration, held_generation: u64) Error!abi.GfxNativeState {
     if (identity.kind != .driver or !identity.valid() or bridge.driver_owner.id != 0) return error.Busy;
     if (request.version != 1 or request.size < @sizeOf(abi.GfxNativeRegistration) or request.reference.reserved0 != 0 or
         request.commit_callback < 0xffff800000000000 or request.restore_callback < 0xffff800000000000 or
@@ -114,35 +143,54 @@ fn prepareImpl(identity: buffers.Owner, request: abi.GfxNativeRegistration) Erro
         break :blk .{ .reference = reference, .address = mapped.backing.cpu_address, .descriptor = descriptor };
     };
     bridge = .{ .driver_owner = identity, .registration = request, .reference = prepared.reference,
-        .bytes = prepared.descriptor.bytes, .frame = saved.framebuffer };
-    errdefer _ = discard();
+        .bytes = prepared.descriptor.bytes, .frame = saved.framebuffer, .held_generation = held_generation };
+    @atomicStore(u32, &retained_owner, @intCast(identity.id), .release);
+    errdefer cancelPreparation();
     bridge.frame.address = @ptrFromInt(prepared.address);
     bridge.frame.pitch = prepared.descriptor.planes[0].pitch;
     bridge.frame.edid = null; bridge.frame.edid_size = 0;
-    bridge.timeline = try queue.open(owner, .{ .binding = binding(request.backend), .milestone = .device_execution, .capacity = 1 });
-    try queue.bindDisplayQueue(@intCast(identity.id), binding(request.backend), bridge.timeline);
     var mode = saved.mode;
     mode.pitch = @intCast(bridge.frame.pitch);
-    _ = try display.prepareNative(.{ .owner = identity.id, .adapter_id = request.backend.adapter_id,
+    const candidate = display.NativeBackend{ .owner = identity.id, .adapter_id = request.backend.adapter_id,
         .target = .{ .name = bridge.registration.name[0..end], .kind = .native, .flags = 255, .mode = mode,
             .mapping = .{ .kind = .native_scanout, .virt_base = prepared.address, .byte_len = bridge.bytes }, .framebuffer = &bridge.frame },
         .context = @intFromPtr(&bridge), .commit = commit, .restore = restore,
-        .begin_cpu = beginCpu, .end_cpu = endCpu });
+        .begin_cpu = beginCpu, .end_cpu = endCpu };
+    bridge.generation = if (held_generation != 0) try display.prepareHeldNative(candidate, held_generation) else try display.prepareNative(candidate);
+    bridge.timeline = try queue.open(owner, .{ .binding = binding(request.backend), .milestone = .device_execution, .capacity = 1 });
+    try queue.bindDisplayQueue(@intCast(identity.id), binding(request.backend), bridge.timeline);
+    bridge.ready = true;
     return stateResult(@intCast(identity.id), abi.gfx_output_outcome_validated);
+}
+fn cancelPreparation() void {
+    if (bridge.generation != 0) display.abortNative(bridge.driver_owner.id, bridge.generation) catch return;
+    bridge.cancelled = true;
+    _ = discard();
 }
 pub fn transition(id: u32, generation: u64, operation: u32, output: *abi.GfxNativeState) i32 {
     if (id == 0 or irq.inDispatch() or !buffer_api.validOutput(abi.GfxNativeState, output) or operation > 2) return abi.gfx_output_error_invalid;
-    if (bridge.driver_owner.id != id) return abi.gfx_output_error_stale;
+    if (!execution.enter(0)) return abi.gfx_output_error_busy;
+    defer _ = execution.leave();
+    // Native cleanup may already have released this bridge while a retained
+    // boot snapshot still needs release. DisplayManager owns that final retry.
+    if (bridge.driver_owner.id != id and !(operation == 2 and bridge.driver_owner.id == 0 and display.retainsDriverOwner(id))) return abi.gfx_output_error_stale;
     const outcome: u32 = switch (operation) {
         0 => blk: {
+            if (!bridge.ready or bridge.cancelled) return abi.gfx_output_error_busy;
             const result = display.commitNative(id, generation) catch |err| return code(err);
-            if (result == .old_preserved) _ = discard();
+            if (result == .old_preserved) {
+                bridge.cancelled = true;
+                bridge.ready = false;
+                if (!discard()) break :blk abi.gfx_output_outcome_lost;
+            }
             break :blk switch (result) { .confirmed => abi.gfx_output_outcome_applied, .old_preserved => abi.gfx_output_outcome_old_preserved, .output_lost => abi.gfx_output_outcome_lost };
         },
         1 => blk: {
-            display.abortNative(id, generation) catch |err| return code(err);
-            _ = discard();
-            break :blk abi.gfx_output_outcome_old_preserved;
+            if (generation != bridge.generation) return abi.gfx_output_error_stale;
+            if (!bridge.cancelled) display.abortNative(id, generation) catch |err| return code(err);
+            bridge.cancelled = true;
+            bridge.ready = false;
+            break :blk if (discard()) abi.gfx_output_outcome_old_preserved else abi.gfx_output_outcome_lost;
         },
         2 => blk: {
             display.restoreBootBackend(id, generation) catch |err| {
@@ -157,16 +205,24 @@ pub fn transition(id: u32, generation: u64, operation: u32, output: *abi.GfxNati
     return abi.gfx_output_ok;
 }
 fn commit(_: usize, generation: u64, saved: *const display.BootSnapshot) display.CommitResult {
+    if (!execution.enter(0)) return .old_preserved;
+    defer _ = execution.leave();
     outputs.validateNative(@intCast(bridge.driver_owner.id), bridge.registration.backend, bridge.registration.output, saved.mode.width, saved.mode.height) catch return .old_preserved;
     if (!beginCpu(0)) return .old_preserved;
-    // The firmware writer gate has already been revoked. Preserve the old
-    // image once; ordinary frames afterwards write the resident WB shadow.
-    for (0..saved.mode.height) |y| for (0..saved.mode.width) |x| {
-        const source: *volatile u32 = @ptrCast(@alignCast(saved.framebuffer.address + y * saved.framebuffer.pitch + x * 4));
-        const target: *u32 = @ptrFromInt(@intFromPtr(bridge.frame.address) + y * bridge.frame.pitch + x * 4);
-        target.* = source.*;
+    // A firmware-started GPU may have repurposed the original VRAM mapping.
+    // Only its pre-effects RAM capture is a valid source for a held handoff.
+    const copied = if (bridge.held_generation != 0)
+        boot_driver.copySnapshot(bridge.driver_owner, bridge.held_generation, saved, &bridge.frame, false)
+    else blk: {
+        for (0..saved.mode.height) |y| for (0..saved.mode.width) |x| {
+            const source: *volatile u32 = @ptrCast(@alignCast(saved.framebuffer.address + y * saved.framebuffer.pitch + x * 4));
+            const target: *u32 = @ptrFromInt(@intFromPtr(bridge.frame.address) + y * bridge.frame.pitch + x * 4);
+            target.* = source.*;
+        };
+        break :blk true;
     };
-    if (!endCpu(0, false, null)) return .old_preserved;
+    const released = endCpu(0, false, null);
+    if (!copied or !released) return .old_preserved;
     if (!driver.enterOwnerBounded(@intCast(bridge.driver_owner.id), @max(timer.frequency(), 1))) return .old_preserved;
     defer _ = driver.leaveOwner();
     const callback: Callback = @ptrFromInt(bridge.registration.commit_callback);
@@ -181,23 +237,37 @@ fn commit(_: usize, generation: u64, saved: *const display.BootSnapshot) display
     };
 }
 fn restore(_: usize, generation: u64, saved: *const display.BootSnapshot) bool {
-    if (!driver.enterOwnerBounded(@intCast(bridge.driver_owner.id), @max(timer.frequency(), 1))) return false;
-    const callback: Callback = @ptrFromInt(bridge.registration.restore_callback);
-    const boot = bootDescription(generation, saved);
-    const restored = callback(bridge.registration.context, generation, &boot) == 1;
-    _ = driver.leaveOwner();
-    if (!restored) return false;
-    outputs.nativeActive(@intCast(bridge.driver_owner.id), bridge.registration.output, false);
+    if (!execution.enter(0)) return false;
+    defer _ = execution.leave();
+    if (!bridge.hardware_restored) {
+        if (!driver.enterOwnerBounded(@intCast(bridge.driver_owner.id), @max(timer.frequency(), 1))) return false;
+        const callback: Callback = @ptrFromInt(bridge.registration.restore_callback);
+        const boot = bootDescription(generation, saved);
+        const restored = callback(bridge.registration.context, generation, &boot) == 1;
+        _ = driver.leaveOwner();
+        if (!restored) return false;
+        bridge.hardware_restored = true;
+    }
+    if (bridge.held_generation != 0 and !bridge.pixels_restored) {
+        if (!boot_driver.copySnapshot(bridge.driver_owner, bridge.held_generation, saved, &saved.framebuffer, true)) return false;
+        bridge.pixels_restored = true;
+    }
     // The device callback has acknowledged whole-device quiescence. Marking
     // common queue jobs stopped is now backed by physical evidence.
-    queue.unregisterNative(@intCast(bridge.driver_owner.id), binding(bridge.registration.backend), true) catch |err| {
-        // The common worker may still be publishing the final completion or
-        // releasing its notification. Its own retained record remains alive.
-        if (err != error.Busy) return false;
-    };
+    if (!bridge.queue_stopped) {
+        outputs.nativeActive(@intCast(bridge.driver_owner.id), bridge.registration.output, false);
+        queue.unregisterNative(@intCast(bridge.driver_owner.id), binding(bridge.registration.backend), true) catch |err| {
+            // Busy follows publication of quiescence; the worker keeps its
+            // own live record. Stale means this exact binding already retired.
+            if (err != error.Busy and err != error.Stale) return false;
+        };
+        bridge.queue_stopped = true;
+    }
     return discard();
 }
 fn beginCpu(_: usize) bool {
+    if (!execution.enter(0)) return false;
+    defer _ = execution.leave();
     if (bridge.cpu_lease.id != 0 or bridge.reference.id == 0 or bridge.pending != null) return false;
     buffers.lock(); defer buffers.unlock();
     const use = buffers.mapLocked(bridge.reference, owner, .cpu_write, 0, bridge.bytes) catch return false;
@@ -209,6 +279,8 @@ fn beginCpu(_: usize) bool {
     return true;
 }
 fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {
+    if (!execution.enter(0)) return false;
+    defer _ = execution.leave();
     if (bridge.cpu_lease.id == 0) return false;
     buffers.lock();
     buffers.unmapCpuLocked(bridge.cpu_lease, owner) catch { buffers.unlock(); return false; };
@@ -230,7 +302,12 @@ fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {
     return complete.result == .complete and !complete.device_active and !complete.resources_held;
 }
 fn discard() bool {
-    if (bridge.cpu_lease.id != 0) return false;
+    if (bridge.cpu_lease.id != 0) {
+        buffers.lock();
+        buffers.unmapCpuLocked(bridge.cpu_lease, owner) catch { buffers.unlock(); return false; };
+        bridge.cpu_lease = .{};
+        buffers.unlock();
+    }
     if (bridge.pending) |fence| {
         queue.drop(owner, fence) catch return false;
         bridge.pending = null;
@@ -251,5 +328,6 @@ fn discard() bool {
         bridge.reference = .{};
     }
     bridge = .{};
+    @atomicStore(u32, &retained_owner, 0, .release);
     return true;
 }

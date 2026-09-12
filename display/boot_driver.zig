@@ -2,6 +2,7 @@
 // the driver; the kernel owns writer exclusion and an immutable resident copy.
 const abi = @import("r4os_kernel_contract");
 const display = @import("display.zig");
+const framebuffer = @import("framebuffer.zig");
 const native = @import("native_driver.zig");
 const ownership = @import("ownership.zig");
 const buffers = @import("../memory/gfx_buffers.zig");
@@ -19,6 +20,10 @@ const Bridge = struct {
     lease: buffers.Handle = .{},
     address: u64 = 0,
     bytes: u64 = 0,
+    held_generation: u64 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    pitch: u32 = 0,
     captured: bool = false,
 };
 var bridge: ?Bridge = null;
@@ -35,12 +40,13 @@ pub fn hold(identity: buffers.Owner, input: *const abi.GfxBootHoldRequest, outpu
         !native.validAdapter(request.adapter_id) or request.restore_callback < 0xffff800000000000) return abi.gfx_output_error_invalid;
     bridge = .{ .identity = identity, .request = request };
     const result = display.holdBoot(.{ .owner = identity.id, .adapter_id = request.adapter_id,
-        .expected_generation = request.generation, .context = 0, .capture = capture, .restore = restore, .release = release }) catch |err| {
+        .expected_generation = request.generation, .context = 0, .capture = capture, .restore = restore,
+        .release = release, .release_adopted = releaseAdopted }) catch |err| {
         // No capture has run on these admission errors.
         bridge = null;
         return native.code(err);
     };
-    if (!result.retained) bridge = null;
+    if (result.retained) bridge.?.held_generation = result.generation else bridge = null;
     output.* = .{ .generation = result.generation, .state = @intFromEnum(display.backendState().state),
         .outcome = if (result.captured) abi.gfx_output_outcome_validated else if (result.retained) abi.gfx_output_outcome_lost else abi.gfx_output_outcome_old_preserved,
         .retained = @intFromBool(result.retained) };
@@ -67,6 +73,40 @@ pub fn finish(identity: buffers.Owner, generation: u64, operation: u32, output: 
     return abi.gfx_output_ok;
 }
 
+pub fn prepareHeld(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, generation: u64, output: *abi.GfxNativeState) i32 {
+    if (irq.inDispatch() or @intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(abi.GfxNativeRegistration) or
+        !buffer_api.validOutput(abi.GfxNativeState, output)) return abi.gfx_output_error_invalid;
+    if (!execution.tryEnter()) return abi.gfx_output_error_busy;
+    defer execution.leave();
+    const current = &(bridge orelse return abi.gfx_output_error_stale);
+    if (!current.identity.eql(identity) or generation == 0 or current.held_generation != generation or
+        current.request.adapter_id != input.backend.adapter_id) return abi.gfx_output_error_stale;
+    if (!current.captured or current.lease.id == 0) return abi.gfx_output_error_invalid;
+    return native.prepareHeld(identity, input, generation, output);
+}
+
+// Called only by the native display callback after it has acquired the CPU
+// destination lease, or proved hardware recovery of the original scanout.
+pub fn copySnapshot(identity: buffers.Owner, generation: u64, saved: *const display.BootSnapshot, target: *const framebuffer.Framebuffer, include_padding: bool) bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
+    const current = &(bridge orelse return false);
+    if (!current.identity.eql(identity) or generation == 0 or current.held_generation != generation or
+        !current.captured or current.lease.id == 0 or current.width != saved.mode.width or
+        current.height != saved.mode.height or current.pitch != saved.mode.pitch or
+        target.width != current.width or target.height != current.height or !framebuffer.isNativeXrgb32(target) or
+        target.pitch < @as(u64, current.width) * 4 or (target.pitch & 3) != 0 or
+        (@intFromPtr(target.address) & 3) != 0 or target.pitch > 256 * 1024 * 1024 / current.height) return false;
+    if (include_padding and (target.pitch != current.pitch or target.address != saved.framebuffer.address)) return false;
+    const words = if (include_padding) current.pitch / 4 else current.width;
+    const source: [*]const u32 = @ptrFromInt(current.address);
+    const destination: [*]volatile u32 = @ptrCast(@alignCast(target.address));
+    for (0..current.height) |y| for (0..words) |x| {
+        destination[y * (target.pitch / 4) + x] = source[y * (current.pitch / 4) + x];
+    };
+    return true;
+}
+
 fn capture(_: usize, saved: *const display.BootSnapshot) bool {
     const current = if (bridge) |*value| value else return false;
     const bytes = @as(u64, saved.mode.pitch) * saved.mode.height;
@@ -82,6 +122,9 @@ fn capture(_: usize, saved: *const display.BootSnapshot) bool {
     const mapped = buffers.mapLocked(current.reference, owner, .cpu_write, 0, bytes) catch { buffers.unlock(); return false; };
     current.lease = mapped.lease;
     current.bytes = bytes;
+    current.width = saved.mode.width;
+    current.height = saved.mode.height;
+    current.pitch = saved.mode.pitch;
     current.address = mapped.backing.cpu_address;
     buffers.unlock();
     // Full rows include pitch padding. All firmware/normal CPU writers are
@@ -131,5 +174,12 @@ fn release(_: usize) bool {
         buffers.drop(current.reference, owner) catch return false;
         current.reference = .{};
     }
+    bridge = null;
     return true;
+}
+
+fn releaseAdopted(context: usize) bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
+    return release(context);
 }
