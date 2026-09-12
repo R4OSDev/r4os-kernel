@@ -37,14 +37,25 @@ pub const Store = struct {
     }
     pub fn publish(self: *Store, owner: u32, info: abi.GfxOutputInfo, modes: []const abi.GfxOutputMode, edid: []const u8) Error!abi.GfxOutputId {
         try self.canChange();
-        for (&self.sources) |*source| if (source.binding.generation != 0 and source.binding.adapter_id == info.identity.adapter_id) return error.Busy;
+        for (&self.sources) |*source| if (source.binding.generation != 0 and source.binding.adapter_id == info.identity.adapter_id and
+            source.owner.id != owner) return error.Busy;
         if (!header(info) or !header(info.limits) or info.reserved0 != 0 or info.reserved1 != 0 or info.limits.reserved0 != 0 or
             info.identity.connector_id == 0 or info.identity.device_generation == 0 or
             info.identity.connection_generation != 0 or info.mode_count != modes.len or info.edid_bytes != edid.len or
             modes.len > abi.gfx_output_max_modes or edid.len > abi.gfx_output_max_edid_bytes or edid.len % 128 != 0 or
-            info.flags & ~@as(u32, 31) != 0 or info.connector_kind > abi.gfx_output_kind_firmware) return error.Invalid;
+            info.flags & ~@as(u32, 31 | abi.gfx_output_flag_edid_missing | abi.gfx_output_flag_edid_invalid |
+                abi.gfx_output_flag_receiver_incomplete | abi.gfx_output_flag_query_failed) != 0 or info.connector_kind > abi.gfx_output_kind_firmware) return error.Invalid;
         if ((owner == 0) != (info.identity.adapter_id == 0)) return error.Invalid;
-        if (info.flags & abi.gfx_output_flag_connected == 0 and (modes.len != 0 or edid.len != 0 or info.preferred_mode_id != 0)) return error.Invalid;
+        if (info.flags & abi.gfx_output_flag_connected == 0) {
+            if (edid.len != 0) return error.Invalid;
+            if (modes.len != 0 or info.preferred_mode_id != 0) {
+                // A retained source geometry does not assert sink presence or
+                // advertise receiver timings. Only held native admission can
+                // activate this source while its connection remains unknown.
+                if (info.flags & abi.gfx_output_flag_connection_unknown == 0 or modes.len != 1 or
+                    modes[0].flags & abi.gfx_output_mode_geometry_only == 0) return error.Invalid;
+            }
+        }
         try validLimits(info.limits);
         if (info.possible_heads == 0 or info.possible_planes == 0 or info.possible_plls == 0 or
             info.possible_heads & ~info.limits.head_mask != 0 or info.possible_planes & ~info.limits.plane_mask != 0 or
@@ -63,7 +74,7 @@ pub const Store = struct {
             if (entry.info.identity.adapter_id != info.identity.adapter_id) continue;
             // Source limits are adapter-wide. A driver must withdraw/rebind a
             // complete device before changing that adapter capability contract.
-            if (entry.info.identity.device_generation == info.identity.device_generation and
+            if (entry.receiver_source == 0 and entry.info.identity.device_generation == info.identity.device_generation and
                 !std.meta.eql(entry.info.limits, info.limits)) return error.Invalid;
             if (entry.info.identity.connector_id != info.identity.connector_id) continue;
             if (entry.owner != owner and entry.owner != 0) return error.Busy;
@@ -114,7 +125,7 @@ pub const Store = struct {
         self.revision += 1;
         entry.info.identity.connection_generation = self.receiver_serial;
         entry.info.topology_revision = self.revision;
-        entry.info.flags &= ~(abi.gfx_output_flag_connected | abi.gfx_output_flag_active);
+        entry.info.flags = 0;
         entry.info.mode_count = 0;
         entry.info.preferred_mode_id = 0;
         entry.info.edid_bytes = 0;
@@ -141,7 +152,7 @@ pub const Store = struct {
     pub fn registerSource(self: *Store, owner: DriverOwner, adapter: u32) Error!abi.GfxReceiverSource {
         if (owner.kind != .driver or !owner.valid() or owner.id > std.math.maxInt(u32) or adapter == 0) return error.Invalid;
         if (self.source_serial == std.math.maxInt(u64) or self.revision == std.math.maxInt(u64)) return error.Exhausted;
-        for (&self.entries) |*entry| if (entry.info.identity.connector_id != 0 and entry.info.identity.adapter_id == adapter) return error.Busy;
+        for (&self.entries) |*entry| if (entry.info.identity.connector_id != 0 and entry.info.identity.adapter_id == adapter and entry.owner != owner.id) return error.Busy;
         for (&self.sources) |*source| if (source.binding.generation != 0 and source.binding.adapter_id == adapter) return error.Busy;
         for (&self.sources) |*source| if (source.binding.generation == 0) {
             self.source_serial += 1;
@@ -188,18 +199,24 @@ pub const Store = struct {
         if (self.revision >= ceiling or self.receiver_serial > std.math.maxInt(u64) - records.len) return error.Exhausted;
         var available: usize = 0;
         for (&self.entries) |*entry| if (entry.info.identity.connector_id == 0 or entry.receiver_source == binding.generation) { available += 1; };
-        if (records.len > available) return error.Capacity;
+        var required: usize = 0;
         // Complete preflight before changing even one old receiver. The R4D
         // owns these resident records exclusively for the whole callback.
         for (records, 0..) |*record, i| {
             try validReceiver(record);
             for (records[0..i]) |*prior| if (record.connector_id == prior.connector_id) return error.Invalid;
+            if (!self.sourceOwnsPort(owner, binding.adapter_id, record.connector_id)) required += 1;
         }
+        if (required > available) return error.Capacity;
         for (&self.entries) |*entry| if (entry.receiver_source == binding.generation) { entry.* = .{}; };
         self.revision += 1;
         source.sequence = sequence;
         var slot: usize = 0;
         for (records) |*record| {
+            // A native source publication replaces this port's metadata-only
+            // entry. Later receiver batches cannot overwrite its queue binding,
+            // geometry, active flags or identity. Other ports remain visible.
+            if (self.sourceOwnsPort(owner, binding.adapter_id, record.connector_id)) continue;
             while (self.entries[slot].info.identity.connector_id != 0) : (slot += 1) {}
             const entry = &self.entries[slot];
             slot += 1;
@@ -214,6 +231,11 @@ pub const Store = struct {
             @memcpy(entry.modes[0..record.mode_count], record.modes[0..record.mode_count]);
             @memcpy(entry.edid[0..record.edid_bytes], record.edid[0..record.edid_bytes]);
         }
+    }
+    fn sourceOwnsPort(self: *const Store, owner: DriverOwner, adapter: u32, connector: u32) bool {
+        for (&self.entries) |*entry| if (entry.receiver_source == 0 and entry.owner == owner.id and
+            entry.info.identity.adapter_id == adapter and entry.info.identity.connector_id == connector) return true;
+        return false;
     }
     pub fn cursor(self: *const Store) abi.GfxDisplayRevision {
         var present: u32 = 0;
@@ -531,6 +553,33 @@ test "receiver batches preserve boot, reject partial generations and revoke meta
     try t.expectError(error.Stale, store.find(replacement.identity));
     try t.expectError(error.Stale, store.replaceReceivers(owner, binding, 4, records));
     try t.expect(store.cursor().present == 1 and store.infoAt(0).?.identity.adapter_id == 0 and store.infoAt(1) == null);
+
+    // A source replaces only its own metadata port. Receiver refresh/close
+    // cannot revoke that source's binding or invent a connected monitor.
+    store.* = .{};
+    const native_source = try store.registerSource(owner, 9);
+    records[0] = .{ .connector_id = 1, .flags = abi.gfx_output_flag_connection_unknown };
+    records[1] = .{ .connector_id = 2 };
+    try store.replaceReceivers(owner, native_source, 1, records[0..2]);
+    const metadata = store.infoAt(0).?.identity;
+    var native_info = testInfo(1);
+    native_info.identity.adapter_id = 9;
+    native_info.flags = abi.gfx_output_flag_connection_unknown;
+    native_info.limits.flags = 0;
+    const geometry: abi.GfxOutputMode = .{ .mode_id = 1, .width = 640, .height = 480, .flags = abi.gfx_output_mode_geometry_only };
+    try t.expectError(error.Busy, store.publish(99, native_info, &.{geometry}, &.{}));
+    try t.expectError(error.Invalid, store.publish(3, native_info, &.{testMode()}, &.{}));
+    const promoted = try store.publish(3, native_info, &.{geometry}, &.{});
+    try t.expectError(error.Stale, store.find(metadata));
+    try t.expect(store.cursor().present == 2 and (try store.find(promoted)).receiver_source == 0);
+    try store.replaceReceivers(owner, native_source, 2, records[0..2]);
+    try t.expect(std.meta.eql((try store.find(promoted)).info.identity, promoted) and store.cursor().present == 2);
+    try t.expect((try store.find(promoted)).info.flags == abi.gfx_output_flag_connection_unknown);
+    try t.expect(try store.closeSource(owner, native_source));
+    try t.expect(store.cursor().present == 1 and (try store.find(promoted)).owner == 3);
+    try store.withdraw(3, promoted);
+    try t.expectError(error.Stale, store.find(promoted));
+    try t.expect(store.infoAt(0).?.flags == 0 and store.infoAt(0).?.mode_count == 0);
 }
 
 test "receiver capacity and legacy table prefix preserve previous publications and caller canaries" {

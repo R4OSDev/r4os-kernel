@@ -86,7 +86,7 @@ pub fn publish(owner: u32, input: *const abi.GfxOutputPublication) Error!abi.Gfx
         const token = ownership.enterState(); defer ownership.leaveState(token);
         if (epoch_exhausted or owner_epoch != epoch) return error.Stale;
         var info = input.info;
-        if (owner == native_owner and samePort(info.identity, native_port) and info.flags & abi.gfx_output_flag_connected != 0)
+        if (owner == native_owner and samePort(info.identity, native_port) and nativePresence(info.flags, true))
             info.flags |= abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry;
         break :blk try catalog.publish(owner, info, input.modes[0..info.mode_count], input.edid[0..info.edid_bytes]);
     };
@@ -166,15 +166,21 @@ pub fn bootActive(active: bool) void {
     };
     if (changed) events.signal();
 }
-pub fn validateNative(owner: u32, backend: abi.GfxBackendBinding, identity: abi.GfxOutputId, width: u32, height: u32) Error!void {
+pub fn validateNative(owner: u32, backend: abi.GfxBackendBinding, identity: abi.GfxOutputId, width: u32, height: u32, held: bool) Error!void {
     try queue.validateOutputBinding(owner, backend);
     const token = ownership.enterState(); defer ownership.leaveState(token);
     if (epoch_exhausted) return error.Exhausted;
     const entry = try catalog.find(identity);
-    if (owner == 0 or entry.owner != owner or identity.adapter_id != backend.adapter_id or
-        identity.device_generation != backend.device_generation or entry.info.flags & abi.gfx_output_flag_connected == 0) return error.Stale;
+    if (owner == 0 or entry.owner != owner or entry.receiver_source != 0 or identity.adapter_id != backend.adapter_id or
+        identity.device_generation != backend.device_generation or !nativePresence(entry.info.flags, held)) return error.Stale;
     for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.width == width and mode.height == height) return;
     return error.Unsupported;
+}
+fn nativePresence(flags: u32, held: bool) bool {
+    // An authenticated held boot route may keep driving an unresponsive sink.
+    // This preserves the distinction between active scanout and connection.
+    return flags & abi.gfx_output_flag_connected != 0 or
+        (held and flags & abi.gfx_output_flag_connection_unknown != 0);
 }
 pub fn nativeActive(owner: u32, identity: abi.GfxOutputId, active: bool) void {
     const changed = blk: {
@@ -193,7 +199,7 @@ pub fn nativeActive(owner: u32, identity: abi.GfxOutputId, active: bool) void {
         for (&catalog.entries) |*entry| {
             if (entry.owner != owner or !samePort(entry.info.identity, identity)) continue;
             const was = entry.info.flags & abi.gfx_output_flag_active != 0;
-            const enabled = active and entry.info.flags & abi.gfx_output_flag_connected != 0;
+            const enabled = active and nativePresence(entry.info.flags, true);
             if (was == enabled) break :blk false;
             if (catalog.revision == std.math.maxInt(u64)) { epoch_exhausted = true; break :blk false; }
             if (enabled) entry.info.flags |= abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry else

@@ -124,7 +124,7 @@ fn prepareImpl(identity: buffers.Owner, request: abi.GfxNativeRegistration, held
     for (request.name[end..]) |byte| if (byte != 0) return error.Invalid;
     const saved = display.bootSnapshot() orelse return error.Unavailable;
     if (!framebuffer.isNativeXrgb32(&saved.framebuffer)) return error.Unsupported;
-    try outputs.validateNative(@intCast(identity.id), request.backend, request.output, saved.mode.width, saved.mode.height);
+    try outputs.validateNative(@intCast(identity.id), request.backend, request.output, saved.mode.width, saved.mode.height, held_generation != 0);
     const caller_reference = try buffer_api.handle(request.reference);
     const prepared = blk: {
         buffers.lock(); defer buffers.unlock();
@@ -207,7 +207,7 @@ pub fn transition(id: u32, generation: u64, operation: u32, output: *abi.GfxNati
 fn commit(_: usize, generation: u64, saved: *const display.BootSnapshot) display.CommitResult {
     if (!execution.enter(0)) return .old_preserved;
     defer _ = execution.leave();
-    outputs.validateNative(@intCast(bridge.driver_owner.id), bridge.registration.backend, bridge.registration.output, saved.mode.width, saved.mode.height) catch return .old_preserved;
+    outputs.validateNative(@intCast(bridge.driver_owner.id), bridge.registration.backend, bridge.registration.output, saved.mode.width, saved.mode.height, bridge.held_generation != 0) catch return .old_preserved;
     if (!beginCpu(0)) return .old_preserved;
     // A firmware-started GPU may have repurposed the original VRAM mapping.
     // Only its pre-effects RAM capture is a valid source for a held handoff.
