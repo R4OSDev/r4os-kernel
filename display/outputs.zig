@@ -101,6 +101,42 @@ pub fn withdraw(owner: u32, identity: abi.GfxOutputId) Error!void {
     }
     events.signal();
 }
+pub fn receiverEpoch() u64 {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return owner_epoch;
+}
+pub fn registerReceiverSource(owner: buffers.Owner, adapter: u32, epoch: u64) Error!abi.GfxReceiverSource {
+    if (irq.inDispatch()) return error.Invalid;
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    if (epoch_exhausted) return error.Exhausted;
+    if (epoch != owner_epoch) return error.Stale;
+    return catalog.registerSource(owner, adapter);
+}
+pub fn replaceReceivers(owner: buffers.Owner, input: *const abi.GfxReceiverUpdate) Error!void {
+    if (irq.inDispatch() or input.version != 1 or input.size < @sizeOf(abi.GfxReceiverUpdate) or
+        input.reserved0 != 0 or input.count > abi.gfx_receiver_max_outputs or
+        (input.count == 0) != (input.receivers == 0) or input.receivers % @alignOf(abi.GfxReceiverInfo) != 0 or
+        input.receivers > std.math.maxInt(u64) - @as(u64, input.count) * @sizeOf(abi.GfxReceiverInfo)) return error.Invalid;
+    // Unlike pageable R4X payloads this bridge accepts exclusively borrowed
+    // resident R4D memory. Only bounded counted prefixes are copied; never a
+    // 32-record snapshot on the worker/kernel stack.
+    const records: []const abi.GfxReceiverInfo = if (input.count == 0) &.{} else
+        @as([*]const abi.GfxReceiverInfo, @ptrFromInt(input.receivers))[0..input.count];
+    {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        if (epoch_exhausted) return error.Exhausted;
+        try catalog.replaceReceivers(owner, input.source, input.sequence, records);
+    }
+    events.signal();
+}
+pub fn closeReceiverSource(owner: buffers.Owner, binding: abi.GfxReceiverSource) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    const changed = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        break :blk try catalog.closeSource(owner, binding);
+    };
+    if (changed) events.signal();
+}
 pub fn stoppedDriver(owner: u32) void {
     if (owner == 0) return;
     const changed = blk: {

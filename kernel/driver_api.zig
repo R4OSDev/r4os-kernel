@@ -3143,6 +3143,20 @@ fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
     return gfx_memory.owner(current_owner, admission);
 }
 
+// Receiver metadata supports authenticated Init/Work/Shutdown without the
+// wait-spanning lifecycle guard. Read the already-bound start epoch through
+// the resident runtime owner; do not widen PCI/DMA/display admission or use
+// the unsynchronized legacy graphics-memory epoch table from a worker.
+fn currentReceiverOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
+    if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0 or driver_threads.currentOwner() != 0) return error.WrongOwner;
+    const owner = activeOwner();
+    if (owner == 0) return error.WrongOwner;
+    var snapshot: outputs_contract.DriverHeapStats = .{};
+    if (driver_heap.stats(owner, &snapshot) != outputs_contract.driver_heap_ok or snapshot.owner_epoch == 0) return error.Stale;
+    if (admission and snapshot.closing != 0) return error.Closed;
+    return .{ .kind = .driver, .id = owner, .generation = snapshot.owner_epoch };
+}
+
 const gfx_queue_api = @import("gfx_driver_queue.zig");
 fn heapOwner() u32 {
     if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return 0;
@@ -3325,9 +3339,34 @@ fn gfxDisplaySchedule(input: *const outputs_contract.GfxBackendBinding) callconv
     return outputs_contract.gfx_queue_ok;
 }
 fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32 {
-    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
-    if (!gfx_api.validOutput(outputs_contract.GfxDriverOutputApi, output)) return outputs_contract.gfx_output_error_invalid;
-    output.* = .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw) };
+    _ = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
+    return @import("../display/output_state.zig").driverTable(output, .{
+        .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw),
+        .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace),
+        .close_source = @intFromPtr(&gfxReceiverClose) });
+}
+fn gfxReceiverRegister(adapter: u32, output: *outputs_contract.GfxReceiverSource) callconv(.c) i32 {
+    if (@intFromPtr(output) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const catalog = @import("../display/outputs.zig");
+    // Snapshot before admission so close/reset between epoch lookup and
+    // publication cannot leave a new source behind stoppedDriver().
+    const epoch = catalog.receiverEpoch();
+    const owner = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
+    const binding = catalog.registerReceiverSource(owner, adapter, epoch) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+    output.* = binding;
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxReceiverReplace(input: *const outputs_contract.GfxReceiverUpdate) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const value = input.*;
+    const owner = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
+    @import("../display/outputs.zig").replaceReceivers(owner, &value) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxReceiverClose(input: *const outputs_contract.GfxReceiverSource) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const owner = currentReceiverOwner(false) catch |err| return gfx_api.status(err);
+    @import("../display/outputs.zig").closeReceiverSource(owner, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err);
     return outputs_contract.gfx_output_ok;
 }
 fn gfxOutputPublish(input: *const outputs_contract.GfxOutputPublication, output: *outputs_contract.GfxOutputId) callconv(.c) i32 {
