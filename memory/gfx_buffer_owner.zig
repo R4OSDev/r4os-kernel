@@ -194,7 +194,11 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
                     return error.Busy;
                 };
             }
-            if (!layout.spanFits(object.descriptor.bytes, offset, bytes)) return error.Invalid;
+            // Native address translation covers complete allocated pages.
+            // Padding remains inaccessible to CPU/execution/queue users;
+            // only the mapping-only reference may retain that backing tail.
+            const limit = if (ref_record.mapping_only) object.allocation_bytes else object.descriptor.bytes;
+            if (!layout.spanFits(limit, offset, bytes)) return error.Invalid;
             const backing = object.backing orelse return error.Busy;
             const required: u32 = switch (access) {
                 .cpu_read => layout.Usage.cpu_read,

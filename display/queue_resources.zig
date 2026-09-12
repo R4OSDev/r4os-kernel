@@ -111,28 +111,31 @@ test "queued dependencies reserve CPU ownership across producer death and physic
     var resources = Resources(8){};
     var refs: [3]lifetime.Handle = undefined;
     for (&refs, 0..) |*ref, i| {
-        const created = try buffers.begin(producer, .{ .bytes = 4096, .usage = 15 });
+        const created = try buffers.begin(producer, .{ .bytes = 4091, .usage = 15 });
         try buffers.publish(created, .{ .cookie = i + 1, .bytes = 4096, .cpu_address = 4096 * (i + 1), .cache = .write_back });
         ref.* = created.reference;
     }
+    try t.expectError(error.Invalid, buffers.use(refs[0], producer, .cpu_read, 0, 4096));
+    try t.expectError(error.Invalid, buffers.reserveQueued(refs[0], producer, owner, false, 0, 4096));
     const upload = try state.open(producer, .{});
     const render = try state.open(producer, .{});
-    const first = try resources.submit(&state, &buffers, upload, producer, .{ .deadline_ns = 100 }, .{ .source = refs[0], .target = refs[1], .bytes = 4096 }, 0);
+    const first = try resources.submit(&state, &buffers, upload, producer, .{ .deadline_ns = 100 }, .{ .source = refs[0], .target = refs[1], .bytes = 4091 }, 0);
     const driver = lifetime.Owner{ .kind = .driver, .id = 5, .generation = 17 };
     try t.expectError(error.Busy, resources.retain(&state, &buffers, first, 0, driver));
-    try t.expectError(error.Busy, resources.submit(&state, &buffers, render, producer, .{ .deadline_ns = 100 }, .{ .source = refs[1], .target = refs[2], .bytes = 4096 }, 0));
-    const second = try resources.submit(&state, &buffers, render, producer, .{ .deadline_ns = 100, .dependencies = &.{first} }, .{ .source = refs[1], .target = refs[2], .bytes = 4096 }, 0);
-    try t.expectError(error.Busy, buffers.use(refs[0], producer, .cpu_write, 0, 4096));
-    try t.expectError(error.Busy, buffers.use(refs[1], producer, .cpu_read, 0, 4096));
+    try t.expectError(error.Busy, resources.submit(&state, &buffers, render, producer, .{ .deadline_ns = 100 }, .{ .source = refs[1], .target = refs[2], .bytes = 4091 }, 0));
+    const second = try resources.submit(&state, &buffers, render, producer, .{ .deadline_ns = 100, .dependencies = &.{first} }, .{ .source = refs[1], .target = refs[2], .bytes = 4091 }, 0);
+    try t.expectError(error.Busy, buffers.use(refs[0], producer, .cpu_write, 0, 4091));
+    try t.expectError(error.Busy, buffers.use(refs[1], producer, .cpu_read, 0, 4091));
     try t.expectEqualDeep(first, state.takeReady(0).?);
     // Mapping retention must not freeze the source against later ordered
     // writes, and it cannot manufacture an independent execution permission.
     const source_mapping = try resources.retain(&state, &buffers, first, 0, driver);
     const source_dma = try buffers.use(source_mapping, driver, .device_mapping, 0, 4096);
+    try t.expectError(error.Invalid, buffers.use(source_mapping, driver, .device_mapping, 0, 4097));
     try t.expectError(error.Unsupported, buffers.share(source_mapping, producer));
     for ([_]lifetime.Access{ .cpu_read, .cpu_write, .device_read, .device_write, .scanout, .queue_read, .queue_write }) |access|
         try t.expectError(error.Unsupported, buffers.use(source_mapping, driver, access, 0, 4096));
-    const later_write = try buffers.reserveQueued(refs[0], producer, owner, true, 0, 4096);
+    const later_write = try buffers.reserveQueued(refs[0], producer, owner, true, 0, 4091);
     try buffers.endUse(later_write.lease, owner, true);
     buffers.stoppedOwner(producer);
     state.stopped(producer, 1);
