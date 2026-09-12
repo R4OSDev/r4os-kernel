@@ -40,7 +40,8 @@ pub const OwnedRelease = struct { release: Release, driver: Owner, binding: layo
 pub const Stats = struct { objects: usize = 0, references: usize = 0, leases: usize = 0, bytes: u64 = 0, retained_bytes: u64 = 0 };
 
 test "CPU backing release failure remains visible to the exact driver epoch without public references" {
-    try ownedBackingLifetime();
+    try ownedBackingLifetime(false);
+    try ownedBackingLifetime(true);
     const t = std.testing;
     var store = Table(2, 2, 2){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
     const owner: Owner = .{ .kind = .driver, .id = 8, .generation = 7 };
@@ -63,14 +64,19 @@ test "CPU backing release failure remains visible to the exact driver epoch with
     try t.expectEqual(@as(u64, 0), store.stats().bytes);
 }
 
-fn ownedBackingLifetime() !void {
+fn ownedBackingLifetime(native_layout: bool) !void {
     const t = std.testing;
     var store = Table(4, 8, 8){ .budget_bytes = 16384, .producer_budget_bytes = 16384 };
     const driver: Owner = .{ .kind = .driver, .id = 7, .generation = 4 };
     const stale: Owner = .{ .kind = .driver, .id = 7, .generation = 5 };
     const app: Owner = .{ .kind = .program, .id = 8, .generation = 1 };
     const binding: layout.Binding = .{ .adapter = 2, .driver_owner = 7, .device_generation = 9 };
-    const desc: layout.Descriptor = .{ .bytes = 4091, .location = .device_local, .binding = binding, .usage = 12 };
+    var desc: layout.Descriptor = .{ .bytes = 4091, .location = .device_local, .binding = binding, .usage = 12 };
+    if (native_layout) {
+        desc.modifier = 0x0300000000606010; desc.width = 5; desc.height = 3; desc.format = .nv12; desc.plane_count = 2;
+        desc.planes[0] = .{ .pitch = 64 }; desc.planes[1] = .{ .offset = 2048, .pitch = 64 };
+        try t.expectError(error.Unsupported, store.begin(driver, desc));
+    }
     const reserved = try store.beginOwned(driver, desc, 0x100000001);
     try t.expect(store.retainsDriver(driver));
     try t.expect(!store.retainsDriver(stale));
@@ -87,6 +93,7 @@ fn ownedBackingLifetime() !void {
     try t.expectError(error.Stale, store.commitOwned(reserved, driver));
     try t.expectError(error.Unsupported, store.use(reserved.create.reference, driver, .cpu_read, 0, 1));
     const imported = try store.share(reserved.create.reference, app);
+    try t.expect(std.meta.eql(desc, try store.describe(imported, app)));
     const device = try store.use(reserved.create.reference, driver, .device_write, 0, 4091);
     try store.drop(reserved.create.reference, driver);
     try t.expectEqual(@as(?OwnedRelease, null), try store.takeOwnedRelease(driver, binding));
@@ -159,8 +166,10 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         producer_budget_bytes: u64,
 
         pub fn begin(self: *Self, producer: Owner, descriptor: layout.Descriptor) Error!Create {
+            return self.beginValidated(producer, descriptor, try layout.validate(descriptor));
+        }
+        fn beginValidated(self: *Self, producer: Owner, descriptor: layout.Descriptor, validated: layout.Layout) Error!Create {
             if (!producer.valid()) return error.Invalid;
-            const validated = try layout.validate(descriptor);
             if (self.committed_bytes > self.budget_bytes or validated.allocation_bytes > self.budget_bytes - self.committed_bytes) return error.Budget;
             var owner_bytes: u64 = 0;
             for (&self.objects) |object| {
@@ -191,7 +200,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
                 if (object.phase != .empty and object.producer.eql(driver) and object.owned_cookie == cookie and
                     std.meta.eql(object.descriptor.binding, descriptor.binding)) return error.Busy;
             }
-            const ticket = try self.begin(driver, descriptor);
+            const ticket = try self.beginValidated(driver, descriptor, try layout.validateDriverOwned(descriptor));
             const object = try self.findObject(ticket.buffer);
             object.owned_cookie = cookie;
             object.owned_reference = ticket.reference;

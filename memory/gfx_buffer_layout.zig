@@ -60,16 +60,30 @@ pub fn spanFits(total: u64, offset: u64, bytes: u64) bool {
 }
 
 pub fn validate(descriptor: Descriptor) Error!Layout {
+    return validateLayout(descriptor, false);
+}
+
+// Only the authenticated driver-owned allocation path may carry an opaque
+// storage modifier. The driver validates its physical/tiled layout; the
+// common owner validates bounded logical planes and retains their backing.
+pub fn validateDriverOwned(descriptor: Descriptor) Error!Layout {
+    if (descriptor.location != .device_local or descriptor.binding.portable() or
+        descriptor.usage & (Usage.cpu_read | Usage.cpu_write) != 0) return error.Unsupported;
+    return validateLayout(descriptor, true);
+}
+
+fn validateLayout(descriptor: Descriptor, owned: bool) Error!Layout {
     if (descriptor.bytes == 0 or !std.math.isPowerOfTwo(descriptor.alignment) or
         descriptor.alignment > (@as(u64, 1) << 30) or descriptor.usage == 0 or
         (descriptor.usage & ~Usage.valid) != 0 or !descriptor.binding.valid()) return error.Invalid;
-    if (descriptor.modifier != linear_modifier) return error.Unsupported;
+    const native_layout = descriptor.modifier != linear_modifier;
+    if (native_layout and !owned) return error.Unsupported;
     if (descriptor.location == .device_local and descriptor.binding.portable()) return error.Invalid;
     const allocation_alignment = @max(@as(u64, 4096), descriptor.alignment);
     const padded = std.math.add(u64, descriptor.bytes, allocation_alignment - 1) catch return error.Overflow;
     var result = Layout{ .allocation_bytes = padded & ~(allocation_alignment - 1), .planes = .{Range{ .offset = 0, .bytes = 0 }} ** max_planes, .plane_count = descriptor.plane_count };
     if (descriptor.format == .bytes) {
-        if (descriptor.width != 0 or descriptor.height != 0 or descriptor.plane_count != 0 or
+        if (native_layout or descriptor.width != 0 or descriptor.height != 0 or descriptor.plane_count != 0 or
             (descriptor.usage & (Usage.render | Usage.scanout)) != 0) return error.Invalid;
     } else {
         const multi = descriptor.format == .nv12 or descriptor.format == .p010;
@@ -87,8 +101,16 @@ pub fn validate(descriptor: Descriptor) Error!Layout {
             const row_bytes = std.math.mul(u64, columns, sample_bytes) catch return error.Overflow;
             if (plane.pitch < row_bytes or plane.pitch % sample_bytes != 0 or plane.offset % sample_bytes != 0) return error.Invalid;
             // Complete padded rows are owned, including the final row's tail.
-            const bytes = std.math.mul(u64, plane.pitch, rows) catch return error.Overflow;
+            var bytes = std.math.mul(u64, plane.pitch, rows) catch return error.Overflow;
             if (!spanFits(descriptor.bytes, plane.offset, bytes)) return error.Invalid;
+            if (native_layout) {
+                // Physical padding belongs to this plane until the next
+                // ordered offset, or the end of the declared backing extent.
+                // No vendor-specific row/block formula belongs in this owner.
+                const end = if (index + 1 < count) descriptor.planes[index + 1].offset else descriptor.bytes;
+                if (end > descriptor.bytes or end <= plane.offset or bytes > end - plane.offset) return error.Invalid;
+                bytes = end - plane.offset;
+            }
             for (result.planes[0..index]) |previous| {
                 if (plane.offset < previous.offset + previous.bytes and previous.offset < plane.offset + bytes) return error.Invalid;
             }
@@ -138,4 +160,15 @@ test "multi-plane layout validates chroma extents, overlap, bindings and unsuppo
     _ = try validate(image);
     image.modifier = 1;
     try t.expectError(error.Unsupported, validate(image));
+    try t.expectError(error.Unsupported, validateDriverOwned(image)); // CPU usage is never admitted.
+    image.usage = Usage.transfer_source | Usage.transfer_target;
+    image.bytes = 128;
+    image.planes[1].offset = 64;
+    const native_layout = try validateDriverOwned(image);
+    try t.expectEqual(@as(u64, 64), native_layout.planes[0].bytes);
+    try t.expectEqual(@as(u64, 64), native_layout.planes[1].bytes);
+    image.planes[1].offset = 20;
+    try t.expectError(error.Invalid, validateDriverOwned(image));
+    image.planes[1].offset = 136;
+    try t.expectError(error.Invalid, validateDriverOwned(image));
 }
