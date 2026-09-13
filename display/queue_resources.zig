@@ -7,7 +7,7 @@ const queue = @import("queue_state.zig");
 const abi = @import("r4os_kernel_contract");
 pub const owner = lifetime.Owner{ .kind = .kernel, .id = 2, .generation = 1 };
 pub const display_owner = lifetime.Owner{ .kind = .kernel, .id = 3, .generation = 1 };
-pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render };
+pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present };
 pub const Request = struct {
     operation: Operation = .copy,
     source: lifetime.Handle = .{},
@@ -143,6 +143,7 @@ pub fn Resources(comptime capacity: usize) type {
 
         pub fn submit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
             const config = try state.configuration(timeline, producer);
+            if (request.operation == .present) return self.presentSubmit(state, buffers, timeline, producer, submission, request, now);
             const rows = request.operation == .copy_rows;
             if (!rows and (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0)) return error.Invalid;
             if (request.operation == .render) return self.renderSubmit(state, buffers, timeline, producer, submission, request, now);
@@ -202,6 +203,36 @@ pub fn Resources(comptime capacity: usize) type {
             entry.fence = fence;
             std.debug.assert(self.entries[fence.slot - 1].fence.slot == 0);
             self.entries[fence.slot - 1] = entry;
+            return fence;
+        }
+
+        // Output admission belongs to DisplayExecution. The queue owns a
+        // whole-image read until the driver has copied it into its inactive
+        // scanout. The private scanout is never an invented producer handle.
+        fn presentSubmit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
+            const config = try state.configuration(timeline, producer);
+            if (config.binding.adapter == 0 or request.source_offset != 0 or request.target_offset != 0 or
+                request.target.id != 0 or request.target.generation != 0 or request.target_pitch != 0 or
+                !std.meta.eql(request.render, abi.GfxRenderCommand{})) return error.Invalid;
+            const descriptor = try buffers.describe(request.source, producer);
+            if (descriptor.format != .xrgb8888 or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0 or
+                descriptor.usage & lifetime.layout.Usage.transfer_source == 0 or request.bytes != @as(u64, descriptor.width) * 4 or
+                request.row_count != descriptor.height or request.source_pitch != descriptor.planes[0].pitch or
+                try rowSpan(request.bytes, request.row_count, request.source_pitch) > descriptor.bytes) return error.Unsupported;
+            if (!descriptor.binding.portable()) {
+                const binding = request.memory_binding orelse return error.Stale;
+                if (binding.adapter != config.binding.adapter or !std.meta.eql(binding, descriptor.binding)) return error.Stale;
+            }
+            const object = try buffers.bufferFor(request.source, producer);
+            try self.ordered(state, timeline, submission.dependencies, object, false);
+            const use = try buffers.reserveQueued(request.source, producer, owner, false, 0, descriptor.bytes);
+            errdefer buffers.endUse(use.lease, owner, true) catch unreachable;
+            const fence = try state.submit(timeline, producer, submission, now);
+            std.debug.assert(self.entries[fence.slot - 1].fence.slot == 0);
+            self.entries[fence.slot - 1] = .{ .fence = fence, .operation = .present, .uses = .{ use, null },
+                .bytes = std.math.mul(u64, request.bytes, request.row_count) catch unreachable,
+                .row_bytes = request.bytes, .row_count = request.row_count, .source_pitch = request.source_pitch,
+                .deadline_ns = submission.deadline_ns };
             return fence;
         }
 
@@ -354,6 +385,7 @@ test "queued dependencies reserve CPU ownership across producer death and physic
 }
 
 test "native upload retains a single source beyond cancellation and producer reference release" {
+    try checkImagePresentation();
     const t = std.testing;
     const producer = display_owner;
     var buffers = lifetime.Table(2, 8, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
@@ -462,4 +494,49 @@ test "native upload retains a single source beyond cancellation and producer ref
     try buffers.drop(retained_target, driver);
     while (try buffers.takeOwnedRelease(driver, memory)) |ticket| try buffers.finishOwnedRelease(ticket, driver, true);
     try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
+}
+
+fn checkImagePresentation() !void {
+    const t = std.testing;
+    const producer: lifetime.Owner = .{ .kind = .program, .id = 41, .generation = 2 };
+    const driver: lifetime.Owner = .{ .kind = .driver, .id = 12, .generation = 4 };
+    const memory: lifetime.layout.Binding = .{ .adapter = 7, .driver_owner = 12, .device_generation = 73 };
+    const device: queue.Binding = .{ .adapter = 7, .device_generation = 3, .reset_generation = 2 };
+    var buffers = lifetime.Table(1, 4, 8){ .budget_bytes = 4096, .producer_budget_bytes = 4096 };
+    var state = queue.Store(2, 4){};
+    var resources = Resources(4){};
+    const native = try buffers.beginOwned(driver, .{ .bytes = 4096, .usage = 28, .location = .device_local, .binding = memory,
+        .format = .xrgb8888, .width = 16, .height = 16, .plane_count = 1, .planes = .{ .{ .pitch = 64 }, .{}, .{}, .{} } }, 100);
+    try buffers.commitOwned(native, driver);
+    const ref = try buffers.share(native.create.reference, producer);
+    const rendering = try state.open(producer, .{ .binding = device, .milestone = .device_execution });
+    const presenting = try state.open(producer, .{ .binding = device, .milestone = .device_execution });
+    const writer = try resources.submit(&state, &buffers, rendering, producer, .{ .deadline_ns = 100 },
+        .{ .operation = .render, .target = ref, .memory_binding = memory }, 1);
+    var request: Request = .{ .operation = .present, .source = ref, .bytes = 64, .row_count = 16, .source_pitch = 64, .memory_binding = memory };
+    request.target_pitch = 64;
+    try t.expectError(error.Invalid, resources.submit(&state, &buffers, presenting, producer, .{ .deadline_ns = 100 }, request, 1));
+    request.target_pitch = 0;
+    try t.expectError(error.Busy, resources.submit(&state, &buffers, presenting, producer, .{ .deadline_ns = 100 }, request, 1));
+    const reader = try resources.submit(&state, &buffers, presenting, producer, .{ .deadline_ns = 100, .dependencies = &.{writer} }, request, 1);
+    const held = &resources.entries[reader.slot - 1];
+    try t.expect(held.uses[1] == null and held.uses[0].?.range.bytes == 4096 and held.bytes == 1024 and held.row_bytes == 64);
+    try buffers.drop(ref, producer); try buffers.drop(native.create.reference, driver);
+    try t.expectEqualDeep(writer, state.takeReadyFor(device, 2).?);
+    try state.complete(writer, .complete, true, 3);
+    const written = state.takeRelease().?;
+    try resources.release(&buffers, written); try state.released(written, true);
+    try t.expectEqualDeep(reader, state.takeReadyFor(device, 4).?);
+    const mapped = try resources.retain(&state, &buffers, reader, 0, driver);
+    try t.expect(try buffers.mappingOnly(mapped, driver));
+    try state.cancel(reader, producer, 5);
+    try t.expectError(error.Busy, state.complete(reader, .cancelled, false, 6));
+    try t.expect(state.takeRelease() == null and (try buffers.takeOwnedRelease(driver, memory)) == null);
+    try state.complete(reader, .complete, true, 7);
+    const released = state.takeRelease().?;
+    try resources.release(&buffers, released); try state.released(released, true);
+    try t.expect((try buffers.takeOwnedRelease(driver, memory)) == null);
+    try buffers.drop(mapped, driver);
+    try buffers.finishOwnedRelease((try buffers.takeOwnedRelease(driver, memory)).?, driver, true);
+    try t.expect(buffers.stats().bytes == 0 and (try state.query(reader)).result == .cancelled);
 }

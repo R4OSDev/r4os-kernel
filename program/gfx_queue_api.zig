@@ -98,7 +98,9 @@ pub fn submit(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input:
     const call = task_context.enterUnwind();
     if (!call.admitted()) return abi.gfx_queue_error_busy;
     defer _ = task_context.leaveUnwind(call);
-    const snapshot = runtime.submit(owner, queue.timeline, .{
+    const submitter: *const fn (buffers.Owner, u64, model.Submission, resource.Request) runtime.Error!model.Status =
+        if (operation == .present) @import("../display/native_driver.zig").submitImage else runtime.submit;
+    const snapshot = submitter(owner, queue.timeline, .{
         .deadline_ns = value.deadline_ns,
         .frame_key = value.frame_key,
         .dependencies = dependencies[0..value.dependency_count],

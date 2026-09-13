@@ -94,7 +94,7 @@ pub fn validatedProfile(input: abi.GfxBackendProfile) Error!abi.GfxBackendProfil
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
-    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 31) != 0) return error.Invalid;
+    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 63) != 0) return error.Invalid;
     const profile = try validatedProfile(config.profile);
     buffers.lock();
     defer buffers.unlock();
@@ -142,10 +142,10 @@ pub fn nativeOperations(id: u32, binding: model.Binding) Error!u64 {
     return backend.operations;
 }
 fn nativeJobCapacity(backend: *const Backend) u32 {
-    return if (backend.job_operations & 16 != 0) 224 else if (backend.job_operations & 8 != 0) 136 else 112;
+    return if (backend.job_operations & 16 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
 }
 pub fn updateNativeOperations(id: u32, binding: model.Binding, operations: u64) Error!void {
-    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 31) != 0) return error.Invalid;
+    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 63) != 0) return error.Invalid;
     buffers.lock(); defer buffers.unlock();
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
@@ -396,12 +396,24 @@ fn notifyDriver(index: usize) callconv(.c) i32 {
     return selected.notify.?(selected.context);
 }
 pub fn submit(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request) Error!model.Status {
+    if (transport.operation == .present) return error.Unsupported;
+    return submitImpl(owner, timeline, request, transport, null);
+}
+// Only the native display bridge calls this while holding DisplayExecution
+// and its own lifetime guard. Public queue submission cannot skip geometry,
+// active-output and concurrent-writer admission.
+pub fn submitDisplayImage(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request, binding: model.Binding) Error!model.Status {
+    if (transport.operation != .present) return error.Invalid;
+    return submitImpl(owner, timeline, request, transport, binding);
+}
+fn submitImpl(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request, output_binding: ?model.Binding) Error!model.Status {
     if (!started or irq.inDispatch()) return error.Unavailable;
     const instant = now();
     const snapshot = blk: {
         buffers.lock();
         defer buffers.unlock();
         const config = try state.configuration(timeline, owner);
+        if (output_binding) |binding| if (!std.meta.eql(binding, config.binding)) return error.Stale;
         const backend = if (config.binding.adapter == 0) null else try backendLocked(config.binding);
         const operations = if (backend) |native| native.operations else @as(u64, 11);
         if (operations & (@as(u64, 1) << @intCast(@intFromEnum(transport.operation))) == 0) return error.Unsupported;

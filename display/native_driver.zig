@@ -26,6 +26,7 @@ const Bridge = struct {
     cpu_lease: buffers.Handle = .{},
     timeline: u64 = 0,
     pending: ?queue.model.Fence = null,
+    image_pending: ?queue.model.Fence = null,
     last_present: ?queue.model.Fence = null,
     bytes: u64 = 0,
     frame: framebuffer.Framebuffer = undefined,
@@ -286,7 +287,7 @@ fn restore(_: usize, generation: u64, saved: *const display.BootSnapshot) bool {
 fn beginCpu(_: usize) bool {
     if (!execution.enter(0)) return false;
     defer _ = execution.leave();
-    if (bridge.cpu_lease.id != 0 or bridge.reference.id == 0 or bridge.pending != null) return false;
+    if (bridge.cpu_lease.id != 0 or bridge.reference.id == 0 or bridge.pending != null or !imageIdle()) return false;
     buffers.lock(); defer buffers.unlock();
     const use = buffers.mapLocked(bridge.reference, owner, .cpu_write, 0, bridge.bytes) catch return false;
     if (use.backing.cpu_address != @intFromPtr(bridge.frame.address)) {
@@ -295,6 +296,46 @@ fn beginCpu(_: usize) bool {
     }
     bridge.cpu_lease = use.lease;
     return true;
+}
+// Called only under the bridge's unwind guard. The receipt belongs to the
+// producer queue; observing retirement never drops that producer reference.
+fn imageIdle() bool {
+    const fence = bridge.image_pending orelse return true;
+    const status = queue.query(fence) catch |err| {
+        // Fence storage is collected only after device activity and retained
+        // resources are gone. Stale here releases admission, not a success
+        // receipt and not a claim that this image was ever displayed.
+        if (err != error.Stale) return false;
+        bridge.image_pending = null;
+        return true;
+    };
+    if (status.phase != .terminal or status.device_active or status.resources_held) return false;
+    if (status.result == .complete) bridge.last_present = fence;
+    bridge.image_pending = null;
+    return true;
+}
+pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model.Submission,
+    request: @import("queue_resources.zig").Request) queue.Error!queue.model.Status
+{
+    if (!display.beginOutputCommit()) return error.Busy;
+    defer display.endOutputCommit();
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    if (!bridge.ready or bridge.cancelled or bridge.hardware_restored or
+        display.backendState().state != .software_native) return error.Unsupported;
+    if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
+    if (outputs.nativePaused(@intCast(bridge.driver_owner.id), bridge.registration.output)) return error.Unavailable;
+    try queue.validateOutputBinding(@intCast(bridge.driver_owner.id), bridge.registration.backend);
+    const descriptor = blk: {
+        buffers.lock(); defer buffers.unlock();
+        break :blk try buffers.store.describe(request.source, caller);
+    };
+    if (request.operation != .present or descriptor.width != bridge.frame.width or descriptor.height != bridge.frame.height or
+        descriptor.format != .xrgb8888 or descriptor.location != .device_local or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0)
+        return error.Unsupported;
+    const accepted = try queue.submitDisplayImage(caller, timeline, submission, request, binding(bridge.registration.backend));
+    bridge.image_pending = accepted.fence;
+    return accepted;
 }
 fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {
     if (!execution.enter(0)) return false;
@@ -326,7 +367,7 @@ fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {
     return succeeded or (complete.result == .cancelled and !complete.device_active and !complete.resources_held);
 }
 fn discard() bool {
-    if (replacement != null) return false;
+    if (replacement != null or !imageIdle()) return false;
     if (bridge.cpu_lease.id != 0) {
         buffers.lock();
         buffers.unmapCpuLocked(bridge.cpu_lease, owner) catch { buffers.unlock(); return false; };
@@ -371,7 +412,7 @@ pub fn cursorBinding() Error!CursorBinding {
     defer _ = execution.leave();
     if (!bridge.ready or bridge.cancelled or bridge.hardware_restored or
         display.backendState().state != .software_native) return error.Unsupported;
-    if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null) return error.Busy;
+    if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
     try queue.validateOutputBinding(@intCast(bridge.driver_owner.id), bridge.registration.backend);
     return .{ .driver = bridge.driver_owner, .backend = bridge.registration.backend, .generation = bridge.generation,
         .head = try outputs.cursorHead(@intCast(bridge.driver_owner.id), bridge.registration.output),
@@ -409,7 +450,7 @@ pub fn modeBinding(assignment: abi.GfxScanoutState) Error!ModeBinding {
 pub fn prepareMode(caller: buffers.Owner, assignment: abi.GfxScanoutState, mode: abi.GfxOutputMode) Error!abi.GfxBufferReference {
     if (!execution.enter(0)) return error.Busy;
     defer _ = execution.leave();
-    if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null) return error.Busy;
+    if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
     if (assignment.source_x != 0 or assignment.source_y != 0 or assignment.destination_x != 0 or assignment.destination_y != 0 or
         assignment.source_width != mode.width or assignment.source_height != mode.height or
         assignment.destination_width != mode.width or assignment.destination_height != mode.height or
@@ -447,7 +488,7 @@ pub fn startMode(operation: u32, expected: ModeBinding) Error!void {
     if (!bridge.driver_owner.eql(expected.driver) or bridge.generation != expected.generation or
         !std.meta.eql(bridge.registration.backend, expected.backend) or bridge.cancelled or bridge.hardware_restored) return error.Stale;
     const change = if (replacement) |*value| value else return error.Stale;
-    if (bridge.cpu_lease.id != 0 or bridge.pending != null) return error.Busy;
+    if (bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
     try queue.validateOutputBinding(@intCast(expected.driver.id), expected.backend);
     const surface = if (operation == abi.gfx_mode_operation_apply) &change.old else if (operation == abi.gfx_mode_operation_rollback) &change.new else return;
     if (surface.read_lease.id == 0) {

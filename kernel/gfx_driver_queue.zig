@@ -54,7 +54,7 @@ pub fn take(id: u32, input: *const abi.GfxBackendBinding, output: *abi.GfxDriver
         .operation = @intFromEnum(job.operation),
         .source_buffer = if (job.uses[0]) |use| memory_api.publicHandle(use.buffer) else .{},
         .target_buffer = if (job.uses[1]) |use| memory_api.publicHandle(use.buffer) else .{},
-        .byte_length = if (job.operation == .copy_rows) job.row_bytes else job.bytes,
+        .byte_length = if (job.operation == .copy_rows or job.operation == .present) job.row_bytes else job.bytes,
         .source_offset = job.source_offset,
         .target_offset = job.target_offset,
         .row_count = job.row_count,
