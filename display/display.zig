@@ -231,6 +231,7 @@ pub fn systemTransitionQuiesced() bool {
         backend_manager.value.owner == 0 and backend_manager.value.pending_owner == 0;
 }
 var completed_stats: Stats = .{};
+var presentation_statistics: @import("presentation_stats.zig").Owner = .{};
 var backend_manager: backend_state.Manager = .{};
 var completed_backend_state: backend_state.Snapshot = .{};
 var completed_boot_mode: Mode = .{};
@@ -691,6 +692,28 @@ pub fn stats() Stats {
     return completed_stats;
 }
 
+pub fn bindPresentationStats(owner: usize, owner_generation: u64, binding: @import("r4os_kernel_contract").GfxBackendBinding,
+    generation: u64) @import("presentation_stats.zig").Error!void
+{
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
+    if (completed_backend_state.pending_owner != owner or completed_backend_state.pending_generation != generation or
+        completed_backend_state.pending_adapter_id != binding.adapter_id) return error.Stale;
+    try presentation_statistics.bind(owner, owner_generation, binding, generation);
+}
+pub fn publishPresentationStats(owner: usize, owner_generation: u64, value: @import("r4os_kernel_contract").DisplayPresentationStats)
+    @import("presentation_stats.zig").Error!void
+{
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
+    try presentation_statistics.publish(owner, owner_generation, value, completed_backend_state);
+}
+pub fn presentationStats(head: u32) @import("presentation_stats.zig").Error!@import("r4os_kernel_contract").DisplayPresentationStats {
+    const token = ownership.enterState();
+    defer ownership.leaveState(token);
+    return presentation_statistics.read(head, completed_backend_state);
+}
+
 fn publishStats() void {
     asm volatile ("sfence" ::: .{ .memory = true });
     const value = captureStats();
@@ -1041,6 +1064,7 @@ pub fn highestCompletedFence() u64 {
 
 test "display takeover excludes firmware writers and retains uncertain hardware owners" {
     const t = @import("std").testing;
+    try @import("presentation_stats_test.zig").check();
     const Probe = struct {
         result: CommitResult = .old_preserved,
         restores: bool = false,

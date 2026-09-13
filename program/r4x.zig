@@ -7640,6 +7640,7 @@ fn configureR4XStartR4DrawTable() void {
         .display_present_regions = &r4api.r4draw.displayPresentRegions,
         .display_present_capabilities = &r4api.r4draw.displayPresentCapabilities,
         .display_present_completion = &r4api.r4draw.displayPresentCompletion,
+        .display_presentation_stats = &r4api.r4draw.displayPresentationStats,
         .gui_frame_begin_damage = &apiGuiFrameBeginDamage,
         .gui_frame_generation_info = &apiGuiFrameGenerationInfo,
         .gui_frame_generation_read = &apiGuiFrameGenerationRead,

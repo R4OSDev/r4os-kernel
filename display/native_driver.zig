@@ -173,6 +173,7 @@ fn prepareImpl(identity: buffers.Owner, request: abi.GfxNativeRegistration, held
     bridge.generation = if (held_generation != 0) try display.prepareHeldNative(candidate, held_generation) else try display.prepareNative(candidate);
     bridge.timeline = try queue.open(owner, .{ .binding = binding(request.backend), .milestone = .device_execution, .capacity = 1 });
     try queue.bindDisplayQueue(@intCast(identity.id), binding(request.backend), bridge.timeline);
+    try display.bindPresentationStats(identity.id, identity.generation, request.backend, bridge.generation);
     bridge.ready = true;
     return stateResult(@intCast(identity.id), abi.gfx_output_outcome_validated);
 }

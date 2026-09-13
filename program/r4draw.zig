@@ -216,6 +216,14 @@ pub fn displayPresentCompletion(fence: u64, out: *DisplayPresentCompletion) call
     return out.result;
 }
 
+pub fn displayPresentationStats(head_id: u32, out: *@import("r4os_kernel_contract").DisplayPresentationStats) callconv(.c) i32 {
+    const a = @import("r4os_kernel_contract");
+    if (@intFromPtr(out) == 0 or out.version != 1 or out.size < @sizeOf(a.DisplayPresentationStats)) return a.gfx_output_error_invalid;
+    const sample = display.presentationStats(head_id) catch |err| return @import("../display/presentation_stats.zig").code(err);
+    out.* = sample;
+    return a.gfx_output_ok;
+}
+
 fn fillPresentResult(result: presenter.PresentResult, out: *DisplayPresentResult) void {
     out.* = .{
         .flags = (if (result.success) r4x_api.display_present_result_success else 0) |
