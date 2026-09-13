@@ -234,7 +234,7 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
         /// O(1) worker metadata transition. IRQ producers use queue_ingress;
         /// wakeup and resource release are separate, retained worker tickets.
         pub fn complete(self: *Self, fence: Fence, result: Result, quiesced: bool, now: u64) Error!void {
-            if (result != .complete and result != .failed) return error.Invalid;
+            if (result != .complete and result != .failed and result != .cancelled) return error.Invalid;
             const slot = try self.fenceIndex(fence);
             const job = &self.jobs[slot];
             if (job.phase == .queued) return error.Invalid;
@@ -404,6 +404,18 @@ test "running cancellation wakes once and keeps capacity and DMA until exact lat
     try state.releaseWaiter(f);
     try testing.expectEqualDeep(f, state.reapOne().?);
     try testing.expectError(error.Stale, state.query(f));
+
+    const unplug = try state.submit(q, test_owner, .{ .deadline_ns = 100 }, 6);
+    try testing.expectEqualDeep(unplug, state.takeReady(7).?);
+    try testing.expectError(error.Busy, state.complete(unplug, .cancelled, false, 8));
+    try testing.expect((try state.query(unplug)).device_active and state.takeRelease() == null);
+    try state.complete(unplug, .cancelled, true, 9);
+    try testing.expect((try state.query(unplug)).result == .cancelled and !(try state.query(unplug)).device_active);
+    try testing.expectEqualDeep(unplug, state.takeNotification().?);
+    try state.published(unplug);
+    try state.drop(unplug, test_owner);
+    try state.released(state.takeRelease().?, true);
+    try testing.expectEqualDeep(unplug, state.reapOne().?);
 }
 
 test "latest frame replaces only queued work and cannot discard on allocation failure" {

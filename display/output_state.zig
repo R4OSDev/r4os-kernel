@@ -14,6 +14,7 @@ const Source = struct {
 pub const Entry = struct {
     owner: u32 = 0,
     receiver_source: u64 = 0,
+    paused: bool = false,
     info: abi.GfxOutputInfo = .{},
     modes: [abi.gfx_output_max_modes]abi.GfxOutputMode = .{abi.GfxOutputMode{}} ** abi.gfx_output_max_modes,
     edid: [abi.gfx_output_max_edid_bytes]u8 = .{0} ** abi.gfx_output_max_edid_bytes,
@@ -79,15 +80,17 @@ pub const Store = struct {
         for (&self.entries, 0..) |*entry, index| {
             if (entry.info.identity.connector_id == 0) { if (vacant == null) vacant = index; continue; }
             if (entry.info.identity.adapter_id != info.identity.adapter_id) continue;
-            // Source limits are adapter-wide. A driver must withdraw/rebind a
-            // complete device before changing that adapter capability contract.
+            // Source limits remain adapter-wide. Only this owner's withdrawn
+            // port can negotiate new receiver limits; other ports must agree.
             if (entry.receiver_source == 0 and entry.info.identity.device_generation == info.identity.device_generation and
                 !std.meta.eql(entry.info.limits, info.limits)) {
                 // The common primary bridge may explicitly negotiate its
                 // first modeset contract after boot takeover. Other ports
                 // and already-negotiated device limits must still agree.
-                if (!promote or entry.owner != owner or entry.info.identity.connector_id != info.identity.connector_id or
-                    entry.info.limits.flags & abi.gfx_output_limit_modeset != 0 or info.limits.flags & abi.gfx_output_limit_modeset == 0) return error.Invalid;
+                const withdrawn = entry.info.flags == 0 and entry.info.mode_count == 0 and entry.info.edid_bytes == 0;
+                if (entry.owner != owner or entry.info.identity.connector_id != info.identity.connector_id or
+                    (!withdrawn and (!promote or entry.info.limits.flags & abi.gfx_output_limit_modeset != 0 or
+                        info.limits.flags & abi.gfx_output_limit_modeset == 0))) return error.Invalid;
             }
             if (entry.info.identity.connector_id != info.identity.connector_id) continue;
             if (entry.owner != owner and entry.owner != 0) return error.Busy;
@@ -99,7 +102,9 @@ pub const Store = struct {
         self.revision += 1;
         identity.connection_generation = self.receiver_serial;
         const entry = &self.entries[index];
-        entry.* = .{ .owner = owner, .info = info };
+        const paused = entry.owner == owner and entry.receiver_source == 0 and entry.paused;
+        entry.* = .{ .owner = owner, .info = info, .paused = paused };
+        if (paused) entry.info.flags &= ~@as(u32, abi.gfx_output_flag_active);
         entry.info.identity = identity;
         entry.info.topology_revision = self.revision;
         @memcpy(entry.modes[0..modes.len], modes);
@@ -132,6 +137,18 @@ pub const Store = struct {
         const entry = try self.find(identity);
         if (owner == 0 or entry.owner != owner or entry.receiver_source != 0) return error.Stale;
         self.disconnect(@constCast(entry));
+    }
+    pub fn pause(self: *Store, owner: u32, identity: abi.GfxOutputId, paused: bool, primary: bool) Error!bool {
+        const entry = @constCast(try self.find(identity));
+        if (owner == 0 or entry.owner != owner or entry.receiver_source != 0) return error.Stale;
+        if (entry.paused == paused) return false;
+        const ceiling = std.math.maxInt(u64) - @as(u64, @intFromBool(self.pending.id != 0));
+        if (self.revision >= ceiling) return error.Exhausted;
+        entry.paused = paused;
+        if (paused) entry.info.flags &= ~@as(u32, abi.gfx_output_flag_active)
+        else if (primary) entry.info.flags |= abi.gfx_output_flag_active;
+        self.revision += 1; entry.info.topology_revision = self.revision;
+        return true;
     }
     fn disconnect(self: *Store, entry: *Entry) void {
         self.receiver_serial += 1;
@@ -446,6 +463,17 @@ test "output unplug and identical replug invalidate every old receiver mode and 
     try t.expect(first.connector_id == second.connector_id and second.connection_generation > first.connection_generation);
     try t.expectError(error.Stale, store.modeAt(first, 0));
     try t.expect((try store.modeAt(second, 0)).?.width == 640);
+    var changed = info; changed.limits.max_width = 2560;
+    try t.expectError(error.Invalid, store.publishModeset(14, changed, &.{testMode()}, &data));
+    try store.withdraw(14, second);
+    try t.expectError(error.Invalid, store.publishModeset(15, changed, &.{testMode()}, &data));
+    const restored = try store.publishModeset(14, changed, &.{testMode()}, &data);
+    try t.expect(restored.connection_generation > second.connection_generation and (try store.find(restored)).info.limits.max_width == 2560);
+    var sibling = changed; sibling.identity.connector_id += 1;
+    _ = try store.publish(14, sibling, &.{testMode()}, &data);
+    try store.withdraw(14, restored);
+    changed.limits.max_width = 1920;
+    try t.expectError(error.Invalid, store.publishModeset(14, changed, &.{testMode()}, &data));
     try t.expect(try store.stop(14));
     try t.expectError(error.Stale, store.find(second));
 }
@@ -489,11 +517,18 @@ test "atomic rollback and uncertain hardware outcomes retain resources until exp
     var state = abi.GfxAtomicState{ .count = 1, .topology_revision = store.revision };
     state.assignments[0] = testAssignment(id, 0);
     const ticket = try store.begin(&state, &.{testFact()});
+    try t.expect(try store.pause(14, id, true, true));
+    try t.expect(!try store.pause(14, id, true, true));
+    try t.expect((try store.find(id)).paused and store.pending.id == ticket.id);
+    try t.expectError(error.Stale, store.pause(15, id, false, true));
     try t.expectError(error.Busy, store.withdraw(14, id));
     try t.expectError(error.Busy, store.finish(ticket, abi.gfx_output_outcome_old_preserved, 0));
     const rollback = try store.finish(ticket, abi.gfx_output_outcome_old_preserved, abi.gfx_output_retain_new);
     try t.expectEqual(@as(u32, 1), rollback.retained);
     try t.expectEqual(@as(u64, 0), rollback.commit_sequence);
+    try t.expect((try store.find(id)).paused);
+    try t.expect(try store.pause(14, id, false, true));
+    try t.expect(!(try store.find(id)).paused and (try store.find(id)).info.flags & abi.gfx_output_flag_active != 0);
     try t.expectError(error.Stale, store.begin(&state, &.{testFact()}));
     state.topology_revision = store.revision;
     const next = try store.begin(&state, &.{testFact()});
@@ -624,8 +659,8 @@ test "receiver capacity and legacy table prefix preserve previous publications a
     try t.expect(rebound.generation > first.generation);
     try t.expect(try store.stop(@intCast(owner.id)));
     try t.expectError(error.Stale, store.replaceReceivers(owner, rebound, 1, records));
-    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 79, 80, 87, 88 }) |bytes| {
-        var storage: [96]u8 align(8) = @splat(0x79);
+    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 79, 80, 87, 88, 95, 96, 103, 104, 111, 112, 119 }) |bytes| {
+        var storage: [128]u8 align(8) = @splat(0x79);
         const table: *abi.GfxDriverOutputApi = @ptrCast(&storage);
         table.version = 1; table.size = bytes;
         const before = storage;

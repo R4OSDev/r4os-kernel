@@ -97,9 +97,35 @@ pub fn withdraw(owner: u32, identity: abi.GfxOutputId) Error!void {
     if (irq.inDispatch()) return error.Invalid;
     {
         const token = ownership.enterState(); defer ownership.leaveState(token);
+        const entry = try catalog.find(identity);
+        if (owner == 0 or entry.owner != owner or entry.receiver_source != 0) return error.Stale;
+    }
+    // Request rollback before removing the identity used by its receipt.
+    // The driver retries withdrawal after draining its real GPU operation.
+    if (@import("mode_work.zig").withdrawingOutput(owner, identity)) return error.Busy;
+    {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
         try catalog.withdraw(owner, identity);
     }
     events.signal();
+}
+pub fn pause(owner: u32, identity: abi.GfxOutputId, paused: bool) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    const changed = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        if (native_owner != owner or !samePort(native_port, identity)) return error.Stale;
+        const entry = try catalog.find(identity);
+        if (!paused and !nativePresence(entry.info.flags, true)) return error.Stale;
+        break :blk try catalog.pause(owner, identity, paused, true);
+    };
+    if (paused) _ = @import("mode_work.zig").withdrawingOutput(owner, identity);
+    if (changed) events.signal();
+}
+pub fn nativePaused(owner: u32, identity: abi.GfxOutputId) bool {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    for (&catalog.entries) |*entry| if (entry.owner == owner and entry.receiver_source == 0 and samePort(entry.info.identity, identity))
+        return entry.paused;
+    return false;
 }
 pub fn receiverEpoch() u64 {
     const token = ownership.enterState(); defer ownership.leaveState(token);
@@ -225,7 +251,7 @@ pub fn nativeActive(owner: u32, identity: abi.GfxOutputId, active: bool) void {
         for (&catalog.entries) |*entry| {
             if (entry.owner != owner or !samePort(entry.info.identity, identity)) continue;
             const was = entry.info.flags & abi.gfx_output_flag_active != 0;
-            const enabled = active and nativePresence(entry.info.flags, true);
+            const enabled = active and !entry.paused and nativePresence(entry.info.flags, true);
             if (was == enabled) break :blk false;
             if (catalog.revision == std.math.maxInt(u64)) { epoch_exhausted = true; break :blk false; }
             if (enabled) entry.info.flags |= abi.gfx_output_flag_active |

@@ -46,6 +46,22 @@ pub fn status(ticket: u64) Error!abi.GfxModeStatus {
     return state.status;
 }
 pub fn submit(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmation_ms: u32) Error!abi.GfxModeStatus {
+    return submitImpl(caller, input, confirmation_ms, false);
+}
+pub fn restore(driver: buffers.Owner, input: *const abi.GfxAtomicState) Error!abi.GfxModeStatus {
+    if (driver.kind != .driver or !driver.valid() or input.version != 1 or input.size < @sizeOf(abi.GfxAtomicState) or
+        input.count != 1) return error.Invalid;
+    if (!outputs.nativePaused(@intCast(driver.id), input.assignments[0].output)) return error.Stale;
+    var state_copy = input.*;
+    if (state_copy.topology_revision == 0) state_copy.topology_revision = outputs.revision().revision;
+    return submitImpl(driver, &state_copy, 1000, true);
+}
+pub fn driverStatus(driver: buffers.Owner, ticket: u64) Error!abi.GfxModeStatus {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    if (ticket == 0 or ticket != state.status.ticket or !driver.eql(state.driver)) return error.Stale;
+    return state.status;
+}
+fn submitImpl(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmation_ms: u32, automatic: bool) Error!abi.GfxModeStatus {
     if (irq.inDispatch() or confirmation_ms < 1000 or confirmation_ms > 60000) return error.Invalid;
     if (!admission.enter(0)) return error.Busy;
     defer _ = admission.leave();
@@ -57,6 +73,8 @@ pub fn submit(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmat
     if (!display.beginOutputCommit()) return error.Busy;
     defer display.endOutputCommit();
     const target = try native.modeBinding(input.assignments[0]);
+    if (!automatic and outputs.nativePaused(@intCast(target.driver.id), input.assignments[0].output)) return error.Busy;
+    if (automatic and !target.driver.eql(caller)) return error.Stale;
     const reference = try native.prepareMode(caller, input.assignments[0], mode);
     errdefer native.abortPreparedMode();
     const accepted = try outputs.beginNative(caller, input);
@@ -65,6 +83,7 @@ pub fn submit(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmat
         const token = ownership.enterState(); defer ownership.leaveState(token);
         try state.begin(caller, target.driver, .{ .ticket = accepted.ticket.id, .backend = target.backend,
             .assignment = input.assignments[0], .mode = accepted.mode, .reference = reference }, accepted.revision, confirmation_ms, now);
+        state.automatic = automatic;
         binding = target;
         break :blk state.status;
     };
@@ -124,6 +143,19 @@ pub fn stoppedDriver(id: u32) void {
         break :blk true;
     };
     if (changed) worker_event.signal();
+}
+pub fn withdrawingOutput(driver_id: u32, output: abi.GfxOutputId) bool {
+    const now = nowNs();
+    var changed = false;
+    const pending = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        if (state.available() or state.driver.kind != .driver or state.driver.id != driver_id or
+            !std.meta.eql(state.job.assignment.output, output)) break :blk false;
+        changed = state.outputGone(driver_id, output, now);
+        break :blk true;
+    };
+    if (changed) { worker_event.signal(); events.signal(); }
+    return pending;
 }
 fn rejected(error_code: i32) void {
     const token = ownership.enterState(); defer ownership.leaveState(token);

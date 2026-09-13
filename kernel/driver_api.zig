@@ -3390,7 +3390,26 @@ fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32
     _ = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
     return @import("../display/output_state.zig").driverTable(output, .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw), .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace), .close_source = @intFromPtr(&gfxReceiverClose),
         .mode_enable = @intFromPtr(&gfxModeEnable), .mode_take = @intFromPtr(&gfxModeTake), .mode_complete = @intFromPtr(&gfxModeComplete),
-        .audio_publish = @intFromPtr(&gfxAudioPublish), .audio_query = @intFromPtr(&gfxAudioQuery) });
+        .audio_publish = @intFromPtr(&gfxAudioPublish), .audio_query = @intFromPtr(&gfxAudioQuery),
+        .output_pause = @intFromPtr(&gfxOutputPause), .mode_restore = @intFromPtr(&gfxModeRestore), .mode_status = @intFromPtr(&gfxModeStatus) });
+}
+fn gfxOutputPause(input: *const outputs_contract.GfxOutputId, paused: u32) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or paused > 1 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    @import("../display/outputs.zig").pause(@intCast(identity.id), input.*, paused != 0) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxModeRestore(input: *const outputs_contract.GfxAtomicState, output: *outputs_contract.GfxModeStatus) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or !gfx_api.validOutput(outputs_contract.GfxModeStatus, output) or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    output.* = gfx_modes.restore(identity, input) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxModeStatus(ticket: u64, output: *outputs_contract.GfxModeStatus) callconv(.c) i32 {
+    if (!gfx_api.validOutput(outputs_contract.GfxModeStatus, output) or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    output.* = gfx_modes.driverStatus(identity, ticket) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
 }
 fn gfxAudioPublish(input: *const outputs_contract.GfxAudioRoute) callconv(.c) i32 {
     if (@intFromPtr(input) == 0 or irq_router.inDispatch() or input.version != 1 or input.size < @sizeOf(outputs_contract.GfxAudioRoute))

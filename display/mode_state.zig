@@ -17,6 +17,7 @@ pub const State = struct {
     taken: bool = false,
     cancelled: bool = false,
     expired: bool = false,
+    automatic: bool = false,
     reply: ?abi.GfxDriverModeCompletion = null,
 
     pub fn available(self: *const State) bool {
@@ -99,6 +100,17 @@ pub const State = struct {
         if (self.status.phase == abi.gfx_mode_phase_awaiting_confirmation) return self.status.confirmation_deadline_ns;
         return self.status.operation_deadline_ns;
     }
+    pub fn outputGone(self: *State, driver_id: u32, output: abi.GfxOutputId, now: u64) bool {
+        if (self.available() or self.driver.kind != .driver or self.driver.id != driver_id or
+            !std.meta.eql(self.job.assignment.output, output)) return false;
+        const changed = !self.cancelled or self.status.phase == abi.gfx_mode_phase_awaiting_confirmation;
+        self.cancelled = true;
+        if (self.status.phase == abi.gfx_mode_phase_awaiting_confirmation)
+            self.schedule(abi.gfx_mode_operation_rollback, now);
+        // In-flight apply/confirm receipts still own their exact operation
+        // and references. Withdrawal itself proves no physical quiescence.
+        return changed;
+    }
     pub fn expire(self: *State, now: u64) bool {
         const end = self.deadline();
         if (end == 0 or now < end or self.reply != null) return false;
@@ -146,7 +158,8 @@ pub const State = struct {
             self.status.retained = 2;
         } else {
             self.status.retained = 3;
-            if (self.cancelled or self.expired) self.schedule(abi.gfx_mode_operation_rollback, now) else {
+            if (self.cancelled or self.expired) self.schedule(abi.gfx_mode_operation_rollback, now)
+            else if (self.automatic) self.schedule(abi.gfx_mode_operation_confirm, now) else {
                 self.status.phase = abi.gfx_mode_phase_awaiting_confirmation;
                 self.status.confirmation_deadline_ns = now +| self.confirmation_ns;
             }
@@ -210,4 +223,50 @@ test "mode jobs bind owner generation and operation, preserve late receipts and 
         .operation = attempt.operation, .outcome = abi.gfx_output_outcome_old_preserved, .quiesced = 2 });
     denied.settled(.{ .outcome = abi.gfx_output_outcome_old_preserved }, attempt.deadline_ns + 1);
     try t.expect(denied.status.phase == abi.gfx_mode_phase_reverted and denied.status.retained == 1);
+
+    // HPD requests bounded cancellation but cannot forge a driver receipt.
+    var unplug: State = .{};
+    var connected = next;
+    connected.assignment.output = .{ .adapter_id = 5, .device_generation = 6, .connector_id = 4, .connection_generation = 12 };
+    try unplug.begin(caller, driver, connected, 10, 15000, 100);
+    try unplug.arm();
+    const in_flight = (try unplug.take(driver, connected.backend)).?;
+    var foreign = connected.assignment.output; foreign.connection_generation += 1;
+    try t.expect(!unplug.outputGone(driver.id + 1, connected.assignment.output, 110));
+    try t.expect(!unplug.outputGone(driver.id, foreign, 110));
+    try t.expect(unplug.outputGone(driver.id, connected.assignment.output, 110));
+    try t.expect(!unplug.outputGone(driver.id, connected.assignment.output, 111));
+    try t.expect(unplug.reply == null and unplug.taken and unplug.status.retained == 3 and unplug.job.sequence == in_flight.sequence);
+    try unplug.complete(driver, .{ .ticket = in_flight.ticket, .sequence = in_flight.sequence, .operation = in_flight.operation,
+        .outcome = abi.gfx_output_outcome_applied, .quiesced = 1 });
+    unplug.settled(.{ .outcome = abi.gfx_output_outcome_applied }, 120);
+    try t.expect(unplug.status.phase == abi.gfx_mode_phase_reverting and unplug.job.sequence == in_flight.sequence + 1);
+
+    var waiting: State = .{};
+    try waiting.begin(caller, driver, connected, 10, 15000, 100);
+    try waiting.arm();
+    const applied_job = (try waiting.take(driver, connected.backend)).?;
+    try waiting.complete(driver, .{ .ticket = applied_job.ticket, .sequence = applied_job.sequence, .operation = applied_job.operation,
+        .outcome = abi.gfx_output_outcome_applied, .quiesced = 1 });
+    waiting.settled(.{ .outcome = abi.gfx_output_outcome_applied }, 120);
+    try t.expect(waiting.outputGone(driver.id, connected.assignment.output, 121));
+    try t.expect(waiting.status.phase == abi.gfx_mode_phase_reverting and waiting.status.confirmation_deadline_ns == 0 and
+        waiting.status.retained == 3 and waiting.reply == null);
+
+    var reconnect: State = .{};
+    try reconnect.begin(driver, driver, connected, 10, 1000, 100);
+    reconnect.automatic = true;
+    try reconnect.arm();
+    const restoring = (try reconnect.take(driver, connected.backend)).?;
+    try reconnect.complete(driver, .{ .ticket = restoring.ticket, .sequence = restoring.sequence, .operation = restoring.operation,
+        .outcome = abi.gfx_output_outcome_applied, .quiesced = 1 });
+    reconnect.settled(.{ .outcome = abi.gfx_output_outcome_applied }, 120);
+    try t.expect(reconnect.status.phase == abi.gfx_mode_phase_confirming and reconnect.status.confirmation_deadline_ns == 0 and
+        reconnect.status.retained == 3 and reconnect.job.sequence == restoring.sequence + 1);
+    try reconnect.arm();
+    const confirming = (try reconnect.take(driver, connected.backend)).?;
+    try reconnect.complete(driver, .{ .ticket = confirming.ticket, .sequence = confirming.sequence, .operation = confirming.operation,
+        .outcome = abi.gfx_output_outcome_applied, .quiesced = 1 });
+    reconnect.settled(.{ .outcome = abi.gfx_output_outcome_applied }, 130);
+    try t.expect(reconnect.available() and reconnect.status.phase == abi.gfx_mode_phase_confirmed and reconnect.status.retained == 2);
 }

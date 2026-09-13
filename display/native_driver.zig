@@ -305,6 +305,7 @@ fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {
     bridge.cpu_lease = .{};
     buffers.unlock();
     if (!changed) return true;
+    if (outputs.nativePaused(@intCast(bridge.driver_owner.id), bridge.registration.output)) return true;
     const rect = damage orelse display.Rect{ .w = @intCast(bridge.frame.width), .h = @intCast(bridge.frame.height) };
     if (rect.w == 0 or rect.h == 0 or rect.x >= bridge.frame.width or rect.y >= bridge.frame.height or
         rect.w > bridge.frame.width - rect.x or rect.h > bridge.frame.height - rect.y) return false;
@@ -319,7 +320,10 @@ fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {
     bridge.pending = null;
     const succeeded = complete.result == .complete and !complete.device_active and !complete.resources_held;
     if (succeeded) bridge.last_present = accepted.fence;
-    return succeeded;
+    // A driver may drain a queued upload when its connector disappears.
+    // CPU painting is still valid; no visible/Present fence is invented and
+    // the driver must refresh the retained image before reconnecting it.
+    return succeeded or (complete.result == .cancelled and !complete.device_active and !complete.resources_held);
 }
 fn discard() bool {
     if (replacement != null) return false;

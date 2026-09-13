@@ -51,7 +51,7 @@ pub fn Ingress(comptime capacity: usize) type {
             entry.* = .{ .fence = fence, .owner = owner, .active = true };
         }
         pub fn acknowledge(self: *Self, owner: u32, fence: queue.Fence, result: queue.Result, quiesced: bool, instant: u64) queue.Error!void {
-            if (fence.slot == 0 or fence.slot > capacity or (result != .complete and result != .failed)) return error.Invalid;
+            if (fence.slot == 0 or fence.slot > capacity or (result != .complete and result != .failed and result != .cancelled)) return error.Invalid;
             const entry = &self.entries[fence.slot - 1];
             if (!std.meta.eql(entry.fence, fence)) return error.Stale;
             if (owner == 0 or entry.owner != owner) return error.WrongOwner;
@@ -98,6 +98,13 @@ test "IRQ mailbox rejects wrong owners and stale resets and retains a single exa
     try t.expectError(error.Stale, ingress.acknowledge(7, fence, .complete, true, 4));
     ingress.quiesce(newer);
     try t.expectError(error.AlreadyCompleted, ingress.acknowledge(7, newer, .complete, true, 4));
+    try ingress.arm(7, newer);
+    try t.expectError(error.Busy, ingress.acknowledge(7, newer, .cancelled, false, 5));
+    try t.expect(ingress.take(0) == null);
+    try ingress.acknowledge(7, newer, .cancelled, true, 6);
+    const cancelled = ingress.take(0).?;
+    try t.expect(cancelled.result == .cancelled and std.meta.eql(cancelled.fence, newer));
+    try t.expect(ingress.take(0) == null);
     var wake = Wakeups(2){};
     wake.bind(0, 7, fence.binding);
     try t.expectError(error.WrongOwner, wake.request(8, fence.binding));
