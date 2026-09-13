@@ -244,7 +244,9 @@ pub fn build(b: *std.Build) void {
     addFontUnitTest(b, test_step);
     addBootscreenUnitTest(b, test_step);
     addContractUnitTest(b, test_step, contract, config, "services_tests.zig");
-    addLoaderTests(b, test_step, contract, config);
+    const loader_test_step = b.step("loader-test", "Run the existing module and driver ownership tests");
+    addLoaderTests(b, loader_test_step, contract, config);
+    test_step.dependOn(loader_test_step);
 
     addProviderNegative(
         b,

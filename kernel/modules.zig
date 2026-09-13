@@ -805,6 +805,10 @@ pub fn prepareResolvedBytes(bytes: []const u8, expected_kind: Kind, fallback_nam
             return null;
         };
         const provider_slot = findByName(import.module) orelse {
+            if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) {
+                resolved_buf[import_index] = missingOptional(import);
+                continue;
+            }
             missing_dependency_errors += 1;
             k.puts("[MOD] resolver missing module=");
             k.puts(import.module);
@@ -873,6 +877,10 @@ pub fn prepareResolvedFile(source: module_file.FileSource, expected_kind: Kind, 
     while (import_index < header.import_count) : (import_index += 1) {
         const import = tables.imports[import_index].view();
         const provider_slot = findByName(import.module) orelse {
+            if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) {
+                resolved_buf[import_index] = missingOptional(import);
+                continue;
+            }
             missing_dependency_errors += 1;
             k.puts("[MOD] resolver missing module=");
             k.puts(import.module);
@@ -967,6 +975,7 @@ fn resolveImport(pending: []PendingLibrary, importer_index: usize, import: Impor
     }
 
     const provider_index = findPendingByName(pending, import.module) orelse {
+        if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) return missingOptional(import);
         missing_dependency_errors += 1;
         k.puts("[MOD] resolver missing module=");
         k.puts(import.module);
@@ -977,6 +986,7 @@ fn resolveImport(pending: []PendingLibrary, importer_index: usize, import: Impor
     };
 
     if (pending[provider_index].state == .loading) {
+        if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) return missingOptional(import);
         cycle_dependency_errors += 1;
         pending[provider_index].state = .failed;
         k.puts("[MOD] resolver cycle importer=");
@@ -986,7 +996,8 @@ fn resolveImport(pending: []PendingLibrary, importer_index: usize, import: Impor
         k.puts("\r\n");
         return null;
     }
-    if (!resolveAndLoadPending(pending, provider_index)) return null;
+    if (!resolveAndLoadPending(pending, provider_index))
+        return if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) missingOptional(import) else null;
     if (findByName(import.module)) |slot| {
         return resolveImportFromEntry(&entries[slot], import, importer_name);
     }
@@ -995,7 +1006,11 @@ fn resolveImport(pending: []PendingLibrary, importer_index: usize, import: Impor
 }
 
 fn resolveImportFromEntry(provider: *const Entry, import: ImportRecord, importer_name: []const u8) ?ResolvedImport {
+    if (!module_r4m.validImportFlags(import.module, import.flags)) return null;
+    const optional = (import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0;
+    if (optional and provider.kind != .r4l) return null;
     const exp = findExport(provider, import.symbol) orelse {
+        if (optional) return missingOptional(import);
         symbol_dependency_errors += 1;
         k.puts("[MOD] resolver missing export module=");
         k.puts(provider.name[0..provider.name_len]);
@@ -1007,6 +1022,7 @@ fn resolveImportFromEntry(provider: *const Entry, import: ImportRecord, importer
         return null;
     };
     if (exp.version < import.min_version) {
+        if (optional) return missingOptional(import);
         version_dependency_errors += 1;
         k.puts("[MOD] resolver version reject module=");
         k.puts(provider.name[0..provider.name_len]);
@@ -1028,6 +1044,19 @@ fn resolveImportFromEntry(provider: *const Entry, import: ImportRecord, importer
     resolved.version = exp.version;
     resolved.address = exp.address;
     return resolved;
+}
+
+fn missingOptional(import: ImportRecord) ResolvedImport {
+    var result: ResolvedImport = .{};
+    result.module_len = copyBytes(import.module, &result.module);
+    result.symbol_len = copyBytes(import.symbol, &result.symbol);
+    return result;
+}
+
+fn countResolvedImports(imports: []const ResolvedImport) u32 {
+    var count: u32 = 0;
+    for (imports) |item| if (item.address != 0) { count += 1; };
+    return count;
 }
 
 fn loadR4MFile(load: *PreparedLoad, source: module_file.FileSource, tables: *const ValidatedFileTables, expected_kind: Kind, fallback_name: []const u8, path: []const u8, resolved_imports: []const ResolvedImport) bool {
@@ -1140,7 +1169,7 @@ fn loadR4MFile(load: *PreparedLoad, source: module_file.FileSource, tables: *con
         .reloc_rel32_count = reloc_stats.rel32,
         .reloc_base_rel64_count = reloc_stats.base_rel64,
         .reloc_import_slot64_count = reloc_stats.import_slot64,
-        .resolved_import_count = @intCast(resolved_imports.len),
+        .resolved_import_count = countResolvedImports(resolved_imports),
         .resolver_status = .resolved,
         .bss_zeroed = bss_zeroed,
         .generation = load.generation,
@@ -1265,7 +1294,7 @@ fn loadR4M(load: *PreparedLoad, bytes: []const u8, expected_kind: Kind, fallback
         .reloc_rel32_count = reloc_stats.rel32,
         .reloc_base_rel64_count = reloc_stats.base_rel64,
         .reloc_import_slot64_count = reloc_stats.import_slot64,
-        .resolved_import_count = @intCast(resolved_imports.len),
+        .resolved_import_count = countResolvedImports(resolved_imports),
         .resolver_status = .resolved,
         .bss_zeroed = bss_zeroed,
         .generation = load.generation,
@@ -1395,7 +1424,8 @@ fn readValidatedFileTables(reader: *module_r4m.Reader, tables: *ValidatedFileTab
         var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
         const module_name = reader.readZString(record.module_offset, module_buf[0..], "r4m-import-module", true) orelse return false;
         const symbol_name = reader.readZString(record.symbol_offset, symbol_buf[0..], "r4m-import-symbol", true) orelse return false;
-        if (!validImportModuleName(module_name) or !validSymbolName(symbol_name) or record.min_version == 0) {
+        if (!validImportModuleName(module_name) or !validSymbolName(symbol_name) or record.min_version == 0 or
+            !module_r4m.validImportFlags(module_name, record.flags)) {
             k.puts("[MOD] malformed import module=");
             k.puts(module_name);
             k.puts(" symbol=");
@@ -1774,6 +1804,7 @@ fn applyRelocation(reloc: Relocation, sections: []const SectionHeader, section_o
         R4M_RELOC_IMPORT_SLOT64 => {
             const import_index: usize = @intCast(reloc.target_section);
             if (import_index >= resolved_imports.len) return .unresolved_import;
+            if (resolved_imports[import_index].address == 0 and reloc.addend != 0) return .bad_range;
             writeLe64(patch, addSignedU64(resolved_imports[import_index].address, reloc.addend) orelse return .bad_range);
             return .ok;
         },
@@ -1872,6 +1903,7 @@ fn validateImports(header: Header, bytes: []const u8) bool {
         const symbol_name = zString(bytes, readLe32(bytes[off + 4 .. off + 8])) orelse return false;
         if (!validImportModuleName(module_name) or !validSymbolName(symbol_name)) return false;
         if (readLe32(bytes[off + 8 .. off + 12]) == 0) return false;
+        if (!module_r4m.validImportFlags(module_name, readLe32(bytes[off + 12 .. off + 16]))) return false;
     }
     return true;
 }
@@ -2259,6 +2291,30 @@ test "R4D byte admission rejects entries and exports into file resources" {
 }
 
 test "Runtime-R4L identity parser fails closed" {
+    const t = @import("std").testing;
+    try t.expect(module_r4m.validImportFlags("R4NV", module_r4m.IMPORT_FLAG_OPTIONAL));
+    try t.expect(!module_r4m.validImportFlags("r4sys", module_r4m.IMPORT_FLAG_OPTIONAL));
+    try t.expect(!module_r4m.validImportFlags("R4NV", 2));
+    var provider: Entry = .{ .kind = .r4l };
+    provider.name_len = copyBytes("R4NV", &provider.name);
+    provider.exports[0] = .{ .used = true, .version = 2, .address = 0x123456789abc };
+    provider.exports[0].name_len = copyBytes("API_V1", &provider.exports[0].name);
+    provider.export_count = 1;
+    const optional = ImportRecord{ .module = "R4NV", .symbol = "API_V1", .min_version = 2, .flags = module_r4m.IMPORT_FLAG_OPTIONAL };
+    const present = resolveImportFromEntry(&provider, optional, "consumer").?;
+    try t.expectEqual(@as(u64, 0x123456789abc), present.address);
+    var request = optional;
+    request.min_version = 3;
+    const absent = resolveImportFromEntry(&provider, request, "consumer").?;
+    try t.expect(absent.address == 0 and absent.version == 0);
+    try t.expectEqualStrings("R4NV", absent.module[0..absent.module_len]);
+    request.symbol = "NOT_FOUND";
+    try t.expectEqual(@as(u64, 0), resolveImportFromEntry(&provider, request, "consumer").?.address);
+    request.flags = 0;
+    try t.expect(resolveImportFromEntry(&provider, request, "consumer") == null);
+    try t.expectEqual(@as(u32, 1), countResolvedImports(&.{present, absent}));
+    provider.kind = .r4d;
+    try t.expect(resolveImportFromEntry(&provider, optional, "consumer") == null);
     const testing = @import("std").testing;
 
     try testing.expect(hasR4lExtension("EXAMPLE.R4L"));

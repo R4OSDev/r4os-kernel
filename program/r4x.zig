@@ -7674,6 +7674,7 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_fence_cancel = &apiGfxFenceCancel,
         .gfx_fence_release = &apiGfxFenceRelease,
         .gfx_queue_backend = &gfx_queue_api.backend,
+        .gfx_queue_backend_info = &gfx_queue_api.backendInfo,
         .gfx_output_revision = &gfx_output_api.revision,
         .gfx_output_info = &gfx_output_api.info,
         .gfx_output_mode = &gfx_output_api.mode,
@@ -9177,7 +9178,16 @@ fn resolveR4MImportsFromReader(reader: *module_r4m.Reader, header: module_r4m.He
             .min_version = record.min_version,
             .flags = record.flags,
         };
+        if (!module_r4m.validImportFlags(import.module, import.flags) or import.min_version == 0) return false;
         const resolved = modules.resolveExportInfo(import.module, import.symbol, import.min_version) orelse {
+            if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) {
+                var seed = R4XStartImportSeed{ .min_version = import.min_version };
+                if (!copyR4XStartName(import.module, seed.module_name[0..], &seed.module_name_len) or
+                    !copyR4XStartName(import.symbol, seed.symbol_name[0..], &seed.symbol_name_len)) return false;
+                resolved_out[i] = .{};
+                start_out[i] = seed;
+                continue;
+            }
             k.puts("Unresolved R4M0 import ");
             k.puts(import.module);
             k.puts(":");
@@ -9185,6 +9195,7 @@ fn resolveR4MImportsFromReader(reader: *module_r4m.Reader, header: module_r4m.He
             k.puts("\r\n");
             return false;
         };
+        if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0 and resolved.kind != .r4l) return false;
         resolved_out[i] = .{ .address = resolved.address, .version = resolved.version, .generation = resolved.generation };
         // Gruppen-IDs gehoeren ausschliesslich zu den sechs fest eingebauten
         // Plattform-APIs. Jeder Runtime-R4L-Export wird als benanntes
@@ -9288,6 +9299,7 @@ fn applyR4MRelocation(reloc: R4MRelocation, sections: []const R4MSection, sectio
             const patch = r4mPatchSlice(reloc, sections, section_offsets, image, 8) orelse return false;
             const import_index: usize = @intCast(reloc.target_section);
             if (import_index >= resolved_imports.len) return false;
+            if (resolved_imports[import_index].address == 0 and reloc.addend != 0) return false;
             writeLe64(patch, addSignedU64(resolved_imports[import_index].address, reloc.addend) orelse return false);
             return true;
         },

@@ -48,6 +48,12 @@ pub fn backend(index: u32, output: *abi.GfxBackendBinding) callconv(.c) i32 {
     output.* = .{ .adapter_id = info.binding.adapter, .device_generation = info.binding.device_generation, .reset_generation = info.binding.reset_generation, .milestone = @intFromEnum(info.milestone) };
     return abi.gfx_queue_ok;
 }
+pub fn backendInfo(index: u32, output: *abi.GfxBackendInfo) callconv(.c) i32 {
+    if (!buffer_api.validOutput(abi.GfxBackendInfo, output)) return abi.gfx_queue_error_invalid;
+    const info = runtime.backendAt(index) orelse return 0;
+    output.* = .{ .binding = .{ .adapter_id = info.binding.adapter, .device_generation = info.binding.device_generation, .reset_generation = info.binding.reset_generation, .milestone = @intFromEnum(info.milestone) }, .profile = info.profile };
+    return abi.gfx_queue_ok;
+}
 pub fn open(owner: buffers.Owner, input: *const abi.GfxQueueConfig, output: *abi.GfxQueueHandle) i32 {
     if (@intFromPtr(input) == 0 or !buffer_api.validOutput(abi.GfxQueueHandle, output)) return abi.gfx_queue_error_invalid;
     const value = input.*;

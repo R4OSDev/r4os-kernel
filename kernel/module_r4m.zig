@@ -10,6 +10,17 @@ pub const RELOCATION_SIZE: usize = 24;
 pub const RELOCATION_WINDOW_RECORDS: usize = module_file.metadata_window_size / RELOCATION_SIZE;
 pub const VERSION: u16 = 1;
 pub const ARCH_X86_64: u16 = 1;
+pub const IMPORT_FLAG_OPTIONAL: u32 = 1;
+
+// This flag belongs to the R4M0 file record, not R4XStartImport.flags.
+// A missing optional provider yields table/version/generation zero.
+pub fn validImportFlags(module: []const u8, flags: u32) bool {
+    if ((flags & ~IMPORT_FLAG_OPTIONAL) != 0) return false;
+    if (flags == 0) return true;
+    for ([_][]const u8{ "R4SYS", "R4DESK", "R4DRAW", "R4NET", "R4AUDIO", "R4DEV" }) |platform|
+        if (@import("std").ascii.eqlIgnoreCase(module, platform)) return false;
+    return true;
+}
 
 pub const Kind = enum(u16) {
     r4x = 1,

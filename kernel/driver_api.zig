@@ -3499,6 +3499,7 @@ fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
         .reset = @intFromPtr(&gfxQueueReset),
         .segment = @intFromPtr(&gfxQueueSegment),
         .retain_resource = @intFromPtr(&gfxQueueRetain),
+        .register_profile = @intFromPtr(&gfxQueueRegisterProfile),
     };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_queue_ok;
@@ -3506,6 +3507,10 @@ fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
 fn gfxQueueRegister(input: *const outputs_contract.GfxBackendRegistration, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
     const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
     return gfx_queue_api.register(identity, input, output);
+}
+fn gfxQueueRegisterProfile(input: *const outputs_contract.GfxBackendRegistration, profile: *const outputs_contract.GfxBackendProfile, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_queue_api.registerProfile(identity, input, profile, output);
 }
 fn gfxQueueUnregister(input: *const outputs_contract.GfxBackendBinding, quiesced: u32) callconv(.c) i32 {
     return gfx_queue_api.unregister(activeOwner(), input, quiesced);

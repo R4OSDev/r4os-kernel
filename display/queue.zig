@@ -1,6 +1,7 @@
 // Kernel ownership and wait bridge for asynchronous graphics transports.
 // Rendering policy remains in R4GFX; native command encoding stays in R4D.
 const std = @import("std");
+const abi = @import("r4os_kernel_contract");
 const buffers = @import("../memory/gfx_buffers.zig");
 const resource_model = @import("queue_resources.zig");
 pub const model = @import("queue_state.zig");
@@ -27,8 +28,8 @@ var started = false;
 var next_copy: usize = 0;
 const Waiter = struct { task_id: u32 = 0, generation: u64 = 0, fence: model.Fence = .{} };
 var waiters: [256]Waiter = .{Waiter{}} ** 256;
-pub const NativeConfig = struct { adapter: u32, milestone: model.Milestone, notify: work.WorkHandler, context: usize };
-pub const BackendInfo = struct { binding: model.Binding, milestone: model.Milestone };
+pub const NativeConfig = struct { adapter: u32, milestone: model.Milestone, notify: work.WorkHandler, context: usize, profile: abi.GfxBackendProfile = .{} };
+pub const BackendInfo = struct { binding: model.Binding, milestone: model.Milestone, profile: abi.GfxBackendProfile = .{} };
 pub fn backendAt(index: u32) ?BackendInfo {
     if (!started or index > backends.len) return null;
     if (index == 0) return .{ .binding = software, .milestone = .cpu_stores };
@@ -36,7 +37,7 @@ pub fn backendAt(index: u32) ?BackendInfo {
     defer buffers.unlock();
     const backend = backends[index - 1];
     if (backend.owner.id == 0 or backend.closing) return null;
-    return .{ .binding = backend.binding, .milestone = backend.milestone };
+    return .{ .binding = backend.binding, .milestone = backend.milestone, .profile = backend.profile };
 }
 const Backend = struct {
     owner: buffers.Owner = .{ .kind = .driver, .id = 0, .generation = 0 },
@@ -48,6 +49,7 @@ const Backend = struct {
     notifying: bool = false,
     work_handle: u32 = 0,
     display_timeline: u64 = 0,
+    profile: abi.GfxBackendProfile = .{},
 };
 var backends: [16]Backend = .{Backend{}} ** 16;
 var wakeups = @import("queue_ingress.zig").Wakeups(backends.len){};
@@ -76,16 +78,26 @@ pub fn open(owner: buffers.Owner, config: model.Config) Error!u64 {
     return state.open(owner, config);
 }
 
+pub fn validatedProfile(input: abi.GfxBackendProfile) Error!abi.GfxBackendProfile {
+    var profile = input;
+    if (profile.version != 1 or profile.size < @sizeOf(abi.GfxBackendProfile) or profile.data_bytes > profile.data.len) return error.Invalid;
+    const empty = profile.interface_id_lo == 0 and profile.interface_id_hi == 0;
+    if ((empty and (profile.revision != 0 or profile.data_bytes != 0)) or (!empty and profile.revision == 0)) return error.Invalid;
+    for (profile.data[profile.data_bytes..]) |byte| if (byte != 0) return error.Invalid;
+    profile.size = @sizeOf(abi.GfxBackendProfile);
+    return profile;
+}
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
     if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores) return error.Invalid;
+    const profile = try validatedProfile(config.profile);
     buffers.lock();
     defer buffers.unlock();
     if (backend_serial == std.math.maxInt(u64)) return error.Exhausted;
     for (&backends) |backend| if (backend.owner.id != 0 and backend.binding.adapter == config.adapter) return error.Busy;
     for (&backends, 0..) |*backend, index| if (backend.owner.id == 0) {
         backend_serial += 1;
-        backend.* = .{ .owner = identity, .binding = .{ .adapter = config.adapter, .device_generation = backend_serial, .reset_generation = 1 }, .milestone = config.milestone, .notify = config.notify, .context = config.context };
+        backend.* = .{ .owner = identity, .binding = .{ .adapter = config.adapter, .device_generation = backend_serial, .reset_generation = 1 }, .milestone = config.milestone, .notify = config.notify, .context = config.context, .profile = profile };
         const flags = interrupts.saveAndDisableRuntime();
         wakeups.bind(index, @intCast(identity.id), backend.binding);
         interrupts.restore(flags);

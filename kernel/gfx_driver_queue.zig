@@ -19,11 +19,14 @@ fn publicBinding(value: queue.model.Binding, milestone: u32) abi.GfxBackendBindi
     return .{ .adapter_id = value.adapter, .device_generation = value.device_generation, .reset_generation = value.reset_generation, .milestone = milestone };
 }
 pub fn register(identity: buffers.Owner, input: *const abi.GfxBackendRegistration, output: *abi.GfxBackendBinding) i32 {
-    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxBackendBinding, output)) return abi.gfx_queue_error_invalid;
+    return registerProfile(identity, input, &.{}, output);
+}
+pub fn registerProfile(identity: buffers.Owner, input: *const abi.GfxBackendRegistration, profile: *const abi.GfxBackendProfile, output: *abi.GfxBackendBinding) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(profile) == 0 or !memory_api.validOutput(abi.GfxBackendBinding, output)) return abi.gfx_queue_error_invalid;
     const request = input.*;
     if (request.version != 1 or request.size < @sizeOf(abi.GfxBackendRegistration) or request.notify_callback < 0xFFFF800000000000 or irq.inDispatch()) return abi.gfx_queue_error_invalid;
     const milestone = std.enums.fromInt(queue.model.Milestone, request.milestone) orelse return abi.gfx_queue_error_unsupported;
-    const value = queue.registerNative(identity, .{ .adapter = request.adapter_id, .milestone = milestone, .notify = @ptrFromInt(request.notify_callback), .context = request.context }) catch |err| return api.errorCode(err);
+    const value = queue.registerNative(identity, .{ .adapter = request.adapter_id, .milestone = milestone, .notify = @ptrFromInt(request.notify_callback), .context = request.context, .profile = profile.* }) catch |err| return api.errorCode(err);
     output.* = publicBinding(value, request.milestone);
     return abi.gfx_queue_ok;
 }
