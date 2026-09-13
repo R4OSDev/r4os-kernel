@@ -4,9 +4,10 @@
 const std = @import("std");
 const lifetime = @import("../memory/gfx_buffer_owner.zig");
 const queue = @import("queue_state.zig");
+const abi = @import("r4os_kernel_contract");
 pub const owner = lifetime.Owner{ .kind = .kernel, .id = 2, .generation = 1 };
 pub const display_owner = lifetime.Owner{ .kind = .kernel, .id = 3, .generation = 1 };
-pub const Operation = enum(u32) { copy, barrier, upload, copy_rows };
+pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render };
 pub const Request = struct {
     operation: Operation = .copy,
     source: lifetime.Handle = .{},
@@ -17,6 +18,7 @@ pub const Request = struct {
     row_count: u32 = 0,
     source_pitch: u64 = 0,
     target_pitch: u64 = 0,
+    render: abi.GfxRenderCommand = .{},
     memory_binding: ?lifetime.layout.Binding = null,
 };
 pub const Entry = struct {
@@ -31,6 +33,8 @@ pub const Entry = struct {
     row_count: u32 = 0,
     source_pitch: u64 = 0,
     target_pitch: u64 = 0,
+    render: abi.GfxRenderCommand = .{},
+    deadline_ns: u64 = 0,
 };
 pub const Error = lifetime.Error || queue.Error;
 
@@ -86,13 +90,66 @@ pub fn Resources(comptime capacity: usize) type {
         const Self = @This();
         entries: [capacity]Entry = .{Entry{}} ** capacity,
 
+        fn ordered(self: *Self, state: anytype, timeline: u64, dependencies: []const queue.Fence, object: lifetime.Handle, write: bool) Error!void {
+            for (&self.entries) |prior| {
+                if (prior.fence.slot == 0) continue;
+                const status = try state.query(prior.fence);
+                if (status.phase == .terminal and !status.device_active) continue;
+                for (prior.uses, 0..) |use, j| if (use) |held| {
+                    if (!held.buffer.eql(object) or (!write and j == 0)) continue;
+                    if (!try state.orders(timeline, dependencies, prior.fence)) return error.Busy;
+                };
+            }
+        }
+
+        fn renderSubmit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
+            const config = try state.configuration(timeline, producer);
+            if (config.binding.adapter == 0) return error.Unsupported;
+            const draw = request.render;
+            if (request.bytes != 0 or request.source_offset != 0 or request.target_offset != 0 or draw.reserved0 != 0 or
+                draw.kind > abi.gfx_render_kind_sample or draw.filter > abi.gfx_render_filter_bilinear or draw.blend > abi.gfx_render_blend_over or
+                draw.transfer > abi.gfx_render_transfer_srgb_encode or draw.opacity > 255) return error.Invalid;
+            const sampled = draw.kind == abi.gfx_render_kind_sample;
+            if (!sampled and (request.source.id != 0 or request.source.generation != 0 or draw.filter != 0 or draw.transfer != 0 or
+                !std.meta.eql(draw.source_rect, abi.GfxRenderRect{}))) return error.Invalid;
+            if (sampled and draw.color != 0) return error.Invalid;
+            var entry = Entry{ .operation = .render, .render = draw, .deadline_ns = submission.deadline_ns };
+            const references = [_]lifetime.Handle{ request.source, request.target };
+            var objects: [2]lifetime.Handle = .{ .{}, .{} };
+            var extents: [2]u64 = .{ 0, 0 };
+            const first: usize = if (sampled) 0 else 1;
+            for (first..2) |i| {
+                const reference = references[i];
+                objects[i] = try buffers.bufferFor(reference, producer);
+                const descriptor = try buffers.describe(reference, producer);
+                if (!descriptor.binding.portable()) {
+                    const binding = request.memory_binding orelse return error.Stale;
+                    if (binding.adapter != config.binding.adapter or !std.meta.eql(descriptor.binding, binding)) return error.Stale;
+                }
+                if (i == 1 and descriptor.usage & lifetime.layout.Usage.render == 0) return error.Unsupported;
+                extents[i] = descriptor.bytes;
+                try self.ordered(state, timeline, submission.dependencies, objects[i], i == 1);
+            }
+            if (sampled and objects[0].eql(objects[1])) return error.Unsupported;
+            if (sampled) entry.uses[0] = try buffers.reserveQueued(request.source, producer, owner, false, 0, extents[0]);
+            errdefer if (entry.uses[0]) |held| buffers.endUse(held.lease, owner, true) catch unreachable;
+            entry.uses[1] = try buffers.reserveQueued(request.target, producer, owner, true, 0, extents[1]);
+            errdefer buffers.endUse(entry.uses[1].?.lease, owner, true) catch unreachable;
+            entry.fence = try state.submit(timeline, producer, submission, now);
+            std.debug.assert(self.entries[entry.fence.slot - 1].fence.slot == 0);
+            self.entries[entry.fence.slot - 1] = entry;
+            return entry.fence;
+        }
+
         pub fn submit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
             const config = try state.configuration(timeline, producer);
             const rows = request.operation == .copy_rows;
             if (!rows and (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0)) return error.Invalid;
+            if (request.operation == .render) return self.renderSubmit(state, buffers, timeline, producer, submission, request, now);
+            if (!std.meta.eql(request.render, abi.GfxRenderCommand{})) return error.Invalid;
             const source_span = if (rows) try rowSpan(request.bytes, request.row_count, request.source_pitch) else request.bytes;
             const target_span = if (rows) try rowSpan(request.bytes, request.row_count, request.target_pitch) else request.bytes;
-            var entry = Entry{ .operation = request.operation,
+            var entry = Entry{ .operation = request.operation, .deadline_ns = submission.deadline_ns,
                 .bytes = if (rows) std.math.mul(u64, request.bytes, request.row_count) catch return error.Overflow else request.bytes,
                 .source_offset = request.source_offset, .target_offset = request.target_offset,
                 .row_bytes = if (rows) request.bytes else 0, .row_count = request.row_count,
@@ -122,15 +179,7 @@ pub fn Resources(comptime capacity: usize) type {
                         offsets[i] = 0;
                         extents[i] = descriptor.bytes;
                     }
-                    for (&self.entries) |prior| {
-                        if (prior.fence.slot == 0) continue;
-                        const status = try state.query(prior.fence);
-                        if (status.phase == .terminal and !status.device_active) continue;
-                        for (prior.uses, 0..) |use, j| if (use) |held| {
-                            if (!held.buffer.eql(objects[i]) or (i == 0 and j == 0)) continue;
-                            if (!try state.orders(timeline, submission.dependencies, prior.fence)) return error.Busy;
-                        };
-                    }
+                    try self.ordered(state, timeline, submission.dependencies, objects[i], i == 1);
                 }
                 entry.uses[0] = try buffers.reserveQueued(request.source, producer, owner, false, offsets[0], extents[0]);
                 errdefer buffers.endUse(entry.uses[0].?.lease, owner, true) catch unreachable;
@@ -308,7 +357,7 @@ test "native upload retains a single source beyond cancellation and producer ref
     const t = std.testing;
     const producer = display_owner;
     var buffers = lifetime.Table(2, 8, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
-    var state = queue.Store(2, 4){};
+    var state = queue.Store(3, 4){};
     var resources = Resources(4){};
     const created = try buffers.begin(producer, .{ .bytes = 4096, .usage = 7 });
     try buffers.publish(created, .{ .cookie = 1, .bytes = 4096, .cpu_address = 4096, .cache = .write_back });
@@ -356,5 +405,61 @@ test "native upload retains a single source beyond cancellation and producer ref
     try resources.release(&buffers, done); try state.released(done, true);
     try buffers.finishOwnedRelease((try buffers.takeOwnedRelease(driver, memory)).?, driver, true);
     try buffers.finishRelease(buffers.pendingSystemRelease().?, true);
+    try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
+
+    // Render uses the same queue lifetime without requiring any CPU image
+    // mapping. Changed caller state and producer death cannot edit the job.
+    var native_refs: [2]lifetime.Handle = undefined;
+    var render_refs: [2]lifetime.Handle = undefined;
+    for (&native_refs, &render_refs, 0..) |*owned_ref, *ref, i| {
+        const image = try buffers.beginOwned(driver, .{ .bytes = 4096, .usage = 28, .location = .device_local, .binding = memory,
+            .format = .argb8888, .width = 16, .height = 16, .plane_count = 1, .planes = .{ .{ .pitch = 64 }, .{}, .{}, .{} } }, 100 + i);
+        try buffers.commitOwned(image, driver);
+        owned_ref.* = image.create.reference;
+        ref.* = try buffers.share(owned_ref.*, producer);
+    }
+    const draw_queue = try state.open(producer, .{ .binding = device, .milestone = .device_execution });
+    var draw = Request{ .operation = .render, .target = render_refs[1], .memory_binding = memory,
+        .render = .{ .target_rect = .{ .x = -2, .width = 16, .height = 16 }, .scissor = .{ .width = 8, .height = 8 }, .color = 0x80402010, .opacity = 255 } };
+    try t.expectError(error.Unsupported, resources.submit(&state, &buffers, software, producer, .{ .deadline_ns = 100 }, draw, 8));
+    draw.render.kind = abi.gfx_render_kind_sample;
+    draw.render.color = 0; draw.source = render_refs[1];
+    try t.expectError(error.Unsupported, resources.submit(&state, &buffers, draw_queue, producer, .{ .deadline_ns = 100 }, draw, 8));
+    draw.source = render_refs[0]; draw.render.source_rect = .{ .width = 16, .height = 16 };
+    draw.render.reserved0 = 1;
+    try t.expectError(error.Invalid, resources.submit(&state, &buffers, draw_queue, producer, .{ .deadline_ns = 100 }, draw, 8));
+    draw.render.reserved0 = 0;
+    const retained_draw = draw.render;
+    const render_fence = try resources.submit(&state, &buffers, draw_queue, producer, .{ .deadline_ns = 100 }, draw, 8);
+    draw.render.opacity = 0;
+    const held_draw = &resources.entries[render_fence.slot - 1];
+    try t.expectEqualDeep(retained_draw, held_draw.render);
+    try t.expectEqual(@as(u64, 100), held_draw.deadline_ns);
+    try t.expectEqual(@as(u64, 4096), held_draw.uses[1].?.range.bytes);
+    // A separately queued reader must explicitly depend on the writer.
+    draw.source = render_refs[1]; draw.target = render_refs[0];
+    try t.expectError(error.Busy, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, draw, 8));
+    const read_fence = try resources.submit(&state, &buffers, timeline, producer,
+        .{ .deadline_ns = 100, .dependencies = &.{render_fence} }, draw, 8);
+    try t.expectEqualDeep(render_fence, state.takeReadyFor(device, 9).?);
+    for (render_refs) |ref| try buffers.drop(ref, producer);
+    for (native_refs) |ref| try buffers.drop(ref, driver);
+    const retained_target = try resources.retain(&state, &buffers, render_fence, 1, driver);
+    try t.expect(try buffers.mappingOnly(retained_target, driver));
+    try t.expect((try buffers.takeOwnedRelease(driver, memory)) == null);
+    try state.cancel(render_fence, producer, 10);
+    try t.expectError(error.Busy, state.complete(render_fence, .failed, false, 11));
+    try t.expect(state.takeRelease() == null);
+    try state.complete(render_fence, .failed, true, 12);
+    const draw_release = state.takeRelease().?;
+    try resources.release(&buffers, draw_release); try state.released(draw_release, true);
+    try t.expectEqual(queue.Result.cancelled, (try state.query(render_fence)).result);
+    // Failed dependencies terminate the dependent work without dispatch.
+    try t.expect(state.takeReadyFor(device, 13) == null);
+    const read_release = state.takeRelease().?;
+    try t.expectEqualDeep(read_fence, read_release.fence);
+    try resources.release(&buffers, read_release); try state.released(read_release, true);
+    try buffers.drop(retained_target, driver);
+    while (try buffers.takeOwnedRelease(driver, memory)) |ticket| try buffers.finishOwnedRelease(ticket, driver, true);
     try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
 }

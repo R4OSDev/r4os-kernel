@@ -51,6 +51,7 @@ const Backend = struct {
     display_timeline: u64 = 0,
     profile: abi.GfxBackendProfile = .{},
     operations: u64 = 7,
+    job_operations: u64 = 7,
     memory_generation: u64 = 0,
 };
 var backends: [16]Backend = .{Backend{}} ** 16;
@@ -93,7 +94,7 @@ pub fn validatedProfile(input: abi.GfxBackendProfile) Error!abi.GfxBackendProfil
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
-    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 15) != 0) return error.Invalid;
+    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 31) != 0) return error.Invalid;
     const profile = try validatedProfile(config.profile);
     buffers.lock();
     defer buffers.unlock();
@@ -101,7 +102,7 @@ pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model
     for (&backends) |backend| if (backend.owner.id != 0 and backend.binding.adapter == config.adapter) return error.Busy;
     for (&backends, 0..) |*backend, index| if (backend.owner.id == 0) {
         backend_serial += 1;
-        backend.* = .{ .owner = identity, .binding = .{ .adapter = config.adapter, .device_generation = backend_serial, .reset_generation = 1 }, .milestone = config.milestone, .notify = config.notify, .context = config.context, .profile = profile, .operations = config.operations,
+        backend.* = .{ .owner = identity, .binding = .{ .adapter = config.adapter, .device_generation = backend_serial, .reset_generation = 1 }, .milestone = config.milestone, .notify = config.notify, .context = config.context, .profile = profile, .operations = config.operations, .job_operations = config.operations,
             .memory_generation = if (config.memory_generation != 0) config.memory_generation else backend_serial };
         const flags = interrupts.saveAndDisableRuntime();
         wakeups.bind(index, @intCast(identity.id), backend.binding);
@@ -140,6 +141,20 @@ pub fn nativeOperations(id: u32, binding: model.Binding) Error!u64 {
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
     return backend.operations;
 }
+fn nativeJobCapacity(backend: *const Backend) u32 {
+    return if (backend.job_operations & 16 != 0) 224 else if (backend.job_operations & 8 != 0) 136 else 112;
+}
+pub fn updateNativeOperations(id: u32, binding: model.Binding, operations: u64) Error!void {
+    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 31) != 0) return error.Invalid;
+    buffers.lock(); defer buffers.unlock();
+    const backend = try backendLocked(binding);
+    if (id == 0 or backend.owner.id != id) return error.WrongOwner;
+    if (backend.closing) return error.DeviceLost;
+    backend.operations = operations;
+    // Disabling future admission cannot shrink the output needed to receive
+    // work already queued under the former capability set.
+    backend.job_operations |= operations;
+}
 // The extra operation is private to the retained display producer. Old R4D
 // queue registrations cannot accidentally receive an operation they lack.
 pub fn bindDisplayQueue(id: u32, binding: model.Binding, timeline: u64) Error!void {
@@ -164,13 +179,16 @@ pub fn validateOutputBinding(id: u32, input: @import("r4os_kernel_contract").Gfx
     if (backend.closing) return error.DeviceLost;
     if (@intFromEnum(backend.milestone) != input.milestone) return error.Invalid;
 }
-pub fn takeNative(id: u32, binding: model.Binding) Error!resource_model.Entry {
+pub fn takeNative(id: u32, binding: model.Binding, output_bytes: u32) Error!resource_model.Entry {
     if (irq.inDispatch()) return error.Unavailable;
     const instant = now();
     buffers.lock();
     defer buffers.unlock();
     const backend = try backendLocked(binding);
     if (backend.owner.id != id or id == 0) return error.WrongOwner;
+    // Check and dequeue under the same owner: capability updates cannot
+    // admit a larger job between output validation and acquiring that job.
+    if (output_bytes < nativeJobCapacity(backend)) return error.Invalid;
     if (backend.closing) return error.DeviceLost;
     const fence = state.takeReadyFor(binding, instant) orelse return error.Busy;
     const flags = interrupts.saveAndDisableRuntime();

@@ -37,12 +37,17 @@ pub fn unregister(id: u32, input: *const abi.GfxBackendBinding, quiesced: u32) i
     queue.unregisterNative(id, value, quiesced == 1) catch |err| return api.errorCode(err);
     return abi.gfx_queue_ok;
 }
+pub fn updateOperations(id: u32, input: *const abi.GfxBackendBinding, operations: u64) i32 {
+    if (@intFromPtr(input) == 0 or irq.inDispatch()) return abi.gfx_queue_error_invalid;
+    const value = binding(id, input.*) catch |err| return api.errorCode(err);
+    queue.updateNativeOperations(id, value, operations) catch |err| return api.errorCode(err);
+    return abi.gfx_queue_ok;
+}
 pub fn take(id: u32, input: *const abi.GfxBackendBinding, output: *abi.GfxDriverJob) i32 {
     if (@intFromPtr(input) == 0 or irq.inDispatch()) return abi.gfx_queue_error_invalid;
     const bytes = wire.capacity(abi.GfxDriverJob, output) orelse return abi.gfx_queue_error_invalid;
     const value = binding(id, input.*) catch |err| return api.errorCode(err);
-    if (bytes < @sizeOf(abi.GfxDriverJob) and (queue.nativeOperations(id, value) catch |err| return api.errorCode(err)) & 8 != 0) return abi.gfx_queue_error_invalid;
-    const job = queue.takeNative(id, value) catch |err| return api.errorCode(err);
+    const job = queue.takeNative(id, value, bytes) catch |err| return api.errorCode(err);
     const result: abi.GfxDriverJob = .{
         .size = bytes,
         .fence = api.publicFence(job.fence),
@@ -55,6 +60,8 @@ pub fn take(id: u32, input: *const abi.GfxBackendBinding, output: *abi.GfxDriver
         .row_count = job.row_count,
         .source_pitch = job.source_pitch,
         .target_pitch = job.target_pitch,
+        .render = job.render,
+        .deadline_ns = job.deadline_ns,
     };
     wire.write(abi.GfxDriverJob, output, bytes, result);
     return abi.gfx_queue_ok;

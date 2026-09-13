@@ -6,8 +6,8 @@ const abi = @import("r4os_kernel_contract");
 pub fn prefix(comptime T: type, available: u32) ?u32 {
     const sizes = comptime if (T == abi.GfxBackendRegistration) &[_]u32{ 32, 40, 48 }
         else if (T == abi.GfxBackendInfo) &[_]u32{ 136, 144, 152 }
-        else if (T == abi.GfxSubmission) &[_]u32{ 408, 432 }
-        else if (T == abi.GfxDriverJob) &[_]u32{ 112, 136 }
+        else if (T == abi.GfxSubmission) &[_]u32{ 408, 432, 512 }
+        else if (T == abi.GfxDriverJob) &[_]u32{ 112, 136, 224 }
         else @compileError("Unsupported graphics queue payload");
     comptime std.debug.assert(sizes[sizes.len - 1] == @sizeOf(T));
     var size: ?u32 = null;

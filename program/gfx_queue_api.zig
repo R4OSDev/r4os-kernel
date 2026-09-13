@@ -90,6 +90,7 @@ pub fn submit(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input:
     if (!header(abi.GfxQueueHandle, queue) or value.dependency_count > model.max_dependencies or
         value.source.reserved0 != 0 or value.target.reserved0 != 0 or value.reserved0 != 0) return abi.gfx_queue_error_invalid;
     const operation = std.enums.fromInt(resource.Operation, value.operation) orelse return abi.gfx_queue_error_unsupported;
+    if (operation == .render and value.size < @sizeOf(abi.GfxSubmission)) return abi.gfx_queue_error_invalid;
     var dependencies: [model.max_dependencies]model.Fence = undefined;
     for (value.dependencies, 0..) |dependency, i| {
         if (i < value.dependency_count) dependencies[i] = fence(dependency) else if (!std.meta.eql(dependency, abi.GfxFence{})) return abi.gfx_queue_error_invalid;
@@ -111,6 +112,7 @@ pub fn submit(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input:
         .row_count = value.row_count,
         .source_pitch = value.source_pitch,
         .target_pitch = value.target_pitch,
+        .render = value.render,
     }) catch |err| return errorCode(err);
     output.* = publicStatus(snapshot);
     return abi.gfx_queue_ok;
