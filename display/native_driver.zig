@@ -26,6 +26,7 @@ const Bridge = struct {
     cpu_lease: buffers.Handle = .{},
     timeline: u64 = 0,
     pending: ?queue.model.Fence = null,
+    last_present: ?queue.model.Fence = null,
     bytes: u64 = 0,
     frame: framebuffer.Framebuffer = undefined,
     held_generation: u64 = 0,
@@ -316,7 +317,9 @@ fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {
     const complete = queue.wait(accepted.fence, @as(u64, @max(timer.frequency(), 1)) * 4, .resources_released) catch return false;
     queue.drop(owner, accepted.fence) catch return false;
     bridge.pending = null;
-    return complete.result == .complete and !complete.device_active and !complete.resources_held;
+    const succeeded = complete.result == .complete and !complete.device_active and !complete.resources_held;
+    if (succeeded) bridge.last_present = accepted.fence;
+    return succeeded;
 }
 fn discard() bool {
     if (replacement != null) return false;
@@ -355,6 +358,22 @@ fn discard() bool {
 }
 
 pub const ModeBinding = struct { driver: buffers.Owner, backend: abi.GfxBackendBinding, generation: u64 };
+pub const CursorBinding = struct { driver: buffers.Owner, backend: abi.GfxBackendBinding, generation: u64,
+    head: u32, timeline: u64 = 0, point: u64 = 0 };
+// Caller holds DisplayExecution. Taking this snapshot never waits for a GPU
+// or reuses the CPU-copy result as a visibility receipt.
+pub fn cursorBinding() Error!CursorBinding {
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    if (!bridge.ready or bridge.cancelled or bridge.hardware_restored or
+        display.backendState().state != .software_native) return error.Unsupported;
+    if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null) return error.Busy;
+    try queue.validateOutputBinding(@intCast(bridge.driver_owner.id), bridge.registration.backend);
+    return .{ .driver = bridge.driver_owner, .backend = bridge.registration.backend, .generation = bridge.generation,
+        .head = try outputs.cursorHead(@intCast(bridge.driver_owner.id), bridge.registration.output),
+        .timeline = if (bridge.last_present) |fence| fence.timeline else 0,
+        .point = if (bridge.last_present) |fence| fence.point else 0 };
+}
 pub fn enableModes(identity: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
     if (!execution.enter(0)) return error.Busy;
     defer _ = execution.leave();

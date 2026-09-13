@@ -1065,6 +1065,7 @@ pub fn highestCompletedFence() u64 {
 test "display takeover excludes firmware writers and retains uncertain hardware owners" {
     const t = @import("std").testing;
     try @import("presentation_stats_test.zig").check();
+    try @import("cursor_test.zig").check();
     const Probe = struct {
         result: CommitResult = .old_preserved,
         restores: bool = false,

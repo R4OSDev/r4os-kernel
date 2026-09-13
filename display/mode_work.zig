@@ -168,6 +168,11 @@ fn workerMain() callconv(.c) void {
             if (!locked) { _ = worker_event.waitResult(1); continue; }
         }
         if (current.needsStart()) {
+            @import("cursor_work.zig").beforeMode(binding.driver) catch |err| {
+                if (err == error.Busy) { _ = worker_event.waitResult(1); continue; }
+                rejected(@import("cursor_work.zig").code(err));
+                continue;
+            };
             native.startMode(current.job.operation, binding) catch |err| {
                 if (err == error.Busy) { _ = worker_event.waitResult(1); continue; }
                 rejected(code(err));
@@ -212,6 +217,7 @@ fn workerMain() callconv(.c) void {
             events.signal();
         }
         if (locked and (!current.offered or current.expired)) {
+            @import("cursor_work.zig").resumeModes();
             display.endOutputCommit();
             locked = false;
         }

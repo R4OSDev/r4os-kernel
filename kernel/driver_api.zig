@@ -3331,7 +3331,8 @@ fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i
     // Version-1 consumers may still allocate exactly the original 40-byte
     // prefix. Publish only complete slots within their actual capacity.
     const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverDisplayApi));
-    const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes, .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule), .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish), .prepare_held = @intFromPtr(&gfxDisplayPrepareHeld), .presentation_stats = @intFromPtr(&gfxDisplayPresentationStats) };
+    const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes, .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule), .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish), .prepare_held = @intFromPtr(&gfxDisplayPrepareHeld), .presentation_stats = @intFromPtr(&gfxDisplayPresentationStats),
+        .cursor_configure = @intFromPtr(&gfxCursorConfigure), .cursor_take = @intFromPtr(&gfxCursorTake), .cursor_complete = @intFromPtr(&gfxCursorComplete) };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_output_ok;
 }
@@ -3345,6 +3346,18 @@ fn gfxDisplayPresentationStats(input: *const outputs_contract.DisplayPresentatio
     @import("../display/display.zig").publishPresentationStats(identity.id, identity.generation, input.*) catch |err|
         return @import("../display/presentation_stats.zig").code(err);
     return outputs_contract.gfx_output_ok;
+}
+fn gfxCursorConfigure(input: *const outputs_contract.DisplayCursorInfo) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return @import("../display/cursor_work.zig").configure(identity, input);
+}
+fn gfxCursorTake(backend: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverCursorJob) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return @import("../display/cursor_work.zig").take(identity, backend, output);
+}
+fn gfxCursorComplete(input: *const outputs_contract.GfxDriverCursorCompletion) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return @import("../display/cursor_work.zig").complete(identity, input);
 }
 fn gfxBootFinish(generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);

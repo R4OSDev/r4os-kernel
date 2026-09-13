@@ -140,6 +140,7 @@ pub fn closeReceiverSource(owner: buffers.Owner, binding: abi.GfxReceiverSource)
 pub fn stoppedDriver(owner: u32) void {
     if (owner == 0) return;
     @import("mode_work.zig").stoppedDriver(owner);
+    @import("cursor_work.zig").stoppedDriver(owner);
     const changed = blk: {
         const token = ownership.enterState(); defer ownership.leaveState(token);
         if (owner_epoch == std.math.maxInt(u64)) epoch_exhausted = true else owner_epoch += 1;
@@ -175,6 +176,16 @@ pub fn validateNative(owner: u32, backend: abi.GfxBackendBinding, identity: abi.
     if (owner == 0 or entry.owner != owner or entry.receiver_source != 0 or identity.adapter_id != backend.adapter_id or
         identity.device_generation != backend.device_generation or !nativePresence(entry.info.flags, held)) return error.Stale;
     for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.width == width and mode.height == height) return;
+    return error.Unsupported;
+}
+pub fn cursorHead(owner: u32, identity: abi.GfxOutputId) Error!u32 {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    if (epoch_exhausted or owner == 0 or native_owner != owner or !samePort(identity, native_port)) return error.Stale;
+    for (&catalog.entries) |*entry| if (entry.owner == owner and samePort(identity, entry.info.identity) and
+        entry.info.flags & abi.gfx_output_flag_active != 0) {
+        if (@popCount(entry.info.possible_heads) != 1 or entry.info.possible_heads & ~@as(u32, 255) != 0) return error.Unsupported;
+        return @ctz(entry.info.possible_heads);
+    };
     return error.Unsupported;
 }
 fn nativePresence(flags: u32, held: bool) bool {

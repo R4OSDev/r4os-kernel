@@ -2037,6 +2037,7 @@ fn sharedRasterReleaseProcess(handle: ProgramProcessHandle) void {
     gfx_buffers.store.stoppedOwner(graphicsOwner(handle));
     _ = shared_raster_lock.unlock();
     gfx_queue.stopped(graphicsOwner(handle));
+    @import("../display/cursor_work.zig").stopped(graphicsOwner(handle));
     for (free_sets[0..free_count]) |set| sharedRasterFreeMemories(set);
     gfx_buffers.collect();
 }
@@ -7641,6 +7642,9 @@ fn configureR4XStartR4DrawTable() void {
         .display_present_capabilities = &r4api.r4draw.displayPresentCapabilities,
         .display_present_completion = &r4api.r4draw.displayPresentCompletion,
         .display_presentation_stats = &r4api.r4draw.displayPresentationStats,
+        .display_cursor_info = &@import("../display/cursor_work.zig").info,
+        .display_cursor_submit = &apiDisplayCursorSubmit,
+        .display_cursor_status = &@import("../display/cursor_work.zig").status,
         .gui_frame_begin_damage = &apiGuiFrameBeginDamage,
         .gui_frame_generation_info = &apiGuiFrameGenerationInfo,
         .gui_frame_generation_read = &apiGuiFrameGenerationRead,
@@ -16226,6 +16230,10 @@ fn apiGfxAtomicCommit(input: *const gfx_output_api.abi.GfxAtomicState, output: *
 fn apiGfxAtomicSubmit(input: *const gfx_output_api.abi.GfxAtomicState, confirmation_ms: u32, output: *gfx_output_api.abi.GfxModeStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
     return gfx_output_api.submit(graphicsOwner(owner), input, confirmation_ms, output);
+}
+fn apiDisplayCursorSubmit(input: *const @import("r4os_kernel_contract").DisplayCursorRequest, output: *@import("r4os_kernel_contract").DisplayCursorStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
+    return @import("../display/cursor_work.zig").submit(graphicsOwner(owner), input, output);
 }
 fn apiGfxAtomicResolve(ticket: u64, action: u32, output: *gfx_output_api.abi.GfxModeStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
