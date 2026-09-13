@@ -6,6 +6,7 @@ const resource = @import("../display/queue_resources.zig");
 const buffer_api = @import("gfx_buffer_api.zig");
 const buffers = @import("../memory/gfx_buffers.zig");
 const task_context = @import("../sched/task_context.zig");
+const wire = @import("gfx_queue_wire.zig");
 
 pub fn errorCode(err: runtime.Error) i32 {
     return switch (err) {
@@ -49,9 +50,10 @@ pub fn backend(index: u32, output: *abi.GfxBackendBinding) callconv(.c) i32 {
     return abi.gfx_queue_ok;
 }
 pub fn backendInfo(index: u32, output: *abi.GfxBackendInfo) callconv(.c) i32 {
-    if (!buffer_api.validOutput(abi.GfxBackendInfo, output)) return abi.gfx_queue_error_invalid;
+    const bytes = wire.capacity(abi.GfxBackendInfo, output) orelse return abi.gfx_queue_error_invalid;
     const info = runtime.backendAt(index) orelse return 0;
-    output.* = .{ .binding = .{ .adapter_id = info.binding.adapter, .device_generation = info.binding.device_generation, .reset_generation = info.binding.reset_generation, .milestone = @intFromEnum(info.milestone) }, .profile = info.profile };
+    const result: abi.GfxBackendInfo = .{ .size = bytes, .binding = .{ .adapter_id = info.binding.adapter, .device_generation = info.binding.device_generation, .reset_generation = info.binding.reset_generation, .milestone = @intFromEnum(info.milestone) }, .profile = info.profile, .operations = info.operations, .memory_generation = info.memory_generation };
+    wire.write(abi.GfxBackendInfo, output, bytes, result);
     return abi.gfx_queue_ok;
 }
 pub fn open(owner: buffers.Owner, input: *const abi.GfxQueueConfig, output: *abi.GfxQueueHandle) i32 {
@@ -84,9 +86,9 @@ pub fn close(owner: buffers.Owner, input: *const abi.GfxQueueHandle) i32 {
 pub fn submit(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, output: *abi.GfxFenceStatus) i32 {
     if (@intFromPtr(queue_ptr) == 0 or @intFromPtr(input) == 0 or !buffer_api.validOutput(abi.GfxFenceStatus, output)) return abi.gfx_queue_error_invalid;
     const queue = queue_ptr.*;
-    const value = input.*;
-    if (!header(abi.GfxQueueHandle, queue) or !header(abi.GfxSubmission, value) or value.dependency_count > model.max_dependencies or
-        value.source.reserved0 != 0 or value.target.reserved0 != 0) return abi.gfx_queue_error_invalid;
+    const value = wire.read(abi.GfxSubmission, input) orelse return abi.gfx_queue_error_invalid;
+    if (!header(abi.GfxQueueHandle, queue) or value.dependency_count > model.max_dependencies or
+        value.source.reserved0 != 0 or value.target.reserved0 != 0 or value.reserved0 != 0) return abi.gfx_queue_error_invalid;
     const operation = std.enums.fromInt(resource.Operation, value.operation) orelse return abi.gfx_queue_error_unsupported;
     var dependencies: [model.max_dependencies]model.Fence = undefined;
     for (value.dependencies, 0..) |dependency, i| {
@@ -106,6 +108,9 @@ pub fn submit(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input:
         .source_offset = value.source_offset,
         .target_offset = value.target_offset,
         .bytes = value.byte_length,
+        .row_count = value.row_count,
+        .source_pitch = value.source_pitch,
+        .target_pitch = value.target_pitch,
     }) catch |err| return errorCode(err);
     output.* = publicStatus(snapshot);
     return abi.gfx_queue_ok;

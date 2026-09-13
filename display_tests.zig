@@ -10,6 +10,24 @@ test {
     profile.data_bytes = 63; try std.testing.expectError(error.Invalid, queue.validatedProfile(profile));
     profile.data_bytes = 64; profile.revision = 0; try std.testing.expectError(error.Invalid, queue.validatedProfile(profile));
     profile.revision = 1; profile.interface_id_hi = 0; try std.testing.expectError(error.Invalid, queue.validatedProfile(profile));
+    const wire = @import("program/gfx_queue_wire.zig");
+    inline for (.{ abi.GfxBackendRegistration, abi.GfxBackendInfo, abi.GfxSubmission, abi.GfxDriverJob }) |T| {
+        // Caller capacity and physical guard bytes are independent. Exercise
+        // every incomplete tail as well as both released prefix revisions.
+        var guarded: [@sizeOf(T) + 16]u8 align(@alignOf(T)) = undefined;
+        for (8..@sizeOf(T) + 9) |capacity| {
+            @memset(&guarded, 0xa5);
+            const ptr: *T = @ptrCast(&guarded);
+            ptr.version = 1; ptr.size = @intCast(capacity);
+            const size = wire.capacity(T, ptr) orelse continue;
+            try std.testing.expect(size <= capacity and size <= @sizeOf(T));
+            wire.write(T, ptr, size, .{});
+            try std.testing.expect(std.mem.allEqual(u8, guarded[size..], 0xa5));
+            const decoded = wire.read(T, ptr).?;
+            var expected: T = .{}; expected.size = size;
+            try std.testing.expectEqualDeep(expected, decoded);
+        }
+    }
     _ = @import("display/display.zig");
     _ = @import("display/backend_state.zig");
     _ = @import("display/output_state.zig");

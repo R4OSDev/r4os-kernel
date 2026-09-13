@@ -6,7 +6,7 @@ const lifetime = @import("../memory/gfx_buffer_owner.zig");
 const queue = @import("queue_state.zig");
 pub const owner = lifetime.Owner{ .kind = .kernel, .id = 2, .generation = 1 };
 pub const display_owner = lifetime.Owner{ .kind = .kernel, .id = 3, .generation = 1 };
-pub const Operation = enum(u32) { copy, barrier, upload };
+pub const Operation = enum(u32) { copy, barrier, upload, copy_rows };
 pub const Request = struct {
     operation: Operation = .copy,
     source: lifetime.Handle = .{},
@@ -14,6 +14,10 @@ pub const Request = struct {
     source_offset: u64 = 0,
     target_offset: u64 = 0,
     bytes: u64 = 0,
+    row_count: u32 = 0,
+    source_pitch: u64 = 0,
+    target_pitch: u64 = 0,
+    memory_binding: ?lifetime.layout.Binding = null,
 };
 pub const Entry = struct {
     fence: queue.Fence = .{},
@@ -21,8 +25,61 @@ pub const Entry = struct {
     uses: [2]?lifetime.Use = .{ null, null },
     bytes: u64 = 0,
     copied: u64 = 0,
+    source_offset: u64 = 0,
+    target_offset: u64 = 0,
+    row_bytes: u64 = 0,
+    row_count: u32 = 0,
+    source_pitch: u64 = 0,
+    target_pitch: u64 = 0,
 };
 pub const Error = lifetime.Error || queue.Error;
+
+pub fn rowSpan(bytes: u64, rows: u32, pitch: u64) Error!u64 {
+    if (bytes == 0 or rows == 0 or pitch < bytes) return error.Invalid;
+    return std.math.add(u64, std.math.mul(u64, rows - 1, pitch) catch return error.Overflow, bytes) catch error.Overflow;
+}
+
+// Geometric copies refer to logical plane offsets. An opaque modifier never
+// grants the kernel knowledge of a physical tiled address or byte extent.
+fn planeRows(desc: lifetime.layout.Descriptor, offset: u64, bytes: u64, rows: u32, pitch: u64) Error!void {
+    if (desc.format == .bytes) return;
+    const multi = desc.format == .nv12 or desc.format == .p010;
+    const sample: u64 = switch (desc.format) { .xrgb8888, .argb8888 => 4, .p010 => 2, else => 1 };
+    for (desc.planes[0..desc.plane_count], 0..) |plane, index| {
+        if (offset < plane.offset or pitch != plane.pitch) continue;
+        const relative = offset - plane.offset;
+        const x = relative % pitch;
+        const y = relative / pitch;
+        const columns: u64 = if (multi and index == 1) ((@as(u64, desc.width) + 1) / 2) * 2 else desc.width;
+        const height: u64 = if (multi and index == 1) (@as(u64, desc.height) + 1) / 2 else desc.height;
+        if (y < height and rows <= height - y and x < columns * sample and bytes <= columns * sample - x) return;
+    }
+    return error.Invalid;
+}
+
+// Called outside the metadata owner with both queue leases still retained.
+// Bound copied bytes and discontiguous spans independently; narrow rows must
+// not turn one worker slice into an unbounded loop.
+pub fn copyChunk(entry: *const Entry, budget: u64, max_spans: u32) u64 {
+    const source = entry.uses[0] orelse return 0;
+    const target = entry.uses[1] orelse return 0;
+    const remaining = @min(budget, entry.bytes - entry.copied);
+    var done: u64 = 0;
+    var spans: u32 = 0;
+    while (done < remaining and spans < max_spans) : (spans += 1) {
+        const cursor = entry.copied + done;
+        const rows = entry.operation == .copy_rows;
+        const contiguous = !rows or (entry.source_pitch == entry.row_bytes and entry.target_pitch == entry.row_bytes);
+        const y = if (rows) cursor / entry.row_bytes else 0;
+        const x = if (rows) cursor % entry.row_bytes else cursor;
+        const count = if (contiguous) remaining - done else @min(remaining - done, entry.row_bytes - x);
+        const src: [*]const u8 = @ptrFromInt(source.backing.cpu_address + entry.source_offset + y * entry.source_pitch + x);
+        const dst: [*]u8 = @ptrFromInt(target.backing.cpu_address + entry.target_offset + y * entry.target_pitch + x);
+        @memcpy(dst[0..count], src[0..count]);
+        done += count;
+    }
+    return done;
+}
 
 pub fn Resources(comptime capacity: usize) type {
     return struct {
@@ -31,8 +88,16 @@ pub fn Resources(comptime capacity: usize) type {
 
         pub fn submit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
             const config = try state.configuration(timeline, producer);
-            var entry = Entry{ .operation = request.operation, .bytes = request.bytes };
-            if (request.operation == .copy or request.operation == .upload) {
+            const rows = request.operation == .copy_rows;
+            if (!rows and (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0)) return error.Invalid;
+            const source_span = if (rows) try rowSpan(request.bytes, request.row_count, request.source_pitch) else request.bytes;
+            const target_span = if (rows) try rowSpan(request.bytes, request.row_count, request.target_pitch) else request.bytes;
+            var entry = Entry{ .operation = request.operation,
+                .bytes = if (rows) std.math.mul(u64, request.bytes, request.row_count) catch return error.Overflow else request.bytes,
+                .source_offset = request.source_offset, .target_offset = request.target_offset,
+                .row_bytes = if (rows) request.bytes else 0, .row_count = request.row_count,
+                .source_pitch = request.source_pitch, .target_pitch = request.target_pitch };
+            if (request.operation == .copy or request.operation == .upload or rows) {
                 if (request.bytes == 0) return error.Invalid;
                 const source = try buffers.bufferFor(request.source, producer);
                 const upload = request.operation == .upload;
@@ -42,10 +107,21 @@ pub fn Resources(comptime capacity: usize) type {
                 if (source.eql(target)) return error.Unsupported;
                 const references = [_]lifetime.Handle{ request.source, request.target };
                 const objects = [_]lifetime.Handle{ source, target };
+                var offsets = [_]u64{request.source_offset, request.target_offset};
+                var extents = [_]u64{source_span, target_span};
                 for (references[0..@as(usize, if (upload) 1 else 2)], 0..) |reference, i| {
                     const descriptor = try buffers.describe(reference, producer);
-                    if (!descriptor.binding.portable() and (descriptor.binding.adapter != config.binding.adapter or
-                        descriptor.binding.device_generation != config.binding.device_generation)) return error.Stale;
+                    if (!descriptor.binding.portable()) {
+                        const binding = request.memory_binding orelse return error.Stale;
+                        if (binding.adapter != config.binding.adapter or !std.meta.eql(descriptor.binding, binding)) return error.Stale;
+                    }
+                    if (!lifetime.layout.spanFits(descriptor.bytes, offsets[i], extents[i])) return error.Invalid;
+                    if (rows) try planeRows(descriptor, offsets[i], request.bytes, request.row_count, if (i == 0) request.source_pitch else request.target_pitch);
+                    if (descriptor.modifier != 0) {
+                        if (!rows or config.binding.adapter == 0) return error.Unsupported;
+                        offsets[i] = 0;
+                        extents[i] = descriptor.bytes;
+                    }
                     for (&self.entries) |prior| {
                         if (prior.fence.slot == 0) continue;
                         const status = try state.query(prior.fence);
@@ -56,9 +132,9 @@ pub fn Resources(comptime capacity: usize) type {
                         };
                     }
                 }
-                entry.uses[0] = try buffers.reserveQueued(request.source, producer, owner, false, request.source_offset, request.bytes);
+                entry.uses[0] = try buffers.reserveQueued(request.source, producer, owner, false, offsets[0], extents[0]);
                 errdefer buffers.endUse(entry.uses[0].?.lease, owner, true) catch unreachable;
-                if (!upload) entry.uses[1] = try buffers.reserveQueued(request.target, producer, owner, true, request.target_offset, request.bytes);
+                if (!upload) entry.uses[1] = try buffers.reserveQueued(request.target, producer, owner, true, offsets[1], extents[1]);
                 errdefer if (entry.uses[1]) |held| buffers.endUse(held.lease, owner, true) catch unreachable;
                 // The software adapter only accepts CPU-visible coherent RAM.
                 // Native engines may accept other backing via their own bind.
@@ -175,12 +251,63 @@ test "queued dependencies reserve CPU ownership across producer death and physic
     try buffers.endUse(target_gpu.lease, driver, true);
     while (buffers.pendingRelease()) |ticket| try buffers.finishRelease(ticket, true);
     try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
+
+    // Actual worker copy primitive: different pitches, partial byte slices,
+    // padding sentinels and a dependent readback queued before the upload ends.
+    var pixels: [3][4096]u8 align(4096) = .{@as([4096]u8, @splat(0xa5))} ** 3;
+    for (0..3) |y| for (0..5) |x| { pixels[0][3 + y * 11 + x] = @intCast(17 + y * 5 + x); };
+    for (&refs, 0..) |*ref, i| {
+        const created = try buffers.begin(producer, .{ .bytes = 64, .usage = 15 });
+        try buffers.publish(created, .{ .cookie = i + 1, .bytes = 4096, .cpu_address = @intFromPtr(&pixels[i]), .cache = .write_back });
+        ref.* = created.reference;
+    }
+    var row_state = queue.Store(2, 8){};
+    var row_resources = Resources(8){};
+    const forward = try row_state.open(producer, .{});
+    const back = try row_state.open(producer, .{});
+    var rows: Request = .{ .operation = .copy_rows, .source = refs[0], .target = refs[1],
+        .source_offset = 3, .target_offset = 1, .bytes = 5, .row_count = 3, .source_pitch = 11, .target_pitch = 9 };
+    const row_fence = try row_resources.submit(&row_state, &buffers, forward, producer, .{ .deadline_ns = 100 }, rows, 0);
+    rows.source = refs[1]; rows.target = refs[2]; rows.source_offset = 1; rows.target_offset = 2; rows.source_pitch = 9; rows.target_pitch = 7;
+    try t.expectError(error.Busy, row_resources.submit(&row_state, &buffers, back, producer, .{ .deadline_ns = 100 }, rows, 0));
+    const back_fence = try row_resources.submit(&row_state, &buffers, back, producer, .{ .deadline_ns = 100, .dependencies = &.{row_fence} }, rows, 0);
+    try t.expectError(error.Busy, buffers.use(refs[2], producer, .cpu_read, 0, 64));
+    try t.expectEqualDeep(row_fence, row_state.takeReady(1).?);
+    try t.expect(row_state.takeReady(1) == null);
+    for ([_]queue.Fence{row_fence, back_fence}, 0..) |current, i| {
+        if (i != 0) try t.expectEqualDeep(current, row_state.takeReady(2).?);
+        const entry = &row_resources.entries[current.slot - 1];
+        while (entry.copied < entry.bytes) {
+            const count = copyChunk(entry, 7, 1);
+            try t.expect(count > 0 and count <= 5);
+            entry.copied += count;
+        }
+        try t.expectEqual(@as(u64, 15), entry.copied);
+        try row_state.complete(current, .complete, true, 2);
+        const release_ticket = row_state.takeRelease().?;
+        try row_resources.release(&buffers, release_ticket);
+        try row_state.released(release_ticket, true);
+    }
+    for (pixels[2], 0..) |pixel, index| {
+        const valid = index >= 2 and (index - 2) / 7 < 3 and (index - 2) % 7 < 5;
+        const expected: u8 = if (valid) @intCast(17 + ((index - 2) / 7) * 5 + (index - 2) % 7) else 0xa5;
+        try t.expectEqual(expected, pixel);
+    }
+    const read = try buffers.use(refs[2], producer, .cpu_read, 0, 64);
+    try buffers.endUse(read.lease, producer, true);
+    rows.row_count = 0;
+    try t.expectError(error.Invalid, row_resources.submit(&row_state, &buffers, back, producer, .{ .deadline_ns = 100 }, rows, 3));
+    rows.row_count = 3; rows.source_pitch = std.math.maxInt(u64);
+    try t.expectError(error.Overflow, row_resources.submit(&row_state, &buffers, back, producer, .{ .deadline_ns = 100 }, rows, 3));
+    for (refs) |ref| try buffers.drop(ref, producer);
+    while (buffers.pendingRelease()) |ticket| try buffers.finishRelease(ticket, true);
+    try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
 }
 
 test "native upload retains a single source beyond cancellation and producer reference release" {
     const t = std.testing;
     const producer = display_owner;
-    var buffers = lifetime.Table(1, 4, 8){ .budget_bytes = 4096, .producer_budget_bytes = 4096 };
+    var buffers = lifetime.Table(2, 8, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
     var state = queue.Store(2, 4){};
     var resources = Resources(4){};
     const created = try buffers.begin(producer, .{ .bytes = 4096, .usage = 7 });
@@ -205,4 +332,29 @@ test "native upload retains a single source beyond cancellation and producer ref
     try buffers.finishRelease(buffers.pendingRelease().?, true);
     try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
     try t.expectEqual(queue.Result.cancelled, (try state.query(fence)).result);
+    // Driver memory epoch 73 is unrelated to queue generation 3. The exact
+    // registered owner must match as well; matching an adapter is insufficient.
+    const driver = lifetime.Owner{ .kind = .driver, .id = 12, .generation = 4 };
+    const memory = lifetime.layout.Binding{ .adapter = 7, .driver_owner = 12, .device_generation = 73 };
+    const native = try buffers.beginOwned(driver, .{ .bytes = 4096, .usage = 12, .location = .device_local, .binding = memory }, 79);
+    try buffers.commitOwned(native, driver);
+    const imported = try buffers.share(native.create.reference, producer);
+    const cpu = try buffers.begin(producer, .{ .bytes = 4096, .usage = 15 });
+    try buffers.publish(cpu, .{ .cookie = 80, .bytes = 4096, .cpu_address = 4096, .cache = .write_back });
+    var copy = Request{ .source = cpu.reference, .target = imported, .bytes = 4096, .memory_binding = memory };
+    copy.memory_binding.?.device_generation = device.device_generation;
+    try t.expectError(error.Stale, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, copy, 5));
+    copy.memory_binding = memory; copy.memory_binding.?.driver_owner += 1;
+    try t.expectError(error.Stale, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, copy, 5));
+    copy.memory_binding = memory;
+    const accepted = try resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, copy, 5);
+    try t.expectEqualDeep(accepted, state.takeReadyFor(device, 6).?);
+    try buffers.drop(imported, producer); try buffers.drop(native.create.reference, driver); try buffers.drop(cpu.reference, producer);
+    try t.expect((try buffers.takeOwnedRelease(driver, memory)) == null);
+    try state.complete(accepted, .complete, true, 7);
+    const done = state.takeRelease().?;
+    try resources.release(&buffers, done); try state.released(done, true);
+    try buffers.finishOwnedRelease((try buffers.takeOwnedRelease(driver, memory)).?, driver, true);
+    try buffers.finishRelease(buffers.pendingSystemRelease().?, true);
+    try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
 }

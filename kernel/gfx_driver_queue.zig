@@ -7,6 +7,7 @@ const api = @import("../program/gfx_queue_api.zig");
 const memory_api = @import("../program/gfx_buffer_api.zig");
 const buffers = @import("../memory/gfx_buffers.zig");
 const irq = @import("irq_router.zig");
+const wire = @import("../program/gfx_queue_wire.zig");
 
 fn binding(id: u32, input: abi.GfxBackendBinding) queue.Error!queue.model.Binding {
     if (input.version != 1 or input.size < @sizeOf(abi.GfxBackendBinding)) return error.Invalid;
@@ -23,10 +24,10 @@ pub fn register(identity: buffers.Owner, input: *const abi.GfxBackendRegistratio
 }
 pub fn registerProfile(identity: buffers.Owner, input: *const abi.GfxBackendRegistration, profile: *const abi.GfxBackendProfile, output: *abi.GfxBackendBinding) i32 {
     if (@intFromPtr(input) == 0 or @intFromPtr(profile) == 0 or !memory_api.validOutput(abi.GfxBackendBinding, output)) return abi.gfx_queue_error_invalid;
-    const request = input.*;
-    if (request.version != 1 or request.size < @sizeOf(abi.GfxBackendRegistration) or request.notify_callback < 0xFFFF800000000000 or irq.inDispatch()) return abi.gfx_queue_error_invalid;
+    const request = wire.read(abi.GfxBackendRegistration, input) orelse return abi.gfx_queue_error_invalid;
+    if (request.notify_callback < 0xFFFF800000000000 or irq.inDispatch()) return abi.gfx_queue_error_invalid;
     const milestone = std.enums.fromInt(queue.model.Milestone, request.milestone) orelse return abi.gfx_queue_error_unsupported;
-    const value = queue.registerNative(identity, .{ .adapter = request.adapter_id, .milestone = milestone, .notify = @ptrFromInt(request.notify_callback), .context = request.context, .profile = profile.* }) catch |err| return api.errorCode(err);
+    const value = queue.registerNative(identity, .{ .adapter = request.adapter_id, .milestone = milestone, .notify = @ptrFromInt(request.notify_callback), .context = request.context, .profile = profile.*, .operations = request.operations, .memory_generation = request.memory_generation }) catch |err| return api.errorCode(err);
     output.* = publicBinding(value, request.milestone);
     return abi.gfx_queue_ok;
 }
@@ -37,18 +38,25 @@ pub fn unregister(id: u32, input: *const abi.GfxBackendBinding, quiesced: u32) i
     return abi.gfx_queue_ok;
 }
 pub fn take(id: u32, input: *const abi.GfxBackendBinding, output: *abi.GfxDriverJob) i32 {
-    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxDriverJob, output) or irq.inDispatch()) return abi.gfx_queue_error_invalid;
+    if (@intFromPtr(input) == 0 or irq.inDispatch()) return abi.gfx_queue_error_invalid;
+    const bytes = wire.capacity(abi.GfxDriverJob, output) orelse return abi.gfx_queue_error_invalid;
     const value = binding(id, input.*) catch |err| return api.errorCode(err);
+    if (bytes < @sizeOf(abi.GfxDriverJob) and (queue.nativeOperations(id, value) catch |err| return api.errorCode(err)) & 8 != 0) return abi.gfx_queue_error_invalid;
     const job = queue.takeNative(id, value) catch |err| return api.errorCode(err);
-    output.* = .{
+    const result: abi.GfxDriverJob = .{
+        .size = bytes,
         .fence = api.publicFence(job.fence),
         .operation = @intFromEnum(job.operation),
         .source_buffer = if (job.uses[0]) |use| memory_api.publicHandle(use.buffer) else .{},
         .target_buffer = if (job.uses[1]) |use| memory_api.publicHandle(use.buffer) else .{},
-        .byte_length = job.bytes,
-        .source_offset = if (job.uses[0]) |use| use.range.offset else 0,
-        .target_offset = if (job.uses[1]) |use| use.range.offset else 0,
+        .byte_length = if (job.operation == .copy_rows) job.row_bytes else job.bytes,
+        .source_offset = job.source_offset,
+        .target_offset = job.target_offset,
+        .row_count = job.row_count,
+        .source_pitch = job.source_pitch,
+        .target_pitch = job.target_pitch,
     };
+    wire.write(abi.GfxDriverJob, output, bytes, result);
     return abi.gfx_queue_ok;
 }
 pub fn complete(id: u32, input: *const abi.GfxFence, result: u32, quiesced: u32) i32 {

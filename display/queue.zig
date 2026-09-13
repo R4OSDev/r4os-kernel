@@ -28,16 +28,16 @@ var started = false;
 var next_copy: usize = 0;
 const Waiter = struct { task_id: u32 = 0, generation: u64 = 0, fence: model.Fence = .{} };
 var waiters: [256]Waiter = .{Waiter{}} ** 256;
-pub const NativeConfig = struct { adapter: u32, milestone: model.Milestone, notify: work.WorkHandler, context: usize, profile: abi.GfxBackendProfile = .{} };
-pub const BackendInfo = struct { binding: model.Binding, milestone: model.Milestone, profile: abi.GfxBackendProfile = .{} };
+pub const NativeConfig = struct { adapter: u32, milestone: model.Milestone, notify: work.WorkHandler, context: usize, profile: abi.GfxBackendProfile = .{}, operations: u64 = 7, memory_generation: u64 = 0 };
+pub const BackendInfo = struct { binding: model.Binding, milestone: model.Milestone, profile: abi.GfxBackendProfile = .{}, operations: u64 = 0, memory_generation: u64 = 0 };
 pub fn backendAt(index: u32) ?BackendInfo {
     if (!started or index > backends.len) return null;
-    if (index == 0) return .{ .binding = software, .milestone = .cpu_stores };
+    if (index == 0) return .{ .binding = software, .milestone = .cpu_stores, .operations = 11 };
     buffers.lock();
     defer buffers.unlock();
     const backend = backends[index - 1];
     if (backend.owner.id == 0 or backend.closing) return null;
-    return .{ .binding = backend.binding, .milestone = backend.milestone, .profile = backend.profile };
+    return .{ .binding = backend.binding, .milestone = backend.milestone, .profile = backend.profile, .operations = backend.operations, .memory_generation = backend.memory_generation };
 }
 const Backend = struct {
     owner: buffers.Owner = .{ .kind = .driver, .id = 0, .generation = 0 },
@@ -50,6 +50,8 @@ const Backend = struct {
     work_handle: u32 = 0,
     display_timeline: u64 = 0,
     profile: abi.GfxBackendProfile = .{},
+    operations: u64 = 7,
+    memory_generation: u64 = 0,
 };
 var backends: [16]Backend = .{Backend{}} ** 16;
 var wakeups = @import("queue_ingress.zig").Wakeups(backends.len){};
@@ -89,7 +91,7 @@ pub fn validatedProfile(input: abi.GfxBackendProfile) Error!abi.GfxBackendProfil
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
-    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores) return error.Invalid;
+    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 15) != 0) return error.Invalid;
     const profile = try validatedProfile(config.profile);
     buffers.lock();
     defer buffers.unlock();
@@ -97,7 +99,8 @@ pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model
     for (&backends) |backend| if (backend.owner.id != 0 and backend.binding.adapter == config.adapter) return error.Busy;
     for (&backends, 0..) |*backend, index| if (backend.owner.id == 0) {
         backend_serial += 1;
-        backend.* = .{ .owner = identity, .binding = .{ .adapter = config.adapter, .device_generation = backend_serial, .reset_generation = 1 }, .milestone = config.milestone, .notify = config.notify, .context = config.context, .profile = profile };
+        backend.* = .{ .owner = identity, .binding = .{ .adapter = config.adapter, .device_generation = backend_serial, .reset_generation = 1 }, .milestone = config.milestone, .notify = config.notify, .context = config.context, .profile = profile, .operations = config.operations,
+            .memory_generation = if (config.memory_generation != 0) config.memory_generation else backend_serial };
         const flags = interrupts.saveAndDisableRuntime();
         wakeups.bind(index, @intCast(identity.id), backend.binding);
         interrupts.restore(flags);
@@ -128,6 +131,12 @@ pub fn nativeMilestone(id: u32, binding: model.Binding) Error!model.Milestone {
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
     return backend.milestone;
+}
+pub fn nativeOperations(id: u32, binding: model.Binding) Error!u64 {
+    buffers.lock(); defer buffers.unlock();
+    const backend = try backendLocked(binding);
+    if (id == 0 or backend.owner.id != id) return error.WrongOwner;
+    return backend.operations;
 }
 // The extra operation is private to the retained display producer. Old R4D
 // queue registrations cannot accidentally receive an operation they lack.
@@ -372,13 +381,20 @@ pub fn submit(owner: buffers.Owner, timeline: u64, request: model.Submission, tr
     const snapshot = blk: {
         buffers.lock();
         defer buffers.unlock();
+        const config = try state.configuration(timeline, owner);
+        const backend = if (config.binding.adapter == 0) null else try backendLocked(config.binding);
+        const operations = if (backend) |native| native.operations else @as(u64, 11);
+        if (operations & (@as(u64, 1) << @intCast(@intFromEnum(transport.operation))) == 0) return error.Unsupported;
         if (transport.operation == .upload) {
             if (!owner.eql(resource_model.display_owner)) return error.Unsupported;
-            const config = try state.configuration(timeline, owner);
-            const backend = try backendLocked(config.binding);
-            if (backend.closing or backend.display_timeline != timeline) return error.Unsupported;
+            const native = backend orelse return error.Unsupported;
+            if (native.closing or native.display_timeline != timeline) return error.Unsupported;
         }
-        const accepted = try resources.submit(&state, &buffers.store, timeline, owner, request, transport, instant);
+        var retained = transport;
+        // Authenticated registry state, never caller-provided driver identity.
+        retained.memory_binding = if (backend) |native| .{ .adapter = native.binding.adapter,
+            .driver_owner = @intCast(native.owner.id), .device_generation = native.memory_generation } else null;
+        const accepted = try resources.submit(&state, &buffers.store, timeline, owner, request, retained, instant);
         completions[accepted.slot - 1] = sync.Event.init(false);
         releases[accepted.slot - 1] = sync.Event.init(false);
         buffers.visibility();
@@ -539,14 +555,7 @@ fn copySlice() bool {
     const status = query(entry.fence) catch unreachable;
     // Only this worker executes software copies. Cancellation between chunks
     // is therefore a provable stop; it never implies native DMA quiescence.
-    const count = if (status.phase == .terminal) 0 else @min(copy_slice_bytes, entry.bytes - entry.copied);
-    if (count != 0) {
-        const src = entry.uses[0].?;
-        const dst = entry.uses[1].?;
-        const source: [*]const u8 = @ptrFromInt(src.backing.cpu_address + src.range.offset + entry.copied);
-        const target: [*]u8 = @ptrFromInt(dst.backing.cpu_address + dst.range.offset + entry.copied);
-        @memcpy(target[0..count], source[0..count]);
-    }
+    const count = if (status.phase == .terminal) 0 else resource_model.copyChunk(&entry, copy_slice_bytes, 256);
     buffers.visibility();
     const finished_at = now();
     buffers.lock();
