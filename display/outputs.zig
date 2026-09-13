@@ -137,6 +137,16 @@ pub fn closeReceiverSource(owner: buffers.Owner, binding: abi.GfxReceiverSource)
     };
     if (changed) events.signal();
 }
+pub fn publishAudio(owner: buffers.Owner, input: *const abi.GfxAudioRoute) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    if (epoch_exhausted) return error.Exhausted;
+    try catalog.publishAudio(owner, input);
+}
+pub fn queryAudio(location: u32, device: u32, index: u32) ?abi.GfxAudioRoute {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return catalog.audio.query(location, device, index);
+}
 pub fn stoppedDriver(owner: u32) void {
     if (owner == 0) return;
     @import("mode_work.zig").stoppedDriver(owner);

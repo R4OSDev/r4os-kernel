@@ -3389,7 +3389,27 @@ fn gfxDisplaySchedule(input: *const outputs_contract.GfxBackendBinding) callconv
 fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32 {
     _ = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
     return @import("../display/output_state.zig").driverTable(output, .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw), .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace), .close_source = @intFromPtr(&gfxReceiverClose),
-        .mode_enable = @intFromPtr(&gfxModeEnable), .mode_take = @intFromPtr(&gfxModeTake), .mode_complete = @intFromPtr(&gfxModeComplete) });
+        .mode_enable = @intFromPtr(&gfxModeEnable), .mode_take = @intFromPtr(&gfxModeTake), .mode_complete = @intFromPtr(&gfxModeComplete),
+        .audio_publish = @intFromPtr(&gfxAudioPublish), .audio_query = @intFromPtr(&gfxAudioQuery) });
+}
+fn gfxAudioPublish(input: *const outputs_contract.GfxAudioRoute) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or irq_router.inDispatch() or input.version != 1 or input.size < @sizeOf(outputs_contract.GfxAudioRoute))
+        return outputs_contract.gfx_output_error_invalid;
+    const owner = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
+    @import("../display/outputs.zig").publishAudio(owner, input) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxAudioQuery(location: u32, device: u32, index: u32, output: *outputs_contract.GfxAudioRoute) callconv(.c) i32 {
+    if (!gfx_api.validOutput(outputs_contract.GfxAudioRoute, output) or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    // HDA catalog/write callbacks retain their real R4D through the existing
+    // device-callback ledger. Admit only this bounded read there; receiver
+    // publication, PCI, display commands and allocation keep their owners.
+    const owner = activeOwner();
+    if (owner == 0 or driver_threads.currentOwner() != 0) return gfx_api.status(error.WrongOwner);
+    var state: outputs_contract.DriverHeapStats = .{};
+    if (driver_heap.stats(owner, &state) != outputs_contract.driver_heap_ok or state.owner_epoch == 0) return gfx_api.status(error.Stale);
+    output.* = @import("../display/outputs.zig").queryAudio(location, device, index) orelse return 0;
+    return 1;
 }
 const gfx_modes = @import("../display/mode_work.zig");
 fn gfxModeEnable(input: *const outputs_contract.GfxBackendBinding) callconv(.c) i32 {

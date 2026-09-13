@@ -22,6 +22,7 @@ pub const Fact = struct { buffer: ?bo.Descriptor = null, dependency: enum { none
 pub const Ticket = struct { id: u64 = 0 };
 pub const Store = struct {
     entries: [capacity]Entry = .{Entry{}} ** capacity,
+    audio: @import("audio_routes.zig").Store = .{},
     sources: [16]Source = @splat(.{}),
     source_serial: u64 = 0,
     revision: u64 = 0,
@@ -187,7 +188,7 @@ pub const Store = struct {
         if (self.revision < ceiling) self.revision += 1;
     }
     fn eraseReceivers(self: *Store, generation: u64) bool {
-        var changed = false;
+        var changed = self.audio.erase(generation);
         for (&self.entries) |*entry| if (entry.receiver_source == generation) {
             entry.* = .{};
             changed = true;
@@ -223,6 +224,7 @@ pub const Store = struct {
         for (&self.entries) |*entry| if (entry.receiver_source == binding.generation) { entry.* = .{}; };
         self.revision += 1;
         source.sequence = sequence;
+        self.audio.invalidate(binding.generation, sequence);
         var slot: usize = 0;
         for (records) |*record| {
             // A native source publication replaces this port's metadata-only
@@ -248,6 +250,11 @@ pub const Store = struct {
         for (&self.entries) |*entry| if (entry.receiver_source == 0 and entry.owner == owner.id and
             entry.info.identity.adapter_id == adapter and entry.info.identity.connector_id == connector) return true;
         return false;
+    }
+    pub fn publishAudio(self: *Store, owner: DriverOwner, value: *const abi.GfxAudioRoute) Error!void {
+        const source = try self.receiverSource(owner, value.source);
+        if (value.receiver_sequence != source.sequence) return error.Stale;
+        try self.audio.publish(value);
     }
     pub fn cursor(self: *const Store) abi.GfxDisplayRevision {
         var present: u32 = 0;
@@ -617,7 +624,7 @@ test "receiver capacity and legacy table prefix preserve previous publications a
     try t.expect(rebound.generation > first.generation);
     try t.expect(try store.stop(@intCast(owner.id)));
     try t.expectError(error.Stale, store.replaceReceivers(owner, rebound, 1, records));
-    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 88 }) |bytes| {
+    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 79, 80, 87, 88 }) |bytes| {
         var storage: [96]u8 align(8) = @splat(0x79);
         const table: *abi.GfxDriverOutputApi = @ptrCast(&storage);
         table.version = 1; table.size = bytes;
@@ -626,9 +633,51 @@ test "receiver capacity and legacy table prefix preserve previous publications a
         if (bytes < 24) {
             try t.expect(code == abi.gfx_output_error_invalid and std.mem.eql(u8, &storage, &before));
         } else {
-            const returned = @min(bytes & ~@as(u32, 7), 72);
+            const returned = @min(bytes & ~@as(u32, 7), @sizeOf(abi.GfxDriverOutputApi));
             try t.expect(code == abi.gfx_output_ok and table.version == 1 and table.size == returned and table.publish == 3 and table.withdraw == 4);
             try t.expect(std.mem.allEqual(u8, storage[returned..], 0x79));
         }
     }
+}
+
+test "receiver audio metadata rejects stale ELD and disappears on source close without video waits" {
+    const t = std.testing;
+    const store = try t.allocator.create(Store);
+    defer t.allocator.destroy(store);
+    store.* = .{};
+    const owner: DriverOwner = .{ .kind = .driver, .id = 3, .generation = 9 };
+    const source = try store.registerSource(owner, 0x01000900);
+    const record = try t.allocator.create(abi.GfxReceiverInfo);
+    defer t.allocator.destroy(record);
+    record.* = .{ .connector_id = 16, .flags = abi.gfx_output_flag_connected };
+    try store.replaceReceivers(owner, source, 1, @as([*]const abi.GfxReceiverInfo, @ptrCast(record))[0..1]);
+    var route: abi.GfxAudioRoute = .{ .source = source, .receiver_sequence = 1, .revision = 1,
+        .connector_id = 16, .hda_location = 0x01000901, .hda_device = 0x228e10de,
+        .head_id = 2, .device_entry = 0, .state = abi.gfx_audio_route_ready, .eld_bytes = 24,
+        .port_id = .{16,0,0,0,0,0,0,0} };
+    @memcpy(route.eld[8..16], &route.port_id);
+    try store.publishAudio(owner, &route);
+    try store.publishAudio(owner, &route); // exact retry
+    try t.expect(std.meta.eql(route, store.audio.query(route.hda_location, route.hda_device, 0).?));
+    try t.expect(store.audio.query(route.hda_location ^ 1, route.hda_device, 0) == null);
+    var other = route;
+    other.connector_id = 32;
+    try t.expectError(error.Routing, store.publishAudio(owner, &other));
+    other = route; other.revision += 1; other.eld[8] ^= 1;
+    try t.expectError(error.Invalid, store.publishAudio(owner, &other));
+    try t.expectError(error.Stale, store.publishAudio(.{ .kind = .driver, .id = 3, .generation = 10 }, &route));
+    // Receiver changes invalidate audio even during a retained video ticket.
+    store.pending = .{ .id = 7 }; store.retained = 1;
+    try store.replaceReceivers(owner, source, 2, &.{});
+    const invalidated = store.audio.query(route.hda_location, route.hda_device, 0).?;
+    try t.expect(invalidated.receiver_sequence == 2 and invalidated.state == abi.gfx_audio_route_pending and invalidated.eld_bytes == 0);
+    try t.expect(std.mem.allEqual(u8, &invalidated.eld, 0));
+    try t.expectError(error.Stale, store.publishAudio(owner, &route));
+    route.receiver_sequence = 2;
+    try t.expectError(error.Stale, store.publishAudio(owner, &route)); // same revision cannot restore invalid data
+    route.revision += 1; route.state = abi.gfx_audio_route_absent; route.eld_bytes = 0; @memset(&route.eld, 0);
+    try store.publishAudio(owner, &route);
+    try t.expect(try store.closeSource(owner, source));
+    try t.expect(store.audio.query(route.hda_location, route.hda_device, 0) == null);
+    try t.expectError(error.Stale, store.publishAudio(owner, &route));
 }
