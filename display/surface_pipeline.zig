@@ -19,6 +19,14 @@ const FrameMode = enum(u8) {
 };
 
 var target: Target = .{};
+// IRQ consumers need one coherent size without entering the program-state
+// owner. This projection is published only with the canonical target.
+var pixel_bounds: u64 = 0;
+pub const PixelBounds = struct { width: u32, height: u32 };
+pub fn pixelBounds() PixelBounds {
+    const value = @atomicLoad(u64, &pixel_bounds, .acquire);
+    return .{ .width = @truncate(value), .height = @truncate(value >> 32) };
+}
 var frame_active = false;
 var frame_mode: FrameMode = .none;
 var last_frame_mode: FrameMode = .none;
@@ -39,7 +47,20 @@ pub fn initFromDisplayManager() void {
 pub fn initTarget(new_target: Target) void {
     const token = ownership.enterState();
     defer ownership.leaveState(token);
+    resetTargetLocked(new_target);
+}
+
+// The DisplayManager publishes this under the same state owner as its
+// completed mode. Unchanged presents preserve an in-progress frame; a real
+// geometry change invalidates that frame before readers see the new target.
+pub fn publishTargetLocked(new_target: Target) void {
+    if (@import("std").meta.eql(target, new_target)) return;
+    resetTargetLocked(new_target);
+}
+
+fn resetTargetLocked(new_target: Target) void {
     target = new_target;
+    @atomicStore(u64, &pixel_bounds, @as(u32, @intCast(target.width)) | (target.height << 32), .release);
     frame_active = false;
     frame_mode = .none;
     last_frame_mode = .none;

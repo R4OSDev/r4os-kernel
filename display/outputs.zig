@@ -71,9 +71,8 @@ pub fn publish(owner: u32, input: *const abi.GfxOutputPublication) Error!abi.Gfx
         input.info.mode_count > abi.gfx_output_max_modes or input.info.edid_bytes > abi.gfx_output_max_edid_bytes) return error.Invalid;
     if (input.info.flags & (abi.gfx_output_flag_firmware_snapshot | abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry) != 0 or
         input.info.identity.adapter_id != input.backend.adapter_id or input.info.identity.device_generation != input.backend.device_generation) return error.Invalid;
-    // This catalog bridge cannot promise native hardware/pipeline commits.
-    // A later backend must negotiate that path before advertising modeset.
-    if (input.info.limits.flags & abi.gfx_output_limit_modeset != 0) return error.Unsupported;
+    const modeset = input.info.limits.flags & abi.gfx_output_limit_modeset != 0;
+    if (modeset and !@import("native_driver.zig").modesEnabled(owner, input.backend)) return error.Unsupported;
     for (input.modes[input.info.mode_count..]) |value| if (!std.meta.eql(value, abi.GfxOutputMode{})) return error.Invalid;
     for (input.edid[input.info.edid_bytes..]) |value| if (value != 0) return error.Invalid;
     const epoch = blk: {
@@ -87,8 +86,9 @@ pub fn publish(owner: u32, input: *const abi.GfxOutputPublication) Error!abi.Gfx
         if (epoch_exhausted or owner_epoch != epoch) return error.Stale;
         var info = input.info;
         if (owner == native_owner and samePort(info.identity, native_port) and nativePresence(info.flags, true))
-            info.flags |= abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry;
-        break :blk try catalog.publish(owner, info, input.modes[0..info.mode_count], input.edid[0..info.edid_bytes]);
+            info.flags |= abi.gfx_output_flag_active | (if (modeset) @as(u32, 0) else abi.gfx_output_flag_fixed_geometry);
+        break :blk if (modeset) try catalog.publishModeset(owner, info, input.modes[0..info.mode_count], input.edid[0..info.edid_bytes]) else
+            try catalog.publish(owner, info, input.modes[0..info.mode_count], input.edid[0..info.edid_bytes]);
     };
     events.signal(); // Complete topology is visible before sequence + wake.
     return identity;
@@ -139,6 +139,7 @@ pub fn closeReceiverSource(owner: buffers.Owner, binding: abi.GfxReceiverSource)
 }
 pub fn stoppedDriver(owner: u32) void {
     if (owner == 0) return;
+    @import("mode_work.zig").stoppedDriver(owner);
     const changed = blk: {
         const token = ownership.enterState(); defer ownership.leaveState(token);
         if (owner_epoch == std.math.maxInt(u64)) epoch_exhausted = true else owner_epoch += 1;
@@ -187,9 +188,13 @@ pub fn nativeActive(owner: u32, identity: abi.GfxOutputId, active: bool) void {
         const token = ownership.enterState(); defer ownership.leaveState(token);
         if (owner == 0 or epoch_exhausted) break :blk false;
         if (active) {
-            const found = catalog.find(identity) catch break :blk false;
-            if (found.owner != owner) break :blk false;
-            native_owner = owner; native_port = identity;
+            var found: ?abi.GfxOutputId = null;
+            for (&catalog.entries) |*entry| if (entry.owner == owner and samePort(entry.info.identity, identity)) {
+                found = entry.info.identity;
+                break;
+            };
+            const selected = found orelse break :blk false;
+            native_owner = owner; native_port = selected;
         } else {
             if (native_owner != owner or !samePort(native_port, identity)) break :blk false;
             native_owner = 0; native_port = .{};
@@ -202,7 +207,8 @@ pub fn nativeActive(owner: u32, identity: abi.GfxOutputId, active: bool) void {
             const enabled = active and nativePresence(entry.info.flags, true);
             if (was == enabled) break :blk false;
             if (catalog.revision == std.math.maxInt(u64)) { epoch_exhausted = true; break :blk false; }
-            if (enabled) entry.info.flags |= abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry else
+            if (enabled) entry.info.flags |= abi.gfx_output_flag_active |
+                (if (entry.info.limits.flags & abi.gfx_output_limit_modeset != 0) @as(u32, 0) else abi.gfx_output_flag_fixed_geometry) else
                 entry.info.flags &= ~(abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry);
             catalog.revision += 1;
             break :blk true;
@@ -251,4 +257,47 @@ pub fn atomic(owner: buffers.Owner, state: *const abi.GfxAtomicState, commit: bo
     };
     events.signal();
     return result;
+}
+
+pub const NativeAdmission = struct { ticket: model.Ticket, mode: abi.GfxOutputMode, revision: u64 };
+pub fn nativeMode(owner: buffers.Owner, state: *const abi.GfxAtomicState) Error!abi.GfxOutputMode {
+    var facts: [abi.gfx_output_max_assignments]model.Fact = @splat(.{});
+    try gather(owner, state, &facts);
+    if (state.count != 1 or state.assignments[0].output.adapter_id == 0) return error.Unsupported;
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    _ = try catalog.validate(state, facts[0..1]);
+    const entry = try catalog.find(state.assignments[0].output);
+    for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.mode_id == state.assignments[0].mode_id) return mode;
+    return error.Stale;
+}
+pub fn beginNative(owner: buffers.Owner, state: *const abi.GfxAtomicState) Error!NativeAdmission {
+    var facts: [abi.gfx_output_max_assignments]model.Fact = @splat(.{});
+    try gather(owner, state, &facts);
+    if (state.count != 1 or state.assignments[0].output.adapter_id == 0) return error.Unsupported;
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    if (epoch_exhausted) return error.Exhausted;
+    if (catalog.revision > std.math.maxInt(u64) - 3 or catalog.commit_sequence > std.math.maxInt(u64) - 2) return error.Exhausted;
+    const entry = try catalog.find(state.assignments[0].output);
+    for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.mode_id == state.assignments[0].mode_id) {
+        return .{ .ticket = try catalog.begin(state, facts[0..1]), .mode = mode, .revision = catalog.revision };
+    };
+    return error.Stale;
+}
+pub fn finishNative(ticket: model.Ticket, operation: u32, outcome: u32, quiesced: u32) Error!abi.GfxAtomicResult {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    if (operation == abi.gfx_mode_operation_apply) return catalog.finish(ticket, outcome, quiesced);
+    if (catalog.pending.id != 0 or catalog.retained != 0) return error.Busy;
+    if (catalog.revision == std.math.maxInt(u64) or catalog.commit_sequence == std.math.maxInt(u64)) return error.Exhausted;
+    if (outcome == abi.gfx_output_outcome_lost) catalog.retained = 3;
+    if (operation == abi.gfx_mode_operation_rollback and outcome == abi.gfx_output_outcome_old_preserved) catalog.commit_sequence += 1;
+    catalog.revision += 1;
+    return .{ .topology_revision = catalog.revision, .commit_sequence = catalog.commit_sequence, .outcome = outcome,
+        .retained = if (outcome == abi.gfx_output_outcome_lost) 3 else if (outcome == abi.gfx_output_outcome_applied) 2 else 1 };
+}
+pub fn canFinishNative(ticket: model.Ticket, operation: u32) Error!void {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    if (operation == abi.gfx_mode_operation_apply) {
+        if (ticket.id == 0 or catalog.pending.id != ticket.id) return error.Stale;
+    } else if (catalog.pending.id != 0 or catalog.retained != 0) return error.Busy;
+    if (catalog.revision == std.math.maxInt(u64) or catalog.commit_sequence == std.math.maxInt(u64)) return error.Exhausted;
 }

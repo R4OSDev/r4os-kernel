@@ -7675,6 +7675,9 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_output_edid = &gfx_output_api.edid,
         .gfx_atomic_test = &apiGfxAtomicTest,
         .gfx_atomic_commit = &apiGfxAtomicCommit,
+        .gfx_atomic_submit = &apiGfxAtomicSubmit,
+        .gfx_atomic_status = &gfx_output_api.modeStatus,
+        .gfx_atomic_resolve = &apiGfxAtomicResolve,
     });
 }
 
@@ -16218,6 +16221,14 @@ fn apiGfxAtomicTest(input: *const gfx_output_api.abi.GfxAtomicState, output: *gf
 fn apiGfxAtomicCommit(input: *const gfx_output_api.abi.GfxAtomicState, output: *gfx_output_api.abi.GfxAtomicResult) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
     return gfx_output_api.atomic(graphicsOwner(owner), input, output, true);
+}
+fn apiGfxAtomicSubmit(input: *const gfx_output_api.abi.GfxAtomicState, confirmation_ms: u32, output: *gfx_output_api.abi.GfxModeStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
+    return gfx_output_api.submit(graphicsOwner(owner), input, confirmation_ms, output);
+}
+fn apiGfxAtomicResolve(ticket: u64, action: u32, output: *gfx_output_api.abi.GfxModeStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
+    return gfx_output_api.resolve(graphicsOwner(owner), ticket, action, output);
 }
 fn apiGfxQueueClose(input: *const gfx_queue_api.abi.GfxQueueHandle) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;

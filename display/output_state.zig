@@ -36,6 +36,12 @@ pub const Store = struct {
         if (self.revision == std.math.maxInt(u64) or self.receiver_serial == std.math.maxInt(u64)) return error.Exhausted;
     }
     pub fn publish(self: *Store, owner: u32, info: abi.GfxOutputInfo, modes: []const abi.GfxOutputMode, edid: []const u8) Error!abi.GfxOutputId {
+        return self.publishImpl(owner, info, modes, edid, false);
+    }
+    pub fn publishModeset(self: *Store, owner: u32, info: abi.GfxOutputInfo, modes: []const abi.GfxOutputMode, edid: []const u8) Error!abi.GfxOutputId {
+        return self.publishImpl(owner, info, modes, edid, true);
+    }
+    fn publishImpl(self: *Store, owner: u32, info: abi.GfxOutputInfo, modes: []const abi.GfxOutputMode, edid: []const u8, promote: bool) Error!abi.GfxOutputId {
         try self.canChange();
         for (&self.sources) |*source| if (source.binding.generation != 0 and source.binding.adapter_id == info.identity.adapter_id and
             source.owner.id != owner) return error.Busy;
@@ -75,7 +81,13 @@ pub const Store = struct {
             // Source limits are adapter-wide. A driver must withdraw/rebind a
             // complete device before changing that adapter capability contract.
             if (entry.receiver_source == 0 and entry.info.identity.device_generation == info.identity.device_generation and
-                !std.meta.eql(entry.info.limits, info.limits)) return error.Invalid;
+                !std.meta.eql(entry.info.limits, info.limits)) {
+                // The common primary bridge may explicitly negotiate its
+                // first modeset contract after boot takeover. Other ports
+                // and already-negotiated device limits must still agree.
+                if (!promote or entry.owner != owner or entry.info.identity.connector_id != info.identity.connector_id or
+                    entry.info.limits.flags & abi.gfx_output_limit_modeset != 0 or info.limits.flags & abi.gfx_output_limit_modeset == 0) return error.Invalid;
+            }
             if (entry.info.identity.connector_id != info.identity.connector_id) continue;
             if (entry.owner != owner and entry.owner != 0) return error.Busy;
             selected = index;
@@ -605,8 +617,8 @@ test "receiver capacity and legacy table prefix preserve previous publications a
     try t.expect(rebound.generation > first.generation);
     try t.expect(try store.stop(@intCast(owner.id)));
     try t.expectError(error.Stale, store.replaceReceivers(owner, rebound, 1, records));
-    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 56 }) |bytes| {
-        var storage: [64]u8 align(8) = @splat(0x79);
+    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 88 }) |bytes| {
+        var storage: [96]u8 align(8) = @splat(0x79);
         const table: *abi.GfxDriverOutputApi = @ptrCast(&storage);
         table.version = 1; table.size = bytes;
         const before = storage;
@@ -614,7 +626,7 @@ test "receiver capacity and legacy table prefix preserve previous publications a
         if (bytes < 24) {
             try t.expect(code == abi.gfx_output_error_invalid and std.mem.eql(u8, &storage, &before));
         } else {
-            const returned = @min(bytes & ~@as(u32, 7), 48);
+            const returned = @min(bytes & ~@as(u32, 7), 72);
             try t.expect(code == abi.gfx_output_ok and table.version == 1 and table.size == returned and table.publish == 3 and table.withdraw == 4);
             try t.expect(std.mem.allEqual(u8, storage[returned..], 0x79));
         }

@@ -35,8 +35,19 @@ const Bridge = struct {
     hardware_restored: bool = false,
     pixels_restored: bool = false,
     queue_stopped: bool = false,
+    modes_enabled: bool = false,
+    driver_reference: buffers.Handle = .{},
 };
 var bridge: Bridge = .{};
+const Surface = struct {
+    reference: buffers.Handle = .{},
+    driver_reference: buffers.Handle = .{},
+    read_lease: buffers.Handle = .{},
+    bytes: u64 = 0,
+    frame: framebuffer.Framebuffer = undefined,
+};
+const Replacement = struct { old: Surface, new: Surface, using_new: bool = false };
+var replacement: ?Replacement = null;
 // Different R4D owners can call this global bridge concurrently. Callbacks
 // also enter from normal display presentation, outside a driver transition.
 // Reentrance is required for a transition's own commit/CPU/restore callbacks;
@@ -49,6 +60,9 @@ fn binding(value: abi.GfxBackendBinding) queue.model.Binding {
     return .{ .adapter = value.adapter_id, .device_generation = value.device_generation, .reset_generation = value.reset_generation };
 }
 pub fn retained(id: u32) bool { return id != 0 and @atomicLoad(u32, &retained_owner, .acquire) == id; }
+// Read only while DisplayExecution is held; replacement admission, geometry
+// mutation and retirement all use that same execution owner.
+pub fn modePending() bool { return replacement != null; }
 pub fn code(err: Error) i32 {
     return switch (err) {
         error.Busy => abi.gfx_output_error_busy,
@@ -171,6 +185,7 @@ pub fn transition(id: u32, generation: u64, operation: u32, output: *abi.GfxNati
     if (id == 0 or irq.inDispatch() or !buffer_api.validOutput(abi.GfxNativeState, output) or operation > 2) return abi.gfx_output_error_invalid;
     if (!execution.enter(0)) return abi.gfx_output_error_busy;
     defer _ = execution.leave();
+    if (replacement != null) return abi.gfx_output_error_busy;
     // Native cleanup may already have released this bridge while a retained
     // boot snapshot still needs release. DisplayManager owns that final retry.
     if (bridge.driver_owner.id != id and !(operation == 2 and bridge.driver_owner.id == 0 and display.retainsDriverOwner(id))) return abi.gfx_output_error_stale;
@@ -239,6 +254,7 @@ fn commit(_: usize, generation: u64, saved: *const display.BootSnapshot) display
 fn restore(_: usize, generation: u64, saved: *const display.BootSnapshot) bool {
     if (!execution.enter(0)) return false;
     defer _ = execution.leave();
+    if (replacement != null) return false;
     if (!bridge.hardware_restored) {
         if (!driver.enterOwnerBounded(@intCast(bridge.driver_owner.id), @max(timer.frequency(), 1))) return false;
         const callback: Callback = @ptrFromInt(bridge.registration.restore_callback);
@@ -302,6 +318,7 @@ fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {
     return complete.result == .complete and !complete.device_active and !complete.resources_held;
 }
 fn discard() bool {
+    if (replacement != null) return false;
     if (bridge.cpu_lease.id != 0) {
         buffers.lock();
         buffers.unmapCpuLocked(bridge.cpu_lease, owner) catch { buffers.unlock(); return false; };
@@ -327,7 +344,150 @@ fn discard() bool {
         buffers.drop(bridge.reference, owner) catch return false;
         bridge.reference = .{};
     }
+    if (bridge.driver_reference.id != 0) {
+        buffers.drop(bridge.driver_reference, bridge.driver_owner) catch return false;
+        bridge.driver_reference = .{};
+    }
     bridge = .{};
     @atomicStore(u32, &retained_owner, 0, .release);
     return true;
+}
+
+pub const ModeBinding = struct { driver: buffers.Owner, backend: abi.GfxBackendBinding, generation: u64 };
+pub fn enableModes(identity: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    if (!bridge.driver_owner.eql(identity) or !bridge.ready or !std.meta.eql(bridge.registration.backend, backend) or
+        display.backendState().state != .software_native or bridge.cancelled or bridge.hardware_restored) return error.Stale;
+    try queue.validateOutputBinding(@intCast(identity.id), backend);
+    bridge.modes_enabled = true;
+}
+pub fn modesEnabled(id: u32, backend: abi.GfxBackendBinding) bool {
+    if (!execution.enter(0)) return false;
+    defer _ = execution.leave();
+    return bridge.ready and bridge.modes_enabled and bridge.driver_owner.id == id and
+        std.meta.eql(bridge.registration.backend, backend) and !bridge.cancelled and !bridge.hardware_restored;
+}
+pub fn modeBinding(assignment: abi.GfxScanoutState) Error!ModeBinding {
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    if (!bridge.ready or !bridge.modes_enabled or bridge.cancelled or bridge.hardware_restored or
+        display.backendState().state != .software_native) return error.Unsupported;
+    if (assignment.output.adapter_id != bridge.registration.backend.adapter_id or
+        assignment.output.device_generation != bridge.registration.backend.device_generation or
+        assignment.output.connector_id != bridge.registration.output.connector_id) return error.Stale;
+    try queue.validateOutputBinding(@intCast(bridge.driver_owner.id), bridge.registration.backend);
+    return .{ .driver = bridge.driver_owner, .backend = bridge.registration.backend, .generation = bridge.generation };
+}
+// DisplayExecution is held by the submitting task. Full references are
+// imported before caller exit can close the producer; queued mapping-only
+// loans cannot support subsequent normal desktop CPU writes.
+pub fn prepareMode(caller: buffers.Owner, assignment: abi.GfxScanoutState, mode: abi.GfxOutputMode) Error!abi.GfxBufferReference {
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null) return error.Busy;
+    if (assignment.source_x != 0 or assignment.source_y != 0 or assignment.destination_x != 0 or assignment.destination_y != 0 or
+        assignment.source_width != mode.width or assignment.source_height != mode.height or
+        assignment.destination_width != mode.width or assignment.destination_height != mode.height or
+        assignment.rotation != 0 or assignment.color != 0 or assignment.bits_per_color != 8) return error.Unsupported;
+    const source = try buffer_api.handle(assignment.buffer);
+    buffers.lock(); defer buffers.unlock();
+    const descriptor = try buffers.store.describe(source, caller);
+    const usage = buffers.layout.Usage.cpu_write | buffers.layout.Usage.transfer_source | buffers.layout.Usage.scanout;
+    if (descriptor.format != .xrgb8888 or descriptor.location != .system or !descriptor.binding.portable() or
+        descriptor.modifier != 0 or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0 or descriptor.usage & usage != usage or
+        descriptor.width != mode.width or descriptor.height != mode.height or descriptor.planes[0].pitch > std.math.maxInt(u32) or
+        descriptor.bytes != descriptor.planes[0].pitch * descriptor.height) return error.Unsupported;
+    if ((try buffers.store.bufferFor(source, caller)).eql(try buffers.store.bufferFor(bridge.reference, owner))) return error.Invalid;
+    const reference = try buffers.store.share(source, owner);
+    errdefer buffers.store.drop(reference, owner) catch unreachable;
+    const driver_reference = try buffers.store.share(source, bridge.driver_owner);
+    errdefer buffers.store.drop(driver_reference, bridge.driver_owner) catch unreachable;
+    const mapped = try buffers.mapLocked(reference, owner, .cpu_write, 0, descriptor.bytes);
+    try buffers.unmapCpuLocked(mapped.lease, owner);
+    const read = try buffers.store.use(reference, owner, .device_read, 0, descriptor.bytes);
+    errdefer buffers.store.endUse(read.lease, owner, true) catch unreachable;
+    const wire = try buffer_api.referenceLocked(driver_reference, bridge.driver_owner);
+    var frame = bridge.frame;
+    frame.address = @ptrFromInt(mapped.backing.cpu_address);
+    frame.width = descriptor.width; frame.height = descriptor.height; frame.pitch = descriptor.planes[0].pitch;
+    frame.edid = null; frame.edid_size = 0;
+    replacement = .{ .old = .{ .reference = bridge.reference, .driver_reference = bridge.driver_reference, .bytes = bridge.bytes, .frame = bridge.frame },
+        .new = .{ .reference = reference, .driver_reference = driver_reference, .read_lease = read.lease, .bytes = descriptor.bytes, .frame = frame } };
+    return wire;
+}
+// The mode worker holds DisplayExecution before exposing a job to the R4D.
+pub fn startMode(operation: u32, expected: ModeBinding) Error!void {
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    if (!bridge.driver_owner.eql(expected.driver) or bridge.generation != expected.generation or
+        !std.meta.eql(bridge.registration.backend, expected.backend) or bridge.cancelled or bridge.hardware_restored) return error.Stale;
+    const change = if (replacement) |*value| value else return error.Stale;
+    if (bridge.cpu_lease.id != 0 or bridge.pending != null) return error.Busy;
+    try queue.validateOutputBinding(@intCast(expected.driver.id), expected.backend);
+    const surface = if (operation == abi.gfx_mode_operation_apply) &change.old else if (operation == abi.gfx_mode_operation_rollback) &change.new else return;
+    if (surface.read_lease.id == 0) {
+        buffers.lock(); defer buffers.unlock();
+        surface.read_lease = (try buffers.store.use(surface.reference, owner, .device_read, 0, surface.bytes)).lease;
+    }
+}
+fn releaseRead(surface: *Surface) Error!void {
+    if (surface.read_lease.id == 0) return;
+    buffers.lock(); defer buffers.unlock();
+    try buffers.store.endUse(surface.read_lease, owner, true);
+    surface.read_lease = .{};
+}
+fn releaseSurface(surface: *Surface) Error!void {
+    try releaseRead(surface);
+    if (surface.driver_reference.id != 0) {
+        try buffers.drop(surface.driver_reference, bridge.driver_owner);
+        surface.driver_reference = .{};
+    }
+    if (surface.reference.id != 0) {
+        try buffers.drop(surface.reference, owner);
+        surface.reference = .{};
+    }
+}
+fn selectSurface(surface: *const Surface) Error!void {
+    const before = bridge.frame;
+    bridge.frame = surface.frame;
+    display.replaceNativeFrameLocked(bridge.driver_owner.id, bridge.generation, &bridge.frame, surface.bytes) catch |err| {
+        bridge.frame = before;
+        return err;
+    };
+    bridge.reference = surface.reference; bridge.driver_reference = surface.driver_reference; bridge.bytes = surface.bytes;
+    outputs.nativeActive(@intCast(bridge.driver_owner.id), bridge.registration.output, true);
+}
+pub fn settleMode(operation: u32, outcome: u32) Error!void {
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    const change = if (replacement) |*value| value else return error.Stale;
+    if (outcome == abi.gfx_output_outcome_lost) {
+        try display.loseNativeModeLocked(bridge.driver_owner.id, bridge.generation);
+        outputs.nativeActive(@intCast(bridge.driver_owner.id), bridge.registration.output, false);
+        return;
+    }
+    if (outcome == abi.gfx_output_outcome_applied) {
+        if (operation == abi.gfx_mode_operation_apply) {
+            try releaseRead(&change.new);
+            try selectSurface(&change.new);
+            change.using_new = true;
+            return;
+        }
+        if (operation != abi.gfx_mode_operation_confirm or !change.using_new) return error.Invalid;
+        // A late receipt may follow an operation timeout that hid the
+        // primary. Republish the proven image before retiring old backing.
+        try selectSurface(&change.new);
+        try releaseSurface(&change.old);
+    } else if (outcome == abi.gfx_output_outcome_old_preserved) {
+        try releaseRead(&change.old);
+        // Even a rejected apply may arrive after the primary was hidden.
+        // using_new alone therefore cannot decide whether recovery is needed.
+        try selectSurface(&change.old);
+        try releaseSurface(&change.new);
+    } else return error.Invalid;
+    replacement = null;
+}
+pub fn abortPreparedMode() void {
+    settleMode(abi.gfx_mode_operation_apply, abi.gfx_output_outcome_old_preserved) catch {};
 }

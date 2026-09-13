@@ -543,7 +543,37 @@ pub fn restoreBootBackend(owner: usize, generation: u64) TransitionError!void {
     defer execution.leave();
     return restoreBootLocked(owner, generation);
 }
+
+// Caller holds DisplayExecution across the real device transaction. Neither
+// routine changes the immutable boot snapshot or calls a driver callback.
+pub fn replaceNativeFrameLocked(owner: usize, generation: u64, frame: *fb.Framebuffer, bytes: u64) TransitionError!void {
+    const backend = if (native_backend) |*value| value else return error.Unavailable;
+    try backend_manager.checkActive(owner, generation);
+    if (backend.owner != owner or system_transition or !fb.isNativeXrgb32(frame) or frame.width == 0 or frame.height == 0 or
+        frame.width > 65536 or frame.height > 65536 or frame.pitch > ~@as(u32, 0) or frame.pitch < frame.width * 4 or
+        frame.pitch & 3 != 0 or @intFromPtr(frame.address) & 3 != 0 or bytes != frame.pitch * frame.height or
+        @intFromPtr(frame.address) > ~@as(u64, 0) - bytes) return error.Invalid;
+    try backend_manager.modeResult(owner, generation, true);
+    native_device.mode.width = @intCast(frame.width);
+    native_device.mode.height = @intCast(frame.height);
+    native_device.mode.pitch = @intCast(frame.pitch);
+    native_device.mapping = .{ .kind = .native_scanout, .virt_base = @intFromPtr(frame.address), .byte_len = bytes };
+    native_device.framebuffer = frame;
+    native_device.flags &= ~DeviceFlags.fixed_mode;
+    backend.target.mode = native_device.mode;
+    backend.target.mapping = native_device.mapping;
+    backend.target.framebuffer = frame;
+    backend.target.flags = native_device.flags;
+    primary_device = &native_device;
+    publishStats();
+}
+pub fn loseNativeModeLocked(owner: usize, generation: u64) TransitionError!void {
+    try backend_manager.modeResult(owner, generation, false);
+    primary_device = null;
+    publishStats();
+}
 fn restoreBootLocked(owner: usize, generation: u64) TransitionError!void {
+    if (@import("builtin").os.tag == .freestanding and @import("native_driver.zig").modePending()) return error.Busy;
     const backend = native_backend orelse return error.Unavailable;
     const boot = &(saved_boot orelse return error.Unavailable);
     const recovery_generation = try backend_manager.beginRecovery(owner, generation);
@@ -605,6 +635,7 @@ pub fn registerBootBackend(target: DisplayTarget) void {
     if (target.framebuffer) |frame| saved_boot = .{ .mode = target.mode, .mapping = target.mapping, .framebuffer = frame.* };
     completed_backend_state = backend_manager.value;
     completed_stats = captureStats();
+    publishGeometryLocked(completed_stats);
     completed_boot_mode = target.mode;
     completed_boot_mapping = target.mapping;
     copyName(&completed_output_name, target.name);
@@ -665,6 +696,7 @@ fn publishStats() void {
     const value = captureStats();
     const token = ownership.enterState();
     completed_stats = value;
+    publishGeometryLocked(value);
     completed_backend_state = backend_manager.value;
     if (saved_boot) |boot| {
         completed_boot_mode = boot.mode;
@@ -679,6 +711,13 @@ fn publishStats() void {
     ownership.leaveState(token);
     if (@import("builtin").os.tag == .freestanding)
         @import("outputs.zig").bootActive(value.registered and value.kind == .bootfb);
+}
+
+fn publishGeometryLocked(value: Stats) void {
+    @import("surface_pipeline.zig").publishTargetLocked(if (value.registered) .{
+        .width = value.mode.width, .height = value.mode.height,
+        .pitch = value.mode.pitch, .bpp = value.mode.bpp,
+    } else .{});
 }
 
 fn captureStats() Stats {
@@ -1113,6 +1152,24 @@ test "display takeover excludes firmware writers and retains uncertain hardware 
     try t.expectEqual(@as(u32, 0x00445566), native_pixels[17]);
     try t.expectEqualStrings("native-cpu", nameSlice(&presented.backend_name));
     try t.expect(!probe.cpu_active and probe.cpu_frames == 1);
+    // A completed variable geometry change republishes the shared primary
+    // while keeping the boot timing/mapping and original pixels immutable.
+    var resized = native_frame;
+    resized.width = 4; resized.height = 4; resized.pitch = 16;
+    try t.expect(beginOutputCommit());
+    try replaceNativeFrameLocked(92, second, &resized, 64);
+    try t.expect(stats().mode.width == 4 and stats().mode.height == 4 and bootSnapshot().?.mode.width == 8);
+    try t.expect(@import("surface_pipeline.zig").width() == 4 and @import("surface_pipeline.zig").height() == 4);
+    try t.expect(@import("surface_pipeline.zig").pixelBounds().width == 4 and @import("surface_pipeline.zig").pixelBounds().height == 4);
+    try loseNativeModeLocked(92, second);
+    try t.expect(!stats().registered and retainsDriverOwner(92));
+    try t.expect(@import("surface_pipeline.zig").width() == 0 and @import("surface_pipeline.zig").height() == 0);
+    try t.expect(@import("surface_pipeline.zig").pixelBounds().width == 0);
+    try replaceNativeFrameLocked(92, second, &native_frame, 256);
+    endOutputCommit();
+    try t.expect(stats().mode.width == 8 and @import("std").mem.eql(u32, &before, &boot_pixels));
+    try t.expect(@import("surface_pipeline.zig").width() == 8 and @import("surface_pipeline.zig").height() == 8);
+    try t.expect(@import("surface_pipeline.zig").pixelBounds().width == 8);
     probe.cpu_ok = false;
     try t.expect(!fill(0x112233)); // Failed upload triggers the same recovery.
     try t.expect(!probe.cpu_active and probe.cpu_frames == 2);

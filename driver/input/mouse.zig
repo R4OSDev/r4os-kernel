@@ -48,8 +48,6 @@ var state: State = .{
     .present = false,
 };
 
-var max_x: i32 = 0;
-var max_y: i32 = 0;
 var packet: [PACKET_LEN]u8 = .{0} ** PACKET_LEN;
 var packet_index: usize = 0;
 var button_press_latch: u8 = 0;
@@ -90,8 +88,8 @@ pub const Stats = struct {
 };
 
 pub fn init(bounds: Bounds) bool {
-    max_x = if (bounds.width == 0) 0 else @intCast(bounds.width - 1);
-    max_y = if (bounds.height == 0) 0 else @intCast(bounds.height - 1);
+    const max_x: i32 = if (bounds.width == 0) 0 else @intCast(bounds.width - 1);
+    const max_y: i32 = if (bounds.height == 0) 0 else @intCast(bounds.height - 1);
     state.x = @divTrunc(max_x, 2);
     state.y = @divTrunc(max_y, 2);
     cursor_x = state.x;
@@ -134,18 +132,19 @@ pub fn onControllerByte(data: u8) void {
 
 pub fn snapshot() State {
     pollUsb();
-    return state;
+    return boundedState();
 }
 
 pub fn stats() Stats {
     pollUsb();
+    const current = boundedState();
     return .{
         .irq_count = irq_count,
         .bytes_received = bytes_received,
         .packets = state.packets,
         .usb_packets = usb_packets,
-        .x = state.x,
-        .y = state.y,
+        .x = current.x,
+        .y = current.y,
         .dx = state.dx,
         .dy = state.dy,
         .wheel = state.wheel,
@@ -156,7 +155,7 @@ pub fn stats() Stats {
 
 pub fn snapshotForApi() State {
     pollUsb();
-    var s = state;
+    var s = boundedState();
     const latched = button_press_latch;
     if (latched != 0) {
         s.buttons |= latched;
@@ -175,11 +174,12 @@ pub fn injectRelativePacket(dx: i32, dy: i32, buttons: u8) void {
 }
 
 pub fn injectRelativePacketWheel(dx: i32, dy: i32, buttons: u8, wheel: i32) void {
+    const limit = currentLimits();
     state.dx = dx;
     state.dy = dy;
     state.wheel += wheel;
-    state.x = clamp(state.x + dx, 0, max_x);
-    state.y = clamp(state.y + dy, 0, max_y);
+    state.x = clamp(state.x +| dx, 0, limit.x);
+    state.y = clamp(state.y +| dy, 0, limit.y);
     const new_buttons = buttons & 0x07;
     button_press_latch |= new_buttons & ~state.buttons;
     state.buttons = new_buttons;
@@ -207,13 +207,27 @@ pub fn refreshCursor() void {
 }
 
 pub fn cursorOverlay() CursorOverlay {
+    const limit = currentLimits();
     return .{
         .visible = cursor_visible,
-        .x = cursor_x,
-        .y = cursor_y,
-        .max_x = max_x,
-        .max_y = max_y,
+        .x = clamp(cursor_x, 0, limit.x),
+        .y = clamp(cursor_y, 0, limit.y),
+        .max_x = limit.x,
+        .max_y = limit.y,
     };
+}
+
+fn currentLimits() struct { x: i32, y: i32 } {
+    const bounds = @import("../../display/surface_pipeline.zig").pixelBounds();
+    return .{ .x = @intCast(@min(bounds.width -| 1, 0x7fff_ffff)),
+        .y = @intCast(@min(bounds.height -| 1, 0x7fff_ffff)) };
+}
+fn boundedState() State {
+    var value = state;
+    const limit = currentLimits();
+    value.x = clamp(value.x, 0, limit.x);
+    value.y = clamp(value.y, 0, limit.y);
+    return value;
 }
 
 fn handleByte(byte: u8) void {
@@ -229,11 +243,12 @@ fn handlePacket(p: [PACKET_LEN]u8) void {
     if ((p[0] & 0xC0) != 0) return;
     const dx = signExtend(p[1], (p[0] & 0x10) != 0);
     const dy = signExtend(p[2], (p[0] & 0x20) != 0);
+    const limit = currentLimits();
 
     state.dx = dx;
     state.dy = -dy;
-    state.x = clamp(state.x + dx, 0, max_x);
-    state.y = clamp(state.y - dy, 0, max_y);
+    state.x = clamp(state.x +| dx, 0, limit.x);
+    state.y = clamp(state.y -| dy, 0, limit.y);
     const new_buttons = p[0] & 0x07;
     button_press_latch |= new_buttons & ~state.buttons;
     state.buttons = new_buttons;

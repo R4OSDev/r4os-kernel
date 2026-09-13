@@ -47,3 +47,26 @@ pub fn atomic(owner: buffers.Owner, input: *const abi.GfxAtomicState, output: *a
     output.* = result;
     return abi.gfx_output_ok;
 }
+const modes = @import("../display/mode_work.zig");
+pub fn submit(owner: buffers.Owner, input: *const abi.GfxAtomicState, confirmation_ms: u32, output: *abi.GfxModeStatus) i32 {
+    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxModeStatus, output)) return abi.gfx_output_error_invalid;
+    const state = input.*;
+    const call = lifetime.enterUnwind();
+    if (!call.admitted()) return abi.gfx_output_error_busy;
+    defer _ = lifetime.leaveUnwind(call);
+    const result = modes.submit(owner, &state, confirmation_ms) catch |err| return modes.code(err);
+    output.* = result;
+    return abi.gfx_output_ok;
+}
+pub fn modeStatus(ticket: u64, output: *abi.GfxModeStatus) callconv(.c) i32 {
+    if (!memory_api.validOutput(abi.GfxModeStatus, output)) return abi.gfx_output_error_invalid;
+    const result = modes.status(ticket) catch |err| return modes.code(err);
+    output.* = result;
+    return abi.gfx_output_ok;
+}
+pub fn resolve(owner: buffers.Owner, ticket: u64, action: u32, output: *abi.GfxModeStatus) i32 {
+    if (!memory_api.validOutput(abi.GfxModeStatus, output)) return abi.gfx_output_error_invalid;
+    const result = modes.resolve(owner, ticket, action) catch |err| return modes.code(err);
+    output.* = result;
+    return abi.gfx_output_ok;
+}

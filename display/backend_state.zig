@@ -123,6 +123,16 @@ pub const Manager = struct {
         if (owner == 0 or generation == 0 or self.value.owner != owner or self.value.generation != generation) return error.Stale;
     }
 
+    // A mode transaction keeps the same driver incarnation and boot hold.
+    // Only its real receipt can republish native output after uncertainty.
+    pub fn modeResult(self: *Manager, owner: usize, generation: u64, confirmed: bool) Error!void {
+        try self.checkActive(owner, generation);
+        if (self.value.state != .software_native and self.value.state != .unavailable) return error.Busy;
+        self.value.state = if (confirmed) .software_native else .unavailable;
+        self.value.reason = if (confirmed) .none else .commit_failed;
+        self.changed();
+    }
+
     pub fn retainsOwner(self: *const Manager, owner: usize) bool {
         return owner != 0 and (self.value.owner == owner or self.value.pending_owner == owner);
     }

@@ -3368,7 +3368,28 @@ fn gfxDisplaySchedule(input: *const outputs_contract.GfxBackendBinding) callconv
 }
 fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32 {
     _ = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
-    return @import("../display/output_state.zig").driverTable(output, .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw), .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace), .close_source = @intFromPtr(&gfxReceiverClose) });
+    return @import("../display/output_state.zig").driverTable(output, .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw), .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace), .close_source = @intFromPtr(&gfxReceiverClose),
+        .mode_enable = @intFromPtr(&gfxModeEnable), .mode_take = @intFromPtr(&gfxModeTake), .mode_complete = @intFromPtr(&gfxModeComplete) });
+}
+const gfx_modes = @import("../display/mode_work.zig");
+fn gfxModeEnable(input: *const outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    gfx_modes.enable(identity, input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxModeTake(input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverModeJob) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or !gfx_api.validOutput(outputs_contract.GfxDriverModeJob, output) or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    const value = gfx_modes.take(identity, input.*) catch |err| return gfx_modes.code(err);
+    output.* = value orelse return 0;
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxModeComplete(input: *const outputs_contract.GfxDriverModeCompletion) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    gfx_modes.complete(identity, input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
 }
 fn gfxReceiverRegister(adapter: u32, output: *outputs_contract.GfxReceiverSource) callconv(.c) i32 {
     if (@intFromPtr(output) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
