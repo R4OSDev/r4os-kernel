@@ -59,8 +59,9 @@ pub fn admitLocked(identity: Owner) buffers.Error!void {
 }
 pub fn beginClose(id: u32) void {
     const token = lifecycleLock();
-    defer lifecycleUnlock(token);
     state.close(id);
+    lifecycleUnlock(token);
+    if (scheduler.current() != null) @import("gfx_allocations.zig").closingDriver(id);
 }
 pub fn retained(id: u32) bool {
     const held = blk: {
@@ -69,7 +70,7 @@ pub fn retained(id: u32) bool {
         const identity = state.owner(id, false) catch return false;
         break :blk state.retains(identity);
     };
-    return held or (scheduler.current() != null and buffers.retainsDriver(id));
+    return held or (scheduler.current() != null and (buffers.retainsDriver(id) or @import("gfx_allocations.zig").retainsDriver(id)));
 }
 pub fn finishOwner(id: u32) void {
     const identity = owner(id, false) catch return;

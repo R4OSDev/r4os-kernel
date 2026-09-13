@@ -3637,9 +3637,30 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
         .buffer_abort = @intFromPtr(&gfxOwnedAbort),
         .buffer_take_release = @intFromPtr(&gfxOwnedTakeRelease),
         .buffer_finish_release = @intFromPtr(&gfxOwnedFinishRelease),
+        .native_register = @intFromPtr(&gfxNativeRegister),
+        .native_unregister = @intFromPtr(&gfxNativeUnregister),
+        .native_take = @intFromPtr(&gfxNativeTake),
+        .native_complete = @intFromPtr(&gfxNativeComplete),
     };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_buffer_result_ok;
+}
+
+fn gfxNativeRegister(input: *const outputs_contract.GfxNativeProvider, output: *outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return @import("gfx_allocation_driver_api.zig").register(identity, input, output);
+}
+fn gfxNativeUnregister(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return @import("gfx_allocation_driver_api.zig").unregister(identity, input);
+}
+fn gfxNativeTake(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxNativeJob) callconv(.c) i32 {
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return @import("gfx_allocation_driver_api.zig").take(identity, input, output);
+}
+fn gfxNativeComplete(provider: *const outputs_contract.GfxBufferHandle, request: *const outputs_contract.GfxBufferHandle, result: i32, reference: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return @import("gfx_allocation_driver_api.zig").complete(identity, provider, request, result, reference);
 }
 
 fn gfxMemoryStats(output: *outputs_contract.GfxBufferStats) callconv(.c) i32 {

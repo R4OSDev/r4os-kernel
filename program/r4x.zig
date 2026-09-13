@@ -14,6 +14,8 @@ const gfx_buffers = @import("../memory/gfx_buffers.zig");
 const gfx_buffer_api = @import("gfx_buffer_api.zig");
 const gfx_queue = @import("../display/queue.zig");
 const gfx_queue_api = @import("gfx_queue_api.zig");
+const gfx_allocation_api = @import("gfx_allocation_api.zig");
+const gfx_allocations = @import("../kernel/gfx_allocations.zig");
 const gfx_output_api = @import("gfx_output_api.zig");
 const module_file = @import("../kernel/module_file.zig");
 const module_r4m = @import("../kernel/module_r4m.zig");
@@ -2037,6 +2039,7 @@ fn sharedRasterReleaseProcess(handle: ProgramProcessHandle) void {
     gfx_buffers.store.stoppedOwner(graphicsOwner(handle));
     _ = shared_raster_lock.unlock();
     gfx_queue.stopped(graphicsOwner(handle));
+    gfx_allocations.stopped(graphicsOwner(handle));
     @import("../display/cursor_work.zig").stopped(graphicsOwner(handle));
     for (free_sets[0..free_count]) |set| sharedRasterFreeMemories(set);
     gfx_buffers.collect();
@@ -7675,6 +7678,11 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_fence_release = &apiGfxFenceRelease,
         .gfx_queue_backend = &gfx_queue_api.backend,
         .gfx_queue_backend_info = &gfx_queue_api.backendInfo,
+        .gfx_native_start = &apiGfxNativeStart,
+        .gfx_native_query = &apiGfxNativeQuery,
+        .gfx_native_receive = &apiGfxNativeReceive,
+        .gfx_native_close = &apiGfxNativeClose,
+        .gfx_native_wait = &apiGfxNativeWait,
         .gfx_output_revision = &gfx_output_api.revision,
         .gfx_output_info = &gfx_output_api.info,
         .gfx_output_mode = &gfx_output_api.mode,
@@ -12634,6 +12642,7 @@ fn releaseProgramTaskGeneration(task_id: u32, task_generation: u64, current_task
     return switch (task.retireIdentity(task_id, task_generation)) {
         .gone, .released => blk: {
             gfx_queue.retiredTask(task_id, task_generation);
+            gfx_allocations.retiredTask(task_id, task_generation);
             break :blk true;
         },
         .pending => false,
@@ -16227,6 +16236,26 @@ fn apiGfxBufferCreate(input: *const r4x_api.GfxBufferDescriptor, output: *r4x_ap
     const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
     return gfx_buffer_api.create(graphicsOwner(owner), input, output);
 }
+fn apiGfxNativeStart(input: *const r4x_api.GfxNativeAllocation, output: *r4x_api.GfxNativeStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_allocation_api.start(graphicsOwner(owner), input, output);
+}
+fn apiGfxNativeQuery(input: *const r4x_api.GfxBufferHandle, output: *r4x_api.GfxNativeStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_allocation_api.query(graphicsOwner(owner), input, output);
+}
+fn apiGfxNativeReceive(input: *const r4x_api.GfxBufferHandle, output: *r4x_api.GfxBufferReference) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_allocation_api.receive(graphicsOwner(owner), input, output);
+}
+fn apiGfxNativeClose(input: *const r4x_api.GfxBufferHandle) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_allocation_api.close(graphicsOwner(owner), input);
+}
+fn apiGfxNativeWait(input: *const r4x_api.GfxBufferHandle, timeout_ticks: u64, output: *r4x_api.GfxNativeStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_allocation_api.wait(graphicsOwner(owner), input, timeout_ticks, output);
+}
 fn apiGfxQueueOpen(input: *const gfx_queue_api.abi.GfxQueueConfig, output: *gfx_queue_api.abi.GfxQueueHandle) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
     return gfx_queue_api.open(graphicsOwner(owner), input, output);
@@ -17704,6 +17733,7 @@ fn commitProgramExit(handle: ProgramProcessHandle, exit_code: i32, requested_rea
 
     orphanOwnedProgramCompletions(handle);
     gfx_queue.stopped(graphicsOwner(handle));
+    gfx_allocations.stopped(graphicsOwner(handle));
     terminateProgramThreadsForHandle(handle, -9, scheduler.currentId());
     return .committed;
 }

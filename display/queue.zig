@@ -63,6 +63,8 @@ pub fn init() bool {
     started = true;
     return true;
 }
+pub fn available() bool { return started; }
+pub fn wake() void { worker_event.signal(); }
 fn now() u64 {
     return monotonic.nowNanoseconds() orelse 0;
 }
@@ -584,6 +586,7 @@ fn workerMain() callconv(.c) void {
             }
         }
         publishAndRelease();
+        const allocation_pending = @import("../kernel/gfx_allocations.zig").service();
         const native_pending = notifyNative();
         if (copySlice()) {
             scheduler.yield();
@@ -598,6 +601,6 @@ fn workerMain() callconv(.c) void {
             break;
         };
         buffers.unlock();
-        _ = worker_event.waitResult(if (pending or native_pending) 1 else scheduler.WAIT_FOREVER);
+        _ = worker_event.waitResult(if (pending or native_pending or allocation_pending) 1 else scheduler.WAIT_FOREVER);
     }
 }
