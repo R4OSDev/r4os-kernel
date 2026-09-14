@@ -94,6 +94,12 @@ pub fn reset(id: u32, input: *const abi.GfxBackendBinding, quiesced: u32, output
     output.* = publicBinding(changed, request.milestone);
     return abi.gfx_queue_ok;
 }
+pub fn readRenderColorList(id: u32, input: *const abi.GfxFence, output: *abi.GfxRenderColorList) i32 {
+    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxRenderColorList, output)) return abi.gfx_queue_error_invalid;
+    const value = queue.nativeRenderColorList(id, api.fence(input.*)) catch |err| return api.errorCode(err);
+    output.* = value;
+    return abi.gfx_queue_ok;
+}
 pub fn segment(id: u32, input: *const abi.GfxFence, which: u32, offset: u64, mask: u64, output: *abi.GfxDmaSegment) i32 {
     if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxDmaSegment, output)) return abi.gfx_queue_error_invalid;
     const value = queue.nativeSegment(id, api.fence(input.*), which, offset, mask) catch |err| return api.errorCode(err);

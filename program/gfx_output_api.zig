@@ -37,6 +37,12 @@ pub fn edid(input: *const abi.GfxOutputId, index: u32, output: *abi.GfxEdidBlock
     output.* = snapshot orelse return 0;
     return abi.gfx_output_ok;
 }
+pub fn color(input: *const abi.GfxOutputId, output: *abi.GfxOutputColorState) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxOutputColorState, output)) return abi.gfx_output_error_invalid;
+    const snapshot = outputs.colorAt(input.*) catch |err| return code(err);
+    output.* = snapshot;
+    return abi.gfx_output_ok;
+}
 pub fn atomic(owner: buffers.Owner, input: *const abi.GfxAtomicState, output: *abi.GfxAtomicResult, commit: bool) i32 {
     if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxAtomicResult, output)) return abi.gfx_output_error_invalid;
     const state = input.*;
@@ -55,6 +61,29 @@ pub fn submit(owner: buffers.Owner, input: *const abi.GfxAtomicState, confirmati
     if (!call.admitted()) return abi.gfx_output_error_busy;
     defer _ = lifetime.leaveUnwind(call);
     const result = modes.submit(owner, &state, confirmation_ms) catch |err| return modes.code(err);
+    output.* = result;
+    return abi.gfx_output_ok;
+}
+pub fn testColor(owner: buffers.Owner, input: *const abi.GfxModeColorRequest, output: *abi.GfxAtomicResult) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxModeColorRequest) != 0 or
+        !memory_api.validOutput(abi.GfxAtomicResult, output)) return abi.gfx_output_error_invalid;
+    const request = input.*;
+    const call = lifetime.enterUnwind();
+    if (!call.admitted()) return abi.gfx_output_error_busy;
+    defer _ = lifetime.leaveUnwind(call);
+    @import("../display/mode_color.zig").validate(owner, &request) catch |err| return code(err);
+    const result = outputs.atomic(owner, &request.state, false) catch |err| return code(err);
+    output.* = result;
+    return abi.gfx_output_ok;
+}
+pub fn submitColor(owner: buffers.Owner, input: *const abi.GfxModeColorRequest, confirmation_ms: u32, output: *abi.GfxModeStatus) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxModeColorRequest) != 0 or
+        !memory_api.validOutput(abi.GfxModeStatus, output)) return abi.gfx_output_error_invalid;
+    const request = input.*;
+    const call = lifetime.enterUnwind();
+    if (!call.admitted()) return abi.gfx_output_error_busy;
+    defer _ = lifetime.leaveUnwind(call);
+    const result = modes.submitColor(owner, &request, confirmation_ms) catch |err| return modes.code(err);
     output.* = result;
     return abi.gfx_output_ok;
 }

@@ -131,8 +131,9 @@ pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model
             entry.pending = null;
         }
         const descriptor = try buffers.store.describe(request.source, caller);
+        const presentation = try entry.info();
         if ((request.operation != .present and request.operation != .direct_present) or descriptor.width != entry.width or descriptor.height != entry.height or
-            descriptor.format != .xrgb8888 or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0) return error.Unsupported;
+            @intFromEnum(descriptor.format) != presentation.format or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0) return error.Unsupported;
         const accepted = try queue.submitOutputLocked(caller, timeline, submission, request, binding(entry.binding));
         entry.pending = accepted.fence;
         entry.direct = request.operation == .direct_present;

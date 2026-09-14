@@ -41,7 +41,7 @@ pub const Owner = struct {
         const sync = a.display_presentation_info_synchronized;
         const visible = a.display_presentation_info_visibility;
         if (input.sequence == 0 or input.head_id >= 8 or input.width == 0 or input.height == 0 or
-            input.format != a.gfx_buffer_format_xrgb8888 or input.flags & ~@as(u32, 511) != 0 or input.flags & native == 0 or
+            (input.format != a.gfx_buffer_format_xrgb8888 and input.format != a.gfx_buffer_format_xrgb2101010) or input.flags & ~@as(u32, 511) != 0 or input.flags & native == 0 or
             input.buffer_count < 2 or input.buffer_count > 3 or input.plane_count == 0 or input.plane_count > 8 or
             input.policies & ~@as(u32, 7) != 0 or input.policies & 1 == 0 or input.reserved0 != 0 or input.path > 3 or
             input.interval_ns > std.time.ns_per_s or (input.observed_ns == 0) != (input.observed_sequence == 0) or

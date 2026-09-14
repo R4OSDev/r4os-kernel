@@ -3420,7 +3420,21 @@ fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32
     return @import("../display/output_state.zig").driverTable(output, .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw), .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace), .close_source = @intFromPtr(&gfxReceiverClose),
         .mode_enable = @intFromPtr(&gfxModeEnable), .mode_take = @intFromPtr(&gfxModeTake), .mode_complete = @intFromPtr(&gfxModeComplete),
         .audio_publish = @intFromPtr(&gfxAudioPublish), .audio_query = @intFromPtr(&gfxAudioQuery),
-        .output_pause = @intFromPtr(&gfxOutputPause), .mode_restore = @intFromPtr(&gfxModeRestore), .mode_status = @intFromPtr(&gfxModeStatus) });
+        .output_pause = @intFromPtr(&gfxOutputPause), .mode_restore = @intFromPtr(&gfxModeRestore), .mode_status = @intFromPtr(&gfxModeStatus),
+        .color_publish = @intFromPtr(&gfxOutputColorPublish), .mode_read_color = @intFromPtr(&gfxModeReadColor) });
+}
+fn gfxModeReadColor(ticket: u64, sequence: u64, output: *outputs_contract.GfxDriverModeColor) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    if (!@import("../program/gfx_buffer_api.zig").validOutput(outputs_contract.GfxDriverModeColor, output)) return outputs_contract.gfx_output_error_invalid;
+    const value = gfx_modes.readColor(identity, ticket, sequence) catch |err| return gfx_modes.code(err);
+    output.* = value orelse return 0;
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxOutputColorPublish(input: *const outputs_contract.GfxOutputColorState) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    @import("../display/outputs.zig").publishColor(@intCast(identity.id), input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
 }
 fn gfxOutputPause(input: *const outputs_contract.GfxOutputId, paused: u32) callconv(.c) i32 {
     if (@intFromPtr(input) == 0 or paused > 1 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
@@ -3532,6 +3546,7 @@ fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
         .update_operations = @intFromPtr(&gfxQueueUpdateOperations),
         .read_render_list = @intFromPtr(&gfxQueueReadRenderList),
         .read_render_grid_list = @intFromPtr(&gfxQueueReadRenderGridList),
+        .read_render_color_list = @intFromPtr(&gfxQueueReadRenderColorList),
         .retain_scanout = @intFromPtr(&gfxQueueRetainScanout),
         .begin_scanout = @intFromPtr(&gfxQueueBeginScanout),
         .scanout_retire_requested = @intFromPtr(&gfxQueueScanoutRetireRequested),
@@ -3561,6 +3576,9 @@ fn gfxQueueReadRenderGridList(input: *const outputs_contract.GfxFence, output: *
 }
 fn gfxQueueUpdateOperations(input: *const outputs_contract.GfxBackendBinding, operations: u64) callconv(.c) i32 {
     return gfx_queue_api.updateOperations(activeOwner(), input, operations);
+}
+fn gfxQueueReadRenderColorList(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderColorList) callconv(.c) i32 {
+    return gfx_queue_api.readRenderColorList(activeOwner(), input, output);
 }
 fn gfxQueueComplete(input: *const outputs_contract.GfxFence, result: u32, quiesced: u32) callconv(.c) i32 {
     return gfx_queue_api.complete(activeOwner(), input, result, quiesced);

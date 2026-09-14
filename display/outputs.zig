@@ -59,6 +59,18 @@ pub fn infoAt(index: u32) ?abi.GfxOutputInfo {
     const token = ownership.enterState(); defer ownership.leaveState(token);
     return catalog.infoAt(index);
 }
+pub fn colorAt(identity: abi.GfxOutputId) Error!abi.GfxOutputColorState {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return catalog.colorAt(identity);
+}
+pub fn publishColor(owner: u32, value: abi.GfxOutputColorState) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    const changed = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        break :blk try catalog.publishColor(owner, value);
+    };
+    if (changed) events.signal();
+}
 pub fn modeAt(identity: abi.GfxOutputId, index: u32) Error!?abi.GfxOutputMode {
     const token = ownership.enterState(); defer ownership.leaveState(token);
     return catalog.modeAt(identity, index);

@@ -7,7 +7,7 @@ const queue = @import("queue_state.zig");
 const abi = @import("r4os_kernel_contract");
 pub const owner = lifetime.Owner{ .kind = .kernel, .id = 2, .generation = 1 };
 pub const display_owner = lifetime.Owner{ .kind = .kernel, .id = 3, .generation = 1 };
-pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present, render_list, direct_present, render_grid_list };
+pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present, render_list, direct_present, render_grid_list, render_color_list };
 pub const Request = struct {
     operation: Operation = .copy,
     source: lifetime.Handle = .{},
@@ -21,6 +21,7 @@ pub const Request = struct {
     render: abi.GfxRenderCommand = .{},
     render_list: ?*const abi.GfxRenderList = null,
     grid_list: ?*const abi.GfxRenderGridList = null,
+    color_list: ?*const abi.GfxRenderColorList = null,
     memory_binding: ?lifetime.layout.Binding = null,
     display_target: abi.GfxOutputTarget = .{},
 };
@@ -52,7 +53,10 @@ pub fn rowSpan(bytes: u64, rows: u32, pitch: u64) Error!u64 {
 fn planeRows(desc: lifetime.layout.Descriptor, offset: u64, bytes: u64, rows: u32, pitch: u64) Error!void {
     if (desc.format == .bytes) return;
     const multi = desc.format == .nv12 or desc.format == .p010;
-    const sample: u64 = switch (desc.format) { .xrgb8888, .argb8888 => 4, .p010 => 2, else => 1 };
+    const sample: u64 = switch (desc.format) {
+        .xrgb8888, .argb8888, .xrgb2101010, .argb2101010 => 4,
+        .abgr16161616f => 8, .p010 => 2, else => 1,
+    };
     for (desc.planes[0..desc.plane_count], 0..) |plane, index| {
         if (offset < plane.offset or pitch != plane.pitch) continue;
         const relative = offset - plane.offset;
@@ -97,6 +101,7 @@ pub fn Resources(comptime capacity: usize) type {
         // used by workers and interrupt completion ingress.
         render_lists: [capacity]abi.GfxRenderList = @splat(.{}),
         render_grids: [capacity][abi.gfx_render_list_capacity]abi.GfxSampleGrid = @splat(@splat(.{})),
+        render_colors: [capacity]abi.GfxRenderColorProgram = @splat(.{}),
 
         fn ordered(self: *Self, state: anytype, timeline: u64, dependencies: []const queue.Fence, object: lifetime.Handle, write: bool) Error!void {
             for (&self.entries) |prior| {
@@ -116,12 +121,12 @@ pub fn Resources(comptime capacity: usize) type {
             const draw = request.render;
             if (request.bytes != 0 or request.source_offset != 0 or request.target_offset != 0 or draw.reserved0 != 0 or
                 draw.kind > abi.gfx_render_kind_sample or draw.filter > abi.gfx_render_filter_bilinear or draw.blend > abi.gfx_render_blend_over or
-                draw.transfer > abi.gfx_render_transfer_srgb_encode or draw.opacity > 255) return error.Invalid;
+                draw.transfer > (if (request.operation == .render_color_list) abi.gfx_render_transfer_color else abi.gfx_render_transfer_srgb_encode) or draw.opacity > 255) return error.Invalid;
             const sampled = draw.kind == abi.gfx_render_kind_sample;
             if (!sampled and (request.source.id != 0 or request.source.generation != 0 or draw.filter != 0 or draw.transfer != 0 or
                 !std.meta.eql(draw.source_rect, abi.GfxRenderRect{}))) return error.Invalid;
             if (sampled and draw.color != 0) return error.Invalid;
-            if (request.operation == .render_list or request.operation == .render_grid_list) {
+            if (request.operation == .render_list or request.operation == .render_grid_list or request.operation == .render_color_list) {
                 const list = request.render_list orelse return error.Invalid;
                 if (list.version != 1 or list.size != @sizeOf(abi.GfxRenderList) or list.count == 0 or
                     list.count > abi.gfx_render_list_capacity or list.reserved0 != 0 or !std.meta.eql(list.commands[0], draw)) return error.Invalid;
@@ -159,6 +164,7 @@ pub fn Resources(comptime capacity: usize) type {
             self.entries[entry.fence.slot - 1] = entry;
             if (request.render_list) |list| self.render_lists[entry.fence.slot - 1] = list.*;
             if (request.grid_list) |list| self.render_grids[entry.fence.slot - 1] = list.grids;
+            if (request.color_list) |list| self.render_colors[entry.fence.slot - 1] = list.program;
             return entry.fence;
         }
 
@@ -181,6 +187,21 @@ pub fn Resources(comptime capacity: usize) type {
 
         pub fn submit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
             const config = try state.configuration(timeline, producer);
+            if (request.operation == .render_color_list) {
+                if (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0 or request.grid_list != null or request.render_list != null) return error.Invalid;
+                const color = request.color_list orelse return error.Invalid;
+                if (color.version != 1 or color.size != @sizeOf(abi.GfxRenderColorList) or color.reserved0 != 0 or
+                    color.count == 0 or color.count > abi.gfx_render_list_capacity or color.program.version != 1 or
+                    color.program.size != @sizeOf(abi.GfxRenderColorProgram) or color.program.reserved0 != 0 or
+                    request.render.kind != abi.gfx_render_kind_sample or request.render.filter != abi.gfx_render_filter_nearest or
+                    request.render.transfer != abi.gfx_render_transfer_color) return error.Invalid;
+                // Coefficients are opaque to this owner. Native userland validates
+                // their domains before binding the fixed shader; no float math here.
+                const list: abi.GfxRenderList = .{ .count = color.count, .commands = color.commands };
+                var copied = request; copied.render_list = &list;
+                return self.renderSubmit(state, buffers, timeline, producer, submission, copied, now);
+            }
+            if (request.color_list != null) return error.Invalid;
             if (request.operation == .render_grid_list) {
                 if (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0) return error.Invalid;
                 const grid = request.grid_list orelse return error.Invalid;
@@ -261,6 +282,15 @@ pub fn Resources(comptime capacity: usize) type {
             std.debug.assert(self.entries[fence.slot - 1].fence.slot == 0);
             self.entries[fence.slot - 1] = entry;
             return fence;
+        }
+
+        pub fn renderColorList(self: *Self, state: anytype, fence: queue.Fence) Error!abi.GfxRenderColorList {
+            const status = try state.query(fence);
+            if (!status.device_active) return error.Invalid;
+            const entry = &self.entries[fence.slot - 1];
+            if (!std.meta.eql(entry.fence, fence) or entry.operation != .render_color_list) return error.Invalid;
+            const list = &self.render_lists[fence.slot - 1];
+            return .{ .count = list.count, .commands = list.commands, .program = self.render_colors[fence.slot - 1] };
         }
 
         // Output admission belongs to DisplayExecution. The queue owns a
@@ -452,10 +482,22 @@ test "queued dependencies reserve CPU ownership across producer death and physic
 }
 
 test "native upload retains a single source beyond cancellation and producer reference release" {
+    const t = std.testing;
+    // High-precision image rows keep their real byte width. Accept the
+    // final pixel, reject row padding and a rectangle crossing the bottom.
+    for ([_]lifetime.layout.Format{ .xrgb2101010, .argb2101010, .abgr16161616f }) |format| {
+        const pixel_bytes: u64 = if (format == .abgr16161616f) 8 else 4;
+        const descriptor: lifetime.layout.Descriptor = .{ .bytes = 256, .width = 7, .height = 2,
+            .format = format, .plane_count = 1, .planes = .{ .{ .offset = 16, .pitch = 64 }, .{}, .{}, .{} } };
+        try planeRows(descriptor, 16, 7 * pixel_bytes, 2, 64);
+        try planeRows(descriptor, 80 + 6 * pixel_bytes, pixel_bytes, 1, 64);
+        try t.expectError(error.Invalid, planeRows(descriptor, 80 + 6 * pixel_bytes, pixel_bytes + 1, 1, 64));
+        try t.expectError(error.Invalid, planeRows(descriptor, 80, pixel_bytes, 2, 64));
+    }
     try checkImagePresentation(false);
     try checkImagePresentation(true);
     try checkGridLifetime();
-    const t = std.testing;
+    try checkColorLifetime();
     const producer = display_owner;
     var buffers = lifetime.Table(2, 8, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
     var state = queue.Store(3, 4){};
@@ -615,6 +657,49 @@ fn checkGridLifetime() !void {
     try state.complete(fence, .failed, true, 5);
     const release = state.takeRelease().?;
     try resources.release(&buffers, release); try state.released(release, true);
+    while (buffers.pendingSystemRelease()) |ticket| try buffers.finishRelease(ticket, true);
+    try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
+}
+
+fn checkColorLifetime() !void {
+    const t = std.testing;
+    const producer: lifetime.Owner = .{ .kind = .program, .id = 41, .generation = 2 };
+    const device: queue.Binding = .{ .adapter = 7, .device_generation = 3, .reset_generation = 2 };
+    var buffers = lifetime.Table(2, 4, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
+    var state = queue.Store(1, 2){}; var resources = Resources(2){};
+    var refs: [2]lifetime.Handle = undefined;
+    for (&refs, 0..) |*ref, i| {
+        const created = try buffers.begin(producer, .{ .bytes = 4096, .usage = 31, .format = .xrgb8888,
+            .width = 16, .height = 16, .plane_count = 1, .planes = .{ .{ .pitch = 64 }, .{}, .{}, .{} } });
+        try buffers.publish(created, .{ .cookie = i + 1, .bytes = 4096, .cpu_address = (i + 1) * 4096, .cache = .write_back });
+        ref.* = created.reference;
+    }
+    const timeline = try state.open(producer, .{ .binding = device, .milestone = .device_execution });
+    var list: abi.GfxRenderColorList = .{ .count = 1 };
+    list.commands[0] = .{ .kind = abi.gfx_render_kind_sample, .transfer = abi.gfx_render_transfer_color, .opacity = 255,
+        .source_rect = .{ .width = 16, .height = 16 }, .target_rect = .{ .width = 16, .height = 16 }, .scissor = .{ .width = 16, .height = 16 } };
+    for (&list.program.words, 0..) |*word, i| word.* = @intCast(0x10000 + i);
+    var request: Request = .{ .operation = .render_color_list, .source = refs[0], .target = refs[1], .render = list.commands[0], .color_list = &list };
+    list.program.reserved0 = 1;
+    try t.expectError(error.Invalid, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 1));
+    list.program.reserved0 = 0; request.operation = .render;
+    try t.expectError(error.Invalid, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 1));
+    request.operation = .render_color_list;
+    const expected = list;
+    const fence = try resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 1);
+    try t.expectError(error.Invalid, resources.renderColorList(&state, fence));
+    list.program.words = @splat(0); list.commands[0].opacity = 0;
+    try t.expectEqualDeep(fence, state.takeReadyFor(device, 2).?);
+    try t.expectEqualDeep(expected, try resources.renderColorList(&state, fence));
+    try t.expectError(error.Invalid, resources.renderList(&state, fence));
+    try state.cancel(fence, producer, 3);
+    for (refs) |ref| try buffers.drop(ref, producer);
+    try t.expectError(error.Busy, state.complete(fence, .failed, false, 4));
+    try t.expect(buffers.pendingSystemRelease() == null and state.takeRelease() == null);
+    try state.complete(fence, .failed, true, 5);
+    const release = state.takeRelease().?;
+    try resources.release(&buffers, release); try state.released(release, true);
+    try t.expectError(error.Invalid, resources.renderColorList(&state, fence));
     while (buffers.pendingSystemRelease()) |ticket| try buffers.finishRelease(ticket, true);
     try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
 }

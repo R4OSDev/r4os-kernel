@@ -31,6 +31,8 @@ const Bridge = struct {
     last_present: ?queue.model.Fence = null,
     bytes: u64 = 0,
     frame: framebuffer.Framebuffer = undefined,
+    output_format: u32 = abi.gfx_buffer_format_xrgb8888,
+    encoded_output: bool = false,
     held_generation: u64 = 0,
     generation: u64 = 0,
     ready: bool = false,
@@ -48,6 +50,8 @@ const Surface = struct {
     read_lease: buffers.Handle = .{},
     bytes: u64 = 0,
     frame: framebuffer.Framebuffer = undefined,
+    output_format: u32 = abi.gfx_buffer_format_xrgb8888,
+    encoded_output: bool = false,
 };
 const Replacement = struct { old: Surface, new: Surface, using_new: bool = false };
 var replacement: ?Replacement = null;
@@ -288,7 +292,7 @@ fn restore(_: usize, generation: u64, saved: *const display.BootSnapshot) bool {
 fn beginCpu(_: usize) bool {
     if (!execution.enter(0)) return false;
     defer _ = execution.leave();
-    if (bridge.cpu_lease.id != 0 or bridge.reference.id == 0 or bridge.pending != null or !imageIdle()) return false;
+    if (bridge.encoded_output or bridge.cpu_lease.id != 0 or bridge.reference.id == 0 or bridge.pending != null or !imageIdle()) return false;
     buffers.lock(); defer buffers.unlock();
     const use = buffers.mapLocked(bridge.reference, owner, .cpu_write, 0, bridge.bytes) catch return false;
     if (use.backing.cpu_address != @intFromPtr(bridge.frame.address)) {
@@ -355,7 +359,7 @@ pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model
         break :blk try buffers.store.describe(request.source, caller);
     };
     if ((request.operation != .present and request.operation != .direct_present) or descriptor.width != bridge.frame.width or descriptor.height != bridge.frame.height or
-        descriptor.format != .xrgb8888 or (descriptor.location != .device_local and descriptor.location != .system) or
+        @intFromEnum(descriptor.format) != bridge.output_format or (descriptor.location != .device_local and descriptor.location != .system) or
         descriptor.plane_count != 1 or descriptor.planes[0].offset != 0)
         return error.Unsupported;
     const accepted = try queue.submitDisplayImage(caller, timeline, submission, request, binding(bridge.registration.backend));
@@ -480,6 +484,10 @@ pub fn modeBinding(assignment: abi.GfxScanoutState) Error!ModeBinding {
 // imported before caller exit can close the producer; queued mapping-only
 // loans cannot support subsequent normal desktop CPU writes.
 pub fn prepareMode(caller: buffers.Owner, assignment: abi.GfxScanoutState, mode: abi.GfxOutputMode) Error!abi.GfxBufferReference {
+    return prepareModeEncoding(caller, assignment, mode, null);
+}
+pub fn prepareModeEncoding(caller: buffers.Owner, assignment: abi.GfxScanoutState, mode: abi.GfxOutputMode, encoded_format: ?u32) Error!abi.GfxBufferReference {
+    if (encoded_format) |format| if (format != abi.gfx_buffer_format_xrgb8888 and format != abi.gfx_buffer_format_xrgb2101010) return error.Unsupported;
     if (!execution.enter(0)) return error.Busy;
     defer _ = execution.leave();
     const selected = try modeBinding(assignment);
@@ -511,8 +519,10 @@ pub fn prepareMode(caller: buffers.Owner, assignment: abi.GfxScanoutState, mode:
     frame.address = @ptrFromInt(mapped.backing.cpu_address);
     frame.width = descriptor.width; frame.height = descriptor.height; frame.pitch = descriptor.planes[0].pitch;
     frame.edid = null; frame.edid_size = 0;
-    replacement = .{ .old = .{ .reference = bridge.reference, .driver_reference = bridge.driver_reference, .bytes = bridge.bytes, .frame = bridge.frame },
-        .new = .{ .reference = reference, .driver_reference = driver_reference, .read_lease = read.lease, .bytes = descriptor.bytes, .frame = frame } };
+    replacement = .{ .old = .{ .reference = bridge.reference, .driver_reference = bridge.driver_reference, .bytes = bridge.bytes, .frame = bridge.frame,
+            .output_format = bridge.output_format, .encoded_output = bridge.encoded_output },
+        .new = .{ .reference = reference, .driver_reference = driver_reference, .read_lease = read.lease, .bytes = descriptor.bytes, .frame = frame,
+            .output_format = encoded_format orelse abi.gfx_buffer_format_xrgb8888, .encoded_output = encoded_format != null } };
     return wire;
 }
 // The mode worker holds DisplayExecution before exposing a job to the R4D.
@@ -556,6 +566,7 @@ fn selectSurface(surface: *const Surface) Error!void {
         return err;
     };
     bridge.reference = surface.reference; bridge.driver_reference = surface.driver_reference; bridge.bytes = surface.bytes;
+    bridge.output_format = surface.output_format; bridge.encoded_output = surface.encoded_output;
     outputs.nativeActive(@intCast(bridge.driver_owner.id), bridge.registration.output, true);
 }
 pub fn settleMode(operation: u32, outcome: u32) Error!void {

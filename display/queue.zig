@@ -95,7 +95,7 @@ pub fn validatedProfile(input: abi.GfxBackendProfile) Error!abi.GfxBackendProfil
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
-    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 511) != 0) return error.Invalid;
+    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 1023) != 0) return error.Invalid;
     const profile = try validatedProfile(config.profile);
     buffers.lock();
     defer buffers.unlock();
@@ -143,7 +143,7 @@ pub fn nativeOperations(id: u32, binding: model.Binding) Error!u64 {
     return backend.operations;
 }
 fn nativeJobCapacity(backend: *const Backend) u32 {
-    return if (backend.target_jobs) 272 else if (backend.job_operations & 464 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
+    return if (backend.target_jobs) 272 else if (backend.job_operations & 976 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
 }
 // Caller holds the BO/queue metadata mutex during output admission.
 pub fn requireOutputTargetsLocked(identity: buffers.Owner, binding: model.Binding, job_size: u32) Error!void {
@@ -162,7 +162,7 @@ pub fn outputBusyLocked(target: abi.GfxOutputTarget) bool {
     return false;
 }
 pub fn updateNativeOperations(id: u32, binding: model.Binding, operations: u64) Error!void {
-    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 511) != 0) return error.Invalid;
+    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 1023) != 0) return error.Invalid;
     buffers.lock(); defer buffers.unlock();
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
@@ -239,6 +239,12 @@ pub fn nativeRenderGridList(id: u32, fence: model.Fence) Error!abi.GfxRenderGrid
     return resources.renderGridList(&state, fence);
 }
 pub const RetainedResource = struct { reference: buffers.Handle, buffer: buffers.Handle };
+pub fn nativeRenderColorList(id: u32, fence: model.Fence) Error!abi.GfxRenderColorList {
+    if (irq.inDispatch()) return error.Unavailable;
+    buffers.lock(); defer buffers.unlock();
+    _ = try jobBackendLocked(id, fence);
+    return resources.renderColorList(&state, fence);
+}
 pub fn retainNative(identity: buffers.Owner, fence: model.Fence, which: u32) Error!RetainedResource {
     if (irq.inDispatch() or which > 1) return error.Invalid;
     buffers.lock();

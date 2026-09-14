@@ -9,6 +9,9 @@ pub const Format = enum(u32) {
     bytes = 0,
     xrgb8888 = 0x34325258,
     argb8888 = 0x34325241,
+    xrgb2101010 = 0x30335258,
+    argb2101010 = 0x30335241,
+    abgr16161616f = 0x48344241,
     r8 = 0x20203852,
     nv12 = 0x3231564e,
     p010 = 0x30313050,
@@ -92,7 +95,8 @@ fn validateLayout(descriptor: Descriptor, owned: bool) Error!Layout {
         for (0..count) |index| {
             const plane = descriptor.planes[index];
             const sample_bytes: u64 = switch (descriptor.format) {
-                .xrgb8888, .argb8888 => 4,
+                .xrgb8888, .argb8888, .xrgb2101010, .argb2101010 => 4,
+                .abgr16161616f => 8,
                 .p010 => 2,
                 else => 1,
             };
@@ -139,6 +143,15 @@ test "buffer layout keeps 64-bit sizes and rejects wrapping pitch, maps and padd
     image.planes[0].pitch = std.math.maxInt(u64) - 3;
     try t.expectError(error.Overflow, validate(image));
     image.planes[0].pitch = 8;
+    try t.expectError(error.Invalid, validate(image));
+    image = .{ .bytes = 96, .width = 3, .height = 4, .format = .abgr16161616f, .plane_count = 1 };
+    image.planes[0].pitch = 24;
+    try t.expectEqual(@as(u64, 96), (try validate(image)).planes[0].bytes);
+    image.planes[0].pitch = 20;
+    try t.expectError(error.Invalid, validate(image));
+    image.format = .xrgb2101010; image.planes[0].pitch = 12; image.bytes = 48;
+    try t.expectEqual(@as(u64, 48), (try validate(image)).planes[0].bytes);
+    image.format = .argb2101010; image.planes[0].offset = 2;
     try t.expectError(error.Invalid, validate(image));
 }
 

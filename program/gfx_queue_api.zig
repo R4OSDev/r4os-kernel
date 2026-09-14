@@ -84,27 +84,32 @@ pub fn close(owner: buffers.Owner, input: *const abi.GfxQueueHandle) i32 {
     return abi.gfx_queue_ok;
 }
 pub fn submit(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, output: *abi.GfxFenceStatus) i32 {
-    return submitCommon(owner, queue_ptr, input, null, null, null, output);
+    return submitCommon(owner, queue_ptr, input, null, null, null, null, output);
 }
 pub fn submitRenderList(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list_ptr: *const abi.GfxRenderList, output: *abi.GfxFenceStatus) i32 {
     if (@intFromPtr(list_ptr) == 0 or @intFromPtr(list_ptr) % @alignOf(abi.GfxRenderList) != 0) return abi.gfx_queue_error_invalid;
     // Copy pageable input before entering the common metadata owner. The
     // complete 1296-byte value is bounded independently of producer counts.
     const list = list_ptr.*;
-    return submitCommon(owner, queue_ptr, input, &list, null, null, output);
+    return submitCommon(owner, queue_ptr, input, &list, null, null, null, output);
 }
 pub fn submitRenderGridList(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list_ptr: *const abi.GfxRenderGridList, output: *abi.GfxFenceStatus) i32 {
     if (@intFromPtr(list_ptr) == 0 or @intFromPtr(list_ptr) % @alignOf(abi.GfxRenderGridList) != 0) return abi.gfx_queue_error_invalid;
     const list = list_ptr.*;
-    return submitCommon(owner, queue_ptr, input, null, &list, null, output);
+    return submitCommon(owner, queue_ptr, input, null, &list, null, null, output);
+}
+pub fn submitRenderColorList(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list_ptr: *const abi.GfxRenderColorList, output: *abi.GfxFenceStatus) i32 {
+    if (@intFromPtr(list_ptr) == 0 or @intFromPtr(list_ptr) % @alignOf(abi.GfxRenderColorList) != 0) return abi.gfx_queue_error_invalid;
+    const list = list_ptr.*;
+    return submitCommon(owner, queue_ptr, input, null, null, &list, null, output);
 }
 pub fn submitOutput(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, target_ptr: *const abi.GfxOutputTarget, output: *abi.GfxFenceStatus) i32 {
     if (@intFromPtr(target_ptr) == 0 or @intFromPtr(target_ptr) % @alignOf(abi.GfxOutputTarget) != 0) return abi.gfx_queue_error_invalid;
     const target = target_ptr.*;
     if (!@import("../display/output_target.zig").valid(target)) return abi.gfx_queue_error_invalid;
-    return submitCommon(owner, queue_ptr, input, null, null, target, output);
+    return submitCommon(owner, queue_ptr, input, null, null, null, target, output);
 }
-fn submitCommon(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list: ?*const abi.GfxRenderList, grid: ?*const abi.GfxRenderGridList, target: ?abi.GfxOutputTarget, output: *abi.GfxFenceStatus) i32 {
+fn submitCommon(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list: ?*const abi.GfxRenderList, grid: ?*const abi.GfxRenderGridList, color: ?*const abi.GfxRenderColorList, target: ?abi.GfxOutputTarget, output: *abi.GfxFenceStatus) i32 {
     if (@intFromPtr(queue_ptr) == 0 or @intFromPtr(input) == 0 or !buffer_api.validOutput(abi.GfxFenceStatus, output)) return abi.gfx_queue_error_invalid;
     const queue = queue_ptr.*;
     const value = wire.read(abi.GfxSubmission, input) orelse return abi.gfx_queue_error_invalid;
@@ -112,9 +117,10 @@ fn submitCommon(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, inpu
         value.source.reserved0 != 0 or value.target.reserved0 != 0 or value.reserved0 != 0) return abi.gfx_queue_error_invalid;
     const operation = std.enums.fromInt(resource.Operation, value.operation) orelse return abi.gfx_queue_error_unsupported;
     if (target != null and operation != .present and operation != .direct_present) return abi.gfx_queue_error_invalid;
-    if ((operation == .render or operation == .render_list or operation == .render_grid_list) and value.size < @sizeOf(abi.GfxSubmission)) return abi.gfx_queue_error_invalid;
+    if ((operation == .render or operation == .render_list or operation == .render_grid_list or operation == .render_color_list) and value.size < @sizeOf(abi.GfxSubmission)) return abi.gfx_queue_error_invalid;
     if ((operation == .render_list) != (list != null)) return abi.gfx_queue_error_invalid;
     if ((operation == .render_grid_list) != (grid != null)) return abi.gfx_queue_error_invalid;
+    if ((operation == .render_color_list) != (color != null)) return abi.gfx_queue_error_invalid;
     var dependencies: [model.max_dependencies]model.Fence = undefined;
     for (value.dependencies, 0..) |dependency, i| {
         if (i < value.dependency_count) dependencies[i] = fence(dependency) else if (!std.meta.eql(dependency, abi.GfxFence{})) return abi.gfx_queue_error_invalid;
@@ -141,6 +147,7 @@ fn submitCommon(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, inpu
         .render = value.render,
         .render_list = list,
         .grid_list = grid,
+        .color_list = color,
         .display_target = target orelse .{},
     }) catch |err| return errorCode(err);
     output.* = publicStatus(snapshot);

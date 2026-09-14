@@ -7677,6 +7677,7 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_queue_submit = &apiGfxQueueSubmit,
         .gfx_queue_submit_render_list = &apiGfxQueueSubmitRenderList,
         .gfx_queue_submit_render_grid_list = &apiGfxQueueSubmitRenderGridList,
+        .gfx_queue_submit_render_color_list = &apiGfxQueueSubmitRenderColorList,
         .gfx_queue_submit_output = &apiGfxQueueSubmitOutput,
         .display_output_target = &r4api.r4draw.displayOutputTarget,
         .display_output_presentation_info = &r4api.r4draw.displayOutputPresentationInfo,
@@ -7696,9 +7697,12 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_output_info = &gfx_output_api.info,
         .gfx_output_mode = &gfx_output_api.mode,
         .gfx_output_edid = &gfx_output_api.edid,
+        .gfx_output_color = &gfx_output_api.color,
         .gfx_atomic_test = &apiGfxAtomicTest,
         .gfx_atomic_commit = &apiGfxAtomicCommit,
         .gfx_atomic_submit = &apiGfxAtomicSubmit,
+        .gfx_atomic_test_color = &apiGfxAtomicTestColor,
+        .gfx_atomic_submit_color = &apiGfxAtomicSubmitColor,
         .gfx_atomic_status = &gfx_output_api.modeStatus,
         .gfx_atomic_resolve = &apiGfxAtomicResolve,
     });
@@ -16281,6 +16285,14 @@ fn apiGfxAtomicSubmit(input: *const gfx_output_api.abi.GfxAtomicState, confirmat
     const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
     return gfx_output_api.submit(graphicsOwner(owner), input, confirmation_ms, output);
 }
+fn apiGfxAtomicTestColor(input: *const gfx_output_api.abi.GfxModeColorRequest, output: *gfx_output_api.abi.GfxAtomicResult) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
+    return gfx_output_api.testColor(graphicsOwner(owner), input, output);
+}
+fn apiGfxAtomicSubmitColor(input: *const gfx_output_api.abi.GfxModeColorRequest, confirmation_ms: u32, output: *gfx_output_api.abi.GfxModeStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
+    return gfx_output_api.submitColor(graphicsOwner(owner), input, confirmation_ms, output);
+}
 fn apiDisplayCursorSubmit(input: *const @import("r4os_kernel_contract").DisplayCursorRequest, output: *@import("r4os_kernel_contract").DisplayCursorStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
     return @import("../display/cursor_work.zig").submit(graphicsOwner(owner), input, output);
@@ -16308,6 +16320,10 @@ fn apiGfxQueueSubmitRenderGridList(queue: *const gfx_queue_api.abi.GfxQueueHandl
 fn apiGfxQueueSubmitOutput(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *const gfx_queue_api.abi.GfxSubmission, target: *const gfx_queue_api.abi.GfxOutputTarget, output: *gfx_queue_api.abi.GfxFenceStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
     return gfx_queue_api.submitOutput(graphicsOwner(owner), queue, input, target, output);
+}
+fn apiGfxQueueSubmitRenderColorList(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *const gfx_queue_api.abi.GfxSubmission, list: *const gfx_queue_api.abi.GfxRenderColorList, output: *gfx_queue_api.abi.GfxFenceStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
+    return gfx_queue_api.submitRenderColorList(graphicsOwner(owner), queue, input, list, output);
 }
 fn apiGfxFenceCancel(input: *const gfx_queue_api.abi.GfxFence) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;

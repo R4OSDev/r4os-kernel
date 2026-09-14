@@ -10,6 +10,7 @@ const empty_owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 };
 pub const State = struct {
     status: abi.GfxModeStatus = .{},
     job: abi.GfxDriverModeJob = .{},
+    color: ?abi.GfxDriverModeColor = null,
     caller: Owner = empty_owner,
     driver: Owner = empty_owner,
     confirmation_ns: u64 = 0,
@@ -25,10 +26,15 @@ pub const State = struct {
             self.status.phase == abi.gfx_mode_phase_reverted;
     }
     pub fn begin(self: *State, caller: Owner, driver: Owner, job: abi.GfxDriverModeJob, revision: u64, confirmation_ms: u32, now: u64) Error!void {
+        return self.beginColor(caller, driver, job, null, revision, confirmation_ms, now);
+    }
+    pub fn beginColor(self: *State, caller: Owner, driver: Owner, job: abi.GfxDriverModeJob, color: ?abi.GfxDriverModeColor,
+        revision: u64, confirmation_ms: u32, now: u64) Error!void
+    {
         if (!self.available()) return error.Busy;
         if (!caller.valid() or driver.kind != .driver or !driver.valid() or job.ticket == 0 or job.ticket <= self.status.ticket or
             confirmation_ms < 1000 or confirmation_ms > 60000 or now == 0 or now > std.math.maxInt(u64) - operation_ns) return error.Invalid;
-        self.* = .{ .caller = caller, .driver = driver, .job = job, .confirmation_ns = @as(u64, confirmation_ms) * std.time.ns_per_ms,
+        self.* = .{ .caller = caller, .driver = driver, .job = job, .color = color, .confirmation_ns = @as(u64, confirmation_ms) * std.time.ns_per_ms,
             .status = .{ .ticket = job.ticket, .topology_revision = revision, .output = job.assignment.output, .retained = 3 } };
         self.schedule(abi.gfx_mode_operation_apply, now);
     }
@@ -36,6 +42,7 @@ pub const State = struct {
         // At most apply + confirm + rollback; a transaction never loops or
         // reuses an operation sequence after an uncertain hardware failure.
         self.job.sequence += 1;
+        if (self.color) |*value| { value.ticket = self.job.ticket; value.sequence = self.job.sequence; }
         self.job.operation = operation;
         self.job.deadline_ns = now +| operation_ns;
         self.status.operation_deadline_ns = self.job.deadline_ns;
@@ -80,6 +87,11 @@ pub const State = struct {
             else => return error.Invalid,
         }
         self.reply = value;
+    }
+    pub fn readColor(self: *const State, driver: Owner, ticket: u64, sequence: u64) Error!?abi.GfxDriverModeColor {
+        if (!self.driver.eql(driver) or ticket == 0 or ticket != self.job.ticket or sequence != self.job.sequence or
+            !self.taken or !self.offered or self.reply != null) return error.Stale;
+        return self.color;
     }
     pub fn resolve(self: *State, caller: Owner, ticket: u64, action: u32, now: u64) Error!void {
         if (ticket == 0 or ticket != self.status.ticket or !self.caller.eql(caller)) return error.Stale;
@@ -167,7 +179,56 @@ pub const State = struct {
     }
 };
 
+fn checkColorTransaction() !void {
+    const t = std.testing;
+    const bo = @import("../memory/gfx_buffer_layout.zig");
+    const check = @import("mode_color_state.zig").validate;
+    const identity: abi.GfxOutputId = .{ .adapter_id = 5, .connector_id = 2, .device_generation = 6, .connection_generation = 7 };
+    var source: abi.GfxOutputColorState = .{ .identity = identity, .revision = 8, .flags = 15,
+        .formats = 3, .depths = 3, .color_spaces = 3, .transfers = 13, .ranges = 3 };
+    var request: abi.GfxModeColorRequest = .{ .state = .{ .topology_revision = 8, .count = 1 },
+        .image = .{ .id = 3, .generation = 4 }, .signal = .{ .format = abi.gfx_buffer_format_xrgb2101010,
+            .bpc = 10, .primaries = 3, .transfer = 3, .range = 2, .pipeline = 7,
+            .reference_white = 2030000, .peak = 10000000, .metadata_valid = 1 } };
+    request.state.assignments[0] = .{ .output = identity, .source_width = 640, .source_height = 480 };
+    var image: bo.Descriptor = .{ .bytes = 2560 * 480, .width = 640, .height = 480, .format = .xrgb2101010,
+        .plane_count = 1, .planes = .{ .{ .pitch = 2560 }, .{}, .{}, .{} }, .usage = bo.Usage.cpu_write | bo.Usage.transfer_source };
+    try check(&request, source, image);
+    source.transfers = 1; try t.expectError(error.Unsupported, check(&request, source, image)); source.transfers = 13;
+    source.flags = 7; try t.expectError(error.Unsupported, check(&request, source, image)); source.flags = 15;
+    request.signal.pipeline = 3; try t.expectError(error.Unsupported, check(&request, source, image)); request.signal.pipeline = 7;
+    request.signal.metadata_valid = 0; try t.expectError(error.Unsupported, check(&request, source, image)); request.signal.metadata_valid = 1;
+    source.identity.connection_generation += 1; try t.expectError(error.Stale, check(&request, source, image)); source.identity = identity;
+    image.format = .xrgb8888; try t.expectError(error.Unsupported, check(&request, source, image)); image.format = .xrgb2101010;
+    image.planes[0].pitch = std.math.maxInt(u64); try t.expectError(error.Unsupported, check(&request, source, image));
+
+    const caller: Owner = .{ .kind = .program, .id = 7, .generation = 9 };
+    const driver: Owner = .{ .kind = .driver, .id = 12, .generation = 3 };
+    const job: abi.GfxDriverModeJob = .{ .ticket = 4, .assignment = request.state.assignments[0],
+        .backend = .{ .adapter_id = 5, .device_generation = 6, .reset_generation = 7 } };
+    var extension: abi.GfxDriverModeColor = .{ .signal = request.signal, .reference = .{ .reference = .{ .id = 71, .generation = 17 } } };
+    var state: State = .{};
+    try state.beginColor(caller, driver, job, extension, 8, 1000, 100);
+    extension.signal.peak = 1; extension.reference.reference.id = 0;
+    try t.expectError(error.Stale, state.readColor(driver, 4, 1));
+    try state.arm();
+    const taken = (try state.take(driver, job.backend)).?;
+    try t.expectError(error.Stale, state.readColor(caller, taken.ticket, taken.sequence));
+    const copied = (try state.readColor(driver, taken.ticket, taken.sequence)).?;
+    try t.expect(copied.ticket == 4 and copied.sequence == 1 and copied.signal.peak == 10000000 and copied.reference.reference.id == 71);
+    try state.complete(driver, .{ .ticket = taken.ticket, .sequence = taken.sequence, .operation = taken.operation, .outcome = 1, .quiesced = 1 });
+    try t.expectError(error.Stale, state.readColor(driver, taken.ticket, taken.sequence));
+    state.settled(.{ .outcome = 1 }, 200);
+    try t.expect(state.expire(state.status.confirmation_deadline_ns));
+    try state.arm();
+    const rollback = (try state.take(driver, job.backend)).?;
+    try t.expectError(error.Stale, state.readColor(driver, taken.ticket, taken.sequence));
+    const retained = (try state.readColor(driver, rollback.ticket, rollback.sequence)).?;
+    try t.expect(std.meta.eql(retained.signal, copied.signal) and std.meta.eql(retained.reference, copied.reference) and retained.sequence == 2);
+}
+
 test "mode jobs bind owner generation and operation, preserve late receipts and automatically request rollback" {
+    try checkColorTransaction();
     const t = std.testing;
     const caller: Owner = .{ .kind = .program, .id = 7, .generation = 9 };
     const driver: Owner = .{ .kind = .driver, .id = 12, .generation = 3 };

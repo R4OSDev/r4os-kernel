@@ -16,6 +16,7 @@ pub const Entry = struct {
     receiver_source: u64 = 0,
     paused: bool = false,
     info: abi.GfxOutputInfo = .{},
+    color: ?abi.GfxOutputColorState = null,
     modes: [abi.gfx_output_max_modes]abi.GfxOutputMode = .{abi.GfxOutputMode{}} ** abi.gfx_output_max_modes,
     edid: [abi.gfx_output_max_edid_bytes]u8 = .{0} ** abi.gfx_output_max_edid_bytes,
 };
@@ -127,6 +128,31 @@ pub const Store = struct {
             ordinal += 1;
         }
         return null;
+    }
+    pub fn publishColor(self: *Store, owner: u32, value: abi.GfxOutputColorState) Error!bool {
+        if (owner == 0 or !validColor(value) or value.revision != 0) return error.Invalid;
+        const entry = for (&self.entries) |*item| {
+            if (std.meta.eql(item.info.identity, value.identity)) break item;
+        } else return error.Stale;
+        if (entry.owner != owner or entry.receiver_source != 0) return error.Stale;
+        if (value.flags & abi.gfx_output_color_active != 0 and (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0)) return error.Stale;
+        if (entry.color) |old| if (std.meta.eql(old, value)) return false;
+        try self.canChange();
+        entry.color = value;
+        self.revision += 1;
+        return true;
+    }
+    pub fn colorAt(self: *const Store, identity: abi.GfxOutputId) Error!abi.GfxOutputColorState {
+        const entry = try self.find(identity);
+        var value = entry.color orelse return error.Unsupported;
+        if (!std.meta.eql(value.identity, identity)) return error.Unsupported;
+        value.revision = self.revision;
+        if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) {
+            value.flags &= ~@as(u32, abi.gfx_output_color_active);
+            value.format = 0; value.bpc = 0; value.primaries = 0; value.transfer = 0; value.range = 0;
+            value.reference_white = 0; value.peak = 0; value.black = 0;
+        }
+        return value;
     }
     pub fn modeAt(self: *const Store, identity: abi.GfxOutputId, index: u32) Error!?abi.GfxOutputMode {
         const entry = try self.find(identity);
@@ -371,6 +397,24 @@ pub const Store = struct {
     }
 };
 fn header(value: anytype) bool { return value.version == 1 and value.size >= @sizeOf(@TypeOf(value)); }
+// Bounded wire validation only. EDID, transfer functions, profiles and
+// source/link eligibility are owned by the publishing driver and userland.
+fn validColor(value: abi.GfxOutputColorState) bool {
+    if (!header(value) or value.reserved0 != 0 or value.flags & ~@as(u32, 127) != 0 or
+        value.flags & abi.gfx_output_color_known == 0 or value.formats & ~@as(u32, 3) != 0 or
+        value.depths & ~@as(u32, 3) != 0 or value.color_spaces & ~@as(u32, 3) != 0 or
+        value.transfers & ~@as(u32, 13) != 0 or value.ranges & ~@as(u32, 3) != 0 or
+        value.gamma_entries > 65536 or value.degamma_entries > 65536 or value.ctm_fraction_bits > 32) return false;
+    if (value.flags & abi.gfx_output_color_active == 0) return value.format == 0 and value.bpc == 0 and value.primaries == 0 and
+        value.transfer == 0 and value.range == 0 and value.reference_white == 0 and value.peak == 0 and value.black == 0;
+    const format: u32 = switch (value.format) { abi.gfx_buffer_format_xrgb8888 => 1, abi.gfx_buffer_format_xrgb2101010 => 2, else => return false };
+    const depth: u32 = switch (value.bpc) { 8 => 1, 10 => 2, else => return false };
+    const primaries: u32 = switch (value.primaries) { 1 => 1, 3 => 2, else => return false };
+    const transfer: u32 = switch (value.transfer) { 1 => 1, 3 => 4, 4 => 8, else => return false };
+    const range: u32 = switch (value.range) { 1 => 1, 2 => 2, else => return false };
+    return value.formats & format != 0 and value.depths & depth != 0 and value.color_spaces & primaries != 0 and
+        value.transfers & transfer != 0 and value.ranges & range != 0 and value.reference_white != 0 and value.peak != 0;
+}
 pub const unknown_limits = blk: {
     var value = std.mem.zeroes(abi.GfxDisplayLimits);
     value.version = 1;
@@ -451,15 +495,41 @@ test "output unplug and identical replug invalidate every old receiver mode and 
     var info = testInfo(9); info.edid_bytes = 128;
     var data: [128]u8 = .{0x79} ** 128;
     const first = try store.publish(14, info, &.{testMode()}, &data);
+    try t.expectError(error.Unsupported, store.colorAt(first));
+    var color: abi.GfxOutputColorState = .{ .identity = first, .flags = abi.gfx_output_color_known,
+        .formats = 1, .depths = 1, .color_spaces = 1, .transfers = 1, .ranges = 1 };
+    try t.expectError(error.Stale, store.publishColor(15, color));
+    try t.expect(try store.publishColor(14, color));
+    const color_revision = store.revision;
+    try t.expect(!(try store.publishColor(14, color)) and store.revision == color_revision);
+    color.reserved0 = 1;
+    try t.expectError(error.Invalid, store.publishColor(14, color));
+    color.reserved0 = 0;
+    color.flags |= abi.gfx_output_color_active | abi.gfx_output_color_identity;
+    color.format = abi.gfx_buffer_format_xrgb8888; color.bpc = 8; color.primaries = 1; color.transfer = 1; color.range = 1;
+    color.reference_white = 1_000_000; color.peak = 1_000_000;
+    _ = try store.pause(14, first, true, true);
+    try t.expectError(error.Stale, store.publishColor(14, color));
+    _ = try store.pause(14, first, false, true);
+    try t.expect(try store.publishColor(14, color));
+    const active_color = try store.colorAt(first);
+    try t.expect(active_color.revision == store.revision and active_color.bpc == 8 and active_color.gamma_entries == 0 and active_color.transfers == 1);
+    _ = try store.pause(14, first, true, true);
+    const paused_color = try store.colorAt(first);
+    try t.expect(paused_color.flags & abi.gfx_output_color_active == 0 and paused_color.bpc == 0 and paused_color.formats == 1);
+    _ = try store.pause(14, first, false, true);
     const revision = store.revision;
     try store.withdraw(14, first);
     try t.expect(store.revision > revision);
     try t.expectError(error.Stale, store.find(first));
     const empty = store.infoAt(0).?;
+    try t.expectError(error.Stale, store.colorAt(first));
+    try t.expectError(error.Unsupported, store.colorAt(empty.identity));
     try t.expectEqual(@as(u32, 0), empty.edid_bytes);
     try t.expectEqual(@as(u32, 0), empty.mode_count);
     try t.expectEqual(@as(u32, 0), empty.preferred_mode_id);
     const second = try store.publish(14, info, &.{testMode()}, &data);
+    try t.expectError(error.Unsupported, store.colorAt(second));
     try t.expect(first.connector_id == second.connector_id and second.connection_generation > first.connection_generation);
     try t.expectError(error.Stale, store.modeAt(first, 0));
     try t.expect((try store.modeAt(second, 0)).?.width == 640);
@@ -662,18 +732,20 @@ test "receiver capacity and legacy table prefix preserve previous publications a
     try t.expect(rebound.generation > first.generation);
     try t.expect(try store.stop(@intCast(owner.id)));
     try t.expectError(error.Stale, store.replaceReceivers(owner, rebound, 1, records));
-    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 79, 80, 87, 88, 95, 96, 103, 104, 111, 112, 119 }) |bytes| {
+    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 79, 80, 87, 88, 95, 96, 103, 104, 111, 112, 119, 120, 127, 128 }) |bytes| {
         var storage: [128]u8 align(8) = @splat(0x79);
         const table: *abi.GfxDriverOutputApi = @ptrCast(&storage);
         table.version = 1; table.size = bytes;
         const before = storage;
-        const code = driverTable(table, .{ .publish = 3, .withdraw = 4, .register_source = 5, .replace_receivers = 6, .close_source = 7 });
+        const code = driverTable(table, .{ .publish = 3, .withdraw = 4, .register_source = 5, .replace_receivers = 6, .close_source = 7, .color_publish = 9, .mode_read_color = 10 });
         if (bytes < 24) {
             try t.expect(code == abi.gfx_output_error_invalid and std.mem.eql(u8, &storage, &before));
         } else {
             const returned = @min(bytes & ~@as(u32, 7), @sizeOf(abi.GfxDriverOutputApi));
             try t.expect(code == abi.gfx_output_ok and table.version == 1 and table.size == returned and table.publish == 3 and table.withdraw == 4);
             try t.expect(std.mem.allEqual(u8, storage[returned..], 0x79));
+            if (returned >= 120) try t.expect(table.color_publish == 9);
+            if (returned >= 128) try t.expect(table.mode_read_color == 10);
         }
     }
 }

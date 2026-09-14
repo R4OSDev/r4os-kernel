@@ -24,6 +24,7 @@ var binding: native.ModeBinding = undefined;
 var worker_event = sync.Event.initMode(false, .auto_reset);
 var admission = sync.UnwindGuard.init("display-mode-admission");
 var started = false;
+var color_image: @import("mode_color.zig").Owner = .{};
 
 pub fn enable(driver: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
     if (irq.inDispatch()) return error.Invalid;
@@ -46,7 +47,10 @@ pub fn status(ticket: u64) Error!abi.GfxModeStatus {
     return state.status;
 }
 pub fn submit(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmation_ms: u32) Error!abi.GfxModeStatus {
-    return submitImpl(caller, input, confirmation_ms, false);
+    return submitImpl(caller, input, confirmation_ms, false, null);
+}
+pub fn submitColor(caller: buffers.Owner, input: *const abi.GfxModeColorRequest, confirmation_ms: u32) Error!abi.GfxModeStatus {
+    return submitImpl(caller, &input.state, confirmation_ms, false, input);
 }
 pub fn restore(driver: buffers.Owner, input: *const abi.GfxAtomicState) Error!abi.GfxModeStatus {
     if (driver.kind != .driver or !driver.valid() or input.version != 1 or input.size < @sizeOf(abi.GfxAtomicState) or
@@ -54,19 +58,19 @@ pub fn restore(driver: buffers.Owner, input: *const abi.GfxAtomicState) Error!ab
     if (!outputs.nativePaused(@intCast(driver.id), input.assignments[0].output)) return error.Stale;
     var state_copy = input.*;
     if (state_copy.topology_revision == 0) state_copy.topology_revision = outputs.revision().revision;
-    return submitImpl(driver, &state_copy, 1000, true);
+    return submitImpl(driver, &state_copy, 1000, true, null);
 }
 pub fn driverStatus(driver: buffers.Owner, ticket: u64) Error!abi.GfxModeStatus {
     const token = ownership.enterState(); defer ownership.leaveState(token);
     if (ticket == 0 or ticket != state.status.ticket or !driver.eql(state.driver)) return error.Stale;
     return state.status;
 }
-fn submitImpl(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmation_ms: u32, automatic: bool) Error!abi.GfxModeStatus {
+fn submitImpl(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmation_ms: u32, automatic: bool, color: ?*const abi.GfxModeColorRequest) Error!abi.GfxModeStatus {
     if (irq.inDispatch() or confirmation_ms < 1000 or confirmation_ms > 60000) return error.Invalid;
     if (!admission.enter(0)) return error.Busy;
     defer _ = admission.leave();
     if (!started) return error.Unsupported;
-    if (!snapshot().available()) return error.Busy;
+    if (!snapshot().available() or !color_image.empty()) return error.Busy;
     const now = nowNs();
     if (now == 0 or now > std.math.maxInt(u64) - model.operation_ns) return error.Unavailable;
     const mode = try outputs.nativeMode(caller, input);
@@ -75,14 +79,16 @@ fn submitImpl(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmat
     const target = try native.modeBinding(input.assignments[0]);
     if (!automatic and outputs.nativePaused(@intCast(target.driver.id), input.assignments[0].output)) return error.Busy;
     if (automatic and !target.driver.eql(caller)) return error.Stale;
-    const reference = try native.prepareMode(caller, input.assignments[0], mode);
+    const color_job = if (color) |request| try color_image.prepare(caller, target.driver, request) else null;
+    errdefer color_image.release() catch {};
+    const reference = try native.prepareModeEncoding(caller, input.assignments[0], mode, if (color_job) |value| value.signal.format else null);
     errdefer native.abortPreparedMode(target);
     const accepted = try outputs.beginNative(caller, input);
     errdefer _ = outputs.finishNative(accepted.ticket, abi.gfx_mode_operation_apply, abi.gfx_output_outcome_old_preserved, 2) catch {};
     const result = blk: {
         const token = ownership.enterState(); defer ownership.leaveState(token);
-        try state.begin(caller, target.driver, .{ .ticket = accepted.ticket.id, .backend = target.backend,
-            .assignment = input.assignments[0], .mode = accepted.mode, .reference = reference }, accepted.revision, confirmation_ms, now);
+        try state.beginColor(caller, target.driver, .{ .ticket = accepted.ticket.id, .backend = target.backend,
+            .assignment = input.assignments[0], .mode = accepted.mode, .reference = reference }, color_job, accepted.revision, confirmation_ms, now);
         state.automatic = automatic;
         binding = target;
         break :blk state.status;
@@ -126,6 +132,11 @@ pub fn complete(driver: buffers.Owner, value: abi.GfxDriverModeCompletion) Error
         try state.complete(driver, value);
     }
     worker_event.signal();
+}
+pub fn readColor(driver: buffers.Owner, ticket: u64, sequence: u64) Error!?abi.GfxDriverModeColor {
+    if (irq.inDispatch()) return error.Invalid;
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return state.readColor(driver, ticket, sequence);
 }
 pub fn stoppedDriver(id: u32) void {
     const changed = blk: {
@@ -235,6 +246,12 @@ fn workerMain() callconv(.c) void {
                 state.status.error_code = code(err);
                 ownership.leaveState(token);
             };
+            // The separate encoded source can retire only after the driver
+            // has completed confirm/rollback, or rejected apply before use.
+            // Lost receipts leave it retained with the two native surfaces.
+            if (outcome != abi.gfx_output_outcome_lost and
+                (receipt.operation == abi.gfx_mode_operation_confirm or outcome == abi.gfx_output_outcome_old_preserved))
+                color_image.release() catch { outcome = abi.gfx_output_outcome_lost; };
             const result = outputs.finishNative(.{ .id = receipt.ticket }, receipt.operation, outcome,
                 if (outcome == abi.gfx_output_outcome_lost) 0 else receipt.quiesced) catch abi.GfxAtomicResult{ .outcome = abi.gfx_output_outcome_lost, .retained = 3 };
             {
