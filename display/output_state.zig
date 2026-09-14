@@ -52,7 +52,7 @@ pub const Store = struct {
             info.identity.connection_generation != 0 or info.mode_count != modes.len or info.edid_bytes != edid.len or
             modes.len > abi.gfx_output_max_modes or edid.len > abi.gfx_output_max_edid_bytes or edid.len % 128 != 0 or
             info.flags & ~@as(u32, 31 | abi.gfx_output_flag_edid_missing | abi.gfx_output_flag_edid_invalid |
-                abi.gfx_output_flag_receiver_incomplete | abi.gfx_output_flag_query_failed) != 0 or info.connector_kind > abi.gfx_output_kind_firmware) return error.Invalid;
+                abi.gfx_output_flag_receiver_incomplete | abi.gfx_output_flag_query_failed) != 0 or info.connector_kind > abi.gfx_output_kind_dvi) return error.Invalid;
         if ((owner == 0) != (info.identity.adapter_id == 0)) return error.Invalid;
         if (info.flags & abi.gfx_output_flag_connected == 0) {
             if (edid.len != 0) return error.Invalid;
@@ -389,7 +389,7 @@ fn validReceiver(value: *const abi.GfxReceiverInfo) Error!void {
         abi.gfx_output_flag_edid_missing | abi.gfx_output_flag_edid_invalid |
         abi.gfx_output_flag_receiver_incomplete | abi.gfx_output_flag_query_failed;
     if (value.connector_id == 0 or value.reserved0 != 0 or value.flags & ~flags != 0 or
-        value.connector_kind > abi.gfx_output_kind_virtual or value.mode_count > abi.gfx_output_max_modes or
+        (value.connector_kind > abi.gfx_output_kind_virtual and value.connector_kind != abi.gfx_output_kind_dvi) or value.mode_count > abi.gfx_output_max_modes or
         value.edid_bytes > abi.gfx_output_max_edid_bytes or value.edid_bytes % 128 != 0) return error.Invalid;
     const connected = value.flags & abi.gfx_output_flag_connected != 0;
     if (connected and value.flags & abi.gfx_output_flag_connection_unknown != 0) return error.Invalid;
@@ -573,9 +573,12 @@ test "receiver batches preserve boot, reject partial generations and revoke meta
         record.modes[0] = testMode();
         record.edid[1] = 79;
     }
+    records[0].connector_kind = abi.gfx_output_kind_dvi;
+    records[1].connector_kind = abi.gfx_output_kind_displayport;
     try store.replaceReceivers(owner, binding, 1, records);
     try t.expectEqual(@as(u32, 33), store.cursor().present);
     const first = store.infoAt(1).?;
+    try t.expect(first.connector_kind == abi.gfx_output_kind_dvi and store.infoAt(2).?.connector_kind == abi.gfx_output_kind_displayport);
     const last = store.infoAt(32).?;
     try t.expect(std.meta.eql(first.limits, unknown_limits) and first.possible_heads == 0 and
         first.flags == abi.gfx_output_flag_connected | abi.gfx_output_flag_receiver_only);
