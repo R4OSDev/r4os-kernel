@@ -17,6 +17,7 @@ pub const Entry = struct {
     paused: bool = false,
     info: abi.GfxOutputInfo = .{},
     color: ?abi.GfxOutputColorState = null,
+    refresh: @import("refresh_state.zig").State = .{},
     modes: [abi.gfx_output_max_modes]abi.GfxOutputMode = .{abi.GfxOutputMode{}} ** abi.gfx_output_max_modes,
     edid: [abi.gfx_output_max_edid_bytes]u8 = .{0} ** abi.gfx_output_max_edid_bytes,
 };
@@ -158,6 +159,36 @@ pub const Store = struct {
         const entry = try self.find(identity);
         return if (index < entry.info.mode_count) entry.modes[index] else null;
     }
+    pub fn refreshEntry(self: *Store, target: abi.GfxOutputTarget) Error!*Entry {
+        if (!@import("output_target.zig").valid(target)) return error.Invalid;
+        const entry = @constCast(try self.find(.{ .adapter_id = target.adapter_id, .connector_id = target.connector_id,
+            .device_generation = target.device_generation, .connection_generation = target.connection_generation }));
+        if (entry.owner == 0 or entry.receiver_source != 0) return error.Unsupported;
+        return entry;
+    }
+    pub fn publishRefresh(self: *Store, owner: u32, value: abi.GfxOutputRefresh) Error!bool {
+        const entry = try self.refreshEntry(value.target);
+        if (entry.owner != owner or owner == 0) return error.Stale;
+        if (value.status.phase == abi.gfx_refresh_phase_active and
+            (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0)) return error.Stale;
+        return entry.refresh.publish(value);
+    }
+    pub fn refreshAt(self: *Store, target: abi.GfxOutputTarget) Error!abi.GfxOutputRefresh {
+        const entry = try self.refreshEntry(target);
+        if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) return error.Stale;
+        return entry.refresh.get(target);
+    }
+    pub fn requestRefresh(self: *Store, actor: DriverOwner, input: abi.GfxRefreshRequest, now: u64) Error!abi.GfxRefreshRequest {
+        const entry = try self.refreshEntry(input.target);
+        if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) return error.Stale;
+        return entry.refresh.request(actor, input, now);
+    }
+    pub fn readRefresh(self: *Store, owner: u32, target: abi.GfxOutputTarget, now: u64) Error!abi.GfxRefreshRequest {
+        const entry = try self.refreshEntry(target);
+        if (entry.owner != owner or owner == 0) return error.Stale;
+        if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) entry.refresh.pause();
+        return entry.refresh.read(target, now);
+    }
     pub fn withdraw(self: *Store, owner: u32, identity: abi.GfxOutputId) Error!void {
         try self.canChange();
         const entry = try self.find(identity);
@@ -171,6 +202,7 @@ pub const Store = struct {
         const ceiling = std.math.maxInt(u64) - @as(u64, @intFromBool(self.pending.id != 0));
         if (self.revision >= ceiling) return error.Exhausted;
         entry.paused = paused;
+        if (paused) entry.refresh.pause();
         if (paused) entry.info.flags &= ~@as(u32, abi.gfx_output_flag_active)
         else if (primary) entry.info.flags |= abi.gfx_output_flag_active;
         self.revision += 1; entry.info.topology_revision = self.revision;
@@ -185,6 +217,7 @@ pub const Store = struct {
         entry.info.mode_count = 0;
         entry.info.preferred_mode_id = 0;
         entry.info.edid_bytes = 0;
+        entry.refresh = .{};
         @memset(&entry.modes, .{});
         @memset(&entry.edid, 0);
     }
@@ -518,6 +551,7 @@ test "output unplug and identical replug invalidate every old receiver mode and 
     const paused_color = try store.colorAt(first);
     try t.expect(paused_color.flags & abi.gfx_output_color_active == 0 and paused_color.bpc == 0 and paused_color.formats == 1);
     _ = try store.pause(14, first, false, true);
+    try @import("refresh_state_test.zig").check(&store, first);
     const revision = store.revision;
     try store.withdraw(14, first);
     try t.expect(store.revision > revision);
@@ -732,12 +766,12 @@ test "receiver capacity and legacy table prefix preserve previous publications a
     try t.expect(rebound.generation > first.generation);
     try t.expect(try store.stop(@intCast(owner.id)));
     try t.expectError(error.Stale, store.replaceReceivers(owner, rebound, 1, records));
-    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 79, 80, 87, 88, 95, 96, 103, 104, 111, 112, 119, 120, 127, 128 }) |bytes| {
-        var storage: [128]u8 align(8) = @splat(0x79);
+    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 79, 80, 87, 88, 95, 96, 103, 104, 111, 112, 119, 120, 127, 128, 135, 136, 143, 144 }) |bytes| {
+        var storage: [144]u8 align(8) = @splat(0x79);
         const table: *abi.GfxDriverOutputApi = @ptrCast(&storage);
         table.version = 1; table.size = bytes;
         const before = storage;
-        const code = driverTable(table, .{ .publish = 3, .withdraw = 4, .register_source = 5, .replace_receivers = 6, .close_source = 7, .color_publish = 9, .mode_read_color = 10 });
+        const code = driverTable(table, .{ .publish = 3, .withdraw = 4, .register_source = 5, .replace_receivers = 6, .close_source = 7, .color_publish = 9, .mode_read_color = 10, .refresh_publish = 11, .refresh_read = 12 });
         if (bytes < 24) {
             try t.expect(code == abi.gfx_output_error_invalid and std.mem.eql(u8, &storage, &before));
         } else {
@@ -746,6 +780,8 @@ test "receiver capacity and legacy table prefix preserve previous publications a
             try t.expect(std.mem.allEqual(u8, storage[returned..], 0x79));
             if (returned >= 120) try t.expect(table.color_publish == 9);
             if (returned >= 128) try t.expect(table.mode_read_color == 10);
+            if (returned >= 136) try t.expect(table.refresh_publish == 11);
+            if (returned >= 144) try t.expect(table.refresh_read == 12);
         }
     }
 }

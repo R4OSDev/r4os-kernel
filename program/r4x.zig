@@ -2041,6 +2041,7 @@ fn sharedRasterReleaseProcess(handle: ProgramProcessHandle) void {
     gfx_queue.stopped(graphicsOwner(handle));
     gfx_allocations.stopped(graphicsOwner(handle));
     @import("../display/cursor_work.zig").stopped(graphicsOwner(handle));
+    @import("../display/outputs.zig").refreshStopped(graphicsOwner(handle));
     for (free_sets[0..free_count]) |set| sharedRasterFreeMemories(set);
     gfx_buffers.collect();
 }
@@ -7698,6 +7699,8 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_output_mode = &gfx_output_api.mode,
         .gfx_output_edid = &gfx_output_api.edid,
         .gfx_output_color = &gfx_output_api.color,
+        .gfx_output_refresh = &gfx_output_api.refresh,
+        .gfx_refresh_request = &apiGfxRefreshRequest,
         .gfx_atomic_test = &apiGfxAtomicTest,
         .gfx_atomic_commit = &apiGfxAtomicCommit,
         .gfx_atomic_submit = &apiGfxAtomicSubmit,
@@ -16292,6 +16295,10 @@ fn apiGfxAtomicTestColor(input: *const gfx_output_api.abi.GfxModeColorRequest, o
 fn apiGfxAtomicSubmitColor(input: *const gfx_output_api.abi.GfxModeColorRequest, confirmation_ms: u32, output: *gfx_output_api.abi.GfxModeStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
     return gfx_output_api.submitColor(graphicsOwner(owner), input, confirmation_ms, output);
+}
+fn apiGfxRefreshRequest(input: *const gfx_output_api.abi.GfxRefreshRequest, output: *gfx_output_api.abi.GfxRefreshRequest) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
+    return gfx_output_api.requestRefresh(graphicsOwner(owner), input, output);
 }
 fn apiDisplayCursorSubmit(input: *const @import("r4os_kernel_contract").DisplayCursorRequest, output: *@import("r4os_kernel_contract").DisplayCursorStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;

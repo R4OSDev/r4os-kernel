@@ -392,6 +392,16 @@ pub fn wakeNative(id: u32, binding: model.Binding) Error!void {
     interrupts.restore(flags);
     worker_event.signal();
 }
+pub fn wakeOutput(id: u32, target: @import("r4os_kernel_contract").GfxOutputTarget) Error!void {
+    const binding = blk: {
+        buffers.lock(); defer buffers.unlock();
+        for (&backends) |*backend| if (id != 0 and backend.owner.id == id and !backend.closing and
+            backend.binding.adapter == target.adapter_id and backend.binding.device_generation == target.device_generation)
+            break :blk backend.binding;
+        return error.Stale;
+    };
+    try wakeNative(id, binding);
+}
 fn notifyNative() bool {
     var pending = false;
     for (0..backends.len) |i| {

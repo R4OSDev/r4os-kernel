@@ -71,6 +71,60 @@ pub fn publishColor(owner: u32, value: abi.GfxOutputColorState) Error!void {
     };
     if (changed) events.signal();
 }
+fn refreshNow() u64 { return @import("../platform/monotonic.zig").nowNanoseconds() orelse 0; }
+fn currentRefreshTarget(target: abi.GfxOutputTarget) Error!void {
+    const current = @import("native_driver.zig").outputTarget(target.adapter_id, target.head_id) catch return error.Stale;
+    if (!std.meta.eql(current, target)) return error.Stale;
+}
+pub fn refreshAt(target: abi.GfxOutputTarget) Error!abi.GfxOutputRefresh {
+    try currentRefreshTarget(target);
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return catalog.refreshAt(target);
+}
+pub fn publishRefresh(owner: u32, value: abi.GfxOutputRefresh) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    if (value.status.phase == abi.gfx_refresh_phase_active) try currentRefreshTarget(value.target);
+    const changed = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        try registeredHeadLocked(owner, .{ .adapter_id = value.target.adapter_id, .connector_id = value.target.connector_id,
+            .device_generation = value.target.device_generation, .connection_generation = value.target.connection_generation }, value.target.head_id);
+        break :blk try catalog.publishRefresh(owner, value);
+    };
+    if (changed) events.signal();
+}
+pub fn requestRefresh(actor: buffers.Owner, input: abi.GfxRefreshRequest) Error!abi.GfxRefreshRequest {
+    if (irq.inDispatch()) return error.Invalid;
+    try currentRefreshTarget(input.target);
+    const now = refreshNow();
+    var owner: u32 = 0;
+    const value = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        owner = (try catalog.refreshEntry(input.target)).owner;
+        break :blk try catalog.requestRefresh(actor, input, now);
+    };
+    queue.wakeOutput(owner, input.target) catch {};
+    return value;
+}
+pub fn readRefresh(owner: u32, target: abi.GfxOutputTarget) Error!abi.GfxRefreshRequest {
+    if (irq.inDispatch()) return error.Invalid;
+    const now = refreshNow();
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return catalog.readRefresh(owner, target, now);
+}
+pub fn refreshStopped(actor: buffers.Owner) void {
+    // One small snapshot at a time; no catalog-sized array on kernel stacks.
+    for (0..catalog.entries.len) |index| {
+        const Wake = struct { owner: u32, target: abi.GfxOutputTarget };
+        const wake: ?Wake = blk: {
+            const token = ownership.enterState(); defer ownership.leaveState(token);
+            const entry = &catalog.entries[index];
+            if (entry.refresh.stopped(actor)) if (entry.refresh.value) |value|
+                break :blk .{ .owner = entry.owner, .target = value.target };
+            break :blk null;
+        };
+        if (wake) |value| queue.wakeOutput(value.owner, value.target) catch {};
+    }
+}
 pub fn modeAt(identity: abi.GfxOutputId, index: u32) Error!?abi.GfxOutputMode {
     const token = ownership.enterState(); defer ownership.leaveState(token);
     return catalog.modeAt(identity, index);

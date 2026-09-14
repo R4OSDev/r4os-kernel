@@ -3421,7 +3421,23 @@ fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32
         .mode_enable = @intFromPtr(&gfxModeEnable), .mode_take = @intFromPtr(&gfxModeTake), .mode_complete = @intFromPtr(&gfxModeComplete),
         .audio_publish = @intFromPtr(&gfxAudioPublish), .audio_query = @intFromPtr(&gfxAudioQuery),
         .output_pause = @intFromPtr(&gfxOutputPause), .mode_restore = @intFromPtr(&gfxModeRestore), .mode_status = @intFromPtr(&gfxModeStatus),
-        .color_publish = @intFromPtr(&gfxOutputColorPublish), .mode_read_color = @intFromPtr(&gfxModeReadColor) });
+        .color_publish = @intFromPtr(&gfxOutputColorPublish), .mode_read_color = @intFromPtr(&gfxModeReadColor),
+        .refresh_publish = @intFromPtr(&gfxOutputRefreshPublish), .refresh_read = @intFromPtr(&gfxRefreshRead) });
+}
+fn gfxOutputRefreshPublish(input: *const outputs_contract.GfxOutputRefresh) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputRefresh) != 0 or irq_router.inDispatch())
+        return outputs_contract.gfx_output_error_invalid;
+    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    @import("../display/outputs.zig").publishRefresh(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxRefreshRead(input: *const outputs_contract.GfxOutputTarget, output: *outputs_contract.GfxRefreshRequest) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputTarget) != 0 or
+        !@import("../program/gfx_buffer_api.zig").validOutput(outputs_contract.GfxRefreshRequest, output)) return outputs_contract.gfx_output_error_invalid;
+    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    const value = @import("../display/outputs.zig").readRefresh(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
+    output.* = value;
+    return outputs_contract.gfx_output_ok;
 }
 fn gfxModeReadColor(ticket: u64, sequence: u64, output: *outputs_contract.GfxDriverModeColor) callconv(.c) i32 {
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);

@@ -43,6 +43,21 @@ pub fn color(input: *const abi.GfxOutputId, output: *abi.GfxOutputColorState) ca
     output.* = snapshot;
     return abi.gfx_output_ok;
 }
+pub fn refresh(input: *const abi.GfxOutputTarget, output: *abi.GfxOutputRefresh) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxOutputTarget) != 0 or
+        !memory_api.validOutput(abi.GfxOutputRefresh, output)) return abi.gfx_output_error_invalid;
+    const value = outputs.refreshAt(input.*) catch |err| return code(err);
+    output.* = value;
+    return abi.gfx_output_ok;
+}
+pub fn requestRefresh(owner: buffers.Owner, input: *const abi.GfxRefreshRequest, output: *abi.GfxRefreshRequest) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxRefreshRequest) != 0 or
+        !memory_api.validOutput(abi.GfxRefreshRequest, output)) return abi.gfx_output_error_invalid;
+    const request = input.*;
+    const value = outputs.requestRefresh(owner, request) catch |err| return code(err);
+    output.* = value;
+    return abi.gfx_output_ok;
+}
 pub fn atomic(owner: buffers.Owner, input: *const abi.GfxAtomicState, output: *abi.GfxAtomicResult, commit: bool) i32 {
     if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxAtomicResult, output)) return abi.gfx_output_error_invalid;
     const state = input.*;
