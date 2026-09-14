@@ -94,7 +94,7 @@ pub fn validatedProfile(input: abi.GfxBackendProfile) Error!abi.GfxBackendProfil
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
-    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 63) != 0) return error.Invalid;
+    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 127) != 0) return error.Invalid;
     const profile = try validatedProfile(config.profile);
     buffers.lock();
     defer buffers.unlock();
@@ -142,10 +142,10 @@ pub fn nativeOperations(id: u32, binding: model.Binding) Error!u64 {
     return backend.operations;
 }
 fn nativeJobCapacity(backend: *const Backend) u32 {
-    return if (backend.job_operations & 16 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
+    return if (backend.job_operations & 80 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
 }
 pub fn updateNativeOperations(id: u32, binding: model.Binding, operations: u64) Error!void {
-    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 63) != 0) return error.Invalid;
+    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 127) != 0) return error.Invalid;
     buffers.lock(); defer buffers.unlock();
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
@@ -207,6 +207,13 @@ pub fn nativeSegment(id: u32, fence: model.Fence, which: u32, offset: u64, mask:
     // One page-bounded translation, under the BO pin and the established
     // program -> paging lock order. Never allocates a page list in an IRQ.
     return @import("../kernel/gfx_driver_memory.zig").dmaSegment(use, offset, mask);
+}
+pub fn nativeRenderList(id: u32, fence: model.Fence) Error!abi.GfxRenderList {
+    if (irq.inDispatch()) return error.Unavailable;
+    buffers.lock();
+    defer buffers.unlock();
+    _ = try jobBackendLocked(id, fence);
+    return resources.renderList(&state, fence);
 }
 pub const RetainedResource = struct { reference: buffers.Handle, buffer: buffers.Handle };
 pub fn retainNative(identity: buffers.Owner, fence: model.Fence, which: u32) Error!RetainedResource {

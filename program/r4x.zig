@@ -7672,6 +7672,7 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_queue_open = &apiGfxQueueOpen,
         .gfx_queue_close = &apiGfxQueueClose,
         .gfx_queue_submit = &apiGfxQueueSubmit,
+        .gfx_queue_submit_render_list = &apiGfxQueueSubmitRenderList,
         .gfx_fence_query = &gfx_queue_api.query,
         .gfx_fence_wait = &gfx_queue_api.wait,
         .gfx_fence_cancel = &apiGfxFenceCancel,
@@ -16287,6 +16288,10 @@ fn apiGfxQueueClose(input: *const gfx_queue_api.abi.GfxQueueHandle) callconv(.c)
 fn apiGfxQueueSubmit(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *const gfx_queue_api.abi.GfxSubmission, output: *gfx_queue_api.abi.GfxFenceStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
     return gfx_queue_api.submit(graphicsOwner(owner), queue, input, output);
+}
+fn apiGfxQueueSubmitRenderList(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *const gfx_queue_api.abi.GfxSubmission, list: *const gfx_queue_api.abi.GfxRenderList, output: *gfx_queue_api.abi.GfxFenceStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
+    return gfx_queue_api.submitRenderList(graphicsOwner(owner), queue, input, list, output);
 }
 fn apiGfxFenceCancel(input: *const gfx_queue_api.abi.GfxFence) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;

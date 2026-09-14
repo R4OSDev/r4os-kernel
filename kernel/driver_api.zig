@@ -3501,6 +3501,7 @@ fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
         .retain_resource = @intFromPtr(&gfxQueueRetain),
         .register_profile = @intFromPtr(&gfxQueueRegisterProfile),
         .update_operations = @intFromPtr(&gfxQueueUpdateOperations),
+        .read_render_list = @intFromPtr(&gfxQueueReadRenderList),
     };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_queue_ok;
@@ -3518,6 +3519,9 @@ fn gfxQueueUnregister(input: *const outputs_contract.GfxBackendBinding, quiesced
 }
 fn gfxQueueTake(input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverJob) callconv(.c) i32 {
     return gfx_queue_api.take(activeOwner(), input, output);
+}
+fn gfxQueueReadRenderList(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderList) callconv(.c) i32 {
+    return gfx_queue_api.readRenderList(activeOwner(), input, output);
 }
 fn gfxQueueUpdateOperations(input: *const outputs_contract.GfxBackendBinding, operations: u64) callconv(.c) i32 {
     return gfx_queue_api.updateOperations(activeOwner(), input, operations);

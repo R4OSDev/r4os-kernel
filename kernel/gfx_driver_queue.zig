@@ -73,6 +73,12 @@ pub fn complete(id: u32, input: *const abi.GfxFence, result: u32, quiesced: u32)
     queue.completeNative(id, value, terminal, quiesced == 1) catch |err| return api.errorCode(err);
     return abi.gfx_queue_ok;
 }
+pub fn readRenderList(id: u32, input: *const abi.GfxFence, output: *abi.GfxRenderList) i32 {
+    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxRenderList, output)) return abi.gfx_queue_error_invalid;
+    const value = queue.nativeRenderList(id, api.fence(input.*)) catch |err| return api.errorCode(err);
+    output.* = value;
+    return abi.gfx_queue_ok;
+}
 pub fn reset(id: u32, input: *const abi.GfxBackendBinding, quiesced: u32, output: *abi.GfxBackendBinding) i32 {
     if (@intFromPtr(input) == 0 or quiesced > 1 or !memory_api.validOutput(abi.GfxBackendBinding, output) or irq.inDispatch()) return abi.gfx_queue_error_invalid;
     const request = input.*;

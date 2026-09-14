@@ -7,7 +7,7 @@ const queue = @import("queue_state.zig");
 const abi = @import("r4os_kernel_contract");
 pub const owner = lifetime.Owner{ .kind = .kernel, .id = 2, .generation = 1 };
 pub const display_owner = lifetime.Owner{ .kind = .kernel, .id = 3, .generation = 1 };
-pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present };
+pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present, render_list };
 pub const Request = struct {
     operation: Operation = .copy,
     source: lifetime.Handle = .{},
@@ -19,6 +19,7 @@ pub const Request = struct {
     source_pitch: u64 = 0,
     target_pitch: u64 = 0,
     render: abi.GfxRenderCommand = .{},
+    render_list: ?*const abi.GfxRenderList = null,
     memory_binding: ?lifetime.layout.Binding = null,
 };
 pub const Entry = struct {
@@ -89,6 +90,9 @@ pub fn Resources(comptime capacity: usize) type {
     return struct {
         const Self = @This();
         entries: [capacity]Entry = .{Entry{}} ** capacity,
+        // Separate resident metadata avoids inflating the small Entry snapshots
+        // used by workers and interrupt completion ingress.
+        render_lists: [capacity]abi.GfxRenderList = @splat(.{}),
 
         fn ordered(self: *Self, state: anytype, timeline: u64, dependencies: []const queue.Fence, object: lifetime.Handle, write: bool) Error!void {
             for (&self.entries) |prior| {
@@ -113,7 +117,18 @@ pub fn Resources(comptime capacity: usize) type {
             if (!sampled and (request.source.id != 0 or request.source.generation != 0 or draw.filter != 0 or draw.transfer != 0 or
                 !std.meta.eql(draw.source_rect, abi.GfxRenderRect{}))) return error.Invalid;
             if (sampled and draw.color != 0) return error.Invalid;
-            var entry = Entry{ .operation = .render, .render = draw, .deadline_ns = submission.deadline_ns };
+            if (request.operation == .render_list) {
+                const list = request.render_list orelse return error.Invalid;
+                if (list.version != 1 or list.size != @sizeOf(abi.GfxRenderList) or list.count == 0 or
+                    list.count > abi.gfx_render_list_capacity or list.reserved0 != 0 or !std.meta.eql(list.commands[0], draw)) return error.Invalid;
+                for (&list.commands, 0..) |*item, i| {
+                    if (i >= list.count) { if (!std.meta.eql(item.*, abi.GfxRenderCommand{})) return error.Invalid; continue; }
+                    if (item.kind != draw.kind or item.filter != draw.filter or item.blend != draw.blend or item.transfer != draw.transfer or
+                        item.opacity > 255 or item.reserved0 != 0 or (sampled and item.color != 0) or
+                        (!sampled and !std.meta.eql(item.source_rect, abi.GfxRenderRect{}))) return error.Invalid;
+                }
+            } else if (request.render_list != null) return error.Invalid;
+            var entry = Entry{ .operation = request.operation, .render = draw, .deadline_ns = submission.deadline_ns };
             const references = [_]lifetime.Handle{ request.source, request.target };
             var objects: [2]lifetime.Handle = .{ .{}, .{} };
             var extents: [2]u64 = .{ 0, 0 };
@@ -138,15 +153,25 @@ pub fn Resources(comptime capacity: usize) type {
             entry.fence = try state.submit(timeline, producer, submission, now);
             std.debug.assert(self.entries[entry.fence.slot - 1].fence.slot == 0);
             self.entries[entry.fence.slot - 1] = entry;
+            if (request.render_list) |list| self.render_lists[entry.fence.slot - 1] = list.*;
             return entry.fence;
+        }
+
+        pub fn renderList(self: *Self, state: anytype, fence: queue.Fence) Error!abi.GfxRenderList {
+            const status = try state.query(fence);
+            if (!status.device_active) return error.Invalid;
+            const entry = &self.entries[fence.slot - 1];
+            if (!std.meta.eql(entry.fence, fence) or entry.operation != .render_list) return error.Invalid;
+            return self.render_lists[fence.slot - 1];
         }
 
         pub fn submit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
             const config = try state.configuration(timeline, producer);
+            if (request.operation != .render_list and request.render_list != null) return error.Invalid;
             if (request.operation == .present) return self.presentSubmit(state, buffers, timeline, producer, submission, request, now);
             const rows = request.operation == .copy_rows;
             if (!rows and (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0)) return error.Invalid;
-            if (request.operation == .render) return self.renderSubmit(state, buffers, timeline, producer, submission, request, now);
+            if (request.operation == .render or request.operation == .render_list) return self.renderSubmit(state, buffers, timeline, producer, submission, request, now);
             if (!std.meta.eql(request.render, abi.GfxRenderCommand{})) return error.Invalid;
             const source_span = if (rows) try rowSpan(request.bytes, request.row_count, request.source_pitch) else request.bytes;
             const target_span = if (rows) try rowSpan(request.bytes, request.row_count, request.target_pitch) else request.bytes;
@@ -462,18 +487,31 @@ test "native upload retains a single source beyond cancellation and producer ref
     try t.expectError(error.Invalid, resources.submit(&state, &buffers, draw_queue, producer, .{ .deadline_ns = 100 }, draw, 8));
     draw.render.reserved0 = 0;
     const retained_draw = draw.render;
+    var list: abi.GfxRenderList = .{ .count = 2 };
+    list.commands[0] = draw.render; list.commands[1] = draw.render; list.commands[1].opacity = 128;
+    const expected_list = list;
+    draw.operation = .render_list; draw.render_list = &list;
+    list.count = 17;
+    try t.expectError(error.Invalid, resources.submit(&state, &buffers, draw_queue, producer, .{ .deadline_ns = 100 }, draw, 8));
+    list.count = 2; list.commands[2].opacity = 1;
+    try t.expectError(error.Invalid, resources.submit(&state, &buffers, draw_queue, producer, .{ .deadline_ns = 100 }, draw, 8));
+    list.commands[2] = .{};
     const render_fence = try resources.submit(&state, &buffers, draw_queue, producer, .{ .deadline_ns = 100 }, draw, 8);
+    try t.expectError(error.Invalid, resources.renderList(&state, render_fence));
+    list.commands[1].opacity = 17;
     draw.render.opacity = 0;
     const held_draw = &resources.entries[render_fence.slot - 1];
     try t.expectEqualDeep(retained_draw, held_draw.render);
     try t.expectEqual(@as(u64, 100), held_draw.deadline_ns);
     try t.expectEqual(@as(u64, 4096), held_draw.uses[1].?.range.bytes);
     // A separately queued reader must explicitly depend on the writer.
+    draw.operation = .render; draw.render_list = null;
     draw.source = render_refs[1]; draw.target = render_refs[0];
     try t.expectError(error.Busy, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, draw, 8));
     const read_fence = try resources.submit(&state, &buffers, timeline, producer,
         .{ .deadline_ns = 100, .dependencies = &.{render_fence} }, draw, 8);
     try t.expectEqualDeep(render_fence, state.takeReadyFor(device, 9).?);
+    try t.expectEqualDeep(expected_list, try resources.renderList(&state, render_fence));
     for (render_refs) |ref| try buffers.drop(ref, producer);
     for (native_refs) |ref| try buffers.drop(ref, driver);
     const retained_target = try resources.retain(&state, &buffers, render_fence, 1, driver);
