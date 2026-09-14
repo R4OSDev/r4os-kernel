@@ -153,6 +153,15 @@ pub fn mouseState(out: *MouseApiState) callconv(.c) void {
         .packets = s.packets,
     };
 }
+pub fn mouseMotion(out: *r4x_api.MouseMotion) callconv(.c) i32 {
+    if (@intFromPtr(out) == 0 or out.version != 1 or out.size < @sizeOf(r4x_api.MouseMotion)) return -1;
+    var value: r4x_api.MouseMotion = .{ .mouse = undefined };
+    mouseState(&value.mouse);
+    const totals = mouse.motionTotals();
+    value.motion_x = @truncate(totals); value.motion_y = @truncate(totals >> 32);
+    out.* = value;
+    return 0;
+}
 
 pub fn mouseShow() callconv(.c) void {
     r4draw.markDisplayUsed();

@@ -18,8 +18,13 @@ var catalog: model.Store = .{};
 // A queue binding checked before that transition cannot publish afterwards.
 var owner_epoch: u64 = 1;
 var epoch_exhausted = false;
-var native_owner: u32 = 0;
-var native_port: abi.GfxOutputId = .{};
+const NativePort = struct { owner: u32 = 0, identity: abi.GfxOutputId = .{}, head: u32 = 0 };
+var native_ports: [abi.gfx_output_max_assignments]NativePort = @splat(.{});
+fn nativePort(owner: u32, identity: abi.GfxOutputId) ?*NativePort {
+    if (owner == 0) return null;
+    for (&native_ports) |*port| if (port.owner == owner and samePort(port.identity, identity)) return port;
+    return null;
+}
 fn samePort(left: abi.GfxOutputId, right: abi.GfxOutputId) bool {
     return left.adapter_id == right.adapter_id and left.connector_id == right.connector_id and left.device_generation == right.device_generation;
 }
@@ -85,7 +90,7 @@ pub fn publish(owner: u32, input: *const abi.GfxOutputPublication) Error!abi.Gfx
         const token = ownership.enterState(); defer ownership.leaveState(token);
         if (epoch_exhausted or owner_epoch != epoch) return error.Stale;
         var info = input.info;
-        if (owner == native_owner and samePort(info.identity, native_port) and nativePresence(info.flags, true))
+        if (nativePort(owner, info.identity) != null and nativePresence(info.flags, true))
             info.flags |= abi.gfx_output_flag_active | (if (modeset) @as(u32, 0) else abi.gfx_output_flag_fixed_geometry);
         break :blk if (modeset) try catalog.publishModeset(owner, info, input.modes[0..info.mode_count], input.edid[0..info.edid_bytes]) else
             try catalog.publish(owner, info, input.modes[0..info.mode_count], input.edid[0..info.edid_bytes]);
@@ -113,7 +118,7 @@ pub fn pause(owner: u32, identity: abi.GfxOutputId, paused: bool) Error!void {
     if (irq.inDispatch()) return error.Invalid;
     const changed = blk: {
         const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (native_owner != owner or !samePort(native_port, identity)) return error.Stale;
+        if (nativePort(owner, identity) == null) return error.Stale;
         const entry = try catalog.find(identity);
         if (!paused and !nativePresence(entry.info.flags, true)) return error.Stale;
         break :blk try catalog.pause(owner, identity, paused, true);
@@ -175,12 +180,13 @@ pub fn queryAudio(location: u32, device: u32, index: u32) ?abi.GfxAudioRoute {
 }
 pub fn stoppedDriver(owner: u32) void {
     if (owner == 0) return;
+    @import("output_runtime.zig").stoppedDriver(owner);
     @import("mode_work.zig").stoppedDriver(owner);
     @import("cursor_work.zig").stoppedDriver(owner);
     const changed = blk: {
         const token = ownership.enterState(); defer ownership.leaveState(token);
         if (owner_epoch == std.math.maxInt(u64)) epoch_exhausted = true else owner_epoch += 1;
-        if (native_owner == owner) { native_owner = 0; native_port = .{}; }
+        for (&native_ports) |*port| if (port.owner == owner) { port.* = .{}; };
         break :blk catalog.stop(owner) catch {
             // Exhaustion is fail-closed: no stale receiver data survives.
             for (&catalog.entries) |*entry| if (entry.owner == owner) { entry.* = .{}; };
@@ -216,13 +222,73 @@ pub fn validateNative(owner: u32, backend: abi.GfxBackendBinding, identity: abi.
 }
 pub fn cursorHead(owner: u32, identity: abi.GfxOutputId) Error!u32 {
     const token = ownership.enterState(); defer ownership.leaveState(token);
-    if (epoch_exhausted or owner == 0 or native_owner != owner or !samePort(identity, native_port)) return error.Stale;
+    const route = nativePort(owner, identity) orelse return error.Stale;
+    if (epoch_exhausted) return error.Stale;
     for (&catalog.entries) |*entry| if (entry.owner == owner and samePort(identity, entry.info.identity) and
         entry.info.flags & abi.gfx_output_flag_active != 0) {
-        if (@popCount(entry.info.possible_heads) != 1 or entry.info.possible_heads & ~@as(u32, 255) != 0) return error.Unsupported;
-        return @ctz(entry.info.possible_heads);
+        return route.head;
     };
     return error.Unsupported;
+}
+pub fn activeTarget(owner: u32, port: abi.GfxOutputId, generation: u64) error{Stale}!abi.GfxOutputTarget {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return activeTargetLocked(owner, port, generation);
+}
+pub fn activeTargetLocked(owner: u32, port: abi.GfxOutputId, generation: u64) error{Stale}!abi.GfxOutputTarget {
+    if (epoch_exhausted or generation == 0) return error.Stale;
+    for (&catalog.entries) |*entry| if (entry.owner == owner and entry.receiver_source == 0 and
+        samePort(port, entry.info.identity) and !entry.paused and entry.info.flags & abi.gfx_output_flag_active != 0) {
+        const head = if (nativePort(owner, port)) |route| route.head else if (owner == 0 and entry.info.possible_heads == 1) @as(u32, 0) else return error.Stale;
+        return @import("output_target.zig").fromOutput(entry.info.identity, head, generation);
+    };
+    return error.Stale;
+}
+// The caller holds the output state owner, after the BO/queue mutex when
+// needed. Receiver validation and admission share this critical section.
+pub fn validateTargetLocked(owner: u32, target: abi.GfxOutputTarget) queue.Error!void {
+    if (epoch_exhausted or !@import("output_target.zig").valid(target)) return error.Stale;
+    const entry = catalog.find(.{ .adapter_id = target.adapter_id, .connector_id = target.connector_id,
+        .device_generation = target.device_generation, .connection_generation = target.connection_generation }) catch return error.Stale;
+    if (entry.owner != owner or entry.receiver_source != 0 or entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0 or
+        entry.info.possible_heads & (@as(u32, 1) << @intCast(target.head_id)) == 0) return error.Stale;
+    const route = nativePort(owner, entry.info.identity) orelse return error.Stale;
+    if (route.head != target.head_id) return error.Stale;
+}
+pub fn registeredHeadLocked(owner: u32, identity: abi.GfxOutputId, head: u32) Error!void {
+    const entry = try catalog.find(identity);
+    if (epoch_exhausted or entry.owner != owner or entry.receiver_source != 0 or head >= abi.gfx_output_max_assignments or
+        entry.info.possible_heads & (@as(u32, 1) << @intCast(head)) == 0) return error.Stale;
+    for (&native_ports) |*port| if (port.owner != 0 and port.identity.adapter_id == identity.adapter_id and !samePort(port.identity, identity)) {
+        if (port.head == head) return error.Busy;
+    };
+}
+pub fn validateAdditionalLocked(owner: u32, request: abi.GfxAdditionalOutput) Error!void {
+    try registeredHeadLocked(owner, request.output, request.head_id);
+    const entry = try catalog.find(request.output);
+    if (nativePort(owner, request.output) != null or !nativePresence(entry.info.flags, false)) return error.Stale;
+    // Registration is paused. A retained headless shadow may have the old
+    // receiver's geometry; activation still requires a published mode below.
+}
+pub fn validateAdditionalActivationLocked(owner: u32, identity: abi.GfxOutputId, head: u32, width: u32, height: u32) Error!void {
+    try registeredHeadLocked(owner, identity, head);
+    const entry = try catalog.find(identity);
+    if (!nativePresence(entry.info.flags, false)) return error.Stale;
+    for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.width == width and mode.height == height) return;
+    return error.Unsupported;
+}
+pub fn pauseAdditionalLocked(owner: u32, identity: abi.GfxOutputId, paused: bool) Error!bool {
+    return catalog.pause(owner, identity, paused, false);
+}
+pub fn currentIdentityLocked(owner: u32, identity: abi.GfxOutputId) ?abi.GfxOutputId {
+    for (&catalog.entries) |*entry| if (entry.owner == owner and entry.receiver_source == 0 and samePort(entry.info.identity, identity)) return entry.info.identity;
+    return null;
+}
+pub fn connectedLocked(owner: u32, identity: abi.GfxOutputId) bool {
+    const entry = catalog.find(identity) catch return false;
+    return entry.owner == owner and !entry.paused and entry.info.flags & abi.gfx_output_flag_connected != 0;
+}
+pub fn forgetNativePortLocked(owner: u32, identity: abi.GfxOutputId) void {
+    if (nativePort(owner, identity)) |route| route.* = .{};
 }
 fn nativePresence(flags: u32, held: bool) bool {
     // An authenticated held boot route may keep driving an unresponsive sink.
@@ -233,36 +299,35 @@ fn nativePresence(flags: u32, held: bool) bool {
 pub fn nativeActive(owner: u32, identity: abi.GfxOutputId, active: bool) void {
     const changed = blk: {
         const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (owner == 0 or epoch_exhausted) break :blk false;
-        if (active) {
-            var found: ?abi.GfxOutputId = null;
-            for (&catalog.entries) |*entry| if (entry.owner == owner and samePort(entry.info.identity, identity)) {
-                found = entry.info.identity;
-                break;
-            };
-            const selected = found orelse break :blk false;
-            native_owner = owner; native_port = selected;
-        } else {
-            if (native_owner != owner or !samePort(native_port, identity)) break :blk false;
-            native_owner = 0; native_port = .{};
-        }
-        // Recovery uses the original registration; receiver refresh may have
-        // advanced its connection generation while the physical route stayed.
         for (&catalog.entries) |*entry| {
             if (entry.owner != owner or !samePort(entry.info.identity, identity)) continue;
-            const was = entry.info.flags & abi.gfx_output_flag_active != 0;
-            const enabled = active and !entry.paused and nativePresence(entry.info.flags, true);
-            if (was == enabled) break :blk false;
-            if (catalog.revision == std.math.maxInt(u64)) { epoch_exhausted = true; break :blk false; }
-            if (enabled) entry.info.flags |= abi.gfx_output_flag_active |
-                (if (entry.info.limits.flags & abi.gfx_output_limit_modeset != 0) @as(u32, 0) else abi.gfx_output_flag_fixed_geometry) else
-                entry.info.flags &= ~(abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry);
-            catalog.revision += 1;
-            break :blk true;
+            const head = if (nativePort(owner, identity)) |port| port.head else if (@popCount(entry.info.possible_heads) == 1)
+                @as(u32, @ctz(entry.info.possible_heads)) else break :blk false;
+            break :blk setNativeActiveLocked(owner, entry.info.identity, head, active) catch false;
         }
         break :blk false;
     };
     if (changed) events.signal();
+}
+pub fn setNativeActiveLocked(owner: u32, identity: abi.GfxOutputId, head: u32, active: bool) Error!bool {
+    if (owner == 0 or epoch_exhausted) return error.Stale;
+    if (active) try registeredHeadLocked(owner, identity, head);
+    const entry = @constCast(try catalog.find(identity)); // Mutable catalog, held output state owner.
+    if (catalog.revision == std.math.maxInt(u64)) return error.Exhausted;
+    if (active) {
+        const port = nativePort(owner, identity) orelse for (&native_ports) |*candidate| {
+            if (candidate.owner == 0) break candidate;
+        } else return error.Capacity;
+        port.* = .{ .owner = owner, .identity = identity, .head = head };
+    } else if (nativePort(owner, identity)) |port| { port.* = .{}; }
+    const was = entry.info.flags & abi.gfx_output_flag_active != 0;
+    const enabled = active and !entry.paused and nativePresence(entry.info.flags, true);
+    if (enabled) entry.info.flags |= abi.gfx_output_flag_active |
+        (if (entry.info.limits.flags & abi.gfx_output_limit_modeset != 0) @as(u32, 0) else abi.gfx_output_flag_fixed_geometry) else
+        entry.info.flags &= ~(abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry);
+    if (was == enabled) return false;
+    catalog.revision += 1;
+    return true;
 }
 fn gather(owner: buffers.Owner, state: *const abi.GfxAtomicState, result: *[abi.gfx_output_max_assignments]model.Fact) Error!void {
     if (state.count == 0 or state.count > result.len) return error.Invalid;

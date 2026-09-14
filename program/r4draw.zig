@@ -216,6 +216,56 @@ pub fn displayPresentCompletion(fence: u64, out: *DisplayPresentCompletion) call
     return out.result;
 }
 
+pub fn displayOutputTarget(adapter_id: u32, head_id: u32, out: *@import("r4os_kernel_contract").GfxOutputTarget) callconv(.c) i32 {
+    const a = @import("r4os_kernel_contract");
+    if (@intFromPtr(out) == 0 or @intFromPtr(out) % @alignOf(a.GfxOutputTarget) != 0 or
+        out.version != 1 or out.size != @sizeOf(a.GfxOutputTarget)) return a.gfx_output_error_invalid;
+    const native = @import("../display/native_driver.zig");
+    const target = native.outputTarget(adapter_id, head_id) catch |err| return native.code(err);
+    out.* = target;
+    return a.gfx_output_ok;
+}
+pub fn displayOutputPresentationInfo(input: *const @import("r4os_kernel_contract").GfxOutputTarget,
+    out: *@import("r4os_kernel_contract").DisplayPresentationInfo) callconv(.c) i32
+{
+    const a = @import("r4os_kernel_contract");
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(a.GfxOutputTarget) != 0 or
+        !@import("gfx_buffer_api.zig").validOutput(a.DisplayPresentationInfo, out)) return a.gfx_output_error_invalid;
+    const target = input.*;
+    const additional = @import("../display/output_runtime.zig");
+    if (additional.contains(target)) {
+        const value = additional.info(target) catch |err| return @import("gfx_output_api.zig").code(err);
+        out.* = value; return a.gfx_output_ok;
+    }
+    const native = @import("../display/native_driver.zig");
+    const current = native.outputTarget(target.adapter_id, target.head_id) catch |err| return native.code(err);
+    if (!@import("../display/output_target.zig").same(current, target)) return a.gfx_output_error_stale;
+    const value = display.presentationInfo(target.head_id) catch |err| return @import("../display/presentation_stats.zig").code(err);
+    const after = native.outputTarget(target.adapter_id, target.head_id) catch |err| return native.code(err);
+    if (!@import("../display/output_target.zig").same(after, target) or value.display_generation != target.display_generation) return a.gfx_output_error_stale;
+    out.* = value; return a.gfx_output_ok;
+}
+pub fn displayOutputPresentationFeedback(input: *const @import("r4os_kernel_contract").GfxOutputTarget,
+    source: *const @import("r4os_kernel_contract").GfxFence, out: *@import("r4os_kernel_contract").DisplayPresentationStats) callconv(.c) i32
+{
+    const a = @import("r4os_kernel_contract");
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(a.GfxOutputTarget) != 0 or @intFromPtr(source) == 0 or
+        !@import("gfx_buffer_api.zig").validOutput(a.DisplayPresentationStats, out)) return a.gfx_output_error_invalid;
+    const target = input.*;
+    const fence = source.*;
+    const additional = @import("../display/output_runtime.zig");
+    const value = if (additional.contains(target))
+        additional.feedback(target, fence) catch |err| return @import("gfx_output_api.zig").code(err)
+    else blk: {
+        const native = @import("../display/native_driver.zig");
+        const current = native.outputTarget(target.adapter_id, target.head_id) catch |err| return native.code(err);
+        if (!@import("../display/output_target.zig").same(current, target)) return a.gfx_output_error_stale;
+        const sample = display.presentationFeedback(target.head_id, fence) catch |err| return @import("../display/presentation_stats.zig").code(err);
+        if (sample.display_generation != target.display_generation) return a.gfx_output_error_stale;
+        break :blk sample;
+    };
+    out.* = value; return a.gfx_output_ok;
+}
 pub fn displayPresentationStats(head_id: u32, out: *@import("r4os_kernel_contract").DisplayPresentationStats) callconv(.c) i32 {
     const a = @import("r4os_kernel_contract");
     if (@intFromPtr(out) == 0 or out.version != 1 or out.size < @sizeOf(a.DisplayPresentationStats)) return a.gfx_output_error_invalid;

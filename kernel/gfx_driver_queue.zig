@@ -62,6 +62,7 @@ pub fn take(id: u32, input: *const abi.GfxBackendBinding, output: *abi.GfxDriver
         .target_pitch = job.target_pitch,
         .render = job.render,
         .deadline_ns = job.deadline_ns,
+        .display_target = job.display_target,
     };
     wire.write(abi.GfxDriverJob, output, bytes, result);
     return abi.gfx_queue_ok;
@@ -76,6 +77,12 @@ pub fn complete(id: u32, input: *const abi.GfxFence, result: u32, quiesced: u32)
 pub fn readRenderList(id: u32, input: *const abi.GfxFence, output: *abi.GfxRenderList) i32 {
     if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxRenderList, output)) return abi.gfx_queue_error_invalid;
     const value = queue.nativeRenderList(id, api.fence(input.*)) catch |err| return api.errorCode(err);
+    output.* = value;
+    return abi.gfx_queue_ok;
+}
+pub fn readRenderGridList(id: u32, input: *const abi.GfxFence, output: *abi.GfxRenderGridList) i32 {
+    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxRenderGridList, output)) return abi.gfx_queue_error_invalid;
+    const value = queue.nativeRenderGridList(id, api.fence(input.*)) catch |err| return api.errorCode(err);
     output.* = value;
     return abi.gfx_queue_ok;
 }

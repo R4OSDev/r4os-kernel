@@ -3333,7 +3333,8 @@ fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i
     const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverDisplayApi));
     const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes, .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule), .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish), .prepare_held = @intFromPtr(&gfxDisplayPrepareHeld), .presentation_stats = @intFromPtr(&gfxDisplayPresentationStats),
         .cursor_configure = @intFromPtr(&gfxCursorConfigure), .cursor_take = @intFromPtr(&gfxCursorTake), .cursor_complete = @intFromPtr(&gfxCursorComplete),
-        .presentation_info = @intFromPtr(&gfxDisplayPresentationInfo) };
+        .presentation_info = @intFromPtr(&gfxDisplayPresentationInfo),
+        .output_register = @intFromPtr(&gfxDisplayOutputRegister), .output_transition = @intFromPtr(&gfxDisplayOutputTransition) };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_output_ok;
 }
@@ -3344,6 +3345,8 @@ fn gfxBootHold(input: *const outputs_contract.GfxBootHoldRequest, output: *outpu
 fn gfxDisplayPresentationStats(input: *const outputs_contract.DisplayPresentationStats) callconv(.c) i32 {
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
     if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(outputs_contract.DisplayPresentationStats)) return outputs_contract.gfx_output_error_invalid;
+    if (@import("../display/output_runtime.zig").publishStats(identity, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err))
+        return outputs_contract.gfx_output_ok;
     @import("../display/display.zig").publishPresentationStats(identity.id, identity.generation, input.*) catch |err|
         return @import("../display/presentation_stats.zig").code(err);
     return outputs_contract.gfx_output_ok;
@@ -3351,8 +3354,26 @@ fn gfxDisplayPresentationStats(input: *const outputs_contract.DisplayPresentatio
 fn gfxDisplayPresentationInfo(input: *const outputs_contract.DisplayPresentationInfo) callconv(.c) i32 {
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
     if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(outputs_contract.DisplayPresentationInfo)) return outputs_contract.gfx_output_error_invalid;
+    if (@import("../display/output_runtime.zig").publishInfo(identity, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err))
+        return outputs_contract.gfx_output_ok;
     @import("../display/display.zig").publishPresentationInfo(identity.id, identity.generation, input.*) catch |err|
         return @import("../display/presentation_stats.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxDisplayOutputRegister(input: *const outputs_contract.GfxAdditionalOutput, output: *outputs_contract.GfxOutputTarget) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxAdditionalOutput) != 0 or
+        !gfx_api.validOutput(outputs_contract.GfxOutputTarget, output) or output.size != @sizeOf(outputs_contract.GfxOutputTarget)) return outputs_contract.gfx_output_error_invalid;
+    const value = input.*;
+    const target = @import("../display/output_runtime.zig").register(identity, value) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+    output.* = target;
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxDisplayOutputTransition(input: *const outputs_contract.GfxOutputTarget, operation: u32, quiesced: u32) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputTarget) != 0) return outputs_contract.gfx_output_error_invalid;
+    const target = input.*;
+    @import("../display/output_runtime.zig").transition(identity, target, operation, quiesced) catch |err| return @import("../program/gfx_output_api.zig").code(err);
     return outputs_contract.gfx_output_ok;
 }
 fn gfxCursorConfigure(input: *const outputs_contract.DisplayCursorInfo) callconv(.c) i32 {
@@ -3510,6 +3531,7 @@ fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
         .register_profile = @intFromPtr(&gfxQueueRegisterProfile),
         .update_operations = @intFromPtr(&gfxQueueUpdateOperations),
         .read_render_list = @intFromPtr(&gfxQueueReadRenderList),
+        .read_render_grid_list = @intFromPtr(&gfxQueueReadRenderGridList),
         .retain_scanout = @intFromPtr(&gfxQueueRetainScanout),
         .begin_scanout = @intFromPtr(&gfxQueueBeginScanout),
         .scanout_retire_requested = @intFromPtr(&gfxQueueScanoutRetireRequested),
@@ -3533,6 +3555,9 @@ fn gfxQueueTake(input: *const outputs_contract.GfxBackendBinding, output: *outpu
 }
 fn gfxQueueReadRenderList(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderList) callconv(.c) i32 {
     return gfx_queue_api.readRenderList(activeOwner(), input, output);
+}
+fn gfxQueueReadRenderGridList(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderGridList) callconv(.c) i32 {
+    return gfx_queue_api.readRenderGridList(activeOwner(), input, output);
 }
 fn gfxQueueUpdateOperations(input: *const outputs_contract.GfxBackendBinding, operations: u64) callconv(.c) i32 {
     return gfx_queue_api.updateOperations(activeOwner(), input, operations);

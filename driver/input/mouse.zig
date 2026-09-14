@@ -55,6 +55,20 @@ var irq_count: u64 = 0;
 var bytes_received: u64 = 0;
 var usb_packets: u64 = 0;
 var poll_hook: ?PollHook = null;
+// One atomic word contains two independent modulo2^32 sums. Unlike the
+// legacy clamped coordinates and last-packet dx/dy, these preserve coalesced
+// motion across display edges. No task lock is acquired in an IRQ callback.
+var motion_totals: u64 = 0;
+fn addMotion(dx: i32, dy: i32) void {
+    var previous = @atomicLoad(u64, &motion_totals, .monotonic);
+    while (true) {
+        const x: u32 = @as(u32, @truncate(previous)) +% @as(u32, @bitCast(dx));
+        const y: u32 = @as(u32, @truncate(previous >> 32)) +% @as(u32, @bitCast(dy));
+        const next = @as(u64, x) | (@as(u64, y) << 32);
+        previous = @cmpxchgWeak(u64, &motion_totals, previous, next, .monotonic, .monotonic) orelse return;
+    }
+}
+pub fn motionTotals() u64 { return @atomicLoad(u64, &motion_totals, .monotonic); }
 
 var cursor_visible = false;
 var cursor_x: i32 = 0;
@@ -177,6 +191,7 @@ pub fn injectRelativePacketWheel(dx: i32, dy: i32, buttons: u8, wheel: i32) void
     const limit = currentLimits();
     state.dx = dx;
     state.dy = dy;
+    addMotion(dx, dy);
     state.wheel += wheel;
     state.x = clamp(state.x +| dx, 0, limit.x);
     state.y = clamp(state.y +| dy, 0, limit.y);
@@ -247,6 +262,7 @@ fn handlePacket(p: [PACKET_LEN]u8) void {
 
     state.dx = dx;
     state.dy = -dy;
+    addMotion(dx, -dy);
     state.x = clamp(state.x +| dx, 0, limit.x);
     state.y = clamp(state.y -| dy, 0, limit.y);
     const new_buttons = p[0] & 0x07;

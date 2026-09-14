@@ -17,7 +17,7 @@ const clock = @import("../platform/monotonic.zig");
 const timer = @import("../kernel/timer.zig");
 const events = @import("../kernel/desktop_events.zig");
 const irq = @import("../kernel/irq_router.zig");
-pub const Error = outputs.Error || display.TransitionError;
+pub const Error = native.Error;
 pub const code = native.code;
 var state: model.State = .{};
 var binding: native.ModeBinding = undefined;
@@ -76,7 +76,7 @@ fn submitImpl(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmat
     if (!automatic and outputs.nativePaused(@intCast(target.driver.id), input.assignments[0].output)) return error.Busy;
     if (automatic and !target.driver.eql(caller)) return error.Stale;
     const reference = try native.prepareMode(caller, input.assignments[0], mode);
-    errdefer native.abortPreparedMode();
+    errdefer native.abortPreparedMode(target);
     const accepted = try outputs.beginNative(caller, input);
     errdefer _ = outputs.finishNative(accepted.ticket, abi.gfx_mode_operation_apply, abi.gfx_output_outcome_old_preserved, 2) catch {};
     const result = blk: {
@@ -195,16 +195,18 @@ fn workerMain() callconv(.c) void {
         }
         const needs_lock = current.needsStart() or current.reply != null or
             (current.status.phase == abi.gfx_mode_phase_lost and (hidden_ticket != current.status.ticket or hidden_sequence != current.job.sequence));
-        if (needs_lock and !locked) {
+        if (needs_lock and binding.additional == null and !locked) {
             locked = display.beginOutputCommit();
             if (!locked) { _ = worker_event.waitResult(1); continue; }
         }
         if (current.needsStart()) {
-            @import("cursor_work.zig").beforeMode(binding.driver) catch |err| {
-                if (err == error.Busy) { _ = worker_event.waitResult(1); continue; }
-                rejected(@import("cursor_work.zig").code(err));
-                continue;
-            };
+            if (binding.additional == null) {
+                @import("cursor_work.zig").beforeMode(binding.driver) catch |err| {
+                    if (err == error.Busy) { _ = worker_event.waitResult(1); continue; }
+                    rejected(@import("cursor_work.zig").code(err));
+                    continue;
+                };
+            }
             native.startMode(current.job.operation, binding) catch |err| {
                 if (err == error.Busy) { _ = worker_event.waitResult(1); continue; }
                 rejected(code(err));
@@ -226,9 +228,9 @@ fn workerMain() callconv(.c) void {
             outputs.canFinishNative(.{ .id = receipt.ticket }, receipt.operation) catch {
                 outcome = abi.gfx_output_outcome_lost;
             };
-            native.settleMode(receipt.operation, outcome) catch |err| {
+            native.settleModeFor(receipt.operation, outcome, binding) catch |err| {
                 outcome = abi.gfx_output_outcome_lost;
-                native.settleMode(receipt.operation, outcome) catch {};
+                native.settleModeFor(receipt.operation, outcome, binding) catch {};
                 const token = ownership.enterState();
                 state.status.error_code = code(err);
                 ownership.leaveState(token);
@@ -243,7 +245,7 @@ fn workerMain() callconv(.c) void {
             continue;
         }
         if (current.status.phase == abi.gfx_mode_phase_lost and (hidden_ticket != current.status.ticket or hidden_sequence != current.job.sequence)) {
-            native.settleMode(current.job.operation, abi.gfx_output_outcome_lost) catch {};
+            native.settleModeFor(current.job.operation, abi.gfx_output_outcome_lost, binding) catch {};
             hidden_ticket = current.status.ticket;
             hidden_sequence = current.job.sequence;
             events.signal();

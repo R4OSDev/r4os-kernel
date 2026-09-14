@@ -2155,6 +2155,7 @@ pub const R4XStartYieldFn = generated.R4XStartYieldFn;
 pub const BootInfoSummary = generated.BootInfoSummary;
 pub const BootInfoMemoryEntry = generated.BootInfoMemoryEntry;
 pub const Mouse = generated.Mouse;
+pub const MouseMotion = generated.MouseMotion;
 pub const ProgramStatus = generated.ProgramStatus;
 pub const ProgramInstanceInfo = generated.ProgramInstanceInfo;
 pub const ThreadEntryFn = generated.ThreadEntryFn;

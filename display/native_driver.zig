@@ -17,7 +17,7 @@ const owner = @import("queue_resources.zig").display_owner;
 const timer = @import("../kernel/timer.zig");
 const monotonic = @import("../platform/monotonic.zig");
 const irq = @import("../kernel/irq_router.zig");
-const Error = outputs.Error || display.TransitionError;
+pub const Error = outputs.Error || display.TransitionError || @import("native_additional_mode.zig").Error;
 const Callback = *const fn (u64, u64, *const abi.GfxNativeBootInfo) callconv(.c) i32;
 const Bridge = struct {
     driver_owner: buffers.Owner = .{ .kind = .driver, .id = 0, .generation = 0 },
@@ -315,9 +315,28 @@ fn imageIdle() bool {
     bridge.image_pending = null;
     return true;
 }
+pub fn outputTarget(adapter: u32, head: u32) Error!abi.GfxOutputTarget {
+    if (try @import("output_runtime.zig").targetAt(adapter, head)) |target| return target;
+    if (!display.beginOutputCommit()) return error.Busy;
+    defer display.endOutputCommit();
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    const state = display.backendState();
+    const target = if (adapter == 0)
+        try outputs.activeTarget(0, .{ .connector_id = 1, .device_generation = 1 }, state.generation)
+    else blk: {
+        if (!bridge.ready or bridge.cancelled or bridge.hardware_restored or state.state != .software_native) return error.Unsupported;
+        try queue.validateOutputBinding(@intCast(bridge.driver_owner.id), bridge.registration.backend);
+        break :blk try outputs.activeTarget(@intCast(bridge.driver_owner.id), bridge.registration.output, bridge.generation);
+    };
+    if (target.adapter_id != adapter or target.head_id != head) return error.Unsupported;
+    return target;
+}
 pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model.Submission,
     request: @import("queue_resources.zig").Request) queue.Error!queue.model.Status
 {
+    const additional = @import("output_runtime.zig");
+    if (additional.contains(request.display_target)) return additional.submitImage(caller, timeline, submission, request);
     if (!display.beginOutputCommit()) return error.Busy;
     defer display.endOutputCommit();
     if (!execution.enter(0)) return error.Busy;
@@ -326,13 +345,18 @@ pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model
         display.backendState().state != .software_native) return error.Unsupported;
     if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
     if (outputs.nativePaused(@intCast(bridge.driver_owner.id), bridge.registration.output)) return error.Unavailable;
+    if (request.display_target.connector_id != 0) {
+        const current = try outputs.activeTarget(@intCast(bridge.driver_owner.id), bridge.registration.output, bridge.generation);
+        if (!@import("output_target.zig").same(current, request.display_target)) return error.Stale;
+    }
     try queue.validateOutputBinding(@intCast(bridge.driver_owner.id), bridge.registration.backend);
     const descriptor = blk: {
         buffers.lock(); defer buffers.unlock();
         break :blk try buffers.store.describe(request.source, caller);
     };
     if ((request.operation != .present and request.operation != .direct_present) or descriptor.width != bridge.frame.width or descriptor.height != bridge.frame.height or
-        descriptor.format != .xrgb8888 or descriptor.location != .device_local or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0)
+        descriptor.format != .xrgb8888 or (descriptor.location != .device_local and descriptor.location != .system) or
+        descriptor.plane_count != 1 or descriptor.planes[0].offset != 0)
         return error.Unsupported;
     const accepted = try queue.submitDisplayImage(caller, timeline, submission, request, binding(bridge.registration.backend));
     bridge.image_pending = accepted.fence;
@@ -404,7 +428,8 @@ fn discard() bool {
     return true;
 }
 
-pub const ModeBinding = struct { driver: buffers.Owner, backend: abi.GfxBackendBinding, generation: u64 };
+pub const ModeBinding = struct { driver: buffers.Owner, backend: abi.GfxBackendBinding, generation: u64,
+    additional: ?@import("native_additional_mode.zig").Binding = null };
 pub const CursorBinding = struct { driver: buffers.Owner, backend: abi.GfxBackendBinding, generation: u64,
     head: u32, timeline: u64 = 0, point: u64 = 0 };
 // Caller holds DisplayExecution. Taking this snapshot never waits for a GPU
@@ -441,9 +466,14 @@ pub fn modeBinding(assignment: abi.GfxScanoutState) Error!ModeBinding {
     if (!bridge.ready or !bridge.modes_enabled or bridge.cancelled or bridge.hardware_restored or
         display.backendState().state != .software_native) return error.Unsupported;
     if (assignment.output.adapter_id != bridge.registration.backend.adapter_id or
-        assignment.output.device_generation != bridge.registration.backend.device_generation or
-        assignment.output.connector_id != bridge.registration.output.connector_id) return error.Stale;
+        assignment.output.device_generation != bridge.registration.backend.device_generation) return error.Stale;
     try queue.validateOutputBinding(@intCast(bridge.driver_owner.id), bridge.registration.backend);
+    if (assignment.output.connector_id != bridge.registration.output.connector_id) {
+        const additional = try @import("output_runtime.zig").modeBinding(assignment);
+        if (!additional.driver.eql(bridge.driver_owner) or !std.meta.eql(additional.backend, bridge.registration.backend)) return error.Stale;
+        return .{ .driver = additional.driver, .backend = additional.backend,
+            .generation = additional.target.display_generation, .additional = additional };
+    }
     return .{ .driver = bridge.driver_owner, .backend = bridge.registration.backend, .generation = bridge.generation };
 }
 // DisplayExecution is held by the submitting task. Full references are
@@ -452,6 +482,8 @@ pub fn modeBinding(assignment: abi.GfxScanoutState) Error!ModeBinding {
 pub fn prepareMode(caller: buffers.Owner, assignment: abi.GfxScanoutState, mode: abi.GfxOutputMode) Error!abi.GfxBufferReference {
     if (!execution.enter(0)) return error.Busy;
     defer _ = execution.leave();
+    const selected = try modeBinding(assignment);
+    if (selected.additional) |additional| return @import("native_additional_mode.zig").prepare(caller, assignment, mode, additional);
     if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
     if (assignment.source_x != 0 or assignment.source_y != 0 or assignment.destination_x != 0 or assignment.destination_y != 0 or
         assignment.source_width != mode.width or assignment.source_height != mode.height or
@@ -487,6 +519,7 @@ pub fn prepareMode(caller: buffers.Owner, assignment: abi.GfxScanoutState, mode:
 pub fn startMode(operation: u32, expected: ModeBinding) Error!void {
     if (!execution.enter(0)) return error.Busy;
     defer _ = execution.leave();
+    if (expected.additional) |additional| return @import("native_additional_mode.zig").start(operation, additional);
     if (!bridge.driver_owner.eql(expected.driver) or bridge.generation != expected.generation or
         !std.meta.eql(bridge.registration.backend, expected.backend) or bridge.cancelled or bridge.hardware_restored) return error.Stale;
     const change = if (replacement) |*value| value else return error.Stale;
@@ -555,6 +588,10 @@ pub fn settleMode(operation: u32, outcome: u32) Error!void {
     } else return error.Invalid;
     replacement = null;
 }
-pub fn abortPreparedMode() void {
-    settleMode(abi.gfx_mode_operation_apply, abi.gfx_output_outcome_old_preserved) catch {};
+pub fn settleModeFor(operation: u32, outcome: u32, expected: ModeBinding) Error!void {
+    if (expected.additional != null) return @import("native_additional_mode.zig").settle(operation, outcome);
+    return settleMode(operation, outcome);
+}
+pub fn abortPreparedMode(expected: ModeBinding) void {
+    settleModeFor(abi.gfx_mode_operation_apply, abi.gfx_output_outcome_old_preserved, expected) catch {};
 }

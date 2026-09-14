@@ -2,6 +2,7 @@ test {
     const std = @import("std");
     const queue = @import("display/queue.zig");
     const abi = @import("r4os_kernel_contract");
+    try @import("display/output_runtime_check.zig").run();
     try std.testing.expectEqualDeep(abi.GfxBackendProfile{}, try queue.validatedProfile(.{}));
     var profile: abi.GfxBackendProfile = .{ .size = 104, .interface_id_hi = 0x100000017, .revision = 1, .data_bytes = 64, .data = @splat(0xa5) };
     const accepted = try queue.validatedProfile(profile);

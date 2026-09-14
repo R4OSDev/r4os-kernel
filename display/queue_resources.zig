@@ -7,7 +7,7 @@ const queue = @import("queue_state.zig");
 const abi = @import("r4os_kernel_contract");
 pub const owner = lifetime.Owner{ .kind = .kernel, .id = 2, .generation = 1 };
 pub const display_owner = lifetime.Owner{ .kind = .kernel, .id = 3, .generation = 1 };
-pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present, render_list, direct_present };
+pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present, render_list, direct_present, render_grid_list };
 pub const Request = struct {
     operation: Operation = .copy,
     source: lifetime.Handle = .{},
@@ -20,7 +20,9 @@ pub const Request = struct {
     target_pitch: u64 = 0,
     render: abi.GfxRenderCommand = .{},
     render_list: ?*const abi.GfxRenderList = null,
+    grid_list: ?*const abi.GfxRenderGridList = null,
     memory_binding: ?lifetime.layout.Binding = null,
+    display_target: abi.GfxOutputTarget = .{},
 };
 pub const Entry = struct {
     fence: queue.Fence = .{},
@@ -36,6 +38,7 @@ pub const Entry = struct {
     target_pitch: u64 = 0,
     render: abi.GfxRenderCommand = .{},
     deadline_ns: u64 = 0,
+    display_target: abi.GfxOutputTarget = .{},
 };
 pub const Error = lifetime.Error || queue.Error;
 
@@ -93,6 +96,7 @@ pub fn Resources(comptime capacity: usize) type {
         // Separate resident metadata avoids inflating the small Entry snapshots
         // used by workers and interrupt completion ingress.
         render_lists: [capacity]abi.GfxRenderList = @splat(.{}),
+        render_grids: [capacity][abi.gfx_render_list_capacity]abi.GfxSampleGrid = @splat(@splat(.{})),
 
         fn ordered(self: *Self, state: anytype, timeline: u64, dependencies: []const queue.Fence, object: lifetime.Handle, write: bool) Error!void {
             for (&self.entries) |prior| {
@@ -117,7 +121,7 @@ pub fn Resources(comptime capacity: usize) type {
             if (!sampled and (request.source.id != 0 or request.source.generation != 0 or draw.filter != 0 or draw.transfer != 0 or
                 !std.meta.eql(draw.source_rect, abi.GfxRenderRect{}))) return error.Invalid;
             if (sampled and draw.color != 0) return error.Invalid;
-            if (request.operation == .render_list) {
+            if (request.operation == .render_list or request.operation == .render_grid_list) {
                 const list = request.render_list orelse return error.Invalid;
                 if (list.version != 1 or list.size != @sizeOf(abi.GfxRenderList) or list.count == 0 or
                     list.count > abi.gfx_render_list_capacity or list.reserved0 != 0 or !std.meta.eql(list.commands[0], draw)) return error.Invalid;
@@ -154,6 +158,7 @@ pub fn Resources(comptime capacity: usize) type {
             std.debug.assert(self.entries[entry.fence.slot - 1].fence.slot == 0);
             self.entries[entry.fence.slot - 1] = entry;
             if (request.render_list) |list| self.render_lists[entry.fence.slot - 1] = list.*;
+            if (request.grid_list) |list| self.render_grids[entry.fence.slot - 1] = list.grids;
             return entry.fence;
         }
 
@@ -165,8 +170,35 @@ pub fn Resources(comptime capacity: usize) type {
             return self.render_lists[fence.slot - 1];
         }
 
+        pub fn renderGridList(self: *Self, state: anytype, fence: queue.Fence) Error!abi.GfxRenderGridList {
+            const status = try state.query(fence);
+            if (!status.device_active) return error.Invalid;
+            const entry = &self.entries[fence.slot - 1];
+            if (!std.meta.eql(entry.fence, fence) or entry.operation != .render_grid_list) return error.Invalid;
+            const list = &self.render_lists[fence.slot - 1];
+            return .{ .count = list.count, .commands = list.commands, .grids = self.render_grids[fence.slot - 1] };
+        }
+
         pub fn submit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
             const config = try state.configuration(timeline, producer);
+            if (request.operation == .render_grid_list) {
+                if (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0) return error.Invalid;
+                const grid = request.grid_list orelse return error.Invalid;
+                if (request.render_list != null or grid.version != 1 or grid.size != @sizeOf(abi.GfxRenderGridList) or
+                    grid.count == 0 or grid.count > abi.gfx_render_list_capacity or grid.reserved0 != 0) return error.Invalid;
+                for (grid.grids, 0..) |value, index| {
+                    if (index >= grid.count or value.enabled == 0) {
+                        if (!std.meta.eql(value, abi.GfxSampleGrid{})) return error.Invalid;
+                    } else if (value.enabled != 1 or value.reserved != 0 or value.rotation > 3 or
+                        value.scale < 60 or value.scale > 960 or value.pixel_width == 0 or value.pixel_height == 0 or
+                        value.viewport_width == 0 or value.viewport_height == 0 or value.guest_width == 0 or value.guest_height == 0 or
+                        grid.commands[index].kind != abi.gfx_render_kind_sample or grid.commands[index].filter != 0 or grid.commands[index].transfer != 0) return error.Invalid;
+                }
+                const list: abi.GfxRenderList = .{ .count = grid.count, .commands = grid.commands };
+                var copied = request; copied.render_list = &list;
+                return self.renderSubmit(state, buffers, timeline, producer, submission, copied, now);
+            }
+            if (request.grid_list != null) return error.Invalid;
             if (request.operation != .render_list and request.render_list != null) return error.Invalid;
             if (request.operation == .present or request.operation == .direct_present) return self.presentSubmit(state, buffers, timeline, producer, submission, request, now);
             const rows = request.operation == .copy_rows;
@@ -259,7 +291,7 @@ pub fn Resources(comptime capacity: usize) type {
             self.entries[fence.slot - 1] = .{ .fence = fence, .operation = request.operation, .uses = .{ use, null },
                 .bytes = std.math.mul(u64, request.bytes, request.row_count) catch unreachable,
                 .row_bytes = request.bytes, .row_count = request.row_count, .source_pitch = request.source_pitch,
-                .deadline_ns = submission.deadline_ns };
+                .deadline_ns = submission.deadline_ns, .display_target = request.display_target };
             return fence;
         }
 
@@ -422,6 +454,7 @@ test "queued dependencies reserve CPU ownership across producer death and physic
 test "native upload retains a single source beyond cancellation and producer reference release" {
     try checkImagePresentation(false);
     try checkImagePresentation(true);
+    try checkGridLifetime();
     const t = std.testing;
     const producer = display_owner;
     var buffers = lifetime.Table(2, 8, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
@@ -545,6 +578,47 @@ test "native upload retains a single source beyond cancellation and producer ref
     try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
 }
 
+fn checkGridLifetime() !void {
+    const t = std.testing;
+    const producer: lifetime.Owner = .{ .kind = .program, .id = 41, .generation = 2 };
+    const device: queue.Binding = .{ .adapter = 7, .device_generation = 3, .reset_generation = 2 };
+    var buffers = lifetime.Table(2, 4, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
+    var state = queue.Store(1, 2){}; var resources = Resources(2){};
+    var refs: [2]lifetime.Handle = undefined;
+    for (&refs, 0..) |*ref, i| {
+        const created = try buffers.begin(producer, .{ .bytes = 4096, .usage = 31, .format = .xrgb8888,
+            .width = 16, .height = 16, .plane_count = 1, .planes = .{ .{ .pitch = 64 }, .{}, .{}, .{} } });
+        try buffers.publish(created, .{ .cookie = i + 1, .bytes = 4096, .cpu_address = (i + 1) * 4096, .cache = .write_back });
+        ref.* = created.reference;
+    }
+    const timeline = try state.open(producer, .{ .binding = device, .milestone = .device_execution });
+    var list: abi.GfxRenderGridList = .{ .count = 1 };
+    list.commands[0] = .{ .kind = abi.gfx_render_kind_sample, .opacity = 255,
+        .source_rect = .{ .width = 16, .height = 16 }, .target_rect = .{ .width = 16, .height = 16 }, .scissor = .{ .width = 16, .height = 16 } };
+    list.grids[0] = .{ .enabled = 1, .rotation = 1, .scale = 180, .pixel_width = 16, .pixel_height = 16,
+        .viewport_width = 16, .viewport_height = 16, .guest_width = 16, .guest_height = 16 };
+    const request: Request = .{ .operation = .render_grid_list, .source = refs[0], .target = refs[1], .render = list.commands[0], .grid_list = &list };
+    list.grids[0].scale = 0;
+    try t.expectError(error.Invalid, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 1));
+    list.grids[0].scale = 180;
+    const expected = list;
+    const fence = try resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 1);
+    try t.expectError(error.Invalid, resources.renderGridList(&state, fence));
+    list.grids[0].scale = 240; list.commands[0].opacity = 0;
+    try t.expectEqualDeep(fence, state.takeReadyFor(device, 2).?);
+    try t.expectEqualDeep(expected, try resources.renderGridList(&state, fence));
+    try t.expectError(error.Invalid, resources.renderList(&state, fence));
+    try state.cancel(fence, producer, 3);
+    for (refs) |ref| try buffers.drop(ref, producer);
+    try t.expectError(error.Busy, state.complete(fence, .failed, false, 4));
+    try t.expect(buffers.pendingSystemRelease() == null and state.takeRelease() == null);
+    try state.complete(fence, .failed, true, 5);
+    const release = state.takeRelease().?;
+    try resources.release(&buffers, release); try state.released(release, true);
+    while (buffers.pendingSystemRelease()) |ticket| try buffers.finishRelease(ticket, true);
+    try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
+}
+
 fn checkImagePresentation(direct: bool) !void {
     const t = std.testing;
     const producer: lifetime.Owner = .{ .kind = .program, .id = 41, .generation = 2 };
@@ -562,12 +636,17 @@ fn checkImagePresentation(direct: bool) !void {
     const presenting = try state.open(producer, .{ .binding = device, .milestone = .device_execution });
     const writer = try resources.submit(&state, &buffers, rendering, producer, .{ .deadline_ns = 100 },
         .{ .operation = .render, .target = ref, .memory_binding = memory }, 1);
-    var request: Request = .{ .operation = if (direct) .direct_present else .present, .source = ref, .bytes = 64, .row_count = 16, .source_pitch = 64, .memory_binding = memory };
+    const display_target: abi.GfxOutputTarget = .{ .adapter_id = device.adapter, .device_generation = device.device_generation,
+        .connector_id = 2, .connection_generation = 4, .display_generation = 9, .head_id = 1 };
+    var request: Request = .{ .operation = if (direct) .direct_present else .present, .source = ref, .bytes = 64, .row_count = 16,
+        .source_pitch = 64, .memory_binding = memory, .display_target = display_target };
     request.target_pitch = 64;
     try t.expectError(error.Invalid, resources.submit(&state, &buffers, presenting, producer, .{ .deadline_ns = 100 }, request, 1));
     request.target_pitch = 0;
     try t.expectError(error.Busy, resources.submit(&state, &buffers, presenting, producer, .{ .deadline_ns = 100 }, request, 1));
     const reader = try resources.submit(&state, &buffers, presenting, producer, .{ .deadline_ns = 100, .dependencies = &.{writer} }, request, 1);
+    request.display_target.head_id = 3;
+    try t.expectEqualDeep(display_target, resources.entries[reader.slot - 1].display_target);
     const held = &resources.entries[reader.slot - 1];
     try t.expect(held.uses[1] == null and held.uses[0].?.range.bytes == 4096 and held.bytes == 1024 and held.row_bytes == 64);
     try buffers.drop(ref, producer); try buffers.drop(native.create.reference, driver);

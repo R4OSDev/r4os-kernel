@@ -52,6 +52,7 @@ const Backend = struct {
     profile: abi.GfxBackendProfile = .{},
     operations: u64 = 7,
     job_operations: u64 = 7,
+    target_jobs: bool = false,
     memory_generation: u64 = 0,
 };
 var backends: [16]Backend = .{Backend{}} ** 16;
@@ -94,7 +95,7 @@ pub fn validatedProfile(input: abi.GfxBackendProfile) Error!abi.GfxBackendProfil
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
-    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 255) != 0) return error.Invalid;
+    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 511) != 0) return error.Invalid;
     const profile = try validatedProfile(config.profile);
     buffers.lock();
     defer buffers.unlock();
@@ -142,10 +143,26 @@ pub fn nativeOperations(id: u32, binding: model.Binding) Error!u64 {
     return backend.operations;
 }
 fn nativeJobCapacity(backend: *const Backend) u32 {
-    return if (backend.job_operations & 208 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
+    return if (backend.target_jobs) 272 else if (backend.job_operations & 464 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
+}
+// Caller holds the BO/queue metadata mutex during output admission.
+pub fn requireOutputTargetsLocked(identity: buffers.Owner, binding: model.Binding, job_size: u32) Error!void {
+    if (job_size != @sizeOf(abi.GfxDriverJob)) return error.Invalid;
+    const backend = try backendLocked(binding);
+    if (!backend.owner.eql(identity)) return error.WrongOwner;
+    if (backend.closing) return error.DeviceLost;
+    if (backend.operations & (@as(u64, 1) << abi.gfx_queue_operation_present) == 0) return error.Unsupported;
+    backend.target_jobs = true;
+}
+pub fn outputBusyLocked(target: abi.GfxOutputTarget) bool {
+    for (&resources.entries) |*entry| if (entry.fence.slot != 0 and @import("output_target.zig").same(entry.display_target, target)) {
+        const status = state.query(entry.fence) catch continue;
+        if (status.phase != .terminal or status.device_active or status.resources_held) return true;
+    };
+    return false;
 }
 pub fn updateNativeOperations(id: u32, binding: model.Binding, operations: u64) Error!void {
-    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 255) != 0) return error.Invalid;
+    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 511) != 0) return error.Invalid;
     buffers.lock(); defer buffers.unlock();
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
@@ -214,6 +231,12 @@ pub fn nativeRenderList(id: u32, fence: model.Fence) Error!abi.GfxRenderList {
     defer buffers.unlock();
     _ = try jobBackendLocked(id, fence);
     return resources.renderList(&state, fence);
+}
+pub fn nativeRenderGridList(id: u32, fence: model.Fence) Error!abi.GfxRenderGridList {
+    if (irq.inDispatch()) return error.Unavailable;
+    buffers.lock(); defer buffers.unlock();
+    _ = try jobBackendLocked(id, fence);
+    return resources.renderGridList(&state, fence);
 }
 pub const RetainedResource = struct { reference: buffers.Handle, buffer: buffers.Handle };
 pub fn retainNative(identity: buffers.Owner, fence: model.Fence, which: u32) Error!RetainedResource {
@@ -452,9 +475,32 @@ fn submitImpl(owner: buffers.Owner, timeline: u64, request: model.Submission, tr
     const snapshot = blk: {
         buffers.lock();
         defer buffers.unlock();
+        break :blk try submitLocked(owner, timeline, request, transport, output_binding, instant);
+    };
+    worker_event.signal();
+    return snapshot;
+}
+// Additional outputs keep route validation, BO admission and their pending
+// fence in this same critical section; no callbacks or waits are performed.
+pub fn submitOutputLocked(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request, binding: model.Binding) Error!model.Status {
+    if (!started or irq.inDispatch()) return error.Unavailable;
+    if (transport.operation != .present and transport.operation != .direct_present or transport.display_target.connector_id == 0) return error.Invalid;
+    return submitLocked(owner, timeline, request, transport, binding, now());
+}
+pub fn queryLocked(fence: model.Fence) Error!model.Status { return state.query(fence); }
+fn submitLocked(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request, output_binding: ?model.Binding, instant: u64) Error!model.Status {
+        // BO/queue mutex precedes the short output state owner. Keep receiver
+        // validation and queue admission atomic without reversing that order.
+        const outputs_owner = @import("ownership.zig");
+        const output_token = if (transport.display_target.connector_id != 0) outputs_owner.enterState() else null;
+        defer if (output_token) |token| outputs_owner.leaveState(token);
         const config = try state.configuration(timeline, owner);
         if (output_binding) |binding| if (!std.meta.eql(binding, config.binding)) return error.Stale;
         const backend = if (config.binding.adapter == 0) null else try backendLocked(config.binding);
+        if (transport.display_target.connector_id != 0) {
+            const native = backend orelse return error.Unsupported;
+            try @import("outputs.zig").validateTargetLocked(@intCast(native.owner.id), transport.display_target);
+        }
         const operations = if (backend) |native| native.operations else @as(u64, 11);
         if (operations & (@as(u64, 1) << @intCast(@intFromEnum(transport.operation))) == 0) return error.Unsupported;
         if (transport.operation == .upload) {
@@ -470,10 +516,7 @@ fn submitImpl(owner: buffers.Owner, timeline: u64, request: model.Submission, tr
         completions[accepted.slot - 1] = sync.Event.init(false);
         releases[accepted.slot - 1] = sync.Event.init(false);
         buffers.visibility();
-        break :blk state.query(accepted) catch unreachable;
-    };
-    worker_event.signal();
-    return snapshot;
+        return state.query(accepted) catch unreachable;
 }
 pub fn query(fence: model.Fence) Error!model.Status {
     buffers.lock();

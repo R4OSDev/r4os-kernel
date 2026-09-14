@@ -7548,6 +7548,7 @@ fn configureR4XStartR4DeskTable() void {
         .read_key = &apiReadKey,
         .read_key_codepoint = &apiReadKeyCodepoint,
         .mouse_state = &r4api.r4desk.mouseState,
+        .mouse_motion = &r4api.r4desk.mouseMotion,
         .mouse_show = &r4api.r4desk.mouseShow,
         .mouse_hide = &r4api.r4desk.mouseHide,
         .keyboard_layout_current = &r4api.r4desk.keyboardLayoutCurrent,
@@ -7675,6 +7676,11 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_queue_close = &apiGfxQueueClose,
         .gfx_queue_submit = &apiGfxQueueSubmit,
         .gfx_queue_submit_render_list = &apiGfxQueueSubmitRenderList,
+        .gfx_queue_submit_render_grid_list = &apiGfxQueueSubmitRenderGridList,
+        .gfx_queue_submit_output = &apiGfxQueueSubmitOutput,
+        .display_output_target = &r4api.r4draw.displayOutputTarget,
+        .display_output_presentation_info = &r4api.r4draw.displayOutputPresentationInfo,
+        .display_output_presentation_feedback = &r4api.r4draw.displayOutputPresentationFeedback,
         .gfx_fence_query = &gfx_queue_api.query,
         .gfx_fence_wait = &gfx_queue_api.wait,
         .gfx_fence_cancel = &apiGfxFenceCancel,
@@ -16294,6 +16300,14 @@ fn apiGfxQueueSubmit(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *con
 fn apiGfxQueueSubmitRenderList(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *const gfx_queue_api.abi.GfxSubmission, list: *const gfx_queue_api.abi.GfxRenderList, output: *gfx_queue_api.abi.GfxFenceStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
     return gfx_queue_api.submitRenderList(graphicsOwner(owner), queue, input, list, output);
+}
+fn apiGfxQueueSubmitRenderGridList(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *const gfx_queue_api.abi.GfxSubmission, list: *const gfx_queue_api.abi.GfxRenderGridList, output: *gfx_queue_api.abi.GfxFenceStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
+    return gfx_queue_api.submitRenderGridList(graphicsOwner(owner), queue, input, list, output);
+}
+fn apiGfxQueueSubmitOutput(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *const gfx_queue_api.abi.GfxSubmission, target: *const gfx_queue_api.abi.GfxOutputTarget, output: *gfx_queue_api.abi.GfxFenceStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
+    return gfx_queue_api.submitOutput(graphicsOwner(owner), queue, input, target, output);
 }
 fn apiGfxFenceCancel(input: *const gfx_queue_api.abi.GfxFence) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
