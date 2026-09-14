@@ -3332,7 +3332,8 @@ fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i
     // prefix. Publish only complete slots within their actual capacity.
     const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverDisplayApi));
     const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes, .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule), .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish), .prepare_held = @intFromPtr(&gfxDisplayPrepareHeld), .presentation_stats = @intFromPtr(&gfxDisplayPresentationStats),
-        .cursor_configure = @intFromPtr(&gfxCursorConfigure), .cursor_take = @intFromPtr(&gfxCursorTake), .cursor_complete = @intFromPtr(&gfxCursorComplete) };
+        .cursor_configure = @intFromPtr(&gfxCursorConfigure), .cursor_take = @intFromPtr(&gfxCursorTake), .cursor_complete = @intFromPtr(&gfxCursorComplete),
+        .presentation_info = @intFromPtr(&gfxDisplayPresentationInfo) };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_output_ok;
 }
@@ -3344,6 +3345,13 @@ fn gfxDisplayPresentationStats(input: *const outputs_contract.DisplayPresentatio
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
     if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(outputs_contract.DisplayPresentationStats)) return outputs_contract.gfx_output_error_invalid;
     @import("../display/display.zig").publishPresentationStats(identity.id, identity.generation, input.*) catch |err|
+        return @import("../display/presentation_stats.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxDisplayPresentationInfo(input: *const outputs_contract.DisplayPresentationInfo) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(outputs_contract.DisplayPresentationInfo)) return outputs_contract.gfx_output_error_invalid;
+    @import("../display/display.zig").publishPresentationInfo(identity.id, identity.generation, input.*) catch |err|
         return @import("../display/presentation_stats.zig").code(err);
     return outputs_contract.gfx_output_ok;
 }
@@ -3502,6 +3510,9 @@ fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
         .register_profile = @intFromPtr(&gfxQueueRegisterProfile),
         .update_operations = @intFromPtr(&gfxQueueUpdateOperations),
         .read_render_list = @intFromPtr(&gfxQueueReadRenderList),
+        .retain_scanout = @intFromPtr(&gfxQueueRetainScanout),
+        .begin_scanout = @intFromPtr(&gfxQueueBeginScanout),
+        .scanout_retire_requested = @intFromPtr(&gfxQueueScanoutRetireRequested),
     };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_queue_ok;
@@ -3538,6 +3549,16 @@ fn gfxQueueSegment(input: *const outputs_contract.GfxFence, which: u32, offset: 
 fn gfxQueueRetain(input: *const outputs_contract.GfxFence, which: u32, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
     const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
     return gfx_queue_api.retain(identity, input, which, output);
+}
+fn gfxQueueRetainScanout(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_queue_api.retainScanout(identity, input, output);
+}
+fn gfxQueueBeginScanout(input: *const outputs_contract.GfxFence) callconv(.c) i32 {
+    return gfx_queue_api.beginScanout(activeOwner(), input);
+}
+fn gfxQueueScanoutRetireRequested(input: *const outputs_contract.GfxFence) callconv(.c) i32 {
+    return gfx_queue_api.scanoutRetireRequested(activeOwner(), input);
 }
 
 fn gfxBufferCreate(input: *const outputs_contract.GfxBufferDescriptor, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {

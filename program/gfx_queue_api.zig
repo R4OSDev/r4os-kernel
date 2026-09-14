@@ -110,7 +110,7 @@ fn submitCommon(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, inpu
     if (!call.admitted()) return abi.gfx_queue_error_busy;
     defer _ = task_context.leaveUnwind(call);
     const submitter: *const fn (buffers.Owner, u64, model.Submission, resource.Request) runtime.Error!model.Status =
-        if (operation == .present) @import("../display/native_driver.zig").submitImage else runtime.submit;
+        if (operation == .present or operation == .direct_present) @import("../display/native_driver.zig").submitImage else runtime.submit;
     const snapshot = submitter(owner, queue.timeline, .{
         .deadline_ns = value.deadline_ns,
         .frame_key = value.frame_key,

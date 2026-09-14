@@ -27,6 +27,7 @@ const Bridge = struct {
     timeline: u64 = 0,
     pending: ?queue.model.Fence = null,
     image_pending: ?queue.model.Fence = null,
+    image_direct: bool = false,
     last_present: ?queue.model.Fence = null,
     bytes: u64 = 0,
     frame: framebuffer.Framebuffer = undefined,
@@ -309,7 +310,7 @@ fn imageIdle() bool {
         bridge.image_pending = null;
         return true;
     };
-    if (status.phase != .terminal or status.device_active or status.resources_held) return false;
+    if (status.phase != .terminal or (!bridge.image_direct and (status.device_active or status.resources_held))) return false;
     if (status.result == .complete) bridge.last_present = fence;
     bridge.image_pending = null;
     return true;
@@ -330,11 +331,12 @@ pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model
         buffers.lock(); defer buffers.unlock();
         break :blk try buffers.store.describe(request.source, caller);
     };
-    if (request.operation != .present or descriptor.width != bridge.frame.width or descriptor.height != bridge.frame.height or
+    if ((request.operation != .present and request.operation != .direct_present) or descriptor.width != bridge.frame.width or descriptor.height != bridge.frame.height or
         descriptor.format != .xrgb8888 or descriptor.location != .device_local or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0)
         return error.Unsupported;
     const accepted = try queue.submitDisplayImage(caller, timeline, submission, request, binding(bridge.registration.backend));
     bridge.image_pending = accepted.fence;
+    bridge.image_direct = request.operation == .direct_present;
     return accepted;
 }
 fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {

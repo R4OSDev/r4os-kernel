@@ -223,6 +223,22 @@ pub fn displayPresentationStats(head_id: u32, out: *@import("r4os_kernel_contrac
     out.* = sample;
     return a.gfx_output_ok;
 }
+pub fn displayPresentationInfo(head_id: u32, out: *@import("r4os_kernel_contract").DisplayPresentationInfo) callconv(.c) i32 {
+    const a = @import("r4os_kernel_contract");
+    if (@intFromPtr(out) == 0 or out.version != 1 or out.size < @sizeOf(a.DisplayPresentationInfo)) return a.gfx_output_error_invalid;
+    const sample = display.presentationInfo(head_id) catch |err| return @import("../display/presentation_stats.zig").code(err);
+    out.* = sample;
+    return a.gfx_output_ok;
+}
+pub fn displayPresentationFeedback(head_id: u32, source: *const @import("r4os_kernel_contract").GfxFence,
+    out: *@import("r4os_kernel_contract").DisplayPresentationStats) callconv(.c) i32
+{
+    const a = @import("r4os_kernel_contract");
+    if (@intFromPtr(source) == 0 or @intFromPtr(out) == 0 or out.version != 1 or out.size < @sizeOf(a.DisplayPresentationStats)) return a.gfx_output_error_invalid;
+    const sample = display.presentationFeedback(head_id, source.*) catch |err| return @import("../display/presentation_stats.zig").code(err);
+    out.* = sample;
+    return a.gfx_output_ok;
+}
 
 fn fillPresentResult(result: presenter.PresentResult, out: *DisplayPresentResult) void {
     out.* = .{

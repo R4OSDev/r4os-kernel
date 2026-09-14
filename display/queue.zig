@@ -94,7 +94,7 @@ pub fn validatedProfile(input: abi.GfxBackendProfile) Error!abi.GfxBackendProfil
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
-    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 127) != 0) return error.Invalid;
+    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 255) != 0) return error.Invalid;
     const profile = try validatedProfile(config.profile);
     buffers.lock();
     defer buffers.unlock();
@@ -142,10 +142,10 @@ pub fn nativeOperations(id: u32, binding: model.Binding) Error!u64 {
     return backend.operations;
 }
 fn nativeJobCapacity(backend: *const Backend) u32 {
-    return if (backend.job_operations & 80 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
+    return if (backend.job_operations & 208 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
 }
 pub fn updateNativeOperations(id: u32, binding: model.Binding, operations: u64) Error!void {
-    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 127) != 0) return error.Invalid;
+    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 255) != 0) return error.Invalid;
     buffers.lock(); defer buffers.unlock();
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
@@ -240,6 +240,37 @@ pub fn completeNative(id: u32, fence: model.Fence, result: model.Result, quiesce
     // callbacks, page tables and destruction are processed by that worker.
     worker_event.signal();
 }
+pub fn retainNativeScanout(identity: buffers.Owner, fence: model.Fence) Error!RetainedResource {
+    if (irq.inDispatch()) return error.Invalid;
+    buffers.lock(); defer buffers.unlock();
+    try @import("../kernel/gfx_driver_memory.zig").admitLocked(identity);
+    const backend = try jobBackendLocked(@intCast(identity.id), fence);
+    if (!backend.owner.eql(identity)) return error.WrongOwner;
+    if (backend.closing) return error.DeviceLost;
+    const reference = try resources.retainScanout(&state, &buffers.store, fence, identity);
+    return .{ .reference = reference, .buffer = buffers.store.bufferFor(reference, identity) catch unreachable };
+}
+pub fn beginNativeScanout(id: u32, fence: model.Fence) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    const instant = now();
+    {
+        buffers.lock(); defer buffers.unlock();
+        _ = try jobBackendLocked(id, fence);
+        const entry = &resources.entries[fence.slot - 1];
+        if (!std.meta.eql(entry.fence, fence) or entry.operation != .direct_present) return error.Invalid;
+        try state.beginScanout(fence, instant);
+    }
+    // The existing IRQ mailbox remains armed for the final physical receipt.
+    worker_event.signal();
+}
+pub fn nativeScanoutRetireRequested(id: u32, fence: model.Fence) Error!bool {
+    if (irq.inDispatch()) return error.Invalid;
+    buffers.lock(); defer buffers.unlock();
+    _ = try jobBackendLocked(id, fence);
+    const entry = &resources.entries[fence.slot - 1];
+    if (!std.meta.eql(entry.fence, fence) or entry.operation != .direct_present) return error.Invalid;
+    return state.scanoutRetireRequested(fence);
+}
 fn loseLocked(backend: *Backend, quiesced: bool, instant: u64) void {
     backend.closing = true;
     const slot = (@intFromPtr(backend) - @intFromPtr(&backends)) / @sizeOf(Backend);
@@ -249,7 +280,7 @@ fn loseLocked(backend: *Backend, quiesced: bool, instant: u64) void {
     // Earlier reset generations also remain owned until a proven device stop.
     state.deviceLost(backend.binding, instant);
     if (quiesced) for (&state.jobs) |job| {
-        if (job.fence.slot != 0 and job.active and job.fence.binding.adapter == backend.binding.adapter and
+        if (job.fence.slot != 0 and (job.active or job.scanout) and job.fence.binding.adapter == backend.binding.adapter and
             job.fence.binding.device_generation == backend.binding.device_generation)
         {
             const flags = interrupts.saveAndDisableRuntime();
@@ -359,7 +390,9 @@ fn notifyNative() bool {
             const flags = interrupts.saveAndDisableRuntime();
             ready = wakeups.take(i);
             interrupts.restore(flags);
-            for (&state.jobs) |job| if (job.fence.slot != 0 and job.phase == .queued and std.meta.eql(job.fence.binding, backend.binding)) {
+            for (&state.jobs) |job| if (job.fence.slot != 0 and
+                (job.phase == .queued or (job.scanout and (job.retire_requested or !job.client_reference or state.queues[job.queue].closing))) and
+                std.meta.eql(job.fence.binding, backend.binding)) {
                 ready = true;
                 break;
             };
@@ -403,14 +436,14 @@ fn notifyDriver(index: usize) callconv(.c) i32 {
     return selected.notify.?(selected.context);
 }
 pub fn submit(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request) Error!model.Status {
-    if (transport.operation == .present) return error.Unsupported;
+    if (transport.operation == .present or transport.operation == .direct_present) return error.Unsupported;
     return submitImpl(owner, timeline, request, transport, null);
 }
 // Only the native display bridge calls this while holding DisplayExecution
 // and its own lifetime guard. Public queue submission cannot skip geometry,
 // active-output and concurrent-writer admission.
 pub fn submitDisplayImage(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request, binding: model.Binding) Error!model.Status {
-    if (transport.operation != .present) return error.Invalid;
+    if (transport.operation != .present and transport.operation != .direct_present) return error.Invalid;
     return submitImpl(owner, timeline, request, transport, binding);
 }
 fn submitImpl(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request, output_binding: ?model.Binding) Error!model.Status {

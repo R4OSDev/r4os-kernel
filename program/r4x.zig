@@ -7645,6 +7645,8 @@ fn configureR4XStartR4DrawTable() void {
         .display_present_capabilities = &r4api.r4draw.displayPresentCapabilities,
         .display_present_completion = &r4api.r4draw.displayPresentCompletion,
         .display_presentation_stats = &r4api.r4draw.displayPresentationStats,
+        .display_presentation_info = &r4api.r4draw.displayPresentationInfo,
+        .display_presentation_feedback = &r4api.r4draw.displayPresentationFeedback,
         .display_cursor_info = &@import("../display/cursor_work.zig").info,
         .display_cursor_submit = &apiDisplayCursorSubmit,
         .display_cursor_status = &@import("../display/cursor_work.zig").status,

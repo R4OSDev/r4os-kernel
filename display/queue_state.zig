@@ -65,6 +65,8 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
             frame_key: u64 = 0,
             client_reference: bool = true,
             active: bool = false,
+            scanout: bool = false,
+            retire_requested: bool = false,
             resources_held: bool = true,
             release_nonce: u64 = 0,
             notification_pending: bool = false,
@@ -143,7 +145,7 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
 
         pub fn query(self: *Self, fence: Fence) Error!Status {
             const job = &self.jobs[try self.fenceIndex(fence)];
-            return .{ .fence = job.fence, .phase = job.phase, .result = job.result, .milestone = self.queues[job.queue].config.milestone, .deadline_ns = job.deadline_ns, .completed_ns = job.completed_ns, .device_active = job.active, .resources_held = job.resources_held };
+            return .{ .fence = job.fence, .phase = job.phase, .result = job.result, .milestone = self.queues[job.queue].config.milestone, .deadline_ns = job.deadline_ns, .completed_ns = job.completed_ns, .device_active = job.active or job.scanout, .resources_held = job.resources_held };
         }
 
         pub fn configuration(self: *Self, timeline: u64, owner: Owner) Error!Config {
@@ -216,7 +218,7 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
                     const parent = self.jobs[dependency];
                     if (parent.phase != .terminal) blocked = true else if (parent.result != .complete) {
                         failed = true;
-                    } else if (parent.active) blocked = true;
+                    } else if (parent.active or parent.scanout) blocked = true;
                 }
                 if (failed) {
                     self.makeTerminal(slot, .dependency_failed, now);
@@ -238,18 +240,40 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
             const slot = try self.fenceIndex(fence);
             const job = &self.jobs[slot];
             if (job.phase == .queued) return error.Invalid;
-            if (!job.active) return error.AlreadyCompleted;
+            if (!job.active and !job.scanout) return error.AlreadyCompleted;
             if (!quiesced) return error.Busy;
             job.active = false;
+            job.scanout = false;
             self.queues[job.queue].inflight -= 1;
             // A late physical acknowledgement retires a cancelled/timed-out
             // operation, but cannot overwrite its already published result.
             if (job.phase != .terminal) self.makeTerminal(slot, result, now);
         }
 
+        /// Only the authenticated direct-image consumer calls this after
+        /// activation. Physical ownership remains with this exact fence,
+        /// while later work on other images may use the same timeline.
+        pub fn beginScanout(self: *Self, fence: Fence, now: u64) Error!void {
+            const slot = try self.fenceIndex(fence);
+            const job = &self.jobs[slot];
+            if (job.scanout) return;
+            if (!job.active or job.phase == .queued) return error.Invalid;
+            job.active = false; job.scanout = true;
+            if (job.phase != .terminal) self.makeTerminal(slot, .complete, now)
+            else job.retire_requested = true;
+        }
+
+        pub fn scanoutRetireRequested(self: *Self, fence: Fence) Error!bool {
+            const job = &self.jobs[try self.fenceIndex(fence)];
+            if (!job.active and !job.scanout) return error.AlreadyCompleted;
+            return job.retire_requested or !job.client_reference or self.queues[job.queue].closing or
+                (job.phase == .terminal and job.result != .complete);
+        }
+
         pub fn cancel(self: *Self, fence: Fence, owner: Owner, now: u64) Error!void {
             const slot = try self.fenceIndex(fence);
             if (!self.queues[self.jobs[slot].queue].owner.eql(owner)) return error.WrongOwner;
+            if (self.jobs[slot].scanout) { self.jobs[slot].retire_requested = true; return; }
             if (self.jobs[slot].phase == .terminal) return error.AlreadyCompleted;
             self.makeTerminal(slot, .cancelled, now);
         }
@@ -266,6 +290,7 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
             for (&self.jobs, 0..) |*job, index| {
                 if (job.fence.slot == 0 or job.queue != qi) continue;
                 job.client_reference = false;
+                if (job.scanout) job.retire_requested = true;
                 if (job.phase != .terminal) self.makeTerminal(index, .cancelled, now);
             }
             if (self.queues[qi].jobs == 0) self.queues[qi] = .{};
@@ -281,7 +306,10 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
             for (&self.queues, 0..) |*queue, qi| {
                 if (queue.timeline == 0 or !std.meta.eql(queue.config.binding, binding)) continue;
                 queue.closing = true;
-                for (&self.jobs, 0..) |job, slot| if (job.fence.slot != 0 and job.queue == qi and job.phase != .terminal) self.makeTerminal(slot, .device_lost, now);
+                for (&self.jobs, 0..) |*job, slot| if (job.fence.slot != 0 and job.queue == qi) {
+                    if (job.scanout) job.retire_requested = true;
+                    if (job.phase != .terminal) self.makeTerminal(slot, .device_lost, now);
+                };
                 if (queue.jobs == 0) queue.* = .{};
             }
         }
@@ -321,7 +349,7 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
         pub fn takeRelease(self: *Self) ?Release {
             if (self.release_serial == std.math.maxInt(u64)) return null;
             for (&self.jobs) |*job| {
-                if (job.fence.slot == 0 or job.phase != .terminal or job.active or !job.resources_held or job.release_nonce != 0) continue;
+                if (job.fence.slot == 0 or job.phase != .terminal or job.active or job.scanout or !job.resources_held or job.release_nonce != 0) continue;
                 self.release_serial += 1;
                 job.release_nonce = self.release_serial;
                 return .{ .fence = job.fence, .nonce = job.release_nonce };
@@ -416,6 +444,30 @@ test "running cancellation wakes once and keeps capacity and DMA until exact lat
     try state.drop(unplug, test_owner);
     try state.released(state.takeRelease().?, true);
     try testing.expectEqualDeep(unplug, state.reapOne().?);
+
+    var display = Store(1, 4){};
+    const display_queue = try display.open(test_owner, .{ .capacity = 3 });
+    const front = try display.submit(display_queue, test_owner, .{ .deadline_ns = 20 }, 10);
+    try testing.expectEqualDeep(front, display.takeReady(11).?);
+    try display.beginScanout(front, 12);
+    try display.beginScanout(front, 12); // Retrying the same activation is harmless.
+    display.expire(30); // A static visible image has no running render deadline.
+    try testing.expect((try display.query(front)).result == .complete and (try display.query(front)).device_active);
+    try testing.expect(display.takeRelease() == null and !try display.scanoutRetireRequested(front));
+    const next = try display.submit(display_queue, test_owner, .{ .deadline_ns = 100 }, 31);
+    try testing.expectEqualDeep(next, display.takeReady(32).?);
+    try display.cancel(front, test_owner, 33);
+    try testing.expect(try display.scanoutRetireRequested(front));
+    try testing.expectEqual(@as(u64, 12), (try display.query(front)).completed_ns);
+    try testing.expectError(error.Busy, display.complete(front, .complete, false, 34));
+    try display.complete(front, .complete, true, 35);
+    try testing.expectEqualDeep(front, display.takeRelease().?.fence);
+    try display.beginScanout(next, 36);
+    try display.close(display_queue, test_owner, 37);
+    try testing.expect(try display.scanoutRetireRequested(next));
+    try testing.expect(display.takeRelease() == null);
+    try display.complete(next, .complete, true, 38);
+    try testing.expectEqualDeep(next, display.takeRelease().?.fence);
 }
 
 test "latest frame replaces only queued work and cannot discard on allocation failure" {

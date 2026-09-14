@@ -365,6 +365,20 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             return reference;
         }
 
+        /// Direct presentation retains a read-only full reference so the
+        /// display owner can acquire its own real device-read lease. Its
+        /// presence excludes new writers until final DMA-context retirement.
+        pub fn retainScanout(self: *Self, handle: Handle, queue_owner: Owner, driver: Owner) Error!Handle {
+            const lease = try self.findLease(handle, queue_owner);
+            const object = try self.findObject(lease.buffer);
+            if (lease.access != .queue_read or object.descriptor.location != .device_local or
+                object.descriptor.usage & layout.Usage.scanout == 0) return error.Unsupported;
+            const reference = try self.retainQueued(handle, queue_owner, driver);
+            const retained = self.findReference(reference, driver) catch unreachable;
+            retained.mapping_only = false; retained.read_only = true;
+            return reference;
+        }
+
         // GPU/DMA/scanout leases need an engine/TLB completion or a proven
         // stop. A timeout, cancel request, or producer death is not that proof.
         pub fn endUse(self: *Self, handle: Handle, owner: Owner, device_quiesced: bool) Error!void {

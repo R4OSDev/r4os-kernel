@@ -713,6 +713,32 @@ pub fn presentationStats(head: u32) @import("presentation_stats.zig").Error!@imp
     defer ownership.leaveState(token);
     return presentation_statistics.read(head, completed_backend_state);
 }
+pub fn publishPresentationInfo(owner: usize, owner_generation: u64, value: @import("r4os_kernel_contract").DisplayPresentationInfo)
+    @import("presentation_stats.zig").Error!void
+{
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    try presentation_statistics.publishInfo(owner, owner_generation, value, completed_backend_state);
+}
+pub fn presentationInfo(head: u32) @import("presentation_stats.zig").Error!@import("r4os_kernel_contract").DisplayPresentationInfo {
+    const a = @import("r4os_kernel_contract");
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    if (presentation_statistics.readInfo(head, completed_backend_state)) |value| return value else |_| {}
+    const mode = completed_stats.mode;
+    if (head != 0 or mode.width == 0 or mode.height == 0) return error.Unsupported;
+    // The current CPU-copy path is always explicit. It has no scanout clock,
+    // visible receipt, plane import or hardware VSync claim.
+    return .{ .flags = if (completed_backend_state.state == .recovering) a.display_presentation_info_lost else
+            if (!completed_stats.registered or completed_stats.flags & DeviceFlags.visible == 0) a.display_presentation_info_occluded else a.display_presentation_info_active,
+        .display_generation = @max(1, completed_backend_state.generation), .sequence = 1,
+        .width = mode.width, .height = mode.height, .format = a.gfx_buffer_format_xrgb8888,
+        .policies = 7, .buffer_count = 2, .plane_count = 1 };
+}
+pub fn presentationFeedback(head: u32, source: @import("r4os_kernel_contract").GfxFence)
+    @import("presentation_stats.zig").Error!@import("r4os_kernel_contract").DisplayPresentationStats
+{
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return presentation_statistics.feedback(head, source, completed_backend_state);
+}
 
 fn publishStats() void {
     asm volatile ("sfence" ::: .{ .memory = true });

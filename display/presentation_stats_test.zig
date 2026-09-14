@@ -70,4 +70,52 @@ pub fn check() !void {
     value.display_generation = next.generation; value.sequence = 1; value.size += 8;
     try owner.publish(92, 18, value, next);
     try t.expectEqual(@as(u32, @sizeOf(a.DisplayPresentationStats)), (try owner.read(3, next)).size);
+    var info: a.DisplayPresentationInfo = .{ .flags = a.display_presentation_info_active | a.display_presentation_info_native |
+        a.display_presentation_info_synchronized | a.display_presentation_info_visibility,
+        .head_id = 3, .backend = binding, .display_generation = next.generation, .sequence = 1,
+        .width = 1920, .height = 1080, .format = a.gfx_buffer_format_xrgb8888, .policies = 3,
+        .buffer_count = 3, .plane_count = 1, .interval_ns = 16_666_666, .path = 1 };
+    try owner.publishInfo(92, 18, info, next);
+    try t.expectEqualDeep(info, try owner.readInfo(3, next));
+    try t.expectError(error.Stale, owner.publishInfo(92, 17, info, next));
+    var bad_info = info; bad_info.path = 2; bad_info.sequence += 1;
+    try t.expectError(error.Invalid, owner.publishInfo(92, 18, bad_info, next));
+    bad_info = info; bad_info.observed_ns = 100;
+    try t.expectError(error.Invalid, owner.publishInfo(92, 18, bad_info, next));
+    info.sequence += 1; info.observed_sequence = 5; info.observed_ns = 100;
+    try owner.publishInfo(92, 18, info, next);
+    bad_info = info; bad_info.sequence += 1; bad_info.observed_sequence = 4;
+    try t.expectError(error.Stale, owner.publishInfo(92, 18, bad_info, next));
+    try t.expectEqualDeep(info, try owner.readInfo(3, next));
+    try t.expectError(error.Unsupported, owner.readInfo(0, next));
+    var history: stats.Owner = .{};
+    try history.bind(92, 17, binding, active.generation);
+    var receipt: a.DisplayPresentationStats = .{ .flags = a.display_presentation_flag_available, .head_id = 3,
+        .backend = binding, .display_generation = active.generation, .buffer_count = 3, .source_timeline = 17,
+        .render_point = 1, .window_point = 1, .submitted_ns = 50 };
+    for (1..35) |i| {
+        receipt.sequence = i; receipt.acquired_count = i; receipt.rendered_count = i; receipt.submitted_count = i;
+        receipt.visible_count = i; receipt.released_count = i - 1; receipt.visible_sequence = i;
+        receipt.source_point = i; receipt.irq_sequence = i; receipt.irq_observed_ns = 90 + i; receipt.visible_ns = 100 + i;
+        try history.publish(92, 17, receipt, active);
+    }
+    var source: a.GfxFence = .{ .slot = 1, .timeline = 17, .point = 3, .adapter_id = binding.adapter_id,
+        .device_generation = binding.device_generation, .reset_generation = binding.reset_generation };
+    try t.expectEqual(@as(u64, 3), (try history.feedback(3, source, active)).source_point);
+    try t.expectEqual(@as(u64, 34), (try history.read(3, active)).source_point);
+    source.point = 1;
+    try t.expectError(error.Unsupported, history.feedback(3, source, active)); // Bounded eviction is explicit.
+    source.point = 34; source.reset_generation += 1;
+    try t.expectError(error.Stale, history.feedback(3, source, active));
+    // A direct source has no intervening CE copy point. Its real Window,
+    // head IRQ and exact queue identity remain mandatory visibility proof.
+    receipt.sequence = 35; receipt.acquired_count = 35; receipt.rendered_count = 35; receipt.submitted_count = 35;
+    receipt.visible_count = 35; receipt.released_count = 34; receipt.visible_sequence = 35;
+    receipt.source_point = 35; receipt.irq_sequence = 35; receipt.irq_observed_ns = 125; receipt.visible_ns = 135;
+    receipt.render_point = 0;
+    try t.expectError(error.Invalid, history.publish(92, 17, receipt, active));
+    receipt.flags |= a.display_presentation_flag_direct;
+    try history.publish(92, 17, receipt, active);
+    source.point = 35; source.reset_generation = binding.reset_generation;
+    try t.expectEqualDeep(receipt, try history.feedback(3, source, active));
 }

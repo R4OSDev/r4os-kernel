@@ -54,7 +54,7 @@ pub fn take(id: u32, input: *const abi.GfxBackendBinding, output: *abi.GfxDriver
         .operation = @intFromEnum(job.operation),
         .source_buffer = if (job.uses[0]) |use| memory_api.publicHandle(use.buffer) else .{},
         .target_buffer = if (job.uses[1]) |use| memory_api.publicHandle(use.buffer) else .{},
-        .byte_length = if (job.operation == .copy_rows or job.operation == .present) job.row_bytes else job.bytes,
+        .byte_length = if (job.operation == .copy_rows or job.operation == .present or job.operation == .direct_present) job.row_bytes else job.bytes,
         .source_offset = job.source_offset,
         .target_offset = job.target_offset,
         .row_count = job.row_count,
@@ -103,4 +103,23 @@ pub fn retain(identity: buffers.Owner, input: *const abi.GfxFence, which: u32, o
     // Pageable output is written after dropping the metadata owner.
     output.* = .{ .reference = memory_api.publicHandle(retained.reference), .buffer = memory_api.publicHandle(retained.buffer), .flags = abi.gfx_buffer_reference_mapping_only };
     return abi.gfx_queue_ok;
+}
+pub fn retainScanout(identity: buffers.Owner, input: *const abi.GfxFence, output: *abi.GfxBufferReference) i32 {
+    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxBufferReference, output)) return abi.gfx_queue_error_invalid;
+    const value = api.fence(input.*);
+    const call = @import("../sched/task_context.zig").enterUnwind();
+    if (!call.admitted()) return abi.gfx_queue_error_busy;
+    defer _ = @import("../sched/task_context.zig").leaveUnwind(call);
+    const retained = queue.retainNativeScanout(identity, value) catch |err| return api.errorCode(err);
+    output.* = .{ .reference = memory_api.publicHandle(retained.reference), .buffer = memory_api.publicHandle(retained.buffer), .flags = abi.gfx_buffer_reference_immutable };
+    return abi.gfx_queue_ok;
+}
+pub fn beginScanout(id: u32, input: *const abi.GfxFence) i32 {
+    if (@intFromPtr(input) == 0) return abi.gfx_queue_error_invalid;
+    queue.beginNativeScanout(id, api.fence(input.*)) catch |err| return api.errorCode(err);
+    return abi.gfx_queue_ok;
+}
+pub fn scanoutRetireRequested(id: u32, input: *const abi.GfxFence) i32 {
+    if (@intFromPtr(input) == 0) return abi.gfx_queue_error_invalid;
+    return @intFromBool(queue.nativeScanoutRetireRequested(id, api.fence(input.*)) catch |err| return api.errorCode(err));
 }
