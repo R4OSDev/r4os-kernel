@@ -16,6 +16,7 @@ const gfx_queue = @import("../display/queue.zig");
 const gfx_queue_api = @import("gfx_queue_api.zig");
 const gfx_allocation_api = @import("gfx_allocation_api.zig");
 const gfx_allocations = @import("../kernel/gfx_allocations.zig");
+const notifications = @import("notifications.zig");
 const gfx_output_api = @import("gfx_output_api.zig");
 const module_file = @import("../kernel/module_file.zig");
 const module_r4m = @import("../kernel/module_r4m.zig");
@@ -1013,6 +1014,7 @@ const ProgramInstanceStorage = struct {
 };
 
 const ProgramInstance = struct {
+    notifications: notifications.Owner = .{},
     used: bool = false,
     id: u32 = 0,
     task_id: u32 = 0,
@@ -6989,6 +6991,7 @@ fn finishCancelledProgramReservation(reservation: *const ProgramInstanceReservat
 }
 
 fn cleanupCancelledProgramResources(instance: *ProgramInstance) bool {
+    if (!notifications.cleanup(&instance.notifications)) return false;
     var resources = programResourcesFromInstance(instance);
     if (instance.runtime_payload) |runtime| {
         if (instance.process_payload) |process| {
@@ -7543,6 +7546,11 @@ fn configureR4XStartR4SysTable() void {
         .storage_unmount = &@import("../storage/operations.zig").unmount,
         .storage_use_begin = &r4api.r4sys.storageUseBegin,
         .storage_use_end = &@import("../storage/operations.zig").useEnd,
+        .notification_create = &apiNotificationCreate,
+        .notification_query = &apiNotificationQuery,
+        .notification_notify = &apiNotificationNotify,
+        .notification_wait = &apiNotificationWait,
+        .notification_close = &apiNotificationClose,
     });
 }
 
@@ -12123,6 +12131,27 @@ fn apiThreadCurrent() callconv(.c) u32 {
     return thread_ctx.id;
 }
 
+fn notificationOwner() ?*notifications.Owner {
+    const thread = currentProgramThread() orelse return null;
+    const instance = thread.owner_instance orelse return null;
+    return &instance.notifications;
+}
+fn apiNotificationCreate(output: *u64) callconv(.c) i32 {
+    return notifications.create(notificationOwner() orelse return r4x_api.notification_error_context, output);
+}
+fn apiNotificationQuery(handle: u64, output: *u64) callconv(.c) i32 {
+    return notifications.query(notificationOwner() orelse return r4x_api.notification_error_context, handle, output);
+}
+fn apiNotificationNotify(handle: u64, count: u32) callconv(.c) i32 {
+    return notifications.notify(notificationOwner() orelse return r4x_api.notification_error_context, handle, count);
+}
+fn apiNotificationWait(handle: u64, observed: u64, timeout_ticks: u64) callconv(.c) i32 {
+    return notifications.wait(notificationOwner() orelse return r4x_api.notification_error_context, handle, observed, timeout_ticks);
+}
+fn apiNotificationClose(handle: u64) callconv(.c) i32 {
+    return notifications.close(notificationOwner() orelse return r4x_api.notification_error_context, handle);
+}
+
 fn apiThreadStatus(thread_id: u32, out: *ProgramThreadInfo) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return THREAD_ERROR_INVALID;
     const current_instance = currentInstance() orelse return THREAD_ERROR_NO_INSTANCE;
@@ -12682,6 +12711,10 @@ fn normalizeThreadEntry(instance: *const ProgramInstance, entry: RawEntryFn) ?Ra
     if (base == 0 or size == 0) return null;
     const end = base +% size;
     if (end >= base and raw >= base and raw < end) return entry;
+    // A native library may own a worker entry. Its exact imported R4L
+    // generation remains pinned by this program until all threads retire.
+    // Only executable sections qualify; never translate a library offset.
+    if (instructionPointerInImportedLibrary(instance, raw)) return entry;
     if (raw < size) return @ptrFromInt(base + raw);
 
     const link_end = R4X_MODULE_LINK_BASE +% size;
@@ -18219,6 +18252,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                 reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Taskabbau");
                 terminateProgramThreadsForHandle(handle, -9, null);
                 if (!releaseThreadsForHandleReporting(handle, report_boot_foreground)) return deferProgramRetire(handle);
+                if (!notifications.cleanup(&slot.instance.notifications)) return deferProgramRetire(handle);
                 reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O-Abbau");
                 if (!purgeCancelledAsyncIoRequestsForHandle(handle)) return deferProgramRetire(handle);
                 if (!releaseFileRangeLocksForHandle(handle)) return deferProgramRetire(handle);
@@ -18562,6 +18596,10 @@ fn resolveR4SysStreamOwner() ?r4api.r4sys.StreamOwner {
 pub fn isPreemptibleInstructionPointer(rip: u64) bool {
     const instance = currentExecutionInstanceNoRegistry() orelse return false;
     if (instructionPointerInInstance(instance, rip)) return true;
+    return instructionPointerInImportedLibrary(instance, rip);
+}
+
+fn instructionPointerInImportedLibrary(instance: *const ProgramInstance, rip: u64) bool {
     const runtime = instance.runtime_payload orelse return false;
     const binding_count: usize = @min(@as(usize, runtime.r4l_code_binding_count), runtime.r4l_code_bindings.len);
     for (runtime.r4l_code_bindings[0..binding_count]) |binding| {

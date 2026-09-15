@@ -135,6 +135,19 @@ pub const WaitQueue = struct {
         return self.waitUnlessCritical(timeout_ticks, reason, still_needed, ctx, current_task, irq_flags);
     }
 
+    // Consume an already-held outer scheduler runtime owner. This variant
+    // preserves its original IF state, unlike releasing that outer owner
+    // from inside a second runtime acquisition. The caller has no other
+    // owner/preemption guard and must not restore irq_flags after this call.
+    pub fn waitUnlessRuntimeLocked(self: *WaitQueue, timeout_ticks: u64, reason: []const u8, still_needed: ?*const fn (*anyopaque) bool, ctx: ?*anyopaque, irq_flags: u64) WaitResult {
+        const current_task = scheduler.current() orelse {
+            interrupts.restore(irq_flags);
+            return .failed;
+        };
+        scheduler.preemptDisable();
+        return self.waitUnlessCritical(timeout_ticks, reason, still_needed, ctx, current_task, irq_flags);
+    }
+
     // Atomically transfers a caller-held owner lock into this wait queue.
     // The release callback runs after the queue IRQ/preemption critical
     // section has started but before the predicate and intrusive enrollment.
