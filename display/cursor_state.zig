@@ -27,6 +27,8 @@ pub const State = struct {
             input.max_height == 0 or input.max_height > 256 or input.min_x > 0 or input.min_y > 0 or input.max_x <= 0 or input.max_y <= 0)) return error.Invalid;
         if (input.flags == 0 and (self.job != null or self.actor != null or self.visible() or self.lost())) return error.Busy;
         if (self.info.flags != 0 and input.flags != 0 and !std.meta.eql(self.info, input)) return error.Stale;
+        if (self.info.display_generation == 0)
+            self.status = .{ .sequence = self.status.sequence, .completed = self.status.completed };
         self.info = input; self.info.size = @sizeOf(a.DisplayCursorInfo); self.driver = driver;
         self.status.display_generation = input.display_generation; self.status.head_id = input.head_id;
     }
@@ -160,5 +162,16 @@ pub const State = struct {
     pub fn markLost(self: *State, code: i32) void {
         self.status.phase = a.display_cursor_phase_lost; self.status.error_code = code;
         self.status.flags |= a.display_cursor_state_unknown; self.status.deadline_ns = 0;
+    }
+    // The caller has released the source after a proven backend stop. Keep
+    // the sequence monotonic and reject every receipt from the old display.
+    pub fn retireAfterReset(self: *State, driver: Identity, backend: a.GfxBackendBinding) Error!void {
+        if (self.info.display_generation == 0) return;
+        if (!self.driver.eql(driver) or !std.meta.eql(self.info.backend, backend)) return error.Stale;
+        self.markLost(a.gfx_output_error_unavailable);
+        self.status.flags = 0;
+        self.info = .{};
+        self.job = null; self.reply = null; self.actor = null;
+        self.taken = false; self.closing = false; self.suspended = false;
     }
 };

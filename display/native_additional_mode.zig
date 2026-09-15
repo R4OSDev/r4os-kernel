@@ -159,3 +159,25 @@ pub fn retire(driver: buffers.Owner, target: abi.GfxOutputTarget) Error!void {
         return;
     };
 }
+
+// Called under common mode admission after the exact backend stopped. No
+// surface is selected and no mode acknowledgement is fabricated here.
+pub fn retireAfterReset(driver: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    if (change) |*value| {
+        if (value.binding.driver.eql(driver) and std.meta.eql(value.binding.backend, backend)) {
+            // The resident aliases one of these two owned surfaces. Remove
+            // that alias before a potentially partial, retryable release.
+            residents[value.index] = null;
+            try releaseSurface(driver, &value.old);
+            try releaseSurface(driver, &value.new);
+            change = null;
+        }
+    }
+    for (&residents) |*slot| if (slot.*) |*value| {
+        if (!value.binding.driver.eql(driver) or !std.meta.eql(value.binding.backend, backend)) continue;
+        try releaseSurface(driver, &value.surface);
+        slot.* = null;
+    };
+}

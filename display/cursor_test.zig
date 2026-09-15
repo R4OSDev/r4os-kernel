@@ -62,6 +62,20 @@ pub fn check() !void {
     reply.sequence = release.sequence; reply.visibility = a.display_cursor_visibility_hidden;
     try t.expect(try state.validateReply(driver, reply)); state.finish(reply);
     try t.expect(state.actor == null and !state.visible() and state.status.image_sequence == 0);
+    var next_info = info;
+    next_info.display_generation += 1;
+    next_info.backend.device_generation += 1;
+    try t.expectError(error.Stale, state.retireAfterReset(driver, next_info.backend));
+    try t.expectError(error.Stale, state.retireAfterReset(foreign, info.backend));
+    state.markLost(a.gfx_output_error_timeout);
+    const serial = state.status.sequence;
+    try state.retireAfterReset(driver, info.backend);
+    try t.expect(state.lost() and !state.available() and state.info.display_generation == 0 and state.job == null);
+    try t.expectError(error.Stale, state.validateReply(driver, reply));
+    try state.configure(driver, next_info);
+    try t.expect(state.available() and state.status.sequence == serial and state.status.display_generation == next_info.display_generation);
+    try t.expectError(error.Stale, state.retireAfterReset(driver, info.backend));
+    try t.expectError(error.Stale, state.validateReply(driver, reply));
     try checkSource(caller, driver);
 }
 fn checkSource(caller: memory.Owner, driver: memory.Owner) !void {

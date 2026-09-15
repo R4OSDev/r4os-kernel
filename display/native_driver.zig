@@ -62,6 +62,14 @@ var replacement: ?Replacement = null;
 // owner across the queue completion or the actual driver callback.
 var execution = @import("../sched/sync.zig").UnwindGuard.init("native-display-driver");
 var retained_owner: u32 = 0;
+const ResetRecord = struct {
+    driver: buffers.Owner,
+    backend: abi.GfxBackendBinding,
+    original_generation: u64,
+    generation: u64,
+    retired: bool = false,
+};
+var reset_record: ?ResetRecord = null;
 
 fn binding(value: abi.GfxBackendBinding) queue.model.Binding {
     return .{ .adapter = value.adapter_id, .device_generation = value.device_generation, .reset_generation = value.reset_generation };
@@ -116,26 +124,38 @@ pub fn validAdapter(adapter: u32) bool {
     return false;
 }
 pub fn prepare(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, output: *abi.GfxNativeState) i32 {
-    return prepareRequest(identity, input, 0, output);
+    return prepareRequest(identity, input, 0, 0, output);
 }
 pub fn prepareHeld(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, generation: u64, output: *abi.GfxNativeState) i32 {
     if (generation == 0) return abi.gfx_output_error_stale;
-    return prepareRequest(identity, input, generation, output);
+    return prepareRequest(identity, input, generation, 0, output);
 }
-fn prepareRequest(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, held_generation: u64, output: *abi.GfxNativeState) i32 {
+pub fn prepareReset(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, held_generation: u64, generation: u64, output: *abi.GfxNativeState) i32 {
+    if (generation == 0) return abi.gfx_output_error_stale;
+    return prepareRequest(identity, input, held_generation, generation, output);
+}
+fn prepareRequest(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, held_generation: u64, reset_generation: u64, output: *abi.GfxNativeState) i32 {
     if (@intFromPtr(input) == 0 or irq.inDispatch() or input.version != 1 or input.size < @sizeOf(abi.GfxNativeRegistration) or
         !buffer_api.validOutput(abi.GfxNativeState, output)) return abi.gfx_output_error_invalid;
     if (!execution.enter(0)) return abi.gfx_output_error_busy;
     defer _ = execution.leave();
-    const result = prepareImpl(identity, input.*, held_generation) catch |err| {
+    if (reset_generation != 0) {
+        const reset = reset_record orelse return abi.gfx_output_error_stale;
+        if (!reset.driver.eql(identity) or reset.generation != reset_generation or
+            input.backend.adapter_id != reset.backend.adapter_id or input.backend.device_generation <= reset.backend.device_generation)
+            return abi.gfx_output_error_stale;
+        if (!reset.retired) return abi.gfx_output_error_busy;
+    } else if (reset_record != null) return abi.gfx_output_error_busy;
+    const result = prepareImpl(identity, input.*, held_generation, reset_generation) catch |err| {
         if (bridge.driver_owner.eql(identity) and !bridge.ready)
             output.* = stateResult(@intCast(identity.id), abi.gfx_output_outcome_lost);
         return code(err);
     };
+    if (reset_generation != 0) reset_record = null;
     output.* = result;
     return abi.gfx_output_ok;
 }
-fn prepareImpl(identity: buffers.Owner, request: abi.GfxNativeRegistration, held_generation: u64) Error!abi.GfxNativeState {
+fn prepareImpl(identity: buffers.Owner, request: abi.GfxNativeRegistration, held_generation: u64, reset_generation: u64) Error!abi.GfxNativeState {
     if (identity.kind != .driver or !identity.valid() or bridge.driver_owner.id != 0) return error.Busy;
     if (request.version != 1 or request.size < @sizeOf(abi.GfxNativeRegistration) or request.reference.reserved0 != 0 or
         request.commit_callback < 0xffff800000000000 or request.restore_callback < 0xffff800000000000 or
@@ -177,7 +197,8 @@ fn prepareImpl(identity: buffers.Owner, request: abi.GfxNativeRegistration, held
             .mapping = .{ .kind = .native_scanout, .virt_base = prepared.address, .byte_len = bridge.bytes }, .framebuffer = &bridge.frame },
         .context = @intFromPtr(&bridge), .commit = commit, .restore = restore,
         .begin_cpu = beginCpu, .end_cpu = endCpu };
-    bridge.generation = if (held_generation != 0) try display.prepareHeldNative(candidate, held_generation) else try display.prepareNative(candidate);
+    bridge.generation = if (reset_generation != 0) try display.prepareRecoveredNative(candidate, held_generation, reset_generation)
+        else if (held_generation != 0) try display.prepareHeldNative(candidate, held_generation) else try display.prepareNative(candidate);
     bridge.timeline = try queue.open(owner, .{ .binding = binding(request.backend), .milestone = .device_execution, .capacity = 1 });
     try queue.bindDisplayQueue(@intCast(identity.id), binding(request.backend), bridge.timeline);
     try display.bindPresentationStats(identity.id, identity.generation, request.backend, bridge.generation);
@@ -216,10 +237,12 @@ pub fn transition(id: u32, generation: u64, operation: u32, output: *abi.GfxNati
             break :blk if (discard()) abi.gfx_output_outcome_old_preserved else abi.gfx_output_outcome_lost;
         },
         2 => blk: {
+            if (reset_record) |reset| if (!reset.retired) return abi.gfx_output_error_busy;
             display.restoreBootBackend(id, generation) catch |err| {
                 if (err != error.RestoreFailed) return code(err);
                 break :blk abi.gfx_output_outcome_lost;
             };
+            reset_record = null;
             break :blk abi.gfx_output_outcome_applied;
         },
         else => unreachable,
@@ -605,4 +628,94 @@ pub fn settleModeFor(operation: u32, outcome: u32, expected: ModeBinding) Error!
 }
 pub fn abortPreparedMode(expected: ModeBinding) void {
     settleModeFor(abi.gfx_mode_operation_apply, abi.gfx_output_outcome_old_preserved, expected) catch {};
+}
+
+// DisplayExecution and common mode admission exclude writers and receipts.
+// Only the reset bridge may call this after proven quiescence of backend.
+pub fn retireModeAfterReset(identity: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
+    if (!execution.enter(0)) return error.Busy;
+    defer _ = execution.leave();
+    if (bridge.driver_owner.id != 0) {
+        if (!bridge.driver_owner.eql(identity) or !std.meta.eql(bridge.registration.backend, backend)) return error.Stale;
+        if (bridge.cpu_lease.id != 0) {
+            buffers.lock(); defer buffers.unlock();
+            try buffers.unmapCpuLocked(bridge.cpu_lease, owner);
+            bridge.cpu_lease = .{};
+        }
+        if (bridge.pending) |fence| {
+            try requireQuiescedFence(fence);
+            queue.drop(owner, fence) catch |err| { if (err != error.Stale) return err; };
+            bridge.pending = null;
+        }
+        if (bridge.image_pending) |fence| {
+            try requireQuiescedFence(fence);
+            bridge.image_pending = null;
+        }
+        bridge.modes_enabled = false;
+        bridge.cancelled = true;
+        if (replacement) |*change| {
+            // The bridge aliases the selected surface; the replacement owns
+            // both references until retirement has completed, including retry.
+            bridge.reference = .{};
+            bridge.driver_reference = .{};
+            try releaseSurface(&change.old);
+            try releaseSurface(&change.new);
+            replacement = null;
+        }
+    }
+    try @import("native_additional_mode.zig").retireAfterReset(identity, backend);
+}
+
+fn requireQuiescedFence(fence: queue.model.Fence) Error!void {
+    const status = queue.query(fence) catch |err| {
+        // Collection can retire only a terminal, physically released fence.
+        if (err == error.Stale) return;
+        return err;
+    };
+    if (status.phase != .terminal or status.device_active or status.resources_held) return error.Busy;
+}
+
+pub fn deviceReset(identity: buffers.Owner, input: *const abi.GfxBackendBinding, generation: u64, quiesced: u32, output: *abi.GfxNativeState) i32 {
+    if (@intFromPtr(input) == 0 or irq.inDispatch() or !buffer_api.validOutput(abi.GfxNativeState, output) or quiesced > 1 or
+        input.version != 1 or input.size < @sizeOf(abi.GfxBackendBinding) or generation == 0 or
+        !identity.valid() or identity.kind != .driver or !validAdapter(input.adapter_id) or
+        input.milestone != abi.gfx_queue_milestone_device_execution or (input.device_generation == 0) != (input.reset_generation == 0))
+        return abi.gfx_output_error_invalid;
+    if (!execution.enter(0)) return abi.gfx_output_error_busy;
+    defer _ = execution.leave();
+    if (reset_record == null) {
+        if (quiesced != 0) return abi.gfx_output_error_stale;
+        const current = display.backendState();
+        if (current.state == .preparing) {
+            if (current.pending_owner != identity.id or current.pending_generation != generation or current.pending_adapter_id != input.adapter_id)
+                return abi.gfx_output_error_stale;
+        } else if (current.owner != identity.id or current.generation != generation or current.adapter_id != input.adapter_id)
+            return abi.gfx_output_error_stale;
+        if (bridge.driver_owner.id != 0 and (!bridge.driver_owner.eql(identity) or
+            !std.meta.eql(bridge.registration.backend, input.*) or (bridge.generation != generation and
+                !(current.state == .unavailable and current.reason == .restore_failed and bridge.generation < generation)))) return abi.gfx_output_error_stale;
+        @import("mode_work.zig").stoppedDriver(@intCast(identity.id));
+        @import("cursor_work.zig").stoppedDriver(@intCast(identity.id));
+        @import("output_runtime.zig").stoppedDriver(@intCast(identity.id));
+        const next = display.beginDeviceReset(identity.id, generation, input.adapter_id) catch |err| return code(err);
+        bridge.cancelled = true;
+        reset_record = .{ .driver = identity, .backend = input.*, .original_generation = generation, .generation = next };
+    }
+    const reset = &reset_record.?;
+    if (!reset.driver.eql(identity) or !std.meta.eql(reset.backend, input.*) or
+        generation != (if (quiesced == 0) reset.original_generation else reset.generation)) return abi.gfx_output_error_stale;
+    if (quiesced == 1 and !reset.retired) {
+        if (input.device_generation != 0) queue.unregisterNative(@intCast(identity.id), binding(input.*), true) catch |err| {
+            if (err != error.Stale) return code(err);
+        };
+        @import("mode_work.zig").retireAfterReset(identity, input.*) catch |err| return code(err);
+        @import("cursor_work.zig").retireAfterReset(identity, input.*) catch |err| return @import("cursor_work.zig").code(err);
+        @import("output_runtime.zig").retireAfterReset(identity, input.*) catch |err| return code(err);
+        display.retireDeviceReset(identity.id, reset.generation) catch |err| return code(err);
+        if (!discard()) return abi.gfx_output_error_busy;
+        reset.retired = true;
+    }
+    output.* = .{ .generation = reset.generation, .state = @intFromEnum(display.backendState().state),
+        .outcome = abi.gfx_output_outcome_lost, .retained = 1 };
+    return abi.gfx_output_ok;
 }

@@ -53,6 +53,7 @@ test "CPU backing release failure remains visible to the exact driver epoch with
     try deviceBudgetLifetime();
     try ownedBackingLifetime(false);
     try ownedBackingLifetime(true);
+    try resetBackingLifetime();
     const t = std.testing;
     var store = Table(2, 2, 2){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
     const owner: Owner = .{ .kind = .driver, .id = 8, .generation = 7 };
@@ -245,6 +246,57 @@ fn ownedBackingLifetime(native_layout: bool) !void {
     try t.expectEqual(@as(u64, 0), store.stats().bytes);
 }
 
+fn resetBackingLifetime() !void {
+    const t = std.testing;
+    var store = Table(8, 12, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
+    const driver: Owner = .{ .kind = .driver, .id = 7, .generation = 3 };
+    const app: Owner = .{ .kind = .program, .id = 8, .generation = 4 };
+    const binding: layout.Binding = .{ .adapter = 2, .driver_owner = 7, .device_generation = 9 };
+    try store.setDeviceBudget(driver, binding, 8192);
+    const cpu = try store.begin(app, .{ .bytes = 4096 });
+    try store.publish(cpu, .{ .cookie = 55, .bytes = 4096 });
+    const native = try store.beginOwned(driver, .{ .bytes = 4096, .location = .device_local, .binding = binding, .usage = 12 }, 77);
+    try store.commitOwned(native, driver);
+    const imported = try store.share(native.create.reference, app);
+    const device = try store.use(native.create.reference, driver, .device_write, 0, 4096);
+    try t.expectError(error.WrongOwner, store.loseDevice(.{ .kind = .driver, .id = 9, .generation = 3 }, binding, true));
+    try store.loseDevice(driver, binding, false);
+    try t.expectError(error.Closed, store.describe(imported, app));
+    try t.expectError(error.Closed, store.share(imported, app));
+    try t.expectError(error.Closed, store.use(imported, app, .device_write, 0, 4096));
+    try t.expectEqual(@as(u64, 4096), (try store.describe(cpu.reference, app)).bytes);
+    try t.expect((try store.deviceBudget(driver, binding)).closing);
+    var next = binding; next.device_generation += 1;
+    try t.expectError(error.Busy, store.setDeviceBudget(driver, next, 8192));
+    try t.expectError(error.Busy, store.endUse(device.lease, driver, false));
+    try t.expect((try store.takeOwnedRelease(driver, binding)) == null);
+    try store.loseDevice(driver, binding, true);
+    try t.expect((try store.takeOwnedRelease(driver, binding)) == null); // actual DMA owner still holds its lease
+    _ = try store.useInfo(device.lease, driver); // cleanup remains possible
+    try store.endUse(device.lease, driver, true);
+    const ticket = (try store.takeOwnedRelease(driver, binding)).?;
+    try t.expectError(error.Busy, store.finishOwnedRelease(ticket, driver, false));
+    try t.expectEqual(@as(u64, 8192), store.stats().bytes);
+    try store.finishOwnedRelease(ticket, driver, true);
+    try t.expectError(error.Stale, store.finishOwnedRelease(ticket, driver, true));
+    try t.expectEqual(@as(u64, 4096), store.stats().bytes);
+    try t.expect(!store.retainsDriver(driver));
+    try store.setDeviceBudget(driver, next, 8192); // old reference stubs do not retain physical VRAM budget
+    const replacement = try store.beginOwned(driver, .{ .bytes = 4096, .location = .device_local, .binding = next, .usage = 12 }, 77);
+    try store.commitOwned(replacement, driver);
+    try t.expect(!replacement.create.buffer.eql(native.create.buffer));
+    try t.expectError(error.Closed, store.describe(imported, app));
+    try store.loseDevice(driver, binding, false); // a late old-generation notification cannot revive or affect new storage
+    try t.expectEqual(@as(u64, 4096), (try store.describe(replacement.create.reference, driver)).bytes);
+    try store.drop(imported, app);
+    try store.drop(native.create.reference, driver);
+    try store.drop(replacement.create.reference, driver);
+    try store.finishOwnedRelease((try store.takeOwnedRelease(driver, next)).?, driver, true);
+    try store.drop(cpu.reference, app);
+    try store.finishRelease(store.pendingSystemRelease().?, true);
+    try t.expectEqualDeep(Stats{}, store.stats());
+}
+
 pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize, comptime lease_capacity: usize) type {
     comptime {
         if (object_capacity > std.math.maxInt(u32) or reference_capacity > std.math.maxInt(u32) or lease_capacity > std.math.maxInt(u32)) @compileError("buffer handle capacity exceeds u32");
@@ -265,6 +317,8 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             release_attempt: u64 = 0,
             owned_cookie: u64 = 0,
             owned_reference: Handle = .{},
+            device_lost: bool = false,
+            device_quiesced: bool = false,
         };
         const Reference = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, read_only: bool = false, mapping_only: bool = false };
         const Lease = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, access: Access = .cpu_read, range: layout.Range = .{ .offset = 0, .bytes = 0 } };
@@ -473,7 +527,9 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         }
 
         pub fn describe(self: *Self, reference: Handle, owner: Owner) Error!layout.Descriptor {
-            return (try self.referencedObject(reference, owner)).descriptor;
+            const object = try self.referencedObject(reference, owner);
+            if (object.device_lost) return error.Closed;
+            return object.descriptor;
         }
 
         // Sharing names a live reference, preserving immutable-export mode.
@@ -507,7 +563,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             if (ref_record.mapping_only and access != .device_mapping) return error.Unsupported;
             if (ref_record.read_only and writes(access)) return error.Unsupported;
             const object = try self.referencedObject(reference, owner);
-            if (object.phase != .live) return error.Closed;
+            if (object.phase != .live or object.device_lost) return error.Closed;
             if (writes(access)) {
                 for (&self.references) |item| if (item.handle.id != 0 and item.buffer.eql(object.handle) and item.read_only) {
                     return error.Busy;
@@ -562,7 +618,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             const lease = try self.findLease(handle, queue_owner);
             if (!queued(lease.access)) return error.Unsupported;
             const object = try self.findObject(lease.buffer);
-            if (object.phase != .live or object.backing == null) return error.Closed;
+            if (object.phase != .live or object.device_lost or object.backing == null) return error.Closed;
             const slot = self.freeReference() orelse return error.Capacity;
             const reference = try self.nextHandle(slot);
             self.references[slot] = .{ .handle = reference, .buffer = object.handle, .owner = driver, .mapping_only = true };
@@ -603,6 +659,27 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
 
         pub fn bufferFor(self: *Self, handle: Handle, owner: Owner) Error!Handle {
             return (try self.findReference(handle, owner)).buffer;
+        }
+
+        /// Exact adapter/memory epoch only. Logical loss stops new access but
+        /// does not revoke existing DMA leases. After an independently proven
+        /// stop, the driver can retire native backing even if applications
+        /// still hold invalid references; those references remain closeable.
+        pub fn loseDevice(self: *Self, driver: Owner, binding: layout.Binding, quiesced: bool) Error!void {
+            if (!driver.valid() or driver.kind != .driver or !binding.valid() or binding.portable()) return error.Invalid;
+            if (binding.driver_owner != driver.id) return error.WrongOwner;
+            for (&self.device_budgets) |*slot| if (slot.*) |*budget| {
+                if (budget.driver.eql(driver) and std.meta.eql(budget.binding, binding)) budget.closing = true;
+            };
+            for (&self.objects) |*object| {
+                if (object.phase == .empty or object.descriptor.location != .device_local or
+                    !object.producer.eql(driver) or !std.meta.eql(object.descriptor.binding, binding)) continue;
+                object.device_lost = true;
+                object.device_quiesced = object.device_quiesced or quiesced;
+                object.producer_open = false;
+                self.maybeRelease(object);
+            }
+            self.collectClosedBudgets();
         }
 
         // Called only after the program lifecycle has stopped every CPU task.
@@ -688,7 +765,8 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         pub fn finishRelease(self: *Self, ticket: Release, released: bool) Error!void {
             const object = try self.findObject(ticket.buffer);
             if (object.release_attempt != ticket.attempt) return error.Stale;
-            if (object.phase != .destroying or object.references != 0 or object.leases != 0) return error.Busy;
+            if (object.phase != .destroying or object.leases != 0 or
+                (object.references != 0 and !(object.device_lost and object.device_quiesced))) return error.Busy;
             const backing = object.backing orelse return error.Stale;
             if (backing.cookie != ticket.backing.cookie) return error.Stale;
             if (!released) {
@@ -696,7 +774,17 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
                 return error.Busy;
             }
             self.committed_bytes -= object.allocation_bytes;
-            object.* = .{};
+            if (object.references == 0) {
+                object.* = .{};
+            } else {
+                // Retain handle identity for close only, never the freed GPU
+                // allocation/cookie or its charged physical capacity.
+                object.phase = .live;
+                object.backing = null;
+                object.owned_cookie = 0;
+                object.owned_reference = .{};
+                object.allocation_bytes = 0;
+            }
             self.collectClosedBudgets();
         }
 
@@ -752,7 +840,12 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         }
 
         fn maybeRelease(_: *Self, object: *Object) void {
-            if (object.phase == .live and object.references == 0 and object.leases == 0) object.phase = .releasing;
+            if (object.phase != .live or object.leases != 0) return;
+            if (object.device_lost and object.device_quiesced and object.backing == null and object.owned_cookie == 0) {
+                if (object.references == 0) object.* = .{};
+                return;
+            }
+            if (object.references == 0 or (object.device_lost and object.device_quiesced)) object.phase = .releasing;
         }
         fn nextHandle(self: *Self, slot: usize) Error!Handle {
             if (self.serial == std.math.maxInt(u64) or slot >= std.math.maxInt(u32)) return error.Exhausted;

@@ -34,7 +34,12 @@ pub fn Store(comptime capacity: usize) type {
                 if (entry.owner == null) { if (empty == null) empty = entry; continue; }
                 if (entry.data.adapter_id != input.adapter_id) continue;
                 if (!entry.owner.?.eql(owner)) return error.WrongOwner;
-                if (entry.data.memory_generation != input.memory_generation or input.sampled_ns < entry.data.sampled_ns) return error.Stale;
+                if (input.memory_generation < entry.data.memory_generation or input.sampled_ns < entry.data.sampled_ns) return error.Stale;
+                // A surviving driver may rebuild its GPU after reset. Only a
+                // strictly newer memory epoch can replace this same adapter;
+                // old reads/publications and their demand cannot cross it.
+                if (entry.data.memory_generation != input.memory_generation)
+                    entry.demand = .{ .adapter_id = input.adapter_id, .memory_generation = input.memory_generation };
                 entry.data = input.*;
                 return demand(entry, now);
             }
@@ -96,8 +101,19 @@ test "common telemetry demand is finite and generation-bound, stale values are n
     try t.expectError(error.Invalid, state.publish(owner, &input, 200));
     input.sampled_ns = 120 + demand_ns; input.valid_until_ns = input.sampled_ns;
     try t.expect((try state.publish(owner, &input, input.sampled_ns)).metric_mask == 0);
+    request.memory_generation = input.memory_generation;
+    request.metric_mask = 32;
+    _ = try state.query(request, input.sampled_ns);
+    const old = input;
+    input.memory_generation += 1;
+    input.metrics = @splat(.{});
+    const rebuilt = try state.publish(owner, &input, input.sampled_ns);
+    try t.expect(rebuilt.metric_mask == 0 and rebuilt.until_ns == 0 and rebuilt.memory_generation == input.memory_generation);
+    try t.expectError(error.Stale, state.query(request, input.sampled_ns));
+    try t.expectError(error.Stale, state.publish(owner, &old, input.sampled_ns));
+    request.memory_generation = input.memory_generation;
+    try t.expect((try state.query(request, input.sampled_ns)).metrics[5].status == a.gfx_telemetry_unavailable);
     state.closeDriver(7);
-    request.memory_generation = 9;
     try t.expectError(error.Unavailable, state.query(request, input.sampled_ns));
     input.memory_generation += 1;
     _ = try state.publish(.{ .kind = .driver, .id = 7, .generation = 10 }, &input, input.sampled_ns);

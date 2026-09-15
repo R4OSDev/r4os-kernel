@@ -3334,7 +3334,8 @@ fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i
     const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes, .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule), .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish), .prepare_held = @intFromPtr(&gfxDisplayPrepareHeld), .presentation_stats = @intFromPtr(&gfxDisplayPresentationStats),
         .cursor_configure = @intFromPtr(&gfxCursorConfigure), .cursor_take = @intFromPtr(&gfxCursorTake), .cursor_complete = @intFromPtr(&gfxCursorComplete),
         .presentation_info = @intFromPtr(&gfxDisplayPresentationInfo),
-        .output_register = @intFromPtr(&gfxDisplayOutputRegister), .output_transition = @intFromPtr(&gfxDisplayOutputTransition) };
+        .output_register = @intFromPtr(&gfxDisplayOutputRegister), .output_transition = @intFromPtr(&gfxDisplayOutputTransition),
+        .device_reset = @intFromPtr(&gfxDisplayDeviceReset), .prepare_reset = @intFromPtr(&gfxDisplayPrepareReset) };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_output_ok;
 }
@@ -3409,6 +3410,14 @@ fn gfxDisplayPrepareHeld(input: *const outputs_contract.GfxNativeRegistration, g
 fn gfxDisplayTransition(generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
     return native_display.transition(@intCast(identity.id), generation, operation, output);
+}
+fn gfxDisplayDeviceReset(input: *const outputs_contract.GfxBackendBinding, generation: u64, quiesced: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    return native_display.deviceReset(identity, input, generation, quiesced, output);
+}
+fn gfxDisplayPrepareReset(input: *const outputs_contract.GfxNativeRegistration, held_generation: u64, reset_generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return @import("../display/boot_driver.zig").prepareReset(identity, input, held_generation, reset_generation, output);
 }
 fn gfxDisplaySchedule(input: *const outputs_contract.GfxBackendBinding) callconv(.c) i32 {
     if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(outputs_contract.GfxBackendBinding)) return outputs_contract.gfx_queue_error_invalid;
@@ -3732,6 +3741,7 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
         .native_complete = @intFromPtr(&gfxNativeComplete),
         .memory_budget = @intFromPtr(&gfxMemoryBudget),
         .telemetry_exchange = @intFromPtr(&gfxTelemetryExchange),
+        .device_lost = @intFromPtr(&gfxDeviceLost),
     };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_buffer_result_ok;
@@ -3766,4 +3776,9 @@ fn gfxMemoryBudget(input: *const outputs_contract.GfxDeviceBudgetRequest, output
 fn gfxTelemetryExchange(input: *const outputs_contract.GfxTelemetryState, output: *outputs_contract.GfxTelemetryDemand) callconv(.c) i32 {
     const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
     return @import("../program/gfx_telemetry_api.zig").publish(identity, input, output);
+}
+
+fn gfxDeviceLost(adapter: u32, generation: u64, quiesced: u32) callconv(.c) i32 {
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return @import("gfx_owned_buffers.zig").lose(identity, adapter, generation, quiesced);
 }

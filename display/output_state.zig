@@ -34,6 +34,7 @@ pub const Store = struct {
     commit_sequence: u64 = 0,
     pending: Ticket = .{},
     retained: u32 = 0,
+    reset_retired: Ticket = .{},
 
     fn canChange(self: *const Store) Error!void {
         if (self.pending.id != 0 or self.retained != 0) return error.Busy;
@@ -433,6 +434,19 @@ pub const Store = struct {
         if (outcome == abi.gfx_output_outcome_lost) self.retained = retain;
         return .{ .topology_revision = self.revision, .commit_sequence = self.commit_sequence, .outcome = outcome, .retained = retain };
     }
+    // The caller has retired both surfaces after a proven device stop. The
+    // ticket must still identify the latest transaction, including a LOST
+    // apply whose pending slot was already consumed by finish().
+    pub fn retireAfterReset(self: *Store, ticket: Ticket) Error!void {
+        if (ticket.id == 0 or ticket.id != self.attempt or
+            (self.pending.id != 0 and self.pending.id != ticket.id)) return error.Stale;
+        if (self.reset_retired.id == ticket.id) return;
+        if (self.revision == std.math.maxInt(u64)) return error.Exhausted;
+        self.pending = .{};
+        self.retained = 0;
+        self.reset_retired = ticket;
+        self.revision += 1;
+    }
 };
 fn header(value: anytype) bool { return value.version == 1 and value.size >= @sizeOf(@TypeOf(value)); }
 // Bounded wire validation only. EDID, transfer functions, profiles and
@@ -663,6 +677,18 @@ test "atomic rollback and uncertain hardware outcomes retain resources until exp
     try t.expectEqual(@as(u32, 3), lost.retained);
     state.topology_revision = store.revision;
     try t.expectError(error.Busy, store.begin(&state, &.{testFact()}));
+    try t.expectError(error.Stale, store.retireAfterReset(ticket));
+    try store.retireAfterReset(next);
+    const reset_revision = store.revision;
+    try store.retireAfterReset(next);
+    try t.expect(store.retained == 0 and store.pending.id == 0 and store.revision == reset_revision);
+    state.topology_revision = store.revision;
+    const fresh = try store.begin(&state, &.{testFact()});
+    try t.expectError(error.Stale, store.retireAfterReset(next));
+    try t.expectError(error.Stale, store.finish(next, abi.gfx_output_outcome_applied, 3));
+    try t.expect(store.pending.id == fresh.id);
+    try store.retireAfterReset(fresh);
+    try t.expect(store.pending.id == 0 and store.retained == 0);
 }
 test "firmware mode only retains actual geometry without invented refresh or replacement BO" {
     const t = std.testing;

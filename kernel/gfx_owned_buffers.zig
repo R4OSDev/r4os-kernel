@@ -6,6 +6,17 @@ const driver = @import("gfx_driver_memory.zig");
 const context = @import("../sched/task_context.zig");
 const Owner = buffers.Owner;
 
+pub fn lose(identity: Owner, adapter: u32, generation: u64, quiesced: u32) i32 {
+    if (quiesced > 1) return abi.gfx_buffer_error_invalid;
+    const call = context.enterUnwind();
+    if (!call.admitted()) return abi.gfx_buffer_error_busy;
+    defer _ = context.leaveUnwind(call);
+    buffers.lock();
+    defer buffers.unlock();
+    buffers.store.loseDevice(identity, .{ .adapter = adapter, .driver_owner = @intCast(identity.id), .device_generation = generation }, quiesced == 1) catch |err| return api.status(err);
+    return abi.gfx_buffer_result_ok;
+}
+
 fn creation(input: *const abi.GfxOwnedBufferReservation) buffers.Error!buffers.lifetime.OwnedCreate {
     if (@intFromPtr(input) == 0) return error.Invalid;
     const v = input.*;

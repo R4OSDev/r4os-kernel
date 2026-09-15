@@ -479,3 +479,7 @@ pub fn canFinishNative(ticket: model.Ticket, operation: u32) Error!void {
     } else if (catalog.pending.id != 0 or catalog.retained != 0) return error.Busy;
     if (catalog.revision == std.math.maxInt(u64) or catalog.commit_sequence == std.math.maxInt(u64)) return error.Exhausted;
 }
+pub fn retireNativeAfterReset(ticket: model.Ticket) Error!void {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    try catalog.retireAfterReset(ticket);
+}

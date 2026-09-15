@@ -20,10 +20,27 @@ pub const State = struct {
     expired: bool = false,
     automatic: bool = false,
     reply: ?abi.GfxDriverModeCompletion = null,
+    device_retired: bool = false,
 
     pub fn available(self: *const State) bool {
         return self.status.phase == abi.gfx_mode_phase_idle or self.status.phase == abi.gfx_mode_phase_confirmed or
-            self.status.phase == abi.gfx_mode_phase_reverted;
+            self.status.phase == abi.gfx_mode_phase_reverted or
+            (self.status.phase == abi.gfx_mode_phase_lost and self.device_retired);
+    }
+    /// Called after the display bridge has released the old transaction's
+    /// surfaces under independently proven device quiescence. Preserve LOST
+    /// for its waiter while allowing a fresh generation to accept new modes.
+    pub fn retireAfterReset(self: *State, driver: Owner, backend: abi.GfxBackendBinding) Error!void {
+        if (self.status.ticket == 0) return;
+        if (!self.driver.eql(driver) or !std.meta.eql(self.job.backend, backend)) return error.Stale;
+        self.status.phase = abi.gfx_mode_phase_lost;
+        self.status.outcome = abi.gfx_output_outcome_lost;
+        self.status.error_code = abi.gfx_output_error_unavailable;
+        self.status.retained = 0;
+        self.status.operation_deadline_ns = 0; self.status.confirmation_deadline_ns = 0;
+        self.cancelled = true; self.expired = true;
+        self.offered = false; self.taken = false; self.reply = null;
+        self.color = null; self.device_retired = true;
     }
     pub fn begin(self: *State, caller: Owner, driver: Owner, job: abi.GfxDriverModeJob, revision: u64, confirmation_ms: u32, now: u64) Error!void {
         return self.beginColor(caller, driver, job, null, revision, confirmation_ms, now);
@@ -272,6 +289,17 @@ test "mode jobs bind owner generation and operation, preserve late receipts and 
     try t.expectError(error.Stale, state.resolve(driver, next.ticket, abi.gfx_mode_resolve_confirm, end - 1));
     try t.expectError(error.Busy, state.resolve(caller, next.ticket, abi.gfx_mode_resolve_confirm, end));
     try t.expect(state.expire(end) and state.status.phase == abi.gfx_mode_phase_reverting);
+
+    try t.expectError(error.Stale, state.retireAfterReset(wrong, job.backend));
+    var new_backend = job.backend; new_backend.device_generation += 1;
+    try t.expectError(error.Stale, state.retireAfterReset(driver, new_backend));
+    try state.retireAfterReset(driver, job.backend);
+    try t.expect(state.available() and state.status.phase == abi.gfx_mode_phase_lost and state.status.retained == 0);
+    try t.expectError(error.Stale, state.complete(driver, receipt));
+    var replacement = next; replacement.ticket += 1; replacement.backend = new_backend;
+    try state.begin(caller, driver, replacement, 11, 1000, end + 1);
+    try t.expect(!state.device_retired and !state.available());
+    try t.expectError(error.Stale, state.retireAfterReset(driver, job.backend));
 
     // A rejected in-flight apply can also arrive after the output was hidden.
     // The common bridge must republish the retained old image for this result.

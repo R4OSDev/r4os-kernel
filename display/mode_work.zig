@@ -138,6 +138,28 @@ pub fn readColor(driver: buffers.Owner, ticket: u64, sequence: u64) Error!?abi.G
     const token = ownership.enterState(); defer ownership.leaveState(token);
     return state.readColor(driver, ticket, sequence);
 }
+// The reset owner first stops submissions/receipts and then supplies the
+// exact backend whose DMA is proven idle. Admission serializes this release
+// with each worker slice; neither guard spans the worker's event wait.
+pub fn retireAfterReset(driver: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    if (!admission.enter(0)) return error.Busy;
+    defer _ = admission.leave();
+    const current = snapshot();
+    const matches = current.driver.eql(driver) and std.meta.eql(current.job.backend, backend);
+    if (current.status.ticket != 0 and !matches and (!current.available() or !color_image.empty())) return error.Busy;
+    if (!display.beginOutputCommit()) return error.Busy;
+    defer display.endOutputCommit();
+    try native.retireModeAfterReset(driver, backend);
+    if (matches and !current.device_retired) {
+        try color_image.release();
+        try outputs.retireNativeAfterReset(.{ .id = current.status.ticket });
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        try state.retireAfterReset(driver, backend);
+    }
+    worker_event.signal();
+    events.signal();
+}
 pub fn stoppedDriver(id: u32) void {
     const changed = blk: {
         const token = ownership.enterState(); defer ownership.leaveState(token);
@@ -185,11 +207,12 @@ fn ticksUntil(deadline: u64, now: u64) u64 {
     if (deadline <= now) return 1;
     return @max(1, @as(u64, @intCast((@as(u128, deadline - now) * @max(timer.frequency(), 1) + std.time.ns_per_s - 1) / std.time.ns_per_s)));
 }
-fn workerMain() callconv(.c) void {
-    var locked = false;
-    var hidden_ticket: u64 = 0;
-    var hidden_sequence: u64 = 0;
-    while (true) {
+const Worker = struct {
+    locked: bool = false,
+    hidden_ticket: u64 = 0,
+    hidden_sequence: u64 = 0,
+};
+fn workerStep(self: *Worker) u64 {
         const now = nowNs();
         const expired = blk: {
             const token = ownership.enterState(); defer ownership.leaveState(token);
@@ -205,23 +228,24 @@ fn workerMain() callconv(.c) void {
             current = snapshot();
         }
         const needs_lock = current.needsStart() or current.reply != null or
-            (current.status.phase == abi.gfx_mode_phase_lost and (hidden_ticket != current.status.ticket or hidden_sequence != current.job.sequence));
-        if (needs_lock and binding.additional == null and !locked) {
-            locked = display.beginOutputCommit();
-            if (!locked) { _ = worker_event.waitResult(1); continue; }
+            (current.status.phase == abi.gfx_mode_phase_lost and !current.device_retired and
+                (self.hidden_ticket != current.status.ticket or self.hidden_sequence != current.job.sequence));
+        if (needs_lock and binding.additional == null and !self.locked) {
+            self.locked = display.beginOutputCommit();
+            if (!self.locked) return 1;
         }
         if (current.needsStart()) {
             if (binding.additional == null) {
                 @import("cursor_work.zig").beforeMode(binding.driver) catch |err| {
-                    if (err == error.Busy) { _ = worker_event.waitResult(1); continue; }
+                    if (err == error.Busy) return 1;
                     rejected(@import("cursor_work.zig").code(err));
-                    continue;
+                    return 0;
                 };
             }
             native.startMode(current.job.operation, binding) catch |err| {
-                if (err == error.Busy) { _ = worker_event.waitResult(1); continue; }
+                if (err == error.Busy) return 1;
                 rejected(code(err));
-                continue;
+                return 0;
             };
             {
                 const token = ownership.enterState(); defer ownership.leaveState(token);
@@ -229,7 +253,7 @@ fn workerMain() callconv(.c) void {
             }
             queue.wakeNative(@intCast(current.driver.id), .{ .adapter = current.job.backend.adapter_id,
                 .device_generation = current.job.backend.device_generation, .reset_generation = current.job.backend.reset_generation }) catch |err| rejected(code(err));
-            continue;
+            return 0;
         }
         if (current.reply) |receipt| {
             var outcome = receipt.outcome;
@@ -259,19 +283,30 @@ fn workerMain() callconv(.c) void {
                 state.settled(result, now);
             }
             events.signal();
-            continue;
+            return 0;
         }
-        if (current.status.phase == abi.gfx_mode_phase_lost and (hidden_ticket != current.status.ticket or hidden_sequence != current.job.sequence)) {
+        if (current.status.phase == abi.gfx_mode_phase_lost and !current.device_retired and
+            (self.hidden_ticket != current.status.ticket or self.hidden_sequence != current.job.sequence)) {
             native.settleModeFor(current.job.operation, abi.gfx_output_outcome_lost, binding) catch {};
-            hidden_ticket = current.status.ticket;
-            hidden_sequence = current.job.sequence;
+            self.hidden_ticket = current.status.ticket;
+            self.hidden_sequence = current.job.sequence;
             events.signal();
         }
-        if (locked and (!current.offered or current.expired)) {
+        if (self.locked and (!current.offered or current.expired)) {
             @import("cursor_work.zig").resumeModes();
             display.endOutputCommit();
-            locked = false;
+            self.locked = false;
         }
-        _ = worker_event.waitResult(ticksUntil(current.deadline(), now));
+        return ticksUntil(current.deadline(), now);
+}
+fn workerMain() callconv(.c) void {
+    var worker: Worker = .{};
+    while (true) {
+        const delay = blk: {
+            if (!admission.enter(0)) break :blk 1;
+            defer _ = admission.leave();
+            break :blk workerStep(&worker);
+        };
+        if (delay != 0) _ = worker_event.waitResult(delay);
     }
 }

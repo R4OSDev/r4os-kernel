@@ -22,6 +22,7 @@ pub const Snapshot = struct {
 pub const Manager = struct {
     value: Snapshot = .{},
     serial: u64 = 0,
+    recovering_preparation: bool = false,
 
     pub fn initBoot(self: *Manager) void {
         self.* = .{ .serial = 1, .value = .{ .state = .bootfb, .revision = 1, .generation = 1 } };
@@ -57,8 +58,9 @@ pub const Manager = struct {
 
     pub fn abort(self: *Manager, owner: usize, generation: u64, reason: Reason) Error!void {
         try self.checkPending(owner, generation);
-        self.value.state = .bootfb;
-        self.value.reason = reason;
+        self.value.state = if (self.recovering_preparation) .unavailable else .bootfb;
+        self.value.reason = if (self.recovering_preparation) .restore_failed else reason;
+        self.recovering_preparation = false;
         self.clearPending();
         self.changed();
     }
@@ -90,6 +92,40 @@ pub const Manager = struct {
         self.value.reset_generation += 1;
         self.value.state = .recovering;
         self.value.reason = .device_lost;
+        self.changed();
+        return next;
+    }
+
+    /// Firmware startup can fail while the immutable boot hold is still a
+    /// pending display owner. Logical reset adopts that owner without ever
+    /// reopening bootfb; physical quiescence is supplied by the driver later.
+    pub fn beginDeviceReset(self: *Manager, owner: usize, generation: u64) Error!u64 {
+        if (self.value.state != .preparing) return self.beginRecovery(owner, generation);
+        try self.checkPending(owner, generation);
+        if (self.value.reset_generation == ~@as(u64, 0)) return error.Exhausted;
+        const next = try self.nextGeneration();
+        self.adoptPending();
+        self.value.generation = next;
+        self.value.reset_generation += 1;
+        self.value.state = .recovering;
+        self.value.reason = .device_lost;
+        self.changed();
+        return next;
+    }
+
+    /// Only the enclosing display/driver bridge may call this after old
+    /// consumers have retired under proven GPU stop. The held boot snapshot
+    /// retains its own identity; the replacement gets a fresh generation.
+    pub fn reprepare(self: *Manager, owner: usize, generation: u64, adapter: u32) Error!u64 {
+        try self.checkActive(owner, generation);
+        if (self.value.state != .recovering) return error.Busy;
+        if (adapter == 0 or adapter != self.value.adapter_id) return error.Stale;
+        const next = try self.nextGeneration();
+        self.value.state = .preparing;
+        self.value.pending_owner = owner;
+        self.value.pending_adapter_id = adapter;
+        self.value.pending_generation = next;
+        self.recovering_preparation = true;
         self.changed();
         return next;
     }
@@ -141,7 +177,8 @@ pub const Manager = struct {
         self.value.owner = self.value.pending_owner;
         self.value.adapter_id = self.value.pending_adapter_id;
         self.value.generation = self.value.pending_generation;
-        self.value.reset_generation = 1;
+        if (self.value.reset_generation == 0) self.value.reset_generation = 1;
+        self.recovering_preparation = false;
         self.clearPending();
     }
 
@@ -198,6 +235,27 @@ test "unproven hardware stop retains the owner across failure and recovery" {
     try t.expectEqual(State.bootfb, manager.value.state);
     try t.expect(!manager.retainsOwner(91));
     try t.expect(manager.value.generation > retry);
+
+    // Also cover startup loss and failed native reconstruction. The saved
+    // boot hold must never masquerade as a restored output in either case.
+    manager.initBoot();
+    const held = try manager.begin(91, 4);
+    try t.expectError(error.Stale, manager.beginDeviceReset(92, held));
+    const stopped = try manager.beginDeviceReset(91, held);
+    try t.expect(stopped > held and manager.value.state == .recovering and manager.retainsOwner(91));
+    try t.expectError(error.Stale, manager.reprepare(91, held, 4));
+    try t.expectError(error.Stale, manager.reprepare(91, stopped, 5));
+    const fresh = try manager.reprepare(91, stopped, 4);
+    try t.expect(fresh > stopped and manager.value.state == .preparing);
+    try manager.abort(91, fresh, .prepare_failed);
+    try t.expect(manager.value.state == .unavailable and manager.retainsOwner(91));
+    const again = try manager.beginDeviceReset(91, stopped);
+    const prepared = try manager.reprepare(91, again, 4);
+    const resets = manager.value.reset_generation;
+    try t.expectError(error.Stale, manager.commit(91, fresh, true));
+    try manager.commit(91, prepared, true);
+    try t.expect(manager.value.state == .software_native and manager.value.generation == prepared and
+        manager.value.reset_generation == resets and resets > 1);
 }
 
 test "software policy rejects native admission and exhaustion never wraps" {

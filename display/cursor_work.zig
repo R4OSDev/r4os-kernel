@@ -179,6 +179,18 @@ pub fn stoppedDriver(id: u32) void {
     };
     if (changed) events.signal();
 }
+pub fn retireAfterReset(driver: buffers.Owner, backend: a.GfxBackendBinding) !void {
+    if (!admission.tryEnter()) return error.Busy;
+    defer admission.leave();
+    const current = snapshot();
+    if (current.info.display_generation == 0) return;
+    if (!current.driver.eql(driver) or !std.meta.eql(current.info.backend, backend)) return error.Stale;
+    try releaseSource();
+    const token = ownership.enterState();
+    state.retireAfterReset(driver, backend) catch unreachable;
+    ownership.leaveState(token);
+    events.signal();
+}
 // The mode worker holds DisplayExecution, so public cursor submissions are
 // excluded. Its job is exposed only after a confirmed hidden cursor plane.
 pub fn beforeMode(driver: buffers.Owner) !void {

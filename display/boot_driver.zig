@@ -40,7 +40,7 @@ pub fn hold(identity: buffers.Owner, input: *const abi.GfxBootHoldRequest, outpu
         !native.validAdapter(request.adapter_id) or request.restore_callback < 0xffff800000000000) return abi.gfx_output_error_invalid;
     bridge = .{ .identity = identity, .request = request };
     const result = display.holdBoot(.{ .owner = identity.id, .adapter_id = request.adapter_id,
-        .expected_generation = request.generation, .context = 0, .capture = capture, .restore = restore,
+        .expected_generation = request.generation, .context = 0, .capture = capture, .restore = restore, .restore_adopted = restoreAdopted,
         .release = release, .release_adopted = releaseAdopted }) catch |err| {
         // No capture has run on these admission errors.
         bridge = null;
@@ -83,6 +83,20 @@ pub fn prepareHeld(identity: buffers.Owner, input: *const abi.GfxNativeRegistrat
         current.request.adapter_id != input.backend.adapter_id) return abi.gfx_output_error_stale;
     if (!current.captured or current.lease.id == 0) return abi.gfx_output_error_invalid;
     return native.prepareHeld(identity, input, generation, output);
+}
+
+pub fn prepareReset(identity: buffers.Owner, input: *const abi.GfxNativeRegistration, generation: u64, reset_generation: u64, output: *abi.GfxNativeState) i32 {
+    if (irq.inDispatch() or @intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(abi.GfxNativeRegistration) or
+        !buffer_api.validOutput(abi.GfxNativeState, output)) return abi.gfx_output_error_invalid;
+    if (!execution.tryEnter()) return abi.gfx_output_error_busy;
+    defer execution.leave();
+    if (generation != 0) {
+        const current = &(bridge orelse return abi.gfx_output_error_stale);
+        if (!current.identity.eql(identity) or current.held_generation != generation or
+            current.request.adapter_id != input.backend.adapter_id) return abi.gfx_output_error_stale;
+        if (!current.captured or current.lease.id == 0) return abi.gfx_output_error_invalid;
+    } else if (bridge != null) return abi.gfx_output_error_stale;
+    return native.prepareReset(identity, input, generation, reset_generation, output);
 }
 
 // Called only by the native display callback after it has acquired the CPU
@@ -182,4 +196,9 @@ fn releaseAdopted(context: usize) bool {
     if (!execution.tryEnter()) return false;
     defer execution.leave();
     return release(context);
+}
+fn restoreAdopted(context: usize, generation: u64, saved: *const display.BootSnapshot) bool {
+    if (!execution.tryEnter()) return false;
+    defer execution.leave();
+    return restore(context, generation, saved);
 }

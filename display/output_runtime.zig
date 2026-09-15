@@ -210,3 +210,18 @@ pub fn stoppedDriver(driver: u32) void {
     buffers.lock(); defer buffers.unlock();
     store.stop(driver);
 }
+// Exact backend quiescence has already retired mode surfaces and queue jobs.
+// Each additional target still passes its ordinary consumer-removal checks.
+pub fn retireAfterReset(driver: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
+    if (!admission.enter(0)) return error.Busy;
+    defer _ = admission.leave();
+    for (0..store.entries.len) |index| {
+        const target = blk: {
+            buffers.lock(); defer buffers.unlock();
+            const entry = &store.entries[index];
+            if (!entry.driver.eql(driver) or !std.meta.eql(entry.binding, backend)) continue;
+            break :blk entry.target;
+        };
+        try transition(driver, target, 2, 1);
+    }
+}
