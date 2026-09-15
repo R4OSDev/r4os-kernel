@@ -30,6 +30,23 @@ test {
         }
     }
     _ = @import("display/display.zig");
+    {
+        const color_wire = @import("program/gfx_output_wire.zig");
+        const Color = abi.GfxOutputColorState;
+        var guarded: [@sizeOf(Color) + 16]u8 align(@alignOf(Color)) = undefined;
+        for (8..@sizeOf(Color) + 9) |capacity| {
+            @memset(&guarded, 0xa5);
+            const ptr: *Color = @ptrCast(&guarded);
+            ptr.version = 1; ptr.size = @intCast(capacity);
+            const count = color_wire.capacity(ptr) orelse { try std.testing.expect(capacity < 128); continue; };
+            try std.testing.expect(count <= capacity and count == (if (capacity < 192) @as(u32, 128) else 192));
+            color_wire.write(ptr, count, .{ .formats = 3, .dsc_depths = 3, .max_frl_rate = 6 });
+            try std.testing.expect(std.mem.allEqual(u8, guarded[count..], 0xa5));
+            const decoded = color_wire.read(ptr).?;
+            try std.testing.expect(decoded.size == 192 and decoded.formats == 3 and decoded.dsc_depths == (if (count == 192) @as(u32, 3) else 0));
+            try std.testing.expect(decoded.max_frl_rate == (if (count == 192) @as(u32, 6) else 0));
+        }
+    }
     _ = @import("display/backend_state.zig");
     _ = @import("display/output_state.zig");
     _ = @import("display/mode_state.zig");

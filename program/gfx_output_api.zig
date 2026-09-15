@@ -38,9 +38,11 @@ pub fn edid(input: *const abi.GfxOutputId, index: u32, output: *abi.GfxEdidBlock
     return abi.gfx_output_ok;
 }
 pub fn color(input: *const abi.GfxOutputId, output: *abi.GfxOutputColorState) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxOutputColorState, output)) return abi.gfx_output_error_invalid;
+    const wire = @import("gfx_output_wire.zig");
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxOutputId) != 0) return abi.gfx_output_error_invalid;
+    const count = wire.capacity(output) orelse return abi.gfx_output_error_invalid;
     const snapshot = outputs.colorAt(input.*) catch |err| return code(err);
-    output.* = snapshot;
+    wire.write(output, count, snapshot);
     return abi.gfx_output_ok;
 }
 pub fn refresh(input: *const abi.GfxOutputTarget, output: *abi.GfxOutputRefresh) callconv(.c) i32 {

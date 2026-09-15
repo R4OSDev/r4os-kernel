@@ -152,6 +152,11 @@ pub const Store = struct {
             value.flags &= ~@as(u32, abi.gfx_output_color_active);
             value.format = 0; value.bpc = 0; value.primaries = 0; value.transfer = 0; value.range = 0;
             value.reference_white = 0; value.peak = 0; value.black = 0;
+            value.dp_payload_bits_per_second = 0;
+            value.link_kind = 0; value.link_flags = 0; value.compressed_bpp_x16 = 0;
+            value.link_lanes = 0; value.link_rate_mbps = 0; value.link_payload_bits_per_second = 0;
+            value.h_active = 0; value.h_total = 0; value.v_active = 0;
+            value.pixel_clock_numerator = 0; value.pixel_clock_denominator = 0;
         }
         return value;
     }
@@ -433,7 +438,7 @@ fn header(value: anytype) bool { return value.version == 1 and value.size >= @si
 // Bounded wire validation only. EDID, transfer functions, profiles and
 // source/link eligibility are owned by the publishing driver and userland.
 fn validColor(value: abi.GfxOutputColorState) bool {
-    if (!header(value) or value.reserved0 != 0 or value.flags & ~@as(u32, 127) != 0 or
+    if (!header(value) or value.reserved0 != 0 or !validColorLink(value) or value.flags & ~@as(u32, 127) != 0 or
         value.flags & abi.gfx_output_color_known == 0 or value.formats & ~@as(u32, 3) != 0 or
         value.depths & ~@as(u32, 3) != 0 or value.color_spaces & ~@as(u32, 3) != 0 or
         value.transfers & ~@as(u32, 13) != 0 or value.ranges & ~@as(u32, 3) != 0 or
@@ -447,6 +452,17 @@ fn validColor(value: abi.GfxOutputColorState) bool {
     const range: u32 = switch (value.range) { 1 => 1, 2 => 2, else => return false };
     return value.formats & format != 0 and value.depths & depth != 0 and value.color_spaces & primaries != 0 and
         value.transfers & transfer != 0 and value.ranges & range != 0 and value.reference_white != 0 and value.peak != 0;
+}
+fn validColorLink(value: abi.GfxOutputColorState) bool {
+    if (value.reserved_link != 0 or value.link_kind > abi.gfx_output_link_dp_mst or value.link_flags & ~@as(u32, 3) != 0 or
+        value.dsc_depths & ~@as(u32, 3) != 0 or value.max_frl_rate > 6 or value.compressed_bpp_x16 > 1023 or value.link_lanes > 4) return false;
+    if (value.link_kind == 0 or value.flags & abi.gfx_output_color_active == 0) return value.link_kind == 0 and
+        value.link_flags == 0 and value.compressed_bpp_x16 == 0 and value.link_lanes == 0 and value.link_rate_mbps == 0 and
+        value.h_active == 0 and value.h_total == 0 and value.v_active == 0 and value.link_payload_bits_per_second == 0 and
+        value.pixel_clock_numerator == 0 and value.pixel_clock_denominator == 0;
+    return (value.compressed_bpp_x16 != 0) == (value.link_flags & abi.gfx_output_link_dsc != 0) and
+        value.h_active != 0 and value.h_total > value.h_active and value.v_active != 0 and
+        value.pixel_clock_numerator != 0 and value.pixel_clock_denominator != 0;
 }
 pub const unknown_limits = blk: {
     var value = std.mem.zeroes(abi.GfxDisplayLimits);
@@ -541,6 +557,10 @@ test "output unplug and identical replug invalidate every old receiver mode and 
     color.flags |= abi.gfx_output_color_active | abi.gfx_output_color_identity;
     color.format = abi.gfx_buffer_format_xrgb8888; color.bpc = 8; color.primaries = 1; color.transfer = 1; color.range = 1;
     color.reference_white = 1_000_000; color.peak = 1_000_000;
+    color.link_kind = abi.gfx_output_link_dp_sst; color.link_flags = 3; color.dsc_depths = 3;
+    color.compressed_bpp_x16 = 256; color.link_lanes = 4; color.link_rate_mbps = 8100;
+    color.link_payload_bits_per_second = 25_142_400_000; color.h_active = 640; color.h_total = 800; color.v_active = 480;
+    color.pixel_clock_numerator = 25_175_000; color.pixel_clock_denominator = 1;
     _ = try store.pause(14, first, true, true);
     try t.expectError(error.Stale, store.publishColor(14, color));
     _ = try store.pause(14, first, false, true);
@@ -550,6 +570,8 @@ test "output unplug and identical replug invalidate every old receiver mode and 
     _ = try store.pause(14, first, true, true);
     const paused_color = try store.colorAt(first);
     try t.expect(paused_color.flags & abi.gfx_output_color_active == 0 and paused_color.bpc == 0 and paused_color.formats == 1);
+    try t.expect(paused_color.link_kind == 0 and paused_color.link_flags == 0 and paused_color.compressed_bpp_x16 == 0 and
+        paused_color.link_payload_bits_per_second == 0 and paused_color.pixel_clock_numerator == 0 and paused_color.dsc_depths == 3);
     _ = try store.pause(14, first, false, true);
     try @import("refresh_state_test.zig").check(&store, first);
     const revision = store.revision;

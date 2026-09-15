@@ -3447,9 +3447,10 @@ fn gfxModeReadColor(ticket: u64, sequence: u64, output: *outputs_contract.GfxDri
     return outputs_contract.gfx_output_ok;
 }
 fn gfxOutputColorPublish(input: *const outputs_contract.GfxOutputColorState) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    if (irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
+    const value = @import("../program/gfx_output_wire.zig").read(input) orelse return outputs_contract.gfx_output_error_invalid;
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    @import("../display/outputs.zig").publishColor(@intCast(identity.id), input.*) catch |err| return gfx_modes.code(err);
+    @import("../display/outputs.zig").publishColor(@intCast(identity.id), value) catch |err| return gfx_modes.code(err);
     return outputs_contract.gfx_output_ok;
 }
 fn gfxOutputPause(input: *const outputs_contract.GfxOutputId, paused: u32) callconv(.c) i32 {
