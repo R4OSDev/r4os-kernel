@@ -76,6 +76,7 @@ test {
         }
     }
     _ = @import("memory/gfx_allocation_state.zig");
+    _ = @import("memory/gfx_telemetry_state.zig");
     _ = @import("program/gfx_buffer_api.zig");
     _ = @import("kernel/mmio_windows.zig");
     _ = @import("kernel/gfx_driver_memory_owner.zig");

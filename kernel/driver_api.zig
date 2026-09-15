@@ -3731,6 +3731,7 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
         .native_take = @intFromPtr(&gfxNativeTake),
         .native_complete = @intFromPtr(&gfxNativeComplete),
         .memory_budget = @intFromPtr(&gfxMemoryBudget),
+        .telemetry_exchange = @intFromPtr(&gfxTelemetryExchange),
     };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_buffer_result_ok;
@@ -3761,4 +3762,8 @@ fn gfxMemoryStats(output: *outputs_contract.GfxBufferStats) callconv(.c) i32 {
 fn gfxMemoryBudget(input: *const outputs_contract.GfxDeviceBudgetRequest, output: *outputs_contract.GfxDeviceBudgetState) callconv(.c) i32 {
     const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
     return @import("../program/gfx_memory_budget_api.zig").provider(identity, input, output);
+}
+fn gfxTelemetryExchange(input: *const outputs_contract.GfxTelemetryState, output: *outputs_contract.GfxTelemetryDemand) callconv(.c) i32 {
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return @import("../program/gfx_telemetry_api.zig").publish(identity, input, output);
 }

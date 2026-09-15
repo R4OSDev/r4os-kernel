@@ -61,7 +61,10 @@ pub fn beginClose(id: u32) void {
     const token = lifecycleLock();
     state.close(id);
     lifecycleUnlock(token);
-    if (scheduler.current() != null) @import("gfx_allocations.zig").closingDriver(id);
+    if (scheduler.current() != null) {
+        @import("gfx_allocations.zig").closingDriver(id);
+        @import("../program/gfx_telemetry_api.zig").closeDriver(id);
+    }
 }
 pub fn retained(id: u32) bool {
     const held = blk: {
