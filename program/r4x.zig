@@ -17,6 +17,7 @@ const gfx_queue_api = @import("gfx_queue_api.zig");
 const gfx_allocation_api = @import("gfx_allocation_api.zig");
 const gfx_allocations = @import("../kernel/gfx_allocations.zig");
 const notifications = @import("notifications.zig");
+const local_context = @import("local_context.zig");
 const gfx_output_api = @import("gfx_output_api.zig");
 const module_file = @import("../kernel/module_file.zig");
 const module_r4m = @import("../kernel/module_r4m.zig");
@@ -799,6 +800,7 @@ const ProgramPayloadHeader = struct {
 
 const ProgramRuntimePayload = struct {
     header: ProgramPayloadHeader = .{},
+    local_context: local_context.Owner = .{},
     r4xstart_context: R4XStartContext = .{},
     r4xstart_imports: [MAX_R4M_IMPORTS]R4XStartImport = .{R4XStartImport{}} ** MAX_R4M_IMPORTS,
     r4xstart_import_count: u32 = 0,
@@ -6991,6 +6993,7 @@ fn finishCancelledProgramReservation(reservation: *const ProgramInstanceReservat
 }
 
 fn cleanupCancelledProgramResources(instance: *ProgramInstance) bool {
+    if (!cleanupLocalContext(instance)) return false;
     if (!notifications.cleanup(&instance.notifications)) return false;
     var resources = programResourcesFromInstance(instance);
     if (instance.runtime_payload) |runtime| {
@@ -7551,6 +7554,8 @@ fn configureR4XStartR4SysTable() void {
         .notification_notify = &apiNotificationNotify,
         .notification_wait = &apiNotificationWait,
         .notification_close = &apiNotificationClose,
+        .program_local_get = &apiProgramLocalGet,
+        .program_local_publish = &apiProgramLocalPublish,
     });
 }
 
@@ -12150,6 +12155,23 @@ fn apiNotificationWait(handle: u64, observed: u64, timeout_ticks: u64) callconv(
 }
 fn apiNotificationClose(handle: u64) callconv(.c) i32 {
     return notifications.close(notificationOwner() orelse return r4x_api.notification_error_context, handle);
+}
+
+fn localContextOwner() ?*local_context.Owner {
+    const thread = currentProgramThread() orelse return null;
+    const instance = thread.owner_instance orelse return null;
+    const runtime = instance.runtime_payload orelse return null;
+    return &runtime.local_context;
+}
+fn cleanupLocalContext(instance: *ProgramInstance) bool {
+    const runtime = instance.runtime_payload orelse return true;
+    return local_context.cleanup(&runtime.local_context);
+}
+fn apiProgramLocalGet(key: u64, output: *u64) callconv(.c) i32 {
+    return local_context.get(localContextOwner() orelse return r4x_api.program_local_error_context, key, output);
+}
+fn apiProgramLocalPublish(key: u64, value: u64, output: *u64) callconv(.c) i32 {
+    return local_context.publish(localContextOwner() orelse return r4x_api.program_local_error_context, key, value, output);
 }
 
 fn apiThreadStatus(thread_id: u32, out: *ProgramThreadInfo) callconv(.c) i32 {
@@ -18252,6 +18274,7 @@ fn retireProgramSlot(slot: *ProgramRegistrySlot) ProgramRetireResult {
                 reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Taskabbau");
                 terminateProgramThreadsForHandle(handle, -9, null);
                 if (!releaseThreadsForHandleReporting(handle, report_boot_foreground)) return deferProgramRetire(handle);
+                if (!cleanupLocalContext(&slot.instance)) return deferProgramRetire(handle);
                 if (!notifications.cleanup(&slot.instance.notifications)) return deferProgramRetire(handle);
                 reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O-Abbau");
                 if (!purgeCancelledAsyncIoRequestsForHandle(handle)) return deferProgramRetire(handle);
