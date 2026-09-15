@@ -95,6 +95,7 @@ pub fn dumpStatus() void {
     k.puts("\r\n");
     k.puts("  Poweroff path: DSDT _S5 PM1 if available, known FADT PM1 emulator path, emulator ports, halt fallback\r\n");
     k.puts("  Reboot path: FADT reset register if advertised, keyboard-controller fallback\r\n");
+    k.puts("  System suspend/resume: unavailable (no S3, S4 or S0ix platform path)\r\n");
 }
 
 fn tryAcpiS5Poweroff(info: acpi.Info) bool {

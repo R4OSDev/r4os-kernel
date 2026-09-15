@@ -60,6 +60,21 @@ pub fn requestRefresh(owner: buffers.Owner, input: *const abi.GfxRefreshRequest,
     output.* = value;
     return abi.gfx_output_ok;
 }
+pub fn power(input: *const abi.GfxOutputId, output: *abi.GfxOutputPower) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxOutputId) != 0 or
+        !memory_api.validOutput(abi.GfxOutputPower, output)) return abi.gfx_output_error_invalid;
+    const value = outputs.powerAt(input.*) catch |err| return code(err);
+    output.* = value;
+    return abi.gfx_output_ok;
+}
+pub fn requestPower(owner: buffers.Owner, input: *const abi.GfxPowerRequest, output: *abi.GfxPowerRequest) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxPowerRequest) != 0 or
+        !memory_api.validOutput(abi.GfxPowerRequest, output)) return abi.gfx_output_error_invalid;
+    const request = input.*;
+    const value = outputs.requestPower(owner, request) catch |err| return code(err);
+    output.* = value;
+    return abi.gfx_output_ok;
+}
 pub fn atomic(owner: buffers.Owner, input: *const abi.GfxAtomicState, output: *abi.GfxAtomicResult, commit: bool) i32 {
     if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxAtomicResult, output)) return abi.gfx_output_error_invalid;
     const state = input.*;

@@ -3431,7 +3431,23 @@ fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32
         .audio_publish = @intFromPtr(&gfxAudioPublish), .audio_query = @intFromPtr(&gfxAudioQuery),
         .output_pause = @intFromPtr(&gfxOutputPause), .mode_restore = @intFromPtr(&gfxModeRestore), .mode_status = @intFromPtr(&gfxModeStatus),
         .color_publish = @intFromPtr(&gfxOutputColorPublish), .mode_read_color = @intFromPtr(&gfxModeReadColor),
-        .refresh_publish = @intFromPtr(&gfxOutputRefreshPublish), .refresh_read = @intFromPtr(&gfxRefreshRead) });
+        .refresh_publish = @intFromPtr(&gfxOutputRefreshPublish), .refresh_read = @intFromPtr(&gfxRefreshRead),
+        .power_publish = @intFromPtr(&gfxOutputPowerPublish), .power_read = @intFromPtr(&gfxPowerRead) });
+}
+fn gfxOutputPowerPublish(input: *const outputs_contract.GfxOutputPower) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputPower) != 0 or irq_router.inDispatch())
+        return outputs_contract.gfx_output_error_invalid;
+    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    @import("../display/outputs.zig").publishPower(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxPowerRead(input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxPowerRequest) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputId) != 0 or
+        !@import("../program/gfx_buffer_api.zig").validOutput(outputs_contract.GfxPowerRequest, output)) return outputs_contract.gfx_output_error_invalid;
+    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    const value = @import("../display/outputs.zig").readPower(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
+    output.* = value;
+    return outputs_contract.gfx_output_ok;
 }
 fn gfxOutputRefreshPublish(input: *const outputs_contract.GfxOutputRefresh) callconv(.c) i32 {
     if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputRefresh) != 0 or irq_router.inDispatch())

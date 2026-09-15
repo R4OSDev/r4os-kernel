@@ -18,6 +18,8 @@ pub const Entry = struct {
     info: abi.GfxOutputInfo = .{},
     color: ?abi.GfxOutputColorState = null,
     refresh: @import("refresh_state.zig").State = .{},
+    power: @import("power_state.zig").State = .{},
+    retained_sleep: bool = false,
     modes: [abi.gfx_output_max_modes]abi.GfxOutputMode = .{abi.GfxOutputMode{}} ** abi.gfx_output_max_modes,
     edid: [abi.gfx_output_max_edid_bytes]u8 = .{0} ** abi.gfx_output_max_edid_bytes,
 };
@@ -106,7 +108,9 @@ pub const Store = struct {
         identity.connection_generation = self.receiver_serial;
         const entry = &self.entries[index];
         const paused = entry.owner == owner and entry.receiver_source == 0 and entry.paused;
-        entry.* = .{ .owner = owner, .info = info, .paused = paused };
+        const sleeping = paused and entry.info.identity.device_generation == info.identity.device_generation and
+            (entry.power.sleeping() or entry.retained_sleep);
+        entry.* = .{ .owner = owner, .info = info, .paused = paused, .retained_sleep = sleeping };
         if (paused) entry.info.flags &= ~@as(u32, abi.gfx_output_flag_active);
         entry.info.identity = identity;
         entry.info.topology_revision = self.revision;
@@ -124,6 +128,7 @@ pub const Store = struct {
             if (entry.info.identity.connector_id == 0) continue;
             if (ordinal == index) {
                 var result = entry.info;
+                if (entry.power.sleeping() or entry.retained_sleep) result.flags |= abi.gfx_output_flag_sleeping;
                 result.topology_revision = self.revision;
                 return result;
             }
@@ -195,6 +200,34 @@ pub const Store = struct {
         if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) entry.refresh.pause();
         return entry.refresh.read(target, now);
     }
+    pub fn powerEntry(self: *Store, identity: abi.GfxOutputId) Error!*Entry {
+        const entry = @constCast(try self.find(identity));
+        if (entry.owner == 0 or entry.receiver_source != 0) return error.Unsupported;
+        return entry;
+    }
+    pub fn publishPower(self: *Store, owner: u32, value: abi.GfxOutputPower) Error!bool {
+        const entry = try self.powerEntry(value.identity);
+        if (owner == 0 or owner != entry.owner) return error.Stale;
+        if (value.phase == abi.gfx_power_phase_on and (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0)) return error.Stale;
+        if (value.phase == abi.gfx_power_phase_off and !entry.paused) return error.Stale;
+        const topology = (entry.power.sleeping() or entry.retained_sleep) != @import("power_state.zig").sleepingPhase(value.phase);
+        if (topology and self.revision >= std.math.maxInt(u64) - @as(u64, @intFromBool(self.pending.id != 0))) return error.Exhausted;
+        const changed = try entry.power.publish(value);
+        entry.retained_sleep = false;
+        if (topology) self.revision += 1;
+        return changed;
+    }
+    pub fn powerAt(self: *Store, identity: abi.GfxOutputId) Error!abi.GfxOutputPower {
+        return (try self.powerEntry(identity)).power.get(identity);
+    }
+    pub fn requestPower(self: *Store, actor: DriverOwner, input: abi.GfxPowerRequest, now: u64) Error!abi.GfxPowerRequest {
+        return (try self.powerEntry(input.identity)).power.request(actor, input, now);
+    }
+    pub fn readPower(self: *Store, owner: u32, identity: abi.GfxOutputId, now: u64) Error!abi.GfxPowerRequest {
+        const entry = try self.powerEntry(identity);
+        if (owner == 0 or entry.owner != owner) return error.Stale;
+        return entry.power.read(identity, now);
+    }
     pub fn withdraw(self: *Store, owner: u32, identity: abi.GfxOutputId) Error!void {
         try self.canChange();
         const entry = try self.find(identity);
@@ -224,6 +257,8 @@ pub const Store = struct {
         entry.info.preferred_mode_id = 0;
         entry.info.edid_bytes = 0;
         entry.refresh = .{};
+        entry.power = .{};
+        entry.retained_sleep = false;
         @memset(&entry.modes, .{});
         @memset(&entry.edid, 0);
     }
@@ -588,6 +623,7 @@ test "output unplug and identical replug invalidate every old receiver mode and 
         paused_color.link_payload_bits_per_second == 0 and paused_color.pixel_clock_numerator == 0 and paused_color.dsc_depths == 3);
     _ = try store.pause(14, first, false, true);
     try @import("refresh_state_test.zig").check(&store, first);
+    try @import("power_state_check.zig").check(&store, first);
     const revision = store.revision;
     try store.withdraw(14, first);
     try t.expect(store.revision > revision);
@@ -814,12 +850,12 @@ test "receiver capacity and legacy table prefix preserve previous publications a
     try t.expect(rebound.generation > first.generation);
     try t.expect(try store.stop(@intCast(owner.id)));
     try t.expectError(error.Stale, store.replaceReceivers(owner, rebound, 1, records));
-    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 79, 80, 87, 88, 95, 96, 103, 104, 111, 112, 119, 120, 127, 128, 135, 136, 143, 144 }) |bytes| {
-        var storage: [144]u8 align(8) = @splat(0x79);
+    for ([_]u32{ 8, 23, 24, 31, 32, 40, 48, 55, 56, 63, 64, 71, 72, 79, 80, 87, 88, 95, 96, 103, 104, 111, 112, 119, 120, 127, 128, 135, 136, 143, 144, 151, 152, 159, 160 }) |bytes| {
+        var storage: [160]u8 align(8) = @splat(0x79);
         const table: *abi.GfxDriverOutputApi = @ptrCast(&storage);
         table.version = 1; table.size = bytes;
         const before = storage;
-        const code = driverTable(table, .{ .publish = 3, .withdraw = 4, .register_source = 5, .replace_receivers = 6, .close_source = 7, .color_publish = 9, .mode_read_color = 10, .refresh_publish = 11, .refresh_read = 12 });
+        const code = driverTable(table, .{ .publish = 3, .withdraw = 4, .register_source = 5, .replace_receivers = 6, .close_source = 7, .color_publish = 9, .mode_read_color = 10, .refresh_publish = 11, .refresh_read = 12, .power_publish = 13, .power_read = 14 });
         if (bytes < 24) {
             try t.expect(code == abi.gfx_output_error_invalid and std.mem.eql(u8, &storage, &before));
         } else {
@@ -830,6 +866,8 @@ test "receiver capacity and legacy table prefix preserve previous publications a
             if (returned >= 128) try t.expect(table.mode_read_color == 10);
             if (returned >= 136) try t.expect(table.refresh_publish == 11);
             if (returned >= 144) try t.expect(table.refresh_read == 12);
+            if (returned >= 152) try t.expect(table.power_publish == 13);
+            if (returned >= 160) try t.expect(table.power_read == 14);
         }
     }
 }

@@ -125,6 +125,55 @@ pub fn refreshStopped(actor: buffers.Owner) void {
         if (wake) |value| queue.wakeOutput(value.owner, value.target) catch {};
     }
 }
+pub fn powerAt(identity: abi.GfxOutputId) Error!abi.GfxOutputPower {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return catalog.powerAt(identity);
+}
+pub fn publishPower(owner: u32, value: abi.GfxOutputPower) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    const changed = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        if (nativePort(owner, value.identity) == null) return error.Stale;
+        break :blk try catalog.publishPower(owner, value);
+    };
+    if (changed) events.signal();
+}
+fn wakePower(owner: u32, identity: abi.GfxOutputId) void {
+    // Queue wake binds only the owned adapter/device generation. A sleeping
+    // output has no current scanout target and cannot submit new presents.
+    queue.wakeOutput(owner, .{ .adapter_id = identity.adapter_id, .device_generation = identity.device_generation,
+        .connector_id = identity.connector_id, .connection_generation = identity.connection_generation }) catch {};
+}
+pub fn requestPower(actor: buffers.Owner, input: abi.GfxPowerRequest) Error!abi.GfxPowerRequest {
+    if (irq.inDispatch()) return error.Invalid;
+    const now = refreshNow();
+    var owner: u32 = 0;
+    const value = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        owner = (try catalog.powerEntry(input.identity)).owner;
+        break :blk try catalog.requestPower(actor, input, now);
+    };
+    wakePower(owner, input.identity);
+    return value;
+}
+pub fn readPower(owner: u32, identity: abi.GfxOutputId) Error!abi.GfxPowerRequest {
+    if (irq.inDispatch()) return error.Invalid;
+    const now = refreshNow();
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return catalog.readPower(owner, identity, now);
+}
+pub fn powerStopped(actor: buffers.Owner) void {
+    for (0..catalog.entries.len) |index| {
+        const Wake = struct { owner: u32, identity: abi.GfxOutputId };
+        const wake: ?Wake = blk: {
+            const token = ownership.enterState(); defer ownership.leaveState(token);
+            const entry = &catalog.entries[index];
+            if (entry.power.stopped(actor)) break :blk .{ .owner = entry.owner, .identity = entry.info.identity };
+            break :blk null;
+        };
+        if (wake) |value| wakePower(value.owner, value.identity);
+    }
+}
 pub fn modeAt(identity: abi.GfxOutputId, index: u32) Error!?abi.GfxOutputMode {
     const token = ownership.enterState(); defer ownership.leaveState(token);
     return catalog.modeAt(identity, index);
