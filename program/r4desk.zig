@@ -67,6 +67,9 @@ pub const KeyboardLayoutInfo = r4x_api.KeyboardLayoutInfo;
 pub const ClipboardInfo = r4x_api.ClipboardInfo;
 
 pub const RemoteFrameInfo = r4x_api.RemoteFrameInfo;
+pub const RemoteFrameLease = r4x_api.RemoteFrameLease;
+pub const RemoteFrameCaptureStats = r4x_api.RemoteFrameCaptureStats;
+pub const CaptureOwner = remote_frame_state.Owner;
 
 // Shared-Frame-Mapping fuer RDPSVC. Die Adresse zeigt auf einen vom Live-
 // Publisher getrennten Snapshot; generation benennt dessen Frame-Revision.
@@ -90,6 +93,7 @@ const RemoteFrameSnapshot = struct {
     revision: u32 = 0,
     width: u32 = 0,
     height: u32 = 0,
+    epoch: u64 = 0,
 };
 
 var clipboard_text: [clipboard_text_size]u8 = .{0} ** clipboard_text_size;
@@ -107,6 +111,13 @@ var remote_frame_guard = sync.UnwindGuard.init("remote-frame");
 // Consumer transitions and these two lifecycle fields use program_state.
 var remote_frame_epoch: u64 = 1;
 var remote_frame_discard_pending: bool = false;
+var remote_frame_reap_pending: bool = false;
+var remote_frame_registry: remote_frame_state.CaptureRegistry = .{};
+var remote_frame_source: CaptureOwner = .{};
+var remote_frame_leased: [remote_frame_state.snapshot_capacity]RemoteFrameSnapshot = @splat(.{});
+var remote_frame_published_bytes: u64 = 0;
+var remote_frame_snapshot_bytes: u64 = 0;
+var remote_frame_snapshot_misses: u64 = 0;
 var remote_frame_consumers_count: u32 = 0;
 var remote_frame_revision_counter: u32 = 0;
 var remote_frame_published_revision: u32 = 0;
@@ -316,33 +327,26 @@ pub fn desktopActivityWait(last_seq: u64, timeout_ticks: u64, out_seq: *u64) cal
     return desktop_events.wait(last_seq, timeout_ticks, out_seq);
 }
 
-pub fn remoteFrameAcquire() callconv(.c) i32 {
+pub fn remoteFrameAcquire(owner: CaptureOwner) i32 {
     const token = owner_locks.program_state.acquire();
     const current = remoteFrameConsumers();
-    if (current >= 0x7fff_ffff) {
-        owner_locks.program_state.release(token);
-        return remote_frame_error_invalid;
-    }
-    const next = current + 1;
+    const next = remote_frame_registry.acquire(owner) catch {
+        owner_locks.program_state.release(token); return remote_frame_error_invalid;
+    };
     @atomicStore(u32, &remote_frame_consumers_count, next, .release);
     owner_locks.program_state.release(token);
     if (current == 0) desktop_events.signal();
     return @intCast(next);
 }
 
-pub fn remoteFrameRelease() callconv(.c) i32 {
+pub fn remoteFrameRelease(owner: CaptureOwner) i32 {
     const token = owner_locks.program_state.acquire();
-    const current = remoteFrameConsumers();
-    if (current == 0) {
-        owner_locks.program_state.release(token);
-        return 0;
-    }
-    const next = current - 1;
+    const next = remote_frame_registry.release(owner) catch {
+        owner_locks.program_state.release(token); return remote_frame_error_invalid;
+    };
     @atomicStore(u32, &remote_frame_consumers_count, next, .release);
     if (next == 0) {
-        remote_frame_epoch +%= 1;
-        remote_frame_discard_pending = true;
-        @atomicStore(u32, &remote_frame_published_revision, 0, .release);
+        retireRemoteFrameLocked();
     }
     owner_locks.program_state.release(token);
     if (next == 0) {
@@ -355,6 +359,41 @@ pub fn remoteFrameRelease() callconv(.c) i32 {
     return @intCast(next);
 }
 
+fn retireRemoteFrameLocked() void {
+    remote_frame_epoch +%= 1; if (remote_frame_epoch == 0) remote_frame_epoch = 1;
+    remote_frame_discard_pending = true; remote_frame_reap_pending = true;
+    @atomicStore(u32, &remote_frame_published_revision, 0, .release);
+}
+pub fn remoteFramePublisher(owner: CaptureOwner) bool {
+    const token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(token);
+    if (remote_frame_source.id == 0) remote_frame_source = owner;
+    return remote_frame_source.same(owner);
+}
+pub fn remoteFrameSourceReset(owner: CaptureOwner) i32 {
+    const token = owner_locks.program_state.acquire();
+    remote_frame_source = owner; retireRemoteFrameLocked();
+    owner_locks.program_state.release(token);
+    if (enterRemoteFrame()) leaveRemoteFrame();
+    _ = remote_frame_waitq.wakeAll(); desktop_events.signal();
+    return 0;
+}
+/// Execution retirement calls this after the program's last task/API access.
+/// A stopped consumer loses only its own demand and immutable snapshot leases.
+pub fn remoteFrameStopped(owner: CaptureOwner) void {
+    const token = owner_locks.program_state.acquire();
+    const before = remote_frame_registry.count;
+    remote_frame_registry.stopped(owner, timer.eventNanoseconds());
+    @atomicStore(u32, &remote_frame_consumers_count, remote_frame_registry.count, .release);
+    const publisher = remote_frame_source.same(owner);
+    if (publisher) remote_frame_source = .{};
+    if (publisher or (before != 0 and remote_frame_registry.count == 0)) retireRemoteFrameLocked();
+    remote_frame_reap_pending = true;
+    owner_locks.program_state.release(token);
+    if (enterRemoteFrame()) leaveRemoteFrame();
+    _ = remote_frame_waitq.wakeAll(); desktop_events.signal();
+}
+
 pub fn remoteFrameConsumers() callconv(.c) u32 {
     return @atomicLoad(u32, &remote_frame_consumers_count, .acquire);
 }
@@ -365,7 +404,7 @@ pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32
     if (info.width == 0 or info.height == 0 or info.stride_pixels < info.width) return remote_frame_error_invalid;
 
     const total_pixels_u64 = @as(u64, info.width) * @as(u64, info.height);
-    const max_frame_pixels: u64 = 0xffff_ffff / @sizeOf(u32);
+    const max_frame_pixels: u64 = remote_frame_state.max_frame_bytes / @sizeOf(u32);
     if (total_pixels_u64 == 0 or total_pixels_u64 > max_frame_pixels) return remote_frame_error_invalid;
     const source_pixels_u64 = @as(u64, info.stride_pixels) * @as(u64, info.height);
     if (source_pixels_u64 > @as(u64, pixel_count)) return remote_frame_error_invalid;
@@ -414,6 +453,7 @@ pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32
     };
     remote_frame_ready = true;
     remote_frame_history.record(revision, rect);
+    remote_frame_published_bytes +|= @as(u64, rect.w) * rect.h * 4;
     if (!completeRemoteFrame(epoch, revision)) return 0;
     _ = remote_frame_waitq.wakeAll();
 
@@ -437,7 +477,7 @@ pub fn remoteFramePublishRegions(
     }
     const total_pixels_u64 = @as(u64, info.width) * info.height;
     const source_pixels_u64 = @as(u64, info.stride_pixels) * info.height;
-    const max_frame_pixels: u64 = 0xffff_ffff / @sizeOf(u32);
+    const max_frame_pixels: u64 = remote_frame_state.max_frame_bytes / @sizeOf(u32);
     if (total_pixels_u64 == 0 or total_pixels_u64 > max_frame_pixels or source_pixels_u64 > pixel_count) return remote_frame_error_invalid;
 
     var regions: [r4x_api.display_damage_max_regions]RemoteRect =
@@ -504,6 +544,7 @@ pub fn remoteFramePublishRegions(
     };
     remote_frame_ready = true;
     remote_frame_history.record(revision, bounds);
+    remote_frame_published_bytes +|= copied_pixels * 4;
     if (!completeRemoteFrame(epoch, revision)) return 0;
     _ = remote_frame_waitq.wakeAll();
     return if (copied_pixels > 0x7fff_ffff) 0x7fff_ffff else @intCast(copied_pixels);
@@ -726,7 +767,7 @@ fn bumpClipboardRevision() void {
 }
 
 fn ensureRemoteFrameCapacity(pixel_count: usize) bool {
-    if (pixel_count == 0) return false;
+    if (pixel_count == 0 or pixel_count > remote_frame_state.max_frame_bytes / 4) return false;
     if (remote_frame_capacity_pixels >= pixel_count and remote_frame_pixels != null) return true;
     if (pixel_count > (~@as(usize, 0)) / @sizeOf(u32)) return false;
     const bytes = pixel_count * @sizeOf(u32);
@@ -749,8 +790,14 @@ fn ensureRemoteFrameCapacity(pixel_count: usize) bool {
 fn discardRemoteFrameStorage() void {
     if (remote_frame_memory) |memory| _ = heap.free(memory);
     for (&remote_frame_snapshots) |*snapshot| {
-        if (snapshot.memory) |memory| _ = heap.free(memory);
-        snapshot.* = .{};
+        if (remoteFrameConsumers() == 0) {
+            if (snapshot.memory) |memory| _ = heap.free(memory);
+            snapshot.* = .{};
+        } else {
+            // Legacy owner-thread mappings survive producer reset until
+            // their next map/release; new lease consumers use the pool below.
+            snapshot.revision = 0; snapshot.width = 0; snapshot.height = 0;
+        }
     }
     remote_frame_memory = null;
     remote_frame_pixels = null;
@@ -758,15 +805,16 @@ fn discardRemoteFrameStorage() void {
     remote_frame_info = .{};
     remote_frame_ready = false;
     remote_frame_history.reset();
-    remote_frame_snapshot_active = 1;
+    if (remoteFrameConsumers() == 0) remote_frame_snapshot_active = 1;
     @atomicStore(u32, &remote_frame_published_revision, 0, .release);
+    reapRemoteSnapshots();
 }
 
 fn ensureRemoteFrameSnapshotCapacity(index: usize, pixel_count: usize) bool {
     if (index >= remote_frame_snapshots.len or pixel_count == 0) return false;
     const snapshot = &remote_frame_snapshots[index];
     if (snapshot.capacity_pixels >= pixel_count and snapshot.pixels != null) return true;
-    if (pixel_count > (~@as(usize, 0)) / @sizeOf(u32)) return false;
+    if (pixel_count > remote_frame_state.max_frame_bytes / 4) return false;
     const memory = heap.alloc(pixel_count * @sizeOf(u32), @alignOf(u32)) orelse return false;
     if (snapshot.memory) |old| _ = heap.free(old);
     const aligned: [*]align(@alignOf(u32)) u8 = @alignCast(memory.ptr);
@@ -818,6 +866,114 @@ pub fn remoteFrameMap(out: *RemoteFrameMapInfo) callconv(.c) i32 {
     return 0;
 }
 
+fn snapshotUnavailable() i32 {
+    const token = owner_locks.program_state.acquire();
+    remote_frame_snapshot_misses +|= 1;
+    owner_locks.program_state.release(token);
+    return remote_frame_error_unavailable;
+}
+pub fn remoteFrameSnapshotAcquire(owner: CaptureOwner, expected_revision: u32, out_info: *RemoteFrameInfo, out_lease: *RemoteFrameLease) i32 {
+    out_info.* = .{}; out_lease.* = .{};
+    if (!enterRemoteFrame()) return snapshotUnavailable();
+    defer leaveRemoteFrame();
+    const epoch = currentRemoteFrameEpoch() orelse return snapshotUnavailable();
+    if (!remote_frame_ready or remote_frame_pixels == null or (expected_revision != 0 and expected_revision != remote_frame_info.revision)) return snapshotUnavailable();
+    const info = remote_frame_info;
+    const token = owner_locks.program_state.acquire();
+    if (!remote_frame_registry.hasConsumer(owner)) {
+        owner_locks.program_state.release(token); return snapshotUnavailable();
+    }
+    var owned_leases: usize = 0;
+    for (&remote_frame_registry.leases) |*entry| if (entry.id != 0 and entry.owner.same(owner)) { owned_leases += 1; };
+    if (owned_leases >= remote_frame_state.leases_per_consumer) {
+        owner_locks.program_state.release(token); return snapshotUnavailable();
+    }
+    const selected = for (&remote_frame_leased, 0..) |*snapshot, index| {
+        if (snapshot.epoch == epoch and snapshot.revision == info.revision and snapshot.width == info.width and snapshot.height == info.height and snapshot.pixels != null) break index;
+    } else for (remote_frame_registry.references, 0..) |count, index| { if (count == 0) break index; } else {
+        owner_locks.program_state.release(token); return snapshotUnavailable();
+    };
+    const held = remote_frame_registry.references[selected] != 0;
+    owner_locks.program_state.release(token);
+    const snapshot = &remote_frame_leased[selected];
+    const required: usize = info.frame_pixels;
+    if (required == 0 or required > remote_frame_state.max_frame_bytes / 4) return remote_frame_error_invalid;
+    if (snapshot.capacity_pixels < required or snapshot.pixels == null) {
+        if (held) return snapshotUnavailable();
+        const memory = heap.alloc(required * 4, @alignOf(u32)) orelse return remote_frame_error_oom;
+        if (snapshot.memory) |old| _ = heap.free(old);
+        const pixels: [*]u32 = @ptrCast(@alignCast(memory.ptr));
+        snapshot.* = .{ .memory = memory, .pixels = pixels[0..required], .capacity_pixels = required };
+    }
+    if (snapshot.epoch != epoch or snapshot.revision != info.revision) {
+        if (held) return snapshotUnavailable();
+        const rect = if (snapshot.epoch != epoch or snapshot.width != info.width or snapshot.height != info.height or snapshot.revision == 0)
+            RemoteRect{ .w = info.width, .h = info.height }
+        else remote_frame_history.unionSince(snapshot.revision, info.revision, info.width, info.height);
+        if (!rect.empty()) {
+            copyRemoteFrameRect(snapshot.pixels.?[0..required], remote_frame_pixels.?[0..required], info.width, info.width, rect);
+            remote_frame_snapshot_bytes +|= @as(u64, rect.w) * rect.h * 4;
+        }
+        snapshot.epoch = epoch; snapshot.revision = info.revision; snapshot.width = info.width; snapshot.height = info.height;
+    }
+    const final_token = owner_locks.program_state.acquire();
+    if (epoch != remote_frame_epoch or remote_frame_discard_pending) {
+        owner_locks.program_state.release(final_token); return snapshotUnavailable();
+    }
+    const now = timer.eventNanoseconds();
+    const lease = remote_frame_registry.beginLease(owner, selected, epoch, now) catch {
+        owner_locks.program_state.release(final_token); return snapshotUnavailable();
+    };
+    owner_locks.program_state.release(final_token);
+    out_info.* = info;
+    out_lease.* = .{ .id = lease.id, .pixels_addr = @intFromPtr(snapshot.pixels.?.ptr),
+        .capacity_pixels = required, .epoch = epoch, .acquired_ns = now };
+    return 0;
+}
+pub fn remoteFrameSnapshotRelease(owner: CaptureOwner, lease: *const RemoteFrameLease) i32 {
+    if (lease.version != 1 or lease.size != @sizeOf(RemoteFrameLease) or lease.id == 0 or lease.epoch == 0) return remote_frame_error_invalid;
+    const token = owner_locks.program_state.acquire();
+    remote_frame_registry.endLease(owner, lease.id, lease.epoch, timer.eventNanoseconds()) catch {
+        owner_locks.program_state.release(token); return remote_frame_error_invalid;
+    };
+    remote_frame_reap_pending = true;
+    owner_locks.program_state.release(token);
+    if (enterRemoteFrame()) leaveRemoteFrame();
+    return 0;
+}
+fn reapRemoteSnapshots() void {
+    // Only remote_frame_guard can admit or mutate snapshot storage. The
+    // no-sleep program owner covers reference metadata, never heap/copies.
+    for (&remote_frame_leased, 0..) |*snapshot, index| {
+        const token = owner_locks.program_state.acquire();
+        const free = remote_frame_registry.references[index] == 0 and
+            (remote_frame_registry.count == 0 or snapshot.epoch != remote_frame_epoch);
+        owner_locks.program_state.release(token);
+        if (free) {
+            if (snapshot.memory) |memory| _ = heap.free(memory);
+            snapshot.* = .{};
+        }
+    }
+}
+pub fn remoteFrameCaptureStats(out: *RemoteFrameCaptureStats) callconv(.c) i32 {
+    if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
+    out.* = .{};
+    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
+    defer leaveRemoteFrame();
+    out.live_bytes = remote_frame_capacity_pixels * 4;
+    for (&remote_frame_leased) |*snapshot| if (snapshot.memory != null) {
+        out.snapshots += 1; out.snapshot_bytes += snapshot.capacity_pixels * 4;
+    };
+    out.published_bytes = remote_frame_published_bytes; out.snapshot_copy_bytes = remote_frame_snapshot_bytes;
+    const token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(token);
+    out.consumers = remote_frame_registry.count; out.epoch = remote_frame_epoch;
+    out.revision = currentRemoteFrameRevision(); out.acquires = remote_frame_registry.acquired;
+    out.misses = remote_frame_snapshot_misses; out.max_reader_ns = remote_frame_registry.max_reader_ns;
+    for (remote_frame_registry.references) |count| out.leases += count;
+    return 0;
+}
+
 fn captureRemoteFrameInfo(since_revision: ?u32, out: *RemoteFrameInfo) bool {
     if (!enterRemoteFrame()) return false;
     defer leaveRemoteFrame();
@@ -847,10 +1003,9 @@ fn enterRemoteFrame() bool {
 fn leaveRemoteFrame() void {
     while (true) {
         const token = owner_locks.program_state.acquire();
-        if (remote_frame_discard_pending) {
-            remote_frame_discard_pending = false;
+        if (remote_frame_discard_pending or remote_frame_reap_pending) {
             owner_locks.program_state.release(token);
-            discardRemoteFrameStorage();
+            discardPendingRemoteFrames();
             continue;
         }
         // Publish the end of ownership together with the retirement check.
@@ -864,9 +1019,12 @@ fn leaveRemoteFrame() void {
 fn discardPendingRemoteFrames() void {
     const token = owner_locks.program_state.acquire();
     const pending = remote_frame_discard_pending;
+    const reap = remote_frame_reap_pending;
     remote_frame_discard_pending = false;
+    remote_frame_reap_pending = false;
     owner_locks.program_state.release(token);
     if (pending) discardRemoteFrameStorage();
+    if (reap) reapRemoteSnapshots();
 }
 
 fn currentRemoteFrameEpoch() ?u64 {

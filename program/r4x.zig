@@ -2043,6 +2043,7 @@ fn sharedRasterReleaseProcess(handle: ProgramProcessHandle) void {
     @import("../display/cursor_work.zig").stopped(graphicsOwner(handle));
     @import("../display/outputs.zig").refreshStopped(graphicsOwner(handle));
     @import("../display/outputs.zig").powerStopped(graphicsOwner(handle));
+    r4api.r4desk.remoteFrameStopped(.{ .id = handle.instance_id, .generation = handle.generation });
     for (free_sets[0..free_count]) |set| sharedRasterFreeMemories(set);
     gfx_buffers.collect();
 }
@@ -7589,7 +7590,7 @@ fn configureR4XStartR4DeskTable() void {
         .remote_frame_info = &r4api.r4desk.remoteFrameInfo,
         .remote_frame_read = &r4api.r4desk.remoteFrameRead,
         .remote_frame_wait = &r4api.r4desk.remoteFrameWait,
-        .remote_frame_publish = &r4api.r4desk.remoteFramePublish,
+        .remote_frame_publish = &apiRemoteFramePublish,
         .remote_input_push = &r4api.r4desk.remoteInputPush,
         .remote_input_poll = &r4api.r4desk.remoteInputPoll,
         .remote_input_status = &r4api.r4desk.remoteInputStatus,
@@ -7601,11 +7602,15 @@ fn configureR4XStartR4DeskTable() void {
         .program_spawn_with_console_host_handle = &apiProgramSpawnWithConsoleHostHandle,
         .program_set_window_handle = &apiProgramSetWindowHandle,
         .console_push_input = &apiConsolePushInput,
-        .remote_frame_acquire = &r4api.r4desk.remoteFrameAcquire,
-        .remote_frame_release = &r4api.r4desk.remoteFrameRelease,
+        .remote_frame_acquire = &apiRemoteFrameAcquire,
+        .remote_frame_release = &apiRemoteFrameRelease,
         .remote_frame_consumers = &r4api.r4desk.remoteFrameConsumers,
-        .remote_frame_publish_regions = &r4api.r4desk.remoteFramePublishRegions,
+        .remote_frame_publish_regions = &apiRemoteFramePublishRegions,
         .physical_key_poll = &r4api.r4desk.physicalKeyPoll,
+        .remote_frame_snapshot_acquire = &apiRemoteFrameSnapshotAcquire,
+        .remote_frame_snapshot_release = &apiRemoteFrameSnapshotRelease,
+        .remote_frame_source_reset = &apiRemoteFrameSourceReset,
+        .remote_frame_capture_stats = &r4api.r4desk.remoteFrameCaptureStats,
     });
 }
 
@@ -16193,6 +16198,40 @@ fn apiGuiFrameStreamInfo(handle_ptr: *const ProgramProcessHandle, out: *GuiFrame
     result.shared_live_bytes = shared.live_bytes;
     writeGuiFrameStreamInfoOutput(out, caller_version, result);
     return r4x_api.gui_frame_result_ok;
+}
+
+fn remoteCaptureOwner() ?r4api.r4desk.CaptureOwner {
+    const owner = currentProgramHandle() orelse return null;
+    return .{ .id = owner.instance_id, .generation = owner.generation };
+}
+fn apiRemoteFrameAcquire() callconv(.c) i32 {
+    return r4api.r4desk.remoteFrameAcquire(remoteCaptureOwner() orelse return r4x_api.remote_frame_error_unavailable);
+}
+fn apiRemoteFrameRelease() callconv(.c) i32 {
+    return r4api.r4desk.remoteFrameRelease(remoteCaptureOwner() orelse return r4x_api.remote_frame_error_unavailable);
+}
+fn apiRemoteFramePublish(info: *const r4x_api.RemoteFrameInfo, pixels: [*]const u32, count: u32) callconv(.c) i32 {
+    const owner = remoteCaptureOwner() orelse return r4x_api.remote_frame_error_unavailable;
+    if (!r4api.r4desk.remoteFramePublisher(owner)) return r4x_api.remote_frame_error_unavailable;
+    return r4api.r4desk.remoteFramePublish(info, pixels, count);
+}
+fn apiRemoteFramePublishRegions(info: *const r4x_api.RemoteFrameInfo, pixels: [*]const u32, count: u32,
+    regions: [*]const r4x_api.DisplayDamageRect, region_count: u32) callconv(.c) i32
+{
+    const owner = remoteCaptureOwner() orelse return r4x_api.remote_frame_error_unavailable;
+    if (!r4api.r4desk.remoteFramePublisher(owner)) return r4x_api.remote_frame_error_unavailable;
+    return r4api.r4desk.remoteFramePublishRegions(info, pixels, count, regions, region_count);
+}
+fn apiRemoteFrameSnapshotAcquire(expected: u32, info: *r4x_api.RemoteFrameInfo, lease: *r4x_api.RemoteFrameLease) callconv(.c) i32 {
+    if (@intFromPtr(info) == 0 or @intFromPtr(lease) == 0) return r4x_api.remote_frame_error_invalid;
+    return r4api.r4desk.remoteFrameSnapshotAcquire(remoteCaptureOwner() orelse return r4x_api.remote_frame_error_unavailable, expected, info, lease);
+}
+fn apiRemoteFrameSnapshotRelease(lease: *const r4x_api.RemoteFrameLease) callconv(.c) i32 {
+    if (@intFromPtr(lease) == 0) return r4x_api.remote_frame_error_invalid;
+    return r4api.r4desk.remoteFrameSnapshotRelease(remoteCaptureOwner() orelse return r4x_api.remote_frame_error_unavailable, lease);
+}
+fn apiRemoteFrameSourceReset() callconv(.c) i32 {
+    return r4api.r4desk.remoteFrameSourceReset(remoteCaptureOwner() orelse return r4x_api.remote_frame_error_unavailable);
 }
 
 fn apiGuiSharedRasterCreate(info: *const GuiSharedRasterCreateInfo, out_handle: *GuiSharedRasterHandle) callconv(.c) i32 {

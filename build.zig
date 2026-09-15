@@ -194,6 +194,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&kernel.step);
     const display_test_step = b.step("display-test", "Bounded display ownership, fallback and firmware-writer tests");
     addDisplayUnitTest(b, display_test_step, contract, config);
+    addUnitTest(b, display_test_step, "program/remote_frame_state.zig");
     test_step.dependOn(display_test_step);
     const unit_tests = [_][]const u8{
         "audio/backend_contract.zig",
@@ -232,7 +233,6 @@ pub fn build(b: *std.Build) void {
         "platform/pci_scan.zig",
         "program/gui_alpha8.zig",
         "program/lifecycle_retire_policy.zig",
-        "program/remote_frame_state.zig",
         "program/r4x_start.zig",
         "sched/initial_stack.zig",
         "sched/wait_node.zig",
