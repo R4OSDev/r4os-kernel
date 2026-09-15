@@ -37,9 +37,20 @@ pub const Use = struct { lease: Handle, buffer: Handle, access: Access, backing:
 pub const Release = struct { buffer: Handle, backing: Backing, attempt: u64 };
 pub const OwnedCreate = struct { create: Create, cookie: u64, driver: Owner, binding: layout.Binding };
 pub const OwnedRelease = struct { release: Release, driver: Owner, binding: layout.Binding };
-pub const Stats = struct { objects: usize = 0, references: usize = 0, leases: usize = 0, bytes: u64 = 0, retained_bytes: u64 = 0 };
+pub const BudgetSnapshot = struct { limit: u64, charged: u64, closing: bool };
+pub const Stats = struct {
+    objects: usize = 0, references: usize = 0, leases: usize = 0,
+    bytes: u64 = 0, retained_bytes: u64 = 0,
+    system_bytes: u64 = 0, device_bytes: u64 = 0,
+    system_backed_bytes: u64 = 0, device_backed_bytes: u64 = 0,
+    system_pinned_bytes: u64 = 0, device_pinned_bytes: u64 = 0,
+    scanout_pinned_bytes: u64 = 0, device_mapped_bytes: u64 = 0,
+    allocating_bytes: u64 = 0, destroying_bytes: u64 = 0,
+};
 
 test "CPU backing release failure remains visible to the exact driver epoch without public references" {
+    try accountingLifetime();
+    try deviceBudgetLifetime();
     try ownedBackingLifetime(false);
     try ownedBackingLifetime(true);
     const t = std.testing;
@@ -62,6 +73,107 @@ test "CPU backing release failure remains visible to the exact driver epoch with
     try store.finishRelease(store.pendingRelease().?, true);
     try t.expect(!store.pendingReleaseForOwner(owner));
     try t.expectEqual(@as(u64, 0), store.stats().bytes);
+}
+
+fn deviceBudgetLifetime() !void {
+    const t = std.testing;
+    var store = Table(8, 12, 4){ .budget_bytes = 8192, .producer_budget_bytes = 4096 };
+    const app: Owner = .{ .kind = .program, .id = 1, .generation = 1 };
+    const other: Owner = .{ .kind = .program, .id = 2, .generation = 1 };
+    const gpu: Owner = .{ .kind = .driver, .id = 3, .generation = 7 };
+    const binding: layout.Binding = .{ .adapter = 4, .driver_owner = 3, .device_generation = 9 };
+    const descriptor: layout.Descriptor = .{ .bytes = 4096, .usage = 12, .location = .device_local, .binding = binding };
+    const cpu = try store.begin(app, .{ .bytes = 4096 });
+    const first = try store.beginOwned(gpu, descriptor, 21);
+    try t.expectError(error.Budget, store.beginOwned(gpu, descriptor, 22));
+    // A newly configured provider adopts its already represented boot BOs.
+    // Native capacity is independent of RAM and its per-program budget.
+    try store.setDeviceBudget(gpu, binding, 12288);
+    var large = descriptor; large.bytes = 8192;
+    const second = try store.beginOwned(gpu, large, 22);
+    const other_cpu = try store.begin(other, .{ .bytes = 4096 });
+    try t.expect(store.totalBudgetBytes() == 20480 and store.stats().bytes == 20480);
+    try t.expect((try store.deviceBudget(gpu, binding)).charged == 12288);
+    try t.expect(store.sharedChargedBytes() == 8192);
+    try t.expectEqualDeep(try store.deviceBudget(gpu, binding), try store.queryDeviceBudget(binding.adapter, binding.device_generation));
+    try t.expectError(error.Stale, store.queryDeviceBudget(binding.adapter, binding.device_generation + 1));
+    const replacement_driver: Owner = .{ .kind = .driver, .id = 5, .generation = 8 };
+    var replacement_binding = binding; replacement_binding.driver_owner = 5;
+    try t.expectError(error.Busy, store.setDeviceBudget(replacement_driver, replacement_binding, 8192));
+    try t.expectError(error.Budget, store.begin(app, .{ .bytes = 4096 }));
+    try store.setDeviceBudget(gpu, binding, 4096);
+    try t.expect((try store.deviceBudget(gpu, binding)).charged == 12288 and store.stats().device_bytes == 12288);
+    try t.expectError(error.Budget, store.beginOwned(gpu, descriptor, 23));
+    var wrong = binding; wrong.device_generation += 1;
+    try t.expectError(error.Busy, store.setDeviceBudget(gpu, wrong, 4096));
+    try t.expectError(error.Overflow, store.setDeviceBudget(gpu, binding, std.math.maxInt(u64) & ~@as(u64, 4095)));
+    try t.expect((try store.deviceBudget(gpu, binding)).limit == 4096);
+    try store.abortOwned(second, gpu, true);
+    try store.setDeviceBudget(gpu, binding, 8192);
+    const replacement = try store.beginOwned(gpu, descriptor, 23);
+    store.stoppedOwner(gpu);
+    try t.expect((try store.deviceBudget(gpu, binding)).closing);
+    try t.expectError(error.Closed, store.setDeviceBudget(gpu, binding, 12288));
+    try t.expectError(error.Closed, store.beginOwned(gpu, descriptor, 24));
+    try store.abortOwned(first, gpu, true);
+    try t.expect((try store.deviceBudget(gpu, binding)).charged == 4096);
+    try store.abortOwned(replacement, gpu, true);
+    try t.expectError(error.Stale, store.deviceBudget(gpu, binding));
+    try t.expect(store.totalBudgetBytes() == 8192);
+    try store.abort(cpu); try store.abort(other_cpu);
+    try t.expectEqualDeep(Stats{}, store.stats());
+}
+
+fn accountingLifetime() !void {
+    const t = std.testing;
+    var store = Table(4, 12, 12){ .budget_bytes = 16384, .producer_budget_bytes = 16384 };
+    const app: Owner = .{ .kind = .program, .id = 3, .generation = 1 };
+    const gpu: Owner = .{ .kind = .driver, .id = 4, .generation = 7 };
+    const binding: layout.Binding = .{ .adapter = 2, .driver_owner = 4, .device_generation = 9 };
+    var raster: layout.Descriptor = .{ .bytes = 1024, .format = .xrgb8888, .width = 16, .height = 16,
+        .plane_count = 1, .usage = layout.Usage.cpu_read | layout.Usage.scanout };
+    raster.planes[0].pitch = 64;
+    const cpu = try store.begin(app, raster);
+    const native = try store.beginOwned(gpu, .{ .bytes = 4091, .usage = 12, .location = .device_local, .binding = binding }, 19);
+    var stats = store.stats();
+    try t.expect(stats.bytes == 8192 and stats.system_bytes == 4096 and stats.device_bytes == 4096 and
+        stats.allocating_bytes == 8192 and stats.system_backed_bytes == 0 and stats.device_backed_bytes == 0);
+    try store.publish(cpu, .{ .cookie = 21, .bytes = 4096, .cpu_address = 0x10000, .cache = .write_back });
+    try store.commitOwned(native, gpu);
+    const shared = try store.share(cpu.reference, gpu);
+    const a = try store.use(cpu.reference, app, .cpu_read, 0, 1024);
+    const b = try store.use(cpu.reference, app, .cpu_read, 0, 1024);
+    const scanout = try store.use(shared, gpu, .scanout, 0, 1024);
+    const mapping = try store.use(shared, gpu, .device_mapping, 0, 1024);
+    const draw = try store.use(native.create.reference, gpu, .device_write, 0, 4091);
+    stats = store.stats();
+    try t.expect(stats.leases == 5 and stats.references == 3 and stats.system_backed_bytes == 4096 and
+        stats.device_backed_bytes == 4096 and stats.system_pinned_bytes == 4096 and stats.device_pinned_bytes == 4096 and
+        stats.scanout_pinned_bytes == 4096 and stats.device_mapped_bytes == 4096 and stats.allocating_bytes == 0);
+    store.stoppedOwner(app);
+    try t.expectError(error.Stale, store.useInfo(a.lease, app));
+    try t.expectError(error.Stale, store.useInfo(b.lease, app));
+    stats = store.stats();
+    try t.expect(stats.leases == 3 and stats.system_pinned_bytes == 4096 and stats.retained_bytes == 4096);
+    try store.drop(shared, gpu);
+    try store.drop(native.create.reference, gpu);
+    try t.expectError(error.Busy, store.endUse(draw.lease, gpu, false));
+    try t.expect(store.stats().device_pinned_bytes == 4096 and store.pendingRelease() == null);
+    try store.endUse(scanout.lease, gpu, true);
+    try t.expect(store.stats().scanout_pinned_bytes == 0 and store.stats().system_pinned_bytes == 4096);
+    try store.endUse(mapping.lease, gpu, true);
+    try store.endUse(draw.lease, gpu, true);
+    stats = store.stats();
+    try t.expect(stats.system_pinned_bytes == 0 and stats.device_pinned_bytes == 0 and
+        stats.device_mapped_bytes == 0 and stats.destroying_bytes == 8192);
+    const cpu_release = store.pendingSystemRelease().?;
+    try t.expectError(error.Busy, store.finishRelease(cpu_release, false));
+    const native_release = (try store.takeOwnedRelease(gpu, binding)).?;
+    try t.expectError(error.Busy, store.finishOwnedRelease(native_release, gpu, false));
+    try t.expect(store.stats().system_backed_bytes == 4096 and store.stats().device_backed_bytes == 4096);
+    try store.finishRelease(store.pendingSystemRelease().?, true);
+    try store.finishOwnedRelease(native_release, gpu, true);
+    try t.expectEqualDeep(Stats{}, store.stats());
 }
 
 fn ownedBackingLifetime(native_layout: bool) !void {
@@ -156,6 +268,12 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         };
         const Reference = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, read_only: bool = false, mapping_only: bool = false };
         const Lease = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, access: Access = .cpu_read, range: layout.Range = .{ .offset = 0, .bytes = 0 } };
+        const DeviceBudget = struct {
+            driver: Owner,
+            binding: layout.Binding,
+            bytes: u64,
+            closing: bool = false,
+        };
 
         objects: [object_capacity]Object = .{Object{}} ** object_capacity,
         references: [reference_capacity]Reference = .{Reference{}} ** reference_capacity,
@@ -164,18 +282,104 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         committed_bytes: u64 = 0,
         budget_bytes: u64,
         producer_budget_bytes: u64,
+        device_budgets: [@min(object_capacity, 16)]?DeviceBudget = @splat(null),
+
+        fn belongs(object: *const Object, budget: DeviceBudget) bool {
+            return object.phase != .empty and object.descriptor.location == .device_local and
+                object.producer.eql(budget.driver) and std.meta.eql(object.descriptor.binding, budget.binding);
+        }
+        fn budgetIndex(self: *const Self, producer: Owner, descriptor: layout.Descriptor) ?usize {
+            if (descriptor.location != .device_local or producer.kind != .driver) return null;
+            for (&self.device_budgets, 0..) |*slot, index| if (slot.*) |budget| {
+                if (budget.driver.eql(producer) and std.meta.eql(budget.binding, descriptor.binding)) return index;
+            };
+            return null;
+        }
+        fn chargedDevice(self: *const Self, budget: DeviceBudget) u64 {
+            var bytes: u64 = 0;
+            for (&self.objects) |*object| if (belongs(object, budget)) { bytes += object.allocation_bytes; };
+            return bytes;
+        }
+        /// Generic accounting limit supplied by the authenticated memory
+        /// provider. It grants no physical allocation or placement policy.
+        /// Live charges may exceed a reduced limit; new admission then waits
+        /// for confirmed retirement instead of forgetting existing backing.
+        pub fn setDeviceBudget(self: *Self, driver: Owner, binding: layout.Binding, bytes: u64) Error!void {
+            if (!driver.valid() or driver.kind != .driver or driver.id > std.math.maxInt(u32) or
+                !binding.valid() or binding.portable() or binding.driver_owner != driver.id or bytes % 4096 != 0) return error.Invalid;
+            var selected: ?usize = null;
+            var empty: ?usize = null;
+            var combined = self.budget_bytes;
+            for (&self.device_budgets, 0..) |*slot, index| {
+                const budget = slot.* orelse { if (empty == null) empty = index; continue; };
+                if (budget.driver.eql(driver) and std.meta.eql(budget.binding, binding)) {
+                    if (budget.closing) return error.Closed;
+                    selected = index;
+                    continue;
+                }
+                // An adapter has one physical admission domain. A new driver
+                // epoch must not double-budget backing retained by the old one.
+                if (budget.binding.adapter == binding.adapter) return error.Busy;
+                combined = std.math.add(u64, combined, budget.bytes) catch return error.Overflow;
+            }
+            _ = std.math.add(u64, combined, bytes) catch return error.Overflow;
+            const index = selected orelse empty orelse return error.Capacity;
+            self.device_budgets[index] = .{ .driver = driver, .binding = binding, .bytes = bytes };
+        }
+        pub fn deviceBudget(self: *const Self, driver: Owner, binding: layout.Binding) Error!BudgetSnapshot {
+            for (&self.device_budgets) |*slot| if (slot.*) |budget| {
+                if (budget.driver.eql(driver) and std.meta.eql(budget.binding, binding))
+                    return .{ .limit = budget.bytes, .charged = self.chargedDevice(budget), .closing = budget.closing };
+            };
+            return error.Stale;
+        }
+        pub fn queryDeviceBudget(self: *const Self, adapter: u32, generation: u64) Error!BudgetSnapshot {
+            if (adapter == 0 or generation == 0) return error.Invalid;
+            for (&self.device_budgets) |*slot| if (slot.*) |budget| {
+                if (budget.binding.adapter == adapter and budget.binding.device_generation == generation)
+                    return .{ .limit = budget.bytes, .charged = self.chargedDevice(budget), .closing = budget.closing };
+            };
+            return error.Stale;
+        }
+        pub fn sharedChargedBytes(self: *const Self) u64 {
+            var bytes = self.committed_bytes;
+            for (&self.device_budgets) |*slot| if (slot.*) |budget| { bytes -= self.chargedDevice(budget); };
+            return bytes;
+        }
+        pub fn totalBudgetBytes(self: *const Self) u64 {
+            var bytes = self.budget_bytes;
+            for (&self.device_budgets) |*slot| if (slot.*) |budget| { bytes += budget.bytes; };
+            return bytes; // Overflow was checked before configuration publication.
+        }
+        fn collectClosedBudgets(self: *Self) void {
+            for (&self.device_budgets) |*slot| if (slot.*) |budget| {
+                if (budget.closing and self.chargedDevice(budget) == 0) slot.* = null;
+            };
+        }
 
         pub fn begin(self: *Self, producer: Owner, descriptor: layout.Descriptor) Error!Create {
             return self.beginValidated(producer, descriptor, try layout.validate(descriptor));
         }
         fn beginValidated(self: *Self, producer: Owner, descriptor: layout.Descriptor, validated: layout.Layout) Error!Create {
             if (!producer.valid()) return error.Invalid;
-            if (self.committed_bytes > self.budget_bytes or validated.allocation_bytes > self.budget_bytes - self.committed_bytes) return error.Budget;
+            const selected = self.budgetIndex(producer, descriptor);
+            var shared_bytes: u64 = 0;
             var owner_bytes: u64 = 0;
             for (&self.objects) |object| {
-                if (object.phase != .empty and object.producer.eql(producer)) owner_bytes += object.allocation_bytes;
+                if (object.phase == .empty or self.budgetIndex(object.producer, object.descriptor) != null) continue;
+                shared_bytes += object.allocation_bytes;
+                if (object.producer.eql(producer)) owner_bytes += object.allocation_bytes;
             }
-            if (owner_bytes > self.producer_budget_bytes or validated.allocation_bytes > self.producer_budget_bytes - owner_bytes) return error.Budget;
+            if (selected) |index| {
+                const budget = self.device_budgets[index].?;
+                if (budget.closing) return error.Closed;
+                const charged = self.chargedDevice(budget);
+                if (charged > budget.bytes or validated.allocation_bytes > budget.bytes - charged) return error.Budget;
+            } else {
+                if (shared_bytes > self.budget_bytes or validated.allocation_bytes > self.budget_bytes - shared_bytes) return error.Budget;
+                if (owner_bytes > self.producer_budget_bytes or validated.allocation_bytes > self.producer_budget_bytes - owner_bytes) return error.Budget;
+            }
+            _ = std.math.add(u64, self.committed_bytes, validated.allocation_bytes) catch return error.Overflow;
             const slot = self.freeObject() orelse return error.Capacity;
             const reference_slot = self.freeReference() orelse return error.Capacity;
             // Reserve both serials before publication, so failure has no live
@@ -250,6 +454,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             };
             self.committed_bytes -= object.allocation_bytes;
             object.* = .{};
+            self.collectClosedBudgets();
         }
 
         pub fn import(self: *Self, buffer: Handle, consumer: Owner) Error!Handle {
@@ -403,6 +608,9 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         // Called only after the program lifecycle has stopped every CPU task.
         // Imported references of other consumers and all device uses survive.
         pub fn stoppedOwner(self: *Self, owner: Owner) void {
+            for (&self.device_budgets) |*slot| if (slot.*) |*budget| {
+                if (budget.driver.eql(owner)) budget.closing = true;
+            };
             for (&self.objects) |*object| {
                 if (object.phase != .empty and object.producer.eql(owner)) object.producer_open = false;
             }
@@ -421,6 +629,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             for (&self.objects) |*object| if (object.phase != .empty) {
                 self.maybeRelease(object);
             };
+            self.collectClosedBudgets();
         }
 
         // Returning a ticket does not release its budget or slot. The caller
@@ -488,6 +697,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             }
             self.committed_bytes -= object.allocation_bytes;
             object.* = .{};
+            self.collectClosedBudgets();
         }
 
         pub fn retainsDriver(self: *const Self, owner: Owner) bool {
@@ -505,13 +715,39 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
 
         pub fn stats(self: *const Self) Stats {
             var result = Stats{ .bytes = self.committed_bytes };
-            for (&self.objects) |object| {
+            // One bounded pass over leases, then one over objects. Aliases,
+            // overlapping ranges and multiple lease kinds never double-charge
+            // backing. These are overlapping subsets, not sums of allocation.
+            var uses: [object_capacity]u8 = @splat(0);
+            for (&self.leases) |lease| {
+                if (lease.handle.id == 0) continue;
+                std.debug.assert(lease.buffer.id != 0 and lease.buffer.id <= object_capacity);
+                const index = lease.buffer.id - 1;
+                std.debug.assert(self.objects[index].handle.eql(lease.buffer));
+                if (lease.access == .scanout) uses[index] |= 1;
+                if (lease.access == .device_mapping) uses[index] |= 2;
+            }
+            for (&self.objects, 0..) |object, index| {
                 if (object.phase == .empty) continue;
                 result.objects += 1;
                 result.references += object.references;
                 result.leases += object.leases;
                 if (!object.producer_open or object.phase == .releasing or object.phase == .destroying) result.retained_bytes += object.allocation_bytes;
+                const bytes = object.allocation_bytes;
+                const device = object.descriptor.location == .device_local;
+                if (device) result.device_bytes += bytes else result.system_bytes += bytes;
+                if (object.phase == .allocating) result.allocating_bytes += bytes;
+                if (object.phase == .releasing or object.phase == .destroying) result.destroying_bytes += bytes;
+                if (object.backing != null) {
+                    if (device) result.device_backed_bytes += bytes else result.system_backed_bytes += bytes;
+                    if (object.leases != 0) {
+                        if (device) result.device_pinned_bytes += bytes else result.system_pinned_bytes += bytes;
+                    }
+                }
+                if (uses[index] & 1 != 0) result.scanout_pinned_bytes += bytes;
+                if (uses[index] & 2 != 0) result.device_mapped_bytes += bytes;
             }
+            std.debug.assert(result.system_bytes + result.device_bytes == result.bytes);
             return result;
         }
 

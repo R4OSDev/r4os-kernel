@@ -59,6 +59,22 @@ test {
     _ = @import("kernel/graphics_boot_policy.zig");
     _ = @import("memory/gfx_buffer_layout.zig");
     _ = @import("memory/gfx_buffer_owner.zig");
+    {
+        const wire_stats = @import("program/gfx_buffer_stats_wire.zig");
+        const Stats = abi.GfxBufferStats;
+        var guarded: [@sizeOf(Stats) + 16]u8 align(@alignOf(Stats)) = undefined;
+        for (8..@sizeOf(Stats) + 9) |capacity| {
+            @memset(&guarded, 0xa5);
+            const ptr: *Stats = @ptrCast(&guarded);
+            ptr.version = 1; ptr.size = @intCast(capacity);
+            const count = wire_stats.capacity(ptr) orelse { try std.testing.expect(capacity < 56); continue; };
+            try std.testing.expect(count == (if (capacity < 136) @as(u32, 56) else 136));
+            wire_stats.write(ptr, count, .{ .committed_bytes = 0x100000007, .device_bytes = 0x100000007 });
+            try std.testing.expect(ptr.size == count and ptr.committed_bytes == 0x100000007);
+            if (count == 136) try std.testing.expect(ptr.device_bytes == 0x100000007);
+            try std.testing.expect(std.mem.allEqual(u8, guarded[count..], 0xa5));
+        }
+    }
     _ = @import("memory/gfx_allocation_state.zig");
     _ = @import("program/gfx_buffer_api.zig");
     _ = @import("kernel/mmio_windows.zig");

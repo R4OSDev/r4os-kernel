@@ -51,7 +51,7 @@ pub const Store = struct {
     pub fn register(self: *Store, driver: lifetime.Owner, request: abi.GfxAdditionalOutput) Error!abi.GfxOutputTarget {
         const binding = request.backend;
         if (driver.kind != .driver or !driver.valid() or request.version != 1 or request.size != @sizeOf(abi.GfxAdditionalOutput) or
-            request.flags != 0 or request.reserved0 != 0 or request.job_size != @sizeOf(abi.GfxDriverJob) or
+            request.flags != 0 or request.reserved0 != 0 or (request.job_size != 272 and request.job_size != @sizeOf(abi.GfxDriverJob)) or
             request.head_id >= capacity or request.width == 0 or request.width > 65536 or request.height == 0 or request.height > 65536 or
             request.format != abi.gfx_buffer_format_xrgb8888 or binding.adapter_id == 0 or
             request.output.adapter_id != binding.adapter_id or request.output.device_generation != binding.device_generation or

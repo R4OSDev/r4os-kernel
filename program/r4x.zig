@@ -7673,6 +7673,7 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_buffer_unmap = &apiGfxBufferUnmap,
         .gfx_buffer_export_raster = &apiGfxBufferExportRaster,
         .gfx_buffer_stats = &gfx_buffer_api.stats,
+        .gfx_memory_budget = &@import("gfx_memory_budget_api.zig").query,
         .gfx_queue_open = &apiGfxQueueOpen,
         .gfx_queue_close = &apiGfxQueueClose,
         .gfx_queue_submit = &apiGfxQueueSubmit,

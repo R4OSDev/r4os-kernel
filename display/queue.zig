@@ -147,7 +147,7 @@ fn nativeJobCapacity(backend: *const Backend) u32 {
 }
 // Caller holds the BO/queue metadata mutex during output admission.
 pub fn requireOutputTargetsLocked(identity: buffers.Owner, binding: model.Binding, job_size: u32) Error!void {
-    if (job_size != @sizeOf(abi.GfxDriverJob)) return error.Invalid;
+    if (job_size != 272 and job_size != @sizeOf(abi.GfxDriverJob)) return error.Invalid;
     const backend = try backendLocked(binding);
     if (!backend.owner.eql(identity)) return error.WrongOwner;
     if (backend.closing) return error.DeviceLost;
@@ -196,7 +196,7 @@ pub fn validateOutputBinding(id: u32, input: @import("r4os_kernel_contract").Gfx
     if (backend.closing) return error.DeviceLost;
     if (@intFromEnum(backend.milestone) != input.milestone) return error.Invalid;
 }
-pub fn takeNative(id: u32, binding: model.Binding, output_bytes: u32) Error!resource_model.Entry {
+pub fn takeNative(id: u32, binding: model.Binding, output_bytes: u32) Error!struct { entry: resource_model.Entry, producer: model.Owner } {
     if (irq.inDispatch()) return error.Unavailable;
     const instant = now();
     buffers.lock();
@@ -212,7 +212,7 @@ pub fn takeNative(id: u32, binding: model.Binding, output_bytes: u32) Error!reso
     ingress.arm(id, fence) catch unreachable;
     interrupts.restore(flags);
     buffers.visibility();
-    return resources.entries[fence.slot - 1];
+    return .{ .entry = resources.entries[fence.slot - 1], .producer = try state.producer(fence) };
 }
 pub fn nativeSegment(id: u32, fence: model.Fence, which: u32, offset: u64, mask: u64) Error!@import("r4os_kernel_contract").GfxDmaSegment {
     if (irq.inDispatch() or which > 1) return error.Invalid;

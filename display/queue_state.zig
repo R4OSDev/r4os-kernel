@@ -54,6 +54,11 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
             closing: bool = false,
             inflight: u32 = 0,
             jobs: u32 = 0,
+            // Shared by every live queue of this exact backend binding.
+            // It survives one producer closing/reopening all of its queues
+            // while another producer remains present.
+            last_owner: ?Owner = null,
+            next_owner_queue: usize = 0,
         };
         const Job = struct {
             fence: Fence = .{},
@@ -81,15 +86,20 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
         timeline_serial: u64 = 0,
         release_serial: u64 = 0,
         next_queue: usize = 0,
+        last_owner: ?Owner = null,
         terminal_publications: u64 = 0,
 
         pub fn open(self: *Self, owner: Owner, config: Config) Error!u64 {
             if (owner.id == 0 or owner.generation == 0 or config.capacity == 0 or config.capacity > fence_capacity or
                 config.binding.device_generation == 0 or config.binding.reset_generation == 0) return error.Invalid;
             if (self.timeline_serial == std.math.maxInt(u64)) return error.Exhausted;
+            var cursor: ?Owner = null;
+            var owner_cursor: usize = 0;
+            for (&self.queues) |*queue| if (queue.timeline != 0 and std.meta.eql(queue.config.binding, config.binding)) { cursor = queue.last_owner; break; };
+            for (&self.queues) |*queue| if (queue.timeline != 0 and queue.owner.eql(owner) and std.meta.eql(queue.config.binding, config.binding)) { owner_cursor = queue.next_owner_queue; break; };
             for (&self.queues) |*queue| if (queue.timeline == 0) {
                 self.timeline_serial += 1;
-                queue.* = .{ .timeline = self.timeline_serial, .owner = owner, .config = config };
+                queue.* = .{ .timeline = self.timeline_serial, .owner = owner, .config = config, .last_owner = cursor, .next_owner_queue = owner_cursor };
                 return queue.timeline;
             };
             return error.Capacity;
@@ -191,8 +201,14 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
             return self.takeReadyFor(null, now);
         }
 
+        pub fn producer(self: *Self, fence: Fence) Error!Owner {
+            return self.queues[self.jobs[try self.fenceIndex(fence)].queue].owner;
+        }
+
         pub fn takeReadyFor(self: *Self, binding: ?Binding, now: u64) ?Fence {
             self.expire(now);
+            var selected: ?usize = null;
+            var selected_after = false;
             var visited: usize = 0;
             while (visited < queue_capacity) : (visited += 1) {
                 const qi = (self.next_queue + visited) % queue_capacity;
@@ -225,12 +241,30 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
                     continue;
                 }
                 if (blocked) continue; // FIFO does not bypass a blocked head.
-                job.phase = .running;
-                job.active = true;
-                self.next_queue = (qi + 1) % queue_capacity;
-                return job.fence;
+                const cursor = if (binding != null) queue.last_owner else self.last_owner;
+                const after = if (cursor) |owner| ownerBefore(owner, queue.owner) else true;
+                if (selected) |previous| {
+                    const previous_owner = self.queues[self.jobs[previous].queue].owner;
+                    if (queue.owner.eql(previous_owner)) {
+                        const start = if (binding != null) queue.next_owner_queue else self.next_queue;
+                        const distance = (qi + queue_capacity - start) % queue_capacity;
+                        const previous_distance = (self.jobs[previous].queue + queue_capacity - start) % queue_capacity;
+                        if (distance >= previous_distance) continue;
+                    } else if ((!after and selected_after) or (after == selected_after and !ownerBefore(queue.owner, previous_owner))) continue;
+                }
+                selected = slot; selected_after = after;
             }
-            return null;
+            const job = &self.jobs[selected orelse return null];
+            const queue = self.queues[job.queue];
+            job.phase = .running;
+            job.active = true;
+            self.next_queue = (job.queue + 1) % queue_capacity;
+            self.last_owner = queue.owner;
+            for (&self.queues) |*peer| if (peer.timeline != 0 and std.meta.eql(peer.config.binding, queue.config.binding)) {
+                peer.last_owner = queue.owner;
+                if (peer.owner.eql(queue.owner)) peer.next_owner_queue = self.next_queue;
+            };
+            return job.fence;
         }
 
         /// O(1) worker metadata transition. IRQ producers use queue_ingress;
@@ -409,7 +443,49 @@ pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) typ
 const testing = std.testing;
 const test_owner = Owner{ .kind = .program, .id = 1, .generation = 2 };
 
+fn ownerBefore(left: Owner, right: Owner) bool {
+    if (left.kind != right.kind) return @intFromEnum(left.kind) < @intFromEnum(right.kind);
+    if (left.id != right.id) return left.id < right.id;
+    return left.generation < right.generation;
+}
+fn fairProducers() !void {
+    var state = Store(8, 32){};
+    const binding: Binding = .{ .adapter = 9 };
+    const owners = [_]Owner{ test_owner, .{ .kind = .program, .id = 2, .generation = 1 }, .{ .kind = .kernel, .id = 3, .generation = 1 } };
+    const order = [_]usize{ 0, 0, 1, 2, 0 };
+    var timelines: [5]u64 = undefined;
+    for (order, 0..) |producer, index| {
+        timelines[index] = try state.open(owners[producer], .{ .binding = binding, .capacity = 4 });
+        for (0..4) |_| _ = try state.submit(timelines[index], owners[producer], .{ .deadline_ns = 100 }, 0);
+    }
+    // Kernel owner, app1, app2: one turn per ready producer regardless of
+    // app1 opening three queues. The cursor is independent for each adapter.
+    const expected = [_]usize{ 2, 0, 1 };
+    var previous_app_queue: ?usize = null;
+    for (0..12) |turn| {
+        const other: Binding = .{ .adapter = 10 };
+        if (turn == 0) {
+            const timeline = try state.open(owners[2], .{ .binding = other });
+            _ = try state.submit(timeline, owners[2], .{ .deadline_ns = 100 }, 0);
+        }
+        if (turn == 2) {
+            const unrelated = state.takeReadyFor(other, 1).?;
+            try state.complete(unrelated, .complete, true, 1);
+        }
+        const selected = state.takeReadyFor(binding, turn + 1).?;
+        const queue_index = state.jobs[selected.slot - 1].queue;
+        try testing.expect(state.queues[queue_index].owner.eql(owners[expected[turn % 3]]));
+        try testing.expect((try state.producer(selected)).eql(owners[expected[turn % 3]]));
+        if (expected[turn % 3] == 0) {
+            if (previous_app_queue) |prior| try testing.expect(prior != queue_index);
+            previous_app_queue = queue_index;
+        }
+        try state.complete(selected, .complete, true, turn + 1);
+    }
+}
+
 test "running cancellation wakes once and keeps capacity and DMA until exact late completion" {
+    try fairProducers();
     var state = Store(2, 8){};
     const q = try state.open(test_owner, .{ .capacity = 1 });
     const f = try state.submit(q, test_owner, .{ .deadline_ns = 100 }, 0);

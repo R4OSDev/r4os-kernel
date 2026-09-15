@@ -146,14 +146,20 @@ pub fn unmap(owner: buffers.Owner, input: *const abi.GfxBufferHandle) i32 {
     return abi.gfx_buffer_result_ok;
 }
 pub fn stats(output: *abi.GfxBufferStats) callconv(.c) i32 {
-    if (!validOutput(abi.GfxBufferStats, output)) return abi.gfx_buffer_error_invalid;
+    const wire = @import("gfx_buffer_stats_wire.zig");
+    const count = wire.capacity(output) orelse return abi.gfx_buffer_error_invalid;
     const value: abi.GfxBufferStats = blk: {
         buffers.lock();
         defer buffers.unlock();
         const snapshot = buffers.store.stats();
-        break :blk .{ .objects = @intCast(snapshot.objects), .references = @intCast(snapshot.references), .leases = @intCast(snapshot.leases), .committed_bytes = snapshot.bytes, .retained_bytes = snapshot.retained_bytes, .budget_bytes = buffers.store.budget_bytes, .producer_budget_bytes = buffers.store.producer_budget_bytes };
+        break :blk .{ .objects = @intCast(snapshot.objects), .references = @intCast(snapshot.references), .leases = @intCast(snapshot.leases), .committed_bytes = snapshot.bytes, .retained_bytes = snapshot.retained_bytes, .budget_bytes = buffers.store.totalBudgetBytes(), .producer_budget_bytes = buffers.store.producer_budget_bytes,
+            .system_bytes = snapshot.system_bytes, .device_bytes = snapshot.device_bytes,
+            .system_backed_bytes = snapshot.system_backed_bytes, .device_backed_bytes = snapshot.device_backed_bytes,
+            .system_pinned_bytes = snapshot.system_pinned_bytes, .device_pinned_bytes = snapshot.device_pinned_bytes,
+            .scanout_pinned_bytes = snapshot.scanout_pinned_bytes, .device_mapped_bytes = snapshot.device_mapped_bytes,
+            .allocating_bytes = snapshot.allocating_bytes, .destroying_bytes = snapshot.destroying_bytes };
     };
-    output.* = value;
+    wire.write(output, count, value);
     return abi.gfx_buffer_result_ok;
 }
 

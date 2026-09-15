@@ -47,7 +47,8 @@ pub fn take(id: u32, input: *const abi.GfxBackendBinding, output: *abi.GfxDriver
     if (@intFromPtr(input) == 0 or irq.inDispatch()) return abi.gfx_queue_error_invalid;
     const bytes = wire.capacity(abi.GfxDriverJob, output) orelse return abi.gfx_queue_error_invalid;
     const value = binding(id, input.*) catch |err| return api.errorCode(err);
-    const job = queue.takeNative(id, value, bytes) catch |err| return api.errorCode(err);
+    const taken = queue.takeNative(id, value, bytes) catch |err| return api.errorCode(err);
+    const job = taken.entry;
     const result: abi.GfxDriverJob = .{
         .size = bytes,
         .fence = api.publicFence(job.fence),
@@ -63,6 +64,9 @@ pub fn take(id: u32, input: *const abi.GfxBackendBinding, output: *abi.GfxDriver
         .render = job.render,
         .deadline_ns = job.deadline_ns,
         .display_target = job.display_target,
+        .producer_kind = @as(u32, @intFromEnum(taken.producer.kind)) + 1,
+        .producer_id = taken.producer.id,
+        .producer_generation = taken.producer.generation,
     };
     wire.write(abi.GfxDriverJob, output, bytes, result);
     return abi.gfx_queue_ok;
