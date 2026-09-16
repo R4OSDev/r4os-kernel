@@ -13,8 +13,15 @@ const ownership = @import("gfx_driver_memory_owner.zig");
 const task_context = @import("../sched/task_context.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
+const heap = @import("../memory/heap.zig");
 pub const Owner = buffers.Owner;
-var state: ownership.State(@import("../driver/registry.zig").MAX_DRIVERS, 1024) = .{};
+const State = ownership.State(@import("../driver/registry.zig").MAX_DRIVERS);
+var state: State = .{};
+
+fn freeDevice(record: *State.Device) void {
+    const bytes: [*]u8 = @ptrCast(record);
+    std.debug.assert(heap.free(bytes[0..@sizeOf(State.Device)]) == .ok);
+}
 
 const LifecycleToken = union(enum) { boot: u64, task };
 fn lifecycleLock() LifecycleToken {
@@ -97,6 +104,11 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
     const call = task_context.enterUnwind();
     if (!call.admitted()) return abi.gfx_buffer_error_busy;
     defer _ = task_context.leaveUnwind(call);
+    const allocation = heap.alloc(@sizeOf(State.Device), @alignOf(State.Device)) orelse return abi.gfx_buffer_error_oom;
+    const record: *State.Device = @ptrCast(@alignCast(allocation.ptr));
+    record.* = .{};
+    var published = false;
+    defer if (!published) freeDevice(record);
     buffers.lockPrepared(.{ .leases = 1 }) catch |err| return api.status(err);
     const desc = buffers.store.describe(ref, identity) catch |err| {
         buffers.unlock();
@@ -129,11 +141,12 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
         .address_space = request.address_space,
         .dma_mask = request.dma_mask,
     };
-    const record = state.reserve(identity, descriptor) catch |err| {
+    state.reserve(identity, descriptor, record) catch |err| {
         buffers.store.endUse(use.lease, identity, true) catch unreachable;
         buffers.unlock();
         return api.status(err);
     };
+    published = true;
     buffers.unlock();
     // Both the backing and a busy device slot survive this page walk.
     // Another admission cannot reuse the slot, even if this one fails.
@@ -143,7 +156,8 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
             const piece = dmaSegment(use, offset, request.dma_mask) catch |err| {
                 buffers.lock();
                 buffers.store.endUse(use.lease, identity, true) catch unreachable;
-                record.* = .{};
+                state.detach(record) catch unreachable;
+                published = false;
                 buffers.unlock();
                 buffers.collect();
                 return api.status(err);
@@ -206,8 +220,9 @@ pub fn release(identity: Owner, input: *const abi.GfxDeviceLease, quiesced: u32)
         buffers.unlock();
         return api.status(err);
     };
-    record.* = .{};
+    state.detach(record) catch unreachable;
     buffers.unlock();
+    freeDevice(record);
     buffers.collect();
     return abi.gfx_buffer_result_ok;
 }
