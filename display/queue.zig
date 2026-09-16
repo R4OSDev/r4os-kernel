@@ -49,6 +49,7 @@ const Backend = struct {
     context: usize = 0,
     closing: bool = false,
     notifying: bool = false,
+    lifecycle_dirty: bool = false,
     work_handle: u32 = 0,
     display_timeline: u64 = 0,
     profile: abi.GfxBackendProfile = .{},
@@ -173,6 +174,29 @@ pub fn nativeOperations(id: u32, binding: model.Binding) Error!u64 {
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
     return backend.operations;
+}
+pub fn nativeQueueOwnerInfo(id: u32, binding: model.Binding, timeline: u64) Error!?abi.GfxQueueOwnerInfo {
+    if (irq.inDispatch()) return error.Unavailable;
+    if (timeline == 0) return error.Invalid;
+    buffers.lock(); defer buffers.unlock();
+    const backend = try backendLocked(binding);
+    if (id == 0 or backend.owner.id != id) return error.WrongOwner;
+    if (backend.closing) return error.DeviceLost;
+    for (&state.queues) |*queue| if (queue.timeline == timeline) {
+        if (!std.meta.eql(queue.config.binding, binding)) return error.Stale;
+        return .{ .timeline = timeline, .producer_kind = @as(u32, @intFromEnum(queue.owner.kind)) + 1,
+            .closing = @intFromBool(queue.closing), .producer_id = queue.owner.id, .producer_generation = queue.owner.generation,
+            .inflight_jobs = queue.inflight, .retained_jobs = queue.jobs };
+    };
+    return null;
+}
+// Resident hint only. The normal worker submits the callback after unlocking;
+// no allocation, wakeup or driver call occurs under the BO owner.
+fn queueClosingLocked(binding: model.Binding) void {
+    for (&backends) |*backend| if (backend.owner.id != 0 and !backend.closing and std.meta.eql(backend.binding, binding)) {
+        backend.lifecycle_dirty = true;
+        return;
+    };
 }
 fn nativeJobCapacity(backend: *const Backend) u32 {
     if (backend.job_operations & (@as(u64, 1) << abi.gfx_queue_operation_native) != 0) return @sizeOf(abi.GfxDriverJob);
@@ -493,7 +517,8 @@ fn notifyNative() bool {
         var ready = false;
         if (backend.owner.id != 0 and !backend.closing and !backend.notifying and backend.work_handle == 0) {
             const flags = interrupts.saveAndDisableRuntime();
-            ready = wakeups.take(i);
+            ready = wakeups.take(i) or backend.lifecycle_dirty;
+            backend.lifecycle_dirty = false;
             interrupts.restore(flags);
             for (&state.jobs) |job| if (job.fence.slot != 0 and
                 (job.phase == .queued or (job.scanout and (job.retire_requested or !job.client_reference or state.queues[job.queue].closing))) and
@@ -643,6 +668,10 @@ pub fn cancel(owner: buffers.Owner, fence: model.Fence) Error!void {
 pub fn close(owner: buffers.Owner, timeline: u64) Error!void {
     const instant = now();
     buffers.lock();
+    for (&state.queues) |*queue| if (queue.timeline == timeline and queue.owner.eql(owner)) {
+        queueClosingLocked(queue.config.binding);
+        break;
+    };
     state.close(timeline, owner, instant) catch |err| {
         buffers.unlock();
         return err;
@@ -662,6 +691,7 @@ pub fn drop(owner: buffers.Owner, fence: model.Fence) Error!void {
 pub fn stopped(owner: buffers.Owner) void {
     const instant = now();
     buffers.lock();
+    for (&state.queues) |*queue| if (queue.timeline != 0 and queue.owner.eql(owner)) queueClosingLocked(queue.config.binding);
     state.stopped(owner, instant);
     buffers.unlock();
     worker_event.signal();

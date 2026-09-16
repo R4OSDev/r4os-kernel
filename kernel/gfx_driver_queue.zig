@@ -145,6 +145,13 @@ pub fn readNativeInfo(id: u32, input: *const abi.GfxFence, output: *abi.GfxNativ
     output.* = result;
     return abi.gfx_queue_ok;
 }
+pub fn queueOwnerInfo(id: u32, input: *const abi.GfxBackendBinding, timeline: u64, output: *abi.GfxQueueOwnerInfo) i32 {
+    if (irq.inDispatch() or @intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxQueueOwnerInfo, output)) return abi.gfx_queue_error_invalid;
+    const value = binding(id, input.*) catch |err| return api.errorCode(err);
+    const snapshot = queue.nativeQueueOwnerInfo(id, value, timeline) catch |err| return api.errorCode(err);
+    if (snapshot) |info| { output.* = info; return abi.gfx_queue_ok; }
+    return 0;
+}
 pub fn readNativeData(id: u32, input: *const abi.GfxFence, offset: u32, output: [*]u8, count: u32) i32 {
     if (@intFromPtr(input) == 0 or @intFromPtr(output) == 0 or @intFromPtr(output) > std.math.maxInt(usize) - @as(usize, count)) return abi.gfx_queue_error_invalid;
     const result = queue.nativeData(id, api.fence(input.*), offset, count) catch |err| return api.errorCode(err);

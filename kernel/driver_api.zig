@@ -3593,6 +3593,7 @@ fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
         .read_native_info = @intFromPtr(&gfxQueueReadNativeInfo),
         .read_native_data = @intFromPtr(&gfxQueueReadNativeData),
         .read_native_binding = @intFromPtr(&gfxQueueReadNativeBinding),
+        .queue_owner_info = @intFromPtr(&gfxQueueOwnerInfo),
         .retain_scanout = @intFromPtr(&gfxQueueRetainScanout),
         .begin_scanout = @intFromPtr(&gfxQueueBeginScanout),
         .scanout_retire_requested = @intFromPtr(&gfxQueueScanoutRetireRequested),
@@ -3620,6 +3621,9 @@ fn gfxQueueReadNativeData(input: *const outputs_contract.GfxFence, offset: u32, 
 }
 fn gfxQueueReadNativeBinding(input: *const outputs_contract.GfxFence, index: u32, output: *outputs_contract.GfxNativeBinding) callconv(.c) i32 {
     return gfx_queue_api.readNativeBinding(activeOwner(), input, index, output);
+}
+fn gfxQueueOwnerInfo(input: *const outputs_contract.GfxBackendBinding, timeline: u64, output: *outputs_contract.GfxQueueOwnerInfo) callconv(.c) i32 {
+    return gfx_queue_api.queueOwnerInfo(activeOwner(), input, timeline, output);
 }
 fn gfxQueueUnregister(input: *const outputs_contract.GfxBackendBinding, quiesced: u32) callconv(.c) i32 {
     return gfx_queue_api.unregister(activeOwner(), input, quiesced);
