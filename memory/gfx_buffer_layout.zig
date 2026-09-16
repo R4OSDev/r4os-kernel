@@ -76,7 +76,7 @@ pub fn validateDriverOwned(descriptor: Descriptor) Error!Layout {
 }
 
 fn validateLayout(descriptor: Descriptor, owned: bool) Error!Layout {
-    if (descriptor.bytes == 0 or !std.math.isPowerOfTwo(descriptor.alignment) or
+    if (descriptor.bytes == 0 or descriptor.alignment == 0 or !std.math.isPowerOfTwo(descriptor.alignment) or
         descriptor.alignment > (@as(u64, 1) << 30) or descriptor.usage == 0 or
         (descriptor.usage & ~Usage.valid) != 0 or !descriptor.binding.valid()) return error.Invalid;
     const native_layout = descriptor.modifier != linear_modifier;
@@ -129,6 +129,7 @@ fn validateLayout(descriptor: Descriptor, owned: bool) Error!Layout {
 
 test "buffer layout keeps 64-bit sizes and rejects wrapping pitch, maps and padding" {
     const t = std.testing;
+    try t.expectError(error.Invalid, validate(.{ .bytes = 4096, .alignment = 0 }));
     const huge: u64 = @as(u64, 8) * 1024 * 1024 * 1024;
     try t.expectEqual(huge, (try validate(.{ .bytes = huge })).allocation_bytes);
     try t.expectError(error.Overflow, validate(.{ .bytes = std.math.maxInt(u64) }));
