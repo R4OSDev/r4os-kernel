@@ -115,7 +115,7 @@ pub fn submit(caller: buffers.Owner, input: *const a.DisplayCursorRequest, outpu
         !std.meta.eql(target.backend, current.info.backend)) return a.gfx_output_error_stale;
     current.validate(caller, input.*) catch |err| return code(err);
     if (input.operation == a.display_cursor_operation_prepare) {
-        buffers.lock();
+        buffers.lockPrepared(.{ .references = 2, .leases = 1 }) catch |err| return code(err);
         source.open(&buffers.store, caller, target.driver, input.*) catch |err| { buffers.unlock(); return code(err); };
         buffers.unlock();
     }

@@ -121,7 +121,7 @@ pub fn contains(target: abi.GfxOutputTarget) bool {
 }
 pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model.Submission, request: resources.Request) queue.Error!queue.model.Status {
     const result = blk: {
-        buffers.lock(); defer buffers.unlock();
+        try buffers.lockPrepared(.{ .leases = 2 }); defer buffers.unlock();
         const entry = store.find(request.display_target) catch return error.Stale;
         if (!entry.active or entry.mode_lost or entry.removing) return error.Unavailable;
         if (entry.mode_blocked) return error.Busy;

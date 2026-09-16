@@ -127,7 +127,7 @@ fn capture(_: usize, saved: *const display.BootSnapshot) bool {
     if (bytes == 0 or bytes > 256 * 1024 * 1024 or bytes > saved.mapping.byte_len or
         (bytes & 3) != 0 or (@intFromPtr(saved.framebuffer.address) & 3) != 0) return false;
     const caller = buffer_api.handle(current.request.reference) catch return false;
-    buffers.lock();
+    buffers.lockPrepared(.{ .references = 1, .leases = 1 }) catch return false;
     const descriptor = buffers.store.describe(caller, current.identity) catch { buffers.unlock(); return false; };
     if (descriptor.format != .bytes or descriptor.location != .system or !descriptor.binding.portable() or
         descriptor.bytes != bytes or descriptor.usage & (buffers.layout.Usage.cpu_read | buffers.layout.Usage.cpu_write) !=

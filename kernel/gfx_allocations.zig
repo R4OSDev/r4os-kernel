@@ -129,7 +129,7 @@ pub fn query(owner: buffers.Owner, handle: buffers.Handle) Error!abi.GfxNativeSt
 pub fn receive(owner: buffers.Owner, handle: buffers.Handle, output: *abi.GfxBufferReference) i32 {
     const instant = now();
     const result = blk: {
-        buffers.lock();
+        buffers.lockPrepared(.{ .references = 1 }) catch |err| return errorCode(err);
         defer buffers.unlock();
         const entry = state.owned(handle, owner) catch |err| return errorCode(err);
         if (entry.phase != .terminal) return abi.gfx_buffer_error_busy;
@@ -185,7 +185,7 @@ pub fn complete(owner: buffers.Owner, provider_handle: buffers.Handle, handle: b
     if (result != 1 and (reference.id != 0 or reference.generation != 0)) return error.Invalid;
     const instant = now();
     {
-        buffers.lock();
+        try buffers.lockPrepared(.{ .references = if (result == 1) 1 else 0 });
         defer buffers.unlock();
         _ = try providerLocked(provider_handle, owner);
         const entry = try state.claim(handle, provider_handle);

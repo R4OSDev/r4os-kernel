@@ -49,6 +49,7 @@ pub const Stats = struct {
 };
 
 test "CPU backing release failure remains visible to the exact driver epoch without public references" {
+    try dynamicStorageLifetime();
     try accountingLifetime();
     try deviceBudgetLifetime();
     try ownedBackingLifetime(false);
@@ -74,6 +75,65 @@ test "CPU backing release failure remains visible to the exact driver epoch with
     try store.finishRelease(store.pendingRelease().?, true);
     try t.expect(!store.pendingReleaseForOwner(owner));
     try t.expectEqual(@as(u64, 0), store.stats().bytes);
+}
+
+fn dynamicStorageLifetime() !void {
+    const t = std.testing;
+    const S = DynamicTable();
+    var store: S = .{ .budget_bytes = 8 * 1024 * 1024, .producer_budget_bytes = 8 * 1024 * 1024 };
+    defer inline for (std.enums.values(Pool)) |kind| t.allocator.free(@field(store, @tagName(kind)));
+    const app: Owner = .{ .kind = .program, .id = 4, .generation = 10 };
+    const driver: Owner = .{ .kind = .driver, .id = 8, .generation = 17 };
+    var first: Create = undefined;
+    var first_mapping: Use = undefined;
+    var descriptor: layout.Descriptor = .{ .bytes = 4096, .usage = 63, .format = .argb8888,
+        .width = 32, .height = 32, .plane_count = 1 };
+    descriptor.planes[0].pitch = 128;
+    // These counts cross the old production pools; none is an implementation
+    // limit. Storage replacement must preserve IDs, generations and leases.
+    for (0..513) |i| {
+        inline for (std.enums.values(Pool)) |kind| {
+            const needed: usize = switch (kind) { .objects => 1, .references => 4, .leases => 6 };
+            if (store.freeSlots(kind, needed) < needed) {
+                const size = @max(8, @field(store, @tagName(kind)).len * 2);
+                const replacement = try t.allocator.alloc(S.Element(kind), size);
+                @memset(replacement[@field(store, @tagName(kind)).len..], .{});
+                const old = try store.replaceStorage(kind, replacement);
+                t.allocator.free(old);
+            }
+        }
+        const created = try store.begin(app, descriptor);
+        try store.publish(created, .{ .cookie = i + 1, .bytes = 4096 });
+        const imported = try store.share(created.reference, driver);
+        _ = try store.share(imported, driver);
+        _ = try store.share(imported, driver);
+        for (0..5) |lease| {
+            const mapping = try store.use(imported, driver, .device_mapping, 0, 4096);
+            if (i == 0 and lease == 0) first_mapping = mapping;
+        }
+        if (i == 0) {
+            first = created;
+            _ = try store.use(imported, driver, .scanout, 0, 4096);
+        }
+        try t.expect((try store.describe(first.reference, app)).bytes == 4096);
+        try t.expectEqualDeep(first_mapping, try store.useInfo(first_mapping.lease, driver));
+    }
+    const before = store.stats();
+    try t.expect(before.objects == 513 and before.references == 2052 and before.leases == 2566 and
+        before.device_mapped_bytes == 513 * 4096 and before.scanout_pinned_bytes == 4096);
+    store.stoppedOwner(app);
+    store.stoppedOwner(driver);
+    try t.expect(store.stats().references == 0 and store.pendingSystemRelease() == null);
+    try t.expectError(error.Busy, store.endUse(first_mapping.lease, driver, false));
+    for (store.leases) |*lease| if (lease.handle.id != 0) try store.endUse(lease.handle, driver, true);
+    var freed: usize = 0;
+    while (store.pendingSystemRelease()) |ticket| {
+        try store.finishRelease(ticket, true);
+        freed += 1;
+    }
+    try t.expect(freed == 513);
+    try t.expectEqualDeep(Stats{}, store.stats());
+    try t.expectError(error.Stale, store.useInfo(first_mapping.lease, driver));
 }
 
 fn deviceBudgetLifetime() !void {
@@ -297,9 +357,21 @@ fn resetBackingLifetime() !void {
     try t.expectEqualDeep(Stats{}, store.stats());
 }
 
-pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize, comptime lease_capacity: usize) type {
+pub const Pool = enum { objects, references, leases };
+/// Production metadata grows outside the enclosing no-sleep owner. Handles
+/// survive replacement; internal record pointers never escape that owner.
+pub fn DynamicTable() type { return StorageTable(null, null, null); }
+/// Fixed backing remains useful for bounded lifetime/fault models.
+pub fn Table(comptime objects: usize, comptime references: usize, comptime leases: usize) type {
+    return StorageTable(objects, references, leases);
+}
+fn Slice(comptime SelfPointer: type, comptime Element: type) type {
+    return if (@typeInfo(SelfPointer).pointer.is_const) []const Element else []Element;
+}
+fn StorageTable(comptime object_capacity: ?usize, comptime reference_capacity: ?usize, comptime lease_capacity: ?usize) type {
     comptime {
-        if (object_capacity > std.math.maxInt(u32) or reference_capacity > std.math.maxInt(u32) or lease_capacity > std.math.maxInt(u32)) @compileError("buffer handle capacity exceeds u32");
+        for ([_]?usize{object_capacity, reference_capacity, lease_capacity}) |capacity|
+            if (capacity != null and capacity.? > std.math.maxInt(u32)) @compileError("buffer handle capacity exceeds u32");
     }
     return struct {
         const Self = @This();
@@ -314,6 +386,8 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             backing: ?Backing = null,
             references: u32 = 0,
             leases: u32 = 0,
+            scanout_leases: u32 = 0,
+            mapping_leases: u32 = 0,
             release_attempt: u64 = 0,
             owned_cookie: u64 = 0,
             owned_reference: Handle = .{},
@@ -329,14 +403,54 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             closing: bool = false,
         };
 
-        objects: [object_capacity]Object = .{Object{}} ** object_capacity,
-        references: [reference_capacity]Reference = .{Reference{}} ** reference_capacity,
-        leases: [lease_capacity]Lease = .{Lease{}} ** lease_capacity,
+        objects: if (object_capacity) |n| [n]Object else []Object = if (object_capacity != null) @splat(Object{}) else &.{},
+        references: if (reference_capacity) |n| [n]Reference else []Reference = if (reference_capacity != null) @splat(Reference{}) else &.{},
+        leases: if (lease_capacity) |n| [n]Lease else []Lease = if (lease_capacity != null) @splat(Lease{}) else &.{},
         serial: u64 = 0,
         committed_bytes: u64 = 0,
         budget_bytes: u64,
         producer_budget_bytes: u64,
-        device_budgets: [@min(object_capacity, 16)]?DeviceBudget = @splat(null),
+        device_budgets: [@min(object_capacity orelse 16, 16)]?DeviceBudget = @splat(null),
+
+        pub fn Element(comptime kind: Pool) type {
+            return switch (kind) { .objects => Object, .references => Reference, .leases => Lease };
+        }
+        fn objectsSlice(self: anytype) Slice(@TypeOf(self), Object) {
+            return if (object_capacity != null) &self.objects else self.objects;
+        }
+        fn referencesSlice(self: anytype) Slice(@TypeOf(self), Reference) {
+            return if (reference_capacity != null) &self.references else self.references;
+        }
+        fn leasesSlice(self: anytype) Slice(@TypeOf(self), Lease) {
+            return if (lease_capacity != null) &self.leases else self.leases;
+        }
+        pub fn freeSlots(self: *const Self, comptime kind: Pool, needed: usize) usize {
+            const values = switch (kind) { .objects => self.objectsSlice(), .references => self.referencesSlice(), .leases => self.leasesSlice() };
+            var count: usize = 0;
+            for (values) |*value| if (value.handle.id == 0) {
+                count += 1;
+                if (count >= needed) break;
+            };
+            return count;
+        }
+        /// Caller allocated resident replacement before taking the metadata
+        /// owner. Return the detached old storage for release after unlocking.
+        /// The caller initializes the new tail to default records outside the
+        /// owner; the existing prefix is copied from the latest locked state.
+        /// No record pointer may be retained across this owner boundary.
+        pub fn replaceStorage(self: *Self, comptime kind: Pool, prepared: []Element(kind)) Error![]Element(kind) {
+            const capacity = switch (kind) { .objects => object_capacity, .references => reference_capacity, .leases => lease_capacity };
+            if (capacity != null) return error.Unsupported;
+            const old = @field(self, @tagName(kind));
+            if (prepared.len <= old.len or prepared.len > std.math.maxInt(u32)) return error.Invalid;
+            const start = @intFromPtr(prepared.ptr);
+            const end = start + std.mem.sliceAsBytes(prepared).len;
+            const previous = @intFromPtr(old.ptr);
+            if (old.len != 0 and start < previous + std.mem.sliceAsBytes(old).len and previous < end) return error.Invalid;
+            @memcpy(prepared[0..old.len], old);
+            @field(self, @tagName(kind)) = prepared;
+            return old;
+        }
 
         fn belongs(object: *const Object, budget: DeviceBudget) bool {
             return object.phase != .empty and object.descriptor.location == .device_local and
@@ -351,7 +465,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         }
         fn chargedDevice(self: *const Self, budget: DeviceBudget) u64 {
             var bytes: u64 = 0;
-            for (&self.objects) |*object| if (belongs(object, budget)) { bytes += object.allocation_bytes; };
+            for (self.objectsSlice()) |*object| if (belongs(object, budget)) { bytes += object.allocation_bytes; };
             return bytes;
         }
         /// Generic accounting limit supplied by the authenticated memory
@@ -419,7 +533,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             const selected = self.budgetIndex(producer, descriptor);
             var shared_bytes: u64 = 0;
             var owner_bytes: u64 = 0;
-            for (&self.objects) |object| {
+            for (self.objectsSlice()) |object| {
                 if (object.phase == .empty or self.budgetIndex(object.producer, object.descriptor) != null) continue;
                 shared_bytes += object.allocation_bytes;
                 if (object.producer.eql(producer)) owner_bytes += object.allocation_bytes;
@@ -454,7 +568,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             if (descriptor.location != .device_local or descriptor.binding.portable() or
                 descriptor.binding.driver_owner != driver.id or
                 descriptor.usage & (layout.Usage.cpu_read | layout.Usage.cpu_write) != 0) return error.Unsupported;
-            for (&self.objects) |object| {
+            for (self.objectsSlice()) |object| {
                 if (object.phase != .empty and object.producer.eql(driver) and object.owned_cookie == cookie and
                     std.meta.eql(object.descriptor.binding, descriptor.binding)) return error.Busy;
             }
@@ -503,7 +617,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         pub fn abort(self: *Self, ticket: Create) Error!void {
             const object = try self.findObject(ticket.buffer);
             if (object.phase != .allocating or object.backing != null) return error.Stale;
-            for (&self.references) |*reference| if (reference.buffer.eql(ticket.buffer)) {
+            for (self.referencesSlice()) |*reference| if (reference.buffer.eql(ticket.buffer)) {
                 reference.* = .{};
             };
             self.committed_bytes -= object.allocation_bytes;
@@ -535,7 +649,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         // Sharing names a live reference, preserving immutable-export mode.
         // A bare diagnostic object ID is not an importable reference.
         pub fn share(self: *Self, handle: Handle, consumer: Owner) Error!Handle {
-            if (handle.id == 0 or handle.id > reference_capacity or handle.generation == 0) return error.Stale;
+            if (handle.id == 0 or handle.id > self.references.len or handle.generation == 0) return error.Stale;
             const item = self.references[handle.id - 1];
             if (!item.handle.eql(handle)) return error.Stale;
             if (item.mapping_only) return error.Unsupported;
@@ -565,7 +679,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             const object = try self.referencedObject(reference, owner);
             if (object.phase != .live or object.device_lost) return error.Closed;
             if (writes(access)) {
-                for (&self.references) |item| if (item.handle.id != 0 and item.buffer.eql(object.handle) and item.read_only) {
+                for (self.referencesSlice()) |item| if (item.handle.id != 0 and item.buffer.eql(object.handle) and item.read_only) {
                     return error.Busy;
                 };
             }
@@ -586,13 +700,15 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             if (required != 0 and (object.descriptor.usage & required) == 0) return error.Unsupported;
             if ((access == .cpu_read or access == .cpu_write) and backing.cpu_address == 0) return error.Unsupported;
             if (access == .cpu_read and backing.cache == .write_combining) return error.Unsupported;
-            for (&self.leases) |lease| {
+            for (self.leasesSlice()) |lease| {
                 if (lease.handle.id != 0 and lease.buffer.eql(object.handle) and conflicts(lease.access, access)) return error.Busy;
             }
             const slot = self.freeLease() orelse return error.Capacity;
             const token = try self.nextHandle(slot);
             self.leases[slot] = .{ .handle = token, .buffer = object.handle, .owner = owner, .access = access, .range = .{ .offset = offset, .bytes = bytes } };
             object.leases += 1;
+            if (access == .scanout) object.scanout_leases += 1;
+            if (access == .device_mapping) object.mapping_leases += 1;
             return .{ .lease = token, .buffer = object.handle, .access = access, .backing = backing, .range = .{ .offset = offset, .bytes = bytes } };
         }
 
@@ -646,6 +762,8 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             const lease = try self.findLease(handle, owner);
             if (isDevice(lease.access) and !device_quiesced) return error.Busy;
             const object = try self.findObject(lease.buffer);
+            if (lease.access == .scanout) object.scanout_leases -= 1;
+            if (lease.access == .device_mapping) object.mapping_leases -= 1;
             lease.* = .{};
             object.leases -= 1;
             self.maybeRelease(object);
@@ -671,7 +789,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             for (&self.device_budgets) |*slot| if (slot.*) |*budget| {
                 if (budget.driver.eql(driver) and std.meta.eql(budget.binding, binding)) budget.closing = true;
             };
-            for (&self.objects) |*object| {
+            for (self.objectsSlice()) |*object| {
                 if (object.phase == .empty or object.descriptor.location != .device_local or
                     !object.producer.eql(driver) or !std.meta.eql(object.descriptor.binding, binding)) continue;
                 object.device_lost = true;
@@ -688,22 +806,22 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             for (&self.device_budgets) |*slot| if (slot.*) |*budget| {
                 if (budget.driver.eql(owner)) budget.closing = true;
             };
-            for (&self.objects) |*object| {
+            for (self.objectsSlice()) |*object| {
                 if (object.phase != .empty and object.producer.eql(owner)) object.producer_open = false;
             }
-            for (&self.references) |*reference| {
+            for (self.referencesSlice()) |*reference| {
                 if (reference.handle.id == 0 or !reference.owner.eql(owner)) continue;
                 const object = self.findObject(reference.buffer) catch unreachable;
                 reference.* = .{};
                 object.references -= 1;
             }
-            for (&self.leases) |*lease| {
+            for (self.leasesSlice()) |*lease| {
                 if (lease.handle.id == 0 or !lease.owner.eql(owner) or isDevice(lease.access)) continue;
                 const object = self.findObject(lease.buffer) catch unreachable;
                 lease.* = .{};
                 object.leases -= 1;
             }
-            for (&self.objects) |*object| if (object.phase != .empty) {
+            for (self.objectsSlice()) |*object| if (object.phase != .empty) {
                 self.maybeRelease(object);
             };
             self.collectClosedBudgets();
@@ -713,7 +831,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         // must acknowledge successful VM/TLB or backend destruction outside
         // the metadata lock. Failure remains discoverable and retryable.
         pub fn pendingReleaseForOwner(self: *const Self, producer: Owner) bool {
-            for (&self.objects) |object| {
+            for (self.objectsSlice()) |object| {
                 if ((object.phase == .releasing or object.phase == .destroying) and object.producer.eql(producer)) return true;
                 if (object.phase == .allocating and object.owned_cookie != 0 and object.producer.eql(producer)) return true;
             }
@@ -733,7 +851,7 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             return .{ .release = ticket, .driver = driver, .binding = binding };
         }
         fn pendingFiltered(self: *Self, owned: ?OwnedRelease, system_only: bool) ?Release {
-            for (&self.objects) |*object| if (object.phase == .releasing) {
+            for (self.objectsSlice()) |*object| if (object.phase == .releasing) {
                 const backing = object.backing orelse continue;
                 if (system_only and backing.driver != null) continue;
                 if (owned) |filter| {
@@ -789,13 +907,13 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
         }
 
         pub fn retainsDriver(self: *const Self, owner: Owner) bool {
-            for (&self.objects) |object| {
+            for (self.objectsSlice()) |object| {
                 if (object.phase != .empty and object.owned_cookie != 0 and object.producer.eql(owner)) return true;
             }
-            for (&self.objects) |object| if (object.backing) |backing| if (backing.driver) |driver| {
+            for (self.objectsSlice()) |object| if (object.backing) |backing| if (backing.driver) |driver| {
                 if (driver.eql(owner)) return true;
             };
-            for (&self.leases) |lease| {
+            for (self.leasesSlice()) |lease| {
                 if (lease.handle.id != 0 and lease.owner.eql(owner) and isDevice(lease.access)) return true;
             }
             return false;
@@ -803,19 +921,10 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
 
         pub fn stats(self: *const Self) Stats {
             var result = Stats{ .bytes = self.committed_bytes };
-            // One bounded pass over leases, then one over objects. Aliases,
+            // One pass over objects. Aliases,
             // overlapping ranges and multiple lease kinds never double-charge
             // backing. These are overlapping subsets, not sums of allocation.
-            var uses: [object_capacity]u8 = @splat(0);
-            for (&self.leases) |lease| {
-                if (lease.handle.id == 0) continue;
-                std.debug.assert(lease.buffer.id != 0 and lease.buffer.id <= object_capacity);
-                const index = lease.buffer.id - 1;
-                std.debug.assert(self.objects[index].handle.eql(lease.buffer));
-                if (lease.access == .scanout) uses[index] |= 1;
-                if (lease.access == .device_mapping) uses[index] |= 2;
-            }
-            for (&self.objects, 0..) |object, index| {
+            for (self.objectsSlice()) |object| {
                 if (object.phase == .empty) continue;
                 result.objects += 1;
                 result.references += object.references;
@@ -832,8 +941,8 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
                         if (device) result.device_pinned_bytes += bytes else result.system_pinned_bytes += bytes;
                     }
                 }
-                if (uses[index] & 1 != 0) result.scanout_pinned_bytes += bytes;
-                if (uses[index] & 2 != 0) result.device_mapped_bytes += bytes;
+                if (object.scanout_leases != 0) result.scanout_pinned_bytes += bytes;
+                if (object.mapping_leases != 0) result.device_mapped_bytes += bytes;
             }
             std.debug.assert(result.system_bytes + result.device_bytes == result.bytes);
             return result;
@@ -853,13 +962,13 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             return .{ .id = @intCast(slot + 1), .generation = self.serial };
         }
         fn findObject(self: *Self, handle: Handle) Error!*Object {
-            if (handle.id == 0 or handle.id > object_capacity or handle.generation == 0) return error.Stale;
+            if (handle.id == 0 or handle.id > self.objects.len or handle.generation == 0) return error.Stale;
             const item = &self.objects[handle.id - 1];
             if (item.phase == .empty or !item.handle.eql(handle)) return error.Stale;
             return item;
         }
         fn findReference(self: *Self, handle: Handle, owner: Owner) Error!*Reference {
-            if (handle.id == 0 or handle.id > reference_capacity or handle.generation == 0) return error.Stale;
+            if (handle.id == 0 or handle.id > self.references.len or handle.generation == 0) return error.Stale;
             const item = &self.references[handle.id - 1];
             if (!item.handle.eql(handle)) return error.Stale;
             if (!item.owner.eql(owner)) return error.WrongOwner;
@@ -869,26 +978,26 @@ pub fn Table(comptime object_capacity: usize, comptime reference_capacity: usize
             return self.findObject((try self.findReference(handle, owner)).buffer);
         }
         fn findLease(self: *Self, handle: Handle, owner: Owner) Error!*Lease {
-            if (handle.id == 0 or handle.id > lease_capacity or handle.generation == 0) return error.Stale;
+            if (handle.id == 0 or handle.id > self.leases.len or handle.generation == 0) return error.Stale;
             const item = &self.leases[handle.id - 1];
             if (!item.handle.eql(handle)) return error.Stale;
             if (!item.owner.eql(owner)) return error.WrongOwner;
             return item;
         }
         fn freeObject(self: *const Self) ?usize {
-            for (&self.objects, 0..) |item, index| if (item.phase == .empty) {
+            for (self.objectsSlice(), 0..) |item, index| if (item.phase == .empty) {
                 return index;
             };
             return null;
         }
         fn freeReference(self: *const Self) ?usize {
-            for (&self.references, 0..) |item, index| if (item.handle.id == 0) {
+            for (self.referencesSlice(), 0..) |item, index| if (item.handle.id == 0) {
                 return index;
             };
             return null;
         }
         fn freeLease(self: *const Self) ?usize {
-            for (&self.leases, 0..) |item, index| if (item.handle.id == 0) {
+            for (self.leasesSlice(), 0..) |item, index| if (item.handle.id == 0) {
                 return index;
             };
             return null;

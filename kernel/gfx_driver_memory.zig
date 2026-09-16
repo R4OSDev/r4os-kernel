@@ -96,7 +96,7 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
     const call = task_context.enterUnwind();
     if (!call.admitted()) return abi.gfx_buffer_error_busy;
     defer _ = task_context.leaveUnwind(call);
-    buffers.lock();
+    buffers.lockPrepared(.{ .leases = 1 }) catch |err| return api.status(err);
     const desc = buffers.store.describe(ref, identity) catch |err| {
         buffers.unlock();
         return api.status(err);

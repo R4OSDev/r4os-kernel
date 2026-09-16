@@ -34,7 +34,7 @@ pub fn reserve(identity: Owner, input: *const abi.GfxBufferDescriptor, cookie: u
     if (!call.admitted()) return abi.gfx_buffer_error_busy;
     defer _ = context.leaveUnwind(call);
     const ticket = blk: {
-        buffers.lock();
+        buffers.lockPrepared(.{ .objects = 1, .references = 1 }) catch |err| return api.status(err);
         defer buffers.unlock();
         driver.admitLocked(identity) catch |err| return api.status(err);
         break :blk buffers.store.beginOwned(identity, desc, cookie) catch |err| return api.status(err);

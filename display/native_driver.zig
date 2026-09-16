@@ -168,7 +168,7 @@ fn prepareImpl(identity: buffers.Owner, request: abi.GfxNativeRegistration, held
     try outputs.validateNative(@intCast(identity.id), request.backend, request.output, saved.mode.width, saved.mode.height, held_generation != 0);
     const caller_reference = try buffer_api.handle(request.reference);
     const prepared = blk: {
-        buffers.lock(); defer buffers.unlock();
+        try buffers.lockPrepared(.{ .references = 1, .leases = 1 }); defer buffers.unlock();
         const descriptor = try buffers.store.describe(caller_reference, identity);
         if (descriptor.format != .xrgb8888 or descriptor.location != .system or !descriptor.binding.portable() or
             descriptor.modifier != 0 or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0 or
@@ -316,7 +316,8 @@ fn beginCpu(_: usize) bool {
     if (!execution.enter(0)) return false;
     defer _ = execution.leave();
     if (bridge.encoded_output or bridge.cpu_lease.id != 0 or bridge.reference.id == 0 or bridge.pending != null or !imageIdle()) return false;
-    buffers.lock(); defer buffers.unlock();
+    buffers.lockPrepared(.{ .leases = 1 }) catch return false;
+    defer buffers.unlock();
     const use = buffers.mapLocked(bridge.reference, owner, .cpu_write, 0, bridge.bytes) catch return false;
     if (use.backing.cpu_address != @intFromPtr(bridge.frame.address)) {
         buffers.unmapCpuLocked(use.lease, owner) catch {};
@@ -521,7 +522,7 @@ pub fn prepareModeEncoding(caller: buffers.Owner, assignment: abi.GfxScanoutStat
         assignment.destination_width != mode.width or assignment.destination_height != mode.height or
         assignment.rotation != 0 or assignment.color != 0 or assignment.bits_per_color != 8) return error.Unsupported;
     const source = try buffer_api.handle(assignment.buffer);
-    buffers.lock(); defer buffers.unlock();
+    try buffers.lockPrepared(.{ .references = 2, .leases = 1 }); defer buffers.unlock();
     const descriptor = try buffers.store.describe(source, caller);
     const usage = buffers.layout.Usage.cpu_write | buffers.layout.Usage.transfer_source | buffers.layout.Usage.scanout;
     if (descriptor.format != .xrgb8888 or descriptor.location != .system or !descriptor.binding.portable() or
@@ -560,7 +561,7 @@ pub fn startMode(operation: u32, expected: ModeBinding) Error!void {
     try queue.validateOutputBinding(@intCast(expected.driver.id), expected.backend);
     const surface = if (operation == abi.gfx_mode_operation_apply) &change.old else if (operation == abi.gfx_mode_operation_rollback) &change.new else return;
     if (surface.read_lease.id == 0) {
-        buffers.lock(); defer buffers.unlock();
+        try buffers.lockPrepared(.{ .leases = 1 }); defer buffers.unlock();
         surface.read_lease = (try buffers.store.use(surface.reference, owner, .device_read, 0, surface.bytes)).lease;
     }
 }

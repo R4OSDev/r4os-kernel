@@ -1510,7 +1510,10 @@ fn sharedRasterAllocate(owner: ProgramProcessHandle, info: GuiSharedRasterCreate
     };
     descriptor.planes[0] = .{ .offset = info.data_offset, .pitch = info.stride_bytes };
     var allocation = gfx_buffers.create(graphicsOwner(owner), descriptor) catch return null;
-    lockSharedRasterState();
+    gfx_buffers.lockPrepared(.{ .references = 1 }) catch {
+        gfx_buffers.drop(allocation.reference, graphicsOwner(owner)) catch {};
+        return null;
+    };
     const bridge = gfx_buffers.store.import(allocation.buffer, gfx_buffers.raster_owner) catch {
         _ = shared_raster_lock.unlock();
         gfx_buffers.drop(allocation.reference, graphicsOwner(owner)) catch {};
@@ -1598,7 +1601,7 @@ fn sharedRasterDestroy(owner: ProgramProcessHandle, handle: GuiSharedRasterHandl
 }
 
 fn sharedRasterMapWrite(owner: ProgramProcessHandle, handle: GuiSharedRasterHandle, out_map: *GuiSharedRasterWriteMap) i32 {
-    lockSharedRasterState();
+    gfx_buffers.lockPrepared(.{ .leases = 1 }) catch |err| return if (err == error.OutOfMemory) r4x_api.gui_frame_error_oom else r4x_api.gui_frame_error_state;
     const resource = sharedRasterResourceLocked(handle) orelse {
         _ = shared_raster_lock.unlock();
         return r4x_api.gui_frame_error_stale;
@@ -1698,7 +1701,7 @@ fn sharedRasterPinExact(
     expected_data_bytes: ?u64,
 ) ?ProgramGuiSharedRasterRef {
     if (raster_generation == 0) return null;
-    lockSharedRasterState();
+    gfx_buffers.lockPrepared(.{ .leases = 1 }) catch return null;
     defer _ = shared_raster_lock.unlock();
     for (&shared_raster_frame_refs) |*record| {
         if (record.used and record.frame == frame and sharedRasterHandleEqual(record.reference.handle, handle) and
@@ -1777,7 +1780,7 @@ fn sharedRasterCopyFrameReferences(owner: ProgramProcessHandle, source: *const P
         var pinned = false;
         for (&resource.buffers) |*buffer| {
             if (buffer.raster_generation != source_record.reference.raster_generation or buffer.write_token != 0 or
-                buffer.frame_refs == std.math.maxInt(u32)) continue;
+                buffer.frame_refs == 0 or buffer.frame_refs == std.math.maxInt(u32)) continue;
             if (!sharedRasterRetainFrameBufferLocked(buffer)) break;
             pinned = true;
             break;
@@ -1883,7 +1886,7 @@ fn sharedRasterAcquire(
     {
         return r4x_api.gui_frame_error_invalid;
     }
-    lockSharedRasterState();
+    gfx_buffers.lockPrepared(.{ .leases = 1 }) catch |err| return if (err == error.OutOfMemory) r4x_api.gui_frame_error_oom else r4x_api.gui_frame_error_state;
     const resource = sharedRasterResourceLocked(handle) orelse {
         _ = shared_raster_lock.unlock();
         return r4x_api.gui_frame_error_stale;
@@ -16475,7 +16478,7 @@ fn gfxBufferExportRaster(consumer: ProgramProcessHandle, input: *const GuiShared
     if (!call.admitted()) return r4x_api.gfx_buffer_error_busy;
     defer _ = task_context.leaveUnwind(call);
     const value = blk: {
-        lockSharedRasterState();
+        gfx_buffers.lockPrepared(.{ .references = 1 }) catch |err| return gfx_buffer_api.status(err);
         defer _ = shared_raster_lock.unlock();
         for (shared_raster_leases) |record| {
             if (!record.used or record.lease_token != input_value.lease_token or !programHandleEqual(record.consumer, consumer) or

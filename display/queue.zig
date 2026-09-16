@@ -247,7 +247,7 @@ pub fn nativeRenderColorList(id: u32, fence: model.Fence) Error!abi.GfxRenderCol
 }
 pub fn retainNative(identity: buffers.Owner, fence: model.Fence, which: u32) Error!RetainedResource {
     if (irq.inDispatch() or which > 1) return error.Invalid;
-    buffers.lock();
+    try buffers.lockPrepared(.{ .references = 1 });
     defer buffers.unlock();
     try @import("../kernel/gfx_driver_memory.zig").admitLocked(identity);
     const backend = try backendLocked(fence.binding);
@@ -271,7 +271,7 @@ pub fn completeNative(id: u32, fence: model.Fence, result: model.Result, quiesce
 }
 pub fn retainNativeScanout(identity: buffers.Owner, fence: model.Fence) Error!RetainedResource {
     if (irq.inDispatch()) return error.Invalid;
-    buffers.lock(); defer buffers.unlock();
+    try buffers.lockPrepared(.{ .references = 1 }); defer buffers.unlock();
     try @import("../kernel/gfx_driver_memory.zig").admitLocked(identity);
     const backend = try jobBackendLocked(@intCast(identity.id), fence);
     if (!backend.owner.eql(identity)) return error.WrongOwner;
@@ -489,7 +489,7 @@ fn submitImpl(owner: buffers.Owner, timeline: u64, request: model.Submission, tr
     if (!started or irq.inDispatch()) return error.Unavailable;
     const instant = now();
     const snapshot = blk: {
-        buffers.lock();
+        try buffers.lockPrepared(.{ .leases = 2 });
         defer buffers.unlock();
         break :blk try submitLocked(owner, timeline, request, transport, output_binding, instant);
     };

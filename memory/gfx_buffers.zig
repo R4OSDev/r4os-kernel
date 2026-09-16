@@ -7,6 +7,7 @@ const phys = @import("phys.zig");
 const paging = @import("paging.zig");
 const sync = @import("../sched/sync.zig");
 const calls = @import("../display/ownership.zig");
+const heap = @import("heap.zig");
 pub const lifetime = @import("gfx_buffer_owner.zig");
 pub const layout = lifetime.layout;
 pub const Owner = lifetime.Owner;
@@ -19,9 +20,11 @@ pub const Created = struct { buffer: Handle, reference: Handle, address: u64, by
 pub const total_budget: u64 = 1024 * 1024 * 1024;
 pub const producer_budget: u64 = 256 * 1024 * 1024;
 pub const system_reserve: u64 = 16 * 1024 * 1024;
-pub const capacity: usize = 256;
-pub const Store = lifetime.Table(capacity, 1024, 2048);
+pub const Store = lifetime.DynamicTable();
 pub var store = Store{ .budget_bytes = total_budget, .producer_budget_bytes = producer_budget };
+pub const Need = struct { objects: usize = 0, references: usize = 0, leases: usize = 0 };
+const Growth = struct { busy: bool = false, owned: ?[]u8 = null, retired: ?[]u8 = null };
+var growth: [3]Growth = @splat(.{});
 
 // Legacy shared raster metadata uses this very same owner, so its immutable
 // generation and the BO lease are published in one critical section.
@@ -35,13 +38,85 @@ pub fn unlock() void {
     _ = metadata_lock.unlock();
 }
 
+/// Prepare resident metadata before entering any graphics transaction. Heap
+/// allocation/free never spans the BO owner, and the caller is kill-protected
+/// until publication/release bookkeeping has finished. Growth keeps handles,
+/// generations and backing owners; only internal, lock-scoped POD records move.
+fn prepare(need: Need) Error!void {
+    if (@import("../kernel/irq_router.zig").inDispatch()) return error.Busy;
+    const call = calls.retainCall();
+    if (!call.admitted()) return error.Busy;
+    defer calls.releaseCall(call);
+    inline for (std.enums.values(lifetime.Pool)) |kind| {
+        const needed = @field(need, @tagName(kind));
+        if (needed != 0) try preparePool(kind, needed);
+    }
+}
+/// On success the caller owns metadata_lock and all requested free slots.
+/// Recheck after allocation: another CPU may have consumed slots while the
+/// heap operation ran. Contention is bounded and never reported as heap OOM.
+pub fn lockPrepared(need: Need) Error!void {
+    if (@import("../kernel/irq_router.zig").inDispatch()) return error.Busy;
+    for (0..4) |_| {
+        lock();
+        const ready = inline for (std.enums.values(lifetime.Pool)) |kind| {
+            const needed = @field(need, @tagName(kind));
+            if (needed != 0 and store.freeSlots(kind, needed) < needed) break false;
+        } else true;
+        if (ready) return;
+        unlock();
+        try prepare(need);
+    }
+    return error.Busy;
+}
+fn preparePool(comptime kind: lifetime.Pool, needed: usize) Error!void {
+    const T = Store.Element(kind);
+    const control = &growth[@intFromEnum(kind)];
+    lock();
+    if (control.busy) { unlock(); return error.Busy; }
+    if (store.freeSlots(kind, needed) >= needed) { unlock(); return; }
+    const old_count = @field(store, @tagName(kind)).len;
+    const added = std.math.add(usize, old_count, needed) catch { unlock(); return error.Exhausted; };
+    const count = @max(64, @max(added, old_count *| 2));
+    if (count > std.math.maxInt(u32)) { unlock(); return error.Exhausted; }
+    const bytes = std.math.mul(usize, count, @sizeOf(T)) catch { unlock(); return error.Exhausted; };
+    control.busy = true;
+    const pending = control.retired;
+    unlock();
+    defer { lock(); control.busy = false; unlock(); }
+    if (pending) |old| {
+        if (heap.free(old) != .ok) return error.Busy;
+        lock(); control.retired = null; unlock();
+    }
+    const allocation = heap.alloc(bytes, @alignOf(T)) orelse return error.OutOfMemory;
+    const values: [*]T = @ptrCast(@alignCast(allocation.ptr));
+    // Initializing the new tail has no shared state and needs no BO owner.
+    @memset(values[old_count..count], .{});
+    lock();
+    _ = store.replaceStorage(kind, values[0..count]) catch |err| {
+        // These extents come from distinct live heap allocations. Retain any
+        // unexpected failed publication until its exact heap release succeeds.
+        control.retired = allocation;
+        unlock();
+        return err;
+    };
+    const detached = control.owned;
+    control.owned = allocation;
+    control.retired = detached;
+    unlock();
+    if (detached) |old| {
+        if (heap.free(old) != .ok) return error.Busy;
+        lock(); control.retired = null; unlock();
+    }
+}
+
 pub fn create(owner: Owner, descriptor: layout.Descriptor) Error!Created {
     if (descriptor.location != .system or !descriptor.binding.portable()) return error.Unsupported;
     const call = calls.retainCall();
     if (!call.admitted()) return error.Busy;
     defer calls.releaseCall(call);
     collect();
-    lock();
+    try lockPrepared(.{ .objects = 1, .references = 1 });
     const ticket = store.begin(owner, descriptor) catch |err| {
         unlock();
         return err;
@@ -140,10 +215,14 @@ pub fn collect() void {
     const call = calls.retainCall();
     if (!call.admitted()) return;
     defer calls.releaseCall(call);
+    defer collectMetadata();
     // A failed release is retried by the next resource operation. A claimed
     // ticket excludes concurrent collectors; never spin on a TLB timeout.
+    lock();
+    const budget = store.objects.len;
+    unlock();
     var count: usize = 0;
-    while (count < capacity) : (count += 1) {
+    while (count < budget) : (count += 1) {
         lock();
         const ticket = store.pendingSystemRelease() orelse {
             unlock();
@@ -161,12 +240,48 @@ pub fn collect() void {
     }
 }
 
+// Empty metadata must not become permanent heap consumption after the last
+// process/driver has retired. Serial generations survive this release. A
+// failed heap free retains its exact descriptor for a subsequent collection.
+fn emptyLocked() bool {
+    if (store.committed_bytes != 0) return false;
+    inline for (std.enums.values(lifetime.Pool)) |kind| {
+        const len = @field(store, @tagName(kind)).len;
+        if (store.freeSlots(kind, len) != len) return false;
+    }
+    return true;
+}
+fn collectMetadata() void {
+    inline for (std.enums.values(lifetime.Pool)) |kind| {
+        const control = &growth[@intFromEnum(kind)];
+        lock();
+        if (control.busy) {
+            unlock();
+        } else {
+            if (control.retired == null and emptyLocked()) {
+                control.retired = control.owned;
+                control.owned = null;
+                @field(store, @tagName(kind)) = &.{};
+            }
+            if (control.retired) |allocation| {
+                control.busy = true;
+                unlock();
+                const released = heap.free(allocation) == .ok;
+                lock();
+                if (released) control.retired = null;
+                control.busy = false;
+                unlock();
+            } else unlock();
+        }
+    }
+}
+
 pub fn retainsDriver(owner: u32) bool {
     lock();
     defer unlock();
     // The loader's owner ID is reusable; the driver memory bridge supplies
     // the actual nonwrapping driver-start epoch. Any surviving driver use vetoes reuse.
-    for (&store.objects) |object| {
+    for (store.objects) |object| {
         if (object.phase != .empty and object.owned_cookie != 0 and
             object.producer.kind == .driver and object.producer.id == owner) return true;
         if ((object.phase == .releasing or object.phase == .destroying) and
@@ -175,10 +290,10 @@ pub fn retainsDriver(owner: u32) bool {
             if (driver.id == owner) return true;
         };
     }
-    for (&store.leases) |lease| {
+    for (store.leases) |lease| {
         if (lease.handle.id != 0 and lease.owner.kind == .driver and lease.owner.id == owner) return true;
     }
-    for (&store.references) |reference| {
+    for (store.references) |reference| {
         if (reference.handle.id != 0 and reference.owner.kind == .driver and reference.owner.id == owner) return true;
     }
     return false;

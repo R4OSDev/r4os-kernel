@@ -33,7 +33,7 @@ pub const Owner = struct {
         if (!self.empty()) return error.Busy;
         if (request.state.count != 1) return error.Invalid;
         const source = try outputs.colorAt(request.state.assignments[0].output);
-        buffers.lock(); defer buffers.unlock();
+        try buffers.lockPrepared(.{ .references = 2, .leases = 1 }); defer buffers.unlock();
         const handle = try validateLocked(caller, request, source);
         const descriptor = try buffers.store.describe(handle, caller);
         const reference = try buffers.store.share(handle, owner);

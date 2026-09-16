@@ -102,7 +102,7 @@ pub fn import(owner: buffers.Owner, input: *const abi.GfxBufferHandle, output: *
     defer _ = task_context.leaveUnwind(call);
     const source = handle(input.*) catch |err| return status(err);
     const value = blk: {
-        buffers.lock();
+        buffers.lockPrepared(.{ .references = 1 }) catch |err| return status(err);
         defer buffers.unlock();
         const reference = buffers.store.share(source, owner) catch |err| return status(err);
         break :blk referenceLocked(reference, owner) catch unreachable;
@@ -123,7 +123,7 @@ pub fn map(owner: buffers.Owner, input: *const abi.GfxBufferHandle, access: u32,
     defer _ = task_context.leaveUnwind(call);
     const reference = handle(input.*) catch |err| return status(err);
     const use = blk: {
-        buffers.lock();
+        buffers.lockPrepared(.{ .leases = 1 }) catch |err| return status(err);
         defer buffers.unlock();
         break :blk buffers.mapLocked(reference, owner, if (access == abi.gfx_buffer_map_read) .cpu_read else .cpu_write, offset, bytes) catch |err| return status(err);
     };

@@ -61,7 +61,7 @@ pub fn prepare(caller: buffers.Owner, assignment: abi.GfxScanoutState, mode: abi
     try runtime.beginMode(expected);
     errdefer runtime.finishMode(expected, expected.width, expected.height, expected.active, false) catch {};
     const prepared = blk: {
-        buffers.lock(); defer buffers.unlock();
+        try buffers.lockPrepared(.{ .references = 2, .leases = 1 }); defer buffers.unlock();
         const descriptor = try buffers.store.describe(source, caller);
         const usage = buffers.layout.Usage.cpu_write | buffers.layout.Usage.transfer_source | buffers.layout.Usage.scanout;
         if (descriptor.format != .xrgb8888 or descriptor.location != .system or !descriptor.binding.portable() or
@@ -97,7 +97,7 @@ pub fn start(operation: u32, expected: Binding) Error!void {
     // The initial private shadow belongs entirely to R4D. It needs no
     // invented common reference when the first additional mode is applied.
     if (surface.reference.id != 0 and surface.read_lease.id == 0) {
-        buffers.lock(); defer buffers.unlock();
+        try buffers.lockPrepared(.{ .leases = 1 }); defer buffers.unlock();
         surface.read_lease = (try buffers.store.use(surface.reference, owner, .device_read, 0, surface.bytes)).lease;
     }
 }
