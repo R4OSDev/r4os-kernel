@@ -91,7 +91,10 @@ pub fn validate(input: abi.GfxVirtualRequest, instant: u64) Error!void {
         input.byte_length == 0 or input.byte_length & 4095 != 0) return error.Invalid;
     switch (input.kind) {
         1 => {
-            if (input.flags & ~@as(u32, 1) != 0 or input.location > 1) return error.Unsupported;
+            const layout_flags = abi.gfx_virtual_flag_blocklinear | abi.gfx_virtual_layout_mask;
+            if (input.flags & ~layout_flags != 0 or input.location > 1) return error.Unsupported;
+            if (input.flags & abi.gfx_virtual_layout_mask != 0 and input.flags & abi.gfx_virtual_flag_blocklinear == 0)
+                return error.Invalid;
             if (!emptyHandle(input.parent) or !emptyHandle(input.reference) or input.byte_offset != 0 or input.virtual_offset != 0 or
                 input.alignment < 4096 or !std.math.isPowerOfTwo(input.alignment) or input.fixed_address % input.alignment != 0 or
                 input.fixed_address > std.math.maxInt(u64) - input.byte_length) return error.Invalid;
@@ -243,8 +246,18 @@ pub fn checkLifetime() !void {
     var binding: Entry = .{};
     var extra: Entry = .{};
     const input: abi.GfxVirtualRequest = .{ .kind = 1, .adapter_id = 3, .memory_generation = 9,
-        .byte_length = 16384, .alignment = 4096, .deadline_ns = 100 };
+        .byte_length = 16384, .alignment = 4096, .deadline_ns = 100,
+        .flags = abi.gfx_virtual_flag_blocklinear | (255 << abi.gfx_virtual_layout_shift) };
+    // The broker preserves a driver-specific byte, including IDs unknown to
+    // NVIDIA, without interpreting it. Reserved bits and a pitch-only layout
+    // ID are invalid before any provider work or resource retention.
+    var malformed = input;
+    malformed.flags &= ~abi.gfx_virtual_flag_blocklinear;
+    try t.expectError(error.Invalid, validate(malformed, 1));
+    malformed.flags = input.flags | (1 << 16);
+    try t.expectError(error.Unsupported, validate(malformed, 1));
     try store.start(&range, app, provider, input, 1);
+    try t.expectEqual(input.flags, range.request.flags);
     const old = range.handle;
     try t.expectError(error.WrongOwner, store.owned(old, other));
     try t.expect(store.take(provider, 2).? == &range);
