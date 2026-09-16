@@ -7715,6 +7715,7 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_fence_release = &apiGfxFenceRelease,
         .gfx_queue_backend = &gfx_queue_api.backend,
         .gfx_queue_backend_info = &gfx_queue_api.backendInfo,
+        .gfx_queue_backend_properties = &gfx_queue_api.backendProperties,
         .gfx_native_start = &apiGfxNativeStart,
         .gfx_native_query = &apiGfxNativeQuery,
         .gfx_native_receive = &apiGfxNativeReceive,

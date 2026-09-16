@@ -3589,6 +3589,7 @@ fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
         .read_render_list = @intFromPtr(&gfxQueueReadRenderList),
         .read_render_grid_list = @intFromPtr(&gfxQueueReadRenderGridList),
         .read_render_color_list = @intFromPtr(&gfxQueueReadRenderColorList),
+        .publish_properties = @intFromPtr(&gfxQueuePublishProperties),
         .retain_scanout = @intFromPtr(&gfxQueueRetainScanout),
         .begin_scanout = @intFromPtr(&gfxQueueBeginScanout),
         .scanout_retire_requested = @intFromPtr(&gfxQueueScanoutRetireRequested),
@@ -3603,6 +3604,10 @@ fn gfxQueueRegister(input: *const outputs_contract.GfxBackendRegistration, outpu
 fn gfxQueueRegisterProfile(input: *const outputs_contract.GfxBackendRegistration, profile: *const outputs_contract.GfxBackendProfile, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
     const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
     return gfx_queue_api.registerProfile(identity, input, profile, output);
+}
+fn gfxQueuePublishProperties(input: *const outputs_contract.GfxBackendBinding, properties: *const outputs_contract.GfxBackendProperties) callconv(.c) i32 {
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return gfx_queue_api.publishProperties(identity, input, properties);
 }
 fn gfxQueueUnregister(input: *const outputs_contract.GfxBackendBinding, quiesced: u32) callconv(.c) i32 {
     return gfx_queue_api.unregister(activeOwner(), input, quiesced);

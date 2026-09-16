@@ -50,6 +50,7 @@ const Backend = struct {
     work_handle: u32 = 0,
     display_timeline: u64 = 0,
     profile: abi.GfxBackendProfile = .{},
+    properties: ?abi.GfxBackendProperties = null,
     operations: u64 = 7,
     job_operations: u64 = 7,
     target_jobs: bool = false,
@@ -92,6 +93,33 @@ pub fn validatedProfile(input: abi.GfxBackendProfile) Error!abi.GfxBackendProfil
     for (profile.data[profile.data_bytes..]) |byte| if (byte != 0) return error.Invalid;
     profile.size = @sizeOf(abi.GfxBackendProfile);
     return profile;
+}
+pub fn validatedProperties(input: abi.GfxBackendProperties) Error!abi.GfxBackendProperties {
+    if (input.version != 1 or input.size < @sizeOf(abi.GfxBackendProperties) or
+        (input.interface_id_lo == 0 and input.interface_id_hi == 0) or
+        input.revision == 0 or input.data_bytes == 0 or input.data_bytes > input.data.len) return error.Invalid;
+    for (input.data[input.data_bytes..]) |byte| if (byte != 0) return error.Invalid;
+    var result = input;
+    result.size = @sizeOf(abi.GfxBackendProperties);
+    return result;
+}
+pub fn publishNativeProperties(identity: buffers.Owner, binding: model.Binding, milestone: u32, input: abi.GfxBackendProperties) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    const value = try validatedProperties(input);
+    buffers.lock(); defer buffers.unlock();
+    const backend = try backendLocked(binding);
+    if (!backend.owner.eql(identity)) return error.WrongOwner;
+    if (backend.closing) return error.DeviceLost;
+    if (@intFromEnum(backend.milestone) != milestone) return error.Invalid;
+    if (backend.properties != null) return error.Busy;
+    backend.properties = value;
+}
+pub fn backendProperties(binding: model.Binding, milestone: u32) Error!?abi.GfxBackendProperties {
+    buffers.lock(); defer buffers.unlock();
+    const backend = try backendLocked(binding);
+    if (backend.closing) return error.DeviceLost;
+    if (@intFromEnum(backend.milestone) != milestone) return error.Invalid;
+    return backend.properties;
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
@@ -331,6 +359,7 @@ pub fn resetNative(id: u32, binding: model.Binding, quiesced: bool) Error!model.
         loseLocked(backend, quiesced, instant);
         if (!quiesced) break :blk @as(?model.Binding, null);
         backend.binding.reset_generation += 1;
+        backend.properties = null;
         backend.display_timeline = 0;
         backend.closing = false;
         const slot = (@intFromPtr(backend) - @intFromPtr(&backends)) / @sizeOf(Backend);

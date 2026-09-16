@@ -37,6 +37,14 @@ pub fn unregister(id: u32, input: *const abi.GfxBackendBinding, quiesced: u32) i
     queue.unregisterNative(id, value, quiesced == 1) catch |err| return api.errorCode(err);
     return abi.gfx_queue_ok;
 }
+pub fn publishProperties(identity: buffers.Owner, input: *const abi.GfxBackendBinding, properties: *const abi.GfxBackendProperties) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(properties) == 0 or irq.inDispatch()) return abi.gfx_queue_error_invalid;
+    const value = input.*;
+    if (value.version != 1 or value.size < @sizeOf(abi.GfxBackendBinding)) return abi.gfx_queue_error_invalid;
+    queue.publishNativeProperties(identity, .{ .adapter = value.adapter_id, .device_generation = value.device_generation,
+        .reset_generation = value.reset_generation }, value.milestone, properties.*) catch |err| return api.errorCode(err);
+    return abi.gfx_queue_ok;
+}
 pub fn updateOperations(id: u32, input: *const abi.GfxBackendBinding, operations: u64) i32 {
     if (@intFromPtr(input) == 0 or irq.inDispatch()) return abi.gfx_queue_error_invalid;
     const value = binding(id, input.*) catch |err| return api.errorCode(err);

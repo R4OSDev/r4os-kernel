@@ -11,6 +11,16 @@ test {
     profile.data_bytes = 63; try std.testing.expectError(error.Invalid, queue.validatedProfile(profile));
     profile.data_bytes = 64; profile.revision = 0; try std.testing.expectError(error.Invalid, queue.validatedProfile(profile));
     profile.revision = 1; profile.interface_id_hi = 0; try std.testing.expectError(error.Invalid, queue.validatedProfile(profile));
+    var properties: abi.GfxBackendProperties = .{ .size = 304, .interface_id_hi = 0x100000035, .revision = 1, .data_bytes = 256, .data = @splat(0x35) };
+    const facts = try queue.validatedProperties(properties);
+    try std.testing.expect(facts.size == 288 and facts.data[255] == 0x35);
+    properties.data_bytes = 257; try std.testing.expectError(error.Invalid, queue.validatedProperties(properties));
+    properties.data_bytes = 255; try std.testing.expectError(error.Invalid, queue.validatedProperties(properties));
+    properties.data_bytes = 0; try std.testing.expectError(error.Invalid, queue.validatedProperties(properties));
+    properties.data_bytes = 256; properties.size = 287; try std.testing.expectError(error.Invalid, queue.validatedProperties(properties));
+    properties.size = 288; properties.version = 2; try std.testing.expectError(error.Invalid, queue.validatedProperties(properties));
+    properties.version = 1; properties.revision = 0; try std.testing.expectError(error.Invalid, queue.validatedProperties(properties));
+    properties.revision = 1; properties.interface_id_hi = 0; try std.testing.expectError(error.Invalid, queue.validatedProperties(properties));
     const wire = @import("program/gfx_queue_wire.zig");
     inline for (.{ abi.GfxBackendRegistration, abi.GfxBackendInfo, abi.GfxSubmission, abi.GfxDriverJob }) |T| {
         // Caller capacity and physical guard bytes are independent. Exercise
