@@ -7,7 +7,7 @@ const queue = @import("queue_state.zig");
 const abi = @import("r4os_kernel_contract");
 pub const owner = lifetime.Owner{ .kind = .kernel, .id = 2, .generation = 1 };
 pub const display_owner = lifetime.Owner{ .kind = .kernel, .id = 3, .generation = 1 };
-pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present, render_list, direct_present, render_grid_list, render_color_list };
+pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present, render_list, direct_present, render_grid_list, render_color_list, native };
 pub const Request = struct {
     operation: Operation = .copy,
     source: lifetime.Handle = .{},
@@ -29,6 +29,7 @@ pub const Entry = struct {
     fence: queue.Fence = .{},
     operation: Operation = .barrier,
     uses: [2]?lifetime.Use = .{ null, null },
+    native_uses: []?lifetime.Use = &.{},
     bytes: u64 = 0,
     copied: u64 = 0,
     source_offset: u64 = 0,
@@ -103,13 +104,17 @@ pub fn Resources(comptime capacity: usize) type {
         render_grids: [capacity][abi.gfx_render_list_capacity]abi.GfxSampleGrid = @splat(@splat(.{})),
         render_colors: [capacity]abi.GfxRenderColorProgram = @splat(.{}),
 
-        fn ordered(self: *Self, state: anytype, timeline: u64, dependencies: []const queue.Fence, object: lifetime.Handle, write: bool) Error!void {
+        pub fn ordered(self: *Self, state: anytype, timeline: u64, dependencies: []const queue.Fence, object: lifetime.Handle, write: bool) Error!void {
             for (&self.entries) |prior| {
                 if (prior.fence.slot == 0) continue;
                 const status = try state.query(prior.fence);
                 if (status.phase == .terminal and !status.device_active) continue;
                 for (prior.uses, 0..) |use, j| if (use) |held| {
                     if (!held.buffer.eql(object) or (!write and j == 0)) continue;
+                    if (!try state.orders(timeline, dependencies, prior.fence)) return error.Busy;
+                };
+                for (prior.native_uses) |use| if (use) |held| {
+                    if (!held.buffer.eql(object) or (!write and held.access == .queue_read)) continue;
                     if (!try state.orders(timeline, dependencies, prior.fence)) return error.Busy;
                 };
             }
@@ -348,6 +353,10 @@ pub fn Resources(comptime capacity: usize) type {
             const entry = &self.entries[ticket.fence.slot - 1];
             if (!std.meta.eql(entry.fence, ticket.fence)) return error.Stale;
             for (&entry.uses) |*use| if (use.*) |held| {
+                try buffers.endUse(held.lease, owner, true);
+                use.* = null;
+            };
+            for (entry.native_uses) |*use| if (use.*) |held| {
                 try buffers.endUse(held.lease, owner, true);
                 use.* = null;
             };

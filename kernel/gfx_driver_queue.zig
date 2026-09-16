@@ -139,6 +139,25 @@ pub fn retainScanout(identity: buffers.Owner, input: *const abi.GfxFence, output
     output.* = .{ .reference = memory_api.publicHandle(retained.reference), .buffer = memory_api.publicHandle(retained.buffer), .flags = abi.gfx_buffer_reference_immutable };
     return abi.gfx_queue_ok;
 }
+pub fn readNativeInfo(id: u32, input: *const abi.GfxFence, output: *abi.GfxNativeJobInfo) i32 {
+    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxNativeJobInfo, output)) return abi.gfx_queue_error_invalid;
+    const result = queue.nativeInfo(id, api.fence(input.*)) catch |err| return api.errorCode(err);
+    output.* = result;
+    return abi.gfx_queue_ok;
+}
+pub fn readNativeData(id: u32, input: *const abi.GfxFence, offset: u32, output: [*]u8, count: u32) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(output) == 0 or @intFromPtr(output) > std.math.maxInt(usize) - @as(usize, count)) return abi.gfx_queue_error_invalid;
+    const result = queue.nativeData(id, api.fence(input.*), offset, count) catch |err| return api.errorCode(err);
+    // Pageable caller storage is touched after releasing the shared owner.
+    @memcpy(output[0..count], result.bytes[0..count]);
+    return abi.gfx_queue_ok;
+}
+pub fn readNativeBinding(id: u32, input: *const abi.GfxFence, index: u32, output: *abi.GfxNativeBinding) i32 {
+    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxNativeBinding, output)) return abi.gfx_queue_error_invalid;
+    const result = queue.nativeBinding(id, api.fence(input.*), index) catch |err| return api.errorCode(err);
+    output.* = result;
+    return abi.gfx_queue_ok;
+}
 pub fn beginScanout(id: u32, input: *const abi.GfxFence) i32 {
     if (@intFromPtr(input) == 0) return abi.gfx_queue_error_invalid;
     queue.beginNativeScanout(id, api.fence(input.*)) catch |err| return api.errorCode(err);

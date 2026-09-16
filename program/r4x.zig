@@ -7705,6 +7705,7 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_queue_submit_render_list = &apiGfxQueueSubmitRenderList,
         .gfx_queue_submit_render_grid_list = &apiGfxQueueSubmitRenderGridList,
         .gfx_queue_submit_render_color_list = &apiGfxQueueSubmitRenderColorList,
+        .gfx_queue_submit_native = &apiGfxQueueSubmitNative,
         .gfx_queue_submit_output = &apiGfxQueueSubmitOutput,
         .display_output_target = &r4api.r4draw.displayOutputTarget,
         .display_output_presentation_info = &r4api.r4draw.displayOutputPresentationInfo,
@@ -16464,6 +16465,10 @@ fn apiGfxQueueSubmitOutput(queue: *const gfx_queue_api.abi.GfxQueueHandle, input
 fn apiGfxQueueSubmitRenderColorList(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *const gfx_queue_api.abi.GfxSubmission, list: *const gfx_queue_api.abi.GfxRenderColorList, output: *gfx_queue_api.abi.GfxFenceStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
     return gfx_queue_api.submitRenderColorList(graphicsOwner(owner), queue, input, list, output);
+}
+fn apiGfxQueueSubmitNative(queue: *const gfx_queue_api.abi.GfxQueueHandle, input: *const gfx_queue_api.abi.GfxSubmission, native: *const gfx_queue_api.abi.GfxNativeSubmission, output: *gfx_queue_api.abi.GfxFenceStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;
+    return gfx_queue_api.submitNative(graphicsOwner(owner), queue, input, native, output);
 }
 fn apiGfxFenceCancel(input: *const gfx_queue_api.abi.GfxFence) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_queue_api.abi.gfx_queue_error_unavailable;

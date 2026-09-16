@@ -95,6 +95,32 @@ pub fn close(owner: buffers.Owner, input: *const abi.GfxQueueHandle) i32 {
 pub fn submit(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, output: *abi.GfxFenceStatus) i32 {
     return submitCommon(owner, queue_ptr, input, null, null, null, null, output);
 }
+pub fn submitNative(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission,
+    native_ptr: *const abi.GfxNativeSubmission, output: *abi.GfxFenceStatus) i32
+{
+    if (@intFromPtr(queue_ptr) == 0 or @intFromPtr(input) == 0 or @intFromPtr(native_ptr) == 0 or
+        @intFromPtr(native_ptr) % @alignOf(abi.GfxNativeSubmission) != 0 or
+        !buffer_api.validOutput(abi.GfxFenceStatus, output)) return abi.gfx_queue_error_invalid;
+    const queue = queue_ptr.*;
+    const value = wire.read(abi.GfxSubmission, input) orelse return abi.gfx_queue_error_invalid;
+    const native = native_ptr.*;
+    if (!header(abi.GfxQueueHandle, queue) or value.operation != abi.gfx_queue_operation_native or value.size < @sizeOf(abi.GfxSubmission) or
+        value.dependency_count > model.max_dependencies or !std.meta.eql(value.source, abi.GfxBufferHandle{}) or
+        !std.meta.eql(value.target, abi.GfxBufferHandle{}) or value.source_offset != 0 or value.target_offset != 0 or
+        value.byte_length != 0 or value.row_count != 0 or value.reserved0 != 0 or value.source_pitch != 0 or value.target_pitch != 0 or
+        !std.meta.eql(value.render, abi.GfxRenderCommand{})) return abi.gfx_queue_error_invalid;
+    var dependencies: [model.max_dependencies]model.Fence = undefined;
+    for (value.dependencies, 0..) |dependency, i| {
+        if (i < value.dependency_count) dependencies[i] = fence(dependency) else if (!std.meta.eql(dependency, abi.GfxFence{})) return abi.gfx_queue_error_invalid;
+    }
+    const call = task_context.enterUnwind();
+    if (!call.admitted()) return abi.gfx_queue_error_busy;
+    defer _ = task_context.leaveUnwind(call);
+    const snapshot = runtime.submitNative(owner, queue.timeline, .{ .deadline_ns = value.deadline_ns,
+        .frame_key = value.frame_key, .dependencies = dependencies[0..value.dependency_count] }, native) catch |err| return errorCode(err);
+    output.* = publicStatus(snapshot);
+    return abi.gfx_queue_ok;
+}
 pub fn submitRenderList(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list_ptr: *const abi.GfxRenderList, output: *abi.GfxFenceStatus) i32 {
     if (@intFromPtr(list_ptr) == 0 or @intFromPtr(list_ptr) % @alignOf(abi.GfxRenderList) != 0) return abi.gfx_queue_error_invalid;
     // Copy pageable input before entering the common metadata owner. The

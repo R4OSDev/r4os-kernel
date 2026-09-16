@@ -160,6 +160,35 @@ pub fn query(owner: buffers.Owner, handle: buffers.Handle) Error!abi.GfxVirtualS
     buffers.lock(); defer buffers.unlock();
     return (try state.owned(handle, owner)).status();
 }
+pub const Execution = struct {
+    entry: *model.Entry,
+    driver: buffers.Owner,
+    reference: buffers.Handle,
+    binding: abi.GfxNativeBinding,
+};
+/// Caller holds the common BO/queue owner. The imported full BO reference
+/// belongs to this resident VA record, not to the submitting application's
+/// potentially closing reference. No heap, callback or driver work here.
+pub fn retainExecutionLocked(owner: buffers.Owner, input: abi.GfxNativeResource, target: buffers.layout.Binding) Error!Execution {
+    if (input.version != 1 or input.size != @sizeOf(abi.GfxNativeResource) or input.access > 1 or input.reserved0 != 0) return error.Invalid;
+    const entry = try state.owned(try api.handle(input.binding), owner);
+    const value = record(entry);
+    const provider = try providerLocked(entry.provider, value.driver);
+    if (provider.closing) return error.Closed;
+    if (provider.owner.id != target.driver_owner or provider.config.adapter_id != target.adapter or
+        provider.config.memory_generation != target.device_generation or entry.request.adapter_id != target.adapter or
+        entry.request.memory_generation != target.device_generation or value.reference.flags != 0) return error.Stale;
+    try memory.admitLocked(provider.owner);
+    const reference = try api.handle(value.reference.reference);
+    try entry.retainExecution();
+    return .{ .entry = entry, .driver = value.driver, .reference = reference,
+        .binding = .{ .binding = api.publicHandle(entry.handle), .token = entry.token, .address = entry.address,
+            .byte_length = entry.request.byte_length, .access = input.access } };
+}
+pub fn releaseExecutionLocked(use: Execution) void {
+    use.entry.releaseExecution();
+    service_needed = true;
+}
 pub fn close(owner: buffers.Owner, handle: buffers.Handle, mode: u32) Error!void {
     if (mode > 1) return error.Invalid;
     buffers.lock();

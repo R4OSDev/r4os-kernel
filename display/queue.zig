@@ -20,6 +20,8 @@ const software = model.Binding{};
 var state = model.Store(queue_capacity, fence_capacity){};
 var ingress = @import("queue_ingress.zig").Ingress(fence_capacity){};
 var resources = resource_model.Resources(fence_capacity){};
+const native_model = @import("queue_native.zig");
+var native_jobs: [fence_capacity]?*native_model.Job = @splat(null);
 var completions: [fence_capacity]sync.Event = .{sync.Event.init(false)} ** fence_capacity;
 var releases: [fence_capacity]sync.Event = .{sync.Event.init(false)} ** fence_capacity;
 pub const WaitFor = enum(u32) { completion, resources_released };
@@ -123,8 +125,10 @@ pub fn backendProperties(binding: model.Binding, milestone: u32) Error!?abi.GfxB
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
-    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 1023) != 0) return error.Invalid;
+    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 2047) != 0) return error.Invalid;
     const profile = try validatedProfile(config.profile);
+    if (config.operations & (@as(u64, 1) << abi.gfx_queue_operation_native) != 0 and
+        profile.interface_id_lo == 0 and profile.interface_id_hi == 0) return error.Unsupported;
     buffers.lock();
     defer buffers.unlock();
     if (backend_serial == std.math.maxInt(u64)) return error.Exhausted;
@@ -171,6 +175,7 @@ pub fn nativeOperations(id: u32, binding: model.Binding) Error!u64 {
     return backend.operations;
 }
 fn nativeJobCapacity(backend: *const Backend) u32 {
+    if (backend.job_operations & (@as(u64, 1) << abi.gfx_queue_operation_native) != 0) return @sizeOf(abi.GfxDriverJob);
     return if (backend.target_jobs) 272 else if (backend.job_operations & 976 != 0) 224 else if (backend.job_operations & 40 != 0) 136 else 112;
 }
 // Caller holds the BO/queue metadata mutex during output admission.
@@ -190,11 +195,13 @@ pub fn outputBusyLocked(target: abi.GfxOutputTarget) bool {
     return false;
 }
 pub fn updateNativeOperations(id: u32, binding: model.Binding, operations: u64) Error!void {
-    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 1023) != 0) return error.Invalid;
+    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 2047) != 0) return error.Invalid;
     buffers.lock(); defer buffers.unlock();
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
     if (backend.closing) return error.DeviceLost;
+    if (operations & (@as(u64, 1) << abi.gfx_queue_operation_native) != 0 and
+        backend.profile.interface_id_lo == 0 and backend.profile.interface_id_hi == 0) return error.Unsupported;
     backend.operations = operations;
     // Disabling future admission cannot shrink the output needed to receive
     // work already queued under the former capability set.
@@ -252,6 +259,36 @@ pub fn nativeSegment(id: u32, fence: model.Fence, which: u32, offset: u64, mask:
     // One page-bounded translation, under the BO pin and the established
     // program -> paging lock order. Never allocates a page list in an IRQ.
     return @import("../kernel/gfx_driver_memory.zig").dmaSegment(use, offset, mask);
+}
+fn nativeJobLocked(id: u32, fence: model.Fence) Error!*native_model.Job {
+    _ = try jobBackendLocked(id, fence);
+    if (!(try state.query(fence)).device_active) return error.AlreadyCompleted;
+    const entry = &resources.entries[fence.slot - 1];
+    if (!std.meta.eql(entry.fence, fence) or entry.operation != .native) return error.Invalid;
+    return native_jobs[fence.slot - 1] orelse error.Stale;
+}
+pub fn nativeInfo(id: u32, fence: model.Fence) Error!abi.GfxNativeJobInfo {
+    if (irq.inDispatch()) return error.Unavailable;
+    buffers.lock(); defer buffers.unlock();
+    return (try nativeJobLocked(id, fence)).info;
+}
+pub fn nativeBinding(id: u32, fence: model.Fence, index: u32) Error!abi.GfxNativeBinding {
+    if (irq.inDispatch()) return error.Unavailable;
+    buffers.lock(); defer buffers.unlock();
+    const job = try nativeJobLocked(id, fence);
+    if (index >= job.resources.len) return error.Invalid;
+    return (job.resources[index].held orelse return error.Stale).binding;
+}
+pub const NativeData = struct { bytes: [abi.gfx_native_read_capacity]u8 = undefined };
+pub fn nativeData(id: u32, fence: model.Fence, offset: u32, count: u32) Error!NativeData {
+    if (irq.inDispatch()) return error.Unavailable;
+    if (count == 0 or count > abi.gfx_native_read_capacity) return error.Invalid;
+    buffers.lock(); defer buffers.unlock();
+    const job = try nativeJobLocked(id, fence);
+    if (count > job.commands.len or offset > job.commands.len - count) return error.Invalid;
+    var result: NativeData = .{};
+    @memcpy(result.bytes[0..count], job.commands[offset..][0..count]);
+    return result;
 }
 pub fn nativeRenderList(id: u32, fence: model.Fence) Error!abi.GfxRenderList {
     if (irq.inDispatch()) return error.Unavailable;
@@ -504,8 +541,33 @@ fn notifyDriver(index: usize) callconv(.c) i32 {
     return selected.notify.?(selected.context);
 }
 pub fn submit(owner: buffers.Owner, timeline: u64, request: model.Submission, transport: resource_model.Request) Error!model.Status {
-    if (transport.operation == .present or transport.operation == .direct_present) return error.Unsupported;
+    if (transport.operation == .native or transport.operation == .present or transport.operation == .direct_present) return error.Unsupported;
     return submitImpl(owner, timeline, request, transport, null);
+}
+pub fn submitNative(owner: buffers.Owner, timeline: u64, request: model.Submission, input: abi.GfxNativeSubmission) Error!model.Status {
+    if (!started or irq.inDispatch()) return error.Unavailable;
+    const job = try native_model.Job.create(input);
+    errdefer job.destroy();
+    defer worker_event.signal();
+    const instant = now();
+    try buffers.lockPrepared(.{ .leases = job.resources.len });
+    defer buffers.unlock();
+    const config = try state.configuration(timeline, owner);
+    if (config.binding.adapter == 0) return error.Unsupported;
+    const backend = try backendLocked(config.binding);
+    if (backend.closing) return error.DeviceLost;
+    if (backend.operations & (@as(u64, 1) << abi.gfx_queue_operation_native) == 0 or
+        job.info.interface_id_lo != backend.profile.interface_id_lo or job.info.interface_id_hi != backend.profile.interface_id_hi or
+        job.info.revision != backend.profile.revision) return error.Unsupported;
+    errdefer job.rollbackLocked();
+    try job.acquireLocked(owner, .{ .adapter = backend.binding.adapter, .driver_owner = @intCast(backend.owner.id),
+        .device_generation = backend.memory_generation }, &state, &resources, timeline, request.dependencies);
+    const accepted = try submitLocked(owner, timeline, request, .{ .operation = .native }, null, instant);
+    const index = accepted.fence.slot - 1;
+    std.debug.assert(native_jobs[index] == null);
+    resources.entries[index].native_uses = job.uses;
+    native_jobs[index] = job;
+    return accepted;
 }
 // Only the native display bridge calls this while holding DisplayExecution
 // and its own lifetime guard. Public queue submission cannot skip geometry,
@@ -677,11 +739,15 @@ fn publishAndRelease() void {
             buffers.unlock();
             break;
         };
+        const native = native_jobs[ticket.fence.slot - 1];
+        if (native) |job| job.releaseBindingsLocked();
+        native_jobs[ticket.fence.slot - 1] = null;
         state.released(ticket, true) catch unreachable;
         // A short publication reference prevents event storage reuse even
         // when all client references and external waiters have disappeared.
         state.retainWaiter(ticket.fence) catch unreachable;
         buffers.unlock();
+        if (native) |job| job.destroy();
         releases[ticket.fence.slot - 1].signal();
         buffers.lock();
         state.releaseWaiter(ticket.fence) catch unreachable;

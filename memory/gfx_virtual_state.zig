@@ -19,6 +19,7 @@ pub const Entry = struct {
     next_child: ?*Entry = null,
     previous_child: ?*Entry = null,
     live_children: usize = 0,
+    executions: usize = 0,
     open: bool = true,
     closing: bool = false,
     retired: bool = false,
@@ -47,7 +48,7 @@ pub const Entry = struct {
     // Parent metadata remains linked until the child handle is released, but
     // physical parent retirement only waits for physical child retirement.
     fn settleRetirement(self: *Entry) void {
-        if (self.retired or !self.closing or self.claim != null or self.backend() or self.live_children != 0) return;
+        if (self.retired or !self.closing or self.claim != null or self.backend() or self.live_children != 0 or self.executions != 0) return;
         self.retired = true;
         self.notifications |= 2;
         if (self.parent) |parent| {
@@ -66,8 +67,18 @@ pub const Entry = struct {
     }
     pub fn pending(self: *const Entry) ?Claim {
         if (self.claim != null or self.retired) return null;
-        if (self.closing) return if (self.backend() and self.live_children == 0) .retire else null;
+        if (self.closing) return if (self.backend() and self.live_children == 0 and self.executions == 0) .retire else null;
         return if (self.result == 0) .create else null;
+    }
+    pub fn retainExecution(self: *Entry) Error!void {
+        if (!self.open or self.closing or self.retired) return error.Closed;
+        if (self.request.kind != 2 or self.result != 1 or !self.backend() or self.claim != null) return error.Busy;
+        self.executions = std.math.add(usize, self.executions, 1) catch return error.Exhausted;
+    }
+    pub fn releaseExecution(self: *Entry) void {
+        std.debug.assert(self.executions != 0 and !self.retired);
+        self.executions -= 1;
+        self.settleRetirement();
     }
 };
 pub fn publicHandle(value: Handle) abi.GfxBufferHandle { return .{ .id = value.id, .generation = value.generation }; }
