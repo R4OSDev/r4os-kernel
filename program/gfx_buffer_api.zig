@@ -117,6 +117,12 @@ pub fn release(owner: buffers.Owner, input: *const abi.GfxBufferHandle) i32 {
     return abi.gfx_buffer_result_ok;
 }
 pub fn map(owner: buffers.Owner, input: *const abi.GfxBufferHandle, access: u32, offset: u64, bytes: u64, output: *abi.GfxBufferMap) i32 {
+    return mapMode(owner, input, access, offset, bytes, output, false);
+}
+pub fn mapPersistent(owner: buffers.Owner, input: *const abi.GfxBufferHandle, access: u32, offset: u64, bytes: u64, output: *abi.GfxBufferMap) i32 {
+    return mapMode(owner, input, access, offset, bytes, output, true);
+}
+fn mapMode(owner: buffers.Owner, input: *const abi.GfxBufferHandle, access: u32, offset: u64, bytes: u64, output: *abi.GfxBufferMap, persistent: bool) i32 {
     if (@intFromPtr(input) == 0 or !validOutput(abi.GfxBufferMap, output) or access > abi.gfx_buffer_map_write) return abi.gfx_buffer_error_invalid;
     const call = task_context.enterUnwind();
     if (!call.admitted()) return abi.gfx_buffer_error_busy;
@@ -125,7 +131,11 @@ pub fn map(owner: buffers.Owner, input: *const abi.GfxBufferHandle, access: u32,
     const use = blk: {
         buffers.lockPrepared(.{ .leases = 1 }) catch |err| return status(err);
         defer buffers.unlock();
-        break :blk buffers.mapLocked(reference, owner, if (access == abi.gfx_buffer_map_read) .cpu_read else .cpu_write, offset, bytes) catch |err| return status(err);
+        const mode: @import("../memory/gfx_buffer_owner.zig").Access = if (persistent)
+            (if (access == abi.gfx_buffer_map_read) .cpu_persistent_read else .cpu_persistent_write)
+        else
+            (if (access == abi.gfx_buffer_map_read) .cpu_read else .cpu_write);
+        break :blk buffers.mapLocked(reference, owner, mode, offset, bytes) catch |err| return status(err);
     };
     output.* = .{ .lease = publicHandle(use.lease), .cpu_address = use.backing.cpu_address + offset, .byte_length = bytes, .cache_policy = @intFromEnum(use.backing.cache) };
     return abi.gfx_buffer_result_ok;

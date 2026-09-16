@@ -30,7 +30,7 @@ pub const Backing = struct {
     cache: enum { unavailable, write_back, write_combining, uncached } = .unavailable,
     driver: ?Owner = null,
 };
-pub const Access = enum { cpu_read, cpu_write, device_read, device_write, scanout, device_mapping, queue_read, queue_write };
+pub const Access = enum { cpu_read, cpu_write, device_read, device_write, scanout, device_mapping, queue_read, queue_write, cpu_persistent_read, cpu_persistent_write };
 pub const Error = layout.Error || error{ Exhausted, Budget, Capacity, Stale, Busy, Closed, WrongOwner };
 pub const Create = struct { buffer: Handle, reference: Handle, bytes: u64 };
 pub const Use = struct { lease: Handle, buffer: Handle, access: Access, backing: Backing, range: layout.Range };
@@ -633,6 +633,11 @@ fn StorageTable(comptime object_capacity: ?usize, comptime reference_capacity: ?
             if (!consumer.valid()) return error.Invalid;
             const object = try self.findObject(buffer);
             if (object.phase != .live or !object.producer_open) return error.Closed;
+            // An immutable export cannot be published while a writer still
+            // holds access, including a persistent Vulkan CPU mapping.
+            if (read_only) for (self.leasesSlice()) |lease| {
+                if (lease.handle.id != 0 and lease.buffer.eql(buffer) and writes(lease.access)) return error.Busy;
+            };
             const slot = self.freeReference() orelse return error.Capacity;
             const reference = try self.nextHandle(slot);
             self.references[slot] = .{ .handle = reference, .buffer = buffer, .owner = consumer, .read_only = read_only };
@@ -690,15 +695,18 @@ fn StorageTable(comptime object_capacity: ?usize, comptime reference_capacity: ?
             if (!layout.spanFits(limit, offset, bytes)) return error.Invalid;
             const backing = object.backing orelse return error.Busy;
             const required: u32 = switch (access) {
-                .cpu_read => layout.Usage.cpu_read,
+                .cpu_read, .cpu_persistent_read => layout.Usage.cpu_read,
                 .cpu_write => layout.Usage.cpu_write,
+                .cpu_persistent_write => layout.Usage.cpu_read | layout.Usage.cpu_write,
                 .device_read, .queue_read => layout.Usage.transfer_source,
                 .device_write, .queue_write => layout.Usage.transfer_target | layout.Usage.render,
                 .scanout => layout.Usage.scanout,
                 .device_mapping => 0,
             };
             if (required != 0 and (object.descriptor.usage & required) == 0) return error.Unsupported;
-            if ((access == .cpu_read or access == .cpu_write) and backing.cpu_address == 0) return error.Unsupported;
+            if (persistentCpu(access) and (object.descriptor.location != .system or backing.cache != .write_back or
+                object.descriptor.usage & required != required)) return error.Unsupported;
+            if (isCpu(access) and backing.cpu_address == 0) return error.Unsupported;
             if (access == .cpu_read and backing.cache == .write_combining) return error.Unsupported;
             for (self.leasesSlice()) |lease| {
                 if (lease.handle.id != 0 and lease.buffer.eql(object.handle) and conflicts(lease.access, access)) return error.Busy;
@@ -1005,11 +1013,23 @@ fn StorageTable(comptime object_capacity: ?usize, comptime reference_capacity: ?
     };
 }
 
+pub fn isCpu(access: Access) bool {
+    return access == .cpu_read or access == .cpu_write or persistentCpu(access);
+}
 fn isDevice(access: Access) bool {
-    return access != .cpu_read and access != .cpu_write;
+    return !isCpu(access);
+}
+fn persistentCpu(access: Access) bool {
+    return access == .cpu_persistent_read or access == .cpu_persistent_write;
+}
+fn execution(access: Access) bool {
+    return access == .device_read or access == .device_write or queued(access);
 }
 fn conflicts(first: Access, second: Access) bool {
     if (first == .device_mapping or second == .device_mapping) return false;
+    // Address lifetime and explicit CPU/GPU synchronization are independent.
+    // Ordinary CPU maps and scanout remain exclusive against writers.
+    if ((persistentCpu(first) and execution(second)) or (persistentCpu(second) and execution(first))) return false;
     if (queued(first) and queued(second)) return false;
     return writes(first) or writes(second);
 }
@@ -1017,7 +1037,7 @@ fn queued(access: Access) bool {
     return access == .queue_read or access == .queue_write;
 }
 fn writes(access: Access) bool {
-    return access == .cpu_write or access == .device_write or access == .queue_write;
+    return access == .cpu_write or access == .cpu_persistent_write or access == .device_write or access == .queue_write;
 }
 
 test "producer exit preserves imported pixels and outstanding scanout until explicit release" {
@@ -1083,6 +1103,7 @@ test "failed allocation, stopped creation and stale release cannot leak budgets 
 }
 
 test "immutable raster exports pin contents after CPU maps end and shares preserve immutability" {
+    try persistentCpuLifetime();
     const t = std.testing;
     var store = Table(2, 8, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
     const producer = Owner{ .kind = .program, .id = 1, .generation = 1 };
@@ -1102,4 +1123,43 @@ test "immutable raster exports pin contents after CPU maps end and shares preser
     try store.drop(created.reference, producer);
     try store.finishRelease(store.pendingRelease().?, true);
     try t.expectEqual(@as(u64, 0), store.stats().bytes);
+}
+
+fn persistentCpuLifetime() !void {
+    const t = std.testing;
+    var store = Table(2, 8, 8){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
+    const app: Owner = .{ .kind = .program, .id = 1, .generation = 1 };
+    const driver: Owner = .{ .kind = .driver, .id = 2, .generation = 7 };
+    const queue: Owner = .{ .kind = .kernel, .id = 3, .generation = 1 };
+    const created = try store.begin(app, .{ .bytes = 4096, .usage = 15 });
+    try store.publish(created, .{ .cookie = 1, .bytes = 4096, .cpu_address = 0x1000, .cache = .write_back });
+    const ref = try store.share(created.reference, driver);
+    const cpu = try store.use(created.reference, app, .cpu_persistent_write, 0, 4096);
+    try t.expectError(error.Busy, store.importMode(created.buffer, driver, true));
+    try t.expectError(error.Busy, store.use(created.reference, app, .cpu_read, 0, 4096));
+    const gpu = try store.use(ref, driver, .device_write, 0, 4096);
+    try t.expectError(error.Busy, store.endUse(gpu.lease, driver, false));
+    try store.endUse(gpu.lease, driver, true);
+    const queued_use = try store.reserveQueued(created.reference, app, queue, true, 0, 4096);
+    try store.endUse(cpu.lease, app, false);
+    // Admission works in either order. Neither map removal nor app death is
+    // evidence that the independently held device/queue use has completed.
+    const next = try store.use(created.reference, app, .cpu_persistent_read, 0, 4096);
+    store.stoppedOwner(app);
+    try t.expectError(error.Stale, store.useInfo(next.lease, app));
+    try store.drop(ref, driver);
+    try t.expect(store.pendingRelease() == null);
+    try t.expectError(error.Busy, store.endUse(queued_use.lease, queue, false));
+    try store.endUse(queued_use.lease, queue, true);
+    try store.finishRelease(store.pendingRelease().?, true);
+    try t.expectEqual(@as(u64, 0), store.stats().bytes);
+
+    for ([_]@FieldType(Backing, "cache"){ .uncached, .write_combining }) |cache| {
+        var other = Table(1, 2, 2){ .budget_bytes = 4096, .producer_budget_bytes = 4096 };
+        const item = try other.begin(app, .{ .bytes = 4096, .usage = 15 });
+        try other.publish(item, .{ .cookie = 2, .bytes = 4096, .cpu_address = 0x2000, .cache = cache });
+        try t.expectError(error.Unsupported, other.use(item.reference, app, .cpu_persistent_write, 0, 4096));
+        try other.drop(item.reference, app);
+        try other.finishRelease(other.pendingRelease().?, true);
+    }
 }

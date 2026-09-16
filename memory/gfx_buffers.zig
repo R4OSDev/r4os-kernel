@@ -185,7 +185,7 @@ pub fn mapLocked(reference: Handle, owner: Owner, access: lifetime.Access, offse
 
 pub fn unmapCpuLocked(lease: Handle, owner: Owner) Error!void {
     const use = try store.useInfo(lease, owner);
-    if (use.access != .cpu_read and use.access != .cpu_write) return error.Invalid;
+    if (!lifetime.isCpu(use.access)) return error.Invalid;
     visibility();
     try store.endUse(lease, owner, false);
 }

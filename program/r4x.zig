@@ -7724,6 +7724,7 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_virtual_query = &apiGfxVirtualQuery,
         .gfx_virtual_close = &apiGfxVirtualClose,
         .gfx_virtual_wait = &apiGfxVirtualWait,
+        .gfx_buffer_map_persistent = &apiGfxBufferMapPersistent,
         .gfx_output_revision = &gfx_output_api.revision,
         .gfx_output_info = &gfx_output_api.info,
         .gfx_output_mode = &gfx_output_api.mode,
@@ -16490,6 +16491,10 @@ fn apiGfxBufferMap(input: *const r4x_api.GfxBufferHandle, access: u32, offset: u
 fn apiGfxBufferUnmap(input: *const r4x_api.GfxBufferHandle) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
     return gfx_buffer_api.unmap(graphicsOwner(owner), input);
+}
+fn apiGfxBufferMapPersistent(input: *const r4x_api.GfxBufferHandle, access: u32, offset: u64, bytes: u64, output: *r4x_api.GfxBufferMap) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_buffer_api.mapPersistent(graphicsOwner(owner), input, access, offset, bytes, output);
 }
 fn apiGfxBufferExportRaster(input: *const GuiSharedRasterLease, output: *r4x_api.GfxBufferReference) callconv(.c) i32 {
     const consumer = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
