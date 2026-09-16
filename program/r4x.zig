@@ -1016,6 +1016,7 @@ const ProgramInstanceStorage = struct {
 };
 
 const ProgramInstance = struct {
+    gfx_virtual_closed: bool = false, // common BO owner; closed before exit publication
     notifications: notifications.Owner = .{},
     used: bool = false,
     id: u32 = 0,
@@ -2047,6 +2048,7 @@ fn sharedRasterReleaseProcess(handle: ProgramProcessHandle) void {
     _ = shared_raster_lock.unlock();
     gfx_queue.stopped(graphicsOwner(handle));
     gfx_allocations.stopped(graphicsOwner(handle));
+    @import("../kernel/gfx_virtual.zig").stopped(graphicsOwner(handle));
     @import("../display/cursor_work.zig").stopped(graphicsOwner(handle));
     @import("../display/outputs.zig").refreshStopped(graphicsOwner(handle));
     @import("../display/outputs.zig").powerStopped(graphicsOwner(handle));
@@ -7718,6 +7720,10 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_native_receive = &apiGfxNativeReceive,
         .gfx_native_close = &apiGfxNativeClose,
         .gfx_native_wait = &apiGfxNativeWait,
+        .gfx_virtual_start = &apiGfxVirtualStart,
+        .gfx_virtual_query = &apiGfxVirtualQuery,
+        .gfx_virtual_close = &apiGfxVirtualClose,
+        .gfx_virtual_wait = &apiGfxVirtualWait,
         .gfx_output_revision = &gfx_output_api.revision,
         .gfx_output_info = &gfx_output_api.info,
         .gfx_output_mode = &gfx_output_api.mode,
@@ -12723,6 +12729,7 @@ fn releaseProgramTaskGeneration(task_id: u32, task_generation: u64, current_task
         .gone, .released => blk: {
             gfx_queue.retiredTask(task_id, task_generation);
             gfx_allocations.retiredTask(task_id, task_generation);
+            @import("../kernel/gfx_virtual.zig").retiredTask(task_id, task_generation);
             break :blk true;
         },
         .pending => false,
@@ -16354,6 +16361,24 @@ fn apiGfxBufferCreate(input: *const r4x_api.GfxBufferDescriptor, output: *r4x_ap
     const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
     return gfx_buffer_api.create(graphicsOwner(owner), input, output);
 }
+const gfx_virtual_api = @import("gfx_virtual_api.zig");
+fn apiGfxVirtualStart(input: *const gfx_virtual_api.abi.GfxVirtualRequest, output: *gfx_virtual_api.abi.GfxVirtualStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    const instance = currentExecutionInstanceNoRegistry() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_virtual_api.start(graphicsOwner(owner), &instance.gfx_virtual_closed, input, output);
+}
+fn apiGfxVirtualQuery(input: *const r4x_api.GfxBufferHandle, output: *gfx_virtual_api.abi.GfxVirtualStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_virtual_api.query(graphicsOwner(owner), input, output);
+}
+fn apiGfxVirtualClose(input: *const r4x_api.GfxBufferHandle, mode: u32) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_virtual_api.close(graphicsOwner(owner), input, mode);
+}
+fn apiGfxVirtualWait(input: *const r4x_api.GfxBufferHandle, until: u32, timeout: u64, output: *gfx_virtual_api.abi.GfxVirtualStatus) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
+    return gfx_virtual_api.wait(graphicsOwner(owner), input, until, timeout, output);
+}
 fn apiGfxNativeStart(input: *const r4x_api.GfxNativeAllocation, output: *r4x_api.GfxNativeStatus) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return r4x_api.gfx_buffer_error_unavailable;
     return gfx_allocation_api.start(graphicsOwner(owner), input, output);
@@ -17839,6 +17864,7 @@ fn commitProgramExit(handle: ProgramProcessHandle, exit_code: i32, requested_rea
         unlockProgramRegistry();
         return .retry;
     };
+    @import("../kernel/gfx_virtual.zig").stopAdmission(&instance.gfx_virtual_closed);
     const finish_tick = timer.tickCount();
     const exit_reason = if (requested_reason == PROGRAM_EXIT_REASON_NATURAL and instance.close_requested)
         PROGRAM_EXIT_REASON_CLOSE
@@ -17884,6 +17910,7 @@ fn commitProgramExit(handle: ProgramProcessHandle, exit_code: i32, requested_rea
     orphanOwnedProgramCompletions(handle);
     gfx_queue.stopped(graphicsOwner(handle));
     gfx_allocations.stopped(graphicsOwner(handle));
+    @import("../kernel/gfx_virtual.zig").stopped(graphicsOwner(handle));
     terminateProgramThreadsForHandle(handle, -9, scheduler.currentId());
     return .committed;
 }

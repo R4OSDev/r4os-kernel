@@ -63,6 +63,7 @@ pub fn beginClose(id: u32) void {
     lifecycleUnlock(token);
     if (scheduler.current() != null) {
         @import("gfx_allocations.zig").closingDriver(id);
+        @import("gfx_virtual.zig").closingDriver(id);
         @import("../program/gfx_telemetry_api.zig").closeDriver(id);
     }
 }
@@ -73,7 +74,7 @@ pub fn retained(id: u32) bool {
         const identity = state.owner(id, false) catch return false;
         break :blk state.retains(identity);
     };
-    return held or (scheduler.current() != null and (buffers.retainsDriver(id) or @import("gfx_allocations.zig").retainsDriver(id)));
+    return held or (scheduler.current() != null and (buffers.retainsDriver(id) or @import("gfx_allocations.zig").retainsDriver(id) or @import("gfx_virtual.zig").retainsDriver(id)));
 }
 pub fn finishOwner(id: u32) void {
     const identity = owner(id, false) catch return;

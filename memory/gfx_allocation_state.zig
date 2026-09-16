@@ -143,6 +143,7 @@ pub fn Store(comptime capacity: usize) type {
 }
 
 test "native allocation close, expiry, ownership and publication retain exact claims" {
+    try @import("gfx_virtual_state.zig").checkLifetime();
     const t = std.testing;
     const app: Owner = .{ .kind = .program, .id = 7, .generation = 2 };
     const other: Owner = .{ .kind = .program, .id = 7, .generation = 3 };

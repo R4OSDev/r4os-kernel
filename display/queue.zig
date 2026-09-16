@@ -716,6 +716,7 @@ fn workerMain() callconv(.c) void {
         }
         publishAndRelease();
         const allocation_pending = @import("../kernel/gfx_allocations.zig").service();
+        const virtual_pending = @import("../kernel/gfx_virtual.zig").service();
         const native_pending = notifyNative();
         if (copySlice()) {
             scheduler.yield();
@@ -730,6 +731,6 @@ fn workerMain() callconv(.c) void {
             break;
         };
         buffers.unlock();
-        _ = worker_event.waitResult(if (pending or native_pending or allocation_pending) 1 else scheduler.WAIT_FOREVER);
+        _ = worker_event.waitResult(if (pending or native_pending or allocation_pending or virtual_pending) 1 else scheduler.WAIT_FOREVER);
     }
 }

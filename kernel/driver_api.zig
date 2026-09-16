@@ -3755,6 +3755,10 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
         .native_unregister = @intFromPtr(&gfxNativeUnregister),
         .native_take = @intFromPtr(&gfxNativeTake),
         .native_complete = @intFromPtr(&gfxNativeComplete),
+        .virtual_register = @intFromPtr(&gfxVirtualRegister),
+        .virtual_unregister = @intFromPtr(&gfxVirtualUnregister),
+        .virtual_take = @intFromPtr(&gfxVirtualTake),
+        .virtual_complete = @intFromPtr(&gfxVirtualComplete),
         .memory_budget = @intFromPtr(&gfxMemoryBudget),
         .telemetry_exchange = @intFromPtr(&gfxTelemetryExchange),
         .device_lost = @intFromPtr(&gfxDeviceLost),
@@ -3763,6 +3767,22 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
     return outputs_contract.gfx_buffer_result_ok;
 }
 
+fn gfxVirtualRegister(input: *const outputs_contract.GfxNativeProvider, output: *outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return @import("gfx_virtual_driver_api.zig").register(identity, input, output);
+}
+fn gfxVirtualUnregister(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return @import("gfx_virtual_driver_api.zig").unregister(identity, input);
+}
+fn gfxVirtualTake(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxVirtualJob) callconv(.c) i32 {
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return @import("gfx_virtual_driver_api.zig").take(identity, input, output);
+}
+fn gfxVirtualComplete(input: *const outputs_contract.GfxBufferHandle, completion: *const outputs_contract.GfxVirtualCompletion) callconv(.c) i32 {
+    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
+    return @import("gfx_virtual_driver_api.zig").complete(identity, input, completion);
+}
 fn gfxNativeRegister(input: *const outputs_contract.GfxNativeProvider, output: *outputs_contract.GfxBufferHandle) callconv(.c) i32 {
     const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
     return @import("gfx_allocation_driver_api.zig").register(identity, input, output);
