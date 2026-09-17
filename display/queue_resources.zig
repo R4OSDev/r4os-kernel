@@ -7,7 +7,7 @@ const queue = @import("queue_state.zig");
 const abi = @import("r4os_kernel_contract");
 pub const owner = lifetime.Owner{ .kind = .kernel, .id = 2, .generation = 1 };
 pub const display_owner = lifetime.Owner{ .kind = .kernel, .id = 3, .generation = 1 };
-pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present, render_list, direct_present, render_grid_list, render_color_list, native };
+pub const Operation = enum(u32) { copy, barrier, upload, copy_rows, render, present, render_list, direct_present, render_grid_list, render_color_list, native, render_color_grid_list };
 pub const Request = struct {
     operation: Operation = .copy,
     source: lifetime.Handle = .{},
@@ -22,6 +22,7 @@ pub const Request = struct {
     render_list: ?*const abi.GfxRenderList = null,
     grid_list: ?*const abi.GfxRenderGridList = null,
     color_list: ?*const abi.GfxRenderColorList = null,
+    color_grid_list: ?*const abi.GfxRenderColorGridList = null,
     memory_binding: ?lifetime.layout.Binding = null,
     display_target: abi.GfxOutputTarget = .{},
 };
@@ -43,6 +44,26 @@ pub const Entry = struct {
     display_target: abi.GfxOutputTarget = .{},
 };
 pub const Error = lifetime.Error || queue.Error;
+
+fn validateColorList(list: anytype, render: abi.GfxRenderCommand) Error!void {
+    if (list.version != 1 or list.size != @sizeOf(@TypeOf(list.*)) or list.reserved0 != 0 or
+        list.count == 0 or list.count > abi.gfx_render_list_capacity or list.program.version != 1 or
+        list.program.size != @sizeOf(abi.GfxRenderColorProgram) or list.program.reserved0 != 0 or
+        render.kind != abi.gfx_render_kind_sample or render.filter != abi.gfx_render_filter_nearest or
+        render.transfer != abi.gfx_render_transfer_color) return error.Invalid;
+}
+fn validateGrids(grids: *const [abi.gfx_render_list_capacity]abi.GfxSampleGrid, count: u32,
+    commands: *const [abi.gfx_render_list_capacity]abi.GfxRenderCommand, transfer: u32) Error!void {
+    for (grids, 0..) |value, index| {
+        if (index >= count or value.enabled == 0) {
+            if (!std.meta.eql(value, abi.GfxSampleGrid{})) return error.Invalid;
+        } else if (value.enabled != 1 or value.reserved != 0 or value.rotation > 3 or
+            value.scale < 60 or value.scale > 960 or value.pixel_width == 0 or value.pixel_height == 0 or
+            value.viewport_width == 0 or value.viewport_height == 0 or value.guest_width == 0 or value.guest_height == 0 or
+            commands[index].kind != abi.gfx_render_kind_sample or commands[index].filter != abi.gfx_render_filter_nearest or
+            commands[index].transfer != transfer) return error.Invalid;
+    }
+}
 
 pub fn rowSpan(bytes: u64, rows: u32, pitch: u64) Error!u64 {
     if (bytes == 0 or rows == 0 or pitch < bytes) return error.Invalid;
@@ -126,12 +147,12 @@ pub fn Resources(comptime capacity: usize) type {
             const draw = request.render;
             if (request.bytes != 0 or request.source_offset != 0 or request.target_offset != 0 or draw.reserved0 != 0 or
                 draw.kind > abi.gfx_render_kind_sample or draw.filter > abi.gfx_render_filter_bilinear or draw.blend > abi.gfx_render_blend_over or
-                draw.transfer > (if (request.operation == .render_color_list) abi.gfx_render_transfer_color else abi.gfx_render_transfer_srgb_encode) or draw.opacity > 255) return error.Invalid;
+                draw.transfer > (if (request.operation == .render_color_list or request.operation == .render_color_grid_list) abi.gfx_render_transfer_color else abi.gfx_render_transfer_srgb_encode) or draw.opacity > 255) return error.Invalid;
             const sampled = draw.kind == abi.gfx_render_kind_sample;
             if (!sampled and (request.source.id != 0 or request.source.generation != 0 or draw.filter != 0 or draw.transfer != 0 or
                 !std.meta.eql(draw.source_rect, abi.GfxRenderRect{}))) return error.Invalid;
             if (sampled and draw.color != 0) return error.Invalid;
-            if (request.operation == .render_list or request.operation == .render_grid_list or request.operation == .render_color_list) {
+            if (request.operation == .render_list or request.operation == .render_grid_list or request.operation == .render_color_list or request.operation == .render_color_grid_list) {
                 const list = request.render_list orelse return error.Invalid;
                 if (list.version != 1 or list.size != @sizeOf(abi.GfxRenderList) or list.count == 0 or
                     list.count > abi.gfx_render_list_capacity or list.reserved0 != 0 or !std.meta.eql(list.commands[0], draw)) return error.Invalid;
@@ -170,6 +191,10 @@ pub fn Resources(comptime capacity: usize) type {
             if (request.render_list) |list| self.render_lists[entry.fence.slot - 1] = list.*;
             if (request.grid_list) |list| self.render_grids[entry.fence.slot - 1] = list.grids;
             if (request.color_list) |list| self.render_colors[entry.fence.slot - 1] = list.program;
+            if (request.color_grid_list) |list| {
+                self.render_grids[entry.fence.slot - 1] = list.grids;
+                self.render_colors[entry.fence.slot - 1] = list.program;
+            }
             return entry.fence;
         }
 
@@ -185,21 +210,28 @@ pub fn Resources(comptime capacity: usize) type {
             const status = try state.query(fence);
             if (!status.device_active) return error.Invalid;
             const entry = &self.entries[fence.slot - 1];
-            if (!std.meta.eql(entry.fence, fence) or entry.operation != .render_grid_list) return error.Invalid;
+            if (!std.meta.eql(entry.fence, fence) or (entry.operation != .render_grid_list and entry.operation != .render_color_grid_list)) return error.Invalid;
             const list = &self.render_lists[fence.slot - 1];
             return .{ .count = list.count, .commands = list.commands, .grids = self.render_grids[fence.slot - 1] };
         }
 
         pub fn submit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
             const config = try state.configuration(timeline, producer);
+            if (request.operation == .render_color_grid_list) {
+                if (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0 or
+                    request.color_list != null or request.grid_list != null or request.render_list != null) return error.Invalid;
+                const combined = request.color_grid_list orelse return error.Invalid;
+                try validateColorList(combined, request.render);
+                try validateGrids(&combined.grids, combined.count, &combined.commands, abi.gfx_render_transfer_color);
+                const list: abi.GfxRenderList = .{ .count = combined.count, .commands = combined.commands };
+                var copied = request; copied.render_list = &list;
+                return self.renderSubmit(state, buffers, timeline, producer, submission, copied, now);
+            }
+            if (request.color_grid_list != null) return error.Invalid;
             if (request.operation == .render_color_list) {
                 if (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0 or request.grid_list != null or request.render_list != null) return error.Invalid;
                 const color = request.color_list orelse return error.Invalid;
-                if (color.version != 1 or color.size != @sizeOf(abi.GfxRenderColorList) or color.reserved0 != 0 or
-                    color.count == 0 or color.count > abi.gfx_render_list_capacity or color.program.version != 1 or
-                    color.program.size != @sizeOf(abi.GfxRenderColorProgram) or color.program.reserved0 != 0 or
-                    request.render.kind != abi.gfx_render_kind_sample or request.render.filter != abi.gfx_render_filter_nearest or
-                    request.render.transfer != abi.gfx_render_transfer_color) return error.Invalid;
+                try validateColorList(color, request.render);
                 // Coefficients are opaque to this owner. Native userland validates
                 // their domains before binding the fixed shader; no float math here.
                 const list: abi.GfxRenderList = .{ .count = color.count, .commands = color.commands };
@@ -212,14 +244,7 @@ pub fn Resources(comptime capacity: usize) type {
                 const grid = request.grid_list orelse return error.Invalid;
                 if (request.render_list != null or grid.version != 1 or grid.size != @sizeOf(abi.GfxRenderGridList) or
                     grid.count == 0 or grid.count > abi.gfx_render_list_capacity or grid.reserved0 != 0) return error.Invalid;
-                for (grid.grids, 0..) |value, index| {
-                    if (index >= grid.count or value.enabled == 0) {
-                        if (!std.meta.eql(value, abi.GfxSampleGrid{})) return error.Invalid;
-                    } else if (value.enabled != 1 or value.reserved != 0 or value.rotation > 3 or
-                        value.scale < 60 or value.scale > 960 or value.pixel_width == 0 or value.pixel_height == 0 or
-                        value.viewport_width == 0 or value.viewport_height == 0 or value.guest_width == 0 or value.guest_height == 0 or
-                        grid.commands[index].kind != abi.gfx_render_kind_sample or grid.commands[index].filter != 0 or grid.commands[index].transfer != 0) return error.Invalid;
-                }
+                try validateGrids(&grid.grids, grid.count, &grid.commands, abi.gfx_render_transfer_identity);
                 const list: abi.GfxRenderList = .{ .count = grid.count, .commands = grid.commands };
                 var copied = request; copied.render_list = &list;
                 return self.renderSubmit(state, buffers, timeline, producer, submission, copied, now);
@@ -293,7 +318,7 @@ pub fn Resources(comptime capacity: usize) type {
             const status = try state.query(fence);
             if (!status.device_active) return error.Invalid;
             const entry = &self.entries[fence.slot - 1];
-            if (!std.meta.eql(entry.fence, fence) or entry.operation != .render_color_list) return error.Invalid;
+            if (!std.meta.eql(entry.fence, fence) or (entry.operation != .render_color_list and entry.operation != .render_color_grid_list)) return error.Invalid;
             const list = &self.render_lists[fence.slot - 1];
             return .{ .count = list.count, .commands = list.commands, .program = self.render_colors[fence.slot - 1] };
         }
@@ -671,6 +696,10 @@ fn checkGridLifetime() !void {
 }
 
 fn checkColorLifetime() !void {
+    try checkColorLifetimeKind(false);
+    try checkColorLifetimeKind(true);
+}
+fn checkColorLifetimeKind(combined: bool) !void {
     const t = std.testing;
     const producer: lifetime.Owner = .{ .kind = .program, .id = 41, .generation = 2 };
     const device: queue.Binding = .{ .adapter = 7, .device_generation = 3, .reset_generation = 2 };
@@ -695,11 +724,26 @@ fn checkColorLifetime() !void {
     try t.expectError(error.Invalid, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 1));
     request.operation = .render_color_list;
     const expected = list;
+    var full: abi.GfxRenderColorGridList = .{ .count = list.count, .commands = list.commands, .program = list.program };
+    full.grids[0] = .{ .enabled = 1, .rotation = 3, .scale = 150, .pixel_width = 16, .pixel_height = 16,
+        .viewport_width = 13, .viewport_height = 13, .guest_width = 16, .guest_height = 16 };
+    const expected_grid = full.grids[0];
+    if (combined) {
+        request.operation = .render_color_grid_list; request.color_list = null; request.color_grid_list = &full;
+        full.grids[0].scale = 0;
+        try t.expectError(error.Invalid, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 1));
+        full.grids[0] = expected_grid;
+        full.grids[1].enabled = 1;
+        try t.expectError(error.Invalid, resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 1));
+        full.grids[1] = .{};
+    }
     const fence = try resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 1);
     try t.expectError(error.Invalid, resources.renderColorList(&state, fence));
     list.program.words = @splat(0); list.commands[0].opacity = 0;
+    full = .{};
     try t.expectEqualDeep(fence, state.takeReadyFor(device, 2).?);
     try t.expectEqualDeep(expected, try resources.renderColorList(&state, fence));
+    if (combined) try t.expectEqualDeep(expected_grid, (try resources.renderGridList(&state, fence)).grids[0]);
     try t.expectError(error.Invalid, resources.renderList(&state, fence));
     try state.cancel(fence, producer, 3);
     for (refs) |ref| try buffers.drop(ref, producer);

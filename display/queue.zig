@@ -126,7 +126,7 @@ pub fn backendProperties(binding: model.Binding, milestone: u32) Error!?abi.GfxB
 }
 pub fn registerNative(identity: buffers.Owner, config: NativeConfig) Error!model.Binding {
     if (!started or irq.inDispatch()) return error.Unavailable;
-    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 2047) != 0) return error.Invalid;
+    if (identity.kind != .driver or !identity.valid() or config.adapter == 0 or config.milestone == .cpu_stores or config.operations == 0 or config.operations & ~@as(u64, 4095) != 0) return error.Invalid;
     const profile = try validatedProfile(config.profile);
     if (config.operations & (@as(u64, 1) << abi.gfx_queue_operation_native) != 0 and
         profile.interface_id_lo == 0 and profile.interface_id_hi == 0) return error.Unsupported;
@@ -219,7 +219,7 @@ pub fn outputBusyLocked(target: abi.GfxOutputTarget) bool {
     return false;
 }
 pub fn updateNativeOperations(id: u32, binding: model.Binding, operations: u64) Error!void {
-    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 2047) != 0) return error.Invalid;
+    if (irq.inDispatch() or operations == 0 or operations & ~@as(u64, 4095) != 0) return error.Invalid;
     buffers.lock(); defer buffers.unlock();
     const backend = try backendLocked(binding);
     if (id == 0 or backend.owner.id != id) return error.WrongOwner;
