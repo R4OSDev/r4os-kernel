@@ -32,6 +32,14 @@ pub const max_api_path: usize = @as(usize, r4x_api.file_path_max_bytes) + 1;
 pub const dir_entry_result_end: i32 = -5;
 pub const dir_entry_error_io: i32 = -9;
 
+pub fn cpuCapacity(output: *r4x_api.CpuCapacity) callconv(.c) i32 {
+    if (@intFromPtr(output) == 0) return r4x_api.thread_error_invalid;
+    const value = @import("../kernel/smp.zig").capacity();
+    if (value.available == 0 or value.available > value.configured) return r4x_api.thread_error_busy;
+    output.* = .{ .available_cpus = value.available, .configured_cpus = value.configured };
+    return r4x_api.thread_ok;
+}
+
 pub const Target = struct {
     drive_ref: *drive.Drive,
     path: []const u8,

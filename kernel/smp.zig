@@ -701,6 +701,13 @@ pub fn runAcceptanceProbeIfEnabled(usable_bytes: u64) bool {
     return ok;
 }
 
+/// Boot plan is immutable once program execution starts. Available CPUs come
+/// from one acquire load of the scheduler admission mask, excluding failed APs
+/// and online CPUs that have not passed clock/scheduler admission.
+pub fn capacity() struct { available: u32, configured: u32 } {
+    return .{ .available = percpu.schedulableCount(), .configured = @max(topology.count, 1) };
+}
+
 pub fn status() Status {
     var result = current;
     result.online = 0;

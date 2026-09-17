@@ -2387,6 +2387,7 @@ pub const ProgramRegistrySummaryV2 = generated.ProgramRegistrySummaryV2;
 pub const ProgramRegistrySelfTestResult = generated.ProgramRegistrySelfTestResult;
 pub const ProgramRegistrySelfTestResultV2 = generated.ProgramRegistrySelfTestResultV2;
 pub const ProgramJoinHandle = generated.ProgramJoinHandle;
+pub const CpuCapacity = generated.CpuCapacity;
 pub const ProgramInventoryCursor = generated.ProgramInventoryCursor;
 pub const ProgramInventoryPageInfo = generated.ProgramInventoryPageInfo;
 pub const ProgramInstanceSnapshot = generated.ProgramInstanceSnapshot;

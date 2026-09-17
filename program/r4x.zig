@@ -7561,6 +7561,9 @@ fn configureR4XStartR4SysTable() void {
         .notification_close = &apiNotificationClose,
         .program_local_get = &apiProgramLocalGet,
         .program_local_publish = &apiProgramLocalPublish,
+        .thread_current_handle = &apiThreadCurrentHandle,
+        .cpu_capacity = &r4api.r4sys.cpuCapacity,
+        .program_exit = &apiProgramExit,
     });
 }
 
@@ -11930,14 +11933,33 @@ fn threadCreateErrorForTaskFailure(failure: task.CreateFailure) i32 {
 
 fn apiThreadExit(exit_code: i32) callconv(.c) void {
     const thread_ctx = currentProgramThread() orelse scheduler.exitCurrentAndRetire();
+    exitProgramThread(thread_ctx, exit_code, if ((thread_ctx.flags & THREAD_FLAG_MAIN) != 0) PROGRAM_EXIT_REASON_NATURAL else null);
+}
+
+// A process-scoped terminal operation, including when called by a worker.
+// The caller's normal exit epilogue keeps its execution pin and stack until
+// the terminal context switch; the existing reaper owns its peers/resources.
+fn apiProgramExit(exit_code: i32, reason: u32) callconv(.c) i32 {
+    if (reason != PROGRAM_EXIT_REASON_NATURAL and reason != PROGRAM_EXIT_REASON_FAILED) return THREAD_ERROR_INVALID;
+    const interrupts = @import("../arch/x86_64/interrupts.zig");
+    const io = @import("../arch/x86_64/io.zig");
+    if (!interrupts.wereEnabled(io.readRflags()) or interrupts.inRuntimeCriticalSection()) return THREAD_ERROR_BUSY;
+    const running = scheduler.current() orelse return THREAD_ERROR_NO_INSTANCE;
+    if (running.preempt_disable_depth != 0 or running.held_lock_count != 0 or
+        running.unwind_guard_count != 0 or running.wait_handoff_guard_pending) return THREAD_ERROR_BUSY;
+    const thread_ctx = currentProgramThread() orelse return THREAD_ERROR_NO_INSTANCE;
+    exitProgramThread(thread_ctx, exit_code, @intCast(reason));
+}
+
+fn exitProgramThread(thread_ctx: *ProgramThread, exit_code: i32, process_reason: ?u8) noreturn {
     markProgramThreadDone(thread_ctx, exit_code);
-    if ((thread_ctx.flags & THREAD_FLAG_MAIN) != 0) {
+    if (process_reason) |reason| {
         const handle = ProgramProcessHandle{
             .instance_id = thread_ctx.instance_id,
             .reserved = 0,
             .generation = thread_ctx.instance_generation,
         };
-        markInstanceDone(handle, exit_code);
+        while (!beginProgramExit(handle, exit_code, reason)) scheduler.yield();
     }
     unpinProgramThreadExecution(thread_ctx);
     scheduler.exitCurrentAndRetire();
@@ -12148,6 +12170,21 @@ fn finishJoinedThread(target: *ProgramThread, owner_task_id: u32, owner_task_gen
 fn apiThreadCurrent() callconv(.c) u32 {
     const thread_ctx = currentProgramThread() orelse return 0;
     return thread_ctx.id;
+}
+
+fn apiThreadCurrentHandle(out: *ProgramJoinHandle) callconv(.c) i32 {
+    if (@intFromPtr(out) == 0) return THREAD_ERROR_INVALID;
+    const thread_ctx = currentProgramThread() orelse return THREAD_ERROR_NO_INSTANCE;
+    // Execution ownership retains this exact thread until its Task retires.
+    // These immutable fields need neither a registry scan nor a join lease.
+    out.* = .{
+        .thread_id = thread_ctx.id,
+        .instance_id = thread_ctx.instance_id,
+        .thread_generation = thread_ctx.generation,
+        .instance_generation = thread_ctx.instance_generation,
+        .reserved = 0,
+    };
+    return THREAD_OK;
 }
 
 fn notificationOwner() ?*notifications.Owner {
