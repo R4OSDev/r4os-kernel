@@ -327,6 +327,13 @@ pub fn desktopActivityWait(last_seq: u64, timeout_ticks: u64, out_seq: *u64) cal
     return desktop_events.wait(last_seq, timeout_ticks, out_seq);
 }
 
+/// Userland publishes its own work before calling this generic wake. State,
+/// image ownership and GPU completion remain with their existing owners.
+pub fn desktopActivityNotify() callconv(.c) i32 {
+    desktop_events.signal();
+    return 0;
+}
+
 pub fn remoteFrameAcquire(owner: CaptureOwner) i32 {
     const token = owner_locks.program_state.acquire();
     const current = remoteFrameConsumers();

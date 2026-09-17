@@ -7629,6 +7629,7 @@ fn configureR4XStartR4DeskTable() void {
         .remote_frame_snapshot_release = &apiRemoteFrameSnapshotRelease,
         .remote_frame_source_reset = &apiRemoteFrameSourceReset,
         .remote_frame_capture_stats = &r4api.r4desk.remoteFrameCaptureStats,
+        .desktop_activity_notify = &r4api.r4desk.desktopActivityNotify,
     });
 }
 
