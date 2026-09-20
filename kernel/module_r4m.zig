@@ -341,6 +341,29 @@ pub fn metadataValue(meta: []const u8, prefix: []const u8) ?[]const u8 {
     return found;
 }
 
+// Retained, bounded display labels. Never truncate an unrepresentable version
+// into a different version, and never expose control bytes to user interfaces.
+pub const VersionLabels = struct {
+    module: [32]u8 = .{0} ** 32,
+    firmware: [32]u8 = .{0} ** 32,
+
+    pub fn parse(meta: []const u8) VersionLabels {
+        return .{
+            .module = label(meta, "module.version="),
+            .firmware = label(meta, "firmware.version="),
+        };
+    }
+
+    fn label(meta: []const u8, prefix: []const u8) [32]u8 {
+        var out: [32]u8 = .{0} ** 32;
+        const value = metadataValue(meta, prefix) orelse return out;
+        if (value.len == 0 or value.len >= out.len) return out;
+        for (value) |c| if (c < 33 or c > 126) return out;
+        @memcpy(out[0..value.len], value);
+        return out;
+    }
+};
+
 pub fn metadataContains(meta: []const u8, needle: []const u8) bool {
     var it = metadataIterator(meta);
     while (it.next()) |item| {

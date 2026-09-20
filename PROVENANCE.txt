@@ -23,6 +23,15 @@ ihre Git-Blobs geprueft. Die fuenf Supportdateien sind ebenfalls bytegleich
 zum eingefrorenen Referenzcommit und liegen nun explizit innerhalb der
 Kernelgrenze, damit der Kernel keine SDK-Quelle importiert.
 
+Besitzerabgleich 0.79.42 / Kernel 0.1.199
+---------------------------------------
+Support/system_update_recovery.zig und Support/system_update_paths.zig sind
+bytegleich mit den kanonischen SDK-Dateien. Der fruehe Wiederhersteller
+akzeptiert die eng begrenzten LICENSES-/SOURCES-Begleitdateien der R4U-Pakete.
+Das Journalformat bleibt unveraendert. Die eigenstaendige RAM-Recovery wird
+dadurch nicht automatisch veraendert; ihr Start liest keine SYSUPD-Journale
+der installierten Systempartition.
+
 Absichtliche Grenzaenderungen:
 
 - Der alte Root-Build und sein Modul-Aggregat wurden nicht uebernommen.

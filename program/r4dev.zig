@@ -1527,6 +1527,18 @@ pub fn displayState(out: *r4x_api.DisplayStateInfo) callconv(.c) i32 {
     return 1;
 }
 
+pub fn driverModuleInfo(owner: u32, out: *r4x_api.DriverModuleInfo) callconv(.c) i32 {
+    if (owner == 0 or @intFromPtr(out) == 0 or out.version != 1 or out.size < @sizeOf(r4x_api.DriverModuleInfo)) return -1;
+    return switch (@import("r4d.zig").moduleInfo(owner)) {
+        .absent => 0,
+        .busy => -2,
+        .found => |info| blk: {
+            out.* = info;
+            break :blk 1;
+        },
+    };
+}
+
 comptime {
     for (@typeInfo(display.backend_state.State).@"enum".fields) |field| {
         if (field.value != @field(r4x_api, "display_state_" ++ field.name)) @compileError("display state contract mismatch");

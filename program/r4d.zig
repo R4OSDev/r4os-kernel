@@ -9,6 +9,7 @@ const module_r4m = @import("../kernel/module_r4m.zig");
 const modules = @import("../kernel/modules.zig");
 const sync = @import("../sched/sync.zig");
 const timer = @import("../kernel/timer.zig");
+const api = @import("r4x_api.zig");
 
 const VERSION: u32 = 1;
 const MAX_RUNTIME_DRIVERS: usize = 16;
@@ -70,6 +71,7 @@ const RuntimeDriver = struct {
     name_len: usize = 0,
     driver_type: u16 = 0,
     registry_slot: usize = 0,
+    module_slot: usize = 0,
     owner: u32 = 0,
     shutdown: ?ShutdownFn = null,
 };
@@ -496,7 +498,7 @@ fn initRuntimeModuleResultSource(module_slot: usize, source: LoadSource) Runtime
         driver_registry.setState(registry_slot, if (cleanup_ok) .failed else .quarantined);
         return .load_failed;
     };
-    storeRuntime(runtime_slot, name, descriptor.driver_type, registry_slot, owner, shutdown);
+    storeRuntime(runtime_slot, name, descriptor.driver_type, registry_slot, descriptor.module_slot, owner, shutdown);
     k.puts("[R4D] runtime load ");
     k.puts(name);
     k.puts(" [OK]\r\n");
@@ -698,18 +700,47 @@ fn leaveRuntimeLifecycle() void {
     _ = runtime_lifecycle_guard.leave();
 }
 
-fn storeRuntime(slot: usize, name: []const u8, driver_type: u16, registry_slot: usize, owner: u32, shutdown: ShutdownFn) void {
+fn storeRuntime(slot: usize, name: []const u8, driver_type: u16, registry_slot: usize, module_slot: usize, owner: u32, shutdown: ShutdownFn) void {
     const d = &runtime_drivers[slot];
     d.* = .{
         .used = true,
         .generation = allocateRuntimeGeneration(),
         .driver_type = driver_type,
         .registry_slot = registry_slot,
+        .module_slot = module_slot,
         .owner = owner,
         .shutdown = shutdown,
     };
     d.name_len = if (name.len < MAX_RUNTIME_NAME) name.len else MAX_RUNTIME_NAME - 1;
     if (d.name_len > 0) @memcpy(d.name[0..d.name_len], name[0..d.name_len]);
+}
+
+pub const ModuleInfoResult = union(enum) { absent, busy, found: api.DriverModuleInfo };
+
+// Copy under the existing lifecycle owner; release it before the API writes
+// caller memory. Never reopen the installed file: SYSUPD may have replaced it.
+pub fn moduleInfo(owner: u32) ModuleInfoResult {
+    if (!enterRuntimeLifecycle(0)) return .busy;
+    defer leaveRuntimeLifecycle();
+    for (&runtime_drivers) |*driver| {
+        if (!driver.used or driver.owner != owner) continue;
+        const entry = modules.entryAt(driver.module_slot) orelse return .absent;
+        if (entry.kind != .r4d or entry.state != .loaded) return .absent;
+        var result: api.DriverModuleInfo = .{
+            .owner = owner,
+            .generation = driver.generation,
+            .module_generation = entry.generation,
+            .flags = @as(u32, if (driver.quarantined) 1 else 0) |
+                @as(u32, if (entry.version_labels.module[0] != 0) 2 else 0) |
+                @as(u32, if (entry.version_labels.firmware[0] != 0) 4 else 0),
+            .module_version = entry.version_labels.module,
+            .firmware_version = entry.version_labels.firmware,
+        };
+        const len = @min(driver.name_len, result.driver_name.len - 1);
+        @memcpy(result.driver_name[0..len], driver.name[0..len]);
+        return .{ .found = result };
+    }
+    return .absent;
 }
 
 fn allocateRuntimeGeneration() u64 {

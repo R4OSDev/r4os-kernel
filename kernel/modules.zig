@@ -147,6 +147,7 @@ const FileImport = struct {
 };
 
 const ValidatedFileTables = struct {
+    version_labels: module_r4m.VersionLabels = .{},
     header: Header,
     sections: [MAX_SECTIONS]SectionHeader = undefined,
     imports: [MAX_IMPORTS_PER_MODULE]FileImport = .{FileImport{}} ** MAX_IMPORTS_PER_MODULE,
@@ -191,6 +192,7 @@ pub const Section = struct {
 };
 
 pub const Entry = struct {
+    version_labels: module_r4m.VersionLabels = .{},
     used: bool = false,
     name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
     name_len: usize = 0,
@@ -1175,6 +1177,7 @@ fn loadR4MFile(load: *PreparedLoad, source: module_file.FileSource, tables: *con
         .generation = load.generation,
         .resource_source = if (kind == .r4d) source else null,
         .resource_file_offset = resource_file_offset,
+        .version_labels = tables.version_labels,
         .pinned = kind == .r4l,
         .sections = sections,
     };
@@ -1304,6 +1307,10 @@ fn loadR4M(load: *PreparedLoad, bytes: []const u8, expected_kind: Kind, fallback
     e.name_len = copyBytes(module_name, e.name[0..]);
     e.path_len = copyBytes(path, e.path[0..]);
     fillExports(e, bytes, header);
+
+    if (header.meta_size <= MAX_R4M_METADATA_PROBE and checkRange(bytes.len, header.meta_off, header.meta_size)) {
+        e.version_labels = module_r4m.VersionLabels.parse(bytes[header.meta_off..][0..header.meta_size]);
+    }
 
     return requiredExportsValid(e);
 }
@@ -1479,6 +1486,7 @@ fn readValidatedFileTables(reader: *module_r4m.Reader, tables: *ValidatedFileTab
     if (header.meta_size <= MAX_R4M_METADATA_PROBE) {
         var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
         if (reader.readMetadata(header, meta_buf[0..], "r4m-module-name", true)) |meta| {
+            tables.version_labels = module_r4m.VersionLabels.parse(meta);
             if (module_r4m.firstMetadataItem(meta)) |module_name| {
                 tables.module_name_len = copyBytes(module_name, tables.module_name[0..]);
             }
@@ -2213,6 +2221,14 @@ fn upper(c: u8) u8 {
 test "R4D resources do not consume executable image memory or relocation addresses" {
     const std = @import("std");
     const testing = std.testing;
+    const metadata = "NVIDIA\x00module.version=0.1.144\x00firmware.version=570.144\x00";
+    const labels = module_r4m.VersionLabels.parse(metadata);
+    try testing.expectEqualStrings("0.1.144", std.mem.sliceTo(&labels.module, 0));
+    try testing.expectEqualStrings("570.144", std.mem.sliceTo(&labels.firmware, 0));
+    const bad_labels = module_r4m.VersionLabels.parse("module.version=12345678901234567890123456789012\x00firmware.version=x\ny\x00");
+    try testing.expectEqual(@as(u8, 0), bad_labels.module[0]);
+    try testing.expectEqual(@as(u8, 0), bad_labels.firmware[0]);
+    try testing.expectEqual(@as(u8, 0), module_r4m.VersionLabels.parse("NVIDIA\x00").firmware[0]);
     const code = SectionHeader{ .name = ".text\x00\x00\x00".*, .name_len = 5, .flags = 3, .file_off = 256, .file_size = 16, .mem_size = 16, .alignment = 16 };
     const resource = SectionHeader{ .name = ".rsrc\x00\x00\x00".*, .name_len = 5, .flags = 0, .file_off = 512, .file_size = 64 * 1024 * 1024, .mem_size = 64 * 1024 * 1024, .alignment = 16 };
     const data = SectionHeader{ .name = ".data\x00\x00\x00".*, .name_len = 5, .flags = 5, .file_off = 272, .file_size = 16, .mem_size = 16, .alignment = 16 };

@@ -395,7 +395,8 @@ fn addLoaderTests(
         .optimize = optimize,
     }));
 
-    const tests = b.addTest(.{ .root_module = root });
+    const filter = b.option([]const u8, "loader-test-filter", "Run only matching existing loader ownership tests");
+    const tests = b.addTest(.{ .root_module = root, .filters = if (filter) |value| &.{value} else &.{} });
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
 }
