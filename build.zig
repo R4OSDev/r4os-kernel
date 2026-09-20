@@ -285,7 +285,8 @@ fn addDisplayUnitTest(b: *std.Build, test_step: *std.Build.Step, contract: *std.
     root.addOptions("config", config);
     root.addImport("r4os_kernel_contract", b.createModule(.{ .root_source_file = contract.path("Generated/Kernel/Zig/r4x_api_generated.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }));
     root.addImport("r4f_format", b.createModule(.{ .root_source_file = b.path("kernel/font_format.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }));
-    const tests = b.addTest(.{ .root_module = root });
+    const filter = b.option([]const u8, "display-test-filter", "Run only matching existing display ownership tests");
+    const tests = b.addTest(.{ .root_module = root, .filters = if (filter) |value| &.{value} else &.{} });
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
 }

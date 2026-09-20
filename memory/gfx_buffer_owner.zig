@@ -1042,7 +1042,8 @@ fn writes(access: Access) bool {
 
 test "producer exit preserves imported pixels and outstanding scanout until explicit release" {
     const t = std.testing;
-    var store = Table(4, 12, 12){ .budget_bytes = 16384, .producer_budget_bytes = 8192 };
+    var store = Table(4, 12, 12){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };
+    const baseline = store.stats();
     const producer = Owner{ .kind = .program, .id = 1, .generation = 1 };
     const consumer = Owner{ .kind = .program, .id = 2, .generation = 3 };
     const driver = Owner{ .kind = .driver, .id = 9, .generation = 2 };
@@ -1059,13 +1060,26 @@ test "producer exit preserves imported pixels and outstanding scanout until expl
     const second_map = try store.use(imported, consumer, .cpu_read, 64, 64);
     try t.expectError(error.Busy, store.use(created.reference, producer, .cpu_write, 0, 4096));
     const scanout = try store.use(hardware, driver, .scanout, 0, 4096);
+    // A capture reader, physical scanout and a new allocation compete while
+    // the producer exits. Failed admission must not change any accounting.
+    const pressure_owner = Owner{ .kind = .program, .id = 3, .generation = 1 };
+    const pressure = try store.begin(pressure_owner, .{ .bytes = 4096 });
+    const full = store.stats();
+    try t.expectEqual(@as(u64, 4096), full.system_pinned_bytes);
+    try t.expectEqual(@as(u64, 4096), full.scanout_pinned_bytes);
+    try t.expectEqual(@as(u64, 4096), full.allocating_bytes);
+    try t.expectError(error.Budget, store.begin(pressure_owner, .{ .bytes = 1 }));
+    try t.expectEqualDeep(full, store.stats());
     store.stoppedOwner(producer);
     try t.expectError(error.Closed, store.import(created.buffer, producer));
     try t.expectError(error.Stale, store.describe(created.reference, producer));
     try t.expectEqual(@as(u8, 0x5A), @as([*]const u8, @ptrFromInt(first_map.backing.cpu_address))[4095]);
-    try store.endUse(first_map.lease, consumer, false);
-    try store.endUse(second_map.lease, consumer, false);
-    try store.drop(imported, consumer);
+    // Capture death retires both CPU mappings; it is not a scanout ACK.
+    store.stoppedOwner(consumer);
+    try t.expectError(error.Stale, store.endUse(first_map.lease, consumer, false));
+    try t.expectError(error.Stale, store.endUse(second_map.lease, consumer, false));
+    try t.expectEqual(@as(usize, 1), store.stats().leases);
+    try t.expectEqual(@as(u64, 4096), store.stats().scanout_pinned_bytes);
     store.stoppedOwner(driver);
     try t.expect(store.retainsDriver(driver));
     try t.expectEqual(@as(?Release, null), store.pendingRelease());
@@ -1074,11 +1088,13 @@ test "producer exit preserves imported pixels and outstanding scanout until expl
     const release = store.pendingRelease().?;
     try t.expectEqual(@as(?Release, null), store.pendingRelease());
     try t.expectError(error.Busy, store.finishRelease(release, false));
-    try t.expectEqual(@as(u64, 4096), store.stats().bytes);
+    try t.expectEqual(@as(u64, 8192), store.stats().bytes);
     const retry = store.pendingRelease().?;
     try t.expectError(error.Stale, store.finishRelease(release, true));
     try store.finishRelease(retry, true);
-    try t.expectEqual(@as(u64, 0), store.stats().bytes);
+    try t.expectEqual(@as(u64, 4096), store.stats().bytes);
+    try store.abort(pressure);
+    try t.expectEqualDeep(baseline, store.stats());
     try t.expectError(error.Stale, store.endUse(scanout.lease, driver, true));
 }
 

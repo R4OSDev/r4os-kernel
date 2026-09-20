@@ -394,6 +394,7 @@ test "queued dependencies reserve CPU ownership across producer death and physic
     const t = std.testing;
     const producer = lifetime.Owner{ .kind = .program, .id = 7, .generation = 9 };
     var buffers = lifetime.Table(3, 8, 16){ .budget_bytes = 12288, .producer_budget_bytes = 12288 };
+    const baseline = buffers.stats();
     var state = queue.Store(2, 8){};
     var resources = Resources(8){};
     var refs: [3]lifetime.Handle = undefined;
@@ -410,7 +411,7 @@ test "queued dependencies reserve CPU ownership across producer death and physic
     const driver = lifetime.Owner{ .kind = .driver, .id = 5, .generation = 17 };
     try t.expectError(error.Busy, resources.retain(&state, &buffers, first, 0, driver));
     try t.expectError(error.Busy, resources.submit(&state, &buffers, render, producer, .{ .deadline_ns = 100 }, .{ .source = refs[1], .target = refs[2], .bytes = 4091 }, 0));
-    const second = try resources.submit(&state, &buffers, render, producer, .{ .deadline_ns = 100, .dependencies = &.{first} }, .{ .source = refs[1], .target = refs[2], .bytes = 4091 }, 0);
+    const second = try resources.submit(&state, &buffers, render, producer, .{ .deadline_ns = 200, .dependencies = &.{first} }, .{ .source = refs[1], .target = refs[2], .bytes = 4091 }, 0);
     try t.expectError(error.Busy, buffers.use(refs[0], producer, .cpu_write, 0, 4091));
     try t.expectError(error.Busy, buffers.use(refs[1], producer, .cpu_read, 0, 4091));
     try t.expectEqualDeep(first, state.takeReady(0).?);
@@ -424,8 +425,15 @@ test "queued dependencies reserve CPU ownership across producer death and physic
         try t.expectError(error.Unsupported, buffers.use(source_mapping, driver, access, 0, 4096));
     const later_write = try buffers.reserveQueued(refs[0], producer, owner, true, 0, 4091);
     try buffers.endUse(later_write.lease, owner, true);
+    // Missing completion reaches its deadline while a dependent job is
+    // queued; device loss and producer death must not substitute a DMA ACK.
+    state.expire(100);
+    state.deviceLost(first.binding, 101);
+    try t.expectEqual(queue.Result.timeout, (try state.query(first)).result);
+    try t.expectEqual(queue.Result.device_lost, (try state.query(second)).result);
+    try t.expect((try state.query(first)).device_active);
     buffers.stoppedOwner(producer);
-    state.stopped(producer, 1);
+    state.stopped(producer, 102);
     // Public imports remain closed, while the exact active job still owns
     // this target and may hand its mapping to the authenticated driver.
     const target_mapping = try resources.retain(&state, &buffers, first, 1, driver);
@@ -447,7 +455,8 @@ test "queued dependencies reserve CPU ownership across producer death and physic
     try buffers.finishRelease(target, true);
     try t.expect(buffers.pendingRelease() == null);
     try t.expectEqual(@as(u64, 8192), buffers.stats().bytes);
-    try state.complete(first, .complete, true, 2);
+    try state.complete(first, .complete, true, 103);
+    try t.expectEqual(queue.Result.timeout, (try state.query(first)).result);
     try t.expectError(error.AlreadyCompleted, resources.retain(&state, &buffers, first, 0, driver));
     const active = state.takeRelease().?;
     try resources.release(&buffers, active);
@@ -461,7 +470,13 @@ test "queued dependencies reserve CPU ownership across producer death and physic
     try buffers.endUse(source_dma.lease, driver, true);
     try buffers.endUse(target_gpu.lease, driver, true);
     while (buffers.pendingRelease()) |ticket| try buffers.finishRelease(ticket, true);
-    try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
+    try t.expectEqualDeep(baseline, buffers.stats());
+    while (state.takeNotification()) |notification| try state.published(notification);
+    var reaped: usize = 0;
+    while (state.reapOne() != null) reaped += 1;
+    try t.expectEqual(@as(usize, 2), reaped);
+    for (&state.queues) |*entry| try t.expectEqual(@as(u64, 0), entry.timeline);
+    for (&resources.entries) |*entry| try t.expectEqual(@as(u32, 0), entry.fence.slot);
 
     // Actual worker copy primitive: different pitches, partial byte slices,
     // padding sentinels and a dependent readback queued before the upload ends.
@@ -512,7 +527,14 @@ test "queued dependencies reserve CPU ownership across producer death and physic
     try t.expectError(error.Overflow, row_resources.submit(&row_state, &buffers, back, producer, .{ .deadline_ns = 100 }, rows, 3));
     for (refs) |ref| try buffers.drop(ref, producer);
     while (buffers.pendingRelease()) |ticket| try buffers.finishRelease(ticket, true);
-    try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
+    try t.expectEqualDeep(baseline, buffers.stats());
+    row_state.stopped(producer, 4);
+    while (row_state.takeNotification()) |notification| try row_state.published(notification);
+    reaped = 0;
+    while (row_state.reapOne() != null) reaped += 1;
+    try t.expectEqual(@as(usize, 2), reaped);
+    for (&row_state.queues) |*entry| try t.expectEqual(@as(u64, 0), entry.timeline);
+    for (&row_resources.entries) |*entry| try t.expectEqual(@as(u32, 0), entry.fence.slot);
 }
 
 test "native upload retains a single source beyond cancellation and producer reference release" {
