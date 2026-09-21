@@ -52,3 +52,31 @@ pub fn readAt(owner: u32, id: u64, offset: u64, output: []u8, deadline_ns: u64) 
 pub fn nowNs() callconv(.c) u64 {
     return clock.nowNanoseconds() orelse std.math.maxInt(u64);
 }
+
+pub fn acpiStat(owner: u32, signature: u32, index: u32, output: *a.DriverFirmwareTableInfo) i32 {
+    if (@intFromPtr(output) == 0 or @intFromPtr(output) % @alignOf(a.DriverFirmwareTableInfo) != 0 or
+        output.version != 1 or output.size < @sizeOf(a.DriverFirmwareTableInfo)) return a.driver_resource_error_invalid;
+    _ = state.current(owner) catch return a.driver_resource_error_stale;
+    const value = @import("../platform/acpi.zig").firmware_tables.stat(signature, index) catch |err| return firmwareError(err);
+    output.* = .{ .handle = value.handle, .byte_length = value.bytes, .generation = value.generation,
+        .signature = value.signature, .revision = value.revision };
+    return a.driver_resource_ok;
+}
+pub fn acpiReadAt(owner: u32, handle: u64, offset: u64, output: []u8, deadline_ns: u64) i32 {
+    if (output.len == 0 or output.len > a.driver_resource_max_read_bytes or deadline_ns == 0 or deadline_ns == std.math.maxInt(u64)) return a.driver_resource_error_invalid;
+    _ = state.current(owner) catch return a.driver_resource_error_stale;
+    const started = nowNs();
+    if (started >= deadline_ns) return a.driver_resource_error_deadline;
+    @import("../platform/acpi.zig").firmware_tables.readAt(handle, offset, output) catch |err| return firmwareError(err);
+    const finished = nowNs();
+    if (finished < started or finished >= deadline_ns) return a.driver_resource_error_deadline;
+    return @intCast(output.len);
+}
+fn firmwareError(err: @import("../platform/firmware_tables.zig").Error) i32 {
+    return switch (err) {
+        error.Invalid => a.driver_resource_error_invalid,
+        error.Stale => a.driver_resource_error_stale,
+        error.NotFound => a.driver_resource_error_not_found,
+        error.Unavailable, error.Corrupt => a.driver_resource_error_source,
+    };
+}

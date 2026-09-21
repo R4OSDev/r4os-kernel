@@ -153,9 +153,12 @@ pub const Info = struct {
 };
 
 var last_info: Info = .{};
+pub var firmware_tables: @import("firmware_tables.zig").Catalog = .{};
 
 pub fn inspect() Info {
     last_info = .{};
+    firmware_tables.begin();
+    defer firmware_tables.seal();
     bootlog.puts("[ACPI] static reader\r\n");
 
     const rsdp_phys = findRsdp() orelse {
@@ -226,6 +229,8 @@ fn inspectXsdt(xsdt_phys: u64) void {
         bootlog.puts("[ACPI][WARN] invalid XSDT\r\n");
         return;
     }
+    if ((header.length - @sizeOf(SdtHeader)) % 8 != 0) { firmware_tables.incomplete(); return; }
+    firmware_tables.rootValidated();
     const count = (header.length - @sizeOf(SdtHeader)) / 8;
     const bytes: [*]const u8 = @ptrCast(header);
     var i: usize = 0;
@@ -241,6 +246,8 @@ fn inspectRsdt(rsdt_phys: u32) void {
         bootlog.puts("[ACPI][WARN] invalid RSDT\r\n");
         return;
     }
+    if ((header.length - @sizeOf(SdtHeader)) % 4 != 0) { firmware_tables.incomplete(); return; }
+    firmware_tables.rootValidated();
     const count = (header.length - @sizeOf(SdtHeader)) / 4;
     const bytes: [*]const u8 = @ptrCast(header);
     var i: usize = 0;
@@ -248,14 +255,23 @@ fn inspectRsdt(rsdt_phys: u32) void {
 }
 
 fn inspectTable(table_phys: u64) void {
-    if (table_phys == 0) return;
+    if (table_phys == 0) { firmware_tables.incomplete(); return; }
     const header = mapTable(table_phys) orelse {
+        firmware_tables.incomplete();
         last_info.invalid_table_count += 1;
         bootlog.puts("[ACPI][WARN] table mapping failed phys=0x");
         bootlog.putHex(table_phys, 16);
         bootlog.puts("\r\n");
         return;
     };
+    // mapTable guarantees only the header for an invalid declared length.
+    // Keep that damaged signature distinguishable from a missing table.
+    const source: [*]const u8 = @ptrCast(header);
+    const bounded = if (header.length < @sizeOf(SdtHeader) or header.length > MAX_SDT_LENGTH) @sizeOf(SdtHeader) else header.length;
+    if (@import("firmware_tables.zig").retainedBacking(table_phys, bounded, boot_info.memoryMap()))
+        firmware_tables.observe(source[0..bounded])
+    else
+        firmware_tables.incomplete();
     if (!validAnySdt(header)) {
         last_info.invalid_table_count += 1;
         bootlog.puts("[ACPI][WARN] invalid table at phys=0x");

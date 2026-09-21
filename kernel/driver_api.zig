@@ -3306,8 +3306,9 @@ fn resourceQuery(output: *outputs_contract.DriverResourceApi) callconv(.c) i32 {
     if (owner < 0) return owner;
     defer _ = leaveOwner();
     _ = driver_resources.state.current(@intCast(owner)) catch return outputs_contract.driver_resource_error_stale;
-    if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverResourceApi)) return outputs_contract.driver_resource_error_invalid;
-    output.* = .{ .stat = @intFromPtr(&resourceStat), .read_at = @intFromPtr(&resourceReadAt), .now_ns = @intFromPtr(&driver_resources.nowNs) };
+    const value: outputs_contract.DriverResourceApi = .{ .stat = @intFromPtr(&resourceStat), .read_at = @intFromPtr(&resourceReadAt), .now_ns = @intFromPtr(&driver_resources.nowNs),
+        .acpi_stat = @intFromPtr(&resourceAcpiStat), .acpi_read_at = @intFromPtr(&resourceAcpiReadAt) };
+    if (!@import("driver_resource_state.zig").publishApi(output, value)) return outputs_contract.driver_resource_error_invalid;
     return outputs_contract.driver_resource_ok;
 }
 fn resourceStat(name: [*]const u8, length: u32, output: *outputs_contract.DriverResourceInfo) callconv(.c) i32 {
@@ -3323,6 +3324,19 @@ fn resourceReadAt(id: u64, offset: u64, output: [*]u8, length: u32, deadline_ns:
     defer _ = leaveOwner();
     if (length == 0 or length > outputs_contract.driver_resource_max_read_bytes) return outputs_contract.driver_resource_error_invalid;
     return driver_resources.readAt(@intCast(owner), id, offset, output[0..length], deadline_ns);
+}
+fn resourceAcpiStat(signature: u32, index: u32, output: *outputs_contract.DriverFirmwareTableInfo) callconv(.c) i32 {
+    const owner = enterResourceOwner();
+    if (owner < 0) return owner;
+    defer _ = leaveOwner();
+    return driver_resources.acpiStat(@intCast(owner), signature, index, output);
+}
+fn resourceAcpiReadAt(handle: u64, offset: u64, output: [*]u8, length: u32, deadline_ns: u64) callconv(.c) i32 {
+    const owner = enterResourceOwner();
+    if (owner < 0) return owner;
+    defer _ = leaveOwner();
+    if (@intFromPtr(output) == 0 or length == 0 or length > outputs_contract.driver_resource_max_read_bytes) return outputs_contract.driver_resource_error_invalid;
+    return driver_resources.acpiReadAt(@intCast(owner), handle, offset, output[0..length], deadline_ns);
 }
 const native_display = @import("../display/native_driver.zig");
 fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i32 {

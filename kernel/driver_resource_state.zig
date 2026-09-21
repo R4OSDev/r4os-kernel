@@ -44,7 +44,35 @@ pub const State = struct {
     }
 };
 
+pub fn publishApi(output: *@import("r4os_kernel_contract").DriverResourceApi, input: @import("r4os_kernel_contract").DriverResourceApi) bool {
+    const Api = @TypeOf(input);
+    if (@intFromPtr(output) == 0 or @intFromPtr(output) % @alignOf(Api) != 0 or output.version != 1 or output.size < 32) return false;
+    const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(Api));
+    var value = input; value.size = bytes;
+    @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
+    return true;
+}
+
 test "resource handles reject foreign owners, restart, shutdown and exhaustion" {
+    const Api = @import("r4os_kernel_contract").DriverResourceApi;
+    const t = std.testing;
+    for ([_]u32{ 31, 32, 39, 40, 47, 48, 64 }) |capacity| {
+        var storage: [80]u8 align(8) = @splat(0x79);
+        std.mem.writeInt(u32, storage[0..4], 1, .little);
+        std.mem.writeInt(u32, storage[4..8], capacity, .little);
+        const before = storage;
+        const output: *Api = @ptrCast(&storage);
+        if (capacity < 32) {
+            try t.expect(!publishApi(output, .{}));
+            try t.expectEqualSlices(u8, &before, &storage);
+        } else {
+            try t.expect(publishApi(output, .{ .stat = 11, .read_at = 13, .now_ns = 17, .acpi_stat = 19, .acpi_read_at = 23 }));
+            const written = @min(capacity & ~@as(u32, 7), 48);
+            try t.expectEqual(written, output.size);
+            try t.expectEqual(@as(u64, 11), output.stat);
+            try t.expectEqualSlices(u8, before[written..], storage[written..]);
+        }
+    }
     var state: State = .{};
     try state.bind(1, 7, 100);
     try state.bind(2, 8, 101);
