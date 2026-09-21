@@ -3762,6 +3762,14 @@ fn gfxOwnedFinishRelease(input: *const outputs_contract.GfxOwnedBufferRelease, q
     return @import("gfx_owned_buffers.zig").finish(identity, input, quiesced);
 }
 
+fn gfxReservedSpan(base: u64, bytes: u64) callconv(.c) i32 {
+    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    if (base == 0 or bytes == 0 or (base | bytes) & 4095 != 0 or base >= (@as(u64, 1) << 52) or bytes > (@as(u64, 1) << 52) - base)
+        return outputs_contract.gfx_buffer_error_invalid;
+    return if (@import("../memory/device_reserved.zig").bootCovers(base, bytes, @import("../bootloader/boot_info.zig").get()))
+        outputs_contract.gfx_buffer_result_ok else outputs_contract.gfx_buffer_error_unsupported;
+}
+
 fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32 {
     if (@intFromPtr(output) == 0 or output.version != 1 or output.size < 112) return outputs_contract.gfx_buffer_error_invalid;
     _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
@@ -3797,6 +3805,7 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
         .memory_budget = @intFromPtr(&gfxMemoryBudget),
         .telemetry_exchange = @intFromPtr(&gfxTelemetryExchange),
         .device_lost = @intFromPtr(&gfxDeviceLost),
+        .reserved_span = @intFromPtr(&gfxReservedSpan),
     };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_buffer_result_ok;

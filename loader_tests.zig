@@ -3,6 +3,7 @@ test {
     _ = @import("kernel/module_resources.zig");
     _ = @import("kernel/driver_resource_state.zig");
     _ = @import("platform/firmware_tables.zig");
+    _ = @import("memory/device_reserved.zig");
     _ = @import("kernel/driver_memory_owner.zig");
     _ = @import("kernel/driver_thread_owner.zig");
     _ = @import("kernel/driver_semaphore_owner.zig");
