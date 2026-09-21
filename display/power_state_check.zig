@@ -47,4 +47,37 @@ pub fn check(store: *model.Store, identity: a.GfxOutputId) !void {
     value.sequence += 1; value.phase = a.gfx_power_phase_on;
     try t.expect(try store.publishPower(14, value));
     try t.expect(store.infoAt(0).?.flags & a.gfx_output_flag_sleeping == 0);
+    try brightness(store, identity, actor);
+}
+fn brightness(store: *model.Store, identity: a.GfxOutputId, actor: model.DriverOwner) !void {
+    var value: a.GfxOutputBrightness = .{ .identity = identity, .path = a.gfx_brightness_path_aux16,
+        .phase = a.gfx_brightness_phase_ready, .minimum = 512, .maximum = 65535, .current = 32768,
+        .flags = a.gfx_brightness_flag_current_known, .sequence = 1, .since_ns = 100 };
+    try t.expectError(error.Unsupported, store.brightnessAt(identity));
+    try t.expectError(error.Stale, store.publishBrightness(15, value));
+    try t.expect(try store.publishBrightness(14, value));
+    const request = try store.requestBrightness(actor, .{ .identity = identity, .level = 50000 });
+    try t.expect(request.sequence != 0 and (try store.brightnessAt(identity)).current == 32768);
+    try t.expectEqualDeep(request, try store.readBrightness(14, identity));
+    try t.expectError(error.Stale, store.readBrightness(15, identity));
+    try t.expectError(error.Invalid, store.requestBrightness(actor, .{ .identity = identity, .level = 511 }));
+    var stale = identity; stale.connection_generation += 1;
+    try t.expectError(error.Stale, store.requestBrightness(actor, .{ .identity = stale, .level = 40000 }));
+    var invalid = value; invalid.sequence += 1; invalid.request_sequence = request.sequence + 1;
+    try t.expectError(error.Stale, store.publishBrightness(14, invalid));
+    value.sequence += 1; value.request_sequence = request.sequence; value.phase = a.gfx_brightness_phase_failed;
+    value.reason = a.gfx_brightness_reason_io; value.flags = 0;
+    try t.expect(try store.publishBrightness(14, value));
+    try t.expect(!(try store.publishBrightness(14, value)));
+    try t.expectError(error.Stale, store.publishBrightness(14, .{ .identity = identity, .sequence = 1, .since_ns = 100,
+        .path = 1, .phase = 1, .maximum = 65535, .flags = 1 }));
+    const retry = try store.requestBrightness(actor, .{ .identity = identity, .level = request.level });
+    try t.expect(retry.sequence > request.sequence);
+    _ = try store.pause(14, identity, true, true);
+    try t.expectError(error.Busy, store.requestBrightness(actor, .{ .identity = identity, .level = 20000 }));
+    _ = try store.pause(14, identity, false, true);
+    value.sequence += 1; value.request_sequence = retry.sequence; value.phase = a.gfx_brightness_phase_ready;
+    value.current = retry.level; value.reason = 0; value.flags = 1;
+    try t.expect(try store.publishBrightness(14, value));
+    try t.expectEqualDeep(value, try store.brightnessAt(identity));
 }

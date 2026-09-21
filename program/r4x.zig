@@ -7741,6 +7741,8 @@ fn configureR4XStartR4DrawTable() void {
         .gfx_refresh_request = &apiGfxRefreshRequest,
         .gfx_output_power = &gfx_output_api.power,
         .gfx_power_request = &apiGfxPowerRequest,
+        .gfx_output_brightness = &gfx_output_api.brightness,
+        .gfx_brightness_request = &apiGfxBrightnessRequest,
         .gfx_atomic_test = &apiGfxAtomicTest,
         .gfx_atomic_commit = &apiGfxAtomicCommit,
         .gfx_atomic_submit = &apiGfxAtomicSubmit,
@@ -19230,4 +19232,9 @@ fn writeLe64(bytes: []u8, value: u64) void {
     bytes[5] = @intCast((value >> 40) & 0xff);
     bytes[6] = @intCast((value >> 48) & 0xff);
     bytes[7] = @intCast((value >> 56) & 0xff);
+}
+
+fn apiGfxBrightnessRequest(input: *const gfx_output_api.abi.GfxBrightnessRequest, output: *gfx_output_api.abi.GfxBrightnessRequest) callconv(.c) i32 {
+    const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
+    return gfx_output_api.requestBrightness(graphicsOwner(owner), input, output);
 }

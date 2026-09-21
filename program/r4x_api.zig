@@ -2651,3 +2651,6 @@ pub const R4DevSlots = generated.R4DevSlots;
 pub const R4DevProvider = generated.R4DevProvider;
 pub const buildR4DevTable = generated.buildR4DevTable;
 // R4OS-KERNEL-API-GENERATED-EXPORTS:END
+
+pub const GfxOutputBrightness = generated.GfxOutputBrightness;
+pub const GfxBrightnessRequest = generated.GfxBrightnessRequest;

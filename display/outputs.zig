@@ -532,3 +532,33 @@ pub fn retireNativeAfterReset(ticket: model.Ticket) Error!void {
     const token = ownership.enterState(); defer ownership.leaveState(token);
     try catalog.retireAfterReset(ticket);
 }
+
+pub fn brightnessAt(identity: abi.GfxOutputId) Error!abi.GfxOutputBrightness {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return catalog.brightnessAt(identity);
+}
+pub fn publishBrightness(owner: u32, value: abi.GfxOutputBrightness) Error!void {
+    if (irq.inDispatch()) return error.Invalid;
+    const changed = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        if (nativePort(owner, value.identity) == null) return error.Stale;
+        break :blk try catalog.publishBrightness(owner, value);
+    };
+    if (changed) events.signal();
+}
+pub fn requestBrightness(actor: buffers.Owner, input: abi.GfxBrightnessRequest) Error!abi.GfxBrightnessRequest {
+    if (irq.inDispatch()) return error.Invalid;
+    var owner: u32 = 0;
+    const value = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        owner = (try catalog.powerEntry(input.identity)).owner;
+        break :blk try catalog.requestBrightness(actor, input);
+    };
+    wakePower(owner, input.identity);
+    return value;
+}
+pub fn readBrightness(owner: u32, identity: abi.GfxOutputId) Error!abi.GfxBrightnessRequest {
+    if (irq.inDispatch()) return error.Invalid;
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return catalog.readBrightness(owner, identity);
+}

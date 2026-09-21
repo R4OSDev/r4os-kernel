@@ -131,3 +131,19 @@ pub fn resolve(owner: buffers.Owner, ticket: u64, action: u32, output: *abi.GfxM
     output.* = result;
     return abi.gfx_output_ok;
 }
+
+pub fn brightness(input: *const abi.GfxOutputId, output: *abi.GfxOutputBrightness) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxOutputId) != 0 or
+        !memory_api.validOutput(abi.GfxOutputBrightness, output)) return abi.gfx_output_error_invalid;
+    const value = outputs.brightnessAt(input.*) catch |err| return code(err);
+    output.* = value;
+    return abi.gfx_output_ok;
+}
+pub fn requestBrightness(owner: buffers.Owner, input: *const abi.GfxBrightnessRequest, output: *abi.GfxBrightnessRequest) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxBrightnessRequest) != 0 or
+        !memory_api.validOutput(abi.GfxBrightnessRequest, output)) return abi.gfx_output_error_invalid;
+    const request = input.*;
+    const value = outputs.requestBrightness(owner, request) catch |err| return code(err);
+    output.* = value;
+    return abi.gfx_output_ok;
+}

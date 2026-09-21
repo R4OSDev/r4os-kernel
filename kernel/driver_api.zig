@@ -3446,7 +3446,8 @@ fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32
         .output_pause = @intFromPtr(&gfxOutputPause), .mode_restore = @intFromPtr(&gfxModeRestore), .mode_status = @intFromPtr(&gfxModeStatus),
         .color_publish = @intFromPtr(&gfxOutputColorPublish), .mode_read_color = @intFromPtr(&gfxModeReadColor),
         .refresh_publish = @intFromPtr(&gfxOutputRefreshPublish), .refresh_read = @intFromPtr(&gfxRefreshRead),
-        .power_publish = @intFromPtr(&gfxOutputPowerPublish), .power_read = @intFromPtr(&gfxPowerRead) });
+        .power_publish = @intFromPtr(&gfxOutputPowerPublish), .power_read = @intFromPtr(&gfxPowerRead),
+        .brightness_publish = @intFromPtr(&gfxOutputBrightnessPublish), .brightness_read = @intFromPtr(&gfxBrightnessRead) });
 }
 fn gfxOutputPowerPublish(input: *const outputs_contract.GfxOutputPower) callconv(.c) i32 {
     if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputPower) != 0 or irq_router.inDispatch())
@@ -3861,4 +3862,20 @@ fn gfxTelemetryExchange(input: *const outputs_contract.GfxTelemetryState, output
 fn gfxDeviceLost(adapter: u32, generation: u64, quiesced: u32) callconv(.c) i32 {
     const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
     return @import("gfx_owned_buffers.zig").lose(identity, adapter, generation, quiesced);
+}
+
+fn gfxOutputBrightnessPublish(input: *const outputs_contract.GfxOutputBrightness) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputBrightness) != 0 or irq_router.inDispatch())
+        return outputs_contract.gfx_output_error_invalid;
+    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    @import("../display/outputs.zig").publishBrightness(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+fn gfxBrightnessRead(input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxBrightnessRequest) callconv(.c) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputId) != 0 or
+        !@import("../program/gfx_buffer_api.zig").validOutput(outputs_contract.GfxBrightnessRequest, output)) return outputs_contract.gfx_output_error_invalid;
+    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+    const value = @import("../display/outputs.zig").readBrightness(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
+    output.* = value;
+    return outputs_contract.gfx_output_ok;
 }
