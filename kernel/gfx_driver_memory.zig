@@ -100,7 +100,7 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
         (request.address_space == 0 and (request.gpu_virtual_address != 0 or request.access == 3)) or
         (request.address_space == 1 and (request.gpu_virtual_address == 0 or request.gpu_virtual_address > std.math.maxInt(u64) - request.byte_length)) or
         (request.access == 4 and request.address_space != 0) or
-        (request.access == 3 and (request.byte_offset | request.byte_length | request.gpu_virtual_address) % paging.PAGE_SIZE != 0)) return abi.gfx_buffer_error_invalid;
+        (request.access == 3 and (request.byte_offset | request.gpu_virtual_address) % paging.PAGE_SIZE != 0)) return abi.gfx_buffer_error_invalid;
     const call = task_context.enterUnwind();
     if (!call.admitted()) return abi.gfx_buffer_error_busy;
     defer _ = task_context.leaveUnwind(call);
@@ -117,6 +117,13 @@ pub fn acquire(identity: Owner, reference: *const abi.GfxBufferHandle, request_p
     if (!desc.binding.portable() and (desc.binding.adapter != request.adapter_id or desc.binding.driver_owner != identity.id or desc.binding.device_generation != request.device_generation)) {
         buffers.unlock();
         return abi.gfx_buffer_error_stale;
+    }
+    // Residency holds the exact logical BO extent. Only its final page may
+    // be partial; the backing allocator owns that entire physical page. Never
+    // extend the lease beyond the descriptor just to satisfy PTE granularity.
+    if (request.access == 3 and !@import("gfx_driver_memory_owner.zig").mappingRange(request.byte_offset, request.byte_length, request.gpu_virtual_address, desc.bytes)) {
+        buffers.unlock();
+        return abi.gfx_buffer_error_invalid;
     }
     const access: buffers.lifetime.Access = switch (request.access) {
         0 => .device_read,

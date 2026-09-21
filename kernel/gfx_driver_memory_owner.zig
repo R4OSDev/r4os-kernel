@@ -6,6 +6,15 @@ const lifetime = @import("../memory/gfx_buffer_owner.zig");
 pub const Owner = lifetime.Owner;
 pub const Error = lifetime.Error;
 
+/// A GPU residency lease holds its exact logical extent. Its last partial
+/// page is allowed only at the BO end, backed by the existing page allocation.
+pub fn mappingRange(offset: u64, bytes: u64, address: u64, object_bytes: u64) bool {
+    return address != 0 and (offset | address) & 4095 == 0 and bytes != 0 and
+        offset < object_bytes and bytes <= object_bytes - offset and
+        address <= std.math.maxInt(u64) - bytes and
+        (bytes & 4095 == 0 or bytes == object_bytes - offset);
+}
+
 pub fn State(comptime owner_capacity: usize) type {
     return struct {
         const Self = @This();
@@ -208,4 +217,17 @@ test "worker collection distinguishes live MMIO from incomplete or busy retireme
     state.endMmio(identity, false, false);
     try t.expect(!state.pendingMmio(identity));
     try t.expect(state.retire(identity));
+}
+
+test "GPU residency admits only the final logical partial page without enlarging the lease" {
+    const t = std.testing;
+    try t.expect(mappingRange(0, 5001, 0x100000, 5001));
+    try t.expect(mappingRange(4096, 905, 0x100000, 5001));
+    try t.expect(mappingRange(0, 4096, 0x100000, 5001));
+    try t.expect(!mappingRange(0, 4097, 0x100000, 5001));
+    try t.expect(!mappingRange(0, 8192, 0x100000, 5001));
+    try t.expect(!mappingRange(1, 5000, 0x100000, 5001));
+    try t.expect(!mappingRange(0, 5001, 0x100001, 5001));
+    try t.expect(!mappingRange(0, 8192, 0xfffffffffffff000, 8192));
+    try t.expect(!mappingRange(0, 0, 0x1000, 1));
 }
