@@ -17,8 +17,10 @@ pub const Created = struct { buffer: Handle, reference: Handle, address: u64, by
 
 // A finite admission budget, distinct from an allocation guarantee. Failed
 // TLB release remains charged. The allocator also retains system headroom.
-pub const total_budget: u64 = 1024 * 1024 * 1024;
-pub const producer_budget: u64 = 256 * 1024 * 1024;
+// A producer can retain a 1 GB buffer alongside its other graphics resources.
+// These ceilings reserve no RAM; every creation still checks physical headroom.
+pub const total_budget: u64 = 4 * 1024 * 1024 * 1024;
+pub const producer_budget: u64 = 2 * 1024 * 1024 * 1024;
 pub const system_reserve: u64 = 16 * 1024 * 1024;
 pub const Store = lifetime.DynamicTable();
 pub var store = Store{ .budget_bytes = total_budget, .producer_budget_bytes = producer_budget };
