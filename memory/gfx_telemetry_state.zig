@@ -12,11 +12,22 @@ const Entry = struct {
 };
 pub fn validate(input: *const a.GfxTelemetryState, now: u64) Error!void {
     if (input.version != 1 or input.size < @sizeOf(a.GfxTelemetryState) or input.adapter_id == 0 or input.memory_generation == 0 or
-        input.reserved0 != 0 or input.reserved1 != 0 or input.source > 1 or input.state > 4 or input.policy > 9 or input.boost > 2 or
+        input.reserved0 != 0 or input.reserved1 != 0 or input.source > a.gfx_telemetry_source_smu10 or input.state > 4 or input.policy > 9 or input.boost > 2 or
         now == 0 or input.sampled_ns == 0 or input.sampled_ns > now or input.valid_until_ns < input.sampled_ns or
         input.valid_until_ns - input.sampled_ns > max_age_ns) return error.Invalid;
     for (&input.metrics, 0..) |*metric, i| {
-        if (metric.status > a.gfx_telemetry_stale or metric.flags & ~@as(u32, if (i == 9 and metric.status == a.gfx_telemetry_fresh) 1 else 0) != 0) return error.Invalid;
+        var allowed: u32 = 0;
+        if (metric.status == a.gfx_telemetry_fresh) {
+            if (i == 9) allowed = a.gfx_telemetry_timer_delta_valid;
+            if (i == 0 or i == 2) allowed = a.gfx_telemetry_partial_values | a.gfx_telemetry_value_mask;
+            if (i == 0) allowed |= a.gfx_telemetry_current_clocks | a.gfx_telemetry_fabric_clock;
+        }
+        if (metric.status > a.gfx_telemetry_stale or metric.flags & ~allowed != 0) return error.Invalid;
+        const known = (metric.flags & a.gfx_telemetry_value_mask) >> 8;
+        if (metric.flags & a.gfx_telemetry_partial_values != 0) {
+            if (known == 0 or (i == 2 and known & ~@as(u32, 3) != 0)) return error.Invalid;
+            for (metric.values, 0..) |value, component| if (known & (@as(u32, 1) << @intCast(component)) == 0 and value != 0) return error.Invalid;
+        } else if (known != 0) return error.Invalid;
         if (metric.status == a.gfx_telemetry_fresh) {
             if (metric.source_stamp == 0) return error.Invalid;
         } else if (!std.mem.allEqual(i64, &metric.values, 0)) return error.Invalid;
@@ -113,6 +124,16 @@ test "common telemetry demand is finite and generation-bound, stale values are n
     try t.expectError(error.Stale, state.publish(owner, &old, input.sampled_ns));
     request.memory_generation = input.memory_generation;
     try t.expect((try state.query(request, input.sampled_ns)).metrics[5].status == a.gfx_telemetry_unavailable);
+    // Partial APU metrics never turn absent sensor components into zero readings.
+    input.source = a.gfx_telemetry_source_smu10;
+    input.metrics[0] = .{ .status = a.gfx_telemetry_fresh, .source_stamp = 1,
+        .flags = a.gfx_telemetry_partial_values | a.gfx_telemetry_current_clocks | a.gfx_telemetry_fabric_clock | (3 << 8),
+        .values = .{ 400000000, 800000000, 0, 0 } };
+    try validate(&input, input.sampled_ns);
+    input.metrics[0].values[2] = 1; try t.expectError(error.Invalid, validate(&input, input.sampled_ns));
+    input.metrics[0].values[2] = 0; input.metrics[0].flags = 3 << 8;
+    try t.expectError(error.Invalid, validate(&input, input.sampled_ns));
+    input.metrics[0] = .{};
     state.closeDriver(7);
     try t.expectError(error.Unavailable, state.query(request, input.sampled_ns));
     input.memory_generation += 1;
