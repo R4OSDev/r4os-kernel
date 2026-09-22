@@ -9,7 +9,7 @@ pub const Store = struct {
     pub fn publish(self: *Store, value: *const a.GfxAudioRoute) Error!void {
         if (value.version != 1 or value.size < @sizeOf(a.GfxAudioRoute) or value.reserved0 != 0 or
             value.source.adapter_id == 0 or value.source.generation == 0 or value.source.reserved0 != 0 or
-            value.revision == 0 or value.connector_id == 0 or value.hda_location >> 24 != 1 or
+            value.revision == 0 or value.connector_id == 0 or (value.hda_location >> 24 != 1 and value.hda_location >> 24 != 2) or
             value.hda_location & 0x00ff0000 != 0 or value.hda_device & 0xffff == 0 or value.hda_device >> 16 == 0 or
             value.head_id >= 32 or value.device_entry > 3 or value.state > a.gfx_audio_route_failed) return error.Invalid;
         if (value.state == a.gfx_audio_route_ready) {
