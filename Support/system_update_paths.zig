@@ -1,11 +1,14 @@
 const std = @import("std");
 
-// These package companions are ordinary files, never executable components.
+// Package companions have no separate installed component identity. Boot
+// preloads mirror the separately versioned protocol/driver components.
 // The same scope must be understood by packer, updater and early recovery.
-pub const CompanionKind = enum { license, source };
+pub const CompanionKind = enum { license, source, preload };
 pub const companion_recovery_kernel = "0.1.199";
+pub const preload_recovery_kernel = "0.1.208";
 
 pub fn companionKind(path: []const u8) ?CompanionKind {
+    if (preloadTarget(path)) return .preload;
     const scopes = .{
         .{ "C:/R4OS/LICENSES/", CompanionKind.license },
         .{ "C:/R4OS/SOURCES/", CompanionKind.source },
@@ -37,4 +40,12 @@ fn samePath(a: []const u8, b: []const u8) bool {
         if (l != r) return false;
     }
     return true;
+}
+
+/// Exact managed boot leaves only; no bootloader/configuration or arbitrary
+/// BOOT path enters the update journal through this companion kind.
+pub fn preloadTarget(path: []const u8) bool {
+    for ([_][]const u8{ "/boot/preload.r4i", "/boot/preload/hidreport.r4p", "/boot/preload/usbhid.r4p", "/boot/preload/usbbot.r4p", "/boot/preload/usbscsi.r4p" }) |target|
+        if (samePath(path, target)) return true;
+    return false;
 }

@@ -630,20 +630,28 @@ pub fn checkLastGood(io: anytype, journal: *const TransactionJournal) ReplayStat
     for (journal.payloads[0..journal.payload_count]) |*entry| {
         if (!entry.committed or entry.rolled_back) return .invalid;
         switch (io.pathState(entry.targetText(), entry.size, entry.checksum)) {
-            .match => {}, .io => return .io, else => return .conflict,
+            .match => {},
+            .io => return .io,
+            else => return .conflict,
         }
         if (!entry.replace_required) continue;
         changed = true;
         if (entry.target_existed and !entry.old_known) return .invalid;
         switch (io.presence(entry.stageText())) {
-            .not_found => {}, .io => return .io, else => return .conflict,
+            .not_found => {},
+            .io => return .io,
+            else => return .conflict,
         }
         if (entry.target_existed) {
             switch (io.pathState(entry.backupText(), entry.old_size, entry.old_checksum)) {
-                .match => {}, .io => return .io, else => return .conflict,
+                .match => {},
+                .io => return .io,
+                else => return .conflict,
             }
         } else switch (io.presence(entry.backupText())) {
-            .not_found => {}, .io => return .io, else => return .conflict,
+            .not_found => {},
+            .io => return .io,
+            else => return .conflict,
         }
     }
     return if (changed) .ok else .invalid;
@@ -1677,7 +1685,9 @@ test "restart batch recovery commits every bound payload before post boot" {
             self.reads += 1;
             return if (self.reads == self.fail_read) .other else .match;
         }
-        pub fn presence(self: *@This(), _: []const u8) PresenceState { return if (self.stage_present) .file else .not_found; }
+        pub fn presence(self: *@This(), _: []const u8) PresenceState {
+            return if (self.stage_present) .file else .not_found;
+        }
     };
     var io: MockIo = .{};
     try testing.expectEqual(ReplayStatus.ok, resumeBatchForward(&io, &journal));
@@ -1690,13 +1700,16 @@ test "restart batch recovery commits every bound payload before post boot" {
     journal.phase = .cleanup;
     try testing.expectEqual(ReplayStatus.ok, checkLastGood(&io, &journal));
     for ([_]usize{ 1, 2 }) |fault| {
-        io.reads = 0; io.fail_read = fault;
+        io.reads = 0;
+        io.fail_read = fault;
         try testing.expectEqual(ReplayStatus.conflict, checkLastGood(&io, &journal));
         try testing.expectEqual(JournalPhase.cleanup, journal.phase);
     }
-    io.fail_read = 0; io.stage_present = true;
+    io.fail_read = 0;
+    io.stage_present = true;
     try testing.expectEqual(ReplayStatus.conflict, checkLastGood(&io, &journal));
-    io.stage_present = false; journal.payloads[0].old_known = false;
+    io.stage_present = false;
+    journal.payloads[0].old_known = false;
     try testing.expectEqual(ReplayStatus.invalid, checkLastGood(&io, &journal));
     try testing.expectEqual(persisted, io.persist_count);
 }
@@ -1708,6 +1721,14 @@ test "an ASCII target set stays acceptable" {
     for ([_][]const u8{ "C:\\R4OS\\LICENSES\\GFX\\NOTICE.TXT", "C:\\R4OS\\SOURCES\\R4VIDEO\\SOURCE.ZIP" }) |target| {
         testJournalWithTarget(&journal, target);
         try testing.expect(journalPathsValid(&journal));
+    }
+    for ([_][]const u8{ "\\boot\\preload.r4i", "\\boot\\preload\\hidreport.r4p", "\\boot\\preload\\usbhid.r4p", "\\boot\\preload\\usbbot.r4p", "\\boot\\preload\\usbscsi.r4p" }) |target| {
+        testJournalWithTarget(&journal, target);
+        try testing.expect(journalPathsValid(&journal));
+    }
+    for ([_][]const u8{ "\\boot\\limine.conf", "\\boot\\preload\\other.r4p", "C:\\boot\\preload.r4i" }) |target| {
+        testJournalWithTarget(&journal, target);
+        try testing.expect(!journalPathsValid(&journal));
     }
     testJournalWithTarget(&journal, "C:\\R4OS\\LICENSES-OTHER\\NOTICE.TXT");
     try testing.expect(!journalPathsValid(&journal));
