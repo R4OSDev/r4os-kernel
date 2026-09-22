@@ -719,6 +719,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         bootlog.puts(" cpu-heap=retained resources=quarantined\r\n");
         return false;
     }
+    @import("../driver/input/platform_input.zig").remove(owner);
     driver_resources.state.finish(owner);
     gfx_memory.finishOwner(owner);
     token.active = false;
@@ -3307,9 +3308,38 @@ fn resourceQuery(output: *outputs_contract.DriverResourceApi) callconv(.c) i32 {
     defer _ = leaveOwner();
     _ = driver_resources.state.current(@intCast(owner)) catch return outputs_contract.driver_resource_error_stale;
     const value: outputs_contract.DriverResourceApi = .{ .stat = @intFromPtr(&resourceStat), .read_at = @intFromPtr(&resourceReadAt), .now_ns = @intFromPtr(&driver_resources.nowNs),
-        .acpi_stat = @intFromPtr(&resourceAcpiStat), .acpi_read_at = @intFromPtr(&resourceAcpiReadAt) };
+        .acpi_stat = @intFromPtr(&resourceAcpiStat), .acpi_read_at = @intFromPtr(&resourceAcpiReadAt), .platform_query = @intFromPtr(&platformQuery) };
     if (!@import("driver_resource_state.zig").publishApi(output, value)) return outputs_contract.driver_resource_error_invalid;
     return outputs_contract.driver_resource_ok;
+}
+fn platformIdentity() ?struct { owner: u32, epoch: u64 } {
+    const owner = heapOwner();
+    if (owner == 0) return null;
+    var stats: outputs_contract.DriverHeapStats = .{};
+    if (driver_heap.stats(owner, &stats) != 0 or stats.owner_epoch == 0 or stats.closing != 0) return null;
+    return .{ .owner = owner, .epoch = stats.owner_epoch };
+}
+fn platformQuery(output: *outputs_contract.DriverPlatformApi) callconv(.c) i32 {
+    _ = platformIdentity() orelse return outputs_contract.driver_resource_error_owner;
+    if (@intFromPtr(output) == 0 or @intFromPtr(output) % @alignOf(outputs_contract.DriverPlatformApi) != 0 or
+        output.version != 1 or output.size < @sizeOf(outputs_contract.DriverPlatformApi)) return outputs_contract.driver_resource_error_invalid;
+    output.* = .{ .rsdp = @intFromPtr(&platformRsdp), .physical_view = @intFromPtr(&platformPhysicalView), .input_submit = @intFromPtr(&platformInputSubmit) };
+    return outputs_contract.driver_resource_ok;
+}
+fn platformRsdp() callconv(.c) u64 {
+    _ = platformIdentity() orelse return 0;
+    return @import("../platform/firmware_view.zig").root();
+}
+fn platformPhysicalView(physical: u64, bytes: u64, output: *u64) callconv(.c) i32 {
+    _ = platformIdentity() orelse return outputs_contract.driver_resource_error_owner;
+    if (@intFromPtr(output) == 0 or @intFromPtr(output) % 8 != 0) return outputs_contract.driver_resource_error_invalid;
+    const address = @import("../platform/firmware_view.zig").view(physical, bytes) orelse return outputs_contract.driver_resource_error_source;
+    output.* = address;
+    return outputs_contract.driver_resource_ok;
+}
+fn platformInputSubmit(kind: u32, value: u32) callconv(.c) i32 {
+    const identity = platformIdentity() orelse return outputs_contract.driver_resource_error_owner;
+    return @import("../driver/input/platform_input.zig").submit(identity.owner, identity.epoch, kind, value);
 }
 fn resourceStat(name: [*]const u8, length: u32, output: *outputs_contract.DriverResourceInfo) callconv(.c) i32 {
     const owner = enterResourceOwner();

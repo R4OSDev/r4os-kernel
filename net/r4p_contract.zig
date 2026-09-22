@@ -326,6 +326,8 @@ pub const HID_REPORT_MAX_FIELDS: usize = 24;
 pub const HID_REPORT_MAX_FIELD_USAGES: usize = 8;
 
 pub const HID_REPORT_OP_PARSE: u32 = 1;
+pub const HID_REPORT_OP_CONSUMER = @import("r4os_kernel_contract").hid_report_op_consumer;
+pub const HidConsumerOp = @import("r4os_kernel_contract").HidConsumerOp;
 
 pub const HID_REPORT_RESULT_OK: i32 = 0;
 pub const HID_REPORT_RESULT_BUFFER_SMALL: i32 = -1;

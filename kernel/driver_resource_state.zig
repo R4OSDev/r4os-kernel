@@ -56,7 +56,7 @@ pub fn publishApi(output: *@import("r4os_kernel_contract").DriverResourceApi, in
 test "resource handles reject foreign owners, restart, shutdown and exhaustion" {
     const Api = @import("r4os_kernel_contract").DriverResourceApi;
     const t = std.testing;
-    for ([_]u32{ 31, 32, 39, 40, 47, 48, 64 }) |capacity| {
+    for ([_]u32{ 31, 32, 39, 40, 47, 48, 55, 56, 64 }) |capacity| {
         var storage: [80]u8 align(8) = @splat(0x79);
         std.mem.writeInt(u32, storage[0..4], 1, .little);
         std.mem.writeInt(u32, storage[4..8], capacity, .little);
@@ -67,7 +67,7 @@ test "resource handles reject foreign owners, restart, shutdown and exhaustion" 
             try t.expectEqualSlices(u8, &before, &storage);
         } else {
             try t.expect(publishApi(output, .{ .stat = 11, .read_at = 13, .now_ns = 17, .acpi_stat = 19, .acpi_read_at = 23 }));
-            const written = @min(capacity & ~@as(u32, 7), 48);
+            const written = @min(capacity & ~@as(u32, 7), @sizeOf(Api));
             try t.expectEqual(written, output.size);
             try t.expectEqual(@as(u64, 11), output.stat);
             try t.expectEqualSlices(u8, before[written..], storage[written..]);

@@ -251,8 +251,14 @@ pub fn unloadRuntimeName(raw_name: []const u8) bool {
         _ = driver_api.leaveOwner();
         return false;
     };
-    driver_api.beginOwnerShutdown(&cleanup_token);
+    // External input may finish AML (_DOS/_REG) while quiescing. Those
+    // methods still need the driver's heap and semaphores. Its own stop
+    // barrier retires producers first; generic admission/cleanup follows
+    // the callback and still refuses to release unjoined work.
+    const input_shutdown = driver.driver_type == @intFromEnum(DriverType.input);
+    if (!input_shutdown) driver_api.beginOwnerShutdown(&cleanup_token);
     const result = shutdown();
+    if (input_shutdown) driver_api.beginOwnerShutdown(&cleanup_token);
     if (result != 0) {
         _ = driver_api.quarantineOwnerCleanup(&cleanup_token);
         quarantineRuntimeDriver(driver);
@@ -605,14 +611,15 @@ pub fn shutdownForSystemTransition() bool {
         stopped += 1;
         _ = driver_api.leaveOwner();
     }
-    k.puts("[R4D] system-transition network/display shutdown stopped=");
+    k.puts("[R4D] system-transition network/display/input shutdown stopped=");
     k.putDec(stopped);
     k.puts(if (success) " result=OK\r\n" else " result=FAILED\r\n");
     return success;
 }
 
 fn needsSystemTransition(driver_type: u16) bool {
-    return driver_type == @intFromEnum(DriverType.net) or driver_type == @intFromEnum(DriverType.display);
+    return driver_type == @intFromEnum(DriverType.net) or driver_type == @intFromEnum(DriverType.display) or
+        driver_type == @intFromEnum(DriverType.input);
 }
 
 fn shutdownAndCleanupFailedLoad(
@@ -636,8 +643,10 @@ fn shutdownAndCleanupFailedLoad(
         logFailedLoadQuarantine(name, owner, "resource-busy");
         return false;
     };
-    driver_api.beginOwnerShutdown(&cleanup_token);
+    const input_shutdown = descriptor.driver_type == @intFromEnum(DriverType.input);
+    if (!input_shutdown) driver_api.beginOwnerShutdown(&cleanup_token);
     const shutdown_result = shutdown();
+    if (input_shutdown) driver_api.beginOwnerShutdown(&cleanup_token);
     if (shutdown_result != 0) {
         _ = driver_api.quarantineOwnerCleanup(&cleanup_token);
         _ = driver_api.leaveOwner();

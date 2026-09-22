@@ -25,6 +25,7 @@ const KEYBOARD_REPORT_QUEUE_RESERVE: u32 = (r4p_contract.USB_HID_BOOT_MAX_KEYS *
 const HidKind = enum {
     keyboard,
     mouse,
+    consumer,
 };
 
 const HidInterfaceCandidate = struct {
@@ -56,6 +57,10 @@ const HidBinding = struct {
     report_descriptor_len: u16 = 0,
     report_descriptor_read_len: u16 = 0,
     report_summary: hid_report.Summary = .{},
+    report_wire: r4p_contract.HidReportSummary = .{},
+    consumer_pressed: [16]u8 = @splat(0),
+    consumer_caps: u32 = 0,
+    report_protocol: bool = false,
     polls: u64 = 0,
     no_reports: u64 = 0,
     reports: u64 = 0,
@@ -133,6 +138,8 @@ pub const Status = struct {
 var current: Status = .{};
 var keyboard_binding: HidBinding = .{};
 var mouse_binding: HidBinding = .{};
+var consumer_binding: HidBinding = .{};
+const platform_input = @import("../input/platform_input.zig");
 var service_polls: u64 = 0;
 var keyboard_backpressure_active = false;
 var keyboard_backpressure_polls: u64 = 0;
@@ -161,6 +168,8 @@ pub fn initWithOptions(selected: Options) bool {
     current = .{ .initialized = true, .reason = "no USB HID boot device found" };
     keyboard_binding = .{};
     mouse_binding = .{};
+    consumer_binding = .{};
+    platform_input.usb(false);
     service_polls = 0;
     keyboard_backpressure_active = false;
     keyboard_backpressure_polls = 0;
@@ -182,13 +191,13 @@ pub fn initWithOptions(selected: Options) bool {
         current.reason = "USB HID boot keyboard bound; USB HID boot mouse bound";
         if (current.setup_warnings != 0) current.reason = "USB HID boot keyboard bound; USB HID boot mouse bound; optional class setup warning";
     }
-    return current.keyboard_bound or current.mouse_bound;
+    return current.keyboard_bound or current.mouse_bound or consumer_binding.bound;
 }
 
 fn topologyChangedHook() callconv(.c) void {
     topology_reconciles +%= 1;
     reconcileBindings();
-    if (keyboard_binding.bound or mouse_binding.bound) _ = startPollTask();
+    if (keyboard_binding.bound or mouse_binding.bound or consumer_binding.bound) _ = startPollTask();
 }
 
 fn reconcileBindings() void {
@@ -200,6 +209,7 @@ fn reconcileBindings() void {
 
     if (keyboard_binding.present and !bindingStillPublished(&keyboard_binding)) keyboard_binding = .{};
     if (mouse_binding.present and !bindingStillPublished(&mouse_binding)) mouse_binding = .{};
+    if (consumer_binding.present and !bindingStillPublished(&consumer_binding)) consumer_binding = .{};
     if (!keyboard_binding.bound) {
         keyboard_backpressure_active = false;
         keyboard.setPollHook(null);
@@ -229,7 +239,10 @@ fn bindingStillPublished(binding: *const HidBinding) bool {
     var index: usize = 0;
     while (usb_core.deviceAt(index)) |dev| : (index += 1) {
         if (!dev.active or !dev.configured) continue;
-        if (dev.port == binding.port and dev.slot_id == binding.device.slot_id) return true;
+        if (dev.port == binding.port and dev.slot_id == binding.device.slot_id) {
+            const live = xhci.deviceHandleFromCore(dev);
+            return live.generation != 0 and live.generation == binding.device.generation;
+        }
     }
     return false;
 }
@@ -275,6 +288,19 @@ fn chooseInterruptEndpoint(interrupt_in: u8, first_address: u8, first_attributes
 fn handleCandidate(dev: *const usb_core.Device, candidate: HidInterfaceCandidate) void {
     if (candidate.class_code != 0x03) return;
     if (!options.bind_mouse and candidate.subclass == 0x01 and candidate.protocol == 0x02) return;
+    // Non-boot HID interfaces use the advertised report descriptor. Keep
+    // boot keyboard/mouse transport and their negotiated protocol intact.
+    if (candidate.subclass == 0 and candidate.protocol == 0 and candidateHasInterruptEndpoint(candidate)) {
+        if (consumer_binding.bound or !hidProtocolRolesReady()) return;
+        fillBinding(&consumer_binding, dev, candidate);
+        consumer_binding.report_protocol = true;
+        readReportDescriptor(&consumer_binding);
+        const decoded = hid_report.consumer(&consumer_binding.report_wire, &.{}) orelse return;
+        if (!consumer_binding.report_descriptor_ok or decoded.capabilities == 0) return;
+        consumer_binding.consumer_caps = decoded.capabilities;
+        if (bindDevice(&consumer_binding, .consumer)) platform_input.usb(true);
+        return;
+    }
     const kind = classifyCandidate(candidate) orelse {
         if (candidate.subclass == 0x01 and !candidateHasInterruptEndpoint(candidate)) {
             current.missing_endpoint_hid += 1;
@@ -397,6 +423,8 @@ pub fn servicePoll() void {
     service_polls +%= 1;
     pollKeyboard();
     pollMouse();
+    _ = pollBinding(&consumer_binding, .consumer);
+    platform_input.usb(consumer_binding.bound and consumer_binding.consumer_caps != 0);
 }
 
 // 0.56.17: Autonomer Input-Poll-Task (Befund 7.1). Bisher trieben nur die
@@ -591,6 +619,7 @@ fn bindDevice(binding: *HidBinding, kind: HidKind) bool {
         current.reason = switch (kind) {
             .keyboard => "USB HID keyboard select failed",
             .mouse => "USB HID mouse select failed",
+            .consumer => "USB HID Consumer select failed",
         };
         return false;
     }
@@ -602,7 +631,11 @@ fn bindInterruptInput(binding: *HidBinding) bool {
     if (!xhci.setConfigurationForHandle(&binding.device)) {
         binding.setup_warnings += 1;
     }
-    if (!xhci.setHidBootProtocolForHandle(&binding.device, binding.interface_number)) {
+    if (binding.report_protocol) {
+        // SET_PROTOCOL is defined only for boot subclasses; reset selects
+        // report protocol for the dedicated Consumer interface.
+        binding.protocol_ok = true;
+    } else if (!xhci.setHidBootProtocolForHandle(&binding.device, binding.interface_number)) {
         binding.setup_warnings += 1;
     } else {
         binding.protocol_ok = true;
@@ -612,7 +645,7 @@ fn bindInterruptInput(binding: *HidBinding) bool {
     } else {
         binding.idle_ok = true;
     }
-    readReportDescriptor(binding);
+    if (!binding.report_protocol) readReportDescriptor(binding);
     if (!xhci.configureInterruptInEndpointHandle(&binding.endpoint)) {
         binding.failures += 1;
         current.reason = "interrupt endpoint configure failed";
@@ -629,7 +662,7 @@ fn readReportDescriptor(binding: *HidBinding) void {
         return;
     };
     binding.report_descriptor_read_len = @intCast(actual);
-    binding.report_summary = hid_report.parse(report_desc[0..actual]);
+    binding.report_summary = hid_report.parse(report_desc[0..actual], &binding.report_wire);
     binding.report_descriptor_ok = binding.report_summary.parsed and !binding.report_summary.malformed;
     binding.report_descriptor_malformed = binding.report_summary.malformed;
     if (binding.report_summary.has_report_id) binding.report_id_heuristic = true;
@@ -704,6 +737,7 @@ fn pollBinding(binding: *HidBinding, kind: HidKind) bool {
     switch (kind) {
         .keyboard => decodeKeyboardReport(binding, report[0..actual_report_len]),
         .mouse => decodeMouseReport(binding, report[0..actual_report_len]),
+        .consumer => decodeConsumerReport(binding, report[0..actual_report_len]),
     }
     binding.last_report = report;
     binding.last_report_len = @intCast(actual_report_len);
@@ -743,6 +777,7 @@ fn ensureSelected(binding: *HidBinding, kind: HidKind) bool {
         current.reason = switch (kind) {
             .keyboard => "USB HID keyboard select failed",
             .mouse => "USB HID mouse select failed",
+            .consumer => "USB HID Consumer select failed",
         };
         return false;
     }
@@ -756,6 +791,16 @@ fn ensureSelected(binding: *HidBinding, kind: HidKind) bool {
         return true;
     }
     return bindInterruptInput(binding);
+}
+
+fn decodeConsumerReport(binding: *HidBinding, report: []const u8) void {
+    const decoded = hid_report.consumer(&binding.report_wire, report) orelse { binding.failures += 1; return; };
+    if (decoded.report_id >= binding.consumer_pressed.len) return;
+    const pressed: u8 = @intCast(decoded.pressed);
+    const rising = pressed & ~binding.consumer_pressed[decoded.report_id];
+    binding.consumer_pressed[decoded.report_id] = pressed;
+    if (rising & 1 != 0) platform_input.consumer(0x6f);
+    if (rising & 2 != 0) platform_input.consumer(0x70);
 }
 
 fn decodeKeyboardReport(binding: *HidBinding, report: []const u8) void {
@@ -866,6 +911,7 @@ fn injectReleasedUsages(op: *const r4p_contract.UsbHidBootOp) void {
 }
 
 fn refreshAggregateStatus() void {
+    platform_input.usb(consumer_binding.bound and consumer_binding.consumer_caps != 0);
     const keyboard_queue = keyboard.stats();
     current.keyboard_present = keyboard_binding.present;
     current.keyboard_bound = keyboard_binding.bound;
@@ -900,7 +946,7 @@ fn refreshAggregateStatus() void {
     current.boot_last_result = boot_last_result;
     current.protocol_ok = aggregateOk(.protocol);
     current.idle_ok = aggregateOk(.idle);
-    const primary = if (keyboard_binding.bound or keyboard_binding.present) keyboard_binding else mouse_binding;
+    const primary = if (keyboard_binding.bound or keyboard_binding.present) &keyboard_binding else if (mouse_binding.present) &mouse_binding else &consumer_binding;
     current.port = primary.port;
     current.interface_number = primary.interface_number;
     current.endpoint_address = primary.endpoint_address;
@@ -948,7 +994,7 @@ fn reportsEqual(a: []const u8, b: []const u8) bool {
 fn shouldSuppressDuplicate(binding: *const HidBinding, kind: HidKind, report: []const u8) bool {
     if (!reportsEqual(report, binding.last_report[0..binding.last_report_len])) return false;
     return switch (kind) {
-        .keyboard => true,
+        .keyboard, .consumer => true,
         .mouse => !reportHasNonzero(report),
     };
 }

@@ -3658,6 +3658,10 @@ pub fn setFirstConfigurationForHid() bool {
 
 pub fn setConfigurationForHandle(handle: *DeviceHandle) bool {
     if (!selectDeviceHandle(handle)) return false;
+    // Additional interfaces of the same composite device share configuration.
+    // Reissuing SET_CONFIGURATION would reset an already bound keyboard's
+    // protocol and endpoint state when its Consumer interface is selected.
+    if (current.set_configuration_ok and current.config_value == handle.config_value) return true;
     return setFirstConfiguration();
 }
 

@@ -79,12 +79,12 @@ pub const Status = struct {
 
 var status_state: Status = .{};
 
-pub fn parse(bytes: []const u8) Summary {
+pub fn parse(bytes: []const u8, wire: *r4p_contract.HidReportSummary) Summary {
     if (!r4p.hasActiveR4p("usb.hid_report")) {
         status_state.required_missing +%= 1;
         return .{ .reason = "HIDREPORT.R4P required" };
     }
-    return parseR4p(bytes) orelse .{ .malformed = true, .reason = "HIDREPORT.R4P dispatch failed" };
+    return parseR4p(bytes, wire) orelse .{ .malformed = true, .reason = "HIDREPORT.R4P dispatch failed" };
 }
 
 pub fn status() Status {
@@ -96,7 +96,7 @@ pub fn sourceName() []const u8 {
     return r4p.requiredSourceName("usb.hid_report");
 }
 
-fn parseR4p(bytes: []const u8) ?Summary {
+fn parseR4p(bytes: []const u8, wire: *r4p_contract.HidReportSummary) ?Summary {
     if (bytes.len > r4p_contract.HID_REPORT_MAX_DESCRIPTOR) {
         status_state.dispatch_failures +%= 1;
         status_state.last_result = r4p_contract.HID_REPORT_RESULT_BAD_LENGTH;
@@ -120,6 +120,7 @@ fn parseR4p(bytes: []const u8) ?Summary {
         return null;
     }
     status_state.r4p_parse +%= 1;
+    wire.* = op.summary;
     return summaryFromR4p(op.summary);
 }
 
@@ -183,4 +184,16 @@ fn reasonName(code: u16) []const u8 {
         r4p_contract.HID_REPORT_REASON_TRUNCATED_SHORT_ITEM => "truncated short item",
         else => "not parsed",
     };
+}
+
+// Decode remains external. No callbacks or pointers survive this dispatch.
+pub fn consumer(summary: *const r4p_contract.HidReportSummary, report: []const u8) ?r4p_contract.HidConsumerOp {
+    if (report.len > 32 or !r4p.hasActiveR4p("usb.hid_report")) return null;
+    var request: r4p_contract.HidConsumerOp = .{ .summary_address = @intFromPtr(summary), .report_len = @intCast(report.len) };
+    @memcpy(request.report[0..report.len], report);
+    const buffer: protocol_api.ProtocolBuffer = .{ .data = &request, .len = @sizeOf(@TypeOf(request)), .capacity = @sizeOf(@TypeOf(request)), .flags = 0, .reserved = 0 };
+    var output: protocol_api.ProtocolBuffer = .{};
+    if (r4p.dispatch("usb.hid_report", r4p_contract.HID_REPORT_OP_CONSUMER, &buffer, &output) != 0 or request.capabilities > 3 or request.pressed > 3 or
+        (request.report_id != 0xffffffff and request.report_id >= 16)) return null;
+    return request;
 }

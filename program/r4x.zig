@@ -7532,6 +7532,7 @@ fn configureR4XStartR4SysTable() void {
         .program_module_path = &apiProgramModulePath,
         .program_module_running = &r4api.r4sys.programModuleRunning,
         .monotonic_clock = &r4api.r4sys.monotonicClock,
+        .platform_input_snapshot = &@import("../driver/input/platform_input.zig").snapshot,
         .boot_ready = &apiBootReady,
         .registry_snapshot_begin = &r4api.r4sys.registrySnapshotBegin,
         .registry_snapshot_page = &r4api.r4sys.registrySnapshotPage,
