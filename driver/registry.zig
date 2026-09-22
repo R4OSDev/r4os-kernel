@@ -1,7 +1,9 @@
 const bootlog = @import("../kernel/bootlog.zig");
 
 pub const MAX_NAME: usize = 32;
-pub const MAX_DRIVERS: usize = 16;
+// Full AMD images contain 17 R4D modules, alongside built-in owners.
+// All per-driver runtime/resource tables derive their capacity here.
+pub const MAX_DRIVERS: usize = 32;
 
 pub const State = enum(u8) {
     empty,

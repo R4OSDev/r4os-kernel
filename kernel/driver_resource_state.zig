@@ -1,6 +1,7 @@
 // Serialized by DriverApi's wait-spanning owner guard. No resource handle
 // owns a buffer, a filesystem lease or a path which could be reopened.
 const std = @import("std");
+const owner_capacity = @import("../driver/registry.zig").MAX_DRIVERS;
 pub const Error = error{ Owner, Busy, Stale, Capacity };
 pub const Binding = struct {
     epoch: u64 = 0,
@@ -10,7 +11,7 @@ pub const Binding = struct {
 };
 pub const State = struct {
     next_epoch: u64 = 1,
-    bindings: [16]Binding = .{Binding{}} ** 16,
+    bindings: [owner_capacity]Binding = .{Binding{}} ** owner_capacity,
 
     pub fn bind(self: *State, owner: u32, slot: usize, generation: u32) Error!void {
         if (owner == 0 or owner > self.bindings.len or generation == 0) return error.Owner;
@@ -74,6 +75,14 @@ test "resource handles reject foreign owners, restart, shutdown and exhaustion" 
         }
     }
     var state: State = .{};
+    try state.bind(owner_capacity, 9, 102);
+    const last = try state.handle(owner_capacity, 0);
+    try t.expectEqual(@as(usize, 0), try state.resolve(owner_capacity, last));
+    try t.expectError(error.Owner, state.bind(owner_capacity + 1, 10, 103));
+    try t.expectError(error.Owner, state.resolve(owner_capacity + 1, last));
+    state.close(owner_capacity);
+    try t.expectError(error.Stale, state.resolve(owner_capacity, last));
+    state.finish(owner_capacity);
     try state.bind(1, 7, 100);
     try state.bind(2, 8, 101);
     const first = try state.handle(1, 63);

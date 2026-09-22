@@ -12,8 +12,8 @@ const timer = @import("../kernel/timer.zig");
 const api = @import("r4x_api.zig");
 
 const VERSION: u32 = 1;
-const MAX_RUNTIME_DRIVERS: usize = 16;
-const MAX_MODULE_DRIVERS: usize = 16;
+const MAX_RUNTIME_DRIVERS: usize = driver_registry.MAX_DRIVERS;
+const MAX_MODULE_DRIVERS: usize = driver_registry.MAX_DRIVERS;
 const MAX_RUNTIME_NAME: usize = 32;
 const MAX_PATH: usize = 96;
 const R4M_HEADER_SIZE: usize = 64;
