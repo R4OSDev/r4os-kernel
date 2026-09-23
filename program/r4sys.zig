@@ -448,28 +448,49 @@ pub fn timeSetState(request: *const time_core.State) callconv(.c) i32 {
 }
 
 pub fn bootLogInfo(out: *BootLogInfo) callconv(.c) i32 {
-    const flags = owner_locks.program_state.acquire();
-    defer owner_locks.program_state.release(flags);
+    const value = bootlog.info();
+    // Caller storage may be demand-paged. Publish only after the log owner
+    // released its coherent resident snapshot.
     out.* = .{
         .capacity = @intCast(bootlog.capacity()),
-        .length = @intCast(bootlog.length()),
-        .flags = bootlog.flags(),
+        .length = @intCast(value.length),
+        .flags = value.flags,
         .reserved = 0,
-        .total_written = bootlog.totalWritten(),
-        .dropped_bytes = bootlog.droppedBytes(),
+        .total_written = value.total_written,
+        .dropped_bytes = value.dropped_bytes,
     };
     return 1;
 }
 
 pub fn bootLogRead(offset: u32, out: [*]u8, capacity_value: u32) callconv(.c) i32 {
-    const flags = owner_locks.program_state.acquire();
-    defer owner_locks.program_state.release(flags);
     if (capacity_value == 0) return 0;
     const len = bootlog.length();
     const offset_usize: usize = @intCast(offset);
     if (offset_usize >= len) return 0;
     const max_len = @min(@as(usize, @intCast(capacity_value)), len - offset_usize);
-    const written = bootlog.read(offset_usize, out[0..max_len]);
+    const task_context = @import("../sched/task_context.zig");
+    const unwind = blk: {
+        const flags = interrupts.saveAndDisableRuntime();
+        defer interrupts.restore(flags);
+        break :blk task_context.enterUnwind();
+    };
+    if (!unwind.admitted()) return -1;
+    defer {
+        const flags = interrupts.saveAndDisableRuntime();
+        defer interrupts.restore(flags);
+        std.debug.assert(task_context.leaveUnwind(unwind));
+    }
+    // The ring owner must never fault into a caller's lazy VM region. Small
+    // reads use resident stack headroom; larger reads retain one bounded
+    // kernel allocation so the whole returned range remains one snapshot.
+    var small: [4096]u8 = undefined;
+    const allocated = if (max_len > small.len) heap.allocBytes(max_len) orelse return -1 else null;
+    defer if (allocated) |bytes| {
+        _ = heap.free(bytes);
+    };
+    const resident = if (allocated) |bytes| bytes else small[0..max_len];
+    const written = bootlog.read(offset_usize, resident);
+    @memcpy(out[0..written], resident[0..written]);
     return @intCast(written);
 }
 

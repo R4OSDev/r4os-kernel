@@ -8,6 +8,24 @@ var cursor: usize = 0;
 var wrapped: bool = false;
 var total_written: u64 = 0;
 
+pub const Info = struct {
+    length: usize,
+    flags: u32,
+    total_written: u64,
+    dropped_bytes: u64,
+};
+
+pub fn info() Info {
+    const irq_state = owner_locks.boot_log.acquire();
+    defer owner_locks.boot_log.release(irq_state);
+    return .{
+        .length = if (wrapped) BUFFER_SIZE else cursor,
+        .flags = if (wrapped) FLAG_WRAPPED else 0,
+        .total_written = total_written,
+        .dropped_bytes = if (total_written > BUFFER_SIZE) total_written - BUFFER_SIZE else 0,
+    };
+}
+
 pub fn puts(text: []const u8) void {
     const irq_state = owner_locks.boot_log.acquire();
     defer owner_locks.boot_log.release(irq_state);

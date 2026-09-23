@@ -592,7 +592,8 @@ pub fn shutdownForSystemTransition() bool {
         k.putDec(driver.owner);
         k.puts("\r\n");
         const result = if (driver.shutdown) |shutdown| shutdown() else -1;
-        const quiesced = result == 0 and (!is_display or driver_api.displaySystemTransitionQuiesced(expected_owner));
+        const admission_closed = !is_display or driver_api.endDisplaySystemTransition(expected_owner);
+        const quiesced = admission_closed and result == 0 and (!is_display or driver_api.displaySystemTransitionQuiesced(expected_owner));
         if (!quiesced) {
             quarantineRuntimeDriver(driver);
             k.puts("[R4D] system-transition shutdown failed name=");

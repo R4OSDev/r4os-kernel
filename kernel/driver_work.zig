@@ -275,6 +275,7 @@ pub const CleanupResult = struct {
 
 const WorkItem = struct {
     owner: u32 = 0,
+    owned_slice: bool = false,
     handle: u32 = 0,
     generation: u32 = 0,
     flags: u32 = 0,
@@ -378,7 +379,13 @@ pub fn init() bool {
 pub fn submit(owner: u32, handler: WorkHandler, context: usize, flags: u32, out_handle: *u32) i32 {
     const actual_irq = irq_router.inDispatch();
     const source: work_queue.SourceClass = if (actual_irq or (flags & WORK_FLAG_FROM_IRQ) != 0) .irq else .task;
-    return submitInternal(owner, handler, context, flags, source, 0, 0, 0, actual_irq, out_handle);
+    return submitInternal(owner, handler, context, flags, source, 0, 0, 0, actual_irq, false, out_handle);
+}
+
+pub fn submitOwned(owner: u32, handler: WorkHandler, context: usize, out_handle: *u32) i32 {
+    out_handle.* = 0;
+    if (owner == 0 or irq_router.inDispatch()) return -3;
+    return submitInternal(owner, handler, context, 0, .task, 0, 0, 0, false, true, out_handle);
 }
 
 pub fn submitRequest(owner: u32, request: *const WorkRequest, out_handle: *u32) i32 {
@@ -406,6 +413,7 @@ pub fn submitRequest(owner: u32, request: *const WorkRequest, out_handle: *u32) 
         request.deadline_tick,
         request.budget_ticks,
         irq_router.inDispatch(),
+        false,
         out_handle,
     );
 }
@@ -420,6 +428,7 @@ fn submitInternal(
     deadline_tick: u64,
     budget_ticks: u64,
     actual_irq: bool,
+    owned_slice: bool,
     out_handle: *u32,
 ) i32 {
     out_handle.* = 0;
@@ -449,6 +458,7 @@ fn submitInternal(
     const handle = work_queue.makeHandle(slot, generation);
     items[slot] = .{
         .owner = owner,
+        .owned_slice = owned_slice,
         .handle = handle,
         .generation = generation,
         .flags = flags | if (actual_irq) WORK_FLAG_FROM_IRQ else WORK_FLAG_NONE,
@@ -1033,7 +1043,9 @@ fn runSlot(slot: usize, deadline_lane: bool) void {
     } else {
         normal_callback_owner = 0;
     };
-    const result = handler(items[slot].context);
+    const result = if (items[slot].owned_slice)
+        @import("driver_api.zig").invokeOwnedWork(items[slot].owner, handler, items[slot].context)
+    else handler(items[slot].context);
     finishSlot(slot, result);
 }
 

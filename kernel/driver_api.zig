@@ -38,7 +38,7 @@ const driver_semaphores = @import("driver_semaphores.zig");
 
 pub const MAGIC: u32 = 0x31495044; // "DPI1" little endian
 // Version 35: owned Task-to-Work admission, unchanged v34 table layout.
-pub const VERSION: u32 = 35;
+pub const VERSION: u32 = 36;
 
 const AUDIO_BACKEND_VERSION: u32 = 2;
 const AUDIO_BACKEND_FORMAT_S16LE: u32 = 1 << 0;
@@ -556,10 +556,14 @@ pub fn beginOwnerShutdown(token: *OwnerCleanupToken) void {
 }
 
 fn closeOwnerAdmissions(owner: u32) void {
+    closeOwnerDataAdmissions(owner);
+    driver_threads.beginClose(owner);
+}
+
+fn closeOwnerDataAdmissions(owner: u32) void {
     driver_resources.state.close(owner);
     driver_heap.beginClose(owner);
     driver_semaphores.beginClose(owner);
-    driver_threads.beginClose(owner);
     @import("../display/queue.zig").closingDriver(owner);
     gfx_memory.beginClose(owner);
 }
@@ -570,7 +574,18 @@ fn closeOwnerAdmissions(owner: u32) void {
 pub fn beginDisplaySystemTransition(owner: u32) bool {
     if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return false;
     if (!display_blit.prepareOwnerCleanup(owner)) return false;
-    closeOwnerAdmissions(owner);
+    closeOwnerDataAdmissions(owner);
+    // Stop existing pacing tasks, but let Shutdown start a bounded cleanup
+    // callback using retained mappings. No new resource/heap/BO admission.
+    driver_threads.stopExisting(owner);
+    return true;
+}
+
+// Close cleanup-task admission even when Shutdown failed. This is terminal:
+// a live callback still vetoes reset and no generic backing may be freed.
+pub fn endDisplaySystemTransition(owner: u32) bool {
+    if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return false;
+    driver_threads.beginClose(owner);
     return true;
 }
 
@@ -889,14 +904,16 @@ pub const Table = extern struct {
     semaphore_query: *const fn (*outputs_contract.DriverSemaphoreApi) callconv(.c) i32,
     dma_sync_range_for_device: *const fn (*const DmaMapping, u32, u32) callconv(.c) i32,
     dma_sync_range_for_cpu: *const fn (*const DmaMapping, u32, u32) callconv(.c) i32,
+    driver_work_submit_owned: *const fn (DriverWorkHandler, usize, *u32) callconv(.c) i32,
 };
 
 comptime {
     if (VERSION != outputs_contract.driver_api_version or @offsetOf(Table, "resource_query") != 592 or
         @offsetOf(Table, "heap_query") != 600 or @offsetOf(Table, "monotonic_clock") != 608 or
         @offsetOf(Table, "thread_query") != 616 or @offsetOf(Table, "semaphore_query") != 624 or
-        @offsetOf(Table, "dma_sync_range_for_device") != 632 or @offsetOf(Table, "dma_sync_range_for_cpu") != 640 or @sizeOf(Table) != 648)
-        @compileError("DriverApi v35 unchanged v34 layout drift");
+        @offsetOf(Table, "dma_sync_range_for_device") != 632 or @offsetOf(Table, "dma_sync_range_for_cpu") != 640 or
+        @offsetOf(Table, "driver_work_submit_owned") != 648 or @sizeOf(Table) != 656)
+        @compileError("DriverApi v36 appended owned Work layout drift");
 }
 
 pub var table = Table{
@@ -913,6 +930,7 @@ pub var table = Table{
     .semaphore_query = semaphoreQuery,
     .dma_sync_range_for_device = dmaSyncRangeForDevice,
     .dma_sync_range_for_cpu = dmaSyncRangeForCpu,
+    .driver_work_submit_owned = driverWorkSubmitOwned,
     .size = @sizeOf(Table),
     .reserved = 0,
     .log_info = logInfo,
@@ -1474,6 +1492,30 @@ fn driverWorkSubmit(handler: DriverWorkHandler, context: usize, flags: u32, out_
 
 fn driverWorkSubmitRequest(request: *const DriverWorkRequest, out_handle: *u32) callconv(.c) i32 {
     return driver_work.submitRequest(activeOwner(), request, out_handle);
+}
+
+// A dedicated CPU task may request a bounded hardware-owner slice on the
+// existing BSP Work lane. It never borrows legacy PCI/MMIO/display admission
+// on its own stack or keeps the lifecycle guard across its pacing waits.
+fn driverWorkSubmitOwned(handler: DriverWorkHandler, context: usize, out_handle: *u32) callconv(.c) i32 {
+    if (@intFromPtr(out_handle) == 0) return outputs_contract.driver_thread_error_invalid;
+    out_handle.* = 0;
+    if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return outputs_contract.driver_thread_error_owner;
+    const thread_owner = driver_threads.currentOwner();
+    const owner = if (thread_owner != 0) driver_threads.currentWorkOwner() else activeOwner();
+    if (owner == 0) return outputs_contract.driver_thread_error_closed;
+    return driver_work.submitOwned(owner, handler, context, out_handle);
+}
+
+pub fn invokeOwnedWork(owner: u32, handler: DriverWorkHandler, context: usize) i32 {
+    if (owner == 0 or driver_work.currentOwner() != owner or driver_threads.currentOwner() != 0 or
+        irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return outputs_contract.driver_thread_error_owner;
+    // Shutdown may hold this guard while checking worker completion. Never
+    // park the shared Work lane behind that caller; no callback ran on BUSY.
+    if (!enterOwnerBounded(owner, 0)) return outputs_contract.driver_work_owner_busy;
+    defer _ = leaveOwner();
+    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return handler(context);
 }
 
 fn driverWorkCancel(handle: u32) callconv(.c) i32 {
@@ -3250,7 +3292,15 @@ fn threadAbortCurrent(result: i32) callconv(.c) i32 {
     return driver_threads.abortCurrent(owner, result);
 }
 fn threadStart(input: *const outputs_contract.DriverThreadRequest, output: *u64) callconv(.c) i32 {
-    return driver_threads.start(heapOwner(), input, output);
+    const owner = heapOwner();
+    // Once data admission closes, only the synchronous lifecycle owner can
+    // launch a cleanup callback. Stopped tasks/Work cannot grow another tree.
+    if (driver_heap.query(owner) == outputs_contract.driver_heap_error_closed and
+        (owner != current_owner or !current_owner_guard.ownedByCurrent())) {
+        output.* = 0;
+        return outputs_contract.driver_thread_error_closed;
+    }
+    return driver_threads.start(owner, input, output);
 }
 fn threadStop(handle: u64) callconv(.c) i32 {
     return driver_threads.stop(heapOwner(), handle);
@@ -3801,6 +3851,14 @@ fn gfxReservedSpan(base: u64, bytes: u64) callconv(.c) i32 {
         outputs_contract.gfx_buffer_result_ok else outputs_contract.gfx_buffer_error_unsupported;
 }
 
+fn gfxUnmanagedSpan(base: u64, bytes: u64) callconv(.c) i32 {
+    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    if (base == 0 or bytes == 0 or (base | bytes) & 4095 != 0 or base >= (@as(u64, 1) << 52) or bytes > (@as(u64, 1) << 52) - base)
+        return outputs_contract.gfx_buffer_error_invalid;
+    return if (@import("../memory/device_reserved.zig").bootExcludesSystemMemory(base, bytes, @import("../bootloader/boot_info.zig").get()))
+        outputs_contract.gfx_buffer_result_ok else outputs_contract.gfx_buffer_error_unsupported;
+}
+
 fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32 {
     if (@intFromPtr(output) == 0 or output.version != 1 or output.size < 112) return outputs_contract.gfx_buffer_error_invalid;
     _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
@@ -3837,6 +3895,7 @@ fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32
         .telemetry_exchange = @intFromPtr(&gfxTelemetryExchange),
         .device_lost = @intFromPtr(&gfxDeviceLost),
         .reserved_span = @intFromPtr(&gfxReservedSpan),
+        .unmanaged_span = @intFromPtr(&gfxUnmanagedSpan),
     };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_buffer_result_ok;

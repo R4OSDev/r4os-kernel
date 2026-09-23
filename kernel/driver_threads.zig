@@ -352,12 +352,27 @@ pub fn beginClose(owner: u32) void {
         defer interrupts.restore(flags);
         state.close(owner);
     }
+    stopExisting(owner);
+}
+
+// Terminal display shutdown may need a fresh dedicated callback to undo
+// hardware programming. Cancel current tasks independently of final close.
+pub fn stopExisting(owner: u32) void {
+    const last_handle = capture: {
+        const flags = interrupts.saveAndDisableRuntime();
+        defer interrupts.restore(flags);
+        // Handles never wrap/reuse. Do not chase tasks created after this
+        // snapshot; final admission close and callback quiescence cover them.
+        break :capture if (state.next_handle == 0) std.math.maxInt(u64) else state.next_handle - 1;
+    };
     var cursor: u64 = 0;
     while (true) {
         const flags = interrupts.saveAndDisableRuntime();
         defer interrupts.restore(flags);
         const record = (state.after(owner, cursor) catch return) orelse return;
+        if (record.handle > last_handle) return;
         cursor = record.handle;
+        _ = state.stop(owner, record.handle) catch return;
         cancelWaitLocked(record);
     }
 }
