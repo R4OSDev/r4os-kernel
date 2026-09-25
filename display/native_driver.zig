@@ -24,6 +24,8 @@ const Bridge = struct {
     registration: abi.GfxNativeRegistration = .{},
     reference: buffers.Handle = .{},
     cpu_lease: buffers.Handle = .{},
+    cpu_refresh_required: bool = false,
+    cpu_retry_reported: bool = false,
     timeline: u64 = 0,
     pending: ?queue.model.Fence = null,
     image_pending: ?queue.model.Fence = null,
@@ -68,7 +70,36 @@ const ResetRecord = struct {
     original_generation: u64,
     generation: u64,
     retired: bool = false,
+    reported_step: ResetStep = .none,
+    reported_result: i32 = 0,
 };
+const ResetStep = enum { none, queue, mode, cursor, output, display, bridge, retired };
+fn resetResult(reset: *ResetRecord, step: ResetStep, result: i32) i32 {
+    // Only a changed checkpoint is emitted. Repeated bounded cleanup polls
+    // must not overwrite the useful shutdown history in the bootlog ring.
+    if (reset.reported_step != step or reset.reported_result != result) {
+        reset.reported_step = step;
+        reset.reported_result = result;
+        var text: [192]u8 = undefined;
+        const message = std.fmt.bufPrint(&text, "[GFX-RESET] owner={d} generation={d} retire={s} result={d}\n", .{
+            reset.driver.id, reset.generation, @tagName(step), result,
+        }) catch unreachable;
+        @import("../kernel/log.zig").serialWriteRaw(message);
+        // serialWriteRaw bypasses the boot log hook. Persist the same bounded
+        // checkpoint so a machine without a serial cable retains the cause.
+        @import("../kernel/bootlog.zig").puts(message);
+        var detail: [320]u8 = undefined;
+        const current = display.backendState();
+        const snapshot = std.fmt.bufPrint(&detail,
+            "[GFX-RESET] display={s}/{s} owner={d} generation={d} adapter={d} bridge-generation={d} timeline={d} reference={d}/{d} cpu-lease={d} pending={d}/{d} replacement={d}\n",
+            .{ @tagName(current.state), @tagName(current.reason), current.owner, current.generation, current.adapter_id,
+               bridge.generation, bridge.timeline, bridge.reference.id, bridge.driver_reference.id, bridge.cpu_lease.id,
+               @intFromBool(bridge.pending != null), @intFromBool(bridge.image_pending != null), @intFromBool(replacement != null) }) catch unreachable;
+        @import("../kernel/log.zig").serialWriteRaw(snapshot);
+        @import("../kernel/bootlog.zig").puts(snapshot);
+    }
+    return result;
+}
 var reset_record: ?ResetRecord = null;
 
 fn binding(value: abi.GfxBackendBinding) queue.model.Binding {
@@ -268,7 +299,7 @@ fn commit(_: usize, generation: u64, saved: *const display.BootSnapshot) display
         break :blk true;
     };
     const released = endCpu(0, false, null);
-    if (!copied or !released) return .old_preserved;
+    if (!copied or released != .complete) return .old_preserved;
     if (!driver.enterOwnerBounded(@intCast(bridge.driver_owner.id), @max(timer.frequency(), 1))) return .old_preserved;
     defer _ = driver.leaveOwner();
     const callback: Callback = @ptrFromInt(bridge.registration.commit_callback);
@@ -391,34 +422,70 @@ pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model
     bridge.image_direct = request.operation == .direct_present;
     return accepted;
 }
-fn endCpu(_: usize, changed: bool, damage: ?display.Rect) bool {
-    if (!execution.enter(0)) return false;
+fn cpuFailure(comptime stage: []const u8, reason: []const u8) display.CpuWriteResult {
+    var text: [320]u8 = undefined;
+    const message = if (execution.ownedByCurrent())
+        std.fmt.bufPrint(&text, "[GFX-CPU] stage={s} reason={s} owner={d} generation={d} timeline={d} lease={d} pending={d} image-pending={d}\n",
+            .{ stage, reason, bridge.driver_owner.id, bridge.generation, bridge.timeline, bridge.cpu_lease.id,
+               @intFromBool(bridge.pending != null), @intFromBool(bridge.image_pending != null) }) catch unreachable
+    else
+        std.fmt.bufPrint(&text, "[GFX-CPU] stage={s} reason={s} bridge-snapshot=not-owned\n", .{stage, reason}) catch unreachable;
+    @import("../kernel/log.zig").serialWriteRaw(message);
+    @import("../kernel/bootlog.zig").puts(message);
+    return .failed;
+}
+fn endCpu(_: usize, changed: bool, damage: ?display.Rect) display.CpuWriteResult {
+    if (!execution.enter(0)) return cpuFailure("finish-entry", "Busy");
     defer _ = execution.leave();
-    if (bridge.cpu_lease.id == 0) return false;
+    if (bridge.cpu_lease.id == 0) return cpuFailure("finish-lease", "Missing");
     buffers.lock();
-    buffers.unmapCpuLocked(bridge.cpu_lease, owner) catch { buffers.unlock(); return false; };
+    buffers.unmapCpuLocked(bridge.cpu_lease, owner) catch |err| { buffers.unlock(); return cpuFailure("finish-unmap", @errorName(err)); };
     bridge.cpu_lease = .{};
     buffers.unlock();
-    if (!changed) return true;
-    if (outputs.nativePaused(@intCast(bridge.driver_owner.id), bridge.registration.output)) return true;
-    const rect = damage orelse display.Rect{ .w = @intCast(bridge.frame.width), .h = @intCast(bridge.frame.height) };
-    if (rect.w == 0 or rect.h == 0 or rect.x >= bridge.frame.width or rect.y >= bridge.frame.height or
-        rect.w > bridge.frame.width - rect.x or rect.h > bridge.frame.height - rect.y) return false;
+    if (!changed) return .complete;
+    const full = display.Rect{ .w = @intCast(bridge.frame.width), .h = @intCast(bridge.frame.height) };
+    const requested = damage orelse full;
+    if (requested.w == 0 or requested.h == 0 or requested.x >= bridge.frame.width or requested.y >= bridge.frame.height or
+        requested.w > bridge.frame.width - requested.x or requested.h > bridge.frame.height - requested.y) return cpuFailure("finish-damage", "Invalid");
+    // The CPU shadow already changed, even when no queue slot is available.
+    // Keep that debt until a completed full upload also carries older damage.
+    const rect = if (bridge.cpu_refresh_required) full else requested;
+    bridge.cpu_refresh_required = true;
+    if (outputs.nativePaused(@intCast(bridge.driver_owner.id), bridge.registration.output)) return .complete;
     const offset = @as(u64, rect.y) * bridge.frame.pitch + @as(u64, rect.x) * 4;
     const span = @as(u64, rect.h - 1) * bridge.frame.pitch + @as(u64, rect.w) * 4;
-    const now = monotonic.nowNanoseconds() orelse return false;
+    const now = monotonic.nowNanoseconds() orelse return cpuFailure("finish-clock", "Unavailable");
     const accepted = queue.submit(owner, bridge.timeline, .{ .deadline_ns = now +| 3_000_000_000 },
-        .{ .operation = .upload, .source = bridge.reference, .source_offset = offset, .bytes = span }) catch return false;
+        .{ .operation = .upload, .source = bridge.reference, .source_offset = offset, .bytes = span }) catch |err| {
+        // No fence or device operation exists on these admission failures.
+        // The caller keeps its failed-present damage; do not reset the GPU.
+        if (err == error.Busy or err == error.Capacity) {
+            if (!bridge.cpu_retry_reported) {
+                bridge.cpu_retry_reported = true;
+                _ = cpuFailure("retry-submit", @errorName(err));
+            }
+            return .retry;
+        }
+        return cpuFailure("finish-submit", @errorName(err));
+    };
     bridge.pending = accepted.fence;
-    const complete = queue.wait(accepted.fence, @as(u64, @max(timer.frequency(), 1)) * 4, .resources_released) catch return false;
-    queue.drop(owner, accepted.fence) catch return false;
+    const complete = queue.wait(accepted.fence, @as(u64, @max(timer.frequency(), 1)) * 4, .resources_released) catch |err| return cpuFailure("finish-wait", @errorName(err));
+    queue.drop(owner, accepted.fence) catch |err| return cpuFailure("finish-drop", @errorName(err));
     bridge.pending = null;
     const succeeded = complete.result == .complete and !complete.device_active and !complete.resources_held;
-    if (succeeded) bridge.last_present = accepted.fence;
+    if (succeeded) {
+        bridge.last_present = accepted.fence;
+        bridge.cpu_refresh_required = false;
+        bridge.cpu_retry_reported = false;
+    }
     // A driver may drain a queued upload when its connector disappears.
     // CPU painting is still valid; no visible/Present fence is invented and
     // the driver must refresh the retained image before reconnecting it.
-    return succeeded or (complete.result == .cancelled and !complete.device_active and !complete.resources_held);
+    if (succeeded or (complete.result == .cancelled and !complete.device_active and !complete.resources_held)) return .complete;
+    var detail: [192]u8 = undefined;
+    const reason = std.fmt.bufPrint(&detail, "result={s} device-active={d} resources-held={d} fence={d}:{d}",
+        .{@tagName(complete.result), @intFromBool(complete.device_active), @intFromBool(complete.resources_held), accepted.fence.timeline, accepted.fence.point}) catch unreachable;
+    return cpuFailure("finish-result", reason);
 }
 fn discard() bool {
     if (replacement != null or !imageIdle()) return false;
@@ -707,14 +774,15 @@ pub fn deviceReset(identity: buffers.Owner, input: *const abi.GfxBackendBinding,
         generation != (if (quiesced == 0) reset.original_generation else reset.generation)) return abi.gfx_output_error_stale;
     if (quiesced == 1 and !reset.retired) {
         if (input.device_generation != 0) queue.unregisterNative(@intCast(identity.id), binding(input.*), true) catch |err| {
-            if (err != error.Stale) return code(err);
+            if (err != error.Stale) return resetResult(reset, .queue, code(err));
         };
-        @import("mode_work.zig").retireAfterReset(identity, input.*) catch |err| return code(err);
-        @import("cursor_work.zig").retireAfterReset(identity, input.*) catch |err| return @import("cursor_work.zig").code(err);
-        @import("output_runtime.zig").retireAfterReset(identity, input.*) catch |err| return code(err);
-        display.retireDeviceReset(identity.id, reset.generation) catch |err| return code(err);
-        if (!discard()) return abi.gfx_output_error_busy;
+        @import("mode_work.zig").retireAfterReset(identity, input.*, reset.generation) catch |err| return resetResult(reset, .mode, code(err));
+        @import("cursor_work.zig").retireAfterReset(identity, input.*) catch |err| return resetResult(reset, .cursor, @import("cursor_work.zig").code(err));
+        @import("output_runtime.zig").retireAfterReset(identity, input.*) catch |err| return resetResult(reset, .output, code(err));
+        display.retireDeviceReset(identity.id, reset.generation) catch |err| return resetResult(reset, .display, code(err));
+        if (!discard()) return resetResult(reset, .bridge, abi.gfx_output_error_busy);
         reset.retired = true;
+        _ = resetResult(reset, .retired, abi.gfx_output_ok);
     }
     output.* = .{ .generation = reset.generation, .state = @intFromEnum(display.backendState().state),
         .outcome = abi.gfx_output_outcome_lost, .retained = 1 };

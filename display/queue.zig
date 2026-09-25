@@ -441,11 +441,17 @@ fn retainedLocked(backend: Backend) bool {
 }
 pub fn unregisterNative(id: u32, binding: model.Binding, quiesced: bool) Error!void {
     if (irq.inDispatch()) return error.Unavailable;
+    if (id == 0) return error.WrongOwner;
     const instant = now();
     buffers.lock();
     const backend = backendLocked(binding) catch |err| {
         buffers.unlock();
-        return err;
+        // Lookup uses Unsupported when no adapter is registered. Retirement
+        // instead asks about a concrete, generation-bound prior identity:
+        // an absent backend is Stale, as is a superseded generation. The
+        // display reset owner may retry after the engine owner removed it.
+        // No live backend, job, callback or resource is changed by this path.
+        return if (err == error.Unsupported) error.Stale else err;
     };
     if (id == 0 or backend.owner.id != id) {
         buffers.unlock();

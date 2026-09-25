@@ -500,28 +500,67 @@ pub fn systemHalt() callconv(.c) void {
     interrupts.haltForever();
 }
 
+var reboot_started: bool = false;
+
 pub fn systemReboot() callconv(.c) void {
+    // Exactly one terminal owner also owns the diagnostic snapshots. A
+    // competing request must not dismantle the same drivers a second time.
+    if (@atomicRmw(bool, &reboot_started, .Xchg, true, .acq_rel)) return;
     k.puts("System reboot.\r\n");
     flushRegistryWritebackForShutdown();
     flushPageCacheForShutdown();
+    power.dumpStatus();
+    saveRebootLog("begin");
     // ACPI warm reset does not guarantee that PCI DMA stops. Drain display
     // callbacks before entering the R4D owner, then stop network and graphics
     // drivers while their mappings and firmware memory are still retained.
     const display_drained = @import("../display/display.zig").beginSystemTransition(@max(timer.frequency() / 4, 1));
+    k.puts(if (display_drained) "[RESET] display-drain=OK\r\n" else "[RESET] display-drain=FAILED\r\n");
+    saveRebootLog("display-drained");
     const callbacks_drained = net.beginSystemTransition("reboot");
-    const drivers_stopped = display_drained and callbacks_drained and r4d.shutdownForSystemTransition() and
-        @import("../display/display.zig").systemTransitionQuiesced();
-    if (!display_drained or !callbacks_drained or !drivers_stopped) {
+    k.puts(if (callbacks_drained) "[RESET] network-drain=OK\r\n" else "[RESET] network-drain=FAILED\r\n");
+    saveRebootLog("network-drained");
+    const drivers_stopped = display_drained and callbacks_drained and r4d.shutdownForSystemTransition();
+    const display_released = drivers_stopped and @import("../display/display.zig").systemTransitionQuiesced();
+    k.puts(if (drivers_stopped) "[RESET] driver-shutdown=OK\r\n" else "[RESET] driver-shutdown=FAILED-OR-SKIPPED\r\n");
+    k.puts(if (display_released) "[RESET] display-release=OK\r\n" else "[RESET] display-release=FAILED-OR-SKIPPED\r\n");
+    if (!display_drained or !callbacks_drained or !drivers_stopped or !display_released) {
         // Never cross a warm reset with an unproven callback/DMA handoff. A
         // real poweroff is the only safe fallback because it removes device
         // power instead of exposing retained hardware to the next kernel.
         k.puts("[RESET][ERROR] device handoff unsafe; powering off instead of warm reset\r\n");
+        saveRebootLog("poweroff-device-handoff");
         k.serialFlush();
         power.poweroff();
     }
+    saveRebootLog("warm-reset-ready");
     // 0.56.15: COM1-TX-Ring verlustfrei leeren, bevor die Maschine weg ist.
     k.serialFlush();
     reset.reboot();
+}
+
+// Qualification diagnostic, before IRQ/AP shutdown: storage remains active
+// through the network/display/input transition. The resident snapshot is
+// copied under the bootlog owner and written only after that owner is gone.
+// A missing TEMP directory or write error changes no device-stop decision.
+fn saveRebootLog(stage: []const u8) void {
+    k.puts("[RESET] checkpoint=");
+    k.puts(stage);
+    k.puts(" kernel=");
+    k.puts(@import("../kernel/version.zig").text);
+    k.puts(" ticks=");
+    k.putDec(timer.tickCount());
+    k.puts("\r\n");
+    const bytes = heap.allocBytes(bootlog.capacity()) orelse {
+        k.puts("[RESET] diagnostic allocation failed\r\n");
+        return;
+    };
+    defer _ = heap.free(bytes);
+    const count = bootlog.snapshot(bytes);
+    const written = fileWrite("C:\\TEMP\\REBOOT.LOG", bytes.ptr, @intCast(count));
+    const durable = page_cache.flushAll();
+    if (written != @as(i32, @intCast(count)) or !durable)
+        k.puts("[RESET] diagnostic write/flush failed\r\n");
 }
 
 pub fn systemPoweroff() callconv(.c) void {

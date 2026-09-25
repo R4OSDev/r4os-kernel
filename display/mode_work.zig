@@ -141,15 +141,15 @@ pub fn readColor(driver: buffers.Owner, ticket: u64, sequence: u64) Error!?abi.G
 // The reset owner first stops submissions/receipts and then supplies the
 // exact backend whose DMA is proven idle. Admission serializes this release
 // with each worker slice; neither guard spans the worker's event wait.
-pub fn retireAfterReset(driver: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
+pub fn retireAfterReset(driver: buffers.Owner, backend: abi.GfxBackendBinding, reset_generation: u64) Error!void {
     if (irq.inDispatch()) return error.Invalid;
     if (!admission.enter(0)) return error.Busy;
     defer _ = admission.leave();
     const current = snapshot();
     const matches = current.driver.eql(driver) and std.meta.eql(current.job.backend, backend);
     if (current.status.ticket != 0 and !matches and (!current.available() or !color_image.empty())) return error.Busy;
-    if (!display.beginOutputCommit()) return error.Busy;
-    defer display.endOutputCommit();
+    try display.beginResetRetirement(driver.id, reset_generation, backend.adapter_id);
+    defer display.endResetRetirement();
     try native.retireModeAfterReset(driver, backend);
     if (matches and !current.device_retired) {
         try color_image.release();

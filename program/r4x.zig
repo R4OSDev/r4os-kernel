@@ -12050,6 +12050,10 @@ fn apiThreadHandleJoin(handle: *const ProgramJoinHandle, timeout_ticks: u64, out
 fn joinProgramThread(thread_id: u32, exact: ?ProgramJoinHandle, timeout_ticks: u64, out_exit_code: *i32) i32 {
     if (@intFromPtr(out_exit_code) == 0) return THREAD_ERROR_INVALID;
     out_exit_code.* = 0;
+    const deadline = if (timeout_ticks == sync.WAIT_FOREVER)
+        sync.WAIT_FOREVER
+    else
+        timer.deadlineAfter(timer.tickCount(), timeout_ticks);
     const current_thread = currentProgramThread() orelse return THREAD_ERROR_NO_INSTANCE;
     const current_instance_id = current_thread.instance_id;
     const current_instance_generation = current_thread.instance_generation;
@@ -12091,7 +12095,7 @@ fn joinProgramThread(thread_id: u32, exact: ?ProgramJoinHandle, timeout_ticks: u
         // WaitQueue critical section. Otherwise a worker can exit after the
         // state check above but before enrollment, send its wake to an empty
         // queue, and leave this join blocked forever.
-        const result = queue.waitUnless(timeout_ticks, "thread_join", programThreadJoinStillNeeded, target);
+        const result = queue.waitUnless(timer.remainingUntil(timer.tickCount(), deadline), "thread_join", programThreadJoinStillNeeded, target);
         const end_flags = owner_locks.program_state.acquire();
         if (!containsProgramThreadLocked(target) or
             !target.join_lease_active or
@@ -12112,10 +12116,10 @@ fn joinProgramThread(thread_id: u32, exact: ?ProgramJoinHandle, timeout_ticks: u
             releaseJoinLease(target, current_task_id, current_task_generation);
             return THREAD_ERROR_BUSY;
         }
-        return finishJoinedThread(target, current_task_id, current_task_generation, out_exit_code);
+        return finishJoinedThread(target, current_task_id, current_task_generation, deadline, out_exit_code);
     }
 
-    return finishJoinedThread(target, current_task_id, current_task_generation, out_exit_code);
+    return finishJoinedThread(target, current_task_id, current_task_generation, deadline, out_exit_code);
 }
 
 fn programThreadJoinStillNeeded(raw: *anyopaque) bool {
@@ -12123,52 +12127,65 @@ fn programThreadJoinStillNeeded(raw: *anyopaque) bool {
     return target.used and (target.state == .ready or target.state == .running);
 }
 
-fn finishJoinedThread(target: *ProgramThread, owner_task_id: u32, owner_task_generation: u64, out_exit_code: *i32) i32 {
+fn finishJoinedThread(target: *ProgramThread, owner_task_id: u32, owner_task_generation: u64, deadline: u64, out_exit_code: *i32) i32 {
     const target_id = target.id;
     const cleanup_started = timer.tickCount();
-    const release_token = task_context.enterUnwind();
-    if (!release_token.admitted()) {
-        releaseJoinLease(target, owner_task_id, owner_task_generation);
-        return THREAD_ERROR_BUSY;
-    }
-    const irq_flags = owner_locks.program_state.acquire();
-    if (!containsProgramThreadLocked(target) or
-        !target.join_lease_active or
-        target.join_owner_task_id != owner_task_id or
-        target.join_owner_task_generation != owner_task_generation or
-        target.join_waiter_refs != 0 or
-        target.join_queue.hasWaiters() or
-        target.pin_count != 1 or
-        (target.state != .exited and target.state != .killed))
-    {
-        if (containsProgramThreadLocked(target)) _ = releaseJoinLeaseLocked(target, owner_task_id, owner_task_generation);
+    var retired = false;
+    // A deferred physical retirement does not relinquish the public join.
+    // Retain the exact generation and exclude a competing join/reaper across
+    // yields; a timeout releases only this lease, never the worker resources.
+    defer if (!retired) releaseJoinLease(target, owner_task_id, owner_task_generation);
+    var counted = false;
+    var retries: u64 = 0;
+    while (true) {
+        const release_token = task_context.enterUnwind();
+        if (!release_token.admitted()) return THREAD_ERROR_BUSY;
+        const irq_flags = owner_locks.program_state.acquire();
+        if (!containsProgramThreadLocked(target) or
+            !target.join_lease_active or
+            target.join_owner_task_id != owner_task_id or
+            target.join_owner_task_generation != owner_task_generation or
+            target.join_waiter_refs != 0 or
+            target.join_queue.hasWaiters() or
+            target.pin_count != 1 or
+            (target.state != .exited and target.state != .killed))
+        {
+            owner_locks.program_state.release(irq_flags);
+            _ = task_context.leaveUnwind(release_token);
+            return THREAD_ERROR_BUSY;
+        }
+        const exit_code = target.exit_code;
+        if (!counted) {
+            target.join_count +%= 1;
+            counted = true;
+        }
+        target.retire_pending = true;
+        target.retire_in_progress = true;
+        bumpProgramThreadInventoryEpochLocked();
         owner_locks.program_state.release(irq_flags);
-        _ = task_context.leaveUnwind(release_token);
-        return THREAD_ERROR_BUSY;
+        if (completeProgramThreadRetire(target, release_token, false, true)) {
+            retired = true; // target is now freed; do not touch its lease.
+            out_exit_code.* = exit_code;
+            const cleanup_finished = timer.tickCount();
+            const cleanup_ticks = if (cleanup_finished >= cleanup_started) cleanup_finished - cleanup_started else 0;
+            if (retries != 0 or cleanup_ticks >= 25) {
+                k.puts("[R4XTHREAD] join cleanup complete thread=");
+                k.putDec(target_id);
+                k.puts(" retries=");
+                k.putDec(retries);
+                k.puts(" ticks=");
+                k.putDec(cleanup_ticks);
+                k.puts("\r\n");
+            }
+            return THREAD_OK;
+        }
+        // completeProgramThreadRetire dropped its unwind guard and internal
+        // claim, but retained our join lease. Completion gets one attempt
+        // even at the deadline; remaining work consumes the original budget.
+        if (timer.remainingUntil(timer.tickCount(), deadline) == 0) return THREAD_ERROR_TIMEOUT;
+        retries +|= 1;
+        scheduler.yield();
     }
-    const exit_code = target.exit_code;
-    target.join_count +%= 1;
-    target.retire_pending = true;
-    target.retire_in_progress = true;
-    bumpProgramThreadInventoryEpochLocked();
-    owner_locks.program_state.release(irq_flags);
-    if (!completeProgramThreadRetire(target, release_token, false)) {
-        k.puts("[R4XTHREAD] join cleanup deferred thread=");
-        k.putDec(target_id);
-        k.puts("\r\n");
-        return THREAD_ERROR_BUSY;
-    }
-    out_exit_code.* = exit_code;
-    const cleanup_finished = timer.tickCount();
-    const cleanup_ticks = if (cleanup_finished >= cleanup_started) cleanup_finished - cleanup_started else 0;
-    if (cleanup_ticks >= 25) {
-        k.puts("[R4XTHREAD] slow join cleanup thread=");
-        k.putDec(target_id);
-        k.puts(" ticks=");
-        k.putDec(cleanup_ticks);
-        k.puts("\r\n");
-    }
-    return THREAD_OK;
 }
 
 fn apiThreadCurrent() callconv(.c) u32 {
@@ -12523,7 +12540,7 @@ fn releaseThreadsForHandleReporting(handle: ProgramProcessHandle, report_boot_fo
             },
             .claimed => |claim| {
                 reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Thread freigeben");
-                if (!completeProgramThreadRetire(claim.thread_ctx, claim.release_token, report_boot_foreground)) return false;
+                if (!completeProgramThreadRetire(claim.thread_ctx, claim.release_token, report_boot_foreground, false)) return false;
             },
         }
     }
@@ -12618,13 +12635,15 @@ fn claimProgramThreadRetireForHandle(handle: ProgramProcessHandle) ProgramThread
     return if (pending_reason) |reason| .{ .pending = reason } else .done;
 }
 
-fn clearProgramThreadRetireClaim(thread_ctx: *ProgramThread) void {
+fn clearProgramThreadRetireClaim(thread_ctx: *ProgramThread, keep_join_lease: bool) void {
     const irq_flags = owner_locks.program_state.acquire();
     defer owner_locks.program_state.release(irq_flags);
     if (!containsProgramThreadLocked(thread_ctx) or !thread_ctx.retire_in_progress) return;
     thread_ctx.retire_in_progress = false;
     if (!thread_ctx.retire_for_instance) thread_ctx.retire_pending = false;
-    if (thread_ctx.join_lease_active) {
+    if (keep_join_lease) {
+        std.debug.assert(thread_ctx.join_lease_active);
+    } else if (thread_ctx.join_lease_active) {
         _ = releaseJoinLeaseLocked(thread_ctx, thread_ctx.join_owner_task_id, thread_ctx.join_owner_task_generation);
     } else if (thread_ctx.pin_count != 0) {
         thread_ctx.pin_count -= 1;
@@ -12635,6 +12654,7 @@ fn completeProgramThreadRetire(
     thread_ctx: *ProgramThread,
     release_token: task_context.UnwindToken,
     report_boot_foreground: bool,
+    keep_join_lease: bool,
 ) bool {
     defer _ = task_context.leaveUnwind(release_token);
     const owner_task_id = thread_ctx.task_id;
@@ -12645,13 +12665,20 @@ fn completeProgramThreadRetire(
         .generation = thread_ctx.instance_generation,
     };
     if (!thread_ctx.task_detached) {
+        // markProgramThreadDone wakes joiners before the returning worker's
+        // kernel epilogue and scheduler Task retirement finish. A join must
+        // let those existing owners finish, rather than hard-kill that tail.
+        if (keep_join_lease and naturalExitEpilogueOwnsTask(thread_ctx)) {
+            clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
+            return false;
+        }
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Task freigeben");
         const current_task = scheduler.current();
         const current_task_id = if (current_task) |value| value.id else 0;
         const current_task_generation = if (current_task) |value| value.generation else 0;
         if (!releaseProgramTaskGeneration(owner_task_id, owner_task_generation, current_task_id, current_task_generation)) {
             reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Task wartet");
-            clearProgramThreadRetireClaim(thread_ctx);
+            clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
             return false;
         }
         thread_ctx.task_detached = true;
@@ -12672,7 +12699,7 @@ fn completeProgramThreadRetire(
         owner_task_generation,
     )) {
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O wartet");
-        clearProgramThreadRetireClaim(thread_ctx);
+        clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
         return false;
     }
     reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O entfernen");
@@ -12682,7 +12709,7 @@ fn completeProgramThreadRetire(
         owner_task_generation,
     )) {
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: I/O-Abbau wartet");
-        clearProgramThreadRetireClaim(thread_ctx);
+        clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
         return false;
     }
     reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Streams loesen");
@@ -12693,11 +12720,11 @@ fn completeProgramThreadRetire(
         owner_task_generation,
     )) {
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Streams warten");
-        clearProgramThreadRetireClaim(thread_ctx);
+        clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
         return false;
     }
     if (!@import("../storage/operations.zig").releaseOwner(thread_ctx.instance_id, thread_ctx.instance_generation, owner_task_id, owner_task_generation)) {
-        clearProgramThreadRetireClaim(thread_ctx);
+        clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
         return false;
     }
     if (thread_ctx.task_id != 0 or thread_ctx.task_generation != 0) {
@@ -12709,7 +12736,7 @@ fn completeProgramThreadRetire(
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Stack freigeben");
         if (thread_ctx.stack.range_id != 0 and !freeProgramStack(&thread_ctx.stack)) {
             reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Stack wartet");
-            clearProgramThreadRetireClaim(thread_ctx);
+            clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
             return false;
         }
         thread_ctx.stack_released = true;
@@ -12718,7 +12745,7 @@ fn completeProgramThreadRetire(
     unpinProgramThreadExecution(thread_ctx);
     if (thread_ctx.execution_pinned) {
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Pin wartet");
-        clearProgramThreadRetireClaim(thread_ctx);
+        clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
         return false;
     }
 
@@ -12734,7 +12761,7 @@ fn completeProgramThreadRetire(
     {
         owner_locks.program_state.release(irq_flags);
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Thread wartet");
-        clearProgramThreadRetireClaim(thread_ctx);
+        clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
         return false;
     }
     thread_ctx.flags |= THREAD_FLAG_JOINED;
@@ -12752,7 +12779,9 @@ fn completeProgramThreadRetire(
     linkProgramThreadLocked(thread_ctx);
     thread_ctx.retire_in_progress = false;
     if (!thread_ctx.retire_for_instance) thread_ctx.retire_pending = false;
-    if (thread_ctx.join_lease_active) {
+    if (keep_join_lease) {
+        std.debug.assert(thread_ctx.join_lease_active);
+    } else if (thread_ctx.join_lease_active) {
         _ = releaseJoinLeaseLocked(thread_ctx, thread_ctx.join_owner_task_id, thread_ctx.join_owner_task_generation);
     } else if (thread_ctx.pin_count != 0) {
         thread_ctx.pin_count -= 1;

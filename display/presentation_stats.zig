@@ -76,20 +76,29 @@ pub const Owner = struct {
         if (driver != self.driver or generation != self.driver_generation or !self.current(state) or
             input.display_generation != self.display_generation or !std.meta.eql(input.backend, self.backend)) return error.Stale;
         if (input.version != 1 or input.size < @sizeOf(a.DisplayPresentationStats) or input.sequence == 0 or
-            input.flags & a.display_presentation_flag_available == 0 or input.flags & ~@as(u32, 7) != 0 or input.pending & ~@as(u32, 15) != 0 or
+            input.flags & a.display_presentation_flag_available == 0 or input.flags & ~@as(u32, 15) != 0 or input.pending & ~@as(u32, 15) != 0 or
             input.buffer_count == 0 or input.rendered_count > input.acquired_count or input.visible_count > input.submitted_count or
             input.released_count > input.visible_count or input.visible_count - input.released_count > 1 or
             input.visible_sequence > input.submitted_count or (input.source_timeline == 0) != (input.source_point == 0)) return error.Invalid;
+        const polled = input.flags & a.display_presentation_flag_polled != 0;
+        const direct = input.flags & a.display_presentation_flag_direct != 0;
+        // Polled composition-copy receipts have their own explicit proof kind;
+        // they must never pretend to contain Window/IRQ/GPU notifier evidence.
+        if (polled and (direct or input.render_point != 0 or input.window_point != 0 or input.gpu_timestamp != 0 or
+            input.irq_sequence != 0 or input.irq_observed_ns != 0)) return error.Invalid;
         if (input.visible_count == 0) {
             if (input.visible_sequence != 0 or input.source_timeline != 0 or input.source_point != 0 or input.render_point != 0 or input.window_point != 0 or
                 input.submitted_ns != 0 or input.visible_ns != 0 or input.gpu_timestamp != 0 or input.irq_sequence != 0 or
                 input.irq_observed_ns != 0 or input.released_ns != 0) return error.Invalid;
         } else {
-            if (input.visible_sequence == 0 or (input.render_point == 0 and input.flags & a.display_presentation_flag_direct == 0) or
-                (input.flags & a.display_presentation_flag_direct != 0 and input.source_timeline == 0) or input.window_point == 0 or input.submitted_ns == 0 or
-                input.visible_ns < input.submitted_ns or input.irq_sequence == 0 or input.irq_observed_ns < input.submitted_ns or
-                input.irq_observed_ns > input.visible_ns or (input.released_ns != 0 and input.released_ns < input.visible_ns) or
+            if (input.visible_sequence == 0 or input.submitted_ns == 0 or input.visible_ns < input.submitted_ns or
+                (input.released_ns != 0 and input.released_ns < input.visible_ns) or
                 (input.released_ns == 0) != (input.released_count < input.visible_count)) return error.Invalid;
+            if (polled) {
+                if (input.source_timeline == 0) return error.Invalid;
+            } else if ((input.render_point == 0 and !direct) or (direct and input.source_timeline == 0) or
+                input.window_point == 0 or input.irq_sequence == 0 or input.irq_observed_ns < input.submitted_ns or
+                input.irq_observed_ns > input.visible_ns) return error.Invalid;
         }
         var free: ?usize = null;
         for (&self.heads, 0..) |*slot, index| {

@@ -118,4 +118,26 @@ pub fn check() !void {
     try history.publish(92, 17, receipt, active);
     source.point = 35; source.reset_generation = binding.reset_generation;
     try t.expectEqualDeep(receipt, try history.feedback(3, source, active));
+    // Explicit polled scanout proof has no IRQ/GPU/Window notifier values.
+    // The source fence and actual address/frame proof belong to the driver;
+    // kernel metadata admission still rejects mixed or missing identities.
+    var polled: stats.Owner = .{};
+    try polled.bind(92, 17, binding, active.generation);
+    receipt.flags = a.display_presentation_flag_available | a.display_presentation_flag_polled;
+    receipt.render_point = 0; receipt.window_point = 0; receipt.gpu_timestamp = 0;
+    receipt.irq_sequence = 0; receipt.irq_observed_ns = 0;
+    try polled.publish(92, 17, receipt, active);
+    try t.expectEqualDeep(receipt, try polled.feedback(3, source, active));
+    inline for (.{ "render_point", "window_point", "gpu_timestamp", "irq_sequence", "irq_observed_ns" }) |field| {
+        var bad = receipt; bad.sequence += 1; @field(bad, field) = 1;
+        try t.expectError(error.Invalid, polled.publish(92, 17, bad, active));
+    }
+    var bad = receipt; bad.sequence += 1; bad.source_timeline = 0; bad.source_point = 0;
+    try t.expectError(error.Invalid, polled.publish(92, 17, bad, active));
+    bad = receipt; bad.sequence += 1; bad.flags |= a.display_presentation_flag_direct;
+    try t.expectError(error.Invalid, polled.publish(92, 17, bad, active));
+    bad = receipt; bad.sequence += 1; bad.flags &= ~a.display_presentation_flag_polled;
+    try t.expectError(error.Invalid, polled.publish(92, 17, bad, active));
+    source.reset_generation += 1;
+    try t.expectError(error.Stale, polled.feedback(3, source, active));
 }

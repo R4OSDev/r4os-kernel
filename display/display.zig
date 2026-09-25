@@ -261,6 +261,9 @@ pub const BootSnapshot = struct {
 };
 
 pub const CommitResult = enum { confirmed, old_preserved, output_lost };
+// A retry rejects this presentation without declaring hardware lost. The
+// native owner retains any dirty shadow pixels for the next full refresh.
+pub const CpuWriteResult = enum { complete, retry, failed };
 pub const NativeBackend = struct {
     // adapter_id is the existing PCI inventory identity, never a second index.
     owner: usize,
@@ -271,9 +274,9 @@ pub const NativeBackend = struct {
     // True confirms hardware quiescence AND restoration of the saved scanout.
     restore: *const fn (usize, u64, *const BootSnapshot) bool,
     // Optional resident CPU shadow ownership. End completes its upload before
-    // normal presentation succeeds; false triggers the same proven recovery.
+    // normal presentation succeeds; only failed requires proven recovery.
     begin_cpu: ?*const fn (usize) bool = null,
-    end_cpu: ?*const fn (usize, bool, ?Rect) bool = null,
+    end_cpu: ?*const fn (usize, bool, ?Rect) CpuWriteResult = null,
 };
 
 pub const TransitionError = backend_state.Error || error{ Unavailable, RestoreFailed };
@@ -375,7 +378,7 @@ pub fn bootSnapshot() ?BootSnapshot {
 }
 
 const CpuWrite = struct {
-    callback: ?*const fn (usize, bool, ?Rect) bool = null,
+    callback: ?*const fn (usize, bool, ?Rect) CpuWriteResult = null,
     context: usize = 0,
     active: bool = true,
     damage: ?Rect = null,
@@ -383,7 +386,11 @@ const CpuWrite = struct {
         if (!self.active) return true;
         self.active = false;
         const callback = self.callback orelse return true;
-        if (callback(self.context, changed, self.damage)) return true;
+        switch (callback(self.context, changed, self.damage)) {
+            .complete => return true,
+            .retry => return false,
+            .failed => {},
+        }
         if (native_backend) |backend| restoreBootLocked(backend.owner, backend_manager.value.generation) catch {};
         return false;
     }
@@ -568,7 +575,9 @@ pub fn restoreBootBackend(owner: usize, generation: u64) TransitionError!void {
 // Logical loss only. The R4D retains all GPU memory until its independent
 // stop proof, while both native and firmware CPU writers remain excluded.
 pub fn beginDeviceReset(owner: usize, generation: u64, adapter: u32) TransitionError!u64 {
-    if (!beginOutputCommit()) return error.Busy;
+    // Invalidating an existing owner is teardown. A terminal transition
+    // blocks new output, but must still let that owner's R4D stop and drain.
+    if (!execution.tryEnter()) return error.Busy;
     defer execution.leave();
     const current = backend_manager.value;
     if (adapter == 0 or adapter != (if (current.state == .preparing) current.pending_adapter_id else current.adapter_id)) return error.Stale;
@@ -581,10 +590,24 @@ pub fn beginDeviceReset(owner: usize, generation: u64, adapter: u32) TransitionE
     return next;
 }
 
+// Serialize retirement of common consumers under the exact reset identity.
+// This removes existing ownership and remains legal after terminal admission
+// has closed. It must not reopen presentation or release the boot hold.
+pub fn beginResetRetirement(owner: usize, generation: u64, adapter: u32) TransitionError!void {
+    if (!execution.tryEnter()) return error.Busy;
+    errdefer execution.leave();
+    try backend_manager.checkActive(owner, generation);
+    if (adapter == 0 or backend_manager.value.adapter_id != adapter) return error.Stale;
+    if (backend_manager.value.state != .recovering) return error.Busy;
+}
+pub fn endResetRetirement() void { execution.leave(); }
+
 // Called after common mode/cursor/queue consumers have retired under the
 // exact reset proof. The immutable boot hold is deliberately retained.
 pub fn retireDeviceReset(owner: usize, generation: u64) TransitionError!void {
-    if (!beginOutputCommit()) return error.Busy;
+    // Retirement removes output and keeps the immutable boot hold. It must
+    // remain available after presentation admission is closed for reboot.
+    if (!execution.tryEnter()) return error.Busy;
     defer execution.leave();
     try backend_manager.checkActive(owner, generation);
     if (backend_manager.value.state != .recovering) return error.Busy;
@@ -1164,6 +1187,7 @@ test "display takeover excludes firmware writers and retains uncertain hardware 
         commits: u32 = 0,
         cpu_active: bool = false,
         cpu_ok: bool = true,
+        cpu_retry: bool = false,
         cpu_frames: u32 = 0,
         fn beginCpu(raw: usize) bool {
             const self: *@This() = @ptrFromInt(raw);
@@ -1171,13 +1195,13 @@ test "display takeover excludes firmware writers and retains uncertain hardware 
             self.cpu_active = true;
             return true;
         }
-        fn endCpu(raw: usize, changed: bool, damage: ?Rect) bool {
+        fn endCpu(raw: usize, changed: bool, damage: ?Rect) CpuWriteResult {
             const self: *@This() = @ptrFromInt(raw);
             t.expect(self.cpu_active) catch unreachable;
             self.cpu_active = false;
             if (changed) self.cpu_frames += 1;
             if (changed and self.cpu_frames == 1) t.expectEqualDeep(Rect{ .x = 2, .y = 2, .w = 2, .h = 2 }, damage.?) catch unreachable;
-            return self.cpu_ok;
+            return if (self.cpu_retry) .retry else if (self.cpu_ok) .complete else .failed;
         }
         fn commit(raw: usize, _: u64, snapshot: *const BootSnapshot) CommitResult {
             const self: *@This() = @ptrFromInt(raw);
@@ -1288,9 +1312,18 @@ test "display takeover excludes firmware writers and retains uncertain hardware 
     try t.expect(stats().mode.width == 8 and @import("std").mem.eql(u32, &before, &boot_pixels));
     try t.expect(@import("surface_pipeline.zig").width() == 8 and @import("surface_pipeline.zig").height() == 8);
     try t.expect(@import("surface_pipeline.zig").pixelBounds().width == 8);
+    const live_generation = backendState().generation;
+    const live_reset = backendState().reset_generation;
+    probe.cpu_retry = true;
+    try t.expect(!fill(0x998877));
+    try t.expect(!probe.cpu_active and backendState().state == .software_native);
+    try t.expect(backendState().generation == live_generation and backendState().reset_generation == live_reset);
+    try t.expect(retainsDriverOwner(92) and firmware_access.gate.isRevoked());
+    probe.cpu_retry = false;
+    try t.expect(fill(0x998877));
     probe.cpu_ok = false;
     try t.expect(!fill(0x112233)); // Failed upload triggers the same recovery.
-    try t.expect(!probe.cpu_active and probe.cpu_frames == 2);
+    try t.expect(!probe.cpu_active and probe.cpu_frames == 4);
     try t.expectEqual(@as(u64, 2), backendState().reset_generation);
     try t.expect(!fill(0xAAAAAA));
     try t.expectEqual(@as(u32, 0), presentCapabilities().flags);
@@ -1364,7 +1397,7 @@ fn exerciseHeldNative(template: NativeBackend) !void {
     candidate.end_cpu = null;
     var holder = BootHolder{ .owner = 91, .adapter_id = candidate.adapter_id, .expected_generation = backendState().generation,
         .context = @intFromPtr(&probe), .capture = Probe.capture, .restore = Probe.oldRestore,
-        .release = Probe.release, .release_adopted = Probe.releaseAdopted };
+        .release = Probe.release, .release_adopted = Probe.releaseAdopted, .restore_adopted = Probe.restore };
     try t.expectError(error.Stale, prepareHeldNative(candidate, 0));
     try t.expectError(error.Stale, prepareHeldNative(candidate, holder.expected_generation));
     const held = try holdBoot(holder);
@@ -1459,8 +1492,36 @@ fn exerciseHeldNative(template: NativeBackend) !void {
         try t.expect(held_boot != null and retainsDriverOwner(91));
         if (result == .output_lost) try t.expectEqual(backend_state.State.unavailable, backendState().state);
         if (result == .confirmed) {
+            try t.expectError(error.Busy, beginResetRetirement(91, next.generation, candidate.adapter_id));
             try t.expect(beginSystemTransition(0));
             try t.expect(!systemTransitionQuiesced());
+            // A live R4D must still invalidate and retire its exact native
+            // generation after terminal admission has stopped presentation.
+            // These are teardown receipts, never new-output admissions.
+            try t.expectError(error.Stale, beginDeviceReset(92, next.generation, candidate.adapter_id));
+            try t.expectError(error.Stale, beginDeviceReset(91, next.generation - 1, candidate.adapter_id));
+            try t.expectError(error.Stale, beginDeviceReset(91, next.generation, candidate.adapter_id + 1));
+            const terminal_reset = try beginDeviceReset(91, next.generation, candidate.adapter_id);
+            try t.expect(terminal_reset > next.generation and held_boot.?.generation == next.generation);
+            try t.expect(!systemTransitionQuiesced() and !beginOutputCommit() and !fill(0xFFFFFF));
+            try t.expectError(error.Stale, beginResetRetirement(92, terminal_reset, candidate.adapter_id));
+            try t.expectError(error.Stale, beginResetRetirement(91, next.generation, candidate.adapter_id));
+            try t.expectError(error.Stale, beginResetRetirement(91, terminal_reset, candidate.adapter_id + 1));
+            try t.expectError(error.Stale, beginResetRetirement(91, terminal_reset, 0));
+            try beginResetRetirement(91, terminal_reset, candidate.adapter_id);
+            try t.expect(native_backend != null and held_boot != null and retainsDriverOwner(91));
+            try t.expect(!systemTransitionQuiesced() and firmware_access.gate.isRevoked() and !beginOutputCommit());
+            endResetRetirement();
+            try t.expectError(error.Stale, retireDeviceReset(92, terminal_reset));
+            try t.expectError(error.Stale, retireDeviceReset(91, next.generation));
+            try retireDeviceReset(91, terminal_reset);
+            try t.expect(native_backend == null and held_boot != null and retainsDriverOwner(91));
+            try t.expect(!systemTransitionQuiesced() and firmware_access.gate.isRevoked());
+            try t.expectError(error.Busy, prepareRecoveredNative(candidate, next.generation, terminal_reset));
+            probe.restore_ok = false;
+            try t.expectError(error.RestoreFailed, restoreBootBackend(91, terminal_reset));
+            try t.expect(!systemTransitionQuiesced() and retainsDriverOwner(91) and !fill(0xFFFFFF));
+            probe.restore_ok = true;
         }
         try restoreBootBackend(91, backendState().generation);
         try t.expect(held_boot == null and !retainsDriverOwner(91));
