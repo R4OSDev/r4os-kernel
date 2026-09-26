@@ -1166,8 +1166,9 @@ fn recordRuntimeWarnings(now: u64) void {
     if ((now & 0xF) != 0) return;
     // 0.56.13 (Befund 4.4): Starvation-Scan nur mit Metrics (-Dmetrics).
     if (comptime !config.enable_metrics) return;
-    var cursor = task.firstReady(percpu.currentIndex());
-    while (cursor) |candidate| : (cursor = task.nextReady(candidate)) {
+    const samples = @min(task.readyCountForCpu(percpu.currentIndex()), 8);
+    for (0..samples) |_| {
+        const candidate = task.nextReadyWarning(percpu.currentIndex()) orelse break;
         warning_candidate_visit_count +%= 1;
         const base_tick = if (candidate.ready_since_tick != 0)
             candidate.ready_since_tick
@@ -1267,15 +1268,11 @@ fn nextReadyTask(force_priority: bool) ?*task.Task {
     }
 
     var best: ?*task.Task = null;
-    var best_rank: u8 = task.no_dispatch_rank;
-    var cursor = task.firstReady(percpu.currentIndex());
-    while (cursor) |candidate| : (cursor = task.nextReady(candidate)) {
+    for (0..task.role_count) |rank| {
         ready_candidate_visit_count +%= 1;
-        const rank = task.dispatchRank(candidate);
-        if (rank < best_rank) {
-            best_rank = rank;
+        if (task.firstReadyAtRank(percpu.currentIndex(), rank)) |candidate| {
             best = candidate;
-            if (rank == 0) break;
+            break;
         }
     }
     if (best) |selected| {

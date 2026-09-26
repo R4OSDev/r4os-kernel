@@ -86,8 +86,9 @@ pub const LockSummary = struct {
 var global_lock_summary: LockSummary = .{};
 
 pub fn lockSummary() LockSummary {
+    const irq_flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(irq_flags);
     var out = global_lock_summary;
-    out.held_slots_used = countHeldSlots();
     if (scheduler.current()) |current_task| {
         out.current_depth = heldDepthFor(current_task);
     }
@@ -1024,6 +1025,7 @@ fn recordLockAcquire(owner_task: *task.Task, object_id: u64, name: []const u8, r
         .mode_no_sleep = mode == .no_sleep,
         .active = true,
     };
+    global_lock_summary.held_slots_used +|= 1;
     const depth = heldDepthFor(owner_task);
     if (depth > global_lock_summary.max_depth) global_lock_summary.max_depth = depth;
 }
@@ -1033,6 +1035,7 @@ fn recordLockRelease(owner_task: *task.Task, object_id: u64) void {
     while (i < owner_task.held_locks.len) : (i += 1) {
         if (owner_task.held_locks[i].active and owner_task.held_locks[i].object_id == object_id) {
             owner_task.held_locks[i] = .{};
+            global_lock_summary.held_slots_used -|= 1;
             return;
         }
     }
@@ -1046,24 +1049,6 @@ fn heldDepthFor(owner_task: *const task.Task) u32 {
         if (owner_task.held_locks[i].active) depth += 1;
     }
     return depth;
-}
-
-fn countHeldSlots() u32 {
-    const irq_flags = interrupts.saveAndDisableRuntime();
-    scheduler.preemptDisable();
-    defer {
-        scheduler.preemptEnable();
-        interrupts.restore(irq_flags);
-    }
-    var count: u32 = 0;
-    var cursor = task.first();
-    while (cursor) |candidate| : (cursor = task.next(candidate)) {
-        var held_index: usize = 0;
-        while (held_index < candidate.held_locks.len) : (held_index += 1) {
-            if (candidate.held_locks[held_index].active) count +|= 1;
-        }
-    }
-    return count;
 }
 
 // -----------------------------------------------------------------------------

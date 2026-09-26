@@ -235,6 +235,7 @@ pub fn build(b: *std.Build) void {
         "program/lifecycle_retire_policy.zig",
         "program/r4x_start.zig",
         "sched/initial_stack.zig",
+        "sched/task_index.zig",
         "sched/wait_node.zig",
         "storage/block_dispatch.zig",
         "storage/block_split.zig",

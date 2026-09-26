@@ -10,6 +10,7 @@ const smp_policy = @import("../kernel/smp_policy.zig");
 const initial_stack = @import("initial_stack.zig");
 const task_context = @import("task_context.zig");
 const wait_node = @import("wait_node.zig");
+const task_index = @import("task_index.zig");
 
 // 0.56.15: 32K -> 64K. Der Guard-Wachhund hat unter Gate-FTP-Last einen
 // ECHTEN net-rx-Overflow gefangen (STACK GUARD HIT task=net-rx,
@@ -155,10 +156,14 @@ pub const Task = struct {
     ready_prev: ?*Task = null,
     ready_next: ?*Task = null,
     ready_linked: bool = false,
+    ready_order: u128 = 0,
+    ready_rank: u8 = 0,
+    ready_index: task_index.Links(Task) = .{},
     timeout_prev: ?*Task = null,
     timeout_next: ?*Task = null,
     timeout_linked: bool = false,
-    timeout_sequence: u64 = 0,
+    timeout_sequence: u128 = 0,
+    timeout_index: task_index.Links(Task) = .{},
     reap_prev: ?*Task = null,
     reap_next: ?*Task = null,
     reap_linked: bool = false,
@@ -298,12 +303,25 @@ pub const StackTelemetryStats = struct {
 
 var registry_head: ?*Task = null;
 var registry_tail: ?*Task = null;
+const ReadyIndex = task_index.Index(Task, "ready_index", readyBefore);
+const TimeoutIndex = task_index.Index(Task, "timeout_index", timeoutBefore);
 const ReadyQueue = struct {
     head: ?*Task = null,
     tail: ?*Task = null,
     count: usize = 0,
     dispatch_counts: [role_count]usize = .{0} ** role_count,
+    ranks: [role_count]ReadyIndex = .{ReadyIndex{}} ** role_count,
+    warning_cursor: ?*Task = null,
 };
+
+fn readyBefore(a: *const Task, b: *const Task) bool {
+    return a.ready_order < b.ready_order;
+}
+
+fn timeoutBefore(a: *const Task, b: *const Task) bool {
+    return a.wake_tick < b.wake_tick or
+        (a.wake_tick == b.wake_tick and a.timeout_sequence < b.timeout_sequence);
+}
 
 var ready_queues: [percpu.max_cpus]ReadyQueue = .{ReadyQueue{}} ** percpu.max_cpus;
 var role_activation_counts: [role_count]u64 = .{0} ** role_count;
@@ -315,7 +333,9 @@ var donation_budget_exhaustion_count: u64 = 0;
 var timeout_head: ?*Task = null;
 var timeout_tail: ?*Task = null;
 var timeout_count: usize = 0;
-var next_timeout_sequence: u64 = 1;
+var next_timeout_sequence: u128 = 1;
+var next_ready_order: u128 = 1;
+var timeout_index: TimeoutIndex = .{};
 var reap_head: ?*Task = null;
 var reap_tail: ?*Task = null;
 var reap_count: usize = 0;
@@ -434,6 +454,8 @@ pub fn init() bool {
     timeout_tail = null;
     timeout_count = 0;
     next_timeout_sequence = 1;
+    next_ready_order = 1;
+    timeout_index = .{};
     reap_head = null;
     reap_tail = null;
     reap_count = 0;
@@ -827,9 +849,12 @@ pub fn effectivePriority(t: *const Task) Priority {
     };
 }
 
-fn adjustReadyDispatchCountLocked(t: *const Task, old_rank: u8, new_rank: u8) void {
+fn adjustReadyDispatchCountLocked(t: *Task, old_rank: u8, new_rank: u8) void {
     if (!t.ready_linked or old_rank == new_rank) return;
     const queue = readyQueueForTask(t);
+    queue.ranks[t.ready_rank].remove(t);
+    t.ready_rank = new_rank;
+    _ = queue.ranks[new_rank].insert(t);
     if (old_rank < queue.dispatch_counts.len and queue.dispatch_counts[old_rank] != 0) {
         queue.dispatch_counts[old_rank] -= 1;
     }
@@ -903,11 +928,16 @@ fn consumeRunBudgetsLocked(t: *Task, elapsed: u64) void {
 fn linkReadyLocked(t: *Task) void {
     if (t.ready_linked) return;
     const queue = readyQueueForTask(t);
+    t.ready_order = next_ready_order;
+    next_ready_order += 1;
+    t.ready_rank = dispatchRank(t);
+    _ = queue.ranks[t.ready_rank].insert(t);
     t.ready_prev = queue.tail;
     t.ready_next = null;
     if (queue.tail) |tail| tail.ready_next = t else queue.head = t;
     queue.tail = t;
     t.ready_linked = true;
+    if (queue.warning_cursor == null) queue.warning_cursor = t;
     queue.count += 1;
     queue.dispatch_counts[dispatchRank(t)] += 1;
 }
@@ -915,13 +945,15 @@ fn linkReadyLocked(t: *Task) void {
 fn unlinkReadyLocked(t: *Task) void {
     if (!t.ready_linked) return;
     const queue = readyQueueForTask(t);
+    queue.ranks[t.ready_rank].remove(t);
     if (t.ready_prev) |previous| previous.ready_next = t.ready_next else queue.head = t.ready_next;
     if (t.ready_next) |following| following.ready_prev = t.ready_prev else queue.tail = t.ready_prev;
+    if (queue.warning_cursor == t) queue.warning_cursor = t.ready_next orelse queue.head;
     t.ready_prev = null;
     t.ready_next = null;
     t.ready_linked = false;
     if (queue.count != 0) queue.count -= 1;
-    const index = dispatchRank(t);
+    const index = t.ready_rank;
     if (queue.dispatch_counts[index] != 0) queue.dispatch_counts[index] -= 1;
 }
 
@@ -946,7 +978,7 @@ fn selectHomeCpuLocked(t: *Task) void {
     // per-CPU runqueues and parallel execution. Rebind only after CPU loss.
     if (t.home_cpu_bound and percpu.isSchedulable(t.home_cpu)) return;
     var loads: [percpu.max_cpus]usize = .{0} ** percpu.max_cpus;
-    for (ready_queues, 0..) |queue, index| {
+    for (&ready_queues, 0..) |*queue, index| {
         loads[index] = queue.count + @intFromBool(percpu.workActive(@intCast(index)));
     }
     t.home_cpu = @intCast(smp_policy.leastLoadedCpu(percpu.schedulableMask(), &loads));
@@ -957,17 +989,9 @@ fn linkTimeoutLocked(t: *Task) void {
     if (t.timeout_linked or t.wake_tick == 0) return;
     if (t.timeout_sequence == 0) t.timeout_sequence = allocateTimeoutSequenceLocked();
 
-    var following: ?*Task = null;
-    var previous = timeout_tail;
-    while (previous) |candidate| {
-        if (candidate.wake_tick < t.wake_tick or
-            (candidate.wake_tick == t.wake_tick and candidate.timeout_sequence < t.timeout_sequence))
-        {
-            break;
-        }
-        following = candidate;
-        previous = candidate.timeout_prev;
-    }
+    const neighbors = timeout_index.insert(t);
+    const following = neighbors.following;
+    const previous = neighbors.previous;
     t.timeout_prev = previous;
     t.timeout_next = following;
     if (previous) |before| before.timeout_next = t else timeout_head = t;
@@ -976,23 +1000,17 @@ fn linkTimeoutLocked(t: *Task) void {
     timeout_count += 1;
 }
 
-fn allocateTimeoutSequenceLocked() u64 {
-    if (next_timeout_sequence == 0 or next_timeout_sequence == ~@as(u64, 0)) {
-        var sequence: u64 = 1;
-        var cursor = timeout_head;
-        while (cursor) |candidate| : (cursor = candidate.timeout_next) {
-            candidate.timeout_sequence = sequence;
-            sequence +|= 1;
-        }
-        next_timeout_sequence = sequence;
-    }
+fn allocateTimeoutSequenceLocked() u128 {
+    // Enrollment order is independent of 64-bit tick overflow. Widening the
+    // serial also removes the former whole-list renumbering boundary.
     const sequence = next_timeout_sequence;
-    next_timeout_sequence +|= 1;
+    next_timeout_sequence += 1;
     return sequence;
 }
 
 fn unlinkTimeoutLocked(t: *Task) void {
     if (!t.timeout_linked) return;
+    timeout_index.remove(t);
     if (t.timeout_prev) |previous| previous.timeout_next = t.timeout_next else timeout_head = t.timeout_next;
     if (t.timeout_next) |following| following.timeout_prev = t.timeout_prev else timeout_tail = t.timeout_prev;
     t.timeout_prev = null;
@@ -1728,9 +1746,22 @@ pub fn nextReady(t: *const Task) ?*Task {
     return t.ready_next;
 }
 
+pub fn firstReadyAtRank(cpu_index: u32, rank: usize) ?*Task {
+    return readyQueue(cpu_index).ranks[rank].first;
+}
+
+// The cursor is part of the ready projection: removal moves it before Task
+// storage can retire. No diagnostic pointer survives outside that owner.
+pub fn nextReadyWarning(cpu_index: u32) ?*Task {
+    const queue = readyQueue(cpu_index);
+    const candidate = queue.warning_cursor orelse queue.head orelse return null;
+    queue.warning_cursor = candidate.ready_next orelse queue.head;
+    return candidate;
+}
+
 pub fn readyCount() usize {
     var total: usize = 0;
-    for (ready_queues) |queue| total += queue.count;
+    for (&ready_queues) |*queue| total += queue.count;
     return total;
 }
 
@@ -1839,6 +1870,7 @@ pub fn queueSnapshot() QueueSnapshot {
         previous = null;
         cursor = queue.head;
         var observed_dispatch: [role_count]usize = .{0} ** role_count;
+        var first_dispatch: [role_count]?*Task = .{null} ** role_count;
         var observed_count: usize = 0;
         while (cursor) |candidate| {
             out.ready += 1;
@@ -1853,11 +1885,16 @@ pub fn queueSnapshot() QueueSnapshot {
                 out.valid = false;
             }
             observed_dispatch[dispatchRank(candidate)] += 1;
+            if (first_dispatch[dispatchRank(candidate)] == null) first_dispatch[dispatchRank(candidate)] = candidate;
+            if (candidate.ready_rank != dispatchRank(candidate)) out.valid = false;
             previous = candidate;
             cursor = candidate.ready_next;
         }
         for (observed_dispatch, queue.dispatch_counts, expected_dispatch[queue_index]) |observed, tracked, expected| {
             if (observed != tracked or observed != expected) out.valid = false;
+        }
+        for (&queue.ranks, first_dispatch, observed_dispatch) |*index, first_at_rank, rank_count| {
+            if (index.first != first_at_rank or index.count != rank_count) out.valid = false;
         }
         if (observed_count != queue.count or previous != queue.tail) out.valid = false;
     }
@@ -1883,6 +1920,7 @@ pub fn queueSnapshot() QueueSnapshot {
         cursor = candidate.timeout_next;
     }
     if (out.timed != timeout_count or out.timed != expected_timed or previous != timeout_tail) out.valid = false;
+    if (timeout_index.first != timeout_head or timeout_index.count != timeout_count) out.valid = false;
 
     previous = null;
     cursor = reap_head;
