@@ -6266,6 +6266,7 @@ const R4L_PREEMPTION_TIMEOUT_NS: u64 = 5_000_000_000;
 const R4LPreemptionMode = enum(u8) {
     timer,
     reschedule_ipi,
+    cooperative_kernel,
 };
 
 const R4LPreemptionScenario = struct {
@@ -6283,6 +6284,7 @@ var r4l_preemption_witness_done: u8 = 0;
 var r4l_preemption_witness_abort: u8 = 0;
 var r4l_preemption_witness_failures: u32 = 0;
 var r4l_preemption_witness_cpu: u32 = std.math.maxInt(u32);
+var r4l_cooperative_switches: u64 = 0;
 var program_thread_head: ?*ProgramThread = null;
 var program_thread_tail: ?*ProgramThread = null;
 var program_thread_count: usize = 0;
@@ -10382,7 +10384,7 @@ fn waitForR4lPreemptionWitness(start: monotonic.Stamp, start_tick: u64) bool {
 
 fn r4lPreemptionWitnessMain() callconv(.c) void {
     @atomicStore(u32, &r4l_preemption_witness_cpu, percpu.currentIndex(), .release);
-    @atomicStore(u8, &r4l_preemption_witness_started, 1, .release);
+    if (r4l_preemption_mode != .cooperative_kernel) @atomicStore(u8, &r4l_preemption_witness_started, 1, .release);
 
     const flag = r4l_preemption_flag orelse {
         _ = @atomicRmw(u32, &r4l_preemption_witness_failures, .Add, 1, .acq_rel);
@@ -10402,6 +10404,37 @@ fn r4lPreemptionWitnessMain() callconv(.c) void {
             if (r4l_preemption_event.waitResult(scheduler.WAIT_FOREVER) != .signaled) {
                 _ = @atomicRmw(u32, &r4l_preemption_witness_failures, .Add, 1, .acq_rel);
             }
+        },
+        .cooperative_kernel => {
+            // Run on the same AP and at the same rank as the ordinary R4X.
+            // Its entry flag cannot change until an explicit kernel boundary
+            // lets it run. Keep the private buffer and unwind lease until
+            // the witness returns, including the abort path.
+            const unwind = task_context.enterUnwind();
+            if (unwind.admitted()) {
+                defer _ = task_context.leaveUnwind(unwind);
+                if (heap.allocBytes(64 * 1024)) |buffer| {
+                    defer _ = heap.free(buffer);
+                    var value: u8 = 0;
+                    @atomicStore(u8, &r4l_preemption_witness_started, 1, .release);
+                    while (@atomicLoad(u64, flag, .acquire) != 1 and
+                        @atomicLoad(u8, &r4l_preemption_witness_abort, .acquire) == 0)
+                    {
+                        value +%= 1;
+                        @memset(buffer[0 .. 64 * 1024], value);
+                        if (scheduler.safeReschedulePoint()) r4l_cooperative_switches += 1;
+                        if (buffer[0] != value or buffer[64 * 1024 - 1] != value) {
+                            _ = @atomicRmw(u32, &r4l_preemption_witness_failures, .Add, 1, .acq_rel);
+                            break;
+                        }
+                    }
+                } else {
+                    _ = @atomicRmw(u32, &r4l_preemption_witness_failures, .Add, 1, .acq_rel);
+                }
+            } else {
+                _ = @atomicRmw(u32, &r4l_preemption_witness_failures, .Add, 1, .acq_rel);
+            }
+            @atomicStore(u8, &r4l_preemption_witness_started, 1, .release);
         },
     }
 
@@ -10436,12 +10469,13 @@ fn runR4lPreemptionScenario(
     @atomicStore(u8, &r4l_preemption_witness_abort, 0, .release);
     @atomicStore(u32, &r4l_preemption_witness_failures, 0, .release);
     @atomicStore(u32, &r4l_preemption_witness_cpu, std.math.maxInt(u32), .release);
+    r4l_cooperative_switches = 0;
     @atomicStore(u64, flag, 3, .release);
 
     const witness = task.createParallelWorkerBlockedWithRole(
         "r4l-preempt-witness",
         r4lPreemptionWitnessMain,
-        .input,
+        if (mode == .cooperative_kernel) .interactive else .input,
     ) orelse return .{};
     if (!task.bindBlockedHomeCpu(witness, target_cpu)) {
         _ = releaseCreatedProgramTask(witness);
@@ -10451,7 +10485,7 @@ fn runR4lPreemptionScenario(
     // the remote wake. The timer witness deliberately remains blocked until
     // the R4L loop is active; publishing it without a reschedule request then
     // forces the AP's periodic quantum path to perform the switch.
-    if (mode == .reschedule_ipi) {
+    if (mode != .timer) {
         if (!scheduler.publishCreatedTask(witness)) {
             _ = releaseCreatedProgramTask(witness);
             return .{};
@@ -10500,7 +10534,7 @@ fn runR4lPreemptionScenario(
             abortR4lPreemptionWitness();
         }
         task.markReady(witness, timer.tickCount());
-    } else {
+    } else if (mode == .reschedule_ipi) {
         while (@atomicLoad(u64, flag, .acquire) != 1 and !programCompletionIsReady(handle)) {
             if (r4lPreemptionDeadlineExpired(start, start_tick)) {
                 expired = true;
@@ -10562,6 +10596,7 @@ fn runR4lPreemptionScenario(
     const switch_ok = switch (mode) {
         .timer => timer_switches != 0,
         .reschedule_ipi => ipi_switches != 0,
+        .cooperative_kernel => r4l_cooperative_switches != 0,
     };
     const exit_code = if (completion_ok) completion.exit_code else -1;
     return .{
@@ -10575,13 +10610,13 @@ fn runR4lPreemptionScenario(
     };
 }
 
-// Short Test-profile acceptance: two bounded LSTRX invocations exercise an
-// imported R4L code range on one AP. No subsystem, browser or manual visual
-// workload is involved.
+// Short Test-profile acceptance: bounded LSTRX invocations exercise imported
+// R4L IRQ preemption and an equal-rank kernel continuation on the same AP.
 pub fn runR4lPreemptionAcceptance(target_cpu: u32, usable_bytes: u64) bool {
     initializeRuntime(usable_bytes);
     var timer_result = R4LPreemptionScenario{};
     var ipi_result = R4LPreemptionScenario{};
+    var cooperative_result = R4LPreemptionScenario{};
     var generation: u32 = 0;
 
     if (target_cpu != 0 and target_cpu < percpu.max_cpus and percpu.isSchedulable(target_cpu)) probe: {
@@ -10596,11 +10631,19 @@ pub fn runR4lPreemptionAcceptance(target_cpu: u32, usable_bytes: u64) bool {
         r4l_preemption_flag = @ptrFromInt(flag_info.address);
         timer_result = runR4lPreemptionScenario(file, working_drive, target_cpu, .timer);
         ipi_result = runR4lPreemptionScenario(file, working_drive, target_cpu, .reschedule_ipi);
+        cooperative_result = runR4lPreemptionScenario(file, working_drive, target_cpu, .cooperative_kernel);
         if (r4l_preemption_flag) |flag| @atomicStore(u64, flag, 0, .release);
         r4l_preemption_flag = null;
     }
 
-    const ok = timer_result.ok and ipi_result.ok;
+    const ok = timer_result.ok and ipi_result.ok and cooperative_result.ok;
+    k.puts("[KERNELCOOP] result=");
+    k.puts(if (cooperative_result.ok) "OK" else "FAILED");
+    k.puts(" switches=");
+    k.putDec(r4l_cooperative_switches);
+    k.puts(" exit=");
+    k.putDec(@bitCast(@as(i64, cooperative_result.exit_code)));
+    k.puts("\r\n");
     k.puts("[R4LPREEMPT] result=");
     k.puts(if (ok) "OK" else "FAILED");
     k.puts(" cpu=");

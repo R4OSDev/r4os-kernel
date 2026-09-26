@@ -3,6 +3,7 @@ const task_context = @import("task_context.zig");
 const config = @import("config");
 const fpu = @import("../arch/x86_64/fpu.zig");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
+const owner_locks = @import("../memory/owner_locks.zig");
 const lapic = @import("../arch/x86_64/lapic.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const timer = @import("../kernel/timer.zig");
@@ -804,7 +805,13 @@ pub fn preemptPendingWake(preemptible_instruction_pointer: bool) bool {
 pub fn safeReschedulePoint() bool {
     const state = localState();
     safe_reschedule_point_count +%= 1;
-    if (!state.reschedule_requested or !initialized or !state.initialized or preemption_enabled == 0) return false;
+    if (!initialized or !state.initialized or preemption_enabled == 0) return false;
+    // Inspect outer owners BEFORE acquiring our own runtime token. Even a
+    // mistakenly re-enabled IF must never lend an owner to another task.
+    if (!owner_locks.faultResolutionAllowed()) {
+        safe_reschedule_deferred_owner_count +%= 1;
+        return false;
+    }
 
     const irq_flags = interrupts.saveAndDisableRuntime();
     if (!interrupts.wereEnabled(irq_flags)) {
@@ -816,8 +823,16 @@ pub fn safeReschedulePoint() bool {
         interrupts.restore(irq_flags);
         return false;
     };
-    if (running.state != .running or !task.hasMoreUrgentReady(percpu.currentIndex(), running)) {
+    if (running.state != .running or task.readyCountForCpu(percpu.currentIndex()) == 0) {
         state.reschedule_requested = false;
+        interrupts.restore(irq_flags);
+        return false;
+    }
+    const priority_wakeup = state.reschedule_requested and task.hasMoreUrgentReady(percpu.currentIndex(), running);
+    if (!priority_wakeup) state.reschedule_requested = false;
+    // A kernel RIP defers IRQ preemption, not expiration of the quantum.
+    // Equal-rank work must also progress at these explicitly audited points.
+    if (!priority_wakeup and ticksSince(timer.tickCount(), running.last_scheduled_tick) < preemption_quantum_ticks) {
         interrupts.restore(irq_flags);
         return false;
     }

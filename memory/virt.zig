@@ -11,6 +11,7 @@ const percpu = @import("../arch/x86_64/percpu.zig");
 const k = @import("../kernel/log.zig");
 const sync = @import("../sched/sync.zig");
 const task_context = @import("../sched/task_context.zig");
+const scheduler = @import("../sched/scheduler.zig");
 const r4sys_api = @import("../program/r4sys.zig");
 
 pub const MAX_RANGES: usize = 1024;
@@ -651,6 +652,7 @@ pub fn commit(id: u32, offset: u64, len_raw: u64) Error!void {
         // the range lease, rather than the VM lock, protects its identity.
         if (done < pages) {
             owner_locks.virtual_memory.release(owner_irq_flags);
+            _ = scheduler.safeReschedulePoint();
             owner_irq_flags = owner_locks.virtual_memory.acquire();
         }
     }
@@ -704,6 +706,7 @@ fn drainResidentRollback(range: *Range, token: *owner_locks.Token) Error!void {
         hot_path_stats.resident_rollback_batches +%= 1;
         if (range.partial_uncommit_cursor < end) {
             owner_locks.virtual_memory.release(token.*);
+            _ = scheduler.safeReschedulePoint();
             token.* = owner_locks.virtual_memory.acquire();
         }
     }
