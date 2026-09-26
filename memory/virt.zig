@@ -192,6 +192,10 @@ pub const OwnerStats = struct {
 };
 
 pub const HotPathStats = struct {
+    resident_commit_batches: u64 = 0,
+    resident_commit_max_batch_pages: u64 = 0,
+    resident_commit_unlocked_zero_bytes: u64 = 0,
+    resident_rollback_batches: u64 = 0,
     range_index_capacity: u32 = @intCast(RANGE_ID_INDEX_CAPACITY),
     range_index_entries: u32 = 0,
     range_index_tombstones: u32 = 0,
@@ -421,6 +425,15 @@ const Range = struct {
     // caller can resume over already-unmapped pages without lying about the
     // current committed-byte count or losing the range as a retry anchor.
     pager_io_count: u32 = 0,
+    // A resident commit owns this range across short VM-owner sections.
+    // Its private extent is zeroed through the HHDM before PTE publication.
+    // Failed rollback keeps both the mapped prefix and any private extent
+    // reachable by ID until a later commit/release can finish the cleanup.
+    resident_commit_active: bool = false,
+    resident_commit_failed: bool = false,
+    resident_commit_base: u64 = 0,
+    resident_commit_bytes: u64 = 0,
+    resident_prepared: phys.FrameExtent = .{ .base = 0, .count = 0 },
     partial_uncommit_base: u64 = 0,
     partial_uncommit_len: u64 = 0,
     partial_uncommit_cursor: u64 = 0,
@@ -562,18 +575,22 @@ pub fn reserveAt(req: ReserveAtRequest) Error!u32 {
 }
 
 pub fn commit(id: u32, offset: u64, len_raw: u64) Error!void {
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
+    try finishResidentRollback(id);
+    const outer_owner = !owner_locks.faultResolutionAllowed();
+    var owner_irq_flags = owner_locks.virtual_memory.acquire();
     defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const len = normalizeLen(len_raw) catch |err| return err;
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
     const idx = indexById(id) orelse return Error.NotFound;
     const range = &ranges[idx];
+    if (range.resident_commit_active or range.pager_io_count != 0) return Error.Busy;
+    if (range.partial_uncommit_len != 0) return Error.NotCommitted;
     try validateInside(range.*, offset, len);
     try validateNotGuard(range.*, range.base + offset, len);
-    try validateUncommitted(range.*, range.base + offset, len);
 
     if (range.window == .r4x_vm) {
+        try validateUncommitted(range.*, range.base + offset, len);
         const next_committed = checkedAdd(range.committed_bytes, len) orelse return Error.Overflow;
         try addCommitSpan(range.id, range.base + offset, len);
         addPageStateSpan(range.id, offset / paging.PAGE_SIZE, len / paging.PAGE_SIZE, page_state_flag_committed, 0, 0, 0) catch |err| {
@@ -587,30 +604,113 @@ pub fn commit(id: u32, offset: u64, len_raw: u64) Error!void {
     }
 
     const pages = len / paging.PAGE_SIZE;
+    // Dropping only the inner VM owner cannot shorten an outer no-sleep
+    // section. Small stack/fault commits remain legal in that context;
+    // large callers must first leave their outer metadata owner.
+    if (outer_owner and pages > page_batch.max_extent_pages) return Error.Busy;
     if (!canCommitPages(range.*, pages)) return Error.OutOfMemory;
-
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return Error.Busy;
+    range.resident_commit_active = true;
+    range.resident_commit_base = range.base + offset;
+    range.resident_commit_bytes = 0;
+    defer {
+        range.resident_commit_active = false;
+        _ = task_context.leaveUnwind(unwind);
+    }
+    errdefer {
+        range.resident_commit_failed = true;
+        publishPartialUncommit(range, range.resident_commit_base, range.resident_commit_bytes, true);
+        drainResidentRollback(range, &owner_irq_flags) catch {};
+    }
     var done: u64 = 0;
     while (done < pages) {
-        const virt = range.base + offset + done * paging.PAGE_SIZE;
-        const extent = allocClaimedExtent(range.*, pages - done, .vm_commit) catch |err| {
-            rollbackCommit(range, range.base + offset, done);
-            return err;
-        };
+        const virt = range.resident_commit_base + done * paging.PAGE_SIZE;
+        const batch_pages = page_batch.boundedPageCount(pages - done);
+        try validateUncommitted(range.*, virt, batch_pages * paging.PAGE_SIZE);
+        if (!canCommitPages(range.*, batch_pages)) return Error.OutOfMemory;
+        const extent = try allocClaimedExtent(range.*, batch_pages, .vm_commit);
+        range.resident_prepared = extent;
+        const extent_bytes = extent.count * paging.PAGE_SIZE;
+        owner_locks.virtual_memory.release(owner_irq_flags);
+        const mem: [*]u8 = @ptrFromInt(phys.physToVirt(extent.base));
+        @memset(mem[0..@intCast(extent_bytes)], 0);
+        owner_irq_flags = owner_locks.virtual_memory.acquire();
         if (!paging.mapContiguousPages(virt, extent.base, extent.count, range.flags)) {
-            releaseClaimedExtent(extent);
-            rollbackCommit(range, range.base + offset, done);
             return Error.MapFailed;
         }
-        const mem: [*]u8 = @ptrFromInt(virt);
-        const extent_bytes = extent.count * paging.PAGE_SIZE;
-        @memset(mem[0..@intCast(extent_bytes)], 0);
+        range.resident_prepared = .{ .base = 0, .count = 0 };
         range.committed_bytes += extent_bytes;
+        range.resident_commit_bytes += extent_bytes;
         recordResident(range, extent_bytes);
+        hot_path_stats.resident_commit_batches +%= 1;
+        hot_path_stats.resident_commit_max_batch_pages = @max(hot_path_stats.resident_commit_max_batch_pages, extent.count);
+        if (!outer_owner) hot_path_stats.resident_commit_unlocked_zero_bytes +%= extent_bytes;
         done += extent.count;
+        // Also allow progress between publication and the next allocation;
+        // the range lease, rather than the VM lock, protects its identity.
+        if (done < pages) {
+            owner_locks.virtual_memory.release(owner_irq_flags);
+            owner_irq_flags = owner_locks.virtual_memory.acquire();
+        }
     }
 
     range.status = .committed;
     blocks.setCommitted(range.block_id, range.committed_bytes) catch |err| return convertBlockError(err);
+    range.resident_commit_base = 0;
+    range.resident_commit_bytes = 0;
+}
+
+/// Retry only a failed eager commit, never an unrelated partial uncommit.
+/// A failed retry leaves the range and its outstanding frames owned by ID.
+pub fn finishResidentRollback(id: u32) Error!void {
+    const outer_owner = !owner_locks.faultResolutionAllowed();
+    var token = owner_locks.virtual_memory.acquire();
+    defer owner_locks.virtual_memory.release(token);
+    if (!initialized) return Error.NotInitialized;
+    const range = &ranges[indexById(id) orelse return Error.NotFound];
+    if (range.resident_commit_active) return Error.Busy;
+    if (!range.resident_commit_failed) return;
+    if (outer_owner and range.resident_commit_bytes > page_batch.max_extent_pages * paging.PAGE_SIZE) return Error.Busy;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return Error.Busy;
+    range.resident_commit_active = true;
+    defer {
+        range.resident_commit_active = false;
+        _ = task_context.leaveUnwind(unwind);
+    }
+    try drainResidentRollback(range, &token);
+}
+
+fn drainResidentRollback(range: *Range, token: *owner_locks.Token) Error!void {
+    defer {
+        range.status = if (range.committed_bytes == 0) .reserved else .committed;
+        blocks.setCommitted(range.block_id, range.committed_bytes) catch {};
+    }
+    if (range.resident_prepared.count != 0) {
+        const extent = range.resident_prepared;
+        var plan: blocks.PhysicalReleasePlan = undefined;
+        blocks.preparePhysicalRangeRelease(extent.base, extent.count * paging.PAGE_SIZE, &plan) catch |err| return convertBlockError(err);
+        defer blocks.cancelPhysicalRangeRelease(&plan);
+        phys.freeFrameExtent(extent);
+        blocks.commitPhysicalRangeRelease(&plan);
+        range.resident_prepared = .{ .base = 0, .count = 0 };
+    }
+    const end = range.resident_commit_base + range.resident_commit_bytes;
+    while (range.partial_uncommit_cursor < end) {
+        const start = range.partial_uncommit_cursor;
+        const bytes = @min(end - start, page_batch.max_extent_pages * paging.PAGE_SIZE);
+        try uncommitSpan(range, start, bytes, true);
+        hot_path_stats.resident_rollback_batches +%= 1;
+        if (range.partial_uncommit_cursor < end) {
+            owner_locks.virtual_memory.release(token.*);
+            token.* = owner_locks.virtual_memory.acquire();
+        }
+    }
+    clearPartialUncommit(range);
+    range.resident_commit_failed = false;
+    range.resident_commit_base = 0;
+    range.resident_commit_bytes = 0;
 }
 
 // Bounded physical preparation for callers which must survive loss of their
@@ -673,7 +773,9 @@ pub fn commitResident(id: u32, offset: u64, len_raw: u64) Error!void {
 fn allocClaimedExtent(range: Range, requested_pages: u64, reclaim_reason: reclaim.Reason) Error!phys.FrameExtent {
     const wanted = page_batch.boundedPageCount(requested_pages);
     if (wanted == 0) return Error.OutOfMemory;
-    const max_attempts = phys.stats().total_frames;
+    // An inconsistent PMM/block tree must not turn one bounded commit step
+    // into a scan over all RAM while interrupts are disabled.
+    const max_attempts = page_batch.max_extent_pages;
     var attempts: u64 = 0;
     var reclaimed = false;
     while (attempts < max_attempts) {
@@ -864,6 +966,7 @@ pub fn uncommit(id: u32, offset: u64, len_raw: u64) Error!void {
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
     const idx = indexById(id) orelse return Error.NotFound;
     const range = &ranges[idx];
+    if (range.resident_commit_active or range.resident_commit_failed) return Error.Busy;
     if (range.pager_io_count != 0) return Error.Busy;
     try validateInside(range.*, offset, len);
     const start = range.base + offset;
@@ -886,11 +989,13 @@ pub fn uncommit(id: u32, offset: u64, len_raw: u64) Error!void {
 }
 
 pub fn release(id: u32) Error!void {
+    try finishResidentRollback(id);
     const owner_irq_flags = owner_locks.virtual_memory.acquire();
     defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const idx = indexById(id) orelse return Error.NotFound;
     var range = &ranges[idx];
+    if (range.resident_commit_active or range.resident_commit_failed) return Error.Busy;
     if (range.pager_io_count != 0) return Error.Busy;
     if (range.window == .r4x_vm and range.owner == .r4x_instance and range.owner_id <= std.math.maxInt(u32)) {
         _ = backing_store.releaseVmRegion(@intCast(range.owner_id), range.id);
@@ -937,13 +1042,20 @@ pub fn release(id: u32) Error!void {
 }
 
 pub fn releaseOwner(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) Error!u64 {
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return Error.NotInitialized;
     var released: u64 = 0;
     while (true) {
-        const id = firstOwnedRange(owner, owner_id, kind) orelse break;
-        try release(id);
+        const owner_irq_flags = owner_locks.virtual_memory.acquire();
+        if (!initialized) {
+            owner_locks.virtual_memory.release(owner_irq_flags);
+            return Error.NotInitialized;
+        }
+        const candidate = firstOwnedRange(owner, owner_id, kind);
+        owner_locks.virtual_memory.release(owner_irq_flags);
+        const id = candidate orelse break;
+        release(id) catch |err| {
+            if (err == Error.NotFound) continue;
+            return err;
+        };
         released += 1;
     }
     return released;
@@ -957,6 +1069,7 @@ pub fn protectGuard(id: u32, offset: u64, len_raw: u64) Error!void {
     if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
     const idx = indexById(id) orelse return Error.NotFound;
     var range = &ranges[idx];
+    if (range.resident_commit_active or range.resident_commit_failed) return Error.Busy;
     try validateInside(range.*, offset, len);
     const guard_base = range.base + offset;
     if (overlapsMapped(guard_base, len) or commitSpanOverlaps(range.id, guard_base, len)) return Error.AlreadyCommitted;
@@ -969,6 +1082,7 @@ pub fn clearGuard(id: u32) Error!void {
     defer owner_locks.virtual_memory.release(owner_irq_flags);
     if (!initialized) return Error.NotInitialized;
     const idx = indexById(id) orelse return Error.NotFound;
+    if (ranges[idx].resident_commit_active or ranges[idx].resident_commit_failed) return Error.Busy;
     ranges[idx].guard_base = 0;
     ranges[idx].guard_len = 0;
 }
@@ -1477,15 +1591,6 @@ fn uncommitExtent(range: *Range, virt: u64, extent: phys.FrameExtent, count_logi
         }
     }
     blocks.commitPhysicalRangeRelease(&release_plan);
-}
-
-fn rollbackCommit(range: *Range, start: u64, page_count: u64) void {
-    defer blocks.coalescePhysicalRanges();
-    var i: u64 = 0;
-    while (i < page_count) : (i += 1) {
-        uncommitPage(range, start + i * paging.PAGE_SIZE, true) catch {};
-    }
-    blocks.setCommitted(range.block_id, range.committed_bytes) catch {};
 }
 
 fn validateInside(range: Range, offset: u64, len: u64) Error!void {

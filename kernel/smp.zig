@@ -972,7 +972,12 @@ fn acceptanceWorkerMain() callconv(.c) void {
 fn runOwnerStress(cpu_index: u32, bit: u64) void {
     var iteration: u64 = 0;
     while (iteration < OWNER_STRESS_ITERATIONS) : (iteration += 1) {
-        const size: usize = @intCast(64 + ((iteration + cpu_index) & 7) * 32);
+        // One large allocation per CPU exercises concurrent heap growth;
+        // the remaining existing iterations keep the short metadata stress.
+        const size: usize = if (iteration == 0)
+            @as(usize, cpu_index + 1) * 512 * 1024
+        else
+            @intCast(64 + ((iteration + cpu_index) & 7) * 32);
         const memory = heap.alloc(size, 16) orelse {
             _ = @atomicRmw(u32, &acceptance_owner_failures, .Add, 1, .acq_rel);
             continue;

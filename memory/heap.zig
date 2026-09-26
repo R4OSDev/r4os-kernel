@@ -13,9 +13,10 @@
 //   - Geometrisches Commit und RAM-/druckabhaengige Trailing-Hysterese
 //     vermeiden Commit/Uncommit-Thrash bei begrenztem freien Randbestand.
 //
-// SMP-INVARIANTE: Der Heap yieldet und blockiert weiterhin nicht. Seine
-// Metadaten werden ueber den reentranten Heap-Owner serialisiert, weil
-// lokales Nicht-Preemptieren mehrere CPUs nicht schuetzt.
+// SMP-INVARIANTE: Nur Metadaten liegen unter dem reentranten Heap-Owner.
+// Wachstum reserviert den unveroeffentlichten Rand und gibt den Owner fuer
+// die begrenzten VM-Schritte frei. Konkurrierendes Wachstum wartet nur in
+// einem schlaffaehigen Taskkontext; IRQ-/No-Sleep-Aufrufer warten nie.
 // Der Reentry-Waechter (control.in_heap) erkennt damit nur noch echte
 // Rekursion auf derselben CPU und nicht erlaubte parallele Nutzung.
 //
@@ -37,6 +38,9 @@ const phys = @import("phys.zig");
 const owner_locks = @import("owner_locks.zig");
 const k = @import("../kernel/log.zig");
 const task_context = @import("../sched/task_context.zig");
+const scheduler = @import("../sched/scheduler.zig");
+const sync = @import("../sched/sync.zig");
+const percpu = @import("../arch/x86_64/percpu.zig");
 
 const HEAP_BASE: u64 = virt.windowBase(.kernel_heap);
 const PAGE_SIZE: usize = 4096;
@@ -111,6 +115,7 @@ const Control = struct {
     range_id: u32 = 0,
     initialized: bool = false,
     in_heap: bool = false,
+    growth_cleanup_pending: bool = false,
     reentry_reported: bool = false,
     allocation_errors: u64 = 0,
     invalid_free_errors: u64 = 0,
@@ -134,6 +139,8 @@ const Control = struct {
 };
 
 var control: Control = .{};
+var growth_active: u8 = 0;
+var growth_waiters: sync.WaitQueue = sync.WaitQueue.init();
 
 pub fn init() bool {
     control = .{};
@@ -155,7 +162,9 @@ pub fn init() bool {
     control.cap_pages = cap_bytes / PAGE_SIZE;
 
     control.initialized = true;
-    if (!growCommitted(MIN_COMMITTED_PAGES * PAGE_SIZE)) {
+    var guard = enterHeap() orelse return false;
+    defer leaveHeap(guard);
+    if (!growCommitted(MIN_COMMITTED_PAGES * PAGE_SIZE, &guard)) {
         control.initialized = false;
         return false;
     }
@@ -163,21 +172,23 @@ pub fn init() bool {
 }
 
 pub fn alloc(size: usize, alignment: usize) ?[]u8 {
-    const guard = enterHeap() orelse return allocFailure();
+    var guard = enterHeap() orelse return allocFailure();
     defer leaveHeap(guard);
     if (!control.initialized or size == 0) return allocFailure();
     const align_value = normalizeAlignment(alignment) orelse return allocFailure();
     const need = blockSizeFor(size) orelse return oomFailure();
     if (need > control.cap_pages * PAGE_SIZE) return oomFailure();
 
-    if (align_value <= GRANULE) {
-        if (findFit(need)) |off| return placeBlock(off, need, size);
-        const grow_need = need + MIN_BLOCK;
-        if (!growCommitted(grow_need)) return oomFailure();
-        if (findFit(need)) |off| return placeBlock(off, need, size);
-        return oomFailure();
+    while (true) {
+        if (align_value <= GRANULE) {
+            if (findFit(need)) |off| return placeBlock(off, need, size);
+        } else if (findAlignedFit(need, align_value)) |found| {
+            return placeAligned(found.offset, found.payload, need, size);
+        }
+        const padding = if (align_value <= GRANULE) MIN_BLOCK else checkedAdd(align_value, MIN_BLOCK) orelse return oomFailure();
+        const grow_need = checkedAdd(need, padding) orelse return oomFailure();
+        if (!growCommitted(grow_need, &guard)) return oomFailure();
     }
-    return allocAligned(size, need, align_value);
 }
 
 pub fn allocBytes(size: usize) ?[]u8 {
@@ -610,18 +621,6 @@ fn placeBlock(offset: usize, need: usize, requested: usize) ?[]u8 {
     return ptr[0..requested];
 }
 
-fn allocAligned(requested: usize, need: usize, alignment: usize) ?[]u8 {
-    if (findAlignedFit(need, alignment)) |found| {
-        return placeAligned(found.offset, found.payload, need, requested);
-    }
-    const grow_need = need + alignment + MIN_BLOCK;
-    if (!growCommitted(grow_need)) return oomFailure();
-    if (findAlignedFit(need, alignment)) |found| {
-        return placeAligned(found.offset, found.payload, need, requested);
-    }
-    return oomFailure();
-}
-
 const AlignedFit = struct {
     offset: usize,
     payload: usize,
@@ -683,7 +682,16 @@ fn placeAligned(offset: usize, payload: usize, need: usize, requested: usize) ?[
     return ptr[0..requested];
 }
 
-fn growCommitted(min_extra_bytes: usize) bool {
+fn growCommitted(min_extra_bytes: usize, guard: *HeapGuard) bool {
+    if (@atomicLoad(u8, &growth_active, .acquire) != 0) {
+        if (!canWaitForGrowth(guard.*)) return false;
+        suspendHeap(guard.*);
+        const result = growth_waiters.waitUnless(sync.WAIT_FOREVER, "heap-growth", growthStillActive, &growth_active);
+        resumeHeap(guard);
+        // Another allocator may consume the new space before we return.
+        // The caller retries its fit and, if needed, reserves another tail.
+        return result == .signaled;
+    }
     if (!finishPendingTail()) return false;
     const extra_pages_min = pagesForBytes(min_extra_bytes);
     if (extra_pages_min == 0) return true;
@@ -692,8 +700,13 @@ fn growCommitted(min_extra_bytes: usize) bool {
     const start = committedBytes();
     const remaining_pages = control.cap_pages - control.committed_pages;
     var extra_pages = heap_policy.growthPages(extra_pages_min, control.next_growth_pages, remaining_pages);
-    if (!commitAdditionalPages(start, extra_pages)) {
-        if (extra_pages == extra_pages_min or !commitAdditionalPages(start, extra_pages_min)) return false;
+    @atomicStore(u8, &growth_active, 1, .release);
+    defer {
+        @atomicStore(u8, &growth_active, 0, .release);
+        guard.wake_growth = guard.wake_growth or (canDropHeap(guard.*) and guard.unwind.context_present);
+    }
+    if (!commitAdditionalPages(start, extra_pages, guard)) {
+        if (extra_pages == extra_pages_min or !commitAdditionalPages(start, extra_pages_min, guard)) return false;
         extra_pages = extra_pages_min;
     }
     const extra_bytes = extra_pages * PAGE_SIZE;
@@ -719,18 +732,28 @@ fn growCommitted(min_extra_bytes: usize) bool {
     return true;
 }
 
-fn commitAdditionalPages(start: usize, pages: usize) bool {
+fn commitAdditionalPages(start: usize, pages: usize, guard: *HeapGuard) bool {
     if (pages == 0) return true;
+    const range_id = control.range_id;
     control.commit_calls +%= 1;
-    virt.commit(control.range_id, @intCast(start), @intCast(pages * PAGE_SIZE)) catch {
+    const drop_owner = canDropHeap(guard.*);
+    if (drop_owner) suspendHeap(guard.*);
+    const committed = virt.commit(range_id, @intCast(start), @intCast(pages * PAGE_SIZE));
+    if (drop_owner) resumeHeap(guard);
+    committed catch {
         control.commit_failures +%= 1;
+        control.growth_cleanup_pending = true;
         return false;
     };
+    control.growth_cleanup_pending = false;
     control.committed_pages_total +%= pages;
     return true;
 }
 
 fn releaseTrailingPages() void {
+    // Keep all published boundary tags mapped while a grower prepares the
+    // adjacent tail. Failed commit rollback also owns an unpublished tail.
+    if (@atomicLoad(u8, &growth_active, .acquire) != 0 or control.growth_cleanup_pending) return;
     if (!finishPendingTail()) return;
     const floor_bytes = MIN_COMMITTED_PAGES * PAGE_SIZE;
     if (control.heap_top <= floor_bytes) return;
@@ -960,7 +983,7 @@ pub fn acceptanceProbe() AcceptanceProbe {
         batch_accounting and
         after.commit_failures == before.commit_failures and
         after.uncommit_failures == before.uncommit_failures and
-        poison_delta >= @as(u64, @intCast(request_bytes)) * iterations;
+        poison_delta >= @as(u64, @intCast(request_bytes)) * iterations and residentCommitProbe();
     return .{
         .ok = ok,
         .iterations = completed,
@@ -976,6 +999,61 @@ pub fn acceptanceProbe() AcceptanceProbe {
         .unmap_batches = unmap_batch_delta,
         .under_pressure = pressure,
     };
+}
+
+// Extends the existing HEAPPROBE with a real late commit failure: four
+// completed batches must roll back without changing the pre-existing page.
+// The same range must then support a full zeroed commit and ordinary release.
+fn residentCommitProbe() bool {
+    const bytes = 257 * PAGE_SIZE;
+    const before = virt.hotPathStats();
+    const id = virt.reserve(.{ .window = .temp_kernel, .len = bytes, .name = "resident-commit-probe" }) catch return false;
+    var live = true;
+    defer if (live) {
+        virt.release(id) catch {};
+    };
+    const info = virt.rangeInfo(id) orelse return false;
+    const memory: [*]u8 = @ptrFromInt(info.base);
+    virt.commit(id, bytes - PAGE_SIZE, PAGE_SIZE) catch return false;
+    memory[bytes - 1] = 0xA5;
+    if (virt.commit(id, 0, bytes)) |_| {
+        return false;
+    } else |err| {
+        if (err != virt.Error.AlreadyCommitted) return false;
+    }
+    const partial = virt.rangeInfo(id) orelse return false;
+    if (partial.committed_bytes != PAGE_SIZE or partial.resident_bytes != PAGE_SIZE or memory[bytes - 1] != 0xA5) return false;
+    var offset: usize = 0;
+    while (offset < bytes - PAGE_SIZE) : (offset += PAGE_SIZE) {
+        if (paging.isMapped(info.base + offset)) return false;
+    }
+    virt.uncommit(id, bytes - PAGE_SIZE, PAGE_SIZE) catch return false;
+    virt.commit(id, 0, bytes) catch return false;
+    for (memory[0..bytes]) |byte| {
+        if (byte != 0) return false;
+    }
+    const complete = virt.rangeInfo(id) orelse return false;
+    if (complete.committed_bytes != bytes or complete.resident_bytes != bytes) return false;
+    virt.release(id) catch return false;
+    live = false;
+    const after = virt.hotPathStats();
+    if (after.resident_commit_batches - before.resident_commit_batches < 6 or
+        after.resident_commit_max_batch_pages > 64 or
+        after.resident_commit_unlocked_zero_bytes - before.resident_commit_unlocked_zero_bytes < bytes or
+        after.resident_rollback_batches == before.resident_rollback_batches) return false;
+
+    // Reserve more pages than can be backed. The app reserve check must
+    // reject the whole operation without publishing a successful prefix.
+    const impossible = (phys.stats().free_frames + 1) * PAGE_SIZE;
+    const oom_id = virt.reserve(.{ .window = .app_stack, .len = impossible, .owner = .r4x_instance, .name = "resident-oom-probe" }) catch return false;
+    defer virt.release(oom_id) catch {};
+    if (virt.commit(oom_id, 0, impossible)) |_| {
+        return false;
+    } else |err| {
+        if (err != virt.Error.OutOfMemory) return false;
+    }
+    const empty = virt.rangeInfo(oom_id) orelse return false;
+    return empty.committed_bytes == 0 and empty.resident_bytes == 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1106,7 +1184,32 @@ fn rdtsc() u64 {
 const HeapGuard = struct {
     unwind: task_context.UnwindToken,
     lock_token: owner_locks.Token,
+    wake_growth: bool = false,
 };
+
+fn growthStillActive(_: *anyopaque) bool {
+    return @atomicLoad(u8, &growth_active, .acquire) != 0;
+}
+
+fn canWaitForGrowth(guard: HeapGuard) bool {
+    if (!canDropHeap(guard) or guard.lock_token.flags & (1 << 9) == 0) return false;
+    const current = scheduler.current() orelse return false;
+    return current.preempt_disable_depth == 0 and current.held_lock_count == 0;
+}
+
+fn canDropHeap(guard: HeapGuard) bool {
+    return guard.lock_token.previous_rank == 0 and percpu.runtimeCriticalDepth().* == 0;
+}
+
+fn suspendHeap(guard: HeapGuard) void {
+    control.in_heap = false;
+    owner_locks.heap.release(guard.lock_token);
+}
+
+fn resumeHeap(guard: *HeapGuard) void {
+    guard.lock_token = owner_locks.heap.acquire();
+    control.in_heap = true;
+}
 
 fn enterHeap() ?HeapGuard {
     const irq_flags = owner_locks.heap.acquire();
@@ -1132,6 +1235,15 @@ fn enterHeap() ?HeapGuard {
 
 fn leaveHeap(guard: HeapGuard) void {
     control.in_heap = false;
+    if (guard.wake_growth) {
+        owner_locks.heap.release(guard.lock_token);
+        _ = growth_waiters.wakeAll();
+        // Keep the grower kill-safe until all sleepers can observe completion.
+        const token = owner_locks.heap.acquire();
+        _ = task_context.leaveUnwind(guard.unwind);
+        owner_locks.heap.release(token);
+        return;
+    }
     _ = task_context.leaveUnwind(guard.unwind);
     owner_locks.heap.release(guard.lock_token);
 }
