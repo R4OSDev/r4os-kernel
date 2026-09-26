@@ -187,6 +187,11 @@ pub const Summary = struct {
     read_ahead_pages_scheduled: u64 = 0,
     read_ahead_pages_issued: u64 = 0,
     read_ahead_random_resets: u64 = 0,
+    writeback_windows: u64 = 0,
+    writeback_window_pages: u64 = 0,
+    writeback_window_requests: u64 = 0,
+    writeback_window_max_sectors: u64 = 0,
+    writeback_window_pending_max: u64 = 0,
 };
 
 /// Identifies the dirty sectors produced by one filesystem mutation.  Zero is
@@ -266,6 +271,7 @@ pub fn init() void {
     releaseAllPayloads(false);
     entries = .{Entry{}} ** MAX_ENTRIES;
     buckets = .{NO_INDEX} ** BUCKET_COUNT;
+    writeback_window_busy = false;
     stats = .{
         .enabled = true,
         .sector_bytes = SECTOR_SIZE,
@@ -1706,6 +1712,131 @@ const DrainReason = enum {
     background_age,
 };
 
+const WRITEBACK_WINDOW_PAGES: usize = 16;
+const WritebackPage = struct {
+    index: usize,
+    page: u64,
+    frame: u64,
+    sequence: [PAGE_SECTORS]u64,
+    request: usize,
+};
+// One bounded resident window; pressure/background/sparse work never needs
+// heap allocation and can continue through the existing one-page path.
+var writeback_window: [WRITEBACK_WINDOW_PAGES * PAGE_BYTES]u8 align(16) = undefined;
+var writeback_window_busy = false;
+
+fn writebackDrainEntry(guard: bool, index: usize, batch: ?WriteBatch) bool {
+    return writebackWindowLocked(guard, index, batch) orelse writebackEntrySelectedUnlocked(guard, index, batch);
+}
+
+fn homogeneousDirtyOwner(entry: *const Entry, batch: ?WriteBatch) ?WriteBatch {
+    if (!entry.valid or entry.io_busy or entry.dirty_mask != FULL_MASK) return null;
+    const owner = batch orelse entry.dirty_owner[0];
+    for (entry.dirty_owner) |value| if (value != owner) return null;
+    return owner;
+}
+
+/// Only explicit drain loops use this window. Background and pressure retain
+/// their existing one-page budget. Selection order is unchanged; adjacent
+/// selected pages coalesce. Nonzero/selected batches use one ordered run.
+/// Unscoped writes may overlap only inside the current drain: zero is not a
+/// payload type (NTFS also uses it for metadata). Existing filesystem flush
+/// boundaries still complete all earlier writes before admitting later work.
+fn writebackWindowLocked(guard: bool, first: usize, batch: ?WriteBatch) ?bool {
+    if (first >= entries.len or writeback_window_busy) return null;
+    const owner = homogeneousDirtyOwner(&entries[first], batch) orelse return null;
+    const device_index = entries[first].device_index;
+    const limits = block.directWriteLimits(device_index) orelse return null;
+    const request_limit: u16 = @min(WRITEBACK_WINDOW_PAGES * PAGE_SECTORS, limits.max_sectors);
+    if (request_limit < PAGE_SECTORS) return null;
+    const parallel = batch == null and owner == NO_WRITE_BATCH;
+    var pages: [WRITEBACK_WINDOW_PAGES]WritebackPage = undefined;
+    var writes: [block.direct_write_batch_limit]block.DirectWrite = undefined;
+    var page_count: usize = 0;
+    var request_count: usize = 0;
+    var candidate: ?usize = first;
+    writeback_window_busy = true;
+    while (candidate) |index| {
+        if (page_count == pages.len) break;
+        const entry = &entries[index];
+        if (entry.device_index != device_index or homogeneousDirtyOwner(entry, batch) != owner) break;
+        const frame = payloadFrame(index) orelse break;
+        const extend = request_count != 0 and
+            writes[request_count - 1].lba <= @as(u64, std.math.maxInt(u64)) - writes[request_count - 1].sectors and
+            writes[request_count - 1].lba + writes[request_count - 1].sectors == entry.page_lba and
+            writes[request_count - 1].sectors + PAGE_SECTORS <= request_limit;
+        if (!extend and (request_count == writes.len or (!parallel and request_count != 0))) break;
+        if (!policy_index.pin(index)) break;
+        entry.io_busy = true;
+        const offset = page_count * PAGE_BYTES;
+        @memcpy(writeback_window[offset..][0..PAGE_BYTES], frame);
+        if (extend) {
+            const write = &writes[request_count - 1];
+            write.sectors += PAGE_SECTORS;
+            write.data = writeback_window[@intFromPtr(write.data.ptr) - @intFromPtr(&writeback_window) ..][0 .. @as(usize, write.sectors) * SECTOR_SIZE];
+        } else {
+            writes[request_count] = .{ .lba = entry.page_lba, .sectors = PAGE_SECTORS, .data = writeback_window[offset..][0..PAGE_BYTES] };
+            request_count += 1;
+        }
+        pages[page_count] = .{ .index = index, .page = entry.page_lba, .frame = entry.phys_addr, .sequence = entry.dirty_write_sequence, .request = request_count - 1 };
+        page_count += 1;
+        candidate = if (batch) |token| findOldestDirtyForDeviceBatch(device_index, token) else findOldestDirtyForDevice(device_index);
+    }
+    if (page_count < 2) {
+        if (page_count != 0) {
+            entries[first].io_busy = false;
+            _ = policy_index.unpin(first, true);
+        }
+        writeback_window_busy = false;
+        return null;
+    }
+    stats.writeback_windows +%= 1;
+    stats.writeback_window_pages +%= page_count;
+    stats.writeback_window_requests +%= request_count;
+    for (writes[0..request_count]) |write| stats.writeback_window_max_sectors = @max(stats.writeback_window_max_sectors, write.sectors);
+    releaseLock(guard);
+    const outcome = block.writeBatchDirect(device_index, limits.reference, writes[0..request_count], parallel);
+    var retry_count: u64 = 0;
+    if (!limits.owns_transport_retry) for (writes[0..request_count]) |*write| {
+        if (write.ok or !write.attempted) continue;
+        // Preserve the historical one retry, only for that failed transfer.
+        // Completed siblings are not replayed; transport-owned retries are
+        // never multiplied by the cache.
+        _ = block.writeBatchDirect(device_index, limits.reference, @as([*]block.DirectWrite, @ptrCast(write))[0..1], false);
+        retry_count += 1;
+    };
+    relock(guard);
+    stats.writeback_retries +%= retry_count;
+    stats.writeback_window_pending_max = @max(stats.writeback_window_pending_max, outcome.pending_max);
+    var ok = true;
+    // Reverse release preserves FIFO priority for failed/redirtied snapshots.
+    var remaining = page_count;
+    while (remaining != 0) {
+        remaining -= 1;
+        const snapshot = &pages[remaining];
+        const entry = &entries[snapshot.index];
+        if (!entry.valid or entry.device_index != device_index or entry.page_lba != snapshot.page or
+            entry.phys_addr != snapshot.frame or !entry.io_busy)
+        {
+            ok = false;
+            continue; // Never mutate a foreign/reused slot.
+        }
+        var cleared: u8 = 0;
+        if (writes[snapshot.request].ok) for (0..PAGE_SECTORS) |sector| {
+            if (entry.dirty_owner[sector] == owner and entry.dirty_write_sequence[sector] == snapshot.sequence[sector])
+                cleared |= @as(u8, 1) << @intCast(sector);
+        };
+        clearDirtyBits(snapshot.index, cleared);
+        stats.writeback_sectors +%= @popCount(cleared);
+        entry.io_busy = false;
+        _ = policy_index.unpin(snapshot.index, entry.dirty_mask != 0);
+        ok = ok and writes[snapshot.request].ok;
+    }
+    writeback_window_busy = false;
+    if (!ok) stats.writeback_errors +%= 1;
+    return ok;
+}
+
 fn drainDevice(guard: bool, device_index: usize, reason: DrainReason) bool {
     if (dirtyEntriesForDevice(device_index) == 0) return true;
     const start = timer.tickCount();
@@ -1721,7 +1852,7 @@ fn drainDevice(guard: bool, device_index: usize, reason: DrainReason) bool {
             return false;
         };
         const before = stats.writeback_sectors;
-        if (!writebackEntryUnlocked(guard, index)) return false;
+        if (!writebackDrainEntry(guard, index, null)) return false;
         written +%= stats.writeback_sectors - before;
     }
     recordDrain(reason, written, start);
@@ -1743,7 +1874,7 @@ fn drainDeviceBatch(guard: bool, device_index: usize, batch: WriteBatch, reason:
             break;
         };
         const before = stats.writeback_sectors;
-        if (!writebackEntryBatchUnlocked(guard, index, batch)) return false;
+        if (!writebackDrainEntry(guard, index, batch)) return false;
         written +%= stats.writeback_sectors - before;
     }
     stats.selective_writeback_sectors +%= written;
@@ -1766,7 +1897,7 @@ fn drainAll(guard: bool, reason: DrainReason) bool {
             return false;
         };
         const before = stats.writeback_sectors;
-        if (!writebackEntryUnlocked(guard, index)) return false;
+        if (!writebackDrainEntry(guard, index, null)) return false;
         written +%= stats.writeback_sectors - before;
     }
     recordDrain(reason, written, start);
@@ -1786,8 +1917,9 @@ fn writebackOldestDirty(guard: bool, reason: DrainReason) bool {
     return true;
 }
 
-// Schreibt alle dirty Sektoren des Eintrags zurueck (sektorweise;
-// Run-Coalescing kommt in 0.56.9). I/O laeuft OHNE Lock unter io_busy;
+// Small/range/pressure path: coalesce dirty runs within one cache page.
+// Explicit drains may first use the bounded cross-page window above.
+// I/O laeuft OHNE Lock unter io_busy;
 // Schreiber auf dieselbe Seite warten solange (waitBusy), daher ist der
 // Frame waehrend des I/O stabil.
 fn writebackEntryUnlocked(guard: bool, index: usize) bool {

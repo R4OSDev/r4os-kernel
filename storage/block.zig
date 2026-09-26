@@ -1195,6 +1195,94 @@ fn writeChunk(device: *Device, lba: u64, sectors: u16, data: []const u8, trusted
     return if (result.ok) .none else result.err;
 }
 
+pub const direct_write_batch_limit: usize = 4;
+pub const DirectWriteLimits = struct {
+    reference: access.DeviceRef,
+    max_sectors: u16,
+    owns_transport_retry: bool,
+};
+
+/// Copy capabilities while the registration owner is held; callers do not
+/// keep a pointer to a reusable device slot across cache lock drops.
+pub fn directWriteLimits(index: usize) ?DirectWriteLimits {
+    const flags = owner_locks.storage.acquire();
+    defer owner_locks.storage.release(flags);
+    if (index >= device_slot_count) return null;
+    const slot = &devices[index];
+    if (!slot.used or slot.retiring or busExcluded(slot.device.bus) or
+        slot.device.sector_size != 512 or !slot.device.writable) return null;
+    return .{ .reference = slot.device.access_ref, .max_sectors = if (slot.device.max_sectors_per_request == 0) 65535 else slot.device.max_sectors_per_request, .owns_transport_retry = slot.device.owns_transport_retry };
+}
+
+pub const DirectWrite = struct {
+    lba: u64,
+    sectors: u16,
+    data: []const u8,
+    attempted: bool = false,
+    ok: bool = false,
+};
+pub const DirectWriteBatchResult = struct { pending_max: usize = 0 };
+
+/// Resident buffers are borrowed until every published request completes.
+/// A generation-bound device pin/unwind spans admission, backpressure and
+/// all waits. No buffers detach, even when a timeout/reset is classified.
+/// The existing queue still orders flush barriers; only disjoint
+/// writes explicitly admitted by the caller may overlap.
+pub fn writeBatchDirect(index: usize, expected: access.DeviceRef, writes: []DirectWrite, parallel: bool) DirectWriteBatchResult {
+    for (writes) |*job| {
+        job.ok = false;
+        job.attempted = false;
+    }
+    if (writes.len == 0 or writes.len > direct_write_batch_limit) return .{};
+    var pin = pinDevice(index) orelse return .{};
+    defer unpinDevice(&pin);
+    const device = pin.device;
+    if (device.access_ref.slot != expected.slot or device.access_ref.generation != expected.generation or
+        !device.writable or (device.write_fn == null and device.async_submit_fn == null)) return .{};
+    const limit = if (device.max_sectors_per_request == 0) 65535 else device.max_sectors_per_request;
+    for (writes, 0..) |job, i| {
+        if (job.sectors > limit or validateRequest(device, job.lba, job.sectors, job.data.len) != null) return .{};
+        for (writes[0..i]) |before| {
+            if (job.lba < before.lba + before.sectors and before.lba < job.lba + job.sectors) return .{};
+        }
+    }
+    const runtime_worker = runtimeWorkerReady();
+    const width: usize = if (parallel and runtime_worker and device.async_submit_fn != null)
+        @max(1, @min(direct_write_batch_limit, device.queue_depth))
+    else
+        1;
+    var result: DirectWriteBatchResult = .{};
+    var first: usize = 0;
+    while (first < writes.len) {
+        var ids: [direct_write_batch_limit]u64 = undefined;
+        var admitted: usize = 0;
+        const wave_count = @min(width, writes.len - first);
+        while (admitted < wave_count) : (admitted += 1) {
+            const job = &writes[first + admitted];
+            const bytes = @as(usize, job.sectors) * device.sector_size;
+            ids[admitted] = enqueueRequest(device, .write, job.lba, job.sectors, null, job.data.ptr, bytes, if (runtime_worker) .borrowed_resident else .none) orelse break;
+            job.attempted = true;
+            device.stats.direct_requests +%= 1;
+            device.stats.direct_bytes +%= bytes;
+            runtime_summary.direct_requests +%= 1;
+            runtime_summary.direct_bytes +%= bytes;
+            scheduleDeviceQueue(device, runtime_worker);
+        }
+        result.pending_max = @max(result.pending_max, admitted);
+        var all_ok = admitted == wave_count;
+        // Drain every admitted slot on every exit. Successful siblings are
+        // individually acknowledged even when another completion fails.
+        for (ids[0..admitted], 0..) |id, offset| {
+            const done = waitForRequest(device, id, requestTimeout(device));
+            writes[first + offset].ok = done.ok;
+            all_ok = all_ok and done.ok;
+        }
+        if (!all_ok) break;
+        first += admitted;
+    }
+    return result;
+}
+
 pub fn flush(index: usize) bool {
     var pin = pinDevice(index) orelse return false;
     defer unpinDevice(&pin);
@@ -2395,9 +2483,11 @@ const AsyncTestState = struct {
     timeout_cancels: u32 = 0,
     reset_cancels: u32 = 0,
     resets: u32 = 0,
-    requests: [8]AsyncRequest = undefined,
+    requests: [12]AsyncRequest = undefined,
 };
 
+var async_test_batch_done = sync.EventV2.initMode(false, .auto_reset);
+var async_test_batch_ok = false;
 var async_test_state: AsyncTestState = .{};
 var async_test_submitted = sync.EventV2.initMode(false, .auto_reset);
 var async_test_first_done = sync.EventV2.initMode(false, .auto_reset);
@@ -2424,6 +2514,8 @@ var async_test_flush_last_buffer: [512]u8 = .{0} ** 512;
 
 fn asyncDispatchSelfTest() bool {
     async_test_state = .{};
+    async_test_batch_ok = false;
+    async_test_batch_done = sync.EventV2.initMode(false, .auto_reset);
     async_test_submitted = sync.EventV2.initMode(false, .auto_reset);
     async_test_first_done = sync.EventV2.initMode(false, .auto_reset);
     async_test_second_done = sync.EventV2.initMode(false, .auto_reset);
@@ -2453,6 +2545,7 @@ fn asyncDispatchSelfTest() bool {
         .bus = .ram,
         .sector_size = 512,
         .sector_count = 8,
+        .writable = true,
         .queue_depth = 2,
         .timeout_ticks = 50,
         .ctx = &async_test_state,
@@ -2571,6 +2664,24 @@ fn asyncDispatchSelfTest() bool {
     ok = async_test_flush_first_ok and async_test_flush_ok and async_test_flush_last_ok and
         async_test_flush_first_buffer[0] == 0xC4 and async_test_flush_last_buffer[0] == 0xD5 and ok;
 
+    // A single batch caller must fill both hardware slots, retain its
+    // registration across out-of-order partial failure, and drain both.
+    if (sched_task.createKernelThreadWithRole("blk-write-batch", asyncTestBatchRequester, .batch) == null) ok = false;
+    if (ok and !asyncTestWaitForSubmissions(9)) ok = false;
+    if (ok) {
+        const first = async_test_state.requests[7];
+        const second = async_test_state.requests[8];
+        if (first.kind != .write or second.kind != .write or
+            first.const_buffer == null or second.const_buffer == null or
+            first.const_buffer.?[0] != 0xE1 or second.const_buffer.?[0] != 0xE2 or
+            (get(index) orelse return false).active_executions != 2 or unregister(index)) ok = false;
+        second.complete(second.handle, ASYNC_RESULT_ERROR, 0);
+        first.complete(first.handle, ASYNC_RESULT_OK, @intCast(first.buffer_len));
+    }
+    if (async_test_batch_done.waitResult(2 * @as(u64, timer.DEFAULT_HZ)) != .signaled) ok = false;
+    ok = async_test_batch_ok and ok;
+    k.puts(if (async_test_batch_ok) "[BLOCKWRITEBATCH] result=OK pending=2 partial_failure=1 drained=1\r\n" else "[BLOCKWRITEBATCH] result=FAIL\r\n");
+
     const after = runtimeWorkerSummary();
     ok = !async_test_reset_ok and
         async_test_state.cancels == 2 and
@@ -2581,6 +2692,20 @@ fn asyncDispatchSelfTest() bool {
         after.late_completions > before.late_completions and ok;
     ok = unregister(index) and ok;
     return asyncDispatchSelfTestResult(ok, before, after);
+}
+
+fn asyncTestBatchRequester() callconv(.c) void {
+    defer async_test_batch_done.signal();
+    @memset(&async_test_first_buffer, 0xE1);
+    @memset(&async_test_second_buffer, 0xE2);
+    const limits = directWriteLimits(async_test_index) orelse return;
+    var writes = [_]DirectWrite{
+        .{ .lba = 6, .sectors = 1, .data = &async_test_first_buffer },
+        .{ .lba = 7, .sectors = 1, .data = &async_test_second_buffer },
+    };
+    const outcome = writeBatchDirect(async_test_index, limits.reference, &writes, true);
+    async_test_batch_ok = outcome.pending_max == 2 and writes[0].attempted and writes[1].attempted and
+        writes[0].ok and !writes[1].ok and queueUsed(async_test_index) == 0;
 }
 
 fn asyncTestWaitForSubmissions(expected: u32) bool {
