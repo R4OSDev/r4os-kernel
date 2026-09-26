@@ -5,6 +5,7 @@ const vfs = @import("../fs/vfs.zig");
 const directory_changes = @import("../fs/directory_changes.zig");
 const page_cache = @import("../fs/page_cache.zig");
 const fs_request = @import("../fs/request.zig");
+const copy_transfer = @import("../fs/copy_transfer.zig");
 const storage_access = @import("../storage/access_runtime.zig");
 const system_update_atomic = @import("../fs/system_update_atomic.zig");
 const upload_claim_store = @import("../fs/upload_claim_store.zig");
@@ -3022,6 +3023,119 @@ fn fileReplaceAtomicImpl(target_ptr: [*:0]const u8, staged_ptr: [*:0]const u8, b
     };
 }
 
+var copy_sequence: u32 = 0;
+var copy_cancel_provider: ?*const fn () callconv(.c) u32 = null;
+
+pub fn setCopyCancellationProvider(provider: *const fn () callconv(.c) u32) void {
+    copy_cancel_provider = provider;
+}
+
+const CopyIo = struct {
+    lease: *fs_request.Guard,
+    source: vfs.Volume,
+    target: vfs.Volume,
+    source_letter: u8,
+    target_letter: u8,
+    entry: vfs.Entry,
+    parent: vfs.NodeRef,
+    target_name: []const u8,
+    stage_buffer: [13]u8 = undefined,
+    stage_len: usize = 0,
+    stage_owned: bool = false,
+    readers_allowed: bool = false,
+
+    pub fn cancelled(_: *CopyIo) bool {
+        return if (copy_cancel_provider) |check| check() != 0 else false;
+    }
+    fn stage(self: *const CopyIo) []const u8 {
+        return self.stage_buffer[0..self.stage_len];
+    }
+    pub fn prepare(self: *CopyIo) bool {
+        // The initial paired request still owns both backend lanes here.
+        var attempt: usize = 0;
+        while (attempt < 128) : (attempt += 1) {
+            const sequence = @atomicRmw(u32, &copy_sequence, .Add, 1, .monotonic) & 0xffffff;
+            const copy_name = std.fmt.bufPrint(&self.stage_buffer, "~C{X:0>6}.TMP", .{sequence}) catch return false;
+            if (std.ascii.eqlIgnoreCase(copy_name, self.target_name)) continue;
+            var existing: vfs.Entry = undefined;
+            switch (vfs.lookupEntryStatus(self.target, self.parent, copy_name, &existing)) {
+                .found => continue,
+                .io => return false,
+                .not_found => {},
+            }
+            self.stage_len = copy_name.len;
+            self.stage_owned = true; // Also clean up a partially failed create.
+            return vfs.writeFile(self.target, self.parent, self.stage(), "");
+        }
+        return false;
+    }
+    pub fn allowReaders(self: *CopyIo) void {
+        self.readers_allowed = fs_request.allowCopyReaders(self.lease);
+    }
+    pub fn read(self: *CopyIo, offset: usize, bytes: []u8) ?usize {
+        var request = fs_request.beginVolume(.file_read_at, self.source_letter, self.source) orelse return null;
+        var ok = false;
+        defer fs_request.finish(&request, ok);
+        const count = vfs.readFileRange(self.source, self.entry, offset, bytes) orelse return null;
+        ok = count == bytes.len;
+        return count;
+    }
+    pub fn append(self: *CopyIo, offset: u64, bytes: []const u8) bool {
+        var request = fs_request.beginVolume(.file_append, self.target_letter, self.target) orelse return false;
+        const ok = vfs.appendFileAtOffsetStatusDeferred(self.target, self.parent, self.stage(), offset, bytes) == .ok;
+        fs_request.finish(&request, ok);
+        return ok;
+    }
+    pub fn progress(self: *CopyIo) void {
+        fs_request.copyProgress(self.lease);
+    }
+    pub fn pause(self: *CopyIo) void {
+        if (self.readers_allowed) scheduler.yield();
+    }
+    pub fn flush(self: *CopyIo) bool {
+        var request = fs_request.beginVolume(.stream_finish, self.target_letter, self.target) orelse return false;
+        const ok = vfs.flushVolume(self.target);
+        fs_request.finish(&request, ok);
+        return ok;
+    }
+    pub fn publish(self: *CopyIo) bool {
+        var request = fs_request.beginVolume(.file_copy, self.target_letter, self.target) orelse return false;
+        var ok = false;
+        defer fs_request.finish(&request, ok);
+        // Other writers were excluded for the whole operation. The old target
+        // stays readable until this final namespace transaction. Durability
+        // failure here keeps the existing non-transactional copy error contract.
+        var old: vfs.Entry = undefined;
+        switch (vfs.lookupEntryStatus(self.target, self.parent, self.target_name, &old)) {
+            .found => {
+                if (old.isDir() or old.isReadOnly() or !vfs.deleteFile(self.target, self.parent, self.target_name)) return false;
+            },
+            .not_found => {},
+            .io => return false,
+        }
+        ok = vfs.publishCopyFile(self.target, self.parent, self.stage(), self.target_name);
+        if (ok) self.stage_owned = false;
+        return ok;
+    }
+    pub fn abort(self: *CopyIo) void {
+        if (!self.stage_owned) return;
+        var request = fs_request.beginVolume(.file_delete, self.target_letter, self.target) orelse return;
+        const ok = vfs.deleteFile(self.target, self.parent, self.stage());
+        fs_request.finish(&request, ok);
+        if (ok) self.stage_owned = false;
+    }
+};
+
+fn copyUnderLease(lease: *fs_request.Guard, src: vfs.Volume, dst: vfs.Volume, src_letter: u8, dst_letter: u8, entry: vfs.Entry, parent: vfs.NodeRef, copy_name: []const u8, supplied: ?[]u8, result: ?*vfs.CopyProgress) bool {
+    const owned = if (supplied == null) heap.allocBytes(copy_transfer.max_chunk_bytes) orelse return false else null;
+    defer if (owned) |bytes| {
+        _ = heap.free(bytes);
+    };
+    var local: vfs.CopyProgress = .{};
+    var io = CopyIo{ .lease = lease, .source = src, .target = dst, .source_letter = src_letter, .target_letter = dst_letter, .entry = entry, .parent = parent, .target_name = copy_name };
+    return copy_transfer.transfer(&io, supplied orelse owned.?, entry.size, result orelse &local);
+}
+
 pub fn fileCopy(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32 {
     return fileCopyWithProgress(src_ptr, dst_ptr, null, null);
 }
@@ -3076,7 +3190,7 @@ fn fileCopyWithProgress(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8, buffer: 
     }
     if (progress) |p| p.source_size = entry.size;
     if (entry.isDir()) return -4;
-    if (buffer != null and entry.size > 0xFFFF_FFFF) return -13;
+    if (entry.size > 0xFFFF_FFFF) return -13;
     var dst_parent: vfs.NodeRef = undefined;
     if (vfs.resolvePathStatus(dst_volume, parentPath(dst_target.path), &dst_parent) != .found) return -5;
     var dst_entry: ?vfs.Entry = null;
@@ -3091,11 +3205,8 @@ fn fileCopyWithProgress(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8, buffer: 
         dst_entry,
         baseName(dst_target.path),
     )) return -9;
-    if (buffer) |chunk| {
-        if (!vfs.copyFileBuffered(src_volume, dst_volume, entry, dst_parent, baseName(dst_target.path), true, chunk, progress.?)) return -9;
-    } else {
-        if (!vfs.copyFile(src_volume, dst_volume, entry, dst_parent, baseName(dst_target.path))) return -9;
-    }
+    if (dst_entry) |destination| if (destination.isDir() or destination.isReadOnly()) return -9;
+    if (!copyUnderLease(&req, src_volume, dst_volume, src_target.drive_ref.letter, dst_target.drive_ref.letter, entry, dst_parent, baseName(dst_target.path), buffer, progress)) return -9;
     invalidateRegistryCacheIfHivePath(raw_dst);
     ok = true;
     return 1;
@@ -3169,8 +3280,12 @@ pub fn fileMove(src_ptr: [*:0]const u8, dst_ptr: [*:0]const u8) callconv(.c) i32
         }
     }
     if (!renamed) {
-        if (!vfs.copyFile(src_volume, dst_volume, entry, dst_parent, baseName(dst_target.path))) return -9;
-        if (!vfs.deleteFile(src_volume, src_parent, baseName(src_target.path))) return -10;
+        if (dst_entry) |destination| if (destination.isDir() or destination.isReadOnly()) return -9;
+        if (!copyUnderLease(&req, src_volume, dst_volume, src_target.drive_ref.letter, dst_target.drive_ref.letter, entry, dst_parent, baseName(dst_target.path), null, null)) return -9;
+        var remove_request = fs_request.beginVolume(.file_delete, src_target.drive_ref.letter, src_volume) orelse return -10;
+        const removed = vfs.deleteFile(src_volume, src_parent, baseName(src_target.path));
+        fs_request.finish(&remove_request, removed);
+        if (!removed) return -10;
     }
     invalidateRegistryCacheIfHivePath(raw_src);
     invalidateRegistryCacheIfHivePath(raw_dst);

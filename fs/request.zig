@@ -83,6 +83,8 @@ pub const Guard = struct {
     lanes: [request_scope.lane_count]u8 = .{0} ** request_scope.lane_count,
     lane_count: u8 = 0,
     gates_locked: bool = false,
+    mutations_locked: bool = false,
+    lanes_active: bool = false,
     start_tick: u64 = 0,
     active: bool = false,
     uses: [drive_gate_count]?access.UseToken = .{null} ** drive_gate_count,
@@ -115,11 +117,26 @@ const LaneState = struct {
 var request_gates: [request_scope.lane_count]sync.UnwindGuard =
     .{sync.UnwindGuard.init("fs-drive")} ** request_scope.lane_count;
 var lane_states: [request_scope.lane_count]LaneState = .{LaneState{}} ** request_scope.lane_count;
+// A copy retains namespace/data stability while its per-call backend lane
+// is lent to readers. Writers always acquire mutation lanes before backend
+// lanes, in canonical drive order. These are wait-spanning task owners.
+var mutation_gates: [request_scope.lane_count]sync.UnwindGuard =
+    .{sync.UnwindGuard.init("fs-mutation")} ** request_scope.lane_count;
+var mutation_progress: [request_scope.lane_count]u64 = .{0} ** request_scope.lane_count;
 var stats: Summary = .{};
+
+fn readOnly(kind: Kind) bool {
+    return switch (kind) {
+        .drive_info, .file_read, .file_read_at, .dir_list, .dir_entry, .file_info, .loader_read, .config_read => true,
+        else => false,
+    };
+}
 
 pub fn init() void {
     request_gates = .{sync.UnwindGuard.init("fs-drive")} ** request_scope.lane_count;
     lane_states = .{LaneState{}} ** request_scope.lane_count;
+    mutation_gates = .{sync.UnwindGuard.init("fs-mutation")} ** request_scope.lane_count;
+    mutation_progress = .{0} ** request_scope.lane_count;
     stats = .{};
 }
 
@@ -228,6 +245,13 @@ fn beginPlan(
         _ = task_context.leaveUnwind(unwind);
     };
     var acquired_count: u8 = 0;
+    var mutation_count: u8 = 0;
+    defer if (!transferred) {
+        while (mutation_count != 0) {
+            mutation_count -= 1;
+            _ = mutation_gates[plan.lanes[mutation_count]].leave();
+        }
+    };
     const runtime_owned = scheduler.currentId() != null;
     if (runtime_owned) {
         if (bound_refs) |refs| {
@@ -241,10 +265,28 @@ fn beginPlan(
                 uses[i] = access.beginUse(volume.accessReference() orelse return null, .request) catch return null;
             }
         }
+        if (!readOnly(kind)) {
+            // An old caller may nest a write inside a read-owned lane. Such
+            // an upgrade can try but must never wait behind another writer
+            // while retaining the lane that writer needs to finish.
+            var nested_backend = false;
+            for (&request_gates) |*gate| if (gate.ownedByCurrent()) {
+                nested_backend = true;
+                break;
+            };
+            while (mutation_count < plan.count) : (mutation_count += 1) {
+                const lane = plan.lanes[mutation_count];
+                const admitted = if (acquire_mode == .immediate or nested_backend)
+                    mutation_gates[lane].tryEnter()
+                else
+                    acquireGate(lane, true);
+                if (!admitted) return null;
+            }
+        }
         while (acquired_count < plan.count) : (acquired_count += 1) {
             const lane = plan.lanes[acquired_count];
             const acquired = switch (acquire_mode) {
-                .bounded_wait => acquireGate(lane),
+                .bounded_wait => acquireGate(lane, false),
                 .immediate => request_gates[lane].tryEnter(),
             };
             if (!acquired) {
@@ -297,6 +339,8 @@ fn beginPlan(
         .lanes = plan.lanes,
         .lane_count = plan.count,
         .gates_locked = runtime_owned,
+        .mutations_locked = runtime_owned and !readOnly(kind),
+        .lanes_active = true,
         .start_tick = timer.tickCount(),
         .active = true,
         .uses = uses,
@@ -319,6 +363,25 @@ pub fn finish(guard: *Guard, ok: bool) void {
     if (stats.active_requests != 0) stats.active_requests -= 1;
     stats.active_progress_sequence +%= 1;
 
+    finishLanes(guard);
+    if (guard.mutations_locked) {
+        var remaining = guard.lane_count;
+        while (remaining != 0) {
+            remaining -= 1;
+            _ = mutation_gates[guard.lanes[remaining]].leave();
+        }
+        guard.mutations_locked = false;
+    }
+    guard.active = false;
+    for (&guard.uses) |*token| if (token.*) |use| {
+        access.endUse(use) catch {};
+        token.* = null;
+    };
+    _ = task_context.leaveUnwind(guard.unwind);
+}
+
+fn finishLanes(guard: *Guard) void {
+    if (!guard.lanes_active) return;
     var lane_offset = guard.lane_count;
     while (lane_offset != 0) {
         lane_offset -= 1;
@@ -333,12 +396,26 @@ pub fn finish(guard: *Guard, ok: bool) void {
         }
         if (guard.gates_locked) _ = request_gates[lane].leave();
     }
-    guard.active = false;
-    for (&guard.uses) |*token| if (token.*) |use| {
-        access.endUse(use) catch {};
-        token.* = null;
-    };
-    _ = task_context.leaveUnwind(guard.unwind);
+    guard.lanes_active = false;
+    guard.gates_locked = false;
+}
+
+/// Copy-only transition: retain both mount uses, mutation owners and unwind
+/// lifetime, but stop borrowing filesystem scratch. A nested legacy caller
+/// keeps its old exclusive lane; it must never accidentally release a parent.
+pub fn allowCopyReaders(guard: *Guard) bool {
+    if (!guard.active or !guard.mutations_locked or !guard.gates_locked or
+        (guard.kind != .file_copy and guard.kind != .file_move)) return false;
+    for (guard.lanes[0..guard.lane_count]) |lane| {
+        if (!mutation_gates[lane].ownedByCurrent() or !request_gates[lane].ownedByCurrent() or request_gates[lane].depth != 1) return false;
+    }
+    finishLanes(guard);
+    return true;
+}
+
+pub fn copyProgress(guard: *const Guard) void {
+    if (!guard.mutations_locked) return;
+    for (guard.lanes[0..guard.lane_count]) |lane| _ = @atomicRmw(u64, &mutation_progress[lane], .Add, 1, .monotonic);
 }
 
 pub fn kindCode(kind: Kind) u32 {
@@ -363,6 +440,7 @@ pub fn reportAtomicProgress(
         state.progress = completed;
         state.progress_total = total;
         state.progress_sequence +%= 1;
+        _ = @atomicRmw(u64, &mutation_progress[lane_index], .Add, 1, .monotonic);
         stats.active_progress_sequence +%= 1;
     }
 }
@@ -377,13 +455,13 @@ pub fn reportAtomicProgress(
 const GATE_SLICE_TICKS: u64 = 5 * @as(u64, timer.DEFAULT_HZ);
 const GATE_SLICE_LIMIT: u32 = 12;
 
-fn acquireGate(lane: u8) bool {
+fn acquireGate(lane: u8, mutation: bool) bool {
     if (scheduler.current() == null) return false;
-    const gate = &request_gates[lane];
+    const gate = if (mutation) &mutation_gates[lane] else &request_gates[lane];
     if (gate.tryEnter()) return true;
     stats.lock_contention_waits +%= 1;
     var slices: u32 = 0;
-    var progress_sequence = lane_states[lane].progress_sequence;
+    var progress_sequence: u64 = if (mutation) @atomicLoad(u64, &mutation_progress[lane], .monotonic) else lane_states[lane].progress_sequence;
     while (true) {
         if (gate.enter(GATE_SLICE_TICKS)) {
             return true;
@@ -391,8 +469,9 @@ fn acquireGate(lane: u8) bool {
         // A full 5-second wait is not a stall if the long checked update
         // crossed at least one explicit progress boundary in that interval.
         // Restart the consecutive-stall budget while retaining the gate.
-        if (lane_states[lane].progress_sequence != progress_sequence) {
-            progress_sequence = lane_states[lane].progress_sequence;
+        const observed: u64 = if (mutation) @atomicLoad(u64, &mutation_progress[lane], .monotonic) else lane_states[lane].progress_sequence;
+        if (observed != progress_sequence) {
+            progress_sequence = observed;
             slices = 0;
             continue;
         }

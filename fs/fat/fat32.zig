@@ -1370,6 +1370,25 @@ fn appendFileInternal(original_volume: Volume, parent_cluster: u32, name: []cons
     return .ok;
 }
 
+/// Non-atomic copy publication, including LFN targets. Persist removal of
+/// the short staging owner before installing the new owner: interruption
+/// may orphan a completed payload but can never create two durable names
+/// that would each free the same chain. Do not retry/delete on uncertain I/O.
+pub fn publishCopyFile(original: Volume, parent: u32, staged: []const u8, target: []const u8) bool {
+    if (!validShortInput(staged) or !validInputName(target) or entryNameEqualAscii(staged, target)) return false;
+    const volume = beginMutation(original) orelse return false;
+    invalidateAppendCache();
+    var existing: Entry = undefined;
+    if (findEntryStatus(volume, parent, target, &existing) != .not_found) return false;
+    var loc: EntryLocation = undefined;
+    if (findEntryLocationStatus(volume, parent, staged, &loc) != .found or loc.entry.isDir() or loc.entry.isReadOnly() or loc.lfn_slot_count != 0) return false;
+    var raw: [MAX_DIR_ENTRIES_PER_NAME * 32]u8 = undefined;
+    const entries = buildNameDirectoryEntries(volume, parent, target, ATTR_ARCHIVE, loc.entry.first_cluster, loc.entry.size, &raw) orelse return false;
+    if (!detachEntryNoFree(volume, loc) or !flushMutation(volume)) return false;
+    if (!writeDirectoryEntries(volume, parent, entries)) return false;
+    return flushMutation(volume);
+}
+
 pub fn copyFile(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent_cluster: u32, dst_name: []const u8) bool {
     return copyFileWithMode(src_volume, dst_volume, src_entry, dst_parent_cluster, dst_name, true);
 }

@@ -180,6 +180,7 @@ pub fn build(b: *std.Build) void {
     addUnitTest(b, storage_test_step, "storage_boot_tests.zig");
     addUnitTest(b, storage_test_step, "storage/access_state.zig");
     addUnitTest(b, storage_test_step, "fs/fat/directory_growth.zig");
+    addUnitTest(b, storage_test_step, "fs/copy_transfer.zig");
     test_step.dependOn(storage_test_step);
     const input_test_step = b.step("input-test", "Run the existing bounded input and USB owner tests");
     for ([_][]const u8{

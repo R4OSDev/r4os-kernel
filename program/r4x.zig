@@ -7466,6 +7466,7 @@ pub fn initializeRuntime(usable_bytes: u64) void {
 fn configureApiGroups() void {
     r4api.r4sys.setPathResolver(resolveApiTarget);
     r4api.r4sys.setStreamOwnerResolver(resolveR4SysStreamOwner);
+    r4api.r4sys.setCopyCancellationProvider(apiProgramShouldClose);
     @import("../storage/access_runtime.zig").setOwnerResolver(resolveStorageOwner);
     r4api.r4sys.setProgramModuleRunningProvider(programModuleRunningByPath);
     r4api.r4draw.setDisplayUsedHook(noteDisplayUsed);

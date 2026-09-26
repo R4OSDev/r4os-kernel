@@ -462,6 +462,16 @@ fn ntfsCurrentSize(v: ntfs_fs.Volume, parent: NodeRef, name: []const u8) u64 {
     return ntfs_fs.childSize(v, parent, name);
 }
 
+/// Caller owns the destination mutation lease and backend lane; the target
+/// name is absent and the staged payload has already been flushed.
+pub fn publishCopyFile(volume: Volume, parent: NodeRef, staged: []const u8, target: []const u8) bool {
+    defer notifyDirectoryChanged(volume, parent);
+    return switch (volume) {
+        .fat32 => |v| fat32.publishCopyFile(v, @intCast(parent), staged, target),
+        .ntfs => |v| ntfs_fs.renameEntryStatus(v, parent, staged, target) == .ok,
+    };
+}
+
 pub fn copyFile(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent: NodeRef, dst_name: []const u8) bool {
     defer notifyDirectoryChanged(dst_volume, dst_parent);
     return switch (src_volume) {
@@ -484,12 +494,7 @@ pub fn copyFileNoReplace(src_volume: Volume, dst_volume: Volume, src_entry: Entr
     };
 }
 
-pub const CopyProgress = struct {
-    bytes: u64 = 0,
-    source_size: u64 = 0,
-    chunks: u32 = 0,
-    max_chunk: u32 = 0,
-};
+pub const CopyProgress = @import("copy_transfer.zig").Progress;
 
 /// Callers hold the paired filesystem request (including its unwind guard).
 /// Each operation owns its buffer across all I/O waits; disjoint volume
