@@ -261,11 +261,12 @@ fn refreshHdaR4dBackend(reason: []const u8) void {
     current.hda.r4d_loaded = true;
     current.hda.attempted = true;
     current.hda.failed = false;
-    current.hda.registered = audio.audioBackendRegistered("HDA");
-    current.hda.active = audio.audioBackendActive("HDA");
+    const backend = audio.audioBackendFamilyStatus("HDA");
+    current.hda.registered = backend.registered;
+    current.hda.active = backend.active;
     current.hda.state = if (current.hda.active)
         .r4d_active
-    else if (current.hda.registered and audio.audioBackendHasOutput("HDA"))
+    else if (current.hda.registered and backend.has_output)
         .r4d_registered
     else
         .r4d_loaded;

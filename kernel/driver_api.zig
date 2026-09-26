@@ -458,6 +458,7 @@ pub const OwnerCleanupToken = struct {
     storage_plan: StorageCleanupPlan = .{},
     net_mutation_active: bool = false,
     display_blit_prepared: bool = false,
+    audio_prepared: bool = false,
     shutdown_started: bool = false,
     active: bool = false,
 };
@@ -537,6 +538,14 @@ pub fn prepareOwnerCleanup(owner: u32) ?OwnerCleanupToken {
         return null;
     }
     token.display_blit_prepared = true;
+    if (!setAudioOwnerClosing(owner, true)) {
+        _ = setAudioOwnerClosing(owner, false);
+        display_blit.cancelOwnerCleanup(owner);
+        cancelStorageOwnerCleanup(&token.storage_plan);
+        finishOwnerNetMutation(&token);
+        return null;
+    }
+    token.audio_prepared = true;
     token.active = true;
     return token;
 }
@@ -546,6 +555,7 @@ pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
     cancelStorageOwnerCleanup(&token.storage_plan);
     finishOwnerNetMutation(token);
     if (token.display_blit_prepared) display_blit.cancelOwnerCleanup(token.owner);
+    if (token.audio_prepared) _ = setAudioOwnerClosing(token.owner, false);
     token.active = false;
     return true;
 }
@@ -632,6 +642,7 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
         cancelStorageOwnerCleanup(&token.storage_plan);
         finishOwnerNetMutation(token);
         if (token.display_blit_prepared) display_blit.cancelOwnerCleanup(owner);
+        if (token.audio_prepared) _ = setAudioOwnerClosing(owner, false);
         token.active = false;
         return false;
     }
@@ -674,7 +685,13 @@ pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
     }
     finishOwnerNetMutation(token);
     const display_blit_count = display_blit.cleanupOwner(owner);
-    const audio_count = cleanupAudioOwner(owner);
+    const audio_cleanup = cleanupAudioOwner(owner);
+    if (audio_cleanup.failed) {
+        token.active = false;
+        bootlog.puts("[R4D] audio-finalize=FAILED resources=quarantined\r\n");
+        return false;
+    }
+    const audio_count = audio_cleanup.removed;
     const usb_host_cleanup = usb_host.cleanupOwner(owner);
     if (usb_host_cleanup.failed) {
         token.active = false;
@@ -2170,8 +2187,7 @@ fn registerAudioOutputBackend(name: [*:0]const u8, backend: *const anyopaque) ca
             .select = audioOutputSelectCallback,
             .active = audioOutputActiveCallback,
         })) {
-            _ = audio.unregisterAudioBackendZ(name);
-            slot.* = .{};
+            if (audio.unregisterAudioBackendZ(name) == 0) slot.* = .{};
             return -3;
         }
     }
@@ -2926,18 +2942,36 @@ fn commitStorageOwnerCleanup(plan: *StorageCleanupPlan) StorageCleanupResult {
     return result;
 }
 
-fn cleanupAudioOwner(owner: u32) u32 {
-    var removed: u32 = 0;
+fn setAudioOwnerClosing(owner: u32, closing: bool) bool {
+    for (&r4d_audio_backends) |*backend| {
+        if (!backend.used or backend.owner != owner) continue;
+        if (!audio.setAudioBackendClosing(backend.name[0..backend.name_len], closing)) return false;
+    }
+    return true;
+}
+
+const AudioOwnerCleanupResult = struct { removed: u32 = 0, failed: bool = false };
+
+fn cleanupAudioOwner(owner: u32) AudioOwnerCleanupResult {
+    var result: AudioOwnerCleanupResult = .{};
     var index: usize = 0;
     while (index < r4d_audio_backends.len) : (index += 1) {
         const backend = &r4d_audio_backends[index];
         if (!backend.used or backend.owner != owner) continue;
-        if (backend.descriptor.shutdown) |shutdown| _ = shutdown(backend.descriptor.context);
-        _ = audio.unregisterAudioBackendByName(backend.name[0..backend.name_len]);
+        if (backend.descriptor.shutdown) |shutdown| {
+            if (shutdown(backend.descriptor.context) != 0) {
+                result.failed = true;
+                continue;
+            }
+        }
+        if (audio.unregisterAudioBackendByName(backend.name[0..backend.name_len]) != 0) {
+            result.failed = true;
+            continue;
+        }
         backend.* = R4DAudioBackend{};
-        removed += 1;
+        result.removed += 1;
     }
-    return removed;
+    return result;
 }
 
 fn cleanupNetOwner(owner: u32) NetOwnerCleanupResult {
