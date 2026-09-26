@@ -26,6 +26,7 @@ const tlb = @import("../arch/x86_64/tlb_shootdown.zig");
 const platform_cpu = @import("../platform/cpu.zig");
 const monotonic = @import("../platform/monotonic.zig");
 const scheduler = @import("../sched/scheduler.zig");
+const sync = @import("../sched/sync.zig");
 const task = @import("../sched/task.zig");
 const r4x = @import("../program/r4x.zig");
 const timer = @import("timer.zig");
@@ -121,6 +122,8 @@ var acceptance_tlb_updated_mask: u64 = 0;
 var acceptance_tlb_failures: u32 = 0;
 var acceptance_owner_done_mask: u64 = 0;
 var acceptance_owner_failures: u32 = 0;
+var acceptance_mutex: sync.Mutex = sync.Mutex.initClass("smp-owner-probe", sync.LockRank.local, .sleepable);
+var acceptance_mutex_counter: u64 = 0;
 var acceptance_retire_release: u8 = 0;
 
 pub fn initBsp() void {
@@ -385,6 +388,8 @@ pub fn runAcceptanceProbeIfEnabled(usable_bytes: u64) bool {
     @atomicStore(u32, &acceptance_tlb_failures, 0, .release);
     @atomicStore(u64, &acceptance_owner_done_mask, 0, .release);
     @atomicStore(u32, &acceptance_owner_failures, 0, .release);
+    acceptance_mutex = sync.Mutex.initClass("smp-owner-probe", sync.LockRank.local, .sleepable);
+    acceptance_mutex_counter = 0;
     @atomicStore(u8, &acceptance_retire_release, 0, .release);
     defer @atomicStore(u8, &acceptance_retire_release, 1, .release);
 
@@ -534,7 +539,8 @@ pub fn runAcceptanceProbeIfEnabled(usable_bytes: u64) bool {
     const owner_done_mask = @atomicLoad(u64, &acceptance_owner_done_mask, .acquire);
     const owner_failures = @atomicLoad(u32, &acceptance_owner_failures, .acquire);
     const lock_ok = runtime_stats.legacy_global_acquisitions == 0 and owner_stats.order_violations == 0 and
-        owner_failures == 0 and (owner_done_mask & online_mask) == online_mask;
+        owner_failures == 0 and (owner_done_mask & online_mask) == online_mask and
+        acceptance_mutex_counter == @as(u64, online_count) * OWNER_STRESS_ITERATIONS;
     const serial_stats = com.logTxStats();
     const serial_ok = serial_stats.bulk_calls != 0 and serial_stats.max_span > 1 and
         serial_stats.lock_acquisitions == serial_stats.write_calls and
@@ -989,6 +995,18 @@ fn runOwnerStress(cpu_index: u32, bit: u64) void {
         const free_result = heap.free(memory);
         if (!content_ok or free_result != .ok) {
             _ = @atomicRmw(u32, &acceptance_owner_failures, .Add, 1, .acq_rel);
+        }
+        // Real cross-CPU mutex contention in the existing owner witness.
+        // Only bounded arithmetic lies under this sleepable mutex; heap
+        // mutation, waits and callbacks remain outside its owned section.
+        if (!acceptance_mutex.lock(timer.DEFAULT_HZ)) {
+            _ = @atomicRmw(u32, &acceptance_owner_failures, .Add, 1, .acq_rel);
+            break;
+        }
+        acceptance_mutex_counter += 1;
+        if (!acceptance_mutex.unlock()) {
+            _ = @atomicRmw(u32, &acceptance_owner_failures, .Add, 1, .acq_rel);
+            break;
         }
     }
     _ = @atomicRmw(u64, &acceptance_owner_done_mask, .Or, bit, .acq_rel);

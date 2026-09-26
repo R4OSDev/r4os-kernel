@@ -680,6 +680,9 @@ pub const Mutex = struct {
     name: []const u8 = "local",
     queue: WaitQueue = WaitQueue.init(),
     donation_rank: u8 = task.no_dispatch_rank,
+    // A selected waiter already owns depth one before it becomes Ready.
+    // Its first retry acknowledges that transfer rather than recursing.
+    handoff_pending: bool = false,
 
     pub fn init() Mutex {
         return .{};
@@ -711,6 +714,10 @@ pub const Mutex = struct {
             return true;
         }
         if (self.owner == current_id and self.owner_generation == current_generation) {
+            if (self.handoff_pending) {
+                self.handoff_pending = false;
+                return true;
+            }
             if (self.depth == 0xFFFF_FFFF) return false;
             self.depth += 1;
             global_lock_summary.acquires +%= 1;
@@ -755,18 +762,9 @@ pub const Mutex = struct {
         const current_task = scheduler.current() orelse return false;
         const current_id = current_task.id;
         const current_generation = current_task.generation;
-        var wake_waiter = false;
-
         const irq_flags = interrupts.saveAndDisableRuntime();
         scheduler.preemptDisable();
         defer {
-            // A selected waiter does not own the mutex yet. If it is hard-
-            // killed before its retry, wakeOne would strand every remaining
-            // waiter on a free mutex with no future unlock as wake source.
-            // Drain the queue while the release publication is still covered
-            // by the outer preemption critical section; losers retry/enrol
-            // through waitUnless.
-            if (wake_waiter) _ = self.queue.wakeAll();
             scheduler.preemptEnable();
             interrupts.restore(irq_flags);
         }
@@ -788,15 +786,50 @@ pub const Mutex = struct {
             }
             self.owner = 0;
             self.owner_generation = 0;
+            self.handoff_pending = false;
             if (self.donation_rank != task.no_dispatch_rank) {
                 if (task.removeDispatchDonation(current_task, self.donation_rank)) {
                     global_lock_summary.role_donation_releases +%= 1;
                 }
                 self.donation_rank = task.no_dispatch_rank;
             }
-            wake_waiter = true;
+            self.handoffNextLocked();
         }
         return true;
+    }
+
+    fn handoffNextLocked(self: *Mutex) void {
+        while (self.queue.popWaiter(true)) |node| {
+            const target: *task.Task = @ptrCast(@alignCast(node.owner));
+            if (target.generation != node.owner_generation or target.state != .blocked) continue;
+            if (target.held_lock_count == 0xFFFF_FFFF) {
+                _ = scheduler.wakeTask(target, .cancelled);
+                continue;
+            }
+            recordLockOrder(target, self.objectId(), self.rank);
+            self.owner = target.id;
+            self.owner_generation = target.generation;
+            self.depth = 1;
+            self.handoff_pending = true;
+            target.held_lock_count += 1;
+            recordLockAcquire(target, self.objectId(), self.name, self.rank, self.mode);
+            // The canonical lock count blocks hard kill/reap before Ready
+            // publication. Timeout/cancel before selection detached the node;
+            // after this point the exact generation is an ordinary owner.
+            if (scheduler.wakeTask(target, .signaled)) {
+                global_summary.wake_one +%= 1;
+                global_summary.directed_wakes +%= 1;
+                return;
+            }
+            // Defensive rollback if the selected state cannot be published.
+            // Do not leave a free mutex with remaining sleepers and no owner.
+            recordLockRelease(target, self.objectId());
+            target.held_lock_count -= 1;
+            self.owner = 0;
+            self.owner_generation = 0;
+            self.depth = 0;
+            self.handoff_pending = false;
+        }
     }
 
     fn objectId(self: *const Mutex) u64 {
