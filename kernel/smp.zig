@@ -549,10 +549,11 @@ pub fn runAcceptanceProbeIfEnabled(usable_bytes: u64) bool {
         r4x.runR4lPreemptionAcceptance(target_cpu, usable_bytes)
     else
         false;
+    const parallel_owners_ok = r4x.runParallelOwnersAcceptance();
     const tlb_ok = tlb_runtime_ok and tlb_cleanup_ok and tlb_worker_failures == 0 and
         (tlb_ready_mask & online_mask) == online_mask and (tlb_updated_mask & online_mask) == online_mask and
         tlb_stats.timeouts == tlb_stats.expected_timeouts and tlb_stats.successes != 0;
-    const ok = failures == 0 and clock_ok and placement_mask == online_mask and observed_mask == online_mask and
+    const ok = parallel_owners_ok and failures == 0 and clock_ok and placement_mask == online_mask and observed_mask == online_mask and
         actual_checksum == expected_checksum and speedup_milli >= ACCEPTANCE_MIN_SPEEDUP_MILLI and heap_probe.ok and
         tlb_ok and lock_ok and serial_ok and r4l_preemption_ok;
 

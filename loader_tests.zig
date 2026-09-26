@@ -10,3 +10,7 @@ test {
     _ = @import("kernel/driver_semaphore_owner.zig");
     _ = @import("arch/x86_64/callback_abort.zig");
 }
+
+test {
+    _ = @import("program/execution_policy.zig");
+}

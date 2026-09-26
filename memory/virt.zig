@@ -124,6 +124,7 @@ pub const Error = error{
 };
 
 pub const ReserveRequest = struct {
+    eviction_allowed: bool = true,
     window: Window,
     len: u64,
     alignment: u64 = paging.PAGE_SIZE,
@@ -135,6 +136,7 @@ pub const ReserveRequest = struct {
 };
 
 pub const ReserveAtRequest = struct {
+    eviction_allowed: bool = true,
     window: Window,
     base: u64,
     len: u64,
@@ -404,6 +406,7 @@ const EvictionStep = struct {
 const Range = struct {
     slot_used: bool = false,
     id: u32 = 0,
+    eviction_allowed: bool = true,
     window: Window = .temp_kernel,
     kind: blocks.Kind = .virtual_range,
     owner: blocks.Owner = .kernel,
@@ -554,6 +557,7 @@ pub fn reserve(req: ReserveRequest) Error!u32 {
         .owner_id = req.owner_id,
         .name = req.name,
         .flags = req.flags,
+        .eviction_allowed = req.eviction_allowed,
     });
 }
 
@@ -572,6 +576,7 @@ pub fn reserveAt(req: ReserveAtRequest) Error!u32 {
         .owner_id = req.owner_id,
         .name = req.name,
         .flags = req.flags,
+        .eviction_allowed = req.eviction_allowed,
     });
 }
 
@@ -594,7 +599,7 @@ pub fn commit(id: u32, offset: u64, len_raw: u64) Error!void {
         try validateUncommitted(range.*, range.base + offset, len);
         const next_committed = checkedAdd(range.committed_bytes, len) orelse return Error.Overflow;
         try addCommitSpan(range.id, range.base + offset, len);
-        addPageStateSpan(range.id, offset / paging.PAGE_SIZE, len / paging.PAGE_SIZE, page_state_flag_committed, 0, 0, 0) catch |err| {
+        addPageStateSpan(range.id, offset / paging.PAGE_SIZE, len / paging.PAGE_SIZE, page_state_flag_committed | (if (range.eviction_allowed) @as(u32, 0) else page_state_flag_pinned), 0, 0, 0) catch |err| {
             removeCommitSpan(range.id, range.base + offset, len) catch {};
             return err;
         };
@@ -1377,6 +1382,7 @@ fn reserveAtInternal(req: ReserveAtRequest) Error!u32 {
         .status = .reserved,
         .name = req.name,
         .flags = req.flags,
+        .eviction_allowed = req.eviction_allowed,
         .base = req.base,
         .len = req.len,
         .committed_bytes = 0,
@@ -2700,6 +2706,7 @@ fn applyPageStateOperation(range: Range, input: PageStateInput, first_page: u64,
             page_state_summary.pinned_marks +%= input.page_count;
         },
         page_state_operation_clear_pinned => {
+            if (!range.eviction_allowed) return Error.Busy;
             try pageStateSet(range.id, first_page, input.page_count, 0, page_state_flag_pinned, null, true);
             page_state_summary.pinned_clears +%= input.page_count;
         },

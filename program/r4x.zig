@@ -41,6 +41,7 @@ const task_context = @import("../sched/task_context.zig");
 const r4api = @import("r4api.zig");
 const r4x_api = @import("r4x_api.zig");
 const r4x_start = @import("r4x_start.zig");
+const execution_policy = @import("execution_policy.zig");
 const lifecycle_retire_policy = @import("lifecycle_retire_policy.zig");
 const gui_alpha8 = @import("gui_alpha8.zig");
 const desktop_events = @import("../kernel/desktop_events.zig");
@@ -513,6 +514,7 @@ const LoadedProgram = struct {
     image: ProgramImage,
     entry: RawEntryFn,
     memory_contract: ProgramMemoryContract = .{},
+    parallel_execution: bool = false,
     imports: [MAX_R4M_IMPORTS]R4XStartImportSeed = .{R4XStartImportSeed{}} ** MAX_R4M_IMPORTS,
     import_count: u32 = 0,
     loader_section_count: u32 = 0,
@@ -966,6 +968,7 @@ const ProgramGuiFramePayload = struct {
 };
 
 const ProgramGuiPayload = struct {
+    operation_gate: sync.UnwindGuard = sync.UnwindGuard.init("gui-operation"),
     header: ProgramPayloadHeader = .{},
     frame_lock: sync.Mutex = sync.Mutex.initClass("r4x-gui-frame", sync.LockRank.program_instances, .no_sleep),
     committed_frame: ?*ProgramGuiFramePayload = null,
@@ -1016,6 +1019,7 @@ const ProgramInstanceStorage = struct {
 };
 
 const ProgramInstance = struct {
+    parallel_execution: bool = false, // immutable after publication
     gfx_virtual_closed: bool = false, // common BO owner; closed before exit publication
     notifications: notifications.Owner = .{},
     used: bool = false,
@@ -1275,6 +1279,12 @@ pub const ProgramInstanceStorageSelfTestReport = struct {
     storage_baseline_ok: bool = false,
     zero_init_ok: bool = false,
 };
+
+fn addInstanceStorageStat(comptime field: []const u8, amount: u64) void {
+    const token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(token);
+    @field(instance_storage_stats, field) +%= @intCast(amount);
+}
 
 var instance_storage_stats: ProgramInstanceStorageStats = .{};
 var active_published_payload_bytes: u64 = 0;
@@ -2105,13 +2115,13 @@ fn noteGuiFrameReleaseForSelfTest(kind: ProgramPayloadKind) void {
 }
 
 fn allocateInstancePayload(comptime Payload: type, owner_id: u32, kind: ProgramPayloadKind) ?*Payload {
-    instance_storage_stats.allocation_attempts +%= 1;
+    addInstanceStorageStat("allocation_attempts", 1);
     if (shouldInjectInstanceStorageFailure()) {
-        instance_storage_stats.allocation_failures +%= 1;
+        addInstanceStorageStat("allocation_failures", 1);
         return null;
     }
     const memory = heap.alloc(@sizeOf(Payload), @alignOf(Payload)) orelse {
-        instance_storage_stats.allocation_failures +%= 1;
+        addInstanceStorageStat("allocation_failures", 1);
         return null;
     };
     const payload: *Payload = @ptrCast(@alignCast(memory.ptr));
@@ -2122,7 +2132,7 @@ fn allocateInstancePayload(comptime Payload: type, owner_id: u32, kind: ProgramP
         .requested_bytes = @intCast(@sizeOf(Payload)),
         .kind = kind,
     };
-    instance_storage_stats.payload_allocations +%= 1;
+    addInstanceStorageStat("payload_allocations", 1);
     notePayloadAllocation(kind, @sizeOf(Payload));
     if (instanceById(owner_id) != null) noteActivePayloadAllocation(@sizeOf(Payload));
     return payload;
@@ -2148,13 +2158,13 @@ fn guiCommandPayloadCommandsConst(payload: *const ProgramGuiCommandPayload) []co
 
 fn allocateGuiCommandPayload(owner_id: u32, logical_offset: u64, capacity: u32) ?*ProgramGuiCommandPayload {
     const requested_bytes = guiCommandPayloadBytes(capacity) orelse return null;
-    instance_storage_stats.allocation_attempts +%= 1;
+    addInstanceStorageStat("allocation_attempts", 1);
     if (shouldInjectInstanceStorageFailure()) {
-        instance_storage_stats.allocation_failures +%= 1;
+        addInstanceStorageStat("allocation_failures", 1);
         return null;
     }
     const memory = heap.alloc(requested_bytes, @alignOf(ProgramGuiCommandPayload)) orelse {
-        instance_storage_stats.allocation_failures +%= 1;
+        addInstanceStorageStat("allocation_failures", 1);
         return null;
     };
     @memset(memory, 0);
@@ -2167,7 +2177,7 @@ fn allocateGuiCommandPayload(owner_id: u32, logical_offset: u64, capacity: u32) 
     };
     payload.logical_offset = logical_offset;
     payload.capacity = capacity;
-    instance_storage_stats.payload_allocations +%= 1;
+    addInstanceStorageStat("payload_allocations", 1);
     notePayloadAllocation(.gui_commands, requested_bytes);
     if (instanceById(owner_id) != null) noteActivePayloadAllocation(requested_bytes);
     return payload;
@@ -2219,13 +2229,13 @@ fn allocateGuiResourcePayload(
 ) ?*ProgramGuiResourcePayload {
     const payload_kind = guiResourcePayloadKind(resource_kind) orelse return null;
     const requested_bytes = guiResourcePayloadBytes(byte_count) orelse return null;
-    instance_storage_stats.allocation_attempts +%= 1;
+    addInstanceStorageStat("allocation_attempts", 1);
     if (shouldInjectInstanceStorageFailure()) {
-        instance_storage_stats.allocation_failures +%= 1;
+        addInstanceStorageStat("allocation_failures", 1);
         return null;
     }
     const memory = heap.alloc(requested_bytes, @alignOf(ProgramGuiResourcePayload)) orelse {
-        instance_storage_stats.allocation_failures +%= 1;
+        addInstanceStorageStat("allocation_failures", 1);
         return null;
     };
     @memset(memory, 0);
@@ -2240,7 +2250,7 @@ fn allocateGuiResourcePayload(
     payload.raster_word_offset = raster_word_offset;
     payload.byte_count = @intCast(byte_count);
     payload.resource_kind = resource_kind;
-    instance_storage_stats.payload_allocations +%= 1;
+    addInstanceStorageStat("payload_allocations", 1);
     notePayloadAllocation(payload_kind, requested_bytes);
     if (instanceById(owner_id) != null) noteActivePayloadAllocation(requested_bytes);
     return payload;
@@ -2258,11 +2268,11 @@ fn releaseInstancePayload(comptime Payload: type, payload: *Payload, owner_id: u
     const bytes: [*]u8 = @ptrCast(payload);
     noteGuiFrameReleaseForSelfTest(kind);
     if (heap.free(bytes[0..@sizeOf(Payload)]) != .ok) {
-        instance_storage_stats.free_failures +%= 1;
+        addInstanceStorageStat("free_failures", 1);
         quarantinePayload(kind, @sizeOf(Payload));
         return false;
     }
-    instance_storage_stats.payload_releases +%= 1;
+    addInstanceStorageStat("payload_releases", 1);
     notePayloadRelease(kind, @sizeOf(Payload));
     return true;
 }
@@ -2281,11 +2291,11 @@ fn releaseGuiCommandPayload(payload: *ProgramGuiCommandPayload, owner_id: u32) b
     const bytes: [*]u8 = @ptrCast(payload);
     noteGuiFrameReleaseForSelfTest(.gui_commands);
     if (heap.free(bytes[0..requested_bytes]) != .ok) {
-        instance_storage_stats.free_failures +%= 1;
+        addInstanceStorageStat("free_failures", 1);
         quarantinePayload(.gui_commands, requested_bytes);
         return false;
     }
-    instance_storage_stats.payload_releases +%= 1;
+    addInstanceStorageStat("payload_releases", 1);
     notePayloadRelease(.gui_commands, requested_bytes);
     return true;
 }
@@ -2307,11 +2317,11 @@ fn releaseGuiResourcePayload(payload: *ProgramGuiResourcePayload, owner_id: u32)
     const bytes: [*]u8 = @ptrCast(payload);
     noteGuiFrameReleaseForSelfTest(payload_kind);
     if (heap.free(bytes[0..requested_bytes]) != .ok) {
-        instance_storage_stats.free_failures +%= 1;
+        addInstanceStorageStat("free_failures", 1);
         quarantinePayload(payload_kind, requested_bytes);
         return false;
     }
-    instance_storage_stats.payload_releases +%= 1;
+    addInstanceStorageStat("payload_releases", 1);
     notePayloadRelease(payload_kind, requested_bytes);
     return true;
 }
@@ -2327,11 +2337,11 @@ fn validateInstancePayloadHeaderBytes(header: *const ProgramPayloadHeader, owner
         header.kind != kind or
         header.reserved != 0)
     {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     if (header.owner_id != owner_id) {
-        instance_storage_stats.owner_mismatches +%= 1;
+        addInstanceStorageStat("owner_mismatches", 1);
         return false;
     }
     return true;
@@ -2340,7 +2350,7 @@ fn validateInstancePayloadHeaderBytes(header: *const ProgramPayloadHeader, owner
 fn validateConsoleOutputPayload(payload: *const ProgramConsoleOutputPayload, owner_id: u32) bool {
     if (!validateInstancePayloadHeader(ProgramConsoleOutputPayload, payload, owner_id, .console_output)) return false;
     if (payload.ref_count == 0 or payload.active_ref_count > payload.ref_count or !std.mem.allEqual(u8, payload.reserved[0..], 0)) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     return true;
@@ -2387,11 +2397,11 @@ fn freeConsoleOutputPayloadMemory(payload: *ProgramConsoleOutputPayload) bool {
     }
     const bytes: [*]u8 = @ptrCast(payload);
     if (heap.free(bytes[0..@sizeOf(ProgramConsoleOutputPayload)]) != .ok) {
-        instance_storage_stats.free_failures +%= 1;
+        addInstanceStorageStat("free_failures", 1);
         quarantinePayload(.console_output, @sizeOf(ProgramConsoleOutputPayload));
         return false;
     }
-    instance_storage_stats.payload_releases +%= 1;
+    addInstanceStorageStat("payload_releases", 1);
     notePayloadRelease(.console_output, @sizeOf(ProgramConsoleOutputPayload));
     return true;
 }
@@ -2401,7 +2411,7 @@ fn releaseConsoleOutputPayload(payload: *ProgramConsoleOutputPayload, active: bo
     payload.ref_count -= 1;
     if (payload.ref_count != 0) return true;
     if (payload.active_ref_count != 0) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     return freeConsoleOutputPayloadMemory(payload);
@@ -2440,7 +2450,7 @@ fn validateConsoleTranscript(transcript: *const ProgramConsoleTranscriptPayload,
     if (!validateInstancePayloadHeader(ProgramConsoleTranscriptPayload, transcript, owner_id, .console_transcript) or
         transcript.segment_count > transcript.segments.len or transcript.output_len > CONSOLE_OUTPUT_SIZE)
     {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     var total: u64 = 0;
@@ -2448,28 +2458,28 @@ fn validateConsoleTranscript(transcript: *const ProgramConsoleTranscriptPayload,
     while (index < transcript.segment_count) : (index += 1) {
         const segment = transcript.segments[index];
         const payload = segment.payload orelse {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         };
         if (segment.length == 0 or segment.reserved != 0 or
             !validateConsoleOutputPayload(payload, payload.header.owner_id))
         {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         const end = std.math.add(u64, segment.start_sequence, segment.length) catch {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         };
         const retained_start = payload.next_sequence -| @min(payload.next_sequence, CONSOLE_OUTPUT_SIZE);
         if (segment.start_sequence < retained_start or end > payload.next_sequence) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         total += segment.length;
     }
     if (total != transcript.output_len) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     return true;
@@ -2477,18 +2487,18 @@ fn validateConsoleTranscript(transcript: *const ProgramConsoleTranscriptPayload,
 
 fn allocateProgramInstanceStorage(owner_id: u32, app_class: AppClass, inherit_environment: bool) ?ProgramInstanceStorage {
     const runtime = allocateInstancePayload(ProgramRuntimePayload, owner_id, .runtime) orelse {
-        instance_storage_stats.transaction_rollbacks +%= 1;
+        addInstanceStorageStat("transaction_rollbacks", 1);
         return null;
     };
     const process = allocateInstancePayload(ProgramProcessPayload, owner_id, .process) orelse {
-        instance_storage_stats.transaction_rollbacks +%= 1;
+        addInstanceStorageStat("transaction_rollbacks", 1);
         _ = releaseInstancePayload(ProgramRuntimePayload, runtime, owner_id, .runtime);
         return null;
     };
     var storage = ProgramInstanceStorage{ .runtime = runtime, .process = process };
     if (inherit_environment) {
         process.environment_payload = allocateInstancePayload(ProgramEnvironmentPayload, owner_id, .environment) orelse {
-            instance_storage_stats.transaction_rollbacks +%= 1;
+            addInstanceStorageStat("transaction_rollbacks", 1);
             rollbackProgramInstanceStorage(owner_id, &storage);
             return null;
         };
@@ -2496,20 +2506,20 @@ fn allocateProgramInstanceStorage(owner_id: u32, app_class: AppClass, inherit_en
     switch (app_class) {
         .console => {
             const console = allocateInstancePayload(ProgramConsolePayload, owner_id, .console) orelse {
-                instance_storage_stats.transaction_rollbacks +%= 1;
+                addInstanceStorageStat("transaction_rollbacks", 1);
                 rollbackProgramInstanceStorage(owner_id, &storage);
                 return null;
             };
             storage.console = console;
             console.transcript_payload = allocateInstancePayload(ProgramConsoleTranscriptPayload, owner_id, .console_transcript) orelse {
-                instance_storage_stats.transaction_rollbacks +%= 1;
+                addInstanceStorageStat("transaction_rollbacks", 1);
                 rollbackProgramInstanceStorage(owner_id, &storage);
                 return null;
             };
         },
         .gui => {
             storage.gui = allocateInstancePayload(ProgramGuiPayload, owner_id, .gui) orelse {
-                instance_storage_stats.transaction_rollbacks +%= 1;
+                addInstanceStorageStat("transaction_rollbacks", 1);
                 rollbackProgramInstanceStorage(owner_id, &storage);
                 return null;
             };
@@ -2521,19 +2531,19 @@ fn allocateProgramInstanceStorage(owner_id: u32, app_class: AppClass, inherit_en
 
 fn validateGuiCommandPayload(payload: *const ProgramGuiCommandPayload, owner_id: u32) bool {
     const requested_bytes = guiCommandPayloadBytes(payload.capacity) orelse {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     };
     if (payload.allocation_sequence == 0 or payload.command_count == 0 or payload.command_count > payload.capacity or
         !validateInstancePayloadHeaderBytes(&payload.header, owner_id, .gui_commands, requested_bytes))
     {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     const commands = guiCommandPayloadCommandsConst(payload);
     for (commands[0..payload.command_count]) |command| {
         if (command.version != 1 or command.size != 96 or command.reserved != 0) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
     }
@@ -2542,11 +2552,11 @@ fn validateGuiCommandPayload(payload: *const ProgramGuiCommandPayload, owner_id:
 
 fn validateGuiResourcePayload(payload: *const ProgramGuiResourcePayload, owner_id: u32) bool {
     const payload_kind = guiResourcePayloadKind(payload.resource_kind) orelse {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     };
     const requested_bytes = guiResourcePayloadBytes(payload.byte_count) orelse {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     };
     if (payload.allocation_sequence == 0 or
@@ -2554,7 +2564,7 @@ fn validateGuiResourcePayload(payload: *const ProgramGuiResourcePayload, owner_i
         payload.reserved != 0 or
         !validateInstancePayloadHeaderBytes(&payload.header, owner_id, payload_kind, requested_bytes))
     {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     return true;
@@ -2563,21 +2573,21 @@ fn validateGuiResourcePayload(payload: *const ProgramGuiResourcePayload, owner_i
 fn validateGuiFrameOwnership(frame: *const ProgramGuiFramePayload, owner_id: u32) bool {
     if (!validateInstancePayloadHeader(ProgramGuiFramePayload, frame, owner_id, .gui_frame)) return false;
     if (frame.build_failed and frame.generation != 0) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     if (frame.shared_raster_count > r4x_api.gui_shared_raster_max_frame_resources) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
 
     if (frame.command_payload == null) {
         if (frame.command_tail != null or frame.command_count != 0) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
     } else if (frame.command_tail == null or frame.command_count == 0) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
 
@@ -2587,32 +2597,32 @@ fn validateGuiFrameOwnership(frame: *const ProgramGuiFramePayload, owner_id: u32
     while (command_cursor) |payload| {
         if (!validateGuiCommandPayload(payload, owner_id)) return false;
         if (payload.previous != previous_command or payload.logical_offset != logical_command) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         logical_command = std.math.add(u64, logical_command, payload.command_count) catch {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         };
         if (logical_command > frame.command_count or (payload.next == null and frame.command_tail != payload)) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         previous_command = payload;
         command_cursor = payload.next;
     }
     if (previous_command != frame.command_tail or logical_command != frame.command_count) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
 
     if (frame.resource_payload == null) {
         if (frame.resource_tail != null or frame.resource_len != 0) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
     } else if (frame.resource_tail == null or frame.resource_len == 0) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
 
@@ -2622,15 +2632,15 @@ fn validateGuiFrameOwnership(frame: *const ProgramGuiFramePayload, owner_id: u32
     while (cursor) |payload| {
         if (!validateGuiResourcePayload(payload, owner_id)) return false;
         if (payload.previous != previous or payload.logical_offset != logical_offset) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         logical_offset = std.math.add(u64, logical_offset, payload.byte_count) catch {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         };
         if (logical_offset > frame.resource_len) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         // Generic shared-blob nodes do not own a legacy raster-word range.
@@ -2638,18 +2648,18 @@ fn validateGuiFrameOwnership(frame: *const ProgramGuiFramePayload, owner_id: u32
         // complete semantic validator below; their offset may follow raster
         // commands stored in earlier generic blob nodes.
         if (payload.resource_kind != .xrgb32 and payload.resource_kind != .alpha8 and payload.raster_word_offset != 0) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         if (payload.next == null and frame.resource_tail != payload) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         previous = payload;
         cursor = payload.next;
     }
     if (previous != frame.resource_tail or logical_offset != frame.resource_len) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
 
@@ -2667,14 +2677,14 @@ fn validateGuiFrameOwnership(frame: *const ProgramGuiFramePayload, owner_id: u32
             true
         else blk: {
             if (ordered_command.?.allocation_sequence == ordered_resource.?.allocation_sequence) {
-                instance_storage_stats.header_errors +%= 1;
+                addInstanceStorageStat("header_errors", 1);
                 return false;
             }
             break :blk ordered_command.?.allocation_sequence < ordered_resource.?.allocation_sequence;
         };
         const sequence = if (take_command) ordered_command.?.allocation_sequence else ordered_resource.?.allocation_sequence;
         if (last_sequence == std.math.maxInt(u64) or sequence != last_sequence + 1) {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         last_sequence = sequence;
@@ -2685,7 +2695,7 @@ fn validateGuiFrameOwnership(frame: *const ProgramGuiFramePayload, owner_id: u32
         }
     }
     if (last_sequence != frame.node_sequence) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
 
@@ -2734,27 +2744,27 @@ fn validateGuiFrame(frame: *const ProgramGuiFramePayload, owner_id: u32) bool {
                 r4x_api.gui_frame_command_kind_xrgb32_nearest => .xrgb32_nearest,
                 r4x_api.gui_frame_command_kind_shared_raster => .shared_raster,
                 else => {
-                    instance_storage_stats.header_errors +%= 1;
+                    addInstanceStorageStat("header_errors", 1);
                     return false;
                 },
             };
             if (command.resource_kind != expected_kind) {
-                instance_storage_stats.header_errors +%= 1;
+                addInstanceStorageStat("header_errors", 1);
                 return false;
             }
             if (command.resource_kind == .none) {
                 if (command.payload_offset != 0 or command.payload_bytes != 0 or command.raster_word_offset != 0) {
-                    instance_storage_stats.header_errors +%= 1;
+                    addInstanceStorageStat("header_errors", 1);
                     return false;
                 }
                 continue;
             }
             const payload_end = std.math.add(u64, command.payload_offset, command.payload_bytes) catch {
-                instance_storage_stats.header_errors +%= 1;
+                addInstanceStorageStat("header_errors", 1);
                 return false;
             };
             if (command.payload_bytes == 0 or payload_end > frame.resource_len) {
-                instance_storage_stats.header_errors +%= 1;
+                addInstanceStorageStat("header_errors", 1);
                 return false;
             }
             if (command.resource_kind == .xrgb32 or command.resource_kind == .alpha8) {
@@ -2765,40 +2775,40 @@ fn validateGuiFrame(frame: *const ProgramGuiFramePayload, owner_id: u32) bool {
                 if ((command.resource_kind == .xrgb32 and (command.payload_bytes % @sizeOf(u32)) != 0) or
                     command.raster_word_offset != command_raster_words)
                 {
-                    instance_storage_stats.header_errors +%= 1;
+                    addInstanceStorageStat("header_errors", 1);
                     return false;
                 }
                 if (physical_resource) |resource| {
                     if (command.payload_offset > resource.logical_offset) {
-                        instance_storage_stats.header_errors +%= 1;
+                        addInstanceStorageStat("header_errors", 1);
                         return false;
                     }
                     if (command.payload_offset == resource.logical_offset) {
                         const physical_bytes = std.math.mul(u64, words, @sizeOf(u32)) catch {
-                            instance_storage_stats.header_errors +%= 1;
+                            addInstanceStorageStat("header_errors", 1);
                             return false;
                         };
                         if (resource.resource_kind != command.resource_kind or resource.byte_count != physical_bytes or
                             resource.raster_word_offset != command.raster_word_offset)
                         {
-                            instance_storage_stats.header_errors +%= 1;
+                            addInstanceStorageStat("header_errors", 1);
                             return false;
                         }
                         physical_resource = nextPhysicalGuiResource(resource.next);
                     }
                 }
                 command_raster_words = std.math.add(u64, command_raster_words, words) catch {
-                    instance_storage_stats.header_errors +%= 1;
+                    addInstanceStorageStat("header_errors", 1);
                     return false;
                 };
             } else if (command.raster_word_offset != 0) {
-                instance_storage_stats.header_errors +%= 1;
+                addInstanceStorageStat("header_errors", 1);
                 return false;
             }
         }
     }
     if (physical_resource != null or command_raster_words != frame.raster_words) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     return true;
@@ -2966,7 +2976,7 @@ fn releaseGuiFrame(frame: *ProgramGuiFramePayload, owner_id: u32) bool {
 
 fn validateGuiFrameSet(gui: *const ProgramGuiPayload, owner_id: u32) bool {
     if (gui.committed_frame != null and gui.committed_frame == gui.building_frame) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         return false;
     }
     if (gui.committed_frame) |frame| {
@@ -2983,7 +2993,7 @@ fn validateGuiFrameSet(gui: *const ProgramGuiPayload, owner_id: u32) bool {
         if (!frame.retired or frame.generation == 0 or frame.generation >= previous_generation or
             frame == gui.committed_frame or frame == gui.building_frame or !validateCommittedGuiFrameChain(frame, owner_id, true))
         {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             return false;
         }
         previous_generation = frame.generation;
@@ -3034,7 +3044,7 @@ fn validateProgramInstanceStorage(instance: *const ProgramInstance) bool {
     if (instance.runtime_payload) |runtime| {
         if (!validateInstancePayloadHeader(ProgramRuntimePayload, runtime, instance.id, .runtime)) valid = false;
     } else {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         valid = false;
     }
 
@@ -3046,7 +3056,7 @@ fn validateProgramInstanceStorage(instance: *const ProgramInstance) bool {
             if (!validateInstancePayloadHeader(ProgramEnvironmentPayload, environment, instance.id, .environment)) valid = false;
         }
     } else {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         valid = false;
     }
 
@@ -3060,11 +3070,11 @@ fn validateProgramInstanceStorage(instance: *const ProgramInstance) bool {
                 if (!validateConsoleOutputPayload(output, instance.id)) valid = false;
             }
         } else {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
             valid = false;
         }
     } else if (instance.app_class == .console) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         valid = false;
     }
 
@@ -3074,7 +3084,7 @@ fn validateProgramInstanceStorage(instance: *const ProgramInstance) bool {
             valid = false;
         } else if (!validateGuiFrameSet(gui, instance.id)) valid = false;
     } else if (instance.app_class == .gui) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
         valid = false;
     }
     return valid;
@@ -3265,6 +3275,8 @@ fn freeCompletionOutput(node: *ProgramCompletionNode) void {
 }
 
 pub fn instanceStorageStats() ProgramInstanceStorageStats {
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
     refreshInstanceByteTelemetry();
     return instance_storage_stats;
 }
@@ -4639,15 +4651,17 @@ fn instanceStorageCurrentEqual(a: ProgramInstanceStorageStats, b: ProgramInstanc
 }
 
 fn notePayloadAllocation(kind: ProgramPayloadKind, bytes: usize) void {
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
     const count = payloadCount(kind);
     count.* +%= 1;
     const category = payloadCategoryBytes(kind);
     category.current.* +%= @intCast(bytes);
     if (category.current.* > category.peak.*) category.peak.* = category.current.*;
-    instance_storage_stats.current_payload_bytes +%= @intCast(bytes);
+    addInstanceStorageStat("current_payload_bytes", @intCast(bytes));
     if (isGuiFramePayloadKind(kind)) {
-        instance_storage_stats.current_gui_frame_bytes +%= @intCast(bytes);
-        instance_storage_stats.current_gui_frame_nodes +%= 1;
+        addInstanceStorageStat("current_gui_frame_bytes", @intCast(bytes));
+        addInstanceStorageStat("current_gui_frame_nodes", 1);
         if (instance_storage_stats.current_gui_frame_bytes > instance_storage_stats.peak_gui_frame_bytes) {
             instance_storage_stats.peak_gui_frame_bytes = instance_storage_stats.current_gui_frame_bytes;
         }
@@ -4665,27 +4679,29 @@ fn notePayloadAllocation(kind: ProgramPayloadKind, bytes: usize) void {
 }
 
 fn notePayloadRelease(kind: ProgramPayloadKind, bytes: usize) void {
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
     const count = payloadCount(kind);
-    if (count.* > 0) count.* -= 1 else instance_storage_stats.header_errors +%= 1;
+    if (count.* > 0) count.* -= 1 else addInstanceStorageStat("header_errors", 1);
     const category = payloadCategoryBytes(kind);
     const byte_count: u64 = @intCast(bytes);
-    if (category.current.* >= byte_count) category.current.* -= byte_count else instance_storage_stats.header_errors +%= 1;
+    if (category.current.* >= byte_count) category.current.* -= byte_count else addInstanceStorageStat("header_errors", 1);
     if (instance_storage_stats.current_payload_bytes >= byte_count) {
         instance_storage_stats.current_payload_bytes -= byte_count;
     } else {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
     }
     if (isGuiFramePayloadKind(kind)) {
         if (instance_storage_stats.current_gui_frame_bytes >= byte_count) {
             instance_storage_stats.current_gui_frame_bytes -= byte_count;
         } else {
             instance_storage_stats.current_gui_frame_bytes = 0;
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
         }
         if (instance_storage_stats.current_gui_frame_nodes > 0) {
             instance_storage_stats.current_gui_frame_nodes -= 1;
         } else {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
         }
     }
     refreshInstanceByteTelemetry();
@@ -4696,18 +4712,22 @@ fn isGuiFramePayloadKind(kind: ProgramPayloadKind) bool {
 }
 
 fn noteGuiFrameCommandsAllocation(count: u64) void {
-    instance_storage_stats.current_gui_frame_commands +%= count;
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
+    addInstanceStorageStat("current_gui_frame_commands", count);
     if (instance_storage_stats.current_gui_frame_commands > instance_storage_stats.peak_gui_frame_commands) {
         instance_storage_stats.peak_gui_frame_commands = instance_storage_stats.current_gui_frame_commands;
     }
 }
 
 fn noteGuiFrameCommandsRelease(count: u64) void {
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
     if (instance_storage_stats.current_gui_frame_commands >= count) {
         instance_storage_stats.current_gui_frame_commands -= count;
     } else {
         instance_storage_stats.current_gui_frame_commands = 0;
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
     }
 }
 
@@ -4741,6 +4761,8 @@ fn payloadCount(kind: ProgramPayloadKind) *u32 {
 }
 
 fn refreshInstanceByteTelemetry() void {
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
     instance_storage_stats.live_core_bytes = @as(u64, instance_storage_stats.active_instances) * @sizeOf(ProgramInstance);
     instance_storage_stats.active_instance_bytes = instance_storage_stats.live_core_bytes + active_published_payload_bytes;
     instance_storage_stats.reserved_instance_bytes = instance_storage_stats.registry_reserved_core_bytes + instance_storage_stats.current_payload_bytes;
@@ -4753,17 +4775,21 @@ fn refreshInstanceByteTelemetry() void {
 }
 
 fn noteActivePayloadAllocation(bytes: usize) void {
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
     active_published_payload_bytes +%= @intCast(bytes);
     refreshInstanceByteTelemetry();
 }
 
 fn noteActivePayloadRelease(bytes: usize) void {
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
     const byte_count: u64 = @intCast(bytes);
     if (active_published_payload_bytes >= byte_count) {
         active_published_payload_bytes -= byte_count;
     } else {
         active_published_payload_bytes = 0;
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
     }
     refreshInstanceByteTelemetry();
 }
@@ -4791,7 +4817,9 @@ fn programInstancePayloadBytes(instance: *const ProgramInstance) u64 {
 }
 
 fn noteProgramInstancePublished(app_class: AppClass, payload_bytes: u64) void {
-    instance_storage_stats.active_instances +%= 1;
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
+    addInstanceStorageStat("active_instances", 1);
     active_published_payload_bytes +%= payload_bytes;
     switch (app_class) {
         .service => instance_storage_stats.active_service_instances +%= 1,
@@ -4802,32 +4830,36 @@ fn noteProgramInstancePublished(app_class: AppClass, payload_bytes: u64) void {
 }
 
 fn noteProgramInstanceRetired(app_class: AppClass) void {
-    if (instance_storage_stats.active_instances > 0) instance_storage_stats.active_instances -= 1 else instance_storage_stats.header_errors +%= 1;
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
+    if (instance_storage_stats.active_instances > 0) instance_storage_stats.active_instances -= 1 else addInstanceStorageStat("header_errors", 1);
     switch (app_class) {
         .service => if (instance_storage_stats.active_service_instances > 0) {
             instance_storage_stats.active_service_instances -= 1;
         } else {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
         },
         .console => if (instance_storage_stats.active_console_instances > 0) {
             instance_storage_stats.active_console_instances -= 1;
         } else {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
         },
         .gui => if (instance_storage_stats.active_gui_instances > 0) {
             instance_storage_stats.active_gui_instances -= 1;
         } else {
-            instance_storage_stats.header_errors +%= 1;
+            addInstanceStorageStat("header_errors", 1);
         },
     }
     refreshInstanceByteTelemetry();
 }
 
 fn quarantinePayload(kind: ProgramPayloadKind, bytes: usize) void {
+    const stats_token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(stats_token);
     const count = payloadCount(kind);
-    if (count.* > 0) count.* -= 1 else instance_storage_stats.header_errors +%= 1;
-    instance_storage_stats.quarantined_payloads +%= 1;
-    instance_storage_stats.quarantined_bytes +%= @intCast(bytes);
+    if (count.* > 0) count.* -= 1 else addInstanceStorageStat("header_errors", 1);
+    addInstanceStorageStat("quarantined_payloads", 1);
+    addInstanceStorageStat("quarantined_bytes", @intCast(bytes));
     refreshInstanceByteTelemetry();
 }
 
@@ -4864,10 +4896,20 @@ fn guiPayloadConst(instance: *const ProgramInstance) *const ProgramGuiPayload {
 }
 
 fn ensureGuiPayload(instance: *ProgramInstance) ?*ProgramGuiPayload {
-    if (instance.gui_payload) |payload| return payload;
-    const payload = allocateInstancePayload(ProgramGuiPayload, instance.id, .gui) orelse return null;
-    instance.gui_payload = payload;
-    return payload;
+    const first = owner_locks.program_state.acquire();
+    const existing = instance.gui_payload;
+    owner_locks.program_state.release(first);
+    if (existing) |payload| return payload;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return null;
+    defer _ = task_context.leaveUnwind(unwind);
+    const candidate = allocateInstancePayload(ProgramGuiPayload, instance.id, .gui) orelse return null;
+    const token = owner_locks.program_state.acquire();
+    const chosen = instance.gui_payload orelse candidate;
+    instance.gui_payload = chosen;
+    owner_locks.program_state.release(token);
+    if (chosen != candidate) _ = releaseInstancePayload(ProgramGuiPayload, candidate, instance.id, .gui);
+    return chosen;
 }
 
 fn ensureEnvironmentPayload(instance: *ProgramInstance) ?*ProgramEnvironmentPayload {
@@ -5040,7 +5082,7 @@ fn prepareGuiBlitStorage(
     };
     const resource = prepareGuiResourceStorage(instance, frame, byte_count, resource_kind) orelse {
         cancelGuiCommandStorage(instance, &command);
-        instance_storage_stats.transaction_rollbacks +%= 1;
+        addInstanceStorageStat("transaction_rollbacks", 1);
         return null;
     };
     return .{ .command = command, .resource = resource };
@@ -5049,7 +5091,7 @@ fn prepareGuiBlitStorage(
 fn cancelGuiBlitStorage(instance: *ProgramInstance, storage: *GuiBlitStorage) void {
     cancelGuiResourceStorage(instance, &storage.resource);
     cancelGuiCommandStorage(instance, &storage.command);
-    instance_storage_stats.transaction_rollbacks +%= 1;
+    addInstanceStorageStat("transaction_rollbacks", 1);
 }
 
 fn commitGuiBlitStorage(storage: *GuiBlitStorage, command: ProgramGuiCommand) i32 {
@@ -5066,38 +5108,57 @@ const GuiFrameCapture = struct {
     gui: *ProgramGuiPayload,
     frame: *ProgramGuiFramePayload,
     generation: u64,
+    unwind: task_context.UnwindToken = .{},
 };
 
-// Frame state is protected by a no-sleep mutex.  Kernel instruction pointers
-// are not timer-preempted today, so contention here can only be transient
-// future-SMP contention.  Spin without yielding: a captured frame reference
-// must never cross a scheduler wait before it is released.
+// Short resident metadata owner; captured immutable readers hold an unwind
+// lease across allocation, copying and cooperative rescheduling.
 fn lockGuiFrameState(gui: *ProgramGuiPayload) void {
+    while (!gui.operation_gate.enter(sync.WAIT_FOREVER)) scheduler.yield();
     while (!gui.frame_lock.tryLock()) asm volatile ("pause");
+}
+
+fn unlockGuiFrameState(gui: *ProgramGuiPayload) void {
+    _ = gui.frame_lock.unlock();
+    _ = gui.operation_gate.leave();
 }
 
 fn captureCommittedGuiFrame(instance: *ProgramInstance, expected_generation: ?u64) ?GuiFrameCapture {
     const gui = instance.gui_payload orelse return null;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return null;
+    var captured = false;
+    defer if (!captured) {
+        _ = task_context.leaveUnwind(unwind);
+    };
     lockGuiFrameState(gui);
-    defer _ = gui.frame_lock.unlock();
+    defer unlockGuiFrameState(gui);
     const frame = gui.committed_frame orelse return null;
     if (expected_generation) |expected| if (frame.generation != expected) return null;
     if (frame.reader_refs == std.math.maxInt(u32)) return null;
     frame.reader_refs += 1;
-    return .{ .gui = gui, .frame = frame, .generation = frame.generation };
+    captured = true;
+    return .{ .gui = gui, .frame = frame, .generation = frame.generation, .unwind = unwind };
 }
 
 fn captureGuiFrameGeneration(instance: *ProgramInstance, generation: u64) ?GuiFrameCapture {
     if (generation == 0) return null;
     const gui = instance.gui_payload orelse return null;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return null;
+    var captured = false;
+    defer if (!captured) {
+        _ = task_context.leaveUnwind(unwind);
+    };
     lockGuiFrameState(gui);
-    defer _ = gui.frame_lock.unlock();
+    defer unlockGuiFrameState(gui);
     var cursor = gui.committed_frame;
     while (cursor) |frame| : (cursor = frame.base_frame) {
         if (frame.generation != generation) continue;
         if (frame.reader_refs == std.math.maxInt(u32)) return null;
         frame.reader_refs += 1;
-        return .{ .gui = gui, .frame = frame, .generation = generation };
+        captured = true;
+        return .{ .gui = gui, .frame = frame, .generation = generation, .unwind = unwind };
     }
     return null;
 }
@@ -5149,16 +5210,17 @@ fn removeReleasableRetiredGuiChainLocked(gui: *ProgramGuiPayload, changed: *cons
 }
 
 fn releaseCapturedGuiFrame(instance: *ProgramInstance, capture: *GuiFrameCapture) void {
+    defer _ = task_context.leaveUnwind(capture.unwind);
     var release_frame: ?*ProgramGuiFramePayload = null;
     const gui = capture.gui;
     lockGuiFrameState(gui);
     if (capture.frame.reader_refs == 0) {
-        instance_storage_stats.header_errors +%= 1;
+        addInstanceStorageStat("header_errors", 1);
     } else {
         capture.frame.reader_refs -= 1;
         if (capture.frame.reader_refs == 0) release_frame = removeReleasableRetiredGuiChainLocked(gui, capture.frame);
     }
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     if (release_frame) |frame| _ = releaseGuiFrame(frame, instance.id);
 }
 
@@ -5917,7 +5979,7 @@ fn guiFrameMarkBuildFailed(gui: *ProgramGuiPayload, frame: ?*ProgramGuiFramePayl
     if (frame) |value| value.build_failed = true;
     gui.frame_oom +%= 1;
     gui.frame_last_error = r4x_api.gui_frame_error_oom;
-    instance_storage_stats.gui_frame_oom_failures +%= 1;
+    addInstanceStorageStat("gui_frame_oom_failures", 1);
 }
 
 fn setGuiFrameResult(gui: *ProgramGuiPayload, result: i32) i32 {
@@ -5934,10 +5996,10 @@ fn guiFrameBegin(instance: *ProgramInstance) i32 {
     // the frame-state lock across allocation or release.
     lockGuiFrameState(gui);
     if (gui.building_frame != null) {
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return -3;
     }
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
 
     const frame = allocateGuiFramePayload(instance.id, true) orelse {
         guiFrameMarkBuildFailed(gui, null);
@@ -5945,13 +6007,13 @@ fn guiFrameBegin(instance: *ProgramInstance) i32 {
     };
     lockGuiFrameState(gui);
     if (gui.building_frame != null) {
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         _ = releaseGuiFrame(frame, instance.id);
         return -3;
     }
     gui.building_frame = frame;
     refreshGuiFrameOwnerPeak(gui);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     return 0;
 }
 
@@ -5970,10 +6032,10 @@ fn guiFrameBeginDamage(instance: *ProgramInstance, regions: []const DisplayDamag
     if (gui.building_frame != null or gui.committed_frame == null or
         gui.committed_frame.?.chain_depth >= r4x_api.gui_frame_max_delta_chain)
     {
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
     }
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
 
     const frame = allocateGuiFramePayload(instance.id, true) orelse {
         guiFrameMarkBuildFailed(gui, null);
@@ -5985,13 +6047,13 @@ fn guiFrameBeginDamage(instance: *ProgramInstance, regions: []const DisplayDamag
     if (gui.building_frame != null or gui.committed_frame == null or
         gui.committed_frame.?.chain_depth >= r4x_api.gui_frame_max_delta_chain)
     {
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         _ = releaseGuiFrame(frame, instance.id);
         return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
     }
     gui.building_frame = frame;
     refreshGuiFrameOwnerPeak(gui);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     return setGuiFrameResult(gui, r4x_api.gui_frame_result_ok);
 }
 
@@ -6001,10 +6063,10 @@ fn guiFrameBeginReplace(instance: *ProgramInstance, regions: []const DisplayDama
     const gui = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
     lockGuiFrameState(gui);
     if (gui.building_frame != null) {
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
     }
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
 
     const frame = allocateGuiFramePayload(instance.id, true) orelse {
         guiFrameMarkBuildFailed(gui, null);
@@ -6015,13 +6077,13 @@ fn guiFrameBeginReplace(instance: *ProgramInstance, regions: []const DisplayDama
     frame.replacement = true;
     lockGuiFrameState(gui);
     if (gui.building_frame != null) {
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         _ = releaseGuiFrame(frame, instance.id);
         return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
     }
     gui.building_frame = frame;
     refreshGuiFrameOwnerPeak(gui);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     return setGuiFrameResult(gui, r4x_api.gui_frame_result_ok);
 }
 
@@ -6035,7 +6097,7 @@ fn guiFrameReplaceBuild(instance: *ProgramInstance, explicit_build: bool) ?*Prog
     const old = gui.building_frame;
     gui.building_frame = frame;
     refreshGuiFrameOwnerPeak(gui);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     if (old) |old_frame| _ = releaseGuiFrame(old_frame, instance.id);
     return frame;
 }
@@ -6054,7 +6116,7 @@ fn guiFrameEnsureBuild(instance: *ProgramInstance) ?*ProgramGuiFramePayload {
             };
             lockGuiFrameState(gui);
             if (gui.building_frame) |frame| {
-                _ = gui.frame_lock.unlock();
+                unlockGuiFrameState(gui);
                 releaseCapturedGuiFrame(instance, &captured);
                 _ = releaseGuiFrame(clone, instance.id);
                 return if (frame.build_failed) null else frame;
@@ -6062,11 +6124,11 @@ fn guiFrameEnsureBuild(instance: *ProgramInstance) ?*ProgramGuiFramePayload {
             if (gui.committed_frame == captured.frame and gui.committed_frame.?.generation == captured.generation) {
                 gui.building_frame = clone;
                 refreshGuiFrameOwnerPeak(gui);
-                _ = gui.frame_lock.unlock();
+                unlockGuiFrameState(gui);
                 releaseCapturedGuiFrame(instance, &captured);
                 return clone;
             }
-            _ = gui.frame_lock.unlock();
+            unlockGuiFrameState(gui);
             releaseCapturedGuiFrame(instance, &captured);
             _ = releaseGuiFrame(clone, instance.id);
             continue;
@@ -6078,17 +6140,17 @@ fn guiFrameEnsureBuild(instance: *ProgramInstance) ?*ProgramGuiFramePayload {
         };
         lockGuiFrameState(gui);
         if (gui.building_frame) |frame| {
-            _ = gui.frame_lock.unlock();
+            unlockGuiFrameState(gui);
             _ = releaseGuiFrame(empty, instance.id);
             return if (frame.build_failed) null else frame;
         }
         if (gui.committed_frame == null) {
             gui.building_frame = empty;
             refreshGuiFrameOwnerPeak(gui);
-            _ = gui.frame_lock.unlock();
+            unlockGuiFrameState(gui);
             return empty;
         }
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         _ = releaseGuiFrame(empty, instance.id);
     }
 }
@@ -6097,13 +6159,13 @@ fn guiFrameCancel(instance: *ProgramInstance) i32 {
     const gui = instance.gui_payload orelse return -2;
     lockGuiFrameState(gui);
     const frame = gui.building_frame orelse {
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return -3;
     };
     gui.building_frame = null;
     gui.frame_cancels +%= 1;
-    instance_storage_stats.gui_frame_cancels +%= 1;
-    _ = gui.frame_lock.unlock();
+    addInstanceStorageStat("gui_frame_cancels", 1);
+    unlockGuiFrameState(gui);
     _ = releaseGuiFrame(frame, instance.id);
     return 0;
 }
@@ -6117,7 +6179,7 @@ fn guiFrameCommit(instance: *ProgramInstance) i32 {
     var release_old: ?*ProgramGuiFramePayload = null;
     lockGuiFrameState(gui);
     if (gui.building_frame != building or building.build_failed) {
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return -3;
     }
     // Consume the global generation only after the prepared frame has won
@@ -6125,12 +6187,12 @@ fn guiFrameCommit(instance: *ProgramInstance) i32 {
     // fallible steps, so failed/cancelled builds never burn a generation.
     const old = gui.committed_frame;
     if (is_delta and (old == null or old.?.chain_depth >= r4x_api.gui_frame_max_delta_chain)) {
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
     }
     const generation = reserveGuiFrameGeneration() orelse {
         building.build_failed = true;
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return -7;
     };
     building.generation = generation;
@@ -6142,7 +6204,7 @@ fn guiFrameCommit(instance: *ProgramInstance) i32 {
     gui.committed_frame = building;
     gui.building_frame = null;
     gui.frame_commits +%= 1;
-    instance_storage_stats.gui_frame_commits +%= 1;
+    addInstanceStorageStat("gui_frame_commits", 1);
     if (is_delta) {
         gui.frame_delta_commits +%= 1;
         gui.frame_avoided_clone_bytes +|= guiFrameBytes(old.?);
@@ -6183,7 +6245,7 @@ fn guiFrameCommit(instance: *ProgramInstance) i32 {
     const committed_bytes = guiFrameBytes(building);
     if (committed_bytes > gui.frame_stream_peak_bytes) gui.frame_stream_peak_bytes = committed_bytes;
     refreshGuiFrameOwnerPeak(gui);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     if (release_old) |frame| _ = releaseGuiFrame(frame, instance.id);
     if (building.shared_raster_count != 0) {
         if (currentProgramHandle() orelse programHandleForInstance(instance)) |owner| sharedRasterNoteFrameCommit(owner, building);
@@ -6763,7 +6825,7 @@ fn linkProgramRegistryChunkLocked(chunk: *ProgramRegistryChunk) void {
     if (@as(u64, program_registry_stats.chunk_count) > program_registry_stats.peak_chunks) {
         program_registry_stats.peak_chunks = program_registry_stats.chunk_count;
     }
-    instance_storage_stats.registry_reserved_core_bytes +%= @sizeOf(ProgramRegistryChunk);
+    addInstanceStorageStat("registry_reserved_core_bytes", @sizeOf(ProgramRegistryChunk));
     refreshInstanceByteTelemetry();
 }
 
@@ -7288,6 +7350,8 @@ fn unlinkProgramRegistryChunkLocked(candidate: *ProgramRegistryChunk) bool {
         chunk.next = null;
         if (program_registry_stats.chunk_count != 0) program_registry_stats.chunk_count -= 1;
         if (program_registry_stats.slot_capacity >= PROGRAM_REGISTRY_CHUNK_SLOTS) program_registry_stats.slot_capacity -= PROGRAM_REGISTRY_CHUNK_SLOTS;
+        const stats_token = owner_locks.program_state.acquire();
+        defer owner_locks.program_state.release(stats_token);
         if (instance_storage_stats.registry_reserved_core_bytes >= @sizeOf(ProgramRegistryChunk)) {
             instance_storage_stats.registry_reserved_core_bytes -= @sizeOf(ProgramRegistryChunk);
         }
@@ -7354,6 +7418,7 @@ var shell_instance_generation: u64 = 0;
 var last_display_used: bool = false;
 var last_exit_code: i32 = 0;
 var output_capture: ?[]u8 = null;
+var output_capture_owner: ?*task.Task = null;
 var output_capture_len: usize = 0;
 var output_capture_truncated: bool = false;
 var input_capture: ?[]const u8 = null;
@@ -8184,8 +8249,8 @@ fn fillInputPerformanceInfo(out: *r4api.r4dev.ProgramInputPerformanceInfo) void 
     out.console_output_segment_drops = console_output_segment_drops;
     out.console_output_segment_drop_bytes = console_output_segment_drop_bytes;
     out.program_launch_attempts = program_launch_attempts;
-    out.program_entries_started = program_entries_started;
-    out.program_attach_wait_events = program_attach_wait_events;
+    out.program_entries_started = @atomicLoad(u64, &program_entries_started, .monotonic);
+    out.program_attach_wait_events = @atomicLoad(u64, &program_attach_wait_events, .monotonic);
 }
 
 fn configureR4XStartR4DevTable() void {
@@ -8359,7 +8424,7 @@ pub fn instanceSnapshot(id: u32) ?InstanceSnapshot {
         .task_id = instance.task_id,
         .app_class = @intFromEnum(instance.app_class),
         .state = @intFromEnum(instanceState(instance)),
-        .close_requested = instance.close_requested,
+        .close_requested = @atomicLoad(bool, &instance.close_requested, .acquire),
         .exit_code = instance.exit_code,
     };
 }
@@ -8524,6 +8589,7 @@ pub fn lastExitCode() i32 {
 }
 
 pub fn beginOutputCapture(buffer: []u8) void {
+    output_capture_owner = scheduler.current();
     output_capture = buffer;
     output_capture_len = 0;
     output_capture_truncated = false;
@@ -8532,6 +8598,7 @@ pub fn beginOutputCapture(buffer: []u8) void {
 pub fn endOutputCapture() OutputCaptureResult {
     const result = OutputCaptureResult{ .len = output_capture_len, .truncated = output_capture_truncated };
     output_capture = null;
+    output_capture_owner = null;
     output_capture_len = 0;
     output_capture_truncated = false;
     return result;
@@ -8846,11 +8913,19 @@ const R4XExportContract = struct {
     }
 };
 
-fn readValidatedProgramMemoryContractFromReader(reader: *module_r4m.Reader, r4m: module_r4m.Header, app_class: AppClass, export_contract: R4XExportContract, verbose: bool) ?ProgramMemoryContract {
+const ProgramMetadataContract = struct {
+    memory: ProgramMemoryContract,
+    parallel_execution: bool,
+};
+
+fn readValidatedProgramMetadataFromReader(reader: *module_r4m.Reader, r4m: module_r4m.Header, app_class: AppClass, export_contract: R4XExportContract, verbose: bool) ?ProgramMetadataContract {
     var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
     const meta = reader.readMetadata(r4m, meta_buf[0..], "r4x-metadata-probe", verbose) orelse return null;
     if (!r4x_start.accepts(meta, export_contract.hasExactStartV1(), r4m.export_count)) return null;
-    return resolveProgramMemoryContractMetadata(meta, app_class);
+    return .{
+        .memory = resolveProgramMemoryContractMetadata(meta, app_class) orelse return null,
+        .parallel_execution = (execution_policy.parse(meta) orelse return null) == .owned_v1,
+    };
 }
 
 fn readR4MProgramHeaderFromReader(reader: *module_r4m.Reader, name: []const u8, verbose: bool) ?module_r4m.Header {
@@ -8892,7 +8967,7 @@ fn loadR4MProgramImage(file: ProgramFile, owner_id: u32, app_class: AppClass, re
         k.puts("Invalid R4M0 exports\r\n");
         return null;
     }
-    const memory_contract = readValidatedProgramMemoryContractFromReader(reader, r4m, app_class, export_contract, true) orelse return null;
+    const memory_contract = readValidatedProgramMetadataFromReader(reader, r4m, app_class, export_contract, true) orelse return null;
     var section_offsets: [MAX_R4M_SECTIONS]usize = .{0} ** MAX_R4M_SECTIONS;
     const image_size = layoutR4MSections(sections[0..section_count], section_offsets[0..]) orelse {
         k.puts("Invalid R4M0 image layout\r\n");
@@ -8948,7 +9023,8 @@ fn loadR4MProgramImage(file: ProgramFile, owner_id: u32, app_class: AppClass, re
     return .{
         .image = image,
         .entry = entry,
-        .memory_contract = memory_contract,
+        .memory_contract = memory_contract.memory,
+        .parallel_execution = memory_contract.parallel_execution,
         .imports = r4xstart_imports,
         .import_count = r4xstart_import_count,
         .loader_section_count = r4m.section_count,
@@ -10269,11 +10345,9 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
         payload.revision = 1;
     }
 
-    // Global program/console owners remain on the BSP. LSTRX is the first
-    // explicitly audited CPU-only R4X container: the Test-profile loader
-    // probe starts four ordinary instances and verifies their full teardown.
-    // This allow-list is internal ownership policy, not a public affinity ABI.
-    const smp_audited = app_class == .console and isSmpAuditedBackgroundR4x(loaded);
+    // The module owner opts in only after auditing its state and imports.
+    // Foreground/shell roles retain their separate BSP console owner.
+    const smp_audited = instance.parallel_execution;
     const program_task = (if (smp_audited)
         task.createParallelThreadBlocked("r4x-app", programTaskMain)
     else
@@ -10332,7 +10406,7 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
     // orphans caller-owned observation state.  Pre-Publish cancellation above
     // remains a complete rollback.
     if (app_class == .gui and options.out_handle != null) {
-        guiPayload(instance).start_attach_pending = true;
+        @atomicStore(bool, &guiPayload(instance).start_attach_pending, true, .release);
     }
     if (options.out_handle) |out_handle| out_handle.* = handle;
     const published = scheduler.publishCreatedTask(program_task);
@@ -10354,11 +10428,6 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
     // publishCreatedTask wakes it after the complete registry and task commit;
     // this does not replace timer preemption once user code is running.
     return .ran;
-}
-
-fn isSmpAuditedBackgroundR4x(loaded: LoadedProgram) bool {
-    const origin = loaded.origin[0..loaded.origin_len];
-    return std.ascii.eqlIgnoreCase(origin, "C:\\R4OS\\SOFTWARE\\TERMINAL\\DIAG\\LSTRX.R4X");
 }
 
 fn r4lPreemptionDeadlineExpired(start: monotonic.Stamp, start_tick: u64) bool {
@@ -10678,13 +10747,14 @@ fn programTaskMain() callconv(.c) void {
         foreground_instance_generation == handle.generation;
     markProgramHandleRunning(handle);
     markProgramThreadRunning(thread_ctx);
+    noteParallelOwnerExecution(run, false);
     // Handle-based GUI spawning is a two-step host transaction: Desktop first
     // receives the process handle and then attaches its window slot. Do not let
     // user code observe the intermediate, unhosted state. Other launch modes
     // never set this flag and retain their established start behaviour.
-    if (run.app_class == .gui and guiPayloadConst(run).start_attach_pending) program_attach_wait_events +%= 1;
-    while (run.app_class == .gui and guiPayloadConst(run).start_attach_pending) {
-        if (run.close_requested) break;
+    if (run.app_class == .gui and @atomicLoad(bool, &guiPayloadConst(run).start_attach_pending, .acquire)) _ = @atomicRmw(u64, &program_attach_wait_events, .Add, 1, .monotonic);
+    while (run.app_class == .gui and @atomicLoad(bool, &guiPayloadConst(run).start_attach_pending, .acquire)) {
+        if (@atomicLoad(bool, &run.close_requested, .acquire)) break;
         scheduler.yield();
     }
     {
@@ -10748,6 +10818,7 @@ fn programThreadTaskMain() callconv(.c) void {
     };
     thread_ctx.entry = entry;
     markProgramThreadRunning(thread_ctx);
+    noteParallelOwnerExecution(instance, true);
     const exit_code = r4os_call_program(entry, thread_ctx.arg, thread_ctx.stack.top);
     measureProgramStackHighWater(&thread_ctx.stack);
     if (thread_ctx.stack.serial_telemetry) logProgramStackHighWater(instance, &thread_ctx.stack, thread_ctx.id);
@@ -10764,7 +10835,7 @@ fn callInstanceEntry(run: *ProgramInstance) i32 {
     if (parseSubsystemTrace(process.args[0..cStringLen(process.args[0..])])) |trace| {
         logSubsystemTracePhase(trace, "r4xstart", traceNowNanoseconds());
     }
-    program_entries_started +%= 1;
+    _ = @atomicRmw(u64, &program_entries_started, .Add, 1, .monotonic);
     const exit_code = r4os_call_program(entry, @intFromPtr(&runtimePayload(run).r4xstart_context), run.stack_top);
     if (stackFromInstance(run)) |initial_stack| {
         var measured_stack = initial_stack;
@@ -10910,7 +10981,7 @@ fn apiIoServiceCall(handle: u32, op: u16, request_ptr: [*]const u8, request_len:
     if (request_len != 0 and @intFromPtr(request_ptr) == 0) return services.API_ERR_INVALID;
     if (@intFromPtr(response_ptr) == 0) return services.API_ERR_INVALID;
     const instance = currentInstance() orelse return IO_ERROR_NO_INSTANCE;
-    if (instance.done) return IO_ERROR_NO_INSTANCE;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return IO_ERROR_NO_INSTANCE;
     const instance_handle = currentProgramHandle() orelse return IO_ERROR_NO_INSTANCE;
     const caller_thread = currentProgramThread() orelse return IO_ERROR_NO_INSTANCE;
 
@@ -11107,7 +11178,7 @@ fn submitAsyncFileRequest(kind: AsyncIoKind, path: [*:0]const u8, offset: u64, d
     if ((kind == .file_write or kind == .file_append or kind == .file_write_at or kind == .file_stream_write) and data_len != 0 and data_ptr == 0) return IO_ERROR_INVALID;
     if ((kind == .file_read or kind == .file_read_at) and out_len != 0 and out_ptr == 0) return IO_ERROR_INVALID;
     const instance = currentInstance() orelse return IO_ERROR_NO_INSTANCE;
-    if (instance.done) return IO_ERROR_NO_INSTANCE;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return IO_ERROR_NO_INSTANCE;
     const instance_handle = currentProgramHandle() orelse return IO_ERROR_NO_INSTANCE;
     const caller_thread = currentProgramThread() orelse return IO_ERROR_NO_INSTANCE;
 
@@ -11895,7 +11966,7 @@ fn apiThreadCreateHandle(entry: RawEntryFn, arg: u64, stack_reserve_bytes: u64, 
     defer if (!admitted) recordProgramThreadCreateFailure();
     if ((flags & ~THREAD_CREATE_FLAGS_SUPPORTED) != 0) return THREAD_ERROR_UNSUPPORTED;
     const instance = currentInstance() orelse return THREAD_ERROR_NO_INSTANCE;
-    if (instance.done) return THREAD_ERROR_NO_INSTANCE;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return THREAD_ERROR_NO_INSTANCE;
     const instance_handle = currentProgramHandle() orelse return THREAD_ERROR_NO_INSTANCE;
     const canonical_entry = normalizeThreadEntry(instance, entry) orelse return THREAD_ERROR_INVALID;
 
@@ -11909,7 +11980,7 @@ fn apiThreadCreateHandle(entry: RawEntryFn, arg: u64, stack_reserve_bytes: u64, 
         return THREAD_ERROR_NO_MEMORY;
     };
     var task_failure: task.CreateFailure = .none;
-    const parallel_owner = if (scheduler.current()) |owner_task| owner_task.smp_eligible else false;
+    const parallel_owner = instance.parallel_execution;
     const new_task = (if (parallel_owner)
         task.createParallelThreadBlockedWithFailure("r4x-thread", programThreadTaskMain, &task_failure)
     else
@@ -12964,7 +13035,7 @@ fn captureOutputByte(ch: u8) void {
 
 fn apiOutputTextSpan(stream: ConsoleStream, data: []const u8) void {
     if (data.len == 0) return;
-    if (output_capture != null) {
+    if (percpu.currentIndex() == 0 and output_capture != null and scheduler.current() == output_capture_owner) {
         for (data) |ch| {
             if (ch == '\n') {
                 captureOutputByte('\r');
@@ -13199,6 +13270,7 @@ fn apiVmReserve(size: u64, alignment_raw: u64, flags: u64, out: *ProgramVmRegion
         .owner_id = @intCast(instance.id),
         .name = "r4x-vm-region",
         .flags = map_flags,
+        .eviction_allowed = !instance.parallel_execution,
     }) catch |err| return vmErrorCode(err);
     const rc = fillVmRegionInfoForInstance(instance.id, region_id, out);
     if (rc != VM_OK) {
@@ -13375,18 +13447,31 @@ fn readInputCodepoint() ?u32 {
             // continue to receive input only through their separate queues.
             if (isRawFullscreenPresenter(console_instance)) return keyboard.readCodepoint();
             const current_console = consolePayloadConst(instance);
-            const target_window_id = if (console_instance.gui_payload) |gui| gui.window_id else -1;
+            const target_window_id = if (console_instance.gui_payload) |gui| @atomicLoad(i32, &gui.window_id, .acquire) else -1;
             if (current_console.io_target_id != 0 or target_window_id >= 0 or consolePayloadConst(console_instance).host != .none) return null;
         }
     }
     return keyboard.readCodepoint();
 }
 
+fn guiProducerAllowed(instance: *const ProgramInstance) bool {
+    if (!instance.parallel_execution) return true;
+    const thread = currentProgramThread() orelse return false;
+    return thread.owner_instance == instance and (thread.flags & THREAD_FLAG_MAIN) != 0;
+}
+
 fn apiGuiSetFont(font_id: u32) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     if (!font.isRenderableFontId(font_id)) return -2;
     const gui = ensureGuiPayload(instance) orelse return -3;
-    gui.font_id = font_id;
+    @atomicStore(u32, &gui.font_id, font_id, .release);
     bumpGuiRevision(instance);
     return 0;
 }
@@ -13395,11 +13480,13 @@ fn apiGuiFont(instance_id: u32, out: *GuiFontInfo) callconv(.c) i32 {
     if (@intFromPtr(out) == 0) return -1;
     const selected_font_id = if (instance_id == 0) blk: {
         const instance = currentInstance() orelse return -1;
-        break :blk if (instance.gui_payload) |gui| gui.font_id else GUI_FONT_BUILTIN_ID;
+        break :blk if (instance.gui_payload) |gui| @atomicLoad(u32, &gui.font_id, .acquire) else GUI_FONT_BUILTIN_ID;
     } else blk: {
         reapFinishedInstances();
-        const instance = instanceById(instance_id) orelse return -1;
-        break :blk if (instance.gui_payload) |gui| gui.font_id else GUI_FONT_BUILTIN_ID;
+        const lease = pinProgramInstance(instance_id) orelse return -1;
+        defer unpinProgramInstance(&lease);
+        const instance = lease.instance;
+        break :blk if (instance.gui_payload) |gui| @atomicLoad(u32, &gui.font_id, .acquire) else GUI_FONT_BUILTIN_ID;
     };
     return fillGuiFontInfo(selected_font_id, true, out);
 }
@@ -13624,8 +13711,8 @@ fn apiProgramHandleRequestClose(handle_ptr: *const ProgramProcessHandle) callcon
         unlockProgramRegistry();
         return PROGRAM_HANDLE_ERROR_NOT_RUNNING;
     }
-    if (!slot.instance.close_requested) {
-        slot.instance.close_requested = true;
+    if (!@atomicLoad(bool, &slot.instance.close_requested, .acquire)) {
+        @atomicStore(bool, &slot.instance.close_requested, true, .release);
         bumpProgramInventoryEpochLocked();
     }
     unlockProgramRegistry();
@@ -13737,7 +13824,7 @@ fn apiProgramRequestClose(id: u32) callconv(.c) i32 {
 
 fn apiProgramShouldClose() callconv(.c) u32 {
     const instance = currentInstance() orelse return 0;
-    return if (instance.close_requested) 1 else 0;
+    return if (@atomicLoad(bool, &instance.close_requested, .acquire)) 1 else 0;
 }
 
 fn apiProgramKill(id: u32) callconv(.c) i32 {
@@ -14457,9 +14544,11 @@ fn apiProgramSetWindow(id: u32, window_id: i32) callconv(.c) i32 {
     const lease = pinProgramInstance(id) orelse return -1;
     defer unpinProgramInstance(&lease);
     const instance = lease.instance;
-    if (instance.done) return -2;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return -2;
     const gui = ensureGuiPayload(instance) orelse return -3;
-    gui.window_id = window_id;
+    const token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(token);
+    @atomicStore(i32, &gui.window_id, window_id, .release);
     gui.window_info.window_id = window_id;
     return 0;
 }
@@ -14480,16 +14569,20 @@ fn apiProgramSetWindowHandle(handle_ptr: *const ProgramProcessHandle, window_id:
     };
     defer unpinProgramInstance(&lease);
     const gui = ensureGuiPayload(lease.instance) orelse return PROGRAM_HANDLE_ERROR_TASK_FAILED;
-    gui.window_id = window_id;
+    const token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(token);
+    @atomicStore(i32, &gui.window_id, window_id, .release);
     gui.window_info.window_id = window_id;
-    gui.start_attach_pending = false;
+    @atomicStore(bool, &gui.start_attach_pending, false, .release);
     return PROGRAM_HANDLE_OK;
 }
 
 fn apiProgramSetConsoleHost(id: u32, host_raw: u32) callconv(.c) i32 {
     reapFinishedInstances();
-    const instance = instanceById(id) orelse return -1;
-    if (instance.done) return -2;
+    const lease = pinProgramInstance(id) orelse return -1;
+    defer unpinProgramInstance(&lease);
+    const instance = lease.instance;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return -2;
     if (instance.app_class != .console) return -3;
     const host = parseConsoleHost(host_raw) orelse return -4;
     const console = consolePayload(instance);
@@ -14531,7 +14624,7 @@ fn apiProgramRequestHostLaunch(path_ptr: [*:0]const u8, args_ptr: [*:0]const u8,
     const instance = currentInstance() orelse return -1;
     if (instance.role != .background or instance.app_class != .gui) return -3;
     const gui = guiPayload(instance);
-    if (gui.window_id < 0) return -3;
+    if (apiProgramWindowId() < 0) return -3;
     const policy = parseLaunchPolicy(policy_raw) orelse return -4;
     var path_buf: [MAX_API_PATH]u8 = undefined;
     const raw_path = copyZ(path_ptr, path_buf[0..]) orelse return -2;
@@ -14542,24 +14635,30 @@ fn apiProgramRequestHostLaunch(path_ptr: [*:0]const u8, args_ptr: [*:0]const u8,
     // ProgramHostLaunchRequest is a binary-frozen v1 payload: its path/args
     // fields keep their original widths.  Longer inputs (possible since the
     // 0.60.19 path limits) are rejected visibly instead of truncated.
-    gui.host_launch_request = .{};
-    gui.host_launch_request.policy = @intFromEnum(policy);
-    gui.host_launch_request.reserved = 0;
-    if (raw_path.len >= gui.host_launch_request.path.len) return -2;
-    if (raw_args.len >= gui.host_launch_request.args.len) return -2;
-    copySliceZ(gui.host_launch_request.path[0..], raw_path);
-    copySliceZ(gui.host_launch_request.args[0..], raw_args);
+    var request = ProgramHostLaunchRequest{};
+    request.policy = @intFromEnum(policy);
+    request.reserved = 0;
+    if (raw_path.len >= request.path.len) return -2;
+    if (raw_args.len >= request.args.len) return -2;
+    copySliceZ(request.path[0..], raw_path);
+    copySliceZ(request.args[0..], raw_args);
+    const token = owner_locks.program_state.acquire();
+    gui.host_launch_request = request;
     gui.host_launch_pending = true;
+    owner_locks.program_state.release(token);
+    desktop_events.signal();
     return 0;
 }
 
 fn apiProgramTakeHostLaunch(id: u32, out: *ProgramHostLaunchRequest) callconv(.c) i32 {
     reapFinishedInstances();
-    const instance = instanceById(id) orelse {
+    const lease = pinProgramInstance(id) orelse {
         out.* = .{};
         return -1;
     };
-    if (instance.done) {
+    defer unpinProgramInstance(&lease);
+    const instance = lease.instance;
+    if (@atomicLoad(bool, &instance.done, .acquire)) {
         out.* = .{};
         return -2;
     }
@@ -14567,20 +14666,22 @@ fn apiProgramTakeHostLaunch(id: u32, out: *ProgramHostLaunchRequest) callconv(.c
         out.* = .{};
         return 0;
     };
-    if (!gui.host_launch_pending) {
-        out.* = .{};
-        return 0;
-    }
-    out.* = gui.host_launch_request;
+    const token = owner_locks.program_state.acquire();
+    const pending = gui.host_launch_pending;
+    const snapshot = if (pending) gui.host_launch_request else ProgramHostLaunchRequest{};
     gui.host_launch_request = .{};
     gui.host_launch_pending = false;
-    return 1;
+    owner_locks.program_state.release(token);
+    out.* = snapshot;
+    return if (pending) 1 else 0;
 }
 
 fn apiProgramWindowId() callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
     const gui = instance.gui_payload orelse return -1;
-    return gui.window_id;
+    const token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(token);
+    return @atomicLoad(i32, &gui.window_id, .acquire);
 }
 
 fn apiGuiWindowInfo(out: *GuiWindowInfo) callconv(.c) i32 {
@@ -14592,8 +14693,12 @@ fn apiGuiWindowInfo(out: *GuiWindowInfo) callconv(.c) i32 {
         out.* = .{};
         return 0;
     };
-    out.* = gui.window_info;
-    return if (gui.window_id >= 0) 1 else 0;
+    const token = owner_locks.program_state.acquire();
+    const snapshot = gui.window_info;
+    const hosted = @atomicLoad(i32, &gui.window_id, .acquire) >= 0;
+    owner_locks.program_state.release(token);
+    out.* = snapshot;
+    return if (hosted) 1 else 0;
 }
 
 fn apiGuiSetWindowInfo(id: u32, info: *const GuiWindowInfo) callconv(.c) i32 {
@@ -14601,10 +14706,13 @@ fn apiGuiSetWindowInfo(id: u32, info: *const GuiWindowInfo) callconv(.c) i32 {
     const lease = pinProgramInstance(id) orelse return -1;
     defer unpinProgramInstance(&lease);
     const instance = lease.instance;
-    if (instance.done) return -2;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return -2;
     const gui = ensureGuiPayload(instance) orelse return -3;
-    gui.window_info = info.*;
-    gui.window_id = info.window_id;
+    const value = info.*;
+    const token = owner_locks.program_state.acquire();
+    gui.window_info = value;
+    @atomicStore(i32, &gui.window_id, value.window_id, .release);
+    owner_locks.program_state.release(token);
     return 0;
 }
 
@@ -14617,13 +14725,16 @@ fn apiGuiPollEvent(out: *GuiEvent) callconv(.c) i32 {
         out.* = .{};
         return 0;
     };
-    if (gui.event_head == gui.event_tail) {
-        out.* = .{};
-        return 0;
+    const token = owner_locks.program_state.acquire();
+    var event = GuiEvent{};
+    const available = gui.event_head != gui.event_tail;
+    if (available) {
+        event = gui.events[gui.event_head];
+        gui.event_head = (gui.event_head + 1) % GUI_EVENT_QUEUE_SIZE;
     }
-    out.* = gui.events[gui.event_head];
-    gui.event_head = (gui.event_head + 1) % GUI_EVENT_QUEUE_SIZE;
-    return 1;
+    owner_locks.program_state.release(token);
+    out.* = event;
+    return if (available) 1 else 0;
 }
 
 fn apiGuiPushEvent(id: u32, event: *const GuiEvent) callconv(.c) i32 {
@@ -14631,12 +14742,16 @@ fn apiGuiPushEvent(id: u32, event: *const GuiEvent) callconv(.c) i32 {
     const lease = pinProgramInstance(id) orelse return -1;
     defer unpinProgramInstance(&lease);
     const instance = lease.instance;
-    if (instance.done) return -2;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return -2;
     const gui = ensureGuiPayload(instance) orelse return -3;
     return enqueueGuiEvent(gui, event);
 }
 
-fn enqueueGuiEvent(gui: *ProgramGuiPayload, event: *const GuiEvent) i32 {
+fn enqueueGuiEvent(gui: *ProgramGuiPayload, event_ptr: *const GuiEvent) i32 {
+    const value = event_ptr.*;
+    const event = &value;
+    const token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(token);
     gui_event_push_attempts +%= 1;
 
     // Pointer events carry their own coordinates. Removing an older move and
@@ -14687,6 +14802,8 @@ fn removeQueuedGuiEvent(gui: *ProgramGuiPayload, remove_index: usize) void {
 }
 
 fn guiEventPendingCount(gui: *const ProgramGuiPayload) u32 {
+    const token = owner_locks.program_state.acquire();
+    defer owner_locks.program_state.release(token);
     return @intCast(if (gui.event_tail >= gui.event_head)
         gui.event_tail - gui.event_head
     else
@@ -14706,7 +14823,7 @@ fn broadcastGuiFontCatalogChanged() void {
     var iterator = programRegistryIterator(false);
     while (iterator.next()) |instance| {
         const gui = instance.gui_payload orelse continue;
-        if (gui.window_id < 0) continue;
+        if (@atomicLoad(i32, &gui.window_id, .acquire) < 0) continue;
         _ = enqueueGuiEvent(gui, &event);
         bumpGuiRevision(instance);
     }
@@ -14721,27 +14838,41 @@ fn guiSetTextForInstance(instance: *ProgramInstance, text: [*:0]const u8) i32 {
     }
     _ = guiFrameReplaceBuild(instance, false) orelse return -2;
     if (guiFrameCommit(instance) != 0) return -2;
+    const token = owner_locks.program_state.acquire();
     gui.text = next_text;
+    owner_locks.program_state.release(token);
     return @intCast(len);
 }
 
 fn apiGuiSetText(text: [*:0]const u8) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     return guiSetTextForInstance(instance, text);
 }
 
 fn apiGuiText(id: u32, out: [*]u8, capacity: u32) callconv(.c) i32 {
     reapFinishedInstances();
-    const instance = instanceById(id) orelse return -1;
+    const lease = pinProgramInstance(id) orelse return -1;
+    defer unpinProgramInstance(&lease);
+    const instance = lease.instance;
     if (capacity == 0) return 0;
     const gui = instance.gui_payload orelse {
         out[0] = 0;
         return 0;
     };
+    const token = owner_locks.program_state.acquire();
+    const snapshot = gui.text;
+    owner_locks.program_state.release(token);
     var len: usize = 0;
     const max_len: usize = @intCast(capacity - 1);
-    while (len < max_len and len < gui.text.len and gui.text[len] != 0) : (len += 1) {
-        out[len] = gui.text[len];
+    while (len < max_len and len < snapshot.len and snapshot[len] != 0) : (len += 1) {
+        out[len] = snapshot[len];
     }
     out[len] = 0;
     return @intCast(len);
@@ -14749,9 +14880,11 @@ fn apiGuiText(id: u32, out: [*]u8, capacity: u32) callconv(.c) i32 {
 
 fn apiGuiRevision(id: u32) callconv(.c) u32 {
     reapFinishedInstances();
-    const instance = instanceById(id) orelse return 0;
+    const lease = pinProgramInstance(id) orelse return 0;
+    defer unpinProgramInstance(&lease);
+    const instance = lease.instance;
     const gui = instance.gui_payload orelse return 0;
-    return gui.revision;
+    return @atomicLoad(u32, &gui.revision, .acquire);
 }
 
 fn apiProgramClass(path_ptr: [*:0]const u8, policy_raw: u32) callconv(.c) i32 {
@@ -15426,7 +15559,7 @@ pub fn dumpStatus() void {
         k.puts(" state=");
         k.puts(instanceStateName(instanceState(instance)));
         k.puts(" window=");
-        putSignedDec(if (instance.gui_payload) |gui| gui.window_id else -1);
+        putSignedDec(if (instance.gui_payload) |gui| @atomicLoad(i32, &gui.window_id, .acquire) else -1);
         k.puts(" console_host=");
         k.puts(consoleHostName(if (instance.console_payload) |console| console.host else .none));
         k.puts(" exit=");
@@ -15462,6 +15595,13 @@ pub fn dumpStatus() void {
 
 fn apiGuiClear(rgb: u32) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = ensureGuiPayload(instance) orelse return -2;
     // An explicit frame transaction is terminal after its first build error;
     // only gui_frame_cancel may discard that failed transaction.  Legacy
@@ -15483,6 +15623,13 @@ fn apiGuiClear(rgb: u32) callconv(.c) i32 {
 
 fn apiGuiRect(x: i32, y: i32, w: u32, h: u32, rgb: u32) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     return appendGuiCommand(instance, .{
         .kind = 2,
         .x = x,
@@ -15495,6 +15642,13 @@ fn apiGuiRect(x: i32, y: i32, w: u32, h: u32, rgb: u32) callconv(.c) i32 {
 
 fn apiGuiBlit(x: i32, y: i32, w: u32, h: u32, scale: u32, pixels: [*]const u32, pixel_count: u32) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     if (@intFromPtr(pixels) == 0) return -1;
     if (w == 0 or h == 0) return -2;
     if (w > GUI_RASTER_MAX_WIDTH or h > GUI_RASTER_MAX_HEIGHT) return -2;
@@ -15533,6 +15687,13 @@ fn apiGuiBlit(x: i32, y: i32, w: u32, h: u32, scale: u32, pixels: [*]const u32, 
 
 fn apiGuiBlendAlpha8(x: i32, y: i32, w: u32, h: u32, stride: u32, rgb: u32, alpha: [*]const u8, alpha_len: u32) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     if (@intFromPtr(alpha) == 0) return -1;
     const source = alpha[0..@as(usize, alpha_len)];
     const geometry = gui_alpha8.validate(
@@ -15588,12 +15749,26 @@ fn apiGuiBlendAlpha8(x: i32, y: i32, w: u32, h: u32, stride: u32, rgb: u32, alph
 
 fn apiGuiDrawText(x: i32, y: i32, text: [*:0]const u8, fg: u32, bg: u32) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = ensureGuiPayload(instance) orelse return -2;
-    return appendGuiTextCommand(instance, x, y, text, fg, bg, gui.font_id, 0);
+    return appendGuiTextCommand(instance, x, y, text, fg, bg, @atomicLoad(u32, &gui.font_id, .acquire), 0);
 }
 
 fn apiGuiDrawTextEx(x: i32, y: i32, text: [*:0]const u8, fg: u32, bg: u32, font_id: u32, flags: u32) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     return appendGuiTextCommand(instance, x, y, text, fg, bg, font_id, flags);
 }
 
@@ -15626,7 +15801,7 @@ fn appendGuiTextCommand(instance: *ProgramInstance, x: i32, y: i32, text: [*:0]c
         resource_storage = prepareGuiResourceStorage(instance, frame, len, .utf8) orelse {
             cancelGuiCommandStorage(instance, &command_storage);
             guiFrameMarkBuildFailed(gui, frame);
-            instance_storage_stats.transaction_rollbacks +%= 1;
+            addInstanceStorageStat("transaction_rollbacks", 1);
             return -4;
         };
         @memcpy(guiResourcePayloadData(resource_storage.?.payload), text[0..len]);
@@ -15913,28 +16088,43 @@ fn apiGuiRasterRead(id: u32, offset: u32, out: [*]u32, capacity: u32) callconv(.
 
 fn apiGuiSetTitle(title: [*:0]const u8) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = ensureGuiPayload(instance) orelse return -2;
-    @memset(gui.title[0..], 0);
+    var next_title = [_]u8{0} ** GUI_TITLE_SIZE;
     var len: usize = 0;
-    while (len + 1 < gui.title.len and title[len] != 0) : (len += 1) {
-        gui.title[len] = title[len];
+    while (len + 1 < next_title.len and title[len] != 0) : (len += 1) {
+        next_title[len] = title[len];
     }
+    const token = owner_locks.program_state.acquire();
+    gui.title = next_title;
+    owner_locks.program_state.release(token);
     bumpGuiRevision(instance);
     return @intCast(len);
 }
 
 fn apiGuiTitle(id: u32, out: [*]u8, capacity: u32) callconv(.c) i32 {
     reapFinishedInstances();
-    const instance = instanceById(id) orelse return -1;
+    const lease = pinProgramInstance(id) orelse return -1;
+    defer unpinProgramInstance(&lease);
+    const instance = lease.instance;
     if (capacity == 0) return -2;
     const gui = instance.gui_payload orelse {
         out[0] = 0;
         return 0;
     };
+    const token = owner_locks.program_state.acquire();
+    const snapshot = gui.title;
+    owner_locks.program_state.release(token);
     const max_len: usize = @intCast(capacity - 1);
     var len: usize = 0;
-    while (len < max_len and len < gui.title.len and gui.title[len] != 0) : (len += 1) {
-        out[len] = gui.title[len];
+    while (len < max_len and len < snapshot.len and snapshot[len] != 0) : (len += 1) {
+        out[len] = snapshot[len];
     }
     out[len] = 0;
     return @intCast(len);
@@ -15942,32 +16132,50 @@ fn apiGuiTitle(id: u32, out: [*]u8, capacity: u32) callconv(.c) i32 {
 
 fn apiGuiSetMinSize(w: i32, h: i32) callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = ensureGuiPayload(instance) orelse return -2;
+    const token = owner_locks.program_state.acquire();
     gui.min_client_w = @max(0, w);
     gui.min_client_h = @max(0, h);
+    owner_locks.program_state.release(token);
     bumpGuiRevision(instance);
     return 0;
 }
 
 fn apiGuiMinSize(id: u32, out: *GuiSize) callconv(.c) i32 {
     reapFinishedInstances();
-    const instance = instanceById(id) orelse {
+    const lease = pinProgramInstance(id) orelse {
         out.* = .{};
         return -1;
     };
+    defer unpinProgramInstance(&lease);
+    const instance = lease.instance;
     const gui = instance.gui_payload orelse {
         out.* = .{};
         return 0;
     };
-    out.* = .{
-        .w = gui.min_client_w,
-        .h = gui.min_client_h,
-    };
+    const token = owner_locks.program_state.acquire();
+    const snapshot = GuiSize{ .w = gui.min_client_w, .h = gui.min_client_h };
+    owner_locks.program_state.release(token);
+    out.* = snapshot;
     return 0;
 }
 
 fn apiGuiPresent() callconv(.c) i32 {
     const instance = currentInstance() orelse return -1;
+    if (!guiProducerAllowed(instance)) return -1;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return -1;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return -1;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return -1;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = ensureGuiPayload(instance) orelse return -2;
     if (gui.building_frame != null) return guiFrameCommit(instance);
     bumpGuiRevision(instance);
@@ -16021,7 +16229,7 @@ fn fillCurrentGuiFrameInfoForId(instance_id: u32, result: i32, out: *GuiFrameInf
     lockGuiFrameState(gui);
     fillGuiFrameInfoLocked(gui, owner, out);
     out.last_error = result;
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
 }
 
 fn externalGuiFrameCommandWithBase(command: *const ProgramGuiCommand, resource_base: u64) GuiFrameCommand {
@@ -16087,6 +16295,13 @@ fn copyGuiFrameCommands(frame: *const ProgramGuiFramePayload, out: []GuiFrameCom
 
 fn apiGuiFrameBegin() callconv(.c) i32 {
     const instance = currentInstance() orelse return r4x_api.gui_frame_error_unavailable;
+    if (!guiProducerAllowed(instance)) return r4x_api.gui_frame_error_unavailable;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return r4x_api.gui_frame_error_unavailable;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return r4x_api.gui_frame_error_unavailable;
+    defer _ = gui_owner.operation_gate.leave();
     const result = guiFrameBegin(instance);
     if (instance.gui_payload) |gui| gui.frame_last_error = result;
     return result;
@@ -16094,6 +16309,13 @@ fn apiGuiFrameBegin() callconv(.c) i32 {
 
 fn apiGuiFrameBeginDamage(regions_ptr: [*]const DisplayDamageRect, region_count: u32) callconv(.c) i32 {
     const instance = currentInstance() orelse return r4x_api.gui_frame_error_unavailable;
+    if (!guiProducerAllowed(instance)) return r4x_api.gui_frame_error_unavailable;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return r4x_api.gui_frame_error_unavailable;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return r4x_api.gui_frame_error_unavailable;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
     if (@intFromPtr(regions_ptr) == 0 or region_count == 0 or region_count > r4x_api.gui_frame_max_damage_regions) {
         return setGuiFrameResult(gui, r4x_api.gui_frame_error_invalid);
@@ -16103,6 +16325,13 @@ fn apiGuiFrameBeginDamage(regions_ptr: [*]const DisplayDamageRect, region_count:
 
 fn apiGuiFrameBeginReplace(regions_ptr: [*]const DisplayDamageRect, region_count: u32) callconv(.c) i32 {
     const instance = currentInstance() orelse return r4x_api.gui_frame_error_unavailable;
+    if (!guiProducerAllowed(instance)) return r4x_api.gui_frame_error_unavailable;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return r4x_api.gui_frame_error_unavailable;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return r4x_api.gui_frame_error_unavailable;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
     if (@intFromPtr(regions_ptr) == 0 or region_count == 0 or region_count > r4x_api.gui_frame_max_damage_regions) {
         return setGuiFrameResult(gui, r4x_api.gui_frame_error_invalid);
@@ -16117,6 +16346,13 @@ fn apiGuiFrameAppend(
     resource_len: u64,
 ) callconv(.c) i32 {
     const instance = currentInstance() orelse return r4x_api.gui_frame_error_unavailable;
+    if (!guiProducerAllowed(instance)) return r4x_api.gui_frame_error_unavailable;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return r4x_api.gui_frame_error_unavailable;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return r4x_api.gui_frame_error_unavailable;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = instance.gui_payload orelse return r4x_api.gui_frame_error_unavailable;
     const building = gui.building_frame orelse return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
     if (!building.explicit_build or building.build_failed) return setGuiFrameResult(gui, r4x_api.gui_frame_error_state);
@@ -16143,6 +16379,13 @@ fn apiGuiFrameAppend(
 
 fn apiGuiFrameCommit() callconv(.c) i32 {
     const instance = currentInstance() orelse return r4x_api.gui_frame_error_unavailable;
+    if (!guiProducerAllowed(instance)) return r4x_api.gui_frame_error_unavailable;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return r4x_api.gui_frame_error_unavailable;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return r4x_api.gui_frame_error_unavailable;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = instance.gui_payload orelse return r4x_api.gui_frame_error_unavailable;
     const result = guiFrameCommit(instance);
     gui.frame_last_error = result;
@@ -16151,13 +16394,24 @@ fn apiGuiFrameCommit() callconv(.c) i32 {
 
 fn apiGuiFrameCancel() callconv(.c) i32 {
     const instance = currentInstance() orelse return r4x_api.gui_frame_error_unavailable;
+    if (!guiProducerAllowed(instance)) return r4x_api.gui_frame_error_unavailable;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return r4x_api.gui_frame_error_unavailable;
+    defer _ = task_context.leaveUnwind(unwind);
+    const gui_owner = ensureGuiPayload(instance) orelse return r4x_api.gui_frame_error_unavailable;
+    if (!gui_owner.operation_gate.enter(sync.WAIT_FOREVER)) return r4x_api.gui_frame_error_unavailable;
+    defer _ = gui_owner.operation_gate.leave();
     const gui = instance.gui_payload orelse return r4x_api.gui_frame_error_unavailable;
     const result = guiFrameCancel(instance);
     gui.frame_last_error = result;
     return result;
 }
 
-fn apiGuiFrameInfo(handle_ptr: ?*const ProgramProcessHandle, out: *GuiFrameInfo) callconv(.c) i32 {
+fn apiGuiFrameInfo(handle_ptr: ?*const ProgramProcessHandle, caller_out: *GuiFrameInfo) callconv(.c) i32 {
+    if (@intFromPtr(caller_out) == 0) return r4x_api.gui_frame_error_invalid;
+    var snapshot = caller_out.*;
+    const out = &snapshot;
+    defer caller_out.* = snapshot;
     if (@intFromPtr(out) == 0) return r4x_api.gui_frame_error_invalid;
     if (!validGuiFrameInfoOutput(out)) return r4x_api.gui_frame_error_invalid;
     const handle = if (handle_ptr) |value| value.* else currentProgramHandle() orelse {
@@ -16181,7 +16435,7 @@ fn apiGuiFrameInfo(handle_ptr: ?*const ProgramProcessHandle, out: *GuiFrameInfo)
     };
     lockGuiFrameState(gui);
     fillGuiFrameInfoLocked(gui, handle, out);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     return r4x_api.gui_frame_result_ok;
 }
 
@@ -16192,8 +16446,12 @@ fn apiGuiFrameRead(
     command_capacity: u64,
     resources_ptr: ?[*]u8,
     resource_capacity: u64,
-    out: *GuiFrameInfo,
+    caller_out: *GuiFrameInfo,
 ) callconv(.c) i32 {
+    if (@intFromPtr(caller_out) == 0) return r4x_api.gui_frame_error_invalid;
+    var snapshot = caller_out.*;
+    const out = &snapshot;
+    defer caller_out.* = snapshot;
     if (@intFromPtr(handle_ptr) == 0 or @intFromPtr(out) == 0) return r4x_api.gui_frame_error_invalid;
     if (!validGuiFrameInfoOutput(out)) return r4x_api.gui_frame_error_invalid;
     const handle = handle_ptr.*;
@@ -16213,23 +16471,26 @@ fn apiGuiFrameRead(
         return r4x_api.gui_frame_error_unavailable;
     };
 
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return r4x_api.gui_frame_error_invalid;
+    defer _ = task_context.leaveUnwind(unwind);
     lockGuiFrameState(gui);
     const frame = gui.committed_frame orelse {
         gui.frame_last_error = r4x_api.gui_frame_error_unavailable;
         fillGuiFrameInfoLocked(gui, handle, out);
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return r4x_api.gui_frame_error_unavailable;
     };
     if (frame.generation != expected_generation) {
         gui.frame_last_error = r4x_api.gui_frame_error_stale;
         fillGuiFrameInfoLocked(gui, handle, out);
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return r4x_api.gui_frame_error_stale;
     }
     if ((commands_ptr == null and command_capacity != 0) or (resources_ptr == null and resource_capacity != 0)) {
         gui.frame_last_error = r4x_api.gui_frame_error_invalid;
         fillGuiFrameInfoLocked(gui, handle, out);
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return r4x_api.gui_frame_error_invalid;
     }
     const total_commands = guiFrameChainCommandCount(frame);
@@ -16237,7 +16498,7 @@ fn apiGuiFrameRead(
     if (command_capacity < total_commands or resource_capacity < total_resources) {
         gui.frame_last_error = r4x_api.gui_frame_error_buffer_too_small;
         fillGuiFrameInfoLocked(gui, handle, out);
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return r4x_api.gui_frame_error_buffer_too_small;
     }
     if (command_capacity > std.math.maxInt(usize) or resource_capacity > std.math.maxInt(usize) or
@@ -16245,15 +16506,15 @@ fn apiGuiFrameRead(
     {
         gui.frame_last_error = r4x_api.gui_frame_error_overflow;
         fillGuiFrameInfoLocked(gui, handle, out);
-        _ = gui.frame_lock.unlock();
+        unlockGuiFrameState(gui);
         return r4x_api.gui_frame_error_overflow;
     }
     frame.reader_refs += 1;
     gui.frame_snapshot_reads +%= 1;
-    instance_storage_stats.gui_frame_snapshot_reads +%= 1;
+    addInstanceStorageStat("gui_frame_snapshot_reads", 1);
     gui.frame_last_error = r4x_api.gui_frame_result_ok;
     fillGuiFrameInfoLocked(gui, handle, out);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
 
     var capture = GuiFrameCapture{ .gui = gui, .frame = frame, .generation = frame.generation };
     if (total_commands != 0) {
@@ -16347,7 +16608,11 @@ fn writeGuiFrameStreamInfoOutput(out: *GuiFrameStreamInfo, caller_version: u32, 
     @memcpy(destination[0..response_size], std.mem.asBytes(&response)[0..response_size]);
 }
 
-fn apiGuiFrameStreamInfo(handle_ptr: *const ProgramProcessHandle, out: *GuiFrameStreamInfo) callconv(.c) i32 {
+fn apiGuiFrameStreamInfo(handle_ptr: *const ProgramProcessHandle, caller_out: *GuiFrameStreamInfo) callconv(.c) i32 {
+    if (@intFromPtr(caller_out) == 0) return r4x_api.gui_frame_error_invalid;
+    var snapshot = caller_out.*;
+    const out = &snapshot;
+    defer caller_out.* = snapshot;
     if (@intFromPtr(handle_ptr) == 0 or @intFromPtr(out) == 0) return r4x_api.gui_frame_error_invalid;
     if (!validGuiFrameStreamInfoOutput(out)) return r4x_api.gui_frame_error_invalid;
     const caller_version = out.version;
@@ -16369,7 +16634,7 @@ fn apiGuiFrameStreamInfo(handle_ptr: *const ProgramProcessHandle, out: *GuiFrame
     var result: GuiFrameStreamInfo = .{};
     lockGuiFrameState(gui);
     fillGuiFrameStreamInfo(gui, handle, &result);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     const shared = sharedRasterStatsSnapshot(handle);
     result.shared_publish_count = shared.publish_count;
     result.shared_acquire_count = shared.acquire_count;
@@ -16398,9 +16663,7 @@ fn apiRemoteFramePublish(info: *const r4x_api.RemoteFrameInfo, pixels: [*]const 
     if (!r4api.r4desk.remoteFramePublisher(owner)) return r4x_api.remote_frame_error_unavailable;
     return r4api.r4desk.remoteFramePublish(info, pixels, count);
 }
-fn apiRemoteFramePublishRegions(info: *const r4x_api.RemoteFrameInfo, pixels: [*]const u32, count: u32,
-    regions: [*]const r4x_api.DisplayDamageRect, region_count: u32) callconv(.c) i32
-{
+fn apiRemoteFramePublishRegions(info: *const r4x_api.RemoteFrameInfo, pixels: [*]const u32, count: u32, regions: [*]const r4x_api.DisplayDamageRect, region_count: u32) callconv(.c) i32 {
     const owner = remoteCaptureOwner() orelse return r4x_api.remote_frame_error_unavailable;
     if (!r4api.r4desk.remoteFramePublisher(owner)) return r4x_api.remote_frame_error_unavailable;
     return r4api.r4desk.remoteFramePublishRegions(info, pixels, count, regions, region_count);
@@ -16648,7 +16911,11 @@ fn gfxBufferExportRaster(consumer: ProgramProcessHandle, input: *const GuiShared
     return r4x_api.gfx_buffer_result_ok;
 }
 
-fn apiGuiFrameGenerationInfo(handle_ptr: *const ProgramProcessHandle, generation: u64, out: *GuiFrameGenerationInfo) callconv(.c) i32 {
+fn apiGuiFrameGenerationInfo(handle_ptr: *const ProgramProcessHandle, generation: u64, caller_out: *GuiFrameGenerationInfo) callconv(.c) i32 {
+    if (@intFromPtr(caller_out) == 0) return r4x_api.gui_frame_error_invalid;
+    var snapshot = caller_out.*;
+    const out = &snapshot;
+    defer caller_out.* = snapshot;
     if (@intFromPtr(handle_ptr) == 0 or @intFromPtr(out) == 0 or generation == 0) return r4x_api.gui_frame_error_invalid;
     if (!validGuiFrameGenerationInfoOutput(out)) return r4x_api.gui_frame_error_invalid;
     const handle = handle_ptr.*;
@@ -16670,7 +16937,7 @@ fn apiGuiFrameGenerationInfo(handle_ptr: *const ProgramProcessHandle, generation
     const gui = capture.gui;
     lockGuiFrameState(gui);
     fillGuiFrameGenerationInfo(gui, handle, capture.frame, out);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     return r4x_api.gui_frame_result_ok;
 }
 
@@ -16683,8 +16950,12 @@ fn apiGuiFrameGenerationRead(
     resource_capacity: u64,
     regions_ptr: ?[*]DisplayDamageRect,
     region_capacity: u32,
-    out: *GuiFrameGenerationInfo,
+    caller_out: *GuiFrameGenerationInfo,
 ) callconv(.c) i32 {
+    if (@intFromPtr(caller_out) == 0) return r4x_api.gui_frame_error_invalid;
+    var snapshot = caller_out.*;
+    const out = &snapshot;
+    defer caller_out.* = snapshot;
     if (@intFromPtr(handle_ptr) == 0 or @intFromPtr(out) == 0 or generation == 0) return r4x_api.gui_frame_error_invalid;
     if (!validGuiFrameGenerationInfoOutput(out)) return r4x_api.gui_frame_error_invalid;
     const handle = handle_ptr.*;
@@ -16707,7 +16978,7 @@ fn apiGuiFrameGenerationRead(
     const frame = capture.frame;
     lockGuiFrameState(gui);
     fillGuiFrameGenerationInfo(gui, handle, frame, out);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     if ((commands_ptr == null and command_capacity != 0) or
         (resources_ptr == null and resource_capacity != 0) or
         (regions_ptr == null and region_capacity != 0)) return r4x_api.gui_frame_error_invalid;
@@ -16727,7 +16998,7 @@ fn apiGuiFrameGenerationRead(
     lockGuiFrameState(gui);
     gui.frame_generation_reads +%= 1;
     fillGuiFrameGenerationInfo(gui, handle, frame, out);
-    _ = gui.frame_lock.unlock();
+    unlockGuiFrameState(gui);
     return r4x_api.gui_frame_result_ok;
 }
 
@@ -16995,8 +17266,10 @@ fn apiConsoleState(id: u32, out: *ConsoleState) callconv(.c) i32 {
 
 fn apiConsoleSetMetrics(id: u32, cols: u32, rows: u32) callconv(.c) i32 {
     reapFinishedInstances();
-    const instance = instanceById(id) orelse return -1;
-    if (instance.done) return -2;
+    const lease = pinProgramInstance(id) orelse return -1;
+    defer unpinProgramInstance(&lease);
+    const instance = lease.instance;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return -2;
     if (instance.app_class != .console) return -3;
     const next_cols = clampConsoleMetric(cols, CONSOLE_MIN_COLS, CONSOLE_MAX_COLS);
     const next_rows = clampConsoleMetric(rows, CONSOLE_MIN_ROWS, CONSOLE_MAX_ROWS);
@@ -17015,7 +17288,7 @@ fn apiConsolePushKey(id: u32, key: u8) callconv(.c) i32 {
     const lease = pinProgramInstance(id) orelse return -1;
     defer unpinProgramInstance(&lease);
     const instance = lease.instance;
-    if (instance.done) return -2;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return -2;
     if (instance.app_class != .console) return -3;
     const data = [_]u8{key};
     return if (pushConsoleInput(instance, data[0..]) == 1) 0 else -4;
@@ -17029,7 +17302,7 @@ fn apiConsolePushInput(id: u32, data: [*]const u8, length: u32) callconv(.c) i32
     const lease = pinProgramInstance(id) orelse return -1;
     defer unpinProgramInstance(&lease);
     const instance = lease.instance;
-    if (instance.done) return -2;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return -2;
     if (instance.app_class != .console) return -3;
     return @intCast(pushConsoleInput(instance, data[0..@as(usize, @intCast(length))]));
 }
@@ -17091,7 +17364,7 @@ fn consoleInputWaitStillNeeded(raw: *anyopaque) bool {
     const context: *ConsoleInputWaitContext = @ptrCast(@alignCast(raw));
     return context.console.input_generation == context.last_generation and
         context.console.input_head == context.console.input_tail and
-        !context.source.close_requested;
+        !@atomicLoad(bool, &context.source.close_requested, .acquire);
 }
 
 fn releaseConsoleInputLock(raw: *anyopaque) void {
@@ -17144,7 +17417,7 @@ fn apiConsoleInputWait(last_generation: u64, timeout_ticks: u64, out_generation:
         if (isRawFullscreenPresenter(lease.instance)) {
             const generation = keyboard.inputGeneration();
             out_generation.* = generation;
-            if (source.close_requested) return r4x_api.console_input_wait_error_closed;
+            if (@atomicLoad(bool, &source.close_requested, .acquire)) return r4x_api.console_input_wait_error_closed;
             if (!console.input_lock.lock(sync.WAIT_FOREVER)) return r4x_api.console_input_wait_error_failed;
             const queued = console.input_head != console.input_tail;
             _ = console.input_lock.unlock();
@@ -17158,7 +17431,7 @@ fn apiConsoleInputWait(last_generation: u64, timeout_ticks: u64, out_generation:
         }
         if (!console.input_lock.lock(sync.WAIT_FOREVER)) return r4x_api.console_input_wait_error_failed;
         const current_generation = console.input_generation;
-        if (source.close_requested) {
+        if (@atomicLoad(bool, &source.close_requested, .acquire)) {
             out_generation.* = current_generation;
             _ = console.input_lock.unlock();
             console_wait_cancellations +%= 1;
@@ -17280,7 +17553,7 @@ fn consoleTargetByHandle(handle: ProgramProcessHandle) ?*ProgramInstance {
     if (!locked) return null;
     defer unlockProgramRegistry();
     const slot = lookupProgramRegistryHandleLocked(handle, false) orelse return null;
-    if (!programRegistryStateIsRunning(slot.state) or slot.instance.done or slot.instance.app_class != .console) return null;
+    if (!programRegistryStateIsRunning(slot.state) or @atomicLoad(bool, &slot.instance.done, .acquire) or slot.instance.app_class != .console) return null;
     return &slot.instance;
 }
 
@@ -17472,7 +17745,7 @@ pub fn currentConsoleHostKind() ConsoleHostKind {
 pub fn requestDesktopFromHostedConsole() bool {
     const instance = currentConsoleInstance() orelse return false;
     if (instance.role != .background or consolePayloadConst(instance).host != .terminal_mode) return false;
-    instance.desktop_requested = true;
+    @atomicStore(bool, &instance.desktop_requested, true, .release);
     bumpConsoleRevision(instance);
     return true;
 }
@@ -17662,8 +17935,11 @@ fn appendGuiCommand(instance: *ProgramInstance, command: ProgramGuiCommand) i32 
 
 fn bumpGuiRevision(instance: *ProgramInstance) void {
     const gui = instance.gui_payload orelse return;
-    gui.revision +%= 1;
-    if (gui.revision == 0) gui.revision = 1;
+    var old = @atomicLoad(u32, &gui.revision, .acquire);
+    while (true) {
+        const next = if (old == std.math.maxInt(u32)) 1 else old + 1;
+        old = @cmpxchgWeak(u32, &gui.revision, old, next, .acq_rel, .acquire) orelse break;
+    }
     desktop_events.signal();
 }
 
@@ -17694,7 +17970,7 @@ fn classifyProgramFile(file: ProgramFile, policy: LaunchPolicy) ?AppClass {
     const header = readR4MProgramHeaderFromReader(&reader, "r4x-classify-header", false) orelse return null;
     const app_class = resolveAppClass(policy, header.flags);
     const export_contract = scanR4XStartExports(&reader, header, false) orelse return null;
-    _ = readValidatedProgramMemoryContractFromReader(&reader, header, app_class, export_contract, false) orelse return null;
+    _ = readValidatedProgramMetadataFromReader(&reader, header, app_class, export_contract, false) orelse return null;
     return app_class;
 }
 
@@ -17784,6 +18060,7 @@ fn createInstance(
             .task_id = 0,
             .role = role,
             .app_class = app_class,
+            .parallel_execution = role == .background and loaded.parallel_execution,
             .entry = loaded.entry,
             .stack_top = stack.top,
             .program_image_range_id = loaded.image.range_id,
@@ -17926,7 +18203,7 @@ fn cStringLen(bytes: []const u8) u64 {
 fn r4xstartShouldClose(ctx: *const R4XStartContext) callconv(.c) u32 {
     _ = ctx;
     const instance = currentInstance() orelse return 1;
-    return if (instance.close_requested) 1 else 0;
+    return if (@atomicLoad(bool, &instance.close_requested, .acquire)) 1 else 0;
 }
 
 fn r4xstartYield(ctx: *const R4XStartContext) callconv(.c) void {
@@ -17996,12 +18273,12 @@ fn commitProgramExit(handle: ProgramProcessHandle, exit_code: i32, requested_rea
     };
     @import("../kernel/gfx_virtual.zig").stopAdmission(&instance.gfx_virtual_closed);
     const finish_tick = timer.tickCount();
-    const exit_reason = if (requested_reason == PROGRAM_EXIT_REASON_NATURAL and instance.close_requested)
+    const exit_reason = if (requested_reason == PROGRAM_EXIT_REASON_NATURAL and @atomicLoad(bool, &instance.close_requested, .acquire))
         PROGRAM_EXIT_REASON_CLOSE
     else
         requested_reason;
     instance.exit_code = exit_code;
-    instance.done = true;
+    @atomicStore(bool, &instance.done, true, .release);
     completion.finish_tick = finish_tick;
     completion.exit_code = exit_code;
     completion.task_id = instance.task_id;
@@ -18189,7 +18466,7 @@ fn requestConsoleClientsClose(host: ProgramProcessHandle) void {
         var chunk = program_registry_head;
         search: while (chunk) |current| : (chunk = current.next) {
             for (&current.slots) |*slot| {
-                if (!programRegistryStateIsRunning(slot.state) or slot.instance.app_class != .console or slot.instance.close_requested) continue;
+                if (!programRegistryStateIsRunning(slot.state) or slot.instance.app_class != .console or @atomicLoad(bool, &slot.instance.close_requested, .acquire)) continue;
                 const console = consolePayloadConst(&slot.instance);
                 const parent_handle = ProgramProcessHandle{
                     .instance_id = console.io_target_id,
@@ -18197,8 +18474,8 @@ fn requestConsoleClientsClose(host: ProgramProcessHandle) void {
                     .generation = console.io_target_generation,
                 };
                 const parent = lookupProgramRegistryHandleLocked(parent_handle, false) orelse continue;
-                if (!parent.instance.close_requested) continue;
-                slot.instance.close_requested = true;
+                if (!@atomicLoad(bool, &parent.instance.close_requested, .acquire)) continue;
+                @atomicStore(bool, &slot.instance.close_requested, true, .release);
                 changed_handle = programHandleForSlot(slot);
                 bumpProgramInventoryEpochLocked();
                 changed = true;
@@ -18618,8 +18895,8 @@ fn activeInstanceCount() u8 {
 
 fn instanceInfo(instance: *const ProgramInstance) ProgramInstanceInfo {
     var flags: u8 = 0;
-    if (instance.close_requested) flags |= ProgramInstanceFlag.close_requested;
-    if (instance.desktop_requested) flags |= ProgramInstanceFlag.desktop_requested;
+    if (@atomicLoad(bool, &instance.close_requested, .acquire)) flags |= ProgramInstanceFlag.close_requested;
+    if (@atomicLoad(bool, &instance.desktop_requested, .acquire)) flags |= ProgramInstanceFlag.desktop_requested;
     if (instance.console_payload) |console| {
         if (console.host == .terminal_mode) flags |= ProgramInstanceFlag.terminal_mode;
     }
@@ -18632,7 +18909,7 @@ fn instanceInfo(instance: *const ProgramInstance) ProgramInstanceInfo {
         .state = @intFromEnum(instanceState(instance)),
         .flags = flags,
         .exit_code = instance.exit_code,
-        .window_id = if (instance.gui_payload) |gui| gui.window_id else -1,
+        .window_id = if (instance.gui_payload) |gui| @atomicLoad(i32, &gui.window_id, .acquire) else -1,
         .memory_profile = @intFromEnum(instance.memory_profile),
         .reserved0 = .{0} ** 3,
         .memory_reserved_limit = instance.memory_limits.vm_reserve_limit,
@@ -18658,8 +18935,8 @@ fn putSignedDec(value: i32) void {
 }
 
 fn instanceState(instance: *const ProgramInstance) InstanceState {
-    if (instance.done) return .done;
-    if (instance.close_requested) return .close_requested;
+    if (@atomicLoad(bool, &instance.done, .acquire)) return .done;
+    if (@atomicLoad(bool, &instance.close_requested, .acquire)) return .close_requested;
     return .running;
 }
 
@@ -19310,4 +19587,127 @@ fn writeLe64(bytes: []u8, value: u64) void {
 fn apiGfxBrightnessRequest(input: *const gfx_output_api.abi.GfxBrightnessRequest, output: *gfx_output_api.abi.GfxBrightnessRequest) callconv(.c) i32 {
     const owner = currentProgramHandle() orelse return gfx_output_api.abi.gfx_output_error_unavailable;
     return gfx_output_api.requestBrightness(graphicsOwner(owner), input, output);
+}
+
+// Bounded extension of the existing SMP acceptance. These are normal shipped
+// owners using the same loader/API paths as Desktop and SERVMAN.
+var parallel_probe_active: bool = false;
+var parallel_probe_main_mask: u64 = 0;
+var parallel_probe_service_mask: u64 = 0;
+var parallel_probe_thread_mask: u64 = 0;
+var parallel_probe_bad_inheritance: u32 = 0;
+
+fn noteParallelOwnerExecution(instance: *const ProgramInstance, worker: bool) void {
+    if (!@atomicLoad(bool, &parallel_probe_active, .acquire) or !instance.parallel_execution) return;
+    const mask = @as(u64, 1) << @as(u6, @intCast(percpu.currentIndex()));
+    _ = @atomicRmw(u64, if (worker) &parallel_probe_thread_mask else &parallel_probe_main_mask, .Or, mask, .acq_rel);
+    if (!worker and instance.app_class == .service) _ = @atomicRmw(u64, &parallel_probe_service_mask, .Or, mask, .acq_rel);
+    if (scheduler.current()) |running| {
+        if (!running.smp_eligible) _ = @atomicRmw(u32, &parallel_probe_bad_inheritance, .Add, 1, .acq_rel);
+    }
+}
+
+pub fn runParallelOwnersAcceptance() bool {
+    const working_drive = drive.get('C') orelse return false;
+    const calc = resolveProgramFile(working_drive, "/R4OS/SOFTWARE/DESKTOP/CALC.R4X") orelse return false;
+    const clip = resolveProgramFile(working_drive, "/R4OS/SERVICES/CLIPSVC.R4X") orelse return false;
+    const before = instanceStorageStats();
+    var handles = [_]ProgramProcessHandle{.{}} ** 3;
+    var service_info = ServiceInfo{};
+    const registered_here = services.entryByName("CLIPSVC") == null;
+    if (registered_here and services.register("CLIPSVC", "C:\\R4OS\\SERVICES\\CLIPSVC.R4X", "/RUN", .manual) != services.OK) return false;
+    @atomicStore(u64, &parallel_probe_main_mask, 0, .release);
+    @atomicStore(u64, &parallel_probe_service_mask, 0, .release);
+    @atomicStore(u64, &parallel_probe_thread_mask, 0, .release);
+    @atomicStore(u32, &parallel_probe_bad_inheritance, 0, .release);
+    @atomicStore(bool, &parallel_probe_active, true, .release);
+    defer @atomicStore(bool, &parallel_probe_active, false, .release);
+    k.puts("[PARALLEL-OWNERS] begin CALC CLIPSVC\r\n");
+    const work_ok = work: {
+        for (0..2) |i| {
+            if (runProgramFile(calc, .background, .auto, "", working_drive, .none, .{
+                .owner = true,
+                .owner_handle = ProgramProcessHandle{},
+                .out_handle = &handles[i],
+                .forced_cpu = @intCast(1 + 2 * i),
+            }) != .ran) break :work false;
+            const window = GuiWindowInfo{ .window_id = @intCast(i), .client_w = 300, .client_h = 360 };
+            if (apiGuiSetWindowInfo(handles[i].instance_id, &window) != 0 or
+                apiProgramSetWindowHandle(&handles[i], @intCast(i)) != PROGRAM_HANDLE_OK) break :work false;
+        }
+        const start = timer.tickCount();
+        for (handles[0..2]) |handle| {
+            while (true) {
+                var info = GuiFrameInfo{};
+                if (apiGuiFrameInfo(&handle, &info) == 0 and info.committed_generation != 0 and info.committed_command_count != 0) break;
+                if (timer.tickCount() -% start > 5 * timer.DEFAULT_HZ) break :work false;
+                scheduler.yield();
+            }
+            const revision = apiGuiRevision(handle.instance_id);
+            const key = GuiEvent{ .kind = 6, .key = '7' };
+            if (apiGuiPushEvent(handle.instance_id, &key) != 0) break :work false;
+            desktop_events.signal();
+            while (apiGuiRevision(handle.instance_id) == revision) {
+                if (timer.tickCount() -% start > 5 * timer.DEFAULT_HZ) break :work false;
+                scheduler.yield();
+            }
+        }
+        k.puts("[PARALLEL-OWNERS] GUI frames and input OK\r\n");
+        if (serviceApiStartByName("CLIPSVC", &service_info) != services.API_OK) break :work false;
+        if (runProgramFile(clip, .background, .auto, "/SELFTEST", working_drive, .none, .{
+            .owner = true,
+            .owner_handle = ProgramProcessHandle{},
+            .out_handle = &handles[2],
+            .forced_cpu = 2,
+        }) != .ran) break :work false;
+        var completion = ProgramProcessCompletion{};
+        if (apiProgramHandleWait(&handles[2], 8 * timer.DEFAULT_HZ, &completion) != PROGRAM_HANDLE_OK or completion.exit_code != 0) break :work false;
+        if (apiProgramHandleRequestClose(&handles[0]) != PROGRAM_HANDLE_OK or
+            apiProgramHandleWait(&handles[0], 3 * timer.DEFAULT_HZ, &completion) != PROGRAM_HANDLE_OK or completion.exit_code != 0) break :work false;
+        if (apiProgramHandleKill(&handles[1]) != PROGRAM_HANDLE_OK or
+            apiProgramHandleWait(&handles[1], 3 * timer.DEFAULT_HZ, &completion) != PROGRAM_HANDLE_OK or completion.exit_code != -9) break :work false;
+        break :work true;
+    };
+    var cleanup_ok = true;
+    for (&handles) |*handle| {
+        if (!programHandleValid(handle.*)) continue;
+        if (!programCompletionIsReady(handle.*)) _ = apiProgramHandleKill(handle);
+        var completion = ProgramProcessCompletion{};
+        cleanup_ok = apiProgramHandleWait(handle, 5 * timer.DEFAULT_HZ, &completion) == PROGRAM_HANDLE_OK and cleanup_ok;
+        cleanup_ok = apiProgramHandleReap(handle, &completion) == PROGRAM_HANDLE_OK and cleanup_ok;
+    }
+    if (service_info.instance_id != 0) cleanup_ok = serviceApiStopByName("CLIPSVC", &service_info, 5 * timer.DEFAULT_HZ) == services.API_OK and cleanup_ok;
+    if (registered_here) cleanup_ok = services.unregister("CLIPSVC") == services.OK and cleanup_ok;
+    const cleanup_start = timer.tickCount();
+    var after = instanceStorageStats();
+    while (after.current_payload_bytes != before.current_payload_bytes and timer.tickCount() -% cleanup_start < 3 * timer.DEFAULT_HZ) {
+        _ = runProgramReaperForTest();
+        scheduler.yield();
+        after = instanceStorageStats();
+    }
+    const mains = @atomicLoad(u64, &parallel_probe_main_mask, .acquire);
+    const services_mask = @atomicLoad(u64, &parallel_probe_service_mask, .acquire);
+    const workers = @atomicLoad(u64, &parallel_probe_thread_mask, .acquire);
+    const ok = work_ok and cleanup_ok and (mains & 0xe) == 0xe and (services_mask & ~@as(u64, 1)) != 0 and workers != 0 and
+        @atomicLoad(u32, &parallel_probe_bad_inheritance, .acquire) == 0 and
+        before.current_payload_bytes == after.current_payload_bytes and before.active_instances == after.active_instances and
+        before.header_errors == after.header_errors and before.free_failures == after.free_failures;
+    k.puts("[PARALLEL-OWNERS] result=");
+    k.puts(if (ok) "OK" else "FAILED");
+    k.puts(" main_mask=");
+    k.putDec(mains);
+    k.puts(" service_mask=");
+    k.putDec(services_mask);
+    k.puts(" thread_mask=");
+    k.putDec(workers);
+    k.puts(" work=");
+    k.putDec(@intFromBool(work_ok));
+    k.puts(" cleanup=");
+    k.putDec(@intFromBool(cleanup_ok));
+    k.puts(" payload_before=");
+    k.putDec(before.current_payload_bytes);
+    k.puts(" payload_after=");
+    k.putDec(after.current_payload_bytes);
+    k.puts("\r\n");
+    return ok;
 }
