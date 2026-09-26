@@ -751,6 +751,7 @@ fn waitSatisfied(status: model.Status, wait_for: WaitFor) bool {
 }
 
 fn publishAndRelease() void {
+    var desktop_progress = false;
     var count: usize = 0;
     while (count < fence_capacity) : (count += 1) {
         buffers.lock();
@@ -759,6 +760,7 @@ fn publishAndRelease() void {
         const fence = notification orelse break;
         // Arbitrarily many task wakeups belong in worker context, never IRQ.
         completions[fence.slot - 1].signal();
+        desktop_progress = true;
         buffers.lock();
         state.published(fence) catch unreachable;
         buffers.unlock();
@@ -785,6 +787,7 @@ fn publishAndRelease() void {
         buffers.unlock();
         if (native) |job| job.destroy();
         releases[ticket.fence.slot - 1].signal();
+        desktop_progress = true;
         buffers.lock();
         state.releaseWaiter(ticket.fence) catch unreachable;
         buffers.unlock();
@@ -794,6 +797,9 @@ fn publishAndRelease() void {
     buffers.unlock();
     // VM/TLB destruction, including failure quarantine, stays outside owner.
     buffers.collect();
+    // Coalesce this worker pass after every graphics owner has been released.
+    // This never runs in IRQ/native completion context.
+    if (desktop_progress) @import("../kernel/desktop_events.zig").signal();
 }
 
 fn copySlice() bool {
