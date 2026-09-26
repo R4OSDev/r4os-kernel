@@ -1883,6 +1883,101 @@ fn readDirectoryEntryClusterStatus(volume: Volume, start_cluster: u32, wanted: u
     return if (chain.fat_error or lfn_state.active) .io else .not_found;
 }
 
+// Caller-owned physical position. The enclosing R4SYS cursor binds this state
+// to the exact owner, mount and unchanged directory generation. No pointers,
+// allocation or retained cache loans survive a call.
+pub const DirectoryCursor = extern struct {
+    cluster: u32 = 0,
+    successor: u32 = 0,
+    steps: u32 = 0,
+    offset: u32 = 0,
+    state: u32 = 0,
+    lfn_len: u32 = 0,
+    lfn_active: u8 = 0,
+    lfn_total: u8 = 0,
+    lfn_expected: u8 = 0,
+    lfn_checksum: u8 = 0,
+    units: [NAME_UNITS_MAX]u16 = .{0} ** NAME_UNITS_MAX,
+};
+pub const DirectoryNextStatus = enum { found, not_found, again, io };
+
+pub fn nextDirectoryEntry(volume: Volume, start: u32, cursor: *DirectoryCursor, out: *Entry) DirectoryNextStatus {
+    if (cursor.state > 2 or cursor.lfn_active > 1 or cursor.lfn_len > NAME_UNITS_MAX or
+        cursor.lfn_total > MAX_LFN_ENTRIES or cursor.lfn_expected > cursor.lfn_total) return .io;
+    if (cursor.state == 2) return .not_found;
+    if (cursor.state == 0) cursor.* = .{ .cluster = start, .state = 1 };
+    const cluster_bytes = @as(u32, volume.sectors_per_cluster) * SECTOR_SIZE;
+    if (cursor.offset > cluster_bytes or cursor.offset % 32 != 0) return .io;
+    var lfn = LfnState{
+        .units = cursor.units,
+        .len = cursor.lfn_len,
+        .active = cursor.lfn_active != 0,
+        .total = cursor.lfn_total,
+        .expected = cursor.lfn_expected,
+        .checksum = cursor.lfn_checksum,
+    };
+    defer {
+        cursor.units = lfn.units;
+        cursor.lfn_len = @intCast(lfn.len);
+        cursor.lfn_active = @intFromBool(lfn.active);
+        cursor.lfn_total = lfn.total;
+        cursor.lfn_expected = lfn.expected;
+        cursor.lfn_checksum = lfn.checksum;
+    }
+    var examined: u32 = 0;
+    var sector: [SECTOR_SIZE]u8 = undefined;
+    while (examined < 256) {
+        if (cursor.offset == cluster_bytes and cluster_bytes != 0) {
+            cursor.cluster = cursor.successor;
+            cursor.offset = 0;
+        }
+        if (fatValueIsEoc(cursor.cluster)) {
+            if (lfn.active) return .io;
+            cursor.state = 2;
+            return .not_found;
+        }
+        if (!validDataCluster(volume, cursor.cluster)) return .io;
+        if (cursor.offset == 0) {
+            if (cursor.steps >= DIR_CHAIN_MAX_CLUSTERS) return .io;
+            cursor.successor = readFatEntry(volume, cursor.cluster) orelse return .io;
+            if (!fatValueIsEoc(cursor.successor) and !validDataCluster(volume, cursor.successor)) return .io;
+            cursor.steps += 1;
+            stats.dir_scans +%= 1;
+        }
+        const lba = volume.clusterLba(cursor.cluster) + cursor.offset / SECTOR_SIZE;
+        if (!readSector(volume.device_index, lba, 1, &sector)) return .io;
+        var off: usize = cursor.offset % SECTOR_SIZE;
+        while (off < SECTOR_SIZE and examined < 256) : (off += 32) {
+            examined += 1;
+            stats.dir_entries_scanned +%= 1;
+            cursor.offset += 32;
+            const raw = sector[off..][0..32];
+            if (raw[0] == 0) {
+                lfn.reset();
+                cursor.state = 2;
+                return .not_found;
+            }
+            if (raw[0] == 0xe5) {
+                lfn.reset();
+                continue;
+            }
+            if (raw[11] == ATTR_LONG_NAME) {
+                if (!lfn.consume(raw)) return .io;
+                continue;
+            }
+            if (raw[0] == '.' or raw[11] & 0x08 != 0) {
+                if (lfn.active) return .io;
+                continue;
+            }
+            if (lfn.active and !lfn.completeFor(raw)) return .io;
+            out.* = makeEntry(raw, &lfn.units, lfn.len, lba, @intCast(off));
+            lfn.reset();
+            return .found;
+        }
+    }
+    return .again;
+}
+
 const ClusterLookupStatus = enum(u8) {
     found,
     next_cluster,

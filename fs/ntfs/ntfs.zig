@@ -623,6 +623,16 @@ pub fn readDirectoryEntryStatus(volume: Volume, dir_record: u64, index: usize, o
     return .found;
 }
 
+pub const DirectoryCursor = nv.DirectoryCursor;
+pub const DirectoryNextStatus = nv.DirectoryNextStatus;
+pub fn nextDirectoryEntry(volume: Volume, dir: u64, cursor: *DirectoryCursor, out: *Entry) DirectoryNextStatus {
+    var v = buildVolume(volume);
+    var entry: nv.Entry = undefined;
+    const status = nv.nextDirectoryEntry(&v, dir, cursor, &entry);
+    if (status == .found) out.* = entryFromShared(entry);
+    return status;
+}
+
 fn appendBytes(out: []u8, cursor: *usize, bytes: []const u8) bool {
     if (cursor.* + bytes.len >= out.len) return false;
     @memcpy(out[cursor.* .. cursor.* + bytes.len], bytes);

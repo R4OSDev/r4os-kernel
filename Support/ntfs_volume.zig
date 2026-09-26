@@ -34,6 +34,7 @@ pub const WorkStats = struct {
     cluster_bitmap_probes: u64 = 0,
     record_bitmap_probes: u64 = 0,
     read_zero_bytes: u64 = 0,
+    directory_entries: u64 = 0,
 };
 
 pub const SECTOR_SIZE: usize = 512;
@@ -1993,6 +1994,78 @@ pub fn recordParentAndName(v: *const Volume, record_number: u64) ?RecordName {
 // ---------------------------------------------------------------------------
 // Enumeration (read side)
 // ---------------------------------------------------------------------------
+
+pub const DirectoryCursor = extern struct {
+    pub const Frame = extern struct { vcn: u64 = 0, offset: u32 = 0, child_done: u32 = 0 };
+    state: u32 = 0,
+    depth: u32 = 0,
+    frames: [MAX_INDEX_DEPTH]Frame = .{Frame{}} ** MAX_INDEX_DEPTH,
+};
+pub const DirectoryNextStatus = enum { found, not_found, again, io };
+
+/// Resume an in-order I30 traversal. Ancestors retain only a physical entry
+/// offset and whether its child was consumed. Reloading a node never scans
+/// the prefix. All scratch belongs to this call's enclosing volume gate.
+pub fn nextDirectoryEntry(v: *const Volume, dir: u64, cursor: *DirectoryCursor, out: *Entry) DirectoryNextStatus {
+    if (cursor.state > 2 or cursor.depth > MAX_INDEX_DEPTH) return .io;
+    if (cursor.state == 2) return .not_found;
+    if (cursor.state == 0) cursor.* = .{ .state = 1, .depth = 1 };
+    if (cursor.depth == 0) return .io;
+    const header = loadRecord(v, dir, v.scratch.record[0..]) orelse return .io;
+    const record = v.scratch.record[0..v.record_bytes];
+    const root_attr = ntfs.findAttribute(record, header, .index_root, &ntfs.I30_NAME_UTF16) orelse return .io;
+    var root = ntfs.IndexRoot.parse(root_attr.value) orelse return .io;
+    var alloc = AttrScratch{};
+    if (root.header.hasSubNodes()) {
+        if (!collectAttribute(v, dir, .index_allocation, &ntfs.I30_NAME_UTF16, &alloc)) return .io;
+        const reloaded = loadRecord(v, dir, v.scratch.record[0..]) orelse return .io;
+        const attr = ntfs.findAttribute(record, reloaded, .index_root, &ntfs.I30_NAME_UTF16) orelse return .io;
+        root = ntfs.IndexRoot.parse(attr.value) orelse return .io;
+    }
+    var examined: u32 = 0;
+    while (examined < 256) : (examined += 1) {
+        const level = cursor.depth - 1;
+        const frame = &cursor.frames[level];
+        if (frame.child_done > 1) return .io;
+        var entries = root.entries;
+        if (level != 0) {
+            if (!loadIndexBlockCached(v, dir, alloc.runs[0..alloc.count], frame.vcn)) return .io;
+            const block = ntfs.IndexBlock.parse(v.scratch.block[0..v.index_block_bytes]) orelse return .io;
+            entries = block.entries;
+        }
+        if (frame.offset >= entries.len) return .io; // Missing END is corruption.
+        var it = ntfs.IndexEntryIterator.init(entries[frame.offset..]);
+        const entry = it.next() orelse return .io;
+        if (work_counters_enabled) v.scratch.work.directory_entries += 1;
+        if (entry.hasSubNode() and frame.child_done == 0) {
+            if (cursor.depth >= MAX_INDEX_DEPTH) return .io;
+            const child = entry.sub_node_vcn orelse return .io;
+            // Reject cycles before reloading the same index buffer.
+            for (cursor.frames[1..cursor.depth]) |ancestor| if (ancestor.vcn == child) return .io;
+            frame.child_done = 1;
+            cursor.frames[cursor.depth] = .{ .vcn = child };
+            cursor.depth += 1;
+            continue;
+        }
+        if (entry.isEnd()) {
+            cursor.depth -= 1;
+            if (cursor.depth == 0) {
+                cursor.state = 2;
+                return .not_found;
+            }
+            continue;
+        }
+        frame.offset += entry.entry_length;
+        frame.child_done = 0;
+        const name = entry.fileName() orelse return .io;
+        if (name.namespace == ntfs.NAMESPACE_DOS) continue;
+        const reference = ntfs.FileReference.parse(entry.file_reference);
+        if (dir == ntfs.MFT_RECORD_ROOT and reference.record < ntfs.MFT_FIRST_NORMAL) continue;
+        out.* = entryFromFileName(reference, name) orelse return .io;
+        return .found;
+    }
+    return .again;
+}
 
 pub const EnumSink = struct {
     out: ?[]u8 = null,

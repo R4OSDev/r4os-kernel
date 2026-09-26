@@ -2654,3 +2654,5 @@ pub const buildR4DevTable = generated.buildR4DevTable;
 
 pub const GfxOutputBrightness = generated.GfxOutputBrightness;
 pub const GfxBrightnessRequest = generated.GfxBrightnessRequest;
+
+pub const DirectoryScanCursor = generated.DirectoryScanCursor;

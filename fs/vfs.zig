@@ -767,6 +767,38 @@ pub fn readDirectoryEntryStatus(volume: Volume, dir: NodeRef, index: usize, out:
     };
 }
 
+pub const DirectoryNextStatus = enum { found, not_found, again, io };
+pub fn nextDirectoryEntry(volume: Volume, dir: NodeRef, state: *[128]u64, out: *Entry) DirectoryNextStatus {
+    comptime {
+        if (@sizeOf(fat32.DirectoryCursor) > 1024 or @sizeOf(ntfs_fs.DirectoryCursor) > 1024) @compileError("directory cursor exceeds contract");
+    }
+    return switch (volume) {
+        .fat32 => |v| blk: {
+            if (dir > 0xffffffff) break :blk .io;
+            var entry: fat32.Entry = undefined;
+            const status = fat32.nextDirectoryEntry(v, @intCast(dir), @ptrCast(state), &entry);
+            if (status == .found) out.* = entryFromFat32(entry);
+            break :blk switch (status) {
+                .found => .found,
+                .not_found => .not_found,
+                .again => .again,
+                .io => .io,
+            };
+        },
+        .ntfs => |v| blk: {
+            var entry: ntfs_fs.Entry = undefined;
+            const status = ntfs_fs.nextDirectoryEntry(v, dir, @ptrCast(state), &entry);
+            if (status == .found) out.* = entryFromNtfs(entry);
+            break :blk switch (status) {
+                .found => .found,
+                .not_found => .not_found,
+                .again => .again,
+                .io => .io,
+            };
+        },
+    };
+}
+
 pub fn freeClusterCount(volume: Volume) ?u32 {
     return switch (volume) {
         .fat32 => |v| fat32.freeClusterCount(v),
