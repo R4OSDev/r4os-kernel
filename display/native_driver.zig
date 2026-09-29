@@ -70,6 +70,7 @@ const ResetRecord = struct {
     original_generation: u64,
     generation: u64,
     retired: bool = false,
+    terminal_released: bool = false,
     reported_step: ResetStep = .none,
     reported_result: i32 = 0,
 };
@@ -176,6 +177,7 @@ fn prepareRequest(identity: buffers.Owner, input: *const abi.GfxNativeRegistrati
             input.backend.adapter_id != reset.backend.adapter_id or input.backend.device_generation <= reset.backend.device_generation)
             return abi.gfx_output_error_stale;
         if (!reset.retired) return abi.gfx_output_error_busy;
+        if (reset.terminal_released) return abi.gfx_output_error_stale;
     } else if (reset_record != null) return abi.gfx_output_error_busy;
     const result = prepareImpl(identity, input.*, held_generation, reset_generation) catch |err| {
         if (bridge.driver_owner.eql(identity) and !bridge.ready)
@@ -770,6 +772,7 @@ pub fn deviceReset(identity: buffers.Owner, input: *const abi.GfxBackendBinding,
         reset_record = .{ .driver = identity, .backend = input.*, .original_generation = generation, .generation = next };
     }
     const reset = &reset_record.?;
+    if (reset.terminal_released) return abi.gfx_output_error_stale;
     if (!reset.driver.eql(identity) or !std.meta.eql(reset.backend, input.*) or
         generation != (if (quiesced == 0) reset.original_generation else reset.generation)) return abi.gfx_output_error_stale;
     if (quiesced == 1 and !reset.retired) {
@@ -786,5 +789,29 @@ pub fn deviceReset(identity: buffers.Owner, input: *const abi.GfxBackendBinding,
     }
     output.* = .{ .generation = reset.generation, .state = @intFromEnum(display.backendState().state),
         .outcome = abi.gfx_output_outcome_lost, .retained = 1 };
+    return abi.gfx_output_ok;
+}
+
+pub fn releaseTerminal(identity: buffers.Owner, input: *const abi.GfxBackendBinding, generation: u64, output: *abi.GfxNativeState) i32 {
+    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxBackendBinding) != 0 or irq.inDispatch() or
+        !buffer_api.validOutput(abi.GfxNativeState, output) or input.version != 1 or
+        input.size < @sizeOf(abi.GfxBackendBinding) or generation == 0 or !identity.valid() or identity.kind != .driver)
+        return abi.gfx_output_error_invalid;
+    if (!execution.enter(0)) return abi.gfx_output_error_busy;
+    defer _ = execution.leave();
+    const reset = if (reset_record) |*value| value else return abi.gfx_output_error_stale;
+    if (!reset.driver.eql(identity) or !std.meta.eql(reset.backend, input.*) or generation != reset.generation)
+        return abi.gfx_output_error_stale;
+    if (!reset.retired) return abi.gfx_output_error_busy;
+    if (!reset.terminal_released) {
+        // retired is set only after queue/mode/cursor/output/display and the
+        // native bridge all acknowledged cleanup of this same binding.
+        display.releaseTerminal(identity.id, generation, input.adapter_id) catch |err| return code(err);
+        reset.terminal_released = true;
+    }
+    // Keep only this pointer-free receipt for exact idempotent retries. It
+    // owns no resources and cannot authorize a new display/reset generation.
+    output.* = .{ .generation = generation, .state = @intFromEnum(display.backendState().state),
+        .outcome = abi.gfx_output_outcome_lost, .retained = 0 };
     return abi.gfx_output_ok;
 }

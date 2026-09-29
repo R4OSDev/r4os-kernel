@@ -286,6 +286,7 @@ var saved_boot: ?BootSnapshot = null;
 var native_hold_generation: u64 = 0;
 var native_reset_generation: u64 = 0;
 var native_restore_confirmed = false;
+var retired_reset_generation: u64 = 0;
 
 // Firmware bringup precedes output/queue discovery. This is a hold of the
 // existing boot display, not a fabricated native output or completion queue.
@@ -494,6 +495,7 @@ fn prepareNativeImpl(backend: NativeBackend, held_generation: u64, reset_generat
         break :blk held_generation;
     } else try backend_manager.begin(backend.owner, backend.adapter_id);
     native_backend = backend;
+    retired_reset_generation = 0;
     native_hold_generation = held_generation;
     native_reset_generation = reset_generation;
     native_restore_confirmed = false;
@@ -585,6 +587,7 @@ pub fn beginDeviceReset(owner: usize, generation: u64, adapter: u32) TransitionE
     const next = try candidate.beginDeviceReset(owner, generation);
     if (!firmware_access.gate.isRevoked() and !firmware_access.gate.tryRevoke()) return error.Busy;
     backend_manager = candidate;
+    retired_reset_generation = 0;
     primary_device = null;
     publishStats();
     return next;
@@ -618,6 +621,34 @@ pub fn retireDeviceReset(owner: usize, generation: u64) TransitionError!void {
     native_hold_generation = 0;
     native_reset_generation = 0;
     native_restore_confirmed = false;
+    retired_reset_generation = generation;
+    publishStats();
+}
+
+// Only the reset bridge calls this after all common consumers and its own
+// references have retired under the driver's physical DMA-stop receipt.
+// Release the immutable RAM copy without invoking hardware restore or
+// touching the old framebuffer. Terminal admission stays permanently shut.
+pub fn releaseTerminal(owner: usize, generation: u64, adapter: u32) TransitionError!void {
+    if (!execution.tryEnter()) return error.Busy;
+    defer execution.leave();
+    if (!system_transition) return error.Busy;
+    try backend_manager.checkActive(owner, generation);
+    if (adapter == 0 or adapter != backend_manager.value.adapter_id) return error.Stale;
+    if (retired_reset_generation != generation or primary_device != null or native_backend != null or
+        !firmware_access.gate.isRevoked()) return error.Busy;
+    // Validate even exhaustion before releasing any CPU resource. A failed
+    // release retains this exact generation for a bounded caller retry.
+    var candidate = backend_manager;
+    try candidate.finishTerminal(owner, generation);
+    if (held_boot) |hold| {
+        if (hold.holder.owner != owner or hold.holder.adapter_id != adapter) return error.Stale;
+        const release = hold.holder.release_adopted orelse hold.holder.release;
+        if (!release(hold.holder.context)) return error.Busy;
+        held_boot = null;
+    }
+    backend_manager = candidate;
+    retired_reset_generation = 0;
     publishStats();
 }
 
@@ -699,6 +730,7 @@ fn restoreBootLocked(owner: usize, generation: u64) TransitionError!void {
     native_device = .{};
     native_reset_generation = 0;
     native_restore_confirmed = false;
+    retired_reset_generation = 0;
     publishStats();
 }
 
@@ -1531,6 +1563,62 @@ fn exerciseHeldNative(template: NativeBackend) !void {
     system_transition = false;
     primary_device = &bootfb_device;
     firmware_access.gate.restore();
+
+    // Shutdown may discard the captured RAM image after physical-reset
+    // retirement, with either a headless boot hold or an adopted display.
+    // It never depends on recovering the old scanout or writes its pixels.
+    for ([_]bool{ false, true }) |adopt| {
+        const before_manager = backend_manager;
+        holder.expected_generation = backendState().generation;
+        const final_hold = try holdBoot(holder);
+        try t.expect(!try finishBoot(91, final_hold.generation, 1));
+        if (adopt) {
+            _ = try prepareHeldNative(candidate, final_hold.generation);
+            probe.result = .confirmed;
+            _ = try commitNative(91, final_hold.generation);
+        }
+        try t.expectError(error.Busy, releaseTerminal(91, final_hold.generation, candidate.adapter_id));
+        try t.expect(beginSystemTransition(0));
+        const final_reset = try beginDeviceReset(91, final_hold.generation, candidate.adapter_id);
+        try t.expectError(error.Busy, releaseTerminal(91, final_reset, candidate.adapter_id));
+        try t.expectError(error.Stale, releaseTerminal(92, final_reset, candidate.adapter_id));
+        try t.expectError(error.Stale, releaseTerminal(91, final_hold.generation, candidate.adapter_id));
+        try t.expectError(error.Stale, releaseTerminal(91, final_reset, candidate.adapter_id + 1));
+        try retireDeviceReset(91, final_reset);
+        const before_release = backendState();
+        const restores = probe.native_restores + probe.old_restores;
+        const serial = backend_manager.serial;
+        const releases = probe.releases;
+        backend_manager.serial = ~@as(u64, 0);
+        try t.expectError(error.Exhausted, releaseTerminal(91, final_reset, candidate.adapter_id));
+        try t.expectEqual(releases, probe.releases);
+        backend_manager.serial = serial;
+        probe.restore_ok = false;
+        probe.release_ok = false;
+        try t.expectError(error.Busy, releaseTerminal(91, final_reset, candidate.adapter_id));
+        try t.expectEqualDeep(before_release, backendState());
+        try t.expect(held_boot != null and retainsDriverOwner(91) and !systemTransitionQuiesced());
+        var pixels: [64]u32 = undefined;
+        const source: [*]volatile const u32 = @ptrCast(@alignCast(saved_boot.?.framebuffer.address));
+        for (&pixels, 0..) |*pixel, index| pixel.* = source[index];
+        probe.release_ok = true;
+        try releaseTerminal(91, final_reset, candidate.adapter_id);
+        try t.expectEqual(restores, probe.native_restores + probe.old_restores);
+        try t.expectEqual(releases + 2, probe.releases);
+        for (pixels, 0..) |pixel, index| try t.expectEqual(pixel, source[index]);
+        try t.expect(systemTransitionQuiesced() and !retainsDriverOwner(91) and held_boot == null);
+        try t.expect(backendState().state == .unavailable and backendState().generation > final_reset);
+        try t.expect(firmware_access.gate.isRevoked() and !fill(0xFFFFFF) and !beginOutputCommit());
+        try t.expectError(error.Stale, releaseTerminal(91, final_reset, candidate.adapter_id));
+        try t.expectError(error.Busy, prepareNative(candidate));
+        // Test-only restoration of the surrounding fixture; the real system
+        // transition cannot be cancelled or republish the old framebuffer.
+        backend_manager = before_manager;
+        system_transition = false;
+        primary_device = &bootfb_device;
+        firmware_access.gate.restore();
+        publishStats();
+    }
 }
 
 fn exerciseBootHold(native: NativeBackend) !void {

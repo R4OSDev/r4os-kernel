@@ -150,6 +150,18 @@ pub const Manager = struct {
         self.changed();
     }
 
+    // Terminal shutdown after confirmed reset retirement. There is no claim
+    // that the original scanout or its pixels have been restored.
+    pub fn finishTerminal(self: *Manager, owner: usize, generation: u64) Error!void {
+        try self.checkActive(owner, generation);
+        if (self.value.state != .recovering) return error.Busy;
+        const next = try self.nextGeneration();
+        self.value = .{ .state = .unavailable, .policy = self.value.policy, .reason = .device_lost,
+            .revision = self.value.revision, .generation = next, .reset_generation = self.value.reset_generation };
+        self.recovering_preparation = false;
+        self.changed();
+    }
+
     pub fn checkPending(self: *const Manager, owner: usize, generation: u64) Error!void {
         if (owner == 0 or generation == 0 or self.value.state != .preparing or
             self.value.pending_owner != owner or self.value.pending_generation != generation) return error.Stale;
