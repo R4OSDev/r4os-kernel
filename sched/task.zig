@@ -252,14 +252,10 @@ pub const Task = struct {
     fpu_state: ?[]u8 = null,
     fpu_state_bytes: u32 = 0,
     fpu_state_valid: bool = false,
-    // 0.56.30 Lazy-FPU: false nur fuer reine Kernel-Tasks - der Kernel ist
-    // soft_float OHNE SSE/AVX (Code/build.zig subtrahiert die Features),
-    // solche Tasks koennen FPU-State weder nutzen noch korrumpieren.
-    // Default true (sicher); createKernelThread setzt false, weil dessen
-    // Aufrufer ausschliesslich Kernel-Worker sind (net-rx, usb-hid-poll,
-    // r4d-work, async-I/O, Selbsttests). Echte R4X-Ausfuehrung laeuft ueber
-    // createKernelThreadBlocked und behaelt true; ein initial blockierter,
-    // reiner Kernel-Worker nutzt createKernelWorkerBlocked.
+    // Kernel code is soft-float, but its workers call SIMD-capable R4D/R4P
+    // modules (including indirect storage, network and graphics callbacks).
+    // All executable task constructors therefore own an FPU state. Only the
+    // CPU-idle task, which cannot enter modules, may skip save/restore.
     uses_fpu: bool = false,
 };
 
@@ -482,7 +478,7 @@ pub fn init() bool {
     if (!prepareCriticalReserve()) return false;
     initialized = true;
     var create_failure: CreateFailure = .none;
-    _ = createTask("kernel-main", .running, false, null, .interactive, false, false, &create_failure, .{}) orelse {
+    _ = createTask("kernel-main", .running, true, null, .interactive, false, false, &create_failure, .{}) orelse {
         initialized = false;
         cleanupCriticalReserve();
         return false;
@@ -566,25 +562,12 @@ fn createTask(
 
     var fpu_memory: ?[]u8 = null;
     if (needs_fpu) {
-        const state_bytes = fpu.activeStateBytes();
-        if (state_bytes == 0) {
+        if (!allocateTaskFpuState(new_task)) {
             recordCreateFailure(failure_out, .fpu);
             rollbackUnpublishedTask(new_task);
             return null;
         }
-        const memory = heap.alloc(state_bytes, fpu.state_storage_align) orelse {
-            recordCreateFailure(failure_out, .fpu);
-            rollbackUnpublishedTask(new_task);
-            return null;
-        };
-        new_task.fpu_state = memory;
-        new_task.fpu_state_bytes = @intCast(memory.len);
-        if (!fpu.initTaskState(memory)) {
-            recordCreateFailure(failure_out, .fpu);
-            rollbackUnpublishedTask(new_task);
-            return null;
-        }
-        fpu_memory = memory;
+        fpu_memory = new_task.fpu_state;
     }
 
     const now = timer.tickCount();
@@ -638,6 +621,18 @@ fn createTask(
     interrupts.restore(irq_flags);
     recordStackCreate(role, readTimestampCounter() -% create_started_cycles);
     return new_task;
+}
+
+fn allocateTaskFpuState(t: *Task) bool {
+    const state_bytes = fpu.activeStateBytes();
+    if (state_bytes == 0) return false;
+    const memory = heap.alloc(state_bytes, fpu.state_storage_align) orelse return false;
+    // Keep the allocation anchored even if initialization fails: the caller
+    // rolls the entire unpublished Task back through its existing retry path.
+    t.fpu_state = memory;
+    t.fpu_state_bytes = @intCast(memory.len);
+    t.fpu_state_valid = fpu.initTaskState(memory);
+    return t.fpu_state_valid;
 }
 
 fn rollbackUnpublishedTask(t: *Task) void {
@@ -1070,6 +1065,7 @@ const GuardedStack = struct {
 const CriticalBundle = struct {
     task: ?*Task = null,
     stack: GuardedStack = .{},
+    fpu_state: ?[]u8 = null,
     in_use: bool = false,
 };
 
@@ -1105,9 +1101,16 @@ fn prepareCriticalReserve() bool {
         reserved_task.stack_base = stack.base;
         reserved_task.stack_top = stack.top;
         reserved_task.stack_range_id = stack.range_id;
+        if (!allocateTaskFpuState(reserved_task)) {
+            noteCreateFailure(.fpu);
+            rollbackUnpublishedTask(reserved_task);
+            cleanupCriticalReserve();
+            return false;
+        }
         bundle.* = .{
             .task = reserved_task,
             .stack = stack,
+            .fpu_state = reserved_task.fpu_state,
         };
     }
     return true;
@@ -1375,17 +1378,17 @@ pub fn createKernelThread(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelThreadWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .ready, false, entry, .interactive, false, false, failure_out, .{});
+    return createTask(name, .ready, true, entry, .interactive, false, false, failure_out, .{});
 }
 
 pub fn createKernelThreadWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .ready, false, entry, role, false, false, &failure, .{});
+    return createTask(name, .ready, true, entry, role, false, false, &failure, .{});
 }
 
 pub fn createParallelKernelThreadWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .ready, false, entry, role, true, false, &failure, .{});
+    return createTask(name, .ready, true, entry, role, true, false, &failure, .{});
 }
 
 pub fn createKernelThreadBlocked(name: []const u8, entry: Entry) ?*Task {
@@ -1451,22 +1454,22 @@ pub fn createKernelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
 }
 
 pub fn createKernelWorkerBlockedWithFailure(name: []const u8, entry: Entry, failure_out: *CreateFailure) ?*Task {
-    return createTask(name, .blocked, false, entry, .interactive, false, false, failure_out, .{});
+    return createTask(name, .blocked, true, entry, .interactive, false, false, failure_out, .{});
 }
 
 pub fn createKernelWorkerBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, false, entry, role, false, false, &failure, .{});
+    return createTask(name, .blocked, true, entry, role, false, false, &failure, .{});
 }
 
 pub fn createParallelWorkerBlocked(name: []const u8, entry: Entry) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, false, entry, .interactive, true, false, &failure, .{});
+    return createTask(name, .blocked, true, entry, .interactive, true, false, &failure, .{});
 }
 
 pub fn createParallelWorkerBlockedWithRole(name: []const u8, entry: Entry, role: Role) ?*Task {
     var failure: CreateFailure = .none;
-    return createTask(name, .blocked, false, entry, role, true, false, &failure, .{});
+    return createTask(name, .blocked, true, entry, role, true, false, &failure, .{});
 }
 
 pub fn createCpuIdleTask(cpu_index: u32) ?*Task {
@@ -1480,10 +1483,11 @@ pub fn createCpuIdleTask(cpu_index: u32) ?*Task {
     return idle;
 }
 
-// Critical workers consume one of four boot-time Task+Stack bundles. Normal
+// Critical workers consume one of four boot-time Task+Stack+FPU bundles. Normal
 // admission can never borrow these bundles, so an allocator/VM pressure event
 // cannot prevent an already designed recovery, I/O or reaper path from making
-// progress. Critical workers are kernel-only and therefore use soft-float.
+// progress. Storage/reaper callbacks may enter modules, so their FPU buffers
+// are also reserved at boot and retained across reuse, without late allocation.
 pub fn createKernelThreadCritical(name: []const u8, entry: Entry) ?*Task {
     var failure: CreateFailure = .none;
     return createKernelThreadCriticalWithFailure(name, entry, &failure);
@@ -1530,6 +1534,16 @@ fn createCriticalTask(name: []const u8, state: State, entry: Entry, role: Role, 
         interrupts.restore(irq_flags);
         return null;
     }
+    const fpu_memory = bundle.fpu_state orelse {
+        recordCreateFailure(failure_out, .fpu);
+        interrupts.restore(irq_flags);
+        return null;
+    };
+    if (!fpu.initTaskState(fpu_memory)) {
+        recordCreateFailure(failure_out, .fpu);
+        interrupts.restore(irq_flags);
+        return null;
+    }
 
     const now = timer.tickCount();
     new_task.* = .{
@@ -1545,7 +1559,10 @@ fn createCriticalTask(name: []const u8, state: State, entry: Entry, role: Role, 
         .last_scheduled_tick = if (state == .running) now else 0,
         .switches_in = if (state == .running) 1 else 0,
         .entry = entry,
-        .uses_fpu = false,
+        .fpu_state = fpu_memory,
+        .fpu_state_bytes = @intCast(fpu_memory.len),
+        .fpu_state_valid = true,
+        .uses_fpu = true,
     };
     configureRoleFields(new_task, role);
     const id = allocateTaskIdLocked() orelse {
@@ -1578,6 +1595,9 @@ fn resetCriticalTaskLocked(bundle: *CriticalBundle, index: usize) void {
         .stack_base = bundle.stack.base,
         .stack_top = bundle.stack.top,
         .stack_range_id = bundle.stack.range_id,
+        .fpu_state = bundle.fpu_state,
+        .fpu_state_bytes = if (bundle.fpu_state) |memory| @intCast(memory.len) else 0,
+        .fpu_state_valid = bundle.fpu_state != null,
     };
 }
 
@@ -2662,6 +2682,9 @@ fn releaseTaskResources(t: *Task) bool {
         interrupts.haltForever();
     }
     if (!t.wait_node.reset()) return false;
+    // A reserve bundle owns both stack and FPU allocation for its whole
+    // lifetime. Reset the register image on next admission, never free it here.
+    if (t.critical_reserve_slot != NO_CRITICAL_RESERVE_SLOT) return true;
     if (t.fpu_state) |memory| {
         if (heap.free(memory) != .ok) {
             k.puts("Task FPU state release pending retry\r\n");
@@ -2671,7 +2694,7 @@ fn releaseTaskResources(t: *Task) bool {
         t.fpu_state_bytes = 0;
         t.fpu_state_valid = false;
     }
-    if (t.critical_reserve_slot == NO_CRITICAL_RESERVE_SLOT and !releaseTaskStack(t)) return false;
+    if (!releaseTaskStack(t)) return false;
     return true;
 }
 

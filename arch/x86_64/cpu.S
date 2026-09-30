@@ -126,6 +126,41 @@ r4os_fninit:
     fninit
     ret
 
+.global r4os_init_simd
+.type r4os_init_simd, @function
+r4os_init_simd:
+    # FNINIT affects x87 only. Record the inherited SIMD baseline for the
+    # bounded boot diagnostic, then initialize SSE control and every lane.
+    movdqu %xmm0, (%rsi)
+    stmxcsr 16(%rsi)
+    sub $8, %rsp
+    movl $0x1f80, (%rsp)
+    ldmxcsr (%rsp)
+    add $8, %rsp
+    test %edi, %edi
+    jz .Linit_simd_sse
+    # The caller has already enabled OSXSAVE and XCR0.AVX on this CPU.
+    vzeroall
+    ret
+.Linit_simd_sse:
+    pxor %xmm0, %xmm0
+    pxor %xmm1, %xmm1
+    pxor %xmm2, %xmm2
+    pxor %xmm3, %xmm3
+    pxor %xmm4, %xmm4
+    pxor %xmm5, %xmm5
+    pxor %xmm6, %xmm6
+    pxor %xmm7, %xmm7
+    pxor %xmm8, %xmm8
+    pxor %xmm9, %xmm9
+    pxor %xmm10, %xmm10
+    pxor %xmm11, %xmm11
+    pxor %xmm12, %xmm12
+    pxor %xmm13, %xmm13
+    pxor %xmm14, %xmm14
+    pxor %xmm15, %xmm15
+    ret
+
 .global r4os_fxsave
 .type r4os_fxsave, @function
 r4os_fxsave:

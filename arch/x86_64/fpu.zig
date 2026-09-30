@@ -67,6 +67,7 @@ extern fn r4os_read_cr4() callconv(.c) u64;
 extern fn r4os_write_cr4(value: u64) callconv(.c) void;
 extern fn r4os_xsetbv(index: u32, value: u64) callconv(.c) void;
 extern fn r4os_fninit() callconv(.c) void;
+extern fn r4os_init_simd(avx_enabled: u32, inherited: *[3]u64) callconv(.c) void;
 extern fn r4os_fxsave(dest: [*]u8) callconv(.c) void;
 extern fn r4os_fxrstor(src: [*]const u8) callconv(.c) void;
 extern fn r4os_xsave(dest: [*]u8, mask: u64) callconv(.c) void;
@@ -160,11 +161,21 @@ pub fn init() bool {
     active_cr0 = r4os_read_cr0();
     active_cr4 = r4os_read_cr4();
     r4os_fninit();
+    // A firmware/bootloader caller may leave live XMM/YMM data and a changed
+    // SSE rounding/exception policy. FNINIT resets none of those. Publish a
+    // canonical initial image for all tasks, APs and external IRQ handlers.
+    var inherited_simd: [3]u64 = @splat(0);
+    r4os_init_simd(@intFromBool(active_avx_enabled), &inherited_simd);
     const state_bytes: usize = active_state_bytes;
     saveRaw(initial_state[0..state_bytes]);
     restoreRaw(initial_state[0..state_bytes]);
     initialized = true;
     cpu.setModuleSimdAllowed(true);
+    bootlog.puts("[FPU] initial SIMD normalized inherited-xmm0=");
+    bootlog.puts(if (inherited_simd[0] != 0 or inherited_simd[1] != 0) "nonzero" else "zero");
+    bootlog.puts(" inherited-mxcsr=0x");
+    bootlog.putHex(inherited_simd[2], 8);
+    bootlog.puts(" initial-mxcsr=0x00001F80\r\n");
     logStatus("ready");
     return true;
 }
@@ -209,7 +220,7 @@ pub fn restoreTaskState(state: []const u8) void {
 // compiler-generated SSE/AVX instructions.  They do not own a schedulable
 // task state, so an IRQ must run them from the architectural initial state
 // after the interrupted task has been saved.  Otherwise an asynchronous
-// handler can overwrite live XMM/YMM lanes in the interrupted R4X program.
+// handler can overwrite live XMM/YMM lanes in an R4X program or module worker.
 pub fn restoreInitialState() bool {
     const bytes = activeStateBytes();
     if (bytes == 0) return false;

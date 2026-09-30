@@ -1,5 +1,25 @@
 ﻿# R4OS Kernel
 
+Kernel 0.1.233 preserves FPU/SIMD state for kernel-main and all executable
+worker constructors, including indirect R4D/R4P callbacks. Critical worker
+reserves preallocate and reuse their state buffers; only CPU-idle tasks may
+skip them. The bounded `OPTION TASKREGISTRY selftest=fpu-work` probe reproduces
+YMM loss on both shared Driver Work lanes with232 and passes with233, including
+clean critical-reserve reuse. Kernel467 host checks and short SMP4 probes pass;
+the relationship to the intermittent physical NVIDIA Stale remains unproven.
+Kernel 0.1.234 also clears XMM/YMM and initializes MXCSR to0x1F80 before
+capturing the task/AP/IRQ initial image. A private SMP4 fixture with inherited
+SIMD data and rounding mode fails the reserve probe on233 and passes on234.
+Both Work lanes and two critical-reserve reuses also pass on OssiPC234.
+
+Kernel 0.1.235 retains SET_CONFIGURATION acknowledgement in each USB device
+runtime. A keyboard's successful configuration must not cause a mouse with
+the same configuration value to skip its own request. A real SMP4 xHCI trace
+reproduces that omission on234 and shows both requests on235. The USB-only
+guest also delivers injected mouse movement; QEMU accepts movement even in
+the unconfigured negative case, so the trace is the regression witness.
+On OssiPC235, the repeated Completion4 endpoint recovery disappears:39616 interrupt polls with0 recoveries/0 pending timeouts, still0 after two ordinary post-GPU reboots. Both HID protocols remain bound. Manual movement is a separate final acceptance; early COM1 configuration messages were not captured remotely.
+
 Kernel 0.1.152 advertises DriverApi35 without changing its 648-byte layout.
 A live dedicated driver Task can post normal serialized Work with its exact
 owner and epoch; stopped or closing Tasks are rejected. Direct hardware APIs

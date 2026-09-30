@@ -112,11 +112,69 @@ var directed_queue = sync.WaitQueue.init();
 
 pub fn runIfEnabled() bool {
     const value = boot_config.optionValue(boot_config.get(), "TASKREGISTRY", "selftest") orelse return true;
+    if (std.ascii.eqlIgnoreCase(value, "fpu-work")) {
+        if (!driverWorkFpuProbe()) return false;
+        if (!runOomReserveTest()) return fail("fpu-reserve");
+        k.puts("TASKREG08201 fpu-reserve PASS admission=oom reuse=2 initial=clean irq-preserved=yes\r\n");
+        return true;
+    }
     if (!std.ascii.eqlIgnoreCase(value, "yes")) return true;
     return run();
 }
 
+// Exercise the actual two shared callback lanes and the actual external IRQ
+// save/restore boundary. A scalar constructor assertion cannot detect the
+// asynchronous corruption of compiler-generated SIMD ownership checks.
+fn driverWorkFpuProbe() bool {
+    if (!fpu.status().avx_enabled) return fail("fpu-work-avx-unavailable");
+    var passed = true;
+    for (0..2) |lane| {
+        var handle: u32 = 0;
+        const submitted = if (lane == 0)
+            driver_work.submit(0, driverWorkFpuCallback, lane, 0, &handle)
+        else
+            driver_work.submitRequest(0, &.{ .handler = driverWorkFpuCallback, .context = lane,
+                .serial_key = 0x465055, .deadline_tick = timer.tickCount() +| 1000, .budget_ticks = 2 }, &handle);
+        if (submitted != 0) return fail("fpu-work-submit");
+        var result: i32 = -1;
+        if (driver_work.completionWait(handle, 2000, &result) != 0) {
+            _ = driver_work.cancel(handle);
+            _ = driver_work.completionRelease(handle);
+            return fail("fpu-work-wait");
+        }
+        if (driver_work.completionRelease(handle) != 0) return fail("fpu-work-release");
+        k.puts("TASKREG08201 fpu-work lane=");
+        k.puts(if (lane == 0) "normal" else "deadline");
+        k.puts(" ymm-preserved=");
+        k.puts(if (result == 0) "yes\r\n" else "NO\r\n");
+        passed = passed and result == 0;
+    }
+    k.puts(if (passed) "TASKREG08201 fpu-work PASS lanes=2 irq-boundary=actual\r\n" else
+        "TASKREG08201 fpu-work FAIL lanes=2 irq-boundary=actual\r\n");
+    if (passed and driverWorkFpuCallback(2) != 0) return fail("fpu-kernel-main");
+    return passed;
+}
+
+fn driverWorkFpuCallback(lane: usize) callconv(.c) i32 {
+    const expected: [4]u64 = .{ 0x13579bdf2468ace0, 0x8877665544332211, 0xa5a55a5af0f00f0f, 0x123456789abcdef0 + lane };
+    var observed: [4]u64 = @splat(0);
+    const flags = interrupts.saveAndDisableLocal();
+    asm volatile ("vmovdqu (%[source]), %%ymm0"
+        :
+        : [source] "r" (&expected),
+        : .{ .ymm0 = true, .memory = true });
+    const guard = scheduler.enterExternalIrqFpuGuard();
+    scheduler.leaveExternalIrqFpuGuard(guard);
+    asm volatile ("vmovdqu %%ymm0, (%[destination]); vzeroupper"
+        :
+        : [destination] "r" (&observed),
+        : .{ .ymm0 = true, .memory = true });
+    interrupts.restoreLocal(flags);
+    return if (std.mem.eql(u64, &expected, &observed)) 0 else -1;
+}
+
 fn run() bool {
+    if (!driverWorkFpuProbe()) return fail("fpu-work");
     resetState();
     _ = task.reapDeferred();
     _ = task.reclaimStackCache(0);
@@ -1213,6 +1271,26 @@ fn shortWorker() callconv(.c) void {
     short_completed +%= 1;
 }
 
+fn criticalFpuWorker() callconv(.c) void {
+    // A recycled reserve must start clean even if its previous incarnation
+    // left a nonzero saved SIMD image. Read before the IRQ preservation probe.
+    var initial: [4]u64 = undefined;
+    var mxcsr: u32 = 0;
+    asm volatile ("vmovdqu %%ymm0, (%[destination]); stmxcsr (%[control])"
+        :
+        : [destination] "r" (&initial),
+          [control] "r" (&mxcsr),
+        : .{ .memory = true });
+    const zero: [4]u64 = @splat(0);
+    if (!std.mem.eql(u64, &initial, &zero) or mxcsr != 0x1F80) {
+        k.puts("TASKREG08201 fpu-reserve inherited-state ymm0=");
+        for (initial) |word| { k.putHex(word, 16); k.puts(" "); }
+        k.puts("mxcsr="); k.putHex(mxcsr, 8); k.puts("\r\n");
+        return;
+    }
+    if (driverWorkFpuCallback(3) == 0) short_completed +%= 1;
+}
+
 fn runOomReserveTest() bool {
     const reserve_before = task.criticalReserveStats();
     if (reserve_before.available == 0) return false;
@@ -1225,19 +1303,26 @@ fn runOomReserveTest() bool {
     }
     if (normal_failure != .task_metadata) return false;
 
-    short_completed = 0;
-    var critical_failure: task.CreateFailure = .none;
-    const critical = task.createKernelThreadCriticalWithFailure("taskreg-critical", shortWorker, &critical_failure) orelse return false;
-    if (critical_failure != .none or !task.pin(critical)) return false;
-    const critical_id = critical.id;
-    const critical_generation = critical.generation;
     var spins: usize = 0;
-    while (critical.state != .dead and spins < 4096) : (spins += 1) scheduler.yield();
-    if (critical.state != .dead or short_completed != 1) {
-        _ = task.unpin(critical);
-        return false;
+    var first_fpu: ?[*]u8 = null;
+    for (0..2) |_| {
+        short_completed = 0;
+        var critical_failure: task.CreateFailure = .none;
+        const critical = task.createKernelThreadCriticalWithFailure("taskreg-critical", criticalFpuWorker, &critical_failure) orelse return false;
+        if (critical_failure != .none or !task.pin(critical)) return false;
+        const critical_id = critical.id;
+        const critical_generation = critical.generation;
+        const memory = critical.fpu_state;
+        const stable_fpu = if (memory) |state| first_fpu == null or first_fpu.? == state.ptr else false;
+        if (memory) |state| first_fpu = state.ptr;
+        spins = 0;
+        while (critical.state != .dead and spins < 4096) : (spins += 1) scheduler.yield();
+        if (critical.state != .dead or short_completed != 1 or !stable_fpu) {
+            _ = task.unpin(critical);
+            return false;
+        }
+        if (!task.unpin(critical) or !task.releaseDeadIdentity(critical_id, critical_generation)) return false;
     }
-    if (!task.unpin(critical) or !task.releaseDeadIdentity(critical_id, critical_generation)) return false;
     const reserve_after = task.criticalReserveStats();
     if (reserve_after.total != reserve_before.total or reserve_after.available != reserve_before.available or reserve_after.in_use != reserve_before.in_use) return false;
 

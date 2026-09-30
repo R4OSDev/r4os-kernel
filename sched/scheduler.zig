@@ -430,7 +430,7 @@ var external_irq_fpu_guard_mismatches: u64 = 0;
 var external_irq_fpu_guard_mismatch_reported = false;
 
 // An external R4D IRQ handler is not a task and therefore has no scheduler
-// FPU slot of its own.  Save the interrupted R4X state before entering module
+// FPU slot of its own. Save the interrupted task state before entering module
 // code and give the handler a clean MXCSR/XMM/YMM baseline.  irq_router calls
 // this immediately around the handler while interrupt delivery is disabled;
 // handlers must not yield or switch tasks.

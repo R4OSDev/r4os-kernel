@@ -5,6 +5,49 @@ Dieses Repository enthaelt den R4OS-Kernel fuer x86_64, seine Limine-
 Bootintegration, den Linker, zwingend eingebaute Bestandteile und kernelnahe
 Tests. Der Kernel wird fest in ReleaseSafe und ohne SIMD gebaut.
 
+0.1.235: USB-Konfigurationsquittung gehoert zum Geraet
+---------------------------------------------------
+SET_CONFIGURATION-attempted/ok bleiben beim jeweiligen DeviceRuntime und
+werden mit dessen Ringspeicher und Transferzustand gespeichert/restauriert.
+Zuvor konnte eine Maus mit demselben bConfigurationValue die Quittung der
+vorher ausgewaehlten Tastatur erben und den eigenen Konfigurationsrequest
+ueberspringen. Das weitere Interface desselben Geraets vermeidet weiterhin
+eine unnoetige Neukonfiguration; ein neues Geraet beginnt ohne Quittung.
+Die SMP4-Gegenprobe verwendet zwei echte virtuelle xHCI-HID-Geraete, ohne
+i8042:234 sendet nur den ersten OS-Konfigurationsrequest,235 beide. Der
+QEMU-USB-Trace ist der negative Nachweis; QEMU liefert Mausdaten sogar ohne
+dessen Konfiguration und bildet diesen physischen Fehler nicht streng ab.
+Mit235 kommen injizierte Mausbewegungen an. OssiPC235 hat nach zuvor
+tausenden Completion4/Request8/Residue8-Fehlern nun39616 Interrupt-Polls
+mit0Recoveries/0Pending-Timeouts; nach zwei normalen GPU-Neustarts weiter0.
+Beide HID-Protokolle bleiben gebunden. Fruehe USBCONFIG-Zeilen gingen nur
+an COM1 und wurden physisch nicht per Remote erfasst. Manuelle Bewegung
+ist eine separate finale Abnahme; der USB-Controltrace ist ein SMP4-Beleg.
+
+0.1.233/234: SIMD-Zustand bei Kernel-Workern
+-------------------------------------
+Auch Kernel-Worker und kernel-main rufen R4D-/R4P-Module mit SIMD-Code auf.
+Sie besitzen jetzt ebenso wie R4X-Tasks einen ausgerichteten CPUID-/XCR0-
+FPU-Puffer fuer Taskwechsel und den externen IRQ-Guard. Nur CPU-Idle-Tasks
+ohne Modulaufrufe bleiben ausgenommen. Die vier kritischen Task-/Stack-
+Reserven enthalten den FPU-Puffer schon beim Boot und behalten ihn beim
+Abbau; erneute Aufnahme setzt den Inhalt ohne Allokation auf den Startwert.
+OPTION TASKREGISTRY selftest=fpu-work aktiviert eine kurze Variante des
+bestehenden Tasktests: beide echten Driver-Work-Lanes, kernel-main und zwei
+Reserve-Wiederverwendungen muessen YMM-Werte ueber den echten IRQ-Guard
+erhalten. Kernel232 scheitert auf beiden Lanes,233 besteht.467 Besitzertests
+und der kurze SMP4-/Parallelitaetsnachweis bestehen ebenfalls. Der Nachweis
+erklaert einen realen Registerverlust, noch nicht die physische NVIDIA-
+Stale-Ursache.0.1.234 setzt vor dem kanonischen Anfangssnapshot auch alle
+XMM-/YMM-Register und MXCSR auf0x1F80 zurueck. FNINIT allein laesst SIMD-
+Register und SSE-Steuerwort unveraendert; der Task-Anfangszustand hing daher
+vom Bootloader ab. Eine private SMP4-Fixture mit XMM0=0x12345678 und
+MXCSR=0x3F80 reproduziert den Fehler mit233 und besteht mit234; die Fixture
+wird nicht verteilt. Der bestehende Reservetest prueft auch MXCSR.
+Erste USB-HID-Recoveries protokollieren begrenzt den tatsaechlichen
+Transfercode, angeforderte Laenge und Restlaenge vor der Recovery. Die
+periodischen Zaehler hatten zuvor nur den spaeteren Befehlsabschluss gezeigt.
+
 Nicht blockierender TCP-FIN-Abschluss seit 0.74.3
 -------------------------------------------------
 

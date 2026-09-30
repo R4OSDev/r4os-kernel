@@ -298,6 +298,10 @@ const DeviceRuntime = struct {
     port: u8 = 0,
     speed: u8 = 0,
     config_value: u8 = 0,
+    // SET_CONFIGURATION acknowledges one USB device, not the controller.
+    // Different devices commonly advertise the same configuration value.
+    set_configuration_attempted: bool = false,
+    set_configuration_ok: bool = false,
     vendor_id: u16 = 0,
     product_id: u16 = 0,
     device_context_phys: u64 = 0,
@@ -2673,6 +2677,8 @@ fn persistActiveRuntime() void {
     rt.port = current.addressed_port;
     rt.speed = current.addressed_speed;
     rt.config_value = current.config_value;
+    rt.set_configuration_attempted = current.set_configuration_attempted;
+    rt.set_configuration_ok = current.set_configuration_ok;
     rt.vendor_id = current.device_vendor_id;
     rt.product_id = current.device_product_id;
     rt.device_context_phys = current.device_context_phys;
@@ -2741,6 +2747,8 @@ fn loadRuntime(index_value: usize) void {
     current.addressed_port = rt.port;
     current.addressed_speed = rt.speed;
     current.config_value = rt.config_value;
+    current.set_configuration_attempted = rt.set_configuration_attempted;
+    current.set_configuration_ok = rt.set_configuration_ok;
     current.device_vendor_id = rt.vendor_id;
     current.device_product_id = rt.product_id;
     current.get_config_ok = rt.config_value != 0;
@@ -3669,6 +3677,14 @@ pub fn setFirstConfiguration() bool {
     if (!selectedDeviceAllowsMutation()) return false;
     current.set_configuration_attempted = true;
     current.set_configuration_ok = submitControlNoData(0x00, USB_REQ_SET_CONFIGURATION, current.config_value, 0);
+    k.puts("[USBCONFIG] slot="); k.putDec(current.addressed_slot_id);
+    k.puts(" port="); k.putDec(current.addressed_port);
+    k.puts(" vid="); k.putHex(current.device_vendor_id, 4);
+    k.puts(" pid="); k.putHex(current.device_product_id, 4);
+    k.puts(" value="); k.putDec(current.config_value);
+    k.puts(" result="); k.puts(if (current.set_configuration_ok) "OK" else "FAILED");
+    k.puts(" code="); k.putDec(current.last_control_completion_code);
+    k.puts("\r\n");
     return current.set_configuration_ok;
 }
 
@@ -4607,6 +4623,23 @@ fn recoverInterruptEndpoint(from_pending: bool) bool {
     const slot = current.addressed_slot_id;
     const ep_id = current.interrupt_endpoint_id;
     if (slot == 0 or ep_id == 0) return false;
+    // Preserve the first actual completion cause before recovery overwrites
+    // the controller's generic last-event fields with command completions.
+    // The existing periodic counters alone cannot distinguish a stalled HID
+    // endpoint from a malformed/failed transfer. No additional device reads.
+    if (current.interrupt_recoveries < 4) {
+        k.puts("[USBHIDRECOVERY] slot="); k.putDec(slot);
+        k.puts(" endpoint="); k.putDec(ep_id);
+        k.puts(" port="); k.putDec(current.addressed_port);
+        k.puts(" vid="); k.putHex(current.device_vendor_id, 4);
+        k.puts(" pid="); k.putHex(current.device_product_id, 4);
+        k.puts(" from="); k.puts(if (from_pending) "pending-state" else "completion");
+        k.puts(" code="); k.putDec(current.last_interrupt_completion_code);
+        k.puts(" request="); k.putDec(current.last_interrupt_request_len);
+        k.puts(" residue="); k.putDec(current.last_interrupt_residue);
+        k.puts(" last-state="); k.putDec(current.last_interrupt_ep_state);
+        k.puts("\r\n");
+    }
     const pending_owner = currentInterruptOwnerMatch();
     if (pending_owner) |owner| _ = deferred_events.purge(owner);
     releaseInterruptTransfer(true);
