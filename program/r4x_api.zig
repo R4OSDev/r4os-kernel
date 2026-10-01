@@ -2652,6 +2652,8 @@ pub const R4DevProvider = generated.R4DevProvider;
 pub const buildR4DevTable = generated.buildR4DevTable;
 // R4OS-KERNEL-API-GENERATED-EXPORTS:END
 
+pub const program_instance_flag_desktop_host = generated.program_instance_flag_desktop_host;
+
 pub const GfxOutputBrightness = generated.GfxOutputBrightness;
 pub const GfxBrightnessRequest = generated.GfxBrightnessRequest;
 

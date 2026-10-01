@@ -515,6 +515,7 @@ const LoadedProgram = struct {
     entry: RawEntryFn,
     memory_contract: ProgramMemoryContract = .{},
     parallel_execution: bool = false,
+    desktop_host: bool = false,
     imports: [MAX_R4M_IMPORTS]R4XStartImportSeed = .{R4XStartImportSeed{}} ** MAX_R4M_IMPORTS,
     import_count: u32 = 0,
     loader_section_count: u32 = 0,
@@ -1020,6 +1021,7 @@ const ProgramInstanceStorage = struct {
 
 const ProgramInstance = struct {
     parallel_execution: bool = false, // immutable after publication
+    desktop_host: bool = false, // immutable admitted GUI owner declaration
     gfx_virtual_closed: bool = false, // common BO owner; closed before exit publication
     notifications: notifications.Owner = .{},
     used: bool = false,
@@ -8918,6 +8920,7 @@ const R4XExportContract = struct {
 const ProgramMetadataContract = struct {
     memory: ProgramMemoryContract,
     parallel_execution: bool,
+    desktop_host: bool,
 };
 
 fn readValidatedProgramMetadataFromReader(reader: *module_r4m.Reader, r4m: module_r4m.Header, app_class: AppClass, export_contract: R4XExportContract, verbose: bool) ?ProgramMetadataContract {
@@ -8927,6 +8930,7 @@ fn readValidatedProgramMetadataFromReader(reader: *module_r4m.Reader, r4m: modul
     return .{
         .memory = resolveProgramMemoryContractMetadata(meta, app_class) orelse return null,
         .parallel_execution = (execution_policy.parse(meta) orelse return null) == .owned_v1,
+        .desktop_host = (execution_policy.desktopHost(meta) orelse return null) and app_class == .gui,
     };
 }
 
@@ -9027,6 +9031,7 @@ fn loadR4MProgramImage(file: ProgramFile, owner_id: u32, app_class: AppClass, re
         .entry = entry,
         .memory_contract = memory_contract.memory,
         .parallel_execution = memory_contract.parallel_execution,
+        .desktop_host = memory_contract.desktop_host,
         .imports = r4xstart_imports,
         .import_count = r4xstart_import_count,
         .loader_section_count = r4m.section_count,
@@ -10407,7 +10412,10 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
     // commit still starts the child; leaveProgramSpawnTransaction only
     // orphans caller-owned observation state.  Pre-Publish cancellation above
     // remains a complete rollback.
-    if (app_class == .gui and options.out_handle != null) {
+    // A declared desktop host owns windows rather than waiting for another
+    // Desktop to attach its own GUI process. Ordinary GUI starts keep the
+    // existing two-step host transaction.
+    if (app_class == .gui and !instance.desktop_host and options.out_handle != null) {
         @atomicStore(bool, &guiPayload(instance).start_attach_pending, true, .release);
     }
     if (options.out_handle) |out_handle| out_handle.* = handle;
@@ -18063,6 +18071,7 @@ fn createInstance(
             .role = role,
             .app_class = app_class,
             .parallel_execution = role == .background and loaded.parallel_execution,
+            .desktop_host = loaded.desktop_host,
             .entry = loaded.entry,
             .stack_top = stack.top,
             .program_image_range_id = loaded.image.range_id,
@@ -18897,6 +18906,7 @@ fn activeInstanceCount() u8 {
 
 fn instanceInfo(instance: *const ProgramInstance) ProgramInstanceInfo {
     var flags: u8 = 0;
+    if (instance.desktop_host) flags |= r4x_api.program_instance_flag_desktop_host;
     if (@atomicLoad(bool, &instance.close_requested, .acquire)) flags |= ProgramInstanceFlag.close_requested;
     if (@atomicLoad(bool, &instance.desktop_requested, .acquire)) flags |= ProgramInstanceFlag.desktop_requested;
     if (instance.console_payload) |console| {
