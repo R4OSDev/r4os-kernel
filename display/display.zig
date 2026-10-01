@@ -583,6 +583,10 @@ pub fn beginDeviceReset(owner: usize, generation: u64, adapter: u32) TransitionE
     defer execution.leave();
     const current = backend_manager.value;
     if (adapter == 0 or adapter != (if (current.state == .preparing) current.pending_adapter_id else current.adapter_id)) return error.Stale;
+    // Headless execution can resume without replacing the held display.
+    // A later stop may advance that identity only after every old common
+    // consumer was retired. The driver bridge also verifies the new queue.
+    if (current.state == .recovering and retired_reset_generation != generation) return error.Busy;
     var candidate = backend_manager;
     const next = try candidate.beginDeviceReset(owner, generation);
     if (!firmware_access.gate.isRevoked() and !firmware_access.gate.tryRevoke()) return error.Busy;
@@ -1496,14 +1500,24 @@ fn exerciseHeldNative(template: NativeBackend) !void {
     try t.expectError(error.Stale, beginDeviceReset(92, reset_hold.generation, candidate.adapter_id));
     const reset = try beginDeviceReset(91, reset_hold.generation, candidate.adapter_id);
     try t.expect(reset > reset_hold.generation and !fill(0x123456) and firmware_access.gate.isRevoked());
+    try t.expectError(error.Busy, beginDeviceReset(91, reset, candidate.adapter_id));
     try t.expectError(error.Stale, retireDeviceReset(91, reset_hold.generation));
     try retireDeviceReset(91, reset);
+    // No scanout preparation occurs during headless restart. An additional
+    // physical stop requires a fresh common generation and fresh retirement.
+    try t.expectError(error.Stale, beginDeviceReset(92, reset, candidate.adapter_id));
+    const headless_reset = try beginDeviceReset(91, reset, candidate.adapter_id);
+    try t.expect(headless_reset > reset and held_boot.?.generation == reset_hold.generation and
+        backendState().state == .recovering and !fill(0x123456) and retired_reset_generation == 0);
+    try t.expectError(error.Busy, beginDeviceReset(91, headless_reset, candidate.adapter_id));
+    try t.expectError(error.Stale, retireDeviceReset(91, reset));
+    try retireDeviceReset(91, headless_reset);
     try t.expectError(error.Stale, prepareRecoveredNative(candidate, reset_hold.generation + 1, reset));
-    const prepared = try prepareRecoveredNative(candidate, reset_hold.generation, reset);
+    const prepared = try prepareRecoveredNative(candidate, reset_hold.generation, headless_reset);
     try t.expect(prepared > reset and native_hold_generation == reset_hold.generation);
     try abortNative(91, prepared);
     try t.expect(backendState().state == .unavailable and held_boot != null and !fill(0xFFFFFF));
-    const retry = try beginDeviceReset(91, reset, candidate.adapter_id);
+    const retry = try beginDeviceReset(91, headless_reset, candidate.adapter_id);
     try retireDeviceReset(91, retry);
     const fresh = try prepareRecoveredNative(candidate, reset_hold.generation, retry);
     try t.expectError(error.Stale, commitNative(91, prepared));

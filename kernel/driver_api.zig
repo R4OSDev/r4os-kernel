@@ -3464,7 +3464,7 @@ fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i
         .presentation_info = @intFromPtr(&gfxDisplayPresentationInfo),
         .output_register = @intFromPtr(&gfxDisplayOutputRegister), .output_transition = @intFromPtr(&gfxDisplayOutputTransition),
         .device_reset = @intFromPtr(&gfxDisplayDeviceReset), .prepare_reset = @intFromPtr(&gfxDisplayPrepareReset),
-        .terminal_release = @intFromPtr(&gfxDisplayTerminalRelease) };
+        .terminal_release = @intFromPtr(&gfxDisplayTerminalRelease), .resume_headless = @intFromPtr(&gfxDisplayResumeHeadless) };
     @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
     return outputs_contract.gfx_output_ok;
 }
@@ -3543,6 +3543,10 @@ fn gfxDisplayTransition(generation: u64, operation: u32, output: *outputs_contra
 fn gfxDisplayDeviceReset(input: *const outputs_contract.GfxBackendBinding, generation: u64, quiesced: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
     return native_display.deviceReset(identity, input, generation, quiesced, output);
+}
+fn gfxDisplayResumeHeadless(input: *const outputs_contract.GfxBackendBinding, generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+    return native_display.resumeHeadless(identity, input, generation, output);
 }
 fn gfxDisplayTerminalRelease(input: *const outputs_contract.GfxBackendBinding, generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
     const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);

@@ -100,6 +100,18 @@ pub const Manager = struct {
     /// pending display owner. Logical reset adopts that owner without ever
     /// reopening bootfb; physical quiescence is supplied by the driver later.
     pub fn beginDeviceReset(self: *Manager, owner: usize, generation: u64) Error!u64 {
+        // The enclosing display owner admits this only after the previous
+        // reset's consumers retired. Headless GPU work does not reprepare
+        // scanout, so it deliberately leaves this display state recovering.
+        if (self.value.state == .recovering) {
+            try self.checkActive(owner, generation);
+            if (self.value.reset_generation == ~@as(u64, 0)) return error.Exhausted;
+            const next = try self.nextGeneration();
+            self.value.generation = next;
+            self.value.reset_generation += 1;
+            self.changed();
+            return next;
+        }
         if (self.value.state != .preparing) return self.beginRecovery(owner, generation);
         try self.checkPending(owner, generation);
         if (self.value.reset_generation == ~@as(u64, 0)) return error.Exhausted;
