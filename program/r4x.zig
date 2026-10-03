@@ -13796,7 +13796,12 @@ fn apiProgramHandleWait(handle_ptr: *const ProgramProcessHandle, timeout_ticks: 
             const now = timer.tickCount();
             if (now -% start >= timeout_ticks) return PROGRAM_HANDLE_ERROR_TIMEOUT;
         }
-        scheduler.yield();
+        // A blocking completion wait must leave the runnable set. Concurrent
+        // BSP/AP callers otherwise continuously hand off the registry mutex
+        // and send reschedule IPIs, starving the BSP's timed sleepers until
+        // a caller's deadline expires. No registry owner or completion-node
+        // pointer spans this sleep; the next pass revalidates the handle.
+        scheduler.sleepTicks(1);
     }
 }
 
