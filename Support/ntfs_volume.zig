@@ -3268,7 +3268,9 @@ fn allocateIndexBlockVcn(v: *const Volume, dir_record: u64) ?u64 {
     var grow_run: [1]ntfs.Run = undefined;
     var grew = false;
     if (vcn == capacity) {
-        if (alloc.count >= MAX_DATA_RUNS) return null;
+        // Index allocation uses the collected attribute's full run buffer;
+        // the smaller payload-operation buffer does not own this runlist.
+        if (alloc.count >= alloc.runs.len) return null;
         const allocation = allocateClusters(v, 1, grow_run[0..]);
         if (allocation.status != .ok) return null;
         const produced = allocation.produced;
