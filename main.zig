@@ -127,9 +127,11 @@ export fn kmain() callconv(.c) noreturn {
     requireBootStep(storage_boot.initControllers(pcie_status), .storage, "Storage controller boot failed");
     fatal.setBootPhase(.loader);
     beginBootStep(.loader, "System laden");
-    requireBootStep(loader_boot.initFilesystemLoader(), .loader, "Loader boot failed");
+    // Replay durable filesystem transactions before caching any installed
+    // library, driver descriptor, font or boot policy from their targets.
     requireBootStep(system_update_recovery_boot.recoverBeforeRuntime(), .loader, "System update recovery failed");
     requireBootStep(upload_claim_boot.recoverBeforeRuntime(), .loader, "Upload publish claim recovery failed");
+    requireBootStep(loader_boot.initFilesystemLoader(), .loader, "Loader boot failed");
     fatal.setBootPhase(.irq);
     beginBootStep(.irq, "Interrupts starten");
     requireBootStep(platform_irq_boot.init(), .irq, "Platform IRQ boot failed");
