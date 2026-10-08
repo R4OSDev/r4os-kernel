@@ -334,7 +334,11 @@ pub fn Resources(comptime capacity: usize) type {
             const descriptor = try buffers.describe(request.source, producer);
             if (request.operation == .direct_present and (descriptor.location != .device_local or descriptor.modifier != 0 or
                 descriptor.usage & lifetime.layout.Usage.scanout == 0 or descriptor.planes[0].pitch & 63 != 0)) return error.Unsupported;
-            if (descriptor.format != .xrgb8888 or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0 or
+            // Both acknowledged opaque RGB scanout formats have four-byte
+            // pixels. Display admission already matches the exact output
+            // encoding; this lifetime check must also retain XR30 sources.
+            if ((descriptor.format != .xrgb8888 and descriptor.format != .xrgb2101010) or
+                descriptor.plane_count != 1 or descriptor.planes[0].offset != 0 or
                 descriptor.usage & lifetime.layout.Usage.transfer_source == 0 or request.bytes != @as(u64, descriptor.width) * 4 or
                 request.row_count != descriptor.height or request.source_pitch != descriptor.planes[0].pitch or
                 try rowSpan(request.bytes, request.row_count, request.source_pitch) > descriptor.bytes) return error.Unsupported;
@@ -550,8 +554,10 @@ test "native upload retains a single source beyond cancellation and producer ref
         try t.expectError(error.Invalid, planeRows(descriptor, 80 + 6 * pixel_bytes, pixel_bytes + 1, 1, 64));
         try t.expectError(error.Invalid, planeRows(descriptor, 80, pixel_bytes, 2, 64));
     }
-    try checkImagePresentation(false);
-    try checkImagePresentation(true);
+    for ([_]lifetime.layout.Format{ .xrgb8888, .xrgb2101010, .argb8888, .argb2101010 }) |format| {
+        try checkImagePresentation(false, format);
+        try checkImagePresentation(true, format);
+    }
     try checkGridLifetime();
     try checkColorLifetime();
     const producer = display_owner;
@@ -779,7 +785,7 @@ fn checkColorLifetimeKind(combined: bool) !void {
     try t.expectEqual(@as(u64, 0), buffers.stats().bytes);
 }
 
-fn checkImagePresentation(direct: bool) !void {
+fn checkImagePresentation(direct: bool, format: lifetime.layout.Format) !void {
     const t = std.testing;
     const producer: lifetime.Owner = .{ .kind = .program, .id = 41, .generation = 2 };
     const driver: lifetime.Owner = .{ .kind = .driver, .id = 12, .generation = 4 };
@@ -789,7 +795,7 @@ fn checkImagePresentation(direct: bool) !void {
     var state = queue.Store(2, 4){};
     var resources = Resources(4){};
     const native = try buffers.beginOwned(driver, .{ .bytes = 4096, .usage = if (direct) 60 else 28, .location = .device_local, .binding = memory,
-        .format = .xrgb8888, .width = 16, .height = 16, .plane_count = 1, .planes = .{ .{ .pitch = 64 }, .{}, .{}, .{} } }, 100);
+        .format = format, .width = 16, .height = 16, .plane_count = 1, .planes = .{ .{ .pitch = 64 }, .{}, .{}, .{} } }, 100);
     try buffers.commitOwned(native, driver);
     const ref = try buffers.share(native.create.reference, producer);
     const rendering = try state.open(producer, .{ .binding = device, .milestone = .device_execution });
@@ -803,6 +809,24 @@ fn checkImagePresentation(direct: bool) !void {
     request.target_pitch = 64;
     try t.expectError(error.Invalid, resources.submit(&state, &buffers, presenting, producer, .{ .deadline_ns = 100 }, request, 1));
     request.target_pitch = 0;
+    if (format == .argb8888 or format == .argb2101010) {
+        const before = buffers.stats();
+        try t.expectError(error.Unsupported, resources.submit(&state, &buffers, presenting, producer,
+            .{ .deadline_ns = 100, .dependencies = &.{writer} }, request, 1));
+        try t.expectEqualDeep(before, buffers.stats());
+        try buffers.drop(ref, producer); try buffers.drop(native.create.reference, driver);
+        try t.expectEqualDeep(writer, state.takeReadyFor(device, 2).?);
+        try state.complete(writer, .complete, true, 3);
+        const written = state.takeRelease().?;
+        try resources.release(&buffers, written); try state.released(written, true);
+        try buffers.finishOwnedRelease((try buffers.takeOwnedRelease(driver, memory)).?, driver, true);
+        try t.expect(buffers.stats().bytes == 0);
+        return;
+    }
+    request.bytes = 63;
+    try t.expectError(error.Unsupported, resources.submit(&state, &buffers, presenting, producer,
+        .{ .deadline_ns = 100, .dependencies = &.{writer} }, request, 1));
+    request.bytes = 64;
     try t.expectError(error.Busy, resources.submit(&state, &buffers, presenting, producer, .{ .deadline_ns = 100 }, request, 1));
     const reader = try resources.submit(&state, &buffers, presenting, producer, .{ .deadline_ns = 100, .dependencies = &.{writer} }, request, 1);
     request.display_target.head_id = 3;
