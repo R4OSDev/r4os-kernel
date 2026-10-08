@@ -46,6 +46,10 @@ pub fn status(ticket: u64) Error!abi.GfxModeStatus {
     if (ticket != 0 and ticket != state.status.ticket) return error.Stale;
     return state.status;
 }
+pub fn presentationReady(driver: buffers.Owner, backend: abi.GfxBackendBinding) bool {
+    const token = ownership.enterState(); defer ownership.leaveState(token);
+    return state.presentationReady(driver, backend);
+}
 pub fn submit(caller: buffers.Owner, input: *const abi.GfxAtomicState, confirmation_ms: u32) Error!abi.GfxModeStatus {
     return submitImpl(caller, input, confirmation_ms, false, null);
 }

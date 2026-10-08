@@ -582,19 +582,30 @@ pub fn beginDeviceReset(owner: usize, generation: u64, adapter: u32) TransitionE
     if (!execution.tryEnter()) return error.Busy;
     defer execution.leave();
     const current = backend_manager.value;
-    if (adapter == 0 or adapter != (if (current.state == .preparing) current.pending_adapter_id else current.adapter_id)) return error.Stale;
+    const restored_console = current.state == .bootfb;
+    if (restored_console) {
+        if (!backend_manager.restoredBootOwner(owner, generation, adapter)) return error.Stale;
+        if (!system_transition or held_boot != null or native_backend != null) return error.Busy;
+    } else if (adapter == 0 or adapter != (if (current.state == .preparing) current.pending_adapter_id else current.adapter_id)) return error.Stale;
     // Headless execution can resume without replacing the held display.
     // A later stop may advance that identity only after every old common
     // consumer was retired. The driver bridge also verifies the new queue.
     if (current.state == .recovering and retired_reset_generation != generation) return error.Busy;
     var candidate = backend_manager;
-    const next = try candidate.beginDeviceReset(owner, generation);
+    const next = if (restored_console) try candidate.beginRestoredBootReset(owner, generation, adapter)
+        else try candidate.beginDeviceReset(owner, generation);
     if (!firmware_access.gate.isRevoked() and !firmware_access.gate.tryRevoke()) return error.Busy;
     backend_manager = candidate;
     retired_reset_generation = 0;
     primary_device = null;
     publishStats();
     return next;
+}
+
+pub fn restoredBootOwner(owner: usize, generation: u64, adapter: u32) TransitionError!bool {
+    if (!execution.tryEnter()) return error.Busy;
+    defer execution.leave();
+    return held_boot == null and native_backend == null and backend_manager.restoredBootOwner(owner, generation, adapter);
 }
 
 // Serialize retirement of common consumers under the exact reset identity.
@@ -1525,8 +1536,34 @@ fn exerciseHeldNative(template: NativeBackend) !void {
     try t.expectEqual(CommitResult.confirmed, try commitNative(91, fresh));
     try t.expect(backendState().generation == fresh and held_boot.?.generation == reset_hold.generation);
     try t.expectError(error.Stale, beginDeviceReset(91, reset_hold.generation, candidate.adapter_id));
-    try restoreBootBackend(91, fresh);
+    try @import("native_driver.zig").checkConsoleRestoreForTest(91, fresh, candidate.adapter_id);
     try t.expect(held_boot == null and !firmware_access.gate.isRevoked());
+
+    // A physically reconstructed original console keeps its GPU alive after
+    // common bootfb ownership returns. Shutdown needs a fresh logical reset,
+    // followed by a separate physical stop; the old receipt is insufficient.
+    const restored_manager = backend_manager;
+    const restored_generation = backendState().generation;
+    const before_console_restores = probe.native_restores + probe.old_restores;
+    try t.expectError(error.Busy, beginDeviceReset(91, restored_generation, candidate.adapter_id));
+    try t.expect(beginSystemTransition(0));
+    try t.expectError(error.Stale, beginDeviceReset(92, restored_generation, candidate.adapter_id));
+    try t.expectError(error.Stale, beginDeviceReset(91, restored_generation - 1, candidate.adapter_id));
+    try t.expectError(error.Stale, beginDeviceReset(91, restored_generation, candidate.adapter_id + 1));
+    const console_reset = try beginDeviceReset(91, restored_generation, candidate.adapter_id);
+    try t.expect(console_reset > restored_generation and backendState().state == .recovering and
+        held_boot == null and !fill(0xabcdef) and firmware_access.gate.isRevoked());
+    try t.expectError(error.Busy, releaseTerminal(91, console_reset, candidate.adapter_id));
+    try retireDeviceReset(91, console_reset);
+    try releaseTerminal(91, console_reset, candidate.adapter_id);
+    try t.expect(backendState().state == .unavailable and systemTransitionQuiesced() and
+        before_console_restores == probe.native_restores + probe.old_restores);
+    // Continue the independent original scenarios from their saved CPU model.
+    backend_manager = restored_manager;
+    system_transition = false;
+    primary_device = &bootfb_device;
+    firmware_access.gate.restore();
+    publishStats();
 
     for ([_]CommitResult{ .output_lost, .confirmed }) |result| {
         holder.expected_generation = backendState().generation;

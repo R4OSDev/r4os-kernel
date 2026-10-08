@@ -30,7 +30,6 @@ const Bridge = struct {
     pending: ?queue.model.Fence = null,
     image_pending: ?queue.model.Fence = null,
     image_direct: bool = false,
-    last_present: ?queue.model.Fence = null,
     bytes: u64 = 0,
     frame: framebuffer.Framebuffer = undefined,
     output_format: u32 = abi.gfx_buffer_format_xrgb8888,
@@ -103,6 +102,63 @@ fn resetResult(reset: *ResetRecord, step: ResetStep, result: i32) i32 {
     return result;
 }
 var reset_record: ?ResetRecord = null;
+// Successful boot-console restoration consumes the public reset record.
+// Its private GPU channels remain resident, so retain their exact R4D
+// identity separately. This receipt proves ownership, never physical DMA rest.
+const ConsoleReceipt = struct {
+    driver: buffers.Owner,
+    adapter: u32,
+    reset_generation: u64,
+    restored_generation: u64,
+};
+var console_receipt: ?ConsoleReceipt = null;
+
+fn restoreAfterReset(id: u32, generation: u64) Error!void {
+    if (reset_record) |reset| if (!reset.retired) return error.Busy;
+    try display.restoreBootBackend(id, generation);
+    // The display callback has restored the original console and consumed
+    // its common hold. Preserve only the retired owner's identity before
+    // clearing the public reset record, which must stay clear for CPU output.
+    console_receipt = null;
+    if (reset_record) |reset| {
+        const restored = display.backendState();
+        if (reset.driver.id == id and reset.retired and !reset.terminal_released and reset.resumed_backend == null and
+            restored.state == .bootfb and restored.owner == 0 and restored.generation > reset.generation and
+            (display.restoredBootOwner(id, restored.generation, reset.backend.adapter_id) catch false))
+            console_receipt = .{ .driver = reset.driver, .adapter = reset.backend.adapter_id,
+                .reset_generation = reset.generation, .restored_generation = restored.generation };
+    }
+    reset_record = null;
+}
+
+fn ownsRestoredConsole(identity: buffers.Owner, generation: u64, adapter: u32) bool {
+    const receipt = console_receipt orelse return false;
+    return receipt.driver.eql(identity) and receipt.adapter == adapter and
+        receipt.restored_generation == generation and generation > receipt.reset_generation;
+}
+
+// Extend the existing display lifecycle test through the same production
+// restore path that consumes the old reset record. The seed represents the
+// independently verified old physical retirement, not a new DMA receipt.
+pub fn checkConsoleRestoreForTest(id: u32, generation: u64, adapter: u32) !void {
+    std.debug.assert(@import("builtin").is_test);
+    const t = std.testing;
+    const saved_reset = reset_record;
+    const saved_console = console_receipt;
+    defer { reset_record = saved_reset; console_receipt = saved_console; }
+    const identity: buffers.Owner = .{ .kind = .driver, .id = id, .generation = 19 };
+    reset_record = .{ .driver = identity, .backend = .{ .adapter_id = adapter,
+        .device_generation = 1, .reset_generation = 1 }, .original_generation = generation - 1,
+        .generation = generation, .retired = true };
+    console_receipt = null;
+    try restoreAfterReset(id, generation);
+    const restored = display.backendState().generation;
+    try t.expect(reset_record == null and ownsRestoredConsole(identity, restored, adapter));
+    try t.expect(!ownsRestoredConsole(.{ .kind = .driver, .id = id, .generation = 20 }, restored, adapter));
+    try t.expect(!ownsRestoredConsole(.{ .kind = .driver, .id = id + 1, .generation = 19 }, restored, adapter));
+    try t.expect(!ownsRestoredConsole(identity, restored - 1, adapter));
+    try t.expect(!ownsRestoredConsole(identity, restored, adapter + 1));
+}
 
 fn binding(value: abi.GfxBackendBinding) queue.model.Binding {
     return .{ .adapter = value.adapter_id, .device_generation = value.device_generation, .reset_generation = value.reset_generation };
@@ -110,7 +166,11 @@ fn binding(value: abi.GfxBackendBinding) queue.model.Binding {
 pub fn retained(id: u32) bool { return id != 0 and @atomicLoad(u32, &retained_owner, .acquire) == id; }
 // Read only while DisplayExecution is held; replacement admission, geometry
 // mutation and retirement all use that same execution owner.
-pub fn modePending() bool { return replacement != null; }
+pub fn modePending() bool {
+    const change = replacement orelse return false;
+    return !change.using_new or
+        !@import("mode_work.zig").presentationReady(bridge.driver_owner, bridge.registration.backend);
+}
 pub fn code(err: Error) i32 {
     return switch (err) {
         error.Busy => abi.gfx_output_error_busy,
@@ -123,15 +183,10 @@ pub fn code(err: Error) i32 {
 }
 pub fn bootDescription(generation: u64, saved: *const display.BootSnapshot) abi.GfxNativeBootInfo {
     const state = display.backendState();
-    const base = paging.physicalAddress(saved.mapping.virt_base) orelse 0;
-    var physical = base;
-    // One-time bounded verification of the saved contiguous physical extent.
-    // It is not reconstructed from an HHDM offset or an arbitrary PCI BAR.
-    if (saved.mapping.byte_len == 0 or saved.mapping.byte_len > 256 * 1024 * 1024) physical = 0;
-    var offset: u64 = 0;
-    while (physical != 0 and offset < saved.mapping.byte_len) : (offset += 4096) {
-        if (paging.physicalAddress(saved.mapping.virt_base + offset) != base + offset) physical = 0;
-    }
+    // The saved boot mapping remains owned by display. Recheck its complete
+    // current physical extent; the paging owner groups bounded leaf reads,
+    // including huge-page spans. No cached success or inferred BAR address.
+    const physical = paging.contiguousPhysicalAddress(saved.mapping.virt_base, saved.mapping.byte_len) orelse 0;
     return .{ .generation = generation, .physical_address = physical, .byte_length = saved.mapping.byte_len,
         .width = saved.mode.width, .height = saved.mode.height, .pitch = saved.mode.pitch,
         .format = if (framebuffer.isNativeXrgb32(&saved.framebuffer)) abi.gfx_buffer_format_xrgb8888 else 0,
@@ -178,7 +233,11 @@ fn prepareRequest(identity: buffers.Owner, input: *const abi.GfxNativeRegistrati
             input.backend.adapter_id != reset.backend.adapter_id or input.backend.device_generation <= reset.backend.device_generation)
             return abi.gfx_output_error_stale;
         if (!reset.retired) return abi.gfx_output_error_busy;
-        if (reset.terminal_released or reset.resumed_backend != null) return abi.gfx_output_error_stale;
+        if (reset.terminal_released) return abi.gfx_output_error_stale;
+        // A rebuilt queue may be registered before receiver discovery
+        // finishes. Only that exact live binding can then prepare scanout;
+        // an unrelated newer queue cannot consume its display receipt.
+        if (reset.resumed_backend) |resumed| if (!std.meta.eql(resumed, input.backend)) return abi.gfx_output_error_stale;
     } else if (reset_record != null) return abi.gfx_output_error_busy;
     const result = prepareImpl(identity, input.*, held_generation, reset_generation) catch |err| {
         if (bridge.driver_owner.eql(identity) and !bridge.ready)
@@ -271,12 +330,10 @@ pub fn transition(id: u32, generation: u64, operation: u32, output: *abi.GfxNati
             break :blk if (discard()) abi.gfx_output_outcome_old_preserved else abi.gfx_output_outcome_lost;
         },
         2 => blk: {
-            if (reset_record) |reset| if (!reset.retired) return abi.gfx_output_error_busy;
-            display.restoreBootBackend(id, generation) catch |err| {
+            restoreAfterReset(id, generation) catch |err| {
                 if (err != error.RestoreFailed) return code(err);
                 break :blk abi.gfx_output_outcome_lost;
             };
-            reset_record = null;
             break :blk abi.gfx_output_outcome_applied;
         },
         else => unreachable,
@@ -373,7 +430,6 @@ fn imageIdle() bool {
         return true;
     };
     if (status.phase != .terminal or (!bridge.image_direct and (status.device_active or status.resources_held))) return false;
-    if (status.result == .complete) bridge.last_present = fence;
     bridge.image_pending = null;
     return true;
 }
@@ -405,7 +461,8 @@ pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model
     defer _ = execution.leave();
     if (!bridge.ready or bridge.cancelled or bridge.hardware_restored or
         display.backendState().state != .software_native) return error.Unsupported;
-    if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
+    if (modePending()) return error.Busy;
+    if (bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
     if (outputs.nativePaused(@intCast(bridge.driver_owner.id), bridge.registration.output)) return error.Unavailable;
     if (request.display_target.connector_id != 0) {
         const current = try outputs.activeTarget(@intCast(bridge.driver_owner.id), bridge.registration.output, bridge.generation);
@@ -477,7 +534,6 @@ fn endCpu(_: usize, changed: bool, damage: ?display.Rect) display.CpuWriteResult
     bridge.pending = null;
     const succeeded = complete.result == .complete and !complete.device_active and !complete.resources_held;
     if (succeeded) {
-        bridge.last_present = accepted.fence;
         bridge.cpu_refresh_required = false;
         bridge.cpu_retry_reported = false;
     }
@@ -537,12 +593,18 @@ pub fn cursorBinding() Error!CursorBinding {
     defer _ = execution.leave();
     if (!bridge.ready or bridge.cancelled or bridge.hardware_restored or
         display.backendState().state != .software_native) return error.Unsupported;
-    if (replacement != null or bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
+    if (modePending()) return error.Busy;
+    if (bridge.cpu_lease.id != 0 or bridge.pending != null or !imageIdle()) return error.Busy;
     try queue.validateOutputBinding(@intCast(bridge.driver_owner.id), bridge.registration.backend);
+    // pending/imageIdle above discharge the exact producer's device work.
+    // An upload/present fence completes after CE, before Window visibility;
+    // latest-ready or a mode change may discard that unsubmitted image.
+    // Never turn its device-execution receipt into a scanout dependency.
+    // The R4D still admits SHOW at its real Core boundary and independently
+    // requires cursor PIO/Core, a subsequent head IRQ and ARM readback.
     return .{ .driver = bridge.driver_owner, .backend = bridge.registration.backend, .generation = bridge.generation,
         .head = try outputs.cursorHead(@intCast(bridge.driver_owner.id), bridge.registration.output),
-        .timeline = if (bridge.last_present) |fence| fence.timeline else 0,
-        .point = if (bridge.last_present) |fence| fence.point else 0 };
+        .timeline = 0, .point = 0 };
 }
 pub fn enableModes(identity: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
     if (!execution.enter(0)) return error.Busy;
@@ -755,6 +817,15 @@ pub fn deviceReset(identity: buffers.Owner, input: *const abi.GfxBackendBinding,
     if (!execution.enter(0)) return abi.gfx_output_error_busy;
     defer _ = execution.leave();
     var rebuilt_headless = false;
+    const restored_console = quiesced == 0 and input.device_generation == 0 and input.reset_generation == 0 and
+        (display.restoredBootOwner(identity.id, generation, input.adapter_id) catch |err| return code(err));
+    if (restored_console) {
+        // Private reconstructed console channels have no new public queue.
+        // Authenticate the exact old R4D receipt and the completed common
+        // restoration before admitting their separate terminal stop.
+        if (!ownsRestoredConsole(identity, generation, input.adapter_id) or bridge.driver_owner.id != 0)
+            return abi.gfx_output_error_stale;
+    }
     if (reset_record) |reset| {
         // A rebuilt headless GPU has no prepare_reset/scanout handoff to
         // consume the previous receipt. Its eventual stop must nevertheless
@@ -766,10 +837,13 @@ pub fn deviceReset(identity: buffers.Owner, input: *const abi.GfxBackendBinding,
             rebuilt_headless = true;
         }
     }
-    if (reset_record == null or rebuilt_headless) {
+    if (reset_record == null or rebuilt_headless or restored_console) {
         if (quiesced != 0) return abi.gfx_output_error_stale;
         const current = display.backendState();
-        if (current.state == .preparing) {
+        if (restored_console) {
+            // beginDeviceReset revalidates the exact restored boot identity
+            // and terminal admission before revoking CPU framebuffer access.
+        } else if (current.state == .preparing) {
             if (current.pending_owner != identity.id or current.pending_generation != generation or current.pending_adapter_id != input.adapter_id)
                 return abi.gfx_output_error_stale;
         } else if (current.owner != identity.id or current.generation != generation or current.adapter_id != input.adapter_id)
@@ -783,6 +857,7 @@ pub fn deviceReset(identity: buffers.Owner, input: *const abi.GfxBackendBinding,
         const next = display.beginDeviceReset(identity.id, generation, input.adapter_id) catch |err| return code(err);
         bridge.cancelled = true;
         reset_record = .{ .driver = identity, .backend = input.*, .original_generation = generation, .generation = next };
+        console_receipt = null;
     }
     const reset = &reset_record.?;
     if (reset.terminal_released) return abi.gfx_output_error_stale;

@@ -25,7 +25,14 @@ pub const State = struct {
             !std.meta.eql(self.info.backend, input.backend) or self.info.head_id != input.head_id)) return error.Stale;
         if (input.flags != 0 and (input.flags != 15 or input.max_width == 0 or input.max_width > 256 or
             input.max_height == 0 or input.max_height > 256 or input.min_x > 0 or input.min_y > 0 or input.max_x <= 0 or input.max_y <= 0)) return error.Invalid;
-        if (input.flags == 0 and (self.job != null or self.actor != null or self.visible() or self.lost())) return error.Busy;
+        if (input.flags == 0 and (self.job != null or self.actor != null or self.visible() or self.lost())) {
+            // A retained provider asks to retire its cursor before output
+            // pause/withdraw. Request the existing bounded RELEASE job;
+            // keep actor, image, visibility and any current job until its
+            // exact physical completion. Unknown ownership stays retained.
+            if (!self.lost() and self.actor != null) self.closing = true;
+            return error.Busy;
+        }
         if (self.info.flags != 0 and input.flags != 0 and !std.meta.eql(self.info, input)) return error.Stale;
         if (self.info.display_generation == 0)
             self.status = .{ .sequence = self.status.sequence, .completed = self.status.completed };

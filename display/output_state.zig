@@ -289,10 +289,13 @@ pub const Store = struct {
             receivers_changed = self.eraseReceivers(source.binding.generation) or receivers_changed;
             source.* = .{};
         };
-        try self.canChange();
         var count: u64 = 0;
         for (&self.entries) |*entry| if (entry.owner == owner) { count += 1; };
-        if (self.receiver_serial > std.math.maxInt(u64) - count or self.revision > std.math.maxInt(u64) - count) return error.Exhausted;
+        // Queue removal revokes metadata even with an outstanding mode
+        // consumer. It is not a BO/ticket retirement: keep pending/retained
+        // and reserve the pending finish increment until its exact receipt.
+        const ceiling = std.math.maxInt(u64) - @as(u64, @intFromBool(self.pending.id != 0));
+        if (self.receiver_serial > std.math.maxInt(u64) - count or self.revision > ceiling - count) return error.Exhausted;
         for (&self.entries) |*entry| if (entry.owner == owner) {
             self.disconnect(entry);
             entry.owner = 0; // Rebinding reuses the stable port slot with new generations.
@@ -302,14 +305,30 @@ pub const Store = struct {
     pub fn registerSource(self: *Store, owner: DriverOwner, adapter: u32) Error!abi.GfxReceiverSource {
         if (owner.kind != .driver or !owner.valid() or owner.id > std.math.maxInt(u32) or adapter == 0) return error.Invalid;
         if (self.source_serial == std.math.maxInt(u64) or self.revision == std.math.maxInt(u64)) return error.Exhausted;
-        for (&self.entries) |*entry| if (entry.info.identity.connector_id != 0 and entry.info.identity.adapter_id == adapter and entry.owner != owner.id) return error.Busy;
+        for (&self.entries) |*entry| if (entry.info.identity.connector_id != 0 and entry.info.identity.adapter_id == adapter and
+            entry.owner != owner.id and !retiredPort(entry)) return error.Busy;
         for (&self.sources) |*source| if (source.binding.generation != 0 and source.binding.adapter_id == adapter) return error.Busy;
         for (&self.sources) |*source| if (source.binding.generation == 0) {
+            // stoppedDriver() already revoked these native ports when their
+            // queue retired. They carry no GPU ownership, active receiver or
+            // valid prior source. Reclaim metadata only after source admission
+            // has succeeded, so a failed registration cannot mutate the old
+            // catalog or resurrect a disconnected native generation.
+            var reclaimed = false;
+            for (&self.entries) |*entry| if (entry.info.identity.adapter_id == adapter and retiredPort(entry)) {
+                entry.* = .{};
+                reclaimed = true;
+            };
+            if (reclaimed) self.receiverChange();
             self.source_serial += 1;
             source.* = .{ .owner = owner, .binding = .{ .adapter_id = adapter, .generation = self.source_serial } };
             return source.binding;
         };
         return error.Capacity;
+    }
+    fn retiredPort(entry: *const Entry) bool {
+        return entry.owner == 0 and entry.receiver_source == 0 and entry.info.identity.adapter_id != 0 and
+            entry.info.flags == 0 and entry.info.mode_count == 0 and entry.info.edid_bytes == 0;
     }
     fn receiverSource(self: *Store, owner: DriverOwner, binding: abi.GfxReceiverSource) Error!*Source {
         if (binding.adapter_id == 0 or binding.generation == 0 or binding.reserved0 != 0) return error.Invalid;
@@ -847,6 +866,77 @@ test "receiver batches preserve boot, reject partial generations and revoke meta
     try store.withdraw(3, promoted);
     try t.expectError(error.Stale, store.find(promoted));
     try t.expect(store.infoAt(0).?.flags == 0 and store.infoAt(0).?.mode_count == 0);
+
+    // Queue retirement calls stop() after the metadata source has closed.
+    // The old native port is now disconnected and unowned, not a competing
+    // driver. A rebuilt source must be admitted without reviving its ID or
+    // leaving a duplicate port behind the fresh receiver publication.
+    const retired_port = store.infoAt(0).?.identity;
+    try t.expect(try store.stop(3));
+    var rebuilt_owner = owner; rebuilt_owner.generation += 1;
+    const rebuilt_source = try store.registerSource(rebuilt_owner, 9);
+    try t.expectError(error.Stale, store.find(retired_port));
+    try t.expectError(error.Stale, store.closeSource(owner, native_source));
+    try t.expectEqual(@as(u32, 0), store.cursor().present);
+    try store.replaceReceivers(rebuilt_owner, rebuilt_source, 1, records[0..1]);
+    try t.expectEqual(@as(u32, 1), store.cursor().present);
+    try t.expectEqual(rebuilt_source.generation, store.infoAt(0).?.identity.device_generation);
+    try t.expectError(error.Busy, store.registerSource(owner, 9));
+    try t.expectError(error.Busy, store.publish(99, native_info, &.{geometry}, &.{}));
+    native_info.identity.device_generation += 1;
+    const rebuilt_port = try store.publish(3, native_info, &.{geometry}, &.{});
+    try t.expectEqual(@as(u32, 1), store.cursor().present);
+    try t.expectEqual(@as(u32, 3), (try store.find(rebuilt_port)).owner);
+    try t.expect(!(try store.closeSource(rebuilt_owner, rebuilt_source)));
+    try t.expect(try store.stop(3));
+
+    // Generic queue removal precedes proven mode retirement. Withdraw only
+    // this driver's metadata while the exact pending/lost ticket stays held.
+    // Busy is a live consumer, not catalog counter exhaustion.
+    for (0..2) |lost_first| {
+        store.* = .{};
+        const source = try store.registerSource(owner, 4);
+        records[0] = .{ .connector_id = 1 };
+        try store.replaceReceivers(owner, source, 1, records[0..1]);
+        const live_port = try store.publish(3, testInfo(1), &.{testMode()}, &.{});
+        var foreign_info = testInfo(2); foreign_info.identity.adapter_id = 10;
+        const foreign_port = try store.publish(99, foreign_info, &.{testMode()}, &.{});
+        state = .{ .count = 1, .topology_revision = store.revision };
+        state.assignments[0] = testAssignment(live_port, 0);
+        const ticket = try store.begin(&state, &.{testFact()});
+        if (lost_first != 0) _ = try store.finish(ticket, abi.gfx_output_outcome_lost, 0);
+        const pending = store.pending; const retained = store.retained;
+        try t.expect(try store.stop(3));
+        try t.expect(std.meta.eql(store.pending, pending) and store.retained == retained and store.reset_retired.id == 0);
+        try t.expectError(error.Stale, store.find(live_port));
+        try t.expectError(error.Stale, store.closeSource(owner, source));
+        try t.expect((try store.find(foreign_port)).owner == 99);
+        if (lost_first == 0) _ = try store.finish(ticket, abi.gfx_output_outcome_lost, 0);
+        try t.expect(store.retained == 3 and store.pending.id == 0);
+        try t.expect(!(try store.stop(3)) and store.retained == 3);
+        try t.expectError(error.Stale, store.retireAfterReset(.{ .id = ticket.id + 1 }));
+        try t.expect(store.retained == 3);
+        try store.retireAfterReset(ticket);
+        try t.expect(store.retained == 0 and store.reset_retired.id == ticket.id);
+        const fresh_source = try store.registerSource(rebuilt_owner, 4);
+        try store.replaceReceivers(rebuilt_owner, fresh_source, 1, records[0..1]);
+        const fresh_port = try store.publish(3, testInfo(1), &.{testMode()}, &.{});
+        try t.expect(fresh_source.generation > source.generation and !std.meta.eql(fresh_port, live_port));
+        try t.expect((try store.find(foreign_port)).owner == 99);
+    }
+    // Withdrawal must not consume the outstanding ticket's last increment.
+    store.* = .{};
+    const final_port = try store.publish(3, testInfo(1), &.{testMode()}, &.{});
+    state = .{ .count = 1, .topology_revision = store.revision };
+    state.assignments[0] = testAssignment(final_port, 0);
+    const final_ticket = try store.begin(&state, &.{testFact()});
+    store.revision = std.math.maxInt(u64) - 2;
+    try t.expect(try store.stop(3));
+    try t.expect(store.revision == std.math.maxInt(u64) - 1 and store.pending.id == final_ticket.id);
+    _ = try store.finish(final_ticket, abi.gfx_output_outcome_lost, 0);
+    try t.expect(store.revision == std.math.maxInt(u64) and store.retained == 3);
+    try t.expectError(error.Exhausted, store.retireAfterReset(final_ticket));
+    try t.expect(store.retained == 3);
 }
 
 test "receiver capacity and legacy table prefix preserve previous publications and caller canaries" {

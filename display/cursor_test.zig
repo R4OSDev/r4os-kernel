@@ -76,7 +76,59 @@ pub fn check() !void {
     try t.expect(state.available() and state.status.sequence == serial and state.status.display_generation == next_info.display_generation);
     try t.expectError(error.Stale, state.retireAfterReset(driver, info.backend));
     try t.expectError(error.Stale, state.validateReply(driver, reply));
+    try checkProviderDisable(driver, caller, info);
     try checkSource(caller, driver);
+}
+fn checkProviderDisable(driver: memory.Owner, caller: memory.Owner, info: a.DisplayCursorInfo) !void {
+    for ([_]bool{ false, true }) |visible| {
+        var state: model.State = .{};
+        try state.configure(driver, info);
+        try state.begin(caller, .{ .display_generation = info.display_generation, .head_id = info.head_id,
+            .reference = .{ .id = 1, .generation = 2 }, .width = 32, .height = 32, .pitch = 128, .byte_length = 4096 },
+            .{ .id = 3, .generation = 4 }, 0, 0, 10);
+        const prepared = (try state.take(driver, info.backend, 11)).?;
+        var reply: a.GfxDriverCursorCompletion = .{ .sequence = prepared.sequence,
+            .display_generation = info.display_generation, .outcome = a.gfx_output_outcome_applied };
+        try t.expect(try state.validateReply(driver, reply)); state.finish(reply);
+        if (visible) {
+            try state.begin(caller, .{ .operation = a.display_cursor_operation_show,
+                .display_generation = info.display_generation, .head_id = info.head_id,
+                .image_sequence = prepared.sequence, .x = 1, .y = 2 }, .{}, 9, 10, 20);
+            const shown = (try state.take(driver, info.backend, 21)).?;
+            reply.sequence = shown.sequence; reply.visibility = a.display_cursor_visibility_visible;
+            try t.expect(try state.validateReply(driver, reply)); state.finish(reply);
+        }
+        var disabled = info; disabled.flags = 0;
+        var foreign = driver; foreign.generation += 1;
+        try t.expectError(error.Stale, state.configure(foreign, disabled));
+        var wrong = disabled; wrong.display_generation += 1;
+        try t.expectError(error.Stale, state.configure(driver, wrong));
+        try t.expect(!state.closing and state.actor.?.eql(caller) and state.visible() == visible);
+        const sequence = state.status.sequence;
+        try t.expectError(error.Busy, state.configure(driver, disabled));
+        try t.expect(state.closing and state.available() and state.actor.?.eql(caller) and
+            state.visible() == visible and state.job == null and state.status.sequence == sequence);
+        try t.expectError(error.Busy, state.validate(caller, .{ .display_generation = info.display_generation,
+            .head_id = info.head_id, .operation = a.display_cursor_operation_show, .image_sequence = prepared.sequence }));
+        const release = (try state.take(driver, info.backend, 30)).?;
+        try t.expect(release.request.operation == a.display_cursor_operation_release and release.sequence == sequence + 1);
+        try t.expectError(error.Busy, state.configure(driver, disabled));
+        try t.expect(state.job.?.sequence == release.sequence and state.job.?.deadline_ns == release.deadline_ns and
+            state.actor.?.eql(caller) and state.visible() == visible and (try state.take(driver, info.backend, 31)) == null);
+        reply.sequence = release.sequence + 1; reply.visibility = a.display_cursor_visibility_hidden;
+        try t.expectError(error.Stale, state.validateReply(driver, reply));
+        try t.expect(state.actor.?.eql(caller) and state.visible() == visible);
+        reply.sequence = release.sequence;
+        try t.expect(try state.validateReply(driver, reply)); state.finish(reply);
+        try t.expect(state.actor == null and !state.visible() and state.status.image_sequence == 0);
+        try state.configure(driver, disabled);
+        try t.expect(!state.available() and state.job == null);
+        try state.configure(driver, info);
+        try t.expect(state.available() and state.actor == null and state.status.sequence == release.sequence);
+        state.markLost(a.gfx_output_error_timeout);
+        try t.expectError(error.Busy, state.configure(driver, disabled));
+        try t.expect(state.lost() and !state.closing and state.job == null);
+    }
 }
 fn checkSource(caller: memory.Owner, driver: memory.Owner) !void {
     var store = memory.Table(2, 8, 4){ .budget_bytes = 8192, .producer_budget_bytes = 8192 };

@@ -23,6 +23,7 @@ pub const Manager = struct {
     value: Snapshot = .{},
     serial: u64 = 0,
     recovering_preparation: bool = false,
+    restored_boot: ?struct { owner: usize, adapter: u32, generation: u64 } = null,
 
     pub fn initBoot(self: *Manager) void {
         self.* = .{ .serial = 1, .value = .{ .state = .bootfb, .revision = 1, .generation = 1 } };
@@ -125,6 +126,31 @@ pub const Manager = struct {
         return next;
     }
 
+    pub fn restoredBootOwner(self: *const Manager, owner: usize, generation: u64, adapter: u32) bool {
+        const restored = self.restored_boot orelse return false;
+        return self.value.state == .bootfb and self.value.owner == 0 and self.value.pending_owner == 0 and
+            self.value.generation == generation and restored.generation == generation and
+            restored.owner == owner and restored.adapter == adapter and owner != 0 and adapter != 0;
+    }
+
+    /// The enclosing owner permits this only during system shutdown. Restored
+    /// bootfb has no public GPU queue, but its resident hardware owner still
+    /// needs a new physical stop, not the reset proof used to reconstruct it.
+    pub fn beginRestoredBootReset(self: *Manager, owner: usize, generation: u64, adapter: u32) Error!u64 {
+        if (!self.restoredBootOwner(owner, generation, adapter)) return error.Stale;
+        if (self.value.reset_generation == ~@as(u64, 0)) return error.Exhausted;
+        const next = try self.nextGeneration();
+        self.value.generation = next;
+        self.value.reset_generation += 1;
+        self.value.owner = owner;
+        self.value.adapter_id = adapter;
+        self.value.state = .recovering;
+        self.value.reason = .device_lost;
+        self.restored_boot = null;
+        self.changed();
+        return next;
+    }
+
     /// Only the enclosing display/driver bridge may call this after old
     /// consumers have retired under proven GPU stop. The held boot snapshot
     /// retains its own identity; the replacement gets a fresh generation.
@@ -158,6 +184,7 @@ pub const Manager = struct {
         const next = try self.nextGeneration();
         const policy = self.value.policy;
         const revision = self.value.revision;
+        self.restored_boot = .{ .owner = owner, .adapter = self.value.adapter_id, .generation = next };
         self.value = .{ .state = .bootfb, .policy = policy, .reason = .device_lost, .revision = revision, .generation = next };
         self.changed();
     }

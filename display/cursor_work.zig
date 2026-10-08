@@ -70,15 +70,34 @@ pub fn configure(driver: buffers.Owner, input: *const a.DisplayCursorInfo) i32 {
     defer display.endOutputCommit();
     if (!admission.tryEnter()) return a.gfx_output_error_busy;
     defer admission.leave();
-    const target = native.cursorBinding() catch |err| return code(err);
-    if (!target.driver.eql(driver) or input.display_generation != target.generation or input.head_id != target.head or
-        !std.meta.eql(input.backend, target.backend)) return a.gfx_output_error_stale;
-    {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        state.configure(driver, input.*) catch |err| return code(err);
+    if (input.flags == 0) {
+        // Pause/withdraw removes ACTIVE before the R4D retires the physical
+        // plane. Disabling an already bound cursor needs that exact retained
+        // identity, not a fresh active-output admission. State.configure still
+        // retains visible, claimed, pending or uncertain cursor ownership.
+        // A known actor is closed by its bounded, physically completed job.
+        const current = snapshot();
+        if (current.info.display_generation == 0 or !current.driver.eql(driver) or
+            input.display_generation != current.info.display_generation or input.head_id != current.info.head_id or
+            !std.meta.eql(input.backend, current.info.backend)) return a.gfx_output_error_stale;
+        queue.validateOutputBinding(@intCast(driver.id), input.backend) catch |err| return code(err);
+    } else {
+        const target = native.cursorBinding() catch |err| return code(err);
+        if (!target.driver.eql(driver) or input.display_generation != target.generation or input.head_id != target.head or
+            !std.meta.eql(input.backend, target.backend)) return a.gfx_output_error_stale;
     }
-    events.signal();
-    return a.gfx_output_ok;
+    var newly_closing = false;
+    const configured = blk: {
+        const token = ownership.enterState(); defer ownership.leaveState(token);
+        const was_closing = state.closing;
+        state.configure(driver, input.*) catch |err| {
+            newly_closing = !was_closing and state.closing;
+            break :blk code(err);
+        };
+        break :blk a.gfx_output_ok;
+    };
+    if (newly_closing) wake() else if (configured == a.gfx_output_ok) events.signal();
+    return configured;
 }
 pub fn info(output: *a.DisplayCursorInfo) callconv(.c) i32 {
     if (!buffer_api.validOutput(a.DisplayCursorInfo, output) or irq.inDispatch()) return a.gfx_output_error_invalid;
@@ -208,9 +227,9 @@ pub fn beforeMode(driver: buffers.Owner) !void {
     if (!ready) { wake(); return error.Busy; }
 }
 pub fn resumeModes() void {
-    // The new image can be shown during confirmation while its previous
-    // backing remains retained. Keep the cursor in software for that whole
-    // transaction; public cursor admission also excludes the replacement.
+    // Physical mode operations exclude cursor submissions. The settled
+    // confirmation interval may resume its exact new image and cursor while
+    // the old backing remains retained for rollback.
     if (native.modePending()) return;
     const token = ownership.enterState();
     state.suspended = false;

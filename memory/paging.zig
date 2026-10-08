@@ -259,6 +259,30 @@ pub fn physicalAddress(virt: u64) ?u64 {
     return (leaf.entry.* & ADDR_MASK & ~(leaf.bytes - 1)) | (virt & (leaf.bytes - 1));
 }
 
+/// Fresh complete translation of a caller-retained range. Verify each leaf,
+/// without reacquiring the page-table owner or reading CR3 for every 4K page.
+/// Release after at most 64 leaves; neither a lookup pointer nor a mutation
+/// lease crosses that boundary. A changed active root rejects the whole view.
+pub fn contiguousPhysicalAddress(virt: u64, bytes: u64) ?u64 {
+    var probe = page_batch.ContiguousTranslation.init(virt, bytes) orelse return null;
+    var root: u64 = 0;
+    while (probe.consumed < probe.bytes) {
+        const token = owner_locks.page_tables.acquire();
+        defer owner_locks.page_tables.release(token);
+        if (!activeRootMatchesHardwareLocked()) return null;
+        if (root == 0) root = pml4_phys else if (root != pml4_phys) return null;
+        for (0..page_batch.max_extent_pages) |_| {
+            if (probe.consumed == probe.bytes) break;
+            const current = probe.virtual + probe.consumed;
+            const leaf = getLeaf(current) orelse return null;
+            const offset = current & (leaf.bytes - 1);
+            const physical = (leaf.entry.* & ADDR_MASK & ~(leaf.bytes - 1)) | offset;
+            if (!probe.accept(physical, leaf.bytes - offset)) return null;
+        }
+    }
+    return probe.result();
+}
+
 pub fn mappedFrameLocked(virt: u64) ?u64 {
     if (!owner_locks.page_tables.heldByCurrent() or
         !activeRootMatchesHardwareLocked() or !isAligned(virt)) return null;

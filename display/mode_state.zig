@@ -27,6 +27,15 @@ pub const State = struct {
             self.status.phase == abi.gfx_mode_phase_reverted or
             (self.status.phase == abi.gfx_mode_phase_lost and self.device_retired);
     }
+    /// APPLY has settled the exact trial image, but both rollback surfaces
+    /// remain owned. Ordinary presentation is allowed only between physical
+    /// operations; a new decision closes admission before the worker starts.
+    pub fn presentationReady(self: *const State, driver: Owner, backend: abi.GfxBackendBinding) bool {
+        return self.driver.eql(driver) and std.meta.eql(self.job.backend, backend) and
+            self.status.phase == abi.gfx_mode_phase_awaiting_confirmation and
+            self.status.outcome == abi.gfx_output_outcome_applied and self.status.retained == 3 and
+            !self.offered and self.reply == null and !self.cancelled and !self.expired and !self.device_retired;
+    }
     /// Called after the display bridge has released the old transaction's
     /// surfaces under independently proven device quiescence. Preserve LOST
     /// for its waiter while allowing a fresh generation to accept new modes.
@@ -252,11 +261,13 @@ test "mode jobs bind owner generation and operation, preserve late receipts and 
     var state: State = .{};
     const job: abi.GfxDriverModeJob = .{ .ticket = 4, .backend = .{ .adapter_id = 5, .device_generation = 6, .reset_generation = 7 } };
     try state.begin(caller, driver, job, 8, 15000, 100);
+    try t.expect(!state.presentationReady(driver, job.backend));
     try t.expect((try state.take(driver, job.backend)) == null);
     try state.arm();
     var wrong = driver; wrong.generation += 1;
     try t.expectError(error.Stale, state.take(wrong, job.backend));
     const first = (try state.take(driver, job.backend)).?;
+    try t.expect(!state.presentationReady(driver, job.backend));
     try t.expect((try state.take(driver, job.backend)) == null);
     var receipt: abi.GfxDriverModeCompletion = .{ .ticket = first.ticket, .sequence = first.sequence, .operation = first.operation,
         .outcome = abi.gfx_output_outcome_applied, .quiesced = 0 };
@@ -264,6 +275,7 @@ test "mode jobs bind owner generation and operation, preserve late receipts and 
     receipt.quiesced = 1;
     try t.expect(state.expire(first.deadline_ns));
     try t.expect(state.status.phase == abi.gfx_mode_phase_lost and state.status.retained == 3 and !state.available());
+    try t.expect(!state.presentationReady(driver, job.backend));
     try state.complete(driver, receipt);
     try t.expectError(error.Stale, state.complete(driver, receipt));
     state.settled(.{ .outcome = 1, .topology_revision = 9, .commit_sequence = 1 }, first.deadline_ns + 1);
@@ -284,11 +296,21 @@ test "mode jobs bind owner generation and operation, preserve late receipts and 
     try state.arm();
     const applied = (try state.take(driver, job.backend)).?;
     try state.complete(driver, .{ .ticket = applied.ticket, .sequence = applied.sequence, .operation = applied.operation, .outcome = 1, .quiesced = 1 });
+    try t.expect(!state.presentationReady(driver, job.backend));
     state.settled(.{ .outcome = 1 }, 500);
+    try t.expect(state.presentationReady(driver, job.backend) and state.status.retained == 3);
+    try t.expect(!state.presentationReady(wrong, job.backend));
+    var other_backend = job.backend;
+    other_backend.reset_generation += 1;
+    try t.expect(!state.presentationReady(driver, other_backend));
+    var confirming_trial = state;
+    try confirming_trial.resolve(caller, next.ticket, abi.gfx_mode_resolve_confirm, 501);
+    try t.expect(!confirming_trial.presentationReady(driver, job.backend));
     const end = state.status.confirmation_deadline_ns;
     try t.expectError(error.Stale, state.resolve(driver, next.ticket, abi.gfx_mode_resolve_confirm, end - 1));
     try t.expectError(error.Busy, state.resolve(caller, next.ticket, abi.gfx_mode_resolve_confirm, end));
     try t.expect(state.expire(end) and state.status.phase == abi.gfx_mode_phase_reverting);
+    try t.expect(!state.presentationReady(driver, job.backend));
 
     try t.expectError(error.Stale, state.retireAfterReset(wrong, job.backend));
     var new_backend = job.backend; new_backend.device_generation += 1;
