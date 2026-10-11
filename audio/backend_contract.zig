@@ -5,6 +5,18 @@ pub const FORMAT_U8: u16 = 2;
 pub const FORMAT_FLAG_S16LE: u32 = 1 << 0;
 pub const FORMAT_FLAG_U8: u32 = 1 << 1;
 
+pub const EndMode = enum { idle, stop };
+pub const EndCallback = *const fn (?*anyopaque) callconv(.c) i32;
+
+/// Ordinary PCM completion may retain a hardware-owned silent carrier.
+/// A closing owner or physical output change must always use Stop. Errors
+/// including Busy retain their exact meaning; Idle failure is no Stop ack.
+pub fn finishPcm(mode: EndMode, closing: bool, context: ?*anyopaque, stop: ?EndCallback, idle: ?EndCallback) i32 {
+    if (mode == .idle and !closing) if (idle) |callback| return callback(context);
+    if (stop) |callback| return callback(context);
+    return 0;
+}
+
 pub const Limits = struct {
     formats: u32 = 0,
     min_rate: u32 = 0,
@@ -56,4 +68,35 @@ test "audio backend format mask is enforced independently" {
 
     try std.testing.expect(s16_only.accepts(48_000, 2, FORMAT_S16LE));
     try std.testing.expect(!s16_only.accepts(48_000, 2, FORMAT_U8));
+}
+
+test "PCM idle drains separately while switch and closing owner require physical stop" {
+    const Probe = struct {
+        idles: usize = 0,
+        stops: usize = 0,
+        result: i32 = 0,
+        fn idle(raw: ?*anyopaque) callconv(.c) i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.idles += 1;
+            return self.result;
+        }
+        fn stop(raw: ?*anyopaque) callconv(.c) i32 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.stops += 1;
+            return self.result;
+        }
+    };
+    var probe: Probe = .{};
+    try std.testing.expectEqual(@as(i32, 0), finishPcm(.idle, false, &probe, Probe.stop, Probe.idle));
+    try std.testing.expectEqual(@as(usize, 1), probe.idles);
+    try std.testing.expectEqual(@as(usize, 0), probe.stops);
+    probe.result = -6;
+    try std.testing.expectEqual(@as(i32, -6), finishPcm(.idle, false, &probe, Probe.stop, Probe.idle));
+    try std.testing.expectEqual(@as(usize, 0), probe.stops);
+    probe.result = 0;
+    _ = finishPcm(.stop, false, &probe, Probe.stop, Probe.idle);
+    _ = finishPcm(.idle, true, &probe, Probe.stop, Probe.idle);
+    _ = finishPcm(.idle, false, &probe, Probe.stop, null);
+    try std.testing.expectEqual(@as(usize, 2), probe.idles);
+    try std.testing.expectEqual(@as(usize, 3), probe.stops);
 }

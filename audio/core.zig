@@ -201,6 +201,7 @@ const AudioBackend = struct {
     stop_pcm: ?StopPcmFn = null,
     write_pcm_ctx: ?WritePcmCtxFn = null,
     stop_pcm_ctx: ?StopPcmCtxFn = null,
+    idle_pcm_ctx: ?StopPcmCtxFn = null,
     status_ctx: ?StatusCtxFn = null,
     pcm_limits: ?BackendPcmLimits = null,
     outputs: ?AudioOutputExtension = null,
@@ -994,12 +995,13 @@ pub fn registerExternalAudioBackendZ(name: [*:0]const u8, limits: BackendPcmLimi
     return if (registerAudioBackendInternal(name_slice, null, null, null, context, write_pcm, stop_pcm, status, limits)) 0 else -2;
 }
 
-pub fn registerExternalAudioOutputs(name: []const u8, outputs: AudioOutputExtension) bool {
+pub fn registerExternalAudioOutputs(name: []const u8, outputs: AudioOutputExtension, idle_pcm: ?StopPcmCtxFn) bool {
     const output_guard = OutputGuard.acquire(true) orelse return false;
     defer output_guard.release();
     const slot = findAudioBackend(name) orelse return false;
     if (audio_backends[slot].closing) return false;
     audio_backends[slot].outputs = outputs;
+    audio_backends[slot].idle_pcm_ctx = idle_pcm;
     initial_output_pending = true;
     return true;
 }
@@ -1838,7 +1840,16 @@ fn stopActivePcm() void {
 fn stopActivePcmResult() i32 {
     const output_guard = OutputGuard.acquire(false) orelse return r4x_api.service_api_result_busy;
     defer output_guard.release();
-    return stopActivePcmOwned();
+    return idleActivePcmOwned();
+}
+
+// Only ordinary last-client/synth completion uses Idle. Route replacement,
+// unregister and owner shutdown retain the physical Stop barrier below.
+fn idleActivePcmOwned() i32 {
+    const slot = active_audio_slot orelse return 0;
+    const backend = &audio_backends[slot];
+    if (backend.stop_pcm) |stop_pcm| { stop_pcm(); return 0; }
+    return backend_contract.finishPcm(.idle, backend.closing, backend.context, backend.stop_pcm_ctx, backend.idle_pcm_ctx);
 }
 
 fn stopActivePcmOwned() i32 {
@@ -1848,8 +1859,7 @@ fn stopActivePcmOwned() i32 {
         stop_pcm();
         return 0;
     }
-    if (backend.stop_pcm_ctx) |stop_pcm_ctx| return stop_pcm_ctx(backend.context);
-    return 0;
+    return backend_contract.finishPcm(.stop, backend.closing, backend.context, backend.stop_pcm_ctx, backend.idle_pcm_ctx);
 }
 
 fn activateFirstNativeBackend() void {
@@ -2112,7 +2122,7 @@ fn stopClosingStreamsLocked(closing_count: u32) i32 {
     defer output_guard.release();
     if (openStreamCountLocked() != closing_count or sid_acquired or midi_acquired) return 0;
     _ = stream_lock.unlock();
-    const result = stopActivePcmOwned();
+    const result = idleActivePcmOwned();
     lockStreamState();
     return result;
 }
@@ -2230,7 +2240,7 @@ fn stopPcmIfNoStreams() void {
     lockStreamState();
     const empty = openStreamCountLocked() == 0;
     _ = stream_lock.unlock();
-    if (empty) _ = stopActivePcmOwned();
+    if (empty) _ = idleActivePcmOwned();
 }
 
 fn copyZ(ptr: [*:0]const u8, out: []u8) ?[]const u8 {

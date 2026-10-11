@@ -112,6 +112,11 @@ var directed_queue = sync.WaitQueue.init();
 
 pub fn runIfEnabled() bool {
     const value = boot_config.optionValue(boot_config.get(), "TASKREGISTRY", "selftest") orelse return true;
+    if (std.ascii.eqlIgnoreCase(value, "idle-deadline")) {
+        if (!runDeadlineStormProbe()) return fail("idle-deadline");
+        k.puts("TASKREG08244 idle-timeout PASS due=65 bounded=64+1 future=held timer-irq=unchanged\r\n");
+        return true;
+    }
     if (std.ascii.eqlIgnoreCase(value, "fpu-work")) {
         if (!driverWorkFpuProbe()) return false;
         if (!runOomReserveTest()) return fail("fpu-reserve");
@@ -553,14 +558,25 @@ fn runDeadlineStormProbe() bool {
     const deferred = scheduler.structureStats();
     const deferred_once = deferred.timeout_storm_deferrals == before.timeout_storm_deferrals + 1;
 
-    _ = scheduler.onTick(timer.tickCount(), false);
+    const irq_before_idle = timer.deadlineStats().timer_irqs;
+    const idle_tail = scheduler.pollTimedWaitsBeforeIdle();
     const drained = probes[DEADLINE_STORM_COUNT - 1].?.state == .ready;
+    const tail = probes[DEADLINE_STORM_COUNT - 1].?;
+    // A checkpoint must preserve future deadlines and wake the same exact
+    // task once due, with IRQs disabled throughout this admission sequence.
+    task.beginWait(tail, timer.deadlineAfterNow(1000), "taskreg-idle-future", scheduler.timer_wait_object);
+    const future_due = scheduler.pollTimedWaitsBeforeIdle();
+    const future_held = tail.state == .blocked;
+    task.beginWait(tail, 1, "taskreg-idle-due", scheduler.timer_wait_object);
+    const final_tail = scheduler.pollTimedWaitsBeforeIdle();
+    const idle_woken = tail.state == .ready and timer.deadlineStats().timer_irqs == irq_before_idle;
     const projections_valid = task.queueSnapshot().valid;
     interrupts.restore(irq_flags);
 
     const bounded = enrolled and fifo_head and
         ready_after_first == DEADLINE_STORM_COUNT - 1 and bounded_tail and
-        deferred_once and drained and projections_valid;
+        deferred_once and drained and !idle_tail and !future_due and future_held and
+        !final_tail and idle_woken and projections_valid;
     if (!bounded) {
         k.puts("TASKREG06932 storm-failed enrolled=");
         k.putDec(@intFromBool(enrolled));

@@ -211,9 +211,16 @@ const AudioOutputsDescriptor = extern struct {
     outputs: outputs_contract.AudioOutputExtension,
 };
 
+const AudioIdleDescriptor = extern struct {
+    base: AudioOutputsDescriptor,
+    idle: ?audio.StopPcmCtxFn,
+};
+
 comptime {
     if (@sizeOf(AudioBackendDescriptor) != 72 or @offsetOf(AudioOutputsDescriptor, "outputs") != 72 or @sizeOf(AudioOutputsDescriptor) != 96)
         @compileError("audio output backend prefix drift");
+    if (@offsetOf(AudioIdleDescriptor, "idle") != 96 or @sizeOf(AudioIdleDescriptor) != 104)
+        @compileError("audio idle backend prefix drift");
 }
 
 pub const SynthEngineDescriptor = extern struct {
@@ -2181,12 +2188,12 @@ fn registerAudioOutputBackend(name: [*:0]const u8, backend: *const anyopaque) ca
         return -3;
     }
 
-    if (descriptor.version == outputs_contract.audio_backend_outputs_version) {
+    if (audioDescriptorHasOutputs(descriptor)) {
         if (!audio.registerExternalAudioOutputs(slot.name[0..slot.name_len], .{
             .query = audioOutputQueryCallback,
             .select = audioOutputSelectCallback,
             .active = audioOutputActiveCallback,
-        })) {
+        }, if (descriptor.version == outputs_contract.audio_backend_idle_version) audioIdleCallback else null)) {
             if (audio.unregisterAudioBackendZ(name) == 0) slot.* = .{};
             return -3;
         }
@@ -2231,6 +2238,20 @@ fn audioStopCallback(raw: ?*anyopaque) callconv(.c) i32 {
     return callback(slot.descriptor.context);
 }
 
+fn audioIdleCallback(raw: ?*anyopaque) callconv(.c) i32 {
+    const slot: *R4DAudioBackend = @ptrCast(@alignCast(raw orelse return -1));
+    if (!slot.used or slot.descriptor.version != outputs_contract.audio_backend_idle_version or slot.descriptor.size < @sizeOf(AudioIdleDescriptor)) return -1;
+    const descriptor: *const AudioIdleDescriptor = @ptrCast(slot.descriptor);
+    const callback = descriptor.idle orelse return audioStopCallback(raw);
+    const token = enterStorageCallback(slot.owner) orelse return -1;
+    defer leaveStorageCallback(token);
+    return callback(slot.descriptor.context);
+}
+
+fn audioDescriptorHasOutputs(descriptor: *const AudioBackendDescriptor) bool {
+    return descriptor.version == outputs_contract.audio_backend_outputs_version or descriptor.version == outputs_contract.audio_backend_idle_version;
+}
+
 fn audioStatusCallback(raw: ?*anyopaque, out: *AudioBackendStatus) callconv(.c) i32 {
     const slot: *R4DAudioBackend = @ptrCast(@alignCast(raw orelse return -1));
     if (!slot.used) return -1;
@@ -2245,7 +2266,7 @@ fn audioStatusCallback(raw: ?*anyopaque, out: *AudioBackendStatus) callconv(.c) 
 
 fn audioOutputQueryCallback(raw: u64, index: u32, out: *outputs_contract.AudioOutputInfo) callconv(.c) i32 {
     const slot: *R4DAudioBackend = @ptrFromInt(raw);
-    if (!slot.used or slot.descriptor.version != outputs_contract.audio_backend_outputs_version) return -1;
+    if (!slot.used or !audioDescriptorHasOutputs(slot.descriptor)) return -1;
     const descriptor: *const AudioOutputsDescriptor = @ptrCast(slot.descriptor);
     const token = enterStorageCallback(slot.owner) orelse return -1;
     defer leaveStorageCallback(token);
@@ -2254,7 +2275,7 @@ fn audioOutputQueryCallback(raw: u64, index: u32, out: *outputs_contract.AudioOu
 
 fn audioOutputSelectCallback(raw: u64, index: u32) callconv(.c) i32 {
     const slot: *R4DAudioBackend = @ptrFromInt(raw);
-    if (!slot.used or slot.descriptor.version != outputs_contract.audio_backend_outputs_version) return -1;
+    if (!slot.used or !audioDescriptorHasOutputs(slot.descriptor)) return -1;
     const descriptor: *const AudioOutputsDescriptor = @ptrCast(slot.descriptor);
     const token = enterStorageCallback(slot.owner) orelse return -1;
     defer leaveStorageCallback(token);
@@ -2263,7 +2284,7 @@ fn audioOutputSelectCallback(raw: u64, index: u32) callconv(.c) i32 {
 
 fn audioOutputActiveCallback(raw: u64) callconv(.c) i32 {
     const slot: *R4DAudioBackend = @ptrFromInt(raw);
-    if (!slot.used or slot.descriptor.version != outputs_contract.audio_backend_outputs_version) return -1;
+    if (!slot.used or !audioDescriptorHasOutputs(slot.descriptor)) return -1;
     const descriptor: *const AudioOutputsDescriptor = @ptrCast(slot.descriptor);
     return descriptor.outputs.active(@intFromPtr(descriptor.base.context));
 }
@@ -2483,7 +2504,7 @@ fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.
 }
 
 fn validAudioBackend(descriptor: *const AudioBackendDescriptor) bool {
-    if (descriptor.version != AUDIO_BACKEND_VERSION and descriptor.version != outputs_contract.audio_backend_outputs_version) {
+    if (descriptor.version != AUDIO_BACKEND_VERSION and !audioDescriptorHasOutputs(descriptor)) {
         bootlog.puts("[R4D][ERROR] audio backend version mismatch\r\n");
         return false;
     }
@@ -2491,7 +2512,8 @@ fn validAudioBackend(descriptor: *const AudioBackendDescriptor) bool {
         bootlog.puts("[R4D][ERROR] audio backend descriptor too small\r\n");
         return false;
     }
-    if (descriptor.version == outputs_contract.audio_backend_outputs_version and descriptor.size < @sizeOf(AudioOutputsDescriptor)) return false;
+    if (audioDescriptorHasOutputs(descriptor) and descriptor.size < @sizeOf(AudioOutputsDescriptor)) return false;
+    if (descriptor.version == outputs_contract.audio_backend_idle_version and descriptor.size < @sizeOf(AudioIdleDescriptor)) return false;
     if (descriptor.write_pcm == null) {
         bootlog.puts("[R4D][ERROR] audio backend missing write_pcm\r\n");
         return false;

@@ -644,6 +644,10 @@ const ProgramThread = struct {
     instance_id: u32 = 0,
     instance_generation: u64 = 0,
     execution_pinned: bool = false,
+    // A console input wait may sleep without an unwind guard. Its target
+    // lease belongs to this stable thread, so hard task retirement can
+    // release it after detaching the intrusive wait node.
+    console_input_lease: ?ProgramInstanceLease = null,
     spawn_transaction_depth: u32 = 0,
     exit_deferred: bool = false,
     // Stable chunk-backed owner address.  IRQ/exception paths must never
@@ -7199,6 +7203,42 @@ fn unpinProgramThreadExecution(thread_ctx: *ProgramThread) void {
     if (wake_reaper) program_reaper_event.signal();
 }
 
+fn pinConsoleInputTarget(thread_ctx: *ProgramThread, handle: ProgramProcessHandle) ?ProgramInstanceLease {
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return null;
+    defer _ = task_context.leaveUnwind(unwind);
+    if (thread_ctx.console_input_lease != null) return null;
+    const lease = pinProgramHandle(handle, false) orelse return null;
+    // Publish before dropping the short construction guard. The reaper
+    // cannot claim this field until the exact task has physically detached.
+    thread_ctx.console_input_lease = lease;
+    return lease;
+}
+
+fn releaseConsoleInputTarget(thread_ctx: *ProgramThread) bool {
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return false;
+    defer _ = task_context.leaveUnwind(unwind);
+    const locked = lockProgramRegistry();
+    if (!locked) return false;
+    const lease = thread_ctx.console_input_lease orelse {
+        unlockProgramRegistry();
+        return true;
+    };
+    const slot = lookupProgramRegistryHandleLocked(.{ .instance_id = lease.id, .generation = lease.generation }, true);
+    if (slot == null or slot.? != lease.slot or &slot.?.instance != lease.instance or slot.?.pin_count == 0) {
+        program_registry_stats.stale_lease_rejections +%= 1;
+        unlockProgramRegistry();
+        return false;
+    }
+    slot.?.pin_count -= 1;
+    thread_ctx.console_input_lease = null;
+    const wake_reaper = slot.?.pin_count == 0 and slot.?.state == .retire;
+    unlockProgramRegistry();
+    if (wake_reaper) program_reaper_event.signal();
+    return true;
+}
+
 fn naturalExitEpilogueOwnsTask(thread_ctx: *const ProgramThread) bool {
     const scheduler_task_present = thread_ctx.task_id != 0 and
         thread_ctx.task_generation != 0 and
@@ -12809,6 +12849,12 @@ fn completeProgramThreadRetire(
         bumpProgramThreadInventoryEpoch();
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Task frei");
     }
+    // A killed task never runs apiConsoleInputWait's defer. Its wait node
+    // has now detached, so retire the exact retained input target once.
+    if (!releaseConsoleInputTarget(thread_ctx)) {
+        clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
+        return false;
+    }
     // The caller task and its intrusive Completion waiter are now physically
     // detached, so it cannot publish another request while cancellation
     // yields. Every request carries raw caller-owned pointers, including
@@ -17413,6 +17459,7 @@ fn apiConsoleInputWait(last_generation: u64, timeout_ticks: u64, out_generation:
     if (source.app_class != .console) return r4x_api.console_input_wait_error_invalid;
     const source_console = consolePayload(source);
 
+    const input_thread = currentProgramThread() orelse return r4x_api.console_input_wait_error_invalid;
     var input_lease: ?ProgramInstanceLease = null;
     if (source_console.io_target_id != 0) {
         const handle = ProgramProcessHandle{
@@ -17420,12 +17467,12 @@ fn apiConsoleInputWait(last_generation: u64, timeout_ticks: u64, out_generation:
             .reserved = 0,
             .generation = source_console.io_target_generation,
         };
-        input_lease = pinProgramHandle(handle, false) orelse return r4x_api.console_input_wait_error_closed;
+        input_lease = pinConsoleInputTarget(input_thread, handle) orelse return r4x_api.console_input_wait_error_closed;
     } else if (source.role == .background or (source.role == .shell and source_console.host != .none)) {
         const handle = currentProgramHandle() orelse return r4x_api.console_input_wait_error_invalid;
-        input_lease = pinProgramHandle(handle, false) orelse return r4x_api.console_input_wait_error_closed;
+        input_lease = pinConsoleInputTarget(input_thread, handle) orelse return r4x_api.console_input_wait_error_closed;
     }
-    defer if (input_lease) |*lease| unpinProgramInstance(lease);
+    defer _ = releaseConsoleInputTarget(input_thread);
 
     if (input_lease) |lease| {
         const console = consolePayload(lease.instance);

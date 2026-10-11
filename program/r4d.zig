@@ -578,12 +578,30 @@ pub fn shutdownForSystemTransition() bool {
             continue;
         }
         const is_display = driver.driver_type == @intFromEnum(DriverType.display);
+        const is_audio = driver.driver_type == @intFromEnum(DriverType.audio);
         if (is_display and !driver_api.beginDisplaySystemTransition(expected_owner)) {
             quarantineRuntimeDriver(driver);
             k.puts("[R4D] system-transition display admission failed\r\n");
             success = false;
             _ = driver_api.leaveOwner();
             continue;
+        }
+        // An audio output may own a quiet HDMI DMA carrier with no open
+        // application stream. Close callback admission before hardware
+        // shutdown and use the existing full unload barrier afterwards.
+        // ACPI warm reset does not itself prove that this DMA has stopped.
+        var audio_cleanup: ?driver_api.OwnerCleanupToken = null;
+        if (is_audio) {
+            audio_cleanup = driver_api.prepareOwnerCleanup(expected_owner);
+            if (audio_cleanup) |*token| {
+                driver_api.beginOwnerShutdown(token);
+            } else {
+                quarantineRuntimeDriver(driver);
+                k.puts("[R4D] system-transition audio admission failed\r\n");
+                success = false;
+                _ = driver_api.leaveOwner();
+                continue;
+            }
         }
         driver_registry.setState(expected_registry_slot, .shutdown);
         k.puts("[R4D] system-transition shutdown name=");
@@ -593,7 +611,14 @@ pub fn shutdownForSystemTransition() bool {
         k.puts("\r\n");
         const result = if (driver.shutdown) |shutdown| shutdown() else -1;
         const admission_closed = !is_display or driver_api.endDisplaySystemTransition(expected_owner);
-        const quiesced = admission_closed and result == 0 and (!is_display or driver_api.displaySystemTransitionQuiesced(expected_owner));
+        const audio_quiesced = if (audio_cleanup) |*token| blk: {
+            if (result != 0) {
+                _ = driver_api.quarantineOwnerCleanup(token);
+                break :blk false;
+            }
+            break :blk driver_api.commitOwnerCleanup(token);
+        } else true;
+        const quiesced = admission_closed and result == 0 and audio_quiesced and (!is_display or driver_api.displaySystemTransitionQuiesced(expected_owner));
         if (!quiesced) {
             quarantineRuntimeDriver(driver);
             k.puts("[R4D] system-transition shutdown failed name=");
@@ -612,7 +637,7 @@ pub fn shutdownForSystemTransition() bool {
         stopped += 1;
         _ = driver_api.leaveOwner();
     }
-    k.puts("[R4D] system-transition network/display/input shutdown stopped=");
+    k.puts("[R4D] system-transition network/display/input/audio shutdown stopped=");
     k.putDec(stopped);
     k.puts(if (success) " result=OK\r\n" else " result=FAILED\r\n");
     return success;
@@ -620,7 +645,7 @@ pub fn shutdownForSystemTransition() bool {
 
 fn needsSystemTransition(driver_type: u16) bool {
     return driver_type == @intFromEnum(DriverType.net) or driver_type == @intFromEnum(DriverType.display) or
-        driver_type == @intFromEnum(DriverType.input);
+        driver_type == @intFromEnum(DriverType.input) or driver_type == @intFromEnum(DriverType.audio);
 }
 
 fn shutdownAndCleanupFailedLoad(

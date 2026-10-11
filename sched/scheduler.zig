@@ -92,7 +92,7 @@ pub const preemption_test_mode: u32 = 0;
 pub const preemption_quantum_ticks: u32 = @intCast(@max(1, (30 * timer.DEFAULT_HZ) / 1000));
 pub const long_running_warn_ticks: u64 = @max(1, (1000 * @as(u64, timer.DEFAULT_HZ)) / 1000);
 pub const starvation_warn_ticks: u64 = @max(1, (2000 * @as(u64, timer.DEFAULT_HZ)) / 1000);
-const MAX_TIMEOUT_WAKEUPS_PER_IRQ: u32 = 64;
+const MAX_TIMEOUT_WAKEUPS_PER_CHECK: u32 = 64;
 pub const ready_latency_bucket_count: usize = 5;
 var ready_latency_role_samples: [task.role_count]u64 = .{0} ** task.role_count;
 var ready_latency_role_buckets: [task.role_count][ready_latency_bucket_count]u64 =
@@ -922,14 +922,18 @@ fn exitCurrentImpl(retire: bool) noreturn {
 
 fn waitForInterruptUntilNextDeadline() void {
     const irq_flags = interrupts.saveAndDisableRuntime();
+    const bsp = percpu.currentIndex() == 0;
+    // Device/IPI wakes can repeatedly cancel the BSP's idle one-shot before
+    // its IRQ arrives. Process absolute task deadlines before rearming: an
+    // already due wait must not become another minimum-length hardware wait.
+    const due_tail = if (bsp) pollTimedWaitsBeforeIdle() else false;
     // Recheck after joining the cross-CPU owner boundary.  A remote producer
     // cannot publish work between this check and the lock release below; its
     // IPI is then consumed by the adjacent STI/HLT sequence.
-    if (task.readyCountForCpu(percpu.currentIndex()) != 0) {
+    if (due_tail or task.readyCountForCpu(percpu.currentIndex()) != 0) {
         interrupts.restore(irq_flags);
         return;
     }
-    const bsp = percpu.currentIndex() == 0;
     if (bsp) _ = timer.enterIdleDeadline(task.minWakeTick());
     if (!interrupts.releaseRuntimeForContextSwitch()) interrupts.haltForever();
     interrupts.enableAndWaitForInterrupt();
@@ -957,22 +961,39 @@ pub fn onTick(now: u64, preemptible_instruction_pointer: bool) bool {
             }
         }
     }
-    // The timed projection is ordered, so IRQ work stops at the first future
-    // deadline. A simultaneous-deadline storm is drained in bounded batches;
-    // the periodic active mode or the next one-shot checkpoint continues it.
+    _ = wakeExpiredTimeouts(now);
+    const should_preempt = runTimerPreemption(now, preemptible_instruction_pointer);
+    recordRuntimeWarnings(now);
+    return should_preempt;
+}
+
+/// BSP idle checkpoint, including wakes which were not timer interrupts.
+/// Returns true when another bounded batch of expired waits remains; the
+/// caller must revisit the checkpoint instead of sleeping on a later event.
+pub fn pollTimedWaitsBeforeIdle() bool {
+    const irq_flags = interrupts.saveAndDisableRuntime();
+    defer interrupts.restore(irq_flags);
+    if (percpu.currentIndex() != 0) return false;
+    return wakeExpiredTimeouts(timer.tickCount());
+}
+
+fn wakeExpiredTimeouts(now: u64) bool {
+    // Both timer IRQ and idle checkpoint stop at the first future deadline.
+    // Keep the existing bound and exact timeout wake/owner notification path.
     var timeout_wakeups: u32 = 0;
-    while (timeout_wakeups < MAX_TIMEOUT_WAKEUPS_PER_IRQ) : (timeout_wakeups += 1) {
+    while (timeout_wakeups < MAX_TIMEOUT_WAKEUPS_PER_CHECK) : (timeout_wakeups += 1) {
         const candidate = task.firstTimedWait() orelse break;
         timeout_candidate_visit_count +%= 1;
         if (candidate.wake_tick > now) break;
         _ = wakeTask(candidate, .timeout);
     }
     if (task.firstTimedWait()) |candidate| {
-        if (candidate.wake_tick <= now) timeout_storm_deferral_count +%= 1;
+        if (candidate.wake_tick <= now) {
+            timeout_storm_deferral_count +%= 1;
+            return true;
+        }
     }
-    const should_preempt = runTimerPreemption(now, preemptible_instruction_pointer);
-    recordRuntimeWarnings(now);
-    return should_preempt;
+    return false;
 }
 
 pub fn onSecondaryTick(now: u64, preemptible_instruction_pointer: bool) bool {
