@@ -1,4 +1,5 @@
 const keyboard = @import("../driver/input/keyboard.zig");
+const config = @import("config");
 const audio = @import("../audio/core.zig");
 const font = @import("../kernel/font.zig");
 const drive = @import("../fs/drive.zig");
@@ -537,6 +538,7 @@ const MemoryProfile = enum(u8) {
     workstation = 8,
 };
 const MEMORY_PROFILE_COUNT: usize = 9;
+pub const stack_profile_count: u32 = MEMORY_PROFILE_COUNT;
 const PROGRAM_STACK_HIGH_WATER_PATTERN: u8 = 0xA5;
 
 const ProgramStackTelemetryStats = struct {
@@ -8347,6 +8349,9 @@ fn configureR4XStartR4DevTable() void {
         .performance_input = &r4api.r4dev.performanceInput,
         .display_state = &r4api.r4dev.displayState,
         .driver_module_info = &r4api.r4dev.driverModuleInfo,
+        .performance_instrumentation = &r4api.r4dev.performanceInstrumentation,
+        .performance_lock = &r4api.r4dev.performanceLock,
+        .performance_stack = &r4api.r4dev.performanceStack,
     });
 }
 
@@ -9625,18 +9630,43 @@ fn recordProgramStackCreate(profile: MemoryProfile, reserve_bytes: u64, initial_
     _ = @atomicRmw(u64, &stats.creates, .Add, 1, .monotonic);
     _ = @atomicRmw(u64, &stats.reserve_max_bytes, .Max, reserve_bytes, .monotonic);
     _ = @atomicRmw(u64, &stats.initial_commit_max_bytes, .Max, initial_commit_bytes, .monotonic);
+    if (comptime !config.enable_metrics) return;
     _ = @atomicRmw(u64, &stats.create_cycles_total, .Add, cycles, .monotonic);
     _ = @atomicRmw(u64, &stats.create_cycles_max, .Max, cycles, .monotonic);
 }
 
-fn recordProgramStackRelease(stack: *const ProgramStack, committed_bytes: u64, release_cycles: u64) ProgramStackTelemetryStats {
+fn recordProgramStackRelease(stack: *const ProgramStack, committed_bytes: u64, release_cycles: u64) void {
     const stats = &program_stack_telemetry_by_profile[@intFromEnum(stack.profile)];
     _ = @atomicRmw(u64, &stats.releases, .Add, 1, .monotonic);
     _ = @atomicRmw(u64, &stats.committed_max_bytes, .Max, committed_bytes, .monotonic);
-    _ = @atomicRmw(u64, &stats.high_water_max_bytes, .Max, stack.telemetry_high_water, .monotonic);
-    _ = @atomicRmw(u64, &stats.release_cycles_total, .Add, release_cycles, .monotonic);
-    _ = @atomicRmw(u64, &stats.release_cycles_max, .Max, release_cycles, .monotonic);
-    return loadProgramStackTelemetryStats(stack.profile);
+    if (config.enable_metrics) {
+        _ = @atomicRmw(u64, &stats.high_water_max_bytes, .Max, stack.telemetry_high_water, .monotonic);
+        _ = @atomicRmw(u64, &stats.release_cycles_total, .Add, release_cycles, .monotonic);
+        _ = @atomicRmw(u64, &stats.release_cycles_max, .Max, release_cycles, .monotonic);
+    }
+}
+
+pub fn stackTelemetryInfo(index: u32, out: *r4x_api.ProgramStackPerformanceInfo) bool {
+    if (index >= MEMORY_PROFILE_COUNT) return false;
+    const profile: MemoryProfile = @enumFromInt(index);
+    const stats = loadProgramStackTelemetryStats(profile);
+    out.* = .{
+        .kind = 1,
+        .flags = if (config.enable_metrics) 1 else 0,
+        .created = stats.creates,
+        .released = stats.releases,
+        .reserve_max_bytes = stats.reserve_max_bytes,
+        .initial_commit_max_bytes = stats.initial_commit_max_bytes,
+        .committed_max_bytes = stats.committed_max_bytes,
+        .high_water_max_bytes = stats.high_water_max_bytes,
+        .create_cycles_total = stats.create_cycles_total,
+        .create_cycles_max = stats.create_cycles_max,
+        .release_cycles_total = stats.release_cycles_total,
+        .release_cycles_max = stats.release_cycles_max,
+    };
+    const profile_name = @tagName(profile);
+    @memcpy(out.name[0..profile_name.len], profile_name);
+    return true;
 }
 
 fn loadProgramStackTelemetryStats(profile: MemoryProfile) ProgramStackTelemetryStats {
@@ -9656,6 +9686,7 @@ fn loadProgramStackTelemetryStats(profile: MemoryProfile) ProgramStackTelemetryS
 }
 
 fn poisonProgramStackSpan(base: u64, len_raw: u64) void {
+    if (comptime !config.enable_metrics) return;
     if (base == 0 or len_raw == 0) return;
     const len: usize = @intCast(len_raw);
     const bytes: [*]u8 = @ptrFromInt(base);
@@ -9666,6 +9697,7 @@ fn measureProgramStackHighWater(stack: *ProgramStack) void {
     if (stack.telemetry_measured) return;
     stack.telemetry_measured = true;
     stack.telemetry_committed_pages = std.math.cast(u32, stack.committed_size / paging.PAGE_SIZE) orelse std.math.maxInt(u32);
+    if (comptime !config.enable_metrics) return;
     if (stack.committed_base == 0 or stack.top <= stack.committed_base) return;
     const len: usize = @intCast(stack.top - stack.committed_base);
     const bytes: [*]const u8 = @ptrFromInt(stack.committed_base);
@@ -9675,6 +9707,7 @@ fn measureProgramStackHighWater(stack: *ProgramStack) void {
 }
 
 fn readStackTimestampCounter() u64 {
+    if (comptime !config.enable_metrics) return 0;
     var lo: u32 = undefined;
     var hi: u32 = undefined;
     asm volatile ("rdtsc"
@@ -9690,6 +9723,7 @@ fn logProgramStackRelease(stack: *const ProgramStack, committed_bytes: u64, rele
     const critical_stats = task.criticalReserveStats();
     k.puts("[R4XSTACK] release owner=");
     k.putDec(stack.owner_id);
+    k.puts(if (config.enable_metrics) " detail=on" else " detail=off");
     k.puts(" profile=");
     k.puts(memoryProfileName(stack.profile));
     k.puts(" reserve=");
@@ -9803,7 +9837,7 @@ fn freeProgramStack(stack: *ProgramStack) bool {
     if (stack.range_id == 0) return true;
     measureProgramStackHighWater(stack);
     const committed_bytes = @as(u64, stack.telemetry_committed_pages) * paging.PAGE_SIZE;
-    const release_started_tick = timer.tickCount();
+    const release_started_tick = if (config.enable_metrics) timer.tickCount() else 0;
     const release_started_cycles = readStackTimestampCounter();
     if (stack.committed_size != 0 and stack.committed_base >= stack.base) {
         mem_virt.uncommit(stack.range_id, stack.committed_base - stack.base, stack.committed_size) catch |err| {
@@ -9842,7 +9876,7 @@ fn freeProgramStack(stack: *ProgramStack) bool {
 }
 
 fn finishProgramStackRelease(stack: *ProgramStack, committed_bytes: u64, release_started_tick: u64, release_started_cycles: u64) bool {
-    const release_finished_tick = timer.tickCount();
+    const release_finished_tick = if (config.enable_metrics) timer.tickCount() else 0;
     const release_ticks = if (release_finished_tick >= release_started_tick) release_finished_tick - release_started_tick else 0;
     const release_cycles = readStackTimestampCounter() -% release_started_cycles;
     if (release_ticks >= 25) {
@@ -9854,8 +9888,8 @@ fn finishProgramStackRelease(stack: *ProgramStack, committed_bytes: u64, release
         k.putDec(committed_bytes);
         k.puts("\r\n");
     }
-    const stats = recordProgramStackRelease(stack, committed_bytes, release_cycles);
-    if (stack.serial_telemetry) logProgramStackRelease(stack, committed_bytes, release_cycles, stats);
+    recordProgramStackRelease(stack, committed_bytes, release_cycles);
+    if (stack.serial_telemetry) logProgramStackRelease(stack, committed_bytes, release_cycles, loadProgramStackTelemetryStats(stack.profile));
     stack.* = .{};
     return true;
 }
@@ -9950,6 +9984,7 @@ fn growInstanceStack(instance: *ProgramInstance, fault_addr: u64) bool {
     const before = stack.committed_size;
     if (!growProgramStack(&stack, fault_addr)) return false;
     writeStackToInstance(instance, stack);
+    if (!stack.serial_telemetry) return true;
     bootlog.puts("[R4X] stack grow owner=");
     bootlog.putDec(instance.id);
     bootlog.puts(" committed=");
@@ -9963,6 +9998,7 @@ fn growInstanceStack(instance: *ProgramInstance, fault_addr: u64) bool {
 fn growThreadStack(thread_ctx: *ProgramThread, fault_addr: u64) bool {
     const before = thread_ctx.stack.committed_size;
     if (!growProgramStack(&thread_ctx.stack, fault_addr)) return false;
+    if (!thread_ctx.stack.serial_telemetry) return true;
     bootlog.puts("[R4X] thread stack grow owner=");
     bootlog.putDec(thread_ctx.instance_id);
     bootlog.puts(" thread=");
@@ -10901,6 +10937,7 @@ fn logProgramStackHighWater(instance: *const ProgramInstance, stack: *const Prog
     const module_len: usize = @min(@as(usize, @intCast(runtime.module_path_len)), runtime.module_path.len);
     k.puts("[R4XSTACK] highwater owner=");
     k.putDec(instance.id);
+    k.puts(if (config.enable_metrics) " detail=on" else " detail=off");
     k.puts(" thread=");
     k.putDec(thread_id);
     k.puts(" module=");
@@ -18312,6 +18349,9 @@ const ProgramExitCommitResult = enum {
 
 fn commitProgramExit(handle: ProgramProcessHandle, exit_code: i32, requested_reason: u8) ProgramExitCommitResult {
     if (consumeProgramLifecycleFailure(.exit_commit)) return .retry;
+    const unwind = task_context.enterUnwind();
+    if (!unwind.admitted()) return .retry;
+    defer _ = task_context.leaveUnwind(unwind);
     const locked = lockProgramRegistry();
     if (!locked) return .retry;
     const slot = lookupProgramRegistryHandleLocked(handle, true) orelse {
@@ -18327,14 +18367,41 @@ fn commitProgramExit(handle: ProgramProcessHandle, exit_code: i32, requested_rea
         return .retry;
     }
 
-    slot.state = .exit;
     const instance = &slot.instance;
-    const completion = slot.completion orelse {
-        slot.state = .run;
+    if (slot.completion == null or slot.pin_count == std.math.maxInt(u32)) {
+        unlockProgramRegistry();
+        return .retry;
+    }
+    const lease = ProgramInstanceLease{
+        .slot = slot,
+        .instance = instance,
+        .id = handle.instance_id,
+        .generation = handle.generation,
+    };
+    slot.pin_count += 1;
+    unlockProgramRegistry();
+    defer unpinProgramInstance(&lease);
+
+    // Admission and closure share the BO owner (rank 100), which must never
+    // be acquired under the registry (rank 110). Pin this exact generation
+    // through closure and exit publication, then revalidate the competing
+    // exit state. The unwind token also protects this temporary lease if the
+    // caller itself is killed while the registry lock is released.
+    @import("../kernel/gfx_virtual.zig").stopAdmission(&instance.gfx_virtual_closed);
+    if (!lockProgramRegistry()) return .retry;
+    const current = lookupProgramRegistryHandleLocked(handle, true) orelse {
         unlockProgramRegistry();
         return .retry;
     };
-    @import("../kernel/gfx_virtual.zig").stopAdmission(&instance.gfx_virtual_closed);
+    if (current != slot or !programRegistryStateIsRunning(current.state)) {
+        unlockProgramRegistry();
+        return if (current == slot) .already_exiting else .retry;
+    }
+    const completion = slot.completion orelse {
+        unlockProgramRegistry();
+        return .retry;
+    };
+    slot.state = .exit;
     const finish_tick = timer.tickCount();
     const exit_reason = if (requested_reason == PROGRAM_EXIT_REASON_NATURAL and @atomicLoad(bool, &instance.close_requested, .acquire))
         PROGRAM_EXIT_REASON_CLOSE

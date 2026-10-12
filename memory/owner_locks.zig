@@ -2,6 +2,7 @@ const io = @import("../arch/x86_64/io.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const policy = @import("owner_lock_policy.zig");
 const layout = @import("layout.zig");
+const config = @import("config");
 
 const RFLAGS_IF: u64 = 1 << 9;
 
@@ -83,7 +84,7 @@ pub const Lock = struct {
         var collided = false;
         while (@cmpxchgWeak(u8, &self.state, 0, 1, .acquire, .monotonic)) |_| {
             collided = true;
-            spins +|= 1;
+            if (config.enable_metrics) spins +|= 1;
             // An ordinary task waiting for an owner must remain able to
             // acknowledge the higher-priority cross-CPU TLB IPI.  Callers
             // which deliberately entered with IF=0 (notably IRQ paths) keep
@@ -97,13 +98,15 @@ pub const Lock = struct {
             }
         }
         if (collided) _ = @atomicRmw(u64, &self.collisions, .Add, 1, .monotonic);
-        _ = @atomicRmw(u64, &self.wait_spins, .Add, spins, .monotonic);
-        _ = @atomicRmw(u64, &self.max_wait_spins, .Max, spins, .monotonic);
+        if (config.enable_metrics and collided) {
+            _ = @atomicRmw(u64, &self.wait_spins, .Add, spins, .monotonic);
+            _ = @atomicRmw(u64, &self.max_wait_spins, .Max, spins, .monotonic);
+        }
         _ = @atomicRmw(u64, &self.acquisitions, .Add, 1, .monotonic);
 
         @atomicStore(u8, &self.owner_cpu_plus_one, owner, .release);
         self.depth[slot] = 1;
-        self.acquired_tsc[slot] = readTsc();
+        if (config.enable_metrics) self.acquired_tsc[slot] = readTsc();
         held_rank[slot] = self.rank;
         return .{
             .flags = flags,
@@ -128,9 +131,11 @@ pub const Lock = struct {
 
         self.depth[slot] -= 1;
         if (self.depth[slot] == 0) {
-            const cycles = readTsc() -% self.acquired_tsc[slot];
-            _ = @atomicRmw(u64, &self.hold_cycles, .Add, cycles, .monotonic);
-            _ = @atomicRmw(u64, &self.max_hold_cycles, .Max, cycles, .monotonic);
+            if (config.enable_metrics) {
+                const cycles = readTsc() -% self.acquired_tsc[slot];
+                _ = @atomicRmw(u64, &self.hold_cycles, .Add, cycles, .monotonic);
+                _ = @atomicRmw(u64, &self.max_hold_cycles, .Max, cycles, .monotonic);
+            }
             held_rank[slot] = token.previous_rank;
             @atomicStore(u8, &self.owner_cpu_plus_one, 0, .release);
             @atomicStore(u8, &self.state, 0, .release);
@@ -204,6 +209,21 @@ pub var page_tables = Lock{ .class = .page_tables, .rank = policy.Rank.page_tabl
 pub var physical_memory = Lock{ .class = .physical_memory, .rank = policy.Rank.physical_memory };
 pub var boot_log = Lock{ .class = .boot_log, .rank = policy.Rank.boot_log };
 pub var serial_output = Lock{ .class = .serial_output, .rank = policy.Rank.serial_output };
+
+pub fn forClass(class: Class) *const Lock {
+    return switch (class) {
+        .program_state => &program_state,
+        .storage => &storage,
+        .network => &network,
+        .driver_work => &driver_work,
+        .heap => &heap,
+        .virtual_memory => &virtual_memory,
+        .page_tables => &page_tables,
+        .physical_memory => &physical_memory,
+        .boot_log => &boot_log,
+        .serial_output => &serial_output,
+    };
+}
 
 pub fn combinedStats() Stats {
     var result: Stats = .{};

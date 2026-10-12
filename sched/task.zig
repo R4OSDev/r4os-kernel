@@ -1,4 +1,5 @@
 const virt = @import("../memory/virt.zig");
+const config = @import("config");
 const heap = @import("../memory/heap.zig");
 const diag_screen = @import("../kernel/diag_screen.zig");
 const k = @import("../kernel/log.zig");
@@ -351,6 +352,15 @@ var forced_next_create_failure: CreateFailure = .none;
 var kill_held_lock_deferrals: u64 = 0;
 var stack_telemetry_by_role: [role_count]StackTelemetryStats = .{StackTelemetryStats{}} ** role_count;
 
+pub fn stackTelemetryForRole(role: Role) StackTelemetryStats {
+    const stats = &stack_telemetry_by_role[@intFromEnum(role)];
+    var out: StackTelemetryStats = .{};
+    inline for (@typeInfo(StackTelemetryStats).@"struct".fields) |field| {
+        @field(out, field.name) = @atomicLoad(u64, &@field(stats, field.name), .monotonic);
+    }
+    return out;
+}
+
 pub fn stackTelemetryStats() StackTelemetryStats {
     var out: StackTelemetryStats = .{};
     for (&stack_telemetry_by_role) |*stats| {
@@ -369,6 +379,7 @@ pub fn stackTelemetryStats() StackTelemetryStats {
 fn recordStackCreate(role: Role, cycles: u64) void {
     const stats = &stack_telemetry_by_role[@intFromEnum(role)];
     _ = @atomicRmw(u64, &stats.created, .Add, 1, .monotonic);
+    if (comptime !config.enable_metrics) return;
     _ = @atomicRmw(u64, &stats.create_cycles_total, .Add, cycles, .monotonic);
     _ = @atomicRmw(u64, &stats.create_cycles_max, .Max, cycles, .monotonic);
 }
@@ -376,6 +387,7 @@ fn recordStackCreate(role: Role, cycles: u64) void {
 fn recordStackRelease(role: Role, high_water_bytes: u64, cycles: u64) void {
     const stats = &stack_telemetry_by_role[@intFromEnum(role)];
     _ = @atomicRmw(u64, &stats.released, .Add, 1, .monotonic);
+    if (comptime !config.enable_metrics) return;
     _ = @atomicRmw(u64, &stats.high_water_total_bytes, .Add, high_water_bytes, .monotonic);
     _ = @atomicRmw(u64, &stats.high_water_max_bytes, .Max, high_water_bytes, .monotonic);
     _ = @atomicRmw(u64, &stats.release_cycles_total, .Add, cycles, .monotonic);
@@ -1214,6 +1226,7 @@ fn allocGuardedStack(retry_owner: *Task) ?GuardedStack {
 }
 
 fn poisonGuardedStack(stack: GuardedStack) void {
+    if (comptime !config.enable_metrics) return;
     if (stack.base == 0 or stack.top <= stack.base) return;
     const len: usize = @intCast(stack.top - stack.base);
     const bytes: [*]u8 = @ptrFromInt(stack.base);
@@ -1221,6 +1234,7 @@ fn poisonGuardedStack(stack: GuardedStack) void {
 }
 
 fn measureTaskStackHighWater(t: *Task) void {
+    if (comptime !config.enable_metrics) return;
     if (t.stack_high_water_measured) return;
     t.stack_high_water_measured = true;
     if (t.stack_base == 0 or t.stack_top <= t.stack_base) return;
@@ -1232,6 +1246,7 @@ fn measureTaskStackHighWater(t: *Task) void {
 }
 
 fn readTimestampCounter() u64 {
+    if (comptime !config.enable_metrics) return 0;
     var lo: u32 = undefined;
     var hi: u32 = undefined;
     asm volatile ("rdtsc"

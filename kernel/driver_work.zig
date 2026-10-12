@@ -1,4 +1,5 @@
 const monotonic = @import("../platform/monotonic.zig");
+const instrumentation = @import("instrumentation.zig");
 const owner_locks = @import("../memory/owner_locks.zig");
 const irq_router = @import("irq_router.zig");
 const sched_task = @import("../sched/task.zig");
@@ -306,6 +307,7 @@ const CriticalGuard = struct {
     lock_token: owner_locks.Token,
     started_at: monotonic.Stamp,
     from_irq: bool,
+    timed: bool,
 };
 
 const HandleLookup = union(enum) {
@@ -468,7 +470,7 @@ fn submitInternal(
         .handler = handler,
         .context = context,
         .submitted_tick = timer.tickCount(),
-        .submitted_at = monotonic.capture(),
+        .submitted_at = instrumentation.capture(),
         .completion = sync.Completion.init(),
     };
     deadline_ticks[slot] = deadline_tick;
@@ -525,7 +527,7 @@ pub fn cancel(handle: u32) i32 {
         }
         items[slot].result = RESULT_CANCELLED;
         items[slot].completed_tick = timer.tickCount();
-        items[slot].completed_at = monotonic.capture();
+        items[slot].completed_at = instrumentation.capture();
         items[slot].completion_published = false;
         noteOwnerCancelledLocked(owner, source);
         appendOwnerFinalLocked(owner, slot);
@@ -541,7 +543,7 @@ pub fn cancel(handle: u32) i32 {
 pub fn completionWait(handle: u32, timeout_ticks: u64, out_result: *i32) i32 {
     out_result.* = 0;
     const wait_started_tick = timer.tickCount();
-    const wait_started_at = monotonic.capture();
+    const wait_started_at = instrumentation.capture();
 
     if (irq_router.inDispatch()) {
         const critical = enterCritical();
@@ -786,9 +788,9 @@ pub fn cleanupOwner(owner: u32) CleanupResult {
             .running => {
                 if (!wait_for_running) continue;
                 const remaining = cleanupRemainingTicks(cleanup_started_tick);
-                const wait_started_at = monotonic.capture();
+                const wait_started_at = instrumentation.capture();
                 const wait_result = completion.wait(remaining);
-                const wait_ended_at = monotonic.capture();
+                const wait_ended_at = instrumentation.capture();
 
                 const critical = enterCritical();
                 switch (lookupHandleLocked(handle)) {
@@ -860,7 +862,7 @@ pub fn summary() Summary {
 
 pub fn performance(owner: u32) Performance {
     const clock = monotonic.snapshot();
-    const now = monotonic.capture();
+    const now = instrumentation.capture();
     const critical = enterCritical();
     var zero_metrics = PerformanceMetrics{};
     const selected_metrics: *const PerformanceMetrics = if (owner == 0)
@@ -931,7 +933,7 @@ pub fn performance(owner: u32) Performance {
         .deadline_lateness_total_ticks = selected_deadline_metrics.lateness_total_ticks,
         .deadline_lateness_max_ticks = selected_deadline_metrics.lateness_max_ticks,
     };
-    const final_slot = oldestFinalForOwnerLocked(owner);
+    const final_slot = if (instrumentation.detailed) oldestFinalForOwnerLocked(owner) else null;
     if (final_slot) |index| {
         if (monotonic.elapsedNanoseconds(items[index].completed_at, now)) |age| {
             out.metrics.completion_age_current_ns = age;
@@ -989,7 +991,7 @@ fn beginSelectionLocked(critical: CriticalGuard, selection: work_queue.Selection
     const slot = selection.slot;
     const owner = items[slot].owner;
     items[slot].started_tick = timer.tickCount();
-    items[slot].started_at = monotonic.capture();
+    items[slot].started_at = instrumentation.capture();
     noteOwnerStartedLocked(owner, selection.source);
     last_started_owner = owner;
     addMetric(owner, "started", 1);
@@ -1045,7 +1047,8 @@ fn runSlot(slot: usize, deadline_lane: bool) void {
     };
     const result = if (items[slot].owned_slice)
         @import("driver_api.zig").invokeOwnedWork(items[slot].owner, handler, items[slot].context)
-    else handler(items[slot].context);
+    else
+        handler(items[slot].context);
     finishSlot(slot, result);
 }
 
@@ -1058,7 +1061,7 @@ pub fn currentOwner() u32 {
 
 fn finishSlot(slot: usize, result: i32) void {
     const completed_tick = timer.tickCount();
-    const completed_at = monotonic.capture();
+    const completed_at = instrumentation.capture();
     var handle: u32 = 0;
     var owner: u32 = 0;
     {
@@ -1091,8 +1094,10 @@ fn finishSlot(slot: usize, result: i32) void {
         if (items[slot].cleanup_waiting) addMetric(owner, "cleanup_late_finishes", 1);
         recordDurationLocked(owner, "run_total_ns", "run_max_ns", "run_last_ns", items[slot].started_at, completed_at);
         recordDurationLocked(owner, "e2e_total_ns", "e2e_max_ns", "e2e_last_ns", items[slot].submitted_at, completed_at);
-        if (monotonic.elapsedNanoseconds(items[slot].started_at, completed_at)) |run_ns| {
-            if (run_ns >= LONG_CALLBACK_THRESHOLD_NS) addMetric(owner, "long_callbacks", 1);
+        if (instrumentation.detailed) {
+            if (monotonic.elapsedNanoseconds(items[slot].started_at, completed_at)) |run_ns| {
+                if (run_ns >= LONG_CALLBACK_THRESHOLD_NS) addMetric(owner, "long_callbacks", 1);
+            }
         }
 
         const run_ticks = elapsedTicks(items[slot].started_tick, completed_tick);
@@ -1164,7 +1169,7 @@ fn recordWaitLocked(owner: u32, started_tick: u64, started_at: monotonic.Stamp, 
     const waited_ticks = elapsedTicks(started_tick, timer.tickCount());
     addMetric(owner, "waits", 1);
     if (timed_out) addMetric(owner, "wait_timeouts", 1);
-    recordDurationLocked(owner, "wait_total_ns", "wait_max_ns", "wait_last_ns", started_at, monotonic.capture());
+    recordDurationLocked(owner, "wait_total_ns", "wait_max_ns", "wait_last_ns", started_at, instrumentation.capture());
     summary_state.waits +%= 1;
     if (timed_out) summary_state.wait_timeouts +%= 1;
     summary_state.wait_total_ticks +%= waited_ticks;
@@ -1180,6 +1185,7 @@ fn recordDurationLocked(
     start: monotonic.Stamp,
     end: monotonic.Stamp,
 ) void {
+    if (comptime !instrumentation.detailed) return;
     const elapsed = monotonic.elapsedNanoseconds(start, end) orelse {
         addMetric(owner, "timing_unavailable", 1);
         return;
@@ -1190,6 +1196,7 @@ fn recordDurationLocked(
 }
 
 fn noteCompletionAgeLocked(owner: u32, completed_at: monotonic.Stamp) void {
+    if (comptime !instrumentation.detailed) return;
     const age = monotonic.elapsedSince(completed_at) orelse {
         addMetric(owner, "timing_unavailable", 1);
         return;
@@ -1441,24 +1448,30 @@ fn isFinal(state: work_queue.State) bool {
 fn enterCritical() CriticalGuard {
     const from_irq = irq_router.inDispatch();
     const irq_flags = owner_locks.driver_work.acquire();
+    // The owner already provides detailed cycle totals. Keep the per-owner
+    // nanosecond view sampled instead of taking two more stamps on every lock.
+    const timed = instrumentation.detailed and global_metrics.critical_sections % instrumentation.work_critical_stride == 0;
     return .{
         .lock_token = irq_flags,
-        .started_at = monotonic.capture(),
+        .started_at = if (timed) instrumentation.capture() else .{},
         .from_irq = from_irq,
+        .timed = timed,
     };
 }
 
 fn leaveCritical(guard: CriticalGuard, owner: u32) void {
-    const ended_at = monotonic.capture();
     addMetric(owner, "critical_sections", 1);
     if (guard.from_irq) addMetric(owner, "critical_from_irq", 1);
-    if (monotonic.elapsedNanoseconds(guard.started_at, ended_at)) |elapsed| {
-        addMetric(owner, "critical_timing_samples", 1);
-        addMetric(owner, "critical_total_ns", elapsed);
-        maxMetric(owner, "critical_max_ns", elapsed);
-        setMetric(owner, "critical_last_ns", elapsed);
-    } else {
-        addMetric(owner, "critical_timing_unavailable", 1);
+    if (guard.timed) {
+        const ended_at = instrumentation.capture();
+        if (monotonic.elapsedNanoseconds(guard.started_at, ended_at)) |elapsed| {
+            addMetric(owner, "critical_timing_samples", 1);
+            addMetric(owner, "critical_total_ns", elapsed);
+            maxMetric(owner, "critical_max_ns", elapsed);
+            setMetric(owner, "critical_last_ns", elapsed);
+        } else {
+            addMetric(owner, "critical_timing_unavailable", 1);
+        }
     }
     owner_locks.driver_work.release(guard.lock_token);
 }

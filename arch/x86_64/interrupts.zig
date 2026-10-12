@@ -1,6 +1,7 @@
 const io = @import("io.zig");
 const percpu = @import("percpu.zig");
 const owner_locks = @import("../../memory/owner_locks.zig");
+const config = @import("config");
 
 const RFLAGS_IF: u64 = 1 << 9;
 
@@ -116,7 +117,7 @@ fn acquireRuntimeSerialization(original_flags: u64) void {
     var cpu_collision = false;
     while (@cmpxchgWeak(u8, &runtime_serialization_lock, 0, 1, .acquire, .monotonic)) |_| {
         collided = true;
-        spins +|= 1;
+        if (config.enable_metrics) spins +|= 1;
         const owner = @atomicLoad(u8, &runtime_owner_cpu_plus_one, .acquire);
         if (owner != 0 and owner != @as(u8, @intCast(cpu_index + 1))) cpu_collision = true;
         // A task waiting for the runtime projection must still be able to
@@ -132,10 +133,12 @@ fn acquireRuntimeSerialization(original_flags: u64) void {
     }
     if (collided) _ = @atomicRmw(u64, &runtime_collisions, .Add, 1, .monotonic);
     if (cpu_collision) _ = @atomicRmw(u64, &runtime_cpu_collisions, .Add, 1, .monotonic);
-    _ = @atomicRmw(u64, &runtime_wait_spins, .Add, spins, .monotonic);
-    _ = @atomicRmw(u64, &runtime_max_wait_spins, .Max, spins, .monotonic);
+    if (config.enable_metrics and collided) {
+        _ = @atomicRmw(u64, &runtime_wait_spins, .Add, spins, .monotonic);
+        _ = @atomicRmw(u64, &runtime_max_wait_spins, .Max, spins, .monotonic);
+    }
     @atomicStore(u8, &runtime_owner_cpu_plus_one, @intCast(cpu_index + 1), .release);
-    runtime_acquired_tsc[slot] = readTsc();
+    if (config.enable_metrics) runtime_acquired_tsc[slot] = readTsc();
     depth.* = 1;
 }
 
@@ -152,9 +155,11 @@ fn releaseRuntimeSerialization() void {
 
 fn finishRuntimeOuter(cpu_index: u32) void {
     const slot: usize = @intCast(cpu_index);
-    const cycles = readTsc() -% runtime_acquired_tsc[slot];
-    _ = @atomicRmw(u64, &runtime_hold_cycles, .Add, cycles, .monotonic);
-    _ = @atomicRmw(u64, &runtime_max_hold_cycles, .Max, cycles, .monotonic);
+    if (config.enable_metrics) {
+        const cycles = readTsc() -% runtime_acquired_tsc[slot];
+        _ = @atomicRmw(u64, &runtime_hold_cycles, .Add, cycles, .monotonic);
+        _ = @atomicRmw(u64, &runtime_max_hold_cycles, .Max, cycles, .monotonic);
+    }
     @atomicStore(u8, &runtime_owner_cpu_plus_one, 0, .release);
 }
 

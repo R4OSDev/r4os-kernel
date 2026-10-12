@@ -1,4 +1,7 @@
 const r4x_api = @import("r4x_api.zig");
+const instrumentation = @import("../kernel/instrumentation.zig");
+const runtime_interrupts = @import("../arch/x86_64/interrupts.zig");
+const r4x = @import("r4x.zig");
 const std = @import("std");
 const device_inventory = @import("../platform/device_inventory.zig");
 const acpi = @import("../platform/acpi.zig");
@@ -1551,6 +1554,79 @@ comptime {
     }
 }
 
+pub fn performanceInstrumentation(out: *r4x_api.ProgramInstrumentationInfo) callconv(.c) i32 {
+    if (out.version < 1 or out.size < @sizeOf(r4x_api.ProgramInstrumentationInfo)) return -1;
+    const clock = time_core.monotonicSnapshot();
+    out.* = .{
+        .mode = if (instrumentation.detailed) 1 else 0,
+        .service_lock_stride = if (instrumentation.detailed) 64 else 0,
+        .work_critical_stride = if (instrumentation.detailed) instrumentation.work_critical_stride else 0,
+        .lock_count = 1 + mem_owner_locks.class_count,
+        .stack_group_count = sched_task.role_count + r4x.stack_profile_count,
+        .clock_source = @intFromEnum(clock.source),
+        .clock_generation = clock.generation,
+        .clock_flags = clock.flags,
+        .clock_resolution_ns = clock.resolution_ns,
+    };
+    return 1;
+}
+
+pub fn performanceLock(index: u32, out: *r4x_api.ProgramLockPerformanceInfo) callconv(.c) i32 {
+    if (out.version < 1 or out.size < @sizeOf(r4x_api.ProgramLockPerformanceInfo)) return -1;
+    if (index > mem_owner_locks.class_count) return 0;
+    var result: r4x_api.ProgramLockPerformanceInfo = .{ .index = index, .flags = if (instrumentation.detailed) 1 else 0 };
+    if (index == 0) {
+        const stats = runtime_interrupts.runtimeStats();
+        result.flags |= 2;
+        result.acquisitions = stats.acquisitions;
+        result.nested_acquisitions = stats.nested_acquisitions;
+        result.collisions = stats.collisions;
+        result.cpu_collisions = stats.cpu_collisions;
+        result.wait_spins = stats.wait_spins;
+        result.max_wait_spins = stats.max_wait_spins;
+        result.hold_cycles = stats.hold_cycles;
+        result.max_hold_cycles = stats.max_hold_cycles;
+        @memcpy(result.name[0..7], "runtime");
+    } else {
+        const class: mem_owner_locks.Class = @enumFromInt(index - 1);
+        const stats = mem_owner_locks.forClass(class).stats();
+        result.flags |= 4;
+        inline for (@typeInfo(mem_owner_locks.Stats).@"struct".fields) |field| {
+            @field(result, field.name) = @field(stats, field.name);
+        }
+        const class_name = @tagName(class);
+        @memcpy(result.name[0..class_name.len], class_name);
+    }
+    out.* = result;
+    return 1;
+}
+
+pub fn performanceStack(index: u32, out: *r4x_api.ProgramStackPerformanceInfo) callconv(.c) i32 {
+    if (out.version < 1 or out.size < @sizeOf(r4x_api.ProgramStackPerformanceInfo)) return -1;
+    if (index >= sched_task.role_count + r4x.stack_profile_count) return 0;
+    var result: r4x_api.ProgramStackPerformanceInfo = .{};
+    if (index < sched_task.role_count) {
+        const role: sched_task.Role = @enumFromInt(index);
+        const stats = sched_task.stackTelemetryForRole(role);
+        result.flags = if (instrumentation.detailed) 3 else 0;
+        inline for (@typeInfo(sched_task.StackTelemetryStats).@"struct".fields) |field| {
+            @field(result, field.name) = @field(stats, field.name);
+        }
+        if (stats.created != 0) {
+            result.reserve_max_bytes = sched_task.stack_size + sched_task.stack_guard_size;
+            result.initial_commit_max_bytes = sched_task.stack_size;
+        }
+        if (stats.released != 0) result.committed_max_bytes = sched_task.stack_size;
+        const role_name = @tagName(role);
+        @memcpy(result.name[0..role_name.len], role_name);
+    } else {
+        _ = r4x.stackTelemetryInfo(@intCast(index - sched_task.role_count), &result);
+    }
+    result.index = index;
+    out.* = result;
+    return 1;
+}
+
 pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
     const caller_version = out.version;
     const caller_size: usize = out.size;
@@ -2950,6 +3026,10 @@ pub fn performanceIrqTiming(irq: u32, out: *ProgramIrqTimingInfo) callconv(.c) i
         coverage |= r4x_api.performance_irq_coverage_irq_safe_clock;
     if (timing.mixed_generation)
         coverage |= r4x_api.performance_irq_coverage_mixed_generation;
+    if (!instrumentation.detailed) {
+        coverage &= ~(r4x_api.performance_irq_coverage_dispatch | r4x_api.performance_irq_coverage_external_handler);
+        coverage |= r4x_api.performance_irq_coverage_instrumentation_disabled;
+    }
     out.* = .{
         .irq = @intCast(irq),
         .registered = legacy.registered,

@@ -6,6 +6,7 @@ const scheduler = @import("../sched/scheduler.zig");
 const timer = @import("timer.zig");
 const time_core = @import("../platform/time.zig");
 const k = @import("log.zig");
+const config = @import("config");
 
 pub const MAX_IRQS: usize = 32;
 pub const MAX_HANDLERS_PER_IRQ: usize = 4;
@@ -202,7 +203,7 @@ pub fn dispatch(irq: u8) void {
     const irq_index: usize = @intCast(irq);
     var invoked = false;
     var last_result: u32 = 0;
-    const measure_dispatch = stats_table[irq_index].registered != 0;
+    const measure_dispatch = config.enable_metrics and stats_table[irq_index].registered != 0;
     const dispatch_start = if (measure_dispatch) time_core.monotonicCapture() else time_core.MonotonicStamp{};
     if (measure_dispatch) timing_table[irq_index].observer_reads +|= 1;
 
@@ -221,9 +222,9 @@ pub fn dispatch(irq: u8) void {
             }
             invoked = true;
             active_owner[cpu_index] = entry.owner;
-            const start = timer.tickCount();
-            const timing_start = time_core.monotonicCapture();
-            timing_table[irq_index].observer_reads +|= 1;
+            const start = if (config.enable_metrics) timer.tickCount() else 0;
+            const timing_start = if (config.enable_metrics) time_core.monotonicCapture() else time_core.MonotonicStamp{};
+            if (config.enable_metrics) timing_table[irq_index].observer_reads +|= 1;
             // R4D modules are built with the normal SIMD-capable module
             // target.  Unlike a task, an asynchronous IRQ handler has no FPU
             // context of its own, so preserve the interrupted R4X state and
@@ -231,18 +232,20 @@ pub fn dispatch(irq: u8) void {
             const fpu_guard = scheduler.enterExternalIrqFpuGuard();
             last_result = handler(irq, entry.context);
             scheduler.leaveExternalIrqFpuGuard(fpu_guard);
-            const timing_end = time_core.monotonicCapture();
-            timing_table[irq_index].observer_reads +|= 1;
-            const elapsed = elapsedTicks(start, timer.tickCount());
-            stats_table[irq_index].handler_total_ticks +%= elapsed;
-            stats_table[irq_index].handler_last_ticks = elapsed;
-            if (elapsed > stats_table[irq_index].handler_max_ticks) stats_table[irq_index].handler_max_ticks = elapsed;
+            if (config.enable_metrics) {
+                const timing_end = time_core.monotonicCapture();
+                timing_table[irq_index].observer_reads +|= 1;
+                const elapsed = elapsedTicks(start, timer.tickCount());
+                stats_table[irq_index].handler_total_ticks +%= elapsed;
+                stats_table[irq_index].handler_last_ticks = elapsed;
+                if (elapsed > stats_table[irq_index].handler_max_ticks) stats_table[irq_index].handler_max_ticks = elapsed;
+                recordHandlerTiming(irq_index, timing_start, timing_end);
+            }
             stats_table[irq_index].last_owner = entry.owner;
             active_owner[cpu_index] = 0;
             if ((last_result & IRQ_RESULT_HANDLED) != 0) {
                 stats_table[irq_index].handled_count +%= 1;
             }
-            recordHandlerTiming(irq_index, timing_start, timing_end);
         }
     }
 

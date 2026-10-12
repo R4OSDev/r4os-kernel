@@ -1,6 +1,7 @@
 const crash = @import("crash.zig");
 const timer = @import("timer.zig");
 const time_core = @import("../platform/time.zig");
+const OrderedDurations = @import("../platform/monotonic_math.zig").OrderedDurations;
 
 pub const MAX_PHASES: usize = 32;
 const MAX_TIME_SPANS: usize = 128;
@@ -287,40 +288,19 @@ fn finishCurrent(now: u64, now_stamp: time_core.MonotonicStamp) void {
 }
 
 fn populatePhaseTiming(out: *PhaseInfo, now_stamp: time_core.MonotonicStamp) void {
-    var first: ?u64 = null;
-    var last: ?u64 = null;
-    var total: u64 = 0;
-    var unavailable: u32 = 0;
+    var timing: OrderedDurations = .{};
     for (time_spans[0..time_span_count]) |span| {
         if (span.phase != out.phase) continue;
-        const start_ns = time_core.monotonicResolve(span.start);
-        const end_ns = time_core.monotonicResolve(span.end);
-        const elapsed = time_core.monotonicElapsed(span.start, span.end);
-        if (start_ns == null or end_ns == null or elapsed == null) {
-            unavailable +|= 1;
-            continue;
-        }
-        if (first == null) first = start_ns.?;
-        last = end_ns.?;
-        total +|= elapsed.?;
+        timing.add(time_core.monotonicResolve(span.start), time_core.monotonicResolve(span.end));
     }
     if (out.phase == current_phase and completion_state == .running) {
-        const start_ns = time_core.monotonicResolve(current_enter_stamp);
-        const end_ns = time_core.monotonicResolve(now_stamp);
-        const elapsed = time_core.monotonicElapsed(current_enter_stamp, now_stamp);
-        if (start_ns == null or end_ns == null or elapsed == null) {
-            unavailable +|= 1;
-        } else {
-            if (first == null) first = start_ns.?;
-            last = end_ns.?;
-            total +|= elapsed.?;
-        }
+        timing.add(time_core.monotonicResolve(current_enter_stamp), time_core.monotonicResolve(now_stamp));
     }
-    out.first_ns = first orelse 0;
-    out.last_ns = last orelse 0;
-    out.total_ns = total;
-    out.timing_unavailable_spans = unavailable;
-    out.timing_valid = first != null and last != null and unavailable == 0;
+    out.first_ns = timing.first orelse 0;
+    out.last_ns = timing.last orelse 0;
+    out.total_ns = timing.total;
+    out.timing_unavailable_spans = timing.unavailable;
+    out.timing_valid = timing.valid();
 }
 
 fn unavailableSpanCount(now_stamp: time_core.MonotonicStamp, include_current: bool) u32 {

@@ -5,6 +5,16 @@ Dieses Repository enthaelt den R4OS-Kernel fuer x86_64, seine Limine-
 Bootintegration, den Linker, zwingend eingebaute Bestandteile und kernelnahe
 Tests. Der Kernel wird fest in ReleaseSafe und ohne SIMD gebaut.
 
+0.1.264: Basis- und Detailinstrumentierung
+-----------------------------------------
+Standard ist -Dmetrics=false. -Dmetrics=true aktiviert optionale Lock-,
+IRQ-, IPC-, Driver-Work- und Stackzeiten sowie Stack-Hochwasser. Funktionale
+Deadlines, Besitzervertraege, Guardseiten und Ressourcenbuchhaltung bleiben
+in beiden Modi erhalten. R4DEV v13 liefert Modus/Clockmetadaten und gezielte
+Lock-/Stacklisten. Deaktivierte Zeiten sind unverfuegbar. Die Workspace-
+Anleitung Docs/Diagnostics/KernelInstrumentation.txt beschreibt Sampling,
+Ausgabegrenzen und den kurzen SMP4-A/B-Nachweis.
+
 0.1.235: USB-Konfigurationsquittung gehoert zum Geraet
 ---------------------------------------------------
 SET_CONFIGURATION-attempted/ok bleiben beim jeweiligen DeviceRuntime und
@@ -729,3 +739,8 @@ wartet auf die zugehoerige Keyboard-Generation; Queue-Injektion und Close
 signalisieren denselben Wartepfad. SSH-, Fenster- und Recovery-Menue-Hosts
 bleiben bei ihren getrennten Konsolenqueues. So funktioniert R4PART auch
 im regulaeren lokalen Terminal und greift keiner Remote-Sitzung Tasten ab.
+
+0.83.1: GPU-VA-Annahmeschluss beim Prozessende erfolgt mit einer gegen
+Caller-Kill geschuetzten Generationsleihe ohne gehaltenen Registry-Lock.
+BO-Rang 100 wird nicht mehr unter Registry-Rang 110 erworben. Je 482
+Hosttests und der kurze SMP4-A/B-Lauf bestehen in beiden Messmodi.

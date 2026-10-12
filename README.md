@@ -1,5 +1,15 @@
 ﻿# R4OS Kernel
 
+Kernel 0.1.264 defaults to base instrumentation (`-Dmetrics=false`). Detailed
+lock, IRQ, IPC, driver-work and stack measurements require `-Dmetrics=true`.
+Functional deadlines, ownership, stack guards and resource accounting remain
+active in both modes. R4DEV v13 exposes mode/clock metadata and bounded lock
+and stack snapshots; unavailable timing must not be interpreted as zero cost.
+Exit closes graphics-VA admission while the exact process generation is pinned,
+without acquiring the BO owner beneath the program registry lock. Both
+instrumentation modes pass 482 host tests and the bounded SMP4 guest checks.
+See the workspace guide `Docs/Diagnostics/KernelInstrumentation.txt`.
+
 Kernel 0.1.233 preserves FPU/SIMD state for kernel-main and all executable
 worker constructors, including indirect R4D/R4P callbacks. Critical worker
 reserves preallocate and reuse their state buffers; only CPU-idle tasks may

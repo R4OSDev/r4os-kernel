@@ -6,6 +6,31 @@ pub const Rate = struct {
     denominator: u64,
 };
 
+/// Aggregate separately resolved intervals without treating a clock-origin
+/// discontinuity between them as a valid ordered measurement.
+pub const OrderedDurations = struct {
+    first: ?u64 = null,
+    last: ?u64 = null,
+    total: u64 = 0,
+    unavailable: u32 = 0,
+
+    pub fn add(self: *OrderedDurations, start: ?u64, end: ?u64) void {
+        if (start == null or end == null or end.? < start.? or
+            (self.last != null and start.? < self.last.?))
+        {
+            self.unavailable +|= 1;
+            return;
+        }
+        if (self.first == null) self.first = start;
+        self.last = end;
+        self.total +|= end.? - start.?;
+    }
+
+    pub fn valid(self: OrderedDurations) bool {
+        return self.first != null and self.last != null and self.unavailable == 0;
+    }
+};
+
 /// Precomputed floor conversion for hot clock paths. Construction may divide;
 /// applying the scale uses only one 64x64->128 multiply and a shift.
 pub const FixedScale = struct {
@@ -262,4 +287,27 @@ test "32-bit counter extension is monotonic across wrap and stale readers" {
     try std.testing.expectEqual(after_wrap, extendCounter32(after_wrap, 0xFFFF_FFF8));
     try std.testing.expectEqual(after_wrap, extendCounter32(after_wrap, 0x0000_0008));
     try std.testing.expectEqual(@as(u64, 0x0000_0001_0000_0020), extendCounter32(after_wrap, 0x0000_0020));
+}
+
+test "ordered durations reject a later boot interval before the earlier origin" {
+    var timing: OrderedDurations = .{};
+    timing.add(475795, 88627501);
+    timing.add(0, 0);
+    try std.testing.expect(!timing.valid());
+    try std.testing.expectEqual(@as(u32, 1), timing.unavailable);
+    try std.testing.expectEqual(@as(?u64, 88627501), timing.last);
+    try std.testing.expectEqual(@as(u64, 88151706), timing.total);
+}
+
+test "ordered durations retain disjoint intervals and unavailable spans" {
+    var timing: OrderedDurations = .{};
+    timing.add(0, 0);
+    timing.add(10, 30);
+    timing.add(30, 40);
+    try std.testing.expect(timing.valid());
+    try std.testing.expectEqual(@as(u64, 30), timing.total);
+    timing.add(null, 50);
+    timing.add(60, 55);
+    try std.testing.expectEqual(@as(u32, 2), timing.unavailable);
+    try std.testing.expect(!timing.valid());
 }

@@ -42,8 +42,8 @@ pub fn build(b: *std.Build) void {
     const enable_metrics = b.option(
         bool,
         "metrics",
-        "Enable lock/starvation metrics scans",
-    ) orelse true;
+        "Enable detailed lock/IRQ/IPC/work timing, stack high-water and diagnostic scans",
+    ) orelse false;
     const force_x2apic = b.option(
         bool,
         "force-x2apic",
@@ -177,10 +177,10 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Build the kernel and run kernel-owned host tests");
     const storage_test_step = b.step("storage-test", "Bounded partition identity and installation boot tests");
-    addUnitTest(b, storage_test_step, "storage_boot_tests.zig");
-    addUnitTest(b, storage_test_step, "storage/access_state.zig");
-    addUnitTest(b, storage_test_step, "fs/fat/directory_growth.zig");
-    addUnitTest(b, storage_test_step, "fs/copy_transfer.zig");
+    addUnitTest(b, storage_test_step, config, "storage_boot_tests.zig");
+    addUnitTest(b, storage_test_step, config, "storage/access_state.zig");
+    addUnitTest(b, storage_test_step, config, "fs/fat/directory_growth.zig");
+    addUnitTest(b, storage_test_step, config, "fs/copy_transfer.zig");
     test_step.dependOn(storage_test_step);
     const input_test_step = b.step("input-test", "Run the existing bounded input and USB owner tests");
     for ([_][]const u8{
@@ -190,12 +190,12 @@ pub fn build(b: *std.Build) void {
         "driver/input/hid_set1.zig",
         "usb_host_controller_tests.zig",
         "driver/usb/xhci_event_router.zig",
-    }) |path| addUnitTest(b, input_test_step, path);
+    }) |path| addUnitTest(b, input_test_step, config, path);
     test_step.dependOn(input_test_step);
     test_step.dependOn(&kernel.step);
     const display_test_step = b.step("display-test", "Bounded display ownership, fallback and firmware-writer tests");
     addDisplayUnitTest(b, display_test_step, contract, config);
-    addUnitTest(b, display_test_step, "program/remote_frame_state.zig");
+    addUnitTest(b, display_test_step, config, "program/remote_frame_state.zig");
     test_step.dependOn(display_test_step);
     const unit_tests = [_][]const u8{
         "audio/backend_contract.zig",
@@ -242,7 +242,7 @@ pub fn build(b: *std.Build) void {
         "storage/block_split.zig",
         "storage/gpt.zig",
     };
-    for (unit_tests) |path| addUnitTest(b, test_step, path);
+    for (unit_tests) |path| addUnitTest(b, test_step, config, path);
     addFontUnitTest(b, test_step);
     addBootscreenUnitTest(b, test_step);
     addContractUnitTest(b, test_step, contract, config, "services_tests.zig");
@@ -293,7 +293,7 @@ fn addDisplayUnitTest(b: *std.Build, test_step: *std.Build.Step, contract: *std.
     test_step.dependOn(&run.step);
 }
 
-fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, path: []const u8) void {
+fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, config: *std.Build.Step.Options, path: []const u8) void {
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path(path),
@@ -301,6 +301,7 @@ fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, path: []const u8) void
             .optimize = .ReleaseSafe,
         }),
     });
+    tests.root_module.addOptions("config", config);
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
 }

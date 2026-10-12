@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("config");
 const r4x_api = @import("../program/r4x_api.zig");
 const monotonic = @import("../platform/monotonic.zig");
 const scheduler = @import("../sched/scheduler.zig");
@@ -274,7 +275,7 @@ pub const PerformanceSummary = struct {
     lock_hold_ns: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
     lock_hold_max_ns: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
     lock_timing_unavailable: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
-    lock_timing_stride: u32 = @intCast(SERVICE_LOCK_TIMING_STRIDE),
+    lock_timing_stride: u32 = if (config.enable_metrics) @intCast(SERVICE_LOCK_TIMING_STRIDE) else 0,
     lock_timing_reserved0: u32 = 0,
     lock_timing_samples: [SERVICE_LOCK_FAMILY_COUNT]u64 = .{0} ** SERVICE_LOCK_FAMILY_COUNT,
     registry_index_queries: u64 = 0,
@@ -328,12 +329,12 @@ fn acquireTimedLock(mutex: *sync.Mutex, timing: *LockTiming) TimedLock {
     if (scheduler.current() == null) return .{ .mutex = mutex, .admitted = true };
 
     const immediate = mutex.tryLock();
-    const wait_started = if (immediate) monotonic.Stamp{} else monotonic.capture();
+    const wait_started = if (config.enable_metrics and !immediate) monotonic.capture() else monotonic.Stamp{};
     const acquired = immediate or mutex.lock(sync.WAIT_FOREVER);
     if (!acquired) return .{ .mutex = mutex };
     timing.acquisitions +%= 1;
     if (!immediate) timing.contentions +%= 1;
-    const sampled = !immediate or ((timing.acquisitions -% 1) % SERVICE_LOCK_TIMING_STRIDE == 0);
+    const sampled = config.enable_metrics and (!immediate or ((timing.acquisitions -% 1) % SERVICE_LOCK_TIMING_STRIDE == 0));
     const acquired_at = if (sampled) monotonic.capture() else monotonic.Stamp{};
     if (sampled) {
         timing.timing_samples +%= 1;
@@ -359,7 +360,7 @@ fn tryAcquireTimedLock(mutex: *sync.Mutex, timing: *LockTiming) ?TimedLock {
         return null;
     }
     timing.acquisitions +%= 1;
-    const sampled = (timing.acquisitions -% 1) % SERVICE_LOCK_TIMING_STRIDE == 0;
+    const sampled = config.enable_metrics and (timing.acquisitions -% 1) % SERVICE_LOCK_TIMING_STRIDE == 0;
     const acquired_at = if (sampled) monotonic.capture() else monotonic.Stamp{};
     if (sampled) timing.timing_samples +%= 1;
     return .{

@@ -5,6 +5,7 @@ const builtin = @import("builtin");
 const k = @import("log.zig");
 const irq_router = @import("irq_router.zig");
 const monotonic = @import("../platform/monotonic.zig");
+const instrumentation = @import("instrumentation.zig");
 const queue_model = @import("service_ipc_queue.zig");
 const sched_task = @import("../sched/task.zig");
 const scheduler = @import("../sched/scheduler.zig");
@@ -631,7 +632,7 @@ fn admitHandler(
     prepareSlotLocked(ch, slot, mode, payload.len);
     slot.channel_generation = ch.generation;
     slot.handler = identity_handler;
-    slot.submitted_at = monotonic.capture();
+    slot.submitted_at = instrumentation.capture();
     if (payload.len != 0) {
         @memcpy(slot.data[0..payload.len], payload);
         ch.lifetime.payload_copy_bytes +%= payload.len;
@@ -799,9 +800,9 @@ fn invokeHandlerDirect(channel_id: u32, payload: []const u8, response: []u8, cou
     if (count_request) ch.lifetime.request_calls +%= 1;
     unlockChannel(&guard);
 
-    const started = monotonic.capture();
+    const started = instrumentation.capture();
     const produced = handler(channel_id, payload, response);
-    const completed = monotonic.capture();
+    const completed = instrumentation.capture();
 
     guard = lockChannel(&channels[idx]) orelse return fail();
     const result_ch = guard.channel;
@@ -859,7 +860,7 @@ fn takeNextWorkerTarget(worker: *Worker) ?WorkerTarget {
             continue;
         };
         slot.meta.state = .handler_running;
-        slot.started_at = monotonic.capture();
+        slot.started_at = instrumentation.capture();
         ch.lifetime.handler_started +%= 1;
         noteDuration(&ch.lifetime, slot.submitted_at, slot.started_at, .queue);
         worker.cursor = (idx + 1) % channels.len;
@@ -885,7 +886,7 @@ fn runWorkerTarget(worker: *Worker, target: WorkerTarget) void {
         message.data[0..request_len],
         worker.response[0..],
     );
-    const completed_at = monotonic.capture();
+    const completed_at = instrumentation.capture();
 
     var guard = lockChannel(&channels[target.channel_index]) orelse return;
     const ch = guard.channel;
@@ -956,6 +957,7 @@ const TimingKind = enum {
 };
 
 fn noteDuration(lifetime: *Lifetime, start: monotonic.Stamp, end: monotonic.Stamp, kind: TimingKind) void {
+    if (comptime !instrumentation.detailed) return;
     const elapsed = monotonic.elapsedNanoseconds(start, end) orelse {
         lifetime.timing_unavailable +%= 1;
         return;
