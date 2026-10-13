@@ -1,6 +1,8 @@
 .section .text
 
 .extern exceptionDispatch
+.extern preparePageFaultFrame
+.extern pageFaultDispatch
 .extern irqDispatch
 .extern ipiDispatch
 
@@ -144,7 +146,28 @@ isr_common:
     movq %rsp, %rdi
     movq %rsp, %r12
     andq $-16, %rsp
+    cmpq $14, 120(%r12)
+    jne .Lexception_regular
+    # Capture CR2 before preparing resident private stack space. Page-in
+    # waits must not retain frames on the per-CPU emergency IST: another
+    # task can fault there while this one is parked.
+    movq %cr2, %r13
+    movq %r13, %rsi
+    call preparePageFaultFrame
+    xorl %edx, %edx
+    testq %rax, %rax
+    jz .Lpage_fault_dispatch
+    movq %rax, %r12
+    movq %rax, %rsp
+    movl $1, %edx
+.Lpage_fault_dispatch:
+    movq %r12, %rdi
+    movq %r13, %rsi
+    call pageFaultDispatch
+    jmp .Lexception_restore
+.Lexception_regular:
     call exceptionDispatch
+.Lexception_restore:
     movq %r12, %rsp
 
     popq %r15

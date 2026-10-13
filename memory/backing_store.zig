@@ -714,7 +714,14 @@ pub fn slotProbe(input: SlotInput) SlotResult {
         return result;
     }
 
-    ensureSlotBacking(input.backing, capacity_slots);
+    if (!ensureSlotBacking(input.backing, capacity_slots)) {
+        result.status = slot_status_backing_unavailable;
+        result.blockers |= slot_blocker_backing_not_ready;
+        result.capacity_slots = active_capacity_slots;
+        fillSlotCounts(&result);
+        recordSlot(&result);
+        return result;
+    }
     result.capacity_slots = active_capacity_slots;
     fillSlotCounts(&result);
 
@@ -1018,16 +1025,19 @@ fn record(result: Result) void {
     state.last_first_cluster = result.first_cluster;
 }
 
-fn ensureSlotBacking(backing: Result, capacity_slots: u64) void {
+fn ensureSlotBacking(backing: Result, capacity_slots: u64) bool {
     if (active_first_cluster == backing.first_cluster and
         active_cluster_bytes == backing.cluster_bytes and
         active_file_size == backing.file_size and
         active_capacity_slots == capacity_slots and
         std.ascii.eqlIgnoreCase(std.mem.sliceTo(&active_backing_path, 0), std.mem.sliceTo(&backing.path, 0)))
     {
-        return;
+        return true;
     }
 
+    // Live reservations retain the exact file identity. A later diagnostic
+    // selecting another file must not erase the only page-in metadata.
+    for (&slot_extents) |*extent| if (extentActive(extent.*)) return false;
     slot_extents = .{SlotExtent{}} ** SLOT_TABLE_MAX_RANGES;
     active_first_cluster = backing.first_cluster;
     active_file_size = backing.file_size;
@@ -1035,6 +1045,7 @@ fn ensureSlotBacking(backing: Result, capacity_slots: u64) void {
     active_capacity_slots = capacity_slots;
     rememberActivePath(if (backing.path[0] == 0) null else &backing.path);
     slot_generation +%= 1;
+    return true;
 }
 
 fn rememberActivePath(path: ?[*:0]const u8) void {
@@ -1799,4 +1810,21 @@ fn validSlotOwnerKind(owner_kind: u32) bool {
 
 fn extentActive(extent: SlotExtent) bool {
     return (extent.state & extent_state_reserved) != 0 and extent.slot_count != 0;
+}
+
+test "backing identity cannot replace live reservations" {
+    const old = probe(.{ .path = "C:\\TEMP\\OLD.BIN", .file_exists = true, .fat32 = true, .file_size = 8192, .requested_bytes = 8192, .cluster_bytes = 4096, .first_cluster = 40 });
+    const reserved = slotProbe(.{ .backing = old, .operation = slot_operation_reserve, .requested_slots = 1, .owner_kind = slot_owner_kind_vm_region, .owner_id = 7, .region_id = 9 });
+    try std.testing.expectEqual(slot_status_reserved, reserved.status);
+    const replacement = probe(.{ .path = "C:\\TEMP\\NEW.BIN", .file_exists = true, .fat32 = true, .file_size = 16384, .requested_bytes = 16384, .cluster_bytes = 4096, .first_cluster = 42 });
+    const denied = slotProbe(.{ .backing = replacement });
+    try std.testing.expectEqual(slot_status_backing_unavailable, denied.status);
+    try std.testing.expectEqual(@as(u64, 1), denied.reserved_slots);
+    try std.testing.expectEqualStrings("C:\\TEMP\\OLD.BIN", std.mem.sliceTo(activeBackingPath().?, 0));
+    const released = slotProbe(.{ .backing = old, .operation = slot_operation_release, .reservation_id = reserved.reservation_id, .owner_kind = slot_owner_kind_vm_region, .owner_id = 7, .region_id = 9 });
+    try std.testing.expectEqual(slot_status_released, released.status);
+    const accepted = slotProbe(.{ .backing = replacement });
+    try std.testing.expectEqual(slot_status_ready, accepted.status);
+    try std.testing.expectEqual(@as(u64, 0), accepted.reserved_slots);
+    try std.testing.expectEqualStrings("C:\\TEMP\\NEW.BIN", std.mem.sliceTo(activeBackingPath().?, 0));
 }

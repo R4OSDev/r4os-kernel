@@ -5,6 +5,10 @@ const source = @import("storage/boot_source.zig");
 const guid = tables.guid;
 const a = std.testing.allocator;
 
+test {
+    _ = @import("memory/backing_store.zig");
+}
+
 const Fixture = struct {
     const sectors: u64 = 4194304;
     bytes: [67][512]u8 = .{.{0} ** 512} ** 67,

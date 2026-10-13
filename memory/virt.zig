@@ -2172,7 +2172,7 @@ fn makePageRangeNonresident(region_id: u32, region_offset: u64, page_count: u64)
     return nonresident_pages;
 }
 
-pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32) reclaim.SourceResult {
+pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32, vm_owner_id: ?u64) reclaim.SourceResult {
     _ = reason;
     const requested_frames = if (requested_frames_raw == 0) 1 else requested_frames_raw;
     var result = reclaim.SourceResult{};
@@ -2201,7 +2201,7 @@ pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32) rec
     const path: [*:0]const u8 = &backing.path;
 
     while (result.returned_frames < requested_frames) {
-        const step = evictOneResidentPage(backing, path);
+        const step = evictOneResidentPage(backing, path, vm_owner_id);
         switch (step.outcome) {
             .returned => {
                 result.returned_frames = result.returned_frames +| step.returned_frames;
@@ -2274,7 +2274,7 @@ pub fn evictableDirtyBytes() u64 {
     return bytes;
 }
 
-fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8) EvictionStep {
+fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8, vm_owner_id: ?u64) EvictionStep {
     const token = owner_locks.virtual_memory.acquire();
     var locked = true;
     defer if (locked) owner_locks.virtual_memory.release(token);
@@ -2298,7 +2298,8 @@ fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8) Evic
         const page_floor = if (visited == 0) start_page else 0;
 
         if (range.active() and range.pager_io_count == 0 and range.partial_uncommit_len == 0 and range.window == .r4x_vm and range.owner == .r4x_instance and
-            range.owner_id != 0 and range.owner_id <= std.math.maxInt(u32))
+            range.owner_id != 0 and range.owner_id <= std.math.maxInt(u32) and
+            (vm_owner_id == null or range.owner_id == vm_owner_id.?))
         {
             var span_cursor = range.page_state_span_head;
             while (span_cursor) |span_slot| : (span_cursor = page_state_spans[span_slot].next) {

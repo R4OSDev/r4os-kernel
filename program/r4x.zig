@@ -9717,52 +9717,85 @@ fn readStackTimestampCounter() u64 {
     return (@as(u64, hi) << 32) | lo;
 }
 
+// Explicit stack traces also enter the existing bounded kernel log. Format
+// once per requested trace, append one whole record under the bootlog owner,
+// then release that owner before writing to the console/serial sink.
+const StackTrace = struct {
+    bytes: [1536]u8 = undefined,
+    len: usize = 0,
+    truncated: bool = false,
+
+    fn puts(self: *StackTrace, text: []const u8) void {
+        const count = @min(text.len, self.bytes.len - self.len);
+        @memcpy(self.bytes[self.len..][0..count], text[0..count]);
+        self.len += count;
+        self.truncated = self.truncated or count != text.len;
+    }
+
+    fn putDec(self: *StackTrace, value: u64) void {
+        var text: [20]u8 = undefined;
+        self.puts(std.fmt.bufPrint(&text, "{d}", .{value}) catch unreachable);
+    }
+
+    fn finish(self: *StackTrace) void {
+        if (self.truncated) {
+            const marker = " [trace truncated]\r\n";
+            self.len = self.bytes.len - marker.len;
+            self.puts(marker);
+        }
+        bootlog.puts(self.bytes[0..self.len]);
+        k.puts(self.bytes[0..self.len]);
+    }
+};
+
 fn logProgramStackRelease(stack: *const ProgramStack, committed_bytes: u64, release_cycles: u64, stats: ProgramStackTelemetryStats) void {
+    var trace: StackTrace = .{};
     const task_stats = task.stackTelemetryStats();
     const cache_stats = task.stackCacheStats();
     const critical_stats = task.criticalReserveStats();
-    k.puts("[R4XSTACK] release owner=");
-    k.putDec(stack.owner_id);
-    k.puts(if (config.enable_metrics) " detail=on" else " detail=off");
-    k.puts(" profile=");
-    k.puts(memoryProfileName(stack.profile));
-    k.puts(" reserve=");
-    k.putDec(stack.reserve_size);
-    k.puts(" initial=");
-    k.putDec(stack.initial_commit_size);
-    k.puts(" committed=");
-    k.putDec(committed_bytes);
-    k.puts(" highwater=");
-    k.putDec(stack.telemetry_high_water);
-    k.puts(" creates=");
-    k.putDec(stats.creates);
-    k.puts(" releases=");
-    k.putDec(stats.releases);
-    k.puts(" create_cycles=");
-    k.putDec(stack.create_cycles);
-    k.puts(" create_cycles_max=");
-    k.putDec(stats.create_cycles_max);
-    k.puts(" release_cycles=");
-    k.putDec(release_cycles);
-    k.puts(" release_cycles_max=");
-    k.putDec(stats.release_cycles_max);
-    k.puts(" kernel_highwater_max=");
-    k.putDec(task_stats.high_water_max_bytes);
-    k.puts(" kernel_create_cycles_max=");
-    k.putDec(task_stats.create_cycles_max);
-    k.puts(" kernel_release_cycles_max=");
-    k.putDec(task_stats.release_cycles_max);
-    k.puts(" kernel_cache_cached=");
-    k.putDec(cache_stats.cached);
-    k.puts(" kernel_cache_hits=");
-    k.putDec(cache_stats.hits);
-    k.puts(" kernel_cache_misses=");
-    k.putDec(cache_stats.misses);
-    k.puts(" critical_available=");
-    k.putDec(critical_stats.available);
-    k.puts(" critical_in_use=");
-    k.putDec(critical_stats.in_use);
-    k.puts("\r\n");
+    trace.puts("[R4XSTACK] release owner=");
+    trace.putDec(stack.owner_id);
+    trace.puts(if (config.enable_metrics) " detail=on" else " detail=off");
+    trace.puts(" profile=");
+    trace.puts(memoryProfileName(stack.profile));
+    trace.puts(" reserve=");
+    trace.putDec(stack.reserve_size);
+    trace.puts(" initial=");
+    trace.putDec(stack.initial_commit_size);
+    trace.puts(" committed=");
+    trace.putDec(committed_bytes);
+    trace.puts(" highwater=");
+    trace.putDec(stack.telemetry_high_water);
+    trace.puts(" creates=");
+    trace.putDec(stats.creates);
+    trace.puts(" releases=");
+    trace.putDec(stats.releases);
+    trace.puts(" create_cycles=");
+    trace.putDec(stack.create_cycles);
+    trace.puts(" create_cycles_max=");
+    trace.putDec(stats.create_cycles_max);
+    trace.puts(" release_cycles=");
+    trace.putDec(release_cycles);
+    trace.puts(" release_cycles_max=");
+    trace.putDec(stats.release_cycles_max);
+    trace.puts(" kernel_highwater_max=");
+    trace.putDec(task_stats.high_water_max_bytes);
+    trace.puts(" kernel_create_cycles_max=");
+    trace.putDec(task_stats.create_cycles_max);
+    trace.puts(" kernel_release_cycles_max=");
+    trace.putDec(task_stats.release_cycles_max);
+    trace.puts(" kernel_cache_cached=");
+    trace.putDec(cache_stats.cached);
+    trace.puts(" kernel_cache_hits=");
+    trace.putDec(cache_stats.hits);
+    trace.puts(" kernel_cache_misses=");
+    trace.putDec(cache_stats.misses);
+    trace.puts(" critical_available=");
+    trace.putDec(critical_stats.available);
+    trace.puts(" critical_in_use=");
+    trace.putDec(critical_stats.in_use);
+    trace.puts("\r\n");
+    trace.finish();
 }
 
 fn allocateProgramStack(owner_id: u32, contract: ProgramMemoryContract, serial_telemetry: bool) ?ProgramStack {
@@ -9930,7 +9963,42 @@ fn cleanupProgramResources(resources: *ProgramResources) bool {
     resources.image_owner_id = 0;
     return true;
 }
-pub fn handlePageFault(addr: u64, error_code: u64) bool {
+/// A pageable VM fault may wait for filesystem I/O. Its continuation must
+/// live on the interrupted task's own stack, never the CPU's shared IST.
+/// Called with interrupts disabled on that IST; only resident stack growth
+/// is allowed here. The ordinary terminal guard remains the lower bound.
+pub fn preparePageFaultStack(addr: u64, interrupted_rsp: u64, frame_bytes: u64) ?u64 {
+    const vm_base = mem_virt.windowBase(.r4x_vm);
+    if (addr < vm_base or addr - vm_base >= mem_virt.windowLen(.r4x_vm)) return null;
+    if (!owner_locks.faultResolutionAllowed()) return null;
+    const current_task = scheduler.current() orelse return null;
+    if (interrupted_rsp < frame_bytes) return null;
+    const frame_base = alignDown(interrupted_rsp - frame_bytes, 16);
+    if (currentProgramThread()) |thread_ctx| {
+        if (thread_ctx.task_id != current_task.id) return null;
+        if ((thread_ctx.flags & THREAD_FLAG_MAIN) != 0) {
+            const instance = thread_ctx.owner_instance orelse return null;
+            if (addressInStackReserve(instance, interrupted_rsp - 1)) {
+                const floor = frame_base -| owner_locks.STACK_HEADROOM;
+                if (floor < instance.program_stack_base + PROGRAM_STACK_GUARD_SIZE) return null;
+                if (floor < instance.program_stack_committed_base and !growInstanceStack(instance, floor)) return null;
+                return frame_base;
+            }
+        } else if (addressInProgramStack(&thread_ctx.stack, interrupted_rsp - 1)) {
+            const floor = frame_base -| owner_locks.STACK_HEADROOM;
+            if (floor < thread_ctx.stack.base + thread_ctx.stack.guard_size) return null;
+            if (floor < thread_ctx.stack.committed_base and !growThreadStack(thread_ctx, floor)) return null;
+            return frame_base;
+        }
+    }
+    // Kernel continuations already have resident guarded stacks. Do not
+    // accept a foreign stack or an exhausted call budget.
+    if (interrupted_rsp > current_task.stack_top or frame_base < current_task.stack_base or
+        frame_base - current_task.stack_base < 32 * 1024) return null;
+    return frame_base;
+}
+
+pub fn handlePageFault(addr: u64, error_code: u64, allow_pageable_vm: bool) bool {
     if ((error_code & PAGE_FAULT_PRESENT) != 0) return false;
     // Resolving a fault while an owner is mid-mutation used to recursively
     // allocate stack pages through that same owner and corrupt its indices.
@@ -9938,11 +10006,11 @@ pub fn handlePageFault(addr: u64, error_code: u64) bool {
     // the protected operation must stop before touching allocator state.
     if (!owner_locks.faultResolutionAllowed()) return false;
     const current_task_id = scheduler.currentId();
-    if (currentExecutionInstanceNoRegistry()) |instance| {
+    if (allow_pageable_vm) if (currentExecutionInstanceNoRegistry()) |instance| {
         if (vmResidentWithinProfile(instance, paging.PAGE_SIZE)) {
             if (mem_virt.handleDemandFault(addr, error_code, .r4x_instance, @intCast(instance.id))) return true;
         }
-    }
+    };
 
     if (currentProgramThread()) |thread_ctx| {
         if ((thread_ctx.flags & THREAD_FLAG_MAIN) != 0) {
@@ -10933,28 +11001,30 @@ fn callInstanceEntry(run: *ProgramInstance) i32 {
 }
 
 fn logProgramStackHighWater(instance: *const ProgramInstance, stack: *const ProgramStack, thread_id: u32) void {
+    var trace: StackTrace = .{};
     const runtime = runtimePayloadConst(instance);
     const module_len: usize = @min(@as(usize, @intCast(runtime.module_path_len)), runtime.module_path.len);
-    k.puts("[R4XSTACK] highwater owner=");
-    k.putDec(instance.id);
-    k.puts(if (config.enable_metrics) " detail=on" else " detail=off");
-    k.puts(" thread=");
-    k.putDec(thread_id);
-    k.puts(" module=");
-    if (module_len == 0) k.puts("unknown") else k.puts(runtime.module_path[0..module_len]);
-    k.puts(" profile=");
-    k.puts(memoryProfileName(stack.profile));
-    k.puts(" reserve=");
-    k.putDec(stack.reserve_size);
-    k.puts(" initial=");
-    k.putDec(stack.initial_commit_size);
-    k.puts(" committed=");
-    k.putDec(stack.committed_size);
-    k.puts(" highwater=");
-    k.putDec(stack.telemetry_high_water);
-    k.puts(" create_cycles=");
-    k.putDec(stack.create_cycles);
-    k.puts("\r\n");
+    trace.puts("[R4XSTACK] highwater owner=");
+    trace.putDec(instance.id);
+    trace.puts(if (config.enable_metrics) " detail=on" else " detail=off");
+    trace.puts(" thread=");
+    trace.putDec(thread_id);
+    trace.puts(" module=");
+    if (module_len == 0) trace.puts("unknown") else trace.puts(runtime.module_path[0..module_len]);
+    trace.puts(" profile=");
+    trace.puts(memoryProfileName(stack.profile));
+    trace.puts(" reserve=");
+    trace.putDec(stack.reserve_size);
+    trace.puts(" initial=");
+    trace.putDec(stack.initial_commit_size);
+    trace.puts(" committed=");
+    trace.putDec(stack.committed_size);
+    trace.puts(" highwater=");
+    trace.putDec(stack.telemetry_high_water);
+    trace.puts(" create_cycles=");
+    trace.putDec(stack.create_cycles);
+    trace.puts("\r\n");
+    trace.finish();
 }
 
 fn apiFileRead(path: [*:0]const u8, out: [*]u8, max_len: u32) callconv(.c) i32 {
@@ -19119,6 +19189,11 @@ fn currentInstance() ?*ProgramInstance {
 // ProgramInstance addresses stable, and teardown clears task/request records
 // before reclaiming their owner slot.  This helper therefore needs neither a
 // registry pin nor a sleepable mutex and must remain free of waits/yields.
+pub fn diagnosticMemoryOwnerId() u64 {
+    const instance = currentExecutionInstanceNoRegistry() orelse return 0;
+    return instance.id;
+}
+
 fn currentExecutionInstanceNoRegistry() ?*ProgramInstance {
     if (currentProgramThread()) |thread_ctx| return thread_ctx.owner_instance;
     if (currentAsyncIoRequest()) |request| return request.owner_instance;

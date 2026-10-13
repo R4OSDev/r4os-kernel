@@ -801,7 +801,7 @@ pub fn memoryPressureSnapshot(out: *ProgramMemoryPressureSnapshot) callconv(.c) 
 
 pub fn memoryReclaimProbe(requested_frames_raw: u32, out: *ProgramMemoryReclaimProbe) callconv(.c) i32 {
     const requested_frames = clampReclaimFrames(requested_frames_raw);
-    const result = mem_reclaim.reclaimFrames(.diagnostic, requested_frames);
+    const result = mem_reclaim.reclaimDiagnosticFrames(requested_frames, r4x.diagnosticMemoryOwnerId());
     const reclaim_summary = mem_reclaim.summary();
 
     out.* = .{

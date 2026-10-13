@@ -38,7 +38,7 @@ pub const SourceResult = struct {
     failures: u64 = 0,
 };
 
-pub const VmReclaimer = *const fn (Reason, u32) SourceResult;
+pub const VmReclaimer = *const fn (Reason, u32, ?u64) SourceResult;
 pub const TaskStackReclaimer = *const fn (u32) u32;
 
 // A cached kernel stack owns 64 KB of committed memory; its guard page is
@@ -89,6 +89,18 @@ pub fn registerTaskStackReclaimer(reclaimer: TaskStackReclaimer) void {
 }
 
 pub fn reclaimFrames(reason: Reason, requested_frames_raw: u32) Result {
+    return reclaimFramesScoped(reason, requested_frames_raw, null);
+}
+
+/// Diagnostic backing files belong to the caller. Do not leave another
+/// live program's pages bound to a file the diagnostic may replace next time.
+/// Owner zero deliberately selects no VM pages; shared cache/stack reclaim
+/// remains available to callers without an R4X owner.
+pub fn reclaimDiagnosticFrames(requested_frames: u32, vm_owner_id: u64) Result {
+    return reclaimFramesScoped(.diagnostic, requested_frames, vm_owner_id);
+}
+
+fn reclaimFramesScoped(reason: Reason, requested_frames_raw: u32, vm_owner_id: ?u64) Result {
     const requested_frames = if (requested_frames_raw == 0) 1 else requested_frames_raw;
     const before = phys.stats().free_frames;
     const start = timer.tickCount();
@@ -140,7 +152,7 @@ pub fn reclaimFrames(reason: Reason, requested_frames_raw: u32) Result {
     const non_vm_frames = task_stack_result.returned_frames +| cache_result.returned_frames;
     if (non_vm_frames < requested_frames) {
         if (vm_reclaimer) |reclaimer| {
-            vm_result = reclaimer(reason, requested_frames - non_vm_frames);
+            vm_result = reclaimer(reason, requested_frames - non_vm_frames, vm_owner_id);
         }
     }
     const after = phys.stats().free_frames;

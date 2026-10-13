@@ -8,6 +8,7 @@ const irq_router = @import("../../kernel/irq_router.zig");
 const scheduler = @import("../../sched/scheduler.zig");
 const timer = @import("../../kernel/timer.zig");
 const tss = @import("tss.zig");
+const fpu = @import("fpu.zig");
 const tlb = @import("tlb_shootdown.zig");
 const keyboard = @import("../../driver/input/keyboard.zig");
 const mouse = @import("../../driver/input/mouse.zig");
@@ -264,7 +265,44 @@ fn istForVector(vector: usize) u8 {
 
 pub export fn exceptionDispatch(frame: *const InterruptFrame) callconv(.c) void {
     const page_fault_addr = if (frame.vector == 14) readCr2() else 0;
-    if (frame.vector == 14 and r4x.handlePageFault(page_fault_addr, frame.error_code)) return;
+    exceptionDispatchInner(frame, page_fault_addr, false);
+}
+
+pub export fn preparePageFaultFrame(frame: *const InterruptFrame, addr: u64) callconv(.c) usize {
+    // IST hardware frames include saved RSP and SS after RFLAGS.
+    comptime {
+        if (@sizeOf(InterruptFrame) != 160 or @offsetOf(InterruptFrame, "vector") != 120)
+            @compileError("exception assembly frame layout changed");
+    }
+    if ((frame.error_code & 1) != 0) return 0;
+    const frame_bytes = @sizeOf(InterruptFrame) + 2 * @sizeOf(u64);
+    const destination = r4x.preparePageFaultStack(addr, interruptedRsp(frame), frame_bytes) orelse return 0;
+    const source: [*]const u8 = @ptrCast(frame);
+    const target: [*]u8 = @ptrFromInt(destination);
+    @memcpy(target[0..frame_bytes], source[0..frame_bytes]);
+    return destination;
+}
+
+pub export fn pageFaultDispatch(frame: *const InterruptFrame, addr: u64, private_stack: u32) callconv(.c) void {
+    if (private_stack == 0) {
+        exceptionDispatchInner(frame, addr, false);
+        return;
+    }
+    pageFaultOnPrivateStack(frame, addr);
+}
+
+noinline fn pageFaultOnPrivateStack(frame: *const InterruptFrame, addr: u64) void {
+    // A page-in can call SIMD-capable R4Ds and switch tasks. Keep the
+    // interrupted SIMD image in this private continuation, separately from
+    // the scheduler's mutable task-state slot.
+    var state: [fpu.state_storage_bytes]u8 align(fpu.state_storage_align) = @splat(0);
+    fpu.saveTaskState(&state);
+    defer fpu.restoreTaskState(&state);
+    exceptionDispatchInner(frame, addr, true);
+}
+
+fn exceptionDispatchInner(frame: *const InterruptFrame, page_fault_addr: u64, private_stack: bool) void {
+    if (frame.vector == 14 and r4x.handlePageFault(page_fault_addr, frame.error_code, private_stack)) return;
 
     k.puts("[SMP] exception cpu=");
     k.putDec(percpu.currentIndex());
