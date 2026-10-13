@@ -7,6 +7,7 @@ publish = false
 
 [lib]
 path = "Rust/lib.rs"
+crate-type = ["staticlib"]
 
 [dependencies]
 r4os-contract = { git = "https://github.com/R4OSDev/r4os-contract.git", rev = "213a2bd50a7f40d88f5ff7ac87b4ef03ee8e3057" }

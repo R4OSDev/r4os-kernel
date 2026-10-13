@@ -68,6 +68,10 @@ pub fn zigPanic(message: []const u8) noreturn {
     renderAndHalt(&report);
 }
 
+pub fn rustPanic(message: []const u8) noreturn {
+    kernelFatal(current_phase, message);
+}
+
 fn renderAndHalt(report: *const crash.CrashReport) noreturn {
     boot_status.disableForCrash();
     const entry = crash.enterCrashPath();

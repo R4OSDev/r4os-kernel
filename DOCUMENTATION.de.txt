@@ -3,7 +3,25 @@
 
 Dieses Repository enthaelt den R4OS-Kernel fuer x86_64, seine Limine-
 Bootintegration, den Linker, zwingend eingebaute Bestandteile und kernelnahe
-Tests. Der Kernel wird fest in ReleaseSafe und ohne SIMD gebaut.
+Tests. Die verbleibenden Zig-Bereiche werden fest in ReleaseSafe ohne SIMD
+gebaut; die Rust-Migration verwendet das gepruefte Releaseprofil unten.
+
+0.1.266 / 0.83.6: Gemeinsamer Cargo-/Zig-Kernelbau
+------------------------------------------------
+Build.sh und Build.bat starten denselben PowerShell-7-Build.ps1. Er waehlt
+Optionen aus BuildOptions.json, baut mit der isolierten Rust-1.99.0-Toolchain
+native Objekte und verbindet sie mit den noch produktiven Zig-Besitzern.
+Rust: opt-level3, Overflowchecks/Assertions an, panic=abort, keine Red-Zone
+oder SIMD im normalen Kernelcode; kein Cross-Language-LTO. Der gepruefte
+Contractpin wird gegen den lokalen Zig-Vertrag verglichen.
+
+Die private Buildinfo prueft beim Boot Optionsbits, AP-Fehlerindex und die
+gemeinsame Kernelversion. Rust-Panic nimmt den vorhandenen Fatalbesitzer;
+Zig-Innenobjekte und Rust-Referenzen werden nicht ueber die Bruecke geteilt.
+r4os.build.json bindet beide wirklichen Compiler/Profile an den ELF-Hash.
+Nur Installationsbauten erneuern ihn; reine Besitzer-Teststeps behalten die
+Herkunft des alten installierten Artefakts. Aufrufe, Ausgabe und Abnahme:
+Docs/Core/KernelRustBuild.txt im Workspace.
 
 0.1.264: Basis- und Detailinstrumentierung
 -----------------------------------------

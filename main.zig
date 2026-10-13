@@ -42,6 +42,7 @@ const bootscreen = @import("kernel/bootscreen.zig");
 const boot_display = @import("display/boot_display.zig");
 const kernel_version = @import("kernel/version.zig");
 const smp = @import("kernel/smp.zig");
+const rust_bridge = @import("kernel/rust_bridge.zig");
 
 pub const panic = std.debug.FullPanic(handleZigPanic);
 
@@ -56,6 +57,7 @@ export fn kmain() callconv(.c) noreturn {
     _ = boot_display.init();
     boot_status.beginBootLogRedirect();
     beginBootStep(.framebuffer, "Startbild");
+    rust_bridge.init();
     if (config.enable_kernel_fatal_test) fatal.kernelFatal(.entry, "Kernel fatal crash test");
     if (config.enable_zig_panic_test) @panic("Zig panic crash test");
     if (config.enable_crash_screen_test) {

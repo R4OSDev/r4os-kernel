@@ -1,5 +1,16 @@
 ﻿# R4OS Kernel
 
+The kernel is migrating from Zig to Rust in roadmap 0.83.4–27. `Build.sh` and
+`Build.bat` run the same PowerShell 7 builder: pinned Rust 1.99.0 builds native
+objects with checked release arithmetic, assertions, `panic=abort`, no red-zone
+and no SIMD, then the existing Zig ReleaseSafe kernel links the remaining owners.
+Build options have one source in `BuildOptions.json`. A private boot bridge
+checks the exact Rust/Zig configuration and version; Rust panic uses the active
+kernel fatal owner. The installed `r4os.elf` path and metadata format stay stable.
+`r4os.build.json` records the actual compilers/profiles against that ELF's SHA256.
+See the workspace guide `Docs/Core/KernelRustBuild.txt`. Other modules retain
+their existing source and ABI, and performance changes follow the migration.
+
 Kernel 0.1.264 defaults to base instrumentation (`-Dmetrics=false`). Detailed
 lock, IRQ, IPC, driver-work and stack measurements require `-Dmetrics=true`.
 Functional deadlines, ownership, stack guards and resource accounting remain

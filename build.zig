@@ -1,85 +1,33 @@
 const std = @import("std");
 
+const KernelOption = struct {
+    name: []const u8,
+    config: []const u8,
+    type: enum { bool, u32 },
+    default: u64,
+    bit: ?u6 = null,
+    description: []const u8,
+};
+
 pub fn build(b: *std.Build) void {
     // The R4OS kernel is pinned to ReleaseSafe. Debug overflows the Zig 0.16
     // ELF linker, while the kernel must never inherit a caller optimization.
     const optimize: std.builtin.OptimizeMode = .ReleaseSafe;
-    const enable_exception_test = b.option(
-        bool,
-        "exception-test",
-        "Trigger an invalid-opcode exception after loading the IDT",
-    ) orelse false;
-    const enable_page_fault_test = b.option(
-        bool,
-        "page-fault-test",
-        "Trigger a page fault after paging helpers are initialized",
-    ) orelse false;
-    const enable_general_protection_test = b.option(
-        bool,
-        "general-protection-test",
-        "Trigger a general-protection fault after loading the IDT",
-    ) orelse false;
-    const enable_crash_screen_test = b.option(
-        bool,
-        "crash-screen-test",
-        "Render the crash screen after the boot framebuffer is initialized",
-    ) orelse false;
-    const enable_kernel_fatal_test = b.option(
-        bool,
-        "kernel-fatal-test",
-        "Trigger a central KernelFatal crash after the boot framebuffer is initialized",
-    ) orelse false;
-    const enable_zig_panic_test = b.option(
-        bool,
-        "zig-panic-test",
-        "Trigger a Zig panic through the central crash path after the boot framebuffer is initialized",
-    ) orelse false;
-    const enable_com1_debug = b.option(
-        bool,
-        "com1-debug",
-        "Enable COM1 serial output for early kernel debug logs",
-    ) orelse true;
-    const enable_metrics = b.option(
-        bool,
-        "metrics",
-        "Enable detailed lock/IRQ/IPC/work timing, stack high-water and diagnostic scans",
-    ) orelse false;
-    const force_x2apic = b.option(
-        bool,
-        "force-x2apic",
-        "Force-enable x2APIC MSR mode when supported",
-    ) orelse false;
-    const stack_guard_test = b.option(
-        bool,
-        "stack-guard-test",
-        "Spawn a kernel thread that intentionally overflows its stack",
-    ) orelse false;
-    const boot_selftests = b.option(
-        bool,
-        "boot-selftests",
-        "Run invasive heap, page-table, scheduler, and sync selftests during boot",
-    ) orelse false;
-    const display_reject_test = b.option(bool, "display-reject-test", "Bounded native-display rejection probe; never programs hardware") orelse false;
-    const block_dispatch_selftest = b.option(
-        bool,
-        "block-dispatch-selftest",
-        "Run controller-parallel and asynchronous block-dispatch selftests during boot",
-    ) orelse false;
-    const net_loss_test = b.option(
-        bool,
-        "net-loss-test",
-        "Drop every Nth received network frame in test builds",
-    ) orelse false;
-    const smp_fail_ap_index = b.option(
-        u32,
-        "smp-fail-ap-index",
-        "Diagnostic seam: leave the selected AP index offline",
-    ) orelse 0xFFFF_FFFF;
-    const strip_kernel = b.option(
-        bool,
-        "strip-kernel",
-        "Strip host-only debug and symbol sections from the installed kernel ELF",
-    ) orelse true;
+    const parsed = std.json.parseFromSlice([]KernelOption, b.allocator, @embedFile("BuildOptions.json"), .{}) catch @panic("Invalid canonical Kernel build options");
+    const config = b.addOptions();
+    var rust_build_flags: u64 = 0;
+    var strip_kernel = true;
+    for (parsed.value) |option| switch (option.type) {
+        .bool => {
+            const value = b.option(bool, option.name, option.description) orelse (option.default != 0);
+            config.addOption(bool, option.config, value);
+            if (value) rust_build_flags |= @as(u64, 1) << option.bit.?;
+            if (std.mem.eql(u8, option.name, "strip-kernel")) strip_kernel = value;
+        },
+        .u32 => config.addOption(u32, option.config, b.option(u32, option.name, option.description) orelse @intCast(option.default)),
+    };
+    config.addOption(u64, "rust_build_flags", rust_build_flags);
+    const rust_archive = b.option([]const u8, "rust-archive", "Private native archive produced by Kernel/Build.ps1") orelse @panic("Use Kernel/Build.sh or Build.bat to build the checked Cargo archive first; there is no Zig-only kernel fallback");
 
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
@@ -111,22 +59,6 @@ pub fn build(b: *std.Build) void {
         .stack_protector = false,
         .strip = strip_kernel,
     });
-    const config = b.addOptions();
-    config.addOption(bool, "enable_exception_test", enable_exception_test);
-    config.addOption(bool, "enable_page_fault_test", enable_page_fault_test);
-    config.addOption(bool, "enable_general_protection_test", enable_general_protection_test);
-    config.addOption(bool, "enable_crash_screen_test", enable_crash_screen_test);
-    config.addOption(bool, "enable_kernel_fatal_test", enable_kernel_fatal_test);
-    config.addOption(bool, "enable_zig_panic_test", enable_zig_panic_test);
-    config.addOption(bool, "enable_com1_debug", enable_com1_debug);
-    config.addOption(bool, "enable_metrics", enable_metrics);
-    config.addOption(bool, "force_x2apic", force_x2apic);
-    config.addOption(bool, "enable_stack_guard_test", stack_guard_test);
-    config.addOption(bool, "enable_boot_selftests", boot_selftests);
-    config.addOption(bool, "display_reject_test", display_reject_test);
-    config.addOption(bool, "enable_block_dispatch_selftest", block_dispatch_selftest);
-    config.addOption(bool, "enable_net_loss_test", net_loss_test);
-    config.addOption(u32, "smp_fail_ap_index", smp_fail_ap_index);
     kernel_mod.addOptions("config", config);
     kernel_mod.addImport("r4os_kernel_contract", contract_kernel);
     kernel_mod.addImport("r4f_format", b.createModule(.{
@@ -165,11 +97,15 @@ pub fn build(b: *std.Build) void {
     kernel_mod.addAssemblyFile(b.path("arch/x86_64/cpu.S"));
     kernel_mod.addAssemblyFile(b.path("arch/x86_64/isr.S"));
     kernel_mod.addAssemblyFile(b.path("arch/x86_64/ap_trampoline.S"));
+    kernel_mod.addObjectFile(.{ .cwd_relative = rust_archive });
 
     const kernel = b.addExecutable(.{
         .name = "r4os.elf",
         .root_module = kernel_mod,
     });
+    // Select referenced sections from native Cargo/core archive members.
+    // Unused compiler runtime (including hard-float helpers) is not kernel code.
+    kernel.link_gc_sections = true;
     kernel.setLinkerScript(b.path("linker.ld"));
     kernel.entry = .{ .symbol_name = "kmain" };
     kernel.image_base = 0xffffffff80000000;
