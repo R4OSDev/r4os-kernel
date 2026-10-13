@@ -1,4 +1,5 @@
 const std = @import("std");
+var rust_owner_test_archive: ?[]const u8 = null;
 
 const KernelOption = struct {
     name: []const u8,
@@ -10,6 +11,7 @@ const KernelOption = struct {
 };
 
 pub fn build(b: *std.Build) void {
+    rust_owner_test_archive = b.option([]const u8, "rust-owner-test-archive", "Host archive for existing migrated kernel owner fixtures");
     // The R4OS kernel is pinned to ReleaseSafe. Debug overflows the Zig 0.16
     // ELF linker, while the kernel must never inherit a caller optimization.
     const optimize: std.builtin.OptimizeMode = .ReleaseSafe;
@@ -152,6 +154,7 @@ pub fn build(b: *std.Build) void {
         "memory/owner_lock_policy.zig",
         "memory/page_batch.zig",
         "kernel/bootscreen_r4b_format.zig",
+        "kernel/crash.zig",
         "kernel/dma_segments.zig",
         "kernel/dma_sync_range.zig",
         "kernel/pci_interrupt_policy.zig",
@@ -213,6 +216,7 @@ fn addBootscreenUnitTest(b: *std.Build, test_step: *std.Build.Step) void {
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     }));
+    linkRustOwners(b, root);
     const tests = b.addTest(.{ .root_module = root });
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
@@ -238,8 +242,14 @@ fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, config: *std.Build.Ste
         }),
     });
     tests.root_module.addOptions("config", config);
+    if (std.mem.eql(u8, path, "kernel/crash.zig") or std.mem.eql(u8, path, "kernel/bootscreen_r4b_format.zig")) linkRustOwners(b, tests.root_module);
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
+}
+
+fn linkRustOwners(b: *std.Build, root: *std.Build.Module) void {
+    root.addImport("rust_owner_test", b.createModule(.{ .root_source_file = b.path("Tests/RustOwnerBridge.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }));
+    if (rust_owner_test_archive) |archive| root.addObjectFile(.{ .cwd_relative = archive });
 }
 
 fn addFontUnitTest(b: *std.Build, test_step: *std.Build.Step) void {

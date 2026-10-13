@@ -11,6 +11,15 @@ kernel fatal owner. The installed `r4os.elf` path and metadata format stay stabl
 See the workspace guide `Docs/Core/KernelRustBuild.txt`. Other modules retain
 their existing source and ABI, and performance changes follow the migration.
 
+Kernel 0.1.267 moves `kmain`, Limine requests and normalized boot data,
+GDT/TSS/IDT, exception-frame relocation, COM1/bootlog rings and the fatal/crash
+record owner into Rust. The existing assembly and private C adapters preserve
+the boot order, IRQ/runtime owners and visible framebuffer/font renderer.
+Blocking page faults retain their exact task stack and a separate aligned
+SIMD image. Existing crash and bootscreen host fixtures call the migrated
+Rust functions, and guest acceptance uses SMP4. Migration boundaries and
+evidence: workspace `Docs/Core/KernelRustBoot.txt`.
+
 Kernel 0.1.264 defaults to base instrumentation (`-Dmetrics=false`). Detailed
 lock, IRQ, IPC, driver-work and stack measurements require `-Dmetrics=true`.
 Functional deadlines, ownership, stack guards and resource accounting remain

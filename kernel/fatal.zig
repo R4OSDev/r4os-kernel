@@ -1,4 +1,6 @@
-const interrupts = @import("../arch/x86_64/interrupts.zig");
+// Compatibility facade. Rust owns phase, pending failure and terminal
+// decisions; clock instrumentation and framebuffer primitives retain their
+// existing owners until their respective migration waves.
 const boot_status = @import("boot_status.zig");
 const bootscreen = @import("bootscreen.zig");
 const boot_perf = @import("boot_perf.zig");
@@ -6,79 +8,59 @@ const crash = @import("crash.zig");
 const crash_screen = @import("crash_screen.zig");
 const timer = @import("timer.zig");
 const monotonic = @import("../platform/monotonic.zig");
-
-const PendingFailure = struct {
-    active: bool = false,
-    phase: crash.BootPhase = .unknown,
-    message: crash.FixedText = .{},
-};
-
-var current_phase: crash.BootPhase = .entry;
-var pending_failure: PendingFailure = .{};
-
+extern fn r4os_rust_fatal_init() callconv(.c) void;
+extern fn r4os_rust_fatal_phase(crash.BootPhase) callconv(.c) void;
+extern fn r4os_rust_fatal_record(crash.BootPhase, [*]const u8, usize) callconv(.c) void;
+extern fn r4os_rust_fatal_pending(crash.BootPhase, [*]const u8, usize) callconv(.c) noreturn;
+extern fn r4os_rust_kernel_fatal(crash.BootPhase, [*]const u8, usize) callconv(.c) noreturn;
+extern fn r4os_rust_zig_panic([*]const u8, usize) callconv(.c) noreturn;
+extern fn r4os_rust_panic_fatal([*]const u8, usize) callconv(.c) noreturn;
 pub fn init() void {
-    monotonic.earlyInit();
-    current_phase = .entry;
-    pending_failure = .{};
-    boot_perf.init();
+    r4os_rust_fatal_init();
 }
-
 pub fn setBootPhase(phase: crash.BootPhase) void {
-    current_phase = phase;
-    boot_perf.record(phase);
+    r4os_rust_fatal_phase(phase);
 }
-
 pub fn fail(phase: crash.BootPhase, message: []const u8) bool {
     recordFailure(phase, message);
     return false;
 }
-
 pub fn recordFailure(phase: crash.BootPhase, message: []const u8) void {
-    current_phase = phase;
-    pending_failure = .{
-        .active = true,
-        .phase = phase,
-        .message = .{},
-    };
-    pending_failure.message.set(message);
-    bootscreen.setError(message);
-    boot_status.disableForCrash();
+    r4os_rust_fatal_record(phase, message.ptr, message.len);
 }
-
-pub fn haltPendingOrMessage(phase: crash.BootPhase, fallback_message: []const u8) noreturn {
-    if (pending_failure.active) {
-        const message = pending_failure.message.slice();
-        kernelFatal(pending_failure.phase, message);
-    }
-    kernelFatal(phase, fallback_message);
+pub fn haltPendingOrMessage(phase: crash.BootPhase, message: []const u8) noreturn {
+    r4os_rust_fatal_pending(phase, message.ptr, message.len);
 }
-
 pub fn kernelFatal(phase: crash.BootPhase, message: []const u8) noreturn {
-    current_phase = phase;
-    boot_perf.failFatal();
-    bootscreen.setError(message);
-    var report = crash.fromKernelFatal(phase, timer.tickCount(), message);
-    renderAndHalt(&report);
+    r4os_rust_kernel_fatal(phase, message.ptr, message.len);
 }
-
 pub fn zigPanic(message: []const u8) noreturn {
-    boot_perf.failFatal();
-    bootscreen.setError(message);
-    var report = crash.fromZigPanic(current_phase, timer.tickCount(), message);
-    renderAndHalt(&report);
+    r4os_rust_zig_panic(message.ptr, message.len);
 }
-
 pub fn rustPanic(message: []const u8) noreturn {
-    kernelFatal(current_phase, message);
+    r4os_rust_panic_fatal(message.ptr, message.len);
 }
-
-fn renderAndHalt(report: *const crash.CrashReport) noreturn {
+export fn r4os_zig_fatal_init_dependencies() callconv(.c) void {
+    monotonic.earlyInit();
+    boot_perf.init();
+}
+export fn r4os_zig_boot_perf_record(phase: crash.BootPhase) callconv(.c) void {
+    boot_perf.record(phase);
+}
+export fn r4os_zig_fatal_record_display(message: [*]const u8, len: usize) callconv(.c) void {
+    bootscreen.setError(message[0..len]);
     boot_status.disableForCrash();
-    const entry = crash.enterCrashPath();
-    if (entry == .reentrant) {
-        crash_screen.serialMirror(report);
-    } else {
+}
+export fn r4os_zig_fatal_display(message: [*]const u8, len: usize) callconv(.c) void {
+    boot_perf.failFatal();
+    bootscreen.setError(message[0..len]);
+}
+export fn r4os_zig_fatal_ticks() callconv(.c) u64 {
+    return timer.tickCount();
+}
+export fn r4os_zig_crash_output(report: *const crash.CrashReport, reentrant: bool) callconv(.c) void {
+    boot_status.disableForCrash();
+    if (reentrant) crash_screen.serialMirror(report) else {
         _ = crash_screen.render(report);
     }
-    interrupts.haltForever();
 }

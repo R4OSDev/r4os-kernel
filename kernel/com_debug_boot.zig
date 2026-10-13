@@ -1,42 +1,13 @@
-// Early COM1 debug hook for kernel startup.
-
-const config = @import("config");
+// Rust selects the optional COM1 hooks; the general log facade stays with
+// its own owner until 0.83.26. No ConsoleSink or native slice crosses C.
 const log = @import("log.zig");
-
+extern fn r4os_rust_com_debug_boot() callconv(.c) void;
 pub fn init() void {
-    if (comptime config.enable_com1_debug) {
-        const com = @import("../driver/com.zig");
-        com.init();
-        log.setSerialSink(com1Putc);
-        log.setSerialBulkSink(com1Write);
-        // COM1-TX-Ring: Crash-/Poweroff-Pfade schalten auf synchron, bleiben
-        // bei einem nicht antwortenden UART aber strikt begrenzt.
-        log.setSerialFlushHook(com1Flush);
-        log.setSerialSyncHook(com1EnterSync);
-    } else {
-        log.setSerialSink(null);
-        log.setSerialBulkSink(null);
-        log.setSerialFlushHook(null);
-        log.setSerialSyncHook(null);
-    }
+    r4os_rust_com_debug_boot();
 }
-
-fn com1Putc(ch: u8) callconv(.c) void {
-    const com = @import("../driver/com.zig");
-    com.logPutc(ch);
-}
-
-fn com1Write(ptr: [*]const u8, len: usize) callconv(.c) void {
-    const com = @import("../driver/com.zig");
-    com.logWrite(ptr[0..len]);
-}
-
-fn com1Flush() callconv(.c) void {
-    const com = @import("../driver/com.zig");
-    com.logFlushSync();
-}
-
-fn com1EnterSync() callconv(.c) void {
-    const com = @import("../driver/com.zig");
-    com.logEnterSyncMode();
+export fn r4os_zig_kernel_serial_sinks(putc: ?log.SerialSink, write: ?log.SerialBulkSink, flush: ?log.SerialControlHook, sync: ?log.SerialControlHook) callconv(.c) void {
+    log.setSerialSink(putc);
+    log.setSerialBulkSink(write);
+    log.setSerialFlushHook(flush);
+    log.setSerialSyncHook(sync);
 }

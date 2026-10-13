@@ -6,41 +6,19 @@ pub fn valid(bytes: []const u8) bool {
     return format.valid(bytes);
 }
 
+extern fn r4os_rust_r4b_draw(*const fb.Framebuffer, [*]const u8, usize) callconv(.c) bool;
+extern fn r4os_rust_r4b_draw_header(*const fb.Framebuffer, [*]const u8, usize, *const format.Header) callconv(.c) bool;
+const Origin = extern struct { x: u64, y: u64 };
+extern fn r4os_rust_r4b_origin(u64, u64, u32, u32, *Origin) callconv(.c) bool;
 pub fn draw(framebuf: *fb.Framebuffer, bytes: []const u8) bool {
-    if (!fb.supportsRgb32(framebuf)) return false;
-    const header = format.read(bytes) orelse return false;
-    return drawHeader(framebuf, bytes, header);
+    return r4os_rust_r4b_draw(framebuf, bytes.ptr, bytes.len);
 }
-
-const Origin = struct {
-    x: u64,
-    y: u64,
-};
-
-fn centeredOrigin(frame_width: u64, frame_height: u64, image_width: u32, image_height: u32) ?Origin {
-    if (frame_width < image_width or frame_height < image_height) return null;
-    return .{
-        .x = (frame_width - image_width) / 2,
-        .y = (frame_height - image_height) / 2,
-    };
+fn centeredOrigin(width: u64, height: u64, image_width: u32, image_height: u32) ?Origin {
+    var result: Origin = undefined;
+    return if (r4os_rust_r4b_origin(width, height, image_width, image_height, &result)) result else null;
 }
-
 fn drawHeader(framebuf: *fb.Framebuffer, bytes: []const u8, header: format.Header) bool {
-    const origin = centeredOrigin(framebuf.width, framebuf.height, header.width, header.height) orelse return false;
-    const pixel_count = std.math.mul(usize, header.width, header.height) catch return false;
-    const pixel_bytes = std.math.mul(usize, pixel_count, @sizeOf(u32)) catch return false;
-    if (header.payload_size != pixel_bytes or header.pixel_offset > bytes.len or pixel_bytes > bytes.len - header.pixel_offset) return false;
-
-    var y: u32 = 0;
-    while (y < header.height) : (y += 1) {
-        var x: u32 = 0;
-        while (x < header.width) : (x += 1) {
-            const offset = header.pixel_offset + (@as(usize, y) * @as(usize, header.width) + @as(usize, x)) * @sizeOf(u32);
-            const rgb = format.readLe32(bytes[offset .. offset + 4]) & 0x00FF_FFFF;
-            fb.putPacked32(framebuf, origin.x + x, origin.y + y, fb.packRgb(framebuf, rgb));
-        }
-    }
-    return true;
+    return r4os_rust_r4b_draw_header(framebuf, bytes.ptr, bytes.len, &header);
 }
 
 test "720p bootscreen is unchanged and larger framebuffers center it" {

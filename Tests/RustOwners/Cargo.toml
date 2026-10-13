@@ -1,0 +1,17 @@
+[package]
+name = "r4os-kernel-owner-fixture"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.99"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+crate-type = ["staticlib"]
+
+[profile.release]
+opt-level = 3
+overflow-checks = true
+debug-assertions = true
+panic = "abort"
+lto = false

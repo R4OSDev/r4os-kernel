@@ -1,4 +1,7 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
 pub const magic = "R4B0";
 pub const version: u16 = 1;
@@ -9,7 +12,7 @@ pub const pixel_format_xrgb32_rgb: u32 = 1;
 pub const payload_size: usize = @as(usize, width) * @as(usize, height) * @sizeOf(u32);
 pub const total_size: usize = header_size + payload_size;
 
-pub const Header = struct {
+pub const Header = extern struct {
     width: u32,
     height: u32,
     pixel_format: u32,
@@ -17,37 +20,17 @@ pub const Header = struct {
     payload_size: usize,
 };
 
+extern fn r4os_rust_r4b_read([*]const u8, usize, ?*Header, bool) callconv(.c) bool;
 pub fn valid(bytes: []const u8) bool {
-    return read(bytes) != null;
+    return r4os_rust_r4b_read(bytes.ptr, bytes.len, null, true);
 }
-
 pub fn read(bytes: []const u8) ?Header {
-    const header = readFields(bytes) orelse return null;
-    if (header.pixel_offset != header_size) return null;
-    if (header.payload_size != payload_size) return null;
-    if (bytes.len < header.pixel_offset + header.payload_size) return null;
-    return header;
+    var result: Header = undefined;
+    return if (r4os_rust_r4b_read(bytes.ptr, bytes.len, &result, true)) result else null;
 }
-
 pub fn readFields(bytes: []const u8) ?Header {
-    if (bytes.len < header_size) return null;
-    if (!std.mem.eql(u8, bytes[0..4], magic)) return null;
-    if (readLe16(bytes[4..6]) != version) return null;
-    if (readLe16(bytes[6..8]) != header_size) return null;
-    const raw_width = readLe32(bytes[8..12]);
-    const raw_height = readLe32(bytes[12..16]);
-    const pixel_format = readLe32(bytes[16..20]);
-    const pixel_offset = readLe32(bytes[20..24]);
-    const raw_payload_size = readLe32(bytes[24..28]);
-    if (raw_width != width or raw_height != height) return null;
-    if (pixel_format != pixel_format_xrgb32_rgb) return null;
-    return .{
-        .width = raw_width,
-        .height = raw_height,
-        .pixel_format = pixel_format,
-        .pixel_offset = @intCast(pixel_offset),
-        .payload_size = @intCast(raw_payload_size),
-    };
+    var result: Header = undefined;
+    return if (r4os_rust_r4b_read(bytes.ptr, bytes.len, &result, false)) result else null;
 }
 
 pub fn readLe16(bytes: []const u8) u16 {

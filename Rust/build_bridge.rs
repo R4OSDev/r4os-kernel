@@ -51,10 +51,6 @@ pub extern "C" fn r4os_rust_boot_probe() {
     }
 }
 
-unsafe extern "C" {
-    fn r4os_zig_rust_fatal(message: *const u8, len: usize) -> !;
-}
-
 struct PanicText {
     bytes: [u8; 256],
     len: usize,
@@ -84,7 +80,5 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
     if let Some(location) = info.location() {
         let _ = write!(&mut message, " at {}:{}", location.file(), location.line());
     }
-    // SAFETY: the existing fatal owner consumes these bounded bytes synchronously
-    // and never returns; no reference or unwinding crosses the native C boundary.
-    unsafe { r4os_zig_rust_fatal(message.bytes.as_ptr(), message.len) }
+    crate::boot::fatal::rust_panic(&message.bytes[..message.len])
 }

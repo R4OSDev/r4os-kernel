@@ -13,7 +13,20 @@ const timer = @import("timer.zig");
 const input_boot = @import("input_boot.zig");
 const boot_display = @import("../display/boot_display.zig");
 
-var boot_redirect_active: bool = false;
+extern fn r4os_rust_boot_redirect() callconv(.c) void;
+extern fn r4os_rust_boot_release() callconv(.c) void;
+extern fn r4os_rust_boot_unroute() callconv(.c) void;
+extern fn r4os_rust_boot_redirect_active() callconv(.c) bool;
+export fn r4os_zig_boot_foundation_summary() callconv(.c) void {
+    printFoundationSummary();
+}
+export fn r4os_zig_boot_route(hook: ?log.OutputHook) callconv(.c) void {
+    log.setOutputHook(hook);
+}
+export fn r4os_zig_boot_release_display() callconv(.c) void {
+    boot_display.invalidateConsoleBackingForExternalDisplay();
+    diag_screen.resetForExternalDisplay();
+}
 
 pub fn printFoundationSummary() void {
     log.puts("  Booted via Limine ");
@@ -36,34 +49,17 @@ pub fn printFoundationSummary() void {
 }
 
 pub fn beginBootLogRedirect() void {
-    boot_redirect_active = true;
-    log.setOutputHook(bootOutputHook);
+    r4os_rust_boot_redirect();
 }
-
 pub fn releaseForUserSession() void {
-    boot_redirect_active = false;
-    boot_display.invalidateConsoleBackingForExternalDisplay();
-    diag_screen.resetForExternalDisplay();
-    // Keep the non-visible sink installed for runtime kernel messages. This is
-    // intentionally the non-intercepting hook: log.zig writes COM1 first, the
-    // hook mirrors into bootlog and suppresses only the framebuffer sink.
-    log.setOutputHook(bootOutputHook);
+    r4os_rust_boot_release();
 }
-
 pub fn disableForCrash() void {
-    boot_redirect_active = false;
-    log.setOutputHook(null);
+    r4os_rust_boot_unroute();
 }
-
 pub fn isBootLogRedirectActive() bool {
-    return boot_redirect_active;
+    return r4os_rust_boot_redirect_active();
 }
-
 pub fn statusLine(text: []const u8) void {
     log.puts(text);
-}
-
-fn bootOutputHook(ch: u8) callconv(.c) bool {
-    bootlog.putc(ch);
-    return true;
 }

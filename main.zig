@@ -46,169 +46,131 @@ const rust_bridge = @import("kernel/rust_bridge.zig");
 
 pub const panic = std.debug.FullPanic(handleZigPanic);
 
-export fn kmain() callconv(.c) noreturn {
-    kernel_version.keepMetadata();
-    limine.keepRequests();
-    crash.init();
-    fatal.init();
-    fatal.setBootPhase(.entry);
-    com_debug_boot.init();
-    _ = boot_info.init();
-    _ = boot_display.init();
-    boot_status.beginBootLogRedirect();
-    beginBootStep(.framebuffer, "Startbild");
-    rust_bridge.init();
-    if (config.enable_kernel_fatal_test) fatal.kernelFatal(.entry, "Kernel fatal crash test");
-    if (config.enable_zig_panic_test) @panic("Zig panic crash test");
-    if (config.enable_crash_screen_test) {
-        const report = crash.fromCpuException(.{
-            .frame = .{
-                .registers = .{
-                    .rax = 0x0000_0000_0000_0001,
-                    .rbx = 0x0000_0000_0000_0002,
-                    .rcx = 0x0000_0000_0000_0003,
-                    .rdx = 0x0000_0000_0000_0004,
-                    .rbp = 0xffff_ffff_8000_1000,
-                },
-                .vector = 14,
-                .error_code = 0b10111,
-                .rip = 0xffff_ffff_8000_2000,
-                .rsp = 0xffff_ffff_8000_3000,
-                .cs = 0x8,
-                .rflags = 0x202,
-            },
-            .cr2 = 0xffff_ffff_dead_beef,
-            .boot_phase = .entry,
-            .ticks = 0,
-            .memory = crash.untrackedMemory(),
-            .message = "Crash screen renderer test",
-        });
-        _ = crash_screen.render(&report);
-        interrupts.haltForever();
+// Private boot cuts for the Rust entry owner. No native Zig value crosses
+// this boundary; each future migration wave replaces its own cut in Rust.
+export fn r4os_zig_boot_action(action: u32) callconv(.c) bool {
+    switch (action) {
+        0 => kernel_version.keepMetadata(),
+        1 => {
+            crash.init();
+            fatal.init();
+            fatal.setBootPhase(.entry);
+            com_debug_boot.init();
+        },
+        2 => {
+            _ = boot_info.init();
+            _ = boot_display.init();
+            boot_status.beginBootLogRedirect();
+        },
+        3 => {
+            rust_bridge.init();
+            if (config.enable_kernel_fatal_test) fatal.kernelFatal(.entry, "Kernel fatal crash test");
+            if (config.enable_zig_panic_test) @panic("Zig panic crash test");
+            if (config.enable_crash_screen_test) {
+                const report = crash.fromCpuException(.{
+                    .frame = .{
+                        .registers = .{ .rax = 1, .rbx = 2, .rcx = 3, .rdx = 4, .rbp = 0xffff_ffff_8000_1000 },
+                        .vector = 14,
+                        .error_code = 0b10111,
+                        .rip = 0xffff_ffff_8000_2000,
+                        .rsp = 0xffff_ffff_8000_3000,
+                        .cs = 8,
+                        .rflags = 0x202,
+                    },
+                    .cr2 = 0xffff_ffff_dead_beef,
+                    .boot_phase = .entry,
+                    .ticks = 0,
+                    .memory = crash.untrackedMemory(),
+                    .message = "Crash screen renderer test",
+                });
+                _ = crash_screen.render(&report);
+                interrupts.haltForever();
+            }
+        },
+        4 => cpu_boot.init(),
+        5 => timer_boot.init(),
+        6 => driver_boot.init(),
+        7 => {
+            input_boot.initKeyboard();
+            input_boot.initMouse();
+            input_boot.completePs2();
+        },
+        8 => return boot_intro.init(),
+        9 => return memory_boot.initCore(),
+        10 => memory_boot.dumpBlockSummary(),
+        11 => return storage_boot.initFoundation(),
+        12 => module_boot.init(),
+        13 => return platform_boot.initDeviceMappings(),
+        14 => return usb_protocol_preload_boot.init(),
+        15 => service_boot.init(),
+        16 => {
+            fatal.setBootPhase(.platform);
+            _ = platform_boot.pcieStatus() orelse fatal.kernelFatal(.platform, "PCIe status missing after platform boot");
+        },
+        17 => return storage_boot.initControllers(platform_boot.pcieStatus().?),
+        18 => return system_update_recovery_boot.recoverBeforeRuntime(),
+        19 => return upload_claim_boot.recoverBeforeRuntime(),
+        20 => return loader_boot.initFilesystemLoader(),
+        21 => return platform_irq_boot.init(),
+        22 => return audio_boot.init(),
+        23 => return network_boot.init(),
+        24 => return usb_hid_boot.init(),
+        25 => return runtime_boot.initTaskRuntime(),
+        26 => return driver_policy_boot.init(),
+        27 => {
+            const quick_acceptance = smp.acceptanceProbeEnabled();
+            _ = smp.runAcceptanceProbeIfEnabled(memory_boot.usableBytes());
+            if (quick_acceptance) {
+                _ = runNvmeInterruptAcceptanceProbe();
+                if (net_core.runTcpPerformanceContractProbe()) {
+                    log.puts("[TCPBURSTPROBE] result=OK write_bytes=4068 segments=3 catalog=48 delayed_ack_ms=40\r\n");
+                } else {
+                    log.puts("[TCPBURSTPROBE] result=FAILED\r\n");
+                    fatal.kernelFatal(.runtime, "TCP burst probe failed");
+                }
+                log.puts("[QUICKPROBE] result=DONE\r\n");
+            }
+        },
+        28 => {
+            _ = net_core.startRxTask();
+        },
+        29 => {
+            _ = net_core.startDhcpTask();
+        },
+        30 => return if (comptime config.enable_boot_selftests) sched_sync.selfTest() else true,
+        31 => return if (comptime config.enable_boot_selftests or config.enable_block_dispatch_selftest) block_storage.parallelDispatchSelfTest() else true,
+        32 => {
+            _ = usb_hid_boot.startPollTask();
+        },
+        33 => return if (comptime config.enable_boot_selftests) sched_scheduler.prioritySelfTest() else true,
+        34 => boot_status.statusLine(if (comptime config.enable_boot_selftests)
+            "BOOTSELFTEST OK heap=1 page_tables=1 sync=1 priority=1\r\n"
+        else
+            "BOOTSELFTEST OFF heap=0 page_tables=0 sync=0 priority=0\r\n"),
+        35 => {
+            _ = task_registry_selftest.runIfEnabled();
+        },
+        36 => {
+            if (comptime config.enable_stack_guard_test) {
+                _ = sched_task.createKernelThread("st-overflow", stackGuardTestMain);
+            }
+        },
+        else => fatal.kernelFatal(.entry, "Invalid private boot cut"),
     }
-    fatal.setBootPhase(.cpu);
-    beginBootStep(.cpu, "CPU initialisieren");
-    cpu_boot.init();
-    fatal.setBootPhase(.timer);
-    beginBootStep(.timer, "Timer initialisieren");
-    timer_boot.init();
-    fatal.setBootPhase(.driver);
-    beginBootStep(.driver, "Basistreiber laden");
-    driver_boot.init();
-    fatal.setBootPhase(.input);
-    beginBootStep(.input, "Eingabe initialisieren");
-    input_boot.initKeyboard();
-    input_boot.initMouse();
-    input_boot.completePs2();
-    fatal.setBootPhase(.entry);
-    beginBootStep(.intro, "Startinfo laden");
-    requireBootStep(boot_intro.init(), .entry, "Boot intro failed");
-    fatal.setBootPhase(.memory);
-    beginBootStep(.memory, "Speicher initialisieren");
-    requireBootStep(memory_boot.initCore(), .memory, "Memory boot failed");
-    memory_boot.dumpBlockSummary();
-    fatal.setBootPhase(.storage);
-    beginBootStep(.storage_foundation, "Laufwerke vorbereiten");
-    requireBootStep(storage_boot.initFoundation(), .storage, "Storage foundation failed");
-    fatal.setBootPhase(.module);
-    beginBootStep(.module, "Module laden");
-    module_boot.init();
-    fatal.setBootPhase(.platform);
-    beginBootStep(.platform, "Plattform erfassen");
-    requireBootStep(platform_boot.initDeviceMappings(), .platform, "Platform boot failed");
-    fatal.setBootPhase(.usb);
-    beginBootStep(.usb_preload, "USB-Protokolle laden");
-    requireBootStep(usb_protocol_preload_boot.init(), .usb, "USB protocol preload failed");
-    fatal.setBootPhase(.service);
-    beginBootStep(.service, "Dienste vorbereiten");
-    service_boot.init();
-    fatal.setBootPhase(.platform);
-    const pcie_status = platform_boot.pcieStatus() orelse fatal.kernelFatal(.platform, "PCIe status missing after platform boot");
-    fatal.setBootPhase(.storage);
-    beginBootStep(.storage_controllers, "Controller starten");
-    requireBootStep(storage_boot.initControllers(pcie_status), .storage, "Storage controller boot failed");
-    fatal.setBootPhase(.loader);
-    beginBootStep(.loader, "System laden");
-    // Replay durable filesystem transactions before caching any installed
-    // library, driver descriptor, font or boot policy from their targets.
-    requireBootStep(system_update_recovery_boot.recoverBeforeRuntime(), .loader, "System update recovery failed");
-    requireBootStep(upload_claim_boot.recoverBeforeRuntime(), .loader, "Upload publish claim recovery failed");
-    requireBootStep(loader_boot.initFilesystemLoader(), .loader, "Loader boot failed");
-    fatal.setBootPhase(.irq);
-    beginBootStep(.irq, "Interrupts starten");
-    requireBootStep(platform_irq_boot.init(), .irq, "Platform IRQ boot failed");
-    fatal.setBootPhase(.audio);
-    beginBootStep(.audio, "Audio vorbereiten");
-    requireBootStep(audio_boot.init(), .audio, "Audio boot failed");
-    fatal.setBootPhase(.network);
-    beginBootStep(.network, "Netzwerk vorbereiten");
-    requireBootStep(network_boot.init(), .network, "Network boot failed");
-    fatal.setBootPhase(.usb);
-    beginBootStep(.usb_hid, "USB-Eingabe starten");
-    requireBootStep(usb_hid_boot.init(), .usb, "USB-HID boot failed");
-    fatal.setBootPhase(.task_runtime);
-    beginBootStep(.task_runtime, "Task-Runtime starten");
-    requireBootStep(runtime_boot.initTaskRuntime(), .task_runtime, "Task runtime boot failed");
-    fatal.setBootPhase(.driver_policy);
-    beginBootStep(.driver_policy, "Treiberplan erstellen");
-    requireBootStep(driver_policy_boot.init(), .driver_policy, "Driver policy boot failed");
-    fatal.setBootPhase(.runtime);
-    beginBootStep(.runtime, "Runtime vorbereiten");
-    bootscreen.setStatus("SMP pruefen");
-    const quick_acceptance = smp.acceptanceProbeEnabled();
-    // Keep the scheduler/preemption witness isolated from device IRQ work.
-    // The NVMe proof follows it and a final marker tells the host that both
-    // bounded probes have emitted their complete diagnostics.
-    _ = smp.runAcceptanceProbeIfEnabled(memory_boot.usableBytes());
-    if (quick_acceptance) {
-        _ = runNvmeInterruptAcceptanceProbe();
-        if (net_core.runTcpPerformanceContractProbe()) {
-            log.puts("[TCPBURSTPROBE] result=OK write_bytes=4068 segments=3 catalog=48 delayed_ack_ms=40\r\n");
-        } else {
-            log.puts("[TCPBURSTPROBE] result=FAILED\r\n");
-            fatal.kernelFatal(.runtime, "TCP burst probe failed");
-        }
-        log.puts("[QUICKPROBE] result=DONE\r\n");
-    }
-    // 0.56.2: Hintergrund-RX-Task - NACH initTaskRuntime (sonst von
-    // task.init() gewischt) und NACH driver_policy_boot (NIC geladen).
-    bootscreen.setStatus("Netzwerk-Task starten");
-    _ = net_core.startRxTask();
-    // 0.59.13: DHCP acquisition follows the real R4D link in its own task.
-    // It must start after the NIC modules and scheduler, just like net-rx.
-    bootscreen.setStatus("DHCP starten");
-    _ = net_core.startDhcpTask();
-    // Invasive correctness workloads are excluded from every normal kernel
-    // artifact. The explicit -Dboot-selftests diagnostic kernel preserves
-    // their real boot-time coverage without charging product readiness.
-    if (comptime config.enable_boot_selftests) {
-        if (!sched_sync.selfTest()) fatal.kernelFatal(.runtime, "Boot sync selftest failed");
-    }
-    if (comptime config.enable_boot_selftests or config.enable_block_dispatch_selftest) {
-        if (!block_storage.parallelDispatchSelfTest()) fatal.kernelFatal(.runtime, "Block dispatch selftest failed");
-    }
-    // 0.56.17: Autonomer Input-Poll-Task - NACH initTaskRuntime (sonst von
-    // task.init() gewischt); pollt USB-HID im 10-ms-Takt ohne Konsumenten.
-    bootscreen.setStatus("USB-Polling starten");
-    _ = usb_hid_boot.startPollTask();
-    if (comptime config.enable_boot_selftests) {
-        if (!sched_scheduler.prioritySelfTest()) fatal.kernelFatal(.runtime, "Boot scheduler priority selftest failed");
-        boot_status.statusLine("BOOTSELFTEST OK heap=1 page_tables=1 sync=1 priority=1\r\n");
-    } else {
-        boot_status.statusLine("BOOTSELFTEST OFF heap=0 page_tables=0 sync=0 priority=0\r\n");
-    }
-    // 0.59.10: Nur mit OPTION TASKREGISTRY selftest=yes. Die echte QEMU-
-    // Abnahme belastet die dynamische Task-/Wait-/Stack-/Reserve-Linie;
-    // normale Produktionsboots fuehren hier keinen Zusatztest aus.
-    bootscreen.setStatus("Task-Registry pruefen");
-    _ = task_registry_selftest.runIfEnabled();
-    // 0.56.15: Absichtlicher Kernel-Stack-Overflow (nur -Dstack-guard-test):
-    // der Thread rennt in seine Guard-Page, erwartet wird ein sauberer
-    // Page-Fault-Crash-Report mit "STACK GUARD HIT task=st-overflow".
-    if (comptime config.enable_stack_guard_test) {
-        _ = sched_task.createKernelThread("st-overflow", stackGuardTestMain);
-    }
-    bootscreen.setStatus("Runtime starten");
+    return true;
+}
+
+export fn r4os_zig_boot_step(phase: u8, progress: u8, text: [*]const u8, len: usize) callconv(.c) void {
+    fatal.setBootPhase(@enumFromInt(phase));
+    beginBootStep(@enumFromInt(progress), text[0..len]);
+}
+export fn r4os_zig_boot_status(text: [*]const u8, len: usize) callconv(.c) void {
+    bootscreen.setStatus(text[0..len]);
+}
+export fn r4os_zig_boot_require(ok: bool, phase: u8, text: [*]const u8, len: usize) callconv(.c) void {
+    requireBootStep(ok, @enumFromInt(phase), text[0..len]);
+}
+export fn r4os_zig_runtime_start() callconv(.c) noreturn {
     return runtime_boot.start();
 }
 

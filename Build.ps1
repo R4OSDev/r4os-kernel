@@ -101,6 +101,23 @@ try {
     $archive = Join-Path $rustOutput ($pin.kernel_target+'/release/libr4os_kernel.a')
     if (-not (Test-Path -LiteralPath $archive)) { throw 'Cargo did not produce a native Kernel archive.' }
     $zigArguments.Add('-Drust-archive='+$archive)
+    if ($BuildArguments -contains 'test') {
+        # Run the existing Zig owner fixtures against native Rust C exports.
+        # The isolated host archive has no boot entry or platform execution.
+        $bareFlags=$env:CARGO_ENCODED_RUSTFLAGS
+        try {
+            $env:CARGO_ENCODED_RUSTFLAGS=@('-Ccode-model=small','-Crelocation-model=static','-Coverflow-checks=yes','-Cdebug-assertions=yes','-Cpanic=abort','-Clto=off') -join [char]31
+            $ownerOutput=Join-Path $artifacts 'Kernel/RustOwners'
+            # Like Contract ABI tests, Linux executes the actual bare SysV
+            # implementation. Windows needs native COFF for its host runner.
+            $ownerTarget=if($IsLinux){$pin.kernel_target}else{'x86_64-pc-windows-msvc'}
+            & pwsh -NoLogo -NoProfile -File $rust cargo build --locked --release --manifest-path (Join-Path $kernel 'Tests/RustOwners/Cargo.toml') --target $ownerTarget --target-dir $ownerOutput
+            if ($LASTEXITCODE -ne 0) { throw 'Rust host owner fixture build failed.' }
+            $ownerArchive=Join-Path $ownerOutput ($ownerTarget+'/release/'+$(if($IsWindows){'r4os_kernel_owner_fixture.lib'}else{'libr4os_kernel_owner_fixture.a'}))
+            if (-not (Test-Path -LiteralPath $ownerArchive)) { throw 'Rust host owner archive missing.' }
+            $zigArguments.Add('-Drust-owner-test-archive='+$ownerArchive)
+        } finally { $env:CARGO_ENCODED_RUSTFLAGS=$bareFlags }
+    }
     if (Test-Path -LiteralPath (Join-Path $contract 'build.zig.zon')) { $zigArguments.Add('--fork='+$contract) }
     Push-Location $kernel
     try { & $zig build @($zigArguments.ToArray()); $result=$LASTEXITCODE } finally { Pop-Location }

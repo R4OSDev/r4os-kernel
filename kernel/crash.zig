@@ -1,4 +1,7 @@
 pub const MAGIC: u64 = 0x52344f5343525348;
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const VERSION: u16 = 1;
 pub const MAX_MESSAGE_BYTES: usize = 128;
 
@@ -210,11 +213,7 @@ pub const FixedText = extern struct {
     bytes: [MAX_MESSAGE_BYTES]u8 = .{0} ** MAX_MESSAGE_BYTES,
 
     pub fn set(self: *FixedText, text: []const u8) void {
-        self.* = .{};
-        const n = min(text.len, MAX_MESSAGE_BYTES);
-        var i: usize = 0;
-        while (i < n) : (i += 1) self.bytes[i] = text[i];
-        self.len = @intCast(n);
+        r4os_rust_crash_text(self, text.ptr, text.len);
     }
 
     pub fn slice(self: *const FixedText) []const u8 {
@@ -259,64 +258,54 @@ pub const CpuExceptionInput = struct {
     message: []const u8 = "",
 };
 
-var crash_depth: u8 = 0;
-
+// Only fixed C values cross to the one Rust crash-record/depth owner.
+const RawBuildInput = extern struct {
+    cause: Cause,
+    phase: BootPhase,
+    ticks: u64,
+    cpu: ?*const CpuFrameSnapshot,
+    cr2: u64,
+    memory: *const FaultMemoryInfo,
+    context: *const ExecutionContext,
+    message: [*]const u8,
+    message_len: usize,
+};
+const TextView = extern struct { data: [*]const u8, len: usize };
+comptime {
+    if (@sizeOf(CrashReport) != 496 or @offsetOf(CrashReport, "cpu") != 32 or
+        @offsetOf(CrashReport, "message") != 360 or @sizeOf(RawBuildInput) != 64 or
+        @offsetOf(RawBuildInput, "cpu") != 16) @compileError("Rust crash-record layout differs");
+}
+extern fn r4os_rust_crash_reset() callconv(.c) void;
+extern fn r4os_rust_crash_depth() callconv(.c) u8;
+extern fn r4os_rust_crash_enter() callconv(.c) CrashEntry;
+extern fn r4os_rust_crash_build(*CrashReport, *const RawBuildInput) callconv(.c) void;
+extern fn r4os_rust_crash_cpu(*CpuExceptionInfo, *const CpuFrameSnapshot) callconv(.c) void;
+extern fn r4os_rust_crash_pf(*PageFaultInfo, u64, u64) callconv(.c) void;
+extern fn r4os_rust_crash_text(*FixedText, [*]const u8, usize) callconv(.c) void;
+extern fn r4os_rust_crash_name(*TextView, u32, u8) callconv(.c) void;
+extern fn r4os_rust_crash_code(Cause) callconv(.c) u32;
+extern fn r4os_rust_crash_vector_code(u64) callconv(.c) u32;
+extern fn r4os_rust_crash_vector_cause(u64) callconv(.c) Cause;
+extern fn r4os_rust_crash_vector_kind(u64) callconv(.c) ExceptionKind;
 pub fn init() void {
-    crash_depth = 0;
+    r4os_rust_crash_reset();
 }
-
 pub fn enterCrashPath() CrashEntry {
-    if (crash_depth == 0) {
-        crash_depth = 1;
-        return .primary;
-    }
-    if (crash_depth != 255) crash_depth += 1;
-    return .reentrant;
+    return r4os_rust_crash_enter();
 }
-
 pub fn resetCrashPathForTest() void {
-    crash_depth = 0;
+    r4os_rust_crash_reset();
 }
-
 pub fn crashDepthForTest() u8 {
-    return crash_depth;
+    return r4os_rust_crash_depth();
 }
-
 pub fn build(input: BuildInput) CrashReport {
-    var report: CrashReport = .{
-        .cause = input.cause,
-        .boot_phase = input.boot_phase,
-        .ticks = input.ticks,
-        .stop_code = stopCodeForCause(input.cause),
-    };
-
-    if (input.cpu) |frame| {
-        report.flags |= FLAG_CPU;
-        report.cpu = cpuExceptionFromFrame(frame);
-        report.stop_code = stopCodeForCpuVector(frame.vector);
-        if (frame.vector == 14 or input.cause == .page_fault) {
-            report.flags |= FLAG_PAGE_FAULT;
-            report.page_fault = decodePageFault(frame.error_code, input.cr2);
-            if (frame.vector != 14) report.stop_code = stopCodeForCause(.page_fault);
-        }
-    }
-
-    if (input.memory.state != .unavailable) {
-        report.flags |= FLAG_MEMORY;
-        report.memory = input.memory;
-    }
-
-    if (input.context.state == .available) {
-        report.flags |= FLAG_CONTEXT;
-        report.context = input.context;
-    }
-
-    if (input.message.len != 0) {
-        report.flags |= FLAG_MESSAGE;
-        report.message.set(input.message);
-    }
-
-    return report;
+    var frame = input.cpu orelse CpuFrameSnapshot{};
+    const raw = RawBuildInput{ .cause = input.cause, .phase = input.boot_phase, .ticks = input.ticks, .cpu = if (input.cpu != null) &frame else null, .cr2 = input.cr2, .memory = &input.memory, .context = &input.context, .message = input.message.ptr, .message_len = input.message.len };
+    var output: CrashReport = undefined;
+    r4os_rust_crash_build(&output, &raw);
+    return output;
 }
 
 pub fn fromCpuException(input: CpuExceptionInput) CrashReport {
@@ -360,32 +349,15 @@ pub fn manualCrashTest(boot_phase: BootPhase, ticks: u64, message: []const u8) C
 }
 
 pub fn cpuExceptionFromFrame(frame: CpuFrameSnapshot) CpuExceptionInfo {
-    return .{
-        .vector = saturateU16(frame.vector),
-        .kind = exceptionKindForVector(frame.vector),
-        .error_code = frame.error_code,
-        .rip = frame.rip,
-        .rsp = frame.rsp,
-        .rbp = frame.registers.rbp,
-        .cs = frame.cs,
-        .rflags = frame.rflags,
-        .registers = frame.registers,
-    };
+    var result: CpuExceptionInfo = undefined;
+    r4os_rust_crash_cpu(&result, &frame);
+    return result;
 }
 
 pub fn decodePageFault(error_code: u64, fault_address: u64) PageFaultInfo {
-    return .{
-        .fault_address = fault_address,
-        .raw_error_code = error_code,
-        .present = bit(error_code, 0),
-        .write = bit(error_code, 1),
-        .user = bit(error_code, 2),
-        .reserved_bit = bit(error_code, 3),
-        .instruction_fetch = bit(error_code, 4),
-        .protection_key = bit(error_code, 5),
-        .shadow_stack = bit(error_code, 6),
-        .sgx = bit(error_code, 15),
-    };
+    var result: PageFaultInfo = undefined;
+    r4os_rust_crash_pf(&result, error_code, fault_address);
+    return result;
 }
 
 pub fn unavailableMemory() FaultMemoryInfo {
@@ -443,180 +415,49 @@ pub fn programContextInfo(r4x_instance_id: u32, task_id: u32, owner_id: u64, ima
 }
 
 pub fn causeForCpuVector(vector: u64) Cause {
-    return switch (vector) {
-        8 => .double_fault,
-        14 => .page_fault,
-        18 => .machine_check,
-        else => .cpu_exception,
-    };
+    return r4os_rust_crash_vector_cause(vector);
 }
 
 pub fn exceptionKindForVector(vector: u64) ExceptionKind {
-    return switch (vector) {
-        0 => .divide_error,
-        1 => .debug,
-        2 => .nmi,
-        3 => .breakpoint,
-        4 => .overflow,
-        5 => .bound_range_exceeded,
-        6 => .invalid_opcode,
-        7 => .device_not_available,
-        8 => .double_fault,
-        9 => .coprocessor_segment_overrun,
-        10 => .invalid_tss,
-        11 => .segment_not_present,
-        12 => .stack_segment_fault,
-        13 => .general_protection_fault,
-        14 => .page_fault,
-        16 => .x87_floating_point,
-        17 => .alignment_check,
-        18 => .machine_check,
-        19 => .simd_floating_point,
-        20 => .virtualization,
-        21 => .control_protection,
-        28 => .hypervisor_injection,
-        29 => .vmm_communication,
-        30 => .security,
-        else => .unknown,
-    };
+    return r4os_rust_crash_vector_kind(vector);
 }
 
 pub fn causeName(cause: Cause) []const u8 {
-    return switch (cause) {
-        .cpu_exception => "CPU Exception",
-        .page_fault => "Page Fault",
-        .double_fault => "Double Fault",
-        .machine_check => "Machine Check",
-        .kernel_fatal => "Kernel Fatal",
-        .zig_panic => "Zig Panic",
-        .manual_crash_test => "Manual Crash Test",
-    };
+    return rustName(0, @intFromEnum(cause));
 }
 
 pub fn bootPhaseName(phase: BootPhase) []const u8 {
-    return switch (phase) {
-        .unknown => "unknown",
-        .entry => "entry",
-        .cpu => "cpu",
-        .timer => "timer",
-        .driver => "driver",
-        .input => "input",
-        .memory => "memory",
-        .storage => "storage",
-        .module => "module",
-        .platform => "platform",
-        .loader => "loader",
-        .irq => "irq",
-        .service => "service",
-        .runtime => "runtime",
-        .audio => "audio",
-        .network => "network",
-        .usb => "usb",
-        .driver_policy => "driver_policy",
-        .shell => "shell",
-        .task_runtime => "task_runtime",
-    };
+    return rustName(1, @intFromEnum(phase));
 }
 
 pub fn exceptionName(kind: ExceptionKind) []const u8 {
-    return switch (kind) {
-        .divide_error => "Divide Error",
-        .debug => "Debug",
-        .nmi => "Non-maskable Interrupt",
-        .breakpoint => "Breakpoint",
-        .overflow => "Overflow",
-        .bound_range_exceeded => "Bound Range Exceeded",
-        .invalid_opcode => "Invalid Opcode",
-        .device_not_available => "Device Not Available",
-        .double_fault => "Double Fault",
-        .coprocessor_segment_overrun => "Coprocessor Segment Overrun",
-        .invalid_tss => "Invalid TSS",
-        .segment_not_present => "Segment Not Present",
-        .stack_segment_fault => "Stack-Segment Fault",
-        .general_protection_fault => "General Protection Fault",
-        .page_fault => "Page Fault",
-        .x87_floating_point => "x87 Floating-Point Exception",
-        .alignment_check => "Alignment Check",
-        .machine_check => "Machine Check",
-        .simd_floating_point => "SIMD Floating-Point Exception",
-        .virtualization => "Virtualization Exception",
-        .control_protection => "Control Protection Exception",
-        .hypervisor_injection => "Hypervisor Injection Exception",
-        .vmm_communication => "VMM Communication Exception",
-        .security => "Security Exception",
-        .unknown => "Unknown",
-    };
+    return rustName(2, @intFromEnum(kind));
 }
 
 pub fn memoryOwnerName(owner: MemoryOwner) []const u8 {
-    return switch (owner) {
-        .kernel => "kernel",
-        .driver => "driver",
-        .protocol => "protocol",
-        .r4x_instance => "r4x_instance",
-        .task => "task",
-        .device => "device",
-        .bootloader => "bootloader",
-        .system => "system",
-        .unknown => "unknown",
-        .unavailable => "unavailable",
-    };
+    return rustName(3, @intFromEnum(owner));
 }
 
 pub fn memoryKindName(kind: MemoryKind) []const u8 {
-    return switch (kind) {
-        .boot => "boot",
-        .kernel => "kernel",
-        .kernel_heap => "kernel_heap",
-        .page_table => "page_table",
-        .virtual_range => "virtual_range",
-        .program_image => "program_image",
-        .app_heap => "app_heap",
-        .app_stack => "app_stack",
-        .dma => "dma",
-        .mmio => "mmio",
-        .framebuffer => "framebuffer",
-        .reserved => "reserved",
-        .free => "free",
-        .unknown => "unknown",
-        .unavailable => "unavailable",
-    };
+    return rustName(4, @intFromEnum(kind));
 }
 
 pub fn memoryStatusName(status: MemoryStatus) []const u8 {
-    return switch (status) {
-        .free => "free",
-        .reserved => "reserved",
-        .committed => "committed",
-        .guard => "guard",
-        .mapped => "mapped",
-        .released => "released",
-        .@"error" => "error",
-        .unknown => "unknown",
-        .unavailable => "unavailable",
-    };
+    return rustName(5, @intFromEnum(status));
 }
 
 pub fn stopCodeForCause(cause: Cause) u32 {
-    return switch (cause) {
-        .cpu_exception => 0x0001_0000,
-        .page_fault => 0x0001_000e,
-        .double_fault => 0x0001_0008,
-        .machine_check => 0x0001_0012,
-        .kernel_fatal => 0x0002_0001,
-        .zig_panic => 0x0002_0002,
-        .manual_crash_test => 0x000f_0001,
-    };
+    return r4os_rust_crash_code(cause);
 }
 
 pub fn stopCodeForCpuVector(vector: u64) u32 {
-    const low: u32 = @intCast(vector & 0xffff);
-    return switch (vector) {
-        8 => stopCodeForCause(.double_fault),
-        14 => stopCodeForCause(.page_fault),
-        18 => stopCodeForCause(.machine_check),
-        else => 0x0001_0000 | low,
-    };
+    return r4os_rust_crash_vector_code(vector);
+}
+
+fn rustName(group: u32, value: u8) []const u8 {
+    var output: TextView = undefined;
+    r4os_rust_crash_name(&output, group, value);
+    return output.data[0..output.len];
 }
 
 fn memoryOwnerFromName(name: []const u8) MemoryOwner {

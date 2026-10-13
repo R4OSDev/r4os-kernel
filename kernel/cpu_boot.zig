@@ -12,22 +12,20 @@ const fatal = @import("fatal.zig");
 const pic = @import("../arch/x86_64/pic.zig");
 const smp = @import("smp.zig");
 
-var initialized = false;
-
+// Transitional facade; Rust owns this boot cut and its readiness state.
+extern fn r4os_rust_cpu_boot() callconv(.c) void;
+extern fn r4os_rust_cpu_ready() callconv(.c) bool;
 pub fn init() void {
-    if (initialized) return;
-
-    gdt.init();
-    idt.init();
+    r4os_rust_cpu_boot();
+}
+pub fn isInitialized() bool {
+    return r4os_rust_cpu_ready();
+}
+// These owners migrate in clock/CPU/SMP waves 0.83.9–10.
+export fn r4os_zig_cpu_foundation() callconv(.c) void {
     pic.init();
     _ = cpu.detect();
     smp.initBsp();
     monotonic.configureCpuClock();
     if (!fpu.init()) fatal.kernelFatal(.cpu, "FPU/SSE task-state init failed");
-
-    initialized = true;
-}
-
-pub fn isInitialized() bool {
-    return initialized;
 }

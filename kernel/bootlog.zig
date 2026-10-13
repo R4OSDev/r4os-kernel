@@ -1,155 +1,51 @@
-const owner_locks = @import("../memory/owner_locks.zig");
-
+// Thin compatibility view of the Rust-owned bounded bootlog.
 pub const BUFFER_SIZE: usize = 65536;
-pub const FLAG_WRAPPED: u32 = 1 << 0;
-
-var buffer: [BUFFER_SIZE]u8 = .{0} ** BUFFER_SIZE;
-var cursor: usize = 0;
-var wrapped: bool = false;
-var total_written: u64 = 0;
-
-pub const Info = struct {
-    length: usize,
-    flags: u32,
-    total_written: u64,
-    dropped_bytes: u64,
-};
-
+pub const FLAG_WRAPPED: u32 = 1;
+pub const Info = extern struct { length: usize, flags: u32, total_written: u64, dropped_bytes: u64 };
+comptime {
+    if (@sizeOf(Info) != 32 or @offsetOf(Info, "total_written") != 16) @compileError("Rust bootlog info differs");
+}
+extern fn r4os_rust_bootlog_info(*Info) callconv(.c) void;
+extern fn r4os_rust_bootlog_write([*]const u8, usize) callconv(.c) void;
+extern fn r4os_rust_bootlog_dec(u64) callconv(.c) void;
+extern fn r4os_rust_bootlog_hex(u64, usize) callconv(.c) void;
+extern fn r4os_rust_bootlog_read(usize, [*]u8, usize) callconv(.c) usize;
 pub fn info() Info {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    return .{
-        .length = if (wrapped) BUFFER_SIZE else cursor,
-        .flags = if (wrapped) FLAG_WRAPPED else 0,
-        .total_written = total_written,
-        .dropped_bytes = if (total_written > BUFFER_SIZE) total_written - BUFFER_SIZE else 0,
-    };
+    var result: Info = undefined;
+    r4os_rust_bootlog_info(&result);
+    return result;
 }
-
 pub fn puts(text: []const u8) void {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    append(text);
+    r4os_rust_bootlog_write(text.ptr, text.len);
 }
-
-pub fn putc(ch: u8) void {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    appendByte(ch);
+pub fn putc(byte: u8) void {
+    const text = [_]u8{byte};
+    puts(&text);
 }
-
 pub fn putDec(value: u64) void {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    var tmp: [20]u8 = undefined;
-    var n = value;
-    var len: usize = 0;
-    if (n == 0) {
-        appendByte('0');
-        return;
-    }
-    while (n > 0 and len < tmp.len) : (len += 1) {
-        tmp[len] = @intCast('0' + (n % 10));
-        n /= 10;
-    }
-    while (len > 0) {
-        len -= 1;
-        appendByte(tmp[len]);
-    }
+    r4os_rust_bootlog_dec(value);
 }
-
 pub fn putHex(value: u64, width: usize) void {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    const digits = "0123456789ABCDEF";
-    var i = width;
-    while (i > 0) {
-        i -= 1;
-        const shift: u6 = @intCast(i * 4);
-        const nibble: usize = @intCast((value >> shift) & 0xF);
-        appendByte(digits[nibble]);
-    }
+    r4os_rust_bootlog_hex(value, width);
 }
-
 pub fn snapshot(out: []u8) usize {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    if (!wrapped) {
-        const len = if (cursor < out.len) cursor else out.len;
-        if (len > 0) @memcpy(out[0..len], buffer[0..len]);
-        return len;
-    }
-
-    var written: usize = 0;
-    var i = cursor;
-    while (i < BUFFER_SIZE and written < out.len) : (i += 1) {
-        out[written] = buffer[i];
-        written += 1;
-    }
-    i = 0;
-    while (i < cursor and written < out.len) : (i += 1) {
-        out[written] = buffer[i];
-        written += 1;
-    }
-    return written;
+    return read(0, out);
 }
-
 pub fn capacity() usize {
     return BUFFER_SIZE;
 }
-
 pub fn length() usize {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    return if (wrapped) BUFFER_SIZE else cursor;
+    return info().length;
 }
-
 pub fn flags() u32 {
-    const irq_flags = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_flags);
-    return if (wrapped) FLAG_WRAPPED else 0;
+    return info().flags;
 }
-
 pub fn totalWritten() u64 {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    return total_written;
+    return info().total_written;
 }
-
 pub fn droppedBytes() u64 {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    return if (total_written > BUFFER_SIZE) total_written - BUFFER_SIZE else 0;
+    return info().dropped_bytes;
 }
-
 pub fn read(offset: usize, out: []u8) usize {
-    const irq_state = owner_locks.boot_log.acquire();
-    defer owner_locks.boot_log.release(irq_state);
-    const len = if (wrapped) BUFFER_SIZE else cursor;
-    if (offset >= len or out.len == 0) return 0;
-    const count = @min(out.len, len - offset);
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        out[i] = chronologicalByte(offset + i);
-    }
-    return count;
-}
-
-fn append(text: []const u8) void {
-    for (text) |ch| appendByte(ch);
-}
-
-fn appendByte(ch: u8) void {
-    buffer[cursor] = ch;
-    cursor += 1;
-    if (cursor >= BUFFER_SIZE) {
-        cursor = 0;
-        wrapped = true;
-    }
-    total_written +%= 1;
-}
-
-fn chronologicalByte(index: usize) u8 {
-    if (!wrapped) return buffer[index];
-    return buffer[(cursor + index) % BUFFER_SIZE];
+    return r4os_rust_bootlog_read(offset, out.ptr, out.len);
 }

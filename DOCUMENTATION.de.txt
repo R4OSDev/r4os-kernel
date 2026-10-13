@@ -6,6 +6,17 @@ Bootintegration, den Linker, zwingend eingebaute Bestandteile und kernelnahe
 Tests. Die verbleibenden Zig-Bereiche werden fest in ReleaseSafe ohne SIMD
 gebaut; die Rust-Migration verwendet das gepruefte Releaseprofil unten.
 
+0.1.267 / 0.83.7: Rust-Boot und Exceptiongrundlage
+------------------------------------------------
+Rust exportiert kmain und besitzt Limine-Requests/Bootdaten, GDT/TSS/IDT/IST,
+Exception-Framewechsel, CPU-Bootbereitschaft/Intro, COM1-/Bootlog-Ringe und
+Fatalzustand/Crashrecords. Feste C-Adapter erhalten die spaeteren Besitzer,
+Assembly, Bootreihenfolge und vorhandenen Stopcodes. Wartender Page-in behaelt
+den genauen Taskstack und eine eigene ausgerichtete SIMD-Sicherung.
+Framebuffer-/Fontbesitzer und sichtbarer Renderer folgen in der Anzeigewelle.
+Die bestehenden Crash-/Bootscreenfixtures rufen die wirklichen Rustfunktionen.
+Vertraege und Belege: Docs/Core/KernelRustBoot.txt im Workspace.
+
 0.1.266 / 0.83.6: Gemeinsamer Cargo-/Zig-Kernelbau
 ------------------------------------------------
 Build.sh und Build.bat starten denselben PowerShell-7-Build.ps1. Er waehlt
