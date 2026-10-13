@@ -1,39 +1,28 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
 pub const min_growth_pages: usize = 16;
 pub const max_growth_pages: usize = 256;
 pub const min_retained_tail_pages: usize = 16;
 
-/// Chooses a bounded geometric commit batch. The caller may retry with the
-/// exact requirement if the speculative part cannot be committed.
+extern fn r4os_rust_heap_growth(required: usize, hint: usize, remaining: usize) usize;
+extern fn r4os_rust_heap_next_hint(committed: usize) usize;
+extern fn r4os_rust_heap_retained(hint: usize, cap: usize, pressure: bool) usize;
+extern fn r4os_rust_heap_release_tail(free: usize, retained: usize, pressure: bool) bool;
+
 pub fn growthPages(required_pages: usize, previous_hint: usize, remaining_pages: usize) usize {
-    if (required_pages == 0 or remaining_pages == 0) return 0;
-    const hint = std.math.clamp(previous_hint, min_growth_pages, max_growth_pages);
-    return @min(@max(required_pages, hint), remaining_pages);
+    return r4os_rust_heap_growth(required_pages, previous_hint, remaining_pages);
 }
-
 pub fn nextGrowthHint(committed_pages: usize) usize {
-    if (committed_pages == 0) return min_growth_pages;
-    return std.math.clamp(committed_pages *| 2, min_growth_pages, max_growth_pages);
+    return r4os_rust_heap_next_hint(committed_pages);
 }
-
-/// Normal retention is RAM-aware and never exceeds roughly 1/1024 of the
-/// heap's physical cap. Explicit memory pressure removes speculative tail
-/// retention completely; the heap's absolute one-page floor is enforced by
-/// its owner.
 pub fn retainedTailPages(next_hint: usize, cap_pages: usize, under_pressure: bool) usize {
-    if (under_pressure) return 0;
-    const ram_ceiling = std.math.clamp(cap_pages / 1024, min_retained_tail_pages, max_growth_pages);
-    return @min(@max(next_hint, min_retained_tail_pages), ram_ceiling);
+    return r4os_rust_heap_retained(next_hint, cap_pages, under_pressure);
 }
-
-/// Avoids trimming on every free. Once the free tail exceeds twice the
-/// retained target, one uncommit returns it to the low watermark.
 pub fn shouldReleaseTail(free_tail_pages: usize, retained_pages: usize, under_pressure: bool) bool {
-    if (free_tail_pages == 0) return false;
-    if (under_pressure) return true;
-    const high = @max(retained_pages *| 2, min_retained_tail_pages * 2);
-    return free_tail_pages > high;
+    return r4os_rust_heap_release_tail(free_tail_pages, retained_pages, under_pressure);
 }
 
 test "geometric growth is bounded by requirement and remaining capacity" {

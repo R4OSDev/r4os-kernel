@@ -2,7 +2,6 @@ const config = @import("config");
 const fatal = @import("fatal.zig");
 const version = @import("version.zig");
 const crash = @import("crash.zig");
-const owner_locks = @import("../memory/owner_locks.zig");
 
 const BuildInfo = extern struct {
     magic: u32,
@@ -45,20 +44,4 @@ export fn r4os_zig_kernel_hex(value: u64, width: u8) callconv(.c) void {
 }
 export fn r4os_zig_kernel_putc(byte: u8) callconv(.c) void {
     log.putc(byte);
-}
-
-const BootLockToken = extern struct { flags: u64, cpu_index: u32, previous_rank: u8, outermost: bool };
-comptime {
-    if (@sizeOf(BootLockToken) != 16 or @offsetOf(BootLockToken, "cpu_index") != 8)
-        @compileError("Rust boot owner token layout differs");
-}
-fn bootLock(class: u8) *owner_locks.Lock {
-    return if (class == 0) &owner_locks.boot_log else &owner_locks.serial_output;
-}
-export fn r4os_zig_boot_lock(class: u8, output: *BootLockToken) callconv(.c) void {
-    const token = bootLock(class).acquire();
-    output.* = .{ .flags = token.flags, .cpu_index = token.cpu_index, .previous_rank = token.previous_rank, .outermost = token.outermost };
-}
-export fn r4os_zig_boot_unlock(class: u8, input: *const BootLockToken) callconv(.c) void {
-    bootLock(class).release(.{ .flags = input.flags, .cpu_index = input.cpu_index, .previous_rank = input.previous_rank, .outermost = input.outermost });
 }

@@ -1,7 +1,7 @@
 const boot_info = @import("../bootloader/boot_info.zig");
 const k = @import("../kernel/log.zig");
 
-pub const Summary = struct {
+pub const Summary = extern struct {
     entries: u64 = 0,
     invalid_entries: u64 = 0,
     usable_bytes: u64 = 0,
@@ -11,28 +11,12 @@ pub const Summary = struct {
     overflow: bool = false,
 };
 
+extern fn r4os_rust_memory_summary([*]const boot_info.MemoryMapEntry, usize, *Summary) callconv(.c) void;
 pub fn summarize() Summary {
     const entries = boot_info.memoryMap();
-    var summary: Summary = .{ .entries = entries.len };
-
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const entry = entries[i];
-        if (!entry.valid) {
-            summary.invalid_entries += 1;
-            continue;
-        }
-        if (entry.kind == .usable) {
-            checkedAddInto(&summary.usable_bytes, entry.length, &summary.overflow);
-            checkedAddInto(&summary.usable_page_bytes, entry.usable_len, &summary.overflow);
-            if (entry.usable_len > summary.largest_usable_len) {
-                summary.largest_usable_base = entry.usable_base;
-                summary.largest_usable_len = entry.usable_len;
-            }
-        }
-    }
-
-    return summary;
+    var result: Summary = undefined;
+    r4os_rust_memory_summary(entries.ptr, entries.len, &result);
+    return result;
 }
 
 pub fn dump() void {
@@ -84,19 +68,4 @@ pub fn dump() void {
 
 pub fn kindName(kind: boot_info.MemoryKind) []const u8 {
     return boot_info.memoryKindName(kind);
-}
-
-fn checkedAdd(a: u64, b: u64) ?u64 {
-    const result = a +% b;
-    if (result < a) return null;
-    return result;
-}
-
-fn checkedAddInto(target: *u64, value: u64, overflow: *bool) void {
-    if (checkedAdd(target.*, value)) |next| {
-        target.* = next;
-    } else {
-        overflow.* = true;
-        target.* = ~@as(u64, 0);
-    }
 }

@@ -1,7 +1,23 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
 pub const max_extent_pages: u64 = 64;
 pub const max_translation_bytes: u64 = 256 * 1024 * 1024;
+
+const RawTranslation = extern struct {
+    virtual_base: u64,
+    bytes: u64,
+    consumed: u64,
+    physical: u64,
+    physical_present: bool,
+};
+extern fn r4os_rust_translation_init(virtual_base: u64, bytes: u64, out: *RawTranslation) bool;
+extern fn r4os_rust_translation_accept(value: *RawTranslation, address: u64, remaining: u64) bool;
+extern fn r4os_rust_translation_result(value: *const RawTranslation, out: *u64) bool;
+extern fn r4os_rust_page_batch_bound(remaining: u64) u64;
+extern fn r4os_rust_page_batch_prefix(frames: [*]const u64, count: usize, page: u64) usize;
 
 /// Accumulate fresh translations while the caller retains the virtual range.
 /// A leaf covers every byte to its boundary, including huge leaves. This
@@ -13,38 +29,40 @@ pub const ContiguousTranslation = struct {
     physical: ?u64 = null,
 
     pub fn init(virtual: u64, bytes: u64) ?ContiguousTranslation {
-        if (bytes == 0 or bytes > max_translation_bytes or bytes - 1 > std.math.maxInt(u64) - virtual) return null;
-        return .{ .virtual = virtual, .bytes = bytes };
+        var raw: RawTranslation = undefined;
+        return if (r4os_rust_translation_init(virtual, bytes, &raw)) fromRaw(raw) else null;
     }
     pub fn accept(self: *ContiguousTranslation, address: u64, leaf_remaining: u64) bool {
-        if (self.consumed >= self.bytes or leaf_remaining == 0) return false;
-        const count = @min(self.bytes - self.consumed, leaf_remaining);
-        if (count - 1 > std.math.maxInt(u64) - address) return false;
-        if (self.physical) |base| {
-            if (self.consumed > std.math.maxInt(u64) - base or address != base + self.consumed) return false;
-        } else self.physical = address;
-        self.consumed += count;
-        return true;
+        var raw = self.toRaw();
+        const accepted = r4os_rust_translation_accept(&raw, address, leaf_remaining);
+        self.* = fromRaw(raw);
+        return accepted;
     }
     pub fn result(self: *const ContiguousTranslation) ?u64 {
-        return if (self.consumed == self.bytes) self.physical else null;
+        const raw = self.toRaw();
+        var physical: u64 = undefined;
+        return if (r4os_rust_translation_result(&raw, &physical)) physical else null;
+    }
+    fn toRaw(self: *const ContiguousTranslation) RawTranslation {
+        return .{ .virtual_base = self.virtual, .bytes = self.bytes, .consumed = self.consumed, .physical = self.physical orelse 0, .physical_present = self.physical != null };
+    }
+    fn fromRaw(raw: RawTranslation) ContiguousTranslation {
+        return .{ .virtual = raw.virtual_base, .bytes = raw.bytes, .consumed = raw.consumed, .physical = if (raw.physical_present) raw.physical else null };
     }
 };
 
 pub fn boundedPageCount(remaining_pages: u64) u64 {
-    return @min(remaining_pages, max_extent_pages);
+    return r4os_rust_page_batch_bound(remaining_pages);
 }
 
 /// Counts the naturally contiguous prefix of already acquired frames. It is
 /// deliberately not a physical-memory search and therefore cannot turn an
 /// ordinary VM commit into an unbounded contiguous-allocation scan.
 pub fn contiguousPrefix(frames: []const u64, page_size: u64) usize {
-    if (frames.len == 0 or page_size == 0) return 0;
-    var count: usize = 1;
-    while (count < frames.len) : (count += 1) {
-        if (frames[count] != frames[0] +% @as(u64, @intCast(count)) *% page_size) break;
-    }
-    return count;
+    return r4os_rust_page_batch_prefix(frames.ptr, frames.len, page_size);
+}
+comptime {
+    if (@sizeOf(RawTranslation) != 40) @compileError("Rust translation C layout mismatch");
 }
 
 test "batch size remains stack and latency bounded" {

@@ -242,7 +242,10 @@ fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, config: *std.Build.Ste
         }),
     });
     tests.root_module.addOptions("config", config);
-    if (std.mem.eql(u8, path, "kernel/crash.zig") or std.mem.eql(u8, path, "kernel/bootscreen_r4b_format.zig")) linkRustOwners(b, tests.root_module);
+    if (std.mem.eql(u8, path, "kernel/crash.zig") or std.mem.eql(u8, path, "kernel/bootscreen_r4b_format.zig") or
+        std.mem.eql(u8, path, "memory/owner_lock_policy.zig") or
+        std.mem.eql(u8, path, "memory/heap_policy.zig") or
+        std.mem.eql(u8, path, "memory/page_batch.zig") or std.mem.eql(u8, path, "input_controller_tests.zig")) linkRustOwners(b, tests.root_module);
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
 }
@@ -287,6 +290,7 @@ fn addContractUnitTest(
     });
     root.addOptions("config", config);
     root.addImport("r4os_kernel_contract", host_contract);
+    linkRustOwners(b, root);
     const tests = b.addTest(.{ .root_module = root });
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
@@ -345,6 +349,7 @@ fn addLoaderTests(
         .optimize = optimize,
     }));
 
+    linkRustOwners(b, root);
     const filter = b.option([]const u8, "loader-test-filter", "Run only matching existing loader ownership tests");
     const tests = b.addTest(.{ .root_module = root, .filters = if (filter) |value| &.{value} else &.{} });
     const run = b.addRunArtifact(tests);

@@ -21,14 +21,14 @@ pub const Class = enum(u8) {
 
 pub const class_count: u32 = 10;
 
-pub const Token = struct {
+pub const Token = extern struct {
     flags: u64 = 0,
     cpu_index: u32 = 0,
     previous_rank: u8 = 0,
     outermost: bool = false,
 };
 
-pub const Stats = struct {
+pub const Stats = extern struct {
     acquisitions: u64 = 0,
     nested_acquisitions: u64 = 0,
     collisions: u64 = 0,
@@ -39,7 +39,7 @@ pub const Stats = struct {
     order_violations: u64 = 0,
 };
 
-pub const Lock = struct {
+pub const Lock = extern struct {
     class: Class,
     rank: u8,
     state: u8 = 0,
@@ -56,144 +56,55 @@ pub const Lock = struct {
     order_violations: u64 = 0,
 
     pub fn acquire(self: *Lock) Token {
-        const flags = io.readRflags();
-        io.cli();
-        prepareCurrentStack();
-        const cpu_index = percpu.currentIndex();
-        const slot: usize = @intCast(cpu_index);
-        const owner: u8 = @intCast(cpu_index + 1);
-        const previous_rank = held_rank[slot];
-
-        if (@atomicLoad(u8, &self.owner_cpu_plus_one, .acquire) == owner and self.depth[slot] != 0) {
-            self.depth[slot] +|= 1;
-            _ = @atomicRmw(u64, &self.nested_acquisitions, .Add, 1, .monotonic);
-            _ = @atomicRmw(u64, &self.acquisitions, .Add, 1, .monotonic);
-            return .{
-                .flags = flags,
-                .cpu_index = cpu_index,
-                .previous_rank = previous_rank,
-                .outermost = false,
-            };
-        }
-
-        if (!policy.orderAllowed(previous_rank, self.rank)) {
-            _ = @atomicRmw(u64, &self.order_violations, .Add, 1, .monotonic);
-        }
-
-        var spins: u64 = 0;
-        var collided = false;
-        while (@cmpxchgWeak(u8, &self.state, 0, 1, .acquire, .monotonic)) |_| {
-            collided = true;
-            if (config.enable_metrics) spins +|= 1;
-            // An ordinary task waiting for an owner must remain able to
-            // acknowledge the higher-priority cross-CPU TLB IPI.  Callers
-            // which deliberately entered with IF=0 (notably IRQ paths) keep
-            // that state and never acquire interruptibility implicitly.
-            if ((flags & RFLAGS_IF) != 0) {
-                io.sti();
-                asm volatile ("pause");
-                io.cli();
-            } else {
-                asm volatile ("pause");
-            }
-        }
-        if (collided) _ = @atomicRmw(u64, &self.collisions, .Add, 1, .monotonic);
-        if (config.enable_metrics and collided) {
-            _ = @atomicRmw(u64, &self.wait_spins, .Add, spins, .monotonic);
-            _ = @atomicRmw(u64, &self.max_wait_spins, .Max, spins, .monotonic);
-        }
-        _ = @atomicRmw(u64, &self.acquisitions, .Add, 1, .monotonic);
-
-        @atomicStore(u8, &self.owner_cpu_plus_one, owner, .release);
-        self.depth[slot] = 1;
-        if (config.enable_metrics) self.acquired_tsc[slot] = readTsc();
-        held_rank[slot] = self.rank;
-        return .{
-            .flags = flags,
-            .cpu_index = cpu_index,
-            .previous_rank = previous_rank,
-            .outermost = true,
-        };
+        var result: Token = undefined;
+        r4os_rust_owner_acquire(self, &result);
+        return result;
     }
-
     pub fn release(self: *Lock, token: Token) void {
-        const cpu_index = percpu.currentIndex();
-        const slot: usize = @intCast(cpu_index);
-        const owner: u8 = @intCast(cpu_index + 1);
-        if (token.cpu_index != cpu_index or
-            @atomicLoad(u8, &self.owner_cpu_plus_one, .acquire) != owner or
-            self.depth[slot] == 0)
-        {
-            _ = @atomicRmw(u64, &self.order_violations, .Add, 1, .monotonic);
-            restoreLocal(token.flags);
-            return;
-        }
-
-        self.depth[slot] -= 1;
-        if (self.depth[slot] == 0) {
-            if (config.enable_metrics) {
-                const cycles = readTsc() -% self.acquired_tsc[slot];
-                _ = @atomicRmw(u64, &self.hold_cycles, .Add, cycles, .monotonic);
-                _ = @atomicRmw(u64, &self.max_hold_cycles, .Max, cycles, .monotonic);
-            }
-            held_rank[slot] = token.previous_rank;
-            @atomicStore(u8, &self.owner_cpu_plus_one, 0, .release);
-            @atomicStore(u8, &self.state, 0, .release);
-        }
-        restoreLocal(token.flags);
+        r4os_rust_owner_release(self, &token);
     }
-
     pub fn heldByCurrent(self: *Lock) bool {
-        const cpu_index = percpu.currentIndex();
-        const owner: u8 = @intCast(cpu_index + 1);
-        return @atomicLoad(u8, &self.owner_cpu_plus_one, .acquire) == owner and
-            self.depth[@intCast(cpu_index)] != 0;
+        return r4os_rust_owner_held(self);
     }
-
     pub fn stats(self: *const Lock) Stats {
-        return .{
-            .acquisitions = @atomicLoad(u64, &self.acquisitions, .monotonic),
-            .nested_acquisitions = @atomicLoad(u64, &self.nested_acquisitions, .monotonic),
-            .collisions = @atomicLoad(u64, &self.collisions, .monotonic),
-            .wait_spins = @atomicLoad(u64, &self.wait_spins, .monotonic),
-            .max_wait_spins = @atomicLoad(u64, &self.max_wait_spins, .monotonic),
-            .hold_cycles = @atomicLoad(u64, &self.hold_cycles, .monotonic),
-            .max_hold_cycles = @atomicLoad(u64, &self.max_hold_cycles, .monotonic),
-            .order_violations = @atomicLoad(u64, &self.order_violations, .monotonic),
-        };
+        var result: Stats = undefined;
+        r4os_rust_owner_stats(self, &result);
+        return result;
     }
 };
 
-var held_rank: [percpu.max_cpus]u8 = .{0} ** percpu.max_cpus;
-
-pub const STACK_HEADROOM: u64 = 64 * layout.KiB;
-
-/// Page faults cannot reenter a half-mutated registry, heap, AVL tree or
-/// scheduler projection. Called at exception entry, before fault resolution
-/// acquires any of those owners itself.
-pub fn faultResolutionAllowed() bool {
-    return held_rank[percpu.currentIndex()] == 0 and percpu.runtimeCriticalDepth().* == 0;
+// Rust owns every mutation, including independently declared Lock instances.
+// The remaining Zig owners retain their resident storage/identity until their
+// own migrations; no native struct or mutable reference crosses this C layout.
+extern fn r4os_rust_owner_acquire(*const Lock, *Token) callconv(.c) void;
+extern fn r4os_rust_owner_release(*const Lock, *const Token) callconv(.c) void;
+extern fn r4os_rust_owner_held(*const Lock) callconv(.c) bool;
+extern fn r4os_rust_owner_stats(*const Lock, *Stats) callconv(.c) void;
+extern fn r4os_rust_owner_fault_allowed() callconv(.c) bool;
+extern fn r4os_rust_owner_prepare_stack() callconv(.c) void;
+comptime {
+    if (percpu.max_cpus != 32 or @sizeOf(Token) != 16 or @offsetOf(Token, "cpu_index") != 8 or
+        @sizeOf(Lock) != 392 or @offsetOf(Lock, "depth") != 4 or
+        @offsetOf(Lock, "acquired_tsc") != 72 or @offsetOf(Lock, "acquisitions") != 328 or
+        @sizeOf(Stats) != 64) @compileError("Rust memory-owner C layout differs");
+    if (layout.APP_STACK_BASE != 0xffff_ff40_0000_0000 or layout.APP_STACK_BYTES != 8 * layout.GiB)
+        @compileError("Rust stack preflight window differs");
 }
-
-/// R4X calls kernel APIs on its demand-grown execution stack. Prepare the
-/// same resident call budget as a kernel Task stack BEFORE taking the first
-/// no-sleep/runtime owner. IRQs are already disabled; a synchronous fault
-/// uses the separate resident IST stack and may safely finish the growth.
-/// Probe each page so a terminal guard cannot be skipped into another stack.
-/// Reads preserve stack canaries; nested owners neither probe nor allocate.
+export fn r4os_zig_owner_cpu() callconv(.c) u32 {
+    return percpu.currentIndex();
+}
+export fn r4os_zig_owner_runtime_depth() callconv(.c) u32 {
+    return percpu.runtimeCriticalDepth().*;
+}
+export fn r4os_zig_named_owner(class: Class) callconv(.c) *const Lock {
+    return forClass(class);
+}
+pub const STACK_HEADROOM: u64 = 64 * layout.KiB;
+pub fn faultResolutionAllowed() bool {
+    return r4os_rust_owner_fault_allowed();
+}
 pub fn prepareCurrentStack() void {
-    if (!faultResolutionAllowed()) return;
-    const rsp = asm volatile ("mov %%rsp, %[value]"
-        : [value] "=r" (-> u64),
-    );
-    if (rsp < layout.APP_STACK_BASE or rsp >= layout.APP_STACK_BASE + layout.APP_STACK_BYTES) return;
-    var offset: u64 = layout.PAGE_SIZE;
-    while (offset <= STACK_HEADROOM) : (offset += layout.PAGE_SIZE) {
-        const page: *const volatile u8 = @ptrFromInt(rsp - offset);
-        _ = page.*;
-    }
-    // Fault handlers may have updated stack metadata while a probe ran.
-    asm volatile ("" ::: .{ .memory = true });
+    r4os_rust_owner_prepare_stack();
 }
 
 // The small ranks are leaf-domain entry points.  They may call into the
@@ -249,22 +160,4 @@ fn addStats(target: *Stats, source: Stats) void {
     target.hold_cycles +%= source.hold_cycles;
     target.max_hold_cycles = @max(target.max_hold_cycles, source.max_hold_cycles);
     target.order_violations +%= source.order_violations;
-}
-
-fn restoreLocal(flags: u64) void {
-    if ((flags & RFLAGS_IF) != 0) {
-        io.sti();
-    } else {
-        io.cli();
-    }
-}
-
-fn readTsc() u64 {
-    var low: u32 = undefined;
-    var high: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [low] "={eax}" (low),
-          [high] "={edx}" (high),
-    );
-    return (@as(u64, high) << 32) | low;
 }

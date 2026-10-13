@@ -5,6 +5,8 @@ test {
     _ = @import("platform/firmware_tables.zig");
     _ = @import("driver/input/platform_input_state.zig");
     _ = @import("memory/device_reserved.zig");
+    _ = @import("Tests/blocks_owner_tests.zig");
+    _ = @import("Tests/vm_metadata_tests.zig");
     _ = @import("kernel/driver_memory_owner.zig");
     _ = @import("kernel/driver_thread_owner.zig");
     _ = @import("kernel/driver_semaphore_owner.zig");

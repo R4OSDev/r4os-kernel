@@ -6,7 +6,6 @@ const paging = @import("paging.zig");
 const phys = @import("phys.zig");
 const reclaim = @import("reclaim.zig");
 const owner_locks = @import("owner_locks.zig");
-const address_layout = @import("layout.zig");
 const percpu = @import("../arch/x86_64/percpu.zig");
 const k = @import("../kernel/log.zig");
 const sync = @import("../sched/sync.zig");
@@ -17,23 +16,12 @@ const r4sys_api = @import("../program/r4sys.zig");
 pub const MAX_RANGES: usize = 1024;
 pub const MAX_COMMIT_SPANS: usize = 4096;
 pub const MAX_PAGE_STATE_SPANS: usize = 8192;
-pub const WINDOW_COUNT: usize = WINDOWS.len;
+pub const WINDOW_COUNT: usize = 9;
 pub const RANGE_ID_INDEX_CAPACITY: usize = MAX_RANGES * 2;
 const INVALID_RANGE_POSITION: u16 = std.math.maxInt(u16);
 
 const MB: u64 = 1024 * 1024;
 const GB: u64 = 1024 * MB;
-const TB: u64 = 1024 * GB;
-
-const TEMP_KERNEL_BASE: u64 = 0xFFFF_FF00_0000_0000;
-const KERNEL_HEAP_BASE: u64 = 0xFFFF_FF10_0000_0000;
-const PROGRAM_IMAGE_BASE: u64 = 0xFFFF_FF20_0000_0000;
-const APP_HEAP_BASE: u64 = 0xFFFF_FF30_0000_0000;
-const APP_STACK_BASE = address_layout.APP_STACK_BASE;
-const MMIO_BASE: u64 = 0xFFFF_FF50_0000_0000;
-const KERNEL_STACK_BASE: u64 = 0xFFFF_FF60_0000_0000;
-const GRAPHICS_BASE: u64 = 0xFFFF_FF70_0000_0000;
-const R4X_VM_BASE: u64 = 0xFFFF_FB00_0000_0000;
 
 const APP_SYSTEM_RESERVE_FRAMES: u64 = 384;
 const PAGE_FAULT_PRESENT: u64 = 1 << 0;
@@ -167,7 +155,7 @@ pub const RangeInfo = struct {
     guard_len: u64 = 0,
 };
 
-pub const Stats = struct {
+pub const Stats = extern struct {
     active_ranges: u64 = 0,
     reserved_bytes: u64 = 0,
     committed_bytes: u64 = 0,
@@ -183,7 +171,7 @@ pub const Stats = struct {
     overflow: bool = false,
 };
 
-pub const OwnerStats = struct {
+pub const OwnerStats = extern struct {
     active_ranges: u64 = 0,
     reserved_bytes: u64 = 0,
     committed_bytes: u64 = 0,
@@ -355,19 +343,36 @@ const WindowDef = struct {
     name: []const u8,
 };
 
-const FreeSpan = struct {
+const CommitSpan = extern struct {
+    slot_used: bool,
+    range_id: u32,
     base: u64,
     len: u64,
+    prev: OptionalSlot,
+    next: OptionalSlot,
 };
-
-const CommitSpan = struct {
-    slot_used: bool = false,
-    range_id: u32 = 0,
-    base: u64 = 0,
-    len: u64 = 0,
-    prev: ?u16 = null,
-    next: ?u16 = null,
+const CommitSpanStats = extern struct {
+    commit_span_active: u32,
+    commit_span_lookups: u64,
+    commit_span_steps: u64,
+    commit_span_step_max: u32,
 };
+extern fn r4os_rust_vm_commit_spans_init() *const [MAX_COMMIT_SPANS]CommitSpan;
+extern fn r4os_rust_vm_commit_span_change(operation: u8, range_id: u32, base: u64, len: u64, reserved: ?*OptionalSlot) u32;
+extern fn r4os_rust_vm_commit_span_scan(head: OptionalSlot, base: u64, len: u64, covers: bool) bool;
+extern fn r4os_rust_vm_commit_span_cursor(free: bool) usize;
+extern fn r4os_rust_vm_commit_span_stats(output: *CommitSpanStats) void;
+fn commitSpanActiveCount() u32 {
+    return @intCast(r4os_rust_vm_commit_span_cursor(false));
+}
+fn commitSpanFreeHead() ?u16 {
+    const slot = r4os_rust_vm_commit_span_cursor(true);
+    return if (slot == std.math.maxInt(usize)) null else @intCast(slot);
+}
+comptime {
+    if (@sizeOf(CommitSpan) != 32 or @offsetOf(CommitSpan, "prev") != 24 or @sizeOf(CommitSpanStats) != 32)
+        @compileError("Rust VM commit span C layout mismatch");
+}
 
 const PageStateSpan = struct {
     slot_used: bool = false,
@@ -403,7 +408,17 @@ const EvictionStep = struct {
     dirty: bool = false,
 };
 
-const Range = struct {
+const OptionalSlot = extern struct {
+    value: u16 = 0,
+    present: bool = false,
+    fn get(self: OptionalSlot) ?u16 {
+        return if (self.present) self.value else null;
+    }
+    fn from(value: ?u16) OptionalSlot {
+        return if (value) |slot| .{ .value = slot, .present = true } else .{};
+    }
+};
+const Range = extern struct {
     slot_used: bool = false,
     id: u32 = 0,
     eviction_allowed: bool = true,
@@ -412,7 +427,8 @@ const Range = struct {
     owner: blocks.Owner = .kernel,
     owner_id: u64 = 0,
     status: blocks.Status = .reserved,
-    name: []const u8 = "",
+    name_ptr: [*]const u8 = "",
+    name_len: usize = 0,
     flags: u64 = paging.WRITABLE | paging.NO_EXECUTE,
     base: u64 = 0,
     len: u64 = 0,
@@ -442,83 +458,188 @@ const Range = struct {
     partial_uncommit_len: u64 = 0,
     partial_uncommit_cursor: u64 = 0,
     partial_uncommit_accounted: bool = false,
-    commit_span_head: ?u16 = null,
-    page_state_span_head: ?u16 = null,
+    commit_span_head: OptionalSlot = .{},
+    page_state_span_head: OptionalSlot = .{},
 
     fn active(self: Range) bool {
         return self.slot_used and self.status != .released;
     }
 };
 
+extern fn r4os_rust_vm_ranges_init() *[MAX_RANGES]Range;
+extern fn r4os_rust_vm_range_info(id: u32, output: *Range) bool;
+extern fn r4os_rust_vm_stats(output: *Stats) void;
+extern fn r4os_rust_vm_owner_stats(owner: u8, owner_id: u64, window: u8, kind: u8, output: *OwnerStats) void;
+extern fn r4os_rust_vm_window_usage(window: u8, output: *WindowUsage) void;
+comptime {
+    if (@sizeOf(Stats) != 104 or @sizeOf(OwnerStats) != 64 or @sizeOf(WindowUsage) != 24)
+        @compileError("Rust VM query C layout mismatch");
+}
+extern fn r4os_rust_vm_initialized() bool;
+extern fn r4os_rust_vm_publish_ready() void;
+extern fn r4os_rust_vm_commit(id: u32, offset: u64, len: u64) u32;
+extern fn r4os_rust_vm_commit_resident(id: u32, offset: u64, len: u64) u32;
+extern fn r4os_rust_vm_uncommit(id: u32, offset: u64, len: u64) u32;
+extern fn r4os_rust_vm_release(id: u32) u32;
+extern fn r4os_rust_vm_finish_rollback(id: u32) u32;
+extern fn r4os_rust_vm_protect_guard(id: u32, offset: u64, len: u64, clear: bool) u32;
+extern fn r4os_rust_vm_partial(range: *Range, operation: u8, base: u64, len: u64, reset: bool) void;
+extern fn r4os_rust_vm_uncommit_span(range: *Range, base: u64, len: u64, skip: bool) u32;
+const ResidentStats = extern struct {
+    resident_commit_batches: u64,
+    resident_commit_max_batch_pages: u64,
+    resident_commit_unlocked_zero_bytes: u64,
+    resident_rollback_batches: u64,
+};
+extern fn r4os_rust_vm_transaction_stats(output: *ResidentStats) void;
+comptime {
+    if (@sizeOf(ResidentStats) != 32) @compileError("Rust resident VM stats layout mismatch");
+}
+export fn r4os_zig_vm_reschedule() callconv(.c) void {
+    if (@import("builtin").is_test) @panic("kernel VM reschedule requested by host fixture");
+    _ = scheduler.safeReschedulePoint();
+}
+// Fixed demand-pager cuts under the admitted VM owner, retaining the exact
+// range identity. Rust ends all range references before calling these.
+export fn r4os_zig_vm_demand_commit(range: *Range, offset: u64, len: u64) callconv(.c) u32 {
+    if (@import("builtin").is_test) @panic("kernel demand commit requested by host fixture");
+    demandCommit(range, offset, len) catch |err| return errorCode(err);
+    return 0;
+}
+fn demandCommit(range: *Range, offset: u64, len: u64) Error!void {
+    try validateUncommitted(range.*, range.base + offset, len);
+    const next_committed = checkedAdd(range.committed_bytes, len) orelse return Error.Overflow;
+    try addCommitSpan(range.id, range.base + offset, len);
+    addPageStateSpan(range.id, offset / paging.PAGE_SIZE, len / paging.PAGE_SIZE, page_state_flag_committed | (if (range.eviction_allowed) @as(u32, 0) else page_state_flag_pinned), 0, 0, 0) catch |err| {
+        removeCommitSpan(range.id, range.base + offset, len) catch {};
+        return err;
+    };
+    range.committed_bytes = next_committed;
+    range.status = .committed;
+    blocks.setCommitted(range.block_id, range.committed_bytes) catch |err| return convertBlockError(err);
+}
+export fn r4os_zig_vm_uncommit_demand(range: *Range, base: u64, len: u64, skip: bool) callconv(.c) u32 {
+    if (@import("builtin").is_test) @panic("kernel demand uncommit requested by host fixture");
+    uncommitDemandSpan(range, base, len, skip) catch |err| return errorCode(err);
+    return 0;
+}
+export fn r4os_zig_vm_pager_cleanup(range: *Range, operation: u8, slot: usize) callconv(.c) void {
+    if (@import("builtin").is_test) @panic("kernel VM pager cleanup requested by host fixture");
+    switch (operation) {
+        0 => {
+            _ = backing_store.releaseVmRegion(@intCast(range.owner_id), range.id);
+        },
+        1 => removePageStateForRange(range.id),
+        2 => removeRangeAddressIndex(slot),
+        else => unreachable,
+    }
+}
+export fn r4os_zig_vm_resident_page_state(id: u32, first_page: u64, pages: u64, mark: bool) callconv(.c) u32 {
+    if (@import("builtin").is_test) @panic("kernel resident page-state requested by host fixture");
+    residentPageState(id, first_page, pages, mark) catch |err| return errorCode(err);
+    return 0;
+}
+fn residentPageState(id: u32, first_page: u64, pages: u64, mark: bool) Error!void {
+    if (mark) {
+        try pageStateSet(id, first_page, pages, page_state_flag_resident, 0, null, true);
+    } else {
+        try addPageStateSpan(id, first_page, pages, page_state_flag_committed | page_state_flag_pinned, 0, 0, 0);
+    }
+}
+extern fn r4os_rust_vm_allocate(range: *const Range, reason: u32, requested: u64, single: bool, output: *phys.FrameExtent) u32;
+extern fn r4os_rust_vm_can_commit(range: *const Range, pages: u64) bool;
+extern fn r4os_rust_vm_release_prepared(base: u64, count: u64, single: bool) void;
+extern fn r4os_rust_vm_uncommit_extent(range: *Range, address: u64, base: u64, count: u64, logical: bool, single: bool) u32;
+// Reclaim retains its original owner until 0.83.17. Rust ends the input
+// snapshot's reference and rejects calls under the VM owner before this cut.
+export fn r4os_zig_vm_reclaim(reason: u32, frames: u32) callconv(.c) u32 {
+    if (@import("builtin").is_test) @panic("kernel VM reclaim requested by host fixture");
+    return reclaim.reclaimFrames(@enumFromInt(reason), frames).returned_frames;
+}
+const RawReserve = extern struct {
+    eviction_allowed: bool,
+    window: u8,
+    kind: u8,
+    owner: u8,
+    owner_id: u64,
+    name_ptr: [*]const u8,
+    name_len: usize,
+    flags: u64,
+    base: u64,
+    len: u64,
+};
+extern fn r4os_rust_vm_reserve_at(request: *const RawReserve, output: *u32) u32;
+comptime {
+    if (@sizeOf(OptionalSlot) != 4 or @sizeOf(RawReserve) != 56 or
+        @sizeOf(Range) != 216 or @offsetOf(Range, "commit_span_head") != 202 or
+        @offsetOf(Range, "page_state_span_head") != 206)
+        @compileError("Rust VM range C layout mismatch");
+}
+
 var pager_activity: sync.WaitQueue = sync.WaitQueue.init();
 var pager_sequence: u64 = 0;
 
-const RangeIdIndexState = enum(u8) {
-    empty = 0,
-    used = 1,
-    tombstone = 2,
+// Rust owns these indices; the legacy pager reads their resident arrays
+// under the VM owner until its migration.
+const IndexStats = extern struct {
+    range_index_capacity: u32,
+    range_index_entries: u32,
+    range_index_tombstones: u32,
+    range_index_lookups: u64,
+    range_index_hits: u64,
+    range_index_misses: u64,
+    range_index_probe_total: u64,
+    range_index_probe_max: u32,
+    range_index_probe_last: u32,
+    range_index_rebuilds: u64,
+    range_index_insert_failures: u64,
+    range_free_slot_lookups: u64,
+    range_free_slot_probe_total: u64,
+    range_free_slot_probe_max: u32,
+    range_free_slot_probe_last: u32,
+    range_address_entries: u32,
+    range_address_lookups: u64,
+    range_address_probe_total: u64,
+    range_address_probe_max: u32,
+    range_address_probe_last: u32,
 };
+extern fn r4os_rust_vm_index_init(order: **const [MAX_RANGES]u16, positions: **const [MAX_RANGES]u16) void;
+extern fn r4os_rust_vm_index_query(operation: u8, argument: u64) usize;
+extern fn r4os_rust_vm_index_change(operation: u8, id: u32, slot: usize) bool;
+extern fn r4os_rust_vm_index_stats(output: *IndexStats) void;
 
-const RangeIdIndexEntry = struct {
-    state: RangeIdIndexState = .empty,
-    id: u32 = 0,
-    slot: usize = 0,
-};
+comptime {
+    if (@sizeOf(IndexStats) != 128)
+        @compileError("Rust VM index C layout mismatch");
+}
+fn indexSlot(operation: u8, argument: u64) ?usize {
+    const slot = r4os_rust_vm_index_query(operation, argument);
+    return if (slot == std.math.maxInt(usize)) null else slot;
+}
+fn rangeAddressCount() usize {
+    return r4os_rust_vm_index_query(5, 0);
+}
+fn rangeIndexEntries() usize {
+    return r4os_rust_vm_index_query(6, 0);
+}
 
-const WINDOWS = [_]WindowDef{
-    .{ .base = TEMP_KERNEL_BASE, .len = 16 * MB, .name = "temp-kernel" },
-    // 0.56.6: 32 MB -> 1 GB virtuelles Fenster. Committed bleibt bedarfsweise
-    // und ist in heap.zig RAM-abhaengig gedeckelt; die Fensterbasen liegen
-    // 64 GB auseinander, 1 GB kollidiert mit nichts.
-    .{ .base = KERNEL_HEAP_BASE, .len = 1 * GB, .name = "kernel-heap" },
-    .{ .base = PROGRAM_IMAGE_BASE, .len = 512 * MB, .name = "program-image" },
-    .{ .base = APP_HEAP_BASE, .len = 0, .name = "app-heap-retired" },
-    // Eight GiB keeps the 8-MiB per-program-thread guard/reserve policy while
-    // removing the old 128-thread virtual-address ceiling. The next window is
-    // 64 GiB away, so this remains isolated with ample unmapped separation.
-    .{ .base = APP_STACK_BASE, .len = address_layout.APP_STACK_BYTES, .name = "app-stack" },
-    .{ .base = MMIO_BASE, .len = 512 * MB, .name = "mmio" },
-    .{ .base = R4X_VM_BASE, .len = 4 * TB, .name = "r4x-vm" },
-    .{ .base = KERNEL_STACK_BASE, .len = 64 * MB, .name = "kernel-stack" },
-    // Dedicated resident BO address space. Admission budgets charge actual
-    // pages separately; this does not reserve 16 GB of physical RAM.
-    .{ .base = GRAPHICS_BASE, .len = 16 * GB, .name = "graphics" },
-};
-
-var ranges: [MAX_RANGES]Range = .{Range{}} ** MAX_RANGES;
-var range_id_index: [RANGE_ID_INDEX_CAPACITY]RangeIdIndexEntry = .{RangeIdIndexEntry{}} ** RANGE_ID_INDEX_CAPACITY;
-var range_address_order: [MAX_RANGES]u16 = .{0} ** MAX_RANGES;
-var range_address_position: [MAX_RANGES]u16 = .{INVALID_RANGE_POSITION} ** MAX_RANGES;
-var commit_spans: [MAX_COMMIT_SPANS]CommitSpan = .{CommitSpan{}} ** MAX_COMMIT_SPANS;
+var ranges: *[MAX_RANGES]Range = undefined;
+var range_address_order: *const [MAX_RANGES]u16 = undefined;
+var range_address_position: *const [MAX_RANGES]u16 = undefined;
+var commit_spans: *const [MAX_COMMIT_SPANS]CommitSpan = undefined;
 var page_state_spans: [MAX_PAGE_STATE_SPANS]PageStateSpan = .{PageStateSpan{}} ** MAX_PAGE_STATE_SPANS;
 var page_state_summary: PageStateSummary = .{};
-var range_id_index_entries: usize = 0;
-var range_id_index_tombstones: usize = 0;
-var range_address_count: usize = 0;
-var commit_span_free_head: ?u16 = null;
-var commit_span_active_count: u32 = 0;
 var page_state_span_free_head: ?u16 = null;
 var page_state_span_active_count: u32 = 0;
 var reclaim_cursor_range_slot: ?u16 = null;
 var reclaim_cursor_page: u64 = 0;
-var next_free_range_slot: usize = 0;
 var hot_path_stats: HotPathStats = .{};
-var next_id: u32 = 1;
-var initialized = false;
 
 pub fn init() bool {
+    ranges = r4os_rust_vm_ranges_init();
     var i: usize = 0;
-    while (i < ranges.len) : (i += 1) ranges[i] = .{};
-    i = 0;
-    while (i < range_id_index.len) : (i += 1) range_id_index[i] = .{};
-    i = 0;
-    while (i < range_address_position.len) : (i += 1) range_address_position[i] = INVALID_RANGE_POSITION;
-    commit_span_free_head = null;
-    i = 0;
-    while (i < commit_spans.len) : (i += 1) {
-        commit_spans[i] = .{ .next = commit_span_free_head };
-        commit_span_free_head = @intCast(i);
-    }
+    r4os_rust_vm_index_init(&range_address_order, &range_address_position);
+    commit_spans = r4os_rust_vm_commit_spans_init();
     page_state_span_free_head = null;
     i = 0;
     while (i < page_state_spans.len) : (i += 1) {
@@ -526,17 +647,11 @@ pub fn init() bool {
         page_state_span_free_head = @intCast(i);
     }
     page_state_summary = .{};
-    range_id_index_entries = 0;
-    range_id_index_tombstones = 0;
-    range_address_count = 0;
-    commit_span_active_count = 0;
     page_state_span_active_count = 0;
     reclaim_cursor_range_slot = null;
     reclaim_cursor_page = 0;
-    next_free_range_slot = 0;
     hot_path_stats = .{};
-    next_id = 1;
-    initialized = true;
+    r4os_rust_vm_publish_ready();
     reclaim.registerVmReclaimer(reclaimEvictFrames);
     return true;
 }
@@ -544,7 +659,7 @@ pub fn init() bool {
 pub fn reserve(req: ReserveRequest) Error!u32 {
     const owner_irq_flags = owner_locks.virtual_memory.acquire();
     defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return Error.NotInitialized;
+    if (!r4os_rust_vm_initialized()) return Error.NotInitialized;
     const len = normalizeLen(req.len) catch |err| return err;
     const alignment = normalizeAlignment(req.alignment) catch |err| return err;
     const base = firstFit(req.window, len, alignment) catch |err| return err;
@@ -564,7 +679,7 @@ pub fn reserve(req: ReserveRequest) Error!u32 {
 pub fn reserveAt(req: ReserveAtRequest) Error!u32 {
     const owner_irq_flags = owner_locks.virtual_memory.acquire();
     defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return Error.NotInitialized;
+    if (!r4os_rust_vm_initialized()) return Error.NotInitialized;
     const len = normalizeLen(req.len) catch |err| return err;
     if (!isAligned(req.base, paging.PAGE_SIZE)) return Error.BadAlignment;
     return reserveAtInternal(.{
@@ -581,144 +696,13 @@ pub fn reserveAt(req: ReserveAtRequest) Error!u32 {
 }
 
 pub fn commit(id: u32, offset: u64, len_raw: u64) Error!void {
-    try finishResidentRollback(id);
-    const outer_owner = !owner_locks.faultResolutionAllowed();
-    var owner_irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return Error.NotInitialized;
-    const len = normalizeLen(len_raw) catch |err| return err;
-    if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
-    const idx = indexById(id) orelse return Error.NotFound;
-    const range = &ranges[idx];
-    if (range.resident_commit_active or range.pager_io_count != 0) return Error.Busy;
-    if (range.partial_uncommit_len != 0) return Error.NotCommitted;
-    try validateInside(range.*, offset, len);
-    try validateNotGuard(range.*, range.base + offset, len);
-
-    if (range.window == .r4x_vm) {
-        try validateUncommitted(range.*, range.base + offset, len);
-        const next_committed = checkedAdd(range.committed_bytes, len) orelse return Error.Overflow;
-        try addCommitSpan(range.id, range.base + offset, len);
-        addPageStateSpan(range.id, offset / paging.PAGE_SIZE, len / paging.PAGE_SIZE, page_state_flag_committed | (if (range.eviction_allowed) @as(u32, 0) else page_state_flag_pinned), 0, 0, 0) catch |err| {
-            removeCommitSpan(range.id, range.base + offset, len) catch {};
-            return err;
-        };
-        range.committed_bytes = next_committed;
-        range.status = .committed;
-        blocks.setCommitted(range.block_id, range.committed_bytes) catch |err| return convertBlockError(err);
-        return;
-    }
-
-    const pages = len / paging.PAGE_SIZE;
-    // Dropping only the inner VM owner cannot shorten an outer no-sleep
-    // section. Small stack/fault commits remain legal in that context;
-    // large callers must first leave their outer metadata owner.
-    if (outer_owner and pages > page_batch.max_extent_pages) return Error.Busy;
-    if (!canCommitPages(range.*, pages)) return Error.OutOfMemory;
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) return Error.Busy;
-    range.resident_commit_active = true;
-    range.resident_commit_base = range.base + offset;
-    range.resident_commit_bytes = 0;
-    defer {
-        range.resident_commit_active = false;
-        _ = task_context.leaveUnwind(unwind);
-    }
-    errdefer {
-        range.resident_commit_failed = true;
-        publishPartialUncommit(range, range.resident_commit_base, range.resident_commit_bytes, true);
-        drainResidentRollback(range, &owner_irq_flags) catch {};
-    }
-    var done: u64 = 0;
-    while (done < pages) {
-        const virt = range.resident_commit_base + done * paging.PAGE_SIZE;
-        const batch_pages = page_batch.boundedPageCount(pages - done);
-        try validateUncommitted(range.*, virt, batch_pages * paging.PAGE_SIZE);
-        if (!canCommitPages(range.*, batch_pages)) return Error.OutOfMemory;
-        const extent = try allocClaimedExtent(range.*, batch_pages, .vm_commit);
-        range.resident_prepared = extent;
-        const extent_bytes = extent.count * paging.PAGE_SIZE;
-        owner_locks.virtual_memory.release(owner_irq_flags);
-        const mem: [*]u8 = @ptrFromInt(phys.physToVirt(extent.base));
-        @memset(mem[0..@intCast(extent_bytes)], 0);
-        owner_irq_flags = owner_locks.virtual_memory.acquire();
-        if (!paging.mapContiguousPages(virt, extent.base, extent.count, range.flags)) {
-            return Error.MapFailed;
-        }
-        range.resident_prepared = .{ .base = 0, .count = 0 };
-        range.committed_bytes += extent_bytes;
-        range.resident_commit_bytes += extent_bytes;
-        recordResident(range, extent_bytes);
-        hot_path_stats.resident_commit_batches +%= 1;
-        hot_path_stats.resident_commit_max_batch_pages = @max(hot_path_stats.resident_commit_max_batch_pages, extent.count);
-        if (!outer_owner) hot_path_stats.resident_commit_unlocked_zero_bytes +%= extent_bytes;
-        done += extent.count;
-        // Also allow progress between publication and the next allocation;
-        // the range lease, rather than the VM lock, protects its identity.
-        if (done < pages) {
-            owner_locks.virtual_memory.release(owner_irq_flags);
-            _ = scheduler.safeReschedulePoint();
-            owner_irq_flags = owner_locks.virtual_memory.acquire();
-        }
-    }
-
-    range.status = .committed;
-    blocks.setCommitted(range.block_id, range.committed_bytes) catch |err| return convertBlockError(err);
-    range.resident_commit_base = 0;
-    range.resident_commit_bytes = 0;
+    try policyCheck(r4os_rust_vm_commit(id, offset, len_raw));
 }
 
 /// Retry only a failed eager commit, never an unrelated partial uncommit.
 /// A failed retry leaves the range and its outstanding frames owned by ID.
 pub fn finishResidentRollback(id: u32) Error!void {
-    const outer_owner = !owner_locks.faultResolutionAllowed();
-    var token = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(token);
-    if (!initialized) return Error.NotInitialized;
-    const range = &ranges[indexById(id) orelse return Error.NotFound];
-    if (range.resident_commit_active) return Error.Busy;
-    if (!range.resident_commit_failed) return;
-    if (outer_owner and range.resident_commit_bytes > page_batch.max_extent_pages * paging.PAGE_SIZE) return Error.Busy;
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) return Error.Busy;
-    range.resident_commit_active = true;
-    defer {
-        range.resident_commit_active = false;
-        _ = task_context.leaveUnwind(unwind);
-    }
-    try drainResidentRollback(range, &token);
-}
-
-fn drainResidentRollback(range: *Range, token: *owner_locks.Token) Error!void {
-    defer {
-        range.status = if (range.committed_bytes == 0) .reserved else .committed;
-        blocks.setCommitted(range.block_id, range.committed_bytes) catch {};
-    }
-    if (range.resident_prepared.count != 0) {
-        const extent = range.resident_prepared;
-        var plan: blocks.PhysicalReleasePlan = undefined;
-        blocks.preparePhysicalRangeRelease(extent.base, extent.count * paging.PAGE_SIZE, &plan) catch |err| return convertBlockError(err);
-        defer blocks.cancelPhysicalRangeRelease(&plan);
-        phys.freeFrameExtent(extent);
-        blocks.commitPhysicalRangeRelease(&plan);
-        range.resident_prepared = .{ .base = 0, .count = 0 };
-    }
-    const end = range.resident_commit_base + range.resident_commit_bytes;
-    while (range.partial_uncommit_cursor < end) {
-        const start = range.partial_uncommit_cursor;
-        const bytes = @min(end - start, page_batch.max_extent_pages * paging.PAGE_SIZE);
-        try uncommitSpan(range, start, bytes, true);
-        hot_path_stats.resident_rollback_batches +%= 1;
-        if (range.partial_uncommit_cursor < end) {
-            owner_locks.virtual_memory.release(token.*);
-            _ = scheduler.safeReschedulePoint();
-            token.* = owner_locks.virtual_memory.acquire();
-        }
-    }
-    clearPartialUncommit(range);
-    range.resident_commit_failed = false;
-    range.resident_commit_base = 0;
-    range.resident_commit_bytes = 0;
+    try policyCheck(r4os_rust_vm_finish_rollback(id));
 }
 
 // Bounded physical preparation for callers which must survive loss of their
@@ -728,171 +712,21 @@ fn drainResidentRollback(range: *Range, token: *owner_locks.Token) Error!void {
 // On rollback failure the normal partial-uncommit state retains mappings and
 // frames until a later release obtains the required TLB acknowledgements.
 pub fn commitResident(id: u32, offset: u64, len_raw: u64) Error!void {
-    const irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(irq_flags);
-    if (!initialized) return Error.NotInitialized;
-    const len = try normalizeLen(len_raw);
-    if (len > 64 * paging.PAGE_SIZE) return Error.OutsideWindow;
-    if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
-    const idx = indexById(id) orelse return Error.NotFound;
-    const range = &ranges[idx];
-    if (range.window != .r4x_vm or range.kind != .virtual_range) return Error.OutsideWindow;
-    if (range.partial_uncommit_len != 0) return Error.NotCommitted;
-    try validateInside(range.*, offset, len);
-    const start = range.base + offset;
-    try validateNotGuard(range.*, start, len);
-    try validateUncommitted(range.*, start, len);
-    const pages = len / paging.PAGE_SIZE;
-    if (!canCommitPages(range.*, pages)) return Error.OutOfMemory;
-    const next_committed = checkedAdd(range.committed_bytes, len) orelse return Error.Overflow;
-    try addCommitSpan(id, start, len);
-    addPageStateSpan(id, offset / paging.PAGE_SIZE, pages, page_state_flag_committed | page_state_flag_pinned, 0, 0, 0) catch |err| {
-        removeCommitSpan(id, start, len) catch {};
-        return err;
-    };
-    range.committed_bytes = next_committed;
-    range.status = .committed;
-    errdefer {
-        publishPartialUncommit(range, start, len, true);
-        if (uncommitSpan(range, start, len, false)) |_| {
-            clearPartialUncommit(range);
-        } else |_| {}
-        range.status = if (range.committed_bytes == 0) .reserved else .committed;
-        blocks.setCommitted(range.block_id, range.committed_bytes) catch {};
-    }
-    var done: u64 = 0;
-    while (done < pages) {
-        const virt = start + done * paging.PAGE_SIZE;
-        const extent = try allocClaimedExtent(range.*, pages - done, .vm_commit);
-        if (!paging.mapContiguousPages(virt, extent.base, extent.count, range.flags)) {
-            releaseClaimedExtent(extent);
-            return Error.MapFailed;
-        }
-        const extent_bytes = extent.count * paging.PAGE_SIZE;
-        const memory: [*]u8 = @ptrFromInt(virt);
-        @memset(memory[0..@intCast(extent_bytes)], 0);
-        recordResident(range, extent_bytes);
-        done += extent.count;
-    }
-    try pageStateSet(id, offset / paging.PAGE_SIZE, pages, page_state_flag_resident, 0, null, true);
-    blocks.setCommitted(range.block_id, range.committed_bytes) catch |err| return convertBlockError(err);
-}
-
-fn allocClaimedExtent(range: Range, requested_pages: u64, reclaim_reason: reclaim.Reason) Error!phys.FrameExtent {
-    const wanted = page_batch.boundedPageCount(requested_pages);
-    if (wanted == 0) return Error.OutOfMemory;
-    // An inconsistent PMM/block tree must not turn one bounded commit step
-    // into a scan over all RAM while interrupts are disabled.
-    const max_attempts = page_batch.max_extent_pages;
-    var attempts: u64 = 0;
-    var reclaimed = false;
-    while (attempts < max_attempts) {
-        const acquired = phys.allocFrameExtent(wanted) orelse {
-            if (!reclaimed) {
-                reclaimed = true;
-                if (owner_locks.virtual_memory.heldByCurrent()) return Error.OutOfMemory;
-                if (reclaim.reclaimFrames(reclaim_reason, @intCast(wanted)).returned_frames > 0) continue;
-            }
-            return Error.OutOfMemory;
-        };
-        attempts +|= acquired.count;
-
-        const acquired_bytes = acquired.count * paging.PAGE_SIZE;
-        const free_bytes = blocks.freePhysicalPrefix(acquired.base, acquired_bytes);
-        const claim_pages = free_bytes / paging.PAGE_SIZE;
-        if (claim_pages == 0) {
-            returnUnclaimedExtent(acquired);
-            continue;
-        }
-        const claim = phys.FrameExtent{ .base = acquired.base, .count = claim_pages };
-        if (claim_pages < acquired.count) {
-            returnUnclaimedExtent(.{
-                .base = acquired.base + claim_pages * paging.PAGE_SIZE,
-                .count = acquired.count - claim_pages,
-            });
-        }
-        _ = blocks.claimPhysicalRange(
-            claim.base,
-            claim.count * paging.PAGE_SIZE,
-            range.kind,
-            range.owner,
-            range.owner_id,
-            range.name,
-        ) catch |err| {
-            returnUnclaimedExtent(claim);
-            if (err == error.NotFree) continue;
-            return convertBlockError(err);
-        };
-        return claim;
-    }
-    return Error.OutOfMemory;
+    try policyCheck(r4os_rust_vm_commit_resident(id, offset, len_raw));
 }
 
 // A PMM/MemoryBlock discrepancy must never make a frame owned by another
 // block allocatable. Return only subranges which the block tree still marks
 // canonical-free; inconsistent pages stay conservatively used.
-fn returnUnclaimedExtent(extent: phys.FrameExtent) void {
-    var cursor = extent.base;
-    const end = extent.base + extent.count * paging.PAGE_SIZE;
-    while (cursor < end) {
-        const free_bytes = blocks.freePhysicalPrefix(cursor, end - cursor);
-        if (free_bytes >= paging.PAGE_SIZE) {
-            const pages = free_bytes / paging.PAGE_SIZE;
-            phys.freeFrameExtent(.{ .base = cursor, .count = pages });
-            cursor += pages * paging.PAGE_SIZE;
-        } else {
-            cursor += paging.PAGE_SIZE;
-        }
-    }
-}
-
-fn releaseClaimedExtent(extent: phys.FrameExtent) void {
-    if (extent.count == 0) return;
-    var release_plan: blocks.PhysicalReleasePlan = undefined;
-    blocks.preparePhysicalRangeRelease(extent.base, extent.count * paging.PAGE_SIZE, &release_plan) catch return;
-    defer blocks.cancelPhysicalRangeRelease(&release_plan);
-    phys.freeFrameExtent(extent);
-    blocks.commitPhysicalRangeRelease(&release_plan);
-}
 
 fn allocClaimedFrame(range: Range, reclaim_reason: reclaim.Reason) Error!u64 {
-    const max_attempts = phys.stats().total_frames;
-    var attempts: u64 = 0;
-    var reclaimed = false;
-    while (attempts < max_attempts) : (attempts += 1) {
-        const frame = phys.allocFrame() orelse {
-            if (!reclaimed) {
-                reclaimed = true;
-                // Reclaimers may reach filesystem/block I/O and yield.  The
-                // VM owner boundary is deliberately no-sleep; callers
-                // holding it fail with controlled OOM instead of lending the
-                // owner across a context switch.
-                if (owner_locks.virtual_memory.heldByCurrent()) return Error.OutOfMemory;
-                if (reclaim.reclaimFrames(reclaim_reason, 1).returned_frames > 0) {
-                    attempts = 0;
-                    continue;
-                }
-            }
-            return Error.OutOfMemory;
-        };
-        _ = blocks.claimPhysicalRange(frame, paging.PAGE_SIZE, range.kind, range.owner, range.owner_id, range.name) catch |err| {
-            if (err == error.NotFree) {
-                continue;
-            }
-            phys.freeFrame(frame);
-            return convertBlockError(err);
-        };
-        return frame;
-    }
-    return Error.OutOfMemory;
+    var extent: phys.FrameExtent = undefined;
+    try policyCheck(r4os_rust_vm_allocate(&range, @intFromEnum(reclaim_reason), 1, true, &extent));
+    return extent.base;
 }
 
 fn releaseClaimedFrame(frame: u64) void {
-    var release_plan: blocks.PhysicalReleasePlan = undefined;
-    blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE, &release_plan) catch return;
-    defer blocks.cancelPhysicalRangeRelease(&release_plan);
-    phys.freeFrame(frame);
-    blocks.commitPhysicalRangeRelease(&release_plan);
+    r4os_rust_vm_release_prepared(frame, 1, true);
 }
 
 pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_id: u64) bool {
@@ -902,7 +736,7 @@ pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_
         const owner_irq_flags = owner_locks.virtual_memory.acquire();
         var owner_locked = true;
         defer if (owner_locked) owner_locks.virtual_memory.release(owner_irq_flags);
-        if (!initialized) return false;
+        if (!r4os_rust_vm_initialized()) return false;
         if ((error_code & PAGE_FAULT_PRESENT) != 0) return false;
         const fault_page = alignDownValue(addr, paging.PAGE_SIZE);
         const range = rangeByAddress(fault_page) orelse return false;
@@ -967,93 +801,18 @@ pub fn handleDemandFault(addr: u64, error_code: u64, owner: blocks.Owner, owner_
 }
 
 pub fn uncommit(id: u32, offset: u64, len_raw: u64) Error!void {
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return Error.NotInitialized;
-    const len = normalizeLen(len_raw) catch |err| return err;
-    if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
-    const idx = indexById(id) orelse return Error.NotFound;
-    const range = &ranges[idx];
-    if (range.resident_commit_active or range.resident_commit_failed) return Error.Busy;
-    if (range.pager_io_count != 0) return Error.Busy;
-    try validateInside(range.*, offset, len);
-    const start = range.base + offset;
-    try validateNotGuard(range.*, start, len);
-    const resuming_partial = range.partial_uncommit_len != 0;
-    if (resuming_partial) {
-        if (range.partial_uncommit_base != start or range.partial_uncommit_len != len) return Error.NotCommitted;
-    } else {
-        try validateCommitted(range.*, start, len);
-        publishPartialUncommit(range, start, len, true);
-    }
-    uncommitSpan(range, start, len, resuming_partial) catch |err| {
-        range.status = if (range.committed_bytes == 0) .reserved else .committed;
-        blocks.setCommitted(range.block_id, range.committed_bytes) catch |block_err| return convertBlockError(block_err);
-        return err;
-    };
-    range.status = if (range.committed_bytes == 0) .reserved else .committed;
-    blocks.setCommitted(range.block_id, range.committed_bytes) catch |err| return convertBlockError(err);
-    clearPartialUncommit(range);
+    try policyCheck(r4os_rust_vm_uncommit(id, offset, len_raw));
 }
 
 pub fn release(id: u32) Error!void {
-    try finishResidentRollback(id);
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return Error.NotInitialized;
-    const idx = indexById(id) orelse return Error.NotFound;
-    var range = &ranges[idx];
-    if (range.resident_commit_active or range.resident_commit_failed) return Error.Busy;
-    if (range.pager_io_count != 0) return Error.Busy;
-    if (range.window == .r4x_vm and range.owner == .r4x_instance and range.owner_id <= std.math.maxInt(u32)) {
-        _ = backing_store.releaseVmRegion(@intCast(range.owner_id), range.id);
-    }
-    // Releasing a sparse reservation must scale with its committed pages, not
-    // with the virtual reserve. Callers that know a compact committed span
-    // (notably guarded program stacks) uncommit it first; do not walk every
-    // page of an already-empty multi-megabyte reservation afterwards.
-    const resuming_release = range.partial_uncommit_len != 0 and
-        range.partial_uncommit_base == range.base and range.partial_uncommit_len == range.len;
-    if (!resuming_release) publishPartialUncommit(range, range.base, range.len, true);
-    if (range.committed_bytes != 0) {
-        uncommitSpan(range, range.base, range.len, true) catch |err| {
-            blocks.setCommitted(range.block_id, range.committed_bytes) catch |block_err| return convertBlockError(block_err);
-            return err;
-        };
-    }
-    // Once the public ID index is removed there is no lookup path for a
-    // retry. Keep block release, ID tombstone and Range retirement in one
-    // IRQ-atomic no-yield publication boundary.
-    const release_irq_flags = owner_locks.virtual_memory.acquire();
-    blocks.release(range.block_id) catch |err| {
-        owner_locks.virtual_memory.release(release_irq_flags);
-        return convertBlockError(err);
-    };
-    removeCommitSpansForRange(range.id);
-    removePageStateForRange(range.id);
-    removeRangeIdIndex(range.id);
-    removeRangeAddressIndex(idx);
-    range.status = .released;
-    range.committed_bytes = 0;
-    range.resident_bytes = 0;
-    range.peak_resident_bytes = 0;
-    range.fault_count = 0;
-    range.failed_faults = 0;
-    range.guard_base = 0;
-    range.guard_len = 0;
-    range.partial_uncommit_base = 0;
-    range.partial_uncommit_len = 0;
-    range.partial_uncommit_cursor = 0;
-    range.partial_uncommit_accounted = false;
-    next_free_range_slot = idx;
-    owner_locks.virtual_memory.release(release_irq_flags);
+    try policyCheck(r4os_rust_vm_release(id));
 }
 
 pub fn releaseOwner(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) Error!u64 {
     var released: u64 = 0;
     while (true) {
         const owner_irq_flags = owner_locks.virtual_memory.acquire();
-        if (!initialized) {
+        if (!r4os_rust_vm_initialized()) {
             owner_locks.virtual_memory.release(owner_irq_flags);
             return Error.NotInitialized;
         }
@@ -1070,39 +829,16 @@ pub fn releaseOwner(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) Erro
 }
 
 pub fn protectGuard(id: u32, offset: u64, len_raw: u64) Error!void {
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return Error.NotInitialized;
-    const len = normalizeLen(len_raw) catch |err| return err;
-    if (!isAligned(offset, paging.PAGE_SIZE)) return Error.BadAlignment;
-    const idx = indexById(id) orelse return Error.NotFound;
-    var range = &ranges[idx];
-    if (range.resident_commit_active or range.resident_commit_failed) return Error.Busy;
-    try validateInside(range.*, offset, len);
-    const guard_base = range.base + offset;
-    if (overlapsMapped(guard_base, len) or commitSpanOverlaps(range.id, guard_base, len)) return Error.AlreadyCommitted;
-    range.guard_base = guard_base;
-    range.guard_len = len;
+    try policyCheck(r4os_rust_vm_protect_guard(id, offset, len_raw, false));
 }
 
 pub fn clearGuard(id: u32) Error!void {
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return Error.NotInitialized;
-    const idx = indexById(id) orelse return Error.NotFound;
-    if (ranges[idx].resident_commit_active or ranges[idx].resident_commit_failed) return Error.Busy;
-    ranges[idx].guard_base = 0;
-    ranges[idx].guard_len = 0;
+    try policyCheck(r4os_rust_vm_protect_guard(id, 0, 0, true));
 }
 
 pub fn rangeInfo(id: u32) ?RangeInfo {
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized) return null;
-    const idx = indexById(id) orelse return null;
-    const range = ranges[idx];
-    if (!range.active()) return null;
-    return infoFromRange(range);
+    var range: Range = undefined;
+    return if (r4os_rust_vm_range_info(id, &range)) infoFromRange(range) else null;
 }
 
 pub fn pageStateProbe(input: PageStateInput) PageStateResult {
@@ -1222,84 +958,24 @@ pub fn recordPagerPolicyFailure(input: PageStateInput, page_out: bool) void {
     if (page_out) page_state_summary.pager_dirty_preserved_pages +%= dirty_pages;
 }
 
-pub const WindowUsage = struct { active_ranges: u32 = 0, committed_bytes: u64 = 0, reserved_bytes: u64 = 0 };
+pub const WindowUsage = extern struct { active_ranges: u32 = 0, committed_bytes: u64 = 0, reserved_bytes: u64 = 0 };
 
 pub fn windowUsage(window: Window) WindowUsage {
-    const token = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(token);
-    var result: WindowUsage = .{};
-    for (ranges) |range| {
-        if (!range.active() or range.window != window) continue;
-        result.active_ranges += 1;
-        result.committed_bytes += range.committed_bytes;
-        result.reserved_bytes += range.len;
-    }
+    var result: WindowUsage = undefined;
+    r4os_rust_vm_window_usage(@intFromEnum(window), &result);
     return result;
 }
 
 pub fn stats() Stats {
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(owner_irq_flags);
-    var s: Stats = .{};
-    if (!initialized) return s;
-
-    var i: usize = 0;
-    while (i < ranges.len) : (i += 1) {
-        const range = ranges[i];
-        if (!range.active()) continue;
-        s.active_ranges += 1;
-        checkedAddInto(&s.reserved_bytes, range.len, &s.overflow);
-        checkedAddInto(&s.committed_bytes, range.committed_bytes, &s.overflow);
-        checkedAddInto(&s.resident_bytes, range.resident_bytes, &s.overflow);
-        checkedAddInto(&s.fault_count, range.fault_count, &s.overflow);
-        checkedAddInto(&s.failed_faults, range.failed_faults, &s.overflow);
-        if (range.peak_resident_bytes > s.peak_resident_bytes) s.peak_resident_bytes = range.peak_resident_bytes;
-        checkedAddInto(&s.guard_bytes, range.guard_len, &s.overflow);
-    }
-
-    var window_index: usize = 0;
-    while (window_index < WINDOWS.len) : (window_index += 1) {
-        const window: Window = @enumFromInt(window_index);
-        const largest = largestFreeInWindow(window);
-        if (largest.len > s.largest_free_virtual_len) {
-            s.largest_free_virtual_base = largest.base;
-            s.largest_free_virtual_len = largest.len;
-        }
-    }
-
-    const p = phys.stats();
-    if (p.free_frames > APP_SYSTEM_RESERVE_FRAMES) {
-        s.app_available_frames = p.free_frames - APP_SYSTEM_RESERVE_FRAMES;
-    }
-    return s;
+    var result: Stats = undefined;
+    r4os_rust_vm_stats(&result);
+    return result;
 }
 
 pub fn ownerStats(owner: blocks.Owner, owner_id: u64, window_filter: ?Window, kind_filter: ?blocks.Kind) OwnerStats {
-    const owner_irq_flags = owner_locks.virtual_memory.acquire();
-    defer owner_locks.virtual_memory.release(owner_irq_flags);
-    var s: OwnerStats = .{};
-    if (!initialized) return s;
-
-    var i: usize = 0;
-    while (i < ranges.len) : (i += 1) {
-        const range = ranges[i];
-        if (!range.active()) continue;
-        if (range.owner != owner or range.owner_id != owner_id) continue;
-        if (window_filter) |window| {
-            if (range.window != window) continue;
-        }
-        if (kind_filter) |kind| {
-            if (range.kind != kind) continue;
-        }
-        s.active_ranges += 1;
-        checkedAddInto(&s.reserved_bytes, range.len, &s.overflow);
-        checkedAddInto(&s.committed_bytes, range.committed_bytes, &s.overflow);
-        checkedAddInto(&s.resident_bytes, range.resident_bytes, &s.overflow);
-        checkedAddInto(&s.fault_count, range.fault_count, &s.overflow);
-        checkedAddInto(&s.failed_faults, range.failed_faults, &s.overflow);
-        if (range.peak_resident_bytes > s.peak_resident_bytes) s.peak_resident_bytes = range.peak_resident_bytes;
-    }
-    return s;
+    var result: OwnerStats = undefined;
+    r4os_rust_vm_owner_stats(@intFromEnum(owner), owner_id, if (window_filter) |window| @intFromEnum(window) else std.math.maxInt(u8), if (kind_filter) |kind| @intFromEnum(kind) else std.math.maxInt(u8), &result);
+    return result;
 }
 
 pub fn dumpStats() void {
@@ -1352,136 +1028,35 @@ pub fn windowName(window: Window) []const u8 {
 }
 
 fn reserveAtInternal(req: ReserveAtRequest) Error!u32 {
-    const window = windowDef(req.window);
-    const end = checkedEnd(req.base, req.len) orelse return Error.Overflow;
-    const window_end = checkedEnd(window.base, window.len) orelse return Error.Overflow;
-    if (req.base < window.base or end > window_end) return Error.OutsideWindow;
-    if (overlapsExisting(req.base, req.len)) return Error.Overlap;
-
-    const slot = freeSlot() orelse return Error.TableFull;
-    const id = allocId() catch |err| return err;
-    const block_id = blocks.register(.{
-        .kind = req.kind,
-        .owner = req.owner,
-        .owner_id = req.owner_id,
-        .status = .reserved,
-        .name = req.name,
-        .virt_base = req.base,
-        .virt_len = req.len,
-        .reserved_bytes = req.len,
-        .committed_bytes = 0,
-    }) catch |err| return convertBlockError(err);
-
-    ranges[slot] = .{
-        .slot_used = true,
-        .id = id,
-        .window = req.window,
-        .kind = req.kind,
-        .owner = req.owner,
-        .owner_id = req.owner_id,
-        .status = .reserved,
-        .name = req.name,
-        .flags = req.flags,
-        .eviction_allowed = req.eviction_allowed,
-        .base = req.base,
-        .len = req.len,
-        .committed_bytes = 0,
-        .block_id = block_id,
-    };
-    if (!insertRangeIdIndex(id, slot)) {
-        ranges[slot] = .{};
-        blocks.release(block_id) catch {};
-        next_free_range_slot = slot;
-        return Error.TableFull;
-    }
-    insertRangeAddressIndex(slot);
+    const request: RawReserve = .{ .eviction_allowed = req.eviction_allowed, .window = @intFromEnum(req.window), .kind = @intFromEnum(req.kind), .owner = @intFromEnum(req.owner), .owner_id = req.owner_id, .name_ptr = req.name.ptr, .name_len = req.name.len, .flags = req.flags, .base = req.base, .len = req.len };
+    var id: u32 = undefined;
+    try policyCheck(r4os_rust_vm_reserve_at(&request, &id));
     return id;
 }
 
 fn firstFit(window: Window, len: u64, alignment: u64) Error!u64 {
-    const def = windowDef(window);
-    const window_end = checkedEnd(def.base, def.len) orelse return Error.Overflow;
-    var candidate = alignUpChecked(def.base, alignment) orelse return Error.Overflow;
-
-    var pos = lowerBoundAddress(def.base);
-    while (pos < range_address_count) : (pos += 1) {
-        const range = ranges[range_address_order[pos]];
-        if (range.base >= window_end) break;
-        if (range.window != window) continue;
-        const candidate_end = checkedEnd(candidate, len) orelse return Error.Overflow;
-        if (candidate_end > window_end) return Error.NoSpace;
-        if (candidate_end <= range.base) return candidate;
-        const range_end = checkedEnd(range.base, range.len) orelse return Error.Overflow;
-        if (range_end > candidate) {
-            const next = alignUpChecked(range_end, alignment) orelse return Error.Overflow;
-            if (next <= candidate) return Error.Overflow;
-            candidate = next;
-        }
-    }
-    const candidate_end = checkedEnd(candidate, len) orelse return Error.Overflow;
-    return if (candidate_end <= window_end) candidate else Error.NoSpace;
+    var base: u64 = undefined;
+    try policyCheck(r4os_rust_vm_first_fit(@intFromEnum(window), len, alignment, &base));
+    return base;
 }
 
 fn uncommitSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) Error!void {
-    if (range.window == .r4x_vm) return uncommitDemandSpan(range, start, len, skip_unmapped);
-
-    const end = checkedEnd(start, len) orelse return Error.Overflow;
-    var virt = if (range.partial_uncommit_cursor >= start and range.partial_uncommit_cursor <= end)
-        range.partial_uncommit_cursor
-    else
-        start;
-    while (virt < end) {
-        const first_frame = paging.mappedFrame(virt) orelse {
-            if (skip_unmapped) {
-                virt += paging.PAGE_SIZE;
-                advancePartialUncommitCursor(range, virt);
-                continue;
-            }
-            return Error.NotCommitted;
-        };
-        const remaining_pages = (end - virt) / paging.PAGE_SIZE;
-        const max_pages = page_batch.boundedPageCount(remaining_pages);
-        const claimed_pages = blocks.claimedPhysicalPrefix(first_frame, max_pages * paging.PAGE_SIZE) / paging.PAGE_SIZE;
-        if (claimed_pages == 0) return Error.NotCommitted;
-
-        var run_pages: u64 = 1;
-        while (run_pages < claimed_pages) : (run_pages += 1) {
-            const mapped = paging.mappedFrame(virt + run_pages * paging.PAGE_SIZE) orelse break;
-            if (mapped != first_frame + run_pages * paging.PAGE_SIZE) break;
-        }
-        try uncommitExtent(range, virt, .{ .base = first_frame, .count = run_pages }, true);
-        virt += run_pages * paging.PAGE_SIZE;
-        advancePartialUncommitCursor(range, virt);
-    }
+    try policyCheck(r4os_rust_vm_uncommit_span(range, start, len, skip_unmapped));
 }
 
 // Marker publication and removal are tiny IRQ-atomic state transitions. A
 // timer hard-kill may happen between pages, but can never observe a torn
 // base/length/accounted tuple.
 fn publishPartialUncommit(range: *Range, base: u64, len: u64, reset_accounted: bool) void {
-    const irq_flags = owner_locks.virtual_memory.acquire();
-    range.partial_uncommit_base = base;
-    range.partial_uncommit_len = len;
-    if (reset_accounted) {
-        range.partial_uncommit_cursor = base;
-        range.partial_uncommit_accounted = false;
-    }
-    owner_locks.virtual_memory.release(irq_flags);
+    r4os_rust_vm_partial(range, 0, base, len, reset_accounted);
 }
 
 fn advancePartialUncommitCursor(range: *Range, cursor: u64) void {
-    const irq_flags = owner_locks.virtual_memory.acquire();
-    range.partial_uncommit_cursor = cursor;
-    owner_locks.virtual_memory.release(irq_flags);
+    r4os_rust_vm_partial(range, 1, cursor, 0, false);
 }
 
 fn clearPartialUncommit(range: *Range) void {
-    const irq_flags = owner_locks.virtual_memory.acquire();
-    range.partial_uncommit_base = 0;
-    range.partial_uncommit_len = 0;
-    range.partial_uncommit_cursor = 0;
-    range.partial_uncommit_accounted = false;
-    owner_locks.virtual_memory.release(irq_flags);
+    r4os_rust_vm_partial(range, 2, 0, 0, false);
 }
 
 fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) Error!void {
@@ -1498,14 +1073,14 @@ fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) 
         range.partial_uncommit_cursor
     else
         start;
-    var committed = range.commit_span_head;
+    var committed = range.commit_span_head.get();
     while (virt < end) {
         // Commit metadata is ordered and remains intact until this request
         // completes. Resume through its spans, jumping over reserved holes.
         while (committed) |slot| {
             const span = &commit_spans[slot];
             if (span.base + span.len > virt) break;
-            committed = span.next;
+            committed = span.next.get();
         }
         const slot = committed orelse break;
         const span = &commit_spans[slot];
@@ -1550,66 +1125,19 @@ fn uncommitDemandSpan(range: *Range, start: u64, len: u64, skip_unmapped: bool) 
 }
 
 fn uncommitPage(range: *Range, virt: u64, count_logical_commit: bool) Error!void {
-    const page_table_token = paging.acquireMutation();
-    defer paging.releaseMutation(page_table_token);
-    const frame = paging.mappedFrameLocked(virt) orelse return Error.NotCommitted;
-    var release_plan: blocks.PhysicalReleasePlan = undefined;
-    blocks.preparePhysicalRangeRelease(frame, paging.PAGE_SIZE, &release_plan) catch |err| return convertBlockError(err);
-    defer blocks.cancelPhysicalRangeRelease(&release_plan);
-    if (!paging.unmapPageLocked(virt)) {
-        return Error.MapFailed;
-    }
-    // Page-table -> physical-metadata is the canonical order.  The frame is
-    // reusable only after every online CPU acknowledged the invalidation.
-    phys.freeFrame(frame);
-    if (range.resident_bytes >= paging.PAGE_SIZE) {
-        range.resident_bytes -= paging.PAGE_SIZE;
-    } else if (range.resident_bytes != 0) {
-        range.resident_bytes = 0;
-    }
-    if (count_logical_commit) {
-        if (range.committed_bytes >= paging.PAGE_SIZE) {
-            range.committed_bytes -= paging.PAGE_SIZE;
-        } else {
-            range.committed_bytes = 0;
-        }
-    }
-    blocks.commitPhysicalRangeRelease(&release_plan);
+    try policyCheck(r4os_rust_vm_uncommit_extent(range, virt, 0, 1, count_logical_commit, true));
 }
 
 fn uncommitExtent(range: *Range, virt: u64, extent: phys.FrameExtent, count_logical_commit: bool) Error!void {
-    if (extent.count == 0) return Error.NotCommitted;
-    const bytes = extent.count * paging.PAGE_SIZE;
-    const page_table_token = paging.acquireMutation();
-    defer paging.releaseMutation(page_table_token);
-    var release_plan: blocks.PhysicalReleasePlan = undefined;
-    blocks.preparePhysicalRangeRelease(extent.base, bytes, &release_plan) catch |err| return convertBlockError(err);
-    defer blocks.cancelPhysicalRangeRelease(&release_plan);
-    if (!paging.unmapContiguousPagesLocked(virt, extent.base, extent.count)) return Error.MapFailed;
-    phys.freeFrameExtent(extent);
-    if (range.resident_bytes >= bytes) {
-        range.resident_bytes -= bytes;
-    } else if (range.resident_bytes != 0) {
-        range.resident_bytes = 0;
-    }
-    if (count_logical_commit) {
-        if (range.committed_bytes >= bytes) {
-            range.committed_bytes -= bytes;
-        } else {
-            range.committed_bytes = 0;
-        }
-    }
-    blocks.commitPhysicalRangeRelease(&release_plan);
+    try policyCheck(r4os_rust_vm_uncommit_extent(range, virt, extent.base, extent.count, count_logical_commit, false));
 }
 
 fn validateInside(range: Range, offset: u64, len: u64) Error!void {
-    const end = checkedEnd(offset, len) orelse return Error.Overflow;
-    if (end > range.len) return Error.OutsideWindow;
+    try policyCheck(r4os_rust_vm_inside(range.len, offset, len));
 }
 
 fn validateNotGuard(range: Range, base: u64, len: u64) Error!void {
-    if (range.guard_len == 0) return;
-    if (rangesOverlap(base, len, range.guard_base, range.guard_len)) return Error.GuardRange;
+    try policyCheck(r4os_rust_vm_guard(base, len, range.guard_base, range.guard_len));
 }
 
 fn validateUncommitted(range: Range, base: u64, len: u64) Error!void {
@@ -1624,96 +1152,12 @@ fn validateUncommitted(range: Range, base: u64, len: u64) Error!void {
     }
 }
 
-fn validateCommitted(range: Range, base: u64, len: u64) Error!void {
-    if (range.window == .r4x_vm) {
-        if (!commitSpanCovers(range.id, base, len)) return Error.NotCommitted;
-        return;
-    }
-
-    var offset: u64 = 0;
-    while (offset < len) : (offset += paging.PAGE_SIZE) {
-        if (!paging.isMapped(base + offset)) return Error.NotCommitted;
-    }
-}
-
-fn overlapsMapped(base: u64, len: u64) bool {
-    var offset: u64 = 0;
-    while (offset < len) : (offset += paging.PAGE_SIZE) {
-        if (paging.isMapped(base + offset)) return true;
-    }
-    return false;
-}
-
 fn canCommitPages(range: Range, pages: u64) bool {
-    if (!isAppRange(range)) return true;
-    const p = phys.stats();
-    return p.free_frames > pages + APP_SYSTEM_RESERVE_FRAMES;
-}
-
-fn isAppRange(range: Range) bool {
-    return range.owner == .r4x_instance or range.kind == .app_stack or range.kind == .program_image;
+    return r4os_rust_vm_can_commit(&range, pages);
 }
 
 fn addCommitSpan(range_id: u32, base: u64, len: u64) Error!void {
-    const range_index = indexById(range_id) orelse return Error.NotFound;
-    const range = &ranges[range_index];
-    const end = checkedEnd(base, len) orelse return Error.Overflow;
-    hot_path_stats.commit_span_lookups +%= 1;
-
-    var previous: ?u16 = null;
-    var current = range.commit_span_head;
-    var steps: usize = 0;
-    while (current) |slot| {
-        steps += 1;
-        if (commit_spans[slot].base >= base) break;
-        previous = slot;
-        current = commit_spans[slot].next;
-    }
-    recordCommitSpanSteps(steps);
-
-    if (previous) |slot| {
-        const previous_end = checkedEnd(commit_spans[slot].base, commit_spans[slot].len) orelse return Error.Overflow;
-        if (previous_end > base) return Error.Overlap;
-        if (previous_end == base) {
-            if (current) |next_slot| {
-                if (commit_spans[next_slot].base < end) return Error.Overlap;
-                if (commit_spans[next_slot].base == end) {
-                    const next_end = checkedEnd(commit_spans[next_slot].base, commit_spans[next_slot].len) orelse return Error.Overflow;
-                    commit_spans[slot].len = next_end - commit_spans[slot].base;
-                    unlinkCommitSpan(range, next_slot);
-                    releaseCommitSpanSlot(next_slot);
-                    return;
-                }
-            }
-            commit_spans[slot].len = end - commit_spans[slot].base;
-            return;
-        }
-    }
-    if (current) |slot| {
-        if (commit_spans[slot].base < end) return Error.Overlap;
-        if (commit_spans[slot].base == end) {
-            const next_end = checkedEnd(commit_spans[slot].base, commit_spans[slot].len) orelse return Error.Overflow;
-            commit_spans[slot].base = base;
-            commit_spans[slot].len = next_end - base;
-            return;
-        }
-    }
-
-    const slot = allocCommitSpanSlot() orelse return Error.TableFull;
-    commit_spans[slot] = .{
-        .slot_used = true,
-        .range_id = range_id,
-        .base = base,
-        .len = len,
-        .prev = previous,
-        .next = current,
-    };
-    if (previous) |prev_slot| {
-        commit_spans[prev_slot].next = slot;
-    } else {
-        range.commit_span_head = slot;
-    }
-    if (current) |next_slot| commit_spans[next_slot].prev = slot;
+    try policyCheck(r4os_rust_vm_commit_span_change(0, range_id, base, len, null));
 }
 
 fn removeCommitSpan(range_id: u32, base: u64, len: u64) Error!void {
@@ -1722,95 +1166,21 @@ fn removeCommitSpan(range_id: u32, base: u64, len: u64) Error!void {
     try removeCommitSpanReserved(range_id, base, len, &reserved);
 }
 
-fn removeCommitSpanNeedsSlot(range_id: u32, base: u64, len: u64) Error!bool {
-    const range_index = indexById(range_id) orelse return Error.NotFound;
-    const range = &ranges[range_index];
-    const release_end = checkedEnd(base, len) orelse return Error.Overflow;
-    hot_path_stats.commit_span_lookups +%= 1;
-    var current = range.commit_span_head;
-    var steps: usize = 0;
-    while (current) |slot| : (current = commit_spans[slot].next) {
-        steps += 1;
-        const span = commit_spans[slot];
-        if (span.base >= release_end) break;
-        if (!rangesOverlap(base, len, span.base, span.len)) continue;
-        const span_end = checkedEnd(span.base, span.len) orelse return Error.Overflow;
-        if (span.base < base and span_end > release_end) {
-            recordCommitSpanSteps(steps);
-            return true;
-        }
-    }
-    recordCommitSpanSteps(steps);
-    return false;
-}
-
 fn reserveCommitSplitSlot(range_id: u32, base: u64, len: u64) Error!?u16 {
-    if (!try removeCommitSpanNeedsSlot(range_id, base, len)) return null;
-    return allocCommitSpanSlot() orelse Error.TableFull;
+    var reserved: OptionalSlot = .{};
+    try policyCheck(r4os_rust_vm_commit_span_change(3, range_id, base, len, &reserved));
+    return reserved.get();
 }
 
 fn removeCommitSpanReserved(range_id: u32, base: u64, len: u64, reserved: *?u16) Error!void {
-    const range_index = indexById(range_id) orelse return Error.NotFound;
-    const range = &ranges[range_index];
-    const release_end = checkedEnd(base, len) orelse return Error.Overflow;
-    hot_path_stats.commit_span_lookups +%= 1;
-
-    var current = range.commit_span_head;
-    var steps: usize = 0;
-    while (current) |slot| {
-        steps += 1;
-        const next = commit_spans[slot].next;
-        const span_base = commit_spans[slot].base;
-        if (span_base >= release_end) break;
-        const span_end = checkedEnd(span_base, commit_spans[slot].len) orelse return Error.Overflow;
-        if (span_end <= base) {
-            current = next;
-            continue;
-        }
-
-        const keep_left = span_base < base;
-        const keep_right = span_end > release_end;
-        if (keep_left and keep_right) {
-            const right_slot = reserved.* orelse return Error.TableFull;
-            reserved.* = null;
-            const old_next = commit_spans[slot].next;
-            commit_spans[slot].len = base - span_base;
-            commit_spans[right_slot] = .{
-                .slot_used = true,
-                .range_id = range_id,
-                .base = release_end,
-                .len = span_end - release_end,
-                .prev = slot,
-                .next = old_next,
-            };
-            commit_spans[slot].next = right_slot;
-            if (old_next) |next_slot| commit_spans[next_slot].prev = right_slot;
-            break;
-        } else if (keep_left) {
-            commit_spans[slot].len = base - span_base;
-        } else if (keep_right) {
-            commit_spans[slot].base = release_end;
-            commit_spans[slot].len = span_end - release_end;
-            break;
-        } else {
-            unlinkCommitSpan(range, slot);
-            releaseCommitSpanSlot(slot);
-        }
-        current = next;
-    }
-    recordCommitSpanSteps(steps);
+    var raw = OptionalSlot.from(reserved.*);
+    const code = r4os_rust_vm_commit_span_change(1, range_id, base, len, &raw);
+    reserved.* = raw.get();
+    try policyCheck(code);
 }
 
 fn removeCommitSpansForRange(range_id: u32) void {
-    const range_index = indexById(range_id) orelse return;
-    const range = &ranges[range_index];
-    var current = range.commit_span_head;
-    while (current) |slot| {
-        const next = commit_spans[slot].next;
-        releaseCommitSpanSlot(slot);
-        current = next;
-    }
-    range.commit_span_head = null;
+    _ = r4os_rust_vm_commit_span_change(2, range_id, 0, 0, null);
 }
 
 fn commitSpanOverlaps(range_id: u32, base: u64, len: u64) bool {
@@ -1819,25 +1189,7 @@ fn commitSpanOverlaps(range_id: u32, base: u64, len: u64) bool {
 }
 
 fn commitSpanOverlapsForRange(range: *const Range, base: u64, len: u64) bool {
-    const end = checkedEnd(base, len) orelse return false;
-    hot_path_stats.commit_span_lookups +%= 1;
-    var current = range.commit_span_head;
-    var steps: usize = 0;
-    while (current) |slot| : (current = commit_spans[slot].next) {
-        steps += 1;
-        const span = commit_spans[slot];
-        if (span.base >= end) break;
-        const span_end = checkedEnd(span.base, span.len) orelse {
-            recordCommitSpanSteps(steps);
-            return true;
-        };
-        if (span_end > base) {
-            recordCommitSpanSteps(steps);
-            return true;
-        }
-    }
-    recordCommitSpanSteps(steps);
-    return false;
+    return r4os_rust_vm_commit_span_scan(range.commit_span_head, base, len, false);
 }
 
 fn commitSpanCovers(range_id: u32, base: u64, len: u64) bool {
@@ -1846,77 +1198,15 @@ fn commitSpanCovers(range_id: u32, base: u64, len: u64) bool {
 }
 
 fn commitSpanCoversForRange(range: *const Range, base: u64, len: u64) bool {
-    const end = checkedEnd(base, len) orelse return false;
-    hot_path_stats.commit_span_lookups +%= 1;
-    var cursor = base;
-    var current = range.commit_span_head;
-    var steps: usize = 0;
-    while (current) |slot| : (current = commit_spans[slot].next) {
-        steps += 1;
-        const span = commit_spans[slot];
-        const span_end = checkedEnd(span.base, span.len) orelse {
-            recordCommitSpanSteps(steps);
-            return false;
-        };
-        if (span_end <= cursor) continue;
-        if (span.base > cursor) break;
-        cursor = @min(span_end, end);
-        if (cursor == end) {
-            recordCommitSpanSteps(steps);
-            return true;
-        }
-    }
-    recordCommitSpanSteps(steps);
-    return false;
-}
-
-fn allocCommitSpanSlot() ?u16 {
-    const slot = commit_span_free_head orelse return null;
-    commit_span_free_head = commit_spans[slot].next;
-    commit_spans[slot] = .{};
-    commit_span_active_count +|= 1;
-    return slot;
+    return r4os_rust_vm_commit_span_scan(range.commit_span_head, base, len, true);
 }
 
 fn releaseCommitSpanSlot(slot: u16) void {
-    commit_spans[slot] = .{ .next = commit_span_free_head };
-    commit_span_free_head = slot;
-    if (commit_span_active_count != 0) commit_span_active_count -= 1;
-}
-
-fn unlinkCommitSpan(range: *Range, slot: u16) void {
-    const previous = commit_spans[slot].prev;
-    const next = commit_spans[slot].next;
-    if (previous) |prev_slot| {
-        commit_spans[prev_slot].next = next;
-    } else {
-        range.commit_span_head = next;
-    }
-    if (next) |next_slot| commit_spans[next_slot].prev = previous;
+    _ = r4os_rust_vm_commit_span_change(4, 0, slot, 0, null);
 }
 
 fn rangeByAddress(addr: u64) ?*Range {
-    hot_path_stats.range_address_lookups +%= 1;
-    var probes: usize = 0;
-    var low: usize = 0;
-    var high = range_address_count;
-    while (low < high) {
-        probes += 1;
-        const mid = low + (high - low) / 2;
-        if (ranges[range_address_order[mid]].base <= addr) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    recordRangeAddressProbe(probes);
-    if (low == 0) return null;
-    const slot: usize = range_address_order[low - 1];
-    const end = checkedEnd(ranges[slot].base, ranges[slot].len) orelse return null;
-    if (addr < end) {
-        return &ranges[slot];
-    }
-    return null;
+    return &ranges[indexSlot(4, addr) orelse return null];
 }
 
 fn pageStateForFault(range_id: u32, page_index: u64) ?FaultPageState {
@@ -1926,7 +1216,7 @@ fn pageStateForFault(range_id: u32, page_index: u64) ?FaultPageState {
 
 fn pageStateForFaultInRange(range: *const Range, page_index: u64) ?FaultPageState {
     hot_path_stats.page_state_span_lookups +%= 1;
-    var current = range.page_state_span_head;
+    var current = range.page_state_span_head.get();
     var steps: usize = 0;
     while (current) |slot| : (current = page_state_spans[slot].next) {
         steps += 1;
@@ -2176,7 +1466,7 @@ pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32, vm_
     _ = reason;
     const requested_frames = if (requested_frames_raw == 0) 1 else requested_frames_raw;
     var result = reclaim.SourceResult{};
-    if (!initialized) return result;
+    if (!r4os_rust_vm_initialized()) return result;
     // The pager transaction intentionally spans filesystem/block waits and
     // therefore cannot hold the VM owner.
     // Normal VM and lifecycle work remains BSP-owned; AP callers fail closed.
@@ -2237,12 +1527,12 @@ pub fn reclaimEvictFrames(reason: reclaim.Reason, requested_frames_raw: u32, vm_
 pub fn evictableBytes() u64 {
     const owner_irq_flags = owner_locks.virtual_memory.acquire();
     defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized or backing_store.activeBackingResult() == null) return 0;
+    if (!r4os_rust_vm_initialized() or backing_store.activeBackingResult() == null) return 0;
     var bytes: u64 = 0;
     var range_pos: usize = 0;
-    while (range_pos < range_address_count) : (range_pos += 1) {
+    while (range_pos < rangeAddressCount()) : (range_pos += 1) {
         const range = ranges[range_address_order[range_pos]];
-        var current = range.page_state_span_head;
+        var current = range.page_state_span_head.get();
         while (current) |slot| : (current = page_state_spans[slot].next) {
             const span = page_state_spans[slot];
             const evictable_flags = page_state_flag_committed | page_state_flag_resident;
@@ -2257,12 +1547,12 @@ pub fn evictableBytes() u64 {
 pub fn evictableDirtyBytes() u64 {
     const owner_irq_flags = owner_locks.virtual_memory.acquire();
     defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized or backing_store.activeBackingResult() == null) return 0;
+    if (!r4os_rust_vm_initialized() or backing_store.activeBackingResult() == null) return 0;
     var bytes: u64 = 0;
     var range_pos: usize = 0;
-    while (range_pos < range_address_count) : (range_pos += 1) {
+    while (range_pos < rangeAddressCount()) : (range_pos += 1) {
         const range = ranges[range_address_order[range_pos]];
-        var current = range.page_state_span_head;
+        var current = range.page_state_span_head.get();
         while (current) |slot| : (current = page_state_spans[slot].next) {
             const span = page_state_spans[slot];
             const evictable_flags = page_state_flag_committed | page_state_flag_resident | page_state_flag_dirty;
@@ -2278,12 +1568,12 @@ fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8, vm_o
     const token = owner_locks.virtual_memory.acquire();
     var locked = true;
     defer if (locked) owner_locks.virtual_memory.release(token);
-    if (range_address_count == 0) return .{ .outcome = .skipped };
+    if (rangeAddressCount() == 0) return .{ .outcome = .skipped };
     var start_pos: usize = 0;
     var start_page: u64 = 0;
     if (reclaim_cursor_range_slot) |cursor_slot| {
         const raw_position = range_address_position[cursor_slot];
-        if (raw_position != INVALID_RANGE_POSITION and @as(usize, raw_position) < range_address_count) {
+        if (raw_position != INVALID_RANGE_POSITION and @as(usize, raw_position) < rangeAddressCount()) {
             start_pos = raw_position;
             start_page = reclaim_cursor_page;
         }
@@ -2291,7 +1581,7 @@ fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8, vm_o
 
     var visited: usize = 0;
     var range_pos = start_pos;
-    while (visited < range_address_count) : (visited += 1) {
+    while (visited < rangeAddressCount()) : (visited += 1) {
         const range_slot = range_address_order[range_pos];
         var range = &ranges[range_slot];
         hot_path_stats.reclaim_cursor_range_steps +%= 1;
@@ -2301,7 +1591,7 @@ fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8, vm_o
             range.owner_id != 0 and range.owner_id <= std.math.maxInt(u32) and
             (vm_owner_id == null or range.owner_id == vm_owner_id.?))
         {
-            var span_cursor = range.page_state_span_head;
+            var span_cursor = range.page_state_span_head.get();
             while (span_cursor) |span_slot| : (span_cursor = page_state_spans[span_slot].next) {
                 hot_path_stats.reclaim_cursor_span_steps +%= 1;
                 const span = page_state_spans[span_slot];
@@ -2369,7 +1659,7 @@ fn evictOneResidentPage(backing: backing_store.Result, path: [*:0]const u8, vm_o
         }
 
         range_pos += 1;
-        if (range_pos == range_address_count) {
+        if (range_pos == rangeAddressCount()) {
             range_pos = 0;
             hot_path_stats.reclaim_cursor_wraps +%= 1;
         }
@@ -2388,7 +1678,7 @@ fn setReclaimCursorAfterPage(range_pos: usize, next_page: u64) void {
         return;
     }
     var next_pos = range_pos + 1;
-    if (next_pos == range_address_count) {
+    if (next_pos == rangeAddressCount()) {
         next_pos = 0;
         hot_path_stats.reclaim_cursor_wraps +%= 1;
     }
@@ -2626,7 +1916,7 @@ fn makePageStateResult(input: PageStateInput) PageStateResult {
 }
 
 fn validatePageStateInput(input: PageStateInput, result: *PageStateResult) bool {
-    if (!initialized) {
+    if (!r4os_rust_vm_initialized()) {
         result.status = page_state_status_not_initialized;
         result.blockers |= page_state_blocker_not_initialized;
         return false;
@@ -2746,7 +2036,7 @@ fn addPageStateSpan(range_id: u32, first_page: u64, page_count: u64, flags: u32,
     hot_path_stats.page_state_span_lookups +%= 1;
 
     var previous: ?u16 = null;
-    var current = range.page_state_span_head;
+    var current = range.page_state_span_head.get();
     var steps: usize = 0;
     while (current) |current_slot| {
         steps += 1;
@@ -2772,7 +2062,7 @@ fn addPageStateSpan(range_id: u32, first_page: u64, page_count: u64, flags: u32,
     if (previous) |prev_slot| {
         page_state_spans[prev_slot].next = slot;
     } else {
-        range.page_state_span_head = slot;
+        range.page_state_span_head = OptionalSlot.from(slot);
     }
     if (current) |next_slot| page_state_spans[next_slot].prev = slot;
     try coalescePageStateSpansForRange(range);
@@ -2790,7 +2080,7 @@ fn pageStateSet(range_id: u32, first_page: u64, page_count: u64, add_flags: u32,
 
     var changed = false;
     hot_path_stats.page_state_span_lookups +%= 1;
-    var current = range.page_state_span_head;
+    var current = range.page_state_span_head.get();
     var steps: usize = 0;
     while (current) |slot| : (current = page_state_spans[slot].next) {
         steps += 1;
@@ -2822,7 +2112,7 @@ fn pageStateSet(range_id: u32, first_page: u64, page_count: u64, add_flags: u32,
 fn reservePageStateSplitSlots(range: *const Range, first_page: u64, end_page: u64) Error![2]?u16 {
     var needed: usize = 0;
     hot_path_stats.page_state_span_lookups +%= 1;
-    var current = range.page_state_span_head;
+    var current = range.page_state_span_head.get();
     var steps: usize = 0;
     while (current) |slot| : (current = page_state_spans[slot].next) {
         steps += 1;
@@ -2853,7 +2143,7 @@ fn splitPageStateBoundariesReserved(range: *Range, first_page: u64, end_page: u6
 }
 
 fn splitPageStateBoundaryReserved(range: *Range, boundary: u64, reserved: *[2]?u16) Error!void {
-    var current = range.page_state_span_head;
+    var current = range.page_state_span_head.get();
     while (current) |slot| : (current = page_state_spans[slot].next) {
         const span = page_state_spans[slot];
         if (boundary <= span.first_page) return;
@@ -2911,7 +2201,7 @@ fn removePageStateRange(range_id: u32, first_page: u64, page_count: u64) Error!v
 fn removePageStateRangeReserved(range: *Range, first_page: u64, end_page: u64, reserved: *[2]?u16) Error!void {
     try splitPageStateBoundariesReserved(range, first_page, end_page, reserved);
     var removed_pages: u64 = 0;
-    var current = range.page_state_span_head;
+    var current = range.page_state_span_head.get();
     while (current) |slot| {
         const next = page_state_spans[slot].next;
         const span = page_state_spans[slot];
@@ -2932,19 +2222,19 @@ fn removePageStateForRange(range_id: u32) void {
     const range_index = indexById(range_id) orelse return;
     const range = &ranges[range_index];
     var removed_pages: u64 = 0;
-    var current = range.page_state_span_head;
+    var current = range.page_state_span_head.get();
     while (current) |slot| {
         const next = page_state_spans[slot].next;
         removed_pages +%= page_state_spans[slot].page_count;
         releasePageStateSpanSlot(slot);
         current = next;
     }
-    range.page_state_span_head = null;
+    range.page_state_span_head = OptionalSlot.from(null);
     page_state_summary.cleanup_pages +%= removed_pages;
 }
 
 fn coalescePageStateSpansForRange(range: *Range) Error!void {
-    var current = range.page_state_span_head;
+    var current = range.page_state_span_head.get();
     while (current) |slot| {
         const next = page_state_spans[slot].next orelse break;
         const span_end = checkedAdd(page_state_spans[slot].first_page, page_state_spans[slot].page_count) orelse return Error.Overflow;
@@ -2973,7 +2263,7 @@ fn fillPageStateCounts(range_id: u32, first_page: u64, page_count: u64, result: 
     const range = &ranges[range_index];
     var first_slot_seen = false;
     hot_path_stats.page_state_span_lookups +%= 1;
-    var current = range.page_state_span_head;
+    var current = range.page_state_span_head.get();
     var steps: usize = 0;
     while (current) |slot| : (current = page_state_spans[slot].next) {
         steps += 1;
@@ -3103,7 +2393,7 @@ fn unlinkPageStateSpan(range: *Range, slot: u16) void {
     if (previous) |prev_slot| {
         page_state_spans[prev_slot].next = next;
     } else {
-        range.page_state_span_head = next;
+        range.page_state_span_head = OptionalSlot.from(next);
     }
     if (next) |next_slot| page_state_spans[next_slot].prev = previous;
 }
@@ -3116,32 +2406,6 @@ fn alignDownValue(value: u64, alignment: u64) u64 {
     return value & ~(alignment - 1);
 }
 
-fn largestFreeInWindow(window: Window) FreeSpan {
-    const def = windowDef(window);
-    var best: FreeSpan = .{ .base = def.base, .len = 0 };
-    var cursor = def.base;
-    const window_end = checkedEnd(def.base, def.len) orelse return best;
-
-    var pos = lowerBoundAddress(def.base);
-    while (pos < range_address_count) : (pos += 1) {
-        const range = ranges[range_address_order[pos]];
-        if (range.base >= window_end) break;
-        if (range.window != window) continue;
-        if (range.base > cursor) {
-            const free_len = range.base - cursor;
-            if (free_len > best.len) best = .{ .base = cursor, .len = free_len };
-        }
-        const range_end = checkedEnd(range.base, range.len) orelse return best;
-        if (range_end > cursor) cursor = range_end;
-    }
-
-    if (cursor < window_end and window_end - cursor > best.len) {
-        best = .{ .base = cursor, .len = window_end - cursor };
-    }
-
-    return best;
-}
-
 fn infoFromRange(range: Range) RangeInfo {
     return .{
         .id = range.id,
@@ -3150,7 +2414,7 @@ fn infoFromRange(range: Range) RangeInfo {
         .owner = range.owner,
         .owner_id = range.owner_id,
         .status = range.status,
-        .name = range.name,
+        .name = range.name_ptr[0..range.name_len],
         .flags = range.flags,
         .base = range.base,
         .len = range.len,
@@ -3164,57 +2428,19 @@ fn infoFromRange(range: Range) RangeInfo {
     };
 }
 
-fn freeSlot() ?usize {
-    hot_path_stats.range_free_slot_lookups +%= 1;
-    var probes: usize = 0;
-    while (probes < ranges.len) : (probes += 1) {
-        const i = (next_free_range_slot + probes) % ranges.len;
-        if (!ranges[i].slot_used or ranges[i].status == .released) {
-            recordFreeSlotProbe(probes + 1);
-            next_free_range_slot = (i + 1) % ranges.len;
-            return i;
-        }
-    }
-    recordFreeSlotProbe(probes);
-    return null;
-}
-
 fn lowerBoundAddress(base: u64) usize {
-    var low: usize = 0;
-    var high = range_address_count;
-    while (low < high) {
-        const mid = low + (high - low) / 2;
-        if (ranges[range_address_order[mid]].base < base) {
-            low = mid + 1;
-        } else {
-            high = mid;
-        }
-    }
-    return low;
-}
-
-fn insertRangeAddressIndex(slot: usize) void {
-    const pos = lowerBoundAddress(ranges[slot].base);
-    var i = range_address_count;
-    while (i > pos) {
-        range_address_order[i] = range_address_order[i - 1];
-        range_address_position[range_address_order[i]] = @intCast(i);
-        i -= 1;
-    }
-    range_address_order[pos] = @intCast(slot);
-    range_address_position[slot] = @intCast(pos);
-    range_address_count += 1;
+    return r4os_rust_vm_index_query(3, base);
 }
 
 fn removeRangeAddressIndex(slot: usize) void {
     const raw_pos = range_address_position[slot];
     if (raw_pos == INVALID_RANGE_POSITION) return;
     const pos: usize = raw_pos;
-    if (pos >= range_address_count or range_address_order[pos] != slot) return;
+    if (pos >= rangeAddressCount() or range_address_order[pos] != slot) return;
 
     if (reclaim_cursor_range_slot != null and reclaim_cursor_range_slot.? == slot) {
-        if (range_address_count > 1) {
-            const next_pos = if (pos + 1 < range_address_count) pos + 1 else 0;
+        if (rangeAddressCount() > 1) {
+            const next_pos = if (pos + 1 < rangeAddressCount()) pos + 1 else 0;
             reclaim_cursor_range_slot = range_address_order[next_pos];
             reclaim_cursor_page = 0;
         } else {
@@ -3223,165 +2449,11 @@ fn removeRangeAddressIndex(slot: usize) void {
         }
     }
 
-    var i = pos;
-    while (i + 1 < range_address_count) : (i += 1) {
-        range_address_order[i] = range_address_order[i + 1];
-        range_address_position[range_address_order[i]] = @intCast(i);
-    }
-    range_address_count -= 1;
-    range_address_position[slot] = INVALID_RANGE_POSITION;
-}
-
-fn allocId() Error!u32 {
-    if (next_id == 0) return Error.Overflow;
-    const id = next_id;
-    next_id += 1;
-    return id;
+    _ = r4os_rust_vm_index_change(3, 0, slot);
 }
 
 fn indexById(id: u32) ?usize {
-    hot_path_stats.range_index_lookups +%= 1;
-    var probes: usize = 0;
-    var pos = rangeIdIndexStart(id);
-    while (probes < range_id_index.len) : (probes += 1) {
-        const entry = range_id_index[pos];
-        switch (entry.state) {
-            .empty => {
-                recordRangeIndexProbe(probes + 1);
-                hot_path_stats.range_index_misses +%= 1;
-                return null;
-            },
-            .tombstone => {},
-            .used => {
-                if (entry.id == id) {
-                    recordRangeIndexProbe(probes + 1);
-                    if (entry.slot < ranges.len and ranges[entry.slot].id == id and ranges[entry.slot].active()) {
-                        hot_path_stats.range_index_hits +%= 1;
-                        return entry.slot;
-                    }
-                    hot_path_stats.range_index_misses +%= 1;
-                    return null;
-                }
-            },
-        }
-        pos = (pos + 1) % range_id_index.len;
-    }
-    recordRangeIndexProbe(probes);
-    hot_path_stats.range_index_misses +%= 1;
-    return null;
-}
-
-fn rangeIdIndexStart(id: u32) usize {
-    const mixed = @as(u64, id) *% 11400714819323198485;
-    return @intCast(mixed % RANGE_ID_INDEX_CAPACITY);
-}
-
-fn insertRangeIdIndex(id: u32, slot: usize) bool {
-    if (insertRangeIdIndexNoRebuild(id, slot)) return true;
-    rebuildRangeIdIndex();
-    if (insertRangeIdIndexNoRebuild(id, slot)) return true;
-    hot_path_stats.range_index_insert_failures +%= 1;
-    return false;
-}
-
-fn insertRangeIdIndexNoRebuild(id: u32, slot: usize) bool {
-    var first_tombstone: ?usize = null;
-    var probes: usize = 0;
-    var pos = rangeIdIndexStart(id);
-    while (probes < range_id_index.len) : (probes += 1) {
-        switch (range_id_index[pos].state) {
-            .empty => {
-                const target = first_tombstone orelse pos;
-                if (range_id_index[target].state == .tombstone and range_id_index_tombstones != 0) {
-                    range_id_index_tombstones -= 1;
-                }
-                range_id_index[target] = .{ .state = .used, .id = id, .slot = slot };
-                range_id_index_entries += 1;
-                return true;
-            },
-            .tombstone => {
-                if (first_tombstone == null) first_tombstone = pos;
-            },
-            .used => {
-                if (range_id_index[pos].id == id) {
-                    range_id_index[pos].slot = slot;
-                    return true;
-                }
-            },
-        }
-        pos = (pos + 1) % range_id_index.len;
-    }
-    if (first_tombstone) |target| {
-        range_id_index[target] = .{ .state = .used, .id = id, .slot = slot };
-        range_id_index_entries += 1;
-        if (range_id_index_tombstones != 0) range_id_index_tombstones -= 1;
-        return true;
-    }
-    return false;
-}
-
-fn removeRangeIdIndex(id: u32) void {
-    var probes: usize = 0;
-    var pos = rangeIdIndexStart(id);
-    while (probes < range_id_index.len) : (probes += 1) {
-        switch (range_id_index[pos].state) {
-            .empty => return,
-            .tombstone => {},
-            .used => {
-                if (range_id_index[pos].id == id) {
-                    range_id_index[pos] = .{ .state = .tombstone };
-                    if (range_id_index_entries != 0) range_id_index_entries -= 1;
-                    range_id_index_tombstones += 1;
-                    return;
-                }
-            },
-        }
-        pos = (pos + 1) % range_id_index.len;
-    }
-}
-
-fn rebuildRangeIdIndex() void {
-    hot_path_stats.range_index_rebuilds +%= 1;
-    var i: usize = 0;
-    while (i < range_id_index.len) : (i += 1) range_id_index[i] = .{};
-    range_id_index_entries = 0;
-    range_id_index_tombstones = 0;
-    i = 0;
-    while (i < ranges.len) : (i += 1) {
-        const range = ranges[i];
-        if (!range.active()) continue;
-        if (!insertRangeIdIndexNoRebuild(range.id, i)) {
-            hot_path_stats.range_index_insert_failures +%= 1;
-            return;
-        }
-    }
-}
-
-fn recordRangeIndexProbe(probes: usize) void {
-    const p: u32 = @intCast(@min(probes, std.math.maxInt(u32)));
-    hot_path_stats.range_index_probe_last = p;
-    hot_path_stats.range_index_probe_total +%= p;
-    if (p > hot_path_stats.range_index_probe_max) hot_path_stats.range_index_probe_max = p;
-}
-
-fn recordFreeSlotProbe(probes: usize) void {
-    const p: u32 = @intCast(@min(probes, std.math.maxInt(u32)));
-    hot_path_stats.range_free_slot_probe_last = p;
-    hot_path_stats.range_free_slot_probe_total +%= p;
-    if (p > hot_path_stats.range_free_slot_probe_max) hot_path_stats.range_free_slot_probe_max = p;
-}
-
-fn recordRangeAddressProbe(probes: usize) void {
-    const p: u32 = @intCast(@min(probes, std.math.maxInt(u32)));
-    hot_path_stats.range_address_probe_last = p;
-    hot_path_stats.range_address_probe_total +%= p;
-    if (p > hot_path_stats.range_address_probe_max) hot_path_stats.range_address_probe_max = p;
-}
-
-fn recordCommitSpanSteps(steps: usize) void {
-    const value: u32 = @intCast(@min(steps, std.math.maxInt(u32)));
-    hot_path_stats.commit_span_steps +%= value;
-    if (value > hot_path_stats.commit_span_step_max) hot_path_stats.commit_span_step_max = value;
+    return indexSlot(1, id);
 }
 
 fn recordPageStateSpanSteps(steps: usize) void {
@@ -3394,11 +2466,18 @@ pub fn hotPathStats() HotPathStats {
     const owner_irq_flags = owner_locks.virtual_memory.acquire();
     defer owner_locks.virtual_memory.release(owner_irq_flags);
     var out = hot_path_stats;
-    out.range_index_capacity = @intCast(RANGE_ID_INDEX_CAPACITY);
-    out.range_index_entries = @intCast(@min(range_id_index_entries, std.math.maxInt(u32)));
-    out.range_index_tombstones = @intCast(@min(range_id_index_tombstones, std.math.maxInt(u32)));
-    out.range_address_entries = @intCast(@min(range_address_count, std.math.maxInt(u32)));
-    out.commit_span_active = commit_span_active_count;
+    var resident: ResidentStats = undefined;
+    r4os_rust_vm_transaction_stats(&resident);
+    inline for (@typeInfo(ResidentStats).@"struct".fields) |field|
+        @field(out, field.name) = @field(resident, field.name);
+    var indices: IndexStats = undefined;
+    r4os_rust_vm_index_stats(&indices);
+    inline for (@typeInfo(IndexStats).@"struct".fields) |field|
+        @field(out, field.name) = @field(indices, field.name);
+    var commits: CommitSpanStats = undefined;
+    r4os_rust_vm_commit_span_stats(&commits);
+    inline for (@typeInfo(CommitSpanStats).@"struct".fields) |field|
+        @field(out, field.name) = @field(commits, field.name);
     out.page_state_span_active = page_state_span_active_count;
     return out;
 }
@@ -3406,7 +2485,7 @@ pub fn hotPathStats() HotPathStats {
 pub fn metadataInvariant() bool {
     const owner_irq_flags = owner_locks.virtual_memory.acquire();
     defer owner_locks.virtual_memory.release(owner_irq_flags);
-    if (!initialized or range_address_count != range_id_index_entries) return false;
+    if (!r4os_rust_vm_initialized() or rangeAddressCount() != rangeIndexEntries()) return false;
     var commit_seen: [MAX_COMMIT_SPANS / 64]u64 = .{0} ** (MAX_COMMIT_SPANS / 64);
     var page_seen: [MAX_PAGE_STATE_SPANS / 64]u64 = .{0} ** (MAX_PAGE_STATE_SPANS / 64);
     var active_ranges: usize = 0;
@@ -3422,20 +2501,20 @@ pub fn metadataInvariant() bool {
         }
         active_ranges += 1;
         const position = range_address_position[slot_index];
-        if (position == INVALID_RANGE_POSITION or @as(usize, position) >= range_address_count or
+        if (position == INVALID_RANGE_POSITION or @as(usize, position) >= rangeAddressCount() or
             range_address_order[position] != slot_index or rawIndexById(range.id) != slot_index)
         {
             return false;
         }
 
         var previous_commit: ?u16 = null;
-        var commit_cursor = range.commit_span_head;
+        var commit_cursor = range.commit_span_head.get();
         var commit_steps: usize = 0;
-        while (commit_cursor) |span_slot| : (commit_cursor = commit_spans[span_slot].next) {
+        while (commit_cursor) |span_slot| : (commit_cursor = commit_spans[span_slot].next.get()) {
             commit_steps += 1;
             if (commit_steps > MAX_COMMIT_SPANS or !markMetadataSeen(commit_seen[0..], span_slot)) return false;
             const span = commit_spans[span_slot];
-            if (!span.slot_used or span.range_id != range.id or span.prev != previous_commit or span.len == 0) return false;
+            if (!span.slot_used or span.range_id != range.id or span.prev.get() != previous_commit or span.len == 0) return false;
             if (previous_commit) |previous_slot| {
                 const previous_end = checkedEnd(commit_spans[previous_slot].base, commit_spans[previous_slot].len) orelse return false;
                 if (previous_end >= span.base) return false;
@@ -3445,7 +2524,7 @@ pub fn metadataInvariant() bool {
         }
 
         var previous_page: ?u16 = null;
-        var page_cursor = range.page_state_span_head;
+        var page_cursor = range.page_state_span_head.get();
         var page_steps: usize = 0;
         while (page_cursor) |span_slot| : (page_cursor = page_state_spans[span_slot].next) {
             page_steps += 1;
@@ -3461,11 +2540,11 @@ pub fn metadataInvariant() bool {
             linked_page_spans += 1;
         }
     }
-    if (active_ranges != range_address_count or linked_commit_spans != commit_span_active_count or
+    if (active_ranges != rangeAddressCount() or linked_commit_spans != commitSpanActiveCount() or
         linked_page_spans != page_state_span_active_count) return false;
 
     var position: usize = 0;
-    while (position < range_address_count) : (position += 1) {
+    while (position < rangeAddressCount()) : (position += 1) {
         const slot: usize = range_address_order[position];
         if (!ranges[slot].active() or range_address_position[slot] != position) return false;
         if (position != 0) {
@@ -3476,8 +2555,8 @@ pub fn metadataInvariant() bool {
     }
 
     var free_commit_count: usize = 0;
-    var free_commit = commit_span_free_head;
-    while (free_commit) |span_slot| : (free_commit = commit_spans[span_slot].next) {
+    var free_commit = commitSpanFreeHead();
+    while (free_commit) |span_slot| : (free_commit = commit_spans[span_slot].next.get()) {
         free_commit_count += 1;
         if (free_commit_count > MAX_COMMIT_SPANS or commit_spans[span_slot].slot_used or
             !markMetadataSeen(commit_seen[0..], span_slot)) return false;
@@ -3498,18 +2577,7 @@ pub fn metadataInvariant() bool {
 }
 
 fn rawIndexById(id: u32) ?usize {
-    var probes: usize = 0;
-    var position = rangeIdIndexStart(id);
-    while (probes < range_id_index.len) : (probes += 1) {
-        const entry = range_id_index[position];
-        switch (entry.state) {
-            .empty => return null,
-            .tombstone => {},
-            .used => if (entry.id == id) return entry.slot,
-        }
-        position = (position + 1) % range_id_index.len;
-    }
-    return null;
+    return indexSlot(2, id);
 }
 
 fn markMetadataSeen(seen: []u64, raw_index: u16) bool {
@@ -3536,33 +2604,87 @@ fn firstOwnedRange(owner: blocks.Owner, owner_id: u64, kind: ?blocks.Kind) ?u32 
     return null;
 }
 
-fn overlapsExisting(base: u64, len: u64) bool {
-    const end = checkedEnd(base, len) orelse return true;
-    const pos = lowerBoundAddress(base);
-    if (pos > 0) {
-        const previous = ranges[range_address_order[pos - 1]];
-        const previous_end = checkedEnd(previous.base, previous.len) orelse return true;
-        if (previous_end > base) return true;
-    }
-    if (pos < range_address_count) {
-        const next = ranges[range_address_order[pos]];
-        if (next.base < end) return true;
-    }
-    return false;
+const RawWindowDef = extern struct { base: u64, len: u64, name: [*]const u8, name_len: usize };
+const FitRecord = extern struct { base: u64, len: u64, window: u8 };
+extern fn r4os_rust_vm_window(window: u8, output: *RawWindowDef) void;
+extern fn r4os_rust_vm_normalize(value: u64, alignment: bool, output: *u64) u32;
+extern fn r4os_rust_vm_inside(range_len: u64, offset: u64, len: u64) u32;
+extern fn r4os_rust_vm_guard(base: u64, len: u64, guard_base: u64, guard_len: u64) u32;
+extern fn r4os_rust_vm_overlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) bool;
+extern fn r4os_rust_vm_first_fit(window: u8, len: u64, alignment: u64, output: *u64) u32;
+fn errorCode(err: Error) u32 {
+    return switch (err) {
+        Error.NotInitialized => 1,
+        Error.TableFull => 2,
+        Error.EmptyRange => 3,
+        Error.BadAlignment => 4,
+        Error.Overflow => 5,
+        Error.NoSpace => 6,
+        Error.Overlap => 7,
+        Error.NotFound => 8,
+        Error.AlreadyCommitted => 9,
+        Error.NotCommitted => 10,
+        Error.GuardRange => 11,
+        Error.OutOfMemory => 12,
+        Error.MapFailed => 13,
+        Error.Busy => 14,
+        Error.OutsideWindow => 15,
+    };
+}
+fn policyCheck(code: u32) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => Error.NotInitialized,
+        2 => Error.TableFull,
+        3 => Error.EmptyRange,
+        4 => Error.BadAlignment,
+        5 => Error.Overflow,
+        6 => Error.NoSpace,
+        7 => Error.Overlap,
+        8 => Error.NotFound,
+        9 => Error.AlreadyCommitted,
+        10 => Error.NotCommitted,
+        11 => Error.GuardRange,
+        12 => Error.OutOfMemory,
+        13 => Error.MapFailed,
+        14 => Error.Busy,
+        15 => Error.OutsideWindow,
+        else => unreachable,
+    };
+}
+// Fixed resident metadata readers for the still active legacy range owner.
+// Caller retains the VM owner; no state pointer or callback leaves this cut.
+export fn r4os_zig_vm_fit_start(base: u64, count: *usize) callconv(.c) usize {
+    count.* = rangeAddressCount();
+    return lowerBoundAddress(base);
+}
+export fn r4os_zig_vm_fit_record(position: usize, output: *FitRecord) callconv(.c) bool {
+    if (position >= rangeAddressCount()) return false;
+    const range = &ranges[range_address_order[position]];
+    output.* = .{ .base = range.base, .len = range.len, .window = @intFromEnum(range.window) };
+    return true;
+}
+comptime {
+    if (@sizeOf(RawWindowDef) != 32 or @sizeOf(FitRecord) != 24)
+        @compileError("Rust VM policy C layout mismatch");
 }
 
 fn windowDef(window: Window) WindowDef {
-    return WINDOWS[@intFromEnum(window)];
+    var raw: RawWindowDef = undefined;
+    r4os_rust_vm_window(@intFromEnum(window), &raw);
+    return .{ .base = raw.base, .len = raw.len, .name = raw.name[0..raw.name_len] };
 }
 
 fn normalizeLen(len: u64) Error!u64 {
-    if (len == 0) return Error.EmptyRange;
-    return alignUpChecked(len, paging.PAGE_SIZE) orelse return Error.Overflow;
+    var normalized: u64 = undefined;
+    try policyCheck(r4os_rust_vm_normalize(len, false, &normalized));
+    return normalized;
 }
 
 fn normalizeAlignment(alignment: u64) Error!u64 {
-    if (alignment < paging.PAGE_SIZE or !isPowerOfTwo(alignment)) return Error.BadAlignment;
-    return alignment;
+    var normalized: u64 = undefined;
+    try policyCheck(r4os_rust_vm_normalize(alignment, true, &normalized));
+    return normalized;
 }
 
 fn checkedEnd(base: u64, len: u64) ?u64 {
@@ -3589,16 +2711,6 @@ fn alignUpChecked(value: u64, alignment: u64) ?u64 {
     return sum & ~add;
 }
 
-fn checkedAddInto(target: *u64, value: u64, overflow: *bool) void {
-    const next = target.* +% value;
-    if (next < target.*) {
-        overflow.* = true;
-        target.* = ~@as(u64, 0);
-    } else {
-        target.* = next;
-    }
-}
-
 fn isAligned(value: u64, alignment: u64) bool {
     return (value & (alignment - 1)) == 0;
 }
@@ -3608,9 +2720,7 @@ fn isPowerOfTwo(value: u64) bool {
 }
 
 fn rangesOverlap(a_base: u64, a_len: u64, b_base: u64, b_len: u64) bool {
-    const a_end = checkedEnd(a_base, a_len) orelse return true;
-    const b_end = checkedEnd(b_base, b_len) orelse return true;
-    return a_base < b_end and b_base < a_end;
+    return r4os_rust_vm_overlap(a_base, a_len, b_base, b_len);
 }
 
 fn convertBlockError(err: blocks.Error) Error {

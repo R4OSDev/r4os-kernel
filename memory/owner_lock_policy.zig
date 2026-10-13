@@ -11,8 +11,12 @@ pub const Rank = struct {
     pub const serial_output: u8 = 80;
 };
 
+extern fn r4os_rust_owner_order(u8, u8) callconv(.c) bool;
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub fn orderAllowed(previous_rank: u8, requested_rank: u8) bool {
-    return previous_rank == 0 or previous_rank < requested_rank;
+    return r4os_rust_owner_order(previous_rank, requested_rank);
 }
 
 test "owner ranks admit the canonical memory and terminal logging order" {

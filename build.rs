@@ -1,6 +1,7 @@
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 fn main() {
+    println!("cargo::rustc-check-cfg=cfg(r4os_owner_fixture)");
     println!("cargo::rerun-if-env-changed=R4OS_KERNEL_BUILD_CONFIG");
     println!("cargo::rerun-if-changed=VERSION.R4S");
     let path = env::var("R4OS_KERNEL_BUILD_CONFIG").expect(

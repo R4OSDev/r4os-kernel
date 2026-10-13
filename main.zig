@@ -137,12 +137,27 @@ export fn r4os_zig_boot_action(action: u32) callconv(.c) bool {
         29 => {
             _ = net_core.startDhcpTask();
         },
-        30 => return if (comptime config.enable_boot_selftests) sched_sync.selfTest() else true,
-        31 => return if (comptime config.enable_boot_selftests or config.enable_block_dispatch_selftest) block_storage.parallelDispatchSelfTest() else true,
+        30 => {
+            if (comptime config.enable_boot_selftests) {
+                return sched_sync.selfTest();
+            }
+            return true;
+        },
+        31 => {
+            if (comptime config.enable_boot_selftests or config.enable_block_dispatch_selftest) {
+                return block_storage.parallelDispatchSelfTest();
+            }
+            return true;
+        },
         32 => {
             _ = usb_hid_boot.startPollTask();
         },
-        33 => return if (comptime config.enable_boot_selftests) sched_scheduler.prioritySelfTest() else true,
+        33 => {
+            if (comptime config.enable_boot_selftests) {
+                return sched_scheduler.prioritySelfTest();
+            }
+            return true;
+        },
         34 => boot_status.statusLine(if (comptime config.enable_boot_selftests)
             "BOOTSELFTEST OK heap=1 page_tables=1 sync=1 priority=1\r\n"
         else

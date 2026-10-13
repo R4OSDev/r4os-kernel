@@ -1,4 +1,5 @@
-// Kernel-Heap v3 (0.56.6): Boundary-Tags + segregierte Free-Listen.
+// Kernel-Heap v3: Rust-Besitzer unter Rust/memory/heap.rs; diese Fassade
+// behaelt die bisherigen Aufrufer und Diagnosefaelle.
 //
 // Ersetzt die flache Block-Tabelle (8192 Slots, lineare Scans, Coalesce mit
 // Restart-Schleife) durch klassische in-band Boundary-Tags:
@@ -31,18 +32,17 @@
 
 const paging = @import("paging.zig");
 const virt = @import("virt.zig");
-const map = @import("map.zig");
 const blocks = @import("blocks.zig");
 const heap_policy = @import("heap_policy.zig");
 const phys = @import("phys.zig");
-const owner_locks = @import("owner_locks.zig");
 const k = @import("../kernel/log.zig");
 const task_context = @import("../sched/task_context.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const sync = @import("../sched/sync.zig");
-const percpu = @import("../arch/x86_64/percpu.zig");
 
-const HEAP_BASE: u64 = virt.windowBase(.kernel_heap);
+// Read-only C-layout default for callers; the active allocator is Rust.
+// The reservation cut checks this projection against the window owner.
+const HEAP_BASE: u64 = 0xffff_ff10_0000_0000;
 const PAGE_SIZE: usize = 4096;
 const WINDOW_BYTES: usize = 1024 * 1024 * 1024;
 const CAP_MIN_BYTES: usize = 32 * 1024 * 1024;
@@ -65,7 +65,7 @@ pub const FreeResult = enum {
     size_mismatch,
 };
 
-pub const Stats = struct {
+pub const Stats = extern struct {
     base: u64 = HEAP_BASE,
     pages: usize = 0,
     capacity_bytes: usize = 0,
@@ -98,279 +98,123 @@ pub const Stats = struct {
     bootstrap_bump_active: bool = false,
 };
 
-pub const MetadataRange = struct {
+pub const MetadataRange = extern struct {
     base: u64 = 0,
     len: u64 = 0,
 };
 
-const Control = struct {
-    bins: [BIN_COUNT]u64 = .{NONE} ** BIN_COUNT,
-    heap_top: usize = 0,
-    committed_pages: usize = 0,
-    cap_pages: usize = 0,
-    used_bytes: usize = 0,
-    active_blocks: usize = 0,
-    free_blocks: usize = 0,
-    free_bytes: usize = 0,
-    range_id: u32 = 0,
-    initialized: bool = false,
-    in_heap: bool = false,
-    growth_cleanup_pending: bool = false,
-    reentry_reported: bool = false,
-    allocation_errors: u64 = 0,
-    invalid_free_errors: u64 = 0,
-    double_free_errors: u64 = 0,
-    size_mismatch_errors: u64 = 0,
-    oom_errors: u64 = 0,
-    reentry_errors: u64 = 0,
-    next_growth_pages: usize = heap_policy.min_growth_pages,
-    pending_uncommit_start: usize = 0,
-    pending_uncommit_bytes: usize = 0,
-    pending_uncommit_pressure: bool = false,
-    commit_calls: u64 = 0,
-    commit_failures: u64 = 0,
-    committed_pages_total: u64 = 0,
-    uncommit_calls: u64 = 0,
-    uncommit_failures: u64 = 0,
-    uncommitted_pages_total: u64 = 0,
-    release_suppressed: u64 = 0,
-    pressure_releases: u64 = 0,
-    poison_bytes: u64 = 0,
+const RawUnwind = extern struct {
+    counter: ?*u32 = null,
+    context_present: bool = false,
+    active: bool = false,
 };
+extern fn r4os_rust_heap_init() bool;
+extern fn r4os_rust_heap_alloc(size: usize, alignment: usize) ?[*]u8;
+extern fn r4os_rust_heap_free(pointer: [*]u8, len: usize) u8;
+extern fn r4os_rust_heap_realloc(pointer: [*]u8, len: usize, size: usize, alignment: usize) ?[*]u8;
+extern fn r4os_rust_heap_stats(output: *Stats) void;
+extern fn r4os_rust_heap_metadata(output: *MetadataRange) void;
+extern fn r4os_rust_heap_boot_invariant() bool;
+extern fn r4os_rust_heap_growing() bool;
+extern fn r4os_rust_heap_initialized() bool;
+extern fn r4os_rust_heap_allocator_probe() bool;
 
-var control: Control = .{};
-var growth_active: u8 = 0;
+// These cuts retain the old task/scheduler/wait and VM owners. No Rust
+// control reference crosses them; blocking growth runs after owner release.
 var growth_waiters: sync.WaitQueue = sync.WaitQueue.init();
-
-pub fn init() bool {
-    control = .{};
-    control.range_id = virt.reserveAt(.{
-        .window = .kernel_heap,
-        .base = HEAP_BASE,
-        .kind = .kernel_heap,
-        .owner = .kernel,
-        .name = "kernel-heap",
-        .len = WINDOW_BYTES,
-        .flags = paging.WRITABLE,
-    }) catch 0;
-    if (control.range_id == 0) return false;
-
-    const summary = map.summarize();
-    var cap_bytes: usize = @intCast(summary.usable_page_bytes / 4);
-    if (cap_bytes < CAP_MIN_BYTES) cap_bytes = CAP_MIN_BYTES;
-    if (cap_bytes > WINDOW_BYTES) cap_bytes = WINDOW_BYTES;
-    control.cap_pages = cap_bytes / PAGE_SIZE;
-
-    control.initialized = true;
-    var guard = enterHeap() orelse return false;
-    defer leaveHeap(guard);
-    if (!growCommitted(MIN_COMMITTED_PAGES * PAGE_SIZE, &guard)) {
-        control.initialized = false;
-        return false;
-    }
+var growth_predicate_context: u8 = 0;
+export fn r4os_zig_heap_unwind_enter(output: *RawUnwind) callconv(.c) void {
+    const token = task_context.enterUnwind();
+    output.* = .{ .counter = token.counter, .context_present = token.context_present, .active = token.active };
+}
+export fn r4os_zig_heap_unwind_leave(token: *const RawUnwind) callconv(.c) bool {
+    return task_context.leaveUnwind(.{ .counter = token.counter, .context_present = token.context_present, .active = token.active });
+}
+export fn r4os_zig_heap_can_wait() callconv(.c) bool {
+    const current = scheduler.current() orelse return false;
+    return current.preempt_disable_depth == 0 and current.held_lock_count == 0;
+}
+fn growthStillActive(_: *anyopaque) bool {
+    return r4os_rust_heap_growing();
+}
+export fn r4os_zig_heap_wait_growth() callconv(.c) bool {
+    if (@import("builtin").is_test) @panic("kernel heap wait requested by host fixture");
+    return growth_waiters.waitUnless(sync.WAIT_FOREVER, "heap-growth", growthStillActive, &growth_predicate_context) == .signaled;
+}
+export fn r4os_zig_heap_wake_growth() callconv(.c) void {
+    if (@import("builtin").is_test) @panic("kernel heap wake requested by host fixture");
+    _ = growth_waiters.wakeAll();
+}
+export fn r4os_zig_heap_reserve(base: u64, bytes: u64) callconv(.c) u32 {
+    if (@import("builtin").is_test) @panic("kernel heap VM reserve requested by host fixture");
+    if (base != virt.windowBase(.kernel_heap)) return 0;
+    return virt.reserveAt(.{ .window = .kernel_heap, .base = base, .kind = .kernel_heap, .owner = .kernel, .name = "kernel-heap", .len = bytes, .flags = paging.WRITABLE }) catch 0;
+}
+export fn r4os_zig_heap_commit(id: u32, offset: u64, bytes: u64) callconv(.c) bool {
+    if (@import("builtin").is_test) @panic("kernel heap VM commit requested by host fixture");
+    virt.commit(id, offset, bytes) catch return false;
     return true;
 }
-
-pub fn alloc(size: usize, alignment: usize) ?[]u8 {
-    var guard = enterHeap() orelse return allocFailure();
-    defer leaveHeap(guard);
-    if (!control.initialized or size == 0) return allocFailure();
-    const align_value = normalizeAlignment(alignment) orelse return allocFailure();
-    const need = blockSizeFor(size) orelse return oomFailure();
-    if (need > control.cap_pages * PAGE_SIZE) return oomFailure();
-
-    while (true) {
-        if (align_value <= GRANULE) {
-            if (findFit(need)) |off| return placeBlock(off, need, size);
-        } else if (findAlignedFit(need, align_value)) |found| {
-            return placeAligned(found.offset, found.payload, need, size);
-        }
-        const padding = if (align_value <= GRANULE) MIN_BLOCK else checkedAdd(align_value, MIN_BLOCK) orelse return oomFailure();
-        const grow_need = checkedAdd(need, padding) orelse return oomFailure();
-        if (!growCommitted(grow_need, &guard)) return oomFailure();
-    }
+export fn r4os_zig_heap_uncommit(id: u32, offset: u64, bytes: u64) callconv(.c) bool {
+    if (@import("builtin").is_test) @panic("kernel heap VM uncommit requested by host fixture");
+    virt.uncommit(id, offset, bytes) catch return false;
+    return true;
 }
-
+export fn r4os_zig_heap_fault(kind: u8, offset: u64) callconv(.c) void {
+    if (kind == 0) {
+        k.puts("HEAP REENTRY detected (non-preempt invariant violated)\r\n");
+        return;
+    }
+    k.puts("HEAP CORRUPT kind=");
+    k.puts(switch (kind) {
+        1 => "unlink-header",
+        2 => "unlink-next",
+        3 => "unlink-prev",
+        else => "unknown",
+    });
+    k.puts(" off=0x");
+    k.putHex(offset, 12);
+    k.puts("\r\n");
+}
+pub fn init() bool {
+    return r4os_rust_heap_init();
+}
+pub fn alloc(size: usize, alignment: usize) ?[]u8 {
+    const pointer = r4os_rust_heap_alloc(size, alignment) orelse return null;
+    return pointer[0..size];
+}
 pub fn allocBytes(size: usize) ?[]u8 {
     return alloc(size, 1);
 }
-
 pub fn free(mem: []u8) FreeResult {
-    const guard = enterHeap() orelse return .invalid_pointer;
-    defer leaveHeap(guard);
-    if (!control.initialized or mem.len == 0) return recordInvalidFree();
-    const check = validateUsedBlock(mem.ptr, mem.len) orelse return recordInvalidFree();
-    switch (check.kind) {
-        .used_ok => {},
-        .free_block => return recordDoubleFree(),
-        .size_mismatch => return recordSizeMismatch(),
-    }
-
-    control.active_blocks -= 1;
-    control.used_bytes -= check.requested;
-    releaseBlock(check.offset, check.size);
-    releaseTrailingPages();
-    return .ok;
+    return switch (r4os_rust_heap_free(mem.ptr, mem.len)) {
+        0 => .ok,
+        1 => .invalid_pointer,
+        2 => .double_free,
+        3 => .size_mismatch,
+        else => unreachable,
+    };
 }
-
-const InPlaceResult = union(enum) {
-    done: []u8,
-    failed,
-    need_copy,
-};
-
 pub fn realloc(mem: []u8, new_size: usize, alignment: usize) ?[]u8 {
-    if (!control.initialized) return null;
-    if (new_size == 0) {
-        _ = free(mem);
-        return null;
-    }
-    if (mem.len == 0) return alloc(new_size, alignment);
-    const align_value = normalizeAlignment(alignment) orelse {
-        control.allocation_errors += 1;
-        return null;
-    };
-
-    switch (reallocInPlace(mem, new_size, align_value)) {
-        .done => |slice| return slice,
-        .failed => return null,
-        .need_copy => {},
-    }
-
-    // Copy-Pfad ausserhalb des Guards: alloc/free setzen ihn selbst.
-    const new_mem = alloc(new_size, align_value) orelse return null;
-    const copy_len = if (mem.len < new_mem.len) mem.len else new_mem.len;
-    @memcpy(new_mem[0..copy_len], mem[0..copy_len]);
-    if (free(mem) != .ok) return null;
-    return new_mem;
+    const pointer = r4os_rust_heap_realloc(mem.ptr, mem.len, new_size, alignment) orelse return null;
+    return pointer[0..new_size];
 }
-
-fn reallocInPlace(mem: []u8, new_size: usize, align_value: usize) InPlaceResult {
-    const guard = enterHeap() orelse return .failed;
-    defer leaveHeap(guard);
-
-    const check = validateUsedBlock(mem.ptr, mem.len) orelse {
-        control.invalid_free_errors += 1;
-        return .failed;
-    };
-    switch (check.kind) {
-        .used_ok => {},
-        .free_block => {
-            control.invalid_free_errors += 1;
-            return .failed;
-        },
-        .size_mismatch => {
-            control.size_mismatch_errors += 1;
-            return .failed;
-        },
-    }
-
-    if (!isAligned(@intFromPtr(mem.ptr), align_value)) return .need_copy;
-
-    const need = blockSizeFor(new_size) orelse {
-        _ = oomFailure();
-        return .failed;
-    };
-    const off = check.offset;
-    var bsize = check.size;
-
-    if (need <= bsize) {
-        if (bsize - need >= MIN_BLOCK) {
-            writeUsedBlock(off, need, new_size);
-            releaseBlock(off + need, bsize - need);
-            releaseTrailingPages();
-        } else {
-            writeUsedBlock(off, bsize, new_size);
-        }
-        control.used_bytes = control.used_bytes - check.requested + new_size;
-        const ptr: [*]u8 = @ptrFromInt(HEAP_BASE + @as(u64, off) + HEADER_SIZE);
-        return .{ .done = ptr[0..new_size] };
-    }
-
-    const next_off = off + bsize;
-    if (next_off < control.heap_top) {
-        const next_word = word(next_off).*;
-        if ((next_word & 1) == 0) {
-            const next_size = blockSize(next_word);
-            if (bsize + next_size >= need) {
-                unlinkFree(next_off, next_size);
-                bsize += next_size;
-                if (bsize - need >= MIN_BLOCK) {
-                    writeUsedBlock(off, need, new_size);
-                    insertFree(off + need, bsize - need);
-                } else {
-                    writeUsedBlock(off, bsize, new_size);
-                }
-                control.used_bytes = control.used_bytes - check.requested + new_size;
-                const ptr: [*]u8 = @ptrFromInt(HEAP_BASE + @as(u64, off) + HEADER_SIZE);
-                return .{ .done = ptr[0..new_size] };
-            }
-        }
-    }
-
-    return .need_copy;
-}
-
 pub fn stats() Stats {
-    const irq_flags = owner_locks.heap.acquire();
-    defer owner_locks.heap.release(irq_flags);
-    var s: Stats = .{
-        .pages = control.committed_pages,
-        .capacity_bytes = committedBytes(),
-        .reserved_bytes = control.cap_pages * PAGE_SIZE,
-        .committed_bytes = committedBytes(),
-        .used_bytes = control.used_bytes,
-        .free_bytes = control.free_bytes,
-        .active_blocks = control.active_blocks,
-        .free_blocks = control.free_blocks,
-        .allocation_errors = control.allocation_errors,
-        .invalid_free_errors = control.invalid_free_errors,
-        .double_free_errors = control.double_free_errors,
-        .size_mismatch_errors = control.size_mismatch_errors,
-        .oom_errors = control.oom_errors,
-        .reentry_errors = control.reentry_errors,
-        .next_growth_pages = control.next_growth_pages,
-        .pending_uncommit_bytes = control.pending_uncommit_bytes,
-        .commit_calls = control.commit_calls,
-        .commit_failures = control.commit_failures,
-        .committed_pages_total = control.committed_pages_total,
-        .uncommit_calls = control.uncommit_calls,
-        .uncommit_failures = control.uncommit_failures,
-        .uncommitted_pages_total = control.uncommitted_pages_total,
-        .release_suppressed = control.release_suppressed,
-        .pressure_releases = control.pressure_releases,
-        .poison_bytes = control.poison_bytes,
-        .retained_tail_pages = heap_policy.retainedTailPages(control.next_growth_pages, control.cap_pages, memoryUnderPressure()),
-    };
-    s.largest_free = largestFreeBlock();
-    s.fragmentation_hint = s.free_blocks > 1 and s.free_bytes > s.largest_free;
-    return s;
+    var result: Stats = undefined;
+    r4os_rust_heap_stats(&result);
+    return result;
 }
-
 pub fn metadataRange() MetadataRange {
-    return .{
-        .base = @intFromPtr(&control),
-        .len = @sizeOf(Control),
-    };
+    var result: MetadataRange = undefined;
+    r4os_rust_heap_metadata(&result);
+    return result;
 }
-
-// Product-boot invariant: validate only the structure created by init().
-// Allocation, error-injection, alignment, and churn probes belong to the
-// explicit -Dboot-selftests diagnostic kernel.
 pub fn bootInvariant() bool {
-    const irq_flags = owner_locks.heap.acquire();
-    defer owner_locks.heap.release(irq_flags);
-    if (!control.initialized or control.range_id == 0) return false;
-    if (control.committed_pages < MIN_COMMITTED_PAGES or control.committed_pages > control.cap_pages) return false;
-    if (control.heap_top != committedBytes() or control.heap_top < MIN_BLOCK) return false;
-    if (control.active_blocks != 0 or control.used_bytes != 0) return false;
-    if (control.free_blocks != 1 or control.free_bytes != control.heap_top) return false;
-
-    const first = word(0).*;
-    if ((first & 1) != 0 or blockSize(first) != control.heap_top) return false;
-    if (word(8).* != FREE_MAGIC or word(control.heap_top - FOOTER_SIZE).* != first) return false;
-    if (word(16).* != NONE or word(24).* != NONE) return false;
-    return control.bins[binIndex(control.heap_top)] == 0;
+    return r4os_rust_heap_boot_invariant();
+}
+comptime {
+    if (@sizeOf(RawUnwind) != 16 or @sizeOf(Stats) != 232 or @sizeOf(MetadataRange) != 16)
+        @compileError("Rust kernel heap C layout mismatch");
 }
 
 pub fn dumpStats() void {
@@ -439,481 +283,6 @@ pub fn dumpStats() void {
 // ---------------------------------------------------------------------------
 // Interna: Wort-Zugriff, Bins, Platzierung, Wachstum
 // ---------------------------------------------------------------------------
-
-fn word(offset: usize) *u64 {
-    return @ptrFromInt(HEAP_BASE + @as(u64, offset));
-}
-
-fn blockSize(word0: u64) usize {
-    return @intCast(word0 & ~@as(u64, GRANULE - 1));
-}
-
-fn blockSizeFor(request: usize) ?usize {
-    const raw = checkedAdd(request, OVERHEAD) orelse return null;
-    const rounded = alignUp(raw, GRANULE) orelse return null;
-    return if (rounded < MIN_BLOCK) MIN_BLOCK else rounded;
-}
-
-fn binIndex(size: usize) usize {
-    if (size < 128) return 0;
-    const lg: usize = 63 - @as(usize, @clz(@as(u64, size)));
-    const idx = lg - 6;
-    return if (idx >= BIN_COUNT) BIN_COUNT - 1 else idx;
-}
-
-fn insertFree(offset: usize, size: usize) void {
-    word(offset).* = @as(u64, size);
-    word(offset + 8).* = FREE_MAGIC;
-    word(offset + size - FOOTER_SIZE).* = @as(u64, size);
-    const idx = binIndex(size);
-    const head = control.bins[idx];
-    word(offset + 16).* = head;
-    word(offset + 24).* = NONE;
-    if (head != NONE) word(@intCast(head + 24)).* = @as(u64, offset);
-    control.bins[idx] = @as(u64, offset);
-    control.free_blocks += 1;
-    control.free_bytes += size;
-}
-
-fn unlinkFree(offset: usize, size: usize) void {
-    // Validierung gegen Metadaten-Korruption (z.B. Use-after-free eines
-    // Konsumenten, der in einen freien Block geschrieben hat): kaputte
-    // Nachbar-Offsets NICHT dereferenzieren, sondern laut markieren.
-    const head_word = word(offset).*;
-    if ((head_word & 1) != 0 or blockSize(head_word) != size or
-        word(offset + 8).* != FREE_MAGIC)
-    {
-        reportCorruption("unlink-header", offset);
-    }
-    const next = word(offset + 16).*;
-    const prev = word(offset + 24).*;
-    if (next != NONE and !nodeOffsetPlausible(next)) {
-        reportCorruption("unlink-next", offset);
-    } else if (prev != NONE and !nodeOffsetPlausible(prev)) {
-        reportCorruption("unlink-prev", offset);
-    } else {
-        if (prev != NONE) {
-            word(@intCast(prev + 16)).* = next;
-        } else {
-            control.bins[binIndex(size)] = next;
-        }
-        if (next != NONE) word(@intCast(next + 24)).* = prev;
-    }
-    control.free_blocks -= 1;
-    control.free_bytes -= size;
-}
-
-fn nodeOffsetPlausible(offset_word: u64) bool {
-    if ((offset_word & (GRANULE - 1)) != 0) return false;
-    const off: usize = @intCast(offset_word);
-    return off + MIN_BLOCK <= control.heap_top;
-}
-
-var corruption_reported: bool = false;
-var corruption_count: u64 = 0;
-
-fn reportCorruption(kind: []const u8, offset: usize) void {
-    corruption_count += 1;
-    if (corruption_reported) return;
-    corruption_reported = true;
-    k.puts("HEAP CORRUPT kind=");
-    k.puts(kind);
-    k.puts(" off=0x");
-    k.putHex(@as(u64, offset), 12);
-    k.puts("\r\n");
-}
-
-fn writeUsedBlock(offset: usize, size: usize, requested: usize) void {
-    word(offset).* = @as(u64, size) | 1;
-    word(offset + 8).* = @as(u64, requested);
-    word(offset + size - FOOTER_SIZE).* = @as(u64, size) | 1;
-}
-
-// Koalesziert den (nicht mehr verketteten) Block mit freien Nachbarn und
-// haengt das Ergebnis in seinen Bin.
-fn releaseBlock(offset_in: usize, size_in: usize) void {
-    var offset = offset_in;
-    var size = size_in;
-
-    // Poison (0xDD) ueber die freigegebene Payload: macht Use-after-free
-    // deterministisch sichtbar (Crash-Adressen/Zeiger werden 0xDDDD...),
-    // statt zufaellig weiterzulaufen. Kostet einen memset pro Free.
-    if (size >= OVERHEAD + GRANULE) {
-        const body: [*]u8 = @ptrFromInt(HEAP_BASE + @as(u64, offset) + HEADER_SIZE);
-        const poison_len = size - OVERHEAD;
-        @memset(body[0..poison_len], 0xDD);
-        control.poison_bytes +%= poison_len;
-    }
-
-    const next_off = offset + size;
-    if (next_off < control.heap_top) {
-        const next_word = word(next_off).*;
-        if ((next_word & 1) == 0) {
-            const next_size = blockSize(next_word);
-            unlinkFree(next_off, next_size);
-            size += next_size;
-        }
-    }
-    if (offset > 0) {
-        const prev_footer = word(offset - FOOTER_SIZE).*;
-        if ((prev_footer & 1) == 0) {
-            const prev_size = blockSize(prev_footer);
-            const prev_off = offset - prev_size;
-            unlinkFree(prev_off, prev_size);
-            offset = prev_off;
-            size += prev_size;
-        }
-    }
-    insertFree(offset, size);
-}
-
-fn findFit(need: usize) ?usize {
-    var idx = binIndex(need);
-    // Im exakten Bin kurz suchen (Groessen dort koennen < need sein) ...
-    var cursor = control.bins[idx];
-    var scanned: usize = 0;
-    while (cursor != NONE and scanned < FIT_SCAN_LIMIT) : (scanned += 1) {
-        const off: usize = @intCast(cursor);
-        const size = blockSize(word(off).*);
-        if (size >= need) {
-            unlinkFree(off, size);
-            return off;
-        }
-        cursor = word(off + 16).*;
-    }
-    // ... in hoeheren Bins passt jeder Block garantiert: Kopf nehmen.
-    idx += 1;
-    while (idx < BIN_COUNT) : (idx += 1) {
-        const head = control.bins[idx];
-        if (head == NONE) continue;
-        const off: usize = @intCast(head);
-        const size = blockSize(word(off).*);
-        if (size >= need) {
-            unlinkFree(off, size);
-            return off;
-        }
-        // Nur moeglich im obersten Sammel-Bin: dort linear weiter.
-        var walk = word(off + 16).*;
-        while (walk != NONE) {
-            const woff: usize = @intCast(walk);
-            const wsize = blockSize(word(woff).*);
-            if (wsize >= need) {
-                unlinkFree(woff, wsize);
-                return woff;
-            }
-            walk = word(woff + 16).*;
-        }
-    }
-    return null;
-}
-
-fn placeBlock(offset: usize, need: usize, requested: usize) ?[]u8 {
-    const total = blockSize(word(offset).*);
-    if (total - need >= MIN_BLOCK) {
-        writeUsedBlock(offset, need, requested);
-        insertFree(offset + need, total - need);
-    } else {
-        writeUsedBlock(offset, total, requested);
-    }
-    control.active_blocks += 1;
-    control.used_bytes += requested;
-    const ptr: [*]u8 = @ptrFromInt(HEAP_BASE + @as(u64, offset) + HEADER_SIZE);
-    return ptr[0..requested];
-}
-
-const AlignedFit = struct {
-    offset: usize,
-    payload: usize,
-};
-
-fn findAlignedFit(need: usize, alignment: usize) ?AlignedFit {
-    var idx = binIndex(need);
-    while (idx < BIN_COUNT) : (idx += 1) {
-        var cursor = control.bins[idx];
-        var scanned: usize = 0;
-        while (cursor != NONE and scanned < FIT_SCAN_LIMIT) : (scanned += 1) {
-            const off: usize = @intCast(cursor);
-            const size = blockSize(word(off).*);
-            if (alignedPayloadFor(off, size, need, alignment)) |payload| {
-                unlinkFree(off, size);
-                return .{ .offset = off, .payload = payload };
-            }
-            cursor = word(off + 16).*;
-        }
-    }
-    return null;
-}
-
-// Liefert die Payload-Adresse (als Heap-Offset), wenn der freie Block
-// [off, off+size) einen ausgerichteten Block der Groesse need aufnehmen
-// kann. Prefix-Reste sind entweder 0 oder >= MIN_BLOCK.
-fn alignedPayloadFor(off: usize, size: usize, need: usize, alignment: usize) ?usize {
-    var payload = alignUp(off + HEADER_SIZE, alignment) orelse return null;
-    while (true) {
-        const prefix = payload - HEADER_SIZE - off;
-        if (prefix == 0 or prefix >= MIN_BLOCK) break;
-        payload = checkedAdd(payload, alignment) orelse return null;
-    }
-    const prefix = payload - HEADER_SIZE - off;
-    const total_need = checkedAdd(prefix, need) orelse return null;
-    if (total_need > size) return null;
-    return payload;
-}
-
-fn placeAligned(offset: usize, payload: usize, need: usize, requested: usize) ?[]u8 {
-    const total = blockSize(word(offset).*);
-    const prefix = payload - HEADER_SIZE - offset;
-    var used_off = offset;
-    var used_size = total;
-    if (prefix != 0) {
-        insertFree(offset, prefix);
-        used_off = offset + prefix;
-        used_size = total - prefix;
-    }
-    if (used_size - need >= MIN_BLOCK) {
-        writeUsedBlock(used_off, need, requested);
-        insertFree(used_off + need, used_size - need);
-    } else {
-        writeUsedBlock(used_off, used_size, requested);
-    }
-    control.active_blocks += 1;
-    control.used_bytes += requested;
-    const ptr: [*]u8 = @ptrFromInt(HEAP_BASE + @as(u64, used_off) + HEADER_SIZE);
-    return ptr[0..requested];
-}
-
-fn growCommitted(min_extra_bytes: usize, guard: *HeapGuard) bool {
-    if (@atomicLoad(u8, &growth_active, .acquire) != 0) {
-        if (!canWaitForGrowth(guard.*)) return false;
-        suspendHeap(guard.*);
-        const result = growth_waiters.waitUnless(sync.WAIT_FOREVER, "heap-growth", growthStillActive, &growth_active);
-        resumeHeap(guard);
-        // Another allocator may consume the new space before we return.
-        // The caller retries its fit and, if needed, reserves another tail.
-        return result == .signaled;
-    }
-    if (!finishPendingTail()) return false;
-    const extra_pages_min = pagesForBytes(min_extra_bytes);
-    if (extra_pages_min == 0) return true;
-    if (control.committed_pages + extra_pages_min > control.cap_pages) return false;
-
-    const start = committedBytes();
-    const remaining_pages = control.cap_pages - control.committed_pages;
-    var extra_pages = heap_policy.growthPages(extra_pages_min, control.next_growth_pages, remaining_pages);
-    @atomicStore(u8, &growth_active, 1, .release);
-    defer {
-        @atomicStore(u8, &growth_active, 0, .release);
-        guard.wake_growth = guard.wake_growth or (canDropHeap(guard.*) and guard.unwind.context_present);
-    }
-    if (!commitAdditionalPages(start, extra_pages, guard)) {
-        if (extra_pages == extra_pages_min or !commitAdditionalPages(start, extra_pages_min, guard)) return false;
-        extra_pages = extra_pages_min;
-    }
-    const extra_bytes = extra_pages * PAGE_SIZE;
-    control.committed_pages += extra_pages;
-    control.heap_top = committedBytes();
-    control.next_growth_pages = heap_policy.nextGrowthHint(extra_pages);
-
-    // Neues Freistueck mit einem freien Vorgaenger am alten Heap-Ende
-    // verschmelzen, damit die Kein-Nachbar-frei-Invariante haelt.
-    var offset = start;
-    var size = extra_bytes;
-    if (offset > 0) {
-        const prev_footer = word(offset - FOOTER_SIZE).*;
-        if ((prev_footer & 1) == 0) {
-            const prev_size = blockSize(prev_footer);
-            const prev_off = offset - prev_size;
-            unlinkFree(prev_off, prev_size);
-            offset = prev_off;
-            size += prev_size;
-        }
-    }
-    insertFree(offset, size);
-    return true;
-}
-
-fn commitAdditionalPages(start: usize, pages: usize, guard: *HeapGuard) bool {
-    if (pages == 0) return true;
-    const range_id = control.range_id;
-    control.commit_calls +%= 1;
-    const drop_owner = canDropHeap(guard.*);
-    if (drop_owner) suspendHeap(guard.*);
-    const committed = virt.commit(range_id, @intCast(start), @intCast(pages * PAGE_SIZE));
-    if (drop_owner) resumeHeap(guard);
-    committed catch {
-        control.commit_failures +%= 1;
-        control.growth_cleanup_pending = true;
-        return false;
-    };
-    control.growth_cleanup_pending = false;
-    control.committed_pages_total +%= pages;
-    return true;
-}
-
-fn releaseTrailingPages() void {
-    // Keep all published boundary tags mapped while a grower prepares the
-    // adjacent tail. Failed commit rollback also owns an unpublished tail.
-    if (@atomicLoad(u8, &growth_active, .acquire) != 0 or control.growth_cleanup_pending) return;
-    if (!finishPendingTail()) return;
-    const floor_bytes = MIN_COMMITTED_PAGES * PAGE_SIZE;
-    if (control.heap_top <= floor_bytes) return;
-    const last_footer = word(control.heap_top - FOOTER_SIZE).*;
-    if ((last_footer & 1) != 0) return;
-    const last_size = blockSize(last_footer);
-    const last_start = control.heap_top - last_size;
-
-    const first_releasable = alignUp(last_start, PAGE_SIZE) orelse return;
-    if (first_releasable >= control.heap_top) return;
-    const free_tail_pages = (control.heap_top - first_releasable) / PAGE_SIZE;
-    const under_pressure = memoryUnderPressure();
-    const retained_pages = heap_policy.retainedTailPages(control.next_growth_pages, control.cap_pages, under_pressure);
-    if (!heap_policy.shouldReleaseTail(free_tail_pages, retained_pages, under_pressure)) {
-        control.release_suppressed +%= 1;
-        return;
-    }
-
-    const retained_bytes = retained_pages * PAGE_SIZE;
-    const retained_end = checkedAdd(last_start, retained_bytes) orelse return;
-    var uncommit_start = alignUp(retained_end, PAGE_SIZE) orelse return;
-    var remainder = uncommit_start - last_start;
-    if (remainder != 0 and remainder < MIN_BLOCK) {
-        uncommit_start += PAGE_SIZE;
-        remainder += PAGE_SIZE;
-    }
-    if (uncommit_start < floor_bytes) {
-        uncommit_start = floor_bytes;
-        remainder = uncommit_start - last_start;
-        if (remainder != 0 and remainder < MIN_BLOCK) {
-            uncommit_start += PAGE_SIZE;
-            remainder += PAGE_SIZE;
-        }
-    }
-    if (uncommit_start >= control.heap_top) return;
-
-    unlinkFree(last_start, last_size);
-    const bytes = control.heap_top - uncommit_start;
-    // Retire the entire requested tail before the first destructive VM call.
-    // A failed call may already have removed a prefix, so neither its old
-    // footer nor any part of that tail may re-enter the allocation bins.
-    control.committed_pages = uncommit_start / PAGE_SIZE;
-    control.heap_top = uncommit_start;
-    if (remainder != 0) insertFree(last_start, remainder);
-    control.pending_uncommit_start = uncommit_start;
-    control.pending_uncommit_bytes = bytes;
-    control.pending_uncommit_pressure = under_pressure;
-    _ = finishPendingTail();
-}
-
-fn finishPendingTail() bool {
-    const bytes = control.pending_uncommit_bytes;
-    if (bytes == 0) return true;
-    control.uncommit_calls +%= 1;
-    virt.uncommit(control.range_id, @intCast(control.pending_uncommit_start), @intCast(bytes)) catch {
-        control.uncommit_failures +%= 1;
-        return false;
-    };
-    control.uncommitted_pages_total +%= bytes / PAGE_SIZE;
-    if (control.pending_uncommit_pressure) control.pressure_releases +%= 1;
-    control.pending_uncommit_start = 0;
-    control.pending_uncommit_bytes = 0;
-    control.pending_uncommit_pressure = false;
-    return true;
-}
-
-fn memoryUnderPressure() bool {
-    const frame_stats = phys.stats();
-    if (frame_stats.total_frames == 0) return false;
-    const pressure_floor: u64 = 512;
-    const pressure_threshold = @max(frame_stats.total_frames / 32, pressure_floor);
-    return frame_stats.free_frames <= pressure_threshold;
-}
-
-fn largestFreeBlock() usize {
-    var idx: usize = BIN_COUNT;
-    while (idx > 0) {
-        idx -= 1;
-        var cursor = control.bins[idx];
-        if (cursor == NONE) continue;
-        var best: usize = 0;
-        while (cursor != NONE) {
-            const off: usize = @intCast(cursor);
-            const size = blockSize(word(off).*);
-            if (size > best) best = size;
-            cursor = word(off + 16).*;
-        }
-        return best;
-    }
-    return 0;
-}
-
-// ---------------------------------------------------------------------------
-// Validierung eingehender Pointer (free/realloc)
-// ---------------------------------------------------------------------------
-
-const ValidationKind = enum {
-    used_ok,
-    free_block,
-    size_mismatch,
-};
-
-const Validation = struct {
-    kind: ValidationKind,
-    offset: usize = 0,
-    size: usize = 0,
-    requested: usize = 0,
-};
-
-fn validateUsedBlock(ptr: [*]u8, len: usize) ?Validation {
-    const addr: u64 = @intFromPtr(ptr);
-    if (addr < HEAP_BASE + HEADER_SIZE) return null;
-    const payload_off: usize = @intCast(addr - HEAP_BASE);
-    if (payload_off >= control.heap_top) return null;
-    if ((payload_off & (GRANULE - 1)) != 0) return null;
-    const offset = payload_off - HEADER_SIZE;
-
-    const word0 = word(offset).*;
-    const size = blockSize(word0);
-    const header_plausible = size >= MIN_BLOCK and size <= control.heap_top and
-        offset + size <= control.heap_top and
-        word(offset + size - FOOTER_SIZE).* == word0;
-    if (!header_plausible) return classifyByWalk(offset);
-
-    if ((word0 & 1) == 0) {
-        if (word(offset + 8).* == FREE_MAGIC) {
-            return .{ .kind = .free_block, .offset = offset, .size = size };
-        }
-        return classifyByWalk(offset);
-    }
-
-    const requested: usize = @intCast(word(offset + 8).*);
-    if (requested > size - OVERHEAD) return classifyByWalk(offset);
-    if (requested != len) {
-        return .{ .kind = .size_mismatch, .offset = offset, .size = size, .requested = requested };
-    }
-    return .{ .kind = .used_ok, .offset = offset, .size = size, .requested = requested };
-}
-
-// Langsamer Fallback fuer die Fehlerpfade: physische Blockkette von vorn
-// ablaufen und den Block bestimmen, der das Ziel enthaelt. Liegt das Ziel
-// in einem FREIEN Block (z.B. weil der ehemals eigene Block beim Free mit
-// Nachbarn koalesziert wurde), ist es ein Double-Free; sonst ungueltig.
-fn classifyByWalk(target: usize) ?Validation {
-    var off: usize = 0;
-    while (off < control.heap_top) {
-        const w0 = word(off).*;
-        const size = blockSize(w0);
-        if (size < MIN_BLOCK) return null;
-        if (off + size > control.heap_top) return null;
-        if (target < off + size) {
-            if ((w0 & 1) == 0) {
-                return .{ .kind = .free_block, .offset = off, .size = size };
-            }
-            return null;
-        }
-        off += size;
-    }
-    return null;
-}
 
 pub const AcceptanceProbe = struct {
     ok: bool = false,
@@ -1072,7 +441,8 @@ const SELFTEST_SLOTS: usize = 200;
 const SELFTEST_OPS: usize = 2000;
 
 pub fn selfTest() bool {
-    if (!control.initialized) return selfTestFail("not-initialized");
+    if (!r4os_rust_heap_initialized()) return selfTestFail("not-initialized");
+    if (!r4os_rust_heap_allocator_probe()) return selfTestFail("rust-allocator");
 
     // 1) Funktional: drei Groessen, Muster schreiben/lesen, Free ok.
     const sizes = [_]usize{ 24, 400, 6000 };
@@ -1097,12 +467,12 @@ pub fn selfTest() bool {
 
     // 3) Fehlererkennung: Double-Free muss als solcher erkannt werden
     //    (Zaehler-Delta exakt 1, kein stiller Erfolg).
-    const df_before = control.double_free_errors;
+    const df_before = stats().double_free_errors;
     const probe = alloc(64, 1) orelse return selfTestFail("alloc-df");
     const probe_copy = probe;
     if (free(probe) != .ok) return selfTestFail("free-df1");
     if (free(probe_copy) == .ok) return selfTestFail("double-free-accepted");
-    if (control.double_free_errors != df_before + 1) return selfTestFail("double-free-count");
+    if (stats().double_free_errors != df_before + 1) return selfTestFail("double-free-count");
 
     // 4) Churn-Benchmark: pseudo-zufaellige alloc/free-Folge (fester Seed).
     var slots: [SELFTEST_SLOTS]?[]u8 = .{null} ** SELFTEST_SLOTS;
@@ -1180,130 +550,3 @@ fn rdtsc() u64 {
 // ---------------------------------------------------------------------------
 // Kleinkram
 // ---------------------------------------------------------------------------
-
-const HeapGuard = struct {
-    unwind: task_context.UnwindToken,
-    lock_token: owner_locks.Token,
-    wake_growth: bool = false,
-};
-
-fn growthStillActive(_: *anyopaque) bool {
-    return @atomicLoad(u8, &growth_active, .acquire) != 0;
-}
-
-fn canWaitForGrowth(guard: HeapGuard) bool {
-    if (!canDropHeap(guard) or guard.lock_token.flags & (1 << 9) == 0) return false;
-    const current = scheduler.current() orelse return false;
-    return current.preempt_disable_depth == 0 and current.held_lock_count == 0;
-}
-
-fn canDropHeap(guard: HeapGuard) bool {
-    return guard.lock_token.previous_rank == 0 and percpu.runtimeCriticalDepth().* == 0;
-}
-
-fn suspendHeap(guard: HeapGuard) void {
-    control.in_heap = false;
-    owner_locks.heap.release(guard.lock_token);
-}
-
-fn resumeHeap(guard: *HeapGuard) void {
-    guard.lock_token = owner_locks.heap.acquire();
-    control.in_heap = true;
-}
-
-fn enterHeap() ?HeapGuard {
-    const irq_flags = owner_locks.heap.acquire();
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) {
-        control.reentry_errors += 1;
-        owner_locks.heap.release(irq_flags);
-        return null;
-    }
-    if (control.in_heap) {
-        control.reentry_errors += 1;
-        if (!control.reentry_reported) {
-            control.reentry_reported = true;
-            k.puts("HEAP REENTRY detected (non-preempt invariant violated)\r\n");
-        }
-        owner_locks.heap.release(irq_flags);
-        _ = task_context.leaveUnwind(unwind);
-        return null;
-    }
-    control.in_heap = true;
-    return .{ .unwind = unwind, .lock_token = irq_flags };
-}
-
-fn leaveHeap(guard: HeapGuard) void {
-    control.in_heap = false;
-    if (guard.wake_growth) {
-        owner_locks.heap.release(guard.lock_token);
-        _ = growth_waiters.wakeAll();
-        // Keep the grower kill-safe until all sleepers can observe completion.
-        const token = owner_locks.heap.acquire();
-        _ = task_context.leaveUnwind(guard.unwind);
-        owner_locks.heap.release(token);
-        return;
-    }
-    _ = task_context.leaveUnwind(guard.unwind);
-    owner_locks.heap.release(guard.lock_token);
-}
-
-fn committedBytes() usize {
-    return control.committed_pages * PAGE_SIZE;
-}
-
-fn pagesForBytes(bytes: usize) usize {
-    return (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
-}
-
-fn normalizeAlignment(alignment: usize) ?usize {
-    const value = if (alignment == 0) 1 else alignment;
-    if (!isPowerOfTwo(value)) return null;
-    return value;
-}
-
-fn checkedAdd(a: usize, b: usize) ?usize {
-    const result = a +% b;
-    if (result < a) return null;
-    return result;
-}
-
-fn alignUp(value: usize, alignment: usize) ?usize {
-    const add = alignment - 1;
-    const sum = checkedAdd(value, add) orelse return null;
-    return sum & ~add;
-}
-
-fn isAligned(value: usize, alignment: usize) bool {
-    return (value & (alignment - 1)) == 0;
-}
-
-fn isPowerOfTwo(value: usize) bool {
-    return value != 0 and (value & (value - 1)) == 0;
-}
-
-fn allocFailure() ?[]u8 {
-    control.allocation_errors += 1;
-    return null;
-}
-
-fn oomFailure() ?[]u8 {
-    control.allocation_errors += 1;
-    control.oom_errors += 1;
-    return null;
-}
-
-fn recordInvalidFree() FreeResult {
-    control.invalid_free_errors += 1;
-    return .invalid_pointer;
-}
-
-fn recordDoubleFree() FreeResult {
-    control.double_free_errors += 1;
-    return .double_free;
-}
-
-fn recordSizeMismatch() FreeResult {
-    control.size_mismatch_errors += 1;
-    return .size_mismatch;
-}

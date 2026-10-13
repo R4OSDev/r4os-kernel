@@ -1145,11 +1145,13 @@ fn stIfEventPartnerMain() callconv(.c) void {
 }
 
 fn stSleepPreservesInterruptState(enabled: bool) bool {
-    const original_flags = interrupts.saveAndDisableRuntime();
+    // Probe the caller's IF state, without lending a runtime-owner token
+    // across a blocking operation. The scheduler owns its own boundary.
+    const original_flags = interrupts.saveAndDisableLocal();
     if (enabled) interrupts.enable();
     scheduler.sleepTicksWithReason(1, if (enabled) "sync-st-if-sleep-on" else "sync-st-if-sleep-off");
-    const after_flags = interrupts.saveAndDisableRuntime();
-    interrupts.restore(original_flags);
+    const after_flags = interrupts.saveAndDisableLocal();
+    interrupts.restoreLocal(original_flags);
     return interrupts.wereEnabled(after_flags) == enabled;
 }
 
@@ -1158,11 +1160,11 @@ fn stEventPreservesInterruptState(enabled: bool) bool {
     st_if_partner_done = false;
     if (task.createKernelThread("sync-st-if-evt", stIfEventPartnerMain) == null) return false;
 
-    const original_flags = interrupts.saveAndDisableRuntime();
+    const original_flags = interrupts.saveAndDisableLocal();
     if (enabled) interrupts.enable();
     const result = st_if_event.waitResult(200);
-    const after_flags = interrupts.saveAndDisableRuntime();
-    interrupts.restore(original_flags);
+    const after_flags = interrupts.saveAndDisableLocal();
+    interrupts.restoreLocal(original_flags);
     return result == .signaled and
         @as(*volatile bool, &st_if_partner_done).* and
         interrupts.wereEnabled(after_flags) == enabled;
