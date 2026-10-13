@@ -7,8 +7,8 @@
         // The identity is pinned here. Build.bat and Build.sh map the actual
         // checkout from Settings.R4S and provide it as a local Zig fork.
         .r4os_contract = .{
-            .url = "https://github.com/R4OSDev/r4os-contract/archive/5521df06871b4cee158e44853db01380934d6c4c.tar.gz",
-            .hash = "r4os_contract-0.64.11-ELhbYa_UcgBuo-SnWc6plpYE5WHMo3UJlk7o7Daeerdo",
+            .url = "https://github.com/R4OSDev/r4os-contract/archive/213a2bd50a7f40d88f5ff7ac87b4ef03ee8e3057.tar.gz",
+            .hash = "r4os_contract-0.64.11-ELhbYS6n6QDs2kBqhn_q3VFdJYXTPIN4qbS1Llfpj9IF",
         },
     },
     .paths = .{
@@ -19,6 +19,10 @@
         "Build.bat",
         "Build.sh",
         "Settings.R4S",
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "Rust",
         "Assets",
         "Boot",
         "Support",

@@ -1,5 +1,7 @@
 /.zig-cache/
+/zig-pkg/
 /zig-out/
+/target/
 
 *.elf
 *.obj
