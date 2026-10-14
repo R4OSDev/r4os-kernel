@@ -1,12 +1,11 @@
-// Intrusive scheduler wait linkage.
-//
-// A Node is owned by one stable Task object and can be linked into at most one
-// QueueCore. Queue operations allocate no memory and are intentionally free of
-// scheduler/interrupt policy; callers serialize them with the scheduler's
-// IRQ/preemption critical section.
+// Intrusive wait linkage belongs to the native owner; stable C records retain
+// exact task generation and queue identity. Runtime admission stays at caller.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
-pub const Node = struct {
-    owner: *anyopaque = undefined,
+pub const Node = extern struct {
+    owner: ?*anyopaque = null,
     owner_generation: u64 = 0,
     queue: ?*QueueCore = null,
     prev: ?*Node = null,
@@ -15,118 +14,58 @@ pub const Node = struct {
     pub fn detached(self: *const Node) bool {
         return self.queue == null;
     }
-
     pub fn reset(self: *Node) bool {
         return clearOwner(self);
     }
 };
-
-pub const QueueCore = struct {
+pub const QueueCore = extern struct {
     head: ?*Node = null,
     tail: ?*Node = null,
     count: usize = 0,
     closing: bool = false,
     generation: u64 = 1,
 };
-
-/// Links `node` at the FIFO tail. The owner address must remain stable until
-/// the node has been detached. A closing queue rejects new enrollment.
-pub fn link(queue: *QueueCore, node: *Node, owner: *anyopaque, owner_generation: u64) bool {
-    if (queue.closing or owner_generation == 0 or node.queue != null) return false;
-
-    node.owner = owner;
-    node.owner_generation = owner_generation;
-    node.queue = queue;
-    node.prev = queue.tail;
-    node.next = null;
-    if (queue.tail) |tail| {
-        tail.next = node;
-    } else {
-        queue.head = node;
-    }
-    queue.tail = node;
-    queue.count += 1;
-    return true;
+extern fn r4os_rust_wait_node_link(queue: *QueueCore, node: *Node, owner: *anyopaque, generation: u64) bool;
+extern fn r4os_rust_wait_node_detach(node: *Node) bool;
+extern fn r4os_rust_wait_node_pop_front(queue: *QueueCore) ?*Node;
+extern fn r4os_rust_wait_node_close(queue: *QueueCore) void;
+extern fn r4os_rust_wait_node_reopen(queue: *QueueCore) bool;
+extern fn r4os_rust_wait_node_clear_owner(node: *Node) bool;
+comptime {
+    if (@sizeOf(Node) != 40 or @sizeOf(QueueCore) != 40 or
+        @offsetOf(Node, "queue") != 16 or @offsetOf(QueueCore, "closing") != 24 or
+        @offsetOf(QueueCore, "generation") != 32)
+        @compileError("Native wait-node C layout differs");
 }
-
-/// Removes a node from whichever queue currently owns it. This is the common
-/// O(1) primitive used by signal, timeout, cancellation, kill and task detach.
-/// Owner identity is retained so a caller that popped the node can still
-/// validate and wake its task.
+pub fn link(queue: *QueueCore, node: *Node, owner: *anyopaque, generation: u64) bool {
+    return r4os_rust_wait_node_link(queue, node, owner, generation);
+}
 pub fn detach(node: *Node) bool {
-    const queue = node.queue orelse return false;
-
-    if (node.prev) |prev| {
-        prev.next = node.next;
-    } else {
-        queue.head = node.next;
-    }
-    if (node.next) |next| {
-        next.prev = node.prev;
-    } else {
-        queue.tail = node.prev;
-    }
-    if (queue.count != 0) queue.count -= 1;
-    node.queue = null;
-    node.prev = null;
-    node.next = null;
-    return true;
+    return r4os_rust_wait_node_detach(node);
 }
-
-/// Removes and returns the oldest waiter. Removal happens before the caller
-/// changes scheduler state, so no ready task retains queue ownership.
 pub fn popFront(queue: *QueueCore) ?*Node {
-    const node = queue.head orelse return null;
-    _ = detach(node);
-    return node;
+    return r4os_rust_wait_node_pop_front(queue);
 }
-
-/// Starts object teardown in O(1). Callers drain nodes with popFront and wake
-/// them with the desired terminal result. Queue storage must not be reused
-/// until `count == 0`.
 pub fn close(queue: *QueueCore) void {
-    if (queue.closing) return;
-    queue.closing = true;
-    advanceGeneration(queue);
+    r4os_rust_wait_node_close(queue);
 }
-
-/// Reopens drained stable storage for a new object generation.
 pub fn reopen(queue: *QueueCore) bool {
-    if (!queue.closing or queue.count != 0 or queue.head != null or queue.tail != null) return false;
-    queue.closing = false;
-    advanceGeneration(queue);
-    return true;
+    return r4os_rust_wait_node_reopen(queue);
 }
-
-/// Clears stale task identity only after the node is detached.
 pub fn clearOwner(node: *Node) bool {
-    if (node.queue != null) return false;
-    node.owner_generation = 0;
-    node.owner = undefined;
-    node.prev = null;
-    node.next = null;
-    return true;
+    return r4os_rust_wait_node_clear_owner(node);
 }
-
 pub fn reset(node: *Node) bool {
     return clearOwner(node);
 }
-
 pub fn isLinked(node: *const Node) bool {
     return node.queue != null;
 }
-
 pub fn isDetached(node: *const Node) bool {
     return node.queue == null;
 }
-
 pub fn isEmpty(queue: *const QueueCore) bool {
     return queue.count == 0;
-}
-
-fn advanceGeneration(queue: *QueueCore) void {
-    queue.generation +%= 1;
-    if (queue.generation == 0) queue.generation = 1;
 }
 
 test "intrusive queue links, unlinks and pops in FIFO order" {

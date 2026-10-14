@@ -145,6 +145,9 @@ pub fn eventClockInfo() EventClockInfo {
     r4os_rust_timer_event_info(&value);
     return value;
 }
+pub fn oneShotIrqCount() u64 {
+    return r4os_rust_timer_control(16, 0, 0);
+}
 pub fn deadlineStats() DeadlineStats {
     var raw: RawDeadlineStats = undefined;
     r4os_rust_timer_deadlines(&raw);

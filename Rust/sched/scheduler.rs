@@ -213,35 +213,35 @@ pub fn current() -> Task {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TaskView {
-    rsp_slot: *mut u64,
-    unwind_slot: *mut u32,
-    entry: Option<unsafe extern "C" fn()>,
-    generation: u64,
-    rsp: u64,
-    wake_tick: u64,
-    wait_object: u64,
-    last_scheduled_tick: u64,
-    ready_since_tick: u64,
-    created_tick: u64,
-    last_long_warning: u64,
-    last_starvation_warning: u64,
-    max_ready_latency: u64,
-    id: u32,
-    home_cpu: u32,
-    preempt_depth: u32,
-    held_locks: u32,
-    unwind_count: u32,
-    state: u8,
-    role: u8,
-    priority: u8,
-    dispatch_rank: u8,
-    cpu_idle: bool,
-    smp_eligible: bool,
-    smp_r4x: bool,
-    uses_fpu: bool,
-    fpu_valid: bool,
-    fpu_present: bool,
-    handoff_pending: bool,
+    pub(crate) rsp_slot: *mut u64,
+    pub(crate) unwind_slot: *mut u32,
+    pub(crate) entry: Option<unsafe extern "C" fn()>,
+    pub(crate) generation: u64,
+    pub(crate) rsp: u64,
+    pub(crate) wake_tick: u64,
+    pub(crate) wait_object: u64,
+    pub(crate) last_scheduled_tick: u64,
+    pub(crate) ready_since_tick: u64,
+    pub(crate) created_tick: u64,
+    pub(crate) last_long_warning: u64,
+    pub(crate) last_starvation_warning: u64,
+    pub(crate) max_ready_latency: u64,
+    pub(crate) id: u32,
+    pub(crate) home_cpu: u32,
+    pub(crate) preempt_depth: u32,
+    pub(crate) held_locks: u32,
+    pub(crate) unwind_count: u32,
+    pub(crate) state: u8,
+    pub(crate) role: u8,
+    pub(crate) priority: u8,
+    pub(crate) dispatch_rank: u8,
+    pub(crate) cpu_idle: bool,
+    pub(crate) smp_eligible: bool,
+    pub(crate) smp_r4x: bool,
+    pub(crate) uses_fpu: bool,
+    pub(crate) fpu_valid: bool,
+    pub(crate) fpu_present: bool,
+    pub(crate) handoff_pending: bool,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -262,34 +262,22 @@ impl ExternalIrqFpuGuard {
 unsafe extern "C" {
     #[cfg(not(r4os_owner_fixture))]
     fn r4os_context_switch(old_rsp: *mut u64, new_rsp: u64);
-    fn r4os_zig_scheduler_view(task: Task, output: *mut TaskView);
-    fn r4os_zig_scheduler_query(operation: u8, task: Task, a: u64) -> u64;
-    fn r4os_zig_scheduler_mutate(
-        operation: u8,
-        task: Task,
-        a: u64,
-        b: u64,
-        text: *const u8,
-        len: usize,
-    ) -> u64;
-    fn r4os_zig_scheduler_attach();
     fn r4os_zig_scheduler_log(event: u8, task: Task, a: u64, b: u64);
 }
+// Keep scalar native projections visible to the caller; a single field
+// access must not materialize the complete temporary TaskView.
+#[inline(always)]
 fn view(task: Task) -> TaskView {
-    let mut value = core::mem::MaybeUninit::uninit();
-    unsafe {
-        r4os_zig_scheduler_view(task, value.as_mut_ptr());
-        value.assume_init()
-    }
+    unsafe { super::task::scheduler_view(task) }
 }
 fn query(operation: u8, task: Task, a: u64) -> u64 {
-    unsafe { r4os_zig_scheduler_query(operation, task, a) }
+    unsafe { super::task::scheduler_query(operation, task, a) }
 }
 fn mutate(operation: u8, task: Task, a: u64, b: u64) -> u64 {
-    unsafe { r4os_zig_scheduler_mutate(operation, task, a, b, ptr::null(), 0) }
+    unsafe { super::task::scheduler_mutate(operation, task, a, b, ptr::null(), 0) }
 }
 fn text_mutate(operation: u8, task: Task, a: u64, b: u64, text: *const u8, len: usize) -> u64 {
-    unsafe { r4os_zig_scheduler_mutate(operation, task, a, b, text, len) }
+    unsafe { super::task::scheduler_mutate(operation, task, a, b, text, len) }
 }
 fn task_query(operation: u8, a: u64) -> Task {
     ptr::with_exposed_provenance_mut(query(operation, ptr::null_mut(), a) as usize)
@@ -360,7 +348,6 @@ fn init() -> bool {
     });
     unsafe { task_context::bind(view(first).unwind_slot) };
     change(|s| s.initialized = true);
-    unsafe { r4os_zig_scheduler_attach() };
     let deadline = timer::r4os_rust_timer_control(11, 0, 0);
     log(0, ptr::null_mut(), deadline, 0);
     true

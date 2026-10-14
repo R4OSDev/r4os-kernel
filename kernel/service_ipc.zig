@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 // Kanalbasierte Kernel-IPC fuer die Netz-Service-Bruecke. Kanal- und
 // Slotidentitaet bleiben statisch, waehrend Handlerarbeit nach Start der
 // Task-Runtime auf einem eigenen Worker laeuft.
@@ -232,7 +233,7 @@ pub fn startRuntimeWorker() bool {
     for (&workers) |*lane| {
         if (lane.task_id != 0) continue;
         const worker = sched_task.createKernelWorkerBlockedWithRole("ipc-worker", workerMain, .short_completion) orelse return false;
-        lane.task_id = worker.id;
+        lane.task_id = native_tasks.get(worker, .id);
         sched_task.markReady(worker, timer.tickCount());
     }
     worker_task_id = workers[0].task_id;
@@ -1044,7 +1045,7 @@ fn currentIsWorker() bool {
 fn currentWorker() ?*Worker {
     const current = scheduler.current() orelse return null;
     for (&workers) |*worker| {
-        if (worker.task_id == current.id) return worker;
+        if (worker.task_id == native_tasks.get(current, .id)) return worker;
     }
     return null;
 }

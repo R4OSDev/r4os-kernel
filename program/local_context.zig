@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 // Process-local publication for shared runtime libraries. Userland owns the
 // pointed-to data and its allocator; the kernel owns only this association.
 const std = @import("std");
@@ -27,7 +28,7 @@ fn find(owner: *Owner, key: u64) ?*Record {
 fn operation() ?task_context.UnwindToken {
     if (!interrupts.wereEnabled(io.readRflags()) or interrupts.inRuntimeCriticalSection()) return null;
     const current = scheduler.current() orelse return null;
-    if (current.preempt_disable_depth != 0 or current.held_lock_count != 0) return null;
+    if (native_tasks.get(current, .preempt_disable_depth) != 0 or native_tasks.get(current, .held_lock_count) != 0) return null;
     const flags = interrupts.saveAndDisableRuntime();
     defer interrupts.restore(flags);
     const token = task_context.enterUnwind();

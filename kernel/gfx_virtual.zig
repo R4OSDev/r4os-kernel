@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 // Resident cross-process transport. The common BO owner protects metadata;
 // the existing gfx-work thread publishes events and notifies the sole R4D.
 const std = @import("std");
@@ -44,9 +45,15 @@ var waiters: ?*Waiter = null;
 var providers: [16]Provider = .{Provider{}} ** 16;
 var provider_serial: u64 = 0;
 var service_needed = false;
-fn now() u64 { return @import("../platform/monotonic.zig").nowNanoseconds() orelse 0; }
-pub fn errorCode(err: Error) i32 { return @import("gfx_allocations.zig").errorCode(err); }
-fn record(entry: *model.Entry) *Record { return @fieldParentPtr("value", entry); }
+fn now() u64 {
+    return @import("../platform/monotonic.zig").nowNanoseconds() orelse 0;
+}
+pub fn errorCode(err: Error) i32 {
+    return @import("gfx_allocations.zig").errorCode(err);
+}
+fn record(entry: *model.Entry) *Record {
+    return @fieldParentPtr("value", entry);
+}
 fn allocate(comptime T: type) Error!*T {
     const allocation = heap.alloc(@sizeOf(T), @alignOf(T)) orelse return error.OutOfMemory;
     return @ptrCast(@alignCast(allocation.ptr));
@@ -75,7 +82,8 @@ pub fn register(owner: buffers.Owner, config: abi.GfxNativeProvider) Error!buffe
     if (!queue.available() or irq.inDispatch()) return error.Unavailable;
     if (config.version != 1 or config.size < @sizeOf(abi.GfxNativeProvider) or config.reserved0 != 0 or
         config.adapter_id == 0 or config.memory_generation == 0 or config.notify == 0) return error.Invalid;
-    buffers.lock(); defer buffers.unlock();
+    buffers.lock();
+    defer buffers.unlock();
     try memory.admitLocked(owner);
     for (&providers) |provider| if (provider.handle.id != 0 and provider.config.adapter_id == config.adapter_id) return error.Busy;
     if (provider_serial == std.math.maxInt(u64)) return error.Exhausted;
@@ -89,7 +97,8 @@ pub fn register(owner: buffers.Owner, config: abi.GfxNativeProvider) Error!buffe
 pub fn unregister(owner: buffers.Owner, handle: buffers.Handle) Error!void {
     if (irq.inDispatch()) return error.Unavailable;
     const busy = blk: {
-        buffers.lock(); defer buffers.unlock();
+        buffers.lock();
+        defer buffers.unlock();
         const provider = try providerLocked(handle, owner);
         provider.closing = true;
         state.closeProvider(handle);
@@ -104,21 +113,26 @@ pub fn unregister(owner: buffers.Owner, handle: buffers.Handle) Error!void {
 pub fn closingDriver(id: u32) void {
     buffers.lock();
     for (&providers) |*provider| if (id != 0 and provider.owner.id == id) {
-        provider.closing = true; provider.retiring = true;
+        provider.closing = true;
+        provider.retiring = true;
         state.closeProvider(provider.handle);
         service_needed = true;
     };
-    buffers.unlock(); queue.wake();
+    buffers.unlock();
+    queue.wake();
 }
 pub fn retainsDriver(id: u32) bool {
-    buffers.lock(); defer buffers.unlock();
+    buffers.lock();
+    defer buffers.unlock();
     for (&providers) |provider| if (id != 0 and provider.owner.id == id) return true;
     return false;
 }
 // The program owner closes this bit before publishing exit. Admission reads
 // it under the same BO owner; no process tombstones or caller pointer persist.
 pub fn stopAdmission(closed: *bool) void {
-    buffers.lock(); closed.* = true; buffers.unlock();
+    buffers.lock();
+    closed.* = true;
+    buffers.unlock();
 }
 pub fn start(owner: buffers.Owner, closed: *const bool, input: abi.GfxVirtualRequest) Error!abi.GfxVirtualStatus {
     if (!queue.available() or irq.inDispatch()) return error.Unavailable;
@@ -154,10 +168,12 @@ pub fn start(owner: buffers.Owner, closed: *const bool, input: abi.GfxVirtualReq
         service_needed = true;
         break :blk value.value.status();
     };
-    queue.wake(); return result;
+    queue.wake();
+    return result;
 }
 pub fn query(owner: buffers.Owner, handle: buffers.Handle) Error!abi.GfxVirtualStatus {
-    buffers.lock(); defer buffers.unlock();
+    buffers.lock();
+    defer buffers.unlock();
     return (try state.owned(handle, owner)).status();
 }
 pub const Execution = struct {
@@ -181,9 +197,7 @@ pub fn retainExecutionLocked(owner: buffers.Owner, input: abi.GfxNativeResource,
     try memory.admitLocked(provider.owner);
     const reference = try api.handle(value.reference.reference);
     try entry.retainExecution();
-    return .{ .entry = entry, .driver = value.driver, .reference = reference,
-        .binding = .{ .binding = api.publicHandle(entry.handle), .token = entry.token, .address = entry.address,
-            .byte_length = entry.request.byte_length, .access = input.access } };
+    return .{ .entry = entry, .driver = value.driver, .reference = reference, .binding = .{ .binding = api.publicHandle(entry.handle), .token = entry.token, .address = entry.address, .byte_length = entry.request.byte_length, .access = input.access } };
 }
 pub fn releaseExecutionLocked(use: Execution) void {
     use.entry.releaseExecution();
@@ -192,32 +206,39 @@ pub fn releaseExecutionLocked(use: Execution) void {
 pub fn close(owner: buffers.Owner, handle: buffers.Handle, mode: u32) Error!void {
     if (mode > 1) return error.Invalid;
     buffers.lock();
-    const entry = state.owned(handle, owner) catch |err| { buffers.unlock(); return err; };
+    const entry = state.owned(handle, owner) catch |err| {
+        buffers.unlock();
+        return err;
+    };
     entry.close(mode == 1, abi.gfx_queue_error_wait_cancelled);
     service_needed = true;
-    buffers.unlock(); queue.wake();
+    buffers.unlock();
+    queue.wake();
 }
 pub fn stopped(owner: buffers.Owner) void {
     buffers.lock();
-    state.stopped(owner); service_needed = true;
-    buffers.unlock(); queue.wake();
+    state.stopped(owner);
+    service_needed = true;
+    buffers.unlock();
+    queue.wake();
 }
 pub fn take(owner: buffers.Owner, handle: buffers.Handle) Error!abi.GfxVirtualJob {
     if (irq.inDispatch()) return error.Unavailable;
     const instant = now();
-    buffers.lock(); defer buffers.unlock();
+    buffers.lock();
+    defer buffers.unlock();
     const provider = try providerLocked(handle, owner);
     if (!provider.closing) try memory.admitLocked(owner);
     const entry = state.take(handle, instant) orelse return error.Busy;
     service_needed = true;
-    return .{ .resource = api.publicHandle(entry.handle), .operation = @intFromEnum(entry.claim.?), .request = entry.request,
-        .parent_token = if (entry.parent) |parent| parent.token else .{}, .token = entry.token, .reference = record(entry).reference };
+    return .{ .resource = api.publicHandle(entry.handle), .operation = @intFromEnum(entry.claim.?), .request = entry.request, .parent_token = if (entry.parent) |parent| parent.token else .{}, .token = entry.token, .reference = record(entry).reference };
 }
 pub fn complete(owner: buffers.Owner, handle: buffers.Handle, completion: abi.GfxVirtualCompletion) Error!void {
     if (irq.inDispatch()) return error.Unavailable;
     const instant = now();
     {
-        buffers.lock(); defer buffers.unlock();
+        buffers.lock();
+        defer buffers.unlock();
         _ = try providerLocked(handle, owner);
         state.expire(instant);
         try state.complete(handle, completion);
@@ -240,10 +261,14 @@ pub fn retiredTask(id: u32, generation: u64) void {
         next = waiter.next;
         if (waiter.task_id != id or waiter.generation != generation) continue;
         unlinkWaiterLocked(waiter);
-        waiter.next = detached; detached = waiter;
+        waiter.next = detached;
+        detached = waiter;
     }
     buffers.unlock();
-    while (detached) |waiter| { detached = waiter.next; release(Waiter, waiter); }
+    while (detached) |waiter| {
+        detached = waiter.next;
+        release(Waiter, waiter);
+    }
     queue.wake();
 }
 pub fn wait(owner: buffers.Owner, handle: buffers.Handle, until: u32, timeout: u64) Error!abi.GfxVirtualStatus {
@@ -257,16 +282,25 @@ pub fn wait(owner: buffers.Owner, handle: buffers.Handle, until: u32, timeout: u
         const value = try allocate(Waiter);
         errdefer release(Waiter, value);
         buffers.lock();
-        const entry = state.owned(handle, owner) catch |err| { buffers.unlock(); return err; };
+        const entry = state.owned(handle, owner) catch |err| {
+            buffers.unlock();
+            return err;
+        };
         if (entry.settled(until)) {
             const result = entry.status();
-            buffers.unlock(); release(Waiter, value); return result;
+            buffers.unlock();
+            release(Waiter, value);
+            return result;
         }
         const target = record(entry);
-        if (target.waiters == std.math.maxInt(usize)) { buffers.unlock(); return error.Exhausted; }
-        value.* = .{ .record = target, .task_id = current.id, .generation = current.generation, .next = waiters };
+        if (target.waiters == std.math.maxInt(usize)) {
+            buffers.unlock();
+            return error.Exhausted;
+        }
+        value.* = .{ .record = target, .task_id = native_tasks.get(current, .id), .generation = native_tasks.get(current, .generation), .next = waiters };
         if (waiters) |first| first.previous = value;
-        waiters = value; target.waiters += 1;
+        waiters = value;
+        target.waiters += 1;
         buffers.unlock();
         break :blk value;
     };
@@ -281,7 +315,8 @@ pub fn wait(owner: buffers.Owner, handle: buffers.Handle, until: u32, timeout: u
     const done = waiter.record.value.settled(until);
     unlinkWaiterLocked(waiter);
     buffers.unlock();
-    release(Waiter, waiter); queue.wake();
+    release(Waiter, waiter);
+    queue.wake();
     if (done) return result;
     return if (waited == .timeout) error.WaitTimeout else error.WaitCancelled;
 }
@@ -290,16 +325,23 @@ fn notifyDriver(index: usize) callconv(.c) i32 {
     const id = work.currentOwner();
     if (id == 0 or !@import("driver_api.zig").enterOwnerBounded(id, @as(u64, @max(@import("timer.zig").frequency(), 1)) * 3)) return -1;
     defer _ = @import("driver_api.zig").leaveOwner();
-    buffers.lock(); const selected = providers[index]; buffers.unlock();
+    buffers.lock();
+    const selected = providers[index];
+    buffers.unlock();
     if (selected.owner.id != id or selected.handle.id == 0) return 0;
     const callback: work.WorkHandler = @ptrFromInt(selected.config.notify);
     return callback(selected.config.context);
 }
 pub fn service() bool {
-    buffers.lock(); const needed = service_needed; buffers.unlock();
+    buffers.lock();
+    const needed = service_needed;
+    buffers.unlock();
     if (!needed) return false;
     const instant = now();
-    buffers.lock(); state.expire(instant); var next = state.tree.getMin(); buffers.unlock();
+    buffers.lock();
+    state.expire(instant);
+    var next = state.tree.getMin();
+    buffers.unlock();
     var dropped = false;
     // Only this worker unlinks resource nodes. Admissions append new serials;
     // caller close/retirement only changes state under the common owner.
@@ -318,7 +360,8 @@ pub fn service() bool {
         value.publishing = false;
         if (entry.retired and value.reference.reference.id != 0) {
             buffers.store.drop(api.handle(value.reference.reference) catch unreachable, value.driver) catch unreachable;
-            value.reference = .{}; dropped = true;
+            value.reference = .{};
+            dropped = true;
         }
         const remove = model.Store.removable(entry) and value.waiters == 0 and !value.publishing;
         if (remove) state.remove(entry);
@@ -327,7 +370,9 @@ pub fn service() bool {
     }
     if (dropped) buffers.collect();
     for (0..providers.len) |index| {
-        buffers.lock(); const snapshot = providers[index]; buffers.unlock();
+        buffers.lock();
+        const snapshot = providers[index];
+        buffers.unlock();
         if (snapshot.handle.id == 0) continue;
         if (snapshot.work_handle != 0) {
             var status: work.CompletionStatus = .{};
@@ -348,7 +393,10 @@ pub fn service() bool {
             var iter = state.tree.inorderIterator();
             while (iter.next()) |node| {
                 const entry: *model.Entry = @fieldParentPtr("index", node);
-                if (entry.provider.eql(provider.handle) and entry.pending() != null) { ready = true; break; }
+                if (entry.provider.eql(provider.handle) and entry.pending() != null) {
+                    ready = true;
+                    break;
+                }
             }
         }
         if (ready) provider.notifying = true;
@@ -362,11 +410,13 @@ pub fn service() bool {
         providers[index].work_handle = if (rc == 0) handle else 0;
         buffers.unlock();
     }
-    buffers.lock(); defer buffers.unlock();
+    buffers.lock();
+    defer buffers.unlock();
     var pending = false;
     for (&providers) |*provider| if (provider.handle.id != 0) {
-        if (provider.retiring and !heldLocked(provider)) provider.* = .{}
-        else if (provider.work_handle != 0 or provider.notifying) { pending = true; }
+        if (provider.retiring and !heldLocked(provider)) provider.* = .{} else if (provider.work_handle != 0 or provider.notifying) {
+            pending = true;
+        }
     };
     var iter = state.tree.inorderIterator();
     while (iter.next()) |node| {

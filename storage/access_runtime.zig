@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 // Runtime serialization for storage admission metadata. This owner is always
 // released before filesystem, cache, driver or scheduler work begins.
 const core = @import("access_state.zig");
@@ -29,7 +30,7 @@ pub fn setOwnerResolver(resolver: OwnerResolver) void {
 pub fn currentOwner() ?Owner {
     if (owner_resolver) |resolve| if (resolve()) |owner| return owner;
     const running = scheduler.current() orelse return null;
-    return .{ .task = running.id, .task_generation = running.generation };
+    return .{ .task = native_tasks.get(running, .id), .task_generation = native_tasks.get(running, .generation) };
 }
 
 // The block registry already owns locks.storage at these two boundaries.

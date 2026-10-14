@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 const std = @import("std");
 const a = @import("r4os_kernel_contract");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
@@ -186,7 +187,7 @@ pub fn cleanup(owner: u32) Cleanup {
 pub fn canSleep() bool {
     if (!interrupts.wereEnabled(io.readRflags()) or interrupts.inRuntimeCriticalSection()) return false;
     const value = scheduler.current() orelse return false;
-    return value.preempt_disable_depth == 0 and value.held_lock_count == 0;
+    return native_tasks.get(value, .preempt_disable_depth) == 0 and native_tasks.get(value, .held_lock_count) == 0;
 }
 fn enterOperation() ?task_context.UnwindToken {
     const flags = interrupts.saveAndDisableRuntime();

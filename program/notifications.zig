@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 // Resident wait transport for userland runtimes. Mutex/condition-variable
 // policy stays in the calling library; only scheduler enrollment lives here.
 const std = @import("std");
@@ -38,7 +39,7 @@ fn active(owner: *Owner, handle: u64) ?*Record {
 fn canSleep() bool {
     if (!interrupts.wereEnabled(io.readRflags()) or interrupts.inRuntimeCriticalSection()) return false;
     const current = scheduler.current() orelse return false;
-    return current.preempt_disable_depth == 0 and current.held_lock_count == 0;
+    return native_tasks.get(current, .preempt_disable_depth) == 0 and native_tasks.get(current, .held_lock_count) == 0;
 }
 fn operation() ?task_context.UnwindToken {
     if (!canSleep()) return null;

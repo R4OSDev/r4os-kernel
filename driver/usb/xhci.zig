@@ -1,3 +1,4 @@
+const native_tasks = @import("../../sched/task.zig");
 const bootlog = @import("../../kernel/bootlog.zig");
 const diag_screen = @import("../../kernel/diag_screen.zig");
 const k = @import("../../kernel/log.zig");
@@ -419,7 +420,7 @@ pub const DeviceTransaction = struct {
 pub fn beginDeviceTransaction(handle: *DeviceHandle) ?DeviceTransaction {
     if (scheduler.current()) |task| {
         const controller_guard: u32 = if (controller_ownership.ownedByCurrent()) 1 else 0;
-        if (task.unwind_guard_count <= controller_guard) return null;
+        if (native_tasks.get(task, .unwind_guard_count) <= controller_guard) return null;
     }
     if (!acquireControllerOwnership()) return null;
     defer releaseControllerOwnership();
@@ -429,8 +430,8 @@ pub fn beginDeviceTransaction(handle: *DeviceHandle) ?DeviceTransaction {
     if (rt.transaction_active or rt.detach_pending) return null;
     const task = scheduler.current();
     rt.transaction_active = true;
-    rt.transaction_task_id = if (task) |owner| owner.id else 0;
-    rt.transaction_task_generation = if (task) |owner| owner.generation else 0;
+    rt.transaction_task_id = if (task) |owner| native_tasks.get(owner, .id) else 0;
+    rt.transaction_task_generation = if (task) |owner| native_tasks.get(owner, .generation) else 0;
     return .{ .runtime_index = index, .generation = rt.generation };
 }
 
@@ -449,8 +450,8 @@ pub fn endDeviceTransaction(transaction: DeviceTransaction) void {
 fn transactionOwnedByCurrent(rt: *const DeviceRuntime) bool {
     if (!rt.transaction_active) return false;
     const task = scheduler.current();
-    return rt.transaction_task_id == (if (task) |owner| owner.id else @as(u32, 0)) and
-        rt.transaction_task_generation == (if (task) |owner| owner.generation else @as(u64, 0));
+    return rt.transaction_task_id == (if (task) |owner| native_tasks.get(owner, .id) else @as(u32, 0)) and
+        rt.transaction_task_generation == (if (task) |owner| native_tasks.get(owner, .generation) else @as(u64, 0));
 }
 
 fn selectedDeviceAllowsMutation() bool {
@@ -1128,9 +1129,9 @@ pub fn startPortTask() bool {
         return false;
     };
     port_task_started = true;
-    port_task_id = worker.id;
+    port_task_id = native_tasks.get(worker, .id);
     k.puts("[XHCI] port-task started id=");
-    k.putDec(worker.id);
+    k.putDec(native_tasks.get(worker, .id));
     k.puts("\r\n");
     return true;
 }
@@ -3677,13 +3678,20 @@ pub fn setFirstConfiguration() bool {
     if (!selectedDeviceAllowsMutation()) return false;
     current.set_configuration_attempted = true;
     current.set_configuration_ok = submitControlNoData(0x00, USB_REQ_SET_CONFIGURATION, current.config_value, 0);
-    k.puts("[USBCONFIG] slot="); k.putDec(current.addressed_slot_id);
-    k.puts(" port="); k.putDec(current.addressed_port);
-    k.puts(" vid="); k.putHex(current.device_vendor_id, 4);
-    k.puts(" pid="); k.putHex(current.device_product_id, 4);
-    k.puts(" value="); k.putDec(current.config_value);
-    k.puts(" result="); k.puts(if (current.set_configuration_ok) "OK" else "FAILED");
-    k.puts(" code="); k.putDec(current.last_control_completion_code);
+    k.puts("[USBCONFIG] slot=");
+    k.putDec(current.addressed_slot_id);
+    k.puts(" port=");
+    k.putDec(current.addressed_port);
+    k.puts(" vid=");
+    k.putHex(current.device_vendor_id, 4);
+    k.puts(" pid=");
+    k.putHex(current.device_product_id, 4);
+    k.puts(" value=");
+    k.putDec(current.config_value);
+    k.puts(" result=");
+    k.puts(if (current.set_configuration_ok) "OK" else "FAILED");
+    k.puts(" code=");
+    k.putDec(current.last_control_completion_code);
     k.puts("\r\n");
     return current.set_configuration_ok;
 }
@@ -4628,16 +4636,26 @@ fn recoverInterruptEndpoint(from_pending: bool) bool {
     // The existing periodic counters alone cannot distinguish a stalled HID
     // endpoint from a malformed/failed transfer. No additional device reads.
     if (current.interrupt_recoveries < 4) {
-        k.puts("[USBHIDRECOVERY] slot="); k.putDec(slot);
-        k.puts(" endpoint="); k.putDec(ep_id);
-        k.puts(" port="); k.putDec(current.addressed_port);
-        k.puts(" vid="); k.putHex(current.device_vendor_id, 4);
-        k.puts(" pid="); k.putHex(current.device_product_id, 4);
-        k.puts(" from="); k.puts(if (from_pending) "pending-state" else "completion");
-        k.puts(" code="); k.putDec(current.last_interrupt_completion_code);
-        k.puts(" request="); k.putDec(current.last_interrupt_request_len);
-        k.puts(" residue="); k.putDec(current.last_interrupt_residue);
-        k.puts(" last-state="); k.putDec(current.last_interrupt_ep_state);
+        k.puts("[USBHIDRECOVERY] slot=");
+        k.putDec(slot);
+        k.puts(" endpoint=");
+        k.putDec(ep_id);
+        k.puts(" port=");
+        k.putDec(current.addressed_port);
+        k.puts(" vid=");
+        k.putHex(current.device_vendor_id, 4);
+        k.puts(" pid=");
+        k.putHex(current.device_product_id, 4);
+        k.puts(" from=");
+        k.puts(if (from_pending) "pending-state" else "completion");
+        k.puts(" code=");
+        k.putDec(current.last_interrupt_completion_code);
+        k.puts(" request=");
+        k.putDec(current.last_interrupt_request_len);
+        k.puts(" residue=");
+        k.putDec(current.last_interrupt_residue);
+        k.puts(" last-state=");
+        k.putDec(current.last_interrupt_ep_state);
         k.puts("\r\n");
     }
     const pending_owner = currentInterruptOwnerMatch();

@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 // Kernel-Heap v3: Rust-Besitzer unter Rust/memory/heap.rs; diese Fassade
 // behaelt die bisherigen Aufrufer und Diagnosefaelle.
 //
@@ -119,7 +120,7 @@ var growth_waiters: sync.WaitQueue = sync.WaitQueue.init();
 var growth_predicate_context: u8 = 0;
 export fn r4os_zig_heap_can_wait() callconv(.c) bool {
     const current = scheduler.current() orelse return false;
-    return current.preempt_disable_depth == 0 and current.held_lock_count == 0;
+    return native_tasks.get(current, .preempt_disable_depth) == 0 and native_tasks.get(current, .held_lock_count) == 0;
 }
 fn growthStillActive(_: *anyopaque) bool {
     return r4os_rust_heap_growing();

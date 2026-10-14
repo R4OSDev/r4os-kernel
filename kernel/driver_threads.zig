@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 const std = @import("std");
 const a = @import("r4os_kernel_contract");
 const interrupts = @import("../arch/x86_64/interrupts.zig");
@@ -130,8 +131,8 @@ pub fn start(owner: u32, input: *const a.DriverThreadRequest, output: *u64) i32 
         defer interrupts.restore(flags);
         if (created) |value| {
             record.payload.task_ptr = value;
-            record.payload.task_id = value.id;
-            record.payload.task_generation = value.generation;
+            record.payload.task_id = native_tasks.get(value, .id);
+            record.payload.task_generation = native_tasks.get(value, .generation);
         }
         const failure = if (created == null) a.driver_thread_error_memory else a.driver_thread_error_closed;
         if (!(state.prepared(record, created != null, failure) catch unreachable)) break :publish failure;
@@ -171,7 +172,7 @@ pub fn abortCurrent(owner: u32, result: i32) i32 {
         const record = currentRecordLocked() orelse return a.driver_thread_error_context;
         if (record.owner != owner) return a.driver_thread_error_owner;
         const current_task = scheduler.current() orelse unreachable;
-        if (current_task.unwind_guard_count != 1 or record.payload.waiting_on != null)
+        if (native_tasks.get(current_task, .unwind_guard_count) != 1 or record.payload.waiting_on != null)
             return a.driver_thread_error_busy;
         const frame = record.payload.abort_frame orelse return a.driver_thread_error_context;
         if (record.payload.flags & a.driver_thread_flag_abortable == 0 or frame.rsp == 0)
@@ -191,7 +192,7 @@ pub fn status(owner: u32, handle: u64, output: *a.DriverThreadStatus) i32 {
     defer interrupts.restore(flags);
     const record = publicRecord(owner, handle) catch |err| return code(err);
     const sleeping = record.phase == .running and record.payload.waiting_on == &record.payload.sleep_queue and
-        record.payload.task_ptr != null and record.payload.task_ptr.?.state == .blocked;
+        record.payload.task_ptr != null and native_tasks.get(record.payload.task_ptr.?, .state) == .blocked;
     output.* = .{
         .handle = record.handle,
         .owner_epoch = record.epoch,
@@ -439,8 +440,8 @@ fn threadMain() callconv(.c) void {
     const admitted = enter: {
         const flags = interrupts.saveAndDisableRuntime();
         defer interrupts.restore(flags);
-        std.debug.assert(record.payload.task_id == current_task.id and record.payload.task_generation == current_task.generation);
-        std.debug.assert(current_task.unwind_guard_count == 1);
+        std.debug.assert(record.payload.task_id == native_tasks.get(current_task, .id) and record.payload.task_generation == native_tasks.get(current_task, .generation));
+        std.debug.assert(native_tasks.get(current_task, .unwind_guard_count) == 1);
         record.payload.cpu_index = percpu.currentIndex();
         break :enter state.enter(record) catch unreachable;
     };
@@ -458,7 +459,7 @@ fn threadMain() callconv(.c) void {
         defer interrupts.restore(flags);
         // Follow the existing scheduler exit invariant. A broken callback
         // must never publish successful quiescence with synchronization held.
-        std.debug.assert(current_task.held_lock_count == 0 and current_task.unwind_guard_count == 1);
+        std.debug.assert(native_tasks.get(current_task, .held_lock_count) == 0 and native_tasks.get(current_task, .unwind_guard_count) == 1);
         std.debug.assert(record.payload.waiting_on == null);
         state.complete(record, result) catch unreachable;
     }
@@ -466,7 +467,7 @@ fn threadMain() callconv(.c) void {
     // A completed handle can be observed now, but Task retirement still fails.
     while (record.payload.completion.wakeOne() != 0) {}
     const flags = interrupts.saveAndDisableRuntime();
-    current_task.unwind_guard_count -= 1;
+    native_tasks.set(current_task, .unwind_guard_count, native_tasks.get(current_task, .unwind_guard_count) - (1));
     // No access to record after dropping this last execution-lifetime guard.
     interrupts.restore(flags);
 }
@@ -482,7 +483,7 @@ fn currentRecordLocked() ?*Record {
     const execution = task.executionOwner(current_task);
     if (execution.kind != .driver_thread) return null;
     const record: *Record = @ptrCast(@alignCast(execution.context orelse return null));
-    if (record.phase != .running or record.payload.task_id != current_task.id or record.payload.task_generation != current_task.generation) return null;
+    if (record.phase != .running or record.payload.task_id != native_tasks.get(current_task, .id) or record.payload.task_generation != native_tasks.get(current_task, .generation)) return null;
     return record;
 }
 
@@ -494,7 +495,7 @@ fn publicRecord(owner: u32, handle: u64) ownership.Error!*Record {
 fn canSleep() bool {
     if (!interrupts.wereEnabled(io.readRflags()) or interrupts.inRuntimeCriticalSection()) return false;
     const value = scheduler.current() orelse return false;
-    return value.preempt_disable_depth == 0 and value.held_lock_count == 0;
+    return native_tasks.get(value, .preempt_disable_depth) == 0 and native_tasks.get(value, .held_lock_count) == 0;
 }
 
 fn enterOperation() ?task_context.UnwindToken {

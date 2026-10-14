@@ -1,161 +1,56 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+const RawIndex = extern struct {
+    root: ?*anyopaque = null,
+    first: ?*anyopaque = null,
+    count: usize = 0,
+    visits: u64 = 0,
+};
+const RawNeighbors = extern struct { previous: ?*anyopaque = null, following: ?*anyopaque = null };
+const Less = *const fn (*const anyopaque, *const anyopaque) callconv(.c) bool;
+extern fn r4os_rust_task_index_insert(index: *RawIndex, node: *anyopaque, offset: usize, less: Less, output: *RawNeighbors) void;
+extern fn r4os_rust_task_index_next(index: *RawIndex, node: *anyopaque, offset: usize) ?*anyopaque;
+extern fn r4os_rust_task_index_remove(index: *RawIndex, node: *anyopaque, offset: usize) void;
 
-/// Intrusive AVL links: stable task storage owns every node. All mutations
-/// belong to the scheduler runtime owner and never allocate or call out.
+// The stable node contains a fixed private C link record; the native owner
+// receives only the link offset and pure ordering function, no Task layout.
 pub fn Links(comptime T: type) type {
-    return struct {
+    return extern struct {
         parent: ?*T = null,
         left: ?*T = null,
         right: ?*T = null,
         height: u8 = 1,
     };
 }
-
 pub fn Index(comptime T: type, comptime field: []const u8, comptime less: fn (*const T, *const T) bool) type {
-    return struct {
+    return extern struct {
         const Self = @This();
-        pub const Neighbors = struct { previous: ?*T = null, following: ?*T = null };
+        pub const Neighbors = extern struct { previous: ?*T = null, following: ?*T = null };
         root: ?*T = null,
         first: ?*T = null,
         count: usize = 0,
         visits: u64 = 0,
 
-        fn link(node: *T) *Links(T) {
-            return &@field(node, field);
+        comptime {
+            if (@sizeOf(Links(T)) != 32 or @sizeOf(Self) != 32 or @sizeOf(Neighbors) != 16)
+                @compileError("Native intrusive AVL C layout differs");
         }
-        fn height(node: ?*T) u8 {
-            return if (node) |n| link(n).height else 0;
+        fn lessBridge(a: *const anyopaque, b: *const anyopaque) callconv(.c) bool {
+            return less(@ptrCast(@alignCast(a)), @ptrCast(@alignCast(b)));
         }
-        fn update(node: *T) void {
-            link(node).height = 1 + @max(height(link(node).left), height(link(node).right));
-        }
-        fn balance(node: *T) i16 {
-            return @as(i16, height(link(node).left)) - @as(i16, height(link(node).right));
-        }
-
-        fn replace(self: *Self, old: *T, replacement: ?*T) void {
-            const parent = link(old).parent;
-            if (parent) |p| {
-                if (link(p).left == old) link(p).left = replacement else link(p).right = replacement;
-            } else self.root = replacement;
-            if (replacement) |n| link(n).parent = parent;
-        }
-
-        fn rotateLeft(self: *Self, node: *T) *T {
-            const pivot = link(node).right.?;
-            const middle = link(pivot).left;
-            self.replace(node, pivot);
-            link(pivot).left = node;
-            link(node).parent = pivot;
-            link(node).right = middle;
-            if (middle) |m| link(m).parent = node;
-            update(node);
-            update(pivot);
-            return pivot;
-        }
-
-        fn rotateRight(self: *Self, node: *T) *T {
-            const pivot = link(node).left.?;
-            const middle = link(pivot).right;
-            self.replace(node, pivot);
-            link(pivot).right = node;
-            link(node).parent = pivot;
-            link(node).left = middle;
-            if (middle) |m| link(m).parent = node;
-            update(node);
-            update(pivot);
-            return pivot;
-        }
-
-        fn rebalance(self: *Self, start: ?*T) void {
-            var cursor = start;
-            while (cursor) |node| {
-                self.visits +%= 1;
-                update(node);
-                var top = node;
-                if (balance(node) > 1) {
-                    if (balance(link(node).left.?) < 0) _ = self.rotateLeft(link(node).left.?);
-                    top = self.rotateRight(node);
-                } else if (balance(node) < -1) {
-                    if (balance(link(node).right.?) > 0) _ = self.rotateRight(link(node).right.?);
-                    top = self.rotateLeft(node);
-                }
-                cursor = link(top).parent;
-            }
-        }
-
         pub fn insert(self: *Self, node: *T) Neighbors {
-            link(node).* = .{};
-            var parent: ?*T = null;
-            var cursor = self.root;
-            var neighbors: Neighbors = .{};
-            while (cursor) |candidate| {
-                self.visits +%= 1;
-                parent = candidate;
-                if (less(node, candidate)) {
-                    neighbors.following = candidate;
-                    cursor = link(candidate).left;
-                } else {
-                    neighbors.previous = candidate;
-                    cursor = link(candidate).right;
-                }
-            }
-            link(node).parent = parent;
-            if (parent) |p| {
-                if (less(node, p)) link(p).left = node else link(p).right = node;
-            } else self.root = node;
-            if (neighbors.previous == null) self.first = node;
-            self.count += 1;
-            self.rebalance(parent);
-            return neighbors;
+            var result: Neighbors = .{};
+            r4os_rust_task_index_insert(@ptrCast(self), @ptrCast(node), @offsetOf(T, field), lessBridge, @ptrCast(&result));
+            return result;
         }
-
-        fn minimum(self: *Self, node: *T) *T {
-            var cursor = node;
-            while (link(cursor).left) |left| {
-                self.visits +%= 1;
-                cursor = left;
-            }
-            return cursor;
-        }
-
         pub fn next(self: *Self, node: *T) ?*T {
-            if (link(node).right) |right| return self.minimum(right);
-            var child = node;
-            var parent = link(child).parent;
-            while (parent) |p| {
-                self.visits +%= 1;
-                if (link(p).left == child) return p;
-                child = p;
-                parent = link(p).parent;
-            }
-            return null;
+            const result = r4os_rust_task_index_next(@ptrCast(self), @ptrCast(node), @offsetOf(T, field)) orelse return null;
+            return @ptrCast(@alignCast(result));
         }
-
         pub fn remove(self: *Self, node: *T) void {
-            if (self.first == node) self.first = self.next(node);
-            var start = link(node).parent;
-            if (link(node).left == null) {
-                self.replace(node, link(node).right);
-            } else if (link(node).right == null) {
-                self.replace(node, link(node).left);
-            } else {
-                // Move the successor node, never task payloads or identities.
-                const successor = self.minimum(link(node).right.?);
-                if (link(successor).parent != node) {
-                    start = link(successor).parent;
-                    self.replace(successor, link(successor).right);
-                    link(successor).right = link(node).right;
-                    link(link(successor).right.?).parent = successor;
-                } else start = successor;
-                self.replace(node, successor);
-                link(successor).left = link(node).left;
-                link(link(successor).left.?).parent = successor;
-                update(successor);
-            }
-            link(node).* = .{};
-            self.count -= 1;
-            self.rebalance(start);
+            r4os_rust_task_index_remove(@ptrCast(self), @ptrCast(node), @offsetOf(T, field));
         }
     };
 }

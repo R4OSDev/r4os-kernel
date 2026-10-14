@@ -73,13 +73,19 @@ pub mod rtc;
 pub mod scheduler;
 #[path = "../../../Rust/sched/scheduler_types.rs"]
 pub mod scheduler_types;
+#[path = "../../../Rust/sched/task/mod.rs"]
+pub mod task;
 #[path = "../../../Rust/sched/task_context.rs"]
 pub mod task_context;
+#[path = "../../../Rust/sched/task_index.rs"]
+pub mod task_index;
+#[path = "../../../Rust/sched/wait_node.rs"]
+pub mod wait_node;
 pub mod sched {
-    pub use crate::{scheduler, scheduler_types, task_context};
+    pub use crate::{scheduler, scheduler_types, task, task_context, task_index, wait_node};
 }
 pub mod memory {
-    pub use crate::{owner, paging, phys};
+    pub use crate::{heap, owner, paging, phys};
 }
 pub mod arch {
     pub use crate::fpu;
@@ -175,3 +181,27 @@ fn panic(_: &core::panic::PanicInfo<'_>) -> ! {
 pub extern "C" fn rust_eh_personality() -> ! {
     unsafe { r4os_kernel_owner_test_panic() }
 }
+
+// Weak archive links retain genuine test adapters and fail on unexpected entry.
+core::arch::global_asm!(include_str!("hardware_traps.S"));
+
+#[path = "../../../Rust/sched/sync_types.rs"]
+pub mod sync_types;
+
+#[path = "../../../Rust/sched/sync_wait.rs"]
+pub mod sync_wait;
+
+#[path = "../../../Rust/sched/sync_locks.rs"]
+pub mod sync_locks;
+
+#[path = "../../../Rust/sched/sync_objects.rs"]
+pub mod sync_objects;
+
+#[path = "../../../Rust/sched/sync_stats.rs"]
+pub mod sync_stats;
+
+#[path = "../../../Rust/sched/sync_selftest.rs"]
+pub mod sync_selftest;
+
+#[path = "../../../Rust/kernel/deadman.rs"]
+pub mod deadman;

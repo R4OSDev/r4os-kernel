@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 // Native allocation transport only. Placement and RM work remain in R4D.
 const std = @import("std");
 const abi = @import("r4os_kernel_contract");
@@ -231,7 +232,7 @@ pub fn wait(owner: buffers.Owner, handle: buffers.Handle, timeout_ticks: u64) Er
         if (entry.phase == .terminal) return entry.status();
         for (&waiters, 0..) |*waiter, i| if (waiter.task_id == 0) {
             entry.waiters += 1;
-            waiter.* = .{ .task_id = current.id, .generation = current.generation, .request = handle };
+            waiter.* = .{ .task_id = native_tasks.get(current, .id), .generation = native_tasks.get(current, .generation), .request = handle };
             break :blk i;
         };
         return error.Capacity;

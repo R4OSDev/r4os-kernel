@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 // Exact C report transport and remaining Task/VM/Mutex owner cuts.
 const std = @import("std");
 const boot_config = @import("boot_config.zig");
@@ -112,7 +113,7 @@ export fn r4os_zig_smp_probe_task(operation: u8, target: ?*task.Task, value: u64
         1 => @intFromBool(task.bindBlockedHomeCpu(target.?, @intCast(value))),
         2 => blk: {
             task.markReady(target.?, value);
-            break :blk target.?.home_cpu;
+            break :blk native_tasks.get(target.?, .home_cpu);
         },
         else => unreachable,
     };

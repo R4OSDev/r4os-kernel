@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 const monotonic = @import("../platform/monotonic.zig");
 const instrumentation = @import("instrumentation.zig");
 const owner_locks = @import("../memory/owner_locks.zig");
@@ -362,7 +363,7 @@ pub fn init() bool {
             summary_state.worker_started = 0;
             return false;
         };
-        worker_task_id = worker.id;
+        worker_task_id = native_tasks.get(worker, .id);
         worker_started = true;
         summary_state.worker_task_id = worker_task_id;
     }
@@ -371,7 +372,7 @@ pub fn init() bool {
             summary_state.worker_started = 0;
             return false;
         };
-        deadline_worker_task_id = worker.id;
+        deadline_worker_task_id = native_tasks.get(worker, .id);
         deadline_worker_started = true;
     }
     summary_state.worker_started = 1;

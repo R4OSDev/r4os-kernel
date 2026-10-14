@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 // Page-Cache v2 (0.56.8): page-organisiert + Hash-Index + Cache-Lock.
 //
 // Ersetzt den Sektor-Cache v1 (64 Eintraege, je EIN 512-B-Sektor in einem
@@ -315,9 +316,9 @@ pub fn startPolicyWorker() bool {
     if (policy_worker_started) return true;
     const worker = sched_task.createKernelThreadWithRole("pgcache-wb", policyWorkerMain, .batch) orelse return false;
     policy_worker_started = true;
-    policy_worker_task_id = worker.id;
+    policy_worker_task_id = native_tasks.get(worker, .id);
     stats.policy_worker_started = 1;
-    stats.policy_worker_task_id = worker.id;
+    stats.policy_worker_task_id = native_tasks.get(worker, .id);
     policy_event.signal();
     return true;
 }

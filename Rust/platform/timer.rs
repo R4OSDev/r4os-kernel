@@ -50,6 +50,8 @@ static DEADLINE_ENABLED: AtomicBool = AtomicBool::new(false);
 static MODE: AtomicU32 = AtomicU32::new(0);
 static ARMED: AtomicU64 = AtomicU64::new(NO_DEADLINE);
 static IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
+// Private diagnostic count; total IRQ telemetry and the public C record stay unchanged.
+static IDLE_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static IDLE_ENTRIES: AtomicU64 = AtomicU64::new(0);
 static ARMS: AtomicU64 = AtomicU64::new(0);
 static EARLIER: AtomicU64 = AtomicU64::new(0);
@@ -260,6 +262,7 @@ fn on_irq() -> u64 {
     let now = tick_count();
     LAST_IRQ.store(now, Ordering::Release);
     if MODE.load(Ordering::Acquire) == 1 {
+        IDLE_IRQ_COUNT.fetch_add(1, Ordering::Relaxed);
         LAST_LATENESS.store(0, Ordering::Release);
         let armed = ARMED.load(Ordering::Acquire);
         if armed != NO_DEADLINE && now > armed {
@@ -426,6 +429,7 @@ pub extern "C" fn r4os_rust_timer_control(operation: u8, a: u64, b: u64) -> u64 
                 u64::from(DEADLINE_ENABLED.load(Ordering::Acquire))
             }
         }
+        16 => IDLE_IRQ_COUNT.load(Ordering::Relaxed),
         _ => panic!("Invalid private timer operation"),
     }
 }

@@ -1,3 +1,4 @@
+const native_tasks = @import("task.zig");
 // Private C facade. Rust owns scheduling, CPU slots, counters and switch policy.
 const task = @import("task.zig");
 const timer = @import("../kernel/timer.zig");
@@ -273,10 +274,10 @@ pub fn publishCreatedTask(target: *task.Task) bool {
     return r4os_rust_scheduler_task(3, target, 0, 0, null, 0) != 0;
 }
 pub fn currentId() ?u32 {
-    return if (current()) |t| t.id else null;
+    return if (current()) |t| native_tasks.get(t, .id) else null;
 }
 pub fn currentName() ?[]const u8 {
-    return if (current()) |t| t.name else null;
+    return if (current()) |t| native_tasks.get(t, .name) else null;
 }
 pub fn stats() Stats {
     var value: Stats = undefined;

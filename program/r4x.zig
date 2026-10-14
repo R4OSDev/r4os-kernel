@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 const keyboard = @import("../driver/input/keyboard.zig");
 const config = @import("config");
 const audio = @import("../audio/core.zig");
@@ -8557,7 +8558,7 @@ fn reportBootFilesystemWait(enabled: bool, drive_letter: u8) void {
     };
     defer _ = task.unpin(owner_task);
 
-    var owner_name = owner_task.name;
+    var owner_name = native_tasks.get(owner_task, .name);
     var activity = filesystemKindLabel(snapshot.kind);
     const execution_owner = task.executionOwner(owner_task);
     switch (execution_owner.kind) {
@@ -8583,8 +8584,8 @@ fn reportBootFilesystemWait(enabled: bool, drive_letter: u8) void {
         },
         .none, .driver_thread => {},
     }
-    if (owner_task.state == .blocked and owner_task.wait_reason.len != 0) {
-        activity = owner_task.wait_reason;
+    if (native_tasks.get(owner_task, .state) == .blocked and native_tasks.get(owner_task, .wait_reason).len != 0) {
+        activity = native_tasks.get(owner_task, .wait_reason);
     }
 
     bootscreen.setServiceStage(owner_name, activity);
@@ -9975,7 +9976,7 @@ pub fn preparePageFaultStack(addr: u64, interrupted_rsp: u64, frame_bytes: u64) 
     if (interrupted_rsp < frame_bytes) return null;
     const frame_base = alignDown(interrupted_rsp - frame_bytes, 16);
     if (currentProgramThread()) |thread_ctx| {
-        if (thread_ctx.task_id != current_task.id) return null;
+        if (thread_ctx.task_id != native_tasks.get(current_task, .id)) return null;
         if ((thread_ctx.flags & THREAD_FLAG_MAIN) != 0) {
             const instance = thread_ctx.owner_instance orelse return null;
             if (addressInStackReserve(instance, interrupted_rsp - 1)) {
@@ -9993,8 +9994,8 @@ pub fn preparePageFaultStack(addr: u64, interrupted_rsp: u64, frame_bytes: u64) 
     }
     // Kernel continuations already have resident guarded stacks. Do not
     // accept a foreign stack or an exhausted call budget.
-    if (interrupted_rsp > current_task.stack_top or frame_base < current_task.stack_base or
-        frame_base - current_task.stack_base < 32 * 1024) return null;
+    if (interrupted_rsp > native_tasks.get(current_task, .stack_top) or frame_base < native_tasks.get(current_task, .stack_base) or
+        frame_base - native_tasks.get(current_task, .stack_base) < 32 * 1024) return null;
     return frame_base;
 }
 
@@ -10288,7 +10289,7 @@ fn runForegroundProgram(reservation: *const ProgramInstanceReservation, reservat
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_TASK_FAILED);
         return .failed;
     }
-    instance.task_id = program_task.id;
+    instance.task_id = native_tasks.get(program_task, .id);
     if (registerMainThread(instance, program_task) == null) {
         _ = releaseCreatedProgramTask(program_task);
         rollbackReservedProgramInstance(reservation);
@@ -10406,7 +10407,7 @@ fn runShellProgram(reservation: *const ProgramInstanceReservation, reservation_a
         setProgramLaunchError(options, PROGRAM_HANDLE_ERROR_TASK_FAILED);
         return .failed;
     }
-    instance.task_id = shell_task.id;
+    instance.task_id = native_tasks.get(shell_task, .id);
     reportBootLaunchStage(options.report_boot_launch, "Thread binden");
     if (registerMainThread(instance, shell_task) == null) {
         _ = releaseCreatedProgramTask(shell_task);
@@ -10528,7 +10529,7 @@ fn runBackgroundProgram(reservation: *const ProgramInstanceReservation, reservat
             return .failed;
         }
     }
-    instance.task_id = program_task.id;
+    instance.task_id = native_tasks.get(program_task, .id);
     if (registerMainThread(instance, program_task) == null) {
         _ = releaseCreatedProgramTask(program_task);
         rollbackReservedProgramInstance(reservation);
@@ -11484,8 +11485,8 @@ fn ensureAsyncIoWorkersLocked(service: bool) bool {
                 // A fresh blocked task cannot already have an owner.
                 @panic("async worker owner binding");
             }
-            worker.task_id = new_task.id;
-            worker.task_generation = new_task.generation;
+            worker.task_id = native_tasks.get(new_task, .id);
+            worker.task_generation = native_tasks.get(new_task, .generation);
             worker.service = service;
             async_io_worker_creations +%= 1;
             task.markReady(new_task, timer.tickCount());
@@ -11505,9 +11506,9 @@ fn asyncIoWorkerRequest(owner_task: *const task.Task) ?*AsyncIoRequest {
     const owner = task.executionOwner(owner_task);
     if (owner.kind != .async_io) return null;
     const worker: *AsyncIoWorker = @ptrCast(@alignCast(owner.context orelse return null));
-    if (worker.task_id != owner_task.id or worker.task_generation != owner_task.generation) return null;
+    if (worker.task_id != native_tasks.get(owner_task, .id) or worker.task_generation != native_tasks.get(owner_task, .generation)) return null;
     const req = @atomicLoad(?*AsyncIoRequest, &worker.request, .acquire) orelse return null;
-    if (!req.used or req.task_id != owner_task.id or req.task_generation != owner_task.generation) return null;
+    if (!req.used or req.task_id != native_tasks.get(owner_task, .id) or req.task_generation != native_tasks.get(owner_task, .generation)) return null;
     return req;
 }
 
@@ -12052,7 +12053,7 @@ fn retireAsyncIoTask(claim: AsyncIoRetireClaim) bool {
     unlockAsyncIoRequests();
     const worker = target orelse return true;
     const current_task = scheduler.current();
-    if (!releaseProgramTaskGeneration(claim.task_id, claim.task_generation, if (current_task) |value| value.id else 0, if (current_task) |value| value.generation else 0)) return false;
+    if (!releaseProgramTaskGeneration(claim.task_id, claim.task_generation, if (current_task) |value| native_tasks.get(value, .id) else 0, if (current_task) |value| native_tasks.get(value, .generation) else 0)) return false;
     if (!lockAsyncIoRequests()) return false;
     defer unlockAsyncIoRequests();
     if (worker.task_id == claim.task_id and worker.task_generation == claim.task_generation) {
@@ -12151,8 +12152,8 @@ fn apiThreadCreateHandle(entry: RawEntryFn, arg: u64, stack_reserve_bytes: u64, 
         .instance_id = instance.id,
         .instance_generation = instance_handle.generation,
         .owner_instance = instance,
-        .task_id = new_task.id,
-        .task_generation = new_task.generation,
+        .task_id = native_tasks.get(new_task, .id),
+        .task_generation = native_tasks.get(new_task, .generation),
         .state = .ready,
         .flags = THREAD_FLAG_JOINABLE,
         .entry = canonical_entry,
@@ -12167,14 +12168,14 @@ fn apiThreadCreateHandle(entry: RawEntryFn, arg: u64, stack_reserve_bytes: u64, 
         .join_queue = sync.WaitQueue.init(),
     };
     if (!task.bindExecutionOwner(new_task, .program_thread, @ptrCast(thread_ctx))) {
-        _ = task.retireIdentity(new_task.id, new_task.generation);
+        _ = task.retireIdentity(native_tasks.get(new_task, .id), native_tasks.get(new_task, .generation));
         _ = freeProgramThreadMemory(thread_ctx);
         _ = freeProgramStack(&stack);
         return THREAD_ERROR_NO_MEMORY;
     }
     if (!publishProgramThread(thread_ctx)) {
         _ = task.clearExecutionOwner(new_task, @ptrCast(thread_ctx));
-        _ = task.retireIdentity(new_task.id, new_task.generation);
+        _ = task.retireIdentity(native_tasks.get(new_task, .id), native_tasks.get(new_task, .generation));
         _ = freeProgramThreadMemory(thread_ctx);
         _ = freeProgramStack(&stack);
         return THREAD_ERROR_NO_MEMORY;
@@ -12220,8 +12221,8 @@ fn apiProgramExit(exit_code: i32, reason: u32) callconv(.c) i32 {
     const io = @import("../arch/x86_64/io.zig");
     if (!interrupts.wereEnabled(io.readRflags()) or interrupts.inRuntimeCriticalSection()) return THREAD_ERROR_BUSY;
     const running = scheduler.current() orelse return THREAD_ERROR_NO_INSTANCE;
-    if (running.preempt_disable_depth != 0 or running.held_lock_count != 0 or
-        running.unwind_guard_count != 0 or running.wait_handoff_guard_pending) return THREAD_ERROR_BUSY;
+    if (native_tasks.get(running, .preempt_disable_depth) != 0 or native_tasks.get(running, .held_lock_count) != 0 or
+        native_tasks.get(running, .unwind_guard_count) != 0 or native_tasks.get(running, .wait_handoff_guard_pending)) return THREAD_ERROR_BUSY;
     const thread_ctx = currentProgramThread() orelse return THREAD_ERROR_NO_INSTANCE;
     exitProgramThread(thread_ctx, exit_code, @intCast(reason));
 }
@@ -12333,8 +12334,8 @@ fn joinProgramThread(thread_id: u32, exact: ?ProgramJoinHandle, timeout_ticks: u
             return THREAD_ERROR_NOT_FOUND;
     }
     const current_task = scheduler.current() orelse return THREAD_ERROR_NO_INSTANCE;
-    const current_task_id = current_task.id;
-    const current_task_generation = current_task.generation;
+    const current_task_id = native_tasks.get(current_task, .id);
+    const current_task_generation = native_tasks.get(current_task, .generation);
     const target = switch (claimProgramThreadJoin(
         thread_id,
         if (exact) |handle| handle.thread_generation else null,
@@ -12559,8 +12560,8 @@ fn registerMainThread(instance: *ProgramInstance, program_task: *task.Task) ?*Pr
         .instance_id = instance.id,
         .instance_generation = instance_handle.generation,
         .owner_instance = instance,
-        .task_id = program_task.id,
-        .task_generation = program_task.generation,
+        .task_id = native_tasks.get(program_task, .id),
+        .task_generation = native_tasks.get(program_task, .generation),
         .state = .ready,
         .flags = THREAD_FLAG_MAIN,
         .entry = instance.entry,
@@ -12676,7 +12677,7 @@ fn currentProgramThread() ?*ProgramThread {
     const owner = task.executionOwner(current_task);
     if (owner.kind != .program_thread) return null;
     const thread_ctx: *ProgramThread = @ptrCast(@alignCast(owner.context orelse return null));
-    if (!thread_ctx.used or thread_ctx.task_id != current_task.id or thread_ctx.task_generation != current_task.generation) return null;
+    if (!thread_ctx.used or thread_ctx.task_id != native_tasks.get(current_task, .id) or thread_ctx.task_generation != native_tasks.get(current_task, .generation)) return null;
     return thread_ctx;
 }
 
@@ -12945,8 +12946,8 @@ fn completeProgramThreadRetire(
         }
         reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Task freigeben");
         const current_task = scheduler.current();
-        const current_task_id = if (current_task) |value| value.id else 0;
-        const current_task_generation = if (current_task) |value| value.generation else 0;
+        const current_task_id = if (current_task) |value| native_tasks.get(value, .id) else 0;
+        const current_task_generation = if (current_task) |value| native_tasks.get(value, .generation) else 0;
         if (!releaseProgramTaskGeneration(owner_task_id, owner_task_generation, current_task_id, current_task_generation)) {
             reportBootForegroundRetireStage(report_boot_foreground, "SERVMAN: Task wartet");
             clearProgramThreadRetireClaim(thread_ctx, keep_join_lease);
@@ -13069,9 +13070,9 @@ fn completeProgramThreadRetire(
 
 fn releaseCreatedProgramTask(created: *task.Task) bool {
     const current_task = scheduler.current();
-    const current_task_id = if (current_task) |value| value.id else 0;
-    const current_task_generation = if (current_task) |value| value.generation else 0;
-    return releaseProgramTaskGeneration(created.id, created.generation, current_task_id, current_task_generation);
+    const current_task_id = if (current_task) |value| native_tasks.get(value, .id) else 0;
+    const current_task_generation = if (current_task) |value| native_tasks.get(value, .generation) else 0;
+    return releaseProgramTaskGeneration(native_tasks.get(created, .id), native_tasks.get(created, .generation), current_task_id, current_task_generation);
 }
 
 fn releaseProgramTaskGeneration(task_id: u32, task_generation: u64, current_task_id: u32, current_task_generation: u64) bool {
@@ -15177,8 +15178,8 @@ fn publishAsyncServiceRequestId(req: *AsyncIoRequest, request_id: u32) bool {
     defer unlockAsyncIoRequests();
     const current_task = scheduler.current() orelse return false;
     if (!req.used or
-        req.task_id != current_task.id or
-        req.task_generation != current_task.generation or
+        req.task_id != native_tasks.get(current_task, .id) or
+        req.task_generation != native_tasks.get(current_task, .generation) or
         req.cancel_requested) return false;
     req.service_request_id = request_id;
     return true;
@@ -15189,8 +15190,8 @@ fn clearAsyncServiceRequestId(req: *AsyncIoRequest, request_id: u32) void {
     defer unlockAsyncIoRequests();
     const current_task = scheduler.current() orelse return;
     if (!req.used or
-        req.task_id != current_task.id or
-        req.task_generation != current_task.generation or
+        req.task_id != native_tasks.get(current_task, .id) or
+        req.task_generation != native_tasks.get(current_task, .generation) or
         req.service_request_id != request_id) return;
     req.service_request_id = 0;
 }
@@ -19809,7 +19810,7 @@ fn noteParallelOwnerExecution(instance: *const ProgramInstance, worker: bool) vo
     _ = @atomicRmw(u64, if (worker) &parallel_probe_thread_mask else &parallel_probe_main_mask, .Or, mask, .acq_rel);
     if (!worker and instance.app_class == .service) _ = @atomicRmw(u64, &parallel_probe_service_mask, .Or, mask, .acq_rel);
     if (scheduler.current()) |running| {
-        if (!running.smp_eligible) _ = @atomicRmw(u32, &parallel_probe_bad_inheritance, .Add, 1, .acq_rel);
+        if (!native_tasks.get(running, .smp_eligible)) _ = @atomicRmw(u32, &parallel_probe_bad_inheritance, .Add, 1, .acq_rel);
     }
 }
 

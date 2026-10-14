@@ -1,3 +1,4 @@
+const native_tasks = @import("../../sched/task.zig");
 const protocol_api = @import("../../kernel/protocol_api.zig");
 const r4p = @import("../../program/r4p.zig");
 const r4p_contract = @import("../../net/r4p_contract.zig");
@@ -461,10 +462,10 @@ pub fn startPollTask() bool {
         return false;
     };
     poll_task_started = true;
-    poll_task_id = worker.id;
+    poll_task_id = native_tasks.get(worker, .id);
     sched_task.markReady(worker, timer_core.tickCount());
     k.puts("USBHID poll-task started id=");
-    k.putDec(worker.id);
+    k.putDec(native_tasks.get(worker, .id));
     k.puts("\r\n");
     return true;
 }
@@ -794,7 +795,10 @@ fn ensureSelected(binding: *HidBinding, kind: HidKind) bool {
 }
 
 fn decodeConsumerReport(binding: *HidBinding, report: []const u8) void {
-    const decoded = hid_report.consumer(&binding.report_wire, report) orelse { binding.failures += 1; return; };
+    const decoded = hid_report.consumer(&binding.report_wire, report) orelse {
+        binding.failures += 1;
+        return;
+    };
     if (decoded.report_id >= binding.consumer_pressed.len) return;
     const pressed: u8 = @intCast(decoded.pressed);
     const rising = pressed & ~binding.consumer_pressed[decoded.report_id];

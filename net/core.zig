@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 const r4x_api = @import("../program/r4x_api.zig");
 const arp = @import("arp.zig");
 const net_config = @import("config.zig");
@@ -5242,7 +5243,7 @@ fn pollAdaptersInner(rounds: usize, adapter_mask: u16) void {
 
 fn isRxTaskCurrent() bool {
     const current = scheduler.current() orelse return false;
-    return current.id == rx_task_id and current.generation == rx_task_generation;
+    return native_tasks.get(current, .id) == rx_task_id and native_tasks.get(current, .generation) == rx_task_generation;
 }
 
 // 0.56.2: Autonomer Hintergrund-RX-Task. Der heutige Netzstack nimmt
@@ -5356,10 +5357,10 @@ pub fn startRxTask() bool {
         return false;
     };
     rx_task_started = true;
-    rx_task_id = worker.id;
-    rx_task_generation = worker.generation;
+    rx_task_id = native_tasks.get(worker, .id);
+    rx_task_generation = native_tasks.get(worker, .generation);
     k.puts("NET rx-task started id=");
-    k.putDec(worker.id);
+    k.putDec(native_tasks.get(worker, .id));
     k.puts("\r\n");
     k.puts("NETRX handoff queue=");
     k.putDec(RX_HANDOFF_QUEUE_SIZE);
@@ -5383,12 +5384,12 @@ pub fn startDhcpTask() bool {
     dhcp_task_started = true;
     dhcp_task_retry_requested = false;
     dhcp_task_next_retry_tick = 0;
-    dhcp_task_id = worker.id;
-    dhcp_task_generation = worker.generation;
+    dhcp_task_id = native_tasks.get(worker, .id);
+    dhcp_task_generation = native_tasks.get(worker, .generation);
     k.puts("DHCP05913 task=started id=");
-    k.putDec(worker.id);
+    k.putDec(native_tasks.get(worker, .id));
     k.puts(" generation=");
-    k.putDec(worker.generation);
+    k.putDec(native_tasks.get(worker, .generation));
     k.puts("\r\n");
     return true;
 }

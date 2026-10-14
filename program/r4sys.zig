@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 const r4x_api = @import("r4x_api.zig");
 const std = @import("std");
 const drive = @import("../fs/drive.zig");
@@ -3785,8 +3786,8 @@ fn currentStreamOwner() ?StreamOwner {
     const current = scheduler.current() orelse return null;
     return .{
         .kind = .kernel_task,
-        .id = current.id,
-        .generation = current.generation,
+        .id = native_tasks.get(current, .id),
+        .generation = native_tasks.get(current, .generation),
     };
 }
 

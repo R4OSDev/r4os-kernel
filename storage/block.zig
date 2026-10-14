@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 const diag_screen = @import("../kernel/diag_screen.zig");
 const block_dispatch = @import("block_dispatch.zig");
 const block_split = @import("block_split.zig");
@@ -468,8 +469,8 @@ fn startControllerWorker(lane: u8, critical: bool) bool {
         sched_task.createKernelThreadWithRole(worker_names[lane], workerMain, .batch);
     const task = worker orelse return false;
     controller_runtime[lane].worker_started = true;
-    controller_runtime[lane].worker_task_id = task.id;
-    controller_runtime[lane].worker_task_generation = task.generation;
+    controller_runtime[lane].worker_task_id = native_tasks.get(task, .id);
+    controller_runtime[lane].worker_task_generation = native_tasks.get(task, .generation);
     return true;
 }
 
@@ -2298,8 +2299,8 @@ fn currentWorkerLane() u8 {
     while (lane < controller_runtime.len) : (lane += 1) {
         const runtime = &controller_runtime[lane];
         if (runtime.worker_started and
-            runtime.worker_task_id == current.id and
-            runtime.worker_task_generation == current.generation)
+            runtime.worker_task_id == native_tasks.get(current, .id) and
+            runtime.worker_task_generation == native_tasks.get(current, .generation))
         {
             return @intCast(lane);
         }
@@ -2596,7 +2597,7 @@ fn asyncDispatchSelfTest() bool {
     if (ok) {
         late_handle = (asyncTestFindRequest(.read, 2) orelse return asyncDispatchSelfTestResult(false, before, runtimeWorkerSummary())).handle;
         const kill_deferrals_before = sched_task.killHeldLockDeferrals();
-        if (sched_task.kill(reset_task.?.id) or sched_task.killHeldLockDeferrals() <= kill_deferrals_before) ok = false;
+        if (sched_task.kill(native_tasks.get(reset_task.?, .id)) or sched_task.killHeldLockDeferrals() <= kill_deferrals_before) ok = false;
         // Unload admission must remain transactional while either a caller pin
         // or a hardware-owned request is live.
         if (unregister(index)) ok = false;

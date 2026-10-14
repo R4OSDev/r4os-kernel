@@ -1,3 +1,4 @@
+const native_tasks = @import("../../sched/task.zig");
 const gdt = @import("gdt.zig");
 const interrupts = @import("interrupts.zig");
 const lapic = @import("lapic.zig");
@@ -105,20 +106,19 @@ fn exceptionDispatchInner(frame: *const InterruptFrame, page_fault_addr: u64, pr
     k.putDec(percpu.currentIndex());
     if (scheduler.current()) |current_task| {
         k.puts(" task=");
-        k.putDec(current_task.id);
+        k.putDec(native_tasks.get(current_task, .id));
         k.puts("/");
-        k.puts(current_task.name);
+        k.puts(native_tasks.get(current_task, .name));
         k.puts(" state_raw=");
-        const state_raw: *const u8 = @ptrCast(&current_task.state);
-        k.putDec(state_raw.*);
+        k.putDec(native_tasks.rawState(current_task));
         k.puts(" running_cpu=");
-        k.putDec(current_task.running_cpu);
+        k.putDec(native_tasks.get(current_task, .running_cpu));
         k.puts(" saved_rsp=0x");
-        k.putHex(current_task.rsp, 16);
+        k.putHex(native_tasks.get(current_task, .rsp), 16);
         k.puts(" stack=0x");
-        k.putHex(current_task.stack_base, 16);
+        k.putHex(native_tasks.get(current_task, .stack_base), 16);
         k.puts("..0x");
-        k.putHex(current_task.stack_top, 16);
+        k.putHex(native_tasks.get(current_task, .stack_top), 16);
     }
     const fault_rsp = interruptedRsp(frame);
     k.puts(" rip=0x");

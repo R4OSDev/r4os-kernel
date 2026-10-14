@@ -1,3 +1,4 @@
+const native_tasks = @import("../sched/task.zig");
 const r4x_api = @import("r4x_api.zig");
 const instrumentation = @import("../kernel/instrumentation.zig");
 const runtime_interrupts = @import("../arch/x86_64/interrupts.zig");
@@ -2170,8 +2171,8 @@ pub fn performanceSummary(out: *ProgramPerformanceSummary) callconv(.c) i32 {
         .lock_held_slots_used = lock_summary.held_slots_used,
         .lock_current_depth = lock_summary.current_depth,
         .lock_max_depth = lock_summary.max_depth,
-        .fpu_lazy_saves = sched_task.fpu_lazy_saves,
-        .fpu_lazy_skips = sched_task.fpu_lazy_skips,
+        .fpu_lazy_saves = sched_task.fpuLazySaves(),
+        .fpu_lazy_skips = sched_task.fpuLazySkips(),
         .lock_tracking_drops = lock_summary.tracking_drops,
         .preemption_supported = sched.preemption_supported,
         .preemption_enabled = sched.preemption_enabled,
@@ -2732,54 +2733,54 @@ pub fn performanceTask(index: u32, out: *ProgramTaskPerformanceInfo) callconv(.c
     };
     defer _ = sched_task.unpin(t);
     const now = timer.tickCount();
-    const blocked_ticks = if (t.state == .blocked and t.blocked_since_tick != 0 and now >= t.blocked_since_tick)
-        now - t.blocked_since_tick
+    const blocked_ticks = if (native_tasks.get(t, .state) == .blocked and native_tasks.get(t, .blocked_since_tick) != 0 and now >= native_tasks.get(t, .blocked_since_tick))
+        now - native_tasks.get(t, .blocked_since_tick)
     else
         0;
-    const ticks_since_yield = if (t.last_yield_tick != 0 and now >= t.last_yield_tick)
-        now - t.last_yield_tick
+    const ticks_since_yield = if (native_tasks.get(t, .last_yield_tick) != 0 and now >= native_tasks.get(t, .last_yield_tick))
+        now - native_tasks.get(t, .last_yield_tick)
     else
         0;
-    const ticks_since_scheduled = if (t.last_scheduled_tick != 0 and now >= t.last_scheduled_tick)
-        now - t.last_scheduled_tick
+    const ticks_since_scheduled = if (native_tasks.get(t, .last_scheduled_tick) != 0 and now >= native_tasks.get(t, .last_scheduled_tick))
+        now - native_tasks.get(t, .last_scheduled_tick)
     else
         0;
     out.* = .{
         .index = index,
-        .id = t.id,
-        .state = sched_task.stateCode(t.state),
-        .flags = if (t.entry != null) 1 else 0,
-        .wake_tick = t.wake_tick,
-        .blocked_since_tick = t.blocked_since_tick,
+        .id = native_tasks.get(t, .id),
+        .state = sched_task.stateCode(native_tasks.get(t, .state)),
+        .flags = if (native_tasks.get(t, .entry) != null) 1 else 0,
+        .wake_tick = native_tasks.get(t, .wake_tick),
+        .blocked_since_tick = native_tasks.get(t, .blocked_since_tick),
         .blocked_ticks = blocked_ticks,
-        .created_tick = t.created_tick,
-        .last_scheduled_tick = t.last_scheduled_tick,
-        .last_yield_tick = t.last_yield_tick,
+        .created_tick = native_tasks.get(t, .created_tick),
+        .last_scheduled_tick = native_tasks.get(t, .last_scheduled_tick),
+        .last_yield_tick = native_tasks.get(t, .last_yield_tick),
         .ticks_since_yield = ticks_since_yield,
-        .run_ticks = t.run_ticks,
-        .switches_in = t.switches_in,
-        .stack_base = t.stack_base,
-        .stack_top = t.stack_top,
-        .stack_bytes = if (t.stack_top >= t.stack_base) t.stack_top - t.stack_base else 0,
-        .blocked_object = t.wait_object,
-        .wait_result = @intFromEnum(t.wait_result),
-        .preempt_disable_depth = t.preempt_disable_depth,
-        .preempt_disable_max_depth = t.preempt_disable_max_depth,
+        .run_ticks = native_tasks.get(t, .run_ticks),
+        .switches_in = native_tasks.get(t, .switches_in),
+        .stack_base = native_tasks.get(t, .stack_base),
+        .stack_top = native_tasks.get(t, .stack_top),
+        .stack_bytes = if (native_tasks.get(t, .stack_top) >= native_tasks.get(t, .stack_base)) native_tasks.get(t, .stack_top) - native_tasks.get(t, .stack_base) else 0,
+        .blocked_object = native_tasks.get(t, .wait_object),
+        .wait_result = @intFromEnum(native_tasks.get(t, .wait_result)),
+        .preempt_disable_depth = native_tasks.get(t, .preempt_disable_depth),
+        .preempt_disable_max_depth = native_tasks.get(t, .preempt_disable_max_depth),
         .ticks_since_scheduled = ticks_since_scheduled,
-        .preemption_probe_hits = t.preemption_probe_hits,
-        .preemption_deferred_ticks = t.preemption_deferred_ticks,
-        .long_run_warnings = t.long_run_warnings,
-        .starvation_warnings = t.starvation_warnings,
-        .ready_since_tick = t.ready_since_tick,
-        .last_ready_latency_ticks = t.last_ready_latency_ticks,
-        .max_ready_latency_ticks = t.max_ready_latency_ticks,
-        .last_wait_ticks = t.last_wait_ticks,
-        .max_wait_ticks = t.max_wait_ticks,
-        .max_run_without_switch_ticks = t.max_run_without_switch_ticks,
-        .max_preemption_deferred_ticks = t.max_preemption_deferred_ticks,
+        .preemption_probe_hits = native_tasks.get(t, .preemption_probe_hits),
+        .preemption_deferred_ticks = native_tasks.get(t, .preemption_deferred_ticks),
+        .long_run_warnings = native_tasks.get(t, .long_run_warnings),
+        .starvation_warnings = native_tasks.get(t, .starvation_warnings),
+        .ready_since_tick = native_tasks.get(t, .ready_since_tick),
+        .last_ready_latency_ticks = native_tasks.get(t, .last_ready_latency_ticks),
+        .max_ready_latency_ticks = native_tasks.get(t, .max_ready_latency_ticks),
+        .last_wait_ticks = native_tasks.get(t, .last_wait_ticks),
+        .max_wait_ticks = native_tasks.get(t, .max_wait_ticks),
+        .max_run_without_switch_ticks = native_tasks.get(t, .max_run_without_switch_ticks),
+        .max_preemption_deferred_ticks = native_tasks.get(t, .max_preemption_deferred_ticks),
     };
-    copyFixedZ(out.name[0..], t.name);
-    copyFixedZ(out.wait_reason[0..], t.wait_reason);
+    copyFixedZ(out.name[0..], native_tasks.get(t, .name));
+    copyFixedZ(out.wait_reason[0..], native_tasks.get(t, .wait_reason));
     return 1;
 }
 
