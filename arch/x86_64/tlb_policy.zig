@@ -1,16 +1,19 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+extern fn r4os_rust_tlb_mask(operation: u8, first: u64, second: u64) u64;
 
 pub fn targetMask(online_mask: u64, current_cpu: u32) u64 {
-    if (current_cpu >= 64) return online_mask;
-    return online_mask & ~(@as(u64, 1) << @intCast(current_cpu));
+    return r4os_rust_tlb_mask(0, online_mask, current_cpu);
 }
 
 pub fn completed(target_mask: u64, acknowledgement_mask: u64) bool {
-    return (acknowledgement_mask & target_mask) == target_mask;
+    return r4os_rust_tlb_mask(1, target_mask, acknowledgement_mask) != 0;
 }
 
 pub fn offlineSinceSnapshot(target_mask: u64, online_mask: u64) u64 {
-    return target_mask & ~online_mask;
+    return r4os_rust_tlb_mask(2, target_mask, online_mask);
 }
 
 test "shootdown excludes issuer and offline CPUs" {

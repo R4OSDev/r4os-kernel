@@ -1,10 +1,4 @@
-// CPU-local architectural state.  The first field is intentionally the
-// scheduler-visible CPU index: r4os_current_cpu_index reads it through GS:0.
-
-const msr = @import("msr.zig");
-const builtin = @import("builtin");
-const interrupts = @import("interrupts.zig");
-
+// Fixed C projection of the single native CPU-local/lifecycle owner.
 pub const max_cpus: usize = 32;
 
 const IA32_GS_BASE: u32 = 0xC000_0101;
@@ -34,209 +28,85 @@ pub const CpuLocal = extern struct {
     reserved: [46]u8 = .{0} ** 46,
 };
 
+extern fn r4os_rust_percpu_control(operation: u8, index: u32, value: u64, extra: u8) u64;
+extern fn r4os_rust_percpu_slot(index: u32) ?*CpuLocal;
+extern fn r4os_rust_percpu_depth() *u32;
 comptime {
-    if (@offsetOf(CpuLocal, "index") != 0 or @sizeOf(CpuLocal) != 64) {
-        @compileError("CpuLocal must keep its assembly ABI and cache-line size");
-    }
+    if (@offsetOf(CpuLocal, "index") != 0 or @sizeOf(CpuLocal) != 64 or
+        @offsetOf(CpuLocal, "runtime_critical_depth") != 12 or
+        @offsetOf(CpuLocal, "scheduler_ready") != 16)
+        @compileError("Native CpuLocal assembly/C layout differs");
 }
-
-extern fn r4os_current_cpu_index() callconv(.c) u32;
-
-var locals: [max_cpus]CpuLocal align(64) = .{CpuLocal{}} ** max_cpus;
-var cpu_local_ready: bool = false;
-var schedulable_mask: u64 = 0;
-var productive_kernel_mask: u64 = 0;
-var productive_r4x_mask: u64 = 0;
-
 pub fn initBsp(apic_id: u32) void {
-    locals = .{CpuLocal{}} ** max_cpus;
-    locals[0].index = 0;
-    locals[0].apic_id = apic_id;
-    locals[0].state = @intFromEnum(State.online);
-    install(0);
-    @atomicStore(u64, &schedulable_mask, 1, .release);
-    @atomicStore(u64, &productive_kernel_mask, 0, .release);
-    @atomicStore(u64, &productive_r4x_mask, 0, .release);
-    @atomicStore(bool, &cpu_local_ready, true, .release);
+    _ = r4os_rust_percpu_control(0, apic_id, 0, 0);
 }
-
 pub fn install(index: u32) void {
-    if (index >= max_cpus) return;
-    const base = @intFromPtr(&locals[index]);
-    msr.write(IA32_GS_BASE, base);
-    // R4OS does not use swapgs yet.  Keeping both bases identical prevents a
-    // later defensive swapgs from exposing an unrelated address.
-    msr.write(IA32_KERNEL_GS_BASE, base);
+    _ = r4os_rust_percpu_control(1, index, 0, 0);
 }
-
 pub fn currentIndex() u32 {
-    if (comptime builtin.os.tag != .freestanding) return 0;
-    if (!@atomicLoad(bool, &cpu_local_ready, .acquire)) return 0;
-    const index = r4os_current_cpu_index();
-    return if (index < max_cpus) index else 0;
+    return @intCast(r4os_rust_percpu_control(2, 0, 0, 0));
 }
-
 pub fn current() *CpuLocal {
-    return &locals[currentIndex()];
+    return at(currentIndex()).?;
 }
-
 pub fn at(index: u32) ?*CpuLocal {
-    if (index >= max_cpus) return null;
-    return &locals[index];
+    return r4os_rust_percpu_slot(index);
 }
-
-/// Only the BSP configures previously absent slots, before sending INIT/SIPI.
 pub fn configure(index: u32, apic_id: u32) bool {
-    const local = at(index) orelse return false;
-    const flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(flags);
-    if (state(index) != .absent) return false;
-    local.index = index;
-    local.apic_id = apic_id;
-    @atomicStore(u8, &local.state, @intFromEnum(State.detected), .release);
-    return true;
+    return r4os_rust_percpu_control(3, index, apic_id, 0) != 0;
 }
-
-/// The scheduler runtime owner serializes lifecycle and scheduling-mask
-/// publication. No hardware operation or wait is performed under this owner.
 pub fn transition(index: u32, from: State, to: State) bool {
-    if (!allowedTransition(from, to)) return false;
-    const flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(flags);
-    return transitionHeld(index, from, to);
+    return r4os_rust_percpu_control(4, index, @intFromEnum(from), @intFromEnum(to)) != 0;
 }
-
-/// Rejection competes with online publication, and can never retire an AP
-/// which already won admission. Repeated rejection remains idempotent.
 pub fn rejectStart(index: u32) bool {
-    const flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(flags);
-    const before = state(index);
-    if (before == .failed) return true;
-    if (!allowedTransition(before, .failed)) return false;
-    return transitionHeld(index, before, .failed);
+    return r4os_rust_percpu_control(5, index, 0, 0) != 0;
 }
-
-fn allowedTransition(from: State, to: State) bool {
-    return switch (from) {
-        .detected => to == .starting or to == .failed,
-        .starting => to == .parked or to == .failed,
-        .parked => to == .qualified or to == .failed,
-        .qualified => to == .online or to == .failed,
-        .online => to == .stopping,
-        .stopping => to == .offline,
-        .absent, .offline, .failed => false,
-    };
-}
-
-fn transitionHeld(index: u32, from: State, to: State) bool {
-    const local = at(index) orelse return false;
-    if (@cmpxchgStrong(u8, &local.state, @intFromEnum(from), @intFromEnum(to), .acq_rel, .acquire) != null) return false;
-    setSchedulableHeld(index, to == .online);
-    return true;
-}
-
-/// Prepared clock samples are visible as registered CPUs only after the BSP
-/// confirms them. Rejected and offline CPUs cannot reappear via a late sample.
 pub fn clockQualifiedMask() u64 {
-    var mask: u64 = 0;
-    var index: u32 = 0;
-    while (index < max_cpus) : (index += 1) {
-        switch (state(index)) {
-            .qualified, .online, .stopping => mask |= @as(u64, 1) << @intCast(index),
-            else => {},
-        }
-    }
-    return mask;
+    return r4os_rust_percpu_control(6, 0, 0, 0);
 }
-
 pub fn state(index: u32) State {
-    const local = at(index) orelse return .absent;
-    return @enumFromInt(@atomicLoad(u8, &local.state, .acquire));
+    return @enumFromInt(@as(u8, @intCast(r4os_rust_percpu_control(7, index, 0, 0))));
 }
-
 pub fn apicId(index: u32) ?u32 {
-    const local = at(index) orelse return null;
-    return local.apic_id;
+    const value = r4os_rust_percpu_control(8, index, 0, 0);
+    return if (value == ~@as(u64, 0)) null else @intCast(value);
 }
-
 pub fn setSchedulerReady(index: u32, ready: bool) void {
-    const local = at(index) orelse return;
-    @atomicStore(u8, &local.scheduler_ready, @intFromBool(ready), .release);
+    _ = r4os_rust_percpu_control(9, index, @intFromBool(ready), 0);
 }
-
 pub fn schedulerReady(index: u32) bool {
-    const local = at(index) orelse return false;
-    return @atomicLoad(u8, &local.scheduler_ready, .acquire) != 0;
+    return r4os_rust_percpu_control(10, index, 0, 0) != 0;
 }
-
 pub fn setWorkActive(index: u32, active: bool) void {
-    const local = at(index) orelse return;
-    @atomicStore(u8, &local.work_active, @intFromBool(active), .release);
+    _ = r4os_rust_percpu_control(11, index, @intFromBool(active), 0);
 }
-
 pub fn workActive(index: u32) bool {
-    const local = at(index) orelse return false;
-    return @atomicLoad(u8, &local.work_active, .acquire) != 0;
+    return r4os_rust_percpu_control(12, index, 0, 0) != 0;
 }
-
-fn setSchedulableHeld(index: u32, enabled: bool) void {
-    if (index >= max_cpus) return;
-    const mask = @as(u64, 1) << @intCast(index);
-    if (enabled) {
-        _ = @atomicRmw(u64, &schedulable_mask, .Or, mask, .acq_rel);
-    } else {
-        _ = @atomicRmw(u64, &schedulable_mask, .And, ~mask, .acq_rel);
-    }
-}
-
 pub fn isSchedulable(index: u32) bool {
-    if (index >= max_cpus) return false;
-    const mask = @as(u64, 1) << @intCast(index);
-    return (@atomicLoad(u64, &schedulable_mask, .acquire) & mask) != 0;
+    return r4os_rust_percpu_control(13, index, 0, 0) != 0;
 }
-
 pub fn schedulableMask() u64 {
-    return @atomicLoad(u64, &schedulable_mask, .acquire);
+    return r4os_rust_percpu_control(14, 0, 0, 0);
 }
-
 pub fn schedulableCount() u32 {
-    return @popCount(schedulableMask());
+    return @intCast(r4os_rust_percpu_control(15, 0, 0, 0));
 }
-
-/// CPUs which can currently execute the shared kernel address space.  TLB
-/// shootdowns use lifecycle state rather than the scheduling mask so a CPU
-/// is not skipped merely because its run queue is temporarily disabled.
 pub fn onlineMask() u64 {
-    var mask: u64 = 0;
-    var index: u32 = 0;
-    while (index < max_cpus) : (index += 1) {
-        if (state(index) == .online) mask |= @as(u64, 1) << @intCast(index);
-    }
-    return mask;
+    return r4os_rust_percpu_control(16, 0, 0, 0);
 }
-
 pub fn noteProductive(index: u32, r4x_work: bool) bool {
-    if (index >= max_cpus) return false;
-    const mask = @as(u64, 1) << @intCast(index);
-    const target = if (r4x_work) &productive_r4x_mask else &productive_kernel_mask;
-    const previous = @atomicRmw(u64, target, .Or, mask, .acq_rel);
-    return (previous & mask) == 0;
+    return r4os_rust_percpu_control(17, index, @intFromBool(r4x_work), 0) != 0;
 }
-
 pub fn productiveMask() u64 {
-    return @atomicLoad(u64, &productive_kernel_mask, .acquire) |
-        @atomicLoad(u64, &productive_r4x_mask, .acquire);
+    return r4os_rust_percpu_control(18, 0, 0, 0);
 }
-
 pub fn productiveKernelMask() u64 {
-    return @atomicLoad(u64, &productive_kernel_mask, .acquire);
+    return r4os_rust_percpu_control(19, 0, 0, 0);
 }
-
 pub fn productiveR4xMask() u64 {
-    return @atomicLoad(u64, &productive_r4x_mask, .acquire);
+    return r4os_rust_percpu_control(20, 0, 0, 0);
 }
-
 pub fn runtimeCriticalDepth() *u32 {
-    return &current().runtime_critical_depth;
+    return r4os_rust_percpu_depth();
 }

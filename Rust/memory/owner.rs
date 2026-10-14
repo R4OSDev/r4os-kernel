@@ -240,6 +240,11 @@ impl Guard {
 pub(super) fn named(class: u8) -> &'static Lock {
     unsafe { &*r4os_zig_named_owner(class) }
 }
+/// Passive admission check for a native caller in another kernel domain.
+/// It never lends the lock/token or acquires an additional owner.
+pub(crate) fn held(class: u8) -> bool {
+    named(class).held()
+}
 impl Drop for Guard {
     fn drop(&mut self) {
         self.lock.release(self.token);

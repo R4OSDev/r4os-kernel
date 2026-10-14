@@ -36,7 +36,6 @@ const blocks = @import("blocks.zig");
 const heap_policy = @import("heap_policy.zig");
 const phys = @import("phys.zig");
 const k = @import("../kernel/log.zig");
-const task_context = @import("../sched/task_context.zig");
 const scheduler = @import("../sched/scheduler.zig");
 const sync = @import("../sched/sync.zig");
 
@@ -103,11 +102,6 @@ pub const MetadataRange = extern struct {
     len: u64 = 0,
 };
 
-const RawUnwind = extern struct {
-    counter: ?*u32 = null,
-    context_present: bool = false,
-    active: bool = false,
-};
 extern fn r4os_rust_heap_init() bool;
 extern fn r4os_rust_heap_alloc(size: usize, alignment: usize) ?[*]u8;
 extern fn r4os_rust_heap_free(pointer: [*]u8, len: usize) u8;
@@ -123,13 +117,6 @@ extern fn r4os_rust_heap_allocator_probe() bool;
 // control reference crosses them; blocking growth runs after owner release.
 var growth_waiters: sync.WaitQueue = sync.WaitQueue.init();
 var growth_predicate_context: u8 = 0;
-export fn r4os_zig_heap_unwind_enter(output: *RawUnwind) callconv(.c) void {
-    const token = task_context.enterUnwind();
-    output.* = .{ .counter = token.counter, .context_present = token.context_present, .active = token.active };
-}
-export fn r4os_zig_heap_unwind_leave(token: *const RawUnwind) callconv(.c) bool {
-    return task_context.leaveUnwind(.{ .counter = token.counter, .context_present = token.context_present, .active = token.active });
-}
 export fn r4os_zig_heap_can_wait() callconv(.c) bool {
     const current = scheduler.current() orelse return false;
     return current.preempt_disable_depth == 0 and current.held_lock_count == 0;
@@ -213,7 +200,7 @@ pub fn bootInvariant() bool {
     return r4os_rust_heap_boot_invariant();
 }
 comptime {
-    if (@sizeOf(RawUnwind) != 16 or @sizeOf(Stats) != 232 or @sizeOf(MetadataRange) != 16)
+    if (@sizeOf(Stats) != 232 or @sizeOf(MetadataRange) != 16)
         @compileError("Rust kernel heap C layout mismatch");
 }
 

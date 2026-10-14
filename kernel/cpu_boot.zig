@@ -12,6 +12,12 @@ const fatal = @import("fatal.zig");
 const pic = @import("../arch/x86_64/pic.zig");
 const smp = @import("smp.zig");
 
+// Native BSP/AP setup no longer calls the Zig IDT facade. Keep its remaining
+// exception/IRQ owner callbacks linked until those foreign owners migrate.
+comptime {
+    _ = idt;
+}
+
 // Transitional facade; Rust owns this boot cut and its readiness state.
 extern fn r4os_rust_cpu_boot() callconv(.c) void;
 extern fn r4os_rust_cpu_ready() callconv(.c) bool;

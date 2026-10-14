@@ -19814,6 +19814,20 @@ fn noteParallelOwnerExecution(instance: *const ProgramInstance, worker: bool) vo
 }
 
 pub fn runParallelOwnersAcceptance() bool {
+    // Failure injection can leave holes in the original four-CPU topology.
+    // Preserve the two GUI owners and the service/thread workload, using
+    // only APs which passed the scheduler admission boundary.
+    const ap_mask = percpu.schedulableMask() & ~@as(u64, 1);
+    if (@popCount(ap_mask) < 2) return false;
+    const first_ap: u8 = @intCast(@ctz(ap_mask));
+    const after_first = ap_mask & (ap_mask - 1);
+    const second_ap: u8 = @intCast(@ctz(after_first));
+    const after_second = after_first & (after_first - 1);
+    const third_ap: ?u8 = if (after_second != 0) @intCast(@ctz(after_second)) else null;
+    const gui_cpus = [2]u8{ first_ap, third_ap orelse second_ap };
+    const clip_cpu = if (third_ap != null) second_ap else first_ap;
+    const expected_main_mask = (@as(u64, 1) << @intCast(gui_cpus[0])) |
+        (@as(u64, 1) << @intCast(gui_cpus[1])) | (@as(u64, 1) << @intCast(clip_cpu));
     const working_drive = drive.get('C') orelse return false;
     const calc = resolveProgramFile(working_drive, "/R4OS/SOFTWARE/DESKTOP/CALC.R4X") orelse return false;
     const clip = resolveProgramFile(working_drive, "/R4OS/SERVICES/CLIPSVC.R4X") orelse return false;
@@ -19835,7 +19849,7 @@ pub fn runParallelOwnersAcceptance() bool {
                 .owner = true,
                 .owner_handle = ProgramProcessHandle{},
                 .out_handle = &handles[i],
-                .forced_cpu = @intCast(1 + 2 * i),
+                .forced_cpu = gui_cpus[i],
             }) != .ran) break :work false;
             const window = GuiWindowInfo{ .window_id = @intCast(i), .client_w = 300, .client_h = 360 };
             if (apiGuiSetWindowInfo(handles[i].instance_id, &window) != 0 or
@@ -19864,7 +19878,7 @@ pub fn runParallelOwnersAcceptance() bool {
             .owner = true,
             .owner_handle = ProgramProcessHandle{},
             .out_handle = &handles[2],
-            .forced_cpu = 2,
+            .forced_cpu = clip_cpu,
         }) != .ran) break :work false;
         var completion = ProgramProcessCompletion{};
         if (apiProgramHandleWait(&handles[2], 8 * timer.DEFAULT_HZ, &completion) != PROGRAM_HANDLE_OK or completion.exit_code != 0) break :work false;
@@ -19894,7 +19908,8 @@ pub fn runParallelOwnersAcceptance() bool {
     const mains = @atomicLoad(u64, &parallel_probe_main_mask, .acquire);
     const services_mask = @atomicLoad(u64, &parallel_probe_service_mask, .acquire);
     const workers = @atomicLoad(u64, &parallel_probe_thread_mask, .acquire);
-    const ok = work_ok and cleanup_ok and (mains & 0xe) == 0xe and (services_mask & ~@as(u64, 1)) != 0 and workers != 0 and
+    const ok = work_ok and cleanup_ok and (mains & expected_main_mask) == expected_main_mask and
+        (mains & ~ap_mask) == 0 and (services_mask & ap_mask) != 0 and workers != 0 and
         @atomicLoad(u32, &parallel_probe_bad_inheritance, .acquire) == 0 and
         before.current_payload_bytes == after.current_payload_bytes and before.active_instances == after.active_instances and
         before.header_errors == after.header_errors and before.free_failures == after.free_failures;

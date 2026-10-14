@@ -1,64 +1,37 @@
-// Pure SMP admission policy.  It is shared by the kernel implementation and
-// host tests so partial AP failures and deterministic 1-CPU fallback do not
-// depend on QEMU timing.
+// Native bounded policy; original host cases call the same C owner as boot.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
 pub const max_cpus: usize = 32;
 
-pub const Candidate = struct {
+pub const Candidate = extern struct {
     apic_id: u32 = 0,
     enabled: bool = false,
     online_capable: bool = false,
 };
 
-pub const Plan = struct {
+pub const Plan = extern struct {
     apic_ids: [max_cpus]u32 = .{0} ** max_cpus,
     count: u32 = 0,
     duplicates: u32 = 0,
     disabled: u32 = 0,
 };
 
+extern fn r4os_rust_smp_plan(bsp: u32, candidates: [*]const Candidate, len: usize, output: *Plan) void;
+extern fn r4os_rust_smp_least_loaded(mask: u64, loads: [*]const usize, len: usize) u32;
+comptime {
+    if (@sizeOf(Candidate) != 8 or @offsetOf(Candidate, "enabled") != 4 or
+        @sizeOf(Plan) != 140 or @offsetOf(Plan, "count") != 128)
+        @compileError("Native SMP policy C layout differs");
+}
 pub fn buildPlan(bsp_apic_id: u32, candidates: []const Candidate) Plan {
-    var plan: Plan = .{};
-    plan.apic_ids[0] = bsp_apic_id;
-    plan.count = 1;
-    for (candidates) |candidate| {
-        if (!candidate.enabled and !candidate.online_capable) {
-            plan.disabled += 1;
-            continue;
-        }
-        var duplicate = false;
-        var index: usize = 0;
-        while (index < plan.count) : (index += 1) {
-            if (plan.apic_ids[index] == candidate.apic_id) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (duplicate) {
-            plan.duplicates += 1;
-            continue;
-        }
-        if (plan.count >= max_cpus) break;
-        plan.apic_ids[plan.count] = candidate.apic_id;
-        plan.count += 1;
-    }
+    var plan: Plan = undefined;
+    r4os_rust_smp_plan(bsp_apic_id, candidates.ptr, candidates.len, &plan);
     return plan;
 }
-
 pub fn leastLoadedCpu(schedulable_mask: u64, loads: []const usize) u32 {
-    if ((schedulable_mask & 1) == 0 or loads.len == 0) return 0;
-    var selected: u32 = 0;
-    var selected_load = loads[0];
-    var index: u32 = 1;
-    while (index < max_cpus and index < loads.len) : (index += 1) {
-        const mask = @as(u64, 1) << @intCast(index);
-        if ((schedulable_mask & mask) == 0) continue;
-        if (loads[index] < selected_load) {
-            selected = index;
-            selected_load = loads[index];
-        }
-    }
-    return selected;
+    return r4os_rust_smp_least_loaded(schedulable_mask, loads.ptr, loads.len);
 }
 
 test "topology removes BSP duplicates and disabled entries" {

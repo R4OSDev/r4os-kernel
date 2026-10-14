@@ -65,13 +65,7 @@ pub struct Metadata {
     pub base: u64,
     pub len: u64,
 }
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Unwind {
-    pub counter: *mut u32,
-    pub context_present: bool,
-    pub active: bool,
-}
+pub use crate::sched::task_context::Unwind;
 struct Control {
     bins: [u64; BINS],
     heap_top: usize,
@@ -529,8 +523,6 @@ fn control<T>(operation: impl FnOnce(&mut Control) -> T) -> T {
 }
 
 unsafe extern "C" {
-    fn r4os_zig_heap_unwind_enter(output: *mut Unwind);
-    fn r4os_zig_heap_unwind_leave(token: *const Unwind) -> bool;
     fn r4os_zig_heap_can_wait() -> bool;
     fn r4os_zig_heap_wait_growth() -> bool;
     fn r4os_zig_heap_wake_growth();
@@ -549,14 +541,7 @@ impl HeapGuard {
     fn enter() -> Option<Self> {
         let lock = owner::named(4);
         let token = lock.acquire();
-        let mut unwind = Unwind {
-            counter: null_mut(),
-            context_present: false,
-            active: false,
-        };
-        unsafe {
-            r4os_zig_heap_unwind_enter(&mut unwind);
-        }
+        let unwind = unsafe { crate::sched::task_context::enter() };
         if unwind.context_present && !unwind.active {
             control(|control| control.reentry_errors += 1);
             lock.release(token);
@@ -581,7 +566,7 @@ impl HeapGuard {
             }
             lock.release(token);
             unsafe {
-                r4os_zig_heap_unwind_leave(&unwind);
+                crate::sched::task_context::leave(unwind);
             }
             return None;
         }
@@ -619,12 +604,12 @@ impl Drop for HeapGuard {
             // actual completion. Reacquire before releasing the exact token.
             let token = owner::named(4).acquire();
             unsafe {
-                r4os_zig_heap_unwind_leave(&self.unwind);
+                crate::sched::task_context::leave(self.unwind);
             }
             owner::named(4).release(token);
         } else {
             unsafe {
-                r4os_zig_heap_unwind_leave(&self.unwind);
+                crate::sched::task_context::leave(self.unwind);
             }
             owner::named(4).release(self.token);
         }

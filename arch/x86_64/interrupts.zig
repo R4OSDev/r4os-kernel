@@ -14,9 +14,6 @@ pub const RuntimeStats = extern struct {
     legacy_global_acquisitions: u64 = 0,
 };
 
-export fn r4os_zig_runtime_depth() callconv(.c) *u32 {
-    return percpu.runtimeCriticalDepth();
-}
 pub fn disable() void {
     _ = r4os_rust_runtime_control(0, 0);
 }

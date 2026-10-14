@@ -40,8 +40,6 @@ fn counters(operation: impl FnOnce(&mut Stats)) {
     operation(unsafe { &mut *COUNTERS.0.get() });
 }
 unsafe extern "C" {
-    fn r4os_zig_heap_unwind_enter(output: *mut Unwind);
-    fn r4os_zig_heap_unwind_leave(token: *const Unwind) -> bool;
     fn r4os_zig_vm_reschedule();
     fn r4os_zig_vm_demand_commit(range: *mut Range, offset: u64, len: u64) -> u32;
     fn r4os_zig_vm_uncommit_demand(range: *mut Range, base: u64, len: u64, skip: bool) -> u32;
@@ -200,11 +198,7 @@ struct Lease {
 }
 impl Lease {
     unsafe fn admit(range: *mut Range) -> Result<Self, u32> {
-        let mut token = MaybeUninit::<Unwind>::uninit();
-        unsafe {
-            r4os_zig_heap_unwind_enter(token.as_mut_ptr());
-        }
-        let unwind = unsafe { token.assume_init() };
+        let unwind = unsafe { crate::sched::task_context::enter() };
         if unwind.context_present && !unwind.active {
             return Err(14);
         }
@@ -220,7 +214,7 @@ impl Drop for Lease {
         // range lease before allowing the pinned task's terminal unwind.
         unsafe {
             update(self.range, |range| range.resident_commit_active = false);
-            r4os_zig_heap_unwind_leave(&self.unwind);
+            crate::sched::task_context::leave(self.unwind);
         }
     }
 }

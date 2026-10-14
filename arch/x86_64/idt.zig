@@ -69,37 +69,16 @@ pub fn loadCurrent() void {
 
 // Rust owns IRQ/IPI ordering. These are the exact existing foreign owners;
 // host metadata fixtures cannot execute hardware IRQ or task-switch work.
-export fn r4os_zig_irq_event(operation: u8, a: u64, b: u64) callconv(.c) u64 {
+export fn r4os_zig_irq_event(operation: u8, a: u64, _: u64) callconv(.c) u64 {
     if (comptime @import("builtin").is_test) @panic("IRQ owner callbacks require the kernel guest");
     return switch (operation) {
         0 => @intFromBool(r4x.isPreemptibleInstructionPointer(a)),
-        1 => @intFromBool(scheduler.onSecondaryTick(a, b != 0)),
-        2 => timer.tickCount(),
-        3 => scheduler.structureStats().wakeup_reschedule_requests,
-        4 => @intFromBool(scheduler.onTick(timer.onIrq(), a != 0)),
         5 => blk: {
             ps2_controller.onIrq(@intCast(a));
             break :blk 0;
         },
         6 => blk: {
             irq_router.dispatch(@intCast(a));
-            break :blk 0;
-        },
-        7 => @intFromBool(scheduler.preemptPendingWake(a != 0)),
-        8 => blk: {
-            scheduler.preemptFromIrq();
-            break :blk 0;
-        },
-        9 => blk: {
-            scheduler.onRescheduleIpi(a != 0);
-            break :blk 0;
-        },
-        10 => blk: {
-            _ = percpu.transition(percpu.currentIndex(), .stopping, .offline);
-            break :blk 0;
-        },
-        11 => blk: {
-            tlb.handleIpi();
             break :blk 0;
         },
         else => unreachable,

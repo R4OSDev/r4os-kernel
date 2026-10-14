@@ -1,6 +1,8 @@
-//! Original IRQ/IPI dispatch order. Scheduler, timer and device owners supply
-//! fixed scalar C operations until their waves; no borrowed frame crosses them.
-use super::{interrupt_frame::InterruptFrame, ioapic, lapic, pic, runtime};
+//! Original IRQ/IPI ordering with direct native scheduler/timer/TLB owners.
+//! Saved IF follows the exact interrupted stack; no RAII runtime token or
+//! state reference survives a physical task switch.
+use super::{interrupt_frame::InterruptFrame, ioapic, lapic, percpu, pic, runtime};
+use crate::{platform::timer, sched::scheduler};
 unsafe extern "C" {
     fn r4os_zig_irq_event(operation: u8, a: u64, b: u64) -> u64;
 }
@@ -11,32 +13,34 @@ fn eoi() {
     lapic::r4os_rust_lapic_control(8, 0, 0);
 }
 /// # Safety
-/// isr.S owns the full resident frame on this exact interrupted task stack,
-/// including its FPU state. The frame remains valid across an IRQ preemption.
+/// isr.S retains the complete frame and FPU image on the exact interrupted task
+/// stack. Local runtime/IF follows that stack through physical preemption.
 pub unsafe fn dispatch(frame: *const InterruptFrame) {
-    let _admission = runtime::RuntimeGuard::acquire();
+    let saved = runtime::save_runtime();
     let vector = unsafe { core::ptr::addr_of!((*frame).vector).read() };
     if !(0x20..0x40).contains(&vector) {
+        runtime::restore_runtime(saved);
         return;
     }
     let irq = (vector - 0x20) as u8;
     let rip = unsafe { core::ptr::addr_of!((*frame).rip).read() };
     let preemptible = event(0, rip, 0) != 0;
     if runtime::current_cpu() != 0 && irq == 0 {
-        let now = event(2, 0, 0);
-        let preempt = event(1, now, u64::from(preemptible)) != 0;
+        let preempt = scheduler::on_tick(timer::tick_count(), preemptible, true);
         eoi();
         if preempt {
-            event(8, 0, 0);
+            scheduler::preempt_from_irq();
         }
+        runtime::restore_runtime(saved);
         return;
     }
-    let mut wake_checkpoint = event(3, 0, 0);
+    let mut wake_checkpoint = scheduler::wakeup_checkpoint();
     let mut preempt = false;
     match irq {
         0 => {
-            preempt = event(4, u64::from(preemptible), 0) != 0;
-            wake_checkpoint = event(3, 0, 0);
+            preempt =
+                scheduler::on_tick(timer::r4os_rust_timer_control(4, 0, 0), preemptible, false);
+            wake_checkpoint = scheduler::wakeup_checkpoint();
         }
         1 | 12 => {
             event(5, u64::from(irq), 0);
@@ -48,31 +52,31 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
         pic::r4os_rust_pic_control(4, irq);
     }
     eoi();
-    if !preempt && (irq != 0 || event(3, 0, 0) != wake_checkpoint) {
-        preempt = event(7, u64::from(preemptible), 0) != 0;
+    if !preempt && (irq != 0 || scheduler::wakeup_checkpoint() != wake_checkpoint) {
+        preempt = scheduler::preempt_pending(preemptible);
     }
     if preempt {
-        event(8, 0, 0);
+        scheduler::preempt_from_irq();
     }
+    runtime::restore_runtime(saved);
 }
 /// # Safety
-/// Same resident assembly-frame/FPU contract. High-priority TLB completion
-/// remains independent of runtime admission even while another CPU holds it.
+/// Same exact assembly frame contract. TLB completion remains independent of
+/// runtime admission while another CPU can retain the page-table owner.
 pub unsafe fn dispatch_ipi(frame: *const InterruptFrame) {
     match unsafe { core::ptr::addr_of!((*frame).vector).read() } {
         0xf0 => {
             eoi();
             let rip = unsafe { core::ptr::addr_of!((*frame).rip).read() };
-            let preemptible = event(0, rip, 0);
-            event(9, preemptible, 0);
+            scheduler::on_reschedule(event(0, rip, 0) != 0);
         }
         0xf1 => {
             eoi();
-            event(10, 0, 0);
+            percpu::r4os_rust_percpu_control(4, percpu::current_index(), 5, 6);
             runtime::halt_forever();
         }
         0xf2 => {
-            event(11, 0, 0);
+            super::tlb::handle_ipi();
             eoi();
         }
         _ => eoi(),

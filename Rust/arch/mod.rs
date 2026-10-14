@@ -1,3 +1,4 @@
+pub mod fpu;
 pub mod hpet;
 pub mod interrupt_frame;
 pub mod io;
@@ -5,8 +6,13 @@ pub mod ioapic;
 pub mod irq;
 pub mod lapic;
 pub mod msr;
+pub mod percpu;
 pub mod pic;
 pub mod pit;
 pub mod rtc;
 pub mod runtime;
+pub mod smp;
+pub mod smp_policy;
+pub mod smp_probe;
 pub mod tables;
+pub mod tlb;

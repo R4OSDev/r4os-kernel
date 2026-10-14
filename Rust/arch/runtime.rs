@@ -1,5 +1,6 @@
 //! Single scheduler/wait/IRQ runtime owner. Context switch releases the outer
-//! token before RSP changes. Unrelated owners never borrow this admission.
+//! token after outgoing RSP is durable, below the incoming saved context.
+//! Unrelated owners never borrow this admission.
 use crate::{build_bridge::config, memory::owner};
 use core::{
     marker::PhantomData,
@@ -19,10 +20,6 @@ static WAIT_SPINS: AtomicU64 = AtomicU64::new(0);
 static MAX_WAIT_SPINS: AtomicU64 = AtomicU64::new(0);
 static HOLD_CYCLES: AtomicU64 = AtomicU64::new(0);
 static MAX_HOLD_CYCLES: AtomicU64 = AtomicU64::new(0);
-unsafe extern "C" {
-    fn r4os_zig_owner_cpu() -> u32;
-    fn r4os_zig_runtime_depth() -> *mut u32;
-}
 #[repr(C)]
 #[derive(Default)]
 pub struct Stats {
@@ -37,10 +34,10 @@ pub struct Stats {
     pub legacy_global_acquisitions: u64,
 }
 pub fn current_cpu() -> u32 {
-    unsafe { r4os_zig_owner_cpu() }
+    super::percpu::current_index()
 }
 fn depth() -> *mut u32 {
-    unsafe { r4os_zig_runtime_depth() }
+    super::percpu::r4os_rust_percpu_depth()
 }
 fn flags() -> u64 {
     let value;
