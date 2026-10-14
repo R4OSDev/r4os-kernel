@@ -94,29 +94,7 @@ impl IdtEntry {
 struct Idt([IdtEntry; 256]);
 static mut IDT: Idt = Idt([IdtEntry::ZERO; 256]);
 
-#[repr(C)]
-pub struct InterruptFrame {
-    pub r15: u64,
-    pub r14: u64,
-    pub r13: u64,
-    pub r12: u64,
-    pub r11: u64,
-    pub r10: u64,
-    pub r9: u64,
-    pub r8: u64,
-    pub rsi: u64,
-    pub rdi: u64,
-    pub rbp: u64,
-    pub rdx: u64,
-    pub rcx: u64,
-    pub rbx: u64,
-    pub rax: u64,
-    pub vector: u64,
-    pub error_code: u64,
-    pub rip: u64,
-    pub cs: u64,
-    pub rflags: u64,
-}
+pub use super::interrupt_frame::InterruptFrame;
 const _: () = {
     assert!(size_of::<TablePointer>() == 10 && offset_of!(TablePointer, base) == 2);
     assert!(
@@ -140,8 +118,6 @@ unsafe extern "C" {
     fn r4os_load_gdt(pointer: *const TablePointer);
     fn r4os_load_tss(selector: u16);
     fn r4os_load_idt(pointer: *const TablePointer);
-    fn r4os_zig_irq_dispatch(frame: *const InterruptFrame);
-    fn r4os_zig_ipi_dispatch(frame: *const InterruptFrame);
     fn r4os_zig_exception_inner(frame: *const InterruptFrame, address: u64, private_stack: bool);
     fn r4os_zig_prepare_fault_stack(address: u64, rsp: u64, bytes: usize) -> usize;
     fn r4os_zig_fault_fpu_save(state: *mut u8);
@@ -337,13 +313,13 @@ pub unsafe extern "C" fn r4os_rust_interrupted_rsp(frame: *const InterruptFrame)
 /// # Safety
 /// Called by isr.S with the unchanged resident IRQ frame and aligned stack.
 pub unsafe extern "C" fn irqDispatch(frame: *const InterruptFrame) {
-    unsafe { r4os_zig_irq_dispatch(frame) }
+    unsafe { super::irq::dispatch(frame) }
 }
 #[unsafe(no_mangle)]
 /// # Safety
 /// Called by isr.S with the unchanged resident IPI frame and aligned stack.
 pub unsafe extern "C" fn ipiDispatch(frame: *const InterruptFrame) {
-    unsafe { r4os_zig_ipi_dispatch(frame) }
+    unsafe { super::irq::dispatch_ipi(frame) }
 }
 #[unsafe(no_mangle)]
 /// # Safety

@@ -9,3 +9,4 @@ pub mod arch;
 pub mod boot;
 pub mod build_bridge;
 pub mod memory;
+pub mod platform;

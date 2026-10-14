@@ -1,2 +1,12 @@
+pub mod hpet;
+pub mod interrupt_frame;
 pub mod io;
+pub mod ioapic;
+pub mod irq;
+pub mod lapic;
+pub mod msr;
+pub mod pic;
+pub mod pit;
+pub mod rtc;
+pub mod runtime;
 pub mod tables;

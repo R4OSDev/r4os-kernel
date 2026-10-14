@@ -1,22 +1,10 @@
-// Early timer foundation for kernel startup.
-//
-// This layer starts the initial PIT timer after cpu_boot has prepared GDT, IDT,
-// and PIC. Later timer switches to HPET/LAPIC stay in the existing timer core.
-
-const timer = @import("timer.zig");
-const monotonic = @import("../platform/monotonic.zig");
-
-var initialized = false;
+// Early PIT/periodic foundation and completion are owned by Rust.
+extern fn r4os_rust_timer_boot_control(operation: u8) bool;
 
 pub fn init() void {
-    if (initialized) return;
-
-    timer.initPit(timer.DEFAULT_HZ);
-    monotonic.attachPeriodicClock();
-
-    initialized = true;
+    _ = r4os_rust_timer_boot_control(0);
 }
 
 pub fn isInitialized() bool {
-    return initialized;
+    return r4os_rust_timer_boot_control(1);
 }

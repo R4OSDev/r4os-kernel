@@ -114,6 +114,9 @@ pub(super) fn slot(index: usize) -> *mut Range {
     assert!(index < RANGES);
     unsafe { TABLE.0.get().cast::<Range>().add(index) }
 }
+// Keep scalar projections from materializing the entire C snapshot in loops.
+// Callers that cross an owner boundary still receive their independent value.
+#[inline(always)]
 pub(super) fn read(index: usize) -> Range {
     unsafe { slot(index).read() }
 }

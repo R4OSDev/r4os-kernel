@@ -3,6 +3,7 @@
 const a = @import("r4os_kernel_contract");
 const time_core = @import("../platform/time.zig");
 const MonotonicClockInfo = a.MonotonicClockInfo;
+extern fn r4os_rust_monotonic_clock_api(output: *MonotonicClockInfo) i32;
 
 pub fn monotonicClock(out: *MonotonicClockInfo) callconv(.c) i32 {
     comptime {
@@ -18,24 +19,5 @@ pub fn monotonicClock(out: *MonotonicClockInfo) callconv(.c) i32 {
             @compileError("monotonic clock flag contract drift");
         }
     }
-    const clock = time_core.monotonicSnapshot();
-    out.* = .{
-        .flags = clock.flags,
-        .source = @intFromEnum(clock.source),
-        .generation = clock.generation,
-        .event_backend = switch (clock.event_backend) {
-            .pit => 0,
-            .hpet => 1,
-            .lapic => 2,
-        },
-        .instant_ns = clock.instant_ns,
-        .frequency_hz = a.monotonic_clock_frequency_hz,
-        .resolution_ns = clock.resolution_ns,
-        .source_frequency_hz = clock.source_frequency_hz,
-        .event_frequency_numerator = clock.event.frequency_numerator,
-        .event_frequency_denominator = clock.event.frequency_denominator,
-        .event_requested_hz = clock.event.requested_hz,
-        .event_effective_hz = clock.event.effective_hz,
-    };
-    return if (clock.valid) 1 else 0;
+    return r4os_rust_monotonic_clock_api(out);
 }

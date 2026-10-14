@@ -1,12 +1,20 @@
-const config = @import("config");
-const lapic = @import("../arch/x86_64/lapic.zig");
-const hpet = @import("../arch/x86_64/hpet.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
-const ioapic = @import("../arch/x86_64/ioapic.zig");
+// Private C projection. Event epochs and BSP deadline state have one Rust owner.
 const pit = @import("../arch/x86_64/pit.zig");
-const clocksource = @import("../platform/clocksource.zig");
-const monotonic_math = @import("../platform/monotonic_math.zig");
-
+comptime {
+    if (@import("builtin").is_test) {
+        // A host unit can use only a scalar timer helper while its native C
+        // dispatcher still links the actual hardware-owner branches. Admit
+        // their canonical bridges in this same module, without duplicate
+        // owners, fake clocks or guest hardware execution in the fixture.
+        _ = @import("rust_owner_test");
+        _ = @import("../arch/x86_64/hpet.zig");
+        _ = @import("../arch/x86_64/ioapic.zig");
+        _ = @import("../arch/x86_64/lapic.zig");
+        _ = @import("../arch/x86_64/interrupts.zig");
+        _ = @import("../memory/owner_locks.zig");
+        _ = @import("../platform/clocksource.zig");
+    }
+}
 pub const Backend = enum {
     pit,
     hpet,
@@ -23,7 +31,7 @@ pub const Mode = enum {
     one_shot_idle,
 };
 
-pub const EventClockInfo = struct {
+pub const EventClockInfo = extern struct {
     requested_hz: u32 = 0,
     effective_hz: u32 = 0,
     frequency_numerator: u64 = 0,
@@ -49,326 +57,101 @@ pub const DeadlineStats = struct {
     last_irq_tick: u64 = 0,
 };
 
-var backend: Backend = .pit;
-var initialized = false;
-var tick_epoch: u64 = 0;
-var tick_origin: u64 = 0;
-var event_epoch_ns: u64 = 0;
-var event_origin: u64 = 0;
-var logical_hz: u32 = DEFAULT_HZ;
-var modern_clock_origin_ns: u64 = 0;
-var modern_counter_frequency_hz: u64 = 0;
-var modern_tick_scale: monotonic_math.FixedScale = .{};
-var deadline_enabled = false;
-var deadline_mode: Mode = .periodic;
-var armed_deadline: u64 = NO_DEADLINE;
-var timer_irq_count: u64 = 0;
-var idle_entry_count: u64 = 0;
-var one_shot_arm_count: u64 = 0;
-var earlier_reprogram_count: u64 = 0;
-var deadline_cancel_count: u64 = 0;
-var periodic_resume_count: u64 = 0;
-var runtime_fallback_count: u64 = 0;
-var late_irq_count: u64 = 0;
-var max_lateness_ticks: u64 = 0;
-var last_lateness_ticks: u64 = 0;
-var last_irq_tick: u64 = 0;
-
-pub fn initPit(requested_hz: u32) void {
-    if (initialized) rebaseActiveClock();
-    logical_hz = if (requested_hz == 0) DEFAULT_HZ else requested_hz;
-    pit.init(logical_hz);
-    backend = .pit;
-    modern_clock_origin_ns = 0;
-    modern_counter_frequency_hz = 0;
-    modern_tick_scale = .{};
-    deadline_enabled = false;
-    deadline_mode = .periodic;
-    armed_deadline = NO_DEADLINE;
-    activateBackendOrigins();
-    initialized = true;
+const RawDeadlineStats = extern struct {
+    flags: u32,
+    mode: u32,
+    armed_deadline: u64,
+    timer_irqs: u64,
+    idle_entries: u64,
+    one_shot_arms: u64,
+    earlier_reprograms: u64,
+    cancels: u64,
+    periodic_resumes: u64,
+    runtime_fallbacks: u64,
+    late_irqs: u64,
+    max_lateness_ticks: u64,
+    last_lateness_ticks: u64,
+    last_irq_tick: u64,
+};
+extern fn r4os_rust_timer_control(operation: u8, a: u64, b: u64) u64;
+extern fn r4os_rust_timer_event_info(output: *EventClockInfo) void;
+extern fn r4os_rust_timer_deadlines(output: *RawDeadlineStats) void;
+export fn r4os_zig_timer_serial_drain() callconv(.c) void {
+    if (comptime @import("builtin").is_test) @panic("Timer serial drain requires the kernel guest");
+    @import("../driver/com.zig").logDrain();
 }
-
-pub fn trySwitchToLapic(requested_hz: u32) bool {
-    if (!lapic.initTimerFromHpet(requested_hz)) return false;
-    rebaseActiveClock();
-    logical_hz = if (requested_hz == 0) DEFAULT_HZ else requested_hz;
-    backend = .lapic;
-    activateModernCounter();
-    activateBackendOrigins();
-    return true;
+pub fn initPit(hz: u32) void {
+    _ = r4os_rust_timer_control(0, hz, 0);
 }
-
-pub fn trySwitchToHpet(requested_hz: u32) bool {
-    if (!hpet.startLegacyIrqTimer(requested_hz)) return false;
-    rebaseActiveClock();
-    logical_hz = if (requested_hz == 0) DEFAULT_HZ else requested_hz;
-    backend = .hpet;
-    activateModernCounter();
-    activateBackendOrigins();
-    return true;
+pub fn trySwitchToLapic(hz: u32) bool {
+    return r4os_rust_timer_control(1, hz, 0) != 0;
 }
-
+pub fn trySwitchToHpet(hz: u32) bool {
+    return r4os_rust_timer_control(2, hz, 0) != 0;
+}
 pub fn fallbackToPit() void {
-    rebaseActiveClock();
-    if (backend == .lapic) lapic.stopTimer();
-    if (backend == .hpet) hpet.stopLegacyIrqTimer();
-    if (ioapic.isRoutingActive()) _ = ioapic.setLegacyIrqMasked(PIT_IRQ, false);
-    pit.init(logical_hz);
-    backend = .pit;
-    modern_clock_origin_ns = 0;
-    modern_counter_frequency_hz = 0;
-    modern_tick_scale = .{};
-    deadline_enabled = false;
-    deadline_mode = .periodic;
-    armed_deadline = NO_DEADLINE;
-    activateBackendOrigins();
+    _ = r4os_rust_timer_control(3, 0, 0);
 }
-
 pub fn onIrq() u64 {
-    // 0.56.15: COM1-TX-Ring pro Tick opportunistisch drainen, damit
-    // gepufferte Logzeilen auch ohne weitere Ausgaben rausgehen.
-    if (comptime config.enable_com1_debug) {
-        const com = @import("../driver/com.zig");
-        com.logDrain();
-    }
-    switch (backend) {
-        .pit => pit.onTick(),
-        .hpet => _ = hpet.onTimerIrq(),
-        .lapic => _ = lapic.onTimerIrq(),
-    }
-    timer_irq_count +%= 1;
-    if ((timer_irq_count & 0x3FF) == 0) _ = clocksource.periodicValidate();
-    const now = tickCount();
-    last_irq_tick = now;
-    if (deadline_mode == .one_shot_idle) {
-        last_lateness_ticks = 0;
-        if (armed_deadline != NO_DEADLINE and now > armed_deadline) {
-            const lateness = now - armed_deadline;
-            last_lateness_ticks = lateness;
-            late_irq_count +%= 1;
-            if (lateness > max_lateness_ticks) max_lateness_ticks = lateness;
-        }
-        armed_deadline = NO_DEADLINE;
-    }
-    return now;
+    return r4os_rust_timer_control(4, 0, 0);
 }
-
 pub fn tickCount() u64 {
-    const local = rawTickCount();
-    return tick_epoch +| (local -% tick_origin);
+    return r4os_rust_timer_control(5, 0, 0);
 }
-
-pub fn deadlineAfter(now: u64, duration_ticks: u64) u64 {
-    return monotonic_math.finiteDeadline(now, duration_ticks);
+pub fn deadlineAfter(now: u64, ticks: u64) u64 {
+    return r4os_rust_timer_control(6, now, ticks);
 }
-
-pub fn deadlineAfterNow(duration_ticks: u64) u64 {
-    return deadlineAfter(tickCount(), duration_ticks);
+pub fn deadlineAfterNow(ticks: u64) u64 {
+    return r4os_rust_timer_control(7, ticks, 0);
 }
-
 pub fn remainingUntil(now: u64, deadline: u64) u64 {
-    if (deadline == NO_DEADLINE) return NO_DEADLINE;
-    return if (now >= deadline) 0 else deadline - now;
+    return r4os_rust_timer_control(8, now, deadline);
 }
-
 pub fn eventNanoseconds() u64 {
-    if (!initialized) return 0;
-    const local = rawTickCount();
-    const elapsed = local -% event_origin;
-    const rate = eventClockInfo();
-    return event_epoch_ns +| monotonic_math.rateToNanoseconds(
-        elapsed,
-        rate.frequency_numerator,
-        rate.frequency_denominator,
-    );
+    return r4os_rust_timer_control(9, 0, 0);
 }
-
-pub fn eventClockInfo() EventClockInfo {
-    const rate = switch (backend) {
-        .pit => monotonic_math.reducedRate(pit.BASE_HZ, pit.divisor()),
-        .hpet, .lapic => monotonic_math.Rate{ .numerator = logical_hz, .denominator = 1 },
-    };
-    const requested = frequency();
-    return .{
-        .requested_hz = requested,
-        .effective_hz = monotonic_math.roundedRate(rate.numerator, rate.denominator),
-        .frequency_numerator = rate.numerator,
-        .frequency_denominator = rate.denominator,
-        .resolution_ns = monotonic_math.resolutionNanoseconds(rate.numerator, rate.denominator),
-    };
-}
-
-fn rawTickCount() u64 {
-    return switch (backend) {
-        .pit => pit.tickCount(),
-        .hpet, .lapic => modernTickCount(),
-    };
-}
-
-fn modernTickCount() u64 {
-    if (modern_counter_frequency_hz == 0 or !modern_tick_scale.valid()) return 0;
-    const now_ns = clocksource.nowNanoseconds() orelse return 0;
-    return modern_tick_scale.apply(now_ns -% modern_clock_origin_ns);
-}
-
-fn activateModernCounter() void {
-    const source = clocksource.status();
-    modern_counter_frequency_hz = source.frequency_hz;
-    modern_tick_scale = monotonic_math.FixedScale.initFloor(logical_hz, monotonic_math.nanoseconds_per_second);
-    modern_clock_origin_ns = clocksource.nowNanoseconds() orelse 0;
-}
-
-fn rebaseActiveClock() void {
-    if (!initialized) return;
-    const local = rawTickCount();
-    tick_epoch +|= local -% tick_origin;
-    const rate = eventClockInfo();
-    event_epoch_ns +|= monotonic_math.rateToNanoseconds(
-        local -% event_origin,
-        rate.frequency_numerator,
-        rate.frequency_denominator,
-    );
-}
-
-fn activateBackendOrigins() void {
-    const local = rawTickCount();
-    tick_origin = local;
-    event_origin = local;
-}
-
 pub fn frequency() u32 {
-    return logical_hz;
+    return @intCast(r4os_rust_timer_control(10, 0, 0));
 }
-
 pub fn enableDeadlineScheduling() bool {
-    const irq_flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(irq_flags);
-    deadline_enabled = backend != .pit and modern_counter_frequency_hz != 0;
-    deadline_mode = .periodic;
-    armed_deadline = NO_DEADLINE;
-    return deadline_enabled;
+    return r4os_rust_timer_control(11, 0, 0) != 0;
 }
-
-pub fn enterIdleDeadline(requested_deadline: u64) bool {
-    const irq_flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(irq_flags);
-    if (!deadline_enabled or backend == .pit) return false;
-
-    const now = tickCount();
-    if (deadline_mode == .periodic) {
-        const prepared = switch (backend) {
-            .hpet => hpet.startLegacyOneShotTimer(logical_hz),
-            .lapic => lapic.startOneShotTimer(),
-            .pit => false,
-        };
-        if (!prepared) {
-            runtime_fallback_count +%= 1;
-            fallbackToPit();
-            return false;
-        }
-        deadline_mode = .one_shot_idle;
-        idle_entry_count +%= 1;
-    }
-
-    if (requested_deadline == NO_DEADLINE) {
-        disarmOneShotBackend();
-        armed_deadline = NO_DEADLINE;
-        return true;
-    }
-
-    if (armed_deadline != NO_DEADLINE and requested_deadline < armed_deadline) {
-        earlier_reprogram_count +%= 1;
-    }
-    const delta = monotonic_math.boundedDeadlineDelta(now, requested_deadline, MAX_FINITE_DEADLINE -| now);
-    const programmed_ticks = switch (backend) {
-        .hpet => hpet.armLegacyOneShotTicks(delta, logical_hz),
-        .lapic => lapic.armOneShotTicks(delta),
-        .pit => 0,
-    };
-    if (programmed_ticks == 0) {
-        runtime_fallback_count +%= 1;
-        fallbackToPit();
-        return false;
-    }
-    armed_deadline = deadlineAfter(now, programmed_ticks);
-    one_shot_arm_count +%= 1;
-    return true;
+pub fn enterIdleDeadline(deadline: u64) bool {
+    return r4os_rust_timer_control(12, deadline, 0) != 0;
 }
-
 pub fn leaveIdleDeadline() bool {
-    // Productive scheduler observations call this defensively.  The deadline
-    // backend is owned by the BSP, so keep the overwhelmingly common periodic
-    // path to one local branch instead of nesting the runtime owner on every
-    // cooperative yield.
-    if (deadline_mode != .one_shot_idle) return backend != .pit;
-    const irq_flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(irq_flags);
-    if (deadline_mode != .one_shot_idle) return backend != .pit;
-
-    if (armed_deadline != NO_DEADLINE) deadline_cancel_count +%= 1;
-    disarmOneShotBackend();
-    armed_deadline = NO_DEADLINE;
-    const resumed = switch (backend) {
-        .hpet => hpet.resumeLegacyIrqTimer(logical_hz),
-        .lapic => lapic.resumePeriodicTimer(),
-        .pit => true,
-    };
-    if (!resumed) {
-        runtime_fallback_count +%= 1;
-        fallbackToPit();
-        return false;
-    }
-    deadline_mode = .periodic;
-    periodic_resume_count +%= 1;
-    return true;
+    return r4os_rust_timer_control(13, 0, 0) != 0;
 }
-
-fn disarmOneShotBackend() void {
-    switch (backend) {
-        .hpet => hpet.disarmLegacyOneShotTimer(),
-        .lapic => lapic.disarmOneShotTimer(),
-        .pit => {},
-    }
-}
-
-pub fn deadlineStats() DeadlineStats {
-    const irq_flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(irq_flags);
-    return .{
-        .enabled = deadline_enabled,
-        .capable = backend != .pit and modern_counter_frequency_hz != 0,
-        .mode = deadline_mode,
-        .armed_deadline = armed_deadline,
-        .timer_irqs = timer_irq_count,
-        .idle_entries = idle_entry_count,
-        .one_shot_arms = one_shot_arm_count,
-        .earlier_reprograms = earlier_reprogram_count,
-        .cancels = deadline_cancel_count,
-        .periodic_resumes = periodic_resume_count,
-        .runtime_fallbacks = runtime_fallback_count,
-        .late_irqs = late_irq_count,
-        .max_lateness_ticks = max_lateness_ticks,
-        .last_lateness_ticks = last_lateness_ticks,
-        .last_irq_tick = last_irq_tick,
-    };
-}
-
-pub fn deadlineModeName() []const u8 {
-    return switch (deadline_mode) {
-        .periodic => if (deadline_enabled) "periodic-active" else "periodic-fallback",
-        .one_shot_idle => "one-shot-idle",
-    };
-}
-
 pub fn activeBackend() Backend {
-    return backend;
+    return @enumFromInt(r4os_rust_timer_control(14, 0, 0));
 }
-
+pub fn deadlineModeName() []const u8 {
+    return switch (r4os_rust_timer_control(15, 0, 0)) {
+        0 => "periodic-fallback",
+        1 => "periodic-active",
+        2 => "one-shot-idle",
+        else => unreachable,
+    };
+}
 pub fn backendName() []const u8 {
-    return switch (backend) {
+    return switch (activeBackend()) {
         .pit => "PIT",
         .hpet => "HPET",
         .lapic => "LAPIC timer",
     };
+}
+pub fn eventClockInfo() EventClockInfo {
+    var value: EventClockInfo = undefined;
+    r4os_rust_timer_event_info(&value);
+    return value;
+}
+pub fn deadlineStats() DeadlineStats {
+    var raw: RawDeadlineStats = undefined;
+    r4os_rust_timer_deadlines(&raw);
+    return .{ .enabled = raw.flags & 1 != 0, .capable = raw.flags & 2 != 0, .mode = @enumFromInt(raw.mode), .armed_deadline = raw.armed_deadline, .timer_irqs = raw.timer_irqs, .idle_entries = raw.idle_entries, .one_shot_arms = raw.one_shot_arms, .earlier_reprograms = raw.earlier_reprograms, .cancels = raw.cancels, .periodic_resumes = raw.periodic_resumes, .runtime_fallbacks = raw.runtime_fallbacks, .late_irqs = raw.late_irqs, .max_lateness_ticks = raw.max_lateness_ticks, .last_lateness_ticks = raw.last_lateness_ticks, .last_irq_tick = raw.last_irq_tick };
+}
+comptime {
+    if (PIT_IRQ != 0 or DEFAULT_HZ != 1000 or @sizeOf(EventClockInfo) != 32 or @offsetOf(EventClockInfo, "frequency_numerator") != 8 or
+        @sizeOf(RawDeadlineStats) != 104 or @offsetOf(RawDeadlineStats, "last_irq_tick") != 96)
+        @compileError("Rust timer C layout or platform constants differ");
 }

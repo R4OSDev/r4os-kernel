@@ -1,8 +1,11 @@
+// Rust owns scan/coverage/ECAM rules; the original fixtures use a C trampoline.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const bus_kind_legacy: u8 = 1;
 pub const bus_kind_ecam: u8 = 2;
 pub const max_devices: usize = 64;
-
-pub const Device = struct {
+pub const Device = extern struct {
     bus_kind: u8 = 0,
     bus: u8 = 0,
     device: u8 = 0,
@@ -13,8 +16,7 @@ pub const Device = struct {
     subclass: u8 = 0,
     prog_if: u8 = 0,
 };
-
-pub const Metrics = struct {
+pub const Metrics = extern struct {
     found: u32 = 0,
     stored: u32 = 0,
     dropped: u32 = 0,
@@ -26,154 +28,52 @@ pub const Metrics = struct {
     function_pages: u64 = 0,
     early_stops: u64 = 0,
 };
-
-pub const Result = struct {
-    devices: [max_devices]Device = .{Device{}} ** max_devices,
-    metrics: Metrics = .{},
-};
-
-pub const Reader = struct {
-    context: ?*anyopaque = null,
-    read_config32: *const fn (?*anyopaque, u8, u8, u8, u16) u32,
-};
-
-pub const Range = struct {
-    bus_kind: u8 = 0,
-    start_bus: u8 = 0,
-    end_bus: u8 = 0,
-};
-
-pub const CoveragePlan = struct {
+pub const Result = extern struct { devices: [max_devices]Device = .{Device{}} ** max_devices, metrics: Metrics = .{} };
+pub const Reader = struct { context: ?*anyopaque = null, read_config32: *const fn (?*anyopaque, u8, u8, u8, u16) u32 };
+const CReader = extern struct { context: ?*anyopaque, read_config32: *const fn (?*anyopaque, u8, u8, u8, u16) callconv(.c) u32 };
+pub const Range = extern struct { bus_kind: u8 = 0, start_bus: u8 = 0, end_bus: u8 = 0 };
+pub const CoveragePlan = extern struct {
     ranges: [3]Range = .{Range{}} ** 3,
     count: u8 = 0,
     ecam_used: bool = false,
     legacy_used: bool = false,
     partial: bool = false,
-
-    fn append(self: *CoveragePlan, range: Range) void {
-        if (self.count >= self.ranges.len) return;
-        self.ranges[@intCast(self.count)] = range;
-        self.count += 1;
-        if (range.bus_kind == bus_kind_ecam) self.ecam_used = true;
-        if (range.bus_kind == bus_kind_legacy) self.legacy_used = true;
-    }
 };
-
-pub fn planCoverage(ecam_ready: bool, segment: u16, start_bus: u8, end_bus: u8) CoveragePlan {
-    var plan: CoveragePlan = .{};
-    if (!ecam_ready or segment != 0 or start_bus > end_bus) {
-        plan.append(.{ .bus_kind = bus_kind_legacy, .start_bus = 0, .end_bus = 255 });
-        return plan;
-    }
-
-    plan.append(.{ .bus_kind = bus_kind_ecam, .start_bus = start_bus, .end_bus = end_bus });
-    if (start_bus > 0) {
-        plan.append(.{ .bus_kind = bus_kind_legacy, .start_bus = 0, .end_bus = start_bus - 1 });
-    }
-    if (end_bus < 255) {
-        plan.append(.{ .bus_kind = bus_kind_legacy, .start_bus = end_bus + 1, .end_bus = 255 });
-    }
-    plan.partial = plan.legacy_used;
-    return plan;
+pub const EcamWindow = extern struct { base: u64, bytes: u64 };
+extern fn r4os_rust_pci_scan_plan(ready: bool, segment: u16, start: u8, end: u8, output: *CoveragePlan) void;
+extern fn r4os_rust_pci_scan_range(result: *Result, range: Range, reader: CReader) bool;
+extern fn r4os_rust_pci_scan_find(result: *const Result, class: u8, subclass: u8, start: u64, output: *u64) bool;
+extern fn r4os_rust_pci_ecam_offset(start: u8, bus: u8, device: u8, function: u8, offset: u16, output: *u64) bool;
+extern fn r4os_rust_pci_ecam_window(base: u64, start: u8, end: u8, output: *EcamWindow) bool;
+pub fn planCoverage(ready: bool, segment: u16, start: u8, end: u8) CoveragePlan {
+    var output: CoveragePlan = undefined;
+    r4os_rust_pci_scan_plan(ready, segment, start, end, &output);
+    return output;
 }
-
-pub fn scanRange(result: *Result, range: Range, reader: Reader) bool {
-    var bus: u16 = range.start_bus;
-    while (bus <= range.end_bus) : (bus += 1) {
-        var device: u8 = 0;
-        while (device < 32) : (device += 1) {
-            var function: u8 = 0;
-            while (function < 8) : (function += 1) {
-                const vendor_device = read(result, reader, @intCast(bus), device, function, 0x00, .vendor);
-                const vendor: u16 = @truncate(vendor_device);
-                if (vendor == 0xFFFF) {
-                    if (function == 0) break;
-                    continue;
-                }
-
-                const class_reg = read(result, reader, @intCast(bus), device, function, 0x08, .class);
-                const found = Device{
-                    .bus_kind = range.bus_kind,
-                    .bus = @intCast(bus),
-                    .device = device,
-                    .function = function,
-                    .vendor_id = vendor,
-                    .device_id = @truncate(vendor_device >> 16),
-                    .class_code = @truncate(class_reg >> 24),
-                    .subclass = @truncate(class_reg >> 16),
-                    .prog_if = @truncate(class_reg >> 8),
-                };
-                if (!store(result, found)) return false;
-
-                if (function == 0) {
-                    const header_type: u8 = @truncate(read(result, reader, @intCast(bus), device, function, 0x0C, .header) >> 16);
-                    if ((header_type & 0x80) == 0) break;
-                }
-            }
-        }
-    }
-    return true;
-}
-
-pub fn findByClass(result: *const Result, class_code: u8, subclass: u8, start_index: usize) ?usize {
-    var index = start_index;
-    const stored: usize = @intCast(result.metrics.stored);
-    while (index < stored and index < result.devices.len) : (index += 1) {
-        const device = result.devices[index];
-        if (device.class_code == class_code and device.subclass == subclass) return index;
-    }
-    return null;
-}
-
-pub fn ecamOffset(start_bus: u8, bus: u8, device: u8, function: u8, offset: u16) ?u64 {
-    if (bus < start_bus or device >= 32 or function >= 8 or offset > 0x0FFF) return null;
-    // MCFG describes the base for bus zero, even for a partial bus window.
-    return (@as(u64, bus) << 20) |
-        (@as(u64, device) << 15) |
-        (@as(u64, function) << 12) |
-        @as(u64, offset & 0x0FFC);
-}
-
-pub const EcamWindow = struct { base: u64, bytes: u64 };
-
-pub fn ecamWindow(base: u64, start_bus: u8, end_bus: u8) ?EcamWindow {
-    if (base == 0 or start_bus > end_bus) return null;
-    const start = @as(u64, start_bus) << 20;
-    const end = (@as(u64, end_bus) + 1) << 20;
-    if (base > ~@as(u64, 0) - end) return null;
-    return .{ .base = base + start, .bytes = end - start };
-}
-
-const ReadPurpose = enum {
-    vendor,
-    class,
-    header,
-};
-
-fn read(result: *Result, reader: Reader, bus: u8, device: u8, function: u8, offset: u16, purpose: ReadPurpose) u32 {
-    result.metrics.config_reads +%= 1;
-    switch (purpose) {
-        .vendor => {
-            result.metrics.vendor_probes +%= 1;
-            result.metrics.function_pages +%= 1;
-        },
-        .class => result.metrics.class_reads +%= 1,
-        .header => result.metrics.header_reads +%= 1,
-    }
+export fn r4os_zig_pci_scan_read(context: ?*anyopaque, bus: u8, device: u8, function: u8, offset: u16) callconv(.c) u32 {
+    const reader: *const Reader = @ptrCast(@alignCast(context.?));
     return reader.read_config32(reader.context, bus, device, function, offset);
 }
-
-fn store(result: *Result, device: Device) bool {
-    result.metrics.found +%= 1;
-    if (result.metrics.stored >= result.devices.len) {
-        result.metrics.dropped +%= 1;
-        result.metrics.truncated = true;
-        result.metrics.early_stops +%= 1;
-        return false;
-    }
-    result.devices[@intCast(result.metrics.stored)] = device;
-    result.metrics.stored += 1;
-    return true;
+pub fn scanRange(result: *Result, range: Range, reader: Reader) bool {
+    const adapter = reader;
+    return r4os_rust_pci_scan_range(result, range, .{ .context = @ptrCast(@constCast(&adapter)), .read_config32 = r4os_zig_pci_scan_read });
+}
+pub fn findByClass(result: *const Result, class_code: u8, subclass: u8, start_index: usize) ?usize {
+    var output: u64 = undefined;
+    return if (r4os_rust_pci_scan_find(result, class_code, subclass, start_index, &output)) @intCast(output) else null;
+}
+pub fn ecamOffset(start: u8, bus: u8, device: u8, function: u8, offset: u16) ?u64 {
+    var output: u64 = undefined;
+    return if (r4os_rust_pci_ecam_offset(start, bus, device, function, offset, &output)) output else null;
+}
+pub fn ecamWindow(base: u64, start: u8, end: u8) ?EcamWindow {
+    var output: EcamWindow = undefined;
+    return if (r4os_rust_pci_ecam_window(base, start, end, &output)) output else null;
+}
+comptime {
+    if (@sizeOf(Device) != 12 or @sizeOf(Metrics) != 64 or @sizeOf(Result) != 832 or
+        @sizeOf(Range) != 3 or @sizeOf(CoveragePlan) != 13 or @sizeOf(CReader) != 16)
+        @compileError("Rust PCI scanner layout differs");
 }
 
 test "coverage plan uses one full ECAM range" {

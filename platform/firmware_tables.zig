@@ -1,100 +1,105 @@
-// Boot-owned, read-only ACPI root tables. Populated before driver/task/SMP
-// publication, sealed afterwards. No firmware-specific parser or execution.
+// Boot-owned read-only ACPI catalog; Rust owns construction, identity and reads.
 const std = @import("std");
 const boot = @import("../bootloader/boot_info.zig");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const max_tables = 256;
 pub const max_bytes = 1024 * 1024;
 pub const Error = error{ Invalid, Unavailable, Corrupt, NotFound, Stale };
-pub const Info = struct { handle: u64, bytes: u64, generation: u64, signature: u32, revision: u8 };
-const Record = struct { bytes: []const u8, signature: u32, revision: u8, valid: bool, digest: [32]u8 };
-// Only retain firmware memory that blocks.zig never puts into the allocator
-// and page_tables.mapHhdmDirectMap carries into the kernel's own CR3. A table
-// mapped ad hoc by the bootloader outside that map is not a durable source.
-pub fn retainedBacking(base: u64, bytes: u64, entries: []const boot.MemoryMapEntry) bool {
-    if (base == 0 or bytes == 0) return false;
-    const end = std.math.add(u64, base, bytes) catch return false;
-    var cursor = base;
-    while (cursor < end) {
-        var next = cursor;
-        for (entries) |entry| {
-            if (!entry.valid or entry.length == 0 or entry.base > cursor or entry.end <= cursor) continue;
-            switch (entry.kind) {
-                .reserved, .acpi_reclaimable, .acpi_nvs => next = @min(end, entry.end),
-                else => return false,
-            }
-            break;
-        }
-        if (next <= cursor) return false;
-        cursor = next;
-    }
-    return true;
+pub const Info = extern struct { handle: u64, bytes: u64, generation: u64, signature: u32, revision: u8 };
+const Record = extern struct {
+    address: u64 = 0,
+    bytes: u64 = 0,
+    signature: u32 = 0,
+    revision: u8 = 0,
+    valid: bool = false,
+    digest: [32]u8 = @splat(0),
+};
+extern fn r4os_rust_firmware_catalog() *Catalog;
+extern fn r4os_rust_firmware_retained(base: u64, bytes: u64, entries: [*]const boot.MemoryMapEntry, count: u64) bool;
+extern fn r4os_rust_firmware_control(catalog: *Catalog, operation: u8, input: ?[*]const u8, bytes: u64) void;
+extern fn r4os_rust_firmware_stat(catalog: *const Catalog, signature: u32, occurrence: u32, output: *Info) i32;
+extern fn r4os_rust_firmware_read(catalog: *const Catalog, handle: u64, offset: u64, output: [*]u8, bytes: u64) i32;
+fn result(code: i32) Error!void {
+    return switch (code) {
+        0 => {},
+        -1 => error.Invalid,
+        -2 => error.Unavailable,
+        -3 => error.Corrupt,
+        -4 => error.NotFound,
+        -5 => error.Stale,
+        else => unreachable,
+    };
 }
-pub const Catalog = struct {
-    records: [max_tables]Record = undefined,
+pub fn retainedBacking(base: u64, bytes: u64, entries: []const boot.MemoryMapEntry) bool {
+    return r4os_rust_firmware_retained(base, bytes, entries.ptr, entries.len);
+}
+// Explicit C storage also lets the unchanged existing fixture exercise the
+// actual Rust owner on a caller-owned catalog. Production storage lives in Rust.
+pub const Catalog = extern struct {
+    records: [max_tables]Record = .{Record{}} ** max_tables,
     count: usize = 0,
     generation: u32 = 0,
     root_valid: bool = false,
     failed: bool = false,
     sealed: bool = false,
-
     pub fn begin(self: *Catalog) void {
-        self.count = 0; self.root_valid = false; self.sealed = false;
-        self.failed = self.generation == std.math.maxInt(u32);
-        if (!self.failed) self.generation += 1;
+        r4os_rust_firmware_control(self, 0, null, 0);
     }
-    pub fn rootValidated(self: *Catalog) void { if (!self.sealed) self.root_valid = true; }
-    pub fn incomplete(self: *Catalog) void { if (!self.sealed) self.failed = true; }
-    pub fn seal(self: *Catalog) void { self.sealed = true; }
+    pub fn rootValidated(self: *Catalog) void {
+        r4os_rust_firmware_control(self, 1, null, 0);
+    }
+    pub fn incomplete(self: *Catalog) void {
+        r4os_rust_firmware_control(self, 2, null, 0);
+    }
+    pub fn seal(self: *Catalog) void {
+        r4os_rust_firmware_control(self, 3, null, 0);
+    }
     pub fn observe(self: *Catalog, bytes: []const u8) void {
-        if (self.sealed or self.failed) return;
-        if (bytes.len < 36 or bytes.len > max_bytes) { self.failed = true; return; }
-        for (self.records[0..self.count]) |*record| if (record.bytes.ptr == bytes.ptr) return;
-        if (self.count == self.records.len) { self.failed = true; return; }
-        const size = std.mem.readInt(u32, bytes[4..8], .little);
-        var sum: u8 = 0;
-        for (bytes) |byte| sum +%= byte;
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        self.records[self.count] = .{ .bytes = bytes, .signature = std.mem.readInt(u32, bytes[0..4], .little),
-            .revision = bytes[8], .valid = size == bytes.len and sum == 0, .digest = digest };
-        self.count += 1;
+        r4os_rust_firmware_control(self, 4, bytes.ptr, bytes.len);
     }
     pub fn stat(self: *const Catalog, signature: u32, occurrence: u32) Error!Info {
-        if (!self.sealed or !self.root_valid or self.failed) return error.Unavailable;
-        var index: u32 = 0;
-        for (self.records[0..self.count], 0..) |*record, slot| {
-            if (record.signature != signature) continue;
-            if (index != occurrence) { index += 1; continue; }
-            try unchanged(record);
-            return .{ .handle = (@as(u64, self.generation) << 32) | (slot + 1), .bytes = record.bytes.len,
-                .generation = self.generation, .signature = record.signature, .revision = record.revision };
-        }
-        return error.NotFound;
+        var output: Info = undefined;
+        try result(r4os_rust_firmware_stat(self, signature, occurrence, &output));
+        return output;
     }
     pub fn readAt(self: *const Catalog, handle: u64, offset: u64, output: []u8) Error!void {
-        if (!self.sealed or !self.root_valid or self.failed) return error.Unavailable;
-        const index = handle & 0xffffffff;
-        if (handle >> 32 != self.generation or index == 0 or index > self.count) return error.Stale;
-        const record = &self.records[index - 1];
-        if (output.len == 0 or output.len > 65536 or offset > record.bytes.len or output.len > record.bytes.len - offset) return error.Invalid;
-        // Never copy into any retained source or into catalog metadata, even
-        // accidentally. This is a read API, not a writable firmware mapping.
-        const address = @intFromPtr(output.ptr);
-        const end = std.math.add(usize, address, output.len) catch return error.Invalid;
-        if (address < @intFromPtr(self) + @sizeOf(Catalog) and @intFromPtr(self) < end) return error.Invalid;
-        for (self.records[0..self.count]) |*source| {
-            if (address < @intFromPtr(source.bytes.ptr) + source.bytes.len and @intFromPtr(source.bytes.ptr) < end) return error.Invalid;
-        }
-        try unchanged(record);
-        @memcpy(output, record.bytes[@intCast(offset)..][0..output.len]);
-        try unchanged(record);
+        try result(r4os_rust_firmware_read(self, handle, offset, output.ptr, output.len));
     }
 };
-fn unchanged(record: *const Record) Error!void {
-    if (!record.valid) return error.Corrupt;
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(record.bytes, &digest, .{});
-    if (!std.mem.eql(u8, &digest, &record.digest)) return error.Stale;
+pub fn residentCatalog() *Catalog {
+    return r4os_rust_firmware_catalog();
+}
+// Namespace compatibility for the remaining ACPI/driver-resource callers;
+// this contains no mutable state or second catalog.
+pub const ResidentCatalog = struct {
+    pub fn begin() void {
+        residentCatalog().begin();
+    }
+    pub fn rootValidated() void {
+        residentCatalog().rootValidated();
+    }
+    pub fn incomplete() void {
+        residentCatalog().incomplete();
+    }
+    pub fn seal() void {
+        residentCatalog().seal();
+    }
+    pub fn observe(bytes: []const u8) void {
+        residentCatalog().observe(bytes);
+    }
+    pub fn stat(signature: u32, occurrence: u32) Error!Info {
+        return residentCatalog().stat(signature, occurrence);
+    }
+    pub fn readAt(handle: u64, offset: u64, output: []u8) Error!void {
+        try residentCatalog().readAt(handle, offset, output);
+    }
+};
+comptime {
+    if (@sizeOf(Record) != 56 or @sizeOf(Catalog) != 14352 or
+        @offsetOf(Catalog, "count") != 14336 or @sizeOf(Info) != 32)
+        @compileError("Rust firmware catalog layout differs");
 }
 
 test "firmware table catalog keeps complete boot identity, damaged sources and bounded immutable reads" {

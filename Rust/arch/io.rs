@@ -17,3 +17,21 @@ pub unsafe fn inb(port: u16) -> u8 {
     };
     value
 }
+#[inline]
+/// # Safety
+/// Caller owns this device port and executes at the kernel privilege level.
+pub unsafe fn outl(port: u16, value: u32) {
+    unsafe {
+        core::arch::asm!("out dx, eax", in("dx") port, in("eax") value, options(nomem, nostack, preserves_flags))
+    };
+}
+#[inline]
+/// # Safety
+/// Caller owns this device port and executes at the kernel privilege level.
+pub unsafe fn inl(port: u16) -> u32 {
+    let value: u32;
+    unsafe {
+        core::arch::asm!("in eax, dx", in("dx") port, out("eax") value, options(nomem, nostack, preserves_flags))
+    };
+    value
+}

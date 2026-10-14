@@ -1,66 +1,42 @@
-// Platform and device mapping bridge for kernel startup.
-//
-// This layer creates the ACPI and canonical PCI state once and finalizes the
-// late device mappings. Consumers read the inventory, never the raw buses.
-
+// Rust owns platform boot order and cached completion views.
 const acpi = @import("../platform/acpi.zig");
+const pci_inventory = @import("../platform/pci_inventory.zig");
+const memory_boot = @import("memory_boot.zig");
 const boot_status = @import("boot_status.zig");
 const fatal = @import("fatal.zig");
-const memory_boot = @import("memory_boot.zig");
-const pci_inventory = @import("../platform/pci_inventory.zig");
-const pcie = @import("../platform/pcie.zig");
-
-var initialized = false;
-var legacy_pci_enumerated = false;
-var cached_acpi_info: acpi.Info = .{};
-var cached_pci_status: pci_inventory.Status = .{};
-
+extern fn r4os_rust_platform_boot_control(operation: u8) bool;
+extern fn r4os_rust_platform_boot_acpi(output: *acpi.RawInfo) bool;
+extern fn r4os_rust_platform_boot_pci(output: *pci_inventory.RawStatus) bool;
+export fn r4os_zig_platform_boot_step(operation: u8, input: ?*const acpi.RawInfo) callconv(.c) bool {
+    if (@import("builtin").is_test) @panic("platform boot work requested by host fixture");
+    return switch (operation) {
+        0 => memory_boot.isCoreInitialized(),
+        1 => memory_boot.finalizeDeviceMappings(acpi.project(input.?.*)),
+        2 => blk: {
+            boot_status.statusLine("  Platform mappings [OK]\r\n");
+            break :blk true;
+        },
+        3 => fatal.fail(.platform, "Platform boot before memory core"),
+        else => false,
+    };
+}
 pub fn initDeviceMappings() bool {
-    if (initialized) return true;
-
-    if (!memory_boot.isCoreInitialized()) {
-        return fail("Platform boot before memory core");
-    }
-
-    cached_acpi_info = acpi.inspect();
-    pcie.configure(cached_acpi_info);
-
-    if (!memory_boot.finalizeDeviceMappings(cached_acpi_info)) {
-        return false;
-    }
-
-    _ = pcie.activateMappedAperture();
-    cached_pci_status = pci_inventory.enumerate();
-    legacy_pci_enumerated = cached_pci_status.legacy_used;
-
-    initialized = true;
-    boot_status.statusLine("  Platform mappings [OK]\r\n");
-    return true;
+    return r4os_rust_platform_boot_control(0);
 }
-
 pub fn isInitialized() bool {
-    return initialized;
+    return r4os_rust_platform_boot_control(1);
 }
-
 pub fn isLegacyPciEnumerated() bool {
-    return legacy_pci_enumerated;
+    return r4os_rust_platform_boot_control(2);
 }
-
 pub fn acpiInfo() ?acpi.Info {
-    if (!initialized) return null;
-    return cached_acpi_info;
+    var output: acpi.RawInfo = undefined;
+    return if (r4os_rust_platform_boot_acpi(&output)) acpi.project(output) else null;
 }
-
 pub fn pcieStatus() ?pci_inventory.Status {
-    if (!initialized) return null;
-    return cached_pci_status;
+    var output: pci_inventory.RawStatus = undefined;
+    return if (r4os_rust_platform_boot_pci(&output)) pci_inventory.project(output) else null;
 }
-
 pub fn pciInventoryStatus() ?pci_inventory.Status {
-    if (!initialized) return null;
-    return cached_pci_status;
-}
-
-fn fail(message: []const u8) bool {
-    return fatal.fail(.platform, message);
+    return pcieStatus();
 }

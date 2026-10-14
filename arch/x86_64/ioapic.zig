@@ -1,42 +1,52 @@
+// Private C facade. MMIO, route construction and mutation have one Rust owner.
 const acpi = @import("../../platform/acpi.zig");
 const bootlog = @import("../../kernel/bootlog.zig");
 const k = @import("../../kernel/log.zig");
 const lapic = @import("lapic.zig");
-const paging = @import("../../memory/paging.zig");
-const phys = @import("../../memory/phys.zig");
 const percpu = @import("percpu.zig");
-
-const REGSEL: u64 = 0x00;
-const IOWIN: u64 = 0x10;
-
-const REG_ID: u8 = 0x00;
-const REG_VERSION: u8 = 0x01;
-const REDIR_BASE: u8 = 0x10;
-
 const REDIR_MASKED: u32 = 1 << 16;
-const REDIR_POLARITY_LOW: u32 = 1 << 13;
-const REDIR_TRIGGER_LEVEL: u32 = 1 << 15;
-const IRQ_VECTOR_BASE: u8 = 0x20;
-const PCI_INTX_FLAGS: u16 = 0x000F;
-
-pub const RedirectionEntry = struct {
+pub const RedirectionEntry = extern struct {
     low: u32 = 0,
     high: u32 = 0,
     present: bool = false,
 };
-
-pub const IrqRoute = struct {
-    irq: u8 = 0,
+pub const IrqRoute = extern struct {
     gsi: u32 = 0,
-    vector: u8 = 0,
     flags: u16 = 0,
+    irq: u8 = 0,
+    vector: u8 = 0,
     target_lapic: u8 = 0,
     redir_index: u8 = 0,
     present: bool = false,
     in_range: bool = false,
     override: bool = false,
 };
-
+const Iso = extern struct { gsi: u32 = 0, flags: u16 = 0, bus: u8 = 0, source: u8 = 0 };
+const Input = extern struct {
+    phys_base: u32,
+    gsi_base: u32,
+    ioapic_count: u32,
+    iso_count: u32,
+    madt_id: u8,
+    bsp_id: u8,
+    reserved: [2]u8 = .{ 0, 0 },
+    isos: [16]Iso = [_]Iso{.{}} ** 16,
+};
+pub const RawStatus = extern struct {
+    phys_base: u64,
+    virt_base: u64,
+    gsi_base: u32,
+    flags: u32,
+    madt_id: u8,
+    reg_id: u8,
+    version: u8,
+    max_redirection_entry: u8,
+    programmed_routes: u8,
+    reason: u8,
+    reserved: [2]u8,
+    redirections: [4]RedirectionEntry,
+    routes: [4]IrqRoute,
+};
 pub const Status = struct {
     available: bool = false,
     mapped: bool = false,
@@ -60,58 +70,85 @@ pub const Status = struct {
     reason: []const u8 = "not initialized",
 };
 
-var current: Status = .{};
-var base_virt: u64 = 0;
-var next_runtime_target: u32 = 1;
-
+extern fn r4os_rust_ioapic_init(input: *const Input, output: *RawStatus) void;
+extern fn r4os_rust_ioapic_status(output: *RawStatus) void;
+extern fn r4os_rust_ioapic_control(operation: u8, irq: u8, masked: bool) bool;
+extern fn r4os_rust_ioapic_route(irq: u8, output: *IrqRoute) void;
+extern fn r4os_rust_ioapic_redirection(index: u8, output: *RedirectionEntry) void;
+pub fn project(raw: RawStatus) Status {
+    return .{ .available = raw.flags & 1 != 0, .mapped = raw.flags & 2 != 0, .routing_active = raw.flags & 4 != 0, .madt_id = raw.madt_id, .reg_id = raw.reg_id, .version = raw.version, .max_redirection_entry = raw.max_redirection_entry, .phys_base = raw.phys_base, .virt_base = raw.virt_base, .gsi_base = raw.gsi_base, .programmed_routes = raw.programmed_routes, .redir0 = raw.redirections[0], .redir1 = raw.redirections[1], .redir2 = raw.redirections[2], .redir12 = raw.redirections[3], .route0 = raw.routes[0], .route1 = raw.routes[1], .route2 = raw.routes[2], .route12 = raw.routes[3], .reason = switch (raw.reason) {
+        0 => "not initialized",
+        1 => "MADT has no IOAPIC",
+        2 => "IOAPIC MMIO mapping failed",
+        3 => "MMIO mapped, redirection table visible, routing unchanged",
+        4 => "legacy IRQ0/1/12 routed through IOAPIC",
+        5 => "IOAPIC routing incomplete, PIC fallback required",
+        else => unreachable,
+    } };
+}
+fn makeInput(info: acpi.Info) Input {
+    var input = Input{ .phys_base = info.madt_first_ioapic_address, .gsi_base = info.madt_first_ioapic_gsi_base, .ioapic_count = info.madt_ioapic_count, .iso_count = info.madt_iso_count, .madt_id = info.madt_first_ioapic_id, .bsp_id = lapic.status().id };
+    for (0..@min(@as(usize, info.madt_iso_count), 16)) |index| {
+        const iso = info.madt_isos[index];
+        input.isos[index] = .{ .gsi = iso.gsi, .flags = iso.flags, .bus = iso.bus, .source = iso.source };
+    }
+    return input;
+}
+export fn r4os_zig_ioapic_inputs(output: *Input) callconv(.c) void {
+    output.* = makeInput(acpi.info());
+}
+export fn r4os_zig_ioapic_cpu_mask() callconv(.c) u64 {
+    return percpu.schedulableMask();
+}
+export fn r4os_zig_ioapic_cpu_id(index: u32, output: *u32) callconv(.c) bool {
+    if (!percpu.isSchedulable(index)) return false;
+    output.* = percpu.apicId(index) orelse return false;
+    return true;
+}
 pub fn initFromAcpi(info: acpi.Info) Status {
-    current = .{
-        .available = info.madt_ioapic_count > 0 and info.madt_first_ioapic_address != 0,
-        .madt_id = info.madt_first_ioapic_id,
-        .phys_base = info.madt_first_ioapic_address,
-        .gsi_base = info.madt_first_ioapic_gsi_base,
-        .reason = "MADT has no IOAPIC",
-    };
-    base_virt = 0;
-    if (!current.available) {
-        logStatus();
-        return current;
-    }
-    if (!mapMmio(current.phys_base)) {
-        current.reason = "IOAPIC MMIO mapping failed";
-        logStatus();
-        return current;
-    }
-
-    const id_reg = readReg(REG_ID);
-    const version_reg = readReg(REG_VERSION);
-    current.reg_id = @truncate((id_reg >> 24) & 0x0F);
-    current.version = @truncate(version_reg);
-    current.max_redirection_entry = @truncate((version_reg >> 16) & 0xFF);
-    current.mapped = true;
-    current.redir0 = readRedirectionEntryIfPresent(0);
-    current.redir1 = readRedirectionEntryIfPresent(1);
-    current.redir2 = readRedirectionEntryIfPresent(2);
-    current.redir12 = readRedirectionEntryIfPresent(12);
-    current.route0 = buildRoute(info, 0);
-    current.route1 = buildRoute(info, 1);
-    current.route2 = buildRoute(info, 2);
-    current.route12 = buildRoute(info, 12);
-    current.reason = "MMIO mapped, redirection table visible, routing unchanged";
-    logStatus();
-    return current;
+    const input = makeInput(info);
+    var raw: RawStatus = undefined;
+    r4os_rust_ioapic_init(&input, &raw);
+    return project(raw);
 }
-
 pub fn status() Status {
-    return current;
+    var raw: RawStatus = undefined;
+    r4os_rust_ioapic_status(&raw);
+    return project(raw);
 }
-
 pub fn isRoutingActive() bool {
-    return current.routing_active;
+    return r4os_rust_ioapic_control(0, 0, false);
+}
+pub fn readRedirectionEntry(index: u8) RedirectionEntry {
+    var entry: RedirectionEntry = undefined;
+    r4os_rust_ioapic_redirection(index, &entry);
+    return entry;
+}
+pub fn setLegacyIrqMasked(irq: u8, masked: bool) bool {
+    return r4os_rust_ioapic_control(1, irq, masked);
+}
+pub fn activateLegacyIrq(irq: u8) bool {
+    return r4os_rust_ioapic_control(2, irq, false);
+}
+pub fn activatePciIntxIrq(irq: u8) bool {
+    return r4os_rust_ioapic_control(3, irq, false);
+}
+pub fn activateLegacyRoutes() bool {
+    return r4os_rust_ioapic_control(4, 0, false);
+}
+pub fn routeForIrq(irq: u8) IrqRoute {
+    var route: IrqRoute = undefined;
+    r4os_rust_ioapic_route(irq, &route);
+    return route;
+}
+comptime {
+    if (percpu.max_cpus != 32 or acpi.MAX_MADT_ISO != 16 or @sizeOf(Input) != 148 or @offsetOf(Input, "isos") != 20 or
+        @sizeOf(RedirectionEntry) != 12 or @sizeOf(IrqRoute) != 16 or @sizeOf(RawStatus) != 144 or @offsetOf(RawStatus, "routes") != 80)
+        @compileError("Rust IOAPIC C layout or platform bound differs");
 }
 
 pub fn dumpStatus() void {
-    const s = current;
+    const s = status();
     k.puts("IOAPIC status\r\n");
     k.puts("  Available: ");
     k.puts(if (s.available) "yes" else "no");
@@ -153,219 +190,6 @@ pub fn dumpStatus() void {
     k.puts("  Note: ");
     k.puts(s.reason);
     k.puts("\r\n");
-}
-
-pub fn readRedirectionEntry(index: u8) RedirectionEntry {
-    if (!current.mapped or index > current.max_redirection_entry) return .{};
-    return .{
-        .low = readReg(REDIR_BASE + @as(u8, index * 2)),
-        .high = readReg(REDIR_BASE + @as(u8, index * 2) + 1),
-        .present = true,
-    };
-}
-
-pub fn setLegacyIrqMasked(irq: u8, masked: bool) bool {
-    if (!current.mapped) return false;
-    const route = routeForIrq(irq);
-    if (!route.present or !route.in_range) return false;
-    const low_reg = REDIR_BASE + @as(u8, route.redir_index * 2);
-    var low = readReg(low_reg);
-    if (masked) {
-        low |= REDIR_MASKED;
-    } else {
-        low &= ~@as(u32, REDIR_MASKED);
-    }
-    writeReg(low_reg, low);
-    refreshKnownRedirection(route.redir_index);
-    return true;
-}
-
-pub fn activateLegacyIrq(irq: u8) bool {
-    if (!current.mapped) return false;
-    const route = routeForIrq(irq);
-    if (!route.present or !route.in_range) return false;
-    if (!programRoute(route)) return false;
-    refreshKnownRedirection(route.redir_index);
-    return true;
-}
-
-pub fn activatePciIntxIrq(irq: u8) bool {
-    if (!current.mapped) return false;
-    var route = routeForIrq(irq);
-    if (!route.present or !route.in_range) return false;
-    route.flags = PCI_INTX_FLAGS;
-    route.target_lapic = chooseRuntimeTarget();
-    if (!programRoute(route)) return false;
-    refreshKnownRedirection(route.redir_index);
-    return true;
-}
-
-fn chooseRuntimeTarget() u8 {
-    const mask = percpu.schedulableMask();
-    if (@popCount(mask) <= 1) return lapic.status().id;
-    var attempts: u32 = 0;
-    while (attempts < percpu.max_cpus) : (attempts += 1) {
-        const index = next_runtime_target % @as(u32, @intCast(percpu.max_cpus));
-        next_runtime_target +%= 1;
-        if (index == 0 or !percpu.isSchedulable(index)) continue;
-        const apic_id = percpu.apicId(index) orelse continue;
-        if (apic_id <= 0xFF) return @intCast(apic_id);
-    }
-    return lapic.status().id;
-}
-
-pub fn activateLegacyRoutes() bool {
-    if (!current.mapped) {
-        bootlog.puts("[IOAPIC][WARN] legacy route activation skipped, IOAPIC not mapped\r\n");
-        return false;
-    }
-    if (!current.route0.in_range or !current.route1.in_range or !current.route12.in_range) {
-        bootlog.puts("[IOAPIC][WARN] legacy route activation skipped, route out of range\r\n");
-        return false;
-    }
-
-    maskAllRedirections();
-    current.programmed_routes = 0;
-    if (programRoute(current.route0)) current.programmed_routes += 1;
-    if (programRoute(current.route1)) current.programmed_routes += 1;
-    if (programRoute(current.route12)) current.programmed_routes += 1;
-    current.redir0 = readRedirectionEntryIfPresent(0);
-    current.redir1 = readRedirectionEntryIfPresent(1);
-    current.redir2 = readRedirectionEntryIfPresent(2);
-    current.redir12 = readRedirectionEntryIfPresent(12);
-    current.routing_active = current.programmed_routes == 3;
-    current.reason = if (current.routing_active)
-        "legacy IRQ0/1/12 routed through IOAPIC"
-    else
-        "IOAPIC routing incomplete, PIC fallback required";
-    bootlog.puts("[IOAPIC] routing=");
-    bootlog.puts(if (current.routing_active) "active" else "incomplete");
-    bootlog.puts(" programmed=");
-    bootlog.putDec(current.programmed_routes);
-    bootlog.puts(" irq0=");
-    bootlog.putDec(current.route0.gsi);
-    bootlog.puts(" irq1=");
-    bootlog.putDec(current.route1.gsi);
-    bootlog.puts(" irq12=");
-    bootlog.putDec(current.route12.gsi);
-    bootlog.puts("\r\n");
-    return current.routing_active;
-}
-
-pub fn routeForIrq(irq: u8) IrqRoute {
-    // Only these device vectors have installed IRQ handlers (0x20..0x3F).
-    if (irq >= 32) return .{ .irq = irq };
-    return switch (irq) {
-        0 => current.route0,
-        1 => current.route1,
-        2 => current.route2,
-        12 => current.route12,
-        else => buildRoute(acpi.info(), irq),
-    };
-}
-
-fn readRedirectionEntryIfPresent(index: u8) RedirectionEntry {
-    if (index > current.max_redirection_entry) return .{};
-    return readRedirectionEntry(index);
-}
-
-fn buildRoute(info: acpi.Info, irq: u8) IrqRoute {
-    var route = IrqRoute{
-        .irq = irq,
-        .gsi = irq,
-        .vector = vectorForIrq(irq),
-        .target_lapic = lapic.status().id,
-        .present = current.mapped,
-    };
-    const max_iso = minU32(info.madt_iso_count, acpi.MAX_MADT_ISO);
-    var i: usize = 0;
-    while (i < max_iso) : (i += 1) {
-        const iso = info.madt_isos[i];
-        if (iso.bus == 0 and iso.source == irq) {
-            route.gsi = iso.gsi;
-            route.flags = iso.flags;
-            route.override = true;
-            break;
-        }
-    }
-    if (gsiInRange(route.gsi)) {
-        route.in_range = true;
-        route.redir_index = @intCast(route.gsi - current.gsi_base);
-    }
-    return route;
-}
-
-fn gsiInRange(gsi: u32) bool {
-    if (!current.mapped or gsi < current.gsi_base) return false;
-    const index = gsi - current.gsi_base;
-    return index <= current.max_redirection_entry;
-}
-
-fn vectorForIrq(irq: u8) u8 {
-    if (irq <= 0xDF) return IRQ_VECTOR_BASE + irq;
-    return 0xFF;
-}
-
-fn mapMmio(base_phys: u64) bool {
-    const page = base_phys & ~(paging.PAGE_SIZE - 1);
-    const virt_page = phys.physToVirt(page);
-    if (!paging.isMapped(virt_page)) {
-        if (!paging.mapPage(virt_page, page, paging.WRITABLE | paging.CACHE_DISABLE | paging.NO_EXECUTE)) {
-            return false;
-        }
-    }
-    base_virt = phys.physToVirt(base_phys);
-    current.virt_base = base_virt;
-    return true;
-}
-
-fn readReg(reg: u8) u32 {
-    const select: *volatile u32 = @ptrFromInt(base_virt + REGSEL);
-    const window: *volatile u32 = @ptrFromInt(base_virt + IOWIN);
-    select.* = reg;
-    return window.*;
-}
-
-fn writeReg(reg: u8, value: u32) void {
-    const select: *volatile u32 = @ptrFromInt(base_virt + REGSEL);
-    const window: *volatile u32 = @ptrFromInt(base_virt + IOWIN);
-    select.* = reg;
-    window.* = value;
-}
-
-fn maskAllRedirections() void {
-    var index: u8 = 0;
-    while (index <= current.max_redirection_entry) : (index += 1) {
-        const low_reg = REDIR_BASE + @as(u8, index * 2);
-        writeReg(low_reg, readReg(low_reg) | REDIR_MASKED);
-    }
-}
-
-fn programRoute(route: IrqRoute) bool {
-    if (!route.present or !route.in_range) return false;
-    const low_reg = REDIR_BASE + @as(u8, route.redir_index * 2);
-    const high_reg = low_reg + 1;
-    var low: u32 = route.vector;
-    if (isActiveLow(route.flags)) low |= REDIR_POLARITY_LOW;
-    if (isLevelTriggered(route.flags)) low |= REDIR_TRIGGER_LEVEL;
-    writeReg(high_reg, @as(u32, route.target_lapic) << 24);
-    writeReg(low_reg, low);
-    return true;
-}
-
-fn refreshKnownRedirection(index: u8) void {
-    if (current.route0.in_range and current.route0.redir_index == index) {
-        current.redir0 = readRedirectionEntryIfPresent(index);
-    }
-    if (current.route1.in_range and current.route1.redir_index == index) {
-        current.redir1 = readRedirectionEntryIfPresent(index);
-    }
-    if (current.route2.in_range and current.route2.redir_index == index) {
-        current.redir2 = readRedirectionEntryIfPresent(index);
-    }
-    if (current.route12.in_range and current.route12.redir_index == index) {
-        current.redir12 = readRedirectionEntryIfPresent(index);
-    }
 }
 
 fn dumpRedir(label: []const u8, entry: RedirectionEntry) void {
@@ -430,46 +254,58 @@ fn triggerName(flags: u16) []const u8 {
     };
 }
 
-fn isActiveLow(flags: u16) bool {
-    return (flags & 0x3) == 3;
-}
-
-fn isLevelTriggered(flags: u16) bool {
-    return ((flags >> 2) & 0x3) == 3;
-}
-
-fn minU32(value: u32, comptime limit: usize) usize {
-    return if (value < limit) @intCast(value) else limit;
-}
-
-fn logStatus() void {
+fn logStatus(s: Status) void {
     bootlog.puts("[IOAPIC] ");
-    bootlog.puts(if (current.available) "available" else "missing");
+    bootlog.puts(if (s.available) "available" else "missing");
     bootlog.puts(" mapped=");
-    bootlog.puts(if (current.mapped) "yes" else "no");
+    bootlog.puts(if (s.mapped) "yes" else "no");
     bootlog.puts(" routing=");
-    bootlog.puts(if (current.routing_active) "active" else "off");
+    bootlog.puts(if (s.routing_active) "active" else "off");
     bootlog.puts(" id=");
-    bootlog.putDec(current.reg_id);
+    bootlog.putDec(s.reg_id);
     bootlog.puts("/");
-    bootlog.putDec(current.madt_id);
+    bootlog.putDec(s.madt_id);
     bootlog.puts(" ver=0x");
-    bootlog.putHex(current.version, 2);
+    bootlog.putHex(s.version, 2);
     bootlog.puts(" redirs=");
-    if (current.mapped) {
-        bootlog.putDec(@as(u64, current.max_redirection_entry) + 1);
+    if (s.mapped) {
+        bootlog.putDec(@as(u64, s.max_redirection_entry) + 1);
     } else {
         bootlog.putDec(0);
     }
     bootlog.puts(" gsi_base=");
-    bootlog.putDec(current.gsi_base);
+    bootlog.putDec(s.gsi_base);
     bootlog.puts(" route_irq0_gsi=");
-    bootlog.putDec(current.route0.gsi);
+    bootlog.putDec(s.route0.gsi);
     bootlog.puts(" route_irq1_gsi=");
-    bootlog.putDec(current.route1.gsi);
+    bootlog.putDec(s.route1.gsi);
     bootlog.puts(" route_irq12_gsi=");
-    bootlog.putDec(current.route12.gsi);
+    bootlog.putDec(s.route12.gsi);
     bootlog.puts(" reason=");
-    bootlog.puts(current.reason);
+    bootlog.puts(s.reason);
     bootlog.puts("\r\n");
+}
+
+export fn r4os_zig_ioapic_log(event: u8, raw: *const RawStatus) callconv(.c) void {
+    if (comptime @import("builtin").is_test) return;
+    const s = project(raw.*);
+    switch (event) {
+        0 => logStatus(s),
+        1 => {
+            bootlog.puts("[IOAPIC] routing=");
+            bootlog.puts(if (s.routing_active) "active" else "incomplete");
+            bootlog.puts(" programmed=");
+            bootlog.putDec(s.programmed_routes);
+            bootlog.puts(" irq0=");
+            bootlog.putDec(s.route0.gsi);
+            bootlog.puts(" irq1=");
+            bootlog.putDec(s.route1.gsi);
+            bootlog.puts(" irq12=");
+            bootlog.putDec(s.route12.gsi);
+            bootlog.puts("\r\n");
+        },
+        2 => bootlog.puts("[IOAPIC][WARN] legacy route activation skipped, IOAPIC not mapped\r\n"),
+        3 => bootlog.puts("[IOAPIC][WARN] legacy route activation skipped, route out of range\r\n"),
+        else => unreachable,
+    }
 }

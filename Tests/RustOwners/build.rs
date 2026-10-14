@@ -7,14 +7,19 @@ fn main() {
         .expect("Use the shared Kernel builder for owner fixtures");
     println!("cargo::rerun-if-changed={path}");
     let source = fs::read_to_string(path).expect("Kernel fixture configuration");
-    let value = source
-        .lines()
-        .find_map(|line| line.strip_prefix("ENABLE_METRICS="))
-        .expect("Canonical metrics flag");
-    assert!(value == "true" || value == "false");
+    let mut constants = String::new();
+    for key in ["ENABLE_METRICS", "FORCE_X2APIC", "ENABLE_COM1_DEBUG"] {
+        let prefix = format!("{key}=");
+        let value = source
+            .lines()
+            .find_map(|line| line.strip_prefix(&prefix))
+            .expect("Canonical kernel fixture flag");
+        assert!(value == "true" || value == "false");
+        constants.push_str(&format!("pub const {key}: bool = {value};\n"));
+    }
     fs::write(
         PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("owner_config.rs"),
-        format!("pub const ENABLE_METRICS: bool = {value};\n"),
+        constants,
     )
     .unwrap();
 }

@@ -1,43 +1,33 @@
+// Private fixed C facade. CPU-local APIC operations and BSP timer state live in Rust.
 const acpi = @import("../../platform/acpi.zig");
 const bootlog = @import("../../kernel/bootlog.zig");
-const hpet = @import("hpet.zig");
 const k = @import("../../kernel/log.zig");
-const msr = @import("msr.zig");
-const config = @import("config");
 const platform_cpu = @import("../../platform/cpu.zig");
-const paging = @import("../../memory/paging.zig");
-const phys = @import("../../memory/phys.zig");
-
-const IA32_APIC_BASE: u32 = 0x1B;
-const APIC_BASE_BSP: u64 = 1 << 8;
-const APIC_BASE_X2APIC: u64 = 1 << 10;
-const APIC_BASE_ENABLE: u64 = 1 << 11;
-const APIC_BASE_MASK: u64 = 0x000F_FFFF_FFFF_F000;
-
-const REG_ID: u32 = 0x020;
-const REG_VERSION: u32 = 0x030;
-const REG_EOI: u32 = 0x0B0;
-const REG_SVR: u32 = 0x0F0;
-const REG_ICR_LOW: u32 = 0x300;
-const REG_ICR_HIGH: u32 = 0x310;
-const REG_LVT_TIMER: u32 = 0x320;
-const REG_TIMER_INITIAL_COUNT: u32 = 0x380;
-const REG_TIMER_CURRENT_COUNT: u32 = 0x390;
-const REG_TIMER_DIVIDE: u32 = 0x3E0;
-
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
-const SVR_ENABLE: u32 = 1 << 8;
 const TIMER_VECTOR: u8 = 0x20;
-const TIMER_MASKED: u32 = 1 << 16;
-const TIMER_PERIODIC: u32 = 1 << 17;
 const TIMER_DIVIDE_BY_16: u32 = 0x3;
-const CALIBRATION_HPET_DIVISOR: u64 = 100;
-const MIN_TIMER_INITIAL_COUNT: u32 = 16;
-const ICR_DELIVERY_PENDING: u32 = 1 << 12;
-const ICR_INIT_ASSERT: u32 = 0x0000_C500;
-const ICR_INIT_DEASSERT: u32 = 0x0000_8500;
-const ICR_STARTUP: u32 = 0x0000_0600;
-
+pub const RawStatus = extern struct {
+    phys_base: u64,
+    msr_base: u64,
+    virt_base: u64,
+    timer_ticks: u64,
+    calibration_hpet_ticks: u64,
+    flags: u32,
+    svr: u32,
+    timer_frequency_hz: u32,
+    timer_initial_count: u32,
+    timer_current_count: u32,
+    timer_divide: u32,
+    timer_lvt: u32,
+    calibration_lapic_ticks: u32,
+    id: u8,
+    version: u8,
+    max_lvt: u8,
+    timer_vector: u8,
+    reason: u8,
+    timer_reason: u8,
+    reserved: [2]u8,
+};
 pub const Status = struct {
     available: bool = false,
     enabled: bool = false,
@@ -49,6 +39,7 @@ pub const Status = struct {
     x2apic: bool = false,
     phys_base: u64 = 0,
     msr_base: u64 = 0,
+    virt_base: u64 = 0,
     id: u8 = 0,
     version: u8 = 0,
     max_lvt: u8 = 0,
@@ -66,348 +57,110 @@ pub const Status = struct {
     timer_reason: []const u8 = "timer not initialized",
 };
 
-var current: Status = .{};
-var base_virt: u64 = 0;
-// 0.56.14: x2APIC-MSR-Modus. Registerzugriffe laufen dann ueber
-// MSR 0x800 + (MMIO-Offset >> 4) statt ueber das MMIO-Fenster.
-var x2_mode: bool = false;
-const X2APIC_MSR_BASE: u32 = 0x800;
-
+extern fn r4os_rust_lapic_init(address: u64, enabled_count: u32, supports_x2: bool, output: *RawStatus) void;
+extern fn r4os_rust_lapic_status(output: *RawStatus) void;
+extern fn r4os_rust_lapic_control(operation: u8, a: u64, b: u32) u64;
+pub fn project(raw: RawStatus) Status {
+    return .{ .available = raw.flags & 1 != 0, .enabled = raw.flags & 2 != 0, .software_enabled = raw.flags & 4 != 0, .timer_enabled = raw.flags & 8 != 0, .timer_calibrated = raw.flags & 16 != 0, .timer_one_shot = raw.flags & 32 != 0, .bsp = raw.flags & 64 != 0, .x2apic = raw.flags & 128 != 0, .phys_base = raw.phys_base, .msr_base = raw.msr_base, .virt_base = raw.virt_base, .id = raw.id, .version = raw.version, .max_lvt = raw.max_lvt, .svr = raw.svr, .timer_vector = raw.timer_vector, .timer_frequency_hz = raw.timer_frequency_hz, .timer_initial_count = raw.timer_initial_count, .timer_current_count = raw.timer_current_count, .timer_ticks = raw.timer_ticks, .timer_divide = raw.timer_divide, .timer_lvt = raw.timer_lvt, .calibration_hpet_ticks = raw.calibration_hpet_ticks, .calibration_lapic_ticks = raw.calibration_lapic_ticks, .reason = switch (raw.reason) {
+        0 => "not initialized",
+        1 => "MADT has no enabled LAPIC",
+        2 => "x2APIC MSR mode active, PIC/IOAPIC routing unchanged",
+        3 => "LAPIC base missing",
+        4 => "LAPIC MMIO mapping failed",
+        5 => "xAPIC MMIO enabled, PIC/IOAPIC routing unchanged",
+        else => unreachable,
+    }, .timer_reason = switch (raw.timer_reason) {
+        0 => "timer not initialized",
+        1 => "LAPIC not enabled",
+        2 => "HPET reference clock unavailable",
+        3 => "HPET reference too slow",
+        4 => "LAPIC timer did not count during calibration",
+        5 => "LAPIC calibration denominator is zero",
+        6 => "LAPIC calibrated count out of range",
+        7 => "calibrated against HPET",
+        8 => "periodic LAPIC timer active",
+        9 => "LAPIC one-shot unavailable without calibration",
+        10 => "LAPIC one-shot ready",
+        11 => "LAPIC one-shot armed",
+        12 => "LAPIC one-shot disarmed",
+        13 => "LAPIC periodic resume unavailable",
+        else => unreachable,
+    } };
+}
 pub fn initFromAcpi(info: acpi.Info) Status {
-    current = .{
-        .available = info.madt_lapic_address != 0 and info.madt_lapic_enabled_count > 0,
-        .phys_base = info.madt_lapic_address,
-        .reason = "MADT has no enabled LAPIC",
-        .timer_reason = "timer not initialized",
-    };
-    base_virt = 0;
-    if (!current.available) {
-        logStatus();
-        return current;
-    }
-
-    const apic_base = msr.read(IA32_APIC_BASE);
-    current.msr_base = apic_base & APIC_BASE_MASK;
-    current.bsp = (apic_base & APIC_BASE_BSP) != 0;
-    current.x2apic = (apic_base & APIC_BASE_X2APIC) != 0;
-    current.enabled = (apic_base & APIC_BASE_ENABLE) != 0;
-    if (current.phys_base == 0) current.phys_base = current.msr_base;
-
-    // 0.56.14: Opt-in-Forcierung (-Dforce-x2apic, Default aus) - nur
-    // wenn die CPU x2APIC meldet (CPUID.1:ECX.21), sonst wuerde das
-    // EXTD-Bit einen #GP ausloesen.
-    if (config.force_x2apic and !current.x2apic and platform_cpu.status().features.x2apic) {
-        msr.write(IA32_APIC_BASE, apic_base | APIC_BASE_ENABLE | APIC_BASE_X2APIC);
-        const forced = msr.read(IA32_APIC_BASE);
-        current.x2apic = (forced & APIC_BASE_X2APIC) != 0;
-        current.enabled = (forced & APIC_BASE_ENABLE) != 0;
-    }
-
-    if (current.x2apic) {
-        // 0.56.14: vollwertiger MSR-Pfad statt Bail-out. Kein MMIO-
-        // Mapping noetig; dieselbe Init-Sequenz laeuft ueber MSRs.
-        x2_mode = true;
-        if (!current.enabled) {
-            msr.write(IA32_APIC_BASE, msr.read(IA32_APIC_BASE) | APIC_BASE_ENABLE | APIC_BASE_X2APIC);
-            current.enabled = true;
-        }
-        // ID ist im x2APIC-Modus das volle 32-Bit-Register.
-        current.id = @truncate(readReg(REG_ID) & 0xFF);
-        const version_reg_x2 = readReg(REG_VERSION);
-        current.version = @truncate(version_reg_x2);
-        current.max_lvt = @truncate((version_reg_x2 >> 16) & 0xFF);
-        const old_svr_x2 = readReg(REG_SVR);
-        writeReg(REG_SVR, (old_svr_x2 & ~@as(u32, 0xFF)) | SVR_ENABLE | SPURIOUS_VECTOR);
-        current.svr = readReg(REG_SVR);
-        current.software_enabled = (current.svr & SVR_ENABLE) != 0;
-        current.reason = "x2APIC MSR mode active, PIC/IOAPIC routing unchanged";
-        logStatus();
-        return current;
-    }
-    if (current.phys_base == 0) {
-        current.reason = "LAPIC base missing";
-        logStatus();
-        return current;
-    }
-    if (!mapMmio(current.phys_base)) {
-        current.reason = "LAPIC MMIO mapping failed";
-        logStatus();
-        return current;
-    }
-
-    if (!current.enabled) {
-        msr.write(IA32_APIC_BASE, apic_base | APIC_BASE_ENABLE);
-        current.enabled = true;
-    }
-
-    const id_reg = readReg(REG_ID);
-    const version_reg = readReg(REG_VERSION);
-    current.id = @truncate(id_reg >> 24);
-    current.version = @truncate(version_reg);
-    current.max_lvt = @truncate((version_reg >> 16) & 0xFF);
-
-    const old_svr = readReg(REG_SVR);
-    writeReg(REG_SVR, (old_svr & ~@as(u32, 0xFF)) | SVR_ENABLE | SPURIOUS_VECTOR);
-    current.svr = readReg(REG_SVR);
-    current.software_enabled = (current.svr & SVR_ENABLE) != 0;
-    current.reason = "xAPIC MMIO enabled, PIC/IOAPIC routing unchanged";
-
-    logStatus();
-    return current;
+    var raw: RawStatus = undefined;
+    r4os_rust_lapic_init(info.madt_lapic_address, info.madt_lapic_enabled_count, platform_cpu.status().features.x2apic, &raw);
+    return project(raw);
 }
-
 pub fn status() Status {
-    return current;
+    var raw: RawStatus = undefined;
+    r4os_rust_lapic_status(&raw);
+    return project(raw);
 }
-
 pub fn isEnabled() bool {
-    return current.enabled and current.software_enabled and (base_virt != 0 or x2_mode);
+    return r4os_rust_lapic_control(0, 0, 0) != 0;
 }
-
 pub fn initCurrentCpu() bool {
-    if (base_virt == 0 and !x2_mode) return false;
-    var apic_base = msr.read(IA32_APIC_BASE);
-    apic_base |= APIC_BASE_ENABLE;
-    if (x2_mode) apic_base |= APIC_BASE_X2APIC;
-    msr.write(IA32_APIC_BASE, apic_base);
-    const old_svr = readReg(REG_SVR);
-    writeReg(REG_SVR, (old_svr & ~@as(u32, 0xFF)) | SVR_ENABLE | SPURIOUS_VECTOR);
-    return (readReg(REG_SVR) & SVR_ENABLE) != 0;
+    return r4os_rust_lapic_control(1, 0, 0) != 0;
 }
-
 pub fn localApicId() u32 {
-    if (x2_mode) return readReg(REG_ID);
-    return readReg(REG_ID) >> 24;
+    return @intCast(r4os_rust_lapic_control(2, 0, 0));
 }
-
-// AP timers are calibrated independently because the global event clock may
-// use HPET and LAPIC calibration is CPU-local.  Only the resulting count is
-// stored in CpuLocal; BSP timer/deadline state remains untouched.
-pub fn startSecondaryPeriodicTimer(requested_hz: u32) bool {
-    if (!initCurrentCpu()) return false;
-    const reference = hpet.status();
-    if (!reference.enabled or reference.frequency_hz == 0) return false;
-    const hz = if (requested_hz == 0) 100 else requested_hz;
-    const hpet_delta = reference.frequency_hz / CALIBRATION_HPET_DIVISOR;
-    if (hpet_delta == 0) return false;
-
-    writeReg(REG_TIMER_INITIAL_COUNT, 0);
-    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
-    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_MASKED);
-    writeReg(REG_TIMER_INITIAL_COUNT, 0xFFFF_FFFF);
-    const start_hpet = hpet.readMainCounter();
-    while (hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter()) < hpet_delta) {
-        asm volatile ("pause");
-    }
-    const elapsed_hpet = hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter());
-    const elapsed_lapic = 0xFFFF_FFFF -% readReg(REG_TIMER_CURRENT_COUNT);
-    writeReg(REG_TIMER_INITIAL_COUNT, 0);
-    if (elapsed_hpet == 0 or elapsed_lapic < MIN_TIMER_INITIAL_COUNT) return false;
-    const numerator = @as(u128, elapsed_lapic) * @as(u128, reference.frequency_hz);
-    const denominator = @as(u128, elapsed_hpet) * @as(u128, hz);
-    if (denominator == 0) return false;
-    const initial = numerator / denominator;
-    if (initial < MIN_TIMER_INITIAL_COUNT or initial > 0xFFFF_FFFE) return false;
-    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
-    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_PERIODIC);
-    writeReg(REG_TIMER_INITIAL_COUNT, @intCast(initial));
-    return true;
+pub fn startSecondaryPeriodicTimer(hz: u32) bool {
+    return r4os_rust_lapic_control(3, 0, hz) != 0;
 }
-
 pub fn sendInitSipi(apic_id: u32, vector: u8) bool {
-    if (!isEnabled() or vector == 0) return false;
-    if (!writeIcr(apic_id, ICR_INIT_ASSERT) or !waitIcrIdle()) return false;
-    delayMicroseconds(10_000);
-    if (!writeIcr(apic_id, ICR_INIT_DEASSERT) or !waitIcrIdle()) return false;
-    delayMicroseconds(200);
-    if (!writeIcr(apic_id, ICR_STARTUP | vector) or !waitIcrIdle()) return false;
-    delayMicroseconds(200);
-    if (!writeIcr(apic_id, ICR_STARTUP | vector) or !waitIcrIdle()) return false;
-    return true;
+    return r4os_rust_lapic_control(4, apic_id, vector) != 0;
 }
-
 pub fn sendReschedule(apic_id: u32, vector: u8) bool {
-    return writeIcr(apic_id, vector) and waitIcrIdle();
+    return r4os_rust_lapic_control(5, apic_id, vector) != 0;
 }
-
 pub fn sendStop(apic_id: u32, vector: u8) bool {
-    return writeIcr(apic_id, vector) and waitIcrIdle();
+    return r4os_rust_lapic_control(6, apic_id, vector) != 0;
 }
-
 pub fn sendIpi(apic_id: u32, vector: u8) bool {
-    if (!isEnabled() or vector < 0x20) return false;
-    return writeIcr(apic_id, vector) and waitIcrIdle();
+    return r4os_rust_lapic_control(7, apic_id, vector) != 0;
 }
-
-pub fn initTimerFromHpet(requested_hz: u32) bool {
-    if (!isEnabled()) {
-        current.timer_reason = "LAPIC not enabled";
-        logTimerStatus(false);
-        return false;
-    }
-    const hpet_status = hpet.status();
-    if (!hpet_status.enabled or hpet_status.frequency_hz == 0) {
-        current.timer_reason = "HPET reference clock unavailable";
-        logTimerStatus(false);
-        return false;
-    }
-    const hz = if (requested_hz == 0) 100 else requested_hz;
-    const hpet_delta = hpet_status.frequency_hz / CALIBRATION_HPET_DIVISOR;
-    if (hpet_delta == 0) {
-        current.timer_reason = "HPET reference too slow";
-        logTimerStatus(false);
-        return false;
-    }
-
-    stopTimer();
-    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
-    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_MASKED);
-    writeReg(REG_TIMER_INITIAL_COUNT, 0xFFFF_FFFF);
-
-    const start_hpet = hpet.readMainCounter();
-    while (hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter()) < hpet_delta) {
-        asm volatile ("pause");
-    }
-    const elapsed_hpet = hpet.elapsedMainCounter(start_hpet, hpet.readMainCounter());
-    const lapic_current = readReg(REG_TIMER_CURRENT_COUNT);
-    const elapsed_lapic = 0xFFFF_FFFF -% lapic_current;
-    stopTimer();
-
-    if (elapsed_hpet == 0 or elapsed_lapic < MIN_TIMER_INITIAL_COUNT) {
-        current.timer_reason = "LAPIC timer did not count during calibration";
-        logTimerStatus(false);
-        return false;
-    }
-
-    const numerator = @as(u128, elapsed_lapic) * @as(u128, hpet_status.frequency_hz);
-    const denominator = @as(u128, elapsed_hpet) * @as(u128, hz);
-    if (denominator == 0) {
-        current.timer_reason = "LAPIC calibration denominator is zero";
-        logTimerStatus(false);
-        return false;
-    }
-    const initial_u128 = numerator / denominator;
-    if (initial_u128 < MIN_TIMER_INITIAL_COUNT or initial_u128 > 0xFFFF_FFFE) {
-        current.timer_reason = "LAPIC calibrated count out of range";
-        logTimerStatus(false);
-        return false;
-    }
-
-    current.timer_frequency_hz = hz;
-    current.timer_initial_count = @intCast(initial_u128);
-    current.calibration_hpet_ticks = elapsed_hpet;
-    current.calibration_lapic_ticks = elapsed_lapic;
-    current.timer_calibrated = true;
-    current.timer_reason = "calibrated against HPET";
-
-    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
-    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_PERIODIC);
-    writeReg(REG_TIMER_INITIAL_COUNT, current.timer_initial_count);
-    current.timer_lvt = readReg(REG_LVT_TIMER);
-    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
-    current.timer_enabled = true;
-    current.timer_one_shot = false;
-    current.timer_reason = "periodic LAPIC timer active";
-    logTimerStatus(true);
-    return true;
-}
-
-pub fn startOneShotTimer() bool {
-    if (!isEnabled() or !current.timer_calibrated or current.timer_initial_count < MIN_TIMER_INITIAL_COUNT) {
-        current.timer_reason = "LAPIC one-shot unavailable without calibration";
-        return false;
-    }
-    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
-    writeReg(REG_TIMER_INITIAL_COUNT, 0);
-    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_MASKED);
-    current.timer_lvt = readReg(REG_LVT_TIMER);
-    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
-    current.timer_enabled = true;
-    current.timer_one_shot = true;
-    current.timer_reason = "LAPIC one-shot ready";
-    return true;
-}
-
-pub fn armOneShotTicks(requested_ticks: u64) u64 {
-    if (!current.timer_one_shot and !startOneShotTimer()) return 0;
-    const count_per_tick = @as(u64, current.timer_initial_count);
-    if (count_per_tick == 0) return 0;
-    const maximum_ticks = @max(@as(u64, 1), @as(u64, 0xFFFF_FFFE) / count_per_tick);
-    const programmed_ticks = @min(@max(@as(u64, 1), requested_ticks), maximum_ticks);
-    const initial_count: u32 = @intCast(programmed_ticks * count_per_tick);
-
-    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
-    writeReg(REG_LVT_TIMER, TIMER_VECTOR);
-    writeReg(REG_TIMER_INITIAL_COUNT, initial_count);
-    current.timer_lvt = readReg(REG_LVT_TIMER);
-    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
-    current.timer_enabled = true;
-    current.timer_reason = "LAPIC one-shot armed";
-    return programmed_ticks;
-}
-
-pub fn disarmOneShotTimer() void {
-    if (!current.timer_one_shot) return;
-    writeReg(REG_TIMER_INITIAL_COUNT, 0);
-    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_MASKED);
-    current.timer_lvt = readReg(REG_LVT_TIMER);
-    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
-    current.timer_reason = "LAPIC one-shot disarmed";
-}
-
-pub fn resumePeriodicTimer() bool {
-    if (!isEnabled() or !current.timer_calibrated or current.timer_initial_count < MIN_TIMER_INITIAL_COUNT) {
-        current.timer_reason = "LAPIC periodic resume unavailable";
-        return false;
-    }
-    writeReg(REG_TIMER_DIVIDE, TIMER_DIVIDE_BY_16);
-    writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_PERIODIC);
-    writeReg(REG_TIMER_INITIAL_COUNT, current.timer_initial_count);
-    current.timer_lvt = readReg(REG_LVT_TIMER);
-    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
-    current.timer_enabled = true;
-    current.timer_one_shot = false;
-    current.timer_reason = "periodic LAPIC timer active";
-    return true;
-}
-
-pub fn stopTimer() void {
-    if (base_virt != 0 or x2_mode) {
-        writeReg(REG_TIMER_INITIAL_COUNT, 0);
-        writeReg(REG_LVT_TIMER, TIMER_VECTOR | TIMER_MASKED);
-        current.timer_lvt = readReg(REG_LVT_TIMER);
-        current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
-    }
-    current.timer_enabled = false;
-    current.timer_one_shot = false;
-}
-
-pub fn onTimerIrq() u64 {
-    const p: *volatile u64 = &current.timer_ticks;
-    p.* +%= 1;
-    current.timer_current_count = readReg(REG_TIMER_CURRENT_COUNT);
-    return p.*;
-}
-
-pub fn timerTickCount() u64 {
-    const p: *volatile u64 = &current.timer_ticks;
-    return p.*;
-}
-
-pub fn timerFrequency() u32 {
-    return current.timer_frequency_hz;
-}
-
-pub fn isTimerActive() bool {
-    return current.timer_enabled and current.timer_calibrated and current.timer_initial_count != 0;
-}
-
 pub fn endOfInterrupt() void {
-    if (isEnabled()) writeReg(REG_EOI, 0);
+    _ = r4os_rust_lapic_control(8, 0, 0);
+}
+pub fn onTimerIrq() u64 {
+    return r4os_rust_lapic_control(9, 0, 0);
+}
+pub fn timerTickCount() u64 {
+    return r4os_rust_lapic_control(10, 0, 0);
+}
+pub fn timerFrequency() u32 {
+    return @intCast(r4os_rust_lapic_control(11, 0, 0));
+}
+pub fn initTimerFromHpet(hz: u32) bool {
+    return r4os_rust_lapic_control(12, 0, hz) != 0;
+}
+pub fn startOneShotTimer() bool {
+    return r4os_rust_lapic_control(13, 0, 0) != 0;
+}
+pub fn armOneShotTicks(ticks: u64) u64 {
+    return r4os_rust_lapic_control(14, ticks, 0);
+}
+pub fn disarmOneShotTimer() void {
+    _ = r4os_rust_lapic_control(15, 0, 0);
+}
+pub fn resumePeriodicTimer() bool {
+    return r4os_rust_lapic_control(16, 0, 0) != 0;
+}
+pub fn stopTimer() void {
+    _ = r4os_rust_lapic_control(17, 0, 0);
+}
+pub fn isTimerActive() bool {
+    return r4os_rust_lapic_control(18, 0, 0) != 0;
+}
+comptime {
+    if (@sizeOf(RawStatus) != 80 or @offsetOf(RawStatus, "flags") != 40 or @offsetOf(RawStatus, "timer_reason") != 77)
+        @compileError("Rust LAPIC C layout differs");
 }
 
 pub fn dumpStatus() void {
-    const s = current;
+    const s = status();
     k.puts("LAPIC status\r\n");
     k.puts("  Available: ");
     k.puts(if (s.available) "yes" else "no");
@@ -425,7 +178,7 @@ pub fn dumpStatus() void {
     k.puts(" msr=0x");
     k.putHex(s.msr_base, 16);
     k.puts(" virt=0x");
-    k.putHex(base_virt, 16);
+    k.putHex(s.virt_base, 16);
     k.puts("\r\n");
     k.puts("  ID=");
     k.putDec(s.id);
@@ -449,8 +202,8 @@ pub fn dumpStatus() void {
     k.puts(" initial=");
     k.putDec(s.timer_initial_count);
     k.puts(" current=");
-    if (base_virt != 0) {
-        k.putDec(readReg(REG_TIMER_CURRENT_COUNT));
+    if (s.virt_base != 0) {
+        k.putDec(r4os_rust_lapic_control(19, 0, 0));
     } else {
         k.putDec(s.timer_current_count);
     }
@@ -472,103 +225,52 @@ pub fn dumpStatus() void {
     k.puts("\r\n");
 }
 
-fn mapMmio(base_phys: u64) bool {
-    const page = base_phys & ~(paging.PAGE_SIZE - 1);
-    const virt_page = phys.physToVirt(page);
-    if (!paging.isMapped(virt_page)) {
-        if (!paging.mapPage(virt_page, page, paging.WRITABLE | paging.CACHE_DISABLE | paging.NO_EXECUTE)) {
-            return false;
-        }
-    }
-    base_virt = phys.physToVirt(base_phys);
-    return true;
-}
-
-fn readReg(offset: u32) u32 {
-    if (x2_mode) {
-        return @truncate(msr.read(X2APIC_MSR_BASE + (offset >> 4)));
-    }
-    const ptr: *volatile u32 = @ptrFromInt(base_virt + offset);
-    return ptr.*;
-}
-
-fn writeReg(offset: u32, value: u32) void {
-    if (x2_mode) {
-        msr.write(X2APIC_MSR_BASE + (offset >> 4), value);
-        return;
-    }
-    const ptr: *volatile u32 = @ptrFromInt(base_virt + offset);
-    ptr.* = value;
-}
-
-fn writeIcr(apic_id: u32, low: u32) bool {
-    if (x2_mode) {
-        msr.write(X2APIC_MSR_BASE + (REG_ICR_LOW >> 4), (@as(u64, apic_id) << 32) | low);
-        return true;
-    }
-    if (apic_id > 0xFF or base_virt == 0) return false;
-    writeReg(REG_ICR_HIGH, apic_id << 24);
-    writeReg(REG_ICR_LOW, low);
-    return true;
-}
-
-fn waitIcrIdle() bool {
-    var spins: u32 = 0;
-    while ((readReg(REG_ICR_LOW) & ICR_DELIVERY_PENDING) != 0) : (spins += 1) {
-        if (spins >= 1_000_000) return false;
-        asm volatile ("pause");
-    }
-    return true;
-}
-
-fn delayMicroseconds(microseconds: u64) void {
-    const reference = hpet.status();
-    if (reference.enabled and reference.frequency_hz != 0) {
-        const requested = (@as(u128, reference.frequency_hz) * microseconds) / 1_000_000;
-        const delta: u64 = @intCast(@max(@as(u128, 1), requested));
-        const start = hpet.readMainCounter();
-        while (hpet.elapsedMainCounter(start, hpet.readMainCounter()) < delta) asm volatile ("pause");
-        return;
-    }
-    var spins = microseconds *| 256;
-    while (spins != 0) : (spins -= 1) asm volatile ("pause");
-}
-
-fn logStatus() void {
+fn logStatus(s: Status) void {
     // 0.56.14: mode-Marker zusaetzlich auf COM1 (Abnahme-Kriterium);
     // der volle Status bleibt im Bootlog/DMESG.
     k.puts("[LAPIC] mode=");
-    k.puts(if (x2_mode) "x2apic" else if (base_virt != 0) "xapic" else "none");
+    k.puts(if (s.x2apic) "x2apic" else if (s.virt_base != 0) "xapic" else "none");
     k.puts("\r\n");
     bootlog.puts("[LAPIC] mode=");
-    bootlog.puts(if (x2_mode) "x2apic" else if (base_virt != 0) "xapic" else "none");
+    bootlog.puts(if (s.x2apic) "x2apic" else if (s.virt_base != 0) "xapic" else "none");
     bootlog.puts(" ");
-    bootlog.puts(if (current.available) "available" else "missing");
+    bootlog.puts(if (s.available) "available" else "missing");
     bootlog.puts(" enabled=");
-    bootlog.puts(if (current.enabled and current.software_enabled) "yes" else "no");
+    bootlog.puts(if (s.enabled and s.software_enabled) "yes" else "no");
     bootlog.puts(" base=0x");
-    bootlog.putHex(current.phys_base, 16);
+    bootlog.putHex(s.phys_base, 16);
     bootlog.puts(" id=");
-    bootlog.putDec(current.id);
+    bootlog.putDec(s.id);
     bootlog.puts(" ver=0x");
-    bootlog.putHex(current.version, 2);
+    bootlog.putHex(s.version, 2);
     bootlog.puts(" reason=");
-    bootlog.puts(current.reason);
+    bootlog.puts(s.reason);
     bootlog.puts("\r\n");
 }
 
-fn logTimerStatus(active: bool) void {
+fn logTimerStatus(s: Status, active: bool) void {
     bootlog.puts("[LAPIC] timer=");
     bootlog.puts(if (active) "active" else "off");
     bootlog.puts(" hz=");
-    bootlog.putDec(current.timer_frequency_hz);
+    bootlog.putDec(s.timer_frequency_hz);
     bootlog.puts(" initial=");
-    bootlog.putDec(current.timer_initial_count);
+    bootlog.putDec(s.timer_initial_count);
     bootlog.puts(" hpet_ticks=");
-    bootlog.putDec(current.calibration_hpet_ticks);
+    bootlog.putDec(s.calibration_hpet_ticks);
     bootlog.puts(" lapic_ticks=");
-    bootlog.putDec(current.calibration_lapic_ticks);
+    bootlog.putDec(s.calibration_lapic_ticks);
     bootlog.puts(" reason=");
-    bootlog.puts(current.timer_reason);
+    bootlog.puts(s.timer_reason);
     bootlog.puts("\r\n");
+}
+
+export fn r4os_zig_lapic_log(event: u8, raw: *const RawStatus) callconv(.c) void {
+    if (comptime @import("builtin").is_test) return;
+    const s = project(raw.*);
+    switch (event) {
+        0 => logStatus(s),
+        1 => logTimerStatus(s, false),
+        2 => logTimerStatus(s, true),
+        else => unreachable,
+    }
 }

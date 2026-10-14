@@ -2982,8 +2982,7 @@ pub fn performancePciInventory(out: *ProgramPciInventoryPerformanceInfo) callcon
             @compileError("PCI inventory performance contract drift");
         }
     }
-    out.* = @bitCast(pci_inventory.performance());
-    return if (pci_inventory.status().enumerated) 1 else 0;
+    return pci_inventory.readPerformance(out);
 }
 
 pub fn performanceInput(out: *ProgramInputPerformanceInfo) callconv(.c) i32 {
@@ -3055,40 +3054,11 @@ pub fn performanceIrqTiming(irq: u32, out: *ProgramIrqTimingInfo) callconv(.c) i
 }
 
 pub fn deviceInventorySummary(out: *DeviceInventorySummary) callconv(.c) i32 {
-    const s = device_inventory.snapshot();
-    out.* = .{
-        .total = @intCast(s.count),
-        .with_driver = s.with_driver,
-        .without_driver = s.without_driver,
-        .unknown = s.unknown,
-        .truncated = if (s.truncated) 1 else 0,
-    };
-    return 1;
+    return device_inventory.summary(out);
 }
 
 pub fn deviceInventoryRecord(index: u32, out: *DeviceInventoryRecord) callconv(.c) i32 {
-    const s = device_inventory.snapshot();
-    if (index >= s.count) return 0;
-    const record_index: usize = @intCast(index);
-    const rec = s.records[record_index];
-    out.* = .{
-        .binding = @intFromEnum(rec.binding),
-        .bus = @intFromEnum(rec.bus),
-        .flags = if (rec.has_pci_address) 1 else 0,
-        .bus_no = rec.bus_no,
-        .device_no = rec.device_no,
-        .function_no = rec.function_no,
-        .class_code = rec.class_code,
-        .subclass = rec.subclass,
-        .prog_if = rec.prog_if,
-        .vendor_id = rec.vendor_id,
-        .device_id = rec.device_id,
-    };
-    copyFixedZ(out.name[0..], rec.name);
-    copyFixedZ(out.driver[0..], rec.driver);
-    copyFixedZ(out.status[0..], rec.status);
-    copyFixedZ(out.note[0..], rec.note);
-    return 1;
+    return device_inventory.record(index, out);
 }
 
 pub fn hardwareSummary(out: *HardwareSummary) callconv(.c) i32 {
@@ -3096,7 +3066,7 @@ pub fn hardwareSummary(out: *HardwareSummary) callconv(.c) i32 {
     const ps = pci_inventory.status();
     const irq = irq_status.status();
     const usb = usb_core.summary();
-    const inv = device_inventory.snapshot();
+    const inventory_counts = device_inventory.counts();
     const cs = cpu.status();
 
     var flags: u32 = 0;
@@ -3112,17 +3082,6 @@ pub fn hardwareSummary(out: *HardwareSummary) callconv(.c) i32 {
     if (ps.nvme_count != 0 or hasBlockBus(.nvme)) flags |= hardware_summary_flag_nvme;
     if (usb.configured != 0) flags |= hardware_summary_flag_usb_configured;
 
-    var driver_records: u32 = 0;
-    var protocol_records: u32 = 0;
-    var display_controllers: u32 = 0;
-    var index: usize = 0;
-    while (index < inv.count) : (index += 1) {
-        const rec = inv.records[index];
-        if (rec.bus == .driver) driver_records += 1;
-        if (rec.bus == .protocol) protocol_records += 1;
-        if (rec.class_code == 0x03) display_controllers += 1;
-    }
-
     out.* = .{
         .flags = flags,
         .acpi_tables = ai.table_count,
@@ -3131,14 +3090,14 @@ pub fn hardwareSummary(out: *HardwareSummary) callconv(.c) i32 {
         .legacy_pci_devices = legacy_pci_devices,
         .storage_controllers = ps.ahci_count + ps.nvme_count,
         .network_controllers = ps.network_count,
-        .display_controllers = display_controllers,
+        .display_controllers = inventory_counts.displays,
         .usb_controllers = ps.xhci_count,
         .hda_controllers = ps.hda_count,
         .block_devices = block_devices,
         .usb_devices = @intCast(usb.count),
         .usb_configured = @intCast(usb.configured),
-        .driver_records = driver_records,
-        .protocol_records = protocol_records,
+        .driver_records = inventory_counts.drivers,
+        .protocol_records = inventory_counts.protocols,
         .irq_controller = @intFromEnum(irq.controller),
         .timer_backend = @intFromEnum(irq.timer),
         .lapic_count = irq.lapic_count,

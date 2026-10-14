@@ -227,6 +227,7 @@ fn addDisplayUnitTest(b: *std.Build, test_step: *std.Build.Step, contract: *std.
     root.addOptions("config", config);
     root.addImport("r4os_kernel_contract", b.createModule(.{ .root_source_file = contract.path("Generated/Kernel/Zig/r4x_api_generated.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }));
     root.addImport("r4f_format", b.createModule(.{ .root_source_file = b.path("kernel/font_format.zig"), .target = b.graph.host, .optimize = .ReleaseSafe }));
+    linkRustOwners(b, root);
     const filter = b.option([]const u8, "display-test-filter", "Run only matching existing display ownership tests");
     const tests = b.addTest(.{ .root_module = root, .filters = if (filter) |value| &.{value} else &.{} });
     const run = b.addRunArtifact(tests);
@@ -242,10 +243,7 @@ fn addUnitTest(b: *std.Build, test_step: *std.Build.Step, config: *std.Build.Ste
         }),
     });
     tests.root_module.addOptions("config", config);
-    if (std.mem.eql(u8, path, "kernel/crash.zig") or std.mem.eql(u8, path, "kernel/bootscreen_r4b_format.zig") or
-        std.mem.eql(u8, path, "memory/owner_lock_policy.zig") or
-        std.mem.eql(u8, path, "memory/heap_policy.zig") or
-        std.mem.eql(u8, path, "memory/page_batch.zig") or std.mem.eql(u8, path, "input_controller_tests.zig")) linkRustOwners(b, tests.root_module);
+    linkRustOwners(b, tests.root_module);
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);
 }
@@ -266,6 +264,7 @@ fn addFontUnitTest(b: *std.Build, test_step: *std.Build.Step) void {
         .target = b.graph.host,
         .optimize = .ReleaseSafe,
     }));
+    linkRustOwners(b, root);
     const tests = b.addTest(.{ .root_module = root });
     const run = b.addRunArtifact(tests);
     test_step.dependOn(&run.step);

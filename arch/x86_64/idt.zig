@@ -1,6 +1,5 @@
 const gdt = @import("gdt.zig");
 const interrupts = @import("interrupts.zig");
-const ioapic = @import("ioapic.zig");
 const lapic = @import("lapic.zig");
 const percpu = @import("percpu.zig");
 const pic = @import("pic.zig");
@@ -57,7 +56,8 @@ comptime {
         @offsetOf(InterruptFrame, "error_code") != 128 or @offsetOf(InterruptFrame, "rip") != 136 or
         @offsetOf(InterruptFrame, "rflags") != 152) @compileError("Rust/assembly interrupt frame differs");
     if (fpu.state_storage_bytes != 4096 or fpu.state_storage_align != 64 or TLB_VECTOR != 0xF2 or
-        lapic.SPURIOUS_VECTOR != 0xFF or pic.MASTER_OFFSET != 32) @compileError("Rust exception foundation differs");
+        lapic.SPURIOUS_VECTOR != 0xFF or pic.MASTER_OFFSET != 32 or RESCHEDULE_VECTOR != 0xF0 or
+        STOP_VECTOR != 0xF1 or timer.PIT_IRQ != 0 or keyboard.IRQ != 1 or mouse.IRQ != 12) @compileError("Rust exception/IRQ foundation differs");
 }
 pub fn init() void {
     r4os_rust_idt_init();
@@ -67,65 +67,43 @@ pub fn loadCurrent() void {
     r4os_rust_idt_load();
 }
 
-// IRQ runtime remains with its scheduler/device owners until 0.83.9/11.
-export fn r4os_zig_irq_dispatch(frame: *const InterruptFrame) callconv(.c) void {
-    const irq_flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(irq_flags);
-    const vector = frame.vector;
-    if (vector < pic.MASTER_OFFSET or vector >= pic.MASTER_OFFSET + 32) return;
-
-    const irq: u8 = @intCast(vector - pic.MASTER_OFFSET);
-    var request_preempt = false;
-    const preemptible_instruction_pointer = r4x.isPreemptibleInstructionPointer(frame.rip);
-    if (percpu.currentIndex() != 0 and irq == timer.PIT_IRQ) {
-        request_preempt = scheduler.onSecondaryTick(timer.tickCount(), preemptible_instruction_pointer);
-        lapic.endOfInterrupt();
-        if (request_preempt) scheduler.preemptFromIrq();
-        return;
-    }
-    var wake_request_checkpoint = scheduler.structureStats().wakeup_reschedule_requests;
-    switch (irq) {
-        timer.PIT_IRQ => {
-            request_preempt = scheduler.onTick(timer.onIrq(), preemptible_instruction_pointer);
-            // Timer wakeups were considered by onTick. Only a new wake from a
-            // subsequently dispatched device handler needs another decision.
-            wake_request_checkpoint = scheduler.structureStats().wakeup_reschedule_requests;
+// Rust owns IRQ/IPI ordering. These are the exact existing foreign owners;
+// host metadata fixtures cannot execute hardware IRQ or task-switch work.
+export fn r4os_zig_irq_event(operation: u8, a: u64, b: u64) callconv(.c) u64 {
+    if (comptime @import("builtin").is_test) @panic("IRQ owner callbacks require the kernel guest");
+    return switch (operation) {
+        0 => @intFromBool(r4x.isPreemptibleInstructionPointer(a)),
+        1 => @intFromBool(scheduler.onSecondaryTick(a, b != 0)),
+        2 => timer.tickCount(),
+        3 => scheduler.structureStats().wakeup_reschedule_requests,
+        4 => @intFromBool(scheduler.onTick(timer.onIrq(), a != 0)),
+        5 => blk: {
+            ps2_controller.onIrq(@intCast(a));
+            break :blk 0;
         },
-        keyboard.IRQ, mouse.IRQ => ps2_controller.onIrq(irq),
-        else => {},
-    }
-    irq_router.dispatch(irq);
-    if (!ioapic.isRoutingActive() or irq < 16) {
-        pic.endOfInterrupt(irq);
-    }
-    lapic.endOfInterrupt();
-    if (!request_preempt and
-        (irq != timer.PIT_IRQ or
-            scheduler.structureStats().wakeup_reschedule_requests != wake_request_checkpoint))
-    {
-        request_preempt = scheduler.preemptPendingWake(preemptible_instruction_pointer);
-    }
-    if (request_preempt) scheduler.preemptFromIrq();
-}
-
-export fn r4os_zig_ipi_dispatch(frame: *const InterruptFrame) callconv(.c) void {
-    switch (frame.vector) {
-        RESCHEDULE_VECTOR => {
-            lapic.endOfInterrupt();
-            scheduler.onRescheduleIpi(r4x.isPreemptibleInstructionPointer(frame.rip));
+        6 => blk: {
+            irq_router.dispatch(@intCast(a));
+            break :blk 0;
         },
-        STOP_VECTOR => {
-            lapic.endOfInterrupt();
-            const index = percpu.currentIndex();
-            _ = percpu.transition(index, .stopping, .offline);
-            interrupts.haltForever();
+        7 => @intFromBool(scheduler.preemptPendingWake(a != 0)),
+        8 => blk: {
+            scheduler.preemptFromIrq();
+            break :blk 0;
         },
-        TLB_VECTOR => {
+        9 => blk: {
+            scheduler.onRescheduleIpi(a != 0);
+            break :blk 0;
+        },
+        10 => blk: {
+            _ = percpu.transition(percpu.currentIndex(), .stopping, .offline);
+            break :blk 0;
+        },
+        11 => blk: {
             tlb.handleIpi();
-            lapic.endOfInterrupt();
+            break :blk 0;
         },
-        else => lapic.endOfInterrupt(),
-    }
+        else => unreachable,
+    };
 }
 
 export fn r4os_zig_prepare_fault_stack(addr: u64, rsp: u64, bytes: usize) callconv(.c) usize {

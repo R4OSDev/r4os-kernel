@@ -1,5 +1,6 @@
 param()
 $BuildArguments = @($args)
+$runOwnerTests=@($BuildArguments|Where-Object {$_ -ceq 'test' -or ($_ -cnotmatch '^-' -and $_ -cmatch '-test$')}).Count -ne 0
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 $kernel = $PSScriptRoot
@@ -27,12 +28,14 @@ if (-not (Test-Path -LiteralPath $zig -PathType Leaf)) { throw 'Pinned Zig is mi
 if (-not (Test-Path -LiteralPath $rust -PathType Leaf)) { throw 'Pinned Rust starter is missing; initialize the DevKit.' }
 $pin = Get-Content -LiteralPath (Join-Path $devkit 'Setup/RustToolchain.json') -Raw | ConvertFrom-Json
 if ($pin.rust_version -cne '1.99.0' -or $pin.kernel_target -cne 'x86_64-unknown-none') { throw 'Review and update the Kernel Rust pin before changing its toolchain.' }
+$contractPackageId=$null
 if (Test-Path -LiteralPath (Join-Path $contract 'build.zig.zon')) {
     $graphText=@(& pwsh -NoLogo -NoProfile -File $rust cargo metadata --locked --format-version 1 --manifest-path (Join-Path $kernel 'Cargo.toml')) -join "`n"
     if($LASTEXITCODE -ne 0){throw 'Cannot resolve the exact Cargo Contract pin.'}
     $graph=$graphText|ConvertFrom-Json
     $package=@($graph.packages|Where-Object name -CEQ 'r4os-contract')
     if($package.Count -ne 1){throw 'Kernel must resolve exactly one canonical Contract crate.'}
+    $contractPackageId=$package[0].id
     $pinnedContract=[IO.Path]::GetFullPath((Join-Path (Split-Path $package[0].manifest_path -Parent) '../../..'))
     foreach($relative in @('API/ApiContract.json','Generated/SDK/Zig/abi.zig','Generated/SDK/Zig/abi_generated.zig',
         'Generated/Kernel/Zig/r4x_api_generated.zig','Generated/SDK/Rust/src/lib.rs')) {
@@ -101,9 +104,16 @@ try {
     $archive = Join-Path $rustOutput ($pin.kernel_target+'/release/libr4os_kernel.a')
     if (-not (Test-Path -LiteralPath $archive)) { throw 'Cargo did not produce a native Kernel archive.' }
     $zigArguments.Add('-Drust-archive='+$archive)
-    if ($BuildArguments -contains 'test') {
+    if ($runOwnerTests) {
         # Run the existing Zig owner fixtures against native Rust C exports.
         # The isolated host archive has no boot entry or platform execution.
+        $ownerGraphText=@(& pwsh -NoLogo -NoProfile -File $rust cargo metadata --locked --offline --format-version 1 --manifest-path (Join-Path $kernel 'Tests/RustOwners/Cargo.toml')) -join "`n"
+        if($LASTEXITCODE -ne 0){throw 'Cannot resolve the owner fixture Contract pin.'}
+        $ownerGraph=$ownerGraphText|ConvertFrom-Json
+        $ownerContract=@($ownerGraph.packages|Where-Object name -CEQ 'r4os-contract')
+        if($ownerContract.Count -ne 1 -or $null -eq $contractPackageId -or $ownerContract[0].id -cne $contractPackageId){
+            throw 'Host owner fixtures and Kernel must use the same canonical Contract pin.'
+        }
         $bareFlags=$env:CARGO_ENCODED_RUSTFLAGS
         try {
             $env:CARGO_ENCODED_RUSTFLAGS=@('-Ccode-model=small','-Crelocation-model=static','-Coverflow-checks=yes','-Cdebug-assertions=yes','-Cpanic=abort','-Clto=off') -join [char]31
