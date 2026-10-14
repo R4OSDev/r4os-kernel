@@ -30,7 +30,7 @@ pub const Category = enum(u16) {
     unknown = 0,
 };
 
-pub const Entry = struct {
+pub const Entry = extern struct {
     used: bool = false,
     source: Source = .builtin,
     state: State = .empty,
@@ -46,160 +46,114 @@ pub const Entry = struct {
     note_len: usize = 0,
 };
 
-var entries: [MAX_PROTOCOLS]Entry = .{Entry{}} ** MAX_PROTOCOLS;
-
+const Registration = extern struct {
+    name: [*]const u8,
+    name_len: usize,
+    role: [*]const u8,
+    role_len: usize,
+    note: [*]const u8,
+    note_len: usize,
+    category: u16,
+    version: u16,
+    api_version: u32,
+};
+comptime {
+    if (@sizeOf(Entry) != 232 or @offsetOf(Entry, "name_len") != 48 or @offsetOf(Entry, "role_len") != 120 or
+        @offsetOf(Entry, "note_len") != 224 or @sizeOf(Registration) != 56)
+        @compileError("Native protocol registry C layout drift");
+}
+extern fn r4os_rust_protocol_registry_reset() void;
+extern fn r4os_rust_protocol_registry_register(operation: u8, input: *const Registration) usize;
+extern fn r4os_rust_protocol_registry_select(slot: usize, input: *const Registration) bool;
+extern fn r4os_rust_protocol_registry_mutate(slot: usize, operation: u8, value: u32, err: i32, note: [*]const u8, len: usize) void;
+extern fn r4os_rust_protocol_registry_entry(role: [*]const u8, len: usize, mode: u8, output: *Entry) bool;
+extern fn r4os_rust_protocol_registry_get(slot: usize, output: *Entry) bool;
+extern fn r4os_rust_protocol_registry_count() usize;
+extern fn r4os_rust_protocol_registry_query(operation: u8, slot: usize, role: [*]const u8, len: usize) i32;
+fn request(name: []const u8, role: []const u8, category: u16, version: u16, api_version: u32, note: []const u8) Registration {
+    return .{ .name = name.ptr, .name_len = name.len, .role = role.ptr, .role_len = role.len, .note = note.ptr, .note_len = note.len, .category = category, .version = version, .api_version = api_version };
+}
+fn begin(operation: u8, input: Registration) ?usize {
+    const slot = r4os_rust_protocol_registry_register(operation, &input);
+    return if (slot == @import("std").math.maxInt(usize)) null else slot;
+}
 pub fn init() void {
-    entries = .{Entry{}} ** MAX_PROTOCOLS;
+    r4os_rust_protocol_registry_reset();
 }
-
 pub fn registerBuiltin(name: []const u8, role: []const u8, category_value: u16, note: []const u8) void {
-    if (findBuiltinByRole(role) != null) return;
-    const slot = freeSlot() orelse return;
-    writeEntry(slot, .builtin, .fallback, name, role, category_value, 1, 1, 0, note);
+    _ = begin(0, request(name, role, category_value, 1, 1, note));
 }
-
 pub fn beginLoadR4p(name: []const u8, role: []const u8, category_value: u16, version: u16, api_version: u32) ?usize {
-    return beginLoadModule(.r4p, name, role, category_value, version, api_version);
+    return begin(1, request(name, role, category_value, version, api_version, ""));
 }
-
 pub fn catalogR4p(name: []const u8, role: []const u8, category_value: u16, version: u16, api_version: u32) ?usize {
-    if (findModuleByRole(role) != null) return null;
-    const slot = freeSlot() orelse return null;
-    writeEntry(slot, .r4p, .loaded, name, role, category_value, version, api_version, 0, "installed; lazy");
-    return slot;
+    return begin(2, request(name, role, category_value, version, api_version, ""));
 }
-
 pub fn selectCatalogR4p(slot: usize, name: []const u8, role: []const u8, category_value: u16, version: u16, api_version: u32) bool {
-    if (slot >= entries.len or !entries[slot].used) return false;
-    const entry = &entries[slot];
-    if (entry.source != .r4p or !nameEq(entry.role[0..entry.role_len], role)) return false;
-    entry.name = .{0} ** MAX_NAME;
-    entry.name_len = copy(name, entry.name[0..]);
-    entry.category = category_value;
-    entry.version = version;
-    entry.api_version = api_version;
-    entry.last_error = 0;
-    entry.state = .loaded;
-    setNote(slot, "loading on demand");
-    return true;
+    const value = request(name, role, category_value, version, api_version, "");
+    return r4os_rust_protocol_registry_select(slot, &value);
 }
-
 pub fn beginLoadPreload(name: []const u8, role: []const u8, category_value: u16, version: u16, api_version: u32) ?usize {
-    return beginLoadModule(.preload, name, role, category_value, version, api_version);
+    return begin(3, request(name, role, category_value, version, api_version, ""));
 }
-
-fn beginLoadModule(source: Source, name: []const u8, role: []const u8, category_value: u16, version: u16, api_version: u32) ?usize {
-    if (findModuleByRole(role) != null) return null;
-    const slot = freeSlot() orelse return null;
-    writeEntry(slot, source, .loaded, name, role, category_value, version, api_version, 0, "loaded");
-    return slot;
-}
-
 pub fn setState(slot: usize, state: State) void {
-    if (slot >= entries.len or !entries[slot].used) return;
-    entries[slot].state = state;
+    r4os_rust_protocol_registry_mutate(slot, 0, @intFromEnum(state), 0, "", 0);
 }
-
 pub fn setError(slot: usize, err: i32, note: []const u8) void {
-    if (slot >= entries.len or !entries[slot].used) return;
-    entries[slot].last_error = err;
-    entries[slot].state = .err;
-    setNote(slot, note);
+    r4os_rust_protocol_registry_mutate(slot, 1, 0, err, note.ptr, note.len);
 }
-
 pub fn setBlocked(slot: usize, err: i32, note: []const u8) void {
-    if (slot >= entries.len or !entries[slot].used) return;
-    entries[slot].last_error = err;
-    entries[slot].state = .blocked;
-    setNote(slot, note);
+    r4os_rust_protocol_registry_mutate(slot, 2, 0, err, note.ptr, note.len);
 }
-
 pub fn setNote(slot: usize, note: []const u8) void {
-    if (slot >= entries.len or !entries[slot].used) return;
-    const e = &entries[slot];
-    e.note = .{0} ** MAX_NOTE;
-    e.note_len = copy(note, e.note[0..]);
+    r4os_rust_protocol_registry_mutate(slot, 3, 0, 0, note.ptr, note.len);
 }
-
 pub fn setStatus(slot: usize, state_value: u32, note: []const u8) void {
-    if (slot >= entries.len or !entries[slot].used) return;
-    entries[slot].state = stateFromProtocolValue(state_value);
-    setNote(slot, note);
+    r4os_rust_protocol_registry_mutate(slot, 4, state_value, 0, note.ptr, note.len);
 }
-
 pub fn activeRole(role: []const u8) bool {
-    if (findRolePreferred(role)) |slot| {
-        const state = entries[slot].state;
-        return state == .active or state == .fallback;
-    }
-    return false;
+    return r4os_rust_protocol_registry_query(0, 0, role.ptr, role.len) != 0;
 }
-
-pub fn r4pEntryForRole(role: []const u8) ?*const Entry {
-    const slot = findModuleByRole(role) orelse return null;
-    return &entries[slot];
+fn entryForRole(role: []const u8, mode: u8) ?Entry {
+    var entry: Entry = undefined;
+    if (!r4os_rust_protocol_registry_entry(role.ptr, role.len, mode, &entry)) return null;
+    return entry;
 }
-
-pub fn moduleEntryForRole(role: []const u8) ?*const Entry {
-    const slot = findModuleByRole(role) orelse return null;
-    return &entries[slot];
+pub fn r4pEntryForRole(role: []const u8) ?Entry {
+    return entryForRole(role, 1);
 }
-
-pub fn builtinEntryForRole(role: []const u8) ?*const Entry {
-    const slot = findBuiltinByRole(role) orelse return null;
-    return &entries[slot];
+pub fn moduleEntryForRole(role: []const u8) ?Entry {
+    return entryForRole(role, 1);
 }
-
+pub fn builtinEntryForRole(role: []const u8) ?Entry {
+    return entryForRole(role, 0);
+}
 pub fn activeR4pRole(role: []const u8) bool {
-    const e = moduleEntryForRole(role) orelse return false;
-    return e.state == .active;
+    return r4os_rust_protocol_registry_query(1, 0, role.ptr, role.len) != 0;
 }
-
 pub fn dependencyStatus(role: []const u8) i32 {
-    if (findRolePreferred(role)) |slot| {
-        return switch (entries[slot].state) {
-            .active, .fallback => 1,
-            .loaded => 0,
-            .blocked => -5,
-            .err => -1,
-            .disabled => -6,
-            else => 0,
-        };
-    }
-    return -5;
+    return r4os_rust_protocol_registry_query(2, 0, role.ptr, role.len);
 }
-
 pub fn roleMatches(slot: usize, role: []const u8) bool {
-    if (slot >= entries.len or !entries[slot].used) return false;
-    const e = &entries[slot];
-    return nameEq(e.role[0..e.role_len], role);
+    return r4os_rust_protocol_registry_query(3, slot, role.ptr, role.len) != 0;
 }
-
-pub fn get(slot: usize) ?*const Entry {
-    if (slot >= entries.len or !entries[slot].used) return null;
-    return &entries[slot];
+pub fn get(slot: usize) ?Entry {
+    var entry: Entry = undefined;
+    if (!r4os_rust_protocol_registry_get(slot, &entry)) return null;
+    return entry;
 }
-
-pub fn entryAt(index: usize) ?*const Entry {
-    if (index >= entries.len or !entries[index].used) return null;
-    return &entries[index];
+pub fn entryAt(index: usize) ?Entry {
+    return get(index);
 }
-
 pub fn countUsed() usize {
-    var count: usize = 0;
-    for (entries) |entry| {
-        if (entry.used) count += 1;
-    }
-    return count;
+    return r4os_rust_protocol_registry_count();
 }
-
 pub fn dumpStatus() void {
     k.puts("Protocol registry\r\n");
     var i: usize = 0;
     var shown: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const e = &entries[i];
-        if (!e.used) continue;
+    while (i < MAX_PROTOCOLS) : (i += 1) {
+        const e = get(i) orelse continue;
         shown += 1;
         k.puts("  ");
         k.puts(e.role[0..e.role_len]);
@@ -264,105 +218,6 @@ pub fn categoryFromValue(value: u16) ?Category {
         255 => .misc,
         else => null,
     };
-}
-
-fn writeEntry(slot: usize, source: Source, state: State, name: []const u8, role: []const u8, category_value: u16, version: u16, api_version: u32, last_error: i32, note: []const u8) void {
-    const e = &entries[slot];
-    e.* = .{
-        .used = true,
-        .source = source,
-        .state = state,
-        .category = category_value,
-        .version = version,
-        .api_version = api_version,
-        .last_error = last_error,
-    };
-    e.name_len = copy(name, e.name[0..]);
-    e.role_len = copy(role, e.role[0..]);
-    e.note_len = copy(note, e.note[0..]);
-}
-
-fn freeSlot() ?usize {
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        if (!entries[i].used) return i;
-    }
-    return null;
-}
-
-fn findBuiltinByRole(role: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const e = &entries[i];
-        if (!e.used or e.source != .builtin) continue;
-        if (nameEq(e.role[0..e.role_len], role)) return i;
-    }
-    return null;
-}
-
-fn findR4pByRole(role: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const e = &entries[i];
-        if (!e.used or e.source != .r4p) continue;
-        if (nameEq(e.role[0..e.role_len], role)) return i;
-    }
-    return null;
-}
-
-fn findModuleByRole(role: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const e = &entries[i];
-        if (!e.used or (e.source != .r4p and e.source != .preload)) continue;
-        if (nameEq(e.role[0..e.role_len], role)) return i;
-    }
-    return null;
-}
-
-fn findRolePreferred(role: []const u8) ?usize {
-    var fallback: ?usize = null;
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const e = &entries[i];
-        if (!e.used or !nameEq(e.role[0..e.role_len], role)) continue;
-        if ((e.source == .r4p or e.source == .preload) and e.state == .active) return i;
-        if (fallback == null and (e.state == .active or e.state == .fallback)) fallback = i;
-    }
-    return fallback;
-}
-
-fn stateFromProtocolValue(value: u32) State {
-    return switch (value) {
-        1 => .loaded,
-        2 => .active,
-        3 => .fallback,
-        4 => .blocked,
-        5 => .err,
-        6 => .disabled,
-        else => .loaded,
-    };
-}
-
-fn copy(src: []const u8, dst: []u8) usize {
-    @memset(dst, 0);
-    const len = @min(src.len, dst.len - 1);
-    if (len > 0) @memcpy(dst[0..len], src[0..len]);
-    return len;
-}
-
-fn nameEq(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (upper(a[i]) != upper(b[i])) return false;
-    }
-    return true;
-}
-
-fn upper(c: u8) u8 {
-    if (c >= 'a' and c <= 'z') return c - ('a' - 'A');
-    return c;
 }
 
 fn putSignedDec(value: i32) void {

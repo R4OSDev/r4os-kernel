@@ -39,8 +39,12 @@ const UsbInput = extern struct {
 };
 const HidInput = extern struct { keyboard: bool, mouse: bool, missing: u32, source: Text };
 const MscInput = extern struct { registered: bool, write_protected: bool, external_owner: bool, missing: u64, bot: Text, scsi: Text };
-const DriverInput = extern struct { kind: u16, name: Text, source: Text, state: Text, type_name: Text };
-const ProtocolInput = extern struct { category: u16, role: Text, source: Text, state: Text, note: Text };
+const DriverInput = extern struct { kind: u16, name: [32]u8, name_len: u64, source: Text, state: Text, type_name: Text };
+comptime {
+    if (@sizeOf(DriverInput) != 96 or @offsetOf(DriverInput, "name_len") != 40)
+        @compileError("Native driver inventory copy layout drift");
+}
+const ProtocolInput = extern struct { category: u16, role: [64]u8, role_len: u64, source: Text, state: Text, note: [96]u8, note_len: u64 };
 const NetInput = extern struct {
     name: Text,
     driver: Text,
@@ -140,13 +144,13 @@ export fn r4os_zig_inventory_msc(out: *MscInput) callconv(.c) void {
 export fn r4os_zig_inventory_driver(index: u64, out: *DriverInput) callconv(.c) bool {
     if (@import("builtin").is_test) @panic("Driver metadata requested by host fixture");
     const value = driver_registry.entryAt(@intCast(index)) orelse return false;
-    out.* = .{ .kind = value.driver_type, .name = text(value.name[0..value.name_len]), .source = text(driver_registry.sourceName(value.source)), .state = text(driver_registry.stateName(value.state)), .type_name = text(driver_registry.typeName(value.driver_type)) };
+    out.* = .{ .kind = value.driver_type, .name = value.name, .name_len = value.name_len, .source = text(driver_registry.sourceName(value.source)), .state = text(driver_registry.stateName(value.state)), .type_name = text(driver_registry.typeName(value.driver_type)) };
     return true;
 }
 export fn r4os_zig_inventory_protocol(index: u64, out: *ProtocolInput) callconv(.c) bool {
     if (@import("builtin").is_test) @panic("Protocol metadata requested by host fixture");
     const value = protocol_registry.entryAt(@intCast(index)) orelse return false;
-    out.* = .{ .category = value.category, .role = text(value.role[0..value.role_len]), .source = text(protocol_registry.sourceName(value.source)), .state = text(protocol_registry.stateName(value.state)), .note = text(value.note[0..value.note_len]) };
+    out.* = .{ .category = value.category, .role = value.role, .role_len = value.role_len, .source = text(protocol_registry.sourceName(value.source)), .state = text(protocol_registry.stateName(value.state)), .note = value.note, .note_len = value.note_len };
     return true;
 }
 export fn r4os_zig_inventory_net(index: u64, out: *NetInput) callconv(.c) bool {
@@ -179,7 +183,7 @@ export fn r4os_zig_inventory_xhci(with_status: bool, out: *XhciInput) callconv(.
 }
 comptime {
     if (@sizeOf(Text) != 16 or @sizeOf(DisplayInput) != 32 or @sizeOf(BlockInput) != 40 or @sizeOf(UsbInput) != 12 or
-        @sizeOf(HidInput) != 24 or @sizeOf(MscInput) != 48 or @sizeOf(DriverInput) != 72 or @sizeOf(ProtocolInput) != 72 or
+        @sizeOf(HidInput) != 24 or @sizeOf(MscInput) != 48 or @sizeOf(DriverInput) != 96 or @sizeOf(ProtocolInput) != 216 or
         @sizeOf(NetInput) != 128 or @sizeOf(XhciInput) != 72 or @sizeOf(Counts) != 12)
         @compileError("Rust inventory transport layout differs");
     if (@sizeOf(api.DeviceInventorySummary) != 20 or @sizeOf(api.DeviceInventoryRecord) != 224)

@@ -1,82 +1,48 @@
-const std = @import("std");
+// Stateless facade. Exact DriverApi execution admission spans every resource
+// operation; canonical bindings, validation, clocks and results belong to Rust.
 const a = @import("r4os_kernel_contract");
-const modules = @import("modules.zig");
-const module_file = @import("module_file.zig");
-const catalog = @import("module_resources.zig");
-const clock = @import("../platform/monotonic.zig");
-pub var state: @import("driver_resource_state.zig").State = .{};
-
-// Every entry except the read-only clock runs under DriverApi's owner guard,
-// including complete synchronous filesystem reads and owner shutdown.
-pub fn stat(owner: u32, name: []const u8, out: *a.DriverResourceInfo) i32 {
-    if (out.version != 1 or out.size < @sizeOf(a.DriverResourceInfo) or !catalog.validName(name)) return a.driver_resource_error_invalid;
-    out.* = .{};
-    const binding = state.current(owner) catch return a.driver_resource_error_stale;
-    const view = modules.driverResourceView(binding.slot, binding.module_generation) orelse return a.driver_resource_error_source;
-    const index = view.catalog.find(name) orelse return a.driver_resource_error_not_found;
-    out.* = .{
-        .handle = state.handle(owner, index) catch return a.driver_resource_error_stale,
-        .byte_length = view.catalog.records[index].bytes,
-        .module_generation = binding.module_generation,
-    };
-    return a.driver_resource_ok;
+const resource_state = @import("driver_resource_state.zig");
+const bridge = @import("driver_resources_bridge.zig");
+extern fn r4os_rust_driver_resource_state() *resource_state.State;
+extern fn r4os_rust_driver_resource_stat(owner: u32, name: [*]const u8, len: usize, output: *a.DriverResourceInfo) i32;
+extern fn r4os_rust_driver_resource_read(owner: u32, id: u64, offset: u64, output: [*]u8, len: usize, deadline: u64, plan: *anyopaque) i32;
+extern fn r4os_rust_driver_resource_now() u64;
+extern fn r4os_rust_driver_resource_acpi_stat(owner: u32, signature: u32, index: u32, output: *a.DriverFirmwareTableInfo) i32;
+extern fn r4os_rust_driver_resource_acpi_read(owner: u32, handle: u64, offset: u64, output: [*]u8, len: usize, deadline: u64) i32;
+const StateFacade = struct {
+    pub fn bind(_: @This(), owner: u32, slot: usize, generation: u32) resource_state.Error!void {
+        return r4os_rust_driver_resource_state().bind(owner, slot, generation);
+    }
+    pub fn current(_: @This(), owner: u32) resource_state.Error!*const resource_state.Binding {
+        return r4os_rust_driver_resource_state().current(owner);
+    }
+    pub fn handle(_: @This(), owner: u32, index: usize) resource_state.Error!u64 {
+        return r4os_rust_driver_resource_state().handle(owner, index);
+    }
+    pub fn resolve(_: @This(), owner: u32, id: u64) resource_state.Error!usize {
+        return r4os_rust_driver_resource_state().resolve(owner, id);
+    }
+    pub fn close(_: @This(), owner: u32) void {
+        r4os_rust_driver_resource_state().close(owner);
+    }
+    pub fn finish(_: @This(), owner: u32) void {
+        r4os_rust_driver_resource_state().finish(owner);
+    }
+};
+pub const state = StateFacade{};
+pub fn stat(owner: u32, name: []const u8, output: *a.DriverResourceInfo) i32 {
+    return r4os_rust_driver_resource_stat(owner, name.ptr, name.len, output);
 }
-
 pub fn readAt(owner: u32, id: u64, offset: u64, output: []u8, deadline_ns: u64) i32 {
-    if (output.len == 0 or output.len > a.driver_resource_max_read_bytes or deadline_ns == 0 or deadline_ns == std.math.maxInt(u64)) return a.driver_resource_error_invalid;
-    const binding = state.current(owner) catch return a.driver_resource_error_stale;
-    const index = state.resolve(owner, id) catch return a.driver_resource_error_stale;
-    const view = modules.driverResourceView(binding.slot, binding.module_generation) orelse return a.driver_resource_error_source;
-    if (index >= view.catalog.count or view.catalog.records[index].kind != 3) return a.driver_resource_error_stale;
-    const record = view.catalog.records[index];
-    if (offset > record.bytes or output.len > record.bytes - offset) return a.driver_resource_error_invalid;
-    const started = nowNs();
-    if (started >= deadline_ns) return a.driver_resource_error_deadline;
-    // The captured Volume includes MountRef generation. Each range obtains a
-    // real filesystem request lease, rejecting stale/remounted sources. NTFS
-    // additionally checks the captured MFT sequence; no pathname is reopened.
-    // The synchronous storage core retains buffers until hardware use ends.
-    const ok = module_file.readExact(.{
-        .source = view.source,
-        .offset = view.file_offset + record.offset + @as(usize, @intCast(offset)),
-        .out = output,
-        .name = "driver-resource",
-        .verbose = false,
-    });
-    const finished = nowNs();
-    if (finished < started or finished >= deadline_ns) return a.driver_resource_error_deadline;
-    if (!ok) return a.driver_resource_error_io;
-    return @intCast(output.len);
+    var plan: bridge.ReadPlan = undefined;
+    return r4os_rust_driver_resource_read(owner, id, offset, output.ptr, output.len, deadline_ns, &plan);
 }
-
 pub fn nowNs() callconv(.c) u64 {
-    return clock.nowNanoseconds() orelse std.math.maxInt(u64);
+    return r4os_rust_driver_resource_now();
 }
-
 pub fn acpiStat(owner: u32, signature: u32, index: u32, output: *a.DriverFirmwareTableInfo) i32 {
-    if (@intFromPtr(output) == 0 or @intFromPtr(output) % @alignOf(a.DriverFirmwareTableInfo) != 0 or
-        output.version != 1 or output.size < @sizeOf(a.DriverFirmwareTableInfo)) return a.driver_resource_error_invalid;
-    _ = state.current(owner) catch return a.driver_resource_error_stale;
-    const value = @import("../platform/acpi.zig").firmware_tables.stat(signature, index) catch |err| return firmwareError(err);
-    output.* = .{ .handle = value.handle, .byte_length = value.bytes, .generation = value.generation,
-        .signature = value.signature, .revision = value.revision };
-    return a.driver_resource_ok;
+    return r4os_rust_driver_resource_acpi_stat(owner, signature, index, output);
 }
 pub fn acpiReadAt(owner: u32, handle: u64, offset: u64, output: []u8, deadline_ns: u64) i32 {
-    if (output.len == 0 or output.len > a.driver_resource_max_read_bytes or deadline_ns == 0 or deadline_ns == std.math.maxInt(u64)) return a.driver_resource_error_invalid;
-    _ = state.current(owner) catch return a.driver_resource_error_stale;
-    const started = nowNs();
-    if (started >= deadline_ns) return a.driver_resource_error_deadline;
-    @import("../platform/acpi.zig").firmware_tables.readAt(handle, offset, output) catch |err| return firmwareError(err);
-    const finished = nowNs();
-    if (finished < started or finished >= deadline_ns) return a.driver_resource_error_deadline;
-    return @intCast(output.len);
-}
-fn firmwareError(err: @import("../platform/firmware_tables.zig").Error) i32 {
-    return switch (err) {
-        error.Invalid => a.driver_resource_error_invalid,
-        error.Stale => a.driver_resource_error_stale,
-        error.NotFound => a.driver_resource_error_not_found,
-        error.Unavailable, error.Corrupt => a.driver_resource_error_source,
-    };
+    return r4os_rust_driver_resource_acpi_read(owner, handle, offset, output.ptr, output.len, deadline_ns);
 }

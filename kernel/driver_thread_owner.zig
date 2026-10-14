@@ -1,12 +1,14 @@
-// Pure ownership for dedicated R4D threads. Runtime objects, stacks, waits
-// and real backing release belong to driver_threads.zig, outside this index.
+// Rust implements exact R4D thread admission, generation, leases and cleanup.
 const std = @import("std");
-const Tree = std.Treap(u64, std.math.order);
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const Error = error{ Invalid, Owner, Stale, Closed, Busy, Exhausted };
 pub const Phase = enum(u32) { preparing = 0, runnable = 1, running = 2, completed = 3 };
-pub const Stats = struct {
+const Node = extern struct { key: u64, priority: usize, parent: ?*Node, children: [2]?*Node };
+const Tree = extern struct { root: ?*Node = null, xorshift: usize = 0 };
+pub const Stats = extern struct {
     epoch: u64 = 0,
-    closing: bool = false,
     records: u64 = 0,
     active: u64 = 0,
     completed: u64 = 0,
@@ -18,249 +20,132 @@ pub const Stats = struct {
     pending_creates: u32 = 0,
     pending_releases: u32 = 0,
     leases: u32 = 0,
+    closing: bool = false,
 };
-pub const Create = struct { owner: u32, epoch: u64, handle: u64, active: bool = true };
-
+pub const Create = extern struct { epoch: u64, handle: u64, owner: u32, active: bool = true };
+const NativeOwner = extern struct { stats: Stats = .{}, tree: Tree = .{} };
+extern fn r4os_rust_thread_owner_mutate(base: [*]NativeOwner, cap: usize, id: u32, epoch: u64, op: u8) u8;
+extern fn r4os_rust_thread_owner_stats(base: [*]NativeOwner, cap: usize, id: u32, out: *Stats) u8;
+extern fn r4os_rust_thread_owner_begin(base: [*]NativeOwner, cap: usize, next: *u64, id: u32, out: *Create) u8;
+extern fn r4os_rust_thread_owner_abort(base: [*]NativeOwner, cap: usize, c: *Create) u8;
+extern fn r4os_rust_thread_owner_adopt(base: [*]NativeOwner, cap: usize, c: *Create, r: *anyopaque) u8;
+extern fn r4os_rust_thread_owner_record(base: [*]NativeOwner, cap: usize, r: *anyopaque, op: u8, created: bool, result: i32, out: ?*bool) u8;
+extern fn r4os_rust_thread_owner_lookup(base: [*]NativeOwner, cap: usize, id: u32, handle: u64, op: u8, out: *?*anyopaque) u8;
+extern fn r4os_rust_thread_owner_remove(base: [*]NativeOwner, cap: usize, id: u32, handle: u64, out: *anyopaque) u8;
+extern fn r4os_rust_thread_owner_finish_remove(base: [*]NativeOwner, cap: usize, t: *anyopaque, success: bool) u8;
+extern fn r4os_rust_thread_owner_after(base: [*]NativeOwner, cap: usize, id: u32, cursor: u64, out: *?*anyopaque) u8;
+comptime {
+    if (@sizeOf(Stats) != 88 or @sizeOf(NativeOwner) != 104 or @sizeOf(Create) != 24) @compileError("Native thread metadata C layout drift");
+}
+fn checked(code: u8) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Owner,
+        3 => error.Stale,
+        4 => error.Closed,
+        5 => error.Busy,
+        6 => error.Exhausted,
+        else => @panic("Invalid native thread owner status"),
+    };
+}
 pub fn State(comptime capacity: usize, comptime Payload: type) type {
-    return struct {
+    return extern struct {
         const Self = @This();
-        pub const Record = struct {
-            node: Tree.Node = undefined,
-            owner: u32 = 0,
+        pub const Record = extern struct {
+            node: Node = undefined,
             epoch: u64 = 0,
             handle: u64 = 0,
+            owner: u32 = 0,
             phase: Phase = .preparing,
-            private: bool = true,
-            stop_requested: bool = false,
             references: u32 = 0,
             result: i32 = 0,
+            private: bool = true,
+            stop_requested: bool = false,
+            padding: [6]u8 = @splat(0),
             payload: Payload,
         };
-        pub const Removal = struct {
-            record: *Record,
-            owner: u32,
-            epoch: u64,
-            handle: u64,
-            private: bool,
-            active: bool = true,
-        };
-        const Owner = struct { stats: Stats = .{}, tree: Tree = .{} };
-        owners: [capacity]Owner = .{Owner{}} ** capacity,
+        pub const Removal = extern struct { record: *Record, epoch: u64, handle: u64, owner: u32, private: bool, active: bool = true };
+        comptime {
+            if (@offsetOf(Record, "payload") != 80 or @offsetOf(Record, "private") != 72 or @sizeOf(Removal) != 32) @compileError("Native thread record prefix drift");
+        }
+        owners: [capacity]NativeOwner = .{NativeOwner{}} ** capacity,
         next_handle: u64 = 1,
-
-        pub fn bind(self: *Self, owner: u32, epoch: u64) Error!void {
-            if (epoch == 0) return error.Invalid;
-            const entry = try self.slot(owner);
-            if (entry.stats.epoch != 0) {
-                if (entry.stats.epoch != epoch) return error.Busy;
-                if (entry.stats.closing) return error.Closed;
-                return;
-            }
-            entry.* = .{ .stats = .{ .epoch = epoch } };
+        pub fn bind(self: *Self, id: u32, epoch: u64) Error!void {
+            try checked(r4os_rust_thread_owner_mutate(&self.owners, capacity, id, epoch, 0));
         }
-
-        pub fn stats(self: *Self, owner: u32) Error!Stats {
-            return (try self.current(owner)).stats;
+        pub fn stats(self: *Self, id: u32) Error!Stats {
+            var out: Stats = undefined;
+            try checked(r4os_rust_thread_owner_stats(&self.owners, capacity, id, &out));
+            return out;
         }
-
-        pub fn begin(self: *Self, owner: u32) Error!Create {
-            const entry = try self.current(owner);
-            if (entry.stats.closing) return error.Closed;
-            if (self.next_handle == 0) return error.Exhausted;
-            if (entry.stats.pending_creates == std.math.maxInt(u32)) return error.Busy;
-            const handle = self.next_handle;
-            self.next_handle = if (handle == std.math.maxInt(u64)) 0 else handle + 1;
-            entry.stats.pending_creates += 1;
-            entry.stats.starts +|= 1;
-            return .{ .owner = owner, .epoch = entry.stats.epoch, .handle = handle };
+        pub fn begin(self: *Self, id: u32) Error!Create {
+            var out: Create = undefined;
+            try checked(r4os_rust_thread_owner_begin(&self.owners, capacity, &self.next_handle, id, &out));
+            return out;
         }
-
-        pub fn abort(self: *Self, create: *Create) Error!void {
-            if (!create.active) return error.Stale;
-            const entry = try self.matching(create.owner, create.epoch);
-            std.debug.assert(entry.stats.pending_creates != 0);
-            entry.stats.pending_creates -= 1;
-            entry.stats.start_failures +|= 1;
-            create.active = false;
+        pub fn abort(self: *Self, c: *Create) Error!void {
+            try checked(r4os_rust_thread_owner_abort(&self.owners, capacity, c));
         }
-
-        // Caller initializes payload before adoption. A create stays pending
-        // until actual Task construction and ready publication have resolved.
-        pub fn adopt(self: *Self, create: *Create, record: *Record) Error!void {
-            if (!create.active) return error.Stale;
-            const entry = try self.matching(create.owner, create.epoch);
-            std.debug.assert(record.owner == 0 and record.references == 0);
-            record.owner = create.owner;
-            record.epoch = create.epoch;
-            record.handle = create.handle;
-            record.phase = .preparing;
-            record.private = true;
-            var index = entry.tree.getEntryFor(create.handle);
-            std.debug.assert(index.node == null);
-            index.set(&record.node);
-            entry.stats.records += 1;
-            entry.stats.private += 1;
-            create.active = false;
+        pub fn adopt(self: *Self, c: *Create, r: *Record) Error!void {
+            try checked(r4os_rust_thread_owner_adopt(&self.owners, capacity, c, r));
         }
-
-        // Run under the same runtime boundary as scheduler publication. If
-        // ready publication fails, failPublication restores a private record.
-        pub fn prepared(self: *Self, record: *Record, task_created: bool, failure: i32) Error!bool {
-            const entry = try self.matching(record.owner, record.epoch);
-            if (record.phase != .preparing) return error.Stale;
-            std.debug.assert(entry.stats.pending_creates != 0);
-            entry.stats.pending_creates -= 1;
-            if (!task_created or entry.stats.closing) {
-                record.phase = .completed;
-                record.result = failure;
-                record.stop_requested = true;
-                entry.stats.start_failures +|= 1;
-                entry.stats.completed += 1;
-                return false;
-            }
-            record.phase = .runnable;
-            record.private = false;
-            entry.stats.private -= 1;
-            entry.stats.active += 1;
-            return true;
+        pub fn prepared(self: *Self, r: *Record, created: bool, failure: i32) Error!bool {
+            var out = false;
+            try checked(r4os_rust_thread_owner_record(&self.owners, capacity, r, 0, created, failure, &out));
+            return out;
         }
-
-        pub fn failPublication(self: *Self, record: *Record, result: i32) Error!void {
-            const entry = try self.matching(record.owner, record.epoch);
-            if (record.phase != .runnable) return error.Stale;
-            record.phase = .completed;
-            record.result = result;
-            record.private = true;
-            record.stop_requested = true;
-            entry.stats.active -= 1;
-            entry.stats.completed += 1;
-            entry.stats.private += 1;
-            entry.stats.start_failures +|= 1;
+        pub fn failPublication(self: *Self, r: *Record, result: i32) Error!void {
+            try checked(r4os_rust_thread_owner_record(&self.owners, capacity, r, 1, false, result, null));
         }
-
-        pub fn enter(self: *Self, record: *Record) Error!bool {
-            _ = try self.matching(record.owner, record.epoch);
-            if (record.phase != .runnable) return error.Stale;
-            record.phase = .running;
-            return !(try self.stopping(record));
+        pub fn enter(self: *Self, r: *Record) Error!bool {
+            var out = false;
+            try checked(r4os_rust_thread_owner_record(&self.owners, capacity, r, 2, false, 0, &out));
+            return out;
         }
-
-        pub fn complete(self: *Self, record: *Record, result: i32) Error!void {
-            const entry = try self.matching(record.owner, record.epoch);
-            if (record.phase != .running) return error.Stale;
-            record.phase = .completed;
-            record.result = result;
-            entry.stats.active -= 1;
-            entry.stats.completed += 1;
+        pub fn complete(self: *Self, r: *Record, result: i32) Error!void {
+            try checked(r4os_rust_thread_owner_record(&self.owners, capacity, r, 3, false, result, null));
         }
-
-        pub fn lookup(self: *Self, owner: u32, handle: u64) Error!*Record {
-            if (handle == 0) return error.Invalid;
-            const entry = try self.current(owner);
-            const node = entry.tree.getEntryFor(handle).node orelse return error.Stale;
-            const record: *Record = @fieldParentPtr("node", node);
-            std.debug.assert(record.owner == owner and record.epoch == entry.stats.epoch);
-            return record;
+        pub fn stopping(self: *Self, r: *const Record) Error!bool {
+            var out = false;
+            try checked(r4os_rust_thread_owner_record(&self.owners, capacity, @constCast(r), 4, false, 0, &out));
+            return out;
         }
-
-        pub fn stopping(self: *Self, record: *const Record) Error!bool {
-            const entry = try self.matching(record.owner, record.epoch);
-            return record.stop_requested or entry.stats.closing;
+        fn record(self: *Self, id: u32, handle: u64, op: u8) Error!*Record {
+            var out: ?*anyopaque = null;
+            try checked(r4os_rust_thread_owner_lookup(&self.owners, capacity, id, handle, op, &out));
+            return @ptrCast(@alignCast(out.?));
         }
-
-        pub fn stop(self: *Self, owner: u32, handle: u64) Error!*Record {
-            const record = try self.lookup(owner, handle);
-            record.stop_requested = true;
-            return record;
+        pub fn lookup(self: *Self, id: u32, handle: u64) Error!*Record {
+            return self.record(id, handle, 0);
         }
-
-        pub fn retain(self: *Self, owner: u32, handle: u64) Error!*Record {
-            const record = try self.lookup(owner, handle);
-            const entry = try self.matching(owner, record.epoch);
-            if (record.phase == .preparing or record.references == std.math.maxInt(u32) or entry.stats.leases == std.math.maxInt(u32)) return error.Busy;
-            record.references += 1;
-            entry.stats.leases += 1;
-            return record;
+        pub fn stop(self: *Self, id: u32, handle: u64) Error!*Record {
+            return self.record(id, handle, 1);
         }
-
-        pub fn unretain(self: *Self, record: *Record) Error!void {
-            const entry = try self.matching(record.owner, record.epoch);
-            if (record.references == 0) return error.Stale;
-            record.references -= 1;
-            entry.stats.leases -= 1;
+        pub fn retain(self: *Self, id: u32, handle: u64) Error!*Record {
+            return self.record(id, handle, 2);
         }
-
-        pub fn beginRemove(self: *Self, owner: u32, handle: u64) Error!Removal {
-            const record = try self.lookup(owner, handle);
-            const entry = try self.matching(owner, record.epoch);
-            if (record.phase != .completed or record.references != 0 or entry.stats.pending_releases == std.math.maxInt(u32)) return error.Busy;
-            const result: Removal = .{ .record = record, .owner = owner, .epoch = record.epoch, .handle = handle, .private = record.private };
-            var index = entry.tree.getEntryForExisting(&record.node);
-            index.set(null);
-            entry.stats.pending_releases += 1;
-            return result;
+        pub fn unretain(self: *Self, r: *Record) Error!void {
+            try checked(r4os_rust_thread_owner_record(&self.owners, capacity, r, 5, false, 0, null));
         }
-
-        // Caller confirms actual Task retirement and then backing free. Never
-        // dereference a successfully freed record; failure retains everything.
-        pub fn finishRemove(self: *Self, removal: *Removal, success: bool) Error!void {
-            if (!removal.active) return error.Stale;
-            const entry = try self.matching(removal.owner, removal.epoch);
-            std.debug.assert(entry.stats.pending_releases != 0);
-            entry.stats.pending_releases -= 1;
-            if (success) {
-                entry.stats.records -= 1;
-                entry.stats.completed -= 1;
-                if (removal.private) entry.stats.private -= 1;
-                entry.stats.releases +|= 1;
-            } else {
-                var index = entry.tree.getEntryFor(removal.handle);
-                std.debug.assert(index.node == null);
-                index.set(&removal.record.node);
-                entry.stats.release_failures +|= 1;
-            }
-            removal.active = false;
+        pub fn beginRemove(self: *Self, id: u32, handle: u64) Error!Removal {
+            var out: Removal = undefined;
+            try checked(r4os_rust_thread_owner_remove(&self.owners, capacity, id, handle, &out));
+            return out;
         }
-
-        pub fn close(self: *Self, owner: u32) void {
-            const entry = self.current(owner) catch return;
-            entry.stats.closing = true;
+        pub fn finishRemove(self: *Self, t: *Removal, success: bool) Error!void {
+            try checked(r4os_rust_thread_owner_finish_remove(&self.owners, capacity, t, success));
         }
-
-        // Numeric cursor survives releases and allows one bounded record
-        // action per runtime-owner acquisition instead of a lock-spanning walk.
-        pub fn after(self: *Self, owner: u32, cursor: u64) Error!?*Record {
-            const entry = try self.current(owner);
-            var node = entry.tree.root;
-            var found: ?*Tree.Node = null;
-            while (node) |current_node| {
-                if (current_node.key > cursor) {
-                    found = current_node;
-                    node = current_node.children[0];
-                } else node = current_node.children[1];
-            }
-            return if (found) |value| @fieldParentPtr("node", value) else null;
+        pub fn close(self: *Self, id: u32) void {
+            _ = r4os_rust_thread_owner_mutate(&self.owners, capacity, id, 0, 1);
         }
-
-        pub fn finish(self: *Self, owner: u32) Error!void {
-            const entry = try self.current(owner);
-            if (!entry.stats.closing or entry.stats.records != 0 or entry.stats.pending_creates != 0 or entry.stats.pending_releases != 0 or entry.stats.leases != 0) return error.Busy;
-            entry.* = .{};
+        pub fn after(self: *Self, id: u32, cursor: u64) Error!?*Record {
+            var out: ?*anyopaque = null;
+            try checked(r4os_rust_thread_owner_after(&self.owners, capacity, id, cursor, &out));
+            return if (out) |r| @ptrCast(@alignCast(r)) else null;
         }
-
-        fn slot(self: *Self, owner: u32) Error!*Owner {
-            if (owner == 0 or owner > capacity) return error.Owner;
-            return &self.owners[owner - 1];
-        }
-        fn current(self: *Self, owner: u32) Error!*Owner {
-            const entry = try self.slot(owner);
-            if (entry.stats.epoch == 0) return error.Stale;
-            return entry;
-        }
-        fn matching(self: *Self, owner: u32, epoch: u64) Error!*Owner {
-            const entry = try self.current(owner);
-            if (entry.stats.epoch != epoch) return error.Stale;
-            return entry;
+        pub fn finish(self: *Self, id: u32) Error!void {
+            try checked(r4os_rust_thread_owner_mutate(&self.owners, capacity, id, 0, 2));
         }
     };
 }

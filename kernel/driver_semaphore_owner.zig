@@ -1,181 +1,106 @@
-// Dynamic R4D semaphore ownership. Actual queues, heap backing and scheduler
-// waits belong to driver_semaphores.zig; this index mutates resident metadata.
+// Dynamic semaphore ownership is native Rust; actual semaphore queues and
+// backing stay resident under the existing runtime owner and unwind token.
 const std = @import("std");
-const Tree = std.Treap(u64, std.math.order);
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const Error = error{ Invalid, Owner, Stale, Closed, Busy, Exhausted };
-pub const Stats = struct {
-    epoch: u64 = 0,
-    closing: bool = false,
-    records: u64 = 0,
-    private: u64 = 0,
-    creates: u64 = 0,
-    create_failures: u64 = 0,
-    destroys: u64 = 0,
-    destroy_failures: u64 = 0,
-    pending_creates: u32 = 0,
-    pending_destroys: u32 = 0,
-    acquires: u32 = 0,
-};
-pub const Create = struct { owner: u32, epoch: u64, handle: u64, active: bool = true };
-
+const Node = extern struct { key: u64, priority: usize, parent: ?*Node, children: [2]?*Node };
+const Tree = extern struct { root: ?*Node = null, xorshift: usize = 0 };
+pub const Stats = extern struct { epoch: u64 = 0, records: u64 = 0, private: u64 = 0, creates: u64 = 0, create_failures: u64 = 0, destroys: u64 = 0, destroy_failures: u64 = 0, pending_creates: u32 = 0, pending_destroys: u32 = 0, acquires: u32 = 0, closing: bool = false };
+pub const Create = extern struct { epoch: u64, handle: u64, owner: u32, active: bool = true };
+const Owner = extern struct { stats: Stats = .{}, tree: Tree = .{} };
+extern fn r4os_rust_semaphore_owner_mutate(base: [*]Owner, cap: usize, id: u32, epoch: u64, op: u8) u8;
+extern fn r4os_rust_semaphore_owner_stats(base: [*]Owner, cap: usize, id: u32, out: *Stats) u8;
+extern fn r4os_rust_semaphore_owner_begin(base: [*]Owner, cap: usize, next: *u64, id: u32, out: *Create) u8;
+extern fn r4os_rust_semaphore_owner_abort(base: [*]Owner, cap: usize, c: *Create) u8;
+extern fn r4os_rust_semaphore_owner_adopt(base: [*]Owner, cap: usize, c: *Create, record: *anyopaque, visible: *bool) u8;
+extern fn r4os_rust_semaphore_owner_lookup(base: [*]Owner, cap: usize, id: u32, handle: u64, op: u8, out: *?*anyopaque) u8;
+extern fn r4os_rust_semaphore_owner_acquired(base: [*]Owner, cap: usize, record: *anyopaque) u8;
+extern fn r4os_rust_semaphore_owner_destroy(base: [*]Owner, cap: usize, id: u32, handle: u64, out: *anyopaque) u8;
+extern fn r4os_rust_semaphore_owner_finish_destroy(base: [*]Owner, cap: usize, ticket: *anyopaque, success: bool) u8;
+extern fn r4os_rust_semaphore_owner_first(base: [*]Owner, cap: usize, id: u32, out: *?*anyopaque) u8;
+comptime {
+    if (@sizeOf(Stats) != 72 or @sizeOf(Owner) != 88 or @sizeOf(Create) != 24) @compileError("Native semaphore metadata C layout drift");
+}
+fn checked(code: u8) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Owner,
+        3 => error.Stale,
+        4 => error.Closed,
+        5 => error.Busy,
+        6 => error.Exhausted,
+        else => @panic("Invalid native semaphore owner status"),
+    };
+}
 pub fn State(comptime capacity: usize, comptime Payload: type) type {
-    return struct {
+    return extern struct {
         const Self = @This();
-        pub const Record = struct {
-            node: Tree.Node = undefined,
-            owner: u32 = 0,
-            epoch: u64 = 0,
-            handle: u64 = 0,
-            private: bool = true,
-            acquires: u32 = 0,
-            payload: Payload,
-        };
-        pub const Destroy = struct {
-            record: *Record,
-            owner: u32,
-            epoch: u64,
-            handle: u64,
-            private: bool,
-            active: bool = true,
-        };
-        const Owner = struct { stats: Stats = .{}, tree: Tree = .{} };
+        pub const Record = extern struct { node: Node = undefined, epoch: u64 = 0, handle: u64 = 0, owner: u32 = 0, acquires: u32 = 0, private: bool = true, padding: [7]u8 = @splat(0), payload: Payload };
+        pub const Destroy = extern struct { record: *Record, epoch: u64, handle: u64, owner: u32, private: bool, active: bool = true };
+        comptime {
+            if (@offsetOf(Record, "payload") != 72 or @offsetOf(Record, "private") != 64 or @sizeOf(Destroy) != 32) @compileError("Native semaphore record prefix drift");
+        }
         owners: [capacity]Owner = .{Owner{}} ** capacity,
         next_handle: u64 = 1,
-
-        pub fn bind(self: *Self, owner: u32, epoch: u64) Error!void {
-            if (epoch == 0) return error.Invalid;
-            const entry = try self.slot(owner);
-            if (entry.stats.epoch != 0) return error.Busy;
-            entry.* = .{ .stats = .{ .epoch = epoch } };
+        pub fn bind(self: *Self, id: u32, epoch: u64) Error!void {
+            try checked(r4os_rust_semaphore_owner_mutate(&self.owners, capacity, id, epoch, 0));
         }
-        pub fn stats(self: *Self, owner: u32) Error!Stats {
-            return (try self.current(owner)).stats;
+        pub fn stats(self: *Self, id: u32) Error!Stats {
+            var out: Stats = undefined;
+            try checked(r4os_rust_semaphore_owner_stats(&self.owners, capacity, id, &out));
+            return out;
         }
-        pub fn begin(self: *Self, owner: u32) Error!Create {
-            const entry = try self.current(owner);
-            if (entry.stats.closing) return error.Closed;
-            if (self.next_handle == 0) return error.Exhausted;
-            if (entry.stats.pending_creates == std.math.maxInt(u32)) return error.Busy;
-            const handle = self.next_handle;
-            self.next_handle = if (handle == std.math.maxInt(u64)) 0 else handle + 1;
-            entry.stats.pending_creates += 1;
-            entry.stats.creates +|= 1;
-            return .{ .owner = owner, .epoch = entry.stats.epoch, .handle = handle };
+        pub fn begin(self: *Self, id: u32) Error!Create {
+            var out: Create = undefined;
+            try checked(r4os_rust_semaphore_owner_begin(&self.owners, capacity, &self.next_handle, id, &out));
+            return out;
         }
-        pub fn abort(self: *Self, create: *Create) Error!void {
-            if (!create.active) return error.Stale;
-            const entry = try self.matching(create.owner, create.epoch);
-            std.debug.assert(entry.stats.pending_creates != 0);
-            entry.stats.pending_creates -= 1;
-            entry.stats.create_failures +|= 1;
-            create.active = false;
+        pub fn abort(self: *Self, c: *Create) Error!void {
+            try checked(r4os_rust_semaphore_owner_abort(&self.owners, capacity, c));
         }
-        pub fn adopt(self: *Self, create: *Create, record: *Record) Error!bool {
-            if (!create.active) return error.Stale;
-            const entry = try self.matching(create.owner, create.epoch);
-            std.debug.assert(record.owner == 0 and entry.stats.pending_creates != 0);
-            record.owner = create.owner;
-            record.epoch = create.epoch;
-            record.handle = create.handle;
-            record.private = entry.stats.closing;
-            record.acquires = 0;
-            var index = entry.tree.getEntryFor(create.handle);
-            std.debug.assert(index.node == null);
-            index.set(&record.node);
-            entry.stats.records += 1;
-            entry.stats.pending_creates -= 1;
-            if (record.private) {
-                entry.stats.private += 1;
-                entry.stats.create_failures +|= 1;
-            }
-            create.active = false;
-            return !record.private;
+        pub fn adopt(self: *Self, c: *Create, r: *Record) Error!bool {
+            var publish_visible = false;
+            try checked(r4os_rust_semaphore_owner_adopt(&self.owners, capacity, c, r, &publish_visible));
+            return publish_visible;
         }
-        pub fn lookup(self: *Self, owner: u32, handle: u64) Error!*Record {
-            if (handle == 0) return error.Invalid;
-            const entry = try self.current(owner);
-            const node = entry.tree.getEntryFor(handle).node orelse return error.Stale;
-            const record: *Record = @fieldParentPtr("node", node);
-            std.debug.assert(record.owner == owner and record.epoch == entry.stats.epoch);
-            return record;
+        fn record(self: *Self, id: u32, handle: u64, op: u8) Error!*Record {
+            var out: ?*anyopaque = null;
+            try checked(r4os_rust_semaphore_owner_lookup(&self.owners, capacity, id, handle, op, &out));
+            return @ptrCast(@alignCast(out.?));
         }
-        pub fn visible(self: *Self, owner: u32, handle: u64) Error!*Record {
-            const record = try self.lookup(owner, handle);
-            return if (record.private) error.Stale else record;
+        pub fn lookup(self: *Self, id: u32, handle: u64) Error!*Record {
+            return self.record(id, handle, 0);
         }
-        // Close stops creation, not existing semaphore operations. In
-        // particular it never grants a permit or aborts uninterruptible down.
-        pub fn acquire(self: *Self, owner: u32, handle: u64) Error!*Record {
-            const record = try self.visible(owner, handle);
-            const entry = try self.matching(owner, record.epoch);
-            if (record.acquires == std.math.maxInt(u32) or entry.stats.acquires == std.math.maxInt(u32)) return error.Busy;
-            record.acquires += 1;
-            entry.stats.acquires += 1;
-            return record;
+        pub fn visible(self: *Self, id: u32, handle: u64) Error!*Record {
+            return self.record(id, handle, 1);
         }
-        pub fn acquired(self: *Self, record: *Record) Error!void {
-            const entry = try self.matching(record.owner, record.epoch);
-            if (record.acquires == 0) return error.Stale;
-            record.acquires -= 1;
-            entry.stats.acquires -= 1;
+        pub fn acquire(self: *Self, id: u32, handle: u64) Error!*Record {
+            return self.record(id, handle, 2);
         }
-        pub fn beginDestroy(self: *Self, owner: u32, handle: u64) Error!Destroy {
-            const record = try self.lookup(owner, handle);
-            const entry = try self.matching(owner, record.epoch);
-            if (record.acquires != 0 or entry.stats.pending_destroys == std.math.maxInt(u32)) return error.Busy;
-            const ticket: Destroy = .{ .record = record, .owner = owner, .epoch = record.epoch, .handle = handle, .private = record.private };
-            var index = entry.tree.getEntryForExisting(&record.node);
-            index.set(null);
-            entry.stats.pending_destroys += 1;
-            return ticket;
+        pub fn acquired(self: *Self, r: *Record) Error!void {
+            try checked(r4os_rust_semaphore_owner_acquired(&self.owners, capacity, r));
         }
-        // A successful caller free already invalidated record. Only copied
-        // accounting may be read; failure reinserts the exact live identity.
-        pub fn finishDestroy(self: *Self, ticket: *Destroy, success: bool) Error!void {
-            if (!ticket.active) return error.Stale;
-            const entry = try self.matching(ticket.owner, ticket.epoch);
-            std.debug.assert(entry.stats.pending_destroys != 0);
-            entry.stats.pending_destroys -= 1;
-            if (success) {
-                entry.stats.records -= 1;
-                if (ticket.private) entry.stats.private -= 1;
-                entry.stats.destroys +|= 1;
-            } else {
-                var index = entry.tree.getEntryFor(ticket.handle);
-                std.debug.assert(index.node == null);
-                index.set(&ticket.record.node);
-                entry.stats.destroy_failures +|= 1;
-            }
-            ticket.active = false;
+        pub fn beginDestroy(self: *Self, id: u32, handle: u64) Error!Destroy {
+            var out: Destroy = undefined;
+            try checked(r4os_rust_semaphore_owner_destroy(&self.owners, capacity, id, handle, &out));
+            return out;
         }
-        pub fn first(self: *Self, owner: u32) Error!?*Record {
-            const entry = try self.current(owner);
-            var node = entry.tree.root orelse return null;
-            while (node.children[0]) |child| node = child;
-            return @fieldParentPtr("node", node);
+        pub fn finishDestroy(self: *Self, t: *Destroy, success: bool) Error!void {
+            try checked(r4os_rust_semaphore_owner_finish_destroy(&self.owners, capacity, t, success));
         }
-        pub fn close(self: *Self, owner: u32) void {
-            const entry = self.current(owner) catch return;
-            entry.stats.closing = true;
+        pub fn first(self: *Self, id: u32) Error!?*Record {
+            var out: ?*anyopaque = null;
+            try checked(r4os_rust_semaphore_owner_first(&self.owners, capacity, id, &out));
+            return if (out) |r| @ptrCast(@alignCast(r)) else null;
         }
-        pub fn finish(self: *Self, owner: u32) Error!void {
-            const entry = try self.current(owner);
-            if (!entry.stats.closing or entry.stats.records != 0 or entry.stats.pending_creates != 0 or entry.stats.pending_destroys != 0 or entry.stats.acquires != 0) return error.Busy;
-            entry.* = .{};
+        pub fn close(self: *Self, id: u32) void {
+            _ = r4os_rust_semaphore_owner_mutate(&self.owners, capacity, id, 0, 1);
         }
-        fn slot(self: *Self, owner: u32) Error!*Owner {
-            if (owner == 0 or owner > capacity) return error.Owner;
-            return &self.owners[owner - 1];
-        }
-        fn current(self: *Self, owner: u32) Error!*Owner {
-            const entry = try self.slot(owner);
-            if (entry.stats.epoch == 0) return error.Stale;
-            return entry;
-        }
-        fn matching(self: *Self, owner: u32, epoch: u64) Error!*Owner {
-            const entry = try self.current(owner);
-            if (entry.stats.epoch != epoch) return error.Stale;
-            return entry;
+        pub fn finish(self: *Self, id: u32) Error!void {
+            try checked(r4os_rust_semaphore_owner_mutate(&self.owners, capacity, id, 0, 2));
         }
     };
 }

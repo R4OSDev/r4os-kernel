@@ -1,57 +1,66 @@
 // Serialized by DriverApi's wait-spanning owner guard. No resource handle
 // owns a buffer, a filesystem lease or a path which could be reopened.
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 const owner_capacity = @import("../driver/registry.zig").MAX_DRIVERS;
 pub const Error = error{ Owner, Busy, Stale, Capacity };
-pub const Binding = struct {
+pub const Binding = extern struct {
     epoch: u64 = 0,
     slot: usize = 0,
     module_generation: u32 = 0,
     closing: bool = false,
 };
-pub const State = struct {
+extern fn r4os_rust_resource_state_mutate(state: *State, operation: u8, owner: u32, slot: usize, generation: u32) u8;
+extern fn r4os_rust_resource_current(state: *const State, owner: u32, output: *?*const Binding) u8;
+extern fn r4os_rust_resource_handle(state: *const State, operation: u8, owner: u32, value: u64, output: *u64) u8;
+extern fn r4os_rust_resource_publish(output: *@import("r4os_kernel_contract").DriverResourceApi, input: *const @import("r4os_kernel_contract").DriverResourceApi) bool;
+comptime {
+    if (@sizeOf(Binding) != 24 or @offsetOf(Binding, "module_generation") != 16 or
+        @sizeOf(State) != 776 or @offsetOf(State, "bindings") != 8)
+        @compileError("Native resource state C layout drift");
+}
+fn checked(code: u8) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => error.Owner,
+        2 => error.Busy,
+        3 => error.Stale,
+        4 => error.Capacity,
+        else => @panic("Invalid native resource status"),
+    };
+}
+pub const State = extern struct {
     next_epoch: u64 = 1,
     bindings: [owner_capacity]Binding = .{Binding{}} ** owner_capacity,
-
     pub fn bind(self: *State, owner: u32, slot: usize, generation: u32) Error!void {
-        if (owner == 0 or owner > self.bindings.len or generation == 0) return error.Owner;
-        if (self.bindings[owner - 1].epoch != 0) return error.Busy;
-        // Exhaustion fails closed; old handles can never become current.
-        if (self.next_epoch > std.math.maxInt(u56)) return error.Capacity;
-        self.bindings[owner - 1] = .{ .epoch = self.next_epoch, .slot = slot, .module_generation = generation };
-        self.next_epoch += 1;
+        try checked(r4os_rust_resource_state_mutate(self, 0, owner, slot, generation));
     }
     pub fn current(self: *const State, owner: u32) Error!*const Binding {
-        if (owner == 0 or owner > self.bindings.len) return error.Owner;
-        const binding = &self.bindings[owner - 1];
-        if (binding.epoch == 0 or binding.closing) return error.Stale;
-        return binding;
+        var value: ?*const Binding = null;
+        try checked(r4os_rust_resource_current(self, owner, &value));
+        return value.?;
     }
     pub fn handle(self: *const State, owner: u32, index: usize) Error!u64 {
-        if (index >= 64) return error.Capacity;
-        return ((try self.current(owner)).epoch << 8) | (index + 1);
+        var value: u64 = undefined;
+        try checked(r4os_rust_resource_handle(self, 0, owner, index, &value));
+        return value;
     }
     pub fn resolve(self: *const State, owner: u32, id: u64) Error!usize {
-        const binding = try self.current(owner);
-        const index = id & 255;
-        if (id >> 8 != binding.epoch or index == 0 or index > 64) return error.Stale;
-        return @intCast(index - 1);
+        var value: u64 = undefined;
+        try checked(r4os_rust_resource_handle(self, 1, owner, id, &value));
+        return @intCast(value);
     }
     pub fn close(self: *State, owner: u32) void {
-        if (owner != 0 and owner <= self.bindings.len) self.bindings[owner - 1].closing = true;
+        _ = r4os_rust_resource_state_mutate(self, 1, owner, 0, 0);
     }
     pub fn finish(self: *State, owner: u32) void {
-        if (owner != 0 and owner <= self.bindings.len) self.bindings[owner - 1] = .{};
+        _ = r4os_rust_resource_state_mutate(self, 2, owner, 0, 0);
     }
 };
-
 pub fn publishApi(output: *@import("r4os_kernel_contract").DriverResourceApi, input: @import("r4os_kernel_contract").DriverResourceApi) bool {
-    const Api = @TypeOf(input);
-    if (@intFromPtr(output) == 0 or @intFromPtr(output) % @alignOf(Api) != 0 or output.version != 1 or output.size < 32) return false;
-    const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(Api));
-    var value = input; value.size = bytes;
-    @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
-    return true;
+    return r4os_rust_resource_publish(output, &input);
 }
 
 test "resource handles reject foreign owners, restart, shutdown and exhaustion" {

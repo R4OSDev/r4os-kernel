@@ -1,27 +1,14 @@
 const std = @import("std");
-
-pub const MsixTableGeometry = struct {
-    bir: u8,
-    offset: u32,
-    mapping_bytes: u32,
-};
-
-/// Decode the MSI-X table descriptor for the single-vector DriverApi path.
-/// PCI only defines BAR indicators 0..5. The complete first 16-byte entry
-/// must fit both the kernel MMIO policy and the u32 DriverApi map request.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+pub const MsixTableGeometry = struct { bir: u8, offset: u32, mapping_bytes: u32 };
+const RawGeometry = extern struct { bir: u8, offset: u32, mapping_bytes: u32 };
+extern fn r4os_rust_driver_msix_geometry(descriptor: u32, max_mapping_bytes: u64, output: *RawGeometry) bool;
 pub fn msixTableGeometry(descriptor: u32, max_mapping_bytes: u64) ?MsixTableGeometry {
-    const bir: u8 = @truncate(descriptor & 0x7);
-    if (bir >= 6) return null;
-
-    const offset = descriptor & 0xFFFF_FFF8;
-    const required = @as(u64, offset) + 16;
-    if (required > max_mapping_bytes or required > std.math.maxInt(u32)) return null;
-
-    return .{
-        .bir = bir,
-        .offset = offset,
-        .mapping_bytes = @intCast(required),
-    };
+    var value: RawGeometry = undefined;
+    if (!r4os_rust_driver_msix_geometry(descriptor, max_mapping_bytes, &value)) return null;
+    return .{ .bir = value.bir, .offset = value.offset, .mapping_bytes = value.mapping_bytes };
 }
 
 test "MSI-X table geometry retains BIR and aligned offset" {

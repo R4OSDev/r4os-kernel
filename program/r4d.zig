@@ -483,7 +483,7 @@ fn initRuntimeModuleResultSource(module_slot: usize, source: LoadSource) Runtime
             driver_registry.setState(registry_slot, .failed);
             return .load_failed;
         }
-        break :owner_init init(&driver_api.table);
+        break :owner_init init(driver_api.table());
     };
     if (result != 0) {
         k.puts("[R4D] init failed code=");

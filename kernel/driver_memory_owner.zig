@@ -1,16 +1,14 @@
-// Resident CPU allocations owned by an actual R4D start. This component only
-// mutates metadata. The runtime wrapper allocates/frees backing outside its
-// owner boundary and calls finishRelease only after the backend returns.
+// Resident R4D CPU allocation metadata is implemented in Rust. This fixed
+// private C view owns no second index; backing allocation/free stays outside.
 const std = @import("std");
-
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const Error = error{ Invalid, Owner, Stale, Closed, Busy, Exhausted, Overflow };
-const Tree = std.Treap(u64, std.math.order);
-
-// One record lives in the same resident heap allocation as its CPU payload.
-// A rejected heap.free leaves the complete allocation intact; a successful
-// free may retain VM tail pages internally, under the kernel heap's ownership.
-pub const Record = struct {
-    node: Tree.Node = undefined,
+const Node = extern struct { key: u64, priority: usize, parent: ?*Node, children: [2]?*Node };
+const Tree = extern struct { root: ?*Node = null, xorshift: usize = 0 };
+pub const Record = extern struct {
+    node: Node = undefined,
     epoch: u64,
     requested_bytes: u64,
     heap_bytes: usize,
@@ -19,211 +17,121 @@ pub const Record = struct {
     private: bool,
     release_failed: bool = false,
 };
-
-pub const Layout = struct {
+pub const Layout = extern struct {
     requested_bytes: u64,
     heap_bytes: usize,
     payload_offset: usize,
     alignment: u32,
-
     pub fn init(bytes: u64, alignment: u32) Error!Layout {
-        if (bytes == 0 or alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.Invalid;
-        const normalized = @max(alignment, 16);
-        const offset = std.mem.alignForward(usize, @sizeOf(Record), normalized);
-        const total = std.math.add(usize, @intCast(bytes), offset) catch return error.Overflow;
-        return .{ .requested_bytes = bytes, .heap_bytes = total, .payload_offset = offset, .alignment = normalized };
+        var out: Layout = undefined;
+        try checked(r4os_rust_driver_memory_layout(bytes, alignment, &out));
+        return out;
     }
 };
-
-pub const Allocation = struct { handle: u64, address: usize, bytes: u64, alignment: u32 };
-pub const Create = struct { owner: u32, epoch: u64, handle: u64, layout: Layout, active: bool = true };
-pub const Published = struct { allocation: Allocation, visible: bool };
-pub const Release = struct {
-    owner: u32,
+pub const Allocation = extern struct { handle: u64, address: usize, bytes: u64, alignment: u32 };
+pub const Create = extern struct { epoch: u64, handle: u64, layout: Layout, owner: u32, active: bool = true };
+pub const Published = extern struct { allocation: Allocation, visible: bool };
+pub const Release = extern struct {
+    record: *Record,
     epoch: u64,
     handle: u64,
-    record: *Record,
     bytes: u64,
     heap_bytes: usize,
+    owner: u32,
     private: bool,
     active: bool = true,
-
     pub fn backing(self: Release) []u8 {
         std.debug.assert(self.active);
         const address: [*]u8 = @ptrCast(self.record);
         return address[0..self.heap_bytes];
     }
 };
-
-pub const Stats = struct {
+pub const Stats = extern struct {
     epoch: u64 = 0,
-    closing: bool = false,
     allocations: u64 = 0,
     bytes: u64 = 0,
     backing_bytes: u64 = 0,
     peak_bytes: u64 = 0,
     private_allocations: u64 = 0,
-    pending_creates: u32 = 0,
-    pending_releases: u32 = 0,
     allocation_calls: u64 = 0,
     allocation_failures: u64 = 0,
     releases: u64 = 0,
     release_failures: u64 = 0,
+    pending_creates: u32 = 0,
+    pending_releases: u32 = 0,
+    closing: bool = false,
 };
-
-// Only the existing driver registry bounds owner slots. Allocations have no
-// separate fixed slot pool: records grow with real resident heap storage.
-// Intrusive treaps provide expected logarithmic lookup without allocating
-// index storage or moving a record while its payload is borrowed.
+const Owner = extern struct { stats: Stats = .{}, tree: Tree = .{} };
+extern fn r4os_rust_driver_memory_layout(bytes: u64, alignment: u32, out: *Layout) u8;
+extern fn r4os_rust_driver_memory_mutate(owners: [*]Owner, cap: usize, op: u8, id: u32, epoch: u64) u8;
+extern fn r4os_rust_driver_memory_snapshot(owners: [*]Owner, cap: usize, id: u32, out: *Stats) u8;
+extern fn r4os_rust_driver_memory_begin(owners: [*]Owner, cap: usize, next: *u64, id: u32, layout: *const Layout, out: *Create) u8;
+extern fn r4os_rust_driver_memory_abort(owners: [*]Owner, cap: usize, create: *Create) u8;
+extern fn r4os_rust_driver_memory_adopt(owners: [*]Owner, cap: usize, create: *Create, backing: [*]u8, len: usize, out: *Published) u8;
+extern fn r4os_rust_driver_memory_release(owners: [*]Owner, cap: usize, id: u32, handle: u64, out: *Release) u8;
+extern fn r4os_rust_driver_memory_finish_release(owners: [*]Owner, cap: usize, release: *Release, success: bool) u8;
+extern fn r4os_rust_driver_memory_cleanup(owners: [*]Owner, cap: usize, id: u32, out: *Release, present: *bool) u8;
+comptime {
+    if (@sizeOf(Node) != 40 or @sizeOf(Tree) != 16 or @sizeOf(Record) != 80 or @sizeOf(Layout) != 32 or @sizeOf(Create) != 56 or @sizeOf(Release) != 48 or @sizeOf(Stats) != 96 or @sizeOf(Owner) != 112) @compileError("Native R4D CPU allocation C layout drift");
+}
+fn checked(code: u8) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Owner,
+        3 => error.Stale,
+        4 => error.Closed,
+        5 => error.Busy,
+        6 => error.Exhausted,
+        7 => error.Overflow,
+        else => @panic("Invalid native CPU allocation status"),
+    };
+}
 pub fn State(comptime owner_capacity: usize) type {
-    return struct {
+    return extern struct {
         const Self = @This();
-        const Owner = struct { stats: Stats = .{}, tree: Tree = .{} };
         owners: [owner_capacity]Owner = .{Owner{}} ** owner_capacity,
         next_handle: u64 = 1,
-
         pub fn activate(self: *Self, id: u32, epoch: u64) Error!void {
-            if (epoch == 0) return error.Invalid;
-            const entry = try self.slot(id);
-            if (entry.stats.epoch != 0) {
-                if (entry.stats.epoch != epoch) return error.Busy;
-                if (entry.stats.closing) return error.Closed;
-                return;
-            }
-            entry.* = .{ .stats = .{ .epoch = epoch } };
+            try checked(r4os_rust_driver_memory_mutate(&self.owners, owner_capacity, 0, id, epoch));
         }
-
         pub fn snapshot(self: *Self, id: u32) Error!Stats {
-            return (try self.current(id)).stats;
+            var out: Stats = undefined;
+            try checked(r4os_rust_driver_memory_snapshot(&self.owners, owner_capacity, id, &out));
+            return out;
         }
-
         pub fn begin(self: *Self, id: u32, layout: Layout) Error!Create {
-            const entry = try self.current(id);
-            if (entry.stats.closing) return error.Closed;
-            if (self.next_handle == 0) return error.Exhausted;
-            if (entry.stats.pending_creates == std.math.maxInt(u32)) return error.Busy;
-            const handle = self.next_handle;
-            self.next_handle = if (handle == std.math.maxInt(u64)) 0 else handle + 1;
-            entry.stats.pending_creates += 1;
-            entry.stats.allocation_calls +|= 1;
-            return .{ .owner = id, .epoch = entry.stats.epoch, .handle = handle, .layout = layout };
+            var out: Create = undefined;
+            try checked(r4os_rust_driver_memory_begin(&self.owners, owner_capacity, &self.next_handle, id, &layout, &out));
+            return out;
         }
-
         pub fn abort(self: *Self, create: *Create) Error!void {
-            if (!create.active) return error.Stale;
-            const entry = try self.matching(create.owner, create.epoch);
-            std.debug.assert(entry.stats.pending_creates != 0);
-            entry.stats.pending_creates -= 1;
-            entry.stats.allocation_failures +|= 1;
-            create.active = false;
+            try checked(r4os_rust_driver_memory_abort(&self.owners, owner_capacity, create));
         }
-
-        // A close racing with the actual heap allocation cannot lose its
-        // backing. Adopt it privately, refuse the caller's publication and
-        // let owner cleanup reclaim it after callbacks and DMA have drained.
         pub fn adopt(self: *Self, create: *Create, backing: []u8) Error!Published {
-            if (!create.active) return error.Stale;
-            const entry = try self.matching(create.owner, create.epoch);
-            const layout = create.layout;
-            std.debug.assert(backing.len == layout.heap_bytes and @intFromPtr(backing.ptr) % layout.alignment == 0);
-            const record: *Record = @ptrCast(@alignCast(backing.ptr));
-            record.* = .{
-                .epoch = create.epoch,
-                .requested_bytes = layout.requested_bytes,
-                .heap_bytes = layout.heap_bytes,
-                .payload_offset = layout.payload_offset,
-                .alignment = layout.alignment,
-                .private = entry.stats.closing,
-            };
-            var target = entry.tree.getEntryFor(create.handle);
-            std.debug.assert(target.node == null);
-            target.set(&record.node);
-            entry.stats.pending_creates -= 1;
-            entry.stats.allocations += 1;
-            entry.stats.bytes += layout.requested_bytes;
-            entry.stats.backing_bytes += layout.heap_bytes;
-            entry.stats.peak_bytes = @max(entry.stats.peak_bytes, entry.stats.bytes);
-            if (record.private) {
-                entry.stats.private_allocations += 1;
-                entry.stats.allocation_failures +|= 1;
-            }
-            create.active = false;
-            return .{ .allocation = .{ .handle = create.handle, .address = @intFromPtr(backing.ptr) + layout.payload_offset, .bytes = layout.requested_bytes, .alignment = layout.alignment }, .visible = !record.private };
+            var out: Published = undefined;
+            try checked(r4os_rust_driver_memory_adopt(&self.owners, owner_capacity, create, backing.ptr, backing.len, &out));
+            return out;
         }
-
         pub fn beginRelease(self: *Self, id: u32, handle: u64) Error!Release {
-            if (handle == 0) return error.Invalid;
-            const entry = try self.current(id);
-            if (entry.stats.pending_releases == std.math.maxInt(u32)) return error.Busy;
-            var target = entry.tree.getEntryFor(handle);
-            const node = target.node orelse return error.Stale;
-            const record: *Record = @fieldParentPtr("node", node);
-            std.debug.assert(record.epoch == entry.stats.epoch);
-            const release: Release = .{ .owner = id, .epoch = record.epoch, .handle = handle, .record = record, .bytes = record.requested_bytes, .heap_bytes = record.heap_bytes, .private = record.private };
-            target.set(null);
-            entry.stats.pending_releases += 1;
-            return release;
+            var out: Release = undefined;
+            try checked(r4os_rust_driver_memory_release(&self.owners, owner_capacity, id, handle, &out));
+            return out;
         }
-
-        // No dereference of record after a successful backing release. Failed
-        // heap release means the complete original allocation remains valid;
-        // return that exact identity to the index, retaining all accounting.
         pub fn finishRelease(self: *Self, release: *Release, success: bool) Error!void {
-            if (!release.active) return error.Stale;
-            const entry = try self.matching(release.owner, release.epoch);
-            std.debug.assert(entry.stats.pending_releases != 0);
-            entry.stats.pending_releases -= 1;
-            if (success) {
-                entry.stats.allocations -= 1;
-                entry.stats.bytes -= release.bytes;
-                entry.stats.backing_bytes -= release.heap_bytes;
-                if (release.private) entry.stats.private_allocations -= 1;
-                entry.stats.releases +|= 1;
-            } else {
-                release.record.release_failed = true;
-                var target = entry.tree.getEntryFor(release.handle);
-                std.debug.assert(target.node == null);
-                target.set(&release.record.node);
-                entry.stats.release_failures +|= 1;
-            }
-            release.active = false;
+            try checked(r4os_rust_driver_memory_finish_release(&self.owners, owner_capacity, release, success));
         }
-
         pub fn close(self: *Self, id: u32) void {
-            const entry = self.current(id) catch return;
-            entry.stats.closing = true;
+            _ = r4os_rust_driver_memory_mutate(&self.owners, owner_capacity, 1, id, 0);
         }
-
         pub fn nextCleanup(self: *Self, id: u32) Error!?Release {
-            const entry = try self.current(id);
-            if (!entry.stats.closing or entry.stats.pending_creates != 0 or entry.stats.pending_releases != 0) return error.Busy;
-            const node = entry.tree.getMin() orelse return null;
-            return try self.beginRelease(id, node.key);
+            var out: Release = undefined;
+            var present = false;
+            try checked(r4os_rust_driver_memory_cleanup(&self.owners, owner_capacity, id, &out, &present));
+            return if (present) out else null;
         }
-
         pub fn finish(self: *Self, id: u32) Error!void {
-            const entry = try self.slot(id);
-            if (entry.stats.epoch == 0) return;
-            if (!entry.stats.closing or entry.stats.allocations != 0 or entry.stats.pending_creates != 0 or entry.stats.pending_releases != 0) return error.Busy;
-            std.debug.assert(entry.tree.root == null and entry.stats.bytes == 0 and entry.stats.backing_bytes == 0);
-            entry.* = .{};
-        }
-
-        fn slot(self: *Self, id: u32) Error!*Owner {
-            if (id == 0 or id > owner_capacity) return error.Owner;
-            return &self.owners[id - 1];
-        }
-
-        fn current(self: *Self, id: u32) Error!*Owner {
-            const entry = try self.slot(id);
-            if (entry.stats.epoch == 0) return error.Stale;
-            return entry;
-        }
-
-        fn matching(self: *Self, id: u32, epoch: u64) Error!*Owner {
-            const entry = try self.current(id);
-            if (entry.stats.epoch != epoch) return error.Stale;
-            return entry;
+            try checked(r4os_rust_driver_memory_mutate(&self.owners, owner_capacity, 2, id, 0));
         }
     };
 }

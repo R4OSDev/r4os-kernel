@@ -1,4 +1,7 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
 // The kernel and its R4D callbacks use the AMD64 System V ABI on either build
 // host. This is one ordinary call/return boundary, not a returns-twice setjmp
@@ -21,68 +24,14 @@ comptime {
         @compileError("callback abort assembly layout drift");
 }
 
+extern fn r4os_rust_callback_invoke(handler: Handler, context: usize, frame: *Frame) callconv(.{ .x86_64_sysv = .{} }) i32;
+extern fn r4os_rust_callback_resume(frame: *const Frame, result: i32) callconv(.{ .x86_64_sysv = .{} }) noreturn;
 pub fn invoke(handler: Handler, context: usize, frame: *Frame) i32 {
-    const call: *const fn (Handler, usize, *Frame) callconv(.{ .x86_64_sysv = .{} }) i32 = @ptrCast(&invokeNaked);
-    return call(handler, context, frame);
+    return r4os_rust_callback_invoke(handler, context, frame);
 }
-
-// Only the current Task may resume its still-active frame. No C/Zig defer or
-// foreign stack cleanup is run by this transfer. All kernel owners must have
-// returned, and the enclosing Task lifetime guard must remain installed.
+// Same current-task live frame and fully returned kernel owners as before.
 pub fn returnToCaller(frame: *const Frame, result: i32) noreturn {
-    const call: *const fn (*const Frame, i32) callconv(.{ .x86_64_sysv = .{} }) noreturn = @ptrCast(&resumeNaked);
-    call(frame, result);
-}
-
-fn invokeNaked() callconv(.naked) void {
-    @setRuntimeSafety(false);
-    asm volatile (
-        \\ movq %%rsp, 0(%%rdx)
-        \\ movq %%rbx, 8(%%rdx)
-        \\ movq %%rbp, 16(%%rdx)
-        \\ movq %%r12, 24(%%rdx)
-        \\ movq %%r13, 32(%%rdx)
-        \\ movq %%r14, 40(%%rdx)
-        \\ movq %%r15, 48(%%rdx)
-        \\ stmxcsr 56(%%rdx)
-        \\ fnstcw 60(%%rdx)
-        \\ movq %%rdi, %%rax
-        \\ movq %%rsi, %%rdi
-        // Entry RSP is 8 mod 16. This push preserves the frame pointer and
-        // establishes the required 16-byte alignment immediately before call.
-        \\ pushq %%rdx
-        \\ call *%%rax
-        \\ popq %%rdx
-        \\ ldmxcsr 56(%%rdx)
-        \\ fldcw 60(%%rdx)
-        \\ movq 8(%%rdx), %%rbx
-        \\ movq 16(%%rdx), %%rbp
-        \\ movq 24(%%rdx), %%r12
-        \\ movq 32(%%rdx), %%r13
-        \\ movq 40(%%rdx), %%r14
-        \\ movq 48(%%rdx), %%r15
-        \\ cld
-        \\ ret
-    );
-}
-
-fn resumeNaked() callconv(.naked) void {
-    @setRuntimeSafety(false);
-    asm volatile (
-        \\ movl %%esi, %%eax
-        \\ movq %%rdi, %%rdx
-        \\ movq 0(%%rdx), %%rsp
-        \\ ldmxcsr 56(%%rdx)
-        \\ fldcw 60(%%rdx)
-        \\ movq 8(%%rdx), %%rbx
-        \\ movq 16(%%rdx), %%rbp
-        \\ movq 24(%%rdx), %%r12
-        \\ movq 32(%%rdx), %%r13
-        \\ movq 40(%%rdx), %%r14
-        \\ movq 48(%%rdx), %%r15
-        \\ cld
-        \\ ret
-    );
+    r4os_rust_callback_resume(frame, result);
 }
 
 const Probe = struct {

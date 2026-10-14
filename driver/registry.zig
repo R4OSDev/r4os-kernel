@@ -32,85 +32,72 @@ pub const Entry = struct {
     state: State = .empty,
 };
 
-var entries: [MAX_DRIVERS]Entry = .{Entry{}} ** MAX_DRIVERS;
-
-pub fn init() void {
-    entries = .{Entry{}} ** MAX_DRIVERS;
+// Native registry snapshots are caller-owned; no reusable slot pointer escapes.
+const RawEntry = extern struct {
+    used: bool,
+    name: [MAX_NAME]u8,
+    name_len: usize,
+    driver_type: u16,
+    version: u32,
+    source: Source,
+    state: State,
+};
+comptime {
+    if (@sizeOf(RawEntry) != 64 or @offsetOf(RawEntry, "name_len") != 40 or
+        @offsetOf(RawEntry, "version") != 52 or @offsetOf(RawEntry, "state") != 57)
+        @compileError("Native driver registry C layout drift");
 }
-
+extern fn r4os_rust_driver_registry_reset() void;
+extern fn r4os_rust_driver_registry_begin(name: [*]const u8, len: usize, kind: u16, version: u32, source: Source) usize;
+extern fn r4os_rust_driver_registry_set_state(slot: usize, state: State) void;
+extern fn r4os_rust_driver_registry_get(slot: usize, output: *RawEntry) bool;
+extern fn r4os_rust_driver_registry_count() usize;
+extern fn r4os_rust_driver_registry_find(name: [*]const u8, len: usize) usize;
+pub fn init() void {
+    r4os_rust_driver_registry_reset();
+}
 pub fn beginLoad(name: []const u8, driver_type: u16, version: u32) ?usize {
     return beginLoadSource(name, driver_type, version, .builtin);
 }
-
 pub fn beginLoadR4d(name: []const u8, driver_type: u16, version: u32) ?usize {
     return beginLoadSource(name, driver_type, version, .r4d);
 }
-
 pub fn beginLoadPreloadR4d(name: []const u8, driver_type: u16, version: u32) ?usize {
     return beginLoadSource(name, driver_type, version, .preload);
 }
-
 fn beginLoadSource(name: []const u8, driver_type: u16, version: u32, source: Source) ?usize {
-    const slot = freeSlot() orelse return null;
-    const e = &entries[slot];
-    e.* = .{
-        .used = true,
-        .driver_type = driver_type,
-        .version = version,
-        .source = source,
-        .state = .loaded,
-    };
-    e.name_len = if (name.len < MAX_NAME) name.len else MAX_NAME - 1;
-    if (e.name_len > 0) @memcpy(e.name[0..e.name_len], name[0..e.name_len]);
+    const slot = r4os_rust_driver_registry_begin(name.ptr, name.len, driver_type, version, source);
+    if (slot == @import("std").math.maxInt(usize)) return null;
     logState(slot);
     return slot;
 }
-
 pub fn setState(slot: usize, state: State) void {
-    if (slot >= entries.len or !entries[slot].used) return;
-    entries[slot].state = state;
+    r4os_rust_driver_registry_set_state(slot, state);
     logState(slot);
 }
-
 pub fn markUnloaded(slot: usize) void {
     setState(slot, .unloaded);
 }
-
 pub fn get(slot: usize) ?Entry {
-    if (slot >= entries.len or !entries[slot].used) return null;
-    return entries[slot];
+    var value: RawEntry = undefined;
+    if (!r4os_rust_driver_registry_get(slot, &value)) return null;
+    return .{ .used = value.used, .name = value.name, .name_len = value.name_len, .driver_type = value.driver_type, .version = value.version, .source = value.source, .state = value.state };
 }
-
+pub fn entryAt(index: usize) ?Entry {
+    return get(index);
+}
 pub fn countUsed() usize {
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        if (entries[i].used) count += 1;
-    }
-    return count;
+    return r4os_rust_driver_registry_count();
 }
-
-pub fn entryAt(index: usize) ?*const Entry {
-    if (index >= entries.len or !entries[index].used) return null;
-    return &entries[index];
-}
-
 pub fn findByName(name: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const e = &entries[i];
-        if (!e.used) continue;
-        if (nameEq(e.name[0..e.name_len], name)) return i;
-    }
-    return null;
+    const slot = r4os_rust_driver_registry_find(name.ptr, name.len);
+    return if (slot == @import("std").math.maxInt(usize)) null else slot;
 }
-
 pub fn logRegistryToBootlog() void {
     bootlog.puts("[DRIVER] registry:\r\n");
     var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const e = &entries[i];
-        if (!e.used) continue;
+    while (i < MAX_DRIVERS) : (i += 1) {
+        const e = get(i) orelse continue;
         bootlog.puts("[DRIVER]   ");
         bootlog.puts(e.name[0..e.name_len]);
         bootlog.puts(" src=");
@@ -125,30 +112,8 @@ pub fn logRegistryToBootlog() void {
     }
 }
 
-fn nameEq(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (upper(a[i]) != upper(b[i])) return false;
-    }
-    return true;
-}
-
-fn upper(c: u8) u8 {
-    if (c >= 'a' and c <= 'z') return c - ('a' - 'A');
-    return c;
-}
-
-fn freeSlot() ?usize {
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        if (!entries[i].used or entries[i].state == .unloaded or entries[i].state == .failed) return i;
-    }
-    return null;
-}
-
 fn logState(slot: usize) void {
-    const e = &entries[slot];
+    const e = get(slot) orelse return;
     bootlog.puts("[DRIVER] ");
     bootlog.puts(e.name[0..e.name_len]);
     bootlog.puts(" (");

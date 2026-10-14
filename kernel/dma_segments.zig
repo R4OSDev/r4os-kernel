@@ -1,4 +1,7 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
 pub const page_size: u64 = 4096;
 pub const max_segments: usize = 64;
@@ -9,7 +12,7 @@ pub const Segment = extern struct {
     reserved: u32 = 0,
 };
 
-pub const SegmentList = struct {
+pub const SegmentList = extern struct {
     count: u16 = 0,
     segments: [max_segments]Segment = .{Segment{}} ** max_segments,
 };
@@ -30,156 +33,71 @@ pub const Error = error{
     Overflow,
 };
 
-pub fn buildFromFrames(
-    frames: []const u64,
-    first_offset: u32,
-    bytes: u32,
-    constraints: Constraints,
-) Error!SegmentList {
-    try validateConstraints(constraints);
-    if (bytes == 0 or first_offset >= page_size) return error.InvalidArgument;
-
-    const covered = std.math.add(u64, first_offset, bytes) catch return error.Overflow;
-    const required_frames = (covered + page_size - 1) / page_size;
-    if (required_frames != frames.len) return error.InvalidArgument;
-
-    var result: SegmentList = .{};
-    var remaining: u64 = bytes;
-    var index: usize = 0;
-    while (index < frames.len) : (index += 1) {
-        const frame = frames[index];
-        if ((frame & (page_size - 1)) != 0) return error.InvalidArgument;
-        const offset: u64 = if (index == 0) first_offset else 0;
-        const available = page_size - offset;
-        const take = @min(remaining, available);
-        try appendPhysicalRange(&result, frame + offset, take, constraints);
-        remaining -= take;
-    }
-    if (remaining != 0) return error.InvalidArgument;
-    return result;
+const RawConstraints = extern struct {
+    dma_mask: u64,
+    boundary: u64,
+    max_segment_bytes: u32,
+    alignment: u32,
+    max_segment_count: u16,
+};
+comptime {
+    if (@sizeOf(Segment) != 16 or @sizeOf(SegmentList) != 1032 or @offsetOf(SegmentList, "segments") != 8 or
+        @sizeOf(RawConstraints) != 32 or @offsetOf(RawConstraints, "max_segment_count") != 24)
+        @compileError("Native DMA geometry C layout drift");
 }
-
+extern fn r4os_rust_dma_from_frames(frames: [*]const u64, len: usize, first_offset: u32, bytes: u32, constraints: *const RawConstraints, output: *SegmentList) u8;
+extern fn r4os_rust_dma_constrain(source: *const SegmentList, constraints: *const RawConstraints, output: *SegmentList) u8;
+extern fn r4os_rust_dma_range(output: *SegmentList, start: u64, bytes: u32, constraints: *const RawConstraints, append_existing: bool) u8;
+extern fn r4os_rust_dma_handle(operation: u8, a: u64, b: u64) u64;
+fn raw(c: Constraints) RawConstraints {
+    return .{ .dma_mask = c.dma_mask, .boundary = c.boundary, .max_segment_bytes = c.max_segment_bytes, .alignment = c.alignment, .max_segment_count = c.max_segment_count };
+}
+fn checked(code: u8) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => error.InvalidArgument,
+        2 => error.AddressLimit,
+        3 => error.Alignment,
+        4 => error.TooManySegments,
+        5 => error.Overflow,
+        else => @panic("Invalid native DMA geometry status"),
+    };
+}
+pub fn buildFromFrames(frames: []const u64, first_offset: u32, bytes: u32, constraints: Constraints) Error!SegmentList {
+    const c = raw(constraints);
+    var output: SegmentList = undefined;
+    try checked(r4os_rust_dma_from_frames(frames.ptr, frames.len, first_offset, bytes, &c, &output));
+    return output;
+}
 pub fn constrain(source: *const SegmentList, constraints: Constraints) Error!SegmentList {
-    try validateConstraints(constraints);
-    if (source.count == 0 or source.count > max_segments) return error.InvalidArgument;
-    var result: SegmentList = .{};
-    var index: usize = 0;
-    while (index < source.count) : (index += 1) {
-        const segment = source.segments[index];
-        if (segment.bytes == 0) return error.InvalidArgument;
-        try appendPhysicalRange(&result, segment.phys_addr, segment.bytes, constraints);
-    }
-    return result;
+    const c = raw(constraints);
+    var output: SegmentList = undefined;
+    try checked(r4os_rust_dma_constrain(source, &c, &output));
+    return output;
 }
-
 pub fn singleRange(phys_addr: u64, bytes: u32, constraints: Constraints) Error!SegmentList {
-    try validateConstraints(constraints);
-    if (bytes == 0) return error.InvalidArgument;
-    var result: SegmentList = .{};
-    try appendPhysicalRange(&result, phys_addr, bytes, constraints);
-    return result;
+    const c = raw(constraints);
+    var output: SegmentList = undefined;
+    try checked(r4os_rust_dma_range(&output, phys_addr, bytes, &c, false));
+    return output;
 }
-
 pub fn appendRange(list: *SegmentList, phys_addr: u64, bytes: u32, constraints: Constraints) Error!void {
-    try validateConstraints(constraints);
-    if (bytes == 0) return error.InvalidArgument;
-    try appendPhysicalRange(list, phys_addr, bytes, constraints);
+    const c = raw(constraints);
+    try checked(r4os_rust_dma_range(list, phys_addr, bytes, &c, true));
 }
-
-fn validateConstraints(constraints: Constraints) Error!void {
-    if (constraints.max_segment_count == 0 or constraints.max_segment_count > max_segments) {
-        return error.InvalidArgument;
-    }
-    if (!isPowerOfTwoOrZero(constraints.boundary)) return error.InvalidArgument;
-    if (!isPowerOfTwo(constraints.alignment)) return error.InvalidArgument;
-    if (constraints.boundary != 0 and constraints.boundary < constraints.alignment) {
-        return error.InvalidArgument;
-    }
-}
-
-fn appendPhysicalRange(
-    list: *SegmentList,
-    start: u64,
-    byte_count: u64,
-    constraints: Constraints,
-) Error!void {
-    if (byte_count == 0) return;
-    const last = std.math.add(u64, start, byte_count - 1) catch return error.Overflow;
-    if (last > constraints.dma_mask) return error.AddressLimit;
-    const max_segment_bytes: u64 = if (constraints.max_segment_bytes == 0)
-        std.math.maxInt(u32)
-    else
-        constraints.max_segment_bytes;
-    var current = start;
-    var remaining = byte_count;
-    while (remaining != 0) {
-        var take = @min(remaining, max_segment_bytes);
-        if (constraints.boundary != 0) {
-            const boundary_offset = current & (constraints.boundary - 1);
-            take = @min(take, constraints.boundary - boundary_offset);
-        }
-        // If this physical run needs another descriptor, keep its next start
-        // aligned as well. The final descriptor may have any byte length.
-        if (take < remaining and constraints.alignment > 1) {
-            take &= ~(@as(u64, constraints.alignment) - 1);
-        }
-        if (take == 0 or take > std.math.maxInt(u32)) return error.Overflow;
-
-        if (list.count != 0) {
-            const previous_index: usize = list.count - 1;
-            var previous = &list.segments[previous_index];
-            const previous_end = std.math.add(u64, previous.phys_addr, previous.bytes) catch return error.Overflow;
-            const merged_bytes = @as(u64, previous.bytes) + take;
-            const same_boundary = constraints.boundary == 0 or
-                (previous.phys_addr / constraints.boundary == current / constraints.boundary);
-            if (previous_end == current and merged_bytes <= max_segment_bytes and same_boundary) {
-                previous.bytes = @intCast(merged_bytes);
-                current += take;
-                remaining -= take;
-                continue;
-            }
-        }
-
-        if ((current & (@as(u64, constraints.alignment) - 1)) != 0) return error.Alignment;
-        if (list.count >= constraints.max_segment_count) return error.TooManySegments;
-        const target: usize = list.count;
-        list.segments[target] = .{
-            .phys_addr = current,
-            .bytes = @intCast(take),
-        };
-        list.count += 1;
-        current += take;
-        remaining -= take;
-    }
-}
-
 pub fn nextGeneration(previous: u64) u64 {
-    const generation = (previous +% 1) & 0x00FF_FFFF_FFFF_FFFF;
-    return if (generation == 0) 1 else generation;
+    return r4os_rust_dma_handle(0, previous, 0);
 }
-
 pub fn makeHandle(slot: usize, generation: u64) ?u64 {
-    if (slot >= 255 or generation == 0 or generation > 0x00FF_FFFF_FFFF_FFFF) return null;
-    return (generation << 8) | @as(u64, @intCast(slot + 1));
+    const value = r4os_rust_dma_handle(1, slot, generation);
+    return if (value == 0) null else value;
 }
-
 pub fn handleSlot(handle: u64, capacity: usize) ?usize {
-    const encoded = handle & 0xFF;
-    if (encoded == 0) return null;
-    const slot: usize = @intCast(encoded - 1);
-    return if (slot < capacity) slot else null;
+    const value = r4os_rust_dma_handle(2, handle, capacity);
+    return if (value == std.math.maxInt(u64)) null else @intCast(value);
 }
-
 pub fn handleGeneration(handle: u64) u64 {
-    return handle >> 8;
-}
-
-fn isPowerOfTwo(value: u32) bool {
-    return value != 0 and (value & (value - 1)) == 0;
-}
-
-fn isPowerOfTwoOrZero(value: u64) bool {
-    return value == 0 or (value & (value - 1)) == 0;
+    return r4os_rust_dma_handle(3, handle, 0);
 }
 
 test "non-contiguous frames merge only adjacent physical runs" {

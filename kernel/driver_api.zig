@@ -84,9 +84,6 @@ const MAX_R4D_DMA_MAP_BYTES: u32 = 16 * 1024 * 1024;
 const MAX_MMIO_MAP_BYTES: u64 = 16 * 1024 * 1024;
 const MMIO_MAP_WRITE_COMBINING: u32 = 1 << 0;
 
-const empty_z: [1:0]u8 = .{0};
-var option_value_z: [64:0]u8 = .{0} ** 64;
-
 pub const NetBackendStatus = net.BackendStatus;
 pub const NetBufferSegment = net_backend.BufferSegment;
 pub const NetPacket = net_backend.Packet;
@@ -343,124 +340,13 @@ pub const NetBackendDescriptor = extern struct {
 
 const NET_BACKEND_V1_SIZE: u32 = @intCast(@offsetOf(NetBackendDescriptor, "offered_capabilities"));
 
-const R4DStorageBackend = struct {
-    used: bool = false,
-    owner: u32 = 0,
-    block_index: usize = 0,
-    name: [MAX_R4D_STORAGE_NAME]u8 = .{0} ** MAX_R4D_STORAGE_NAME,
-    name_len: usize = 0,
-    descriptor: *const StorageBackendDescriptor = undefined,
-};
-
-const R4DNetBackend = struct {
-    used: bool = false,
-    owner: u32 = 0,
-    registration_id: u32 = 0,
-    name: [MAX_R4D_NET_NAME]u8 = .{0} ** MAX_R4D_NET_NAME,
-    name_len: usize = 0,
-    descriptor: *const NetBackendDescriptor = undefined,
-    negotiation: NetBackendNegotiation = .{},
-};
-
-const R4DAudioBackend = struct {
-    used: bool = false,
-    owner: u32 = 0,
-    name: [MAX_R4D_AUDIO_NAME]u8 = .{0} ** MAX_R4D_AUDIO_NAME,
-    name_len: usize = 0,
-    descriptor: *const AudioBackendDescriptor = undefined,
-};
-
-var r4d_storage_backends: [MAX_R4D_STORAGE_BACKENDS]R4DStorageBackend = .{R4DStorageBackend{}} ** MAX_R4D_STORAGE_BACKENDS;
-var r4d_net_backends: [MAX_R4D_NET_BACKENDS]R4DNetBackend = .{R4DNetBackend{}} ** MAX_R4D_NET_BACKENDS;
-var r4d_audio_backends: [MAX_R4D_AUDIO_BACKENDS]R4DAudioBackend = .{R4DAudioBackend{}} ** MAX_R4D_AUDIO_BACKENDS;
-
-const DmaAllocation = struct {
-    used: bool = false,
-    owner: u32 = 0,
-    phys_addr: u64 = 0,
-    bytes: u32 = 0,
-};
-
-const DmaPinRecord = struct {
-    used: bool = false,
-    generation: u64 = 0,
-    owner: u32 = 0,
-    virt_addr: u64 = 0,
-    bytes: u32 = 0,
-    page_count: u32 = 0,
-    map_count: u32 = 0,
-};
-
-const DmaMappingRecord = struct {
-    used: bool = false,
-    generation: u64 = 0,
-    owner: u32 = 0,
-    pin_slot: usize = 0,
-    pin_handle: u64 = 0,
-    direction: u32 = DMA_DIRECTION_BIDIRECTIONAL,
-    flags: u32 = 0,
-    original_virt: u64 = 0,
-    requested_bytes: u32 = 0,
-    bounce_phys: u64 = 0,
-    bounce_virt: u64 = 0,
-    bounce_bytes: u32 = 0,
-    device_owned: bool = false,
-    segments: dma_segments.SegmentList = .{},
-};
-
-const MsiKind = enum(u8) {
-    msi,
-    msix,
-};
-
-const MsiAllocation = struct {
-    used: bool = false,
-    kind: MsiKind = .msi,
-    owner: u32 = 0,
-    bus_kind: u8 = 0,
-    bus: u8 = 0,
-    device: u8 = 0,
-    function: u8 = 0,
-    irq: u8 = 0,
-    capability: u16 = 0,
-    original_control: u16 = 0,
-    original_command: u16 = 0,
-    msix_table_virt: u64 = 0,
-    msix_original_address_low: u32 = 0,
-    msix_original_address_high: u32 = 0,
-    msix_original_data: u32 = 0,
-    msix_original_vector_control: u32 = 0,
-};
-
-const MsiOwnerCleanupResult = struct {
+const MsiOwnerCleanupResult = extern struct {
     removed: u32 = 0,
     failed: bool = false,
 };
 
-var current_owner: u32 = 0;
-var current_owner_guard = sync.UnwindGuard.init("r4d-owner");
-
-const StorageCallbackOwner = struct {
-    used: bool = false,
-    task_id: u32 = 0,
-    owner: u32 = 0,
-    depth: u32 = 0,
-};
-
-const StorageCallbackToken = struct {
-    slot: usize,
-    task_id: u32,
-};
-
-var storage_callback_owners: [STORAGE_CALLBACK_OWNER_CAPACITY]StorageCallbackOwner =
-    .{StorageCallbackOwner{}} ** STORAGE_CALLBACK_OWNER_CAPACITY;
-var dma_allocations: [MAX_R4D_DMA_ALLOCATIONS]DmaAllocation = .{DmaAllocation{}} ** MAX_R4D_DMA_ALLOCATIONS;
-var dma_pins: [MAX_R4D_DMA_PINS]DmaPinRecord = .{DmaPinRecord{}} ** MAX_R4D_DMA_PINS;
-var dma_pin_generations: [MAX_R4D_DMA_PINS]u64 = .{0} ** MAX_R4D_DMA_PINS;
-var dma_mappings: [MAX_R4D_DMA_MAPPINGS]DmaMappingRecord = .{DmaMappingRecord{}} ** MAX_R4D_DMA_MAPPINGS;
-var dma_mapping_generations: [MAX_R4D_DMA_MAPPINGS]u64 = .{0} ** MAX_R4D_DMA_MAPPINGS;
-
-pub const OwnerCleanupToken = struct {
+const StorageCallbackToken = extern struct { slot: usize, task_id: u32 };
+pub const OwnerCleanupToken = extern struct {
     owner: u32 = 0,
     storage_plan: StorageCleanupPlan = .{},
     net_mutation_active: bool = false,
@@ -470,358 +356,77 @@ pub const OwnerCleanupToken = struct {
     active: bool = false,
 };
 
-const NetOwnerCleanupResult = struct {
+const NetOwnerCleanupResult = extern struct {
     removed: u32 = 0,
     failed: bool = false,
 };
 
 pub fn enterOwner(owner: u32) bool {
-    return enterOwnerBounded(owner, sync.WAIT_FOREVER);
+    return r4os_rust_driver_api_enter(owner, sync.WAIT_FOREVER);
 }
 
-pub fn enterOwnerBounded(owner: u32, timeout_ticks: u64) bool {
-    if (owner == 0) return false;
-    if (!current_owner_guard.enter(timeout_ticks)) return false;
-    if (current_owner != 0 and current_owner != owner) {
-        _ = current_owner_guard.leave();
-        return false;
-    }
-    current_owner = owner;
-    return true;
+pub fn enterOwnerBounded(owner: u32, ticks: u64) bool {
+    return r4os_rust_driver_api_enter(owner, ticks);
 }
 
 pub fn leaveOwner() bool {
-    if (!current_owner_guard.ownedByCurrent()) return false;
-    if (current_owner_guard.depth == 1) current_owner = 0;
-    return current_owner_guard.leave();
+    return r4os_rust_driver_api_leave();
 }
 
-pub fn bindModuleResources(owner: u32, module_slot: usize) bool {
-    if (current_owner != owner or !current_owner_guard.ownedByCurrent()) return false;
-    const module = @import("modules.zig").entryAt(module_slot) orelse return false;
-    if (module.kind != .r4d) return false;
-    driver_resources.state.bind(owner, module_slot, module.generation) catch return false;
-    const binding = driver_resources.state.current(owner) catch unreachable;
-    if (!driver_threads.bind(owner, binding.epoch)) {
-        driver_resources.state.finish(owner);
-        return false;
-    }
-    if (!driver_semaphores.bind(owner, binding.epoch)) {
-        std.debug.assert(driver_threads.discardEmptyBinding(owner, binding.epoch));
-        driver_resources.state.finish(owner);
-        return false;
-    }
-    if (!gfx_memory.bind(owner, binding.epoch)) {
-        std.debug.assert(driver_semaphores.discardEmptyBinding(owner, binding.epoch));
-        std.debug.assert(driver_threads.discardEmptyBinding(owner, binding.epoch));
-        driver_resources.state.finish(owner);
-        return false;
-    }
-    if (!driver_heap.bind(owner, binding.epoch)) {
-        std.debug.assert(gfx_memory.discardEmptyBinding(owner, binding.epoch));
-        std.debug.assert(driver_semaphores.discardEmptyBinding(owner, binding.epoch));
-        std.debug.assert(driver_threads.discardEmptyBinding(owner, binding.epoch));
-        driver_resources.state.finish(owner);
-        return false;
-    }
-    return true;
+pub fn bindModuleResources(owner: u32, slot: usize) bool {
+    return r4os_rust_driver_api_bind(owner, slot);
 }
 
 pub fn prepareOwnerCleanup(owner: u32) ?OwnerCleanupToken {
-    if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return null;
-    if (display.retainsDriverOwner(owner) or @import("../display/native_driver.zig").retained(owner)) return null;
-    var token = OwnerCleanupToken{ .owner = owner };
-    if (!prepareStorageOwnerCleanup(owner, &token.storage_plan)) return null;
-    if (ownerHasNetBackend(owner)) {
-        if (!net.beginBackendMutation()) {
-            cancelStorageOwnerCleanup(&token.storage_plan);
-            return null;
-        }
-        token.net_mutation_active = true;
-    }
-    if (!display_blit.prepareOwnerCleanup(owner)) {
-        cancelStorageOwnerCleanup(&token.storage_plan);
-        finishOwnerNetMutation(&token);
-        return null;
-    }
-    token.display_blit_prepared = true;
-    if (!setAudioOwnerClosing(owner, true)) {
-        _ = setAudioOwnerClosing(owner, false);
-        display_blit.cancelOwnerCleanup(owner);
-        cancelStorageOwnerCleanup(&token.storage_plan);
-        finishOwnerNetMutation(&token);
-        return null;
-    }
-    token.audio_prepared = true;
-    token.active = true;
-    return token;
+    var token: OwnerCleanupToken = undefined;
+    return if (r4os_rust_driver_cleanup_prepare(owner, &token)) token else null;
 }
 
 pub fn cancelOwnerCleanup(token: *OwnerCleanupToken) bool {
-    if (!token.active or token.shutdown_started or current_owner != token.owner or !current_owner_guard.ownedByCurrent()) return false;
-    cancelStorageOwnerCleanup(&token.storage_plan);
-    finishOwnerNetMutation(token);
-    if (token.display_blit_prepared) display_blit.cancelOwnerCleanup(token.owner);
-    if (token.audio_prepared) _ = setAudioOwnerClosing(token.owner, false);
-    token.active = false;
-    return true;
+    return r4os_rust_driver_cleanup_cancel(token);
 }
 
 pub fn beginOwnerShutdown(token: *OwnerCleanupToken) void {
-    closeOwnerAdmissions(token.owner);
-    token.shutdown_started = true;
-}
-
-fn closeOwnerAdmissions(owner: u32) void {
-    closeOwnerDataAdmissions(owner);
-    driver_threads.beginClose(owner);
-}
-
-fn closeOwnerDataAdmissions(owner: u32) void {
-    driver_resources.state.close(owner);
-    driver_heap.beginClose(owner);
-    driver_semaphores.beginClose(owner);
-    @import("../display/queue.zig").closingDriver(owner);
-    gfx_memory.beginClose(owner);
+    r4os_rust_driver_cleanup_begin(token);
 }
 
 // Unlike unload, a terminal system transition must let DriverShutdown stop
 // an active or partially initialized GPU while its display and DMA remain
 // retained. This path never issues a generic memory/module cleanup permit.
 pub fn beginDisplaySystemTransition(owner: u32) bool {
-    if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return false;
-    if (!display_blit.prepareOwnerCleanup(owner)) return false;
-    closeOwnerDataAdmissions(owner);
-    // Stop existing pacing tasks, but let Shutdown start a bounded cleanup
-    // callback using retained mappings. No new resource/heap/BO admission.
-    driver_threads.stopExisting(owner);
-    return true;
+    return r4os_rust_driver_system_transition(owner, 0);
 }
 
 // Close cleanup-task admission even when Shutdown failed. This is terminal:
 // a live callback still vetoes reset and no generic backing may be freed.
 pub fn endDisplaySystemTransition(owner: u32) bool {
-    if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return false;
-    driver_threads.beginClose(owner);
-    return true;
+    return r4os_rust_driver_system_transition(owner, 1);
 }
 
 // Called only after the driver's explicit successful hardware shutdown.
 // A remaining display, GPU job, mapping or dedicated callback vetoes warm
 // reset. Shared Work is cancelled/drained before it can restart the device.
 pub fn displaySystemTransitionQuiesced(owner: u32) bool {
-    if (owner == 0 or current_owner != owner or !current_owner_guard.ownedByCurrent()) return false;
-    if (display.retainsDriverOwner(owner) or @import("../display/native_driver.zig").retained(owner) or
-        gfx_memory.retained(owner) or @import("../display/queue.zig").retainsDriver(owner) or
-        !driver_threads.callbacksQuiesced(owner)) return false;
-    if (!driver_work.cleanupOwner(owner).quiesced) return false;
-    // An admission before close may finish while shared Work is draining.
-    return !gfx_memory.retained(owner) and !@import("../display/queue.zig").retainsDriver(owner);
+    return r4os_rust_driver_system_transition(owner, 2);
 }
 
 pub fn quarantineOwnerCleanup(token: *OwnerCleanupToken) bool {
-    if (!token.active or !token.shutdown_started or current_owner != token.owner or !current_owner_guard.ownedByCurrent()) return false;
-    cancelStorageOwnerCleanup(&token.storage_plan);
-    quarantineOwnerNetMutation(token);
-    token.active = false;
-    return true;
-}
-
-fn finishOwnerNetMutation(token: *OwnerCleanupToken) void {
-    if (!token.net_mutation_active) return;
-    net.endBackendMutation();
-    token.net_mutation_active = false;
-}
-
-fn quarantineOwnerNetMutation(token: *OwnerCleanupToken) void {
-    if (!token.net_mutation_active) return;
-    net.quarantineBackendMutation();
-    token.net_mutation_active = false;
+    return r4os_rust_driver_cleanup_quarantine(token);
 }
 
 pub fn commitOwnerCleanup(token: *OwnerCleanupToken) bool {
-    if (!token.active or token.owner == 0 or current_owner != token.owner or !current_owner_guard.ownedByCurrent()) return false;
-    const owner = token.owner;
-
-    // A prepared token only closes admissions. Destructive cleanup is legal
-    // after the owning R4D has explicitly started its top-level shutdown.
-    if (!token.shutdown_started) {
-        cancelStorageOwnerCleanup(&token.storage_plan);
-        finishOwnerNetMutation(token);
-        if (token.display_blit_prepared) display_blit.cancelOwnerCleanup(owner);
-        if (token.audio_prepared) _ = setAudioOwnerClosing(owner, false);
-        token.active = false;
-        return false;
-    }
-    // DriverShutdown gets the opportunity to stop engines and release its
-    // maps. A retained use afterwards vetoes every generic resource free.
-    if (!driver_threads.callbacksQuiesced(owner)) {
-        _ = quarantineOwnerCleanup(token);
-        var message: [128]u8 = undefined;
-        bootlog.puts(std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} thread-callbacks=active resources=quarantined\r\n", .{owner}) catch unreachable);
-        return false;
-    }
-    if (gfx_memory.retained(owner) or @import("../display/queue.zig").retainsDriver(owner)) {
-        _ = quarantineOwnerCleanup(token);
-        return false;
-    }
-
-    // Backend finalizers run while every storage admission is stopped and all
-    // generic owner resources (IRQ, work, DMA, USB and network) still exist.
-    // The top-level R4D shutdown is the first unload veto. Backend finalizers
-    // are checked again under closed callback admission; any failure stops
-    // generic IRQ/work/DMA release and quarantines the remaining ownership.
-    const storage_cleanup = commitStorageOwnerCleanup(&token.storage_plan);
-    if (storage_cleanup.remaining != 0) {
-        quarantineOwnerNetMutation(token);
-        token.active = false;
-        return false;
-    }
-
-    // Backend finalizers must run before their generic IRQ/work/DMA resources
-    // disappear. In particular, a network backend may still need its MMIO,
-    // IRQ registration and tracked DMA region to prove a safe device stop.
-    const net_cleanup = cleanupNetOwner(owner);
-    if (net_cleanup.failed) {
-        quarantineOwnerNetMutation(token);
-        token.active = false;
-        bootlog.puts("[R4D] cleanup owner=");
-        bootlog.putDec(owner);
-        bootlog.puts(" net-finalize=FAILED resources=quarantined\r\n");
-        return false;
-    }
-    finishOwnerNetMutation(token);
-    const display_blit_count = display_blit.cleanupOwner(owner);
-    const audio_cleanup = cleanupAudioOwner(owner);
-    if (audio_cleanup.failed) {
-        token.active = false;
-        bootlog.puts("[R4D] audio-finalize=FAILED resources=quarantined\r\n");
-        return false;
-    }
-    const audio_count = audio_cleanup.removed;
-    const usb_host_cleanup = usb_host.cleanupOwner(owner);
-    if (usb_host_cleanup.failed) {
-        token.active = false;
-        bootlog.puts("[R4D] cleanup owner=");
-        bootlog.putDec(owner);
-        bootlog.puts(" usb-host-finalize=FAILED resources=quarantined\r\n");
-        return false;
-    }
-    const msi_cleanup = cleanupMsiOwner(owner);
-    if (msi_cleanup.failed) {
-        token.active = false;
-        bootlog.puts("[R4D] cleanup owner=");
-        bootlog.putDec(owner);
-        bootlog.puts(" msi-disable=FAILED resources=quarantined\r\n");
-        return false;
-    }
-    const irq_count = irq_router.cleanupOwner(owner);
-    const work_cleanup = driver_work.cleanupOwner(owner);
-    if (!work_cleanup.quiesced) {
-        token.active = false;
-        bootlog.puts("[R4D] cleanup owner=");
-        bootlog.putDec(owner);
-        bootlog.puts(" work-quiesce=FAILED dma=retained resources=quarantined\r\n");
-        return false;
-    }
-    // Work now owns common BO operations. A call admitted before close can
-    // finish after the earlier retention check; recheck after quiescence,
-    // before any generic DMA/heap/module destruction.
-    if (gfx_memory.retained(owner) or @import("../display/queue.zig").retainsDriver(owner)) {
-        token.active = false;
-        bootlog.puts("[R4D] cleanup work=quiesced graphics=retained resources=quarantined\r\n");
-        return false;
-    }
-    const work_count = work_cleanup.removed;
-    const thread_cleanup = driver_threads.cleanup(owner);
-    if (!thread_cleanup.quiesced) {
-        token.active = false;
-        bootlog.puts("[R4D] cleanup owner=");
-        bootlog.putDec(owner);
-        bootlog.puts(" threads=retained dma=retained cpu-heap=retained resources=quarantined\r\n");
-        return false;
-    }
-    const semaphore_cleanup = driver_semaphores.cleanup(owner);
-    if (!semaphore_cleanup.quiesced) {
-        token.active = false;
-        bootlog.puts("[R4D] cleanup owner=");
-        bootlog.putDec(owner);
-        bootlog.puts(" semaphores=retained dma=retained cpu-heap=retained resources=quarantined\r\n");
-        return false;
-    }
-    const dma_count = cleanupDmaOwner(owner);
-    const cpu_cleanup = driver_heap.cleanup(owner);
-    if (!cpu_cleanup.quiesced) {
-        token.active = false;
-        bootlog.puts("[R4D] cleanup owner=");
-        bootlog.putDec(owner);
-        bootlog.puts(" cpu-heap=retained resources=quarantined\r\n");
-        return false;
-    }
-    @import("../driver/input/platform_input.zig").remove(owner);
-    driver_resources.state.finish(owner);
-    gfx_memory.finishOwner(owner);
-    token.active = false;
-
-    if (irq_count == 0 and
-        work_count == 0 and
-        thread_cleanup.released == 0 and
-        semaphore_cleanup.released == 0 and
-        dma_count == 0 and
-        cpu_cleanup.released == 0 and
-        msi_cleanup.removed == 0 and
-        audio_count == 0 and
-        storage_cleanup.removed == 0 and
-        usb_host_cleanup.removed == 0 and
-        display_blit_count == 0 and
-        net_cleanup.removed == 0)
-    {
-        return true;
-    }
-    // Name ties the generic owner result to the driver's diagnostic records.
-    // Publish one complete bounded line so concurrent log writers cannot
-    // splice a different driver's text into the release accounting.
-    const entry = @import("../driver/registry.zig").get(owner - 1);
-    const name = if (entry) |*item| item.name[0..item.name_len] else "unknown";
-    var message: [640]u8 = undefined;
-    const line = std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} irq={d} work={d} threads={d} semaphores={d} dma={d} cpu-heap={d} cpu-bytes={d} msi={d} audio={d} storage={d} usb-host={d} display-blit={d} net={d} name={s} result=complete\r\n", .{ owner, irq_count, work_count, thread_cleanup.released, semaphore_cleanup.released, dma_count, cpu_cleanup.released, cpu_cleanup.bytes, msi_cleanup.removed, audio_count, storage_cleanup.removed, usb_host_cleanup.removed, display_blit_count, net_cleanup.removed, name }) catch unreachable;
-    bootlog.puts(line);
-    return true;
+    return r4os_rust_driver_cleanup_commit(token);
 }
 
 pub fn cleanupOwner(owner: u32) bool {
-    if (owner == 0) return true;
-    if (!enterOwner(owner)) return false;
-    defer _ = leaveOwner();
-    var token = prepareOwnerCleanup(owner) orelse {
-        bootlog.puts("[R4D] cleanup veto owner=");
-        bootlog.putDec(owner);
-        bootlog.puts(" backend-busy\r\n");
-        return false;
-    };
-    return commitOwnerCleanup(&token);
+    return r4os_rust_driver_cleanup(owner);
 }
 
 /// Snapshot the owner-provided status for a registered R4D block backend.
 /// This is an internal diagnostic projection: it neither changes backend
 /// admission nor exposes another public ABI surface.
-pub fn queryStorageBackendStatus(block_index: usize, out: *StorageBackendStatus) bool {
-    out.* = .{
-        .state = 0,
-        .last_error = 0,
-        .last_lba = 0,
-        .last_sectors = 0,
-        .recoveries = 0,
-        .recovery_failures = 0,
-    };
-    for (&r4d_storage_backends) |*backend| {
-        if (!backend.used or backend.block_index != block_index) continue;
-        const status = backend.descriptor.status orelse return false;
-        const callback = enterStorageCallback(backend.owner) orelse return false;
-        defer leaveStorageCallback(callback);
-        return status(backend.descriptor.context, out) == 0;
-    }
-    return false;
+pub fn queryStorageBackendStatus(index: usize, out: *StorageBackendStatus) bool {
+    return r4os_rust_driver_storage_status(index, out);
 }
 
 pub const Table = extern struct {
@@ -940,7 +545,7 @@ comptime {
         @compileError("DriverApi v36 appended owned Work layout drift");
 }
 
-pub var table = Table{
+const table_template = Table{
     .magic = MAGIC,
     .version = VERSION,
     .gfx_memory_query = gfxMemoryQuery,
@@ -1028,39 +633,39 @@ pub var table = Table{
 };
 
 fn logInfo(text: [*:0]const u8) callconv(.c) void {
-    log_event.driver(log_event.Severity.info, runtimeOwner(), text);
+    r4os_rust_driver_log(0, text);
 }
 
 fn logWarn(text: [*:0]const u8) callconv(.c) void {
-    log_event.driver(log_event.Severity.warn, runtimeOwner(), text);
+    r4os_rust_driver_log(1, text);
 }
 
 fn logError(text: [*:0]const u8) callconv(.c) void {
-    log_event.driver(log_event.Severity.err, runtimeOwner(), text);
+    r4os_rust_driver_log(2, text);
 }
 
 fn portInb(port: u16) callconv(.c) u8 {
-    return io.inb(port);
+    return r4os_rust_driver_port_inb(port);
 }
 
 fn portOutb(port: u16, value: u8) callconv(.c) void {
-    io.outb(port, value);
+    r4os_rust_driver_port_outb(port, value);
 }
 
 fn portInw(port: u16) callconv(.c) u16 {
-    return io.inw(port);
+    return r4os_rust_driver_port_inw(port);
 }
 
 fn portOutw(port: u16, value: u16) callconv(.c) void {
-    io.outw(port, value);
+    r4os_rust_driver_port_outw(port, value);
 }
 
 fn portInl(port: u16) callconv(.c) u32 {
-    return io.inl(port);
+    return r4os_rust_driver_port_inl(port);
 }
 
 fn portOutl(port: u16, value: u32) callconv(.c) void {
-    io.outl(port, value);
+    r4os_rust_driver_port_outl(port, value);
 }
 
 fn tickCount() callconv(.c) u64 {
@@ -1072,211 +677,45 @@ fn timerFrequency() callconv(.c) u32 {
 }
 
 fn waitTicks(ticks: u64) callconv(.c) void {
-    if (ticks == 0) return;
-    if (irq_router.inDispatch()) {
-        driver_work.noteSleepDeniedFromIrq();
-        return;
-    }
-    driver_work.noteSleepWait(ticks);
-    if (scheduler.current() != null) {
-        scheduler.sleepTicksWithReason(ticks, "driver-wait");
-        return;
-    }
-    waitBootTicks(ticks);
-}
-
-fn waitBootTicks(ticks: u64) void {
-    const start = timer.tickCount();
-    interrupts.enable();
-    while (timer.tickCount() - start < ticks) {
-        asm volatile ("pause");
-    }
-    interrupts.disable();
+    r4os_rust_driver_wait_ticks(ticks);
 }
 
 fn allocDmaBuffer(bytes: u32, alignment: u32) callconv(.c) u64 {
-    var buffer: DmaBuffer = .{};
-    if (allocDmaRegion(bytes, alignment, &buffer) != 0) return 0;
-    return buffer.phys_addr;
+    return r4os_rust_driver_dma_allocate_legacy(bytes, alignment);
 }
+extern fn r4os_rust_driver_dma_allocate_legacy(bytes: u32, alignment: u32) u64;
 
-fn freeDmaBuffer(phys_addr: u64, bytes: u32) callconv(.c) void {
+fn freeDmaBuffer(physical: u64, bytes: u32) callconv(.c) void {
     _ = bytes;
-    if (phys_addr == 0) return;
-    const allocation = takeDmaAllocation(activeOwner(), phys_addr) orelse return;
-    const frames = frameCount(allocation.bytes) orelse return;
-    phys.freeContiguousFrames(allocation.phys_addr, frames);
+    r4os_rust_driver_dma_free_physical(physical);
 }
 
 fn allocDmaRegion(bytes: u32, alignment: u32, out: *DmaBuffer) callconv(.c) i32 {
     return allocDmaRegionConstrained(bytes, alignment, std.math.maxInt(u64), out);
 }
 
-fn allocDmaRegionConstrained(bytes: u32, alignment: u32, max_phys_addr: u64, out: *DmaBuffer) callconv(.c) i32 {
-    out.* = .{};
-    const owner = activeOwner();
-    if (owner == 0 or irq_router.inDispatch()) return -6;
-    const dma_alignment = if (alignment == 0) @as(u32, @intCast(phys.FRAME_SIZE)) else alignment;
-    if (bytes == 0) return -1;
-    if (@as(u64, dma_alignment) > phys.FRAME_SIZE) return -2;
-    const frames = frameCount(bytes) orelse return -3;
-    const phys_addr = phys.allocContiguousFramesBelow(frames, max_phys_addr) orelse return -4;
-    const virt_addr = phys.physToVirt(phys_addr);
-    const total_bytes = frames * phys.FRAME_SIZE;
-    const data: [*]u8 = @ptrFromInt(virt_addr);
-    @memset(data[0..@intCast(total_bytes)], 0);
-    if (!trackDmaAllocation(owner, phys_addr, @intCast(total_bytes))) {
-        phys.freeContiguousFrames(phys_addr, frames);
-        return -5;
-    }
-    out.* = .{
-        .phys_addr = phys_addr,
-        .virt_addr = virt_addr,
-        .bytes = @intCast(total_bytes),
-        .alignment = dma_alignment,
-        .flags = 0,
-        .reserved = 0,
-    };
-    return 0;
+fn allocDmaRegionConstrained(bytes: u32, alignment: u32, maximum: u64, out: *DmaBuffer) callconv(.c) i32 {
+    return r4os_rust_driver_dma_allocate(bytes, alignment, maximum, out);
 }
 
-fn freeDmaRegion(buffer: *DmaBuffer) callconv(.c) void {
-    if (buffer.phys_addr == 0 or buffer.bytes == 0) {
-        buffer.* = .{};
-        return;
-    }
-    if (irq_router.inDispatch()) return;
-    const allocation = takeDmaAllocation(activeOwner(), buffer.phys_addr) orelse return;
-    const frames = frameCount(allocation.bytes) orelse 0;
-    if (frames > 0) phys.freeContiguousFrames(allocation.phys_addr, frames);
-    buffer.* = .{};
+fn freeDmaRegion(out: *DmaBuffer) callconv(.c) void {
+    r4os_rust_driver_dma_free(out);
 }
 
-fn dmaPinBuffer(virt_addr: u64, bytes: u32, flags: u32, out: *DmaPinnedBuffer) callconv(.c) i32 {
-    out.* = .{};
-    const owner = activeOwner();
-    if (owner == 0 or irq_router.inDispatch()) return -1;
-    if (virt_addr == 0 or bytes == 0 or bytes > MAX_R4D_DMA_MAP_BYTES or flags != 0) return -2;
-    const end = std.math.add(u64, virt_addr, bytes) catch return -2;
-    if (end > std.math.maxInt(u64) - (phys.FRAME_SIZE - 1)) return -2;
-    const first_page = alignDown(virt_addr, phys.FRAME_SIZE);
-    const last_page_end = alignUp(end, phys.FRAME_SIZE);
-    if (last_page_end <= first_page) return -2;
-    const page_count_u64 = (last_page_end - first_page) / phys.FRAME_SIZE;
-    if (page_count_u64 == 0 or page_count_u64 > std.math.maxInt(u32)) return -2;
-
-    var page_index: u64 = 0;
-    while (page_index < page_count_u64) : (page_index += 1) {
-        const virt_page = first_page + page_index * phys.FRAME_SIZE;
-        _ = dmaPhysicalPage(virt_page) orelse return -3;
-    }
-
-    const slot = freeDmaPinSlot() orelse return -5;
-    dma_pin_generations[slot] = dma_segments.nextGeneration(dma_pin_generations[slot]);
-    const handle = dma_segments.makeHandle(slot, dma_pin_generations[slot]) orelse return -5;
-    dma_pins[slot] = .{
-        .used = true,
-        .generation = dma_pin_generations[slot],
-        .owner = owner,
-        .virt_addr = virt_addr,
-        .bytes = bytes,
-        .page_count = @intCast(page_count_u64),
-    };
-    out.* = .{
-        .handle = handle,
-        .virt_addr = virt_addr,
-        .bytes = bytes,
-        .page_count = @intCast(page_count_u64),
-        .flags = flags,
-    };
-    return 0;
+fn dmaPinBuffer(address: u64, bytes: u32, flags: u32, out: *DmaPinnedBuffer) callconv(.c) i32 {
+    return r4os_rust_driver_dma_pin(address, bytes, flags, out);
 }
 
-fn dmaMapPinned(pin: *const DmaPinnedBuffer, constraints: *const DmaConstraints, direction: u32, out: *DmaMapping) callconv(.c) i32 {
-    out.* = .{};
-    const owner = activeOwner();
-    if (owner == 0 or irq_router.inDispatch()) return -1;
-    if (!validDmaPinHeader(pin) or !validDmaConstraints(constraints) or !validDmaDirection(direction)) return -2;
-    const pin_slot = dma_segments.handleSlot(pin.handle, dma_pins.len) orelse return -3;
-    var pinned = &dma_pins[pin_slot];
-    if (!pinned.used or pinned.owner != owner or pinned.generation != dma_segments.handleGeneration(pin.handle) or
-        pinned.virt_addr != pin.virt_addr or pinned.bytes != pin.bytes)
-    {
-        return -3;
-    }
-    if (pinned.map_count == std.math.maxInt(u32)) return -4;
-    const mapping_slot = freeDmaMappingSlot() orelse return -5;
-    const normalized = dmaSegmentConstraints(constraints.*) orelse return -2;
-
-    var mapped_segments = buildPinnedDmaSegments(pinned, normalized) catch |err| switch (err) {
-        error.InvalidArgument, error.Overflow => return -2,
-        error.AddressLimit, error.Alignment, error.TooManySegments => blk: {
-            if ((constraints.flags & DMA_FLAG_ALLOW_BOUNCE) == 0) return -6;
-            break :blk dma_segments.SegmentList{};
-        },
-    };
-    var bounce_phys: u64 = 0;
-    var bounce_virt: u64 = 0;
-    var bounce_bytes: u32 = 0;
-    var mapping_flags: u32 = constraints.flags;
-    if (mapped_segments.count == 0) {
-        const frames = frameCount(pinned.bytes) orelse return -2;
-        bounce_phys = phys.allocContiguousFramesBelow(frames, constraints.dma_mask) orelse return -7;
-        const allocated_bytes = frames * phys.FRAME_SIZE;
-        if (allocated_bytes > std.math.maxInt(u32)) {
-            phys.freeContiguousFrames(bounce_phys, frames);
-            return -7;
-        }
-        bounce_bytes = @intCast(allocated_bytes);
-        bounce_virt = phys.physToVirt(bounce_phys);
-        mapped_segments = dma_segments.singleRange(bounce_phys, pinned.bytes, normalized) catch {
-            phys.freeContiguousFrames(bounce_phys, frames);
-            return -7;
-        };
-        const bounce: [*]u8 = @ptrFromInt(bounce_virt);
-        @memset(bounce[0..bounce_bytes], 0);
-        mapping_flags |= DMA_MAPPING_FLAG_BOUNCED;
-    }
-
-    dma_mapping_generations[mapping_slot] = dma_segments.nextGeneration(dma_mapping_generations[mapping_slot]);
-    const handle = dma_segments.makeHandle(mapping_slot, dma_mapping_generations[mapping_slot]) orelse {
-        if (bounce_phys != 0) phys.freeContiguousFrames(bounce_phys, frameCount(bounce_bytes) orelse 0);
-        return -5;
-    };
-    dma_mappings[mapping_slot] = .{
-        .used = true,
-        .generation = dma_mapping_generations[mapping_slot],
-        .owner = owner,
-        .pin_slot = pin_slot,
-        .pin_handle = pin.handle,
-        .direction = direction,
-        .flags = mapping_flags,
-        .original_virt = pinned.virt_addr,
-        .requested_bytes = pinned.bytes,
-        .bounce_phys = bounce_phys,
-        .bounce_virt = bounce_virt,
-        .bounce_bytes = bounce_bytes,
-        .segments = mapped_segments,
-    };
-    pinned.map_count += 1;
-    if (!syncMappingForDevice(&dma_mappings[mapping_slot])) {
-        releaseDmaMapping(mapping_slot, false);
-        return -8;
-    }
-    out.* = mappingDescriptor(handle, &dma_mappings[mapping_slot]);
-    return 0;
+fn dmaMapPinned(pin: *const DmaPinnedBuffer, c: *const DmaConstraints, direction: u32, out: *DmaMapping) callconv(.c) i32 {
+    return r4os_rust_driver_dma_map(pin, c, direction, out);
 }
 
 fn dmaSyncForDevice(mapping: *const DmaMapping) callconv(.c) i32 {
-    if (irq_router.inDispatch()) return -1;
-    const slot = dmaMappingSlotForOwner(mapping.handle, activeOwner()) orelse return -2;
-    return if (syncMappingForDevice(&dma_mappings[slot])) 0 else -3;
+    return r4os_rust_driver_dma_sync(mapping, false, false, 0, 0);
 }
 
 fn dmaSyncForCpu(mapping: *const DmaMapping) callconv(.c) i32 {
-    if (irq_router.inDispatch()) return -1;
-    const slot = dmaMappingSlotForOwner(mapping.handle, activeOwner()) orelse return -2;
-    return if (syncMappingForCpu(&dma_mappings[slot])) 0 else -3;
+    return r4os_rust_driver_dma_sync(mapping, true, false, 0, 0);
 }
 
 fn dmaSyncRangeForDevice(mapping: *const DmaMapping, offset: u32, bytes: u32) callconv(.c) i32 {
@@ -1288,208 +727,30 @@ fn dmaSyncRangeForCpu(mapping: *const DmaMapping, offset: u32, bytes: u32) callc
 }
 
 fn dmaSyncRange(mapping: *const DmaMapping, offset: u32, bytes: u32, phase: dma_sync_range.Phase) i32 {
-    // Preserve the audited init/shutdown/Driver Work admission. Dedicated
-    // tasks and IRQ/storage callbacks do not gain legacy DMA access here.
-    const owner = activeOwner();
-    if (owner == 0 or irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return -1;
-    if (mapping.version != DMA_ABI_VERSION or mapping.size < @sizeOf(DmaMapping) or mapping.handle == 0) return -2;
-    const slot = dmaMappingSlotForOwner(mapping.handle, owner) orelse return -3;
-    // Bounds/direction/backing come from the actual retained record, never
-    // from modifiable descriptor lengths, flags or caller-supplied addresses.
-    return if (syncMappingRange(&dma_mappings[slot], phase, offset, bytes)) 0 else -2;
+    return r4os_rust_driver_dma_sync(mapping, phase == .cpu, true, offset, bytes);
 }
 
-fn dmaUnmap(mapping: *DmaMapping) callconv(.c) i32 {
-    if (irq_router.inDispatch()) return -1;
-    const slot = dmaMappingSlotForOwner(mapping.handle, activeOwner()) orelse return -2;
-    releaseDmaMapping(slot, true);
-    mapping.* = .{};
-    return 0;
+fn dmaUnmap(out: *DmaMapping) callconv(.c) i32 {
+    return r4os_rust_driver_dma_unmap(out);
 }
 
-fn dmaUnpinBuffer(pin: *DmaPinnedBuffer) callconv(.c) i32 {
-    if (irq_router.inDispatch()) return -1;
-    const owner = activeOwner();
-    const slot = dma_segments.handleSlot(pin.handle, dma_pins.len) orelse return -2;
-    const record = &dma_pins[slot];
-    if (!record.used or record.owner != owner or record.generation != dma_segments.handleGeneration(pin.handle)) return -2;
-    if (record.map_count != 0) return -3;
-    record.* = .{};
-    pin.* = .{};
-    return 0;
-}
-
-fn validDmaPinHeader(pin: *const DmaPinnedBuffer) bool {
-    return pin.version == DMA_ABI_VERSION and pin.size >= @sizeOf(DmaPinnedBuffer) and pin.handle != 0;
-}
-
-fn validDmaConstraints(constraints: *const DmaConstraints) bool {
-    const mode = constraints.flags & (DMA_FLAG_COHERENT | DMA_FLAG_STREAMING);
-    const known = DMA_FLAG_COHERENT | DMA_FLAG_STREAMING | DMA_FLAG_ALLOW_BOUNCE;
-    return constraints.version == DMA_ABI_VERSION and
-        constraints.size >= @sizeOf(DmaConstraints) and
-        constraints.reserved == 0 and
-        constraints.max_segments != 0 and
-        constraints.max_segments <= dma_segments.max_segments and
-        constraints.alignment != 0 and
-        constraints.alignment <= phys.FRAME_SIZE and
-        mode != 0 and mode != (DMA_FLAG_COHERENT | DMA_FLAG_STREAMING) and
-        (constraints.flags & ~known) == 0;
-}
-
-fn validDmaDirection(direction: u32) bool {
-    return direction == DMA_DIRECTION_BIDIRECTIONAL or
-        direction == DMA_DIRECTION_TO_DEVICE or
-        direction == DMA_DIRECTION_FROM_DEVICE;
-}
-
-fn dmaSegmentConstraints(constraints: DmaConstraints) ?dma_segments.Constraints {
-    if (constraints.boundary != 0 and (constraints.boundary & (constraints.boundary - 1)) != 0) return null;
-    if ((constraints.alignment & (constraints.alignment - 1)) != 0) return null;
-    return .{
-        .dma_mask = constraints.dma_mask,
-        .boundary = constraints.boundary,
-        .max_segment_bytes = constraints.max_segment_bytes,
-        .alignment = constraints.alignment,
-        .max_segment_count = constraints.max_segments,
-    };
-}
-
-fn buildPinnedDmaSegments(
-    pinned: *const DmaPinRecord,
-    constraints: dma_segments.Constraints,
-) dma_segments.Error!dma_segments.SegmentList {
-    const end = std.math.add(u64, pinned.virt_addr, pinned.bytes) catch return error.Overflow;
-    if (end > std.math.maxInt(u64) - (phys.FRAME_SIZE - 1)) return error.Overflow;
-    const first_page = alignDown(pinned.virt_addr, phys.FRAME_SIZE);
-    const last_page_end = alignUp(end, phys.FRAME_SIZE);
-    const page_count = (last_page_end - first_page) / phys.FRAME_SIZE;
-    if (page_count != pinned.page_count) return error.InvalidArgument;
-
-    var result: dma_segments.SegmentList = .{};
-    var remaining: u64 = pinned.bytes;
-    var page_index: u64 = 0;
-    while (page_index < page_count) : (page_index += 1) {
-        const virt_page = first_page + page_index * phys.FRAME_SIZE;
-        const frame = dmaPhysicalPage(virt_page) orelse return error.InvalidArgument;
-        const offset: u64 = if (page_index == 0) pinned.virt_addr - first_page else 0;
-        const take: u32 = @intCast(@min(remaining, phys.FRAME_SIZE - offset));
-        try dma_segments.appendRange(&result, frame + offset, take, constraints);
-        remaining -= take;
-    }
-    if (remaining != 0) return error.InvalidArgument;
-    return result;
-}
-
-fn dmaPhysicalPage(virt_page: u64) ?u64 {
-    if ((virt_page & (phys.FRAME_SIZE - 1)) != 0) return null;
-    const direct_base = phys.physToVirt(0);
-    const physical_bytes = std.math.mul(u64, phys.stats().total_frames, phys.FRAME_SIZE) catch return null;
-    const direct_end = std.math.add(u64, direct_base, physical_bytes) catch return null;
-    if (virt_page >= direct_base and virt_page < direct_end) return virt_page - direct_base;
-    if (virt_page >= memory_layout.MMIO_BASE and virt_page < memory_layout.FRAMEBUFFER_END) return null;
-    return paging.mappedFrame(virt_page);
-}
-
-fn freeDmaPinSlot() ?usize {
-    // Iterate the resident tables by reference. Iterating these fixed arrays
-    // by value asks Zig to materialize a complete snapshot in the caller's
-    // stack frame; with the v19 mapping capacity that can exceed a runtime
-    // worker stack before the first DMA mapping is even inspected.
-    for (&dma_pins, 0..) |*pin, index| if (!pin.used) return index;
-    return null;
-}
-
-fn freeDmaMappingSlot() ?usize {
-    for (&dma_mappings, 0..) |*mapping, index| if (!mapping.used) return index;
-    return null;
-}
-
-fn dmaMappingSlotForOwner(handle: u64, owner: u32) ?usize {
-    if (owner == 0) return null;
-    const slot = dma_segments.handleSlot(handle, dma_mappings.len) orelse return null;
-    const mapping = &dma_mappings[slot];
-    if (!mapping.used or mapping.owner != owner or mapping.generation != dma_segments.handleGeneration(handle)) return null;
-    return slot;
-}
-
-fn mappingDescriptor(handle: u64, mapping: *const DmaMappingRecord) DmaMapping {
-    var out = DmaMapping{
-        .handle = handle,
-        .pin_handle = mapping.pin_handle,
-        .requested_bytes = mapping.requested_bytes,
-        .mapped_bytes = mapping.requested_bytes,
-        .direction = mapping.direction,
-        .flags = mapping.flags,
-        .segment_count = mapping.segments.count,
-    };
-    @memcpy(out.segments[0..], mapping.segments.segments[0..]);
-    return out;
-}
-
-fn syncMappingForDevice(mapping: *DmaMappingRecord) bool {
-    return syncMappingRange(mapping, .device, 0, mapping.requested_bytes);
-}
-
-fn syncMappingForCpu(mapping: *DmaMappingRecord) bool {
-    return syncMappingRange(mapping, .cpu, 0, mapping.requested_bytes);
-}
-
-fn syncMappingRange(mapping: *DmaMappingRecord, phase: dma_sync_range.Phase, offset: u32, bytes: u32) bool {
-    if (!mapping.used) return false;
-    const original: [*]u8 = @ptrFromInt(mapping.original_virt);
-    const bounce: ?[]u8 = if (mapping.bounce_virt == 0) null else blk: {
-        const pointer: [*]u8 = @ptrFromInt(mapping.bounce_virt);
-        break :blk pointer[0..mapping.requested_bytes];
-    };
-    if (!dma_sync_range.synchronize(original[0..mapping.requested_bytes], bounce, @enumFromInt(mapping.direction), phase, offset, bytes)) return false;
-    // A partial transfer cannot label the whole mapping CPU/device-owned.
-    if (offset == 0 and bytes == mapping.requested_bytes) mapping.device_owned = phase == .device;
-    return true;
-}
-
-fn releaseDmaMapping(slot: usize, copy_back: bool) void {
-    if (slot >= dma_mappings.len or !dma_mappings[slot].used) return;
-    const mapping = &dma_mappings[slot];
-    if (copy_back) _ = syncMappingForCpu(mapping);
-    if (mapping.bounce_phys != 0 and mapping.bounce_bytes != 0) {
-        const frames = frameCount(mapping.bounce_bytes) orelse 0;
-        if (frames != 0) phys.freeContiguousFrames(mapping.bounce_phys, frames);
-    }
-    if (mapping.pin_slot < dma_pins.len and dma_pins[mapping.pin_slot].used and dma_pins[mapping.pin_slot].map_count != 0) {
-        dma_pins[mapping.pin_slot].map_count -= 1;
-    }
-    mapping.* = .{};
-}
-
-fn frameCount(bytes: u32) ?u64 {
-    if (bytes == 0) return null;
-    const total = alignUp(@as(u64, bytes), phys.FRAME_SIZE);
-    return total / phys.FRAME_SIZE;
+fn dmaUnpinBuffer(out: *DmaPinnedBuffer) callconv(.c) i32 {
+    return r4os_rust_driver_dma_unpin(out);
 }
 
 fn requestIrq(irq: u8, handler: *const anyopaque) callconv(.c) i32 {
     _ = irq;
     _ = handler;
-    bootlog.puts("[R4D][WARN] request_irq not implemented yet\r\n");
-    return -1;
+    return r4os_rust_driver_irq_legacy(false);
 }
 
 fn releaseIrq(irq: u8) callconv(.c) i32 {
     _ = irq;
-    bootlog.puts("[R4D][WARN] release_irq not implemented yet\r\n");
-    return -1;
+    return r4os_rust_driver_irq_legacy(true);
 }
 
 fn irqRegister(irq: u8, handler: IrqHandler, context: usize, flags: u32) callconv(.c) i32 {
-    const owner = activeOwner();
-    const registered = irq_router.register(irq, handler, context, flags, owner);
-    if (registered != 0) return registered;
-    if ((flags & irq_router.IRQ_FLAG_MSI) != 0 and !unmaskRegisteredMsix(owner, irq)) {
-        _ = irq_router.unregister(irq, handler, context);
-        return -5;
-    }
-    return 0;
+    return r4os_rust_driver_irq_register(irq, handler, context, flags);
 }
 
 fn irqUnregister(irq: u8, handler: IrqHandler, context: usize) callconv(.c) i32 {
@@ -1500,46 +761,23 @@ fn irqStats(irq: u8, out: *IrqStats) callconv(.c) i32 {
     return irq_router.stats(irq, out);
 }
 
-fn driverWorkSubmit(handler: DriverWorkHandler, context: usize, flags: u32, out_handle: *u32) callconv(.c) i32 {
-    // An interrupt/storage callback can run above a dedicated Task. Keep
-    // that actual callback's existing owner; never borrow the interrupted
-    // Task's identity or apply its stop/close state to another driver's IRQ.
-    if (!irq_router.inDispatch() and currentStorageCallbackOwner() == 0 and driver_threads.currentOwner() != 0) {
-        out_handle.* = 0;
-        if (flags != 0) return -3; // A dedicated task is never an IRQ producer.
-        const owner = driver_threads.currentWorkOwner();
-        if (owner == 0) return outputs_contract.driver_thread_error_closed;
-        return driver_work.submit(owner, handler, context, flags, out_handle);
-    }
-    return driver_work.submit(activeOwner(), handler, context, flags, out_handle);
+fn driverWorkSubmit(handler: DriverWorkHandler, context: usize, flags: u32, out: *u32) callconv(.c) i32 {
+    return r4os_rust_driver_api_work_submit(handler, context, flags, out);
 }
 
-fn driverWorkSubmitRequest(request: *const DriverWorkRequest, out_handle: *u32) callconv(.c) i32 {
-    return driver_work.submitRequest(activeOwner(), request, out_handle);
+fn driverWorkSubmitRequest(request: *const DriverWorkRequest, out: *u32) callconv(.c) i32 {
+    return r4os_rust_driver_api_work_request(request, out);
 }
 
 // A dedicated CPU task may request a bounded hardware-owner slice on the
 // existing BSP Work lane. It never borrows legacy PCI/MMIO/display admission
 // on its own stack or keeps the lifecycle guard across its pacing waits.
-fn driverWorkSubmitOwned(handler: DriverWorkHandler, context: usize, out_handle: *u32) callconv(.c) i32 {
-    if (@intFromPtr(out_handle) == 0) return outputs_contract.driver_thread_error_invalid;
-    out_handle.* = 0;
-    if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return outputs_contract.driver_thread_error_owner;
-    const thread_owner = driver_threads.currentOwner();
-    const owner = if (thread_owner != 0) driver_threads.currentWorkOwner() else activeOwner();
-    if (owner == 0) return outputs_contract.driver_thread_error_closed;
-    return driver_work.submitOwned(owner, handler, context, out_handle);
+fn driverWorkSubmitOwned(handler: DriverWorkHandler, context: usize, out: *u32) callconv(.c) i32 {
+    return r4os_rust_driver_api_work_owned(handler, context, out);
 }
 
 pub fn invokeOwnedWork(owner: u32, handler: DriverWorkHandler, context: usize) i32 {
-    if (owner == 0 or driver_work.currentOwner() != owner or driver_threads.currentOwner() != 0 or
-        irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return outputs_contract.driver_thread_error_owner;
-    // Shutdown may hold this guard while checking worker completion. Never
-    // park the shared Work lane behind that caller; no callback ran on BUSY.
-    if (!enterOwnerBounded(owner, 0)) return outputs_contract.driver_work_owner_busy;
-    defer _ = leaveOwner();
-    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return handler(context);
+    return r4os_rust_driver_api_invoke_owned(owner, handler, context);
 }
 
 fn driverWorkCancel(handle: u32) callconv(.c) i32 {
@@ -1564,97 +802,24 @@ fn driverWorkSummary(out: *DriverWorkSummary) callconv(.c) i32 {
 }
 
 fn activeOwner() u32 {
-    const irq_owner = irq_router.currentOwner();
-    if (irq_owner != 0) return irq_owner;
-    const storage_owner = currentStorageCallbackOwner();
-    if (storage_owner != 0) return storage_owner;
-    const work_owner = driver_work.currentOwner();
-    if (work_owner != 0) return work_owner;
-    if (current_owner != 0 and current_owner_guard.ownedByCurrent()) return current_owner;
-    return 0;
+    return r4os_rust_driver_api_runtime_owner(false);
 }
 
 // Dedicated tasks admit the audited CPU heap, clock, thread and semaphore
 // services, plus the explicit normal-Work submission bridge above. Do not
 // extend legacy PCI/DMA/backend entrypoints to parallel callers by changing
 // activeOwner's admission contract.
-fn runtimeOwner() u32 {
-    if (irq_router.inDispatch()) return irq_router.currentOwner();
-    const storage_owner = currentStorageCallbackOwner();
-    if (storage_owner != 0) return storage_owner;
-    const thread_owner = driver_threads.currentOwner();
-    return if (thread_owner != 0) thread_owner else activeOwner();
-}
-
-fn enterStorageCallback(owner: u32) ?StorageCallbackToken {
-    if (owner == 0) return null;
-    const flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(flags);
-    // Before scheduler admission the boot path is the only execution owner;
-    // task ID zero is therefore a unique and safe callback identity.
-    const task_id = scheduler.currentId() orelse 0;
-    var free_slot: ?usize = null;
-    for (&storage_callback_owners, 0..) |*entry, index| {
-        if (!entry.used) {
-            if (free_slot == null) free_slot = index;
-            continue;
-        }
-        if (entry.task_id != task_id) continue;
-        if (entry.owner != owner or entry.depth == std.math.maxInt(u32)) return null;
-        entry.depth += 1;
-        return .{ .slot = index, .task_id = task_id };
-    }
-    const slot = free_slot orelse return null;
-    storage_callback_owners[slot] = .{
-        .used = true,
-        .task_id = task_id,
-        .owner = owner,
-        .depth = 1,
-    };
-    return .{ .slot = slot, .task_id = task_id };
-}
-
-fn leaveStorageCallback(token: StorageCallbackToken) void {
-    const flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(flags);
-    if (token.slot >= storage_callback_owners.len) return;
-    const entry = &storage_callback_owners[token.slot];
-    if (!entry.used or entry.task_id != token.task_id or entry.depth == 0) return;
-    entry.depth -= 1;
-    if (entry.depth == 0) entry.* = .{};
-}
-
-fn currentStorageCallbackOwner() u32 {
-    // Dedicated SMP callers inspect this exclusion too. Synchronize the
-    // small identity projection without changing storage I/O admission.
-    const flags = interrupts.saveAndDisableRuntime();
-    defer interrupts.restore(flags);
-    const task_id = scheduler.currentId() orelse 0;
-    for (&storage_callback_owners) |*entry| {
-        if (entry.used and entry.task_id == task_id and entry.depth != 0) return entry.owner;
-    }
-    return 0;
-}
 
 fn pciDeviceCount() callconv(.c) u32 {
-    return @intCast(pci_inventory.count());
+    return r4os_rust_driver_pci_count();
 }
 
 fn pciDeviceAt(index: u32, out: *PciDeviceInfo) callconv(.c) i32 {
-    out.* = .{};
-    const dev = pci_inventory.deviceAt(@intCast(index)) orelse return -1;
-    out.* = pciInfoFromDevice(dev);
-    pci_inventory.noteDetailMaterialization();
-    return 0;
+    return r4os_rust_driver_pci_at(index, out);
 }
 
-fn pciFindByClass(class_code: u8, subclass: u8, start_index: u32, out: *PciDeviceInfo) callconv(.c) i32 {
-    out.* = .{};
-    const index = pci_inventory.findByClass(class_code, subclass, @intCast(start_index)) orelse return -1;
-    const dev = pci_inventory.deviceAt(index) orelse return -1;
-    out.* = pciInfoFromDevice(dev);
-    pci_inventory.noteDetailMaterialization();
-    return @intCast(index);
+fn pciFindByClass(class: u8, subclass: u8, start: u32, out: *PciDeviceInfo) callconv(.c) i32 {
+    return r4os_rust_driver_pci_find(class, subclass, start, out);
 }
 
 // 0.59.19: MSI-Fenster. Router-IRQs 24..31 haben feste IDT-Vektoren 56..63,
@@ -1663,499 +828,37 @@ fn pciFindByClass(class_code: u8, subclass: u8, start_index: u32, out: *PciDevic
 const MSI_IRQ_BASE: u8 = 24;
 const MSI_IRQ_COUNT: u8 = 8;
 const IDT_IRQ_VECTOR_BASE: u32 = 32;
-var msi_allocations: [MSI_IRQ_COUNT]MsiAllocation = .{MsiAllocation{}} ** MSI_IRQ_COUNT;
 
-fn pciEnableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i32 {
-    const owner = activeOwner();
-    if (owner == 0) return -6;
-    for (msi_allocations) |allocation| {
-        if (!allocation.used or allocation.bus_kind != bus_kind or allocation.bus != bus or allocation.device != device or allocation.function != function) continue;
-        return if (allocation.owner == owner) @intCast(allocation.irq) else -6;
-    }
-    const status_command = pciReadConfig32(bus_kind, bus, device, function, 0x04);
-    if (status_command == 0xFFFF_FFFF or (status_command & (@as(u32, 1) << 20)) == 0) return -1;
-
-    // Begrenzter, zyklussicherer Capability-Walk. Die bestehende Funktion
-    // bevorzugt weiterhin MSI (0x05), akzeptiert fuer NVMe und andere moderne
-    // Endpunkte aber auch genau einen MSI-X-Tabelleneintrag (0x11).
-    var offset: u16 = @as(u16, @as(u8, @truncate(pciReadConfig32(bus_kind, bus, device, function, 0x34)))) & 0xFC;
-    var cap: u16 = 0;
-    var msix_cap: u16 = 0;
-    var visited: u64 = 0;
-    var steps: u8 = 0;
-    while (offset >= 0x40 and offset <= 0xFC and steps < 48) : (steps += 1) {
-        const visited_index: u6 = @intCast((offset - 0x40) / 4);
-        const visited_bit = @as(u64, 1) << visited_index;
-        if ((visited & visited_bit) != 0) return -1;
-        visited |= visited_bit;
-        const header = pciReadConfig32(bus_kind, bus, device, function, offset);
-        if (header == 0xFFFF_FFFF) return -1;
-        const capability_id: u8 = @truncate(header);
-        if (capability_id == 0x05) {
-            cap = offset;
-            break;
-        }
-        if (capability_id == 0x11 and msix_cap == 0) msix_cap = offset;
-        const next = @as(u16, @as(u8, @truncate(header >> 8))) & 0xFC;
-        if (next == 0 or next == offset) break;
-        offset = next;
-    }
-    if (cap == 0 and msix_cap == 0) return -2;
-
-    var slot: u8 = 0;
-    while (slot < MSI_IRQ_COUNT and msi_allocations[slot].used) : (slot += 1) {}
-    if (slot >= MSI_IRQ_COUNT) return -3;
-    const irq: u8 = MSI_IRQ_BASE + slot;
-    const vector: u32 = IDT_IRQ_VECTOR_BASE + irq;
-
-    if (cap == 0) {
-        return enableMsix(bus_kind, bus, device, function, owner, slot, irq, vector, msix_cap, status_command);
-    }
-
-    const cap_header = pciReadConfig32(bus_kind, bus, device, function, cap);
-    if (cap_header == 0xFFFF_FFFF) return -1;
-    const control: u16 = @truncate(cap_header >> 16);
-    if ((control & 1) != 0) return -7;
-    const is_64bit = (control & (1 << 7)) != 0;
-
-    // Fixed/Edge to one internal scheduler target; Multiple Message Enable
-    // remains one. No public affinity or multi-vector ABI is introduced.
-    const msi_target = smp.irqTarget(slot + 1);
-    const address: u32 = 0xFEE0_0000 | (msi_target << 12);
-    if (pciWriteConfig32(bus_kind, bus, device, function, cap + 0x04, address) != 0) return -4;
-    if (is_64bit) {
-        if (pciWriteConfig32(bus_kind, bus, device, function, cap + 0x08, 0) != 0) return -4;
-        if (pciWriteConfig32(bus_kind, bus, device, function, cap + 0x0C, vector) != 0) return -4;
-    } else {
-        if (pciWriteConfig32(bus_kind, bus, device, function, cap + 0x08, vector) != 0) return -4;
-    }
-    const new_control: u32 = (@as(u32, control) & ~@as(u32, 0x0070)) | 0x0001;
-    const cap_write = (cap_header & 0x0000_FFFF) | (new_control << 16);
-    if (pciWriteConfig32(bus_kind, bus, device, function, cap, cap_write) != 0) {
-        _ = restoreMsiHardware(bus_kind, bus, device, function, cap, control, @truncate(status_command));
-        return -4;
-    }
-    const verified = pciReadConfig32(bus_kind, bus, device, function, cap);
-    if (verified == 0xFFFF_FFFF or ((verified >> 16) & 0x0001) == 0) {
-        _ = restoreMsiHardware(bus_kind, bus, device, function, cap, control, @truncate(status_command));
-        return -5;
-    }
-
-    // INTx am Endpunkt deaktivieren; der W1C-Statusanteil wird nie geechot.
-    const command_raw = pciReadConfig32(bus_kind, bus, device, function, 0x04);
-    if (command_raw != 0xFFFF_FFFF) {
-        const command = (command_raw & 0x0000_FFFF) | (@as(u32, 1) << 10);
-        if (pciWriteConfig32(bus_kind, bus, device, function, 0x04, command) != 0) {
-            _ = restoreMsiHardware(bus_kind, bus, device, function, cap, control, @truncate(status_command));
-            return -4;
-        }
-        const command_verify = pciReadConfig32(bus_kind, bus, device, function, 0x04);
-        if (command_verify == 0xFFFF_FFFF or (command_verify & (@as(u32, 1) << 10)) == 0) {
-            _ = restoreMsiHardware(bus_kind, bus, device, function, cap, control, @truncate(status_command));
-            return -5;
-        }
-    }
-
-    msi_allocations[slot] = .{
-        .used = true,
-        .kind = .msi,
-        .owner = owner,
-        .bus_kind = bus_kind,
-        .bus = bus,
-        .device = device,
-        .function = function,
-        .irq = irq,
-        .capability = cap,
-        .original_control = control,
-        .original_command = @truncate(status_command),
-    };
-    bootlog.puts("[R4D] MSI enabled irq=");
-    bootlog.putDec(irq);
-    bootlog.puts(" vector=");
-    bootlog.putDec(vector);
-    bootlog.puts("\r\n");
-    return @intCast(irq);
+fn pciEnableMsi(kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i32 {
+    return r4os_rust_driver_msi_enable(kind, bus, device, function);
 }
 
-fn enableMsix(
-    bus_kind: u8,
-    bus: u8,
-    device: u8,
-    function: u8,
-    owner: u32,
-    slot: u8,
-    irq: u8,
-    vector: u32,
-    capability: u16,
-    status_command: u32,
-) i32 {
-    const cap_header = pciReadConfig32(bus_kind, bus, device, function, capability);
-    if (cap_header == 0xFFFF_FFFF) return -1;
-    const control: u16 = @truncate(cap_header >> 16);
-    const msix_enable: u16 = 1 << 15;
-    const function_mask: u16 = 1 << 14;
-    if ((control & msix_enable) != 0) return -7;
-
-    const table_descriptor = pciReadConfig32(bus_kind, bus, device, function, capability + 0x04);
-    if (table_descriptor == 0xFFFF_FFFF) return -1;
-    const geometry = pci_interrupt_policy.msixTableGeometry(table_descriptor, MAX_MMIO_MAP_BYTES) orelse return -8;
-    var region: MmioRegion = .{};
-    if (pciMapBar(
-        bus_kind,
-        bus,
-        device,
-        function,
-        geometry.bir,
-        geometry.mapping_bytes,
-        0,
-        &region,
-    ) != 0) return -8;
-
-    const table_virt = region.virt_addr + geometry.offset;
-    const candidate = MsiAllocation{
-        .used = true,
-        .kind = .msix,
-        .owner = owner,
-        .bus_kind = bus_kind,
-        .bus = bus,
-        .device = device,
-        .function = function,
-        .irq = irq,
-        .capability = capability,
-        .original_control = control,
-        .original_command = @truncate(status_command),
-        .msix_table_virt = table_virt,
-        .msix_original_address_low = msixTableRead32(table_virt, 0),
-        .msix_original_address_high = msixTableRead32(table_virt, 4),
-        .msix_original_data = msixTableRead32(table_virt, 8),
-        .msix_original_vector_control = msixTableRead32(table_virt, 12),
-    };
-
-    // Keep the whole function and entry zero masked until its destination is
-    // complete. The DriverApi deliberately exposes one message only.
-    const masked_control = (control & ~msix_enable) | function_mask;
-    if (!writeMsixControl(bus_kind, bus, device, function, capability, cap_header, masked_control)) return -4;
-    msixTableWrite32(table_virt, 12, candidate.msix_original_vector_control | 1);
-    const msi_target = smp.irqTarget(slot + 1);
-    msixTableWrite32(table_virt, 0, 0xFEE0_0000 | (msi_target << 12));
-    msixTableWrite32(table_virt, 4, 0);
-    msixTableWrite32(table_virt, 8, vector);
-    asm volatile ("mfence" ::: .{ .memory = true });
-
-    if (!writeMsixControl(bus_kind, bus, device, function, capability, cap_header, masked_control | msix_enable)) {
-        _ = restoreMsixHardware(&candidate);
-        return -4;
-    }
-    // Keep entry zero masked until irq_register has published its handler.
-    // This closes the enable-before-register window imposed by the historical
-    // DriverApi call order without changing the public ABI.
-    if (!writeMsixControl(bus_kind, bus, device, function, capability, cap_header, (control | msix_enable) & ~function_mask)) {
-        _ = restoreMsixHardware(&candidate);
-        return -4;
-    }
-
-    const verified_header = pciReadConfig32(bus_kind, bus, device, function, capability);
-    const verified_entry = msixTableRead32(table_virt, 12);
-    if (verified_header == 0xFFFF_FFFF or
-        ((verified_header >> 16) & msix_enable) == 0 or
-        ((verified_header >> 16) & function_mask) != 0 or
-        (verified_entry & 1) == 0)
-    {
-        _ = restoreMsixHardware(&candidate);
-        return -5;
-    }
-
-    // MSI-X and legacy INTx must not be active at the same endpoint.
-    const command_raw = pciReadConfig32(bus_kind, bus, device, function, 0x04);
-    if (command_raw == 0xFFFF_FFFF or
-        pciWriteConfig32(bus_kind, bus, device, function, 0x04, (command_raw & 0x0000_FFFF) | (@as(u32, 1) << 10)) != 0)
-    {
-        _ = restoreMsixHardware(&candidate);
-        return -4;
-    }
-    const command_verify = pciReadConfig32(bus_kind, bus, device, function, 0x04);
-    if (command_verify == 0xFFFF_FFFF or (command_verify & (@as(u32, 1) << 10)) == 0) {
-        _ = restoreMsixHardware(&candidate);
-        return -5;
-    }
-
-    msi_allocations[slot] = candidate;
-    bootlog.puts("[R4D] MSI-X prepared irq=");
-    bootlog.putDec(irq);
-    bootlog.puts(" vector=");
-    bootlog.putDec(vector);
-    bootlog.puts("\r\n");
-    return @intCast(irq);
+fn pciDisableMsi(kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i32 {
+    return r4os_rust_driver_msi_disable(kind, bus, device, function);
 }
 
-fn writeMsixControl(bus_kind: u8, bus: u8, device: u8, function: u8, capability: u16, header: u32, control: u16) bool {
-    const value = (header & 0x0000_FFFF) | (@as(u32, control) << 16);
-    return pciWriteConfig32(bus_kind, bus, device, function, capability, value) == 0;
+fn pciReadConfig32(kind: u8, bus: u8, device: u8, function: u8, offset: u16) callconv(.c) u32 {
+    return r4os_rust_driver_pci_read(kind, bus, device, function, offset);
 }
 
-fn msixTableRead32(table_virt: u64, offset: u32) u32 {
-    const value: *const volatile u32 = @ptrFromInt(table_virt + offset);
-    return value.*;
+fn pciWriteConfig32(kind: u8, bus: u8, device: u8, function: u8, offset: u16, value: u32) callconv(.c) i32 {
+    return r4os_rust_driver_pci_write(kind, bus, device, function, offset, value);
 }
 
-fn msixTableWrite32(table_virt: u64, offset: u32, value: u32) void {
-    const target: *volatile u32 = @ptrFromInt(table_virt + offset);
-    target.* = value;
+fn pciReadBar(kind: u8, bus: u8, device: u8, function: u8, index: u8) callconv(.c) u32 {
+    return @intCast(r4os_rust_driver_pci_bar(kind, bus, device, function, index, false));
 }
 
-fn unmaskRegisteredMsix(owner: u32, irq: u8) bool {
-    for (&msi_allocations) |*allocation| {
-        if (!allocation.used or allocation.kind != .msix or allocation.owner != owner or allocation.irq != irq) continue;
-        const control = msixTableRead32(allocation.msix_table_virt, 12);
-        msixTableWrite32(allocation.msix_table_virt, 12, control & ~@as(u32, 1));
-        asm volatile ("mfence" ::: .{ .memory = true });
-        return (msixTableRead32(allocation.msix_table_virt, 12) & 1) == 0;
-    }
-    return true;
+fn pciEnableBusMaster(kind: u8, bus: u8, device: u8, function: u8, flags: u32) callconv(.c) i32 {
+    return r4os_rust_driver_pci_bus_master(kind, bus, device, function, flags);
 }
 
-fn pciDisableMsi(bus_kind: u8, bus: u8, device: u8, function: u8) callconv(.c) i32 {
-    const owner = activeOwner();
-    for (&msi_allocations) |*allocation| {
-        if (!allocation.used or allocation.bus_kind != bus_kind or allocation.bus != bus or allocation.device != device or allocation.function != function) continue;
-        if (owner != 0 and allocation.owner != owner) return -2;
-        if (!restoreMsiAllocation(allocation)) return -3;
-        allocation.* = .{};
-        return 0;
-    }
-    return 0;
-}
-
-fn restoreMsiAllocation(allocation: *const MsiAllocation) bool {
-    return switch (allocation.kind) {
-        .msi => restoreMsiHardware(
-            allocation.bus_kind,
-            allocation.bus,
-            allocation.device,
-            allocation.function,
-            allocation.capability,
-            allocation.original_control,
-            allocation.original_command,
-        ),
-        .msix => restoreMsixHardware(allocation),
-    };
-}
-
-fn restoreMsixHardware(allocation: *const MsiAllocation) bool {
-    const current_header = pciReadConfig32(
-        allocation.bus_kind,
-        allocation.bus,
-        allocation.device,
-        allocation.function,
-        allocation.capability,
-    );
-    if (current_header == 0xFFFF_FFFF or allocation.msix_table_virt == 0) return false;
-    const msix_enable: u16 = 1 << 15;
-    const function_mask: u16 = 1 << 14;
-    const current_control: u16 = @truncate(current_header >> 16);
-    if (!writeMsixControl(
-        allocation.bus_kind,
-        allocation.bus,
-        allocation.device,
-        allocation.function,
-        allocation.capability,
-        current_header,
-        (current_control & ~msix_enable) | function_mask,
-    )) return false;
-
-    msixTableWrite32(allocation.msix_table_virt, 12, msixTableRead32(allocation.msix_table_virt, 12) | 1);
-    asm volatile ("mfence" ::: .{ .memory = true });
-    msixTableWrite32(allocation.msix_table_virt, 0, allocation.msix_original_address_low);
-    msixTableWrite32(allocation.msix_table_virt, 4, allocation.msix_original_address_high);
-    msixTableWrite32(allocation.msix_table_virt, 8, allocation.msix_original_data);
-    msixTableWrite32(allocation.msix_table_virt, 12, allocation.msix_original_vector_control);
-    asm volatile ("mfence" ::: .{ .memory = true });
-    if (!writeMsixControl(
-        allocation.bus_kind,
-        allocation.bus,
-        allocation.device,
-        allocation.function,
-        allocation.capability,
-        current_header,
-        allocation.original_control,
-    )) return false;
-
-    const current_command = pciReadConfig32(
-        allocation.bus_kind,
-        allocation.bus,
-        allocation.device,
-        allocation.function,
-        0x04,
-    );
-    if (current_command == 0xFFFF_FFFF) return false;
-    const intx_mask: u32 = @as(u32, 1) << 10;
-    const restored_command = (current_command & 0x0000_FFFF & ~intx_mask) |
-        (@as(u32, allocation.original_command) & intx_mask);
-    if (pciWriteConfig32(
-        allocation.bus_kind,
-        allocation.bus,
-        allocation.device,
-        allocation.function,
-        0x04,
-        restored_command,
-    ) != 0) return false;
-
-    const final_header = pciReadConfig32(
-        allocation.bus_kind,
-        allocation.bus,
-        allocation.device,
-        allocation.function,
-        allocation.capability,
-    );
-    const final_command = pciReadConfig32(
-        allocation.bus_kind,
-        allocation.bus,
-        allocation.device,
-        allocation.function,
-        0x04,
-    );
-    return final_header != 0xFFFF_FFFF and
-        (@as(u16, @truncate(final_header >> 16)) & (msix_enable | function_mask)) ==
-            (allocation.original_control & (msix_enable | function_mask)) and
-        final_command != 0xFFFF_FFFF and
-        (final_command & intx_mask) == (@as(u32, allocation.original_command) & intx_mask);
-}
-
-fn restoreMsiHardware(bus_kind: u8, bus: u8, device: u8, function: u8, capability: u16, original_control: u16, original_command: u16) bool {
-    const current_header = pciReadConfig32(bus_kind, bus, device, function, capability);
-    if (current_header == 0xFFFF_FFFF) return false;
-    const disabled_control = @as(u16, @truncate(current_header >> 16)) & ~@as(u16, 1);
-    const disabled_header = (current_header & 0x0000_FFFF) | (@as(u32, disabled_control) << 16);
-    if (pciWriteConfig32(bus_kind, bus, device, function, capability, disabled_header) != 0) return false;
-    const disabled_verify = pciReadConfig32(bus_kind, bus, device, function, capability);
-    if (disabled_verify == 0xFFFF_FFFF or ((disabled_verify >> 16) & 1) != 0) return false;
-
-    const original_header = (disabled_verify & 0x0000_FFFF) | (@as(u32, original_control) << 16);
-    if (pciWriteConfig32(bus_kind, bus, device, function, capability, original_header) != 0) return false;
-    const current_command = pciReadConfig32(bus_kind, bus, device, function, 0x04);
-    if (current_command == 0xFFFF_FFFF) return false;
-    const intx_mask: u32 = @as(u32, 1) << 10;
-    const restored_command = (current_command & 0x0000_FFFF & ~intx_mask) | (@as(u32, original_command) & intx_mask);
-    if (pciWriteConfig32(bus_kind, bus, device, function, 0x04, restored_command) != 0) return false;
-    const final_header = pciReadConfig32(bus_kind, bus, device, function, capability);
-    const final_command = pciReadConfig32(bus_kind, bus, device, function, 0x04);
-    return final_header != 0xFFFF_FFFF and
-        ((final_header >> 16) & 1) == 0 and
-        final_command != 0xFFFF_FFFF and
-        (final_command & intx_mask) == (@as(u32, original_command) & intx_mask);
-}
-
-fn cleanupMsiOwner(owner: u32) MsiOwnerCleanupResult {
-    var result: MsiOwnerCleanupResult = .{};
-    for (&msi_allocations) |*allocation| {
-        if (!allocation.used or allocation.owner != owner) continue;
-        if (!restoreMsiAllocation(allocation)) {
-            result.failed = true;
-            continue;
-        }
-        allocation.* = .{};
-        result.removed += 1;
-    }
-    return result;
-}
-
-fn pciReadConfig32(bus_kind: u8, bus: u8, device: u8, function: u8, offset: u16) callconv(.c) u32 {
-    return pci_inventory.readConfig32At(bus_kind, bus, device, function, offset);
-}
-
-fn pciWriteConfig32(bus_kind: u8, bus: u8, device: u8, function: u8, offset: u16, value: u32) callconv(.c) i32 {
-    return if (pci_inventory.writeConfig32At(bus_kind, bus, device, function, offset, value)) 0 else -1;
-}
-
-fn pciReadBar(bus_kind: u8, bus: u8, device: u8, function: u8, index: u8) callconv(.c) u32 {
-    if (index >= 6) return 0;
-    if (bus_kind != NET_BUS_PCIE and bus_kind != NET_BUS_PCI) return 0;
-    return pci_inventory.readBar(.{ .bus_kind = bus_kind, .bus = bus, .device = device, .function = function }, index);
-}
-
-fn pciEnableBusMaster(bus_kind: u8, bus: u8, device: u8, function: u8, flags: u32) callconv(.c) i32 {
-    const raw = pciReadConfig32(bus_kind, bus, device, function, 0x04);
-    if (raw == 0xFFFF_FFFF) return -1;
-    var command: u16 = @truncate(raw & 0xFFFF);
-    if ((flags & 1) != 0) command |= 0x0001;
-    if ((flags & 2) != 0) command |= 0x0002;
-    command |= 0x0004;
-    command &= ~@as(u16, 0x0400);
-    // PCI Status occupies the upper half of this dword and contains W1C
-    // fields.  Never echo a status snapshot while changing Command.  The
-    // readback is also the ordering boundary required before a freshly
-    // enabled device is allowed to fetch DMA descriptors.
-    if (pciWriteConfig32(bus_kind, bus, device, function, 0x04, @as(u32, command)) != 0) return -2;
-    const verified = pciReadConfig32(bus_kind, bus, device, function, 0x04);
-    if (verified == 0xFFFF_FFFF) return -3;
-    var required: u16 = 0x0004;
-    if ((flags & 1) != 0) required |= 0x0001;
-    if ((flags & 2) != 0) required |= 0x0002;
-    const verified_command: u16 = @truncate(verified);
-    if ((verified_command & required) != required or (verified_command & 0x0400) != 0) return -4;
-    return 0;
-}
-
-fn pciMapBar(bus_kind: u8, bus: u8, device: u8, function: u8, index: u8, bytes: u32, flags: u32, out: *MmioRegion) callconv(.c) i32 {
-    out.* = .{};
-    if (index >= 6) return -1;
-    const raw = pciReadBar(bus_kind, bus, device, function, index);
-    if (raw == 0 or raw == 0xFFFF_FFFF) return -2;
-    if ((raw & 1) != 0) return -3;
-
-    const full_bar = pciReadBar64(bus_kind, bus, device, function, index);
-    const base = full_bar & 0xFFFF_FFFF_FFFF_FFF0;
-    if (base == 0) return -4;
-
-    const requested: u64 = if (bytes == 0) paging.PAGE_SIZE else @as(u64, bytes);
-    if (requested > MAX_MMIO_MAP_BYTES) return -5;
-
-    const page = alignDown(base, paging.PAGE_SIZE);
-    const offset = base - page;
-    const total = alignUp(offset + requested, paging.PAGE_SIZE);
-    var mapped: u64 = 0;
-    while (mapped < total) : (mapped += paging.PAGE_SIZE) {
-        const phys_page = page + mapped;
-        const virt_page = phys.physToVirt(phys_page);
-        if (!paging.isMapped(virt_page)) {
-            if (!paging.mapPage(virt_page, phys_page, paging.WRITABLE | paging.CACHE_DISABLE | paging.NO_EXECUTE)) return -6;
-        }
-    }
-
-    const virt_addr = phys.physToVirt(base);
-    if ((flags & MMIO_MAP_WRITE_COMBINING) != 0) {
-        _ = paging.setWriteCombiningRange(virt_addr, requested);
-    }
-
-    out.* = .{
-        .phys_addr = base,
-        .virt_addr = virt_addr,
-        .bytes = @intCast(requested),
-        .mapped_bytes = @intCast(total),
-        .bar_index = index,
-        .flags = @truncate(flags),
-        .reserved = 0,
-    };
-    return 0;
-}
-
-fn pciReadBar64(bus_kind: u8, bus: u8, device: u8, function: u8, index: u8) u64 {
-    if (index >= 6) return 0;
-    if (bus_kind != NET_BUS_PCIE and bus_kind != NET_BUS_PCI) return 0;
-    return pci_inventory.readBar64(.{ .bus_kind = bus_kind, .bus = bus, .device = device, .function = function }, index);
+fn pciMapBar(kind: u8, bus: u8, device: u8, function: u8, index: u8, bytes: u32, flags: u32, out: *MmioRegion) callconv(.c) i32 {
+    return r4os_rust_driver_pci_map(kind, bus, device, function, index, bytes, flags, out);
 }
 
 fn getOption(driver: [*:0]const u8, key: [*:0]const u8) callconv(.c) [*:0]const u8 {
-    const config = boot_config.get();
-    var i: usize = 0;
-    while (i < config.option_count) : (i += 1) {
-        const opt = &config.options[i];
-        if (!zEqSlice(driver, opt.driver[0..opt.driver_len])) continue;
-        if (!zEqSlice(key, opt.key[0..opt.key_len])) continue;
-        copyOptionValue(opt.value[0..opt.value_len]);
-        return &option_value_z;
-    }
-    return &empty_z;
+    return r4os_rust_driver_option(driver, key);
 }
 
 fn registerAudioBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
@@ -2163,264 +866,64 @@ fn registerAudioBackend(name: [*:0]const u8, backend: *const anyopaque) callconv
 }
 
 fn registerAudioOutputBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
-    const descriptor: *const AudioBackendDescriptor = @ptrCast(@alignCast(backend));
-    if (!validAudioBackend(descriptor)) return -1;
-    const slot_index = freeR4DAudioBackendSlot() orelse {
-        bootlog.puts("[R4D][ERROR] audio backend table full\r\n");
-        return -2;
-    };
-    const slot = &r4d_audio_backends[slot_index];
-    slot.* = .{
-        .used = true,
-        .owner = current_owner,
-        .descriptor = descriptor,
-    };
-    copyZName(name, slot.name[0..], &slot.name_len);
-
-    const result = audio.registerExternalAudioBackendZ(name, .{
-        .formats = descriptor.formats,
-        .min_rate = descriptor.min_rate,
-        .max_rate = descriptor.max_rate,
-        .max_channels = descriptor.max_channels,
-    }, slot, audioWriteCallback, audioStopCallback, audioStatusCallback);
-    if (result != 0) {
-        slot.* = R4DAudioBackend{};
-        return -3;
-    }
-
-    if (audioDescriptorHasOutputs(descriptor)) {
-        if (!audio.registerExternalAudioOutputs(slot.name[0..slot.name_len], .{
-            .query = audioOutputQueryCallback,
-            .select = audioOutputSelectCallback,
-            .active = audioOutputActiveCallback,
-        }, if (descriptor.version == outputs_contract.audio_backend_idle_version) audioIdleCallback else null)) {
-            if (audio.unregisterAudioBackendZ(name) == 0) slot.* = .{};
-            return -3;
-        }
-    }
-
-    bootlog.puts("[R4D] register audio backend ");
-    bootlog.puts(slot.name[0..slot.name_len]);
-    bootlog.puts("\r\n");
-    return 0;
+    return r4os_rust_driver_audio_register(name, @ptrCast(@alignCast(backend)));
 }
 
 fn unregisterAudioBackend(name: [*:0]const u8) callconv(.c) i32 {
-    const result = audio.unregisterAudioBackendZ(name);
-    if (result != 0) return result;
-    var index: usize = 0;
-    while (index < r4d_audio_backends.len) : (index += 1) {
-        const slot = &r4d_audio_backends[index];
-        if (!slot.used or !zEqSlice(name, slot.name[0..slot.name_len])) continue;
-        slot.* = R4DAudioBackend{};
-        return 0;
-    }
-    return 0;
+    return r4os_rust_driver_audio_unregister(name);
 }
 
 // Audio callbacks use the existing task-local device-callback owner ledger.
 // Keeping that identity through a wait also makes DMA/work completion calls
 // belong to the actual R4D instead of the caller's program or owner zero.
-fn audioWriteCallback(raw: ?*anyopaque, data: [*]const u8, len: u32, rate: u32, channels: u16, format: u16) callconv(.c) i32 {
-    const slot: *R4DAudioBackend = @ptrCast(@alignCast(raw orelse return -1));
-    if (!slot.used) return -1;
-    const token = enterStorageCallback(slot.owner) orelse return -1;
-    defer leaveStorageCallback(token);
-    return slot.descriptor.write_pcm.?(slot.descriptor.context, data, len, rate, channels, format);
-}
-
-fn audioStopCallback(raw: ?*anyopaque) callconv(.c) i32 {
-    const slot: *R4DAudioBackend = @ptrCast(@alignCast(raw orelse return -1));
-    if (!slot.used) return -1;
-    const callback = slot.descriptor.stop orelse return 0;
-    const token = enterStorageCallback(slot.owner) orelse return -1;
-    defer leaveStorageCallback(token);
-    return callback(slot.descriptor.context);
-}
-
-fn audioIdleCallback(raw: ?*anyopaque) callconv(.c) i32 {
-    const slot: *R4DAudioBackend = @ptrCast(@alignCast(raw orelse return -1));
-    if (!slot.used or slot.descriptor.version != outputs_contract.audio_backend_idle_version or slot.descriptor.size < @sizeOf(AudioIdleDescriptor)) return -1;
-    const descriptor: *const AudioIdleDescriptor = @ptrCast(slot.descriptor);
-    const callback = descriptor.idle orelse return audioStopCallback(raw);
-    const token = enterStorageCallback(slot.owner) orelse return -1;
-    defer leaveStorageCallback(token);
-    return callback(slot.descriptor.context);
-}
-
-fn audioDescriptorHasOutputs(descriptor: *const AudioBackendDescriptor) bool {
-    return descriptor.version == outputs_contract.audio_backend_outputs_version or descriptor.version == outputs_contract.audio_backend_idle_version;
-}
-
-fn audioStatusCallback(raw: ?*anyopaque, out: *AudioBackendStatus) callconv(.c) i32 {
-    const slot: *R4DAudioBackend = @ptrCast(@alignCast(raw orelse return -1));
-    if (!slot.used) return -1;
-    const callback = slot.descriptor.status orelse {
-        out.* = .{ .active = 1 };
-        return 0;
-    };
-    const token = enterStorageCallback(slot.owner) orelse return -1;
-    defer leaveStorageCallback(token);
-    return callback(slot.descriptor.context, out);
-}
-
-fn audioOutputQueryCallback(raw: u64, index: u32, out: *outputs_contract.AudioOutputInfo) callconv(.c) i32 {
-    const slot: *R4DAudioBackend = @ptrFromInt(raw);
-    if (!slot.used or !audioDescriptorHasOutputs(slot.descriptor)) return -1;
-    const descriptor: *const AudioOutputsDescriptor = @ptrCast(slot.descriptor);
-    const token = enterStorageCallback(slot.owner) orelse return -1;
-    defer leaveStorageCallback(token);
-    return descriptor.outputs.query(@intFromPtr(descriptor.base.context), index, out);
-}
-
-fn audioOutputSelectCallback(raw: u64, index: u32) callconv(.c) i32 {
-    const slot: *R4DAudioBackend = @ptrFromInt(raw);
-    if (!slot.used or !audioDescriptorHasOutputs(slot.descriptor)) return -1;
-    const descriptor: *const AudioOutputsDescriptor = @ptrCast(slot.descriptor);
-    const token = enterStorageCallback(slot.owner) orelse return -1;
-    defer leaveStorageCallback(token);
-    return descriptor.outputs.select(@intFromPtr(descriptor.base.context), index);
-}
-
-fn audioOutputActiveCallback(raw: u64) callconv(.c) i32 {
-    const slot: *R4DAudioBackend = @ptrFromInt(raw);
-    if (!slot.used or !audioDescriptorHasOutputs(slot.descriptor)) return -1;
-    const descriptor: *const AudioOutputsDescriptor = @ptrCast(slot.descriptor);
-    return descriptor.outputs.active(@intFromPtr(descriptor.base.context));
-}
 
 fn registerStorageBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
-    const descriptor: *const StorageBackendDescriptor = @ptrCast(@alignCast(backend));
-    if (!validStorageBackend(descriptor)) return -1;
-    const async_submit = storageBackendSubmit(descriptor);
-    if (storage.findByName(zSlice(name)) != null) {
-        bootlog.puts("[R4D][ERROR] storage backend duplicate name ");
-        putZ(name);
-        bootlog.puts("\r\n");
-        return -2;
-    }
-    const slot_index = freeR4DStorageBackendSlot() orelse {
-        bootlog.puts("[R4D][ERROR] storage backend table full\r\n");
-        return -3;
-    };
-    const slot = &r4d_storage_backends[slot_index];
-    slot.* = .{
-        .used = true,
-        .owner = current_owner,
-        .descriptor = descriptor,
-    };
-    copyZName(name, slot.name[0..], &slot.name_len);
-
-    const block_index = storage.register(.{
-        .name = slot.name[0..slot.name_len],
-        .driver = "R4D",
-        .bus = storageBus(descriptor.bus),
-        .controller = storageController(descriptor),
-        .port = 0,
-        .sector_size = descriptor.sector_size,
-        .sector_count = descriptor.sector_count,
-        .max_sectors_per_request = descriptor.max_sectors_per_request,
-        .queue_depth = if (async_submit != null) descriptor.queue_depth else 1,
-        .timeout_ticks = descriptor.timeout_ticks,
-        .removable = (descriptor.flags & STORAGE_BACKEND_FLAG_REMOVABLE) != 0,
-        .writable = (descriptor.flags & STORAGE_BACKEND_FLAG_WRITABLE) != 0,
-        .source = storageSource(descriptor.source),
-        .owner_id = current_owner,
-        .ctx = slot,
-        .read_fn = r4dStorageRead,
-        .write_fn = if (descriptor.write != null) r4dStorageWrite else null,
-        .flush_fn = if (descriptor.flush != null) r4dStorageFlush else null,
-        .async_submit_fn = if (async_submit != null) r4dStorageSubmit else null,
-        .async_cancel_fn = if (storageBackendCancel(descriptor) != null) r4dStorageCancel else null,
-        .async_reset_fn = if (storageBackendReset(descriptor) != null) r4dStorageReset else null,
-    }) orelse {
-        slot.* = R4DStorageBackend{};
-        bootlog.puts("[R4D][ERROR] storage block table full\r\n");
-        return -4;
-    };
-
-    slot.block_index = block_index;
-    bootlog.puts("[R4D] register storage backend ");
-    bootlog.puts(slot.name[0..slot.name_len]);
-    bootlog.puts(" block=");
-    bootlog.putDec(block_index);
-    bootlog.puts(" source=");
-    bootlog.puts(storage.sourceLabel(storageSource(descriptor.source)));
-    bootlog.puts("\r\n");
-    return @intCast(block_index);
+    return r4os_rust_driver_storage_register(name, @ptrCast(@alignCast(backend)));
 }
 
 fn unregisterStorageBackend(name: [*:0]const u8) callconv(.c) i32 {
-    const backend = findR4DStorageBackendByName(name) orelse return -1;
-    const removed = storage.unregister(backend.block_index);
-    if (!removed) return -2;
-    if (backend.descriptor.shutdown) |shutdown| _ = shutdown(backend.descriptor.context);
-    backend.* = R4DStorageBackend{};
-    return 0;
+    return r4os_rust_driver_storage_unregister(name);
 }
 
 fn storageBackendRecoveryBegin(name: [*:0]const u8) callconv(.c) i32 {
-    const backend = findR4DStorageBackendByName(name) orelse return -1;
-    storage.beginBackendRecovery(backend.block_index);
-    return 0;
+    return r4os_rust_driver_storage_recovery(name, false, 0);
 }
 
 fn storageBackendRecoveryFinish(name: [*:0]const u8, ok: i32) callconv(.c) i32 {
-    const backend = findR4DStorageBackendByName(name) orelse return -1;
-    storage.finishBackendRecovery(backend.block_index, ok != 0);
-    return 0;
+    return r4os_rust_driver_storage_recovery(name, true, ok);
 }
 
-fn registerUsbHostController(name: [*:0]const u8, descriptor: *const UsbHostControllerDescriptor) callconv(.c) i32 {
-    if (!validUsbHostController(descriptor)) return -1;
-    if (usb_host.findByName(zSlice(name)) != null) {
-        bootlog.puts("[R4D][ERROR] usb host duplicate name ");
-        putZ(name);
-        bootlog.puts("\r\n");
-        return -2;
-    }
-    const index = usb_host.register(zSlice(name), descriptor, current_owner) orelse return -3;
-    return @intCast(index);
+fn registerUsbHostController(name: [*:0]const u8, d: *const UsbHostControllerDescriptor) callconv(.c) i32 {
+    return r4os_rust_driver_usb_register(name, d);
 }
 
 fn unregisterUsbHostController(name: [*:0]const u8) callconv(.c) i32 {
-    return if (usb_host.unregisterByName(zSlice(name), activeOwner())) 0 else -1;
+    return r4os_rust_driver_usb_unregister(name);
 }
 
 fn activateUsbHostController(name: [*:0]const u8, source: u32) callconv(.c) i32 {
-    if (!zEqSlice(name, "XHCI")) return -1;
-    if (source != USB_HOST_SOURCE_PRELOAD and source != USB_HOST_SOURCE_DISK) return -2;
-    return xhci.activate(activeOwner(), source);
+    return r4os_rust_driver_usb_activate(name, source);
 }
 
-fn registerDisplayBlitBackend(name: [*:0]const u8, descriptor: *const display_blit.Descriptor) callconv(.c) i32 {
-    const owner = activeOwner();
-    if (owner == 0 or @intFromPtr(descriptor) == 0) return -1;
-    const result = display_blit.register(owner, zSlice(name), descriptor);
-    if (result == 0) {
-        bootlog.puts("[R4D] register display blit backend ");
-        putZ(name);
-        bootlog.puts("\r\n");
-    }
-    return result;
+fn registerDisplayBlitBackend(name: [*:0]const u8, d: *const display_blit.Descriptor) callconv(.c) i32 {
+    return r4os_rust_driver_blit(true, name, d);
 }
 
 fn unregisterDisplayBlitBackend(name: [*:0]const u8) callconv(.c) i32 {
-    return display_blit.unregister(activeOwner(), zSlice(name));
+    return r4os_rust_driver_blit(false, name, null);
 }
 
 fn registerInputBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
     _ = backend;
-    return logRegister("input", name);
+    return r4os_rust_driver_input(name);
 }
 
 fn registerSynthEngine(name: [*:0]const u8, engine: *const anyopaque) callconv(.c) i32 {
     return audio.registerSynthEngineZ(name, engine);
 }
 
-fn registerSynthEngineV2(name: [*:0]const u8, engine: *const SynthEngineDescriptor) callconv(.c) i32 {
-    if (!validSynthEngine(engine)) return -1;
-    return audio.registerExternalSynthEngineZ(name, engine.flags, engine.context, engine.midi_send, engine.render, engine.stop, engine.status, engine.opl3_reset, engine.opl3_write_register, engine.sid_acquire, engine.sid_release, engine.sid_set_model, engine.sid_write_register, engine.sid_load_data, engine.sid_init, engine.sid_play_frame, engine.sid_render_pcm, synthRenderPcm(engine));
+fn registerSynthEngineV2(name: [*:0]const u8, d: *const SynthEngineDescriptor) callconv(.c) i32 {
+    return r4os_rust_driver_synth(name, d);
 }
 
 fn protocolDispatch(role: [*:0]const u8, op: u32, in_buffer: *const protocol_api.ProtocolBuffer, out_buffer: *protocol_api.ProtocolBuffer) callconv(.c) i32 {
@@ -2431,704 +934,100 @@ fn registerMixerBackend(name: [*:0]const u8, backend: *const anyopaque) callconv
     return audio.registerMixerBackendZ(name, backend);
 }
 
-fn registerNetBackend(name: [*:0]const u8, backend: *const anyopaque) callconv(.c) i32 {
-    const descriptor: *const NetBackendDescriptor = @ptrCast(@alignCast(backend));
-    if (!validNetBackend(descriptor)) return -1;
-    const negotiation = net_backend.negotiate(netBackendOffer(descriptor)) catch |err| {
-        bootlog.puts("[R4D][ERROR] net backend capability negotiation failed: ");
-        bootlog.puts(switch (err) {
-            error.InvalidOffer => "invalid-offer",
-            error.RequiredNotOffered => "required-not-offered",
-            error.RequiredUnsupported => "required-unsupported",
-        });
-        bootlog.puts("\r\n");
-        return -4;
-    };
-    if (!net.beginBackendMutation()) return -5;
-    defer net.endBackendMutation();
-    const slot_index = freeR4DNetBackendSlot() orelse {
-        bootlog.puts("[R4D][ERROR] net backend table full\r\n");
-        return -2;
-    };
-    const slot = &r4d_net_backends[slot_index];
-    slot.* = .{
-        .used = true,
-        .owner = current_owner,
-        .descriptor = descriptor,
-        .negotiation = negotiation,
-    };
-    copyZName(name, slot.name[0..], &slot.name_len);
-
-    const flags = net.ADAPTER_FLAG_TRUSTED_BACKEND |
-        (if ((descriptor.flags & NET_BACKEND_FLAG_BROADCAST) != 0) net.ADAPTER_FLAG_BROADCAST else 0);
-    const adapter_index = net.register(.{
-        .name = slot.name[0..slot.name_len],
-        .driver = "R4D",
-        .bus = netBus(descriptor.bus_kind),
-        .bus_no = descriptor.bus,
-        .device_no = descriptor.device,
-        .function_no = descriptor.function,
-        .vendor_id = descriptor.vendor_id,
-        .device_id = descriptor.device_id,
-        .mac = descriptor.mac,
-        .mtu = descriptor.mtu,
-        .flags = flags,
-        .backend = negotiation,
-        .link = if ((descriptor.flags & NET_BACKEND_FLAG_LINK_UP) != 0) .up else .unknown,
-        .ops = .{
-            .transmit = if (descriptor.transmit != null) r4dNetTransmit else null,
-            .poll = if (descriptor.poll != null) r4dNetPoll else null,
-            .status = if (descriptor.status != null) r4dNetStatus else null,
-        },
-    }) orelse {
-        slot.* = R4DNetBackend{};
-        bootlog.puts("[R4D][ERROR] net core adapter table full\r\n");
-        return -3;
-    };
-
-    slot.registration_id = net.get(adapter_index).?.registration_id;
-    bootlog.puts("[R4D] register net backend ");
-    bootlog.puts(slot.name[0..slot.name_len]);
-    bootlog.puts(" adapter=");
-    bootlog.putDec(adapter_index);
-    bootlog.puts(" caps=");
-    bootlog.putHex(negotiation.accepted, 16);
-    bootlog.puts("/");
-    bootlog.putHex(negotiation.offered, 16);
-    bootlog.puts(" queues=");
-    bootlog.putDec(negotiation.rx_queue_count);
-    bootlog.puts("/");
-    bootlog.putDec(negotiation.tx_queue_count);
-    bootlog.puts("\r\n");
-    return @intCast(slot.registration_id);
+fn registerNetBackend(name: [*:0]const u8, descriptor: *const anyopaque) callconv(.c) i32 {
+    return r4os_rust_driver_net_register(name, @ptrCast(@alignCast(descriptor)));
 }
 
-fn validAudioBackend(descriptor: *const AudioBackendDescriptor) bool {
-    if (descriptor.version != AUDIO_BACKEND_VERSION and !audioDescriptorHasOutputs(descriptor)) {
-        bootlog.puts("[R4D][ERROR] audio backend version mismatch\r\n");
-        return false;
-    }
-    if (descriptor.size < @sizeOf(AudioBackendDescriptor)) {
-        bootlog.puts("[R4D][ERROR] audio backend descriptor too small\r\n");
-        return false;
-    }
-    if (audioDescriptorHasOutputs(descriptor) and descriptor.size < @sizeOf(AudioOutputsDescriptor)) return false;
-    if (descriptor.version == outputs_contract.audio_backend_idle_version and descriptor.size < @sizeOf(AudioIdleDescriptor)) return false;
-    if (descriptor.write_pcm == null) {
-        bootlog.puts("[R4D][ERROR] audio backend missing write_pcm\r\n");
-        return false;
-    }
-    if ((descriptor.formats & (AUDIO_BACKEND_FORMAT_S16LE | AUDIO_BACKEND_FORMAT_U8)) == 0) {
-        bootlog.puts("[R4D][ERROR] audio backend unsupported format mask\r\n");
-        return false;
-    }
-    if (descriptor.max_channels == 0 or descriptor.max_channels > 8) {
-        bootlog.puts("[R4D][ERROR] audio backend invalid channel count\r\n");
-        return false;
-    }
-    if (descriptor.min_rate != 0 and descriptor.max_rate != 0 and descriptor.min_rate > descriptor.max_rate) {
-        bootlog.puts("[R4D][ERROR] audio backend invalid rate range\r\n");
-        return false;
-    }
-    return true;
+fn synthRenderPcm(d: *const SynthEngineDescriptor) ?audio.SynthRenderPcmCtxFn {
+    return r4os_rust_driver_synth_pcm(d);
 }
 
-fn validSynthEngine(descriptor: *const SynthEngineDescriptor) bool {
-    if (descriptor.version != SYNTH_ENGINE_VERSION) {
-        bootlog.puts("[R4D][ERROR] synth engine version mismatch\r\n");
-        return false;
-    }
-    if (descriptor.size < SYNTH_ENGINE_V1_SIZE) {
-        bootlog.puts("[R4D][ERROR] synth engine descriptor too small\r\n");
-        return false;
-    }
-    if (descriptor.midi_send == null and descriptor.render == null and descriptor.stop == null and descriptor.status == null and
-        descriptor.opl3_reset == null and descriptor.opl3_write_register == null and descriptor.sid_acquire == null and
-        descriptor.sid_release == null and descriptor.sid_set_model == null and descriptor.sid_write_register == null and descriptor.sid_load_data == null and
-        descriptor.sid_init == null and descriptor.sid_play_frame == null and descriptor.sid_render_pcm == null and synthRenderPcm(descriptor) == null)
-    {
-        bootlog.puts("[R4D][ERROR] synth engine has no operations\r\n");
-        return false;
-    }
-    return true;
+fn storageBackendSubmit(d: *const StorageBackendDescriptor) ?StorageSubmitFn {
+    return r4os_rust_driver_storage_submit(d);
 }
 
-fn synthRenderPcm(descriptor: *const SynthEngineDescriptor) ?audio.SynthRenderPcmCtxFn {
-    const required_size = @offsetOf(SynthEngineDescriptor, "render_pcm") + @sizeOf(?audio.SynthRenderPcmCtxFn);
-    if (descriptor.size < required_size) return null;
-    return descriptor.render_pcm;
+fn storageBackendCancel(d: *const StorageBackendDescriptor) ?StorageCancelFn {
+    return r4os_rust_driver_storage_cancel(d);
 }
 
-fn validStorageBackend(descriptor: *const StorageBackendDescriptor) bool {
-    if (descriptor.version == 0 or descriptor.version > STORAGE_BACKEND_VERSION) {
-        bootlog.puts("[R4D][ERROR] storage backend version mismatch\r\n");
-        return false;
-    }
-    if (descriptor.size < STORAGE_BACKEND_V1_SIZE) {
-        bootlog.puts("[R4D][ERROR] storage backend descriptor too small\r\n");
-        return false;
-    }
-    const async_submit = storageBackendSubmit(descriptor);
-    if (async_submit == null and descriptor.read == null) {
-        bootlog.puts("[R4D][ERROR] storage backend missing read callback\r\n");
-        return false;
-    }
-    if (async_submit == null and (descriptor.flags & STORAGE_BACKEND_FLAG_WRITABLE) != 0 and descriptor.write == null) {
-        bootlog.puts("[R4D][ERROR] storage backend writable without write callback\r\n");
-        return false;
-    }
-    if (async_submit == null and (storageBackendCancel(descriptor) != null or storageBackendReset(descriptor) != null)) {
-        bootlog.puts("[R4D][ERROR] storage backend async controls without submit\r\n");
-        return false;
-    }
-    if (descriptor.sector_count == 0) {
-        bootlog.puts("[R4D][ERROR] storage backend empty device\r\n");
-        return false;
-    }
-    if (!validSectorSize(descriptor.sector_size)) {
-        bootlog.puts("[R4D][ERROR] storage backend invalid sector size\r\n");
-        return false;
-    }
-    if (descriptor.queue_depth == 0) {
-        bootlog.puts("[R4D][ERROR] storage backend invalid queue depth\r\n");
-        return false;
-    }
-    if (@as(usize, descriptor.queue_depth) > storage.MAX_REQUEST_QUEUE_DEPTH) {
-        bootlog.puts("[R4D][ERROR] storage backend queue depth exceeds block queue\r\n");
-        return false;
-    }
-    if (descriptor.source != STORAGE_SOURCE_BUILTIN and descriptor.source != STORAGE_SOURCE_PRELOAD and descriptor.source != STORAGE_SOURCE_DISK) {
-        bootlog.puts("[R4D][ERROR] storage backend invalid source\r\n");
-        return false;
-    }
-    return true;
+fn storageBackendReset(d: *const StorageBackendDescriptor) ?StorageResetFn {
+    return r4os_rust_driver_storage_reset(d);
 }
 
-fn storageBackendSubmit(descriptor: *const StorageBackendDescriptor) ?StorageSubmitFn {
-    const required: u32 = @intCast(@offsetOf(StorageBackendDescriptor, "submit") + @sizeOf(?StorageSubmitFn));
-    if (descriptor.version < 2 or descriptor.size < required) return null;
-    return descriptor.submit;
+fn r4dNetTransmit(index: usize, frame: []const u8) net.TxResult {
+    return @enumFromInt(r4os_rust_driver_net_transmit(index, frame.ptr, @intCast(frame.len)));
 }
 
-fn storageBackendCancel(descriptor: *const StorageBackendDescriptor) ?StorageCancelFn {
-    const required: u32 = @intCast(@offsetOf(StorageBackendDescriptor, "cancel") + @sizeOf(?StorageCancelFn));
-    if (descriptor.version < 2 or descriptor.size < required) return null;
-    return descriptor.cancel;
+fn r4dNetPoll(index: usize) void {
+    r4os_rust_driver_net_poll(index);
 }
 
-fn storageBackendReset(descriptor: *const StorageBackendDescriptor) ?StorageResetFn {
-    const required: u32 = @intCast(@offsetOf(StorageBackendDescriptor, "reset") + @sizeOf(?StorageResetFn));
-    if (descriptor.version < 2 or descriptor.size < required) return null;
-    return descriptor.reset;
+fn r4dNetStatus(index: usize, out: *NetBackendStatus) i32 {
+    return r4os_rust_driver_net_status(index, out);
 }
 
-fn validUsbHostController(descriptor: *const UsbHostControllerDescriptor) bool {
-    if (descriptor.version != USB_HOST_BACKEND_VERSION) {
-        bootlog.puts("[R4D][ERROR] usb host version mismatch\r\n");
-        return false;
-    }
-    if (descriptor.size < @sizeOf(UsbHostControllerDescriptor)) {
-        bootlog.puts("[R4D][ERROR] usb host descriptor too small\r\n");
-        return false;
-    }
-    if (descriptor.source != USB_HOST_SOURCE_BUILTIN and descriptor.source != USB_HOST_SOURCE_PRELOAD and descriptor.source != USB_HOST_SOURCE_DISK) {
-        bootlog.puts("[R4D][ERROR] usb host invalid source\r\n");
-        return false;
-    }
-    if (descriptor.port_scan == null) {
-        bootlog.puts("[R4D][ERROR] usb host missing port_scan\r\n");
-        return false;
-    }
-    if (descriptor.control_transfer == null) {
-        bootlog.puts("[R4D][ERROR] usb host missing control_transfer\r\n");
-        return false;
-    }
-    const known_flags = usb_host.FLAG_PORT_SCAN | usb_host.FLAG_CONTROL |
-        usb_host.FLAG_BULK | usb_host.FLAG_INTERRUPT | usb_host.FLAG_EVENT_IRQ |
-        usb_host.FLAG_POLL_FALLBACK | usb_host.FLAG_MULTI_TRANSFER | usb_host.FLAG_HOTPLUG;
-    if ((descriptor.flags & ~known_flags) != 0) {
-        bootlog.puts("[R4D][ERROR] usb host unknown capability flags\r\n");
-        return false;
-    }
-    if ((descriptor.flags & usb_host.FLAG_PORT_SCAN) == 0 or
-        (descriptor.flags & usb_host.FLAG_CONTROL) == 0 or
-        (descriptor.flags & usb_host.FLAG_BULK) == 0 or
-        (descriptor.flags & usb_host.FLAG_INTERRUPT) == 0 or
-        (descriptor.flags & usb_host.FLAG_POLL_FALLBACK) == 0 or
-        descriptor.address_device == null or
-        descriptor.configure_device == null or
-        descriptor.bulk_transfer == null or
-        descriptor.interrupt_transfer == null or
-        descriptor.reset_port == null or
-        descriptor.clear_halt == null or
-        descriptor.reset_endpoint == null or
-        descriptor.poll == null or
-        descriptor.shutdown == null or
-        descriptor.status == null)
-    {
-        bootlog.puts("[R4D][ERROR] usb host v2 capability/callback mismatch\r\n");
-        return false;
-    }
-    return true;
+fn netReceiveFrame(id: i32, frame: [*]const u8, len: u32) callconv(.c) i32 {
+    return r4os_rust_driver_net_receive(id, frame, len);
 }
 
-fn validNetBackend(descriptor: *const NetBackendDescriptor) bool {
-    if (descriptor.version != 1 and descriptor.version != NET_BACKEND_VERSION) {
-        bootlog.puts("[R4D][ERROR] net backend version mismatch\r\n");
-        return false;
-    }
-    const required_size: u32 = if (descriptor.version == 1) NET_BACKEND_V1_SIZE else @sizeOf(NetBackendDescriptor);
-    if (descriptor.size < required_size) {
-        bootlog.puts("[R4D][ERROR] net backend descriptor too small\r\n");
-        return false;
-    }
-    if (descriptor.mtu < 576 or descriptor.mtu > 1500) {
-        bootlog.puts("[R4D][ERROR] net backend invalid mtu\r\n");
-        return false;
-    }
-    if (macIsZero(descriptor.mac)) {
-        bootlog.puts("[R4D][ERROR] net backend missing mac\r\n");
-        return false;
-    }
-    // 0.56.9: Funktionszeiger des Deskriptors muessen im Kernel-Space
-    // liegen. Ein unrelozierter Zeiger (Modul-LINK-Base 0x4_00000000
-    // oder null-nahe Werte) wuerde spaeter aus dem Netz-/IRQ-Pfad ins
-    // Leere gerufen (rip=0-Crashklasse) - hier laut abweisen.
-    var fnptr_ok = true;
-    if (descriptor.transmit) |p| fnptr_ok = fnptr_ok and netFnPlausible(@intFromPtr(p));
-    if (descriptor.poll) |p| fnptr_ok = fnptr_ok and netFnPlausible(@intFromPtr(p));
-    if (descriptor.status) |p| fnptr_ok = fnptr_ok and netFnPlausible(@intFromPtr(p));
-    if (descriptor.shutdown) |p| fnptr_ok = fnptr_ok and netFnPlausible(@intFromPtr(p));
-    if (netBackendTransmitPacket(descriptor)) |p| fnptr_ok = fnptr_ok and netFnPlausible(@intFromPtr(p));
-    if (!fnptr_ok) {
-        bootlog.puts("[R4D][ERROR] NETBACKEND BAD FNPTR (unrelocated?)\r\n");
-        return false;
-    }
-    return true;
+fn netScheduleRx(id: i32) callconv(.c) i32 {
+    return r4os_rust_driver_net_schedule(id);
 }
 
-fn netBackendOffer(descriptor: *const NetBackendDescriptor) net_backend.Offer {
-    if (descriptor.version < 2 or descriptor.size < @sizeOf(NetBackendDescriptor)) return .{};
-    return .{
-        .offered = descriptor.offered_capabilities,
-        .required = descriptor.required_capabilities,
-        .rx_queue_count = descriptor.rx_queue_count,
-        .tx_queue_count = descriptor.tx_queue_count,
-        .max_rx_segments = descriptor.max_rx_segments,
-        .max_tx_segments = descriptor.max_tx_segments,
-        .rx_ownership = descriptor.rx_ownership,
-        .tx_ownership = descriptor.tx_ownership,
-        .interrupt_moderation_us = descriptor.interrupt_moderation_us,
-    };
+fn netBackendQuery(id: i32, out: *NetBackendNegotiation) callconv(.c) i32 {
+    return r4os_rust_driver_net_query(id, out);
 }
 
-fn netBackendTransmitPacket(descriptor: *const NetBackendDescriptor) ?NetTransmitPacketFn {
-    if (descriptor.version < 2 or descriptor.size < @sizeOf(NetBackendDescriptor)) return null;
-    return descriptor.transmit_packet;
-}
-
-fn netFnPlausible(ptr: u64) bool {
-    return ptr >= 0xFFFF_8000_0000_0000;
-}
-
-fn r4dNetTransmit(adapter_index: usize, frame: []const u8) net.TxResult {
-    const backend = findR4DNetBackend(adapter_index) orelse return .backend_error;
-    const tx = backend.descriptor.transmit orelse return .unsupported;
-    const result = tx(backend.descriptor.context, frame.ptr, @intCast(frame.len));
-    return switch (result) {
-        0 => .ok,
-        1 => .busy,
-        2 => .too_large,
-        3 => .link_down,
-        4 => .unsupported,
-        else => .backend_error,
-    };
-}
-
-fn r4dNetPoll(adapter_index: usize) void {
-    const backend = findR4DNetBackend(adapter_index) orelse return;
-    if (backend.descriptor.poll) |poll| poll(backend.descriptor.context);
-}
-
-fn r4dNetStatus(adapter_index: usize, out: *net.BackendStatus) i32 {
-    const backend = findR4DNetBackend(adapter_index) orelse return -1;
-    const status = backend.descriptor.status orelse return -2;
-    return status(backend.descriptor.context, out);
-}
-
-fn netReceiveFrame(adapter_index: i32, frame: [*]const u8, len: u32) callconv(.c) i32 {
-    if (!net.enterBackendCallback()) return -3;
-    defer net.leaveBackendCallback();
-    if (adapter_index < 0) return -1;
-    if (len == 0 or len > net.MAX_PACKET_SIZE) return -2;
-    const backend = findR4DNetRegistration(adapter_index) orelse return -1;
-    const index = net.indexForRegistration(backend.registration_id) orelse return -1;
-    const slice = frame[0..@intCast(len)];
-    return switch (net.receiveFrame(index, slice)) {
-        .accepted => 0,
-        .accepted_fallback => 0,
-        .invalid_adapter => -1,
-        .invalid_frame => -2,
-        .unavailable => -3,
-        .queue_busy => -4,
-        .irq_context => -5,
-    };
-}
-
-fn netScheduleRx(adapter_index: i32) callconv(.c) i32 {
-    if (!net.enterBackendCallback()) return -3;
-    defer net.leaveBackendCallback();
-    if (adapter_index < 0) return -1;
-    const backend = findR4DNetRegistration(adapter_index) orelse return -1;
-    const index = net.indexForRegistration(backend.registration_id) orelse return -1;
-    if (index >= net.count()) return -1;
-    return if (net.scheduleRxWork(index)) 0 else -3;
-}
-
-fn netBackendQuery(adapter_index: i32, out: *NetBackendNegotiation) callconv(.c) i32 {
-    if (!net.enterBackendCallback()) return -3;
-    defer net.leaveBackendCallback();
-    if (adapter_index < 0) return -1;
-    if (!net_backend.validNegotiationQuery(out)) return -2;
-    const backend = findR4DNetRegistration(adapter_index) orelse return -1;
-    out.* = backend.negotiation;
-    return 0;
-}
-
-fn netReceivePacket(adapter_index: i32, packet: *const NetPacket) callconv(.c) i32 {
-    if (!net.enterBackendCallback()) return -3;
-    defer net.leaveBackendCallback();
-    if (adapter_index < 0) return -1;
-    const backend = findR4DNetRegistration(adapter_index) orelse return -1;
-    const index = net.indexForRegistration(backend.registration_id) orelse return -1;
-    if (!net_backend.validRxPacket(packet, backend.negotiation, net.MAX_PACKET_SIZE)) return -2;
-    const frame_ptr: [*]const u8 = @ptrFromInt(packet.fallback_addr);
-    const frame = frame_ptr[0..@intCast(packet.fallback_bytes)];
-    return switch (net.receivePacket(index, packet.queue_index, packet.flags, frame)) {
-        .accepted => 0,
-        .accepted_fallback => 1,
-        .invalid_adapter => -1,
-        .invalid_frame => -2,
-        .unavailable => -3,
-        .queue_busy => -4,
-        .irq_context => -5,
-    };
+fn netReceivePacket(id: i32, packet: *const NetPacket) callconv(.c) i32 {
+    return r4os_rust_driver_net_receive_packet(id, packet);
 }
 
 fn r4dStorageRead(ctx: ?*anyopaque, lba: u64, sectors: u16, out: []u8) bool {
-    const raw = ctx orelse return false;
-    const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
-    const read = backend.descriptor.read orelse return false;
-    const callback = enterStorageCallback(backend.owner) orelse return false;
-    defer leaveStorageCallback(callback);
-    return read(backend.descriptor.context, lba, sectors, out.ptr, @intCast(out.len)) == 0;
+    return r4os_rust_driver_storage_io(ctx, false, lba, sectors, out.ptr, @intCast(out.len));
 }
 
 fn r4dStorageWrite(ctx: ?*anyopaque, lba: u64, sectors: u16, data: []const u8) bool {
-    const raw = ctx orelse return false;
-    const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
-    const write = backend.descriptor.write orelse return false;
-    const callback = enterStorageCallback(backend.owner) orelse return false;
-    defer leaveStorageCallback(callback);
-    return write(backend.descriptor.context, lba, sectors, data.ptr, @intCast(data.len)) == 0;
+    return r4os_rust_driver_storage_io(ctx, true, lba, sectors, @constCast(data.ptr), @intCast(data.len));
 }
 
 fn r4dStorageFlush(ctx: ?*anyopaque) bool {
-    const raw = ctx orelse return false;
-    const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
-    const flush = backend.descriptor.flush orelse return true;
-    const callback = enterStorageCallback(backend.owner) orelse return false;
-    defer leaveStorageCallback(callback);
-    return flush(backend.descriptor.context) == 0;
+    return r4os_rust_driver_storage_flush(ctx);
 }
 
 fn r4dStorageSubmit(ctx: ?*anyopaque, request: *const storage.AsyncRequest) i32 {
-    const raw = ctx orelse return -1;
-    const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
-    const submit = storageBackendSubmit(backend.descriptor) orelse return -1;
     const buffer_addr: u64 = switch (request.kind) {
-        .read => if (request.buffer) |ptr| @intFromPtr(ptr) else 0,
-        .write => if (request.const_buffer) |ptr| @intFromPtr(ptr) else 0,
+        .read => if (request.buffer) |p| @intFromPtr(p) else 0,
+        .write => if (request.const_buffer) |p| @intFromPtr(p) else 0,
         .flush, .none => 0,
     };
-    const public_request = StorageRequest{
-        .handle = request.handle,
-        .operation = @intFromEnum(request.kind),
-        .lba = request.lba,
-        .sectors = request.sectors,
-        .buffer_bytes = @intCast(request.buffer_len),
-        .buffer_addr = buffer_addr,
-        .complete = request.complete,
-    };
-    const callback = enterStorageCallback(backend.owner) orelse return -1;
-    defer leaveStorageCallback(callback);
-    return submit(backend.descriptor.context, &public_request);
+    const public_request = StorageRequest{ .handle = request.handle, .operation = @intFromEnum(request.kind), .lba = request.lba, .sectors = request.sectors, .buffer_bytes = @intCast(request.buffer_len), .buffer_addr = buffer_addr, .complete = request.complete };
+    return r4os_rust_driver_storage_async(ctx, &public_request);
 }
 
 fn r4dStorageCancel(ctx: ?*anyopaque, handle: u64, reason: u32) i32 {
-    const raw = ctx orelse return -1;
-    const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
-    const cancel = storageBackendCancel(backend.descriptor) orelse return -1;
-    const callback = enterStorageCallback(backend.owner) orelse return -1;
-    defer leaveStorageCallback(callback);
-    return cancel(backend.descriptor.context, handle, reason);
+    return r4os_rust_driver_storage_control(ctx, false, handle, reason);
 }
 
 fn r4dStorageReset(ctx: ?*anyopaque, reason: u32) i32 {
-    const raw = ctx orelse return -1;
-    const backend: *R4DStorageBackend = @ptrCast(@alignCast(raw));
-    const reset_fn = storageBackendReset(backend.descriptor) orelse return -1;
-    const callback = enterStorageCallback(backend.owner) orelse return -1;
-    defer leaveStorageCallback(callback);
-    return reset_fn(backend.descriptor.context, reason);
+    return r4os_rust_driver_storage_control(ctx, true, 0, reason);
 }
 
-const StorageCleanupResult = struct {
+const StorageCleanupResult = extern struct {
     removed: u32 = 0,
     remaining: u32 = 0,
 };
 
-const StorageCleanupEntry = struct {
+const StorageCleanupEntry = extern struct {
     backend_index: usize = 0,
-    token: storage.UnregisterToken = .{},
+    token: NativeStorageToken = .{},
 };
 
-const StorageCleanupPlan = struct {
+const StorageCleanupPlan = extern struct {
     entries: [MAX_R4D_STORAGE_BACKENDS]StorageCleanupEntry = .{StorageCleanupEntry{}} ** MAX_R4D_STORAGE_BACKENDS,
     count: usize = 0,
 };
 
-fn prepareStorageOwnerCleanup(owner: u32, plan: *StorageCleanupPlan) bool {
-    plan.* = .{};
-    var index: usize = 0;
-    while (index < r4d_storage_backends.len) : (index += 1) {
-        const backend = &r4d_storage_backends[index];
-        if (!backend.used or backend.owner != owner) continue;
-        const token = storage.prepareUnregister(backend.block_index) orelse {
-            cancelStorageOwnerCleanup(plan);
-            return false;
-        };
-        plan.entries[plan.count] = .{
-            .backend_index = index,
-            .token = token,
-        };
-        plan.count += 1;
-    }
-    return true;
-}
-
-fn cancelStorageOwnerCleanup(plan: *StorageCleanupPlan) void {
-    while (plan.count != 0) {
-        plan.count -= 1;
-        _ = storage.cancelUnregister(&plan.entries[plan.count].token);
-    }
-}
-
-fn commitStorageOwnerCleanup(plan: *StorageCleanupPlan) StorageCleanupResult {
-    var result = StorageCleanupResult{};
-    var prepared_index: usize = 0;
-    while (prepared_index < plan.count) : (prepared_index += 1) {
-        const entry = &plan.entries[prepared_index];
-        const backend = &r4d_storage_backends[entry.backend_index];
-        if (!backend.used) {
-            _ = storage.cancelUnregister(&entry.token);
-            result.remaining +|= 1;
-            continue;
-        }
-        if (backend.descriptor.shutdown) |shutdown| {
-            const shutdown_result = shutdown(backend.descriptor.context);
-            if (shutdown_result != 0) {
-                bootlog.puts("[R4D] storage finalizer failed owner=");
-                bootlog.putDec(backend.owner);
-                bootlog.puts(" block=");
-                bootlog.putDec(backend.block_index);
-                bootlog.puts(" code=");
-                const signed_result: i64 = shutdown_result;
-                const magnitude: u64 = @intCast(if (signed_result < 0) -signed_result else signed_result);
-                bootlog.putDec(magnitude);
-                bootlog.puts("\r\n");
-                _ = storage.cancelUnregister(&entry.token);
-                result.remaining +|= 1;
-                continue;
-            }
-        }
-        if (!storage.commitUnregister(&entry.token)) {
-            _ = storage.cancelUnregister(&entry.token);
-            result.remaining +|= 1;
-            continue;
-        }
-        backend.* = R4DStorageBackend{};
-        result.removed +|= 1;
-    }
-    plan.count = 0;
-    return result;
-}
-
-fn setAudioOwnerClosing(owner: u32, closing: bool) bool {
-    for (&r4d_audio_backends) |*backend| {
-        if (!backend.used or backend.owner != owner) continue;
-        if (!audio.setAudioBackendClosing(backend.name[0..backend.name_len], closing)) return false;
-    }
-    return true;
-}
-
-const AudioOwnerCleanupResult = struct { removed: u32 = 0, failed: bool = false };
-
-fn cleanupAudioOwner(owner: u32) AudioOwnerCleanupResult {
-    var result: AudioOwnerCleanupResult = .{};
-    var index: usize = 0;
-    while (index < r4d_audio_backends.len) : (index += 1) {
-        const backend = &r4d_audio_backends[index];
-        if (!backend.used or backend.owner != owner) continue;
-        if (backend.descriptor.shutdown) |shutdown| {
-            if (shutdown(backend.descriptor.context) != 0) {
-                result.failed = true;
-                continue;
-            }
-        }
-        if (audio.unregisterAudioBackendByName(backend.name[0..backend.name_len]) != 0) {
-            result.failed = true;
-            continue;
-        }
-        backend.* = R4DAudioBackend{};
-        result.removed += 1;
-    }
-    return result;
-}
-
-fn cleanupNetOwner(owner: u32) NetOwnerCleanupResult {
-    var result: NetOwnerCleanupResult = .{};
-    var index: usize = 0;
-    while (index < r4d_net_backends.len) : (index += 1) {
-        const backend = &r4d_net_backends[index];
-        if (!backend.used or backend.owner != owner) continue;
-        if (backend.descriptor.shutdown) |shutdown| {
-            if (shutdown(backend.descriptor.context) != 0) {
-                result.failed = true;
-                continue;
-            }
-        }
-        const adapter_index = net.indexForRegistration(backend.registration_id) orelse {
-            result.failed = true;
-            continue;
-        };
-        const removed_adapter = net.unregister(adapter_index);
-        if (!removed_adapter) {
-            result.failed = true;
-            continue;
-        }
-        backend.* = R4DNetBackend{};
-        result.removed += 1;
-    }
-    return result;
-}
-
-fn ownerHasNetBackend(owner: u32) bool {
-    for (&r4d_net_backends) |*backend| {
-        if (backend.used and backend.owner == owner) return true;
-    }
-    return false;
-}
-
-fn findR4DStorageBackendByName(name: [*:0]const u8) ?*R4DStorageBackend {
-    var index: usize = 0;
-    while (index < r4d_storage_backends.len) : (index += 1) {
-        const backend = &r4d_storage_backends[index];
-        if (backend.used and zEqSlice(name, backend.name[0..backend.name_len])) return backend;
-    }
-    return null;
-}
-
-fn findR4DNetBackend(adapter_index: usize) ?*R4DNetBackend {
-    const adapter = net.get(adapter_index) orelse return null;
-    return findR4DNetRegistration(@intCast(adapter.registration_id));
-}
-
-fn findR4DNetRegistration(registration: i32) ?*R4DNetBackend {
-    if (registration <= 0) return null;
-    for (&r4d_net_backends) |*backend| {
-        if (backend.used and backend.registration_id == @as(u32, @intCast(registration))) return backend;
-    }
-    return null;
-}
-
-fn freeR4DStorageBackendSlot() ?usize {
-    var index: usize = 0;
-    while (index < r4d_storage_backends.len) : (index += 1) {
-        if (!r4d_storage_backends[index].used) return index;
-    }
-    return null;
-}
-
-fn freeR4DNetBackendSlot() ?usize {
-    var index: usize = 0;
-    while (index < r4d_net_backends.len) : (index += 1) {
-        if (!r4d_net_backends[index].used) return index;
-    }
-    return null;
-}
-
-fn freeR4DAudioBackendSlot() ?usize {
-    var index: usize = 0;
-    while (index < r4d_audio_backends.len) : (index += 1) {
-        if (!r4d_audio_backends[index].used) return index;
-    }
-    return null;
-}
-
-fn trackDmaAllocation(owner: u32, phys_addr: u64, bytes: u32) bool {
-    var index: usize = 0;
-    while (index < dma_allocations.len) : (index += 1) {
-        if (dma_allocations[index].used) continue;
-        dma_allocations[index] = .{
-            .used = true,
-            .owner = owner,
-            .phys_addr = phys_addr,
-            .bytes = bytes,
-        };
-        return true;
-    }
-    return false;
-}
-
-fn takeDmaAllocation(owner: u32, phys_addr: u64) ?DmaAllocation {
-    if (owner == 0) return null;
-    var index: usize = 0;
-    while (index < dma_allocations.len) : (index += 1) {
-        if (!dma_allocations[index].used or dma_allocations[index].owner != owner or dma_allocations[index].phys_addr != phys_addr) continue;
-        const allocation = dma_allocations[index];
-        dma_allocations[index] = .{};
-        return allocation;
-    }
-    return null;
-}
-
-fn cleanupDmaOwner(owner: u32) u32 {
-    var removed: u32 = 0;
-    var mapping_index: usize = 0;
-    while (mapping_index < dma_mappings.len) : (mapping_index += 1) {
-        if (!dma_mappings[mapping_index].used or dma_mappings[mapping_index].owner != owner) continue;
-        releaseDmaMapping(mapping_index, true);
-        removed += 1;
-    }
-    var pin_index: usize = 0;
-    while (pin_index < dma_pins.len) : (pin_index += 1) {
-        if (!dma_pins[pin_index].used or dma_pins[pin_index].owner != owner) continue;
-        if (dma_pins[pin_index].map_count != 0) continue;
-        dma_pins[pin_index] = .{};
-        removed += 1;
-    }
-    var index: usize = 0;
-    while (index < dma_allocations.len) : (index += 1) {
-        const allocation = dma_allocations[index];
-        if (!allocation.used or allocation.owner != owner) continue;
-        const frames = frameCount(allocation.bytes) orelse 0;
-        if (frames > 0) phys.freeContiguousFrames(allocation.phys_addr, frames);
-        dma_allocations[index] = .{};
-        removed += 1;
-    }
-    return removed;
-}
+const AudioOwnerCleanupResult = extern struct { removed: u32 = 0, failed: bool = false };
 
 fn netBus(kind: u8) net.Bus {
     return switch (kind) {
@@ -3166,870 +1065,1081 @@ fn storageController(descriptor: *const StorageBackendDescriptor) []const u8 {
     return descriptor.controller[0..len];
 }
 
-fn validSectorSize(size: u32) bool {
-    return size == 512 or size == 1024 or size == 2048 or size == 4096;
-}
-
-fn pciInfoFromDevice(dev: pci_inventory.Device) PciDeviceInfo {
-    const route = pci_inventory.readInterruptRoute(dev);
-    return .{
-        .bus_kind = dev.bus_kind,
-        .bus = dev.bus,
-        .device = dev.device,
-        .function = dev.function,
-        .vendor_id = dev.vendor_id,
-        .device_id = dev.device_id,
-        .class_code = dev.class_code,
-        .subclass = dev.subclass,
-        .prog_if = dev.prog_if,
-        .interrupt_line = route.line,
-        .interrupt_pin = route.pin,
-        .command = pci_inventory.readCommand(dev),
-    };
-}
-
-fn macIsZero(mac: [6]u8) bool {
-    var index: usize = 0;
-    while (index < mac.len) : (index += 1) {
-        if (mac[index] != 0) return false;
-    }
-    return true;
-}
-
-fn logRegister(kind: []const u8, name: [*:0]const u8) i32 {
-    bootlog.puts("[R4D] register ");
-    bootlog.puts(kind);
-    bootlog.puts(" backend ");
-    putZ(name);
-    bootlog.puts("\r\n");
-    return 0;
-}
-
-fn putZ(text: [*:0]const u8) void {
-    var i: usize = 0;
-    while (text[i] != 0 and i < 512) : (i += 1) {
-        bootlog.putc(text[i]);
-    }
-}
-
-fn copyOptionValue(value: []const u8) void {
-    @memset(option_value_z[0..], 0);
-    const n = if (value.len < option_value_z.len) value.len else option_value_z.len - 1;
-    if (n > 0) @memcpy(option_value_z[0..n], value[0..n]);
-}
-
-fn copyZName(src: [*:0]const u8, dst: []u8, len_out: *usize) void {
-    var len: usize = 0;
-    while (len + 1 < dst.len and src[len] != 0) : (len += 1) {
-        dst[len] = src[len];
-    }
-    if (len < dst.len) dst[len] = 0;
-    len_out.* = len;
-}
-
 fn zSlice(src: [*:0]const u8) []const u8 {
     var len: usize = 0;
     while (len < 512 and src[len] != 0) : (len += 1) {}
     return src[0..len];
 }
 
-fn alignUp(value: u64, alignment: u64) u64 {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
-
-fn alignDown(value: u64, alignment: u64) u64 {
-    return value & ~(alignment - 1);
-}
-
-fn zEqSlice(z: [*:0]const u8, slice: []const u8) bool {
-    var i: usize = 0;
-    while (i < slice.len) : (i += 1) {
-        if (upper(z[i]) != upper(slice[i])) return false;
-    }
-    return z[i] == 0;
-}
-
-fn upper(c: u8) u8 {
-    if (c >= 'a' and c <= 'z') return c - ('a' - 'A');
-    return c;
-}
-
-fn currentGfxOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
-    if (current_owner == 0 or !current_owner_guard.ownedByCurrent()) return error.WrongOwner;
-    return currentBufferOwner(admission);
-}
-
 // Common BOs support normal Work. The real driver-start binding is installed
 // before Init, closed under the same BO metadata owner and retired only after
 // work and hardware leases quiesce. A cached table conveys no caller identity.
 fn currentBufferOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
-    if (irq_router.inDispatch() or scheduler.current() == null or currentStorageCallbackOwner() != 0 or driver_threads.currentOwner() != 0) return error.WrongOwner;
-    const owner = activeOwner();
-    if (owner == 0) return error.WrongOwner;
-    return gfx_memory.owner(owner, admission);
+    return nativeGfxOwner(0, admission);
 }
 
 // Receiver metadata supports authenticated Init/Work/Shutdown without the
 // wait-spanning lifecycle guard. Read the already-bound start epoch through
 // the resident runtime owner; do not widen PCI/DMA/display admission or use
 // any caller-supplied driver identity.
-fn currentReceiverOwner(admission: bool) gfx_buffers.Error!gfx_buffers.Owner {
-    if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0 or driver_threads.currentOwner() != 0) return error.WrongOwner;
-    const owner = activeOwner();
-    if (owner == 0) return error.WrongOwner;
-    var snapshot: outputs_contract.DriverHeapStats = .{};
-    if (driver_heap.stats(owner, &snapshot) != outputs_contract.driver_heap_ok or snapshot.owner_epoch == 0) return error.Stale;
-    if (admission and snapshot.closing != 0) return error.Closed;
-    return .{ .kind = .driver, .id = owner, .generation = snapshot.owner_epoch };
-}
 
 const gfx_queue_api = @import("gfx_driver_queue.zig");
-fn heapOwner() u32 {
-    if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return 0;
-    const thread_owner = driver_threads.currentOwner();
-    if (thread_owner != 0) return thread_owner;
-    return activeOwner();
+
+fn semaphoreQuery(out: *outputs_contract.DriverSemaphoreApi) callconv(.c) i32 {
+    return r4os_rust_driver_semaphore_api(out);
 }
-fn semaphoreContextFlags() callconv(.c) u32 {
-    if (runtimeOwner() == 0) return 0;
-    if (irq_router.inDispatch()) return outputs_contract.driver_semaphore_context_irq;
-    return if (currentStorageCallbackOwner() == 0 and driver_semaphores.canSleep()) outputs_contract.driver_semaphore_context_sleepable else 0;
+
+fn threadQuery(out: *outputs_contract.DriverThreadApi) callconv(.c) i32 {
+    return r4os_rust_driver_thread_api(out);
 }
-fn semaphoreQuery(output: *outputs_contract.DriverSemaphoreApi) callconv(.c) i32 {
-    if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverSemaphoreApi)) return outputs_contract.driver_semaphore_error_invalid;
-    output.* = .{};
-    const result = driver_semaphores.query(runtimeOwner());
-    if (result != 0) return result;
-    output.* = .{ .create = @intFromPtr(&semaphoreCreate), .acquire = @intFromPtr(&semaphoreAcquire), .release = @intFromPtr(&semaphoreRelease), .destroy = @intFromPtr(&semaphoreDestroy), .status = @intFromPtr(&semaphoreStatus), .stats = @intFromPtr(&semaphoreStats), .context_flags = @intFromPtr(&semaphoreContextFlags) };
-    return outputs_contract.driver_semaphore_ok;
+
+fn heapQuery(out: *outputs_contract.DriverHeapApi) callconv(.c) i32 {
+    return r4os_rust_driver_heap_api(out);
 }
-fn semaphoreCreate(initial: u32, maximum: u32, handle: *u64) callconv(.c) i32 {
-    handle.* = 0;
-    if (semaphoreContextFlags() & outputs_contract.driver_semaphore_context_sleepable == 0) return outputs_contract.driver_semaphore_error_context;
-    return driver_semaphores.create(runtimeOwner(), initial, maximum, handle);
-}
-fn semaphoreAcquire(handle: u64, timeout_ticks: u64) callconv(.c) i32 {
-    if (timeout_ticks != 0 and semaphoreContextFlags() & outputs_contract.driver_semaphore_context_sleepable == 0) return outputs_contract.driver_semaphore_error_context;
-    return driver_semaphores.acquire(runtimeOwner(), handle, timeout_ticks);
-}
-fn semaphoreRelease(handle: u64) callconv(.c) i32 {
-    return driver_semaphores.release(runtimeOwner(), handle);
-}
-fn semaphoreDestroy(handle: u64) callconv(.c) i32 {
-    if (semaphoreContextFlags() & outputs_contract.driver_semaphore_context_sleepable == 0) return outputs_contract.driver_semaphore_error_context;
-    return driver_semaphores.destroy(runtimeOwner(), handle);
-}
-fn semaphoreStatus(handle: u64, output: *outputs_contract.DriverSemaphoreStatus) callconv(.c) i32 {
-    return driver_semaphores.status(runtimeOwner(), handle, output);
-}
-fn semaphoreStats(output: *outputs_contract.DriverSemaphoreStats) callconv(.c) i32 {
-    return driver_semaphores.stats(runtimeOwner(), output);
-}
-fn threadQuery(output: *outputs_contract.DriverThreadApi) callconv(.c) i32 {
-    if (output.version != 1 or output.size < outputs_contract.driver_thread_api_min_bytes) return outputs_contract.driver_thread_error_invalid;
-    const bytes: usize = if (output.size >= @sizeOf(outputs_contract.DriverThreadApi)) @sizeOf(outputs_contract.DriverThreadApi) else if (output.size >= @offsetOf(outputs_contract.DriverThreadApi, "current_request")) @offsetOf(outputs_contract.DriverThreadApi, "current_request") else outputs_contract.driver_thread_api_min_bytes;
-    var service: outputs_contract.DriverThreadApi = .{ .size = @intCast(bytes) };
-    const destination = @as([*]u8, @ptrCast(output))[0..bytes];
-    @memcpy(destination, std.mem.asBytes(&service)[0..bytes]);
-    const owner = heapOwner();
-    if (owner == 0) return outputs_contract.driver_thread_error_owner;
-    const result = driver_threads.query(owner);
-    if (result != outputs_contract.driver_thread_ok) return result;
-    service = .{ .size = @intCast(bytes), .start = @intFromPtr(&threadStart), .stop = @intFromPtr(&threadStop), .join = @intFromPtr(&threadJoin), .release = @intFromPtr(&threadRelease), .status = @intFromPtr(&threadStatus), .current = @intFromPtr(&threadCurrent), .sleep_ticks = @intFromPtr(&threadSleepTicks), .stats = @intFromPtr(&threadStats), .abort_current = @intFromPtr(&threadAbortCurrent), .current_request = @intFromPtr(&threadCurrentRequest) };
-    @memcpy(destination, std.mem.asBytes(&service)[0..bytes]);
-    return outputs_contract.driver_thread_ok;
-}
-fn threadCurrentRequest(output: *outputs_contract.DriverThreadRequest) callconv(.c) i32 {
-    return driver_threads.currentRequest(heapOwner(), output);
-}
-fn threadAbortCurrent(result: i32) callconv(.c) i32 {
-    const owner = heapOwner();
-    if (owner == 0) return outputs_contract.driver_thread_error_owner;
-    return driver_threads.abortCurrent(owner, result);
-}
-fn threadStart(input: *const outputs_contract.DriverThreadRequest, output: *u64) callconv(.c) i32 {
-    const owner = heapOwner();
-    // Once data admission closes, only the synchronous lifecycle owner can
-    // launch a cleanup callback. Stopped tasks/Work cannot grow another tree.
-    if (driver_heap.query(owner) == outputs_contract.driver_heap_error_closed and
-        (owner != current_owner or !current_owner_guard.ownedByCurrent())) {
-        output.* = 0;
-        return outputs_contract.driver_thread_error_closed;
-    }
-    return driver_threads.start(owner, input, output);
-}
-fn threadStop(handle: u64) callconv(.c) i32 {
-    return driver_threads.stop(heapOwner(), handle);
-}
-fn threadJoin(handle: u64, timeout_ticks: u64, result: *i32) callconv(.c) i32 {
-    return driver_threads.join(heapOwner(), handle, timeout_ticks, result);
-}
-fn threadRelease(handle: u64) callconv(.c) i32 {
-    return driver_threads.release(heapOwner(), handle);
-}
-fn threadStatus(handle: u64, output: *outputs_contract.DriverThreadStatus) callconv(.c) i32 {
-    return driver_threads.status(heapOwner(), handle, output);
-}
-fn threadCurrent() callconv(.c) u64 {
-    return driver_threads.current(heapOwner());
-}
-fn threadSleepTicks(ticks: u64) callconv(.c) i32 {
-    return driver_threads.sleepTicks(heapOwner(), ticks);
-}
-fn threadStats(output: *outputs_contract.DriverThreadStats) callconv(.c) i32 {
-    return driver_threads.stats(heapOwner(), output);
-}
-fn heapQuery(output: *outputs_contract.DriverHeapApi) callconv(.c) i32 {
-    if (output.version != 1 or output.size < @sizeOf(outputs_contract.DriverHeapApi)) return outputs_contract.driver_heap_error_invalid;
-    output.* = .{};
-    const owner = heapOwner();
-    if (owner == 0) return outputs_contract.driver_heap_error_owner;
-    const result = driver_heap.query(owner);
-    if (result != outputs_contract.driver_heap_ok) return result;
-    output.* = .{ .allocate = @intFromPtr(&heapAllocate), .release = @intFromPtr(&heapRelease), .stats = @intFromPtr(&heapStats) };
-    return outputs_contract.driver_heap_ok;
-}
-fn heapAllocate(bytes: u64, alignment: u32, output: *outputs_contract.DriverHeapAllocation) callconv(.c) i32 {
-    return driver_heap.allocate(heapOwner(), bytes, alignment, output);
-}
-fn heapRelease(handle: u64) callconv(.c) i32 {
-    return driver_heap.release(heapOwner(), handle);
-}
-fn heapStats(output: *outputs_contract.DriverHeapStats) callconv(.c) i32 {
-    return driver_heap.stats(heapOwner(), output);
-}
+
 // Work callbacks already carry an authenticated owner, but must join the
 // lifecycle guard before resource I/O. Never wait here: another owner may
 // itself be waiting for this worker. The caller can reschedule on BUSY.
-fn enterResourceOwner() i32 {
-    if (irq_router.inDispatch() or currentStorageCallbackOwner() != 0) return outputs_contract.driver_resource_error_owner;
-    const owner = activeOwner();
-    if (owner == 0) return outputs_contract.driver_resource_error_owner;
-    if (!enterOwnerBounded(owner, 0)) return outputs_contract.driver_resource_error_busy;
-    return @intCast(owner);
+
+fn resourceQuery(out: *outputs_contract.DriverResourceApi) callconv(.c) i32 {
+    return r4os_rust_driver_resource_api(out);
 }
-fn resourceQuery(output: *outputs_contract.DriverResourceApi) callconv(.c) i32 {
-    const owner = enterResourceOwner();
-    if (owner < 0) return owner;
-    defer _ = leaveOwner();
-    _ = driver_resources.state.current(@intCast(owner)) catch return outputs_contract.driver_resource_error_stale;
-    const value: outputs_contract.DriverResourceApi = .{ .stat = @intFromPtr(&resourceStat), .read_at = @intFromPtr(&resourceReadAt), .now_ns = @intFromPtr(&driver_resources.nowNs),
-        .acpi_stat = @intFromPtr(&resourceAcpiStat), .acpi_read_at = @intFromPtr(&resourceAcpiReadAt), .platform_query = @intFromPtr(&platformQuery) };
-    if (!@import("driver_resource_state.zig").publishApi(output, value)) return outputs_contract.driver_resource_error_invalid;
-    return outputs_contract.driver_resource_ok;
-}
-fn platformIdentity() ?struct { owner: u32, epoch: u64 } {
-    const owner = heapOwner();
-    if (owner == 0) return null;
-    var stats: outputs_contract.DriverHeapStats = .{};
-    if (driver_heap.stats(owner, &stats) != 0 or stats.owner_epoch == 0 or stats.closing != 0) return null;
-    return .{ .owner = owner, .epoch = stats.owner_epoch };
-}
-fn platformQuery(output: *outputs_contract.DriverPlatformApi) callconv(.c) i32 {
-    _ = platformIdentity() orelse return outputs_contract.driver_resource_error_owner;
-    if (@intFromPtr(output) == 0 or @intFromPtr(output) % @alignOf(outputs_contract.DriverPlatformApi) != 0 or
-        output.version != 1 or output.size < @sizeOf(outputs_contract.DriverPlatformApi)) return outputs_contract.driver_resource_error_invalid;
-    output.* = .{ .rsdp = @intFromPtr(&platformRsdp), .physical_view = @intFromPtr(&platformPhysicalView), .input_submit = @intFromPtr(&platformInputSubmit) };
-    return outputs_contract.driver_resource_ok;
-}
-fn platformRsdp() callconv(.c) u64 {
-    _ = platformIdentity() orelse return 0;
-    return @import("../platform/firmware_view.zig").root();
-}
-fn platformPhysicalView(physical: u64, bytes: u64, output: *u64) callconv(.c) i32 {
-    _ = platformIdentity() orelse return outputs_contract.driver_resource_error_owner;
-    if (@intFromPtr(output) == 0 or @intFromPtr(output) % 8 != 0) return outputs_contract.driver_resource_error_invalid;
-    const address = @import("../platform/firmware_view.zig").view(physical, bytes) orelse return outputs_contract.driver_resource_error_source;
-    output.* = address;
-    return outputs_contract.driver_resource_ok;
-}
-fn platformInputSubmit(kind: u32, value: u32) callconv(.c) i32 {
-    const identity = platformIdentity() orelse return outputs_contract.driver_resource_error_owner;
-    return @import("../driver/input/platform_input.zig").submit(identity.owner, identity.epoch, kind, value);
-}
-fn resourceStat(name: [*]const u8, length: u32, output: *outputs_contract.DriverResourceInfo) callconv(.c) i32 {
-    const owner = enterResourceOwner();
-    if (owner < 0) return owner;
-    defer _ = leaveOwner();
-    if (length == 0 or length > 63) return outputs_contract.driver_resource_error_invalid;
-    return driver_resources.stat(@intCast(owner), name[0..length], output);
-}
-fn resourceReadAt(id: u64, offset: u64, output: [*]u8, length: u32, deadline_ns: u64) callconv(.c) i32 {
-    const owner = enterResourceOwner();
-    if (owner < 0) return owner;
-    defer _ = leaveOwner();
-    if (length == 0 or length > outputs_contract.driver_resource_max_read_bytes) return outputs_contract.driver_resource_error_invalid;
-    return driver_resources.readAt(@intCast(owner), id, offset, output[0..length], deadline_ns);
-}
-fn resourceAcpiStat(signature: u32, index: u32, output: *outputs_contract.DriverFirmwareTableInfo) callconv(.c) i32 {
-    const owner = enterResourceOwner();
-    if (owner < 0) return owner;
-    defer _ = leaveOwner();
-    return driver_resources.acpiStat(@intCast(owner), signature, index, output);
-}
-fn resourceAcpiReadAt(handle: u64, offset: u64, output: [*]u8, length: u32, deadline_ns: u64) callconv(.c) i32 {
-    const owner = enterResourceOwner();
-    if (owner < 0) return owner;
-    defer _ = leaveOwner();
-    if (@intFromPtr(output) == 0 or length == 0 or length > outputs_contract.driver_resource_max_read_bytes) return outputs_contract.driver_resource_error_invalid;
-    return driver_resources.acpiReadAt(@intCast(owner), handle, offset, output[0..length], deadline_ns);
-}
+
 const native_display = @import("../display/native_driver.zig");
 fn gfxDisplayQuery(output: *outputs_contract.GfxDriverDisplayApi) callconv(.c) i32 {
-    _ = currentGfxOwner(true) catch |err| return gfx_api.status(err);
-    if (@intFromPtr(output) == 0 or output.version != 1 or output.size < 40) return outputs_contract.gfx_output_error_invalid;
-    // Version-1 consumers may still allocate exactly the original 40-byte
-    // prefix. Publish only complete slots within their actual capacity.
-    const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverDisplayApi));
-    const value: outputs_contract.GfxDriverDisplayApi = .{ .size = bytes, .boot_info = @intFromPtr(&gfxDisplayBootInfo), .prepare = @intFromPtr(&gfxDisplayPrepare), .transition = @intFromPtr(&gfxDisplayTransition), .schedule = @intFromPtr(&gfxDisplaySchedule), .boot_hold = @intFromPtr(&gfxBootHold), .boot_finish = @intFromPtr(&gfxBootFinish), .prepare_held = @intFromPtr(&gfxDisplayPrepareHeld), .presentation_stats = @intFromPtr(&gfxDisplayPresentationStats),
-        .cursor_configure = @intFromPtr(&gfxCursorConfigure), .cursor_take = @intFromPtr(&gfxCursorTake), .cursor_complete = @intFromPtr(&gfxCursorComplete),
-        .presentation_info = @intFromPtr(&gfxDisplayPresentationInfo),
-        .output_register = @intFromPtr(&gfxDisplayOutputRegister), .output_transition = @intFromPtr(&gfxDisplayOutputTransition),
-        .device_reset = @intFromPtr(&gfxDisplayDeviceReset), .prepare_reset = @intFromPtr(&gfxDisplayPrepareReset),
-        .terminal_release = @intFromPtr(&gfxDisplayTerminalRelease), .resume_headless = @intFromPtr(&gfxDisplayResumeHeadless) };
-    @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
-    return outputs_contract.gfx_output_ok;
+    return r4os_rust_driver_gfx_display_query(output);
 }
-fn gfxBootHold(input: *const outputs_contract.GfxBootHoldRequest, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+extern fn r4os_rust_driver_gfx_display_query(output: *outputs_contract.GfxDriverDisplayApi) i32;
+
+extern fn r4os_rust_driver_gfx_boot_hold(input: *const outputs_contract.GfxBootHoldRequest, output: *outputs_contract.GfxNativeState) i32;
+
+extern fn r4os_rust_driver_gfx_display_presentation_stats(input: *const outputs_contract.DisplayPresentationStats) i32;
+
+extern fn r4os_rust_driver_gfx_display_presentation_info(input: *const outputs_contract.DisplayPresentationInfo) i32;
+
+extern fn r4os_rust_driver_gfx_display_output_register(input: *const outputs_contract.GfxAdditionalOutput, output: *outputs_contract.GfxOutputTarget) i32;
+
+extern fn r4os_rust_driver_gfx_display_output_transition(input: *const outputs_contract.GfxOutputTarget, operation: u32, quiesced: u32) i32;
+
+extern fn r4os_rust_driver_gfx_cursor_configure(input: *const outputs_contract.DisplayCursorInfo) i32;
+
+extern fn r4os_rust_driver_gfx_cursor_take(backend: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverCursorJob) i32;
+
+extern fn r4os_rust_driver_gfx_cursor_complete(input: *const outputs_contract.GfxDriverCursorCompletion) i32;
+
+extern fn r4os_rust_driver_gfx_boot_finish(generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) i32;
+
+extern fn r4os_rust_driver_gfx_display_boot_info(output: *outputs_contract.GfxNativeBootInfo) i32;
+
+extern fn r4os_rust_driver_gfx_display_prepare(input: *const outputs_contract.GfxNativeRegistration, output: *outputs_contract.GfxNativeState) i32;
+
+extern fn r4os_rust_driver_gfx_display_prepare_held(input: *const outputs_contract.GfxNativeRegistration, generation: u64, output: *outputs_contract.GfxNativeState) i32;
+
+extern fn r4os_rust_driver_gfx_display_transition(generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) i32;
+
+extern fn r4os_rust_driver_gfx_display_device_reset(input: *const outputs_contract.GfxBackendBinding, generation: u64, quiesced: u32, output: *outputs_contract.GfxNativeState) i32;
+
+extern fn r4os_rust_driver_gfx_display_resume_headless(input: *const outputs_contract.GfxBackendBinding, generation: u64, output: *outputs_contract.GfxNativeState) i32;
+
+extern fn r4os_rust_driver_gfx_display_terminal_release(input: *const outputs_contract.GfxBackendBinding, generation: u64, output: *outputs_contract.GfxNativeState) i32;
+
+extern fn r4os_rust_driver_gfx_display_prepare_reset(input: *const outputs_contract.GfxNativeRegistration, held_generation: u64, reset_generation: u64, output: *outputs_contract.GfxNativeState) i32;
+
+extern fn r4os_rust_driver_gfx_display_schedule(input: *const outputs_contract.GfxBackendBinding) i32;
+fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_output_query(output);
+}
+extern fn r4os_rust_driver_gfx_output_query(output: *outputs_contract.GfxDriverOutputApi) i32;
+fn gfxOutputPowerPublish(input: *const outputs_contract.GfxOutputPower) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_output_power_publish(input);
+}
+extern fn r4os_rust_driver_gfx_output_power_publish(input: *const outputs_contract.GfxOutputPower) i32;
+fn gfxPowerRead(input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxPowerRequest) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_power_read(input, output);
+}
+extern fn r4os_rust_driver_gfx_power_read(input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxPowerRequest) i32;
+fn gfxOutputRefreshPublish(input: *const outputs_contract.GfxOutputRefresh) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_output_refresh_publish(input);
+}
+extern fn r4os_rust_driver_gfx_output_refresh_publish(input: *const outputs_contract.GfxOutputRefresh) i32;
+fn gfxRefreshRead(input: *const outputs_contract.GfxOutputTarget, output: *outputs_contract.GfxRefreshRequest) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_refresh_read(input, output);
+}
+extern fn r4os_rust_driver_gfx_refresh_read(input: *const outputs_contract.GfxOutputTarget, output: *outputs_contract.GfxRefreshRequest) i32;
+fn gfxModeReadColor(ticket: u64, sequence: u64, output: *outputs_contract.GfxDriverModeColor) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_mode_read_color(ticket, sequence, output);
+}
+extern fn r4os_rust_driver_gfx_mode_read_color(ticket: u64, sequence: u64, output: *outputs_contract.GfxDriverModeColor) i32;
+fn gfxOutputColorPublish(input: *const outputs_contract.GfxOutputColorState) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_output_color_publish(input);
+}
+extern fn r4os_rust_driver_gfx_output_color_publish(input: *const outputs_contract.GfxOutputColorState) i32;
+fn gfxOutputPause(input: *const outputs_contract.GfxOutputId, paused: u32) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_output_pause(input, paused);
+}
+extern fn r4os_rust_driver_gfx_output_pause(input: *const outputs_contract.GfxOutputId, paused: u32) i32;
+fn gfxModeRestore(input: *const outputs_contract.GfxAtomicState, output: *outputs_contract.GfxModeStatus) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_mode_restore(input, output);
+}
+extern fn r4os_rust_driver_gfx_mode_restore(input: *const outputs_contract.GfxAtomicState, output: *outputs_contract.GfxModeStatus) i32;
+fn gfxModeStatus(ticket: u64, output: *outputs_contract.GfxModeStatus) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_mode_status(ticket, output);
+}
+extern fn r4os_rust_driver_gfx_mode_status(ticket: u64, output: *outputs_contract.GfxModeStatus) i32;
+fn gfxAudioPublish(input: *const outputs_contract.GfxAudioRoute) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_audio_publish(input);
+}
+extern fn r4os_rust_driver_gfx_audio_publish(input: *const outputs_contract.GfxAudioRoute) i32;
+fn gfxAudioQuery(location: u32, device: u32, index: u32, output: *outputs_contract.GfxAudioRoute) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_audio_query(location, device, index, output);
+}
+extern fn r4os_rust_driver_gfx_audio_query(location: u32, device: u32, index: u32, output: *outputs_contract.GfxAudioRoute) i32;
+const gfx_modes = @import("../display/mode_work.zig");
+fn gfxModeEnable(input: *const outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_mode_enable(input);
+}
+extern fn r4os_rust_driver_gfx_mode_enable(input: *const outputs_contract.GfxBackendBinding) i32;
+fn gfxModeTake(input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverModeJob) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_mode_take(input, output);
+}
+extern fn r4os_rust_driver_gfx_mode_take(input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverModeJob) i32;
+fn gfxModeComplete(input: *const outputs_contract.GfxDriverModeCompletion) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_mode_complete(input);
+}
+extern fn r4os_rust_driver_gfx_mode_complete(input: *const outputs_contract.GfxDriverModeCompletion) i32;
+fn gfxReceiverRegister(adapter: u32, output: *outputs_contract.GfxReceiverSource) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_receiver_register(adapter, output);
+}
+extern fn r4os_rust_driver_gfx_receiver_register(adapter: u32, output: *outputs_contract.GfxReceiverSource) i32;
+fn gfxReceiverReplace(input: *const outputs_contract.GfxReceiverUpdate) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_receiver_replace(input);
+}
+extern fn r4os_rust_driver_gfx_receiver_replace(input: *const outputs_contract.GfxReceiverUpdate) i32;
+fn gfxReceiverClose(input: *const outputs_contract.GfxReceiverSource) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_receiver_close(input);
+}
+extern fn r4os_rust_driver_gfx_receiver_close(input: *const outputs_contract.GfxReceiverSource) i32;
+fn gfxOutputPublish(input: *const outputs_contract.GfxOutputPublication, output: *outputs_contract.GfxOutputId) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_output_publish(input, output);
+}
+extern fn r4os_rust_driver_gfx_output_publish(input: *const outputs_contract.GfxOutputPublication, output: *outputs_contract.GfxOutputId) i32;
+fn gfxOutputWithdraw(input: *const outputs_contract.GfxOutputId) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_output_withdraw(input);
+}
+extern fn r4os_rust_driver_gfx_output_withdraw(input: *const outputs_contract.GfxOutputId) i32;
+fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_queue_query(output);
+}
+extern fn r4os_rust_driver_gfx_queue_query(output: *outputs_contract.GfxDriverQueueApi) i32;
+
+extern fn r4os_rust_driver_gfx_queue_register(input: *const outputs_contract.GfxBackendRegistration, output: *outputs_contract.GfxBackendBinding) i32;
+
+extern fn r4os_rust_driver_gfx_queue_register_profile(input: *const outputs_contract.GfxBackendRegistration, profile: *const outputs_contract.GfxBackendProfile, output: *outputs_contract.GfxBackendBinding) i32;
+
+extern fn r4os_rust_driver_gfx_queue_publish_properties(input: *const outputs_contract.GfxBackendBinding, properties: *const outputs_contract.GfxBackendProperties) i32;
+
+extern fn r4os_rust_driver_gfx_queue_read_native_info(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxNativeJobInfo) i32;
+
+extern fn r4os_rust_driver_gfx_queue_read_native_data(input: *const outputs_contract.GfxFence, offset: u32, output: [*]u8, count: u32) i32;
+
+extern fn r4os_rust_driver_gfx_queue_read_native_binding(input: *const outputs_contract.GfxFence, index: u32, output: *outputs_contract.GfxNativeBinding) i32;
+
+extern fn r4os_rust_driver_gfx_queue_owner_info(input: *const outputs_contract.GfxBackendBinding, timeline: u64, output: *outputs_contract.GfxQueueOwnerInfo) i32;
+
+extern fn r4os_rust_driver_gfx_queue_unregister(input: *const outputs_contract.GfxBackendBinding, quiesced: u32) i32;
+
+extern fn r4os_rust_driver_gfx_queue_take(input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverJob) i32;
+
+extern fn r4os_rust_driver_gfx_queue_read_render_list(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderList) i32;
+
+extern fn r4os_rust_driver_gfx_queue_read_render_grid_list(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderGridList) i32;
+
+extern fn r4os_rust_driver_gfx_queue_update_operations(input: *const outputs_contract.GfxBackendBinding, operations: u64) i32;
+
+extern fn r4os_rust_driver_gfx_queue_read_render_color_list(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderColorList) i32;
+
+extern fn r4os_rust_driver_gfx_queue_complete(input: *const outputs_contract.GfxFence, result: u32, quiesced: u32) i32;
+
+extern fn r4os_rust_driver_gfx_queue_reset(input: *const outputs_contract.GfxBackendBinding, quiesced: u32, output: *outputs_contract.GfxBackendBinding) i32;
+
+extern fn r4os_rust_driver_gfx_queue_segment(input: *const outputs_contract.GfxFence, which: u32, offset: u64, mask: u64, output: *outputs_contract.GfxDmaSegment) i32;
+
+extern fn r4os_rust_driver_gfx_queue_retain(input: *const outputs_contract.GfxFence, which: u32, output: *outputs_contract.GfxBufferReference) i32;
+
+extern fn r4os_rust_driver_gfx_queue_retain_scanout(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxBufferReference) i32;
+
+extern fn r4os_rust_driver_gfx_queue_begin_scanout(input: *const outputs_contract.GfxFence) i32;
+
+extern fn r4os_rust_driver_gfx_queue_scanout_retire_requested(input: *const outputs_contract.GfxFence) i32;
+
+extern fn r4os_rust_driver_gfx_buffer_create(input: *const outputs_contract.GfxBufferDescriptor, output: *outputs_contract.GfxBufferReference) i32;
+
+extern fn r4os_rust_driver_gfx_buffer_describe(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferDescriptor) i32;
+
+extern fn r4os_rust_driver_gfx_buffer_import(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferReference) i32;
+
+extern fn r4os_rust_driver_gfx_buffer_release(input: *const outputs_contract.GfxBufferHandle) i32;
+
+extern fn r4os_rust_driver_gfx_buffer_map(input: *const outputs_contract.GfxBufferHandle, access: u32, offset: u64, bytes: u64, output: *outputs_contract.GfxBufferMap) i32;
+
+extern fn r4os_rust_driver_gfx_buffer_unmap(input: *const outputs_contract.GfxBufferHandle) i32;
+
+extern fn r4os_rust_driver_gfx_device_acquire(reference: *const outputs_contract.GfxBufferHandle, request: *const outputs_contract.GfxDeviceRequest, output: *outputs_contract.GfxDeviceLease) i32;
+
+extern fn r4os_rust_driver_gfx_device_segment(lease: *const outputs_contract.GfxDeviceLease, offset: u64, output: *outputs_contract.GfxDmaSegment) i32;
+
+extern fn r4os_rust_driver_gfx_device_release(lease: *const outputs_contract.GfxDeviceLease, quiesced: u32) i32;
+
+extern fn r4os_rust_driver_gfx_mmio_map(request: *const outputs_contract.GfxMmioRequest, output: *outputs_contract.GfxMmioWindow) i32;
+
+extern fn r4os_rust_driver_gfx_mmio_unmap(window: *const outputs_contract.GfxBufferHandle, quiesced: u32) i32;
+
+extern fn r4os_rust_driver_gfx_collect() i32;
+
+extern fn r4os_rust_driver_gfx_owned_reserve(input: *const outputs_contract.GfxBufferDescriptor, cookie: u64, output: *outputs_contract.GfxOwnedBufferReservation) i32;
+
+extern fn r4os_rust_driver_gfx_owned_commit(input: *const outputs_contract.GfxOwnedBufferReservation, output: *outputs_contract.GfxBufferReference) i32;
+
+extern fn r4os_rust_driver_gfx_owned_abort(input: *const outputs_contract.GfxOwnedBufferReservation, quiesced: u32) i32;
+
+extern fn r4os_rust_driver_gfx_owned_take_release(adapter: u32, generation: u64, output: *outputs_contract.GfxOwnedBufferRelease) i32;
+
+extern fn r4os_rust_driver_gfx_owned_finish_release(input: *const outputs_contract.GfxOwnedBufferRelease, quiesced: u32) i32;
+
+extern fn r4os_rust_driver_gfx_reserved_span(base: u64, bytes: u64) i32;
+
+extern fn r4os_rust_driver_gfx_unmanaged_span(base: u64, bytes: u64) i32;
+
+fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_memory_query(output);
+}
+extern fn r4os_rust_driver_gfx_memory_query(output: *outputs_contract.GfxDriverMemoryApi) i32;
+
+extern fn r4os_rust_driver_gfx_virtual_register(input: *const outputs_contract.GfxNativeProvider, output: *outputs_contract.GfxBufferHandle) i32;
+
+extern fn r4os_rust_driver_gfx_virtual_unregister(input: *const outputs_contract.GfxBufferHandle) i32;
+
+extern fn r4os_rust_driver_gfx_virtual_take(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxVirtualJob) i32;
+
+extern fn r4os_rust_driver_gfx_virtual_complete(input: *const outputs_contract.GfxBufferHandle, completion: *const outputs_contract.GfxVirtualCompletion) i32;
+
+extern fn r4os_rust_driver_gfx_native_register(input: *const outputs_contract.GfxNativeProvider, output: *outputs_contract.GfxBufferHandle) i32;
+
+extern fn r4os_rust_driver_gfx_native_unregister(input: *const outputs_contract.GfxBufferHandle) i32;
+
+extern fn r4os_rust_driver_gfx_native_take(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxNativeJob) i32;
+
+extern fn r4os_rust_driver_gfx_native_complete(provider: *const outputs_contract.GfxBufferHandle, request: *const outputs_contract.GfxBufferHandle, result: i32, reference: *const outputs_contract.GfxBufferHandle) i32;
+
+extern fn r4os_rust_driver_gfx_memory_stats(output: *outputs_contract.GfxBufferStats) i32;
+
+extern fn r4os_rust_driver_gfx_memory_budget(input: *const outputs_contract.GfxDeviceBudgetRequest, output: *outputs_contract.GfxDeviceBudgetState) i32;
+
+extern fn r4os_rust_driver_gfx_telemetry_exchange(input: *const outputs_contract.GfxTelemetryState, output: *outputs_contract.GfxTelemetryDemand) i32;
+
+extern fn r4os_rust_driver_gfx_device_lost(adapter: u32, generation: u64, quiesced: u32) i32;
+
+fn gfxOutputBrightnessPublish(input: *const outputs_contract.GfxOutputBrightness) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_output_brightness_publish(input);
+}
+extern fn r4os_rust_driver_gfx_output_brightness_publish(input: *const outputs_contract.GfxOutputBrightness) i32;
+fn gfxBrightnessRead(input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxBrightnessRequest) callconv(.c) i32 {
+    return r4os_rust_driver_gfx_brightness_read(input, output);
+}
+extern fn r4os_rust_driver_gfx_brightness_read(input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxBrightnessRequest) i32;
+
+extern fn r4os_rust_driver_api_enter(owner: u32, ticks: u64) bool;
+extern fn r4os_rust_driver_api_leave() bool;
+extern fn r4os_rust_driver_api_owner_scalar(op: u8) u32;
+extern fn r4os_rust_driver_api_bind(owner: u32, slot: usize) bool;
+extern fn r4os_rust_driver_api_storage_enter(owner: u32, out: *StorageCallbackToken) bool;
+extern fn r4os_rust_driver_api_storage_leave(token: *const StorageCallbackToken) void;
+extern fn r4os_rust_driver_api_storage_owner() u32;
+extern fn r4os_rust_driver_api_runtime_owner(runtime: bool) u32;
+extern fn r4os_rust_driver_api_work_submit(handler: DriverWorkHandler, context: usize, flags: u32, out: *u32) i32;
+extern fn r4os_rust_driver_api_work_owned(handler: DriverWorkHandler, context: usize, out: *u32) i32;
+extern fn r4os_rust_driver_api_invoke_owned(owner: u32, handler: DriverWorkHandler, context: usize) i32;
+
+export fn r4os_zig_driver_module_identity(slot: usize, generation: *u32) callconv(.c) bool {
+    const module = @import("modules.zig").entryAt(slot) orelse return false;
+    if (module.kind != .r4d) return false;
+    generation.* = module.generation;
+    return true;
+}
+export fn r4os_zig_driver_gfx_bind(owner: u32, epoch: u64) callconv(.c) bool {
+    return gfx_memory.bind(owner, epoch);
+}
+export fn r4os_zig_driver_gfx_discard(owner: u32, epoch: u64) callconv(.c) bool {
+    return gfx_memory.discardEmptyBinding(owner, epoch);
+}
+export fn r4os_zig_driver_owned_buffer_admit() callconv(.c) i32 {
+    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
+    return 0;
+}
+
+extern fn r4os_rust_driver_dma_allocate(bytes: u32, alignment: u32, maximum: u64, out: *DmaBuffer) i32;
+extern fn r4os_rust_driver_dma_free_physical(physical: u64) void;
+extern fn r4os_rust_driver_dma_free(out: *DmaBuffer) void;
+extern fn r4os_rust_driver_dma_pin(address: u64, bytes: u32, flags: u32, out: *DmaPinnedBuffer) i32;
+extern fn r4os_rust_driver_dma_map(pin: *const DmaPinnedBuffer, c: *const DmaConstraints, direction: u32, out: *DmaMapping) i32;
+extern fn r4os_rust_driver_dma_sync(mapping: *const DmaMapping, cpu: bool, range: bool, offset: u32, bytes: u32) i32;
+extern fn r4os_rust_driver_dma_unmap(out: *DmaMapping) i32;
+extern fn r4os_rust_driver_dma_unpin(out: *DmaPinnedBuffer) i32;
+extern fn r4os_rust_driver_dma_cleanup(owner: u32) u32;
+
+extern fn r4os_rust_driver_api_table(template: *const Table) *Table;
+pub fn table() *Table {
+    return r4os_rust_driver_api_table(&table_template);
+}
+
+extern fn r4os_rust_driver_port_inb(port: u16) u8;
+extern fn r4os_rust_driver_port_outb(port: u16, value: u8) void;
+extern fn r4os_rust_driver_port_inw(port: u16) u16;
+extern fn r4os_rust_driver_port_outw(port: u16, value: u16) void;
+extern fn r4os_rust_driver_port_inl(port: u16) u32;
+extern fn r4os_rust_driver_port_outl(port: u16, value: u32) void;
+extern fn r4os_rust_driver_wait_ticks(ticks: u64) void;
+extern fn r4os_rust_driver_pci_count() u32;
+extern fn r4os_rust_driver_pci_at(index: u32, out: *PciDeviceInfo) i32;
+extern fn r4os_rust_driver_pci_find(class: u8, subclass: u8, start: u32, out: *PciDeviceInfo) i32;
+extern fn r4os_rust_driver_pci_read(kind: u8, bus: u8, device: u8, function: u8, offset: u16) u32;
+extern fn r4os_rust_driver_pci_write(kind: u8, bus: u8, device: u8, function: u8, offset: u16, value: u32) i32;
+extern fn r4os_rust_driver_pci_bar(kind: u8, bus: u8, device: u8, function: u8, index: u8, wide: bool) u64;
+extern fn r4os_rust_driver_pci_bus_master(kind: u8, bus: u8, device: u8, function: u8, flags: u32) i32;
+extern fn r4os_rust_driver_pci_map(kind: u8, bus: u8, device: u8, function: u8, index: u8, bytes: u32, flags: u32, out: *MmioRegion) i32;
+
+extern fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, function: u8) i32;
+extern fn r4os_rust_driver_msi_disable(kind: u8, bus: u8, device: u8, function: u8) i32;
+extern fn r4os_rust_driver_msi_unmask(owner: u32, irq: u8) bool;
+extern fn r4os_rust_driver_msi_cleanup(owner: u32, out: *MsiOwnerCleanupResult) void;
+export fn r4os_zig_driver_msi_log(msix: bool, irq: u8, vector: u32) callconv(.c) void {
+    bootlog.puts(if (msix) "[R4D] MSI-X prepared irq=" else "[R4D] MSI enabled irq=");
+    bootlog.putDec(irq);
+    bootlog.puts(" vector=");
+    bootlog.putDec(vector);
+    bootlog.puts("\r\n");
+}
+
+extern fn r4os_rust_driver_heap_owner() u32;
+extern fn r4os_rust_driver_semaphore_context() u32;
+extern fn r4os_rust_driver_heap_api(out: *outputs_contract.DriverHeapApi) i32;
+extern fn r4os_rust_driver_thread_api(out: *outputs_contract.DriverThreadApi) i32;
+extern fn r4os_rust_driver_semaphore_api(out: *outputs_contract.DriverSemaphoreApi) i32;
+
+extern fn r4os_rust_driver_resource_api(out: *outputs_contract.DriverResourceApi) i32;
+export fn r4os_zig_driver_resource_read_owned(owner: u32, id: u64, offset: u64, out: [*]u8, len: u32, deadline: u64) callconv(.c) i32 {
+    return driver_resources.readAt(owner, id, offset, out[0..len], deadline);
+}
+export fn r4os_zig_driver_platform_input(owner: u32, epoch: u64, kind: u32, value: u32) callconv(.c) i32 {
+    return @import("../driver/input/platform_input.zig").submit(owner, epoch, kind, value);
+}
+
+const OptionSpan = extern struct { pointer: [*]const u8, len: usize };
+const OptionView = extern struct { driver: OptionSpan, key: OptionSpan, value: OptionSpan };
+extern fn r4os_rust_driver_option(driver: [*:0]const u8, key: [*:0]const u8) [*:0]const u8;
+export fn r4os_zig_driver_option_count() callconv(.c) usize {
+    return boot_config.get().option_count;
+}
+export fn r4os_zig_driver_option(index: usize, out: *OptionView) callconv(.c) void {
+    const opt = &boot_config.get().options[index];
+    out.* = .{ .driver = .{ .pointer = &opt.driver, .len = opt.driver_len }, .key = .{ .pointer = &opt.key, .len = opt.key_len }, .value = .{ .pointer = &opt.value, .len = opt.value_len } };
+}
+
+extern fn r4os_rust_driver_audio_register(name: [*:0]const u8, descriptor: *const AudioBackendDescriptor) i32;
+extern fn r4os_rust_driver_audio_unregister(name: [*:0]const u8) i32;
+extern fn r4os_rust_driver_audio_closing(owner: u32, closing: bool) bool;
+extern fn r4os_rust_driver_audio_cleanup(owner: u32, out: *AudioOwnerCleanupResult) void;
+export fn r4os_zig_audio_register(name: [*:0]const u8, descriptor: *const AudioBackendDescriptor, context: ?*anyopaque, write: audio.WritePcmCtxFn, stop: audio.StopPcmCtxFn, status: audio.StatusCtxFn) callconv(.c) i32 {
+    return audio.registerExternalAudioBackendZ(name, .{ .formats = descriptor.formats, .min_rate = descriptor.min_rate, .max_rate = descriptor.max_rate, .max_channels = descriptor.max_channels }, context, write, stop, status);
+}
+export fn r4os_zig_audio_register_outputs(name: [*]const u8, len: usize, query: outputs_contract.AudioOutputQueryFn, select: outputs_contract.AudioOutputSelectFn, active: outputs_contract.AudioOutputActiveFn, idle: ?audio.StopPcmCtxFn) callconv(.c) bool {
+    return audio.registerExternalAudioOutputs(name[0..len], .{ .query = query, .select = select, .active = active }, idle);
+}
+export fn r4os_zig_audio_unregister(name: [*]const u8, len: usize, terminated: bool) callconv(.c) i32 {
+    return if (terminated) audio.unregisterAudioBackendZ(@ptrCast(name)) else audio.unregisterAudioBackendByName(name[0..len]);
+}
+export fn r4os_zig_audio_closing(name: [*]const u8, len: usize, closing: bool) callconv(.c) bool {
+    return audio.setAudioBackendClosing(name[0..len], closing);
+}
+
+extern fn r4os_rust_driver_storage_valid(d: *const StorageBackendDescriptor) bool;
+extern fn r4os_rust_driver_storage_submit(d: *const StorageBackendDescriptor) ?StorageSubmitFn;
+extern fn r4os_rust_driver_storage_cancel(d: *const StorageBackendDescriptor) ?StorageCancelFn;
+extern fn r4os_rust_driver_storage_reset(d: *const StorageBackendDescriptor) ?StorageResetFn;
+extern fn r4os_rust_driver_synth_valid(d: *const SynthEngineDescriptor) bool;
+extern fn r4os_rust_driver_synth_pcm(d: *const SynthEngineDescriptor) ?audio.SynthRenderPcmCtxFn;
+extern fn r4os_rust_driver_usb_valid(d: *const UsbHostControllerDescriptor) bool;
+extern fn r4os_rust_driver_net_valid(d: *const NetBackendDescriptor) bool;
+extern fn r4os_rust_driver_net_packet(d: *const NetBackendDescriptor) ?NetTransmitPacketFn;
+
+const NativeStorageToken = extern struct { index: usize = 0, generation: u64 = 0, active: bool = false };
+extern fn r4os_rust_driver_storage_register(name: [*:0]const u8, d: *const StorageBackendDescriptor) i32;
+extern fn r4os_rust_driver_storage_unregister(name: [*:0]const u8) i32;
+extern fn r4os_rust_driver_storage_recovery(name: [*:0]const u8, finish: bool, ok: i32) i32;
+extern fn r4os_rust_driver_storage_status(index: usize, out: *StorageBackendStatus) bool;
+extern fn r4os_rust_driver_storage_prepare(owner: u32, plan: *StorageCleanupPlan) bool;
+extern fn r4os_rust_driver_storage_cancel_plan(plan: *StorageCleanupPlan) void;
+extern fn r4os_rust_driver_storage_commit(plan: *StorageCleanupPlan, out: *StorageCleanupResult) void;
+extern fn r4os_rust_driver_storage_io(context: ?*anyopaque, write: bool, lba: u64, sectors: u16, bytes: [*]u8, len: u32) bool;
+extern fn r4os_rust_driver_storage_flush(context: ?*anyopaque) bool;
+extern fn r4os_rust_driver_storage_async(context: ?*anyopaque, request: *const StorageRequest) i32;
+extern fn r4os_rust_driver_storage_control(context: ?*anyopaque, reset: bool, handle: u64, reason: u32) i32;
+export fn r4os_zig_block_find(name: [*]const u8, len: usize) callconv(.c) bool {
+    return storage.findByName(name[0..len]) != null;
+}
+export fn r4os_zig_block_register(name: [*]const u8, len: usize, owner: u32, d: *const StorageBackendDescriptor, context: ?*anyopaque) callconv(.c) isize {
+    const asynchronous = storageBackendSubmit(d) != null;
+    const index = storage.register(.{ .name = name[0..len], .driver = "R4D", .bus = storageBus(d.bus), .controller = storageController(d), .port = 0, .sector_size = d.sector_size, .sector_count = d.sector_count, .max_sectors_per_request = d.max_sectors_per_request, .queue_depth = if (asynchronous) d.queue_depth else 1, .timeout_ticks = d.timeout_ticks, .removable = (d.flags & STORAGE_BACKEND_FLAG_REMOVABLE) != 0, .writable = (d.flags & STORAGE_BACKEND_FLAG_WRITABLE) != 0, .source = storageSource(d.source), .owner_id = owner, .ctx = context, .read_fn = r4dStorageRead, .write_fn = if (d.write != null) r4dStorageWrite else null, .flush_fn = if (d.flush != null) r4dStorageFlush else null, .async_submit_fn = if (asynchronous) r4dStorageSubmit else null, .async_cancel_fn = if (storageBackendCancel(d) != null) r4dStorageCancel else null, .async_reset_fn = if (storageBackendReset(d) != null) r4dStorageReset else null }) orelse return -1;
+    return @intCast(index);
+}
+export fn r4os_zig_block_unregister(index: usize) callconv(.c) bool {
+    return storage.unregister(index);
+}
+export fn r4os_zig_block_recovery(index: usize, finish: bool, success: bool) callconv(.c) void {
+    if (finish) storage.finishBackendRecovery(index, success) else storage.beginBackendRecovery(index);
+}
+export fn r4os_zig_block_prepare(index: usize, out: *NativeStorageToken) callconv(.c) bool {
+    const token = storage.prepareUnregister(index) orelse return false;
+    out.* = .{ .index = token.index, .generation = token.generation, .active = token.active };
+    return true;
+}
+export fn r4os_zig_block_token(input: *NativeStorageToken, commit: bool) callconv(.c) bool {
+    var token = storage.UnregisterToken{ .index = input.index, .generation = input.generation, .active = input.active };
+    const result = if (commit) storage.commitUnregister(&token) else storage.cancelUnregister(&token);
+    input.* = .{ .index = token.index, .generation = token.generation, .active = token.active };
+    return result;
+}
+export fn r4os_zig_block_registration_log(name: [*]const u8, len: usize, index: usize, source: u32) callconv(.c) void {
+    bootlog.puts("[R4D] register storage backend ");
+    bootlog.puts(name[0..len]);
+    bootlog.puts(" block=");
+    bootlog.putDec(index);
+    bootlog.puts(" source=");
+    bootlog.puts(storage.sourceLabel(storageSource(source)));
+    bootlog.puts("\r\n");
+}
+comptime {
+    if (@sizeOf(NativeStorageToken) != 24 or @sizeOf(StorageCleanupEntry) != 32 or @sizeOf(StorageCleanupPlan) != 264) @compileError("private storage cleanup C layout drift");
+}
+
+extern fn r4os_rust_driver_net_register(name: [*:0]const u8, d: *const NetBackendDescriptor) i32;
+extern fn r4os_rust_driver_net_has_owner(owner: u32) bool;
+extern fn r4os_rust_driver_net_cleanup(owner: u32, out: *NetOwnerCleanupResult) void;
+extern fn r4os_rust_driver_net_transmit(index: usize, frame: [*]const u8, len: u32) u8;
+extern fn r4os_rust_driver_net_poll(index: usize) void;
+extern fn r4os_rust_driver_net_status(index: usize, out: *NetBackendStatus) i32;
+extern fn r4os_rust_driver_net_receive(id: i32, frame: [*]const u8, len: u32) i32;
+extern fn r4os_rust_driver_net_schedule(id: i32) i32;
+extern fn r4os_rust_driver_net_query(id: i32, out: *NetBackendNegotiation) i32;
+extern fn r4os_rust_driver_net_receive_packet(id: i32, packet: *const NetPacket) i32;
+const NativeNetOffer = extern struct { offered: u64, required: u64, rx_queues: u16, tx_queues: u16, rx_segments: u16, tx_segments: u16, rx_owner: u32, tx_owner: u32, moderation: u32 };
+export fn r4os_zig_net_mutation(op: u8) callconv(.c) bool {
+    switch (op) {
+        0 => return net.beginBackendMutation(),
+        1 => net.endBackendMutation(),
+        2 => net.quarantineBackendMutation(),
+        else => unreachable,
+    }
+    return true;
+}
+export fn r4os_zig_net_callback(enter: bool) callconv(.c) bool {
+    if (enter) return net.enterBackendCallback();
+    net.leaveBackendCallback();
+    return true;
+}
+export fn r4os_zig_net_negotiate(input: *const NativeNetOffer, out: *NetBackendNegotiation) callconv(.c) i32 {
+    out.* = net_backend.negotiate(.{ .offered = input.offered, .required = input.required, .rx_queue_count = input.rx_queues, .tx_queue_count = input.tx_queues, .max_rx_segments = input.rx_segments, .max_tx_segments = input.tx_segments, .rx_ownership = input.rx_owner, .tx_ownership = input.tx_owner, .interrupt_moderation_us = input.moderation }) catch |err| return switch (err) {
+        error.InvalidOffer => 1,
+        error.RequiredNotOffered => 2,
+        error.RequiredUnsupported => 3,
+    };
+    return 0;
+}
+export fn r4os_zig_net_register(name: [*]const u8, len: usize, d: *const NetBackendDescriptor, selected: *const NetBackendNegotiation) callconv(.c) isize {
+    const flags = net.ADAPTER_FLAG_TRUSTED_BACKEND | (if ((d.flags & NET_BACKEND_FLAG_BROADCAST) != 0) net.ADAPTER_FLAG_BROADCAST else 0);
+    const index = net.register(.{ .name = name[0..len], .driver = "R4D", .bus = netBus(d.bus_kind), .bus_no = d.bus, .device_no = d.device, .function_no = d.function, .vendor_id = d.vendor_id, .device_id = d.device_id, .mac = d.mac, .mtu = d.mtu, .flags = flags, .backend = selected.*, .link = if ((d.flags & NET_BACKEND_FLAG_LINK_UP) != 0) .up else .unknown, .ops = .{ .transmit = if (d.transmit != null) r4dNetTransmit else null, .poll = if (d.poll != null) r4dNetPoll else null, .status = if (d.status != null) r4dNetStatus else null } }) orelse return -1;
+    return @intCast(index);
+}
+export fn r4os_zig_net_lookup(op: u8, value: usize) callconv(.c) isize {
+    return switch (op) {
+        0 => @intCast((net.get(value) orelse return -1).registration_id),
+        1 => @intCast(net.indexForRegistration(@intCast(value)) orelse return -1),
+        2 => @intCast(net.count()),
+        else => unreachable,
+    };
+}
+export fn r4os_zig_net_unregister(index: usize) callconv(.c) bool {
+    return net.unregister(index);
+}
+export fn r4os_zig_net_receive(index: usize, packet: bool, queue: u16, flags: u64, frame: [*]const u8, len: u32) callconv(.c) u8 {
+    return @intFromEnum(if (packet) net.receivePacket(index, queue, flags, frame[0..len]) else net.receiveFrame(index, frame[0..len]));
+}
+export fn r4os_zig_net_schedule(index: usize) callconv(.c) bool {
+    return net.scheduleRxWork(index);
+}
+export fn r4os_zig_net_packet_valid(packet: *const NetPacket, selected: *const NetBackendNegotiation) callconv(.c) bool {
+    return net_backend.validRxPacket(packet, selected.*, net.MAX_PACKET_SIZE);
+}
+export fn r4os_zig_net_registered_log(name: [*]const u8, len: usize, index: usize, n: *const NetBackendNegotiation) callconv(.c) void {
+    bootlog.puts("[R4D] register net backend ");
+    bootlog.puts(name[0..len]);
+    bootlog.puts(" adapter=");
+    bootlog.putDec(index);
+    bootlog.puts(" caps=");
+    bootlog.putHex(n.accepted, 16);
+    bootlog.puts("/");
+    bootlog.putHex(n.offered, 16);
+    bootlog.puts(" queues=");
+    bootlog.putDec(n.rx_queue_count);
+    bootlog.puts("/");
+    bootlog.putDec(n.tx_queue_count);
+    bootlog.puts("\r\n");
+}
+comptime {
+    if (@sizeOf(NativeNetOffer) != 40 or net.MAX_PACKET_SIZE != 1536 or @intFromEnum(net.TxResult.backend_error) != 6 or @intFromEnum(net.RxAdmission.irq_context) != 6) @compileError("private Net runtime C layout drift");
+}
+
+extern fn r4os_rust_driver_cleanup_prepare(owner: u32, out: *OwnerCleanupToken) bool;
+extern fn r4os_rust_driver_cleanup_cancel(token: *OwnerCleanupToken) bool;
+extern fn r4os_rust_driver_cleanup_begin(token: *OwnerCleanupToken) void;
+extern fn r4os_rust_driver_cleanup_quarantine(token: *OwnerCleanupToken) bool;
+extern fn r4os_rust_driver_cleanup_commit(token: *OwnerCleanupToken) bool;
+extern fn r4os_rust_driver_cleanup(owner: u32) bool;
+extern fn r4os_rust_driver_system_transition(owner: u32, op: u8) bool;
+const NativeCleanupBackend = extern struct { removed: u32, failed: bool };
+const NativeCleanupCounts = extern struct { irq: u32, work: u32, threads: u64, semaphores: u64, dma: u32, msi: u32, cpu_heap: u64, cpu_bytes: u64, audio: u32, storage: u32, usb_host: u32, display_blit: u32, net: u32 };
+export fn r4os_zig_driver_cleanup_owner(op: u8, owner: u32) callconv(.c) u64 {
+    switch (op) {
+        0 => return @intFromBool(display.retainsDriverOwner(owner)),
+        1 => return @intFromBool(@import("../display/native_driver.zig").retained(owner)),
+        2 => return @intFromBool(gfx_memory.retained(owner)),
+        3 => return @intFromBool(@import("../display/queue.zig").retainsDriver(owner)),
+        4 => return @intFromBool(display_blit.prepareOwnerCleanup(owner)),
+        5 => display_blit.cancelOwnerCleanup(owner),
+        6 => @import("../display/queue.zig").closingDriver(owner),
+        7 => gfx_memory.beginClose(owner),
+        8 => gfx_memory.finishOwner(owner),
+        9 => @import("../driver/input/platform_input.zig").remove(owner),
+        10 => return display_blit.cleanupOwner(owner),
+        else => unreachable,
+    }
+    return 0;
+}
+export fn r4os_zig_driver_usb_cleanup(owner: u32, out: *NativeCleanupBackend) callconv(.c) void {
+    const result = usb_host.cleanupOwner(owner);
+    out.* = .{ .removed = result.removed, .failed = result.failed };
+}
+export fn r4os_zig_driver_cleanup_log(event: u8, owner: u32, counts: ?*const NativeCleanupCounts) callconv(.c) void {
+    switch (event) {
+        0 => {
+            const c = counts.?;
+            const entry = @import("../driver/registry.zig").get(owner - 1);
+            const name = if (entry) |*item| item.name[0..item.name_len] else "unknown";
+            var message: [640]u8 = undefined;
+            const line = std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} irq={d} work={d} threads={d} semaphores={d} dma={d} cpu-heap={d} cpu-bytes={d} msi={d} audio={d} storage={d} usb-host={d} display-blit={d} net={d} name={s} result=complete\r\n", .{ owner, c.irq, c.work, c.threads, c.semaphores, c.dma, c.cpu_heap, c.cpu_bytes, c.msi, c.audio, c.storage, c.usb_host, c.display_blit, c.net, name }) catch unreachable;
+            bootlog.puts(line);
+        },
+        1 => {
+            var message: [128]u8 = undefined;
+            bootlog.puts(std.fmt.bufPrint(&message, "[R4D] cleanup owner={d} thread-callbacks=active resources=quarantined\r\n", .{owner}) catch unreachable);
+        },
+        3 => bootlog.puts("[R4D] audio-finalize=FAILED resources=quarantined\r\n"),
+        7 => bootlog.puts("[R4D] cleanup work=quiesced graphics=retained resources=quarantined\r\n"),
+        11 => {
+            bootlog.puts("[R4D] cleanup veto owner=");
+            bootlog.putDec(owner);
+            bootlog.puts(" backend-busy\r\n");
+        },
+        2, 4, 5, 6, 8, 9, 10 => {
+            bootlog.puts("[R4D] cleanup owner=");
+            bootlog.putDec(owner);
+            bootlog.puts(switch (event) {
+                2 => " net-finalize=FAILED resources=quarantined\r\n",
+                4 => " usb-host-finalize=FAILED resources=quarantined\r\n",
+                5 => " msi-disable=FAILED resources=quarantined\r\n",
+                6 => " work-quiesce=FAILED dma=retained resources=quarantined\r\n",
+                8 => " threads=retained dma=retained cpu-heap=retained resources=quarantined\r\n",
+                9 => " semaphores=retained dma=retained cpu-heap=retained resources=quarantined\r\n",
+                10 => " cpu-heap=retained resources=quarantined\r\n",
+                else => unreachable,
+            });
+        },
+        else => unreachable,
+    }
+}
+comptime {
+    if (@sizeOf(OwnerCleanupToken) != 280 or @offsetOf(OwnerCleanupToken, "storage_plan") != 8 or @sizeOf(NativeCleanupCounts) != 72) @compileError("private driver cleanup C layout drift");
+}
+
+extern fn r4os_rust_driver_log(level: u8, text: [*:0]const u8) void;
+extern fn r4os_rust_driver_irq_legacy(release: bool) i32;
+extern fn r4os_rust_driver_irq_register(irq: u8, handler: IrqHandler, context: usize, flags: u32) i32;
+extern fn r4os_rust_driver_api_work_request(request: *const DriverWorkRequest, out: *u32) i32;
+extern fn r4os_rust_driver_usb_register(name: [*:0]const u8, d: *const UsbHostControllerDescriptor) i32;
+extern fn r4os_rust_driver_usb_unregister(name: [*:0]const u8) i32;
+extern fn r4os_rust_driver_usb_activate(name: [*:0]const u8, source: u32) i32;
+extern fn r4os_rust_driver_blit(register: bool, name: [*:0]const u8, d: ?*const anyopaque) i32;
+extern fn r4os_rust_driver_synth(name: [*:0]const u8, d: *const SynthEngineDescriptor) i32;
+extern fn r4os_rust_driver_input(name: [*:0]const u8) i32;
+export fn r4os_zig_driver_log(level: u8, owner: u32, text: [*:0]const u8) callconv(.c) void {
+    log_event.driver(switch (level) {
+        0 => log_event.Severity.info,
+        1 => log_event.Severity.warn,
+        2 => log_event.Severity.err,
+        else => unreachable,
+    }, owner, text);
+}
+export fn r4os_zig_driver_usb(op: u8, name: ?[*]const u8, len: usize, owner: u32, source: u32, descriptor: ?*const UsbHostControllerDescriptor) callconv(.c) isize {
+    return switch (op) {
+        0 => @intFromBool(usb_host.findByName(name.?[0..len]) != null),
+        1 => @intCast(usb_host.register(name.?[0..len], descriptor.?, owner) orelse return -1),
+        2 => @intFromBool(usb_host.unregisterByName(name.?[0..len], owner)),
+        3 => xhci.activate(owner, source),
+        else => unreachable,
+    };
+}
+export fn r4os_zig_driver_blit(register: bool, name: [*]const u8, len: usize, owner: u32, descriptor: ?*const anyopaque) callconv(.c) i32 {
+    return if (register) display_blit.register(owner, name[0..len], @ptrCast(@alignCast(descriptor.?))) else display_blit.unregister(owner, name[0..len]);
+}
+export fn r4os_zig_driver_synth(name: [*:0]const u8, d: *const SynthEngineDescriptor) callconv(.c) i32 {
+    return audio.registerExternalSynthEngineZ(name, d.flags, d.context, d.midi_send, d.render, d.stop, d.status, d.opl3_reset, d.opl3_write_register, d.sid_acquire, d.sid_release, d.sid_set_model, d.sid_write_register, d.sid_load_data, d.sid_init, d.sid_play_frame, d.sid_render_pcm, synthRenderPcm(d));
+}
+
+const NativeGfxIdentity = extern struct { id: u64, generation: u64 };
+fn gfxIdentity(value: NativeGfxIdentity) gfx_buffers.Owner {
+    return .{ .kind = .driver, .id = value.id, .generation = value.generation };
+}
+extern fn r4os_rust_driver_gfx_identity(mode: u8, admit: bool, out: *NativeGfxIdentity) i32;
+fn nativeGfxOwner(mode: u8, admit: bool) gfx_buffers.Error!gfx_buffers.Owner {
+    var value: NativeGfxIdentity = undefined;
+    const code = r4os_rust_driver_gfx_identity(mode, admit, &value);
+    if (code == 0) return gfxIdentity(value);
+    return switch (code) {
+        outputs_contract.gfx_buffer_error_invalid => error.WrongOwner,
+        outputs_contract.gfx_buffer_error_overflow => error.Overflow,
+        outputs_contract.gfx_buffer_error_unsupported => error.Unsupported,
+        outputs_contract.gfx_buffer_error_oom => error.OutOfMemory,
+        outputs_contract.gfx_buffer_error_budget => error.Budget,
+        outputs_contract.gfx_buffer_error_capacity => error.Capacity,
+        outputs_contract.gfx_buffer_error_stale => error.Stale,
+        outputs_contract.gfx_buffer_error_busy => error.Busy,
+        outputs_contract.gfx_buffer_error_closed => error.Closed,
+        else => unreachable,
+    };
+}
+export fn r4os_zig_driver_buffer_identity(owner: u32, admit: bool, out: *NativeGfxIdentity) callconv(.c) i32 {
+    const identity = gfx_memory.owner(owner, admit) catch |err| return gfx_api.status(err);
+    out.* = .{ .id = identity.id, .generation = identity.generation };
+    return 0;
+}
+
+export fn r4os_zig_driver_gfx_boot_hold(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBootHoldRequest, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return @import("../display/boot_driver.zig").hold(identity, input, output);
 }
-fn gfxDisplayPresentationStats(input: *const outputs_contract.DisplayPresentationStats) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(outputs_contract.DisplayPresentationStats)) return outputs_contract.gfx_output_error_invalid;
-    if (@import("../display/output_runtime.zig").publishStats(identity, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err))
-        return outputs_contract.gfx_output_ok;
-    @import("../display/display.zig").publishPresentationStats(identity.id, identity.generation, input.*) catch |err|
-        return @import("../display/presentation_stats.zig").code(err);
-    return outputs_contract.gfx_output_ok;
-}
-fn gfxDisplayPresentationInfo(input: *const outputs_contract.DisplayPresentationInfo) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(outputs_contract.DisplayPresentationInfo)) return outputs_contract.gfx_output_error_invalid;
-    if (@import("../display/output_runtime.zig").publishInfo(identity, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err))
-        return outputs_contract.gfx_output_ok;
-    @import("../display/display.zig").publishPresentationInfo(identity.id, identity.generation, input.*) catch |err|
-        return @import("../display/presentation_stats.zig").code(err);
-    return outputs_contract.gfx_output_ok;
-}
-fn gfxDisplayOutputRegister(input: *const outputs_contract.GfxAdditionalOutput, output: *outputs_contract.GfxOutputTarget) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxAdditionalOutput) != 0 or
-        !gfx_api.validOutput(outputs_contract.GfxOutputTarget, output) or output.size != @sizeOf(outputs_contract.GfxOutputTarget)) return outputs_contract.gfx_output_error_invalid;
-    const value = input.*;
-    const target = @import("../display/output_runtime.zig").register(identity, value) catch |err| return @import("../program/gfx_output_api.zig").code(err);
-    output.* = target;
-    return outputs_contract.gfx_output_ok;
-}
-fn gfxDisplayOutputTransition(input: *const outputs_contract.GfxOutputTarget, operation: u32, quiesced: u32) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputTarget) != 0) return outputs_contract.gfx_output_error_invalid;
-    const target = input.*;
-    @import("../display/output_runtime.zig").transition(identity, target, operation, quiesced) catch |err| return @import("../program/gfx_output_api.zig").code(err);
-    return outputs_contract.gfx_output_ok;
-}
-fn gfxCursorConfigure(input: *const outputs_contract.DisplayCursorInfo) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_cursor_configure(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.DisplayCursorInfo) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return @import("../display/cursor_work.zig").configure(identity, input);
 }
-fn gfxCursorTake(backend: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverCursorJob) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_cursor_take(identity_view: *const NativeGfxIdentity, backend: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverCursorJob) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return @import("../display/cursor_work.zig").take(identity, backend, output);
 }
-fn gfxCursorComplete(input: *const outputs_contract.GfxDriverCursorCompletion) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_cursor_complete(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxDriverCursorCompletion) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return @import("../display/cursor_work.zig").complete(identity, input);
 }
-fn gfxBootFinish(generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_boot_finish(identity_view: *const NativeGfxIdentity, generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return @import("../display/boot_driver.zig").finish(identity, generation, operation, output);
 }
-fn gfxDisplayBootInfo(output: *outputs_contract.GfxNativeBootInfo) callconv(.c) i32 {
-    // The already-bound table remains readable during owner close: drivers
-    // need the current display generation to perform their final rollback.
-    _ = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_display_boot_info(identity_view: *const NativeGfxIdentity, output: *outputs_contract.GfxNativeBootInfo) callconv(.c) i32 {
+    _ = identity_view;
     return native_display.bootInfo(output);
 }
-fn gfxDisplayPrepare(input: *const outputs_contract.GfxNativeRegistration, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_display_prepare(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxNativeRegistration, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return native_display.prepare(identity, input, output);
 }
-fn gfxDisplayPrepareHeld(input: *const outputs_contract.GfxNativeRegistration, generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_display_prepare_held(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxNativeRegistration, generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return @import("../display/boot_driver.zig").prepareHeld(identity, input, generation, output);
 }
-fn gfxDisplayTransition(generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_display_transition(identity_view: *const NativeGfxIdentity, generation: u64, operation: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return native_display.transition(@intCast(identity.id), generation, operation, output);
 }
-fn gfxDisplayDeviceReset(input: *const outputs_contract.GfxBackendBinding, generation: u64, quiesced: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_display_device_reset(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBackendBinding, generation: u64, quiesced: u32, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return native_display.deviceReset(identity, input, generation, quiesced, output);
 }
-fn gfxDisplayResumeHeadless(input: *const outputs_contract.GfxBackendBinding, generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_display_resume_headless(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBackendBinding, generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return native_display.resumeHeadless(identity, input, generation, output);
 }
-fn gfxDisplayTerminalRelease(input: *const outputs_contract.GfxBackendBinding, generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_display_terminal_release(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBackendBinding, generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return native_display.releaseTerminal(identity, input, generation, output);
 }
-fn gfxDisplayPrepareReset(input: *const outputs_contract.GfxNativeRegistration, held_generation: u64, reset_generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+export fn r4os_zig_driver_gfx_display_prepare_reset(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxNativeRegistration, held_generation: u64, reset_generation: u64, output: *outputs_contract.GfxNativeState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     return @import("../display/boot_driver.zig").prepareReset(identity, input, held_generation, reset_generation, output);
 }
-fn gfxDisplaySchedule(input: *const outputs_contract.GfxBackendBinding) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or input.version != 1 or input.size < @sizeOf(outputs_contract.GfxBackendBinding)) return outputs_contract.gfx_queue_error_invalid;
-    @import("../display/queue.zig").wakeNative(activeOwner(), .{ .adapter = input.adapter_id, .device_generation = input.device_generation, .reset_generation = input.reset_generation }) catch |err| return @import("../program/gfx_queue_api.zig").errorCode(err);
-    return outputs_contract.gfx_queue_ok;
+export fn r4os_zig_driver_gfx_output_query(identity_view: *const NativeGfxIdentity, output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32 {
+    _ = identity_view;
+    return @import("../display/output_state.zig").driverTable(output, .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw), .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace), .close_source = @intFromPtr(&gfxReceiverClose), .mode_enable = @intFromPtr(&gfxModeEnable), .mode_take = @intFromPtr(&gfxModeTake), .mode_complete = @intFromPtr(&gfxModeComplete), .audio_publish = @intFromPtr(&gfxAudioPublish), .audio_query = @intFromPtr(&gfxAudioQuery), .output_pause = @intFromPtr(&gfxOutputPause), .mode_restore = @intFromPtr(&gfxModeRestore), .mode_status = @intFromPtr(&gfxModeStatus), .color_publish = @intFromPtr(&gfxOutputColorPublish), .mode_read_color = @intFromPtr(&gfxModeReadColor), .refresh_publish = @intFromPtr(&gfxOutputRefreshPublish), .refresh_read = @intFromPtr(&gfxRefreshRead), .power_publish = @intFromPtr(&gfxOutputPowerPublish), .power_read = @intFromPtr(&gfxPowerRead), .brightness_publish = @intFromPtr(&gfxOutputBrightnessPublish), .brightness_read = @intFromPtr(&gfxBrightnessRead) });
 }
-fn gfxOutputQuery(output: *outputs_contract.GfxDriverOutputApi) callconv(.c) i32 {
-    _ = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
-    return @import("../display/output_state.zig").driverTable(output, .{ .publish = @intFromPtr(&gfxOutputPublish), .withdraw = @intFromPtr(&gfxOutputWithdraw), .register_source = @intFromPtr(&gfxReceiverRegister), .replace_receivers = @intFromPtr(&gfxReceiverReplace), .close_source = @intFromPtr(&gfxReceiverClose),
-        .mode_enable = @intFromPtr(&gfxModeEnable), .mode_take = @intFromPtr(&gfxModeTake), .mode_complete = @intFromPtr(&gfxModeComplete),
-        .audio_publish = @intFromPtr(&gfxAudioPublish), .audio_query = @intFromPtr(&gfxAudioQuery),
-        .output_pause = @intFromPtr(&gfxOutputPause), .mode_restore = @intFromPtr(&gfxModeRestore), .mode_status = @intFromPtr(&gfxModeStatus),
-        .color_publish = @intFromPtr(&gfxOutputColorPublish), .mode_read_color = @intFromPtr(&gfxModeReadColor),
-        .refresh_publish = @intFromPtr(&gfxOutputRefreshPublish), .refresh_read = @intFromPtr(&gfxRefreshRead),
-        .power_publish = @intFromPtr(&gfxOutputPowerPublish), .power_read = @intFromPtr(&gfxPowerRead),
-        .brightness_publish = @intFromPtr(&gfxOutputBrightnessPublish), .brightness_read = @intFromPtr(&gfxBrightnessRead) });
+export fn r4os_zig_driver_gfx_queue_register(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBackendRegistration, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_queue_api.register(identity, input, output);
 }
-fn gfxOutputPowerPublish(input: *const outputs_contract.GfxOutputPower) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputPower) != 0 or irq_router.inDispatch())
-        return outputs_contract.gfx_output_error_invalid;
-    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    @import("../display/outputs.zig").publishPower(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
+export fn r4os_zig_driver_gfx_queue_register_profile(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBackendRegistration, profile: *const outputs_contract.GfxBackendProfile, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_queue_api.registerProfile(identity, input, profile, output);
+}
+export fn r4os_zig_driver_gfx_queue_publish_properties(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBackendBinding, properties: *const outputs_contract.GfxBackendProperties) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_queue_api.publishProperties(identity, input, properties);
+}
+export fn r4os_zig_driver_gfx_queue_read_native_info(owner: u32, input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxNativeJobInfo) callconv(.c) i32 {
+    return gfx_queue_api.readNativeInfo(owner, input, output);
+}
+export fn r4os_zig_driver_gfx_queue_read_native_data(owner: u32, input: *const outputs_contract.GfxFence, offset: u32, output: [*]u8, count: u32) callconv(.c) i32 {
+    return gfx_queue_api.readNativeData(owner, input, offset, output, count);
+}
+export fn r4os_zig_driver_gfx_queue_read_native_binding(owner: u32, input: *const outputs_contract.GfxFence, index: u32, output: *outputs_contract.GfxNativeBinding) callconv(.c) i32 {
+    return gfx_queue_api.readNativeBinding(owner, input, index, output);
+}
+export fn r4os_zig_driver_gfx_queue_owner_info(owner: u32, input: *const outputs_contract.GfxBackendBinding, timeline: u64, output: *outputs_contract.GfxQueueOwnerInfo) callconv(.c) i32 {
+    return gfx_queue_api.queueOwnerInfo(owner, input, timeline, output);
+}
+export fn r4os_zig_driver_gfx_queue_unregister(owner: u32, input: *const outputs_contract.GfxBackendBinding, quiesced: u32) callconv(.c) i32 {
+    return gfx_queue_api.unregister(owner, input, quiesced);
+}
+export fn r4os_zig_driver_gfx_queue_take(owner: u32, input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverJob) callconv(.c) i32 {
+    return gfx_queue_api.take(owner, input, output);
+}
+export fn r4os_zig_driver_gfx_queue_read_render_list(owner: u32, input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderList) callconv(.c) i32 {
+    return gfx_queue_api.readRenderList(owner, input, output);
+}
+export fn r4os_zig_driver_gfx_queue_read_render_grid_list(owner: u32, input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderGridList) callconv(.c) i32 {
+    return gfx_queue_api.readRenderGridList(owner, input, output);
+}
+export fn r4os_zig_driver_gfx_queue_update_operations(owner: u32, input: *const outputs_contract.GfxBackendBinding, operations: u64) callconv(.c) i32 {
+    return gfx_queue_api.updateOperations(owner, input, operations);
+}
+export fn r4os_zig_driver_gfx_queue_read_render_color_list(owner: u32, input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderColorList) callconv(.c) i32 {
+    return gfx_queue_api.readRenderColorList(owner, input, output);
+}
+export fn r4os_zig_driver_gfx_queue_complete(owner: u32, input: *const outputs_contract.GfxFence, result: u32, quiesced: u32) callconv(.c) i32 {
+    return gfx_queue_api.complete(owner, input, result, quiesced);
+}
+export fn r4os_zig_driver_gfx_queue_reset(owner: u32, input: *const outputs_contract.GfxBackendBinding, quiesced: u32, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    return gfx_queue_api.reset(owner, input, quiesced, output);
+}
+export fn r4os_zig_driver_gfx_queue_segment(owner: u32, input: *const outputs_contract.GfxFence, which: u32, offset: u64, mask: u64, output: *outputs_contract.GfxDmaSegment) callconv(.c) i32 {
+    return gfx_queue_api.segment(owner, input, which, offset, mask, output);
+}
+export fn r4os_zig_driver_gfx_queue_retain(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxFence, which: u32, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_queue_api.retain(identity, input, which, output);
+}
+export fn r4os_zig_driver_gfx_queue_retain_scanout(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_queue_api.retainScanout(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_queue_begin_scanout(owner: u32, input: *const outputs_contract.GfxFence) callconv(.c) i32 {
+    return gfx_queue_api.beginScanout(owner, input);
+}
+export fn r4os_zig_driver_gfx_queue_scanout_retire_requested(owner: u32, input: *const outputs_contract.GfxFence) callconv(.c) i32 {
+    return gfx_queue_api.scanoutRetireRequested(owner, input);
+}
+export fn r4os_zig_driver_gfx_buffer_create(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferDescriptor, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_api.create(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_buffer_describe(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferDescriptor) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_api.describe(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_buffer_import(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_api.import(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_buffer_release(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_api.release(identity, input);
+}
+export fn r4os_zig_driver_gfx_buffer_map(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle, access: u32, offset: u64, bytes: u64, output: *outputs_contract.GfxBufferMap) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_api.map(identity, input, access, offset, bytes, output);
+}
+export fn r4os_zig_driver_gfx_buffer_unmap(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_api.unmap(identity, input);
+}
+export fn r4os_zig_driver_gfx_device_acquire(identity_view: *const NativeGfxIdentity, reference: *const outputs_contract.GfxBufferHandle, request: *const outputs_contract.GfxDeviceRequest, output: *outputs_contract.GfxDeviceLease) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_memory.acquire(identity, reference, request, output);
+}
+export fn r4os_zig_driver_gfx_device_segment(identity_view: *const NativeGfxIdentity, lease: *const outputs_contract.GfxDeviceLease, offset: u64, output: *outputs_contract.GfxDmaSegment) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_memory.segment(identity, lease, offset, output);
+}
+export fn r4os_zig_driver_gfx_device_release(identity_view: *const NativeGfxIdentity, lease: *const outputs_contract.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_memory.release(identity, lease, quiesced);
+}
+export fn r4os_zig_driver_gfx_mmio_map(identity_view: *const NativeGfxIdentity, request: *const outputs_contract.GfxMmioRequest, output: *outputs_contract.GfxMmioWindow) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_memory.mapWindow(identity, request, output);
+}
+export fn r4os_zig_driver_gfx_mmio_unmap(identity_view: *const NativeGfxIdentity, window: *const outputs_contract.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return gfx_memory.unmapWindow(identity, window, quiesced);
+}
+export fn r4os_zig_driver_gfx_collect(identity_view: *const NativeGfxIdentity, full: bool) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return if (full) gfx_memory.collect(identity) else gfx_memory.collectBuffers(identity);
+}
+export fn r4os_zig_driver_gfx_owned_reserve(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferDescriptor, cookie: u64, output: *outputs_contract.GfxOwnedBufferReservation) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_owned_buffers.zig").reserve(identity, input, cookie, output);
+}
+export fn r4os_zig_driver_gfx_owned_commit(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOwnedBufferReservation, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_owned_buffers.zig").commit(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_owned_abort(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOwnedBufferReservation, quiesced: u32) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_owned_buffers.zig").abort(identity, input, quiesced);
+}
+export fn r4os_zig_driver_gfx_owned_take_release(identity_view: *const NativeGfxIdentity, adapter: u32, generation: u64, output: *outputs_contract.GfxOwnedBufferRelease) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_owned_buffers.zig").take(identity, adapter, generation, output);
+}
+export fn r4os_zig_driver_gfx_owned_finish_release(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOwnedBufferRelease, quiesced: u32) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_owned_buffers.zig").finish(identity, input, quiesced);
+}
+export fn r4os_zig_driver_gfx_virtual_register(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxNativeProvider, output: *outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_virtual_driver_api.zig").register(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_virtual_unregister(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_virtual_driver_api.zig").unregister(identity, input);
+}
+export fn r4os_zig_driver_gfx_virtual_take(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxVirtualJob) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_virtual_driver_api.zig").take(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_virtual_complete(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle, completion: *const outputs_contract.GfxVirtualCompletion) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_virtual_driver_api.zig").complete(identity, input, completion);
+}
+export fn r4os_zig_driver_gfx_native_register(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxNativeProvider, output: *outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_allocation_driver_api.zig").register(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_native_unregister(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_allocation_driver_api.zig").unregister(identity, input);
+}
+export fn r4os_zig_driver_gfx_native_take(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxNativeJob) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_allocation_driver_api.zig").take(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_native_complete(identity_view: *const NativeGfxIdentity, provider: *const outputs_contract.GfxBufferHandle, request: *const outputs_contract.GfxBufferHandle, result: i32, reference: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_allocation_driver_api.zig").complete(identity, provider, request, result, reference);
+}
+export fn r4os_zig_driver_gfx_memory_stats(identity_view: *const NativeGfxIdentity, output: *outputs_contract.GfxBufferStats) callconv(.c) i32 {
+    _ = identity_view;
+    return gfx_api.stats(output);
+}
+export fn r4os_zig_driver_gfx_memory_budget(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxDeviceBudgetRequest, output: *outputs_contract.GfxDeviceBudgetState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("../program/gfx_memory_budget_api.zig").provider(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_telemetry_exchange(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxTelemetryState, output: *outputs_contract.GfxTelemetryDemand) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("../program/gfx_telemetry_api.zig").publish(identity, input, output);
+}
+export fn r4os_zig_driver_gfx_device_lost(identity_view: *const NativeGfxIdentity, adapter: u32, generation: u64, quiesced: u32) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    return @import("gfx_owned_buffers.zig").lose(identity, adapter, generation, quiesced);
+}
+
+export fn r4os_zig_driver_gfx_output_power_publish(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOutputPower) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    @import("../display/outputs.zig").publishPower(@intCast(identity.id), input.*) catch |err| return gfx_modes.code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxPowerRead(input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxPowerRequest) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputId) != 0 or
-        !@import("../program/gfx_buffer_api.zig").validOutput(outputs_contract.GfxPowerRequest, output)) return outputs_contract.gfx_output_error_invalid;
-    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    const value = @import("../display/outputs.zig").readPower(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
-    output.* = value;
+
+export fn r4os_zig_driver_gfx_output_refresh_publish(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOutputRefresh) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    @import("../display/outputs.zig").publishRefresh(@intCast(identity.id), input.*) catch |err| return gfx_modes.code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxOutputRefreshPublish(input: *const outputs_contract.GfxOutputRefresh) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputRefresh) != 0 or irq_router.inDispatch())
-        return outputs_contract.gfx_output_error_invalid;
-    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    @import("../display/outputs.zig").publishRefresh(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
+
+export fn r4os_zig_driver_gfx_output_brightness_publish(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOutputBrightness) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    @import("../display/outputs.zig").publishBrightness(@intCast(identity.id), input.*) catch |err| return gfx_modes.code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxRefreshRead(input: *const outputs_contract.GfxOutputTarget, output: *outputs_contract.GfxRefreshRequest) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputTarget) != 0 or
-        !@import("../program/gfx_buffer_api.zig").validOutput(outputs_contract.GfxRefreshRequest, output)) return outputs_contract.gfx_output_error_invalid;
-    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    const value = @import("../display/outputs.zig").readRefresh(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
-    output.* = value;
+
+export fn r4os_zig_driver_gfx_mode_enable(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    gfx_modes.enable(identity, input.*) catch |err| return gfx_modes.code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxModeReadColor(ticket: u64, sequence: u64, output: *outputs_contract.GfxDriverModeColor) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    if (!@import("../program/gfx_buffer_api.zig").validOutput(outputs_contract.GfxDriverModeColor, output)) return outputs_contract.gfx_output_error_invalid;
+
+export fn r4os_zig_driver_gfx_mode_complete(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxDriverModeCompletion) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    gfx_modes.complete(identity, input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+
+export fn r4os_zig_driver_gfx_receiver_close(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxReceiverSource) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    @import("../display/outputs.zig").closeReceiverSource(identity, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
+
+export fn r4os_zig_driver_gfx_power_read(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxPowerRequest) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    output.* = @import("../display/outputs.zig").readPower(@intCast(identity.id), input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+
+export fn r4os_zig_driver_gfx_refresh_read(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOutputTarget, output: *outputs_contract.GfxRefreshRequest) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    output.* = @import("../display/outputs.zig").readRefresh(@intCast(identity.id), input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+
+export fn r4os_zig_driver_gfx_brightness_read(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxBrightnessRequest) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    output.* = @import("../display/outputs.zig").readBrightness(@intCast(identity.id), input.*) catch |err| return gfx_modes.code(err);
+    return outputs_contract.gfx_output_ok;
+}
+
+export fn r4os_zig_driver_gfx_display_output_register(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxAdditionalOutput, output: *outputs_contract.GfxOutputTarget) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    const value = input.*;
+    output.* = @import("../display/output_runtime.zig").register(identity, value) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
+
+export fn r4os_zig_driver_gfx_display_output_transition(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOutputTarget, operation: u32, quiesced: u32) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    @import("../display/output_runtime.zig").transition(identity, input.*, operation, quiesced) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
+
+export fn r4os_zig_driver_gfx_mode_read_color(identity_view: *const NativeGfxIdentity, ticket: u64, sequence: u64, output: *outputs_contract.GfxDriverModeColor) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     const value = gfx_modes.readColor(identity, ticket, sequence) catch |err| return gfx_modes.code(err);
     output.* = value orelse return 0;
     return outputs_contract.gfx_output_ok;
 }
-fn gfxOutputColorPublish(input: *const outputs_contract.GfxOutputColorState) callconv(.c) i32 {
-    if (irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const value = @import("../program/gfx_output_wire.zig").read(input) orelse return outputs_contract.gfx_output_error_invalid;
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    @import("../display/outputs.zig").publishColor(@intCast(identity.id), value) catch |err| return gfx_modes.code(err);
-    return outputs_contract.gfx_output_ok;
-}
-fn gfxOutputPause(input: *const outputs_contract.GfxOutputId, paused: u32) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or paused > 1 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+
+export fn r4os_zig_driver_gfx_output_pause(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOutputId, paused: u32) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     @import("../display/outputs.zig").pause(@intCast(identity.id), input.*, paused != 0) catch |err| return gfx_modes.code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxModeRestore(input: *const outputs_contract.GfxAtomicState, output: *outputs_contract.GfxModeStatus) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or !gfx_api.validOutput(outputs_contract.GfxModeStatus, output) or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
+
+export fn r4os_zig_driver_gfx_mode_restore(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxAtomicState, output: *outputs_contract.GfxModeStatus) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     output.* = gfx_modes.restore(identity, input) catch |err| return gfx_modes.code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxModeStatus(ticket: u64, output: *outputs_contract.GfxModeStatus) callconv(.c) i32 {
-    if (!gfx_api.validOutput(outputs_contract.GfxModeStatus, output) or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+
+export fn r4os_zig_driver_gfx_mode_status(identity_view: *const NativeGfxIdentity, ticket: u64, output: *outputs_contract.GfxModeStatus) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     output.* = gfx_modes.driverStatus(identity, ticket) catch |err| return gfx_modes.code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxAudioPublish(input: *const outputs_contract.GfxAudioRoute) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or irq_router.inDispatch() or input.version != 1 or input.size < @sizeOf(outputs_contract.GfxAudioRoute))
-        return outputs_contract.gfx_output_error_invalid;
-    const owner = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
-    @import("../display/outputs.zig").publishAudio(owner, input) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+
+export fn r4os_zig_driver_gfx_audio_publish(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxAudioRoute) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    @import("../display/outputs.zig").publishAudio(identity, input) catch |err| return @import("../program/gfx_output_api.zig").code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxAudioQuery(location: u32, device: u32, index: u32, output: *outputs_contract.GfxAudioRoute) callconv(.c) i32 {
-    if (!gfx_api.validOutput(outputs_contract.GfxAudioRoute, output) or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    // HDA catalog/write callbacks retain their real R4D through the existing
-    // device-callback ledger. Admit only this bounded read there; receiver
-    // publication, PCI, display commands and allocation keep their owners.
-    const owner = activeOwner();
-    if (owner == 0 or driver_threads.currentOwner() != 0) return gfx_api.status(error.WrongOwner);
-    var state: outputs_contract.DriverHeapStats = .{};
-    if (driver_heap.stats(owner, &state) != outputs_contract.driver_heap_ok or state.owner_epoch == 0) return gfx_api.status(error.Stale);
+
+export fn r4os_zig_driver_gfx_audio_query(identity_view: *const NativeGfxIdentity, location: u32, device: u32, index: u32, output: *outputs_contract.GfxAudioRoute) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    _ = identity;
     output.* = @import("../display/outputs.zig").queryAudio(location, device, index) orelse return 0;
     return 1;
 }
-const gfx_modes = @import("../display/mode_work.zig");
-fn gfxModeEnable(input: *const outputs_contract.GfxBackendBinding) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
-    gfx_modes.enable(identity, input.*) catch |err| return gfx_modes.code(err);
-    return outputs_contract.gfx_output_ok;
-}
-fn gfxModeTake(input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverModeJob) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or !gfx_api.validOutput(outputs_contract.GfxDriverModeJob, output) or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
+
+export fn r4os_zig_driver_gfx_mode_take(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverModeJob) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
     const value = gfx_modes.take(identity, input.*) catch |err| return gfx_modes.code(err);
     output.* = value orelse return 0;
     return outputs_contract.gfx_output_ok;
 }
-fn gfxModeComplete(input: *const outputs_contract.GfxDriverModeCompletion) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    gfx_modes.complete(identity, input.*) catch |err| return gfx_modes.code(err);
+
+export fn r4os_zig_driver_gfx_receiver_replace(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxReceiverUpdate) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    @import("../display/outputs.zig").replaceReceivers(identity, input) catch |err| return @import("../program/gfx_output_api.zig").code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxReceiverRegister(adapter: u32, output: *outputs_contract.GfxReceiverSource) callconv(.c) i32 {
-    if (@intFromPtr(output) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const catalog = @import("../display/outputs.zig");
-    // Snapshot before admission so close/reset between epoch lookup and
-    // publication cannot leave a new source behind stoppedDriver().
-    const epoch = catalog.receiverEpoch();
-    const owner = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
-    const binding = catalog.registerReceiverSource(owner, adapter, epoch) catch |err| return @import("../program/gfx_output_api.zig").code(err);
-    output.* = binding;
+
+export fn r4os_zig_driver_gfx_output_publish(owner: u32, input: *const outputs_contract.GfxOutputPublication, output: *outputs_contract.GfxOutputId) callconv(.c) i32 {
+    output.* = @import("../display/outputs.zig").publish(owner, input) catch |err| return @import("../program/gfx_output_api.zig").code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxReceiverReplace(input: *const outputs_contract.GfxReceiverUpdate) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const value = input.*;
-    const owner = currentReceiverOwner(true) catch |err| return gfx_api.status(err);
-    @import("../display/outputs.zig").replaceReceivers(owner, &value) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+
+export fn r4os_zig_driver_gfx_output_withdraw(owner: u32, input: *const outputs_contract.GfxOutputId) callconv(.c) i32 {
+    @import("../display/outputs.zig").withdraw(owner, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxReceiverClose(input: *const outputs_contract.GfxReceiverSource) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const owner = currentReceiverOwner(false) catch |err| return gfx_api.status(err);
-    @import("../display/outputs.zig").closeReceiverSource(owner, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err);
-    return outputs_contract.gfx_output_ok;
-}
-fn gfxOutputPublish(input: *const outputs_contract.GfxOutputPublication, output: *outputs_contract.GfxOutputId) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(output) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    const value = input.*;
-    const identity = @import("../display/outputs.zig").publish(activeOwner(), &value) catch |err| return @import("../program/gfx_output_api.zig").code(err);
-    output.* = identity;
-    return outputs_contract.gfx_output_ok;
-}
-fn gfxOutputWithdraw(input: *const outputs_contract.GfxOutputId) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or irq_router.inDispatch()) return outputs_contract.gfx_output_error_invalid;
-    @import("../display/outputs.zig").withdraw(activeOwner(), input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err);
-    return outputs_contract.gfx_output_ok;
-}
-fn gfxQueueQuery(output: *outputs_contract.GfxDriverQueueApi) callconv(.c) i32 {
-    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    if (@intFromPtr(output) == 0 or output.version != 1 or output.size < 56) return outputs_contract.gfx_queue_error_invalid;
-    const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverQueueApi));
-    const value: outputs_contract.GfxDriverQueueApi = .{
-        .size = bytes,
-        .register_backend = @intFromPtr(&gfxQueueRegister),
-        .unregister_backend = @intFromPtr(&gfxQueueUnregister),
-        .take = @intFromPtr(&gfxQueueTake),
-        .complete = @intFromPtr(&gfxQueueComplete),
-        .reset = @intFromPtr(&gfxQueueReset),
-        .segment = @intFromPtr(&gfxQueueSegment),
-        .retain_resource = @intFromPtr(&gfxQueueRetain),
-        .register_profile = @intFromPtr(&gfxQueueRegisterProfile),
-        .update_operations = @intFromPtr(&gfxQueueUpdateOperations),
-        .read_render_list = @intFromPtr(&gfxQueueReadRenderList),
-        .read_render_grid_list = @intFromPtr(&gfxQueueReadRenderGridList),
-        .read_render_color_list = @intFromPtr(&gfxQueueReadRenderColorList),
-        .publish_properties = @intFromPtr(&gfxQueuePublishProperties),
-        .read_native_info = @intFromPtr(&gfxQueueReadNativeInfo),
-        .read_native_data = @intFromPtr(&gfxQueueReadNativeData),
-        .read_native_binding = @intFromPtr(&gfxQueueReadNativeBinding),
-        .queue_owner_info = @intFromPtr(&gfxQueueOwnerInfo),
-        .retain_scanout = @intFromPtr(&gfxQueueRetainScanout),
-        .begin_scanout = @intFromPtr(&gfxQueueBeginScanout),
-        .scanout_retire_requested = @intFromPtr(&gfxQueueScanoutRetireRequested),
-    };
-    @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
+
+export fn r4os_zig_driver_gfx_display_schedule(owner: u32, input: *const outputs_contract.GfxBackendBinding) callconv(.c) i32 {
+    @import("../display/queue.zig").wakeNative(owner, .{ .adapter = input.adapter_id, .device_generation = input.device_generation, .reset_generation = input.reset_generation }) catch |err| return @import("../program/gfx_queue_api.zig").errorCode(err);
     return outputs_contract.gfx_queue_ok;
 }
-fn gfxQueueRegister(input: *const outputs_contract.GfxBackendRegistration, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_queue_api.register(identity, input, output);
-}
-fn gfxQueueRegisterProfile(input: *const outputs_contract.GfxBackendRegistration, profile: *const outputs_contract.GfxBackendProfile, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_queue_api.registerProfile(identity, input, profile, output);
-}
-fn gfxQueuePublishProperties(input: *const outputs_contract.GfxBackendBinding, properties: *const outputs_contract.GfxBackendProperties) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_queue_api.publishProperties(identity, input, properties);
-}
-fn gfxQueueReadNativeInfo(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxNativeJobInfo) callconv(.c) i32 {
-    return gfx_queue_api.readNativeInfo(activeOwner(), input, output);
-}
-fn gfxQueueReadNativeData(input: *const outputs_contract.GfxFence, offset: u32, output: [*]u8, count: u32) callconv(.c) i32 {
-    return gfx_queue_api.readNativeData(activeOwner(), input, offset, output, count);
-}
-fn gfxQueueReadNativeBinding(input: *const outputs_contract.GfxFence, index: u32, output: *outputs_contract.GfxNativeBinding) callconv(.c) i32 {
-    return gfx_queue_api.readNativeBinding(activeOwner(), input, index, output);
-}
-fn gfxQueueOwnerInfo(input: *const outputs_contract.GfxBackendBinding, timeline: u64, output: *outputs_contract.GfxQueueOwnerInfo) callconv(.c) i32 {
-    return gfx_queue_api.queueOwnerInfo(activeOwner(), input, timeline, output);
-}
-fn gfxQueueUnregister(input: *const outputs_contract.GfxBackendBinding, quiesced: u32) callconv(.c) i32 {
-    return gfx_queue_api.unregister(activeOwner(), input, quiesced);
-}
-fn gfxQueueTake(input: *const outputs_contract.GfxBackendBinding, output: *outputs_contract.GfxDriverJob) callconv(.c) i32 {
-    return gfx_queue_api.take(activeOwner(), input, output);
-}
-fn gfxQueueReadRenderList(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderList) callconv(.c) i32 {
-    return gfx_queue_api.readRenderList(activeOwner(), input, output);
-}
-fn gfxQueueReadRenderGridList(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderGridList) callconv(.c) i32 {
-    return gfx_queue_api.readRenderGridList(activeOwner(), input, output);
-}
-fn gfxQueueUpdateOperations(input: *const outputs_contract.GfxBackendBinding, operations: u64) callconv(.c) i32 {
-    return gfx_queue_api.updateOperations(activeOwner(), input, operations);
-}
-fn gfxQueueReadRenderColorList(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxRenderColorList) callconv(.c) i32 {
-    return gfx_queue_api.readRenderColorList(activeOwner(), input, output);
-}
-fn gfxQueueComplete(input: *const outputs_contract.GfxFence, result: u32, quiesced: u32) callconv(.c) i32 {
-    return gfx_queue_api.complete(activeOwner(), input, result, quiesced);
-}
-fn gfxQueueReset(input: *const outputs_contract.GfxBackendBinding, quiesced: u32, output: *outputs_contract.GfxBackendBinding) callconv(.c) i32 {
-    return gfx_queue_api.reset(activeOwner(), input, quiesced, output);
-}
-fn gfxQueueSegment(input: *const outputs_contract.GfxFence, which: u32, offset: u64, mask: u64, output: *outputs_contract.GfxDmaSegment) callconv(.c) i32 {
-    return gfx_queue_api.segment(activeOwner(), input, which, offset, mask, output);
-}
-fn gfxQueueRetain(input: *const outputs_contract.GfxFence, which: u32, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_queue_api.retain(identity, input, which, output);
-}
-fn gfxQueueRetainScanout(input: *const outputs_contract.GfxFence, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_queue_api.retainScanout(identity, input, output);
-}
-fn gfxQueueBeginScanout(input: *const outputs_contract.GfxFence) callconv(.c) i32 {
-    return gfx_queue_api.beginScanout(activeOwner(), input);
-}
-fn gfxQueueScanoutRetireRequested(input: *const outputs_contract.GfxFence) callconv(.c) i32 {
-    return gfx_queue_api.scanoutRetireRequested(activeOwner(), input);
+
+export fn r4os_zig_driver_receiver_epoch() callconv(.c) u64 {
+    return @import("../display/outputs.zig").receiverEpoch();
 }
 
-fn gfxBufferCreate(input: *const outputs_contract.GfxBufferDescriptor, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_api.create(identity, input, output);
-}
-
-fn gfxBufferDescribe(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferDescriptor) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return gfx_api.describe(identity, input, output);
-}
-
-fn gfxBufferImport(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_api.import(identity, input, output);
-}
-
-fn gfxBufferRelease(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return gfx_api.release(identity, input);
-}
-
-fn gfxBufferMap(input: *const outputs_contract.GfxBufferHandle, access: u32, offset: u64, bytes: u64, output: *outputs_contract.GfxBufferMap) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_api.map(identity, input, access, offset, bytes, output);
-}
-
-fn gfxBufferUnmap(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return gfx_api.unmap(identity, input);
-}
-
-fn gfxDeviceAcquire(reference: *const outputs_contract.GfxBufferHandle, request: *const outputs_contract.GfxDeviceRequest, output: *outputs_contract.GfxDeviceLease) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_memory.acquire(identity, reference, request, output);
-}
-
-fn gfxDeviceSegment(lease: *const outputs_contract.GfxDeviceLease, offset: u64, output: *outputs_contract.GfxDmaSegment) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return gfx_memory.segment(identity, lease, offset, output);
-}
-
-fn gfxDeviceRelease(lease: *const outputs_contract.GfxDeviceLease, quiesced: u32) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return gfx_memory.release(identity, lease, quiesced);
-}
-
-fn gfxMmioMap(request: *const outputs_contract.GfxMmioRequest, output: *outputs_contract.GfxMmioWindow) callconv(.c) i32 {
-    const identity = currentGfxOwner(true) catch |err| return gfx_api.status(err);
-    return gfx_memory.mapWindow(identity, request, output);
-}
-
-fn gfxMmioUnmap(window: *const outputs_contract.GfxBufferHandle, quiesced: u32) callconv(.c) i32 {
-    const identity = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    return gfx_memory.unmapWindow(identity, window, quiesced);
-}
-
-fn gfxCollect() callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return if (current_owner != 0 and current_owner_guard.ownedByCurrent()) gfx_memory.collect(identity) else gfx_memory.collectBuffers(identity);
-}
-
-fn gfxOwnedReserve(input: *const outputs_contract.GfxBufferDescriptor, cookie: u64, output: *outputs_contract.GfxOwnedBufferReservation) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return @import("gfx_owned_buffers.zig").reserve(identity, input, cookie, output);
-}
-fn gfxOwnedCommit(input: *const outputs_contract.GfxOwnedBufferReservation, output: *outputs_contract.GfxBufferReference) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return @import("gfx_owned_buffers.zig").commit(identity, input, output);
-}
-fn gfxOwnedAbort(input: *const outputs_contract.GfxOwnedBufferReservation, quiesced: u32) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("gfx_owned_buffers.zig").abort(identity, input, quiesced);
-}
-fn gfxOwnedTakeRelease(adapter: u32, generation: u64, output: *outputs_contract.GfxOwnedBufferRelease) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("gfx_owned_buffers.zig").take(identity, adapter, generation, output);
-}
-fn gfxOwnedFinishRelease(input: *const outputs_contract.GfxOwnedBufferRelease, quiesced: u32) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("gfx_owned_buffers.zig").finish(identity, input, quiesced);
-}
-
-fn gfxReservedSpan(base: u64, bytes: u64) callconv(.c) i32 {
-    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    if (base == 0 or bytes == 0 or (base | bytes) & 4095 != 0 or base >= (@as(u64, 1) << 52) or bytes > (@as(u64, 1) << 52) - base)
-        return outputs_contract.gfx_buffer_error_invalid;
-    return if (@import("../memory/device_reserved.zig").bootCovers(base, bytes, @import("../bootloader/boot_info.zig").get()))
-        outputs_contract.gfx_buffer_result_ok else outputs_contract.gfx_buffer_error_unsupported;
-}
-
-fn gfxUnmanagedSpan(base: u64, bytes: u64) callconv(.c) i32 {
-    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    if (base == 0 or bytes == 0 or (base | bytes) & 4095 != 0 or base >= (@as(u64, 1) << 52) or bytes > (@as(u64, 1) << 52) - base)
-        return outputs_contract.gfx_buffer_error_invalid;
-    return if (@import("../memory/device_reserved.zig").bootExcludesSystemMemory(base, bytes, @import("../bootloader/boot_info.zig").get()))
-        outputs_contract.gfx_buffer_result_ok else outputs_contract.gfx_buffer_error_unsupported;
-}
-
-fn gfxMemoryQuery(output: *outputs_contract.GfxDriverMemoryApi) callconv(.c) i32 {
-    if (@intFromPtr(output) == 0 or output.version != 1 or output.size < 112) return outputs_contract.gfx_buffer_error_invalid;
-    _ = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    const bytes = @min(output.size & ~@as(u32, 7), @sizeOf(outputs_contract.GfxDriverMemoryApi));
-    const value: outputs_contract.GfxDriverMemoryApi = .{
-        .size = bytes,
-        .buffer_create = @intFromPtr(&gfxBufferCreate),
-        .buffer_describe = @intFromPtr(&gfxBufferDescribe),
-        .buffer_import = @intFromPtr(&gfxBufferImport),
-        .buffer_release = @intFromPtr(&gfxBufferRelease),
-        .buffer_map = @intFromPtr(&gfxBufferMap),
-        .buffer_unmap = @intFromPtr(&gfxBufferUnmap),
-        .device_acquire = @intFromPtr(&gfxDeviceAcquire),
-        .device_segment = @intFromPtr(&gfxDeviceSegment),
-        .device_release = @intFromPtr(&gfxDeviceRelease),
-        .mmio_map = if (current_owner != 0 and current_owner_guard.ownedByCurrent()) @intFromPtr(&gfxMmioMap) else 0,
-        .mmio_unmap = if (current_owner != 0 and current_owner_guard.ownedByCurrent()) @intFromPtr(&gfxMmioUnmap) else 0,
-        .collect = @intFromPtr(&gfxCollect),
-        .buffer_stats = @intFromPtr(&gfxMemoryStats),
-        .buffer_reserve = @intFromPtr(&gfxOwnedReserve),
-        .buffer_commit = @intFromPtr(&gfxOwnedCommit),
-        .buffer_abort = @intFromPtr(&gfxOwnedAbort),
-        .buffer_take_release = @intFromPtr(&gfxOwnedTakeRelease),
-        .buffer_finish_release = @intFromPtr(&gfxOwnedFinishRelease),
-        .native_register = @intFromPtr(&gfxNativeRegister),
-        .native_unregister = @intFromPtr(&gfxNativeUnregister),
-        .native_take = @intFromPtr(&gfxNativeTake),
-        .native_complete = @intFromPtr(&gfxNativeComplete),
-        .virtual_register = @intFromPtr(&gfxVirtualRegister),
-        .virtual_unregister = @intFromPtr(&gfxVirtualUnregister),
-        .virtual_take = @intFromPtr(&gfxVirtualTake),
-        .virtual_complete = @intFromPtr(&gfxVirtualComplete),
-        .memory_budget = @intFromPtr(&gfxMemoryBudget),
-        .telemetry_exchange = @intFromPtr(&gfxTelemetryExchange),
-        .device_lost = @intFromPtr(&gfxDeviceLost),
-        .reserved_span = @intFromPtr(&gfxReservedSpan),
-        .unmanaged_span = @intFromPtr(&gfxUnmanagedSpan),
-    };
-    @memcpy(@as([*]u8, @ptrCast(output))[0..bytes], std.mem.asBytes(&value)[0..bytes]);
-    return outputs_contract.gfx_buffer_result_ok;
-}
-
-fn gfxVirtualRegister(input: *const outputs_contract.GfxNativeProvider, output: *outputs_contract.GfxBufferHandle) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return @import("gfx_virtual_driver_api.zig").register(identity, input, output);
-}
-fn gfxVirtualUnregister(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("gfx_virtual_driver_api.zig").unregister(identity, input);
-}
-fn gfxVirtualTake(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxVirtualJob) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("gfx_virtual_driver_api.zig").take(identity, input, output);
-}
-fn gfxVirtualComplete(input: *const outputs_contract.GfxBufferHandle, completion: *const outputs_contract.GfxVirtualCompletion) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("gfx_virtual_driver_api.zig").complete(identity, input, completion);
-}
-fn gfxNativeRegister(input: *const outputs_contract.GfxNativeProvider, output: *outputs_contract.GfxBufferHandle) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return @import("gfx_allocation_driver_api.zig").register(identity, input, output);
-}
-fn gfxNativeUnregister(input: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("gfx_allocation_driver_api.zig").unregister(identity, input);
-}
-fn gfxNativeTake(input: *const outputs_contract.GfxBufferHandle, output: *outputs_contract.GfxNativeJob) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return @import("gfx_allocation_driver_api.zig").take(identity, input, output);
-}
-fn gfxNativeComplete(provider: *const outputs_contract.GfxBufferHandle, request: *const outputs_contract.GfxBufferHandle, result: i32, reference: *const outputs_contract.GfxBufferHandle) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("gfx_allocation_driver_api.zig").complete(identity, provider, request, result, reference);
-}
-
-fn gfxMemoryStats(output: *outputs_contract.GfxBufferStats) callconv(.c) i32 {
-    _ = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return gfx_api.stats(output);
-}
-
-fn gfxMemoryBudget(input: *const outputs_contract.GfxDeviceBudgetRequest, output: *outputs_contract.GfxDeviceBudgetState) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("../program/gfx_memory_budget_api.zig").provider(identity, input, output);
-}
-fn gfxTelemetryExchange(input: *const outputs_contract.GfxTelemetryState, output: *outputs_contract.GfxTelemetryDemand) callconv(.c) i32 {
-    const identity = currentBufferOwner(true) catch |err| return gfx_api.status(err);
-    return @import("../program/gfx_telemetry_api.zig").publish(identity, input, output);
-}
-
-fn gfxDeviceLost(adapter: u32, generation: u64, quiesced: u32) callconv(.c) i32 {
-    const identity = currentBufferOwner(false) catch |err| return gfx_api.status(err);
-    return @import("gfx_owned_buffers.zig").lose(identity, adapter, generation, quiesced);
-}
-
-fn gfxOutputBrightnessPublish(input: *const outputs_contract.GfxOutputBrightness) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputBrightness) != 0 or irq_router.inDispatch())
-        return outputs_contract.gfx_output_error_invalid;
-    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    @import("../display/outputs.zig").publishBrightness(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
+export fn r4os_zig_driver_gfx_receiver_register(identity_view: *const NativeGfxIdentity, epoch: u64, adapter: u32, output: *outputs_contract.GfxReceiverSource) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    output.* = @import("../display/outputs.zig").registerReceiverSource(identity, adapter, epoch) catch |err| return @import("../program/gfx_output_api.zig").code(err);
     return outputs_contract.gfx_output_ok;
 }
-fn gfxBrightnessRead(input: *const outputs_contract.GfxOutputId, output: *outputs_contract.GfxBrightnessRequest) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(outputs_contract.GfxOutputId) != 0 or
-        !@import("../program/gfx_buffer_api.zig").validOutput(outputs_contract.GfxBrightnessRequest, output)) return outputs_contract.gfx_output_error_invalid;
-    const owner = currentGfxOwner(false) catch |err| return gfx_api.status(err);
-    const value = @import("../display/outputs.zig").readBrightness(@intCast(owner.id), input.*) catch |err| return gfx_modes.code(err);
-    output.* = value;
+
+export fn r4os_zig_driver_gfx_display_presentation_stats(identity_view: *const NativeGfxIdentity, stage: u8, input: *const outputs_contract.DisplayPresentationStats) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    if (stage == 0) {
+        const handled = @import("../display/output_runtime.zig").publishStats(identity, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+        return @intFromBool(handled);
+    }
+    @import("../display/display.zig").publishPresentationStats(identity.id, identity.generation, input.*) catch |err| return @import("../display/presentation_stats.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
+
+export fn r4os_zig_driver_gfx_display_presentation_info(identity_view: *const NativeGfxIdentity, stage: u8, input: *const outputs_contract.DisplayPresentationInfo) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    if (stage == 0) {
+        const handled = @import("../display/output_runtime.zig").publishInfo(identity, input.*) catch |err| return @import("../program/gfx_output_api.zig").code(err);
+        return @intFromBool(handled);
+    }
+    @import("../display/display.zig").publishPresentationInfo(identity.id, identity.generation, input.*) catch |err| return @import("../display/presentation_stats.zig").code(err);
+    return outputs_contract.gfx_output_ok;
+}
+
+export fn r4os_zig_driver_gfx_span(base: u64, bytes: u64, unmanaged: bool) callconv(.c) bool {
+    return if (unmanaged) @import("../memory/device_reserved.zig").bootExcludesSystemMemory(base, bytes, @import("../bootloader/boot_info.zig").get()) else @import("../memory/device_reserved.zig").bootCovers(base, bytes, @import("../bootloader/boot_info.zig").get());
+}
+
+export fn r4os_zig_driver_gfx_output_color_publish(identity_view: *const NativeGfxIdentity, input: *const outputs_contract.GfxOutputColorState) callconv(.c) i32 {
+    const identity = gfxIdentity(identity_view.*);
+    @import("../display/outputs.zig").publishColor(@intCast(identity.id), input.*) catch |err| return gfx_modes.code(err);
     return outputs_contract.gfx_output_ok;
 }

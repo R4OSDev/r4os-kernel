@@ -83,11 +83,20 @@ pub mod task_index;
 pub mod wait_node;
 pub mod sched {
     pub use crate::{scheduler, scheduler_types, task, task_context, task_index, wait_node};
+    pub use crate::{sync_locks, sync_objects, sync_types, sync_wait};
 }
 pub mod memory {
-    pub use crate::{heap, owner, paging, phys};
+    pub use crate::{heap, layout, owner, paging, phys};
 }
 pub mod arch {
+    pub use crate::callback_abort;
+    // Scalar native SMP admission uses the same exported symbol as the product.
+    // Host owner cases never start CPUs; an unexpected call fails via the trap.
+    pub mod smp {
+        unsafe extern "C" {
+            pub safe fn r4os_rust_smp_control(operation: u8, index: u32) -> u64;
+        }
+    }
     pub use crate::fpu;
     pub use crate::{
         hpet, io, ioapic, lapic, msr, percpu, pic, pit, rtc, runtime, smp_policy, tlb,
@@ -205,3 +214,117 @@ pub mod sync_selftest;
 
 #[path = "../../../Rust/kernel/deadman.rs"]
 pub mod deadman;
+
+#[path = "../../../Rust/driver/utilities.rs"]
+pub mod driver_utilities;
+
+#[path = "../../../Rust/driver/work_queue.rs"]
+pub mod driver_work_queue;
+
+#[path = "../../../Rust/arch/callback_abort.rs"]
+pub mod callback_abort;
+#[path = "../../../Rust/driver/dma_segments.rs"]
+pub mod dma_segments;
+#[path = "../../../Rust/driver/registry.rs"]
+pub mod driver_registry;
+#[path = "../../../Rust/driver/resources.rs"]
+pub mod driver_resources;
+#[path = "../../../Rust/driver/irq_router.rs"]
+pub mod irq_router;
+#[path = "../../../Rust/driver/protocol_api.rs"]
+pub mod protocol_api;
+#[path = "../../../Rust/driver/protocol_registry.rs"]
+pub mod protocol_registry;
+#[path = "../../../Rust/driver/resource_state.rs"]
+pub mod resource_state;
+pub mod driver {
+    pub use crate::dma_segments;
+    pub use crate::driver_api_admission as api_admission;
+    pub use crate::driver_api_audio as api_audio;
+    pub use crate::driver_api_cleanup as api_cleanup;
+    pub use crate::driver_api_dma as api_dma;
+    pub use crate::driver_api_entry as api_entry;
+    pub use crate::driver_api_gfx as api_gfx;
+    pub use crate::driver_api_msi as api_msi;
+    pub use crate::driver_api_net as api_net;
+    pub use crate::driver_api_options as api_options;
+    pub use crate::driver_api_platform as api_platform;
+    pub use crate::driver_api_resource as api_resource;
+    pub use crate::driver_api_runtime as api_runtime;
+    pub use crate::driver_api_storage as api_storage;
+    pub use crate::driver_api_validation as api_validation;
+    pub use crate::driver_work as work;
+    pub use crate::{driver_heap as heap, irq_router};
+    pub use crate::{driver_memory_owner as memory_owner, driver_treap as treap};
+    pub use crate::{
+        driver_registry as registry, driver_resources as resources, driver_utilities as utilities,
+        driver_work_queue as work_queue, protocol_registry, resource_state,
+    };
+    pub use crate::{
+        driver_semaphore_owner as semaphore_owner, driver_thread_owner as thread_owner,
+    };
+    pub use crate::{driver_semaphores as semaphores, driver_threads as threads};
+}
+
+#[path = "../../../Rust/driver/heap.rs"]
+pub mod driver_heap;
+#[path = "../../../Rust/driver/memory_owner.rs"]
+pub mod driver_memory_owner;
+#[path = "../../../Rust/driver/treap.rs"]
+pub mod driver_treap;
+#[path = "../../../Rust/driver/mmio_windows.rs"]
+pub mod mmio_windows;
+
+#[path = "../../../Rust/driver/semaphore_owner.rs"]
+pub mod driver_semaphore_owner;
+#[path = "../../../Rust/driver/semaphores.rs"]
+pub mod driver_semaphores;
+#[path = "../../../Rust/driver/thread_owner.rs"]
+pub mod driver_thread_owner;
+
+#[path = "../../../Rust/driver/threads.rs"]
+pub mod driver_threads;
+
+#[path = "../../../Rust/driver/work.rs"]
+pub mod driver_work;
+
+#[path = "../../../Rust/driver/api_admission.rs"]
+pub mod driver_api_admission;
+
+#[path = "../../../Rust/driver/api_dma.rs"]
+pub mod driver_api_dma;
+
+#[path = "../../../Rust/driver/api_platform.rs"]
+pub mod driver_api_platform;
+
+#[path = "../../../Rust/driver/api_msi.rs"]
+pub mod driver_api_msi;
+
+#[path = "../../../Rust/driver/api_runtime.rs"]
+pub mod driver_api_runtime;
+
+#[path = "../../../Rust/driver/api_resource.rs"]
+pub mod driver_api_resource;
+
+#[path = "../../../Rust/driver/api_options.rs"]
+pub mod driver_api_options;
+
+#[path = "../../../Rust/driver/api_audio.rs"]
+pub mod driver_api_audio;
+
+#[path = "../../../Rust/driver/api_validation.rs"]
+pub mod driver_api_validation;
+
+#[path = "../../../Rust/driver/api_storage.rs"]
+pub mod driver_api_storage;
+
+#[path = "../../../Rust/driver/api_net.rs"]
+pub mod driver_api_net;
+
+#[path = "../../../Rust/driver/api_cleanup.rs"]
+pub mod driver_api_cleanup;
+#[path = "../../../Rust/driver/api_entry.rs"]
+pub mod driver_api_entry;
+
+#[path = "../../../Rust/driver/api_gfx.rs"]
+pub mod driver_api_gfx;

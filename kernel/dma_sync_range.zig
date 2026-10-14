@@ -1,24 +1,12 @@
-//! Bounded copying and x86 ordering for an already owned resident DMA mapping.
-//! Admission/lifetime belong to driver_api; this helper allocates nothing and
-//! cannot grant concurrent ownership of the same bytes to CPU and device.
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const Direction = enum(u32) { bidirectional = 0, to_device = 1, from_device = 2 };
 pub const Phase = enum { device, cpu };
-
+extern fn r4os_rust_driver_dma_synchronize(original: [*]u8, original_len: usize, bounce: ?[*]u8, bounce_len: usize, direction: u32, cpu_phase: bool, offset: u32, bytes: u32) bool;
 pub fn synchronize(original: []u8, bounce: ?[]u8, direction: Direction, phase: Phase, offset: u32, bytes: u32) bool {
-    if (bytes == 0 or offset > original.len or bytes > original.len - offset) return false;
-    if (bounce) |area| {
-        if (area.len != original.len) return false;
-    }
-    if (phase == .cpu) asm volatile ("mfence" ::: .{ .memory = true });
-    if (bounce) |area| {
-        if (phase == .device and direction != .from_device)
-            @memcpy(area[offset..][0..bytes], original[offset..][0..bytes]);
-        if (phase == .cpu and direction != .to_device)
-            @memcpy(original[offset..][0..bytes], area[offset..][0..bytes]);
-    }
-    if (phase == .device) asm volatile ("mfence" ::: .{ .memory = true });
-    return true;
+    return r4os_rust_driver_dma_synchronize(original.ptr, original.len, if (bounce) |area| area.ptr else null, if (bounce) |area| area.len else 0, @intFromEnum(direction), phase == .cpu, offset, bytes);
 }
 
 test "DMA range synchronization preserves independently updated peer fields and rejects invalid extents atomically" {

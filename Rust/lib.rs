@@ -8,6 +8,7 @@ pub use r4os_contract as contract;
 pub mod arch;
 pub mod boot;
 pub mod build_bridge;
+pub mod driver;
 pub mod memory;
 pub mod platform;
 pub mod sched;

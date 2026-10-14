@@ -1,123 +1,126 @@
-// Owner-bound MMIO windows. Caller serializes the complete operation using
-// its preemptible driver execution guard, never a no-sleep metadata lock.
+// Owner-bound MMIO windows. Rust owns admission, records, accounting and
+// rollback; the existing wait-spanning driver execution guard serializes it.
 const std = @import("std");
 const lifetime = @import("../memory/gfx_buffer_owner.zig");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const Owner = lifetime.Owner;
 pub const Handle = lifetime.Handle;
 pub const page_size: u64 = 4096;
-pub const Policy = enum { other, write_combining, uncached };
-pub const Request = struct { resource_base: u64, resource_bytes: u64, offset: u64, bytes: u64, policy: Policy, prefetchable: bool = false };
-pub const Extent = struct { physical: u64, bytes: u64 };
+pub const Policy = enum(u8) { other, write_combining, uncached };
+pub const Request = extern struct { resource_base: u64, resource_bytes: u64, offset: u64, bytes: u64, policy: Policy, prefetchable: bool = false };
+pub const Extent = extern struct { physical: u64, bytes: u64 };
 pub const Error = error{ Invalid, Overflow, Unsupported, Busy, Capacity, Stale, Exhausted, MapFailed };
 pub const Window = struct { handle: Handle, cpu: u64, physical: u64, bytes: u64, policy: Policy, borrowed: bool };
-
-// PAT entries are platform state, not fixed meanings of the PCD/PWT bits.
-// UC-minus (7) is deliberately not accepted for register windows requiring UC.
+const NativeOwner = extern struct {
+    id: u64,
+    generation: u64,
+    kind: u8,
+    fn from(value: Owner) NativeOwner {
+        return .{ .id = value.id, .generation = value.generation, .kind = @intFromEnum(value.kind) };
+    }
+};
+const NativeHandle = extern struct { generation: u64 = 0, id: u32 = 0 };
+const NativeWindow = extern struct {
+    handle: NativeHandle = .{},
+    cpu: u64 = 0,
+    physical: u64 = 0,
+    bytes: u64 = 0,
+    policy: Policy = .other,
+    borrowed: bool = false,
+    fn public(self: NativeWindow) Window {
+        return .{ .handle = .{ .id = self.handle.id, .generation = self.handle.generation }, .cpu = self.cpu, .physical = self.physical, .bytes = self.bytes, .policy = self.policy, .borrowed = self.borrowed };
+    }
+};
+const Record = extern struct {
+    owner: NativeOwner = .{ .id = 0, .generation = 0, .kind = 2 },
+    window: NativeWindow = .{},
+    mapped: u64 = 0,
+    used: bool = false,
+    retiring: bool = false,
+};
+const NativeBackend = extern struct {
+    context: *anyopaque,
+    call: *const fn (*anyopaque, u8, u64, u64, u8, *u64) callconv(.c) bool,
+};
+extern fn r4os_rust_mmio_cache_selector(pat: u64, memory_type: u8) u8;
+extern fn r4os_rust_mmio_validate(request: *const Request, output: *Extent) u8;
+extern fn r4os_rust_mmio_create(state: *anyopaque, backend: *const NativeBackend, owner: *const NativeOwner, request: *const Request, output: *NativeWindow) u8;
+extern fn r4os_rust_mmio_release(state: *anyopaque, backend: *const NativeBackend, owner: *const NativeOwner, handle: *const NativeHandle, quiesced: bool) u8;
+extern fn r4os_rust_mmio_query(state: *anyopaque, backend: ?*const NativeBackend, owner: *const NativeOwner, operation: u8) bool;
+comptime {
+    if (@sizeOf(NativeOwner) != 24 or @sizeOf(NativeWindow) != 48 or @sizeOf(Record) != 88 or @sizeOf(Request) != 40) @compileError("Native MMIO C layout drift");
+}
+fn checked(code: u8) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Overflow,
+        3 => error.Unsupported,
+        4 => error.Busy,
+        5 => error.Capacity,
+        6 => error.Stale,
+        7 => error.Exhausted,
+        8 => error.MapFailed,
+        else => @panic("Invalid native MMIO result"),
+    };
+}
 pub fn cacheSelector(pat: u64, memory_type: u8) ?u3 {
-    for (0..8) |index| if (@as(u8, @truncate(pat >> @as(u6, @intCast(index * 8)))) == memory_type) return @intCast(index);
-    return null;
+    const index = r4os_rust_mmio_cache_selector(pat, memory_type);
+    return if (index == 255) null else @intCast(index);
 }
-
 pub fn validate(request: Request) Error!Extent {
-    if (request.resource_base == 0 or request.resource_bytes == 0 or request.bytes == 0 or
-        (request.resource_base | request.resource_bytes | request.offset | request.bytes) % page_size != 0 or
-        !lifetime.layout.spanFits(request.resource_bytes, request.offset, request.bytes)) return error.Invalid;
-    if (request.policy == .other or (request.policy == .write_combining and !request.prefetchable)) return error.Unsupported;
-    _ = std.math.add(u64, request.resource_base, request.resource_bytes) catch return error.Overflow;
-    const start = std.math.add(u64, request.resource_base, request.offset) catch return error.Overflow;
-    const end = std.math.add(u64, start, request.bytes) catch return error.Overflow;
-    if (end > (@as(u64, 1) << 52)) return error.Unsupported;
-    return .{ .physical = start, .bytes = request.bytes };
+    var output: Extent = undefined;
+    try checked(r4os_rust_mmio_validate(&request, &output));
+    return output;
 }
-
 pub fn Manager(comptime Backend: type) type {
-    return struct {
+    return extern struct {
         const Self = @This();
-        const Record = struct { used: bool = false, owner: Owner = .{ .kind = .driver, .id = 0, .generation = 0 }, window: Window = undefined, mapped: u64 = 0, retiring: bool = false };
         records: [64]Record = .{Record{}} ** 64,
         serial: u64 = 0,
         charged: u64 = 0,
         budget: u64 = 1024 * 1024 * 1024,
-
-        pub fn create(self: *Self, backend: *Backend, owner: Owner, request: Request) Error!Window {
-            if (!owner.valid() or owner.kind != .driver) return error.Invalid;
-            const extent = try validate(request);
-            if (self.charged > self.budget or extent.bytes > self.budget - self.charged) return error.Capacity;
-            if (!backend.deviceSpan(extent.physical, extent.bytes)) return error.Unsupported;
-            const cpu = backend.cpuAddress(extent.physical, extent.bytes) orelse return error.Overflow;
-            var slot: ?usize = null;
-            for (&self.records, 0..) |*record, index| {
-                if (!record.used) {
-                    slot = slot orelse index;
-                    continue;
-                }
-                if (extent.physical < record.window.physical + record.window.bytes and record.window.physical < extent.physical + extent.bytes) return error.Busy;
-            }
-            const index = slot orelse return error.Capacity;
-            if (self.serial == std.math.maxInt(u64)) return error.Exhausted;
-            // Never manufacture a second cache alias. Entirely mapped spans
-            // must already have the requested attributes; mixed spans fail.
-            const existing = backend.policy(cpu);
-            if (existing) |policy| if (policy != request.policy) {
-                return error.Unsupported;
+        comptime {
+            if (@sizeOf(Self) != 5656 or @offsetOf(Self, "serial") != 5632) @compileError("Native MMIO state layout drift");
+        }
+        fn call(context: *anyopaque, operation: u8, address: u64, bytes_or_physical: u64, policy: u8, output: *u64) callconv(.c) bool {
+            const backend: *Backend = @ptrCast(@alignCast(context));
+            return switch (operation) {
+                0 => backend.deviceSpan(address, bytes_or_physical),
+                1 => blk: {
+                    output.* = backend.cpuAddress(address, bytes_or_physical) orelse break :blk false;
+                    break :blk true;
+                },
+                2 => blk: {
+                    output.* = @intFromEnum(backend.policy(address) orelse break :blk false);
+                    break :blk true;
+                },
+                3 => backend.map(address, bytes_or_physical, @enumFromInt(policy)),
+                4 => backend.unmap(address),
+                else => @panic("Invalid native MMIO backend operation"),
             };
-            var offset: u64 = 0;
-            while (offset < extent.bytes) : (offset += page_size) {
-                if (backend.policy(cpu + offset) != existing) return error.Unsupported;
-            }
-            self.serial += 1;
-            const window = Window{ .handle = .{ .id = @intCast(index + 1), .generation = self.serial }, .cpu = cpu, .physical = extent.physical, .bytes = extent.bytes, .policy = request.policy, .borrowed = existing != null };
-            const record = &self.records[index];
-            record.* = .{ .used = true, .owner = owner, .window = window };
-            self.charged += extent.bytes;
-            if (!window.borrowed) {
-                while (record.mapped < extent.bytes) {
-                    if (!backend.map(cpu + record.mapped, extent.physical + record.mapped, request.policy)) {
-                        record.retiring = true;
-                        _ = self.reclaim(backend, record);
-                        return error.MapFailed;
-                    }
-                    record.mapped += page_size;
-                }
-            }
-            return window;
         }
-
+        fn adapter(backend: *Backend) NativeBackend {
+            return .{ .context = backend, .call = call };
+        }
+        pub fn create(self: *Self, backend: *Backend, owner: Owner, request: Request) Error!Window {
+            var output: NativeWindow = undefined;
+            try checked(r4os_rust_mmio_create(self, &adapter(backend), &NativeOwner.from(owner), &request, &output));
+            return output.public();
+        }
         pub fn release(self: *Self, backend: *Backend, owner: Owner, handle: Handle, quiesced: bool) Error!void {
-            if (handle.id == 0 or handle.id > self.records.len) return error.Stale;
-            const record = &self.records[handle.id - 1];
-            if (!record.used or !record.owner.eql(owner) or !record.window.handle.eql(handle)) return error.Stale;
-            if (!quiesced) return error.Busy;
-            record.retiring = true;
-            if (!self.reclaim(backend, record)) return error.Busy;
+            try checked(r4os_rust_mmio_release(self, &adapter(backend), &NativeOwner.from(owner), &.{ .generation = handle.generation, .id = handle.id }, quiesced));
         }
-
         pub fn collect(self: *Self, backend: *Backend, owner: Owner) bool {
-            var all_released = true;
-            for (&self.records) |*record| {
-                if (record.used and record.retiring and record.owner.eql(owner) and !self.reclaim(backend, record)) all_released = false;
-            }
-            return all_released;
+            return r4os_rust_mmio_query(self, &adapter(backend), &NativeOwner.from(owner), 0);
         }
         pub fn retains(self: *const Self, owner: Owner) bool {
-            for (&self.records) |*record| if (record.used and record.owner.eql(owner)) return true;
-            return false;
+            return r4os_rust_mmio_query(@constCast(self), null, &NativeOwner.from(owner), 1);
         }
         pub fn pending(self: *const Self, owner: Owner) bool {
-            for (&self.records) |*record| if (record.used and record.retiring and record.owner.eql(owner)) return true;
-            return false;
-        }
-        fn reclaim(self: *Self, backend: *Backend, record: *Record) bool {
-            while (record.mapped != 0) {
-                const offset = record.mapped - page_size;
-                // A failed shootdown leaves the PTE and record intact. Never
-                // subtract charge or discard the only rollback identity.
-                if (!backend.unmap(record.window.cpu + offset)) return false;
-                record.mapped = offset;
-            }
-            self.charged -= record.window.bytes;
-            record.* = .{};
-            return true;
+            return r4os_rust_mmio_query(@constCast(self), null, &NativeOwner.from(owner), 2);
         }
     };
 }

@@ -574,7 +574,7 @@ fn initModule(module: *const Module) void {
     };
     const init_start = loader_perf.now();
     protocol_api.enter(module.registry_slot);
-    const result = init(&protocol_api.table);
+    const result = init(protocol_api.table());
     protocol_api.leave();
     loader_perf.addR4pInitTicks(init_start);
     if (result != 0) {

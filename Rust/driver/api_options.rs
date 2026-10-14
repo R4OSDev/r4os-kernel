@@ -1,0 +1,54 @@
+//! Existing bounded boot option view: borrowed immutable configuration input,
+//! native reusable NUL output with the exact original64-byte payload limit.
+use core::{cell::UnsafeCell, ptr, slice};
+#[repr(C)]
+struct Span {
+    pointer: *const u8,
+    len: usize,
+}
+#[repr(C)]
+struct OptionView {
+    driver: Span,
+    key: Span,
+    value: Span,
+}
+unsafe extern "C" {
+    fn r4os_zig_driver_option_count() -> usize;
+    fn r4os_zig_driver_option(index: usize, out: *mut OptionView);
+}
+struct Buffer(UnsafeCell<[u8; 65]>);
+// SAFETY: the original R4D synchronous option lookup serializes this reusable
+// result; consumers retain no permission to use it after another query.
+unsafe impl Sync for Buffer {}
+static VALUE: Buffer = Buffer(UnsafeCell::new([0; 65]));
+static EMPTY: [u8; 1] = [0];
+unsafe fn matches(z: *const u8, span: Span) -> bool {
+    let supplied = unsafe { slice::from_raw_parts(z, span.len) };
+    let expected = unsafe { slice::from_raw_parts(span.pointer, span.len) };
+    supplied.eq_ignore_ascii_case(expected) && unsafe { *z.add(span.len) == 0 }
+}
+/// # Safety
+/// Zero-terminated names are readable under the original serialized driver
+/// admission; the shared result buffer remains borrowed until the next lookup.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_driver_option(driver: *const u8, key: *const u8) -> *const u8 {
+    let count = unsafe { r4os_zig_driver_option_count() };
+    for i in 0..count {
+        let mut option = core::mem::MaybeUninit::uninit();
+        unsafe { r4os_zig_driver_option(i, option.as_mut_ptr()) };
+        let option = unsafe { option.assume_init() };
+        if !unsafe { matches(driver, option.driver) } || !unsafe { matches(key, option.key) } {
+            continue;
+        }
+        let destination = VALUE.0.get().cast::<u8>();
+        unsafe {
+            ptr::write_bytes(destination, 0, 65);
+            let length = option.value.len.min(64);
+            if length != 0 {
+                ptr::copy_nonoverlapping(option.value.pointer, destination, length)
+            }
+        }
+        return destination;
+    }
+    EMPTY.as_ptr()
+}

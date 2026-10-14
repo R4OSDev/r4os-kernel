@@ -1,4 +1,7 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
 pub const capacity: usize = 16;
 pub const no_slot: u8 = 0xFF;
@@ -45,7 +48,23 @@ pub const CleanupDecision = enum {
     release_final,
 };
 
-pub const OwnerBookkeeping = struct {
+// Fixed private C records; the native policy owns every queue/ledger mutation.
+// Work admission, runtime serialization and actual completion stay with Work.
+const RawSelection = extern struct { slot: usize, source: SourceClass, irq_preferred: bool, task_fairness: bool };
+extern fn r4os_rust_work_owner_ledger(book: *OwnerBookkeeping, operation: u8, value: u8) u32;
+extern fn r4os_rust_work_owner_retained(book: *const OwnerBookkeeping) u32;
+extern fn r4os_rust_work_queue(book: *Bookkeeping, operation: u8, value: usize) usize;
+extern fn r4os_rust_work_queue_query(book: *const Bookkeeping, operation: u8, slot: usize) usize;
+extern fn r4os_rust_work_queue_select(book: *Bookkeeping, deadline_lane: bool, deadlines: ?[*]const u64, len: usize, output: *RawSelection) bool;
+extern fn r4os_rust_work_release_decision(state: u8, published: bool, waiters: u32, claimed: bool) u8;
+extern fn r4os_rust_work_cleanup_decision(state: u8, published: bool, waiters: u32) u8;
+extern fn r4os_rust_work_handle(operation: u8, slot_or_handle: usize, generation: u32) usize;
+comptime {
+    if (@sizeOf(OwnerBookkeeping) != 56 or @sizeOf(Bookkeeping) != 164 or @offsetOf(Bookkeeping, "free_count") != 108 or
+        @sizeOf(RawSelection) != 16 or @offsetOf(RawSelection, "source") != 8)
+        @compileError("Native Work queue C layout drift");
+}
+pub const OwnerBookkeeping = extern struct {
     used: u32 = 0,
     queued: u32 = 0,
     running: u32 = 0,
@@ -61,95 +80,32 @@ pub const OwnerBookkeeping = struct {
     retained_high_water: u32 = 0,
     deadline_queue_high_water: u32 = 0,
 
-    pub fn reserve(self: *OwnerBookkeeping, source: SourceClass) void {
-        self.used +|= 1;
-        self.queued +|= 1;
-        switch (source) {
-            .irq => self.irq_queued +|= 1,
-            .task => self.task_queued +|= 1,
-            .deadline => self.deadline_queued +|= 1,
-        }
-        if (self.deadline_queued > self.deadline_queue_high_water) {
-            self.deadline_queue_high_water = self.deadline_queued;
-        }
-        self.noteHighWater();
+    pub fn reserve(self: *OwnerBookkeeping, value: SourceClass) void {
+        _ = r4os_rust_work_owner_ledger(self, 0, @intFromEnum(value));
     }
-
-    pub fn start(self: *OwnerBookkeeping, source: SourceClass) void {
-        if (self.queued != 0) self.queued -= 1;
-        self.running +|= 1;
-        if (source == .deadline) self.deadline_running +|= 1;
-        switch (source) {
-            .irq => if (self.irq_queued != 0) {
-                self.irq_queued -= 1;
-            },
-            .task => if (self.task_queued != 0) {
-                self.task_queued -= 1;
-            },
-            .deadline => if (self.deadline_queued != 0) {
-                self.deadline_queued -= 1;
-            },
-        }
+    pub fn start(self: *OwnerBookkeeping, value: SourceClass) void {
+        _ = r4os_rust_work_owner_ledger(self, 1, @intFromEnum(value));
     }
-
-    pub fn cancel(self: *OwnerBookkeeping, source: SourceClass) void {
-        if (self.queued != 0) self.queued -= 1;
-        self.cancelled +|= 1;
-        switch (source) {
-            .irq => if (self.irq_queued != 0) {
-                self.irq_queued -= 1;
-            },
-            .task => if (self.task_queued != 0) {
-                self.task_queued -= 1;
-            },
-            .deadline => if (self.deadline_queued != 0) {
-                self.deadline_queued -= 1;
-            },
-        }
-        self.noteHighWater();
+    pub fn cancel(self: *OwnerBookkeeping, value: SourceClass) void {
+        _ = r4os_rust_work_owner_ledger(self, 2, @intFromEnum(value));
     }
-
-    pub fn complete(self: *OwnerBookkeeping, source: SourceClass) void {
-        if (self.running != 0) self.running -= 1;
-        if (source == .deadline and self.deadline_running != 0) self.deadline_running -= 1;
-        self.completed +|= 1;
-        self.noteHighWater();
+    pub fn complete(self: *OwnerBookkeeping, value: SourceClass) void {
+        _ = r4os_rust_work_owner_ledger(self, 3, @intFromEnum(value));
     }
-
-    pub fn release(self: *OwnerBookkeeping, state: State) void {
-        if (self.used != 0) self.used -= 1;
-        switch (state) {
-            .completed => if (self.completed != 0) {
-                self.completed -= 1;
-            },
-            .cancelled => if (self.cancelled != 0) {
-                self.cancelled -= 1;
-            },
-            else => {},
-        }
+    pub fn release(self: *OwnerBookkeeping, value: State) void {
+        _ = r4os_rust_work_owner_ledger(self, 4, @intFromEnum(value));
     }
-
     pub fn addWaiter(self: *OwnerBookkeeping) void {
-        self.waiters +|= 1;
-        if (self.waiters > self.waiters_max) self.waiters_max = self.waiters;
+        _ = r4os_rust_work_owner_ledger(self, 5, 0);
     }
-
     pub fn removeWaiter(self: *OwnerBookkeeping) void {
-        if (self.waiters != 0) self.waiters -= 1;
+        _ = r4os_rust_work_owner_ledger(self, 6, 0);
     }
-
     pub fn retainedCount(self: *const OwnerBookkeeping) u32 {
-        return self.completed + self.cancelled;
-    }
-
-    fn noteHighWater(self: *OwnerBookkeeping) void {
-        if (self.used > self.used_high_water) self.used_high_water = self.used;
-        const retained = self.retainedCount();
-        if (retained > self.retained_high_water) self.retained_high_water = retained;
+        return r4os_rust_work_owner_retained(self);
     }
 };
-
-pub const Bookkeeping = struct {
+pub const Bookkeeping = extern struct {
     states: [capacity]State = [_]State{.free} ** capacity,
     classes: [capacity]SourceClass = [_]SourceClass{.task} ** capacity,
     queue_prev: [capacity]u8 = [_]u8{no_slot} ** capacity,
@@ -180,287 +136,64 @@ pub const Bookkeeping = struct {
     deadline_queue_high_water: u32 = 0,
     current_irq_burst: u32 = 0,
 
-    pub fn reserveAndEnqueue(self: *Bookkeeping, source: SourceClass) ?usize {
-        if (self.free_mask == 0) return null;
-        if (source == .deadline) {
-            if (self.deadline_queued_count >= deadline_queue_capacity) return null;
-        } else if (self.free_count <= deadline_reserved_capacity) {
-            return null;
-        }
-        const slot: usize = @intCast(@ctz(self.free_mask));
-        self.free_mask &= ~slotBit(slot);
-        self.free_count -= 1;
-        self.states[slot] = .queued;
-        self.classes[slot] = source;
-        self.queued_count += 1;
-        switch (source) {
-            .irq => self.irq_queued_count += 1,
-            .task => self.task_queued_count += 1,
-            .deadline => self.deadline_queued_count += 1,
-        }
-        self.appendQueue(slot, source);
-        self.noteHighWater();
-        return slot;
+    pub fn reserveAndEnqueue(self: *Bookkeeping, value: SourceClass) ?usize {
+        const slot = r4os_rust_work_queue(self, 0, @intFromEnum(value));
+        return if (slot == std.math.maxInt(usize)) null else slot;
     }
-
     pub fn takeNext(self: *Bookkeeping) ?Selection {
         return self.takeNextNormal();
     }
-
     pub fn takeNextNormal(self: *Bookkeeping) ?Selection {
-        const has_irq = self.irq_head != no_slot;
-        const has_task = self.task_head != no_slot;
-        if (!has_irq and !has_task) return null;
-
-        var selection = Selection{ .slot = 0, .source = .task };
-        if (has_irq and (!has_task or self.current_irq_burst < irq_burst_limit)) {
-            selection.slot = self.irq_head;
-            selection.source = .irq;
-            selection.irq_preferred = has_task;
-            self.current_irq_burst +|= 1;
-        } else {
-            selection.slot = self.task_head;
-            selection.source = .task;
-            selection.task_fairness = has_irq;
-            self.current_irq_burst = 0;
-        }
-
-        self.startSelection(selection);
-        return selection;
+        var value: RawSelection = undefined;
+        if (!r4os_rust_work_queue_select(self, false, null, 0, &value)) return null;
+        return .{ .slot = value.slot, .source = value.source, .irq_preferred = value.irq_preferred, .task_fairness = value.task_fairness };
     }
-
     pub fn takeNextDeadline(self: *Bookkeeping, deadlines: []const u64) ?Selection {
-        if (self.deadline_head == no_slot or deadlines.len < capacity) return null;
-        var best = self.deadline_head;
-        var cursor = self.queue_next[best];
-        while (cursor != no_slot) : (cursor = self.queue_next[cursor]) {
-            if (deadlines[cursor] < deadlines[best]) best = cursor;
-        }
-        const selection = Selection{ .slot = best, .source = .deadline };
-        self.startSelection(selection);
-        return selection;
+        var value: RawSelection = undefined;
+        if (!r4os_rust_work_queue_select(self, true, deadlines.ptr, deadlines.len, &value)) return null;
+        return .{ .slot = value.slot, .source = value.source, .irq_preferred = value.irq_preferred, .task_fairness = value.task_fairness };
     }
-
     pub fn cancelQueued(self: *Bookkeeping, slot: usize) bool {
-        if (slot >= capacity or self.states[slot] != .queued) return false;
-        const source = self.classes[slot];
-        self.removeQueue(slot);
-        self.states[slot] = .cancelled;
-        self.queued_count -= 1;
-        self.cancelled_count += 1;
-        switch (source) {
-            .irq => self.irq_queued_count -= 1,
-            .task => self.task_queued_count -= 1,
-            .deadline => self.deadline_queued_count -= 1,
-        }
-        self.appendFinal(slot);
-        self.noteHighWater();
-        return true;
+        return r4os_rust_work_queue(self, 1, slot) != 0;
     }
-
     pub fn completeRunning(self: *Bookkeeping, slot: usize) bool {
-        if (slot >= capacity or self.states[slot] != .running) return false;
-        const source = self.classes[slot];
-        self.states[slot] = .completed;
-        self.running_count -= 1;
-        if (source == .deadline and self.deadline_running_count != 0) self.deadline_running_count -= 1;
-        self.completed_count += 1;
-        self.appendFinal(slot);
-        self.noteHighWater();
-        return true;
+        return r4os_rust_work_queue(self, 2, slot) != 0;
     }
-
     pub fn releaseFinal(self: *Bookkeeping, slot: usize) bool {
-        if (slot >= capacity) return false;
-        switch (self.states[slot]) {
-            .completed => self.completed_count -= 1,
-            .cancelled => self.cancelled_count -= 1,
-            else => return false,
-        }
-        self.removeFinal(slot);
-        self.states[slot] = .free;
-        self.classes[slot] = .task;
-        self.free_mask |= slotBit(slot);
-        self.free_count += 1;
-        return true;
+        return r4os_rust_work_queue(self, 3, slot) != 0;
     }
-
     pub fn state(self: *const Bookkeeping, slot: usize) State {
-        if (slot >= capacity) return .free;
-        return self.states[slot];
+        return @enumFromInt(r4os_rust_work_queue_query(self, 4, slot));
     }
-
     pub fn sourceClass(self: *const Bookkeeping, slot: usize) SourceClass {
-        if (slot >= capacity) return .task;
-        return self.classes[slot];
+        return @enumFromInt(r4os_rust_work_queue_query(self, 5, slot));
     }
-
     pub fn usedCount(self: *const Bookkeeping) u32 {
-        return @as(u32, @intCast(capacity)) - self.free_count;
+        return @intCast(r4os_rust_work_queue_query(self, 6, 0));
     }
-
     pub fn retainedCount(self: *const Bookkeeping) u32 {
-        return self.completed_count + self.cancelled_count;
+        return @intCast(r4os_rust_work_queue_query(self, 7, 0));
     }
-
     pub fn oldestFinal(self: *const Bookkeeping) ?usize {
-        if (self.final_head == no_slot) return null;
-        return self.final_head;
-    }
-
-    fn appendQueue(self: *Bookkeeping, slot: usize, source: SourceClass) void {
-        const slot_u8: u8 = @intCast(slot);
-        self.queue_prev[slot] = no_slot;
-        self.queue_next[slot] = no_slot;
-        const tail = switch (source) {
-            .irq => self.irq_tail,
-            .task => self.task_tail,
-            .deadline => self.deadline_tail,
-        };
-        if (tail == no_slot) {
-            switch (source) {
-                .irq => self.irq_head = slot_u8,
-                .task => self.task_head = slot_u8,
-                .deadline => self.deadline_head = slot_u8,
-            }
-        } else {
-            self.queue_next[tail] = slot_u8;
-            self.queue_prev[slot] = tail;
-        }
-        switch (source) {
-            .irq => self.irq_tail = slot_u8,
-            .task => self.task_tail = slot_u8,
-            .deadline => self.deadline_tail = slot_u8,
-        }
-    }
-
-    fn removeQueue(self: *Bookkeeping, slot: usize) void {
-        const source = self.classes[slot];
-        const prev = self.queue_prev[slot];
-        const next = self.queue_next[slot];
-        if (prev == no_slot) {
-            switch (source) {
-                .irq => self.irq_head = next,
-                .task => self.task_head = next,
-                .deadline => self.deadline_head = next,
-            }
-        } else {
-            self.queue_next[prev] = next;
-        }
-        if (next == no_slot) {
-            switch (source) {
-                .irq => self.irq_tail = prev,
-                .task => self.task_tail = prev,
-                .deadline => self.deadline_tail = prev,
-            }
-        } else {
-            self.queue_prev[next] = prev;
-        }
-        self.queue_prev[slot] = no_slot;
-        self.queue_next[slot] = no_slot;
-    }
-
-    fn appendFinal(self: *Bookkeeping, slot: usize) void {
-        const slot_u8: u8 = @intCast(slot);
-        self.final_prev[slot] = self.final_tail;
-        self.final_next[slot] = no_slot;
-        if (self.final_tail == no_slot) {
-            self.final_head = slot_u8;
-        } else {
-            self.final_next[self.final_tail] = slot_u8;
-        }
-        self.final_tail = slot_u8;
-    }
-
-    fn removeFinal(self: *Bookkeeping, slot: usize) void {
-        const prev = self.final_prev[slot];
-        const next = self.final_next[slot];
-        if (prev == no_slot) {
-            self.final_head = next;
-        } else {
-            self.final_next[prev] = next;
-        }
-        if (next == no_slot) {
-            self.final_tail = prev;
-        } else {
-            self.final_prev[next] = prev;
-        }
-        self.final_prev[slot] = no_slot;
-        self.final_next[slot] = no_slot;
-    }
-
-    fn noteHighWater(self: *Bookkeeping) void {
-        if (self.queued_count > self.queue_high_water) self.queue_high_water = self.queued_count;
-        const used = self.usedCount();
-        if (used > self.used_high_water) self.used_high_water = used;
-        const retained = self.retainedCount();
-        if (retained > self.retained_high_water) self.retained_high_water = retained;
-        if (self.deadline_queued_count > self.deadline_queue_high_water) {
-            self.deadline_queue_high_water = self.deadline_queued_count;
-        }
-    }
-
-    fn startSelection(self: *Bookkeeping, selection: Selection) void {
-        self.removeQueue(selection.slot);
-        self.states[selection.slot] = .running;
-        self.queued_count -= 1;
-        self.running_count += 1;
-        if (selection.source == .deadline) self.deadline_running_count += 1;
-        switch (selection.source) {
-            .irq => self.irq_queued_count -= 1,
-            .task => self.task_queued_count -= 1,
-            .deadline => self.deadline_queued_count -= 1,
-        }
+        const slot = r4os_rust_work_queue_query(self, 8, 0);
+        return if (slot == std.math.maxInt(usize)) null else slot;
     }
 };
-
 pub fn releaseDecision(state: State, published: bool, waiters: u32, claimed: bool) ReleaseDecision {
-    return switch (state) {
-        .free => .invalid,
-        .queued, .running => .busy,
-        .completed, .cancelled => if (!published)
-            .publication_pending
-        else if (waiters != 0)
-            .waiters_present
-        else if (claimed)
-            .already_claimed
-        else
-            .claim,
-    };
+    return @enumFromInt(r4os_rust_work_release_decision(@intFromEnum(state), published, waiters, claimed));
 }
-
 pub fn cleanupDecision(state: State, published: bool, waiters: u32) CleanupDecision {
-    return switch (state) {
-        .free => .skip,
-        .queued => .cancel_queued,
-        .running => .wait_running,
-        .completed, .cancelled => if (!published)
-            .wait_publication
-        else if (waiters != 0)
-            .wait_waiters
-        else
-            .release_final,
-    };
+    return @enumFromInt(r4os_rust_work_cleanup_decision(@intFromEnum(state), published, waiters));
 }
-
 pub fn makeHandle(slot: usize, generation: u32) u32 {
-    return ((generation & 0x00FF_FFFF) << 8) | @as(u32, @intCast(slot + 1));
+    return @intCast(r4os_rust_work_handle(0, slot, generation));
 }
-
 pub fn slotFromHandle(handle: u32) ?usize {
-    const slot_code = handle & 0xFF;
-    if (slot_code == 0 or slot_code > capacity) return null;
-    return @intCast(slot_code - 1);
+    const slot = r4os_rust_work_handle(1, handle, 0);
+    return if (slot == std.math.maxInt(usize)) null else slot;
 }
-
 pub fn nextGeneration(current: u32) u32 {
-    var next = (current + 1) & 0x00FF_FFFF;
-    if (next == 0) next = 1;
-    return next;
-}
-
-fn slotBit(slot: usize) u16 {
-    return @as(u16, 1) << @intCast(slot);
+    return @intCast(r4os_rust_work_handle(2, 0, current));
 }
 
 test "retained completions consume visible used capacity until release" {

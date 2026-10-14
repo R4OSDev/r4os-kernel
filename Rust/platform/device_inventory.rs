@@ -300,7 +300,8 @@ pub struct MscInput {
 #[repr(C)]
 pub struct DriverInput {
     pub kind: u16,
-    pub name: Text,
+    pub name: [u8; 32],
+    pub name_len: u64,
     pub source: Text,
     pub state: Text,
     pub type_name: Text,
@@ -308,10 +309,12 @@ pub struct DriverInput {
 #[repr(C)]
 pub struct ProtocolInput {
     pub category: u16,
-    pub role: Text,
+    pub role: [u8; 64],
+    pub role_len: u64,
     pub source: Text,
     pub state: Text,
-    pub note: Text,
+    pub note: [u8; 96],
+    pub note_len: u64,
 }
 #[repr(C)]
 pub struct NetInput {
@@ -451,17 +454,27 @@ struct Snapshot {
     truncated: bool,
     network_notes: [[u8; 96]; MAX_ADAPTERS],
     xhci_note: [u8; 256],
+    // Driver registry snapshots copy names; retain each copy at this exact
+    // stationary snapshot address until all public records have been emitted.
+    driver_names: [[u8; 32]; crate::driver::registry::MAX_DRIVERS],
+    // Only record() reads text bytes after collection; summary/counts consume
+    // scalar classifications. Retain the requested protocol's text without
+    // enlarging the existing 16-KB snapshot stack limit or allocating storage.
+    requested_text_index: usize,
+    protocol_role: [u8; 64],
+    protocol_note: [u8; 96],
 }
 impl Snapshot {
     // Initialization uses exclusive caller storage and does not produce another
     // full array value on the bounded kernel stack. Only populated records are read.
-    unsafe fn initialize(out: *mut Self) {
+    unsafe fn initialize(out: *mut Self, requested_text_index: usize) {
         unsafe {
             ptr::addr_of_mut!((*out).count).write(0);
             ptr::addr_of_mut!((*out).with_driver).write(0);
             ptr::addr_of_mut!((*out).without_driver).write(0);
             ptr::addr_of_mut!((*out).unknown).write(0);
             ptr::addr_of_mut!((*out).truncated).write(false);
+            ptr::addr_of_mut!((*out).requested_text_index).write(requested_text_index);
             ptr::addr_of_mut!((*out).network_notes)
                 .cast::<u8>()
                 .write_bytes(0, MAX_ADAPTERS * 96);
@@ -513,12 +526,24 @@ fn collect(snapshot: *mut Snapshot) {
         if matches!(entry.kind, 2 | 3 | 5) {
             continue;
         }
+        assert!(index < crate::driver::registry::MAX_DRIVERS && entry.name_len <= 32);
+        let name = unsafe {
+            let destination = ptr::addr_of_mut!((*snapshot).driver_names)
+                .cast::<[u8; 32]>()
+                .add(index)
+                .cast::<u8>();
+            ptr::copy_nonoverlapping(entry.name.as_ptr(), destination, 32);
+            Text {
+                pointer: destination,
+                bytes: entry.name_len,
+            }
+        };
         add(
             snapshot,
             Record {
                 binding: WITH_DRIVER,
                 bus: DRIVER,
-                name: entry.name,
+                name,
                 driver: entry.source,
                 status: entry.state,
                 note: entry.type_name,
@@ -533,15 +558,40 @@ fn collect(snapshot: *mut Snapshot) {
             continue;
         }
         let entry = unsafe { entry.assume_init() };
+        assert!(
+            index < crate::driver::protocol_registry::MAX_PROTOCOLS
+                && entry.role_len <= 64
+                && entry.note_len <= 96
+        );
+        let (role, note) = if unsafe { (*snapshot).count == (*snapshot).requested_text_index } {
+            unsafe {
+                let role = ptr::addr_of_mut!((*snapshot).protocol_role).cast::<u8>();
+                let note = ptr::addr_of_mut!((*snapshot).protocol_note).cast::<u8>();
+                ptr::copy_nonoverlapping(entry.role.as_ptr(), role, 64);
+                ptr::copy_nonoverlapping(entry.note.as_ptr(), note, 96);
+                (
+                    Text {
+                        pointer: role,
+                        bytes: entry.role_len,
+                    },
+                    Text {
+                        pointer: note,
+                        bytes: entry.note_len,
+                    },
+                )
+            }
+        } else {
+            (Text::EMPTY, Text::EMPTY)
+        };
         add(
             snapshot,
             Record {
                 binding: WITH_DRIVER,
                 bus: PROTOCOL,
-                name: entry.role,
+                name: role,
                 driver: entry.source,
                 status: entry.state,
-                note: entry.note,
+                note,
                 class_code: entry.category.min(255) as u8,
                 ..Record::EMPTY
             },
@@ -1104,7 +1154,7 @@ pub unsafe extern "C" fn r4os_rust_device_inventory_summary(
 ) -> i32 {
     let mut storage = MaybeUninit::<Snapshot>::uninit();
     let snapshot = storage.as_mut_ptr();
-    unsafe { Snapshot::initialize(snapshot) };
+    unsafe { Snapshot::initialize(snapshot, usize::MAX) };
     collect(snapshot);
     unsafe {
         out.write(contract::DeviceInventorySummary {
@@ -1129,7 +1179,7 @@ pub unsafe extern "C" fn r4os_rust_device_inventory_record(
 ) -> i32 {
     let mut storage = MaybeUninit::<Snapshot>::uninit();
     let snapshot = storage.as_mut_ptr();
-    unsafe { Snapshot::initialize(snapshot) };
+    unsafe { Snapshot::initialize(snapshot, index as usize) };
     collect(snapshot);
     if index as usize >= unsafe { (*snapshot).count } {
         return 0;
@@ -1170,7 +1220,7 @@ pub unsafe extern "C" fn r4os_rust_device_inventory_record(
 pub unsafe extern "C" fn r4os_rust_device_inventory_counts(out: *mut Counts) {
     let mut storage = MaybeUninit::<Snapshot>::uninit();
     let snapshot = storage.as_mut_ptr();
-    unsafe { Snapshot::initialize(snapshot) };
+    unsafe { Snapshot::initialize(snapshot, usize::MAX) };
     collect(snapshot);
     let mut counts = Counts {
         drivers: 0,
@@ -1203,8 +1253,11 @@ const _: () = {
     assert!(core::mem::size_of::<UsbInput>() == 12);
     assert!(core::mem::size_of::<HidInput>() == 24);
     assert!(core::mem::size_of::<MscInput>() == 48);
-    assert!(core::mem::size_of::<DriverInput>() == 72);
-    assert!(core::mem::size_of::<ProtocolInput>() == 72);
+    assert!(core::mem::size_of::<DriverInput>() == 96);
+    assert!(core::mem::offset_of!(DriverInput, name_len) == 40);
+    assert!(core::mem::size_of::<ProtocolInput>() == 216);
+    assert!(core::mem::offset_of!(ProtocolInput, role_len) == 72);
+    assert!(core::mem::offset_of!(ProtocolInput, note_len) == 208);
     assert!(core::mem::size_of::<NetInput>() == 128);
     assert!(core::mem::size_of::<XhciInput>() == 72);
     assert!(core::mem::size_of::<Counts>() == 12);

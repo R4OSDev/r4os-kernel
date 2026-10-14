@@ -1,20 +1,8 @@
-// Early driver registry foundation for kernel startup.
-//
-// This layer only initializes the central driver status list. The actual
-// driver logic stays in the individual driver modules.
-
-const driver_registry = @import("../driver/registry.zig");
-
-var initialized = false;
-
+// Stateless early-boot facade; registry and idempotence belong to Rust.
+extern fn r4os_rust_driver_boot(operation: u8) bool;
 pub fn init() void {
-    if (initialized) return;
-
-    driver_registry.init();
-
-    initialized = true;
+    _ = r4os_rust_driver_boot(0);
 }
-
 pub fn isInitialized() bool {
-    return initialized;
+    return r4os_rust_driver_boot(1);
 }

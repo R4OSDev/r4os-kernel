@@ -1,3 +1,4 @@
+pub mod callback_abort;
 pub mod fpu;
 pub mod hpet;
 pub mod interrupt_frame;
