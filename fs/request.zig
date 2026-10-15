@@ -1,15 +1,11 @@
+// Stateless C facade. Rust owns request admission, lanes and all counters.
 const diag_screen = @import("../kernel/diag_screen.zig");
 const k = @import("../kernel/log.zig");
-const scheduler = @import("../sched/scheduler.zig");
-const sync = @import("../sched/sync.zig");
-const timer = @import("../kernel/timer.zig");
 const request_scope = @import("request_scope.zig");
 const access = @import("../storage/access_runtime.zig");
 const task_context = @import("../sched/task_context.zig");
 const vfs = @import("vfs.zig");
-
 pub const drive_gate_count: usize = request_scope.lane_count;
-
 pub const Kind = enum(u32) {
     drive_info = 1,
     file_read = 2,
@@ -46,7 +42,7 @@ pub const AtomicProgressPhase = enum(u32) {
     cleanup = 4,
 };
 
-pub const Summary = struct {
+pub const Summary = extern struct {
     requests: u64 = 0,
     completed: u64 = 0,
     failed: u64 = 0,
@@ -76,22 +72,32 @@ pub const Summary = struct {
     parallel_active_max: u32 = 0,
 };
 
-pub const Guard = struct {
+
+const empty_owner: access.Owner = .{ .task = 0, .task_generation = 0 };
+pub const Use = extern struct {
+    id: u64 = 0,
+    owner: access.Owner = empty_owner,
+    present: bool = false,
+};
+pub const Guard = extern struct {
     kind: Kind = .file_info,
     drive: u8 = 0,
     second_drive: u8 = 0,
-    lanes: [request_scope.lane_count]u8 = .{0} ** request_scope.lane_count,
+    lanes: [drive_gate_count]u8 = .{0} ** drive_gate_count,
     lane_count: u8 = 0,
     gates_locked: bool = false,
     mutations_locked: bool = false,
     lanes_active: bool = false,
     start_tick: u64 = 0,
     active: bool = false,
-    uses: [drive_gate_count]?access.UseToken = .{null} ** drive_gate_count,
+    uses: [drive_gate_count]Use = .{Use{}} ** drive_gate_count,
     unwind: task_context.UnwindToken = .{},
 };
-
-pub const GateSnapshot = struct {
+const BoundMount = extern struct {
+    reference: access.MountRef,
+    present: bool,
+};
+pub const GateSnapshot = extern struct {
     owner_task_id: u32 = 0,
     owner_task_generation: u64 = 0,
     kind: Kind = .file_info,
@@ -100,434 +106,92 @@ pub const GateSnapshot = struct {
     active_depth: u32 = 0,
 };
 
-const LaneState = struct {
-    kind: Kind = .file_info,
-    drive: u8 = 0,
-    active_depth: u32 = 0,
-    progress_phase: AtomicProgressPhase = .none,
-    progress_sequence: u32 = 0,
-    progress: u64 = 0,
-    progress_total: u64 = 0,
+
+const Stall = extern struct {
+    slices: u32, owner: u32, depth: u32, kind: u32, drive: u32,
+    phase: u32, progress: u64, total: u64,
 };
-
-// Each volume owns its filesystem transaction lane. These owners deliberately
-// span FAT/block-I/O waits, block hard task termination, and stay separate
-// from sleep-under-lock diagnostics. Cross-volume requests acquire the two
-// lanes in canonical drive order; ownership-free cleanup acquires all lanes.
-var request_gates: [request_scope.lane_count]sync.UnwindGuard =
-    .{sync.UnwindGuard.init("fs-drive")} ** request_scope.lane_count;
-var lane_states: [request_scope.lane_count]LaneState = .{LaneState{}} ** request_scope.lane_count;
-// A copy retains namespace/data stability while its per-call backend lane
-// is lent to readers. Writers always acquire mutation lanes before backend
-// lanes, in canonical drive order. These are wait-spanning task owners.
-var mutation_gates: [request_scope.lane_count]sync.UnwindGuard =
-    .{sync.UnwindGuard.init("fs-mutation")} ** request_scope.lane_count;
-var mutation_progress: [request_scope.lane_count]u64 = .{0} ** request_scope.lane_count;
-var stats: Summary = .{};
-
-fn readOnly(kind: Kind) bool {
-    return switch (kind) {
-        .drive_info, .file_read, .file_read_at, .dir_list, .dir_entry, .file_info, .loader_read, .config_read => true,
-        else => false,
-    };
-}
-
-pub fn init() void {
-    request_gates = .{sync.UnwindGuard.init("fs-drive")} ** request_scope.lane_count;
-    lane_states = .{LaneState{}} ** request_scope.lane_count;
-    mutation_gates = .{sync.UnwindGuard.init("fs-mutation")} ** request_scope.lane_count;
-    mutation_progress = .{0} ** request_scope.lane_count;
-    stats = .{};
-}
-
+extern fn r4os_rust_fs_request_init() void;
+extern fn r4os_rust_fs_request_summary(*Summary) void;
+extern fn r4os_rust_fs_request_gate(u8, *GateSnapshot) bool;
+extern fn r4os_rust_fs_request_begin(u32, u8, u8, u8, bool, ?[*]const BoundMount, usize, bool, *Guard) bool;
+extern fn r4os_rust_fs_request_finish(*Guard, bool) void;
+extern fn r4os_rust_fs_request_readers(*Guard) bool;
+extern fn r4os_rust_fs_request_copy_progress(*const Guard) void;
+extern fn r4os_rust_fs_request_atomic_progress(u32, u64, u64) void;
+pub fn init() void { r4os_rust_fs_request_init(); }
 pub fn summary() Summary {
-    var out = stats;
-    out.active_kind = 0;
-    out.active_drive = 0;
-    out.active_phase = 0;
-    out.active_progress = 0;
-    out.active_progress_total = 0;
-    var lane_index: usize = 0;
-    while (lane_index < lane_states.len) : (lane_index += 1) {
-        const state = lane_states[lane_index];
-        if (state.active_depth == 0) continue;
-        if (out.active_kind == 0) {
-            out.active_kind = kindCode(state.kind);
-            out.active_drive = request_scope.driveCode(state.drive);
-            out.active_phase = @intFromEnum(state.progress_phase);
-            out.active_progress_sequence = state.progress_sequence;
-            out.active_progress = state.progress;
-            out.active_progress_total = state.progress_total;
-        }
-    }
+    var out: Summary = undefined;
+    r4os_rust_fs_request_summary(&out);
     return out;
 }
-
-/// Returns the exact runtime owner of one occupied volume lane without
-/// acquiring it. Boot diagnostics use the generation to pin the Task before
-/// dereferencing its execution owner. A changing or boot-only owner is
-/// deliberately reported as unavailable rather than guessed.
 pub fn gateSnapshot(drive_letter: u8) ?GateSnapshot {
-    const plan = request_scope.single(drive_letter);
-    if (plan.count != 1) return null;
-    const lane = plan.lanes[0];
-    const gate = &request_gates[lane];
-    const owner_task_id = gate.owner;
-    const owner_task_generation = gate.owner_generation;
-    const depth = gate.depth;
-    if (owner_task_id == 0 or owner_task_generation == 0 or depth == 0 or gate.boot_owner) return null;
-    const state = lane_states[lane];
-    if (gate.owner != owner_task_id or
-        gate.owner_generation != owner_task_generation or
-        gate.depth != depth)
-        return null;
-    return .{
-        .owner_task_id = owner_task_id,
-        .owner_task_generation = owner_task_generation,
-        .kind = state.kind,
-        .drive = state.drive,
-        .depth = depth,
-        .active_depth = state.active_depth,
-    };
+    var out: GateSnapshot = undefined;
+    return if (r4os_rust_fs_request_gate(drive_letter, &out)) out else null;
 }
-
-pub fn begin(kind: Kind, drive_letter: u8) ?Guard {
-    return beginPlan(kind, drive_letter, 0, request_scope.single(drive_letter), .bounded_wait, null);
+fn start(kind: Kind, first: u8, second: u8, selection: u8, immediate: bool, bound: ?[]const BoundMount) ?Guard {
+    var out: Guard = undefined;
+    return if (r4os_rust_fs_request_begin(@intFromEnum(kind), first, second, selection, immediate,
+        if (bound) |refs| refs.ptr else null, if (bound) |refs| refs.len else 0, bound != null, &out)) out else null;
 }
-
+fn binding(volume: vfs.Volume) BoundMount {
+    const ref = volume.accessReference();
+    return .{ .reference = ref orelse .{ .slot = 0, .generation = 0 }, .present = ref != null };
+}
+pub fn begin(kind: Kind, drive_letter: u8) ?Guard { return start(kind, drive_letter, 0, 0, false, null); }
+pub fn tryBegin(kind: Kind, drive_letter: u8) ?Guard { return start(kind, drive_letter, 0, 0, true, null); }
+pub fn beginPair(kind: Kind, first_drive: u8, second_drive: u8) ?Guard { return start(kind, first_drive, second_drive, 1, false, null); }
 pub fn beginVolume(kind: Kind, letter: u8, volume: vfs.Volume) ?Guard {
-    if (scheduler.currentId() != null and volume.accessReference() == null) return null;
-    return beginPlan(kind, letter, 0, request_scope.single(letter), .bounded_wait, &.{volume.accessReference()});
+    return start(kind, letter, 0, 0, false, &.{binding(volume)});
 }
-
 pub fn tryBeginVolume(kind: Kind, letter: u8, volume: vfs.Volume) ?Guard {
-    if (scheduler.currentId() != null and volume.accessReference() == null) return null;
-    return beginPlan(kind, letter, 0, request_scope.single(letter), .immediate, &.{volume.accessReference()});
+    return start(kind, letter, 0, 0, true, &.{binding(volume)});
 }
-
 pub fn beginPairVolumes(kind: Kind, first: u8, second: u8, a: vfs.Volume, b: vfs.Volume) ?Guard {
-    if (scheduler.currentId() != null and (a.accessReference() == null or b.accessReference() == null)) return null;
-    return beginPlan(kind, first, second, request_scope.pair(first, second), .bounded_wait, &.{ a.accessReference(), b.accessReference() });
+    return start(kind, first, second, 1, false, &.{ binding(a), binding(b) });
 }
-
-/// Starts a request only when every lane in its scope is immediately
-/// available. Lifecycle reapers use this form so ownership-free cleanup can
-/// be deferred without parking the reaper behind an unrelated volume owner.
-pub fn tryBegin(kind: Kind, drive_letter: u8) ?Guard {
-    return beginPlan(kind, drive_letter, 0, request_scope.single(drive_letter), .immediate, null);
+pub fn finish(guard: *Guard, ok: bool) void { r4os_rust_fs_request_finish(guard, ok); }
+pub fn allowCopyReaders(guard: *Guard) bool { return r4os_rust_fs_request_readers(guard); }
+pub fn copyProgress(guard: *const Guard) void { r4os_rust_fs_request_copy_progress(guard); }
+pub fn kindCode(kind: Kind) u32 { return @intFromEnum(kind); }
+pub fn reportAtomicProgress(phase: AtomicProgressPhase, completed: u64, total: u64) void {
+    r4os_rust_fs_request_atomic_progress(@intFromEnum(phase), completed, total);
 }
-
-pub fn beginPair(kind: Kind, first_drive: u8, second_drive: u8) ?Guard {
-    return beginPlan(kind, first_drive, second_drive, request_scope.pair(first_drive, second_drive), .bounded_wait, null);
+// Until VFS migration: projection only, never acquire a request or change a
+// mount here. Absence and missing reference remain distinct results.
+export fn r4os_zig_fs_request_volume(letter: u8, out: *access.MountRef) u8 {
+    const volume = vfs.volumeForDrive(letter) orelse return 0;
+    out.* = volume.accessReference() orelse return 2;
+    return 1;
 }
-
-const GateAcquireMode = enum {
-    bounded_wait,
-    immediate,
-};
-
-fn beginPlan(
-    kind: Kind,
-    drive_letter: u8,
-    second_drive: u8,
-    plan: request_scope.Plan,
-    acquire_mode: GateAcquireMode,
-    bound_refs: ?[]const ?access.MountRef,
-) ?Guard {
-    // Cover admission and queued waits as well as the backend call itself.
-    // A forced task termination may not skip release of either kind of owner.
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) return null;
-    var uses: [drive_gate_count]?access.UseToken = .{null} ** drive_gate_count;
-    var transferred = false;
-    defer if (!transferred) {
-        for (uses) |token| if (token) |use| access.endUse(use) catch {};
-        _ = task_context.leaveUnwind(unwind);
-    };
-    var acquired_count: u8 = 0;
-    var mutation_count: u8 = 0;
-    defer if (!transferred) {
-        while (mutation_count != 0) {
-            mutation_count -= 1;
-            _ = mutation_gates[plan.lanes[mutation_count]].leave();
-        }
-    };
-    const runtime_owned = scheduler.currentId() != null;
-    if (runtime_owned) {
-        if (bound_refs) |refs| {
-            if (refs.len > uses.len) return null;
-            for (refs, 0..) |ref, i| if (ref) |mount| {
-                uses[i] = access.beginUse(mount, .request) catch return null;
-            };
-        } else {
-            for (plan.lanes[0..plan.count], 0..) |lane, i| {
-                const volume = vfs.volumeForDrive('A' + lane) orelse continue;
-                uses[i] = access.beginUse(volume.accessReference() orelse return null, .request) catch return null;
-            }
-        }
-        if (!readOnly(kind)) {
-            // An old caller may nest a write inside a read-owned lane. Such
-            // an upgrade can try but must never wait behind another writer
-            // while retaining the lane that writer needs to finish.
-            var nested_backend = false;
-            for (&request_gates) |*gate| if (gate.ownedByCurrent()) {
-                nested_backend = true;
-                break;
-            };
-            while (mutation_count < plan.count) : (mutation_count += 1) {
-                const lane = plan.lanes[mutation_count];
-                const admitted = if (acquire_mode == .immediate or nested_backend)
-                    mutation_gates[lane].tryEnter()
-                else
-                    acquireGate(lane, true);
-                if (!admitted) return null;
-            }
-        }
-        while (acquired_count < plan.count) : (acquired_count += 1) {
-            const lane = plan.lanes[acquired_count];
-            const acquired = switch (acquire_mode) {
-                .bounded_wait => acquireGate(lane, false),
-                .immediate => request_gates[lane].tryEnter(),
-            };
-            if (!acquired) {
-                if (acquire_mode == .bounded_wait) stats.lock_timeouts +%= 1;
-                releasePlan(plan, acquired_count);
-                return null;
-            }
-        }
-        stats.lock_acquires +%= 1;
-    } else {
-        stats.boot_bypass +%= 1;
+// Existing display owners receive an immutable bounded native snapshot.
+export fn r4os_zig_fs_request_stall(s: *const Stall) void {
+    const incident = diag_screen.beginResolvableIncident();
+    diag_screen.write("[FSGATE] stall slice="); diag_screen.writeDec(s.slices);
+    diag_screen.write(" holder_task="); diag_screen.writeDec(s.owner);
+    diag_screen.write(" depth="); diag_screen.writeDec(s.depth);
+    diag_screen.write(" active_kind="); diag_screen.writeDec(s.kind);
+    diag_screen.write(" active_drive="); diag_screen.writeDec(s.drive);
+    if (s.phase != 0) {
+        diag_screen.write(" phase="); diag_screen.writeDec(s.phase);
+        diag_screen.write(" progress="); diag_screen.writeDec(s.progress);
+        diag_screen.write("/"); diag_screen.writeDec(s.total);
     }
-
-    stats.requests +%= 1;
-    switch (kind) {
-        .file_read, .file_read_at, .loader_read, .config_read => stats.read_requests +%= 1,
-        .file_write, .file_write_at, .file_append, .file_delete, .file_rename, .file_copy, .file_move, .file_replace_atomic, .file_delete_if_match, .file_update_atomic_checked, .config_write => stats.write_requests +%= 1,
-        .stream_begin, .stream_write, .stream_finish, .stream_abort => stats.stream_requests +%= 1,
-        else => stats.metadata_requests +%= 1,
+    diag_screen.endLine();
+    _ = diag_screen.resolveIncident(incident);
+    k.puts("[FSGATE] stall slice="); k.putDec(s.slices);
+    k.puts(" holder_task="); k.putDec(s.owner);
+    k.puts(" active_kind="); k.putDec(s.kind);
+    k.puts(" active_drive="); k.putDec(s.drive);
+    if (s.phase != 0) {
+        k.puts(" phase="); k.putDec(s.phase);
+        k.puts(" progress="); k.putDec(s.progress);
+        k.puts("/"); k.putDec(s.total);
     }
-    if (plan.isGlobal()) {
-        stats.global_requests +%= 1;
-    } else if (plan.count == 2) {
-        stats.cross_drive_requests +%= 1;
-    } else {
-        stats.single_drive_requests +%= 1;
-    }
-    stats.active_requests +|= 1;
-    if (stats.active_requests > stats.parallel_active_max) {
-        stats.parallel_active_max = stats.active_requests;
-    }
-    var lane_offset: u8 = 0;
-    while (lane_offset < plan.count) : (lane_offset += 1) {
-        const lane = plan.lanes[lane_offset];
-        var state = &lane_states[lane];
-        state.kind = kind;
-        state.drive = 'A' + lane;
-        state.active_depth +|= 1;
-        state.progress_phase = .none;
-        state.progress = 0;
-        state.progress_total = 0;
-        state.progress_sequence +%= 1;
-    }
-
-    transferred = true;
-    return .{
-        .kind = kind,
-        .drive = drive_letter,
-        .second_drive = second_drive,
-        .lanes = plan.lanes,
-        .lane_count = plan.count,
-        .gates_locked = runtime_owned,
-        .mutations_locked = runtime_owned and !readOnly(kind),
-        .lanes_active = true,
-        .start_tick = timer.tickCount(),
-        .active = true,
-        .uses = uses,
-        .unwind = unwind,
-    };
+    k.puts("\r\n");
 }
-
-pub fn finish(guard: *Guard, ok: bool) void {
-    if (!guard.active) return;
-
-    const now = timer.tickCount();
-    const elapsed = if (now >= guard.start_tick) now - guard.start_tick else 0;
-    stats.completed +%= 1;
-    if (!ok) stats.failed +%= 1;
-    stats.last_ticks = elapsed;
-    stats.total_ticks +%= elapsed;
-    if (elapsed > stats.max_ticks) stats.max_ticks = elapsed;
-    stats.last_kind = kindCode(guard.kind);
-    stats.last_drive = request_scope.driveCode(guard.drive);
-    if (stats.active_requests != 0) stats.active_requests -= 1;
-    stats.active_progress_sequence +%= 1;
-
-    finishLanes(guard);
-    if (guard.mutations_locked) {
-        var remaining = guard.lane_count;
-        while (remaining != 0) {
-            remaining -= 1;
-            _ = mutation_gates[guard.lanes[remaining]].leave();
-        }
-        guard.mutations_locked = false;
-    }
-    guard.active = false;
-    for (&guard.uses) |*token| if (token.*) |use| {
-        access.endUse(use) catch {};
-        token.* = null;
-    };
-    _ = task_context.leaveUnwind(guard.unwind);
-}
-
-fn finishLanes(guard: *Guard) void {
-    if (!guard.lanes_active) return;
-    var lane_offset = guard.lane_count;
-    while (lane_offset != 0) {
-        lane_offset -= 1;
-        const lane = guard.lanes[lane_offset];
-        var state = &lane_states[lane];
-        if (state.active_depth != 0) state.active_depth -= 1;
-        if (state.active_depth == 0) {
-            state.progress_phase = .none;
-            state.progress = 0;
-            state.progress_total = 0;
-            state.progress_sequence +%= 1;
-        }
-        if (guard.gates_locked) _ = request_gates[lane].leave();
-    }
-    guard.lanes_active = false;
-    guard.gates_locked = false;
-}
-
-/// Copy-only transition: retain both mount uses, mutation owners and unwind
-/// lifetime, but stop borrowing filesystem scratch. A nested legacy caller
-/// keeps its old exclusive lane; it must never accidentally release a parent.
-pub fn allowCopyReaders(guard: *Guard) bool {
-    if (!guard.active or !guard.mutations_locked or !guard.gates_locked or
-        (guard.kind != .file_copy and guard.kind != .file_move)) return false;
-    for (guard.lanes[0..guard.lane_count]) |lane| {
-        if (!mutation_gates[lane].ownedByCurrent() or !request_gates[lane].ownedByCurrent() or request_gates[lane].depth != 1) return false;
-    }
-    finishLanes(guard);
-    return true;
-}
-
-pub fn copyProgress(guard: *const Guard) void {
-    if (!guard.mutations_locked) return;
-    for (guard.lanes[0..guard.lane_count]) |lane| _ = @atomicRmw(u64, &mutation_progress[lane], .Add, 1, .monotonic);
-}
-
-pub fn kindCode(kind: Kind) u32 {
-    return @intFromEnum(kind);
-}
-
-// A checked system update can legitimately hold its volume gate while it
-// fingerprints large target/stage files. The holder reports bounded progress
-// so waiters distinguish a slow, advancing transaction from a wedged one.
-pub fn reportAtomicProgress(
-    phase: AtomicProgressPhase,
-    completed: u64,
-    total: u64,
-) void {
-    const task_id = scheduler.currentId() orelse return;
-    var lane_index: usize = 0;
-    while (lane_index < request_gates.len) : (lane_index += 1) {
-        if (request_gates[lane_index].owner != task_id) continue;
-        var state = &lane_states[lane_index];
-        if (state.active_depth == 0 or state.kind != .file_update_atomic_checked) continue;
-        state.progress_phase = phase;
-        state.progress = completed;
-        state.progress_total = total;
-        state.progress_sequence +%= 1;
-        _ = @atomicRmw(u64, &mutation_progress[lane_index], .Add, 1, .monotonic);
-        stats.active_progress_sequence +%= 1;
-    }
-}
-
-// Bounded gate acquisition (0.60.20): the former single fs-request gate used
-// to park every waiter with WAIT_FOREVER. A holder that never returned froze
-// the whole system silently (Lenovo SSH-exec freeze). Volume lanes now retain
-// the same bounded diagnosis for requests that actually share an owner. Waiters
-// run in slices; every expired slice logs a loud [FSGATE] diagnosis with
-// the current holder, and after the limit the operation fails visibly
-// instead of hanging forever.
-const GATE_SLICE_TICKS: u64 = 5 * @as(u64, timer.DEFAULT_HZ);
-const GATE_SLICE_LIMIT: u32 = 12;
-
-fn acquireGate(lane: u8, mutation: bool) bool {
-    if (scheduler.current() == null) return false;
-    const gate = if (mutation) &mutation_gates[lane] else &request_gates[lane];
-    if (gate.tryEnter()) return true;
-    stats.lock_contention_waits +%= 1;
-    var slices: u32 = 0;
-    var progress_sequence: u64 = if (mutation) @atomicLoad(u64, &mutation_progress[lane], .monotonic) else lane_states[lane].progress_sequence;
-    while (true) {
-        if (gate.enter(GATE_SLICE_TICKS)) {
-            return true;
-        }
-        // A full 5-second wait is not a stall if the long checked update
-        // crossed at least one explicit progress boundary in that interval.
-        // Restart the consecutive-stall budget while retaining the gate.
-        const observed: u64 = if (mutation) @atomicLoad(u64, &mutation_progress[lane], .monotonic) else lane_states[lane].progress_sequence;
-        if (observed != progress_sequence) {
-            progress_sequence = observed;
-            slices = 0;
-            continue;
-        }
-        slices += 1;
-        const report = slices == 1 or (slices & (slices - 1)) == 0 or slices == GATE_SLICE_LIMIT;
-        if (report) {
-            const incident_token = diag_screen.beginResolvableIncident();
-            // Framebuffer-direct: visible even when the desktop owns the
-            // screen. Keep no generation across the next interruptible gate
-            // wait: a hard-killed waiter cannot run Zig defers.
-            diag_screen.write("[FSGATE] stall slice=");
-            diag_screen.writeDec(slices);
-            diag_screen.write(" holder_task=");
-            diag_screen.writeDec(gate.owner);
-            diag_screen.write(" depth=");
-            diag_screen.writeDec(gate.depth);
-            diag_screen.write(" active_kind=");
-            diag_screen.writeDec(kindCode(lane_states[lane].kind));
-            diag_screen.write(" active_drive=");
-            diag_screen.writeDec(request_scope.driveCode(lane_states[lane].drive));
-            if (lane_states[lane].progress_phase != .none) {
-                diag_screen.write(" phase=");
-                diag_screen.writeDec(@intFromEnum(lane_states[lane].progress_phase));
-                diag_screen.write(" progress=");
-                diag_screen.writeDec(lane_states[lane].progress);
-                diag_screen.write("/");
-                diag_screen.writeDec(lane_states[lane].progress_total);
-            }
-            diag_screen.endLine();
-            _ = diag_screen.resolveIncident(incident_token);
-            k.puts("[FSGATE] stall slice=");
-            k.putDec(slices);
-            k.puts(" holder_task=");
-            k.putDec(gate.owner);
-            k.puts(" active_kind=");
-            k.putDec(kindCode(lane_states[lane].kind));
-            k.puts(" active_drive=");
-            k.putDec(request_scope.driveCode(lane_states[lane].drive));
-            if (lane_states[lane].progress_phase != .none) {
-                k.puts(" phase=");
-                k.putDec(@intFromEnum(lane_states[lane].progress_phase));
-                k.puts(" progress=");
-                k.putDec(lane_states[lane].progress);
-                k.puts("/");
-                k.putDec(lane_states[lane].progress_total);
-            }
-            k.puts("\r\n");
-        }
-        if (slices >= GATE_SLICE_LIMIT) return false;
-    }
-}
-
-fn releasePlan(plan: request_scope.Plan, acquired_count: u8) void {
-    var lane_offset = acquired_count;
-    while (lane_offset != 0) {
-        lane_offset -= 1;
-        _ = request_gates[plan.lanes[lane_offset]].leave();
-    }
+comptime {
+    if (@sizeOf(Summary) != 184 or @sizeOf(BoundMount) != 24 or @sizeOf(Use) != 48 or
+        @sizeOf(Guard) != 1320 or @sizeOf(GateSnapshot) != 32 or @sizeOf(Stall) != 40)
+        @compileError("Native FS request private C layout changed");
 }

@@ -1,4 +1,21 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+
+// Private C facade. Native Rust owns all cache policy transitions; the
+// existing cache owner serializes these bounded calls without callbacks.
+extern fn r4os_rust_fs_cache_capacity(u64, u64, *Capacity) void;
+extern fn r4os_rust_fs_cache_fill_limit(u16, u16, u16, u16) u16;
+extern fn r4os_rust_fs_cache_fill_attempts(bool) u8;
+extern fn r4os_rust_fs_cache_fill_mask(u8, u8, u8, bool) u8;
+extern fn r4os_rust_fs_cache_age_due(u64, u64, u64) bool;
+extern fn r4os_rust_fs_cache_sequential(*Sequential, u8, u64, u64, u16, ?*SequentialDecision) void;
+extern fn r4os_rust_fs_cache_readahead(*ReadAhead, u8, u64, u16, ?*const ReadAheadRequest, bool, ?*ReadAheadRequest) bool;
+extern fn r4os_rust_fs_cache_index(*Index, u8, usize, usize, bool) usize;
+
+// Exactly one productive index, natively initialized before page_cache.init.
+pub extern var R4OS_FS_CACHE_INDEX: Index;
 
 pub const max_entries: usize = 512;
 pub const max_devices: usize = 8;
@@ -23,151 +40,56 @@ pub const pressure_low_free_frames: u64 = 4096;
 pub const pressure_moderate_free_frames: u64 = 8192;
 pub const read_ahead_max_pages: u16 = 16;
 
-pub const Capacity = struct {
+
+pub const Capacity = extern struct {
     ram_pages: u16,
     active_pages: u16,
     pressure_level: u8,
     read_ahead_pages: u16,
 };
-
 pub fn capacityForMemory(reference_free_frames: u64, current_free_frames: u64) Capacity {
-    const raw_pages = reference_free_frames / capacity_ram_divisor_frames;
-    const ram_pages: u16 = @intCast(@min(
-        @as(u64, max_capacity_pages),
-        @max(@as(u64, min_capacity_pages), raw_pages),
-    ));
-
-    var active_pages = ram_pages;
-    var pressure_level: u8 = 0;
-    if (current_free_frames <= pressure_critical_free_frames) {
-        active_pages = @min(ram_pages, min_capacity_pages);
-        pressure_level = 3;
-    } else if (current_free_frames <= pressure_low_free_frames) {
-        active_pages = @min(ram_pages, 128);
-        pressure_level = 2;
-    } else if (current_free_frames <= pressure_moderate_free_frames) {
-        active_pages = @min(ram_pages, 256);
-        pressure_level = 1;
-    }
-
-    const unconstrained_window = @max(
-        @as(u16, 1),
-        @min(read_ahead_max_pages, active_pages / 32),
-    );
-    const read_ahead_pages: u16 = switch (pressure_level) {
-        3 => 0,
-        2 => 1,
-        1 => @min(unconstrained_window, 4),
-        else => unconstrained_window,
-    };
-    return .{
-        .ram_pages = ram_pages,
-        .active_pages = active_pages,
-        .pressure_level = pressure_level,
-        .read_ahead_pages = read_ahead_pages,
-    };
+    var result: Capacity = undefined;
+    r4os_rust_fs_cache_capacity(reference_free_frames, current_free_frames, &result);
+    return result;
 }
-
-/// Bounds one contiguous page fill by demand, the backend's sector limit and
-/// the currently admitted cache capacity. A backend limit below one cache
-/// page still admits one page; block.zig then performs its required splits.
-pub fn fillRunPageLimit(
-    requested_pages: u16,
-    max_sectors_per_request: u16,
-    page_sectors: u16,
-    capacity_pages: u16,
-) u16 {
-    if (requested_pages == 0 or page_sectors == 0 or capacity_pages == 0) return 0;
-    var device_pages = requested_pages;
-    if (max_sectors_per_request != 0) {
-        device_pages = @max(@as(u16, 1), max_sectors_per_request / page_sectors);
-    }
-    return @min(requested_pages, @min(device_pages, capacity_pages));
+pub fn fillRunPageLimit(requested_pages: u16, max_sectors_per_request: u16, page_sectors: u16, capacity_pages: u16) u16 {
+    return r4os_rust_fs_cache_fill_limit(requested_pages, max_sectors_per_request, page_sectors, capacity_pages);
 }
-
-/// USB mass storage owns its exact transport retry below the cache. Other
-/// backends retain one cache-level retry after an unsuccessful first attempt.
 pub fn fillAttemptLimit(owns_transport_retry: bool) u8 {
-    return if (owns_transport_retry) 1 else 2;
+    return r4os_rust_fs_cache_fill_attempts(owns_transport_retry);
 }
-
-/// A contiguous media read may update only sectors that were absent when the
-/// cache identities were pinned. Existing valid sectors include dirty data
-/// and must never be replaced by the staging image.
 pub fn fillMissingMask(valid_before: u8, readable_mask: u8) u8 {
-    return readable_mask & ~valid_before;
+    return r4os_rust_fs_cache_fill_mask(0, valid_before, readable_mask, false);
 }
-
-/// Publication is atomic at run level: success exposes every readable sector,
-/// while failure preserves the exact pre-I/O validity mask.
 pub fn fillPublishedMask(valid_before: u8, readable_mask: u8, success: bool) u8 {
-    return if (success) valid_before | readable_mask else valid_before;
+    return r4os_rust_fs_cache_fill_mask(1, valid_before, readable_mask, success);
 }
-
-pub const SequentialDecision = struct {
+pub const SequentialDecision = extern struct {
     next_page: u64 = 0,
     pages: u16 = 0,
     random_reset: bool = false,
 };
-
-pub const Sequential = struct {
+pub const Sequential = extern struct {
     have_last: bool = false,
     last_end_page: u64 = 0,
     window_pages: u16 = 0,
-
-    /// Observes a completed half-open demand range in cache-page units.
-    /// Adjacent reads double the bounded window. A first observation and a
-    /// random jump merely establish a new cursor: neither is sufficient
-    /// evidence for speculative I/O.
     pub fn observe(self: *Sequential, first_page: u64, end_page: u64, max_window: u16) SequentialDecision {
-        if (end_page <= first_page) return .{};
-        const random_reset = self.have_last and first_page != self.last_end_page;
-        const sequential = self.have_last and first_page == self.last_end_page;
-        const demand_pages = end_page - first_page;
-
-        if (max_window == 0) {
-            self.window_pages = 0;
-        } else if (sequential) {
-            const grown = if (self.window_pages == 0)
-                @as(u16, 1)
-            else
-                self.window_pages *| 2;
-            self.window_pages = @min(max_window, grown);
-        } else {
-            _ = demand_pages;
-            self.window_pages = 0;
-        }
-        self.have_last = true;
-        self.last_end_page = end_page;
-        return .{
-            .next_page = end_page,
-            .pages = self.window_pages,
-            .random_reset = random_reset,
-        };
+        var result: SequentialDecision = undefined;
+        r4os_rust_fs_cache_sequential(self, 0, first_page, end_page, max_window, &result);
+        return result;
     }
-
     pub fn reset(self: *Sequential) void {
-        self.* = .{};
+        r4os_rust_fs_cache_sequential(self, 1, 0, 0, 0, null);
     }
 };
-
-pub const Queue = enum(u8) {
-    detached,
-    free,
-    clean,
-    dirty,
-    busy_clean,
-    busy_dirty,
-};
-
-pub const Link = struct {
+pub const Queue = enum(u8) { detached, free, clean, dirty, busy_clean, busy_dirty };
+pub const Link = extern struct {
     prev: u16 = no_index,
     next: u16 = no_index,
     device: u8 = no_device,
     queue: Queue = .detached,
 };
-
-pub const Device = struct {
+pub const Device = extern struct {
     clean_head: u16 = no_index,
     clean_tail: u16 = no_index,
     dirty_head: u16 = no_index,
@@ -179,14 +101,8 @@ pub const Device = struct {
     dirty_high_water: u16 = 0,
     pressure_active: bool = false,
 };
-
-pub const ReadAheadRequest = struct {
-    page: u64,
-    pages: u16,
-    generation: u64,
-};
-
-pub const ReadAhead = struct {
+pub const ReadAheadRequest = extern struct { page: u64, pages: u16, generation: u64 };
+pub const ReadAhead = extern struct {
     generation: u64 = 1,
     pending: bool = false,
     pending_page: u64 = 0,
@@ -196,92 +112,27 @@ pub const ReadAhead = struct {
     inflight_pages: u16 = 0,
     resident_pages: u16 = 0,
     sequential: Sequential = .{},
-
-    // Returns true when an older pending/in-flight request was superseded.
     pub fn schedule(self: *ReadAhead, page: u64, pages: u16) bool {
-        if (pages == 0) return false;
-        if ((self.pending and self.pending_page == page and self.pending_pages == pages) or
-            (self.inflight and self.inflight_page == page and self.inflight_pages == pages)) return false;
-        var cancelled = false;
-        if (self.pending) cancelled = true;
-        if (self.inflight and
-            (self.inflight_page != page or self.inflight_pages != pages)) cancelled = true;
-        if (cancelled) self.bumpGeneration();
-        self.pending = true;
-        self.pending_page = page;
-        self.pending_pages = pages;
-        return cancelled;
+        return r4os_rust_fs_cache_readahead(self, 0, page, pages, null, false, null);
     }
-
-    // A demand request supersedes queued work. An in-flight read of exactly
-    // the demanded page is retained so the caller can consume it as a hit.
     pub fn demand(self: *ReadAhead, page: u64) bool {
-        var cancelled = false;
-        if (self.pending) {
-            self.pending = false;
-            self.pending_pages = 0;
-            cancelled = true;
-        }
-        if (self.inflight and !containsPage(self.inflight_page, self.inflight_pages, page)) {
-            cancelled = true;
-            self.bumpGeneration();
-        }
-        return cancelled;
+        return r4os_rust_fs_cache_readahead(self, 1, page, 0, null, false, null);
     }
-
     pub fn cancelAll(self: *ReadAhead) bool {
-        const cancelled = self.pending or self.inflight;
-        self.pending = false;
-        self.pending_pages = 0;
-        if (self.inflight) self.bumpGeneration();
-        self.sequential.reset();
-        return cancelled;
+        return r4os_rust_fs_cache_readahead(self, 2, 0, 0, null, false, null);
     }
-
     pub fn begin(self: *ReadAhead) ?ReadAheadRequest {
-        if (!self.pending or self.inflight) return null;
-        self.pending = false;
-        self.inflight = true;
-        self.inflight_page = self.pending_page;
-        self.inflight_pages = self.pending_pages;
-        self.pending_pages = 0;
-        return .{
-            .page = self.inflight_page,
-            .pages = self.inflight_pages,
-            .generation = self.generation,
-        };
+        var result: ReadAheadRequest = undefined;
+        return if (r4os_rust_fs_cache_readahead(self, 3, 0, 0, null, false, &result)) result else null;
     }
-
-    // True means the completed page still belongs to the current plan and
-    // may be published as speculative residency.
     pub fn complete(self: *ReadAhead, request: ReadAheadRequest, success: bool) bool {
-        const current = self.inflight and
-            self.inflight_page == request.page and
-            self.inflight_pages == request.pages and
-            self.generation == request.generation;
-        if (self.inflight and self.inflight_page == request.page) {
-            self.inflight = false;
-            self.inflight_pages = 0;
-        }
-        return current and success;
+        return r4os_rust_fs_cache_readahead(self, 4, 0, 0, &request, success, null);
     }
-
     pub fn consumeResident(self: *ReadAhead) void {
-        if (self.resident_pages != 0) self.resident_pages -= 1;
-    }
-
-    fn bumpGeneration(self: *ReadAhead) void {
-        self.generation +%= 1;
-        if (self.generation == 0) self.generation = 1;
-    }
-
-    fn containsPage(first: u64, pages: u16, page: u64) bool {
-        if (pages == 0 or page < first) return false;
-        return page - first < pages;
+        _ = r4os_rust_fs_cache_readahead(self, 5, 0, 0, null, false, null);
     }
 };
-
-pub const Index = struct {
+pub const Index = extern struct {
     links: [max_entries]Link = .{Link{}} ** max_entries,
     devices: [max_devices]Device = .{Device{}} ** max_devices,
     free_head: u16 = no_index,
@@ -292,303 +143,75 @@ pub const Index = struct {
     dirty_device_cursor: u8 = 0,
     clean_device_probes: u64 = 0,
     dirty_device_probes: u64 = 0,
-
     pub fn init() Index {
-        var result = Index{};
-        var index: usize = 0;
-        while (index < max_entries) : (index += 1) {
-            const prev = if (index == 0) no_index else @as(u16, @intCast(index - 1));
-            const next = if (index + 1 == max_entries) no_index else @as(u16, @intCast(index + 1));
-            result.links[index] = .{ .prev = prev, .next = next, .queue = .free };
-        }
-        result.free_head = 0;
-        result.free_tail = max_entries - 1;
-        result.free_count = max_entries;
+        var result: Index = undefined;
+        _ = r4os_rust_fs_cache_index(&result, 0, 0, 0, false);
         return result;
     }
-
     pub fn claimFree(self: *Index) ?usize {
-        const raw = self.free_head;
-        if (raw == no_index) return null;
-        const index: usize = raw;
-        const next = self.links[index].next;
-        self.free_head = next;
-        if (next == no_index) {
-            self.free_tail = no_index;
-        } else {
-            self.links[@as(usize, next)].prev = no_index;
-        }
-        self.free_count -= 1;
-        self.links[index] = .{};
-        return index;
+        return optional(r4os_rust_fs_cache_index(self, 1, 0, 0, false));
     }
-
     pub fn attachClean(self: *Index, index: usize, device_index: usize) bool {
-        if (!validEntry(index) or !validDevice(device_index)) return false;
-        if (self.links[index].queue != .detached) return false;
-        const device: u8 = @intCast(device_index);
-        self.links[index].device = device;
-        self.links[index].queue = .clean;
-        self.linkCleanTail(index, device_index);
-        self.devices[device_index].entries += 1;
-        self.devices[device_index].clean += 1;
-        return true;
+        return r4os_rust_fs_cache_index(self, 2, index, device_index, false) != 0;
     }
-
     pub fn touchClean(self: *Index, index: usize) void {
-        if (!validEntry(index) or self.links[index].queue != .clean) return;
-        const device_index: usize = self.links[index].device;
-        if (self.devices[device_index].clean_tail == @as(u16, @intCast(index))) return;
-        self.unlinkClean(index, device_index);
-        self.linkCleanTail(index, device_index);
+        _ = r4os_rust_fs_cache_index(self, 3, index, 0, false);
     }
-
     pub fn markDirty(self: *Index, index: usize) bool {
-        if (!validEntry(index)) return false;
-        const queue = self.links[index].queue;
-        if (queue == .dirty or queue == .busy_dirty) return true;
-        if (queue != .clean) return false;
-        const device_index: usize = self.links[index].device;
-        self.unlinkClean(index, device_index);
-        self.devices[device_index].clean -= 1;
-        self.devices[device_index].dirty += 1;
-        if (self.devices[device_index].dirty > self.devices[device_index].dirty_high_water) {
-            self.devices[device_index].dirty_high_water = self.devices[device_index].dirty;
-        }
-        if (self.devices[device_index].dirty >= dirty_high_pages) {
-            self.devices[device_index].pressure_active = true;
-        }
-        self.links[index].queue = .dirty;
-        self.linkDirtyTail(index, device_index);
-        return true;
+        return r4os_rust_fs_cache_index(self, 4, index, 0, false) != 0;
     }
-
-    // Transitions a fully written page back to the clean LRU. For a pinned
-    // writeback the page remains detached until unpin() publishes it.
     pub fn clearDirty(self: *Index, index: usize) bool {
-        if (!validEntry(index)) return false;
-        const queue = self.links[index].queue;
-        if (queue != .dirty and queue != .busy_dirty) return queue == .clean or queue == .busy_clean;
-        const device_index: usize = self.links[index].device;
-        if (queue == .dirty) self.unlinkDirty(index, device_index);
-        if (queue == .busy_dirty) self.devices[device_index].busy_dirty -= 1;
-        self.devices[device_index].dirty -= 1;
-        self.devices[device_index].clean += 1;
-        if (self.devices[device_index].dirty <= dirty_low_pages) {
-            self.devices[device_index].pressure_active = false;
-        }
-        if (queue == .dirty) {
-            self.links[index].queue = .clean;
-            self.linkCleanTail(index, device_index);
-        } else {
-            self.links[index].queue = .busy_clean;
-        }
-        return true;
+        return r4os_rust_fs_cache_index(self, 5, index, 0, false) != 0;
     }
-
     pub fn pin(self: *Index, index: usize) bool {
-        if (!validEntry(index)) return false;
-        const device_index: usize = self.links[index].device;
-        switch (self.links[index].queue) {
-            .clean => {
-                self.unlinkClean(index, device_index);
-                self.links[index].queue = .busy_clean;
-            },
-            .dirty => {
-                self.unlinkDirty(index, device_index);
-                self.links[index].queue = .busy_dirty;
-                self.devices[device_index].busy_dirty += 1;
-            },
-            else => return false,
-        }
-        self.busy_count += 1;
-        return true;
+        return r4os_rust_fs_cache_index(self, 6, index, 0, false) != 0;
     }
-
     pub fn unpin(self: *Index, index: usize, retry_oldest: bool) bool {
-        if (!validEntry(index)) return false;
-        const device_index: usize = self.links[index].device;
-        switch (self.links[index].queue) {
-            .busy_clean => {
-                self.links[index].queue = .clean;
-                self.linkCleanTail(index, device_index);
-            },
-            .busy_dirty => {
-                self.devices[device_index].busy_dirty -= 1;
-                self.links[index].queue = .dirty;
-                if (retry_oldest) {
-                    self.linkDirtyHead(index, device_index);
-                } else {
-                    self.linkDirtyTail(index, device_index);
-                }
-            },
-            else => return false,
-        }
-        self.busy_count -= 1;
-        return true;
+        return r4os_rust_fs_cache_index(self, 7, index, 0, retry_oldest) != 0;
     }
-
-    // Removes a clean or dirty identity without returning its slot to the
-    // free queue. Replacement can immediately attach a new device identity.
     pub fn detach(self: *Index, index: usize) bool {
-        if (!validEntry(index)) return false;
-        const device_index: usize = self.links[index].device;
-        switch (self.links[index].queue) {
-            .clean => {
-                self.unlinkClean(index, device_index);
-                self.devices[device_index].clean -= 1;
-            },
-            .dirty => {
-                self.unlinkDirty(index, device_index);
-                self.devices[device_index].dirty -= 1;
-                if (self.devices[device_index].dirty <= dirty_low_pages) {
-                    self.devices[device_index].pressure_active = false;
-                }
-            },
-            .detached => return true,
-            else => return false,
-        }
-        self.devices[device_index].entries -= 1;
-        self.links[index] = .{};
-        return true;
+        return r4os_rust_fs_cache_index(self, 8, index, 0, false) != 0;
     }
-
     pub fn release(self: *Index, index: usize) bool {
-        if (!validEntry(index)) return false;
-        if (self.links[index].queue != .detached and !self.detach(index)) return false;
-        self.links[index] = .{
-            .prev = self.free_tail,
-            .queue = .free,
-        };
-        if (self.free_tail == no_index) {
-            self.free_head = @intCast(index);
-        } else {
-            self.links[@as(usize, self.free_tail)].next = @intCast(index);
-        }
-        self.free_tail = @intCast(index);
-        self.free_count += 1;
-        return true;
+        return r4os_rust_fs_cache_index(self, 9, index, 0, false) != 0;
     }
-
     pub fn cleanVictim(self: *Index, preferred_device: ?usize) ?usize {
-        if (preferred_device) |device_index| {
-            if (validDevice(device_index)) {
-                self.clean_device_probes +%= 1;
-                if (self.devices[device_index].clean_head != no_index) {
-                    return self.devices[device_index].clean_head;
-                }
-            }
-        }
-        var probes: usize = 0;
-        while (probes < max_devices) : (probes += 1) {
-            const device_index = (@as(usize, self.clean_device_cursor) + probes) % max_devices;
-            self.clean_device_probes +%= 1;
-            const head = self.devices[device_index].clean_head;
-            if (head == no_index) continue;
-            self.clean_device_cursor = @intCast((device_index + 1) % max_devices);
-            return head;
-        }
-        return null;
+        return optional(r4os_rust_fs_cache_index(self, 10, 0, preferred_device orelse std.math.maxInt(usize), false));
     }
-
     pub fn dirtyHead(self: *const Index, device_index: usize) ?usize {
-        if (!validDevice(device_index)) return null;
-        const head = self.devices[device_index].dirty_head;
-        return if (head == no_index) null else head;
+        return optional(r4os_rust_fs_cache_index(@constCast(self), 11, 0, device_index, false));
     }
-
     pub fn nextDirty(self: *const Index, index: usize) ?usize {
-        if (!validEntry(index) or self.links[index].queue != .dirty) return null;
-        const next = self.links[index].next;
-        return if (next == no_index) null else next;
+        return optional(r4os_rust_fs_cache_index(@constCast(self), 12, index, 0, false));
     }
-
     pub fn nextDirtyDevice(self: *Index, pressure_only: bool) ?usize {
-        var probes: usize = 0;
-        while (probes < max_devices) : (probes += 1) {
-            const device_index = (@as(usize, self.dirty_device_cursor) + probes) % max_devices;
-            self.dirty_device_probes +%= 1;
-            const device = self.devices[device_index];
-            if (device.dirty_head == no_index or (pressure_only and !device.pressure_active)) continue;
-            self.dirty_device_cursor = @intCast((device_index + 1) % max_devices);
-            return device_index;
-        }
-        return null;
+        return optional(r4os_rust_fs_cache_index(self, 13, 0, 0, pressure_only));
     }
-
     pub fn entryCount(self: *const Index) u16 {
-        return @as(u16, @intCast(max_entries)) - self.free_count;
+        return @intCast(r4os_rust_fs_cache_index(@constCast(self), 14, 0, 0, false));
     }
-
     pub fn dirtyCount(self: *const Index) u16 {
-        var total: u16 = 0;
-        for (self.devices) |device| total += device.dirty;
-        return total;
+        return @intCast(r4os_rust_fs_cache_index(@constCast(self), 15, 0, 0, false));
     }
-
     pub fn cleanCount(self: *const Index) u16 {
-        var total: u16 = 0;
-        for (self.devices) |device| total += device.clean;
-        return total;
-    }
-
-    fn unlinkClean(self: *Index, index: usize, device_index: usize) void {
-        self.unlinkFromList(index, &self.devices[device_index].clean_head, &self.devices[device_index].clean_tail);
-    }
-
-    fn unlinkDirty(self: *Index, index: usize, device_index: usize) void {
-        self.unlinkFromList(index, &self.devices[device_index].dirty_head, &self.devices[device_index].dirty_tail);
-    }
-
-    fn unlinkFromList(self: *Index, index: usize, head: *u16, tail: *u16) void {
-        const prev = self.links[index].prev;
-        const next = self.links[index].next;
-        if (prev == no_index) head.* = next else self.links[@as(usize, prev)].next = next;
-        if (next == no_index) tail.* = prev else self.links[@as(usize, next)].prev = prev;
-        self.links[index].prev = no_index;
-        self.links[index].next = no_index;
-    }
-
-    fn linkCleanTail(self: *Index, index: usize, device_index: usize) void {
-        self.linkTail(index, &self.devices[device_index].clean_head, &self.devices[device_index].clean_tail);
-    }
-
-    fn linkDirtyTail(self: *Index, index: usize, device_index: usize) void {
-        self.linkTail(index, &self.devices[device_index].dirty_head, &self.devices[device_index].dirty_tail);
-    }
-
-    fn linkDirtyHead(self: *Index, index: usize, device_index: usize) void {
-        const old_head = self.devices[device_index].dirty_head;
-        self.links[index].prev = no_index;
-        self.links[index].next = old_head;
-        if (old_head == no_index) {
-            self.devices[device_index].dirty_tail = @intCast(index);
-        } else {
-            self.links[@as(usize, old_head)].prev = @intCast(index);
-        }
-        self.devices[device_index].dirty_head = @intCast(index);
-    }
-
-    fn linkTail(self: *Index, index: usize, head: *u16, tail: *u16) void {
-        const old_tail = tail.*;
-        self.links[index].prev = old_tail;
-        self.links[index].next = no_index;
-        if (old_tail == no_index) head.* = @intCast(index) else self.links[@as(usize, old_tail)].next = @intCast(index);
-        tail.* = @intCast(index);
+        return @intCast(r4os_rust_fs_cache_index(@constCast(self), 16, 0, 0, false));
     }
 };
-
+fn optional(raw: usize) ?usize {
+    return if (raw == std.math.maxInt(usize)) null else raw;
+}
 pub fn ageDue(now: u64, dirty_since: u64, max_age: u64) bool {
-    if (dirty_since == 0) return false;
-    return now >= dirty_since and now - dirty_since >= max_age;
+    return r4os_rust_fs_cache_age_due(now, dirty_since, max_age);
 }
-
-fn validEntry(index: usize) bool {
-    return index < max_entries;
-}
-
-fn validDevice(device_index: usize) bool {
-    return device_index < max_devices;
+comptime {
+    if (@sizeOf(Capacity) != 8 or @offsetOf(Capacity, "read_ahead_pages") != 6 or
+        @sizeOf(SequentialDecision) != 16 or @sizeOf(Sequential) != 24 or
+        @offsetOf(Sequential, "last_end_page") != 8 or @sizeOf(Link) != 6 or
+        @sizeOf(Device) != 20 or @sizeOf(ReadAheadRequest) != 24 or
+        @sizeOf(ReadAhead) != 72 or @offsetOf(ReadAhead, "sequential") != 48 or
+        @sizeOf(Index) != 3264 or @offsetOf(Index, "devices") != 3072 or
+        @offsetOf(Index, "clean_device_probes") != 3248)
+        @compileError("Private native filesystem cache policy layout changed");
 }
 
 test "free and per-device clean selection stay indexed" {

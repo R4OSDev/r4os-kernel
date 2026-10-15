@@ -1,48 +1,23 @@
+// Private C facade to the single native filesystem policy owner.
 const std = @import("std");
-
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const sector_count: usize = 8;
 pub const Owner = u64;
 pub const no_owner: Owner = 0;
-
+extern fn r4os_rust_fs_batch_mask(u8, *const [sector_count]Owner, Owner) callconv(.c) u8;
+extern fn r4os_rust_fs_batch_oldest(u8, *const [sector_count]Owner, *const [sector_count]u64, Owner, *u64) callconv(.c) bool;
+extern fn r4os_rust_fs_batch_clear(*[sector_count]Owner, *[sector_count]u64, u8) callconv(.c) void;
 pub fn maskForOwner(dirty_mask: u8, owners: *const [sector_count]Owner, owner: Owner) u8 {
-    var mask: u8 = 0;
-    var sector: usize = 0;
-    while (sector < sector_count) : (sector += 1) {
-        const bit = @as(u8, 1) << @as(u3, @intCast(sector));
-        if ((dirty_mask & bit) != 0 and owners[sector] == owner) mask |= bit;
-    }
-    return mask;
+    return r4os_rust_fs_batch_mask(dirty_mask, owners, owner);
 }
-
-pub fn oldestSequenceForOwner(
-    dirty_mask: u8,
-    owners: *const [sector_count]Owner,
-    sequences: *const [sector_count]u64,
-    owner: Owner,
-) ?u64 {
-    var oldest: ?u64 = null;
-    var sector: usize = 0;
-    while (sector < sector_count) : (sector += 1) {
-        const bit = @as(u8, 1) << @as(u3, @intCast(sector));
-        if ((dirty_mask & bit) == 0 or owners[sector] != owner) continue;
-        const sequence = sequences[sector];
-        if (oldest == null or sequence < oldest.?) oldest = sequence;
-    }
-    return oldest;
+pub fn oldestSequenceForOwner(dirty_mask: u8, owners: *const [sector_count]Owner, sequences: *const [sector_count]u64, owner: Owner) ?u64 {
+    var out: u64 = undefined;
+    return if (r4os_rust_fs_batch_oldest(dirty_mask, owners, sequences, owner, &out)) out else null;
 }
-
-pub fn clearOwnership(
-    owners: *[sector_count]Owner,
-    sequences: *[sector_count]u64,
-    bits: u8,
-) void {
-    var sector: usize = 0;
-    while (sector < sector_count) : (sector += 1) {
-        const bit = @as(u8, 1) << @as(u3, @intCast(sector));
-        if ((bits & bit) == 0) continue;
-        owners[sector] = no_owner;
-        sequences[sector] = 0;
-    }
+pub fn clearOwnership(owners: *[sector_count]Owner, sequences: *[sector_count]u64, bits: u8) void {
+    r4os_rust_fs_batch_clear(owners, sequences, bits);
 }
 
 test "selective mask excludes foreign sectors on the same cache page" {

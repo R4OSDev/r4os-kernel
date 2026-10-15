@@ -1,58 +1,39 @@
+// Private C facade to the single native filesystem policy owner.
 const std = @import("std");
-
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const lane_count: usize = 26;
-
-pub const Plan = struct {
+pub const Plan = extern struct {
     lanes: [lane_count]u8 = .{0} ** lane_count,
     count: u8 = 0,
-
     pub fn isGlobal(self: Plan) bool {
-        return self.count == lane_count;
+        return r4os_rust_fs_scope_global(&self);
     }
 };
-
-pub fn single(drive_letter: u8) Plan {
-    const lane = driveLane(drive_letter) orelse return all();
-    var plan: Plan = .{};
-    plan.lanes[0] = lane;
-    plan.count = 1;
-    return plan;
+extern fn r4os_rust_fs_scope_plan(u8, u8, u8, *Plan) callconv(.c) void;
+extern fn r4os_rust_fs_scope_global(*const Plan) callconv(.c) bool;
+extern fn r4os_rust_fs_drive_code(u8) callconv(.c) u32;
+pub fn single(letter: u8) Plan {
+    var out: Plan = undefined;
+    r4os_rust_fs_scope_plan(0, letter, 0, &out);
+    return out;
 }
-
-pub fn pair(first_drive: u8, second_drive: u8) Plan {
-    const first = driveLane(first_drive) orelse return all();
-    const second = driveLane(second_drive) orelse return all();
-    var plan: Plan = .{};
-    if (first == second) {
-        plan.lanes[0] = first;
-        plan.count = 1;
-        return plan;
-    }
-    plan.lanes[0] = @min(first, second);
-    plan.lanes[1] = @max(first, second);
-    plan.count = 2;
-    return plan;
+pub fn pair(first: u8, second: u8) Plan {
+    var out: Plan = undefined;
+    r4os_rust_fs_scope_plan(1, first, second, &out);
+    return out;
 }
-
 pub fn all() Plan {
-    var plan: Plan = .{};
-    while (plan.count < lane_count) : (plan.count += 1) {
-        plan.lanes[plan.count] = plan.count;
-    }
-    return plan;
+    var out: Plan = undefined;
+    r4os_rust_fs_scope_plan(2, 0, 0, &out);
+    return out;
 }
-
-pub fn driveCode(drive_letter: u8) u32 {
-    return if (drive_letter >= 'a' and drive_letter <= 'z')
-        @as(u32, drive_letter - ('a' - 'A'))
-    else
-        @as(u32, drive_letter);
+pub fn driveCode(letter: u8) u32 {
+    return r4os_rust_fs_drive_code(letter);
 }
-
-fn driveLane(drive_letter: u8) ?u8 {
-    const upper = driveCode(drive_letter);
-    if (upper < 'A' or upper > 'Z') return null;
-    return @intCast(upper - 'A');
+comptime {
+    if (@sizeOf(Plan) != 27 or @offsetOf(Plan, "count") != 26) @compileError("private request scope layout drift");
 }
 
 test "single drive scopes are case insensitive" {

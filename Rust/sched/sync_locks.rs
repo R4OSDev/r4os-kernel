@@ -337,6 +337,28 @@ unsafe fn mutex_unlock(m: *mut Mutex) -> bool {
         true
     }
 }
+// Exact sync-owner metadata projection for passive FS diagnostics. The
+// filesystem never reads mutable guard ownership outside this boundary.
+pub(crate) struct GuardMetadata {
+    pub owner: u32,
+    pub generation: u64,
+    pub depth: u32,
+    pub boot_owner: bool,
+}
+/// # Safety
+/// Exact initialized guard storage remains resident through this bounded
+/// query. No pointer into task/queue state escapes the native sync owner.
+pub(crate) unsafe fn guard_metadata(g: *const UnwindGuard) -> GuardMetadata {
+    let _runtime = runtime::RuntimeGuard::acquire();
+    unsafe {
+        GuardMetadata {
+            owner: (*g).owner,
+            generation: (*g).owner_generation,
+            depth: (*g).depth,
+            boot_owner: (*g).boot_owner,
+        }
+    }
+}
 unsafe fn guard_free(g: *const UnwindGuard) -> bool {
     unsafe { (*g).owner == 0 && (*g).owner_generation == 0 && !(*g).boot_owner && (*g).depth == 0 }
 }

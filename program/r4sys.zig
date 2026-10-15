@@ -938,7 +938,7 @@ pub fn driveInfo(index: u32, out: *DriveInfo) callconv(.c) i32 {
     out.kind = @intFromEnum(d.kind);
     out.role = @intFromEnum(d.role);
     out.bytes = d.bytes;
-    copyFixedZ(out.name[0..], d.name);
+    copyFixedZ(out.name[0..], d.name.text());
     {
         if (vfs.volumeForDrive(d.letter)) |volume| {
             var req = fs_request.beginVolume(.drive_info, d.letter, volume) orelse return -2;

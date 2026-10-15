@@ -1,41 +1,67 @@
-// A copy's payload phase is independent of namespace publication. The I/O
-// adapter owns mount/mutation leases, one bounded scratch buffer and each
-// short backend transaction. No borrowed backend scratch survives a method.
+// Native transfer owner; generic callbacks only project the exact existing
+// backend instance. Its binding stays on this task's stack through every wait.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const max_chunk_bytes: usize = 32768;
-pub const Progress = struct {
-    bytes: u64 = 0,
-    source_size: u64 = 0,
-    chunks: u32 = 0,
-    max_chunk: u32 = 0,
+pub const Progress = extern struct { bytes: u64 = 0, source_size: u64 = 0, chunks: u32 = 0, max_chunk: u32 = 0 };
+const Io = extern struct {
+    context: *anyopaque,
+    cancelled: *const fn (*anyopaque) callconv(.c) bool,
+    prepare: *const fn (*anyopaque) callconv(.c) bool,
+    allow_readers: *const fn (*anyopaque) callconv(.c) void,
+    read: *const fn (*anyopaque, u32, [*]u8, usize, *usize) callconv(.c) bool,
+    append: *const fn (*anyopaque, u64, [*]const u8, usize) callconv(.c) bool,
+    progress: *const fn (*anyopaque) callconv(.c) void,
+    pause: *const fn (*anyopaque) callconv(.c) void,
+    flush: *const fn (*anyopaque) callconv(.c) bool,
+    publish: *const fn (*anyopaque) callconv(.c) bool,
+    abort: *const fn (*anyopaque) callconv(.c) void,
 };
-
+extern fn r4os_rust_fs_copy_transfer(*const Io, [*]u8, usize, u64, *Progress) callconv(.c) bool;
 pub fn transfer(io: anytype, buffer: []u8, size: u64, progress: *Progress) bool {
-    progress.* = .{ .source_size = size };
-    if (buffer.len == 0 or size > 0xffffffff or io.cancelled()) return false;
-    const chunk = buffer[0..@min(buffer.len, max_chunk_bytes)];
-    var published = false;
-    var publication_attempted = false;
-    // After an uncertain publish the stage may no longer own its payload.
-    // Never free or retry publication after crossing this boundary.
-    defer if (!published and !publication_attempted) io.abort();
-    if (!io.prepare()) return false;
-    io.allowReaders();
-    while (progress.bytes < size) {
-        if (io.cancelled()) return false;
-        const want: usize = @intCast(@min(size - progress.bytes, chunk.len));
-        const got = io.read(@intCast(progress.bytes), chunk[0..want]) orelse return false;
-        if (got != want) return false;
-        if (!io.append(progress.bytes, chunk[0..want])) return false;
-        progress.bytes += want;
-        progress.chunks += 1;
-        progress.max_chunk = @max(progress.max_chunk, @as(u32, @intCast(want)));
-        io.progress();
-        io.pause();
-    }
-    if (!io.flush() or io.cancelled()) return false;
-    publication_attempted = true;
-    published = io.publish();
-    return published;
+    const Binding = struct {
+        fn instance(raw: *anyopaque) *@TypeOf(io) {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn cancelled(raw: *anyopaque) callconv(.c) bool {
+            return instance(raw).*.cancelled();
+        }
+        fn prepare(raw: *anyopaque) callconv(.c) bool {
+            return instance(raw).*.prepare();
+        }
+        fn allowReaders(raw: *anyopaque) callconv(.c) void {
+            instance(raw).*.allowReaders();
+        }
+        fn read(raw: *anyopaque, at: u32, data: [*]u8, len: usize, out: *usize) callconv(.c) bool {
+            out.* = instance(raw).*.read(at, data[0..len]) orelse return false;
+            return true;
+        }
+        fn append(raw: *anyopaque, at: u64, data: [*]const u8, len: usize) callconv(.c) bool {
+            return instance(raw).*.append(at, data[0..len]);
+        }
+        fn report(raw: *anyopaque) callconv(.c) void {
+            instance(raw).*.progress();
+        }
+        fn pause(raw: *anyopaque) callconv(.c) void {
+            instance(raw).*.pause();
+        }
+        fn flush(raw: *anyopaque) callconv(.c) bool {
+            return instance(raw).*.flush();
+        }
+        fn publish(raw: *anyopaque) callconv(.c) bool {
+            return instance(raw).*.publish();
+        }
+        fn abort(raw: *anyopaque) callconv(.c) void {
+            instance(raw).*.abort();
+        }
+    };
+    var binding = io;
+    const callbacks: Io = .{ .context = @ptrCast(&binding), .cancelled = Binding.cancelled, .prepare = Binding.prepare, .allow_readers = Binding.allowReaders, .read = Binding.read, .append = Binding.append, .progress = Binding.report, .pause = Binding.pause, .flush = Binding.flush, .publish = Binding.publish, .abort = Binding.abort };
+    return r4os_rust_fs_copy_transfer(&callbacks, buffer.ptr, buffer.len, size, progress);
+}
+comptime {
+    if (@sizeOf(Progress) != 24 or @offsetOf(Progress, "chunks") != 16 or @sizeOf(Io) != 88) @compileError("private copy transfer layout drift");
 }
 
 test "bounded staged copy preserves old destination until publication and drains failures" {

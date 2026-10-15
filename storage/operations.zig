@@ -84,10 +84,10 @@ pub fn releaseOwner(program: u32, generation: u64, task_id: u32, task_generation
 
 export fn r4os_zig_ops_drive(letter: u8, out: *DriveMetadata) void {
     const d = drive.get(letter);
-    out.* = .{ .present = d != null, .has_vfs = vfs.volumeForDrive(letter) != null, .kind = if (d) |value| @intFromEnum(value.kind) else 0, .role = if (d) |value| @intFromEnum(value.role) else 0, .bytes = if (d) |value| value.bytes else 0, .index = if (d) |value| value.block_device_index orelse std.math.maxInt(usize) else std.math.maxInt(usize), .name = .{0} ** 32 };
+    out.* = .{ .present = d != null, .has_vfs = vfs.volumeForDrive(letter) != null, .kind = if (d) |value| @intFromEnum(value.kind) else 0, .role = if (d) |value| @intFromEnum(value.role) else 0, .bytes = if (d) |value| value.bytes else 0, .index = if (d) |value| value.blockDeviceIndex() orelse std.math.maxInt(usize) else std.math.maxInt(usize), .name = .{0} ** 32 };
     if (d) |value| {
         const len = @min(value.name.len, out.name.len - 1);
-        @memcpy(out.name[0..len], value.name[0..len]);
+        @memcpy(out.name[0..len], value.name.text()[0..len]);
     }
 }
 export fn r4os_zig_ops_volume(slot: u32, out: *VolumeMetadata) bool {

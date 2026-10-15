@@ -800,7 +800,7 @@ export fn r4os_zig_block_backend(device: *Device, request: ?*const RequestExecut
 }
 export fn r4os_zig_block_mount_index(index: usize, out: *usize) callconv(.c) bool {
     const mounted = drive.atIndex(index) orelse return false;
-    out.* = mounted.block_device_index orelse return false;
+    out.* = mounted.blockDeviceIndex() orelse return false;
     return true;
 }
 export fn r4os_zig_block_incident_begin() callconv(.c) u64 {

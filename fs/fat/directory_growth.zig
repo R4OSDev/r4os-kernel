@@ -1,26 +1,62 @@
+// Private C facade to the single native filesystem policy owner.
 const std = @import("std");
-
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const Error = error{ Geometry, Capacity, Allocation, Initialize, Flush, Tail, Publish };
-pub const Extension = struct { first: u32, count: usize };
-
-/// The FAT owner holds its volume request lane. New bytes and FAT entries
-/// become durable before the old tail can reach them. After any publication
-/// attempt, even an error may have linked one mirror: retain the allocation.
+pub const Extension = extern struct { first: u32, count: usize };
+const Io = extern struct {
+    context: *anyopaque,
+    allocate: *const fn (*anyopaque, usize, *u32) callconv(.c) bool,
+    initialize: *const fn (*anyopaque, u32, usize) callconv(.c) bool,
+    flush: *const fn (*anyopaque) callconv(.c) bool,
+    tail_available: *const fn (*anyopaque) callconv(.c) bool,
+    publish: *const fn (*anyopaque, u32) callconv(.c) bool,
+    discard: *const fn (*anyopaque, u32) callconv(.c) void,
+};
+extern fn r4os_rust_fs_directory_extend(*const Io, usize, usize, usize, *Extension) callconv(.c) u8;
 pub fn extend(io: anytype, cluster_bytes: usize, missing_entries: usize, remaining_clusters: usize) Error!Extension {
-    if (cluster_bytes < 512 or cluster_bytes > 65536 or !std.math.isPowerOfTwo(cluster_bytes) or
-        missing_entries == 0 or missing_entries > 21) return error.Geometry;
-    const count = (missing_entries * 32 + cluster_bytes - 1) / cluster_bytes;
-    if (count > remaining_clusters) return error.Capacity;
-    const first = io.allocate(count) orelse return error.Allocation;
-    var may_be_linked = false;
-    errdefer if (!may_be_linked) io.discard(first);
-    if (!io.initialize(first, count)) return error.Initialize;
-    if (!io.flush()) return error.Flush;
-    if (!io.tailAvailable()) return error.Tail;
-    may_be_linked = true;
-    if (!io.publish(first)) return error.Publish;
-    if (!io.flush()) return error.Flush;
-    return .{ .first = first, .count = count };
+    const Binding = struct {
+        fn instance(raw: *anyopaque) *@TypeOf(io) {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn allocate(raw: *anyopaque, count: usize, out: *u32) callconv(.c) bool {
+            out.* = instance(raw).*.allocate(count) orelse return false;
+            return true;
+        }
+        fn initialize(raw: *anyopaque, first: u32, count: usize) callconv(.c) bool {
+            return instance(raw).*.initialize(first, count);
+        }
+        fn flush(raw: *anyopaque) callconv(.c) bool {
+            return instance(raw).*.flush();
+        }
+        fn tailAvailable(raw: *anyopaque) callconv(.c) bool {
+            return instance(raw).*.tailAvailable();
+        }
+        fn publish(raw: *anyopaque, first: u32) callconv(.c) bool {
+            return instance(raw).*.publish(first);
+        }
+        fn discard(raw: *anyopaque, first: u32) callconv(.c) void {
+            instance(raw).*.discard(first);
+        }
+    };
+    var binding = io;
+    const callbacks: Io = .{ .context = @ptrCast(&binding), .allocate = Binding.allocate, .initialize = Binding.initialize, .flush = Binding.flush, .tail_available = Binding.tailAvailable, .publish = Binding.publish, .discard = Binding.discard };
+    var out: Extension = undefined;
+    switch (r4os_rust_fs_directory_extend(&callbacks, cluster_bytes, missing_entries, remaining_clusters, &out)) {
+        0 => return out,
+        1 => return error.Geometry,
+        2 => return error.Capacity,
+        3 => return error.Allocation,
+        4 => return error.Initialize,
+        5 => return error.Flush,
+        6 => return error.Tail,
+        7 => return error.Publish,
+        else => unreachable,
+    }
+}
+comptime {
+    if (@sizeOf(Extension) != 16 or @offsetOf(Extension, "count") != 8 or @sizeOf(Io) != 56) @compileError("private FAT extension layout drift");
 }
 
 test "directory extension initializes before visibility and retains storage after ambiguous FAT publication" {

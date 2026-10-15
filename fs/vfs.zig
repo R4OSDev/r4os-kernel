@@ -1,27 +1,7 @@
-// FS-neutral filesystem dispatch (VFS).
-//
-// Owns the per-drive-letter volume table and dispatches every generic file
-// operation to the mounted filesystem implementation.  Consumers speak the
-// neutral vocabulary defined here (NodeRef, Entry, Volume) and never a
-// filesystem-internal one (FAT32 cluster numbers, NTFS MFT references).
-//
-// Timestamps in Entry stay in the R4OS ABI format (DOS-style u16 date/time
-// pairs from the fixed-layout file_info payload).  Every filesystem backend
-// converts its native time format to this contract at this boundary.
-//
-// Filesystem probing (recognizing a volume on a partition) stays
-// filesystem-specific in the MBR scanner; only mounted volumes live here.
-
+// Private neutral C facade; native Rust owns every VFS state/policy.
 const fat32 = @import("fat/fat32.zig");
 const ntfs_fs = @import("ntfs/ntfs.zig");
 const access = @import("../storage/access_runtime.zig");
-const locks = @import("../memory/owner_locks.zig");
-const drive = @import("drive.zig");
-const heap = @import("../memory/heap.zig");
-const directory_changes = @import("directory_changes.zig");
-
-/// Windows-parity component limit (0.60.19): 255 characters, UTF-8 (BMP)
-/// worst case 765 bytes, buffered as 768.
 pub const NAME_MAX: usize = 768;
 pub const MAX_MOUNTED_VOLUMES: usize = 26;
 
@@ -115,713 +95,334 @@ pub const Entry = struct {
     modified_date: u16 = 0,
 
     pub fn isDir(self: Entry) bool {
-        return (self.attr & ATTR_DIRECTORY) != 0;
+        return r4os_rust_vfs_attribute(0, self.attr);
     }
 
     pub fn isReadOnly(self: Entry) bool {
-        return (self.attr & ATTR_READ_ONLY) != 0;
+        return r4os_rust_vfs_attribute(1, self.attr);
     }
 
     pub fn isHiddenOrSystem(self: Entry) bool {
-        return (self.attr & (ATTR_HIDDEN | ATTR_SYSTEM)) != 0;
+        return r4os_rust_vfs_attribute(2, self.attr);
     }
 };
 
 pub const Volume = union(enum) {
     fat32: fat32.Volume,
     ntfs: ntfs_fs.Volume,
-
     pub fn accessReference(self: Volume) ?access.MountRef {
         return switch (self) {
             inline else => |v| v.mount_ref,
         };
     }
-
     pub fn storageRegion(self: Volume) ?access.Region {
-        if (self.accessReference()) |ref| return (access.mountSnapshot(ref) catch return null).region;
-        const location: ntfs_fs.StorageLocation = switch (self) {
-            .fat32 => |v| .{ .device = v.device_index, .first = @as(u64, v.partition_lba), .count = @as(u64, v.total_sectors) },
-            .ntfs => |v| ntfs_fs.storageLocation(v) orelse return null,
-        };
-        return .{ .device = access.deviceReference(@intCast(location.device)) orelse return null, .first = location.first, .count = location.count };
+        var out: access.Region = undefined;
+        const view = cv(self);
+        return if (r4os_rust_vfs_mount(6, 0, &view, null, @ptrCast(&out))) out else null;
     }
-
-    fn bind(self: *Volume, ref: access.MountRef) void {
-        switch (self.*) {
-            inline else => |*v| v.mount_ref = ref,
-        }
-    }
-
     pub fn clusterBytes(self: Volume) u32 {
-        return switch (self) {
-            .fat32 => |v| v.clusterBytes(),
-            .ntfs => |v| v.cluster_bytes,
-        };
+        const v = cv(self);
+        return @intCast(r4os_rust_vfs_volume(0, &v));
     }
-
     pub fn totalClusters(self: Volume) u32 {
-        return switch (self) {
-            .fat32 => |v| v.totalClusters(),
-            .ntfs => |v| @intCast((v.total_sectors * 512) / v.cluster_bytes),
-        };
+        const v = cv(self);
+        return @intCast(r4os_rust_vfs_volume(1, &v));
     }
-
     pub fn rootNode(self: Volume) NodeRef {
-        return switch (self) {
-            .fat32 => |v| v.root_cluster,
-            .ntfs => ntfs_fs.rootRecord(),
-        };
+        const v = cv(self);
+        return r4os_rust_vfs_volume(2, &v);
     }
-
     pub fn isReadOnly(self: Volume) bool {
-        // NTFS gained a phase-1 write path in 0.60.6; mkdir/rmdir/rename and
-        // atomic replace remain unsupported until 0.60.7/0.60.8.
-        return switch (self) {
-            .fat32 => false,
-            .ntfs => false,
-        };
+        const v = cv(self);
+        return r4os_rust_vfs_volume(3, &v) != 0;
     }
 };
-
-var mounted_volumes: [MAX_MOUNTED_VOLUMES]?Volume = .{null} ** MAX_MOUNTED_VOLUMES;
-
-// Internal mount of the unlettered FAT32 boot partition (Windows-ESP
-// model, 0.60.11).  Only the letterless /boot subtree of the system drive
-// routes here; the volume never appears in the lettered table or in the
-// drive registry.  First boot partition wins.
-var boot_volume_slot: ?Volume = null;
-
+const Ref = access.MountRef;
+const Fat = extern struct {
+    device: usize = 0,
+    partition: u32 = 0,
+    sector_bytes: u16 = 0,
+    cluster_sectors: u8 = 0,
+    reserved: u16 = 0,
+    fats: u8 = 0,
+    fat_sectors: u32 = 0,
+    sectors: u32 = 0,
+    root: u32 = 0,
+    fsinfo: u16 = 0,
+    backup: u16 = 0,
+    write_batch: u64 = 0,
+};
+const Ntfs = extern struct { slot: u8 = 0, cluster_bytes: u32 = 0, sectors: u64 = 0 };
+const CVolume = extern struct {
+    kind: u8 = 0,
+    has_ref: bool = false,
+    reference: Ref = .{ .slot = 0, .generation = 0 },
+    fat: Fat = .{},
+    ntfs: Ntfs = .{},
+};
+const CEntry = extern struct {
+    name: [768]u8 = .{0} ** 768,
+    name_len: usize = 0,
+    attr: u8 = 0,
+    node: u64 = 0,
+    generation: u16 = 0,
+    directory_lba: u64 = 0,
+    has_lba: bool = false,
+    directory_offset: u16 = 0,
+    reparse: bool = false,
+    size: u64 = 0,
+    times: [5]u16 = .{0} ** 5,
+};
+const Location = extern struct { device: usize, first: u64, count: u64 };
+const Bytes = extern struct {
+    data: ?[*]const u8 = null,
+    len: usize = 0,
+    fn text(self: Bytes) []const u8 {
+        return if (self.len == 0) "" else self.data.?[0..self.len];
+    }
+};
+const Args = extern struct {
+    volume: CVolume = .{},
+    other: CVolume = .{},
+    entry: ?*const CEntry = null,
+    peer: ?*const CEntry = null,
+    parent: u64 = 0,
+    offset: u64 = 0,
+    index: usize = 0,
+    name: Bytes = .{},
+    second: Bytes = .{},
+    third: Bytes = .{},
+    data: Bytes = .{},
+    buffer: ?[*]u8 = null,
+    buffer_len: usize = 0,
+    cursor: ?[*]u64 = null,
+    progress: ?*CopyProgress = null,
+    flag: bool = false,
+};
+const Result = extern struct { value: u64 = 0, status: i32 = 0, present: bool = false };
+extern fn r4os_rust_vfs_mount(u8, u8, ?*const CVolume, ?*const Ref, ?*anyopaque) bool;
+extern fn r4os_rust_vfs_volume(u8, *const CVolume) u64;
+extern fn r4os_rust_vfs_identity(u8, *const Args) bool;
+extern fn r4os_rust_vfs_run(u8, *const Args, ?*CEntry) Result;
+extern fn r4os_rust_vfs_attribute(u8, u8) bool;
+extern fn r4os_rust_vfs_notify(*const CVolume, u64) void;
+fn bytes(value: []const u8) Bytes {
+    return .{ .data = value.ptr, .len = value.len };
+}
+fn cv(value: Volume) CVolume {
+    const ref = value.accessReference();
+    var out = CVolume{ .has_ref = ref != null, .reference = ref orelse .{ .slot = 0, .generation = 0 } };
+    switch (value) {
+        .fat32 => |v| out.fat = .{ .device = v.device_index, .partition = v.partition_lba, .sector_bytes = v.bytes_per_sector, .cluster_sectors = v.sectors_per_cluster, .reserved = v.reserved_sectors, .fats = v.fat_count, .fat_sectors = v.sectors_per_fat, .sectors = v.total_sectors, .root = v.root_cluster, .fsinfo = v.fs_info_sector, .backup = v.backup_boot_sector, .write_batch = v.write_batch },
+        .ntfs => |v| {
+            out.kind = 1;
+            out.ntfs = .{ .slot = v.state_slot, .cluster_bytes = v.cluster_bytes, .sectors = v.total_sectors };
+        },
+    }
+    return out;
+}
+fn volume(value: CVolume) Volume {
+    const ref: ?Ref = if (value.has_ref) value.reference else null;
+    return switch (value.kind) {
+        0 => .{ .fat32 = .{ .mount_ref = ref, .device_index = value.fat.device, .partition_lba = value.fat.partition, .bytes_per_sector = value.fat.sector_bytes, .sectors_per_cluster = value.fat.cluster_sectors, .reserved_sectors = value.fat.reserved, .fat_count = value.fat.fats, .sectors_per_fat = value.fat.fat_sectors, .total_sectors = value.fat.sectors, .root_cluster = value.fat.root, .fs_info_sector = value.fat.fsinfo, .backup_boot_sector = value.fat.backup, .write_batch = value.fat.write_batch } },
+        1 => .{ .ntfs = .{ .mount_ref = ref, .state_slot = value.ntfs.slot, .cluster_bytes = value.ntfs.cluster_bytes, .total_sectors = value.ntfs.sectors } },
+        else => unreachable,
+    };
+}
+fn ce(e: Entry) CEntry {
+    return .{ .name = e.name, .name_len = e.name_len, .attr = e.attr, .node = e.node, .generation = e.node_generation, .directory_lba = e.fat_directory_lba orelse 0, .has_lba = e.fat_directory_lba != null, .directory_offset = e.fat_directory_offset, .reparse = e.reparse, .size = e.size, .times = .{ e.created_time, e.created_date, e.access_date, e.modified_time, e.modified_date } };
+}
+fn fromCe(e: CEntry) Entry {
+    return .{ .name = e.name, .name_len = e.name_len, .attr = e.attr, .node = e.node, .node_generation = e.generation, .fat_directory_lba = if (e.has_lba) e.directory_lba else null, .fat_directory_offset = e.directory_offset, .reparse = e.reparse, .size = e.size, .created_time = e.times[0], .created_date = e.times[1], .access_date = e.times[2], .modified_time = e.times[3], .modified_date = e.times[4] };
+}
+fn run(op: u8, a: Args) Result {
+    return r4os_rust_vfs_run(op, &a, null);
+}
+fn found(op: u8, a: Args, out: *Entry) LookupStatus {
+    var e: CEntry = undefined;
+    const result = r4os_rust_vfs_run(op, &a, &e);
+    if (result.status == 0) out.* = fromCe(e);
+    return @enumFromInt(result.status);
+}
 pub fn init() void {
-    mounted_volumes = .{null} ** MAX_MOUNTED_VOLUMES;
-    boot_volume_slot = null;
+    _ = r4os_rust_vfs_mount(0, 0, null, null, null);
 }
-
-pub fn mountBootVolume(volume: Volume) bool {
-    const region = volume.storageRegion() orelse return false;
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    if (boot_volume_slot != null) return false;
-    var bound = volume;
-    bound.bind(access.bindMountLocked(26, region, true) catch return false);
-    boot_volume_slot = bound;
-    return true;
+pub fn mountBootVolume(v: Volume) bool {
+    const a = cv(v);
+    return r4os_rust_vfs_mount(1, 0, &a, null, null);
 }
-
+pub fn mountForDrive(letter: u8, v: Volume) bool {
+    const a = cv(v);
+    return r4os_rust_vfs_mount(2, letter, &a, null, null);
+}
 pub fn bootVolume() ?Volume {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return boot_volume_slot;
+    var a: CVolume = undefined;
+    return if (r4os_rust_vfs_mount(3, 0, null, null, @ptrCast(&a))) volume(a) else null;
 }
-
-pub fn mountForDrive(letter: u8, volume: Volume) bool {
-    const index = driveIndex(letter) orelse return false;
-    const region = volume.storageRegion() orelse return false;
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    if (mounted_volumes[index] != null) return false;
-    var bound = volume;
-    bound.bind(access.bindMountLocked(@intCast(index), region, index == 'C' - 'A') catch return false);
-    mounted_volumes[index] = bound;
-    return true;
-}
-
 pub fn volumeForDrive(letter: u8) ?Volume {
-    const index = driveIndex(letter) orelse return null;
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return mounted_volumes[index];
+    var a: CVolume = undefined;
+    return if (r4os_rust_vfs_mount(4, letter, null, null, @ptrCast(&a))) volume(a) else null;
 }
-
-// The storage transaction has already stopped admissions and drained I/O.
-// Generation invalidation and removal are one short metadata publication.
-pub fn unmount(ref: access.MountRef) bool {
-    defer @import("../kernel/desktop_events.zig").signal();
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    access.unbindMountLocked(ref) catch return false;
-    if (ref.slot == 26) boot_volume_slot = null else {
-        mounted_volumes[ref.slot] = null;
-        drive.unmountLocked(@intCast('A' + ref.slot));
-    }
-    return true;
+pub fn unmount(ref: Ref) bool {
+    return r4os_rust_vfs_mount(5, 0, null, &ref, null);
 }
-
-pub fn resolvePathStatus(volume: Volume, path: []const u8, out: *NodeRef) LookupStatus {
-    return switch (volume) {
-        .fat32 => |v| blk: {
-            var node: u32 = undefined;
-            const status = lookupStatusFromFat32(fat32.resolvePathStatus(v, path, &node));
-            if (status == .found) out.* = node;
-            break :blk status;
-        },
-        .ntfs => |v| lookupStatusFromNtfs(ntfs_fs.resolvePathStatus(v, path, out)),
-    };
+pub fn resolvePathStatus(v: Volume, path: []const u8, out: *NodeRef) LookupStatus {
+    const r = run(0, .{ .volume = cv(v), .name = bytes(path) });
+    if (r.status == 0) out.* = r.value;
+    return @enumFromInt(r.status);
 }
-
-pub fn resolvePath(volume: Volume, path: []const u8) ?NodeRef {
+pub fn resolvePath(v: Volume, path: []const u8) ?NodeRef {
     var out: NodeRef = undefined;
-    return if (resolvePathStatus(volume, path, &out) == .found) out else null;
+    return if (resolvePathStatus(v, path, &out) == .found) out else null;
 }
-
-pub fn resolveEntryStatus(volume: Volume, path: []const u8, out: *Entry) LookupStatus {
-    return switch (volume) {
-        .fat32 => |v| blk: {
-            var entry: fat32.Entry = undefined;
-            const status = lookupStatusFromFat32(fat32.resolveEntryStatus(v, path, &entry));
-            if (status == .found) out.* = entryFromFat32(entry);
-            break :blk status;
-        },
-        .ntfs => |v| blk: {
-            var entry: ntfs_fs.Entry = undefined;
-            const status = lookupStatusFromNtfs(ntfs_fs.resolveEntryStatus(v, path, &entry));
-            if (status == .found) out.* = entryFromNtfs(entry);
-            break :blk status;
-        },
-    };
+pub fn resolveEntryStatus(v: Volume, path: []const u8, out: *Entry) LookupStatus {
+    return found(1, .{ .volume = cv(v), .name = bytes(path) }, out);
 }
-
-pub fn resolveEntry(volume: Volume, path: []const u8) ?Entry {
+pub fn resolveEntry(v: Volume, path: []const u8) ?Entry {
     var out: Entry = undefined;
-    return if (resolveEntryStatus(volume, path, &out) == .found) out else null;
+    return if (resolveEntryStatus(v, path, &out) == .found) out else null;
 }
-
-pub fn lookupDiagnosticStage(volume: Volume) u32 {
-    return switch (volume) {
-        .fat32 => 0,
-        .ntfs => ntfs_fs.lookupDiagnosticStage(),
-    };
+pub fn lookupDiagnosticStage(v: Volume) u32 {
+    return @intCast(run(4, .{ .volume = cv(v) }).value);
 }
-
-pub fn lookupEntryStatus(volume: Volume, parent: NodeRef, name: []const u8, out: *Entry) LookupStatus {
-    return switch (volume) {
-        .fat32 => |v| blk: {
-            var entry: fat32.Entry = undefined;
-            const status = lookupStatusFromFat32(fat32.findEntryStatus(v, @intCast(parent), name, &entry));
-            if (status == .found) out.* = entryFromFat32(entry);
-            break :blk status;
-        },
-        .ntfs => |v| blk: {
-            var entry: ntfs_fs.Entry = undefined;
-            const status = lookupStatusFromNtfs(ntfs_fs.lookupEntryStatus(v, parent, name, &entry));
-            if (status == .found) out.* = entryFromNtfs(entry);
-            break :blk status;
-        },
-    };
+pub fn lookupEntryStatus(v: Volume, parent: NodeRef, name: []const u8, out: *Entry) LookupStatus {
+    return found(2, .{ .volume = cv(v), .parent = parent, .name = bytes(name) }, out);
 }
-
-pub fn lookupEntry(volume: Volume, parent: NodeRef, name: []const u8) ?Entry {
+pub fn lookupEntry(v: Volume, parent: NodeRef, name: []const u8) ?Entry {
     var out: Entry = undefined;
-    return if (lookupEntryStatus(volume, parent, name, &out) == .found) out else null;
+    return if (lookupEntryStatus(v, parent, name, &out) == .found) out else null;
 }
-
-/// Statusful lookup used only by journal replay.  NTFS exposes its
-/// alias-first transient view here; every normal VFS lookup continues to
-/// reject a canonical-name mismatch.
-pub fn lookupRecoveryEntryStatus(volume: Volume, parent: NodeRef, name: []const u8, out: *Entry) LookupStatus {
-    return switch (volume) {
-        .fat32 => lookupEntryStatus(volume, parent, name, out),
-        .ntfs => |v| blk: {
-            var entry: ntfs_fs.Entry = undefined;
-            const status = lookupStatusFromNtfs(ntfs_fs.lookupRecoveryEntryStatus(v, parent, name, &entry));
-            if (status == .found) out.* = entryFromNtfs(entry);
-            break :blk status;
-        },
-    };
+pub fn lookupRecoveryEntryStatus(v: Volume, parent: NodeRef, name: []const u8, out: *Entry) LookupStatus {
+    return found(3, .{ .volume = cv(v), .parent = parent, .name = bytes(name) }, out);
 }
-
-/// Exact backend ownership identity for two names observed under one
-/// filesystem-request gate.  Empty FAT files have no cluster-chain identity;
-/// treating cluster zero as a globally unique object would authorize a
-/// foreign alias, so that ambiguous case deliberately returns false.
-pub fn sameFileIdentity(volume: Volume, left: Entry, right: Entry) bool {
-    if (left.isDir() or right.isDir()) return false;
-    return switch (volume) {
-        .fat32 => left.size != 0 and
-            left.node != 0 and
-            left.node == right.node and
-            left.size == right.size,
-        .ntfs => left.node == right.node and
-            left.node_generation == right.node_generation,
-    };
+pub fn sameVolume(a: Volume, b: Volume) bool {
+    return r4os_rust_vfs_identity(0, &.{ .volume = cv(a), .other = cv(b) });
 }
-
-/// Copy preflight uses the live FAT directory location for empty files.
-/// It does not change the stronger ownership rules of recovery operations.
-pub fn sameFileForCopy(volume: Volume, left: Entry, right: Entry) bool {
-    return switch (volume) {
-        .fat32 => fat32.sameFileForCopy(entryToFat32(left), entryToFat32(right)),
-        .ntfs => sameFileIdentity(volume, left, right),
-    };
+fn identity(op: u8, v: Volume, a: Entry, b: Entry) bool {
+    const left = ce(a);
+    const right = ce(b);
+    return r4os_rust_vfs_identity(op, &.{ .volume = cv(v), .entry = &left, .peer = &right });
 }
-
-/// Recovery-only alias identity. Empty FAT files have no cluster identity, but
-/// an ownership alias copies the complete short-entry metadata. SYSUPD holds
-/// the namespace gate and uses generation-private stage/backup names, so this
-/// full fingerprint can safely recognize that crash-transient alias without
-/// weakening ordinary VFS identity checks.
-pub fn sameFileRecoveryIdentity(volume: Volume, left: Entry, right: Entry) bool {
-    if (sameFileIdentity(volume, left, right)) return true;
-    return switch (volume) {
-        .fat32 => left.node == 0 and
-            right.node == 0 and
-            left.node_generation == 0 and
-            right.node_generation == 0 and
-            left.size == 0 and
-            right.size == 0 and
-            left.attr == right.attr and
-            left.reparse == right.reparse and
-            left.created_time == right.created_time and
-            left.created_date == right.created_date and
-            left.access_date == right.access_date and
-            left.modified_time == right.modified_time and
-            left.modified_date == right.modified_date,
-        .ntfs => false,
-    };
+pub fn sameFileIdentity(v: Volume, a: Entry, b: Entry) bool {
+    return identity(1, v, a, b);
 }
-
-/// Stable mounted-volume identity used by multi-path atomic operations.
-/// Drive letters are aliases and the system drive's `\boot` subtree can route
-/// to the unlettered boot partition, so equality must be established from the
-/// resolved backend volume rather than from the caller-visible letter.
-pub fn sameVolume(left: Volume, right: Volume) bool {
-    return switch (left) {
-        .fat32 => |left_fat| switch (right) {
-            .fat32 => |right_fat| left_fat.device_index == right_fat.device_index and
-                left_fat.partition_lba == right_fat.partition_lba,
-            .ntfs => false,
-        },
-        .ntfs => |left_ntfs| switch (right) {
-            .fat32 => false,
-            .ntfs => |right_ntfs| left_ntfs.state_slot == right_ntfs.state_slot,
-        },
-    };
+pub fn sameFileForCopy(v: Volume, a: Entry, b: Entry) bool {
+    return identity(2, v, a, b);
 }
-
-pub fn readFile(volume: Volume, entry: Entry, out: []u8) ?usize {
-    return switch (volume) {
-        .fat32 => |v| fat32.readFile(v, entryToFat32(entry), out),
-        .ntfs => |v| ntfs_fs.readFile(v, entryToNtfs(entry), out),
-    };
+pub fn sameFileRecoveryIdentity(v: Volume, a: Entry, b: Entry) bool {
+    return identity(3, v, a, b);
 }
-
-pub fn readFileRange(volume: Volume, entry: Entry, offset: usize, out: []u8) ?usize {
-    return switch (volume) {
-        .fat32 => |v| fat32.readFileRange(v, entryToFat32(entry), offset, out),
-        .ntfs => |v| ntfs_fs.readFileRange(v, entryToNtfs(entry), offset, out),
-    };
+fn optional(result: Result) ?usize {
+    return if (result.present) @intCast(result.value) else null;
 }
-
-// Advisory publication happens after the backend returns, including a
-// partially failed mutation. All consumers still re-enumerate under the
-// filesystem request gate; this does not promise an atomic disk snapshot.
-pub fn notifyDirectoryChanged(volume: Volume, parent: NodeRef) void {
-    if (volume.accessReference()) |mount| directory_changes.notify(mount, parent);
+pub fn readFile(v: Volume, e: Entry, out: []u8) ?usize {
+    const a = ce(e);
+    return optional(run(5, .{ .volume = cv(v), .entry = &a, .buffer = out.ptr, .buffer_len = out.len }));
 }
-
-pub fn writeFileRange(volume: Volume, entry: Entry, offset: usize, data: []const u8) ?usize {
-    return switch (volume) {
-        .fat32 => |v| fat32.writeFileRange(v, entryToFat32(entry), offset, data),
-        .ntfs => |v| ntfs_fs.writeFileRange(v, entryToNtfs(entry), offset, data),
-    };
+pub fn readFileRange(v: Volume, e: Entry, offset: usize, out: []u8) ?usize {
+    const a = ce(e);
+    return optional(run(6, .{ .volume = cv(v), .entry = &a, .offset = offset, .buffer = out.ptr, .buffer_len = out.len }));
 }
-
-pub fn writeFile(volume: Volume, parent: NodeRef, name: []const u8, data: []const u8) bool {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| fat32.writeFile(v, @intCast(parent), name, data),
-        .ntfs => |v| ntfs_fs.writeFile(v, parent, name, data),
-    };
+pub fn writeFileRange(v: Volume, e: Entry, offset: usize, data: []const u8) ?usize {
+    const a = ce(e);
+    return optional(run(7, .{ .volume = cv(v), .entry = &a, .offset = offset, .data = bytes(data) }));
 }
-
-pub fn appendFile(volume: Volume, parent: NodeRef, name: []const u8, data: []const u8) bool {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| fat32.appendFile(v, @intCast(parent), name, data),
-        .ntfs => |v| appendStatusFromNtfs(ntfs_fs.appendFileAtOffset(v, parent, name, ntfsCurrentSize(v, parent, name), data)) == .ok,
-    };
+pub fn notifyDirectoryChanged(v: Volume, parent: NodeRef) void {
+    const a = cv(v);
+    r4os_rust_vfs_notify(&a, parent);
 }
-
-pub fn appendFileAtOffsetStatus(volume: Volume, parent: NodeRef, name: []const u8, expected_size: u64, data: []const u8) AppendStatus {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| appendStatusFromFat32(fat32.appendFileAtOffsetStatus(v, @intCast(parent), name, @intCast(expected_size), data)),
-        .ntfs => |v| appendStatusFromNtfs(ntfs_fs.appendFileAtOffset(v, parent, name, expected_size, data)),
-    };
+pub fn writeFile(v: Volume, parent: NodeRef, name: []const u8, data: []const u8) bool {
+    return run(8, .{ .volume = cv(v), .parent = parent, .name = bytes(name), .data = bytes(data) }).present;
 }
-
-pub fn appendFileAtOffsetStatusDeferred(volume: Volume, parent: NodeRef, name: []const u8, expected_size: u64, data: []const u8) AppendStatus {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| appendStatusFromFat32(fat32.appendFileAtOffsetStatusDeferred(v, @intCast(parent), name, @intCast(expected_size), data)),
-        .ntfs => |v| appendStatusFromNtfs(ntfs_fs.appendFileAtOffsetDeferred(v, parent, name, expected_size, data)),
-    };
+pub fn appendFile(v: Volume, parent: NodeRef, name: []const u8, data: []const u8) bool {
+    return run(9, .{ .volume = cv(v), .parent = parent, .name = bytes(name), .data = bytes(data) }).present;
 }
-
-fn ntfsCurrentSize(v: ntfs_fs.Volume, parent: NodeRef, name: []const u8) u64 {
-    // appendFile without an explicit offset appends at the current end.
-    return ntfs_fs.childSize(v, parent, name);
+pub fn appendFileAtOffsetStatus(v: Volume, parent: NodeRef, name: []const u8, expected_size: u64, data: []const u8) AppendStatus {
+    return @enumFromInt(run(10, .{ .volume = cv(v), .parent = parent, .name = bytes(name), .offset = expected_size, .data = bytes(data) }).status);
 }
-
-/// Caller owns the destination mutation lease and backend lane; the target
-/// name is absent and the staged payload has already been flushed.
-pub fn publishCopyFile(volume: Volume, parent: NodeRef, staged: []const u8, target: []const u8) bool {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| fat32.publishCopyFile(v, @intCast(parent), staged, target),
-        .ntfs => |v| ntfs_fs.renameEntryStatus(v, parent, staged, target) == .ok,
-    };
+pub fn appendFileAtOffsetStatusDeferred(v: Volume, parent: NodeRef, name: []const u8, expected_size: u64, data: []const u8) AppendStatus {
+    return @enumFromInt(run(11, .{ .volume = cv(v), .parent = parent, .name = bytes(name), .offset = expected_size, .data = bytes(data) }).status);
 }
-
-pub fn copyFile(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent: NodeRef, dst_name: []const u8) bool {
-    defer notifyDirectoryChanged(dst_volume, dst_parent);
-    return switch (src_volume) {
-        .fat32 => |sv| switch (dst_volume) {
-            .fat32 => |dv| fat32.copyFile(sv, dv, entryToFat32(src_entry), @intCast(dst_parent), dst_name),
-            .ntfs => copyFileGeneric(src_volume, dst_volume, src_entry, dst_parent, dst_name, true),
-        },
-        .ntfs => copyFileGeneric(src_volume, dst_volume, src_entry, dst_parent, dst_name, true),
-    };
+pub fn publishCopyFile(v: Volume, parent: NodeRef, staged: []const u8, target: []const u8) bool {
+    return run(12, .{ .volume = cv(v), .parent = parent, .name = bytes(staged), .second = bytes(target) }).present;
 }
-
-pub fn copyFileNoReplace(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent: NodeRef, dst_name: []const u8) bool {
-    defer notifyDirectoryChanged(dst_volume, dst_parent);
-    return switch (src_volume) {
-        .fat32 => |sv| switch (dst_volume) {
-            .fat32 => |dv| fat32.copyFileNoReplace(sv, dv, entryToFat32(src_entry), @intCast(dst_parent), dst_name),
-            .ntfs => copyFileGeneric(src_volume, dst_volume, src_entry, dst_parent, dst_name, false),
-        },
-        .ntfs => copyFileGeneric(src_volume, dst_volume, src_entry, dst_parent, dst_name, false),
-    };
-}
-
 pub const CopyProgress = @import("copy_transfer.zig").Progress;
-
-/// Callers hold the paired filesystem request (including its unwind guard).
-/// Each operation owns its buffer across all I/O waits; disjoint volume
-/// requests deliberately remain independent. Allocate before changing a name.
-fn copyFileGeneric(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent: NodeRef, dst_name: []const u8, replace: bool) bool {
-    const chunk = heap.allocBytes(32768) orelse return false;
-    defer _ = heap.free(chunk);
-    var progress: CopyProgress = .{};
-    return copyFileBuffered(src_volume, dst_volume, src_entry, dst_parent, dst_name, replace, chunk, &progress);
+fn copy(src: Volume, dst: Volume, e: Entry, parent: NodeRef, name: []const u8, replace: bool) bool {
+    const a = ce(e);
+    return run(13, .{ .volume = cv(src), .other = cv(dst), .entry = &a, .parent = parent, .name = bytes(name), .flag = replace }).present;
 }
-
-/// The caller exclusively owns the bounded buffer until this call returns.
-/// Progress counts completed appends; an I/O error may leave a partial target.
-pub fn copyFileBuffered(src_volume: Volume, dst_volume: Volume, src_entry: Entry, dst_parent: NodeRef, dst_name: []const u8, replace: bool, chunk: []u8, progress: *CopyProgress) bool {
-    progress.* = .{ .source_size = src_entry.size };
-    if (src_entry.isDir() or chunk.len == 0 or src_entry.size > 0xFFFF_FFFF) return false;
-    var existing: Entry = undefined;
-    switch (lookupEntryStatus(dst_volume, dst_parent, dst_name, &existing)) {
-        .found => {
-            if (!replace or existing.isDir() or existing.isReadOnly()) return false;
-            if (sameVolume(src_volume, dst_volume) and sameFileForCopy(src_volume, src_entry, existing)) return false;
-            if (!deleteFile(dst_volume, dst_parent, dst_name)) return false;
-        },
-        .not_found => {},
-        .io => return false,
-    }
-    var completed = false;
-    // Match stream-copy abort: retire our incomplete destination while the
-    // namespace request still excludes another writer. Cleanup I/O can fail.
-    defer if (!completed) {
-        _ = deleteFile(dst_volume, dst_parent, dst_name);
-    };
-    if (!writeFile(dst_volume, dst_parent, dst_name, chunk[0..0])) return false;
-    while (progress.bytes < src_entry.size) {
-        const want: usize = @intCast(@min(src_entry.size - progress.bytes, chunk.len));
-        const got = readFileRange(src_volume, src_entry, @intCast(progress.bytes), chunk[0..want]) orelse return false;
-        if (got != want) return false;
-        if (appendFileAtOffsetStatusDeferred(dst_volume, dst_parent, dst_name, progress.bytes, chunk[0..want]) != .ok) return false;
-        progress.bytes += want;
-        progress.chunks += 1;
-        progress.max_chunk = @max(progress.max_chunk, @as(u32, @intCast(want)));
-    }
-    completed = flushVolume(dst_volume);
-    return completed;
+pub fn copyFile(src: Volume, dst: Volume, e: Entry, parent: NodeRef, name: []const u8) bool {
+    return copy(src, dst, e, parent, name, true);
 }
-
-pub fn makeDirectory(volume: Volume, parent: NodeRef, name: []const u8) bool {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| fat32.makeDirectory(v, @intCast(parent), name),
-        .ntfs => |v| ntfs_fs.makeDirectory(v, parent, name),
-    };
+pub fn copyFileNoReplace(src: Volume, dst: Volume, e: Entry, parent: NodeRef, name: []const u8) bool {
+    return copy(src, dst, e, parent, name, false);
 }
-
-pub fn deleteFile(volume: Volume, parent: NodeRef, name: []const u8) bool {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| fat32.deleteFile(v, @intCast(parent), name),
-        .ntfs => |v| ntfs_fs.deleteFile(v, parent, name),
-    };
+pub fn copyFileBuffered(src: Volume, dst: Volume, e: Entry, parent: NodeRef, name: []const u8, replace: bool, chunk: []u8, progress: *CopyProgress) bool {
+    const a = ce(e);
+    return run(14, .{ .volume = cv(src), .other = cv(dst), .entry = &a, .parent = parent, .name = bytes(name), .flag = replace, .buffer = chunk.ptr, .buffer_len = chunk.len, .progress = progress }).present;
 }
-
-/// Deletes a file only if the filesystem-specific identity still matches the
-/// entry whose bytes were compared by the caller under the same FS gate.
-pub fn deleteFileIfIdentity(
-    volume: Volume,
-    parent: NodeRef,
-    name: []const u8,
-    expected: Entry,
-) DeleteIfMatchResult {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| switch (fat32.deleteFileIfIdentity(
-            v,
-            @intCast(parent),
-            name,
-            entryToFat32(expected),
-        )) {
-            .deleted => .deleted,
-            .not_found => .not_found,
-            .mismatch => .mismatch,
-            .io => .io,
-        },
-        .ntfs => |v| switch (ntfs_fs.deleteFileIfIdentity(
-            v,
-            parent,
-            name,
-            entryToNtfs(expected),
-        )) {
-            .deleted => .deleted,
-            .not_found => .not_found,
-            .mismatch => .mismatch,
-            .io => .io,
-        },
-    };
+pub fn makeDirectory(v: Volume, parent: NodeRef, name: []const u8) bool {
+    return run(15, .{ .volume = cv(v), .parent = parent, .name = bytes(name) }).present;
 }
-
-/// Recovery-only compare-and-delete, reserved for journal/claim replay.
-///
-/// Alias-first publishing has durable windows in which an index name and the
-/// record's canonical `$FILE_NAME` disagree.  `deleteFileIfIdentity` rejects
-/// those windows on purpose, which would leave a transient stage entry stuck
-/// forever.  This operation resolves the name through the recovery view but
-/// still acts only on an exact backend identity match, so it can never
-/// remove a merely equal-named or since-replaced foreign entry.
-///
-/// FAT32 has no canonical-name/index split and therefore cannot produce the
-/// half-state at all; it reuses the ordinary identity delete unchanged.
-pub fn deleteRecoveryEntryIfIdentity(
-    volume: Volume,
-    parent: NodeRef,
-    name: []const u8,
-    expected: Entry,
-) RecoveryDeleteResult {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| switch (fat32.deleteFileIfIdentity(
-            v,
-            @intCast(parent),
-            name,
-            entryToFat32(expected),
-        )) {
-            .deleted => .deleted,
-            .not_found => .not_found,
-            .mismatch => .mismatch,
-            .io => .io,
-        },
-        .ntfs => |v| switch (ntfs_fs.deleteRecoveryEntryIfIdentity(
-            v,
-            parent,
-            name,
-            entryToNtfs(expected),
-        )) {
-            .deleted => .deleted,
-            .unlinked => .unlinked,
-            .not_found => .not_found,
-            .mismatch => .mismatch,
-            .directory => .directory,
-            .unsupported => .unsupported,
-            .io => .io,
-        },
-    };
+pub fn deleteFile(v: Volume, parent: NodeRef, name: []const u8) bool {
+    return run(16, .{ .volume = cv(v), .parent = parent, .name = bytes(name) }).present;
 }
-
-/// Backend-exact name comparison (0.60.24).
-///
-/// Answers "would these two names resolve to the same object on THIS
-/// volume?" using the filesystem's own collation: NTFS folds through
-/// `$UpCase`, FAT32 folds ASCII case only.  The two genuinely disagree
-/// beyond ASCII, which is why a caller must never fold bytes itself and
-/// call that an identity proof.  `null` means the question could not be
-/// answered (malformed name) and must be treated as a visible failure, never
-/// as "different".
-pub fn namesEqualCollated(volume: Volume, a: []const u8, b: []const u8) ?bool {
-    return switch (volume) {
-        .fat32 => |v| fat32.namesEqualCollated(v, a, b),
-        .ntfs => |v| ntfs_fs.namesEqualCollated(v, a, b),
-    };
+pub fn deleteFileIfIdentity(v: Volume, parent: NodeRef, name: []const u8, expected: Entry) DeleteIfMatchResult {
+    const a = ce(expected);
+    return @enumFromInt(run(17, .{ .volume = cv(v), .parent = parent, .name = bytes(name), .entry = &a }).status);
 }
-
-pub fn removeDirectory(volume: Volume, parent: NodeRef, name: []const u8) bool {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| fat32.removeDirectory(v, @intCast(parent), name),
-        .ntfs => |v| ntfs_fs.removeDirectory(v, parent, name),
-    };
+pub fn deleteRecoveryEntryIfIdentity(v: Volume, parent: NodeRef, name: []const u8, expected: Entry) RecoveryDeleteResult {
+    const a = ce(expected);
+    return @enumFromInt(run(18, .{ .volume = cv(v), .parent = parent, .name = bytes(name), .entry = &a }).status);
 }
-
-pub fn renameEntry(volume: Volume, parent: NodeRef, old_name: []const u8, new_name: []const u8) bool {
-    return renameEntryStatus(volume, parent, old_name, new_name) == .ok;
+pub fn namesEqualCollated(v: Volume, a: []const u8, b: []const u8) ?bool {
+    const r = run(19, .{ .volume = cv(v), .name = bytes(a), .second = bytes(b) });
+    return if (r.present) r.value != 0 else null;
 }
-
-pub fn renameEntryStatus(volume: Volume, parent: NodeRef, old_name: []const u8, new_name: []const u8) RenameStatus {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| renameStatusFromFat32(fat32.renameEntryStatus(v, @intCast(parent), old_name, new_name)),
-        .ntfs => |v| renameStatusFromNtfs(ntfs_fs.renameEntryStatus(v, parent, old_name, new_name)),
-    };
+pub fn removeDirectory(v: Volume, parent: NodeRef, name: []const u8) bool {
+    return run(20, .{ .volume = cv(v), .parent = parent, .name = bytes(name) }).present;
 }
-
-pub fn replaceFileAtomic(
-    volume: Volume,
-    parent: NodeRef,
-    target_name: []const u8,
-    staged_name: []const u8,
-    backup_name: []const u8,
-    consume_stage: bool,
-) AtomicReplaceResult {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| replaceResultFromFat32(fat32.replaceFileAtomic(v, @intCast(parent), target_name, staged_name, backup_name, consume_stage)),
-        .ntfs => |v| replaceResultFromNtfs(ntfs_fs.replaceFileAtomic(v, parent, target_name, staged_name, backup_name, consume_stage)),
-    };
+pub fn renameEntryStatus(v: Volume, parent: NodeRef, a: []const u8, b: []const u8) RenameStatus {
+    return @enumFromInt(run(21, .{ .volume = cv(v), .parent = parent, .name = bytes(a), .second = bytes(b) }).status);
 }
-
-/// Publish a previously staged sibling only when the target and backup were
-/// proven absent. Backends publish the target before detaching the stage and
-/// reconcile ambiguous completion without generic path deletion.
-pub fn replaceFileAtomicCreateOnly(
-    volume: Volume,
-    parent: NodeRef,
-    target_name: []const u8,
-    staged_name: []const u8,
-    backup_name: []const u8,
-) AtomicReplaceResult {
-    defer notifyDirectoryChanged(volume, parent);
-    return switch (volume) {
-        .fat32 => |v| replaceResultFromFat32(fat32.replaceFileAtomicCreateOnly(
-            v,
-            @intCast(parent),
-            target_name,
-            staged_name,
-            backup_name,
-        )),
-        .ntfs => |v| replaceResultFromNtfs(ntfs_fs.replaceFileAtomicCreateOnly(
-            v,
-            parent,
-            target_name,
-            staged_name,
-            backup_name,
-        )),
-    };
+pub fn renameEntry(v: Volume, parent: NodeRef, a: []const u8, b: []const u8) bool {
+    return renameEntryStatus(v, parent, a, b) == .ok;
 }
-
-fn replaceResultFromNtfs(result: ntfs_fs.ReplaceResult) AtomicReplaceResult {
-    return switch (result) {
-        .ok => .ok,
-        .invalid => .invalid,
-        .not_found => .not_found,
-        .alias => .alias,
-        .conflict => .conflict,
-        .read_only => .read_only,
-        .io => .io,
-        .not_atomic => .not_atomic,
-    };
+pub fn replaceFileAtomic(v: Volume, parent: NodeRef, target: []const u8, staged: []const u8, backup: []const u8, consume_stage: bool) AtomicReplaceResult {
+    return @enumFromInt(run(22, .{ .volume = cv(v), .parent = parent, .name = bytes(target), .second = bytes(staged), .third = bytes(backup), .flag = consume_stage }).status);
 }
-
-pub fn flushVolume(volume: Volume) bool {
-    return switch (volume) {
-        .fat32 => |v| fat32.flushVolume(v),
-        // Durability point of the deferred NTFS stream path (0.60.14).
-        .ntfs => |v| ntfs_fs.flushVolume(v),
-    };
+pub fn replaceFileAtomicCreateOnly(v: Volume, parent: NodeRef, target: []const u8, staged: []const u8, backup: []const u8) AtomicReplaceResult {
+    return @enumFromInt(run(23, .{ .volume = cv(v), .parent = parent, .name = bytes(target), .second = bytes(staged), .third = bytes(backup) }).status);
 }
-
-pub fn readDirectory(volume: Volume, dir: NodeRef, out: []u8) ?usize {
-    return switch (volume) {
-        .fat32 => |v| fat32.readDirectory(v, @intCast(dir), out),
-        .ntfs => |v| ntfs_fs.readDirectory(v, dir, out),
-    };
+pub fn flushVolume(v: Volume) bool {
+    return run(24, .{ .volume = cv(v) }).present;
 }
-
-pub fn readDirectoryEntry(volume: Volume, dir: NodeRef, index: usize, out: []u8) ?Entry {
-    var entry: Entry = undefined;
-    return if (readDirectoryEntryStatus(volume, dir, index, out, &entry) == .found)
-        entry
-    else
-        null;
+pub fn readDirectory(v: Volume, dir: NodeRef, out: []u8) ?usize {
+    return optional(run(25, .{ .volume = cv(v), .parent = dir, .buffer = out.ptr, .buffer_len = out.len }));
 }
-
-pub fn readDirectoryEntryStatus(volume: Volume, dir: NodeRef, index: usize, out: []u8, entry_out: *Entry) LookupStatus {
-    return switch (volume) {
-        .fat32 => |v| blk: {
-            var entry: fat32.Entry = undefined;
-            const status = lookupStatusFromFat32(fat32.readDirectoryEntryStatus(v, @intCast(dir), index, out, &entry));
-            if (status == .found) entry_out.* = entryFromFat32(entry);
-            break :blk status;
-        },
-        .ntfs => |v| blk: {
-            var entry: ntfs_fs.Entry = undefined;
-            const status = lookupStatusFromNtfs(ntfs_fs.readDirectoryEntryStatus(v, dir, index, out, &entry));
-            if (status == .found) entry_out.* = entryFromNtfs(entry);
-            break :blk status;
-        },
-    };
+pub fn readDirectoryEntryStatus(v: Volume, dir: NodeRef, index: usize, out: []u8, e: *Entry) LookupStatus {
+    return found(26, .{ .volume = cv(v), .parent = dir, .index = index, .buffer = out.ptr, .buffer_len = out.len }, e);
 }
-
+pub fn readDirectoryEntry(v: Volume, dir: NodeRef, index: usize, out: []u8) ?Entry {
+    var e: Entry = undefined;
+    return if (readDirectoryEntryStatus(v, dir, index, out, &e) == .found) e else null;
+}
 pub const DirectoryNextStatus = enum { found, not_found, again, io };
-pub fn nextDirectoryEntry(volume: Volume, dir: NodeRef, state: *[128]u64, out: *Entry) DirectoryNextStatus {
-    comptime {
-        if (@sizeOf(fat32.DirectoryCursor) > 1024 or @sizeOf(ntfs_fs.DirectoryCursor) > 1024) @compileError("directory cursor exceeds contract");
-    }
-    return switch (volume) {
-        .fat32 => |v| blk: {
-            if (dir > 0xffffffff) break :blk .io;
-            var entry: fat32.Entry = undefined;
-            const status = fat32.nextDirectoryEntry(v, @intCast(dir), @ptrCast(state), &entry);
-            if (status == .found) out.* = entryFromFat32(entry);
-            break :blk switch (status) {
-                .found => .found,
-                .not_found => .not_found,
-                .again => .again,
-                .io => .io,
-            };
-        },
-        .ntfs => |v| blk: {
-            var entry: ntfs_fs.Entry = undefined;
-            const status = ntfs_fs.nextDirectoryEntry(v, dir, @ptrCast(state), &entry);
-            if (status == .found) out.* = entryFromNtfs(entry);
-            break :blk switch (status) {
-                .found => .found,
-                .not_found => .not_found,
-                .again => .again,
-                .io => .io,
-            };
-        },
-    };
+pub fn nextDirectoryEntry(v: Volume, dir: NodeRef, state: *[128]u64, out: *Entry) DirectoryNextStatus {
+    var e: CEntry = undefined;
+    const result = r4os_rust_vfs_run(27, &.{ .volume = cv(v), .parent = dir, .cursor = state }, &e);
+    if (result.status == 0) out.* = fromCe(e);
+    return @enumFromInt(result.status);
 }
-
-pub fn freeClusterCount(volume: Volume) ?u32 {
-    return switch (volume) {
-        .fat32 => |v| fat32.freeClusterCount(v),
-        .ntfs => |v| ntfs_fs.freeClusterCount(v),
-    };
+pub fn freeClusterCount(v: Volume) ?u32 {
+    const r = run(28, .{ .volume = cv(v) });
+    return if (r.present) @intCast(r.value) else null;
 }
-
-pub fn listRoot(volume: Volume) bool {
-    return switch (volume) {
-        .fat32 => |v| fat32.listRoot(v),
-        .ntfs => |v| ntfs_fs.listRoot(v),
-    };
+pub fn listRoot(v: Volume) bool {
+    return run(29, .{ .volume = cv(v) }).present;
 }
-
-/// Stage/backup naming contract of the atomic replace path: names must stay
-/// short-name-safe on every filesystem backend.
 pub fn validateShortName83(name: []const u8) bool {
-    return fat32.validateShortName83(name);
+    return run(30, .{ .name = bytes(name) }).present;
 }
 
 fn entryFromFat32(entry: fat32.Entry) Entry {
@@ -896,85 +497,201 @@ fn entryToNtfs(entry: Entry) ntfs_fs.Entry {
     return out;
 }
 
-fn appendStatusFromFat32(status: fat32.AppendStatus) AppendStatus {
-    return switch (status) {
-        .ok => .ok,
-        .invalid => .invalid,
-        .not_found => .not_found,
-        .offset_mismatch => .offset_mismatch,
-        .too_large => .too_large,
-        .io => .io,
+// Raw backend leaves. All neutral routing, identity, status and lifecycle
+// decisions belong to Rust. These functions only project values and call
+// the existing filesystem owner; no mount table or generic policy lives here.
+fn boolean(value: bool) Result {
+    return .{ .present = value };
+}
+fn code(value: anytype) Result {
+    return .{ .status = @intFromEnum(value) };
+}
+fn number(value: ?usize) Result {
+    return if (value) |n| .{ .value = n, .present = true } else .{};
+}
+fn outputBuffer(a: *const Args) []u8 {
+    return a.buffer.?[0..a.buffer_len];
+}
+fn fatEntry(a: *const CEntry) fat32.Entry {
+    return entryToFat32(fromCe(a.*));
+}
+fn ntfsEntry(a: *const CEntry) ntfs_fs.Entry {
+    return entryToNtfs(fromCe(a.*));
+}
+
+export fn r4os_zig_vfs_fat(operation: u8, a: *const Args, out: ?*CEntry) Result {
+    // Each raw operation keeps its own stack frame. Inlining all backend
+    // branches into this dispatcher exhausts the shared 64-KB task stack.
+    return switch (operation) {
+        inline 0, 1, 2, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 34 => |selected| fatLeaf(selected, a, out),
+        else => unreachable,
     };
 }
-
-fn lookupStatusFromFat32(status: fat32.LookupStatus) LookupStatus {
-    return switch (status) {
-        .found => .found,
-        .not_found => .not_found,
-        .io => .io,
+noinline fn fatLeaf(comptime operation: u8, a: *const Args, out: ?*CEntry) Result {
+    const v = volume(a.volume).fat32;
+    return switch (operation) {
+        0 => blk: {
+            var node: u32 = undefined;
+            const status = fat32.resolvePathStatus(v, a.name.text(), &node);
+            var r = code(status);
+            if (status == .found) r.value = node;
+            break :blk r;
+        },
+        1 => blk: {
+            var e: fat32.Entry = undefined;
+            const status = fat32.resolveEntryStatus(v, a.name.text(), &e);
+            if (status == .found) out.?.* = ce(entryFromFat32(e));
+            break :blk code(status);
+        },
+        2 => blk: {
+            var e: fat32.Entry = undefined;
+            const status = fat32.findEntryStatus(v, @intCast(a.parent), a.name.text(), &e);
+            if (status == .found) out.?.* = ce(entryFromFat32(e));
+            break :blk code(status);
+        },
+        5 => number(fat32.readFile(v, fatEntry(a.entry.?), outputBuffer(a))),
+        6 => number(fat32.readFileRange(v, fatEntry(a.entry.?), @intCast(a.offset), outputBuffer(a))),
+        7 => number(fat32.writeFileRange(v, fatEntry(a.entry.?), @intCast(a.offset), a.data.text())),
+        8 => boolean(fat32.writeFile(v, @intCast(a.parent), a.name.text(), a.data.text())),
+        9 => boolean(fat32.appendFile(v, @intCast(a.parent), a.name.text(), a.data.text())),
+        10 => code(fat32.appendFileAtOffsetStatus(v, @intCast(a.parent), a.name.text(), @intCast(a.offset), a.data.text())),
+        11 => code(fat32.appendFileAtOffsetStatusDeferred(v, @intCast(a.parent), a.name.text(), @intCast(a.offset), a.data.text())),
+        12 => boolean(fat32.publishCopyFile(v, @intCast(a.parent), a.name.text(), a.second.text())),
+        13 => boolean(fat32.copyFile(v, volume(a.other).fat32, fatEntry(a.entry.?), @intCast(a.parent), a.name.text())),
+        15 => boolean(fat32.makeDirectory(v, @intCast(a.parent), a.name.text())),
+        16 => boolean(fat32.deleteFile(v, @intCast(a.parent), a.name.text())),
+        17 => code(fat32.deleteFileIfIdentity(v, @intCast(a.parent), a.name.text(), fatEntry(a.entry.?))),
+        19 => blk: {
+            const answer = fat32.namesEqualCollated(v, a.name.text(), a.second.text()) orelse break :blk Result{};
+            break :blk .{ .value = @intFromBool(answer), .present = true };
+        },
+        20 => boolean(fat32.removeDirectory(v, @intCast(a.parent), a.name.text())),
+        21 => code(fat32.renameEntryStatus(v, @intCast(a.parent), a.name.text(), a.second.text())),
+        22 => code(fat32.replaceFileAtomic(v, @intCast(a.parent), a.name.text(), a.second.text(), a.third.text(), a.flag)),
+        23 => code(fat32.replaceFileAtomicCreateOnly(v, @intCast(a.parent), a.name.text(), a.second.text(), a.third.text())),
+        24 => boolean(fat32.flushVolume(v)),
+        25 => number(fat32.readDirectory(v, @intCast(a.parent), outputBuffer(a))),
+        26 => blk: {
+            var e: fat32.Entry = undefined;
+            const status = fat32.readDirectoryEntryStatus(v, @intCast(a.parent), a.index, outputBuffer(a), &e);
+            if (status == .found) out.?.* = ce(entryFromFat32(e));
+            break :blk code(status);
+        },
+        27 => blk: {
+            var e: fat32.Entry = undefined;
+            const cursor: *fat32.DirectoryCursor = @ptrCast(@alignCast(a.cursor.?));
+            const status = fat32.nextDirectoryEntry(v, @intCast(a.parent), cursor, &e);
+            if (status == .found) out.?.* = ce(entryFromFat32(e));
+            break :blk code(status);
+        },
+        28 => blk: {
+            const free = fat32.freeClusterCount(v) orelse break :blk Result{};
+            break :blk .{ .value = free, .present = true };
+        },
+        29 => boolean(fat32.listRoot(v)),
+        30 => boolean(fat32.validateShortName83(a.name.text())),
+        31 => boolean(fat32.sameFileForCopy(fatEntry(a.entry.?), fatEntry(a.peer.?))),
+        34 => boolean(fat32.copyFileNoReplace(v, volume(a.other).fat32, fatEntry(a.entry.?), @intCast(a.parent), a.name.text())),
+        else => unreachable,
     };
 }
-
-fn lookupStatusFromNtfs(status: ntfs_fs.LookupStatus) LookupStatus {
-    return switch (status) {
-        .found => .found,
-        .not_found => .not_found,
-        .io => .io,
+export fn r4os_zig_vfs_ntfs(operation: u8, a: *const Args, out: ?*CEntry) Result {
+    // Each raw operation keeps its own stack frame. Inlining all backend
+    // branches into this dispatcher exhausts the shared 64-KB task stack.
+    return switch (operation) {
+        inline 0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 12, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 32 => |selected| ntfsLeaf(selected, a, out),
+        else => unreachable,
     };
 }
-
-fn renameStatusFromFat32(status: fat32.RenameStatus) RenameStatus {
-    return switch (status) {
-        .ok => .ok,
-        .not_found => .not_found,
-        .not_atomic => .not_atomic,
-        .conflict, .read_only => .conflict,
-        .io => .io,
+noinline fn ntfsLeaf(comptime operation: u8, a: *const Args, out: ?*CEntry) Result {
+    const v = volume(a.volume).ntfs;
+    return switch (operation) {
+        0 => blk: {
+            var node: u64 = undefined;
+            const status = ntfs_fs.resolvePathStatus(v, a.name.text(), &node);
+            var r = code(status);
+            if (status == .found) r.value = node;
+            break :blk r;
+        },
+        1 => blk: {
+            var e: ntfs_fs.Entry = undefined;
+            const status = ntfs_fs.resolveEntryStatus(v, a.name.text(), &e);
+            if (status == .found) out.?.* = ce(entryFromNtfs(e));
+            break :blk code(status);
+        },
+        2 => blk: {
+            var e: ntfs_fs.Entry = undefined;
+            const status = ntfs_fs.lookupEntryStatus(v, a.parent, a.name.text(), &e);
+            if (status == .found) out.?.* = ce(entryFromNtfs(e));
+            break :blk code(status);
+        },
+        3 => blk: {
+            var e: ntfs_fs.Entry = undefined;
+            const status = ntfs_fs.lookupRecoveryEntryStatus(v, a.parent, a.name.text(), &e);
+            if (status == .found) out.?.* = ce(entryFromNtfs(e));
+            break :blk code(status);
+        },
+        4 => .{ .value = ntfs_fs.lookupDiagnosticStage(), .present = true },
+        5 => number(ntfs_fs.readFile(v, ntfsEntry(a.entry.?), outputBuffer(a))),
+        6 => number(ntfs_fs.readFileRange(v, ntfsEntry(a.entry.?), @intCast(a.offset), outputBuffer(a))),
+        7 => number(ntfs_fs.writeFileRange(v, ntfsEntry(a.entry.?), @intCast(a.offset), a.data.text())),
+        8 => boolean(ntfs_fs.writeFile(v, a.parent, a.name.text(), a.data.text())),
+        10 => code(ntfs_fs.appendFileAtOffset(v, a.parent, a.name.text(), a.offset, a.data.text())),
+        11 => code(ntfs_fs.appendFileAtOffsetDeferred(v, a.parent, a.name.text(), a.offset, a.data.text())),
+        12 => code(ntfs_fs.renameEntryStatus(v, a.parent, a.name.text(), a.second.text())),
+        15 => boolean(ntfs_fs.makeDirectory(v, a.parent, a.name.text())),
+        16 => boolean(ntfs_fs.deleteFile(v, a.parent, a.name.text())),
+        17 => code(ntfs_fs.deleteFileIfIdentity(v, a.parent, a.name.text(), ntfsEntry(a.entry.?))),
+        18 => code(ntfs_fs.deleteRecoveryEntryIfIdentity(v, a.parent, a.name.text(), ntfsEntry(a.entry.?))),
+        19 => blk: {
+            const answer = ntfs_fs.namesEqualCollated(v, a.name.text(), a.second.text()) orelse break :blk Result{};
+            break :blk .{ .value = @intFromBool(answer), .present = true };
+        },
+        20 => boolean(ntfs_fs.removeDirectory(v, a.parent, a.name.text())),
+        21 => code(ntfs_fs.renameEntryStatus(v, a.parent, a.name.text(), a.second.text())),
+        22 => code(ntfs_fs.replaceFileAtomic(v, a.parent, a.name.text(), a.second.text(), a.third.text(), a.flag)),
+        23 => code(ntfs_fs.replaceFileAtomicCreateOnly(v, a.parent, a.name.text(), a.second.text(), a.third.text())),
+        24 => boolean(ntfs_fs.flushVolume(v)),
+        25 => number(ntfs_fs.readDirectory(v, a.parent, outputBuffer(a))),
+        26 => blk: {
+            var e: ntfs_fs.Entry = undefined;
+            const status = ntfs_fs.readDirectoryEntryStatus(v, a.parent, a.index, outputBuffer(a), &e);
+            if (status == .found) out.?.* = ce(entryFromNtfs(e));
+            break :blk code(status);
+        },
+        27 => blk: {
+            var e: ntfs_fs.Entry = undefined;
+            const cursor: *ntfs_fs.DirectoryCursor = @ptrCast(@alignCast(a.cursor.?));
+            const status = ntfs_fs.nextDirectoryEntry(v, a.parent, cursor, &e);
+            if (status == .found) out.?.* = ce(entryFromNtfs(e));
+            break :blk code(status);
+        },
+        28 => blk: {
+            const free = ntfs_fs.freeClusterCount(v) orelse break :blk Result{};
+            break :blk .{ .value = free, .present = true };
+        },
+        29 => boolean(ntfs_fs.listRoot(v)),
+        32 => .{ .value = ntfs_fs.childSize(v, a.parent, a.name.text()), .present = true },
+        else => unreachable,
     };
 }
-
-fn renameStatusFromNtfs(status: ntfs_fs.RenameStatus) RenameStatus {
-    return switch (status) {
-        .ok => .ok,
-        .not_found => .not_found,
-        .not_atomic => .not_atomic,
-        .conflict => .conflict,
-        .io => .io,
-    };
+export fn r4os_zig_vfs_location(v: *const CVolume, out: *Location) bool {
+    const value = ntfs_fs.storageLocation(volume(v.*).ntfs) orelse return false;
+    out.* = .{ .device = value.device, .first = value.first, .count = value.count };
+    return true;
 }
-
-fn appendStatusFromNtfs(status: ntfs_fs.WriteStatus) AppendStatus {
-    return switch (status) {
-        .ok => .ok,
-        .invalid, .directory, .not_directory, .not_empty, .read_only_target, .unsupported => .invalid,
-        .not_found => .not_found,
-        .exists => .invalid,
-        .offset_mismatch => .offset_mismatch,
-        .no_space, .dir_full, .record_full => .too_large,
-        .io, .cleanup_failed => .io,
-    };
+export fn r4os_zig_vfs_activity() void {
+    @import("../kernel/desktop_events.zig").signal();
 }
-
-fn replaceResultFromFat32(result: fat32.AtomicReplaceResult) AtomicReplaceResult {
-    return switch (result) {
-        .ok => .ok,
-        .invalid => .invalid,
-        .not_found => .not_found,
-        .alias => .alias,
-        .conflict => .conflict,
-        .read_only => .read_only,
-        .io => .io,
-        .not_atomic => .not_atomic,
-    };
-}
-
-fn driveIndex(letter: u8) ?usize {
-    const upper = upperLetter(letter);
-    if (upper < 'A' or upper > 'Z') return null;
-    return @as(usize, upper - 'A');
-}
-
-fn upperLetter(letter: u8) u8 {
-    if (letter >= 'a' and letter <= 'z') return letter - ('a' - 'A');
-    return letter;
+comptime {
+    if (@sizeOf(Fat) != 48 or @sizeOf(Ntfs) != 16 or @sizeOf(CVolume) != 88 or @sizeOf(CEntry) != 840 or @sizeOf(Result) != 16)
+        @compileError("Native VFS private C layout changed");
+    if (@sizeOf(fat32.DirectoryCursor) > 1024 or @sizeOf(ntfs_fs.DirectoryCursor) > 1024)
+        @compileError("directory cursor exceeds contract");
+    if (@import("ntfs_format").MFT_RECORD_ROOT != 5)
+        @compileError("Native VFS NTFS root record changed");
+    if (@intFromEnum(fat32.RenameStatus.read_only) != 4 or @intFromEnum(fat32.RenameStatus.io) != 5 or
+        @intFromEnum(ntfs_fs.WriteStatus.offset_mismatch) != 12 or @intFromEnum(ntfs_fs.WriteStatus.cleanup_failed) != 14 or
+        @intFromEnum(ntfs_fs.ReplaceResult.io) != 6)
+        @compileError("Native VFS raw backend status mapping changed");
 }

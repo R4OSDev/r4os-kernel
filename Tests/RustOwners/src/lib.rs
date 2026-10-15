@@ -1,5 +1,7 @@
 #![no_std]
 pub use r4os_contract as contract;
+#[path = "../../../Rust/fs/mod.rs"]
+pub mod fs;
 // The existing Zig fixtures call the exact migrated owner implementations.
 // This host-only archive has no boot entry, MMIO execution or kernel runtime.
 #[path = "../../../Rust/memory/blocks.rs"]

@@ -104,7 +104,7 @@ export fn r4os_zig_inventory_scalar(operation: u8, argument: u64) callconv(.c) u
         2 => @intFromBool(drive.get(@intCast(argument)) != null),
         3 => blk: {
             const mounted = drive.get(@truncate(argument)) orelse break :blk 0;
-            break :blk @intFromBool(mounted.block_device_index != null and mounted.block_device_index.? == (argument >> 8));
+            break :blk @intFromBool(mounted.blockDeviceIndex() != null and mounted.blockDeviceIndex().? == (argument >> 8));
         },
         4 => @intFromBool(block.isBusVisible(.usb)),
         5 => driver_registry.MAX_DRIVERS,

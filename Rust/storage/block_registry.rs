@@ -564,3 +564,26 @@ const _: () = {
     assert!(core::mem::size_of::<Identity>() == 160);
     assert!(core::mem::size_of::<WriteLimits>() == 24);
 };
+
+// Immutable cache capability snapshot, protected by the existing registry owner.
+#[derive(Clone, Copy)]
+pub(crate) struct CacheView {
+    pub sector_bytes: u32,
+    pub sectors: u64,
+    pub max_sectors: u16,
+    pub owns_retry: bool,
+}
+pub(crate) fn cache_view(index: usize) -> Option<CacheView> {
+    let _owner = Guard::acquire(1);
+    let r = unsafe { &*REGISTRY.0.get() };
+    if index >= r.slot_count || !visible(r.slots[index], r.excluded) {
+        return None;
+    }
+    let info = r.slots[index].info;
+    Some(CacheView {
+        sector_bytes: info.sector_bytes,
+        sectors: info.sectors,
+        max_sectors: info.max_sectors,
+        owns_retry: info.owns_retry,
+    })
+}
