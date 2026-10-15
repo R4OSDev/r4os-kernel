@@ -1,18 +1,18 @@
-// Versioned BOOT:/boot/r4os-installation.json. Parsing is host-independent;
-// disk I/O and drive assignment belong to the boot/mount owner.
+// Stateless manifestation facade. Rust owns all installation rules/matching;
+// Zig std JSON is only a temporary generic decoder with the original allocator.
 const std = @import("std");
+const builtin = @import("builtin");
+comptime {
+    if (builtin.is_test) {
+        _ = @import("rust_owner_test");
+    }
+}
 const tables = @import("partition_table.zig");
 pub const guid = tables.guid;
 pub const max_bytes = 16384;
 pub const Role = enum { BIOSBOOT, BOOT, SYSTEM, RECOVERY, DATA };
-
-pub const Part = struct {
-    partition_guid: guid.Guid = guid.zero,
-    type_guid: guid.Guid = guid.zero,
-    first_lba: u64 = 0,
-    sector_count: u64 = 0,
-};
-pub const Manifest = struct {
+pub const Part = extern struct { partition_guid: guid.Guid = guid.zero, type_guid: guid.Guid = guid.zero, first_lba: u64 = 0, sector_count: u64 = 0 };
+pub const Manifest = extern struct {
     installation_id: guid.Guid = guid.zero,
     disk_guid: guid.Guid = guid.zero,
     partitions: [5]Part = .{Part{}} ** 5,
@@ -20,108 +20,89 @@ pub const Manifest = struct {
         return &self.partitions[@intFromEnum(role)];
     }
 };
-
+const Label = extern struct { ptr: [*]const u8, len: usize };
+const TableView = extern struct { valid: bool, kind: u8, disk_guid: guid.Guid, partitions: [*]const tables.Partition, count: usize };
+const JsonMeta = extern struct { found: bool = false, kind: u8 = 0, child: ?*const anyopaque = null, text: [*]const u8 = "", len: usize = 0 };
+const JsonReader = *const fn (*const anyopaque, u8, [*]const u8, usize, usize, *JsonMeta) callconv(.c) void;
+extern fn r4os_rust_installation_text([*]const u8, usize, *Label) callconv(.c) i32;
+extern fn r4os_rust_installation_parse(*const anyopaque, JsonReader, *Manifest) callconv(.c) i32;
+extern fn r4os_rust_installation_matches(*const Manifest, *const TableView, *const guid.Guid) callconv(.c) bool;
+fn check(status: i32) !void {
+    switch (status) {
+        0 => {},
+        1 => return error.ManifestSize,
+        2 => return error.UnsupportedSchema,
+        3 => return error.UnsupportedSectorSize,
+        4 => return error.ExpectedObject,
+        5 => return error.MissingField,
+        6 => return error.ExpectedString,
+        7 => return error.InvalidGuid,
+        8 => return error.ExpectedInteger,
+        9 => return error.IntegerOverflow,
+        10 => return error.PartitionRoles,
+        11 => return error.PartitionRange,
+        12 => return error.PartitionType,
+        13 => return error.DuplicatePartitionGuid,
+        14 => return error.PartitionOverlap,
+        15 => return error.BootFiles,
+        16 => return error.BootPath,
+        17 => return error.DuplicateBootPath,
+        18 => return error.Version,
+        else => unreachable,
+    }
+}
+// Pure generic DOM projection: no R4OS field names, GUIDs, ranges or policy.
+fn describe(node: *const std.json.Value, out: *JsonMeta) void {
+    out.* = .{ .found = true, .child = node };
+    switch (node.*) {
+        .object => |object| {
+            out.kind = 1;
+            out.len = object.count();
+        },
+        .array => |array| {
+            out.kind = 2;
+            out.len = array.items.len;
+        },
+        .string => |text| {
+            out.kind = 3;
+            out.text = text.ptr;
+            out.len = text.len;
+        },
+        .number_string => |text| {
+            out.kind = 4;
+            out.text = text.ptr;
+            out.len = text.len;
+        },
+        else => {},
+    }
+}
+fn readJson(raw: *const anyopaque, operation: u8, key: [*]const u8, key_len: usize, index: usize, out: *JsonMeta) callconv(.c) void {
+    const node: *const std.json.Value = @ptrCast(@alignCast(raw));
+    out.* = .{};
+    switch (operation) {
+        0 => describe(node, out),
+        1 => if (node.* == .object) {
+            if (node.object.getPtr(key[0..key_len])) |child| describe(child, out);
+        },
+        2 => if (node.* == .array and index < node.array.items.len) {
+            describe(&node.array.items[index], out);
+        },
+        else => unreachable,
+    }
+}
 pub fn parse(allocator: std.mem.Allocator, input: []const u8) !Manifest {
-    if (input.len == 0 or input.len > max_bytes) return error.ManifestSize;
-    const text = if (std.mem.startsWith(u8, input, "\xef\xbb\xbf")) input[3..] else input;
-    const doc = try std.json.parseFromSlice(std.json.Value, allocator, text, .{ .parse_numbers = false, .duplicate_field_behavior = .@"error" });
+    var text: Label = undefined;
+    try check(r4os_rust_installation_text(input.ptr, input.len, &text));
+    const doc = try std.json.parseFromSlice(std.json.Value, allocator, text.ptr[0..text.len], .{ .parse_numbers = false, .duplicate_field_behavior = .@"error" });
     defer doc.deinit();
-    const root = doc.value;
-    if (try uint(try field(root, "schema")) != 1) return error.UnsupportedSchema;
-    if (try uint(try field(root, "logicalSectorBytes")) != 512) return error.UnsupportedSectorSize;
-    var result = Manifest{
-        .installation_id = try uuid(try field(root, "installationId")),
-        .disk_guid = try uuid(try field(root, "diskGuid")),
-    };
-    const parts = try field(root, "partitions");
-    if (parts != .object or parts.object.count() != 5) return error.PartitionRoles;
-    inline for (std.meta.fields(Role)) |role| {
-        const obj = try field(parts, role.name);
-        result.partitions[role.value] = .{
-            .partition_guid = try uuid(try field(obj, "partitionGuid")),
-            .type_guid = try uuid(try field(obj, "typeGuid")),
-            .first_lba = try uint(try field(obj, "firstLba")),
-            .sector_count = try uint(try field(obj, "sectorCount")),
-        };
-        const p = result.partitions[role.value];
-        if (p.first_lba == 0 or p.sector_count == 0 or p.sector_count > std.math.maxInt(u64) - p.first_lba) return error.PartitionRange;
-        const expected = switch (@as(Role, @enumFromInt(role.value))) {
-            .BIOSBOOT => tables.bios_boot_guid,
-            .BOOT => tables.esp_guid,
-            else => tables.basic_guid,
-        };
-        if (!guid.eql(p.type_guid, expected)) return error.PartitionType;
-    }
-    for (result.partitions, 0..) |p, i| for (result.partitions[0..i]) |other| {
-        if (guid.eql(p.partition_guid, other.partition_guid)) return error.DuplicatePartitionGuid;
-        if (p.first_lba < other.first_lba + other.sector_count and other.first_lba < p.first_lba + p.sector_count) return error.PartitionOverlap;
-    };
-    const files = try field(root, "bootFiles");
-    if (files != .array or files.array.items.len == 0 or files.array.items.len > 64) return error.BootFiles;
-    for (files.array.items, 0..) |value, i| {
-        const path = try string(value);
-        if (!validBootPath(path)) return error.BootPath;
-        for (files.array.items[0..i]) |other| if (std.ascii.eqlIgnoreCase(path, try string(other))) return error.DuplicateBootPath;
-    }
-    if (!validVersion(try string(try field(root, "releaseVersion"))) or !validVersion(try string(try field(root, "kernelVersion")))) return error.Version;
-    return result;
+    var out: Manifest = undefined;
+    try check(r4os_rust_installation_parse(&doc.value, readJson, &out));
+    return out;
 }
-
 pub fn matches(manifest: *const Manifest, table: *const tables.Table, boot_guid: guid.Guid) bool {
-    if (!table.valid or table.kind != .gpt or !guid.eql(manifest.disk_guid, table.disk_guid) or !guid.eql(manifest.part(.BOOT).partition_guid, boot_guid)) return false;
-    for (manifest.partitions) |part| {
-        var found = false;
-        for (table.items()) |p| {
-            if (!guid.eql(part.partition_guid, p.unique_guid)) continue;
-            if (!guid.eql(part.type_guid, p.type_guid) or part.first_lba != p.first_lba or part.sector_count != p.sector_count) return false;
-            found = true;
-        }
-        if (!found) return false;
-    }
-    return true;
+    const view = TableView{ .valid = table.valid, .kind = @intFromEnum(table.kind), .disk_guid = table.disk_guid, .partitions = &table.partitions, .count = table.count };
+    return r4os_rust_installation_matches(manifest, &view, &boot_guid);
 }
-
-fn field(value: std.json.Value, key: []const u8) !std.json.Value {
-    if (value != .object) return error.ExpectedObject;
-    return value.object.get(key) orelse error.MissingField;
-}
-fn string(value: std.json.Value) ![]const u8 {
-    if (value != .string) return error.ExpectedString;
-    return value.string;
-}
-fn uuid(value: std.json.Value) !guid.Guid {
-    const result = guid.parse(try string(value)) orelse return error.InvalidGuid;
-    if (guid.isZero(result)) return error.InvalidGuid;
-    return result;
-}
-fn uint(value: std.json.Value) !u64 {
-    if (value != .number_string) return error.ExpectedInteger;
-    const text = value.number_string;
-    if (text.len == 0) return error.ExpectedInteger;
-    for (text) |c| if (c < '0' or c > '9') return error.ExpectedInteger;
-    return std.fmt.parseInt(u64, text, 10) catch error.IntegerOverflow;
-}
-fn validVersion(text: []const u8) bool {
-    if (text.len == 0 or text.len > 63) return false;
-    var dots: usize = 0;
-    var digits: usize = 0;
-    for (text) |c| {
-        if (c == '.') {
-            if (digits == 0) return false;
-            dots += 1;
-            digits = 0;
-        } else if (c >= '0' and c <= '9') {
-            digits += 1;
-        } else return false;
-    }
-    return dots == 2 and digits != 0;
-}
-fn validBootPath(path: []const u8) bool {
-    if (path.len == 0 or path.len > 255) return false;
-    var components = std.mem.splitScalar(u8, path, '/');
-    while (components.next()) |part| {
-        if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return false;
-        for (part) |c| if (c < 32 or c == ':' or c == '\\') return false;
-    }
-    return true;
+comptime {
+    if (@sizeOf(Part) != 48 or @sizeOf(Manifest) != 272 or @sizeOf(TableView) != 40 or @sizeOf(JsonMeta) != 32) @compileError("Native installation JSON/manifest C layout differs");
 }

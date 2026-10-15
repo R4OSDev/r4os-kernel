@@ -12,3 +12,4 @@ pub mod driver;
 pub mod memory;
 pub mod platform;
 pub mod sched;
+pub mod storage;

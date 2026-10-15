@@ -1,146 +1,65 @@
 const std = @import("std");
-
+const owner_test = if (@import("builtin").is_test) @import("rust_owner_test") else struct {};
+comptime {
+    if (@import("builtin").is_test) _ = owner_test;
+}
 pub const max_controllers: usize = 8;
 pub const max_controller_name: usize = 32;
 pub const no_lane: u8 = 0xFF;
-
-pub const BufferOwnership = enum(u8) {
-    none,
-    bounce_owned,
-    borrowed_resident,
-};
-
-pub const ActiveTimeoutAction = enum(u8) {
-    detach,
-    detach_with_buffer,
-    wait_for_completion,
-};
-
+pub const BufferOwnership = enum(u8) { none, bounce_owned, borrowed_resident };
+pub const ActiveTimeoutAction = enum(u8) { detach, detach_with_buffer, wait_for_completion };
 pub fn activeTimeoutAction(ownership: BufferOwnership) ActiveTimeoutAction {
-    return switch (ownership) {
-        .none => .detach,
-        .bounce_owned => .detach_with_buffer,
-        .borrowed_resident => .wait_for_completion,
-    };
+    return @enumFromInt(r4os_rust_storage_timeout_action(@intFromEnum(ownership)));
 }
-
-pub const Completion = struct {
-    result: i32 = 0,
-    bytes: u32 = 0,
-};
-
-// IRQ callbacks only claim this latch; the owning block worker consumes the
-// publication and performs queue, buffer and waiter teardown.  A handle is
-// never accepted twice and invalidation happens before a request slot can be
-// reused.
-pub const CompletionLatch = struct {
+pub const Completion = extern struct { result: i32 = 0, bytes: u32 = 0 };
+pub const CompletionLatch = extern struct {
     handle: u64 = 0,
     claimed: bool = false,
     ready: bool = false,
     result: i32 = 0,
     bytes: u32 = 0,
-
     pub fn activate(self: *CompletionLatch, handle: u64) bool {
-        if (handle == 0) return false;
-        self.* = .{ .handle = handle };
-        return true;
+        return r4os_rust_storage_latch(self, 0, handle, 0, 0, null);
     }
-
     pub fn publish(self: *CompletionLatch, handle: u64, result: i32, bytes: u32) bool {
-        if (handle == 0 or self.handle != handle or self.claimed) return false;
-        self.claimed = true;
-        self.ready = true;
-        self.result = result;
-        self.bytes = bytes;
-        return true;
+        return r4os_rust_storage_latch(self, 1, handle, result, bytes, null);
     }
-
-    // Used when submit rejects a request before ownership reaches hardware.
-    // An inline completion published by the backend wins the race.
     pub fn rejectSubmission(self: *CompletionLatch, handle: u64) bool {
-        if (handle == 0 or self.handle != handle or self.claimed) return false;
-        self.claimed = true;
-        return true;
+        return r4os_rust_storage_latch(self, 2, handle, 0, 0, null);
     }
-
     pub fn take(self: *CompletionLatch) ?Completion {
-        if (!self.ready) return null;
-        self.ready = false;
-        return .{ .result = self.result, .bytes = self.bytes };
+        var out: Completion = undefined;
+        return if (r4os_rust_storage_latch(self, 3, 0, 0, 0, &out)) out else null;
     }
-
     pub fn invalidate(self: *CompletionLatch) void {
-        self.* = .{};
+        _ = r4os_rust_storage_latch(self, 4, 0, 0, 0, null);
     }
 };
-
-pub fn submissionAllowed(
-    active_count: u32,
-    max_in_flight: u16,
-    candidate_is_flush: bool,
-    flush_in_flight: bool,
-) bool {
-    if (max_in_flight == 0 or active_count >= max_in_flight) return false;
-    if (flush_in_flight) return false;
-    if (candidate_is_flush and active_count != 0) return false;
-    return true;
+pub fn submissionAllowed(active: u32, max: u16, flush: bool, flush_in_flight: bool) bool {
+    return r4os_rust_storage_submission(active, max, flush, flush_in_flight);
 }
-
-pub const ControllerMap = struct {
+pub const ControllerMap = extern struct {
     used: [max_controllers]bool = .{false} ** max_controllers,
-    names: [max_controllers][max_controller_name]u8 =
-        .{.{0} ** max_controller_name} ** max_controllers,
+    names: [max_controllers][max_controller_name]u8 = .{.{0} ** max_controller_name} ** max_controllers,
     lengths: [max_controllers]u8 = .{0} ** max_controllers,
-
-    pub fn assign(self: *ControllerMap, controller: []const u8) ?u8 {
-        const name = normalizedName(controller) orelse return null;
-        var free: ?usize = null;
-        var index: usize = 0;
-        while (index < max_controllers) : (index += 1) {
-            if (!self.used[index]) {
-                if (free == null) free = index;
-                continue;
-            }
-            const len: usize = self.lengths[index];
-            if (equalIgnoreCase(self.names[index][0..len], name)) return @intCast(index);
-        }
-        const target = free orelse return null;
-        self.used[target] = true;
-        self.lengths[target] = @intCast(name.len);
-        @memcpy(self.names[target][0..name.len], name);
-        return @intCast(target);
+    pub fn assign(self: *ControllerMap, name: []const u8) ?u8 {
+        const lane = r4os_rust_storage_controller_assign(self, name.ptr, name.len);
+        return if (lane == no_lane) null else lane;
     }
-
     pub fn clear(self: *ControllerMap, lane: u8) void {
-        if (lane >= max_controllers) return;
-        self.used[lane] = false;
-        self.lengths[lane] = 0;
-        self.names[lane] = .{0} ** max_controller_name;
+        _ = r4os_rust_storage_controller(self, true, lane);
     }
-
     pub fn count(self: *const ControllerMap) u32 {
-        var total: u32 = 0;
-        for (self.used) |used| if (used) {
-            total += 1;
-        };
-        return total;
+        return r4os_rust_storage_controller(@constCast(self), false, 0);
     }
 };
-
-fn normalizedName(controller: []const u8) ?[]const u8 {
-    if (controller.len == 0) return "unknown";
-    if (controller.len > max_controller_name) return null;
-    return controller;
-}
-
-fn equalIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| {
-        const left_lower = if (left >= 'A' and left <= 'Z') left + ('a' - 'A') else left;
-        const right_lower = if (right >= 'A' and right <= 'Z') right + ('a' - 'A') else right;
-        if (left_lower != right_lower) return false;
-    }
-    return true;
+extern fn r4os_rust_storage_timeout_action(ownership: u8) u8;
+extern fn r4os_rust_storage_submission(active: u32, max: u16, flush: bool, flush_in_flight: bool) bool;
+extern fn r4os_rust_storage_latch(state: *CompletionLatch, op: u8, handle: u64, result: i32, bytes: u32, out: ?*Completion) bool;
+extern fn r4os_rust_storage_controller_assign(state: *ControllerMap, input: [*]const u8, len: usize) u8;
+extern fn r4os_rust_storage_controller(state: *ControllerMap, clear: bool, lane: u8) u32;
+comptime {
+    if (@sizeOf(CompletionLatch) != 24 or @offsetOf(CompletionLatch, "result") != 12 or @sizeOf(ControllerMap) != 272 or @sizeOf(Completion) != 8) @compileError("private block dispatch C layout drift");
 }
 
 test "controller map groups one owner and separates independent owners" {

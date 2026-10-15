@@ -63,7 +63,7 @@ pub const Bus = enum {
     virtio,
 };
 
-pub const State = enum {
+pub const State = enum(u8) {
     registered,
     active,
     busy,
@@ -77,21 +77,21 @@ pub const Source = enum {
     disk,
 };
 
-pub const RequestKind = enum {
+pub const RequestKind = enum(u8) {
     none,
     read,
     write,
     flush,
 };
 
-pub const RequestSnapshot = struct {
+pub const RequestSnapshot = extern struct {
     id: u64 = 0,
     kind: RequestKind = .none,
     lba: u64 = 0,
     sectors: u16 = 0,
 };
 
-pub const SenseSnapshot = struct {
+pub const SenseSnapshot = extern struct {
     valid: bool = false,
     opcode: u8 = 0,
     key: u8 = 0,
@@ -106,7 +106,7 @@ const RequestState = enum(u8) {
     completed,
 };
 
-const RequestSlot = struct {
+const RequestSlot = extern struct {
     state: RequestState = .free,
     id: u64 = 0,
     kind: RequestKind = .none,
@@ -134,7 +134,7 @@ const RequestSlot = struct {
     execution_mode: ExecutionMode = .boot_inline,
 };
 
-const RequestExecution = struct {
+const RequestExecution = extern struct {
     slot_index: usize,
     id: u64,
     kind: RequestKind,
@@ -149,7 +149,7 @@ const RequestExecution = struct {
     backend_handle: u64,
 };
 
-const RequestResult = struct {
+const RequestResult = extern struct {
     ok: bool = false,
     err: Error = .none,
     buffer_detached: bool = false,
@@ -160,7 +160,7 @@ const ExecutionMode = enum(u8) {
     runtime_worker,
 };
 
-pub const Error = enum {
+pub const Error = enum(u8) {
     none,
     busy,
     invalid_request,
@@ -185,7 +185,31 @@ pub const TransferResult = struct {
     err: Error = .none,
 };
 
-pub const Stats = struct {
+extern fn r4os_rust_block_async_submission(u8, bool) callconv(.c) bool;
+extern fn r4os_rust_block_backend_error(u8) callconv(.c) u8;
+extern fn r4os_rust_block_validate(u32, u64, u64, u16, usize) callconv(.c) u8;
+extern fn r4os_rust_block_classify(u8, usize, i32, u32, *RequestResult) callconv(.c) void;
+extern fn r4os_rust_block_snapshot(*const RequestSlot, *RequestSnapshot) callconv(.c) void;
+extern fn r4os_rust_block_select(*const [MAX_REQUEST_QUEUE_DEPTH]RequestSlot, u8, u64) callconv(.c) usize;
+extern fn r4os_rust_block_oldest(*const [MAX_REQUEST_QUEUE_DEPTH]RequestSlot, usize, *RequestSnapshot) callconv(.c) void;
+comptime {
+    if (@sizeOf(RequestSlot) != 144 or @offsetOf(RequestSlot, "backend_handle") != 104 or @offsetOf(RequestSlot, "completion_latch") != 112 or @sizeOf(RequestSnapshot) != 32 or @sizeOf(RequestResult) != 3) @compileError("Native block request C layout differs");
+}
+
+const SlotFinish = extern struct { accepted: bool = false, caller_detached: bool = false, completion_override: Error = .none, result_ok: bool = false, result_error: Error = .none, detached_buffer: ?[*]u8 = null, detached_len: usize = 0 };
+const SlotAbort = extern struct { action: u8 = 0, kind: RequestKind = .none, first_timeout: bool = false, first_cancel: bool = false, first_detach: bool = false, buffer_detached: bool = false };
+extern fn r4os_rust_block_slot_enqueue(*RequestSlot, *const RequestExecution, u64, u64) callconv(.c) void;
+extern fn r4os_rust_block_slot_start(*RequestSlot, usize, u8, u64, bool, u64, *RequestExecution) callconv(.c) bool;
+extern fn r4os_rust_block_slot_finish(*RequestSlot, *const RequestExecution, bool, u8, u64, *SlotFinish) callconv(.c) bool;
+extern fn r4os_rust_block_slot_abort(*RequestSlot, u8, *SlotAbort, *RequestExecution, usize) callconv(.c) void;
+extern fn r4os_rust_block_slot_clear(*RequestSlot) callconv(.c) void;
+extern fn r4os_rust_block_slot_reset(*RequestSlot, usize, *RequestExecution, *bool) callconv(.c) u8;
+extern fn r4os_rust_block_execution(usize, *const RequestSlot, *RequestExecution) callconv(.c) void;
+comptime {
+    if (@sizeOf(RequestExecution) != 96 or @offsetOf(RequestExecution, "backend_handle") != 88 or @sizeOf(SlotFinish) != 24 or @sizeOf(SlotAbort) != 6) @compileError("Native slot transition C layout differs");
+}
+
+pub const Stats = extern struct {
     next_request_id: u64 = 0,
     completions: u64 = 0,
     busy_rejections: u64 = 0,
@@ -234,7 +258,7 @@ pub const Stats = struct {
     last_error: Error = .none,
 };
 
-pub const RuntimeSummary = struct {
+pub const RuntimeSummary = extern struct {
     worker_started: u32 = 0,
     worker_task_id: u32 = 0,
     worker_wakeups: u64 = 0,
@@ -266,6 +290,26 @@ pub const RuntimeSummary = struct {
     in_flight: u32 = 0,
     in_flight_high_water: u32 = 0,
 };
+
+extern fn r4os_rust_block_runtime_reset() callconv(.c) void;
+extern fn r4os_rust_block_runtime_snapshot(*RuntimeSummary) callconv(.c) void;
+extern fn r4os_rust_block_runtime_change(u8, u8, u64) callconv(.c) u64;
+extern fn r4os_rust_block_runtime_active(bool) callconv(.c) void;
+extern fn r4os_rust_block_runtime_execution(u8, bool) callconv(.c) void;
+extern fn r4os_rust_block_next_handle(u8, usize) callconv(.c) u64;
+extern fn r4os_rust_block_stats_change(*Stats, u8, u8, u64) callconv(.c) u64;
+extern fn r4os_rust_block_stats_snapshot(*const Stats, *Stats) callconv(.c) void;
+extern fn r4os_rust_block_stats_reset(*Stats) callconv(.c) void;
+extern fn r4os_rust_block_stats_request(*Stats, bool, *const RequestSnapshot) callconv(.c) void;
+extern fn r4os_rust_block_stats_sense(*Stats, u8, u8, u8, u8) callconv(.c) void;
+comptime {
+    if (@sizeOf(Stats) != 408 or @sizeOf(RuntimeSummary) != 208 or @sizeOf(SenseSnapshot) != 5) @compileError("Native block accounting C layout differs");
+}
+pub fn statsSnapshot(device: *const Device) Stats {
+    var out: Stats = undefined;
+    r4os_rust_block_stats_snapshot(&device.stats, &out);
+    return out;
+}
 
 pub const Device = struct {
     // Assigned by the registry; never supplied by a driver or reused after retirement.
@@ -309,25 +353,47 @@ pub const Device = struct {
     queue_lock: sync.Mutex = sync.Mutex.initClass("block-device", sync.LockRank.block_device, .sleepable),
 };
 
-const DeviceSlot = struct {
-    used: bool = false,
-    retiring: bool = false,
-    pin_count: u32 = 0,
-    retire_generation: u64 = 0,
-    device: Device = undefined,
-};
-
-const DevicePin = struct {
-    slot: *DeviceSlot,
-    device: *Device,
-    unwind: task_context.UnwindToken,
-    active: bool = true,
-};
+// Native registry owns all slot identity, retirement and pin metadata.
+const DeviceSlot = extern struct { device: *Device, index: usize, retire_generation: u64, reference: access.DeviceRef, pins: u32, used: bool, retiring: bool, lane: u8 };
+const DevicePin = extern struct { index: usize, device: *Device, unwind: task_context.UnwindToken, active: bool = true };
+const RegistryText = extern struct { data: [*]const u8, len: usize };
+const Registration = extern struct { name: RegistryText, model: RegistryText, driver: RegistryText, controller: RegistryText, sectors: u64, sector_bytes: u32, queue_depth: u16, max_sectors: u16, bus: u8, writable: bool, owns_retry: bool, async_submit: bool };
+extern fn r4os_rust_block_registry_init(*const [MAX_DEVICES]*Device) callconv(.c) void;
+extern fn r4os_rust_block_registry_register(*const Registration, *const Device, *const fn (*Device, *const Device, *const access.DeviceRef, u8) callconv(.c) void, *DeviceSlot) callconv(.c) bool;
+extern fn r4os_rust_block_registry_slot(usize, u8, u64, bool, *DeviceSlot) callconv(.c) bool;
+extern fn r4os_rust_block_registry_retire(usize, u8, *DeviceSlot) callconv(.c) bool;
+extern fn r4os_rust_block_registry_pin(usize, *DevicePin) callconv(.c) bool;
+extern fn r4os_rust_block_registry_unpin(*DevicePin) callconv(.c) void;
+extern fn r4os_rust_block_registry_find([*]const u8, usize) callconv(.c) usize;
+extern fn r4os_rust_block_registry_query(u8, u8) callconv(.c) usize;
+extern fn r4os_rust_block_registry_exclude(u8, bool) callconv(.c) bool;
+extern fn r4os_rust_block_registry_identity(usize, *NativeIdentity) callconv(.c) bool;
+extern fn r4os_rust_block_registry_limits(usize, *DirectWriteLimits) callconv(.c) bool;
+fn registryText(s: []const u8) RegistryText {
+    return .{ .data = s.ptr, .len = s.len };
+}
+fn slotView(index: usize, mode: u8, generation: u64, locked: bool) ?DeviceSlot {
+    var out: DeviceSlot = undefined;
+    return if (r4os_rust_block_registry_slot(index, mode, generation, locked, &out)) out else null;
+}
+fn initializeRegistryDevice(out: *Device, input: *const Device, reference: *const access.DeviceRef, lane: u8) callconv(.c) void {
+    out.* = input.*;
+    out.access_ref = reference.*;
+    _ = changeDeviceState(out, 0, .none, .none, 0);
+    out.slot_index = @intCast(reference.slot);
+    out.controller_lane = lane;
+    var view: NativeExecutionView = undefined;
+    r4os_zig_block_execution_view(out, &view);
+    r4os_rust_block_sync_init(&view);
+}
+comptime {
+    if (@sizeOf(Registration) != 88 or @sizeOf(DeviceSlot) != 48 or @sizeOf(DevicePin) != 40 or @sizeOf(NativeIdentity) != 160 or @sizeOf(DirectWriteLimits) != 24) @compileError("Native block registry C layout differs");
+}
 
 // A prepared unregister owns the retiring admission barrier until it is
 // either committed or cancelled. Index plus retirement generation avoids
 // exposing DeviceSlot and rejects copied stale tokens after cancel/reuse.
-pub const UnregisterToken = struct {
+pub const UnregisterToken = extern struct {
     index: usize = 0,
     generation: u64 = 0,
     active: bool = false,
@@ -336,403 +402,89 @@ pub const UnregisterToken = struct {
 // Device addresses are stable for the complete lifetime of one registration.
 // Unregister leaves a tombstone instead of shifting later Device values (and
 // their embedded WaitQueues/Mutex); register may reuse only a quiescent slot.
-var devices: [MAX_DEVICES]DeviceSlot = .{DeviceSlot{}} ** MAX_DEVICES;
-var device_count: usize = 0;
-var device_slot_count: usize = 0;
+// Resident request/device leaf storage only; no Zig registry metadata.
+var registry_device_storage: [MAX_DEVICES]Device = undefined;
 // Session-wide media policy, applied before physical volumes are admitted.
 // Hardware/USB HID owners are independent of block-device visibility.
-var excluded_bus: ?Bus = null;
-var runtime_worker_started = false;
-var runtime_worker_task_id: u32 = 0;
-var runtime_worker_task_generation: u64 = 0;
-var primary_controller_lane: u8 = block_dispatch.no_lane;
-var controller_map: block_dispatch.ControllerMap = .{};
-const ControllerRuntime = struct {
-    worker_started: bool = false,
-    worker_task_id: u32 = 0,
-    worker_task_generation: u64 = 0,
-    event: sync.EventV2 = sync.EventV2.initMode(false, .auto_reset),
-};
-var controller_runtime: [block_dispatch.max_controllers]ControllerRuntime =
-    .{ControllerRuntime{}} ** block_dispatch.max_controllers;
-const worker_names = [_][]const u8{
-    "block-work",  "block-work1", "block-work2", "block-work3",
-    "block-work4", "block-work5", "block-work6", "block-work7",
-};
-var runtime_summary: RuntimeSummary = .{};
-var next_backend_handle_sequence: u64 = 0;
 
 pub fn init() void {
     access.initForBoot();
-    devices = .{DeviceSlot{}} ** MAX_DEVICES;
-    device_count = 0;
-    device_slot_count = 0;
-    excluded_bus = null;
-    runtime_worker_started = false;
-    runtime_worker_task_id = 0;
-    runtime_worker_task_generation = 0;
-    primary_controller_lane = block_dispatch.no_lane;
-    controller_map = .{};
-    controller_runtime = .{ControllerRuntime{}} ** block_dispatch.max_controllers;
-    runtime_summary = .{};
-    next_backend_handle_sequence = 0;
+    var addresses: [MAX_DEVICES]*Device = undefined;
+    for (&addresses, 0..) |*address, i| address.* = &registry_device_storage[i];
+    r4os_rust_block_registry_init(&addresses);
+    r4os_rust_block_workers_init();
+    r4os_rust_block_runtime_reset();
 }
 
 pub fn initRuntimeWorker() bool {
-    if (runtimeWorkerIdentityAlive()) return true;
-    runtime_worker_started = false;
-    runtime_worker_task_id = 0;
-    runtime_worker_task_generation = 0;
-    primary_controller_lane = block_dispatch.no_lane;
-    var lane: usize = 0;
-    while (lane < controller_runtime.len) : (lane += 1) {
-        controller_runtime[lane].worker_started = false;
-        controller_runtime[lane].worker_task_id = 0;
-        controller_runtime[lane].worker_task_generation = 0;
-        controller_runtime[lane].event = sync.EventV2.initMode(false, .auto_reset);
-    }
-
-    lane = 0;
-    while (lane < controller_runtime.len) : (lane += 1) {
-        if (!controller_map.used[lane]) continue;
-        if (primary_controller_lane == block_dispatch.no_lane) {
-            if (!startControllerWorker(@intCast(lane), true)) {
-                runtime_summary.worker_started = 0;
-                runtime_summary.worker_task_id = 0;
-                return false;
-            }
-            primary_controller_lane = @intCast(lane);
-            continue;
-        }
-        if (!startControllerWorker(@intCast(lane), false)) {
-            runtime_summary.worker_start_failures +%= 1;
-        }
-    }
-    if (primary_controller_lane == block_dispatch.no_lane) {
-        // The runtime storage contract always has at least one boot device.
-        // Fail visibly instead of publishing a worker that can own no queue.
-        runtime_summary.worker_started = 0;
-        runtime_summary.worker_task_id = 0;
-        return false;
-    }
-    const primary = &controller_runtime[primary_controller_lane];
-    runtime_worker_started = true;
-    runtime_worker_task_id = primary.worker_task_id;
-    runtime_worker_task_generation = primary.worker_task_generation;
-    runtime_summary.worker_started = 1;
-    runtime_summary.worker_task_id = primary.worker_task_id;
-    return true;
+    return r4os_rust_block_workers_start();
 }
-
 pub fn runtimeWorkerReady() bool {
-    return scheduler.currentId() != null and runtimeWorkerIdentityAlive();
+    return r4os_rust_block_workers_ready();
 }
-
 pub fn runtimeWorkerSummary() RuntimeSummary {
-    var out = runtime_summary;
-    const alive = runtimeWorkerIdentityAlive();
-    out.worker_started = if (alive) 1 else 0;
-    out.worker_task_id = if (alive) runtime_worker_task_id else 0;
-    out.controller_count = controller_map.count();
-    out.worker_count = 0;
-    var lane: usize = 0;
-    while (lane < controller_runtime.len) : (lane += 1) {
-        if (controller_map.used[lane] and controllerWorkerAlive(@intCast(lane))) {
-            out.worker_count += 1;
-        }
-    }
+    var out: RuntimeSummary = undefined;
+    r4os_rust_block_workers_summary(&out);
     return out;
 }
-
-fn runtimeWorkerIdentityAlive() bool {
-    return runtime_worker_started and
-        runtime_worker_task_id != 0 and
-        runtime_worker_task_generation != 0 and
-        sched_task.isAliveIdentity(runtime_worker_task_id, runtime_worker_task_generation);
-}
-
-fn controllerWorkerAlive(lane: u8) bool {
-    if (lane >= controller_runtime.len) return false;
-    const runtime = &controller_runtime[lane];
-    return runtime.worker_started and
-        runtime.worker_task_id != 0 and
-        runtime.worker_task_generation != 0 and
-        sched_task.isAliveIdentity(runtime.worker_task_id, runtime.worker_task_generation);
-}
-
-fn startControllerWorker(lane: u8, critical: bool) bool {
-    if (lane >= controller_runtime.len) return false;
-    if (controllerWorkerAlive(lane)) return true;
-    const worker = if (critical)
-        sched_task.createKernelThreadCriticalWithRole(worker_names[lane], workerMain, .batch)
-    else
-        sched_task.createKernelThreadWithRole(worker_names[lane], workerMain, .batch);
-    const task = worker orelse return false;
-    controller_runtime[lane].worker_started = true;
-    controller_runtime[lane].worker_task_id = native_tasks.get(task, .id);
-    controller_runtime[lane].worker_task_generation = native_tasks.get(task, .generation);
-    return true;
-}
-
 pub fn register(device: Device) ?usize {
-    const irq_flags = owner_locks.storage.acquire();
-    const result = registerLocked(device);
-    const controller_lane = if (result) |index| devices[index].device.controller_lane else block_dispatch.no_lane;
-    owner_locks.storage.release(irq_flags);
-    if (result != null) {
-        if (runtimeWorkerIdentityAlive() and !controllerWorkerAlive(controller_lane)) {
-            if (!startControllerWorker(controller_lane, false)) {
-                runtime_summary.worker_start_failures +%= 1;
-            }
-        }
-    }
-    return result;
-}
-
-fn registerLocked(device: Device) ?usize {
-    if (device_count >= MAX_DEVICES) return null;
-    if (findByNameLocked(device.name) != null) return null;
-    if (device.queue_depth == 0 or @as(usize, device.queue_depth) > MAX_REQUEST_QUEUE_DEPTH) return null;
-
-    var target_index: usize = 0;
-    while (target_index < device_slot_count and devices[target_index].used) : (target_index += 1) {}
-    if (target_index == device_slot_count and device_slot_count >= devices.len) return null;
-    const controller_lane = controller_map.assign(device.controller) orelse return null;
-    if (target_index == device_slot_count) device_slot_count += 1;
-
-    var normalized = device;
-    // queue_depth is the hardware in-flight limit. Synchronous callbacks are
-    // adapted through one execution lane even if an old descriptor advertised
-    // a larger software queue.
-    if (normalized.async_submit_fn == null) normalized.queue_depth = 1;
-    normalized.access_ref = access.registerDeviceLocked(@intCast(target_index), device.sector_count) catch return null;
-    normalized.state = .registered;
-    normalized.resetting = false;
-    normalized.slot_index = @intCast(target_index);
-    normalized.stats = .{};
-    normalized.active_executions = 0;
-    normalized.controller_lane = controller_lane;
-    normalized.request_slots = .{RequestSlot{}} ** MAX_REQUEST_QUEUE_DEPTH;
-    normalized.slot_available = sync.WaitQueue.init();
-    normalized.completion_available = sync.WaitQueue.init();
-    normalized.queue_lock = sync.Mutex.initClass("block-device", sync.LockRank.block_device, .sleepable);
-    devices[target_index].device = normalized;
-    devices[target_index].retiring = false;
-    devices[target_index].pin_count = 0;
-    devices[target_index].used = true;
-    device_count += 1;
-    return target_index;
+    const info = Registration{ .name = registryText(device.name), .model = registryText(device.model), .driver = registryText(device.driver), .controller = registryText(device.controller), .sectors = device.sector_count, .sector_bytes = device.sector_size, .queue_depth = device.queue_depth, .max_sectors = device.max_sectors_per_request, .bus = @intFromEnum(device.bus), .writable = device.writable, .owns_retry = device.owns_transport_retry, .async_submit = device.async_submit_fn != null };
+    var out: DeviceSlot = undefined;
+    if (!r4os_rust_block_register(&info, &device, initializeRegistryDevice, &out)) return null;
+    return out.index;
 }
 
 pub fn unregister(index: usize) bool {
-    var token = prepareUnregister(index) orelse return false;
-    if (commitUnregister(&token)) return true;
-    _ = cancelUnregister(&token);
-    return false;
+    return r4os_rust_block_unregister(index);
 }
-
 // Stop new admissions and prove the complete device lifetime is quiescent,
 // but leave the registration intact. Callers may prepare several devices and
 // cancel all of them without having partially removed an owner.
 pub fn prepareUnregister(index: usize) ?UnregisterToken {
-    const slot = beginRetirement(index) orelse return null;
-    if (hasMountedDrive(index)) {
-        cancelRetirement(slot);
-        return null;
-    }
-
-    const device = &slot.device;
-    if (!deviceIsQuiescent(device)) {
-        cancelRetirement(slot);
-        return null;
-    }
-
-    // Closing is the final successful-unregister boundary. It prevents the
-    // stable embedded synchronization objects from accepting a late waiter
-    // while the slot is a tombstone. A surprising raced waiter keeps the
-    // registration alive and all queues are reopened after cancellation.
-    const slot_waiters = device.slot_available.close(.cancelled);
-    const completion_waiters = device.completion_available.close(.cancelled);
-    const mutex_waiters = device.queue_lock.queue.close(.cancelled);
-    if (slot_waiters != 0 or completion_waiters != 0 or mutex_waiters != 0) {
-        _ = device.slot_available.reopen();
-        _ = device.completion_available.reopen();
-        _ = device.queue_lock.queue.reopen();
-        cancelRetirement(slot);
-        return null;
-    }
-
-    return .{
-        .index = index,
-        .generation = slot.retire_generation,
-        .active = true,
-    };
+    var out: UnregisterToken = undefined;
+    return if (r4os_rust_block_retirement_prepare(index, &out)) out else null;
 }
-
 pub fn commitUnregister(token: *UnregisterToken) bool {
-    if (!token.active) return false;
-    const slot = preparedSlot(token.index, token.generation) orelse return false;
-    if (!commitRetirement(slot)) return false;
-    token.active = false;
-    return true;
+    return r4os_rust_block_retirement_commit(token);
 }
-
 pub fn cancelUnregister(token: *UnregisterToken) bool {
-    if (!token.active) return false;
-    const slot = preparedSlot(token.index, token.generation) orelse {
-        token.active = false;
-        return false;
-    };
-    const device = &slot.device;
-
-    _ = device.slot_available.reopen();
-    _ = device.completion_available.reopen();
-    _ = device.queue_lock.queue.reopen();
-    cancelRetirement(slot);
-    token.active = false;
-    return true;
-}
-
-fn preparedSlot(index: usize, generation: u64) ?*DeviceSlot {
-    const irq_flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(irq_flags);
-    if (index >= device_slot_count) return null;
-    const slot = &devices[index];
-    if (!slot.used or !slot.retiring or slot.retire_generation != generation) return null;
-    return slot;
-}
-
-fn beginRetirement(index: usize) ?*DeviceSlot {
-    const irq_flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(irq_flags);
-    if (index >= device_slot_count) return null;
-    const slot = &devices[index];
-    if (!slot.used or slot.retiring) return null;
-    if (slot.retire_generation == 0xFFFF_FFFF_FFFF_FFFF) return null;
-    access.beginRetirementLocked(slot.device.access_ref) catch return null;
-
-    // Admission is stopped before the pin snapshot. A live operation makes
-    // unregister a non-destructive retryable failure; it can then unwind its
-    // task-owned pin without ever observing reused Device storage.
-    slot.retiring = true;
-    slot.retire_generation += 1;
-    if (slot.pin_count != 0) {
-        slot.retiring = false;
-        access.cancelRetirementLocked(slot.device.access_ref);
-        return null;
-    }
-    return slot;
-}
-
-fn cancelRetirement(slot: *DeviceSlot) void {
-    const irq_flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(irq_flags);
-    if (slot.used) {
-        slot.retiring = false;
-        access.cancelRetirementLocked(slot.device.access_ref);
-    }
-}
-
-fn commitRetirement(slot: *DeviceSlot) bool {
-    const irq_flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(irq_flags);
-    if (!slot.used or !slot.retiring or slot.pin_count != 0) return false;
-    access.retireDeviceLocked(slot.device.access_ref) catch return false;
-    const retired_lane = slot.device.controller_lane;
-    slot.used = false;
-    slot.retiring = false;
-    if (device_count != 0) device_count -= 1;
-    if (!controllerLaneInUseLocked(retired_lane)) controller_map.clear(retired_lane);
-    return true;
-}
-
-fn controllerLaneInUseLocked(lane: u8) bool {
-    var index: usize = 0;
-    while (index < device_slot_count) : (index += 1) {
-        if (devices[index].used and devices[index].device.controller_lane == lane) return true;
-    }
-    return false;
-}
-
-fn deviceIsQuiescent(device: *Device) bool {
-    if (device.resetting or device.active_executions != 0 or countUsedSlots(device) != 0) return false;
-    if (device.queue_lock.owner != 0 or device.queue_lock.depth != 0) return false;
-    if (device.slot_available.hasWaiters()) return false;
-    if (device.completion_available.hasWaiters()) return false;
-    if (device.queue_lock.queue.hasWaiters()) return false;
-    return true;
-}
-
-fn hasMountedDrive(block_index: usize) bool {
-    var letter: u8 = 'A';
-    while (letter <= 'Z') : (letter += 1) {
-        const d = drive.get(letter) orelse continue;
-        if (d.block_device_index != null and d.block_device_index.? == block_index) return true;
-    }
-    return false;
+    return r4os_rust_block_retirement_cancel(token);
 }
 
 pub fn findByName(name: []const u8) ?usize {
-    const irq_flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(irq_flags);
-    return findByNameLocked(name);
-}
-
-fn findByNameLocked(name: []const u8) ?usize {
-    var index: usize = 0;
-    while (index < device_slot_count) : (index += 1) {
-        if (!devices[index].used or busExcluded(devices[index].device.bus)) continue;
-        if (strEqIgnoreCase(devices[index].device.name, name)) return index;
-    }
-    return null;
+    const index = r4os_rust_block_registry_find(name.ptr, name.len);
+    return if (index == std.math.maxInt(usize)) null else index;
 }
 
 pub fn count() usize {
-    const flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(flags);
-    var visible: usize = 0;
-    for (devices[0..device_slot_count]) |*slot| {
-        if (slot.used and !slot.retiring and !busExcluded(slot.device.bus)) visible += 1;
-    }
-    return visible;
+    return r4os_rust_block_registry_query(0, 0);
 }
 
 pub fn excludeBusBeforeMount(bus: Bus) bool {
-    if (bus == .ram) return false;
-    // This is a boot policy, never an unmount/revocation substitute.
-    for (0..drive.DRIVE_COUNT) |i| if (drive.atIndex(i)) |mounted| {
-        if (mounted.block_device_index) |index| {
-            const device = get(index) orelse continue;
-            if (device.bus == bus) return false;
-        }
-    };
-    const flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(flags);
-    if (excluded_bus != null) return excluded_bus.? == bus;
-    for (devices[0..device_slot_count]) |*slot| {
-        if (slot.used and slot.device.bus == bus and (slot.pin_count != 0 or slot.device.active_executions != 0)) return false;
-    }
-    excluded_bus = bus;
-    return true;
+    return r4os_rust_block_exclude(@intFromEnum(bus));
 }
-
-fn busExcluded(bus: Bus) bool {
-    return excluded_bus != null and excluded_bus.? == bus;
-}
-
 pub fn isBusVisible(bus: Bus) bool {
-    const flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(flags);
-    return !busExcluded(bus);
+    return r4os_rust_block_registry_query(2, @intFromEnum(bus)) != 0;
 }
 
 pub fn slotCount() usize {
-    return device_slot_count;
+    return r4os_rust_block_registry_query(1, 0);
 }
 
 pub fn maxDevices() usize {
     return MAX_DEVICES;
 }
+
+const NativeIdentity = extern struct {
+    reference: access.DeviceRef,
+    sectors: u64,
+    sector_bytes: u32,
+    writable: bool,
+    bus: u8,
+    name: [32]u8 = .{0} ** 32,
+    model: [64]u8 = .{0} ** 64,
+    driver: [32]u8 = .{0} ** 32,
+};
 
 pub const Identity = struct {
     reference: access.DeviceRef,
@@ -748,209 +500,54 @@ pub const Identity = struct {
 // Copy under the registry owner; no pointer into a driver-owned string or a
 // reusable DeviceSlot crosses the public inventory boundary.
 pub fn identity(index: usize) ?Identity {
-    const guard = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(guard);
-    if (index >= device_slot_count) return null;
-    const slot = &devices[index];
-    if (!slot.used or slot.retiring or busExcluded(slot.device.bus)) return null;
-    const d = &slot.device;
-    var result: Identity = .{ .reference = d.access_ref, .sectors = d.sector_count, .sector_bytes = d.sector_size, .writable = d.writable, .bus = d.bus };
-    copyIdentityText(&result.name, d.name);
-    copyIdentityText(&result.model, d.model);
-    copyIdentityText(&result.driver, d.driver);
-    return result;
-}
-
-fn copyIdentityText(out: []u8, value: []const u8) void {
-    const len = @min(out.len - 1, value.len);
-    @memcpy(out[0..len], value[0..len]);
+    var out: NativeIdentity = undefined;
+    if (!r4os_rust_block_registry_identity(index, &out)) return null;
+    return .{ .reference = out.reference, .sectors = out.sectors, .sector_bytes = out.sector_bytes, .writable = out.writable, .bus = @enumFromInt(out.bus), .name = out.name, .model = out.model, .driver = out.driver };
 }
 
 pub fn get(index: usize) ?*const Device {
-    const irq_flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(irq_flags);
-    if (index >= device_slot_count or !devices[index].used or devices[index].retiring or busExcluded(devices[index].device.bus)) return null;
-    return &devices[index].device;
-}
-
-fn pinDevice(index: usize) ?DevicePin {
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) return null;
-
-    const irq_flags = owner_locks.storage.acquire();
-    if (index >= device_slot_count or
-        !devices[index].used or
-        devices[index].retiring or
-        busExcluded(devices[index].device.bus) or
-        devices[index].pin_count == 0xFFFF_FFFF)
-    {
-        owner_locks.storage.release(irq_flags);
-        _ = task_context.leaveUnwind(unwind);
-        return null;
-    }
-    const slot = &devices[index];
-    slot.pin_count += 1;
-    const device = &slot.device;
-    owner_locks.storage.release(irq_flags);
-    return .{ .slot = slot, .device = device, .unwind = unwind };
-}
-
-fn unpinDevice(pin: *DevicePin) void {
-    if (!pin.active) return;
-    const irq_flags = owner_locks.storage.acquire();
-    if (pin.slot.pin_count != 0) pin.slot.pin_count -= 1;
-    pin.active = false;
-    owner_locks.storage.release(irq_flags);
-    _ = task_context.leaveUnwind(pin.unwind);
+    return (slotView(index, 1, 0, false) orelse return null).device;
 }
 
 pub fn queueUsed(index: usize) u32 {
-    var pin = pinDevice(index) orelse return 0;
-    defer unpinDevice(&pin);
-    return countUsedSlots(pin.device);
+    return r4os_rust_block_device_operation(index, 0, 0, 0, 0, 0);
 }
-
 pub fn beginBackendRecovery(index: usize) void {
-    var pin = pinDevice(index) orelse return;
-    defer unpinDevice(&pin);
-    // Recovery runs inside the active backend callback, hence the normal
-    // state is necessarily .busy here.  Preserve that distinction for the
-    // watchdog instead of suppressing the only useful recovery telemetry.
-    pin.device.state = .recovering;
+    _ = r4os_rust_block_device_operation(index, 1, 0, 0, 0, 0);
 }
-
 pub fn finishBackendRecovery(index: usize, ok: bool) void {
-    var pin = pinDevice(index) orelse return;
-    defer unpinDevice(&pin);
-    const device = pin.device;
-    device.stats.backend_recoveries += 1;
-    if (ok) {
-        device.state = if (device.active_executions != 0) .busy else .active;
-    } else {
-        device.stats.backend_recovery_failures += 1;
-        device.state = .failed;
-    }
-}
-
-// A successful backend reset is the only boundary that may retire an active
+    _ = r4os_rust_block_device_operation(index, if (ok) 2 else 3, 0, 0, 0, 0);
+} // A successful backend reset is the only boundary that may retire an active
 // asynchronous request without waiting for its physical completion. The
 // backend promises that old commands can no longer touch buffers before the
 // callback returns; handles are invalidated before waiters or slots are freed.
 pub fn reset(index: usize, reason: u32) bool {
-    var pin = pinDevice(index) orelse return false;
-    defer unpinDevice(&pin);
-    const device = pin.device;
-    const reset_fn = device.async_reset_fn orelse return false;
-
-    var active: [MAX_REQUEST_QUEUE_DEPTH]RequestExecution = undefined;
-    var cancel_needed: [MAX_REQUEST_QUEUE_DEPTH]bool = .{false} ** MAX_REQUEST_QUEUE_DEPTH;
-    var active_count: usize = 0;
-    const locked = lockDevice(device);
-    if (device.resetting) {
-        unlockDevice(device, locked);
-        return false;
-    }
-    device.resetting = true;
-    device.state = .recovering;
-    for (&device.request_slots, 0..) |*slot, slot_index| {
-        switch (slot.state) {
-            .queued => {
-                slot.state = .completed;
-                slot.ok = false;
-                slot.err = .reset;
-                slot.complete_tick = timer.tickCount();
-                recordRequestFailure(device, slot.kind, .reset);
-            },
-            .active => {
-                if (slot.completion_override == .none) slot.completion_override = .reset;
-                const first_cancel = !slot.cancel_requested;
-                slot.cancel_requested = true;
-                if (active_count < active.len) {
-                    active[active_count] = executionFromSlot(slot_index, slot.*);
-                    cancel_needed[active_count] = first_cancel;
-                    active_count += 1;
-                }
-            },
-            .free, .completed => {},
-        }
-    }
-    _ = device.completion_available.wakeAll();
-    unlockDevice(device, locked);
-
-    var cancel_index: usize = 0;
-    while (cancel_index < active_count) : (cancel_index += 1) {
-        if (cancel_needed[cancel_index]) {
-            requestBackendCancel(device, active[cancel_index], CANCEL_REASON_RESET);
-        }
-    }
-    device.stats.async_resets +%= 1;
-    runtime_summary.async_resets +%= 1;
-    if (reset_fn(device.ctx, reason) != 0) {
-        const failed_locked = lockDevice(device);
-        device.resetting = false;
-        device.state = .failed;
-        unlockDevice(device, failed_locked);
-        return false;
-    }
-
-    var finish_index: usize = 0;
-    while (finish_index < active_count) : (finish_index += 1) {
-        forceCompleteAfterReset(device, active[finish_index]);
-    }
-    const finish_locked = lockDevice(device);
-    device.resetting = false;
-    device.state = if (device.active_executions == 0) .active else .busy;
-    _ = device.slot_available.wakeAll();
-    _ = device.completion_available.wakeAll();
-    unlockDevice(device, finish_locked);
-    return true;
-}
-
-fn forceCompleteAfterReset(device: *Device, original: RequestExecution) void {
-    const locked = lockDevice(device);
-    if (original.slot_index >= device.request_slots.len) {
-        unlockDevice(device, locked);
-        return;
-    }
-    const slot = &device.request_slots[original.slot_index];
-    if (slot.state != .active or slot.id != original.id or slot.backend_handle != original.backend_handle) {
-        unlockDevice(device, locked);
-        return;
-    }
-    const request = executionFromSlot(original.slot_index, slot.*);
-    unlockDevice(device, locked);
-    finishRequest(device, request, false, .reset);
+    return r4os_rust_block_reset(index, reason);
 }
 
 pub fn recordSense(index: usize, opcode: u8, key: u8, asc: u8, ascq: u8) void {
-    var pin = pinDevice(index) orelse return;
-    defer unpinDevice(&pin);
-    const device = pin.device;
-    device.stats.last_sense = .{
-        .valid = true,
-        .opcode = opcode,
-        .key = key,
-        .asc = asc,
-        .ascq = ascq,
-    };
+    _ = r4os_rust_block_device_operation(index, 4, opcode, key, asc, ascq);
 }
-
 pub fn busLabel(bus: Bus) []const u8 {
-    return busName(bus);
+    var out: RegistryText = undefined;
+    r4os_rust_block_label(0, @intFromEnum(bus), &out);
+    return out.data[0..out.len];
 }
-
 pub fn stateLabel(state: State) []const u8 {
-    return stateName(state);
+    var out: RegistryText = undefined;
+    r4os_rust_block_label(1, @intFromEnum(state), &out);
+    return out.data[0..out.len];
 }
-
 pub fn errorLabel(err: Error) []const u8 {
-    return errorName(err);
+    var out: RegistryText = undefined;
+    r4os_rust_block_label(2, @intFromEnum(err), &out);
+    return out.data[0..out.len];
 }
-
 pub fn sourceLabel(source: Source) []const u8 {
-    return sourceName(source);
+    var out: RegistryText = undefined;
+    r4os_rust_block_label(3, @intFromEnum(source), &out);
+    return out.data[0..out.len];
 }
-
 pub fn read(index: usize, lba: u64, sectors: u16, out: []u8) bool {
     return readWithPolicy(index, lba, sectors, out, false);
 }
@@ -967,134 +564,11 @@ pub fn readDirect(index: usize, lba: u64, sectors: u16, out: []u8) bool {
 /// emits the companion `[NVMEIRQ]` marker only after an MSI/MSI-X-triggered CQ
 /// drain with no polling fallback.
 pub fn nvmeInterruptAcceptanceProbe() bool {
-    var device_index: usize = 0;
-    while (device_index < maxDevices()) : (device_index += 1) {
-        const device = get(device_index) orelse continue;
-        if (device.bus != .nvme) continue;
-        const sector_size: usize = @intCast(device.sector_size);
-        if (sector_size == 0 or sector_size > 4096) return nvmeProbeFailure("sector-size");
-        const before = snapshotDeviceStats(device_index) orelse return nvmeProbeFailure("stats-before");
-        var sector: [4096]u8 align(64) = undefined;
-        if (!readDirect(device_index, 0, 1, sector[0..sector_size])) return nvmeProbeFailure("read");
-        const after = snapshotDeviceStats(device_index) orelse return nvmeProbeFailure("stats-after");
-        const worker_requests = after.worker_requests -% before.worker_requests;
-        const worker_completions = after.worker_completions -% before.worker_completions;
-        const async_submissions = after.async_submissions -% before.async_submissions;
-        const async_completions = after.async_completions -% before.async_completions;
-        if (worker_requests == 0 or worker_completions == 0 or
-            async_submissions == 0 or async_completions == 0 or
-            after.timeout_failures != before.timeout_failures)
-        {
-            return nvmeProbeFailure("runtime-counters");
-        }
-        k.puts("[NVMEIRQPROBE] result=OK worker_requests=");
-        k.putDec(worker_requests);
-        k.puts(" worker_completions=");
-        k.putDec(worker_completions);
-        k.puts(" async_submissions=");
-        k.putDec(async_submissions);
-        k.puts(" async_completions=");
-        k.putDec(async_completions);
-        k.puts("\r\n");
-        return true;
-    }
-    return nvmeProbeFailure("device-missing");
-}
-
-fn snapshotDeviceStats(index: usize) ?Stats {
-    var pin = pinDevice(index) orelse return null;
-    defer unpinDevice(&pin);
-    const locked = lockDevice(pin.device);
-    defer unlockDevice(pin.device, locked);
-    return pin.device.stats;
-}
-
-fn nvmeProbeFailure(reason: []const u8) bool {
-    k.puts("[NVMEIRQPROBE] result=FAILED reason=");
-    k.puts(reason);
-    k.puts("\r\n");
-    return false;
+    return r4os_rust_block_nvme_probe();
 }
 
 fn readWithPolicy(index: usize, lba: u64, sectors: u16, out: []u8, trusted_resident: bool) bool {
-    var pin = pinDevice(index) orelse return false;
-    defer unpinDevice(&pin);
-    const device = pin.device;
-    if (validateRequest(device, lba, sectors, out.len)) |err| {
-        recordReadFailure(device, err);
-        return false;
-    }
-    var iterator = block_split.Iterator.init(sectors, device.max_sectors_per_request, device.sector_size) orelse {
-        recordReadFailure(device, .invalid_request);
-        return false;
-    };
-    while (iterator.next()) |chunk| {
-        if (readChunk(
-            device,
-            lba + @as(u64, chunk.sector_offset),
-            chunk.sectors,
-            out[chunk.byte_offset .. chunk.byte_offset + chunk.byte_count],
-            trusted_resident,
-        ) != .none) return false;
-    }
-    return true;
-}
-
-fn readChunk(device: *Device, lba: u64, sectors: u16, out: []u8, trusted_resident: bool) Error {
-    const byte_count = @as(usize, sectors) * @as(usize, device.sector_size);
-
-    // The runtime block worker is a different task.  It must never retain a
-    // raw pointer into the caller's pageable R4X address space: a page-out
-    // between enqueue and execution would make the storage worker fault back
-    // into the storage path it is meant to service.  Kernel-heap bounce
-    // memory is non-pageable and remains owned by this synchronous call until
-    // the exact request has completed.  Early boot still executes inline and
-    // therefore needs no allocation.
-    const use_runtime_worker = runtimeWorkerReady();
-    const bounce = if (use_runtime_worker and !trusted_resident)
-        heap.alloc(byte_count, 16) orelse {
-            recordReadFailure(device, .busy);
-            return .busy;
-        }
-    else
-        null;
-    var release_bounce = true;
-    defer if (release_bounce) if (bounce) |memory| {
-        _ = heap.free(memory);
-    };
-    const buffer_ownership: block_dispatch.BufferOwnership = if (!use_runtime_worker)
-        .none
-    else if (trusted_resident)
-        .borrowed_resident
-    else
-        .bounce_owned;
-    if (buffer_ownership == .borrowed_resident) {
-        device.stats.direct_requests +%= 1;
-        device.stats.direct_bytes +%= byte_count;
-        runtime_summary.direct_requests +%= 1;
-        runtime_summary.direct_bytes +%= byte_count;
-    } else if (buffer_ownership == .bounce_owned) {
-        device.stats.bounce_allocations +%= 1;
-        device.stats.bounce_bytes +%= byte_count;
-        runtime_summary.bounce_allocations +%= 1;
-        runtime_summary.bounce_bytes +%= byte_count;
-    }
-    const request_buffer = if (bounce) |memory| memory.ptr else out.ptr;
-    const request_id = enqueueRequest(device, .read, lba, sectors, request_buffer, null, byte_count, buffer_ownership) orelse {
-        const err = device.stats.last_error;
-        recordReadFailure(device, err);
-        return err;
-    };
-    scheduleDeviceQueue(device, use_runtime_worker);
-    const result = waitForRequest(device, request_id, requestTimeout(device));
-    if (result.buffer_detached) release_bounce = false;
-    if (!result.ok) return result.err;
-    if (bounce) |memory| {
-        @memcpy(out[0..byte_count], memory[0..byte_count]);
-        device.stats.bounce_copy_bytes +%= byte_count;
-        runtime_summary.bounce_copy_bytes +%= byte_count;
-    }
-    return .none;
+    return r4os_rust_block_read(index, lba, sectors, out.ptr, out.len, trusted_resident);
 }
 
 pub fn write(index: usize, lba: u64, sectors: u16, data: []const u8) bool {
@@ -1118,86 +592,13 @@ pub fn writeDirectWithProgress(index: usize, lba: u64, sectors: u16, data: []con
 }
 
 fn writeWithProgressPolicy(index: usize, lba: u64, sectors: u16, data: []const u8, trusted_resident: bool) TransferResult {
-    var pin = pinDevice(index) orelse return .{ .err = .invalid_request };
-    defer unpinDevice(&pin);
-    const device = pin.device;
-    if ((device.write_fn == null and device.async_submit_fn == null) or !device.writable) {
-        recordWriteFailure(device, .no_writer);
-        return .{ .err = .no_writer };
-    }
-    if (validateRequest(device, lba, sectors, data.len)) |err| {
-        recordWriteFailure(device, err);
-        return .{ .err = err };
-    }
-    var iterator = block_split.Iterator.init(sectors, device.max_sectors_per_request, device.sector_size) orelse {
-        recordWriteFailure(device, .invalid_request);
-        return .{ .err = .invalid_request };
-    };
-    var completed: u16 = 0;
-    while (iterator.next()) |chunk| {
-        const err = writeChunk(
-            device,
-            lba + @as(u64, chunk.sector_offset),
-            chunk.sectors,
-            data[chunk.byte_offset .. chunk.byte_offset + chunk.byte_count],
-            trusted_resident,
-        );
-        if (err != .none) return .{ .sectors_completed = completed, .err = err };
-        completed += chunk.sectors;
-    }
-    return .{ .sectors_completed = completed };
-}
-
-fn writeChunk(device: *Device, lba: u64, sectors: u16, data: []const u8, trusted_resident: bool) Error {
-    const byte_count = @as(usize, sectors) * @as(usize, device.sector_size);
-    const use_runtime_worker = runtimeWorkerReady();
-    const bounce = if (use_runtime_worker and !trusted_resident)
-        heap.alloc(byte_count, 16) orelse {
-            recordWriteFailure(device, .busy);
-            return .busy;
-        }
-    else
-        null;
-    var release_bounce = true;
-    defer if (release_bounce) if (bounce) |memory| {
-        _ = heap.free(memory);
-    };
-    const buffer_ownership: block_dispatch.BufferOwnership = if (!use_runtime_worker)
-        .none
-    else if (trusted_resident)
-        .borrowed_resident
-    else
-        .bounce_owned;
-    if (buffer_ownership == .borrowed_resident) {
-        device.stats.direct_requests +%= 1;
-        device.stats.direct_bytes +%= byte_count;
-        runtime_summary.direct_requests +%= 1;
-        runtime_summary.direct_bytes +%= byte_count;
-    } else if (buffer_ownership == .bounce_owned) {
-        device.stats.bounce_allocations +%= 1;
-        device.stats.bounce_bytes +%= byte_count;
-        runtime_summary.bounce_allocations +%= 1;
-        runtime_summary.bounce_bytes +%= byte_count;
-    }
-    if (bounce) |memory| {
-        @memcpy(memory[0..byte_count], data[0..byte_count]);
-        device.stats.bounce_copy_bytes +%= byte_count;
-        runtime_summary.bounce_copy_bytes +%= byte_count;
-    }
-    const request_buffer = if (bounce) |memory| memory.ptr else data.ptr;
-    const request_id = enqueueRequest(device, .write, lba, sectors, null, request_buffer, byte_count, buffer_ownership) orelse {
-        const err = device.stats.last_error;
-        recordWriteFailure(device, err);
-        return err;
-    };
-    scheduleDeviceQueue(device, use_runtime_worker);
-    const result = waitForRequest(device, request_id, requestTimeout(device));
-    if (result.buffer_detached) release_bounce = false;
-    return if (result.ok) .none else result.err;
+    var out: NativeTransfer = undefined;
+    r4os_rust_block_write(index, lba, sectors, data.ptr, data.len, trusted_resident, &out);
+    return .{ .sectors_completed = out.sectors_completed, .err = @enumFromInt(out.err) };
 }
 
 pub const direct_write_batch_limit: usize = 4;
-pub const DirectWriteLimits = struct {
+pub const DirectWriteLimits = extern struct {
     reference: access.DeviceRef,
     max_sectors: u16,
     owns_transport_retry: bool,
@@ -1206,13 +607,8 @@ pub const DirectWriteLimits = struct {
 /// Copy capabilities while the registration owner is held; callers do not
 /// keep a pointer to a reusable device slot across cache lock drops.
 pub fn directWriteLimits(index: usize) ?DirectWriteLimits {
-    const flags = owner_locks.storage.acquire();
-    defer owner_locks.storage.release(flags);
-    if (index >= device_slot_count) return null;
-    const slot = &devices[index];
-    if (!slot.used or slot.retiring or busExcluded(slot.device.bus) or
-        slot.device.sector_size != 512 or !slot.device.writable) return null;
-    return .{ .reference = slot.device.access_ref, .max_sectors = if (slot.device.max_sectors_per_request == 0) 65535 else slot.device.max_sectors_per_request, .owns_transport_retry = slot.device.owns_transport_retry };
+    var out: DirectWriteLimits = undefined;
+    return if (r4os_rust_block_registry_limits(index, &out)) out else null;
 }
 
 pub const DirectWrite = struct {
@@ -1235,522 +631,25 @@ pub fn writeBatchDirect(index: usize, expected: access.DeviceRef, writes: []Dire
         job.attempted = false;
     }
     if (writes.len == 0 or writes.len > direct_write_batch_limit) return .{};
-    var pin = pinDevice(index) orelse return .{};
-    defer unpinDevice(&pin);
-    const device = pin.device;
-    if (device.access_ref.slot != expected.slot or device.access_ref.generation != expected.generation or
-        !device.writable or (device.write_fn == null and device.async_submit_fn == null)) return .{};
-    const limit = if (device.max_sectors_per_request == 0) 65535 else device.max_sectors_per_request;
-    for (writes, 0..) |job, i| {
-        if (job.sectors > limit or validateRequest(device, job.lba, job.sectors, job.data.len) != null) return .{};
-        for (writes[0..i]) |before| {
-            if (job.lba < before.lba + before.sectors and before.lba < job.lba + job.sectors) return .{};
-        }
+    var jobs: [direct_write_batch_limit]NativeWrite = undefined;
+    for (writes, 0..) |job, i| jobs[i] = .{ .lba = job.lba, .sectors = job.sectors, .data = job.data.ptr, .len = job.data.len, .attempted = false, .ok = false };
+    const pending = r4os_rust_block_write_batch(index, &expected, &jobs, writes.len, parallel);
+    for (writes, 0..) |*job, i| {
+        job.attempted = jobs[i].attempted;
+        job.ok = jobs[i].ok;
     }
-    const runtime_worker = runtimeWorkerReady();
-    const width: usize = if (parallel and runtime_worker and device.async_submit_fn != null)
-        @max(1, @min(direct_write_batch_limit, device.queue_depth))
-    else
-        1;
-    var result: DirectWriteBatchResult = .{};
-    var first: usize = 0;
-    while (first < writes.len) {
-        var ids: [direct_write_batch_limit]u64 = undefined;
-        var admitted: usize = 0;
-        const wave_count = @min(width, writes.len - first);
-        while (admitted < wave_count) : (admitted += 1) {
-            const job = &writes[first + admitted];
-            const bytes = @as(usize, job.sectors) * device.sector_size;
-            ids[admitted] = enqueueRequest(device, .write, job.lba, job.sectors, null, job.data.ptr, bytes, if (runtime_worker) .borrowed_resident else .none) orelse break;
-            job.attempted = true;
-            device.stats.direct_requests +%= 1;
-            device.stats.direct_bytes +%= bytes;
-            runtime_summary.direct_requests +%= 1;
-            runtime_summary.direct_bytes +%= bytes;
-            scheduleDeviceQueue(device, runtime_worker);
-        }
-        result.pending_max = @max(result.pending_max, admitted);
-        var all_ok = admitted == wave_count;
-        // Drain every admitted slot on every exit. Successful siblings are
-        // individually acknowledged even when another completion fails.
-        for (ids[0..admitted], 0..) |id, offset| {
-            const done = waitForRequest(device, id, requestTimeout(device));
-            writes[first + offset].ok = done.ok;
-            all_ok = all_ok and done.ok;
-        }
-        if (!all_ok) break;
-        first += admitted;
-    }
-    return result;
+    return .{ .pending_max = pending };
 }
-
 pub fn flush(index: usize) bool {
-    var pin = pinDevice(index) orelse return false;
-    defer unpinDevice(&pin);
-    const device = pin.device;
-    if (device.flush_fn == null and device.async_submit_fn == null) return true;
-    const request_id = enqueueRequest(device, .flush, 0, 0, null, null, 0, .none) orelse {
-        recordFlushFailure(device, device.stats.last_error);
-        return false;
-    };
-    scheduleDeviceQueue(device, runtimeWorkerReady());
-    return waitForRequest(device, request_id, requestTimeout(device)).ok;
-}
-
-fn enqueueRequest(
-    device: *Device,
-    kind: RequestKind,
-    lba: u64,
-    sectors: u16,
-    buffer: ?[*]u8,
-    const_buffer: ?[*]const u8,
-    buffer_len: usize,
-    buffer_ownership: block_dispatch.BufferOwnership,
-) ?u64 {
-    const timeout = requestTimeout(device);
-    const forever = timeout == sync.WAIT_FOREVER;
-    const wait_start = timer.tickCount();
-    const finite_deadline = if (forever) std.math.maxInt(u64) else timer.deadlineAfter(wait_start, timeout);
-    while (true) {
-        const locked = lockDevice(device);
-        if (device.resetting) {
-            unlockDevice(device, locked);
-            recordQueueBackpressure(device, .busy);
-            return null;
-        }
-        if (findFreeSlot(device)) |slot_index| {
-            device.stats.next_request_id +%= 1;
-            const id = device.stats.next_request_id;
-            device.request_slots[slot_index] = .{
-                .state = .queued,
-                .id = id,
-                .kind = kind,
-                .lba = lba,
-                .sectors = sectors,
-                .buffer = buffer,
-                .const_buffer = const_buffer,
-                .buffer_len = buffer_len,
-                .buffer_ownership = buffer_ownership,
-                .submit_tick = timer.tickCount(),
-            };
-            device.stats.queued_requests +%= 1;
-            updateQueueHighWater(device);
-            unlockDevice(device, locked);
-            return id;
-        }
-
-        device.stats.queue_full_waits +%= 1;
-        unlockDevice(device, locked);
-        if (!canBlockOnStorage()) {
-            recordQueueBackpressure(device, .busy);
-            return null;
-        }
-
-        const now = timer.tickCount();
-        if (!forever and now >= finite_deadline) {
-            recordQueueBackpressure(device, .timeout);
-            return null;
-        }
-        // A wake for a competing submitter must not restart this request's
-        // relative timeout. Wait only the remaining absolute admission budget.
-        const remaining = if (forever) sync.WAIT_FOREVER else finite_deadline - now;
-        const wait_result = device.slot_available.wait(remaining, "block-slot");
-        if (wait_result == .signaled) continue;
-        recordQueueBackpressure(device, switch (wait_result) {
-            .timeout => .timeout,
-            .cancelled, .killed, .failed => .cancelled,
-            else => .busy,
-        });
-        return null;
-    }
-}
-
-fn scheduleDeviceQueue(device: *Device, use_runtime_worker: bool) void {
-    // The caller chooses the execution owner before publishing any buffer.
-    // Re-checking here could switch an unbounced early-boot pointer to the
-    // asynchronous worker if that worker became live between enqueue/wake.
-    if (use_runtime_worker) {
-        runtime_summary.worker_wakeups +%= 1;
-        const lane = effectiveWorkerLane(device.controller_lane);
-        if (lane != block_dispatch.no_lane) {
-            controller_runtime[lane].event.signal();
-            return;
-        }
-        // A worker disappearing between admission and publication is rare,
-        // but the request still owns a safe resident/bounce buffer. Execute
-        // it synchronously instead of stranding the queue.
-        _ = pumpDeviceQueue(device, .boot_inline);
-        return;
-    }
-
-    _ = pumpDeviceQueue(device, .boot_inline);
-}
-
-fn pumpDeviceQueue(device: *Device, mode: ExecutionMode) bool {
-    var did_work = false;
-    while (true) {
-        if (takeReadyCompletion(device)) |ready| {
-            did_work = true;
-            const result = classifyAsyncCompletion(ready.request, ready.completion);
-            finishRequest(device, ready.request, result.ok, result.err);
-            continue;
-        }
-        const request = beginNextRequest(device, mode) orelse break;
-        did_work = true;
-        // Preload storage is registered and scanned before the scheduler and
-        // controller workers exist. A v2 backend therefore keeps its v1
-        // callbacks as the bounded boot fallback and switches to nonblocking
-        // submit only on the runtime worker. This permits one canonical
-        // descriptor to remain bootable and become parallel later.
-        if (useAsyncSubmission(mode, device.async_submit_fn != null)) if (device.async_submit_fn) |submit| {
-            submitAsyncRequest(device, request, submit);
-            continue;
-        };
-        const result = executeRequest(device, request);
-        finishRequest(device, request, result.ok, result.err);
-    }
-    return did_work;
-}
-
-const ReadyCompletion = struct {
-    request: RequestExecution,
-    completion: block_dispatch.Completion,
-};
-
-fn takeReadyCompletion(device: *Device) ?ReadyCompletion {
-    const locked = lockDevice(device);
-    var index: usize = 0;
-    while (index < device.request_slots.len) : (index += 1) {
-        const slot = &device.request_slots[index];
-        if (slot.state != .active or slot.backend_handle == 0) continue;
-        const irq_flags = owner_locks.storage.acquire();
-        const completion = slot.completion_latch.take();
-        owner_locks.storage.release(irq_flags);
-        if (completion) |value| {
-            const request = executionFromSlot(index, slot.*);
-            unlockDevice(device, locked);
-            return .{ .request = request, .completion = value };
-        }
-    }
-    unlockDevice(device, locked);
-    return null;
-}
-
-fn submitAsyncRequest(device: *Device, request: RequestExecution, submit: AsyncSubmitFn) void {
-    device.stats.async_submissions +%= 1;
-    runtime_summary.async_submissions +%= 1;
-    const public_request = AsyncRequest{
-        .handle = request.backend_handle,
-        .kind = request.kind,
-        .lba = request.lba,
-        .sectors = request.sectors,
-        .buffer = request.buffer,
-        .const_buffer = request.const_buffer,
-        .buffer_len = request.buffer_len,
-        .complete = asyncBackendComplete,
-    };
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) {
-        finishRequest(device, request, false, .busy);
-        return;
-    }
-    defer _ = task_context.leaveUnwind(unwind);
-    const submit_result = submit(device.ctx, &public_request);
-    if (submit_result == 0) return;
-
-    // A backend may complete inline before returning. Completion owns the
-    // terminal result in that race; otherwise the nonzero submit result means
-    // hardware never acquired the request or its buffer.
-    const irq_flags = owner_locks.storage.acquire();
-    const rejected = if (request.slot_index < device.request_slots.len)
-        device.request_slots[request.slot_index].completion_latch.rejectSubmission(request.backend_handle)
-    else
-        false;
-    owner_locks.storage.release(irq_flags);
-    if (!rejected) return;
-    finishRequest(device, request, false, if (submit_result > 0) .busy else backendErrorForKind(request.kind));
-}
-
-fn classifyAsyncCompletion(request: RequestExecution, completion: block_dispatch.Completion) RequestResult {
-    if (completion.result == ASYNC_RESULT_OK) {
-        const expected: u32 = switch (request.kind) {
-            .read, .write => @intCast(request.buffer_len),
-            .flush, .none => 0,
-        };
-        if (completion.bytes == expected) return .{ .ok = true };
-        return .{ .err = backendErrorForKind(request.kind) };
-    }
-    return .{ .err = switch (completion.result) {
-        ASYNC_RESULT_CANCELLED => .cancelled,
-        ASYNC_RESULT_TIMEOUT => .timeout,
-        ASYNC_RESULT_RESET => .reset,
-        ASYNC_RESULT_SHUTDOWN => .shutdown,
-        else => backendErrorForKind(request.kind),
-    } };
-}
-
-fn backendErrorForKind(kind: RequestKind) Error {
-    return switch (kind) {
-        .read => .backend_read,
-        .write => .backend_write,
-        .flush => .backend_flush,
-        .none => .invalid_request,
-    };
-}
-
-fn beginNextRequest(device: *Device, mode: ExecutionMode) ?RequestExecution {
-    const locked = lockDevice(device);
-    const slot_index = findQueuedSlot(device) orelse {
-        unlockDevice(device, locked);
-        return null;
-    };
-    const queued = &device.request_slots[slot_index];
-    if (device.resetting or !block_dispatch.submissionAllowed(
-        device.active_executions,
-        device.queue_depth,
-        queued.kind == .flush,
-        hasActiveFlush(device),
-    )) {
-        unlockDevice(device, locked);
-        return null;
-    }
-    const start_tick = timer.tickCount();
-    var slot = &device.request_slots[slot_index];
-    slot.state = .active;
-    slot.start_tick = start_tick;
-    slot.execution_mode = mode;
-    if (useAsyncSubmission(mode, device.async_submit_fn != null)) {
-        slot.backend_handle = nextBackendHandle(device.slot_index, slot_index);
-        if (!slot.completion_latch.activate(slot.backend_handle)) {
-            slot.state = .queued;
-            slot.backend_handle = 0;
-            unlockDevice(device, locked);
-            return null;
-        }
-    }
-    device.active_executions +|= 1;
-    if (device.active_executions > device.stats.in_flight_high_water) {
-        device.stats.in_flight_high_water = device.active_executions;
-    }
-    runtime_summary.in_flight +|= 1;
-    if (runtime_summary.in_flight > runtime_summary.in_flight_high_water) {
-        runtime_summary.in_flight_high_water = runtime_summary.in_flight;
-    }
-    device.stats.dequeued_requests +%= 1;
-    device.stats.active_request = snapshotFromSlot(slot.*);
-    device.state = .busy;
-    const request = RequestExecution{
-        .slot_index = slot_index,
-        .id = slot.id,
-        .kind = slot.kind,
-        .lba = slot.lba,
-        .sectors = slot.sectors,
-        .buffer = slot.buffer,
-        .const_buffer = slot.const_buffer,
-        .buffer_len = slot.buffer_len,
-        .buffer_ownership = slot.buffer_ownership,
-        .start_tick = start_tick,
-        .mode = mode,
-        .backend_handle = slot.backend_handle,
-    };
-    switch (mode) {
-        .boot_inline => {
-            device.stats.boot_inline_requests +%= 1;
-            runtime_summary.boot_inline_requests +%= 1;
-        },
-        .runtime_worker => {
-            device.stats.worker_requests +%= 1;
-            runtime_summary.worker_runtime_requests +%= 1;
-            runtime_summary.worker_parallel_active +|= 1;
-            if (runtime_summary.worker_parallel_active > runtime_summary.worker_parallel_active_max) {
-                runtime_summary.worker_parallel_active_max = runtime_summary.worker_parallel_active;
-            }
-        },
-    }
-    unlockDevice(device, locked);
-    return request;
+    return r4os_rust_block_flush(index);
 }
 
 fn useAsyncSubmission(mode: ExecutionMode, has_submit: bool) bool {
-    return has_submit and mode == .runtime_worker;
-}
-
-fn executionFromSlot(slot_index: usize, slot: RequestSlot) RequestExecution {
-    return .{
-        .slot_index = slot_index,
-        .id = slot.id,
-        .kind = slot.kind,
-        .lba = slot.lba,
-        .sectors = slot.sectors,
-        .buffer = slot.buffer,
-        .const_buffer = slot.const_buffer,
-        .buffer_len = slot.buffer_len,
-        .buffer_ownership = slot.buffer_ownership,
-        .start_tick = slot.start_tick,
-        .mode = slot.execution_mode,
-        .backend_handle = slot.backend_handle,
-    };
-}
-
-fn hasActiveFlush(device: *const Device) bool {
-    for (device.request_slots) |slot| {
-        if (slot.state == .active and slot.kind == .flush) return true;
-    }
-    return false;
-}
-
-fn nextBackendHandle(device_index: u8, request_slot: usize) u64 {
-    next_backend_handle_sequence = (next_backend_handle_sequence +% 1) & 0x0000_FFFF_FFFF_FFFF;
-    if (next_backend_handle_sequence == 0) next_backend_handle_sequence = 1;
-    return (next_backend_handle_sequence << 16) |
-        (@as(u64, device_index) + 1) << 8 |
-        (@as(u64, @intCast(request_slot)) + 1);
+    return r4os_rust_block_async_submission(@intFromEnum(mode), has_submit);
 }
 
 pub fn asyncBackendComplete(handle: u64, result: i32, bytes: u32) callconv(.c) void {
-    const encoded_request = handle & 0xFF;
-    const encoded_device = (handle >> 8) & 0xFF;
-    if (encoded_request == 0 or encoded_device == 0) {
-        runtime_summary.late_completions +%= 1;
-        return;
-    }
-    const request_slot: usize = @intCast(encoded_request - 1);
-    const device_index: usize = @intCast(encoded_device - 1);
-    if (device_index >= devices.len or request_slot >= MAX_REQUEST_QUEUE_DEPTH) {
-        runtime_summary.late_completions +%= 1;
-        return;
-    }
-
-    const irq_flags = owner_locks.storage.acquire();
-    const device_slot = &devices[device_index];
-    if (!device_slot.used) {
-        runtime_summary.late_completions +%= 1;
-        owner_locks.storage.release(irq_flags);
-        return;
-    }
-    const device = &device_slot.device;
-    const slot = &device.request_slots[request_slot];
-    if (slot.state != .active or slot.backend_handle != handle) {
-        device.stats.late_completions +%= 1;
-        runtime_summary.late_completions +%= 1;
-        owner_locks.storage.release(irq_flags);
-        return;
-    }
-    if (!slot.completion_latch.publish(handle, result, bytes)) {
-        device.stats.duplicate_completions +%= 1;
-        runtime_summary.duplicate_completions +%= 1;
-        owner_locks.storage.release(irq_flags);
-        return;
-    }
-    const lane = effectiveWorkerLane(device.controller_lane);
-    owner_locks.storage.release(irq_flags);
-    if (lane != block_dispatch.no_lane) {
-        runtime_summary.worker_wakeups +%= 1;
-        controller_runtime[lane].event.signal();
-    }
-}
-
-fn executeRequest(device: *Device, request: RequestExecution) RequestResult {
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) return .{ .err = .busy };
-    defer _ = task_context.leaveUnwind(unwind);
-    switch (request.kind) {
-        .read => {
-            const out_ptr = request.buffer orelse return .{ .err = .buffer_too_small };
-            const ok = device.read_fn(device.ctx, request.lba, request.sectors, out_ptr[0..request.buffer_len]);
-            return .{ .ok = ok, .err = if (ok) .none else .backend_read };
-        },
-        .write => {
-            const write_fn = device.write_fn orelse return .{ .err = .no_writer };
-            const data_ptr = request.const_buffer orelse return .{ .err = .buffer_too_small };
-            const ok = write_fn(device.ctx, request.lba, request.sectors, data_ptr[0..request.buffer_len]);
-            return .{ .ok = ok, .err = if (ok) .none else .backend_write };
-        },
-        .flush => {
-            const flush_fn = device.flush_fn orelse return .{ .ok = true };
-            const ok = flush_fn(device.ctx);
-            return .{ .ok = ok, .err = if (ok) .none else .backend_flush };
-        },
-        .none => return .{ .err = .invalid_request },
-    }
-}
-
-fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Error) void {
-    var detached_buffer: ?[]u8 = null;
-    const locked = lockDevice(device);
-    if (request.slot_index >= effectiveQueueDepth(device)) {
-        unlockDevice(device, locked);
-        return;
-    }
-    var slot = &device.request_slots[request.slot_index];
-    if (slot.id != request.id or slot.state != .active or
-        (request.backend_handle != 0 and slot.backend_handle != request.backend_handle))
-    {
-        unlockDevice(device, locked);
-        return;
-    }
-    const irq_flags = owner_locks.storage.acquire();
-    slot.completion_latch.invalidate();
-    owner_locks.storage.release(irq_flags);
-    // Only the exact live execution owns one active count. A stale or double
-    // completion must not make quiescence visible while real I/O still runs.
-    if (device.active_executions != 0) device.active_executions -= 1;
-    if (runtime_summary.in_flight != 0) runtime_summary.in_flight -= 1;
-    const complete_tick = timer.tickCount();
-    const latency = if (complete_tick >= request.start_tick) complete_tick - request.start_tick else 0;
-    const completion_override = slot.completion_override;
-    const caller_detached = slot.caller_detached;
-    if (caller_detached and slot.buffer_ownership == .bounce_owned) {
-        detached_buffer = switch (request.kind) {
-            .read => if (request.buffer) |ptr| ptr[0..request.buffer_len] else null,
-            .write => if (request.const_buffer) |ptr| @constCast(ptr[0..request.buffer_len]) else null,
-            else => null,
-        };
-    }
-    slot.state = .completed;
-    slot.ok = if (completion_override != .none) false else ok;
-    slot.err = if (completion_override != .none) completion_override else err;
-    slot.complete_tick = complete_tick;
-    device.stats.last_request = snapshotFromSlot(slot.*);
-    device.stats.active_request = oldestActiveSnapshot(device, request.slot_index);
-    device.stats.completion_last_ticks = latency;
-    device.stats.completion_total_ticks +%= latency;
-    if (latency > device.stats.completion_max_ticks) device.stats.completion_max_ticks = latency;
-    if (completion_override != .none) {
-        if (!caller_detached) recordRequestFailure(device, request.kind, completion_override);
-    } else if (ok) {
-        recordRequestSuccess(device, request.kind, request.sectors);
-    } else {
-        recordRequestFailure(device, request.kind, err);
-    }
-    if (request.backend_handle != 0) {
-        device.stats.async_completions +%= 1;
-        runtime_summary.async_completions +%= 1;
-    }
-    if (!caller_detached) {
-        _ = device.completion_available.wakeAll();
-        device.stats.completion_signals +%= 1;
-        runtime_summary.completion_signals +%= 1;
-    }
-    switch (request.mode) {
-        .boot_inline => {
-            device.stats.boot_inline_completions +%= 1;
-            runtime_summary.boot_inline_completions +%= 1;
-        },
-        .runtime_worker => {
-            device.stats.worker_completions +%= 1;
-            runtime_summary.worker_runtime_completions +%= 1;
-            if (runtime_summary.worker_parallel_active != 0) {
-                runtime_summary.worker_parallel_active -= 1;
-            }
-        },
-    }
-    if (caller_detached) {
-        slot.* = .{};
-        _ = device.slot_available.wakeOne();
-    }
-    unlockDevice(device, locked);
-    if (detached_buffer) |memory| _ = heap.free(memory);
+    r4os_rust_block_complete(handle, result, bytes);
 }
 
 // Storage-wait watchdog (0.60.20): a device registered without a timeout
@@ -1766,167 +665,22 @@ fn finishRequest(device: *Device, request: RequestExecution, ok: bool, err: Erro
 // ownership-safe forever wait and keeps the backed-off reports.
 const WATCHDOG_SLICE_TICKS: u64 = 5 * @as(u64, timer.DEFAULT_HZ);
 
-fn shouldReportWatchdogSlice(slices: u32) bool {
-    return slices == 1 or (slices & (slices - 1)) == 0;
-}
-
-fn watchdogReport(
-    device: *Device,
-    request_id: u64,
-    slices: u32,
-    incident_token: *diag_screen.IncidentToken,
-) void {
-    // COM1/LOGSVC may be unreachable (LOGSVC itself needs storage), so paint
-    // straight to the framebuffer. Do not enter crash mode merely because a
-    // slow removable device crossed one observation slice.
-    // First line BEFORE taking the device lock: if the queue lock itself is
-    // wedged, at least the stall marker reaches the framebuffer.
-    if (!incident_token.*.valid()) {
-        incident_token.* = diag_screen.beginResolvableIncident();
-    }
-    diag_screen.write("[BLOCK] stall dev=");
-    diag_screen.write(device.name);
-    diag_screen.write(" slice=");
-    diag_screen.writeDec(slices);
-    diag_screen.endLine();
-    k.puts("[BLOCK] watchdog: stall dev=");
-    k.puts(device.name);
-    k.puts(" slice=");
-    putDec(slices);
-    k.puts("\n");
-    var snapshot: RequestSlot = .{};
-    var have_slot = false;
-    const locked = device.queue_lock.tryLock();
-    if (locked) {
-        if (findSlotById(device, request_id)) |slot_index| {
-            snapshot = device.request_slots[slot_index];
-            have_slot = true;
-        }
-    }
-    const dev_state = device.state;
-    unlockDevice(device, locked);
-
-    diag_screen.write("[BLOCK] request dev=");
-    diag_screen.write(device.name);
-    diag_screen.write(" state=");
-    diag_screen.write(@tagName(dev_state));
-    if (!locked) {
-        diag_screen.write(" queue_lock=busy");
-    } else if (have_slot) {
-        diag_screen.write(" req=");
-        diag_screen.write(@tagName(snapshot.kind));
-        diag_screen.write(" slot=");
-        diag_screen.write(@tagName(snapshot.state));
-        diag_screen.write(" lba=");
-        diag_screen.writeDec(snapshot.lba);
-        diag_screen.write(" sectors=");
-        diag_screen.writeDec(snapshot.sectors);
-    } else {
-        diag_screen.write(" req=unknown");
-    }
-    diag_screen.endLine();
-
-    k.puts("[BLOCK] watchdog: request stalled dev=");
-    k.puts(device.name);
-    k.puts(" driver=");
-    k.puts(device.driver);
-    k.puts(" state=");
-    k.puts(@tagName(dev_state));
-    k.puts(" slice=");
-    putDec(slices);
-    if (have_slot) {
-        k.puts(" req=");
-        k.puts(@tagName(snapshot.kind));
-        k.puts(" slot=");
-        k.puts(@tagName(snapshot.state));
-        k.puts(" lba=");
-        putDec(snapshot.lba);
-        k.puts(" sectors=");
-        putDec(snapshot.sectors);
-        k.puts(" submit_tick=");
-        putDec(snapshot.submit_tick);
-        k.puts(" start_tick=");
-        putDec(snapshot.start_tick);
-        k.puts(" now=");
-        putDec(timer.tickCount());
-    } else {
-        k.puts(" req=unknown");
-    }
-    k.puts("\n");
-}
-
 /// Deadman probe (0.60.20): is any request slot executing in a driver
 /// callback for longer than `threshold` ticks?  The runtime worker calls
 /// the driver synchronously; a slot that stays .active that long means the
 /// worker is stuck (or spinning) INSIDE the driver -- invisible to
 /// blocked-task scans.  Racy read-only scan, crash-class trigger only.
 pub fn hasStalledExecution(now: u64, threshold: u64) bool {
-    var index: usize = 0;
-    while (index < device_slot_count) : (index += 1) {
-        const slot_entry = &devices[index];
-        if (!slot_entry.used) continue;
-        const device = &slot_entry.device;
-        for (device.request_slots) |slot| {
-            if (slot.state != .active) continue;
-            if (now < slot.start_tick) continue;
-            if (now - slot.start_tick > threshold) return true;
-        }
-    }
-    return false;
+    return r4os_rust_block_stalled(now, threshold);
 }
-
 /// Framebuffer-direct variant of dumpStalledExecutions (0.60.20).
 pub fn dumpStalledToDiag(now: u64, threshold: u64) void {
-    var index: usize = 0;
-    while (index < device_slot_count) : (index += 1) {
-        const slot_entry = &devices[index];
-        if (!slot_entry.used) continue;
-        const device = &slot_entry.device;
-        for (device.request_slots) |slot| {
-            if (slot.state != .active) continue;
-            if (now < slot.start_tick or now - slot.start_tick <= threshold) continue;
-            diag_screen.write("[BLOCK] stalled exec dev=");
-            diag_screen.write(device.name);
-            diag_screen.write(" drv=");
-            diag_screen.write(device.driver);
-            diag_screen.write(" req=");
-            diag_screen.write(@tagName(slot.kind));
-            diag_screen.write(" lba=");
-            diag_screen.writeDec(slot.lba);
-            diag_screen.write(" active_for=");
-            diag_screen.writeDec(now - slot.start_tick);
-            diag_screen.endLine();
-        }
-    }
+    r4os_rust_block_dump(now, threshold, true);
 }
-
 /// Paints every stalled execution (see hasStalledExecution) to the log.
 pub fn dumpStalledExecutions(now: u64, threshold: u64) void {
-    var index: usize = 0;
-    while (index < device_slot_count) : (index += 1) {
-        const slot_entry = &devices[index];
-        if (!slot_entry.used) continue;
-        const device = &slot_entry.device;
-        for (device.request_slots) |slot| {
-            if (slot.state != .active) continue;
-            if (now < slot.start_tick or now - slot.start_tick <= threshold) continue;
-            k.puts("[BLOCK] stalled execution dev=");
-            k.puts(device.name);
-            k.puts(" driver=");
-            k.puts(device.driver);
-            k.puts(" req=");
-            k.puts(@tagName(slot.kind));
-            k.puts(" lba=");
-            putDec(slot.lba);
-            k.puts(" sectors=");
-            putDec(slot.sectors);
-            k.puts(" active_for=");
-            putDec(now - slot.start_tick);
-            k.puts(" ticks\r\n");
-        }
-    }
+    r4os_rust_block_dump(now, threshold, false);
 }
-
 fn putDec(value: u64) void {
     var digits: [20]u8 = undefined;
     if (value == 0) {
@@ -1942,395 +696,130 @@ fn putDec(value: u64) void {
     k.puts(digits[i..]);
 }
 
-fn waitForRequest(device: *Device, request_id: u64, timeout: u64) RequestResult {
-    var counted_wait = false;
-    var watchdog_slices: u32 = 0;
-    var incident_token: diag_screen.IncidentToken = .{};
-    defer if (incident_token.valid()) {
-        // Success and classified failure both end this reporter's lifetime.
-        // resolveIncident retains the evidence but prevents an abandoned
-        // token from suppressing every later storage diagnosis.
-        _ = diag_screen.resolveIncident(incident_token);
-    };
-    const forever = timeout == sync.WAIT_FOREVER;
-    const wait_start = timer.tickCount();
-    const finite_deadline = if (forever) std.math.maxInt(u64) else timer.deadlineAfter(wait_start, timeout);
-    while (true) {
-        const locked = lockDevice(device);
-        const slot_index = findSlotById(device, request_id) orelse {
-            unlockDevice(device, locked);
-            return .{ .err = .invalid_request };
-        };
-        if (!counted_wait) {
-            device.stats.completion_waits +%= 1;
-            counted_wait = true;
-        }
-        const slot = &device.request_slots[slot_index];
-        if (slot.state == .completed) {
-            const result = RequestResult{ .ok = slot.ok, .err = slot.err };
-            device.request_slots[slot_index] = .{};
-            _ = device.slot_available.wakeOne();
-            unlockDevice(device, locked);
-            return result;
-        }
-        unlockDevice(device, locked);
+extern fn r4os_rust_block_workers_init() callconv(.c) void;
+extern fn r4os_rust_block_workers_start() callconv(.c) bool;
+extern fn r4os_rust_block_workers_ready() callconv(.c) bool;
+extern fn r4os_rust_block_workers_alive() callconv(.c) bool;
+extern fn r4os_rust_block_workers_summary(*RuntimeSummary) callconv(.c) void;
+extern fn r4os_rust_block_worker_alive(u8) callconv(.c) bool;
+extern fn r4os_rust_block_worker_start(u8, bool) callconv(.c) bool;
+extern fn r4os_rust_block_worker_lane(u8) callconv(.c) u8;
+extern fn r4os_rust_block_worker_signal(u8) callconv(.c) void;
 
-        if (!canBlockOnStorage()) {
-            _ = pumpDeviceQueue(device, .boot_inline);
-            continue;
-        }
-
-        if (forever) {
-            const wait_result = device.completion_available.wait(WATCHDOG_SLICE_TICKS, "block-completion");
-            if (wait_result == .signaled) continue;
-            if (wait_result == .cancelled or wait_result == .killed or wait_result == .failed) {
-                switch (requestAbort(device, request_id, .cancelled, CANCEL_REASON_CALLER)) {
-                    .retry => continue,
-                    .done => |result| return result,
-                    .wait_for_completion => {},
-                }
-            }
-            watchdog_slices += 1;
-            if (shouldReportWatchdogSlice(watchdog_slices)) {
-                watchdogReport(device, request_id, watchdog_slices, &incident_token);
-            }
-            continue;
-        }
-        // A foreign completion wakeup must not restart the caller's entire
-        // timeout.  Every pass waits only the remaining absolute budget.
-        const now = timer.tickCount();
-        var wait_result: sync.WaitResult = .timeout;
-        if (now < finite_deadline) {
-            wait_result = device.completion_available.wait(finite_deadline - now, "block-completion");
-            if (wait_result == .signaled) continue;
-        }
-        const abort_error: Error = if (wait_result == .cancelled or wait_result == .killed or wait_result == .failed)
-            .cancelled
-        else
-            .timeout;
-        const abort_reason = if (abort_error == .timeout) CANCEL_REASON_TIMEOUT else CANCEL_REASON_CALLER;
-        switch (requestAbort(device, request_id, abort_error, abort_reason)) {
-            .retry => continue,
-            .done => |result| return result,
-            .wait_for_completion => {
-                watchdog_slices += 1;
-                if (shouldReportWatchdogSlice(watchdog_slices)) {
-                    watchdogReport(device, request_id, watchdog_slices, &incident_token);
-                }
-                _ = device.completion_available.wait(WATCHDOG_SLICE_TICKS, "block-direct-completion");
-                continue;
-            },
-        }
-    }
+const NativeDeviceState = extern struct { state: *State, resetting: *bool, active: *u32, stats: *Stats };
+extern fn r4os_rust_block_device_state(*const NativeDeviceState, u8, u8, u8, u16) callconv(.c) bool;
+fn changeDeviceState(device: *Device, operation: u8, kind: RequestKind, err: Error, sectors: u16) bool {
+    const input = NativeDeviceState{ .state = &device.state, .resetting = &device.resetting, .active = &device.active_executions, .stats = &device.stats };
+    return r4os_rust_block_device_state(&input, operation, @intFromEnum(kind), @intFromEnum(err), sectors);
+}
+comptime {
+    if (@sizeOf(NativeDeviceState) != 32) @compileError("Native device status C view differs");
 }
 
-const AbortDisposition = union(enum) {
-    retry,
-    wait_for_completion,
-    done: RequestResult,
+const NativeIoView = extern struct { reference: access.DeviceRef, sector_size: u32, sector_count: u64, max_sectors: u16, queue_depth: u16, timeout: u64, writable: bool, has_writer: bool, has_submit: bool, has_flush: bool, stats: *Stats };
+const NativeTransfer = extern struct { sectors_completed: u16, err: u8 };
+const NativeWrite = extern struct { lba: u64, sectors: u16, data: [*]const u8, len: usize, attempted: bool, ok: bool };
+const NativeEnqueue = extern struct { kind: RequestKind, lba: u64, sectors: u16, buffer: ?[*]u8, data: ?[*]const u8, len: usize, ownership: block_dispatch.BufferOwnership };
+extern fn r4os_rust_block_read(usize, u64, u16, [*]u8, usize, bool) callconv(.c) bool;
+extern fn r4os_rust_block_write(usize, u64, u16, [*]const u8, usize, bool, *NativeTransfer) callconv(.c) void;
+extern fn r4os_rust_block_write_batch(usize, *const access.DeviceRef, *[direct_write_batch_limit]NativeWrite, usize, bool) callconv(.c) usize;
+extern fn r4os_rust_block_flush(usize) callconv(.c) bool;
+export fn r4os_zig_block_io_view(device: *Device, out: *NativeIoView) callconv(.c) void {
+    out.* = .{ .reference = device.access_ref, .sector_size = device.sector_size, .sector_count = device.sector_count, .max_sectors = device.max_sectors_per_request, .queue_depth = device.queue_depth, .timeout = device.timeout_ticks, .writable = device.writable, .has_writer = device.write_fn != null, .has_submit = device.async_submit_fn != null, .has_flush = device.flush_fn != null, .stats = &device.stats };
+}
+comptime {
+    if (@sizeOf(NativeIoView) != 64 or @sizeOf(NativeTransfer) != 4 or @sizeOf(NativeWrite) != 40 or @sizeOf(NativeEnqueue) != 56) @compileError("Native logical block I/O C layout differs");
+}
+
+const NativeExecutionView = extern struct {
+    io: NativeIoView,
+    state: NativeDeviceState,
+    slots: *[MAX_REQUEST_QUEUE_DEPTH]RequestSlot,
+    mutex: *sync.Mutex,
+    slot_available: *sync.WaitQueue,
+    completion_available: *sync.WaitQueue,
+    name: RegistryText,
+    driver: RegistryText,
+    index: u8,
+    lane: u8,
+    has_cancel: bool,
+    has_reset: bool,
+    bus: u8,
+    queue_depth: *u16,
 };
-
-fn requestAbort(device: *Device, request_id: u64, abort_error: Error, reason: u32) AbortDisposition {
-    const locked = lockDevice(device);
-    const slot_index = findSlotById(device, request_id) orelse {
-        if (abort_error == .timeout) {
-            device.stats.timeout_failures +%= 1;
-            device.stats.completion_timeouts +%= 1;
-        }
-        device.stats.last_error = abort_error;
-        unlockDevice(device, locked);
-        return .{ .done = .{ .err = abort_error } };
-    };
-    var slot = &device.request_slots[slot_index];
-    switch (slot.state) {
-        .queued => {
-            recordRequestFailure(device, slot.kind, abort_error);
-            if (abort_error == .timeout) device.stats.completion_timeouts +%= 1;
-            slot.* = .{};
-            _ = device.slot_available.wakeOne();
-            unlockDevice(device, locked);
-            return .{ .done = .{ .err = abort_error } };
+extern fn r4os_rust_block_register(*const Registration, *const Device, *const fn (*Device, *const Device, *const access.DeviceRef, u8) callconv(.c) void, *DeviceSlot) callconv(.c) bool;
+extern fn r4os_rust_block_unregister(usize) callconv(.c) bool;
+extern fn r4os_rust_block_sync_init(*const NativeExecutionView) callconv(.c) void;
+extern fn r4os_rust_block_retirement_prepare(usize, *UnregisterToken) callconv(.c) bool;
+extern fn r4os_rust_block_retirement_commit(*UnregisterToken) callconv(.c) bool;
+extern fn r4os_rust_block_retirement_cancel(*UnregisterToken) callconv(.c) bool;
+extern fn r4os_rust_block_exclude(u8) callconv(.c) bool;
+extern fn r4os_rust_block_device_operation(usize, u8, u8, u8, u8, u8) callconv(.c) u32;
+extern fn r4os_rust_block_reset(usize, u32) callconv(.c) bool;
+extern fn r4os_rust_block_complete(u64, i32, u32) callconv(.c) void;
+extern fn r4os_rust_block_label(u8, u8, *RegistryText) callconv(.c) void;
+extern fn r4os_rust_block_stalled(u64, u64) callconv(.c) bool;
+extern fn r4os_rust_block_dump(u64, u64, bool) callconv(.c) void;
+extern fn r4os_rust_block_nvme_probe() callconv(.c) bool;
+export fn r4os_zig_block_execution_view(device: *Device, out: *NativeExecutionView) callconv(.c) void {
+    r4os_zig_block_io_view(device, &out.io);
+    out.state = .{ .state = &device.state, .resetting = &device.resetting, .active = &device.active_executions, .stats = &device.stats };
+    out.slots = &device.request_slots;
+    out.mutex = &device.queue_lock;
+    out.slot_available = &device.slot_available;
+    out.completion_available = &device.completion_available;
+    out.name = registryText(device.name);
+    out.driver = registryText(device.driver);
+    out.index = device.slot_index;
+    out.lane = device.controller_lane;
+    out.has_cancel = device.async_cancel_fn != null;
+    out.has_reset = device.async_reset_fn != null;
+    out.bus = @intFromEnum(device.bus);
+    out.queue_depth = &device.queue_depth;
+}
+export fn r4os_zig_block_backend(device: *Device, request: ?*const RequestExecution, operation: u8, reason: u32) callconv(.c) i32 {
+    switch (operation) {
+        1 => {
+            const r = request.?;
+            return @intFromBool(device.read_fn(device.ctx, r.lba, r.sectors, r.buffer.?[0..r.buffer_len]));
         },
-        .completed => {
-            unlockDevice(device, locked);
-            return .retry;
+        2 => {
+            const r = request.?;
+            return @intFromBool(device.write_fn.?(device.ctx, r.lba, r.sectors, r.const_buffer.?[0..r.buffer_len]));
         },
-        .active => {
-            const first_abort = slot.completion_override == .none;
-            if (first_abort) slot.completion_override = abort_error;
-            const first_timeout = abort_error == .timeout and !slot.timeout_requested;
-            if (first_timeout) {
-                slot.timeout_requested = true;
-                device.stats.completion_timeouts +%= 1;
-            }
-            const first_cancel = !slot.cancel_requested;
-            if (first_cancel) slot.cancel_requested = true;
-            const request = executionFromSlot(slot_index, slot.*);
-            const action = block_dispatch.activeTimeoutAction(slot.buffer_ownership);
-            if (action == .wait_for_completion) {
-                if (first_timeout) {
-                    device.stats.direct_timeout_waits +%= 1;
-                    runtime_summary.direct_timeout_waits +%= 1;
-                }
-                unlockDevice(device, locked);
-                if (first_cancel) requestBackendCancel(device, request, reason);
-                return .wait_for_completion;
-            }
-
-            const first_detach = !slot.caller_detached;
-            slot.caller_detached = true;
-            if (first_detach) recordRequestFailure(device, slot.kind, abort_error);
-            const buffer_detached = action == .detach_with_buffer;
-            unlockDevice(device, locked);
-            if (first_cancel) requestBackendCancel(device, request, reason);
-            return .{ .done = .{ .err = abort_error, .buffer_detached = buffer_detached } };
+        3 => return @intFromBool(device.flush_fn.?(device.ctx)),
+        4 => {
+            const r = request.?;
+            const public_request = AsyncRequest{ .handle = r.backend_handle, .kind = r.kind, .lba = r.lba, .sectors = r.sectors, .buffer = r.buffer, .const_buffer = r.const_buffer, .buffer_len = r.buffer_len, .complete = asyncBackendComplete };
+            return device.async_submit_fn.?(device.ctx, &public_request);
         },
-        .free => {
-            unlockDevice(device, locked);
-            return .{ .done = .{ .err = abort_error } };
-        },
+        5 => return device.async_cancel_fn.?(device.ctx, request.?.backend_handle, reason),
+        6 => return device.async_reset_fn.?(device.ctx, reason),
+        else => unreachable,
     }
 }
-
-fn requestBackendCancel(device: *Device, request: RequestExecution, reason: u32) void {
-    if (request.backend_handle == 0) return;
-    const cancel = device.async_cancel_fn orelse return;
-    device.stats.async_cancel_requests +%= 1;
-    runtime_summary.async_cancel_requests +%= 1;
-    _ = cancel(device.ctx, request.backend_handle, reason);
+export fn r4os_zig_block_mount_index(index: usize, out: *usize) callconv(.c) bool {
+    const mounted = drive.atIndex(index) orelse return false;
+    out.* = mounted.block_device_index orelse return false;
+    return true;
 }
-
-fn recordRequestSuccess(device: *Device, kind: RequestKind, sectors: u16) void {
-    device.stats.last_error = .none;
-    device.stats.completions += 1;
-    device.state = if (device.active_executions != 0) .busy else .active;
-    switch (kind) {
-        .read => {
-            device.stats.read_ops += 1;
-            device.stats.read_sectors += sectors;
-        },
-        .write => {
-            device.stats.write_ops += 1;
-            device.stats.write_sectors += sectors;
-        },
-        .flush => device.stats.flush_ops += 1,
-        .none => {},
-    }
+export fn r4os_zig_block_incident_begin() callconv(.c) u64 {
+    return diag_screen.beginResolvableIncident().generation;
 }
-
-fn recordRequestFailure(device: *Device, kind: RequestKind, err: Error) void {
-    device.stats.last_error = err;
-    if (err == .timeout) device.stats.timeout_failures += 1;
-    device.state = if (device.active_executions != 0) .busy else .failed;
-    switch (kind) {
-        .read => device.stats.read_failures += 1,
-        .write => device.stats.write_failures += 1,
-        .flush => device.stats.flush_failures += 1,
-        .none => {},
-    }
+export fn r4os_zig_block_incident_resolve(generation: u64) callconv(.c) void {
+    _ = diag_screen.resolveIncident(.{ .generation = generation });
 }
-
-fn recordQueueBackpressure(device: *Device, err: Error) void {
-    const locked = lockDevice(device);
-    device.stats.queue_full_rejections +%= 1;
-    device.stats.busy_rejections +%= 1;
-    if (err == .timeout) device.stats.timeout_failures +%= 1;
-    device.stats.last_error = err;
-    unlockDevice(device, locked);
+export fn r4os_zig_block_text(channel: u8, data: [*]const u8, len: usize) callconv(.c) void {
+    if (channel == 1) diag_screen.write(data[0..len]) else k.puts(data[0..len]);
 }
-
-fn recordReadFailure(device: *Device, err: Error) void {
-    device.stats.read_failures += 1;
-    device.stats.last_error = err;
-    if (err == .timeout) device.stats.timeout_failures += 1;
+export fn r4os_zig_block_decimal(channel: u8, value: u64) callconv(.c) void {
+    if (channel == 1) diag_screen.writeDec(value) else k.putDec(value);
 }
-
-fn recordWriteFailure(device: *Device, err: Error) void {
-    device.stats.write_failures += 1;
-    device.stats.last_error = err;
-    if (err == .timeout) device.stats.timeout_failures += 1;
+export fn r4os_zig_block_line(channel: u8) callconv(.c) void {
+    if (channel == 1) diag_screen.endLine() else k.puts("\r\n");
 }
-
-fn recordFlushFailure(device: *Device, err: Error) void {
-    device.stats.flush_failures += 1;
-    device.stats.last_error = err;
-    if (err == .timeout) device.stats.timeout_failures += 1;
-}
-
-fn validateRequest(device: *const Device, lba: u64, sectors: u16, bytes: usize) ?Error {
-    if (sectors == 0) return .invalid_request;
-    if (@as(u64, sectors) > std.math.maxInt(u64) - lba) return .out_of_range;
-    if (bytes < @as(usize, sectors) * @as(usize, device.sector_size)) return .buffer_too_small;
-    if (device.sector_count != 0) {
-        if (lba >= device.sector_count) return .out_of_range;
-        if (@as(u64, sectors) > device.sector_count - lba) return .out_of_range;
-    }
-    return null;
-}
-
-fn requestTimeout(device: *const Device) u64 {
-    return if (device.timeout_ticks == 0) sync.WAIT_FOREVER else device.timeout_ticks;
-}
-
-fn effectiveQueueDepth(device: *const Device) usize {
-    _ = device;
-    return MAX_REQUEST_QUEUE_DEPTH;
-}
-
-fn findFreeSlot(device: *Device) ?usize {
-    const limit = effectiveQueueDepth(device);
-    var i: usize = 0;
-    while (i < limit) : (i += 1) {
-        if (device.request_slots[i].state == .free) return i;
-    }
-    return null;
-}
-
-fn findQueuedSlot(device: *Device) ?usize {
-    const limit = effectiveQueueDepth(device);
-    var selected: ?usize = null;
-    var i: usize = 0;
-    while (i < limit) : (i += 1) {
-        if (device.request_slots[i].state != .queued) continue;
-        if (selected == null or device.request_slots[i].id < device.request_slots[selected.?].id) {
-            selected = i;
-        }
-    }
-    return selected;
-}
-
-fn findSlotById(device: *Device, request_id: u64) ?usize {
-    const limit = effectiveQueueDepth(device);
-    var i: usize = 0;
-    while (i < limit) : (i += 1) {
-        if (device.request_slots[i].state != .free and device.request_slots[i].id == request_id) return i;
-    }
-    return null;
-}
-
-fn countUsedSlots(device: *const Device) u32 {
-    const limit = effectiveQueueDepth(device);
-    var used: u32 = 0;
-    var i: usize = 0;
-    while (i < limit) : (i += 1) {
-        if (device.request_slots[i].state != .free) used += 1;
-    }
-    return used;
-}
-
-fn updateQueueHighWater(device: *Device) void {
-    const used = countUsedSlots(device);
-    if (used > device.stats.queue_high_water) device.stats.queue_high_water = used;
-}
-
-fn snapshotFromSlot(slot: RequestSlot) RequestSnapshot {
-    return .{
-        .id = slot.id,
-        .kind = slot.kind,
-        .lba = slot.lba,
-        .sectors = slot.sectors,
-    };
-}
-
-fn oldestActiveSnapshot(device: *const Device, excluding: usize) RequestSnapshot {
-    var selected: ?RequestSlot = null;
-    var index: usize = 0;
-    while (index < device.request_slots.len) : (index += 1) {
-        if (index == excluding) continue;
-        const slot = device.request_slots[index];
-        if (slot.state != .active) continue;
-        if (selected == null or slot.id < selected.?.id) selected = slot;
-    }
-    return if (selected) |slot| snapshotFromSlot(slot) else .{};
-}
-
-fn lockDevice(device: *Device) bool {
-    if (!canBlockOnStorage()) return false;
-    // Bounded slices instead of a silent forever-wait (0.60.20): if the
-    // queue lock is wedged, say so loudly every slice and keep trying.
-    var slices: u32 = 0;
-    var incident_token: diag_screen.IncidentToken = .{};
-    while (true) {
-        if (device.queue_lock.lock(WATCHDOG_SLICE_TICKS)) {
-            if (incident_token.valid()) _ = diag_screen.resolveIncident(incident_token);
-            return true;
-        }
-        slices += 1;
-        if (!incident_token.valid()) {
-            incident_token = diag_screen.beginResolvableIncident();
-        }
-        diag_screen.write("[BLOCK] queue-lock stall dev=");
-        diag_screen.write(device.name);
-        diag_screen.write(" slice=");
-        diag_screen.writeDec(slices);
-        diag_screen.endLine();
-        k.puts("[BLOCK] queue-lock stall dev=");
-        k.puts(device.name);
-        k.puts(" slice=");
-        putDec(slices);
-        k.puts("\r\n");
-    }
-}
-
-fn unlockDevice(device: *Device, locked: bool) void {
-    if (locked) _ = device.queue_lock.unlock();
-}
-
-fn canBlockOnStorage() bool {
-    return scheduler.currentId() != null;
-}
-
-fn workerMain() callconv(.c) void {
-    var lane = currentWorkerLane();
-    while (lane == block_dispatch.no_lane) {
-        scheduler.yield();
-        lane = currentWorkerLane();
-    }
-    while (true) {
-        if (pumpControllerRuntimeQueues(lane)) continue;
-        runtime_summary.worker_idle_waits +%= 1;
-        _ = controller_runtime[lane].event.waitResult(scheduler.WAIT_FOREVER);
-    }
-}
-
-fn currentWorkerLane() u8 {
-    const current = scheduler.current() orelse return block_dispatch.no_lane;
-    var lane: usize = 0;
-    while (lane < controller_runtime.len) : (lane += 1) {
-        const runtime = &controller_runtime[lane];
-        if (runtime.worker_started and
-            runtime.worker_task_id == native_tasks.get(current, .id) and
-            runtime.worker_task_generation == native_tasks.get(current, .generation))
-        {
-            return @intCast(lane);
-        }
-    }
-    return block_dispatch.no_lane;
-}
-
-fn effectiveWorkerLane(controller_lane: u8) u8 {
-    if (controllerWorkerAlive(controller_lane)) return controller_lane;
-    if (controllerWorkerAlive(primary_controller_lane)) return primary_controller_lane;
-    return block_dispatch.no_lane;
-}
-
-fn pumpControllerRuntimeQueues(worker_lane: u8) bool {
-    runtime_summary.worker_queue_scans +%= 1;
-    var did_work = false;
-    var index: usize = 0;
-    while (index < device_slot_count) : (index += 1) {
-        if (!devices[index].used or devices[index].retiring) continue;
-        if (effectiveWorkerLane(devices[index].device.controller_lane) != worker_lane) continue;
-        if (pumpRuntimeDevice(index)) did_work = true;
-    }
-    if (did_work) runtime_summary.worker_runs +%= 1;
-    return did_work;
-}
-
-fn pumpRuntimeDevice(index: usize) bool {
-    var pin = pinDevice(index) orelse return false;
-    defer unpinDevice(&pin);
-    return pumpDeviceQueue(pin.device, .runtime_worker);
+comptime {
+    if (@sizeOf(NativeExecutionView) != 176 or @sizeOf(UnregisterToken) != 24 or sync.LockRank.block_device != 160) @compileError("Native block execution/sync/retirement C layout differs");
 }
 
 // Boot-option-gated runtime acceptance for controller ownership. A deliberately

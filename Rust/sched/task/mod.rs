@@ -10,6 +10,14 @@ use crate::sched::scheduler::TaskView;
 use core::{ffi::c_void, ptr};
 pub(crate) use task_types::Task;
 
+/// # Safety
+/// Non-null exact task remains resident through the call. Identity fields are
+/// immutable for that incarnation; no mutable scheduler metadata is sampled.
+pub(crate) unsafe fn immutable_identity(task: *mut c_void) -> (u32, u64) {
+    let core = unsafe { task_registry::core(task.cast()) };
+    unsafe { ((*core).id, (*core).generation) }
+}
+
 // Keep scalar native projections visible to the caller; a single field
 // access must not materialize the complete temporary TaskView.
 #[inline(always)]

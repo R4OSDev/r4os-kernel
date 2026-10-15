@@ -1,269 +1,142 @@
-// Bounded storage admission state. The runtime owner serializes calls; this
-// layer never waits, calls a driver, touches a filesystem or allocates memory.
+// Native bounded admission owner; only private fixed C layouts cross this facade.
 const std = @import("std");
-
+const builtin = @import("builtin");
+comptime {
+    if (builtin.is_test) {
+        _ = @import("rust_owner_test");
+    }
+}
 pub const max_devices = 16;
-pub const max_mounts = 27; // A..Z plus the internal boot-volume mount.
+pub const max_mounts = 27;
 pub const max_uses = 256;
 pub const max_claims = 16;
 pub const Error = error{ Invalid, Stale, Busy, Protected, Capacity, WrongOwner };
-
-pub const Owner = struct {
+pub const Owner = extern struct {
     task: u32,
     task_generation: u64,
     program: u32 = 0,
     program_generation: u64 = 0,
-
     pub fn eql(a: Owner, b: Owner) bool {
-        return std.meta.eql(a, b);
+        return r4os_rust_storage_owner_equal(&a, &b);
     }
 };
-
-pub const DeviceRef = struct { slot: u32, generation: u64 };
-pub const MountRef = struct { slot: u32, generation: u64 };
-pub const Region = struct {
+pub const DeviceRef = extern struct { slot: u32, generation: u64 };
+pub const MountRef = extern struct { slot: u32, generation: u64 };
+pub const Region = extern struct {
     device: DeviceRef,
     first: u64,
     count: u64,
-
     pub fn overlaps(a: Region, b: Region) bool {
-        if (!std.meta.eql(a.device, b.device) or a.count == 0 or b.count == 0) return false;
-        // Difference comparisons also remain well-defined for rejected input
-        // whose first+count would overflow.
-        return if (a.first <= b.first) b.first - a.first < a.count else a.first - b.first < b.count;
+        return r4os_rust_storage_region(0, &a, &b);
     }
-
-    pub fn contains(outer: Region, inner: Region) bool {
-        return std.meta.eql(outer.device, inner.device) and inner.count != 0 and
-            inner.first >= outer.first and inner.first - outer.first <= outer.count and
-            inner.count <= outer.count - (inner.first - outer.first);
+    pub fn contains(a: Region, b: Region) bool {
+        return r4os_rust_storage_region(1, &a, &b);
     }
 };
-
-pub const Device = struct { active: bool = false, retiring: bool = false, generation: u64 = 0, sectors: u64 = 0 };
-pub const Mount = struct {
-    active: bool = false,
-    generation: u64 = 0,
-    region: Region = undefined,
-    runtime_required: bool = false,
-};
-pub const UseKind = enum { request, lease, raw };
-pub const Use = struct {
-    id: u64 = 0,
-    owner: Owner = undefined,
-    region: Region = undefined,
-    kind: UseKind = .request,
-};
-pub const Phase = enum { preparing, active, finishing };
-pub const Claim = struct {
-    id: u64 = 0,
-    owner: Owner = undefined,
-    region: Region = undefined,
-    phase: Phase = .preparing,
-};
-
-pub const State = struct {
+const empty_owner: Owner = .{ .task = 0, .task_generation = 0 };
+const empty_region: Region = .{ .device = .{ .slot = 0, .generation = 0 }, .first = 0, .count = 0 };
+pub const Device = extern struct { active: bool = false, retiring: bool = false, generation: u64 = 0, sectors: u64 = 0 };
+pub const Mount = extern struct { active: bool = false, generation: u64 = 0, region: Region = empty_region, runtime_required: bool = false };
+pub const UseKind = enum(u8) { request, lease, raw };
+pub const Use = extern struct { id: u64 = 0, owner: Owner = empty_owner, region: Region = empty_region, kind: UseKind = .request };
+pub const Phase = enum(u8) { preparing, active, finishing };
+pub const Claim = extern struct { id: u64 = 0, owner: Owner = empty_owner, region: Region = empty_region, phase: Phase = .preparing };
+pub const Input = extern struct { owner: Owner = empty_owner, region: Region = empty_region, reference: DeviceRef = .{ .slot = 0, .generation = 0 }, id: u64 = 0, value: u64 = 0, kind: u8 = 0 };
+pub fn check(status: i32) Error!void {
+    switch (status) {
+        0 => {},
+        1 => return error.Invalid,
+        2 => return error.Stale,
+        3 => return error.Busy,
+        4 => return error.Protected,
+        5 => return error.Capacity,
+        6 => return error.WrongOwner,
+        else => unreachable,
+    }
+}
+extern fn r4os_rust_storage_owner_equal(*const Owner, *const Owner) callconv(.c) bool;
+extern fn r4os_rust_storage_region(u8, *const Region, *const Region) callconv(.c) bool;
+extern fn r4os_rust_storage_access(*State, u8, *const Input, *u64) callconv(.c) i32;
+extern fn r4os_rust_storage_access_region(*const State, bool, *const Region) callconv(.c) bool;
+pub const State = extern struct {
     devices: [max_devices]Device = .{Device{}} ** max_devices,
     mounts: [max_mounts]Mount = .{Mount{}} ** max_mounts,
     uses: [max_uses]Use = .{Use{}} ** max_uses,
     claims: [max_claims]Claim = .{Claim{}} ** max_claims,
     sequence: u64 = 0,
     topology_generation: u64 = 1,
-
+    fn call(self: *State, op: u8, input: Input) Error!u64 {
+        var out: u64 = undefined;
+        try check(r4os_rust_storage_access(self, op, &input, &out));
+        return out;
+    }
     pub fn changed(self: *State) Error!void {
-        if (self.topology_generation == std.math.maxInt(u64)) return error.Capacity;
-        self.topology_generation += 1;
+        _ = try self.call(0, .{});
     }
-
-    fn next(self: *State) Error!u64 {
-        if (self.sequence == std.math.maxInt(u64)) return error.Capacity;
-        self.sequence += 1;
-        return self.sequence;
-    }
-
     pub fn registerDevice(self: *State, slot: u32, sectors: u64) Error!DeviceRef {
-        if (slot >= max_devices or sectors == 0) return error.Invalid;
-        if (self.devices[slot].active) return error.Busy;
-        const generation = try self.next();
-        try self.changed();
-        self.devices[slot] = .{ .active = true, .generation = generation, .sectors = sectors };
-        return .{ .slot = slot, .generation = generation };
+        return .{ .slot = slot, .generation = try self.call(1, .{ .reference = .{ .slot = slot, .generation = 0 }, .value = sectors }) };
     }
-
-    fn canRetire(self: *State, ref: DeviceRef) Error!*Device {
-        if (ref.slot >= max_devices or ref.generation == 0) return error.Stale;
-        const device = &self.devices[ref.slot];
-        if (!device.active or device.generation != ref.generation) return error.Stale;
-        const all: Region = .{ .device = ref, .first = 0, .count = device.sectors };
-        if (self.regionUsed(all) or self.regionClaimed(all)) return error.Busy;
-        for (self.mounts) |mount| {
-            if (mount.active and mount.region.overlaps(all)) return error.Busy;
-        }
-        return device;
-    }
-
     pub fn beginRetirement(self: *State, ref: DeviceRef) Error!void {
-        const device = try self.canRetire(ref);
-        if (device.retiring) return error.Busy;
-        device.retiring = true;
+        _ = try self.call(2, .{ .reference = ref });
     }
-
     pub fn cancelRetirement(self: *State, ref: DeviceRef) void {
-        if (ref.slot < max_devices and self.devices[ref.slot].generation == ref.generation)
-            self.devices[ref.slot].retiring = false;
+        _ = self.call(3, .{ .reference = ref }) catch unreachable;
     }
-
     pub fn retireDevice(self: *State, ref: DeviceRef) Error!void {
-        const device = try self.canRetire(ref);
-        try self.changed();
-        device.active = false;
+        _ = try self.call(4, .{ .reference = ref });
     }
-
     pub fn deviceValue(self: *State, ref: DeviceRef) Error!*Device {
-        if (ref.slot >= max_devices or ref.generation == 0) return error.Stale;
-        const value = &self.devices[ref.slot];
-        if (!value.active or value.retiring or value.generation != ref.generation) return error.Stale;
-        return value;
+        return &self.devices[try self.call(5, .{ .reference = ref })];
     }
-
     pub fn validateRegion(self: *State, region: Region) Error!void {
-        const d = try self.deviceValue(region.device);
-        if (region.count == 0 or region.first >= d.sectors or region.count > d.sectors - region.first) return error.Invalid;
+        _ = try self.call(6, .{ .region = region });
     }
-
-    pub fn bindMount(self: *State, slot: u32, region: Region, runtime_required: bool) Error!MountRef {
-        try self.validateRegion(region);
-        if (slot >= max_mounts) return error.Invalid;
-        if (self.mounts[slot].active) return error.Busy;
-        const generation = try self.next();
-        try self.changed();
-        self.mounts[slot] = .{ .active = true, .generation = generation, .region = region, .runtime_required = runtime_required };
-        return .{ .slot = slot, .generation = generation };
+    pub fn bindMount(self: *State, slot: u32, region: Region, required: bool) Error!MountRef {
+        return .{ .slot = slot, .generation = try self.call(7, .{ .reference = .{ .slot = slot, .generation = 0 }, .region = region, .value = @intFromBool(required) }) };
     }
-
     pub fn mountValue(self: *State, ref: MountRef) Error!*Mount {
-        if (ref.slot >= max_mounts or ref.generation == 0) return error.Stale;
-        const value = &self.mounts[ref.slot];
-        if (!value.active or value.generation != ref.generation) return error.Stale;
-        try self.validateRegion(value.region);
-        return value;
+        return &self.mounts[try self.call(8, .{ .reference = .{ .slot = ref.slot, .generation = ref.generation } })];
     }
-
-    // Orchestration calls this after admission closes and its flush succeeds.
-    // An unrelated mount on the same physical device keeps its generation.
     pub fn unbindMount(self: *State, ref: MountRef) Error!void {
-        const value = try self.mountValue(ref);
-        if (value.runtime_required) return error.Protected;
-        if (self.regionUsed(value.region)) return error.Busy;
-        try self.changed();
-        value.active = false;
+        _ = try self.call(9, .{ .reference = .{ .slot = ref.slot, .generation = ref.generation } });
     }
-
     pub fn beginUse(self: *State, ref: MountRef, owner: Owner, kind: UseKind) Error!u64 {
-        if (kind == .raw) return error.Invalid;
-        const value = try self.mountValue(ref);
-        if (self.regionClaimed(value.region)) return error.Busy;
-        return self.reserveUse(value.region, owner, kind);
+        return self.call(10, .{ .reference = .{ .slot = ref.slot, .generation = ref.generation }, .owner = owner, .kind = @intFromEnum(kind) });
     }
-
     pub fn beginRawRead(self: *State, region: Region, owner: Owner) Error!u64 {
-        try self.validateRegion(region);
-        if (self.regionClaimed(region)) return error.Busy;
-        return self.reserveUse(region, owner, .raw);
+        return self.call(11, .{ .region = region, .owner = owner });
     }
-
-    fn reserveUse(self: *State, region: Region, owner: Owner, kind: UseKind) Error!u64 {
-        if (owner.task == 0 or owner.task_generation == 0 or
-            (owner.program == 0) != (owner.program_generation == 0)) return error.Invalid;
-        for (&self.uses) |*use| {
-            if (use.id != 0) continue;
-            use.* = .{ .id = try self.next(), .region = region, .owner = owner, .kind = kind };
-            return use.id;
-        }
-        return error.Capacity;
-    }
-
     pub fn endUse(self: *State, id: u64, owner: Owner) Error!void {
-        if (id == 0) return error.Stale;
-        for (&self.uses) |*use| {
-            if (use.id != id) continue;
-            if (!use.owner.eql(owner)) return error.WrongOwner;
-            use.id = 0;
-            return;
-        }
-        return error.Stale;
+        _ = try self.call(12, .{ .id = id, .owner = owner });
     }
-
     pub fn prepareClaim(self: *State, region: Region, owner: Owner) Error!u64 {
-        try self.validateRegion(region);
-        if (owner.task == 0 or owner.task_generation == 0 or
-            (owner.program == 0) != (owner.program_generation == 0)) return error.Invalid;
-        for (self.mounts) |value| {
-            if (value.active and value.runtime_required and value.region.overlaps(region)) return error.Protected;
-        }
-        if (self.regionUsed(region) or self.regionClaimed(region)) return error.Busy;
-        for (&self.claims) |*claim| {
-            if (claim.id != 0) continue;
-            try self.changed();
-            claim.* = .{ .id = try self.next(), .owner = owner, .region = region };
-            return claim.id;
-        }
-        return error.Capacity;
+        return self.call(13, .{ .region = region, .owner = owner });
     }
-
     pub fn claimValue(self: *State, id: u64, owner: Owner) Error!*Claim {
-        if (id == 0) return error.Stale;
-        for (&self.claims) |*value| {
-            if (value.id != id) continue;
-            if (!value.owner.eql(owner)) return error.WrongOwner;
-            try self.validateRegion(value.region);
-            return value;
-        }
-        return error.Stale;
+        return &self.claims[try self.call(14, .{ .id = id, .owner = owner })];
     }
-
     pub fn activateClaim(self: *State, id: u64, owner: Owner) Error!void {
-        const value = try self.claimValue(id, owner);
-        if (value.phase != .preparing) return error.Invalid;
-        value.phase = .active;
+        _ = try self.call(15, .{ .id = id, .owner = owner });
     }
-
     pub fn beginClaimIo(self: *State, id: u64, owner: Owner, region: Region) Error!u64 {
-        const value = try self.claimValue(id, owner);
-        if (value.phase != .active) return error.Busy;
-        if (!value.region.contains(region)) return error.Invalid;
-        return self.reserveUse(region, owner, .raw);
+        return self.call(16, .{ .id = id, .owner = owner, .region = region });
     }
-
     pub fn finishClaim(self: *State, id: u64, owner: Owner) Error!void {
-        const value = try self.claimValue(id, owner);
-        // Reject new claim I/O even while the caller waits for an outstanding
-        // request to physically finish; dropping its buffers is not a drain.
-        value.phase = .finishing;
-        if (self.regionUsed(value.region)) return error.Busy;
+        _ = try self.call(17, .{ .id = id, .owner = owner });
     }
-
-    // Called only after the orchestrator records flush/rescan/remount results.
-    // A failed preparation also uses finish/release, with no raw write allowed.
     pub fn releaseClaim(self: *State, id: u64, owner: Owner) Error!void {
-        const value = try self.claimValue(id, owner);
-        if (value.phase != .finishing or self.regionUsed(value.region)) return error.Busy;
-        // Exhaustion forbids new topology publication, never final cleanup.
-        self.changed() catch {};
-        value.id = 0;
+        _ = try self.call(18, .{ .id = id, .owner = owner });
     }
-
     pub fn regionUsed(self: *const State, region: Region) bool {
-        for (self.uses) |use| if (use.id != 0 and use.region.overlaps(region)) return true;
-        return false;
+        return r4os_rust_storage_access_region(self, false, &region);
     }
-
     pub fn regionClaimed(self: *const State, region: Region) bool {
-        for (self.claims) |value| if (value.id != 0 and value.region.overlaps(region)) return true;
-        return false;
+        return r4os_rust_storage_access_region(self, true, &region);
     }
 };
-
+comptime {
+    if (@sizeOf(Owner) != 32 or @sizeOf(DeviceRef) != 16 or @sizeOf(MountRef) != 16 or @sizeOf(Region) != 32 or @sizeOf(Device) != 24 or @sizeOf(Mount) != 56 or @sizeOf(Use) != 80 or @sizeOf(Claim) != 80 or @sizeOf(State) != 23672 or @offsetOf(State, "topology_generation") != 23664 or @sizeOf(Input) != 104) @compileError("Native storage admission C layout differs");
+}
 const testing = std.testing;
 const test_owner: Owner = .{ .task = 1, .task_generation = 10, .program = 1, .program_generation = 20 };
 const test_other: Owner = .{ .task = 2, .task_generation = 11, .program = 2, .program_generation = 21 };

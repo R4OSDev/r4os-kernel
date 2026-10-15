@@ -1,4 +1,10 @@
 const std = @import("std");
+const builtin = @import("builtin");
+comptime {
+    if (builtin.is_test) {
+        _ = @import("rust_owner_test");
+    }
+}
 
 pub const logical_sector_size: usize = 512;
 pub const minimum_header_size: u32 = 92;
@@ -19,7 +25,8 @@ const microsoft_basic_data_guid = [16]u8{
     0x87, 0xC0, 0x68, 0xB6, 0xB7, 0x26, 0x99, 0xC7,
 };
 
-pub const Header = struct {
+// Same parser and error contract; only private fixed C records cross the facade.
+pub const Header = extern struct {
     disk_guid: [16]u8 = .{0} ** 16,
     current_lba: u64,
     backup_lba: u64,
@@ -29,23 +36,15 @@ pub const Header = struct {
     entry_count: u32,
     entry_size: u32,
     entries_crc32: u32,
-
     pub fn entryBytes(self: Header) u64 {
-        return @as(u64, self.entry_count) * @as(u64, self.entry_size);
+        return r4os_rust_gpt_header_value(&self, false);
     }
-
     pub fn entrySectors(self: Header) u64 {
-        return (self.entryBytes() + logical_sector_size - 1) / logical_sector_size;
+        return r4os_rust_gpt_header_value(&self, true);
     }
 };
-
-pub const PartitionType = enum {
-    efi_system,
-    microsoft_basic_data,
-    other,
-};
-
-pub const Partition = struct {
+pub const PartitionType = enum(u8) { efi_system, microsoft_basic_data, other };
+pub const Partition = extern struct {
     type_guid: [16]u8 = .{0} ** 16,
     unique_guid: [16]u8 = .{0} ** 16,
     name_utf16: [36]u16 = .{0} ** 36,
@@ -53,196 +52,91 @@ pub const Partition = struct {
     first_lba: u64,
     last_lba: u64,
     attributes: u64,
-
     pub fn sectorCount(self: Partition) u64 {
-        return self.last_lba - self.first_lba + 1;
+        return r4os_rust_gpt_partition_value(&self, false);
     }
-
     pub fn isBootCandidate(self: Partition) bool {
-        // GPT attribute bit 2 is the legacy-BIOS bootable attribute.  An EFI
-        // System Partition is a boot candidate independently of that bit.
-        return self.partition_type == .efi_system or (self.attributes & 0x4) != 0;
+        return r4os_rust_gpt_partition_value(&self, true) != 0;
     }
 };
-
-pub const ParseError = error{
-    ShortSector,
-    BadSignature,
-    UnsupportedRevision,
-    BadHeaderSize,
-    NonzeroReserved,
-    BadHeaderCrc,
-    WrongHeaderLba,
-    BadBackupLba,
-    BadUsableRange,
-    UnsupportedEntryLayout,
-    EntryArrayOutOfRange,
-    ShortEntry,
-    BadPartitionRange,
-};
-
-pub fn parseHeader(sector: []const u8, header_lba: u64, device_sector_count: u64) ParseError!Header {
-    if (sector.len < logical_sector_size) return error.ShortSector;
-    if (!std.mem.eql(u8, sector[0..signature.len], signature)) return error.BadSignature;
-    if (readLe32(sector[8..12]) != revision_1_0) return error.UnsupportedRevision;
-
-    const header_size = readLe32(sector[12..16]);
-    if (header_size < minimum_header_size or header_size > logical_sector_size) return error.BadHeaderSize;
-    if (readLe32(sector[20..24]) != 0) return error.NonzeroReserved;
-
-    var crc = Crc32{};
-    crc.update(sector[0..16]);
-    crc.update(&.{ 0, 0, 0, 0 });
-    crc.update(sector[20..header_size]);
-    if (crc.finish() != readLe32(sector[16..20])) return error.BadHeaderCrc;
-
-    const current_lba = readLe64(sector[24..32]);
-    const backup_lba = readLe64(sector[32..40]);
-    const first_usable_lba = readLe64(sector[40..48]);
-    const last_usable_lba = readLe64(sector[48..56]);
-    const entries_lba = readLe64(sector[72..80]);
-    const entry_count = readLe32(sector[80..84]);
-    const entry_size = readLe32(sector[84..88]);
-
-    if (device_sector_count < 3 or current_lba != header_lba) return error.WrongHeaderLba;
-    if (backup_lba >= device_sector_count or backup_lba == current_lba) return error.BadBackupLba;
-    if (first_usable_lba > last_usable_lba or last_usable_lba >= device_sector_count) return error.BadUsableRange;
-    if (entry_count == 0 or entry_count > maximum_entry_count or
-        entry_size < minimum_entry_size or entry_size > maximum_entry_size or
-        entry_size % minimum_entry_size != 0)
-    {
-        return error.UnsupportedEntryLayout;
+pub const ParseError = error{ ShortSector, BadSignature, UnsupportedRevision, BadHeaderSize, NonzeroReserved, BadHeaderCrc, WrongHeaderLba, BadBackupLba, BadUsableRange, UnsupportedEntryLayout, EntryArrayOutOfRange, ShortEntry, BadPartitionRange };
+fn check(status: i32) ParseError!void {
+    switch (status) {
+        0 => {},
+        1 => return error.ShortSector,
+        2 => return error.BadSignature,
+        3 => return error.UnsupportedRevision,
+        4 => return error.BadHeaderSize,
+        5 => return error.NonzeroReserved,
+        6 => return error.BadHeaderCrc,
+        7 => return error.WrongHeaderLba,
+        8 => return error.BadBackupLba,
+        9 => return error.BadUsableRange,
+        10 => return error.UnsupportedEntryLayout,
+        11 => return error.EntryArrayOutOfRange,
+        12 => return error.ShortEntry,
+        13 => return error.BadPartitionRange,
+        else => unreachable,
     }
-
-    const header = Header{
-        .disk_guid = sector[56..72].*,
-        .current_lba = current_lba,
-        .backup_lba = backup_lba,
-        .first_usable_lba = first_usable_lba,
-        .last_usable_lba = last_usable_lba,
-        .entries_lba = entries_lba,
-        .entry_count = entry_count,
-        .entry_size = entry_size,
-        .entries_crc32 = readLe32(sector[88..92]),
-    };
-    const entry_sectors = header.entrySectors();
-    if (entry_sectors == 0 or entries_lba >= device_sector_count or
-        entry_sectors > device_sector_count - entries_lba)
-    {
-        return error.EntryArrayOutOfRange;
-    }
-    const entries_end = entries_lba + entry_sectors;
-
-    // The primary array lives between its header and the first usable LBA;
-    // the backup array lives after the last usable LBA and before its header.
-    // Accepting neither overlap prevents a valid CRC from legitimising GPT
-    // metadata that aliases a filesystem partition.
-    if (header_lba == 1) {
-        if (backup_lba != device_sector_count - 1 or entries_lba <= header_lba or entries_end > first_usable_lba) {
-            return error.EntryArrayOutOfRange;
-        }
-    } else if (header_lba == device_sector_count - 1) {
-        if (backup_lba != 1 or entries_lba <= last_usable_lba or entries_end > header_lba) {
-            return error.EntryArrayOutOfRange;
-        }
-    } else {
-        return error.WrongHeaderLba;
-    }
-
-    return header;
 }
-
-pub fn parsePartition(raw: []const u8, header: Header) ParseError!?Partition {
-    if (raw.len < header.entry_size or raw.len < minimum_entry_size) return error.ShortEntry;
-    const type_guid = raw[0..16];
-    if (allZero(type_guid)) return null;
-
-    const first_lba = readLe64(raw[32..40]);
-    const last_lba = readLe64(raw[40..48]);
-    if (first_lba < header.first_usable_lba or first_lba > last_lba or last_lba > header.last_usable_lba) {
-        return error.BadPartitionRange;
-    }
-
-    var name: [36]u16 = undefined;
-    for (&name, 0..) |*unit, i| unit.* = std.mem.readInt(u16, raw[56 + i * 2 ..][0..2], .little);
-    return .{
-        .type_guid = raw[0..16].*,
-        .unique_guid = raw[16..32].*,
-        .name_utf16 = name,
-        .partition_type = classifyType(type_guid),
-        .first_lba = first_lba,
-        .last_lba = last_lba,
-        .attributes = readLe64(raw[48..56]),
-    };
-}
-
-pub fn errorLabel(err: ParseError) []const u8 {
+fn code(err: ParseError) u8 {
     return switch (err) {
-        error.ShortSector => "short-sector",
-        error.BadSignature => "bad-signature",
-        error.UnsupportedRevision => "unsupported-revision",
-        error.BadHeaderSize => "bad-header-size",
-        error.NonzeroReserved => "reserved-not-zero",
-        error.BadHeaderCrc => "header-crc",
-        error.WrongHeaderLba => "header-lba",
-        error.BadBackupLba => "backup-lba",
-        error.BadUsableRange => "usable-range",
-        error.UnsupportedEntryLayout => "entry-layout",
-        error.EntryArrayOutOfRange => "entry-array-range",
-        error.ShortEntry => "short-entry",
-        error.BadPartitionRange => "partition-range",
+        error.ShortSector => 1,
+        error.BadSignature => 2,
+        error.UnsupportedRevision => 3,
+        error.BadHeaderSize => 4,
+        error.NonzeroReserved => 5,
+        error.BadHeaderCrc => 6,
+        error.WrongHeaderLba => 7,
+        error.BadBackupLba => 8,
+        error.BadUsableRange => 9,
+        error.UnsupportedEntryLayout => 10,
+        error.EntryArrayOutOfRange => 11,
+        error.ShortEntry => 12,
+        error.BadPartitionRange => 13,
     };
 }
 
-pub fn partitionTypeLabel(partition_type: PartitionType) []const u8 {
-    return switch (partition_type) {
-        .efi_system => "EFI-system",
-        .microsoft_basic_data => "Microsoft-basic-data",
-        .other => "unsupported-guid",
-    };
+const Label = extern struct { ptr: [*]const u8, len: usize };
+extern fn r4os_rust_gpt_header([*]const u8, usize, u64, u64, *Header) callconv(.c) i32;
+extern fn r4os_rust_gpt_partition([*]const u8, usize, *const Header, *Partition) callconv(.c) i32;
+extern fn r4os_rust_gpt_header_value(*const Header, bool) callconv(.c) u64;
+extern fn r4os_rust_gpt_partition_value(*const Partition, bool) callconv(.c) u64;
+extern fn r4os_rust_gpt_label(bool, u8) callconv(.c) Label;
+extern fn r4os_rust_gpt_crc(*u32, [*]const u8, usize) callconv(.c) void;
+extern fn r4os_rust_gpt_crc_finish(u32) callconv(.c) u32;
+pub fn parseHeader(sector: []const u8, header_lba: u64, device_sector_count: u64) ParseError!Header {
+    var out: Header = undefined;
+    try check(r4os_rust_gpt_header(sector.ptr, sector.len, header_lba, device_sector_count, &out));
+    return out;
 }
-
-pub const Crc32 = struct {
+pub fn parsePartition(raw: []const u8, header: Header) ParseError!?Partition {
+    var out: Partition = undefined;
+    const status = r4os_rust_gpt_partition(raw.ptr, raw.len, &header, &out);
+    if (status == -1) return null;
+    try check(status);
+    return out;
+}
+pub fn errorLabel(err: ParseError) []const u8 {
+    const result = r4os_rust_gpt_label(false, code(err));
+    return result.ptr[0..result.len];
+}
+pub fn partitionTypeLabel(kind: PartitionType) []const u8 {
+    const result = r4os_rust_gpt_label(true, @intFromEnum(kind));
+    return result.ptr[0..result.len];
+}
+pub const Crc32 = extern struct {
     state: u32 = 0xFFFF_FFFF,
-
     pub fn update(self: *Crc32, bytes: []const u8) void {
-        for (bytes) |byte| {
-            self.state ^= byte;
-            var bit: u4 = 0;
-            while (bit < 8) : (bit += 1) {
-                self.state = (self.state >> 1) ^ (0xEDB8_8320 & (0 -% (self.state & 1)));
-            }
-        }
+        r4os_rust_gpt_crc(&self.state, bytes.ptr, bytes.len);
     }
-
     pub fn finish(self: Crc32) u32 {
-        return ~self.state;
+        return r4os_rust_gpt_crc_finish(self.state);
     }
 };
-
-fn classifyType(type_guid: []const u8) PartitionType {
-    if (std.mem.eql(u8, type_guid, efi_system_guid[0..])) return .efi_system;
-    if (std.mem.eql(u8, type_guid, microsoft_basic_data_guid[0..])) return .microsoft_basic_data;
-    return .other;
+comptime {
+    if (@sizeOf(Header) != 72 or @offsetOf(Header, "entries_crc32") != 64 or @sizeOf(Partition) != 136 or @offsetOf(Partition, "first_lba") != 112 or @sizeOf(Crc32) != 4) @compileError("Native GPT C layout differs");
 }
-
-fn allZero(bytes: []const u8) bool {
-    for (bytes) |byte| if (byte != 0) return false;
-    return true;
-}
-
-fn readLe32(bytes: []const u8) u32 {
-    return @as(u32, bytes[0]) |
-        (@as(u32, bytes[1]) << 8) |
-        (@as(u32, bytes[2]) << 16) |
-        (@as(u32, bytes[3]) << 24);
-}
-
-fn readLe64(bytes: []const u8) u64 {
-    return @as(u64, readLe32(bytes[0..4])) |
-        (@as(u64, readLe32(bytes[4..8])) << 32);
-}
-
 fn writeLe32(bytes: []u8, value: u32) void {
     bytes[0] = @truncate(value);
     bytes[1] = @truncate(value >> 8);

@@ -1,55 +1,27 @@
 const std = @import("std");
-
+const owner_test = if (@import("builtin").is_test) @import("rust_owner_test") else struct {};
+comptime {
+    if (@import("builtin").is_test) _ = owner_test;
+}
 pub const Guid = [16]u8;
 pub const zero: Guid = .{0} ** 16;
-const order = [_]usize{ 3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15 };
-
+extern fn r4os_rust_storage_guid_parse(text: [*]const u8, len: usize, out: *Guid) bool;
+extern fn r4os_rust_storage_guid_format(input: *const Guid, out: *[36]u8) void;
+extern fn r4os_rust_storage_guid_equal(left: *const Guid, right: *const Guid) bool;
 pub fn parse(text: []const u8) ?Guid {
-    if (text.len != 36) return null;
-    var result: Guid = undefined;
-    var pos: usize = 0;
-    for (order, 0..) |destination, i| {
-        if (i == 4 or i == 6 or i == 8 or i == 10) {
-            if (text[pos] != '-') return null;
-            pos += 1;
-        }
-        const hi = nibble(text[pos]) orelse return null;
-        const lo = nibble(text[pos + 1]) orelse return null;
-        result[destination] = hi * 16 + lo;
-        pos += 2;
-    }
-    return result;
+    var value: Guid = undefined;
+    return if (r4os_rust_storage_guid_parse(text.ptr, text.len, &value)) value else null;
 }
-
 pub fn format(value: Guid) [36]u8 {
-    const hex = "0123456789abcdef";
-    var result: [36]u8 = undefined;
-    var pos: usize = 0;
-    for (order, 0..) |source, i| {
-        if (i == 4 or i == 6 or i == 8 or i == 10) {
-            result[pos] = '-';
-            pos += 1;
-        }
-        result[pos] = hex[value[source] >> 4];
-        result[pos + 1] = hex[value[source] & 15];
-        pos += 2;
-    }
-    return result;
+    var out: [36]u8 = undefined;
+    r4os_rust_storage_guid_format(&value, &out);
+    return out;
 }
-
 pub fn eql(a: Guid, b: Guid) bool {
-    return std.mem.eql(u8, &a, &b);
+    return r4os_rust_storage_guid_equal(&a, &b);
 }
 pub fn isZero(value: Guid) bool {
     return eql(value, zero);
-}
-
-fn nibble(c: u8) ?u8 {
-    return switch (c) {
-        '0'...'9' => c - '0',
-        'a'...'f' => c - 'a' + 10,
-        else => null,
-    };
 }
 
 test "UUID text uses GPT field byte order and exact canonical syntax" {

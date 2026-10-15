@@ -1,10 +1,5 @@
-const native_tasks = @import("../sched/task.zig");
-// Runtime serialization for storage admission metadata. This owner is always
-// released before filesystem, cache, driver or scheduler work begins.
+// Stateless facade: canonical storage metadata and resolver binding belong to Rust.
 const core = @import("access_state.zig");
-const locks = @import("../memory/owner_locks.zig");
-const scheduler = @import("../sched/scheduler.zig");
-
 pub const Owner = core.Owner;
 pub const DeviceRef = core.DeviceRef;
 pub const MountRef = core.MountRef;
@@ -13,172 +8,112 @@ pub const Error = core.Error;
 pub const UseKind = core.UseKind;
 pub const OwnerResolver = *const fn () ?Owner;
 pub const UseToken = struct { id: u64, owner: Owner };
-
-var state: core.State = .{};
-var owner_resolver: ?OwnerResolver = null;
-
-// Same boot-only reset boundary as block.init; no live resources may survive.
+extern fn r4os_rust_storage_access_init() callconv(.c) void;
+extern fn r4os_rust_storage_access_resolver(*const fn (*Owner) callconv(.c) bool) callconv(.c) void;
+extern fn r4os_rust_storage_access_current(*Owner) callconv(.c) bool;
+extern fn r4os_rust_storage_access_runtime(u8, bool, *const core.Input, *u64, ?*anyopaque) callconv(.c) i32;
+fn call(op: u8, locked: bool, input: core.Input, snapshot: ?*anyopaque) Error!u64 {
+    var out: u64 = undefined;
+    try core.check(r4os_rust_storage_access_runtime(op, locked, &input, &out, snapshot));
+    return out;
+}
 pub fn initForBoot() void {
-    state = .{};
-    owner_resolver = null;
+    r4os_rust_storage_access_init();
 }
-
-pub fn setOwnerResolver(resolver: OwnerResolver) void {
-    owner_resolver = resolver;
+pub fn setOwnerResolver(comptime resolver: OwnerResolver) void {
+    const Bridge = struct {
+        fn resolve(out: *Owner) callconv(.c) bool {
+            const owner = resolver() orelse return false;
+            out.* = owner;
+            return true;
+        }
+    };
+    r4os_rust_storage_access_resolver(Bridge.resolve);
 }
-
 pub fn currentOwner() ?Owner {
-    if (owner_resolver) |resolve| if (resolve()) |owner| return owner;
-    const running = scheduler.current() orelse return null;
-    return .{ .task = native_tasks.get(running, .id), .task_generation = native_tasks.get(running, .generation) };
+    var out: Owner = undefined;
+    return if (r4os_rust_storage_access_current(&out)) out else null;
 }
-
-// The block registry already owns locks.storage at these two boundaries.
-// Neither helper acquires another owner or performs I/O.
 pub fn registerDeviceLocked(slot: u32, sectors: u64) Error!DeviceRef {
-    return state.registerDevice(slot, sectors);
+    return .{ .slot = slot, .generation = try call(1, true, .{ .reference = .{ .slot = slot, .generation = 0 }, .value = sectors }, null) };
 }
 pub fn retireDeviceLocked(ref: DeviceRef) Error!void {
-    return state.retireDevice(ref);
+    _ = try call(4, true, .{ .reference = ref }, null);
 }
 pub fn beginRetirementLocked(ref: DeviceRef) Error!void {
-    return state.beginRetirement(ref);
+    _ = try call(2, true, .{ .reference = ref }, null);
 }
 pub fn cancelRetirementLocked(ref: DeviceRef) void {
-    state.cancelRetirement(ref);
+    _ = call(3, true, .{ .reference = ref }, null) catch unreachable;
 }
 pub fn bindMountLocked(slot: u32, region: Region, required: bool) Error!MountRef {
-    return state.bindMount(slot, region, required);
+    return .{ .slot = slot, .generation = try call(7, true, .{ .reference = .{ .slot = slot, .generation = 0 }, .region = region, .value = @intFromBool(required) }, null) };
 }
 pub fn unbindMountLocked(ref: MountRef) Error!void {
-    return state.unbindMount(ref);
+    _ = try call(9, true, .{ .reference = .{ .slot = ref.slot, .generation = ref.generation } }, null);
 }
 pub fn topologyGeneration() u64 {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return state.topology_generation;
+    return call(19, false, .{}, null) catch unreachable;
 }
 pub fn topologyChanged() Error!void {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    try state.changed();
+    _ = try call(0, false, .{}, null);
 }
-
 pub fn deviceReference(slot: u32) ?DeviceRef {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    if (slot >= state.devices.len or !state.devices[slot].active) return null;
-    return .{ .slot = slot, .generation = state.devices[slot].generation };
+    return .{ .slot = slot, .generation = call(20, false, .{ .reference = .{ .slot = slot, .generation = 0 } }, null) catch return null };
 }
-
-pub fn bindMount(slot: u32, region: Region, runtime_required: bool) Error!MountRef {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return state.bindMount(slot, region, runtime_required);
+pub fn bindMount(slot: u32, region: Region, required: bool) Error!MountRef {
+    return .{ .slot = slot, .generation = try call(7, false, .{ .reference = .{ .slot = slot, .generation = 0 }, .region = region, .value = @intFromBool(required) }, null) };
 }
-
 pub fn unbindMount(ref: MountRef) Error!void {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return state.unbindMount(ref);
+    _ = try call(9, false, .{ .reference = .{ .slot = ref.slot, .generation = ref.generation } }, null);
 }
-
 pub fn mountSnapshot(ref: MountRef) Error!core.Mount {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return (try state.mountValue(ref)).*;
+    var out: core.Mount = undefined;
+    _ = try call(8, false, .{ .reference = .{ .slot = ref.slot, .generation = ref.generation } }, &out);
+    return out;
 }
-
 pub fn mountReference(slot: u32) ?MountRef {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    if (slot >= state.mounts.len or !state.mounts[slot].active) return null;
-    return .{ .slot = slot, .generation = state.mounts[slot].generation };
+    return .{ .slot = slot, .generation = call(21, false, .{ .reference = .{ .slot = slot, .generation = 0 } }, null) catch return null };
 }
-
 pub fn beginUse(ref: MountRef, kind: UseKind) Error!UseToken {
     const owner = currentOwner() orelse return error.Invalid;
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return .{ .id = try state.beginUse(ref, owner, kind), .owner = owner };
+    return .{ .id = try call(10, false, .{ .reference = .{ .slot = ref.slot, .generation = ref.generation }, .owner = owner, .kind = @intFromEnum(kind) }, null), .owner = owner };
 }
-
 pub fn endUse(token: UseToken) Error!void {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return state.endUse(token.id, token.owner);
+    _ = try call(12, false, .{ .id = token.id, .owner = token.owner }, null);
 }
-
 pub fn beginRawRead(region: Region) Error!UseToken {
     const owner = currentOwner() orelse return error.Invalid;
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return .{ .id = try state.beginRawRead(region, owner), .owner = owner };
+    return .{ .id = try call(11, false, .{ .region = region, .owner = owner }, null), .owner = owner };
 }
-
 pub fn prepareClaim(region: Region) Error!u64 {
     const owner = currentOwner() orelse return error.Invalid;
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return state.prepareClaim(region, owner);
+    return call(13, false, .{ .region = region, .owner = owner }, null);
 }
-
 pub fn claimSnapshot(id: u64, owner: Owner) Error!core.Claim {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return (try state.claimValue(id, owner)).*;
+    var out: core.Claim = undefined;
+    _ = try call(14, false, .{ .id = id, .owner = owner }, &out);
+    return out;
 }
-
 pub fn activateClaim(id: u64, owner: Owner) Error!void {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return state.activateClaim(id, owner);
+    _ = try call(15, false, .{ .id = id, .owner = owner }, null);
 }
-
 pub fn beginClaimIo(id: u64, region: Region) Error!UseToken {
     const owner = currentOwner() orelse return error.Invalid;
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return .{ .id = try state.beginClaimIo(id, owner, region), .owner = owner };
+    return .{ .id = try call(16, false, .{ .id = id, .owner = owner, .region = region }, null), .owner = owner };
 }
-
 pub fn finishClaim(id: u64, owner: Owner) Error!void {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return state.finishClaim(id, owner);
+    _ = try call(17, false, .{ .id = id, .owner = owner }, null);
 }
-
 pub fn releaseClaim(id: u64, owner: Owner) Error!void {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return state.releaseClaim(id, owner);
+    _ = try call(18, false, .{ .id = id, .owner = owner }, null);
 }
-
 pub fn regionClaimed(region: Region) bool {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    return state.regionClaimed(region);
+    return (call(24, false, .{ .region = region }, null) catch unreachable) != 0;
 }
-
-// Program lifecycle has already drained actual I/O and kernel streams.
-// Only persistent user leases are retired here; never discard a live request.
 pub fn releaseOwnerLeases(program: u32, generation: u64, task_id: u32, task_generation: u64) void {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    for (&state.uses) |*use| {
-        if (use.id == 0 or use.kind != .lease or use.owner.program != program or use.owner.program_generation != generation) continue;
-        if (task_id != 0 and (use.owner.task != task_id or use.owner.task_generation != task_generation)) continue;
-        use.id = 0;
-    }
+    _ = call(22, false, .{ .owner = .{ .program = program, .program_generation = generation, .task = task_id, .task_generation = task_generation } }, null) catch unreachable;
 }
-
 pub fn ownerHasClaims(program: u32, generation: u64, task_id: u32, task_generation: u64) bool {
-    const guard = locks.storage.acquire();
-    defer locks.storage.release(guard);
-    for (state.claims) |claim| {
-        if (claim.id == 0 or claim.owner.program != program or claim.owner.program_generation != generation) continue;
-        if (task_id != 0 and (claim.owner.task != task_id or claim.owner.task_generation != task_generation)) continue;
-        return true;
-    }
-    return false;
+    return (call(23, false, .{ .owner = .{ .program = program, .program_generation = generation, .task = task_id, .task_generation = task_generation } }, null) catch unreachable) != 0;
 }

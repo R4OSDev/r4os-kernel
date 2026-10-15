@@ -7,6 +7,9 @@ const a = std.testing.allocator;
 
 test {
     _ = @import("memory/backing_store.zig");
+    // Native partition scanning no longer pulls Zig GPT parser tests through
+    // its implementation body; retain the same four original fixture cases.
+    _ = @import("storage/gpt.zig");
 }
 
 const Fixture = struct {

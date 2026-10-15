@@ -328,3 +328,74 @@ pub mod driver_api_entry;
 
 #[path = "../../../Rust/driver/api_gfx.rs"]
 pub mod driver_api_gfx;
+
+#[path = "../../../Rust/storage/dispatch.rs"]
+pub mod storage_dispatch;
+#[path = "../../../Rust/storage/guid.rs"]
+pub mod storage_guid;
+#[path = "../../../Rust/storage/split.rs"]
+pub mod storage_split;
+#[path = "../../../Rust/storage/access_state.rs"]
+pub mod storage_access_state;
+#[path = "../../../Rust/storage/access_runtime.rs"]
+pub mod storage_access_runtime;
+#[path = "../../../Rust/storage/gpt.rs"]
+pub mod storage_gpt;
+#[path = "../../../Rust/storage/partition_table.rs"]
+pub mod storage_partition_table;
+#[path = "../../../Rust/storage/installation.rs"]
+pub mod storage_installation;
+#[path = "../../../Rust/storage/boot_source.rs"]
+pub mod storage_boot_source;
+#[path = "../../../Rust/storage/block_registry.rs"]
+pub mod storage_block_registry;
+#[path = "../../../Rust/storage/block_requests.rs"]
+pub mod storage_block_requests;
+#[path = "../../../Rust/storage/block_state.rs"]
+pub mod storage_block_state;
+#[path = "../../../Rust/storage/block_accounting.rs"]
+pub mod storage_block_accounting;
+#[path = "../../../Rust/storage/block_workers.rs"]
+pub mod storage_block_workers;
+#[path = "../../../Rust/storage/block_device_state.rs"]
+pub mod storage_block_device_state;
+#[path = "../../../Rust/storage/block_io.rs"]
+pub mod storage_block_io;
+#[path = "../../../Rust/storage/block_execution.rs"]
+pub mod storage_block_execution;
+#[path = "../../../Rust/storage/block_diagnostics.rs"]
+pub mod storage_block_diagnostics;
+#[path = "../../../Rust/storage/media_inventory.rs"]
+pub mod storage_media_inventory;
+#[path = "../../../Rust/storage/normal_boot.rs"]
+pub mod storage_normal_boot;
+#[path = "../../../Rust/storage/mbr.rs"]
+pub mod storage_mbr;
+#[path = "../../../Rust/storage/ahci.rs"]
+pub mod storage_ahci;
+#[path = "../../../Rust/storage/boot.rs"]
+pub mod storage_boot_owner;
+#[path = "../../../Rust/storage/operations.rs"]
+pub mod storage_operations;
+pub mod storage {
+    pub use crate::storage_operations as operations;
+    pub use crate::storage_boot_owner as boot;
+    pub use crate::storage_ahci as ahci;
+    pub use crate::storage_mbr as mbr;
+    pub use crate::storage_media_inventory as media_inventory;
+    pub use crate::storage_normal_boot as normal_boot;
+    pub use crate::storage_block_execution as block_execution;
+    pub use crate::storage_block_diagnostics as block_diagnostics;
+    pub use crate::storage_block_io as block_io;
+    pub use crate::storage_block_device_state as block_device_state;
+    pub use crate::storage_block_workers as block_workers;
+    pub use crate::storage_block_accounting as block_accounting;
+    pub use crate::storage_block_state as block_state;
+    pub use crate::storage_block_requests as block_requests;
+    pub use crate::storage_block_registry as block_registry;
+    pub use crate::storage_boot_source as boot_source;
+    pub use crate::storage_installation as installation;
+    pub use crate::{storage_gpt as gpt, storage_partition_table as partition_table};
+    pub use crate::{storage_access_state as access_state, storage_access_runtime as access_runtime};
+    pub use crate::{storage_dispatch as dispatch, storage_guid as guid, storage_split as split};
+}

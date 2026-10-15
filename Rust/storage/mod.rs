@@ -1,0 +1,25 @@
+//! Existing block/boot/partition owners; filesystem consumers keep their ABI.
+pub mod access_runtime;
+pub mod access_state;
+pub mod ahci;
+pub mod block_accounting;
+pub mod block_device_state;
+pub mod block_diagnostics;
+pub mod block_execution;
+pub mod block_io;
+pub mod block_registry;
+pub mod block_requests;
+pub mod block_state;
+pub mod block_workers;
+pub mod boot;
+pub mod boot_source;
+pub mod dispatch;
+pub mod gpt;
+pub mod guid;
+pub mod installation;
+pub mod mbr;
+pub mod media_inventory;
+pub mod normal_boot;
+pub mod operations;
+pub mod partition_table;
+pub mod split;
