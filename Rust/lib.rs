@@ -10,6 +10,7 @@ pub mod boot;
 pub mod build_bridge;
 pub mod driver;
 pub mod fs;
+pub mod loader;
 pub mod memory;
 pub mod platform;
 pub mod sched;

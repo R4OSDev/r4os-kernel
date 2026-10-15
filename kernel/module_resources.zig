@@ -1,8 +1,7 @@
-// Canonical R4M0 .rsrc catalog. Parsing reads metadata and at most 15 bytes
-// of padding per blob; payloads remain in the original container.
+// Native R4M0 resource owner; private C values retain existing Zig callers.
 const std = @import("std");
 pub const capacity = 64;
-pub const Record = struct {
+pub const Record = extern struct {
     name: [63]u8 = .{0} ** 63,
     name_len: u8 = 0,
     kind: u16 = 0,
@@ -11,99 +10,51 @@ pub const Record = struct {
     bytes: u32 = 0,
 };
 pub const Error = error{ Invalid, Io };
-pub const Catalog = struct {
+const NativeReader = extern struct {
+    context: ?*anyopaque,
+    read: *const fn (?*anyopaque, usize, [*]u8, usize) callconv(.c) bool,
+};
+extern fn r4os_rust_module_resource_parse(*Catalog, *const NativeReader, usize) callconv(.c) i32;
+extern fn r4os_rust_module_resource_find(*const Catalog, [*]const u8, usize) callconv(.c) usize;
+extern fn r4os_rust_module_resource_name([*]const u8, usize) callconv(.c) bool;
+pub const Catalog = extern struct {
     count: usize = 0,
     records: [capacity]Record = .{Record{}} ** capacity,
 
-    // Reader offsets are relative to this section and read() returns bool.
-    // A failed parse never publishes a partial catalog.
     pub fn parse(self: *Catalog, reader: anytype, length: usize) Error!void {
-        self.count = 0;
-        var count_bytes: [4]u8 = undefined;
-        try read(reader, length, 0, &count_bytes);
-        const count = std.mem.readInt(u32, &count_bytes, .little);
-        if (count == 0 or count > capacity) return error.Invalid;
-        var names_end: usize = 4 + 16 * @as(usize, count);
-        if (names_end > length) return error.Invalid;
-        var last_kind: u16 = 1;
-        var next_icon: u16 = 0;
-        var help_seen = false;
-        for (self.records[0..count], 0..) |*record, i| {
-            var raw: [16]u8 = undefined;
-            try read(reader, length, 4 + 16 * i, &raw);
-            const kind = std.mem.readInt(u16, raw[0..2], .little);
-            const index = std.mem.readInt(u16, raw[2..4], .little);
-            const name_offset = std.mem.readInt(u32, raw[4..8], .little);
-            record.* = .{
-                .kind = kind,
-                .index = index,
-                .offset = std.mem.readInt(u32, raw[8..12], .little),
-                .bytes = std.mem.readInt(u32, raw[12..16], .little),
-            };
-            if (kind < last_kind or kind > 3 or record.bytes == 0) return error.Invalid;
-            last_kind = kind;
-            switch (kind) {
-                1 => {
-                    if (index != next_icon or name_offset != 0) return error.Invalid;
-                    next_icon += 1;
-                },
-                2 => {
-                    if (help_seen or index != 0 or name_offset != 0) return error.Invalid;
-                    help_seen = true;
-                },
-                3 => {
-                    if (index != 0 or name_offset != names_end) return error.Invalid;
-                    while (true) {
-                        var byte: [1]u8 = undefined;
-                        try read(reader, length, names_end, &byte);
-                        names_end += 1;
-                        if (byte[0] == 0) break;
-                        if (!nameByte(byte[0]) or record.name_len == record.name.len) return error.Invalid;
-                        record.name[record.name_len] = byte[0];
-                        record.name_len += 1;
-                    }
-                    if (record.name_len == 0) return error.Invalid;
-                    for (self.records[0..i]) |previous| {
-                        if (previous.kind == 3 and std.ascii.eqlIgnoreCase(previous.name[0..previous.name_len], record.name[0..record.name_len])) return error.Invalid;
-                    }
-                },
-                else => return error.Invalid,
+        const Adapter = struct {
+            reader: @TypeOf(reader),
+            fn read(context: ?*anyopaque, offset: usize, out: [*]u8, len: usize) callconv(.c) bool {
+                const adapter: *@This() = @ptrCast(@alignCast(context.?));
+                return adapter.reader.read(offset, out[0..len]);
             }
-        }
-        var cursor = names_end;
-        for (self.records[0..count]) |record| {
-            const padding = (16 - (cursor & 15)) & 15;
-            var zeros: [15]u8 = undefined;
-            try read(reader, length, cursor, zeros[0..padding]);
-            for (zeros[0..padding]) |byte| if (byte != 0) return error.Invalid;
-            cursor += padding;
-            if (record.offset != cursor or cursor > length or record.bytes > length - cursor) return error.Invalid;
-            cursor += record.bytes;
-        }
-        if (cursor != length) return error.Invalid;
-        self.count = count;
+        };
+        var adapter: Adapter = .{ .reader = reader };
+        const callback: NativeReader = .{ .context = &adapter, .read = Adapter.read };
+        return switch (r4os_rust_module_resource_parse(self, &callback, length)) {
+            0 => {},
+            1 => error.Invalid,
+            2 => error.Io,
+            else => unreachable,
+        };
     }
 
     pub fn find(self: *const Catalog, name: []const u8) ?usize {
-        if (!validName(name)) return null;
-        for (self.records[0..self.count], 0..) |record, i| {
-            if (record.kind == 3 and std.ascii.eqlIgnoreCase(name, record.name[0..record.name_len])) return i;
-        }
-        return null;
+        const index = r4os_rust_module_resource_find(self, name.ptr, name.len);
+        return if (index == std.math.maxInt(usize)) null else index;
     }
 };
-
 pub fn validName(name: []const u8) bool {
-    if (name.len == 0 or name.len > 63) return false;
-    for (name) |byte| if (!nameByte(byte)) return false;
-    return true;
+    return r4os_rust_module_resource_name(name.ptr, name.len);
 }
-fn nameByte(byte: u8) bool {
-    return byte >= 0x20 and byte <= 0x7e and byte != '/' and byte != '\\' and byte != ':';
-}
-fn read(reader: anytype, length: usize, offset: usize, out: []u8) Error!void {
-    if (offset > length or out.len > length - offset) return error.Invalid;
-    if (out.len != 0 and !reader.read(offset, out)) return error.Io;
+comptime {
+    if (@sizeOf(Record) != 76 or @alignOf(Record) != 4 or
+        @offsetOf(Record, "name") != 0 or @offsetOf(Record, "name_len") != 63 or
+        @offsetOf(Record, "kind") != 64 or @offsetOf(Record, "index") != 66 or
+        @offsetOf(Record, "offset") != 68 or @offsetOf(Record, "bytes") != 72 or
+        @sizeOf(Catalog) != 4872 or @alignOf(Catalog) != 8 or
+        @offsetOf(Catalog, "count") != 0 or @offsetOf(Catalog, "records") != 8 or
+        @sizeOf(NativeReader) != 16 or @offsetOf(NativeReader, "read") != 8) @compileError("private resource layout");
 }
 
 test "resource catalog streams metadata and rejects ambiguous layouts" {

@@ -10717,7 +10717,11 @@ fn runR4lPreemptionScenario(
         // Initial publication is setup, not the measured wake. Ensure the
         // remote worker reaches its blocking Event before LSTRX starts; the
         // later Event signal remains the one measured reschedule IPI.
-        while (@atomicLoad(u8, &r4l_preemption_witness_started, .acquire) == 0) {
+        // The started store precedes waitResult: only the exact Event queue,
+        // inspected under its runtime owner, proves waiter enrollment.
+        while (@atomicLoad(u8, &r4l_preemption_witness_started, .acquire) == 0 or
+            (mode == .reschedule_ipi and !r4l_preemption_event.queue.hasWaiters()))
+        {
             if (r4lPreemptionDeadlineExpired(start, start_tick)) {
                 abortR4lPreemptionWitness();
                 _ = waitForR4lPreemptionWitness(start, start_tick);
@@ -10861,6 +10865,15 @@ pub fn runR4lPreemptionAcceptance(target_cpu: u32, usable_bytes: u64) bool {
     }
 
     const ok = timer_result.ok and ipi_result.ok and cooperative_result.ok;
+    if (!ipi_result.ok) {
+        k.puts("[R4LPREEMPT] IPI scenario timer_switches=");
+        k.putDec(ipi_result.timer_switches);
+        k.puts(" ipi_switches=");
+        k.putDec(ipi_result.reschedule_ipi_switches);
+        k.puts(" exit=");
+        k.putDec(@bitCast(@as(i64, ipi_result.exit_code)));
+        k.puts("\r\n");
+    }
     k.puts("[KERNELCOOP] result=");
     k.puts(if (cooperative_result.ok) "OK" else "FAILED");
     k.puts(" switches=");

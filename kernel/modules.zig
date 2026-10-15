@@ -1,4 +1,6 @@
-const vfs = @import("../fs/vfs.zig");
+//! Typed compatibility facade. Native Rust owns module discovery, dependency
+//! admission, image construction, publication and the sole registry state.
+
 const heap = @import("../memory/heap.zig");
 const k = @import("log.zig");
 const loader_perf = @import("loader_perf.zig");
@@ -73,17 +75,10 @@ pub const ResolverStatus = enum(u8) {
     failed,
 };
 
-const PendingState = enum(u8) {
-    empty,
-    pending,
-    loading,
-    loaded,
-    failed,
-};
 
 const Header = module_r4m.Header;
 
-const SectionHeader = struct {
+const SectionHeader = extern struct {
     name: [8]u8,
     name_len: usize,
     flags: u32,
@@ -93,14 +88,7 @@ const SectionHeader = struct {
     alignment: u32,
 };
 
-const Relocation = struct {
-    kind: u32,
-    patch_section: u32,
-    patch_offset: u32,
-    target_section: u32,
-    target_offset: u32,
-    addend: i32,
-};
+const Relocation = module_r4m.RelocationRecord;
 
 const ImportRecord = struct {
     module: []const u8,
@@ -109,7 +97,7 @@ const ImportRecord = struct {
     flags: u32,
 };
 
-const ResolvedImport = struct {
+const ResolvedImport = extern struct {
     module: [MAX_NAME]u8 = .{0} ** MAX_NAME,
     module_len: usize = 0,
     symbol: [MAX_NAME]u8 = .{0} ** MAX_NAME,
@@ -118,7 +106,7 @@ const ResolvedImport = struct {
     address: u64 = 0,
 };
 
-pub const Export = struct {
+pub const Export = extern struct {
     used: bool = false,
     name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
     name_len: usize = 0,
@@ -128,58 +116,8 @@ pub const Export = struct {
     section_offset: u32 = 0,
 };
 
-const FileImport = struct {
-    module: [MAX_NAME]u8 = .{0} ** MAX_NAME,
-    module_len: usize = 0,
-    symbol: [MAX_NAME]u8 = .{0} ** MAX_NAME,
-    symbol_len: usize = 0,
-    min_version: u32 = 0,
-    flags: u32 = 0,
 
-    fn view(self: *const FileImport) ImportRecord {
-        return .{
-            .module = self.module[0..self.module_len],
-            .symbol = self.symbol[0..self.symbol_len],
-            .min_version = self.min_version,
-            .flags = self.flags,
-        };
-    }
-};
-
-const ValidatedFileTables = struct {
-    version_labels: module_r4m.VersionLabels = .{},
-    header: Header,
-    sections: [MAX_SECTIONS]SectionHeader = undefined,
-    imports: [MAX_IMPORTS_PER_MODULE]FileImport = .{FileImport{}} ** MAX_IMPORTS_PER_MODULE,
-    exports: [MAX_EXPORTS_PER_MODULE]Export = .{Export{}} ** MAX_EXPORTS_PER_MODULE,
-    module_name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
-    module_name_len: usize = 0,
-
-    fn name(self: *const ValidatedFileTables, fallback_name: []const u8) []const u8 {
-        if (self.module_name_len != 0) return self.module_name[0..self.module_name_len];
-        return fallbackModuleName(fallback_name);
-    }
-};
-
-const PendingLibrary = struct {
-    used: bool = false,
-    state: PendingState = .empty,
-    source: module_file.FileSource = undefined,
-    file_size: usize = 0,
-    file_name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
-    file_name_len: usize = 0,
-    module_name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
-    module_name_len: usize = 0,
-    path: [MAX_PATH]u8 = .{0} ** MAX_PATH,
-    path_len: usize = 0,
-};
-
-const PendingLibraryProbe = struct {
-    module_name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
-    module_name_len: usize = 0,
-};
-
-pub const Section = struct {
+pub const Section = extern struct {
     used: bool = false,
     name: [8]u8 = .{0} ** 8,
     name_len: usize = 0,
@@ -191,7 +129,9 @@ pub const Section = struct {
     runtime_base: u64 = 0,
 };
 
-pub const Entry = struct {
+pub const NativeOptionalSource = extern struct { present: bool = false, value: module_file.NativeSource = undefined };
+
+pub const Entry = extern struct {
     version_labels: module_r4m.VersionLabels = .{},
     used: bool = false,
     name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
@@ -217,19 +157,16 @@ pub const Entry = struct {
     bss_zeroed: bool = true,
     generation: u32 = 0,
     pinned: bool = false,
-    resource_source: ?module_file.FileSource = null,
+    resource_source: NativeOptionalSource = .{},
     resource_file_offset: usize = 0,
     sections: [MAX_SECTIONS]Section = .{Section{}} ** MAX_SECTIONS,
     exports: [MAX_EXPORTS_PER_MODULE]Export = .{Export{}} ** MAX_EXPORTS_PER_MODULE,
 };
 
-// Slots are reserved before any file read and remain private until commit.
-// The packed generation/state claim is shared by R4D, R4P and R4L callers.
+
 const ClaimState = enum(u32) { free, reserved, published, retiring, retained };
-var slot_claims: [MAX_MODULES]u64 = .{0} ** MAX_MODULES;
-// Each catalog follows its private module claim and becomes immutable at
-// publication. Bounded metadata only: no firmware or resource payload copy.
-var resource_catalogs: [MAX_MODULES]resources.Catalog = .{resources.Catalog{}} ** MAX_MODULES;
+extern var r4os_rust_module_claims: [MAX_MODULES]u64;
+const slot_claims = &r4os_rust_module_claims;
 
 pub const ResourceView = struct {
     source: module_file.FileSource,
@@ -238,666 +175,189 @@ pub const ResourceView = struct {
 };
 
 pub fn driverResourceView(slot: usize, generation: u32) ?ResourceView {
-    if (!published(slot)) return null;
-    const entry = &entries[slot];
-    if (entry.kind != .r4d or entry.generation != generation) return null;
-    return .{
-        .source = entry.resource_source orelse return null,
-        .file_offset = entry.resource_file_offset,
-        .catalog = &resource_catalogs[slot],
-    };
+    var result: NativeResourceView = undefined;
+    if (!r4os_rust_mod_resources(slot, generation, &result)) return null;
+    return .{ .source = module_file.sourceFromNative(result.source), .file_offset = result.file_offset, .catalog = result.catalog };
 }
 
-const ResourceCatalogReader = struct {
-    reader: *module_r4m.Reader,
-    base: usize,
-    pub fn read(self: *@This(), offset: usize, out: []u8) bool {
-        return self.reader.file.readExactAt(self.base + offset, out, "driver-resources", false);
-    }
-};
 
 fn claimValue(generation: u32, state: ClaimState) u64 {
     return (@as(u64, generation) << 32) | @intFromEnum(state);
 }
 
-fn published(index: usize) bool {
-    return index < MAX_MODULES and @as(u32, @truncate(@atomicLoad(u64, &slot_claims[index], .acquire))) == @intFromEnum(ClaimState.published);
-}
-
-const LoadScratch = struct {
-    reader: module_r4m.Reader,
-    tables: ValidatedFileTables,
-    resolved: [MAX_IMPORTS_PER_MODULE]ResolvedImport,
-    section_offsets: [MAX_SECTIONS]usize,
-};
-
-/// A private, fully validated image. The caller may finish its R4D/R4P
-/// descriptor/registry admission before publishing or aborting this handle.
-pub const PreparedLoad = struct {
+pub const PreparedLoad = extern struct {
     slot: usize,
     generation: u32,
-    scratch: ?*LoadScratch = null,
+    scratch: ?*anyopaque = null,
     unwind: task_context.UnwindToken,
-
-    fn owns(self: *const PreparedLoad) bool {
-        return @atomicLoad(u64, &slot_claims[self.slot], .acquire) == claimValue(self.generation, .reserved);
-    }
-
     pub fn exportAddress(self: *const PreparedLoad, symbol: []const u8, min_version: u32) ?u64 {
-        if (!self.owns()) return null;
-        const exp = findExport(&entries[self.slot], symbol) orelse return null;
-        return if (exp.version >= min_version) exp.address else null;
+        var value: u64 = undefined;
+        return if (r4os_rust_mod_prepared_export(self, nativeBytes(symbol), min_version, &value)) value else null;
     }
-
     pub fn commit(self: *PreparedLoad) ?usize {
-        const expected = claimValue(self.generation, .reserved);
-        if (@cmpxchgStrong(u64, &slot_claims[self.slot], expected, claimValue(self.generation, .retiring), .acq_rel, .acquire) != null) return null;
-        const entry = &entries[self.slot];
-        entry.used = true;
-        @atomicStore(u64, &slot_claims[self.slot], claimValue(self.generation, .published), .release);
-        if (entry.kind != .platform_api_provider_reserved) logPublication(entry);
-        self.releaseScratch();
-        _ = task_context.leaveUnwind(self.unwind);
-        return self.slot;
+        const peers = loadPeers();
+        const index = r4os_rust_mod_commit(self, &peers);
+        return if (index == @import("std").math.maxInt(usize)) null else index;
     }
-
     pub fn abort(self: *PreparedLoad) void {
-        const expected = claimValue(self.generation, .reserved);
-        if (@cmpxchgStrong(u64, &slot_claims[self.slot], expected, claimValue(self.generation, .retiring), .acq_rel, .acquire) != null) return;
-        const entry = &entries[self.slot];
-        var released = true;
-        if (entry.base != 0) {
-            const bytes: [*]u8 = @ptrFromInt(entry.base);
-            released = heap.free(bytes[0..entry.size]) == .ok;
-        }
-        if (released) entry.* = .{} else {
-            entry.state = .failed;
-            k.puts("[MOD] rejected image release failed; private slot retained\r\n");
-        }
-        self.releaseScratch();
-        @atomicStore(u64, &slot_claims[self.slot], claimValue(self.generation, if (released) .free else .retained), .release);
-        _ = task_context.leaveUnwind(self.unwind);
-    }
-
-    fn releaseScratch(self: *PreparedLoad) void {
-        if (self.scratch) |scratch| {
-            const bytes: [*]u8 = @ptrCast(scratch);
-            _ = heap.free(bytes[0..@sizeOf(LoadScratch)]);
-            self.scratch = null;
-        }
+        const peers = loadPeers();
+        r4os_rust_mod_abort(self, &peers);
     }
 };
 
-fn reserveLoad() ?PreparedLoad {
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) return null;
-    var index: usize = 0;
-    while (index < MAX_MODULES) : (index += 1) {
-        const before = @atomicLoad(u64, &slot_claims[index], .acquire);
-        if (@as(u32, @truncate(before)) != @intFromEnum(ClaimState.free)) continue;
-        var generation: u32 = @as(u32, @truncate(before >> 32)) +% 1;
-        if (generation == 0) generation = 1;
-        if (@cmpxchgStrong(u64, &slot_claims[index], before, claimValue(generation, .reserved), .acq_rel, .acquire) != null) continue;
-        entries[index] = .{ .generation = generation };
-        return .{ .slot = index, .generation = generation, .unwind = unwind };
-    }
-    _ = task_context.leaveUnwind(unwind);
-    k.puts("[MOD] registry full\r\n");
-    return null;
+const NativeLoadPeers = extern struct {
+    scratch_size: usize,
+    scratch_align: usize,
+    alloc: *const fn (usize, usize) callconv(.c) ?[*]u8,
+    free: *const fn ([*]u8, usize) callconv(.c) u8,
+    publication: *const fn (*const Entry) callconv(.c) void,
+    log: *const fn ([*]const u8, usize) callconv(.c) void,
+};
+
+extern fn r4os_rust_mod_commit(*PreparedLoad, *const NativeLoadPeers) usize;
+extern fn r4os_rust_mod_abort(*PreparedLoad, *const NativeLoadPeers) void;
+extern fn r4os_rust_mod_scratch_layout(bool) usize;
+extern fn r4os_rust_mod_prepare(NativeBytes, ?*const module_file.NativeSource, u16, NativeBytes, NativeBytes, *const NativeLoadPeers, *PreparedLoad) bool;
+extern fn r4os_rust_mod_load(NativeBytes, ?*const module_file.NativeSource, u16, NativeBytes, NativeBytes, *const NativeLoadPeers) usize;
+extern fn r4os_rust_mod_prepared_export(*const PreparedLoad, NativeBytes, u32, *u64) bool;
+extern fn r4os_rust_mod_load_libraries(*const NativeLoadPeers) void;
+
+fn nativeLoadAlloc(size: usize, alignment: usize) callconv(.c) ?[*]u8 {
+    return (heap.alloc(size, alignment) orelse return null).ptr;
 }
 
-fn beginLoad() ?PreparedLoad {
-    var load = reserveLoad() orelse return null;
-    const bytes = heap.alloc(@sizeOf(LoadScratch), @alignOf(LoadScratch)) orelse {
-        load.abort();
-        return null;
-    };
-    load.scratch = @ptrCast(@alignCast(bytes.ptr));
-    return load;
+fn nativeLoadFree(data: [*]u8, size: usize) callconv(.c) u8 {
+    return if (heap.free(data[0..size]) == .ok) 0 else 1;
 }
 
-fn requiredExportsValid(entry: *const Entry) bool {
-    const required: []const []const u8 = switch (entry.kind) {
-        .r4d => &.{ "DriverInit", "DriverShutdown" },
-        .r4p => &.{ "ProtocolInit", "ProtocolShutdown", "ProtocolQuery", "ProtocolDispatch" },
-        else => return true,
-    };
-    for (required) |symbol| {
-        const exp = findExport(entry, symbol) orelse return rejectLoadedExport(entry.name[0..entry.name_len], symbol, "required export missing");
-        if (exp.version < 1 or exp.address == 0 or exp.section_index >= entry.section_count) return false;
-        const section = &entry.sections[@intCast(exp.section_index)];
-        if ((section.flags & R4M_SECTION_FLAG_EXEC) == 0 or exp.section_offset >= section.mem_size) return rejectLoadedExport(entry.name[0..entry.name_len], symbol, "required export is not executable");
+fn nativeLoadLog(data: [*]const u8, len: usize) callconv(.c) void {
+    k.puts(data[0..len]);
+}
+
+fn loadPeers() NativeLoadPeers {
+    return .{ .scratch_size = r4os_rust_mod_scratch_layout(false), .scratch_align = r4os_rust_mod_scratch_layout(true), .alloc = nativeLoadAlloc, .free = nativeLoadFree, .publication = r4os_rust_mod_publication, .log = nativeLoadLog };
+}
+
+comptime {
+    if (@sizeOf(NativeOptionalSource) != 944 or @offsetOf(NativeOptionalSource, "present") != 0 or @offsetOf(NativeOptionalSource, "value") != 8 or @sizeOf(Entry) != 3296) @compileError("native module Entry/source C layout drift");
+    for (.{ .{ "version_labels", 0 }, .{ "used", 64 }, .{ "name", 65 }, .{ "name_len", 104 }, .{ "path", 112 }, .{ "path_len", 208 }, .{ "kind", 216 }, .{ "state", 218 }, .{ "flags", 220 }, .{ "base", 224 }, .{ "size", 232 }, .{ "section_count", 240 }, .{ "entry_count", 244 }, .{ "import_count", 248 }, .{ "export_count", 252 }, .{ "reloc_count", 256 }, .{ "reloc_abs64_count", 260 }, .{ "reloc_rel32_count", 264 }, .{ "reloc_base_rel64_count", 268 }, .{ "reloc_import_slot64_count", 272 }, .{ "resolved_import_count", 276 }, .{ "resolver_status", 280 }, .{ "bss_zeroed", 281 }, .{ "generation", 284 }, .{ "pinned", 288 }, .{ "resource_source", 296 }, .{ "resource_file_offset", 1240 }, .{ "sections", 1248 }, .{ "exports", 2144 } }) |field| {
+        if (@offsetOf(Entry, field[0]) != field[1]) @compileError("native module Entry C offset drift");
     }
+    if (@sizeOf(PreparedLoad) != 40 or @offsetOf(PreparedLoad, "slot") != 0 or @offsetOf(PreparedLoad, "generation") != 8 or @offsetOf(PreparedLoad, "scratch") != 16 or @offsetOf(PreparedLoad, "unwind") != 24) @compileError("native PreparedLoad C layout drift");
+    if (@sizeOf(NativeLoadPeers) != 48) @compileError("native load peer C size drift");
+    const names = [_][]const u8{ "scratch_size", "scratch_align", "alloc", "free", "publication", "log" };
+    for (names, 0..) |name, i| {
+        if (@offsetOf(NativeLoadPeers, name) != i * 8) @compileError("native load peer C offset drift");
+    }
+}
+
+
+extern var r4os_rust_module_entries: [MAX_MODULES]Entry;
+const entries = &r4os_rust_module_entries;
+
+// Stateless projections of the canonical Contract metadata and logger.
+// Native Rust owns all registration, lookup, counter and rendering decisions.
+const NativePlatform = extern struct { name: NativeBytes, group: u32, query: u64 };
+const NativeResourceView = extern struct { source: module_file.NativeSource, file_offset: usize, catalog: *const resources.Catalog };
+extern fn r4os_rust_mod_init(*const NativeLoadPeers) void;
+extern fn r4os_rust_mod_counter(u8, bool) u32;
+extern fn r4os_rust_mod_libraries_active(bool) bool;
+extern fn r4os_rust_mod_count() usize;
+extern fn r4os_rust_mod_entry(usize) ?*const Entry;
+extern fn r4os_rust_mod_find_name(NativeBytes) usize;
+extern fn r4os_rust_mod_platform_group(NativeBytes) u64;
+extern fn r4os_rust_mod_summary() void;
+extern fn r4os_rust_mod_library_results(usize) void;
+extern fn r4os_rust_mod_resolve_logged(*const Entry, NativeBytes, NativeBytes, u32, u32, NativeBytes, *ResolvedImport) bool;
+extern fn r4os_rust_mod_required_logged(*const Entry) bool;
+extern fn r4os_rust_mod_reject(NativeBytes, NativeBytes, NativeBytes) bool;
+extern fn r4os_rust_mod_export_info(usize, NativeBytes, u32, *ExportInfo) bool;
+extern fn r4os_rust_mod_resolve_info(NativeBytes, NativeBytes, u32, *ExportInfo) bool;
+extern fn r4os_rust_mod_code_owner(u8, u32, u64) bool;
+extern fn r4os_rust_mod_resources(usize, u32, *NativeResourceView) bool;
+extern fn r4os_rust_mod_publication(*const Entry) void;
+export fn r4os_zig_mod_log(op: u8, value: u64, data: ?[*]const u8, len: usize) callconv(.c) void {
+    switch (op) {
+        0 => k.puts(data.?[0..len]),
+        1 => k.putDec(value),
+        2 => k.putHex(value, 16),
+        else => unreachable,
+    }
+}
+export fn r4os_zig_mod_platform(index: usize, out: *NativePlatform) callconv(.c) bool {
+    if (index >= r4x_api.r4_platform_apis.len) return false;
+    const meta = r4x_api.r4_platform_apis[index];
+    out.* = .{ .name = nativeBytes(meta.name), .group = @intFromEnum(meta.group), .query = @intFromPtr(&platform_api_queries[index]) };
     return true;
 }
-
-var entries: [MAX_MODULES]Entry = .{Entry{}} ** MAX_MODULES;
-var unknown_relocation_errors: u32 = 0;
-var relocation_range_errors: u32 = 0;
-var unresolved_import_errors: u32 = 0;
-var missing_dependency_errors: u32 = 0;
-var symbol_dependency_errors: u32 = 0;
-var version_dependency_errors: u32 = 0;
-var cycle_dependency_errors: u32 = 0;
-var duplicate_provider_errors: u32 = 0;
-var libraries_generation_active: bool = false;
-
-pub fn init() void {
-    entries = .{Entry{}} ** MAX_MODULES;
-    slot_claims = .{0} ** MAX_MODULES;
-    unknown_relocation_errors = 0;
-    relocation_range_errors = 0;
-    unresolved_import_errors = 0;
-    missing_dependency_errors = 0;
-    symbol_dependency_errors = 0;
-    version_dependency_errors = 0;
-    cycle_dependency_errors = 0;
-    duplicate_provider_errors = 0;
-    libraries_generation_active = false;
-    registerPlatformApis();
+comptime {
+    if (r4x_api.r4_platform_apis.len != 6) @compileError("expected exactly six built-in platform APIs");
+    if (@sizeOf(NativePlatform) != 32 or @offsetOf(NativePlatform, "name") != 0 or @offsetOf(NativePlatform, "group") != 16 or @offsetOf(NativePlatform, "query") != 24) @compileError("native platform metadata C layout drift");
+    if (@sizeOf(ExportInfo) != 24 or @offsetOf(ExportInfo, "address") != 0 or @offsetOf(ExportInfo, "version") != 8 or @offsetOf(ExportInfo, "available_size") != 12 or @offsetOf(ExportInfo, "generation") != 16 or @offsetOf(ExportInfo, "module_slot") != 20 or @offsetOf(ExportInfo, "kind") != 22) @compileError("native ExportInfo C layout drift");
+    if (@sizeOf(NativeResourceView) != 952 or @offsetOf(NativeResourceView, "source") != 0 or @offsetOf(NativeResourceView, "file_offset") != 936 or @offsetOf(NativeResourceView, "catalog") != 944) @compileError("native ResourceView C layout drift");
 }
 
+
+export fn r4os_zig_mod_perf(op: u8, a: u64, b: u64) callconv(.c) u64 {
+    switch (op) {
+        0 => return loader_perf.now(),
+        1 => loader_perf.addR4lScanTicks(a),
+        2 => loader_perf.recordR4lScanEntry(),
+        3 => loader_perf.recordR4lCandidate(),
+        4 => loader_perf.addR4lResolveTicks(a),
+        5 => loader_perf.addR4lLoadTicks(a),
+        6 => loader_perf.recordR4lResults(@intCast(a), @intCast(b)),
+        else => unreachable,
+    }
+    return 0;
+}
+pub fn init() void {
+    const peers = loadPeers();
+    r4os_rust_mod_init(&peers);
+}
 pub fn loadSystemLibraries() void {
-    if (libraries_generation_active) {
-        k.puts("[MOD] active R4L generation is pinned; reload deferred until reboot\r\n");
-        return;
-    }
-    const volume = vfs.volumeForDrive('C') orelse {
-        k.puts("[MOD] C: FAT32 volume not mounted\r\n");
-        return;
-    };
-    const dir_cluster = vfs.resolvePath(volume, "/R4OS/LIBS") orelse {
-        k.puts("[MOD] /R4OS/LIBS not found\r\n");
-        return;
-    };
-    libraries_generation_active = true;
-
-    k.puts("[MOD] scanning /R4OS/LIBS\r\n");
-    var pending: [MAX_PENDING_LIBS]PendingLibrary = .{PendingLibrary{}} ** MAX_PENDING_LIBS;
-    defer freePendingLibraries(pending[0..]);
-
-    var pending_count: usize = 0;
-    var index: usize = 0;
-    var name_buf: [64]u8 = .{0} ** 64;
-    while (true) : (index += 1) {
-        const scan_start = loader_perf.now();
-        const maybe_entry = vfs.readDirectoryEntry(volume, dir_cluster, index, name_buf[0..]);
-        loader_perf.addR4lScanTicks(scan_start);
-        const file_entry = maybe_entry orelse break;
-        loader_perf.recordR4lScanEntry();
-        const file_name = zName(name_buf[0..]);
-        if (file_entry.isDir() or !hasR4lExtension(file_name)) continue;
-        loader_perf.recordR4lCandidate();
-        if (pending_count >= pending.len) {
-            k.puts("[MOD] pending library limit reached\r\n");
-            break;
-        }
-        if (collectPendingLibrary(volume, file_entry, file_name, &pending[pending_count])) {
-            pending_count += 1;
-        }
-    }
-
-    markDuplicateProviders(pending[0..pending_count]);
-
-    var loaded: usize = 0;
-    var i: usize = 0;
-    const resolve_start = loader_perf.now();
-    while (i < pending_count) : (i += 1) {
-        if (resolveAndLoadPending(pending[0..pending_count], i)) loaded += 1;
-    }
-    loader_perf.addR4lResolveTicks(resolve_start);
-    loader_perf.recordR4lResults(loaded, pending_count);
-
-    k.puts("[MOD] R4L loaded=");
-    k.putDec(loaded);
-    k.puts(" total=");
-    k.putDec(countUsed());
-    k.puts("\r\n");
-
-    if (missing_dependency_errors != 0 or symbol_dependency_errors != 0 or version_dependency_errors != 0 or cycle_dependency_errors != 0 or duplicate_provider_errors != 0 or unresolved_import_errors != 0) {
-        k.puts("[MOD] resolver errors missing=");
-        k.putDec(missing_dependency_errors);
-        k.puts(" symbol=");
-        k.putDec(symbol_dependency_errors);
-        k.puts(" version=");
-        k.putDec(version_dependency_errors);
-        k.puts(" cycle=");
-        k.putDec(cycle_dependency_errors);
-        k.puts(" duplicate=");
-        k.putDec(duplicate_provider_errors);
-        k.puts(" unresolved=");
-        k.putDec(unresolved_import_errors);
-        k.puts("\r\n");
-    }
+    const peers = loadPeers();
+    r4os_rust_mod_load_libraries(&peers);
 }
 
 pub fn dumpSummary() void {
-    var r4l: usize = 0;
-    var r4x: usize = 0;
-    var r4d: usize = 0;
-    var r4p: usize = 0;
-    var builtin: usize = 0;
-    var failed: usize = 0;
-
-    for (&entries, 0..) |*e, index| {
-        if (!published(index)) continue;
-        switch (e.kind) {
-            .r4l => r4l += 1,
-            .r4x => r4x += 1,
-            .r4d => r4d += 1,
-            .r4p => r4p += 1,
-            .platform_api_provider_reserved, .kernel_module_reserved => builtin += 1,
-        }
-        if (e.state == .failed or e.resolver_status == .failed) failed += 1;
-    }
-
-    k.puts("[MOD] summary total=");
-    k.putDec(countUsed());
-    k.puts(" r4l=");
-    k.putDec(@intCast(r4l));
-    k.puts(" r4x=");
-    k.putDec(@intCast(r4x));
-    k.puts(" r4d=");
-    k.putDec(@intCast(r4d));
-    k.puts(" r4p=");
-    k.putDec(@intCast(r4p));
-    k.puts(" builtin=");
-    k.putDec(@intCast(builtin));
-    k.puts(" failed=");
-    k.putDec(@intCast(failed));
-    k.puts("\r\n");
-
-    if (unknown_relocation_errors != 0 or relocation_range_errors != 0) {
-        k.puts("[MOD] relocation errors unknown=");
-        k.putDec(unknown_relocation_errors);
-        k.puts(" range=");
-        k.putDec(relocation_range_errors);
-        k.puts("\r\n");
-    }
-    if (missing_dependency_errors != 0 or symbol_dependency_errors != 0 or version_dependency_errors != 0 or cycle_dependency_errors != 0 or duplicate_provider_errors != 0 or unresolved_import_errors != 0) {
-        k.puts("[MOD] resolver errors missing=");
-        k.putDec(missing_dependency_errors);
-        k.puts(" symbol=");
-        k.putDec(symbol_dependency_errors);
-        k.puts(" version=");
-        k.putDec(version_dependency_errors);
-        k.puts(" cycle=");
-        k.putDec(cycle_dependency_errors);
-        k.puts(" duplicate=");
-        k.putDec(duplicate_provider_errors);
-        k.puts(" unresolved=");
-        k.putDec(unresolved_import_errors);
-        k.puts("\r\n");
-    }
+    r4os_rust_mod_summary();
 }
 
 pub fn countUsed() usize {
-    var count: usize = 0;
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        if (published(i)) count += 1;
-    }
-    return count;
+    return r4os_rust_mod_count();
 }
 
 pub fn entryAt(index: usize) ?*const Entry {
-    if (!published(index)) return null;
-    return &entries[index];
+    return r4os_rust_mod_entry(index);
 }
 
 pub fn platformApiGroupId(name: []const u8) ?u32 {
-    for (r4x_api.r4_platform_apis) |meta| {
-        if (nameEq(name, meta.name)) return @intFromEnum(meta.group);
-    }
-    return null;
-}
-
-fn registerPlatformApis() void {
-    comptime {
-        if (r4x_api.r4_platform_apis.len != 6) @compileError("expected exactly six built-in platform APIs");
-    }
-    for (r4x_api.r4_platform_apis, 0..) |meta, index| {
-        var load = reserveLoad() orelse return;
-        defer load.abort();
-        const slot = load.slot;
-        const e = &entries[slot];
-        e.* = .{
-            .used = false,
-            .kind = .platform_api_provider_reserved,
-            .state = .builtin,
-            .resolver_status = .builtin,
-            .export_count = 1,
-            .generation = load.generation,
-            .pinned = true,
-        };
-        e.name_len = copyBytes(meta.name, e.name[0..]);
-        e.path_len = copyBytes("builtin:", e.path[0..]);
-        e.path_len += copyBytes(meta.name, e.path[e.path_len..]);
-        e.exports[0] = .{
-            .used = true,
-            .version = 1,
-            .address = @intFromPtr(&platform_api_queries[index]),
-            .section_index = 0,
-            .section_offset = 0,
-        };
-        e.exports[0].name_len = copyBytes("Query", e.exports[0].name[0..]);
-        _ = load.commit() orelse return;
-    }
-}
-
-fn collectPendingLibrary(volume: vfs.Volume, file_entry: vfs.Entry, file_name: []const u8, out: *PendingLibrary) bool {
-    if (file_entry.size == 0) return false;
-    const probe = readPendingLibraryProbe(volume, file_entry, file_name) orelse return false;
-    const probe_module_name = probe.module_name[0..probe.module_name_len];
-    if (findByName(probe_module_name) != null) {
-        duplicate_provider_errors += 1;
-        k.puts("[MOD] resolver duplicate provider module=");
-        k.puts(probe_module_name);
-        k.puts("\r\n");
-        return false;
-    }
-
-    var path_buf: [MAX_PATH]u8 = .{0} ** MAX_PATH;
-    const path = buildLibraryPath(file_name, &path_buf);
-
-    out.* = .{
-        .used = true,
-        .state = .pending,
-        .source = .{
-            .volume = volume,
-            .entry = file_entry,
-            .drive_letter = 'C',
-        },
-        .file_size = @intCast(file_entry.size),
-    };
-    out.file_name_len = copyBytes(file_name, out.file_name[0..]);
-    out.module_name_len = copyBytes(probe_module_name, out.module_name[0..]);
-    out.path_len = copyBytes(path, out.path[0..]);
-    return true;
-}
-
-fn readPendingLibraryProbe(volume: vfs.Volume, file_entry: vfs.Entry, file_name: []const u8) ?PendingLibraryProbe {
-    var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
-    const source = module_file.FileSource{
-        .volume = volume,
-        .entry = file_entry,
-        .drive_letter = 'C',
-    };
-    var reader = module_r4m.Reader.init(source, @intCast(file_entry.size));
-    const header = reader.readHeader(.r4l, .{
-        .max_sections = MAX_SECTIONS,
-        .max_imports = MAX_IMPORTS_PER_MODULE,
-        .max_exports = MAX_EXPORTS_PER_MODULE,
-    }, "r4l-metadata-probe", true) orelse return null;
-    const meta = reader.readMetadata(header, meta_buf[0..], "r4l-metadata-probe", true) orelse return null;
-    const module_name = module_r4m.firstMetadataItem(meta) orelse fallbackModuleName(file_name);
-    if (!validModuleName(module_name)) {
-        k.puts("[MOD] invalid R4L module name file=");
-        k.puts(file_name);
-        k.puts("\r\n");
-        return null;
-    }
-    var probe = PendingLibraryProbe{};
-    probe.module_name_len = copyBytes(module_name, probe.module_name[0..]);
-    return probe;
-}
-
-fn freePendingLibraries(pending: []PendingLibrary) void {
-    var i: usize = 0;
-    while (i < pending.len) : (i += 1) {
-        if (pending[i].used) pending[i] = PendingLibrary{};
-    }
-}
-
-fn markDuplicateProviders(pending: []PendingLibrary) void {
-    var i: usize = 0;
-    while (i < pending.len) : (i += 1) {
-        if (!pending[i].used or pending[i].state == .failed) continue;
-        var j = i + 1;
-        while (j < pending.len) : (j += 1) {
-            if (!pending[j].used or pending[j].state == .failed) continue;
-            if (nameEq(pending[i].module_name[0..pending[i].module_name_len], pending[j].module_name[0..pending[j].module_name_len])) {
-                duplicate_provider_errors += 1;
-                pending[i].state = .failed;
-                pending[j].state = .failed;
-                k.puts("[MOD] resolver duplicate provider module=");
-                k.puts(pending[i].module_name[0..pending[i].module_name_len]);
-                k.puts("\r\n");
-            }
-        }
-    }
-}
-
-fn resolveAndLoadPending(pending: []PendingLibrary, index: usize) bool {
-    if (index >= pending.len or !pending[index].used) return false;
-    var p = &pending[index];
-    return switch (p.state) {
-        .loaded => true,
-        .failed, .empty => false,
-        .loading => blk: {
-            cycle_dependency_errors += 1;
-            p.state = .failed;
-            k.puts("[MOD] resolver cycle at ");
-            k.puts(p.module_name[0..p.module_name_len]);
-            k.puts("\r\n");
-            break :blk false;
-        },
-        .pending => blk: {
-            p.state = .loading;
-            var load = beginLoad() orelse {
-                p.state = .failed;
-                break :blk false;
-            };
-            defer load.abort();
-            const scratch = load.scratch.?;
-            scratch.reader.reset(p.source, p.file_size);
-            const tables = &scratch.tables;
-            if (!readValidatedFileTables(&scratch.reader, tables, .r4l, p.file_name[0..p.file_name_len])) {
-                p.state = .failed;
-                break :blk false;
-            }
-            const resolved_buf = &scratch.resolved;
-            if (tables.header.import_count > resolved_buf.len) {
-                p.state = .failed;
-                unresolved_import_errors += 1;
-                break :blk false;
-            }
-
-            var import_index: usize = 0;
-            while (import_index < tables.header.import_count) : (import_index += 1) {
-                const import = tables.imports[import_index].view();
-                const resolved = resolveImport(pending, index, import) orelse {
-                    if (p.state == .loading) p.state = .failed;
-                    break :blk false;
-                };
-                resolved_buf[import_index] = resolved;
-            }
-
-            if (p.state != .loading) break :blk false;
-            const load_start = loader_perf.now();
-            if (loadR4MFile(
-                &load,
-                p.source,
-                tables,
-                .r4l,
-                p.file_name[0..p.file_name_len],
-                p.path[0..p.path_len],
-                resolved_buf[0..@intCast(tables.header.import_count)],
-            ) and load.commit() != null) {
-                loader_perf.addR4lLoadTicks(load_start);
-                p.state = .loaded;
-                break :blk true;
-            }
-            loader_perf.addR4lLoadTicks(load_start);
-            p.state = .failed;
-            break :blk false;
-        },
-    };
+    const result = r4os_rust_mod_platform_group(nativeBytes(name));
+    return if (result == @import("std").math.maxInt(u64)) null else @intCast(result);
 }
 
 pub fn loadResolvedBytes(bytes: []const u8, expected_kind: Kind, fallback_name: []const u8, path: []const u8) ?usize {
-    var load = prepareResolvedBytes(bytes, expected_kind, fallback_name, path) orelse return null;
-    defer load.abort();
-    return load.commit();
+    const peers = loadPeers();
+    const index = r4os_rust_mod_load(nativeBytes(bytes), null, @intFromEnum(expected_kind), nativeBytes(fallback_name), nativeBytes(path), &peers);
+    return if (index == @import("std").math.maxInt(usize)) null else index;
 }
-
 pub fn loadResolvedFile(source: module_file.FileSource, expected_kind: Kind, fallback_name: []const u8, path: []const u8) ?usize {
-    var load = prepareResolvedFile(source, expected_kind, fallback_name, path) orelse return null;
-    defer load.abort();
-    return load.commit();
+    const peers = loadPeers();
+    const native_source = module_file.nativeSource(source);
+    const index = r4os_rust_mod_load(nativeBytes(""), &native_source, @intFromEnum(expected_kind), nativeBytes(fallback_name), nativeBytes(path), &peers);
+    return if (index == @import("std").math.maxInt(usize)) null else index;
 }
-
 pub fn prepareResolvedBytes(bytes: []const u8, expected_kind: Kind, fallback_name: []const u8, path: []const u8) ?PreparedLoad {
-    var load = beginLoad() orelse return null;
-    var ready = false;
-    defer if (!ready) {
-        load.abort();
-    };
-    const scratch = load.scratch.?;
-
-    const header = parseHeader(bytes) orelse {
-        k.puts("[MOD] bad R4M0 header: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    };
-    const kind = kindFromRaw(header.kind_raw) orelse {
-        k.puts("[MOD] unknown ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    };
-    if (!module_r4m.isLoadableContainerKind(kind) or !module_r4m.isLoadableContainerKind(expected_kind)) {
-        k.puts("[MOD] reserved ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    }
-    if (kind != expected_kind) {
-        k.puts("[MOD] unexpected ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    }
-    if (!validateTables(header, bytes)) {
-        k.puts("[MOD] invalid R4M0 tables: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    }
-
-    const importer_name = moduleName(bytes, header) orelse fallbackModuleName(fallback_name);
-
-    const resolved_buf = &scratch.resolved;
-    if (header.import_count > resolved_buf.len) {
-        unresolved_import_errors += 1;
-        k.puts("[MOD] too many imports importer=");
-        k.puts(importer_name);
-        k.puts("\r\n");
-        return null;
-    }
-
-    var import_index: usize = 0;
-    while (import_index < header.import_count) : (import_index += 1) {
-        const import = readImport(bytes, header, import_index) orelse {
-            unresolved_import_errors += 1;
-            k.puts("[MOD] bad import importer=");
-            k.puts(importer_name);
-            k.puts("\r\n");
-            return null;
-        };
-        const provider_slot = findByName(import.module) orelse {
-            if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) {
-                resolved_buf[import_index] = missingOptional(import);
-                continue;
-            }
-            missing_dependency_errors += 1;
-            k.puts("[MOD] resolver missing module=");
-            k.puts(import.module);
-            k.puts(" importer=");
-            k.puts(importer_name);
-            k.puts("\r\n");
-            return null;
-        };
-        const resolved = resolveImportFromEntry(&entries[provider_slot], import, importer_name) orelse return null;
-        resolved_buf[import_index] = resolved;
-    }
-
-    if (!loadR4M(&load, bytes, expected_kind, fallback_name, path, resolved_buf[0..@intCast(header.import_count)])) return null;
-    ready = true;
-    return load;
+    const peers = loadPeers();
+    var result: PreparedLoad = undefined;
+    return if (r4os_rust_mod_prepare(nativeBytes(bytes), null, @intFromEnum(expected_kind), nativeBytes(fallback_name), nativeBytes(path), &peers, &result)) result else null;
 }
-
 pub fn prepareResolvedFile(source: module_file.FileSource, expected_kind: Kind, fallback_name: []const u8, path: []const u8) ?PreparedLoad {
-    var load = beginLoad() orelse return null;
-    var ready = false;
-    defer if (!ready) {
-        load.abort();
-    };
-    const scratch = load.scratch.?;
-
-    if (!module_r4m.isLoadableContainerKind(expected_kind)) {
-        k.puts("[MOD] reserved ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    }
-    const file_size: usize = @intCast(source.entry.size);
-    scratch.reader.reset(source, file_size);
-    const tables = &scratch.tables;
-    if (!readValidatedFileTables(&scratch.reader, tables, expected_kind, fallback_name)) {
-        k.puts("[MOD] bad R4M0 header: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    }
-    const header = tables.header;
-    const kind = header.kind() orelse {
-        k.puts("[MOD] unknown ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    };
-    if (kind != expected_kind) {
-        k.puts("[MOD] unexpected ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return null;
-    }
-    const importer_name = tables.name(fallback_name);
-
-    const resolved_buf = &scratch.resolved;
-    if (header.import_count > resolved_buf.len) {
-        unresolved_import_errors += 1;
-        k.puts("[MOD] too many imports importer=");
-        k.puts(importer_name);
-        k.puts("\r\n");
-        return null;
-    }
-
-    var import_index: usize = 0;
-    while (import_index < header.import_count) : (import_index += 1) {
-        const import = tables.imports[import_index].view();
-        const provider_slot = findByName(import.module) orelse {
-            if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) {
-                resolved_buf[import_index] = missingOptional(import);
-                continue;
-            }
-            missing_dependency_errors += 1;
-            k.puts("[MOD] resolver missing module=");
-            k.puts(import.module);
-            k.puts(" importer=");
-            k.puts(importer_name);
-            k.puts("\r\n");
-            return null;
-        };
-        const resolved = resolveImportFromEntry(&entries[provider_slot], import, importer_name) orelse return null;
-        resolved_buf[import_index] = resolved;
-    }
-
-    if (!loadR4MFile(&load, source, tables, expected_kind, fallback_name, path, resolved_buf[0..@intCast(header.import_count)])) return null;
-    ready = true;
-    return load;
+    const peers = loadPeers();
+    const native_source = module_file.nativeSource(source);
+    var result: PreparedLoad = undefined;
+    return if (r4os_rust_mod_prepare(nativeBytes(""), &native_source, @intFromEnum(expected_kind), nativeBytes(fallback_name), nativeBytes(path), &peers, &result)) result else null;
 }
 
 pub fn exportAddress(slot: usize, symbol: []const u8, min_version: u32) ?u64 {
@@ -905,7 +365,7 @@ pub fn exportAddress(slot: usize, symbol: []const u8, min_version: u32) ?u64 {
     return info.address;
 }
 
-pub const ExportInfo = struct {
+pub const ExportInfo = extern struct {
     address: u64,
     version: u32,
     available_size: u32,
@@ -915,28 +375,8 @@ pub const ExportInfo = struct {
 };
 
 pub fn exportInfo(slot: usize, symbol: []const u8, min_version: u32) ?ExportInfo {
-    if (!published(slot)) return null;
-    const exp = findExport(&entries[slot], symbol) orelse return null;
-    if (exp.version < min_version) return null;
-    if (entries[slot].kind == .platform_api_provider_reserved) return .{
-        .address = exp.address,
-        .version = exp.version,
-        .available_size = r4x_api.r4l_query_struct_size,
-        .generation = entries[slot].generation,
-        .module_slot = @intCast(slot),
-        .kind = entries[slot].kind,
-    };
-    if (exp.section_index >= entries[slot].section_count or exp.section_index >= entries[slot].sections.len) return null;
-    const section = entries[slot].sections[@intCast(exp.section_index)];
-    if (!section.used or (section.flags & R4M_SECTION_FLAG_ALLOC) == 0 or exp.section_offset >= section.mem_size) return null;
-    return .{
-        .address = exp.address,
-        .version = exp.version,
-        .available_size = section.mem_size - exp.section_offset,
-        .generation = entries[slot].generation,
-        .module_slot = @intCast(slot),
-        .kind = entries[slot].kind,
-    };
+    var result: ExportInfo = undefined;
+    return if (r4os_rust_mod_export_info(slot, nativeBytes(symbol), min_version, &result)) result else null;
 }
 
 // IRQ-time executable ownership lookup. Runtime R4Ls are boot-generation
@@ -945,19 +385,7 @@ pub fn exportInfo(slot: usize, symbol: []const u8, min_version: u32) ?ExportInfo
 // binding preemptible. Only explicitly executable sections qualify; data,
 // BSS, other module kinds and overflowed ranges fail closed.
 pub fn isExecutableAddress(module_slot: u8, generation: u32, address: u64) bool {
-    const slot: usize = module_slot;
-    if (slot >= entries.len or generation == 0) return false;
-    const entry = &entries[slot];
-    if (!published(slot) or entry.state != .loaded or entry.kind != .r4l or entry.generation != generation) return false;
-
-    const section_count: usize = @min(@as(usize, @intCast(entry.section_count)), entry.sections.len);
-    for (entry.sections[0..section_count]) |section| {
-        if (!section.used or (section.flags & (R4M_SECTION_FLAG_ALLOC | R4M_SECTION_FLAG_EXEC)) != (R4M_SECTION_FLAG_ALLOC | R4M_SECTION_FLAG_EXEC) or section.mem_size == 0) continue;
-        const end = section.runtime_base +% @as(u64, section.mem_size);
-        if (end < section.runtime_base) continue;
-        if (address >= section.runtime_base and address < end) return true;
-    }
-    return false;
+    return r4os_rust_mod_code_owner(module_slot, generation, address);
 }
 
 pub fn resolveExportAddress(module_name: []const u8, symbol: []const u8, min_version: u32) ?u64 {
@@ -966,1218 +394,138 @@ pub fn resolveExportAddress(module_name: []const u8, symbol: []const u8, min_ver
 }
 
 pub fn resolveExportInfo(module_name: []const u8, symbol: []const u8, min_version: u32) ?ExportInfo {
-    const slot = findByName(module_name) orelse return null;
-    return exportInfo(slot, symbol, min_version);
+    var result: ExportInfo = undefined;
+    return if (r4os_rust_mod_resolve_info(nativeBytes(module_name), nativeBytes(symbol), min_version, &result)) result else null;
 }
 
-fn resolveImport(pending: []PendingLibrary, importer_index: usize, import: ImportRecord) ?ResolvedImport {
-    const importer_name = pending[importer_index].module_name[0..pending[importer_index].module_name_len];
-    if (findByName(import.module)) |slot| {
-        return resolveImportFromEntry(&entries[slot], import, importer_name);
-    }
 
-    const provider_index = findPendingByName(pending, import.module) orelse {
-        if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) return missingOptional(import);
-        missing_dependency_errors += 1;
-        k.puts("[MOD] resolver missing module=");
-        k.puts(import.module);
-        k.puts(" importer=");
-        k.puts(importer_name);
-        k.puts("\r\n");
-        return null;
-    };
-
-    if (pending[provider_index].state == .loading) {
-        if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) return missingOptional(import);
-        cycle_dependency_errors += 1;
-        pending[provider_index].state = .failed;
-        k.puts("[MOD] resolver cycle importer=");
-        k.puts(importer_name);
-        k.puts(" provider=");
-        k.puts(import.module);
-        k.puts("\r\n");
-        return null;
-    }
-    if (!resolveAndLoadPending(pending, provider_index))
-        return if ((import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0) missingOptional(import) else null;
-    if (findByName(import.module)) |slot| {
-        return resolveImportFromEntry(&entries[slot], import, importer_name);
-    }
-    unresolved_import_errors += 1;
-    return null;
+const NativeEntryView = extern struct { kind: u16, state: u8, generation: u32, section_count: u32, export_count: u32, name: NativeBytes, sections: [*]const Section, exports: [*]const Export };
+const NativeRequired = extern struct { symbol: NativeBytes, reason: NativeBytes, accepted: bool };
+extern fn r4os_rust_mod_find_export(*const NativeEntryView, NativeBytes) ?*const Export;
+extern fn r4os_rust_mod_resolve(*const NativeEntryView, NativeBytes, NativeBytes, u32, u32, *ResolvedImport, *u32) u8;
+extern fn r4os_rust_mod_optional(NativeBytes, NativeBytes, *ResolvedImport) void;
+extern fn r4os_rust_mod_resolved_count([*]const ResolvedImport, usize) u32;
+extern fn r4os_rust_mod_executable(*const NativeEntryView, u32, u64) bool;
+extern fn r4os_rust_mod_required(*const NativeEntryView) NativeRequired;
+fn nativeEntryView(e: *const Entry) NativeEntryView {
+    return .{ .kind = @intFromEnum(e.kind), .state = @intFromEnum(e.state), .generation = e.generation, .section_count = e.section_count, .export_count = e.export_count, .name = .{ .data = &e.name, .len = e.name_len }, .sections = &e.sections, .exports = &e.exports };
 }
+comptime {
+    if (@sizeOf(Export) != 72 or @sizeOf(Section) != 56 or @sizeOf(NativeEntryView) != 48 or @sizeOf(NativeRequired) != 40) @compileError("module query private C size drift");
+    for (.{ .{ "used", 0 }, .{ "name", 1 }, .{ "name_len", 40 }, .{ "version", 48 }, .{ "address", 56 }, .{ "section_index", 64 }, .{ "section_offset", 68 } }) |field| {
+        if (@offsetOf(Export, field[0]) != field[1]) @compileError("module export C offset drift");
+    }
+    for (.{ .{ "used", 0 }, .{ "name", 1 }, .{ "name_len", 16 }, .{ "flags", 24 }, .{ "file_size", 28 }, .{ "mem_size", 32 }, .{ "alignment", 36 }, .{ "runtime_offset", 40 }, .{ "runtime_base", 48 } }) |field| {
+        if (@offsetOf(Section, field[0]) != field[1]) @compileError("module runtime section C offset drift");
+    }
+    for (.{ .{ "kind", 0 }, .{ "state", 2 }, .{ "generation", 4 }, .{ "section_count", 8 }, .{ "export_count", 12 }, .{ "name", 16 }, .{ "sections", 32 }, .{ "exports", 40 } }) |field| {
+        if (@offsetOf(NativeEntryView, field[0]) != field[1]) @compileError("module query view C offset drift");
+    }
+    if (@offsetOf(NativeRequired, "symbol") != 0 or @offsetOf(NativeRequired, "reason") != 16 or @offsetOf(NativeRequired, "accepted") != 32) @compileError("module required-export C offset drift");
+}
+
+// Stateless format projections. Native Rust alone validates byte admission,
+// section policy, image layout, individual relocations and R4L table headers.
+const NativeBytes = extern struct { data: [*]const u8, len: usize };
+const NativeImport = extern struct { module: NativeBytes, symbol: NativeBytes, min_version: u32, flags: u32 };
+const NativeRelocationImage = extern struct { sections: [*]const SectionHeader, section_count: usize, offsets: [*]const usize, offset_count: usize, image: [*]u8, image_len: usize, imports: [*]const ResolvedImport, import_count: usize };
+const NativeLoadedExport = extern struct { name: NativeBytes, version: u32, section_index: u32, export_offset: u32, sections: [*]const SectionHeader, section_count: usize, offsets: [*]const usize, offset_count: usize, image: NativeBytes };
+extern fn r4os_rust_mod_header(NativeBytes, *Header) bool;
+extern fn r4os_rust_mod_validate(NativeBytes, *const Header, u8) bool;
+extern fn r4os_rust_mod_sections(NativeBytes, *const Header, [*]SectionHeader, usize) bool;
+extern fn r4os_rust_mod_section_kinds([*]const SectionHeader, usize, u16) bool;
+extern fn r4os_rust_mod_layout([*]const SectionHeader, usize, [*]usize, *usize) bool;
+extern fn r4os_rust_mod_reloc(Relocation, *const NativeRelocationImage) u8;
+extern fn r4os_rust_mod_import(*const Header, NativeBytes, usize, *NativeImport) bool;
+extern fn r4os_rust_mod_reloc_record(*const Header, NativeBytes, usize, *Relocation) bool;
+extern fn r4os_rust_mod_loaded_export(*const NativeLoadedExport) NativeBytes;
+extern fn r4os_rust_mod_name(NativeBytes, u8) u16;
+fn nativeBytes(value: []const u8) NativeBytes {
+    return .{ .data = value.ptr, .len = value.len };
+}
+comptime {
+    if (@sizeOf(SectionHeader) != 40 or @sizeOf(NativeImport) != 40 or @sizeOf(ResolvedImport) != 96 or @sizeOf(NativeRelocationImage) != 64 or @sizeOf(NativeLoadedExport) != 80) @compileError("module format private C size drift");
+    for (.{ .{ "name", 0 }, .{ "name_len", 8 }, .{ "flags", 16 }, .{ "file_off", 20 }, .{ "file_size", 24 }, .{ "mem_size", 28 }, .{ "alignment", 32 } }) |field| {
+        if (@offsetOf(SectionHeader, field[0]) != field[1]) @compileError("module section C offset drift");
+    }
+    for (.{ .{ "module", 0 }, .{ "symbol", 16 }, .{ "min_version", 32 }, .{ "flags", 36 } }) |field| {
+        if (@offsetOf(NativeImport, field[0]) != field[1]) @compileError("module import C offset drift");
+    }
+    for (.{ .{ "module", 0 }, .{ "module_len", 32 }, .{ "symbol", 40 }, .{ "symbol_len", 72 }, .{ "version", 80 }, .{ "address", 88 } }) |field| {
+        if (@offsetOf(ResolvedImport, field[0]) != field[1]) @compileError("module resolved import C offset drift");
+    }
+    const names = [_][]const u8{ "sections", "section_count", "offsets", "offset_count", "image", "image_len", "imports", "import_count" };
+    for (names, 0..) |name, i| {
+        if (@offsetOf(NativeRelocationImage, name) != i * 8) @compileError("module relocation image C offset drift");
+    }
+    for (.{ .{ "name", 0 }, .{ "version", 16 }, .{ "section_index", 20 }, .{ "export_offset", 24 }, .{ "sections", 32 }, .{ "section_count", 40 }, .{ "offsets", 48 }, .{ "offset_count", 56 }, .{ "image", 64 } }) |field| {
+        if (@offsetOf(NativeLoadedExport, field[0]) != field[1]) @compileError("module loaded export C offset drift");
+    }
+}
+
 
 fn resolveImportFromEntry(provider: *const Entry, import: ImportRecord, importer_name: []const u8) ?ResolvedImport {
-    if (!module_r4m.validImportFlags(import.module, import.flags)) return null;
-    const optional = (import.flags & module_r4m.IMPORT_FLAG_OPTIONAL) != 0;
-    if (optional and provider.kind != .r4l) return null;
-    const exp = findExport(provider, import.symbol) orelse {
-        if (optional) return missingOptional(import);
-        symbol_dependency_errors += 1;
-        k.puts("[MOD] resolver missing export module=");
-        k.puts(provider.name[0..provider.name_len]);
-        k.puts(" symbol=");
-        k.puts(import.symbol);
-        k.puts(" importer=");
-        k.puts(importer_name);
-        k.puts("\r\n");
-        return null;
-    };
-    if (exp.version < import.min_version) {
-        if (optional) return missingOptional(import);
-        version_dependency_errors += 1;
-        k.puts("[MOD] resolver version reject module=");
-        k.puts(provider.name[0..provider.name_len]);
-        k.puts(" symbol=");
-        k.puts(import.symbol);
-        k.puts(" have=");
-        k.putDec(exp.version);
-        k.puts(" need=");
-        k.putDec(import.min_version);
-        k.puts(" importer=");
-        k.puts(importer_name);
-        k.puts("\r\n");
-        return null;
-    }
-
-    var resolved: ResolvedImport = .{};
-    resolved.module_len = copyBytes(provider.name[0..provider.name_len], resolved.module[0..]);
-    resolved.symbol_len = copyBytes(exp.name[0..exp.name_len], resolved.symbol[0..]);
-    resolved.version = exp.version;
-    resolved.address = exp.address;
-    return resolved;
-}
-
-fn missingOptional(import: ImportRecord) ResolvedImport {
-    var result: ResolvedImport = .{};
-    result.module_len = copyBytes(import.module, &result.module);
-    result.symbol_len = copyBytes(import.symbol, &result.symbol);
-    return result;
+    var result: ResolvedImport = undefined;
+    return if (r4os_rust_mod_resolve_logged(provider, nativeBytes(import.module), nativeBytes(import.symbol), import.min_version, import.flags, nativeBytes(importer_name), &result)) result else null;
 }
 
 fn countResolvedImports(imports: []const ResolvedImport) u32 {
-    var count: u32 = 0;
-    for (imports) |item| if (item.address != 0) { count += 1; };
-    return count;
-}
-
-fn loadR4MFile(load: *PreparedLoad, source: module_file.FileSource, tables: *const ValidatedFileTables, expected_kind: Kind, fallback_name: []const u8, path: []const u8, resolved_imports: []const ResolvedImport) bool {
-    if (!module_file.executionDriveAllowed(source.drive_letter)) return false;
-    const header = tables.header;
-    const kind = header.kind() orelse {
-        k.puts("[MOD] unknown ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    };
-    if (kind != expected_kind) {
-        k.puts("[MOD] unexpected ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    }
-    const section_headers = tables.sections[0..@intCast(header.section_count)];
-    resource_catalogs[load.slot].count = 0;
-    var resource_file_offset: usize = 0;
-    if (kind == .r4d) {
-        for (section_headers) |section| {
-            if (sectionLoadable(section)) continue;
-            var resource_reader: ResourceCatalogReader = .{ .reader = &load.scratch.?.reader, .base = section.file_off };
-            resource_catalogs[load.slot].parse(&resource_reader, section.file_size) catch {
-                k.puts("[MOD] invalid R4D resource catalog\r\n");
-                return false;
-            };
-            resource_file_offset = section.file_off;
-        }
-    }
-
-    const section_offsets = &load.scratch.?.section_offsets;
-    const image_size = layoutSections(section_headers, section_offsets[0..]) orelse {
-        k.puts("[MOD] R4M0 image layout failed: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    };
-    const image = heap.alloc(image_size, PAGE_SIZE) orelse {
-        k.puts("[MOD] image allocation failed: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    };
-    @memset(image, 0);
-
-    const slot = load.slot;
-    entries[slot].base = @intFromPtr(image.ptr);
-    entries[slot].size = image.len;
-
-    const module_name = tables.name(fallback_name);
-    var bss_zeroed = true;
-    var sections: [MAX_SECTIONS]Section = .{Section{}} ** MAX_SECTIONS;
-    var i: usize = 0;
-    while (i < header.section_count) : (i += 1) {
-        const sh = section_headers[i];
-        const dst_off = section_offsets[i];
-        const mem_size: usize = @intCast(sh.mem_size);
-        const file_bytes: usize = @intCast(sh.file_size);
-        const loadable = sectionLoadable(sh);
-        if (loadable and file_bytes != 0 and !module_file.readExact(.{
-            .source = source,
-            .offset = @intCast(sh.file_off),
-            .out = image[dst_off .. dst_off + file_bytes],
-            .name = "r4m-section-image",
-        })) {
-            return false;
-        }
-        if (loadable and (sh.flags & R4M_SECTION_FLAG_BSS) != 0 and !rangeIsZero(image[dst_off .. dst_off + mem_size])) {
-            bss_zeroed = false;
-        }
-        sections[i] = .{
-            .used = true,
-            .name = sh.name,
-            .name_len = sh.name_len,
-            .flags = sh.flags,
-            .file_size = sh.file_size,
-            .mem_size = sh.mem_size,
-            .alignment = sh.alignment,
-            .runtime_offset = dst_off,
-            .runtime_base = if (loadable) @intFromPtr(image.ptr) + @as(u64, @intCast(dst_off)) else 0,
-        };
-    }
-
-    const reader = &load.scratch.?.reader;
-    if (!bss_zeroed) return false;
-
-    const reloc_stats = applyRelocationsFromFile(reader, header, section_headers, section_offsets[0..], image, fallback_name, resolved_imports) orelse {
-        return false;
-    };
-    if (kind == .r4l and !validateLoadedExportsFromTables(tables, section_headers, section_offsets[0..], image, fallback_name)) {
-        return false;
-    }
-
-    const e = &entries[slot];
-    e.* = .{
-        .used = false,
-        .kind = kind,
-        .state = .loaded,
-        .flags = header.flags,
-        .base = @intFromPtr(image.ptr),
-        .size = image.len,
-        .section_count = header.section_count,
-        .entry_count = header.entry_count,
-        .import_count = header.import_count,
-        .export_count = header.export_count,
-        .reloc_count = header.reloc_count,
-        .reloc_abs64_count = reloc_stats.abs64,
-        .reloc_rel32_count = reloc_stats.rel32,
-        .reloc_base_rel64_count = reloc_stats.base_rel64,
-        .reloc_import_slot64_count = reloc_stats.import_slot64,
-        .resolved_import_count = countResolvedImports(resolved_imports),
-        .resolver_status = .resolved,
-        .bss_zeroed = bss_zeroed,
-        .generation = load.generation,
-        .resource_source = if (kind == .r4d) source else null,
-        .resource_file_offset = resource_file_offset,
-        .version_labels = tables.version_labels,
-        .pinned = kind == .r4l,
-        .sections = sections,
-    };
-    e.name_len = copyBytes(module_name, e.name[0..]);
-    e.path_len = copyBytes(path, e.path[0..]);
-    fillExportsFromTables(e, tables);
-
-    return requiredExportsValid(e);
-}
-
-fn loadR4M(load: *PreparedLoad, bytes: []const u8, expected_kind: Kind, fallback_name: []const u8, path: []const u8, resolved_imports: []const ResolvedImport) bool {
-    const header = parseHeader(bytes) orelse {
-        k.puts("[MOD] bad R4M0 header: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    };
-    const kind = kindFromRaw(header.kind_raw) orelse {
-        k.puts("[MOD] unknown ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    };
-    if (kind != expected_kind) {
-        k.puts("[MOD] unexpected ModuleKind: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    }
-    if (!validateTables(header, bytes)) {
-        k.puts("[MOD] invalid R4M0 tables: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    }
-
-    const section_headers = &load.scratch.?.tables.sections;
-    if (!readSections(header, bytes, section_headers[0..])) {
-        k.puts("[MOD] invalid R4M0 sections: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    }
-
-    const section_offsets = &load.scratch.?.section_offsets;
-    const image_size = layoutSections(section_headers[0..@intCast(header.section_count)], section_offsets[0..]) orelse {
-        k.puts("[MOD] R4M0 image layout failed: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    };
-    const image = heap.alloc(image_size, PAGE_SIZE) orelse {
-        k.puts("[MOD] image allocation failed: ");
-        k.puts(fallback_name);
-        k.puts("\r\n");
-        return false;
-    };
-    @memset(image, 0);
-
-    const slot = load.slot;
-    entries[slot].base = @intFromPtr(image.ptr);
-    entries[slot].size = image.len;
-
-    const module_name = moduleName(bytes, header) orelse fallbackModuleName(fallback_name);
-    var bss_zeroed = true;
-    var sections: [MAX_SECTIONS]Section = .{Section{}} ** MAX_SECTIONS;
-    var i: usize = 0;
-    while (i < header.section_count) : (i += 1) {
-        const sh = section_headers[i];
-        const dst_off = section_offsets[i];
-        const mem_size: usize = @intCast(sh.mem_size);
-        const file_size: usize = @intCast(sh.file_size);
-        const loadable = sectionLoadable(sh);
-        if (loadable and file_size != 0) {
-            const src_off: usize = @intCast(sh.file_off);
-            @memcpy(image[dst_off .. dst_off + file_size], bytes[src_off .. src_off + file_size]);
-        }
-        if (loadable and (sh.flags & R4M_SECTION_FLAG_BSS) != 0 and !rangeIsZero(image[dst_off .. dst_off + mem_size])) {
-            bss_zeroed = false;
-        }
-        sections[i] = .{
-            .used = true,
-            .name = sh.name,
-            .name_len = sh.name_len,
-            .flags = sh.flags,
-            .file_size = sh.file_size,
-            .mem_size = sh.mem_size,
-            .alignment = sh.alignment,
-            .runtime_offset = dst_off,
-            .runtime_base = if (loadable) @intFromPtr(image.ptr) + @as(u64, @intCast(dst_off)) else 0,
-        };
-    }
-
-    if (!bss_zeroed) return false;
-
-    const reloc_stats = applyRelocations(bytes, header, section_headers[0..@intCast(header.section_count)], section_offsets[0..], image, fallback_name, resolved_imports) orelse {
-        return false;
-    };
-    if (kind == .r4l and !validateLoadedExports(bytes, header, section_headers[0..@intCast(header.section_count)], section_offsets[0..], image, fallback_name)) {
-        return false;
-    }
-
-    const e = &entries[slot];
-    e.* = .{
-        .used = false,
-        .kind = kind,
-        .state = .loaded,
-        .flags = header.flags,
-        .base = @intFromPtr(image.ptr),
-        .size = image.len,
-        .section_count = header.section_count,
-        .entry_count = header.entry_count,
-        .import_count = header.import_count,
-        .export_count = header.export_count,
-        .reloc_count = header.reloc_count,
-        .reloc_abs64_count = reloc_stats.abs64,
-        .reloc_rel32_count = reloc_stats.rel32,
-        .reloc_base_rel64_count = reloc_stats.base_rel64,
-        .reloc_import_slot64_count = reloc_stats.import_slot64,
-        .resolved_import_count = countResolvedImports(resolved_imports),
-        .resolver_status = .resolved,
-        .bss_zeroed = bss_zeroed,
-        .generation = load.generation,
-        .pinned = kind == .r4l,
-        .sections = sections,
-    };
-    e.name_len = copyBytes(module_name, e.name[0..]);
-    e.path_len = copyBytes(path, e.path[0..]);
-    fillExports(e, bytes, header);
-
-    if (header.meta_size <= MAX_R4M_METADATA_PROBE and checkRange(bytes.len, header.meta_off, header.meta_size)) {
-        e.version_labels = module_r4m.VersionLabels.parse(bytes[header.meta_off..][0..header.meta_size]);
-    }
-
-    return requiredExportsValid(e);
-}
-
-fn parseHeader(bytes: []const u8) ?Header {
-    if (bytes.len < R4M_HEADER_SIZE) return null;
-    if (!memEql(bytes[0..4], "R4M0")) return null;
-    return .{
-        .version = readLe16(bytes[4..6]),
-        .arch = readLe16(bytes[6..8]),
-        .kind_raw = readLe16(bytes[8..10]),
-        .header_size = readLe16(bytes[10..12]),
-        .flags = readLe32(bytes[12..16]),
-        .section_off = readLe32(bytes[16..20]),
-        .section_count = readLe32(bytes[20..24]),
-        .import_off = readLe32(bytes[24..28]),
-        .import_count = readLe32(bytes[28..32]),
-        .export_off = readLe32(bytes[32..36]),
-        .export_count = readLe32(bytes[36..40]),
-        .reloc_off = readLe32(bytes[40..44]),
-        .reloc_count = readLe32(bytes[44..48]),
-        .entry_off = readLe32(bytes[48..52]),
-        .entry_count = readLe32(bytes[52..56]),
-        .meta_off = readLe32(bytes[56..60]),
-        .meta_size = readLe32(bytes[60..64]),
-    };
-}
-
-fn validateTables(header: Header, bytes: []const u8) bool {
-    if (header.version != R4M_VERSION or header.arch != ARCH_X86_64) return false;
-    if (header.header_size != R4M_HEADER_SIZE) return false;
-    if (header.section_count == 0 or header.section_count > MAX_SECTIONS) return false;
-    if (header.import_count > MAX_IMPORTS_PER_MODULE or header.export_count > MAX_EXPORTS_PER_MODULE) return false;
-    if (!checkTable(bytes.len, header.section_off, header.section_count, R4M_SECTION_SIZE, true)) return false;
-    if (!checkTable(bytes.len, header.entry_off, header.entry_count, R4M_ENTRY_SIZE, true)) return false;
-    if (!checkTable(bytes.len, header.import_off, header.import_count, R4M_IMPORT_SIZE, false)) return false;
-    if (!checkTable(bytes.len, header.export_off, header.export_count, R4M_EXPORT_SIZE, false)) return false;
-    if (!checkTable(bytes.len, header.reloc_off, header.reloc_count, R4M_RELOCATION_SIZE, false)) return false;
-    if (header.meta_size != 0 and !checkRange(bytes.len, header.meta_off, header.meta_size)) return false;
-    if (!validateEntries(header, bytes)) return false;
-    if (!validateImports(header, bytes)) return false;
-    if (!validateExports(header, bytes)) return false;
-    return true;
+    return r4os_rust_mod_resolved_count(imports.ptr, imports.len);
 }
 
 fn readSections(header: Header, bytes: []const u8, out: []SectionHeader) bool {
-    if (header.section_count > out.len) return false;
-    var i: usize = 0;
-    while (i < header.section_count) : (i += 1) {
-        const off = @as(usize, @intCast(header.section_off)) + i * R4M_SECTION_SIZE;
-        var name: [8]u8 = .{0} ** 8;
-        @memcpy(name[0..], bytes[off .. off + 8]);
-        const name_len = fixedNameLen(name[0..]);
-        const file_off = readLe32(bytes[off + 12 .. off + 16]);
-        const file_size = readLe32(bytes[off + 16 .. off + 20]);
-        const mem_size = readLe32(bytes[off + 20 .. off + 24]);
-        const alignment = readLe32(bytes[off + 24 .. off + 28]);
-        if (name_len == 0 or mem_size < file_size) return false;
-        if (alignment == 0 or !isPowerOfTwo(alignment)) return false;
-        if (file_size != 0 and !checkRange(bytes.len, file_off, file_size)) return false;
-        out[i] = .{
-            .name = name,
-            .name_len = name_len,
-            .flags = readLe32(bytes[off + 8 .. off + 12]),
-            .file_off = file_off,
-            .file_size = file_size,
-            .mem_size = mem_size,
-            .alignment = alignment,
-        };
-    }
-    return validateSectionKinds(out[0..@intCast(header.section_count)], header.kind() orelse return false);
+    return r4os_rust_mod_sections(nativeBytes(bytes), &header, out.ptr, out.len);
 }
 
-fn sectionLoadable(section: SectionHeader) bool {
-    return (section.flags & R4M_SECTION_FLAG_ALLOC) != 0;
-}
-
-// R4M0 resources belong to the module file, never the executable image.
-// Both disk and preloaded-byte admission use this same section policy.
 fn validateSectionKinds(sections: []const SectionHeader, kind: Kind) bool {
-    var resources_seen = false;
-    for (sections) |section| {
-        const is_resource = memEql(section.name[0..section.name_len], ".rsrc");
-        if (sectionLoadable(section)) {
-            if (is_resource) return false;
-            continue;
-        }
-        if (kind == .r4l or resources_seen or !is_resource or section.flags != 0 or
-            section.alignment != 16 or (section.file_off & 15) != 0 or
-            section.file_size == 0 or section.mem_size != section.file_size) return false;
-        resources_seen = true;
-    }
-    return true;
-}
-
-fn readValidatedFileTables(reader: *module_r4m.Reader, tables: *ValidatedFileTables, expected_kind: Kind, fallback_name: []const u8) bool {
-    const file_size = reader.file.file_size;
-    const header = reader.readHeader(expected_kind, .{
-        .max_sections = MAX_SECTIONS,
-        .max_imports = MAX_IMPORTS_PER_MODULE,
-        .max_exports = MAX_EXPORTS_PER_MODULE,
-    }, "r4m-module-header", true) orelse return false;
-    tables.* = ValidatedFileTables{ .header = header };
-    if (!readSectionsFromReader(reader, file_size, header, tables.sections[0..])) return false;
-    const sections = tables.sections[0..@intCast(header.section_count)];
-
-    var entry_index: usize = 0;
-    while (entry_index < header.entry_count) : (entry_index += 1) {
-        const entry = reader.readEntryRecord(header, entry_index, "r4m-entry-table", true) orelse return false;
-        if (entry.section >= sections.len) return false;
-        if (!sectionLoadable(sections[@intCast(entry.section)]) or entry.offset >= sections[@intCast(entry.section)].mem_size) return false;
-    }
-
-    var import_index: usize = 0;
-    while (import_index < header.import_count) : (import_index += 1) {
-        const record = reader.readImportRecord(header, import_index, "r4m-import-table", true) orelse return false;
-        var module_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        var symbol_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const module_name = reader.readZString(record.module_offset, module_buf[0..], "r4m-import-module", true) orelse return false;
-        const symbol_name = reader.readZString(record.symbol_offset, symbol_buf[0..], "r4m-import-symbol", true) orelse return false;
-        if (!validImportModuleName(module_name) or !validSymbolName(symbol_name) or record.min_version == 0 or
-            !module_r4m.validImportFlags(module_name, record.flags)) {
-            k.puts("[MOD] malformed import module=");
-            k.puts(module_name);
-            k.puts(" symbol=");
-            k.puts(symbol_name);
-            k.puts(" importer=");
-            k.puts(fallback_name);
-            k.puts("\r\n");
-            return false;
-        }
-        var file_import = &tables.imports[import_index];
-        file_import.module_len = copyBytes(module_name, file_import.module[0..]);
-        file_import.symbol_len = copyBytes(symbol_name, file_import.symbol[0..]);
-        file_import.min_version = record.min_version;
-        file_import.flags = record.flags;
-    }
-
-    var export_index: usize = 0;
-    while (export_index < header.export_count) : (export_index += 1) {
-        const record = reader.readExportRecord(header, export_index, "r4m-export-table", true) orelse return false;
-        var name_buf: [MAX_R4M_NAME_PROBE]u8 = .{0} ** MAX_R4M_NAME_PROBE;
-        const export_name = reader.readZString(record.name_offset, name_buf[0..], "r4m-export-name", true) orelse return false;
-        if (!validSymbolName(export_name) or record.version == 0) {
-            k.puts("[MOD] malformed export module=");
-            k.puts(fallback_name);
-            k.puts(" symbol=");
-            k.puts(export_name);
-            k.puts("\r\n");
-            return false;
-        }
-        if (record.section >= sections.len or !sectionLoadable(sections[@intCast(record.section)]) or record.offset >= sections[@intCast(record.section)].mem_size) return false;
-        var prior_index: usize = 0;
-        while (prior_index < export_index) : (prior_index += 1) {
-            const prior = &tables.exports[prior_index];
-            if (nameEq(export_name, prior.name[0..prior.name_len])) {
-                k.puts("[MOD] duplicate export module=");
-                k.puts(fallback_name);
-                k.puts(" symbol=");
-                k.puts(export_name);
-                k.puts("\r\n");
-                return false;
-            }
-        }
-        var planned_export = &tables.exports[export_index];
-        planned_export.used = true;
-        planned_export.name_len = copyBytes(export_name, planned_export.name[0..]);
-        planned_export.version = record.version;
-        planned_export.section_index = record.section;
-        planned_export.section_offset = record.offset;
-    }
-
-    if (header.meta_size <= MAX_R4M_METADATA_PROBE) {
-        var meta_buf: [MAX_R4M_METADATA_PROBE]u8 = .{0} ** MAX_R4M_METADATA_PROBE;
-        if (reader.readMetadata(header, meta_buf[0..], "r4m-module-name", true)) |meta| {
-            tables.version_labels = module_r4m.VersionLabels.parse(meta);
-            if (module_r4m.firstMetadataItem(meta)) |module_name| {
-                tables.module_name_len = copyBytes(module_name, tables.module_name[0..]);
-            }
-        }
-    }
-    return true;
-}
-
-fn readSectionsFromReader(reader: *module_r4m.Reader, file_size: usize, header: Header, out: []SectionHeader) bool {
-    if (header.section_count > out.len) return false;
-    var i: usize = 0;
-    while (i < header.section_count) : (i += 1) {
-        const record = reader.readSectionRecord(header, i, "r4m-section-table", true) orelse return false;
-        const name_len = fixedNameLen(record.name[0..]);
-        if (name_len == 0 or record.mem_size < record.file_size) return false;
-        if (record.alignment == 0 or !isPowerOfTwo(record.alignment)) return false;
-        if (record.file_size != 0 and !checkRange(file_size, record.file_off, record.file_size)) return false;
-        out[i] = .{
-            .name = record.name,
-            .name_len = name_len,
-            .flags = record.flags,
-            .file_off = record.file_off,
-            .file_size = record.file_size,
-            .mem_size = record.mem_size,
-            .alignment = record.alignment,
-        };
-    }
-    return validateSectionKinds(out[0..@intCast(header.section_count)], header.kind() orelse return false);
-}
-
-fn validateLoadedExportsFromTables(
-    tables: *const ValidatedFileTables,
-    sections: []const SectionHeader,
-    section_offsets: []const usize,
-    image: []const u8,
-    module_name: []const u8,
-) bool {
-    var i: usize = 0;
-    while (i < tables.header.export_count) : (i += 1) {
-        const exp = &tables.exports[i];
-        if (!validateLoadedExport(exp.name[0..exp.name_len], exp.version, exp.section_index, exp.section_offset, sections, section_offsets, image, module_name)) return false;
-    }
-    return true;
-}
-
-fn validateLoadedExports(
-    bytes: []const u8,
-    header: Header,
-    sections: []const SectionHeader,
-    section_offsets: []const usize,
-    image: []const u8,
-    module_name: []const u8,
-) bool {
-    var i: usize = 0;
-    while (i < header.export_count) : (i += 1) {
-        const off = @as(usize, @intCast(header.export_off)) + i * R4M_EXPORT_SIZE;
-        const name = zString(bytes, readLe32(bytes[off + 0 .. off + 4])) orelse return false;
-        if (!validateLoadedExport(
-            name,
-            readLe32(bytes[off + 12 .. off + 16]),
-            readLe32(bytes[off + 4 .. off + 8]),
-            readLe32(bytes[off + 8 .. off + 12]),
-            sections,
-            section_offsets,
-            image,
-            module_name,
-        )) return false;
-    }
-    return true;
-}
-
-fn validateLoadedExport(
-    name: []const u8,
-    export_version: u32,
-    section_index: u32,
-    export_offset: u32,
-    sections: []const SectionHeader,
-    section_offsets: []const usize,
-    image: []const u8,
-    module_name: []const u8,
-) bool {
-    const is_query = nameEq(name, "Query");
-    const has_interface_prefix = interfaceExportPrefix(name);
-    if (!is_query and !has_interface_prefix) return true;
-    if (section_index >= sections.len or section_index >= section_offsets.len) {
-        return rejectLoadedExport(module_name, name, "section");
-    }
-    const section = sections[@intCast(section_index)];
-    if (export_offset >= section.mem_size) return rejectLoadedExport(module_name, name, "offset");
-    const runtime_offset = section_offsets[@intCast(section_index)] + @as(usize, @intCast(export_offset));
-    const available: usize = @intCast(section.mem_size - export_offset);
-    if (runtime_offset > image.len or available > image.len - runtime_offset) {
-        return rejectLoadedExport(module_name, name, "range");
-    }
-    const table = image[runtime_offset .. runtime_offset + available];
-    if ((@intFromPtr(table.ptr) & 7) != 0) return rejectLoadedExport(module_name, name, "alignment");
-
-    if (is_query) return validateLoadedQuery(table, export_version, module_name, name);
-    const abi_major = interfaceMajorFromName(name) orelse return rejectLoadedExport(module_name, name, "major-name");
-    return validateLoadedInterface(table, export_version, abi_major, module_name, name);
-}
-
-fn validateLoadedQuery(table: []const u8, export_version: u32, module_name: []const u8, symbol_name: []const u8) bool {
-    if (table.len < R4L_QUERY_SIZE) return rejectLoadedExport(module_name, symbol_name, "query-range");
-    const declared_size = readLe32(table[8..12]);
-    if (export_version != 1 or
-        readLe32(table[0..4]) != R4L_QUERY_MAGIC or
-        readLe32(table[4..8]) != R4L_QUERY_VERSION or
-        declared_size < R4L_QUERY_SIZE or
-        (declared_size & 7) != 0 or
-        @as(usize, @intCast(declared_size)) > table.len or
-        readLe64(table[24..32]) != 0)
-    {
-        return rejectLoadedExport(module_name, symbol_name, "query-header");
-    }
-    return true;
-}
-
-fn validateLoadedInterface(table: []const u8, export_version: u32, expected_major: u16, module_name: []const u8, symbol_name: []const u8) bool {
-    if (table.len < R4L_INTERFACE_HEADER_SIZE) return rejectLoadedExport(module_name, symbol_name, "interface-range");
-    const flags = readLe16(table[6..8]);
-    const declared_size = readLe32(table[8..12]);
-    const abi_major = readLe16(table[12..14]);
-    const abi_minor = readLe16(table[14..16]);
-    const interface_id_lo = readLe64(table[16..24]);
-    const interface_id_hi = readLe64(table[24..32]);
-    if (export_version == 0 or export_version > 0xffff or
-        readLe32(table[0..4]) != R4L_INTERFACE_MAGIC or
-        readLe16(table[4..6]) != R4L_INTERFACE_HEADER_VERSION or
-        (flags & 0x00ff) != 0 or
-        declared_size < R4L_INTERFACE_HEADER_SIZE or
-        (declared_size & 7) != 0 or
-        @as(usize, @intCast(declared_size)) > table.len or
-        abi_major != expected_major or
-        abi_minor == 0 or
-        @as(u32, abi_minor) != export_version or
-        (interface_id_lo == 0 and interface_id_hi == 0))
-    {
-        return rejectLoadedExport(module_name, symbol_name, "interface-header");
-    }
-    return true;
-}
-
-fn rejectLoadedExport(module_name: []const u8, symbol_name: []const u8, reason: []const u8) bool {
-    k.puts("[MOD] interface reject module=");
-    k.puts(module_name);
-    k.puts(" symbol=");
-    k.puts(symbol_name);
-    k.puts(" reason=");
-    k.puts(reason);
-    k.puts("\r\n");
-    return false;
-}
-
-fn interfaceExportPrefix(name: []const u8) bool {
-    return name.len >= 5 and
-        upper(name[0]) == 'A' and
-        upper(name[1]) == 'P' and
-        upper(name[2]) == 'I' and
-        name[3] == '_' and
-        upper(name[4]) == 'V';
+    return r4os_rust_mod_section_kinds(sections.ptr, sections.len, @intFromEnum(kind));
 }
 
 fn interfaceMajorFromName(name: []const u8) ?u16 {
-    if (!interfaceExportPrefix(name) or name.len == 5 or name[5] == '0') return null;
-    var value: u32 = 0;
-    for (name[5..]) |byte| {
-        if (byte < '0' or byte > '9') return null;
-        const digit: u32 = byte - '0';
-        if (value > (0xffff - digit) / 10) return null;
-        value = value * 10 + digit;
-    }
-    return @intCast(value);
+    const value = r4os_rust_mod_name(nativeBytes(name), 5);
+    return if (value == 0) null else value;
 }
 
 fn layoutSections(sections: []const SectionHeader, section_offsets: []usize) ?usize {
-    var cursor: usize = 0;
-    for (sections, 0..) |section, index| {
-        if (!sectionLoadable(section)) {
-            section_offsets[index] = 0;
-            continue;
-        }
-        const section_align = if (section.alignment > PAGE_SIZE) @as(usize, @intCast(section.alignment)) else PAGE_SIZE;
-        cursor = alignForward(cursor, section_align);
-        section_offsets[index] = cursor;
-        cursor += @as(usize, @intCast(section.mem_size));
-    }
-    const image_size = alignForward(cursor, PAGE_SIZE);
-    if (image_size == 0) return null;
-    return image_size;
+    var size: usize = undefined;
+    const offsets = section_offsets[0..sections.len];
+    return if (r4os_rust_mod_layout(sections.ptr, sections.len, offsets.ptr, &size)) size else null;
 }
-
-const RelocStats = struct {
-    abs64: u32 = 0,
-    rel32: u32 = 0,
-    base_rel64: u32 = 0,
-    import_slot64: u32 = 0,
-};
-
-fn applyRelocations(bytes: []const u8, header: Header, sections: []const SectionHeader, section_offsets: []const usize, image: []u8, module_name: []const u8, resolved_imports: []const ResolvedImport) ?RelocStats {
-    var stats: RelocStats = .{};
-    var i: usize = 0;
-    while (i < header.reloc_count) : (i += 1) {
-        const reloc = readRelocation(bytes, header, i) orelse return null;
-        switch (applyRelocation(reloc, sections, section_offsets, image, resolved_imports)) {
-            .ok => {},
-            .unknown_type => {
-                unknown_relocation_errors += 1;
-                k.puts("[MOD] relocation error unknown type=");
-                k.putDec(reloc.kind);
-                k.puts(" module=");
-                k.puts(module_name);
-                k.puts("\r\n");
-                return null;
-            },
-            .bad_range => {
-                relocation_range_errors += 1;
-                k.puts("[MOD] relocation range error module=");
-                k.puts(module_name);
-                k.puts("\r\n");
-                return null;
-            },
-            .unresolved_import => {
-                unresolved_import_errors += 1;
-                k.puts("[MOD] relocation import unresolved module=");
-                k.puts(module_name);
-                k.puts("\r\n");
-                return null;
-            },
-        }
-        switch (reloc.kind) {
-            R4M_RELOC_ABS64 => stats.abs64 += 1,
-            R4M_RELOC_REL32 => stats.rel32 += 1,
-            R4M_RELOC_BASE_REL64 => stats.base_rel64 += 1,
-            R4M_RELOC_IMPORT_SLOT64 => stats.import_slot64 += 1,
-            else => {},
-        }
-    }
-    return stats;
-}
-
-fn applyRelocationsFromFile(reader: *module_r4m.Reader, header: Header, sections: []const SectionHeader, section_offsets: []const usize, image: []u8, module_name: []const u8, resolved_imports: []const ResolvedImport) ?RelocStats {
-    var stats: RelocStats = .{};
-    var reloc_reader = module_r4m.RelocationWindowReader.init(reader, header, "r4m-relocation-table", true);
-    var i: usize = 0;
-    while (i < header.reloc_count) : (i += 1) {
-        const record = reloc_reader.next() orelse return null;
-        const reloc = Relocation{
-            .kind = record.kind,
-            .patch_section = record.patch_section,
-            .patch_offset = record.patch_offset,
-            .target_section = record.target_section,
-            .target_offset = record.target_offset,
-            .addend = record.addend,
-        };
-        switch (applyRelocation(reloc, sections, section_offsets, image, resolved_imports)) {
-            .ok => {},
-            .unknown_type => {
-                unknown_relocation_errors += 1;
-                k.puts("[MOD] relocation error unknown type=");
-                k.putDec(reloc.kind);
-                k.puts(" module=");
-                k.puts(module_name);
-                k.puts("\r\n");
-                return null;
-            },
-            .bad_range => {
-                relocation_range_errors += 1;
-                k.puts("[MOD] relocation range error module=");
-                k.puts(module_name);
-                k.puts("\r\n");
-                return null;
-            },
-            .unresolved_import => {
-                unresolved_import_errors += 1;
-                k.puts("[MOD] relocation import unresolved module=");
-                k.puts(module_name);
-                k.puts("\r\n");
-                return null;
-            },
-        }
-        switch (reloc.kind) {
-            R4M_RELOC_ABS64 => stats.abs64 += 1,
-            R4M_RELOC_REL32 => stats.rel32 += 1,
-            R4M_RELOC_BASE_REL64 => stats.base_rel64 += 1,
-            R4M_RELOC_IMPORT_SLOT64 => stats.import_slot64 += 1,
-            else => {},
-        }
-    }
-    return stats;
-}
-
-const RelocApplyResult = enum {
-    ok,
-    unknown_type,
-    bad_range,
-    unresolved_import,
-};
 
 fn applyRelocation(reloc: Relocation, sections: []const SectionHeader, section_offsets: []const usize, image: []u8, resolved_imports: []const ResolvedImport) RelocApplyResult {
-    const patch = patchSlice(reloc, sections, section_offsets, image) orelse return .bad_range;
-    const image_base: u64 = @intFromPtr(image.ptr);
-    switch (reloc.kind) {
-        R4M_RELOC_ABS64 => {
-            const target = targetAddress(reloc, sections, section_offsets, image_base) orelse return .bad_range;
-            writeLe64(patch, addSignedU64(target, reloc.addend) orelse return .bad_range);
-            return .ok;
-        },
-        R4M_RELOC_REL32 => {
-            const target = targetAddress(reloc, sections, section_offsets, image_base) orelse return .bad_range;
-            const patched_target = addSignedU64(target, reloc.addend) orelse return .bad_range;
-            const patch_addr = image_base + @as(u64, @intCast(section_offsets[@intCast(reloc.patch_section)])) + reloc.patch_offset;
-            const delta = @as(i128, patched_target) - @as(i128, patch_addr + 4);
-            if (delta < -2147483648 or delta > 2147483647) return .bad_range;
-            writeLe32(patch, @bitCast(@as(i32, @intCast(delta))));
-            return .ok;
-        },
-        R4M_RELOC_BASE_REL64 => {
-            const target = targetAddress(reloc, sections, section_offsets, image_base) orelse return .bad_range;
-            writeLe64(patch, addSignedU64(target, reloc.addend) orelse return .bad_range);
-            return .ok;
-        },
-        R4M_RELOC_IMPORT_SLOT64 => {
-            const import_index: usize = @intCast(reloc.target_section);
-            if (import_index >= resolved_imports.len) return .unresolved_import;
-            if (resolved_imports[import_index].address == 0 and reloc.addend != 0) return .bad_range;
-            writeLe64(patch, addSignedU64(resolved_imports[import_index].address, reloc.addend) orelse return .bad_range);
-            return .ok;
-        },
-        else => return .unknown_type,
-    }
-}
-
-fn patchSlice(reloc: Relocation, sections: []const SectionHeader, section_offsets: []const usize, image: []u8) ?[]u8 {
-    if (reloc.patch_section >= sections.len) return null;
-    const size = relocationPatchSize(reloc.kind);
-    const section = sections[@intCast(reloc.patch_section)];
-    if (!sectionLoadable(section)) return null;
-    if (reloc.patch_offset > section.mem_size or size > section.mem_size - reloc.patch_offset) return null;
-    const off = section_offsets[@intCast(reloc.patch_section)] + @as(usize, @intCast(reloc.patch_offset));
-    if (off > image.len or size > image.len - off) return null;
-    return image[off .. off + size];
-}
-
-fn targetAddress(reloc: Relocation, sections: []const SectionHeader, section_offsets: []const usize, image_base: u64) ?u64 {
-    if (reloc.target_section >= sections.len) return null;
-    const section = sections[@intCast(reloc.target_section)];
-    if (!sectionLoadable(section)) return null;
-    if (reloc.target_offset >= section.mem_size) return null;
-    return image_base + @as(u64, @intCast(section_offsets[@intCast(reloc.target_section)])) + reloc.target_offset;
-}
-
-fn readRelocation(bytes: []const u8, header: Header, index: usize) ?Relocation {
-    if (index >= header.reloc_count) return null;
-    const off = @as(usize, @intCast(header.reloc_off)) + index * R4M_RELOCATION_SIZE;
-    return .{
-        .kind = readLe32(bytes[off + 0 .. off + 4]),
-        .patch_section = readLe32(bytes[off + 4 .. off + 8]),
-        .patch_offset = readLe32(bytes[off + 8 .. off + 12]),
-        .target_section = readLe32(bytes[off + 12 .. off + 16]),
-        .target_offset = readLe32(bytes[off + 16 .. off + 20]),
-        .addend = @bitCast(readLe32(bytes[off + 20 .. off + 24])),
-    };
-}
-
-fn readImport(bytes: []const u8, header: Header, index: usize) ?ImportRecord {
-    if (index >= header.import_count) return null;
-    const off = @as(usize, @intCast(header.import_off)) + index * R4M_IMPORT_SIZE;
-    return .{
-        .module = zString(bytes, readLe32(bytes[off + 0 .. off + 4])) orelse return null,
-        .symbol = zString(bytes, readLe32(bytes[off + 4 .. off + 8])) orelse return null,
-        .min_version = readLe32(bytes[off + 8 .. off + 12]),
-        .flags = readLe32(bytes[off + 12 .. off + 16]),
-    };
-}
-
-fn relocationPatchSize(kind: u32) u32 {
-    return switch (kind) {
-        R4M_RELOC_REL32 => 4,
-        R4M_RELOC_ABS64, R4M_RELOC_BASE_REL64, R4M_RELOC_IMPORT_SLOT64 => 8,
-        else => 1,
-    };
-}
-
-fn addSignedU64(base: u64, addend: i32) ?u64 {
-    if (addend >= 0) {
-        const plus: u64 = @intCast(addend);
-        if (0xffffffffffffffff - base < plus) return null;
-        return base + plus;
-    }
-    const sub: u64 = @intCast(-@as(i64, addend));
-    if (sub > base) return null;
-    return base - sub;
+    const io = NativeRelocationImage{ .sections = sections.ptr, .section_count = sections.len, .offsets = section_offsets.ptr, .offset_count = section_offsets.len, .image = image.ptr, .image_len = image.len, .imports = resolved_imports.ptr, .import_count = resolved_imports.len };
+    return @enumFromInt(r4os_rust_mod_reloc(reloc, &io));
 }
 
 fn validateEntries(header: Header, bytes: []const u8) bool {
-    if (header.entry_count == 0) return false;
-    var section_sizes: [MAX_SECTIONS]u32 = .{0} ** MAX_SECTIONS;
-    var i: usize = 0;
-    while (i < header.section_count) : (i += 1) {
-        const off = @as(usize, @intCast(header.section_off)) + i * R4M_SECTION_SIZE;
-        section_sizes[i] = if ((readLe32(bytes[off + 8 .. off + 12]) & R4M_SECTION_FLAG_ALLOC) == 0) 0 else readLe32(bytes[off + 20 .. off + 24]);
-    }
-    i = 0;
-    while (i < header.entry_count) : (i += 1) {
-        const off = @as(usize, @intCast(header.entry_off)) + i * R4M_ENTRY_SIZE;
-        const section_index = readLe32(bytes[off + 4 .. off + 8]);
-        const section_offset = readLe32(bytes[off + 8 .. off + 12]);
-        if (section_index >= header.section_count) return false;
-        if (section_offset >= section_sizes[@intCast(section_index)]) return false;
-    }
-    return true;
-}
-
-fn validateImports(header: Header, bytes: []const u8) bool {
-    var i: usize = 0;
-    while (i < header.import_count) : (i += 1) {
-        const off = @as(usize, @intCast(header.import_off)) + i * R4M_IMPORT_SIZE;
-        if (!checkZ(bytes, readLe32(bytes[off + 0 .. off + 4]))) return false;
-        if (!checkZ(bytes, readLe32(bytes[off + 4 .. off + 8]))) return false;
-        const module_name = zString(bytes, readLe32(bytes[off + 0 .. off + 4])) orelse return false;
-        const symbol_name = zString(bytes, readLe32(bytes[off + 4 .. off + 8])) orelse return false;
-        if (!validImportModuleName(module_name) or !validSymbolName(symbol_name)) return false;
-        if (readLe32(bytes[off + 8 .. off + 12]) == 0) return false;
-        if (!module_r4m.validImportFlags(module_name, readLe32(bytes[off + 12 .. off + 16]))) return false;
-    }
-    return true;
+    return r4os_rust_mod_validate(nativeBytes(bytes), &header, 1);
 }
 
 fn validateExports(header: Header, bytes: []const u8) bool {
-    var section_sizes: [MAX_SECTIONS]u32 = .{0} ** MAX_SECTIONS;
-    var i: usize = 0;
-    while (i < header.section_count) : (i += 1) {
-        const off = @as(usize, @intCast(header.section_off)) + i * R4M_SECTION_SIZE;
-        section_sizes[i] = if ((readLe32(bytes[off + 8 .. off + 12]) & R4M_SECTION_FLAG_ALLOC) == 0) 0 else readLe32(bytes[off + 20 .. off + 24]);
-    }
-    i = 0;
-    while (i < header.export_count) : (i += 1) {
-        const off = @as(usize, @intCast(header.export_off)) + i * R4M_EXPORT_SIZE;
-        const section_index = readLe32(bytes[off + 4 .. off + 8]);
-        const section_offset = readLe32(bytes[off + 8 .. off + 12]);
-        if (!checkZ(bytes, readLe32(bytes[off + 0 .. off + 4]))) return false;
-        const name = zString(bytes, readLe32(bytes[off + 0 .. off + 4])) orelse return false;
-        if (!validSymbolName(name) or readLe32(bytes[off + 12 .. off + 16]) == 0) return false;
-        if (section_index >= header.section_count) return false;
-        if (section_offset >= section_sizes[@intCast(section_index)]) return false;
-        var prior_index: usize = 0;
-        while (prior_index < i) : (prior_index += 1) {
-            const prior_off = @as(usize, @intCast(header.export_off)) + prior_index * R4M_EXPORT_SIZE;
-            const prior_name = zString(bytes, readLe32(bytes[prior_off + 0 .. prior_off + 4])) orelse return false;
-            if (nameEq(name, prior_name)) return false;
-        }
-    }
-    return true;
-}
-
-fn fillExports(e: *Entry, bytes: []const u8, header: Header) void {
-    var i: usize = 0;
-    while (i < header.export_count and i < e.exports.len) : (i += 1) {
-        const off = @as(usize, @intCast(header.export_off)) + i * R4M_EXPORT_SIZE;
-        const name = zString(bytes, readLe32(bytes[off + 0 .. off + 4])) orelse continue;
-        const section_index = readLe32(bytes[off + 4 .. off + 8]);
-        const section_offset = readLe32(bytes[off + 8 .. off + 12]);
-        const version = readLe32(bytes[off + 12 .. off + 16]);
-        if (section_index >= e.section_count or section_index >= e.sections.len) continue;
-        const section = &e.sections[@intCast(section_index)];
-        if (!section.used or (section.flags & R4M_SECTION_FLAG_ALLOC) == 0 or section_offset >= section.mem_size) continue;
-
-        e.exports[i] = .{
-            .used = true,
-            .version = version,
-            .address = section.runtime_base + section_offset,
-            .section_index = section_index,
-            .section_offset = section_offset,
-        };
-        e.exports[i].name_len = copyBytes(name, e.exports[i].name[0..]);
-    }
-}
-
-fn fillExportsFromTables(e: *Entry, tables: *const ValidatedFileTables) void {
-    var i: usize = 0;
-    while (i < tables.header.export_count and i < e.exports.len) : (i += 1) {
-        const planned = &tables.exports[i];
-        if (planned.section_index >= e.section_count or planned.section_index >= e.sections.len) continue;
-        const section = &e.sections[@intCast(planned.section_index)];
-        if (!section.used or (section.flags & R4M_SECTION_FLAG_ALLOC) == 0 or planned.section_offset >= section.mem_size) continue;
-
-        e.exports[i] = .{
-            .used = true,
-            .version = planned.version,
-            .address = section.runtime_base + planned.section_offset,
-            .section_index = planned.section_index,
-            .section_offset = planned.section_offset,
-        };
-        e.exports[i].name_len = copyBytes(planned.name[0..planned.name_len], e.exports[i].name[0..]);
-    }
-}
-
-fn findExport(e: *const Entry, symbol: []const u8) ?*const Export {
-    var i: usize = 0;
-    while (i < e.export_count and i < e.exports.len) : (i += 1) {
-        const exp = &e.exports[i];
-        if (exp.used and nameEq(exp.name[0..exp.name_len], symbol)) return exp;
-    }
-    return null;
+    return r4os_rust_mod_validate(nativeBytes(bytes), &header, 3);
 }
 
 fn findByName(name: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const e = &entries[i];
-        if (!published(i)) continue;
-        if (nameEq(e.name[0..e.name_len], name)) return i;
-    }
-    return null;
-}
-
-fn findPendingByName(pending: []PendingLibrary, name: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < pending.len) : (i += 1) {
-        const p = &pending[i];
-        if (!p.used) continue;
-        if (nameEq(p.module_name[0..p.module_name_len], name)) return i;
-    }
-    return null;
-}
-
-fn moduleName(bytes: []const u8, header: Header) ?[]const u8 {
-    if (header.meta_size == 0) return null;
-    return zString(bytes, header.meta_off);
-}
-
-fn fallbackModuleName(file_name: []const u8) []const u8 {
-    if (file_name.len > 4 and file_name[file_name.len - 4] == '.') return file_name[0 .. file_name.len - 4];
-    return file_name;
-}
-
-fn buildLibraryPath(file_name: []const u8, out: *[MAX_PATH]u8) []const u8 {
-    const prefix = "C:\\R4OS\\LIBS\\";
-    var len: usize = 0;
-    const prefix_len = @min(prefix.len, out.len);
-    @memcpy(out[0..prefix_len], prefix[0..prefix_len]);
-    len = prefix_len;
-    const remaining = out.len - len;
-    const copy_len = @min(file_name.len, remaining);
-    if (copy_len > 0) @memcpy(out[len .. len + copy_len], file_name[0..copy_len]);
-    len += copy_len;
-    return out[0..len];
-}
-
-fn checkTable(image_len: usize, off: u32, count: u32, item_size: usize, required: bool) bool {
-    if (count == 0) return !required;
-    if (off == 0) return false;
-    const bytes = @as(u64, count) * @as(u64, item_size);
-    if (bytes > 0xffffffff) return false;
-    return checkRange(image_len, off, @intCast(bytes));
-}
-
-fn checkRange(image_len: usize, off_u32: u32, size_u32: u32) bool {
-    const off: usize = @intCast(off_u32);
-    const size: usize = @intCast(size_u32);
-    return off <= image_len and size <= image_len - off;
-}
-
-fn checkZ(image: []const u8, off_u32: u32) bool {
-    const off: usize = @intCast(off_u32);
-    if (off >= image.len) return false;
-    var i = off;
-    while (i < image.len) : (i += 1) {
-        if (image[i] == 0) return true;
-    }
-    return false;
-}
-
-fn zString(image: []const u8, off_u32: u32) ?[]const u8 {
-    const off: usize = @intCast(off_u32);
-    if (off >= image.len) return null;
-    var i = off;
-    while (i < image.len) : (i += 1) {
-        if (image[i] == 0) return image[off..i];
-    }
-    return null;
-}
-
-fn zName(buf: []const u8) []const u8 {
-    var len: usize = 0;
-    while (len < buf.len and buf[len] != 0) : (len += 1) {}
-    return buf[0..len];
-}
-
-fn rangeIsZero(bytes: []const u8) bool {
-    for (bytes) |b| {
-        if (b != 0) return false;
-    }
-    return true;
-}
-
-fn fixedNameLen(name: []const u8) usize {
-    var len: usize = 0;
-    while (len < name.len and name[len] != 0) : (len += 1) {}
-    return len;
-}
-
-fn kindFromRaw(raw: u16) ?Kind {
-    return switch (raw) {
-        1 => .r4x,
-        2 => .r4l,
-        3 => .r4d,
-        4 => .r4p,
-        5 => .platform_api_provider_reserved,
-        6 => .kernel_module_reserved,
-        else => null,
-    };
-}
-
-fn kindName(kind: Kind) []const u8 {
-    return switch (kind) {
-        .r4x => "r4x",
-        .r4l => "r4l",
-        .r4d => "r4d",
-        .r4p => "r4p",
-        .platform_api_provider_reserved => "platform_api_provider_reserved",
-        .kernel_module_reserved => "kernel_module_reserved",
-    };
+    const result = r4os_rust_mod_find_name(nativeBytes(name));
+    return if (result == @import("std").math.maxInt(usize)) null else result;
 }
 
 fn hasR4lExtension(name: []const u8) bool {
-    if (name.len < 4) return false;
-    const ext = name[name.len - 4 ..];
-    return upper(ext[0]) == '.' and upper(ext[1]) == 'R' and upper(ext[2]) == '4' and upper(ext[3]) == 'L';
-}
-
-fn nameEq(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (upper(a[i]) != upper(b[i])) return false;
-    }
-    return true;
+    return r4os_rust_mod_name(nativeBytes(name), 3) != 0;
 }
 
 fn validModuleName(name: []const u8) bool {
-    if (name.len == 0 or name.len >= MAX_NAME) return false;
-    for (name) |byte| {
-        if (!asciiAlphaNumeric(byte) and byte != '_' and byte != '-') return false;
-    }
-    return true;
-}
-
-fn validImportModuleName(name: []const u8) bool {
-    if (name.len == 0 or name.len >= MAX_NAME) return false;
-    for (name) |byte| {
-        if (!asciiAlphaNumeric(byte) and byte != '_' and byte != '-' and byte != '.') return false;
-    }
-    return true;
+    return r4os_rust_mod_name(nativeBytes(name), 0) != 0;
 }
 
 fn validSymbolName(name: []const u8) bool {
-    if (name.len == 0 or name.len >= MAX_NAME) return false;
-    if (!asciiAlphabetic(name[0]) and name[0] != '_') return false;
-    for (name[1..]) |byte| {
-        if (!asciiAlphaNumeric(byte) and byte != '_') return false;
-    }
-    return true;
-}
-
-fn asciiAlphabetic(value: u8) bool {
-    const folded = upper(value);
-    return folded >= 'A' and folded <= 'Z';
-}
-
-fn asciiAlphaNumeric(value: u8) bool {
-    return asciiAlphabetic(value) or (value >= '0' and value <= '9');
+    return r4os_rust_mod_name(nativeBytes(name), 2) != 0;
 }
 
 fn copyBytes(src: []const u8, dst: []u8) usize {
     const len = @min(src.len, dst.len);
     if (len > 0) @memcpy(dst[0..len], src[0..len]);
     return len;
-}
-
-fn alignForward(value: usize, alignment: usize) usize {
-    return (value + alignment - 1) & ~(alignment - 1);
-}
-
-fn isPowerOfTwo(value: u32) bool {
-    return value != 0 and (value & (value - 1)) == 0;
-}
-
-fn readLe16(bytes: []const u8) u16 {
-    return @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8);
 }
 
 fn readLe32(bytes: []const u8) u32 {
@@ -2204,19 +552,9 @@ fn writeLe64(bytes: []u8, value: u64) void {
     writeLe32(bytes[4..8], @truncate(value >> 32));
 }
 
-fn memEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (a[i] != b[i]) return false;
-    }
-    return true;
-}
+const RelocApplyResult = enum(u8) { ok, unknown_type, bad_range, unresolved_import };
 
-fn upper(c: u8) u8 {
-    if (c >= 'a' and c <= 'z') return c - ('a' - 'A');
-    return c;
-}
+fn kindFromRaw(raw: u16) ?Kind { return module_r4m.kindFromRaw(raw); }
 
 test "R4D resources do not consume executable image memory or relocation addresses" {
     const std = @import("std");
@@ -2433,33 +771,4 @@ test "Runtime-R4L executable ownership is exact and generation safe" {
     entries[slot].kind = .r4l;
     entries[slot].state = .failed;
     try testing.expect(!isExecutableAddress(@intCast(slot), 7, 0x1000));
-}
-
-fn logPublication(e: *const Entry) void {
-    k.puts("[MOD] load ");
-    k.puts(e.name[0..e.name_len]);
-    k.puts(" kind=");
-    k.puts(kindName(e.kind));
-    k.puts(" sections=");
-    k.putDec(e.section_count);
-    k.puts(" image=0x");
-    k.putHex(e.base, 16);
-    k.puts(" size=");
-    k.putDec(@intCast(e.size));
-    k.puts(" bss=");
-    k.puts(if (e.bss_zeroed) "zero" else "bad");
-    if (e.pinned) {
-        k.puts(" generation=");
-        k.putDec(e.generation);
-        k.puts(" pinned");
-    }
-    if (e.import_count != 0) {
-        k.puts(" imports_resolved=");
-        k.putDec(e.resolved_import_count);
-    }
-    if (e.reloc_count != 0) {
-        k.puts(" relocs=");
-        k.putDec(e.reloc_count);
-    }
-    k.puts("\r\n");
 }

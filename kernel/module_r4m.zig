@@ -12,16 +12,6 @@ pub const VERSION: u16 = 1;
 pub const ARCH_X86_64: u16 = 1;
 pub const IMPORT_FLAG_OPTIONAL: u32 = 1;
 
-// This flag belongs to the R4M0 file record, not R4XStartImport.flags.
-// A missing optional provider yields table/version/generation zero.
-pub fn validImportFlags(module: []const u8, flags: u32) bool {
-    if ((flags & ~IMPORT_FLAG_OPTIONAL) != 0) return false;
-    if (flags == 0) return true;
-    for ([_][]const u8{ "R4SYS", "R4DESK", "R4DRAW", "R4NET", "R4AUDIO", "R4DEV" }) |platform|
-        if (@import("std").ascii.eqlIgnoreCase(module, platform)) return false;
-    return true;
-}
-
 pub const Kind = enum(u16) {
     r4x = 1,
     r4l = 2,
@@ -31,7 +21,7 @@ pub const Kind = enum(u16) {
     kernel_module_reserved = 6,
 };
 
-pub const Header = struct {
+pub const Header = extern struct {
     version: u16,
     arch: u16,
     kind_raw: u16,
@@ -55,7 +45,7 @@ pub const Header = struct {
     }
 };
 
-pub const Limits = struct {
+pub const Limits = extern struct {
     max_sections: u32 = 16,
     max_imports: u32 = 16,
     max_exports: u32 = 16,
@@ -92,14 +82,14 @@ pub const ExportLookupRequest = struct {
     verbose: bool = true,
 };
 
-pub const ExportRecord = struct {
+pub const ExportRecord = extern struct {
     name_offset: u32,
     section: u32,
     offset: u32,
     version: u32,
 };
 
-pub const SectionRecord = struct {
+pub const SectionRecord = extern struct {
     name: [8]u8,
     flags: u32,
     file_off: u32,
@@ -108,21 +98,21 @@ pub const SectionRecord = struct {
     alignment: u32,
 };
 
-pub const EntryRecord = struct {
+pub const EntryRecord = extern struct {
     kind: u32,
     section: u32,
     offset: u32,
     flags: u32,
 };
 
-pub const ImportRecord = struct {
+pub const ImportRecord = extern struct {
     module_offset: u32,
     symbol_offset: u32,
     min_version: u32,
     flags: u32,
 };
 
-pub const RelocationRecord = struct {
+pub const RelocationRecord = extern struct {
     kind: u32,
     patch_section: u32,
     patch_offset: u32,
@@ -131,415 +121,249 @@ pub const RelocationRecord = struct {
     addend: i32,
 };
 
-/// One loader-local, allocation-free view of an R4M0 file. All small header,
-/// table, name, metadata and relocation reads share the same two bounded
-/// windows. Section payloads intentionally continue to use module_file
-/// directly so they never evict metadata merely because they are large.
+// Private C values; native Rust owns every parser/iterator decision.
+const NativeBytes = extern struct { data: [*]const u8, len: usize };
+const NativeSpan = extern struct { offset: usize, len: usize, present: bool };
+const NativeIo = extern struct { context: ?*anyopaque, read: *const fn (?*anyopaque, usize, [*]u8, usize) callconv(.c) bool, log: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void, file_size: usize };
+extern fn r4os_rust_r4m_kind(u16) u16;
+extern fn r4os_rust_r4m_loadable(u16) bool;
+extern fn r4os_rust_r4m_import(NativeBytes, u32) bool;
+extern fn r4os_rust_r4m_header(*const NativeIo, u16, *const Limits, *Header) bool;
+extern fn r4os_rust_r4m_record(*const NativeIo, *const Header, usize, u8, *anyopaque) bool;
+extern fn r4os_rust_r4m_decode([*]const u8, usize, *RelocationRecord) void;
+extern fn r4os_rust_r4m_zstring(*const NativeIo, u32, [*]u8, usize) NativeSpan;
+extern fn r4os_rust_r4m_metadata(*const NativeIo, *const Header, [*]u8, usize) NativeSpan;
+extern fn r4os_rust_r4m_export(*const NativeIo, *const Header, NativeBytes, u32, [*]u8, usize) bool;
+extern fn r4os_rust_r4m_windows(usize) usize;
+extern fn r4os_rust_r4m_next(*const NativeIo, *const Header, *usize, *RelocationRecord) bool;
+extern fn r4os_rust_r4m_meta(u8, NativeBytes, NativeBytes, ?*usize) NativeSpan;
+extern fn r4os_rust_r4m_labels(NativeBytes, *VersionLabels) void;
+fn nativeBytes(value: []const u8) NativeBytes {
+    return .{ .data = value.ptr, .len = value.len };
+}
+fn nativeSpan(data: []const u8, value: NativeSpan) ?[]const u8 {
+    return if (value.present) data[value.offset..][0..value.len] else null;
+}
+const NativeContext = struct {
+    file: *module_file.BoundedReader,
+    name: []const u8,
+    verbose: bool,
+    fn read(pointer: ?*anyopaque, offset: usize, out: [*]u8, len: usize) callconv(.c) bool {
+        const context: *@This() = @ptrCast(@alignCast(pointer.?));
+        return context.file.readExactAt(offset, out[0..len], context.name, context.verbose);
+    }
+    fn log(pointer: ?*anyopaque, reason: [*]const u8, len: usize) callconv(.c) void {
+        const context: *@This() = @ptrCast(@alignCast(pointer.?));
+        if (!context.verbose) return;
+        k.puts("[R4M] ");
+        k.puts(reason[0..len]);
+        k.puts(" failed ");
+        k.puts(context.name);
+        k.puts("\r\n");
+    }
+    fn io(self: *@This()) NativeIo {
+        return .{ .context = self, .read = read, .log = log, .file_size = self.file.file_size };
+    }
+};
 pub const Reader = struct {
     file: module_file.BoundedReader,
-
     pub fn init(source: module_file.FileSource, file_size: usize) Reader {
         return .{ .file = module_file.BoundedReader.init(source, file_size) };
     }
-
     pub fn reset(self: *Reader, source: module_file.FileSource, file_size: usize) void {
         self.file.reset(source, file_size);
     }
-
     pub fn readHeader(self: *Reader, expected_kind: ?Kind, limits: Limits, name: []const u8, verbose: bool) ?Header {
-        if (self.file.file_size < HEADER_SIZE) {
-            logFailure(verbose, name, "short-header");
-            return null;
-        }
-        var raw: [HEADER_SIZE]u8 = .{0} ** HEADER_SIZE;
-        if (!self.file.readExactAt(0, raw[0..], name, verbose)) return null;
-        if (memEql(raw[0..4], "R4X0") or memEql(raw[0..4], "R4D0") or memEql(raw[0..4], "R4P0")) {
-            logFailure(verbose, name, "legacy-format");
-            return null;
-        }
-        if (!memEql(raw[0..4], "R4M0")) {
-            logFailure(verbose, name, "bad-magic");
-            return null;
-        }
-        const header = parseHeader(raw[0..]);
-        if (!validateHeader(header, self.file.file_size, expected_kind, limits, name, verbose)) return null;
-        return header;
+        var context: NativeContext = .{ .file = &self.file, .name = name, .verbose = verbose };
+        const io = context.io();
+        var out: Header = undefined;
+        return if (r4os_rust_r4m_header(&io, if (expected_kind) |kind| @intFromEnum(kind) else 0, &limits, &out)) out else null;
     }
-
     pub fn readMetadata(self: *Reader, header: Header, out: []u8, name: []const u8, verbose: bool) ?[]const u8 {
-        if (header.meta_size == 0) return out[0..0];
-        const size: usize = @intCast(header.meta_size);
-        if (size > out.len) {
-            logFailure(verbose, name, "metadata-too-large");
-            return null;
-        }
-        const meta = out[0..size];
-        if (!self.file.readExactAt(@intCast(header.meta_off), meta, name, verbose)) return null;
-        return meta;
+        var context: NativeContext = .{ .file = &self.file, .name = name, .verbose = verbose };
+        const io = context.io();
+        return nativeSpan(out, r4os_rust_r4m_metadata(&io, &header, out.ptr, out.len));
     }
-
     pub fn hasExport(self: *Reader, header: Header, symbol: []const u8, min_version: u32, scratch: []u8, name: []const u8, verbose: bool) bool {
-        if (header.export_count == 0) return false;
-        var i: usize = 0;
-        while (i < header.export_count) : (i += 1) {
-            const record = self.readExportRecord(header, i, name, verbose) orelse return false;
-            if (record.version < min_version) continue;
-            const export_name = self.readZString(record.name_offset, scratch, name, verbose) orelse return false;
-            if (memEql(export_name, symbol)) return true;
-        }
-        return false;
+        var context: NativeContext = .{ .file = &self.file, .name = name, .verbose = verbose };
+        const io = context.io();
+        return r4os_rust_r4m_export(&io, &header, nativeBytes(symbol), min_version, scratch.ptr, scratch.len);
     }
-
+    fn record(self: *Reader, comptime T: type, header: Header, index: usize, operation: u8, name: []const u8, verbose: bool) ?T {
+        var context: NativeContext = .{ .file = &self.file, .name = name, .verbose = verbose };
+        const io = context.io();
+        var out: T = undefined;
+        return if (r4os_rust_r4m_record(&io, &header, index, operation, &out)) out else null;
+    }
     pub fn readSectionRecord(self: *Reader, header: Header, index: usize, name: []const u8, verbose: bool) ?SectionRecord {
-        if (index >= header.section_count) return null;
-        var raw: [SECTION_SIZE]u8 = .{0} ** SECTION_SIZE;
-        const offset = @as(usize, @intCast(header.section_off)) + index * SECTION_SIZE;
-        if (!self.file.readExactAt(offset, raw[0..], name, verbose)) return null;
-        var section_name: [8]u8 = .{0} ** 8;
-        @memcpy(section_name[0..], raw[0..8]);
-        return .{
-            .name = section_name,
-            .flags = readLe32(raw[8..12]),
-            .file_off = readLe32(raw[12..16]),
-            .file_size = readLe32(raw[16..20]),
-            .mem_size = readLe32(raw[20..24]),
-            .alignment = readLe32(raw[24..28]),
-        };
+        return self.record(SectionRecord, header, index, 0, name, verbose);
     }
-
     pub fn readEntryRecord(self: *Reader, header: Header, index: usize, name: []const u8, verbose: bool) ?EntryRecord {
-        if (index >= header.entry_count) return null;
-        var raw: [ENTRY_SIZE]u8 = .{0} ** ENTRY_SIZE;
-        const offset = @as(usize, @intCast(header.entry_off)) + index * ENTRY_SIZE;
-        if (!self.file.readExactAt(offset, raw[0..], name, verbose)) return null;
-        return .{
-            .kind = readLe32(raw[0..4]),
-            .section = readLe32(raw[4..8]),
-            .offset = readLe32(raw[8..12]),
-            .flags = readLe32(raw[12..16]),
-        };
+        return self.record(EntryRecord, header, index, 1, name, verbose);
     }
-
     pub fn readImportRecord(self: *Reader, header: Header, index: usize, name: []const u8, verbose: bool) ?ImportRecord {
-        if (index >= header.import_count) return null;
-        var raw: [IMPORT_SIZE]u8 = .{0} ** IMPORT_SIZE;
-        const offset = @as(usize, @intCast(header.import_off)) + index * IMPORT_SIZE;
-        if (!self.file.readExactAt(offset, raw[0..], name, verbose)) return null;
-        return .{
-            .module_offset = readLe32(raw[0..4]),
-            .symbol_offset = readLe32(raw[4..8]),
-            .min_version = readLe32(raw[8..12]),
-            .flags = readLe32(raw[12..16]),
-        };
+        return self.record(ImportRecord, header, index, 2, name, verbose);
     }
-
     pub fn readExportRecord(self: *Reader, header: Header, index: usize, name: []const u8, verbose: bool) ?ExportRecord {
-        if (index >= header.export_count) return null;
-        var raw: [EXPORT_SIZE]u8 = .{0} ** EXPORT_SIZE;
-        const offset = @as(usize, @intCast(header.export_off)) + index * EXPORT_SIZE;
-        if (!self.file.readExactAt(offset, raw[0..], name, verbose)) return null;
-        return .{
-            .name_offset = readLe32(raw[0..4]),
-            .section = readLe32(raw[4..8]),
-            .offset = readLe32(raw[8..12]),
-            .version = readLe32(raw[12..16]),
-        };
+        return self.record(ExportRecord, header, index, 3, name, verbose);
     }
-
     pub fn readRelocationRecord(self: *Reader, header: Header, index: usize, name: []const u8, verbose: bool) ?RelocationRecord {
-        if (index >= header.reloc_count) return null;
-        var raw: [RELOCATION_SIZE]u8 = .{0} ** RELOCATION_SIZE;
-        const offset = @as(usize, @intCast(header.reloc_off)) + index * RELOCATION_SIZE;
-        if (!self.file.readExactAt(offset, raw[0..], name, verbose)) return null;
-        return decodeRelocationRecord(raw[0..]);
+        return self.record(RelocationRecord, header, index, 4, name, verbose);
     }
-
     pub fn readZString(self: *Reader, offset_u32: u32, out: []u8, name: []const u8, verbose: bool) ?[]const u8 {
-        const offset: usize = @intCast(offset_u32);
-        if (offset >= self.file.file_size or out.len == 0) return null;
-        const max_len = @min(out.len, self.file.file_size - offset);
-        const dst = out[0..max_len];
-        if (!self.file.readExactAt(offset, dst, name, verbose)) return null;
-        var i: usize = 0;
-        while (i < dst.len) : (i += 1) {
-            if (dst[i] == 0) return dst[0..i];
-        }
-        logFailure(verbose, name, "zstring-too-large");
-        return null;
+        var context: NativeContext = .{ .file = &self.file, .name = name, .verbose = verbose };
+        const io = context.io();
+        return nativeSpan(out, r4os_rust_r4m_zstring(&io, offset_u32, out.ptr, out.len));
     }
 };
-
-/// Streams the unchanged relocation table in record-aligned windows.  The
-/// caller still observes and applies records in their original order, while
-/// the filesystem sees one request per window instead of one 24-byte request
-/// per relocation.
 pub const RelocationWindowReader = struct {
     reader: *Reader,
     header: Header,
     name: []const u8,
     verbose: bool,
     next_index: usize = 0,
-
     pub fn init(reader: *Reader, header: Header, name: []const u8, verbose: bool) RelocationWindowReader {
-        return .{
-            .reader = reader,
-            .header = header,
-            .name = name,
-            .verbose = verbose,
-        };
+        return .{ .reader = reader, .header = header, .name = name, .verbose = verbose };
     }
-
     pub fn next(self: *RelocationWindowReader) ?RelocationRecord {
-        if (self.next_index >= self.header.reloc_count) return null;
-        const record = self.reader.readRelocationRecord(self.header, self.next_index, self.name, self.verbose) orelse return null;
-        self.next_index += 1;
-        return record;
+        var context: NativeContext = .{ .file = &self.reader.file, .name = self.name, .verbose = self.verbose };
+        const io = context.io();
+        var out: RelocationRecord = undefined;
+        return if (r4os_rust_r4m_next(&io, &self.header, &self.next_index, &out)) out else null;
     }
 };
-
 pub fn relocationWindowCount(record_count: usize) usize {
-    if (record_count == 0) return 0;
-    return 1 + (record_count - 1) / RELOCATION_WINDOW_RECORDS;
+    return r4os_rust_r4m_windows(record_count);
 }
-
 pub const MetadataIterator = struct {
     meta: []const u8,
     offset: usize = 0,
-
     pub fn next(self: *MetadataIterator) ?[]const u8 {
-        while (self.offset < self.meta.len) {
-            const start = self.offset;
-            while (self.offset < self.meta.len and self.meta[self.offset] != 0) : (self.offset += 1) {}
-            const item = self.meta[start..self.offset];
-            if (self.offset < self.meta.len) self.offset += 1;
-            if (item.len != 0) return item;
-        }
-        return null;
+        return nativeSpan(self.meta, r4os_rust_r4m_meta(0, nativeBytes(self.meta), nativeBytes(""), &self.offset));
     }
 };
-
-pub fn readHeader(req: HeaderReadRequest) ?Header {
-    var reader = Reader.init(req.source, req.file_size);
-    return reader.readHeader(req.expected_kind, req.limits, req.name, req.verbose);
-}
-
-pub fn readMetadata(req: MetadataReadRequest) ?[]const u8 {
-    var reader = Reader.init(req.source, @intCast(req.source.entry.size));
-    return reader.readMetadata(req.header, req.out, req.name, req.verbose);
-}
-
 pub fn metadataIterator(meta: []const u8) MetadataIterator {
     return .{ .meta = meta };
 }
-
 pub fn metadataValue(meta: []const u8, prefix: []const u8) ?[]const u8 {
-    var it = metadataIterator(meta);
-    var found: ?[]const u8 = null;
-    while (it.next()) |item| {
-        if (startsWith(item, prefix)) found = item[prefix.len..];
-    }
-    return found;
+    return nativeSpan(meta, r4os_rust_r4m_meta(1, nativeBytes(meta), nativeBytes(prefix), null));
 }
-
-// Retained, bounded display labels. Never truncate an unrepresentable version
-// into a different version, and never expose control bytes to user interfaces.
-pub const VersionLabels = struct {
-    module: [32]u8 = .{0} ** 32,
-    firmware: [32]u8 = .{0} ** 32,
-
-    pub fn parse(meta: []const u8) VersionLabels {
-        return .{
-            .module = label(meta, "module.version="),
-            .firmware = label(meta, "firmware.version="),
-        };
-    }
-
-    fn label(meta: []const u8, prefix: []const u8) [32]u8 {
-        var out: [32]u8 = .{0} ** 32;
-        const value = metadataValue(meta, prefix) orelse return out;
-        if (value.len == 0 or value.len >= out.len) return out;
-        for (value) |c| if (c < 33 or c > 126) return out;
-        @memcpy(out[0..value.len], value);
-        return out;
-    }
-};
-
 pub fn metadataContains(meta: []const u8, needle: []const u8) bool {
-    var it = metadataIterator(meta);
-    while (it.next()) |item| {
-        if (memEql(item, needle)) return true;
-    }
-    return false;
+    return r4os_rust_r4m_meta(2, nativeBytes(meta), nativeBytes(needle), null).present;
 }
-
 pub fn firstMetadataItem(meta: []const u8) ?[]const u8 {
     var it = metadataIterator(meta);
     return it.next();
 }
-
+pub const VersionLabels = extern struct {
+    module: [32]u8 = .{0} ** 32,
+    firmware: [32]u8 = .{0} ** 32,
+    pub fn parse(meta: []const u8) VersionLabels {
+        var out: VersionLabels = undefined;
+        r4os_rust_r4m_labels(nativeBytes(meta), &out);
+        return out;
+    }
+};
+pub fn validImportFlags(module: []const u8, flags: u32) bool {
+    return r4os_rust_r4m_import(nativeBytes(module), flags);
+}
+pub fn kindFromRaw(raw: u16) ?Kind {
+    const kind = r4os_rust_r4m_kind(raw);
+    return if (kind == 0) null else @enumFromInt(kind);
+}
+pub fn isLoadableContainerKind(kind: Kind) bool {
+    return r4os_rust_r4m_loadable(@intFromEnum(kind));
+}
+pub fn readHeader(req: HeaderReadRequest) ?Header {
+    var reader = Reader.init(req.source, req.file_size);
+    return reader.readHeader(req.expected_kind, req.limits, req.name, req.verbose);
+}
+pub fn readMetadata(req: MetadataReadRequest) ?[]const u8 {
+    var reader = Reader.init(req.source, @intCast(req.source.entry.size));
+    return reader.readMetadata(req.header, req.out, req.name, req.verbose);
+}
 pub fn hasExport(req: ExportLookupRequest) bool {
     var reader = Reader.init(req.source, req.file_size);
     return reader.hasExport(req.header, req.symbol, req.min_version, req.scratch, req.name, req.verbose);
 }
-
-pub fn kindFromRaw(raw: u16) ?Kind {
-    return switch (raw) {
-        1 => .r4x,
-        2 => .r4l,
-        3 => .r4d,
-        4 => .r4p,
-        5 => .platform_api_provider_reserved,
-        6 => .kernel_module_reserved,
-        else => null,
-    };
-}
-
-pub fn isLoadableContainerKind(kind: Kind) bool {
-    return switch (kind) {
-        .r4x, .r4l, .r4d, .r4p => true,
-        .platform_api_provider_reserved, .kernel_module_reserved => false,
-    };
-}
-
 pub fn readSectionRecord(source: module_file.FileSource, header: Header, index: usize, name: []const u8, verbose: bool) ?SectionRecord {
     var reader = Reader.init(source, @intCast(source.entry.size));
     return reader.readSectionRecord(header, index, name, verbose);
 }
-
 pub fn readEntryRecord(source: module_file.FileSource, header: Header, index: usize, name: []const u8, verbose: bool) ?EntryRecord {
     var reader = Reader.init(source, @intCast(source.entry.size));
     return reader.readEntryRecord(header, index, name, verbose);
 }
-
 pub fn readImportRecord(source: module_file.FileSource, header: Header, index: usize, name: []const u8, verbose: bool) ?ImportRecord {
     var reader = Reader.init(source, @intCast(source.entry.size));
     return reader.readImportRecord(header, index, name, verbose);
 }
-
 pub fn readExportRecord(source: module_file.FileSource, header: Header, index: usize, name: []const u8, verbose: bool) ?ExportRecord {
     var reader = Reader.init(source, @intCast(source.entry.size));
     return reader.readExportRecord(header, index, name, verbose);
 }
-
 pub fn readRelocationRecord(source: module_file.FileSource, header: Header, index: usize, name: []const u8, verbose: bool) ?RelocationRecord {
     var reader = Reader.init(source, @intCast(source.entry.size));
     return reader.readRelocationRecord(header, index, name, verbose);
 }
-
-fn decodeRelocationRecord(raw: []const u8) RelocationRecord {
-    return .{
-        .kind = readLe32(raw[0..4]),
-        .patch_section = readLe32(raw[4..8]),
-        .patch_offset = readLe32(raw[8..12]),
-        .target_section = readLe32(raw[12..16]),
-        .target_offset = readLe32(raw[16..20]),
-        .addend = @bitCast(readLe32(raw[20..24])),
-    };
-}
-
 pub fn readZString(source: module_file.FileSource, file_size: usize, offset_u32: u32, out: []u8, name: []const u8, verbose: bool) ?[]const u8 {
     var reader = Reader.init(source, file_size);
     return reader.readZString(offset_u32, out, name, verbose);
 }
-
-fn parseHeader(raw: []const u8) Header {
-    return .{
-        .version = readLe16(raw[4..6]),
-        .arch = readLe16(raw[6..8]),
-        .kind_raw = readLe16(raw[8..10]),
-        .header_size = readLe16(raw[10..12]),
-        .flags = readLe32(raw[12..16]),
-        .section_off = readLe32(raw[16..20]),
-        .section_count = readLe32(raw[20..24]),
-        .import_off = readLe32(raw[24..28]),
-        .import_count = readLe32(raw[28..32]),
-        .export_off = readLe32(raw[32..36]),
-        .export_count = readLe32(raw[36..40]),
-        .reloc_off = readLe32(raw[40..44]),
-        .reloc_count = readLe32(raw[44..48]),
-        .entry_off = readLe32(raw[48..52]),
-        .entry_count = readLe32(raw[52..56]),
-        .meta_off = readLe32(raw[56..60]),
-        .meta_size = readLe32(raw[60..64]),
-    };
+fn decodeRelocationRecord(raw: []const u8) RelocationRecord {
+    var out: RelocationRecord = undefined;
+    r4os_rust_r4m_decode(raw.ptr, raw.len, &out);
+    return out;
 }
-
-fn validateHeader(header: Header, file_size: usize, expected_kind: ?Kind, limits: Limits, name: []const u8, verbose: bool) bool {
-    if (header.version != VERSION) return reject(verbose, name, "version");
-    if (header.arch != ARCH_X86_64) return reject(verbose, name, "arch");
-    if (header.header_size != HEADER_SIZE) return reject(verbose, name, "header-size");
-    const kind = header.kind() orelse return reject(verbose, name, "kind");
-    if (!isLoadableContainerKind(kind)) return reject(verbose, name, "reserved-kind");
-    if (expected_kind) |expected| {
-        if (kind != expected) return reject(verbose, name, "unexpected-kind");
-    }
-    if (header.section_count > limits.max_sections) return reject(verbose, name, "section-count");
-    if (header.import_count > limits.max_imports) return reject(verbose, name, "import-count");
-    if (header.export_count > limits.max_exports) return reject(verbose, name, "export-count");
-    if (header.reloc_count > limits.max_relocations) return reject(verbose, name, "reloc-count");
-    if (!checkTable(file_size, header.section_off, header.section_count, SECTION_SIZE, limits.require_sections)) return reject(verbose, name, "section-table");
-    if (!checkTable(file_size, header.entry_off, header.entry_count, ENTRY_SIZE, limits.require_entries)) return reject(verbose, name, "entry-table");
-    if (!checkTable(file_size, header.import_off, header.import_count, IMPORT_SIZE, false)) return reject(verbose, name, "import-table");
-    if (!checkTable(file_size, header.export_off, header.export_count, EXPORT_SIZE, false)) return reject(verbose, name, "export-table");
-    if (!checkTable(file_size, header.reloc_off, header.reloc_count, RELOCATION_SIZE, false)) return reject(verbose, name, "reloc-table");
-    if (header.meta_size != 0 and !checkRange(file_size, @intCast(header.meta_off), @intCast(header.meta_size))) return reject(verbose, name, "metadata");
-    return true;
-}
-
-fn checkTable(file_size: usize, off: u32, count: u32, entry_size: usize, required: bool) bool {
-    if (count == 0) return !required;
-    if (off == 0) return false;
-    const table_off: usize = @intCast(off);
-    const table_count: usize = @intCast(count);
-    if (table_count > file_size / entry_size) return false;
-    return checkRange(file_size, table_off, table_count * entry_size);
-}
-
-fn checkRange(file_size: usize, off: usize, len: usize) bool {
-    return off <= file_size and len <= file_size - off;
-}
-
-fn reject(verbose: bool, name: []const u8, reason: []const u8) bool {
-    logFailure(verbose, name, reason);
-    return false;
-}
-
-fn logFailure(verbose: bool, name: []const u8, reason: []const u8) void {
-    if (!verbose) return;
-    k.puts("[R4M] ");
-    k.puts(reason);
-    k.puts(" failed ");
-    k.puts(name);
-    k.puts("\r\n");
-}
-
-fn startsWith(value: []const u8, prefix: []const u8) bool {
-    if (value.len < prefix.len) return false;
-    var i: usize = 0;
-    while (i < prefix.len) : (i += 1) {
-        if (value[i] != prefix[i]) return false;
-    }
-    return true;
-}
-
-fn memEql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (a[i] != b[i]) return false;
-    }
-    return true;
-}
-
-fn readLe16(bytes: []const u8) u16 {
-    return @as(u16, bytes[0]) | (@as(u16, bytes[1]) << 8);
-}
-
-fn readLe32(bytes: []const u8) u32 {
-    return @as(u32, bytes[0]) |
-        (@as(u32, bytes[1]) << 8) |
-        (@as(u32, bytes[2]) << 16) |
-        (@as(u32, bytes[3]) << 24);
+comptime {
+    if (@sizeOf(Header) != 60 or @alignOf(Header) != 4 or @sizeOf(Limits) != 20 or @sizeOf(SectionRecord) != 28 or @sizeOf(EntryRecord) != 16 or @sizeOf(ImportRecord) != 16 or @sizeOf(ExportRecord) != 16 or @sizeOf(RelocationRecord) != 24 or @sizeOf(NativeSpan) != 24 or @sizeOf(NativeIo) != 32 or @sizeOf(VersionLabels) != 64 or RELOCATION_WINDOW_RECORDS != 170) @compileError("private R4M0 C layout");
+    if (@offsetOf(Header, "version") != 0) @compileError("private Header.version offset");
+    if (@offsetOf(Header, "arch") != 2) @compileError("private Header.arch offset");
+    if (@offsetOf(Header, "kind_raw") != 4) @compileError("private Header.kind_raw offset");
+    if (@offsetOf(Header, "header_size") != 6) @compileError("private Header.header_size offset");
+    if (@offsetOf(Header, "flags") != 8) @compileError("private Header.flags offset");
+    if (@offsetOf(Header, "section_off") != 12) @compileError("private Header.section_off offset");
+    if (@offsetOf(Header, "section_count") != 16) @compileError("private Header.section_count offset");
+    if (@offsetOf(Header, "import_off") != 20) @compileError("private Header.import_off offset");
+    if (@offsetOf(Header, "import_count") != 24) @compileError("private Header.import_count offset");
+    if (@offsetOf(Header, "export_off") != 28) @compileError("private Header.export_off offset");
+    if (@offsetOf(Header, "export_count") != 32) @compileError("private Header.export_count offset");
+    if (@offsetOf(Header, "reloc_off") != 36) @compileError("private Header.reloc_off offset");
+    if (@offsetOf(Header, "reloc_count") != 40) @compileError("private Header.reloc_count offset");
+    if (@offsetOf(Header, "entry_off") != 44) @compileError("private Header.entry_off offset");
+    if (@offsetOf(Header, "entry_count") != 48) @compileError("private Header.entry_count offset");
+    if (@offsetOf(Header, "meta_off") != 52) @compileError("private Header.meta_off offset");
+    if (@offsetOf(Header, "meta_size") != 56) @compileError("private Header.meta_size offset");
+    if (@offsetOf(Limits, "max_sections") != 0) @compileError("private Limits.max_sections offset");
+    if (@offsetOf(Limits, "max_imports") != 4) @compileError("private Limits.max_imports offset");
+    if (@offsetOf(Limits, "max_exports") != 8) @compileError("private Limits.max_exports offset");
+    if (@offsetOf(Limits, "max_relocations") != 12) @compileError("private Limits.max_relocations offset");
+    if (@offsetOf(Limits, "require_sections") != 16) @compileError("private Limits.require_sections offset");
+    if (@offsetOf(Limits, "require_entries") != 17) @compileError("private Limits.require_entries offset");
+    if (@offsetOf(ExportRecord, "name_offset") != 0) @compileError("private ExportRecord.name_offset offset");
+    if (@offsetOf(ExportRecord, "section") != 4) @compileError("private ExportRecord.section offset");
+    if (@offsetOf(ExportRecord, "offset") != 8) @compileError("private ExportRecord.offset offset");
+    if (@offsetOf(ExportRecord, "version") != 12) @compileError("private ExportRecord.version offset");
+    if (@offsetOf(SectionRecord, "name") != 0) @compileError("private SectionRecord.name offset");
+    if (@offsetOf(SectionRecord, "flags") != 8) @compileError("private SectionRecord.flags offset");
+    if (@offsetOf(SectionRecord, "file_off") != 12) @compileError("private SectionRecord.file_off offset");
+    if (@offsetOf(SectionRecord, "file_size") != 16) @compileError("private SectionRecord.file_size offset");
+    if (@offsetOf(SectionRecord, "mem_size") != 20) @compileError("private SectionRecord.mem_size offset");
+    if (@offsetOf(SectionRecord, "alignment") != 24) @compileError("private SectionRecord.alignment offset");
+    if (@offsetOf(EntryRecord, "kind") != 0) @compileError("private EntryRecord.kind offset");
+    if (@offsetOf(EntryRecord, "section") != 4) @compileError("private EntryRecord.section offset");
+    if (@offsetOf(EntryRecord, "offset") != 8) @compileError("private EntryRecord.offset offset");
+    if (@offsetOf(EntryRecord, "flags") != 12) @compileError("private EntryRecord.flags offset");
+    if (@offsetOf(ImportRecord, "module_offset") != 0) @compileError("private ImportRecord.module_offset offset");
+    if (@offsetOf(ImportRecord, "symbol_offset") != 4) @compileError("private ImportRecord.symbol_offset offset");
+    if (@offsetOf(ImportRecord, "min_version") != 8) @compileError("private ImportRecord.min_version offset");
+    if (@offsetOf(ImportRecord, "flags") != 12) @compileError("private ImportRecord.flags offset");
+    if (@offsetOf(RelocationRecord, "kind") != 0) @compileError("private RelocationRecord.kind offset");
+    if (@offsetOf(RelocationRecord, "patch_section") != 4) @compileError("private RelocationRecord.patch_section offset");
+    if (@offsetOf(RelocationRecord, "patch_offset") != 8) @compileError("private RelocationRecord.patch_offset offset");
+    if (@offsetOf(RelocationRecord, "target_section") != 12) @compileError("private RelocationRecord.target_section offset");
+    if (@offsetOf(RelocationRecord, "target_offset") != 16) @compileError("private RelocationRecord.target_offset offset");
+    if (@offsetOf(RelocationRecord, "addend") != 20) @compileError("private RelocationRecord.addend offset");
 }
 
 test "relocation windows scale with contiguous table ranges" {

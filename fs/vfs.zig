@@ -209,6 +209,21 @@ extern fn r4os_rust_vfs_notify(*const CVolume, u64) void;
 fn bytes(value: []const u8) Bytes {
     return .{ .data = value.ptr, .len = value.len };
 }
+// Reuse the same private projections for native module-file consumers.
+pub const NativeVolume = CVolume;
+pub const NativeEntry = CEntry;
+pub fn nativeVolume(value: Volume) NativeVolume {
+    return cv(value);
+}
+pub fn nativeEntry(value: Entry) NativeEntry {
+    return ce(value);
+}
+pub fn volumeFromNative(value: NativeVolume) Volume {
+    return volume(value);
+}
+pub fn entryFromNative(value: NativeEntry) Entry {
+    return fromCe(value);
+}
 fn cv(value: Volume) CVolume {
     const ref = value.accessReference();
     var out = CVolume{ .has_ref = ref != null, .reference = ref orelse .{ .slot = 0, .generation = 0 } };

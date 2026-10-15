@@ -2,6 +2,8 @@
 pub use r4os_contract as contract;
 #[path = "../../../Rust/fs/mod.rs"]
 pub mod fs;
+#[path = "../../../Rust/loader/mod.rs"]
+pub mod loader;
 // The existing Zig fixtures call the exact migrated owner implementations.
 // This host-only archive has no boot entry, MMIO execution or kernel runtime.
 #[path = "../../../Rust/memory/blocks.rs"]
@@ -240,6 +242,7 @@ pub mod protocol_registry;
 #[path = "../../../Rust/driver/resource_state.rs"]
 pub mod resource_state;
 pub mod driver {
+    pub use crate::protocol_api;
     pub use crate::dma_segments;
     pub use crate::driver_api_admission as api_admission;
     pub use crate::driver_api_audio as api_audio;

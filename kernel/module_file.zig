@@ -1,22 +1,17 @@
+// Native module-file owner. Existing Zig callers retain typed source views;
+// the bridge only projects those immutable values and formats log messages.
 const vfs = @import("../fs/vfs.zig");
 const fs_request = @import("../fs/request.zig");
-const k = @import("log.zig");
 const drive = @import("../fs/drive.zig");
-
-var execution_drive: ?u8 = null;
-
-/// Boot-only admission policy, installed before userland starts. Normal R4OS
-/// leaves it unset; a RAM runtime can restrict executable sources to itself.
+const k = @import("log.zig");
+extern fn r4os_rust_module_file_restrict(u8) void;
+extern fn r4os_rust_module_file_allowed(u8) bool;
 pub fn restrictExecutionToDrive(letter: u8) void {
-    execution_drive = letter;
+    r4os_rust_module_file_restrict(letter);
 }
-
 pub fn executionDriveAllowed(letter: u8) bool {
-    const required = execution_drive orelse return true;
-    const mounted = drive.get(letter) orelse return false;
-    return letter == required and mounted.role == .ram;
+    return r4os_rust_module_file_allowed(letter);
 }
-
 pub const FileSource = struct {
     volume: vfs.Volume,
     entry: vfs.Entry,
@@ -39,7 +34,7 @@ pub const metadata_window_size: usize = 4096;
 pub const metadata_window_count: usize = 2;
 pub const metadata_window_capacity_bytes: usize = metadata_window_size * metadata_window_count;
 
-pub const Stats = struct {
+pub const Stats = extern struct {
     active_buffers: u64 = 0,
     reserved_bytes: u64 = 0,
     committed_bytes: u64 = 0,
@@ -66,59 +61,52 @@ pub const Stats = struct {
     pressure_failures: u64 = 0,
 };
 
-var stats_state = Stats{};
-
+pub const NativeSource = extern struct { volume: vfs.NativeVolume, entry: vfs.NativeEntry, drive: u8 };
+const Bytes = extern struct { data: [*]const u8, len: usize };
+const Output = extern struct { len: usize, present: bool };
+const NativeIo = extern struct { context: ?*anyopaque, read: *const fn (?*anyopaque, usize, [*]u8, usize) callconv(.c) Output, name: Bytes, verbose: bool };
+extern fn r4os_rust_module_file_stats(*Stats) void;
+extern fn r4os_rust_module_file_note_init() void;
+extern fn r4os_rust_module_file_range(*const NativeSource, usize, [*]u8, usize, Bytes, bool) Output;
+extern fn r4os_rust_module_file_exact(*const NativeSource, usize, [*]u8, usize, Bytes, bool) bool;
+extern fn r4os_rust_module_file_find([*]const MetadataWindow, usize, usize) usize;
+extern fn r4os_rust_module_file_replace([*]const MetadataWindow) usize;
+extern fn r4os_rust_module_file_reset([*]MetadataWindow, *u64) void;
+extern fn r4os_rust_module_file_cached([*]MetadataWindow, *u64, usize, usize, [*]u8, usize, *const NativeIo) bool;
+pub fn nativeSource(source: FileSource) NativeSource {
+    return .{ .volume = vfs.nativeVolume(source.volume), .entry = vfs.nativeEntry(source.entry), .drive = source.drive_letter };
+}
+pub fn sourceFromNative(source: NativeSource) FileSource {
+    return .{ .volume = vfs.volumeFromNative(source.volume), .entry = vfs.entryFromNative(source.entry), .drive_letter = source.drive };
+}
+fn bytes(value: []const u8) Bytes {
+    return .{ .data = value.ptr, .len = value.len };
+}
 pub fn stats() Stats {
-    return stats_state;
+    var out: Stats = undefined;
+    r4os_rust_module_file_stats(&out);
+    return out;
 }
-
 pub fn readRange(req: RangeReadRequest) ?usize {
-    if (req.out.len == 0) return 0;
-    var fs_req = fs_request.beginVolume(.loader_read, req.source.drive_letter, req.source.volume) orelse {
-        stats_state.read_failures += 1;
-        logFailure(req.verbose, req.name, "request");
-        return null;
-    };
-    var ok = false;
-    const len = vfs.readFileRange(req.source.volume, req.source.entry, req.offset, req.out) orelse {
-        fs_request.finish(&fs_req, ok);
-        stats_state.read_failures += 1;
-        logFailure(req.verbose, req.name, "read");
-        return null;
-    };
-    ok = true;
-    fs_request.finish(&fs_req, ok);
-    stats_state.range_reads += 1;
-    stats_state.range_read_bytes +|= len;
-    return len;
+    // An empty request never inspects even an undefined source. Conditional
+    // marshalling retains this property; native Rust owns the empty result.
+    var source: NativeSource = undefined;
+    if (req.out.len != 0) source = nativeSource(req.source);
+    const result = r4os_rust_module_file_range(&source, req.offset, req.out.ptr, req.out.len, bytes(req.name), req.verbose);
+    return if (result.present) result.len else null;
 }
-
 pub fn readExact(req: RangeReadRequest) bool {
-    const len = readRange(req) orelse return false;
-    if (len != req.out.len) {
-        noteShortRead(req.verbose, req.name, req.offset, req.out.len, len);
-        return false;
-    }
-    return true;
+    var source: NativeSource = undefined;
+    if (req.out.len != 0) source = nativeSource(req.source);
+    return r4os_rust_module_file_exact(&source, req.offset, req.out.ptr, req.out.len, bytes(req.name), req.verbose);
 }
-
-const MetadataWindow = struct {
+const MetadataWindow = extern struct {
     valid: bool = false,
     offset: usize = 0,
     len: usize = 0,
     stamp: u64 = 0,
     bytes: [metadata_window_size]u8 = .{0} ** metadata_window_size,
-
-    fn contains(self: *const MetadataWindow, offset: usize, len: usize) bool {
-        if (!self.valid or offset < self.offset) return false;
-        const local = offset - self.offset;
-        return local <= self.len and len <= self.len - local;
-    }
 };
-
-/// Bounded, caller-owned R4M0 metadata reader. It never allocates, never owns
-/// file state globally and performs a direct exact read for requests larger
-/// than one window. Callers keep one instance for one coherent load attempt.
 pub const BoundedReader = struct {
     source: FileSource,
     file_size: usize,
@@ -126,147 +114,76 @@ pub const BoundedReader = struct {
     stamp: u64 = 0,
 
     pub fn init(source: FileSource, file_size: usize) BoundedReader {
-        stats_state.metadata_reader_initializations +|= 1;
-        return .{
-            .source = source,
-            .file_size = file_size,
-        };
+        r4os_rust_module_file_note_init();
+        return .{ .source = source, .file_size = file_size };
     }
-
-    /// Initialize private caller storage without a temporary copy of its
-    /// two windows. Bytes are read only after a successful window fill.
     pub fn reset(self: *BoundedReader, source: FileSource, file_size: usize) void {
-        stats_state.metadata_reader_initializations +|= 1;
         self.source = source;
         self.file_size = file_size;
-        self.stamp = 0;
-        for (&self.windows) |*window| {
-            window.valid = false;
-            window.offset = 0;
-            window.len = 0;
-            window.stamp = 0;
-        }
+        r4os_rust_module_file_reset(&self.windows, &self.stamp);
     }
-
     pub fn readExactAt(self: *BoundedReader, offset: usize, out: []u8, name: []const u8, verbose: bool) bool {
-        stats_state.metadata_logical_reads +|= 1;
-        stats_state.metadata_logical_bytes +|= out.len;
-        if (out.len == 0) return offset <= self.file_size;
-        if (offset > self.file_size or out.len > self.file_size - offset) {
-            stats_state.read_failures +|= 1;
-            logBoundsFailure(verbose, name, offset, out.len, self.file_size);
-            return false;
-        }
-
-        if (out.len > metadata_window_size) {
-            stats_state.metadata_direct_reads +|= 1;
-            stats_state.metadata_direct_bytes +|= out.len;
-            return readExact(.{
-                .source = self.source,
-                .offset = offset,
-                .out = out,
-                .name = name,
-                .verbose = verbose,
-            });
-        }
-
-        if (self.findWindow(offset, out.len)) |index| {
-            const window = &self.windows[index];
-            const local = offset - window.offset;
-            @memcpy(out, window.bytes[local .. local + out.len]);
-            stats_state.metadata_window_hits +|= 1;
-            self.touch(index);
-            return true;
-        }
-
-        const index = self.replacementWindow();
-        const wanted = @min(metadata_window_size, self.file_size - offset);
-        var window = &self.windows[index];
-        window.valid = false;
-        const len = readRange(.{
-            .source = self.source,
-            .offset = offset,
-            .out = window.bytes[0..wanted],
-            .name = name,
-            .verbose = verbose,
-        }) orelse return false;
-        stats_state.metadata_window_fills +|= 1;
-        stats_state.metadata_window_fill_bytes +|= len;
-        if (len < out.len) {
-            noteShortRead(verbose, name, offset, out.len, len);
-            return false;
-        }
-        window.offset = offset;
-        window.len = len;
-        window.valid = true;
-        self.touch(index);
-        @memcpy(out, window.bytes[0..out.len]);
-        return true;
+        const Context = struct {
+            source: *const FileSource,
+            name: []const u8,
+            verbose: bool,
+            fn read(pointer: ?*anyopaque, read_offset: usize, buffer: [*]u8, len: usize) callconv(.c) Output {
+                const context: *const @This() = @ptrCast(@alignCast(pointer.?));
+                const got = readRange(.{ .source = context.source.*, .offset = read_offset, .out = buffer[0..len], .name = context.name, .verbose = context.verbose }) orelse return .{ .len = 0, .present = false };
+                return .{ .len = got, .present = true };
+            }
+        };
+        var context: Context = .{ .source = &self.source, .name = name, .verbose = verbose };
+        const io: NativeIo = .{ .context = &context, .read = Context.read, .name = bytes(name), .verbose = verbose };
+        return r4os_rust_module_file_cached(&self.windows, &self.stamp, self.file_size, offset, out.ptr, out.len, &io);
     }
-
     fn findWindow(self: *const BoundedReader, offset: usize, len: usize) ?usize {
-        for (&self.windows, 0..) |*window, index| {
-            if (window.contains(offset, len)) return index;
-        }
-        return null;
+        const index = r4os_rust_module_file_find(&self.windows, offset, len);
+        return if (index == @import("std").math.maxInt(usize)) null else index;
     }
-
     fn replacementWindow(self: *const BoundedReader) usize {
-        for (&self.windows, 0..) |*window, index| {
-            if (!window.valid) return index;
-        }
-        var oldest: usize = 0;
-        var index: usize = 1;
-        while (index < self.windows.len) : (index += 1) {
-            if (self.windows[index].stamp < self.windows[oldest].stamp) oldest = index;
-        }
-        return oldest;
-    }
-
-    fn touch(self: *BoundedReader, index: usize) void {
-        self.stamp +%= 1;
-        if (self.stamp == 0) {
-            for (&self.windows) |*window| window.stamp = 0;
-            self.stamp = 1;
-        }
-        self.windows[index].stamp = self.stamp;
+        return r4os_rust_module_file_replace(&self.windows);
     }
 };
-
-fn noteShortRead(verbose: bool, name: []const u8, offset: usize, wanted: usize, got: usize) void {
-    stats_state.short_reads +|= 1;
+export fn r4os_zig_module_file_log(kind: u8, name_ptr: [*]const u8, name_len: usize, verbose: bool, offset: usize, wanted: usize, got: usize) void {
     if (!verbose) return;
-    k.puts("[MODFILE] short read ");
-    k.puts(name);
-    k.puts(" offset=");
-    k.putDec(@intCast(offset));
-    k.puts(" want=");
-    k.putDec(@intCast(wanted));
-    k.puts(" got=");
-    k.putDec(@intCast(got));
+    const name = name_ptr[0..name_len];
+    switch (kind) {
+        0, 1 => {
+            k.puts("[MODFILE] ");
+            k.puts(if (kind == 0) "request" else "read");
+            k.puts(" failed ");
+            k.puts(name);
+        },
+        2 => {
+            k.puts("[MODFILE] short read ");
+            k.puts(name);
+            k.puts(" offset=");
+            k.putDec(@intCast(offset));
+            k.puts(" want=");
+            k.putDec(@intCast(wanted));
+            k.puts(" got=");
+            k.putDec(@intCast(got));
+        },
+        3 => {
+            k.puts("[MODFILE] range failed ");
+            k.puts(name);
+            k.puts(" offset=");
+            k.putDec(@intCast(offset));
+            k.puts(" len=");
+            k.putDec(@intCast(wanted));
+            k.puts(" file=");
+            k.putDec(@intCast(got));
+        },
+        else => unreachable,
+    }
     k.puts("\r\n");
 }
-
-fn logBoundsFailure(verbose: bool, name: []const u8, offset: usize, len: usize, file_size: usize) void {
-    if (!verbose) return;
-    k.puts("[MODFILE] range failed ");
-    k.puts(name);
-    k.puts(" offset=");
-    k.putDec(@intCast(offset));
-    k.puts(" len=");
-    k.putDec(@intCast(len));
-    k.puts(" file=");
-    k.putDec(@intCast(file_size));
-    k.puts("\r\n");
-}
-
-fn logFailure(verbose: bool, name: []const u8, phase: []const u8) void {
-    if (!verbose) return;
-    k.puts("[MODFILE] ");
-    k.puts(phase);
-    k.puts(" failed ");
-    k.puts(name);
-    k.puts("\r\n");
+comptime {
+    if (@intFromEnum(fs_request.Kind.loader_read) != 19 or @intFromEnum(drive.Role.ram) != 3 or
+        @sizeOf(Stats) != 192 or @sizeOf(NativeSource) != 936 or @offsetOf(NativeSource, "entry") != 88 or @offsetOf(NativeSource, "drive") != 928 or
+        @sizeOf(MetadataWindow) != 4128 or @offsetOf(MetadataWindow, "valid") != 0 or @offsetOf(MetadataWindow, "offset") != 8 or @offsetOf(MetadataWindow, "len") != 16 or @offsetOf(MetadataWindow, "stamp") != 24 or @offsetOf(MetadataWindow, "bytes") != 32 or
+        @sizeOf(NativeIo) != 40 or @sizeOf(Output) != 16) @compileError("private module-file layout");
 }
 
 test "metadata windows use exact containment and bounded LRU replacement" {
