@@ -1,5 +1,5 @@
 //! Original virtual windows, range validation and first-fit placement.
-//! The legacy pager still owns its range table until the shared VM cutover.
+//! The native pager and placement share one resident range owner.
 use super::layout;
 #[repr(C)]
 pub struct Window {
@@ -67,9 +67,33 @@ pub struct AddressRecord {
     pub len: u64,
     pub window: u8,
 }
-unsafe extern "C" {
-    fn r4os_zig_vm_fit_start(base: u64, count: *mut usize) -> usize;
-    fn r4os_zig_vm_fit_record(position: usize, output: *mut AddressRecord) -> bool;
+unsafe fn fit_start(base: u64, count: *mut usize) -> usize {
+    unsafe { count.write(super::vm_index::r4os_rust_vm_index_query(5, 0)) };
+    if base == 0 {
+        0
+    } else {
+        unsafe { super::vm_index::r4os_rust_vm_index_query(3, base) }
+    }
+}
+unsafe fn fit_record(position: usize, output: *mut AddressRecord) -> bool {
+    if position >= unsafe { super::vm_index::r4os_rust_vm_index_query(5, 0) } {
+        return false;
+    }
+    let slot = super::vm_index::neighbors(position)
+        .1
+        .expect("VM address index");
+    let range = super::vm_ranges::read(slot);
+    if !range.active() {
+        return false;
+    }
+    unsafe {
+        output.write(AddressRecord {
+            base: range.base,
+            len: range.len,
+            window: range.window,
+        })
+    };
+    true
 }
 const EMPTY: u32 = 3;
 const ALIGNMENT: u32 = 4;
@@ -165,10 +189,10 @@ pub unsafe extern "C" fn r4os_rust_vm_first_fit(
         return OVERFLOW;
     };
     let mut count = 0;
-    let start = unsafe { r4os_zig_vm_fit_start(definition.base, &mut count) };
+    let start = unsafe { fit_start(definition.base, &mut count) };
     for position in start..count {
         let mut record = core::mem::MaybeUninit::<AddressRecord>::uninit();
-        if !unsafe { r4os_zig_vm_fit_record(position, record.as_mut_ptr()) } {
+        if !unsafe { fit_record(position, record.as_mut_ptr()) } {
             return OVERFLOW;
         }
         let record = unsafe { record.assume_init() };

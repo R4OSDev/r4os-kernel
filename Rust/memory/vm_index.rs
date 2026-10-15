@@ -369,6 +369,9 @@ pub(super) fn neighbors(position: usize) -> (Option<usize>, Option<usize>) {
         )
     })
 }
+pub(super) fn position(slot: usize) -> Option<usize> {
+    state(|state| (state.positions[slot] != u16::MAX).then(|| usize::from(state.positions[slot])))
+}
 /// # Safety
 /// Singleton BSP initialization; outputs are live C pointer slots. The caller
 /// reads these resident arrays only while it retains the VM owner.

@@ -91,7 +91,27 @@ pub mod sched {
     pub use crate::{scheduler, scheduler_types, task, task_context, task_index, wait_node};
     pub use crate::{sync_locks, sync_objects, sync_types, sync_wait};
 }
+#[path = "../../../Rust/memory/backing_types.rs"]
+pub mod backing_types;
+#[path = "../../../Rust/memory/backing_store.rs"]
+pub mod backing_store;
+#[path = "../../../Rust/memory/reclaim.rs"]
+pub mod reclaim;
+#[path = "../../../Rust/memory/vm_pager_types.rs"]
+pub mod vm_pager_types;
+#[path = "../../../Rust/memory/vm_page_state.rs"]
+pub mod vm_page_state;
+#[path = "../../../Rust/memory/vm_pager.rs"]
+pub mod vm_pager;
+#[path = "../../../Rust/memory/vm_pager_api.rs"]
+pub mod vm_pager_api;
+#[path = "../../../Rust/memory/vm_pager_diagnostics.rs"]
+pub mod vm_pager_diagnostics;
 pub mod memory {
+    pub use crate::{
+        backing_types, backing_store, reclaim, vm_pager_types, vm_page_state, vm_pager,
+        vm_pager_api, vm_pager_diagnostics,
+    };
     pub use crate::{
         blocks, heap, layout, owner, paging, phys, virt_policy, vm_query, vm_ranges,
         vm_transactions,

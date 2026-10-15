@@ -11,9 +11,6 @@ use super::{
 };
 use core::mem::MaybeUninit;
 const OUT_OF_MEMORY: u32 = 12;
-unsafe extern "C" {
-    fn r4os_zig_vm_reclaim(reason: u32, frames: u32) -> u32;
-}
 pub(super) fn block_error(code: u32) -> u32 {
     match code {
         1..=3 => code,
@@ -84,7 +81,7 @@ fn extent(range: Range, requested: u64, reason: u32) -> Result<phys::Extent, u32
                 if owner::named(5).held() {
                     return Err(OUT_OF_MEMORY);
                 }
-                if unsafe { r4os_zig_vm_reclaim(reason, wanted as u32) } != 0 {
+                if reclaim_pressure(reason, wanted as u32) != 0 {
                     continue;
                 }
             }
@@ -136,7 +133,7 @@ fn frame(range: Range, reason: u32) -> Result<phys::Extent, u32> {
                 if owner::named(5).held() {
                     return Err(OUT_OF_MEMORY);
                 }
-                if unsafe { r4os_zig_vm_reclaim(reason, 1) } != 0 {
+                if reclaim_pressure(reason, 1) != 0 {
                     attempts = 1;
                     continue;
                 }
@@ -298,4 +295,10 @@ pub unsafe extern "C" fn r4os_rust_vm_uncommit_extent(
     }
     release.commit();
     0
+}
+
+fn reclaim_pressure(reason: u32, frames: u32) -> u32 {
+    let mut result = super::reclaim::Result::INIT;
+    unsafe { super::reclaim::r4os_rust_reclaim_frames(reason, frames, 0, false, &mut result) };
+    result.returned_frames
 }

@@ -1,4 +1,7 @@
 const std = @import("std");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
 pub const PAGE_BYTES: u64 = 4096;
 pub const SLOT_BYTES: u64 = PAGE_BYTES;
@@ -533,220 +536,6 @@ pub const PageIoSummary = struct {
     data_lost_pages: u64 = 0,
 };
 
-const SlotExtent = struct {
-    reservation_id: u32 = 0,
-    owner_kind: u32 = 0,
-    owner_id: u32 = 0,
-    region_id: u32 = 0,
-    start_slot: u64 = 0,
-    slot_count: u64 = 0,
-    state: u32 = 0,
-    // Stable for the reservation lifetime; resetting its content starts a new
-    // incarnation. Unrelated table changes and page I/O do not invalidate it.
-    generation: u64 = 0,
-};
-
-var state: Summary = .{};
-var slot_state: SlotSummary = .{};
-var pager_gate_state: PagerGateSummary = .{};
-var page_io_state: PageIoSummary = .{};
-var slot_extents: [SLOT_TABLE_MAX_RANGES]SlotExtent = .{SlotExtent{}} ** SLOT_TABLE_MAX_RANGES;
-var active_first_cluster: u32 = 0;
-var active_file_size: u64 = 0;
-var active_cluster_bytes: u32 = 0;
-var active_capacity_slots: u64 = 0;
-var active_backing_path: [MAX_BACKING_PATH:0]u8 = .{0} ** MAX_BACKING_PATH;
-var active_backing_path_valid = false;
-var slot_generation: u64 = 0;
-var next_reservation_id: u32 = 1;
-
-pub fn probe(input: Input) Result {
-    var result = Result{
-        .requested_bytes = input.requested_bytes,
-        .file_size = input.file_size,
-        .cluster_bytes = input.cluster_bytes,
-        .first_cluster = input.first_cluster,
-    };
-
-    if ((input.flags & ~supported_probe_flags) != 0) {
-        result.status = status_unsupported_flags;
-        result.blockers |= blocker_unsupported_flags;
-        record(result);
-        return result;
-    }
-
-    if (input.requested_bytes == 0) {
-        result.status = status_invalid_request;
-        result.blockers |= blocker_invalid_request;
-        record(result);
-        return result;
-    }
-
-    if ((input.requested_bytes & (PAGE_BYTES - 1)) != 0) {
-        result.status = status_invalid_request;
-        result.blockers |= blocker_unaligned_request;
-        record(result);
-        return result;
-    }
-    result.flags |= flag_page_aligned_request;
-
-    if (!input.fat32) {
-        result.status = status_unsupported_fs;
-        result.blockers |= blocker_unsupported_fs;
-        record(result);
-        return result;
-    }
-    result.flags |= flag_fat32;
-
-    if (!input.file_exists) {
-        result.status = status_missing_file;
-        result.blockers |= blocker_missing_file;
-        record(result);
-        return result;
-    }
-
-    if (input.is_dir) {
-        result.status = status_directory;
-        result.blockers |= blocker_directory;
-        record(result);
-        return result;
-    }
-
-    result.flags |= flag_file_backed | flag_existing_file;
-    result.available_bytes = input.file_size;
-    if (input.file_size < input.requested_bytes) {
-        result.status = status_too_small;
-        result.blockers |= blocker_too_small;
-        record(result);
-        return result;
-    }
-
-    result.status = status_ready;
-    if (input.path) |path| {
-        const len = std.mem.len(path);
-        if (len >= result.path.len) {
-            result.status = status_invalid_request;
-            result.blockers |= blocker_invalid_request;
-            record(result);
-            return result;
-        }
-        @memcpy(result.path[0..len], path[0..len]);
-    }
-    record(result);
-    return result;
-}
-
-pub fn summary() Summary {
-    return state;
-}
-
-pub fn activeBackingPath() ?[*:0]const u8 {
-    if (!active_backing_path_valid) return null;
-    return @ptrCast(&active_backing_path);
-}
-
-pub fn activeBackingResult() ?Result {
-    if (!active_backing_path_valid or active_capacity_slots == 0 or active_file_size == 0) return null;
-    const available_bytes = active_capacity_slots * SLOT_BYTES;
-    return .{
-        .path = active_backing_path,
-        .status = status_ready,
-        .flags = flag_file_backed |
-            flag_existing_file |
-            flag_fat32 |
-            flag_reserve_only |
-            flag_pager_disabled |
-            flag_uses_fs_api |
-            flag_no_second_io_path |
-            flag_page_aligned_request,
-        .requested_bytes = available_bytes,
-        .available_bytes = available_bytes,
-        .file_size = active_file_size,
-        .cluster_bytes = active_cluster_bytes,
-        .first_cluster = active_first_cluster,
-    };
-}
-
-pub fn slotProbe(input: SlotInput) SlotResult {
-    var result = SlotResult{
-        .operation = input.operation,
-        .requested_slots = input.requested_slots,
-        .reservation_id = input.reservation_id,
-        .owner_kind = input.owner_kind,
-        .owner_id = input.owner_id,
-        .region_id = input.region_id,
-    };
-
-    if ((input.flags & ~supported_slot_flags) != 0) {
-        result.status = slot_status_unsupported_flags;
-        result.blockers |= slot_blocker_unsupported_flags;
-        recordSlot(&result);
-        return result;
-    }
-
-    if (!validSlotOwnerKind(input.owner_kind)) {
-        result.status = slot_status_invalid_request;
-        result.blockers |= slot_blocker_invalid_owner;
-        recordSlot(&result);
-        return result;
-    }
-
-    if (input.backing.status != status_ready) {
-        result.status = slot_status_backing_unavailable;
-        result.blockers |= slot_blocker_backing_not_ready;
-        recordSlot(&result);
-        return result;
-    }
-    result.flags |= slot_flag_file_backed | slot_flag_backing_ready;
-
-    if ((input.backing.available_bytes & (SLOT_BYTES - 1)) != 0) {
-        result.status = slot_status_invalid_request;
-        result.blockers |= slot_blocker_unaligned_backing;
-        recordSlot(&result);
-        return result;
-    }
-
-    const capacity_slots = input.backing.available_bytes / SLOT_BYTES;
-    if (capacity_slots == 0) {
-        result.status = slot_status_invalid_request;
-        result.blockers |= slot_blocker_zero_capacity;
-        recordSlot(&result);
-        return result;
-    }
-
-    if (!ensureSlotBacking(input.backing, capacity_slots)) {
-        result.status = slot_status_backing_unavailable;
-        result.blockers |= slot_blocker_backing_not_ready;
-        result.capacity_slots = active_capacity_slots;
-        fillSlotCounts(&result);
-        recordSlot(&result);
-        return result;
-    }
-    result.capacity_slots = active_capacity_slots;
-    fillSlotCounts(&result);
-
-    switch (input.operation) {
-        slot_operation_probe => {
-            result.status = slot_status_ready;
-        },
-        slot_operation_reserve => reserveSlots(input, &result),
-        slot_operation_release => releaseSlots(input, &result),
-        slot_operation_mark_error => markSlotsError(input, &result),
-        slot_operation_recover => recoverSlots(input, &result),
-        else => {
-            result.status = slot_status_unsupported_operation;
-            result.blockers |= slot_blocker_unsupported_operation;
-        },
-    }
-
-    fillSlotCounts(&result);
-    recordSlot(&result);
-    return result;
-}
-
-pub fn slotSummary() SlotSummary {
-    return slot_state;
-}
 
 pub const LifecycleCleanupResult = struct {
     cleanup_count: u64 = 0,
@@ -757,1061 +546,1443 @@ pub const LifecycleCleanupResult = struct {
     released_error_slots: u64 = 0,
 };
 
-pub fn releaseR4xOwner(owner_id: u32) LifecycleCleanupResult {
-    var result = cleanupOwner(slot_owner_kind_r4x_instance, owner_id);
-    const vm_result = cleanupOwner(slot_owner_kind_vm_region, owner_id);
-    result.cleanup_count +%= vm_result.cleanup_count;
-    result.released_ranges +%= vm_result.released_ranges;
-    result.released_slots +%= vm_result.released_slots;
-    result.released_valid_slots +%= vm_result.released_valid_slots;
-    result.released_dirty_slots +%= vm_result.released_dirty_slots;
-    result.released_error_slots +%= vm_result.released_error_slots;
-    return result;
+// One native metadata owner. The existing VM lock also admits passive
+// snapshots and lifecycle cleanup; no backing lock survives file I/O.
+const AdmissionToken = extern struct {
+    flags: u64 = 0,
+    cpu_index: u32 = 0,
+    previous_rank: u8 = 0,
+    outermost: bool = false,
+};
+extern fn r4os_rust_backing_acquire(*AdmissionToken) callconv(.c) void;
+extern fn r4os_rust_backing_release(*const AdmissionToken) callconv(.c) void;
+fn enter() AdmissionToken {
+    if (@import("builtin").is_test) return .{};
+    var token: AdmissionToken = undefined;
+    r4os_rust_backing_acquire(&token);
+    return token;
+}
+fn leave(token: AdmissionToken) void {
+    if (!@import("builtin").is_test) r4os_rust_backing_release(&token);
+}
+comptime {
+    if (@sizeOf(AdmissionToken) != 16 or @alignOf(AdmissionToken) != 8 or
+        @offsetOf(AdmissionToken, "cpu_index") != 8 or @offsetOf(AdmissionToken, "previous_rank") != 12 or
+        @offsetOf(AdmissionToken, "outermost") != 13) @compileError("Native existing VM owner token geometry");
 }
 
-pub fn releaseVmRegion(owner_id: u32, region_id: u32) LifecycleCleanupResult {
-    var result = cleanupRegion(slot_owner_kind_vm_region, owner_id, region_id);
-    const instance_result = cleanupRegion(slot_owner_kind_r4x_instance, owner_id, region_id);
-    result.cleanup_count +%= instance_result.cleanup_count;
-    result.released_ranges +%= instance_result.released_ranges;
-    result.released_slots +%= instance_result.released_slots;
-    result.released_valid_slots +%= instance_result.released_valid_slots;
-    result.released_dirty_slots +%= instance_result.released_dirty_slots;
-    result.released_error_slots +%= instance_result.released_error_slots;
-    return result;
+const RawInput = extern struct {
+    requested_bytes: u64,
+    flags: u32,
+    path: ?[*:0]const u8,
+    file_exists: bool,
+    is_dir: bool,
+    fat32: bool,
+    file_size: u64,
+    cluster_bytes: u32,
+    first_cluster: u32,
+};
+fn rawInput(value: Input) RawInput {
+    return .{
+        .requested_bytes = value.requested_bytes,
+        .flags = value.flags,
+        .path = value.path,
+        .file_exists = value.file_exists,
+        .is_dir = value.is_dir,
+        .fat32 = value.fat32,
+        .file_size = value.file_size,
+        .cluster_bytes = value.cluster_bytes,
+        .first_cluster = value.first_cluster,
+    };
 }
-
+fn fromRawInput(value: RawInput) Input {
+    return .{
+        .requested_bytes = value.requested_bytes,
+        .flags = value.flags,
+        .path = value.path,
+        .file_exists = value.file_exists,
+        .is_dir = value.is_dir,
+        .fat32 = value.fat32,
+        .file_size = value.file_size,
+        .cluster_bytes = value.cluster_bytes,
+        .first_cluster = value.first_cluster,
+    };
+}
+const RawResult = extern struct {
+    path: [MAX_BACKING_PATH:0]u8,
+    status: u32,
+    flags: u32,
+    blockers: u32,
+    requested_bytes: u64,
+    available_bytes: u64,
+    file_size: u64,
+    cluster_bytes: u32,
+    first_cluster: u32,
+    pager_enabled: u32,
+    anonymous_paging_enabled: u32,
+};
+fn rawResult(value: Result) RawResult {
+    return .{
+        .path = value.path,
+        .status = value.status,
+        .flags = value.flags,
+        .blockers = value.blockers,
+        .requested_bytes = value.requested_bytes,
+        .available_bytes = value.available_bytes,
+        .file_size = value.file_size,
+        .cluster_bytes = value.cluster_bytes,
+        .first_cluster = value.first_cluster,
+        .pager_enabled = value.pager_enabled,
+        .anonymous_paging_enabled = value.anonymous_paging_enabled,
+    };
+}
+fn fromRawResult(value: RawResult) Result {
+    return .{
+        .path = value.path,
+        .status = value.status,
+        .flags = value.flags,
+        .blockers = value.blockers,
+        .requested_bytes = value.requested_bytes,
+        .available_bytes = value.available_bytes,
+        .file_size = value.file_size,
+        .cluster_bytes = value.cluster_bytes,
+        .first_cluster = value.first_cluster,
+        .pager_enabled = value.pager_enabled,
+        .anonymous_paging_enabled = value.anonymous_paging_enabled,
+    };
+}
+const RawSummary = extern struct {
+    enabled: bool,
+    probes: u64,
+    ready: u64,
+    failures: u64,
+    last_status: u32,
+    last_flags: u32,
+    last_blockers: u32,
+    last_requested_bytes: u64,
+    last_available_bytes: u64,
+    last_file_size: u64,
+    last_cluster_bytes: u32,
+    last_first_cluster: u32,
+};
+fn rawSummary(value: Summary) RawSummary {
+    return .{
+        .enabled = value.enabled,
+        .probes = value.probes,
+        .ready = value.ready,
+        .failures = value.failures,
+        .last_status = value.last_status,
+        .last_flags = value.last_flags,
+        .last_blockers = value.last_blockers,
+        .last_requested_bytes = value.last_requested_bytes,
+        .last_available_bytes = value.last_available_bytes,
+        .last_file_size = value.last_file_size,
+        .last_cluster_bytes = value.last_cluster_bytes,
+        .last_first_cluster = value.last_first_cluster,
+    };
+}
+fn fromRawSummary(value: RawSummary) Summary {
+    return .{
+        .enabled = value.enabled,
+        .probes = value.probes,
+        .ready = value.ready,
+        .failures = value.failures,
+        .last_status = value.last_status,
+        .last_flags = value.last_flags,
+        .last_blockers = value.last_blockers,
+        .last_requested_bytes = value.last_requested_bytes,
+        .last_available_bytes = value.last_available_bytes,
+        .last_file_size = value.last_file_size,
+        .last_cluster_bytes = value.last_cluster_bytes,
+        .last_first_cluster = value.last_first_cluster,
+    };
+}
+const RawSlotInput = extern struct {
+    operation: u32,
+    requested_slots: u64,
+    reservation_id: u32,
+    owner_kind: u32,
+    owner_id: u32,
+    region_id: u32,
+    flags: u32,
+    backing: RawResult,
+};
+fn rawSlotInput(value: SlotInput) RawSlotInput {
+    return .{
+        .operation = value.operation,
+        .requested_slots = value.requested_slots,
+        .reservation_id = value.reservation_id,
+        .owner_kind = value.owner_kind,
+        .owner_id = value.owner_id,
+        .region_id = value.region_id,
+        .flags = value.flags,
+        .backing = rawResult(value.backing),
+    };
+}
+fn fromRawSlotInput(value: RawSlotInput) SlotInput {
+    return .{
+        .operation = value.operation,
+        .requested_slots = value.requested_slots,
+        .reservation_id = value.reservation_id,
+        .owner_kind = value.owner_kind,
+        .owner_id = value.owner_id,
+        .region_id = value.region_id,
+        .flags = value.flags,
+        .backing = fromRawResult(value.backing),
+    };
+}
+const RawSlotResult = extern struct {
+    version: u32,
+    status: u32,
+    operation: u32,
+    flags: u32,
+    blockers: u32,
+    slot_bytes: u32,
+    capacity_slots: u64,
+    requested_slots: u64,
+    reserved_slots: u64,
+    free_slots: u64,
+    valid_slots: u64,
+    dirty_slots: u64,
+    error_slots: u64,
+    range_count: u32,
+    max_ranges: u32,
+    reservation_id: u32,
+    owner_kind: u32,
+    owner_id: u32,
+    region_id: u32,
+    first_slot: u64,
+    slot_count: u64,
+    generation: u64,
+    pager_enabled: u32,
+    eviction_enabled: u32,
+    page_in_enabled: u32,
+    page_out_enabled: u32,
+    total_probes: u64,
+    total_reserves: u64,
+    total_releases: u64,
+    total_error_marks: u64,
+    total_recoveries: u64,
+    total_failures: u64,
+};
+fn rawSlotResult(value: SlotResult) RawSlotResult {
+    return .{
+        .version = value.version,
+        .status = value.status,
+        .operation = value.operation,
+        .flags = value.flags,
+        .blockers = value.blockers,
+        .slot_bytes = value.slot_bytes,
+        .capacity_slots = value.capacity_slots,
+        .requested_slots = value.requested_slots,
+        .reserved_slots = value.reserved_slots,
+        .free_slots = value.free_slots,
+        .valid_slots = value.valid_slots,
+        .dirty_slots = value.dirty_slots,
+        .error_slots = value.error_slots,
+        .range_count = value.range_count,
+        .max_ranges = value.max_ranges,
+        .reservation_id = value.reservation_id,
+        .owner_kind = value.owner_kind,
+        .owner_id = value.owner_id,
+        .region_id = value.region_id,
+        .first_slot = value.first_slot,
+        .slot_count = value.slot_count,
+        .generation = value.generation,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .total_probes = value.total_probes,
+        .total_reserves = value.total_reserves,
+        .total_releases = value.total_releases,
+        .total_error_marks = value.total_error_marks,
+        .total_recoveries = value.total_recoveries,
+        .total_failures = value.total_failures,
+    };
+}
+fn fromRawSlotResult(value: RawSlotResult) SlotResult {
+    return .{
+        .version = value.version,
+        .status = value.status,
+        .operation = value.operation,
+        .flags = value.flags,
+        .blockers = value.blockers,
+        .slot_bytes = value.slot_bytes,
+        .capacity_slots = value.capacity_slots,
+        .requested_slots = value.requested_slots,
+        .reserved_slots = value.reserved_slots,
+        .free_slots = value.free_slots,
+        .valid_slots = value.valid_slots,
+        .dirty_slots = value.dirty_slots,
+        .error_slots = value.error_slots,
+        .range_count = value.range_count,
+        .max_ranges = value.max_ranges,
+        .reservation_id = value.reservation_id,
+        .owner_kind = value.owner_kind,
+        .owner_id = value.owner_id,
+        .region_id = value.region_id,
+        .first_slot = value.first_slot,
+        .slot_count = value.slot_count,
+        .generation = value.generation,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .total_probes = value.total_probes,
+        .total_reserves = value.total_reserves,
+        .total_releases = value.total_releases,
+        .total_error_marks = value.total_error_marks,
+        .total_recoveries = value.total_recoveries,
+        .total_failures = value.total_failures,
+    };
+}
+const RawSlotSummary = extern struct {
+    enabled: bool,
+    last_status: u32,
+    last_operation: u32,
+    last_flags: u32,
+    last_blockers: u32,
+    slot_bytes: u32,
+    capacity_slots: u64,
+    reserved_slots: u64,
+    free_slots: u64,
+    valid_slots: u64,
+    dirty_slots: u64,
+    error_slots: u64,
+    range_count: u32,
+    max_ranges: u32,
+    last_reservation_id: u32,
+    last_owner_kind: u32,
+    last_owner_id: u32,
+    last_region_id: u32,
+    last_first_slot: u64,
+    last_slot_count: u64,
+    generation: u64,
+    probes: u64,
+    reserves: u64,
+    releases: u64,
+    error_marks: u64,
+    recoveries: u64,
+    failures: u64,
+    lifecycle_cleanups: u64,
+    lifecycle_released_ranges: u64,
+    lifecycle_released_slots: u64,
+};
+fn rawSlotSummary(value: SlotSummary) RawSlotSummary {
+    return .{
+        .enabled = value.enabled,
+        .last_status = value.last_status,
+        .last_operation = value.last_operation,
+        .last_flags = value.last_flags,
+        .last_blockers = value.last_blockers,
+        .slot_bytes = value.slot_bytes,
+        .capacity_slots = value.capacity_slots,
+        .reserved_slots = value.reserved_slots,
+        .free_slots = value.free_slots,
+        .valid_slots = value.valid_slots,
+        .dirty_slots = value.dirty_slots,
+        .error_slots = value.error_slots,
+        .range_count = value.range_count,
+        .max_ranges = value.max_ranges,
+        .last_reservation_id = value.last_reservation_id,
+        .last_owner_kind = value.last_owner_kind,
+        .last_owner_id = value.last_owner_id,
+        .last_region_id = value.last_region_id,
+        .last_first_slot = value.last_first_slot,
+        .last_slot_count = value.last_slot_count,
+        .generation = value.generation,
+        .probes = value.probes,
+        .reserves = value.reserves,
+        .releases = value.releases,
+        .error_marks = value.error_marks,
+        .recoveries = value.recoveries,
+        .failures = value.failures,
+        .lifecycle_cleanups = value.lifecycle_cleanups,
+        .lifecycle_released_ranges = value.lifecycle_released_ranges,
+        .lifecycle_released_slots = value.lifecycle_released_slots,
+    };
+}
+fn fromRawSlotSummary(value: RawSlotSummary) SlotSummary {
+    return .{
+        .enabled = value.enabled,
+        .last_status = value.last_status,
+        .last_operation = value.last_operation,
+        .last_flags = value.last_flags,
+        .last_blockers = value.last_blockers,
+        .slot_bytes = value.slot_bytes,
+        .capacity_slots = value.capacity_slots,
+        .reserved_slots = value.reserved_slots,
+        .free_slots = value.free_slots,
+        .valid_slots = value.valid_slots,
+        .dirty_slots = value.dirty_slots,
+        .error_slots = value.error_slots,
+        .range_count = value.range_count,
+        .max_ranges = value.max_ranges,
+        .last_reservation_id = value.last_reservation_id,
+        .last_owner_kind = value.last_owner_kind,
+        .last_owner_id = value.last_owner_id,
+        .last_region_id = value.last_region_id,
+        .last_first_slot = value.last_first_slot,
+        .last_slot_count = value.last_slot_count,
+        .generation = value.generation,
+        .probes = value.probes,
+        .reserves = value.reserves,
+        .releases = value.releases,
+        .error_marks = value.error_marks,
+        .recoveries = value.recoveries,
+        .failures = value.failures,
+        .lifecycle_cleanups = value.lifecycle_cleanups,
+        .lifecycle_released_ranges = value.lifecycle_released_ranges,
+        .lifecycle_released_slots = value.lifecycle_released_slots,
+    };
+}
+const RawPagerGateInput = extern struct {
+    requested_bytes: u64,
+    region_id: u32,
+    owner_id: u32,
+    flags: u32,
+    vm_region_exists: bool,
+    vm_region_is_r4x: bool,
+    committed_bytes: u64,
+    resident_bytes: u64,
+    fault_count: u64,
+    failed_faults: u64,
+    backing: RawResult,
+};
+fn rawPagerGateInput(value: PagerGateInput) RawPagerGateInput {
+    return .{
+        .requested_bytes = value.requested_bytes,
+        .region_id = value.region_id,
+        .owner_id = value.owner_id,
+        .flags = value.flags,
+        .vm_region_exists = value.vm_region_exists,
+        .vm_region_is_r4x = value.vm_region_is_r4x,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .fault_count = value.fault_count,
+        .failed_faults = value.failed_faults,
+        .backing = rawResult(value.backing),
+    };
+}
+fn fromRawPagerGateInput(value: RawPagerGateInput) PagerGateInput {
+    return .{
+        .requested_bytes = value.requested_bytes,
+        .region_id = value.region_id,
+        .owner_id = value.owner_id,
+        .flags = value.flags,
+        .vm_region_exists = value.vm_region_exists,
+        .vm_region_is_r4x = value.vm_region_is_r4x,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .fault_count = value.fault_count,
+        .failed_faults = value.failed_faults,
+        .backing = fromRawResult(value.backing),
+    };
+}
+const RawPagerGateResult = extern struct {
+    version: u32,
+    status: u32,
+    flags: u32,
+    blockers: u32,
+    region_id: u32,
+    owner_id: u32,
+    slot_bytes: u32,
+    reserved0: u32,
+    requested_bytes: u64,
+    committed_bytes: u64,
+    resident_bytes: u64,
+    nonresident_bytes: u64,
+    requested_slots: u64,
+    prepared_slots: u64,
+    capacity_slots: u64,
+    free_before_slots: u64,
+    free_after_slots: u64,
+    reserved_before_slots: u64,
+    reserved_after_slots: u64,
+    slot_reservation_id: u32,
+    rollback_completed: u32,
+    commit_gate_enabled: u32,
+    fault_gate_enabled: u32,
+    pager_enabled: u32,
+    eviction_enabled: u32,
+    page_in_enabled: u32,
+    page_out_enabled: u32,
+    slot_generation: u64,
+    fault_count: u64,
+    failed_faults: u64,
+    total_probes: u64,
+    total_ready: u64,
+    total_rollbacks: u64,
+    total_failures: u64,
+};
+fn rawPagerGateResult(value: PagerGateResult) RawPagerGateResult {
+    return .{
+        .version = value.version,
+        .status = value.status,
+        .flags = value.flags,
+        .blockers = value.blockers,
+        .region_id = value.region_id,
+        .owner_id = value.owner_id,
+        .slot_bytes = value.slot_bytes,
+        .reserved0 = value.reserved0,
+        .requested_bytes = value.requested_bytes,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .nonresident_bytes = value.nonresident_bytes,
+        .requested_slots = value.requested_slots,
+        .prepared_slots = value.prepared_slots,
+        .capacity_slots = value.capacity_slots,
+        .free_before_slots = value.free_before_slots,
+        .free_after_slots = value.free_after_slots,
+        .reserved_before_slots = value.reserved_before_slots,
+        .reserved_after_slots = value.reserved_after_slots,
+        .slot_reservation_id = value.slot_reservation_id,
+        .rollback_completed = value.rollback_completed,
+        .commit_gate_enabled = value.commit_gate_enabled,
+        .fault_gate_enabled = value.fault_gate_enabled,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .slot_generation = value.slot_generation,
+        .fault_count = value.fault_count,
+        .failed_faults = value.failed_faults,
+        .total_probes = value.total_probes,
+        .total_ready = value.total_ready,
+        .total_rollbacks = value.total_rollbacks,
+        .total_failures = value.total_failures,
+    };
+}
+fn fromRawPagerGateResult(value: RawPagerGateResult) PagerGateResult {
+    return .{
+        .version = value.version,
+        .status = value.status,
+        .flags = value.flags,
+        .blockers = value.blockers,
+        .region_id = value.region_id,
+        .owner_id = value.owner_id,
+        .slot_bytes = value.slot_bytes,
+        .reserved0 = value.reserved0,
+        .requested_bytes = value.requested_bytes,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .nonresident_bytes = value.nonresident_bytes,
+        .requested_slots = value.requested_slots,
+        .prepared_slots = value.prepared_slots,
+        .capacity_slots = value.capacity_slots,
+        .free_before_slots = value.free_before_slots,
+        .free_after_slots = value.free_after_slots,
+        .reserved_before_slots = value.reserved_before_slots,
+        .reserved_after_slots = value.reserved_after_slots,
+        .slot_reservation_id = value.slot_reservation_id,
+        .rollback_completed = value.rollback_completed,
+        .commit_gate_enabled = value.commit_gate_enabled,
+        .fault_gate_enabled = value.fault_gate_enabled,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .slot_generation = value.slot_generation,
+        .fault_count = value.fault_count,
+        .failed_faults = value.failed_faults,
+        .total_probes = value.total_probes,
+        .total_ready = value.total_ready,
+        .total_rollbacks = value.total_rollbacks,
+        .total_failures = value.total_failures,
+    };
+}
+const RawPagerGateSummary = extern struct {
+    enabled: bool,
+    last_status: u32,
+    last_flags: u32,
+    last_blockers: u32,
+    last_region_id: u32,
+    last_owner_id: u32,
+    requested_bytes: u64,
+    committed_bytes: u64,
+    resident_bytes: u64,
+    nonresident_bytes: u64,
+    requested_slots: u64,
+    prepared_slots: u64,
+    capacity_slots: u64,
+    free_before_slots: u64,
+    free_after_slots: u64,
+    reserved_before_slots: u64,
+    reserved_after_slots: u64,
+    last_reservation_id: u32,
+    rollback_completed: u32,
+    commit_gate_enabled: u32,
+    fault_gate_enabled: u32,
+    pager_enabled: u32,
+    eviction_enabled: u32,
+    page_in_enabled: u32,
+    page_out_enabled: u32,
+    slot_generation: u64,
+    fault_count: u64,
+    failed_faults: u64,
+    probes: u64,
+    ready: u64,
+    rollbacks: u64,
+    failures: u64,
+};
+fn rawPagerGateSummary(value: PagerGateSummary) RawPagerGateSummary {
+    return .{
+        .enabled = value.enabled,
+        .last_status = value.last_status,
+        .last_flags = value.last_flags,
+        .last_blockers = value.last_blockers,
+        .last_region_id = value.last_region_id,
+        .last_owner_id = value.last_owner_id,
+        .requested_bytes = value.requested_bytes,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .nonresident_bytes = value.nonresident_bytes,
+        .requested_slots = value.requested_slots,
+        .prepared_slots = value.prepared_slots,
+        .capacity_slots = value.capacity_slots,
+        .free_before_slots = value.free_before_slots,
+        .free_after_slots = value.free_after_slots,
+        .reserved_before_slots = value.reserved_before_slots,
+        .reserved_after_slots = value.reserved_after_slots,
+        .last_reservation_id = value.last_reservation_id,
+        .rollback_completed = value.rollback_completed,
+        .commit_gate_enabled = value.commit_gate_enabled,
+        .fault_gate_enabled = value.fault_gate_enabled,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .slot_generation = value.slot_generation,
+        .fault_count = value.fault_count,
+        .failed_faults = value.failed_faults,
+        .probes = value.probes,
+        .ready = value.ready,
+        .rollbacks = value.rollbacks,
+        .failures = value.failures,
+    };
+}
+fn fromRawPagerGateSummary(value: RawPagerGateSummary) PagerGateSummary {
+    return .{
+        .enabled = value.enabled,
+        .last_status = value.last_status,
+        .last_flags = value.last_flags,
+        .last_blockers = value.last_blockers,
+        .last_region_id = value.last_region_id,
+        .last_owner_id = value.last_owner_id,
+        .requested_bytes = value.requested_bytes,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .nonresident_bytes = value.nonresident_bytes,
+        .requested_slots = value.requested_slots,
+        .prepared_slots = value.prepared_slots,
+        .capacity_slots = value.capacity_slots,
+        .free_before_slots = value.free_before_slots,
+        .free_after_slots = value.free_after_slots,
+        .reserved_before_slots = value.reserved_before_slots,
+        .reserved_after_slots = value.reserved_after_slots,
+        .last_reservation_id = value.last_reservation_id,
+        .rollback_completed = value.rollback_completed,
+        .commit_gate_enabled = value.commit_gate_enabled,
+        .fault_gate_enabled = value.fault_gate_enabled,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .slot_generation = value.slot_generation,
+        .fault_count = value.fault_count,
+        .failed_faults = value.failed_faults,
+        .probes = value.probes,
+        .ready = value.ready,
+        .rollbacks = value.rollbacks,
+        .failures = value.failures,
+    };
+}
+const RawPageIoInput = extern struct {
+    operation: u32,
+    region_id: u32,
+    region_offset: u64,
+    reservation_id: u32,
+    slot_index: u64,
+    page_count: u64,
+    owner_kind: u32,
+    owner_id: u32,
+    expected_generation: u64,
+    flags: u32,
+    vm_region_exists: bool,
+    vm_region_is_r4x: bool,
+    commit_covered: bool,
+    committed_bytes: u64,
+    resident_bytes: u64,
+    backing: RawResult,
+    io_status: i32,
+    io_bytes: u32,
+};
+fn rawPageIoInput(value: PageIoInput) RawPageIoInput {
+    return .{
+        .operation = value.operation,
+        .region_id = value.region_id,
+        .region_offset = value.region_offset,
+        .reservation_id = value.reservation_id,
+        .slot_index = value.slot_index,
+        .page_count = value.page_count,
+        .owner_kind = value.owner_kind,
+        .owner_id = value.owner_id,
+        .expected_generation = value.expected_generation,
+        .flags = value.flags,
+        .vm_region_exists = value.vm_region_exists,
+        .vm_region_is_r4x = value.vm_region_is_r4x,
+        .commit_covered = value.commit_covered,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .backing = rawResult(value.backing),
+        .io_status = value.io_status,
+        .io_bytes = value.io_bytes,
+    };
+}
+fn fromRawPageIoInput(value: RawPageIoInput) PageIoInput {
+    return .{
+        .operation = value.operation,
+        .region_id = value.region_id,
+        .region_offset = value.region_offset,
+        .reservation_id = value.reservation_id,
+        .slot_index = value.slot_index,
+        .page_count = value.page_count,
+        .owner_kind = value.owner_kind,
+        .owner_id = value.owner_id,
+        .expected_generation = value.expected_generation,
+        .flags = value.flags,
+        .vm_region_exists = value.vm_region_exists,
+        .vm_region_is_r4x = value.vm_region_is_r4x,
+        .commit_covered = value.commit_covered,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .backing = fromRawResult(value.backing),
+        .io_status = value.io_status,
+        .io_bytes = value.io_bytes,
+    };
+}
+const RawPageIoResult = extern struct {
+    version: u32,
+    status: u32,
+    operation: u32,
+    flags: u32,
+    blockers: u32,
+    region_id: u32,
+    reservation_id: u32,
+    owner_kind: u32,
+    owner_id: u32,
+    slot_bytes: u32,
+    reserved0: u32,
+    region_offset: u64,
+    committed_bytes: u64,
+    resident_bytes: u64,
+    slot_index: u64,
+    page_count: u64,
+    transfer_bytes: u64,
+    expected_generation: u64,
+    backing_slot: u64,
+    backing_offset: u64,
+    capacity_slots: u64,
+    reserved_slots: u64,
+    valid_slots: u64,
+    dirty_slots: u64,
+    error_slots: u64,
+    io_bytes: u32,
+    io_status: i32,
+    pager_enabled: u32,
+    eviction_enabled: u32,
+    page_in_enabled: u32,
+    page_out_enabled: u32,
+    retry_limit: u32,
+    backoff_ticks: u32,
+    slot_generation: u64,
+    total_prepares: u64,
+    total_page_outs: u64,
+    total_page_ins: u64,
+    total_failures: u64,
+    total_retry_attempts: u64,
+    total_retryable_failures: u64,
+    total_permanent_failures: u64,
+    total_retry_limit_hits: u64,
+    total_failed_page_outs: u64,
+    total_failed_page_ins: u64,
+    total_data_preserved_pages: u64,
+    total_data_lost_pages: u64,
+};
+fn rawPageIoResult(value: PageIoResult) RawPageIoResult {
+    return .{
+        .version = value.version,
+        .status = value.status,
+        .operation = value.operation,
+        .flags = value.flags,
+        .blockers = value.blockers,
+        .region_id = value.region_id,
+        .reservation_id = value.reservation_id,
+        .owner_kind = value.owner_kind,
+        .owner_id = value.owner_id,
+        .slot_bytes = value.slot_bytes,
+        .reserved0 = value.reserved0,
+        .region_offset = value.region_offset,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .slot_index = value.slot_index,
+        .page_count = value.page_count,
+        .transfer_bytes = value.transfer_bytes,
+        .expected_generation = value.expected_generation,
+        .backing_slot = value.backing_slot,
+        .backing_offset = value.backing_offset,
+        .capacity_slots = value.capacity_slots,
+        .reserved_slots = value.reserved_slots,
+        .valid_slots = value.valid_slots,
+        .dirty_slots = value.dirty_slots,
+        .error_slots = value.error_slots,
+        .io_bytes = value.io_bytes,
+        .io_status = value.io_status,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .retry_limit = value.retry_limit,
+        .backoff_ticks = value.backoff_ticks,
+        .slot_generation = value.slot_generation,
+        .total_prepares = value.total_prepares,
+        .total_page_outs = value.total_page_outs,
+        .total_page_ins = value.total_page_ins,
+        .total_failures = value.total_failures,
+        .total_retry_attempts = value.total_retry_attempts,
+        .total_retryable_failures = value.total_retryable_failures,
+        .total_permanent_failures = value.total_permanent_failures,
+        .total_retry_limit_hits = value.total_retry_limit_hits,
+        .total_failed_page_outs = value.total_failed_page_outs,
+        .total_failed_page_ins = value.total_failed_page_ins,
+        .total_data_preserved_pages = value.total_data_preserved_pages,
+        .total_data_lost_pages = value.total_data_lost_pages,
+    };
+}
+fn fromRawPageIoResult(value: RawPageIoResult) PageIoResult {
+    return .{
+        .version = value.version,
+        .status = value.status,
+        .operation = value.operation,
+        .flags = value.flags,
+        .blockers = value.blockers,
+        .region_id = value.region_id,
+        .reservation_id = value.reservation_id,
+        .owner_kind = value.owner_kind,
+        .owner_id = value.owner_id,
+        .slot_bytes = value.slot_bytes,
+        .reserved0 = value.reserved0,
+        .region_offset = value.region_offset,
+        .committed_bytes = value.committed_bytes,
+        .resident_bytes = value.resident_bytes,
+        .slot_index = value.slot_index,
+        .page_count = value.page_count,
+        .transfer_bytes = value.transfer_bytes,
+        .expected_generation = value.expected_generation,
+        .backing_slot = value.backing_slot,
+        .backing_offset = value.backing_offset,
+        .capacity_slots = value.capacity_slots,
+        .reserved_slots = value.reserved_slots,
+        .valid_slots = value.valid_slots,
+        .dirty_slots = value.dirty_slots,
+        .error_slots = value.error_slots,
+        .io_bytes = value.io_bytes,
+        .io_status = value.io_status,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .retry_limit = value.retry_limit,
+        .backoff_ticks = value.backoff_ticks,
+        .slot_generation = value.slot_generation,
+        .total_prepares = value.total_prepares,
+        .total_page_outs = value.total_page_outs,
+        .total_page_ins = value.total_page_ins,
+        .total_failures = value.total_failures,
+        .total_retry_attempts = value.total_retry_attempts,
+        .total_retryable_failures = value.total_retryable_failures,
+        .total_permanent_failures = value.total_permanent_failures,
+        .total_retry_limit_hits = value.total_retry_limit_hits,
+        .total_failed_page_outs = value.total_failed_page_outs,
+        .total_failed_page_ins = value.total_failed_page_ins,
+        .total_data_preserved_pages = value.total_data_preserved_pages,
+        .total_data_lost_pages = value.total_data_lost_pages,
+    };
+}
+const RawPageIoSummary = extern struct {
+    enabled: bool,
+    last_status: u32,
+    last_operation: u32,
+    last_flags: u32,
+    last_blockers: u32,
+    last_region_id: u32,
+    last_reservation_id: u32,
+    last_owner_kind: u32,
+    last_owner_id: u32,
+    region_offset: u64,
+    page_count: u64,
+    transfer_bytes: u64,
+    expected_generation: u64,
+    backing_slot: u64,
+    backing_offset: u64,
+    io_bytes: u32,
+    io_status: i32,
+    capacity_slots: u64,
+    reserved_slots: u64,
+    valid_slots: u64,
+    dirty_slots: u64,
+    error_slots: u64,
+    pager_enabled: u32,
+    eviction_enabled: u32,
+    page_in_enabled: u32,
+    page_out_enabled: u32,
+    retry_limit: u32,
+    backoff_ticks: u32,
+    slot_generation: u64,
+    prepares: u64,
+    page_outs: u64,
+    page_ins: u64,
+    failures: u64,
+    retry_attempts: u64,
+    retryable_failures: u64,
+    permanent_failures: u64,
+    retry_limit_hits: u64,
+    failed_page_outs: u64,
+    failed_page_ins: u64,
+    data_preserved_pages: u64,
+    data_lost_pages: u64,
+};
+fn rawPageIoSummary(value: PageIoSummary) RawPageIoSummary {
+    return .{
+        .enabled = value.enabled,
+        .last_status = value.last_status,
+        .last_operation = value.last_operation,
+        .last_flags = value.last_flags,
+        .last_blockers = value.last_blockers,
+        .last_region_id = value.last_region_id,
+        .last_reservation_id = value.last_reservation_id,
+        .last_owner_kind = value.last_owner_kind,
+        .last_owner_id = value.last_owner_id,
+        .region_offset = value.region_offset,
+        .page_count = value.page_count,
+        .transfer_bytes = value.transfer_bytes,
+        .expected_generation = value.expected_generation,
+        .backing_slot = value.backing_slot,
+        .backing_offset = value.backing_offset,
+        .io_bytes = value.io_bytes,
+        .io_status = value.io_status,
+        .capacity_slots = value.capacity_slots,
+        .reserved_slots = value.reserved_slots,
+        .valid_slots = value.valid_slots,
+        .dirty_slots = value.dirty_slots,
+        .error_slots = value.error_slots,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .retry_limit = value.retry_limit,
+        .backoff_ticks = value.backoff_ticks,
+        .slot_generation = value.slot_generation,
+        .prepares = value.prepares,
+        .page_outs = value.page_outs,
+        .page_ins = value.page_ins,
+        .failures = value.failures,
+        .retry_attempts = value.retry_attempts,
+        .retryable_failures = value.retryable_failures,
+        .permanent_failures = value.permanent_failures,
+        .retry_limit_hits = value.retry_limit_hits,
+        .failed_page_outs = value.failed_page_outs,
+        .failed_page_ins = value.failed_page_ins,
+        .data_preserved_pages = value.data_preserved_pages,
+        .data_lost_pages = value.data_lost_pages,
+    };
+}
+fn fromRawPageIoSummary(value: RawPageIoSummary) PageIoSummary {
+    return .{
+        .enabled = value.enabled,
+        .last_status = value.last_status,
+        .last_operation = value.last_operation,
+        .last_flags = value.last_flags,
+        .last_blockers = value.last_blockers,
+        .last_region_id = value.last_region_id,
+        .last_reservation_id = value.last_reservation_id,
+        .last_owner_kind = value.last_owner_kind,
+        .last_owner_id = value.last_owner_id,
+        .region_offset = value.region_offset,
+        .page_count = value.page_count,
+        .transfer_bytes = value.transfer_bytes,
+        .expected_generation = value.expected_generation,
+        .backing_slot = value.backing_slot,
+        .backing_offset = value.backing_offset,
+        .io_bytes = value.io_bytes,
+        .io_status = value.io_status,
+        .capacity_slots = value.capacity_slots,
+        .reserved_slots = value.reserved_slots,
+        .valid_slots = value.valid_slots,
+        .dirty_slots = value.dirty_slots,
+        .error_slots = value.error_slots,
+        .pager_enabled = value.pager_enabled,
+        .eviction_enabled = value.eviction_enabled,
+        .page_in_enabled = value.page_in_enabled,
+        .page_out_enabled = value.page_out_enabled,
+        .retry_limit = value.retry_limit,
+        .backoff_ticks = value.backoff_ticks,
+        .slot_generation = value.slot_generation,
+        .prepares = value.prepares,
+        .page_outs = value.page_outs,
+        .page_ins = value.page_ins,
+        .failures = value.failures,
+        .retry_attempts = value.retry_attempts,
+        .retryable_failures = value.retryable_failures,
+        .permanent_failures = value.permanent_failures,
+        .retry_limit_hits = value.retry_limit_hits,
+        .failed_page_outs = value.failed_page_outs,
+        .failed_page_ins = value.failed_page_ins,
+        .data_preserved_pages = value.data_preserved_pages,
+        .data_lost_pages = value.data_lost_pages,
+    };
+}
+const RawLifecycleCleanupResult = extern struct {
+    cleanup_count: u64,
+    released_ranges: u64,
+    released_slots: u64,
+    released_valid_slots: u64,
+    released_dirty_slots: u64,
+    released_error_slots: u64,
+};
+fn rawLifecycleCleanupResult(value: LifecycleCleanupResult) RawLifecycleCleanupResult {
+    return .{
+        .cleanup_count = value.cleanup_count,
+        .released_ranges = value.released_ranges,
+        .released_slots = value.released_slots,
+        .released_valid_slots = value.released_valid_slots,
+        .released_dirty_slots = value.released_dirty_slots,
+        .released_error_slots = value.released_error_slots,
+    };
+}
+fn fromRawLifecycleCleanupResult(value: RawLifecycleCleanupResult) LifecycleCleanupResult {
+    return .{
+        .cleanup_count = value.cleanup_count,
+        .released_ranges = value.released_ranges,
+        .released_slots = value.released_slots,
+        .released_valid_slots = value.released_valid_slots,
+        .released_dirty_slots = value.released_dirty_slots,
+        .released_error_slots = value.released_error_slots,
+    };
+}
+extern fn r4os_rust_backing_probe(*const RawInput, *RawResult) callconv(.c) void;
+pub fn probe(input: Input) Result {
+    const token = enter();
+    defer leave(token);
+    const raw = rawInput(input);
+    var output: RawResult = undefined;
+    r4os_rust_backing_probe(&raw, &output);
+    return fromRawResult(output);
+}
+extern fn r4os_rust_backing_slot_probe(*const RawSlotInput, *RawSlotResult) callconv(.c) void;
+pub fn slotProbe(input: SlotInput) SlotResult {
+    const token = enter();
+    defer leave(token);
+    const raw = rawSlotInput(input);
+    var output: RawSlotResult = undefined;
+    r4os_rust_backing_slot_probe(&raw, &output);
+    return fromRawSlotResult(output);
+}
+extern fn r4os_rust_backing_pager_gate_probe(*const RawPagerGateInput, *RawPagerGateResult) callconv(.c) void;
 pub fn pagerGateProbe(input: PagerGateInput) PagerGateResult {
-    const nonresident_bytes = if (input.committed_bytes > input.resident_bytes) input.committed_bytes - input.resident_bytes else 0;
-    var result = PagerGateResult{
-        .region_id = input.region_id,
-        .owner_id = input.owner_id,
-        .requested_bytes = if (input.requested_bytes != 0) input.requested_bytes else nonresident_bytes,
-        .committed_bytes = input.committed_bytes,
-        .resident_bytes = input.resident_bytes,
-        .nonresident_bytes = nonresident_bytes,
-        .fault_count = input.fault_count,
-        .failed_faults = input.failed_faults,
-    };
-
-    if ((input.flags & ~supported_pager_gate_flags) != 0) {
-        result.status = pager_gate_status_unsupported_flags;
-        result.blockers |= pager_gate_blocker_unsupported_flags;
-        recordPagerGate(&result);
-        return result;
-    }
-
-    if (!input.vm_region_exists) {
-        result.status = pager_gate_status_vm_region_missing;
-        result.blockers |= pager_gate_blocker_vm_region_missing;
-        recordPagerGate(&result);
-        return result;
-    }
-    result.flags |= pager_gate_flag_vm_region_attached;
-
-    if (!input.vm_region_is_r4x) {
-        result.status = pager_gate_status_invalid_request;
-        result.blockers |= pager_gate_blocker_vm_region_not_r4x;
-        recordPagerGate(&result);
-        return result;
-    }
-
-    if (input.backing.status != status_ready) {
-        result.status = pager_gate_status_backing_unavailable;
-        result.blockers |= pager_gate_blocker_backing_not_ready;
-        recordPagerGate(&result);
-        return result;
-    }
-    result.flags |= pager_gate_flag_file_backed | pager_gate_flag_backing_ready;
-
-    if (result.requested_bytes == 0) {
-        result.status = pager_gate_status_no_nonresident_commit;
-        result.blockers |= pager_gate_blocker_no_nonresident_commit;
-        recordPagerGate(&result);
-        return result;
-    }
-
-    if ((result.requested_bytes & (PAGE_BYTES - 1)) != 0) {
-        result.status = pager_gate_status_invalid_request;
-        result.blockers |= pager_gate_blocker_unaligned_request;
-        recordPagerGate(&result);
-        return result;
-    }
-
-    const requested_slots = result.requested_bytes / SLOT_BYTES;
-    result.requested_slots = requested_slots;
-    const probe_result = slotProbe(.{
-        .operation = slot_operation_probe,
-        .requested_slots = 0,
-        .reservation_id = 0,
-        .owner_id = input.owner_id,
-        .flags = 0,
-        .backing = input.backing,
-    });
-    result.capacity_slots = probe_result.capacity_slots;
-    result.free_before_slots = probe_result.free_slots;
-    result.reserved_before_slots = probe_result.reserved_slots;
-    result.free_after_slots = probe_result.free_slots;
-    result.reserved_after_slots = probe_result.reserved_slots;
-    result.slot_generation = probe_result.generation;
-
-    if (probe_result.status != slot_status_ready) {
-        mapSlotFailureToPagerGate(probe_result, &result);
-        recordPagerGate(&result);
-        return result;
-    }
-
-    if (requested_slots > probe_result.free_slots) {
-        result.status = pager_gate_status_insufficient_capacity;
-        result.blockers |= pager_gate_blocker_insufficient_capacity;
-        recordPagerGate(&result);
-        return result;
-    }
-
-    const reserve_result = slotProbe(.{
-        .operation = slot_operation_reserve,
-        .requested_slots = requested_slots,
-        .reservation_id = 0,
-        .owner_id = input.owner_id,
-        .flags = 0,
-        .backing = input.backing,
-    });
-    result.capacity_slots = reserve_result.capacity_slots;
-    result.free_after_slots = reserve_result.free_slots;
-    result.reserved_after_slots = reserve_result.reserved_slots;
-    result.slot_generation = reserve_result.generation;
-    result.slot_reservation_id = reserve_result.reservation_id;
-
-    if (reserve_result.status != slot_status_reserved) {
-        mapSlotFailureToPagerGate(reserve_result, &result);
-        recordPagerGate(&result);
-        return result;
-    }
-    result.flags |= pager_gate_flag_slot_reservation_tested;
-    result.prepared_slots = reserve_result.slot_count;
-
-    const release_result = slotProbe(.{
-        .operation = slot_operation_release,
-        .requested_slots = 0,
-        .reservation_id = reserve_result.reservation_id,
-        .owner_id = input.owner_id,
-        .flags = 0,
-        .backing = input.backing,
-    });
-    result.capacity_slots = release_result.capacity_slots;
-    result.free_after_slots = release_result.free_slots;
-    result.reserved_after_slots = release_result.reserved_slots;
-    result.slot_generation = release_result.generation;
-
-    if (release_result.status != slot_status_released) {
-        result.status = pager_gate_status_rollback_failed;
-        result.blockers |= pager_gate_blocker_rollback_failed;
-        recordPagerGate(&result);
-        return result;
-    }
-
-    result.status = pager_gate_status_ready;
-    result.flags |= pager_gate_flag_rollback_complete;
-    result.rollback_completed = 1;
-    result.slot_reservation_id = release_result.reservation_id;
-
-    const final_probe = slotProbe(.{
-        .operation = slot_operation_probe,
-        .requested_slots = 0,
-        .reservation_id = 0,
-        .owner_id = input.owner_id,
-        .flags = 0,
-        .backing = input.backing,
-    });
-    result.capacity_slots = final_probe.capacity_slots;
-    result.free_after_slots = final_probe.free_slots;
-    result.reserved_after_slots = final_probe.reserved_slots;
-    result.slot_generation = final_probe.generation;
-
-    recordPagerGate(&result);
-    return result;
+    const token = enter();
+    defer leave(token);
+    const raw = rawPagerGateInput(input);
+    var output: RawPagerGateResult = undefined;
+    r4os_rust_backing_pager_gate_probe(&raw, &output);
+    return fromRawPagerGateResult(output);
 }
-
-pub fn pagerGateSummary() PagerGateSummary {
-    return pager_gate_state;
-}
-
+extern fn r4os_rust_backing_page_io_prepare(*const RawPageIoInput, *RawPageIoResult) callconv(.c) void;
 pub fn pageIoPrepare(input: PageIoInput) PageIoResult {
-    var result = makePageIoResult(input);
-    const extent_index = validatePageIo(input, &result) orelse {
-        recordPageIo(&result);
-        return result;
-    };
-    const extent = slot_extents[extent_index];
-    fillPageIoSlotState(&result);
-    result.status = page_io_status_ready;
-    result.backing_slot = extent.start_slot + input.slot_index;
-    result.backing_offset = result.backing_slot * SLOT_BYTES;
-    recordPageIo(&result);
-    return result;
+    const token = enter();
+    defer leave(token);
+    const raw = rawPageIoInput(input);
+    var output: RawPageIoResult = undefined;
+    r4os_rust_backing_page_io_prepare(&raw, &output);
+    return fromRawPageIoResult(output);
 }
-
+extern fn r4os_rust_backing_page_io_complete(*const RawPageIoInput, *RawPageIoResult) callconv(.c) void;
 pub fn pageIoComplete(input: PageIoInput) PageIoResult {
-    var result = makePageIoResult(input);
-    const extent_index = validatePageIo(input, &result) orelse {
-        recordPageIo(&result);
-        return result;
-    };
-    var extent = &slot_extents[extent_index];
-    fillPageIoSlotState(&result);
-    result.backing_slot = extent.start_slot + input.slot_index;
-    result.backing_offset = result.backing_slot * SLOT_BYTES;
-    result.io_status = input.io_status;
-    result.io_bytes = input.io_bytes;
-
-    const expected_io_status: i32 = @intCast(result.transfer_bytes);
-    if (input.io_status != expected_io_status or @as(u64, input.io_bytes) != result.transfer_bytes) {
-        extent.state |= extent_state_error;
-        slot_generation +%= 1;
-        result.slot_generation = slot_generation;
-        if (input.io_status > 0 or input.io_bytes != 0) {
-            result.status = page_io_status_partial_io;
-            result.blockers |= page_io_blocker_partial_io;
-        } else {
-            result.status = page_io_status_io_failed;
-            result.blockers |= page_io_blocker_io_failed;
-        }
-        fillPageIoSlotState(&result);
-        recordPageIo(&result);
-        return result;
-    }
-
-    switch (input.operation) {
-        page_io_operation_page_out => {
-            extent.state |= extent_state_valid;
-            extent.state &= ~extent_state_dirty;
-            slot_generation +%= 1;
-            result.status = page_io_status_page_out_ok;
-            result.flags |= page_io_flag_slot_valid | page_io_flag_slot_clean;
-        },
-        page_io_operation_page_in => {
-            result.status = page_io_status_page_in_ok;
-        },
-        else => {
-            result.status = page_io_status_invalid_request;
-            result.blockers |= page_io_blocker_invalid_request;
-        },
-    }
-    result.slot_generation = slot_generation;
-    fillPageIoSlotState(&result);
-    recordPageIo(&result);
-    return result;
+    const token = enter();
+    defer leave(token);
+    const raw = rawPageIoInput(input);
+    var output: RawPageIoResult = undefined;
+    r4os_rust_backing_page_io_complete(&raw, &output);
+    return fromRawPageIoResult(output);
 }
-
+extern fn r4os_rust_backing_summary(*RawSummary) callconv(.c) void;
+pub fn summary() Summary {
+    const token = enter();
+    defer leave(token);
+    var output: RawSummary = undefined;
+    r4os_rust_backing_summary(&output);
+    return fromRawSummary(output);
+}
+extern fn r4os_rust_backing_slot_summary(*RawSlotSummary) callconv(.c) void;
+pub fn slotSummary() SlotSummary {
+    const token = enter();
+    defer leave(token);
+    var output: RawSlotSummary = undefined;
+    r4os_rust_backing_slot_summary(&output);
+    return fromRawSlotSummary(output);
+}
+extern fn r4os_rust_backing_pager_gate_summary(*RawPagerGateSummary) callconv(.c) void;
+pub fn pagerGateSummary() PagerGateSummary {
+    const token = enter();
+    defer leave(token);
+    var output: RawPagerGateSummary = undefined;
+    r4os_rust_backing_pager_gate_summary(&output);
+    return fromRawPagerGateSummary(output);
+}
+extern fn r4os_rust_backing_page_io_summary(*RawPageIoSummary) callconv(.c) void;
 pub fn pageIoSummary() PageIoSummary {
-    return page_io_state;
+    const token = enter();
+    defer leave(token);
+    var output: RawPageIoSummary = undefined;
+    r4os_rust_backing_page_io_summary(&output);
+    return fromRawPageIoSummary(output);
+}
+extern fn r4os_rust_backing_release_r4x_owner(owner_id: u32, output: *RawLifecycleCleanupResult) callconv(.c) void;
+pub fn releaseR4xOwner(owner_id: u32) LifecycleCleanupResult {
+    const token = enter();
+    defer leave(token);
+    var output: RawLifecycleCleanupResult = undefined;
+    r4os_rust_backing_release_r4x_owner(owner_id, &output);
+    return fromRawLifecycleCleanupResult(output);
+}
+extern fn r4os_rust_backing_release_vm_region(owner_id: u32, region_id: u32, output: *RawLifecycleCleanupResult) callconv(.c) void;
+pub fn releaseVmRegion(owner_id: u32, region_id: u32) LifecycleCleanupResult {
+    const token = enter();
+    defer leave(token);
+    var output: RawLifecycleCleanupResult = undefined;
+    r4os_rust_backing_release_vm_region(owner_id, region_id, &output);
+    return fromRawLifecycleCleanupResult(output);
+}
+extern fn r4os_rust_backing_active_path() callconv(.c) ?[*:0]const u8;
+pub fn activeBackingPath() ?[*:0]const u8 {
+    const token = enter();
+    defer leave(token);
+    return r4os_rust_backing_active_path();
+}
+extern fn r4os_rust_backing_active_result(*RawResult) callconv(.c) bool;
+pub fn activeBackingResult() ?Result {
+    const token = enter();
+    defer leave(token);
+    var output: RawResult = undefined;
+    return if (r4os_rust_backing_active_result(&output)) fromRawResult(output) else null;
 }
 
-fn record(result: Result) void {
-    state.enabled = true;
-    state.probes +%= 1;
-    if (result.status == status_ready) {
-        state.ready +%= 1;
-    } else {
-        state.failures +%= 1;
-    }
-    state.last_status = result.status;
-    state.last_flags = result.flags;
-    state.last_blockers = result.blockers;
-    state.last_requested_bytes = result.requested_bytes;
-    state.last_available_bytes = result.available_bytes;
-    state.last_file_size = result.file_size;
-    state.last_cluster_bytes = result.cluster_bytes;
-    state.last_first_cluster = result.first_cluster;
+comptime {
+    if (@sizeOf(RawInput) != 48 or @alignOf(RawInput) != 8) @compileError("Native backing Input geometry");
+    if (@offsetOf(RawInput, "requested_bytes") != 0) @compileError("Native backing Input.requested_bytes offset");
+    if (@offsetOf(RawInput, "flags") != 8) @compileError("Native backing Input.flags offset");
+    if (@offsetOf(RawInput, "path") != 16) @compileError("Native backing Input.path offset");
+    if (@offsetOf(RawInput, "file_exists") != 24) @compileError("Native backing Input.file_exists offset");
+    if (@offsetOf(RawInput, "is_dir") != 25) @compileError("Native backing Input.is_dir offset");
+    if (@offsetOf(RawInput, "fat32") != 26) @compileError("Native backing Input.fat32 offset");
+    if (@offsetOf(RawInput, "file_size") != 32) @compileError("Native backing Input.file_size offset");
+    if (@offsetOf(RawInput, "cluster_bytes") != 40) @compileError("Native backing Input.cluster_bytes offset");
+    if (@offsetOf(RawInput, "first_cluster") != 44) @compileError("Native backing Input.first_cluster offset");
+    if (@sizeOf(RawResult) != 184 or @alignOf(RawResult) != 8) @compileError("Native backing Result geometry");
+    if (@offsetOf(RawResult, "path") != 0) @compileError("Native backing Result.path offset");
+    if (@offsetOf(RawResult, "status") != 132) @compileError("Native backing Result.status offset");
+    if (@offsetOf(RawResult, "flags") != 136) @compileError("Native backing Result.flags offset");
+    if (@offsetOf(RawResult, "blockers") != 140) @compileError("Native backing Result.blockers offset");
+    if (@offsetOf(RawResult, "requested_bytes") != 144) @compileError("Native backing Result.requested_bytes offset");
+    if (@offsetOf(RawResult, "available_bytes") != 152) @compileError("Native backing Result.available_bytes offset");
+    if (@offsetOf(RawResult, "file_size") != 160) @compileError("Native backing Result.file_size offset");
+    if (@offsetOf(RawResult, "cluster_bytes") != 168) @compileError("Native backing Result.cluster_bytes offset");
+    if (@offsetOf(RawResult, "first_cluster") != 172) @compileError("Native backing Result.first_cluster offset");
+    if (@offsetOf(RawResult, "pager_enabled") != 176) @compileError("Native backing Result.pager_enabled offset");
+    if (@offsetOf(RawResult, "anonymous_paging_enabled") != 180) @compileError("Native backing Result.anonymous_paging_enabled offset");
+    if (@sizeOf(RawSummary) != 80 or @alignOf(RawSummary) != 8) @compileError("Native backing Summary geometry");
+    if (@offsetOf(RawSummary, "enabled") != 0) @compileError("Native backing Summary.enabled offset");
+    if (@offsetOf(RawSummary, "probes") != 8) @compileError("Native backing Summary.probes offset");
+    if (@offsetOf(RawSummary, "ready") != 16) @compileError("Native backing Summary.ready offset");
+    if (@offsetOf(RawSummary, "failures") != 24) @compileError("Native backing Summary.failures offset");
+    if (@offsetOf(RawSummary, "last_status") != 32) @compileError("Native backing Summary.last_status offset");
+    if (@offsetOf(RawSummary, "last_flags") != 36) @compileError("Native backing Summary.last_flags offset");
+    if (@offsetOf(RawSummary, "last_blockers") != 40) @compileError("Native backing Summary.last_blockers offset");
+    if (@offsetOf(RawSummary, "last_requested_bytes") != 48) @compileError("Native backing Summary.last_requested_bytes offset");
+    if (@offsetOf(RawSummary, "last_available_bytes") != 56) @compileError("Native backing Summary.last_available_bytes offset");
+    if (@offsetOf(RawSummary, "last_file_size") != 64) @compileError("Native backing Summary.last_file_size offset");
+    if (@offsetOf(RawSummary, "last_cluster_bytes") != 72) @compileError("Native backing Summary.last_cluster_bytes offset");
+    if (@offsetOf(RawSummary, "last_first_cluster") != 76) @compileError("Native backing Summary.last_first_cluster offset");
+    if (@sizeOf(RawSlotInput) != 224 or @alignOf(RawSlotInput) != 8) @compileError("Native backing SlotInput geometry");
+    if (@offsetOf(RawSlotInput, "operation") != 0) @compileError("Native backing SlotInput.operation offset");
+    if (@offsetOf(RawSlotInput, "requested_slots") != 8) @compileError("Native backing SlotInput.requested_slots offset");
+    if (@offsetOf(RawSlotInput, "reservation_id") != 16) @compileError("Native backing SlotInput.reservation_id offset");
+    if (@offsetOf(RawSlotInput, "owner_kind") != 20) @compileError("Native backing SlotInput.owner_kind offset");
+    if (@offsetOf(RawSlotInput, "owner_id") != 24) @compileError("Native backing SlotInput.owner_id offset");
+    if (@offsetOf(RawSlotInput, "region_id") != 28) @compileError("Native backing SlotInput.region_id offset");
+    if (@offsetOf(RawSlotInput, "flags") != 32) @compileError("Native backing SlotInput.flags offset");
+    if (@offsetOf(RawSlotInput, "backing") != 40) @compileError("Native backing SlotInput.backing offset");
+    if (@sizeOf(RawSlotResult) != 192 or @alignOf(RawSlotResult) != 8) @compileError("Native backing SlotResult geometry");
+    if (@offsetOf(RawSlotResult, "version") != 0) @compileError("Native backing SlotResult.version offset");
+    if (@offsetOf(RawSlotResult, "status") != 4) @compileError("Native backing SlotResult.status offset");
+    if (@offsetOf(RawSlotResult, "operation") != 8) @compileError("Native backing SlotResult.operation offset");
+    if (@offsetOf(RawSlotResult, "flags") != 12) @compileError("Native backing SlotResult.flags offset");
+    if (@offsetOf(RawSlotResult, "blockers") != 16) @compileError("Native backing SlotResult.blockers offset");
+    if (@offsetOf(RawSlotResult, "slot_bytes") != 20) @compileError("Native backing SlotResult.slot_bytes offset");
+    if (@offsetOf(RawSlotResult, "capacity_slots") != 24) @compileError("Native backing SlotResult.capacity_slots offset");
+    if (@offsetOf(RawSlotResult, "requested_slots") != 32) @compileError("Native backing SlotResult.requested_slots offset");
+    if (@offsetOf(RawSlotResult, "reserved_slots") != 40) @compileError("Native backing SlotResult.reserved_slots offset");
+    if (@offsetOf(RawSlotResult, "free_slots") != 48) @compileError("Native backing SlotResult.free_slots offset");
+    if (@offsetOf(RawSlotResult, "valid_slots") != 56) @compileError("Native backing SlotResult.valid_slots offset");
+    if (@offsetOf(RawSlotResult, "dirty_slots") != 64) @compileError("Native backing SlotResult.dirty_slots offset");
+    if (@offsetOf(RawSlotResult, "error_slots") != 72) @compileError("Native backing SlotResult.error_slots offset");
+    if (@offsetOf(RawSlotResult, "range_count") != 80) @compileError("Native backing SlotResult.range_count offset");
+    if (@offsetOf(RawSlotResult, "max_ranges") != 84) @compileError("Native backing SlotResult.max_ranges offset");
+    if (@offsetOf(RawSlotResult, "reservation_id") != 88) @compileError("Native backing SlotResult.reservation_id offset");
+    if (@offsetOf(RawSlotResult, "owner_kind") != 92) @compileError("Native backing SlotResult.owner_kind offset");
+    if (@offsetOf(RawSlotResult, "owner_id") != 96) @compileError("Native backing SlotResult.owner_id offset");
+    if (@offsetOf(RawSlotResult, "region_id") != 100) @compileError("Native backing SlotResult.region_id offset");
+    if (@offsetOf(RawSlotResult, "first_slot") != 104) @compileError("Native backing SlotResult.first_slot offset");
+    if (@offsetOf(RawSlotResult, "slot_count") != 112) @compileError("Native backing SlotResult.slot_count offset");
+    if (@offsetOf(RawSlotResult, "generation") != 120) @compileError("Native backing SlotResult.generation offset");
+    if (@offsetOf(RawSlotResult, "pager_enabled") != 128) @compileError("Native backing SlotResult.pager_enabled offset");
+    if (@offsetOf(RawSlotResult, "eviction_enabled") != 132) @compileError("Native backing SlotResult.eviction_enabled offset");
+    if (@offsetOf(RawSlotResult, "page_in_enabled") != 136) @compileError("Native backing SlotResult.page_in_enabled offset");
+    if (@offsetOf(RawSlotResult, "page_out_enabled") != 140) @compileError("Native backing SlotResult.page_out_enabled offset");
+    if (@offsetOf(RawSlotResult, "total_probes") != 144) @compileError("Native backing SlotResult.total_probes offset");
+    if (@offsetOf(RawSlotResult, "total_reserves") != 152) @compileError("Native backing SlotResult.total_reserves offset");
+    if (@offsetOf(RawSlotResult, "total_releases") != 160) @compileError("Native backing SlotResult.total_releases offset");
+    if (@offsetOf(RawSlotResult, "total_error_marks") != 168) @compileError("Native backing SlotResult.total_error_marks offset");
+    if (@offsetOf(RawSlotResult, "total_recoveries") != 176) @compileError("Native backing SlotResult.total_recoveries offset");
+    if (@offsetOf(RawSlotResult, "total_failures") != 184) @compileError("Native backing SlotResult.total_failures offset");
+    if (@sizeOf(RawSlotSummary) != 192 or @alignOf(RawSlotSummary) != 8) @compileError("Native backing SlotSummary geometry");
+    if (@offsetOf(RawSlotSummary, "enabled") != 0) @compileError("Native backing SlotSummary.enabled offset");
+    if (@offsetOf(RawSlotSummary, "last_status") != 4) @compileError("Native backing SlotSummary.last_status offset");
+    if (@offsetOf(RawSlotSummary, "last_operation") != 8) @compileError("Native backing SlotSummary.last_operation offset");
+    if (@offsetOf(RawSlotSummary, "last_flags") != 12) @compileError("Native backing SlotSummary.last_flags offset");
+    if (@offsetOf(RawSlotSummary, "last_blockers") != 16) @compileError("Native backing SlotSummary.last_blockers offset");
+    if (@offsetOf(RawSlotSummary, "slot_bytes") != 20) @compileError("Native backing SlotSummary.slot_bytes offset");
+    if (@offsetOf(RawSlotSummary, "capacity_slots") != 24) @compileError("Native backing SlotSummary.capacity_slots offset");
+    if (@offsetOf(RawSlotSummary, "reserved_slots") != 32) @compileError("Native backing SlotSummary.reserved_slots offset");
+    if (@offsetOf(RawSlotSummary, "free_slots") != 40) @compileError("Native backing SlotSummary.free_slots offset");
+    if (@offsetOf(RawSlotSummary, "valid_slots") != 48) @compileError("Native backing SlotSummary.valid_slots offset");
+    if (@offsetOf(RawSlotSummary, "dirty_slots") != 56) @compileError("Native backing SlotSummary.dirty_slots offset");
+    if (@offsetOf(RawSlotSummary, "error_slots") != 64) @compileError("Native backing SlotSummary.error_slots offset");
+    if (@offsetOf(RawSlotSummary, "range_count") != 72) @compileError("Native backing SlotSummary.range_count offset");
+    if (@offsetOf(RawSlotSummary, "max_ranges") != 76) @compileError("Native backing SlotSummary.max_ranges offset");
+    if (@offsetOf(RawSlotSummary, "last_reservation_id") != 80) @compileError("Native backing SlotSummary.last_reservation_id offset");
+    if (@offsetOf(RawSlotSummary, "last_owner_kind") != 84) @compileError("Native backing SlotSummary.last_owner_kind offset");
+    if (@offsetOf(RawSlotSummary, "last_owner_id") != 88) @compileError("Native backing SlotSummary.last_owner_id offset");
+    if (@offsetOf(RawSlotSummary, "last_region_id") != 92) @compileError("Native backing SlotSummary.last_region_id offset");
+    if (@offsetOf(RawSlotSummary, "last_first_slot") != 96) @compileError("Native backing SlotSummary.last_first_slot offset");
+    if (@offsetOf(RawSlotSummary, "last_slot_count") != 104) @compileError("Native backing SlotSummary.last_slot_count offset");
+    if (@offsetOf(RawSlotSummary, "generation") != 112) @compileError("Native backing SlotSummary.generation offset");
+    if (@offsetOf(RawSlotSummary, "probes") != 120) @compileError("Native backing SlotSummary.probes offset");
+    if (@offsetOf(RawSlotSummary, "reserves") != 128) @compileError("Native backing SlotSummary.reserves offset");
+    if (@offsetOf(RawSlotSummary, "releases") != 136) @compileError("Native backing SlotSummary.releases offset");
+    if (@offsetOf(RawSlotSummary, "error_marks") != 144) @compileError("Native backing SlotSummary.error_marks offset");
+    if (@offsetOf(RawSlotSummary, "recoveries") != 152) @compileError("Native backing SlotSummary.recoveries offset");
+    if (@offsetOf(RawSlotSummary, "failures") != 160) @compileError("Native backing SlotSummary.failures offset");
+    if (@offsetOf(RawSlotSummary, "lifecycle_cleanups") != 168) @compileError("Native backing SlotSummary.lifecycle_cleanups offset");
+    if (@offsetOf(RawSlotSummary, "lifecycle_released_ranges") != 176) @compileError("Native backing SlotSummary.lifecycle_released_ranges offset");
+    if (@offsetOf(RawSlotSummary, "lifecycle_released_slots") != 184) @compileError("Native backing SlotSummary.lifecycle_released_slots offset");
+    if (@sizeOf(RawPagerGateInput) != 240 or @alignOf(RawPagerGateInput) != 8) @compileError("Native backing PagerGateInput geometry");
+    if (@offsetOf(RawPagerGateInput, "requested_bytes") != 0) @compileError("Native backing PagerGateInput.requested_bytes offset");
+    if (@offsetOf(RawPagerGateInput, "region_id") != 8) @compileError("Native backing PagerGateInput.region_id offset");
+    if (@offsetOf(RawPagerGateInput, "owner_id") != 12) @compileError("Native backing PagerGateInput.owner_id offset");
+    if (@offsetOf(RawPagerGateInput, "flags") != 16) @compileError("Native backing PagerGateInput.flags offset");
+    if (@offsetOf(RawPagerGateInput, "vm_region_exists") != 20) @compileError("Native backing PagerGateInput.vm_region_exists offset");
+    if (@offsetOf(RawPagerGateInput, "vm_region_is_r4x") != 21) @compileError("Native backing PagerGateInput.vm_region_is_r4x offset");
+    if (@offsetOf(RawPagerGateInput, "committed_bytes") != 24) @compileError("Native backing PagerGateInput.committed_bytes offset");
+    if (@offsetOf(RawPagerGateInput, "resident_bytes") != 32) @compileError("Native backing PagerGateInput.resident_bytes offset");
+    if (@offsetOf(RawPagerGateInput, "fault_count") != 40) @compileError("Native backing PagerGateInput.fault_count offset");
+    if (@offsetOf(RawPagerGateInput, "failed_faults") != 48) @compileError("Native backing PagerGateInput.failed_faults offset");
+    if (@offsetOf(RawPagerGateInput, "backing") != 56) @compileError("Native backing PagerGateInput.backing offset");
+    if (@sizeOf(RawPagerGateResult) != 208 or @alignOf(RawPagerGateResult) != 8) @compileError("Native backing PagerGateResult geometry");
+    if (@offsetOf(RawPagerGateResult, "version") != 0) @compileError("Native backing PagerGateResult.version offset");
+    if (@offsetOf(RawPagerGateResult, "status") != 4) @compileError("Native backing PagerGateResult.status offset");
+    if (@offsetOf(RawPagerGateResult, "flags") != 8) @compileError("Native backing PagerGateResult.flags offset");
+    if (@offsetOf(RawPagerGateResult, "blockers") != 12) @compileError("Native backing PagerGateResult.blockers offset");
+    if (@offsetOf(RawPagerGateResult, "region_id") != 16) @compileError("Native backing PagerGateResult.region_id offset");
+    if (@offsetOf(RawPagerGateResult, "owner_id") != 20) @compileError("Native backing PagerGateResult.owner_id offset");
+    if (@offsetOf(RawPagerGateResult, "slot_bytes") != 24) @compileError("Native backing PagerGateResult.slot_bytes offset");
+    if (@offsetOf(RawPagerGateResult, "reserved0") != 28) @compileError("Native backing PagerGateResult.reserved0 offset");
+    if (@offsetOf(RawPagerGateResult, "requested_bytes") != 32) @compileError("Native backing PagerGateResult.requested_bytes offset");
+    if (@offsetOf(RawPagerGateResult, "committed_bytes") != 40) @compileError("Native backing PagerGateResult.committed_bytes offset");
+    if (@offsetOf(RawPagerGateResult, "resident_bytes") != 48) @compileError("Native backing PagerGateResult.resident_bytes offset");
+    if (@offsetOf(RawPagerGateResult, "nonresident_bytes") != 56) @compileError("Native backing PagerGateResult.nonresident_bytes offset");
+    if (@offsetOf(RawPagerGateResult, "requested_slots") != 64) @compileError("Native backing PagerGateResult.requested_slots offset");
+    if (@offsetOf(RawPagerGateResult, "prepared_slots") != 72) @compileError("Native backing PagerGateResult.prepared_slots offset");
+    if (@offsetOf(RawPagerGateResult, "capacity_slots") != 80) @compileError("Native backing PagerGateResult.capacity_slots offset");
+    if (@offsetOf(RawPagerGateResult, "free_before_slots") != 88) @compileError("Native backing PagerGateResult.free_before_slots offset");
+    if (@offsetOf(RawPagerGateResult, "free_after_slots") != 96) @compileError("Native backing PagerGateResult.free_after_slots offset");
+    if (@offsetOf(RawPagerGateResult, "reserved_before_slots") != 104) @compileError("Native backing PagerGateResult.reserved_before_slots offset");
+    if (@offsetOf(RawPagerGateResult, "reserved_after_slots") != 112) @compileError("Native backing PagerGateResult.reserved_after_slots offset");
+    if (@offsetOf(RawPagerGateResult, "slot_reservation_id") != 120) @compileError("Native backing PagerGateResult.slot_reservation_id offset");
+    if (@offsetOf(RawPagerGateResult, "rollback_completed") != 124) @compileError("Native backing PagerGateResult.rollback_completed offset");
+    if (@offsetOf(RawPagerGateResult, "commit_gate_enabled") != 128) @compileError("Native backing PagerGateResult.commit_gate_enabled offset");
+    if (@offsetOf(RawPagerGateResult, "fault_gate_enabled") != 132) @compileError("Native backing PagerGateResult.fault_gate_enabled offset");
+    if (@offsetOf(RawPagerGateResult, "pager_enabled") != 136) @compileError("Native backing PagerGateResult.pager_enabled offset");
+    if (@offsetOf(RawPagerGateResult, "eviction_enabled") != 140) @compileError("Native backing PagerGateResult.eviction_enabled offset");
+    if (@offsetOf(RawPagerGateResult, "page_in_enabled") != 144) @compileError("Native backing PagerGateResult.page_in_enabled offset");
+    if (@offsetOf(RawPagerGateResult, "page_out_enabled") != 148) @compileError("Native backing PagerGateResult.page_out_enabled offset");
+    if (@offsetOf(RawPagerGateResult, "slot_generation") != 152) @compileError("Native backing PagerGateResult.slot_generation offset");
+    if (@offsetOf(RawPagerGateResult, "fault_count") != 160) @compileError("Native backing PagerGateResult.fault_count offset");
+    if (@offsetOf(RawPagerGateResult, "failed_faults") != 168) @compileError("Native backing PagerGateResult.failed_faults offset");
+    if (@offsetOf(RawPagerGateResult, "total_probes") != 176) @compileError("Native backing PagerGateResult.total_probes offset");
+    if (@offsetOf(RawPagerGateResult, "total_ready") != 184) @compileError("Native backing PagerGateResult.total_ready offset");
+    if (@offsetOf(RawPagerGateResult, "total_rollbacks") != 192) @compileError("Native backing PagerGateResult.total_rollbacks offset");
+    if (@offsetOf(RawPagerGateResult, "total_failures") != 200) @compileError("Native backing PagerGateResult.total_failures offset");
+    if (@sizeOf(RawPagerGateSummary) != 200 or @alignOf(RawPagerGateSummary) != 8) @compileError("Native backing PagerGateSummary geometry");
+    if (@offsetOf(RawPagerGateSummary, "enabled") != 0) @compileError("Native backing PagerGateSummary.enabled offset");
+    if (@offsetOf(RawPagerGateSummary, "last_status") != 4) @compileError("Native backing PagerGateSummary.last_status offset");
+    if (@offsetOf(RawPagerGateSummary, "last_flags") != 8) @compileError("Native backing PagerGateSummary.last_flags offset");
+    if (@offsetOf(RawPagerGateSummary, "last_blockers") != 12) @compileError("Native backing PagerGateSummary.last_blockers offset");
+    if (@offsetOf(RawPagerGateSummary, "last_region_id") != 16) @compileError("Native backing PagerGateSummary.last_region_id offset");
+    if (@offsetOf(RawPagerGateSummary, "last_owner_id") != 20) @compileError("Native backing PagerGateSummary.last_owner_id offset");
+    if (@offsetOf(RawPagerGateSummary, "requested_bytes") != 24) @compileError("Native backing PagerGateSummary.requested_bytes offset");
+    if (@offsetOf(RawPagerGateSummary, "committed_bytes") != 32) @compileError("Native backing PagerGateSummary.committed_bytes offset");
+    if (@offsetOf(RawPagerGateSummary, "resident_bytes") != 40) @compileError("Native backing PagerGateSummary.resident_bytes offset");
+    if (@offsetOf(RawPagerGateSummary, "nonresident_bytes") != 48) @compileError("Native backing PagerGateSummary.nonresident_bytes offset");
+    if (@offsetOf(RawPagerGateSummary, "requested_slots") != 56) @compileError("Native backing PagerGateSummary.requested_slots offset");
+    if (@offsetOf(RawPagerGateSummary, "prepared_slots") != 64) @compileError("Native backing PagerGateSummary.prepared_slots offset");
+    if (@offsetOf(RawPagerGateSummary, "capacity_slots") != 72) @compileError("Native backing PagerGateSummary.capacity_slots offset");
+    if (@offsetOf(RawPagerGateSummary, "free_before_slots") != 80) @compileError("Native backing PagerGateSummary.free_before_slots offset");
+    if (@offsetOf(RawPagerGateSummary, "free_after_slots") != 88) @compileError("Native backing PagerGateSummary.free_after_slots offset");
+    if (@offsetOf(RawPagerGateSummary, "reserved_before_slots") != 96) @compileError("Native backing PagerGateSummary.reserved_before_slots offset");
+    if (@offsetOf(RawPagerGateSummary, "reserved_after_slots") != 104) @compileError("Native backing PagerGateSummary.reserved_after_slots offset");
+    if (@offsetOf(RawPagerGateSummary, "last_reservation_id") != 112) @compileError("Native backing PagerGateSummary.last_reservation_id offset");
+    if (@offsetOf(RawPagerGateSummary, "rollback_completed") != 116) @compileError("Native backing PagerGateSummary.rollback_completed offset");
+    if (@offsetOf(RawPagerGateSummary, "commit_gate_enabled") != 120) @compileError("Native backing PagerGateSummary.commit_gate_enabled offset");
+    if (@offsetOf(RawPagerGateSummary, "fault_gate_enabled") != 124) @compileError("Native backing PagerGateSummary.fault_gate_enabled offset");
+    if (@offsetOf(RawPagerGateSummary, "pager_enabled") != 128) @compileError("Native backing PagerGateSummary.pager_enabled offset");
+    if (@offsetOf(RawPagerGateSummary, "eviction_enabled") != 132) @compileError("Native backing PagerGateSummary.eviction_enabled offset");
+    if (@offsetOf(RawPagerGateSummary, "page_in_enabled") != 136) @compileError("Native backing PagerGateSummary.page_in_enabled offset");
+    if (@offsetOf(RawPagerGateSummary, "page_out_enabled") != 140) @compileError("Native backing PagerGateSummary.page_out_enabled offset");
+    if (@offsetOf(RawPagerGateSummary, "slot_generation") != 144) @compileError("Native backing PagerGateSummary.slot_generation offset");
+    if (@offsetOf(RawPagerGateSummary, "fault_count") != 152) @compileError("Native backing PagerGateSummary.fault_count offset");
+    if (@offsetOf(RawPagerGateSummary, "failed_faults") != 160) @compileError("Native backing PagerGateSummary.failed_faults offset");
+    if (@offsetOf(RawPagerGateSummary, "probes") != 168) @compileError("Native backing PagerGateSummary.probes offset");
+    if (@offsetOf(RawPagerGateSummary, "ready") != 176) @compileError("Native backing PagerGateSummary.ready offset");
+    if (@offsetOf(RawPagerGateSummary, "rollbacks") != 184) @compileError("Native backing PagerGateSummary.rollbacks offset");
+    if (@offsetOf(RawPagerGateSummary, "failures") != 192) @compileError("Native backing PagerGateSummary.failures offset");
+    if (@sizeOf(RawPageIoInput) != 272 or @alignOf(RawPageIoInput) != 8) @compileError("Native backing PageIoInput geometry");
+    if (@offsetOf(RawPageIoInput, "operation") != 0) @compileError("Native backing PageIoInput.operation offset");
+    if (@offsetOf(RawPageIoInput, "region_id") != 4) @compileError("Native backing PageIoInput.region_id offset");
+    if (@offsetOf(RawPageIoInput, "region_offset") != 8) @compileError("Native backing PageIoInput.region_offset offset");
+    if (@offsetOf(RawPageIoInput, "reservation_id") != 16) @compileError("Native backing PageIoInput.reservation_id offset");
+    if (@offsetOf(RawPageIoInput, "slot_index") != 24) @compileError("Native backing PageIoInput.slot_index offset");
+    if (@offsetOf(RawPageIoInput, "page_count") != 32) @compileError("Native backing PageIoInput.page_count offset");
+    if (@offsetOf(RawPageIoInput, "owner_kind") != 40) @compileError("Native backing PageIoInput.owner_kind offset");
+    if (@offsetOf(RawPageIoInput, "owner_id") != 44) @compileError("Native backing PageIoInput.owner_id offset");
+    if (@offsetOf(RawPageIoInput, "expected_generation") != 48) @compileError("Native backing PageIoInput.expected_generation offset");
+    if (@offsetOf(RawPageIoInput, "flags") != 56) @compileError("Native backing PageIoInput.flags offset");
+    if (@offsetOf(RawPageIoInput, "vm_region_exists") != 60) @compileError("Native backing PageIoInput.vm_region_exists offset");
+    if (@offsetOf(RawPageIoInput, "vm_region_is_r4x") != 61) @compileError("Native backing PageIoInput.vm_region_is_r4x offset");
+    if (@offsetOf(RawPageIoInput, "commit_covered") != 62) @compileError("Native backing PageIoInput.commit_covered offset");
+    if (@offsetOf(RawPageIoInput, "committed_bytes") != 64) @compileError("Native backing PageIoInput.committed_bytes offset");
+    if (@offsetOf(RawPageIoInput, "resident_bytes") != 72) @compileError("Native backing PageIoInput.resident_bytes offset");
+    if (@offsetOf(RawPageIoInput, "backing") != 80) @compileError("Native backing PageIoInput.backing offset");
+    if (@offsetOf(RawPageIoInput, "io_status") != 264) @compileError("Native backing PageIoInput.io_status offset");
+    if (@offsetOf(RawPageIoInput, "io_bytes") != 268) @compileError("Native backing PageIoInput.io_bytes offset");
+    if (@sizeOf(RawPageIoResult) != 296 or @alignOf(RawPageIoResult) != 8) @compileError("Native backing PageIoResult geometry");
+    if (@offsetOf(RawPageIoResult, "version") != 0) @compileError("Native backing PageIoResult.version offset");
+    if (@offsetOf(RawPageIoResult, "status") != 4) @compileError("Native backing PageIoResult.status offset");
+    if (@offsetOf(RawPageIoResult, "operation") != 8) @compileError("Native backing PageIoResult.operation offset");
+    if (@offsetOf(RawPageIoResult, "flags") != 12) @compileError("Native backing PageIoResult.flags offset");
+    if (@offsetOf(RawPageIoResult, "blockers") != 16) @compileError("Native backing PageIoResult.blockers offset");
+    if (@offsetOf(RawPageIoResult, "region_id") != 20) @compileError("Native backing PageIoResult.region_id offset");
+    if (@offsetOf(RawPageIoResult, "reservation_id") != 24) @compileError("Native backing PageIoResult.reservation_id offset");
+    if (@offsetOf(RawPageIoResult, "owner_kind") != 28) @compileError("Native backing PageIoResult.owner_kind offset");
+    if (@offsetOf(RawPageIoResult, "owner_id") != 32) @compileError("Native backing PageIoResult.owner_id offset");
+    if (@offsetOf(RawPageIoResult, "slot_bytes") != 36) @compileError("Native backing PageIoResult.slot_bytes offset");
+    if (@offsetOf(RawPageIoResult, "reserved0") != 40) @compileError("Native backing PageIoResult.reserved0 offset");
+    if (@offsetOf(RawPageIoResult, "region_offset") != 48) @compileError("Native backing PageIoResult.region_offset offset");
+    if (@offsetOf(RawPageIoResult, "committed_bytes") != 56) @compileError("Native backing PageIoResult.committed_bytes offset");
+    if (@offsetOf(RawPageIoResult, "resident_bytes") != 64) @compileError("Native backing PageIoResult.resident_bytes offset");
+    if (@offsetOf(RawPageIoResult, "slot_index") != 72) @compileError("Native backing PageIoResult.slot_index offset");
+    if (@offsetOf(RawPageIoResult, "page_count") != 80) @compileError("Native backing PageIoResult.page_count offset");
+    if (@offsetOf(RawPageIoResult, "transfer_bytes") != 88) @compileError("Native backing PageIoResult.transfer_bytes offset");
+    if (@offsetOf(RawPageIoResult, "expected_generation") != 96) @compileError("Native backing PageIoResult.expected_generation offset");
+    if (@offsetOf(RawPageIoResult, "backing_slot") != 104) @compileError("Native backing PageIoResult.backing_slot offset");
+    if (@offsetOf(RawPageIoResult, "backing_offset") != 112) @compileError("Native backing PageIoResult.backing_offset offset");
+    if (@offsetOf(RawPageIoResult, "capacity_slots") != 120) @compileError("Native backing PageIoResult.capacity_slots offset");
+    if (@offsetOf(RawPageIoResult, "reserved_slots") != 128) @compileError("Native backing PageIoResult.reserved_slots offset");
+    if (@offsetOf(RawPageIoResult, "valid_slots") != 136) @compileError("Native backing PageIoResult.valid_slots offset");
+    if (@offsetOf(RawPageIoResult, "dirty_slots") != 144) @compileError("Native backing PageIoResult.dirty_slots offset");
+    if (@offsetOf(RawPageIoResult, "error_slots") != 152) @compileError("Native backing PageIoResult.error_slots offset");
+    if (@offsetOf(RawPageIoResult, "io_bytes") != 160) @compileError("Native backing PageIoResult.io_bytes offset");
+    if (@offsetOf(RawPageIoResult, "io_status") != 164) @compileError("Native backing PageIoResult.io_status offset");
+    if (@offsetOf(RawPageIoResult, "pager_enabled") != 168) @compileError("Native backing PageIoResult.pager_enabled offset");
+    if (@offsetOf(RawPageIoResult, "eviction_enabled") != 172) @compileError("Native backing PageIoResult.eviction_enabled offset");
+    if (@offsetOf(RawPageIoResult, "page_in_enabled") != 176) @compileError("Native backing PageIoResult.page_in_enabled offset");
+    if (@offsetOf(RawPageIoResult, "page_out_enabled") != 180) @compileError("Native backing PageIoResult.page_out_enabled offset");
+    if (@offsetOf(RawPageIoResult, "retry_limit") != 184) @compileError("Native backing PageIoResult.retry_limit offset");
+    if (@offsetOf(RawPageIoResult, "backoff_ticks") != 188) @compileError("Native backing PageIoResult.backoff_ticks offset");
+    if (@offsetOf(RawPageIoResult, "slot_generation") != 192) @compileError("Native backing PageIoResult.slot_generation offset");
+    if (@offsetOf(RawPageIoResult, "total_prepares") != 200) @compileError("Native backing PageIoResult.total_prepares offset");
+    if (@offsetOf(RawPageIoResult, "total_page_outs") != 208) @compileError("Native backing PageIoResult.total_page_outs offset");
+    if (@offsetOf(RawPageIoResult, "total_page_ins") != 216) @compileError("Native backing PageIoResult.total_page_ins offset");
+    if (@offsetOf(RawPageIoResult, "total_failures") != 224) @compileError("Native backing PageIoResult.total_failures offset");
+    if (@offsetOf(RawPageIoResult, "total_retry_attempts") != 232) @compileError("Native backing PageIoResult.total_retry_attempts offset");
+    if (@offsetOf(RawPageIoResult, "total_retryable_failures") != 240) @compileError("Native backing PageIoResult.total_retryable_failures offset");
+    if (@offsetOf(RawPageIoResult, "total_permanent_failures") != 248) @compileError("Native backing PageIoResult.total_permanent_failures offset");
+    if (@offsetOf(RawPageIoResult, "total_retry_limit_hits") != 256) @compileError("Native backing PageIoResult.total_retry_limit_hits offset");
+    if (@offsetOf(RawPageIoResult, "total_failed_page_outs") != 264) @compileError("Native backing PageIoResult.total_failed_page_outs offset");
+    if (@offsetOf(RawPageIoResult, "total_failed_page_ins") != 272) @compileError("Native backing PageIoResult.total_failed_page_ins offset");
+    if (@offsetOf(RawPageIoResult, "total_data_preserved_pages") != 280) @compileError("Native backing PageIoResult.total_data_preserved_pages offset");
+    if (@offsetOf(RawPageIoResult, "total_data_lost_pages") != 288) @compileError("Native backing PageIoResult.total_data_lost_pages offset");
+    if (@sizeOf(RawPageIoSummary) != 264 or @alignOf(RawPageIoSummary) != 8) @compileError("Native backing PageIoSummary geometry");
+    if (@offsetOf(RawPageIoSummary, "enabled") != 0) @compileError("Native backing PageIoSummary.enabled offset");
+    if (@offsetOf(RawPageIoSummary, "last_status") != 4) @compileError("Native backing PageIoSummary.last_status offset");
+    if (@offsetOf(RawPageIoSummary, "last_operation") != 8) @compileError("Native backing PageIoSummary.last_operation offset");
+    if (@offsetOf(RawPageIoSummary, "last_flags") != 12) @compileError("Native backing PageIoSummary.last_flags offset");
+    if (@offsetOf(RawPageIoSummary, "last_blockers") != 16) @compileError("Native backing PageIoSummary.last_blockers offset");
+    if (@offsetOf(RawPageIoSummary, "last_region_id") != 20) @compileError("Native backing PageIoSummary.last_region_id offset");
+    if (@offsetOf(RawPageIoSummary, "last_reservation_id") != 24) @compileError("Native backing PageIoSummary.last_reservation_id offset");
+    if (@offsetOf(RawPageIoSummary, "last_owner_kind") != 28) @compileError("Native backing PageIoSummary.last_owner_kind offset");
+    if (@offsetOf(RawPageIoSummary, "last_owner_id") != 32) @compileError("Native backing PageIoSummary.last_owner_id offset");
+    if (@offsetOf(RawPageIoSummary, "region_offset") != 40) @compileError("Native backing PageIoSummary.region_offset offset");
+    if (@offsetOf(RawPageIoSummary, "page_count") != 48) @compileError("Native backing PageIoSummary.page_count offset");
+    if (@offsetOf(RawPageIoSummary, "transfer_bytes") != 56) @compileError("Native backing PageIoSummary.transfer_bytes offset");
+    if (@offsetOf(RawPageIoSummary, "expected_generation") != 64) @compileError("Native backing PageIoSummary.expected_generation offset");
+    if (@offsetOf(RawPageIoSummary, "backing_slot") != 72) @compileError("Native backing PageIoSummary.backing_slot offset");
+    if (@offsetOf(RawPageIoSummary, "backing_offset") != 80) @compileError("Native backing PageIoSummary.backing_offset offset");
+    if (@offsetOf(RawPageIoSummary, "io_bytes") != 88) @compileError("Native backing PageIoSummary.io_bytes offset");
+    if (@offsetOf(RawPageIoSummary, "io_status") != 92) @compileError("Native backing PageIoSummary.io_status offset");
+    if (@offsetOf(RawPageIoSummary, "capacity_slots") != 96) @compileError("Native backing PageIoSummary.capacity_slots offset");
+    if (@offsetOf(RawPageIoSummary, "reserved_slots") != 104) @compileError("Native backing PageIoSummary.reserved_slots offset");
+    if (@offsetOf(RawPageIoSummary, "valid_slots") != 112) @compileError("Native backing PageIoSummary.valid_slots offset");
+    if (@offsetOf(RawPageIoSummary, "dirty_slots") != 120) @compileError("Native backing PageIoSummary.dirty_slots offset");
+    if (@offsetOf(RawPageIoSummary, "error_slots") != 128) @compileError("Native backing PageIoSummary.error_slots offset");
+    if (@offsetOf(RawPageIoSummary, "pager_enabled") != 136) @compileError("Native backing PageIoSummary.pager_enabled offset");
+    if (@offsetOf(RawPageIoSummary, "eviction_enabled") != 140) @compileError("Native backing PageIoSummary.eviction_enabled offset");
+    if (@offsetOf(RawPageIoSummary, "page_in_enabled") != 144) @compileError("Native backing PageIoSummary.page_in_enabled offset");
+    if (@offsetOf(RawPageIoSummary, "page_out_enabled") != 148) @compileError("Native backing PageIoSummary.page_out_enabled offset");
+    if (@offsetOf(RawPageIoSummary, "retry_limit") != 152) @compileError("Native backing PageIoSummary.retry_limit offset");
+    if (@offsetOf(RawPageIoSummary, "backoff_ticks") != 156) @compileError("Native backing PageIoSummary.backoff_ticks offset");
+    if (@offsetOf(RawPageIoSummary, "slot_generation") != 160) @compileError("Native backing PageIoSummary.slot_generation offset");
+    if (@offsetOf(RawPageIoSummary, "prepares") != 168) @compileError("Native backing PageIoSummary.prepares offset");
+    if (@offsetOf(RawPageIoSummary, "page_outs") != 176) @compileError("Native backing PageIoSummary.page_outs offset");
+    if (@offsetOf(RawPageIoSummary, "page_ins") != 184) @compileError("Native backing PageIoSummary.page_ins offset");
+    if (@offsetOf(RawPageIoSummary, "failures") != 192) @compileError("Native backing PageIoSummary.failures offset");
+    if (@offsetOf(RawPageIoSummary, "retry_attempts") != 200) @compileError("Native backing PageIoSummary.retry_attempts offset");
+    if (@offsetOf(RawPageIoSummary, "retryable_failures") != 208) @compileError("Native backing PageIoSummary.retryable_failures offset");
+    if (@offsetOf(RawPageIoSummary, "permanent_failures") != 216) @compileError("Native backing PageIoSummary.permanent_failures offset");
+    if (@offsetOf(RawPageIoSummary, "retry_limit_hits") != 224) @compileError("Native backing PageIoSummary.retry_limit_hits offset");
+    if (@offsetOf(RawPageIoSummary, "failed_page_outs") != 232) @compileError("Native backing PageIoSummary.failed_page_outs offset");
+    if (@offsetOf(RawPageIoSummary, "failed_page_ins") != 240) @compileError("Native backing PageIoSummary.failed_page_ins offset");
+    if (@offsetOf(RawPageIoSummary, "data_preserved_pages") != 248) @compileError("Native backing PageIoSummary.data_preserved_pages offset");
+    if (@offsetOf(RawPageIoSummary, "data_lost_pages") != 256) @compileError("Native backing PageIoSummary.data_lost_pages offset");
+    if (@sizeOf(RawLifecycleCleanupResult) != 48 or @alignOf(RawLifecycleCleanupResult) != 8) @compileError("Native backing LifecycleCleanupResult geometry");
+    if (@offsetOf(RawLifecycleCleanupResult, "cleanup_count") != 0) @compileError("Native backing LifecycleCleanupResult.cleanup_count offset");
+    if (@offsetOf(RawLifecycleCleanupResult, "released_ranges") != 8) @compileError("Native backing LifecycleCleanupResult.released_ranges offset");
+    if (@offsetOf(RawLifecycleCleanupResult, "released_slots") != 16) @compileError("Native backing LifecycleCleanupResult.released_slots offset");
+    if (@offsetOf(RawLifecycleCleanupResult, "released_valid_slots") != 24) @compileError("Native backing LifecycleCleanupResult.released_valid_slots offset");
+    if (@offsetOf(RawLifecycleCleanupResult, "released_dirty_slots") != 32) @compileError("Native backing LifecycleCleanupResult.released_dirty_slots offset");
+    if (@offsetOf(RawLifecycleCleanupResult, "released_error_slots") != 40) @compileError("Native backing LifecycleCleanupResult.released_error_slots offset");
 }
-
-fn ensureSlotBacking(backing: Result, capacity_slots: u64) bool {
-    if (active_first_cluster == backing.first_cluster and
-        active_cluster_bytes == backing.cluster_bytes and
-        active_file_size == backing.file_size and
-        active_capacity_slots == capacity_slots and
-        std.ascii.eqlIgnoreCase(std.mem.sliceTo(&active_backing_path, 0), std.mem.sliceTo(&backing.path, 0)))
-    {
-        return true;
-    }
-
-    // Live reservations retain the exact file identity. A later diagnostic
-    // selecting another file must not erase the only page-in metadata.
-    for (&slot_extents) |*extent| if (extentActive(extent.*)) return false;
-    slot_extents = .{SlotExtent{}} ** SLOT_TABLE_MAX_RANGES;
-    active_first_cluster = backing.first_cluster;
-    active_file_size = backing.file_size;
-    active_cluster_bytes = backing.cluster_bytes;
-    active_capacity_slots = capacity_slots;
-    rememberActivePath(if (backing.path[0] == 0) null else &backing.path);
-    slot_generation +%= 1;
-    return true;
-}
-
-fn rememberActivePath(path: ?[*:0]const u8) void {
-    const path_z = path orelse {
-        active_backing_path_valid = false;
-        active_backing_path[0] = 0;
-        return;
-    };
-    var len: usize = 0;
-    while (len + 1 < active_backing_path.len and path_z[len] != 0) : (len += 1) {
-        active_backing_path[len] = path_z[len];
-    }
-    if (path_z[len] != 0) {
-        active_backing_path_valid = false;
-        active_backing_path[0] = 0;
-        return;
-    }
-    active_backing_path[len] = 0;
-    var clear = len + 1;
-    while (clear < active_backing_path.len) : (clear += 1) active_backing_path[clear] = 0;
-    active_backing_path_valid = true;
-}
-
-fn nextSlotGeneration() u64 {
-    slot_generation +%= 1;
-    if (slot_generation == 0) slot_generation = 1;
-    return slot_generation;
-}
-
-fn reserveSlots(input: SlotInput, result: *SlotResult) void {
-    if (input.requested_slots == 0) {
-        result.status = slot_status_invalid_request;
-        result.blockers |= slot_blocker_invalid_request;
-        return;
-    }
-
-    const reserved = countReservedSlots();
-    const free = if (active_capacity_slots >= reserved) active_capacity_slots - reserved else 0;
-    if (input.requested_slots > free) {
-        result.status = slot_status_insufficient_capacity;
-        result.blockers |= slot_blocker_insufficient_capacity;
-        return;
-    }
-
-    const extent_index = findFreeExtentIndex() orelse {
-        result.status = slot_status_table_full;
-        result.blockers |= slot_blocker_table_full;
-        return;
-    };
-    const first_slot = findFreeSlotRange(input.requested_slots, active_capacity_slots) orelse {
-        result.status = slot_status_insufficient_capacity;
-        result.blockers |= slot_blocker_insufficient_capacity;
-        return;
-    };
-    const reservation_id = allocateReservationId() orelse {
-        result.status = slot_status_table_full;
-        result.blockers |= slot_blocker_table_full;
-        return;
-    };
-
-    slot_extents[extent_index] = .{
-        .reservation_id = reservation_id,
-        .owner_kind = input.owner_kind,
-        .owner_id = input.owner_id,
-        .region_id = input.region_id,
-        .start_slot = first_slot,
-        .slot_count = input.requested_slots,
-        .state = extent_state_reserved,
-        .generation = nextSlotGeneration(),
-    };
-
-    result.status = slot_status_reserved;
-    result.reservation_id = reservation_id;
-    result.owner_kind = input.owner_kind;
-    result.owner_id = input.owner_id;
-    result.region_id = input.region_id;
-    result.first_slot = first_slot;
-    result.slot_count = input.requested_slots;
-}
-
-fn releaseSlots(input: SlotInput, result: *SlotResult) void {
-    if (input.reservation_id == 0) {
-        result.status = slot_status_invalid_request;
-        result.blockers |= slot_blocker_invalid_request;
-        return;
-    }
-
-    const index = findExtentByReservation(input.reservation_id) orelse {
-        result.status = slot_status_reservation_not_found;
-        result.blockers |= slot_blocker_reservation_not_found;
-        return;
-    };
-
-    const extent = slot_extents[index];
-    if (!ownerMatches(extent, input.owner_kind, input.owner_id, input.region_id)) {
-        result.status = slot_status_owner_mismatch;
-        result.blockers |= slot_blocker_owner_mismatch;
-        result.reservation_id = extent.reservation_id;
-        result.owner_kind = extent.owner_kind;
-        result.owner_id = extent.owner_id;
-        result.region_id = extent.region_id;
-        result.first_slot = extent.start_slot;
-        result.slot_count = extent.slot_count;
-        return;
-    }
-
-    result.status = slot_status_released;
-    result.reservation_id = extent.reservation_id;
-    result.owner_kind = extent.owner_kind;
-    result.owner_id = extent.owner_id;
-    result.region_id = extent.region_id;
-    result.first_slot = extent.start_slot;
-    result.slot_count = extent.slot_count;
-    slot_extents[index] = .{};
-    slot_generation +%= 1;
-}
-
-fn markSlotsError(input: SlotInput, result: *SlotResult) void {
-    if (input.reservation_id == 0) {
-        result.status = slot_status_invalid_request;
-        result.blockers |= slot_blocker_invalid_request;
-        return;
-    }
-
-    const index = findExtentByReservation(input.reservation_id) orelse {
-        result.status = slot_status_reservation_not_found;
-        result.blockers |= slot_blocker_reservation_not_found;
-        return;
-    };
-
-    const before = slot_extents[index];
-    if (!ownerMatches(before, input.owner_kind, input.owner_id, input.region_id)) {
-        result.status = slot_status_owner_mismatch;
-        result.blockers |= slot_blocker_owner_mismatch;
-        result.reservation_id = before.reservation_id;
-        result.owner_kind = before.owner_kind;
-        result.owner_id = before.owner_id;
-        result.region_id = before.region_id;
-        result.first_slot = before.start_slot;
-        result.slot_count = before.slot_count;
-        return;
-    }
-
-    slot_extents[index].state |= extent_state_error;
-    const extent = slot_extents[index];
-    result.status = slot_status_error_marked;
-    result.reservation_id = extent.reservation_id;
-    result.owner_kind = extent.owner_kind;
-    result.owner_id = extent.owner_id;
-    result.region_id = extent.region_id;
-    result.first_slot = extent.start_slot;
-    result.slot_count = extent.slot_count;
-    slot_generation +%= 1;
-}
-
-fn recoverSlots(input: SlotInput, result: *SlotResult) void {
-    if (input.reservation_id == 0) {
-        result.status = slot_status_invalid_request;
-        result.blockers |= slot_blocker_invalid_request;
-        return;
-    }
-
-    const index = findExtentByReservation(input.reservation_id) orelse {
-        result.status = slot_status_reservation_not_found;
-        result.blockers |= slot_blocker_reservation_not_found;
-        return;
-    };
-
-    const before = slot_extents[index];
-    if (!ownerMatches(before, input.owner_kind, input.owner_id, input.region_id)) {
-        result.status = slot_status_owner_mismatch;
-        result.blockers |= slot_blocker_owner_mismatch;
-        result.reservation_id = before.reservation_id;
-        result.owner_kind = before.owner_kind;
-        result.owner_id = before.owner_id;
-        result.region_id = before.region_id;
-        result.first_slot = before.start_slot;
-        result.slot_count = before.slot_count;
-        return;
-    }
-
-    slot_extents[index].state = extent_state_reserved;
-    slot_extents[index].generation = nextSlotGeneration();
-    const extent = slot_extents[index];
-    result.status = slot_status_recovered;
-    result.reservation_id = extent.reservation_id;
-    result.owner_kind = extent.owner_kind;
-    result.owner_id = extent.owner_id;
-    result.region_id = extent.region_id;
-    result.first_slot = extent.start_slot;
-    result.slot_count = extent.slot_count;
-    slot_generation +%= 1;
-}
-
-fn fillSlotCounts(result: *SlotResult) void {
-    var reserved: u64 = 0;
-    var valid: u64 = 0;
-    var dirty: u64 = 0;
-    var errors: u64 = 0;
-    var ranges: u32 = 0;
-
-    var index: usize = 0;
-    while (index < SLOT_TABLE_MAX_RANGES) : (index += 1) {
-        const extent = slot_extents[index];
-        if (!extentActive(extent)) continue;
-        ranges += 1;
-        reserved +%= extent.slot_count;
-        if ((extent.state & extent_state_valid) != 0) valid +%= extent.slot_count;
-        if ((extent.state & extent_state_dirty) != 0) dirty +%= extent.slot_count;
-        if ((extent.state & extent_state_error) != 0) errors +%= extent.slot_count;
-    }
-
-    result.capacity_slots = active_capacity_slots;
-    result.reserved_slots = reserved;
-    result.free_slots = if (active_capacity_slots >= reserved) active_capacity_slots - reserved else 0;
-    result.valid_slots = valid;
-    result.dirty_slots = dirty;
-    result.error_slots = errors;
-    result.range_count = ranges;
-    result.max_ranges = slot_table_max_ranges;
-    // A reservation result carries its lifetime token. A table-only probe
-    // still exposes the global change counter for inventory diagnostics.
-    result.generation = if (findExtentByReservation(result.reservation_id)) |slot|
-        slot_extents[slot].generation
-    else
-        slot_generation;
-}
-
-fn recordSlot(result: *SlotResult) void {
-    slot_state.enabled = true;
-    slot_state.probes +%= 1;
-
-    switch (result.status) {
-        slot_status_reserved => slot_state.reserves +%= 1,
-        slot_status_released => slot_state.releases +%= 1,
-        slot_status_error_marked => slot_state.error_marks +%= 1,
-        slot_status_recovered => slot_state.recoveries +%= 1,
-        slot_status_ready => {},
-        else => slot_state.failures +%= 1,
-    }
-
-    result.total_probes = slot_state.probes;
-    result.total_reserves = slot_state.reserves;
-    result.total_releases = slot_state.releases;
-    result.total_error_marks = slot_state.error_marks;
-    result.total_recoveries = slot_state.recoveries;
-    result.total_failures = slot_state.failures;
-
-    slot_state.last_status = result.status;
-    slot_state.last_operation = result.operation;
-    slot_state.last_flags = result.flags;
-    slot_state.last_blockers = result.blockers;
-    slot_state.capacity_slots = result.capacity_slots;
-    slot_state.reserved_slots = result.reserved_slots;
-    slot_state.free_slots = result.free_slots;
-    slot_state.valid_slots = result.valid_slots;
-    slot_state.dirty_slots = result.dirty_slots;
-    slot_state.error_slots = result.error_slots;
-    slot_state.range_count = result.range_count;
-    slot_state.max_ranges = result.max_ranges;
-    slot_state.last_reservation_id = result.reservation_id;
-    slot_state.last_owner_kind = result.owner_kind;
-    slot_state.last_owner_id = result.owner_id;
-    slot_state.last_region_id = result.region_id;
-    slot_state.last_first_slot = result.first_slot;
-    slot_state.last_slot_count = result.slot_count;
-    slot_state.generation = slot_generation;
-}
-
-fn recordPagerGate(result: *PagerGateResult) void {
-    pager_gate_state.enabled = true;
-    pager_gate_state.probes +%= 1;
-    if (result.status == pager_gate_status_ready) {
-        pager_gate_state.ready +%= 1;
-        if (result.rollback_completed != 0) pager_gate_state.rollbacks +%= 1;
-    } else {
-        pager_gate_state.failures +%= 1;
-    }
-
-    result.total_probes = pager_gate_state.probes;
-    result.total_ready = pager_gate_state.ready;
-    result.total_rollbacks = pager_gate_state.rollbacks;
-    result.total_failures = pager_gate_state.failures;
-
-    pager_gate_state.last_status = result.status;
-    pager_gate_state.last_flags = result.flags;
-    pager_gate_state.last_blockers = result.blockers;
-    pager_gate_state.last_region_id = result.region_id;
-    pager_gate_state.last_owner_id = result.owner_id;
-    pager_gate_state.requested_bytes = result.requested_bytes;
-    pager_gate_state.committed_bytes = result.committed_bytes;
-    pager_gate_state.resident_bytes = result.resident_bytes;
-    pager_gate_state.nonresident_bytes = result.nonresident_bytes;
-    pager_gate_state.requested_slots = result.requested_slots;
-    pager_gate_state.prepared_slots = result.prepared_slots;
-    pager_gate_state.capacity_slots = result.capacity_slots;
-    pager_gate_state.free_before_slots = result.free_before_slots;
-    pager_gate_state.free_after_slots = result.free_after_slots;
-    pager_gate_state.reserved_before_slots = result.reserved_before_slots;
-    pager_gate_state.reserved_after_slots = result.reserved_after_slots;
-    pager_gate_state.last_reservation_id = result.slot_reservation_id;
-    pager_gate_state.rollback_completed = result.rollback_completed;
-    pager_gate_state.commit_gate_enabled = result.commit_gate_enabled;
-    pager_gate_state.fault_gate_enabled = result.fault_gate_enabled;
-    pager_gate_state.pager_enabled = result.pager_enabled;
-    pager_gate_state.eviction_enabled = result.eviction_enabled;
-    pager_gate_state.page_in_enabled = result.page_in_enabled;
-    pager_gate_state.page_out_enabled = result.page_out_enabled;
-    pager_gate_state.slot_generation = result.slot_generation;
-    pager_gate_state.fault_count = result.fault_count;
-    pager_gate_state.failed_faults = result.failed_faults;
-}
-
-fn makePageIoResult(input: PageIoInput) PageIoResult {
-    var result = PageIoResult{
-        .operation = input.operation,
-        .region_id = input.region_id,
-        .reservation_id = input.reservation_id,
-        .owner_kind = input.owner_kind,
-        .owner_id = input.owner_id,
-        .region_offset = input.region_offset,
-        .committed_bytes = input.committed_bytes,
-        .resident_bytes = input.resident_bytes,
-        .slot_index = input.slot_index,
-        .page_count = input.page_count,
-        .expected_generation = input.expected_generation,
-        .io_status = input.io_status,
-        .io_bytes = input.io_bytes,
-    };
-    switch (input.operation) {
-        page_io_operation_page_out => result.flags |= page_io_flag_page_out,
-        page_io_operation_page_in => result.flags |= page_io_flag_page_in,
-        else => {},
-    }
-    if ((input.flags & page_io_flag_eviction_request) != 0) result.flags |= page_io_flag_eviction_request;
-    if ((input.flags & page_io_flag_retry_request) != 0) result.flags |= page_io_flag_retry_request;
-    return result;
-}
-
-fn validatePageIo(input: PageIoInput, result: *PageIoResult) ?usize {
-    if ((input.flags & ~supported_page_io_flags) != 0) {
-        result.status = page_io_status_unsupported_flags;
-        result.blockers |= page_io_blocker_unsupported_flags;
-        return null;
-    }
-
-    if (!validSlotOwnerKind(input.owner_kind)) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_invalid_owner;
-        return null;
-    }
-
-    if (input.operation != page_io_operation_page_out and input.operation != page_io_operation_page_in) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_invalid_request;
-        return null;
-    }
-
-    if (input.page_count == 0 or input.page_count > std.math.maxInt(u64) / PAGE_BYTES) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_invalid_request;
-        return null;
-    }
-    const transfer_bytes = input.page_count * PAGE_BYTES;
-    result.transfer_bytes = transfer_bytes;
-    if (transfer_bytes > std.math.maxInt(i32)) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_invalid_request;
-        return null;
-    }
-    if (input.page_count > 1) result.flags |= page_io_flag_multi_page;
-
-    if (!input.vm_region_exists) {
-        result.status = page_io_status_vm_region_missing;
-        result.blockers |= page_io_blocker_vm_region_missing;
-        return null;
-    }
-    result.flags |= page_io_flag_vm_region_attached;
-
-    if (!input.vm_region_is_r4x) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_vm_region_not_r4x;
-        return null;
-    }
-
-    if ((input.region_offset & (PAGE_BYTES - 1)) != 0) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_unaligned_region_offset;
-        return null;
-    }
-    if (input.region_offset > std.math.maxInt(u64) - transfer_bytes or !input.commit_covered) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_region_offset_outside_commit;
-        return null;
-    }
-
-    if (input.backing.status != status_ready) {
-        result.status = page_io_status_backing_unavailable;
-        result.blockers |= page_io_blocker_backing_not_ready;
-        return null;
-    }
-    result.flags |= page_io_flag_file_backed | page_io_flag_backing_ready;
-
-    if (input.reservation_id == 0) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_invalid_request;
-        return null;
-    }
-
-    const capacity_slots = input.backing.available_bytes / SLOT_BYTES;
-    if (active_first_cluster != input.backing.first_cluster or
-        active_file_size != input.backing.file_size or
-        active_cluster_bytes != input.backing.cluster_bytes or
-        active_capacity_slots != capacity_slots or
-        !std.ascii.eqlIgnoreCase(std.mem.sliceTo(&active_backing_path, 0), std.mem.sliceTo(&input.backing.path, 0)))
-    {
-        result.status = page_io_status_stale_generation;
-        result.blockers |= page_io_blocker_stale_generation;
-        return null;
-    }
-    result.capacity_slots = active_capacity_slots;
-    fillPageIoSlotState(result);
-
-    const extent_index = findExtentByReservation(input.reservation_id) orelse {
-        result.status = page_io_status_reservation_not_found;
-        result.blockers |= page_io_blocker_reservation_not_found;
-        return null;
-    };
-    const extent = slot_extents[extent_index];
-    result.flags |= page_io_flag_slot_reserved;
-    if (!ownerMatches(extent, input.owner_kind, input.owner_id, input.region_id)) {
-        result.status = page_io_status_owner_mismatch;
-        result.blockers |= page_io_blocker_owner_mismatch;
-        result.owner_kind = extent.owner_kind;
-        result.owner_id = extent.owner_id;
-        return null;
-    }
-    result.flags |= page_io_flag_owner_matched;
-    if (input.expected_generation != 0) {
-        result.flags |= page_io_flag_generation_checked;
-        if (input.expected_generation != extent.generation) {
-            result.status = page_io_status_stale_generation;
-            result.blockers |= page_io_blocker_stale_generation;
-            result.slot_generation = extent.generation;
-            return null;
-        }
-    }
-
-    if (input.slot_index >= extent.slot_count or input.page_count > extent.slot_count - input.slot_index) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_slot_index_out_of_range;
-        return null;
-    }
-    // Validity is tracked for the whole reservation. Its first write must
-    // initialize all slots before any subset can be read or rewritten.
-    if (input.operation == page_io_operation_page_out and
-        (extent.state & extent_state_valid) == 0 and
-        (input.slot_index != 0 or input.page_count != extent.slot_count))
-    {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_slot_index_out_of_range;
-        return null;
-    }
-    if ((extent.state & extent_state_valid) != 0) result.flags |= page_io_flag_slot_valid;
-    if ((extent.state & extent_state_dirty) != 0) {
-        result.flags |= page_io_flag_slot_dirty;
-    } else {
-        result.flags |= page_io_flag_slot_clean;
-    }
-    if ((extent.state & extent_state_error) != 0) {
-        result.status = page_io_status_slot_error;
-        result.blockers |= page_io_blocker_slot_error;
-        return null;
-    }
-    if (input.operation == page_io_operation_page_out and
-        (extent.state & extent_state_valid) != 0 and
-        (input.flags & page_io_flag_eviction_request) == 0)
-    {
-        result.status = page_io_status_slot_already_valid;
-        result.blockers |= page_io_blocker_slot_already_valid;
-        return null;
-    }
-    if (input.operation == page_io_operation_page_in and (extent.state & extent_state_valid) == 0) {
-        result.status = page_io_status_slot_not_valid;
-        result.blockers |= page_io_blocker_slot_not_valid;
-        return null;
-    }
-
-    const backing_slot = extent.start_slot + input.slot_index;
-    const backing_offset = backing_slot * SLOT_BYTES;
-    if (backing_offset > std.math.maxInt(u64) - transfer_bytes or backing_offset + transfer_bytes > input.backing.available_bytes) {
-        result.status = page_io_status_invalid_request;
-        result.blockers |= page_io_blocker_slot_index_out_of_range;
-        return null;
-    }
-
-    result.backing_slot = backing_slot;
-    result.backing_offset = backing_offset;
-    result.slot_generation = extent.generation;
-    return extent_index;
-}
-
-fn fillPageIoSlotState(result: *PageIoResult) void {
-    var slot_result = SlotResult{ .reservation_id = result.reservation_id };
-    fillSlotCounts(&slot_result);
-    result.capacity_slots = slot_result.capacity_slots;
-    result.reserved_slots = slot_result.reserved_slots;
-    result.valid_slots = slot_result.valid_slots;
-    result.dirty_slots = slot_result.dirty_slots;
-    result.error_slots = slot_result.error_slots;
-    result.slot_generation = slot_result.generation;
-}
-
-fn recordPageIo(result: *PageIoResult) void {
-    page_io_state.enabled = true;
-    if ((result.flags & page_io_flag_retry_request) != 0) page_io_state.retry_attempts +%= 1;
-    if (result.status == page_io_status_ready) {
-        page_io_state.prepares +%= 1;
-    } else if (result.status == page_io_status_page_out_ok) {
-        page_io_state.page_outs +%= 1;
-    } else if (result.status == page_io_status_page_in_ok) {
-        page_io_state.page_ins +%= 1;
-    } else {
-        page_io_state.failures +%= 1;
-        recordPageIoFailurePolicy(result);
-    }
-
-    result.total_prepares = page_io_state.prepares;
-    result.total_page_outs = page_io_state.page_outs;
-    result.total_page_ins = page_io_state.page_ins;
-    result.total_failures = page_io_state.failures;
-    result.total_retry_attempts = page_io_state.retry_attempts;
-    result.total_retryable_failures = page_io_state.retryable_failures;
-    result.total_permanent_failures = page_io_state.permanent_failures;
-    result.total_retry_limit_hits = page_io_state.retry_limit_hits;
-    result.total_failed_page_outs = page_io_state.failed_page_outs;
-    result.total_failed_page_ins = page_io_state.failed_page_ins;
-    result.total_data_preserved_pages = page_io_state.data_preserved_pages;
-    result.total_data_lost_pages = page_io_state.data_lost_pages;
-
-    page_io_state.last_status = result.status;
-    page_io_state.last_operation = result.operation;
-    page_io_state.last_flags = result.flags;
-    page_io_state.last_blockers = result.blockers;
-    page_io_state.last_region_id = result.region_id;
-    page_io_state.last_reservation_id = result.reservation_id;
-    page_io_state.last_owner_kind = result.owner_kind;
-    page_io_state.last_owner_id = result.owner_id;
-    page_io_state.region_offset = result.region_offset;
-    page_io_state.page_count = result.page_count;
-    page_io_state.transfer_bytes = result.transfer_bytes;
-    page_io_state.expected_generation = result.expected_generation;
-    page_io_state.backing_slot = result.backing_slot;
-    page_io_state.backing_offset = result.backing_offset;
-    page_io_state.io_bytes = result.io_bytes;
-    page_io_state.io_status = result.io_status;
-    page_io_state.capacity_slots = result.capacity_slots;
-    page_io_state.reserved_slots = result.reserved_slots;
-    page_io_state.valid_slots = result.valid_slots;
-    page_io_state.dirty_slots = result.dirty_slots;
-    page_io_state.error_slots = result.error_slots;
-    page_io_state.pager_enabled = result.pager_enabled;
-    page_io_state.eviction_enabled = result.eviction_enabled;
-    page_io_state.page_in_enabled = result.page_in_enabled;
-    page_io_state.page_out_enabled = result.page_out_enabled;
-    page_io_state.retry_limit = result.retry_limit;
-    page_io_state.backoff_ticks = result.backoff_ticks;
-    page_io_state.slot_generation = result.slot_generation;
-}
-
-fn recordPageIoFailurePolicy(result: *PageIoResult) void {
-    if (pageIoFailureRetryable(result.status)) {
-        result.flags |= page_io_flag_retryable_failure;
-        page_io_state.retryable_failures +%= 1;
-    } else {
-        result.flags |= page_io_flag_permanent_failure;
-        page_io_state.permanent_failures +%= 1;
-    }
-
-    if ((result.flags & page_io_flag_retry_request) != 0 and !pageIoFailureRetryable(result.status)) {
-        page_io_state.retry_limit_hits +%= 1;
-    }
-
-    if (result.operation == page_io_operation_page_out) {
-        page_io_state.failed_page_outs +%= 1;
-        page_io_state.data_preserved_pages +%= result.page_count;
-        result.flags |= page_io_flag_data_preserved;
-    } else if (result.operation == page_io_operation_page_in) {
-        page_io_state.failed_page_ins +%= 1;
-        if (result.status == page_io_status_io_failed or result.status == page_io_status_partial_io or result.status == page_io_status_backing_unavailable) {
-            page_io_state.data_preserved_pages +%= result.page_count;
-            result.flags |= page_io_flag_data_preserved;
-        }
-    }
-}
-
-fn pageIoFailureRetryable(status: u32) bool {
-    return switch (status) {
-        page_io_status_backing_unavailable,
-        page_io_status_io_failed,
-        page_io_status_partial_io,
-        => true,
-        else => false,
-    };
-}
-
-fn mapSlotFailureToPagerGate(slot_result: SlotResult, result: *PagerGateResult) void {
-    switch (slot_result.status) {
-        slot_status_backing_unavailable => {
-            result.status = pager_gate_status_backing_unavailable;
-            result.blockers |= pager_gate_blocker_backing_not_ready;
-        },
-        slot_status_insufficient_capacity => {
-            result.status = pager_gate_status_insufficient_capacity;
-            result.blockers |= pager_gate_blocker_insufficient_capacity;
-        },
-        slot_status_table_full => {
-            result.status = pager_gate_status_table_full;
-            result.blockers |= pager_gate_blocker_table_full;
-        },
-        slot_status_invalid_request => {
-            result.status = pager_gate_status_invalid_request;
-            result.blockers |= pager_gate_blocker_invalid_request;
-        },
-        else => {
-            result.status = pager_gate_status_invalid_request;
-            result.blockers |= pager_gate_blocker_invalid_request;
-        },
-    }
-}
-
-fn countReservedSlots() u64 {
-    var reserved: u64 = 0;
-    var index: usize = 0;
-    while (index < SLOT_TABLE_MAX_RANGES) : (index += 1) {
-        const extent = slot_extents[index];
-        if (!extentActive(extent)) continue;
-        reserved +%= extent.slot_count;
-    }
-    return reserved;
-}
-
-fn findFreeExtentIndex() ?usize {
-    var index: usize = 0;
-    while (index < SLOT_TABLE_MAX_RANGES) : (index += 1) {
-        if (!extentActive(slot_extents[index])) return index;
-    }
-    return null;
-}
-
-fn findFreeSlotRange(requested_slots: u64, capacity_slots: u64) ?u64 {
-    if (requested_slots == 0 or requested_slots > capacity_slots) return null;
-
-    var start: u64 = 0;
-    while (start <= capacity_slots - requested_slots) {
-        const end = start + requested_slots;
-        var moved = false;
-        var index: usize = 0;
-        while (index < SLOT_TABLE_MAX_RANGES) : (index += 1) {
-            const extent = slot_extents[index];
-            if (!extentActive(extent)) continue;
-            const extent_end = extent.start_slot + extent.slot_count;
-            if (start < extent_end and end > extent.start_slot) {
-                start = extent_end;
-                moved = true;
-                break;
-            }
-        }
-        if (!moved) return start;
-    }
-    return null;
-}
-
-fn allocateReservationId() ?u32 {
-    const start = next_reservation_id;
-    while (true) {
-        const id = next_reservation_id;
-        next_reservation_id +%= 1;
-        if (next_reservation_id == 0) next_reservation_id = 1;
-        if (id != 0 and findExtentByReservation(id) == null) return id;
-        if (next_reservation_id == start) return null;
-    }
-}
-
-fn cleanupOwner(owner_kind: u32, owner_id: u32) LifecycleCleanupResult {
-    return cleanupMatching(owner_kind, owner_id, 0, false);
-}
-
-fn cleanupRegion(owner_kind: u32, owner_id: u32, region_id: u32) LifecycleCleanupResult {
-    if (region_id == 0) return .{};
-    return cleanupMatching(owner_kind, owner_id, region_id, true);
-}
-
-fn cleanupMatching(owner_kind: u32, owner_id: u32, region_id: u32, match_region: bool) LifecycleCleanupResult {
-    if (!validSlotOwnerKind(owner_kind)) return .{};
-    var result = LifecycleCleanupResult{};
-    var index: usize = 0;
-    while (index < SLOT_TABLE_MAX_RANGES) : (index += 1) {
-        const extent = slot_extents[index];
-        if (!extentActive(extent)) continue;
-        if (extent.owner_kind != owner_kind or extent.owner_id != owner_id) continue;
-        if (match_region and extent.region_id != region_id) continue;
-
-        result.released_ranges +%= 1;
-        result.released_slots +%= extent.slot_count;
-        if ((extent.state & extent_state_valid) != 0) result.released_valid_slots +%= extent.slot_count;
-        if ((extent.state & extent_state_dirty) != 0) result.released_dirty_slots +%= extent.slot_count;
-        if ((extent.state & extent_state_error) != 0) result.released_error_slots +%= extent.slot_count;
-        slot_extents[index] = .{};
-    }
-
-    if (result.released_ranges != 0) {
-        result.cleanup_count = 1;
-        slot_generation +%= 1;
-        slot_state.lifecycle_cleanups +%= 1;
-        slot_state.lifecycle_released_ranges +%= result.released_ranges;
-        slot_state.lifecycle_released_slots +%= result.released_slots;
-        slot_state.last_owner_kind = owner_kind;
-        slot_state.last_owner_id = owner_id;
-        slot_state.last_region_id = if (match_region) region_id else 0;
-        refreshSlotSummaryCounts();
-    }
-    return result;
-}
-
-fn refreshSlotSummaryCounts() void {
-    var result = SlotResult{};
-    fillSlotCounts(&result);
-    slot_state.capacity_slots = result.capacity_slots;
-    slot_state.reserved_slots = result.reserved_slots;
-    slot_state.free_slots = result.free_slots;
-    slot_state.valid_slots = result.valid_slots;
-    slot_state.dirty_slots = result.dirty_slots;
-    slot_state.error_slots = result.error_slots;
-    slot_state.range_count = result.range_count;
-    slot_state.max_ranges = result.max_ranges;
-    slot_state.generation = slot_generation;
-}
-
-fn findExtentByReservation(reservation_id: u32) ?usize {
-    var index: usize = 0;
-    while (index < SLOT_TABLE_MAX_RANGES) : (index += 1) {
-        const extent = slot_extents[index];
-        if (extentActive(extent) and extent.reservation_id == reservation_id) return index;
-    }
-    return null;
-}
-
-fn ownerMatches(extent: SlotExtent, owner_kind: u32, owner_id: u32, region_id: u32) bool {
-    if (extent.owner_kind != owner_kind or extent.owner_id != owner_id) return false;
-    if (extent.owner_kind == slot_owner_kind_vm_region) return extent.region_id != 0 and extent.region_id == region_id;
-    if (extent.region_id != 0 and region_id != 0) return extent.region_id == region_id;
-    return extent.region_id == 0 or region_id == 0;
-}
-
-fn validSlotOwnerKind(owner_kind: u32) bool {
-    return owner_kind == slot_owner_kind_diagnostic or
-        owner_kind == slot_owner_kind_r4x_instance or
-        owner_kind == slot_owner_kind_vm_region or
-        owner_kind == slot_owner_kind_pager;
-}
-
-fn extentActive(extent: SlotExtent) bool {
-    return (extent.state & extent_state_reserved) != 0 and extent.slot_count != 0;
-}
-
 test "backing identity cannot replace live reservations" {
     const old = probe(.{ .path = "C:\\TEMP\\OLD.BIN", .file_exists = true, .fat32 = true, .file_size = 8192, .requested_bytes = 8192, .cluster_bytes = 4096, .first_cluster = 40 });
     const reserved = slotProbe(.{ .backing = old, .operation = slot_operation_reserve, .requested_slots = 1, .owner_kind = slot_owner_kind_vm_region, .owner_id = 7, .region_id = 9 });

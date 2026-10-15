@@ -326,6 +326,9 @@ static SPANS: Storage = Storage(UnsafeCell::new(State::EMPTY));
 fn state<T>(operation: impl FnOnce(&mut State) -> T) -> T {
     operation(unsafe { &mut *SPANS.0.get() })
 }
+pub(super) fn read(slot: usize) -> Span {
+    state(|state| state.spans[slot])
+}
 /// # Safety
 /// Singleton BSP initialization before readers are admitted.
 #[unsafe(no_mangle)]

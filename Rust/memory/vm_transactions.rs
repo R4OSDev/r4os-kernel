@@ -41,17 +41,13 @@ fn counters(operation: impl FnOnce(&mut Stats)) {
 }
 unsafe extern "C" {
     fn r4os_zig_vm_reschedule();
-    fn r4os_zig_vm_demand_commit(range: *mut Range, offset: u64, len: u64) -> u32;
-    fn r4os_zig_vm_uncommit_demand(range: *mut Range, base: u64, len: u64, skip: bool) -> u32;
-    fn r4os_zig_vm_pager_cleanup(range: *mut Range, operation: u8, slot: usize);
-    fn r4os_zig_vm_resident_page_state(id: u32, first_page: u64, pages: u64, mark: bool) -> u32;
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_vm_initialized() -> bool {
     READY.load(Ordering::Acquire)
 }
 /// # Safety
-/// Singleton BSP completes the range/index/span and legacy pager initialization.
+/// Singleton BSP completes the range/index/span and native pager initialization.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_vm_publish_ready() {
     counters(|stats| *stats = Stats::EMPTY);
@@ -150,7 +146,7 @@ unsafe fn partial(range: *mut Range, operation: u8, base: u64, len: u64, reset: 
 unsafe fn uncommit_span(range: *mut Range, start: u64, len: u64, skip: bool) -> Result<(), u32> {
     let current = unsafe { snapshot(range) };
     if current.window == 6 {
-        return check(unsafe { r4os_zig_vm_uncommit_demand(range, start, len, skip) });
+        return check(unsafe { super::vm_pager::uncommit_demand(range, start, len, skip) });
     }
     let end = start.checked_add(len).ok_or(5u32)?;
     let mut address =
@@ -311,7 +307,7 @@ fn commit(id: u32, offset: u64, raw_len: u64) -> Result<(), u32> {
     no_guard(current, current.base + offset, len)?;
     let range = vm_ranges::slot(slot);
     if current.window == 6 {
-        return check(unsafe { r4os_zig_vm_demand_commit(range, offset, len) });
+        return check(unsafe { super::vm_pager::demand_commit(range, offset, len) });
     }
     let pages = len / PAGE;
     if outer && pages > BATCH {
@@ -563,7 +559,8 @@ fn commit_resident(id: u32, offset: u64, raw_len: u64) -> Result<(), u32> {
     check(unsafe {
         vm_commit_spans::r4os_rust_vm_commit_span_change(0, id, start, len, ptr::null_mut())
     })?;
-    let page_code = unsafe { r4os_zig_vm_resident_page_state(id, offset / PAGE, pages, false) };
+    let page_code =
+        unsafe { super::vm_pager::resident_page_state(id, offset / PAGE, pages, false) };
     if page_code != 0 {
         let _ = remove_commit_span(id, start, len);
         return Err(page_code);
@@ -610,7 +607,7 @@ fn commit_resident(id: u32, offset: u64, raw_len: u64) -> Result<(), u32> {
             }
             done += extent.count;
         }
-        check(unsafe { r4os_zig_vm_resident_page_state(id, offset / PAGE, pages, true) })?;
+        check(unsafe { super::vm_pager::resident_page_state(id, offset / PAGE, pages, true) })?;
         block_committed(unsafe { snapshot(range) })
     })();
     if result.is_err() {
@@ -648,7 +645,7 @@ fn release(id: u32) -> Result<(), u32> {
     let range = vm_ranges::slot(slot);
     if current.window == 6 && current.owner == 3 && current.owner_id <= u64::from(u32::MAX) {
         unsafe {
-            r4os_zig_vm_pager_cleanup(range, 0, slot);
+            super::vm_pager::pager_cleanup(range, 0, slot);
         }
     }
     let resume = current.partial_uncommit_len != 0
@@ -675,9 +672,9 @@ fn release(id: u32) -> Result<(), u32> {
     }
     unsafe {
         vm_commit_spans::r4os_rust_vm_commit_span_change(2, current.id, 0, 0, ptr::null_mut());
-        r4os_zig_vm_pager_cleanup(range, 1, slot);
+        super::vm_pager::pager_cleanup(range, 1, slot);
         vm_index::r4os_rust_vm_index_change(1, current.id, 0);
-        r4os_zig_vm_pager_cleanup(range, 2, slot);
+        super::vm_pager::pager_cleanup(range, 2, slot);
         update(range, |range| {
             range.status = 5;
             range.committed_bytes = 0;
