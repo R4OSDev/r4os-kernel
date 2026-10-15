@@ -13,5 +13,6 @@ pub mod fs;
 pub mod loader;
 pub mod memory;
 pub mod platform;
+pub mod program;
 pub mod sched;
 pub mod storage;

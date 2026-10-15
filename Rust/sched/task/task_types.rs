@@ -68,7 +68,8 @@ pub enum WaitResult {
 pub enum ExecutionOwnerKind {
     None = 0,
     ProgramThread = 1,
-    DriverThread = 2,
+    AsyncIo = 2,
+    DriverThread = 3,
 }
 
 #[repr(u8)]

@@ -1,34 +1,19 @@
+//! Typed facade for the unchanged native program-owner declarations.
 const std = @import("std");
-
-/// Owner declaration, not a permission or affinity interface. Unknown and
-/// duplicate declarations fail closed; old modules retain their BSP policy.
-pub const Policy = enum { bsp, owned_v1 };
-
-/// The declaration identifies a desktop owner independently of its launch
-/// role. Admission limits this marker to GUI processes; it grants no rights.
+pub const Policy = enum(u8) { bsp, owned_v1 };
+extern fn r4os_rust_program_parallel([*]const u8, usize) u8;
+extern fn r4os_rust_program_desktop_host([*]const u8, usize) u8;
 pub fn desktopHost(metadata: []const u8) ?bool {
-    var found: ?bool = null;
-    var items = std.mem.splitScalar(u8, metadata, 0);
-    while (items.next()) |item| {
-        const prefix = "app.role=";
-        if (!std.mem.startsWith(u8, item, prefix)) continue;
-        if (found != null) return null;
-        found = std.mem.eql(u8, item[prefix.len..], "desktop_host");
-    }
-    return found orelse false;
+    return switch (r4os_rust_program_desktop_host(metadata.ptr, metadata.len)) {
+        0 => false,
+        1 => true,
+        255 => null,
+        else => unreachable,
+    };
 }
-
 pub fn parse(metadata: []const u8) ?Policy {
-    var found: ?Policy = null;
-    var items = std.mem.splitScalar(u8, metadata, 0);
-    while (items.next()) |item| {
-        const prefix = "runtime.parallel=";
-        if (!std.mem.startsWith(u8, item, prefix)) continue;
-        if (found != null) return null;
-        const value = item[prefix.len..];
-        found = if (std.mem.eql(u8, value, "owned-v1")) .owned_v1 else if (std.mem.eql(u8, value, "bsp")) .bsp else return null;
-    }
-    return found orelse .bsp;
+    const value = r4os_rust_program_parallel(metadata.ptr, metadata.len);
+    return if (value == 255) null else @enumFromInt(value);
 }
 
 test "parallel ownership metadata is explicit unique and independent of module name" {

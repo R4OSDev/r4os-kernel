@@ -4,6 +4,8 @@ pub use r4os_contract as contract;
 pub mod fs;
 #[path = "../../../Rust/loader/mod.rs"]
 pub mod loader;
+#[path = "../../../Rust/program/mod.rs"]
+pub mod program;
 // The existing Zig fixtures call the exact migrated owner implementations.
 // This host-only archive has no boot entry, MMIO execution or kernel runtime.
 #[path = "../../../Rust/memory/blocks.rs"]
@@ -90,7 +92,10 @@ pub mod sched {
     pub use crate::{sync_locks, sync_objects, sync_types, sync_wait};
 }
 pub mod memory {
-    pub use crate::{heap, layout, owner, paging, phys};
+    pub use crate::{
+        blocks, heap, layout, owner, paging, phys, virt_policy, vm_query, vm_ranges,
+        vm_transactions,
+    };
 }
 pub mod arch {
     pub use crate::callback_abort;
@@ -102,9 +107,7 @@ pub mod arch {
         }
     }
     pub use crate::fpu;
-    pub use crate::{
-        hpet, io, ioapic, lapic, msr, percpu, pic, pit, rtc, runtime, smp_policy, tlb,
-    };
+    pub use crate::{hpet, io, ioapic, lapic, msr, percpu, pic, pit, rtc, runtime, smp_policy, tlb};
 }
 pub mod platform {
     pub use crate::acpi;
@@ -265,9 +268,7 @@ pub mod driver {
         driver_registry as registry, driver_resources as resources, driver_utilities as utilities,
         driver_work_queue as work_queue, protocol_registry, resource_state,
     };
-    pub use crate::{
-        driver_semaphore_owner as semaphore_owner, driver_thread_owner as thread_owner,
-    };
+    pub use crate::{driver_semaphore_owner as semaphore_owner, driver_thread_owner as thread_owner};
     pub use crate::{driver_semaphores as semaphores, driver_threads as threads};
 }
 

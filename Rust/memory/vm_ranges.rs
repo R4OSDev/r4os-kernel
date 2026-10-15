@@ -261,6 +261,50 @@ pub unsafe extern "C" fn r4os_rust_vm_reserve_at(request: *const Reserve, output
         Err(code) => code,
     }
 }
+/// Complete first-fit reservation, including the original VM-owner admission
+/// and length/alignment normalization. `reserve_at` alone is an admitted leaf.
+/// # Safety
+/// Request/output are resident C records; the name outlives the resulting range.
+/// The request's base is ignored, as in the original first-fit reserve facade.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_vm_reserve(
+    request: *const Reserve,
+    alignment: u64,
+    output: *mut u32,
+) -> u32 {
+    let _owner = super::owner::Guard::acquire(5);
+    if !super::vm_transactions::r4os_rust_vm_initialized() {
+        return 1;
+    }
+    let mut request = unsafe { request.read() };
+    let mut len = 0;
+    let code = unsafe { virt_policy::r4os_rust_vm_normalize(request.len, false, &mut len) };
+    if code != 0 {
+        return code;
+    }
+    let mut normalized_alignment = 0;
+    let code =
+        unsafe { virt_policy::r4os_rust_vm_normalize(alignment, true, &mut normalized_alignment) };
+    if code != 0 {
+        return code;
+    }
+    let mut base = 0;
+    let code = unsafe {
+        virt_policy::r4os_rust_vm_first_fit(request.window, len, normalized_alignment, &mut base)
+    };
+    if code != 0 {
+        return code;
+    }
+    request.base = base;
+    request.len = len;
+    match reserve(request) {
+        Ok(id) => {
+            unsafe { output.write(id) };
+            0
+        }
+        Err(code) => code,
+    }
+}
 const _: () = {
     assert!(core::mem::size_of::<OptionalSlot>() == 4);
     assert!(core::mem::size_of::<Reserve>() == 56);

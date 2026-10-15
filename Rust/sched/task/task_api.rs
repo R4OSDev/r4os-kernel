@@ -38,7 +38,8 @@ fn owner(value: u8) -> ExecutionOwnerKind {
     match value {
         0 => ExecutionOwnerKind::None,
         1 => ExecutionOwnerKind::ProgramThread,
-        2 => ExecutionOwnerKind::DriverThread,
+        2 => ExecutionOwnerKind::AsyncIo,
+        3 => ExecutionOwnerKind::DriverThread,
         _ => panic!("Invalid task execution owner"),
     }
 }

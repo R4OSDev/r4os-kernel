@@ -1,54 +1,12 @@
-const metadata_prefix = "r4x.start=";
-const current_metadata = "r4x.start=r4xstart";
-
-pub const MetadataState = enum {
-    valid,
-    missing,
-    unknown,
-    duplicate,
-    conflicting,
-};
-
+//! R4XStart metadata facade. Native Rust owns the original admission policy.
+pub const MetadataState = enum(u8) { valid, missing, unknown, duplicate, conflicting };
+extern fn r4os_rust_program_start_state([*]const u8, usize) u8;
+extern fn r4os_rust_program_start_accepts([*]const u8, usize, bool, u32) bool;
 pub fn metadataState(meta: []const u8) MetadataState {
-    var current_count: usize = 0;
-    var unknown_count: usize = 0;
-    var cursor: usize = 0;
-
-    while (cursor < meta.len) {
-        var end = cursor;
-        while (end < meta.len and meta[end] != 0) : (end += 1) {}
-        const item = meta[cursor..end];
-        if (startsWith(item, metadata_prefix)) {
-            if (eql(item, current_metadata)) {
-                current_count += 1;
-            } else {
-                unknown_count += 1;
-            }
-        }
-        cursor = end + 1;
-    }
-
-    if (current_count == 0 and unknown_count == 0) return .missing;
-    if (current_count == 0) return if (unknown_count == 1) .unknown else .duplicate;
-    if (unknown_count != 0) return .conflicting;
-    if (current_count != 1) return .duplicate;
-    return .valid;
+    return @enumFromInt(r4os_rust_program_start_state(meta.ptr, meta.len));
 }
-
 pub fn accepts(meta: []const u8, has_entry_export_v1: bool, export_count: u32) bool {
-    return metadataState(meta) == .valid and has_entry_export_v1 and export_count >= 1;
-}
-
-fn startsWith(value: []const u8, prefix: []const u8) bool {
-    return value.len >= prefix.len and eql(value[0..prefix.len], prefix);
-}
-
-fn eql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |left, right| {
-        if (left != right) return false;
-    }
-    return true;
+    return r4os_rust_program_start_accepts(meta.ptr, meta.len, has_entry_export_v1, export_count);
 }
 
 test "current R4X start metadata matrix" {

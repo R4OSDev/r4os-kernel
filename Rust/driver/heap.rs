@@ -68,7 +68,11 @@ impl Operation {
     fn enter() -> Option<Self> {
         let _guard = RuntimeGuard::acquire();
         let token = unsafe { task_context::enter() };
-        token.admitted().then_some(Self(token))
+        if token.admitted() {
+            Some(Self(token))
+        } else {
+            None
+        }
     }
 }
 impl Drop for Operation {

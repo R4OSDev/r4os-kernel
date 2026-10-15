@@ -1,5 +1,24 @@
 const std = @import("std");
 
+extern fn r4os_rust_program_alpha8_validate(u32, u32, u32, usize, u32, u32, usize, *Geometry) u8;
+extern fn r4os_rust_program_alpha8_pack([*]u32, usize, [*]const u8, usize, u32, u32, u32, *usize) u8;
+extern fn r4os_rust_program_alpha8_byte([*]const u32, usize, usize, *u8) bool;
+fn nativeError(status: u8) Error {
+    return switch (status) {
+        1 => error.InvalidDimensions,
+        2 => error.InvalidStride,
+        3 => error.SourceTooSmall,
+        4 => error.DestinationTooSmall,
+        5 => error.Overflow,
+        else => unreachable,
+    };
+}
+comptime {
+    if (@sizeOf(Geometry) != 24 or @alignOf(Geometry) != 8 or @offsetOf(Geometry, "pixel_count") != 0 or @offsetOf(Geometry, "source_bytes") != 8 or @offsetOf(Geometry, "packed_words") != 16)
+        @compileError("Native Alpha8 original geometry drift");
+}
+
+
 pub const Error = error{
     InvalidDimensions,
     InvalidStride,
@@ -8,7 +27,7 @@ pub const Error = error{
     Overflow,
 };
 
-pub const Geometry = struct {
+pub const Geometry = extern struct {
     pixel_count: usize,
     source_bytes: usize,
     packed_words: usize,
@@ -23,49 +42,24 @@ pub fn validate(
     max_height: u32,
     max_pixels: usize,
 ) Error!Geometry {
-    if (width == 0 or height == 0 or width > max_width or height > max_height) return error.InvalidDimensions;
-    if (stride < width) return error.InvalidStride;
-
-    const pixel_count = std.math.mul(usize, @as(usize, width), @as(usize, height)) catch return error.Overflow;
-    if (pixel_count > max_pixels) return error.InvalidDimensions;
-    const preceding_rows = std.math.mul(usize, @as(usize, height - 1), @as(usize, stride)) catch return error.Overflow;
-    const source_bytes = std.math.add(usize, preceding_rows, @as(usize, width)) catch return error.Overflow;
-    if (source_len < source_bytes) return error.SourceTooSmall;
-    const rounded = std.math.add(usize, pixel_count, 3) catch return error.Overflow;
-    return .{
-        .pixel_count = pixel_count,
-        .source_bytes = source_bytes,
-        .packed_words = rounded / 4,
-    };
+    var result: Geometry = undefined;
+    const status = r4os_rust_program_alpha8_validate(width, height, stride, source_len, max_width, max_height, max_pixels, &result);
+    if (status != 0) return nativeError(status);
+    return result;
 }
 
 /// Copies a potentially padded Alpha8 source into tightly packed little-endian
 /// words.  Padding bytes never cross the transport boundary.
 pub fn packCompact(destination: []u32, source: []const u8, width: u32, height: u32, stride: u32) Error!usize {
-    const geometry = try validate(width, height, stride, source.len, width, height, std.math.maxInt(usize));
-    if (destination.len < geometry.packed_words) return error.DestinationTooSmall;
-    @memset(destination[0..geometry.packed_words], 0);
-
-    const row_width: usize = @intCast(width);
-    const row_stride: usize = @intCast(stride);
-    var output_index: usize = 0;
-    var row: usize = 0;
-    while (row < @as(usize, height)) : (row += 1) {
-        const source_row = row * row_stride;
-        var column: usize = 0;
-        while (column < row_width) : (column += 1) {
-            const shift: u5 = @intCast((output_index & 3) * 8);
-            destination[output_index / 4] |= @as(u32, source[source_row + column]) << shift;
-            output_index += 1;
-        }
-    }
-    return geometry.packed_words;
+    var result: usize = undefined;
+    const status = r4os_rust_program_alpha8_pack(destination.ptr, destination.len, source.ptr, source.len, width, height, stride, &result);
+    if (status != 0) return nativeError(status);
+    return result;
 }
 
 pub fn packedByte(words: []const u32, byte_index: usize) ?u8 {
-    if (byte_index / 4 >= words.len) return null;
-    const shift: u5 = @intCast((byte_index & 3) * 8);
-    return @truncate(words[byte_index / 4] >> shift);
+    var result: u8 = undefined;
+    return if (r4os_rust_program_alpha8_byte(words.ptr, words.len, byte_index, &result)) result else null;
 }
 
 test "alpha8 transport validates padded sources and packs only visible bytes" {

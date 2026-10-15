@@ -1,16 +1,12 @@
+//! Native natural-exit ownership decision; the original fixture stays Zig.
 const std = @import("std");
-
-/// A naturally returned R4X task owns its kernel exit epilogue until its
-/// generation-checked execution pin has been released and the scheduler
-/// reaper has removed the exact Task generation. The program reaper must not
-/// kill or claim the task while either owner is still present. Hard-killed
-/// threads use a different ProgramThread state and remain program-reaper-owned.
+extern fn r4os_rust_program_natural_exit(bool, bool, bool) bool;
 pub fn naturalExitEpilogueOwnsTask(
     exited: bool,
     execution_pinned: bool,
     scheduler_task_present: bool,
 ) bool {
-    return exited and (execution_pinned or scheduler_task_present);
+    return r4os_rust_program_natural_exit(exited, execution_pinned, scheduler_task_present);
 }
 
 test "natural exit owns task through scheduler task retirement" {
