@@ -82,20 +82,6 @@ pub struct OptionalSpan {
     pub value: Span,
 }
 unsafe extern "C" {
-    fn r4os_zig_audio_boot_option(
-        config: *const c_void,
-        driver: *const u8,
-        driver_len: usize,
-        key: *const u8,
-        key_len: usize,
-        out: *mut OptionalSpan,
-    );
-    fn r4os_zig_audio_boot_driver(
-        config: *const c_void,
-        name: *const u8,
-        len: usize,
-        disabled: bool,
-    ) -> bool;
     fn r4os_zig_audio_boot_fail(text: *const u8, len: usize) -> bool;
     fn r4os_zig_audio_boot_status(text: *const u8, len: usize);
 }
@@ -118,7 +104,13 @@ unsafe fn fail(message: &[u8], reason: &'static [u8]) -> bool {
     }
 }
 unsafe fn driver(config: *const c_void, name: &[u8], disabled: bool) -> bool {
-    unsafe { r4os_zig_audio_boot_driver(config, name.as_ptr(), name.len(), disabled) }
+    unsafe {
+        if disabled {
+            crate::boot::config::is_disabled(config.cast(), name)
+        } else {
+            crate::boot::config::has_driver(config.cast(), name)
+        }
+    }
 }
 pub(crate) unsafe fn init() -> bool {
     unsafe {
@@ -163,7 +155,14 @@ unsafe fn apply_sid_model(config: *const c_void) {
             present: false,
             value: Span::EMPTY,
         };
-        r4os_zig_audio_boot_option(config, b"SID".as_ptr(), 3, b"model".as_ptr(), 5, &mut value);
+        if let Some(text) = crate::boot::config::option_value(config.cast(), b"SID", b"model") {
+            value.present = true;
+            value.value = Span {
+                pointer: text.as_ptr(),
+                len: text.len(),
+            };
+        }
+
         if value.present {
             let model = value.value.bytes();
             g!(sid_option_present) = true;

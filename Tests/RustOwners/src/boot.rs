@@ -32,3 +32,6 @@ pub mod serial;
 
 // Exact native visible boot renderer dependencies; pure fixtures do not boot.
 pub use crate::{limine, r4b};
+
+#[path = "../../../Rust/boot/config.rs"]
+pub mod config;

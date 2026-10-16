@@ -1,4 +1,3 @@
-const boot_config = @import("boot_config.zig");
 const boot_status = @import("boot_status.zig");
 const fatal = @import("fatal.zig");
 const MAX_SID_MODEL: usize = 16;
@@ -111,15 +110,6 @@ pub fn backendStateName(state: BackendState) []const u8 {
 }
 pub fn dumpStatus() void {
     _ = r4os_rust_audio_boot(10, 0, null);
-}
-export fn r4os_zig_audio_boot_option(raw: *const anyopaque, driver: [*]const u8, driver_len: usize, key: [*]const u8, key_len: usize, out: *OptionalSpan) callconv(.c) void {
-    const config: *const boot_config.Config = @ptrCast(@alignCast(raw));
-    out.* = .{};
-    if (boot_config.optionValue(config, driver[0..driver_len], key[0..key_len])) |value| out.* = .{ .present = true, .value = .{ .pointer = value.ptr, .len = value.len } };
-}
-export fn r4os_zig_audio_boot_driver(raw: *const anyopaque, name: [*]const u8, len: usize, disabled: bool) callconv(.c) bool {
-    const config: *const boot_config.Config = @ptrCast(@alignCast(raw));
-    return if (disabled) boot_config.isDisabled(config, name[0..len]) else boot_config.hasDriver(config, name[0..len]);
 }
 export fn r4os_zig_audio_boot_fail(data: [*]const u8, len: usize) callconv(.c) bool {
     return fatal.fail(.audio, data[0..len]);

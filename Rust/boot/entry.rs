@@ -66,8 +66,16 @@ pub extern "C" fn kmain() -> ! {
     require(action(17), 7, b"Storage controller boot failed");
     step(10, 83, b"System laden");
     // Durable recovery must finish before library/config/font caches exist.
-    require(action(18), 10, b"System update recovery failed");
-    require(action(19), 10, b"Upload publish claim recovery failed");
+    require(
+        crate::update::boot::recover_before_runtime(),
+        10,
+        b"System update recovery failed",
+    );
+    require(
+        crate::update::upload_boot::recover_before_runtime(),
+        10,
+        b"Upload publish claim recovery failed",
+    );
     require(action(20), 10, b"Loader boot failed");
     step(11, 87, b"Interrupts starten");
     require(action(21), 11, b"Platform IRQ boot failed");

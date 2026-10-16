@@ -112,6 +112,7 @@ pub mod vm_pager_api;
 #[path = "../../../Rust/memory/vm_pager_diagnostics.rs"]
 pub mod vm_pager_diagnostics;
 pub mod memory {
+    pub use crate::root;
     pub use crate::{
         backing_types, backing_store, reclaim, vm_pager_types, vm_page_state, vm_pager,
         vm_pager_api, vm_pager_diagnostics,
@@ -122,6 +123,7 @@ pub mod memory {
     };
 }
 pub mod arch {
+    pub use crate::terminal_power;
     pub use crate::callback_abort;
     // Scalar native SMP admission uses the same exported symbol as the product.
     // Host owner cases never start CPUs; an unexpected call fails via the trap.
@@ -448,3 +450,8 @@ pub mod gfx;
 
 #[path="../../../Rust/audio/mod.rs"]
 pub mod audio;
+
+#[path="../../../Rust/arch/terminal_power.rs"]
+pub mod terminal_power;
+#[path="../../../Rust/update/mod.rs"]
+pub mod update;

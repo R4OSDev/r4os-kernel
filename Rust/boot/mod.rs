@@ -9,3 +9,4 @@ pub mod owner;
 pub mod r4b;
 pub mod runtime;
 pub mod serial;
+pub mod config;

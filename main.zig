@@ -23,8 +23,6 @@ const usb_protocol_preload_boot = @import("kernel/usb_protocol_preload_boot.zig"
 const service_boot = @import("kernel/service_boot.zig");
 const platform_boot = @import("kernel/platform_boot.zig");
 const loader_boot = @import("kernel/loader_boot.zig");
-const system_update_recovery_boot = @import("kernel/system_update_recovery_boot.zig");
-const upload_claim_boot = @import("kernel/upload_claim_boot.zig");
 const platform_irq_boot = @import("kernel/platform_irq_boot.zig");
 const audio_boot = @import("kernel/audio_boot.zig");
 const network_boot = @import("kernel/network_boot.zig");
@@ -123,8 +121,6 @@ export fn r4os_zig_boot_action(action: u32) callconv(.c) bool {
             _ = platform_boot.pcieStatus() orelse fatal.kernelFatal(.platform, "PCIe status missing after platform boot");
         },
         17 => return storage_boot.initControllers(platform_boot.pcieStatus().?),
-        18 => return system_update_recovery_boot.recoverBeforeRuntime(),
-        19 => return upload_claim_boot.recoverBeforeRuntime(),
         20 => return loader_boot.initFilesystemLoader(),
         21 => return platform_irq_boot.init(),
         22 => return audio_boot.init(),

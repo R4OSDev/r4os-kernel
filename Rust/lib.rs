@@ -30,3 +30,4 @@ pub mod display;
 pub mod gfx;
 
 pub mod audio;
+pub mod update;

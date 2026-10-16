@@ -1,30 +1,7 @@
 //! Original exact create-only handover/retry and durable claim integration.
 //! No stale path or old visibility acknowledgement authorizes deletion.
-use super::super::registry_format_types::Bytes;
 use super::{fs, path, stream_state as s};
 use core::{cell::UnsafeCell, ptr};
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct ClaimInput {
-    pub volume: fs::Volume,
-    pub parent: Bytes,
-    pub staged: Bytes,
-    pub target: Bytes,
-    pub backup: Bytes,
-    pub node: u64,
-    pub node_generation: u16,
-    pub size: u64,
-    pub protocol: u8,
-    pub generation: u64,
-}
-unsafe extern "C" {
-    fn r4os_zig_sys_publish_claim(
-        refresh: bool,
-        input: *const ClaimInput,
-        out_generation: *mut u64,
-    ) -> bool;
-    fn r4os_zig_sys_publish_retire(generation: u64) -> bool;
-}
 struct ParentBuffers(UnsafeCell<[[u8; 1026]; 26]>);
 // SAFETY: Each scratch buffer belongs to its matching admitted filesystem
 // lane. Independent lanes cannot overwrite a borrowed claim parent over I/O.
@@ -75,30 +52,35 @@ pub(super) unsafe fn claim(
     protocol: u8,
     generation: u64,
 ) -> Option<u64> {
-    unsafe {
-        let input = ClaimInput {
-            volume,
-            parent: Bytes::from_slice(parent),
-            staged: Bytes::from_slice(staged),
-            target: Bytes::from_slice(target),
-            backup: Bytes::from_slice(backup),
+    let args = crate::update::claim_store::WriteArgs {
+        volume,
+        parent: fs::bytes(parent),
+        stage: fs::bytes(staged),
+        target: fs::bytes(target),
+        backup: fs::bytes(backup),
+        identity: crate::update::claim::Identity {
             node,
-            node_generation,
+            generation: node_generation,
             size,
-            protocol,
-            generation,
-        };
-        let mut output = 0;
-        if r4os_zig_sys_publish_claim(refresh, &input, &mut output) {
-            Some(output)
+        },
+        protocol,
+        reuse_generation: generation,
+    };
+    let result = crate::update::claim_store::write_mode(refresh, &args);
+    if result.ok {
+        Some(if refresh {
+            generation
         } else {
-            None
-        }
+            result.generation
+        })
+    } else {
+        None
     }
 }
 pub(super) unsafe fn retire(generation: u64) -> bool {
-    unsafe { r4os_zig_sys_publish_retire(generation) }
+    crate::update::claim_store::retire(generation)
 }
+
 pub(super) unsafe fn target<'a>(slot: *const s::Slot) -> &'a [u8] {
     unsafe {
         core::slice::from_raw_parts(

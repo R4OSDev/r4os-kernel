@@ -26,7 +26,6 @@ unsafe extern "C" {
     fn r4os_zig_sys_bootlog_info(out: *mut c::BootLogInfo);
     fn r4os_zig_sys_bootlog_read(snapshot: bool, offset: usize, out: *mut u8, len: usize) -> usize;
     fn r4os_zig_sys_power_transition(operation: u8, ticks: u64, reason: Bytes) -> bool;
-    fn r4os_zig_sys_power_terminal(reboot: bool) -> !;
     fn r4os_zig_sys_serial_flush();
     fn r4os_zig_sys_version() -> Bytes;
 }
@@ -310,11 +309,11 @@ pub unsafe extern "C" fn r4os_rust_sys_reboot() {
             );
             save_log(b"poweroff-device-handoff");
             r4os_zig_sys_serial_flush();
-            r4os_zig_sys_power_terminal(false);
+            crate::arch::terminal_power::poweroff();
         }
         save_log(b"warm-reset-ready");
         r4os_zig_sys_serial_flush();
-        r4os_zig_sys_power_terminal(true);
+        crate::arch::terminal_power::reboot();
     }
 }
 /// # Safety
@@ -326,6 +325,6 @@ pub unsafe extern "C" fn r4os_rust_sys_poweroff() -> ! {
         flush_registry();
         flush_page_cache();
         r4os_zig_sys_serial_flush();
-        r4os_zig_sys_power_terminal(false)
+        crate::arch::terminal_power::poweroff()
     }
 }

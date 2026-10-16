@@ -5,9 +5,6 @@ const drive=@import("../fs/drive.zig");
 const vfs=@import("../fs/vfs.zig");
 const fs_request=@import("../fs/request.zig");
 const time_core=@import("../platform/time.zig");
-const upc=@import("upload_publish_claim");
-const system_update_atomic=@import("../fs/system_update_atomic.zig");
-const upload_claim_store=@import("../fs/upload_claim_store.zig");
 const bootlog=@import("../kernel/bootlog.zig");
 const k=@import("../kernel/log.zig");
 const power=@import("../arch/x86_64/power.zig");
@@ -758,15 +755,8 @@ const NativeBytes=extern struct {
 };
 fn nativeBytes(value:[]const u8) NativeBytes{return .{.data=value.ptr,.len=value.len};}
 const NativeTarget=extern struct {drive_ref:*drive.Drive,path:NativeBytes};
-const NativeClaimInput=extern struct {
-    volume:vfs.NativeVolume,parent:NativeBytes,staged:NativeBytes,target:NativeBytes,backup:NativeBytes,
-    node:u64,node_generation:u16,size:u64,protocol:u8,generation:u64,
-};
-const NativeUpdateInput=extern struct {
-    volume:vfs.NativeVolume,parent:u64,target:NativeBytes,staged:NativeBytes,backup:NativeBytes,previous:NativeBytes,
-    forward:bool,long_stage:bool,target_existed:bool,old_known:bool,previous_known:bool,
-    new_size:u64,new_checksum:u32,old_size:u64,old_checksum:u32,previous_size:u64,previous_checksum:u32,
-};
+
+
 extern fn r4os_rust_sys_set_provider(u8,usize) callconv(.c) void;
 extern fn r4os_rust_sys_failure(*FsFailureDiagnostic) callconv(.c) void;
 extern fn r4os_rust_sys_rewrite(NativeBytes,[*]u8,usize,[*]u8,usize,*const anyopaque,usize) callconv(.c) i32;
@@ -789,26 +779,6 @@ export fn r4os_zig_sys_rewrite(address:usize,input:NativeBytes,output:[*]u8,capa
     const provider:RewriteFileFn=@ptrFromInt(address);out.*=provider(input.slice(),output[0..capacity],context) orelse return false;return true;
 }
 
-// Still-assigned claim/update peers retain their sole state and algorithms.
-// These transports project fixed C records into their source-level values.
-export fn r4os_zig_sys_publish_claim(refresh:bool,input:*const NativeClaimInput,out_generation:*u64) callconv(.c) bool {
-    const value=input.*;const volume=vfs.volumeFromNative(value.volume);
-    const identity:upc.FileIdentity=.{.node=value.node,.generation=value.node_generation,.size=value.size};
-    const protocol:upc.Protocol=@enumFromInt(value.protocol);
-    if(refresh){out_generation.*=value.generation;return upload_claim_store.refreshIdentity(volume,value.parent.slice(),value.staged.slice(),value.target.slice(),value.backup.slice(),identity,protocol,value.generation);}
-    const result=upload_claim_store.beginPublish(volume,value.parent.slice(),value.staged.slice(),value.target.slice(),value.backup.slice(),identity,protocol);
-    out_generation.*=result.generation;return result.ok;
-}
-export fn r4os_zig_sys_publish_retire(generation:u64) callconv(.c) bool {return upload_claim_store.retire(generation);}
-export fn r4os_zig_sys_update(cleanup:bool,input:*const NativeUpdateInput) callconv(.c) u8 {
-    const value=input.*;const volume=vfs.volumeFromNative(value.volume);
-    return @intFromEnum(if(cleanup) system_update_atomic.cleanupPayload(volume,value.parent,value.target.slice(),value.staged.slice(),value.backup.slice(),value.previous.slice(),.{
-        .new_size=value.new_size,.new_checksum=value.new_checksum,.target_existed=value.target_existed,.old_known=value.old_known,.old_size=value.old_size,.old_checksum=value.old_checksum,
-        .previous_known=value.previous_known,.previous_size=value.previous_size,.previous_checksum=value.previous_checksum,
-    }) else system_update_atomic.transition(volume,value.parent,value.target.slice(),value.staged.slice(),value.backup.slice(),if(value.forward) .forward else .rollback,.{
-        .long_stage=value.long_stage,.target_existed=value.target_existed,.old_known=value.old_known,.new_size=value.new_size,.new_checksum=value.new_checksum,.old_size=value.old_size,.old_checksum=value.old_checksum,
-    }));
-}
 // Resident log snapshot/peer leaves. Native R4SYS owns caller-buffer staging,
 // system transition decisions and the single reboot-admission flag.
 export fn r4os_zig_sys_bootlog_info(out:*BootLogInfo) callconv(.c) void {
@@ -826,7 +796,6 @@ export fn r4os_zig_sys_power_transition(operation:u8,ticks_value:u64,reason:Nati
         4=>@import("../display/display.zig").systemTransitionQuiesced(),else=>unreachable,
     };
 }
-export fn r4os_zig_sys_power_terminal(reboot:bool) callconv(.c) noreturn {if(reboot) reset.reboot() else power.poweroff();}
 export fn r4os_zig_sys_serial_flush() callconv(.c) void {k.serialFlush();}
 export fn r4os_zig_sys_version() callconv(.c) NativeBytes {return nativeBytes(@import("../kernel/version.zig").text);}
 export fn r4os_zig_sys_stream_error(admission:bool,letter:u8,phase:u32,offset:u64,len:u32,native_volume:*const vfs.NativeVolume) callconv(.c) void {
@@ -882,34 +851,5 @@ comptime {
     if(@offsetOf(FsFailureDiagnostic,"kind")!=8) @compileError("R4SYS C FsFailureDiagnostic.kind");
     if(@offsetOf(FsFailureDiagnostic,"result")!=12) @compileError("R4SYS C FsFailureDiagnostic.result");
     if(@offsetOf(FsFailureDiagnostic,"lookup_stage")!=16) @compileError("R4SYS C FsFailureDiagnostic.lookup_stage");
-    if(@sizeOf(NativeClaimInput)!=192 or @alignOf(NativeClaimInput)!=8) @compileError("R4SYS C NativeClaimInput size/alignment");
-    if(@offsetOf(NativeClaimInput,"volume")!=0) @compileError("R4SYS C NativeClaimInput.volume");
-    if(@offsetOf(NativeClaimInput,"parent")!=88) @compileError("R4SYS C NativeClaimInput.parent");
-    if(@offsetOf(NativeClaimInput,"staged")!=104) @compileError("R4SYS C NativeClaimInput.staged");
-    if(@offsetOf(NativeClaimInput,"target")!=120) @compileError("R4SYS C NativeClaimInput.target");
-    if(@offsetOf(NativeClaimInput,"backup")!=136) @compileError("R4SYS C NativeClaimInput.backup");
-    if(@offsetOf(NativeClaimInput,"node")!=152) @compileError("R4SYS C NativeClaimInput.node");
-    if(@offsetOf(NativeClaimInput,"node_generation")!=160) @compileError("R4SYS C NativeClaimInput.node_generation");
-    if(@offsetOf(NativeClaimInput,"size")!=168) @compileError("R4SYS C NativeClaimInput.size");
-    if(@offsetOf(NativeClaimInput,"protocol")!=176) @compileError("R4SYS C NativeClaimInput.protocol");
-    if(@offsetOf(NativeClaimInput,"generation")!=184) @compileError("R4SYS C NativeClaimInput.generation");
-    if(@sizeOf(NativeUpdateInput)!=216 or @alignOf(NativeUpdateInput)!=8) @compileError("R4SYS C NativeUpdateInput size/alignment");
-    if(@offsetOf(NativeUpdateInput,"volume")!=0) @compileError("R4SYS C NativeUpdateInput.volume");
-    if(@offsetOf(NativeUpdateInput,"parent")!=88) @compileError("R4SYS C NativeUpdateInput.parent");
-    if(@offsetOf(NativeUpdateInput,"target")!=96) @compileError("R4SYS C NativeUpdateInput.target");
-    if(@offsetOf(NativeUpdateInput,"staged")!=112) @compileError("R4SYS C NativeUpdateInput.staged");
-    if(@offsetOf(NativeUpdateInput,"backup")!=128) @compileError("R4SYS C NativeUpdateInput.backup");
-    if(@offsetOf(NativeUpdateInput,"previous")!=144) @compileError("R4SYS C NativeUpdateInput.previous");
-    if(@offsetOf(NativeUpdateInput,"forward")!=160) @compileError("R4SYS C NativeUpdateInput.forward");
-    if(@offsetOf(NativeUpdateInput,"long_stage")!=161) @compileError("R4SYS C NativeUpdateInput.long_stage");
-    if(@offsetOf(NativeUpdateInput,"target_existed")!=162) @compileError("R4SYS C NativeUpdateInput.target_existed");
-    if(@offsetOf(NativeUpdateInput,"old_known")!=163) @compileError("R4SYS C NativeUpdateInput.old_known");
-    if(@offsetOf(NativeUpdateInput,"previous_known")!=164) @compileError("R4SYS C NativeUpdateInput.previous_known");
-    if(@offsetOf(NativeUpdateInput,"new_size")!=168) @compileError("R4SYS C NativeUpdateInput.new_size");
-    if(@offsetOf(NativeUpdateInput,"new_checksum")!=176) @compileError("R4SYS C NativeUpdateInput.new_checksum");
-    if(@offsetOf(NativeUpdateInput,"old_size")!=184) @compileError("R4SYS C NativeUpdateInput.old_size");
-    if(@offsetOf(NativeUpdateInput,"old_checksum")!=192) @compileError("R4SYS C NativeUpdateInput.old_checksum");
-    if(@offsetOf(NativeUpdateInput,"previous_size")!=200) @compileError("R4SYS C NativeUpdateInput.previous_size");
-    if(@offsetOf(NativeUpdateInput,"previous_checksum")!=208) @compileError("R4SYS C NativeUpdateInput.previous_checksum");
     _ = @import("../fs/directory_changes.zig");
 }

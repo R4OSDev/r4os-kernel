@@ -387,9 +387,8 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_declare(
         0
     }
 }
-#[repr(C)]
 #[derive(Clone, Copy)]
-pub struct UpdateInput {
+struct UpdateInput {
     pub volume: fs::Volume,
     pub parent: u64,
     pub target: Bytes,
@@ -408,8 +407,52 @@ pub struct UpdateInput {
     pub previous_size: u64,
     pub previous_checksum: u32,
 }
-unsafe extern "C" {
-    fn r4os_zig_sys_update(cleanup: bool, input: *const UpdateInput) -> u8;
+fn update(cleanup: bool, input: &UpdateInput) -> u8 {
+    use crate::update::atomic as owner;
+    let v = input;
+    let span = |b: Bytes| fs::Bytes {
+        data: b.data,
+        len: b.len,
+    };
+    if cleanup {
+        owner::cleanup(
+            v.volume,
+            v.parent,
+            span(v.target),
+            span(v.staged),
+            span(v.backup),
+            span(v.previous),
+            owner::CleanupSpec {
+                new_size: v.new_size,
+                new_checksum: v.new_checksum,
+                target_existed: v.target_existed,
+                old_known: v.old_known,
+                old_size: v.old_size,
+                old_checksum: v.old_checksum,
+                previous_known: v.previous_known,
+                previous_size: v.previous_size,
+                previous_checksum: v.previous_checksum,
+            },
+        )
+    } else {
+        owner::transition(
+            v.volume,
+            v.parent,
+            span(v.target),
+            span(v.staged),
+            span(v.backup),
+            if v.forward { 0 } else { 1 },
+            owner::Spec {
+                long_stage: v.long_stage,
+                target_existed: v.target_existed,
+                old_known: v.old_known,
+                new_size: v.new_size,
+                new_checksum: v.new_checksum,
+                old_size: v.old_size,
+                old_checksum: v.old_checksum,
+            },
+        )
+    }
 }
 fn update_result(raw: u8) -> i32 {
     match raw {
@@ -507,7 +550,7 @@ pub unsafe extern "C" fn r4os_rust_sys_update_checked(
                 names[index],
             );
         }
-        let result = r4os_zig_sys_update(
+        let result = update(
             false,
             &UpdateInput {
                 volume,
@@ -636,7 +679,7 @@ pub unsafe extern "C" fn r4os_rust_sys_update_cleanup(
                 return -5;
             }
         }
-        let result = r4os_zig_sys_update(
+        let result = update(
             true,
             &UpdateInput {
                 volume,

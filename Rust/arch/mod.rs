@@ -17,3 +17,4 @@ pub mod smp_policy;
 pub mod smp_probe;
 pub mod tables;
 pub mod tlb;
+pub mod terminal_power;
