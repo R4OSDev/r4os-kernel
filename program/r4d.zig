@@ -2,7 +2,6 @@
 //! runtime generations, driver admission and the complete terminal lifecycle.
 const api = @import("r4x_api.zig");
 const driver_api = @import("../kernel/driver_api.zig");
-const loader_perf = @import("../kernel/loader_perf.zig");
 
 pub const RuntimeLoadResult = enum(u8) {
     loaded,
@@ -50,18 +49,7 @@ pub fn moduleInfo(owner: u32) ModuleInfoResult {
 // Stateless projection of the canonical generated callback template. The
 // sole initialized DriverApi table already belongs to the native owner.
 export fn r4os_zig_r4d_table() callconv(.c) *const driver_api.Table { return driver_api.table(); }
-export fn r4os_zig_r4d_perf(operation: u8, value: u64) callconv(.c) u64 {
-    switch (operation) {
-        0 => return loader_perf.now(),
-        1 => loader_perf.addR4dScanTicks(value),
-        2 => loader_perf.recordR4dScanEntry(),
-        3 => loader_perf.recordR4dCandidate(),
-        4 => loader_perf.recordR4dResults(@intCast(value)),
-        5 => loader_perf.addR4dProbeTicks(value),
-        else => unreachable,
-    }
-    return 0;
-}
+
 comptime {
     if (@sizeOf(Bytes) != 16 or @sizeOf(api.DriverModuleInfo) != 128) @compileError("R4D facade C layout drift");
 }

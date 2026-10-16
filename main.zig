@@ -263,3 +263,6 @@ fn handleZigPanic(message: []const u8, ret_addr: ?usize) noreturn {
     }
     fatal.zigPanic(message);
 }
+
+// Retain the existing inventory snapshot leaves until final Rust cleanup.
+comptime { _ = @import("platform/device_inventory.zig"); }

@@ -3,6 +3,7 @@
 use crate::arch::runtime;
 use core::{cell::UnsafeCell, mem, slice};
 pub const MAX_PROTOCOLS: usize = 64;
+pub(crate) const MAX_ROLE: usize = 64;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Entry {
@@ -351,4 +352,15 @@ pub unsafe extern "C" fn r4os_rust_protocol_registry_query(
     };
     runtime::restore_runtime(flags);
     result
+}
+
+/// Preserve the original public diagnostic preference: an installed R4P row,
+/// including its failed/disabled state, precedes the built-in fallback row.
+pub(crate) fn diagnostic_entry(role: &[u8]) -> Option<Entry> {
+    let _owner = runtime::RuntimeGuard::acquire();
+    unsafe {
+        find(role, 1)
+            .or_else(|| find(role, 0))
+            .map(|slot| row(slot).read())
+    }
 }

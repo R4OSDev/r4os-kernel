@@ -22,12 +22,6 @@ const LIMITS: r4m::Limits = r4m::Limits {
     require_sections: true,
     require_entries: true,
 };
-unsafe extern "C" {
-    fn r4os_zig_mod_perf(op: u8, a: u64, b: u64) -> u64;
-}
-fn perf(op: u8, a: u64, b: u64) -> u64 {
-    unsafe { r4os_zig_mod_perf(op, a, b) }
-}
 fn span(s: &[u8]) -> t::Bytes {
     ctl::span(s)
 }
@@ -1346,7 +1340,7 @@ unsafe fn resolve_pending(
     if unsafe { (*p).state } != 2 {
         return false;
     }
-    let start = perf(0, 0, 0);
+    let start = super::performance::now();
     let success = unsafe {
         image(
             &lease.load,
@@ -1359,7 +1353,7 @@ unsafe fn resolve_pending(
             peers,
         )
     } && unsafe { lease.commit() };
-    perf(5, start, 0);
+    super::performance::add_r4l_load_ticks(start);
     unsafe {
         (*p).state = if success { 3 } else { 4 };
     };
@@ -1417,7 +1411,7 @@ pub unsafe extern "C" fn r4os_rust_mod_load_libraries(peers: &state::Peers) {
     let mut index = 0;
     let mut name = [0; 64];
     loop {
-        let start = perf(0, 0, 0);
+        let start = super::performance::now();
         let mut entry = MaybeUninit::<t::Entry>::uninit();
         let result = unsafe {
             vfs::r4os_rust_vfs_run(
@@ -1433,17 +1427,17 @@ pub unsafe extern "C" fn r4os_rust_mod_load_libraries(peers: &state::Peers) {
                 entry.as_mut_ptr(),
             )
         };
-        perf(1, start, 0);
+        super::performance::add_r4l_scan_ticks(start);
         if result.status != 0 {
             break;
         }
-        perf(2, 0, 0);
+        super::performance::record_r4l_scan_entry();
         let entry = unsafe { entry.assume_init() };
         let file_name = &name[..name_len(&name)];
         if !vfs::r4os_rust_vfs_attribute(0, entry.attr)
             && unsafe { fmt::r4os_rust_mod_name(span(file_name), 3) } != 0
         {
-            perf(3, 0, 0);
+            super::performance::record_r4l_candidate();
             if count >= 32 {
                 ctl::log(b"[MOD] pending library limit reached\r\n");
                 break;
@@ -1468,14 +1462,14 @@ pub unsafe extern "C" fn r4os_rust_mod_load_libraries(peers: &state::Peers) {
     }
     unsafe { duplicates(pending, count) };
     let mut loaded = 0;
-    let start = perf(0, 0, 0);
+    let start = super::performance::now();
     for i in 0..count {
         if unsafe { resolve_pending(pending, count, i, peers) } {
             loaded += 1;
         }
     }
-    perf(4, start, 0);
-    perf(6, loaded as u64, count as u64);
+    super::performance::add_r4l_resolve_ticks(start);
+    super::performance::record_r4l_results(loaded, count);
     ctl::r4os_rust_mod_library_results(loaded);
     // Original freePendingLibraries only clears its used records; no retained
     // allocation or payload is owned by this temporary metadata array.

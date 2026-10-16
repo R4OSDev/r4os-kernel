@@ -21,7 +21,6 @@ pub struct Fonts {
 pub struct LoaderPeers {
     pub controllers: unsafe extern "C" fn() -> bool,
     pub fail: unsafe extern "C" fn(*const u8, usize) -> bool,
-    pub begin: unsafe extern "C" fn(),
     pub libraries: unsafe extern "C" fn(),
     pub drivers: unsafe extern "C" fn(),
     pub summary: unsafe extern "C" fn(),
@@ -29,7 +28,6 @@ pub struct LoaderPeers {
     pub fonts: unsafe extern "C" fn() -> Fonts,
     pub log: unsafe extern "C" fn(*const u8, usize),
     pub decimal: unsafe extern "C" fn(u64),
-    pub finish: unsafe extern "C" fn(),
     pub status: unsafe extern "C" fn(*const u8, usize),
 }
 
@@ -74,7 +72,7 @@ pub unsafe extern "C" fn r4os_rust_loader_boot_init(peers: &LoaderPeers) -> bool
         let text = b"Loader boot before storage controllers";
         return unsafe { (peers.fail)(text.as_ptr(), text.len()) };
     }
-    unsafe { (peers.begin)() };
+    super::performance::begin_filesystem_loader();
     unsafe { (peers.libraries)() };
     unsafe { (peers.drivers)() };
     unsafe { (peers.summary)() };
@@ -86,7 +84,7 @@ pub unsafe extern "C" fn r4os_rust_loader_boot_init(peers: &LoaderPeers) -> bool
     unsafe { log(peers, b" rejected=") };
     unsafe { (peers.decimal)(u64::from(fonts.rejected)) };
     unsafe { log(peers, b"\r\n") };
-    unsafe { (peers.finish)() };
+    super::performance::finish_filesystem_loader();
     LOADER_READY.store(true, Ordering::Release);
     let text = b"  Loader config [OK]\r\n";
     unsafe { (peers.status)(text.as_ptr(), text.len()) };
@@ -114,17 +112,15 @@ const _: () = {
     assert!(size_of::<Fonts>() == 8);
     assert!(offset_of!(Fonts, registered) == 0);
     assert!(offset_of!(Fonts, rejected) == 4);
-    assert!(size_of::<LoaderPeers>() == 96);
+    assert!(size_of::<LoaderPeers>() == 80);
     assert!(offset_of!(LoaderPeers, controllers) == 0);
     assert!(offset_of!(LoaderPeers, fail) == 8);
-    assert!(offset_of!(LoaderPeers, begin) == 16);
-    assert!(offset_of!(LoaderPeers, libraries) == 24);
-    assert!(offset_of!(LoaderPeers, drivers) == 32);
-    assert!(offset_of!(LoaderPeers, summary) == 40);
-    assert!(offset_of!(LoaderPeers, config) == 48);
-    assert!(offset_of!(LoaderPeers, fonts) == 56);
-    assert!(offset_of!(LoaderPeers, log) == 64);
-    assert!(offset_of!(LoaderPeers, decimal) == 72);
-    assert!(offset_of!(LoaderPeers, finish) == 80);
-    assert!(offset_of!(LoaderPeers, status) == 88);
+    assert!(offset_of!(LoaderPeers, libraries) == 16);
+    assert!(offset_of!(LoaderPeers, drivers) == 24);
+    assert!(offset_of!(LoaderPeers, summary) == 32);
+    assert!(offset_of!(LoaderPeers, config) == 40);
+    assert!(offset_of!(LoaderPeers, fonts) == 48);
+    assert!(offset_of!(LoaderPeers, log) == 56);
+    assert!(offset_of!(LoaderPeers, decimal) == 64);
+    assert!(offset_of!(LoaderPeers, status) == 72);
 };

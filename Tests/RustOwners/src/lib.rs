@@ -92,17 +92,16 @@ pub mod task_index;
 #[path = "../../../Rust/sched/wait_node.rs"]
 pub mod wait_node;
 pub mod sched {
+    pub use crate::sync_stats;
     pub use crate::{scheduler, scheduler_types, task, task_context, task_index, wait_node};
     pub use crate::{sync_locks, sync_objects, sync_types, sync_wait};
 }
-#[path = "../../../Rust/memory/backing_types.rs"]
-pub mod backing_types;
 #[path = "../../../Rust/memory/backing_store.rs"]
 pub mod backing_store;
+#[path = "../../../Rust/memory/backing_types.rs"]
+pub mod backing_types;
 #[path = "../../../Rust/memory/reclaim.rs"]
 pub mod reclaim;
-#[path = "../../../Rust/memory/vm_pager_types.rs"]
-pub mod vm_pager_types;
 #[path = "../../../Rust/memory/vm_page_state.rs"]
 pub mod vm_page_state;
 #[path = "../../../Rust/memory/vm_pager.rs"]
@@ -111,11 +110,13 @@ pub mod vm_pager;
 pub mod vm_pager_api;
 #[path = "../../../Rust/memory/vm_pager_diagnostics.rs"]
 pub mod vm_pager_diagnostics;
+#[path = "../../../Rust/memory/vm_pager_types.rs"]
+pub mod vm_pager_types;
 pub mod memory {
     pub use crate::root;
     pub use crate::{
-        backing_types, backing_store, reclaim, vm_pager_types, vm_page_state, vm_pager,
-        vm_pager_api, vm_pager_diagnostics,
+        backing_store, backing_types, reclaim, vm_page_state, vm_pager, vm_pager_api,
+        vm_pager_diagnostics, vm_pager_types,
     };
     pub use crate::{
         blocks, heap, layout, owner, paging, phys, virt_policy, vm_query, vm_ranges,
@@ -123,8 +124,8 @@ pub mod memory {
     };
 }
 pub mod arch {
-    pub use crate::terminal_power;
     pub use crate::callback_abort;
+    pub use crate::terminal_power;
     // Scalar native SMP admission uses the same exported symbol as the product.
     // Host owner cases never start CPUs; an unexpected call fails via the trap.
     pub mod smp {
@@ -133,7 +134,9 @@ pub mod arch {
         }
     }
     pub use crate::fpu;
-    pub use crate::{hpet, io, ioapic, lapic, msr, percpu, pic, pit, rtc, runtime, smp_policy, tlb};
+    pub use crate::{
+        hpet, io, ioapic, lapic, msr, percpu, pic, pit, rtc, runtime, smp_policy, tlb,
+    };
 }
 pub mod platform {
     pub use crate::acpi;
@@ -271,8 +274,6 @@ pub mod protocol_registry;
 #[path = "../../../Rust/driver/resource_state.rs"]
 pub mod resource_state;
 pub mod driver {
-    pub use crate::mmio_windows;
-    pub use crate::protocol_api;
     pub use crate::dma_segments;
     pub use crate::driver_api_admission as api_admission;
     pub use crate::driver_api_audio as api_audio;
@@ -289,13 +290,17 @@ pub mod driver {
     pub use crate::driver_api_storage as api_storage;
     pub use crate::driver_api_validation as api_validation;
     pub use crate::driver_work as work;
+    pub use crate::mmio_windows;
+    pub use crate::protocol_api;
     pub use crate::{driver_heap as heap, irq_router};
     pub use crate::{driver_memory_owner as memory_owner, driver_treap as treap};
     pub use crate::{
         driver_registry as registry, driver_resources as resources, driver_utilities as utilities,
         driver_work_queue as work_queue, protocol_registry, resource_state,
     };
-    pub use crate::{driver_semaphore_owner as semaphore_owner, driver_thread_owner as thread_owner};
+    pub use crate::{
+        driver_semaphore_owner as semaphore_owner, driver_thread_owner as thread_owner,
+    };
     pub use crate::{driver_semaphores as semaphores, driver_threads as threads};
 }
 
@@ -362,75 +367,77 @@ pub mod driver_api_entry;
 #[path = "../../../Rust/driver/api_gfx.rs"]
 pub mod driver_api_gfx;
 
-#[path = "../../../Rust/storage/dispatch.rs"]
-pub mod storage_dispatch;
-#[path = "../../../Rust/storage/guid.rs"]
-pub mod storage_guid;
-#[path = "../../../Rust/storage/split.rs"]
-pub mod storage_split;
-#[path = "../../../Rust/storage/access_state.rs"]
-pub mod storage_access_state;
 #[path = "../../../Rust/storage/access_runtime.rs"]
 pub mod storage_access_runtime;
-#[path = "../../../Rust/storage/gpt.rs"]
-pub mod storage_gpt;
-#[path = "../../../Rust/storage/partition_table.rs"]
-pub mod storage_partition_table;
-#[path = "../../../Rust/storage/installation.rs"]
-pub mod storage_installation;
-#[path = "../../../Rust/storage/boot_source.rs"]
-pub mod storage_boot_source;
+#[path = "../../../Rust/storage/access_state.rs"]
+pub mod storage_access_state;
+#[path = "../../../Rust/storage/ahci.rs"]
+pub mod storage_ahci;
+#[path = "../../../Rust/storage/block_accounting.rs"]
+pub mod storage_block_accounting;
+#[path = "../../../Rust/storage/block_device_state.rs"]
+pub mod storage_block_device_state;
+#[path = "../../../Rust/storage/block_diagnostics.rs"]
+pub mod storage_block_diagnostics;
+#[path = "../../../Rust/storage/block_execution.rs"]
+pub mod storage_block_execution;
+#[path = "../../../Rust/storage/block_io.rs"]
+pub mod storage_block_io;
 #[path = "../../../Rust/storage/block_registry.rs"]
 pub mod storage_block_registry;
 #[path = "../../../Rust/storage/block_requests.rs"]
 pub mod storage_block_requests;
 #[path = "../../../Rust/storage/block_state.rs"]
 pub mod storage_block_state;
-#[path = "../../../Rust/storage/block_accounting.rs"]
-pub mod storage_block_accounting;
 #[path = "../../../Rust/storage/block_workers.rs"]
 pub mod storage_block_workers;
-#[path = "../../../Rust/storage/block_device_state.rs"]
-pub mod storage_block_device_state;
-#[path = "../../../Rust/storage/block_io.rs"]
-pub mod storage_block_io;
-#[path = "../../../Rust/storage/block_execution.rs"]
-pub mod storage_block_execution;
-#[path = "../../../Rust/storage/block_diagnostics.rs"]
-pub mod storage_block_diagnostics;
+#[path = "../../../Rust/storage/boot.rs"]
+pub mod storage_boot_owner;
+#[path = "../../../Rust/storage/boot_source.rs"]
+pub mod storage_boot_source;
+#[path = "../../../Rust/storage/dispatch.rs"]
+pub mod storage_dispatch;
+#[path = "../../../Rust/storage/gpt.rs"]
+pub mod storage_gpt;
+#[path = "../../../Rust/storage/guid.rs"]
+pub mod storage_guid;
+#[path = "../../../Rust/storage/installation.rs"]
+pub mod storage_installation;
+#[path = "../../../Rust/storage/mbr.rs"]
+pub mod storage_mbr;
 #[path = "../../../Rust/storage/media_inventory.rs"]
 pub mod storage_media_inventory;
 #[path = "../../../Rust/storage/normal_boot.rs"]
 pub mod storage_normal_boot;
-#[path = "../../../Rust/storage/mbr.rs"]
-pub mod storage_mbr;
-#[path = "../../../Rust/storage/ahci.rs"]
-pub mod storage_ahci;
-#[path = "../../../Rust/storage/boot.rs"]
-pub mod storage_boot_owner;
 #[path = "../../../Rust/storage/operations.rs"]
 pub mod storage_operations;
+#[path = "../../../Rust/storage/partition_table.rs"]
+pub mod storage_partition_table;
+#[path = "../../../Rust/storage/split.rs"]
+pub mod storage_split;
 pub mod storage {
-    pub use crate::storage_operations as operations;
-    pub use crate::storage_boot_owner as boot;
     pub use crate::storage_ahci as ahci;
+    pub use crate::storage_block_accounting as block_accounting;
+    pub use crate::storage_block_device_state as block_device_state;
+    pub use crate::storage_block_diagnostics as block_diagnostics;
+    pub use crate::storage_block_execution as block_execution;
+    pub use crate::storage_block_io as block_io;
+    pub use crate::storage_block_registry as block_registry;
+    pub use crate::storage_block_requests as block_requests;
+    pub use crate::storage_block_state as block_state;
+    pub use crate::storage_block_workers as block_workers;
+    pub use crate::storage_boot_owner as boot;
+    pub use crate::storage_boot_source as boot_source;
+    pub use crate::storage_installation as installation;
     pub use crate::storage_mbr as mbr;
     pub use crate::storage_media_inventory as media_inventory;
     pub use crate::storage_normal_boot as normal_boot;
-    pub use crate::storage_block_execution as block_execution;
-    pub use crate::storage_block_diagnostics as block_diagnostics;
-    pub use crate::storage_block_io as block_io;
-    pub use crate::storage_block_device_state as block_device_state;
-    pub use crate::storage_block_workers as block_workers;
-    pub use crate::storage_block_accounting as block_accounting;
-    pub use crate::storage_block_state as block_state;
-    pub use crate::storage_block_requests as block_requests;
-    pub use crate::storage_block_registry as block_registry;
-    pub use crate::storage_boot_source as boot_source;
-    pub use crate::storage_installation as installation;
-    pub use crate::{storage_gpt as gpt, storage_partition_table as partition_table};
-    pub use crate::{storage_access_state as access_state, storage_access_runtime as access_runtime};
+    pub use crate::storage_operations as operations;
+    pub use crate::{
+        storage_access_runtime as access_runtime, storage_access_state as access_state,
+    };
     pub use crate::{storage_dispatch as dispatch, storage_guid as guid, storage_split as split};
+    pub use crate::{storage_gpt as gpt, storage_partition_table as partition_table};
 }
 
 #[path = "../../../Rust/net/mod.rs"]
@@ -439,19 +446,19 @@ pub mod net;
 #[path = "../../../Rust/input/mod.rs"]
 pub mod input;
 
-#[path="../../../Rust/font/mod.rs"]
+#[path = "../../../Rust/font/mod.rs"]
 pub mod font;
 
-#[path="../../../Rust/display/mod.rs"]
+#[path = "../../../Rust/display/mod.rs"]
 pub mod display;
 
-#[path="../../../Rust/gfx/mod.rs"]
+#[path = "../../../Rust/gfx/mod.rs"]
 pub mod gfx;
 
-#[path="../../../Rust/audio/mod.rs"]
+#[path = "../../../Rust/audio/mod.rs"]
 pub mod audio;
 
-#[path="../../../Rust/arch/terminal_power.rs"]
+#[path = "../../../Rust/arch/terminal_power.rs"]
 pub mod terminal_power;
-#[path="../../../Rust/update/mod.rs"]
+#[path = "../../../Rust/update/mod.rs"]
 pub mod update;

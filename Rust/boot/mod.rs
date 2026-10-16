@@ -1,3 +1,4 @@
+pub mod config;
 pub mod crash;
 pub mod entry;
 pub mod fatal;
@@ -9,4 +10,10 @@ pub mod owner;
 pub mod r4b;
 pub mod runtime;
 pub mod serial;
-pub mod config;
+
+pub mod performance;
+
+pub mod log_route;
+
+pub mod instrumentation;
+pub mod log_event;

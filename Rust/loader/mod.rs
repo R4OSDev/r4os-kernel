@@ -11,3 +11,5 @@ pub mod registry_loader;
 pub mod registry_queries;
 pub mod registry_state;
 pub mod resources;
+
+pub mod performance;

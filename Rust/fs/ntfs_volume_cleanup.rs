@@ -35,7 +35,7 @@ pub(super) unsafe fn budgeted_flush(v: Volume) -> bool {
 pub(super) unsafe fn uncertain(v: Volume) -> WriteStatus {
     unsafe {
         if !v.cache().is_null() {
-            (*v.cache()).invalidate(Mutation::Recovery)
+            super::ntfs_volume_cache::with(v.cache(), |cache| cache.invalidate(Mutation::Recovery))
         }
         let marked = r::ensure_dirty(v);
         (*v.scratch()).repair_required = true;
@@ -53,7 +53,7 @@ pub(super) unsafe fn abort(v: Volume, status: WriteStatus) -> WriteStatus {
             return status;
         }
         if !v.cache().is_null() {
-            (*v.cache()).invalidate(Mutation::Recovery)
+            super::ntfs_volume_cache::with(v.cache(), |cache| cache.invalidate(Mutation::Recovery))
         }
         if !io::flush(v.io) || !r::set_dirty(v, false) {
             let _ = uncertain(v);
@@ -66,7 +66,9 @@ pub(super) unsafe fn after_commit(v: Volume, status: WriteStatus) -> WriteStatus
     unsafe {
         if matches!(status, WriteStatus::Io | WriteStatus::CleanupFailed) {
             if !v.cache().is_null() {
-                (*v.cache()).invalidate(Mutation::Recovery)
+                super::ntfs_volume_cache::with(v.cache(), |cache| {
+                    cache.invalidate(Mutation::Recovery)
+                })
             }
             status
         } else {
@@ -81,7 +83,7 @@ pub(super) unsafe fn freeing(v: Volume, runs: io::Runs, status: WriteStatus) -> 
             return status;
         }
         if !v.cache().is_null() {
-            (*v.cache()).invalidate(Mutation::Recovery)
+            super::ntfs_volume_cache::with(v.cache(), |cache| cache.invalidate(Mutation::Recovery))
         }
         if runs.len != 0 && !c::free(v, runs) {
             return WriteStatus::CleanupFailed;
@@ -102,7 +104,7 @@ pub(super) unsafe fn releasing(
             return status;
         }
         if !v.cache().is_null() {
-            (*v.cache()).invalidate(Mutation::Recovery)
+            super::ntfs_volume_cache::with(v.cache(), |cache| cache.invalidate(Mutation::Recovery))
         }
         if stored && !m::mark_free(v, number) {
             return WriteStatus::CleanupFailed;
@@ -122,7 +124,7 @@ pub(super) unsafe fn unpublished(
 ) -> WriteStatus {
     unsafe {
         if !v.cache().is_null() {
-            (*v.cache()).invalidate(Mutation::Recovery)
+            super::ntfs_volume_cache::with(v.cache(), |cache| cache.invalidate(Mutation::Recovery))
         }
         if stored && !m::mark_free(v, number) {
             return WriteStatus::CleanupFailed;

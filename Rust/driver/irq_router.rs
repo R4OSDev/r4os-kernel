@@ -12,7 +12,7 @@ use core::{
     mem::{self, MaybeUninit},
     ptr,
 };
-const MAX_IRQS: usize = 32;
+pub(crate) const MAX_IRQS: usize = 32;
 const MAX_HANDLERS: usize = 4;
 pub type Handler = unsafe extern "C" fn(u8, usize) -> u32;
 #[derive(Clone, Copy)]

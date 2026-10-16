@@ -19,9 +19,10 @@ use core::{cell::UnsafeCell, mem::MaybeUninit, ptr, slice};
 pub const NONE: u8 = 0;
 pub const BOOTFB: u8 = 1;
 pub const NATIVE: u8 = 2;
-const VISIBLE: u32 = 1;
-const FIXED_MODE: u32 = 2;
-const CPU_PRESENT: u32 = 4;
+pub(crate) const VISIBLE: u32 = 1;
+pub(crate) const FIXED_MODE: u32 = 2;
+pub(crate) const CPU_PRESENT: u32 = 4;
+pub(crate) const XRGB32: u32 = 1 << 7;
 const REASON_NONE: u8 = 0;
 const REASON_FILL: u8 = 1;
 const REASON_RECT: u8 = 2;
@@ -1007,6 +1008,22 @@ pub fn stats() -> Stats {
     let _state = ownership::enter_state();
     unsafe { (*context()).completed_stats }
 }
+/// Copy the original completed stats and name before releasing publication
+/// admission. No borrow into the native backend's label escapes this probe.
+pub(crate) fn diagnostic_stats() -> (Stats, [u8; 32]) {
+    let _state = ownership::enter_state();
+    let mut value = unsafe { (*context()).completed_stats };
+    let mut name = [0; 32];
+    let len = value.name.len.min(name.len() - 1);
+    if len != 0 {
+        unsafe {
+            name[..len].copy_from_slice(core::slice::from_raw_parts(value.name.pointer, len));
+        }
+    }
+    value.name = Text::literal(b"");
+    (value, name)
+}
+
 pub fn bind_presentation_stats(
     owner: usize,
     owner_generation: u64,

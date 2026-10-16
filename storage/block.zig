@@ -1388,3 +1388,43 @@ test "preload v2 storage uses synchronous boot fallback before async runtime" {
     try std.testing.expect(useAsyncSubmission(.runtime_worker, true));
     try std.testing.expect(!useAsyncSubmission(.runtime_worker, false));
 }
+
+// Layout-only passive copy under the native storage owner. All text is copied
+// before that owner is released; no registry/backing pointer escapes.
+const NativeDiagnosticDevice=extern struct{
+    bus:u8,state:u8,source:u8,removable:bool,writable:bool,
+    port:u32,sector_size:u32,max_sectors:u32,queue_depth:u32,queue_used:u32,
+    timeout_ticks:u64,sector_count:u64,name:[32]u8,driver:[32]u8,controller:[32]u8,stats:Stats,
+};
+fn diagnosticText(out:[]u8,text:[]const u8) void {
+    @memset(out,0);const n=@min(text.len,out.len-1);@memcpy(out[0..n],text[0..n]);
+}
+export fn r4os_zig_block_diagnostic_snapshot(device:*const Device,out:*NativeDiagnosticDevice) callconv(.c) void {
+    out.*=.{.bus=@intFromEnum(device.bus),.state=@intFromEnum(device.state),.source=@intFromEnum(device.source),
+        .removable=device.removable,.writable=device.writable,.port=device.port,.sector_size=device.sector_size,
+        .max_sectors=device.max_sectors_per_request,.queue_depth=device.queue_depth,
+        .queue_used=@intCast(r4os_rust_block_select(&device.request_slots,3,0)),
+        .timeout_ticks=device.timeout_ticks,.sector_count=device.sector_count,
+        .name=undefined,.driver=undefined,.controller=undefined,.stats=statsSnapshot(device)};
+    diagnosticText(&out.name,device.name);diagnosticText(&out.driver,device.driver);diagnosticText(&out.controller,device.controller);
+}
+
+comptime {
+    if(@sizeOf(NativeDiagnosticDevice)!=552)@compileError("Native passive device geometry");
+    if(@offsetOf(NativeDiagnosticDevice,"bus")!=0)@compileError("Native passive device bus offset");
+    if(@offsetOf(NativeDiagnosticDevice,"state")!=1)@compileError("Native passive device state offset");
+    if(@offsetOf(NativeDiagnosticDevice,"source")!=2)@compileError("Native passive device source offset");
+    if(@offsetOf(NativeDiagnosticDevice,"removable")!=3)@compileError("Native passive device removable offset");
+    if(@offsetOf(NativeDiagnosticDevice,"writable")!=4)@compileError("Native passive device writable offset");
+    if(@offsetOf(NativeDiagnosticDevice,"port")!=8)@compileError("Native passive device port offset");
+    if(@offsetOf(NativeDiagnosticDevice,"sector_size")!=12)@compileError("Native passive device sector_size offset");
+    if(@offsetOf(NativeDiagnosticDevice,"max_sectors")!=16)@compileError("Native passive device max_sectors offset");
+    if(@offsetOf(NativeDiagnosticDevice,"queue_depth")!=20)@compileError("Native passive device queue_depth offset");
+    if(@offsetOf(NativeDiagnosticDevice,"queue_used")!=24)@compileError("Native passive device queue_used offset");
+    if(@offsetOf(NativeDiagnosticDevice,"timeout_ticks")!=32)@compileError("Native passive device timeout_ticks offset");
+    if(@offsetOf(NativeDiagnosticDevice,"sector_count")!=40)@compileError("Native passive device sector_count offset");
+    if(@offsetOf(NativeDiagnosticDevice,"name")!=48)@compileError("Native passive device name offset");
+    if(@offsetOf(NativeDiagnosticDevice,"driver")!=80)@compileError("Native passive device driver offset");
+    if(@offsetOf(NativeDiagnosticDevice,"controller")!=112)@compileError("Native passive device controller offset");
+    if(@offsetOf(NativeDiagnosticDevice,"stats")!=144)@compileError("Native passive device stats offset");
+}

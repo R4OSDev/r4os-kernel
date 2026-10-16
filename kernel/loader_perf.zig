@@ -1,6 +1,4 @@
-const timer = @import("timer.zig");
-const time_core = @import("../platform/time.zig");
-
+// Native loader observations; fixed private C record/call facade.
 pub const service_boot_not_attempted: u32 = 0;
 pub const service_boot_ran: u32 = 1;
 pub const service_boot_not_found: u32 = 2;
@@ -9,7 +7,7 @@ pub const service_boot_failed: u32 = 3;
 const audited_boot_critical_count: u32 = 8;
 const audited_lazy_candidate_count: u32 = 9;
 
-pub const Summary = struct {
+pub const Summary = extern struct {
     initialized: u32 = 0,
     loader_started: u32 = 0,
     loader_completed: u32 = 0,
@@ -71,235 +69,94 @@ pub const Summary = struct {
     config_load_ns: u64 = 0,
 };
 
-var summary: Summary = .{};
-var filesystem_loader_start_tick: u64 = 0;
-var r4p_runtime_start_tick: u64 = 0;
-var filesystem_loader_start_stamp: time_core.MonotonicStamp = .{};
-var r4p_runtime_start_stamp: time_core.MonotonicStamp = .{};
-var service_boot_start_stamp: time_core.MonotonicStamp = .{};
-var config_load_start_stamp: time_core.MonotonicStamp = .{};
+extern fn r4os_rust_loader_performance_snapshot(*Summary) void;
+extern fn r4os_rust_loader_performance_control(u8,u64,u64,u64,u64,u64) u64;
+pub fn init() void {_ = r4os_rust_loader_performance_control(0,0,0,0,0,0);}
+pub fn snapshot() Summary {var out:Summary=undefined;r4os_rust_loader_performance_snapshot(&out);return out;}
+pub fn beginFilesystemLoader() void {_ = r4os_rust_loader_performance_control(1,0,0,0,0,0);}
+pub fn finishFilesystemLoader() void {_ = r4os_rust_loader_performance_control(2,0,0,0,0,0);}
+pub fn beginR4pRuntime() u64 {return r4os_rust_loader_performance_control(3,0,0,0,0,0);}
+pub fn finishR4pRuntime(start:u64) void {_ = r4os_rust_loader_performance_control(4,start,0,0,0,0);}
+pub fn beginServiceBoot() u64 {return r4os_rust_loader_performance_control(5,0,0,0,0,0);}
+pub fn finishServiceBoot(start:u64,status:u32) void {_ = r4os_rust_loader_performance_control(6,start,status,0,0,0);}
+pub fn beginConfigLoad() u64 {return r4os_rust_loader_performance_control(7,0,0,0,0,0);}
+pub fn recordConfigLoad(start:u64,bytes:usize,drivers:usize,disabled:usize,options:usize) void {_ = r4os_rust_loader_performance_control(8,start,bytes,drivers,disabled,options);}
+pub fn recordR4lScanEntry() void {_ = r4os_rust_loader_performance_control(9,0,0,0,0,0);}
+pub fn recordR4lCandidate() void {_ = r4os_rust_loader_performance_control(10,0,0,0,0,0);}
+pub fn addR4lScanTicks(start:u64) void {_ = r4os_rust_loader_performance_control(11,start,0,0,0,0);}
+pub fn addR4lReadTicks(start:u64) void {_ = r4os_rust_loader_performance_control(12,start,0,0,0,0);}
+pub fn addR4lResolveTicks(start:u64) void {_ = r4os_rust_loader_performance_control(13,start,0,0,0,0);}
+pub fn addR4lLoadTicks(start:u64) void {_ = r4os_rust_loader_performance_control(14,start,0,0,0,0);}
+pub fn recordR4dScanEntry() void {_ = r4os_rust_loader_performance_control(15,0,0,0,0,0);}
+pub fn recordR4dCandidate() void {_ = r4os_rust_loader_performance_control(16,0,0,0,0,0);}
+pub fn addR4dScanTicks(start:u64) void {_ = r4os_rust_loader_performance_control(17,start,0,0,0,0);}
+pub fn addR4dReadTicks(start:u64) void {_ = r4os_rust_loader_performance_control(18,start,0,0,0,0);}
+pub fn addR4dProbeTicks(start:u64) void {_ = r4os_rust_loader_performance_control(19,start,0,0,0,0);}
+pub fn recordR4pScanEntry() void {_ = r4os_rust_loader_performance_control(20,0,0,0,0,0);}
+pub fn recordR4pCandidate() void {_ = r4os_rust_loader_performance_control(21,0,0,0,0,0);}
+pub fn addR4pScanTicks(start:u64) void {_ = r4os_rust_loader_performance_control(22,start,0,0,0,0);}
+pub fn addR4pReadTicks(start:u64) void {_ = r4os_rust_loader_performance_control(23,start,0,0,0,0);}
+pub fn addR4pResolveTicks(start:u64) void {_ = r4os_rust_loader_performance_control(24,start,0,0,0,0);}
+pub fn addR4pInitTicks(start:u64) void {_ = r4os_rust_loader_performance_control(25,start,0,0,0,0);}
+pub fn recordR4lResults(loaded:usize,candidates:usize) void {_ = r4os_rust_loader_performance_control(26,loaded,candidates,0,0,0);}
+pub fn recordR4dResults(discovered:usize) void {_ = r4os_rust_loader_performance_control(27,discovered,0,0,0,0);}
+pub fn recordR4pResults(discovered:usize,active:usize,blocked:usize,failed:usize) void {_ = r4os_rust_loader_performance_control(28,discovered,active,blocked,failed,0);}
+pub fn now() u64 {return r4os_rust_loader_performance_control(29,0,0,0,0,0);}
+pub fn elapsedSince(start:u64) u64 {return r4os_rust_loader_performance_control(30,start,0,0,0,0);}
 
-pub fn init() void {
-    summary = .{
-        .initialized = 1,
-        .service_boot_status = service_boot_not_attempted,
-        .boot_critical_count = audited_boot_critical_count,
-        .lazy_candidate_count = audited_lazy_candidate_count,
-    };
-    filesystem_loader_start_tick = 0;
-    r4p_runtime_start_tick = 0;
-    filesystem_loader_start_stamp = .{};
-    r4p_runtime_start_stamp = .{};
-    service_boot_start_stamp = .{};
-    config_load_start_stamp = .{};
-}
-
-pub fn snapshot() Summary {
-    ensure();
-    var out = summary;
-    const clock = time_core.monotonicSnapshot();
-    out.clock_flags = clock.flags;
-    out.clock_source = @intFromEnum(clock.source);
-    out.clock_generation = clock.generation;
-    out.clock_resolution_ns = clock.resolution_ns;
-    return out;
-}
-
-pub fn now() u64 {
-    return timer.tickCount();
-}
-
-pub fn elapsedSince(start_tick: u64) u64 {
-    const end_tick = now();
-    return if (end_tick >= start_tick) end_tick - start_tick else 0;
-}
-
-pub fn beginFilesystemLoader() void {
-    ensure();
-    summary.loader_started = 1;
-    filesystem_loader_start_tick = now();
-    filesystem_loader_start_stamp = time_core.monotonicCapture();
-}
-
-pub fn finishFilesystemLoader() void {
-    ensure();
-    summary.loader_completed = 1;
-    summary.loader_total_ticks +%= elapsedSince(filesystem_loader_start_tick);
-    finishHighResolutionSpan(filesystem_loader_start_stamp, &summary.loader_total_ns);
-}
-
-pub fn beginR4pRuntime() u64 {
-    ensure();
-    summary.r4p_runtime_started = 1;
-    r4p_runtime_start_tick = now();
-    r4p_runtime_start_stamp = time_core.monotonicCapture();
-    return r4p_runtime_start_tick;
-}
-
-pub fn finishR4pRuntime(start_tick: u64) void {
-    ensure();
-    summary.r4p_runtime_completed = 1;
-    summary.r4p_runtime_total_ticks +%= elapsedSince(start_tick);
-    finishHighResolutionSpan(r4p_runtime_start_stamp, &summary.r4p_runtime_total_ns);
-}
-
-pub fn beginServiceBoot() u64 {
-    ensure();
-    summary.service_boot_status = service_boot_not_attempted;
-    service_boot_start_stamp = time_core.monotonicCapture();
-    return now();
-}
-
-pub fn finishServiceBoot(start_tick: u64, status: u32) void {
-    ensure();
-    summary.service_boot_ticks +%= elapsedSince(start_tick);
-    finishHighResolutionSpan(service_boot_start_stamp, &summary.service_boot_ns);
-    summary.service_boot_status = status;
-}
-
-pub fn beginConfigLoad() u64 {
-    ensure();
-    config_load_start_stamp = time_core.monotonicCapture();
-    return now();
-}
-
-pub fn recordConfigLoad(start_tick: u64, bytes: usize, driver_count: usize, disabled_count: usize, option_count: usize) void {
-    ensure();
-    summary.config_load_ticks +%= elapsedSince(start_tick);
-    finishHighResolutionSpan(config_load_start_stamp, &summary.config_load_ns);
-    summary.config_bytes = saturatingU64(bytes);
-    summary.config_driver_count = saturatingU32(driver_count);
-    summary.config_disabled_count = saturatingU32(disabled_count);
-    summary.config_option_count = saturatingU32(option_count);
-}
-
-pub fn recordR4lScanEntry() void {
-    ensure();
-    summary.r4l_scan_entries +%= 1;
-}
-
-pub fn recordR4lCandidate() void {
-    ensure();
-    summary.r4l_candidates +%= 1;
-}
-
-pub fn addR4lScanTicks(start_tick: u64) void {
-    ensure();
-    summary.r4l_scan_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn addR4lReadTicks(start_tick: u64) void {
-    ensure();
-    summary.r4l_read_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn addR4lResolveTicks(start_tick: u64) void {
-    ensure();
-    summary.r4l_resolve_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn addR4lLoadTicks(start_tick: u64) void {
-    ensure();
-    summary.r4l_load_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn recordR4lResults(loaded: usize, total_candidates: usize) void {
-    ensure();
-    summary.r4l_loaded = saturatingU64(loaded);
-    summary.r4l_failed = if (total_candidates > loaded) saturatingU64(total_candidates - loaded) else 0;
-}
-
-pub fn recordR4dScanEntry() void {
-    ensure();
-    summary.r4d_scan_entries +%= 1;
-}
-
-pub fn recordR4dCandidate() void {
-    ensure();
-    summary.r4d_candidates +%= 1;
-}
-
-pub fn addR4dScanTicks(start_tick: u64) void {
-    ensure();
-    summary.r4d_scan_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn addR4dReadTicks(start_tick: u64) void {
-    ensure();
-    summary.r4d_read_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn addR4dProbeTicks(start_tick: u64) void {
-    ensure();
-    summary.r4d_probe_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn recordR4dResults(discovered: usize) void {
-    ensure();
-    summary.r4d_discovered = saturatingU64(discovered);
-    summary.r4d_failed = if (summary.r4d_candidates > summary.r4d_discovered) summary.r4d_candidates - summary.r4d_discovered else 0;
-}
-
-pub fn recordR4pScanEntry() void {
-    ensure();
-    summary.r4p_scan_entries +%= 1;
-}
-
-pub fn recordR4pCandidate() void {
-    ensure();
-    summary.r4p_candidates +%= 1;
-}
-
-pub fn addR4pScanTicks(start_tick: u64) void {
-    ensure();
-    summary.r4p_scan_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn addR4pReadTicks(start_tick: u64) void {
-    ensure();
-    summary.r4p_read_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn addR4pResolveTicks(start_tick: u64) void {
-    ensure();
-    summary.r4p_resolve_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn addR4pInitTicks(start_tick: u64) void {
-    ensure();
-    summary.r4p_init_ticks +%= elapsedSince(start_tick);
-}
-
-pub fn recordR4pResults(discovered: usize, active: usize, blocked: usize, failed: usize) void {
-    ensure();
-    summary.r4p_discovered = saturatingU64(discovered);
-    summary.r4p_active = saturatingU64(active);
-    summary.r4p_blocked = saturatingU64(blocked);
-    summary.r4p_failed = saturatingU64(failed);
-}
-
-fn ensure() void {
-    if (summary.initialized == 0) init();
-}
-
-fn finishHighResolutionSpan(start: time_core.MonotonicStamp, destination: *u64) void {
-    const clock = time_core.monotonicSnapshot();
-    if ((clock.flags & time_core.monotonic_flag_high_resolution) == 0) {
-        summary.timing_unavailable_spans +|= 1;
-        return;
-    }
-    const elapsed = time_core.monotonicElapsedSince(start) orelse {
-        summary.timing_unavailable_spans +|= 1;
-        return;
-    };
-    destination.* +|= elapsed;
-    summary.timing_valid_spans +|= 1;
-}
-
-fn saturatingU32(value: usize) u32 {
-    return @intCast(@min(value, @as(usize, 0xFFFF_FFFF)));
-}
-
-fn saturatingU64(value: usize) u64 {
-    return @intCast(value);
+comptime {
+    if(@sizeOf(Summary)!=352 or @alignOf(Summary)!=8)@compileError("Native Summary C geometry");
+    if(@offsetOf(Summary,"initialized")!=0)@compileError("Native Summary.initialized C offset");
+    if(@offsetOf(Summary,"loader_started")!=4)@compileError("Native Summary.loader_started C offset");
+    if(@offsetOf(Summary,"loader_completed")!=8)@compileError("Native Summary.loader_completed C offset");
+    if(@offsetOf(Summary,"r4p_runtime_started")!=12)@compileError("Native Summary.r4p_runtime_started C offset");
+    if(@offsetOf(Summary,"r4p_runtime_completed")!=16)@compileError("Native Summary.r4p_runtime_completed C offset");
+    if(@offsetOf(Summary,"service_boot_status")!=20)@compileError("Native Summary.service_boot_status C offset");
+    if(@offsetOf(Summary,"boot_critical_count")!=24)@compileError("Native Summary.boot_critical_count C offset");
+    if(@offsetOf(Summary,"lazy_candidate_count")!=28)@compileError("Native Summary.lazy_candidate_count C offset");
+    if(@offsetOf(Summary,"loader_total_ticks")!=32)@compileError("Native Summary.loader_total_ticks C offset");
+    if(@offsetOf(Summary,"r4p_runtime_total_ticks")!=40)@compileError("Native Summary.r4p_runtime_total_ticks C offset");
+    if(@offsetOf(Summary,"service_boot_ticks")!=48)@compileError("Native Summary.service_boot_ticks C offset");
+    if(@offsetOf(Summary,"config_load_ticks")!=56)@compileError("Native Summary.config_load_ticks C offset");
+    if(@offsetOf(Summary,"config_bytes")!=64)@compileError("Native Summary.config_bytes C offset");
+    if(@offsetOf(Summary,"config_driver_count")!=72)@compileError("Native Summary.config_driver_count C offset");
+    if(@offsetOf(Summary,"config_disabled_count")!=76)@compileError("Native Summary.config_disabled_count C offset");
+    if(@offsetOf(Summary,"config_option_count")!=80)@compileError("Native Summary.config_option_count C offset");
+    if(@offsetOf(Summary,"config_reserved0")!=84)@compileError("Native Summary.config_reserved0 C offset");
+    if(@offsetOf(Summary,"r4l_scan_entries")!=88)@compileError("Native Summary.r4l_scan_entries C offset");
+    if(@offsetOf(Summary,"r4l_candidates")!=96)@compileError("Native Summary.r4l_candidates C offset");
+    if(@offsetOf(Summary,"r4l_loaded")!=104)@compileError("Native Summary.r4l_loaded C offset");
+    if(@offsetOf(Summary,"r4l_failed")!=112)@compileError("Native Summary.r4l_failed C offset");
+    if(@offsetOf(Summary,"r4l_scan_ticks")!=120)@compileError("Native Summary.r4l_scan_ticks C offset");
+    if(@offsetOf(Summary,"r4l_read_ticks")!=128)@compileError("Native Summary.r4l_read_ticks C offset");
+    if(@offsetOf(Summary,"r4l_resolve_ticks")!=136)@compileError("Native Summary.r4l_resolve_ticks C offset");
+    if(@offsetOf(Summary,"r4l_load_ticks")!=144)@compileError("Native Summary.r4l_load_ticks C offset");
+    if(@offsetOf(Summary,"r4d_scan_entries")!=152)@compileError("Native Summary.r4d_scan_entries C offset");
+    if(@offsetOf(Summary,"r4d_candidates")!=160)@compileError("Native Summary.r4d_candidates C offset");
+    if(@offsetOf(Summary,"r4d_discovered")!=168)@compileError("Native Summary.r4d_discovered C offset");
+    if(@offsetOf(Summary,"r4d_failed")!=176)@compileError("Native Summary.r4d_failed C offset");
+    if(@offsetOf(Summary,"r4d_scan_ticks")!=184)@compileError("Native Summary.r4d_scan_ticks C offset");
+    if(@offsetOf(Summary,"r4d_read_ticks")!=192)@compileError("Native Summary.r4d_read_ticks C offset");
+    if(@offsetOf(Summary,"r4d_probe_ticks")!=200)@compileError("Native Summary.r4d_probe_ticks C offset");
+    if(@offsetOf(Summary,"r4p_scan_entries")!=208)@compileError("Native Summary.r4p_scan_entries C offset");
+    if(@offsetOf(Summary,"r4p_candidates")!=216)@compileError("Native Summary.r4p_candidates C offset");
+    if(@offsetOf(Summary,"r4p_discovered")!=224)@compileError("Native Summary.r4p_discovered C offset");
+    if(@offsetOf(Summary,"r4p_active")!=232)@compileError("Native Summary.r4p_active C offset");
+    if(@offsetOf(Summary,"r4p_blocked")!=240)@compileError("Native Summary.r4p_blocked C offset");
+    if(@offsetOf(Summary,"r4p_failed")!=248)@compileError("Native Summary.r4p_failed C offset");
+    if(@offsetOf(Summary,"r4p_scan_ticks")!=256)@compileError("Native Summary.r4p_scan_ticks C offset");
+    if(@offsetOf(Summary,"r4p_read_ticks")!=264)@compileError("Native Summary.r4p_read_ticks C offset");
+    if(@offsetOf(Summary,"r4p_resolve_ticks")!=272)@compileError("Native Summary.r4p_resolve_ticks C offset");
+    if(@offsetOf(Summary,"r4p_init_ticks")!=280)@compileError("Native Summary.r4p_init_ticks C offset");
+    if(@offsetOf(Summary,"clock_flags")!=288)@compileError("Native Summary.clock_flags C offset");
+    if(@offsetOf(Summary,"clock_source")!=292)@compileError("Native Summary.clock_source C offset");
+    if(@offsetOf(Summary,"clock_generation")!=296)@compileError("Native Summary.clock_generation C offset");
+    if(@offsetOf(Summary,"timing_valid_spans")!=300)@compileError("Native Summary.timing_valid_spans C offset");
+    if(@offsetOf(Summary,"timing_unavailable_spans")!=304)@compileError("Native Summary.timing_unavailable_spans C offset");
+    if(@offsetOf(Summary,"timing_reserved0")!=308)@compileError("Native Summary.timing_reserved0 C offset");
+    if(@offsetOf(Summary,"clock_resolution_ns")!=312)@compileError("Native Summary.clock_resolution_ns C offset");
+    if(@offsetOf(Summary,"loader_total_ns")!=320)@compileError("Native Summary.loader_total_ns C offset");
+    if(@offsetOf(Summary,"r4p_runtime_total_ns")!=328)@compileError("Native Summary.r4p_runtime_total_ns C offset");
+    if(@offsetOf(Summary,"service_boot_ns")!=336)@compileError("Native Summary.service_boot_ns C offset");
+    if(@offsetOf(Summary,"config_load_ns")!=344)@compileError("Native Summary.config_load_ns C offset");
 }

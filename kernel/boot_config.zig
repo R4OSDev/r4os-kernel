@@ -1,4 +1,3 @@
-const loader_perf = @import("loader_perf.zig");
 pub const MAX_DRIVERS: usize = 12;
 pub const MAX_DISABLED: usize = 8;
 pub const MAX_OPTIONS: usize = 8;
@@ -83,11 +82,7 @@ pub fn shellArgs(config: *const Config) []const u8 {
     _ = r4os_rust_boot_config(8, config, .{}, .{}, 0, &out);
     return out.bytes();
 }
-export fn r4os_zig_boot_config_timing(begin: bool, start: u64, bytes: usize, drivers: usize, disabled: usize, options: usize) callconv(.c) u64 {
-    if (begin) return loader_perf.beginConfigLoad();
-    loader_perf.recordConfigLoad(start, bytes, drivers, disabled, options);
-    return 0;
-}
+
 comptime {
     if (@sizeOf(Config) != 1840 or @sizeOf(Option) != 120 or @offsetOf(Config, "options") != 664 or @offsetOf(Config, "shell_path") != 1632) @compileError("private boot config layout");
 }

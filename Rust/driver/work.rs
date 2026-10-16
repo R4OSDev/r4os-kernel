@@ -30,6 +30,7 @@ pub type Request = a::DriverWorkRequest;
 pub type Handler = unsafe extern "C" fn(usize) -> i32;
 const CAP: usize = 16;
 const OWNERS: usize = 16;
+pub(crate) const OWNER_CAPACITY: u32 = OWNERS as u32;
 const NONE: u8 = 255;
 const FREE: u8 = 0;
 const QUEUED: u8 = 1;

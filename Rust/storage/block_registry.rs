@@ -587,3 +587,16 @@ pub(crate) fn cache_view(index: usize) -> Option<CacheView> {
         owns_retry: info.owns_retry,
     })
 }
+
+// Typed passive bounds for other native kernel domains.
+pub(crate) fn count() -> usize {
+    let _owner = Guard::acquire(1);
+    unsafe { (*REGISTRY.0.get()).count }
+}
+pub(crate) fn slot_count() -> usize {
+    let _owner = Guard::acquire(1);
+    unsafe { (*REGISTRY.0.get()).slot_count }
+}
+pub(crate) const fn max_devices() -> usize {
+    MAX
+}

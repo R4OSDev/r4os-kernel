@@ -1,10 +1,7 @@
+// Native boot/completion owner; fixed private C records only.
 const crash = @import("crash.zig");
-const timer = @import("timer.zig");
-const time_core = @import("../platform/time.zig");
-const OrderedDurations = @import("../platform/monotonic_math.zig").OrderedDurations;
 
 pub const MAX_PHASES: usize = 32;
-const MAX_TIME_SPANS: usize = 128;
 
 pub const CompletionState = enum(u32) {
     uninitialized = 0,
@@ -36,13 +33,7 @@ pub const ready_result_already_completed: i32 = 1;
 pub const ready_error_not_expected_shell: i32 = -1;
 pub const ready_error_boot_failed: i32 = -2;
 
-const TimeSpan = struct {
-    phase: crash.BootPhase = .unknown,
-    start: time_core.MonotonicStamp = .{},
-    end: time_core.MonotonicStamp = .{},
-};
-
-pub const PhaseInfo = struct {
+pub const PhaseInfo = extern struct {
     phase: crash.BootPhase = .unknown,
     first_tick: u64 = 0,
     last_tick: u64 = 0,
@@ -55,7 +46,7 @@ pub const PhaseInfo = struct {
     timing_unavailable_spans: u32 = 0,
 };
 
-pub const Summary = struct {
+pub const Summary = extern struct {
     initialized: bool = false,
     state: CompletionState = .uninitialized,
     completion_reason: CompletionReason = .none,
@@ -81,264 +72,55 @@ pub const Summary = struct {
     shell_instance_id: u32 = 0,
 };
 
-var initialized = false;
-var boot_start_tick: u64 = 0;
-var phase_count: usize = 0;
-var transition_count: u64 = 0;
-var current_phase: crash.BootPhase = .unknown;
-var current_enter_tick: u64 = 0;
-var boot_start_stamp: time_core.MonotonicStamp = .{};
-var current_enter_stamp: time_core.MonotonicStamp = .{};
-var completion_state: CompletionState = .uninitialized;
-var completion_reason: CompletionReason = .none;
-var boot_end_tick: u64 = 0;
-var boot_end_stamp: time_core.MonotonicStamp = .{};
-var completion_clock_flags: u32 = 0;
-var completion_clock_source: u32 = 0;
-var completion_clock_generation: u32 = 0;
-var completion_clock_resolution_ns: u64 = 0;
-var active_shell_kind: ShellKind = .none;
-var expected_shell_instance_id: u32 = 0;
-var configured_attempts: u32 = 0;
-var fallback_attempts: u32 = 0;
-var launch_failures: u32 = 0;
-var phases: [MAX_PHASES]PhaseInfo = .{PhaseInfo{}} ** MAX_PHASES;
-var time_spans: [MAX_TIME_SPANS]TimeSpan = .{TimeSpan{}} ** MAX_TIME_SPANS;
-var time_span_count: usize = 0;
-var timing_dropped_spans: u32 = 0;
+extern fn r4os_rust_boot_performance_control(u8,u32) i32;
+extern fn r4os_rust_boot_performance_snapshot(*Summary) void;
+extern fn r4os_rust_boot_performance_phase(u32,*PhaseInfo) bool;
+pub fn init() void {_ = r4os_rust_boot_performance_control(0,0);}
+pub fn record(phase:crash.BootPhase) void {_ = r4os_rust_boot_performance_control(1,@intFromEnum(phase));}
+pub fn beginShellAttempt(kind:ShellKind) void {_ = r4os_rust_boot_performance_control(2,@intFromEnum(kind));}
+pub fn noteShellLaunched(id:u32) void {_ = r4os_rust_boot_performance_control(3,id);}
+pub fn noteShellLaunchFailure() void {_ = r4os_rust_boot_performance_control(4,0);}
+pub fn completeReady(id:u32) i32 {return r4os_rust_boot_performance_control(5,id);}
+pub fn failNoShell() void {_ = r4os_rust_boot_performance_control(6,0);}
+pub fn failFatal() void {_ = r4os_rust_boot_performance_control(7,0);}
+pub fn failShellExited(id:u32) void {_ = r4os_rust_boot_performance_control(8,id);}
+pub fn snapshot() Summary {var out:Summary=undefined;r4os_rust_boot_performance_snapshot(&out);return out;}
+pub fn phaseAt(index:u32) ?PhaseInfo {var out:PhaseInfo=undefined;return if(r4os_rust_boot_performance_phase(index,&out))out else null;}
 
-pub fn init() void {
-    initialized = true;
-    boot_start_tick = timer.tickCount();
-    boot_start_stamp = time_core.monotonicCapture();
-    phase_count = 0;
-    transition_count = 0;
-    current_phase = .unknown;
-    current_enter_tick = boot_start_tick;
-    current_enter_stamp = boot_start_stamp;
-    completion_state = .running;
-    completion_reason = .none;
-    boot_end_tick = 0;
-    boot_end_stamp = .{};
-    completion_clock_flags = 0;
-    completion_clock_source = 0;
-    completion_clock_generation = 0;
-    completion_clock_resolution_ns = 0;
-    active_shell_kind = .none;
-    expected_shell_instance_id = 0;
-    configured_attempts = 0;
-    fallback_attempts = 0;
-    launch_failures = 0;
-    phases = .{PhaseInfo{}} ** MAX_PHASES;
-    time_spans = .{TimeSpan{}} ** MAX_TIME_SPANS;
-    time_span_count = 0;
-    timing_dropped_spans = 0;
-    record(.entry);
-}
-
-pub fn record(phase: crash.BootPhase) void {
-    if (!initialized) init();
-    if (completion_state != .running) return;
-    const now = timer.tickCount();
-    const now_stamp = time_core.monotonicCapture();
-    finishCurrent(now, now_stamp);
-    transition_count +%= 1;
-    current_phase = phase;
-    current_enter_tick = now;
-    current_enter_stamp = now_stamp;
-    const slot = phaseSlot(phase) orelse return;
-    var p = &phases[slot];
-    if (p.transitions == 0) {
-        p.phase = phase;
-        p.first_tick = now;
-    }
-    p.last_tick = now;
-    p.transitions +%= 1;
-}
-
-pub fn beginShellAttempt(kind: ShellKind) void {
-    if (!initialized) init();
-    if (completion_state != .running) return;
-    active_shell_kind = kind;
-    expected_shell_instance_id = 0;
-    switch (kind) {
-        .configured => configured_attempts +|= 1,
-        .terminal_fallback, .recovery_fallback => fallback_attempts +|= 1,
-        .none => {},
-    }
-}
-
-pub fn noteShellLaunched(instance_id: u32) void {
-    if (completion_state != .running or active_shell_kind == .none or instance_id == 0) return;
-    expected_shell_instance_id = instance_id;
-}
-
-pub fn noteShellLaunchFailure() void {
-    if (completion_state != .running) return;
-    launch_failures +|= 1;
-    expected_shell_instance_id = 0;
-}
-
-pub fn completeReady(instance_id: u32) i32 {
-    switch (completion_state) {
-        .ready, .fallback_ready => return if (instance_id != 0 and instance_id == expected_shell_instance_id)
-            ready_result_already_completed
-        else
-            ready_error_not_expected_shell,
-        .failed => return ready_error_boot_failed,
-        .uninitialized, .running => {},
-    }
-    if (active_shell_kind == .none or instance_id == 0 or instance_id != expected_shell_instance_id)
-        return ready_error_not_expected_shell;
-
-    const state: CompletionState = switch (active_shell_kind) {
-        .configured => .ready,
-        .terminal_fallback, .recovery_fallback => .fallback_ready,
-        .none => unreachable,
-    };
-    const reason: CompletionReason = switch (active_shell_kind) {
-        .configured => .configured_shell_ready,
-        .terminal_fallback => .terminal_fallback_ready,
-        .recovery_fallback => .recovery_fallback_ready,
-        .none => unreachable,
-    };
-    freeze(state, reason);
-    return ready_result_completed;
-}
-
-pub fn failNoShell() void {
-    if (!initialized) init();
-    if (completion_state != .running) return;
-    freeze(.failed, .no_shell);
-}
-
-pub fn failFatal() void {
-    if (!initialized) init();
-    if (completion_state != .running) return;
-    freeze(.failed, .fatal_error);
-}
-
-pub fn failShellExited(instance_id: u32) void {
-    if (completion_state != .running or instance_id == 0 or instance_id != expected_shell_instance_id) return;
-    freeze(.failed, .shell_exited_before_ready);
-}
-
-pub fn snapshot() Summary {
-    const running = completion_state == .running;
-    const now = if (running) timer.tickCount() else boot_end_tick;
-    const now_stamp = if (running) time_core.monotonicCapture() else boot_end_stamp;
-    const live_clock = time_core.monotonicSnapshot();
-    const total_ns = time_core.monotonicElapsed(boot_start_stamp, now_stamp);
-    const unavailable = unavailableSpanCount(now_stamp, running);
-    return .{
-        .initialized = initialized,
-        .state = completion_state,
-        .completion_reason = completion_reason,
-        .boot_start_tick = boot_start_tick,
-        .now_tick = now,
-        .total_ticks = if (now >= boot_start_tick) now - boot_start_tick else 0,
-        .phase_count = @intCast(@min(phase_count, @as(usize, 0xFFFF_FFFF))),
-        .transition_count = transition_count,
-        .current_phase = current_phase,
-        .now_ns = time_core.monotonicResolve(now_stamp) orelse 0,
-        .total_ns = total_ns orelse 0,
-        .clock_flags = if (running) live_clock.flags else completion_clock_flags,
-        .clock_source = if (running) @intFromEnum(live_clock.source) else completion_clock_source,
-        .clock_generation = if (running) live_clock.generation else completion_clock_generation,
-        .clock_resolution_ns = if (running) live_clock.resolution_ns else completion_clock_resolution_ns,
-        .timing_valid = total_ns != null,
-        .timing_span_count = @intCast(@min(time_span_count + @as(usize, if (running and current_phase != .unknown) 1 else 0), @as(usize, 0xFFFF_FFFF))),
-        .timing_unavailable_spans = unavailable,
-        .timing_dropped_spans = timing_dropped_spans,
-        .configured_attempts = configured_attempts,
-        .fallback_attempts = fallback_attempts,
-        .launch_failures = launch_failures,
-        .shell_instance_id = expected_shell_instance_id,
-    };
-}
-
-pub fn phaseAt(index: u32) ?PhaseInfo {
-    const idx: usize = @intCast(index);
-    if (idx >= phase_count) return null;
-    var out = phases[idx];
-    if (out.phase == current_phase and completion_state == .running) {
-        const now = timer.tickCount();
-        if (now >= current_enter_tick) out.total_ticks +%= now - current_enter_tick;
-        out.last_tick = now;
-    }
-    populatePhaseTiming(&out, if (completion_state == .running) time_core.monotonicCapture() else boot_end_stamp);
-    return out;
-}
-
-fn finishCurrent(now: u64, now_stamp: time_core.MonotonicStamp) void {
-    if (current_phase == .unknown) return;
-    const slot = findPhase(current_phase) orelse return;
-    if (now >= current_enter_tick) phases[slot].total_ticks +%= now - current_enter_tick;
-    phases[slot].last_tick = now;
-    if (time_span_count < time_spans.len) {
-        time_spans[time_span_count] = .{
-            .phase = current_phase,
-            .start = current_enter_stamp,
-            .end = now_stamp,
-        };
-        time_span_count += 1;
-    } else {
-        timing_dropped_spans +|= 1;
-    }
-}
-
-fn populatePhaseTiming(out: *PhaseInfo, now_stamp: time_core.MonotonicStamp) void {
-    var timing: OrderedDurations = .{};
-    for (time_spans[0..time_span_count]) |span| {
-        if (span.phase != out.phase) continue;
-        timing.add(time_core.monotonicResolve(span.start), time_core.monotonicResolve(span.end));
-    }
-    if (out.phase == current_phase and completion_state == .running) {
-        timing.add(time_core.monotonicResolve(current_enter_stamp), time_core.monotonicResolve(now_stamp));
-    }
-    out.first_ns = timing.first orelse 0;
-    out.last_ns = timing.last orelse 0;
-    out.total_ns = timing.total;
-    out.timing_unavailable_spans = timing.unavailable;
-    out.timing_valid = timing.valid();
-}
-
-fn unavailableSpanCount(now_stamp: time_core.MonotonicStamp, include_current: bool) u32 {
-    var count: u32 = 0;
-    for (time_spans[0..time_span_count]) |span| {
-        if (time_core.monotonicElapsed(span.start, span.end) == null) count +|= 1;
-    }
-    if (include_current and current_phase != .unknown and time_core.monotonicElapsed(current_enter_stamp, now_stamp) == null) count +|= 1;
-    return count;
-}
-
-fn freeze(state: CompletionState, reason: CompletionReason) void {
-    const now = timer.tickCount();
-    const now_stamp = time_core.monotonicCapture();
-    finishCurrent(now, now_stamp);
-    const clock = time_core.monotonicSnapshot();
-    boot_end_tick = now;
-    boot_end_stamp = now_stamp;
-    completion_clock_flags = clock.flags;
-    completion_clock_source = @intFromEnum(clock.source);
-    completion_clock_generation = clock.generation;
-    completion_clock_resolution_ns = clock.resolution_ns;
-    completion_state = state;
-    completion_reason = reason;
-}
-
-fn phaseSlot(phase: crash.BootPhase) ?usize {
-    if (findPhase(phase)) |slot| return slot;
-    if (phase_count >= phases.len) return null;
-    const slot = phase_count;
-    phase_count += 1;
-    return slot;
-}
-
-fn findPhase(phase: crash.BootPhase) ?usize {
-    var i: usize = 0;
-    while (i < phase_count) : (i += 1) {
-        if (phases[i].phase == phase) return i;
-    }
-    return null;
+comptime {
+    if(@sizeOf(PhaseInfo)!=72 or @alignOf(PhaseInfo)!=8)@compileError("Native PhaseInfo C geometry");
+    if(@offsetOf(PhaseInfo,"phase")!=0)@compileError("Native PhaseInfo.phase C offset");
+    if(@offsetOf(PhaseInfo,"first_tick")!=8)@compileError("Native PhaseInfo.first_tick C offset");
+    if(@offsetOf(PhaseInfo,"last_tick")!=16)@compileError("Native PhaseInfo.last_tick C offset");
+    if(@offsetOf(PhaseInfo,"total_ticks")!=24)@compileError("Native PhaseInfo.total_ticks C offset");
+    if(@offsetOf(PhaseInfo,"transitions")!=32)@compileError("Native PhaseInfo.transitions C offset");
+    if(@offsetOf(PhaseInfo,"first_ns")!=40)@compileError("Native PhaseInfo.first_ns C offset");
+    if(@offsetOf(PhaseInfo,"last_ns")!=48)@compileError("Native PhaseInfo.last_ns C offset");
+    if(@offsetOf(PhaseInfo,"total_ns")!=56)@compileError("Native PhaseInfo.total_ns C offset");
+    if(@offsetOf(PhaseInfo,"timing_valid")!=64)@compileError("Native PhaseInfo.timing_valid C offset");
+    if(@offsetOf(PhaseInfo,"timing_unavailable_spans")!=68)@compileError("Native PhaseInfo.timing_unavailable_spans C offset");
+    if(@sizeOf(Summary)!=136 or @alignOf(Summary)!=8)@compileError("Native Summary C geometry");
+    if(@offsetOf(Summary,"initialized")!=0)@compileError("Native Summary.initialized C offset");
+    if(@offsetOf(Summary,"state")!=4)@compileError("Native Summary.state C offset");
+    if(@offsetOf(Summary,"completion_reason")!=8)@compileError("Native Summary.completion_reason C offset");
+    if(@offsetOf(Summary,"boot_start_tick")!=16)@compileError("Native Summary.boot_start_tick C offset");
+    if(@offsetOf(Summary,"now_tick")!=24)@compileError("Native Summary.now_tick C offset");
+    if(@offsetOf(Summary,"total_ticks")!=32)@compileError("Native Summary.total_ticks C offset");
+    if(@offsetOf(Summary,"phase_count")!=40)@compileError("Native Summary.phase_count C offset");
+    if(@offsetOf(Summary,"transition_count")!=48)@compileError("Native Summary.transition_count C offset");
+    if(@offsetOf(Summary,"current_phase")!=56)@compileError("Native Summary.current_phase C offset");
+    if(@offsetOf(Summary,"now_ns")!=64)@compileError("Native Summary.now_ns C offset");
+    if(@offsetOf(Summary,"total_ns")!=72)@compileError("Native Summary.total_ns C offset");
+    if(@offsetOf(Summary,"clock_flags")!=80)@compileError("Native Summary.clock_flags C offset");
+    if(@offsetOf(Summary,"clock_source")!=84)@compileError("Native Summary.clock_source C offset");
+    if(@offsetOf(Summary,"clock_generation")!=88)@compileError("Native Summary.clock_generation C offset");
+    if(@offsetOf(Summary,"clock_resolution_ns")!=96)@compileError("Native Summary.clock_resolution_ns C offset");
+    if(@offsetOf(Summary,"timing_valid")!=104)@compileError("Native Summary.timing_valid C offset");
+    if(@offsetOf(Summary,"timing_span_count")!=108)@compileError("Native Summary.timing_span_count C offset");
+    if(@offsetOf(Summary,"timing_unavailable_spans")!=112)@compileError("Native Summary.timing_unavailable_spans C offset");
+    if(@offsetOf(Summary,"timing_dropped_spans")!=116)@compileError("Native Summary.timing_dropped_spans C offset");
+    if(@offsetOf(Summary,"configured_attempts")!=120)@compileError("Native Summary.configured_attempts C offset");
+    if(@offsetOf(Summary,"fallback_attempts")!=124)@compileError("Native Summary.fallback_attempts C offset");
+    if(@offsetOf(Summary,"launch_failures")!=128)@compileError("Native Summary.launch_failures C offset");
+    if(@offsetOf(Summary,"shell_instance_id")!=132)@compileError("Native Summary.shell_instance_id C offset");
 }

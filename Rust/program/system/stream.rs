@@ -345,7 +345,7 @@ unsafe fn release(cleanup: Cleanup) -> bool {
             if mask == 0 {
                 continue;
             }
-            let Some(mut request) = fs::Request::begin(9, b'A' + lane, 0, 0, true, &[]) else {
+            let Some(mut request) = fs::Request::begin(9, b'A' + lane, b'C', 1, true, &[]) else {
                 return false;
             };
             let mut released = true;
@@ -378,7 +378,8 @@ unsafe fn release(cleanup: Cleanup) -> bool {
 }
 /// # Safety
 /// Exact process/thread generation has drained all caller-bound async I/O.
-/// This cleanup never parks for admission or touches an unrelated volume lane.
+/// This cleanup never parks for admission or touches an unrelated stream payload. The same immediate ordered
+/// admission also protects the C: catalog used by exact claim retirement.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_sys_stream_cleanup(
     program: u32,

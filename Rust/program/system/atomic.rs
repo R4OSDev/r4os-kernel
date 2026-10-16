@@ -110,7 +110,11 @@ pub unsafe extern "C" fn r4os_rust_sys_file_replace(
             return -8;
         }
         let mut request = some!(
-            fs::Request::volume(23, (*target.drive_ref).letter, volume),
+            if require_owned {
+                fs::Request::claims(23, (*target.drive_ref).letter, volume)
+            } else {
+                fs::Request::volume(23, (*target.drive_ref).letter, volume)
+            },
             -7
         );
         let mut parent = 0;
@@ -323,7 +327,7 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_declare(
             return -5;
         }
         let letter = (*staged.drive_ref).letter;
-        let mut request = some!(fs::Request::volume(6, letter, volume), -6);
+        let mut request = some!(fs::Request::claims(6, letter, volume), -6);
         let mut parent = 0;
         if fs::parent(volume, parent_path, &mut parent) != 0 {
             return -3;

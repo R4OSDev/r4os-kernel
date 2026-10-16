@@ -311,3 +311,20 @@ const _: () = {
     );
     assert!(core::mem::size_of::<Stats>() == 64);
 };
+
+pub(crate) const CLASS_NAMES: [&[u8]; 10] = [
+    b"program_state",
+    b"storage",
+    b"network",
+    b"driver_work",
+    b"heap",
+    b"virtual_memory",
+    b"page_tables",
+    b"physical_memory",
+    b"boot_log",
+    b"serial_output",
+];
+pub(crate) fn stats_for_class(class: u8) -> Stats {
+    assert!((class as usize) < CLASS_NAMES.len());
+    named(class).stats()
+}

@@ -524,7 +524,6 @@ pub unsafe extern "C" fn r4os_rust_program_api_module_path(out: *mut u8, capacit
     }
 }
 unsafe extern "C" {
-    fn r4os_zig_program_api_boot_ready(operation: u8, id: u32) -> i32;
     fn r4os_zig_program_api_display_used();
 }
 #[unsafe(no_mangle)]
@@ -545,10 +544,10 @@ pub extern "C" fn r4os_rust_program_api_action(op: u8) -> i32 {
                 if instance.is_null() || (*instance).role != 1 {
                     return c::boot_ready_error_not_boot_shell;
                 }
-                let result = r4os_zig_program_api_boot_ready(0, (*instance).id);
+                let result = crate::boot::performance::complete_ready((*instance).id);
                 if result == c::boot_ready_result_completed {
-                    r4os_zig_program_api_boot_ready(1, 0);
-                    r4os_zig_program_api_boot_ready(2, 0);
+                    crate::display::bootscreen::complete();
+                    crate::boot::foundation::r4os_rust_boot_release();
                 }
                 result
             }

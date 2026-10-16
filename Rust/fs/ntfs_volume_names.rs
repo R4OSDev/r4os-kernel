@@ -23,6 +23,13 @@ pub fn not_found(depth: u32, phase: u32) -> Lookup {
     LOOKUP_STAGE.store((next << 12) | (code & 0x0fff), Relaxed);
     Lookup::NotFound
 }
+/// Error-only extension of the existing opaque diagnostic stage. Phases
+///50..99 identify I/O rejection, retaining depth/sequence packing and status.
+pub(super) fn io_failure(depth: u32, phase: u32) -> Lookup {
+    assert!(phase < 50);
+    let _ = not_found(depth, 50 + phase);
+    Lookup::Io
+}
 pub(super) unsafe fn entry_from_name(reference: FileReference, name: FileName) -> Option<Entry> {
     unsafe {
         let mut entry = Entry {

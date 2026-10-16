@@ -19,8 +19,8 @@ use core::{
     sync::atomic::{AtomicU64, Ordering},
 };
 use registry::{CriticalBundle, GuardedStack, NO_RESERVE};
-const STACK_SIZE: u64 = 64 * 1024;
-const GUARD_SIZE: u64 = 16 * 1024;
+pub(crate) const STACK_SIZE: u64 = 64 * 1024;
+pub(crate) const GUARD_SIZE: u64 = 16 * 1024;
 const PATTERN: u8 = 0xa5;
 unsafe extern "C" {
     // Each VM operation is independently admitted by the existing memory

@@ -63,7 +63,7 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_begin(input: *const u8, flags: u32
         }
         let letter = (*target.drive_ref).letter;
         let mut request = some!(
-            fs::Request::volume(6, letter, volume),
+            fs::Request::claims(6, letter, volume),
             c::file_stream_error_io
         );
         stream::reap(letter);
@@ -200,7 +200,15 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_write(
         let volume = some!(ctx::volume(target), c::file_stream_error_io);
         let target_path = target.path.slice();
         let letter = (*target.drive_ref).letter;
-        let mut request = match fs::Request::volume(7, letter, volume) {
+        // Empty FAT streams initially lack a node identity; their admitted
+        // write can refresh the C: claim. NTFS chunks retain their original
+        // single-volume parallelism because their live identity is stable.
+        let admission = if volume.kind == 0 {
+            fs::Request::claims(7, letter, volume)
+        } else {
+            fs::Request::volume(7, letter, volume)
+        };
+        let mut request = match admission {
             Some(value) => value,
             None => {
                 r4os_zig_sys_stream_error(true, letter, 0, offset, len, &volume);
@@ -277,15 +285,17 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_write(
             let refresh = (*slot).file_node == 0 && (*slot).file_node_generation == 0;
             (*slot).size += u64::from(len);
             (*slot).identity_refresh_pending = refresh;
-            log.phase = 7;
+            log.phase = 70;
             let mut updated = fs::Entry::EMPTY;
-            match fs::lookup(
+            let lookup_status = fs::lookup(
                 slot_volume,
                 (*slot).parent_node,
                 s::name(slot),
                 false,
                 &mut updated,
-            ) {
+            );
+            log.phase = 70 + u32::try_from(lookup_status).expect("VFS lookup status");
+            match lookup_status {
                 0 => {
                     log.phase = 8;
                     if updated.is_dir() || updated.size != (*slot).size {
@@ -415,7 +425,7 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_abort(input: *const u8) -> i32 {
             return c::file_stream_error_io;
         }
         let mut request = some!(
-            fs::Request::volume(9, letter, volume),
+            fs::Request::claims(9, letter, volume),
             c::file_stream_error_io
         );
         let mut parent = 0;

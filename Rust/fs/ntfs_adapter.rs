@@ -410,6 +410,8 @@ pub unsafe extern "C" fn r4os_rust_ntfs_adapter(
                 }
             }
             3 => {
+                #[cfg(not(r4os_owner_fixture))]
+                let _owner = crate::memory::owner::Guard::acquire(1);
                 for i in 0..s::VOLUMES {
                     let st = s::state(i);
                     if !(*st).in_use
@@ -424,10 +426,14 @@ pub unsafe extern "C" fn r4os_rust_ntfs_adapter(
                 Output::default()
             }
             4 => {
+                #[cfg(not(r4os_owner_fixture))]
+                let _owner = crate::memory::owner::Guard::acquire(1);
                 for i in 0..s::VOLUMES {
                     let st = s::state(i);
                     if (*st).in_use && (*st).device == a.device {
-                        (*s::cache(st)).invalidate_external();
+                        super::ntfs_volume_cache::with(s::cache(st), |cache| {
+                            cache.invalidate_external()
+                        });
                     }
                 }
                 Output::default()
@@ -575,6 +581,8 @@ unsafe fn publish_absent_backup(a: Args) -> Output {
     }
 }
 unsafe fn reclaim(requested: u32) -> t::MetadataReclaimResult {
+    #[cfg(not(r4os_owner_fixture))]
+    let _owner = crate::memory::owner::Guard::acquire(1);
     unsafe {
         let requested = requested.min(8);
         let mut result = t::MetadataReclaimResult {
@@ -595,7 +603,9 @@ unsafe fn reclaim(requested: u32) -> t::MetadataReclaimResult {
             if !(*st).in_use {
                 continue;
             }
-            let one = (*s::cache(st)).reclaim(requested - result.reclaimed_entries);
+            let one = super::ntfs_volume_cache::with(s::cache(st), |cache| {
+                cache.reclaim(requested - result.reclaimed_entries)
+            });
             result.inspected_entries = result
                 .inspected_entries
                 .saturating_add(one.inspected_entries);
@@ -607,7 +617,9 @@ unsafe fn reclaim(requested: u32) -> t::MetadataReclaimResult {
     }
 }
 
-unsafe fn summary() -> t::MetadataCacheSummary {
+pub(crate) unsafe fn summary() -> t::MetadataCacheSummary {
+    #[cfg(not(r4os_owner_fixture))]
+    let _owner = crate::memory::owner::Guard::acquire(1);
     unsafe {
         let mut out = t::MetadataCacheSummary::EMPTY;
         out.active_volumes = 0;
@@ -619,7 +631,7 @@ unsafe fn summary() -> t::MetadataCacheSummary {
             if !(*st).in_use {
                 continue;
             }
-            let one = (*s::cache(st)).summary();
+            let one = super::ntfs_volume_cache::with(s::cache(st), |cache| cache.summary());
             out.bytes_per_volume = out.bytes_per_volume.max(one.bytes_per_volume);
             out.mount_generation = out.mount_generation.max(one.mount_generation);
             out.content_generation = out.content_generation.max(one.content_generation);

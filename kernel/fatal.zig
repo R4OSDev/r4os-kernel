@@ -3,11 +3,9 @@
 // existing owners until their respective migration waves.
 const boot_status = @import("boot_status.zig");
 const bootscreen = @import("bootscreen.zig");
-const boot_perf = @import("boot_perf.zig");
 const crash = @import("crash.zig");
 const crash_screen = @import("crash_screen.zig");
 const timer = @import("timer.zig");
-const monotonic = @import("../platform/monotonic.zig");
 extern fn r4os_rust_fatal_init() callconv(.c) void;
 extern fn r4os_rust_fatal_phase(crash.BootPhase) callconv(.c) void;
 extern fn r4os_rust_fatal_record(crash.BootPhase, [*]const u8, usize) callconv(.c) void;
@@ -40,19 +38,13 @@ pub fn zigPanic(message: []const u8) noreturn {
 pub fn rustPanic(message: []const u8) noreturn {
     r4os_rust_panic_fatal(message.ptr, message.len);
 }
-export fn r4os_zig_fatal_init_dependencies() callconv(.c) void {
-    monotonic.earlyInit();
-    boot_perf.init();
-}
-export fn r4os_zig_boot_perf_record(phase: crash.BootPhase) callconv(.c) void {
-    boot_perf.record(phase);
-}
+
+
 export fn r4os_zig_fatal_record_display(message: [*]const u8, len: usize) callconv(.c) void {
     bootscreen.setError(message[0..len]);
     boot_status.disableForCrash();
 }
 export fn r4os_zig_fatal_display(message: [*]const u8, len: usize) callconv(.c) void {
-    boot_perf.failFatal();
     bootscreen.setError(message[0..len]);
 }
 export fn r4os_zig_fatal_ticks() callconv(.c) u64 {

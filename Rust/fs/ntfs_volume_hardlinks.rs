@@ -242,7 +242,7 @@ pub(super) unsafe fn recover_delete(
             return RecoveryDelete::Io;
         }
         if !v.cache().is_null() {
-            (*v.cache()).invalidate(Mutation::Recovery)
+            super::ntfs_volume_cache::with(v.cache(), |cache| cache.invalidate(Mutation::Recovery))
         }
         if sink.matches > 1 {
             if !r::set_dirty(v, true)

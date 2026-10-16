@@ -22,6 +22,7 @@ const GROW: u64 = 64 * 1024;
 const PATTERN: u8 = 0xa5;
 const DETAIL: bool = config::ENABLE_METRICS;
 const PROFILES: usize = 9;
+pub(crate) const PROFILE_COUNT: usize = PROFILES;
 const PROFILE_NAMES: [&[u8]; PROFILES] = [
     b"unknown",
     b"tiny",

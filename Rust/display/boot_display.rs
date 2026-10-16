@@ -1,6 +1,5 @@
 //! Sole early framebuffer/console bootstrap and resident pixel-shadow storage.
-//! Display admission remains at the existing display owner; typed C peers keep
-//! its still-Zig callback ABI without retaining another bootstrap state.
+//! Display admission and log sink binding retain the same native owner.
 use super::{
     console::Console,
     console_scroll_buffer,
@@ -33,9 +32,6 @@ static FRAME: Storage<Framebuffer> = Storage(UnsafeCell::new(MaybeUninit::uninit
 static CONSOLE: Storage<Console> = Storage(UnsafeCell::new(MaybeUninit::uninit()));
 static STATE: Storage<State> = Storage(UnsafeCell::new(MaybeUninit::uninit()));
 static READY: AtomicBool = AtomicBool::new(false);
-unsafe extern "C" {
-    fn r4os_zig_boot_display_sink(console: *mut Console);
-}
 fn frame() -> *mut Framebuffer {
     FRAME.0.get().cast()
 }
@@ -74,7 +70,7 @@ pub fn init() -> Option<State> {
         (*console()).clear();
         let _ = super::bootscreen::render(frame());
         (*console()).invalidate_external();
-        r4os_zig_boot_display_sink(console());
+        crate::boot::log_route::set_console(console());
         let state = State {
             console_metrics: ConsoleMetrics {
                 cols: ptr::addr_of!((*console()).cols).read(),

@@ -2,7 +2,6 @@
 //! activation, dependency resolution and protocol callback ordering.
 const protocol_api = @import("../kernel/protocol_api.zig");
 const registry = @import("../protocol/registry.zig");
-const loader_perf = @import("../kernel/loader_perf.zig");
 
 pub const ROLE_STATE_MISSING: u8 = 0;
 pub const ROLE_STATE_LOADED: u8 = 1;
@@ -50,20 +49,7 @@ pub fn roleRuntimeStatus(role: []const u8) RoleRuntimeStatus {
 
 // Stateless projections of the existing instrumentation and registry formatter.
 export fn r4os_zig_r4p_dump() callconv(.c) void { registry.dumpStatus(); }
-export fn r4os_zig_r4p_perf(operation: u8, a: u64, b: u64, c: u64, d: u64) callconv(.c) u64 {
-    switch (operation) {
-        0 => return loader_perf.now(),
-        1 => loader_perf.addR4pScanTicks(a),
-        2 => loader_perf.addR4pReadTicks(a),
-        3 => loader_perf.addR4pResolveTicks(a),
-        5 => loader_perf.addR4pInitTicks(a),
-        6 => loader_perf.recordR4pResults(@intCast(a), @intCast(b), @intCast(c), @intCast(d)),
-        7 => loader_perf.recordR4pScanEntry(),
-        8 => loader_perf.recordR4pCandidate(),
-        else => unreachable,
-    }
-    return 0;
-}
+
 comptime {
     if (@sizeOf(Bytes) != 16 or @sizeOf(Status) != 3 or @alignOf(Status) != 1)
         @compileError("R4P facade C layout drift");

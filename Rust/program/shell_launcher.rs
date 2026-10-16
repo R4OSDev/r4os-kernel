@@ -26,7 +26,6 @@ unsafe extern "C" {
     fn r4os_zig_program_shell_init(usable_bytes: u64);
     fn r4os_zig_program_shell_config(config: *const c_void, output: *mut Config);
     fn r4os_zig_program_shell_text(channel: u8, value: Bytes);
-    fn r4os_zig_program_shell_perf(op: u8, a: u64, b: u64) -> u64;
     fn r4os_zig_program_shell_run(
         boot: *mut c_void,
         working: *mut c_void,
@@ -55,9 +54,6 @@ fn text(channel: u8, value: &[u8]) {
 }
 fn log(value: &[u8]) {
     text(1, value)
-}
-fn perf(op: u8, a: u64, b: u64) -> u64 {
-    unsafe { r4os_zig_program_shell_perf(op, a, b) }
 }
 fn run(
     boot: *mut c_void,
@@ -107,23 +103,23 @@ fn service_boot(boot: *mut c_void, working: *mut c_void) {
     log(b"BOOT");
     log(b"\r\n");
     text(3, b"Dienstplan laden");
-    let start = perf(0, 0, 0);
+    let start = crate::loader::performance::begin_service_boot();
     let result = run(boot, working, SERVICES, b"BOOT", false, 0);
     text(4, b"");
     match result {
         RAN => {
-            perf(1, start, 1);
+            crate::loader::performance::finish_service_boot(start, 1);
             log(b"[LAUNCH] service manager boot completed\r\n");
         }
         NOT_FOUND => {
-            perf(1, start, 2);
+            crate::loader::performance::finish_service_boot(start, 2);
             text(0, b"Service manager not found: ");
             text(0, SERVICES);
             text(0, b"\r\n");
             log(b"[LAUNCH][WARN] service manager boot not found\r\n");
         }
         FAILED => {
-            perf(1, start, 3);
+            crate::loader::performance::finish_service_boot(start, 3);
             text(0, b"Service manager failed: ");
             text(0, SERVICES);
             text(0, b"\r\n");
@@ -134,9 +130,11 @@ fn service_boot(boot: *mut c_void, working: *mut c_void) {
 }
 fn note_result(result: u8) -> u8 {
     if result == RAN {
-        perf(3, 0, 0);
+        crate::boot::performance::note_shell_launched(unsafe {
+            super::info::r4os_rust_program_info_shell()
+        });
     } else {
-        perf(4, 0, 0);
+        crate::boot::performance::note_shell_launch_failure();
     }
     result
 }
@@ -148,7 +146,7 @@ fn configured(boot: *mut c_void, working: *mut c_void, path: &[u8], args: &[u8])
         log(args);
     }
     log(b"\r\n");
-    perf(2, 0, 0);
+    crate::boot::performance::begin_shell_attempt(1);
     let host = if same_path(path, TERMINAL) {
         TERMINAL_MODE
     } else {
@@ -178,7 +176,7 @@ fn terminal(boot: *mut c_void, working: *mut c_void) -> u8 {
     log(b"[LAUNCH] external terminal fallback=");
     log(TERMINAL);
     log(b"\r\n");
-    perf(2, 1, 0);
+    crate::boot::performance::begin_shell_attempt(2);
     note_result(run(boot, working, TERMINAL, b"", true, TERMINAL_MODE))
 }
 fn recovery(boot: *mut c_void, working: *mut c_void, path: &[u8]) -> u8 {
@@ -186,7 +184,7 @@ fn recovery(boot: *mut c_void, working: *mut c_void, path: &[u8]) -> u8 {
     log(b"[LAUNCH] external recovery shell=");
     log(path);
     log(b"\r\n");
-    perf(2, 2, 0);
+    crate::boot::performance::begin_shell_attempt(3);
     note_result(run(boot, working, path, b"", true, TERMINAL_MODE))
 }
 fn retire() -> ! {
@@ -198,7 +196,7 @@ fn fatal(reason: &[u8]) -> ! {
     unsafe { r4os_zig_program_shell_fatal(span(reason)) }
 }
 fn crash(path: &[u8]) -> ! {
-    perf(5, 0, 0);
+    crate::boot::performance::fail_no_shell();
     log(b"[LAUNCH][CRASH] no external shell available; checked config=");
     log(path);
     log(b" terminal=");

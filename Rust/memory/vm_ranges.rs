@@ -312,3 +312,6 @@ const _: () = {
     assert!(core::mem::offset_of!(Range, commit_span_head) == 202);
     assert!(core::mem::offset_of!(Range, page_state_span_head) == 206);
 };
+
+// Canonical native range-window tag used by the unchanged private VM contract.
+pub(crate) const R4X_VM_WINDOW: u8 = 6;

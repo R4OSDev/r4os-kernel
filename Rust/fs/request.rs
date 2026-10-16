@@ -23,6 +23,7 @@ use core::{
     sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering::Relaxed},
 };
 const LANES: usize = 26;
+pub(crate) const DRIVE_GATE_COUNT: usize = LANES;
 const SLICE_LIMIT: u32 = 12;
 const SLICE_TICKS: u64 = 5 * DEFAULT_HZ as u64;
 #[repr(C)]
@@ -313,6 +314,14 @@ fn read_only(kind: u32) -> bool {
 }
 unsafe fn gate_op(lane: u8, mutation: bool, op: u8, timeout: u64) -> bool {
     unsafe { sync_locks::r4os_rust_sync_guard(gate_ptr(usize::from(lane), mutation), op, timeout) }
+}
+/// Check only this task's existing exact namespace admission. This does not
+/// acquire, extend or wait on any filesystem request or mounted reference.
+pub(crate) fn owns_drive(letter: u8) -> bool {
+    if !letter.is_ascii_uppercase() {
+        return false;
+    }
+    unsafe { gate_op(letter - b'A', false, 0, 0) }
 }
 unsafe fn begin_use(reference: Reference) -> Option<Use> {
     let mut owner = Owner::default();

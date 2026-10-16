@@ -78,6 +78,16 @@ fn name(generation: u64) -> Bytes {
     unsafe { ptr::copy_nonoverlapping(b".CLM".as_ptr(), out.add(8), 4) }
     Bytes { data: out, len: 12 }
 }
+fn catalog_admitted() -> bool {
+    #[cfg(r4os_owner_fixture)]
+    {
+        true
+    }
+    #[cfg(not(r4os_owner_fixture))]
+    {
+        crate::sched::scheduler::current().is_null() || crate::fs::request::owns_drive(b'C')
+    }
+}
 fn directory(v: Volume) -> Option<u64> {
     match io::resolve(v, span(DIRECTORY)) {
         Ok(Some(dir)) => return Some(dir),
@@ -182,6 +192,9 @@ fn retire_in(v: Volume, dir: u64, generation: u64) -> bool {
 pub fn retire(generation: u64) -> bool {
     if generation == 0 {
         return true;
+    }
+    if !catalog_admitted() {
+        return false;
     }
     let Some(_scratch) = STORE_ADMISSION.acquire() else {
         return false;
@@ -366,6 +379,10 @@ pub unsafe fn recover(summary: *mut Summary) -> bool {
     }
 }
 pub fn write_mode(refresh: bool, a: &WriteArgs) -> WriteResult {
+    if !catalog_admitted() {
+        return FAILED;
+    }
+
     if refresh && a.reuse_generation == 0 {
         return FAILED;
     }

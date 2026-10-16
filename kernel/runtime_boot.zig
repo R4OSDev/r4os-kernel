@@ -1,7 +1,6 @@
 // Native BSP runtime/worker/launcher orchestration. These remaining cuts are
 // stateless adapters to typed Zig callback ABI, presentation and audio owners.
 const bootscreen = @import("bootscreen.zig");
-const loader_perf = @import("loader_perf.zig");
 const task = @import("../sched/task.zig");
 const audio = @import("../audio/core.zig");
 const crash = @import("crash.zig");
@@ -33,11 +32,7 @@ export fn r4os_zig_runtime_audio(progress_worker: bool) callconv(.c) bool {
     _ = audio.applyConfiguredSidModel();
     return true;
 }
-export fn r4os_zig_runtime_loader_timing(begin: bool, start_tick: u64) callconv(.c) u64 {
-    if (begin) return loader_perf.beginR4pRuntime();
-    loader_perf.finishR4pRuntime(start_tick);
-    return 0;
-}
+
 comptime {
     if (@intFromEnum(crash.BootPhase.runtime) != 13 or @intFromEnum(crash.BootPhase.shell) != 18)
         @compileError("Native runtime boot phase drift");

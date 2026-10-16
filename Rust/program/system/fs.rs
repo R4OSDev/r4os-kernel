@@ -266,6 +266,28 @@ impl Request {
             }
         }
     }
+    /// One existing ordered request covers the destination and the durable
+    /// claim catalog on C:. No additional request opens under a target gate.
+    pub unsafe fn claims(kind: u32, letter: u8, volume: Volume) -> Option<Self> {
+        unsafe {
+            let Some(system) = crate::fs::vfs::mounted_volume(b'C') else {
+                return Self::volume(kind, letter, volume);
+            };
+            // The ordinary C: path already retains this exact mounted reference.
+            let same = vfs::r4os_rust_vfs_identity(
+                0,
+                &Args {
+                    volume,
+                    other: system,
+                    ..Default::default()
+                },
+            );
+            if letter == b'C' && same {
+                return Self::volume(kind, letter, volume);
+            }
+            Self::begin(kind, letter, b'C', 1, false, &[volume, system])
+        }
+    }
     pub unsafe fn volume(kind: u32, letter: u8, volume: Volume) -> Option<Self> {
         unsafe { Self::begin(kind, letter, 0, 0, false, &[volume]) }
     }

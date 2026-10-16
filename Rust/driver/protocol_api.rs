@@ -28,7 +28,6 @@ static TABLE: Table = Table(UnsafeCell::new(contract::ProtocolApi {
     file_read,
 }));
 unsafe extern "C" {
-    fn r4os_zig_protocol_log(severity: u8, slot: u32, text: *const u8);
     fn r4os_zig_protocol_file_read(path: *const u8, out: *mut u8, len: u32) -> i32;
 }
 unsafe fn length(text: *const u8) -> usize {
@@ -47,13 +46,13 @@ fn slot_id() -> u32 {
     }
 }
 unsafe extern "C" fn log_info(text: *const u8) {
-    unsafe { r4os_zig_protocol_log(0, slot_id(), text) };
+    unsafe { crate::boot::log_event::protocol(0, slot_id(), text) };
 }
 unsafe extern "C" fn log_warn(text: *const u8) {
-    unsafe { r4os_zig_protocol_log(1, slot_id(), text) };
+    unsafe { crate::boot::log_event::protocol(1, slot_id(), text) };
 }
 unsafe extern "C" fn log_error(text: *const u8) {
-    unsafe { r4os_zig_protocol_log(2, slot_id(), text) };
+    unsafe { crate::boot::log_event::protocol(2, slot_id(), text) };
 }
 unsafe extern "C" fn register_role(role: *const u8, _category: u32, _flags: u32) -> i32 {
     let slot = CURRENT_SLOT.load(Ordering::Relaxed);

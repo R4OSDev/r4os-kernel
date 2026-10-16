@@ -921,61 +921,93 @@ const _: () = {
 };
 static DEV: Table<c::R4XStartR4Dev> = Table::new();
 fn configure_dev() {
-    for op in 20..26 {
-        unsafe { r4os_zig_program_runtime_register(op, 0) }
-    }
-    let mut bindings = [0usize; 45];
-    unsafe { r4os_zig_program_runtime_bindings(6, bindings.as_mut_ptr(), bindings.len()) };
+    use super::r4dev;
+    r4dev::providers::install();
     let value = c::R4XStartR4Dev {
-        device_inventory_summary: bindings[0],
-        device_inventory_record: bindings[1],
-        memory_summary: bindings[2],
-        memory_block_count: bindings[3],
-        memory_block: bindings[4],
-        memory_pressure_snapshot: bindings[5],
-        memory_reclaim_probe: bindings[6],
-        memory_backing_store_probe: bindings[7],
-        memory_backing_store_slot_probe: bindings[8],
-        memory_pager_gate_probe: bindings[9],
-        memory_page_io_probe: bindings[10],
-        memory_vm_page_state_probe: bindings[11],
-        memory_vm_reserve_probe: bindings[12],
-        paging_summary: bindings[13],
-        performance_summary: bindings[14],
-        performance_task: bindings[15],
-        performance_storage: bindings[16],
-        performance_boot_phase: bindings[17],
-        protocol_status: bindings[18],
-        protocol_dispatch: bindings[19],
-        display_summary: bindings[20],
-        hardware_summary: bindings[21],
-        boot_info_summary: bindings[22],
-        boot_info_memory_count: bindings[23],
-        boot_info_memory_entry: bindings[24],
-        program_instance_storage_summary: bindings[25],
-        program_instance_storage_self_test: bindings[26],
-        program_registry_summary: bindings[27],
-        program_registry_self_test: bindings[28],
-        program_registry_summary_v2: bindings[29],
-        program_registry_self_test_v2: bindings[30],
-        execution_inventory_summary: bindings[31],
-        program_instance_storage_summary_v2: bindings[32],
-        kernel_version: bindings[33],
-        performance_boot_phase_clock: bindings[34],
-        performance_irq_timing: bindings[35],
-        performance_boot_summary: bindings[36],
-        performance_driver_work: bindings[37],
-        performance_pci_inventory: bindings[38],
-        performance_input: bindings[39],
-        display_state: bindings[40],
-        driver_module_info: bindings[41],
-        performance_instrumentation: bindings[42],
-        performance_lock: bindings[43],
-        performance_stack: bindings[44],
+        device_inventory_summary: r4dev::devices::r4os_rust_r4dev_device_inventory_summary
+            as *const () as usize,
+        device_inventory_record: r4dev::devices::r4os_rust_r4dev_device_inventory_record
+            as *const () as usize,
+        memory_summary: r4dev::memory::r4os_rust_r4dev_memory_summary as *const () as usize,
+        memory_block_count: r4dev::memory::r4os_rust_r4dev_memory_block_count as *const () as usize,
+        memory_block: r4dev::memory::r4os_rust_r4dev_memory_block as *const () as usize,
+        memory_pressure_snapshot: r4dev::memory::r4os_rust_r4dev_memory_pressure_snapshot
+            as *const () as usize,
+        memory_reclaim_probe: r4dev::memory::r4os_rust_r4dev_memory_reclaim_probe as *const ()
+            as usize,
+        memory_backing_store_probe: r4dev::memory_probes::r4os_rust_r4dev_memory_backing_store_probe
+            as *const () as usize,
+        memory_backing_store_slot_probe:
+            r4dev::memory_probes::r4os_rust_r4dev_memory_backing_store_slot_probe as *const ()
+                as usize,
+        memory_pager_gate_probe: r4dev::memory_probes::r4os_rust_r4dev_memory_pager_gate_probe
+            as *const () as usize,
+        memory_page_io_probe: r4dev::memory_probes::r4os_rust_r4dev_memory_page_io_probe
+            as *const () as usize,
+        memory_vm_page_state_probe: r4dev::memory_probes::r4os_rust_r4dev_memory_vm_page_state_probe
+            as *const () as usize,
+        memory_vm_reserve_probe: super::vm::r4os_rust_program_vm_probe as *const () as usize,
+        paging_summary: r4dev::paging::r4os_rust_r4dev_paging_summary as *const () as usize,
+        performance_summary: r4dev::summary::r4os_rust_r4dev_performance_summary as *const ()
+            as usize,
+        performance_task: r4dev::paging::r4os_rust_r4dev_performance_task as *const () as usize,
+        performance_storage: r4dev::storage::r4os_rust_r4dev_performance_storage as *const ()
+            as usize,
+        performance_boot_phase: r4dev::boot::r4os_rust_r4dev_performance_boot_phase as *const ()
+            as usize,
+        protocol_status: r4dev::protocol::r4os_rust_r4dev_protocol_status as *const () as usize,
+        protocol_dispatch: r4dev::protocol::r4os_rust_r4dev_protocol_dispatch as *const () as usize,
+        display_summary: r4dev::display::r4os_rust_r4dev_display_summary as *const () as usize,
+        hardware_summary: r4dev::devices::r4os_rust_r4dev_hardware_summary as *const () as usize,
+        boot_info_summary: r4dev::boot::r4os_rust_r4dev_boot_info_summary as *const () as usize,
+        boot_info_memory_count: r4dev::boot::r4os_rust_r4dev_boot_info_memory_count as *const ()
+            as usize,
+        boot_info_memory_entry: r4dev::boot::r4os_rust_r4dev_boot_info_memory_entry as *const ()
+            as usize,
+        program_instance_storage_summary:
+            r4dev::providers::r4os_rust_r4dev_program_instance_storage_summary as *const () as usize,
+        program_instance_storage_self_test:
+            r4dev::providers::r4os_rust_r4dev_program_instance_storage_self_test as *const ()
+                as usize,
+        program_registry_summary: r4dev::providers::r4os_rust_r4dev_program_registry_summary
+            as *const () as usize,
+        program_registry_self_test: r4dev::providers::r4os_rust_r4dev_program_registry_self_test
+            as *const () as usize,
+        program_registry_summary_v2: r4dev::providers::r4os_rust_r4dev_program_registry_summary_v2
+            as *const () as usize,
+        program_registry_self_test_v2:
+            r4dev::providers::r4os_rust_r4dev_program_registry_self_test_v2 as *const () as usize,
+        execution_inventory_summary: r4dev::providers::r4os_rust_r4dev_execution_inventory_summary
+            as *const () as usize,
+        program_instance_storage_summary_v2:
+            r4dev::providers::r4os_rust_r4dev_program_instance_storage_summary_v2 as *const ()
+                as usize,
+        kernel_version: r4dev::providers::r4os_rust_r4dev_kernel_version as *const () as usize,
+        performance_boot_phase_clock: r4dev::boot::r4os_rust_r4dev_performance_boot_phase_clock
+            as *const () as usize,
+        performance_irq_timing: r4dev::telemetry::r4os_rust_r4dev_performance_irq_timing
+            as *const () as usize,
+        performance_boot_summary: r4dev::boot::r4os_rust_r4dev_performance_boot_summary as *const ()
+            as usize,
+        performance_driver_work: r4dev::telemetry::r4os_rust_r4dev_performance_driver_work
+            as *const () as usize,
+        performance_pci_inventory: r4dev::telemetry::r4os_rust_r4dev_performance_pci_inventory
+            as *const () as usize,
+        performance_input: r4dev::telemetry::r4os_rust_r4dev_performance_input as *const ()
+            as usize,
+        display_state: r4dev::display::r4os_rust_r4dev_display_state as *const () as usize,
+        driver_module_info: r4dev::display::r4os_rust_r4dev_driver_module_info as *const ()
+            as usize,
+        performance_instrumentation: r4dev::telemetry::r4os_rust_r4dev_performance_instrumentation
+            as *const () as usize,
+        performance_lock: r4dev::telemetry::r4os_rust_r4dev_performance_lock as *const () as usize,
+        performance_stack: r4dev::telemetry::r4os_rust_r4dev_performance_stack as *const ()
+            as usize,
         ..Default::default()
     };
     DEV.configure(value);
 }
+
 const _: () = {
     assert!(mem::size_of::<c::R4XStartR4Dev>() == 392);
     assert!(mem::offset_of!(c::R4XStartR4Dev, magic) == 0);

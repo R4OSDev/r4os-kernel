@@ -139,14 +139,10 @@ static DATA: Owner = Owner(UnsafeCell::new(Data {
 }));
 static GATE: AtomicU8 = AtomicU8::new(0);
 unsafe extern "C" {
-    fn r4os_zig_r4p_perf(op: u8, a: u64, b: u64, c: u64, d: u64) -> u64;
     fn r4os_zig_r4p_dump();
 }
-fn perf(op: u8, a: u64, b: u64, c: u64, d: u64) -> u64 {
-    unsafe { r4os_zig_r4p_perf(op, a, b, c, d) }
-}
 fn now() -> u64 {
-    perf(0, 0, 0, 0, 0)
+    super::performance::now()
 }
 fn log(s: &[u8]) {
     ctl::log(s)
@@ -313,13 +309,7 @@ fn count(state: u8) -> usize {
 }
 fn refresh() {
     let roles = unsafe { (*DATA.0.get()).cataloged_roles };
-    perf(
-        6,
-        roles as u64,
-        count(2) as u64,
-        count(4) as u64,
-        count(5) as u64,
-    );
+    super::performance::record_r4p_results(roles, count(2), count(4), count(5));
 }
 fn ensure_initialized() {
     if unsafe { (*DATA.0.get()).initialized } {
@@ -645,11 +635,11 @@ fn catalog(source: file::Source, name: &[u8]) -> bool {
     }
     let start = now();
     let Some(info) = info_file(&source, name) else {
-        perf(2, start, 0, 0, 0);
+        super::performance::add_r4p_read_ticks(start);
         report(b"[R4P] invalid R4M0 module: ", name, b"\r\n");
         return false;
     };
-    perf(2, start, 0, 0, 0);
+    super::performance::add_r4p_read_ticks(start);
     if !fits(&info, name) {
         return false;
     }
@@ -736,7 +726,7 @@ fn load_candidate(index: usize) -> Option<usize> {
     log(b"\r\n");
     let start = now();
     let prepared = Prepared::new(None, &source, name.bytes(), path.bytes());
-    perf(2, start, 0, 0, 0);
+    super::performance::add_r4p_read_ticks(start);
     let mut prepared = prepared?;
     let init = prepared.export(b"ProtocolInit")?;
     let shutdown = prepared.export(b"ProtocolShutdown")?;
@@ -788,7 +778,7 @@ fn init_module(index: usize) {
     ppi::r4os_rust_protocol_slot(0, slot);
     let result = unsafe { init(ppi::r4os_rust_protocol_table()) };
     ppi::r4os_rust_protocol_slot(1, 0);
-    perf(5, start, 0, 0, 0);
+    super::performance::add_r4p_init_ticks(start);
     if result != 0 {
         mutate(slot, 1, 0, result, b"init failed");
         report(b"[R4P] init failed ", name.bytes(), b" code=");
@@ -896,7 +886,7 @@ fn resolve_init() {
             }
         }
     }
-    perf(3, start, 0, 0, 0);
+    super::performance::add_r4p_resolve_ticks(start);
 }
 fn activate(index: usize, depth: usize) -> u8 {
     let p = cd(index);
@@ -1067,15 +1057,15 @@ fn load_all() {
             )
         };
         unsafe { request::r4os_rust_fs_request_finish(&mut req, true) };
-        perf(1, start, 0, 0, 0);
+        super::performance::add_r4p_scan_ticks(start);
         if result.status != 0 {
             break;
         }
-        perf(7, 0, 0, 0, 0);
+        super::performance::record_r4p_scan_entry();
         let entry = unsafe { entry.assume_init() };
         let name = &name[..zlen(&name)];
         if !entry.is_dir() && extension(name) {
-            perf(8, 0, 0, 0, 0);
+            super::performance::record_r4p_candidate();
             catalog(
                 file::Source {
                     volume,

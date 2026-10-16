@@ -1843,3 +1843,38 @@ const _: () = {
 #[cfg(r4os_owner_fixture)]
 #[path = "../../Tests/RustOwners/blocks_cases.rs"]
 mod owner_cases;
+
+/// Pointer-free passive copy under the same physical-memory catalog owner.
+pub(crate) struct DiagnosticBlock {
+    pub info: Block,
+    pub name: [u8; 32],
+}
+pub(crate) fn diagnostic_active(index: u32, copy_name: bool) -> Option<DiagnosticBlock> {
+    with_table(|table| {
+        let mut seen = 0u64;
+        for entry in &table.entries {
+            if !entry.active() {
+                continue;
+            }
+            if seen == u64::from(index) {
+                let mut name = [0u8; 32];
+                if copy_name && entry.name_len != 0 {
+                    let len = entry.name_len.min(name.len() - 1);
+                    // Name storage remains valid until catalog release; copy
+                    // before releasing that exact owner, never lend it out.
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(entry.name_ptr, name.as_mut_ptr(), len)
+                    };
+                }
+                let mut info = *entry;
+                info.name_ptr = core::ptr::null();
+                info.name_len = 0;
+                return Ok(Some(DiagnosticBlock { info, name }));
+            }
+            seen += 1;
+        }
+        Ok(None)
+    })
+    .ok()
+    .flatten()
+}

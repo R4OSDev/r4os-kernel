@@ -150,3 +150,25 @@ pub(crate) unsafe fn scheduler_mutate(
         task_api::r4os_rust_task_mutate(mapped, target, a, b, text, len)
     }
 }
+
+/// Bounded passive counters with the same runtime admission as task scans.
+pub(crate) fn observer_fpu_counts() -> (u64, u64, u32) {
+    let _owner = crate::arch::runtime::RuntimeGuard::acquire();
+    unsafe {
+        let s = task_registry::raw();
+        let mut count = 0u32;
+        let mut t = (*s).head;
+        while !t.is_null() {
+            let c = task_registry::core(t);
+            if !matches!(
+                (*c).state,
+                task_types::State::Unused | task_types::State::Dead
+            ) && (*c).fpu_state_valid
+            {
+                count += 1
+            }
+            t = (*c).registry_next;
+        }
+        ((*s).fpu_lazy_saves, (*s).fpu_lazy_skips, count)
+    }
+}

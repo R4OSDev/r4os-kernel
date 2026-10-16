@@ -9,7 +9,6 @@ const gfx_api = @import("../program/gfx_buffer_api.zig");
 const gfx_memory = @import("gfx_driver_memory.zig");
 const bootlog = @import("bootlog.zig");
 const boot_config = @import("boot_config.zig");
-const log_event = @import("log_event.zig");
 const net = @import("../net/core.zig");
 const net_backend = @import("../net/backend_contract.zig");
 const pci_inventory = @import("../platform/pci_inventory.zig");
@@ -1668,14 +1667,6 @@ extern fn r4os_rust_driver_usb_activate(name: [*:0]const u8, source: u32) i32;
 extern fn r4os_rust_driver_blit(register: bool, name: [*:0]const u8, d: ?*const anyopaque) i32;
 extern fn r4os_rust_driver_synth(name: [*:0]const u8, d: *const SynthEngineDescriptor) i32;
 extern fn r4os_rust_driver_input(name: [*:0]const u8) i32;
-export fn r4os_zig_driver_log(level: u8, owner: u32, text: [*:0]const u8) callconv(.c) void {
-    log_event.driver(switch (level) {
-        0 => log_event.Severity.info,
-        1 => log_event.Severity.warn,
-        2 => log_event.Severity.err,
-        else => unreachable,
-    }, owner, text);
-}
 export fn r4os_zig_driver_usb(op: u8, name: ?[*]const u8, len: usize, owner: u32, source: u32, descriptor: ?*const UsbHostControllerDescriptor) callconv(.c) isize {
     return switch (op) {
         0 => @intFromBool(usb_host.findByName(name.?[0..len]) != null),

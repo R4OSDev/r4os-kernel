@@ -251,7 +251,7 @@ pub(super) unsafe fn set_range(
             let previous = if v.cache().is_null() {
                 None
             } else {
-                (*v.cache()).free_clusters(total)
+                super::ntfs_volume_cache::with(v.cache(), |cache| cache.free_clusters(total))
             };
             if !io::runs(
                 v.io,
@@ -272,10 +272,14 @@ pub(super) unsafe fn set_range(
             if let Some(free) = previous {
                 if set {
                     if changed <= free {
-                        (*v.cache()).store_free_clusters(total, free - changed)
+                        super::ntfs_volume_cache::with(v.cache(), |cache| {
+                            cache.store_free_clusters(total, free - changed)
+                        })
                     }
                 } else if changed <= total - free {
-                    (*v.cache()).store_free_clusters(total, free + changed)
+                    super::ntfs_volume_cache::with(v.cache(), |cache| {
+                        cache.store_free_clusters(total, free + changed)
+                    })
                 }
             }
         }
@@ -287,7 +291,8 @@ pub(super) unsafe fn free_count(v: Volume) -> Option<u64> {
     unsafe {
         let total = v.geometry().total_clusters();
         if !v.cache().is_null()
-            && let Some(free) = (*v.cache()).free_clusters(total)
+            && let Some(free) =
+                super::ntfs_volume_cache::with(v.cache(), |cache| cache.free_clusters(total))
         {
             return Some(free);
         }
@@ -319,7 +324,9 @@ pub(super) unsafe fn free_count(v: Volume) -> Option<u64> {
             cluster += bits
         }
         if !v.cache().is_null() {
-            (*v.cache()).store_free_clusters(total, free)
+            super::ntfs_volume_cache::with(v.cache(), |cache| {
+                cache.store_free_clusters(total, free)
+            })
         }
         Some(free)
     }

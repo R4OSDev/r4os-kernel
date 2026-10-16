@@ -7,6 +7,43 @@ use crate::{
     storage::{block_execution, block_io, block_registry},
 };
 use core::{ffi::c_void, mem::MaybeUninit};
+#[repr(C)]
+pub(crate) struct DeviceSnapshot {
+    pub bus: u8,
+    pub state: u8,
+    pub source: u8,
+    pub removable: bool,
+    pub writable: bool,
+    pub port: u32,
+    pub sector_size: u32,
+    pub max_sectors: u32,
+    pub queue_depth: u32,
+    pub queue_used: u32,
+    pub timeout_ticks: u64,
+    pub sector_count: u64,
+    pub name: [u8; 32],
+    pub driver: [u8; 32],
+    pub controller: [u8; 32],
+    pub stats: crate::storage::block_accounting::Stats,
+}
+unsafe extern "C" {
+    // Temporary layout-only projection of the resident Zig Device aggregate.
+    // No callback, I/O, allocation or wait; admission remains in this owner.
+    fn r4os_zig_block_diagnostic_snapshot(device: *mut c_void, out: *mut DeviceSnapshot);
+}
+pub(crate) fn device_snapshot(index: usize) -> Option<DeviceSnapshot> {
+    let _owner = Guard::acquire(1);
+    let mut slot = MaybeUninit::uninit();
+    unsafe {
+        if !block_registry::r4os_rust_block_registry_slot(index, 1, 0, true, slot.as_mut_ptr()) {
+            return None;
+        }
+        let slot = slot.assume_init();
+        let mut out = MaybeUninit::uninit();
+        r4os_zig_block_diagnostic_snapshot(slot.device, out.as_mut_ptr());
+        Some(out.assume_init())
+    }
+}
 unsafe extern "C" {
     fn r4os_zig_block_text(channel: u8, text: *const u8, len: usize);
     fn r4os_zig_block_decimal(channel: u8, value: u64);
@@ -402,3 +439,23 @@ unsafe fn probe(index: usize, device: *mut c_void, view: block_execution::View) 
     put(0, b"\r\n");
     true
 }
+
+const _: () = {
+    assert!(core::mem::size_of::<DeviceSnapshot>() == 552);
+    assert!(core::mem::offset_of!(DeviceSnapshot, bus) == 0);
+    assert!(core::mem::offset_of!(DeviceSnapshot, state) == 1);
+    assert!(core::mem::offset_of!(DeviceSnapshot, source) == 2);
+    assert!(core::mem::offset_of!(DeviceSnapshot, removable) == 3);
+    assert!(core::mem::offset_of!(DeviceSnapshot, writable) == 4);
+    assert!(core::mem::offset_of!(DeviceSnapshot, port) == 8);
+    assert!(core::mem::offset_of!(DeviceSnapshot, sector_size) == 12);
+    assert!(core::mem::offset_of!(DeviceSnapshot, max_sectors) == 16);
+    assert!(core::mem::offset_of!(DeviceSnapshot, queue_depth) == 20);
+    assert!(core::mem::offset_of!(DeviceSnapshot, queue_used) == 24);
+    assert!(core::mem::offset_of!(DeviceSnapshot, timeout_ticks) == 32);
+    assert!(core::mem::offset_of!(DeviceSnapshot, sector_count) == 40);
+    assert!(core::mem::offset_of!(DeviceSnapshot, name) == 48);
+    assert!(core::mem::offset_of!(DeviceSnapshot, driver) == 80);
+    assert!(core::mem::offset_of!(DeviceSnapshot, controller) == 112);
+    assert!(core::mem::offset_of!(DeviceSnapshot, stats) == 144);
+};

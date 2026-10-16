@@ -8,7 +8,6 @@ use crate::{
 };
 use core::{ffi::c_void, ptr};
 unsafe extern "C" {
-    fn r4os_zig_driver_log(level: u8, owner: u32, text: *const u8);
     fn r4os_zig_driver_usb(
         op: u8,
         name: *const u8,
@@ -48,7 +47,7 @@ unsafe fn text<'a>(name: *const u8) -> &'a [u8] {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_log(level: u8, text: *const u8) {
     unsafe {
-        r4os_zig_driver_log(
+        crate::boot::log_event::driver(
             level,
             admission::r4os_rust_driver_api_runtime_owner(true),
             text,

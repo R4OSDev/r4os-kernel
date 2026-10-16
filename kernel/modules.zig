@@ -3,7 +3,6 @@
 
 const heap = @import("../memory/heap.zig");
 const k = @import("log.zig");
-const loader_perf = @import("loader_perf.zig");
 const module_file = @import("module_file.zig");
 const module_r4m = @import("module_r4m.zig");
 const resources = @import("module_resources.zig");
@@ -298,19 +297,7 @@ comptime {
 }
 
 
-export fn r4os_zig_mod_perf(op: u8, a: u64, b: u64) callconv(.c) u64 {
-    switch (op) {
-        0 => return loader_perf.now(),
-        1 => loader_perf.addR4lScanTicks(a),
-        2 => loader_perf.recordR4lScanEntry(),
-        3 => loader_perf.recordR4lCandidate(),
-        4 => loader_perf.addR4lResolveTicks(a),
-        5 => loader_perf.addR4lLoadTicks(a),
-        6 => loader_perf.recordR4lResults(@intCast(a), @intCast(b)),
-        else => unreachable,
-    }
-    return 0;
-}
+
 pub fn init() void {
     const peers = loadPeers();
     r4os_rust_mod_init(&peers);

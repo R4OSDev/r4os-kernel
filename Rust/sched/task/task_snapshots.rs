@@ -45,7 +45,7 @@ pub struct QueueSnapshot {
     pub reap: usize,
     pub valid: bool,
 }
-pub(super) unsafe fn summary() -> Summary {
+pub(crate) unsafe fn summary() -> Summary {
     let flags = runtime::save_runtime();
     let mut result = Summary::default();
     unsafe {
@@ -499,3 +499,83 @@ const _: () = {
     assert!(core::mem::size_of::<DeadmanTask>() == 80);
     assert!(core::mem::size_of::<Deadman>() == 512);
 };
+
+/// Copy one original ordinal performance row and both resident labels under
+/// the existing runtime owner. No native reference reaches a caller write.
+pub(crate) unsafe fn performance(
+    index: u32,
+) -> Option<crate::contract::ProgramTaskPerformanceInfo> {
+    unsafe {
+        let task = pin_ordinal(index as usize);
+        if task.is_null() {
+            return None;
+        }
+        let result = {
+            let _owner = runtime::RuntimeGuard::acquire();
+            let c = registry::core(task);
+            let now = crate::platform::timer::tick_count();
+            let elapsed = |tick: u64| {
+                if tick != 0 && now >= tick {
+                    now - tick
+                } else {
+                    0
+                }
+            };
+            let blocked_ticks = if (*c).state == State::Blocked {
+                elapsed((*c).blocked_since_tick)
+            } else {
+                0
+            };
+            let ticks_since_yield = elapsed((*c).last_yield_tick);
+            let ticks_since_scheduled = elapsed((*c).last_scheduled_tick);
+            let mut out = crate::contract::ProgramTaskPerformanceInfo {
+                index,
+                id: (*c).id,
+                state: (*c).state as u32,
+                flags: u32::from((*c).entry.is_some()),
+                wake_tick: (*c).wake_tick,
+                blocked_since_tick: (*c).blocked_since_tick,
+                blocked_ticks,
+                created_tick: (*c).created_tick,
+                last_scheduled_tick: (*c).last_scheduled_tick,
+                last_yield_tick: (*c).last_yield_tick,
+                ticks_since_yield,
+                run_ticks: (*c).run_ticks,
+                switches_in: (*c).switches_in,
+                stack_base: (*c).stack_base,
+                stack_top: (*c).stack_top,
+                stack_bytes: (*c).stack_top.saturating_sub((*c).stack_base),
+                blocked_object: (*c).wait_object,
+                wait_result: (*c).wait_result as u32,
+                preempt_disable_depth: (*c).preempt_disable_depth,
+                preempt_disable_max_depth: (*c).preempt_disable_max_depth,
+                ticks_since_scheduled,
+                preemption_probe_hits: (*c).preemption_probe_hits,
+                preemption_deferred_ticks: (*c).preemption_deferred_ticks,
+                long_run_warnings: (*c).long_run_warnings,
+                starvation_warnings: (*c).starvation_warnings,
+                ready_since_tick: (*c).ready_since_tick,
+                last_ready_latency_ticks: (*c).last_ready_latency_ticks,
+                max_ready_latency_ticks: (*c).max_ready_latency_ticks,
+                last_wait_ticks: (*c).last_wait_ticks,
+                max_wait_ticks: (*c).max_wait_ticks,
+                max_run_without_switch_ticks: (*c).max_run_without_switch_ticks,
+                max_preemption_deferred_ticks: (*c).max_preemption_deferred_ticks,
+                ..Default::default()
+            };
+            for (destination, text) in [
+                (&mut out.name[..], (*c).name),
+                (&mut out.wait_reason[..], (*c).wait_reason),
+            ] {
+                let len = text.len.min(destination.len() - 1);
+                if len != 0 {
+                    destination[..len]
+                        .copy_from_slice(core::slice::from_raw_parts(text.pointer, len));
+                }
+            }
+            out
+        };
+        let _ = super::task_lifecycle::unpin(task);
+        Some(result)
+    }
+}

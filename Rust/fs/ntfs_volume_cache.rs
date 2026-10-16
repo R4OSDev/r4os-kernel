@@ -610,3 +610,15 @@ impl Cache {
         }
     }
 }
+
+/// # Safety
+/// Exact initialized resident cache and disjoint scratch arguments outlive the
+/// pure callback. It cannot allocate, wait, log, perform I/O or return a view
+/// into the cache. Admission starts before any cache reference is constructed.
+pub(crate) unsafe fn with<R>(cache: *mut Cache, call: impl FnOnce(&mut Cache) -> R) -> R {
+    // Serialized original host models never execute privileged CPU admission;
+    // the product and SMP4 guest always acquire the genuine storage owner.
+    #[cfg(not(r4os_owner_fixture))]
+    let _owner = crate::memory::owner::Guard::acquire(1);
+    unsafe { call(&mut *cache) }
+}

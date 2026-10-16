@@ -20,8 +20,6 @@ static mut PENDING: Pending = Pending {
     },
 };
 unsafe extern "C" {
-    fn r4os_zig_fatal_init_dependencies();
-    fn r4os_zig_boot_perf_record(phase: u8);
     fn r4os_zig_fatal_record_display(message: *const u8, len: usize);
     fn r4os_zig_fatal_display(message: *const u8, len: usize);
     fn r4os_zig_fatal_ticks() -> u64;
@@ -34,14 +32,15 @@ pub fn halt() -> ! {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_fatal_init() {
-    unsafe { r4os_zig_fatal_init_dependencies() };
+    crate::platform::clocksource::early_init();
+    super::performance::init();
     PHASE.store(1, Ordering::Relaxed);
     unsafe { addr_of_mut!(PENDING).write(Pending::default()) };
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_fatal_phase(phase: u8) {
     PHASE.store(phase, Ordering::Relaxed);
-    unsafe { r4os_zig_boot_perf_record(phase) };
+    super::performance::record(phase);
 }
 #[unsafe(no_mangle)]
 /// # Safety
@@ -71,6 +70,7 @@ pub fn rust_panic(message: &[u8]) -> ! {
     kernel(PHASE.load(Ordering::Relaxed), message)
 }
 fn terminal(cause: u8, phase: u8, message: &[u8]) -> ! {
+    super::performance::fail_fatal();
     unsafe { r4os_zig_fatal_display(message.as_ptr(), message.len()) };
     let input = BuildInput {
         cause,

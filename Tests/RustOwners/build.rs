@@ -22,6 +22,21 @@ fn main() {
         assert!(value == "true" || value == "false");
         constants.push_str(&format!("pub const {key}: bool = {value};\n"));
     }
+    println!("cargo::rerun-if-changed=../../VERSION.R4S");
+    let version = fs::read_to_string("../../VERSION.R4S").expect("Kernel version");
+    let version = version
+        .trim_start_matches('\u{feff}')
+        .trim()
+        .strip_prefix("KERNEL_VERSION=")
+        .expect("Canonical Kernel version");
+    let parts: Vec<u32> = version
+        .split('.')
+        .map(|v| v.parse().expect("Version integer"))
+        .collect();
+    assert_eq!(parts.len(), 3);
+    for (name, value) in ["MAJOR", "MINOR", "PATCH"].into_iter().zip(parts) {
+        constants.push_str(&format!("pub const KERNEL_{name}: u32 = {value};\n"));
+    }
     fs::write(
         PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("owner_config.rs"),
         constants,

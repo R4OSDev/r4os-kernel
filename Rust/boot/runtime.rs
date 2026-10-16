@@ -26,7 +26,6 @@ unsafe extern "C" {
     fn r4os_zig_runtime_status(data: *const u8, len: usize);
     fn r4os_zig_runtime_stack_reclaimer() -> usize;
     fn r4os_zig_runtime_audio(progress_worker: bool) -> bool;
-    fn r4os_zig_runtime_loader_timing(begin: bool, start: u64) -> u64;
     fn r4os_zig_kernel_hex(value: u64, width: u8);
 }
 fn status(text: &[u8]) {
@@ -140,9 +139,9 @@ fn page_fault_test() -> ! {
 pub unsafe extern "C" fn r4os_rust_runtime_boot_start() -> ! {
     unsafe {
         status(b"Protokolle laden");
-        let start = r4os_zig_runtime_loader_timing(true, 0);
+        let start = crate::loader::performance::begin_r4p_runtime();
         r4p::r4os_rust_r4p_load_all();
-        r4os_zig_runtime_loader_timing(false, start);
+        crate::loader::performance::finish_r4p_runtime(start);
         r4os_zig_runtime_audio(false);
         r4p::r4os_rust_r4p_dump();
         foundation::puts(b"  Loader [OK]\r\n");

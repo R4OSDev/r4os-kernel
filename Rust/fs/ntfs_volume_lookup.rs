@@ -117,35 +117,39 @@ pub(super) unsafe fn lookup(
         };
         if !v.cache().is_null() {
             if transient {
-                (*v.cache()).note_recovery_bypass()
+                super::ntfs_volume_cache::with(v.cache(), |cache| cache.note_recovery_bypass())
             } else {
-                match (*v.cache()).lookup_path(
-                    v.upcase.get(),
-                    dir,
-                    target.get(),
-                    v.cache_now_ticks,
-                    &mut *out,
-                ) {
+                match super::ntfs_volume_cache::with(v.cache(), |cache| {
+                    cache.lookup_path(
+                        v.upcase.get(),
+                        dir,
+                        target.get(),
+                        v.cache_now_ticks,
+                        &mut *out,
+                    )
+                }) {
                     PathLookup::Positive => return Lookup::Found,
                     PathLookup::Negative => return names::not_found(depth, 10),
                     PathLookup::Miss => {}
                 }
-                (*v.cache()).note_tree_walk()
+                super::ntfs_volume_cache::with(v.cache(), |cache| cache.note_tree_walk())
             }
         }
         let result = uncached(v, dir, target, out, transient, depth);
         if !transient && !v.cache().is_null() {
-            (*v.cache()).store_path(
-                dir,
-                target.get(),
-                result,
-                if result == Lookup::Found {
-                    &*out
-                } else {
-                    &LookupResult::EMPTY
-                },
-                v.cache_now_ticks,
-            )
+            super::ntfs_volume_cache::with(v.cache(), |cache| {
+                cache.store_path(
+                    dir,
+                    target.get(),
+                    result,
+                    if result == Lookup::Found {
+                        &*out
+                    } else {
+                        &LookupResult::EMPTY
+                    },
+                    v.cache_now_ticks,
+                )
+            })
         }
         result
     }
@@ -161,27 +165,27 @@ unsafe fn uncached(
 ) -> Lookup {
     unsafe {
         let Some(h) = r::load(v, dir, v.record()) else {
-            return Lookup::Io;
+            return names::io_failure(depth, 1);
         };
         if dir > u64::from(u32::MAX)
             || h.flags & 1 == 0
             || u64::from(h.record_number) != dir
             || h.flags & 2 == 0
         {
-            return Lookup::Io;
+            return names::io_failure(depth, 2);
         }
         let record = v.record();
         if !a::stream_valid(r::view(record), h) {
-            return Lookup::Io;
+            return names::io_failure(depth, 3);
         }
         let Some(root_attr) = r::find(v, record, h, 0x90, View::of(&idx::I30)) else {
-            return Lookup::Io;
+            return names::io_failure(depth, 4);
         };
         let Some(root) = fmt::index_root(root_attr.value.get()) else {
-            return Lookup::Io;
+            return names::io_failure(depth, 5);
         };
         if root.indexed_attr_type != 0x30 || root.collation_rule != 1 {
-            return Lookup::Io;
+            return names::io_failure(depth, 6);
         }
         let mut alloc = AttrScratch::EMPTY;
         let mut have = false;
@@ -190,24 +194,24 @@ unsafe fn uncached(
                 || alloc.resident
                 || alloc.count == 0
             {
-                return Lookup::Io;
+                return names::io_failure(depth, 7);
             }
             have = true;
             let Some(h2) = r::load(v, dir, v.record()) else {
-                return Lookup::Io;
+                return names::io_failure(depth, 8);
             };
             if !a::stream_valid(r::view(record), h2) {
-                return Lookup::Io;
+                return names::io_failure(depth, 9);
             }
         }
         let Some(h2) = fmt::file_header(r::view(record)) else {
-            return Lookup::Io;
+            return names::io_failure(depth, 10);
         };
         let Some(root_attr) = r::find(v, record, h2, 0x90, View::of(&idx::I30)) else {
-            return Lookup::Io;
+            return names::io_failure(depth, 11);
         };
         let Some(root) = fmt::index_root(root_attr.value.get()) else {
-            return Lookup::Io;
+            return names::io_failure(depth, 12);
         };
         let mut node = root.entries;
         let mut in_root = true;
@@ -220,7 +224,7 @@ unsafe fn uncached(
             while let Some(entry) = fmt::index_entry(node.get(), &mut it) {
                 if entry.flags & 2 != 0 {
                     if entry.key_length != 0 {
-                        return Lookup::Io;
+                        return names::io_failure(depth, 13);
                     }
                     routed = true;
                     if entry.flags & 1 != 0 && entry.has_sub_node_vcn {
@@ -232,10 +236,10 @@ unsafe fn uncached(
                     break;
                 }
                 let Some(name) = fmt::file_name(entry.key.get()) else {
-                    return Lookup::Io;
+                    return names::io_failure(depth, 14);
                 };
                 if name.parent.record != dir || name.parent.sequence != h.sequence {
-                    return Lookup::Io;
+                    return names::io_failure(depth, 15);
                 }
                 let order = text::compare(v.upcase.get(), target.get(), name.name.get());
                 if order == 0 {
@@ -244,7 +248,7 @@ unsafe fn uncached(
                         return names::not_found(depth, 22);
                     }
                     let Some(child) = r::load(v, reference.record, v.part_record()) else {
-                        return Lookup::Io;
+                        return names::io_failure(depth, 16);
                     };
                     if reference.record > u64::from(u32::MAX)
                         || child.flags & 1 == 0
@@ -253,13 +257,13 @@ unsafe fn uncached(
                         || (child.flags & 2 != 0) != (name.flags & 0x1000_0000 != 0)
                         || !a::stream_valid(r::view(v.part_record()), child)
                     {
-                        return Lookup::Io;
+                        return names::io_failure(depth, 17);
                     }
                     if !transient && !has_link(v, v.part_record(), child, dir, h.sequence, target) {
-                        return Lookup::Io;
+                        return names::io_failure(depth, 18);
                     }
                     let Some(built) = names::entry_from_name(reference, name) else {
-                        return Lookup::Io;
+                        return names::io_failure(depth, 19);
                     };
                     out.write(LookupResult {
                         record: reference.record,
@@ -284,23 +288,23 @@ unsafe fn uncached(
                 offset += usize::from(entry.entry_length)
             }
             if !routed {
-                return Lookup::Io;
+                return names::io_failure(depth, 20);
             }
             let Some(vcn) = next else { return Lookup::Io };
             if !have || !idx::cached(v, dir, r::attr_runs(&alloc), vcn) {
-                return Lookup::Io;
+                return names::io_failure(depth, 21);
             }
             let Some(block) = fmt::index_block(r::view(idx::block(v))) else {
-                return Lookup::Io;
+                return names::io_failure(depth, 22);
             };
             if block.vcn != vcn {
-                return Lookup::Io;
+                return names::io_failure(depth, 23);
             }
             node = block.entries;
             in_root = false;
             current = vcn;
         }
-        Lookup::Io
+        names::io_failure(depth, 24)
     }
 }
 #[inline(never)]

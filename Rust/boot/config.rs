@@ -84,16 +84,6 @@ macro_rules! g {
         (*STATE.0.get()).$f
     };
 }
-unsafe extern "C" {
-    fn r4os_zig_boot_config_timing(
-        begin: bool,
-        start: u64,
-        bytes: usize,
-        drivers: usize,
-        disabled: usize,
-        options: usize,
-    ) -> u64;
-}
 fn puts(text: &[u8]) {
     unsafe { log::r4os_rust_bootlog_write(text.as_ptr(), text.len()) }
 }
@@ -102,8 +92,7 @@ fn dec(v: usize) {
 }
 unsafe fn record(start: u64, bytes: usize) {
     unsafe {
-        r4os_zig_boot_config_timing(
-            false,
+        crate::loader::performance::record_config_load(
             start,
             bytes,
             g!(driver_count),
@@ -114,7 +103,7 @@ unsafe fn record(start: u64, bytes: usize) {
 }
 pub(crate) unsafe fn load() -> *const Config {
     unsafe {
-        let start = r4os_zig_boot_config_timing(true, 0, 0, 0, 0, 0);
+        let start = crate::loader::performance::begin_config_load();
         STATE.0.get().write(Config::EMPTY);
         set_shell_path(DEFAULT_SHELL_PATH);
         let Some(volume) = vfs::mounted_volume(b'C') else {

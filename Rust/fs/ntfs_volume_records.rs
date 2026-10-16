@@ -97,7 +97,10 @@ pub(super) unsafe fn load(v: Volume, number: u64, buffer: Buffer) -> Option<File
             return None;
         }
         let out = part(buffer, 0, v.record_bytes as usize);
-        let cached = !v.cache().is_null() && (*v.cache()).lookup_record(number, mutable(out));
+        let cached = !v.cache().is_null()
+            && super::ntfs_volume_cache::with(v.cache(), |cache| {
+                cache.lookup_record(number, mutable(out))
+            });
         if !cached && (!load_raw(v, number, out) || fmt::fixup(mutable(out), None) != 0) {
             return None;
         }
@@ -106,7 +109,7 @@ pub(super) unsafe fn load(v: Volume, number: u64, buffer: Buffer) -> Option<File
             return None;
         }
         if !cached && !v.cache().is_null() {
-            (*v.cache()).store_record(number, view(out))
+            super::ntfs_volume_cache::with(v.cache(), |cache| cache.store_record(number, view(out)))
         }
         Some(h)
     }
@@ -140,7 +143,7 @@ pub(super) unsafe fn store(v: Volume, number: u64, buffer: Buffer) -> bool {
         }
         let _ = fmt::fixup(mutable(out), None);
         if !v.cache().is_null() {
-            (*v.cache()).store_record(number, view(out))
+            super::ntfs_volume_cache::with(v.cache(), |cache| cache.store_record(number, view(out)))
         }
         true
     }
@@ -206,7 +209,9 @@ pub(super) unsafe fn collect(
 ) -> Lookup {
     unsafe {
         if !v.cache().is_null()
-            && (*v.cache()).lookup_attribute(number, kind, name.get(), &mut *out)
+            && super::ntfs_volume_cache::with(v.cache(), |cache| {
+                cache.lookup_attribute(number, kind, name.get(), &mut *out)
+            })
         {
             return Lookup::Found;
         }
@@ -284,7 +289,9 @@ pub(super) unsafe fn collect(
                     return Lookup::Io;
                 }
                 if !v.cache().is_null() {
-                    (*v.cache()).store_attribute(number, kind, name.get(), &*out)
+                    super::ntfs_volume_cache::with(v.cache(), |cache| {
+                        cache.store_attribute(number, kind, name.get(), &*out)
+                    })
                 }
                 return Lookup::Found;
             }
@@ -307,7 +314,9 @@ pub(super) unsafe fn collect(
             return Lookup::Io;
         }
         if !v.cache().is_null() {
-            (*v.cache()).store_attribute(number, kind, name.get(), &*out)
+            super::ntfs_volume_cache::with(v.cache(), |cache| {
+                cache.store_attribute(number, kind, name.get(), &*out)
+            })
         }
         Lookup::Found
     }

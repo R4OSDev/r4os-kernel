@@ -135,10 +135,6 @@ static GUARD: Guard = Guard(UnsafeCell::new(UnwindGuard {
 }));
 unsafe extern "C" {
     fn r4os_zig_r4d_table() -> *const api::DriverApi;
-    fn r4os_zig_r4d_perf(op: u8, value: u64) -> u64;
-}
-fn perf(op: u8, value: u64) -> u64 {
-    unsafe { r4os_zig_r4d_perf(op, value) }
 }
 fn span(s: &[u8]) -> t::Bytes {
     ctl::span(s)
@@ -971,7 +967,7 @@ fn discover() {
     }
     let Some(volume) = mount() else {
         log(b"[R4D] C: FAT32 volume not mounted\r\n");
-        perf(4, 0);
+        super::performance::record_r4d_results(0);
         return;
     };
     let Some(mut req) = begin_request() else {
@@ -991,7 +987,7 @@ fn discover() {
     unsafe { request::r4os_rust_fs_request_finish(&mut req, result.status == 0) };
     if result.status != 0 {
         log(b"[R4D] /R4OS/DRIVERS not found\r\n");
-        perf(4, 0);
+        super::performance::record_r4d_results(0);
         return;
     }
     let dir = result.value;
@@ -1000,7 +996,7 @@ fn discover() {
     let mut discovered = 0;
     let mut name = [0; 64];
     while let Some(mut req) = begin_request() {
-        let start = perf(0, 0);
+        let start = super::performance::now();
         let mut entry = MaybeUninit::<t::Entry>::uninit();
         let result = unsafe {
             vfs::r4os_rust_vfs_run(
@@ -1017,15 +1013,15 @@ fn discover() {
             )
         };
         unsafe { request::r4os_rust_fs_request_finish(&mut req, true) };
-        perf(1, start);
+        super::performance::add_r4d_scan_ticks(start);
         if result.status != 0 {
             break;
         }
-        perf(2, 0);
+        super::performance::record_r4d_scan_entry();
         let entry = unsafe { entry.assume_init() };
         let name = &name[..zlen(&name)];
         if !entry.is_dir() && extension(name) {
-            perf(3, 0);
+            super::performance::record_r4d_candidate();
             if entry.size != 0 {
                 let source = file::Source {
                     volume,
@@ -1035,9 +1031,9 @@ fn discover() {
                 if info_file(&source, name).is_some() {
                     let mut output = [0; 96];
                     let path = path(b"C:\\R4OS\\DRIVERS\\", name, &mut output);
-                    let start = perf(0, 0);
+                    let start = super::performance::now();
                     let ok = load_file(&source, name, path, false) == LOADED;
-                    perf(5, start);
+                    super::performance::add_r4d_probe_ticks(start);
                     if ok {
                         discovered += 1;
                     }
@@ -1046,7 +1042,7 @@ fn discover() {
         }
         index += 1;
     }
-    perf(4, discovered);
+    super::performance::record_r4d_results(discovered as usize);
     log(b"[R4D] modules discovered=");
     decimal(discovered);
     log(b"\r\n");

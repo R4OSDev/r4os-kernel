@@ -347,7 +347,7 @@ pub(super) unsafe fn grow(v: Volume) -> WriteStatus {
 unsafe fn rollback(v: Volume, runs: io::Runs, published: bool, status: WriteStatus) -> WriteStatus {
     unsafe {
         if !v.cache().is_null() {
-            (*v.cache()).invalidate(Mutation::Recovery)
+            super::ntfs_volume_cache::with(v.cache(), |cache| cache.invalidate(Mutation::Recovery))
         }
         let old = Buffer {
             data: ptr::addr_of_mut!((*v.scratch()).rollback_record).cast(),

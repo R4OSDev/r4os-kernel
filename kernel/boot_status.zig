@@ -20,14 +20,6 @@ extern fn r4os_rust_boot_redirect_active() callconv(.c) bool;
 export fn r4os_zig_boot_foundation_summary() callconv(.c) void {
     printFoundationSummary();
 }
-export fn r4os_zig_boot_route(hook: ?log.OutputHook) callconv(.c) void {
-    log.setOutputHook(hook);
-}
-export fn r4os_zig_boot_release_display() callconv(.c) void {
-    boot_display.invalidateConsoleBackingForExternalDisplay();
-    diag_screen.resetForExternalDisplay();
-}
-
 pub fn printFoundationSummary() void {
     log.puts("  Booted via Limine ");
     log.puts("[OK]\r\n");

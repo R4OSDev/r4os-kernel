@@ -34,14 +34,20 @@ pub(super) unsafe fn load(v: Volume, runs: io::Runs, vcn: u64) -> bool {
 pub(super) unsafe fn cached(v: Volume, dir: u64, runs: io::Runs, vcn: u64) -> bool {
     unsafe {
         let b = block(v);
-        if !v.cache().is_null() && (*v.cache()).lookup_index(dir, vcn, r::mutable(b)) {
+        if !v.cache().is_null()
+            && super::ntfs_volume_cache::with(v.cache(), |cache| {
+                cache.lookup_index(dir, vcn, r::mutable(b))
+            })
+        {
             return true;
         }
         if !load(v, runs, vcn) {
             return false;
         }
         if !v.cache().is_null() {
-            (*v.cache()).store_index(dir, vcn, r::view(b))
+            super::ntfs_volume_cache::with(v.cache(), |cache| {
+                cache.store_index(dir, vcn, r::view(b))
+            })
         }
         true
     }

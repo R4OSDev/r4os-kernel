@@ -3307,14 +3307,7 @@ extern fn r4os_rust_program_api_module_path([*]u8, u32) i32;
 extern fn r4os_rust_program_api_action(u8) i32;
 extern fn r4os_rust_program_api_target(NativeProgramBytes, *[MAX_API_PATH]u8, *NativeProgramApiTarget) bool;
 extern fn r4os_rust_program_api_build(NativeProgramBytes, NativeProgramBytes, *[MAX_API_PATH]u8, *usize) bool;
-export fn r4os_zig_program_api_boot_ready(op: u8, id: u32) callconv(.c) i32 {
-    return switch (op) {
-        0 => boot_perf.completeReady(id),
-        1 => blk: { bootscreen.completeForHandoff(); break :blk 0; },
-        2 => blk: { boot_status.releaseForUserSession(); break :blk 0; },
-        else => unreachable,
-    };
-}
+
 export fn r4os_zig_program_api_display_used() callconv(.c) void { r4api.r4draw.markDisplayUsed(); }
 comptime {
     if (@sizeOf(NativeProgramApiTarget) != 24 or @alignOf(NativeProgramApiTarget) != 8 or @offsetOf(NativeProgramApiTarget,"drive") != 0 or @offsetOf(NativeProgramApiTarget,"path") != 8 or MAX_API_PATH != 1024 or MAX_API_ARGS != 128 or drive.MAX_PATH != 1024 or
@@ -3786,59 +3779,7 @@ export fn r4os_zig_program_runtime_bindings(group: u8, out: [*]usize, count: usi
                 out[i] = if (@field(provider, field.name)) |callback| @intFromPtr(callback) else 0;
             }
         },
-        6 => {
-            const provider: r4x_api.R4DevProvider = .{
-        .device_inventory_summary = &r4api.r4dev.deviceInventorySummary,
-        .device_inventory_record = &r4api.r4dev.deviceInventoryRecord,
-        .memory_summary = &r4api.r4dev.memorySummary,
-        .memory_block_count = &r4api.r4dev.memoryBlockCount,
-        .memory_block = &r4api.r4dev.memoryBlock,
-        .memory_pressure_snapshot = &r4api.r4dev.memoryPressureSnapshot,
-        .memory_reclaim_probe = &r4api.r4dev.memoryReclaimProbe,
-        .memory_backing_store_probe = &r4api.r4dev.memoryBackingStoreProbe,
-        .memory_backing_store_slot_probe = &r4api.r4dev.memoryBackingStoreSlotProbe,
-        .memory_pager_gate_probe = &r4api.r4dev.memoryPagerGateProbe,
-        .memory_page_io_probe = &r4api.r4dev.memoryPageIoProbe,
-        .memory_vm_page_state_probe = &r4api.r4dev.memoryVmPageStateProbe,
-        .memory_vm_reserve_probe = &apiMemoryVmReserveProbe,
-        .paging_summary = &r4api.r4dev.pagingSummary,
-        .performance_summary = &r4api.r4dev.performanceSummary,
-        .performance_task = &r4api.r4dev.performanceTask,
-        .performance_storage = &r4api.r4dev.performanceStorage,
-        .performance_boot_phase = &r4api.r4dev.performanceBootPhase,
-        .protocol_status = &r4api.r4dev.protocolStatus,
-        .protocol_dispatch = &r4api.r4dev.protocolDispatch,
-        .display_summary = &r4api.r4dev.displaySummary,
-        .hardware_summary = &r4api.r4dev.hardwareSummary,
-        .boot_info_summary = &r4api.r4dev.bootInfoSummary,
-        .boot_info_memory_count = &r4api.r4dev.bootInfoMemoryCount,
-        .boot_info_memory_entry = &r4api.r4dev.bootInfoMemoryEntry,
-        .program_instance_storage_summary = &r4api.r4dev.programInstanceStorageSummary,
-        .program_instance_storage_self_test = &r4api.r4dev.programInstanceStorageSelfTest,
-        .program_registry_summary = &r4api.r4dev.programRegistrySummary,
-        .program_registry_self_test = &r4api.r4dev.programRegistrySelfTest,
-        .program_registry_summary_v2 = &r4api.r4dev.programRegistrySummaryV2,
-        .program_registry_self_test_v2 = &r4api.r4dev.programRegistrySelfTestV2,
-        .execution_inventory_summary = &r4api.r4dev.executionInventorySummary,
-        .program_instance_storage_summary_v2 = &r4api.r4dev.programInstanceStorageSummaryV2,
-        .kernel_version = &r4api.r4dev.kernelVersion,
-        .performance_boot_phase_clock = &r4api.r4dev.performanceBootPhaseClock,
-        .performance_irq_timing = &r4api.r4dev.performanceIrqTiming,
-        .performance_boot_summary = &r4api.r4dev.performanceBootSummary,
-        .performance_driver_work = &r4api.r4dev.performanceDriverWork,
-        .performance_pci_inventory = &r4api.r4dev.performancePciInventory,
-        .performance_input = &r4api.r4dev.performanceInput,
-        .display_state = &r4api.r4dev.displayState,
-        .driver_module_info = &r4api.r4dev.driverModuleInfo,
-        .performance_instrumentation = &r4api.r4dev.performanceInstrumentation,
-        .performance_lock = &r4api.r4dev.performanceLock,
-        .performance_stack = &r4api.r4dev.performanceStack,
-    };
-            std.debug.assert(count == 45);
-            inline for (std.meta.fields(r4x_api.R4DevProvider), 0..) |field, i| {
-                out[i] = if (@field(provider, field.name)) |callback| @intFromPtr(callback) else 0;
-            }
-        },
+
         else => unreachable,
     }
 }
@@ -3854,12 +3795,6 @@ export fn r4os_zig_program_runtime_register(op: u8, value: u64) callconv(.c) voi
         10 => r4api.r4sys.setRuntimeContext(value),
         11 => k.setOutputHookIntercept(kprintOutputHook),
         12 => keyboard.setInputHook(keyboardInputHook),
-        20 => r4api.r4dev.setProgramInstanceStorageSummaryProvider(&fillProgramInstanceStorageSummary),
-        21 => r4api.r4dev.setProgramInstanceStorageSelfTestProvider(&runProgramInstanceStorageSelfTestProvider),
-        22 => r4api.r4dev.setProgramRegistrySummaryProvider(&fillProgramRegistrySummary),
-        23 => r4api.r4dev.setProgramRegistrySelfTestProvider(&runProgramRegistrySelfTestProvider),
-        24 => r4api.r4dev.setExecutionInventorySummaryProvider(&fillExecutionInventorySummaryProvider),
-        25 => r4api.r4dev.setInputPerformanceProvider(&fillInputPerformanceInfo),
         else => unreachable,
     }
 }
@@ -4898,7 +4833,6 @@ export fn r4os_zig_program_exit_console_snapshot(instance: *const ProgramInstanc
 export fn r4os_zig_program_exit_console_close(console: *ProgramConsolePayload) callconv(.c) void { _ = console.input_wait.close(.cancelled); }
 export fn r4os_zig_program_exit_notify(operation: u8, handle: ProgramProcessHandle) callconv(.c) void {
     switch (operation) {
-        0 => boot_perf.failShellExited(handle.instance_id),
         1 => gfx_queue.stopped(graphicsOwner(handle)),
         2 => gfx_allocations.stopped(graphicsOwner(handle)),
         3 => @import("../kernel/gfx_virtual.zig").stopped(graphicsOwner(handle)),
@@ -5481,32 +5415,12 @@ fn apiAudioSetVolume(stream_id: u32, fixed_volume: u32) callconv(.c) i32 {
     return r4os_rust_program_domain_audio_set_volume(stream_id, fixed_volume);
 }
 
-fn fillProgramInstanceStorageSummary(out: *r4api.r4dev.ProgramInstanceStorageSummary) void {
-    r4os_rust_program_diagnostic_storage(out);
-}
-
-fn runProgramInstanceStorageSelfTestProvider(out: *r4api.r4dev.ProgramInstanceStorageSelfTestResult) i32 {
-    return r4os_rust_program_diagnostic_storage_test(out);
-}
-
-fn fillProgramRegistrySummary(out: *r4api.r4dev.ProgramRegistrySummaryV2) void {
-    r4os_rust_program_diagnostic_registry(out);
-}
-
 fn programRegistrySelfTestAllowed() bool {
     return r4os_rust_program_selftest_allowed(1);
 }
 
 fn programLifecycleSelfTestAllowed() bool {
     return r4os_rust_program_selftest_allowed(2);
-}
-
-fn runProgramRegistrySelfTestProvider(out: *r4api.r4dev.ProgramRegistrySelfTestResultV2) i32 {
-    return r4os_rust_program_diagnostic_registry_test(out);
-}
-
-fn fillInputPerformanceInfo(out: *r4api.r4dev.ProgramInputPerformanceInfo) void {
-    r4os_rust_program_diagnostic_input(out);
 }
 
 fn configureR4XStartR4DevTable() void {
@@ -6933,10 +6847,6 @@ fn tryProgramInventoryEpoch() ?u64 {
 
 
 
-
-fn fillExecutionInventorySummaryProvider(out: *ProgramInventorySummary) i32 {
-    return if (r4os_rust_program_execution_summary(out)) PROGRAM_HANDLE_OK else PROGRAM_HANDLE_ERROR_WOULD_BLOCK;
-}
 
 fn apiProgramInventoryBegin(cursor: *ProgramInventoryCursor, out_summary: *ProgramInventorySummary) callconv(.c) i32 {
     return r4os_rust_program_execution_begin(cursor, out_summary);

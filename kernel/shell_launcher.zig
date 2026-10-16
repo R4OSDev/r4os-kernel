@@ -1,12 +1,10 @@
 //! External-shell startup facade; native Rust owns ordering and fallback decisions.
 const boot_config = @import("boot_config.zig");
-const boot_perf = @import("boot_perf.zig");
 const bootlog = @import("bootlog.zig");
 const bootscreen = @import("bootscreen.zig");
 const drive = @import("../fs/drive.zig");
 const fatal = @import("fatal.zig");
 const k = @import("log.zig");
-const loader_perf = @import("loader_perf.zig");
 const r4x = @import("../program/r4x.zig");
 
 const Bytes = extern struct { data: [*]const u8, len: usize };
@@ -37,23 +35,7 @@ export fn r4os_zig_program_shell_text(channel: u8, value: Bytes) callconv(.c) vo
         else => unreachable,
     }
 }
-export fn r4os_zig_program_shell_perf(operation: u8, a: u64, b: u64) callconv(.c) u64 {
-    switch (operation) {
-        0 => return loader_perf.beginServiceBoot(),
-        1 => loader_perf.finishServiceBoot(a, @intCast(b)),
-        2 => boot_perf.beginShellAttempt(switch (a) {
-            0 => .configured,
-            1 => .terminal_fallback,
-            2 => .recovery_fallback,
-            else => unreachable,
-        }),
-        3 => boot_perf.noteShellLaunched(r4x.activeShellInstanceId()),
-        4 => boot_perf.noteShellLaunchFailure(),
-        5 => boot_perf.failNoShell(),
-        else => unreachable,
-    }
-    return 0;
-}
+
 export fn r4os_zig_program_shell_run(boot: *drive.Drive, working: *drive.Drive, path: Bytes, args: Bytes, shell: bool, host: u32) callconv(.c) u8 {
     const result = if (shell) r4x.runShellPathWithHost(boot, slice(path), slice(args), working, @enumFromInt(host)) else r4x.runPath(boot, slice(path), slice(args), working);
     return @intFromEnum(result);

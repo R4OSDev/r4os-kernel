@@ -16,31 +16,16 @@ pub struct IntroInfo {
     glyph_width: u32,
     glyph_height: u32,
 }
-type Putc = unsafe extern "C" fn(u8);
-type Write = unsafe extern "C" fn(*const u8, usize);
-type Control = extern "C" fn();
 unsafe extern "C" {
     fn r4os_zig_cpu_foundation();
-    fn r4os_zig_kernel_write(text: *const u8, len: usize);
-    fn r4os_zig_kernel_dec(value: u64);
-    fn r4os_zig_kernel_hex(value: u64, width: u8);
-    fn r4os_zig_kernel_putc(byte: u8);
     fn r4os_zig_boot_console(output: *mut IntroInfo) -> i32;
     fn r4os_zig_boot_foundation_summary();
-    fn r4os_zig_boot_route(hook: Option<extern "C" fn(u8) -> bool>);
-    fn r4os_zig_boot_release_display();
-    fn r4os_zig_kernel_serial_sinks(
-        putc: Option<Putc>,
-        write: Option<Write>,
-        flush: Option<Control>,
-        sync: Option<Control>,
-    );
 }
 pub fn puts(text: &[u8]) {
-    unsafe { r4os_zig_kernel_write(text.as_ptr(), text.len()) };
+    super::log_route::puts(text);
 }
 pub fn dec(value: u64) {
-    unsafe { r4os_zig_kernel_dec(value) };
+    super::log_route::dec(value);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_cpu_boot() {
@@ -107,13 +92,13 @@ pub extern "C" fn r4os_rust_boot_intro() -> bool {
     dec(info.rows as u64);
     puts(b" rows (");
     dec(info.glyph_width as u64);
-    unsafe { r4os_zig_kernel_putc(b'x') };
+    super::log_route::putc(b'x');
     dec(info.glyph_height as u64);
     puts(b" font, ");
     dec(info.scale as u64);
     puts(b"x scale)\r\n");
     puts(b"  Kernel base: 0x");
-    unsafe { r4os_zig_kernel_hex(0xffffffff80000000, 16) };
+    super::log_route::hex(0xffffffff80000000, 16);
     puts(b"\r\n\r\n");
     true
 }
@@ -124,20 +109,19 @@ extern "C" fn boot_hook(byte: u8) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_boot_redirect() {
     REDIRECT.store(true, Ordering::Relaxed);
-    unsafe { r4os_zig_boot_route(Some(boot_hook)) };
+    super::log_route::set_output_hook(Some(boot_hook), false);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_boot_release() {
     REDIRECT.store(false, Ordering::Relaxed);
-    unsafe {
-        r4os_zig_boot_release_display();
-        r4os_zig_boot_route(Some(boot_hook));
-    }
+    crate::display::boot_display::invalidate_external();
+    crate::display::diag_screen::r4os_rust_diag_reset();
+    super::log_route::set_output_hook(Some(boot_hook), false);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_boot_unroute() {
     REDIRECT.store(false, Ordering::Relaxed);
-    unsafe { r4os_zig_boot_route(None) };
+    super::log_route::set_output_hook(None, false);
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_boot_redirect_active() -> bool {
@@ -151,14 +135,14 @@ pub extern "C" fn r4os_rust_com_debug_boot() {
     if config::ENABLE_COM1_DEBUG {
         super::serial::r4os_rust_serial_init(0x3f8);
         unsafe {
-            r4os_zig_kernel_serial_sinks(
+            super::log_route::set_serial(
                 Some(serial_putc),
                 Some(super::serial::r4os_rust_serial_write),
                 Some(super::serial::r4os_rust_serial_flush),
                 Some(super::serial::r4os_rust_serial_sync),
-            )
+            );
         };
     } else {
-        unsafe { r4os_zig_kernel_serial_sinks(None, None, None, None) };
+        unsafe { super::log_route::set_serial(None, None, None, None) };
     }
 }
