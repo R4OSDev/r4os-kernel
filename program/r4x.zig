@@ -4368,14 +4368,6 @@ extern fn r4os_rust_program_peer_preemptible(u64) bool;
 extern fn r4os_rust_program_peer_contains(*const ProgramInstance, u64) bool;
 extern fn r4os_rust_program_peer_crash(?*const ProgramInstance, u32, u64, bool, *crash.ExecutionContext) void;
 extern fn r4os_rust_program_peer_dump() void;
-export fn r4os_zig_program_peer_notification(op: u8, owner: *notifications.Owner, handle: u64, value: u64, timeout: u64, out: ?*u64) callconv(.c) i32 {
-    return switch (op) {
-        0 => notifications.create(owner, out.?), 1 => notifications.query(owner, handle, out.?),
-        2 => notifications.notify(owner, handle, @intCast(value)), 3 => notifications.wait(owner, handle, value, timeout),
-        4 => notifications.close(owner, handle), else => unreachable,
-    };
-}
-export fn r4os_zig_program_peer_notifications_cleanup(owner: *notifications.Owner) callconv(.c) bool { return notifications.cleanup(owner); }
 export fn r4os_zig_program_peer_vm_release(id: u32) callconv(.c) bool { _ = mem_virt.releaseOwner(.r4x_instance, id, null) catch return false; return true; }
 export fn r4os_zig_program_peer_backing_release(id: u32) callconv(.c) void { _ = mem_backing_store.releaseR4xOwner(id); }
 comptime {

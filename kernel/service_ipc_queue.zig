@@ -1,3 +1,6 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const State = enum(u8) {
     free,
     raw_ready,
@@ -13,7 +16,7 @@ pub const Mode = enum(u8) {
     direct_response,
 };
 
-pub const SlotMeta = struct {
+pub const SlotMeta = extern struct {
     state: State = .free,
     mode: Mode = .raw,
     generation: u64 = 0,
@@ -24,7 +27,7 @@ pub const SlotMeta = struct {
     completion_published: bool = false,
 };
 
-pub const Selection = struct {
+pub const Selection = extern struct {
     index: usize,
     visits: usize,
 };
@@ -52,101 +55,71 @@ pub const CompletionAction = enum {
     drop_too_small,
 };
 
+// The channel admits one native, stateless slot model. Its original generic
+// consumers lend strided metadata only for the duration of this bounded call.
+const NativeView = extern struct { base: [*]const u8, len: usize, stride: usize, meta_offset: usize };
+const NativeDecision = extern struct { selection: Selection, required: usize, kind: u8 };
+extern fn r4os_rust_service_queue_query(NativeView, u8, usize, *NativeDecision) callconv(.c) void;
+extern fn r4os_rust_service_queue_decide(u8, ?*const SlotMeta, u64, u64, bool) callconv(.c) u8;
+fn query(slots: anytype, operation: u8, capacity: usize) NativeDecision {
+    const Slot = @TypeOf(slots[0]);
+    const values: []const Slot = slots;
+    var result: NativeDecision = undefined;
+    r4os_rust_service_queue_query(.{ .base = @ptrCast(values.ptr), .len = values.len, .stride = @sizeOf(Slot), .meta_offset = @offsetOf(Slot, "meta") }, operation, capacity, &result);
+    return result;
+}
+fn nativeSelection(slots: anytype, operation: u8) ?Selection {
+    const result = query(slots, operation, 0);
+    return if (result.kind == 0) null else result.selection;
+}
 pub fn firstFree(slots: anytype) ?Selection {
-    var i: usize = 0;
-    while (i < slots.len) : (i += 1) {
-        if (slots[i].meta.state == .free) return .{ .index = i, .visits = i + 1 };
-    }
-    return null;
+    return nativeSelection(slots, 0);
 }
-
 pub fn oldestReady(slots: anytype) ?Selection {
-    var selected: ?usize = null;
-    var selected_sequence: u64 = 0;
-    var i: usize = 0;
-    while (i < slots.len) : (i += 1) {
-        const meta = slots[i].meta;
-        if (meta.state != .raw_ready and meta.state != .handler_ready) continue;
-        if (selected == null or meta.sequence < selected_sequence) {
-            selected = i;
-            selected_sequence = meta.sequence;
-        }
-    }
-    return if (selected) |index| .{ .index = index, .visits = slots.len } else null;
+    return nativeSelection(slots, 1);
 }
-
 pub fn oldestQueued(slots: anytype) ?Selection {
-    var selected: ?usize = null;
-    var selected_sequence: u64 = 0;
-    var i: usize = 0;
-    while (i < slots.len) : (i += 1) {
-        const meta = slots[i].meta;
-        if (meta.state != .handler_queued) continue;
-        if (selected == null or meta.sequence < selected_sequence) {
-            selected = i;
-            selected_sequence = meta.sequence;
-        }
-    }
-    return if (selected) |index| .{ .index = index, .visits = slots.len } else null;
+    return nativeSelection(slots, 2);
 }
-
 pub fn receiveDecision(slots: anytype, capacity: usize) ReceiveDecision {
-    const selection = oldestReady(slots) orelse return .empty;
-    const required: usize = @intCast(slots[selection.index].meta.len);
-    if (capacity < required) return .{ .drop_too_small = .{ .selection = selection, .required = required } };
-    return .{ .deliver = selection };
+    const result = query(slots, 3, capacity);
+    return switch (result.kind) {
+        0 => .empty,
+        1 => .{ .deliver = result.selection },
+        2 => .{ .drop_too_small = .{ .selection = result.selection, .required = result.required } },
+        else => unreachable,
+    };
 }
-
 pub fn countReady(slots: anytype) usize {
-    var count: usize = 0;
-    for (slots) |slot| {
-        if (slot.meta.state == .raw_ready or slot.meta.state == .handler_ready) count += 1;
-    }
-    return count;
+    return query(slots, 4, 0).selection.index;
 }
-
 pub fn countUsed(slots: anytype) usize {
-    var count: usize = 0;
-    for (slots) |slot| {
-        if (slot.meta.state != .free) count += 1;
-    }
-    return count;
+    return query(slots, 5, 0).selection.index;
 }
-
 pub fn countRunning(slots: anytype) usize {
-    var count: usize = 0;
-    for (slots) |slot| {
-        if (slot.meta.state == .handler_running) count += 1;
-    }
-    return count;
+    return query(slots, 6, 0).selection.index;
 }
-
 pub fn matches(meta: SlotMeta, generation: u64, state: State) bool {
-    return meta.generation == generation and meta.state == state;
+    return r4os_rust_service_queue_decide(0, &meta, generation, @intFromEnum(state), true) != 0;
 }
-
 pub fn channelGenerationMatches(current: u64, submitted: u64) bool {
-    return current == submitted;
+    return r4os_rust_service_queue_decide(3, null, current, submitted, true) != 0;
 }
-
 pub fn timeoutAction(meta: SlotMeta, generation: u64) TimeoutAction {
-    if (meta.generation != generation) return .none;
-    return switch (meta.state) {
-        .handler_queued => .reset,
-        .handler_running => .abandon,
-        .handler_done => if (meta.completion_published) .reset else .abandon,
-        else => .none,
-    };
+    return @enumFromInt(r4os_rust_service_queue_decide(1, &meta, generation, 0, false));
 }
-
 pub fn completionAction(meta: SlotMeta, generation: u64, capacity: ?usize) CompletionAction {
-    if (meta.generation != generation or meta.state != .handler_done) return .none;
-    if (meta.result < 0) return .discard_error;
-    return switch (meta.mode) {
-        .queued_response => .publish_ready,
-        .direct_response => if (capacity == null or capacity.? < meta.len) .drop_too_small else .deliver,
-        .raw => .discard_error,
-    };
+    return @enumFromInt(r4os_rust_service_queue_decide(2, &meta, generation, capacity orelse 0, capacity != null));
+}
+comptime {
+    if (@sizeOf(SlotMeta) != 40 or @alignOf(SlotMeta) != 8 or
+        @offsetOf(SlotMeta, "state") != 0 or @offsetOf(SlotMeta, "mode") != 1 or
+        @offsetOf(SlotMeta, "generation") != 8 or @offsetOf(SlotMeta, "sequence") != 16 or
+        @offsetOf(SlotMeta, "len") != 24 or @offsetOf(SlotMeta, "result") != 28 or
+        @offsetOf(SlotMeta, "abandoned") != 32 or @offsetOf(SlotMeta, "completion_published") != 33 or
+        @sizeOf(NativeView) != 32 or @sizeOf(Selection) != 16 or
+        @sizeOf(NativeDecision) != 32 or @offsetOf(NativeDecision, "required") != 16 or
+        @offsetOf(NativeDecision, "kind") != 24) @compileError("Native service queue C layout drift");
 }
 
 const TestSlot = struct {

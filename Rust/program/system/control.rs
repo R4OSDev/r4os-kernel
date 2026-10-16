@@ -1,0 +1,331 @@
+//! Original R4SYS CPU/time/log API and one-owner system transition ordering.
+//! Device, display, network and boot-log peers retain their own assigned state;
+//! this module owns orchestration and the sole reboot admission flag.
+use super::super::registry_format_types::Bytes;
+use super::{io, path, registry, registry_state};
+use crate::{
+    arch::{
+        percpu, rtc,
+        runtime::{self, RuntimeGuard},
+        smp,
+    },
+    boot::foundation as log,
+    contract as c,
+    fs::page_cache,
+    memory::heap,
+    platform::{acpi, monotonic, time, timer},
+    sched::{scheduler, sync_types::WaitQueue, sync_wait, task_context},
+};
+use core::{
+    mem::MaybeUninit,
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
+static REBOOT: AtomicBool = AtomicBool::new(false);
+unsafe extern "C" {
+    fn r4os_zig_sys_bootlog_info(out: *mut c::BootLogInfo);
+    fn r4os_zig_sys_bootlog_read(snapshot: bool, offset: usize, out: *mut u8, len: usize) -> usize;
+    fn r4os_zig_sys_power_transition(operation: u8, ticks: u64, reason: Bytes) -> bool;
+    fn r4os_zig_sys_power_terminal(reboot: bool) -> !;
+    fn r4os_zig_sys_serial_flush();
+    fn r4os_zig_sys_version() -> Bytes;
+}
+/// # Safety
+/// Nullable public output retains original validation. A nonnull output is
+/// exclusive caller storage through the bounded capacity snapshot.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_cpu_capacity(out: *mut c::CpuCapacity) -> i32 {
+    if out.is_null() {
+        return c::thread_error_invalid;
+    }
+    let available = percpu::r4os_rust_percpu_control(15, 0, 0, 0) as u32;
+    let configured = smp::r4os_rust_smp_control(6, 0) as u32;
+    if available == 0 || available > configured {
+        return c::thread_error_busy;
+    }
+    unsafe {
+        out.write(c::CpuCapacity {
+            available_cpus: available,
+            configured_cpus: configured,
+        })
+    };
+    c::thread_ok
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn r4os_rust_sys_yield() {
+    scheduler::yield_task();
+}
+/// # Safety
+/// Existing schedulable task context; the local resident timer queue remains
+/// alive until the original wait has completed or been cancelled.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_sleep(ticks: u64) {
+    let mut queue = WaitQueue::EMPTY;
+    unsafe { sync_wait::r4os_rust_sync_timer(&mut queue, ticks, b"timer".as_ptr(), 5) };
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn r4os_rust_sys_ticks() -> u64 {
+    timer::tick_count()
+}
+#[unsafe(no_mangle)]
+pub extern "C" fn r4os_rust_sys_seconds() -> u32 {
+    rtc::seconds_since_midnight(rtc::read_date_time(acpi::snapshot().fadt_century))
+}
+/// # Safety
+/// Original exclusive public clock output and RTC caller context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_time_state(out: *mut c::TimeState) {
+    unsafe { time::r4os_rust_time_state(out) }
+}
+/// # Safety
+/// Original readable public clock input and exclusive RTC mutation context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_time_set(input: *const c::TimeState) -> i32 {
+    unsafe { time::r4os_rust_time_set_state(input) }
+}
+/// # Safety
+/// Original exclusive public monotonic snapshot output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_monotonic(out: *mut c::MonotonicClockInfo) -> i32 {
+    unsafe { monotonic::r4os_rust_monotonic_clock_api(out) }
+}
+unsafe fn boot_info() -> c::BootLogInfo {
+    unsafe {
+        let mut info = MaybeUninit::uninit();
+        r4os_zig_sys_bootlog_info(info.as_mut_ptr());
+        info.assume_init()
+    }
+}
+/// # Safety
+/// Exclusive public output may page fault. The log owner has already released
+/// its coherent resident snapshot before this caller-storage publication.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_bootlog_info(out: *mut c::BootLogInfo) -> i32 {
+    let info = unsafe { boot_info() };
+    unsafe { out.write(info) };
+    1
+}
+struct Allocation {
+    pointer: *mut u8,
+    len: usize,
+}
+impl Drop for Allocation {
+    fn drop(&mut self) {
+        if !self.pointer.is_null() {
+            unsafe { heap::r4os_rust_heap_free(self.pointer, self.len) };
+        }
+    }
+}
+struct Unwind(task_context::Unwind);
+impl Drop for Unwind {
+    fn drop(&mut self) {
+        let _runtime = RuntimeGuard::acquire();
+        unsafe {
+            assert!(task_context::leave(self.0));
+        }
+    }
+}
+/// # Safety
+/// Original caller output and admitted task lifetime. The ring owner receives
+/// resident private scratch only; the final caller copy occurs after release.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_bootlog_read(
+    offset: u32,
+    out: *mut u8,
+    capacity: u32,
+) -> i32 {
+    unsafe {
+        if capacity == 0 {
+            return 0;
+        }
+        let len = boot_info().length as usize;
+        let offset = offset as usize;
+        if offset >= len {
+            return 0;
+        }
+        let max = (capacity as usize).min(len - offset);
+        let token = {
+            let _runtime = RuntimeGuard::acquire();
+            task_context::enter()
+        };
+        if !token.admitted() {
+            return -1;
+        }
+        let _unwind = Unwind(token);
+        let mut small = MaybeUninit::<[u8; 4096]>::uninit();
+        let allocated = Allocation {
+            pointer: if max > 4096 {
+                heap::r4os_rust_heap_alloc(max, 1)
+            } else {
+                ptr::null_mut()
+            },
+            len: max,
+        };
+        if max > 4096 && allocated.pointer.is_null() {
+            return -1;
+        }
+        let resident = if max > 4096 {
+            allocated.pointer
+        } else {
+            small.as_mut_ptr().cast()
+        };
+        let written = r4os_zig_sys_bootlog_read(false, offset, resident, max);
+        ptr::copy_nonoverlapping(resident, out, written);
+        i32::try_from(written).expect("Boot log read result")
+    }
+}
+unsafe fn log_registry() {
+    unsafe {
+        let mut performance = MaybeUninit::uninit();
+        let mut generation = 0;
+        let mut dirty = false;
+        let mut pending = false;
+        if !registry_state::r4os_rust_sys_registry_performance(
+            performance.as_mut_ptr(),
+            &mut generation,
+            &mut dirty,
+            &mut pending,
+        ) {
+            return;
+        }
+        let performance = performance.assume_init();
+        log::puts(b"[R4SYS] registry generation=");
+        log::dec(generation);
+        for (label, value) in [
+            (b" reads=".as_slice(), performance.read_calls),
+            (b" cacheHits=", performance.cache_hits),
+            (b" fileLoads=", performance.file_loads),
+            (b" validations=", performance.validation_passes),
+            (b" publications=", performance.publications),
+            (b" commits=", performance.commits),
+            (b" failures=", performance.commit_failures),
+            (b" retries=", performance.atomic_retries),
+        ] {
+            log::puts(label);
+            log::dec(value);
+        }
+        log::puts(b" dirty=");
+        log::puts(if dirty { b"yes" } else { b"no" });
+        log::puts(b" pending=");
+        log::puts(if pending { b"yes" } else { b"no" });
+        log::puts(b"\r\n");
+    }
+}
+unsafe fn flush_registry() {
+    unsafe {
+        if registry::r4os_rust_sys_registry_flush() != c::registry_api_result_ok {
+            log::puts(b"R4SYS shutdown: registry writeback flush failed\r\n");
+        }
+        log_registry();
+    }
+}
+unsafe fn flush_page_cache() {
+    if !unsafe { page_cache::r4os_rust_pagecache_flush_all() } {
+        log::puts(b"R4SYS shutdown: page-cache flush failed\r\n");
+    }
+}
+unsafe fn save_log(stage: &[u8]) {
+    unsafe {
+        log::puts(b"[RESET] checkpoint=");
+        log::puts(stage);
+        log::puts(b" kernel=");
+        log::puts(r4os_zig_sys_version().slice());
+        log::puts(b" ticks=");
+        log::dec(timer::tick_count());
+        log::puts(b"\r\n");
+        let len = boot_info().capacity as usize;
+        let allocated = Allocation {
+            pointer: heap::r4os_rust_heap_alloc(len, 1),
+            len,
+        };
+        if allocated.pointer.is_null() {
+            log::puts(b"[RESET] diagnostic allocation failed\r\n");
+            return;
+        }
+        let count = r4os_zig_sys_bootlog_read(true, 0, allocated.pointer, len);
+        let mut path = [0u8; 19];
+        path::write_z(&mut path, b"C:\\TEMP\\REBOOT.LOG");
+        let written = io::r4os_rust_sys_file_write(path.as_ptr(), allocated.pointer, count as u32);
+        let durable = page_cache::r4os_rust_pagecache_flush_all();
+        if written != i32::try_from(count).expect("Reboot log result") || !durable {
+            log::puts(b"[RESET] diagnostic write/flush failed\r\n");
+        }
+    }
+}
+/// # Safety
+/// Original terminal system-halt caller; registry remains active until flush.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_halt() -> ! {
+    log::puts(b"System halted.\r\n");
+    unsafe { flush_registry() };
+    runtime::halt_forever()
+}
+/// # Safety
+/// Original explicit system reboot. One atomic owner orchestrates peer drains;
+/// only genuine callbacks/driver/display acknowledgements admit warm reset.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_reboot() {
+    unsafe {
+        if REBOOT.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        log::puts(b"System reboot.\r\n");
+        flush_registry();
+        flush_page_cache();
+        r4os_zig_sys_power_transition(0, 0, Bytes::EMPTY);
+        save_log(b"begin");
+        let display = r4os_zig_sys_power_transition(
+            1,
+            u64::from((timer::frequency() / 4).max(1)),
+            Bytes::EMPTY,
+        );
+        log::puts(if display {
+            b"[RESET] display-drain=OK\r\n"
+        } else {
+            b"[RESET] display-drain=FAILED\r\n"
+        });
+        save_log(b"display-drained");
+        let network = r4os_zig_sys_power_transition(2, 0, Bytes::from_slice(b"reboot"));
+        log::puts(if network {
+            b"[RESET] network-drain=OK\r\n"
+        } else {
+            b"[RESET] network-drain=FAILED\r\n"
+        });
+        save_log(b"network-drained");
+        let drivers = display && network && r4os_zig_sys_power_transition(3, 0, Bytes::EMPTY);
+        let released = drivers && r4os_zig_sys_power_transition(4, 0, Bytes::EMPTY);
+        log::puts(if drivers {
+            b"[RESET] driver-shutdown=OK\r\n"
+        } else {
+            b"[RESET] driver-shutdown=FAILED-OR-SKIPPED\r\n"
+        });
+        log::puts(if released {
+            b"[RESET] display-release=OK\r\n"
+        } else {
+            b"[RESET] display-release=FAILED-OR-SKIPPED\r\n"
+        });
+        if !display || !network || !drivers || !released {
+            log::puts(
+                b"[RESET][ERROR] device handoff unsafe; powering off instead of warm reset\r\n",
+            );
+            save_log(b"poweroff-device-handoff");
+            r4os_zig_sys_serial_flush();
+            r4os_zig_sys_power_terminal(false);
+        }
+        save_log(b"warm-reset-ready");
+        r4os_zig_sys_serial_flush();
+        r4os_zig_sys_power_terminal(true);
+    }
+}
+/// # Safety
+/// Original explicit terminal poweroff caller, after required persistent flushes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn r4os_rust_sys_poweroff() -> ! {
+    unsafe {
+        log::puts(b"System poweroff.\r\n");
+        flush_registry();
+        flush_page_cache();
+        r4os_zig_sys_serial_flush();
+        r4os_zig_sys_power_terminal(false)
+    }
+}

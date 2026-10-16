@@ -1,11 +1,13 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+// Native service registry and endpoint owner; this file transports fixed C
+// records to unchanged Zig callers and retains the original owner fixtures.
 const std = @import("std");
 const config = @import("config");
 const r4x_api = @import("../program/r4x_api.zig");
-const monotonic = @import("../platform/monotonic.zig");
-const scheduler = @import("../sched/scheduler.zig");
 const sync = @import("../sched/sync.zig");
 const task_context = @import("../sched/task_context.zig");
-const timer = @import("timer.zig");
 
 pub const MAX_SERVICES: usize = 16;
 pub const MAX_NAME: usize = 32;
@@ -88,57 +90,11 @@ const LockFamily = enum(u8) {
     endpoint_snapshot = 6,
 };
 
-const LockTiming = struct {
-    acquisitions: u64 = 0,
-    contentions: u64 = 0,
-    timing_samples: u64 = 0,
-    wait_ns: u64 = 0,
-    wait_max_ns: u64 = 0,
-    hold_ns: u64 = 0,
-    hold_max_ns: u64 = 0,
-    timing_unavailable: u64 = 0,
-};
-
-const TimedLock = struct {
-    mutex: *sync.Mutex,
-    timing: ?*LockTiming = null,
-    hold_started: monotonic.Stamp = .{},
-    timed: bool = false,
-    locked: bool = false,
-    admitted: bool = false,
-};
-
-const EndpointLifetimePerformance = struct {
-    payload_copy_bytes: u64 = 0,
-    payload_clear_bytes: u64 = 0,
-    slot_metadata_resets: u64 = 0,
-    endpoint_metadata_resets: u64 = 0,
-    endpoint_payload_reset_bytes: u64 = 0,
-    queue_scan_passes: u64 = 0,
-    queue_scan_slots: u64 = 0,
-    revalidations: u64 = 0,
-    stale_rejections: u64 = 0,
-};
-
 const RequestState = enum(u8) {
     free,
     queued,
     delivered,
     responded,
-};
-
-const RequestSlot = struct {
-    state: RequestState = .free,
-    request_id: u32 = 0,
-    client_id: u32 = 0,
-    op: u16 = 0,
-    flags: u32 = 0,
-    request_len: u16 = 0,
-    response_len: u16 = 0,
-    response_status: i32 = API_OK,
-    response_available: sync.WaitQueue = sync.WaitQueue.init(),
-    request_payload: [API_MAX_PAYLOAD]u8 = .{0} ** API_MAX_PAYLOAD,
-    response_payload: [API_MAX_PAYLOAD]u8 = .{0} ** API_MAX_PAYLOAD,
 };
 
 pub const State = enum(u8) {
@@ -157,7 +113,30 @@ pub const StartMode = enum(u8) {
     disabled,
 };
 
-pub const Entry = struct {
+const LockTiming = extern struct {
+    acquisitions: u64 = 0,
+    contentions: u64 = 0,
+    timing_samples: u64 = 0,
+    wait_ns: u64 = 0,
+    wait_max_ns: u64 = 0,
+    hold_ns: u64 = 0,
+    hold_max_ns: u64 = 0,
+    timing_unavailable: u64 = 0,
+};
+
+const EndpointLifetimePerformance = extern struct {
+    payload_copy_bytes: u64 = 0,
+    payload_clear_bytes: u64 = 0,
+    slot_metadata_resets: u64 = 0,
+    endpoint_metadata_resets: u64 = 0,
+    endpoint_payload_reset_bytes: u64 = 0,
+    queue_scan_passes: u64 = 0,
+    queue_scan_slots: u64 = 0,
+    revalidations: u64 = 0,
+    stale_rejections: u64 = 0,
+};
+
+pub const Entry = extern struct {
     used: bool = false,
     state: State = .empty,
     start_mode: StartMode = .manual,
@@ -178,11 +157,7 @@ pub const Entry = struct {
     last_error_len: usize = 0,
 };
 
-/// Stable internal identity for one dense ServiceInfo/ServiceDetail index.
-/// Structural registry changes invalidate every outstanding target through
-/// registry_generation; ordinary state changes keep the target usable as
-/// long as the same service instance remains attached.
-pub const ApiIndexTarget = struct {
+pub const ApiIndexTarget = extern struct {
     registry_generation: u64 = 0,
     api_index: u32 = 0,
     service_slot: usize = 0,
@@ -192,7 +167,21 @@ pub const ApiIndexTarget = struct {
     name_len: usize = 0,
 };
 
-const Endpoint = struct {
+const RequestSlot = extern struct {
+    state: RequestState = .free,
+    request_id: u32 = 0,
+    client_id: u32 = 0,
+    op: u16 = 0,
+    flags: u32 = 0,
+    request_len: u16 = 0,
+    response_len: u16 = 0,
+    response_status: i32 = API_OK,
+    response_available: sync.WaitQueue = sync.WaitQueue.init(),
+    request_payload: [API_MAX_PAYLOAD]u8 = .{0} ** API_MAX_PAYLOAD,
+    response_payload: [API_MAX_PAYLOAD]u8 = .{0} ** API_MAX_PAYLOAD,
+};
+
+const Endpoint = extern struct {
     // The lock, generation, reserved request-ID range and lifetime counters
     // are stable slot identity.
     // resetEndpointMetadata must never replace them while stale waiters may
@@ -231,7 +220,7 @@ const Endpoint = struct {
     queue: [API_ENDPOINT_QUEUE_DEPTH]RequestSlot = .{RequestSlot{}} ** API_ENDPOINT_QUEUE_DEPTH,
 };
 
-pub const PerformanceSummary = struct {
+pub const PerformanceSummary = extern struct {
     max_services: u32 = @intCast(MAX_SERVICES),
     used_services: u32 = 0,
     running_services: u32 = 0,
@@ -285,7 +274,7 @@ pub const PerformanceSummary = struct {
     registry_index_end_markers: u64 = 0,
 };
 
-const RegistryEnumerationPerformance = struct {
+const RegistryEnumerationPerformance = extern struct {
     index_queries: u64 = 0,
     refresh_requests: u64 = 0,
     refresh_visits: u64 = 0,
@@ -293,385 +282,73 @@ const RegistryEnumerationPerformance = struct {
     index_end_markers: u64 = 0,
 };
 
-var entries: [MAX_SERVICES]Entry = .{Entry{}} ** MAX_SERVICES;
-var endpoints: [MAX_ENDPOINTS]Endpoint = .{Endpoint{}} ** MAX_ENDPOINTS;
-var next_endpoint_handle: u32 = 1;
-var next_request_id: u32 = 1;
-var registry_lock = sync.Mutex.initClass("service-registry", sync.LockRank.service_registry, .sleepable);
-var registry_lock_timing: [SERVICE_LOCK_FAMILY_COUNT]LockTiming = .{LockTiming{}} ** SERVICE_LOCK_FAMILY_COUNT;
-var api_index_slots: [MAX_SERVICES]u8 = .{API_INDEX_INVALID_SLOT} ** MAX_SERVICES;
-var api_index_count: u32 = 0;
-var registry_generation: u64 = 1;
-var next_start_generation: u64 = 0;
-var registry_enumeration_performance: RegistryEnumerationPerformance = .{};
-
-fn lockFamilyIndex(family: LockFamily) usize {
-    return @intFromEnum(family);
-}
-
-fn noteElapsed(timing: *LockTiming, start: monotonic.Stamp, end: monotonic.Stamp, is_hold: bool) void {
-    const elapsed = monotonic.elapsedNanoseconds(start, end) orelse {
-        timing.timing_unavailable +%= 1;
-        return;
-    };
-    if (is_hold) {
-        timing.hold_ns +%= elapsed;
-        if (elapsed > timing.hold_max_ns) timing.hold_max_ns = elapsed;
-    } else {
-        timing.wait_ns +%= elapsed;
-        if (elapsed > timing.wait_max_ns) timing.wait_max_ns = elapsed;
-    }
-}
-
-fn acquireTimedLock(mutex: *sync.Mutex, timing: *LockTiming) TimedLock {
-    // Before scheduler admission the kernel is single-threaded. Preserve the
-    // historical boot-time lock bypass without pretending it was measured.
-    if (scheduler.current() == null) return .{ .mutex = mutex, .admitted = true };
-
-    const immediate = mutex.tryLock();
-    const wait_started = if (config.enable_metrics and !immediate) monotonic.capture() else monotonic.Stamp{};
-    const acquired = immediate or mutex.lock(sync.WAIT_FOREVER);
-    if (!acquired) return .{ .mutex = mutex };
-    timing.acquisitions +%= 1;
-    if (!immediate) timing.contentions +%= 1;
-    const sampled = config.enable_metrics and (!immediate or ((timing.acquisitions -% 1) % SERVICE_LOCK_TIMING_STRIDE == 0));
-    const acquired_at = if (sampled) monotonic.capture() else monotonic.Stamp{};
-    if (sampled) {
-        timing.timing_samples +%= 1;
-        // An uncontended try-lock has no scheduler wait. Measuring its few
-        // instructions with HPET MMIO would perturb the hot path more than
-        // the lock itself, so only real contention contributes wait time.
-        if (!immediate) noteElapsed(timing, wait_started, acquired_at, false);
-    }
-    return .{
-        .mutex = mutex,
-        .timing = timing,
-        .hold_started = acquired_at,
-        .timed = sampled,
-        .locked = true,
-        .admitted = true,
-    };
-}
-
-fn tryAcquireTimedLock(mutex: *sync.Mutex, timing: *LockTiming) ?TimedLock {
-    if (scheduler.current() == null) return TimedLock{ .mutex = mutex, .admitted = true };
-    if (!mutex.tryLock()) {
-        timing.contentions +%= 1;
-        return null;
-    }
-    timing.acquisitions +%= 1;
-    const sampled = config.enable_metrics and (timing.acquisitions -% 1) % SERVICE_LOCK_TIMING_STRIDE == 0;
-    const acquired_at = if (sampled) monotonic.capture() else monotonic.Stamp{};
-    if (sampled) timing.timing_samples +%= 1;
-    return .{
-        .mutex = mutex,
-        .timing = timing,
-        .hold_started = acquired_at,
-        .timed = sampled,
-        .locked = true,
-        .admitted = true,
-    };
-}
-
-fn releaseTimedLock(guard: *TimedLock) void {
-    if (guard.locked) {
-        if (guard.timed) {
-            if (guard.timing) |timing| noteElapsed(timing, guard.hold_started, monotonic.capture(), true);
-        }
-        _ = guard.mutex.unlock();
-    }
-    guard.locked = false;
-    guard.admitted = false;
-}
-
-fn releaseTimedLockForWait(raw: *anyopaque) void {
-    const guard: *TimedLock = @ptrCast(@alignCast(raw));
-    releaseTimedLock(guard);
-}
-
-fn lockRegistry(family: LockFamily) TimedLock {
-    return acquireTimedLock(&registry_lock, &registry_lock_timing[lockFamilyIndex(family)]);
-}
-
-fn unlockRegistry(guard: *TimedLock) void {
-    releaseTimedLock(guard);
-}
-
-fn rebuildApiIndexLocked() void {
-    @memset(api_index_slots[0..], API_INDEX_INVALID_SLOT);
-    api_index_count = 0;
-    var slot: usize = 0;
-    while (slot < entries.len) : (slot += 1) {
-        if (!entries[slot].used) continue;
-        api_index_slots[api_index_count] = @intCast(slot);
-        api_index_count += 1;
-    }
-}
-
-fn noteRegistryStructureChangedLocked() void {
-    registry_generation +%= 1;
-    if (registry_generation == 0) registry_generation = 1;
-    rebuildApiIndexLocked();
-}
-
-fn apiSlotAtLocked(index: u32) ?usize {
-    if (index >= api_index_count) return null;
-    const slot: usize = api_index_slots[index];
-    if (slot >= entries.len or !entries[slot].used) return null;
-    return slot;
-}
-
-fn apiTargetSlotLocked(target: ApiIndexTarget, require_instance: bool) ?usize {
-    if (target.registry_generation != registry_generation) return null;
-    const slot = apiSlotAtLocked(target.api_index) orelse return null;
-    if (slot != target.service_slot) return null;
-    const entry = &entries[slot];
-    if (entry.name_len != target.name_len or
-        !nameEq(entry.name[0..entry.name_len], target.name[0..target.name_len])) return null;
-    if (require_instance and entry.instance_id != target.instance_id) return null;
-    return slot;
-}
-
-fn selectApiIndexTarget(index: u32, count_query: bool) ?ApiIndexTarget {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    defer unlockRegistry(&registry_guard);
-    if (count_query) registry_enumeration_performance.index_queries +%= 1;
-    const slot = apiSlotAtLocked(index) orelse {
-        if (count_query) registry_enumeration_performance.index_end_markers +%= 1;
-        return null;
-    };
-    const entry = &entries[slot];
-    if (count_query) registry_enumeration_performance.refresh_requests +%= 1;
-    registry_enumeration_performance.refresh_visits +%= 1;
-    var target = ApiIndexTarget{
-        .registry_generation = registry_generation,
-        .api_index = index,
-        .service_slot = slot,
-        .instance_id = entry.instance_id,
-        .state = entry.state,
-        .name_len = entry.name_len,
-    };
-    if (entry.name_len > 0) @memcpy(target.name[0..entry.name_len], entry.name[0..entry.name_len]);
-    return target;
-}
-
-pub fn beginApiIndexRefresh(index: u32) ?ApiIndexTarget {
-    return selectApiIndexTarget(index, true);
-}
-
-pub fn retryApiIndexRefresh(index: u32) ?ApiIndexTarget {
-    return selectApiIndexTarget(index, false);
-}
-
-pub fn entryForApiIndexTarget(target: ApiIndexTarget) ?Entry {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    defer unlockRegistry(&registry_guard);
-    const slot = apiTargetSlotLocked(target, true) orelse return null;
-    return entries[slot];
-}
-
-pub fn noteApiIndexInstanceLookup(target: ApiIndexTarget) bool {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    defer unlockRegistry(&registry_guard);
-    if (apiTargetSlotLocked(target, true) == null) return false;
-    registry_enumeration_performance.instance_lookups +%= 1;
-    return true;
-}
-
-const EndpointIdentity = struct {
-    endpoint: *Endpoint,
-    handle: u32,
-    generation: u64,
-    service_slot: usize,
+pub const StartReservation = extern struct {
+    slot: usize = 0,
+    generation: u64 = 0,
+    entry: Entry = .{},
 };
 
-const EndpointLease = struct {
-    endpoint: *Endpoint,
-    identity: EndpointIdentity,
-    guard: TimedLock,
-};
-
-const LifecycleEndpointLease = struct {
-    endpoint: *Endpoint,
-    guard: TimedLock,
-};
-
-const LifecycleAttempt = union(enum) {
-    none,
-    contended: *Endpoint,
-    locked: LifecycleEndpointLease,
-};
-
-const QueueCounts = struct {
+const QueueCounts = extern struct {
     queued: u32 = 0,
     delivered: u32 = 0,
     responded: u32 = 0,
     used: u32 = 0,
 };
 
-fn addLockTiming(out: *PerformanceSummary, index: usize, timing: LockTiming) void {
-    out.lock_acquisitions[index] +%= timing.acquisitions;
-    out.lock_contentions[index] +%= timing.contentions;
-    out.lock_wait_ns[index] +%= timing.wait_ns;
-    if (timing.wait_max_ns > out.lock_wait_max_ns[index]) out.lock_wait_max_ns[index] = timing.wait_max_ns;
-    out.lock_hold_ns[index] +%= timing.hold_ns;
-    if (timing.hold_max_ns > out.lock_hold_max_ns[index]) out.lock_hold_max_ns[index] = timing.hold_max_ns;
-    out.lock_timing_unavailable[index] +%= timing.timing_unavailable;
-    out.lock_timing_samples[index] +%= timing.timing_samples;
+const EndpointIdentity = extern struct {
+    endpoint: *Endpoint,
+    handle: u32,
+    generation: u64,
+    service_slot: usize,
+};
+
+const NativeBytes = extern struct { data: [*]const u8, len: usize };
+fn nativeBytes(value: []const u8) NativeBytes {
+    return .{ .data = value.ptr, .len = value.len };
+}
+fn emptyBytes() NativeBytes {
+    return nativeBytes("");
+}
+extern fn r4os_rust_services_init() callconv(.c) void;
+extern fn r4os_rust_services_register(NativeBytes, NativeBytes, NativeBytes, u8, NativeBytes) callconv(.c) i32;
+extern fn r4os_rust_services_name(u8, NativeBytes, u8, u32, i32, u64, NativeBytes) callconv(.c) i32;
+extern fn r4os_rust_services_target(u8, *const ApiIndexTarget, i32, NativeBytes) callconv(.c) i32;
+extern fn r4os_rust_services_start(u8, NativeBytes, *StartReservation, u32, u64, i32, NativeBytes) callconv(.c) i32;
+extern fn r4os_rust_services_get(u8, usize, NativeBytes, ?*const ApiIndexTarget, ?*Entry, ?*ApiIndexTarget) callconv(.c) bool;
+extern fn r4os_rust_services_count() callconv(.c) usize;
+extern fn r4os_rust_services_info(u8, u32, NativeBytes, ?*const ApiIndexTarget, *ApiInfo, u64) callconv(.c) i32;
+extern fn r4os_rust_services_detail(u8, u32, NativeBytes, ?*const ApiIndexTarget, *ApiDetail, u64) callconv(.c) i32;
+extern fn r4os_rust_services_endpoint_register(NativeBytes, u32, u32, *ApiInfo, u64) callconv(.c) i32;
+extern fn r4os_rust_services_endpoint_control(u8, u32, u32, u64) callconv(.c) i32;
+extern fn r4os_rust_services_request(u32, u32, u16, NativeBytes, u64, bool, ?*task_context.UnwindToken) callconv(.c) i32;
+extern fn r4os_rust_services_recv(u32, u32, bool, *ApiMessageHeader, [*]u8, usize) callconv(.c) i32;
+extern fn r4os_rust_services_reply(u32, u32, i32, NativeBytes) callconv(.c) i32;
+extern fn r4os_rust_services_performance(*PerformanceSummary) callconv(.c) void;
+extern fn r4os_rust_services_record(u8, ?*Endpoint, ?*RequestSlot, ?*u32, ?*QueueCounts, ?*const EndpointIdentity) callconv(.c) u32;
+extern fn r4os_rust_services_label(bool, u8) callconv(.c) NativeBytes;
+extern fn r4os_rust_services_parse(NativeBytes) callconv(.c) u8;
+
+pub fn beginApiIndexRefresh(index: u32) ?ApiIndexTarget {
+    var out: ApiIndexTarget = undefined;
+    return if (r4os_rust_services_get(3, index, emptyBytes(), null, null, &out)) out else null;
 }
 
-fn addEndpointLifetime(out: *PerformanceSummary, ep: *const Endpoint) void {
-    out.payload_copy_bytes +%= ep.lifetime.payload_copy_bytes;
-    out.payload_clear_bytes +%= ep.lifetime.payload_clear_bytes;
-    out.slot_metadata_resets +%= ep.lifetime.slot_metadata_resets;
-    out.endpoint_metadata_resets +%= ep.lifetime.endpoint_metadata_resets;
-    out.endpoint_payload_reset_bytes +%= ep.lifetime.endpoint_payload_reset_bytes;
-    out.queue_scan_passes +%= ep.lifetime.queue_scan_passes;
-    out.queue_scan_slots +%= ep.lifetime.queue_scan_slots;
-    out.endpoint_revalidations +%= ep.lifetime.revalidations;
-    out.endpoint_stale_rejections +%= ep.lifetime.stale_rejections;
+pub fn retryApiIndexRefresh(index: u32) ?ApiIndexTarget {
+    var out: ApiIndexTarget = undefined;
+    return if (r4os_rust_services_get(4, index, emptyBytes(), null, null, &out)) out else null;
 }
 
-fn tryLifecycleEndpoint(ep: *Endpoint) LifecycleAttempt {
-    const timing = &ep.lock_timing[lockFamilyIndex(.endpoint_lifecycle)];
-    const guard = tryAcquireTimedLock(&ep.lock, timing) orelse return .{ .contended = ep };
-    return .{ .locked = .{ .endpoint = ep, .guard = guard } };
+pub fn entryForApiIndexTarget(target: ApiIndexTarget) ?Entry {
+    var out: Entry = undefined;
+    return if (r4os_rust_services_get(2, 0, emptyBytes(), &target, &out, null)) out else null;
 }
 
-fn tryLifecycleEndpointForSlot(slot: usize) LifecycleAttempt {
-    const index = endpointForSlot(slot) orelse return .none;
-    return tryLifecycleEndpoint(&endpoints[index]);
-}
-
-fn tryLifecycleEndpointForHandle(handle: u32) LifecycleAttempt {
-    const index = endpointForHandle(handle) orelse return .none;
-    return tryLifecycleEndpoint(&endpoints[index]);
-}
-
-fn waitForEndpointLifecycle(ep: *Endpoint) void {
-    var guard = acquireTimedLock(&ep.lock, &ep.lock_timing[lockFamilyIndex(.endpoint_lifecycle)]);
-    if (guard.admitted) releaseTimedLock(&guard);
-}
-
-fn endpointIdentityForSlotLocked(slot: usize) ?EndpointIdentity {
-    const index = endpointForSlot(slot) orelse return null;
-    const ep = &endpoints[index];
-    return .{
-        .endpoint = ep,
-        .handle = ep.handle,
-        .generation = ep.generation,
-        .service_slot = ep.service_slot,
-    };
-}
-
-fn endpointIdentityForHandleLocked(handle: u32) ?EndpointIdentity {
-    const index = endpointForHandle(handle) orelse return null;
-    const ep = &endpoints[index];
-    return .{
-        .endpoint = ep,
-        .handle = ep.handle,
-        .generation = ep.generation,
-        .service_slot = ep.service_slot,
-    };
-}
-
-fn lookupEndpointIdentity(handle: u32) ?EndpointIdentity {
-    var registry_guard = lockRegistry(.registry_lookup);
-    defer unlockRegistry(&registry_guard);
-    return endpointIdentityForHandleLocked(handle);
-}
-
-fn identityMatches(ep: *const Endpoint, identity: EndpointIdentity) bool {
-    return ep.used and
-        ep.handle == identity.handle and
-        ep.generation == identity.generation and
-        ep.service_slot == identity.service_slot;
-}
-
-fn lockEndpointIdentity(identity: EndpointIdentity, family: LockFamily) ?EndpointLease {
-    var guard = acquireTimedLock(&identity.endpoint.lock, &identity.endpoint.lock_timing[lockFamilyIndex(family)]);
-    if (!guard.admitted) return null;
-    identity.endpoint.lifetime.revalidations +%= 1;
-    if (!identityMatches(identity.endpoint, identity)) {
-        identity.endpoint.lifetime.stale_rejections +%= 1;
-        releaseTimedLock(&guard);
-        return null;
-    }
-    return .{ .endpoint = identity.endpoint, .identity = identity, .guard = guard };
-}
-
-fn lockEndpointForHandle(handle: u32, family: LockFamily) ?EndpointLease {
-    const identity = lookupEndpointIdentity(handle) orelse return null;
-    return lockEndpointIdentity(identity, family);
-}
-
-fn unlockEndpoint(lease: *EndpointLease) void {
-    releaseTimedLock(&lease.guard);
-}
-
-fn markEntryStarting(entry: *Entry) void {
-    next_start_generation +%= 1;
-    if (next_start_generation == 0) next_start_generation = 1;
-    entry.start_generation = next_start_generation;
-    entry.state = .starting;
-    entry.instance_id = 0;
-    entry.exit_code = 0;
-    entry.last_error_len = 0;
-}
-
-fn disableEntry(entry: *Entry) void {
-    entry.start_mode = .disabled;
-    entry.state = .disabled;
-    entry.start_generation = 0;
-    entry.instance_id = 0;
-    entry.start_tick = 0;
-}
-
-fn ifEntryDisabledElseStopped(entry: *const Entry) State {
-    return if (entry.start_mode == .disabled) .disabled else .stopped;
-}
-
-fn alwaysFailed(_: *const Entry) State {
-    return .failed;
-}
-
-fn finishServiceState(name: []const u8, stateFor: *const fn (*const Entry) State, exit_code: i32, error_text: []const u8) i32 {
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        const slot = findByNameIn(&entries, name) orelse {
-            unlockRegistry(&registry_guard);
-            return ERR_NOT_FOUND;
-        };
-        switch (tryLifecycleEndpointForSlot(slot)) {
-            .contended => |ep| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(ep);
-                continue;
-            },
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                retireEndpointLocked(locked.endpoint, .cancelled);
-                finishEntryState(&entries[slot], stateFor, exit_code, error_text);
-                releaseTimedLock(&endpoint_guard);
-            },
-            .none => finishEntryState(&entries[slot], stateFor, exit_code, error_text),
-        }
-        unlockRegistry(&registry_guard);
-        return OK;
-    }
-}
-
-fn finishEntryState(entry: *Entry, stateFor: *const fn (*const Entry) State, exit_code: i32, error_text: []const u8) void {
-    entry.state = stateFor(entry);
-    entry.start_generation = 0;
-    entry.instance_id = 0;
-    entry.exit_code = exit_code;
-    entry.start_tick = 0;
-    entry.last_error_len = copy(error_text, entry.last_error[0..]);
+pub fn noteApiIndexInstanceLookup(target: ApiIndexTarget) bool {
+    return r4os_rust_services_target(3, &target, 0, emptyBytes()) != 0;
 }
 
 pub fn init() void {
-    resetRegistryState();
+    r4os_rust_services_init();
 }
 
 pub fn register(name: []const u8, path: []const u8, args: []const u8, start_mode: StartMode) i32 {
@@ -679,658 +356,147 @@ pub fn register(name: []const u8, path: []const u8, args: []const u8, start_mode
 }
 
 pub fn registerWithDescription(name: []const u8, path: []const u8, args: []const u8, start_mode: StartMode, description: []const u8) i32 {
-    var registry_guard = lockRegistry(.registry_control);
-    defer unlockRegistry(&registry_guard);
-    const result = registerIn(&entries, name, path, args, start_mode, description);
-    if (result >= 0) noteRegistryStructureChangedLocked();
-    return result;
+    return r4os_rust_services_register(nativeBytes(name), nativeBytes(path), nativeBytes(args), @intFromEnum(start_mode), nativeBytes(description));
 }
 
 pub fn unregister(name: []const u8) i32 {
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        const slot = findByNameIn(&entries, name) orelse {
-            unlockRegistry(&registry_guard);
-            return ERR_NOT_FOUND;
-        };
-        switch (tryLifecycleEndpointForSlot(slot)) {
-            .contended => |ep| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(ep);
-                continue;
-            },
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                retireEndpointLocked(locked.endpoint, .cancelled);
-                const result = unregisterIn(&entries, name);
-                if (result == OK) noteRegistryStructureChangedLocked();
-                releaseTimedLock(&endpoint_guard);
-                unlockRegistry(&registry_guard);
-                return result;
-            },
-            .none => {
-                const result = unregisterIn(&entries, name);
-                if (result == OK) noteRegistryStructureChangedLocked();
-                unlockRegistry(&registry_guard);
-                return result;
-            },
-        }
-    }
+    return r4os_rust_services_name(0, nativeBytes(name), 0, 0, 0, 0, emptyBytes());
 }
 
 pub fn setState(name: []const u8, state: State, instance_id: u32, exit_code: i32, error_text: []const u8) i32 {
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        const slot = findByNameIn(&entries, name) orelse {
-            unlockRegistry(&registry_guard);
-            return ERR_NOT_FOUND;
-        };
-        const retire = state != .running or entries[slot].instance_id != instance_id;
-        if (!retire) {
-            const result = setStateIn(&entries, name, state, instance_id, exit_code, error_text);
-            unlockRegistry(&registry_guard);
-            return result;
-        }
-        switch (tryLifecycleEndpointForSlot(slot)) {
-            .contended => |ep| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(ep);
-                continue;
-            },
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                retireEndpointLocked(locked.endpoint, .cancelled);
-                const result = setStateIn(&entries, name, state, instance_id, exit_code, error_text);
-                releaseTimedLock(&endpoint_guard);
-                unlockRegistry(&registry_guard);
-                return result;
-            },
-            .none => {
-                const result = setStateIn(&entries, name, state, instance_id, exit_code, error_text);
-                unlockRegistry(&registry_guard);
-                return result;
-            },
-        }
-    }
+    return r4os_rust_services_name(1, nativeBytes(name), @intFromEnum(state), instance_id, exit_code, 0, nativeBytes(error_text));
 }
 
-pub const StartReservation = struct {
-    slot: usize = 0,
-    generation: u64 = 0,
-    entry: Entry = .{},
-};
-
 pub fn beginStart(name: []const u8, out: *StartReservation) i32 {
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        const slot = findByNameIn(&entries, name) orelse {
-            unlockRegistry(&registry_guard);
-            return API_ERR_NOT_FOUND;
-        };
-        if (entries[slot].start_mode == .disabled) {
-            unlockRegistry(&registry_guard);
-            return API_ERR_DISABLED;
-        }
-        if (entries[slot].state == .running or entries[slot].state == .starting or entries[slot].state == .stopping) {
-            unlockRegistry(&registry_guard);
-            return API_ERR_BUSY;
-        }
-        switch (tryLifecycleEndpointForSlot(slot)) {
-            .contended => |ep| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(ep);
-                continue;
-            },
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                retireEndpointLocked(locked.endpoint, .cancelled);
-                markEntryStarting(&entries[slot]);
-                releaseTimedLock(&endpoint_guard);
-            },
-            .none => markEntryStarting(&entries[slot]),
-        }
-        out.* = .{ .slot = slot, .generation = entries[slot].start_generation, .entry = entries[slot] };
-        unlockRegistry(&registry_guard);
-        return API_OK;
-    }
+    return r4os_rust_services_start(0, nativeBytes(name), out, 0, 0, 0, emptyBytes());
 }
 
 pub fn markStarting(name: []const u8) i32 {
-    var reservation: StartReservation = .{};
-    return if (beginStart(name, &reservation) == API_OK) OK else ERR_INVALID;
-}
-
-fn startEntryLocked(reservation: *const StartReservation) ?*Entry {
-    if (reservation.slot >= entries.len or reservation.generation == 0) return null;
-    const entry = &entries[reservation.slot];
-    if (!entry.used or entry.start_generation != reservation.generation or
-        entry.start_mode == .disabled or entry.state != .starting or entry.instance_id != 0) return null;
-    return entry;
+    return r4os_rust_services_name(2, nativeBytes(name), 0, 0, 0, 0, emptyBytes());
 }
 
 pub fn completeStart(reservation: *const StartReservation, instance_id: u32, start_tick: u64) bool {
-    var guard = lockRegistry(.registry_control);
-    defer unlockRegistry(&guard);
-    const entry = startEntryLocked(reservation) orelse return false;
-    if (instance_id == 0) return false;
-    entry.state = .running;
-    entry.instance_id = instance_id;
-    entry.start_tick = start_tick;
-    entry.start_generation = 0;
-    return true;
+    return r4os_rust_services_start(1, emptyBytes(), @constCast(reservation), instance_id, start_tick, 0, emptyBytes()) != 0;
 }
 
 pub fn failStart(reservation: *const StartReservation, exit_code: i32, error_text: []const u8) void {
-    var guard = lockRegistry(.registry_control);
-    defer unlockRegistry(&guard);
-    const entry = startEntryLocked(reservation) orelse return;
-    finishEntryState(entry, alwaysFailed, exit_code, error_text);
+    _ = r4os_rust_services_start(2, emptyBytes(), @constCast(reservation), 0, 0, exit_code, nativeBytes(error_text));
 }
 
 pub fn cancelStarting(name: []const u8, generation: u64) void {
-    var guard = lockRegistry(.registry_control);
-    defer unlockRegistry(&guard);
-    const slot = findByNameIn(&entries, name) orelse return;
-    const entry = &entries[slot];
-    if (generation == 0 or entry.start_generation != generation or entry.state != .starting or entry.instance_id != 0) return;
-    finishEntryState(entry, ifEntryDisabledElseStopped, 0, "");
+    _ = r4os_rust_services_name(9, nativeBytes(name), 0, 0, 0, generation, emptyBytes());
 }
 
 pub fn markRunning(name: []const u8, instance_id: u32, start_tick: u64) i32 {
-    var registry_guard = lockRegistry(.registry_control);
-    defer unlockRegistry(&registry_guard);
-    const slot = findByNameIn(&entries, name) orelse return ERR_NOT_FOUND;
-    var e = &entries[slot];
-    if (e.start_mode == .disabled or instance_id == 0) return ERR_INVALID;
-    e.state = .running;
-    e.start_generation = 0;
-    e.instance_id = instance_id;
-    e.exit_code = 0;
-    e.start_tick = start_tick;
-    e.last_error_len = 0;
-    return OK;
+    return r4os_rust_services_name(3, nativeBytes(name), 0, instance_id, 0, start_tick, emptyBytes());
 }
 
 pub fn markStopping(name: []const u8) i32 {
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        const slot = findByNameIn(&entries, name) orelse {
-            unlockRegistry(&registry_guard);
-            return ERR_NOT_FOUND;
-        };
-        if (entries[slot].state != .running and entries[slot].state != .starting) {
-            unlockRegistry(&registry_guard);
-            return ERR_INVALID;
-        }
-        switch (tryLifecycleEndpointForSlot(slot)) {
-            .contended => |ep| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(ep);
-                continue;
-            },
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                retireEndpointLocked(locked.endpoint, .cancelled);
-                entries[slot].state = .stopping;
-                releaseTimedLock(&endpoint_guard);
-            },
-            .none => entries[slot].state = .stopping,
-        }
-        unlockRegistry(&registry_guard);
-        return OK;
-    }
+    return r4os_rust_services_name(4, nativeBytes(name), 0, 0, 0, 0, emptyBytes());
 }
 
 pub fn markStopped(name: []const u8, exit_code: i32) i32 {
-    return finishServiceState(name, ifEntryDisabledElseStopped, exit_code, "");
+    return r4os_rust_services_name(5, nativeBytes(name), 0, 0, exit_code, 0, emptyBytes());
 }
 
 pub fn markFailed(name: []const u8, exit_code: i32, error_text: []const u8) i32 {
-    return finishServiceState(name, alwaysFailed, exit_code, error_text);
+    return r4os_rust_services_name(6, nativeBytes(name), 0, 0, exit_code, 0, nativeBytes(error_text));
 }
 
 pub fn markStoppingTarget(target: ApiIndexTarget) i32 {
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        const slot = apiTargetSlotLocked(target, true) orelse {
-            unlockRegistry(&registry_guard);
-            return ERR_NOT_FOUND;
-        };
-        if (entries[slot].state != .running and entries[slot].state != .starting) {
-            unlockRegistry(&registry_guard);
-            return ERR_INVALID;
-        }
-        switch (tryLifecycleEndpointForSlot(slot)) {
-            .contended => |ep| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(ep);
-                continue;
-            },
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                retireEndpointLocked(locked.endpoint, .cancelled);
-                entries[slot].state = .stopping;
-                releaseTimedLock(&endpoint_guard);
-            },
-            .none => entries[slot].state = .stopping,
-        }
-        unlockRegistry(&registry_guard);
-        return OK;
-    }
+    return r4os_rust_services_target(0, &target, 0, emptyBytes());
 }
 
 pub fn markStoppedTarget(target: ApiIndexTarget, exit_code: i32) i32 {
-    return finishServiceTargetState(target, ifEntryDisabledElseStopped, exit_code, "");
+    return r4os_rust_services_target(1, &target, exit_code, emptyBytes());
 }
 
 pub fn markFailedTarget(target: ApiIndexTarget, exit_code: i32, error_text: []const u8) i32 {
-    return finishServiceTargetState(target, alwaysFailed, exit_code, error_text);
-}
-
-fn finishServiceTargetState(target: ApiIndexTarget, stateFor: *const fn (*const Entry) State, exit_code: i32, error_text: []const u8) i32 {
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        const slot = apiTargetSlotLocked(target, true) orelse {
-            unlockRegistry(&registry_guard);
-            return ERR_NOT_FOUND;
-        };
-        switch (tryLifecycleEndpointForSlot(slot)) {
-            .contended => |ep| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(ep);
-                continue;
-            },
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                retireEndpointLocked(locked.endpoint, .cancelled);
-                finishEntryState(&entries[slot], stateFor, exit_code, error_text);
-                releaseTimedLock(&endpoint_guard);
-            },
-            .none => finishEntryState(&entries[slot], stateFor, exit_code, error_text),
-        }
-        unlockRegistry(&registry_guard);
-        return OK;
-    }
+    return r4os_rust_services_target(2, &target, exit_code, nativeBytes(error_text));
 }
 
 pub fn bumpRestartCount(name: []const u8) i32 {
-    var registry_guard = lockRegistry(.registry_control);
-    defer unlockRegistry(&registry_guard);
-    const slot = findByNameIn(&entries, name) orelse return ERR_NOT_FOUND;
-    entries[slot].restart_count +%= 1;
-    return OK;
+    return r4os_rust_services_name(7, nativeBytes(name), 0, 0, 0, 0, emptyBytes());
 }
 
 pub fn setStartMode(name: []const u8, start_mode: StartMode) i32 {
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        const slot = findByNameIn(&entries, name) orelse {
-            unlockRegistry(&registry_guard);
-            return ERR_NOT_FOUND;
-        };
-        if (start_mode != .disabled) {
-            entries[slot].start_mode = start_mode;
-            if (entries[slot].state == .disabled) entries[slot].state = .stopped;
-            unlockRegistry(&registry_guard);
-            return OK;
-        }
-        if (entries[slot].instance_id != 0) {
-            unlockRegistry(&registry_guard);
-            return ERR_INVALID;
-        }
-        switch (tryLifecycleEndpointForSlot(slot)) {
-            .contended => |ep| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(ep);
-                continue;
-            },
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                retireEndpointLocked(locked.endpoint, .cancelled);
-                disableEntry(&entries[slot]);
-                releaseTimedLock(&endpoint_guard);
-            },
-            .none => disableEntry(&entries[slot]),
-        }
-        unlockRegistry(&registry_guard);
-        return OK;
-    }
+    return r4os_rust_services_name(8, nativeBytes(name), @intFromEnum(start_mode), 0, 0, 0, emptyBytes());
 }
 
 pub fn entryAt(index: usize) ?Entry {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    defer unlockRegistry(&registry_guard);
-    if (index >= entries.len or !entries[index].used) return null;
-    return entries[index];
+    var out: Entry = undefined;
+    return if (r4os_rust_services_get(0, index, emptyBytes(), null, &out, null)) out else null;
 }
 
 pub fn entryByName(name: []const u8) ?Entry {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    defer unlockRegistry(&registry_guard);
-    const slot = findByNameIn(&entries, name) orelse return null;
-    return entries[slot];
+    var out: Entry = undefined;
+    return if (r4os_rust_services_get(1, 0, nativeBytes(name), null, &out, null)) out else null;
 }
 
 pub fn countUsed() usize {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    defer unlockRegistry(&registry_guard);
-    return countUsedIn(&entries);
+    return r4os_rust_services_count();
 }
 
 pub fn performanceSummary() PerformanceSummary {
-    var out = PerformanceSummary{};
-    var registry_guard = lockRegistry(.registry_snapshot);
-    var i: usize = 0;
-    while (i < entries.len) : (i += 1) {
-        const e = &entries[i];
-        if (!e.used) continue;
-        out.used_services += 1;
-        if (e.state == .running) out.running_services += 1;
-    }
-    out.registry_index_queries = registry_enumeration_performance.index_queries;
-    out.registry_refresh_requests = registry_enumeration_performance.refresh_requests;
-    out.registry_refresh_visits = registry_enumeration_performance.refresh_visits;
-    out.registry_instance_lookups = registry_enumeration_performance.instance_lookups;
-    out.registry_index_end_markers = registry_enumeration_performance.index_end_markers;
-    i = 0;
-    while (i < 3) : (i += 1) addLockTiming(&out, i, registry_lock_timing[i]);
-    unlockRegistry(&registry_guard);
-
-    i = 0;
-    while (i < endpoints.len) : (i += 1) {
-        var endpoint_guard = acquireTimedLock(
-            &endpoints[i].lock,
-            &endpoints[i].lock_timing[lockFamilyIndex(.endpoint_snapshot)],
-        );
-        if (!endpoint_guard.admitted) continue;
-        const ep = &endpoints[i];
-        addEndpointLifetime(&out, ep);
-        var family_index: usize = 3;
-        while (family_index < SERVICE_LOCK_FAMILY_COUNT) : (family_index += 1) {
-            addLockTiming(&out, family_index, ep.lock_timing[family_index]);
-        }
-        if (!ep.used) {
-            releaseTimedLock(&endpoint_guard);
-            continue;
-        }
-        const counts = queueCounts(ep);
-        out.endpoints_used += 1;
-        out.request_pending +%= counts.queued + counts.delivered;
-        out.response_pending +%= counts.responded;
-        out.queue_depth_total +%= @intCast(API_ENDPOINT_QUEUE_DEPTH);
-        out.queue_used_total +%= counts.used;
-        out.queue_high_water_total +%= ep.queue_high_water;
-        out.active_workers +%= counts.delivered;
-        if (ep.max_active_workers > out.max_active_workers) out.max_active_workers = ep.max_active_workers;
-        out.open_handles +%= ep.open_handles;
-        out.requests +%= ep.requests;
-        out.responses +%= ep.responses;
-        out.drops +%= ep.drops;
-        out.busy_rejections +%= ep.busy_rejections;
-        out.timeouts +%= ep.timeouts;
-        out.cancellations +%= ep.cancellations;
-        out.completion_waits +%= ep.completion_waits;
-        out.completion_timeouts +%= ep.completion_timeouts;
-        out.completion_wait_rounds +%= ep.completion_wait_rounds;
-        out.targeted_response_wakes +%= ep.targeted_response_wakes;
-        out.targeted_response_wake_misses +%= ep.targeted_response_wake_misses;
-        out.admission_waits +%= ep.admission_waits;
-        out.admission_timeouts +%= ep.admission_timeouts;
-        releaseTimedLock(&endpoint_guard);
-    }
+    var out: PerformanceSummary = undefined;
+    r4os_rust_services_performance(&out);
     return out;
 }
 
 pub fn apiInfoAt(index: u32, out: *ApiInfo, now_ticks: u64) i32 {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    out.* = .{};
-    const slot = apiSlotAtLocked(index) orelse {
-        unlockRegistry(&registry_guard);
-        return 0;
-    };
-    fillApiInfoEntryLocked(slot, out, now_ticks);
-    const identity = endpointIdentityForSlotLocked(slot);
-    unlockRegistry(&registry_guard);
-    fillApiInfoEndpoint(identity, out);
-    return 1;
+    return r4os_rust_services_info(0, index, emptyBytes(), null, out, now_ticks);
 }
 
 pub fn apiDetailAt(index: u32, out: *ApiDetail, now_ticks: u64) i32 {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    out.* = .{};
-    const slot = apiSlotAtLocked(index) orelse {
-        unlockRegistry(&registry_guard);
-        return 0;
-    };
-    fillApiDetailEntryLocked(slot, out, now_ticks);
-    const identity = endpointIdentityForSlotLocked(slot);
-    unlockRegistry(&registry_guard);
-    fillApiInfoEndpoint(identity, &out.info);
-    return 1;
+    return r4os_rust_services_detail(0, index, emptyBytes(), null, out, now_ticks);
 }
 
 pub fn apiInfoForIndexTarget(target: ApiIndexTarget, out: *ApiInfo, now_ticks: u64) i32 {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    out.* = .{};
-    const slot = apiTargetSlotLocked(target, true) orelse {
-        unlockRegistry(&registry_guard);
-        return API_ERR_BUSY;
-    };
-    fillApiInfoEntryLocked(slot, out, now_ticks);
-    const identity = endpointIdentityForSlotLocked(slot);
-    unlockRegistry(&registry_guard);
-    fillApiInfoEndpoint(identity, out);
-    return 1;
+    return r4os_rust_services_info(1, 0, emptyBytes(), &target, out, now_ticks);
 }
 
 pub fn apiDetailForIndexTarget(target: ApiIndexTarget, out: *ApiDetail, now_ticks: u64) i32 {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    out.* = .{};
-    const slot = apiTargetSlotLocked(target, true) orelse {
-        unlockRegistry(&registry_guard);
-        return API_ERR_BUSY;
-    };
-    fillApiDetailEntryLocked(slot, out, now_ticks);
-    const identity = endpointIdentityForSlotLocked(slot);
-    unlockRegistry(&registry_guard);
-    fillApiInfoEndpoint(identity, &out.info);
-    return 1;
+    return r4os_rust_services_detail(1, 0, emptyBytes(), &target, out, now_ticks);
 }
 
 pub fn apiStatus(name: []const u8, out: *ApiInfo, now_ticks: u64) i32 {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    out.* = .{};
-    const slot = findByNameIn(&entries, name) orelse {
-        unlockRegistry(&registry_guard);
-        return API_ERR_NOT_FOUND;
-    };
-    fillApiInfoEntryLocked(slot, out, now_ticks);
-    const identity = endpointIdentityForSlotLocked(slot);
-    unlockRegistry(&registry_guard);
-    fillApiInfoEndpoint(identity, out);
-    return API_OK;
+    return r4os_rust_services_info(2, 0, nativeBytes(name), null, out, now_ticks);
 }
 
 pub fn apiDetailByName(name: []const u8, out: *ApiDetail, now_ticks: u64) i32 {
-    var registry_guard = lockRegistry(.registry_snapshot);
-    out.* = .{};
-    const slot = findByNameIn(&entries, name) orelse {
-        unlockRegistry(&registry_guard);
-        return API_ERR_NOT_FOUND;
-    };
-    fillApiDetailEntryLocked(slot, out, now_ticks);
-    const identity = endpointIdentityForSlotLocked(slot);
-    unlockRegistry(&registry_guard);
-    fillApiInfoEndpoint(identity, &out.info);
-    return API_OK;
+    return r4os_rust_services_detail(2, 0, nativeBytes(name), null, out, now_ticks);
 }
 
 pub fn apiOpen(name: []const u8, out: *ApiInfo, now_ticks: u64) i32 {
-    var registry_guard = lockRegistry(.registry_lookup);
-    out.* = .{};
-    const slot = findByNameIn(&entries, name) orelse {
-        unlockRegistry(&registry_guard);
-        return API_ERR_NOT_FOUND;
-    };
-    fillApiInfoEntryLocked(slot, out, now_ticks);
-    if (entries[slot].state != .running or entries[slot].instance_id == 0) {
-        unlockRegistry(&registry_guard);
-        return API_ERR_NOT_RUNNING;
-    }
-    const identity = endpointIdentityForSlotLocked(slot) orelse {
-        unlockRegistry(&registry_guard);
-        return API_ERR_NO_ENDPOINT;
-    };
-    unlockRegistry(&registry_guard);
-
-    var endpoint_lease = lockEndpointIdentity(identity, .endpoint_data) orelse return API_ERR_NOT_RUNNING;
-    defer unlockEndpoint(&endpoint_lease);
-    endpoint_lease.endpoint.open_handles +%= 1;
-    fillApiInfoEndpointLocked(endpoint_lease.endpoint, out);
-    return API_OK;
+    return r4os_rust_services_info(3, 0, nativeBytes(name), null, out, now_ticks);
 }
 
 pub fn apiClose(handle: u32) i32 {
-    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    if (endpoint_lease.endpoint.open_handles > 0) endpoint_lease.endpoint.open_handles -= 1;
-    return API_OK;
+    return r4os_rust_services_endpoint_control(0, handle, 0, 0);
 }
 
 pub fn registerEndpoint(name: []const u8, instance_id: u32, flags: u32, out: *ApiInfo, now_ticks: u64) i32 {
-    if (instance_id == 0) return API_ERR_INVALID;
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        out.* = .{};
-        const slot = findByNameIn(&entries, name) orelse {
-            unlockRegistry(&registry_guard);
-            return API_ERR_NOT_FOUND;
-        };
-        fillApiInfoEntryLocked(slot, out, now_ticks);
-        const e = &entries[slot];
-        if (e.state != .running or e.instance_id != instance_id) {
-            unlockRegistry(&registry_guard);
-            return API_ERR_NOT_RUNNING;
-        }
-
-        const endpoint_index = endpointForSlot(slot) orelse freeEndpointSlot() orelse {
-            unlockRegistry(&registry_guard);
-            return API_ERR_FULL;
-        };
-        const ep = &endpoints[endpoint_index];
-        switch (tryLifecycleEndpoint(ep)) {
-            .contended => |contended| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(contended);
-                continue;
-            },
-            .none => unreachable,
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                if (!ep.used) {
-                    resetEndpointMetadata(ep, true);
-                    advanceEndpointGeneration(ep);
-                    ep.used = true;
-                    ep.service_slot = slot;
-                    ep.handle = allocateEndpointHandle();
-                }
-                ep.flags = flags;
-                fillApiInfoEndpointLocked(ep, out);
-                releaseTimedLock(&endpoint_guard);
-                unlockRegistry(&registry_guard);
-                return API_OK;
-            },
-        }
-    }
+    return r4os_rust_services_endpoint_register(nativeBytes(name), instance_id, flags, out, now_ticks);
 }
 
 pub fn unregisterEndpoint(handle: u32) i32 {
-    while (true) {
-        var registry_guard = lockRegistry(.registry_control);
-        switch (tryLifecycleEndpointForHandle(handle)) {
-            .none => {
-                unlockRegistry(&registry_guard);
-                return API_ERR_BAD_HANDLE;
-            },
-            .contended => |ep| {
-                unlockRegistry(&registry_guard);
-                waitForEndpointLifecycle(ep);
-                continue;
-            },
-            .locked => |locked| {
-                var endpoint_guard = locked.guard;
-                retireEndpointLocked(locked.endpoint, .cancelled);
-                releaseTimedLock(&endpoint_guard);
-                unlockRegistry(&registry_guard);
-                return API_OK;
-            },
-        }
-    }
+    return r4os_rust_services_endpoint_control(1, handle, 0, 0);
 }
 
 pub fn endpointPoll(handle: u32) i32 {
-    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    return @intCast(queueCounts(endpoint_lease.endpoint).queued);
-}
-
-// 0.56.19: Blockierendes Endpoint-API (Befund 8.5). Wartet auf der
-// vorhandenen requests_available-WaitQueue des Endpoints, bis Requests
-// anliegen oder der Timeout ablaeuft. Seit 0.69.9 uebergibt der persistente
-// Endpoint-Lock atomar an die WaitQueue; weder Endpoint- noch Registry-Lock
-// werden ueber den Schlaf gehalten. Das Praedikat schliesst weiterhin das
-// Lost-Wakeup-Fenster zwischen Unlock und Enrollment.
-const EndpointWaitContext = struct {
-    identity: EndpointIdentity,
-};
-
-fn endpointWaitStillNeeded(raw: *anyopaque) bool {
-    const ctx: *EndpointWaitContext = @ptrCast(@alignCast(raw));
-    return identityMatches(ctx.identity.endpoint, ctx.identity) and
-        !hasQueuedRequest(ctx.identity.endpoint);
+    return r4os_rust_services_endpoint_control(2, handle, 0, 0);
 }
 
 pub fn endpointWait(handle: u32, timeout_ticks: u64) i32 {
-    const identity = lookupEndpointIdentity(handle) orelse return API_ERR_BAD_HANDLE;
-    var endpoint_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    const queued = queueCounts(endpoint_lease.endpoint).queued;
-    if (queued > 0) {
-        return @intCast(queued);
-    }
-    var wait_ctx = EndpointWaitContext{ .identity = identity };
-    const wait_result = endpoint_lease.endpoint.requests_available.waitUnlessReleasing(
-        timeout_ticks,
-        "svc-endpoint",
-        endpointWaitStillNeeded,
-        &wait_ctx,
-        releaseTimedLockForWait,
-        &endpoint_lease.guard,
-    );
-
-    var result_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return switch (wait_result) {
-        .cancelled, .killed => API_ERR_NOT_RUNNING,
-        else => API_ERR_BAD_HANDLE,
-    };
-    defer unlockEndpoint(&result_lease);
-    return @intCast(queueCounts(result_lease.endpoint).queued);
+    return r4os_rust_services_endpoint_control(3, handle, 0, timeout_ticks);
 }
 
 pub fn submitRequest(handle: u32, client_id: u32, op: u16, payload: []const u8) i32 {
-    if (op == 0) return API_ERR_INVALID;
-    if (payload.len > API_MAX_PAYLOAD) return API_ERR_PAYLOAD_TOO_LARGE;
-    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    const ep = endpoint_lease.endpoint;
-    if (!ep.slots_available.tryAcquire()) {
-        ep.busy_rejections +%= 1;
-        return API_ERR_BUSY;
-    }
-    return publishRequestLocked(ep, client_id, op, payload);
+    return r4os_rust_services_request(handle, client_id, op, nativeBytes(payload), 0, false, null);
 }
 
 pub fn submitRequestWait(handle: u32, client_id: u32, op: u16, payload: []const u8, timeout_ticks: u64) i32 {
-    return submitRequestWaitInternal(handle, client_id, op, payload, timeout_ticks, null);
+    return r4os_rust_services_request(handle, client_id, op, nativeBytes(payload), timeout_ticks, true, null);
 }
 
 pub fn submitRequestWaitGuarded(
@@ -1341,800 +507,402 @@ pub fn submitRequestWaitGuarded(
     timeout_ticks: u64,
     publish_unwind: *task_context.UnwindToken,
 ) i32 {
-    publish_unwind.* = .{};
-    return submitRequestWaitInternal(handle, client_id, op, payload, timeout_ticks, publish_unwind);
-}
-
-fn submitRequestWaitInternal(
-    handle: u32,
-    client_id: u32,
-    op: u16,
-    payload: []const u8,
-    timeout_ticks: u64,
-    publish_unwind: ?*task_context.UnwindToken,
-) i32 {
-    if (op == 0) return API_ERR_INVALID;
-    if (payload.len > API_MAX_PAYLOAD) return API_ERR_PAYLOAD_TOO_LARGE;
-
-    const forever = timeout_ticks == sync.WAIT_FOREVER;
-    const deadline = if (forever) @as(u64, 0) else timer.deadlineAfterNow(timeout_ticks);
-    const identity = lookupEndpointIdentity(handle) orelse return API_ERR_BAD_HANDLE;
-    var endpoint_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    var ep = endpoint_lease.endpoint;
-    if (timeout_ticks != 0 and !forever and timer.tickCount() >= deadline) {
-        ep.timeouts +%= 1;
-        ep.admission_timeouts +%= 1;
-        return API_ERR_TIMEOUT;
-    }
-    if (ep.slots_available.tryAcquire()) {
-        return publishRequestWithOptionalUnwindLocked(ep, client_id, op, payload, publish_unwind, .{});
-    }
-
-    if (timeout_ticks == 0) {
-        ep.busy_rejections +%= 1;
-        return API_ERR_BUSY;
-    }
-
-    const now = timer.tickCount();
-    if (!forever and now >= deadline) {
-        ep.timeouts +%= 1;
-        ep.admission_timeouts +%= 1;
-        return API_ERR_TIMEOUT;
-    }
-    ep.admission_waits +%= 1;
-    const remaining = if (forever) sync.WAIT_FOREVER else deadline - now;
-    var admission_unwind: task_context.UnwindToken = .{};
-    const wait_result = ep.slots_available.acquireReleasingGuarded(
-        remaining,
-        releaseTimedLockForWait,
-        &endpoint_lease.guard,
-        &admission_unwind,
-    );
-
-    var result_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse {
-        leaveAdmissionUnwind(&admission_unwind);
-        return switch (wait_result) {
-            .cancelled, .killed => API_ERR_NOT_RUNNING,
-            else => API_ERR_BAD_HANDLE,
-        };
-    };
-    defer unlockEndpoint(&result_lease);
-    ep = result_lease.endpoint;
-    switch (wait_result) {
-        .signaled => {},
-        .timeout => {
-            ep.timeouts +%= 1;
-            ep.admission_timeouts +%= 1;
-            return API_ERR_TIMEOUT;
-        },
-        .cancelled, .killed => {
-            leaveAdmissionUnwind(&admission_unwind);
-            return API_ERR_NOT_RUNNING;
-        },
-        .none, .failed => {
-            leaveAdmissionUnwind(&admission_unwind);
-            return API_ERR_BUSY;
-        },
-    }
-    if (!forever and timer.tickCount() >= deadline) {
-        _ = ep.slots_available.release(1);
-        leaveAdmissionUnwind(&admission_unwind);
-        ep.timeouts +%= 1;
-        ep.admission_timeouts +%= 1;
-        return API_ERR_TIMEOUT;
-    }
-    return publishRequestWithOptionalUnwindLocked(ep, client_id, op, payload, publish_unwind, admission_unwind);
-}
-
-fn publishRequestWithOptionalUnwindLocked(
-    ep: *Endpoint,
-    client_id: u32,
-    op: u16,
-    payload: []const u8,
-    publish_unwind: ?*task_context.UnwindToken,
-    acquired_unwind: task_context.UnwindToken,
-) i32 {
-    var owned_unwind = acquired_unwind;
-    if (publish_unwind) |out| {
-        if (!owned_unwind.active) {
-            owned_unwind = task_context.enterUnwind();
-            if (!owned_unwind.admitted()) {
-                _ = ep.slots_available.release(1);
-                return API_ERR_BUSY;
-            }
-        }
-        out.* = owned_unwind;
-    }
-    const result = publishRequestLocked(ep, client_id, op, payload);
-    if (result <= 0) {
-        leaveAdmissionUnwind(&owned_unwind);
-        if (publish_unwind) |out| out.* = .{};
-    } else if (publish_unwind == null) {
-        leaveAdmissionUnwind(&owned_unwind);
-    }
-    return result;
-}
-
-fn leaveAdmissionUnwind(unwind: *task_context.UnwindToken) void {
-    if (unwind.active) _ = task_context.leaveUnwind(unwind.*);
-    unwind.* = .{};
-}
-
-fn publishRequestLocked(ep: *Endpoint, client_id: u32, op: u16, payload: []const u8) i32 {
-    const slot_idx = freeRequestSlot(ep) orelse {
-        _ = ep.slots_available.release(1);
-        ep.busy_rejections +%= 1;
-        return API_ERR_BUSY;
-    };
-    var slot = &ep.queue[slot_idx];
-    const request_id = allocateRequestId(ep);
-    resetRequestSlotMetadata(slot);
-    slot.request_id = request_id;
-    slot.client_id = client_id;
-    slot.op = op;
-    slot.flags = ep.flags;
-    slot.request_len = @intCast(payload.len);
-    if (payload.len > 0) {
-        @memcpy(slot.request_payload[0..payload.len], payload);
-        ep.lifetime.payload_copy_bytes +%= payload.len;
-    }
-    // Der Zustand wird zuletzt publiziert. Damit sind nur die neu gesetzten
-    // Laengen sichtbar; alte Bytes hinter request_len bleiben unerreichbar.
-    ep.queued_slots[ep.queued_count] = slot_idx;
-    ep.queued_count += 1;
-    slot.state = .queued;
-    ep.requests +%= 1;
-    noteQueueHighWater(ep);
-    _ = ep.requests_available.wakeOne();
-    return @intCast(request_id);
+    return r4os_rust_services_request(handle, client_id, op, nativeBytes(payload), timeout_ticks, true, publish_unwind);
 }
 
 pub fn recvRequest(handle: u32, header: *ApiMessageHeader, out: []u8) i32 {
-    clearMessageHeader(header);
-    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    const ep = endpoint_lease.endpoint;
-    const slot_idx = queuedRequestSlot(ep) orelse return 0;
-    var slot = &ep.queue[slot_idx];
-    const len: usize = @intCast(slot.request_len);
-    if (out.len < len) {
-        fillMessageHeader(slot, header, slot.request_len, API_OK);
-        return API_ERR_BUFFER_TOO_SMALL;
-    }
-    if (len > 0) {
-        @memcpy(out[0..len], slot.request_payload[0..len]);
-        ep.lifetime.payload_copy_bytes +%= len;
-    }
-    fillMessageHeader(slot, header, slot.request_len, API_OK);
-    removeQueuedSlot(ep, slot);
-    slot.state = .delivered;
-    noteActiveWorkers(ep);
-    return @intCast(len);
+    return r4os_rust_services_recv(handle, 0, true, header, out.ptr, out.len);
 }
 
 pub fn reply(handle: u32, request_id: u32, status: i32, payload: []const u8) i32 {
-    if (payload.len > API_MAX_PAYLOAD) return API_ERR_PAYLOAD_TOO_LARGE;
-    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    const ep = endpoint_lease.endpoint;
-    const slot_idx = deliveredRequestSlotById(ep, request_id) orelse return API_ERR_NOT_FOUND;
-    var slot = &ep.queue[slot_idx];
-    if (payload.len > 0) {
-        @memcpy(slot.response_payload[0..payload.len], payload);
-        ep.lifetime.payload_copy_bytes +%= payload.len;
-    }
-    slot.response_len = @intCast(payload.len);
-    slot.response_status = status;
-    slot.state = .responded;
-    ep.responses +%= 1;
-    if (slot.response_available.wakeOne() != 0) {
-        ep.targeted_response_wakes +%= 1;
-    } else {
-        ep.targeted_response_wake_misses +%= 1;
-    }
-    return API_OK;
+    return r4os_rust_services_reply(handle, request_id, status, nativeBytes(payload));
 }
 
 pub fn takeResponse(handle: u32, request_id: u32, header: *ApiMessageHeader, out: []u8) i32 {
-    clearMessageHeader(header);
-    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    const ep = endpoint_lease.endpoint;
-    const slot_idx = respondedRequestSlotById(ep, request_id) orelse return 0;
-    var slot = &ep.queue[slot_idx];
-    const len: usize = @intCast(slot.response_len);
-    fillMessageHeader(slot, header, slot.response_len, slot.response_status);
-    if (out.len < len) {
-        clearRequestSlot(ep, slot);
-        _ = ep.slots_available.release(1);
-        return API_ERR_BUFFER_TOO_SMALL;
-    }
-    if (len > 0) {
-        @memcpy(out[0..len], slot.response_payload[0..len]);
-        ep.lifetime.payload_copy_bytes +%= len;
-    }
-    clearRequestSlot(ep, slot);
-    _ = ep.slots_available.release(1);
-    return @intCast(len);
-}
-
-const ResponseWaitContext = struct {
-    identity: EndpointIdentity,
-    slot: *RequestSlot,
-    request_id: u32,
-};
-
-fn responseWaitStillNeeded(raw: *anyopaque) bool {
-    const ctx: *ResponseWaitContext = @ptrCast(@alignCast(raw));
-    return identityMatches(ctx.identity.endpoint, ctx.identity) and
-        ctx.slot.request_id == ctx.request_id and
-        ctx.slot.state != .free and
-        ctx.slot.state != .responded;
+    return r4os_rust_services_recv(handle, request_id, false, header, out.ptr, out.len);
 }
 
 pub fn waitResponse(handle: u32, request_id: u32, timeout_ticks: u64) i32 {
-    if (request_id == 0) return API_ERR_INVALID;
-    const identity = lookupEndpointIdentity(handle) orelse return API_ERR_BAD_HANDLE;
-    var endpoint_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    var ep = endpoint_lease.endpoint;
-    const slot_idx = requestSlotById(ep, request_id) orelse return API_ERR_NOT_FOUND;
-    if (ep.queue[slot_idx].state == .responded) return API_OK;
-    ep.completion_waits +%= 1;
-    ep.completion_wait_rounds +%= 1;
-    var wait_ctx = ResponseWaitContext{
-        .identity = identity,
-        .slot = &ep.queue[slot_idx],
-        .request_id = request_id,
-    };
-    const wait_result = wait_ctx.slot.response_available.waitUnlessReleasing(
-        timeout_ticks,
-        "service-response",
-        responseWaitStillNeeded,
-        &wait_ctx,
-        releaseTimedLockForWait,
-        &endpoint_lease.guard,
-    );
-
-    var result_lease = lockEndpointIdentity(identity, .endpoint_wait) orelse return switch (wait_result) {
-        .cancelled, .killed => API_ERR_NOT_RUNNING,
-        else => API_ERR_BAD_HANDLE,
-    };
-    defer unlockEndpoint(&result_lease);
-    ep = result_lease.endpoint;
-    if (wait_result == .timeout) {
-        ep.timeouts +%= 1;
-        ep.completion_timeouts +%= 1;
-        return API_ERR_TIMEOUT;
-    }
-    if (wait_result == .cancelled or wait_result == .killed) return API_ERR_NOT_RUNNING;
-    if (wait_result == .none or wait_result == .failed) return API_ERR_BUSY;
-    const result_slot = requestSlotById(ep, request_id) orelse return API_ERR_NOT_FOUND;
-    return if (ep.queue[result_slot].state == .responded) API_OK else API_ERR_BUSY;
+    return r4os_rust_services_endpoint_control(4, handle, request_id, timeout_ticks);
 }
 
 pub fn cancelRequest(handle: u32, request_id: u32) i32 {
-    var endpoint_lease = lockEndpointForHandle(handle, .endpoint_data) orelse return API_ERR_BAD_HANDLE;
-    defer unlockEndpoint(&endpoint_lease);
-    const ep = endpoint_lease.endpoint;
-    const slot_idx = requestSlotById(ep, request_id) orelse return API_ERR_NOT_FOUND;
-    ep.drops +%= 1;
-    ep.cancellations +%= 1;
-    clearRequestSlot(ep, &ep.queue[slot_idx]);
-    _ = ep.slots_available.release(1);
-    return API_OK;
+    return r4os_rust_services_endpoint_control(5, handle, request_id, 0);
 }
 
 pub fn stateName(state: State) []const u8 {
-    return switch (state) {
-        .empty => "empty",
-        .stopped => "stopped",
-        .starting => "starting",
-        .running => "running",
-        .stopping => "stopping",
-        .failed => "failed",
-        .disabled => "disabled",
-    };
+    const value = r4os_rust_services_label(false, @intFromEnum(state));
+    return value.data[0..value.len];
 }
 
 pub fn startModeName(start_mode: StartMode) []const u8 {
-    return switch (start_mode) {
-        .manual => "manual",
-        .auto => "auto",
-        .disabled => "disabled",
-    };
+    const value = r4os_rust_services_label(true, @intFromEnum(start_mode));
+    return value.data[0..value.len];
 }
 
 pub fn parseStartMode(value: []const u8) ?StartMode {
-    if (nameEq(value, "manual")) return .manual;
-    if (nameEq(value, "auto")) return .auto;
-    if (nameEq(value, "disabled") or nameEq(value, "disable")) return .disabled;
-    return null;
-}
-
-fn registerIn(table: *[MAX_SERVICES]Entry, name: []const u8, path: []const u8, args: []const u8, start_mode: StartMode, description: []const u8) i32 {
-    if (!isValidName(name) or !hasR4xExtension(path) or path.len >= MAX_PATH or args.len >= MAX_ARGS or description.len >= MAX_DESCRIPTION) return ERR_INVALID;
-    if (!isRegistryValueSafe(path) or !isRegistryValueSafe(args) or !isRegistryValueSafe(description)) return ERR_INVALID;
-    if (findByNameIn(table, name) != null) return ERR_DUPLICATE;
-    const slot = freeSlotIn(table) orelse return ERR_FULL;
-    var e = &table[slot];
-    e.* = .{
-        .used = true,
-        .state = if (start_mode == .disabled) .disabled else .stopped,
-        .start_mode = start_mode,
-    };
-    e.name_len = copy(name, e.name[0..]);
-    e.path_len = copy(path, e.path[0..]);
-    e.args_len = copy(args, e.args[0..]);
-    e.description_len = copy(description, e.description[0..]);
-    return @intCast(slot);
-}
-
-fn unregisterIn(table: *[MAX_SERVICES]Entry, name: []const u8) i32 {
-    const slot = findByNameIn(table, name) orelse return ERR_NOT_FOUND;
-    table[slot] = .{};
-    return OK;
-}
-
-fn setStateIn(table: *[MAX_SERVICES]Entry, name: []const u8, state: State, instance_id: u32, exit_code: i32, error_text: []const u8) i32 {
-    if (state == .empty) return ERR_INVALID;
-    const slot = findByNameIn(table, name) orelse return ERR_NOT_FOUND;
-    var e = &table[slot];
-    e.state = state;
-    e.start_generation = 0;
-    e.instance_id = instance_id;
-    e.exit_code = exit_code;
-    e.last_error_len = copy(error_text, e.last_error[0..]);
-    return OK;
-}
-
-fn markRunningIn(table: *[MAX_SERVICES]Entry, name: []const u8, instance_id: u32, start_tick: u64) i32 {
-    const slot = findByNameIn(table, name) orelse return ERR_NOT_FOUND;
-    var e = &table[slot];
-    if (e.start_mode == .disabled or instance_id == 0) return ERR_INVALID;
-    e.state = .running;
-    e.start_generation = 0;
-    e.instance_id = instance_id;
-    e.exit_code = 0;
-    e.start_tick = start_tick;
-    e.last_error_len = 0;
-    return OK;
-}
-
-fn bumpRestartCountIn(table: *[MAX_SERVICES]Entry, name: []const u8) i32 {
-    const slot = findByNameIn(table, name) orelse return ERR_NOT_FOUND;
-    table[slot].restart_count +%= 1;
-    return OK;
-}
-
-fn countUsedIn(table: *const [MAX_SERVICES]Entry) usize {
-    var count: usize = 0;
-    for (table) |entry| {
-        if (entry.used) count += 1;
-    }
-    return count;
-}
-
-fn freeSlotIn(table: *const [MAX_SERVICES]Entry) ?usize {
-    var i: usize = 0;
-    while (i < table.len) : (i += 1) {
-        if (!table[i].used) return i;
-    }
-    return null;
-}
-
-fn findByNameIn(table: *const [MAX_SERVICES]Entry, name: []const u8) ?usize {
-    if (name.len == 0) return null;
-    var i: usize = 0;
-    while (i < table.len) : (i += 1) {
-        const e = &table[i];
-        if (e.used and nameEq(e.name[0..e.name_len], name)) return i;
-    }
-    return null;
-}
-
-fn resetEndpoints() void {
-    for (&endpoints) |*ep| {
-        if (ep.used) wakeEndpointWaiters(ep, .cancelled);
-        resetEndpointMetadata(ep, false);
-        ep.lock = sync.Mutex.initClass("service-endpoint", sync.LockRank.service_endpoint, .sleepable);
-        ep.generation = 0;
-        ep.request_id_next = 0;
-        ep.request_id_limit = 0;
-        ep.lifetime = .{};
-        ep.lock_timing = .{LockTiming{}} ** SERVICE_LOCK_FAMILY_COUNT;
-    }
-    next_endpoint_handle = 1;
-    next_request_id = 1;
-}
-
-fn resetRegistryState() void {
-    entries = .{Entry{}} ** MAX_SERVICES;
-    registry_lock = sync.Mutex.initClass("service-registry", sync.LockRank.service_registry, .sleepable);
-    registry_lock_timing = .{LockTiming{}} ** SERVICE_LOCK_FAMILY_COUNT;
-    api_index_slots = .{API_INDEX_INVALID_SLOT} ** MAX_SERVICES;
-    api_index_count = 0;
-    registry_generation = 1;
-    next_start_generation = 0;
-    registry_enumeration_performance = .{};
-    resetEndpoints();
-}
-
-fn freeEndpointSlot() ?usize {
-    var i: usize = 0;
-    while (i < endpoints.len) : (i += 1) {
-        if (!endpoints[i].used) return i;
-    }
-    return null;
-}
-
-fn endpointForSlot(slot: usize) ?usize {
-    var i: usize = 0;
-    while (i < endpoints.len) : (i += 1) {
-        if (endpoints[i].used and endpoints[i].service_slot == slot) return i;
-    }
-    return null;
-}
-
-fn endpointForHandle(handle: u32) ?usize {
-    if (handle == 0) return null;
-    var i: usize = 0;
-    while (i < endpoints.len) : (i += 1) {
-        if (endpoints[i].used and endpoints[i].handle == handle) return i;
-    }
-    return null;
-}
-
-fn noteQueueScan(ep: *Endpoint, slots: usize) void {
-    ep.lifetime.queue_scan_passes +%= 1;
-    ep.lifetime.queue_scan_slots +%= slots;
-}
-
-fn freeRequestSlot(ep: *Endpoint) ?usize {
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == .free) {
-            noteQueueScan(ep, i + 1);
-            return i;
-        }
-    }
-    noteQueueScan(ep, ep.queue.len);
-    return null;
-}
-
-fn queuedRequestSlot(ep: *Endpoint) ?usize {
-    if (ep.queued_count == 0) return null;
-    noteQueueScan(ep, 1);
-    return ep.queued_slots[0];
-}
-
-fn hasQueuedRequest(ep: *const Endpoint) bool {
-    return ep.queued_count != 0;
-}
-
-fn removeQueuedSlot(ep: *Endpoint, slot: *const RequestSlot) void {
-    for (ep.queued_slots[0..ep.queued_count], 0..) |slot_index, index| {
-        if (&ep.queue[slot_index] != slot) continue;
-        noteQueueScan(ep, index + 1);
-        std.mem.copyForwards(usize, ep.queued_slots[index .. ep.queued_count - 1], ep.queued_slots[index + 1 .. ep.queued_count]);
-        ep.queued_count -= 1;
-        return;
-    }
-    unreachable; // All callers hold the endpoint owner and remove a queued slot.
-}
-
-fn requestSlotById(ep: *Endpoint, request_id: u32) ?usize {
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state != .free and ep.queue[i].request_id == request_id) {
-            noteQueueScan(ep, i + 1);
-            return i;
-        }
-    }
-    noteQueueScan(ep, ep.queue.len);
-    return null;
-}
-
-fn deliveredRequestSlotById(ep: *Endpoint, request_id: u32) ?usize {
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == .delivered and ep.queue[i].request_id == request_id) {
-            noteQueueScan(ep, i + 1);
-            return i;
-        }
-    }
-    noteQueueScan(ep, ep.queue.len);
-    return null;
-}
-
-fn respondedRequestSlotById(ep: *Endpoint, request_id: u32) ?usize {
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state == .responded and ep.queue[i].request_id == request_id) {
-            noteQueueScan(ep, i + 1);
-            return i;
-        }
-    }
-    noteQueueScan(ep, ep.queue.len);
-    return null;
-}
-
-fn queueCounts(ep: *Endpoint) QueueCounts {
-    var counts = QueueCounts{};
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        switch (ep.queue[i].state) {
-            .free => {},
-            .queued => counts.queued += 1,
-            .delivered => counts.delivered += 1,
-            .responded => counts.responded += 1,
-        }
-    }
-    counts.used = counts.queued + counts.delivered + counts.responded;
-    noteQueueScan(ep, ep.queue.len);
-    return counts;
-}
-
-fn noteQueueHighWater(ep: *Endpoint) void {
-    const used = queueCounts(ep).used;
-    if (used > ep.queue_high_water) ep.queue_high_water = used;
-}
-
-fn noteActiveWorkers(ep: *Endpoint) void {
-    const active = queueCounts(ep).delivered;
-    if (active > ep.max_active_workers) ep.max_active_workers = active;
-}
-
-fn clearRequestSlot(ep: *Endpoint, slot: *RequestSlot) void {
-    if (slot.state == .queued) removeQueuedSlot(ep, slot);
-    _ = slot.response_available.close(.cancelled);
-    resetRequestSlotMetadata(slot);
-    ep.lifetime.slot_metadata_resets +%= 1;
-}
-
-fn resetRequestSlotMetadata(slot: *RequestSlot) void {
-    slot.state = .free;
-    slot.request_id = 0;
-    slot.client_id = 0;
-    slot.op = 0;
-    slot.flags = 0;
-    slot.request_len = 0;
-    slot.response_len = 0;
-    slot.response_status = API_OK;
-    slot.response_available = sync.WaitQueue.init();
-}
-
-fn retireEndpointLocked(ep: *Endpoint, result: sync.WaitResult) void {
-    wakeEndpointWaiters(ep, result);
-    resetEndpointMetadata(ep, true);
-}
-
-fn resetEndpointMetadata(ep: *Endpoint, count_reset: bool) void {
-    ep.used = false;
-    ep.service_slot = 0;
-    ep.handle = 0;
-    ep.flags = 0;
-    ep.queue_high_water = 0;
-    ep.max_active_workers = 0;
-    ep.open_handles = 0;
-    ep.requests = 0;
-    ep.responses = 0;
-    ep.drops = 0;
-    ep.busy_rejections = 0;
-    ep.timeouts = 0;
-    ep.cancellations = 0;
-    ep.completion_waits = 0;
-    ep.completion_timeouts = 0;
-    ep.completion_wait_rounds = 0;
-    ep.targeted_response_wakes = 0;
-    ep.targeted_response_wake_misses = 0;
-    ep.admission_waits = 0;
-    ep.admission_timeouts = 0;
-    ep.queued_count = 0;
-    ep.requests_available = sync.WaitQueue.init();
-    ep.slots_available = sync.Semaphore.init(@intCast(API_ENDPOINT_QUEUE_DEPTH), @intCast(API_ENDPOINT_QUEUE_DEPTH));
-    for (&ep.queue) |*slot| resetRequestSlotMetadata(slot);
-    if (count_reset) ep.lifetime.endpoint_metadata_resets +%= 1;
-}
-
-fn wakeEndpointWaiters(ep: *Endpoint, result: sync.WaitResult) void {
-    var i: usize = 0;
-    while (i < ep.queue.len) : (i += 1) {
-        if (ep.queue[i].state != .free) {
-            _ = ep.queue[i].response_available.close(result);
-        }
-    }
-    _ = ep.requests_available.close(result);
-    _ = ep.slots_available.queue.close(result);
-}
-
-fn advanceEndpointGeneration(ep: *Endpoint) void {
-    ep.generation +%= 1;
-    if (ep.generation == 0) ep.generation = 1;
-}
-
-fn allocateEndpointHandle() u32 {
-    const handle = next_endpoint_handle;
-    next_endpoint_handle +%= 1;
-    if (next_endpoint_handle == 0) next_endpoint_handle = 1;
-    return if (handle == 0) 1 else handle;
-}
-
-fn allocateRequestId(ep: *Endpoint) u32 {
-    return allocateRequestIdFrom(ep, &next_request_id);
-}
-
-fn allocateRequestIdFrom(ep: *Endpoint, counter: *u32) u32 {
-    if (ep.request_id_next != 0 and ep.request_id_next <= ep.request_id_limit) {
-        const id = ep.request_id_next;
-        ep.request_id_next += 1;
-        return id;
-    }
-
-    var observed = @atomicLoad(u32, counter, .monotonic);
-    while (true) {
-        const first: u32 = if (observed == 0 or observed > REQUEST_ID_MAX) 1 else observed;
-        const available = REQUEST_ID_MAX - first + 1;
-        const count = @min(REQUEST_ID_BLOCK_SIZE, available);
-        const after = first + count;
-        const next_global: u32 = if (after > REQUEST_ID_MAX) 1 else after;
-        if (@cmpxchgWeak(u32, counter, observed, next_global, .monotonic, .monotonic)) |actual| {
-            observed = actual;
-        } else {
-            ep.request_id_next = first + 1;
-            ep.request_id_limit = first + count - 1;
-            return first;
-        }
-    }
-}
-
-fn fillApiInfoEntryLocked(slot: usize, out: *ApiInfo, now_ticks: u64) void {
-    out.* = .{};
-    if (slot >= entries.len or !entries[slot].used) return;
-    const e = &entries[slot];
-    out.state = stateCode(e.state);
-    out.start_mode = startModeCode(e.start_mode);
-    out.instance_id = e.instance_id;
-    out.exit_code = e.exit_code;
-    out.restart_count = e.restart_count;
-    out.start_tick = e.start_tick;
-    if (e.state == .running and e.start_tick != 0 and now_ticks >= e.start_tick) {
-        out.uptime_ticks = now_ticks - e.start_tick;
-    }
-    if (e.name_len > 0) @memcpy(out.name[0..e.name_len], e.name[0..e.name_len]);
-    if (e.last_error_len > 0) @memcpy(out.last_error[0..e.last_error_len], e.last_error[0..e.last_error_len]);
-}
-
-fn fillApiInfoEndpoint(identity: ?EndpointIdentity, out: *ApiInfo) void {
-    const exact = identity orelse return;
-    var endpoint_lease = lockEndpointIdentity(exact, .endpoint_snapshot) orelse return;
-    defer unlockEndpoint(&endpoint_lease);
-    fillApiInfoEndpointLocked(endpoint_lease.endpoint, out);
-}
-
-fn fillApiInfoEndpointLocked(ep: *Endpoint, out: *ApiInfo) void {
-    const counts = queueCounts(ep);
-    out.handle = ep.handle;
-    out.flags |= API_FLAG_ENDPOINT;
-    out.flags |= API_FLAG_QUEUE_BACKED;
-    if (counts.queued != 0 or counts.delivered != 0) out.flags |= API_FLAG_REQUEST_PENDING;
-    if (counts.responded != 0) out.flags |= API_FLAG_RESPONSE_PENDING;
-    out.requests = ep.requests;
-    out.responses = ep.responses;
-    out.drops = ep.drops;
-    out.queue_depth = @intCast(API_ENDPOINT_QUEUE_DEPTH);
-    out.queue_used = counts.used;
-    out.queue_high_water = ep.queue_high_water;
-    out.active_workers = counts.delivered;
-    out.max_active_workers = ep.max_active_workers;
-    out.open_handles = ep.open_handles;
-    out.busy_rejections = ep.busy_rejections;
-    out.timeouts = ep.timeouts;
-    out.cancellations = ep.cancellations;
-}
-
-fn fillApiDetailEntryLocked(slot: usize, out: *ApiDetail, now_ticks: u64) void {
-    out.* = .{};
-    if (slot >= entries.len or !entries[slot].used) return;
-    const e = &entries[slot];
-    fillApiInfoEntryLocked(slot, &out.info, now_ticks);
-    if (e.path_len > 0) @memcpy(out.path[0..e.path_len], e.path[0..e.path_len]);
-    if (e.args_len > 0) @memcpy(out.args[0..e.args_len], e.args[0..e.args_len]);
-    if (e.description_len > 0) @memcpy(out.description[0..e.description_len], e.description[0..e.description_len]);
-}
-
-fn fillMessageHeader(slot: *const RequestSlot, header: *ApiMessageHeader, payload_len: u16, status: i32) void {
-    header.* = .{
-        .magic = API_MAGIC,
-        .version = API_VERSION,
-        .op = slot.op,
-        .request_id = slot.request_id,
-        .client_id = slot.client_id,
-        .flags = slot.flags,
-        .payload_len = payload_len,
-        .status = status,
-    };
-}
-
-fn clearMessageHeader(header: *ApiMessageHeader) void {
-    header.* = .{
-        .magic = 0,
-        .version = 0,
-    };
+    const result = r4os_rust_services_parse(nativeBytes(value));
+    return if (result == 255) null else @enumFromInt(result);
 }
 
 pub fn stateCode(state: State) u32 {
-    return switch (state) {
-        .empty => API_STATE_EMPTY,
-        .stopped => API_STATE_STOPPED,
-        .starting => API_STATE_STARTING,
-        .running => API_STATE_RUNNING,
-        .stopping => API_STATE_STOPPING,
-        .failed => API_STATE_FAILED,
-        .disabled => API_STATE_DISABLED,
-    };
+    return @intFromEnum(state);
 }
 
 pub fn startModeCode(start_mode: StartMode) u32 {
-    return switch (start_mode) {
-        .manual => API_START_MANUAL,
-        .auto => API_START_AUTO,
-        .disabled => API_START_DISABLED,
-    };
+    return @as(u32, @intFromEnum(start_mode)) + 1;
 }
 
-fn isValidName(name: []const u8) bool {
-    if (name.len == 0 or name.len >= MAX_NAME) return false;
-    for (name) |ch| {
-        if (!isNameChar(ch)) return false;
-    }
-    return true;
+// Existing metadata cases call these same productive native algorithms.
+fn resetRegistryState() void {
+    r4os_rust_services_init();
+}
+fn resetRequestSlotMetadata(slot: *RequestSlot) void {
+    _ = r4os_rust_services_record(0, null, slot, null, null, null);
+}
+fn resetEndpointMetadata(ep: *Endpoint, count_reset: bool) void {
+    _ = r4os_rust_services_record(if (count_reset) 2 else 1, ep, null, null, null, null);
+}
+fn allocateRequestIdFrom(ep: *Endpoint, counter: *u32) u32 {
+    return r4os_rust_services_record(3, ep, null, counter, null, null);
+}
+fn queueCounts(ep: *Endpoint) QueueCounts {
+    var out: QueueCounts = undefined;
+    _ = r4os_rust_services_record(4, ep, null, null, &out, null);
+    return out;
+}
+fn advanceEndpointGeneration(ep: *Endpoint) void {
+    _ = r4os_rust_services_record(5, ep, null, null, null, null);
+}
+fn identityMatches(ep: *const Endpoint, identity: EndpointIdentity) bool {
+    return r4os_rust_services_record(6, @constCast(ep), null, null, null, &identity) != 0;
+}
+fn lockFamilyIndex(family: LockFamily) usize {
+    return @intFromEnum(family);
 }
 
-fn isNameChar(ch: u8) bool {
-    return (ch >= 'A' and ch <= 'Z') or
-        (ch >= 'a' and ch <= 'z') or
-        (ch >= '0' and ch <= '9') or
-        ch == '.' or ch == '_' or ch == '-';
-}
+comptime {
+    if (@offsetOf(LockTiming, "acquisitions") != 0) @compileError("Native service LockTiming.acquisitions offset drift");
 
-fn isRegistryValueSafe(value: []const u8) bool {
-    for (value) |ch| {
-        if (ch == ';' or ch == '\r' or ch == '\n') return false;
-    }
-    return true;
-}
+    if (@offsetOf(LockTiming, "contentions") != 8) @compileError("Native service LockTiming.contentions offset drift");
 
-fn hasR4xExtension(path: []const u8) bool {
-    if (path.len < 5) return false;
-    return endsWithIgnoreCase(path, ".R4X");
-}
+    if (@offsetOf(LockTiming, "timing_samples") != 16) @compileError("Native service LockTiming.timing_samples offset drift");
 
-fn endsWithIgnoreCase(s: []const u8, suffix: []const u8) bool {
-    if (s.len < suffix.len) return false;
-    return nameEq(s[s.len - suffix.len ..], suffix);
-}
+    if (@offsetOf(LockTiming, "wait_ns") != 24) @compileError("Native service LockTiming.wait_ns offset drift");
 
-fn copy(src: []const u8, dst: []u8) usize {
-    @memset(dst, 0);
-    const len = @min(src.len, dst.len - 1);
-    if (len > 0) @memcpy(dst[0..len], src[0..len]);
-    return len;
-}
+    if (@offsetOf(LockTiming, "wait_max_ns") != 32) @compileError("Native service LockTiming.wait_max_ns offset drift");
 
-fn nameEq(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (upper(a[i]) != upper(b[i])) return false;
-    }
-    return true;
-}
+    if (@offsetOf(LockTiming, "hold_ns") != 40) @compileError("Native service LockTiming.hold_ns offset drift");
 
-fn upper(ch: u8) u8 {
-    if (ch >= 'a' and ch <= 'z') return ch - ('a' - 'A');
-    return ch;
+    if (@offsetOf(LockTiming, "hold_max_ns") != 48) @compileError("Native service LockTiming.hold_max_ns offset drift");
+
+    if (@offsetOf(LockTiming, "timing_unavailable") != 56) @compileError("Native service LockTiming.timing_unavailable offset drift");
+
+    if (@sizeOf(LockTiming) != 64 or @alignOf(LockTiming) != 8) @compileError("Native service LockTiming layout drift");
+
+    if (@offsetOf(EndpointLifetimePerformance, "payload_copy_bytes") != 0) @compileError("Native service EndpointLifetimePerformance.payload_copy_bytes offset drift");
+
+    if (@offsetOf(EndpointLifetimePerformance, "payload_clear_bytes") != 8) @compileError("Native service EndpointLifetimePerformance.payload_clear_bytes offset drift");
+
+    if (@offsetOf(EndpointLifetimePerformance, "slot_metadata_resets") != 16) @compileError("Native service EndpointLifetimePerformance.slot_metadata_resets offset drift");
+
+    if (@offsetOf(EndpointLifetimePerformance, "endpoint_metadata_resets") != 24) @compileError("Native service EndpointLifetimePerformance.endpoint_metadata_resets offset drift");
+
+    if (@offsetOf(EndpointLifetimePerformance, "endpoint_payload_reset_bytes") != 32) @compileError("Native service EndpointLifetimePerformance.endpoint_payload_reset_bytes offset drift");
+
+    if (@offsetOf(EndpointLifetimePerformance, "queue_scan_passes") != 40) @compileError("Native service EndpointLifetimePerformance.queue_scan_passes offset drift");
+
+    if (@offsetOf(EndpointLifetimePerformance, "queue_scan_slots") != 48) @compileError("Native service EndpointLifetimePerformance.queue_scan_slots offset drift");
+
+    if (@offsetOf(EndpointLifetimePerformance, "revalidations") != 56) @compileError("Native service EndpointLifetimePerformance.revalidations offset drift");
+
+    if (@offsetOf(EndpointLifetimePerformance, "stale_rejections") != 64) @compileError("Native service EndpointLifetimePerformance.stale_rejections offset drift");
+
+    if (@sizeOf(EndpointLifetimePerformance) != 72 or @alignOf(EndpointLifetimePerformance) != 8) @compileError("Native service EndpointLifetimePerformance layout drift");
+
+    if (@offsetOf(Entry, "used") != 0) @compileError("Native service Entry.used offset drift");
+
+    if (@offsetOf(Entry, "state") != 1) @compileError("Native service Entry.state offset drift");
+
+    if (@offsetOf(Entry, "start_mode") != 2) @compileError("Native service Entry.start_mode offset drift");
+
+    if (@offsetOf(Entry, "instance_id") != 4) @compileError("Native service Entry.instance_id offset drift");
+
+    if (@offsetOf(Entry, "start_generation") != 8) @compileError("Native service Entry.start_generation offset drift");
+
+    if (@offsetOf(Entry, "exit_code") != 16) @compileError("Native service Entry.exit_code offset drift");
+
+    if (@offsetOf(Entry, "start_tick") != 24) @compileError("Native service Entry.start_tick offset drift");
+
+    if (@offsetOf(Entry, "restart_count") != 32) @compileError("Native service Entry.restart_count offset drift");
+
+    if (@offsetOf(Entry, "name") != 36) @compileError("Native service Entry.name offset drift");
+
+    if (@offsetOf(Entry, "name_len") != 72) @compileError("Native service Entry.name_len offset drift");
+
+    if (@offsetOf(Entry, "path") != 80) @compileError("Native service Entry.path offset drift");
+
+    if (@offsetOf(Entry, "path_len") != 1104) @compileError("Native service Entry.path_len offset drift");
+
+    if (@offsetOf(Entry, "args") != 1112) @compileError("Native service Entry.args offset drift");
+
+    if (@offsetOf(Entry, "args_len") != 1208) @compileError("Native service Entry.args_len offset drift");
+
+    if (@offsetOf(Entry, "description") != 1216) @compileError("Native service Entry.description offset drift");
+
+    if (@offsetOf(Entry, "description_len") != 1296) @compileError("Native service Entry.description_len offset drift");
+
+    if (@offsetOf(Entry, "last_error") != 1304) @compileError("Native service Entry.last_error offset drift");
+
+    if (@offsetOf(Entry, "last_error_len") != 1368) @compileError("Native service Entry.last_error_len offset drift");
+
+    if (@sizeOf(Entry) != 1376 or @alignOf(Entry) != 8) @compileError("Native service Entry layout drift");
+
+    if (@offsetOf(ApiIndexTarget, "registry_generation") != 0) @compileError("Native service ApiIndexTarget.registry_generation offset drift");
+
+    if (@offsetOf(ApiIndexTarget, "api_index") != 8) @compileError("Native service ApiIndexTarget.api_index offset drift");
+
+    if (@offsetOf(ApiIndexTarget, "service_slot") != 16) @compileError("Native service ApiIndexTarget.service_slot offset drift");
+
+    if (@offsetOf(ApiIndexTarget, "instance_id") != 24) @compileError("Native service ApiIndexTarget.instance_id offset drift");
+
+    if (@offsetOf(ApiIndexTarget, "state") != 28) @compileError("Native service ApiIndexTarget.state offset drift");
+
+    if (@offsetOf(ApiIndexTarget, "name") != 29) @compileError("Native service ApiIndexTarget.name offset drift");
+
+    if (@offsetOf(ApiIndexTarget, "name_len") != 64) @compileError("Native service ApiIndexTarget.name_len offset drift");
+
+    if (@sizeOf(ApiIndexTarget) != 72 or @alignOf(ApiIndexTarget) != 8) @compileError("Native service ApiIndexTarget layout drift");
+
+    if (@offsetOf(RequestSlot, "state") != 0) @compileError("Native service RequestSlot.state offset drift");
+
+    if (@offsetOf(RequestSlot, "request_id") != 4) @compileError("Native service RequestSlot.request_id offset drift");
+
+    if (@offsetOf(RequestSlot, "client_id") != 8) @compileError("Native service RequestSlot.client_id offset drift");
+
+    if (@offsetOf(RequestSlot, "op") != 12) @compileError("Native service RequestSlot.op offset drift");
+
+    if (@offsetOf(RequestSlot, "flags") != 16) @compileError("Native service RequestSlot.flags offset drift");
+
+    if (@offsetOf(RequestSlot, "request_len") != 20) @compileError("Native service RequestSlot.request_len offset drift");
+
+    if (@offsetOf(RequestSlot, "response_len") != 22) @compileError("Native service RequestSlot.response_len offset drift");
+
+    if (@offsetOf(RequestSlot, "response_status") != 24) @compileError("Native service RequestSlot.response_status offset drift");
+
+    if (@offsetOf(RequestSlot, "response_available") != 32) @compileError("Native service RequestSlot.response_available offset drift");
+
+    if (@offsetOf(RequestSlot, "request_payload") != 72) @compileError("Native service RequestSlot.request_payload offset drift");
+
+    if (@offsetOf(RequestSlot, "response_payload") != 4168) @compileError("Native service RequestSlot.response_payload offset drift");
+
+    if (@sizeOf(RequestSlot) != 8264 or @alignOf(RequestSlot) != 8) @compileError("Native service RequestSlot layout drift");
+
+    if (@offsetOf(Endpoint, "lock") != 0) @compileError("Native service Endpoint.lock offset drift");
+
+    if (@offsetOf(Endpoint, "generation") != 88) @compileError("Native service Endpoint.generation offset drift");
+
+    if (@offsetOf(Endpoint, "request_id_next") != 96) @compileError("Native service Endpoint.request_id_next offset drift");
+
+    if (@offsetOf(Endpoint, "request_id_limit") != 100) @compileError("Native service Endpoint.request_id_limit offset drift");
+
+    if (@offsetOf(Endpoint, "lifetime") != 104) @compileError("Native service Endpoint.lifetime offset drift");
+
+    if (@offsetOf(Endpoint, "lock_timing") != 176) @compileError("Native service Endpoint.lock_timing offset drift");
+
+    if (@offsetOf(Endpoint, "used") != 624) @compileError("Native service Endpoint.used offset drift");
+
+    if (@offsetOf(Endpoint, "service_slot") != 632) @compileError("Native service Endpoint.service_slot offset drift");
+
+    if (@offsetOf(Endpoint, "handle") != 640) @compileError("Native service Endpoint.handle offset drift");
+
+    if (@offsetOf(Endpoint, "flags") != 644) @compileError("Native service Endpoint.flags offset drift");
+
+    if (@offsetOf(Endpoint, "queue_high_water") != 648) @compileError("Native service Endpoint.queue_high_water offset drift");
+
+    if (@offsetOf(Endpoint, "max_active_workers") != 652) @compileError("Native service Endpoint.max_active_workers offset drift");
+
+    if (@offsetOf(Endpoint, "open_handles") != 656) @compileError("Native service Endpoint.open_handles offset drift");
+
+    if (@offsetOf(Endpoint, "requests") != 664) @compileError("Native service Endpoint.requests offset drift");
+
+    if (@offsetOf(Endpoint, "responses") != 672) @compileError("Native service Endpoint.responses offset drift");
+
+    if (@offsetOf(Endpoint, "drops") != 680) @compileError("Native service Endpoint.drops offset drift");
+
+    if (@offsetOf(Endpoint, "busy_rejections") != 688) @compileError("Native service Endpoint.busy_rejections offset drift");
+
+    if (@offsetOf(Endpoint, "timeouts") != 696) @compileError("Native service Endpoint.timeouts offset drift");
+
+    if (@offsetOf(Endpoint, "cancellations") != 704) @compileError("Native service Endpoint.cancellations offset drift");
+
+    if (@offsetOf(Endpoint, "completion_waits") != 712) @compileError("Native service Endpoint.completion_waits offset drift");
+
+    if (@offsetOf(Endpoint, "completion_timeouts") != 720) @compileError("Native service Endpoint.completion_timeouts offset drift");
+
+    if (@offsetOf(Endpoint, "completion_wait_rounds") != 728) @compileError("Native service Endpoint.completion_wait_rounds offset drift");
+
+    if (@offsetOf(Endpoint, "targeted_response_wakes") != 736) @compileError("Native service Endpoint.targeted_response_wakes offset drift");
+
+    if (@offsetOf(Endpoint, "targeted_response_wake_misses") != 744) @compileError("Native service Endpoint.targeted_response_wake_misses offset drift");
+
+    if (@offsetOf(Endpoint, "admission_waits") != 752) @compileError("Native service Endpoint.admission_waits offset drift");
+
+    if (@offsetOf(Endpoint, "admission_timeouts") != 760) @compileError("Native service Endpoint.admission_timeouts offset drift");
+
+    if (@offsetOf(Endpoint, "requests_available") != 768) @compileError("Native service Endpoint.requests_available offset drift");
+
+    if (@offsetOf(Endpoint, "slots_available") != 808) @compileError("Native service Endpoint.slots_available offset drift");
+
+    if (@offsetOf(Endpoint, "queued_slots") != 856) @compileError("Native service Endpoint.queued_slots offset drift");
+
+    if (@offsetOf(Endpoint, "queued_count") != 920) @compileError("Native service Endpoint.queued_count offset drift");
+
+    if (@offsetOf(Endpoint, "queue") != 928) @compileError("Native service Endpoint.queue offset drift");
+
+    if (@sizeOf(Endpoint) != 67040 or @alignOf(Endpoint) != 8) @compileError("Native service Endpoint layout drift");
+
+    if (@offsetOf(PerformanceSummary, "max_services") != 0) @compileError("Native service PerformanceSummary.max_services offset drift");
+
+    if (@offsetOf(PerformanceSummary, "used_services") != 4) @compileError("Native service PerformanceSummary.used_services offset drift");
+
+    if (@offsetOf(PerformanceSummary, "running_services") != 8) @compileError("Native service PerformanceSummary.running_services offset drift");
+
+    if (@offsetOf(PerformanceSummary, "endpoints_used") != 12) @compileError("Native service PerformanceSummary.endpoints_used offset drift");
+
+    if (@offsetOf(PerformanceSummary, "request_pending") != 16) @compileError("Native service PerformanceSummary.request_pending offset drift");
+
+    if (@offsetOf(PerformanceSummary, "response_pending") != 20) @compileError("Native service PerformanceSummary.response_pending offset drift");
+
+    if (@offsetOf(PerformanceSummary, "queue_depth_total") != 24) @compileError("Native service PerformanceSummary.queue_depth_total offset drift");
+
+    if (@offsetOf(PerformanceSummary, "queue_used_total") != 28) @compileError("Native service PerformanceSummary.queue_used_total offset drift");
+
+    if (@offsetOf(PerformanceSummary, "queue_high_water_total") != 32) @compileError("Native service PerformanceSummary.queue_high_water_total offset drift");
+
+    if (@offsetOf(PerformanceSummary, "active_workers") != 36) @compileError("Native service PerformanceSummary.active_workers offset drift");
+
+    if (@offsetOf(PerformanceSummary, "max_active_workers") != 40) @compileError("Native service PerformanceSummary.max_active_workers offset drift");
+
+    if (@offsetOf(PerformanceSummary, "open_handles") != 44) @compileError("Native service PerformanceSummary.open_handles offset drift");
+
+    if (@offsetOf(PerformanceSummary, "requests") != 48) @compileError("Native service PerformanceSummary.requests offset drift");
+
+    if (@offsetOf(PerformanceSummary, "responses") != 56) @compileError("Native service PerformanceSummary.responses offset drift");
+
+    if (@offsetOf(PerformanceSummary, "drops") != 64) @compileError("Native service PerformanceSummary.drops offset drift");
+
+    if (@offsetOf(PerformanceSummary, "busy_rejections") != 72) @compileError("Native service PerformanceSummary.busy_rejections offset drift");
+
+    if (@offsetOf(PerformanceSummary, "timeouts") != 80) @compileError("Native service PerformanceSummary.timeouts offset drift");
+
+    if (@offsetOf(PerformanceSummary, "cancellations") != 88) @compileError("Native service PerformanceSummary.cancellations offset drift");
+
+    if (@offsetOf(PerformanceSummary, "completion_waits") != 96) @compileError("Native service PerformanceSummary.completion_waits offset drift");
+
+    if (@offsetOf(PerformanceSummary, "completion_timeouts") != 104) @compileError("Native service PerformanceSummary.completion_timeouts offset drift");
+
+    if (@offsetOf(PerformanceSummary, "completion_wait_rounds") != 112) @compileError("Native service PerformanceSummary.completion_wait_rounds offset drift");
+
+    if (@offsetOf(PerformanceSummary, "targeted_response_wakes") != 120) @compileError("Native service PerformanceSummary.targeted_response_wakes offset drift");
+
+    if (@offsetOf(PerformanceSummary, "targeted_response_wake_misses") != 128) @compileError("Native service PerformanceSummary.targeted_response_wake_misses offset drift");
+
+    if (@offsetOf(PerformanceSummary, "admission_waits") != 136) @compileError("Native service PerformanceSummary.admission_waits offset drift");
+
+    if (@offsetOf(PerformanceSummary, "admission_timeouts") != 144) @compileError("Native service PerformanceSummary.admission_timeouts offset drift");
+
+    if (@offsetOf(PerformanceSummary, "payload_copy_bytes") != 152) @compileError("Native service PerformanceSummary.payload_copy_bytes offset drift");
+
+    if (@offsetOf(PerformanceSummary, "payload_clear_bytes") != 160) @compileError("Native service PerformanceSummary.payload_clear_bytes offset drift");
+
+    if (@offsetOf(PerformanceSummary, "slot_metadata_resets") != 168) @compileError("Native service PerformanceSummary.slot_metadata_resets offset drift");
+
+    if (@offsetOf(PerformanceSummary, "endpoint_metadata_resets") != 176) @compileError("Native service PerformanceSummary.endpoint_metadata_resets offset drift");
+
+    if (@offsetOf(PerformanceSummary, "endpoint_payload_reset_bytes") != 184) @compileError("Native service PerformanceSummary.endpoint_payload_reset_bytes offset drift");
+
+    if (@offsetOf(PerformanceSummary, "queue_scan_passes") != 192) @compileError("Native service PerformanceSummary.queue_scan_passes offset drift");
+
+    if (@offsetOf(PerformanceSummary, "queue_scan_slots") != 200) @compileError("Native service PerformanceSummary.queue_scan_slots offset drift");
+
+    if (@offsetOf(PerformanceSummary, "endpoint_revalidations") != 208) @compileError("Native service PerformanceSummary.endpoint_revalidations offset drift");
+
+    if (@offsetOf(PerformanceSummary, "endpoint_stale_rejections") != 216) @compileError("Native service PerformanceSummary.endpoint_stale_rejections offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_family_count") != 224) @compileError("Native service PerformanceSummary.lock_family_count offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_reserved0") != 228) @compileError("Native service PerformanceSummary.lock_reserved0 offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_acquisitions") != 232) @compileError("Native service PerformanceSummary.lock_acquisitions offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_contentions") != 288) @compileError("Native service PerformanceSummary.lock_contentions offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_wait_ns") != 344) @compileError("Native service PerformanceSummary.lock_wait_ns offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_wait_max_ns") != 400) @compileError("Native service PerformanceSummary.lock_wait_max_ns offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_hold_ns") != 456) @compileError("Native service PerformanceSummary.lock_hold_ns offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_hold_max_ns") != 512) @compileError("Native service PerformanceSummary.lock_hold_max_ns offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_timing_unavailable") != 568) @compileError("Native service PerformanceSummary.lock_timing_unavailable offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_timing_stride") != 624) @compileError("Native service PerformanceSummary.lock_timing_stride offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_timing_reserved0") != 628) @compileError("Native service PerformanceSummary.lock_timing_reserved0 offset drift");
+
+    if (@offsetOf(PerformanceSummary, "lock_timing_samples") != 632) @compileError("Native service PerformanceSummary.lock_timing_samples offset drift");
+
+    if (@offsetOf(PerformanceSummary, "registry_index_queries") != 688) @compileError("Native service PerformanceSummary.registry_index_queries offset drift");
+
+    if (@offsetOf(PerformanceSummary, "registry_refresh_requests") != 696) @compileError("Native service PerformanceSummary.registry_refresh_requests offset drift");
+
+    if (@offsetOf(PerformanceSummary, "registry_refresh_visits") != 704) @compileError("Native service PerformanceSummary.registry_refresh_visits offset drift");
+
+    if (@offsetOf(PerformanceSummary, "registry_instance_lookups") != 712) @compileError("Native service PerformanceSummary.registry_instance_lookups offset drift");
+
+    if (@offsetOf(PerformanceSummary, "registry_index_end_markers") != 720) @compileError("Native service PerformanceSummary.registry_index_end_markers offset drift");
+
+    if (@sizeOf(PerformanceSummary) != 728 or @alignOf(PerformanceSummary) != 8) @compileError("Native service PerformanceSummary layout drift");
+
+    if (@offsetOf(RegistryEnumerationPerformance, "index_queries") != 0) @compileError("Native service RegistryEnumerationPerformance.index_queries offset drift");
+
+    if (@offsetOf(RegistryEnumerationPerformance, "refresh_requests") != 8) @compileError("Native service RegistryEnumerationPerformance.refresh_requests offset drift");
+
+    if (@offsetOf(RegistryEnumerationPerformance, "refresh_visits") != 16) @compileError("Native service RegistryEnumerationPerformance.refresh_visits offset drift");
+
+    if (@offsetOf(RegistryEnumerationPerformance, "instance_lookups") != 24) @compileError("Native service RegistryEnumerationPerformance.instance_lookups offset drift");
+
+    if (@offsetOf(RegistryEnumerationPerformance, "index_end_markers") != 32) @compileError("Native service RegistryEnumerationPerformance.index_end_markers offset drift");
+
+    if (@sizeOf(RegistryEnumerationPerformance) != 40 or @alignOf(RegistryEnumerationPerformance) != 8) @compileError("Native service RegistryEnumerationPerformance layout drift");
+
+    if (@offsetOf(StartReservation, "slot") != 0) @compileError("Native service StartReservation.slot offset drift");
+
+    if (@offsetOf(StartReservation, "generation") != 8) @compileError("Native service StartReservation.generation offset drift");
+
+    if (@offsetOf(StartReservation, "entry") != 16) @compileError("Native service StartReservation.entry offset drift");
+
+    if (@sizeOf(StartReservation) != 1392 or @alignOf(StartReservation) != 8) @compileError("Native service StartReservation layout drift");
+
+    if (@offsetOf(QueueCounts, "queued") != 0) @compileError("Native service QueueCounts.queued offset drift");
+
+    if (@offsetOf(QueueCounts, "delivered") != 4) @compileError("Native service QueueCounts.delivered offset drift");
+
+    if (@offsetOf(QueueCounts, "responded") != 8) @compileError("Native service QueueCounts.responded offset drift");
+
+    if (@offsetOf(QueueCounts, "used") != 12) @compileError("Native service QueueCounts.used offset drift");
+
+    if (@sizeOf(QueueCounts) != 16 or @alignOf(QueueCounts) != 4) @compileError("Native service QueueCounts layout drift");
+
+    if (@sizeOf(EndpointIdentity) != 32 or @offsetOf(EndpointIdentity, "endpoint") != 0 or
+        @offsetOf(EndpointIdentity, "handle") != 8 or @offsetOf(EndpointIdentity, "generation") != 16 or
+        @offsetOf(EndpointIdentity, "service_slot") != 24 or @sizeOf(NativeBytes) != 16)
+        @compileError("Native service identity/bytes layout drift");
+    if (@intFromEnum(State.empty) != API_STATE_EMPTY or @intFromEnum(State.disabled) != API_STATE_DISABLED or
+        @intFromEnum(StartMode.manual) + 1 != API_START_MANUAL or @intFromEnum(StartMode.disabled) + 1 != API_START_DISABLED)
+        @compileError("Native service state/mode conversion drift");
 }
 
 test "dense service API index covers empty partial full and hole reuse" {

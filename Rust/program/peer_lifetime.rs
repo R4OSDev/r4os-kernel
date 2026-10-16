@@ -1,9 +1,10 @@
 //! Program peer cleanup and IRQ-safe fault attribution. A retry preserves
-//! exact remaining stack/image/VM ownership. Notification internals still
-//! belong to their separate IPC owner; only program admission lives here.
+//! exact remaining stack/image/VM ownership. Native notification transport
+//! retains its separate namespace and scheduler enrollment owner.
 use super::{
-    context, info, instance_storage, payload, payload_types as t, process, process_data, registry,
-    registry_state, registry_types::*, stack, thread_runtime, threads, util,
+    context, info, instance_storage, notifications, payload, payload_types as t, process,
+    process_data, registry, registry_state, registry_types::*, stack, thread_runtime, threads,
+    util,
 };
 use crate::{
     boot::{crash::ExecutionContext, foundation},
@@ -17,23 +18,12 @@ use core::{
     sync::atomic::{AtomicI32, Ordering},
 };
 unsafe extern "C" {
-    fn r4os_zig_program_peer_notification(
-        op: u8,
-        owner: *mut c_void,
-        handle: u64,
-        value: u64,
-        timeout: u64,
-        out: *mut u64,
-    ) -> i32;
-    fn r4os_zig_program_peer_notifications_cleanup(owner: *mut c_void) -> bool;
     fn r4os_zig_program_peer_vm_release(id: u32) -> bool;
     fn r4os_zig_program_peer_backing_release(id: u32);
 }
 pub(super) unsafe fn notifications_cleanup(instance: *mut ProgramInstance) -> bool {
     unsafe {
-        r4os_zig_program_peer_notifications_cleanup(
-            ptr::addr_of_mut!((*instance).notifications).cast(),
-        )
+        notifications::r4os_rust_notifications_cleanup(ptr::addr_of_mut!((*instance).notifications))
     }
 }
 pub(super) unsafe fn vm_release(id: u32) -> bool {
@@ -139,7 +129,7 @@ pub unsafe extern "C" fn r4os_rust_program_peer_notification(
         if matches!(op, 0 | 1) && out.is_null() {
             return contract::notification_error_invalid;
         }
-        r4os_zig_program_peer_notification(op, owner, handle, value, timeout, out)
+        notifications::r4os_rust_notifications_call(op, owner.cast(), handle, value, timeout, out)
     }
 }
 pub(super) unsafe fn contains(instance: *const ProgramInstance, rip: u64) -> bool {

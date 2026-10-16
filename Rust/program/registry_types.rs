@@ -2,9 +2,9 @@
 //! Productive Zig and Rust check every field offset and original core budget.
 //! Every record retains its stable allocation and exact generation until
 //! original task/payload/image/VM/DMA/completion release acknowledgments.
-//! Notification bytes remain exclusively at the existing foreign owner;
-//! opaque payload pointers confer neither Rust references nor cleanup rights.
-use super::memory;
+//! Notifications share the native process namespace; opaque payload pointers
+//! confer neither Rust references nor cleanup rights to another owner.
+use super::{memory, notifications};
 use crate::contract;
 use core::ffi::c_void;
 
@@ -13,7 +13,7 @@ pub struct ProgramInstance {
     pub program_stack_guard_size: u64,
     pub memory_limits: memory::Limits,
     pub gui_payload: *mut c_void,
-    pub notifications: [u64; 3],
+    pub notifications: notifications::Owner,
     pub console_payload: *mut c_void,
     pub process_payload: *mut c_void,
     pub runtime_payload: *mut c_void,

@@ -289,6 +289,32 @@ fn addContractUnitTest(
     });
     root.addOptions("config", config);
     root.addImport("r4os_kernel_contract", host_contract);
+    // Native owner exports now reach the same lower filesystem value facades
+    // as the product/loader root. Keep their canonical modules available to
+    // the existing service tests without running the full host catalogue.
+    const ntfs_format = b.createModule(.{
+        .root_source_file = b.path("Support/ntfs_format.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    root.addImport("ntfs_format", ntfs_format);
+    const ntfs_volume = b.createModule(.{
+        .root_source_file = b.path("Support/ntfs_volume.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    ntfs_volume.addImport("ntfs_format", ntfs_format);
+    root.addImport("ntfs_volume", ntfs_volume);
+    for ([_][2][]const u8{
+        .{ "r4f_format", "kernel/font_format.zig" },
+        .{ "system_update_recovery", "Support/system_update_recovery.zig" },
+        .{ "upload_publish_claim", "Support/upload_publish_claim.zig" },
+        .{ "r4_registry_core", "Support/registry_core.zig" },
+    }) |item| root.addImport(item[0], b.createModule(.{
+        .root_source_file = b.path(item[1]),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }));
     linkRustOwners(b, root);
     const tests = b.addTest(.{ .root_module = root });
     const run = b.addRunArtifact(tests);

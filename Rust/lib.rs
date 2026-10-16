@@ -15,4 +15,5 @@ pub mod memory;
 pub mod platform;
 pub mod program;
 pub mod sched;
+pub mod service;
 pub mod storage;

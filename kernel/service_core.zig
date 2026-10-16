@@ -1,7 +1,7 @@
 // R4OS kernel - minimal service core contract.
 //
-// This file is the visible boundary between early kernel boot and the existing
-// legacy service implementation. It intentionally contains only the technical
+// This file is the visible boundary between early kernel boot and the native
+// service implementation through its typed Zig compatibility facade. It intentionally contains only the technical
 // service mechanics that may stay in the kernel: registry state, service
 // status, endpoints, and request/response IPC.
 //

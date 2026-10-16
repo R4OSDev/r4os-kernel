@@ -1,141 +1,44 @@
-// Runtime, scheduler, and launcher completion for kernel startup.
-
-const boot_status = @import("boot_status.zig");
+// Native BSP runtime/worker/launcher orchestration. These remaining cuts are
+// stateless adapters to typed Zig callback ABI, presentation and audio owners.
 const bootscreen = @import("bootscreen.zig");
-const config = @import("config");
-const deadman = @import("deadman.zig");
-const interrupts = @import("../arch/x86_64/interrupts.zig");
-const fatal = @import("fatal.zig");
-const driver_work = @import("driver_work.zig");
-const loader_boot = @import("loader_boot.zig");
 const loader_perf = @import("loader_perf.zig");
-const log = @import("log.zig");
-const memory_boot = @import("memory_boot.zig");
-const memory_reclaim = @import("../memory/reclaim.zig");
-const page_cache = @import("../fs/page_cache.zig");
-const r4p = @import("../program/r4p.zig");
-const scheduler = @import("../sched/scheduler.zig");
-const shell_launcher = @import("shell_launcher.zig");
-const service_ipc = @import("service_ipc.zig");
-const block_storage = @import("../storage/block.zig");
-const audio = @import("../audio/core.zig");
 const task = @import("../sched/task.zig");
-const platform_boot = @import("platform_boot.zig");
-const smp = @import("smp.zig");
-
-var task_runtime_initialized = false;
-
+const audio = @import("../audio/core.zig");
+const crash = @import("crash.zig");
+comptime {
+    // Direct native calls still need these separately owned presentation /
+    // config adapters to publish their existing C exports into this product.
+    _ = @import("shell_launcher.zig");
+    _ = @import("deadman.zig");
+}
+extern fn r4os_rust_runtime_boot_init() callconv(.c) bool;
+extern fn r4os_rust_runtime_boot_start() callconv(.c) noreturn;
+pub fn initTaskRuntime() bool {
+    return r4os_rust_runtime_boot_init();
+}
+pub fn start() noreturn {
+    r4os_rust_runtime_boot_start();
+}
 fn reclaimTaskStackCache(requested_stacks: u32) u32 {
     return task.reclaimStackCache(requested_stacks);
 }
-
-pub fn initTaskRuntime() bool {
-    if (task_runtime_initialized) return true;
-
-    bootscreen.setStatus("Task-System starten");
-    if (!task.init()) {
-        return false;
-    }
-    memory_reclaim.registerTaskStackReclaimer(reclaimTaskStackCache);
-    log.puts("  Task system ");
-    log.puts("[OK]\r\n");
-
-    bootscreen.setStatus("Scheduler starten");
-    if (!scheduler.init()) {
-        return false;
-    }
-    log.puts("  Scheduler ");
-    log.puts("[OK]\r\n");
-
-    const acpi_info = platform_boot.acpiInfo() orelse return false;
-    bootscreen.setStatus("SMP starten");
-    if (!smp.startApplicationProcessors(acpi_info)) return false;
-    // APs must be online before runtime R4D registration so new INTx/MSI
-    // routes can select an actual online target at their one-vector boundary.
-    smp.activate();
-    log.puts("  SMP foundation ");
-    log.puts("[OK]\r\n");
-
-    bootscreen.setStatus("Service-IPC starten");
-    if (!service_ipc.startRuntimeWorker()) {
-        return false;
-    }
-    log.puts("  Service IPC worker ");
-    log.puts("[OK]\r\n");
-
-    bootscreen.setStatus("Treiberarbeit starten");
-    if (!driver_work.init()) {
-        return false;
-    }
-    log.puts("  Driver workqueue ");
-    log.puts("[OK]\r\n");
-
-    bootscreen.setStatus("Block-Worker starten");
-    if (!block_storage.initRuntimeWorker()) {
-        return false;
-    }
-    log.puts("  Block worker ");
-    log.puts("[OK]\r\n");
-
-    bootscreen.setStatus("Seitencache starten");
-    if (!page_cache.startPolicyWorker()) {
-        return false;
-    }
-    log.puts("  Page-cache policy worker ");
-    log.puts("[OK]\r\n");
-
-    if (!audio.startProgressWorker()) return false;
-    log.puts("  Audio progress worker [OK]\r\n");
-
-    task_runtime_initialized = true;
-    // The platform timer handoff leaves the boot stack with IF=0. New tasks
-    // enable interrupts in their trampoline, but kernel-main needs the same
-    // transition as soon as the scheduler and runtime workers are ready.
-    // Driver-policy I/O, preemption acceptance and protocol loading below
-    // may already await timed work; deferring this to start() strands those
-    // waits whenever only kernel-main remains runnable on the BSP.
-    interrupts.enable();
+export fn r4os_zig_runtime_stack_reclaimer() callconv(.c) usize {
+    return @intFromPtr(&reclaimTaskStackCache);
+}
+export fn r4os_zig_runtime_status(data: [*]const u8, len: usize) callconv(.c) void {
+    bootscreen.setStatus(data[0..len]);
+}
+export fn r4os_zig_runtime_audio(progress_worker: bool) callconv(.c) bool {
+    if (progress_worker) return audio.startProgressWorker();
+    _ = audio.applyConfiguredSidModel();
     return true;
 }
-
-pub fn start() noreturn {
-    bootscreen.setStatus("Protokolle laden");
-    const r4p_start = loader_perf.beginR4pRuntime();
-    r4p.loadAll();
-    loader_perf.finishR4pRuntime(r4p_start);
-    _ = audio.applyConfiguredSidModel();
-    r4p.dumpStatus();
-    boot_status.statusLine("  Loader [OK]\r\n");
-
-    if (!initTaskRuntime()) {
-        fatal.kernelFatal(.runtime, "Task runtime init failed");
-    }
-
-    if (config.enable_page_fault_test) triggerPageFaultTest();
-
-    // Runtime diagnostic, deliberately last in the boot: everything the
-    // deadman scans (registry, timer, console sinks) is final here.
-    bootscreen.setStatus("Watchdog starten");
-    if (deadman.start()) {
-        boot_status.statusLine("  Deadman watchdog [OK]\r\n");
-    } else {
-        boot_status.statusLine("  Deadman watchdog [FAILED]\r\n");
-        log.puts("[DEADMAN] kernel thread creation failed\r\n");
-    }
-
-    log.puts("\r\n  Launcher [START]\r\n");
-    bootscreen.setStatus("Launcher starten");
-    const loaded_config = loader_boot.config() orelse fatal.kernelFatal(.runtime, "Loader boot state missing");
-    fatal.setBootPhase(.shell);
-    shell_launcher.start(loaded_config, memory_boot.usableBytes());
+export fn r4os_zig_runtime_loader_timing(begin: bool, start_tick: u64) callconv(.c) u64 {
+    if (begin) return loader_perf.beginR4pRuntime();
+    loader_perf.finishR4pRuntime(start_tick);
+    return 0;
 }
-
-fn triggerPageFaultTest() noreturn {
-    const unmapped: u64 = 0xFFFF_FF00_0000_0000;
-    log.puts("  Triggering test page fault at 0x");
-    log.putHex(unmapped, 16);
-    log.puts("...\r\n");
-    const mem: [*]volatile u8 = @ptrFromInt(unmapped);
-    mem[0] = 0xCC;
-    interrupts.haltForever();
+comptime {
+    if (@intFromEnum(crash.BootPhase.runtime) != 13 or @intFromEnum(crash.BootPhase.shell) != 18)
+        @compileError("Native runtime boot phase drift");
 }
