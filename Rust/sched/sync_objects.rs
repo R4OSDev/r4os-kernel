@@ -352,3 +352,37 @@ pub(crate) unsafe fn queue_wait_unless(
 pub(crate) unsafe fn queue_wake_all(queue: *mut WaitQueue) -> usize {
     unsafe { wait::r4os_rust_sync_queue(queue, 1, ptr::null_mut(), 0, ptr::null_mut()) as usize }
 }
+
+// Typed input producers use the original Runtime-owned sequence/lifecycle edges.
+/// # Safety
+/// Exact resident queue and sequence share the existing Runtime lifetime.
+pub(crate) unsafe fn queue_read_sequence(queue: *mut WaitQueue, sequence: *mut u64) -> u64 {
+    unsafe { wait::r4os_rust_sync_queue(queue, 9, ptr::null_mut(), 0, sequence) }
+}
+/// # Safety
+/// Producer published its input state and released metadata admission first.
+pub(crate) unsafe fn queue_bump_sequence(queue: *mut WaitQueue, sequence: *mut u64) {
+    unsafe {
+        wait::r4os_rust_sync_queue(queue, 8, ptr::null_mut(), 0, sequence);
+    }
+}
+/// # Safety
+/// Exact resident queue has no stale enrollment from a previous lifecycle.
+pub(crate) unsafe fn queue_reopen(queue: *mut WaitQueue) {
+    unsafe {
+        wait::r4os_rust_sync_queue(queue, 5, ptr::null_mut(), 0, ptr::null_mut());
+    }
+}
+/// # Safety
+/// Queue remains resident until all original cancelled waiters detach.
+pub(crate) unsafe fn queue_close_cancelled(queue: *mut WaitQueue) {
+    unsafe {
+        wait::r4os_rust_sync_queue(
+            queue,
+            4,
+            ptr::null_mut(),
+            WaitResult::Cancelled as u64,
+            ptr::null_mut(),
+        );
+    }
+}

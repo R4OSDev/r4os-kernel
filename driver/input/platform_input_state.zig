@@ -1,70 +1,45 @@
-// Canonical platform input facts. Hardware decoding and screen policy are
-// external; consumers independently observe counters without stealing events.
+// Native canonical fact model; caller owns this exact C storage.
 const std = @import("std");
 const a = @import("r4os_kernel_contract");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const Error = error{ Invalid, Stale, Busy, Unsupported, Exhausted };
-pub const State = struct {
+extern fn r4os_rust_input_platform_model(*State, u8, u32, u64, u32, u32, u64) i32;
+fn result(code: i32) Error!bool {
+    return switch (code) {
+        0 => false,
+        1 => true,
+        -1 => error.Invalid,
+        -2 => error.Stale,
+        -3 => error.Busy,
+        -4 => error.Unsupported,
+        -5 => error.Exhausted,
+        else => unreachable,
+    };
+}
+pub const State = extern struct {
     value: a.PlatformInputSnapshot = .{},
     owner: u32 = 0,
     epoch: u64 = 0,
     acpi_caps: u32 = 0,
     usb_present: bool = false,
-    fn advance(self: *State, now: u64) Error!void {
-        if (now == 0 or now == std.math.maxInt(u64) or now < self.value.since_ns) return error.Invalid;
-        if (self.value.sequence == std.math.maxInt(u64)) return error.Exhausted;
-        self.value.sequence += 1; self.value.since_ns = now;
-    }
-    fn capabilities(self: *State) void {
-        self.value.capabilities = self.acpi_caps | @as(u32, @intFromBool(self.usb_present));
-        self.value.sources = @as(u32, @intFromBool(self.owner != 0)) | (@as(u32, @intFromBool(self.usb_present)) << 1);
-    }
     pub fn submit(self: *State, owner: u32, epoch: u64, kind: u32, value: u32, now: u64) Error!bool {
-        if (owner == 0 or epoch == 0 or kind == 0 or kind > 4) return error.Invalid;
-        if (kind == 4) {
-            if (value > 3) return error.Invalid;
-            if (self.owner != 0 and (owner != self.owner or epoch != self.epoch)) return error.Busy;
-            if (value == 0) return self.remove(owner, now);
-            if (self.owner == owner and self.epoch == epoch and self.acpi_caps == value) return false;
-            try self.advance(now);
-            self.owner = owner; self.epoch = epoch; self.acpi_caps = value;
-            if (value & 2 == 0 and self.value.lid_state != 0) {
-                self.value.lid_state = 0; self.value.lid_sequence = self.value.sequence;
-            }
-            self.capabilities(); return true;
-        }
-        if (self.owner != owner or self.epoch != epoch) return error.Stale;
-        if (kind == 3) {
-            if (value > 2) return error.Invalid;
-            if (self.acpi_caps & 2 == 0) return error.Unsupported;
-            if (self.value.lid_state == value) return false;
-            try self.advance(now); self.value.lid_state = value; self.value.lid_sequence = self.value.sequence;
-            return true;
-        }
-        if (self.acpi_caps & 1 == 0) return error.Unsupported;
-        return self.button(kind, value, now);
-    }
-    fn button(self: *State, kind: u32, value: u32, now: u64) Error!bool {
-        if (value != 1 or (kind != 1 and kind != 2)) return error.Invalid;
-        const count = if (kind == 1) &self.value.brightness_up else &self.value.brightness_down;
-        if (count.* == std.math.maxInt(u64)) return error.Exhausted;
-        try self.advance(now); count.* += 1; return true;
+        return result(r4os_rust_input_platform_model(self, 0, owner, epoch, kind, value, now));
     }
     pub fn usb(self: *State, present: bool, now: u64) Error!bool {
-        if (self.usb_present == present) return false;
-        try self.advance(now); self.usb_present = present; self.capabilities(); return true;
+        return result(r4os_rust_input_platform_model(self, 1, 0, 0, 0, @intFromBool(present), now));
     }
     pub fn consumer(self: *State, usage: u32, now: u64) Error!bool {
-        if (!self.usb_present) return error.Unsupported;
-        return self.button(switch (usage) { 0x6f => 1, 0x70 => 2, else => return error.Unsupported }, 1, now);
+        return result(r4os_rust_input_platform_model(self, 2, 0, 0, 0, usage, now));
     }
     pub fn remove(self: *State, owner: u32, now: u64) Error!bool {
-        if (self.owner == 0 or owner != self.owner) return false;
-        try self.advance(now);
-        self.owner = 0; self.epoch = 0; self.acpi_caps = 0;
-        self.value.lid_state = 0; self.value.lid_sequence = self.value.sequence;
-        self.capabilities(); return true;
+        return result(r4os_rust_input_platform_model(self, 3, owner, 0, 0, 0, now));
     }
 };
+comptime {
+    if (@sizeOf(State) != 88 or @alignOf(State) != 8 or @offsetOf(State, "owner") != 64 or @offsetOf(State, "epoch") != 72 or @offsetOf(State, "acpi_caps") != 80 or @offsetOf(State, "usb_present") != 84) @compileError("Native platform input State layout");
+}
 
 test "platform input preserves independent counters and rejects stale producers and invented events" {
     const t = std.testing;

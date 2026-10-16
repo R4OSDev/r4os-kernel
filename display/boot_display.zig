@@ -9,81 +9,34 @@ const display = @import("../display/display.zig");
 const surface_pipeline = @import("../display/surface_pipeline.zig");
 const firmware_access = @import("firmware_access.zig");
 
-pub const ConsoleMetrics = struct {
+pub const ConsoleMetrics = extern struct {
     cols: u32 = 0,
     rows: u32 = 0,
     scale: u32 = 0,
 };
 
-pub const State = struct {
+pub const State = extern struct {
     console_metrics: ConsoleMetrics,
 };
 
-var framebuffer_storage: fb.Framebuffer = undefined;
-var console_storage: Console = undefined;
-var state_storage: ?State = null;
-
 pub fn init() ?State {
-    if (state_storage) |state| return state;
-
-    const boot_framebuf = boot_info.framebuffer() orelse return null;
-    framebuffer_storage = framebufferFromBootInfo(boot_framebuf);
-    const framebuf = &framebuffer_storage;
-    console_storage = Console.init(framebuf);
-    const boot_target = displayTargetFromBootFramebuffer(framebuf);
-    display.registerBootBackend(boot_target);
-    @import("outputs.zig").initBoot(framebuf);
-    surface_pipeline.initFromDisplayManager();
-    console_storage.clear();
-    _ = bootscreen.renderToFramebuffer(framebuf);
-    console_storage.invalidateBackingForExternalDisplay();
-    log.setConsoleSink(consoleSink(&console_storage));
-
-    state_storage = .{ .console_metrics = consoleMetrics(&console_storage) };
-    return state_storage;
+    var out: State = undefined;
+    return if (r4os_rust_boot_display_init(&out)) out else null;
 }
 
 pub fn get() ?State {
-    return state_storage;
+    var out: State = undefined;
+    return if (r4os_rust_boot_display_get(&out)) out else null;
 }
 
 // Called once after heap initialization, outside the boot-log owner. Storage
 // stays resident for later console/fatal use; sink callbacks never allocate.
 pub fn prepareConsolePixelBacking(memory_budget: u64) bool {
-    if (state_storage == null) return false;
-    if (console_storage.pixel_backing != null) return true;
-    const bytes = scroll_buffer.requiredPixelBytes(framebuffer_storage.width, framebuffer_storage.height) orelse return false;
-    if (bytes > memory_budget) return false;
-    const memory = heap.alloc(bytes, @alignOf(u32)) orelse return false;
-    const pointer: [*]u32 = @ptrCast(@alignCast(memory.ptr));
-    if (console_storage.attachPixelBacking(pointer[0 .. bytes / 4])) return true;
-    _ = heap.free(memory);
-    return false;
+    return r4os_rust_boot_display_prepare(memory_budget);
 }
 
 pub fn invalidateConsoleBackingForExternalDisplay() void {
-    if (state_storage == null) return;
-    console_storage.invalidateBackingForExternalDisplay();
-}
-
-fn framebufferFromBootInfo(src: *const boot_info.Framebuffer) fb.Framebuffer {
-    return .{
-        .address = src.address,
-        .width = src.width,
-        .height = src.height,
-        .pitch = src.pitch,
-        .bpp = src.bpp,
-        .memory_model = src.memory_model,
-        .red_mask_size = src.red_mask_size,
-        .red_mask_shift = src.red_mask_shift,
-        .green_mask_size = src.green_mask_size,
-        .green_mask_shift = src.green_mask_shift,
-        .blue_mask_size = src.blue_mask_size,
-        .blue_mask_shift = src.blue_mask_shift,
-        .unused = src.unused,
-        .edid_size = src.edid_size,
-        .edid = src.edid,
-    };
+    r4os_rust_boot_display_invalidate();
 }
 
 fn displayTargetFromBootFramebuffer(framebuf: *fb.Framebuffer) display.DisplayTarget {
@@ -134,14 +87,6 @@ fn displayMappingFromFramebuffer(framebuf: *const fb.Framebuffer) display.Mappin
         .virt_base = @intFromPtr(framebuf.address),
         .byte_len = framebuf.pitch * framebuf.height,
         .volatile_cpu_writes = true,
-    };
-}
-
-fn consoleMetrics(console: *const Console) ConsoleMetrics {
-    return .{
-        .cols = console.cols,
-        .rows = console.rows,
-        .scale = console.scale,
     };
 }
 
@@ -219,4 +164,25 @@ fn consoleSinkCols(context: *anyopaque) u32 {
 
 fn consoleSinkRows(context: *anyopaque) u32 {
     return sinkConsole(context).textRows();
+}
+
+extern fn r4os_rust_boot_display_init(*State) bool;
+extern fn r4os_rust_boot_display_get(*State) bool;
+extern fn r4os_rust_boot_display_prepare(u64) bool;
+extern fn r4os_rust_boot_display_invalidate() void;
+export fn r4os_zig_boot_display_register(frame: *fb.Framebuffer) callconv(.c) void {
+    display.registerBootBackend(displayTargetFromBootFramebuffer(frame));
+}
+export fn r4os_zig_boot_display_outputs(frame: *fb.Framebuffer) callconv(.c) void {
+    @import("outputs.zig").initBoot(frame);
+}
+export fn r4os_zig_boot_display_surface() callconv(.c) void {
+    surface_pipeline.initFromDisplayManager();
+}
+
+export fn r4os_zig_boot_display_sink(console: *Console) callconv(.c) void {
+    log.setConsoleSink(consoleSink(console));
+}
+comptime {
+    if (@sizeOf(ConsoleMetrics) != 12 or @alignOf(ConsoleMetrics) != 4 or @offsetOf(ConsoleMetrics, "rows") != 4 or @offsetOf(ConsoleMetrics, "scale") != 8 or @sizeOf(State) != 12 or @alignOf(State) != 4 or @offsetOf(State, "console_metrics") != 0) @compileError("Native boot-display snapshot C layout");
 }

@@ -1,7 +1,20 @@
+// Native input helper; caller retains its existing queue/storage owner.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+extern fn r4os_rust_input_codepoint_reset(*Queue) void;
+extern fn r4os_rust_input_codepoint_clear(*Queue) void;
+extern fn r4os_rust_input_codepoint_push(*Queue, u32) bool;
+extern fn r4os_rust_input_codepoint_pop(*Queue, *u32) bool;
+extern fn r4os_rust_input_codepoint_pending(*const Queue) bool;
+extern fn r4os_rust_input_codepoint_count(*const Queue) u32;
+extern fn r4os_rust_input_codepoint_free(*const Queue) u32;
+extern fn r4os_rust_input_codepoint_accept(*const Queue, u32) bool;
+extern fn r4os_rust_input_codepoint_snapshot(*const Queue, *Snapshot) void;
 pub const STORAGE_LEN: usize = 256;
 pub const CAPACITY: u32 = STORAGE_LEN - 1;
 
-pub const Snapshot = struct {
+pub const Snapshot = extern struct {
     pending: u32 = 0,
     free: u32 = CAPACITY,
     high_water: u32 = 0,
@@ -9,7 +22,7 @@ pub const Snapshot = struct {
     dropped: u64 = 0,
 };
 
-pub const Queue = struct {
+pub const Queue = extern struct {
     items: [STORAGE_LEN]u32 = .{0} ** STORAGE_LEN,
     head: usize = 0,
     tail: usize = 0,
@@ -22,64 +35,42 @@ pub const Queue = struct {
     }
 
     pub fn reset(self: *Queue) void {
-        self.* = .{};
+        r4os_rust_input_codepoint_reset(self);
     }
 
     pub fn clear(self: *Queue) void {
-        self.items = .{0} ** STORAGE_LEN;
-        self.head = 0;
-        self.tail = 0;
+        r4os_rust_input_codepoint_clear(self);
     }
 
     pub fn tryPush(self: *Queue, codepoint: u32) bool {
-        self.push_attempts +%= 1;
-        const next = (self.head + 1) % STORAGE_LEN;
-        if (next == self.tail) {
-            self.dropped +%= 1;
-            return false;
-        }
-        self.items[self.head] = codepoint;
-        self.head = next;
-        const queued = self.pendingCount();
-        if (queued > self.high_water) self.high_water = queued;
-        return true;
+        return r4os_rust_input_codepoint_push(self, codepoint);
     }
 
     pub fn pop(self: *Queue) ?u32 {
-        if (self.head == self.tail) return null;
-        const codepoint = self.items[self.tail];
-        self.items[self.tail] = 0;
-        self.tail = (self.tail + 1) % STORAGE_LEN;
-        return codepoint;
+        var out: u32 = 0;
+        return if (r4os_rust_input_codepoint_pop(self, &out)) out else null;
     }
 
     pub fn pending(self: *const Queue) bool {
-        return self.head != self.tail;
+        return r4os_rust_input_codepoint_pending(self);
     }
 
     pub fn pendingCount(self: *const Queue) u32 {
-        return @intCast(if (self.head >= self.tail)
-            self.head - self.tail
-        else
-            STORAGE_LEN - self.tail + self.head);
+        return r4os_rust_input_codepoint_count(self);
     }
 
     pub fn freeCount(self: *const Queue) u32 {
-        return CAPACITY - self.pendingCount();
+        return r4os_rust_input_codepoint_free(self);
     }
 
     pub fn canAccept(self: *const Queue, count: u32) bool {
-        return count <= self.freeCount();
+        return r4os_rust_input_codepoint_accept(self, count);
     }
 
     pub fn snapshot(self: *const Queue) Snapshot {
-        return .{
-            .pending = self.pendingCount(),
-            .free = self.freeCount(),
-            .high_water = self.high_water,
-            .push_attempts = self.push_attempts,
-            .dropped = self.dropped,
-        };
+        var out: Snapshot = undefined;
+        r4os_rust_input_codepoint_snapshot(self, &out);
+        return out;
     }
 };
 
@@ -123,4 +114,12 @@ test "capacity reservation opens only after the complete report fits" {
 
     _ = queue.pop();
     try testing.expect(queue.canAccept(report_reserve));
+}
+
+comptime {
+    if (@sizeOf(Snapshot) != 32 or @alignOf(Snapshot) != 8 or @offsetOf(Snapshot, "pending") != 0 or @offsetOf(Snapshot, "free") != 4 or @offsetOf(Snapshot, "high_water") != 8 or @offsetOf(Snapshot, "push_attempts") != 16 or @offsetOf(Snapshot, "dropped") != 24) @compileError("Native input Snapshot layout");
+}
+
+comptime {
+    if (@sizeOf(Queue) != 1064 or @alignOf(Queue) != 8 or @offsetOf(Queue, "items") != 0 or @offsetOf(Queue, "head") != 1024 or @offsetOf(Queue, "tail") != 1032 or @offsetOf(Queue, "high_water") != 1040 or @offsetOf(Queue, "push_attempts") != 1048 or @offsetOf(Queue, "dropped") != 1056) @compileError("Native input Queue layout");
 }

@@ -7,6 +7,9 @@
 // builder data.
 
 const r4f = @import("r4f_format");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 
 pub const GLYPH_W: u8 = 8;
 pub const GLYPH_H: u8 = 8;
@@ -28,13 +31,19 @@ pub const MAX_STATUS_TEXT: usize = 48;
 pub const BUILTIN_FONT_ID: u32 = 0;
 const INVALID_CODEPOINT: u32 = 0xFFFFFFFF;
 
-const GlyphIndex = struct {
+pub const FontKind = enum(u16) {
+    builtin = 0,
+    bitmap = r4f.FONT_KIND_BITMAP,
+    windows_vector = r4f.FONT_KIND_WINDOWS_VECTOR,
+    sfnt_truetype = r4f.FONT_KIND_SFNT_TRUETYPE,
+    unknown = 0xFFFF,
+};
+const GlyphIndex = extern struct {
     count: u16 = 0,
     codepoints: [MAX_GLYPHS]u32 = .{INVALID_CODEPOINT} ** MAX_GLYPHS,
     glyph_ids: [MAX_GLYPHS]u16 = .{0} ** MAX_GLYPHS,
 };
-
-pub const GlyphBitmap = struct {
+pub const GlyphBitmap = extern struct {
     width: u32 = GLYPH_W,
     height: u32 = GLYPH_H,
     advance: u32 = GLYPH_W,
@@ -43,16 +52,7 @@ pub const GlyphBitmap = struct {
     fallback: bool = false,
     rows: [MAX_GLYPH_H]u64 = .{0} ** MAX_GLYPH_H,
 };
-
-pub const FontKind = enum(u16) {
-    builtin = 0,
-    bitmap = r4f.FONT_KIND_BITMAP,
-    windows_vector = r4f.FONT_KIND_WINDOWS_VECTOR,
-    sfnt_truetype = r4f.FONT_KIND_SFNT_TRUETYPE,
-    unknown = 0xFFFF,
-};
-
-pub const TextMetrics = struct {
+pub const TextMetrics = extern struct {
     width: u32 = 0,
     height: u32 = 0,
     baseline: i16 = 0,
@@ -60,8 +60,7 @@ pub const TextMetrics = struct {
     visible_bytes: usize = 0,
     clipped: bool = false,
 };
-
-pub const CatalogEntry = struct {
+pub const CatalogEntry = extern struct {
     used: bool = false,
     path: [MAX_FONT_PATH]u8 = .{0} ** MAX_FONT_PATH,
     path_len: usize = 0,
@@ -90,45 +89,7 @@ pub const CatalogEntry = struct {
     status: [MAX_STATUS_TEXT]u8 = .{0} ** MAX_STATUS_TEXT,
     status_len: usize = 0,
 };
-
-const TableSlice = struct {
-    data: []const u8 = &[_]u8{},
-
-    fn valid(self: TableSlice) bool {
-        return self.data.len != 0;
-    }
-};
-
-const ParsedFont = struct {
-    valid: bool = false,
-    kind: FontKind = .unknown,
-    weight: u16 = 0,
-    style_flags: u32 = 0,
-    charset_flags: u32 = 0,
-    face_count: u16 = 0,
-    strike_count: u16 = 0,
-    glyph_count: u32 = 0,
-    family: []const u8 = "R4OS",
-    face: []const u8 = "Builtin",
-    style: []const u8 = "Regular",
-    renderable: bool = false,
-    reason: []const u8 = "invalid",
-    width: u8 = GLYPH_W,
-    height: u8 = GLYPH_H,
-    bytes_per_row: u8 = 1,
-    max_advance: u8 = GLYPH_W,
-    ascent: i16 = GLYPH_H - 1,
-    descent: i16 = 1,
-    line_height: u8 = GLYPH_H,
-    baseline: i16 = GLYPH_H - 1,
-    strike_id: u16 = 0,
-    strike_table: TableSlice = .{},
-    map_table: TableSlice = .{},
-    metric_table: TableSlice = .{},
-    bitmap_table: TableSlice = .{},
-};
-
-const ActiveFont = struct {
+const ActiveFont = extern struct {
     width: u8,
     height: u8,
     bytes_per_row: u8,
@@ -144,8 +105,7 @@ const ActiveFont = struct {
     path: [MAX_FONT_PATH]u8 = .{0} ** MAX_FONT_PATH,
     path_len: usize = 0,
 };
-
-const CachedFont = struct {
+const CachedFont = extern struct {
     used: bool = false,
     width: u8 = GLYPH_W,
     height: u8 = GLYPH_H,
@@ -161,14 +121,15 @@ const CachedFont = struct {
     codepoints: [MAX_GLYPHS]u32 = .{INVALID_CODEPOINT} ** MAX_GLYPHS,
     index: GlyphIndex = .{},
 };
-
-pub const CatalogState = struct {
+pub const CatalogState = extern struct {
     revision: u32 = 1,
     catalog: [MAX_CATALOG_FONTS]CatalogEntry = .{CatalogEntry{}} ** MAX_CATALOG_FONTS,
     catalog_entries: usize = 0,
-    cached_fonts: []CachedFont = &.{},
+    cached_fonts: [*]CachedFont = @ptrFromInt(@alignOf(CachedFont)),
+    cached_fonts_len: usize = 0,
     temp_cached_font: CachedFont = .{},
-    active: ?ActiveFont = null,
+    active_present: bool = false,
+    active: ActiveFont = .{ .width = 0, .height = 0, .bytes_per_row = 0, .max_advance = 0, .ascent = 0, .descent = 0, .line_height = 0, .baseline = 0 },
     active_font_id: u32 = BUILTIN_FONT_ID,
     active_glyphs: [MAX_GLYPHS][MAX_GLYPH_H][MAX_BYTES_PER_ROW]u8 = .{.{.{0} ** MAX_BYTES_PER_ROW} ** MAX_GLYPH_H} ** MAX_GLYPHS,
     active_glyph_widths: [MAX_GLYPHS]u8 = .{GLYPH_W} ** MAX_GLYPHS,
@@ -176,474 +137,148 @@ pub const CatalogState = struct {
     active_index: GlyphIndex = .{},
 
     pub fn reset(self: *CatalogState) void {
-        self.active = null;
-        self.active_font_id = BUILTIN_FONT_ID;
+        r4os_rust_font_state_reset(self);
     }
-
     pub fn resetCatalog(self: *CatalogState) void {
-        self.catalog = .{CatalogEntry{}} ** MAX_CATALOG_FONTS;
-        self.catalog_entries = 0;
-        self.active = null;
-        self.active_font_id = BUILTIN_FONT_ID;
+        r4os_rust_font_state_reset_catalog(self);
     }
-
     pub fn glyphWidth(self: *const CatalogState) u32 {
-        if (self.active) |f| return f.max_advance;
-        return GLYPH_W;
+        return r4os_rust_font_state_glyph_width(self);
     }
-
     pub fn glyphHeight(self: *const CatalogState) u32 {
-        if (self.active) |f| return f.line_height;
-        return GLYPH_H;
+        return r4os_rust_font_state_glyph_height(self);
     }
-
     pub fn baseline(self: *const CatalogState) i16 {
-        if (self.active) |f| return f.baseline;
-        return GLYPH_H - 1;
+        return r4os_rust_font_state_baseline(self);
     }
-
     pub fn catalogCount(self: *const CatalogState) usize {
-        return self.catalog_entries;
+        return r4os_rust_font_state_catalog_count(self);
     }
-
     pub fn catalogEntry(self: *const CatalogState, index: usize) ?CatalogEntry {
-        if (index >= self.catalog_entries) return null;
-        return self.catalog[index];
+        var out: CatalogEntry = undefined;
+        return if (r4os_rust_font_state_catalog_entry(self, index, &out)) out else null;
     }
-
     pub fn fontCount(self: *const CatalogState) usize {
-        return 1 + self.catalog_entries;
+        return r4os_rust_font_state_font_count(self);
     }
-
     pub fn fontIdForCatalogIndex(self: *const CatalogState, index: usize) u32 {
-        if (index >= self.catalog_entries) return BUILTIN_FONT_ID;
-        return @intCast(index + 1);
+        return r4os_rust_font_state_font_id_for_catalog_index(self, index);
     }
-
     pub fn currentFontId(self: *const CatalogState) u32 {
-        if (self.isRenderableFontId(self.active_font_id)) return self.active_font_id;
-        return BUILTIN_FONT_ID;
+        return r4os_rust_font_state_current_font_id(self);
     }
-
     pub fn isRenderableFontId(self: *const CatalogState, font_id: u32) bool {
-        if (font_id == BUILTIN_FONT_ID) return true;
-        const index = self.catalogIndexForFontId(font_id) orelse return false;
-        return self.catalog[index].renderable and self.cached_fonts[index].used;
+        return r4os_rust_font_state_is_renderable_font_id(self, font_id);
     }
-
     pub fn normalizeFontId(self: *const CatalogState, font_id: u32) u32 {
-        return if (self.isRenderableFontId(font_id)) font_id else BUILTIN_FONT_ID;
+        return r4os_rust_font_state_normalize_font_id(self, font_id);
     }
-
     pub fn catalogEntryForFontId(self: *const CatalogState, font_id: u32) ?CatalogEntry {
-        const index = self.catalogIndexForFontId(font_id) orelse return null;
-        return self.catalog[index];
+        var out: CatalogEntry = undefined;
+        return if (r4os_rust_font_state_catalog_entry_for_font_id(self, font_id, &out)) out else null;
     }
-
     pub fn glyphRow(self: *const CatalogState, c: u8, row: u32) u8 {
-        if (self.active) |f| {
-            if (row >= f.height) return 0;
-            if (self.activeGlyphId(c)) |glyph_id| {
-                return self.active_glyphs[glyph_id][row][0];
-            }
-        }
-        if (row >= GLYPH_H) return 0;
-        return glyph(c)[row];
+        return r4os_rust_font_state_glyph_row(self, c, row);
     }
-
     pub fn glyphPixel(self: *const CatalogState, c: u8, row: u32, col: u32) bool {
-        if (self.active) |f| {
-            if (row >= f.height or col >= MAX_GLYPH_W) return false;
-            if (self.activeGlyphId(c)) |glyph_id| {
-                if (col >= self.active_glyph_widths[glyph_id]) return false;
-                const byte_index: usize = @intCast(col / 8);
-                if (byte_index >= f.bytes_per_row or byte_index >= MAX_BYTES_PER_ROW) return false;
-                const shift: u3 = @intCast(7 - (col & 7));
-                return ((self.active_glyphs[glyph_id][row][byte_index] >> shift) & 1) == 1;
-            }
-        }
-        if (row >= GLYPH_H or col >= GLYPH_W) return false;
-        const shift: u3 = @intCast(GLYPH_W - 1 - col);
-        return ((glyph(c)[row] >> shift) & 1) == 1;
+        return r4os_rust_font_state_glyph_pixel(self, c, row, col);
     }
-
     pub fn glyphBitmapWidth(self: *const CatalogState, c: u8) u32 {
-        if (self.active != null) {
-            if (self.activeGlyphId(c)) |glyph_id| return self.active_glyph_widths[glyph_id];
-        }
-        return GLYPH_W;
+        return r4os_rust_font_state_glyph_bitmap_width(self, c);
     }
-
     pub fn glyphAdvance(self: *const CatalogState, c: u8) u32 {
-        if (self.active != null) {
-            if (self.activeGlyphId(c)) |glyph_id| return self.active_glyph_advances[glyph_id];
-        }
-        return GLYPH_W;
+        return r4os_rust_font_state_glyph_advance(self, c);
     }
-
     pub fn glyphHeightForFont(self: *const CatalogState, font_id: u32) u32 {
-        if (self.cachedFont(font_id)) |f| return f.line_height;
-        return GLYPH_H;
+        return r4os_rust_font_state_glyph_height_for_font(self, font_id);
     }
-
     pub fn glyphAdvanceForFont(self: *const CatalogState, font_id: u32, codepoint: u32) u32 {
-        if (self.cachedFont(font_id)) |f| {
-            if (cachedGlyphId(f, codepoint)) |glyph_id| return f.advances[glyph_id];
-        }
-        return GLYPH_W;
+        return r4os_rust_font_state_glyph_advance_for_font(self, font_id, codepoint);
     }
-
     pub fn glyphBitmapWidthForFont(self: *const CatalogState, font_id: u32, codepoint: u32) u32 {
-        if (self.cachedFont(font_id)) |f| {
-            if (cachedGlyphId(f, codepoint)) |glyph_id| return f.widths[glyph_id];
-        }
-        return GLYPH_W;
+        return r4os_rust_font_state_glyph_bitmap_width_for_font(self, font_id, codepoint);
     }
-
     pub fn glyphPixelForFont(self: *const CatalogState, font_id: u32, codepoint: u32, row: u32, col: u32) bool {
-        if (self.cachedFont(font_id)) |f| {
-            if (row >= f.height or col >= MAX_GLYPH_W) return false;
-            if (cachedGlyphId(f, codepoint)) |glyph_id| {
-                if (col >= f.widths[glyph_id]) return false;
-                const byte_index: usize = @intCast(col / 8);
-                if (byte_index >= f.bytes_per_row or byte_index >= MAX_BYTES_PER_ROW) return false;
-                const shift: u3 = @intCast(7 - (col & 7));
-                return ((f.glyphs[glyph_id][row][byte_index] >> shift) & 1) == 1;
-            }
-        }
-        if (row >= GLYPH_H or col >= GLYPH_W) return false;
-        const shift: u3 = @intCast(GLYPH_W - 1 - col);
-        return ((builtinGlyphForCodepoint(codepoint)[row] >> shift) & 1) == 1;
+        return r4os_rust_font_state_glyph_pixel_for_font(self, font_id, codepoint, row, col);
     }
-
     pub fn glyphRowMaskForFont(self: *const CatalogState, font_id: u32, codepoint: u32, row: u32) u64 {
-        if (self.cachedFont(font_id)) |f| {
-            if (row >= f.height) return 0;
-            if (cachedGlyphId(f, codepoint)) |glyph_id| return cachedGlyphRowMask(f, glyph_id, row);
-        }
-        return builtinGlyphRowMask(codepoint, row);
+        return r4os_rust_font_state_glyph_row_mask_for_font(self, font_id, codepoint, row);
     }
-
     pub fn glyphBitmapForFont(self: *const CatalogState, font_id: u32, codepoint: u32) GlyphBitmap {
-        if (self.cachedFont(font_id)) |f| {
-            var result = GlyphBitmap{
-                .height = f.height,
-                .line_height = f.line_height,
-                .baseline = f.baseline,
-            };
-            if (cachedGlyphId(f, codepoint)) |glyph_id| {
-                result.width = f.widths[glyph_id];
-                result.advance = f.advances[glyph_id];
-                var row: u32 = 0;
-                while (row < f.height) : (row += 1) result.rows[row] = cachedGlyphRowMask(f, glyph_id, row);
-                return result;
-            }
-            result.fallback = true;
-            var row: u32 = 0;
-            while (row < @min(@as(u32, f.height), @as(u32, GLYPH_H))) : (row += 1) {
-                result.rows[row] = builtinGlyphRowMask(codepoint, row);
-            }
-            return result;
-        }
-
-        var result = GlyphBitmap{};
-        var row: u32 = 0;
-        while (row < GLYPH_H) : (row += 1) result.rows[row] = builtinGlyphRowMask(codepoint, row);
-        return result;
+        var out: GlyphBitmap = undefined;
+        r4os_rust_font_state_glyph_bitmap_for_font(self, font_id, codepoint, &out);
+        return out;
     }
-
     pub fn measure(self: *const CatalogState, text: []const u8) TextMetrics {
-        return self.measureWithFont(self.currentFontId(), text);
+        var out: TextMetrics = undefined;
+        r4os_rust_font_state_measure(self, text.ptr, text.len, &out);
+        return out;
     }
-
     pub fn measureZ(self: *const CatalogState, text_ptr: [*:0]const u8, max_bytes: usize) TextMetrics {
-        var len: usize = 0;
-        while (len < max_bytes and text_ptr[len] != 0) : (len += 1) {}
-        return self.measure(text_ptr[0..len]);
+        var out: TextMetrics = undefined;
+        r4os_rust_font_state_measure_z(self, text_ptr, max_bytes, &out);
+        return out;
     }
-
     pub fn measureWithFont(self: *const CatalogState, font_id: u32, text: []const u8) TextMetrics {
-        var line_w: u32 = 0;
-        var max_w: u32 = 0;
-        var lines: u32 = 1;
-        var visible: usize = 0;
-        const safe_font_id = self.normalizeFontId(font_id);
-        var cursor: usize = 0;
-        while (cursor < text.len) {
-            const decoded = decodeUtf8Scalar(text, cursor);
-            cursor += decoded.consumed;
-            if (decoded.codepoint == '\r') continue;
-            if (decoded.codepoint == '\n') {
-                if (line_w > max_w) max_w = line_w;
-                line_w = 0;
-                lines += 1;
-                visible += decoded.consumed;
-                continue;
-            }
-            line_w += self.glyphAdvanceForFont(safe_font_id, decoded.codepoint);
-            visible += decoded.consumed;
-        }
-        if (line_w > max_w) max_w = line_w;
-        const lh = self.glyphHeightForFont(safe_font_id);
-        return .{
-            .width = max_w,
-            .height = lines * lh,
-            .baseline = self.baselineForFont(safe_font_id),
-            .line_height = lh,
-            .visible_bytes = visible,
-        };
+        var out: TextMetrics = undefined;
+        r4os_rust_font_state_measure_with_font(self, font_id, text.ptr, text.len, &out);
+        return out;
     }
-
     pub fn measureZWithFont(self: *const CatalogState, font_id: u32, text_ptr: [*:0]const u8, max_bytes: usize) TextMetrics {
-        var len: usize = 0;
-        while (len < max_bytes and text_ptr[len] != 0) : (len += 1) {}
-        return self.measureWithFont(font_id, text_ptr[0..len]);
+        var out: TextMetrics = undefined;
+        r4os_rust_font_state_measure_z_with_font(self, font_id, text_ptr, max_bytes, &out);
+        return out;
     }
-
     pub fn baselineForFont(self: *const CatalogState, font_id: u32) i16 {
-        if (self.cachedFont(font_id)) |f| return f.baseline;
-        return GLYPH_H - 1;
+        return r4os_rust_font_state_baseline_for_font(self, font_id);
     }
-
     pub fn maxAdvanceForFont(self: *const CatalogState, font_id: u32) u32 {
-        if (self.cachedFont(font_id)) |f| return f.max_advance;
-        return GLYPH_W;
+        return r4os_rust_font_state_max_advance_for_font(self, font_id);
     }
-
     pub fn loadR4F(self: *CatalogState, bytes: []const u8) bool {
-        return self.loadR4FNamed("", bytes);
+        return r4os_rust_font_state_load_r4_f(self, bytes.ptr, bytes.len);
     }
-
     pub fn loadR4FNamed(self: *CatalogState, path: []const u8, bytes: []const u8) bool {
-        const parsed = parseR4F(bytes) orelse return false;
-        if (!parsed.renderable) return false;
-
-        if (!fillCachedFont(parsed, &self.temp_cached_font)) return false;
-        self.activateFont(&self.temp_cached_font, parsed.family, parsed.face, path);
-        self.markSelected(path);
-        self.active_font_id = self.fontIdForPath(path) orelse BUILTIN_FONT_ID;
-        return true;
+        return r4os_rust_font_state_load_r4_f_named(self, path.ptr, path.len, bytes.ptr, bytes.len);
     }
-
     pub fn registerR4F(self: *CatalogState, path: []const u8, bytes: []const u8) bool {
-        const parsed_opt = parseR4F(bytes);
-        var entry = CatalogEntry{};
-        copyField(entry.path[0..], &entry.path_len, path);
-        if (parsed_opt) |parsed| {
-            entry.used = true;
-            entry.kind = parsed.kind;
-            entry.weight = parsed.weight;
-            entry.style_flags = parsed.style_flags;
-            entry.charset_flags = parsed.charset_flags;
-            entry.face_count = parsed.face_count;
-            entry.strike_count = parsed.strike_count;
-            entry.glyph_count = parsed.glyph_count;
-            entry.renderable = parsed.renderable;
-            entry.width = parsed.width;
-            entry.height = parsed.height;
-            entry.max_advance = parsed.max_advance;
-            entry.ascent = parsed.ascent;
-            entry.descent = parsed.descent;
-            entry.line_height = parsed.line_height;
-            entry.baseline = parsed.baseline;
-            copyField(entry.family[0..], &entry.family_len, parsed.family);
-            copyField(entry.face[0..], &entry.face_len, parsed.face);
-            copyField(entry.style[0..], &entry.style_len, parsed.style);
-            copyField(entry.status[0..], &entry.status_len, parsed.reason);
-        } else {
-            entry.used = true;
-            entry.kind = .unknown;
-            entry.renderable = false;
-            copyField(entry.family[0..], &entry.family_len, "Invalid");
-            copyField(entry.face[0..], &entry.face_len, "Invalid R4F");
-            copyField(entry.style[0..], &entry.style_len, "Error");
-            copyField(entry.status[0..], &entry.status_len, "invalid R4F1");
-        }
-        const slot = self.addCatalogEntry(entry) orelse return false;
-        self.cached_fonts[slot].used = false;
-        if (parsed_opt) |parsed| {
-            if (parsed.renderable) {
-                if (!fillCachedFont(parsed, &self.cached_fonts[slot])) {
-                    self.cached_fonts[slot] = .{};
-                    self.catalog[slot].renderable = false;
-                    copyField(self.catalog[slot].status[0..], &self.catalog[slot].status_len, "cache failed");
-                }
-            }
-        }
-        return self.catalog[slot].renderable;
-    }
-
-    fn activateFont(self: *CatalogState, cached: *const CachedFont, family: []const u8, face: []const u8, path: []const u8) void {
-        self.active_glyphs = cached.glyphs;
-        self.active_glyph_widths = cached.widths;
-        self.active_glyph_advances = cached.advances;
-        self.active_index = cached.index;
-        var next_active = ActiveFont{
-            .width = cached.width,
-            .height = cached.height,
-            .bytes_per_row = cached.bytes_per_row,
-            .max_advance = cached.max_advance,
-            .ascent = cached.ascent,
-            .descent = cached.descent,
-            .line_height = cached.line_height,
-            .baseline = cached.baseline,
-        };
-        copyField(next_active.family[0..], &next_active.family_len, family);
-        copyField(next_active.face[0..], &next_active.face_len, face);
-        copyField(next_active.path[0..], &next_active.path_len, path);
-        self.active = next_active;
-    }
-
-    fn addCatalogEntry(self: *CatalogState, entry: CatalogEntry) ?usize {
-        if (self.catalog_entries >= self.catalog.len) return null;
-        const slot = self.catalog_entries;
-        self.catalog[self.catalog_entries] = entry;
-        self.catalog_entries += 1;
-        return slot;
-    }
-
-    fn markSelected(self: *CatalogState, path: []const u8) void {
-        var i: usize = 0;
-        while (i < self.catalog_entries) : (i += 1) {
-            self.catalog[i].selected = path.len != 0 and pathEquals(self.catalog[i].path[0..self.catalog[i].path_len], path);
-        }
-    }
-
-    fn fontIdForPath(self: *const CatalogState, path: []const u8) ?u32 {
-        if (path.len == 0) return null;
-        var i: usize = 0;
-        while (i < self.catalog_entries) : (i += 1) {
-            if (pathEquals(self.catalog[i].path[0..self.catalog[i].path_len], path)) return self.fontIdForCatalogIndex(i);
-        }
-        return null;
-    }
-
-    fn catalogIndexForFontId(self: *const CatalogState, font_id: u32) ?usize {
-        if (font_id == BUILTIN_FONT_ID) return null;
-        const raw = font_id - 1;
-        if (raw >= self.catalog_entries) return null;
-        return @intCast(raw);
-    }
-
-    fn cachedFont(self: *const CatalogState, font_id: u32) ?*const CachedFont {
-        const index = self.catalogIndexForFontId(font_id) orelse return null;
-        if (!self.cached_fonts[index].used) return null;
-        return &self.cached_fonts[index];
-    }
-
-    fn activeGlyphId(self: *const CatalogState, codepoint: u32) ?usize {
-        return indexedGlyphId(&self.active_index, codepoint, null);
+        return r4os_rust_font_state_register_r4_f(self, path.ptr, path.len, bytes.ptr, bytes.len);
     }
 };
-
-// Two resident banks bound both preparation and retirement. Readers retain the
-// selected immutable bank; a replacement never overwrites a retained bank.
-// The writer flag reserves storage across filesystem waits, it is not a spin
-// lock. A competing reload or retained retired bank returns unavailable.
-const lifetime = if (@import("builtin").os.tag == .freestanding) @import("../sched/task_context.zig") else struct {
-    pub const UnwindToken = struct {
-        pub fn admitted(_: @This()) bool {
-            return true;
-        }
-    };
-    pub fn enterUnwind() UnwindToken {
-        return .{};
-    }
-    pub fn leaveUnwind(_: UnwindToken) bool {
-        return true;
-    }
-};
-const empty_catalog: CatalogState = .{};
-var catalog_banks: [2]CatalogState = .{ .{}, .{} };
-// Unpublished glyph payload needs no initialized on-disk kernel data. Every
-// registered slot sets used=false before a complete decode can publish it.
-var catalog_payloads: [2][MAX_CATALOG_FONTS]CachedFont = undefined;
-pub const catalog_bank_bytes = @sizeOf(CatalogState) + @sizeOf([MAX_CATALOG_FONTS]CachedFont);
-var current_bank: u8 = 0;
-var catalog_readers: [2]u32 = .{ 0, 0 };
-var catalog_writer: u8 = 0;
-
-pub const CatalogView = struct {
-    bank: ?u8 = null,
-    unwind: lifetime.UnwindToken = .{},
-
+pub const CatalogView = extern struct {
+    bank: u8 = 255,
+    unwind: @import("../sched/task_context.zig").UnwindToken = .{},
     pub fn state(self: *const CatalogView) *const CatalogState {
-        return if (self.bank) |bank| &catalog_banks[bank] else &empty_catalog;
+        return r4os_rust_font_view_state(self);
     }
     pub fn release(self: *CatalogView) void {
-        if (self.bank) |bank| {
-            _ = @atomicRmw(u32, &catalog_readers[bank], .Sub, 1, .release);
-            _ = lifetime.leaveUnwind(self.unwind);
-            self.bank = null;
-        }
+        r4os_rust_font_view_release(self);
     }
 };
-
-pub fn acquireCatalog() CatalogView {
-    const unwind = lifetime.enterUnwind();
-    if (!unwind.admitted()) return .{};
-    while (true) {
-        const bank = @atomicLoad(u8, &current_bank, .acquire);
-        _ = @atomicRmw(u32, &catalog_readers[bank], .Add, 1, .seq_cst);
-        // A reader which raced publication must not access that retired bank.
-        // The second read pairs with the writer's retirement check; a late
-        // registration can inspect bytes only after a matching publication.
-        if (@atomicLoad(u8, &current_bank, .seq_cst) == bank) return .{ .bank = bank, .unwind = unwind };
-        _ = @atomicRmw(u32, &catalog_readers[bank], .Sub, 1, .release);
-    }
-}
-
-pub const CatalogReplacement = struct {
+pub const CatalogReplacement = extern struct {
     bank: u8,
-    unwind: lifetime.UnwindToken,
+    unwind: @import("../sched/task_context.zig").UnwindToken,
     owned: bool = true,
-
     pub fn state(self: *CatalogReplacement) *CatalogState {
-        @import("std").debug.assert(self.owned);
-        return &catalog_banks[self.bank];
+        return r4os_rust_font_replacement_state(self);
     }
     pub fn commit(self: *CatalogReplacement) void {
-        if (!self.owned) return;
-        const old = @atomicLoad(u8, &current_bank, .acquire);
-        var revision = catalog_banks[old].revision +% 1;
-        if (revision == 0) revision = 1;
-        self.state().revision = revision;
-        @atomicStore(u8, &current_bank, self.bank, .seq_cst);
-        self.abort();
+        r4os_rust_font_replacement_commit(self);
     }
     pub fn abort(self: *CatalogReplacement) void {
-        if (!self.owned) return;
-        self.owned = false;
-        @atomicStore(u8, &catalog_writer, 0, .release);
-        _ = lifetime.leaveUnwind(self.unwind);
+        r4os_rust_font_replacement_abort(self);
     }
 };
-
-pub fn beginCatalogReplacement(preserve: bool) ?CatalogReplacement {
-    const unwind = lifetime.enterUnwind();
-    if (!unwind.admitted()) return null;
-    if (@cmpxchgStrong(u8, &catalog_writer, 0, 1, .acquire, .monotonic) != null) {
-        _ = lifetime.leaveUnwind(unwind);
-        return null;
-    }
-    const old = @atomicLoad(u8, &current_bank, .acquire);
-    const next = old ^ 1;
-    if (@atomicLoad(u32, &catalog_readers[next], .seq_cst) != 0) {
-        @atomicStore(u8, &catalog_writer, 0, .release);
-        _ = lifetime.leaveUnwind(unwind);
-        return null;
-    }
-    // Copy directly between resident banks/constant data, never through a
-    // multi-megabyte stack temporary. No published payload is mutated.
-    const source = if (preserve) &catalog_banks[old] else &empty_catalog;
-    @memcpy(@as([*]u8, @ptrCast(&catalog_banks[next]))[0..@sizeOf(CatalogState)], @as([*]const u8, @ptrCast(source))[0..@sizeOf(CatalogState)]);
-    catalog_banks[next].cached_fonts = &catalog_payloads[next];
-    if (preserve and source.catalog_entries != 0) {
-        const bytes = source.catalog_entries * @sizeOf(CachedFont);
-        @memcpy(@as([*]u8, @ptrCast(catalog_payloads[next][0..].ptr))[0..bytes], @as([*]const u8, @ptrCast(source.cached_fonts.ptr))[0..bytes]);
-    }
-    return .{ .bank = next, .unwind = unwind };
+pub fn acquireCatalog() CatalogView {
+    var out: CatalogView = undefined;
+    r4os_rust_font_acquire(&out);
+    return out;
 }
+pub fn beginCatalogReplacement(preserve: bool) ?CatalogReplacement {
+    var out: CatalogReplacement = undefined;
+    return if (r4os_rust_font_begin(preserve, &out)) out else null;
+}
+pub const catalog_bank_bytes = @sizeOf(CatalogState) + @sizeOf([MAX_CATALOG_FONTS]CachedFont);
 
 pub fn catalogRevision() u32 {
     var view = acquireCatalog();
@@ -863,713 +498,74 @@ pub fn registerR4F(path: []const u8, bytes: []const u8) bool {
 pub fn glyph(c: u8) [8]u8 {
     return builtinGlyphForCodepoint(c);
 }
-
-pub fn builtinGlyphForCodepoint(codepoint: u32) [8]u8 {
-    if (codepoint >= 0x20 and codepoint <= 0x7E) return builtin_ascii_font[codepoint - 0x20];
-    return switch (codepoint) {
-        0x00A0 => builtin_ascii_font[0],
-        0x00C0 => accentedGlyph('A', 0x30, true),
-        0x00C1 => accentedGlyph('A', 0x0C, true),
-        0x00C2 => accentedGlyph('A', 0x38, true),
-        0x00C3 => accentedGlyph('A', 0x76, true),
-        0x00C4 => accentedGlyph('A', 0x66, true),
-        0x00C5 => accentedGlyph('A', 0x38, true),
-        0x00C6 => .{ 0x7E, 0xD8, 0xD8, 0xFE, 0xD8, 0xD8, 0xDE, 0x00 },
-        0x00C7 => cedillaGlyph('C'),
-        0x00C8 => accentedGlyph('E', 0x30, true),
-        0x00C9 => accentedGlyph('E', 0x0C, true),
-        0x00CA => accentedGlyph('E', 0x38, true),
-        0x00CB => accentedGlyph('E', 0x66, true),
-        0x00CC => accentedGlyph('I', 0x30, true),
-        0x00CD => accentedGlyph('I', 0x0C, true),
-        0x00CE => accentedGlyph('I', 0x38, true),
-        0x00CF => accentedGlyph('I', 0x66, true),
-        0x00D0 => .{ 0xF8, 0x6C, 0x66, 0xF6, 0x66, 0x6C, 0xF8, 0x00 },
-        0x00D1 => accentedGlyph('N', 0x76, true),
-        0x00D2 => accentedGlyph('O', 0x30, true),
-        0x00D3 => accentedGlyph('O', 0x0C, true),
-        0x00D4 => accentedGlyph('O', 0x38, true),
-        0x00D5 => accentedGlyph('O', 0x76, true),
-        0x00D6 => accentedGlyph('O', 0x66, true),
-        0x00D7 => .{ 0x00, 0xC6, 0x6C, 0x38, 0x6C, 0xC6, 0x00, 0x00 },
-        0x00D8 => .{ 0x7E, 0xCE, 0xDE, 0xF6, 0xE6, 0xC6, 0xFC, 0x00 },
-        0x00D9 => accentedGlyph('U', 0x30, true),
-        0x00DA => accentedGlyph('U', 0x0C, true),
-        0x00DB => accentedGlyph('U', 0x38, true),
-        0x00DC => accentedGlyph('U', 0x66, true),
-        0x00DD => accentedGlyph('Y', 0x0C, true),
-        0x00DE => .{ 0xF0, 0x60, 0x7C, 0x66, 0x7C, 0x60, 0xF0, 0x00 },
-        0x00DF => .{ 0x78, 0xCC, 0xCC, 0xD8, 0xCC, 0xCC, 0xD8, 0xC0 },
-        0x00E0 => accentedGlyph('a', 0x30, false),
-        0x00E1 => accentedGlyph('a', 0x0C, false),
-        0x00E2 => accentedGlyph('a', 0x38, false),
-        0x00E3 => accentedGlyph('a', 0x76, false),
-        0x00E4 => accentedGlyph('a', 0x66, false),
-        0x00E5 => accentedGlyph('a', 0x38, false),
-        0x00E6 => .{ 0x00, 0x00, 0xEC, 0x16, 0x7E, 0xD8, 0x76, 0x00 },
-        0x00E7 => cedillaGlyph('c'),
-        0x00E8 => accentedGlyph('e', 0x30, false),
-        0x00E9 => accentedGlyph('e', 0x0C, false),
-        0x00EA => accentedGlyph('e', 0x38, false),
-        0x00EB => accentedGlyph('e', 0x66, false),
-        0x00EC => accentedGlyph('i', 0x30, false),
-        0x00ED => accentedGlyph('i', 0x0C, false),
-        0x00EE => accentedGlyph('i', 0x38, false),
-        0x00EF => accentedGlyph('i', 0x66, false),
-        0x00F0 => .{ 0x30, 0x18, 0x7C, 0xCC, 0xCC, 0xCC, 0x78, 0x00 },
-        0x00F1 => accentedGlyph('n', 0x76, false),
-        0x00F2 => accentedGlyph('o', 0x30, false),
-        0x00F3 => accentedGlyph('o', 0x0C, false),
-        0x00F4 => accentedGlyph('o', 0x38, false),
-        0x00F5 => accentedGlyph('o', 0x76, false),
-        0x00F6 => accentedGlyph('o', 0x66, false),
-        0x00F7 => .{ 0x00, 0x18, 0x00, 0x7E, 0x00, 0x18, 0x00, 0x00 },
-        0x00F8 => .{ 0x00, 0x00, 0x7E, 0xDC, 0xF6, 0x66, 0xFC, 0x00 },
-        0x00F9 => accentedGlyph('u', 0x30, false),
-        0x00FA => accentedGlyph('u', 0x0C, false),
-        0x00FB => accentedGlyph('u', 0x38, false),
-        0x00FC => accentedGlyph('u', 0x66, false),
-        0x00FD => accentedGlyph('y', 0x0C, false),
-        0x00FE => .{ 0xE0, 0x60, 0x7C, 0x66, 0x66, 0x7C, 0x60, 0xF0 },
-        0x00FF => accentedGlyph('y', 0x66, false),
-        else => builtin_ascii_font[unknown_index],
-    };
+pub fn builtinGlyphForCodepoint(cp: u32) [8]u8 {
+    var out: [8]u8 = undefined;
+    r4os_rust_font_builtin(cp, &out);
+    return out;
 }
-
-fn accentedGlyph(base: u8, accent: u8, shift_base: bool) [8]u8 {
-    const source = builtin_ascii_font[base - 0x20];
-    var result: [8]u8 = .{0} ** 8;
-    result[0] = accent;
-    if (shift_base) {
-        var row: usize = 1;
-        while (row < result.len) : (row += 1) result[row] = source[row - 1];
-    } else {
-        var row: usize = 1;
-        while (row < result.len) : (row += 1) result[row] = source[row];
-    }
-    return result;
-}
-
-fn cedillaGlyph(base: u8) [8]u8 {
-    var result = builtin_ascii_font[base - 0x20];
-    result[7] = 0x30;
-    return result;
-}
-
-/// Returns one rendered row as a least-significant-bit-first mask.  The
-/// bounded codepoint index is resolved exactly once for the complete row.
-/// Materializes every rendered row after one bounded index lookup.  Missing
-/// codepoints retain the historical builtin fallback and the selected font's
-/// line metrics; no persistent R4F bytes leave the kernel cache.
-fn cachedGlyphRowMask(cached: *const CachedFont, glyph_id: usize, row: u32) u64 {
-    if (glyph_id >= MAX_GLYPHS or row >= cached.height) return 0;
-    const width: u32 = @min(@as(u32, cached.widths[glyph_id]), @as(u32, MAX_GLYPH_W));
-    var result: u64 = 0;
-    var column: u32 = 0;
-    while (column < width) : (column += 1) {
-        const byte_index: usize = @intCast(column / 8);
-        if (byte_index >= cached.bytes_per_row or byte_index >= MAX_BYTES_PER_ROW) break;
-        const shift: u3 = @intCast(7 - (column & 7));
-        if (((cached.glyphs[glyph_id][row][byte_index] >> shift) & 1) == 1) {
-            result |= @as(u64, 1) << @intCast(column);
-        }
-    }
-    return result;
-}
-
-fn builtinGlyphRowMask(codepoint: u32, row: u32) u64 {
-    if (row >= GLYPH_H) return 0;
-    const source = builtinGlyphForCodepoint(codepoint)[row];
-    var result: u64 = 0;
-    var column: u32 = 0;
-    while (column < GLYPH_W) : (column += 1) {
-        const shift: u3 = @intCast(GLYPH_W - 1 - column);
-        if (((source >> shift) & 1) == 1) result |= @as(u64, 1) << @intCast(column);
-    }
-    return result;
-}
-
-fn parseR4F(bytes: []const u8) ?ParsedFont {
-    if (bytes.len < r4f.HEADER_SIZE) return null;
-    if (!eq(bytes[0..4], &r4f.MAGIC)) return null;
-    const version = readLe16(bytes[4..6]);
-    const header_size = readLe16(bytes[6..8]);
-    const file_flags = readLe32(bytes[8..12]);
-    const file_size = readLe32(bytes[12..16]);
-    const table_dir_offset = readLe32(bytes[16..20]);
-    const table_count = readLe16(bytes[20..22]);
-    const face_count = readLe16(bytes[22..24]);
-    const strike_count = readLe16(bytes[24..26]);
-    const glyph_count = readLe32(bytes[28..32]);
-    if (version != r4f.VERSION or header_size < r4f.HEADER_SIZE) return null;
-    if (file_size < header_size or file_size > bytes.len) return null;
-    if (table_dir_offset < header_size) return null;
-    if (!rangeValid(file_size, table_dir_offset, @as(u32, table_count) * @as(u32, @intCast(r4f.TABLE_ENTRY_SIZE)))) return null;
-
-    const names = findTable(bytes, file_size, table_dir_offset, table_count, r4f.TABLE_NAME) orelse &[_]u8{};
-    const face_table = findTable(bytes, file_size, table_dir_offset, table_count, r4f.TABLE_FACE) orelse &[_]u8{};
-    const strike_table = findTable(bytes, file_size, table_dir_offset, table_count, r4f.TABLE_STRIKE) orelse &[_]u8{};
-    const map_table = findTable(bytes, file_size, table_dir_offset, table_count, r4f.TABLE_GLYPH_MAP) orelse &[_]u8{};
-    const metric_table = findTable(bytes, file_size, table_dir_offset, table_count, r4f.TABLE_GLYPH_METRICS) orelse &[_]u8{};
-    const bitmap_table = findTable(bytes, file_size, table_dir_offset, table_count, r4f.TABLE_BITMAP_DATA) orelse &[_]u8{};
-
-    var parsed = ParsedFont{
-        .valid = true,
-        .face_count = face_count,
-        .strike_count = strike_count,
-        .glyph_count = glyph_count,
-        .renderable = false,
-        .reason = "no renderable strike",
-        .strike_table = .{ .data = strike_table },
-        .map_table = .{ .data = map_table },
-        .metric_table = .{ .data = metric_table },
-        .bitmap_table = .{ .data = bitmap_table },
-    };
-
-    if (face_table.len >= r4f.FACE_RECORD_SIZE) {
-        parsed.kind = fontKind(readLe16(face_table[2..4]));
-        parsed.style_flags = readLe32(face_table[4..8]);
-        parsed.weight = readLe16(face_table[8..10]);
-        parsed.charset_flags = readLe32(face_table[12..16]);
-        const face_ascent = readLeI16(face_table[18..20]);
-        const face_descent = readLeI16(face_table[20..22]);
-        const face_line_height = readLeI16(face_table[28..30]);
-        parsed.ascent = face_ascent;
-        parsed.descent = face_descent;
-        if (face_line_height > 0 and face_line_height <= MAX_GLYPH_H) parsed.line_height = @intCast(face_line_height);
-        parsed.baseline = if (face_ascent > 0) face_ascent else parsed.baseline;
-        parsed.family = nameAt(names, readLe32(face_table[30..34]), "R4OS");
-        parsed.face = nameAt(names, readLe32(face_table[34..38]), parsed.family);
-        parsed.style = nameAt(names, readLe32(face_table[38..42]), "Regular");
-    } else if ((file_flags & r4f.FLAG_HAS_SFNT) != 0) {
-        parsed.kind = .sfnt_truetype;
-    } else if ((file_flags & r4f.FLAG_HAS_OUTLINE) != 0) {
-        parsed.kind = .windows_vector;
-    }
-
-    if (strike_table.len >= r4f.STRIKE_RECORD_SIZE and map_table.len >= 4 and metric_table.len >= 4 and bitmap_table.len >= 8) {
-        const strike_id = readLe16(strike_table[0..2]);
-        const width_u16 = readLe16(strike_table[8..10]);
-        const height_u16 = readLe16(strike_table[10..12]);
-        const strike_ascent = readLeI16(strike_table[12..14]);
-        const strike_descent = readLeI16(strike_table[14..16]);
-        const strike_line_height = readLeI16(strike_table[16..18]);
-        const strike_baseline = readLeI16(strike_table[18..20]);
-        const bitmap_format = readLe16(strike_table[20..22]);
-        const bytes_per_row = readLe16(strike_table[22..24]);
-        const strike_glyph_count = readLe32(strike_table[24..28]);
-        if (width_u16 > 0 and width_u16 <= MAX_GLYPH_W and height_u16 > 0 and height_u16 <= MAX_GLYPH_H and bytes_per_row > 0 and bytes_per_row <= MAX_BYTES_PER_ROW and bitmap_format == r4f.BITMAP_FORMAT_MONO1_MSB and strike_glyph_count > 0 and strike_glyph_count <= MAX_GLYPHS) {
-            parsed.strike_id = strike_id;
-            parsed.width = @intCast(width_u16);
-            parsed.height = @intCast(height_u16);
-            parsed.bytes_per_row = @intCast(bytes_per_row);
-            parsed.glyph_count = strike_glyph_count;
-            parsed.max_advance = @intCast(width_u16);
-            parsed.ascent = if (strike_ascent > 0) strike_ascent else parsed.ascent;
-            parsed.descent = strike_descent;
-            if (strike_line_height > 0 and strike_line_height <= MAX_GLYPH_H) parsed.line_height = @intCast(strike_line_height) else parsed.line_height = @intCast(height_u16);
-            parsed.baseline = if (strike_baseline > 0) strike_baseline else parsed.ascent;
-            parsed.renderable = true;
-            parsed.reason = "bitmap strike";
-            parsed.kind = .bitmap;
-            return parsed;
-        }
-        parsed.reason = "unsupported bitmap strike";
-        return parsed;
-    }
-
-    if ((file_flags & r4f.FLAG_HAS_SFNT) != 0) {
-        parsed.kind = .sfnt_truetype;
-        parsed.reason = "sfnt catalog only";
-    } else if ((file_flags & r4f.FLAG_HAS_OUTLINE) != 0) {
-        parsed.kind = .windows_vector;
-        parsed.reason = "outline catalog only";
-    }
-    return parsed;
-}
-
-fn eq(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (a[i] != b[i]) return false;
-    }
-    return true;
-}
-
-fn readLe16(s: []const u8) u16 {
-    return @as(u16, s[0]) | (@as(u16, s[1]) << 8);
-}
-
-fn readLeI16(s: []const u8) i16 {
-    return @as(i16, @bitCast(readLe16(s)));
-}
-
-fn readLe32(s: []const u8) u32 {
-    return @as(u32, s[0]) |
-        (@as(u32, s[1]) << 8) |
-        (@as(u32, s[2]) << 16) |
-        (@as(u32, s[3]) << 24);
-}
-
-fn findTable(bytes: []const u8, file_size: u32, dir_offset: u32, table_count: u16, tag: u32) ?[]const u8 {
-    var i: u16 = 0;
-    while (i < table_count) : (i += 1) {
-        const off: usize = @as(usize, dir_offset) + @as(usize, i) * r4f.TABLE_ENTRY_SIZE;
-        const entry = bytes[off .. off + r4f.TABLE_ENTRY_SIZE];
-        const entry_tag = readLe32(entry[0..4]);
-        const table_offset = readLe32(entry[4..8]);
-        const table_size = readLe32(entry[8..12]);
-        if (entry_tag == tag) {
-            if (!rangeValid(file_size, table_offset, table_size)) return null;
-            return bytes[table_offset .. table_offset + table_size];
-        }
-    }
-    return null;
-}
-
-fn loadBitmapGlyphs(table: []const u8, strike_id: u16, height: u8, bytes_per_row: u8, glyph_count: u32, out: *[MAX_GLYPHS][MAX_GLYPH_H][MAX_BYTES_PER_ROW]u8) bool {
-    if (table.len < 8) return false;
-    const record_count = readLe32(table[0..4]);
-    const payload_start = readLe32(table[4..8]);
-    if (record_count < glyph_count) return false;
-    if (!recordsFit(table.len, 8, record_count, r4f.BITMAP_GLYPH_RECORD_SIZE)) return false;
-    const records_end = 8 + @as(usize, record_count) * r4f.BITMAP_GLYPH_RECORD_SIZE;
-    if (payload_start < records_end or payload_start > table.len) return false;
-    var loaded: u32 = 0;
-    var i: u32 = 0;
-    while (i < record_count) : (i += 1) {
-        const off: usize = 8 + @as(usize, i) * r4f.BITMAP_GLYPH_RECORD_SIZE;
-        const glyph_id = readLe32(table[off .. off + 4]);
-        const rec_strike_id = readLe16(table[off + 4 .. off + 6]);
-        const format = readLe16(table[off + 6 .. off + 8]);
-        const data_offset = readLe32(table[off + 8 .. off + 12]);
-        const data_size = readLe32(table[off + 12 .. off + 16]);
-        if (rec_strike_id != strike_id) continue;
-        if (format != r4f.BITMAP_FORMAT_MONO1_MSB) return false;
-        const needed = @as(u32, height) * @as(u32, bytes_per_row);
-        if (glyph_id >= glyph_count or glyph_id >= MAX_GLYPHS or data_size < needed) return false;
-        if (data_offset < payload_start or !rangeValid(@intCast(table.len), data_offset, data_size)) return false;
-        var row: u8 = 0;
-        while (row < height) : (row += 1) {
-            var b: u8 = 0;
-            while (b < bytes_per_row) : (b += 1) {
-                out[glyph_id][row][b] = table[data_offset + @as(u32, row) * bytes_per_row + b];
-            }
-        }
-        loaded += 1;
-    }
-    return loaded >= glyph_count;
-}
-
-fn loadGlyphMetrics(table: []const u8, glyph_count: u32, fallback_width: u8, fallback_advance: u8, widths: *[MAX_GLYPHS]u8, advances: *[MAX_GLYPHS]u8) bool {
-    if (table.len < 4) return false;
-    const record_count = readLe32(table[0..4]);
-    if (!recordsFit(table.len, 4, record_count, r4f.GLYPH_METRIC_RECORD_SIZE)) return false;
-    var i: u32 = 0;
-    while (i < record_count) : (i += 1) {
-        const off: usize = 4 + @as(usize, i) * r4f.GLYPH_METRIC_RECORD_SIZE;
-        const glyph_id = readLe32(table[off .. off + 4]);
-        if (glyph_id >= glyph_count or glyph_id >= MAX_GLYPHS) continue;
-        const advance = readLeI16(table[off + 4 .. off + 6]);
-        const x0 = readLeI16(table[off + 12 .. off + 14]);
-        const x1 = readLeI16(table[off + 16 .. off + 18]);
-        const width_i = @as(i32, x1) - @as(i32, x0);
-        if (width_i < 0 or width_i > MAX_GLYPH_W) return false;
-        widths[glyph_id] = clampMetric(width_i, fallback_width);
-        advances[glyph_id] = clampMetric(advance, fallback_advance);
-    }
-    return true;
-}
-
-fn loadGlyphMap(table: []const u8, glyph_count: u32, out: *[MAX_GLYPHS]u32) bool {
-    if (table.len < 4) return false;
-    const record_count = readLe32(table[0..4]);
-    if (!recordsFit(table.len, 4, record_count, r4f.GLYPH_MAP_RECORD_SIZE)) return false;
-    var mapped: u32 = 0;
-    var i: u32 = 0;
-    while (i < record_count) : (i += 1) {
-        const off: usize = 4 + @as(usize, i) * r4f.GLYPH_MAP_RECORD_SIZE;
-        const codepoint = readLe32(table[off + 4 .. off + 8]);
-        const glyph_id = readLe32(table[off + 8 .. off + 12]);
-        if (codepoint <= 0x10FFFF and glyph_id < glyph_count and glyph_id < MAX_GLYPHS) {
-            out[glyph_id] = codepoint;
-            mapped += 1;
-        }
-    }
-    return mapped > 0;
-}
-
-fn fillCachedFont(parsed: ParsedFont, cached: *CachedFont) bool {
-    if (!parsed.renderable) return false;
-    cached.* = CachedFont{
-        .used = true,
-        .width = parsed.width,
-        .height = parsed.height,
-        .bytes_per_row = parsed.bytes_per_row,
-        .max_advance = parsed.max_advance,
-        .ascent = parsed.ascent,
-        .descent = parsed.descent,
-        .line_height = parsed.line_height,
-        .baseline = parsed.baseline,
-        .widths = .{parsed.width} ** MAX_GLYPHS,
-        .advances = .{parsed.max_advance} ** MAX_GLYPHS,
-    };
-    if (!loadGlyphMetrics(parsed.metric_table.data, parsed.glyph_count, parsed.width, parsed.max_advance, &cached.widths, &cached.advances)) return false;
-    if (!loadBitmapGlyphs(parsed.bitmap_table.data, parsed.strike_id, parsed.height, parsed.bytes_per_row, parsed.glyph_count, &cached.glyphs)) return false;
-    if (!loadGlyphMap(parsed.map_table.data, parsed.glyph_count, &cached.codepoints)) return false;
-    return buildGlyphIndex(&cached.codepoints, &cached.index);
-}
-
-fn rangeValid(total: u32, offset: u32, size: u32) bool {
-    if (offset > total) return false;
-    if (size > total - offset) return false;
-    return true;
-}
-
-fn recordsFit(total: usize, offset: usize, count: u32, stride: usize) bool {
-    return offset <= total and stride != 0 and count <= (total - offset) / stride;
-}
-
-fn pathEquals(a: []const u8, b: []const u8) bool {
-    return normalizedPathEquals(a, b) or normalizedPathEquals(stripDrive(a), stripDrive(b));
-}
-
-fn normalizedPathEquals(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        var ca = a[i];
-        var cb = b[i];
-        if (ca == '/') ca = '\\';
-        if (cb == '/') cb = '\\';
-        if (ca >= 'a' and ca <= 'z') ca -= 32;
-        if (cb >= 'a' and cb <= 'z') cb -= 32;
-        if (ca != cb) return false;
-    }
-    return true;
-}
-
-fn stripDrive(path: []const u8) []const u8 {
-    if (path.len >= 2 and path[1] == ':') return path[2..];
-    return path;
-}
-
-fn cachedGlyphId(cached: *const CachedFont, codepoint: u32) ?usize {
-    return indexedGlyphId(&cached.index, codepoint, null);
-}
-
 fn buildGlyphIndex(codepoints: *const [MAX_GLYPHS]u32, out: *GlyphIndex) bool {
-    out.* = .{};
-    var glyph_id: usize = 0;
-    while (glyph_id < codepoints.len) : (glyph_id += 1) {
-        const codepoint = codepoints[glyph_id];
-        if (codepoint == INVALID_CODEPOINT) continue;
-        var insertion: usize = @intCast(out.count);
-        while (insertion > 0) {
-            const previous = insertion - 1;
-            const previous_codepoint = out.codepoints[previous];
-            const previous_glyph_id = out.glyph_ids[previous];
-            if (previous_codepoint < codepoint or
-                (previous_codepoint == codepoint and @as(usize, previous_glyph_id) <= glyph_id)) break;
-            out.codepoints[insertion] = previous_codepoint;
-            out.glyph_ids[insertion] = previous_glyph_id;
-            insertion = previous;
-        }
-        out.codepoints[insertion] = codepoint;
-        out.glyph_ids[insertion] = @intCast(glyph_id);
-        out.count += 1;
-    }
-    return out.count != 0;
+    return r4os_rust_font_build_index(codepoints, out);
 }
-
-fn indexedGlyphId(index: *const GlyphIndex, codepoint: u32, probe_count: ?*u16) ?usize {
-    var low: usize = 0;
-    var high: usize = @intCast(index.count);
-    while (low < high) {
-        if (probe_count) |count| count.* +%= 1;
-        const middle = low + (high - low) / 2;
-        if (index.codepoints[middle] < codepoint) {
-            low = middle + 1;
-        } else {
-            high = middle;
-        }
-    }
-    if (low >= @as(usize, index.count) or index.codepoints[low] != codepoint) return null;
-    return index.glyph_ids[low];
+fn indexedGlyphId(index: *const GlyphIndex, cp: u32, probes: ?*u16) ?usize {
+    const value = r4os_rust_font_indexed_id(index, cp, probes);
+    return if (value == ~@as(usize, 0)) null else value;
 }
-
-const DecodedScalar = struct {
-    codepoint: u32,
-    consumed: usize,
-};
-
+const DecodedScalar = extern struct { codepoint: u32, consumed: usize };
 pub fn decodeUtf8Scalar(value: []const u8, start: usize) DecodedScalar {
-    if (start >= value.len) return .{ .codepoint = 0xFFFD, .consumed = 0 };
-    const first = value[start];
-    if (first < 0x80) return .{ .codepoint = first, .consumed = 1 };
-    const expected: usize = if (first >= 0xC2 and first <= 0xDF)
-        2
-    else if (first >= 0xE0 and first <= 0xEF)
-        3
-    else if (first >= 0xF0 and first <= 0xF4)
-        4
-    else
-        return .{ .codepoint = 0xFFFD, .consumed = 1 };
-    if (expected > value.len - start) return .{ .codepoint = 0xFFFD, .consumed = 1 };
-    var codepoint: u32 = first & (@as(u8, 0x7F) >> @intCast(expected));
-    var offset: usize = 1;
-    while (offset < expected) : (offset += 1) {
-        const byte = value[start + offset];
-        if ((byte & 0xC0) != 0x80) return .{ .codepoint = 0xFFFD, .consumed = 1 };
-        codepoint = (codepoint << 6) | (byte & 0x3F);
-    }
-    if ((expected == 3 and codepoint < 0x800) or
-        (expected == 4 and codepoint < 0x10000) or
-        codepoint > 0x10FFFF or
-        (codepoint >= 0xD800 and codepoint <= 0xDFFF))
-    {
-        return .{ .codepoint = 0xFFFD, .consumed = 1 };
-    }
-    return .{ .codepoint = codepoint, .consumed = expected };
-}
-
-fn nameAt(names: []const u8, offset: u32, fallback: []const u8) []const u8 {
-    if (offset >= names.len) return fallback;
-    var end: usize = @intCast(offset);
-    while (end < names.len and names[end] != 0) : (end += 1) {}
-    if (end == offset) return fallback;
-    return names[@intCast(offset)..end];
-}
-
-fn copyField(out: []u8, len: *usize, value: []const u8) void {
-    const count = if (value.len < out.len) value.len else out.len;
-    if (count > 0) @memcpy(out[0..count], value[0..count]);
-    if (count < out.len) out[count] = 0;
-    len.* = count;
-}
-
-fn fontKind(value: u16) FontKind {
-    return switch (value) {
-        r4f.FONT_KIND_BITMAP => .bitmap,
-        r4f.FONT_KIND_WINDOWS_VECTOR => .windows_vector,
-        r4f.FONT_KIND_SFNT_TRUETYPE => .sfnt_truetype,
-        else => .unknown,
-    };
+    var out: DecodedScalar = undefined;
+    r4os_rust_font_decode(value.ptr, value.len, start, &out);
+    return out;
 }
 
 pub fn kindName(kind: FontKind) []const u8 {
-    return switch (kind) {
-        .builtin => "builtin",
-        .bitmap => "bitmap",
-        .windows_vector => "win-vector",
-        .sfnt_truetype => "sfnt",
-        .unknown => "unknown",
-    };
+    var len: usize = 0;
+    const p = r4os_rust_font_kind_name(@intFromEnum(kind), &len);
+    return p[0..len];
 }
-
-fn clampMetric(value: i32, fallback: u8) u8 {
-    if (value <= 0) return fallback;
-    if (value > MAX_GLYPH_W) return MAX_GLYPH_W;
-    return @intCast(value);
-}
-
-const unknown_index: usize = '?' - 0x20;
-
-// zig fmt: off
-pub const builtin_ascii_font = [_][8]u8{
-    // 0x20 ' '
-    .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // 0x21 '!'
-    .{ 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x18, 0x00 },
-    // 0x22 '"'
-    .{ 0x6C, 0x6C, 0x6C, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // 0x23 '#'
-    .{ 0x6C, 0x6C, 0xFE, 0x6C, 0xFE, 0x6C, 0x6C, 0x00 },
-    // 0x24 '$'
-    .{ 0x18, 0x7E, 0xC0, 0x7C, 0x06, 0xFC, 0x18, 0x00 },
-    // 0x25 '%'
-    .{ 0x00, 0xC6, 0xCC, 0x18, 0x30, 0x66, 0xC6, 0x00 },
-    // 0x26 '&'
-    .{ 0x38, 0x6C, 0x38, 0x76, 0xDC, 0xCC, 0x76, 0x00 },
-    // 0x27 '''
-    .{ 0x18, 0x18, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // 0x28 '('
-    .{ 0x0C, 0x18, 0x30, 0x30, 0x30, 0x18, 0x0C, 0x00 },
-    // 0x29 ')'
-    .{ 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0x00 },
-    // 0x2A '*'
-    .{ 0x00, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0x00, 0x00 },
-    // 0x2B '+'
-    .{ 0x00, 0x18, 0x18, 0x7E, 0x18, 0x18, 0x00, 0x00 },
-    // 0x2C ','
-    .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30 },
-    // 0x2D '-'
-    .{ 0x00, 0x00, 0x00, 0x7E, 0x00, 0x00, 0x00, 0x00 },
-    // 0x2E '.'
-    .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00 },
-    // 0x2F '/'
-    .{ 0x06, 0x0C, 0x18, 0x30, 0x60, 0xC0, 0x80, 0x00 },
-    // 0x30 '0'
-    .{ 0x7C, 0xC6, 0xCE, 0xDE, 0xF6, 0xE6, 0x7C, 0x00 },
-    // 0x31 '1'
-    .{ 0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0x00 },
-    // 0x32 '2'
-    .{ 0x7C, 0xC6, 0x06, 0x1C, 0x30, 0x66, 0xFE, 0x00 },
-    // 0x33 '3'
-    .{ 0x7C, 0xC6, 0x06, 0x3C, 0x06, 0xC6, 0x7C, 0x00 },
-    // 0x34 '4'
-    .{ 0x0C, 0x1C, 0x3C, 0x6C, 0xFE, 0x0C, 0x0C, 0x00 },
-    // 0x35 '5'
-    .{ 0xFE, 0xC0, 0xC0, 0xFC, 0x06, 0xC6, 0x7C, 0x00 },
-    // 0x36 '6'
-    .{ 0x38, 0x60, 0xC0, 0xFC, 0xC6, 0xC6, 0x7C, 0x00 },
-    // 0x37 '7'
-    .{ 0xFE, 0xC6, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x00 },
-    // 0x38 '8'
-    .{ 0x7C, 0xC6, 0xC6, 0x7C, 0xC6, 0xC6, 0x7C, 0x00 },
-    // 0x39 '9'
-    .{ 0x7C, 0xC6, 0xC6, 0x7E, 0x06, 0x0C, 0x78, 0x00 },
-    // 0x3A ':'
-    .{ 0x00, 0x18, 0x00, 0x00, 0x00, 0x18, 0x00, 0x00 },
-    // 0x3B ';'
-    .{ 0x00, 0x18, 0x00, 0x00, 0x00, 0x18, 0x18, 0x30 },
-    // 0x3C '<'
-    .{ 0x06, 0x0C, 0x18, 0x30, 0x18, 0x0C, 0x06, 0x00 },
-    // 0x3D '='
-    .{ 0x00, 0x00, 0x7E, 0x00, 0x7E, 0x00, 0x00, 0x00 },
-    // 0x3E '>'
-    .{ 0x60, 0x30, 0x18, 0x0C, 0x18, 0x30, 0x60, 0x00 },
-    // 0x3F '?'
-    .{ 0x7C, 0xC6, 0x0C, 0x18, 0x18, 0x00, 0x18, 0x00 },
-    // 0x40 '@'
-    .{ 0x7C, 0xC6, 0xDE, 0xDE, 0xDE, 0xC0, 0x7C, 0x00 },
-    // 0x41 'A'
-    .{ 0x38, 0x6C, 0xC6, 0xC6, 0xFE, 0xC6, 0xC6, 0x00 },
-    // 0x42 'B'
-    .{ 0xFC, 0x66, 0x66, 0x7C, 0x66, 0x66, 0xFC, 0x00 },
-    // 0x43 'C'
-    .{ 0x3C, 0x66, 0xC0, 0xC0, 0xC0, 0x66, 0x3C, 0x00 },
-    // 0x44 'D'
-    .{ 0xF8, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0xF8, 0x00 },
-    // 0x45 'E'
-    .{ 0xFE, 0x62, 0x68, 0x78, 0x68, 0x62, 0xFE, 0x00 },
-    // 0x46 'F'
-    .{ 0xFE, 0x62, 0x68, 0x78, 0x68, 0x60, 0xF0, 0x00 },
-    // 0x47 'G'
-    .{ 0x3C, 0x66, 0xC0, 0xC0, 0xCE, 0x66, 0x3E, 0x00 },
-    // 0x48 'H'
-    .{ 0xC6, 0xC6, 0xC6, 0xFE, 0xC6, 0xC6, 0xC6, 0x00 },
-    // 0x49 'I'
-    .{ 0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00 },
-    // 0x4A 'J'
-    .{ 0x1E, 0x0C, 0x0C, 0x0C, 0xCC, 0xCC, 0x78, 0x00 },
-    // 0x4B 'K'
-    .{ 0xE6, 0x66, 0x6C, 0x78, 0x6C, 0x66, 0xE6, 0x00 },
-    // 0x4C 'L'
-    .{ 0xF0, 0x60, 0x60, 0x60, 0x62, 0x66, 0xFE, 0x00 },
-    // 0x4D 'M'
-    .{ 0xC6, 0xEE, 0xFE, 0xFE, 0xD6, 0xC6, 0xC6, 0x00 },
-    // 0x4E 'N'
-    .{ 0xC6, 0xE6, 0xF6, 0xDE, 0xCE, 0xC6, 0xC6, 0x00 },
-    // 0x4F 'O'
-    .{ 0x7C, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00 },
-    // 0x50 'P'
-    .{ 0xFC, 0x66, 0x66, 0x7C, 0x60, 0x60, 0xF0, 0x00 },
-    // 0x51 'Q'
-    .{ 0x7C, 0xC6, 0xC6, 0xC6, 0xD6, 0x7C, 0x0E, 0x00 },
-    // 0x52 'R'
-    .{ 0xFC, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0xE6, 0x00 },
-    // 0x53 'S'
-    .{ 0x7C, 0xC6, 0xE0, 0x78, 0x0E, 0xC6, 0x7C, 0x00 },
-    // 0x54 'T'
-    .{ 0x7E, 0x7E, 0x5A, 0x18, 0x18, 0x18, 0x3C, 0x00 },
-    // 0x55 'U'
-    .{ 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x7C, 0x00 },
-    // 0x56 'V'
-    .{ 0xC6, 0xC6, 0xC6, 0xC6, 0xC6, 0x6C, 0x38, 0x00 },
-    // 0x57 'W'
-    .{ 0xC6, 0xC6, 0xC6, 0xD6, 0xFE, 0xEE, 0xC6, 0x00 },
-    // 0x58 'X'
-    .{ 0xC6, 0xC6, 0x6C, 0x38, 0x6C, 0xC6, 0xC6, 0x00 },
-    // 0x59 'Y'
-    .{ 0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x3C, 0x00 },
-    // 0x5A 'Z'
-    .{ 0xFE, 0xC6, 0x8C, 0x18, 0x32, 0x66, 0xFE, 0x00 },
-    // 0x5B '['
-    .{ 0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00 },
-    // 0x5C '\\'
-    .{ 0xC0, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x02, 0x00 },
-    // 0x5D ']'
-    .{ 0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x3C, 0x00 },
-    // 0x5E '^'
-    .{ 0x10, 0x38, 0x6C, 0xC6, 0x00, 0x00, 0x00, 0x00 },
-    // 0x5F '_'
-    .{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF },
-    // 0x60 '`'
-    .{ 0x30, 0x30, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00 },
-    // 0x61 'a'
-    .{ 0x00, 0x00, 0x78, 0x0C, 0x7C, 0xCC, 0x76, 0x00 },
-    // 0x62 'b'
-    .{ 0xE0, 0x60, 0x7C, 0x66, 0x66, 0x66, 0xDC, 0x00 },
-    // 0x63 'c'
-    .{ 0x00, 0x00, 0x7C, 0xC6, 0xC0, 0xC6, 0x7C, 0x00 },
-    // 0x64 'd'
-    .{ 0x1C, 0x0C, 0x7C, 0xCC, 0xCC, 0xCC, 0x76, 0x00 },
-    // 0x65 'e'
-    .{ 0x00, 0x00, 0x7C, 0xC6, 0xFE, 0xC0, 0x7C, 0x00 },
-    // 0x66 'f'
-    .{ 0x3C, 0x66, 0x60, 0xF8, 0x60, 0x60, 0xF0, 0x00 },
-    // 0x67 'g'
-    .{ 0x00, 0x00, 0x76, 0xCC, 0xCC, 0x7C, 0x0C, 0xF8 },
-    // 0x68 'h'
-    .{ 0xE0, 0x60, 0x6C, 0x76, 0x66, 0x66, 0xE6, 0x00 },
-    // 0x69 'i'
-    .{ 0x18, 0x00, 0x38, 0x18, 0x18, 0x18, 0x3C, 0x00 },
-    // 0x6A 'j'
-    .{ 0x06, 0x00, 0x06, 0x06, 0x06, 0x66, 0x66, 0x3C },
-    // 0x6B 'k'
-    .{ 0xE0, 0x60, 0x66, 0x6C, 0x78, 0x6C, 0xE6, 0x00 },
-    // 0x6C 'l'
-    .{ 0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0x00 },
-    // 0x6D 'm'
-    .{ 0x00, 0x00, 0xEC, 0xFE, 0xD6, 0xD6, 0xD6, 0x00 },
-    // 0x6E 'n'
-    .{ 0x00, 0x00, 0xDC, 0x66, 0x66, 0x66, 0x66, 0x00 },
-    // 0x6F 'o'
-    .{ 0x00, 0x00, 0x7C, 0xC6, 0xC6, 0xC6, 0x7C, 0x00 },
-    // 0x70 'p'
-    .{ 0x00, 0x00, 0xDC, 0x66, 0x66, 0x7C, 0x60, 0xF0 },
-    // 0x71 'q'
-    .{ 0x00, 0x00, 0x76, 0xCC, 0xCC, 0x7C, 0x0C, 0x1E },
-    // 0x72 'r'
-    .{ 0x00, 0x00, 0xDC, 0x76, 0x60, 0x60, 0xF0, 0x00 },
-    // 0x73 's'
-    .{ 0x00, 0x00, 0x7E, 0xC0, 0x7C, 0x06, 0xFC, 0x00 },
-    // 0x74 't'
-    .{ 0x30, 0x30, 0xFC, 0x30, 0x30, 0x36, 0x1C, 0x00 },
-    // 0x75 'u'
-    .{ 0x00, 0x00, 0xCC, 0xCC, 0xCC, 0xCC, 0x76, 0x00 },
-    // 0x76 'v'
-    .{ 0x00, 0x00, 0xC6, 0xC6, 0xC6, 0x6C, 0x38, 0x00 },
-    // 0x77 'w'
-    .{ 0x00, 0x00, 0xC6, 0xD6, 0xD6, 0xFE, 0x6C, 0x00 },
-    // 0x78 'x'
-    .{ 0x00, 0x00, 0xC6, 0x6C, 0x38, 0x6C, 0xC6, 0x00 },
-    // 0x79 'y'
-    .{ 0x00, 0x00, 0xC6, 0xC6, 0xC6, 0x7E, 0x06, 0xFC },
-    // 0x7A 'z'
-    .{ 0x00, 0x00, 0xFE, 0x4C, 0x18, 0x32, 0xFE, 0x00 },
-    // 0x7B '{'
-    .{ 0x0E, 0x18, 0x18, 0x70, 0x18, 0x18, 0x0E, 0x00 },
-    // 0x7C '|'
-    .{ 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00 },
-    // 0x7D '}'
-    .{ 0x70, 0x18, 0x18, 0x0E, 0x18, 0x18, 0x70, 0x00 },
-    // 0x7E '~'
-    .{ 0x76, 0xDC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 },
-};
-// zig fmt: on
+extern fn r4os_rust_font_state_reset(*CatalogState) void;
+extern fn r4os_rust_font_state_reset_catalog(*CatalogState) void;
+extern fn r4os_rust_font_state_glyph_width(*const CatalogState) u32;
+extern fn r4os_rust_font_state_glyph_height(*const CatalogState) u32;
+extern fn r4os_rust_font_state_baseline(*const CatalogState) i16;
+extern fn r4os_rust_font_state_catalog_count(*const CatalogState) usize;
+extern fn r4os_rust_font_state_catalog_entry(*const CatalogState, usize, *CatalogEntry) bool;
+extern fn r4os_rust_font_state_font_count(*const CatalogState) usize;
+extern fn r4os_rust_font_state_font_id_for_catalog_index(*const CatalogState, usize) u32;
+extern fn r4os_rust_font_state_current_font_id(*const CatalogState) u32;
+extern fn r4os_rust_font_state_is_renderable_font_id(*const CatalogState, u32) bool;
+extern fn r4os_rust_font_state_normalize_font_id(*const CatalogState, u32) u32;
+extern fn r4os_rust_font_state_catalog_entry_for_font_id(*const CatalogState, u32, *CatalogEntry) bool;
+extern fn r4os_rust_font_state_glyph_row(*const CatalogState, u8, u32) u8;
+extern fn r4os_rust_font_state_glyph_pixel(*const CatalogState, u8, u32, u32) bool;
+extern fn r4os_rust_font_state_glyph_bitmap_width(*const CatalogState, u8) u32;
+extern fn r4os_rust_font_state_glyph_advance(*const CatalogState, u8) u32;
+extern fn r4os_rust_font_state_glyph_height_for_font(*const CatalogState, u32) u32;
+extern fn r4os_rust_font_state_glyph_advance_for_font(*const CatalogState, u32, u32) u32;
+extern fn r4os_rust_font_state_glyph_bitmap_width_for_font(*const CatalogState, u32, u32) u32;
+extern fn r4os_rust_font_state_glyph_pixel_for_font(*const CatalogState, u32, u32, u32, u32) bool;
+extern fn r4os_rust_font_state_glyph_row_mask_for_font(*const CatalogState, u32, u32, u32) u64;
+extern fn r4os_rust_font_state_glyph_bitmap_for_font(*const CatalogState, u32, u32, *GlyphBitmap) void;
+extern fn r4os_rust_font_state_measure(*const CatalogState, [*]const u8, usize, *TextMetrics) void;
+extern fn r4os_rust_font_state_measure_z(*const CatalogState, [*]const u8, usize, *TextMetrics) void;
+extern fn r4os_rust_font_state_measure_with_font(*const CatalogState, u32, [*]const u8, usize, *TextMetrics) void;
+extern fn r4os_rust_font_state_measure_z_with_font(*const CatalogState, u32, [*]const u8, usize, *TextMetrics) void;
+extern fn r4os_rust_font_state_baseline_for_font(*const CatalogState, u32) i16;
+extern fn r4os_rust_font_state_max_advance_for_font(*const CatalogState, u32) u32;
+extern fn r4os_rust_font_state_load_r4_f(*CatalogState, [*]const u8, usize) bool;
+extern fn r4os_rust_font_state_load_r4_f_named(*CatalogState, [*]const u8, usize, [*]const u8, usize) bool;
+extern fn r4os_rust_font_state_register_r4_f(*CatalogState, [*]const u8, usize, [*]const u8, usize) bool;
+extern fn r4os_rust_font_acquire(*CatalogView) void;
+extern fn r4os_rust_font_view_state(*const CatalogView) *const CatalogState;
+extern fn r4os_rust_font_view_release(*CatalogView) void;
+extern fn r4os_rust_font_begin(bool, *CatalogReplacement) bool;
+extern fn r4os_rust_font_replacement_state(*const CatalogReplacement) *CatalogState;
+extern fn r4os_rust_font_replacement_commit(*CatalogReplacement) void;
+extern fn r4os_rust_font_replacement_abort(*CatalogReplacement) void;
+extern fn r4os_rust_font_builtin(u32, *[8]u8) void;
+extern fn r4os_rust_font_build_index(*const [MAX_GLYPHS]u32, *GlyphIndex) bool;
+extern fn r4os_rust_font_indexed_id(*const GlyphIndex, u32, ?*u16) usize;
+extern fn r4os_rust_font_decode([*]const u8, usize, usize, *DecodedScalar) void;
+extern fn r4os_rust_font_kind_name(u16, *usize) [*]const u8;
 
 test "font measurement advances once per utf8 scalar" {
     const std = @import("std");
@@ -1688,4 +684,44 @@ test "bulk glyph rows equal indexed row and pixel references" {
 
     resetCatalog();
     try std.testing.expect(!isRenderableFontId(1));
+}
+
+comptime {
+    if (@sizeOf(GlyphIndex) != 1540 or @alignOf(GlyphIndex) != 4 or @offsetOf(GlyphIndex, "count") != 0 or @offsetOf(GlyphIndex, "codepoints") != 4 or @offsetOf(GlyphIndex, "glyph_ids") != 1028) @compileError("Native font GlyphIndex layout");
+}
+
+comptime {
+    if (@sizeOf(GlyphBitmap) != 344 or @alignOf(GlyphBitmap) != 8 or @offsetOf(GlyphBitmap, "width") != 0 or @offsetOf(GlyphBitmap, "height") != 4 or @offsetOf(GlyphBitmap, "advance") != 8 or @offsetOf(GlyphBitmap, "line_height") != 12 or @offsetOf(GlyphBitmap, "baseline") != 16 or @offsetOf(GlyphBitmap, "fallback") != 18 or @offsetOf(GlyphBitmap, "rows") != 24) @compileError("Native font GlyphBitmap layout");
+}
+
+comptime {
+    if (@sizeOf(TextMetrics) != 32 or @alignOf(TextMetrics) != 8 or @offsetOf(TextMetrics, "width") != 0 or @offsetOf(TextMetrics, "height") != 4 or @offsetOf(TextMetrics, "baseline") != 8 or @offsetOf(TextMetrics, "line_height") != 12 or @offsetOf(TextMetrics, "visible_bytes") != 16 or @offsetOf(TextMetrics, "clipped") != 24) @compileError("Native font TextMetrics layout");
+}
+
+comptime {
+    if (@sizeOf(CatalogEntry) != 352 or @alignOf(CatalogEntry) != 8 or @offsetOf(CatalogEntry, "used") != 0 or @offsetOf(CatalogEntry, "path") != 1 or @offsetOf(CatalogEntry, "path_len") != 104 or @offsetOf(CatalogEntry, "family") != 112 or @offsetOf(CatalogEntry, "family_len") != 152 or @offsetOf(CatalogEntry, "face") != 160 or @offsetOf(CatalogEntry, "face_len") != 200 or @offsetOf(CatalogEntry, "style") != 208 or @offsetOf(CatalogEntry, "style_len") != 248 or @offsetOf(CatalogEntry, "kind") != 256 or @offsetOf(CatalogEntry, "weight") != 258 or @offsetOf(CatalogEntry, "style_flags") != 260 or @offsetOf(CatalogEntry, "charset_flags") != 264 or @offsetOf(CatalogEntry, "face_count") != 268 or @offsetOf(CatalogEntry, "strike_count") != 270 or @offsetOf(CatalogEntry, "glyph_count") != 272 or @offsetOf(CatalogEntry, "renderable") != 276 or @offsetOf(CatalogEntry, "selected") != 277 or @offsetOf(CatalogEntry, "width") != 278 or @offsetOf(CatalogEntry, "height") != 279 or @offsetOf(CatalogEntry, "max_advance") != 280 or @offsetOf(CatalogEntry, "ascent") != 282 or @offsetOf(CatalogEntry, "descent") != 284 or @offsetOf(CatalogEntry, "line_height") != 286 or @offsetOf(CatalogEntry, "baseline") != 288 or @offsetOf(CatalogEntry, "status") != 290 or @offsetOf(CatalogEntry, "status_len") != 344) @compileError("Native font CatalogEntry layout");
+}
+
+comptime {
+    if (@sizeOf(ActiveFont) != 216 or @alignOf(ActiveFont) != 8 or @offsetOf(ActiveFont, "width") != 0 or @offsetOf(ActiveFont, "height") != 1 or @offsetOf(ActiveFont, "bytes_per_row") != 2 or @offsetOf(ActiveFont, "max_advance") != 3 or @offsetOf(ActiveFont, "ascent") != 4 or @offsetOf(ActiveFont, "descent") != 6 or @offsetOf(ActiveFont, "line_height") != 8 or @offsetOf(ActiveFont, "baseline") != 10 or @offsetOf(ActiveFont, "family") != 12 or @offsetOf(ActiveFont, "family_len") != 56 or @offsetOf(ActiveFont, "face") != 64 or @offsetOf(ActiveFont, "face_len") != 104 or @offsetOf(ActiveFont, "path") != 112 or @offsetOf(ActiveFont, "path_len") != 208) @compileError("Native font ActiveFont layout");
+}
+
+comptime {
+    if (@sizeOf(CachedFont) != 54292 or @alignOf(CachedFont) != 4 or @offsetOf(CachedFont, "used") != 0 or @offsetOf(CachedFont, "width") != 1 or @offsetOf(CachedFont, "height") != 2 or @offsetOf(CachedFont, "bytes_per_row") != 3 or @offsetOf(CachedFont, "max_advance") != 4 or @offsetOf(CachedFont, "ascent") != 6 or @offsetOf(CachedFont, "descent") != 8 or @offsetOf(CachedFont, "line_height") != 10 or @offsetOf(CachedFont, "baseline") != 12 or @offsetOf(CachedFont, "glyphs") != 14 or @offsetOf(CachedFont, "widths") != 51214 or @offsetOf(CachedFont, "advances") != 51470 or @offsetOf(CachedFont, "codepoints") != 51728 or @offsetOf(CachedFont, "index") != 52752) @compileError("Native font CachedFont layout");
+}
+
+comptime {
+    if (@sizeOf(CatalogState) != 130328 or @alignOf(CatalogState) != 8 or @offsetOf(CatalogState, "revision") != 0 or @offsetOf(CatalogState, "catalog") != 8 or @offsetOf(CatalogState, "catalog_entries") != 22536 or @offsetOf(CatalogState, "cached_fonts") != 22544 or @offsetOf(CatalogState, "cached_fonts_len") != 22552 or @offsetOf(CatalogState, "temp_cached_font") != 22560 or @offsetOf(CatalogState, "active_present") != 76852 or @offsetOf(CatalogState, "active") != 76856 or @offsetOf(CatalogState, "active_font_id") != 77072 or @offsetOf(CatalogState, "active_glyphs") != 77076 or @offsetOf(CatalogState, "active_glyph_widths") != 128276 or @offsetOf(CatalogState, "active_glyph_advances") != 128532 or @offsetOf(CatalogState, "active_index") != 128788) @compileError("Native font CatalogState layout");
+}
+
+comptime {
+    if (@sizeOf(CatalogView) != 24 or @alignOf(CatalogView) != 8 or @offsetOf(CatalogView, "bank") != 0 or @offsetOf(CatalogView, "unwind") != 8) @compileError("Native font CatalogView layout");
+}
+
+comptime {
+    if (@sizeOf(CatalogReplacement) != 32 or @alignOf(CatalogReplacement) != 8 or @offsetOf(CatalogReplacement, "bank") != 0 or @offsetOf(CatalogReplacement, "unwind") != 8 or @offsetOf(CatalogReplacement, "owned") != 24) @compileError("Native font CatalogReplacement layout");
+}
+
+comptime {
+    if (@sizeOf(DecodedScalar) != 16 or @alignOf(DecodedScalar) != 8 or @offsetOf(DecodedScalar, "codepoint") != 0 or @offsetOf(DecodedScalar, "consumed") != 8) @compileError("Native font DecodedScalar layout");
 }

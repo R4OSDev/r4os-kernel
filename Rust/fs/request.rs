@@ -832,3 +832,45 @@ const _: () = {
     assert!(size_of::<GateSnapshot>() == 32);
     assert!(size_of::<Stall>() == 40);
 };
+
+// Native font/loader readers keep the same kind2 request and exact finish edge;
+// this adds no additional filesystem gate or mutation policy.
+pub(crate) struct ScopedRead {
+    guard: Guard,
+}
+impl ScopedRead {
+    pub(crate) fn begin(drive: u8) -> Option<Self> {
+        let mut value = core::mem::MaybeUninit::<Guard>::uninit();
+        if unsafe {
+            r4os_rust_fs_request_begin(
+                2,
+                drive,
+                0,
+                0,
+                false,
+                core::ptr::null(),
+                0,
+                false,
+                value.as_mut_ptr(),
+            )
+        } {
+            Some(Self {
+                guard: unsafe { value.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+    pub(crate) fn finish(&mut self, ok: bool) {
+        unsafe {
+            r4os_rust_fs_request_finish(&mut self.guard, ok);
+        }
+    }
+}
+impl Drop for ScopedRead {
+    fn drop(&mut self) {
+        if self.guard.active {
+            self.finish(false);
+        }
+    }
+}

@@ -9,12 +9,7 @@ const keyboard = @import("../driver/input/keyboard.zig");
 const mouse = @import("../driver/input/mouse.zig");
 const display = @import("../display/display.zig");
 
-var ps2_slot: ?usize = null;
-var keyboard_initialized = false;
-var ps2_completed = false;
-var mouse_status: MouseStatus = .not_started;
-
-pub const MouseStatus = enum {
+pub const MouseStatus = enum(u8) {
     not_started,
     ready,
     not_found,
@@ -22,34 +17,23 @@ pub const MouseStatus = enum {
 };
 
 pub fn initKeyboard() void {
-    if (keyboard_initialized) return;
-
-    ensurePs2Slot();
-    keyboard.init();
-    keyboard_initialized = true;
+    r4os_rust_input_boot_keyboard();
 }
 
 pub fn isKeyboardInitialized() bool {
-    return keyboard_initialized;
+    return r4os_rust_input_boot_keyboard_ready();
 }
 
 pub fn initMouse() void {
-    if (mouse_status != .not_started) return;
-
-    const mode = display.activeMode() orelse {
-        mouse_status = .no_display;
-        return;
-    };
-    const bounds = mouse.Bounds{ .width = mode.width, .height = mode.height };
-    mouse_status = if (mouse.init(bounds)) .ready else .not_found;
+    r4os_rust_input_boot_mouse();
 }
 
 pub fn mouseStatus() MouseStatus {
-    return mouse_status;
+    return @enumFromInt(r4os_rust_input_boot_mouse_status());
 }
 
 pub fn mouseStatusLine() []const u8 {
-    return switch (mouse_status) {
+    return switch (mouseStatus()) {
         .not_started => "[not ready]\r\n",
         .ready => "[OK]\r\n",
         .not_found => "[not found]\r\n",
@@ -58,21 +42,22 @@ pub fn mouseStatusLine() []const u8 {
 }
 
 pub fn completePs2() void {
-    if (ps2_completed) return;
-
-    if (ps2_slot) |slot| {
-        if (keyboard_initialized) {
-            driver_registry.setState(slot, .initialized);
-            driver_registry.setState(slot, .active);
-        } else {
-            driver_registry.setState(slot, .failed);
-        }
-    }
-
-    ps2_completed = true;
+    r4os_rust_input_boot_complete();
 }
 
-fn ensurePs2Slot() void {
-    if (ps2_slot != null) return;
-    ps2_slot = driver_registry.beginLoad("PS2", 3, 1);
+extern fn r4os_rust_input_boot_keyboard() void;
+extern fn r4os_rust_input_boot_keyboard_ready() bool;
+extern fn r4os_rust_input_boot_mouse() void;
+extern fn r4os_rust_input_boot_mouse_status() u8;
+extern fn r4os_rust_input_boot_complete() void;
+export fn r4os_zig_input_boot_registry_begin() callconv(.c) usize {
+    return driver_registry.beginLoad("PS2", 3, 1) orelse ~@as(usize, 0);
+}
+export fn r4os_zig_input_boot_registry_state(slot: usize, state: u8) callconv(.c) void {
+    driver_registry.setState(slot, @enumFromInt(state));
+}
+export fn r4os_zig_input_boot_mode(out: *mouse.Bounds) callconv(.c) bool {
+    const mode = display.activeMode() orelse return false;
+    out.* = .{ .width = mode.width, .height = mode.height };
+    return true;
 }

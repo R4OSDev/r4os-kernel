@@ -708,3 +708,100 @@ pub extern "C" fn r4os_rust_vfs_attribute(operation: u8, attr: u8) -> bool {
 pub unsafe extern "C" fn r4os_rust_vfs_notify(v: *const Volume, parent: u64) {
     unsafe { notify(v.read(), parent) }
 }
+
+// Typed native consumers share the exact existing dispatch and mount owner.
+pub(crate) fn mounted_volume(letter: u8) -> Option<Volume> {
+    let mut out = MaybeUninit::<Volume>::uninit();
+    if unsafe { r4os_rust_vfs_mount(4, letter, ptr::null(), ptr::null(), out.as_mut_ptr().cast()) }
+    {
+        Some(unsafe { out.assume_init() })
+    } else {
+        None
+    }
+}
+pub(crate) fn resolve_path(volume: Volume, path: &[u8]) -> Option<u64> {
+    let result = unsafe {
+        run(
+            op::RESOLVE_PATH,
+            Args {
+                volume,
+                name: t::Bytes {
+                    data: path.as_ptr(),
+                    len: path.len(),
+                },
+                ..Args::default()
+            },
+            ptr::null_mut(),
+        )
+    };
+    if result.status == 0 {
+        Some(result.value)
+    } else {
+        None
+    }
+}
+#[expect(
+    clippy::large_enum_variant,
+    reason = "Original fixed VFS entry remains stack owned; no heap allocation or additional entry lifetime"
+)]
+pub(crate) enum DirectoryStatus {
+    Found(Entry),
+    NotFound,
+    Io,
+}
+pub(crate) fn directory_entry(
+    volume: Volume,
+    parent: u64,
+    index: usize,
+    name: &mut [u8],
+) -> DirectoryStatus {
+    let mut entry = MaybeUninit::<Entry>::uninit();
+    let result = unsafe {
+        run(
+            op::DIR_ENTRY,
+            Args {
+                volume,
+                parent,
+                index,
+                buffer: name.as_mut_ptr(),
+                buffer_len: name.len(),
+                ..Args::default()
+            },
+            entry.as_mut_ptr(),
+        )
+    };
+    match result.status {
+        0 => DirectoryStatus::Found(unsafe { entry.assume_init() }),
+        1 => DirectoryStatus::NotFound,
+        2 => DirectoryStatus::Io,
+        _ => panic!("Original VFS directory status"),
+    }
+}
+/// # Safety
+/// Caller owns the exact buffer through synchronous backend I/O and retains the
+/// original FS request and copied entry/mount generation until completion.
+pub(crate) unsafe fn read_file_raw(
+    volume: Volume,
+    entry: &Entry,
+    buffer: *mut u8,
+    len: usize,
+) -> Option<usize> {
+    let result = unsafe {
+        run(
+            op::READ,
+            Args {
+                volume,
+                entry,
+                buffer,
+                buffer_len: len,
+                ..Args::default()
+            },
+            ptr::null_mut(),
+        )
+    };
+    if result.present {
+        Some(usize::try_from(result.value).expect("Original VFS read length"))
+    } else {
+        None
+    }
+}

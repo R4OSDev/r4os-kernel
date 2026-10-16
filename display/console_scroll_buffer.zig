@@ -1,43 +1,34 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const MAX_CELLS: usize = 65_536;
 
-pub const Cell = struct {
+pub const Cell = extern struct {
     glyph: u8 = ' ',
     foreground: u32 = 0,
     background: u32 = 0,
 };
 
 pub fn requiredCellCount(cols: u32, rows: u32) ?usize {
-    const count = @as(u64, cols) * @as(u64, rows);
-    if (count > MAX_CELLS or count > @as(u64, @intCast(~@as(usize, 0)))) return null;
-    return @intCast(count);
+    const result = r4os_rust_scroll_cells(cols, rows);
+    return if (result == ~@as(usize, 0)) null else result;
 }
 
 pub fn fill(cells: []Cell, value: Cell) void {
-    for (cells) |*cell| cell.* = value;
+    r4os_rust_scroll_fill(cells.ptr, cells.len, &value);
 }
 
 pub const MAX_PIXEL_BYTES: usize = 64 * 1024 * 1024;
 
 pub fn requiredPixelBytes(width: u64, height: u64) ?usize {
-    if (width == 0 or height == 0 or width > MAX_PIXEL_BYTES / 4 or
-        height > MAX_PIXEL_BYTES / 4 / width) return null;
-    return @intCast(width * height * 4);
+    const result = r4os_rust_scroll_pixel_bytes(width, height);
+    return if (result == ~@as(usize, 0)) null else result;
 }
 
 // The packed shadow is ordinary RAM. Move forwards through overlapping rows,
 // then fill the newly exposed line; neither operation evaluates a glyph.
 pub fn scrollPixelsUp(pixels: []u32, stride: usize, left: usize, top: usize, width: usize, height: usize, rows_up: usize, blank: u32) void {
-    const std = @import("std");
-    var row: usize = 0;
-    while (row + rows_up < height) : (row += 1) {
-        const dst = (top + row) * stride + left;
-        const src = (top + row + rows_up) * stride + left;
-        std.mem.copyForwards(u32, pixels[dst .. dst + width], pixels[src .. src + width]);
-    }
-    while (row < height) : (row += 1) {
-        const dst = (top + row) * stride + left;
-        @memset(pixels[dst .. dst + width], blank);
-    }
+    r4os_rust_scroll_pixels(pixels.ptr, pixels.len, stride, left, top, width, height, rows_up, blank);
 }
 
 // Verschiebt eine rechteckige Zellregion um genau eine Textzeile nach oben.
@@ -54,26 +45,7 @@ pub fn scrollUp(
     bottom: u32,
     blank: Cell,
 ) bool {
-    const required = requiredCellCount(cols, rows) orelse return false;
-    if (required > cells.len or left >= right or top >= bottom or
-        right > cols or bottom > rows or bottom - top <= 1)
-    {
-        return false;
-    }
-
-    var row = top;
-    while (row + 1 < bottom) : (row += 1) {
-        var col = left;
-        while (col < right) : (col += 1) {
-            cells[index(cols, row, col)] = cells[index(cols, row + 1, col)];
-        }
-    }
-
-    var col = left;
-    while (col < right) : (col += 1) {
-        cells[index(cols, bottom - 1, col)] = blank;
-    }
-    return true;
+    return r4os_rust_scroll_up(cells.ptr, cells.len, cols, rows, left, top, right, bottom, &blank);
 }
 
 fn index(cols: u32, row: u32, col: u32) usize {
@@ -128,3 +100,13 @@ fn expectCell(testing: type, actual: Cell, expected: Cell) !void {
     try testing.expectEqual(expected.foreground, actual.foreground);
     try testing.expectEqual(expected.background, actual.background);
 }
+
+comptime {
+    if (@sizeOf(Cell) != 12 or @alignOf(Cell) != 4 or @offsetOf(Cell, "glyph") != 0 or @offsetOf(Cell, "foreground") != 4 or @offsetOf(Cell, "background") != 8) @compileError("Native display Cell layout");
+}
+
+extern fn r4os_rust_scroll_cells(u32, u32) usize;
+extern fn r4os_rust_scroll_pixel_bytes(u64, u64) usize;
+extern fn r4os_rust_scroll_fill([*]Cell, usize, *const Cell) void;
+extern fn r4os_rust_scroll_pixels([*]u32, usize, usize, usize, usize, usize, usize, usize, u32) void;
+extern fn r4os_rust_scroll_up([*]Cell, usize, u32, u32, u32, u32, u32, u32, *const Cell) bool;

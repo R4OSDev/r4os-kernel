@@ -1,3 +1,24 @@
+// Native keyboard owner; only typed C projection remains here.
+extern fn r4os_rust_input_keyboard_init() void;
+extern fn r4os_rust_input_keyboard_disable() void;
+extern fn r4os_rust_input_keyboard_irq() void;
+extern fn r4os_rust_input_keyboard_byte(u8) void;
+extern fn r4os_rust_input_keyboard_read(*u32) bool;
+extern fn r4os_rust_input_keyboard_read_char(*u8) bool;
+extern fn r4os_rust_input_keyboard_physical(*PhysicalEvent) bool;
+extern fn r4os_rust_input_keyboard_physical_stats(*PhysicalStats) void;
+extern fn r4os_rust_input_keyboard_pending() bool;
+extern fn r4os_rust_input_keyboard_generation() u64;
+extern fn r4os_rust_input_keyboard_signal() void;
+extern fn r4os_rust_input_keyboard_wait(u64, u64, *u64) u8;
+extern fn r4os_rust_input_keyboard_free() u32;
+extern fn r4os_rust_input_keyboard_accept(u32) bool;
+extern fn r4os_rust_input_keyboard_stats(*NativeStats) void;
+extern fn r4os_rust_input_keyboard_layout(u32) void;
+extern fn r4os_rust_input_keyboard_layout_name([*]const u8, usize, bool) bool;
+extern fn r4os_rust_input_keyboard_layout_id() u32;
+extern fn r4os_rust_input_keyboard_input_hook(?InputHook) void;
+extern fn r4os_rust_input_keyboard_poll_hook(?PollHook) void;
 const io = @import("../../arch/x86_64/io.zig");
 const desktop_events = @import("../../kernel/desktop_events.zig");
 const key_layout = @import("key_layout.zig");
@@ -36,27 +57,6 @@ pub const KEY_DELETE: u8 = 0x7F;
 
 pub const Layout = key_layout.Layout;
 
-var queue = codepoint_queue.Queue.init();
-var physical_queue = physical_key.Queue.init();
-var input_wait = sync.WaitQueue.init();
-var input_generation: u64 = 0;
-var shift_down = false;
-var ctrl_down = false;
-var alt_down = false;
-var altgr_down = false;
-var modifier_tick: u64 = 0;
-var modifier_key_seen = false;
-var modifier_stale_resets: u64 = 0;
-var extended = false;
-var layout: Layout = key_layout.default_layout;
-var input_hook: ?InputHook = null;
-var poll_hook: ?PollHook = null;
-var irq_count: u64 = 0;
-var scancode_count: u64 = 0;
-var decoded_count: u64 = 0;
-var unmapped_character_count: u64 = 0;
-var layout_fallback_count: u64 = 0;
-
 pub const Stats = struct {
     irq_count: u64,
     scancode_count: u64,
@@ -77,151 +77,97 @@ pub const Stats = struct {
 };
 
 pub fn init() void {
-    _ = input_wait.reopen();
-    physical_queue.clear();
-    drainOutput();
-    pic.unmask(IRQ);
+    r4os_rust_input_keyboard_init();
 }
 
 pub fn disable() void {
-    pic.mask(IRQ);
-    queue.clear();
-    physical_queue.clear();
-    shift_down = false;
-    ctrl_down = false;
-    alt_down = false;
-    altgr_down = false;
-    modifier_tick = 0;
-    modifier_key_seen = false;
-    extended = false;
-    _ = input_wait.close(.cancelled);
-    drainOutput();
+    r4os_rust_input_keyboard_disable();
 }
 
 pub fn noteIrq() void {
-    irq_count +%= 1;
+    r4os_rust_input_keyboard_irq();
 }
 
 pub fn onControllerByte(data: u8) void {
-    scancode_count +%= 1;
-    handleScancode(data);
+    r4os_rust_input_keyboard_byte(data);
 }
 
 pub fn readChar() ?u8 {
-    const codepoint = readCodepoint() orelse return null;
-    if (codepoint > 0xff) return null;
-    return @intCast(codepoint);
+    var out: u8 = 0;
+    return if (r4os_rust_input_keyboard_read_char(&out)) out else null;
 }
 
 pub fn readCodepoint() ?u32 {
-    if (poll_hook) |hook| hook();
-    clearStaleModifiers();
-    if (input_hook) |hook| {
-        const hooked = hook();
-        if (hooked != 0) return hooked;
-    }
-    return queue.pop();
+    var out: u32 = 0;
+    return if (r4os_rust_input_keyboard_read(&out)) out else null;
 }
 
 pub const PhysicalEvent = physical_key.Event;
 pub const PhysicalStats = physical_key.Snapshot;
 
 pub fn readPhysicalEvent() ?PhysicalEvent {
-    return physical_queue.pop();
+    var out: PhysicalEvent = undefined;
+    return if (r4os_rust_input_keyboard_physical(&out)) out else null;
 }
 
 pub fn physicalStats() PhysicalStats {
-    return physical_queue.snapshot();
+    var out: PhysicalStats = undefined;
+    r4os_rust_input_keyboard_physical_stats(&out);
+    return out;
 }
 
 pub fn pending() bool {
-    return queue.pending();
+    return r4os_rust_input_keyboard_pending();
 }
 
 pub fn inputGeneration() u64 {
-    return input_wait.readSequence(&input_generation);
+    return r4os_rust_input_keyboard_generation();
 }
 
 pub fn signalInputActivity() void {
-    _ = input_wait.bumpSequenceAndWakeAll(&input_generation);
-}
-
-const InputWaitContext = struct {
-    last_generation: u64,
-};
-
-fn inputWaitStillNeeded(raw: *anyopaque) bool {
-    const context: *InputWaitContext = @ptrCast(@alignCast(raw));
-    return input_generation == context.last_generation and !queue.pending();
+    r4os_rust_input_keyboard_signal();
 }
 
 pub fn waitInput(last_generation: u64, timeout_ticks: u64, out_generation: *u64) sync.WaitResult {
-    var context = InputWaitContext{ .last_generation = last_generation };
-    const result = input_wait.waitUnless(timeout_ticks, "keyboard-input", inputWaitStillNeeded, &context);
-    out_generation.* = input_wait.readSequence(&input_generation);
-    return result;
+    return @enumFromInt(r4os_rust_input_keyboard_wait(last_generation, timeout_ticks, out_generation));
 }
 
 pub fn queueFreeCount() u32 {
-    return queue.freeCount();
+    return r4os_rust_input_keyboard_free();
 }
 
 pub fn canAccept(count: u32) bool {
-    return queue.canAccept(count);
+    return r4os_rust_input_keyboard_accept(count);
 }
 
 pub fn stats() Stats {
-    const queue_stats = queue.snapshot();
-    return .{
-        .irq_count = irq_count,
-        .scancode_count = scancode_count,
-        .decoded_count = decoded_count,
-        .unmapped_character_count = unmapped_character_count,
-        .layout_fallback_count = layout_fallback_count,
-        .push_attempt_count = queue_stats.push_attempts,
-        .dropped_count = queue_stats.dropped,
-        .queue_capacity = codepoint_queue.CAPACITY,
-        .queue_pending = queue_stats.pending,
-        .queue_high_water = queue_stats.high_water,
-        .modifiers = modifierBits(),
-        .modifier_stale_resets = modifier_stale_resets,
-        .pending = pending(),
-        .layout = layout,
-        .layout_name = key_layout.name(layout),
-        .layout_display = key_layout.display(layout),
-    };
+    var out: NativeStats = undefined;
+    r4os_rust_input_keyboard_stats(&out);
+    return .{ .irq_count = out.irq_count, .scancode_count = out.scancode_count, .decoded_count = out.decoded_count, .unmapped_character_count = out.unmapped_character_count, .layout_fallback_count = out.layout_fallback_count, .push_attempt_count = out.push_attempt_count, .dropped_count = out.dropped_count, .queue_capacity = out.queue_capacity, .queue_pending = out.queue_pending, .queue_high_water = out.queue_high_water, .modifiers = out.modifiers, .modifier_stale_resets = out.modifier_stale_resets, .pending = out.pending, .layout = @enumFromInt(out.layout), .layout_name = out.layout_name.slice(), .layout_display = out.layout_display.slice() };
 }
 
 pub fn setLayout(new_layout: Layout) void {
-    layout = new_layout;
+    r4os_rust_input_keyboard_layout(@intFromEnum(new_layout));
 }
 
 pub fn setLayoutByName(name: []const u8) bool {
-    if (key_layout.parseName(name)) |parsed| {
-        layout = parsed;
-        return true;
-    }
-    layout = key_layout.default_layout;
-    layout_fallback_count +%= 1;
-    return false;
+    return r4os_rust_input_keyboard_layout_name(name.ptr, name.len, true);
 }
 
 pub fn trySetLayoutByName(name: []const u8) bool {
-    const parsed = key_layout.parseName(name) orelse return false;
-    layout = parsed;
-    return true;
+    return r4os_rust_input_keyboard_layout_name(name.ptr, name.len, false);
 }
 
 pub fn activeLayoutName() []const u8 {
-    return key_layout.name(layout);
+    return key_layout.name(@enumFromInt(r4os_rust_input_keyboard_layout_id()));
 }
 
 pub fn activeLayoutDisplay() []const u8 {
-    return key_layout.display(layout);
+    return key_layout.display(@enumFromInt(r4os_rust_input_keyboard_layout_id()));
 }
 
 pub fn activeLayoutIndex() usize {
-    return key_layout.indexOf(layout) orelse 0;
+    return r4os_rust_input_keyboard_layout_id();
 }
 
 pub fn layoutCount() usize {
@@ -243,192 +189,37 @@ pub fn layoutDisplayAt(index: usize) ?[]const u8 {
 }
 
 pub fn setInputHook(hook: ?InputHook) void {
-    input_hook = hook;
+    r4os_rust_input_keyboard_input_hook(hook);
 }
 
 pub fn setPollHook(hook: ?PollHook) void {
-    poll_hook = hook;
+    r4os_rust_input_keyboard_poll_hook(hook);
 }
 
 pub fn injectScancode(scancode: u8) void {
-    scancode_count +%= 1;
-    handleScancode(scancode);
+    r4os_rust_input_keyboard_byte(scancode);
 }
 
-fn handleScancode(scancode: u8) void {
-    if (scancode == 0xE0) {
-        extended = true;
-        return;
-    }
-    const physical_extended = extended;
-    const physical_released = (scancode & 0x80) != 0;
-    const physical_make = scancode & 0x7F;
-    if (physical_key.set1Usage(physical_make, physical_extended)) |usage| {
-        if (physical_queue.transition(usage, !physical_released, time_core.monotonicTicks())) {
-            desktop_events.signal();
-        }
-    }
-    if (extended) {
-        extended = false;
-        switch (scancode) {
-            0x38 => {
-                altgr_down = true;
-                markModifierEvent();
-                return;
-            },
-            0xB8 => {
-                altgr_down = false;
-                markModifierEvent();
-                return;
-            },
-            0x1D => {
-                ctrl_down = true;
-                markModifierEvent();
-                return;
-            },
-            0x9D => {
-                ctrl_down = false;
-                markModifierEvent();
-                return;
-            },
-            else => {},
-        }
-        if ((scancode & 0x80) != 0) return;
-        markNonModifierKey();
-        switch (scancode) {
-            0x48 => push(KEY_UP),
-            0x50 => push(KEY_DOWN),
-            0x4B => push(KEY_LEFT),
-            0x4D => push(KEY_RIGHT),
-            0x47 => push(KEY_HOME),
-            0x4F => push(KEY_END),
-            0x49 => push(KEY_PAGE_UP),
-            0x51 => push(KEY_PAGE_DOWN),
-            0x53 => push(KEY_DELETE),
-            0x5B, 0x5C => push(KEY_START_MENU),
-            else => {},
-        }
-        return;
-    }
+const Text = @import("key_layout_types.zig").Text;
+const NativeStats = extern struct {
+    irq_count: u64,
+    scancode_count: u64,
+    decoded_count: u64,
+    unmapped_character_count: u64,
+    layout_fallback_count: u64,
+    push_attempt_count: u64,
+    dropped_count: u64,
+    queue_capacity: u32,
+    queue_pending: u32,
+    queue_high_water: u32,
+    modifiers: u8,
+    modifier_stale_resets: u64,
+    pending: bool,
+    layout: u32,
+    layout_name: Text,
+    layout_display: Text,
+};
 
-    switch (scancode) {
-        0x2A, 0x36 => {
-            shift_down = true;
-            markModifierEvent();
-            return;
-        },
-        0xAA, 0xB6 => {
-            shift_down = false;
-            markModifierEvent();
-            return;
-        },
-        0x1D => {
-            ctrl_down = true;
-            markModifierEvent();
-            return;
-        },
-        0x9D => {
-            ctrl_down = false;
-            markModifierEvent();
-            return;
-        },
-        0x38 => {
-            alt_down = true;
-            markModifierEvent();
-            return;
-        },
-        0xB8 => {
-            alt_down = false;
-            markModifierEvent();
-            return;
-        },
-        else => {},
-    }
-
-    if ((scancode & 0x80) != 0) return;
-    markNonModifierKey();
-    if (scancode == 0x01 and ctrl_down) {
-        push(KEY_CTRL_ESC);
-        return;
-    }
-    if (scancode == 0x3D) {
-        push(KEY_F3);
-        return;
-    }
-    if (scancode == 0x0F and alt_down) {
-        push(if (shift_down) KEY_ALT_SHIFT_TAB else KEY_ALT_TAB);
-        return;
-    }
-    if (scancode == 0x3E and alt_down) {
-        push(KEY_ALT_F4);
-        return;
-    }
-    if (scancode == 0x0F and shift_down) {
-        push(KEY_SHIFT_TAB);
-        return;
-    }
-    if (scancodeToCodepoint(scancode, shift_down, ctrl_down, altgr_down)) |codepoint| {
-        push(codepoint);
-    }
-}
-
-fn push(codepoint: u32) void {
-    if (!queue.tryPush(codepoint)) return;
-    decoded_count +%= 1;
-    _ = input_wait.bumpSequenceAndWakeAll(&input_generation);
-    // 0.56.28: Desktop-Aktivitaets-Event (weckt desktopActivityWait).
-    desktop_events.signal();
-}
-
-fn drainOutput() void {
-    var guard: u32 = 0;
-    while ((io.inb(STATUS_PORT) & STATUS_OUTPUT_FULL) != 0 and guard < 256) : (guard += 1) {
-        _ = io.inb(DATA_PORT);
-    }
-}
-
-fn markModifierEvent() void {
-    modifier_tick = time_core.monotonicTicks();
-    modifier_key_seen = false;
-}
-
-fn markNonModifierKey() void {
-    if (ctrl_down or alt_down or altgr_down) modifier_key_seen = true;
-}
-
-fn clearStaleModifiers() void {
-    if (!modifier_key_seen) return;
-    if (!ctrl_down and !alt_down and !altgr_down) return;
-    const hz = time_core.monotonicFrequency();
-    if (hz == 0 or modifier_tick == 0) return;
-    const now = time_core.monotonicTicks();
-    if (now < modifier_tick) {
-        modifier_tick = now;
-        return;
-    }
-    const timeout = @max(@as(u64, 1), (@as(u64, hz) * MODIFIER_STALE_MS) / 1000);
-    if (now - modifier_tick < timeout) return;
-    ctrl_down = false;
-    alt_down = false;
-    altgr_down = false;
-    extended = false;
-    modifier_key_seen = false;
-    modifier_stale_resets +%= 1;
-}
-
-fn modifierBits() u8 {
-    return (if (shift_down) @as(u8, 0x01) else 0) |
-        (if (ctrl_down) @as(u8, 0x02) else 0) |
-        (if (alt_down) @as(u8, 0x04) else 0) |
-        (if (altgr_down) @as(u8, 0x08) else 0);
-}
-
-fn scancodeToCodepoint(scancode: u8, shifted: bool, ctrl: bool, altgr: bool) ?u32 {
-    if (ctrl) {
-        if (key_layout.ctrlChar(layout, scancode)) |c| return c;
-    }
-    const mapped = key_layout.translate(layout, scancode, .{ .shift = shifted, .altgr = altgr });
-    if (mapped.hasCharacter()) return mapped.codepoint;
-    if (mapped.ascii != 0) return mapped.ascii;
-    return null;
+comptime {
+    if (@sizeOf(NativeStats) != 120 or @alignOf(NativeStats) != 8 or @offsetOf(NativeStats, "modifier_stale_resets") != 72 or @offsetOf(NativeStats, "layout") != 84 or @offsetOf(NativeStats, "layout_name") != 88 or @offsetOf(NativeStats, "layout_display") != 104) @compileError("Native keyboard snapshot C layout");
 }

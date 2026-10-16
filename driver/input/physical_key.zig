@@ -1,3 +1,13 @@
+// Native input helper; caller retains its existing queue/storage owner.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+extern fn r4os_rust_input_physical_clear(*Queue) void;
+extern fn r4os_rust_input_physical_transition(*Queue, u16, bool, u64) bool;
+extern fn r4os_rust_input_physical_pop(*Queue, *Event) bool;
+extern fn r4os_rust_input_physical_pending(*const Queue) bool;
+extern fn r4os_rust_input_physical_snapshot(*const Queue, *Snapshot) void;
+extern fn r4os_rust_input_set1_usage(u8, bool) u16;
 const std = @import("std");
 
 pub const Kind = enum(u8) {
@@ -6,7 +16,7 @@ pub const Kind = enum(u8) {
     reset,
 };
 
-pub const Event = struct {
+pub const Event = extern struct {
     kind: Kind = .reset,
     usage: u16 = 0,
     modifiers: u32 = 0,
@@ -15,7 +25,7 @@ pub const Event = struct {
     tick: u64 = 0,
 };
 
-pub const Snapshot = struct {
+pub const Snapshot = extern struct {
     pending: u32 = 0,
     high_water: u32 = 0,
     transitions: u64 = 0,
@@ -27,7 +37,7 @@ const storage_len: usize = 257;
 pub const capacity: u32 = storage_len - 1;
 pub const flag_repeat: u32 = 1;
 
-pub const Queue = struct {
+pub const Queue = extern struct {
     items: [storage_len]Event = [_]Event{.{}} ** storage_len,
     held: [256]bool = .{false} ** 256,
     head: usize = 0,
@@ -43,118 +53,26 @@ pub const Queue = struct {
     }
 
     pub fn clear(self: *Queue) void {
-        self.items = [_]Event{.{}} ** storage_len;
-        self.held = .{false} ** 256;
-        self.head = 0;
-        self.tail = 0;
+        r4os_rust_input_physical_clear(self);
     }
 
     pub fn transition(self: *Queue, usage: u16, down: bool, tick: u64) bool {
-        if (usage == 0 or usage >= @as(u16, @intCast(self.held.len))) return false;
-        const index: usize = @intCast(usage);
-        if (self.held[index] == down) {
-            self.duplicate_transitions +%= 1;
-            if (down) {
-                if (self.full()) {
-                    self.publishReset(tick);
-                    return true;
-                }
-                self.pushAssumeCapacity(.{
-                    .kind = .down,
-                    .usage = usage,
-                    .modifiers = self.modifierSnapshot(),
-                    .flags = flag_repeat,
-                    .sequence = self.takeSequence(),
-                    .tick = tick,
-                });
-                return true;
-            }
-            return false;
-        }
-        if (self.full()) {
-            self.publishReset(tick);
-            return true;
-        }
-        self.held[index] = down;
-        self.pushAssumeCapacity(.{
-            .kind = if (down) .down else .up,
-            .usage = usage,
-            .modifiers = self.modifierSnapshot(),
-            .sequence = self.takeSequence(),
-            .tick = tick,
-        });
-        self.transitions +%= 1;
-        return true;
+        return r4os_rust_input_physical_transition(self, usage, down, tick);
     }
 
     pub fn pop(self: *Queue) ?Event {
-        if (self.head == self.tail) return null;
-        const event = self.items[self.tail];
-        self.items[self.tail] = .{};
-        self.tail = (self.tail + 1) % storage_len;
-        return event;
+        var out: Event = undefined;
+        return if (r4os_rust_input_physical_pop(self, &out)) out else null;
     }
 
     pub fn pending(self: *const Queue) bool {
-        return self.head != self.tail;
+        return r4os_rust_input_physical_pending(self);
     }
 
     pub fn snapshot(self: *const Queue) Snapshot {
-        return .{
-            .pending = self.pendingCount(),
-            .high_water = self.high_water,
-            .transitions = self.transitions,
-            .duplicate_transitions = self.duplicate_transitions,
-            .overflow_resets = self.overflow_resets,
-        };
-    }
-
-    fn full(self: *const Queue) bool {
-        return (self.head + 1) % storage_len == self.tail;
-    }
-
-    fn pendingCount(self: *const Queue) u32 {
-        return @intCast(if (self.head >= self.tail)
-            self.head - self.tail
-        else
-            storage_len - self.tail + self.head);
-    }
-
-    fn pushAssumeCapacity(self: *Queue, event: Event) void {
-        self.items[self.head] = event;
-        self.head = (self.head + 1) % storage_len;
-        self.high_water = @max(self.high_water, self.pendingCount());
-    }
-
-    fn publishReset(self: *Queue, tick: u64) void {
-        self.items = [_]Event{.{}} ** storage_len;
-        self.held = .{false} ** 256;
-        self.head = 0;
-        self.tail = 0;
-        self.overflow_resets +%= 1;
-        self.pushAssumeCapacity(.{
-            .kind = .reset,
-            .sequence = self.takeSequence(),
-            .tick = tick,
-        });
-    }
-
-    fn takeSequence(self: *Queue) u64 {
-        const result = self.next_sequence;
-        self.next_sequence +%= 1;
-        if (self.next_sequence == 0) self.next_sequence = 1;
-        return result;
-    }
-
-    fn modifierSnapshot(self: *const Queue) u32 {
-        return (if (self.held[0xE0]) @as(u32, 1 << 0) else 0) |
-            (if (self.held[0xE4]) @as(u32, 1 << 1) else 0) |
-            (if (self.held[0xE2]) @as(u32, 1 << 2) else 0) |
-            (if (self.held[0xE6]) @as(u32, 1 << 3) else 0) |
-            (if (self.held[0xE1]) @as(u32, 1 << 4) else 0) |
-            (if (self.held[0xE5]) @as(u32, 1 << 5) else 0) |
-            (if (self.held[0xE3]) @as(u32, 1 << 6) else 0) |
-            (if (self.held[0xE7]) @as(u32, 1 << 7) else 0);
+        var out: Snapshot = undefined;
+        r4os_rust_input_physical_snapshot(self, &out);
+        return out;
     }
 };
 
@@ -162,98 +80,8 @@ pub const Queue = struct {
 /// result is layout-independent; character translation remains a separate
 /// compatibility path in keyboard.zig.
 pub fn set1Usage(scancode: u8, extended: bool) ?u16 {
-    if (extended) return switch (scancode) {
-        0x1C => 0x58,
-        0x1D => 0xE4,
-        0x35 => 0x54,
-        0x37 => 0x46,
-        0x38 => 0xE6,
-        0x47 => 0x4A,
-        0x48 => 0x52,
-        0x49 => 0x4B,
-        0x4B => 0x50,
-        0x4D => 0x4F,
-        0x4F => 0x4D,
-        0x50 => 0x51,
-        0x51 => 0x4E,
-        0x52 => 0x49,
-        0x53 => 0x4C,
-        0x5B => 0xE3,
-        0x5C => 0xE7,
-        0x5D => 0x65,
-        else => null,
-    };
-    return switch (scancode) {
-        0x01 => 0x29,
-        0x02...0x0B => @as(u16, scancode) + 0x1C,
-        0x0C => 0x2D,
-        0x0D => 0x2E,
-        0x0E => 0x2A,
-        0x0F => 0x2B,
-        0x10 => 0x14,
-        0x11 => 0x1A,
-        0x12 => 0x08,
-        0x13 => 0x15,
-        0x14 => 0x17,
-        0x15 => 0x1C,
-        0x16 => 0x18,
-        0x17 => 0x0C,
-        0x18 => 0x12,
-        0x19 => 0x13,
-        0x1A => 0x2F,
-        0x1B => 0x30,
-        0x1C => 0x28,
-        0x1D => 0xE0,
-        0x1E => 0x04,
-        0x1F => 0x16,
-        0x20 => 0x07,
-        0x21 => 0x09,
-        0x22 => 0x0A,
-        0x23 => 0x0B,
-        0x24 => 0x0D,
-        0x25 => 0x0E,
-        0x26 => 0x0F,
-        0x27 => 0x33,
-        0x28 => 0x34,
-        0x29 => 0x35,
-        0x2A => 0xE1,
-        0x2B => 0x31,
-        0x2C => 0x1D,
-        0x2D => 0x1B,
-        0x2E => 0x06,
-        0x2F => 0x19,
-        0x30 => 0x05,
-        0x31 => 0x11,
-        0x32 => 0x10,
-        0x33 => 0x36,
-        0x34 => 0x37,
-        0x35 => 0x38,
-        0x36 => 0xE5,
-        0x37 => 0x55,
-        0x38 => 0xE2,
-        0x39 => 0x2C,
-        0x3A => 0x39,
-        0x3B...0x44 => @as(u16, scancode) - 1,
-        0x45 => 0x53,
-        0x46 => 0x47,
-        0x47 => 0x5F,
-        0x48 => 0x60,
-        0x49 => 0x61,
-        0x4A => 0x56,
-        0x4B => 0x5C,
-        0x4C => 0x5D,
-        0x4D => 0x5E,
-        0x4E => 0x57,
-        0x4F => 0x59,
-        0x50 => 0x5A,
-        0x51 => 0x5B,
-        0x52 => 0x62,
-        0x53 => 0x63,
-        0x56 => 0x64,
-        0x57 => 0x44,
-        0x58 => 0x45,
-        else => null,
-    };
+    const result = r4os_rust_input_set1_usage(scancode, extended);
+    return if (result == 0) null else result;
 }
 
 test "set one conversion distinguishes modifier sides and cursor keys" {
@@ -325,4 +153,16 @@ test "overflow collapses uncertain held state to one fail-safe reset" {
     try std.testing.expectEqual(Kind.reset, reset.kind);
     try std.testing.expect(queue.pop() == null);
     try std.testing.expectEqual(@as(u64, 1), queue.snapshot().overflow_resets);
+}
+
+comptime {
+    if (@sizeOf(Event) != 32 or @alignOf(Event) != 8 or @offsetOf(Event, "kind") != 0 or @offsetOf(Event, "usage") != 2 or @offsetOf(Event, "modifiers") != 4 or @offsetOf(Event, "flags") != 8 or @offsetOf(Event, "sequence") != 16 or @offsetOf(Event, "tick") != 24) @compileError("Native input Event layout");
+}
+
+comptime {
+    if (@sizeOf(Snapshot) != 32 or @alignOf(Snapshot) != 8 or @offsetOf(Snapshot, "pending") != 0 or @offsetOf(Snapshot, "high_water") != 4 or @offsetOf(Snapshot, "transitions") != 8 or @offsetOf(Snapshot, "duplicate_transitions") != 16 or @offsetOf(Snapshot, "overflow_resets") != 24) @compileError("Native input Snapshot layout");
+}
+
+comptime {
+    if (@sizeOf(Queue) != 8536 or @alignOf(Queue) != 8 or @offsetOf(Queue, "items") != 0 or @offsetOf(Queue, "held") != 8224 or @offsetOf(Queue, "head") != 8480 or @offsetOf(Queue, "tail") != 8488 or @offsetOf(Queue, "next_sequence") != 8496 or @offsetOf(Queue, "high_water") != 8504 or @offsetOf(Queue, "transitions") != 8512 or @offsetOf(Queue, "duplicate_transitions") != 8520 or @offsetOf(Queue, "overflow_resets") != 8528) @compileError("Native input Queue layout");
 }

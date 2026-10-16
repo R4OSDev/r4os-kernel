@@ -20,3 +20,9 @@ pub mod storage;
 pub mod usb;
 
 pub mod net;
+
+pub mod input;
+
+pub mod font;
+
+pub mod display;

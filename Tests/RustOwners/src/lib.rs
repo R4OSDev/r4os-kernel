@@ -432,3 +432,12 @@ pub mod storage {
 
 #[path = "../../../Rust/net/mod.rs"]
 pub mod net;
+
+#[path = "../../../Rust/input/mod.rs"]
+pub mod input;
+
+#[path="../../../Rust/font/mod.rs"]
+pub mod font;
+
+#[path="../../../Rust/display/mod.rs"]
+pub mod display;

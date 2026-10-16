@@ -29,3 +29,6 @@ pub mod fatal;
 // Native UART dependency; pure owner fixtures never execute its hardware calls.
 #[path = "../../../Rust/boot/serial.rs"]
 pub mod serial;
+
+// Exact native visible boot renderer dependencies; pure fixtures do not boot.
+pub use crate::{limine, r4b};

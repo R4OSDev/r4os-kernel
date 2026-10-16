@@ -1,3 +1,6 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 // Framebuffer drawing operations.
 //
 // Public color input is 0xRRGGBB. Output is packed through the boot framebuffer
@@ -22,73 +25,38 @@ pub const Framebuffer = extern struct {
 };
 
 pub fn supportsRgb32(fb: *const Framebuffer) bool {
-    return fb.bpp == 32 and fb.width <= @divFloor(~@as(u64, 0), 4) and fb.pitch >= fb.width * 4;
+    return r4os_rust_fb_supports(fb);
 }
 
 pub fn isNativeXrgb32(fb: *const Framebuffer) bool {
-    if (!supportsRgb32(fb)) return false;
-    if (fb.red_mask_size == 0 and fb.green_mask_size == 0 and fb.blue_mask_size == 0) return true;
-    return fb.red_mask_size == 8 and fb.red_mask_shift == 16 and
-        fb.green_mask_size == 8 and fb.green_mask_shift == 8 and
-        fb.blue_mask_size == 8 and fb.blue_mask_shift == 0;
+    return r4os_rust_fb_native(fb);
 }
 
 pub fn pixel(fb: *Framebuffer, x: u64, y: u64, rgb: u32) void {
-    if (!supportsRgb32(fb) or x >= fb.width or y >= fb.height) return;
-    writePixel32(fb.address + y * fb.pitch + x * 4, packRgb(fb, rgb));
+    r4os_rust_fb_pixel(fb, x, y, rgb);
 }
 
 pub fn readPacked32(fb: *Framebuffer, x: u64, y: u64) u32 {
-    if (!supportsRgb32(fb) or x >= fb.width or y >= fb.height) return 0;
-    return readPixel32(fb.address + y * fb.pitch + x * 4);
+    return r4os_rust_fb_read(fb, x, y);
 }
 
 pub fn rect(fb: *Framebuffer, x0: u64, y0: u64, w: u64, h: u64, rgb: u32) void {
-    if (!supportsRgb32(fb) or x0 >= fb.width or y0 >= fb.height) return;
-
-    const x1 = x0 + @min(w, fb.width - x0);
-    const y1 = y0 + @min(h, fb.height - y0);
-    const color32 = packRgb(fb, rgb);
-
-    var y = y0;
-    while (y < y1) : (y += 1) {
-        const row = fb.address + y * fb.pitch;
-        var x = x0;
-        while (x < x1) : (x += 1) {
-            writePixel32(row + x * 4, color32);
-        }
-    }
+    r4os_rust_fb_rect(fb, x0, y0, w, h, rgb);
 }
 
 pub fn fill(fb: *Framebuffer, rgb: u32) void {
-    rect(fb, 0, 0, fb.width, fb.height, rgb);
+    r4os_rust_fb_fill(fb, rgb);
 }
 
 pub fn putPacked32(fb: *Framebuffer, x: u64, y: u64, color32: u32) void {
-    if (!supportsRgb32(fb) or x >= fb.width or y >= fb.height) return;
-    writePixel32(fb.address + y * fb.pitch + x * 4, color32);
+    r4os_rust_fb_put(fb, x, y, color32);
 }
 
 // Present already packed RAM pixels without reading the device framebuffer.
 // Source rows may be wider than the copied rectangle; device pitch and unusual
 // destination alignment remain properties of the framebuffer.
 pub fn blitPacked32(fb: *Framebuffer, x: u64, y: u64, w: u64, h: u64, source: []const u32, stride: usize) bool {
-    if (!supportsRgb32(fb) or w == 0 or h == 0 or x >= fb.width or y >= fb.height) return false;
-    const width = @min(w, fb.width - x);
-    const height = @min(h, fb.height - y);
-    if (stride < width or source.len < width or height - 1 > (source.len - width) / stride) return false;
-    var row: usize = 0;
-    while (row < height) : (row += 1) {
-        const dst = fb.address + (y + row) * fb.pitch + x * 4;
-        const src = source[row * stride ..][0..@intCast(width)];
-        if ((@intFromPtr(dst) & 3) == 0) {
-            const words: [*]volatile u32 = @ptrCast(@alignCast(dst));
-            for (src, 0..) |pixel_value, col| words[col] = pixel_value;
-        } else {
-            for (src, 0..) |pixel_value, col| writePixel32(dst + col * 4, pixel_value);
-        }
-    }
-    return true;
+    return r4os_rust_fb_blit(fb, x, y, w, h, source.ptr, source.len, stride);
 }
 
 // Verschiebt eine 32-bpp-Framebuffer-Region nach oben. Der Vorwaertslauf ist
@@ -103,109 +71,15 @@ pub fn movePacked32RectUp(
     h: u64,
     rows_up: u64,
 ) bool {
-    if (!supportsRgb32(fb) or w == 0 or h == 0 or rows_up == 0) return false;
-    if (x0 >= fb.width or y0 >= fb.height) return false;
-
-    const clipped_w = @min(w, fb.width - x0);
-    const clipped_h = @min(h, fb.height - y0);
-    if (rows_up >= clipped_h) return false;
-
-    const move_h = clipped_h - rows_up;
-    const row_bytes = clipped_w * 4;
-    var y: u64 = 0;
-    while (y < move_h) : (y += 1) {
-        const dst = fb.address + (y0 + y) * fb.pitch + x0 * 4;
-        const src = fb.address + (y0 + rows_up + y) * fb.pitch + x0 * 4;
-        copyVolatileForward(dst, src, row_bytes);
-    }
-    return true;
+    return r4os_rust_fb_move(fb, x0, y0, w, h, rows_up);
 }
 
 pub fn packRgb(fb: *const Framebuffer, rgb: u32) u32 {
-    const r: u8 = @truncate(rgb >> 16);
-    const g: u8 = @truncate(rgb >> 8);
-    const b: u8 = @truncate(rgb);
-
-    if (fb.red_mask_size == 0 and fb.green_mask_size == 0 and fb.blue_mask_size == 0) {
-        return rgb;
-    }
-
-    return packChannel(r, fb.red_mask_size, fb.red_mask_shift) |
-        packChannel(g, fb.green_mask_size, fb.green_mask_shift) |
-        packChannel(b, fb.blue_mask_size, fb.blue_mask_shift);
+    return r4os_rust_fb_pack(fb, rgb);
 }
 
 pub fn unpackRgb(fb: *const Framebuffer, packed_pixel: u32) u32 {
-    if (fb.red_mask_size == 0 and fb.green_mask_size == 0 and fb.blue_mask_size == 0) {
-        return packed_pixel & 0x00FF_FFFF;
-    }
-    const r: u32 = unpackChannel(packed_pixel, fb.red_mask_size, fb.red_mask_shift);
-    const g: u32 = unpackChannel(packed_pixel, fb.green_mask_size, fb.green_mask_shift);
-    const b: u32 = unpackChannel(packed_pixel, fb.blue_mask_size, fb.blue_mask_shift);
-    return (r << 16) | (g << 8) | b;
-}
-
-fn packChannel(value: u8, size: u8, shift: u8) u32 {
-    if (size == 0) return 0;
-    const scaled: u32 = if (size >= 8)
-        @as(u32, value) << @intCast(size - 8)
-    else
-        @as(u32, value) >> @intCast(8 - size);
-    return scaled << @intCast(shift);
-}
-
-fn unpackChannel(value: u32, size: u8, shift: u8) u8 {
-    if (size == 0) return 0;
-    const max = (@as(u32, 1) << @intCast(size)) - 1;
-    const raw = (value >> @intCast(shift)) & max;
-    return @intCast((raw * 255 + max / 2) / max);
-}
-
-fn writePixel32(ptr: [*]volatile u8, value: u32) void {
-    if ((@intFromPtr(ptr) & 3) == 0) {
-        const word: *volatile u32 = @ptrCast(@alignCast(ptr));
-        word.* = value;
-        return;
-    }
-    ptr[0] = @truncate(value);
-    ptr[1] = @truncate(value >> 8);
-    ptr[2] = @truncate(value >> 16);
-    ptr[3] = @truncate(value >> 24);
-}
-
-fn readPixel32(ptr: [*]volatile u8) u32 {
-    if ((@intFromPtr(ptr) & 3) == 0) {
-        const word: *volatile u32 = @ptrCast(@alignCast(ptr));
-        return word.*;
-    }
-    return @as(u32, ptr[0]) |
-        (@as(u32, ptr[1]) << 8) |
-        (@as(u32, ptr[2]) << 16) |
-        (@as(u32, ptr[3]) << 24);
-}
-
-fn copyVolatileForward(dst: [*]volatile u8, src: [*]volatile u8, byte_len: u64) void {
-    var offset: u64 = 0;
-
-    if (((@intFromPtr(dst) | @intFromPtr(src)) & 7) == 0) {
-        const dst_words: [*]volatile u64 = @ptrCast(@alignCast(dst));
-        const src_words: [*]volatile u64 = @ptrCast(@alignCast(src));
-        const count = byte_len / 8;
-        var i: u64 = 0;
-        while (i < count) : (i += 1) dst_words[i] = src_words[i];
-        offset = count * 8;
-    }
-
-    if (((@intFromPtr(dst + offset) | @intFromPtr(src + offset)) & 3) == 0) {
-        const dst_words: [*]volatile u32 = @ptrCast(@alignCast(dst + offset));
-        const src_words: [*]volatile u32 = @ptrCast(@alignCast(src + offset));
-        const count = (byte_len - offset) / 4;
-        var i: u64 = 0;
-        while (i < count) : (i += 1) dst_words[i] = src_words[i];
-        offset += count * 4;
-    }
-
-    while (offset < byte_len) : (offset += 1) dst[offset] = src[offset];
+    return r4os_rust_fb_unpack(fb, packed_pixel);
 }
 
 test "aligned packed pixels use exact 32-bit values" {
@@ -322,3 +196,19 @@ fn testFramebuffer(address: [*]u8, width: u64, height: u64, pitch: u64) Framebuf
         .edid = null,
     };
 }
+
+comptime {
+    if (@sizeOf(Framebuffer) != 64 or @alignOf(Framebuffer) != 8 or @offsetOf(Framebuffer, "address") != 0 or @offsetOf(Framebuffer, "width") != 8 or @offsetOf(Framebuffer, "height") != 16 or @offsetOf(Framebuffer, "pitch") != 24 or @offsetOf(Framebuffer, "bpp") != 32 or @offsetOf(Framebuffer, "memory_model") != 34 or @offsetOf(Framebuffer, "red_mask_size") != 35 or @offsetOf(Framebuffer, "red_mask_shift") != 36 or @offsetOf(Framebuffer, "green_mask_size") != 37 or @offsetOf(Framebuffer, "green_mask_shift") != 38 or @offsetOf(Framebuffer, "blue_mask_size") != 39 or @offsetOf(Framebuffer, "blue_mask_shift") != 40 or @offsetOf(Framebuffer, "unused") != 41 or @offsetOf(Framebuffer, "edid_size") != 48 or @offsetOf(Framebuffer, "edid") != 56) @compileError("Native display Framebuffer layout");
+}
+
+extern fn r4os_rust_fb_supports(*const Framebuffer) bool;
+extern fn r4os_rust_fb_native(*const Framebuffer) bool;
+extern fn r4os_rust_fb_pixel(*const Framebuffer, u64, u64, u32) void;
+extern fn r4os_rust_fb_read(*const Framebuffer, u64, u64) u32;
+extern fn r4os_rust_fb_rect(*const Framebuffer, u64, u64, u64, u64, u32) void;
+extern fn r4os_rust_fb_fill(*const Framebuffer, u32) void;
+extern fn r4os_rust_fb_put(*const Framebuffer, u64, u64, u32) void;
+extern fn r4os_rust_fb_blit(*const Framebuffer, u64, u64, u64, u64, [*]const u32, usize, usize) bool;
+extern fn r4os_rust_fb_move(*const Framebuffer, u64, u64, u64, u64, u64) bool;
+extern fn r4os_rust_fb_pack(*const Framebuffer, u32) u32;
+extern fn r4os_rust_fb_unpack(*const Framebuffer, u32) u32;

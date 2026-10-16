@@ -1,108 +1,28 @@
+// Native input helper; caller retains its existing queue/storage owner.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+extern fn r4os_rust_input_hid_code(u8, bool, *Code) bool;
+extern fn r4os_rust_input_hid_released([*]const u8, usize, usize, [*]const u8, usize, usize, [*]u8, usize) usize;
 const std = @import("std");
 const physical_key = @import("physical_key.zig");
 
 /// One IBM PC/AT Set-1 make code. `extended` emits the E0 prefix for both the
 /// make and break transition. Keeping this bridge pure makes USB and PS/2
 /// keyboard identity directly comparable in host tests.
-pub const Code = struct {
+pub const Code = extern struct {
     make: u8,
     extended: bool = false,
 };
 
 pub fn usageToCode(usage: u8) ?Code {
-    return switch (usage) {
-        0x04 => .{ .make = 0x1E }, // A
-        0x05 => .{ .make = 0x30 },
-        0x06 => .{ .make = 0x2E },
-        0x07 => .{ .make = 0x20 },
-        0x08 => .{ .make = 0x12 },
-        0x09 => .{ .make = 0x21 },
-        0x0A => .{ .make = 0x22 },
-        0x0B => .{ .make = 0x23 },
-        0x0C => .{ .make = 0x17 },
-        0x0D => .{ .make = 0x24 },
-        0x0E => .{ .make = 0x25 },
-        0x0F => .{ .make = 0x26 },
-        0x10 => .{ .make = 0x32 },
-        0x11 => .{ .make = 0x31 },
-        0x12 => .{ .make = 0x18 },
-        0x13 => .{ .make = 0x19 },
-        0x14 => .{ .make = 0x10 },
-        0x15 => .{ .make = 0x13 },
-        0x16 => .{ .make = 0x1F },
-        0x17 => .{ .make = 0x14 },
-        0x18 => .{ .make = 0x16 },
-        0x19 => .{ .make = 0x2F },
-        0x1A => .{ .make = 0x11 },
-        0x1B => .{ .make = 0x2D },
-        0x1C => .{ .make = 0x15 },
-        0x1D => .{ .make = 0x2C }, // Z
-        0x1E => .{ .make = 0x02 }, // 1
-        0x1F => .{ .make = 0x03 },
-        0x20 => .{ .make = 0x04 },
-        0x21 => .{ .make = 0x05 },
-        0x22 => .{ .make = 0x06 },
-        0x23 => .{ .make = 0x07 },
-        0x24 => .{ .make = 0x08 },
-        0x25 => .{ .make = 0x09 },
-        0x26 => .{ .make = 0x0A },
-        0x27 => .{ .make = 0x0B }, // 0
-        0x28 => .{ .make = 0x1C }, // Enter
-        0x29 => .{ .make = 0x01 },
-        0x2A => .{ .make = 0x0E },
-        0x2B => .{ .make = 0x0F },
-        0x2C => .{ .make = 0x39 },
-        0x2D => .{ .make = 0x0C },
-        0x2E => .{ .make = 0x0D },
-        0x2F => .{ .make = 0x1A },
-        0x30 => .{ .make = 0x1B },
-        0x31 => .{ .make = 0x2B },
-        0x33 => .{ .make = 0x27 },
-        0x34 => .{ .make = 0x28 },
-        0x35 => .{ .make = 0x29 },
-        0x36 => .{ .make = 0x33 },
-        0x37 => .{ .make = 0x34 },
-        0x38 => .{ .make = 0x35 },
-        0x3C => .{ .make = 0x3D }, // F3
-        0x3D => .{ .make = 0x3E }, // F4
-
-        0x4A => .{ .make = 0x47, .extended = true }, // Home
-        0x4B => .{ .make = 0x49, .extended = true }, // Page Up
-        0x4C => .{ .make = 0x53, .extended = true }, // Delete
-        0x4D => .{ .make = 0x4F, .extended = true }, // End
-        0x4E => .{ .make = 0x51, .extended = true }, // Page Down
-        0x4F => .{ .make = 0x4D, .extended = true }, // Right
-        0x50 => .{ .make = 0x4B, .extended = true }, // Left
-        0x51 => .{ .make = 0x50, .extended = true }, // Down
-        0x52 => .{ .make = 0x48, .extended = true }, // Up
-
-        0x59 => .{ .make = 0x4F }, // Keypad 1
-        0x5A => .{ .make = 0x50 }, // Keypad 2
-        0x5B => .{ .make = 0x51 }, // Keypad 3
-        0x5C => .{ .make = 0x4B }, // Keypad 4
-        0x5D => .{ .make = 0x4C }, // Keypad 5
-        0x5E => .{ .make = 0x4D }, // Keypad 6
-        0x5F => .{ .make = 0x47 }, // Keypad 7
-        0x60 => .{ .make = 0x48 }, // Keypad 8
-        0x61 => .{ .make = 0x49 }, // Keypad 9
-        0x62 => .{ .make = 0x52 }, // Keypad 0
-        0x63 => .{ .make = 0x53 }, // Keypad decimal
-        else => null,
-    };
+    var out: Code = undefined;
+    return if (r4os_rust_input_hid_code(usage, false, &out)) out else null;
 }
 
 pub fn modifierToCode(bit: u8) ?Code {
-    return switch (bit) {
-        0x01 => .{ .make = 0x1D }, // left control
-        0x02 => .{ .make = 0x2A }, // left shift
-        0x04 => .{ .make = 0x38 }, // left alt
-        0x08 => .{ .make = 0x5B, .extended = true }, // left GUI
-        0x10 => .{ .make = 0x1D, .extended = true }, // right control
-        0x20 => .{ .make = 0x36 }, // right shift
-        0x40 => .{ .make = 0x38, .extended = true }, // right alt
-        0x80 => .{ .make = 0x5C, .extended = true }, // right GUI
-        else => null,
-    };
+    var out: Code = undefined;
+    return if (r4os_rust_input_hid_code(bit, true, &out)) out else null;
 }
 
 /// Returns usages present in the previous boot-keyboard key array but absent
@@ -115,23 +35,7 @@ pub fn collectReleasedUsages(
     current_offset: usize,
     output: []u8,
 ) usize {
-    var count: usize = 0;
-    var index: usize = @min(previous_offset + 2, previous.len);
-    while (index < previous.len and count < output.len) : (index += 1) {
-        const usage = previous[index];
-        if (usage <= 1 or reportContains(current, current_offset, usage)) continue;
-        output[count] = usage;
-        count += 1;
-    }
-    return count;
-}
-
-fn reportContains(report: []const u8, offset: usize, usage: u8) bool {
-    var index: usize = @min(offset + 2, report.len);
-    while (index < report.len) : (index += 1) {
-        if (report[index] == usage) return true;
-    }
-    return false;
+    return r4os_rust_input_hid_released(previous.ptr, previous.len, previous_offset, current.ptr, current.len, current_offset, output.ptr, output.len);
 }
 
 test "USB keypad usages round-trip to the same identities as PS/2 Set-1" {
@@ -190,4 +94,8 @@ test "boot reports expose exact keypad release transitions with or without repor
     const id_count = collectReleasedUsages(previous_with_id[0..], 1, current_with_id[0..], 1, released[0..]);
     try std.testing.expectEqual(@as(usize, 1), id_count);
     try std.testing.expectEqual(@as(u8, 0x5C), released[0]);
+}
+
+comptime {
+    if (@sizeOf(Code) != 2 or @alignOf(Code) != 1 or @offsetOf(Code, "make") != 0 or @offsetOf(Code, "extended") != 1) @compileError("Native input Code layout");
 }

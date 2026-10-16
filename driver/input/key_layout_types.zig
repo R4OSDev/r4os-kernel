@@ -1,10 +1,10 @@
-pub const Layout = enum {
+pub const Layout = enum(u32) {
     en_en,
     de_de,
 };
 
-pub const KeyChar = struct {
-    codepoint: u21 = 0,
+pub const KeyChar = extern struct {
+    codepoint: u32 = 0,
     ascii: u8 = 0,
 
     pub fn none() KeyChar {
@@ -32,7 +32,7 @@ pub const KeyChar = struct {
     }
 };
 
-pub const KeyEntry = struct {
+pub const KeyEntry = extern struct {
     scancode: u8,
     normal: KeyChar = .{},
     shift: KeyChar = .{},
@@ -40,10 +40,14 @@ pub const KeyEntry = struct {
     shift_altgr: KeyChar = .{},
 };
 
-pub const LayoutDefinition = struct {
-    id: Layout,
-    name: []const u8,
-    display: []const u8,
-    aliases: []const []const u8,
-    entries: []const KeyEntry,
+pub const Text = extern struct {
+    pointer: [*]const u8,
+    len: usize,
+    pub fn slice(self: Text) []const u8 {
+        return self.pointer[0..self.len];
+    }
 };
+pub const LayoutDefinition = extern struct { id: Layout, name: Text, display: Text, aliases: [*]const Text, alias_count: usize, entries: [*]const KeyEntry, entry_count: usize };
+comptime {
+    if (@sizeOf(KeyChar) != 8 or @alignOf(KeyChar) != 4 or @offsetOf(KeyChar, "ascii") != 4 or @sizeOf(KeyEntry) != 36 or @alignOf(KeyEntry) != 4 or @offsetOf(KeyEntry, "normal") != 4 or @offsetOf(KeyEntry, "shift") != 12 or @offsetOf(KeyEntry, "altgr") != 20 or @offsetOf(KeyEntry, "shift_altgr") != 28 or @sizeOf(LayoutDefinition) != 72 or @offsetOf(LayoutDefinition, "name") != 8 or @offsetOf(LayoutDefinition, "display") != 24 or @offsetOf(LayoutDefinition, "aliases") != 40 or @offsetOf(LayoutDefinition, "entries") != 56) @compileError("Native keyboard layout C records");
+}

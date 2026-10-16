@@ -74,20 +74,21 @@ pub fn tag(comptime bytes: *const [4]u8) u32 {
 }
 
 pub fn readU16(s: []const u8) u16 {
-    return @as(u16, s[0]) | (@as(u16, s[1]) << 8);
+    return r4os_rust_font_wire_u16(s.ptr, s.len);
 }
 
 pub fn readI16(s: []const u8) i16 {
-    return @as(i16, @bitCast(readU16(s)));
+    return r4os_rust_font_wire_i16(s.ptr, s.len);
 }
 
 pub fn readU32(s: []const u8) u32 {
-    return @as(u32, s[0]) |
-        (@as(u32, s[1]) << 8) |
-        (@as(u32, s[2]) << 16) |
-        (@as(u32, s[3]) << 24);
+    return r4os_rust_font_wire_u32(s.ptr, s.len);
 }
 
 pub fn readTag(s: []const u8) u32 {
     return readU32(s[0..4]);
 }
+
+extern fn r4os_rust_font_wire_u16([*]const u8, usize) u16;
+extern fn r4os_rust_font_wire_i16([*]const u8, usize) i16;
+extern fn r4os_rust_font_wire_u32([*]const u8, usize) u32;

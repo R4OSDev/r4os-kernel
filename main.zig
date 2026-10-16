@@ -67,6 +67,20 @@ export fn r4os_zig_boot_action(action: u32) callconv(.c) bool {
             if (config.enable_kernel_fatal_test) fatal.kernelFatal(.entry, "Kernel fatal crash test");
             if (config.enable_zig_panic_test) @panic("Zig panic crash test");
             if (config.enable_crash_screen_test) {
+                // The existing single renderer fixture also retains an exact
+                // diagnostic generation across presentation handoff and seals
+                // the final incident before its fatal-screen replay.
+                const diag = @import("kernel/diag_screen.zig");
+                const first = diag.beginResolvableIncident();
+                diag.line("Resolved diagnostic predecessor.");
+                diag.resetForExternalDisplay();
+                if (!first.valid() or !diag.resolveIncident(first))
+                    fatal.kernelFatal(.entry, "Diagnostic handoff token mismatch");
+                const retained = diag.beginResolvableIncident();
+                diag.line("Retained diagnostic incident after handoff.");
+                diag.beginIncident();
+                if (!retained.valid() or diag.resolveIncident(first) or diag.resolveIncident(retained))
+                    fatal.kernelFatal(.entry, "Diagnostic incident seal mismatch");
                 const report = crash.fromCpuException(.{
                     .frame = .{
                         .registers = .{ .rax = 1, .rbx = 2, .rcx = 3, .rdx = 4, .rbp = 0xffff_ffff_8000_1000 },
@@ -84,6 +98,7 @@ export fn r4os_zig_boot_action(action: u32) callconv(.c) bool {
                     .message = "Crash screen renderer test",
                 });
                 _ = crash_screen.render(&report);
+                log.serialWriteRaw("[CRASH-RENDER] completed\r\n");
                 interrupts.haltForever();
             }
         },
