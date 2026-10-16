@@ -1,4 +1,9 @@
-pub const Addresses = struct {
+// Native network helper; caller retains its original owner/storage.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+
+pub const Addresses = extern struct {
     local_ip: [4]u8,
     netmask: [4]u8,
     gateway_ip: [4]u8,
@@ -6,128 +11,14 @@ pub const Addresses = struct {
     dns_configured: bool = false,
 };
 
+extern fn r4os_rust_net_config_rewrite([*]const u8, usize, [*]u8, usize, *const Addresses, *usize) bool;
+extern fn r4os_rust_net_config_managed([*]const u8, usize) bool;
 pub fn rewriteConfig(input: []const u8, output: []u8, addresses: Addresses) ?usize {
-    var out_len: usize = 0;
-    var inserted = false;
-    var start: usize = 0;
-    var data = input;
-    if (data.len >= 3 and data[0] == 0xEF and data[1] == 0xBB and data[2] == 0xBF) {
-        appendBytes(output, &out_len, data[0..3]) orelse return null;
-        data = data[3..];
-    }
-
-    while (start < data.len) {
-        var end = start;
-        while (end < data.len and data[end] != '\n' and data[end] != '\r') : (end += 1) {}
-        const line = data[start..end];
-        if (isManagedNetOption(line)) {
-            if (!inserted) {
-                appendNetConfigLines(output, &out_len, addresses) orelse return null;
-                inserted = true;
-            }
-        } else {
-            appendBytes(output, &out_len, line) orelse return null;
-            appendBytes(output, &out_len, "\r\n") orelse return null;
-        }
-        start = end;
-        while (start < data.len and (data[start] == '\n' or data[start] == '\r')) : (start += 1) {}
-    }
-
-    if (!inserted) {
-        if (out_len > 0 and output[out_len - 1] != '\n') appendBytes(output, &out_len, "\r\n") orelse return null;
-        if (out_len > 0) appendBytes(output, &out_len, "\r\n") orelse return null;
-        appendNetConfigLines(output, &out_len, addresses) orelse return null;
-    }
-    return out_len;
+    var len: usize = 0;
+    return if (r4os_rust_net_config_rewrite(input.ptr, input.len, output.ptr, output.len, &addresses, &len)) len else null;
 }
-
 pub fn isManagedNetOption(line_raw: []const u8) bool {
-    const comment = indexOfByte(line_raw, '#') orelse line_raw.len;
-    const line = trimAscii(line_raw[0..comment]);
-    if (!startsWithIgnoreCase(line, "OPTION ")) return false;
-    const rest = trimAscii(line[7..]);
-    const space = indexOfByte(rest, ' ') orelse return false;
-    if (!equalsIgnoreCase(rest[0..space], "NET")) return false;
-    const body = trimAscii(rest[space + 1 ..]);
-    const eq = indexOfByte(body, '=') orelse return false;
-    const key = trimAscii(body[0..eq]);
-    return equalsIgnoreCase(key, "dhcp") or
-        equalsIgnoreCase(key, "ip") or equalsIgnoreCase(key, "addr") or equalsIgnoreCase(key, "address") or
-        equalsIgnoreCase(key, "mask") or equalsIgnoreCase(key, "netmask") or
-        equalsIgnoreCase(key, "gateway") or equalsIgnoreCase(key, "gw") or
-        equalsIgnoreCase(key, "dns") or equalsIgnoreCase(key, "nameserver");
-}
-
-fn appendNetConfigLines(out: []u8, len: *usize, addresses: Addresses) ?void {
-    appendBytes(out, len, "OPTION NET ip=") orelse return null;
-    appendIp(out, len, addresses.local_ip) orelse return null;
-    appendBytes(out, len, "\r\nOPTION NET mask=") orelse return null;
-    appendIp(out, len, addresses.netmask) orelse return null;
-    appendBytes(out, len, "\r\nOPTION NET gateway=") orelse return null;
-    appendIp(out, len, addresses.gateway_ip) orelse return null;
-    if (addresses.dns_configured) {
-        appendBytes(out, len, "\r\nOPTION NET dns=") orelse return null;
-        appendIp(out, len, addresses.dns_ip) orelse return null;
-    }
-    appendBytes(out, len, "\r\n") orelse return null;
-}
-
-fn appendIp(out: []u8, len: *usize, ip: [4]u8) ?void {
-    appendDecByte(out, len, ip[0]) orelse return null;
-    appendBytes(out, len, ".") orelse return null;
-    appendDecByte(out, len, ip[1]) orelse return null;
-    appendBytes(out, len, ".") orelse return null;
-    appendDecByte(out, len, ip[2]) orelse return null;
-    appendBytes(out, len, ".") orelse return null;
-    appendDecByte(out, len, ip[3]) orelse return null;
-}
-
-fn appendDecByte(out: []u8, len: *usize, value: u8) ?void {
-    var tmp: [3]u8 = undefined;
-    var pos = tmp.len;
-    var n = value;
-    if (n == 0) return appendBytes(out, len, "0");
-    while (n > 0) {
-        pos -= 1;
-        tmp[pos] = '0' + (n % 10);
-        n /= 10;
-    }
-    return appendBytes(out, len, tmp[pos..]);
-}
-
-fn appendBytes(out: []u8, len: *usize, text: []const u8) ?void {
-    if (len.* + text.len > out.len) return null;
-    if (text.len > 0) @memcpy(out[len.* .. len.* + text.len], text);
-    len.* += text.len;
-}
-
-fn trimAscii(s: []const u8) []const u8 {
-    var start: usize = 0;
-    var end: usize = s.len;
-    while (start < end and (s[start] == ' ' or s[start] == '\t')) : (start += 1) {}
-    while (end > start and (s[end - 1] == ' ' or s[end - 1] == '\t')) : (end -= 1) {}
-    return s[start..end];
-}
-
-fn startsWithIgnoreCase(s: []const u8, prefix: []const u8) bool {
-    return s.len >= prefix.len and equalsIgnoreCase(s[0..prefix.len], prefix);
-}
-
-fn equalsIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        const ca = if (a[i] >= 'A' and a[i] <= 'Z') a[i] + 32 else a[i];
-        const cb = if (b[i] >= 'A' and b[i] <= 'Z') b[i] + 32 else b[i];
-        if (ca != cb) return false;
-    }
-    return true;
-}
-
-fn indexOfByte(s: []const u8, ch: u8) ?usize {
-    var i: usize = 0;
-    while (i < s.len) : (i += 1) if (s[i] == ch) return i;
-    return null;
+    return r4os_rust_net_config_managed(line_raw.ptr, line_raw.len);
 }
 
 test "rewrite replaces managed network lines and preserves unrelated lines" {
@@ -220,4 +111,8 @@ fn sampleAddresses(dns_configured: bool) Addresses {
         .dns_ip = .{ 10, 0, 2, 3 },
         .dns_configured = dns_configured,
     };
+}
+
+comptime {
+    if (@sizeOf(Addresses) != 17 or @alignOf(Addresses) != 1 or @offsetOf(Addresses, "local_ip") != 0 or @offsetOf(Addresses, "netmask") != 4 or @offsetOf(Addresses, "gateway_ip") != 8 or @offsetOf(Addresses, "dns_ip") != 12 or @offsetOf(Addresses, "dns_configured") != 16) @compileError("Native network Addresses layout");
 }

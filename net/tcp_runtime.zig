@@ -1,3 +1,29 @@
+// Native network helper; caller retains its original owner/storage.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+extern fn r4os_rust_net_tcp_identity_eq(*const ConnectionIdentity, *const ConnectionIdentity) bool;
+extern fn r4os_rust_net_tcp_segment_payload(*const SentSegment, *usize) [*]const u8;
+extern fn r4os_rust_net_tcp_segment_sequence(*const SentSegment) u32;
+extern fn r4os_rust_net_tcp_catalog_reset(*SendCatalog) void;
+extern fn r4os_rust_net_tcp_catalog_capacity(*const SendCatalog) bool;
+extern fn r4os_rust_net_tcp_catalog_count(*const SendCatalog) usize;
+extern fn r4os_rust_net_tcp_catalog_free(*const SendCatalog) usize;
+extern fn r4os_rust_net_tcp_catalog_bytes(*const SendCatalog) usize;
+extern fn r4os_rust_net_tcp_catalog_track(*SendCatalog, u32, u32, u16, [*]const u8, usize, u64) u64;
+extern fn r4os_rust_net_tcp_catalog_ack(*SendCatalog, u32, *AckResult) void;
+extern fn r4os_rust_net_tcp_catalog_oldest(*const SendCatalog, u8) ?*const SentSegment;
+extern fn r4os_rust_net_tcp_catalog_retransmit(*SendCatalog, u64, u64) bool;
+extern fn r4os_rust_net_rto_reset(*RtoTable) void;
+extern fn r4os_rust_net_rto_bind(*RtoTable, *const ConnectionIdentity) ?*RtoState;
+extern fn r4os_rust_net_rto_get(*RtoTable, *const ConnectionIdentity) ?*RtoState;
+extern fn r4os_rust_net_rto_release(*RtoTable, *const ConnectionIdentity) void;
+extern fn r4os_rust_net_rto_release_slot(*RtoTable, usize) void;
+extern fn r4os_rust_net_tcp_tracking(u16, usize) bool;
+extern fn r4os_rust_net_tcp_allowance(u32, usize, bool) usize;
+extern fn r4os_rust_net_tcp_sequence(u16, usize) u32;
+extern fn r4os_rust_net_tcp_seq_after(u32, u32) bool;
+extern fn r4os_rust_net_tcp_deadline(u64, u64) bool;
 pub const CONNECTION_CAPACITY: usize = 16;
 // One bounded catalog can cover a complete unscaled TCP receive window.
 // 48 * 1460 = 70,080 bytes, so a sender is no longer artificially stopped
@@ -9,26 +35,24 @@ pub const SENT_PAYLOAD_CAPACITY: usize = 1460;
 pub const FLAG_FIN: u16 = 0x001;
 pub const FLAG_SYN: u16 = 0x002;
 
-pub const SegmentKind = enum {
+pub const SegmentKind = enum(u8) {
     any,
     data,
     syn,
     fin,
 };
 
-pub const ConnectionIdentity = struct {
+pub const ConnectionIdentity = extern struct {
     connection_id: u32,
     slot: usize,
     generation: u32,
 
     pub fn eql(a: ConnectionIdentity, b: ConnectionIdentity) bool {
-        return a.connection_id == b.connection_id and
-            a.slot == b.slot and
-            a.generation == b.generation;
+        return r4os_rust_net_tcp_identity_eq(&a, &b);
     }
 };
 
-pub const SentSegment = struct {
+pub const SentSegment = extern struct {
     valid: bool = false,
     token: u64 = 0,
     seq: u32 = 0,
@@ -41,68 +65,44 @@ pub const SentSegment = struct {
     payload: [SENT_PAYLOAD_CAPACITY]u8 = .{0} ** SENT_PAYLOAD_CAPACITY,
 
     pub fn payloadSlice(self: *const SentSegment) []const u8 {
-        const start: usize = self.payload_offset;
-        const len: usize = self.payload_len;
-        return self.payload[start .. start + len];
+        var len: usize = 0;
+        const data = r4os_rust_net_tcp_segment_payload(self, &len);
+        return data[0..len];
     }
 
     pub fn sequenceLength(self: *const SentSegment) u32 {
-        return sequenceLengthFor(self.flags, self.payload_len);
-    }
-
-    fn matches(self: *const SentSegment, kind: SegmentKind) bool {
-        if (!self.valid) return false;
-        return switch (kind) {
-            .any => true,
-            .data => self.payload_len != 0,
-            .syn => (self.flags & FLAG_SYN) != 0,
-            .fin => (self.flags & FLAG_FIN) != 0,
-        };
+        return r4os_rust_net_tcp_segment_sequence(self);
     }
 };
 
-pub const AckResult = struct {
+pub const AckResult = extern struct {
     progressed: bool = false,
     fully_acked: u8 = 0,
     remaining: u8 = 0,
 };
 
-pub const SendCatalog = struct {
+pub const SendCatalog = extern struct {
     segments: [SENT_SEGMENT_CAPACITY]SentSegment = .{SentSegment{}} ** SENT_SEGMENT_CAPACITY,
     next_token: u64 = 1,
 
     pub fn reset(self: *SendCatalog) void {
-        for (&self.segments) |*segment| segment.valid = false;
-        self.next_token = 1;
+        r4os_rust_net_tcp_catalog_reset(self);
     }
 
     pub fn hasCapacity(self: *const SendCatalog) bool {
-        // Iterate through the owner in place. Copying this bounded catalog to
-        // a task stack costs about 70 KB at the current 48-segment limit.
-        for (&self.segments) |*segment| {
-            if (!segment.valid) return true;
-        }
-        return false;
+        return r4os_rust_net_tcp_catalog_capacity(self);
     }
 
     pub fn count(self: *const SendCatalog) usize {
-        var result: usize = 0;
-        for (&self.segments) |*segment| {
-            if (segment.valid) result += 1;
-        }
-        return result;
+        return r4os_rust_net_tcp_catalog_count(self);
     }
 
     pub fn freeCount(self: *const SendCatalog) usize {
-        return SENT_SEGMENT_CAPACITY - self.count();
+        return r4os_rust_net_tcp_catalog_free(self);
     }
 
     pub fn outstandingBytes(self: *const SendCatalog) usize {
-        var result: usize = 0;
-        for (&self.segments) |*segment| {
-            if (segment.valid) result += segment.payload_len;
-        }
-        return result;
+        return r4os_rust_net_tcp_catalog_bytes(self);
     }
 
     pub fn track(
@@ -113,89 +113,26 @@ pub const SendCatalog = struct {
         payload: []const u8,
         sent_tick: u64,
     ) ?u64 {
-        if (!needsTracking(flags, payload.len) or payload.len > SENT_PAYLOAD_CAPACITY) return null;
-        for (&self.segments) |*segment| {
-            if (segment.valid) continue;
-            var token = self.next_token;
-            self.next_token +%= 1;
-            if (self.next_token == 0) self.next_token = 1;
-            if (token == 0) token = 1;
-            // Die 2-KB-Nutzlast nicht pro Sendung nullen. valid/Laenge sind
-            // die Besitzgrenze; alte Bytes hinter payload_len sind unsichtbar.
-            segment.valid = true;
-            segment.token = token;
-            segment.seq = seq;
-            segment.ack = ack;
-            segment.flags = flags;
-            segment.payload_offset = 0;
-            segment.payload_len = @intCast(payload.len);
-            segment.sent_tick = sent_tick;
-            segment.retransmits = 0;
-            if (payload.len != 0) @memcpy(segment.payload[0..payload.len], payload);
-            return token;
-        }
-        return null;
+        const token = r4os_rust_net_tcp_catalog_track(self, seq, ack, flags, payload.ptr, payload.len, sent_tick);
+        return if (token == 0) null else token;
     }
 
     pub fn acknowledge(self: *SendCatalog, ack: u32) AckResult {
-        var result: AckResult = .{};
-        for (&self.segments) |*segment| {
-            if (!segment.valid or !seqAfter(ack, segment.seq)) continue;
-            const distance = ack -% segment.seq;
-            const total = segment.sequenceLength();
-            if (distance >= total) {
-                segment.valid = false;
-                result.progressed = true;
-                result.fully_acked +|= 1;
-                continue;
-            }
-
-            var acknowledged = distance;
-            if ((segment.flags & FLAG_SYN) != 0 and acknowledged != 0) {
-                segment.flags &= ~FLAG_SYN;
-                segment.seq +%= 1;
-                acknowledged -= 1;
-                result.progressed = true;
-            }
-            if (acknowledged != 0 and segment.payload_len != 0) {
-                const trim: u16 = @intCast(@min(acknowledged, segment.payload_len));
-                segment.payload_offset += trim;
-                segment.payload_len -= trim;
-                segment.seq +%= trim;
-                acknowledged -= trim;
-                result.progressed = true;
-            }
-            if ((segment.flags & FLAG_FIN) != 0 and acknowledged != 0) {
-                segment.valid = false;
-                result.progressed = true;
-                result.fully_acked +|= 1;
-            }
-        }
-        result.remaining = @intCast(self.count());
-        return result;
+        var out: AckResult = undefined;
+        r4os_rust_net_tcp_catalog_ack(self, ack, &out);
+        return out;
     }
 
     pub fn oldest(self: *const SendCatalog, kind: SegmentKind) ?*const SentSegment {
-        var result: ?*const SentSegment = null;
-        for (&self.segments) |*segment| {
-            if (!segment.matches(kind)) continue;
-            if (result == null or segment.token < result.?.token) result = segment;
-        }
-        return result;
+        return r4os_rust_net_tcp_catalog_oldest(self, @intFromEnum(kind));
     }
 
     pub fn markRetransmitted(self: *SendCatalog, token: u64, sent_tick: u64) bool {
-        for (&self.segments) |*segment| {
-            if (!segment.valid or segment.token != token) continue;
-            segment.sent_tick = sent_tick;
-            segment.retransmits +|= 1;
-            return true;
-        }
-        return false;
+        return r4os_rust_net_tcp_catalog_retransmit(self, token, sent_tick);
     }
 };
 
-pub const RtoState = struct {
+pub const RtoState = extern struct {
     bound: bool = false,
     connection_id: u32 = 0,
     generation: u32 = 0,
@@ -204,72 +141,48 @@ pub const RtoState = struct {
     sent_tx_ack: u32 = 0,
 };
 
-pub const RtoTable = struct {
+pub const RtoTable = extern struct {
     slots: [CONNECTION_CAPACITY]RtoState = .{RtoState{}} ** CONNECTION_CAPACITY,
 
     pub fn reset(self: *RtoTable) void {
-        self.* = .{};
+        r4os_rust_net_rto_reset(self);
     }
 
     pub fn bind(self: *RtoTable, identity: ConnectionIdentity) ?*RtoState {
-        if (identity.connection_id == 0 or identity.generation == 0 or identity.slot >= self.slots.len) return null;
-        const state = &self.slots[identity.slot];
-        if (!state.bound or
-            state.connection_id != identity.connection_id or
-            state.generation != identity.generation)
-        {
-            state.* = .{
-                .bound = true,
-                .connection_id = identity.connection_id,
-                .generation = identity.generation,
-            };
-        }
-        return state;
+        return r4os_rust_net_rto_bind(self, &identity);
     }
 
     pub fn get(self: *RtoTable, identity: ConnectionIdentity) ?*RtoState {
-        if (identity.slot >= self.slots.len) return null;
-        const state = &self.slots[identity.slot];
-        if (!state.bound or
-            state.connection_id != identity.connection_id or
-            state.generation != identity.generation) return null;
-        return state;
+        return r4os_rust_net_rto_get(self, &identity);
     }
 
     pub fn release(self: *RtoTable, identity: ConnectionIdentity) void {
-        const state = self.get(identity) orelse return;
-        state.* = .{};
+        r4os_rust_net_rto_release(self, &identity);
     }
 
     pub fn releaseSlot(self: *RtoTable, slot: usize) void {
-        if (slot < self.slots.len) self.slots[slot] = .{};
+        r4os_rust_net_rto_release_slot(self, slot);
     }
 };
 
 pub fn needsTracking(flags: u16, payload_len: usize) bool {
-    return payload_len != 0 or (flags & (FLAG_SYN | FLAG_FIN)) != 0;
+    return r4os_rust_net_tcp_tracking(flags, payload_len);
 }
 
 pub fn sendAllowance(remote_window: u32, requested: usize, catalog_has_capacity: bool) usize {
-    if (!catalog_has_capacity or remote_window == 0 or requested == 0) return 0;
-    return @min(requested, @as(usize, remote_window));
+    return r4os_rust_net_tcp_allowance(remote_window, requested, catalog_has_capacity);
 }
 
 pub fn sequenceLengthFor(flags: u16, payload_len: usize) u32 {
-    var result: u32 = @intCast(payload_len);
-    if ((flags & FLAG_SYN) != 0) result +%= 1;
-    if ((flags & FLAG_FIN) != 0) result +%= 1;
-    return result;
+    return r4os_rust_net_tcp_sequence(flags, payload_len);
 }
 
 pub fn seqAfter(a: u32, b: u32) bool {
-    const diff: i32 = @bitCast(a -% b);
-    return diff > 0;
+    return r4os_rust_net_tcp_seq_after(a, b);
 }
 
 pub fn deadlineReached(now: u64, deadline: u64) bool {
-    const diff: i64 = @bitCast(now -% deadline);
-    return diff >= 0;
+    return r4os_rust_net_tcp_deadline(now, deadline);
 }
 
 test "remote window and catalog capacity bound each write" {
@@ -368,4 +281,28 @@ test "TIME_WAIT deadlines use monotonic ticks directly" {
     try testing.expect(!deadlineReached(1_000, deadline));
     try testing.expect(!deadlineReached(12_999, deadline));
     try testing.expect(deadlineReached(13_000, deadline));
+}
+
+comptime {
+    if (@sizeOf(ConnectionIdentity) != 24 or @alignOf(ConnectionIdentity) != 8 or @offsetOf(ConnectionIdentity, "connection_id") != 0 or @offsetOf(ConnectionIdentity, "slot") != 8 or @offsetOf(ConnectionIdentity, "generation") != 16) @compileError("Native network ConnectionIdentity layout");
+}
+
+comptime {
+    if (@sizeOf(SentSegment) != 1504 or @alignOf(SentSegment) != 8 or @offsetOf(SentSegment, "valid") != 0 or @offsetOf(SentSegment, "token") != 8 or @offsetOf(SentSegment, "seq") != 16 or @offsetOf(SentSegment, "ack") != 20 or @offsetOf(SentSegment, "flags") != 24 or @offsetOf(SentSegment, "payload_offset") != 26 or @offsetOf(SentSegment, "payload_len") != 28 or @offsetOf(SentSegment, "sent_tick") != 32 or @offsetOf(SentSegment, "retransmits") != 40 or @offsetOf(SentSegment, "payload") != 41) @compileError("Native network SentSegment layout");
+}
+
+comptime {
+    if (@sizeOf(AckResult) != 3 or @alignOf(AckResult) != 1 or @offsetOf(AckResult, "progressed") != 0 or @offsetOf(AckResult, "fully_acked") != 1 or @offsetOf(AckResult, "remaining") != 2) @compileError("Native network AckResult layout");
+}
+
+comptime {
+    if (@sizeOf(SendCatalog) != 72200 or @alignOf(SendCatalog) != 8 or @offsetOf(SendCatalog, "segments") != 0 or @offsetOf(SendCatalog, "next_token") != 72192) @compileError("Native network SendCatalog layout");
+}
+
+comptime {
+    if (@sizeOf(RtoState) != 40 or @alignOf(RtoState) != 8 or @offsetOf(RtoState, "bound") != 0 or @offsetOf(RtoState, "connection_id") != 4 or @offsetOf(RtoState, "generation") != 8 or @offsetOf(RtoState, "srtt_ticks") != 16 or @offsetOf(RtoState, "sent_tick") != 24 or @offsetOf(RtoState, "sent_tx_ack") != 32) @compileError("Native network RtoState layout");
+}
+
+comptime {
+    if (@sizeOf(RtoTable) != 640 or @alignOf(RtoTable) != 8 or @offsetOf(RtoTable, "slots") != 0) @compileError("Native network RtoTable layout");
 }

@@ -508,3 +508,8 @@ const _: () = {
     assert!(mem::size_of::<Timing>() == 88);
     assert!(mem::size_of::<contract::IrqStats>() == 64);
 };
+
+// Typed passive projection of the existing CPU-local dispatch depth.
+pub(crate) fn in_dispatch() -> bool {
+    r4os_rust_irq_router_local(false) != 0
+}

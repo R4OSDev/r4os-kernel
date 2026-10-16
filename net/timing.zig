@@ -1,4 +1,20 @@
-const time_core = @import("../platform/time.zig");
+// Native network helper; caller retains its original owner/storage.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+extern fn r4os_rust_net_timing_status(*Status) void;
+extern fn r4os_rust_net_deadline_start(u64, usize, *Deadline) void;
+extern fn r4os_rust_net_deadline_expired(*const Deadline, u64) bool;
+extern fn r4os_rust_net_deadline_loops(*const Deadline, usize) bool;
+extern fn r4os_rust_net_now_ticks() u64;
+extern fn r4os_rust_net_tick_hz() u64;
+extern fn r4os_rust_net_elapsed_ticks(u64) u64;
+extern fn r4os_rust_net_elapsed_seconds(u64) u32;
+extern fn r4os_rust_net_seconds_remaining(u32, u32) u32;
+extern fn r4os_rust_net_ticks_from_seconds(u32) u64;
+extern fn r4os_rust_net_operation_name(u8, *Text) void;
+extern fn r4os_rust_net_timing_check() bool;
+const Text = @import("../driver/usb/core.zig").Text;
 
 // 0.56.29: Zeitbudgets in ms definiert und comptime gegen die
 // Kernel-Tickrate gerechnet (vorher harte Tick-Werte fuer 100 Hz).
@@ -28,7 +44,7 @@ pub const OperationStatus = enum(u8) {
     would_block,
 };
 
-pub const Status = struct {
+pub const Status = extern struct {
     ticks: u64 = 0,
     hz: u64 = 0,
     arp_cache_ttl_ticks: u64 = DEFAULT_ARP_CACHE_TTL_TICKS,
@@ -42,23 +58,19 @@ pub const Status = struct {
     operation_status_count: u32 = 7,
 };
 
-pub const Deadline = struct {
+pub const Deadline = extern struct {
     start_tick: u64 = 0,
     timeout_ticks: u64 = 0,
     max_loops: usize = 0,
 
     pub fn start(timeout_ticks: u64, max_loops: usize) Deadline {
-        return .{
-            .start_tick = nowTicks(),
-            .timeout_ticks = timeout_ticks,
-            .max_loops = max_loops,
-        };
+        var out: Deadline = undefined;
+        r4os_rust_net_deadline_start(timeout_ticks, max_loops, &out);
+        return out;
     }
 
     pub fn expired(self: Deadline, current_tick: u64) bool {
-        if (self.timeout_ticks == 0) return false;
-        if (current_tick < self.start_tick) return false;
-        return current_tick - self.start_tick >= self.timeout_ticks;
+        return r4os_rust_net_deadline_expired(&self, current_tick);
     }
 
     pub fn expiredNow(self: Deadline) bool {
@@ -66,7 +78,7 @@ pub const Deadline = struct {
     }
 
     pub fn loopLimitReached(self: Deadline, loops: usize) bool {
-        return self.max_loops != 0 and loops >= self.max_loops;
+        return r4os_rust_net_deadline_loops(&self, loops);
     }
 
     pub fn elapsedTicks(self: Deadline) u64 {
@@ -75,78 +87,49 @@ pub const Deadline = struct {
 };
 
 pub fn status() Status {
-    return .{
-        .ticks = nowTicks(),
-        .hz = tickHz(),
-    };
+    var out: Status = undefined;
+    r4os_rust_net_timing_status(&out);
+    return out;
 }
 
 pub fn nowTicks() u64 {
-    return time_core.monotonicTicks();
+    return r4os_rust_net_now_ticks();
 }
 
 pub fn tickHz() u64 {
-    return time_core.monotonicFrequency();
+    return r4os_rust_net_tick_hz();
 }
 
 pub fn elapsedTicksSince(start_tick: u64) u64 {
-    if (start_tick == 0) return 0;
-    const now = nowTicks();
-    if (now <= start_tick) return 0;
-    return now - start_tick;
+    return r4os_rust_net_elapsed_ticks(start_tick);
 }
 
 pub fn elapsedSecondsSince(start_tick: u64) u32 {
-    const hz = tickHz();
-    if (hz == 0) return 0;
-    const seconds = elapsedTicksSince(start_tick) / hz;
-    return if (seconds > 0xFFFF_FFFF) 0xFFFF_FFFF else @intCast(seconds);
+    return r4os_rust_net_elapsed_seconds(start_tick);
 }
 
 pub fn secondsRemaining(total: u32, elapsed: u32) u32 {
-    if (total == 0 or elapsed >= total) return 0;
-    return total - elapsed;
+    return r4os_rust_net_seconds_remaining(total, elapsed);
 }
 
 pub fn ticksFromSeconds(seconds: u32) u64 {
-    const hz = tickHz();
-    if (hz == 0 or seconds == 0) return 0;
-    return @as(u64, seconds) * hz;
+    return r4os_rust_net_ticks_from_seconds(seconds);
 }
 
 pub fn operationStatusName(state: OperationStatus) []const u8 {
-    return switch (state) {
-        .idle => "idle",
-        .pending => "pending",
-        .ok => "ok",
-        .timeout => "timeout",
-        .failed => "failed",
-        .cancelled => "cancelled",
-        .would_block => "would-block",
-    };
+    var out: Text = undefined;
+    r4os_rust_net_operation_name(@intFromEnum(state), &out);
+    return out.slice();
 }
 
 pub fn contractCheck() bool {
-    const deadline = Deadline{ .start_tick = 10, .timeout_ticks = 5, .max_loops = 3 };
-    if (deadline.expired(14)) return false;
-    if (!deadline.expired(15)) return false;
-    if (deadline.loopLimitReached(2)) return false;
-    if (!deadline.loopLimitReached(3)) return false;
-    if (secondsRemaining(10, 3) != 7) return false;
-    if (secondsRemaining(10, 10) != 0) return false;
-    if (!textEquals(operationStatusName(.would_block), "would-block")) return false;
-    if (!textEquals(operationStatusName(.cancelled), "cancelled")) return false;
-    const s = status();
-    return s.tcp_time_wait_ticks == DEFAULT_TCP_TIME_WAIT_TICKS and
-        s.service_operation_timeout_ticks == DEFAULT_SERVICE_OPERATION_TIMEOUT_TICKS and
-        s.operation_status_count == 7;
+    return r4os_rust_net_timing_check();
 }
 
-fn textEquals(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var index: usize = 0;
-    while (index < a.len) : (index += 1) {
-        if (a[index] != b[index]) return false;
-    }
-    return true;
+comptime {
+    if (@sizeOf(Status) != 88 or @alignOf(Status) != 8 or @offsetOf(Status, "ticks") != 0 or @offsetOf(Status, "hz") != 8 or @offsetOf(Status, "arp_cache_ttl_ticks") != 16 or @offsetOf(Status, "arp_resolve_timeout_ticks") != 24 or @offsetOf(Status, "dhcp_timeout_ticks") != 32 or @offsetOf(Status, "dns_timeout_ticks") != 40 or @offsetOf(Status, "tcp_listen_timeout_ticks") != 48 or @offsetOf(Status, "tcp_retransmit_timeout_ticks") != 56 or @offsetOf(Status, "tcp_time_wait_ticks") != 64 or @offsetOf(Status, "service_operation_timeout_ticks") != 72 or @offsetOf(Status, "operation_status_count") != 80) @compileError("Native network Status layout");
+}
+
+comptime {
+    if (@sizeOf(Deadline) != 24 or @alignOf(Deadline) != 8 or @offsetOf(Deadline, "start_tick") != 0 or @offsetOf(Deadline, "timeout_ticks") != 8 or @offsetOf(Deadline, "max_loops") != 16) @compileError("Native network Deadline layout");
 }

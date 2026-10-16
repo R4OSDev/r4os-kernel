@@ -1,3 +1,14 @@
+// Native network helper; caller retains its original owner/storage.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+const Text = @import("../driver/usb/core.zig").Text;
+extern fn r4os_rust_dhcp_coordinator_reset(*Coordinator) void;
+extern fn r4os_rust_dhcp_coordinator_observe(*Coordinator, *const Input) u8;
+extern fn r4os_rust_dhcp_coordinator_start(*Coordinator, u64, u8) bool;
+extern fn r4os_rust_dhcp_coordinator_finish(*Coordinator, u64, bool, bool, u64, u64) void;
+extern fn r4os_rust_dhcp_coordinator_cancel(*Coordinator, u64, bool) bool;
+extern fn r4os_rust_dhcp_coordinator_name(u16, *Text) void;
 // Pure DHCP link/retry coordinator shared by the kernel and the deterministic
 // 0.59.13 host contract. It owns policy only; packet I/O stays in net/core.zig.
 
@@ -14,7 +25,7 @@ pub const State = enum(u16) {
     lease_lost = 9,
 };
 
-pub const Action = enum {
+pub const Action = enum(u8) {
     none,
     acquire,
     renew,
@@ -22,13 +33,13 @@ pub const Action = enum {
     clear_lease,
 };
 
-pub const Operation = enum {
+pub const Operation = enum(u8) {
     acquire,
     renew,
     rebind,
 };
 
-pub const Input = struct {
+pub const Input = extern struct {
     now: u64,
     desired_dhcp: bool,
     adapter_present: bool,
@@ -39,7 +50,7 @@ pub const Input = struct {
     lease_expired: bool = false,
 };
 
-pub const Coordinator = struct {
+pub const Coordinator = extern struct {
     state: State = .disabled,
     link_generation: u32 = 0,
     operation_generation: u32 = 0,
@@ -55,133 +66,36 @@ pub const Coordinator = struct {
     cancels: u64 = 0,
 
     pub fn reset(self: *Coordinator) void {
-        self.* = .{};
+        r4os_rust_dhcp_coordinator_reset(self);
     }
 
     pub fn observe(self: *Coordinator, input: Input) Action {
-        self.observeLink(input.now, input.adapter_present, input.link_up);
-
-        if (!input.desired_dhcp) {
-            self.operation_active = false;
-            self.retry_round = 0;
-            self.next_retry_tick = 0;
-            self.setState(input.now, if (input.adapter_present) .static else .disabled);
-            return .none;
-        }
-        if (!input.adapter_present) {
-            self.setState(input.now, .wait_adapter);
-            return if (input.lease_bound) .clear_lease else .none;
-        }
-        if (!input.link_up) {
-            self.setState(input.now, .wait_link);
-            return if (input.lease_bound) .clear_lease else .none;
-        }
-        if (self.operation_active) return .none;
-        if (input.lease_expired) {
-            self.setState(input.now, .lease_lost);
-            return .clear_lease;
-        }
-        if (input.lease_bound) {
-            if (input.now < self.next_retry_tick) {
-                self.setState(input.now, .retry_wait);
-                return .none;
-            }
-            if (input.rebind_due) return .rebind;
-            if (input.renew_due) return .renew;
-            self.retry_round = 0;
-            self.next_retry_tick = 0;
-            self.setState(input.now, .bound);
-            return .none;
-        }
-        if (input.now < self.next_retry_tick) {
-            self.setState(input.now, .retry_wait);
-            return .none;
-        }
-        return .acquire;
+        return @enumFromInt(r4os_rust_dhcp_coordinator_observe(self, &input));
     }
 
     pub fn startOperation(self: *Coordinator, now: u64, operation: Operation) bool {
-        if (self.operation_active) return false;
-        self.operation_active = true;
-        self.operation_generation +%= 1;
-        if (self.operation_generation == 0) self.operation_generation = 1;
-        self.starts +%= 1;
-        self.setState(now, switch (operation) {
-            .acquire => .acquire,
-            .renew => .renew,
-            .rebind => .rebind,
-        });
-        return true;
+        return r4os_rust_dhcp_coordinator_start(self, now, @intFromEnum(operation));
     }
 
     pub fn finishOperation(self: *Coordinator, now: u64, success: bool, timed_out: bool, base_backoff_ticks: u64, max_backoff_ticks: u64) void {
-        self.operation_active = false;
-        if (success) {
-            if (self.retry_round != 0) self.recoveries +%= 1;
-            self.retry_round = 0;
-            self.next_retry_tick = 0;
-            self.setState(now, .bound);
-            return;
-        }
-        if (timed_out) self.last_timeout_tick = now;
-        if (self.retry_round < 15) self.retry_round += 1;
-        var delay = base_backoff_ticks;
-        var shift: u8 = 1;
-        while (shift < self.retry_round and delay < max_backoff_ticks) : (shift += 1) {
-            delay *|= 2;
-        }
-        if (delay > max_backoff_ticks) delay = max_backoff_ticks;
-        self.next_retry_tick = now +| delay;
-        self.setState(now, .retry_wait);
+        r4os_rust_dhcp_coordinator_finish(self, now, success, timed_out, base_backoff_ticks, max_backoff_ticks);
     }
 
     pub fn cancel(self: *Coordinator, now: u64, keep_desired: bool) bool {
-        const active = self.operation_active;
-        self.operation_active = false;
-        if (active) self.cancels +%= 1;
-        self.operation_generation +%= 1;
-        if (self.operation_generation == 0) self.operation_generation = 1;
-        if (keep_desired) {
-            if (self.retry_round == 0) self.retry_round = 1;
-            self.next_retry_tick = now;
-            self.setState(now, .lease_lost);
-        } else {
-            self.retry_round = 0;
-            self.next_retry_tick = 0;
-            self.setState(now, .static);
-        }
-        return active;
+        return r4os_rust_dhcp_coordinator_cancel(self, now, keep_desired);
     }
 
     pub fn stateName(state: State) []const u8 {
-        return switch (state) {
-            .disabled => "disabled",
-            .static => "static",
-            .wait_adapter => "wait-adapter",
-            .wait_link => "wait-link",
-            .acquire => "acquire",
-            .retry_wait => "retry-wait",
-            .bound => "bound",
-            .renew => "renew",
-            .rebind => "rebind",
-            .lease_lost => "lease-lost",
-        };
-    }
-
-    fn observeLink(self: *Coordinator, now: u64, present: bool, up: bool) void {
-        const effective_up = present and up;
-        if (!self.last_link_known or self.last_link_up != effective_up) {
-            self.last_link_known = true;
-            self.last_link_up = effective_up;
-            self.link_generation +%= 1;
-            if (self.link_generation == 0) self.link_generation = 1;
-            self.transition_tick = now;
-        }
-    }
-
-    fn setState(self: *Coordinator, now: u64, next: State) void {
-        if (self.state == next) return;
-        self.state = next;
-        self.transition_tick = now;
+        var out: Text = undefined;
+        r4os_rust_dhcp_coordinator_name(@intFromEnum(state), &out);
+        return out.slice();
     }
 };
+
+comptime {
+    if (@sizeOf(Input) != 16 or @alignOf(Input) != 8 or @offsetOf(Input, "now") != 0 or @offsetOf(Input, "desired_dhcp") != 8 or @offsetOf(Input, "adapter_present") != 9 or @offsetOf(Input, "link_up") != 10 or @offsetOf(Input, "lease_bound") != 11 or @offsetOf(Input, "renew_due") != 12 or @offsetOf(Input, "rebind_due") != 13 or @offsetOf(Input, "lease_expired") != 14) @compileError("Native network Input layout");
+}
+
+comptime {
+    if (@sizeOf(Coordinator) != 72 or @alignOf(Coordinator) != 8 or @offsetOf(Coordinator, "state") != 0 or @offsetOf(Coordinator, "link_generation") != 4 or @offsetOf(Coordinator, "operation_generation") != 8 or @offsetOf(Coordinator, "transition_tick") != 16 or @offsetOf(Coordinator, "next_retry_tick") != 24 or @offsetOf(Coordinator, "last_timeout_tick") != 32 or @offsetOf(Coordinator, "retry_round") != 40 or @offsetOf(Coordinator, "operation_active") != 41 or @offsetOf(Coordinator, "last_link_known") != 42 or @offsetOf(Coordinator, "last_link_up") != 43 or @offsetOf(Coordinator, "recoveries") != 48 or @offsetOf(Coordinator, "starts") != 56 or @offsetOf(Coordinator, "cancels") != 64) @compileError("Native network Coordinator layout");
+}

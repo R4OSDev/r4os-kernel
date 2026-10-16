@@ -429,3 +429,6 @@ pub mod storage {
     pub use crate::{storage_access_state as access_state, storage_access_runtime as access_runtime};
     pub use crate::{storage_dispatch as dispatch, storage_guid as guid, storage_split as split};
 }
+
+#[path = "../../../Rust/net/mod.rs"]
+pub mod net;

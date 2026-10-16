@@ -393,7 +393,7 @@ pub fn secondary_loop() -> ! {
         wait_until_deadline();
     }
 }
-fn preempt_disable() {
+pub(crate) fn preempt_disable() {
     change(|s| s.preempt_disable_call_count = s.preempt_disable_call_count.wrapping_add(1));
     let task = current();
     let depth = if !task.is_null() {
@@ -406,7 +406,7 @@ fn preempt_disable() {
     };
     change(|s| s.preempt_disable_max_depth = s.preempt_disable_max_depth.max(depth));
 }
-fn preempt_enable() {
+pub(crate) fn preempt_enable() {
     change(|s| s.preempt_enable_call_count = s.preempt_enable_call_count.wrapping_add(1));
     let task = current();
     let ok = if !task.is_null() {

@@ -25,3 +25,7 @@ pub mod foundation {
 // USB registry cases never execute machine boot or framebuffer output.
 #[path = "../../../Rust/boot/fatal.rs"]
 pub mod fatal;
+
+// Native UART dependency; pure owner fixtures never execute its hardware calls.
+#[path = "../../../Rust/boot/serial.rs"]
+pub mod serial;

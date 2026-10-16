@@ -1,3 +1,21 @@
+// Sole state and all configuration decisions belong to Rust.
+const Text = @import("../driver/usb/core.zig").Text;
+const Addresses = @import("config_writer.zig").Addresses;
+extern fn r4os_rust_net_config_reset() void;
+extern fn r4os_rust_net_config_settings(*NativeSettings) void;
+extern fn r4os_rust_net_config_restore(*const NativeSettings) void;
+extern fn r4os_rust_net_config_boot(*const boot_config.Config) void;
+extern fn r4os_rust_net_config_addresses(*const Addresses, bool) void;
+extern fn r4os_rust_net_config_clear() void;
+extern fn r4os_rust_net_config_enable() void;
+extern fn r4os_rust_net_config_clear_preserving(*const Text) void;
+extern fn r4os_rust_net_config_source(*Text) void;
+extern fn r4os_rust_net_config_parse([*]const u8, usize, *[4]u8) bool;
+export fn r4os_zig_net_boot_option(config: *const boot_config.Config, key: [*]const u8, len: usize, out: *Text) callconv(.c) bool {
+    const value = boot_config.optionValue(config, "NET", key[0..len]) orelse return false;
+    out.* = .{ .pointer = value.ptr, .len = value.len };
+    return true;
+}
 const boot_config = @import("../kernel/boot_config.zig");
 
 pub const DEFAULT_LOCAL_IP: [4]u8 = .{ 10, 0, 2, 15 };
@@ -18,206 +36,104 @@ pub const Settings = struct {
     last_error: []const u8 = "default",
 };
 
-var current: Settings = .{};
-
 pub fn reset() void {
-    current = .{};
+    r4os_rust_net_config_reset();
 }
 
 pub fn applyBootConfig(config: *const boot_config.Config) void {
-    reset();
-
-    const ip_keys = [_][]const u8{ "ip", "addr", "address" };
-    const mask_keys = [_][]const u8{ "mask", "netmask" };
-    const gateway_keys = [_][]const u8{ "gateway", "gw" };
-    const dns_keys = [_][]const u8{ "dns", "nameserver" };
-
-    if (boot_config.optionValue(config, "NET", "dhcp")) |value| {
-        if (parseBool(value)) |enabled| {
-            current.dhcp_enabled = enabled;
-            if (enabled) current.configured = true;
-        } else {
-            current.invalid_options += 1;
-            current.last_error = "bad-dhcp";
-        }
-    }
-
-    _ = applyFirstOption(config, ip_keys[0..], &current.local_ip);
-    _ = applyFirstOption(config, mask_keys[0..], &current.netmask);
-    _ = applyFirstOption(config, gateway_keys[0..], &current.gateway_ip);
-    if (applyFirstOption(config, dns_keys[0..], &current.dns_ip)) {
-        current.dns_configured = true;
-    }
-
-    if (current.invalid_options == 0) {
-        current.last_error = if (current.configured) "config" else "default";
-    }
-
-    // DHCP is a desired configuration mode, not a promise that a lease is
-    // already present. Never expose the baked-in QEMU defaults while waiting
-    // for a late R4D link.
-    if (current.dhcp_enabled) clearDhcpLeasePreservingMode("dhcp-pending");
+    r4os_rust_net_config_boot(config);
 }
 
 pub fn settings() Settings {
-    return current;
+    var value: NativeSettings = undefined;
+    r4os_rust_net_config_settings(&value);
+    return .{ .local_ip = value.local_ip, .netmask = value.netmask, .gateway_ip = value.gateway_ip, .dns_ip = value.dns_ip, .dns_configured = value.dns_configured, .dhcp_enabled = value.dhcp_enabled, .dhcp_bound = value.dhcp_bound, .configured = value.configured, .invalid_options = value.invalid_options, .last_error = value.last_error.slice() };
 }
 
 pub fn restore(saved: Settings) void {
-    current = saved;
+    const value = NativeSettings{ .local_ip = saved.local_ip, .netmask = saved.netmask, .gateway_ip = saved.gateway_ip, .dns_ip = saved.dns_ip, .dns_configured = saved.dns_configured, .dhcp_enabled = saved.dhcp_enabled, .dhcp_bound = saved.dhcp_bound, .configured = saved.configured, .invalid_options = saved.invalid_options, .last_error = .{ .pointer = saved.last_error.ptr, .len = saved.last_error.len } };
+    r4os_rust_net_config_restore(&value);
 }
 
 pub fn applyRuntime(local_ip: [4]u8, next_netmask: [4]u8, gateway_ip: [4]u8, dns_ip: [4]u8, next_dns_configured: bool) void {
-    current.local_ip = local_ip;
-    current.netmask = next_netmask;
-    current.gateway_ip = gateway_ip;
-    current.dns_ip = dns_ip;
-    current.dns_configured = next_dns_configured;
-    current.dhcp_enabled = false;
-    current.dhcp_bound = false;
-    current.configured = true;
-    current.invalid_options = 0;
-    current.last_error = "runtime";
+    const addresses = Addresses{ .local_ip = local_ip, .netmask = next_netmask, .gateway_ip = gateway_ip, .dns_ip = dns_ip, .dns_configured = next_dns_configured };
+    r4os_rust_net_config_addresses(&addresses, false);
 }
 
 pub fn applyDhcpLease(local_ip: [4]u8, next_netmask: [4]u8, gateway_ip: [4]u8, dns_ip: [4]u8, next_dns_configured: bool) void {
-    current.local_ip = local_ip;
-    current.netmask = next_netmask;
-    current.gateway_ip = gateway_ip;
-    current.dns_ip = dns_ip;
-    current.dns_configured = next_dns_configured;
-    current.dhcp_enabled = true;
-    current.dhcp_bound = true;
-    current.configured = true;
-    current.invalid_options = 0;
-    current.last_error = "dhcp";
+    const addresses = Addresses{ .local_ip = local_ip, .netmask = next_netmask, .gateway_ip = gateway_ip, .dns_ip = dns_ip, .dns_configured = next_dns_configured };
+    r4os_rust_net_config_addresses(&addresses, true);
 }
 
 pub fn clearDhcpLease() void {
-    current.dhcp_enabled = false;
-    clearDhcpLeasePreservingMode("dhcp-released");
+    r4os_rust_net_config_clear();
 }
 
 pub fn clearDhcpLeasePreservingMode(reason: []const u8) void {
-    current.local_ip = .{0} ** 4;
-    current.netmask = DEFAULT_NETMASK;
-    current.gateway_ip = .{0} ** 4;
-    current.dns_ip = .{0} ** 4;
-    current.dns_configured = false;
-    current.dhcp_bound = false;
-    current.configured = true;
-    current.invalid_options = 0;
-    current.last_error = reason;
+    const text = Text{ .pointer = reason.ptr, .len = reason.len };
+    r4os_rust_net_config_clear_preserving(&text);
 }
 
 pub fn enableDhcp() void {
-    current.dhcp_enabled = true;
-    current.configured = true;
-    if (!current.dhcp_bound) clearDhcpLeasePreservingMode("dhcp-pending");
+    r4os_rust_net_config_enable();
 }
 
 pub fn localIp() [4]u8 {
-    return current.local_ip;
+    return settings().local_ip;
 }
 
 pub fn netmask() [4]u8 {
-    return current.netmask;
+    return settings().netmask;
 }
 
 pub fn gatewayIp() [4]u8 {
-    return current.gateway_ip;
+    return settings().gateway_ip;
 }
 
 pub fn dnsIp() [4]u8 {
-    return current.dns_ip;
+    return settings().dns_ip;
 }
 
 pub fn dnsConfigured() bool {
-    return current.dns_configured;
+    return settings().dns_configured;
 }
 
 pub fn dhcpEnabled() bool {
-    return current.dhcp_enabled;
+    return settings().dhcp_enabled;
 }
 
 pub fn dhcpBound() bool {
-    return current.dhcp_bound;
+    return settings().dhcp_bound;
 }
 
 pub fn sourceName() []const u8 {
-    if (current.invalid_options > 0) return current.last_error;
-    if (current.dhcp_enabled and current.dhcp_bound) return "dhcp";
-    if (current.dhcp_enabled) return "dhcp-pending";
-    if (eqIgnoreCase(current.last_error, "dhcp-released")) return "released";
-    return if (current.configured) "config" else "default";
+    var value: Text = undefined;
+    r4os_rust_net_config_source(&value);
+    return value.slice();
 }
 
 pub fn invalidOptions() u64 {
-    return current.invalid_options;
+    return settings().invalid_options;
 }
 
 pub fn parseIpv4(value: []const u8) ?[4]u8 {
-    var out: [4]u8 = .{0} ** 4;
-    var part: usize = 0;
-    var accum: u16 = 0;
-    var digits: usize = 0;
-
-    var index: usize = 0;
-    while (index < value.len) : (index += 1) {
-        const ch = value[index];
-        if (ch >= '0' and ch <= '9') {
-            accum = accum * 10 + @as(u16, ch - '0');
-            if (accum > 255) return null;
-            digits += 1;
-            if (digits > 3) return null;
-        } else if (ch == '.') {
-            if (digits == 0 or part >= 3) return null;
-            out[part] = @intCast(accum);
-            part += 1;
-            accum = 0;
-            digits = 0;
-        } else {
-            return null;
-        }
-    }
-
-    if (digits == 0 or part != 3) return null;
-    out[part] = @intCast(accum);
-    return out;
+    var out: [4]u8 = undefined;
+    return if (r4os_rust_net_config_parse(value.ptr, value.len, &out)) out else null;
 }
 
-fn applyFirstOption(config: *const boot_config.Config, keys: []const []const u8, target: *[4]u8) bool {
-    var index: usize = 0;
-    while (index < keys.len) : (index += 1) {
-        if (boot_config.optionValue(config, "NET", keys[index])) |value| {
-            if (parseIpv4(value)) |ip| {
-                target.* = ip;
-                current.configured = true;
-                return true;
-            }
-            current.invalid_options += 1;
-            current.last_error = "bad-ipv4";
-            return false;
-        }
-    }
-    return false;
-}
+const NativeSettings = extern struct {
+    local_ip: [4]u8 = DEFAULT_LOCAL_IP,
+    netmask: [4]u8 = DEFAULT_NETMASK,
+    gateway_ip: [4]u8 = DEFAULT_GATEWAY_IP,
+    dns_ip: [4]u8 = DEFAULT_DNS_IP,
+    dns_configured: bool = false,
+    dhcp_enabled: bool = false,
+    dhcp_bound: bool = false,
+    configured: bool = false,
+    invalid_options: u64 = 0,
+    last_error: Text = .{ .pointer = "default".ptr, .len = 7 },
+};
 
-fn parseBool(value: []const u8) ?bool {
-    if (eqIgnoreCase(value, "on") or eqIgnoreCase(value, "yes") or eqIgnoreCase(value, "true") or eqIgnoreCase(value, "1")) return true;
-    if (eqIgnoreCase(value, "off") or eqIgnoreCase(value, "no") or eqIgnoreCase(value, "false") or eqIgnoreCase(value, "0")) return false;
-    return null;
-}
-
-fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var index: usize = 0;
-    while (index < a.len) : (index += 1) {
-        var ca = a[index];
-        var cb = b[index];
-        if (ca >= 'A' and ca <= 'Z') ca += 32;
-        if (cb >= 'A' and cb <= 'Z') cb += 32;
-        if (ca != cb) return false;
-    }
-    return true;
+comptime {
+    if (@sizeOf(NativeSettings) != 48 or @alignOf(NativeSettings) != 8 or @offsetOf(NativeSettings, "local_ip") != 0 or @offsetOf(NativeSettings, "netmask") != 4 or @offsetOf(NativeSettings, "gateway_ip") != 8 or @offsetOf(NativeSettings, "dns_ip") != 12 or @offsetOf(NativeSettings, "dns_configured") != 16 or @offsetOf(NativeSettings, "dhcp_enabled") != 17 or @offsetOf(NativeSettings, "dhcp_bound") != 18 or @offsetOf(NativeSettings, "configured") != 19 or @offsetOf(NativeSettings, "invalid_options") != 24 or @offsetOf(NativeSettings, "last_error") != 32) @compileError("Native network NativeSettings layout");
 }

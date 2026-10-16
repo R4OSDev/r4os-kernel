@@ -222,7 +222,7 @@ unsafe fn donate(m: *mut Mutex) {
         wait::leave(flags);
     }
 }
-unsafe fn mutex_lock(m: *mut Mutex, timeout: u64) -> bool {
+pub(crate) unsafe fn mutex_lock(m: *mut Mutex, timeout: u64) -> bool {
     unsafe {
         if mutex_try(m) {
             return true;
@@ -300,7 +300,7 @@ unsafe fn mutex_handoff(m: *mut Mutex) {
         }
     }
 }
-unsafe fn mutex_unlock(m: *mut Mutex) -> bool {
+pub(crate) unsafe fn mutex_unlock(m: *mut Mutex) -> bool {
     unsafe {
         let t = current();
         if t.is_null() {

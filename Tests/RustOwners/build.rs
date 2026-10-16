@@ -8,7 +8,12 @@ fn main() {
     println!("cargo::rerun-if-changed={path}");
     let source = fs::read_to_string(path).expect("Kernel fixture configuration");
     let mut constants = String::new();
-    for key in ["ENABLE_METRICS", "FORCE_X2APIC", "ENABLE_COM1_DEBUG"] {
+    for key in [
+        "ENABLE_METRICS",
+        "FORCE_X2APIC",
+        "ENABLE_COM1_DEBUG",
+        "ENABLE_NET_LOSS_TEST",
+    ] {
         let prefix = format!("{key}=");
         let value = source
             .lines()

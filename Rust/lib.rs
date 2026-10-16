@@ -18,3 +18,5 @@ pub mod sched;
 pub mod service;
 pub mod storage;
 pub mod usb;
+
+pub mod net;

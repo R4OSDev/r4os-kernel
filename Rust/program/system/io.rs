@@ -356,6 +356,32 @@ pub unsafe extern "C" fn r4os_rust_sys_rewrite(
     rewrite: usize,
 ) -> i32 {
     unsafe {
+        rewrite_with(
+            raw,
+            input,
+            input_capacity,
+            output,
+            output_capacity,
+            |source, dest, capacity| {
+                let mut result = 0;
+                r4os_zig_sys_rewrite(rewrite, source, dest, capacity, context, &mut result)
+                    .then_some(result)
+            },
+        )
+    }
+}
+// Original request/lane and write algorithm shared by exact typed native callers.
+// SAFETY: disjoint retained buffers; rewrite is pure, bounded and never enters
+// R4SYS or waits on another filesystem request while this volume lane is held.
+pub(crate) unsafe fn rewrite_with(
+    raw: Bytes,
+    input: *mut u8,
+    input_capacity: usize,
+    output: *mut u8,
+    output_capacity: usize,
+    mut rewrite: impl FnMut(Bytes, *mut u8, usize) -> Option<usize>,
+) -> i32 {
+    unsafe {
         let mut resolved = path::Buffer::<1024>::new();
         let target = some!(ctx::resolve(raw.slice(), &mut resolved), -1);
         let volume = some!(ctx::volume(target), -2);
@@ -388,20 +414,17 @@ pub unsafe extern "C" fn r4os_rust_sys_rewrite(
             }
             input_len = some!(fs::read(volume, entry, 0, input, input_capacity, false), -6);
         }
-        let mut output_len = 0;
-        if !r4os_zig_sys_rewrite(
-            rewrite,
-            Bytes {
-                data: input,
-                len: input_len,
-            },
-            output,
-            output_capacity,
-            context,
-            &mut output_len,
-        ) {
-            return -5;
-        }
+        let output_len = some!(
+            rewrite(
+                Bytes {
+                    data: input,
+                    len: input_len
+                },
+                output,
+                output_capacity
+            ),
+            -5
+        );
         if output_len > output_capacity || output_len > i32::MAX as usize {
             return -5;
         }
@@ -432,6 +455,7 @@ pub unsafe extern "C" fn r4os_rust_sys_rewrite(
         output_len as i32
     }
 }
+
 /// # Safety
 /// Original immutable NUL-terminated module path lasts through provider query.
 #[unsafe(no_mangle)]

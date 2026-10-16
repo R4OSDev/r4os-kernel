@@ -628,3 +628,51 @@ pub const AudioSidOp = extern struct {
     mirrored: u8 = 0,
     result: i32 = 0,
 };
+
+comptime {
+    if (@sizeOf(EthernetFrameOp) != 1564 or @alignOf(EthernetFrameOp) != 4 or @offsetOf(EthernetFrameOp, "own_mac") != 0 or @offsetOf(EthernetFrameOp, "source_mac") != 6 or @offsetOf(EthernetFrameOp, "frame_len") != 12 or @offsetOf(EthernetFrameOp, "ethertype") != 16 or @offsetOf(EthernetFrameOp, "result") != 20 or @offsetOf(EthernetFrameOp, "flags") != 24 or @offsetOf(EthernetFrameOp, "frame") != 28) @compileError("Native network EthernetFrameOp layout");
+}
+
+comptime {
+    if (@sizeOf(ArpOp) != 1588 or @alignOf(ArpOp) != 4 or @offsetOf(ArpOp, "local_ip") != 0 or @offsetOf(ArpOp, "source_mac") != 4 or @offsetOf(ArpOp, "target_ip") != 10 or @offsetOf(ArpOp, "sender_mac") != 14 or @offsetOf(ArpOp, "sender_ip") != 20 or @offsetOf(ArpOp, "target_mac") != 24 or @offsetOf(ArpOp, "seen_target_ip") != 30 or @offsetOf(ArpOp, "frame_len") != 36 or @offsetOf(ArpOp, "opcode") != 40 or @offsetOf(ArpOp, "result") != 44 or @offsetOf(ArpOp, "flags") != 48 or @offsetOf(ArpOp, "frame") != 52) @compileError("Native network ArpOp layout");
+}
+
+comptime {
+    if (@sizeOf(Ipv4Op) != 3120 or @alignOf(Ipv4Op) != 4 or @offsetOf(Ipv4Op, "local_ip") != 0 or @offsetOf(Ipv4Op, "source_mac") != 4 or @offsetOf(Ipv4Op, "dest_mac") != 10 or @offsetOf(Ipv4Op, "source_ip") != 16 or @offsetOf(Ipv4Op, "dest_ip") != 20 or @offsetOf(Ipv4Op, "protocol") != 24 or @offsetOf(Ipv4Op, "ttl") != 25 or @offsetOf(Ipv4Op, "frame_len") != 28 or @offsetOf(Ipv4Op, "payload_len") != 32 or @offsetOf(Ipv4Op, "ethertype") != 36 or @offsetOf(Ipv4Op, "result") != 40 or @offsetOf(Ipv4Op, "flags") != 44 or @offsetOf(Ipv4Op, "frame") != 48 or @offsetOf(Ipv4Op, "payload") != 1584) @compileError("Native network Ipv4Op layout");
+}
+
+comptime {
+    if (@sizeOf(UdpOp) != 3104 or @alignOf(UdpOp) != 4 or @offsetOf(UdpOp, "source_ip") != 0 or @offsetOf(UdpOp, "dest_ip") != 4 or @offsetOf(UdpOp, "source_port") != 8 or @offsetOf(UdpOp, "dest_port") != 10 or @offsetOf(UdpOp, "length") != 12 or @offsetOf(UdpOp, "payload_len") != 16 or @offsetOf(UdpOp, "datagram_len") != 20 or @offsetOf(UdpOp, "result") != 24 or @offsetOf(UdpOp, "flags") != 28 or @offsetOf(UdpOp, "datagram") != 32 or @offsetOf(UdpOp, "payload") != 1568) @compileError("Native network UdpOp layout");
+}
+
+comptime {
+    if (@sizeOf(IcmpOp) != 1556 or @alignOf(IcmpOp) != 4 or @offsetOf(IcmpOp, "ident") != 0 or @offsetOf(IcmpOp, "seq") != 2 or @offsetOf(IcmpOp, "payload_len") != 4 or @offsetOf(IcmpOp, "result") != 8 or @offsetOf(IcmpOp, "typ") != 12 or @offsetOf(IcmpOp, "code") != 13 or @offsetOf(IcmpOp, "reserved") != 14 or @offsetOf(IcmpOp, "flags") != 16 or @offsetOf(IcmpOp, "payload") != 20) @compileError("Native network IcmpOp layout");
+}
+
+comptime {
+    if (@sizeOf(DhcpOp) != 1604 or @alignOf(DhcpOp) != 4 or @offsetOf(DhcpOp, "xid") != 0 or @offsetOf(DhcpOp, "mac") != 4 or @offsetOf(DhcpOp, "requested_ip") != 10 or @offsetOf(DhcpOp, "server_ip") != 14 or @offsetOf(DhcpOp, "offered_ip") != 18 or @offsetOf(DhcpOp, "client_ip") != 22 or @offsetOf(DhcpOp, "netmask") != 26 or @offsetOf(DhcpOp, "gateway_ip") != 30 or @offsetOf(DhcpOp, "dns_ip") != 34 or @offsetOf(DhcpOp, "lease_seconds") != 40 or @offsetOf(DhcpOp, "renew_seconds") != 44 or @offsetOf(DhcpOp, "rebind_seconds") != 48 or @offsetOf(DhcpOp, "message_type") != 52 or @offsetOf(DhcpOp, "dns_configured") != 53 or @offsetOf(DhcpOp, "reserved") != 54 or @offsetOf(DhcpOp, "payload_len") != 56 or @offsetOf(DhcpOp, "result") != 60 or @offsetOf(DhcpOp, "flags") != 64 or @offsetOf(DhcpOp, "payload") != 68) @compileError("Native network DhcpOp layout");
+}
+
+comptime {
+    if (@sizeOf(DnsOp) != 1812 or @alignOf(DnsOp) != 4 or @offsetOf(DnsOp, "id") != 0 or @offsetOf(DnsOp, "name_len") != 2 or @offsetOf(DnsOp, "payload_len") != 4 or @offsetOf(DnsOp, "result") != 8 or @offsetOf(DnsOp, "flags") != 12 or @offsetOf(DnsOp, "answer") != 16 or @offsetOf(DnsOp, "name") != 20 or @offsetOf(DnsOp, "payload") != 276) @compileError("Native network DnsOp layout");
+}
+
+comptime {
+    if (@sizeOf(TcpR4pSummary) != 96 or @alignOf(TcpR4pSummary) != 8 or @offsetOf(TcpR4pSummary, "max_connections") != 0 or @offsetOf(TcpR4pSummary, "active_connections") != 4 or @offsetOf(TcpR4pSummary, "buffer_size") != 8 or @offsetOf(TcpR4pSummary, "syn_tx") != 16 or @offsetOf(TcpR4pSummary, "synack_rx") != 24 or @offsetOf(TcpR4pSummary, "ack_tx") != 32 or @offsetOf(TcpR4pSummary, "data_tx") != 40 or @offsetOf(TcpR4pSummary, "data_rx") != 48 or @offsetOf(TcpR4pSummary, "fin_tx") != 56 or @offsetOf(TcpR4pSummary, "rst_rx") != 64 or @offsetOf(TcpR4pSummary, "checksum_errors") != 72 or @offsetOf(TcpR4pSummary, "timeouts") != 80 or @offsetOf(TcpR4pSummary, "self_tests") != 88) @compileError("Native network TcpR4pSummary layout");
+}
+
+comptime {
+    if (@sizeOf(TcpR4pConnectionInfo) != 40 or @alignOf(TcpR4pConnectionInfo) != 8 or @offsetOf(TcpR4pConnectionInfo, "id") != 0 or @offsetOf(TcpR4pConnectionInfo, "state") != 4 or @offsetOf(TcpR4pConnectionInfo, "local_port") != 6 or @offsetOf(TcpR4pConnectionInfo, "remote_port") != 8 or @offsetOf(TcpR4pConnectionInfo, "remote_ip") != 10 or @offsetOf(TcpR4pConnectionInfo, "tx_bytes") != 16 or @offsetOf(TcpR4pConnectionInfo, "rx_bytes") != 24 or @offsetOf(TcpR4pConnectionInfo, "pending_rx") != 32) @compileError("Native network TcpR4pConnectionInfo layout");
+}
+
+comptime {
+    if (@sizeOf(TcpOp) != 3264 or @alignOf(TcpOp) != 8 or @offsetOf(TcpOp, "source_ip") != 0 or @offsetOf(TcpOp, "dest_ip") != 4 or @offsetOf(TcpOp, "remote_ip") != 8 or @offsetOf(TcpOp, "conn_id") != 12 or @offsetOf(TcpOp, "index") != 16 or @offsetOf(TcpOp, "local_port") != 20 or @offsetOf(TcpOp, "remote_port") != 22 or @offsetOf(TcpOp, "source_port") != 24 or @offsetOf(TcpOp, "dest_port") != 26 or @offsetOf(TcpOp, "seq") != 28 or @offsetOf(TcpOp, "ack") != 32 or @offsetOf(TcpOp, "flags") != 36 or @offsetOf(TcpOp, "reserved") != 38 or @offsetOf(TcpOp, "payload_len") != 40 or @offsetOf(TcpOp, "segment_len") != 44 or @offsetOf(TcpOp, "result") != 48 or @offsetOf(TcpOp, "summary") != 56 or @offsetOf(TcpOp, "info") != 152 or @offsetOf(TcpOp, "payload") != 192 or @offsetOf(TcpOp, "segment") != 1728) @compileError("Native network TcpOp layout");
+}
+
+comptime {
+    if (@sizeOf(R4slSummary) != 64 or @alignOf(R4slSummary) != 8 or @offsetOf(R4slSummary, "parsed_frames") != 0 or @offsetOf(R4slSummary, "built_frames") != 8 or @offsetOf(R4slSummary, "loopback_tests") != 16 or @offsetOf(R4slSummary, "bad_magic") != 24 or @offsetOf(R4slSummary, "bad_version") != 32 or @offsetOf(R4slSummary, "bad_length") != 40 or @offsetOf(R4slSummary, "checksum_errors") != 48 or @offsetOf(R4slSummary, "overflows") != 56) @compileError("Native network R4slSummary layout");
+}
+
+comptime {
+    if (@sizeOf(R4slOp) != 880 or @alignOf(R4slOp) != 8 or @offsetOf(R4slOp, "frame_type") != 0 or @offsetOf(R4slOp, "completed") != 1 or @offsetOf(R4slOp, "reserved0") != 2 or @offsetOf(R4slOp, "payload_len") != 4 or @offsetOf(R4slOp, "frame_len") != 8 or @offsetOf(R4slOp, "input_len") != 12 or @offsetOf(R4slOp, "result") != 16 or @offsetOf(R4slOp, "summary") != 24 or @offsetOf(R4slOp, "payload") != 88 or @offsetOf(R4slOp, "frame") != 344 or @offsetOf(R4slOp, "input") != 610) @compileError("Native network R4slOp layout");
+}

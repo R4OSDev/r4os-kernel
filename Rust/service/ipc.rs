@@ -392,7 +392,7 @@ fn start_workers() -> bool {
     STARTED.store(true, Ordering::Release);
     true
 }
-fn open(id: u32) -> i32 {
+pub(crate) fn open(id: u32) -> i32 {
     if deny_irq() {
         return fail();
     }
@@ -493,7 +493,7 @@ unsafe fn publish_ready(
         payload.len as i32
     }
 }
-unsafe fn recv(id: u32, output: *mut u8, capacity: usize) -> i32 {
+pub(crate) unsafe fn recv(id: u32, output: *mut u8, capacity: usize) -> i32 {
     unsafe {
         if deny_irq() {
             return fail();
@@ -992,7 +992,7 @@ unsafe fn direct_request(id: u32, payload: Bytes, output: *mut u8, capacity: usi
         produced
     }
 }
-unsafe fn send(id: u32, payload: Bytes) -> i32 {
+pub(crate) unsafe fn send(id: u32, payload: Bytes) -> i32 {
     unsafe {
         if payload.len > MAX_MESSAGE_SIZE || deny_irq() {
             return fail();
@@ -1027,7 +1027,13 @@ unsafe fn send(id: u32, payload: Bytes) -> i32 {
         )
     }
 }
-unsafe fn request(id: u32, payload: Bytes, output: *mut u8, capacity: usize, timeout: u64) -> i32 {
+pub(crate) unsafe fn request(
+    id: u32,
+    payload: Bytes,
+    output: *mut u8,
+    capacity: usize,
+    timeout: u64,
+) -> i32 {
     unsafe {
         if payload.len > MAX_MESSAGE_SIZE || capacity > MAX_MESSAGE_SIZE || deny_irq() {
             return fail();
@@ -1456,4 +1462,12 @@ pub unsafe extern "C" fn r4os_rust_ipc_performance(
     };
     unsafe { output.write(result) };
     1
+}
+
+// Typed native callers retain the same channel control admission and policy.
+pub(crate) fn close_channel(id: u32) -> i32 {
+    control(id, 0)
+}
+pub(crate) fn poll_channel(id: u32) -> i32 {
+    control(id, 1)
 }

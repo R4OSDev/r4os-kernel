@@ -1,3 +1,15 @@
+// Native network helper; caller retains its original owner/storage.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+extern fn r4os_rust_net_rx_reset(*Queue) void;
+extern fn r4os_rust_net_rx_enqueue(*Queue, usize, [*]const u8, usize, u64, *const Metadata) u8;
+extern fn r4os_rust_net_rx_claim(*Queue, *Claim) bool;
+extern fn r4os_rust_net_rx_frame(*const Queue, *const Claim, *usize) ?[*]const u8;
+extern fn r4os_rust_net_rx_release(*Queue, *const Claim) bool;
+extern fn r4os_rust_net_rx_cancel_all(*Queue) usize;
+extern fn r4os_rust_net_rx_queued(*const Queue) usize;
+extern fn r4os_rust_net_rx_occupied(*const Queue) usize;
 pub const capacity: usize = 64;
 pub const max_frame_bytes: usize = 1536;
 
@@ -7,12 +19,12 @@ const SlotState = enum(u8) {
     processing,
 };
 
-pub const Metadata = struct {
+pub const Metadata = extern struct {
     l4_checksum_valid: bool = false,
     software_fallback: bool = false,
 };
 
-const Slot = struct {
+const Slot = extern struct {
     state: SlotState = .free,
     generation: u32 = 0,
     adapter_index: usize = 0,
@@ -22,13 +34,13 @@ const Slot = struct {
     data: [max_frame_bytes]u8 = .{0} ** max_frame_bytes,
 };
 
-pub const EnqueueResult = enum {
+pub const EnqueueResult = enum(u8) {
     accepted,
     invalid_frame,
     busy,
 };
 
-pub const Claim = struct {
+pub const Claim = extern struct {
     slot: u8,
     generation: u32,
     adapter_index: usize,
@@ -43,7 +55,7 @@ pub const Claim = struct {
 /// method with the same IRQ/preemption critical section. A claimed slot stays
 /// occupied until `release`, so a driver buffer is copied exactly once and a
 /// nested protocol poll cannot let a producer overwrite the frame in flight.
-pub const Queue = struct {
+pub const Queue = extern struct {
     slots: [capacity]Slot = .{Slot{}} ** capacity,
     ready: [capacity]u8 = .{0} ** capacity,
     ready_head: usize = 0,
@@ -59,8 +71,7 @@ pub const Queue = struct {
     high_water: usize = 0,
 
     pub fn reset(self: *Queue) void {
-        self.* = .{};
-        self.resetStorage();
+        r4os_rust_net_rx_reset(self);
     }
 
     pub fn enqueue(self: *Queue, adapter_index: usize, frame_bytes: []const u8, enqueued_ns: u64) EnqueueResult {
@@ -68,107 +79,37 @@ pub const Queue = struct {
     }
 
     pub fn enqueueWithMetadata(self: *Queue, adapter_index: usize, frame_bytes: []const u8, enqueued_ns: u64, metadata: Metadata) EnqueueResult {
-        if (frame_bytes.len == 0 or frame_bytes.len > max_frame_bytes) return .invalid_frame;
-        if (self.free_count == 0) {
-            self.busy +%= 1;
-            return .busy;
-        }
-
-        self.free_count -= 1;
-        const slot_index: usize = self.free_slots[self.free_count];
-        const slot = &self.slots[slot_index];
-        slot.generation +%= 1;
-        if (slot.generation == 0) slot.generation = 1;
-        slot.adapter_index = adapter_index;
-        slot.len = @intCast(frame_bytes.len);
-        slot.enqueued_ns = enqueued_ns;
-        slot.metadata = metadata;
-        @memcpy(slot.data[0..frame_bytes.len], frame_bytes);
-        slot.state = .queued;
-
-        self.ready[self.ready_tail] = @intCast(slot_index);
-        self.ready_tail = (self.ready_tail + 1) % capacity;
-        self.ready_count += 1;
-        self.accepted +%= 1;
-        const occupied = self.occupiedCount();
-        if (occupied > self.high_water) self.high_water = occupied;
-        return .accepted;
+        return @enumFromInt(r4os_rust_net_rx_enqueue(self, adapter_index, frame_bytes.ptr, frame_bytes.len, enqueued_ns, &metadata));
     }
 
     pub fn claim(self: *Queue) ?Claim {
-        if (self.ready_count == 0) return null;
-        const slot_index: usize = self.ready[self.ready_head];
-        self.ready_head = (self.ready_head + 1) % capacity;
-        self.ready_count -= 1;
-        const slot = &self.slots[slot_index];
-        if (slot.state != .queued) return null;
-        slot.state = .processing;
-        self.claimed +%= 1;
-        return .{
-            .slot = @intCast(slot_index),
-            .generation = slot.generation,
-            .adapter_index = slot.adapter_index,
-            .len = slot.len,
-            .enqueued_ns = slot.enqueued_ns,
-            .metadata = slot.metadata,
-        };
+        var out: Claim = undefined;
+        return if (r4os_rust_net_rx_claim(self, &out)) out else null;
     }
 
     pub fn frame(self: *const Queue, claim_token: Claim) ?[]const u8 {
-        const slot_index: usize = claim_token.slot;
-        if (slot_index >= capacity) return null;
-        const slot = &self.slots[slot_index];
-        if (slot.state != .processing or slot.generation != claim_token.generation or slot.len != claim_token.len) return null;
-        return slot.data[0..slot.len];
+        var len: usize = 0;
+        const data = r4os_rust_net_rx_frame(self, &claim_token, &len) orelse return null;
+        return data[0..len];
     }
 
     pub fn release(self: *Queue, claim_token: Claim) bool {
-        const slot_index: usize = claim_token.slot;
-        if (slot_index >= capacity) return false;
-        const slot = &self.slots[slot_index];
-        if (slot.state != .processing or slot.generation != claim_token.generation) return false;
-        slot.state = .free;
-        slot.adapter_index = 0;
-        slot.len = 0;
-        slot.enqueued_ns = 0;
-        slot.metadata = .{};
-        self.free_slots[self.free_count] = @intCast(slot_index);
-        self.free_count += 1;
-        self.released +%= 1;
-        return true;
+        return r4os_rust_net_rx_release(self, &claim_token);
     }
 
     /// Cancels queued ownership during an explicit backend/system transition.
     /// Netcore calls this only after every producer and consumer callback has
     /// drained, so no processing slot can still be observed by a caller.
     pub fn cancelAll(self: *Queue) usize {
-        const cancelled_now = self.occupiedCount();
-        self.cancelled +%= cancelled_now;
-        self.resetStorage();
-        return cancelled_now;
+        return r4os_rust_net_rx_cancel_all(self);
     }
 
     pub fn queuedCount(self: *const Queue) usize {
-        return self.ready_count;
+        return r4os_rust_net_rx_queued(self);
     }
 
     pub fn occupiedCount(self: *const Queue) usize {
-        return capacity - self.free_count;
-    }
-
-    fn resetStorage(self: *Queue) void {
-        self.ready_head = 0;
-        self.ready_tail = 0;
-        self.ready_count = 0;
-        self.free_count = capacity;
-        for (&self.slots) |*slot| {
-            slot.state = .free;
-            slot.adapter_index = 0;
-            slot.len = 0;
-            slot.enqueued_ns = 0;
-            slot.metadata = .{};
-        }
-        for (&self.free_slots, 0..) |*slot, index| slot.* = @intCast(index);
+        return r4os_rust_net_rx_occupied(self);
     }
 };
 
@@ -228,4 +169,20 @@ test "RX handoff cancellation accounts every accepted frame" {
     try std.testing.expectEqual(@as(usize, 2), queue.cancelAll());
     try std.testing.expectEqual(queue.accepted, queue.released + queue.cancelled);
     try std.testing.expectEqual(@as(usize, 0), queue.occupiedCount());
+}
+
+comptime {
+    if (@sizeOf(Metadata) != 2 or @alignOf(Metadata) != 1 or @offsetOf(Metadata, "l4_checksum_valid") != 0 or @offsetOf(Metadata, "software_fallback") != 1) @compileError("Native network Metadata layout");
+}
+
+comptime {
+    if (@sizeOf(Slot) != 1576 or @alignOf(Slot) != 8 or @offsetOf(Slot, "state") != 0 or @offsetOf(Slot, "generation") != 4 or @offsetOf(Slot, "adapter_index") != 8 or @offsetOf(Slot, "len") != 16 or @offsetOf(Slot, "enqueued_ns") != 24 or @offsetOf(Slot, "metadata") != 32 or @offsetOf(Slot, "data") != 34) @compileError("Native network Slot layout");
+}
+
+comptime {
+    if (@sizeOf(Claim) != 40 or @alignOf(Claim) != 8 or @offsetOf(Claim, "slot") != 0 or @offsetOf(Claim, "generation") != 4 or @offsetOf(Claim, "adapter_index") != 8 or @offsetOf(Claim, "len") != 16 or @offsetOf(Claim, "enqueued_ns") != 24 or @offsetOf(Claim, "metadata") != 32) @compileError("Native network Claim layout");
+}
+
+comptime {
+    if (@sizeOf(Queue) != 101072 or @alignOf(Queue) != 8 or @offsetOf(Queue, "slots") != 0 or @offsetOf(Queue, "ready") != 100864 or @offsetOf(Queue, "ready_head") != 100928 or @offsetOf(Queue, "ready_tail") != 100936 or @offsetOf(Queue, "ready_count") != 100944 or @offsetOf(Queue, "free_slots") != 100952 or @offsetOf(Queue, "free_count") != 101016 or @offsetOf(Queue, "accepted") != 101024 or @offsetOf(Queue, "claimed") != 101032 or @offsetOf(Queue, "released") != 101040 or @offsetOf(Queue, "cancelled") != 101048 or @offsetOf(Queue, "busy") != 101056 or @offsetOf(Queue, "high_water") != 101064) @compileError("Native network Queue layout");
 }

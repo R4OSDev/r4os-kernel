@@ -315,3 +315,40 @@ pub unsafe extern "C" fn r4os_rust_sync_semaphore(
         }
     }
 }
+
+// Typed native callers use the same checked Event implementation as the C facade.
+/// # Safety
+/// Stable resident Event under its existing runtime-owned lifecycle.
+pub(crate) unsafe fn event_signal(event: *mut Event) {
+    unsafe {
+        r4os_rust_sync_event(event, 0, 0);
+    }
+}
+/// # Safety
+/// Stable resident Event retained through the existing exact Task wait.
+pub(crate) unsafe fn event_wait(event: *mut Event, timeout: u64) -> bool {
+    unsafe { r4os_rust_sync_event(event, 2, timeout) == WaitResult::Signaled as u32 }
+}
+
+/// # Safety
+/// Stable resident Queue and predicate/context through enrollment. Predicate
+/// is nonblocking under runtime admission; no context pointer survives sleep.
+pub(crate) unsafe fn queue_wait_unless(
+    queue: *mut WaitQueue,
+    timeout: u64,
+    reason: Text,
+    predicate: Predicate,
+    context: *mut c_void,
+) -> WaitResult {
+    unsafe {
+        wait::wait(
+            queue,
+            &WaitRequest::predicate(timeout, reason, predicate, context),
+        )
+    }
+}
+/// # Safety
+/// Stable resident Queue under its existing runtime-owned lifetime.
+pub(crate) unsafe fn queue_wake_all(queue: *mut WaitQueue) -> usize {
+    unsafe { wait::r4os_rust_sync_queue(queue, 1, ptr::null_mut(), 0, ptr::null_mut()) as usize }
+}

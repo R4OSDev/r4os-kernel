@@ -1,3 +1,11 @@
+// Native network helper; caller retains its original owner/storage.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+extern fn r4os_rust_net_negotiate(*const Offer, *Negotiation) u8;
+extern fn r4os_rust_net_valid_query(*const Negotiation) bool;
+extern fn r4os_rust_net_valid_rx(*const Packet, *const Negotiation, usize) bool;
+extern fn r4os_rust_net_rx_metadata(u64, u64, [*]const u8, usize) u8;
 pub const version: u32 = 2;
 pub const negotiation_version: u32 = 1;
 pub const packet_version: u32 = 1;
@@ -87,7 +95,7 @@ pub const Negotiation = extern struct {
     reserved: u32 = 0,
 };
 
-pub const Offer = struct {
+pub const Offer = extern struct {
     offered: u64 = 0,
     required: u64 = 0,
     rx_queue_count: u16 = 1,
@@ -106,47 +114,22 @@ pub const NegotiateError = error{
 };
 
 pub fn negotiate(offer: Offer) NegotiateError!Negotiation {
-    if (offer.rx_queue_count == 0 or offer.tx_queue_count == 0 or
-        offer.max_rx_segments == 0 or offer.max_tx_segments == 0 or
-        offer.max_rx_segments > max_packet_segments or offer.max_tx_segments > max_packet_segments or
-        offer.rx_ownership > ownership_transferred_until_completion or
-        offer.tx_ownership > ownership_transferred_until_completion)
-    {
-        return error.InvalidOffer;
-    }
-    if ((offer.required & ~offer.offered) != 0) return error.RequiredNotOffered;
-
-    const accepted = offer.offered & supported_capabilities;
-    if ((offer.required & ~accepted) != 0) return error.RequiredUnsupported;
-
-    return .{
-        .offered = offer.offered,
-        .accepted = accepted,
-        .rejected = offer.offered & ~accepted,
-        // The current BSP-only Netcore intentionally selects one queue and a
-        // flat canonical buffer even when the device offers larger values.
-        .rx_queue_count = 1,
-        .tx_queue_count = 1,
-        .max_rx_segments = 1,
-        .max_tx_segments = 1,
-        .rx_ownership = ownership_borrowed_until_return,
-        .tx_ownership = ownership_borrowed_until_return,
-        .interrupt_moderation_us = 0,
+    var out: Negotiation = undefined;
+    return switch (r4os_rust_net_negotiate(&offer, &out)) {
+        0 => out,
+        1 => error.InvalidOffer,
+        2 => error.RequiredNotOffered,
+        3 => error.RequiredUnsupported,
+        else => unreachable,
     };
 }
 
 pub fn validNegotiationQuery(query: *const Negotiation) bool {
-    return query.version == negotiation_version and query.size >= @sizeOf(Negotiation);
+    return r4os_rust_net_valid_query(query);
 }
 
 pub fn validRxPacket(packet: *const Packet, selected: Negotiation, max_frame_bytes: usize) bool {
-    if (packet.version != packet_version or packet.size < @sizeOf(Packet)) return false;
-    if (packet.ownership != ownership_borrowed_until_return) return false;
-    if (packet.fallback_addr == 0 or packet.fallback_bytes == 0 or packet.fallback_bytes > max_frame_bytes) return false;
-    if (packet.queue_index >= selected.rx_queue_count) return false;
-    if (packet.segment_count > max_packet_segments) return false;
-    if (packet.segment_count != 0 and packet.segments_addr == 0) return false;
-    return true;
+    return r4os_rust_net_valid_rx(packet, &selected, max_frame_bytes);
 }
 
 pub const RxMetadataDecision = enum(u8) {
@@ -160,40 +143,9 @@ pub const RxMetadataDecision = enum(u8) {
 /// malformed claims never reject or mutate the canonical frame; they select
 /// the ordinary software verifier instead.
 pub fn selectRxMetadata(accepted_capabilities: u64, packet_flags: u64, frame: []const u8) RxMetadataDecision {
-    if (packet_flags == 0) return .software;
-    if ((packet_flags & ~known_packet_flags) != 0) return .software_fallback;
-    if (packet_flags != packet_flag_rx_l4_checksum_valid) return .software_fallback;
-    if ((accepted_capabilities & capability_rx_l4_checksum_valid) == 0) return .software_fallback;
-    if (!flatIpv4L4Frame(frame)) return .software_fallback;
-    return .l4_checksum_valid;
+    return @enumFromInt(r4os_rust_net_rx_metadata(accepted_capabilities, packet_flags, frame.ptr, frame.len));
 }
 
-fn flatIpv4L4Frame(frame: []const u8) bool {
-    const ethernet_bytes: usize = 14;
-    const ipv4_min_bytes: usize = 20;
-    if (frame.len < ethernet_bytes + ipv4_min_bytes) return false;
-    if (readBe16(frame, 12) != 0x0800) return false;
-
-    const ip = frame[ethernet_bytes..];
-    if ((ip[0] >> 4) != 4) return false;
-    const header_bytes = @as(usize, ip[0] & 0x0f) * 4;
-    if (header_bytes < ipv4_min_bytes or ip.len < header_bytes) return false;
-    const total_bytes: usize = readBe16(ip, 2);
-    if (total_bytes < header_bytes or total_bytes > ip.len) return false;
-    if ((readBe16(ip, 6) & 0x3fff) != 0) return false;
-
-    const l4_bytes = total_bytes - header_bytes;
-    return switch (ip[9]) {
-        17 => l4_bytes >= 8,
-        6 => l4_bytes >= 20 and (ip[header_bytes + 12] >> 4) >= 5 and
-            @as(usize, ip[header_bytes + 12] >> 4) * 4 <= l4_bytes,
-        else => false,
-    };
-}
-
-fn readBe16(bytes: []const u8, offset: usize) u16 {
-    return (@as(u16, bytes[offset]) << 8) | bytes[offset + 1];
-}
 
 test "negotiation admits only checksum and keeps BSP single-queue fallback" {
     const std = @import("std");
@@ -257,4 +209,16 @@ test "unknown and incapable RX metadata select byte-preserving software fallback
         &frame,
     ));
     try std.testing.expectEqualSlices(u8, &original, &frame);
+}
+
+comptime {
+    if (@sizeOf(Packet) != 64 or @alignOf(Packet) != 8 or @offsetOf(Packet, "version") != 0 or @offsetOf(Packet, "size") != 4 or @offsetOf(Packet, "flags") != 8 or @offsetOf(Packet, "fallback_addr") != 16 or @offsetOf(Packet, "segments_addr") != 24 or @offsetOf(Packet, "completion_handle") != 32 or @offsetOf(Packet, "fallback_bytes") != 40 or @offsetOf(Packet, "ownership") != 44 or @offsetOf(Packet, "queue_index") != 48 or @offsetOf(Packet, "segment_count") != 50 or @offsetOf(Packet, "checksum_start") != 52 or @offsetOf(Packet, "checksum_offset") != 54 or @offsetOf(Packet, "vlan_tag") != 56 or @offsetOf(Packet, "gso_size") != 58 or @offsetOf(Packet, "reserved") != 60) @compileError("Native network Packet layout");
+}
+
+comptime {
+    if (@sizeOf(Negotiation) != 56 or @alignOf(Negotiation) != 8 or @offsetOf(Negotiation, "version") != 0 or @offsetOf(Negotiation, "size") != 4 or @offsetOf(Negotiation, "offered") != 8 or @offsetOf(Negotiation, "accepted") != 16 or @offsetOf(Negotiation, "rejected") != 24 or @offsetOf(Negotiation, "rx_queue_count") != 32 or @offsetOf(Negotiation, "tx_queue_count") != 34 or @offsetOf(Negotiation, "max_rx_segments") != 36 or @offsetOf(Negotiation, "max_tx_segments") != 38 or @offsetOf(Negotiation, "rx_ownership") != 40 or @offsetOf(Negotiation, "tx_ownership") != 44 or @offsetOf(Negotiation, "interrupt_moderation_us") != 48 or @offsetOf(Negotiation, "reserved") != 52) @compileError("Native network Negotiation layout");
+}
+
+comptime {
+    if (@sizeOf(Offer) != 40 or @alignOf(Offer) != 8 or @offsetOf(Offer, "offered") != 0 or @offsetOf(Offer, "required") != 8 or @offsetOf(Offer, "rx_queue_count") != 16 or @offsetOf(Offer, "tx_queue_count") != 18 or @offsetOf(Offer, "max_rx_segments") != 20 or @offsetOf(Offer, "max_tx_segments") != 22 or @offsetOf(Offer, "rx_ownership") != 24 or @offsetOf(Offer, "tx_ownership") != 28 or @offsetOf(Offer, "interrupt_moderation_us") != 32) @compileError("Native network Offer layout");
 }
