@@ -1,127 +1,38 @@
-//! Resident opaque command metadata and canonical VA/BO execution ownership.
-//! GPU methods and placement remain with the registered userland driver.
-const std = @import("std");
+//! Opaque projection of the sole native resident command/VA job owner.
 const abi = @import("r4os_kernel_contract");
 const buffers = @import("../memory/gfx_buffers.zig");
 const lifetime = buffers.lifetime;
-const virtual = @import("../kernel/gfx_virtual.zig");
-const heap = @import("../memory/heap.zig");
-const queue_resources = @import("queue_resources.zig");
-pub const Error = queue_resources.Error || buffers.Error || virtual.Error;
-const Resource = struct {
-    input: abi.GfxNativeResource,
-    held: ?virtual.Execution = null,
-    object: lifetime.Handle = .{},
-    offset: u64 = 0,
-    bytes: u64 = 0,
-    write: bool = false,
-    leader: usize = 0,
-};
-pub const Job = struct {
-    allocation: []u8,
-    info: abi.GfxNativeJobInfo,
-    resources: []Resource,
-    uses: []?lifetime.Use,
-    order: []usize,
-    commands: []u8,
-
+const queue = @import("queue_state.zig");
+const resources = @import("queue_resources.zig");
+pub const Error = resources.Error || buffers.Error || @import("../kernel/gfx_virtual.zig").Error;
+const Projection = extern struct { info: abi.GfxNativeJobInfo, resource_count: usize, uses: [*]resources.UseSlot, commands: [*]u8, command_bytes: usize };
+const Acquire = extern struct { producer: lifetime.Owner, binding: lifetime.layout.Binding, queue: queue.NativeView, resources: resources.NativeView,
+    timeline: u64, dependencies: [*]const queue.Fence, dependencies_len: usize, seen: [*]bool, pending: [*]u16 };
+extern fn r4os_rust_display_queue_native(u32, ?*Job, ?*const anyopaque, ?*anyopaque, u32) i32;
+extern fn r4os_rust_display_queue_native_acquire(*Job, *const Acquire) i32;
+fn checked(code: i32) Error!void { return switch (code) {
+    0 => {}, 1 => error.Invalid, 2 => error.Overflow, 3 => error.Unsupported, 4 => error.Exhausted, 5 => error.Budget, 6 => error.Capacity,
+    7 => error.Stale, 8 => error.Busy, 9 => error.Closed, 10 => error.WrongOwner, 11 => error.OutOfMemory, 12 => error.Unavailable,
+    13 => error.WaitTimeout, 14 => error.WaitCancelled, 16 => error.AlreadyCompleted, else => unreachable,
+}; }
+pub const Job = opaque {
     pub fn create(input: abi.GfxNativeSubmission) buffers.Error!*Job {
-        if (input.version != 1 or input.size != @sizeOf(abi.GfxNativeSubmission) or input.reserved0 != 0 or
-            input.revision == 0 or (input.interface_id_lo == 0 and input.interface_id_hi == 0) or
-            (input.commands == 0) != (input.command_bytes == 0) or (input.resources == 0) != (input.resource_count == 0) or
-            input.resources % @alignOf(abi.GfxNativeResource) != 0 or
-            input.commands > std.math.maxInt(u64) - @as(u64, input.command_bytes) or
-            input.resources > std.math.maxInt(u64) - @as(u64, input.resource_count) * @sizeOf(abi.GfxNativeResource)) return error.Invalid;
-        const resource_offset = std.mem.alignForward(usize, @sizeOf(Job), @alignOf(Resource));
-        const use_offset = std.mem.alignForward(usize, resource_offset + @as(usize, input.resource_count) * @sizeOf(Resource), @alignOf(?lifetime.Use));
-        const order_offset = std.mem.alignForward(usize, use_offset + @as(usize, input.resource_count) * @sizeOf(?lifetime.Use), @alignOf(usize));
-        const command_offset = order_offset + @as(usize, input.resource_count) * @sizeOf(usize);
-        const allocation = heap.alloc(command_offset + input.command_bytes, @max(@alignOf(Job), @alignOf(Resource))) orelse return error.OutOfMemory;
-        const job: *Job = @ptrCast(@alignCast(allocation.ptr));
-        const items: [*]Resource = @ptrCast(@alignCast(allocation.ptr + resource_offset));
-        const uses: [*]?lifetime.Use = @ptrCast(@alignCast(allocation.ptr + use_offset));
-        const order: [*]usize = @ptrCast(@alignCast(allocation.ptr + order_offset));
-        job.* = .{ .allocation = allocation, .info = .{ .interface_id_lo = input.interface_id_lo,
-            .interface_id_hi = input.interface_id_hi, .revision = input.revision,
-            .command_bytes = input.command_bytes, .resource_count = input.resource_count },
-            .resources = items[0..input.resource_count], .uses = uses[0..input.resource_count],
-            .order = order[0..input.resource_count], .commands = allocation[command_offset..] };
-        @memset(job.uses, null);
-        if (input.resource_count != 0) {
-            const from: [*]const abi.GfxNativeResource = @ptrFromInt(input.resources);
-            for (job.resources, 0..) |*item, i| item.* = .{ .input = from[i] };
-        }
-        if (input.command_bytes != 0) {
-            const from: [*]const u8 = @ptrFromInt(input.commands);
-            @memcpy(job.commands, from[0..input.command_bytes]);
-        }
-        return job;
+        var out: *Job = undefined; const result = r4os_rust_display_queue_native(0, null, &input, @ptrCast(&out), 0);
+        switch (result) { 0 => return out, 1 => return error.Invalid, 11 => return error.OutOfMemory, else => unreachable }
     }
-    /// Caller holds the shared owner and prepared enough lease slots. No
-    /// callbacks, heap work, user pointers or hardware operations in this scope.
-    pub fn acquireLocked(self: *Job, producer: lifetime.Owner, binding: lifetime.layout.Binding,
-        state: anytype, resources: anytype, timeline: u64, dependencies: anytype) Error!void
-    {
-        for (self.resources, 0..) |*item, index| {
-            const held = try virtual.retainExecutionLocked(producer, item.input, binding);
-            item.held = held;
-            item.object = try buffers.store.bufferFor(held.reference, held.driver);
-            const desc = try buffers.store.describe(held.reference, held.driver);
-            if (!desc.binding.portable() and !std.meta.eql(desc.binding, binding)) return error.Stale;
-            item.offset = held.entry.request.byte_offset;
-            item.bytes = held.entry.request.byte_length;
-            if (!lifetime.layout.spanFits(desc.bytes, item.offset, item.bytes)) return error.Invalid;
-            item.write = item.input.access == 1;
-            item.leader = index;
-            self.order[index] = index;
-        }
-        // Sort a resident index, preserving the driver's original binding
-        // order. Large lists must not deduplicate through quadratic scans.
-        std.sort.heap(usize, self.order, self.resources, struct {
-            fn less(items: []Resource, left: usize, right: usize) bool {
-                const lhs = items[left].object; const rhs = items[right].object;
-                return if (lhs.id != rhs.id) lhs.id < rhs.id else lhs.generation < rhs.generation;
-            }
-        }.less);
-        for (self.order, 0..) |index, position| {
-            if (position == 0) continue;
-            const item = &self.resources[index];
-            const previous = &self.resources[self.order[position - 1]];
-            if (previous.object.eql(item.object)) {
-                item.leader = previous.leader;
-                const leader = &self.resources[item.leader];
-                const end = @max(leader.offset + leader.bytes, item.offset + item.bytes);
-                leader.offset = @min(leader.offset, item.offset);
-                leader.bytes = end - leader.offset;
-                leader.write = leader.write or item.write;
-            }
-        }
-        for (self.resources, 0..) |*item, index| {
-            if (item.leader != index) continue;
-            try resources.ordered(state, timeline, dependencies, item.object, item.write);
-            const held = item.held.?;
-            self.uses[index] = try buffers.store.reserveQueued(held.reference, held.driver, queue_resources.owner,
-                item.write, item.offset, item.bytes);
-        }
+    fn projection(self: *Job) Projection { var out: Projection = undefined; checked(r4os_rust_display_queue_native(4, self, null, &out, 0)) catch unreachable; return out; }
+    pub fn info(self: *Job) abi.GfxNativeJobInfo { return self.projection().info; }
+    pub fn resourceCount(self: *Job) usize { return self.projection().resource_count; }
+    pub fn useSlots(self: *Job) []resources.UseSlot { const value = self.projection(); return value.uses[0..value.resource_count]; }
+    pub fn commandData(self: *Job) []const u8 { const value = self.projection(); return value.commands[0..value.command_bytes]; }
+    pub fn binding(self: *Job, index: u32) Error!abi.GfxNativeBinding { var out: abi.GfxNativeBinding = undefined; try checked(r4os_rust_display_queue_native(5, self, null, &out, index)); return out; }
+    pub fn acquireLocked(self: *Job, producer: lifetime.Owner, binding_value: lifetime.layout.Binding, state: anytype, held_resources: anytype, timeline: u64, dependencies: []const queue.Fence) Error!void {
+        var seen: [state.jobs.len]bool = @splat(false); var pending: [state.jobs.len]u16 = undefined;
+        const args: Acquire = .{ .producer = producer, .binding = binding_value, .queue = state.nativeView(), .resources = held_resources.nativeView(),
+            .timeline = timeline, .dependencies = dependencies.ptr, .dependencies_len = dependencies.len, .seen = &seen, .pending = &pending };
+        try checked(r4os_rust_display_queue_native_acquire(self, &args));
     }
-    pub fn rollbackLocked(self: *Job) void {
-        for (self.uses) |*slot| if (slot.*) |use| {
-            buffers.store.endUse(use.lease, queue_resources.owner, true) catch unreachable;
-            slot.* = null;
-        };
-        self.releaseBindingsLocked();
-    }
-    pub fn releaseBindingsLocked(self: *Job) void {
-        for (self.uses) |use| std.debug.assert(use == null);
-        for (self.resources) |*item| if (item.held) |held| {
-            virtual.releaseExecutionLocked(held);
-            item.held = null;
-        };
-    }
-    pub fn destroy(self: *Job) void {
-        for (self.uses) |use| std.debug.assert(use == null);
-        for (self.resources) |item| std.debug.assert(item.held == null);
-        const allocation = self.allocation;
-        std.debug.assert(heap.free(allocation) == .ok);
-    }
+    pub fn rollbackLocked(self: *Job) void { checked(r4os_rust_display_queue_native(1, self, null, null, 0)) catch unreachable; }
+    pub fn releaseBindingsLocked(self: *Job) void { checked(r4os_rust_display_queue_native(2, self, null, null, 0)) catch unreachable; }
+    pub fn destroy(self: *Job) void { checked(r4os_rust_display_queue_native(3, self, null, null, 0)) catch unreachable; }
 };

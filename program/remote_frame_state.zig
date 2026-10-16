@@ -1,152 +1,51 @@
+//! Projection of the sole native bounded capture/dirty-history models.
 pub const history_capacity: usize = 64;
 pub const snapshot_capacity = 3;
 pub const consumer_capacity = 64;
 pub const leases_per_consumer = 8;
 pub const max_frame_bytes = 64 * 1024 * 1024;
-
-pub const Owner = struct {
+pub const Owner = extern struct {
     id: u32 = 0, generation: u64 = 0,
     pub fn same(self: Owner, other: Owner) bool { return self.id == other.id and self.generation == other.generation; }
-    fn valid(self: Owner) bool { return self.id != 0 and self.generation != 0; }
 };
-const Consumer = struct { owner: Owner = .{}, count: u32 = 0 };
-pub const Lease = struct { id: u64 = 0, owner: Owner = .{}, snapshot: usize = 0, epoch: u64 = 0, started_ns: u64 = 0 };
-pub const CaptureRegistry = struct {
-    consumers: [consumer_capacity]Consumer = @splat(.{}),
-    leases: [consumer_capacity]Lease = @splat(.{}),
-    references: [snapshot_capacity]u32 = @splat(0),
-    count: u32 = 0,
-    next_lease: u64 = 1,
-    acquired: u64 = 0,
-    max_reader_ns: u64 = 0,
+const Consumer = extern struct { owner: Owner = .{}, count: u32 = 0 };
+pub const Lease = extern struct { id: u64 = 0, owner: Owner = .{}, snapshot: usize = 0, epoch: u64 = 0, started_ns: u64 = 0 };
+const Args = extern struct { owner: Owner = .{}, snapshot: usize = 0, id: u64 = 0, epoch: u64 = 0, now: u64 = 0 };
+extern fn r4os_rust_remote_capture(u32, *CaptureRegistry, *const Args, ?*anyopaque) i32;
+pub const CaptureRegistry = extern struct {
+    consumers: [consumer_capacity]Consumer = @splat(.{}), leases: [consumer_capacity]Lease = @splat(.{}),
+    references: [snapshot_capacity]u32 = @splat(0), count: u32 = 0, next_lease: u64 = 1, acquired: u64 = 0, max_reader_ns: u64 = 0,
     pub const Error = error{ Invalid, Capacity, Stale, Busy };
-    pub fn acquire(self: *CaptureRegistry, owner: Owner) Error!u32 {
-        if (!owner.valid()) return error.Invalid;
-        if (self.count == 0x7fffffff) return error.Capacity;
-        const entry = for (&self.consumers) |*value| { if (value.count != 0 and value.owner.same(owner)) break value; }
-            else for (&self.consumers) |*value| { if (value.count == 0) break value; } else return error.Capacity;
-        entry.owner = owner; entry.count += 1; self.count += 1;
-        return self.count;
+    fn checked(code: i32) Error!void { return switch (code) { 0 => {}, 1 => error.Invalid, 6 => error.Capacity, 7 => error.Stale, 8 => error.Busy, else => unreachable }; }
+    fn call(self: *CaptureRegistry, op: u32, args: Args) Error!void { try checked(r4os_rust_remote_capture(op, self, &args, null)); }
+    fn result(self: *CaptureRegistry, comptime T: type, op: u32, args: Args) Error!T {
+        var out: T = undefined; try checked(r4os_rust_remote_capture(op, self, &args, &out)); return out;
     }
-    pub fn release(self: *CaptureRegistry, owner: Owner) Error!u32 {
-        const entry = for (&self.consumers) |*value| { if (value.count != 0 and value.owner.same(owner)) break value; } else return error.Stale;
-        entry.count -= 1; self.count -= 1;
-        if (entry.count == 0) entry.* = .{};
-        return self.count;
-    }
-    pub fn hasConsumer(self: *const CaptureRegistry, owner: Owner) bool {
-        for (&self.consumers) |*value| if (value.count != 0 and value.owner.same(owner)) return true;
-        return false;
-    }
-    pub fn beginLease(self: *CaptureRegistry, owner: Owner, snapshot: usize, epoch: u64, now: u64) Error!Lease {
-        if (!self.hasConsumer(owner) or snapshot >= snapshot_capacity or epoch == 0) return error.Invalid;
-        var held: usize = 0;
-        for (&self.leases) |*value| if (value.id != 0 and value.owner.same(owner)) { held += 1; };
-        if (held >= leases_per_consumer) return error.Busy;
-        if (self.next_lease == 0) return error.Capacity;
-        const entry = for (&self.leases) |*value| { if (value.id == 0) break value; } else return error.Capacity;
-        entry.* = .{ .id = self.next_lease, .owner = owner, .snapshot = snapshot, .epoch = epoch, .started_ns = now };
-        self.next_lease +%= 1; self.references[snapshot] += 1; self.acquired +|= 1;
-        return entry.*;
-    }
-    pub fn endLease(self: *CaptureRegistry, owner: Owner, id: u64, epoch: u64, now: u64) Error!void {
-        const entry = for (&self.leases) |*value| {
-            if (value.id != 0 and value.id == id and value.epoch == epoch and value.owner.same(owner)) break value;
-        } else return error.Stale;
-        self.references[entry.snapshot] -= 1;
-        self.max_reader_ns = @max(self.max_reader_ns, now -| entry.started_ns);
-        entry.* = .{};
-    }
-    pub fn stopped(self: *CaptureRegistry, owner: Owner, now: u64) void {
-        for (&self.consumers) |*entry| if (entry.count != 0 and entry.owner.same(owner)) {
-            self.count -= entry.count; entry.* = .{};
-        };
-        for (&self.leases) |*entry| if (entry.id != 0 and entry.owner.same(owner)) {
-            self.endLease(owner, entry.id, entry.epoch, now) catch unreachable;
-        };
-    }
+    pub fn acquire(self: *CaptureRegistry, owner: Owner) Error!u32 { return self.result(u32, 0, .{ .owner = owner }); }
+    pub fn release(self: *CaptureRegistry, owner: Owner) Error!u32 { return self.result(u32, 1, .{ .owner = owner }); }
+    pub fn hasConsumer(self: *const CaptureRegistry, owner: Owner) bool { return @constCast(self).result(bool, 2, .{ .owner = owner }) catch unreachable; }
+    pub fn beginLease(self: *CaptureRegistry, owner: Owner, snapshot: usize, epoch: u64, now: u64) Error!Lease { return self.result(Lease, 3, .{ .owner = owner, .snapshot = snapshot, .epoch = epoch, .now = now }); }
+    pub fn endLease(self: *CaptureRegistry, owner: Owner, id: u64, epoch: u64, now: u64) Error!void { try self.call(4, .{ .owner = owner, .id = id, .epoch = epoch, .now = now }); }
+    pub fn stopped(self: *CaptureRegistry, owner: Owner, now: u64) void { self.call(5, .{ .owner = owner, .now = now }) catch unreachable; }
 };
-
-pub const Rect = struct {
-    x: u32 = 0,
-    y: u32 = 0,
-    w: u32 = 0,
-    h: u32 = 0,
-
-    pub fn empty(self: Rect) bool {
-        return self.w == 0 or self.h == 0;
-    }
+pub const Rect = extern struct { x: u32 = 0, y: u32 = 0, w: u32 = 0, h: u32 = 0,
+    pub fn empty(self: Rect) bool { return self.w == 0 or self.h == 0; }
 };
-
-const Change = struct {
-    revision: u32 = 0,
-    rect: Rect = .{},
-};
-
-pub const History = struct {
-    changes: [history_capacity]Change = .{Change{}} ** history_capacity,
-    count: usize = 0,
-
-    pub fn reset(self: *History) void {
-        self.* = .{};
-    }
-
-    pub fn record(self: *History, revision: u32, rect: Rect) void {
-        if (revision == 0) return;
-        self.changes[indexFor(revision)] = .{ .revision = revision, .rect = rect };
-        if (self.count < history_capacity) self.count += 1;
-    }
-
+const Change = extern struct { revision: u32 = 0, rect: Rect = .{} };
+const HistoryArgs = extern struct { revision: u32 = 0, current: u32 = 0, rect: Rect = .{}, other: Rect = .{}, width: u32 = 0, height: u32 = 0 };
+extern fn r4os_rust_remote_history(u32, ?*History, *const HistoryArgs, ?*Rect) void;
+pub const History = extern struct {
+    changes: [history_capacity]Change = @splat(.{}), count: usize = 0,
+    pub fn reset(self: *History) void { r4os_rust_remote_history(0, self, &.{}, null); }
+    pub fn record(self: *History, revision: u32, rect: Rect) void { r4os_rust_remote_history(1, self, &.{ .revision = revision, .rect = rect }, null); }
     pub fn unionSince(self: *const History, last_revision: u32, current_revision: u32, width: u32, height: u32) Rect {
-        const full = Rect{ .w = width, .h = height };
-        if (width == 0 or height == 0 or current_revision == 0) return .{};
-        if (last_revision == current_revision) return .{};
-        if (last_revision == 0) return full;
-
-        const distance = revisionDistance(last_revision, current_revision);
-        if (distance == 0 or distance > history_capacity or distance > self.count) return full;
-
-        var revision = last_revision;
-        var merged = Rect{};
-        var remaining = distance;
-        while (remaining > 0) : (remaining -= 1) {
-            revision = nextRevision(revision);
-            const change = self.changes[indexFor(revision)];
-            if (change.revision != revision or change.rect.empty()) return full;
-            merged = if (merged.empty()) change.rect else merge(merged, change.rect, width, height);
-        }
-        return if (merged.empty()) full else merged;
+        var out: Rect = undefined; r4os_rust_remote_history(2, @constCast(self), &.{ .revision = last_revision, .current = current_revision, .width = width, .height = height }, &out); return out;
     }
 };
-
 pub fn merge(a: Rect, b: Rect, width: u32, height: u32) Rect {
-    if (a.empty()) return b;
-    if (b.empty()) return a;
-    const x0 = @min(a.x, b.x);
-    const y0 = @min(a.y, b.y);
-    const x1 = @min(@max(@as(u64, a.x) + a.w, @as(u64, b.x) + b.w), @as(u64, width));
-    const y1 = @min(@max(@as(u64, a.y) + a.h, @as(u64, b.y) + b.h), @as(u64, height));
-    return .{
-        .x = x0,
-        .y = y0,
-        .w = @intCast(x1 - x0),
-        .h = @intCast(y1 - y0),
-    };
+    var out: Rect = undefined; r4os_rust_remote_history(3, null, &.{ .rect = a, .other = b, .width = width, .height = height }, &out); return out;
 }
-
-fn indexFor(revision: u32) usize {
-    return @intCast(revision % history_capacity);
-}
-
-fn nextRevision(revision: u32) u32 {
-    return if (revision == 0xffff_ffff) 1 else revision + 1;
-}
-
-fn revisionDistance(older: u32, newer: u32) usize {
-    if (older == 0 or newer == 0 or older == newer) return 0;
-    if (newer > older) return @intCast(newer - older);
-    return @intCast((0xffff_ffff - older) + newer);
-}
+comptime { if (@sizeOf(Owner) != 16 or @sizeOf(Lease) != 48 or @sizeOf(CaptureRegistry) != 4648 or @sizeOf(History) != 1288) @compileError("Native capture/history C layout"); }
 
 test "dirty history merges disjoint publications after a consumer revision" {
     try checkCaptureOwnership();

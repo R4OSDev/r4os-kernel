@@ -1,82 +1,41 @@
-// Per-fence IRQ mailbox, serialized solely by the existing IRQ/runtime owner.
-// No task mutex, allocation, callback, dependency walk or BO access is allowed.
+//! Fixed native IRQ mailbox/coalesced wake projection under the runtime owner.
+comptime { if (@import("builtin").is_test) _ = @import("rust_owner_test"); }
 const std = @import("std");
 const queue = @import("queue_state.zig");
-pub const Ack = struct { fence: queue.Fence, result: queue.Result, instant: u64 };
-// One coalesced notification per registered backend, including idle display
-// changes. Runtime ownership protects this mailbox independently of BO locks.
+pub const Ack = extern struct { fence: queue.Fence, result: queue.Result, instant: u64 };
+pub const WakeEntry = extern struct { owner: u32 = 0, binding: queue.Binding = .{}, pending: bool = false };
+pub const Entry = extern struct { fence: queue.Fence = .{}, owner: u32 = 0, active: bool = false, pending: bool = false, result: queue.Result = .pending, instant: u64 = 0 };
+const Args = extern struct { owner: u32 = 0, binding: queue.Binding = .{}, fence: queue.Fence = .{}, result: u32 = 0, quiesced: bool = false, instant: u64 = 0 };
+const OptionalAck = extern struct { has: bool, value: Ack };
+extern fn r4os_rust_display_queue_ingress(u32, *anyopaque, usize, usize, *const Args, ?*anyopaque) i32;
+fn status(code: i32) queue.Error!void { return switch (code) { 0 => {}, 1 => error.Invalid, 7 => error.Stale, 8 => error.Busy, 10 => error.WrongOwner, 16 => error.AlreadyCompleted, else => unreachable }; }
 pub fn Wakeups(comptime capacity: usize) type {
     return struct {
-        const Self = @This();
-        const Entry = struct { owner: u32 = 0, binding: queue.Binding = .{}, pending: bool = false };
-        entries: [capacity]Entry = .{Entry{}} ** capacity,
-        pub fn bind(self: *Self, slot: usize, owner: u32, binding: queue.Binding) void {
-            self.entries[slot] = .{ .owner = owner, .binding = binding };
-        }
-        pub fn close(self: *Self, slot: usize) void { self.entries[slot] = .{}; }
-        pub fn request(self: *Self, owner: u32, binding: queue.Binding) queue.Error!void {
-            if (owner == 0 or binding.adapter == 0) return error.Invalid;
-            for (&self.entries) |*entry| {
-                if (entry.owner == 0 or entry.binding.adapter != binding.adapter) continue;
-                if (entry.owner != owner) return error.WrongOwner;
-                if (!std.meta.eql(entry.binding, binding)) return error.Stale;
-                entry.pending = true;
-                return;
-            }
-            return error.Stale;
-        }
-        pub fn take(self: *Self, slot: usize) bool {
-            const pending = self.entries[slot].pending;
-            self.entries[slot].pending = false;
-            return pending;
-        }
+        const Self = @This(); entries: [capacity]WakeEntry = @splat(.{}),
+        pub fn bind(self: *Self, slot: usize, owner: u32, binding: queue.Binding) void { status(r4os_rust_display_queue_ingress(0, &self.entries, capacity, slot, &.{ .owner = owner, .binding = binding }, null)) catch unreachable; }
+        pub fn close(self: *Self, slot: usize) void { status(r4os_rust_display_queue_ingress(1, &self.entries, capacity, slot, &.{}, null)) catch unreachable; }
+        pub fn request(self: *Self, owner: u32, binding: queue.Binding) queue.Error!void { try status(r4os_rust_display_queue_ingress(2, &self.entries, capacity, 0, &.{ .owner = owner, .binding = binding }, null)); }
+        pub fn take(self: *Self, slot: usize) bool { var value: bool = undefined; status(r4os_rust_display_queue_ingress(3, &self.entries, capacity, slot, &.{}, &value)) catch unreachable; return value; }
     };
 }
 pub fn Ingress(comptime capacity: usize) type {
     return struct {
-        const Self = @This();
-        const Entry = struct {
-            fence: queue.Fence = .{},
-            owner: u32 = 0,
-            active: bool = false,
-            pending: bool = false,
-            result: queue.Result = .pending,
-            instant: u64 = 0,
-        };
-        entries: [capacity]Entry = .{Entry{}} ** capacity,
-        pub fn arm(self: *Self, owner: u32, fence: queue.Fence) queue.Error!void {
-            if (owner == 0 or fence.slot == 0 or fence.slot > capacity or fence.binding.adapter == 0) return error.Invalid;
-            const entry = &self.entries[fence.slot - 1];
-            if (entry.active or entry.pending) return error.Busy;
-            entry.* = .{ .fence = fence, .owner = owner, .active = true };
-        }
+        const Self = @This(); entries: [capacity]Entry = @splat(.{}),
+        pub fn arm(self: *Self, owner: u32, fence: queue.Fence) queue.Error!void { try status(r4os_rust_display_queue_ingress(4, &self.entries, capacity, 0, &.{ .owner = owner, .fence = fence }, null)); }
         pub fn acknowledge(self: *Self, owner: u32, fence: queue.Fence, result: queue.Result, quiesced: bool, instant: u64) queue.Error!void {
-            if (fence.slot == 0 or fence.slot > capacity or (result != .complete and result != .failed and result != .cancelled)) return error.Invalid;
-            const entry = &self.entries[fence.slot - 1];
-            if (!std.meta.eql(entry.fence, fence)) return error.Stale;
-            if (owner == 0 or entry.owner != owner) return error.WrongOwner;
-            if (!entry.active) return error.AlreadyCompleted;
-            if (!quiesced) return error.Busy;
-            entry.active = false;
-            entry.pending = true;
-            entry.result = result;
-            entry.instant = instant;
+            try status(r4os_rust_display_queue_ingress(5, &self.entries, capacity, 0, &.{ .owner = owner, .fence = fence, .result = @intFromEnum(result), .quiesced = quiesced, .instant = instant }, null));
         }
         pub fn take(self: *Self, slot: usize) ?Ack {
-            const entry = &self.entries[slot];
-            if (!entry.pending) return null;
-            entry.pending = false;
-            return .{ .fence = entry.fence, .result = entry.result, .instant = entry.instant };
+            var value: OptionalAck = undefined; status(r4os_rust_display_queue_ingress(6, &self.entries, capacity, slot, &.{}, &value)) catch unreachable; return if (value.has) value.value else null;
         }
-        pub fn quiesce(self: *Self, fence: queue.Fence) void {
-            const entry = &self.entries[fence.slot - 1];
-            if (std.meta.eql(entry.fence, fence)) {
-                entry.active = false;
-                entry.pending = false;
-            }
-        }
+        pub fn quiesce(self: *Self, fence: queue.Fence) void { status(r4os_rust_display_queue_ingress(7, &self.entries, capacity, 0, &.{ .fence = fence }, null)) catch unreachable; }
     };
 }
+comptime {
+    if (@sizeOf(Ack) != 64 or @sizeOf(WakeEntry) != 40 or @sizeOf(Entry) != 72 or @alignOf(Entry) != 8 or @offsetOf(WakeEntry, "binding") != 8 or @offsetOf(WakeEntry, "pending") != 32 or @offsetOf(Entry, "result") != 56 or @offsetOf(Entry, "instant") != 64) @compileError("Native IRQ mailbox C layout");
+    if (@sizeOf(Args) != 96 or @offsetOf(Args, "binding") != 8 or @offsetOf(Args, "fence") != 32 or @offsetOf(Args, "instant") != 88 or @sizeOf(OptionalAck) != 72) @compileError("Native IRQ mailbox call C layout");
+}
+
 test "IRQ mailbox rejects wrong owners and stale resets and retains a single exact acknowledgement" {
     const t = std.testing;
     var ingress = Ingress(2){};

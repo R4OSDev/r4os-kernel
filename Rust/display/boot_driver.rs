@@ -6,10 +6,7 @@ use crate::{
     contract as a,
     driver::{api_admission, irq_router},
     platform::timer,
-    sched::{
-        sync_locks,
-        sync_types::{Text, UnwindGuard, WaitQueue},
-    },
+    sched::sync_types::{Text, UnwindGuard, WaitQueue},
 };
 use core::{cell::UnsafeCell, ffi::c_void, mem::MaybeUninit, ptr};
 #[repr(C)]
@@ -105,11 +102,11 @@ struct Execution;
 impl Execution {
     fn enter() -> Option<Self> {
         unsafe {
-            if !sync_locks::r4os_rust_sync_guard(EXECUTION.0.get(), 2, 0) {
+            if !super::ownership::raw_guard(EXECUTION.0.get(), 2, 0) {
                 return None;
             }
             if ptr::addr_of!((*EXECUTION.0.get()).depth).read() != 1 {
-                let _ = sync_locks::r4os_rust_sync_guard(EXECUTION.0.get(), 3, 0);
+                let _ = super::ownership::raw_guard(EXECUTION.0.get(), 3, 0);
                 return None;
             }
             Some(Self)
@@ -120,35 +117,11 @@ impl Drop for Execution {
     fn drop(&mut self) {
         unsafe {
             core::arch::asm!("sfence", options(nostack, preserves_flags));
-            let _ = sync_locks::r4os_rust_sync_guard(EXECUTION.0.get(), 3, 0);
+            let _ = super::ownership::raw_guard(EXECUTION.0.get(), 3, 0);
         }
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_boot_driver_adapter(id: u32) -> bool;
-    fn r4os_zig_boot_driver_state() -> u32;
-    fn r4os_zig_boot_driver_hold(
-        identity: *const Owner,
-        request: *const a::GfxBootHoldRequest,
-        out: *mut HoldResult,
-    ) -> i32;
-    fn r4os_zig_boot_driver_finish(id: u64, generation: u64, operation: u32, out: *mut u8) -> i32;
-    fn r4os_zig_boot_driver_prepare(
-        identity: *const Owner,
-        input: *const a::GfxNativeRegistration,
-        generation: u64,
-        reset: u64,
-        is_reset: bool,
-        out: *mut a::GfxNativeState,
-    ) -> i32;
-    fn r4os_zig_boot_driver_snapshot(saved: *const c_void, out: *mut Snapshot);
-    fn r4os_zig_boot_driver_description(
-        saved: *const c_void,
-        generation: u64,
-        out: *mut a::GfxNativeBootInfo,
-    );
 
-}
 struct BufferLock;
 impl BufferLock {
     fn acquire(prepared: bool) -> Option<Self> {
@@ -188,7 +161,7 @@ unsafe fn output(out: *mut a::GfxNativeState, generation: u64, outcome: u32, ret
             version: 1,
             size: core::mem::size_of::<a::GfxNativeState>() as u32,
             generation,
-            state: r4os_zig_boot_driver_state(),
+            state: native_state(),
             outcome,
             retained: u32::from(retained),
             reserved0: 0,
@@ -198,7 +171,7 @@ unsafe fn output(out: *mut a::GfxNativeState, generation: u64, outcome: u32, ret
 unsafe fn snapshot(saved: *const c_void) -> Snapshot {
     let mut out = MaybeUninit::uninit();
     unsafe {
-        r4os_zig_boot_driver_snapshot(saved, out.as_mut_ptr());
+        native_snapshot(saved, out.as_mut_ptr());
         out.assume_init()
     }
 }
@@ -235,14 +208,14 @@ pub unsafe extern "C" fn r4os_rust_boot_driver_hold(
         || request.reserved0 != 0
         || request.reference.reserved0 != 0
         || request.generation == 0
-        || !unsafe { r4os_zig_boot_driver_adapter(request.adapter_id) }
+        || !unsafe { native_adapter(request.adapter_id) }
         || request.restore_callback < 0xffff800000000000
     {
         return a::gfx_output_error_invalid;
     }
     publish(Some(Bridge::new(identity, request)));
     let mut result = HoldResult::default();
-    let code = unsafe { r4os_zig_boot_driver_hold(&identity, &request, &mut result) };
+    let code = unsafe { native_hold(&identity, &request, &mut result) };
     if code != 0 {
         publish(None);
         return code;
@@ -296,8 +269,7 @@ pub unsafe extern "C" fn r4os_rust_boot_driver_finish(
         return a::gfx_output_error_invalid;
     }
     let mut result = 0u8;
-    let code =
-        unsafe { r4os_zig_boot_driver_finish(identity.id, generation, operation, &mut result) };
+    let code = unsafe { native_finish(identity.id, generation, operation, &mut result) };
     if code != 0 {
         return code;
     }
@@ -367,7 +339,7 @@ pub unsafe extern "C" fn r4os_rust_boot_driver_prepare(
     } else if current().is_some() {
         return a::gfx_output_error_stale;
     }
-    unsafe { r4os_zig_boot_driver_prepare(&identity, input, generation, reset, is_reset, out) }
+    unsafe { native_prepare(&identity, input, generation, reset, is_reset, out) }
 }
 /// # Safety
 /// Display callback holds the saved boot snapshot; caller owns the exact CPU
@@ -544,7 +516,7 @@ pub unsafe extern "C" fn r4os_rust_boot_driver_restore(
         return false;
     }
     let mut boot = MaybeUninit::uninit();
-    unsafe { r4os_zig_boot_driver_description(saved, generation, boot.as_mut_ptr()) }
+    unsafe { native_description(saved, generation, boot.as_mut_ptr()) }
     let callback: unsafe extern "C" fn(u64, u64, *const a::GfxNativeBootInfo) -> i32 =
         unsafe { core::mem::transmute(current.request.restore_callback as usize) };
     let restored = unsafe { callback(current.request.context, generation, boot.as_ptr()) } == 1;
@@ -724,4 +696,130 @@ unsafe fn buffer_drop(value: *const Handle) -> bool {
         DISPLAY_BUFFER_OWNER,
     )
     .is_ok()
+}
+
+unsafe fn native_adapter(id: u32) -> bool {
+    super::native_driver::valid_adapter(id)
+}
+unsafe fn native_state() -> u32 {
+    super::manager::backend_state().state
+}
+unsafe extern "C" fn capture_holder(
+    _: usize,
+    saved: *const super::core_types::BootSnapshot,
+) -> bool {
+    unsafe { r4os_rust_boot_driver_capture(saved.cast()) }
+}
+unsafe extern "C" fn restore_holder(
+    _: usize,
+    generation: u64,
+    saved: *const super::core_types::BootSnapshot,
+) -> bool {
+    unsafe { r4os_rust_boot_driver_restore(generation, saved.cast(), false) }
+}
+unsafe extern "C" fn restore_adopted(
+    _: usize,
+    generation: u64,
+    saved: *const super::core_types::BootSnapshot,
+) -> bool {
+    unsafe { r4os_rust_boot_driver_restore(generation, saved.cast(), true) }
+}
+unsafe extern "C" fn release_holder(_: usize) -> bool {
+    unsafe { r4os_rust_boot_driver_release(false) }
+}
+unsafe extern "C" fn release_adopted(_: usize) -> bool {
+    unsafe { r4os_rust_boot_driver_release(true) }
+}
+unsafe fn native_hold(
+    identity: *const Owner,
+    request: *const a::GfxBootHoldRequest,
+    out: *mut HoldResult,
+) -> i32 {
+    use super::core_types as c;
+    let identity = unsafe { identity.read() };
+    let request = unsafe { request.read() };
+    let holder = c::Holder {
+        owner: identity.id as usize,
+        adapter_id: request.adapter_id,
+        expected_generation: request.generation,
+        context: 0,
+        capture: c::Capture::Native(capture_holder),
+        restore: c::Restore::Native(restore_holder),
+        restore_adopted: Some(c::Restore::Native(restore_adopted)),
+        release: c::Release::Native(release_holder),
+        release_adopted: Some(c::Release::Native(release_adopted)),
+    };
+    match super::manager::hold_boot(holder) {
+        Ok(result) => {
+            unsafe {
+                out.write(HoldResult {
+                    generation: result.generation,
+                    captured: result.captured,
+                    retained: result.retained,
+                })
+            };
+            0
+        }
+        Err(e) => super::native_driver::code(e),
+    }
+}
+unsafe fn native_finish(id: u64, generation: u64, operation: u32, out: *mut u8) -> i32 {
+    match super::manager::finish_boot(id as usize, generation, operation) {
+        Ok(released) => {
+            unsafe { out.write(u8::from(released)) };
+            0
+        }
+        Err(super::error::Error::RestoreFailed) => {
+            unsafe { out.write(2) };
+            0
+        }
+        Err(e) => super::native_driver::code(e),
+    }
+}
+unsafe fn native_prepare(
+    identity: *const Owner,
+    input: *const a::GfxNativeRegistration,
+    generation: u64,
+    reset: u64,
+    is_reset: bool,
+    out: *mut a::GfxNativeState,
+) -> i32 {
+    let id = unsafe { identity.read() };
+    let identity = crate::gfx::types::Owner {
+        kind: id.kind,
+        id: id.id,
+        generation: id.generation,
+    };
+    if is_reset && reset == 0 || !is_reset && generation == 0 {
+        return a::gfx_output_error_stale;
+    }
+    unsafe {
+        super::native_driver::prepare_request(
+            identity,
+            input,
+            generation,
+            if is_reset { reset } else { 0 },
+            out,
+        )
+    }
+}
+unsafe fn native_snapshot(saved: *const c_void, out: *mut Snapshot) {
+    let saved = unsafe { saved.cast::<super::core_types::BootSnapshot>().read() };
+    unsafe {
+        out.write(Snapshot {
+            frame: saved.framebuffer,
+            mapping_bytes: saved.mapping.byte_len,
+            width: saved.mode.width,
+            height: saved.mode.height,
+            pitch: saved.mode.pitch,
+        })
+    }
+}
+unsafe fn native_description(
+    saved: *const c_void,
+    generation: u64,
+    out: *mut a::GfxNativeBootInfo,
+) {
+    let saved = unsafe { saved.cast::<super::core_types::BootSnapshot>().read() };
+    unsafe { out.write(super::native_driver::boot_description(generation, &saved)) }
 }

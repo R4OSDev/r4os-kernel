@@ -39,57 +39,6 @@ pub fn invalidateConsoleBackingForExternalDisplay() void {
     r4os_rust_boot_display_invalidate();
 }
 
-fn displayTargetFromBootFramebuffer(framebuf: *fb.Framebuffer) display.DisplayTarget {
-    return .{
-        .name = "bootfb",
-        .kind = .bootfb,
-        .flags = displayFlagsFromFramebuffer(framebuf),
-        .mode = displayModeFromFramebuffer(framebuf),
-        .mapping = displayMappingFromFramebuffer(framebuf),
-        .framebuffer = framebuf,
-    };
-}
-
-fn displayFlagsFromFramebuffer(framebuf: *const fb.Framebuffer) u32 {
-    var flags: u32 = display.DeviceFlags.visible |
-        display.DeviceFlags.fixed_mode |
-        display.DeviceFlags.cpu_present |
-        display.DeviceFlags.fill |
-        display.DeviceFlags.rect;
-    if (fb.supportsRgb32(framebuf)) {
-        flags |= display.DeviceFlags.rgb32 |
-            display.DeviceFlags.packed32 |
-            display.DeviceFlags.xrgb32;
-    }
-    return flags;
-}
-
-fn displayModeFromFramebuffer(framebuf: *const fb.Framebuffer) display.Mode {
-    return .{
-        .width = @intCast(framebuf.width),
-        .height = @intCast(framebuf.height),
-        .pitch = @intCast(framebuf.pitch),
-        .bpp = framebuf.bpp,
-        .memory_model = framebuf.memory_model,
-        .red_mask_size = framebuf.red_mask_size,
-        .red_mask_shift = framebuf.red_mask_shift,
-        .green_mask_size = framebuf.green_mask_size,
-        .green_mask_shift = framebuf.green_mask_shift,
-        .blue_mask_size = framebuf.blue_mask_size,
-        .blue_mask_shift = framebuf.blue_mask_shift,
-    };
-}
-
-fn displayMappingFromFramebuffer(framebuf: *const fb.Framebuffer) display.Mapping {
-    return .{
-        .kind = .bootloader_framebuffer,
-        .cache_policy = .bootloader_default,
-        .virt_base = @intFromPtr(framebuf.address),
-        .byte_len = framebuf.pitch * framebuf.height,
-        .volatile_cpu_writes = true,
-    };
-}
-
 fn consoleSink(console: *Console) log.ConsoleSink {
     return .{
         .context = console,
@@ -170,15 +119,6 @@ extern fn r4os_rust_boot_display_init(*State) bool;
 extern fn r4os_rust_boot_display_get(*State) bool;
 extern fn r4os_rust_boot_display_prepare(u64) bool;
 extern fn r4os_rust_boot_display_invalidate() void;
-export fn r4os_zig_boot_display_register(frame: *fb.Framebuffer) callconv(.c) void {
-    display.registerBootBackend(displayTargetFromBootFramebuffer(frame));
-}
-export fn r4os_zig_boot_display_outputs(frame: *fb.Framebuffer) callconv(.c) void {
-    @import("outputs.zig").initBoot(frame);
-}
-export fn r4os_zig_boot_display_surface() callconv(.c) void {
-    surface_pipeline.initFromDisplayManager();
-}
 
 export fn r4os_zig_boot_display_sink(console: *Console) callconv(.c) void {
     log.setConsoleSink(consoleSink(console));

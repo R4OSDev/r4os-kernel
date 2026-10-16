@@ -1,86 +1,44 @@
-//! Copied screen power receipts and a bounded program intent lease. This
-//! owner never touches hardware, suspends a task, calls a driver or frees BOs.
+//! Fixed private C state; one native receipt/intent owner, no Zig optional layout.
 const std = @import("std");
 pub const a = @import("r4os_kernel_contract");
 pub const Actor = @import("../memory/gfx_buffer_owner.zig").Owner;
 pub const Error = error{ Invalid, Stale, Busy, Unsupported, Exhausted };
-pub const lease_ns = 30 * std.time.ns_per_s;
-pub const State = struct {
-    value: ?a.GfxOutputPower = null,
-    actor: ?Actor = null,
-    intent: a.GfxPowerRequest = .{},
-    serial: u64 = 0,
-
-    pub fn sleeping(self: *const State) bool {
-        return if (self.value) |value| sleepingPhase(value.phase) else false;
-    }
+pub const lease_ns: u64 = 30 * std.time.ns_per_s;
+extern fn r4os_rust_display_power_publish(*State, *const a.GfxOutputPower, *bool) i32;
+extern fn r4os_rust_display_power_get(*const State, *const a.GfxOutputId, *a.GfxOutputPower) i32;
+extern fn r4os_rust_display_power_read(*State, *const a.GfxOutputId, u64, *a.GfxPowerRequest) i32;
+extern fn r4os_rust_display_power_request(*State, *const Actor, *const a.GfxPowerRequest, u64, *a.GfxPowerRequest) i32;
+extern fn r4os_rust_display_power_stopped(*State, *const Actor) bool;
+extern fn r4os_rust_display_power_sleeping(*const State) bool;
+extern fn r4os_rust_display_power_phase(u32) bool;
+extern fn r4os_rust_display_power_id_valid(*const a.GfxOutputId) bool;
+pub fn sleepingPhase(phase: u32) bool { return r4os_rust_display_power_phase(phase); }
+pub fn validId(identity: a.GfxOutputId) bool { return r4os_rust_display_power_id_valid(&identity); }
+fn status(code: i32) Error!void { return switch (code) {
+    0 => {}, 1 => error.Invalid, 3 => error.Unsupported, 4 => error.Exhausted,
+    7 => error.Stale, 8 => error.Busy, else => unreachable,
+}; }
+pub const State = extern struct {
+    has_value: bool = false, value_data: a.GfxOutputPower = .{},
+    has_actor: bool = false, actor_data: Actor = .{ .kind = .kernel, .id = 0, .generation = 0 },
+    intent: a.GfxPowerRequest = .{}, serial: u64 = 0,
+    pub fn currentValue(self: *const State) ?a.GfxOutputPower { return if (self.has_value) self.value_data else null; }
+    pub fn actorValue(self: *const State) ?Actor { return if (self.has_actor) self.actor_data else null; }
     pub fn publish(self: *State, input: a.GfxOutputPower) Error!bool {
-        if (!header(input) or !validId(input.identity) or input.capabilities & ~@as(u32, 3) != 0 or
-            input.phase > a.gfx_power_phase_unavailable or input.sequence == 0 or input.since_ns == 0 or
-            input.reason > a.gfx_power_reason_unsupported or input.reserved0 != 0) return error.Invalid;
-        if (input.request_sequence > self.serial) return error.Stale;
-        if (input.capabilities & a.gfx_power_cap_signal == 0) {
-            if (input.capabilities != 0 or input.phase != a.gfx_power_phase_unavailable or
-                input.reason != a.gfx_power_reason_unsupported) return error.Invalid;
-        }
-        if ((input.phase == a.gfx_power_phase_on or input.phase == a.gfx_power_phase_off) and
-            (input.core_point == 0 or input.window_point == 0 or input.reason != 0)) return error.Invalid;
-        if (input.phase == a.gfx_power_phase_off and input.capabilities & a.gfx_power_cap_sink != 0 and
-            input.control_receipt == 0) return error.Invalid;
-        if (self.value) |old| {
-            if (!std.meta.eql(old.identity, input.identity) or input.sequence < old.sequence or
-                input.since_ns < old.since_ns or (input.sequence == old.sequence and !std.meta.eql(old, input))) return error.Stale;
-            if (std.meta.eql(old, input)) return false;
-        }
-        self.value = input;
-        return true;
+        var out: bool = undefined; try status(r4os_rust_display_power_publish(self, &input, &out)); return out;
     }
     pub fn get(self: *const State, identity: a.GfxOutputId) Error!a.GfxOutputPower {
-        const value = self.value orelse return error.Unsupported;
-        if (!std.meta.eql(value.identity, identity)) return error.Stale;
-        return value;
-    }
-    fn wake(self: *State) void {
-        if (self.intent.off != 0) {
-            self.serial +|= 1;
-            self.intent = .{ .identity = self.intent.identity, .sequence = self.serial };
-        }
-        self.actor = null;
-    }
-    pub fn stopped(self: *State, actor: Actor) bool {
-        if (self.actor == null or !self.actor.?.eql(actor)) return false;
-        self.wake();
-        return true;
+        var out: a.GfxOutputPower = undefined; try status(r4os_rust_display_power_get(self, &identity, &out)); return out;
     }
     pub fn read(self: *State, identity: a.GfxOutputId, now: u64) Error!a.GfxPowerRequest {
-        _ = try self.get(identity);
-        if (now == 0 or now == std.math.maxInt(u64)) return error.Invalid;
-        if (self.actor != null and now >= self.intent.deadline_ns) self.wake();
-        var value = self.intent;
-        value.identity = identity;
-        return value;
+        var out: a.GfxPowerRequest = undefined; try status(r4os_rust_display_power_read(self, &identity, now, &out)); return out;
     }
     pub fn request(self: *State, caller: Actor, input: a.GfxPowerRequest, now: u64) Error!a.GfxPowerRequest {
-        if (!header(input) or !caller.valid() or caller.kind != .program or !validId(input.identity) or
-            input.off > 1 or input.reserved0 != 0 or input.reserved1 != 0 or input.sequence != 0 or input.deadline_ns != 0 or
-            now == 0 or now >= std.math.maxInt(u64) - lease_ns) return error.Invalid;
-        const value = try self.get(input.identity);
-        if (value.capabilities & a.gfx_power_cap_signal == 0) return error.Unsupported;
-        if (input.off != 0 and self.actor != null and now < self.intent.deadline_ns and !self.actor.?.eql(caller)) return error.Busy;
-        const renew = input.off != 0 and self.actor != null and self.actor.?.eql(caller) and
-            now < self.intent.deadline_ns and self.intent.off == input.off;
-        if (!renew and self.serial == std.math.maxInt(u64)) return error.Exhausted;
-        if (!renew) self.serial += 1;
-        self.intent = input;
-        self.intent.size = @sizeOf(a.GfxPowerRequest);
-        self.intent.sequence = self.serial;
-        self.intent.deadline_ns = if (input.off != 0) now + lease_ns else 0;
-        self.actor = if (input.off != 0) caller else null;
-        return self.intent;
+        var out: a.GfxPowerRequest = undefined; try status(r4os_rust_display_power_request(self, &caller, &input, now, &out)); return out;
     }
+    pub fn stopped(self: *State, actor: Actor) bool { return r4os_rust_display_power_stopped(self, &actor); }
+    pub fn sleeping(self: *const State) bool { return r4os_rust_display_power_sleeping(self); }
 };
-pub fn sleepingPhase(phase: u32) bool { return phase >= a.gfx_power_phase_stopping and phase <= a.gfx_power_phase_waking; }
-pub fn validId(identity: a.GfxOutputId) bool {
-    return identity.adapter_id != 0 and identity.connector_id != 0 and identity.device_generation != 0 and identity.connection_generation != 0;
+comptime {
+    if (@sizeOf(State) != 208 or @alignOf(State) != 8 or @offsetOf(State, "value_data") != 8 or @offsetOf(State, "intent") != 136 or @offsetOf(State, "serial") != 200) @compileError("Native power intent C layout");
 }
-fn header(value: anytype) bool { return value.version == 1 and value.size == @sizeOf(@TypeOf(value)); }

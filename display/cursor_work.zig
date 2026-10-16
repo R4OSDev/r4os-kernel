@@ -1,21 +1,11 @@
-//! Common cursor transport. GPU policy stays in the R4D, software rendering
-//! in Desktop. The driver worker consumes one bounded job; no new thread.
-const std = @import("std");
+//! Projection of the sole native cursor transport and image owner.
 const model = @import("cursor_state.zig");
 pub const a = model.a;
-const sources = @import("cursor_source.zig");
-const ownership = @import("ownership.zig");
-const display = @import("display.zig");
-const native = @import("native_driver.zig");
 const buffers = @import("../memory/gfx_buffers.zig");
-const buffer_api = @import("../program/gfx_buffer_api.zig");
+const native = @import("native_driver.zig");
 const queue = @import("queue.zig");
-const clock = @import("../platform/monotonic.zig");
-const events = @import("../kernel/desktop_events.zig");
-const irq = @import("../kernel/irq_router.zig");
-var state: model.State = .{};
-var source: sources.Source = .{};
-var admission = ownership.Execution.init("display-cursor");
+pub const Error = native.Error;
+extern fn r4os_rust_display_cursor_work(u32, ?*const buffers.Owner, ?*const anyopaque, ?*anyopaque) i32;
 pub fn code(err: anyerror) i32 {
     return switch (err) {
         error.Busy => a.gfx_output_error_busy,
@@ -26,214 +16,69 @@ pub fn code(err: anyerror) i32 {
         else => a.gfx_output_error_invalid,
     };
 }
-fn nowNs() u64 { return clock.nowNanoseconds() orelse 0; }
-fn snapshot() model.State {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return state;
-}
-fn wake() void {
-    const current = snapshot();
-    if (current.driver.valid() and !current.lost()) queue.wakeNative(@intCast(current.driver.id), .{
-        .adapter = current.info.backend.adapter_id, .device_generation = current.info.backend.device_generation,
-        .reset_generation = current.info.backend.reset_generation }) catch {};
-    events.signal();
-}
-fn releaseSource() !void {
-    buffers.lock();
-    source.close(&buffers.store) catch |err| { buffers.unlock(); return err; };
-    buffers.unlock();
-    buffers.collect();
-}
-fn lost(error_code: i32) void {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    state.markLost(error_code);
-}
-// Admission serializes resource changes. Stop only marks metadata and wakes;
-// it never races BO release or requires the dying program to run again.
-fn maintenance(now: u64) !void {
-    const current = snapshot();
-    const job = current.job orelse return;
-    if (!current.taken and ((current.closing and job.request.operation != a.display_cursor_operation_release) or now >= job.deadline_ns)) {
-        releaseSource() catch |err| { lost(code(err)); return err; };
-        const token = ownership.enterState();
-        state.rejectUntaken(if (current.closing) a.gfx_output_error_stale else a.gfx_output_error_timeout);
-        ownership.leaveState(token);
-        wake();
-    } else if (current.taken and now >= job.deadline_ns and !current.lost()) {
-        lost(a.gfx_output_error_timeout);
-        events.signal(); // Keep source and unknown plane ownership until a real receipt.
-    }
+fn checked(value: i32) Error!void {
+    return switch (value) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Overflow,
+        3 => error.Unsupported,
+        4 => error.Exhausted,
+        5 => error.Budget,
+        6 => error.Capacity,
+        7 => error.Stale,
+        8 => error.Busy,
+        9 => error.Closed,
+        10 => error.WrongOwner,
+        11 => error.OutOfMemory,
+        12 => error.Unavailable,
+        13 => error.WaitTimeout,
+        14 => error.WaitCancelled,
+        15 => error.Disabled,
+        16 => error.AlreadyCompleted,
+        17 => error.Bandwidth,
+        18 => error.Routing,
+        19 => error.Dependency,
+        20 => error.DeviceLost,
+        21 => error.RestoreFailed,
+        else => unreachable,
+    };
 }
 pub fn configure(driver: buffers.Owner, input: *const a.DisplayCursorInfo) i32 {
-    if (irq.inDispatch() or @intFromPtr(input) == 0) return a.gfx_output_error_invalid;
-    if (!display.beginOutputCommit()) return a.gfx_output_error_busy;
-    defer display.endOutputCommit();
-    if (!admission.tryEnter()) return a.gfx_output_error_busy;
-    defer admission.leave();
-    if (input.flags == 0) {
-        // Pause/withdraw removes ACTIVE before the R4D retires the physical
-        // plane. Disabling an already bound cursor needs that exact retained
-        // identity, not a fresh active-output admission. State.configure still
-        // retains visible, claimed, pending or uncertain cursor ownership.
-        // A known actor is closed by its bounded, physically completed job.
-        const current = snapshot();
-        if (current.info.display_generation == 0 or !current.driver.eql(driver) or
-            input.display_generation != current.info.display_generation or input.head_id != current.info.head_id or
-            !std.meta.eql(input.backend, current.info.backend)) return a.gfx_output_error_stale;
-        queue.validateOutputBinding(@intCast(driver.id), input.backend) catch |err| return code(err);
-    } else {
-        const target = native.cursorBinding() catch |err| return code(err);
-        if (!target.driver.eql(driver) or input.display_generation != target.generation or input.head_id != target.head or
-            !std.meta.eql(input.backend, target.backend)) return a.gfx_output_error_stale;
-    }
-    var newly_closing = false;
-    const configured = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        const was_closing = state.closing;
-        state.configure(driver, input.*) catch |err| {
-            newly_closing = !was_closing and state.closing;
-            break :blk code(err);
-        };
-        break :blk a.gfx_output_ok;
-    };
-    if (newly_closing) wake() else if (configured == a.gfx_output_ok) events.signal();
-    return configured;
+    return r4os_rust_display_cursor_work(0, &driver, input, null);
 }
 pub fn info(output: *a.DisplayCursorInfo) callconv(.c) i32 {
-    if (!buffer_api.validOutput(a.DisplayCursorInfo, output) or irq.inDispatch()) return a.gfx_output_error_invalid;
-    const current = snapshot();
-    if (!current.available()) return a.gfx_output_error_unsupported;
-    const active = display.backendState();
-    if (active.state != .software_native or active.owner != current.driver.id or active.generation != current.info.display_generation)
-        return a.gfx_output_error_unsupported;
-    output.* = current.info; return a.gfx_output_ok;
+    return r4os_rust_display_cursor_work(1, null, null, output);
 }
 pub fn status(output: *a.DisplayCursorStatus) callconv(.c) i32 {
-    if (!buffer_api.validOutput(a.DisplayCursorStatus, output) or irq.inDispatch()) return a.gfx_output_error_invalid;
-    if (!admission.tryEnter()) return a.gfx_output_error_busy;
-    defer admission.leave();
-    maintenance(nowNs()) catch {};
-    const current = snapshot();
-    if (current.info.display_generation == 0) return a.gfx_output_error_unsupported;
-    output.* = current.status; return a.gfx_output_ok;
+    return r4os_rust_display_cursor_work(2, null, null, output);
 }
 pub fn submit(caller: buffers.Owner, input: *const a.DisplayCursorRequest, output: *a.DisplayCursorStatus) i32 {
-    if (irq.inDispatch() or @intFromPtr(input) == 0 or !buffer_api.validOutput(a.DisplayCursorStatus, output)) return a.gfx_output_error_invalid;
-    const call = ownership.retainCall();
-    if (!call.admitted()) return a.gfx_output_error_busy;
-    defer ownership.releaseCall(call);
-    if (!display.beginOutputCommit()) return a.gfx_output_error_busy;
-    defer display.endOutputCommit();
-    if (!admission.tryEnter()) return a.gfx_output_error_busy;
-    defer admission.leave();
-    const now = nowNs();
-    maintenance(now) catch |err| return code(err);
-    const target = native.cursorBinding() catch |err| return code(err);
-    const current = snapshot();
-    if (!target.driver.eql(current.driver) or target.generation != current.info.display_generation or
-        !std.meta.eql(target.backend, current.info.backend)) return a.gfx_output_error_stale;
-    current.validate(caller, input.*) catch |err| return code(err);
-    if (input.operation == a.display_cursor_operation_prepare) {
-        buffers.lockPrepared(.{ .references = 2, .leases = 1 }) catch |err| return code(err);
-        source.open(&buffers.store, caller, target.driver, input.*) catch |err| { buffers.unlock(); return code(err); };
-        buffers.unlock();
-    }
-    const result = blk: {
-        const token = ownership.enterState();
-        state.begin(caller, input.*, source.wire(), target.timeline, target.point, now) catch |err| {
-            ownership.leaveState(token);
-            releaseSource() catch |release| lost(code(release));
-            return code(err);
-        };
-        const accepted = state.status;
-        ownership.leaveState(token);
-        break :blk accepted;
-    };
-    output.* = result;
-    wake(); return a.gfx_output_ok;
+    return r4os_rust_display_cursor_work(3, &caller, input, output);
 }
 pub fn take(driver: buffers.Owner, backend: *const a.GfxBackendBinding, output: *a.GfxDriverCursorJob) i32 {
-    if (irq.inDispatch() or @intFromPtr(backend) == 0 or !buffer_api.validOutput(a.GfxDriverCursorJob, output)) return a.gfx_output_error_invalid;
-    if (!admission.tryEnter()) return a.gfx_output_error_busy;
-    defer admission.leave();
-    queue.validateOutputBinding(@intCast(driver.id), backend.*) catch |err| return code(err);
-    const now = nowNs();
-    maintenance(now) catch |err| return code(err);
-    const job = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        break :blk state.take(driver, backend.*, now) catch |err| return code(err);
-    };
-    if (job) |value| { output.* = value; events.signal(); return a.gfx_output_ok; }
-    return 0;
+    return r4os_rust_display_cursor_work(4, &driver, backend, output);
 }
 pub fn complete(driver: buffers.Owner, input: *const a.GfxDriverCursorCompletion) i32 {
-    if (irq.inDispatch() or @intFromPtr(input) == 0) return a.gfx_output_error_invalid;
-    if (!admission.tryEnter()) return a.gfx_output_error_busy;
-    defer admission.leave();
-    const current = snapshot();
-    const changed = current.validateReply(driver, input.*) catch |err| return code(err);
-    if (!changed) return a.gfx_output_ok;
-    if (input.outcome != a.gfx_output_outcome_lost) {
-        queue.validateOutputBinding(@intCast(driver.id), current.info.backend) catch |err| return code(err);
-        releaseSource() catch |err| { lost(code(err)); return code(err); };
-    }
-    {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        state.finish(input.*);
-    }
-    wake(); return a.gfx_output_ok;
+    return r4os_rust_display_cursor_work(5, &driver, input, null);
 }
 pub fn stopped(caller: buffers.Owner) void {
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        break :blk state.close(caller);
-    };
-    if (changed) wake();
+    _ = r4os_rust_display_cursor_work(6, &caller, null, null);
 }
 pub fn stoppedDriver(id: u32) void {
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (id == 0 or state.driver.id != id or state.info.display_generation == 0 or state.lost()) break :blk false;
-        state.markLost(a.gfx_output_error_unavailable); break :blk true;
-    };
-    if (changed) events.signal();
+    const driver = buffers.Owner{ .kind = .driver, .id = id, .generation = 0 };
+    _ = r4os_rust_display_cursor_work(7, &driver, null, null);
 }
-pub fn retireAfterReset(driver: buffers.Owner, backend: a.GfxBackendBinding) !void {
-    if (!admission.tryEnter()) return error.Busy;
-    defer admission.leave();
-    const current = snapshot();
-    if (current.info.display_generation == 0) return;
-    if (!current.driver.eql(driver) or !std.meta.eql(current.info.backend, backend)) return error.Stale;
-    try releaseSource();
-    const token = ownership.enterState();
-    state.retireAfterReset(driver, backend) catch unreachable;
-    ownership.leaveState(token);
-    events.signal();
+pub fn retireAfterReset(driver: buffers.Owner, backend: a.GfxBackendBinding) Error!void {
+    try checked(r4os_rust_display_cursor_work(8, &driver, &backend, null));
 }
-// The mode worker holds DisplayExecution, so public cursor submissions are
-// excluded. Its job is exposed only after a confirmed hidden cursor plane.
-pub fn beforeMode(driver: buffers.Owner) !void {
-    if (!admission.tryEnter()) return error.Busy;
-    defer admission.leave();
-    maintenance(nowNs()) catch |err| return err;
-    const ready = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (state.info.flags == 0) break :blk true;
-        if (!state.driver.eql(driver) or state.lost()) return error.Unavailable;
-        state.suspended = true;
-        state.status.flags |= a.display_cursor_state_suspended;
-        break :blk state.job == null and !state.visible();
-    };
-    if (!ready) { wake(); return error.Busy; }
+pub fn beforeMode(driver: buffers.Owner) Error!void {
+    try checked(r4os_rust_display_cursor_work(9, &driver, null, null));
 }
 pub fn resumeModes() void {
-    // Physical mode operations exclude cursor submissions. The settled
-    // confirmation interval may resume its exact new image and cursor while
-    // the old backing remains retained for rollback.
-    if (native.modePending()) return;
-    const token = ownership.enterState();
-    state.suspended = false;
-    state.status.flags &= ~a.display_cursor_state_suspended;
-    ownership.leaveState(token);
-    events.signal();
+    _ = r4os_rust_display_cursor_work(10, null, null, null);
+}
+const CursorBinding = extern struct { driver: buffers.Owner, backend: a.GfxBackendBinding, generation: u64, head: u32, timeline: u64, point: u64 };
+
+comptime {
+    if (@sizeOf(CursorBinding) != 88) @compileError("Native cursor runtime binding layout");
 }

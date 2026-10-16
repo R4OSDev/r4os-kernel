@@ -1,0 +1,558 @@
+//! Fieldwise equality for unchanged Contract records. No wire padding is read.
+use crate::contract as a;
+pub trait ValueEq {
+    fn value_eq(&self, other: &Self) -> bool;
+}
+macro_rules! scalar { ($($ty:ty),*)=>{$(impl ValueEq for $ty { fn value_eq(&self,other:&Self)->bool {self==other} })*}; }
+scalar!(
+    u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize, bool, f32, f64
+);
+impl<T: ValueEq, const N: usize> ValueEq for [T; N] {
+    fn value_eq(&self, other: &Self) -> bool {
+        self.iter().zip(other.iter()).all(|(a, b)| a.value_eq(b))
+    }
+}
+pub fn same<T: ValueEq>(left: &T, right: &T) -> bool {
+    left.value_eq(right)
+}
+macro_rules! record { ($ty:ty,$($field:ident),+)=>{impl ValueEq for $ty {fn value_eq(&self,other:&Self)->bool {$(self.$field.value_eq(&other.$field))&&+}}}; }
+record!(
+    a::DisplayCursorInfo,
+    version,
+    size,
+    head_id,
+    flags,
+    backend,
+    display_generation,
+    max_width,
+    max_height,
+    min_x,
+    min_y,
+    max_x,
+    max_y
+);
+record!(
+    a::DisplayCursorRequest,
+    version,
+    size,
+    display_generation,
+    operation,
+    head_id,
+    reference,
+    image_sequence,
+    x,
+    y,
+    hotspot_x,
+    hotspot_y,
+    width,
+    height,
+    pitch,
+    byte_length
+);
+record!(
+    a::DisplayCursorStatus,
+    version,
+    size,
+    display_generation,
+    sequence,
+    completed,
+    image_sequence,
+    phase,
+    flags,
+    x,
+    y,
+    head_id,
+    error_code,
+    deadline_ns
+);
+record!(
+    a::DisplayPresentationInfo,
+    version,
+    size,
+    flags,
+    head_id,
+    backend,
+    display_generation,
+    sequence,
+    width,
+    height,
+    format,
+    policies,
+    buffer_count,
+    plane_count,
+    interval_ns,
+    observed_sequence,
+    observed_ns,
+    path,
+    reserved0
+);
+record!(
+    a::DisplayPresentationStats,
+    version,
+    size,
+    flags,
+    head_id,
+    backend,
+    display_generation,
+    sequence,
+    visible_sequence,
+    pending,
+    buffer_count,
+    acquired_count,
+    rendered_count,
+    submitted_count,
+    visible_count,
+    released_count,
+    rejected_count,
+    source_timeline,
+    source_point,
+    render_point,
+    window_point,
+    submitted_ns,
+    visible_ns,
+    gpu_timestamp,
+    irq_sequence,
+    irq_observed_ns,
+    released_ns
+);
+record!(
+    a::GfxAdditionalOutput,
+    version,
+    size,
+    backend,
+    output,
+    head_id,
+    width,
+    height,
+    format,
+    job_size,
+    flags,
+    reserved0
+);
+record!(
+    a::GfxAtomicState,
+    version,
+    size,
+    topology_revision,
+    count,
+    reserved0,
+    assignments
+);
+record!(
+    a::GfxAudioRoute,
+    version,
+    size,
+    source,
+    receiver_sequence,
+    revision,
+    connector_id,
+    hda_location,
+    hda_device,
+    head_id,
+    device_entry,
+    state,
+    eld_bytes,
+    reserved0,
+    port_id,
+    eld
+);
+record!(
+    a::GfxBackendBinding,
+    version,
+    size,
+    adapter_id,
+    milestone,
+    device_generation,
+    reset_generation
+);
+record!(
+    a::GfxBrightnessRequest,
+    version,
+    size,
+    identity,
+    level,
+    reserved0,
+    sequence
+);
+record!(a::GfxBufferHandle, id, reserved0, generation);
+record!(
+    a::GfxColorSignal,
+    version,
+    size,
+    format,
+    bpc,
+    primaries,
+    transfer,
+    range,
+    pipeline,
+    reference_white,
+    peak,
+    black,
+    metadata_valid,
+    metadata,
+    reserved0
+);
+record!(
+    a::GfxDisplayLimits,
+    version,
+    size,
+    flags,
+    head_mask,
+    plane_mask,
+    pll_mask,
+    rotations,
+    colors,
+    bpc_mask,
+    pitch_alignment,
+    max_width,
+    max_height,
+    formats,
+    reserved0,
+    modifiers,
+    bandwidth_bytes_per_second,
+    max_pixel_clock_hz,
+    total_pixel_clock_hz
+);
+record!(
+    a::GfxDriverCursorCompletion,
+    version,
+    size,
+    sequence,
+    display_generation,
+    error_code,
+    outcome,
+    visibility,
+    reserved0
+);
+record!(
+    a::GfxDriverCursorJob,
+    version,
+    size,
+    backend,
+    sequence,
+    deadline_ns,
+    barrier_timeline,
+    barrier_point,
+    request
+);
+record!(
+    a::GfxDriverJob,
+    version,
+    size,
+    fence,
+    operation,
+    reserved0,
+    source_buffer,
+    target_buffer,
+    byte_length,
+    source_offset,
+    target_offset,
+    row_count,
+    reserved1,
+    source_pitch,
+    target_pitch,
+    render,
+    deadline_ns,
+    display_target,
+    producer_kind,
+    producer_reserved,
+    producer_id,
+    producer_generation
+);
+record!(
+    a::GfxFence,
+    slot,
+    adapter_id,
+    timeline,
+    point,
+    device_generation,
+    reset_generation
+);
+record!(
+    a::GfxHdrMetadata,
+    primaries,
+    white,
+    max_mastering,
+    min_mastering,
+    max_cll,
+    max_fall
+);
+record!(a::GfxModeColorRequest, version, size, state, signal, image);
+record!(
+    a::GfxOutputBrightness,
+    version,
+    size,
+    identity,
+    path,
+    phase,
+    minimum,
+    maximum,
+    current,
+    flags,
+    reason,
+    reserved0,
+    sequence,
+    request_sequence,
+    since_ns
+);
+record!(
+    a::GfxOutputColorState,
+    version,
+    size,
+    identity,
+    revision,
+    flags,
+    format,
+    bpc,
+    primaries,
+    transfer,
+    range,
+    reference_white,
+    peak,
+    black,
+    formats,
+    depths,
+    color_spaces,
+    transfers,
+    ranges,
+    gamma_entries,
+    degamma_entries,
+    ctm_fraction_bits,
+    reserved0,
+    max_tmds_clock_hz,
+    dp_payload_bits_per_second,
+    link_kind,
+    link_flags,
+    dsc_depths,
+    max_frl_rate,
+    compressed_bpp_x16,
+    link_lanes,
+    link_rate_mbps,
+    h_active,
+    h_total,
+    reserved_link,
+    link_payload_bits_per_second,
+    pixel_clock_numerator,
+    pixel_clock_denominator,
+    v_active
+);
+record!(
+    a::GfxOutputId,
+    adapter_id,
+    connector_id,
+    device_generation,
+    connection_generation
+);
+record!(
+    a::GfxOutputInfo,
+    version,
+    size,
+    identity,
+    topology_revision,
+    flags,
+    connector_kind,
+    mode_count,
+    preferred_mode_id,
+    edid_bytes,
+    reserved0,
+    possible_heads,
+    possible_planes,
+    possible_plls,
+    reserved1,
+    limits
+);
+record!(
+    a::GfxOutputMode,
+    version,
+    size,
+    mode_id,
+    flags,
+    width,
+    height,
+    pixel_clock_hz,
+    h_total,
+    h_sync_start,
+    h_sync_end,
+    v_total,
+    v_sync_start,
+    v_sync_end,
+    refresh_millihz,
+    reserved0
+);
+record!(
+    a::GfxOutputPower,
+    version,
+    size,
+    identity,
+    capabilities,
+    phase,
+    sequence,
+    request_sequence,
+    since_ns,
+    control_receipt,
+    core_point,
+    window_point,
+    reason,
+    reserved0
+);
+record!(
+    a::GfxOutputRefresh,
+    version,
+    size,
+    target,
+    capabilities,
+    status,
+    measured
+);
+record!(
+    a::GfxOutputTarget,
+    version,
+    size,
+    adapter_id,
+    connector_id,
+    device_generation,
+    connection_generation,
+    display_generation,
+    head_id,
+    reserved0
+);
+record!(
+    a::GfxPowerRequest,
+    version,
+    size,
+    identity,
+    off,
+    reserved0,
+    sequence,
+    deadline_ns,
+    reserved1
+);
+record!(
+    a::GfxReceiverInfo,
+    connector_id,
+    connector_kind,
+    flags,
+    mode_count,
+    preferred_mode_id,
+    edid_bytes,
+    reserved0,
+    modes,
+    edid
+);
+record!(a::GfxReceiverSource, adapter_id, reserved0, generation);
+record!(
+    a::GfxRefreshCapabilities,
+    version,
+    size,
+    flags,
+    origin,
+    min_millihz,
+    max_millihz,
+    nominal_millihz,
+    reserved0,
+    min_period_ns,
+    max_period_ns,
+    max_increase_ns,
+    max_decrease_ns,
+    max_vtotal,
+    reserved1
+);
+record!(
+    a::GfxRefreshMeasure,
+    version,
+    size,
+    sequence,
+    samples,
+    reserved0,
+    observed_ns,
+    last_period_ns,
+    min_period_ns,
+    max_period_ns,
+    mean_period_ns,
+    millihz,
+    gaps,
+    reserved1
+);
+record!(
+    a::GfxRefreshRequest,
+    version,
+    size,
+    target,
+    operation,
+    policy,
+    scene,
+    reserved0,
+    sequence,
+    deadline_ns
+);
+record!(
+    a::GfxRefreshStatus,
+    version,
+    size,
+    sequence,
+    request_sequence,
+    phase,
+    reason,
+    policy,
+    scene,
+    core_point,
+    receipt,
+    since_ns
+);
+record!(
+    a::GfxRenderCommand,
+    kind,
+    filter,
+    blend,
+    transfer,
+    source_rect,
+    target_rect,
+    scissor,
+    color,
+    opacity,
+    reserved0
+);
+record!(a::GfxRenderRect, x, y, width, height);
+record!(
+    a::GfxSampleGrid,
+    enabled,
+    rotation,
+    scale,
+    pixel_width,
+    pixel_height,
+    target_x,
+    target_y,
+    reserved,
+    viewport_x,
+    viewport_y,
+    viewport_width,
+    viewport_height,
+    guest_width,
+    guest_height,
+    source_x,
+    source_y
+);
+record!(
+    a::GfxScanoutState,
+    version,
+    size,
+    output,
+    mode_id,
+    head_id,
+    plane_id,
+    pll_id,
+    source_x,
+    source_y,
+    source_width,
+    source_height,
+    destination_x,
+    destination_y,
+    destination_width,
+    destination_height,
+    rotation,
+    color,
+    bits_per_color,
+    reserved0,
+    buffer,
+    ready_fence
+);

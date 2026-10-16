@@ -1,3 +1,4 @@
+comptime { if (@import("builtin").is_test) _ = @import("rust_owner_test"); }
 // Pure bounded connector catalog and atomic validation. No device accesses,
 // callback invocation, allocation or resource release is permitted here.
 const std = @import("std");
@@ -6,17 +7,17 @@ const bo = @import("../memory/gfx_buffer_layout.zig");
 pub const Error = error{ Invalid, Stale, Busy, Unsupported, Capacity, Exhausted, Bandwidth, Routing, Dependency };
 pub const capacity = abi.gfx_output_catalog_capacity;
 pub const DriverOwner = @import("../memory/gfx_buffer_owner.zig").Owner;
-const Source = struct {
+const Source = extern struct {
     owner: DriverOwner = .{ .kind = .driver, .id = 0, .generation = 0 },
     binding: abi.GfxReceiverSource = .{},
     sequence: u64 = 0,
 };
-pub const Entry = struct {
+pub const Entry = extern struct {
     owner: u32 = 0,
     receiver_source: u64 = 0,
     paused: bool = false,
     info: abi.GfxOutputInfo = .{},
-    color: ?abi.GfxOutputColorState = null,
+    has_color: bool = false, color_data: abi.GfxOutputColorState = .{},
     refresh: @import("refresh_state.zig").State = .{},
     power: @import("power_state.zig").State = .{},
     brightness: @import("brightness_state.zig").State = .{},
@@ -25,8 +26,8 @@ pub const Entry = struct {
     edid: [abi.gfx_output_max_edid_bytes]u8 = .{0} ** abi.gfx_output_max_edid_bytes,
 };
 pub const Fact = struct { buffer: ?bo.Descriptor = null, dependency: enum { none, ready, pending, failed } = .none };
-pub const Ticket = struct { id: u64 = 0 };
-pub const Store = struct {
+pub const Ticket = extern struct { id: u64 = 0 };
+pub const Store = extern struct {
     entries: [capacity]Entry = .{Entry{}} ** capacity,
     audio: @import("audio_routes.zig").Store = .{},
     sources: [16]Source = @splat(.{}),
@@ -39,518 +40,72 @@ pub const Store = struct {
     retained: u32 = 0,
     reset_retired: Ticket = .{},
 
-    fn canChange(self: *const Store) Error!void {
-        if (self.pending.id != 0 or self.retained != 0) return error.Busy;
-        if (self.revision == std.math.maxInt(u64) or self.receiver_serial == std.math.maxInt(u64)) return error.Exhausted;
-    }
+    fn call(self: *const Store, op: u32, args: Args, out: ?*anyopaque) Error!void { try status(r4os_rust_display_output_state(self, op, &args, out)); }
+    fn result(self: *const Store, comptime T: type, op: u32, args: Args) Error!T { var out: T = undefined; try self.call(op, args, &out); return out; }
     pub fn publish(self: *Store, owner: u32, info: abi.GfxOutputInfo, modes: []const abi.GfxOutputMode, edid: []const u8) Error!abi.GfxOutputId {
-        return self.publishImpl(owner, info, modes, edid, false);
+        return self.result(abi.GfxOutputId, 0, .{ .owner = owner, .input = &info, .modes = modes.ptr, .modes_len = modes.len, .edid = edid.ptr, .edid_len = edid.len });
     }
     pub fn publishModeset(self: *Store, owner: u32, info: abi.GfxOutputInfo, modes: []const abi.GfxOutputMode, edid: []const u8) Error!abi.GfxOutputId {
-        return self.publishImpl(owner, info, modes, edid, true);
+        return self.result(abi.GfxOutputId, 0, .{ .owner = owner, .input = &info, .modes = modes.ptr, .modes_len = modes.len, .edid = edid.ptr, .edid_len = edid.len, .flag = true });
     }
-    fn publishImpl(self: *Store, owner: u32, info: abi.GfxOutputInfo, modes: []const abi.GfxOutputMode, edid: []const u8, promote: bool) Error!abi.GfxOutputId {
-        try self.canChange();
-        for (&self.sources) |*source| if (source.binding.generation != 0 and source.binding.adapter_id == info.identity.adapter_id and
-            source.owner.id != owner) return error.Busy;
-        if (!header(info) or !header(info.limits) or info.reserved0 != 0 or info.reserved1 != 0 or info.limits.reserved0 != 0 or
-            info.identity.connector_id == 0 or info.identity.device_generation == 0 or
-            info.identity.connection_generation != 0 or info.mode_count != modes.len or info.edid_bytes != edid.len or
-            modes.len > abi.gfx_output_max_modes or edid.len > abi.gfx_output_max_edid_bytes or edid.len % 128 != 0 or
-            info.flags & ~@as(u32, 31 | abi.gfx_output_flag_edid_missing | abi.gfx_output_flag_edid_invalid |
-                abi.gfx_output_flag_receiver_incomplete | abi.gfx_output_flag_query_failed) != 0 or info.connector_kind > abi.gfx_output_kind_dvi) return error.Invalid;
-        if ((owner == 0) != (info.identity.adapter_id == 0)) return error.Invalid;
-        if (info.flags & abi.gfx_output_flag_connected == 0) {
-            if (edid.len != 0) return error.Invalid;
-            if (modes.len != 0 or info.preferred_mode_id != 0) {
-                // A retained source geometry does not assert sink presence or
-                // advertise receiver timings. Only held native admission can
-                // activate this source while its connection remains unknown.
-                if (info.flags & abi.gfx_output_flag_connection_unknown == 0 or modes.len != 1 or
-                    modes[0].flags & abi.gfx_output_mode_geometry_only == 0) return error.Invalid;
-            }
-        }
-        try validLimits(info.limits);
-        if (info.possible_heads == 0 or info.possible_planes == 0 or info.possible_plls == 0 or
-            info.possible_heads & ~info.limits.head_mask != 0 or info.possible_planes & ~info.limits.plane_mask != 0 or
-            info.possible_plls & ~info.limits.pll_mask != 0) return error.Routing;
-        var preferred_found = info.preferred_mode_id == 0;
-        for (modes, 0..) |mode, i| {
-            if (!validMode(mode)) return error.Invalid;
-            for (modes[0..i]) |prior| if (prior.mode_id == mode.mode_id) return error.Invalid;
-            if (info.preferred_mode_id == mode.mode_id) preferred_found = true;
-        }
-        if (!preferred_found) return error.Invalid;
-        var selected: ?usize = null;
-        var vacant: ?usize = null;
-        for (&self.entries, 0..) |*entry, index| {
-            if (entry.info.identity.connector_id == 0) { if (vacant == null) vacant = index; continue; }
-            if (entry.info.identity.adapter_id != info.identity.adapter_id) continue;
-            // Source limits remain adapter-wide. Only this owner's withdrawn
-            // port can negotiate new receiver limits; other ports must agree.
-            if (entry.receiver_source == 0 and entry.info.identity.device_generation == info.identity.device_generation and
-                !std.meta.eql(entry.info.limits, info.limits)) {
-                // The common primary bridge may explicitly negotiate its
-                // first modeset contract after boot takeover. Other ports
-                // and already-negotiated device limits must still agree.
-                const withdrawn = entry.info.flags == 0 and entry.info.mode_count == 0 and entry.info.edid_bytes == 0;
-                if (entry.owner != owner or entry.info.identity.connector_id != info.identity.connector_id or
-                    (!withdrawn and (!promote or entry.info.limits.flags & abi.gfx_output_limit_modeset != 0 or
-                        info.limits.flags & abi.gfx_output_limit_modeset == 0))) return error.Invalid;
-            }
-            if (entry.info.identity.connector_id != info.identity.connector_id) continue;
-            if (entry.owner != owner and entry.owner != 0) return error.Busy;
-            selected = index;
-        }
-        const index = selected orelse vacant orelse return error.Capacity;
-        var identity = info.identity;
-        self.receiver_serial += 1;
-        self.revision += 1;
-        identity.connection_generation = self.receiver_serial;
-        const entry = &self.entries[index];
-        const paused = entry.owner == owner and entry.receiver_source == 0 and entry.paused;
-        const sleeping = paused and entry.info.identity.device_generation == info.identity.device_generation and
-            (entry.power.sleeping() or entry.retained_sleep);
-        entry.* = .{ .owner = owner, .info = info, .paused = paused, .retained_sleep = sleeping };
-        if (paused) entry.info.flags &= ~@as(u32, abi.gfx_output_flag_active);
-        entry.info.identity = identity;
-        entry.info.topology_revision = self.revision;
-        @memcpy(entry.modes[0..modes.len], modes);
-        @memcpy(entry.edid[0..edid.len], edid);
-        return identity;
-    }
-    pub fn find(self: *const Store, identity: abi.GfxOutputId) Error!*const Entry {
-        for (&self.entries) |*entry| if (entry.info.identity.connector_id != 0 and std.meta.eql(entry.info.identity, identity)) return entry;
-        return error.Stale;
-    }
-    pub fn infoAt(self: *const Store, index: u32) ?abi.GfxOutputInfo {
-        var ordinal: u32 = 0;
-        for (&self.entries) |*entry| {
-            if (entry.info.identity.connector_id == 0) continue;
-            if (ordinal == index) {
-                var result = entry.info;
-                if (entry.power.sleeping() or entry.retained_sleep) result.flags |= abi.gfx_output_flag_sleeping;
-                result.topology_revision = self.revision;
-                return result;
-            }
-            ordinal += 1;
-        }
-        return null;
-    }
-    pub fn publishColor(self: *Store, owner: u32, value: abi.GfxOutputColorState) Error!bool {
-        if (owner == 0 or !validColor(value) or value.revision != 0) return error.Invalid;
-        const entry = for (&self.entries) |*item| {
-            if (std.meta.eql(item.info.identity, value.identity)) break item;
-        } else return error.Stale;
-        if (entry.owner != owner or entry.receiver_source != 0) return error.Stale;
-        if (value.flags & abi.gfx_output_color_active != 0 and (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0)) return error.Stale;
-        if (entry.color) |old| if (std.meta.eql(old, value)) return false;
-        try self.canChange();
-        entry.color = value;
-        self.revision += 1;
-        return true;
-    }
-    pub fn colorAt(self: *const Store, identity: abi.GfxOutputId) Error!abi.GfxOutputColorState {
-        const entry = try self.find(identity);
-        var value = entry.color orelse return error.Unsupported;
-        if (!std.meta.eql(value.identity, identity)) return error.Unsupported;
-        value.revision = self.revision;
-        if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) {
-            value.flags &= ~@as(u32, abi.gfx_output_color_active);
-            value.format = 0; value.bpc = 0; value.primaries = 0; value.transfer = 0; value.range = 0;
-            value.reference_white = 0; value.peak = 0; value.black = 0;
-            value.dp_payload_bits_per_second = 0;
-            value.link_kind = 0; value.link_flags = 0; value.compressed_bpp_x16 = 0;
-            value.link_lanes = 0; value.link_rate_mbps = 0; value.link_payload_bits_per_second = 0;
-            value.h_active = 0; value.h_total = 0; value.v_active = 0;
-            value.pixel_clock_numerator = 0; value.pixel_clock_denominator = 0;
-        }
-        return value;
-    }
-    pub fn modeAt(self: *const Store, identity: abi.GfxOutputId, index: u32) Error!?abi.GfxOutputMode {
-        const entry = try self.find(identity);
-        return if (index < entry.info.mode_count) entry.modes[index] else null;
-    }
-    pub fn refreshEntry(self: *Store, target: abi.GfxOutputTarget) Error!*Entry {
-        if (!@import("output_target.zig").valid(target)) return error.Invalid;
-        const entry = @constCast(try self.find(.{ .adapter_id = target.adapter_id, .connector_id = target.connector_id,
-            .device_generation = target.device_generation, .connection_generation = target.connection_generation }));
-        if (entry.owner == 0 or entry.receiver_source != 0) return error.Unsupported;
-        return entry;
-    }
-    pub fn publishRefresh(self: *Store, owner: u32, value: abi.GfxOutputRefresh) Error!bool {
-        const entry = try self.refreshEntry(value.target);
-        if (entry.owner != owner or owner == 0) return error.Stale;
-        if (value.status.phase == abi.gfx_refresh_phase_active and
-            (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0)) return error.Stale;
-        return entry.refresh.publish(value);
-    }
-    pub fn refreshAt(self: *Store, target: abi.GfxOutputTarget) Error!abi.GfxOutputRefresh {
-        const entry = try self.refreshEntry(target);
-        if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) return error.Stale;
-        return entry.refresh.get(target);
-    }
-    pub fn requestRefresh(self: *Store, actor: DriverOwner, input: abi.GfxRefreshRequest, now: u64) Error!abi.GfxRefreshRequest {
-        const entry = try self.refreshEntry(input.target);
-        if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) return error.Stale;
-        return entry.refresh.request(actor, input, now);
-    }
-    pub fn readRefresh(self: *Store, owner: u32, target: abi.GfxOutputTarget, now: u64) Error!abi.GfxRefreshRequest {
-        const entry = try self.refreshEntry(target);
-        if (entry.owner != owner or owner == 0) return error.Stale;
-        if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) entry.refresh.pause();
-        return entry.refresh.read(target, now);
-    }
-    pub fn powerEntry(self: *Store, identity: abi.GfxOutputId) Error!*Entry {
-        const entry = @constCast(try self.find(identity));
-        if (entry.owner == 0 or entry.receiver_source != 0) return error.Unsupported;
-        return entry;
-    }
-    pub fn publishPower(self: *Store, owner: u32, value: abi.GfxOutputPower) Error!bool {
-        const entry = try self.powerEntry(value.identity);
-        if (owner == 0 or owner != entry.owner) return error.Stale;
-        if (value.phase == abi.gfx_power_phase_on and (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0)) return error.Stale;
-        if (value.phase == abi.gfx_power_phase_off and !entry.paused) return error.Stale;
-        const topology = (entry.power.sleeping() or entry.retained_sleep) != @import("power_state.zig").sleepingPhase(value.phase);
-        if (topology and self.revision >= std.math.maxInt(u64) - @as(u64, @intFromBool(self.pending.id != 0))) return error.Exhausted;
-        const changed = try entry.power.publish(value);
-        entry.retained_sleep = false;
-        if (topology) self.revision += 1;
-        return changed;
-    }
-    pub fn powerAt(self: *Store, identity: abi.GfxOutputId) Error!abi.GfxOutputPower {
-        return (try self.powerEntry(identity)).power.get(identity);
-    }
-    pub fn requestPower(self: *Store, actor: DriverOwner, input: abi.GfxPowerRequest, now: u64) Error!abi.GfxPowerRequest {
-        return (try self.powerEntry(input.identity)).power.request(actor, input, now);
-    }
-    pub fn readPower(self: *Store, owner: u32, identity: abi.GfxOutputId, now: u64) Error!abi.GfxPowerRequest {
-        const entry = try self.powerEntry(identity);
-        if (owner == 0 or entry.owner != owner) return error.Stale;
-        return entry.power.read(identity, now);
-    }
-    pub fn publishBrightness(self: *Store, owner: u32, value: abi.GfxOutputBrightness) Error!bool {
-        const entry = try self.powerEntry(value.identity);
-        if (owner == 0 or entry.owner != owner) return error.Stale;
-        return entry.brightness.publish(value);
-    }
-    pub fn brightnessAt(self: *Store, identity: abi.GfxOutputId) Error!abi.GfxOutputBrightness {
-        return (try self.powerEntry(identity)).brightness.get(identity);
-    }
-    pub fn requestBrightness(self: *Store, actor: DriverOwner, input: abi.GfxBrightnessRequest) Error!abi.GfxBrightnessRequest {
-        const entry = try self.powerEntry(input.identity);
-        if (entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0) return error.Busy;
-        return entry.brightness.request(actor, input);
-    }
-    pub fn readBrightness(self: *Store, owner: u32, identity: abi.GfxOutputId) Error!abi.GfxBrightnessRequest {
-        const entry = try self.powerEntry(identity);
-        if (owner == 0 or entry.owner != owner) return error.Stale;
-        return entry.brightness.read(identity);
-    }
-    pub fn withdraw(self: *Store, owner: u32, identity: abi.GfxOutputId) Error!void {
-        try self.canChange();
-        const entry = try self.find(identity);
-        if (owner == 0 or entry.owner != owner or entry.receiver_source != 0) return error.Stale;
-        self.disconnect(@constCast(entry));
-    }
-    pub fn pause(self: *Store, owner: u32, identity: abi.GfxOutputId, paused: bool, primary: bool) Error!bool {
-        const entry = @constCast(try self.find(identity));
-        if (owner == 0 or entry.owner != owner or entry.receiver_source != 0) return error.Stale;
-        if (entry.paused == paused) return false;
-        const ceiling = std.math.maxInt(u64) - @as(u64, @intFromBool(self.pending.id != 0));
-        if (self.revision >= ceiling) return error.Exhausted;
-        entry.paused = paused;
-        if (paused) entry.refresh.pause();
-        if (paused) entry.info.flags &= ~@as(u32, abi.gfx_output_flag_active)
-        else if (primary) entry.info.flags |= abi.gfx_output_flag_active;
-        self.revision += 1; entry.info.topology_revision = self.revision;
-        return true;
-    }
-    fn disconnect(self: *Store, entry: *Entry) void {
-        self.receiver_serial += 1;
-        self.revision += 1;
-        entry.info.identity.connection_generation = self.receiver_serial;
-        entry.info.topology_revision = self.revision;
-        entry.info.flags = 0;
-        entry.info.mode_count = 0;
-        entry.info.preferred_mode_id = 0;
-        entry.info.edid_bytes = 0;
-        entry.refresh = .{};
-        entry.power = .{};
-        entry.brightness = .{};
-        entry.retained_sleep = false;
-        @memset(&entry.modes, .{});
-        @memset(&entry.edid, 0);
-    }
-    pub fn stop(self: *Store, owner: u32) Error!bool {
-        if (owner == 0) return error.Invalid;
-        var receivers_changed = false;
-        for (&self.sources) |*source| if (source.binding.generation != 0 and source.owner.id == owner) {
-            receivers_changed = self.eraseReceivers(source.binding.generation) or receivers_changed;
-            source.* = .{};
-        };
-        var count: u64 = 0;
-        for (&self.entries) |*entry| if (entry.owner == owner) { count += 1; };
-        // Queue removal revokes metadata even with an outstanding mode
-        // consumer. It is not a BO/ticket retirement: keep pending/retained
-        // and reserve the pending finish increment until its exact receipt.
-        const ceiling = std.math.maxInt(u64) - @as(u64, @intFromBool(self.pending.id != 0));
-        if (self.receiver_serial > std.math.maxInt(u64) - count or self.revision > ceiling - count) return error.Exhausted;
-        for (&self.entries) |*entry| if (entry.owner == owner) {
-            self.disconnect(entry);
-            entry.owner = 0; // Rebinding reuses the stable port slot with new generations.
-        };
-        return count != 0 or receivers_changed;
-    }
-    pub fn registerSource(self: *Store, owner: DriverOwner, adapter: u32) Error!abi.GfxReceiverSource {
-        if (owner.kind != .driver or !owner.valid() or owner.id > std.math.maxInt(u32) or adapter == 0) return error.Invalid;
-        if (self.source_serial == std.math.maxInt(u64) or self.revision == std.math.maxInt(u64)) return error.Exhausted;
-        for (&self.entries) |*entry| if (entry.info.identity.connector_id != 0 and entry.info.identity.adapter_id == adapter and
-            entry.owner != owner.id and !retiredPort(entry)) return error.Busy;
-        for (&self.sources) |*source| if (source.binding.generation != 0 and source.binding.adapter_id == adapter) return error.Busy;
-        for (&self.sources) |*source| if (source.binding.generation == 0) {
-            // stoppedDriver() already revoked these native ports when their
-            // queue retired. They carry no GPU ownership, active receiver or
-            // valid prior source. Reclaim metadata only after source admission
-            // has succeeded, so a failed registration cannot mutate the old
-            // catalog or resurrect a disconnected native generation.
-            var reclaimed = false;
-            for (&self.entries) |*entry| if (entry.info.identity.adapter_id == adapter and retiredPort(entry)) {
-                entry.* = .{};
-                reclaimed = true;
-            };
-            if (reclaimed) self.receiverChange();
-            self.source_serial += 1;
-            source.* = .{ .owner = owner, .binding = .{ .adapter_id = adapter, .generation = self.source_serial } };
-            return source.binding;
-        };
-        return error.Capacity;
-    }
-    fn retiredPort(entry: *const Entry) bool {
-        return entry.owner == 0 and entry.receiver_source == 0 and entry.info.identity.adapter_id != 0 and
-            entry.info.flags == 0 and entry.info.mode_count == 0 and entry.info.edid_bytes == 0;
-    }
-    fn receiverSource(self: *Store, owner: DriverOwner, binding: abi.GfxReceiverSource) Error!*Source {
-        if (binding.adapter_id == 0 or binding.generation == 0 or binding.reserved0 != 0) return error.Invalid;
-        for (&self.sources) |*source| if (source.binding.generation == binding.generation and
-            std.meta.eql(source.binding, binding) and source.owner.eql(owner)) return source;
-        return error.Stale;
-    }
-    // Metadata receivers cannot participate in a hardware commit. They may
-    // therefore be invalidated while unrelated BOs or commit tickets are held.
-    // Reserve the pending ticket's finish increment even at counter exhaustion.
-    fn receiverChange(self: *Store) void {
-        const ceiling = std.math.maxInt(u64) - @as(u64, @intFromBool(self.pending.id != 0));
-        if (self.revision < ceiling) self.revision += 1;
-    }
-    fn eraseReceivers(self: *Store, generation: u64) bool {
-        var changed = self.audio.erase(generation);
-        for (&self.entries) |*entry| if (entry.receiver_source == generation) {
-            entry.* = .{};
-            changed = true;
-        };
-        if (changed) self.receiverChange();
-        return changed;
-    }
-    pub fn closeSource(self: *Store, owner: DriverOwner, binding: abi.GfxReceiverSource) Error!bool {
-        const source = try self.receiverSource(owner, binding);
-        const changed = self.eraseReceivers(binding.generation);
-        source.* = .{};
-        return changed;
-    }
-    pub fn replaceReceivers(self: *Store, owner: DriverOwner, binding: abi.GfxReceiverSource,
-        sequence: u64, records: []const abi.GfxReceiverInfo) Error!void
-    {
-        const source = try self.receiverSource(owner, binding);
-        if (sequence == 0 or sequence <= source.sequence) return error.Stale;
-        if (records.len > abi.gfx_receiver_max_outputs) return error.Invalid;
-        const ceiling = std.math.maxInt(u64) - @as(u64, @intFromBool(self.pending.id != 0));
-        if (self.revision >= ceiling or self.receiver_serial > std.math.maxInt(u64) - records.len) return error.Exhausted;
-        var available: usize = 0;
-        for (&self.entries) |*entry| if (entry.info.identity.connector_id == 0 or entry.receiver_source == binding.generation) { available += 1; };
-        var required: usize = 0;
-        // Complete preflight before changing even one old receiver. The R4D
-        // owns these resident records exclusively for the whole callback.
-        for (records, 0..) |*record, i| {
-            try validReceiver(record);
-            for (records[0..i]) |*prior| if (record.connector_id == prior.connector_id) return error.Invalid;
-            if (!self.sourceOwnsPort(owner, binding.adapter_id, record.connector_id)) required += 1;
-        }
-        if (required > available) return error.Capacity;
-        for (&self.entries) |*entry| if (entry.receiver_source == binding.generation) { entry.* = .{}; };
-        self.revision += 1;
-        source.sequence = sequence;
-        self.audio.invalidate(binding.generation, sequence);
-        var slot: usize = 0;
-        for (records) |*record| {
-            // A native source publication replaces this port's metadata-only
-            // entry. Later receiver batches cannot overwrite its queue binding,
-            // geometry, active flags or identity. Other ports remain visible.
-            if (self.sourceOwnsPort(owner, binding.adapter_id, record.connector_id)) continue;
-            while (self.entries[slot].info.identity.connector_id != 0) : (slot += 1) {}
-            const entry = &self.entries[slot];
-            slot += 1;
-            self.receiver_serial += 1;
-            entry.* = .{ .owner = @intCast(owner.id), .receiver_source = binding.generation, .info = .{
-                .identity = .{ .adapter_id = binding.adapter_id, .device_generation = binding.generation,
-                    .connector_id = record.connector_id, .connection_generation = self.receiver_serial },
-                .topology_revision = self.revision, .flags = record.flags | abi.gfx_output_flag_receiver_only,
-                .connector_kind = record.connector_kind, .mode_count = record.mode_count,
-                .preferred_mode_id = record.preferred_mode_id, .edid_bytes = record.edid_bytes,
-                .limits = unknown_limits } };
-            @memcpy(entry.modes[0..record.mode_count], record.modes[0..record.mode_count]);
-            @memcpy(entry.edid[0..record.edid_bytes], record.edid[0..record.edid_bytes]);
-        }
-    }
-    fn sourceOwnsPort(self: *const Store, owner: DriverOwner, adapter: u32, connector: u32) bool {
-        for (&self.entries) |*entry| if (entry.receiver_source == 0 and entry.owner == owner.id and
-            entry.info.identity.adapter_id == adapter and entry.info.identity.connector_id == connector) return true;
-        return false;
-    }
-    pub fn publishAudio(self: *Store, owner: DriverOwner, value: *const abi.GfxAudioRoute) Error!void {
-        const source = try self.receiverSource(owner, value.source);
-        if (value.receiver_sequence != source.sequence) return error.Stale;
-        try self.audio.publish(value);
-    }
-    pub fn cursor(self: *const Store) abi.GfxDisplayRevision {
-        var present: u32 = 0;
-        for (&self.entries) |*entry| if (entry.info.identity.connector_id != 0) { present += 1; };
-        return .{ .revision = self.revision, .present = present };
-    }
+    pub fn find(self: *const Store, identity: abi.GfxOutputId) Error!*const Entry { return &self.entries[try self.result(usize, 1, .{ .identity = identity })]; }
+    pub fn infoAt(self: *const Store, index: u32) ?abi.GfxOutputInfo { const value = self.result(OptionalInfo, 2, .{ .index = index }) catch unreachable; return if (value.has) value.value else null; }
+    pub fn publishColor(self: *Store, owner: u32, value: abi.GfxOutputColorState) Error!bool { return self.result(bool, 3, .{ .owner = owner, .input = &value }); }
+    pub fn colorAt(self: *const Store, identity: abi.GfxOutputId) Error!abi.GfxOutputColorState { return self.result(abi.GfxOutputColorState, 4, .{ .identity = identity }); }
+    pub fn modeAt(self: *const Store, identity: abi.GfxOutputId, index: u32) Error!?abi.GfxOutputMode { const value = try self.result(OptionalMode, 5, .{ .identity = identity, .index = index }); return if (value.has) value.value else null; }
+    pub fn refreshEntry(self: *Store, target: abi.GfxOutputTarget) Error!*Entry { return &self.entries[try self.result(usize, 6, .{ .target = target })]; }
+    pub fn publishRefresh(self: *Store, owner: u32, value: abi.GfxOutputRefresh) Error!bool { return self.result(bool, 7, .{ .owner = owner, .input = &value }); }
+    pub fn refreshAt(self: *Store, target: abi.GfxOutputTarget) Error!abi.GfxOutputRefresh { return self.result(abi.GfxOutputRefresh, 8, .{ .target = target }); }
+    pub fn requestRefresh(self: *Store, actor: DriverOwner, input: abi.GfxRefreshRequest, now: u64) Error!abi.GfxRefreshRequest { return self.result(abi.GfxRefreshRequest, 9, .{ .actor = actor, .input = &input, .now = now }); }
+    pub fn readRefresh(self: *Store, owner: u32, target: abi.GfxOutputTarget, now: u64) Error!abi.GfxRefreshRequest { return self.result(abi.GfxRefreshRequest, 10, .{ .owner = owner, .target = target, .now = now }); }
+    pub fn powerEntry(self: *Store, identity: abi.GfxOutputId) Error!*Entry { return &self.entries[try self.result(usize, 11, .{ .identity = identity })]; }
+    pub fn publishPower(self: *Store, owner: u32, value: abi.GfxOutputPower) Error!bool { return self.result(bool, 12, .{ .owner = owner, .input = &value }); }
+    pub fn powerAt(self: *Store, identity: abi.GfxOutputId) Error!abi.GfxOutputPower { return self.result(abi.GfxOutputPower, 13, .{ .identity = identity }); }
+    pub fn requestPower(self: *Store, actor: DriverOwner, input: abi.GfxPowerRequest, now: u64) Error!abi.GfxPowerRequest { return self.result(abi.GfxPowerRequest, 14, .{ .actor = actor, .input = &input, .now = now }); }
+    pub fn readPower(self: *Store, owner: u32, identity: abi.GfxOutputId, now: u64) Error!abi.GfxPowerRequest { return self.result(abi.GfxPowerRequest, 15, .{ .owner = owner, .identity = identity, .now = now }); }
+    pub fn publishBrightness(self: *Store, owner: u32, value: abi.GfxOutputBrightness) Error!bool { return self.result(bool, 16, .{ .owner = owner, .input = &value }); }
+    pub fn brightnessAt(self: *Store, identity: abi.GfxOutputId) Error!abi.GfxOutputBrightness { return self.result(abi.GfxOutputBrightness, 17, .{ .identity = identity }); }
+    pub fn requestBrightness(self: *Store, actor: DriverOwner, input: abi.GfxBrightnessRequest) Error!abi.GfxBrightnessRequest { return self.result(abi.GfxBrightnessRequest, 18, .{ .actor = actor, .input = &input }); }
+    pub fn readBrightness(self: *Store, owner: u32, identity: abi.GfxOutputId) Error!abi.GfxBrightnessRequest { return self.result(abi.GfxBrightnessRequest, 19, .{ .owner = owner, .identity = identity }); }
+    pub fn withdraw(self: *Store, owner: u32, identity: abi.GfxOutputId) Error!void { try self.call(20, .{ .owner = owner, .identity = identity }, null); }
+    pub fn pause(self: *Store, owner: u32, identity: abi.GfxOutputId, paused: bool, primary: bool) Error!bool { return self.result(bool, 21, .{ .owner = owner, .identity = identity, .flag = paused, .other_flag = primary }); }
+    pub fn stop(self: *Store, owner: u32) Error!bool { return self.result(bool, 22, .{ .owner = owner }); }
+    pub fn registerSource(self: *Store, owner: DriverOwner, adapter: u32) Error!abi.GfxReceiverSource { return self.result(abi.GfxReceiverSource, 23, .{ .actor = owner, .index = adapter }); }
+    pub fn closeSource(self: *Store, owner: DriverOwner, binding: abi.GfxReceiverSource) Error!bool { return self.result(bool, 24, .{ .actor = owner, .binding = binding }); }
+    pub fn replaceReceivers(self: *Store, owner: DriverOwner, binding: abi.GfxReceiverSource, sequence: u64, records: []const abi.GfxReceiverInfo) Error!void { try self.call(25, .{ .actor = owner, .binding = binding, .sequence = sequence, .records = records.ptr, .records_len = records.len }, null); }
+    pub fn publishAudio(self: *Store, owner: DriverOwner, value: *const abi.GfxAudioRoute) Error!void { try self.call(26, .{ .actor = owner, .input = value }, null); }
+    pub fn cursor(self: *const Store) abi.GfxDisplayRevision { return self.result(abi.GfxDisplayRevision, 27, .{}) catch unreachable; }
     pub fn validate(self: *const Store, state: *const abi.GfxAtomicState, facts: []const Fact) Error!abi.GfxAtomicResult {
-        if (!header(state.*) or state.reserved0 != 0 or state.count == 0 or state.count > abi.gfx_output_max_assignments or facts.len != state.count) return error.Invalid;
-        if (state.topology_revision != self.revision) return error.Stale;
-        if (self.pending.id != 0 or self.retained != 0) return error.Busy;
-        for (state.assignments[state.count..]) |entry| if (!std.meta.eql(entry, abi.GfxScanoutState{})) return error.Invalid;
-        var heads: u32 = 0; var planes: u32 = 0; var plls: u32 = 0;
-        var bandwidth: u128 = 0; var clocks: u128 = 0;
-        const adapter = state.assignments[0].output;
-        var limits: abi.GfxDisplayLimits = .{};
-        for (state.assignments[0..state.count], facts, 0..) |assignment, fact, i| {
-            if (!header(assignment) or assignment.reserved0 != 0 or assignment.buffer.reserved0 != 0 or
-                assignment.output.adapter_id != adapter.adapter_id or assignment.output.device_generation != adapter.device_generation) return error.Invalid;
-            const entry = try self.find(assignment.output);
-            if (entry.info.flags & abi.gfx_output_flag_connected == 0) return error.Stale;
-            if (entry.info.flags & abi.gfx_output_flag_receiver_only != 0) return error.Unsupported;
-            if (i == 0) limits = entry.info.limits else if (!std.meta.eql(limits, entry.info.limits)) return error.Invalid;
-            for (state.assignments[0..i]) |prior| if (prior.output.connector_id == assignment.output.connector_id) return error.Routing;
-            const hb = try bit(assignment.head_id); const pb = try bit(assignment.plane_id); const cb = try bit(assignment.pll_id);
-            if (hb & entry.info.possible_heads == 0 or pb & entry.info.possible_planes == 0 or cb & entry.info.possible_plls == 0 or
-                heads & hb != 0 or planes & pb != 0 or plls & cb != 0) return error.Routing;
-            heads |= hb; planes |= pb; plls |= cb;
-            var selected: ?abi.GfxOutputMode = null;
-            for (entry.modes[0..entry.info.mode_count]) |candidate| if (candidate.mode_id == assignment.mode_id) { selected = candidate; break; };
-            const chosen = selected orelse return error.Stale;
-            if (assignment.rotation > 3 or assignment.color > 3 or assignment.bits_per_color > 16 or assignment.bits_per_color < 6 or
-                limits.rotations & (try bit(assignment.rotation)) == 0 or limits.colors & (try bit(assignment.color)) == 0 or
-                limits.bpc_mask & (try bit(assignment.bits_per_color)) == 0) return error.Unsupported;
-            if (chosen.flags & abi.gfx_output_mode_interlaced != 0 and limits.flags & abi.gfx_output_limit_interlace == 0) return error.Unsupported;
-            if (chosen.flags & abi.gfx_output_mode_420_only != 0 and assignment.color != 3) return error.Unsupported;
-            if (assignment.color == 3 and chosen.flags & (abi.gfx_output_mode_420_only | abi.gfx_output_mode_420_allowed) == 0) return error.Unsupported;
-            if (!fits(chosen.width, assignment.destination_x, assignment.destination_width) or
-                !fits(chosen.height, assignment.destination_y, assignment.destination_height)) return error.Invalid;
-            const sw = if (assignment.rotation & 1 == 0) assignment.source_width else assignment.source_height;
-            const sh = if (assignment.rotation & 1 == 0) assignment.source_height else assignment.source_width;
-            if ((sw != assignment.destination_width or sh != assignment.destination_height) and limits.flags & abi.gfx_output_limit_scaling == 0) return error.Unsupported;
-            if (assignment.source_width > limits.max_width or assignment.source_height > limits.max_height or chosen.width > limits.max_width or chosen.height > limits.max_height) return error.Unsupported;
-            if (fact.dependency == .pending) return error.Busy;
-            if (fact.dependency == .failed) return error.Dependency;
-            if (std.meta.eql(assignment.ready_fence, abi.GfxFence{}) != (fact.dependency == .none)) return error.Invalid;
-            const firmware = entry.info.flags & (abi.gfx_output_flag_fixed_geometry | abi.gfx_output_flag_firmware_snapshot) ==
-                (abi.gfx_output_flag_fixed_geometry | abi.gfx_output_flag_firmware_snapshot);
-            if (firmware) {
-                if (state.count != 1 or !std.meta.eql(assignment.buffer, abi.GfxBufferHandle{}) or fact.buffer != null or fact.dependency != .none or
-                    assignment.rotation != 0 or assignment.color != 0 or assignment.bits_per_color != 8 or
-                    assignment.source_x != 0 or assignment.source_y != 0 or assignment.destination_x != 0 or assignment.destination_y != 0 or
-                    assignment.source_width != chosen.width or assignment.source_height != chosen.height or
-                    assignment.destination_width != chosen.width or assignment.destination_height != chosen.height) return error.Unsupported;
-                continue;
-            }
-            if (limits.flags & abi.gfx_output_limit_modeset == 0 or chosen.flags & abi.gfx_output_mode_geometry_only != 0) return error.Unsupported;
-            const descriptor = fact.buffer orelse return error.Invalid;
-            if (assignment.buffer.id == 0 or assignment.buffer.generation == 0) return error.Invalid;
-            _ = bo.validate(descriptor) catch return error.Invalid;
-            if (!descriptor.binding.portable() and (descriptor.binding.adapter != adapter.adapter_id or descriptor.binding.device_generation != adapter.device_generation)) return error.Stale;
-            if (descriptor.usage & bo.Usage.scanout == 0 or descriptor.modifier != 0 or limits.modifiers & 1 == 0) return error.Unsupported;
-            // YUV memory plane/subsampling and non-linear modifiers require an
-            // explicit validated scanout format path; never guess byte layout.
-            const format: u32 = switch (descriptor.format) { .xrgb8888 => 1, .argb8888 => 2, else => return error.Unsupported };
-            if (limits.formats & format == 0 or descriptor.plane_count != 1 or descriptor.planes[0].pitch % limits.pitch_alignment != 0) return error.Unsupported;
-            if (!fits(descriptor.width, assignment.source_x, assignment.source_width) or !fits(descriptor.height, assignment.source_y, assignment.source_height)) return error.Invalid;
-            clocks += chosen.pixel_clock_hz;
-            bandwidth += (@as(u128, descriptor.planes[0].pitch) * descriptor.height * chosen.refresh_millihz + 999) / 1000;
-            if (chosen.pixel_clock_hz > limits.max_pixel_clock_hz or clocks > limits.total_pixel_clock_hz or bandwidth > limits.bandwidth_bytes_per_second) return error.Bandwidth;
-        }
-        return .{ .topology_revision = self.revision, .commit_sequence = self.commit_sequence };
+        if (facts.len > abi.gfx_output_max_assignments) return error.Invalid;
+        var projected: [abi.gfx_output_max_assignments]NativeFact = undefined; projectFacts(facts, &projected);
+        return self.result(abi.GfxAtomicResult, 28, .{ .input = state, .facts = &projected, .facts_len = facts.len });
     }
     pub fn begin(self: *Store, state: *const abi.GfxAtomicState, facts: []const Fact) Error!Ticket {
-        _ = try self.validate(state, facts);
-        try self.canChange();
-        if (self.attempt == std.math.maxInt(u64) or self.commit_sequence == std.math.maxInt(u64)) return error.Exhausted;
-        self.attempt += 1;
-        self.pending = .{ .id = self.attempt };
-        return self.pending;
+        if (facts.len > abi.gfx_output_max_assignments) return error.Invalid;
+        var projected: [abi.gfx_output_max_assignments]NativeFact = undefined; projectFacts(facts, &projected);
+        return self.result(Ticket, 29, .{ .input = state, .facts = &projected, .facts_len = facts.len });
     }
-    // The caller owns real old/new BO leases. Outcome alone cannot authorize
-    // release: applied needs old quiescence; rollback needs new quiescence.
-    pub fn finish(self: *Store, ticket: Ticket, outcome: u32, quiesced: u32) Error!abi.GfxAtomicResult {
-        if (ticket.id == 0 or ticket.id != self.pending.id) return error.Stale;
-        if (quiesced & ~@as(u32, 3) != 0) return error.Invalid;
-        const retain: u32 = switch (outcome) {
-            abi.gfx_output_outcome_applied => if (quiesced & 1 != 0) 2 else return error.Busy,
-            abi.gfx_output_outcome_old_preserved => if (quiesced & 2 != 0) 1 else return error.Busy,
-            abi.gfx_output_outcome_lost => 3 & ~quiesced,
-            else => return error.Invalid,
-        };
-        self.pending = .{};
-        self.revision += 1;
-        if (outcome == abi.gfx_output_outcome_applied) self.commit_sequence += 1;
-        if (outcome == abi.gfx_output_outcome_lost) self.retained = retain;
-        return .{ .topology_revision = self.revision, .commit_sequence = self.commit_sequence, .outcome = outcome, .retained = retain };
-    }
-    // The caller has retired both surfaces after a proven device stop. The
-    // ticket must still identify the latest transaction, including a LOST
-    // apply whose pending slot was already consumed by finish().
-    pub fn retireAfterReset(self: *Store, ticket: Ticket) Error!void {
-        if (ticket.id == 0 or ticket.id != self.attempt or
-            (self.pending.id != 0 and self.pending.id != ticket.id)) return error.Stale;
-        if (self.reset_retired.id == ticket.id) return;
-        if (self.revision == std.math.maxInt(u64)) return error.Exhausted;
-        self.pending = .{};
-        self.retained = 0;
-        self.reset_retired = ticket;
-        self.revision += 1;
-    }
+    pub fn finish(self: *Store, ticket: Ticket, outcome: u32, quiesced: u32) Error!abi.GfxAtomicResult { return self.result(abi.GfxAtomicResult, 30, .{ .ticket = ticket, .outcome = outcome, .quiesced = quiesced }); }
+    pub fn retireAfterReset(self: *Store, ticket: Ticket) Error!void { try self.call(31, .{ .ticket = ticket }, null); }
 };
-fn header(value: anytype) bool { return value.version == 1 and value.size >= @sizeOf(@TypeOf(value)); }
-// Bounded wire validation only. EDID, transfer functions, profiles and
-// source/link eligibility are owned by the publishing driver and userland.
-fn validColor(value: abi.GfxOutputColorState) bool {
-    if (!header(value) or value.reserved0 != 0 or !validColorLink(value) or value.flags & ~@as(u32, 127) != 0 or
-        value.flags & abi.gfx_output_color_known == 0 or value.formats & ~@as(u32, 3) != 0 or
-        value.depths & ~@as(u32, 3) != 0 or value.color_spaces & ~@as(u32, 3) != 0 or
-        value.transfers & ~@as(u32, 13) != 0 or value.ranges & ~@as(u32, 3) != 0 or
-        value.gamma_entries > 65536 or value.degamma_entries > 65536 or value.ctm_fraction_bits > 32) return false;
-    if (value.flags & abi.gfx_output_color_active == 0) return value.format == 0 and value.bpc == 0 and value.primaries == 0 and
-        value.transfer == 0 and value.range == 0 and value.reference_white == 0 and value.peak == 0 and value.black == 0;
-    const format: u32 = switch (value.format) { abi.gfx_buffer_format_xrgb8888 => 1, abi.gfx_buffer_format_xrgb2101010 => 2, else => return false };
-    const depth: u32 = switch (value.bpc) { 8 => 1, 10 => 2, else => return false };
-    const primaries: u32 = switch (value.primaries) { 1 => 1, 3 => 2, else => return false };
-    const transfer: u32 = switch (value.transfer) { 1 => 1, 3 => 4, 4 => 8, else => return false };
-    const range: u32 = switch (value.range) { 1 => 1, 2 => 2, else => return false };
-    return value.formats & format != 0 and value.depths & depth != 0 and value.color_spaces & primaries != 0 and
-        value.transfers & transfer != 0 and value.ranges & range != 0 and value.reference_white != 0 and value.peak != 0;
-}
-fn validColorLink(value: abi.GfxOutputColorState) bool {
-    if (value.reserved_link != 0 or value.link_kind > abi.gfx_output_link_dp_mst or value.link_flags & ~@as(u32, 3) != 0 or
-        value.dsc_depths & ~@as(u32, 3) != 0 or value.max_frl_rate > 6 or value.compressed_bpp_x16 > 1023 or value.link_lanes > 4) return false;
-    if (value.link_kind == 0 or value.flags & abi.gfx_output_color_active == 0) return value.link_kind == 0 and
-        value.link_flags == 0 and value.compressed_bpp_x16 == 0 and value.link_lanes == 0 and value.link_rate_mbps == 0 and
-        value.h_active == 0 and value.h_total == 0 and value.v_active == 0 and value.link_payload_bits_per_second == 0 and
-        value.pixel_clock_numerator == 0 and value.pixel_clock_denominator == 0;
-    return (value.compressed_bpp_x16 != 0) == (value.link_flags & abi.gfx_output_link_dsc != 0) and
-        value.h_active != 0 and value.h_total > value.h_active and value.v_active != 0 and
-        value.pixel_clock_numerator != 0 and value.pixel_clock_denominator != 0;
+const NativeFact = extern struct { has_buffer: bool, buffer: bo.Descriptor, dependency: u32 };
+fn projectFacts(input: []const Fact, output: *[abi.gfx_output_max_assignments]NativeFact) void { for (input, 0..) |value, i| output[i] = .{ .has_buffer = value.buffer != null, .buffer = value.buffer orelse .{ .bytes = 0 }, .dependency = @intFromEnum(value.dependency) }; }
+const Args = extern struct {
+    owner: u32 = 0, actor: DriverOwner = .{ .kind = .kernel, .id = 0, .generation = 0 },
+    identity: abi.GfxOutputId = .{}, target: abi.GfxOutputTarget = .{}, binding: abi.GfxReceiverSource = .{}, sequence: u64 = 0, index: u32 = 0,
+    ticket: Ticket = .{}, outcome: u32 = 0, quiesced: u32 = 0, flag: bool = false, other_flag: bool = false, now: u64 = 0,
+    input: ?*const anyopaque = null, modes: ?[*]const abi.GfxOutputMode = null, modes_len: usize = 0, edid: ?[*]const u8 = null, edid_len: usize = 0,
+    facts: ?[*]const NativeFact = null, facts_len: usize = 0, records: ?[*]const abi.GfxReceiverInfo = null, records_len: usize = 0,
+};
+const OptionalInfo = extern struct { has: bool, value: abi.GfxOutputInfo };
+const OptionalMode = extern struct { has: bool, value: abi.GfxOutputMode };
+extern fn r4os_rust_display_output_state(*const Store, u32, *const Args, ?*anyopaque) i32;
+fn status(code: i32) Error!void { return switch (code) { 0 => {}, 1 => error.Invalid, 3 => error.Unsupported, 4 => error.Exhausted, 6 => error.Capacity, 7 => error.Stale, 8 => error.Busy, 17 => error.Bandwidth, 18 => error.Routing, 19 => error.Dependency, else => unreachable }; }
+comptime {
+    if (@sizeOf(Source) != 48 or @sizeOf(NativeFact) != 144 or @offsetOf(NativeFact, "buffer") != 8 or @offsetOf(NativeFact, "dependency") != 136 or @sizeOf(Ticket) != 8) @compileError("Native output owner/facts C layout");
+    if (@sizeOf(Entry) != 9360 or @alignOf(Entry) != 8 or @offsetOf(Entry, "info") != 24 or @offsetOf(Entry, "color_data") != 200 or @offsetOf(Entry, "refresh") != 392 or @offsetOf(Entry, "power") != 800 or @offsetOf(Entry, "brightness") != 1008 or @offsetOf(Entry, "modes") != 1168 or @offsetOf(Entry, "edid") != 5264) @compileError("Native output entry C layout");
+    if (@sizeOf(Store) != 611136 or @alignOf(Store) != 8 or @offsetOf(Store, "audio") != 599040 or @offsetOf(Store, "sources") != 610304 or @offsetOf(Store, "source_serial") != 611072 or @offsetOf(Store, "reset_retired") != 611128) @compileError("Native output catalog C layout");
+    if (@sizeOf(Args) != 240 or @offsetOf(Args, "actor") != 8 or @offsetOf(Args, "input") != 168 or @offsetOf(Args, "records_len") != 232 or @sizeOf(OptionalInfo) != 176 or @sizeOf(OptionalMode) != 72) @compileError("Native output call C layout");
 }
 pub const unknown_limits = blk: {
     var value = std.mem.zeroes(abi.GfxDisplayLimits);
@@ -558,54 +113,10 @@ pub const unknown_limits = blk: {
     value.size = @sizeOf(abi.GfxDisplayLimits);
     break :blk value;
 };
-pub fn driverTable(output: *abi.GfxDriverOutputApi, functions: abi.GfxDriverOutputApi) i32 {
-    if (@intFromPtr(output) == 0 or output.version != 1 or output.size < 24) return abi.gfx_output_error_invalid;
-    var value = functions;
-    value.size = @min(output.size & ~@as(u32, 7), @sizeOf(abi.GfxDriverOutputApi));
-    @memcpy(@as([*]u8, @ptrCast(output))[0..value.size], std.mem.asBytes(&value)[0..value.size]);
-    return abi.gfx_output_ok;
-}
-fn validReceiver(value: *const abi.GfxReceiverInfo) Error!void {
-    const flags = abi.gfx_output_flag_connected | abi.gfx_output_flag_connection_unknown |
-        abi.gfx_output_flag_edid_missing | abi.gfx_output_flag_edid_invalid |
-        abi.gfx_output_flag_receiver_incomplete | abi.gfx_output_flag_query_failed;
-    if (value.connector_id == 0 or value.reserved0 != 0 or value.flags & ~flags != 0 or
-        (value.connector_kind > abi.gfx_output_kind_virtual and value.connector_kind != abi.gfx_output_kind_dvi) or value.mode_count > abi.gfx_output_max_modes or
-        value.edid_bytes > abi.gfx_output_max_edid_bytes or value.edid_bytes % 128 != 0) return error.Invalid;
-    const connected = value.flags & abi.gfx_output_flag_connected != 0;
-    if (connected and value.flags & abi.gfx_output_flag_connection_unknown != 0) return error.Invalid;
-    if (!connected and (value.mode_count != 0 or value.edid_bytes != 0 or value.preferred_mode_id != 0 or
-        value.flags & (abi.gfx_output_flag_edid_missing | abi.gfx_output_flag_edid_invalid) != 0)) return error.Invalid;
-    if (value.flags & abi.gfx_output_flag_edid_missing != 0 and value.edid_bytes != 0) return error.Invalid;
-    if (value.flags & abi.gfx_output_flag_edid_invalid != 0 and value.mode_count != 0) return error.Invalid;
-    var preferred = value.preferred_mode_id == 0;
-    for (value.modes[0..value.mode_count], 0..) |mode, i| {
-        if (!validMode(mode) or mode.flags & abi.gfx_output_mode_geometry_only != 0) return error.Invalid;
-        for (value.modes[0..i]) |prior| if (prior.mode_id == mode.mode_id) return error.Invalid;
-        if (mode.mode_id == value.preferred_mode_id) preferred = true;
-    }
-    if (!preferred) return error.Invalid;
-}
-fn bit(index: u32) Error!u32 { if (index >= 32) return error.Routing; return @as(u32, 1) << @as(u5, @intCast(index)); }
-fn fits(total: u32, offset: u32, size: u32) bool { return size != 0 and offset < total and size <= total - offset; }
-fn validLimits(value: abi.GfxDisplayLimits) Error!void {
-    if (value.head_mask == 0 or value.plane_mask == 0 or value.pll_mask == 0 or value.rotations == 0 or value.rotations & ~@as(u32, 15) != 0 or
-        value.colors == 0 or value.colors & ~@as(u32, 15) != 0 or value.bpc_mask & 0x1_5555 == 0 or value.bpc_mask & ~@as(u32, 0x1_5540) != 0 or
-        value.flags & ~@as(u32, 7) != 0 or !std.math.isPowerOfTwo(value.pitch_alignment) or value.pitch_alignment > 65536 or
-        value.max_width == 0 or value.max_height == 0 or value.max_width > 65536 or value.max_height > 65536 or value.formats == 0 or
-        value.formats & ~@as(u32, 15) != 0 or value.modifiers != 1) return error.Invalid;
-    if (value.flags & abi.gfx_output_limit_modeset != 0 and (value.bandwidth_bytes_per_second == 0 or value.max_pixel_clock_hz == 0 or value.total_pixel_clock_hz == 0)) return error.Invalid;
-}
-pub fn validMode(mode: abi.GfxOutputMode) bool {
-    if (!header(mode) or mode.reserved0 != 0 or mode.mode_id == 0 or mode.width == 0 or mode.height == 0 or mode.width > 65536 or mode.height > 65536 or mode.flags & ~@as(u32, 127) != 0) return false;
-    if (mode.flags & abi.gfx_output_mode_geometry_only != 0) return mode.pixel_clock_hz == 0 and mode.refresh_millihz == 0 and mode.h_total == 0 and mode.v_total == 0 and
-        mode.h_sync_start == 0 and mode.h_sync_end == 0 and mode.v_sync_start == 0 and mode.v_sync_end == 0;
-    if (mode.pixel_clock_hz == 0 or mode.pixel_clock_hz > 20_000_000_000 or mode.h_total > 131072 or mode.v_total > 131072 or
-        mode.width > mode.h_sync_start or mode.h_sync_start >= mode.h_sync_end or mode.h_sync_end > mode.h_total or
-        mode.height > mode.v_sync_start or mode.v_sync_start >= mode.v_sync_end or mode.v_sync_end > mode.v_total) return false;
-    const expected = mode.pixel_clock_hz * 1000 * (if (mode.flags & 1 != 0) @as(u64, 2) else 1) / (@as(u64, mode.h_total) * mode.v_total);
-    return expected > 0 and expected == mode.refresh_millihz;
-}
+pub fn driverTable(output: *abi.GfxDriverOutputApi, functions: abi.GfxDriverOutputApi) i32 { return r4os_rust_display_output_driver_table(output, &functions); }
+pub fn validMode(value: abi.GfxOutputMode) bool { return r4os_rust_display_output_valid_mode(&value); }
+extern fn r4os_rust_display_output_driver_table(*abi.GfxDriverOutputApi, *const abi.GfxDriverOutputApi) i32;
+extern fn r4os_rust_display_output_valid_mode(*const abi.GfxOutputMode) bool;
 
 fn testMode() abi.GfxOutputMode {
     return .{ .mode_id = 1, .flags = 8, .width = 640, .height = 480, .pixel_clock_hz = 25175000,

@@ -1,3 +1,5 @@
+//! Private fixed C projection. The enclosing display owner remains the caller.
+comptime { if (@import("builtin").is_test) _ = @import("rust_owner_test"); }
 // One display owner, independent of GPU family and the CPU blit optimization.
 // The DisplayManager serializes mutations; this module never touches hardware.
 pub const State = enum(u32) { unavailable, bootfb, preparing, native, software_native, recovering };
@@ -5,7 +7,7 @@ pub const Policy = enum(u32) { automatic, software, software_once };
 pub const Reason = enum(u32) { none, no_native_backend, policy_disabled, backend_rejected, prepare_failed, commit_failed, device_lost, restore_failed };
 pub const Error = error{ Invalid, Busy, Disabled, Stale, Exhausted };
 
-pub const Snapshot = struct {
+pub const Snapshot = extern struct {
     state: State = .unavailable,
     policy: Policy = .automatic,
     reason: Reason = .no_native_backend,
@@ -19,236 +21,44 @@ pub const Snapshot = struct {
     pending_generation: u64 = 0,
 };
 
-pub const Manager = struct {
-    value: Snapshot = .{},
-    serial: u64 = 0,
-    recovering_preparation: bool = false,
-    restored_boot: ?struct { owner: usize, adapter: u32, generation: u64 } = null,
-
-    pub fn initBoot(self: *Manager) void {
-        self.* = .{ .serial = 1, .value = .{ .state = .bootfb, .revision = 1, .generation = 1 } };
-    }
-
-    pub fn setPolicy(self: *Manager, policy: Policy) Error!void {
-        if (self.value.state != .bootfb and self.value.state != .unavailable) return error.Busy;
-        if (self.value.owner != 0 or self.value.pending_owner != 0) return error.Busy;
-        self.value.policy = policy;
-        self.value.reason = if (policy == .automatic) .no_native_backend else .policy_disabled;
-        self.changed();
-    }
-
-    pub fn reject(self: *Manager, reason: Reason) void {
-        if (self.value.state != .bootfb or self.value.policy != .automatic) return;
-        self.value.reason = reason;
-        self.changed();
-    }
-
-    // Preparation is allocation/query only: the old scanout remains valid.
-    pub fn begin(self: *Manager, owner: usize, adapter_id: u32) Error!u64 {
-        if (owner == 0 or owner > ~@as(u32, 0) or adapter_id == 0) return error.Invalid;
-        if (self.value.policy != .automatic) return error.Disabled;
-        if (self.value.state != .bootfb) return error.Busy;
-        const generation = try self.nextGeneration();
-        self.value.state = .preparing;
-        self.value.pending_owner = owner;
-        self.value.pending_adapter_id = adapter_id;
-        self.value.pending_generation = generation;
-        self.changed();
-        return generation;
-    }
-
-    pub fn abort(self: *Manager, owner: usize, generation: u64, reason: Reason) Error!void {
-        try self.checkPending(owner, generation);
-        self.value.state = if (self.recovering_preparation) .unavailable else .bootfb;
-        self.value.reason = if (self.recovering_preparation) .restore_failed else reason;
-        self.recovering_preparation = false;
-        self.clearPending();
-        self.changed();
-    }
-
-    pub fn commit(self: *Manager, owner: usize, generation: u64, software: bool) Error!void {
-        try self.checkPending(owner, generation);
-        self.adoptPending();
-        self.value.state = if (software) .software_native else .native;
-        self.value.reason = .none;
-        self.changed();
-    }
-
-    // An uncertain hardware failure retains the candidate owner. It may own
-    // DMA/IRQs even though there is no confirmed output; it cannot be unloaded.
-    pub fn failCommit(self: *Manager, owner: usize, generation: u64) Error!void {
-        try self.checkPending(owner, generation);
-        self.adoptPending();
-        self.value.state = .unavailable;
-        self.value.reason = .commit_failed;
-        self.changed();
-    }
-
-    pub fn beginRecovery(self: *Manager, owner: usize, generation: u64) Error!u64 {
-        try self.checkActive(owner, generation);
-        if (self.value.state != .native and self.value.state != .software_native and self.value.state != .unavailable) return error.Busy;
-        if (self.value.reset_generation == ~@as(u64, 0)) return error.Exhausted;
-        const next = try self.nextGeneration();
-        self.value.generation = next;
-        self.value.reset_generation += 1;
-        self.value.state = .recovering;
-        self.value.reason = .device_lost;
-        self.changed();
-        return next;
-    }
-
-    /// Firmware startup can fail while the immutable boot hold is still a
-    /// pending display owner. Logical reset adopts that owner without ever
-    /// reopening bootfb; physical quiescence is supplied by the driver later.
-    pub fn beginDeviceReset(self: *Manager, owner: usize, generation: u64) Error!u64 {
-        // The enclosing display owner admits this only after the previous
-        // reset's consumers retired. Headless GPU work does not reprepare
-        // scanout, so it deliberately leaves this display state recovering.
-        if (self.value.state == .recovering) {
-            try self.checkActive(owner, generation);
-            if (self.value.reset_generation == ~@as(u64, 0)) return error.Exhausted;
-            const next = try self.nextGeneration();
-            self.value.generation = next;
-            self.value.reset_generation += 1;
-            self.changed();
-            return next;
+const Restored = extern struct { owner: usize = 0, adapter: u32 = 0, generation: u64 = 0 };
+const Args = extern struct { owner: usize = 0, generation: u64 = 0, adapter: u32 = 0, reason: u32 = 0, flag: bool = false };
+extern fn r4os_rust_display_backend(u32, *const Manager, *const Args, *u64) i32;
+pub const Manager = extern struct {
+    value: Snapshot = .{}, serial: u64 = 0, recovering_preparation: bool = false,
+    has_restored_boot: bool = false, restored_boot: Restored = .{},
+    fn invoke(self: *const Manager, op: u32, args: Args) Error!u64 {
+        var value: u64 = undefined;
+        switch (r4os_rust_display_backend(op, self, &args, &value)) {
+            0 => return value, 1 => return error.Invalid, 3 => return error.Disabled,
+            4 => return error.Exhausted, 7 => return error.Stale, 8 => return error.Busy,
+            15 => return error.Disabled, else => unreachable,
         }
-        if (self.value.state != .preparing) return self.beginRecovery(owner, generation);
-        try self.checkPending(owner, generation);
-        if (self.value.reset_generation == ~@as(u64, 0)) return error.Exhausted;
-        const next = try self.nextGeneration();
-        self.adoptPending();
-        self.value.generation = next;
-        self.value.reset_generation += 1;
-        self.value.state = .recovering;
-        self.value.reason = .device_lost;
-        self.changed();
-        return next;
     }
-
-    pub fn restoredBootOwner(self: *const Manager, owner: usize, generation: u64, adapter: u32) bool {
-        const restored = self.restored_boot orelse return false;
-        return self.value.state == .bootfb and self.value.owner == 0 and self.value.pending_owner == 0 and
-            self.value.generation == generation and restored.generation == generation and
-            restored.owner == owner and restored.adapter == adapter and owner != 0 and adapter != 0;
-    }
-
-    /// The enclosing owner permits this only during system shutdown. Restored
-    /// bootfb has no public GPU queue, but its resident hardware owner still
-    /// needs a new physical stop, not the reset proof used to reconstruct it.
-    pub fn beginRestoredBootReset(self: *Manager, owner: usize, generation: u64, adapter: u32) Error!u64 {
-        if (!self.restoredBootOwner(owner, generation, adapter)) return error.Stale;
-        if (self.value.reset_generation == ~@as(u64, 0)) return error.Exhausted;
-        const next = try self.nextGeneration();
-        self.value.generation = next;
-        self.value.reset_generation += 1;
-        self.value.owner = owner;
-        self.value.adapter_id = adapter;
-        self.value.state = .recovering;
-        self.value.reason = .device_lost;
-        self.restored_boot = null;
-        self.changed();
-        return next;
-    }
-
-    /// Only the enclosing display/driver bridge may call this after old
-    /// consumers have retired under proven GPU stop. The held boot snapshot
-    /// retains its own identity; the replacement gets a fresh generation.
-    pub fn reprepare(self: *Manager, owner: usize, generation: u64, adapter: u32) Error!u64 {
-        try self.checkActive(owner, generation);
-        if (self.value.state != .recovering) return error.Busy;
-        if (adapter == 0 or adapter != self.value.adapter_id) return error.Stale;
-        const next = try self.nextGeneration();
-        self.value.state = .preparing;
-        self.value.pending_owner = owner;
-        self.value.pending_adapter_id = adapter;
-        self.value.pending_generation = next;
-        self.recovering_preparation = true;
-        self.changed();
-        return next;
-    }
-
-    pub fn recoveryFailed(self: *Manager, owner: usize, generation: u64) Error!void {
-        try self.checkActive(owner, generation);
-        if (self.value.state != .recovering) return error.Busy;
-        self.value.state = .unavailable;
-        self.value.reason = .restore_failed;
-        self.changed();
-    }
-
-    // Only after the device owner confirms both hardware quiescence and the
-    // original boot scanout. Software metadata alone cannot establish either.
-    pub fn restoreBoot(self: *Manager, owner: usize, generation: u64) Error!void {
-        try self.checkActive(owner, generation);
-        if (self.value.state != .recovering) return error.Busy;
-        const next = try self.nextGeneration();
-        const policy = self.value.policy;
-        const revision = self.value.revision;
-        self.restored_boot = .{ .owner = owner, .adapter = self.value.adapter_id, .generation = next };
-        self.value = .{ .state = .bootfb, .policy = policy, .reason = .device_lost, .revision = revision, .generation = next };
-        self.changed();
-    }
-
-    // Terminal shutdown after confirmed reset retirement. There is no claim
-    // that the original scanout or its pixels have been restored.
-    pub fn finishTerminal(self: *Manager, owner: usize, generation: u64) Error!void {
-        try self.checkActive(owner, generation);
-        if (self.value.state != .recovering) return error.Busy;
-        const next = try self.nextGeneration();
-        self.value = .{ .state = .unavailable, .policy = self.value.policy, .reason = .device_lost,
-            .revision = self.value.revision, .generation = next, .reset_generation = self.value.reset_generation };
-        self.recovering_preparation = false;
-        self.changed();
-    }
-
-    pub fn checkPending(self: *const Manager, owner: usize, generation: u64) Error!void {
-        if (owner == 0 or generation == 0 or self.value.state != .preparing or
-            self.value.pending_owner != owner or self.value.pending_generation != generation) return error.Stale;
-    }
-
-    pub fn checkActive(self: *const Manager, owner: usize, generation: u64) Error!void {
-        if (owner == 0 or generation == 0 or self.value.owner != owner or self.value.generation != generation) return error.Stale;
-    }
-
-    // A mode transaction keeps the same driver incarnation and boot hold.
-    // Only its real receipt can republish native output after uncertainty.
-    pub fn modeResult(self: *Manager, owner: usize, generation: u64, confirmed: bool) Error!void {
-        try self.checkActive(owner, generation);
-        if (self.value.state != .software_native and self.value.state != .unavailable) return error.Busy;
-        self.value.state = if (confirmed) .software_native else .unavailable;
-        self.value.reason = if (confirmed) .none else .commit_failed;
-        self.changed();
-    }
-
-    pub fn retainsOwner(self: *const Manager, owner: usize) bool {
-        return owner != 0 and (self.value.owner == owner or self.value.pending_owner == owner);
-    }
-
-    fn adoptPending(self: *Manager) void {
-        self.value.owner = self.value.pending_owner;
-        self.value.adapter_id = self.value.pending_adapter_id;
-        self.value.generation = self.value.pending_generation;
-        if (self.value.reset_generation == 0) self.value.reset_generation = 1;
-        self.recovering_preparation = false;
-        self.clearPending();
-    }
-
-    fn clearPending(self: *Manager) void {
-        self.value.pending_owner = 0;
-        self.value.pending_adapter_id = 0;
-        self.value.pending_generation = 0;
-    }
-
-    fn nextGeneration(self: *Manager) Error!u64 {
-        if (self.serial == ~@as(u64, 0)) return error.Exhausted;
-        self.serial += 1;
-        return self.serial;
-    }
-
-    fn changed(self: *Manager) void {
-        self.value.revision +|= 1;
-    }
+    pub fn initBoot(self: *Manager) void { _ = self.invoke(0, .{  }) catch unreachable; }
+    pub fn setPolicy(self: *Manager, policy: Policy) Error!void { _ = try self.invoke(1, .{ .reason = @intFromEnum(policy) }); }
+    pub fn reject(self: *Manager, reason: Reason) void { _ = self.invoke(2, .{ .reason = @intFromEnum(reason) }) catch unreachable; }
+    pub fn begin(self: *Manager, owner: usize, adapter_id: u32) Error!u64 { return self.invoke(3, .{ .owner = owner, .adapter = adapter_id }); }
+    pub fn abort(self: *Manager, owner: usize, generation: u64, reason: Reason) Error!void { _ = try self.invoke(4, .{ .owner = owner, .generation = generation, .reason = @intFromEnum(reason) }); }
+    pub fn commit(self: *Manager, owner: usize, generation: u64, software: bool) Error!void { _ = try self.invoke(5, .{ .owner = owner, .generation = generation, .flag = software }); }
+    pub fn failCommit(self: *Manager, owner: usize, generation: u64) Error!void { _ = try self.invoke(6, .{ .owner = owner, .generation = generation }); }
+    pub fn beginRecovery(self: *Manager, owner: usize, generation: u64) Error!u64 { return self.invoke(7, .{ .owner = owner, .generation = generation }); }
+    pub fn beginDeviceReset(self: *Manager, owner: usize, generation: u64) Error!u64 { return self.invoke(8, .{ .owner = owner, .generation = generation }); }
+    pub fn reprepare(self: *Manager, owner: usize, generation: u64, adapter: u32) Error!u64 { return self.invoke(9, .{ .owner = owner, .generation = generation, .adapter = adapter }); }
+    pub fn recoveryFailed(self: *Manager, owner: usize, generation: u64) Error!void { _ = try self.invoke(10, .{ .owner = owner, .generation = generation }); }
+    pub fn restoreBoot(self: *Manager, owner: usize, generation: u64) Error!void { _ = try self.invoke(11, .{ .owner = owner, .generation = generation }); }
+    pub fn finishTerminal(self: *Manager, owner: usize, generation: u64) Error!void { _ = try self.invoke(12, .{ .owner = owner, .generation = generation }); }
+    pub fn checkPending(self: *const Manager, owner: usize, generation: u64) Error!void { _ = try self.invoke(13, .{ .owner = owner, .generation = generation }); }
+    pub fn checkActive(self: *const Manager, owner: usize, generation: u64) Error!void { _ = try self.invoke(14, .{ .owner = owner, .generation = generation }); }
+    pub fn modeResult(self: *Manager, owner: usize, generation: u64, confirmed: bool) Error!void { _ = try self.invoke(15, .{ .owner = owner, .generation = generation, .flag = confirmed }); }
+    pub fn retainsOwner(self: *const Manager, owner: usize) bool { return (self.invoke(16, .{ .owner = owner }) catch unreachable) != 0; }
+    pub fn restoredBootOwner(self: *const Manager, owner: usize, generation: u64, adapter: u32) bool { return (self.invoke(17, .{ .owner = owner, .generation = generation, .adapter = adapter }) catch unreachable) != 0; }
+    pub fn beginRestoredBootReset(self: *Manager, owner: usize, generation: u64, adapter: u32) Error!u64 { return self.invoke(18, .{ .owner = owner, .generation = generation, .adapter = adapter }); }
 };
+comptime {
+    if (@sizeOf(Snapshot) != 80 or @alignOf(Snapshot) != 8 or @offsetOf(Snapshot, "revision") != 16 or @offsetOf(Snapshot, "pending_generation") != 72) @compileError("Display snapshot C layout");
+    if (@sizeOf(Manager) != 120 or @offsetOf(Manager, "restored_boot") != 96 or @sizeOf(Args) != 32 or @offsetOf(Args, "flag") != 24) @compileError("Display backend C layout");
+}
 
 test "failed preparation preserves the boot owner and cannot reuse a generation" {
     const t = @import("std").testing;

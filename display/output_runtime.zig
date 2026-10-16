@@ -1,20 +1,10 @@
-//! Additional output routing. The existing BO/queue mutex owns these bounded
-//! lifetimes, followed by the output state owner for catalog mutation. No
-//! framebuffer work, driver callback, wait or allocation runs under either.
-const std = @import("std");
-const state = @import("output_runtime_state.zig");
-const abi = state.abi;
-const targets = @import("output_target.zig");
+//! Fixed projection of the sole native additional-output runtime.
+const abi = @import("r4os_kernel_contract");
 const buffers = @import("../memory/gfx_buffers.zig");
 const queue = @import("queue.zig");
 const resources = @import("queue_resources.zig");
-const outputs = @import("outputs.zig");
-const ownership = @import("ownership.zig");
-const events = @import("../kernel/desktop_events.zig");
-pub const Error = outputs.Error || state.Error;
-var store: state.Store = .{};
-var admission = @import("../sched/sync.zig").UnwindGuard.init("additional-output-admission");
-pub const ModeBinding = struct {
+pub const Error = @import("outputs.zig").Error || @import("output_runtime_state.zig").Error;
+pub const ModeBinding = extern struct {
     driver: buffers.Owner,
     backend: abi.GfxBackendBinding,
     target: abi.GfxOutputTarget,
@@ -22,206 +12,52 @@ pub const ModeBinding = struct {
     height: u32,
     active: bool,
 };
+const empty_binding: ModeBinding = .{ .driver = .{ .kind = .kernel, .id = 0, .generation = 0 }, .backend = .{}, .target = .{}, .width = 0, .height = 0, .active = false };
+const Args = extern struct { owner: buffers.Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, target: abi.GfxOutputTarget = .{},
+    backend: abi.GfxBackendBinding = .{}, binding: ModeBinding = empty_binding, timeline: u64 = 0, value: u32 = 0, other: u32 = 0,
+    width: u32 = 0, height: u32 = 0, flag: bool = false, lost: bool = false, input: ?*const anyopaque = null };
+extern fn r4os_rust_display_additional_runtime(u32, *const Args, ?*anyopaque) i32;
+fn checked(value: i32) Error!void { return switch (value) {
+    0 => {}, 1 => error.Invalid, 2 => error.Overflow, 3 => error.Unsupported, 4 => error.Exhausted, 5 => error.Budget, 6 => error.Capacity,
+    7 => error.Stale, 8 => error.Busy, 9 => error.Closed, 10 => error.WrongOwner, 11 => error.OutOfMemory, 12 => error.Unavailable,
+    13 => error.WaitTimeout, 14 => error.WaitCancelled, 16 => error.AlreadyCompleted, 17 => error.Bandwidth,
+    18 => error.Routing, 19 => error.Dependency, 20 => error.DeviceLost, else => unreachable,
+}; }
 
-fn port(target: abi.GfxOutputTarget) abi.GfxOutputId {
-    return .{ .adapter_id = target.adapter_id, .connector_id = target.connector_id,
-        .device_generation = target.device_generation, .connection_generation = target.connection_generation };
-}
-fn binding(value: abi.GfxBackendBinding) queue.model.Binding {
-    return .{ .adapter = value.adapter_id, .device_generation = value.device_generation, .reset_generation = value.reset_generation };
-}
-pub fn register(driver: buffers.Owner, request: abi.GfxAdditionalOutput) Error!abi.GfxOutputTarget {
-    if (!admission.enter(0)) return error.Busy;
-    defer _ = admission.leave();
-    buffers.lock(); defer buffers.unlock();
-    try queue.requireOutputTargetsLocked(driver, binding(request.backend), request.job_size);
-    for (&store.entries) |*entry| if (entry.driver.id != 0 and entry.target.adapter_id == request.backend.adapter_id and
-        (entry.target.head_id == request.head_id or entry.target.connector_id == request.output.connector_id)) {
-        if (queue.outputBusyLocked(entry.target)) return error.Busy;
-    };
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    try outputs.validateAdditionalLocked(@intCast(driver.id), request);
-    const target = try store.register(driver, request);
-    _ = try outputs.pauseAdditionalLocked(@intCast(driver.id), request.output, true);
-    return target;
-}
-pub fn transition(driver: buffers.Owner, target: abi.GfxOutputTarget, operation: u32, quiesced: u32) Error!void {
-    if (operation > 2 or quiesced != @intFromBool(operation == 2)) return error.Invalid;
-    if (!admission.enter(0)) return error.Busy;
-    defer _ = admission.leave();
-    if (operation == 2) {
-        {
-            buffers.lock(); defer buffers.unlock();
-            const entry = try store.find(target);
-            if (!entry.driver.eql(driver)) return error.WrongOwner;
-            if (queue.outputBusyLocked(target)) return error.Busy;
-            entry.removing = true;
-        }
-        // BO release may enter memory owners. No output/queue lock spans it.
-        // The driver's quiescence proof applies only to this exact consumer.
-        @import("native_additional_mode.zig").retire(driver, target) catch |err| {
-            buffers.lock(); defer buffers.unlock();
-            if (store.find(target)) |entry| {
-                if (entry.driver.eql(driver)) entry.removing = false;
-            } else |_| {}
-            // A pending mode receipt must still be able to settle before
-            // the driver retries physical removal of this output.
-            return err;
-        };
-    }
-    const changed = blk: {
-        buffers.lock(); defer buffers.unlock();
-        const entry = try store.find(target);
-        if (!entry.driver.eql(driver)) return error.WrongOwner;
-        if (operation == 0 and (entry.removing or entry.mode_blocked or entry.mode_lost)) return error.Busy;
-        if (operation == 2 and queue.outputBusyLocked(target)) return error.Busy;
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        // Removal still succeeds after a disconnect replaced the receiver
-        // identity; it cannot activate or otherwise affect that new receiver.
-        const selected = outputs.currentIdentityLocked(@intCast(driver.id), port(target)) orelse port(target);
-        if (operation == 0 and !std.meta.eql(selected, port(target))) return error.Stale;
-        var paused_changed = false;
-        if (operation == 0) {
-            try outputs.validateAdditionalActivationLocked(@intCast(driver.id), selected, target.head_id, entry.width, entry.height);
-            paused_changed = try outputs.pauseAdditionalLocked(@intCast(driver.id), selected, false);
-        } else {
-            paused_changed = outputs.pauseAdditionalLocked(@intCast(driver.id), selected, true) catch |err| absent: {
-                if (err != error.Stale) return err;
-                // Withdrawal already replaced this exact catalog identity.
-                break :absent false;
-            };
-        }
-        const changed = outputs.setNativeActiveLocked(@intCast(driver.id), selected, target.head_id, operation == 0) catch |err| {
-            if (operation == 0) return err;
-            // A withdrawn catalog entry has already lost its active flag.
-            if (err != error.Stale) return err;
-            outputs.forgetNativePortLocked(@intCast(driver.id), selected);
-            entry.active = false;
-            if (operation == 2) entry.* = .{};
-            break :blk true;
-        };
-        entry.active = operation == 0;
-        if (operation == 2) entry.* = .{};
-        break :blk changed or paused_changed;
-    };
-    if (operation == 1) _ = @import("mode_work.zig").withdrawingOutput(@intCast(driver.id), port(target));
-    if (changed) events.signal();
-}
-pub fn targetAt(adapter: u32, head: u32) Error!?abi.GfxOutputTarget {
-    buffers.lock(); defer buffers.unlock();
-    const entry = store.at(adapter, head) orelse return null;
-    const current = try outputs.activeTarget(@intCast(entry.driver.id), port(entry.target), entry.target.display_generation);
-    if (!targets.same(current, entry.target)) return error.Stale;
-    return current;
-}
-pub fn contains(target: abi.GfxOutputTarget) bool {
-    buffers.lock(); defer buffers.unlock();
-    _ = store.find(target) catch return false;
-    return true;
-}
+
+
+fn call(op: u32, args: Args) Error!void { try checked(r4os_rust_display_additional_runtime(op, &args, null)); }
+fn result(comptime T: type, op: u32, args: Args) Error!T { var out: T = undefined; try checked(r4os_rust_display_additional_runtime(op, &args, &out)); return out; }
+pub fn register(driver: buffers.Owner, request: abi.GfxAdditionalOutput) Error!abi.GfxOutputTarget { return result(abi.GfxOutputTarget, 0, .{ .owner = driver, .input = &request }); }
+pub fn transition(driver: buffers.Owner, target: abi.GfxOutputTarget, operation: u32, quiesced: u32) Error!void { try call(1, .{ .owner = driver, .target = target, .value = operation, .other = quiesced }); }
+const OptionalTarget = extern struct { has: bool, value: abi.GfxOutputTarget };
+pub fn targetAt(adapter: u32, head: u32) Error!?abi.GfxOutputTarget { const out = try result(OptionalTarget, 2, .{ .value = adapter, .other = head }); return if (out.has) out.value else null; }
+pub fn contains(target: abi.GfxOutputTarget) bool { return result(bool, 3, .{ .target = target }) catch unreachable; }
+const Image = extern struct { request: *const resources.NativeRequest, deadline: u64, frame_key: u64, dependencies: [*]const queue.model.Fence, dependencies_len: usize };
 pub fn submitImage(caller: buffers.Owner, timeline: u64, submission: queue.model.Submission, request: resources.Request) queue.Error!queue.model.Status {
-    const result = blk: {
-        try buffers.lockPrepared(.{ .leases = 2 }); defer buffers.unlock();
-        const entry = store.find(request.display_target) catch return error.Stale;
-        if (!entry.active or entry.mode_lost or entry.removing) return error.Unavailable;
-        if (entry.mode_blocked) return error.Busy;
-        if (entry.pending) |fence| {
-            const status = queue.queryLocked(fence) catch null;
-            if (status) |value| if (value.phase != .terminal or (!entry.direct and (value.device_active or value.resources_held))) return error.Busy;
-            entry.pending = null;
-        }
-        const descriptor = try buffers.store.describe(request.source, caller);
-        const presentation = try entry.info();
-        if ((request.operation != .present and request.operation != .direct_present) or descriptor.width != entry.width or descriptor.height != entry.height or
-            @intFromEnum(descriptor.format) != presentation.format or descriptor.plane_count != 1 or descriptor.planes[0].offset != 0) return error.Unsupported;
-        const accepted = try queue.submitOutputLocked(caller, timeline, submission, request, binding(entry.binding));
-        entry.pending = accepted.fence;
-        entry.direct = request.operation == .direct_present;
-        break :blk accepted;
-    };
-    queue.wake();
-    return result;
+    const retained = resources.NativeRequest.from(request);
+    const input: Image = .{ .request = &retained, .deadline = submission.deadline_ns, .frame_key = submission.frame_key, .dependencies = submission.dependencies.ptr, .dependencies_len = submission.dependencies.len };
+    return result(queue.model.Status, 4, .{ .owner = caller, .timeline = timeline, .input = &input }) catch |err| switch (err) { error.Bandwidth, error.Routing, error.Dependency => unreachable, else => |failure| return failure };
 }
-pub fn info(target: abi.GfxOutputTarget) Error!abi.DisplayPresentationInfo {
-    buffers.lock(); defer buffers.unlock();
-    const entry = try store.find(target);
-    if (entry.active) {
-        const current = try outputs.activeTarget(@intCast(entry.driver.id), port(target), target.display_generation);
-        if (!targets.same(current, target)) return error.Stale;
-    }
-    return entry.info();
-}
-pub fn feedback(target: abi.GfxOutputTarget, source: abi.GfxFence) Error!abi.DisplayPresentationStats {
-    buffers.lock(); defer buffers.unlock();
-    const entry = try store.find(target);
-    var value = try entry.statistics.feedback(target.head_id, source, entry.snapshot());
-    if (entry.mode_lost) value.flags |= abi.display_presentation_flag_lost;
-    return value;
-}
-pub fn modeBinding(assignment: abi.GfxScanoutState) Error!ModeBinding {
-    buffers.lock(); defer buffers.unlock();
-    for (&store.entries) |*entry| {
-        if (entry.driver.id == 0 or !std.meta.eql(port(entry.target), assignment.output)) continue;
-        if (entry.removing or entry.mode_lost or entry.target.head_id != assignment.head_id) return error.Stale;
-        return .{ .driver = entry.driver, .backend = entry.binding, .target = entry.target,
-            .width = entry.width, .height = entry.height, .active = entry.active };
-    }
-    return error.Stale;
-}
-pub fn beginMode(expected: ModeBinding) Error!void {
-    buffers.lock(); defer buffers.unlock();
-    const entry = try store.find(expected.target);
-    if (!entry.driver.eql(expected.driver) or !std.meta.eql(entry.binding, expected.backend) or entry.removing) return error.Stale;
-    if (queue.outputBusyLocked(entry.target)) return error.Busy;
-    entry.pending = null;
-    entry.mode_blocked = true;
-}
-pub fn finishMode(expected: ModeBinding, width: u32, height: u32, active: bool, lost: bool) Error!void {
-    {
-        buffers.lock(); defer buffers.unlock();
-        const entry = try store.find(expected.target);
-        if (!entry.driver.eql(expected.driver) or !std.meta.eql(entry.binding, expected.backend) or entry.removing or
-            width == 0 or height == 0 or width > 65536 or height > 65536) return error.Stale;
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        _ = try outputs.pauseAdditionalLocked(@intCast(entry.driver.id), port(entry.target), !active or lost);
-        _ = try outputs.setNativeActiveLocked(@intCast(entry.driver.id), port(entry.target), entry.target.head_id, active and !lost);
-        entry.width = width; entry.height = height;
-        entry.active = active and !lost;
-        entry.mode_lost = lost;
-        entry.mode_blocked = lost;
-    }
-    events.signal();
-}
-pub fn publishInfo(driver: buffers.Owner, value: abi.DisplayPresentationInfo) Error!bool {
-    buffers.lock(); defer buffers.unlock();
-    for (&store.entries) |*entry| if (entry.driver.eql(driver) and entry.target.display_generation == value.display_generation) {
-        try entry.publishInfo(driver, value); return true;
-    };
-    return false;
-}
-pub fn publishStats(driver: buffers.Owner, value: abi.DisplayPresentationStats) Error!bool {
-    buffers.lock(); defer buffers.unlock();
-    for (&store.entries) |*entry| if (entry.driver.eql(driver) and entry.target.display_generation == value.display_generation) {
-        try entry.publishStats(driver, value); return true;
-    };
-    return false;
-}
-pub fn stoppedDriver(driver: u32) void {
-    buffers.lock(); defer buffers.unlock();
-    store.stop(driver);
-}
-// Exact backend quiescence has already retired mode surfaces and queue jobs.
-// Each additional target still passes its ordinary consumer-removal checks.
-pub fn retireAfterReset(driver: buffers.Owner, backend: abi.GfxBackendBinding) Error!void {
-    if (!admission.enter(0)) return error.Busy;
-    defer _ = admission.leave();
-    for (0..store.entries.len) |index| {
-        const target = blk: {
-            buffers.lock(); defer buffers.unlock();
-            const entry = &store.entries[index];
-            if (!entry.driver.eql(driver) or !std.meta.eql(entry.binding, backend)) continue;
-            break :blk entry.target;
-        };
-        try transition(driver, target, 2, 1);
-    }
-}
+pub fn info(target: abi.GfxOutputTarget) Error!abi.DisplayPresentationInfo { return result(abi.DisplayPresentationInfo, 5, .{ .target = target }); }
+pub fn feedback(target: abi.GfxOutputTarget, source_fence: abi.GfxFence) Error!abi.DisplayPresentationStats { return result(abi.DisplayPresentationStats, 6, .{ .target = target, .input = &source_fence }); }
+pub fn modeBinding(assignment: abi.GfxScanoutState) Error!ModeBinding { return result(ModeBinding, 7, .{ .input = &assignment }); }
+pub fn beginMode(expected: ModeBinding) Error!void { try call(8, .{ .binding = expected }); }
+pub fn finishMode(expected: ModeBinding, width: u32, height: u32, active: bool, lost: bool) Error!void { try call(9, .{ .binding = expected, .width = width, .height = height, .flag = active, .lost = lost }); }
+pub fn publishInfo(driver: buffers.Owner, value: abi.DisplayPresentationInfo) Error!bool { return result(bool, 10, .{ .owner = driver, .input = &value }); }
+pub fn publishStats(driver: buffers.Owner, value: abi.DisplayPresentationStats) Error!bool { return result(bool, 11, .{ .owner = driver, .input = &value }); }
+pub fn stoppedDriver(id: u32) void { call(12, .{ .owner = .{ .kind = .driver, .id = id, .generation = 0 } }) catch unreachable; }
+pub fn retireAfterReset(driver: buffers.Owner, backend: abi.GfxBackendBinding) Error!void { try call(13, .{ .owner = driver, .backend = backend }); }
+
+// Typed, nonblocking peers to the remaining queue runtime. No output state.
+
+
+
+
+
+fn peerCode(err: anyerror) i32 { return switch (err) {
+    error.Invalid => 1, error.Overflow => 2, error.Unsupported => 3, error.Exhausted => 4, error.Budget => 5, error.Capacity => 6,
+    error.Stale => 7, error.Busy => 8, error.Closed => 9, error.WrongOwner => 10, error.OutOfMemory => 11, error.Unavailable => 12,
+    error.WaitTimeout => 13, error.WaitCancelled => 14, error.Disabled => 15, error.AlreadyCompleted => 16, error.Bandwidth => 17,
+    error.Routing => 18, error.Dependency => 19, error.DeviceLost => 20, error.RestoreFailed => 21, else => unreachable,
+}; }

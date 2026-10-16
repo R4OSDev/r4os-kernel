@@ -1,3 +1,4 @@
+comptime { if (@import("builtin").is_test) _ = @import("rust_owner_test"); }
 // Graphics submission lifetime only. Command execution, device registers,
 // rendering policy and waiter publication live outside this metadata owner.
 const std = @import("std");
@@ -8,18 +9,18 @@ pub const Milestone = enum(u32) { cpu_stores, device_execution, scanout };
 pub const Result = enum(u32) { pending, complete, cancelled, dropped, device_lost, timeout, failed, dependency_failed };
 pub const Phase = enum(u32) { queued, running, terminal };
 pub const Error = error{ Invalid, Stale, WrongOwner, Busy, Closed, Capacity, Exhausted, AlreadyCompleted };
-pub const Binding = struct {
+pub const Binding = extern struct {
     adapter: u32 = 0,
     device_generation: u64 = 1,
     reset_generation: u64 = 1,
 };
-pub const Fence = struct {
+pub const Fence = extern struct {
     slot: u32 = 0,
     timeline: u64 = 0,
     point: u64 = 0,
     binding: Binding = .{},
 };
-pub const Config = struct {
+pub const Config = extern struct {
     binding: Binding = .{},
     policy: Policy = .fifo,
     capacity: u32 = 2,
@@ -30,7 +31,7 @@ pub const Submission = struct {
     frame_key: u64 = 0,
     dependencies: []const Fence = &.{},
 };
-pub const Status = struct {
+pub const Status = extern struct {
     fence: Fence,
     phase: Phase,
     result: Result,
@@ -40,414 +41,103 @@ pub const Status = struct {
     device_active: bool,
     resources_held: bool,
 };
-pub const Release = struct { fence: Fence, nonce: u64 };
+pub const Release = extern struct { fence: Fence, nonce: u64 };
 
+const empty_owner = Owner{ .kind = .kernel, .id = 0, .generation = 0 };
+pub const Queue = extern struct {
+    timeline: u64 = 0, owner: Owner = empty_owner, config: Config = .{}, next_point: u64 = 1,
+    closing: bool = false, inflight: u32 = 0, jobs: u32 = 0, has_last_owner: bool = false,
+    last_owner_data: Owner = empty_owner, next_owner_queue: usize = 0,
+};
+pub const Job = extern struct {
+    fence: Fence = .{}, queue: usize = 0, phase: Phase = .queued, result: Result = .pending,
+    deadline_ns: u64 = 0, completed_ns: u64 = 0, frame_key: u64 = 0, client_reference: bool = true,
+    active: bool = false, scanout: bool = false, retire_requested: bool = false, resources_held: bool = true,
+    release_nonce: u64 = 0, notification_pending: bool = false, notification_publishing: bool = false,
+    waiters: u32 = 0, dependents: u32 = 0, dependencies: [max_dependencies]u16 = @splat(0), dependency_count: usize = 0,
+};
+const Scalars = extern struct {
+    timeline_serial: u64, release_serial: u64, next_queue: usize, has_last_owner: bool,
+    last_owner_data: Owner, terminal_publications: u64,
+};
+pub const NativeView = extern struct { queues: [*]Queue, queues_len: usize, jobs: [*]Job, jobs_len: usize, scalars: *Scalars };
+pub const NativeArgs = extern struct {
+    owner: Owner = empty_owner, config: Config = .{}, fence: Fence = .{}, binding: Binding = .{},
+    timeline: u64 = 0, now: u64 = 0, frame_key: u64 = 0, deadline: u64 = 0, nonce: u64 = 0,
+    result: u32 = 0, flag: bool = false, has_binding: bool = false,
+    dependencies: ?[*]const Fence = null, dependencies_len: usize = 0, seen: ?[*]bool = null, pending: ?[*]u16 = null,
+};
+const OptionalFence = extern struct { has: bool, value: Fence };
+const OptionalRelease = extern struct { has: bool, value: Release };
+extern fn r4os_rust_display_queue_state(*const NativeView, u32, *const NativeArgs, ?*anyopaque) i32;
+fn status(code: i32) Error!void { return switch (code) {
+    0 => {}, 1 => error.Invalid, 4 => error.Exhausted, 6 => error.Capacity, 7 => error.Stale,
+    8 => error.Busy, 9 => error.Closed, 10 => error.WrongOwner, 16 => error.AlreadyCompleted, else => unreachable,
+}; }
 pub fn Store(comptime queue_capacity: usize, comptime fence_capacity: usize) type {
     if (queue_capacity == 0 or fence_capacity == 0 or fence_capacity > 65535) @compileError("invalid graphics queue capacity");
-    return struct {
+    return extern struct {
         const Self = @This();
-        const Queue = struct {
-            timeline: u64 = 0,
-            owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 },
-            config: Config = .{},
-            next_point: u64 = 1,
-            closing: bool = false,
-            inflight: u32 = 0,
-            jobs: u32 = 0,
-            // Shared by every live queue of this exact backend binding.
-            // It survives one producer closing/reopening all of its queues
-            // while another producer remains present.
-            last_owner: ?Owner = null,
-            next_owner_queue: usize = 0,
-        };
-        const Job = struct {
-            fence: Fence = .{},
-            queue: usize = 0,
-            phase: Phase = .queued,
-            result: Result = .pending,
-            deadline_ns: u64 = 0,
-            completed_ns: u64 = 0,
-            frame_key: u64 = 0,
-            client_reference: bool = true,
-            active: bool = false,
-            scanout: bool = false,
-            retire_requested: bool = false,
-            resources_held: bool = true,
-            release_nonce: u64 = 0,
-            notification_pending: bool = false,
-            notification_publishing: bool = false,
-            waiters: u32 = 0,
-            dependents: u32 = 0,
-            dependencies: [max_dependencies]u16 = .{0} ** max_dependencies,
-            dependency_count: usize = 0,
-        };
-        queues: [queue_capacity]Queue = .{Queue{}} ** queue_capacity,
-        jobs: [fence_capacity]Job = .{Job{}} ** fence_capacity,
-        timeline_serial: u64 = 0,
-        release_serial: u64 = 0,
-        next_queue: usize = 0,
-        last_owner: ?Owner = null,
-        terminal_publications: u64 = 0,
-
-        pub fn open(self: *Self, owner: Owner, config: Config) Error!u64 {
-            if (owner.id == 0 or owner.generation == 0 or config.capacity == 0 or config.capacity > fence_capacity or
-                config.binding.device_generation == 0 or config.binding.reset_generation == 0) return error.Invalid;
-            if (self.timeline_serial == std.math.maxInt(u64)) return error.Exhausted;
-            var cursor: ?Owner = null;
-            var owner_cursor: usize = 0;
-            for (&self.queues) |*queue| if (queue.timeline != 0 and std.meta.eql(queue.config.binding, config.binding)) { cursor = queue.last_owner; break; };
-            for (&self.queues) |*queue| if (queue.timeline != 0 and queue.owner.eql(owner) and std.meta.eql(queue.config.binding, config.binding)) { owner_cursor = queue.next_owner_queue; break; };
-            for (&self.queues) |*queue| if (queue.timeline == 0) {
-                self.timeline_serial += 1;
-                queue.* = .{ .timeline = self.timeline_serial, .owner = owner, .config = config, .last_owner = cursor, .next_owner_queue = owner_cursor };
-                return queue.timeline;
-            };
-            return error.Capacity;
+        queues: [queue_capacity]Queue = @splat(.{}), jobs: [fence_capacity]Job = @splat(.{}),
+        timeline_serial: u64 = 0, release_serial: u64 = 0, next_queue: usize = 0,
+        has_last_owner: bool = false, last_owner_data: Owner = empty_owner, terminal_publications: u64 = 0,
+        pub fn nativeView(self: *Self) NativeView {
+            return .{ .queues = &self.queues, .queues_len = queue_capacity, .jobs = &self.jobs, .jobs_len = fence_capacity, .scalars = @ptrCast(&self.timeline_serial) };
         }
-
+        fn call(self: *Self, op: u32, args: NativeArgs, out: ?*anyopaque) Error!void {
+            const view = self.nativeView(); try status(r4os_rust_display_queue_state(&view, op, &args, out));
+        }
+        fn result(self: *Self, comptime T: type, op: u32, args: NativeArgs) Error!T {
+            var out: T = undefined; try self.call(op, args, &out); return out;
+        }
+        fn optional(self: *Self, op: u32, args: NativeArgs) ?Fence {
+            const out = self.result(OptionalFence, op, args) catch unreachable; return if (out.has) out.value else null;
+        }
+        pub fn open(self: *Self, owner: Owner, config: Config) Error!u64 { return self.result(u64, 0, .{ .owner = owner, .config = config }); }
         pub fn submit(self: *Self, timeline: u64, owner: Owner, request: Submission, now: u64) Error!Fence {
-            const qi = try self.queueFor(timeline, owner);
-            const queue = &self.queues[qi];
-            if (queue.closing) return error.Closed;
-            if (request.deadline_ns <= now or request.deadline_ns == std.math.maxInt(u64) or request.dependencies.len > max_dependencies or
-                (queue.config.policy == .latest_frame and request.frame_key == 0)) return error.Invalid;
-            if (queue.next_point == std.math.maxInt(u64)) return error.Exhausted;
-            var dependencies: [max_dependencies]u16 = .{0} ** max_dependencies;
-            for (request.dependencies, 0..) |dependency, index| {
-                const slot = try self.fenceIndex(dependency);
-                // Dependencies must already exist and are immutable after
-                // submit. Future/self edges cannot be admitted, so cycles
-                // cannot be constructed, including across queue timelines.
-                for (dependencies[0..index]) |previous| if (previous == slot) return error.Invalid;
-                if (self.jobs[slot].dependents == std.math.maxInt(u32)) return error.Exhausted;
-                dependencies[index] = @intCast(slot);
-            }
-            var replacement: ?usize = null;
-            if (queue.config.policy == .latest_frame) {
-                for (&self.jobs, 0..) |job, index| {
-                    if (job.fence.slot != 0 and job.queue == qi and job.phase == .queued and job.frame_key == request.frame_key) replacement = index;
-                }
-            }
-            if (replacement == null and queue.inflight >= queue.config.capacity) return error.Busy;
-            var free: ?usize = null;
-            for (&self.jobs, 0..) |job, index| if (job.fence.slot == 0) {
-                free = index;
-                break;
-            };
-            const slot = free orelse return error.Capacity;
-            // Do not discard the old frame if admission of the new one fails.
-            if (replacement) |old| self.makeTerminal(old, .dropped, now);
-            const fence = Fence{ .slot = @intCast(slot + 1), .timeline = timeline, .point = queue.next_point, .binding = queue.config.binding };
-            queue.next_point += 1;
-            queue.inflight += 1;
-            queue.jobs += 1;
-            self.jobs[slot] = .{
-                .fence = fence,
-                .queue = qi,
-                .deadline_ns = request.deadline_ns,
-                .frame_key = request.frame_key,
-                .dependencies = dependencies,
-                .dependency_count = request.dependencies.len,
-            };
-            for (dependencies[0..request.dependencies.len]) |dependency| self.jobs[dependency].dependents += 1;
-            return fence;
+            return self.result(Fence, 1, .{ .timeline = timeline, .owner = owner, .deadline = request.deadline_ns, .frame_key = request.frame_key, .dependencies = request.dependencies.ptr, .dependencies_len = request.dependencies.len, .now = now });
         }
-
-        pub fn query(self: *Self, fence: Fence) Error!Status {
-            const job = &self.jobs[try self.fenceIndex(fence)];
-            return .{ .fence = job.fence, .phase = job.phase, .result = job.result, .milestone = self.queues[job.queue].config.milestone, .deadline_ns = job.deadline_ns, .completed_ns = job.completed_ns, .device_active = job.active or job.scanout, .resources_held = job.resources_held };
-        }
-
-        pub fn configuration(self: *Self, timeline: u64, owner: Owner) Error!Config {
-            const queue = self.queues[try self.queueFor(timeline, owner)];
-            if (queue.closing) return error.Closed;
-            return queue.config;
-        }
-
-        /// A FIFO timeline is implicitly serial. Explicit immutable edges may
-        /// cross timelines; walk them without recursion or allocation. A later
-        /// point also orders every earlier point on that same timeline.
-        /// Do not inherit the dependencies of implicit FIFO predecessors:
-        /// cancelling a queued predecessor removes that wait. Cross-timeline
-        /// buffer hazards therefore require an explicit dependency path.
+        pub fn query(self: *Self, fence: Fence) Error!Status { return self.result(Status, 2, .{ .fence = fence }); }
+        pub fn configuration(self: *Self, timeline: u64, owner: Owner) Error!Config { return self.result(Config, 3, .{ .timeline = timeline, .owner = owner }); }
         pub fn orders(self: *Self, timeline: u64, dependencies: []const Fence, before: Fence) Error!bool {
-            _ = try self.fenceIndex(before);
-            if (timeline == before.timeline) return true;
-            var seen: [fence_capacity]bool = .{false} ** fence_capacity;
-            var pending: [fence_capacity]u16 = undefined;
-            var count: usize = 0;
-            for (dependencies) |fence| {
-                const slot = try self.fenceIndex(fence);
-                if (!seen[slot]) {
-                    seen[slot] = true;
-                    pending[count] = @intCast(slot);
-                    count += 1;
-                }
-            }
-            while (count != 0) {
-                count -= 1;
-                const job = self.jobs[pending[count]];
-                if (job.fence.timeline == before.timeline and job.fence.point >= before.point) return true;
-                for (job.dependencies[0..job.dependency_count]) |slot| if (!seen[slot]) {
-                    seen[slot] = true;
-                    pending[count] = slot;
-                    count += 1;
-                };
-            }
-            return false;
+            var seen: [fence_capacity]bool = @splat(false); var pending: [fence_capacity]u16 = undefined;
+            return self.result(bool, 4, .{ .timeline = timeline, .dependencies = dependencies.ptr, .dependencies_len = dependencies.len, .fence = before, .seen = &seen, .pending = &pending });
         }
-
-        pub fn takeReady(self: *Self, now: u64) ?Fence {
-            return self.takeReadyFor(null, now);
-        }
-
-        pub fn producer(self: *Self, fence: Fence) Error!Owner {
-            return self.queues[self.jobs[try self.fenceIndex(fence)].queue].owner;
-        }
-
-        pub fn takeReadyFor(self: *Self, binding: ?Binding, now: u64) ?Fence {
-            self.expire(now);
-            var selected: ?usize = null;
-            var selected_after = false;
-            var visited: usize = 0;
-            while (visited < queue_capacity) : (visited += 1) {
-                const qi = (self.next_queue + visited) % queue_capacity;
-                const queue = self.queues[qi];
-                if (queue.timeline == 0 or queue.closing) continue;
-                if (binding) |wanted| if (!std.meta.eql(wanted, queue.config.binding)) continue;
-                var first: ?usize = null;
-                var active = false;
-                for (&self.jobs, 0..) |job, index| {
-                    if (job.fence.slot == 0 or job.queue != qi) continue;
-                    if (job.active) active = true;
-                    if (job.phase != .queued) continue;
-                    if (first == null or job.fence.point < self.jobs[first.?].fence.point) first = index;
-                }
-                // Cancel and timeout are logical completions. Even then the
-                // next point must not touch the previous engine's resources.
-                if (active) continue;
-                const slot = first orelse continue;
-                const job = &self.jobs[slot];
-                var blocked = false;
-                var failed = false;
-                for (job.dependencies[0..job.dependency_count]) |dependency| {
-                    const parent = self.jobs[dependency];
-                    if (parent.phase != .terminal) blocked = true else if (parent.result != .complete) {
-                        failed = true;
-                    } else if (parent.active or parent.scanout) blocked = true;
-                }
-                if (failed) {
-                    self.makeTerminal(slot, .dependency_failed, now);
-                    continue;
-                }
-                if (blocked) continue; // FIFO does not bypass a blocked head.
-                const cursor = if (binding != null) queue.last_owner else self.last_owner;
-                const after = if (cursor) |owner| ownerBefore(owner, queue.owner) else true;
-                if (selected) |previous| {
-                    const previous_owner = self.queues[self.jobs[previous].queue].owner;
-                    if (queue.owner.eql(previous_owner)) {
-                        const start = if (binding != null) queue.next_owner_queue else self.next_queue;
-                        const distance = (qi + queue_capacity - start) % queue_capacity;
-                        const previous_distance = (self.jobs[previous].queue + queue_capacity - start) % queue_capacity;
-                        if (distance >= previous_distance) continue;
-                    } else if ((!after and selected_after) or (after == selected_after and !ownerBefore(queue.owner, previous_owner))) continue;
-                }
-                selected = slot; selected_after = after;
-            }
-            const job = &self.jobs[selected orelse return null];
-            const queue = self.queues[job.queue];
-            job.phase = .running;
-            job.active = true;
-            self.next_queue = (job.queue + 1) % queue_capacity;
-            self.last_owner = queue.owner;
-            for (&self.queues) |*peer| if (peer.timeline != 0 and std.meta.eql(peer.config.binding, queue.config.binding)) {
-                peer.last_owner = queue.owner;
-                if (peer.owner.eql(queue.owner)) peer.next_owner_queue = self.next_queue;
-            };
-            return job.fence;
-        }
-
-        /// O(1) worker metadata transition. IRQ producers use queue_ingress;
-        /// wakeup and resource release are separate, retained worker tickets.
-        pub fn complete(self: *Self, fence: Fence, result: Result, quiesced: bool, now: u64) Error!void {
-            if (result != .complete and result != .failed and result != .cancelled) return error.Invalid;
-            const slot = try self.fenceIndex(fence);
-            const job = &self.jobs[slot];
-            if (job.phase == .queued) return error.Invalid;
-            if (!job.active and !job.scanout) return error.AlreadyCompleted;
-            if (!quiesced) return error.Busy;
-            job.active = false;
-            job.scanout = false;
-            self.queues[job.queue].inflight -= 1;
-            // A late physical acknowledgement retires a cancelled/timed-out
-            // operation, but cannot overwrite its already published result.
-            if (job.phase != .terminal) self.makeTerminal(slot, result, now);
-        }
-
-        /// Only the authenticated direct-image consumer calls this after
-        /// activation. Physical ownership remains with this exact fence,
-        /// while later work on other images may use the same timeline.
-        pub fn beginScanout(self: *Self, fence: Fence, now: u64) Error!void {
-            const slot = try self.fenceIndex(fence);
-            const job = &self.jobs[slot];
-            if (job.scanout) return;
-            if (!job.active or job.phase == .queued) return error.Invalid;
-            job.active = false; job.scanout = true;
-            if (job.phase != .terminal) self.makeTerminal(slot, .complete, now)
-            else job.retire_requested = true;
-        }
-
-        pub fn scanoutRetireRequested(self: *Self, fence: Fence) Error!bool {
-            const job = &self.jobs[try self.fenceIndex(fence)];
-            if (!job.active and !job.scanout) return error.AlreadyCompleted;
-            return job.retire_requested or !job.client_reference or self.queues[job.queue].closing or
-                (job.phase == .terminal and job.result != .complete);
-        }
-
-        pub fn cancel(self: *Self, fence: Fence, owner: Owner, now: u64) Error!void {
-            const slot = try self.fenceIndex(fence);
-            if (!self.queues[self.jobs[slot].queue].owner.eql(owner)) return error.WrongOwner;
-            if (self.jobs[slot].scanout) { self.jobs[slot].retire_requested = true; return; }
-            if (self.jobs[slot].phase == .terminal) return error.AlreadyCompleted;
-            self.makeTerminal(slot, .cancelled, now);
-        }
-
-        pub fn expire(self: *Self, now: u64) void {
-            for (&self.jobs, 0..) |job, index| {
-                if (job.fence.slot != 0 and job.phase != .terminal and job.deadline_ns <= now) self.makeTerminal(index, .timeout, now);
-            }
-        }
-
-        pub fn close(self: *Self, timeline: u64, owner: Owner, now: u64) Error!void {
-            const qi = try self.queueFor(timeline, owner);
-            self.queues[qi].closing = true;
-            for (&self.jobs, 0..) |*job, index| {
-                if (job.fence.slot == 0 or job.queue != qi) continue;
-                job.client_reference = false;
-                if (job.scanout) job.retire_requested = true;
-                if (job.phase != .terminal) self.makeTerminal(index, .cancelled, now);
-            }
-            if (self.queues[qi].jobs == 0) self.queues[qi] = .{};
-        }
-
-        pub fn stopped(self: *Self, owner: Owner, now: u64) void {
-            for (&self.queues) |queue| {
-                if (queue.timeline != 0 and queue.owner.eql(owner)) self.close(queue.timeline, owner, now) catch unreachable;
-            }
-        }
-
-        pub fn deviceLost(self: *Self, binding: Binding, now: u64) void {
-            for (&self.queues, 0..) |*queue, qi| {
-                if (queue.timeline == 0 or !std.meta.eql(queue.config.binding, binding)) continue;
-                queue.closing = true;
-                for (&self.jobs, 0..) |*job, slot| if (job.fence.slot != 0 and job.queue == qi) {
-                    if (job.scanout) job.retire_requested = true;
-                    if (job.phase != .terminal) self.makeTerminal(slot, .device_lost, now);
-                };
-                if (queue.jobs == 0) queue.* = .{};
-            }
-        }
-
-        pub fn drop(self: *Self, fence: Fence, owner: Owner) Error!void {
-            const job = &self.jobs[try self.fenceIndex(fence)];
-            if (!self.queues[job.queue].owner.eql(owner)) return error.WrongOwner;
-            if (!job.client_reference) return error.Stale;
-            job.client_reference = false;
-        }
-
-        pub fn retainWaiter(self: *Self, fence: Fence) Error!void {
-            const job = &self.jobs[try self.fenceIndex(fence)];
-            if (job.waiters == std.math.maxInt(u32)) return error.Exhausted;
-            job.waiters += 1;
-        }
-        pub fn releaseWaiter(self: *Self, fence: Fence) Error!void {
-            const job = &self.jobs[try self.fenceIndex(fence)];
-            if (job.waiters == 0) return error.Invalid;
-            job.waiters -= 1;
-        }
-
-        pub fn takeNotification(self: *Self) ?Fence {
-            for (&self.jobs) |*job| if (job.fence.slot != 0 and job.notification_pending and !job.notification_publishing) {
-                job.notification_publishing = true;
-                return job.fence;
-            };
-            return null;
-        }
-        pub fn published(self: *Self, fence: Fence) Error!void {
-            const job = &self.jobs[try self.fenceIndex(fence)];
-            if (!job.notification_publishing) return error.Invalid;
-            job.notification_publishing = false;
-            job.notification_pending = false;
-        }
-
-        pub fn takeRelease(self: *Self) ?Release {
-            if (self.release_serial == std.math.maxInt(u64)) return null;
-            for (&self.jobs) |*job| {
-                if (job.fence.slot == 0 or job.phase != .terminal or job.active or job.scanout or !job.resources_held or job.release_nonce != 0) continue;
-                self.release_serial += 1;
-                job.release_nonce = self.release_serial;
-                return .{ .fence = job.fence, .nonce = job.release_nonce };
-            }
-            return null;
-        }
-        pub fn released(self: *Self, ticket: Release, success: bool) Error!void {
-            const job = &self.jobs[try self.fenceIndex(ticket.fence)];
-            if (ticket.nonce == 0 or job.release_nonce != ticket.nonce) return error.Stale;
-            job.release_nonce = 0;
-            if (success) job.resources_held = false;
-        }
-
-        pub fn reapOne(self: *Self) ?Fence {
-            for (&self.jobs) |*job| {
-                if (job.fence.slot == 0 or job.phase != .terminal or job.active or job.client_reference or job.resources_held or
-                    job.notification_pending or job.notification_publishing or job.waiters != 0 or job.dependents != 0) continue;
-                const fence = job.fence;
-                const qi = job.queue;
-                for (job.dependencies[0..job.dependency_count]) |dependency| self.jobs[dependency].dependents -= 1;
-                job.* = .{};
-                self.queues[qi].jobs -= 1;
-                if (self.queues[qi].closing and self.queues[qi].jobs == 0) self.queues[qi] = .{};
-                return fence;
-            }
-            return null;
-        }
-
-        fn makeTerminal(self: *Self, slot: usize, result: Result, now: u64) void {
-            const job = &self.jobs[slot];
-            std.debug.assert(job.phase != .terminal and result != .pending);
-            if (job.phase == .queued) self.queues[job.queue].inflight -= 1;
-            job.phase = .terminal;
-            job.result = result;
-            job.completed_ns = now;
-            job.notification_pending = true;
-            self.terminal_publications +|= 1;
-        }
-        fn queueFor(self: *Self, timeline: u64, owner: Owner) Error!usize {
-            if (timeline == 0) return error.Invalid;
-            for (&self.queues, 0..) |queue, index_| {
-                if (queue.timeline != timeline) continue;
-                if (!queue.owner.eql(owner)) return error.WrongOwner;
-                return index_;
-            }
-            return error.Stale;
-        }
-        fn fenceIndex(self: *Self, fence: Fence) Error!usize {
-            if (fence.slot == 0 or fence.slot > fence_capacity or fence.timeline == 0 or fence.point == 0) return error.Invalid;
-            const slot: usize = fence.slot - 1;
-            if (!std.meta.eql(self.jobs[slot].fence, fence)) return error.Stale;
-            return slot;
+        pub fn takeReady(self: *Self, now: u64) ?Fence { return self.takeReadyFor(null, now); }
+        pub fn producer(self: *Self, fence: Fence) Error!Owner { return self.result(Owner, 6, .{ .fence = fence }); }
+        pub fn takeReadyFor(self: *Self, binding: ?Binding, now: u64) ?Fence { return self.optional(5, .{ .has_binding = binding != null, .binding = binding orelse .{}, .now = now }); }
+        pub fn complete(self: *Self, fence: Fence, value: Result, quiesced: bool, now: u64) Error!void { try self.call(7, .{ .fence = fence, .result = @intFromEnum(value), .flag = quiesced, .now = now }, null); }
+        pub fn beginScanout(self: *Self, fence: Fence, now: u64) Error!void { try self.call(8, .{ .fence = fence, .now = now }, null); }
+        pub fn scanoutRetireRequested(self: *Self, fence: Fence) Error!bool { return self.result(bool, 9, .{ .fence = fence }); }
+        pub fn cancel(self: *Self, fence: Fence, owner: Owner, now: u64) Error!void { try self.call(10, .{ .fence = fence, .owner = owner, .now = now }, null); }
+        pub fn expire(self: *Self, now: u64) void { self.call(11, .{ .now = now }, null) catch unreachable; }
+        pub fn close(self: *Self, timeline: u64, owner: Owner, now: u64) Error!void { try self.call(12, .{ .timeline = timeline, .owner = owner, .now = now }, null); }
+        pub fn stopped(self: *Self, owner: Owner, now: u64) void { self.call(13, .{ .owner = owner, .now = now }, null) catch unreachable; }
+        pub fn deviceLost(self: *Self, binding: Binding, now: u64) void { self.call(14, .{ .binding = binding, .now = now }, null) catch unreachable; }
+        pub fn drop(self: *Self, fence: Fence, owner: Owner) Error!void { try self.call(15, .{ .fence = fence, .owner = owner }, null); }
+        pub fn retainWaiter(self: *Self, fence: Fence) Error!void { try self.call(16, .{ .fence = fence }, null); }
+        pub fn releaseWaiter(self: *Self, fence: Fence) Error!void { try self.call(17, .{ .fence = fence }, null); }
+        pub fn takeNotification(self: *Self) ?Fence { return self.optional(18, .{}); }
+        pub fn published(self: *Self, fence: Fence) Error!void { try self.call(19, .{ .fence = fence }, null); }
+        pub fn takeRelease(self: *Self) ?Release { const out = self.result(OptionalRelease, 20, .{}) catch unreachable; return if (out.has) out.value else null; }
+        pub fn released(self: *Self, ticket: Release, success: bool) Error!void { try self.call(21, .{ .fence = ticket.fence, .nonce = ticket.nonce, .flag = success }, null); }
+        pub fn reapOne(self: *Self) ?Fence { return self.optional(22, .{}); }
+        comptime {
+            const base = @offsetOf(Self, "timeline_serial");
+            if (@offsetOf(Self, "release_serial") != base + 8 or @offsetOf(Self, "next_queue") != base + 16 or @offsetOf(Self, "has_last_owner") != base + 24 or @offsetOf(Self, "last_owner_data") != base + 32 or @offsetOf(Self, "terminal_publications") != base + 56) @compileError("Native queue scalar C layout");
         }
     };
+}
+comptime {
+    if (@sizeOf(Binding) != 24 or @sizeOf(Fence) != 48 or @sizeOf(Config) != 40 or @sizeOf(Status) != 88 or @sizeOf(Release) != 56) @compileError("Native queue transport C layout");
+    if (@sizeOf(Queue) != 128 or @alignOf(Queue) != 8 or @offsetOf(Queue, "last_owner_data") != 96 or @offsetOf(Queue, "next_owner_queue") != 120) @compileError("Native queue entry C layout");
+    if (@sizeOf(Job) != 144 or @offsetOf(Job, "release_nonce") != 96 or @offsetOf(Job, "dependencies") != 116 or @offsetOf(Job, "dependency_count") != 136) @compileError("Native queue job C layout");
+    if (@sizeOf(Scalars) != 64 or @sizeOf(NativeView) != 40 or @sizeOf(NativeArgs) != 216 or @offsetOf(NativeArgs, "dependencies") != 184 or @offsetOf(NativeArgs, "seen") != 200 or @offsetOf(NativeArgs, "pending") != 208) @compileError("Native queue call C layout");
 }
 
 const testing = std.testing;
 const test_owner = Owner{ .kind = .program, .id = 1, .generation = 2 };
 
-fn ownerBefore(left: Owner, right: Owner) bool {
-    if (left.kind != right.kind) return @intFromEnum(left.kind) < @intFromEnum(right.kind);
-    if (left.id != right.id) return left.id < right.id;
-    return left.generation < right.generation;
-}
 fn fairProducers() !void {
     var state = Store(8, 32){};
     const binding: Binding = .{ .adapter = 9 };

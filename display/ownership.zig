@@ -34,26 +34,13 @@ pub const Execution = struct {
 
     pub fn enter(self: *Execution, timeout_ticks: u64) bool {
         if (!kernel) return self.guard.tryLock();
-        if (!self.guard.enter(timeout_ticks)) return false;
-        // An interrupt or callback on the same task must not start a second
-        // presentation inside an incomplete generation.
-        if (self.guard.depth != 1) {
-            _ = self.guard.leave();
-            return false;
-        }
-        return true;
+        return r4os_rust_display_execution(0, &self.guard, timeout_ticks);
+    }
+    pub fn leave(self: *Execution) void {
+        if (kernel) { _ = r4os_rust_display_execution(1, &self.guard, 0); }
+        else { self.guard.unlock(std.testing.io); }
     }
 
-    pub fn leave(self: *Execution) void {
-        if (kernel) {
-            // A later CPU must not overtake pending write-combining stores,
-            // including a partial write on a failed presentation path.
-            asm volatile ("sfence" ::: .{ .memory = true });
-            _ = self.guard.leave();
-        } else {
-            self.guard.unlock(std.testing.io);
-        }
-    }
 };
 
 pub const CallToken = if (kernel) lifetime.UnwindToken else struct {
@@ -69,3 +56,6 @@ pub fn retainCall() CallToken {
 pub fn releaseCall(token: CallToken) void {
     if (kernel) _ = lifetime.leaveUnwind(token);
 }
+
+extern fn r4os_rust_display_execution(u32, *ExecutionGuard, u64) bool;
+const ExecutionGuard = if (kernel) sync.UnwindGuard else anyopaque;

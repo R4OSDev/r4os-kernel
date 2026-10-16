@@ -1,564 +1,273 @@
-// Privileged output publication boundary. Parsing/policy lives in R4GFX/R4D.
-// All state is copied under the existing program metadata owner; no second
-// event system, framebuffer writer or driver callback is introduced here.
-const std = @import("std");
+//! Fixed projection of the sole native output catalog/publication runtime.
 pub const model = @import("output_state.zig");
 pub const abi = model.abi;
-const ownership = @import("ownership.zig");
-const events = @import("../kernel/desktop_events.zig");
 const buffers = @import("../memory/gfx_buffers.zig");
 const queue = @import("queue.zig");
-const queue_api = @import("../program/gfx_queue_api.zig");
-const buffer_api = @import("../program/gfx_buffer_api.zig");
-const display = @import("display.zig");
-const irq = @import("../kernel/irq_router.zig");
 pub const Error = model.Error || queue.Error;
-var catalog: model.Store = .{};
-// Reset/unload advances this even before the first connector publication.
-// A queue binding checked before that transition cannot publish afterwards.
-var owner_epoch: u64 = 1;
-var epoch_exhausted = false;
-const NativePort = struct { owner: u32 = 0, identity: abi.GfxOutputId = .{}, head: u32 = 0 };
-var native_ports: [abi.gfx_output_max_assignments]NativePort = @splat(.{});
-fn nativePort(owner: u32, identity: abi.GfxOutputId) ?*NativePort {
-    if (owner == 0) return null;
-    for (&native_ports) |*port| if (port.owner == owner and samePort(port.identity, identity)) return port;
-    return null;
-}
-fn samePort(left: abi.GfxOutputId, right: abi.GfxOutputId) bool {
-    return left.adapter_id == right.adapter_id and left.connector_id == right.connector_id and left.device_generation == right.device_generation;
-}
-
-pub fn initBoot(frame: *const @import("framebuffer.zig").Framebuffer) void {
-    if (frame.width == 0 or frame.height == 0 or frame.width > 65536 or frame.height > 65536) return;
-    var data: [abi.gfx_output_max_edid_bytes]u8 = .{0} ** abi.gfx_output_max_edid_bytes;
-    var bytes: usize = 0;
-    if (frame.edid) |pointer| if (frame.edid_size <= data.len and frame.edid_size % 128 == 0) {
-        bytes = @intCast(frame.edid_size);
-        const source: [*]const u8 = @ptrCast(pointer);
-        @memcpy(data[0..bytes], source[0..bytes]);
+pub const NativeAdmission = extern struct { ticket: model.Ticket, mode: abi.GfxOutputMode, revision: u64 };
+const Frame = @import("framebuffer.zig").Framebuffer;
+const Args = extern struct {
+    owner: u32 = 0,
+    actor: buffers.Owner = .{ .kind = .kernel, .id = 0, .generation = 0 },
+    identity: abi.GfxOutputId = .{},
+    target: abi.GfxOutputTarget = .{},
+    binding: abi.GfxBackendBinding = .{},
+    index: u32 = 0,
+    head: u32 = 0,
+    width: u32 = 0,
+    height: u32 = 0,
+    value: u64 = 0,
+    other: u64 = 0,
+    ticket: model.Ticket = .{},
+    operation: u32 = 0,
+    outcome: u32 = 0,
+    quiesced: u32 = 0,
+    flag: bool = false,
+    other_flag: bool = false,
+    input: ?*const anyopaque = null,
+    frame: ?*const Frame = null,
+};
+const OptionalInfo = extern struct { has: bool, value: abi.GfxOutputInfo };
+const OptionalMode = extern struct { has: bool, value: abi.GfxOutputMode };
+const OptionalEdid = extern struct { has: bool, value: abi.GfxEdidBlock };
+const OptionalAudio = extern struct { has: bool, value: abi.GfxAudioRoute };
+const OptionalId = extern struct { has: bool, value: abi.GfxOutputId };
+extern fn r4os_rust_display_outputs(u32, *const Args, ?*anyopaque) i32;
+fn status(code: i32) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Overflow,
+        3 => error.Unsupported,
+        4 => error.Exhausted,
+        5 => error.Budget,
+        6 => error.Capacity,
+        7 => error.Stale,
+        8 => error.Busy,
+        9 => error.Closed,
+        10 => error.WrongOwner,
+        11 => error.OutOfMemory,
+        12 => error.Unavailable,
+        13 => error.WaitTimeout,
+        14 => error.WaitCancelled,
+        16 => error.AlreadyCompleted,
+        17 => error.Bandwidth,
+        18 => error.Routing,
+        19 => error.Dependency,
+        20 => error.DeviceLost,
+        else => unreachable,
     };
-    const width: u32 = @intCast(frame.width); const height: u32 = @intCast(frame.height);
-    const info = abi.GfxOutputInfo{ .identity = .{ .connector_id = 1, .device_generation = 1 },
-        .flags = abi.gfx_output_flag_connected | abi.gfx_output_flag_firmware_snapshot | abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry | abi.gfx_output_flag_connection_unknown,
-        .connector_kind = abi.gfx_output_kind_firmware, .mode_count = 1, .preferred_mode_id = 1, .edid_bytes = @intCast(bytes),
-        .possible_heads = 1, .possible_planes = 1, .possible_plls = 1,
-        .limits = .{ .head_mask = 1, .plane_mask = 1, .pll_mask = 1, .max_width = width, .max_height = height } };
-    const mode = abi.GfxOutputMode{ .mode_id = 1, .flags = abi.gfx_output_mode_geometry_only | abi.gfx_output_mode_preferred, .width = width, .height = height };
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    if (catalog.revision != 0) return;
-    _ = catalog.publish(0, info, &.{mode}, data[0..bytes]) catch return;
-    // Boot runs before the scheduler activity wait exists. First consumers
-    // simply observe the initial revision; no wake is necessary here.
+}
+fn call(op: u32, args: Args) Error!void {
+    try status(r4os_rust_display_outputs(op, &args, null));
+}
+fn result(comptime T: type, op: u32, args: Args) Error!T {
+    var out: T = undefined;
+    try status(r4os_rust_display_outputs(op, &args, &out));
+    return out;
+}
+pub fn initBoot(frame: *const Frame) void {
+    call(0, .{ .frame = frame }) catch unreachable;
 }
 pub fn revision() abi.GfxDisplayRevision {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.cursor();
+    return result(abi.GfxDisplayRevision, 1, .{}) catch unreachable;
 }
 pub fn infoAt(index: u32) ?abi.GfxOutputInfo {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.infoAt(index);
+    const out = result(OptionalInfo, 2, .{ .index = index }) catch unreachable;
+    return if (out.has) out.value else null;
 }
 pub fn colorAt(identity: abi.GfxOutputId) Error!abi.GfxOutputColorState {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.colorAt(identity);
+    return result(abi.GfxOutputColorState, 3, .{ .identity = identity });
 }
 pub fn publishColor(owner: u32, value: abi.GfxOutputColorState) Error!void {
-    if (irq.inDispatch()) return error.Invalid;
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        break :blk try catalog.publishColor(owner, value);
-    };
-    if (changed) events.signal();
-}
-fn refreshNow() u64 { return @import("../platform/monotonic.zig").nowNanoseconds() orelse 0; }
-fn currentRefreshTarget(target: abi.GfxOutputTarget) Error!void {
-    const current = @import("native_driver.zig").outputTarget(target.adapter_id, target.head_id) catch return error.Stale;
-    if (!std.meta.eql(current, target)) return error.Stale;
+    try call(4, .{ .owner = owner, .input = &value });
 }
 pub fn refreshAt(target: abi.GfxOutputTarget) Error!abi.GfxOutputRefresh {
-    try currentRefreshTarget(target);
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.refreshAt(target);
+    return result(abi.GfxOutputRefresh, 5, .{ .target = target });
 }
 pub fn publishRefresh(owner: u32, value: abi.GfxOutputRefresh) Error!void {
-    if (irq.inDispatch()) return error.Invalid;
-    if (value.status.phase == abi.gfx_refresh_phase_active) try currentRefreshTarget(value.target);
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        try registeredHeadLocked(owner, .{ .adapter_id = value.target.adapter_id, .connector_id = value.target.connector_id,
-            .device_generation = value.target.device_generation, .connection_generation = value.target.connection_generation }, value.target.head_id);
-        break :blk try catalog.publishRefresh(owner, value);
-    };
-    if (changed) events.signal();
+    try call(6, .{ .owner = owner, .input = &value });
 }
 pub fn requestRefresh(actor: buffers.Owner, input: abi.GfxRefreshRequest) Error!abi.GfxRefreshRequest {
-    if (irq.inDispatch()) return error.Invalid;
-    try currentRefreshTarget(input.target);
-    const now = refreshNow();
-    var owner: u32 = 0;
-    const value = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        owner = (try catalog.refreshEntry(input.target)).owner;
-        break :blk try catalog.requestRefresh(actor, input, now);
-    };
-    queue.wakeOutput(owner, input.target) catch {};
-    return value;
+    return result(abi.GfxRefreshRequest, 7, .{ .actor = actor, .input = &input });
 }
 pub fn readRefresh(owner: u32, target: abi.GfxOutputTarget) Error!abi.GfxRefreshRequest {
-    if (irq.inDispatch()) return error.Invalid;
-    const now = refreshNow();
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.readRefresh(owner, target, now);
+    return result(abi.GfxRefreshRequest, 8, .{ .owner = owner, .target = target });
 }
 pub fn refreshStopped(actor: buffers.Owner) void {
-    // One small snapshot at a time; no catalog-sized array on kernel stacks.
-    for (0..catalog.entries.len) |index| {
-        const Wake = struct { owner: u32, target: abi.GfxOutputTarget };
-        const wake: ?Wake = blk: {
-            const token = ownership.enterState(); defer ownership.leaveState(token);
-            const entry = &catalog.entries[index];
-            if (entry.refresh.stopped(actor)) if (entry.refresh.value) |value|
-                break :blk .{ .owner = entry.owner, .target = value.target };
-            break :blk null;
-        };
-        if (wake) |value| queue.wakeOutput(value.owner, value.target) catch {};
-    }
+    call(9, .{ .actor = actor }) catch unreachable;
 }
 pub fn powerAt(identity: abi.GfxOutputId) Error!abi.GfxOutputPower {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.powerAt(identity);
+    return result(abi.GfxOutputPower, 10, .{ .identity = identity });
 }
 pub fn publishPower(owner: u32, value: abi.GfxOutputPower) Error!void {
-    if (irq.inDispatch()) return error.Invalid;
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (nativePort(owner, value.identity) == null) return error.Stale;
-        break :blk try catalog.publishPower(owner, value);
-    };
-    if (changed) events.signal();
-}
-fn wakePower(owner: u32, identity: abi.GfxOutputId) void {
-    // Queue wake binds only the owned adapter/device generation. A sleeping
-    // output has no current scanout target and cannot submit new presents.
-    queue.wakeOutput(owner, .{ .adapter_id = identity.adapter_id, .device_generation = identity.device_generation,
-        .connector_id = identity.connector_id, .connection_generation = identity.connection_generation }) catch {};
+    try call(11, .{ .owner = owner, .input = &value });
 }
 pub fn requestPower(actor: buffers.Owner, input: abi.GfxPowerRequest) Error!abi.GfxPowerRequest {
-    if (irq.inDispatch()) return error.Invalid;
-    const now = refreshNow();
-    var owner: u32 = 0;
-    const value = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        owner = (try catalog.powerEntry(input.identity)).owner;
-        break :blk try catalog.requestPower(actor, input, now);
-    };
-    wakePower(owner, input.identity);
-    return value;
+    return result(abi.GfxPowerRequest, 12, .{ .actor = actor, .input = &input });
 }
 pub fn readPower(owner: u32, identity: abi.GfxOutputId) Error!abi.GfxPowerRequest {
-    if (irq.inDispatch()) return error.Invalid;
-    const now = refreshNow();
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.readPower(owner, identity, now);
+    return result(abi.GfxPowerRequest, 13, .{ .owner = owner, .identity = identity });
 }
 pub fn powerStopped(actor: buffers.Owner) void {
-    for (0..catalog.entries.len) |index| {
-        const Wake = struct { owner: u32, identity: abi.GfxOutputId };
-        const wake: ?Wake = blk: {
-            const token = ownership.enterState(); defer ownership.leaveState(token);
-            const entry = &catalog.entries[index];
-            if (entry.power.stopped(actor)) break :blk .{ .owner = entry.owner, .identity = entry.info.identity };
-            break :blk null;
-        };
-        if (wake) |value| wakePower(value.owner, value.identity);
-    }
+    call(14, .{ .actor = actor }) catch unreachable;
 }
 pub fn modeAt(identity: abi.GfxOutputId, index: u32) Error!?abi.GfxOutputMode {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.modeAt(identity, index);
+    const out = try result(OptionalMode, 15, .{ .identity = identity, .index = index });
+    return if (out.has) out.value else null;
 }
 pub fn edidAt(identity: abi.GfxOutputId, index: u32) Error!?abi.GfxEdidBlock {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    const entry = try catalog.find(identity);
-    if (index >= entry.info.edid_bytes / 128) return null;
-    var result = abi.GfxEdidBlock{ .identity = identity, .block_index = index };
-    @memcpy(&result.data, entry.edid[index * 128 ..][0..128]);
-    return result;
+    const out = try result(OptionalEdid, 16, .{ .identity = identity, .index = index });
+    return if (out.has) out.value else null;
 }
 pub fn publish(owner: u32, input: *const abi.GfxOutputPublication) Error!abi.GfxOutputId {
-    if (owner == 0 or irq.inDispatch() or input.version != 1 or input.size < @sizeOf(abi.GfxOutputPublication) or
-        input.info.mode_count > abi.gfx_output_max_modes or input.info.edid_bytes > abi.gfx_output_max_edid_bytes) return error.Invalid;
-    if (input.info.flags & (abi.gfx_output_flag_firmware_snapshot | abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry) != 0 or
-        input.info.identity.adapter_id != input.backend.adapter_id or input.info.identity.device_generation != input.backend.device_generation) return error.Invalid;
-    const modeset = input.info.limits.flags & abi.gfx_output_limit_modeset != 0;
-    if (modeset and !@import("native_driver.zig").modesEnabled(owner, input.backend)) return error.Unsupported;
-    for (input.modes[input.info.mode_count..]) |value| if (!std.meta.eql(value, abi.GfxOutputMode{})) return error.Invalid;
-    for (input.edid[input.info.edid_bytes..]) |value| if (value != 0) return error.Invalid;
-    const epoch = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (epoch_exhausted) return error.Exhausted;
-        break :blk owner_epoch;
-    };
-    try queue.validateOutputBinding(owner, input.backend);
-    const identity = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (epoch_exhausted or owner_epoch != epoch) return error.Stale;
-        var info = input.info;
-        if (nativePort(owner, info.identity) != null and nativePresence(info.flags, true))
-            info.flags |= abi.gfx_output_flag_active | (if (modeset) @as(u32, 0) else abi.gfx_output_flag_fixed_geometry);
-        break :blk if (modeset) try catalog.publishModeset(owner, info, input.modes[0..info.mode_count], input.edid[0..info.edid_bytes]) else
-            try catalog.publish(owner, info, input.modes[0..info.mode_count], input.edid[0..info.edid_bytes]);
-    };
-    events.signal(); // Complete topology is visible before sequence + wake.
-    return identity;
+    return result(abi.GfxOutputId, 17, .{ .owner = owner, .input = input });
 }
 pub fn withdraw(owner: u32, identity: abi.GfxOutputId) Error!void {
-    if (irq.inDispatch()) return error.Invalid;
-    {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        const entry = try catalog.find(identity);
-        if (owner == 0 or entry.owner != owner or entry.receiver_source != 0) return error.Stale;
-    }
-    // Request rollback before removing the identity used by its receipt.
-    // The driver retries withdrawal after draining its real GPU operation.
-    if (@import("mode_work.zig").withdrawingOutput(owner, identity)) return error.Busy;
-    {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        try catalog.withdraw(owner, identity);
-    }
-    events.signal();
+    try call(18, .{ .owner = owner, .identity = identity });
 }
 pub fn pause(owner: u32, identity: abi.GfxOutputId, paused: bool) Error!void {
-    if (irq.inDispatch()) return error.Invalid;
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (nativePort(owner, identity) == null) return error.Stale;
-        const entry = try catalog.find(identity);
-        if (!paused and !nativePresence(entry.info.flags, true)) return error.Stale;
-        break :blk try catalog.pause(owner, identity, paused, true);
-    };
-    if (paused) _ = @import("mode_work.zig").withdrawingOutput(owner, identity);
-    if (changed) events.signal();
+    try call(19, .{ .owner = owner, .identity = identity, .flag = paused });
 }
 pub fn nativePaused(owner: u32, identity: abi.GfxOutputId) bool {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    for (&catalog.entries) |*entry| if (entry.owner == owner and entry.receiver_source == 0 and samePort(entry.info.identity, identity))
-        return entry.paused;
-    return false;
+    return result(bool, 20, .{ .owner = owner, .identity = identity }) catch unreachable;
 }
 pub fn receiverEpoch() u64 {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return owner_epoch;
+    return result(u64, 21, .{}) catch unreachable;
 }
 pub fn registerReceiverSource(owner: buffers.Owner, adapter: u32, epoch: u64) Error!abi.GfxReceiverSource {
-    if (irq.inDispatch()) return error.Invalid;
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    if (epoch_exhausted) return error.Exhausted;
-    if (epoch != owner_epoch) return error.Stale;
-    return catalog.registerSource(owner, adapter);
+    return result(abi.GfxReceiverSource, 22, .{ .actor = owner, .index = adapter, .value = epoch });
 }
 pub fn replaceReceivers(owner: buffers.Owner, input: *const abi.GfxReceiverUpdate) Error!void {
-    if (irq.inDispatch() or input.version != 1 or input.size < @sizeOf(abi.GfxReceiverUpdate) or
-        input.reserved0 != 0 or input.count > abi.gfx_receiver_max_outputs or
-        (input.count == 0) != (input.receivers == 0) or input.receivers % @alignOf(abi.GfxReceiverInfo) != 0 or
-        input.receivers > std.math.maxInt(u64) - @as(u64, input.count) * @sizeOf(abi.GfxReceiverInfo)) return error.Invalid;
-    // Unlike pageable R4X payloads this bridge accepts exclusively borrowed
-    // resident R4D memory. Only bounded counted prefixes are copied; never a
-    // 32-record snapshot on the worker/kernel stack.
-    const records: []const abi.GfxReceiverInfo = if (input.count == 0) &.{} else
-        @as([*]const abi.GfxReceiverInfo, @ptrFromInt(input.receivers))[0..input.count];
-    {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (epoch_exhausted) return error.Exhausted;
-        try catalog.replaceReceivers(owner, input.source, input.sequence, records);
-    }
-    events.signal();
+    try call(23, .{ .actor = owner, .input = input });
 }
 pub fn closeReceiverSource(owner: buffers.Owner, binding: abi.GfxReceiverSource) Error!void {
-    if (irq.inDispatch()) return error.Invalid;
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        break :blk try catalog.closeSource(owner, binding);
-    };
-    if (changed) events.signal();
+    try call(24, .{ .actor = owner, .input = &binding });
 }
 pub fn publishAudio(owner: buffers.Owner, input: *const abi.GfxAudioRoute) Error!void {
-    if (irq.inDispatch()) return error.Invalid;
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    if (epoch_exhausted) return error.Exhausted;
-    try catalog.publishAudio(owner, input);
+    try call(25, .{ .actor = owner, .input = input });
 }
 pub fn queryAudio(location: u32, device: u32, index: u32) ?abi.GfxAudioRoute {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.audio.query(location, device, index);
+    const out = result(OptionalAudio, 26, .{ .owner = location, .head = device, .index = index }) catch unreachable;
+    return if (out.has) out.value else null;
 }
 pub fn stoppedDriver(owner: u32) void {
-    if (owner == 0) return;
-    @import("output_runtime.zig").stoppedDriver(owner);
-    @import("mode_work.zig").stoppedDriver(owner);
-    @import("cursor_work.zig").stoppedDriver(owner);
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (owner_epoch == std.math.maxInt(u64)) epoch_exhausted = true else owner_epoch += 1;
-        for (&native_ports) |*port| if (port.owner == owner) { port.* = .{}; };
-        break :blk catalog.stop(owner) catch {
-            // Exhaustion is fail-closed: no stale receiver data survives.
-            for (&catalog.entries) |*entry| if (entry.owner == owner) { entry.* = .{}; };
-            epoch_exhausted = true;
-            break :blk true;
-        };
-    };
-    if (changed) events.signal();
+    call(27, .{ .owner = owner }) catch unreachable;
 }
 pub fn bootActive(active: bool) void {
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        const entry = &catalog.entries[0];
-        if (entry.info.identity.connector_id == 0 or entry.info.identity.adapter_id != 0) break :blk false;
-        const was = entry.info.flags & abi.gfx_output_flag_active != 0;
-        if (was == active) break :blk false;
-        if (catalog.revision == std.math.maxInt(u64)) { epoch_exhausted = true; break :blk false; }
-        if (active) entry.info.flags |= abi.gfx_output_flag_active else entry.info.flags &= ~abi.gfx_output_flag_active;
-        catalog.revision += 1;
-        break :blk true;
-    };
-    if (changed) events.signal();
+    call(28, .{ .flag = active }) catch unreachable;
 }
 pub fn validateNative(owner: u32, backend: abi.GfxBackendBinding, identity: abi.GfxOutputId, width: u32, height: u32, held: bool) Error!void {
-    try queue.validateOutputBinding(owner, backend);
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    if (epoch_exhausted) return error.Exhausted;
-    const entry = try catalog.find(identity);
-    if (owner == 0 or entry.owner != owner or entry.receiver_source != 0 or identity.adapter_id != backend.adapter_id or
-        identity.device_generation != backend.device_generation or !nativePresence(entry.info.flags, held)) return error.Stale;
-    for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.width == width and mode.height == height) return;
-    return error.Unsupported;
+    try call(29, .{ .owner = owner, .binding = backend, .identity = identity, .width = width, .height = height, .flag = held });
 }
 pub fn cursorHead(owner: u32, identity: abi.GfxOutputId) Error!u32 {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    const route = nativePort(owner, identity) orelse return error.Stale;
-    if (epoch_exhausted) return error.Stale;
-    for (&catalog.entries) |*entry| if (entry.owner == owner and samePort(identity, entry.info.identity) and
-        entry.info.flags & abi.gfx_output_flag_active != 0) {
-        return route.head;
+    return result(u32, 30, .{ .owner = owner, .identity = identity });
+}
+pub fn activeTarget(owner: u32, identity: abi.GfxOutputId, generation: u64) error{Stale}!abi.GfxOutputTarget {
+    return result(abi.GfxOutputTarget, 31, .{ .owner = owner, .identity = identity, .value = generation }) catch |err| {
+        if (err == error.Stale) return error.Stale;
+        unreachable;
     };
-    return error.Unsupported;
 }
-pub fn activeTarget(owner: u32, port: abi.GfxOutputId, generation: u64) error{Stale}!abi.GfxOutputTarget {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return activeTargetLocked(owner, port, generation);
-}
-pub fn activeTargetLocked(owner: u32, port: abi.GfxOutputId, generation: u64) error{Stale}!abi.GfxOutputTarget {
-    if (epoch_exhausted or generation == 0) return error.Stale;
-    for (&catalog.entries) |*entry| if (entry.owner == owner and entry.receiver_source == 0 and
-        samePort(port, entry.info.identity) and !entry.paused and entry.info.flags & abi.gfx_output_flag_active != 0) {
-        const head = if (nativePort(owner, port)) |route| route.head else if (owner == 0 and entry.info.possible_heads == 1) @as(u32, 0) else return error.Stale;
-        return @import("output_target.zig").fromOutput(entry.info.identity, head, generation);
+pub fn activeTargetLocked(owner: u32, identity: abi.GfxOutputId, generation: u64) error{Stale}!abi.GfxOutputTarget {
+    return result(abi.GfxOutputTarget, 32, .{ .owner = owner, .identity = identity, .value = generation }) catch |err| {
+        if (err == error.Stale) return error.Stale;
+        unreachable;
     };
-    return error.Stale;
 }
-// The caller holds the output state owner, after the BO/queue mutex when
-// needed. Receiver validation and admission share this critical section.
 pub fn validateTargetLocked(owner: u32, target: abi.GfxOutputTarget) queue.Error!void {
-    if (epoch_exhausted or !@import("output_target.zig").valid(target)) return error.Stale;
-    const entry = catalog.find(.{ .adapter_id = target.adapter_id, .connector_id = target.connector_id,
-        .device_generation = target.device_generation, .connection_generation = target.connection_generation }) catch return error.Stale;
-    if (entry.owner != owner or entry.receiver_source != 0 or entry.paused or entry.info.flags & abi.gfx_output_flag_active == 0 or
-        entry.info.possible_heads & (@as(u32, 1) << @intCast(target.head_id)) == 0) return error.Stale;
-    const route = nativePort(owner, entry.info.identity) orelse return error.Stale;
-    if (route.head != target.head_id) return error.Stale;
+    call(33, .{ .owner = owner, .target = target }) catch |err| {
+        if (err == error.Stale) return error.Stale;
+        unreachable;
+    };
 }
 pub fn registeredHeadLocked(owner: u32, identity: abi.GfxOutputId, head: u32) Error!void {
-    const entry = try catalog.find(identity);
-    if (epoch_exhausted or entry.owner != owner or entry.receiver_source != 0 or head >= abi.gfx_output_max_assignments or
-        entry.info.possible_heads & (@as(u32, 1) << @intCast(head)) == 0) return error.Stale;
-    for (&native_ports) |*port| if (port.owner != 0 and port.identity.adapter_id == identity.adapter_id and !samePort(port.identity, identity)) {
-        if (port.head == head) return error.Busy;
-    };
+    try call(34, .{ .owner = owner, .identity = identity, .head = head });
 }
 pub fn validateAdditionalLocked(owner: u32, request: abi.GfxAdditionalOutput) Error!void {
-    try registeredHeadLocked(owner, request.output, request.head_id);
-    const entry = try catalog.find(request.output);
-    if (nativePort(owner, request.output) != null or !nativePresence(entry.info.flags, false)) return error.Stale;
-    // Registration is paused. A retained headless shadow may have the old
-    // receiver's geometry; activation still requires a published mode below.
+    try call(35, .{ .owner = owner, .input = &request });
 }
 pub fn validateAdditionalActivationLocked(owner: u32, identity: abi.GfxOutputId, head: u32, width: u32, height: u32) Error!void {
-    try registeredHeadLocked(owner, identity, head);
-    const entry = try catalog.find(identity);
-    if (!nativePresence(entry.info.flags, false)) return error.Stale;
-    for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.width == width and mode.height == height) return;
-    return error.Unsupported;
+    try call(36, .{ .owner = owner, .identity = identity, .head = head, .width = width, .height = height });
 }
 pub fn pauseAdditionalLocked(owner: u32, identity: abi.GfxOutputId, paused: bool) Error!bool {
-    return catalog.pause(owner, identity, paused, false);
+    return result(bool, 37, .{ .owner = owner, .identity = identity, .flag = paused });
 }
 pub fn currentIdentityLocked(owner: u32, identity: abi.GfxOutputId) ?abi.GfxOutputId {
-    for (&catalog.entries) |*entry| if (entry.owner == owner and entry.receiver_source == 0 and samePort(entry.info.identity, identity)) return entry.info.identity;
-    return null;
+    const out = result(OptionalId, 38, .{ .owner = owner, .identity = identity }) catch unreachable;
+    return if (out.has) out.value else null;
 }
 pub fn connectedLocked(owner: u32, identity: abi.GfxOutputId) bool {
-    const entry = catalog.find(identity) catch return false;
-    return entry.owner == owner and !entry.paused and entry.info.flags & abi.gfx_output_flag_connected != 0;
+    return result(bool, 39, .{ .owner = owner, .identity = identity }) catch unreachable;
 }
 pub fn forgetNativePortLocked(owner: u32, identity: abi.GfxOutputId) void {
-    if (nativePort(owner, identity)) |route| route.* = .{};
-}
-fn nativePresence(flags: u32, held: bool) bool {
-    // An authenticated held boot route may keep driving an unresponsive sink.
-    // This preserves the distinction between active scanout and connection.
-    return flags & abi.gfx_output_flag_connected != 0 or
-        (held and flags & abi.gfx_output_flag_connection_unknown != 0);
+    call(40, .{ .owner = owner, .identity = identity }) catch unreachable;
 }
 pub fn nativeActive(owner: u32, identity: abi.GfxOutputId, active: bool) void {
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        for (&catalog.entries) |*entry| {
-            if (entry.owner != owner or !samePort(entry.info.identity, identity)) continue;
-            const head = if (nativePort(owner, identity)) |port| port.head else if (@popCount(entry.info.possible_heads) == 1)
-                @as(u32, @ctz(entry.info.possible_heads)) else break :blk false;
-            break :blk setNativeActiveLocked(owner, entry.info.identity, head, active) catch false;
-        }
-        break :blk false;
-    };
-    if (changed) events.signal();
+    call(41, .{ .owner = owner, .identity = identity, .flag = active }) catch unreachable;
 }
 pub fn setNativeActiveLocked(owner: u32, identity: abi.GfxOutputId, head: u32, active: bool) Error!bool {
-    if (owner == 0 or epoch_exhausted) return error.Stale;
-    if (active) try registeredHeadLocked(owner, identity, head);
-    const entry = @constCast(try catalog.find(identity)); // Mutable catalog, held output state owner.
-    if (catalog.revision == std.math.maxInt(u64)) return error.Exhausted;
-    if (active) {
-        const port = nativePort(owner, identity) orelse for (&native_ports) |*candidate| {
-            if (candidate.owner == 0) break candidate;
-        } else return error.Capacity;
-        port.* = .{ .owner = owner, .identity = identity, .head = head };
-    } else if (nativePort(owner, identity)) |port| { port.* = .{}; }
-    const was = entry.info.flags & abi.gfx_output_flag_active != 0;
-    const enabled = active and !entry.paused and nativePresence(entry.info.flags, true);
-    if (enabled) entry.info.flags |= abi.gfx_output_flag_active |
-        (if (entry.info.limits.flags & abi.gfx_output_limit_modeset != 0) @as(u32, 0) else abi.gfx_output_flag_fixed_geometry) else
-        entry.info.flags &= ~(abi.gfx_output_flag_active | abi.gfx_output_flag_fixed_geometry);
-    if (was == enabled) return false;
-    catalog.revision += 1;
-    return true;
+    return result(bool, 42, .{ .owner = owner, .identity = identity, .head = head, .flag = active });
 }
-fn gather(owner: buffers.Owner, state: *const abi.GfxAtomicState, result: *[abi.gfx_output_max_assignments]model.Fact) Error!void {
-    if (state.count == 0 or state.count > result.len) return error.Invalid;
-    for (state.assignments[0..state.count], result[0..state.count]) |assignment, *fact| {
-        fact.* = .{};
-        if (!std.meta.eql(assignment.buffer, abi.GfxBufferHandle{})) {
-            const reference = try buffer_api.handle(assignment.buffer);
-            buffers.lock();
-            const descriptor = buffers.store.describe(reference, owner) catch |err| { buffers.unlock(); return err; };
-            buffers.unlock();
-            fact.buffer = descriptor;
-        }
-        if (!std.meta.eql(assignment.ready_fence, abi.GfxFence{})) {
-            const status = try queue.query(queue_api.fence(assignment.ready_fence));
-            fact.dependency = if (status.phase != .terminal or status.device_active or status.resources_held) .pending else
-                if (status.result == .complete) .ready else .failed;
-        }
-    }
+pub fn atomic(owner: buffers.Owner, input: *const abi.GfxAtomicState, commit: bool) Error!abi.GfxAtomicResult {
+    return result(abi.GfxAtomicResult, 43, .{ .actor = owner, .input = input, .flag = commit });
 }
-pub fn atomic(owner: buffers.Owner, state: *const abi.GfxAtomicState, commit: bool) Error!abi.GfxAtomicResult {
-    if (irq.inDispatch()) return error.Invalid;
-    var facts: [abi.gfx_output_max_assignments]model.Fact = .{model.Fact{}} ** abi.gfx_output_max_assignments;
-    try gather(owner, state, &facts);
-    if (!commit) {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        return catalog.validate(state, facts[0..state.count]);
-    }
-    // Shared admission with all normal presenters and the existing takeover
-    // path. A fixed-geometry retention performs no firmware/device write.
-    if (!display.beginOutputCommit()) return error.Busy;
-    defer display.endOutputCommit();
-    if (display.backendState().state != .bootfb or state.count != 1 or state.assignments[0].output.adapter_id != 0) return error.Unsupported;
-    const result = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        const ticket = try catalog.begin(state, facts[0..state.count]);
-        var result = try catalog.finish(ticket, abi.gfx_output_outcome_applied, 3);
-        result.retained = 0; // No new/old BO lease exists for firmware retention.
-        break :blk result;
-    };
-    events.signal();
-    return result;
+pub fn nativeMode(owner: buffers.Owner, input: *const abi.GfxAtomicState) Error!abi.GfxOutputMode {
+    return result(abi.GfxOutputMode, 44, .{ .actor = owner, .input = input });
 }
-
-pub const NativeAdmission = struct { ticket: model.Ticket, mode: abi.GfxOutputMode, revision: u64 };
-pub fn nativeMode(owner: buffers.Owner, state: *const abi.GfxAtomicState) Error!abi.GfxOutputMode {
-    var facts: [abi.gfx_output_max_assignments]model.Fact = @splat(.{});
-    try gather(owner, state, &facts);
-    if (state.count != 1 or state.assignments[0].output.adapter_id == 0) return error.Unsupported;
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    _ = try catalog.validate(state, facts[0..1]);
-    const entry = try catalog.find(state.assignments[0].output);
-    for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.mode_id == state.assignments[0].mode_id) return mode;
-    return error.Stale;
-}
-pub fn beginNative(owner: buffers.Owner, state: *const abi.GfxAtomicState) Error!NativeAdmission {
-    var facts: [abi.gfx_output_max_assignments]model.Fact = @splat(.{});
-    try gather(owner, state, &facts);
-    if (state.count != 1 or state.assignments[0].output.adapter_id == 0) return error.Unsupported;
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    if (epoch_exhausted) return error.Exhausted;
-    if (catalog.revision > std.math.maxInt(u64) - 3 or catalog.commit_sequence > std.math.maxInt(u64) - 2) return error.Exhausted;
-    const entry = try catalog.find(state.assignments[0].output);
-    for (entry.modes[0..entry.info.mode_count]) |mode| if (mode.mode_id == state.assignments[0].mode_id) {
-        return .{ .ticket = try catalog.begin(state, facts[0..1]), .mode = mode, .revision = catalog.revision };
-    };
-    return error.Stale;
+pub fn beginNative(owner: buffers.Owner, input: *const abi.GfxAtomicState) Error!NativeAdmission {
+    return result(NativeAdmission, 45, .{ .actor = owner, .input = input });
 }
 pub fn finishNative(ticket: model.Ticket, operation: u32, outcome: u32, quiesced: u32) Error!abi.GfxAtomicResult {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    if (operation == abi.gfx_mode_operation_apply) return catalog.finish(ticket, outcome, quiesced);
-    if (catalog.pending.id != 0 or catalog.retained != 0) return error.Busy;
-    if (catalog.revision == std.math.maxInt(u64) or catalog.commit_sequence == std.math.maxInt(u64)) return error.Exhausted;
-    if (outcome == abi.gfx_output_outcome_lost) catalog.retained = 3;
-    if (operation == abi.gfx_mode_operation_rollback and outcome == abi.gfx_output_outcome_old_preserved) catalog.commit_sequence += 1;
-    catalog.revision += 1;
-    return .{ .topology_revision = catalog.revision, .commit_sequence = catalog.commit_sequence, .outcome = outcome,
-        .retained = if (outcome == abi.gfx_output_outcome_lost) 3 else if (outcome == abi.gfx_output_outcome_applied) 2 else 1 };
+    return result(abi.GfxAtomicResult, 46, .{ .ticket = ticket, .operation = operation, .outcome = outcome, .quiesced = quiesced });
 }
 pub fn canFinishNative(ticket: model.Ticket, operation: u32) Error!void {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    if (operation == abi.gfx_mode_operation_apply) {
-        if (ticket.id == 0 or catalog.pending.id != ticket.id) return error.Stale;
-    } else if (catalog.pending.id != 0 or catalog.retained != 0) return error.Busy;
-    if (catalog.revision == std.math.maxInt(u64) or catalog.commit_sequence == std.math.maxInt(u64)) return error.Exhausted;
+    try call(47, .{ .ticket = ticket, .operation = operation });
 }
 pub fn retireNativeAfterReset(ticket: model.Ticket) Error!void {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    try catalog.retireAfterReset(ticket);
+    try call(48, .{ .ticket = ticket });
 }
-
 pub fn brightnessAt(identity: abi.GfxOutputId) Error!abi.GfxOutputBrightness {
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.brightnessAt(identity);
+    return result(abi.GfxOutputBrightness, 49, .{ .identity = identity });
 }
 pub fn publishBrightness(owner: u32, value: abi.GfxOutputBrightness) Error!void {
-    if (irq.inDispatch()) return error.Invalid;
-    const changed = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        if (nativePort(owner, value.identity) == null) return error.Stale;
-        break :blk try catalog.publishBrightness(owner, value);
-    };
-    if (changed) events.signal();
+    try call(50, .{ .owner = owner, .input = &value });
 }
 pub fn requestBrightness(actor: buffers.Owner, input: abi.GfxBrightnessRequest) Error!abi.GfxBrightnessRequest {
-    if (irq.inDispatch()) return error.Invalid;
-    var owner: u32 = 0;
-    const value = blk: {
-        const token = ownership.enterState(); defer ownership.leaveState(token);
-        owner = (try catalog.powerEntry(input.identity)).owner;
-        break :blk try catalog.requestBrightness(actor, input);
-    };
-    wakePower(owner, input.identity);
-    return value;
+    return result(abi.GfxBrightnessRequest, 51, .{ .actor = actor, .input = &input });
 }
 pub fn readBrightness(owner: u32, identity: abi.GfxOutputId) Error!abi.GfxBrightnessRequest {
-    if (irq.inDispatch()) return error.Invalid;
-    const token = ownership.enterState(); defer ownership.leaveState(token);
-    return catalog.readBrightness(owner, identity);
+    return result(abi.GfxBrightnessRequest, 52, .{ .owner = owner, .identity = identity });
+}
+comptime {
+    if (@sizeOf(Args) != 208 or @offsetOf(Args, "actor") != 8 or @offsetOf(Args, "binding") != 104 or @offsetOf(Args, "input") != 192 or @offsetOf(Args, "frame") != 200 or @sizeOf(NativeAdmission) != 80 or @offsetOf(NativeAdmission, "revision") != 72) @compileError("Native output runtime C layout");
+}
+
+// Temporary typed peers to the still-Zig queue/display/mode/cursor runtime
+// owners. They own no catalog/epoch state and are removed as those owners move.
+fn peerCode(err: anyerror) i32 {
+    return switch (err) {
+        error.Invalid => 1,
+        error.Overflow => 2,
+        error.Unsupported => 3,
+        error.Exhausted => 4,
+        error.Budget => 5,
+        error.Capacity => 6,
+        error.Stale => 7,
+        error.Busy => 8,
+        error.Closed => 9,
+        error.WrongOwner => 10,
+        error.OutOfMemory => 11,
+        error.Unavailable => 12,
+        error.WaitTimeout => 13,
+        error.WaitCancelled => 14,
+        error.Disabled => 15,
+        error.AlreadyCompleted => 16,
+        error.Bandwidth => 17,
+        error.Routing => 18,
+        error.Dependency => 19,
+        error.DeviceLost => 20,
+        error.RestoreFailed => 21,
+        else => unreachable,
+    };
 }

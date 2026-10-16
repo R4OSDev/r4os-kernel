@@ -1,229 +1,102 @@
-const std = @import("std");
+//! Temporary fixed projection of the native public queue API.
 pub const abi = @import("r4os_kernel_contract");
 const runtime = @import("../display/queue.zig");
 const model = runtime.model;
-const resource = @import("../display/queue_resources.zig");
-const buffer_api = @import("gfx_buffer_api.zig");
 const buffers = @import("../memory/gfx_buffers.zig");
-const task_context = @import("../sched/task_context.zig");
-const wire = @import("gfx_queue_wire.zig");
-
+const Args = extern struct { owner: buffers.Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, value: u64 = 0, which: u32 = 0, other: u32 = 0, input: ?*const anyopaque = null, queue: ?*const abi.GfxQueueHandle = null, extra: ?*const anyopaque = null };
+extern fn r4os_rust_gfx_queue_api(u32, *const Args, ?*anyopaque) i32;
 pub fn errorCode(err: runtime.Error) i32 {
-    return switch (err) {
-        error.Unavailable => abi.gfx_queue_error_unavailable,
-        error.DeviceLost => abi.gfx_queue_error_device_lost,
-        error.WaitTimeout => abi.gfx_queue_error_wait_timeout,
-        error.WaitCancelled => abi.gfx_queue_error_wait_cancelled,
-        error.AlreadyCompleted => abi.gfx_queue_error_already_completed,
-        else => |other| buffer_api.status(other),
-    };
+    return r4os_rust_gfx_queue_api(14, &Args{ .which = privateCode(err) }, null);
 }
 pub fn fence(input: abi.GfxFence) model.Fence {
-    return .{ .slot = input.slot, .timeline = input.timeline, .point = input.point, .binding = .{
-        .adapter = input.adapter_id,
-        .device_generation = input.device_generation,
-        .reset_generation = input.reset_generation,
-    } };
+    var out: model.Fence = undefined;
+    _ = r4os_rust_gfx_queue_api(11, &Args{ .input = &input }, &out);
+    return out;
 }
 pub fn publicFence(value: model.Fence) abi.GfxFence {
-    return .{ .slot = value.slot, .timeline = value.timeline, .point = value.point, .adapter_id = value.binding.adapter, .device_generation = value.binding.device_generation, .reset_generation = value.binding.reset_generation };
+    var out: abi.GfxFence = undefined;
+    _ = r4os_rust_gfx_queue_api(12, &Args{ .input = &value }, &out);
+    return out;
 }
 pub fn publicStatus(value: model.Status) abi.GfxFenceStatus {
-    return .{
-        .fence = publicFence(value.fence),
-        .phase = @intFromEnum(value.phase),
-        .result = @intFromEnum(value.result),
-        .milestone = @intFromEnum(value.milestone),
-        .flags = (if (value.device_active) abi.gfx_queue_flag_device_active else @as(u32, 0)) |
-            (if (value.resources_held) abi.gfx_queue_flag_resources_held else @as(u32, 0)),
-        .deadline_ns = value.deadline_ns,
-        .completed_ns = value.completed_ns,
-    };
-}
-fn header(comptime T: type, value: T) bool {
-    return value.version == 1 and value.size >= @sizeOf(T);
+    var out: abi.GfxFenceStatus = undefined;
+    _ = r4os_rust_gfx_queue_api(13, &Args{ .input = &value }, &out);
+    return out;
 }
 pub fn backend(index: u32, output: *abi.GfxBackendBinding) callconv(.c) i32 {
-    if (!buffer_api.validOutput(abi.GfxBackendBinding, output)) return abi.gfx_queue_error_invalid;
-    const info = runtime.backendAt(index) orelse return 0;
-    output.* = .{ .adapter_id = info.binding.adapter, .device_generation = info.binding.device_generation, .reset_generation = info.binding.reset_generation, .milestone = @intFromEnum(info.milestone) };
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(0, &Args{ .which = index }, output);
 }
 pub fn backendInfo(index: u32, output: *abi.GfxBackendInfo) callconv(.c) i32 {
-    const bytes = wire.capacity(abi.GfxBackendInfo, output) orelse return abi.gfx_queue_error_invalid;
-    const info = runtime.backendAt(index) orelse return 0;
-    const result: abi.GfxBackendInfo = .{ .size = bytes, .binding = .{ .adapter_id = info.binding.adapter, .device_generation = info.binding.device_generation, .reset_generation = info.binding.reset_generation, .milestone = @intFromEnum(info.milestone) }, .profile = info.profile, .operations = info.operations, .memory_generation = info.memory_generation };
-    wire.write(abi.GfxBackendInfo, output, bytes, result);
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(1, &Args{ .which = index }, output);
 }
 pub fn backendProperties(input: *const abi.GfxBackendBinding, output: *abi.GfxBackendProperties) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or !buffer_api.validOutput(abi.GfxBackendProperties, output)) return abi.gfx_queue_error_invalid;
-    const value = input.*;
-    if (!header(abi.GfxBackendBinding, value)) return abi.gfx_queue_error_invalid;
-    const result = runtime.backendProperties(.{ .adapter = value.adapter_id, .device_generation = value.device_generation,
-        .reset_generation = value.reset_generation }, value.milestone) catch |err| return errorCode(err);
-    output.* = result orelse return 0;
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(2, &Args{ .input = input }, output);
 }
 pub fn open(owner: buffers.Owner, input: *const abi.GfxQueueConfig, output: *abi.GfxQueueHandle) i32 {
-    if (@intFromPtr(input) == 0 or !buffer_api.validOutput(abi.GfxQueueHandle, output)) return abi.gfx_queue_error_invalid;
-    const value = input.*;
-    if (!header(abi.GfxQueueConfig, value)) return abi.gfx_queue_error_invalid;
-    const config = model.Config{
-        .policy = std.enums.fromInt(model.Policy, value.policy) orelse return abi.gfx_queue_error_unsupported,
-        .milestone = std.enums.fromInt(model.Milestone, value.milestone) orelse return abi.gfx_queue_error_unsupported,
-        .capacity = value.capacity,
-        .binding = .{ .adapter = value.adapter_id, .device_generation = value.device_generation, .reset_generation = value.reset_generation },
-    };
-    const call = task_context.enterUnwind();
-    if (!call.admitted()) return abi.gfx_queue_error_busy;
-    defer _ = task_context.leaveUnwind(call);
-    const timeline = runtime.open(owner, config) catch |err| return errorCode(err);
-    output.* = .{ .timeline = timeline };
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(3, &Args{ .owner = owner, .input = input }, output);
 }
 pub fn close(owner: buffers.Owner, input: *const abi.GfxQueueHandle) i32 {
-    if (@intFromPtr(input) == 0) return abi.gfx_queue_error_invalid;
-    const value = input.*;
-    if (!header(abi.GfxQueueHandle, value)) return abi.gfx_queue_error_invalid;
-    const call = task_context.enterUnwind();
-    if (!call.admitted()) return abi.gfx_queue_error_busy;
-    defer _ = task_context.leaveUnwind(call);
-    runtime.close(owner, value.timeline) catch |err| return errorCode(err);
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(4, &Args{ .owner = owner, .input = input }, null);
 }
 pub fn submit(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, output: *abi.GfxFenceStatus) i32 {
-    return submitCommon(owner, queue_ptr, input, null, null, null, null, null, output);
+    return r4os_rust_gfx_queue_api(5, &Args{ .owner = owner, .queue = queue_ptr, .input = input }, output);
 }
-pub fn submitNative(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission,
-    native_ptr: *const abi.GfxNativeSubmission, output: *abi.GfxFenceStatus) i32
-{
-    if (@intFromPtr(queue_ptr) == 0 or @intFromPtr(input) == 0 or @intFromPtr(native_ptr) == 0 or
-        @intFromPtr(native_ptr) % @alignOf(abi.GfxNativeSubmission) != 0 or
-        !buffer_api.validOutput(abi.GfxFenceStatus, output)) return abi.gfx_queue_error_invalid;
-    const queue = queue_ptr.*;
-    const value = wire.read(abi.GfxSubmission, input) orelse return abi.gfx_queue_error_invalid;
-    const native = native_ptr.*;
-    if (!header(abi.GfxQueueHandle, queue) or value.operation != abi.gfx_queue_operation_native or value.size < @sizeOf(abi.GfxSubmission) or
-        value.dependency_count > model.max_dependencies or !std.meta.eql(value.source, abi.GfxBufferHandle{}) or
-        !std.meta.eql(value.target, abi.GfxBufferHandle{}) or value.source_offset != 0 or value.target_offset != 0 or
-        value.byte_length != 0 or value.row_count != 0 or value.reserved0 != 0 or value.source_pitch != 0 or value.target_pitch != 0 or
-        !std.meta.eql(value.render, abi.GfxRenderCommand{})) return abi.gfx_queue_error_invalid;
-    var dependencies: [model.max_dependencies]model.Fence = undefined;
-    for (value.dependencies, 0..) |dependency, i| {
-        if (i < value.dependency_count) dependencies[i] = fence(dependency) else if (!std.meta.eql(dependency, abi.GfxFence{})) return abi.gfx_queue_error_invalid;
-    }
-    const call = task_context.enterUnwind();
-    if (!call.admitted()) return abi.gfx_queue_error_busy;
-    defer _ = task_context.leaveUnwind(call);
-    const snapshot = runtime.submitNative(owner, queue.timeline, .{ .deadline_ns = value.deadline_ns,
-        .frame_key = value.frame_key, .dependencies = dependencies[0..value.dependency_count] }, native) catch |err| return errorCode(err);
-    output.* = publicStatus(snapshot);
-    return abi.gfx_queue_ok;
+pub fn submitNative(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, native_ptr: *const abi.GfxNativeSubmission, output: *abi.GfxFenceStatus) i32 {
+    return r4os_rust_gfx_queue_api(6, &Args{ .owner = owner, .queue = queue_ptr, .input = input, .extra = native_ptr }, output);
 }
 pub fn submitRenderList(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list_ptr: *const abi.GfxRenderList, output: *abi.GfxFenceStatus) i32 {
-    if (@intFromPtr(list_ptr) == 0 or @intFromPtr(list_ptr) % @alignOf(abi.GfxRenderList) != 0) return abi.gfx_queue_error_invalid;
-    // Copy pageable input before entering the common metadata owner. The
-    // complete 1296-byte value is bounded independently of producer counts.
-    const list = list_ptr.*;
-    return submitCommon(owner, queue_ptr, input, &list, null, null, null, null, output);
+    return r4os_rust_gfx_queue_api(5, &Args{ .owner = owner, .queue = queue_ptr, .input = input, .which = 1, .extra = list_ptr }, output);
 }
 pub fn submitRenderGridList(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list_ptr: *const abi.GfxRenderGridList, output: *abi.GfxFenceStatus) i32 {
-    if (@intFromPtr(list_ptr) == 0 or @intFromPtr(list_ptr) % @alignOf(abi.GfxRenderGridList) != 0) return abi.gfx_queue_error_invalid;
-    const list = list_ptr.*;
-    return submitCommon(owner, queue_ptr, input, null, &list, null, null, null, output);
+    return r4os_rust_gfx_queue_api(5, &Args{ .owner = owner, .queue = queue_ptr, .input = input, .which = 2, .extra = list_ptr }, output);
 }
 pub fn submitRenderColorList(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list_ptr: *const abi.GfxRenderColorList, output: *abi.GfxFenceStatus) i32 {
-    if (@intFromPtr(list_ptr) == 0 or @intFromPtr(list_ptr) % @alignOf(abi.GfxRenderColorList) != 0) return abi.gfx_queue_error_invalid;
-    const list = list_ptr.*;
-    return submitCommon(owner, queue_ptr, input, null, null, &list, null, null, output);
+    return r4os_rust_gfx_queue_api(5, &Args{ .owner = owner, .queue = queue_ptr, .input = input, .which = 3, .extra = list_ptr }, output);
 }
 pub fn submitRenderColorGridList(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list_ptr: *const abi.GfxRenderColorGridList, output: *abi.GfxFenceStatus) i32 {
-    if (@intFromPtr(list_ptr) == 0 or @intFromPtr(list_ptr) % @alignOf(abi.GfxRenderColorGridList) != 0) return abi.gfx_queue_error_invalid;
-    const list = list_ptr.*;
-    return submitCommon(owner, queue_ptr, input, null, null, null, &list, null, output);
+    return r4os_rust_gfx_queue_api(5, &Args{ .owner = owner, .queue = queue_ptr, .input = input, .which = 4, .extra = list_ptr }, output);
 }
 pub fn submitOutput(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, target_ptr: *const abi.GfxOutputTarget, output: *abi.GfxFenceStatus) i32 {
-    if (@intFromPtr(target_ptr) == 0 or @intFromPtr(target_ptr) % @alignOf(abi.GfxOutputTarget) != 0) return abi.gfx_queue_error_invalid;
-    const target = target_ptr.*;
-    if (!@import("../display/output_target.zig").valid(target)) return abi.gfx_queue_error_invalid;
-    return submitCommon(owner, queue_ptr, input, null, null, null, null, target, output);
-}
-fn submitCommon(owner: buffers.Owner, queue_ptr: *const abi.GfxQueueHandle, input: *const abi.GfxSubmission, list: ?*const abi.GfxRenderList, grid: ?*const abi.GfxRenderGridList, color: ?*const abi.GfxRenderColorList, combined: ?*const abi.GfxRenderColorGridList, target: ?abi.GfxOutputTarget, output: *abi.GfxFenceStatus) i32 {
-    if (@intFromPtr(queue_ptr) == 0 or @intFromPtr(input) == 0 or !buffer_api.validOutput(abi.GfxFenceStatus, output)) return abi.gfx_queue_error_invalid;
-    const queue = queue_ptr.*;
-    const value = wire.read(abi.GfxSubmission, input) orelse return abi.gfx_queue_error_invalid;
-    if (!header(abi.GfxQueueHandle, queue) or value.dependency_count > model.max_dependencies or
-        value.source.reserved0 != 0 or value.target.reserved0 != 0 or value.reserved0 != 0) return abi.gfx_queue_error_invalid;
-    const operation = std.enums.fromInt(resource.Operation, value.operation) orelse return abi.gfx_queue_error_unsupported;
-    if (target != null and operation != .present and operation != .direct_present) return abi.gfx_queue_error_invalid;
-    if ((operation == .render or operation == .render_list or operation == .render_grid_list or operation == .render_color_list or operation == .render_color_grid_list) and value.size < @sizeOf(abi.GfxSubmission)) return abi.gfx_queue_error_invalid;
-    if ((operation == .render_list) != (list != null)) return abi.gfx_queue_error_invalid;
-    if ((operation == .render_grid_list) != (grid != null)) return abi.gfx_queue_error_invalid;
-    if ((operation == .render_color_list) != (color != null)) return abi.gfx_queue_error_invalid;
-    if ((operation == .render_color_grid_list) != (combined != null)) return abi.gfx_queue_error_invalid;
-    var dependencies: [model.max_dependencies]model.Fence = undefined;
-    for (value.dependencies, 0..) |dependency, i| {
-        if (i < value.dependency_count) dependencies[i] = fence(dependency) else if (!std.meta.eql(dependency, abi.GfxFence{})) return abi.gfx_queue_error_invalid;
-    }
-    const call = task_context.enterUnwind();
-    if (!call.admitted()) return abi.gfx_queue_error_busy;
-    defer _ = task_context.leaveUnwind(call);
-    const submitter: *const fn (buffers.Owner, u64, model.Submission, resource.Request) runtime.Error!model.Status =
-        if (operation == .present or operation == .direct_present) @import("../display/native_driver.zig").submitImage else runtime.submit;
-    const snapshot = submitter(owner, queue.timeline, .{
-        .deadline_ns = value.deadline_ns,
-        .frame_key = value.frame_key,
-        .dependencies = dependencies[0..value.dependency_count],
-    }, .{
-        .operation = operation,
-        .source = .{ .id = value.source.id, .generation = value.source.generation },
-        .target = .{ .id = value.target.id, .generation = value.target.generation },
-        .source_offset = value.source_offset,
-        .target_offset = value.target_offset,
-        .bytes = value.byte_length,
-        .row_count = value.row_count,
-        .source_pitch = value.source_pitch,
-        .target_pitch = value.target_pitch,
-        .render = value.render,
-        .render_list = list,
-        .grid_list = grid,
-        .color_list = color,
-        .color_grid_list = combined,
-        .display_target = target orelse .{},
-    }) catch |err| return errorCode(err);
-    output.* = publicStatus(snapshot);
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(5, &Args{ .owner = owner, .queue = queue_ptr, .input = input, .which = 5, .extra = target_ptr }, output);
 }
 pub fn query(input: *const abi.GfxFence, output: *abi.GfxFenceStatus) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or !buffer_api.validOutput(abi.GfxFenceStatus, output)) return abi.gfx_queue_error_invalid;
-    const snapshot = runtime.query(fence(input.*)) catch |err| return errorCode(err);
-    output.* = publicStatus(snapshot);
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(7, &Args{ .input = input }, output);
 }
 pub fn wait(input: *const abi.GfxFence, timeout_ticks: u64, wait_for: u32, output: *abi.GfxFenceStatus) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or !buffer_api.validOutput(abi.GfxFenceStatus, output)) return abi.gfx_queue_error_invalid;
-    const identity = fence(input.*);
-    const mode = std.enums.fromInt(runtime.WaitFor, wait_for) orelse return abi.gfx_queue_error_invalid;
-    const snapshot = runtime.wait(identity, timeout_ticks, mode) catch |err| return errorCode(err);
-    output.* = publicStatus(snapshot);
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(8, &Args{ .input = input, .value = timeout_ticks, .which = wait_for }, output);
 }
 pub fn cancel(owner: buffers.Owner, input: *const abi.GfxFence) i32 {
-    if (@intFromPtr(input) == 0) return abi.gfx_queue_error_invalid;
-    const identity = fence(input.*);
-    const call = task_context.enterUnwind();
-    if (!call.admitted()) return abi.gfx_queue_error_busy;
-    defer _ = task_context.leaveUnwind(call);
-    runtime.cancel(owner, identity) catch |err| return errorCode(err);
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(9, &Args{ .owner = owner, .input = input }, null);
 }
 pub fn release(owner: buffers.Owner, input: *const abi.GfxFence) i32 {
-    if (@intFromPtr(input) == 0) return abi.gfx_queue_error_invalid;
-    const identity = fence(input.*);
-    const call = task_context.enterUnwind();
-    if (!call.admitted()) return abi.gfx_queue_error_busy;
-    defer _ = task_context.leaveUnwind(call);
-    runtime.drop(owner, identity) catch |err| return errorCode(err);
-    return abi.gfx_queue_ok;
+    return r4os_rust_gfx_queue_api(10, &Args{ .owner = owner, .input = input }, null);
+}
+fn privateCode(err: anyerror) u32 {
+    return switch (err) {
+        error.Invalid => 1,
+        error.Overflow => 2,
+        error.Unsupported => 3,
+        error.Exhausted => 4,
+        error.Budget => 5,
+        error.Capacity => 6,
+        error.Stale => 7,
+        error.Busy => 8,
+        error.Closed => 9,
+        error.WrongOwner => 10,
+        error.OutOfMemory => 11,
+        error.Unavailable => 12,
+        error.WaitTimeout => 13,
+        error.WaitCancelled => 14,
+        error.Disabled => 15,
+        error.AlreadyCompleted => 16,
+        error.Bandwidth => 17,
+        error.Routing => 18,
+        error.Dependency => 19,
+        error.DeviceLost => 20,
+        error.RestoreFailed => 21,
+        else => unreachable,
+    };
+}
+comptime {
+    if (@sizeOf(Args) != 64 or @offsetOf(Args, "input") != 40) @compileError("Queue API C args layout");
 }

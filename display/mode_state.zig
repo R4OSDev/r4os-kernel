@@ -1,209 +1,63 @@
-// One bounded primary-output transaction. This module owns only copied
-// metadata; the display bridge owns references and the R4D owns GPU state.
+//! Fixed private C transaction. Optional payloads have explicit presence.
+comptime { if (@import("builtin").is_test) _ = @import("rust_owner_test"); }
 const std = @import("std");
 pub const abi = @import("r4os_kernel_contract");
 pub const Owner = @import("../memory/gfx_buffer_owner.zig").Owner;
 pub const Error = error{ Invalid, Stale, Busy, Exhausted };
 pub const operation_ns: u64 = 30 * std.time.ns_per_s;
 const empty_owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 };
-
-pub const State = struct {
-    status: abi.GfxModeStatus = .{},
-    job: abi.GfxDriverModeJob = .{},
-    color: ?abi.GfxDriverModeColor = null,
-    caller: Owner = empty_owner,
-    driver: Owner = empty_owner,
-    confirmation_ns: u64 = 0,
-    offered: bool = false,
-    taken: bool = false,
-    cancelled: bool = false,
-    expired: bool = false,
-    automatic: bool = false,
-    reply: ?abi.GfxDriverModeCompletion = null,
-    device_retired: bool = false,
-
-    pub fn available(self: *const State) bool {
-        return self.status.phase == abi.gfx_mode_phase_idle or self.status.phase == abi.gfx_mode_phase_confirmed or
-            self.status.phase == abi.gfx_mode_phase_reverted or
-            (self.status.phase == abi.gfx_mode_phase_lost and self.device_retired);
-    }
-    /// APPLY has settled the exact trial image, but both rollback surfaces
-    /// remain owned. Ordinary presentation is allowed only between physical
-    /// operations; a new decision closes admission before the worker starts.
-    pub fn presentationReady(self: *const State, driver: Owner, backend: abi.GfxBackendBinding) bool {
-        return self.driver.eql(driver) and std.meta.eql(self.job.backend, backend) and
-            self.status.phase == abi.gfx_mode_phase_awaiting_confirmation and
-            self.status.outcome == abi.gfx_output_outcome_applied and self.status.retained == 3 and
-            !self.offered and self.reply == null and !self.cancelled and !self.expired and !self.device_retired;
-    }
-    /// Called after the display bridge has released the old transaction's
-    /// surfaces under independently proven device quiescence. Preserve LOST
-    /// for its waiter while allowing a fresh generation to accept new modes.
-    pub fn retireAfterReset(self: *State, driver: Owner, backend: abi.GfxBackendBinding) Error!void {
-        if (self.status.ticket == 0) return;
-        if (!self.driver.eql(driver) or !std.meta.eql(self.job.backend, backend)) return error.Stale;
-        self.status.phase = abi.gfx_mode_phase_lost;
-        self.status.outcome = abi.gfx_output_outcome_lost;
-        self.status.error_code = abi.gfx_output_error_unavailable;
-        self.status.retained = 0;
-        self.status.operation_deadline_ns = 0; self.status.confirmation_deadline_ns = 0;
-        self.cancelled = true; self.expired = true;
-        self.offered = false; self.taken = false; self.reply = null;
-        self.color = null; self.device_retired = true;
-    }
+pub const State = extern struct {
+    status: abi.GfxModeStatus = .{}, job: abi.GfxDriverModeJob = .{},
+    has_color: bool = false, color_data: abi.GfxDriverModeColor = .{}, caller: Owner = empty_owner, driver: Owner = empty_owner,
+    confirmation_ns: u64 = 0, offered: bool = false, taken: bool = false, cancelled: bool = false, expired: bool = false,
+    automatic: bool = false, has_reply: bool = false, reply_data: abi.GfxDriverModeCompletion = .{}, device_retired: bool = false,
+    pub fn replyValue(self: *const State) ?abi.GfxDriverModeCompletion { return if (self.has_reply) self.reply_data else null; }
+    pub fn available(self: *const State) bool { return r4os_rust_display_mode_available(self); }
+    pub fn presentationReady(self: *const State, driver: Owner, backend: abi.GfxBackendBinding) bool { return r4os_rust_display_mode_presentation_ready(self, &driver, &backend); }
+    pub fn retireAfterReset(self: *State, driver: Owner, backend: abi.GfxBackendBinding) Error!void { try status(r4os_rust_display_mode_retire(self, &driver, &backend)); }
     pub fn begin(self: *State, caller: Owner, driver: Owner, job: abi.GfxDriverModeJob, revision: u64, confirmation_ms: u32, now: u64) Error!void {
         return self.beginColor(caller, driver, job, null, revision, confirmation_ms, now);
     }
-    pub fn beginColor(self: *State, caller: Owner, driver: Owner, job: abi.GfxDriverModeJob, color: ?abi.GfxDriverModeColor,
-        revision: u64, confirmation_ms: u32, now: u64) Error!void
-    {
-        if (!self.available()) return error.Busy;
-        if (!caller.valid() or driver.kind != .driver or !driver.valid() or job.ticket == 0 or job.ticket <= self.status.ticket or
-            confirmation_ms < 1000 or confirmation_ms > 60000 or now == 0 or now > std.math.maxInt(u64) - operation_ns) return error.Invalid;
-        self.* = .{ .caller = caller, .driver = driver, .job = job, .color = color, .confirmation_ns = @as(u64, confirmation_ms) * std.time.ns_per_ms,
-            .status = .{ .ticket = job.ticket, .topology_revision = revision, .output = job.assignment.output, .retained = 3 } };
-        self.schedule(abi.gfx_mode_operation_apply, now);
+    pub fn beginColor(self: *State, caller: Owner, driver: Owner, job: abi.GfxDriverModeJob, color: ?abi.GfxDriverModeColor, revision: u64, confirmation_ms: u32, now: u64) Error!void {
+        const value = color; try status(r4os_rust_display_mode_begin_color(self, &caller, &driver, &job, if (value) |*input| input else null, revision, confirmation_ms, now));
     }
-    fn schedule(self: *State, operation: u32, now: u64) void {
-        // At most apply + confirm + rollback; a transaction never loops or
-        // reuses an operation sequence after an uncertain hardware failure.
-        self.job.sequence += 1;
-        if (self.color) |*value| { value.ticket = self.job.ticket; value.sequence = self.job.sequence; }
-        self.job.operation = operation;
-        self.job.deadline_ns = now +| operation_ns;
-        self.status.operation_deadline_ns = self.job.deadline_ns;
-        self.status.confirmation_deadline_ns = 0;
-        self.status.phase = switch (operation) {
-            abi.gfx_mode_operation_apply => abi.gfx_mode_phase_queued,
-            abi.gfx_mode_operation_confirm => abi.gfx_mode_phase_confirming,
-            else => abi.gfx_mode_phase_reverting,
-        };
-        self.offered = false;
-        self.taken = false;
-        self.reply = null;
-        self.expired = false;
-    }
-    pub fn needsStart(self: *const State) bool {
-        return !self.offered and self.reply == null and (self.status.phase == abi.gfx_mode_phase_queued or
-            self.status.phase == abi.gfx_mode_phase_confirming or self.status.phase == abi.gfx_mode_phase_reverting);
-    }
-    pub fn arm(self: *State) Error!void {
-        if (!self.needsStart()) return error.Busy;
-        self.offered = true;
-    }
+    pub fn needsStart(self: *const State) bool { return r4os_rust_display_mode_needs_start(self); }
+    pub fn arm(self: *State) Error!void { try status(r4os_rust_display_mode_arm(self)); }
     pub fn take(self: *State, driver: Owner, backend: abi.GfxBackendBinding) Error!?abi.GfxDriverModeJob {
-        if (!self.driver.eql(driver) or !std.meta.eql(self.job.backend, backend)) return error.Stale;
-        if (!self.offered or self.taken or self.reply != null) return null;
-        self.taken = true;
-        if (self.job.operation == abi.gfx_mode_operation_apply) self.status.phase = abi.gfx_mode_phase_executing;
-        return self.job;
+        var out: abi.GfxDriverModeJob = undefined; var has: bool = undefined;
+        try status(r4os_rust_display_mode_take(self, &driver, &backend, &out, &has)); return if (has) out else null;
     }
-    pub fn complete(self: *State, driver: Owner, value: abi.GfxDriverModeCompletion) Error!void {
-        if (value.version != 1 or value.size < @sizeOf(abi.GfxDriverModeCompletion) or value.quiesced & ~@as(u32, 3) != 0 or value.error_code > 0) return error.Invalid;
-        if (!self.driver.eql(driver) or !self.offered or !self.taken or self.reply != null or
-            value.ticket != self.job.ticket or value.sequence != self.job.sequence or value.operation != self.job.operation) return error.Stale;
-        switch (value.outcome) {
-            abi.gfx_output_outcome_applied => {
-                if (value.operation == abi.gfx_mode_operation_rollback or value.quiesced != 1 or value.error_code != 0) return error.Invalid;
-            },
-            abi.gfx_output_outcome_old_preserved => {
-                if (value.operation == abi.gfx_mode_operation_confirm or value.quiesced != 2) return error.Invalid;
-            },
-            abi.gfx_output_outcome_lost => {},
-            else => return error.Invalid,
-        }
-        self.reply = value;
-    }
+    pub fn complete(self: *State, driver: Owner, value: abi.GfxDriverModeCompletion) Error!void { try status(r4os_rust_display_mode_complete(self, &driver, &value)); }
     pub fn readColor(self: *const State, driver: Owner, ticket: u64, sequence: u64) Error!?abi.GfxDriverModeColor {
-        if (!self.driver.eql(driver) or ticket == 0 or ticket != self.job.ticket or sequence != self.job.sequence or
-            !self.taken or !self.offered or self.reply != null) return error.Stale;
-        return self.color;
+        var out: abi.GfxDriverModeColor = undefined; var has: bool = undefined;
+        try status(r4os_rust_display_mode_read_color(self, &driver, ticket, sequence, &out, &has)); return if (has) out else null;
     }
-    pub fn resolve(self: *State, caller: Owner, ticket: u64, action: u32, now: u64) Error!void {
-        if (ticket == 0 or ticket != self.status.ticket or !self.caller.eql(caller)) return error.Stale;
-        if (action != abi.gfx_mode_resolve_confirm and action != abi.gfx_mode_resolve_rollback) return error.Invalid;
-        if (self.available()) return error.Stale;
-        if (action == abi.gfx_mode_resolve_confirm) {
-            if (self.status.phase != abi.gfx_mode_phase_awaiting_confirmation or self.cancelled or
-                now >= self.status.confirmation_deadline_ns) return error.Busy;
-            self.schedule(abi.gfx_mode_operation_confirm, now);
-        } else {
-            if (self.status.phase == abi.gfx_mode_phase_confirming) return error.Busy;
-            self.cancelled = true;
-            if (self.status.phase == abi.gfx_mode_phase_awaiting_confirmation)
-                self.schedule(abi.gfx_mode_operation_rollback, now);
-        }
-    }
-    pub fn deadline(self: *const State) u64 {
-        if (self.status.phase == abi.gfx_mode_phase_awaiting_confirmation) return self.status.confirmation_deadline_ns;
-        return self.status.operation_deadline_ns;
-    }
-    pub fn outputGone(self: *State, driver_id: u32, output: abi.GfxOutputId, now: u64) bool {
-        if (self.available() or self.driver.kind != .driver or self.driver.id != driver_id or
-            !std.meta.eql(self.job.assignment.output, output)) return false;
-        const changed = !self.cancelled or self.status.phase == abi.gfx_mode_phase_awaiting_confirmation;
-        self.cancelled = true;
-        if (self.status.phase == abi.gfx_mode_phase_awaiting_confirmation)
-            self.schedule(abi.gfx_mode_operation_rollback, now);
-        // In-flight apply/confirm receipts still own their exact operation
-        // and references. Withdrawal itself proves no physical quiescence.
-        return changed;
-    }
-    pub fn expire(self: *State, now: u64) bool {
-        const end = self.deadline();
-        if (end == 0 or now < end or self.reply != null) return false;
-        self.cancelled = true;
-        self.status.error_code = abi.gfx_output_error_timeout;
-        if (self.status.phase == abi.gfx_mode_phase_awaiting_confirmation or
-            (!self.taken and self.job.operation == abi.gfx_mode_operation_confirm)) {
-            self.schedule(abi.gfx_mode_operation_rollback, now);
-        } else if (!self.taken and self.job.operation == abi.gfx_mode_operation_apply) {
-            self.rejectUntaken(abi.gfx_output_error_timeout);
-        } else {
-            // An in-flight receipt may arrive later. Preserve its identity
-            // and references; do not issue a competing rollback operation.
-            self.expired = true;
-            self.status.phase = abi.gfx_mode_phase_lost;
-            self.status.outcome = abi.gfx_output_outcome_lost;
-            self.status.operation_deadline_ns = 0;
-        }
-        return true;
-    }
-    pub fn rejectUntaken(self: *State, error_code: i32) void {
-        std.debug.assert(!self.taken and self.reply == null);
-        self.reply = .{ .ticket = self.job.ticket, .sequence = self.job.sequence, .operation = self.job.operation,
-            .outcome = if (self.job.operation == abi.gfx_mode_operation_apply) abi.gfx_output_outcome_old_preserved else abi.gfx_output_outcome_lost,
-            .quiesced = if (self.job.operation == abi.gfx_mode_operation_apply) 2 else 0, .error_code = error_code };
-    }
-    pub fn settled(self: *State, result: abi.GfxAtomicResult, now: u64) void {
-        const value = self.reply.?;
-        const operation = self.job.operation;
-        self.status.topology_revision = result.topology_revision;
-        self.status.commit_sequence = result.commit_sequence;
-        self.status.outcome = result.outcome;
-        if (value.error_code != 0) self.status.error_code = value.error_code;
-        self.status.operation_deadline_ns = 0;
-        self.offered = false;
-        self.reply = null;
-        if (result.outcome == abi.gfx_output_outcome_lost) {
-            self.status.phase = abi.gfx_mode_phase_lost;
-            self.status.retained = 3;
-        } else if (result.outcome == abi.gfx_output_outcome_old_preserved) {
-            self.status.phase = abi.gfx_mode_phase_reverted;
-            self.status.retained = 1;
-        } else if (operation == abi.gfx_mode_operation_confirm) {
-            self.status.phase = abi.gfx_mode_phase_confirmed;
-            self.status.retained = 2;
-        } else {
-            self.status.retained = 3;
-            if (self.cancelled or self.expired) self.schedule(abi.gfx_mode_operation_rollback, now)
-            else if (self.automatic) self.schedule(abi.gfx_mode_operation_confirm, now) else {
-                self.status.phase = abi.gfx_mode_phase_awaiting_confirmation;
-                self.status.confirmation_deadline_ns = now +| self.confirmation_ns;
-            }
-        }
-    }
+    pub fn resolve(self: *State, caller: Owner, ticket: u64, action: u32, now: u64) Error!void { try status(r4os_rust_display_mode_resolve(self, &caller, ticket, action, now)); }
+    pub fn deadline(self: *const State) u64 { return r4os_rust_display_mode_deadline(self); }
+    pub fn outputGone(self: *State, driver_id: u32, output: abi.GfxOutputId, now: u64) bool { return r4os_rust_display_mode_output_gone(self, driver_id, &output, now); }
+    pub fn expire(self: *State, now: u64) bool { return r4os_rust_display_mode_expire(self, now); }
+    pub fn rejectUntaken(self: *State, error_code: i32) void { r4os_rust_display_mode_reject(self, error_code); }
+    pub fn settled(self: *State, result: abi.GfxAtomicResult, now: u64) void { r4os_rust_display_mode_settled(self, &result, now); }
 };
+fn status(code: i32) Error!void { return switch (code) { 0 => {}, 1 => error.Invalid, 4 => error.Exhausted, 7 => error.Stale, 8 => error.Busy, else => unreachable }; }
+extern fn r4os_rust_display_mode_available(*const State) bool;
+extern fn r4os_rust_display_mode_presentation_ready(*const State, *const Owner, *const abi.GfxBackendBinding) bool;
+extern fn r4os_rust_display_mode_retire(*State, *const Owner, *const abi.GfxBackendBinding) i32;
+extern fn r4os_rust_display_mode_begin_color(*State, *const Owner, *const Owner, *const abi.GfxDriverModeJob, ?*const abi.GfxDriverModeColor, u64, u32, u64) i32;
+extern fn r4os_rust_display_mode_needs_start(*const State) bool;
+extern fn r4os_rust_display_mode_arm(*State) i32;
+extern fn r4os_rust_display_mode_take(*State, *const Owner, *const abi.GfxBackendBinding, *abi.GfxDriverModeJob, *bool) i32;
+extern fn r4os_rust_display_mode_complete(*State, *const Owner, *const abi.GfxDriverModeCompletion) i32;
+extern fn r4os_rust_display_mode_read_color(*const State, *const Owner, u64, u64, *abi.GfxDriverModeColor, *bool) i32;
+extern fn r4os_rust_display_mode_resolve(*State, *const Owner, u64, u32, u64) i32;
+extern fn r4os_rust_display_mode_deadline(*const State) u64;
+extern fn r4os_rust_display_mode_output_gone(*State, u32, *const abi.GfxOutputId, u64) bool;
+extern fn r4os_rust_display_mode_expire(*State, u64) bool;
+extern fn r4os_rust_display_mode_reject(*State, i32) void;
+extern fn r4os_rust_display_mode_settled(*State, *const abi.GfxAtomicResult, u64) void;
+comptime {
+    if (@sizeOf(State) != 696 or @alignOf(State) != 8 or @offsetOf(State, "job") != 88 or @offsetOf(State, "color_data") != 432 or @offsetOf(State, "caller") != 584 or @offsetOf(State, "driver") != 608 or @offsetOf(State, "confirmation_ns") != 632 or @offsetOf(State, "reply_data") != 648 or @offsetOf(State, "device_retired") != 688) @compileError("Native mode transaction C layout");
+}
 
 fn checkColorTransaction() !void {
     const t = std.testing;
@@ -347,7 +201,7 @@ test "mode jobs bind owner generation and operation, preserve late receipts and 
     try t.expect(!unplug.outputGone(driver.id, foreign, 110));
     try t.expect(unplug.outputGone(driver.id, connected.assignment.output, 110));
     try t.expect(!unplug.outputGone(driver.id, connected.assignment.output, 111));
-    try t.expect(unplug.reply == null and unplug.taken and unplug.status.retained == 3 and unplug.job.sequence == in_flight.sequence);
+    try t.expect(unplug.replyValue() == null and unplug.taken and unplug.status.retained == 3 and unplug.job.sequence == in_flight.sequence);
     try unplug.complete(driver, .{ .ticket = in_flight.ticket, .sequence = in_flight.sequence, .operation = in_flight.operation,
         .outcome = abi.gfx_output_outcome_applied, .quiesced = 1 });
     unplug.settled(.{ .outcome = abi.gfx_output_outcome_applied }, 120);
@@ -362,7 +216,7 @@ test "mode jobs bind owner generation and operation, preserve late receipts and 
     waiting.settled(.{ .outcome = abi.gfx_output_outcome_applied }, 120);
     try t.expect(waiting.outputGone(driver.id, connected.assignment.output, 121));
     try t.expect(waiting.status.phase == abi.gfx_mode_phase_reverting and waiting.status.confirmation_deadline_ns == 0 and
-        waiting.status.retained == 3 and waiting.reply == null);
+        waiting.status.retained == 3 and waiting.replyValue() == null);
 
     var reconnect: State = .{};
     try reconnect.begin(driver, driver, connected, 10, 1000, 100);

@@ -34,9 +34,6 @@ static CONSOLE: Storage<Console> = Storage(UnsafeCell::new(MaybeUninit::uninit()
 static STATE: Storage<State> = Storage(UnsafeCell::new(MaybeUninit::uninit()));
 static READY: AtomicBool = AtomicBool::new(false);
 unsafe extern "C" {
-    fn r4os_zig_boot_display_register(frame: *mut Framebuffer);
-    fn r4os_zig_boot_display_outputs(frame: *mut Framebuffer);
-    fn r4os_zig_boot_display_surface();
     fn r4os_zig_boot_display_sink(console: *mut Console);
 }
 fn frame() -> *mut Framebuffer {
@@ -60,9 +57,20 @@ pub fn init() -> Option<State> {
     unsafe {
         frame().write(source);
         console().write(Console::new(frame()));
-        r4os_zig_boot_display_register(frame());
-        r4os_zig_boot_display_outputs(frame());
-        r4os_zig_boot_display_surface();
+        super::manager::register_boot_backend(boot_target(frame()));
+        super::outputs::init_boot(&frame().read());
+        let stats = super::manager::stats();
+        let target = if stats.registered {
+            super::surface_pipeline::Target {
+                width: u64::from(stats.mode.width),
+                height: u64::from(stats.mode.height),
+                pitch: u64::from(stats.mode.pitch),
+                bpp: stats.mode.bpp,
+            }
+        } else {
+            super::surface_pipeline::Target::default()
+        };
+        super::surface_pipeline::init_target(target);
         (*console()).clear();
         let _ = super::bootscreen::render(frame());
         (*console()).invalidate_external();
@@ -145,3 +153,38 @@ const _: () = {
     assert!(core::mem::align_of::<State>() == 4);
     assert!(core::mem::offset_of!(State, console_metrics) == 0);
 };
+
+unsafe fn boot_target(frame: *mut Framebuffer) -> super::core_types::Target {
+    use super::core_types::{Mapping, Mode, Target, Text};
+    let f = unsafe { frame.read() };
+    let mut flags = 1 | 2 | 4 | 16 | 32;
+    if framebuffer::supports_rgb32(&f) {
+        flags |= 8 | 64 | 128
+    }
+    Target {
+        name: Text::literal(b"bootfb"),
+        kind: super::manager::BOOTFB,
+        flags,
+        mode: Mode {
+            width: u32::try_from(f.width).expect("boot width"),
+            height: u32::try_from(f.height).expect("boot height"),
+            pitch: u32::try_from(f.pitch).expect("boot pitch"),
+            bpp: f.bpp,
+            memory_model: f.memory_model,
+            red_mask_size: f.red_mask_size,
+            red_mask_shift: f.red_mask_shift,
+            green_mask_size: f.green_mask_size,
+            green_mask_shift: f.green_mask_shift,
+            blue_mask_size: f.blue_mask_size,
+            blue_mask_shift: f.blue_mask_shift,
+        },
+        mapping: Mapping {
+            kind: 1,
+            cache_policy: 1,
+            virt_base: f.address.addr() as u64,
+            byte_len: f.pitch * f.height,
+            volatile_cpu_writes: true,
+        },
+        framebuffer: frame,
+    }
+}

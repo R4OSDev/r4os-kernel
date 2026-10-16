@@ -1,17 +1,6 @@
+//! Temporary fixed projection to native R4DESK input/clipboard/capture owners.
 const r4x_api = @import("r4x_api.zig");
-const keyboard = @import("../driver/input/keyboard.zig");
-const mouse = @import("../driver/input/mouse.zig");
-const heap = @import("../memory/heap.zig");
-const owner_locks = @import("../memory/owner_locks.zig");
-const services = @import("../kernel/services.zig");
-const sync = @import("../sched/sync.zig");
-const task_context = @import("../sched/task_context.zig");
-const desktop_events = @import("../kernel/desktop_events.zig");
-const timer = @import("../kernel/timer.zig");
-const r4draw = @import("r4draw.zig");
-const scheduler = @import("../sched/scheduler.zig");
 const remote_frame_state = @import("remote_frame_state.zig");
-
 pub const name = "R4DESK";
 pub const clipboard_text_size: usize = 4096;
 pub const clipboard_max_text_bytes = r4x_api.clipboard_max_text_bytes;
@@ -20,7 +9,6 @@ pub const clipboard_flag_text = r4x_api.clipboard_flag_text;
 pub const clipboard_error_invalid = r4x_api.clipboard_error_invalid;
 pub const clipboard_error_too_large = r4x_api.clipboard_error_too_large;
 pub const clipboard_error_buffer_too_small = r4x_api.clipboard_error_buffer_too_small;
-
 pub const remote_frame_magic = r4x_api.remote_frame_magic;
 pub const remote_frame_version = r4x_api.remote_frame_version;
 pub const remote_frame_format_xrgb32 = r4x_api.remote_frame_format_xrgb32;
@@ -34,7 +22,6 @@ pub const remote_frame_error_buffer_too_small = r4x_api.remote_frame_error_buffe
 pub const remote_frame_error_out_of_range = r4x_api.remote_frame_error_out_of_range;
 pub const remote_frame_error_oom = r4x_api.remote_frame_error_oom;
 pub const remote_frame_error_unsupported = r4x_api.remote_frame_error_unsupported;
-
 pub const remote_input_magic = r4x_api.remote_input_magic;
 pub const remote_input_version = r4x_api.remote_input_version;
 pub const remote_input_kind_key_down = r4x_api.remote_input_kind_key_down;
@@ -50,424 +37,99 @@ pub const remote_input_error_empty = r4x_api.remote_input_error_empty;
 pub const remote_input_error_full = r4x_api.remote_input_error_full;
 pub const remote_input_error_unsupported = r4x_api.remote_input_error_unsupported;
 pub const remote_input_queue_capacity: usize = 64;
-
-const clipboard_service_name = "CLIPSVC";
-const clipboard_service_op_write = r4x_api.clipboard_service_op_write;
-const clipboard_service_op_read = r4x_api.clipboard_service_op_read;
-const clipboard_service_op_info = r4x_api.clipboard_service_op_info;
-const clipboard_service_op_clear = r4x_api.clipboard_service_op_clear;
-// 0.56.40: hz-neutral (1200 ms; bei 100 Hz wie zuvor 120 Ticks).
-const clipboard_service_timeout_ticks: u64 = @max(1, (1200 * @as(u64, timer.DEFAULT_HZ)) / 1000);
-const clipboard_info_payload_size: usize = 16;
-
 pub const MouseApiState = r4x_api.Mouse;
-
 pub const KeyboardLayoutInfo = r4x_api.KeyboardLayoutInfo;
-
 pub const ClipboardInfo = r4x_api.ClipboardInfo;
-
 pub const RemoteFrameInfo = r4x_api.RemoteFrameInfo;
 pub const RemoteFrameLease = r4x_api.RemoteFrameLease;
 pub const RemoteFrameCaptureStats = r4x_api.RemoteFrameCaptureStats;
 pub const CaptureOwner = remote_frame_state.Owner;
-
-// Shared-Frame-Mapping fuer RDPSVC. Die Adresse zeigt auf einen vom Live-
-// Publisher getrennten Snapshot; generation benennt dessen Frame-Revision.
-// Der Konsument mappt owner-thread-only pro Frame und validiert generation
-// gegen die zuvor gelesene RemoteFrameInfo.revision.
 pub const RemoteFrameMapInfo = r4x_api.RemoteFrameMapInfo;
 pub const DisplayDamageRect = r4x_api.DisplayDamageRect;
-
 pub const RemoteInputEvent = r4x_api.RemoteInputEvent;
-
 pub const RemoteInputStatus = r4x_api.RemoteInputStatus;
-
 pub const PhysicalKeyEvent = r4x_api.PhysicalKeyEvent;
 
-const RemoteRect = remote_frame_state.Rect;
-
-const RemoteFrameSnapshot = struct {
-    memory: ?[]u8 = null,
-    pixels: ?[]u32 = null,
-    capacity_pixels: usize = 0,
-    revision: u32 = 0,
-    width: u32 = 0,
-    height: u32 = 0,
-    epoch: u64 = 0,
-};
-
-var clipboard_text: [clipboard_text_size]u8 = .{0} ** clipboard_text_size;
-var clipboard_len: usize = 0;
-var clipboard_rev: u32 = 0;
-var remote_frame_memory: ?[]u8 = null;
-var remote_frame_pixels: ?[]u32 = null;
-var remote_frame_capacity_pixels: usize = 0;
-var remote_frame_info: RemoteFrameInfo = .{};
-var remote_frame_ready: bool = false;
-// Live pixels, history and snapshot mutation share an unwind-aware owner.
-// Consumer epochs retire its storage only after the last active access.
-// Copies/allocation remain preemptible; network I/O is outside this guard.
-var remote_frame_guard = sync.UnwindGuard.init("remote-frame");
-// Consumer transitions and these two lifecycle fields use program_state.
-var remote_frame_epoch: u64 = 1;
-var remote_frame_discard_pending: bool = false;
-var remote_frame_reap_pending: bool = false;
-var remote_frame_registry: remote_frame_state.CaptureRegistry = .{};
-var remote_frame_source: CaptureOwner = .{};
-var remote_frame_leased: [remote_frame_state.snapshot_capacity]RemoteFrameSnapshot = @splat(.{});
-var remote_frame_published_bytes: u64 = 0;
-var remote_frame_snapshot_bytes: u64 = 0;
-var remote_frame_snapshot_misses: u64 = 0;
-var remote_frame_consumers_count: u32 = 0;
-var remote_frame_revision_counter: u32 = 0;
-var remote_frame_published_revision: u32 = 0;
-var remote_frame_history: remote_frame_state.History = .{};
-var remote_frame_snapshots: [2]RemoteFrameSnapshot = .{ RemoteFrameSnapshot{}, RemoteFrameSnapshot{} };
-var remote_frame_snapshot_active: usize = 1;
-// 0.56.27: Event-Wait fuer remoteFrameWait - remoteFramePublish weckt die
-// Queue, Waiter pruefen die Revision als waitUnless-Praedikat (kein
-// Lost-Wakeup, Muster 0.56.19/0.56.22).
-var remote_frame_waitq: sync.WaitQueue = sync.WaitQueue.init();
-// 0.56.40: hz-neutral (250-ms-Slice; bei 100 Hz wie zuvor 25 Ticks).
-const REMOTE_FRAME_WAIT_SLICE_TICKS: u64 = @max(1, (250 * @as(u64, timer.DEFAULT_HZ)) / 1000);
-
-const RemoteFrameWaitCtx = struct {
-    last_revision: u32,
-};
-
-fn predStillWaitFrame(raw: *anyopaque) bool {
-    const c: *RemoteFrameWaitCtx = @ptrCast(@alignCast(raw));
-    const revision = @atomicLoad(u32, &remote_frame_published_revision, .acquire);
-    return revision == 0 or revision == c.last_revision;
+const Args = extern struct { owner: CaptureOwner = .{}, a: u64 = 0, b: u64 = 0, value: u32 = 0, other: u32 = 0, input: ?*const anyopaque = null, second: ?*const anyopaque = null, third: ?*const anyopaque = null };
+extern fn r4os_rust_r4desk(u32, *const Args, ?*anyopaque) u64;
+fn signed(op: u32, args: Args, out: ?*anyopaque) i32 {
+    return @bitCast(@as(u32, @truncate(r4os_rust_r4desk(op, &args, out))));
 }
-var remote_input_queue: [remote_input_queue_capacity]RemoteInputEvent = .{RemoteInputEvent{}} ** remote_input_queue_capacity;
-var remote_input_head: usize = 0;
-var remote_input_tail: usize = 0;
-var remote_input_pending: usize = 0;
-var remote_input_pushed: u32 = 0;
-var remote_input_polled: u32 = 0;
-var remote_input_dropped: u32 = 0;
-var remote_input_sequence: u32 = 0;
-var remote_input_last: RemoteInputEvent = .{};
-
 pub fn mouseState(out: *MouseApiState) callconv(.c) void {
-    const s = mouse.snapshotForApi();
-    out.* = .{
-        .x = s.x,
-        .y = s.y,
-        .dx = s.dx,
-        .dy = s.dy,
-        .wheel = s.wheel,
-        .buttons = s.buttons,
-        .present = if (s.present) 1 else 0,
-        .reserved = 0,
-        .packets = s.packets,
-    };
+    _ = r4os_rust_r4desk(0, &Args{}, out);
 }
 pub fn mouseMotion(out: *r4x_api.MouseMotion) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0 or out.version != 1 or out.size < @sizeOf(r4x_api.MouseMotion)) return -1;
-    var value: r4x_api.MouseMotion = .{ .mouse = undefined };
-    mouseState(&value.mouse);
-    const totals = mouse.motionTotals();
-    value.motion_x = @truncate(totals); value.motion_y = @truncate(totals >> 32);
-    out.* = value;
-    return 0;
+    return signed(1, .{}, out);
 }
-
 pub fn mouseShow() callconv(.c) void {
-    r4draw.markDisplayUsed();
-    mouse.enableCursor();
+    _ = r4os_rust_r4desk(2, &Args{}, null);
 }
-
 pub fn mouseHide() callconv(.c) void {
-    mouse.disableCursor();
+    _ = r4os_rust_r4desk(3, &Args{}, null);
 }
-
 pub fn physicalKeyPoll(out: *PhysicalKeyEvent) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0) return r4x_api.physical_key_poll_error_invalid;
-    const event = keyboard.readPhysicalEvent() orelse {
-        out.* = .{};
-        return r4x_api.physical_key_poll_empty;
-    };
-    out.* = .{
-        .magic = r4x_api.physical_key_magic,
-        .version = r4x_api.physical_key_version,
-        .size = @sizeOf(PhysicalKeyEvent),
-        .kind = switch (event.kind) {
-            .down => r4x_api.physical_key_kind_down,
-            .up => r4x_api.physical_key_kind_up,
-            .reset => r4x_api.physical_key_kind_reset,
-        },
-        .key = event.usage,
-        .modifiers = event.modifiers,
-        .flags = event.flags,
-        .sequence = event.sequence,
-        .tick = event.tick,
-    };
-    return r4x_api.physical_key_poll_ready;
+    return signed(4, .{}, out);
 }
-
 pub fn keyboardLayoutCurrent(out: *KeyboardLayoutInfo) callconv(.c) i32 {
-    fillKeyboardLayoutInfo(out, keyboard.activeLayoutIndex()) orelse return -1;
-    return 1;
+    return signed(5, .{}, out);
 }
-
 pub fn keyboardLayoutAt(index: u32, out: *KeyboardLayoutInfo) callconv(.c) i32 {
-    fillKeyboardLayoutInfo(out, @intCast(index)) orelse return 0;
-    return 1;
+    return signed(6, .{ .value = index }, out);
 }
-
 pub fn keyboardLayoutSet(layout_name: [*:0]const u8) callconv(.c) i32 {
-    var name_buf: [32]u8 = .{0} ** 32;
-    const value = copyZ(layout_name, name_buf[0..]) orelse return -1;
-    return if (keyboard.trySetLayoutByName(value)) 0 else -1;
+    return signed(7, .{ .input = layout_name }, null);
 }
-
 pub fn clipboardWrite(data: [*]const u8, len: u32) callconv(.c) i32 {
-    if (@intFromPtr(data) == 0) return clipboard_error_invalid;
-    const count: usize = @intCast(len);
-    if (count > clipboard_max_text_bytes) return clipboard_error_too_large;
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
-        if (data[i] == 0) return clipboard_error_invalid;
-    }
-    const text = data[0..count];
-    if (clipboardServiceWrite(text)) |result| return result;
-    return clipboardWriteLocal(text);
+    return signed(8, .{ .input = data, .value = len }, null);
 }
-
 pub fn clipboardRead(out: [*]u8, capacity: u32) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0) return clipboard_error_invalid;
-    const out_len: usize = @intCast(capacity);
-    if (clipboardServiceRead(out, out_len)) |result| return result;
-    return clipboardReadLocal(out, out_len);
+    return signed(9, .{ .value = capacity }, out);
 }
-
 pub fn clipboardRevision() callconv(.c) u32 {
-    var info = ClipboardInfo{};
-    if (clipboardServiceInfo(&info)) return info.revision;
-    return clipboard_rev;
+    return @intCast(r4os_rust_r4desk(10, &Args{}, null));
 }
-
 pub fn clipboardInfo(out: *ClipboardInfo) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0) return clipboard_error_invalid;
-    if (clipboardServiceInfo(out)) return 0;
-    out.* = .{
-        .capacity = @intCast(clipboard_max_text_bytes),
-        .length = @intCast(clipboard_len),
-        .revision = clipboard_rev,
-        .flags = clipboard_flag_text | (if (clipboard_len > 0) clipboard_flag_has_text else 0),
-    };
-    return 0;
+    return signed(11, .{}, out);
 }
-
 pub fn clipboardClear() callconv(.c) i32 {
-    if (clipboardServiceClear()) |result| return result;
-    clearClipboardStorage();
-    bumpClipboardRevision();
-    return 0;
+    return signed(12, .{}, null);
 }
-
 pub fn remoteFrameInfo(out: *RemoteFrameInfo) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
-    if (!captureRemoteFrameInfo(null, out)) {
-        out.* = .{};
-        return remote_frame_error_unavailable;
-    }
-    return 0;
+    return signed(13, .{}, out);
 }
-
 pub fn remoteFrameRead(offset_pixels: u32, out: [*]u32, pixel_count: u32, out_info: *RemoteFrameInfo) callconv(.c) i32 {
-    if (pixel_count != 0 and @intFromPtr(out) == 0) return remote_frame_error_invalid;
-    if (@intFromPtr(out_info) != 0) out_info.* = .{};
-    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
-    defer leaveRemoteFrame();
-    if (!remote_frame_ready or remote_frame_pixels == null) return remote_frame_error_unavailable;
-    const info = remote_frame_info;
-    if (@intFromPtr(out_info) != 0) out_info.* = info;
-    const frame_pixels: usize = @intCast(info.frame_pixels);
-    const offset: usize = @intCast(offset_pixels);
-    if (offset > frame_pixels) return remote_frame_error_out_of_range;
-    if (pixel_count == 0 or offset == frame_pixels) return 0;
-    const count = @min(@as(usize, @intCast(pixel_count)), frame_pixels - offset);
-    @memcpy(out[0..count], remote_frame_pixels.?[offset .. offset + count]);
-    return @intCast(count);
+    return signed(14, .{ .a = offset_pixels, .value = pixel_count, .second = out_info }, out);
 }
-
 pub fn remoteFrameWait(last_revision: u32, timeout_ticks: u64, out: *RemoteFrameInfo) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
-    if (currentRemoteFrameRevision() == 0) {
-        out.* = .{};
-        return remote_frame_error_unavailable;
-    }
-
-    var waited: u64 = 0;
-    while (true) {
-        const revision = currentRemoteFrameRevision();
-        if (revision != 0 and revision != last_revision) {
-            if (captureRemoteFrameInfo(last_revision, out)) return 1;
-            continue;
-        }
-        if (waited >= timeout_ticks) break;
-        const slice = @min(REMOTE_FRAME_WAIT_SLICE_TICKS, timeout_ticks - waited);
-        var wait_ctx = RemoteFrameWaitCtx{ .last_revision = last_revision };
-        _ = remote_frame_waitq.waitUnless(slice, "remote-frame", predStillWaitFrame, &wait_ctx);
-        waited += slice;
-    }
-    if (captureRemoteFrameInfo(null, out)) return 0;
-    out.* = .{};
-    return remote_frame_error_unavailable;
+    return signed(15, .{ .value = last_revision, .a = timeout_ticks }, out);
 }
-
-// 0.56.28: blockierender Aktivitaets-Wait fuer den Desktop-Renderer.
-// last_seq = zuletzt gesehene Sequenz (0 beim ersten Aufruf), out_seq
-// erhaelt den neuen Stand. 1 = Aktivitaet, 0 = Timeout.
 pub fn desktopActivityWait(last_seq: u64, timeout_ticks: u64, out_seq: *u64) callconv(.c) i32 {
-    if (@intFromPtr(out_seq) == 0) return remote_input_error_invalid;
-    return desktop_events.wait(last_seq, timeout_ticks, out_seq);
+    return signed(16, .{ .a = last_seq, .b = timeout_ticks }, out_seq);
 }
-
-/// Userland publishes its own work before calling this generic wake. State,
-/// image ownership and GPU completion remain with their existing owners.
 pub fn desktopActivityNotify() callconv(.c) i32 {
-    desktop_events.signal();
-    return 0;
+    return signed(17, .{}, null);
 }
-
 pub fn remoteFrameAcquire(owner: CaptureOwner) i32 {
-    const token = owner_locks.program_state.acquire();
-    const current = remoteFrameConsumers();
-    const next = remote_frame_registry.acquire(owner) catch {
-        owner_locks.program_state.release(token); return remote_frame_error_invalid;
-    };
-    @atomicStore(u32, &remote_frame_consumers_count, next, .release);
-    owner_locks.program_state.release(token);
-    if (current == 0) desktop_events.signal();
-    return @intCast(next);
+    return signed(18, .{ .owner = owner }, null);
 }
-
 pub fn remoteFrameRelease(owner: CaptureOwner) i32 {
-    const token = owner_locks.program_state.acquire();
-    const next = remote_frame_registry.release(owner) catch {
-        owner_locks.program_state.release(token); return remote_frame_error_invalid;
-    };
-    @atomicStore(u32, &remote_frame_consumers_count, next, .release);
-    if (next == 0) {
-        retireRemoteFrameLocked();
-    }
-    owner_locks.program_state.release(token);
-    if (next == 0) {
-        // Never wait for a publisher or reader. The last active access drains
-        // this retirement before leaving; a new epoch cannot reuse its frame.
-        if (enterRemoteFrame()) leaveRemoteFrame();
-        _ = remote_frame_waitq.wakeAll();
-        desktop_events.signal();
-    }
-    return @intCast(next);
-}
-
-fn retireRemoteFrameLocked() void {
-    remote_frame_epoch +%= 1; if (remote_frame_epoch == 0) remote_frame_epoch = 1;
-    remote_frame_discard_pending = true; remote_frame_reap_pending = true;
-    @atomicStore(u32, &remote_frame_published_revision, 0, .release);
+    return signed(19, .{ .owner = owner }, null);
 }
 pub fn remoteFramePublisher(owner: CaptureOwner) bool {
-    const token = owner_locks.program_state.acquire();
-    defer owner_locks.program_state.release(token);
-    if (remote_frame_source.id == 0) remote_frame_source = owner;
-    return remote_frame_source.same(owner);
+    return r4os_rust_r4desk(20, &Args{ .owner = owner }, null) != 0;
 }
 pub fn remoteFrameSourceReset(owner: CaptureOwner) i32 {
-    const token = owner_locks.program_state.acquire();
-    remote_frame_source = owner; retireRemoteFrameLocked();
-    owner_locks.program_state.release(token);
-    if (enterRemoteFrame()) leaveRemoteFrame();
-    _ = remote_frame_waitq.wakeAll(); desktop_events.signal();
-    return 0;
+    return signed(21, .{ .owner = owner }, null);
 }
-/// Execution retirement calls this after the program's last task/API access.
-/// A stopped consumer loses only its own demand and immutable snapshot leases.
 pub fn remoteFrameStopped(owner: CaptureOwner) void {
-    const token = owner_locks.program_state.acquire();
-    const before = remote_frame_registry.count;
-    remote_frame_registry.stopped(owner, timer.eventNanoseconds());
-    @atomicStore(u32, &remote_frame_consumers_count, remote_frame_registry.count, .release);
-    const publisher = remote_frame_source.same(owner);
-    if (publisher) remote_frame_source = .{};
-    if (publisher or (before != 0 and remote_frame_registry.count == 0)) retireRemoteFrameLocked();
-    remote_frame_reap_pending = true;
-    owner_locks.program_state.release(token);
-    if (enterRemoteFrame()) leaveRemoteFrame();
-    _ = remote_frame_waitq.wakeAll(); desktop_events.signal();
+    _ = r4os_rust_r4desk(22, &Args{ .owner = owner }, null);
 }
-
 pub fn remoteFrameConsumers() callconv(.c) u32 {
-    return @atomicLoad(u32, &remote_frame_consumers_count, .acquire);
+    return @intCast(r4os_rust_r4desk(23, &Args{}, null));
 }
-
 pub fn remoteFramePublish(info: *const RemoteFrameInfo, pixels_ptr: [*]const u32, pixel_count: u32) callconv(.c) i32 {
-    if (@intFromPtr(info) == 0) return remote_frame_error_invalid;
-    if (info.format != remote_frame_format_xrgb32 or info.bytes_per_pixel != 4) return remote_frame_error_unsupported;
-    if (info.width == 0 or info.height == 0 or info.stride_pixels < info.width) return remote_frame_error_invalid;
-
-    const total_pixels_u64 = @as(u64, info.width) * @as(u64, info.height);
-    const max_frame_pixels: u64 = remote_frame_state.max_frame_bytes / @sizeOf(u32);
-    if (total_pixels_u64 == 0 or total_pixels_u64 > max_frame_pixels) return remote_frame_error_invalid;
-    const source_pixels_u64 = @as(u64, info.stride_pixels) * @as(u64, info.height);
-    if (source_pixels_u64 > @as(u64, pixel_count)) return remote_frame_error_invalid;
-    if (@intFromPtr(pixels_ptr) == 0) return remote_frame_error_invalid;
-    if (remoteFrameConsumers() == 0) return 0;
-
-    const total_pixels: usize = @intCast(total_pixels_u64);
-    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
-    const epoch = currentRemoteFrameEpoch() orelse {
-        leaveRemoteFrame();
-        return 0;
-    };
-    if (!ensureRemoteFrameCapacity(total_pixels)) {
-        leaveRemoteFrame();
-        return remote_frame_error_oom;
-    }
-    const dest = remote_frame_pixels.?;
-    const source = pixels_ptr[0..@as(usize, @intCast(source_pixels_u64))];
-
-    const geometry_changed = !remote_frame_ready or
-        remote_frame_info.width != info.width or
-        remote_frame_info.height != info.height;
-    const rect = normalizeRemoteRect(info, geometry_changed);
-    copyRemoteFrameRect(dest, source, info.width, info.stride_pixels, rect);
-
-    const revision = bumpRemoteFrameRevision();
-    remote_frame_info = .{
-        .magic = remote_frame_magic,
-        .version = remote_frame_version,
-        .flags = remote_frame_flag_ready | remote_frame_flag_dirty_valid | remote_frame_flag_cursor_valid,
-        .format = remote_frame_format_xrgb32,
-        .width = info.width,
-        .height = info.height,
-        .stride_pixels = info.width,
-        .bytes_per_pixel = 4,
-        .revision = revision,
-        .frame_pixels = @intCast(total_pixels),
-        .frame_bytes = @intCast(total_pixels * @sizeOf(u32)),
-        .dirty_x = @intCast(rect.x),
-        .dirty_y = @intCast(rect.y),
-        .dirty_w = rect.w,
-        .dirty_h = rect.h,
-        .cursor_x = info.cursor_x,
-        .cursor_y = info.cursor_y,
-        .cursor_flags = info.cursor_flags,
-    };
-    remote_frame_ready = true;
-    remote_frame_history.record(revision, rect);
-    remote_frame_published_bytes +|= @as(u64, rect.w) * rect.h * 4;
-    if (!completeRemoteFrame(epoch, revision)) return 0;
-    _ = remote_frame_waitq.wakeAll();
-
-    const copied = @as(u64, rect.w) * @as(u64, rect.h);
-    return if (copied > 0x7fff_ffff) 0x7fff_ffff else @intCast(copied);
+    return signed(24, .{ .input = info, .second = pixels_ptr, .value = pixel_count }, null);
 }
-
 pub fn remoteFramePublishRegions(
     info: *const RemoteFrameInfo,
     pixels_ptr: [*]const u32,
@@ -475,675 +137,29 @@ pub fn remoteFramePublishRegions(
     regions_ptr: [*]const DisplayDamageRect,
     region_count: u32,
 ) callconv(.c) i32 {
-    if (@intFromPtr(info) == 0 or @intFromPtr(pixels_ptr) == 0 or @intFromPtr(regions_ptr) == 0) return remote_frame_error_invalid;
-    if (info.format != remote_frame_format_xrgb32 or info.bytes_per_pixel != 4) return remote_frame_error_unsupported;
-    if (info.width == 0 or info.height == 0 or info.stride_pixels < info.width or
-        region_count == 0 or region_count > r4x_api.display_damage_max_regions)
-    {
-        return remote_frame_error_invalid;
-    }
-    const total_pixels_u64 = @as(u64, info.width) * info.height;
-    const source_pixels_u64 = @as(u64, info.stride_pixels) * info.height;
-    const max_frame_pixels: u64 = remote_frame_state.max_frame_bytes / @sizeOf(u32);
-    if (total_pixels_u64 == 0 or total_pixels_u64 > max_frame_pixels or source_pixels_u64 > pixel_count) return remote_frame_error_invalid;
-
-    var regions: [r4x_api.display_damage_max_regions]RemoteRect =
-        .{RemoteRect{}} ** r4x_api.display_damage_max_regions;
-    var copied_pixels: u64 = 0;
-    var bounds = RemoteRect{};
-    var index: usize = 0;
-    while (index < region_count) : (index += 1) {
-        const source_region = regions_ptr[index];
-        if (source_region.x < 0 or source_region.y < 0 or source_region.w == 0 or source_region.h == 0) return remote_frame_error_out_of_range;
-        const x: u32 = @intCast(source_region.x);
-        const y: u32 = @intCast(source_region.y);
-        if (x >= info.width or y >= info.height or source_region.w > info.width - x or source_region.h > info.height - y) return remote_frame_error_out_of_range;
-        const region = RemoteRect{ .x = x, .y = y, .w = source_region.w, .h = source_region.h };
-        regions[index] = region;
-        copied_pixels += @as(u64, region.w) * region.h;
-        bounds = if (index == 0) region else mergeRemoteRect(bounds, region);
-    }
-    if (remoteFrameConsumers() == 0) return 0;
-
-    const total_pixels: usize = @intCast(total_pixels_u64);
-    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
-    const epoch = currentRemoteFrameEpoch() orelse {
-        leaveRemoteFrame();
-        return 0;
-    };
-    if (!ensureRemoteFrameCapacity(total_pixels)) {
-        leaveRemoteFrame();
-        return remote_frame_error_oom;
-    }
-    const dest = remote_frame_pixels.?;
-    const source = pixels_ptr[0..@as(usize, @intCast(source_pixels_u64))];
-    const geometry_changed = !remote_frame_ready or
-        remote_frame_info.width != info.width or remote_frame_info.height != info.height;
-    if (geometry_changed) {
-        const full = RemoteRect{ .x = 0, .y = 0, .w = info.width, .h = info.height };
-        copyRemoteFrameRect(dest, source, info.width, info.stride_pixels, full);
-        bounds = full;
-        copied_pixels = total_pixels_u64;
-    } else {
-        for (regions[0..region_count]) |region| copyRemoteFrameRect(dest, source, info.width, info.stride_pixels, region);
-    }
-
-    const revision = bumpRemoteFrameRevision();
-    remote_frame_info = .{
-        .magic = remote_frame_magic,
-        .version = remote_frame_version,
-        .flags = remote_frame_flag_ready | remote_frame_flag_dirty_valid | remote_frame_flag_cursor_valid,
-        .format = remote_frame_format_xrgb32,
-        .width = info.width,
-        .height = info.height,
-        .stride_pixels = info.width,
-        .bytes_per_pixel = 4,
-        .revision = revision,
-        .frame_pixels = @intCast(total_pixels),
-        .frame_bytes = @intCast(total_pixels * @sizeOf(u32)),
-        .dirty_x = @intCast(bounds.x),
-        .dirty_y = @intCast(bounds.y),
-        .dirty_w = bounds.w,
-        .dirty_h = bounds.h,
-        .cursor_x = info.cursor_x,
-        .cursor_y = info.cursor_y,
-        .cursor_flags = info.cursor_flags,
-    };
-    remote_frame_ready = true;
-    remote_frame_history.record(revision, bounds);
-    remote_frame_published_bytes +|= copied_pixels * 4;
-    if (!completeRemoteFrame(epoch, revision)) return 0;
-    _ = remote_frame_waitq.wakeAll();
-    return if (copied_pixels > 0x7fff_ffff) 0x7fff_ffff else @intCast(copied_pixels);
+    return signed(25, .{ .input = info, .second = pixels_ptr, .value = pixel_count, .third = regions_ptr, .other = region_count }, null);
 }
-
 pub fn remoteInputPush(event: *const RemoteInputEvent) callconv(.c) i32 {
-    if (@intFromPtr(event) == 0) return remote_input_error_invalid;
-    if (event.magic != remote_input_magic or event.version != remote_input_version) return remote_input_error_invalid;
-    if (!validRemoteInputKind(event.kind)) return remote_input_error_invalid;
-
-    const token = owner_locks.program_state.acquire();
-    if (remote_input_pending >= remote_input_queue_capacity) {
-        remote_input_dropped +%= 1;
-        owner_locks.program_state.release(token);
-        return remote_input_error_full;
-    }
-
-    var stored = event.*;
-    stored.sequence = nextRemoteInputSequence();
-    remote_input_queue[remote_input_head] = stored;
-    remote_input_head = (remote_input_head + 1) % remote_input_queue_capacity;
-    remote_input_pending += 1;
-    remote_input_pushed +%= 1;
-    remote_input_last = stored;
-    owner_locks.program_state.release(token);
-    // Publish the complete queue entry before waking the Desktop. Otherwise
-    // it can poll an empty queue and sleep again without a second signal.
-    desktop_events.signal();
-    return 1;
+    return signed(26, .{ .input = event }, null);
 }
-
 pub fn remoteInputPoll(out: *RemoteInputEvent) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0) return remote_input_error_invalid;
-    const token = owner_locks.program_state.acquire();
-    defer owner_locks.program_state.release(token);
-    if (remote_input_pending == 0) {
-        out.* = RemoteInputEvent{};
-        return 0;
-    }
-    out.* = remote_input_queue[remote_input_tail];
-    remote_input_tail = (remote_input_tail + 1) % remote_input_queue_capacity;
-    remote_input_pending -= 1;
-    remote_input_polled +%= 1;
-    return 1;
+    return signed(27, .{}, out);
 }
-
 pub fn remoteInputStatus(out: *RemoteInputStatus) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0) return remote_input_error_invalid;
-    const token = owner_locks.program_state.acquire();
-    defer owner_locks.program_state.release(token);
-    out.* = .{
-        .capacity = @intCast(remote_input_queue_capacity),
-        .pending = @intCast(remote_input_pending),
-        .dropped = remote_input_dropped,
-        .pushed = remote_input_pushed,
-        .polled = remote_input_polled,
-        .last_sequence = remote_input_last.sequence,
-        .last_kind = remote_input_last.kind,
-        .last_buttons = remote_input_last.buttons,
-        .last_key = remote_input_last.key,
-        .last_x = remote_input_last.x,
-        .last_y = remote_input_last.y,
-        .last_wheel = remote_input_last.wheel,
-    };
-    return 0;
+    return signed(28, .{}, out);
 }
-
-fn clipboardWriteLocal(data: []const u8) i32 {
-    var i: usize = 0;
-    while (i < data.len) : (i += 1) clipboard_text[i] = data[i];
-    clipboard_text[data.len] = 0;
-    if (data.len + 1 < clipboard_text.len) @memset(clipboard_text[data.len + 1 ..], 0);
-    clipboard_len = data.len;
-    bumpClipboardRevision();
-    return @intCast(data.len);
-}
-
-fn clipboardReadLocal(out: [*]u8, capacity: usize) i32 {
-    if (clipboard_len == 0) {
-        if (capacity > 0) out[0] = 0;
-        return 0;
-    }
-    if (capacity <= clipboard_len) {
-        if (capacity > 0) out[0] = 0;
-        return clipboard_error_buffer_too_small;
-    }
-    const count = @min(clipboard_len, capacity - 1);
-    var i: usize = 0;
-    while (i < count) : (i += 1) out[i] = clipboard_text[i];
-    out[count] = 0;
-    return @intCast(count);
-}
-
-fn clipboardServiceWrite(data: []const u8) ?i32 {
-    var header: services.ApiMessageHeader = .{};
-    var response: [1]u8 = .{0};
-    const got = clipboardServiceCall(clipboard_service_op_write, data, response[0..], &header) orelse return null;
-    if (got < 0) return null;
-    return header.status;
-}
-
-fn clipboardServiceRead(out: [*]u8, capacity: usize) ?i32 {
-    var info = ClipboardInfo{};
-    if (!clipboardServiceInfo(&info)) return null;
-    const text_len: usize = @intCast(info.length);
-    if (text_len == 0) {
-        if (capacity > 0) out[0] = 0;
-        return 0;
-    }
-    if (capacity <= text_len) {
-        if (capacity > 0) out[0] = 0;
-        return clipboard_error_buffer_too_small;
-    }
-
-    var header: services.ApiMessageHeader = .{};
-    const response_capacity = @min(capacity, services.API_MAX_PAYLOAD);
-    const response = out[0..response_capacity];
-    const got = clipboardServiceCall(clipboard_service_op_read, "", response, &header) orelse return null;
-    if (got == services.API_ERR_BUFFER_TOO_SMALL) return clipboard_error_buffer_too_small;
-    if (got < 0) return null;
-    if (header.status < 0) return header.status;
-    const count: usize = @intCast(got);
-    if (count >= capacity) {
-        if (capacity > 0) out[0] = 0;
-        return clipboard_error_buffer_too_small;
-    }
-    out[count] = 0;
-    return @intCast(count);
-}
-
-fn clipboardServiceInfo(out: *ClipboardInfo) bool {
-    var header: services.ApiMessageHeader = .{};
-    var response: [clipboard_info_payload_size]u8 = .{0} ** clipboard_info_payload_size;
-    const got = clipboardServiceCall(clipboard_service_op_info, "", response[0..], &header) orelse return false;
-    if (got != @as(i32, @intCast(clipboard_info_payload_size)) or header.status != services.API_OK) return false;
-    out.* = .{
-        .capacity = readLe32(response[0..4]),
-        .length = readLe32(response[4..8]),
-        .revision = readLe32(response[8..12]),
-        .flags = readLe32(response[12..16]),
-    };
-    return out.capacity == @as(u32, @intCast(clipboard_max_text_bytes)) and out.length <= @as(u32, @intCast(clipboard_max_text_bytes));
-}
-
-fn clipboardServiceClear() ?i32 {
-    var header: services.ApiMessageHeader = .{};
-    var response: [1]u8 = .{0};
-    const got = clipboardServiceCall(clipboard_service_op_clear, "", response[0..], &header) orelse return null;
-    if (got < 0) return null;
-    return header.status;
-}
-
-fn clipboardServiceCall(op: u16, request: []const u8, response: []u8, header: *services.ApiMessageHeader) ?i32 {
-    if (request.len > services.API_MAX_PAYLOAD or response.len > services.API_MAX_PAYLOAD) return null;
-    var info: services.ApiInfo = .{};
-    const open = services.apiOpen(clipboard_service_name, &info, 0);
-    if (open != services.API_OK or info.handle == 0) return null;
-    defer _ = services.apiClose(info.handle);
-
-    header.* = .{ .magic = 0, .version = 0 };
-    const start_ticks = timer.tickCount();
-    const deadline = timer.deadlineAfter(start_ticks, clipboard_service_timeout_ticks);
-    var request_unwind: task_context.UnwindToken = .{};
-    const request_id_raw = services.submitRequestWaitGuarded(
-        info.handle,
-        0,
-        op,
-        request,
-        clipboard_service_timeout_ticks,
-        &request_unwind,
-    );
-    if (request_id_raw <= 0) return null;
-    const request_id: u32 = @intCast(request_id_raw);
-    defer _ = task_context.leaveUnwind(request_unwind);
-    var request_active = true;
-    defer {
-        if (request_active) _ = services.cancelRequest(info.handle, request_id);
-    }
-
-    while (true) {
-        const result = services.takeResponse(info.handle, request_id, header, response);
-        if (result < 0) return result;
-        if (result > 0 or header.magic == services.API_MAGIC) {
-            request_active = false;
-            return result;
-        }
-        const now = timer.tickCount();
-        if (now >= deadline) break;
-        const wait_result = services.waitResponse(info.handle, request_id, deadline - now);
-        if (wait_result == services.API_ERR_TIMEOUT) break;
-        if (wait_result < 0) {
-            _ = services.cancelRequest(info.handle, request_id);
-            return wait_result;
-        }
-    }
-    _ = services.cancelRequest(info.handle, request_id);
-    request_active = false;
-    return services.API_ERR_TIMEOUT;
-}
-
-fn fillKeyboardLayoutInfo(out: *KeyboardLayoutInfo, index: usize) ?void {
-    const layout_name = keyboard.layoutNameAt(index) orelse return null;
-    const display = keyboard.layoutDisplayAt(index) orelse return null;
-    out.* = .{
-        .index = @intCast(index),
-        .count = @intCast(keyboard.layoutCount()),
-    };
-    copyFixedZ(out.name[0..], layout_name);
-    copyFixedZ(out.display[0..], display);
-}
-
-fn clearClipboardStorage() void {
-    @memset(clipboard_text[0..], 0);
-    clipboard_len = 0;
-}
-
-fn bumpClipboardRevision() void {
-    clipboard_rev +%= 1;
-    if (clipboard_rev == 0) clipboard_rev = 1;
-}
-
-fn ensureRemoteFrameCapacity(pixel_count: usize) bool {
-    if (pixel_count == 0 or pixel_count > remote_frame_state.max_frame_bytes / 4) return false;
-    if (remote_frame_capacity_pixels >= pixel_count and remote_frame_pixels != null) return true;
-    if (pixel_count > (~@as(usize, 0)) / @sizeOf(u32)) return false;
-    const bytes = pixel_count * @sizeOf(u32);
-    const memory = heap.alloc(bytes, @alignOf(u32)) orelse return false;
-    // Every live read/write owns remote_frame_guard, so no old access remains.
-    if (remote_frame_memory) |old| _ = heap.free(old);
-    const aligned: [*]align(@alignOf(u32)) u8 = @alignCast(memory.ptr);
-    const raw: [*]u32 = @ptrCast(aligned);
-    remote_frame_memory = memory;
-    remote_frame_pixels = raw[0..pixel_count];
-    remote_frame_capacity_pixels = pixel_count;
-    remote_frame_ready = false;
-    remote_frame_info = .{};
-    remote_frame_history.reset();
-    @atomicStore(u32, &remote_frame_published_revision, 0, .release);
-    return true;
-}
-
-// Called with remote_frame_guard held after an invalidated consumer epoch.
-fn discardRemoteFrameStorage() void {
-    if (remote_frame_memory) |memory| _ = heap.free(memory);
-    for (&remote_frame_snapshots) |*snapshot| {
-        if (remoteFrameConsumers() == 0) {
-            if (snapshot.memory) |memory| _ = heap.free(memory);
-            snapshot.* = .{};
-        } else {
-            // Legacy owner-thread mappings survive producer reset until
-            // their next map/release; new lease consumers use the pool below.
-            snapshot.revision = 0; snapshot.width = 0; snapshot.height = 0;
-        }
-    }
-    remote_frame_memory = null;
-    remote_frame_pixels = null;
-    remote_frame_capacity_pixels = 0;
-    remote_frame_info = .{};
-    remote_frame_ready = false;
-    remote_frame_history.reset();
-    if (remoteFrameConsumers() == 0) remote_frame_snapshot_active = 1;
-    @atomicStore(u32, &remote_frame_published_revision, 0, .release);
-    reapRemoteSnapshots();
-}
-
-fn ensureRemoteFrameSnapshotCapacity(index: usize, pixel_count: usize) bool {
-    if (index >= remote_frame_snapshots.len or pixel_count == 0) return false;
-    const snapshot = &remote_frame_snapshots[index];
-    if (snapshot.capacity_pixels >= pixel_count and snapshot.pixels != null) return true;
-    if (pixel_count > remote_frame_state.max_frame_bytes / 4) return false;
-    const memory = heap.alloc(pixel_count * @sizeOf(u32), @alignOf(u32)) orelse return false;
-    if (snapshot.memory) |old| _ = heap.free(old);
-    const aligned: [*]align(@alignOf(u32)) u8 = @alignCast(memory.ptr);
-    const raw: [*]u32 = @ptrCast(aligned);
-    snapshot.* = .{
-        .memory = memory,
-        .pixels = raw[0..pixel_count],
-        .capacity_pixels = pixel_count,
-    };
-    return true;
-}
-
-// Das Mapping zeigt auf einen vom Publisher getrennten Snapshot. Die beiden
-// Slots halten den zuletzt ausgegebenen Puffer waehrend des naechsten Map-
-// Aufrufs stabil; gemaess ABI bleibt der Pfad owner-thread-only. generation
-// ist die Frame-Revision und muss vom Konsumenten gegen RemoteFrameInfo
-// validiert werden, bevor er Pixel ueber I/O weitergibt.
 pub fn remoteFrameMap(out: *RemoteFrameMapInfo) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
-    out.* = .{};
-    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
-    defer leaveRemoteFrame();
-    // A raw snapshot has no per-consumer release token. With multiple
-    // consumers, use remoteFrameRead's bounded copy instead of lending a
-    // slot that another consumer could recycle during network output.
-    if (remoteFrameConsumers() != 1) return remote_frame_error_unavailable;
-    if (!remote_frame_ready or remote_frame_pixels == null or remote_frame_info.frame_pixels == 0)
-        return remote_frame_error_unavailable;
-    const info = remote_frame_info;
-    const required: usize = @intCast(info.frame_pixels);
-    const target_index = 1 - remote_frame_snapshot_active;
-    if (!ensureRemoteFrameSnapshotCapacity(target_index, required)) return remote_frame_error_oom;
-    const snapshot = &remote_frame_snapshots[target_index];
-    const geometry_changed = snapshot.width != info.width or snapshot.height != info.height;
-    const rect = if (snapshot.revision == 0 or geometry_changed)
-        RemoteRect{ .w = info.width, .h = info.height }
-    else
-        remote_frame_history.unionSince(snapshot.revision, info.revision, info.width, info.height);
-    if (!rect.empty()) {
-        copyRemoteFrameRect(snapshot.pixels.?[0..required], remote_frame_pixels.?[0..required], info.width, info.width, rect);
-    }
-    snapshot.revision = info.revision;
-    snapshot.width = info.width;
-    snapshot.height = info.height;
-    remote_frame_snapshot_active = target_index;
-    out.pixels_addr = @intFromPtr(snapshot.pixels.?.ptr);
-    out.capacity_pixels = snapshot.capacity_pixels;
-    out.generation = info.revision;
-    return 0;
-}
-
-fn snapshotUnavailable() i32 {
-    const token = owner_locks.program_state.acquire();
-    remote_frame_snapshot_misses +|= 1;
-    owner_locks.program_state.release(token);
-    return remote_frame_error_unavailable;
+    return signed(29, .{}, out);
 }
 pub fn remoteFrameSnapshotAcquire(owner: CaptureOwner, expected_revision: u32, out_info: *RemoteFrameInfo, out_lease: *RemoteFrameLease) i32 {
-    out_info.* = .{}; out_lease.* = .{};
-    if (!enterRemoteFrame()) return snapshotUnavailable();
-    defer leaveRemoteFrame();
-    const epoch = currentRemoteFrameEpoch() orelse return snapshotUnavailable();
-    if (!remote_frame_ready or remote_frame_pixels == null or (expected_revision != 0 and expected_revision != remote_frame_info.revision)) return snapshotUnavailable();
-    const info = remote_frame_info;
-    const token = owner_locks.program_state.acquire();
-    if (!remote_frame_registry.hasConsumer(owner)) {
-        owner_locks.program_state.release(token); return snapshotUnavailable();
-    }
-    var owned_leases: usize = 0;
-    for (&remote_frame_registry.leases) |*entry| if (entry.id != 0 and entry.owner.same(owner)) { owned_leases += 1; };
-    if (owned_leases >= remote_frame_state.leases_per_consumer) {
-        owner_locks.program_state.release(token); return snapshotUnavailable();
-    }
-    const selected = for (&remote_frame_leased, 0..) |*snapshot, index| {
-        if (snapshot.epoch == epoch and snapshot.revision == info.revision and snapshot.width == info.width and snapshot.height == info.height and snapshot.pixels != null) break index;
-    } else for (remote_frame_registry.references, 0..) |count, index| { if (count == 0) break index; } else {
-        owner_locks.program_state.release(token); return snapshotUnavailable();
-    };
-    const held = remote_frame_registry.references[selected] != 0;
-    owner_locks.program_state.release(token);
-    const snapshot = &remote_frame_leased[selected];
-    const required: usize = info.frame_pixels;
-    if (required == 0 or required > remote_frame_state.max_frame_bytes / 4) return remote_frame_error_invalid;
-    if (snapshot.capacity_pixels < required or snapshot.pixels == null) {
-        if (held) return snapshotUnavailable();
-        const memory = heap.alloc(required * 4, @alignOf(u32)) orelse return remote_frame_error_oom;
-        if (snapshot.memory) |old| _ = heap.free(old);
-        const pixels: [*]u32 = @ptrCast(@alignCast(memory.ptr));
-        snapshot.* = .{ .memory = memory, .pixels = pixels[0..required], .capacity_pixels = required };
-    }
-    if (snapshot.epoch != epoch or snapshot.revision != info.revision) {
-        if (held) return snapshotUnavailable();
-        const rect = if (snapshot.epoch != epoch or snapshot.width != info.width or snapshot.height != info.height or snapshot.revision == 0)
-            RemoteRect{ .w = info.width, .h = info.height }
-        else remote_frame_history.unionSince(snapshot.revision, info.revision, info.width, info.height);
-        if (!rect.empty()) {
-            copyRemoteFrameRect(snapshot.pixels.?[0..required], remote_frame_pixels.?[0..required], info.width, info.width, rect);
-            remote_frame_snapshot_bytes +|= @as(u64, rect.w) * rect.h * 4;
-        }
-        snapshot.epoch = epoch; snapshot.revision = info.revision; snapshot.width = info.width; snapshot.height = info.height;
-    }
-    const final_token = owner_locks.program_state.acquire();
-    if (epoch != remote_frame_epoch or remote_frame_discard_pending) {
-        owner_locks.program_state.release(final_token); return snapshotUnavailable();
-    }
-    const now = timer.eventNanoseconds();
-    const lease = remote_frame_registry.beginLease(owner, selected, epoch, now) catch {
-        owner_locks.program_state.release(final_token); return snapshotUnavailable();
-    };
-    owner_locks.program_state.release(final_token);
-    out_info.* = info;
-    out_lease.* = .{ .id = lease.id, .pixels_addr = @intFromPtr(snapshot.pixels.?.ptr),
-        .capacity_pixels = required, .epoch = epoch, .acquired_ns = now };
-    return 0;
+    return signed(30, .{ .owner = owner, .value = expected_revision, .second = out_lease }, out_info);
 }
 pub fn remoteFrameSnapshotRelease(owner: CaptureOwner, lease: *const RemoteFrameLease) i32 {
-    if (lease.version != 1 or lease.size != @sizeOf(RemoteFrameLease) or lease.id == 0 or lease.epoch == 0) return remote_frame_error_invalid;
-    const token = owner_locks.program_state.acquire();
-    remote_frame_registry.endLease(owner, lease.id, lease.epoch, timer.eventNanoseconds()) catch {
-        owner_locks.program_state.release(token); return remote_frame_error_invalid;
-    };
-    remote_frame_reap_pending = true;
-    owner_locks.program_state.release(token);
-    if (enterRemoteFrame()) leaveRemoteFrame();
-    return 0;
-}
-fn reapRemoteSnapshots() void {
-    // Only remote_frame_guard can admit or mutate snapshot storage. The
-    // no-sleep program owner covers reference metadata, never heap/copies.
-    for (&remote_frame_leased, 0..) |*snapshot, index| {
-        const token = owner_locks.program_state.acquire();
-        const free = remote_frame_registry.references[index] == 0 and
-            (remote_frame_registry.count == 0 or snapshot.epoch != remote_frame_epoch);
-        owner_locks.program_state.release(token);
-        if (free) {
-            if (snapshot.memory) |memory| _ = heap.free(memory);
-            snapshot.* = .{};
-        }
-    }
+    return signed(31, .{ .owner = owner, .input = lease }, null);
 }
 pub fn remoteFrameCaptureStats(out: *RemoteFrameCaptureStats) callconv(.c) i32 {
-    if (@intFromPtr(out) == 0) return remote_frame_error_invalid;
-    out.* = .{};
-    if (!enterRemoteFrame()) return remote_frame_error_unavailable;
-    defer leaveRemoteFrame();
-    out.live_bytes = remote_frame_capacity_pixels * 4;
-    for (&remote_frame_leased) |*snapshot| if (snapshot.memory != null) {
-        out.snapshots += 1; out.snapshot_bytes += snapshot.capacity_pixels * 4;
-    };
-    out.published_bytes = remote_frame_published_bytes; out.snapshot_copy_bytes = remote_frame_snapshot_bytes;
-    const token = owner_locks.program_state.acquire();
-    defer owner_locks.program_state.release(token);
-    out.consumers = remote_frame_registry.count; out.epoch = remote_frame_epoch;
-    out.revision = currentRemoteFrameRevision(); out.acquires = remote_frame_registry.acquired;
-    out.misses = remote_frame_snapshot_misses; out.max_reader_ns = remote_frame_registry.max_reader_ns;
-    for (remote_frame_registry.references) |count| out.leases += count;
-    return 0;
+    return signed(32, .{}, out);
 }
-
-fn captureRemoteFrameInfo(since_revision: ?u32, out: *RemoteFrameInfo) bool {
-    if (!enterRemoteFrame()) return false;
-    defer leaveRemoteFrame();
-    if (!remote_frame_ready) return false;
-    var info = remote_frame_info;
-    if (since_revision) |revision| {
-        if (revision != info.revision) {
-            const rect = remote_frame_history.unionSince(revision, info.revision, info.width, info.height);
-            info.dirty_x = @intCast(rect.x);
-            info.dirty_y = @intCast(rect.y);
-            info.dirty_w = rect.w;
-            info.dirty_h = rect.h;
-        }
-    }
-    out.* = info;
-    return true;
-}
-
-// The guard is only acquired with tryEnter: every public nonblocking
-// operation stays nonblocking even while a large copy is preempted.
-fn enterRemoteFrame() bool {
-    if (!remote_frame_guard.tryEnter()) return false;
-    discardPendingRemoteFrames();
-    return true;
-}
-
-fn leaveRemoteFrame() void {
-    while (true) {
-        const token = owner_locks.program_state.acquire();
-        if (remote_frame_discard_pending or remote_frame_reap_pending) {
-            owner_locks.program_state.release(token);
-            discardPendingRemoteFrames();
-            continue;
-        }
-        // Publish the end of ownership together with the retirement check.
-        // A later last release can then acquire the guard and drain itself.
-        _ = remote_frame_guard.leave();
-        owner_locks.program_state.release(token);
-        return;
-    }
-}
-
-fn discardPendingRemoteFrames() void {
-    const token = owner_locks.program_state.acquire();
-    const pending = remote_frame_discard_pending;
-    const reap = remote_frame_reap_pending;
-    remote_frame_discard_pending = false;
-    remote_frame_reap_pending = false;
-    owner_locks.program_state.release(token);
-    if (pending) discardRemoteFrameStorage();
-    if (reap) reapRemoteSnapshots();
-}
-
-fn currentRemoteFrameEpoch() ?u64 {
-    const token = owner_locks.program_state.acquire();
-    defer owner_locks.program_state.release(token);
-    return if (remoteFrameConsumers() == 0 or remote_frame_discard_pending) null else remote_frame_epoch;
-}
-
-fn completeRemoteFrame(epoch: u64, revision: u32) bool {
-    const token = owner_locks.program_state.acquire();
-    const current = epoch == remote_frame_epoch and remoteFrameConsumers() != 0 and !remote_frame_discard_pending;
-    if (current) @atomicStore(u32, &remote_frame_published_revision, revision, .release);
-    owner_locks.program_state.release(token);
-    leaveRemoteFrame();
-    return current;
-}
-
-fn currentRemoteFrameRevision() u32 {
-    return @atomicLoad(u32, &remote_frame_published_revision, .acquire);
-}
-
-fn bumpRemoteFrameRevision() u32 {
-    var next = remote_frame_revision_counter +% 1;
-    if (next == 0) next = 1;
-    remote_frame_revision_counter = next;
-    return next;
-}
-
-fn validRemoteInputKind(kind: u32) bool {
-    return kind == remote_input_kind_key_down or
-        kind == remote_input_kind_key_up or
-        kind == remote_input_kind_mouse_move or
-        kind == remote_input_kind_mouse_buttons or
-        kind == remote_input_kind_mouse_wheel;
-}
-
-fn nextRemoteInputSequence() u32 {
-    remote_input_sequence +%= 1;
-    if (remote_input_sequence == 0) remote_input_sequence = 1;
-    return remote_input_sequence;
-}
-
-fn normalizeRemoteRect(info: *const RemoteFrameInfo, force_full: bool) RemoteRect {
-    if (force_full or info.dirty_w == 0 or info.dirty_h == 0) {
-        return .{ .x = 0, .y = 0, .w = info.width, .h = info.height };
-    }
-
-    const width_i: i64 = @intCast(info.width);
-    const height_i: i64 = @intCast(info.height);
-    var left: i64 = @intCast(info.dirty_x);
-    var top: i64 = @intCast(info.dirty_y);
-    var right = left + @as(i64, @intCast(info.dirty_w));
-    var bottom = top + @as(i64, @intCast(info.dirty_h));
-    if (left < 0) left = 0;
-    if (top < 0) top = 0;
-    if (right > width_i) right = width_i;
-    if (bottom > height_i) bottom = height_i;
-    if (right <= left or bottom <= top) {
-        return .{ .x = 0, .y = 0, .w = info.width, .h = info.height };
-    }
-    return .{
-        .x = @intCast(left),
-        .y = @intCast(top),
-        .w = @intCast(right - left),
-        .h = @intCast(bottom - top),
-    };
-}
-
-fn mergeRemoteRect(a: RemoteRect, b: RemoteRect) RemoteRect {
-    const left = @min(a.x, b.x);
-    const top = @min(a.y, b.y);
-    const right = @max(@as(u64, a.x) + a.w, @as(u64, b.x) + b.w);
-    const bottom = @max(@as(u64, a.y) + a.h, @as(u64, b.y) + b.h);
-    return .{
-        .x = left,
-        .y = top,
-        .w = @intCast(right - left),
-        .h = @intCast(bottom - top),
-    };
-}
-
-fn copyRemoteFrameRect(dest: []u32, source: []const u32, width: u32, source_stride: u32, rect: RemoteRect) void {
-    const dst_stride: usize = @intCast(width);
-    const src_stride: usize = @intCast(source_stride);
-    const x: usize = @intCast(rect.x);
-    const count: usize = @intCast(rect.w);
-    var row: u32 = 0;
-    while (row < rect.h) : (row += 1) {
-        const y: usize = @intCast(rect.y + row);
-        const dst_offset = y * dst_stride + x;
-        const src_offset = y * src_stride + x;
-        @memcpy(dest[dst_offset .. dst_offset + count], source[src_offset .. src_offset + count]);
-    }
-}
-
-fn copyZ(ptr: [*:0]const u8, out: []u8) ?[]const u8 {
-    var len: usize = 0;
-    while (len < out.len and ptr[len] != 0) : (len += 1) out[len] = ptr[len];
-    if (len == out.len) return null;
-    return out[0..len];
-}
-
-fn copyFixedZ(out: []u8, value: []const u8) void {
-    @memset(out, 0);
-    if (out.len == 0) return;
-    const count = @min(value.len, out.len - 1);
-    if (count > 0) @memcpy(out[0..count], value[0..count]);
-}
-
-fn readLe32(data: []const u8) u32 {
-    return @as(u32, data[0]) |
-        (@as(u32, data[1]) << 8) |
-        (@as(u32, data[2]) << 16) |
-        (@as(u32, data[3]) << 24);
+comptime {
+    if (@sizeOf(Args) != 64 or @offsetOf(Args, "input") != 40) @compileError("R4DESK C args layout");
 }

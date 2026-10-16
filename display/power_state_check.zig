@@ -29,13 +29,13 @@ pub fn check(store: *model.Store, identity: a.GfxOutputId) !void {
     const state = &(try store.powerEntry(identity)).power;
     try t.expect(!state.stopped(other) and state.stopped(actor));
     const closed = try store.readPower(14, identity, 301);
-    try t.expect(closed.off == 0 and closed.sequence > renew.sequence and state.actor == null);
+    try t.expect(closed.off == 0 and closed.sequence > renew.sequence and state.actorValue() == null);
     const again = try store.requestPower(other, .{ .identity = identity, .off = 1 }, 302);
     const expired = try store.readPower(14, identity, again.deadline_ns);
     try t.expect(expired.off == 0 and expired.sequence > again.sequence);
     _ = try store.requestPower(actor, .{ .identity = identity, .off = 1 }, again.deadline_ns + 1);
     const wake = try store.requestPower(other, .{ .identity = identity }, again.deadline_ns + 2);
-    try t.expect(wake.off == 0 and state.actor == null);
+    try t.expect(wake.off == 0 and state.actorValue() == null);
     var stale = identity; stale.connection_generation += 1;
     try t.expectError(error.Stale, store.requestPower(actor, .{ .identity = stale, .off = 1 }, again.deadline_ns + 3));
     value.sequence += 1; value.phase = a.gfx_power_phase_waking; value.request_sequence = wake.sequence;

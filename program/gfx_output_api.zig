@@ -1,149 +1,89 @@
-// Public copied-payload facade; outputs are written only after owner release.
+//! Temporary fixed projection of the native public output API.
 const outputs = @import("../display/outputs.zig");
 pub const abi = outputs.abi;
 const buffers = @import("../memory/gfx_buffers.zig");
-const memory_api = @import("gfx_buffer_api.zig");
-const queue_api = @import("gfx_queue_api.zig");
-const lifetime = @import("../sched/task_context.zig");
+const Args = extern struct { owner: buffers.Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, ticket: u64 = 0, value: u32 = 0, other: u32 = 0, input: ?*const anyopaque = null };
+extern fn r4os_rust_gfx_output_api(u32, *const Args, ?*anyopaque) i32;
 pub fn code(err: outputs.Error) i32 {
-    return switch (err) {
-        error.Bandwidth => abi.gfx_output_error_bandwidth,
-        error.Routing => abi.gfx_output_error_routing,
-        error.Dependency => abi.gfx_output_error_dependency,
-        else => |other| queue_api.errorCode(other),
-    };
+    return r4os_rust_gfx_output_api(17, &Args{ .value = privateCode(err) }, null);
 }
 pub fn revision(output: *abi.GfxDisplayRevision) callconv(.c) i32 {
-    if (!memory_api.validOutput(abi.GfxDisplayRevision, output)) return abi.gfx_output_error_invalid;
-    const snapshot = outputs.revision();
-    output.* = snapshot;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(0, &Args{}, output);
 }
 pub fn info(index: u32, output: *abi.GfxOutputInfo) callconv(.c) i32 {
-    if (!memory_api.validOutput(abi.GfxOutputInfo, output)) return abi.gfx_output_error_invalid;
-    const snapshot = outputs.infoAt(index) orelse return 0;
-    output.* = snapshot;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(1, &Args{ .value = index }, output);
 }
 pub fn mode(input: *const abi.GfxOutputId, index: u32, output: *abi.GfxOutputMode) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxOutputMode, output)) return abi.gfx_output_error_invalid;
-    const snapshot = outputs.modeAt(input.*, index) catch |err| return code(err);
-    output.* = snapshot orelse return 0;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(2, &Args{ .input = input, .value = index }, output);
 }
 pub fn edid(input: *const abi.GfxOutputId, index: u32, output: *abi.GfxEdidBlock) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxEdidBlock, output)) return abi.gfx_output_error_invalid;
-    const snapshot = outputs.edidAt(input.*, index) catch |err| return code(err);
-    output.* = snapshot orelse return 0;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(3, &Args{ .input = input, .value = index }, output);
 }
 pub fn color(input: *const abi.GfxOutputId, output: *abi.GfxOutputColorState) callconv(.c) i32 {
-    const wire = @import("gfx_output_wire.zig");
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxOutputId) != 0) return abi.gfx_output_error_invalid;
-    const count = wire.capacity(output) orelse return abi.gfx_output_error_invalid;
-    const snapshot = outputs.colorAt(input.*) catch |err| return code(err);
-    wire.write(output, count, snapshot);
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(4, &Args{ .input = input }, output);
 }
 pub fn refresh(input: *const abi.GfxOutputTarget, output: *abi.GfxOutputRefresh) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxOutputTarget) != 0 or
-        !memory_api.validOutput(abi.GfxOutputRefresh, output)) return abi.gfx_output_error_invalid;
-    const value = outputs.refreshAt(input.*) catch |err| return code(err);
-    output.* = value;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(5, &Args{ .input = input }, output);
 }
 pub fn requestRefresh(owner: buffers.Owner, input: *const abi.GfxRefreshRequest, output: *abi.GfxRefreshRequest) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxRefreshRequest) != 0 or
-        !memory_api.validOutput(abi.GfxRefreshRequest, output)) return abi.gfx_output_error_invalid;
-    const request = input.*;
-    const value = outputs.requestRefresh(owner, request) catch |err| return code(err);
-    output.* = value;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(6, &Args{ .owner = owner, .input = input }, output);
 }
 pub fn power(input: *const abi.GfxOutputId, output: *abi.GfxOutputPower) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxOutputId) != 0 or
-        !memory_api.validOutput(abi.GfxOutputPower, output)) return abi.gfx_output_error_invalid;
-    const value = outputs.powerAt(input.*) catch |err| return code(err);
-    output.* = value;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(7, &Args{ .input = input }, output);
 }
 pub fn requestPower(owner: buffers.Owner, input: *const abi.GfxPowerRequest, output: *abi.GfxPowerRequest) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxPowerRequest) != 0 or
-        !memory_api.validOutput(abi.GfxPowerRequest, output)) return abi.gfx_output_error_invalid;
-    const request = input.*;
-    const value = outputs.requestPower(owner, request) catch |err| return code(err);
-    output.* = value;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(8, &Args{ .owner = owner, .input = input }, output);
 }
 pub fn atomic(owner: buffers.Owner, input: *const abi.GfxAtomicState, output: *abi.GfxAtomicResult, commit: bool) i32 {
-    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxAtomicResult, output)) return abi.gfx_output_error_invalid;
-    const state = input.*;
-    const call = lifetime.enterUnwind();
-    if (!call.admitted()) return abi.gfx_output_error_busy;
-    defer _ = lifetime.leaveUnwind(call);
-    const result = outputs.atomic(owner, &state, commit) catch |err| return code(err);
-    output.* = result;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(9, &Args{ .owner = owner, .input = input, .other = @intFromBool(commit) }, output);
 }
-const modes = @import("../display/mode_work.zig");
 pub fn submit(owner: buffers.Owner, input: *const abi.GfxAtomicState, confirmation_ms: u32, output: *abi.GfxModeStatus) i32 {
-    if (@intFromPtr(input) == 0 or !memory_api.validOutput(abi.GfxModeStatus, output)) return abi.gfx_output_error_invalid;
-    const state = input.*;
-    const call = lifetime.enterUnwind();
-    if (!call.admitted()) return abi.gfx_output_error_busy;
-    defer _ = lifetime.leaveUnwind(call);
-    const result = modes.submit(owner, &state, confirmation_ms) catch |err| return modes.code(err);
-    output.* = result;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(10, &Args{ .owner = owner, .input = input, .value = confirmation_ms }, output);
 }
 pub fn testColor(owner: buffers.Owner, input: *const abi.GfxModeColorRequest, output: *abi.GfxAtomicResult) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxModeColorRequest) != 0 or
-        !memory_api.validOutput(abi.GfxAtomicResult, output)) return abi.gfx_output_error_invalid;
-    const request = input.*;
-    const call = lifetime.enterUnwind();
-    if (!call.admitted()) return abi.gfx_output_error_busy;
-    defer _ = lifetime.leaveUnwind(call);
-    @import("../display/mode_color.zig").validate(owner, &request) catch |err| return code(err);
-    const result = outputs.atomic(owner, &request.state, false) catch |err| return code(err);
-    output.* = result;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(11, &Args{ .owner = owner, .input = input }, output);
 }
 pub fn submitColor(owner: buffers.Owner, input: *const abi.GfxModeColorRequest, confirmation_ms: u32, output: *abi.GfxModeStatus) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxModeColorRequest) != 0 or
-        !memory_api.validOutput(abi.GfxModeStatus, output)) return abi.gfx_output_error_invalid;
-    const request = input.*;
-    const call = lifetime.enterUnwind();
-    if (!call.admitted()) return abi.gfx_output_error_busy;
-    defer _ = lifetime.leaveUnwind(call);
-    const result = modes.submitColor(owner, &request, confirmation_ms) catch |err| return modes.code(err);
-    output.* = result;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(12, &Args{ .owner = owner, .input = input, .value = confirmation_ms }, output);
 }
 pub fn modeStatus(ticket: u64, output: *abi.GfxModeStatus) callconv(.c) i32 {
-    if (!memory_api.validOutput(abi.GfxModeStatus, output)) return abi.gfx_output_error_invalid;
-    const result = modes.status(ticket) catch |err| return modes.code(err);
-    output.* = result;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(13, &Args{ .ticket = ticket }, output);
 }
 pub fn resolve(owner: buffers.Owner, ticket: u64, action: u32, output: *abi.GfxModeStatus) i32 {
-    if (!memory_api.validOutput(abi.GfxModeStatus, output)) return abi.gfx_output_error_invalid;
-    const result = modes.resolve(owner, ticket, action) catch |err| return modes.code(err);
-    output.* = result;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(14, &Args{ .owner = owner, .ticket = ticket, .value = action }, output);
 }
-
 pub fn brightness(input: *const abi.GfxOutputId, output: *abi.GfxOutputBrightness) callconv(.c) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxOutputId) != 0 or
-        !memory_api.validOutput(abi.GfxOutputBrightness, output)) return abi.gfx_output_error_invalid;
-    const value = outputs.brightnessAt(input.*) catch |err| return code(err);
-    output.* = value;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(15, &Args{ .input = input }, output);
 }
 pub fn requestBrightness(owner: buffers.Owner, input: *const abi.GfxBrightnessRequest, output: *abi.GfxBrightnessRequest) i32 {
-    if (@intFromPtr(input) == 0 or @intFromPtr(input) % @alignOf(abi.GfxBrightnessRequest) != 0 or
-        !memory_api.validOutput(abi.GfxBrightnessRequest, output)) return abi.gfx_output_error_invalid;
-    const request = input.*;
-    const value = outputs.requestBrightness(owner, request) catch |err| return code(err);
-    output.* = value;
-    return abi.gfx_output_ok;
+    return r4os_rust_gfx_output_api(16, &Args{ .owner = owner, .input = input }, output);
+}
+fn privateCode(err: anyerror) u32 {
+    return switch (err) {
+        error.Invalid => 1,
+        error.Overflow => 2,
+        error.Unsupported => 3,
+        error.Exhausted => 4,
+        error.Budget => 5,
+        error.Capacity => 6,
+        error.Stale => 7,
+        error.Busy => 8,
+        error.Closed => 9,
+        error.WrongOwner => 10,
+        error.OutOfMemory => 11,
+        error.Unavailable => 12,
+        error.WaitTimeout => 13,
+        error.WaitCancelled => 14,
+        error.Disabled => 15,
+        error.AlreadyCompleted => 16,
+        error.Bandwidth => 17,
+        error.Routing => 18,
+        error.Dependency => 19,
+        error.DeviceLost => 20,
+        error.RestoreFailed => 21,
+        else => unreachable,
+    };
+}
+comptime {
+    if (@sizeOf(Args) != 48 or @offsetOf(Args, "input") != 40) @compileError("Output API C args layout");
 }

@@ -2,8 +2,6 @@
 const crash = @import("crash.zig");
 const fb = @import("../display/framebuffer.zig");
 const log = @import("log.zig");
-const firmware = @import("../display/firmware_access.zig");
-const Unwind = @import("../sched/task_context.zig").UnwindToken;
 pub const RenderResult = enum(u8) { framebuffer = 0, serial_only = 1 };
 extern fn r4os_rust_crash_screen_render(*const crash.CrashReport) u8;
 extern fn r4os_rust_crash_screen_frame(*const fb.Framebuffer, *const crash.CrashReport) bool;
@@ -22,14 +20,4 @@ export fn r4os_zig_crash_screen_sync() callconv(.c) void {
 }
 export fn r4os_zig_crash_screen_putc(ch: u8) callconv(.c) void {
     log.serialPutcRaw(ch);
-}
-// These C projections retain the single existing display gate and exact task
-// unwind token; there is no new admission counter or lease table.
-export fn r4os_zig_screen_firmware_acquire(out: *Unwind) callconv(.c) bool {
-    const lease = firmware.acquire() orelse return false;
-    out.* = lease.call;
-    return true;
-}
-export fn r4os_zig_screen_firmware_release(token: *const Unwind) callconv(.c) void {
-    (firmware.Lease{ .call = token.* }).release();
 }

@@ -1,24 +1,11 @@
-//! Complete color payload prefixes. No display policy or hardware access.
+//! Fixed projection of native complete color payload prefixes.
 const std = @import("std");
-const abi = @import("r4os_kernel_contract");
-const Color = abi.GfxOutputColorState;
+const Color = @import("r4os_kernel_contract").GfxOutputColorState;
+extern fn r4os_rust_display_wire(u32, u32, ?*const anyopaque, ?*anyopaque, u32, ?*u32) bool;
 pub fn capacity(pointer: *const Color) ?u32 {
-    if (@intFromPtr(pointer) == 0 or @intFromPtr(pointer) % @alignOf(Color) != 0 or pointer.version != 1 or pointer.size < 128) return null;
-    comptime std.debug.assert(@sizeOf(Color) == 192 and @offsetOf(Color, "link_kind") == 128);
-    return if (pointer.size >= 192) 192 else 128;
+    var out: u32 = undefined; return if (r4os_rust_display_wire(2, 4, pointer, null, 0, &out)) out else null;
 }
 pub fn read(pointer: *const Color) ?Color {
-    const count = capacity(pointer) orelse return null;
-    var value: Color = .{};
-    @memcpy(std.mem.asBytes(&value)[0..count], @as([*]const u8, @ptrCast(pointer))[0..count]);
-    // The owner receives the current complete representation. Missing optional
-    // fields are zero; no byte beyond the released caller prefix was read.
-    value.size = @sizeOf(Color);
-    return value;
+    var out: Color = undefined; return if (r4os_rust_display_wire(1, 4, pointer, &out, 0, null)) out else null;
 }
-pub fn write(pointer: *Color, count: u32, value: Color) void {
-    std.debug.assert(count == 128 or count == 192);
-    var snapshot = value;
-    snapshot.size = count;
-    @memcpy(@as([*]u8, @ptrCast(pointer))[0..count], std.mem.asBytes(&snapshot)[0..count]);
-}
+pub fn write(pointer: *Color, count: u32, value: Color) void { std.debug.assert(r4os_rust_display_wire(3, 4, &value, pointer, count, null)); }

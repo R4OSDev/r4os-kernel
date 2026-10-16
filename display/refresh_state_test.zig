@@ -72,5 +72,5 @@ pub fn check(store: anytype, identity: a.GfxOutputId) !void {
     try t.expect(cleared.operation == a.gfx_refresh_operation_clear_fault);
     request.operation = a.gfx_refresh_operation_release;
     const released = try store.requestRefresh(actor, request, renewed.deadline_ns + 6);
-    try t.expect(released.policy == 0 and released.operation == 0 and released.deadline_ns == 0 and state.actor == null);
+    try t.expect(released.policy == 0 and released.operation == 0 and released.deadline_ns == 0 and state.actorValue() == null);
 }

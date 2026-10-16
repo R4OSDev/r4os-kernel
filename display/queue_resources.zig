@@ -1,6 +1,5 @@
-// The caller holds the shared BO/queue metadata owner. Admission copies only
-// descriptors and reserves existing backing; no pixels or device commands run
-// here. In-use backing belongs to the queue, independently of producer death.
+//! Projection of native queued image/resource ownership. The caller retains
+//! its original BO owner and disjoint model stores; no duplicate state.
 const std = @import("std");
 const lifetime = @import("../memory/gfx_buffer_owner.zig");
 const queue = @import("queue_state.zig");
@@ -26,373 +25,89 @@ pub const Request = struct {
     memory_binding: ?lifetime.layout.Binding = null,
     display_target: abi.GfxOutputTarget = .{},
 };
-pub const Entry = struct {
-    fence: queue.Fence = .{},
-    operation: Operation = .barrier,
-    uses: [2]?lifetime.Use = .{ null, null },
-    native_uses: []?lifetime.Use = &.{},
-    bytes: u64 = 0,
-    copied: u64 = 0,
-    source_offset: u64 = 0,
-    target_offset: u64 = 0,
-    row_bytes: u64 = 0,
-    row_count: u32 = 0,
-    source_pitch: u64 = 0,
-    target_pitch: u64 = 0,
-    render: abi.GfxRenderCommand = .{},
-    deadline_ns: u64 = 0,
-    display_target: abi.GfxOutputTarget = .{},
-};
+
 pub const Error = lifetime.Error || queue.Error;
-
-fn validateColorList(list: anytype, render: abi.GfxRenderCommand) Error!void {
-    if (list.version != 1 or list.size != @sizeOf(@TypeOf(list.*)) or list.reserved0 != 0 or
-        list.count == 0 or list.count > abi.gfx_render_list_capacity or list.program.version != 1 or
-        list.program.size != @sizeOf(abi.GfxRenderColorProgram) or list.program.reserved0 != 0 or
-        render.kind != abi.gfx_render_kind_sample or render.filter != abi.gfx_render_filter_nearest or
-        render.transfer != abi.gfx_render_transfer_color) return error.Invalid;
+pub const UseSlot = extern struct {
+    has: bool = false, value: lifetime.NativeUse = undefined,
+    pub fn get(self: *const UseSlot) ?lifetime.Use { return if (self.has) self.value.value() else null; }
+};
+pub const Entry = extern struct {
+    fence: queue.Fence = .{}, operation: Operation = .barrier, uses: [2]UseSlot = @splat(.{}),
+    native_uses: ?[*]UseSlot = null, native_uses_len: usize = 0, bytes: u64 = 0, copied: u64 = 0,
+    source_offset: u64 = 0, target_offset: u64 = 0, row_bytes: u64 = 0, row_count: u32 = 0,
+    source_pitch: u64 = 0, target_pitch: u64 = 0, render: abi.GfxRenderCommand = .{}, deadline_ns: u64 = 0, display_target: abi.GfxOutputTarget = .{},
+    pub fn useAt(self: *const Entry, index: usize) ?lifetime.Use { return self.uses[index].get(); }
+    pub fn setNativeUses(self: *Entry, uses: []UseSlot) void { self.native_uses = if (uses.len == 0) null else uses.ptr; self.native_uses_len = uses.len; }
+};
+pub const NativeRequest = extern struct {
+    operation: Operation, source: lifetime.Handle, target: lifetime.Handle, source_offset: u64, target_offset: u64, bytes: u64,
+    row_count: u32, source_pitch: u64, target_pitch: u64, render: abi.GfxRenderCommand,
+    render_list: ?*const abi.GfxRenderList, grid_list: ?*const abi.GfxRenderGridList, color_list: ?*const abi.GfxRenderColorList,
+    color_grid_list: ?*const abi.GfxRenderColorGridList, has_memory: bool, memory: lifetime.layout.Binding, display_target: abi.GfxOutputTarget,
+    pub fn from(value: Request) NativeRequest { return .{ .operation = value.operation, .source = value.source, .target = value.target,
+        .source_offset = value.source_offset, .target_offset = value.target_offset, .bytes = value.bytes, .row_count = value.row_count,
+        .source_pitch = value.source_pitch, .target_pitch = value.target_pitch, .render = value.render, .render_list = value.render_list,
+        .grid_list = value.grid_list, .color_list = value.color_list, .color_grid_list = value.color_grid_list,
+        .has_memory = value.memory_binding != null, .memory = value.memory_binding orelse .{}, .display_target = value.display_target }; }
+};
+pub const NativeView = extern struct { entries: [*]Entry, len: usize, lists: [*]abi.GfxRenderList,
+    grids: [*][abi.gfx_render_list_capacity]abi.GfxSampleGrid, colors: [*]abi.GfxRenderColorProgram };
+const Args = extern struct {
+    owner: lifetime.Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, timeline: u64 = 0, now: u64 = 0, deadline: u64 = 0, frame_key: u64 = 0,
+    fence: queue.Fence = .{}, release: queue.Release = .{ .fence = .{}, .nonce = 0 }, object: lifetime.Handle = .{}, which: u32 = 0, write: bool = false,
+    dependencies: ?[*]const queue.Fence = null, dependencies_len: usize = 0, request: ?*const NativeRequest = null,
+    seen: ?[*]bool = null, pending: ?[*]u16 = null,
+};
+extern fn r4os_rust_display_queue_resources(u32, *const NativeView, ?*const queue.NativeView, ?*const lifetime.NativeView, *const Args, ?*anyopaque) i32;
+extern fn r4os_rust_display_row_span(u64, u32, u64, *u64) i32;
+extern fn r4os_rust_display_copy_chunk(*const Entry, u64, u32) u64;
+fn checked(code: i32) Error!void { return switch (code) {
+    0 => {}, 1 => error.Invalid, 2 => error.Overflow, 3 => error.Unsupported, 4 => error.Exhausted, 5 => error.Budget, 6 => error.Capacity,
+    7 => error.Stale, 8 => error.Busy, 9 => error.Closed, 10 => error.WrongOwner, 16 => error.AlreadyCompleted, else => unreachable,
+}; }
+pub fn rowSpan(bytes: u64, rows: u32, pitch: u64) Error!u64 { var out: u64 = undefined; try checked(r4os_rust_display_row_span(bytes, rows, pitch, &out)); return out; }
+pub fn copyChunk(entry: *const Entry, budget: u64, max_spans: u32) u64 { return r4os_rust_display_copy_chunk(entry, budget, max_spans); }
+extern fn r4os_rust_display_plane_rows(*const lifetime.layout.Descriptor, u64, u64, u32, u64) i32;
+fn planeRows(descriptor: lifetime.layout.Descriptor, offset: u64, bytes: u64, rows: u32, pitch: u64) Error!void {
+    try checked(r4os_rust_display_plane_rows(&descriptor, offset, bytes, rows, pitch));
 }
-fn validateGrids(grids: *const [abi.gfx_render_list_capacity]abi.GfxSampleGrid, count: u32,
-    commands: *const [abi.gfx_render_list_capacity]abi.GfxRenderCommand, transfer: u32) Error!void {
-    for (grids, 0..) |value, index| {
-        if (index >= count or value.enabled == 0) {
-            if (!std.meta.eql(value, abi.GfxSampleGrid{})) return error.Invalid;
-        } else if (value.enabled != 1 or value.reserved != 0 or value.rotation > 3 or
-            value.scale < 60 or value.scale > 960 or value.pixel_width == 0 or value.pixel_height == 0 or
-            value.viewport_width == 0 or value.viewport_height == 0 or value.guest_width == 0 or value.guest_height == 0 or
-            commands[index].kind != abi.gfx_render_kind_sample or commands[index].filter != abi.gfx_render_filter_nearest or
-            commands[index].transfer != transfer) return error.Invalid;
-    }
-}
-
-pub fn rowSpan(bytes: u64, rows: u32, pitch: u64) Error!u64 {
-    if (bytes == 0 or rows == 0 or pitch < bytes) return error.Invalid;
-    return std.math.add(u64, std.math.mul(u64, rows - 1, pitch) catch return error.Overflow, bytes) catch error.Overflow;
-}
-
-// Geometric copies refer to logical plane offsets. An opaque modifier never
-// grants the kernel knowledge of a physical tiled address or byte extent.
-fn planeRows(desc: lifetime.layout.Descriptor, offset: u64, bytes: u64, rows: u32, pitch: u64) Error!void {
-    if (desc.format == .bytes) return;
-    const multi = desc.format == .nv12 or desc.format == .p010;
-    const sample: u64 = switch (desc.format) {
-        .xrgb8888, .argb8888, .xrgb2101010, .argb2101010 => 4,
-        .abgr16161616f => 8, .p010 => 2, else => 1,
-    };
-    for (desc.planes[0..desc.plane_count], 0..) |plane, index| {
-        if (offset < plane.offset or pitch != plane.pitch) continue;
-        const relative = offset - plane.offset;
-        const x = relative % pitch;
-        const y = relative / pitch;
-        const columns: u64 = if (multi and index == 1) ((@as(u64, desc.width) + 1) / 2) * 2 else desc.width;
-        const height: u64 = if (multi and index == 1) (@as(u64, desc.height) + 1) / 2 else desc.height;
-        if (y < height and rows <= height - y and x < columns * sample and bytes <= columns * sample - x) return;
-    }
-    return error.Invalid;
-}
-
-// Called outside the metadata owner with both queue leases still retained.
-// Bound copied bytes and discontiguous spans independently; narrow rows must
-// not turn one worker slice into an unbounded loop.
-pub fn copyChunk(entry: *const Entry, budget: u64, max_spans: u32) u64 {
-    const source = entry.uses[0] orelse return 0;
-    const target = entry.uses[1] orelse return 0;
-    const remaining = @min(budget, entry.bytes - entry.copied);
-    var done: u64 = 0;
-    var spans: u32 = 0;
-    while (done < remaining and spans < max_spans) : (spans += 1) {
-        const cursor = entry.copied + done;
-        const rows = entry.operation == .copy_rows;
-        const contiguous = !rows or (entry.source_pitch == entry.row_bytes and entry.target_pitch == entry.row_bytes);
-        const y = if (rows) cursor / entry.row_bytes else 0;
-        const x = if (rows) cursor % entry.row_bytes else cursor;
-        const count = if (contiguous) remaining - done else @min(remaining - done, entry.row_bytes - x);
-        const src: [*]const u8 = @ptrFromInt(source.backing.cpu_address + entry.source_offset + y * entry.source_pitch + x);
-        const dst: [*]u8 = @ptrFromInt(target.backing.cpu_address + entry.target_offset + y * entry.target_pitch + x);
-        @memcpy(dst[0..count], src[0..count]);
-        done += count;
-    }
-    return done;
-}
-
 pub fn Resources(comptime capacity: usize) type {
-    return struct {
+    return extern struct {
         const Self = @This();
-        entries: [capacity]Entry = .{Entry{}} ** capacity,
-        // Separate resident metadata avoids inflating the small Entry snapshots
-        // used by workers and interrupt completion ingress.
-        render_lists: [capacity]abi.GfxRenderList = @splat(.{}),
+        entries: [capacity]Entry = @splat(.{}), render_lists: [capacity]abi.GfxRenderList = @splat(.{}),
         render_grids: [capacity][abi.gfx_render_list_capacity]abi.GfxSampleGrid = @splat(@splat(.{})),
         render_colors: [capacity]abi.GfxRenderColorProgram = @splat(.{}),
-
+        pub fn nativeView(self: *Self) NativeView { return .{ .entries = &self.entries, .len = capacity, .lists = &self.render_lists, .grids = &self.render_grids, .colors = &self.render_colors }; }
+        fn invoke(self: *Self, op: u32, state: anytype, buffers: anytype, input: Args, out: ?*anyopaque) Error!void {
+            var args = input; const view = self.nativeView();
+            var qview: queue.NativeView = undefined; var qp: ?*const queue.NativeView = null;
+            var bview: lifetime.NativeView = undefined; var bp: ?*const lifetime.NativeView = null;
+            const count = if (comptime @TypeOf(state) == void) 0 else state.jobs.len;
+            var seen: [count]bool = @splat(false); var pending: [count]u16 = undefined;
+            args.seen = &seen; args.pending = &pending;
+            if (comptime @TypeOf(state) != void) { qview = state.nativeView(); qp = &qview; }
+            if (comptime @TypeOf(buffers) != void) {
+                if (@hasDecl(@typeInfo(@TypeOf(buffers)).pointer.child, "nativeView")) { bview = buffers.nativeView(); bp = &bview; }
+            }
+            try checked(r4os_rust_display_queue_resources(op, &view, qp, bp, &args, out));
+        }
         pub fn ordered(self: *Self, state: anytype, timeline: u64, dependencies: []const queue.Fence, object: lifetime.Handle, write: bool) Error!void {
-            for (&self.entries) |prior| {
-                if (prior.fence.slot == 0) continue;
-                const status = try state.query(prior.fence);
-                if (status.phase == .terminal and !status.device_active) continue;
-                for (prior.uses, 0..) |use, j| if (use) |held| {
-                    if (!held.buffer.eql(object) or (!write and j == 0)) continue;
-                    if (!try state.orders(timeline, dependencies, prior.fence)) return error.Busy;
-                };
-                for (prior.native_uses) |use| if (use) |held| {
-                    if (!held.buffer.eql(object) or (!write and held.access == .queue_read)) continue;
-                    if (!try state.orders(timeline, dependencies, prior.fence)) return error.Busy;
-                };
-            }
+            try self.invoke(0, state, {}, .{ .timeline = timeline, .dependencies = dependencies.ptr, .dependencies_len = dependencies.len, .object = object, .write = write }, null);
         }
-
-        fn renderSubmit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
-            const config = try state.configuration(timeline, producer);
-            if (config.binding.adapter == 0) return error.Unsupported;
-            const draw = request.render;
-            if (request.bytes != 0 or request.source_offset != 0 or request.target_offset != 0 or draw.reserved0 != 0 or
-                draw.kind > abi.gfx_render_kind_sample or draw.filter > abi.gfx_render_filter_bilinear or draw.blend > abi.gfx_render_blend_over or
-                draw.transfer > (if (request.operation == .render_color_list or request.operation == .render_color_grid_list) abi.gfx_render_transfer_color else abi.gfx_render_transfer_srgb_encode) or draw.opacity > 255) return error.Invalid;
-            const sampled = draw.kind == abi.gfx_render_kind_sample;
-            if (!sampled and (request.source.id != 0 or request.source.generation != 0 or draw.filter != 0 or draw.transfer != 0 or
-                !std.meta.eql(draw.source_rect, abi.GfxRenderRect{}))) return error.Invalid;
-            if (sampled and draw.color != 0) return error.Invalid;
-            if (request.operation == .render_list or request.operation == .render_grid_list or request.operation == .render_color_list or request.operation == .render_color_grid_list) {
-                const list = request.render_list orelse return error.Invalid;
-                if (list.version != 1 or list.size != @sizeOf(abi.GfxRenderList) or list.count == 0 or
-                    list.count > abi.gfx_render_list_capacity or list.reserved0 != 0 or !std.meta.eql(list.commands[0], draw)) return error.Invalid;
-                for (&list.commands, 0..) |*item, i| {
-                    if (i >= list.count) { if (!std.meta.eql(item.*, abi.GfxRenderCommand{})) return error.Invalid; continue; }
-                    if (item.kind != draw.kind or item.filter != draw.filter or item.blend != draw.blend or item.transfer != draw.transfer or
-                        item.opacity > 255 or item.reserved0 != 0 or (sampled and item.color != 0) or
-                        (!sampled and !std.meta.eql(item.source_rect, abi.GfxRenderRect{}))) return error.Invalid;
-                }
-            } else if (request.render_list != null) return error.Invalid;
-            var entry = Entry{ .operation = request.operation, .render = draw, .deadline_ns = submission.deadline_ns };
-            const references = [_]lifetime.Handle{ request.source, request.target };
-            var objects: [2]lifetime.Handle = .{ .{}, .{} };
-            var extents: [2]u64 = .{ 0, 0 };
-            const first: usize = if (sampled) 0 else 1;
-            for (first..2) |i| {
-                const reference = references[i];
-                objects[i] = try buffers.bufferFor(reference, producer);
-                const descriptor = try buffers.describe(reference, producer);
-                if (!descriptor.binding.portable()) {
-                    const binding = request.memory_binding orelse return error.Stale;
-                    if (binding.adapter != config.binding.adapter or !std.meta.eql(descriptor.binding, binding)) return error.Stale;
-                }
-                if (i == 1 and descriptor.usage & lifetime.layout.Usage.render == 0) return error.Unsupported;
-                extents[i] = descriptor.bytes;
-                try self.ordered(state, timeline, submission.dependencies, objects[i], i == 1);
-            }
-            if (sampled and objects[0].eql(objects[1])) return error.Unsupported;
-            if (sampled) entry.uses[0] = try buffers.reserveQueued(request.source, producer, owner, false, 0, extents[0]);
-            errdefer if (entry.uses[0]) |held| buffers.endUse(held.lease, owner, true) catch unreachable;
-            entry.uses[1] = try buffers.reserveQueued(request.target, producer, owner, true, 0, extents[1]);
-            errdefer buffers.endUse(entry.uses[1].?.lease, owner, true) catch unreachable;
-            entry.fence = try state.submit(timeline, producer, submission, now);
-            std.debug.assert(self.entries[entry.fence.slot - 1].fence.slot == 0);
-            self.entries[entry.fence.slot - 1] = entry;
-            if (request.render_list) |list| self.render_lists[entry.fence.slot - 1] = list.*;
-            if (request.grid_list) |list| self.render_grids[entry.fence.slot - 1] = list.grids;
-            if (request.color_list) |list| self.render_colors[entry.fence.slot - 1] = list.program;
-            if (request.color_grid_list) |list| {
-                self.render_grids[entry.fence.slot - 1] = list.grids;
-                self.render_colors[entry.fence.slot - 1] = list.program;
-            }
-            return entry.fence;
-        }
-
-        pub fn renderList(self: *Self, state: anytype, fence: queue.Fence) Error!abi.GfxRenderList {
-            const status = try state.query(fence);
-            if (!status.device_active) return error.Invalid;
-            const entry = &self.entries[fence.slot - 1];
-            if (!std.meta.eql(entry.fence, fence) or entry.operation != .render_list) return error.Invalid;
-            return self.render_lists[fence.slot - 1];
-        }
-
-        pub fn renderGridList(self: *Self, state: anytype, fence: queue.Fence) Error!abi.GfxRenderGridList {
-            const status = try state.query(fence);
-            if (!status.device_active) return error.Invalid;
-            const entry = &self.entries[fence.slot - 1];
-            if (!std.meta.eql(entry.fence, fence) or (entry.operation != .render_grid_list and entry.operation != .render_color_grid_list)) return error.Invalid;
-            const list = &self.render_lists[fence.slot - 1];
-            return .{ .count = list.count, .commands = list.commands, .grids = self.render_grids[fence.slot - 1] };
-        }
-
         pub fn submit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
-            const config = try state.configuration(timeline, producer);
-            if (request.operation == .render_color_grid_list) {
-                if (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0 or
-                    request.color_list != null or request.grid_list != null or request.render_list != null) return error.Invalid;
-                const combined = request.color_grid_list orelse return error.Invalid;
-                try validateColorList(combined, request.render);
-                try validateGrids(&combined.grids, combined.count, &combined.commands, abi.gfx_render_transfer_color);
-                const list: abi.GfxRenderList = .{ .count = combined.count, .commands = combined.commands };
-                var copied = request; copied.render_list = &list;
-                return self.renderSubmit(state, buffers, timeline, producer, submission, copied, now);
-            }
-            if (request.color_grid_list != null) return error.Invalid;
-            if (request.operation == .render_color_list) {
-                if (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0 or request.grid_list != null or request.render_list != null) return error.Invalid;
-                const color = request.color_list orelse return error.Invalid;
-                try validateColorList(color, request.render);
-                // Coefficients are opaque to this owner. Native userland validates
-                // their domains before binding the fixed shader; no float math here.
-                const list: abi.GfxRenderList = .{ .count = color.count, .commands = color.commands };
-                var copied = request; copied.render_list = &list;
-                return self.renderSubmit(state, buffers, timeline, producer, submission, copied, now);
-            }
-            if (request.color_list != null) return error.Invalid;
-            if (request.operation == .render_grid_list) {
-                if (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0) return error.Invalid;
-                const grid = request.grid_list orelse return error.Invalid;
-                if (request.render_list != null or grid.version != 1 or grid.size != @sizeOf(abi.GfxRenderGridList) or
-                    grid.count == 0 or grid.count > abi.gfx_render_list_capacity or grid.reserved0 != 0) return error.Invalid;
-                try validateGrids(&grid.grids, grid.count, &grid.commands, abi.gfx_render_transfer_identity);
-                const list: abi.GfxRenderList = .{ .count = grid.count, .commands = grid.commands };
-                var copied = request; copied.render_list = &list;
-                return self.renderSubmit(state, buffers, timeline, producer, submission, copied, now);
-            }
-            if (request.grid_list != null) return error.Invalid;
-            if (request.operation != .render_list and request.render_list != null) return error.Invalid;
-            if (request.operation == .present or request.operation == .direct_present) return self.presentSubmit(state, buffers, timeline, producer, submission, request, now);
-            const rows = request.operation == .copy_rows;
-            if (!rows and (request.row_count != 0 or request.source_pitch != 0 or request.target_pitch != 0)) return error.Invalid;
-            if (request.operation == .render or request.operation == .render_list) return self.renderSubmit(state, buffers, timeline, producer, submission, request, now);
-            if (!std.meta.eql(request.render, abi.GfxRenderCommand{})) return error.Invalid;
-            const source_span = if (rows) try rowSpan(request.bytes, request.row_count, request.source_pitch) else request.bytes;
-            const target_span = if (rows) try rowSpan(request.bytes, request.row_count, request.target_pitch) else request.bytes;
-            var entry = Entry{ .operation = request.operation, .deadline_ns = submission.deadline_ns,
-                .bytes = if (rows) std.math.mul(u64, request.bytes, request.row_count) catch return error.Overflow else request.bytes,
-                .source_offset = request.source_offset, .target_offset = request.target_offset,
-                .row_bytes = if (rows) request.bytes else 0, .row_count = request.row_count,
-                .source_pitch = request.source_pitch, .target_pitch = request.target_pitch };
-            if (request.operation == .copy or request.operation == .upload or rows) {
-                if (request.bytes == 0) return error.Invalid;
-                const source = try buffers.bufferFor(request.source, producer);
-                const upload = request.operation == .upload;
-                if (upload and (config.binding.adapter == 0 or request.target.id != 0 or request.target.generation != 0 or request.target_offset != 0)) return error.Unsupported;
-                const target = if (upload) lifetime.Handle{} else try buffers.bufferFor(request.target, producer);
-                // Aliased copies need an explicit memmove/backend contract.
-                if (source.eql(target)) return error.Unsupported;
-                const references = [_]lifetime.Handle{ request.source, request.target };
-                const objects = [_]lifetime.Handle{ source, target };
-                var offsets = [_]u64{request.source_offset, request.target_offset};
-                var extents = [_]u64{source_span, target_span};
-                for (references[0..@as(usize, if (upload) 1 else 2)], 0..) |reference, i| {
-                    const descriptor = try buffers.describe(reference, producer);
-                    if (!descriptor.binding.portable()) {
-                        const binding = request.memory_binding orelse return error.Stale;
-                        if (binding.adapter != config.binding.adapter or !std.meta.eql(descriptor.binding, binding)) return error.Stale;
-                    }
-                    if (!lifetime.layout.spanFits(descriptor.bytes, offsets[i], extents[i])) return error.Invalid;
-                    if (rows) try planeRows(descriptor, offsets[i], request.bytes, request.row_count, if (i == 0) request.source_pitch else request.target_pitch);
-                    if (descriptor.modifier != 0) {
-                        if (!rows or config.binding.adapter == 0) return error.Unsupported;
-                        offsets[i] = 0;
-                        extents[i] = descriptor.bytes;
-                    }
-                    try self.ordered(state, timeline, submission.dependencies, objects[i], i == 1);
-                }
-                entry.uses[0] = try buffers.reserveQueued(request.source, producer, owner, false, offsets[0], extents[0]);
-                errdefer buffers.endUse(entry.uses[0].?.lease, owner, true) catch unreachable;
-                if (!upload) entry.uses[1] = try buffers.reserveQueued(request.target, producer, owner, true, offsets[1], extents[1]);
-                errdefer if (entry.uses[1]) |held| buffers.endUse(held.lease, owner, true) catch unreachable;
-                // The software adapter only accepts CPU-visible coherent RAM.
-                // Native engines may accept other backing via their own bind.
-                if (config.binding.adapter == 0) for (entry.uses) |use| {
-                    if (use.?.backing.cpu_address == 0 or use.?.backing.cache != .write_back) return error.Unsupported;
-                };
-                const fence = try state.submit(timeline, producer, submission, now);
-                entry.fence = fence;
-                std.debug.assert(self.entries[fence.slot - 1].fence.slot == 0);
-                self.entries[fence.slot - 1] = entry;
-                return fence;
-            }
-            if (request.source.id != 0 or request.source.generation != 0 or request.target.id != 0 or request.target.generation != 0 or
-                request.bytes != 0 or request.source_offset != 0 or request.target_offset != 0) return error.Invalid;
-            const fence = try state.submit(timeline, producer, submission, now);
-            entry.fence = fence;
-            std.debug.assert(self.entries[fence.slot - 1].fence.slot == 0);
-            self.entries[fence.slot - 1] = entry;
-            return fence;
+            const native = NativeRequest.from(request); var out: queue.Fence = undefined;
+            try self.invoke(1, state, buffers, .{ .owner = producer, .timeline = timeline, .deadline = submission.deadline_ns, .frame_key = submission.frame_key,
+                .dependencies = submission.dependencies.ptr, .dependencies_len = submission.dependencies.len, .request = &native, .now = now }, &out); return out;
         }
-
-        pub fn renderColorList(self: *Self, state: anytype, fence: queue.Fence) Error!abi.GfxRenderColorList {
-            const status = try state.query(fence);
-            if (!status.device_active) return error.Invalid;
-            const entry = &self.entries[fence.slot - 1];
-            if (!std.meta.eql(entry.fence, fence) or (entry.operation != .render_color_list and entry.operation != .render_color_grid_list)) return error.Invalid;
-            const list = &self.render_lists[fence.slot - 1];
-            return .{ .count = list.count, .commands = list.commands, .program = self.render_colors[fence.slot - 1] };
-        }
-
-        // Output admission belongs to DisplayExecution. The queue owns a
-        // whole-image read until the driver has copied it into its inactive
-        // scanout. The private scanout is never an invented producer handle.
-        fn presentSubmit(self: *Self, state: anytype, buffers: anytype, timeline: u64, producer: lifetime.Owner, submission: queue.Submission, request: Request, now: u64) Error!queue.Fence {
-            const config = try state.configuration(timeline, producer);
-            if (config.binding.adapter == 0 or request.source_offset != 0 or request.target_offset != 0 or
-                request.target.id != 0 or request.target.generation != 0 or request.target_pitch != 0 or
-                !std.meta.eql(request.render, abi.GfxRenderCommand{})) return error.Invalid;
-            const descriptor = try buffers.describe(request.source, producer);
-            if (request.operation == .direct_present and (descriptor.location != .device_local or descriptor.modifier != 0 or
-                descriptor.usage & lifetime.layout.Usage.scanout == 0 or descriptor.planes[0].pitch & 63 != 0)) return error.Unsupported;
-            // Both acknowledged opaque RGB scanout formats have four-byte
-            // pixels. Display admission already matches the exact output
-            // encoding; this lifetime check must also retain XR30 sources.
-            if ((descriptor.format != .xrgb8888 and descriptor.format != .xrgb2101010) or
-                descriptor.plane_count != 1 or descriptor.planes[0].offset != 0 or
-                descriptor.usage & lifetime.layout.Usage.transfer_source == 0 or request.bytes != @as(u64, descriptor.width) * 4 or
-                request.row_count != descriptor.height or request.source_pitch != descriptor.planes[0].pitch or
-                try rowSpan(request.bytes, request.row_count, request.source_pitch) > descriptor.bytes) return error.Unsupported;
-            if (!descriptor.binding.portable()) {
-                const binding = request.memory_binding orelse return error.Stale;
-                if (binding.adapter != config.binding.adapter or !std.meta.eql(binding, descriptor.binding)) return error.Stale;
-            }
-            const object = try buffers.bufferFor(request.source, producer);
-            try self.ordered(state, timeline, submission.dependencies, object, false);
-            const use = try buffers.reserveQueued(request.source, producer, owner, false, 0, descriptor.bytes);
-            errdefer buffers.endUse(use.lease, owner, true) catch unreachable;
-            const fence = try state.submit(timeline, producer, submission, now);
-            std.debug.assert(self.entries[fence.slot - 1].fence.slot == 0);
-            self.entries[fence.slot - 1] = .{ .fence = fence, .operation = request.operation, .uses = .{ use, null },
-                .bytes = std.math.mul(u64, request.bytes, request.row_count) catch unreachable,
-                .row_bytes = request.bytes, .row_count = request.row_count, .source_pitch = request.source_pitch,
-                .deadline_ns = submission.deadline_ns, .display_target = request.display_target };
-            return fence;
-        }
-
-        pub fn retain(self: *Self, state: anytype, buffers: anytype, fence: queue.Fence, which: u32, driver: lifetime.Owner) Error!lifetime.Handle {
-            if (which > 1) return error.Invalid;
-            const status = try state.query(fence);
-            if (!status.device_active) return if (status.phase == .queued) error.Busy else error.AlreadyCompleted;
-            const entry = &self.entries[fence.slot - 1];
-            if (!std.meta.eql(entry.fence, fence)) return error.Stale;
-            const use = entry.uses[which] orelse return error.Invalid;
-            return buffers.retainQueued(use.lease, owner, driver);
-        }
-
-        pub fn retainScanout(self: *Self, state: anytype, buffers: anytype, fence: queue.Fence, driver: lifetime.Owner) Error!lifetime.Handle {
-            const status = try state.query(fence);
-            if (!status.device_active) return error.Invalid;
-            const entry = &self.entries[fence.slot - 1];
-            if (!std.meta.eql(entry.fence, fence) or entry.operation != .direct_present) return error.Invalid;
-            return buffers.retainScanout((entry.uses[0] orelse return error.Invalid).lease, owner, driver);
-        }
-
-        pub fn release(self: *Self, buffers: anytype, ticket: queue.Release) Error!void {
-            if (ticket.fence.slot == 0 or ticket.fence.slot > capacity) return error.Invalid;
-            const entry = &self.entries[ticket.fence.slot - 1];
-            if (!std.meta.eql(entry.fence, ticket.fence)) return error.Stale;
-            for (&entry.uses) |*use| if (use.*) |held| {
-                try buffers.endUse(held.lease, owner, true);
-                use.* = null;
-            };
-            for (entry.native_uses) |*use| if (use.*) |held| {
-                try buffers.endUse(held.lease, owner, true);
-                use.* = null;
-            };
-            entry.* = .{};
-        }
+        pub fn renderList(self: *Self, state: anytype, fence: queue.Fence) Error!abi.GfxRenderList { var out: abi.GfxRenderList = undefined; try self.invoke(2, state, {}, .{ .fence = fence }, &out); return out; }
+        pub fn renderGridList(self: *Self, state: anytype, fence: queue.Fence) Error!abi.GfxRenderGridList { var out: abi.GfxRenderGridList = undefined; try self.invoke(3, state, {}, .{ .fence = fence }, &out); return out; }
+        pub fn renderColorList(self: *Self, state: anytype, fence: queue.Fence) Error!abi.GfxRenderColorList { var out: abi.GfxRenderColorList = undefined; try self.invoke(4, state, {}, .{ .fence = fence }, &out); return out; }
+        pub fn retain(self: *Self, state: anytype, buffers: anytype, fence: queue.Fence, which: u32, driver: lifetime.Owner) Error!lifetime.Handle { var out: lifetime.Handle = undefined; try self.invoke(5, state, buffers, .{ .fence = fence, .which = which, .owner = driver }, &out); return out; }
+        pub fn retainScanout(self: *Self, state: anytype, buffers: anytype, fence: queue.Fence, driver: lifetime.Owner) Error!lifetime.Handle { var out: lifetime.Handle = undefined; try self.invoke(6, state, buffers, .{ .fence = fence, .owner = driver }, &out); return out; }
+        pub fn release(self: *Self, buffers: anytype, ticket: queue.Release) Error!void { try self.invoke(7, {}, buffers, .{ .release = ticket }, null); }
     };
 }
+comptime { if (@sizeOf(UseSlot) != 120) @compileError("Native queued use C layout"); }
 
 test "queued dependencies reserve CPU ownership across producer death and physical completion" {
     const t = std.testing;
@@ -572,7 +287,7 @@ test "native upload retains a single source beyond cancellation and producer ref
     const device = queue.Binding{ .adapter = 7, .device_generation = 3, .reset_generation = 1 };
     const timeline = try state.open(producer, .{ .binding = device, .milestone = .device_execution });
     const fence = try resources.submit(&state, &buffers, timeline, producer, .{ .deadline_ns = 100 }, request, 0);
-    try t.expect(resources.entries[fence.slot - 1].uses[1] == null);
+    try t.expect(resources.entries[fence.slot - 1].useAt(1) == null);
     try t.expectError(error.Busy, buffers.use(created.reference, producer, .cpu_write, 0, 4096));
     try t.expectEqualDeep(fence, state.takeReadyFor(device, 1).?);
     try state.cancel(fence, producer, 2);
@@ -651,7 +366,7 @@ test "native upload retains a single source beyond cancellation and producer ref
     const held_draw = &resources.entries[render_fence.slot - 1];
     try t.expectEqualDeep(retained_draw, held_draw.render);
     try t.expectEqual(@as(u64, 100), held_draw.deadline_ns);
-    try t.expectEqual(@as(u64, 4096), held_draw.uses[1].?.range.bytes);
+    try t.expectEqual(@as(u64, 4096), held_draw.useAt(1).?.range.bytes);
     // A separately queued reader must explicitly depend on the writer.
     draw.operation = .render; draw.render_list = null;
     draw.source = render_refs[1]; draw.target = render_refs[0];
@@ -832,7 +547,7 @@ fn checkImagePresentation(direct: bool, format: lifetime.layout.Format) !void {
     request.display_target.head_id = 3;
     try t.expectEqualDeep(display_target, resources.entries[reader.slot - 1].display_target);
     const held = &resources.entries[reader.slot - 1];
-    try t.expect(held.uses[1] == null and held.uses[0].?.range.bytes == 4096 and held.bytes == 1024 and held.row_bytes == 64);
+    try t.expect(held.useAt(1) == null and held.useAt(0).?.range.bytes == 4096 and held.bytes == 1024 and held.row_bytes == 64);
     try buffers.drop(ref, producer); try buffers.drop(native.create.reference, driver);
     try t.expectEqualDeep(writer, state.takeReadyFor(device, 2).?);
     try state.complete(writer, .complete, true, 3);

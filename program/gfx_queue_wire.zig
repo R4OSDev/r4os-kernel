@@ -1,37 +1,20 @@
-// Complete extensible payload prefixes. Capacity between two revisions does
-// not authorize reading or writing a partial new field group.
+//! Fixed projection of native complete released graphics payload prefixes.
 const std = @import("std");
 const abi = @import("r4os_kernel_contract");
-
+extern fn r4os_rust_display_wire(u32, u32, ?*const anyopaque, ?*anyopaque, u32, ?*u32) bool;
+fn kind(comptime T: type) u32 {
+    return if (T == abi.GfxBackendRegistration) 0 else if (T == abi.GfxBackendInfo) 1 else if (T == abi.GfxSubmission) 2
+        else if (T == abi.GfxDriverJob) 3 else @compileError("Unsupported graphics queue payload");
+}
 pub fn prefix(comptime T: type, available: u32) ?u32 {
-    const sizes = comptime if (T == abi.GfxBackendRegistration) &[_]u32{ 32, 40, 48 }
-        else if (T == abi.GfxBackendInfo) &[_]u32{ 136, 144, 152 }
-        else if (T == abi.GfxSubmission) &[_]u32{ 408, 432, 512 }
-        else if (T == abi.GfxDriverJob) &[_]u32{ 112, 136, 224, 272, 296 }
-        else @compileError("Unsupported graphics queue payload");
-    comptime std.debug.assert(sizes[sizes.len - 1] == @sizeOf(T));
-    var size: ?u32 = null;
-    for (sizes) |n| if (n <= available) { size = n; };
-    return size;
+    var out: u32 = undefined; return if (r4os_rust_display_wire(0, kind(T), null, null, available, &out)) out else null;
 }
-
 pub fn read(comptime T: type, input: *const T) ?T {
-    if (@intFromPtr(input) == 0 or input.version != 1) return null;
-    const size = prefix(T, input.size) orelse return null;
-    var value: T = .{};
-    @memcpy(std.mem.asBytes(&value)[0..size], std.mem.asBytes(input)[0..size]);
-    value.size = size;
-    return value;
+    var out: T = undefined; return if (r4os_rust_display_wire(1, kind(T), input, &out, 0, null)) out else null;
 }
-
 pub fn capacity(comptime T: type, output: *T) ?u32 {
-    if (@intFromPtr(output) == 0 or output.version != 1) return null;
-    return prefix(T, output.size);
+    var out: u32 = undefined; return if (r4os_rust_display_wire(2, kind(T), output, null, 0, &out)) out else null;
 }
-
 pub fn write(comptime T: type, output: *T, size: u32, value: T) void {
-    std.debug.assert(prefix(T, size) == size);
-    var snapshot = value;
-    snapshot.size = size;
-    @memcpy(std.mem.asBytes(output)[0..size], std.mem.asBytes(&snapshot)[0..size]);
+    std.debug.assert(r4os_rust_display_wire(3, kind(T), &value, output, size, null));
 }

@@ -467,7 +467,7 @@ const Object = extern struct {
 const Reference = extern struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = empty_owner, read_only: bool = false, mapping_only: bool = false };
 const Lease = extern struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = empty_owner, access: Access = .cpu_read, range: layout.Range = .{ .offset = 0, .bytes = 0 } };
 const DeviceBudget = extern struct { present: bool = false, driver: Owner = empty_owner, binding: layout.Binding = .{}, bytes: u64 = 0, closing: bool = false };
-const NativeView = extern struct {
+pub const NativeView = extern struct {
     objects: [*]Object,
     objects_len: usize,
     references: [*]Reference,
@@ -547,7 +547,7 @@ fn StorageTable(comptime object_capacity: ?usize, comptime reference_capacity: ?
                 .leases => Lease,
             };
         }
-        fn nativeView(self: anytype) NativeView {
+        pub fn nativeView(self: anytype) NativeView {
             const objects: Slice(@TypeOf(self), Object) = if (object_capacity != null) &self.objects else self.objects;
             const references: Slice(@TypeOf(self), Reference) = if (reference_capacity != null) &self.references else self.references;
             const leases: Slice(@TypeOf(self), Lease) = if (lease_capacity != null) &self.leases else self.leases;

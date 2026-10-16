@@ -4,7 +4,7 @@
 // synchronous, self-tested copy implementation, but never owns or retains the
 // framebuffer, source buffer, region list or a fence after the callback.
 
-const ownership = @import("ownership.zig");
+comptime { if (@import("builtin").is_test) _ = @import("rust_owner_test"); }
 
 pub const VERSION: u32 = 1;
 pub const FLAG_XRGB32: u32 = 1 << 0;
@@ -50,144 +50,34 @@ pub const Descriptor = extern struct {
     present: PresentFn,
 };
 
-pub const Snapshot = struct {
+pub const Snapshot = extern struct {
     active: bool = false,
     name: [NAME_BYTES]u8 = .{0} ** NAME_BYTES,
     flags: u32 = 0,
     max_regions: u32 = 0,
 };
 
-pub const InvokeResult = struct {
+pub const InvokeResult = extern struct {
     attempted: bool = false,
     result: i32 = -1,
     name: [NAME_BYTES]u8 = .{0} ** NAME_BYTES,
 };
 
-const Registration = struct {
-    active: bool = false,
-    admissions_open: bool = false,
-    busy: u32 = 0,
-    owner: u32 = 0,
-    name: [NAME_BYTES]u8 = .{0} ** NAME_BYTES,
-    generation: u64 = 0,
-    descriptor: ?Descriptor = null,
-};
-
-var registration: Registration = .{};
-var generation_counter: u64 = 0;
-
-pub fn register(owner: u32, name: []const u8, descriptor: *const Descriptor) i32 {
-    if (owner == 0 or name.len == 0 or name.len >= NAME_BYTES) return -1;
-    if (descriptor.version != VERSION or descriptor.size < @sizeOf(Descriptor)) return -2;
-    if ((descriptor.flags & REQUIRED_FLAGS) != REQUIRED_FLAGS or descriptor.max_regions == 0) return -2;
-    const token = ownership.enterState();
-    defer ownership.leaveState(token);
-    if (registration.active) return -3;
-    generation_counter +%= 1;
-    if (generation_counter == 0) generation_counter = 1;
-
-    registration = .{
-        .active = true,
-        .admissions_open = true,
-        .owner = owner,
-        .generation = generation_counter,
-        .descriptor = descriptor.*,
-    };
-    @memcpy(registration.name[0..name.len], name);
-    return 0;
-}
-
-pub fn unregister(owner: u32, name: []const u8) i32 {
-    const token = ownership.enterState();
-    defer ownership.leaveState(token);
-    if (!registration.active or registration.owner != owner or !nameEqual(registration.name[0..], name)) return -1;
-    if (registration.busy != 0) return -2;
-    registration = .{};
-    return 0;
-}
-
-pub fn snapshot() Snapshot {
-    const token = ownership.enterState();
-    defer ownership.leaveState(token);
-    const descriptor = registration.descriptor orelse return .{};
-    if (!registration.active or !registration.admissions_open) return .{};
-    return .{
-        .active = true,
-        .name = registration.name,
-        .flags = descriptor.flags,
-        .max_regions = descriptor.max_regions,
-    };
-}
-
-pub fn invoke(job: *const Job) InvokeResult {
-    const call = ownership.retainCall();
-    if (!call.admitted()) return .{};
-    defer ownership.releaseCall(call);
-
-    const token = ownership.enterState();
-    const descriptor = registration.descriptor orelse {
-        ownership.leaveState(token);
-        return .{};
-    };
-    if (!registration.active or !registration.admissions_open or
-        job.region_count > descriptor.max_regions or registration.busy == 0xffff_ffff)
-    {
-        ownership.leaveState(token);
-        return .{};
-    }
-    // Admission and the owner's in-flight reference are one transition.
-    registration.busy += 1;
-    const generation = registration.generation;
-    const owner = registration.owner;
-    const name = registration.name;
-    ownership.leaveState(token);
-
-    const result = descriptor.present(descriptor.context, job);
-    const finish = ownership.enterState();
-    // Cleanup cannot replace an admitted registration. Keep the generation
-    // check explicit so a stale completion never decrements a later owner.
-    if (registration.active and registration.owner == owner and registration.generation == generation and registration.busy != 0)
-        registration.busy -= 1;
-    ownership.leaveState(finish);
-    return .{ .attempted = true, .result = result, .name = name };
-}
-
-pub fn prepareOwnerCleanup(owner: u32) bool {
-    const token = ownership.enterState();
-    defer ownership.leaveState(token);
-    if (!registration.active or registration.owner != owner) return true;
-    if (registration.busy != 0) return false;
-    registration.admissions_open = false;
-    return true;
-}
-
-pub fn cancelOwnerCleanup(owner: u32) void {
-    const token = ownership.enterState();
-    defer ownership.leaveState(token);
-    if (registration.active and registration.owner == owner) registration.admissions_open = true;
-}
-
-pub fn cleanupOwner(owner: u32) u32 {
-    const token = ownership.enterState();
-    defer ownership.leaveState(token);
-    if (!registration.active or registration.owner != owner) return 0;
-    if (registration.busy != 0) return 0;
-    registration = .{};
-    return 1;
-}
-
-fn nameEqual(stored: []const u8, expected: []const u8) bool {
-    var len: usize = 0;
-    while (len < stored.len and stored[len] != 0) : (len += 1) {}
-    if (len != expected.len) return false;
-    return len == 0 or equal(stored[0..len], expected);
-}
-
-fn equal(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) if (a[i] != b[i]) return false;
-    return true;
+extern fn r4os_rust_display_blit_register(u32, [*]const u8, usize, *const Descriptor) i32;
+extern fn r4os_rust_display_blit_unregister(u32, [*]const u8, usize) i32;
+extern fn r4os_rust_display_blit_snapshot(*Snapshot) void;
+extern fn r4os_rust_display_blit_invoke(*const Job, *InvokeResult) void;
+extern fn r4os_rust_display_blit_cleanup(u32, u32) u32;
+pub fn register(owner: u32, name: []const u8, descriptor: *const Descriptor) i32 { return r4os_rust_display_blit_register(owner, name.ptr, name.len, descriptor); }
+pub fn unregister(owner: u32, name: []const u8) i32 { return r4os_rust_display_blit_unregister(owner, name.ptr, name.len); }
+pub fn snapshot() Snapshot { var out: Snapshot = undefined; r4os_rust_display_blit_snapshot(&out); return out; }
+pub fn invoke(job: *const Job) InvokeResult { var out: InvokeResult = undefined; r4os_rust_display_blit_invoke(job, &out); return out; }
+pub fn prepareOwnerCleanup(owner: u32) bool { return r4os_rust_display_blit_cleanup(0, owner) != 0; }
+pub fn cancelOwnerCleanup(owner: u32) void { _ = r4os_rust_display_blit_cleanup(1, owner); }
+pub fn cleanupOwner(owner: u32) u32 { return r4os_rust_display_blit_cleanup(2, owner); }
+comptime {
+    if (@sizeOf(Region) != 24 or @sizeOf(Job) != 64 or @sizeOf(Descriptor) != 32 or @alignOf(Descriptor) != 8 or @offsetOf(Job, "regions_address") != 56 or @offsetOf(Descriptor, "present") != 24) @compileError("Display blit descriptor C layout");
+    if (@sizeOf(Snapshot) != 36 or @offsetOf(Snapshot, "flags") != 28 or @sizeOf(InvokeResult) != 32 or @offsetOf(InvokeResult, "name") != 8) @compileError("Display blit result C layout");
 }
 
 test "owner cleanup closes callback admission and removes the backend" {

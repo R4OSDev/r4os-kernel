@@ -46,14 +46,14 @@ pub fn check() !void {
     try t.expect(hidden.request.operation == a.display_cursor_operation_hide and state.visible());
     reply.sequence = hidden.sequence; reply.visibility = a.display_cursor_visibility_hidden;
     try t.expect(try state.validateReply(driver, reply)); state.finish(reply);
-    try t.expect(!state.visible() and state.actor.?.eql(caller) and state.status.image_sequence == upload.sequence);
+    try t.expect(!state.visible() and state.actorValue().?.eql(caller) and state.status.image_sequence == upload.sequence);
     state.suspended = false;
     try state.begin(caller, request, .{}, 77, 101, 50);
     _ = try state.take(driver, info.backend, 51);
     state.markLost(a.gfx_output_error_timeout);
-    try t.expect(state.job != null and state.status.flags & a.display_cursor_state_unknown != 0 and !state.available());
+    try t.expect(state.jobValue() != null and state.status.flags & a.display_cursor_state_unknown != 0 and !state.available());
     // A late exact receipt resolves uncertainty; expiration itself did not.
-    reply.sequence = state.job.?.sequence; reply.visibility = a.display_cursor_visibility_visible;
+    reply.sequence = state.jobValue().?.sequence; reply.visibility = a.display_cursor_visibility_visible;
     try t.expect(try state.validateReply(driver, reply)); state.finish(reply);
     try t.expect(state.available() and state.visible() and state.status.flags & a.display_cursor_state_unknown == 0);
     try t.expect(state.close(caller));
@@ -61,7 +61,7 @@ pub fn check() !void {
     try t.expect(release.request.operation == a.display_cursor_operation_release and state.visible());
     reply.sequence = release.sequence; reply.visibility = a.display_cursor_visibility_hidden;
     try t.expect(try state.validateReply(driver, reply)); state.finish(reply);
-    try t.expect(state.actor == null and !state.visible() and state.status.image_sequence == 0);
+    try t.expect(state.actorValue() == null and !state.visible() and state.status.image_sequence == 0);
     var next_info = info;
     next_info.display_generation += 1;
     next_info.backend.device_generation += 1;
@@ -70,7 +70,7 @@ pub fn check() !void {
     state.markLost(a.gfx_output_error_timeout);
     const serial = state.status.sequence;
     try state.retireAfterReset(driver, info.backend);
-    try t.expect(state.lost() and !state.available() and state.info.display_generation == 0 and state.job == null);
+    try t.expect(state.lost() and !state.available() and state.info.display_generation == 0 and state.jobValue() == null);
     try t.expectError(error.Stale, state.validateReply(driver, reply));
     try state.configure(driver, next_info);
     try t.expect(state.available() and state.status.sequence == serial and state.status.display_generation == next_info.display_generation);
@@ -103,31 +103,31 @@ fn checkProviderDisable(driver: memory.Owner, caller: memory.Owner, info: a.Disp
         try t.expectError(error.Stale, state.configure(foreign, disabled));
         var wrong = disabled; wrong.display_generation += 1;
         try t.expectError(error.Stale, state.configure(driver, wrong));
-        try t.expect(!state.closing and state.actor.?.eql(caller) and state.visible() == visible);
+        try t.expect(!state.closing and state.actorValue().?.eql(caller) and state.visible() == visible);
         const sequence = state.status.sequence;
         try t.expectError(error.Busy, state.configure(driver, disabled));
-        try t.expect(state.closing and state.available() and state.actor.?.eql(caller) and
-            state.visible() == visible and state.job == null and state.status.sequence == sequence);
+        try t.expect(state.closing and state.available() and state.actorValue().?.eql(caller) and
+            state.visible() == visible and state.jobValue() == null and state.status.sequence == sequence);
         try t.expectError(error.Busy, state.validate(caller, .{ .display_generation = info.display_generation,
             .head_id = info.head_id, .operation = a.display_cursor_operation_show, .image_sequence = prepared.sequence }));
         const release = (try state.take(driver, info.backend, 30)).?;
         try t.expect(release.request.operation == a.display_cursor_operation_release and release.sequence == sequence + 1);
         try t.expectError(error.Busy, state.configure(driver, disabled));
-        try t.expect(state.job.?.sequence == release.sequence and state.job.?.deadline_ns == release.deadline_ns and
-            state.actor.?.eql(caller) and state.visible() == visible and (try state.take(driver, info.backend, 31)) == null);
+        try t.expect(state.jobValue().?.sequence == release.sequence and state.jobValue().?.deadline_ns == release.deadline_ns and
+            state.actorValue().?.eql(caller) and state.visible() == visible and (try state.take(driver, info.backend, 31)) == null);
         reply.sequence = release.sequence + 1; reply.visibility = a.display_cursor_visibility_hidden;
         try t.expectError(error.Stale, state.validateReply(driver, reply));
-        try t.expect(state.actor.?.eql(caller) and state.visible() == visible);
+        try t.expect(state.actorValue().?.eql(caller) and state.visible() == visible);
         reply.sequence = release.sequence;
         try t.expect(try state.validateReply(driver, reply)); state.finish(reply);
-        try t.expect(state.actor == null and !state.visible() and state.status.image_sequence == 0);
+        try t.expect(state.actorValue() == null and !state.visible() and state.status.image_sequence == 0);
         try state.configure(driver, disabled);
-        try t.expect(!state.available() and state.job == null);
+        try t.expect(!state.available() and state.jobValue() == null);
         try state.configure(driver, info);
-        try t.expect(state.available() and state.actor == null and state.status.sequence == release.sequence);
+        try t.expect(state.available() and state.actorValue() == null and state.status.sequence == release.sequence);
         state.markLost(a.gfx_output_error_timeout);
         try t.expectError(error.Busy, state.configure(driver, disabled));
-        try t.expect(state.lost() and !state.closing and state.job == null);
+        try t.expect(state.lost() and !state.closing and state.jobValue() == null);
     }
 }
 fn checkSource(caller: memory.Owner, driver: memory.Owner) !void {
