@@ -1,100 +1,70 @@
-//! Bounded common cache and demand metadata; no hardware policy or callbacks.
+//! Private fixed C facade. Native cache/demand lives only in these resident rows.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 const std = @import("std");
 const a = @import("r4os_kernel_contract");
 const bo = @import("gfx_buffer_owner.zig");
-pub const Error = bo.Error || error{ Unavailable };
+pub const Error = bo.Error || error{Unavailable};
 pub const max_age_ns: u64 = 3 * std.time.ns_per_s;
 pub const demand_ns: u64 = 10 * std.time.ns_per_s;
-const Entry = struct {
-    owner: ?bo.Owner = null,
-    data: a.GfxTelemetryState = .{},
-    demand: a.GfxTelemetryDemand = .{},
-};
+const Identity = extern struct { kind: u32 = 0, id: u64 = 0, generation: u64 = 0 };
+const Entry = extern struct { has_owner: bool = false, owner: Identity = .{}, data: a.GfxTelemetryState = .{}, demand: a.GfxTelemetryDemand = .{} };
+extern fn r4os_rust_gfx_telemetry_validate(*const a.GfxTelemetryState, u64) i32;
+extern fn r4os_rust_gfx_telemetry_publish([*]Entry, usize, *const Identity, *const a.GfxTelemetryState, u64, *a.GfxTelemetryDemand) i32;
+extern fn r4os_rust_gfx_telemetry_query([*]Entry, usize, *const a.GfxTelemetryRequest, u64, *a.GfxTelemetryState) i32;
+extern fn r4os_rust_gfx_telemetry_close([*]Entry, usize, u32) void;
+fn status(code: i32) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Overflow,
+        3 => error.Unsupported,
+        4 => error.Exhausted,
+        5 => error.Budget,
+        6 => error.Capacity,
+        7 => error.Stale,
+        8 => error.Busy,
+        9 => error.Closed,
+        10 => error.WrongOwner,
+        12 => error.Unavailable,
+        else => unreachable,
+    };
+}
 pub fn validate(input: *const a.GfxTelemetryState, now: u64) Error!void {
-    if (input.version != 1 or input.size < @sizeOf(a.GfxTelemetryState) or input.adapter_id == 0 or input.memory_generation == 0 or
-        input.reserved0 != 0 or input.reserved1 != 0 or input.source > a.gfx_telemetry_source_smu10 or input.state > 4 or input.policy > 9 or input.boost > 2 or
-        now == 0 or input.sampled_ns == 0 or input.sampled_ns > now or input.valid_until_ns < input.sampled_ns or
-        input.valid_until_ns - input.sampled_ns > max_age_ns) return error.Invalid;
-    for (&input.metrics, 0..) |*metric, i| {
-        var allowed: u32 = 0;
-        if (metric.status == a.gfx_telemetry_fresh) {
-            if (i == 9) allowed = a.gfx_telemetry_timer_delta_valid;
-            if (i == 0 or i == 2) allowed = a.gfx_telemetry_partial_values | a.gfx_telemetry_value_mask;
-            if (i == 0) allowed |= a.gfx_telemetry_current_clocks | a.gfx_telemetry_fabric_clock;
-        }
-        if (metric.status > a.gfx_telemetry_stale or metric.flags & ~allowed != 0) return error.Invalid;
-        const known = (metric.flags & a.gfx_telemetry_value_mask) >> 8;
-        if (metric.flags & a.gfx_telemetry_partial_values != 0) {
-            if (known == 0 or (i == 2 and known & ~@as(u32, 3) != 0)) return error.Invalid;
-            for (metric.values, 0..) |value, component| if (known & (@as(u32, 1) << @intCast(component)) == 0 and value != 0) return error.Invalid;
-        } else if (known != 0) return error.Invalid;
-        if (metric.status == a.gfx_telemetry_fresh) {
-            if (metric.source_stamp == 0) return error.Invalid;
-        } else if (!std.mem.allEqual(i64, &metric.values, 0)) return error.Invalid;
-    }
+    try status(r4os_rust_gfx_telemetry_validate(input, now));
 }
 pub fn Store(comptime capacity: usize) type {
     return struct {
         const Self = @This();
-        entries: [capacity]Entry = .{Entry{}} ** capacity,
+        entries: [capacity]Entry = @splat(.{}),
         pub fn publish(self: *Self, owner: bo.Owner, input: *const a.GfxTelemetryState, now: u64) Error!a.GfxTelemetryDemand {
-            if (owner.kind != .driver or !owner.valid()) return error.WrongOwner;
-            try validate(input, now);
-            var empty: ?*Entry = null;
-            for (&self.entries) |*entry| {
-                if (entry.owner == null) { if (empty == null) empty = entry; continue; }
-                if (entry.data.adapter_id != input.adapter_id) continue;
-                if (!entry.owner.?.eql(owner)) return error.WrongOwner;
-                if (input.memory_generation < entry.data.memory_generation or input.sampled_ns < entry.data.sampled_ns) return error.Stale;
-                // A surviving driver may rebuild its GPU after reset. Only a
-                // strictly newer memory epoch can replace this same adapter;
-                // old reads/publications and their demand cannot cross it.
-                if (entry.data.memory_generation != input.memory_generation)
-                    entry.demand = .{ .adapter_id = input.adapter_id, .memory_generation = input.memory_generation };
-                entry.data = input.*;
-                return demand(entry, now);
-            }
-            const entry = empty orelse return error.Capacity;
-            entry.* = .{ .owner = owner, .data = input.*, .demand = .{ .adapter_id = input.adapter_id, .memory_generation = input.memory_generation } };
-            return entry.demand;
-        }
-        fn demand(entry: *Entry, now: u64) a.GfxTelemetryDemand {
-            if (now >= entry.demand.until_ns) { entry.demand.metric_mask = 0; entry.demand.until_ns = 0; }
-            return entry.demand;
+            const id = Identity{ .kind = @intFromEnum(owner.kind), .id = owner.id, .generation = owner.generation };
+            var out: a.GfxTelemetryDemand = undefined;
+            try status(r4os_rust_gfx_telemetry_publish(self.entries[0..].ptr, capacity, &id, input, now, &out));
+            return out;
         }
         pub fn query(self: *Self, request: a.GfxTelemetryRequest, now: u64) Error!a.GfxTelemetryState {
-            if (request.version != 1 or request.size < @sizeOf(a.GfxTelemetryRequest) or request.reserved0 != 0 or
-                request.adapter_id == 0 or request.memory_generation == 0 or request.metric_mask & ~a.gfx_telemetry_metric_mask != 0 or now == 0) return error.Invalid;
-            for (&self.entries) |*entry| {
-                if (entry.owner == null or entry.data.adapter_id != request.adapter_id) continue;
-                if (entry.data.memory_generation != request.memory_generation) return error.Stale;
-                if (now < entry.data.sampled_ns) return error.Stale;
-                _ = demand(entry, now);
-                if (request.metric_mask != 0) {
-                    entry.demand.metric_mask |= request.metric_mask;
-                    entry.demand.until_ns = now +| demand_ns;
-                }
-                var output = entry.data;
-                if (now >= output.valid_until_ns) for (&output.metrics) |*metric| {
-                    if (metric.status == a.gfx_telemetry_fresh) {
-                        metric.status = a.gfx_telemetry_stale; metric.flags = 0; metric.values = @splat(0);
-                    }
-                };
-                return output;
-            }
-            return error.Unavailable;
+            var out: a.GfxTelemetryState = undefined;
+            try status(r4os_rust_gfx_telemetry_query(self.entries[0..].ptr, capacity, &request, now, &out));
+            return out;
         }
         pub fn closeDriver(self: *Self, id: u32) void {
-            for (&self.entries) |*entry| if (entry.owner) |owner| if (owner.id == id) { entry.* = .{}; };
+            r4os_rust_gfx_telemetry_close(self.entries[0..].ptr, capacity, id);
         }
     };
 }
+comptime {
+    if (@sizeOf(Identity) != 24 or @alignOf(Identity) != 8 or @offsetOf(Identity, "kind") != 0 or @offsetOf(Identity, "id") != 8 or @offsetOf(Identity, "generation") != 16) @compileError("Native graphics identity C layout");
+    if (@sizeOf(Entry) != 616 or @alignOf(Entry) != 8 or @offsetOf(Entry, "has_owner") != 0 or @offsetOf(Entry, "owner") != 8 or @offsetOf(Entry, "data") != 32 or @offsetOf(Entry, "demand") != 576) @compileError("Native graphics telemetry entry C layout");
+}
+
 test "common telemetry demand is finite and generation-bound, stale values are not measurements" {
     const t = std.testing;
     var state: Store(1) = .{};
     const owner: bo.Owner = .{ .kind = .driver, .id = 7, .generation = 8 };
     var input: a.GfxTelemetryState = .{ .adapter_id = 3, .memory_generation = 9, .sampled_ns = 100, .valid_until_ns = 200, .source = 1, .state = 1 };
-    input.metrics[5] = .{ .status = a.gfx_telemetry_fresh, .source_stamp = 12, .values = .{-12500,0,0,0} };
+    input.metrics[5] = .{ .status = a.gfx_telemetry_fresh, .source_stamp = 12, .values = .{ -12500, 0, 0, 0 } };
     try t.expect((try state.publish(owner, &input, 100)).metric_mask == 0);
     var request: a.GfxTelemetryRequest = .{ .adapter_id = 3, .memory_generation = 9, .metric_mask = 32 };
     try t.expect((try state.query(request, 110)).metrics[5].values[0] == -12500);
@@ -108,9 +78,11 @@ test "common telemetry demand is finite and generation-bound, stale values are n
     request.memory_generation += 1;
     try t.expectError(error.Stale, state.query(request, 200));
     try t.expectError(error.WrongOwner, state.publish(.{ .kind = .driver, .id = 8, .generation = 8 }, &input, 200));
-    input.sampled_ns = 201; input.valid_until_ns = 301;
+    input.sampled_ns = 201;
+    input.valid_until_ns = 301;
     try t.expectError(error.Invalid, state.publish(owner, &input, 200));
-    input.sampled_ns = 120 + demand_ns; input.valid_until_ns = input.sampled_ns;
+    input.sampled_ns = 120 + demand_ns;
+    input.valid_until_ns = input.sampled_ns;
     try t.expect((try state.publish(owner, &input, input.sampled_ns)).metric_mask == 0);
     request.memory_generation = input.memory_generation;
     request.metric_mask = 32;
@@ -126,12 +98,12 @@ test "common telemetry demand is finite and generation-bound, stale values are n
     try t.expect((try state.query(request, input.sampled_ns)).metrics[5].status == a.gfx_telemetry_unavailable);
     // Partial APU metrics never turn absent sensor components into zero readings.
     input.source = a.gfx_telemetry_source_smu10;
-    input.metrics[0] = .{ .status = a.gfx_telemetry_fresh, .source_stamp = 1,
-        .flags = a.gfx_telemetry_partial_values | a.gfx_telemetry_current_clocks | a.gfx_telemetry_fabric_clock | (3 << 8),
-        .values = .{ 400000000, 800000000, 0, 0 } };
+    input.metrics[0] = .{ .status = a.gfx_telemetry_fresh, .source_stamp = 1, .flags = a.gfx_telemetry_partial_values | a.gfx_telemetry_current_clocks | a.gfx_telemetry_fabric_clock | (3 << 8), .values = .{ 400000000, 800000000, 0, 0 } };
     try validate(&input, input.sampled_ns);
-    input.metrics[0].values[2] = 1; try t.expectError(error.Invalid, validate(&input, input.sampled_ns));
-    input.metrics[0].values[2] = 0; input.metrics[0].flags = 3 << 8;
+    input.metrics[0].values[2] = 1;
+    try t.expectError(error.Invalid, validate(&input, input.sampled_ns));
+    input.metrics[0].values[2] = 0;
+    input.metrics[0].flags = 3 << 8;
     try t.expectError(error.Invalid, validate(&input, input.sampled_ns));
     input.metrics[0] = .{};
     state.closeDriver(7);

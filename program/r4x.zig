@@ -1253,7 +1253,7 @@ const SharedRasterFreeSet = struct {
         .{null} ** r4x_api.gui_shared_raster_buffer_count,
 };
 
-const shared_raster_lock = &gfx_buffers.metadata_lock;
+// The shared raster mutex is the native BO runtime owner.
 
 fn configureSharedRasterFailureForTest(fail_after: ?u32) void {
     r4os_rust_program_shared_failure(fail_after orelse 0, fail_after != null, true);
@@ -3092,7 +3092,7 @@ const NativeSharedGraphicsOwner = extern struct { id: u64, generation: u64, kind
 fn sharedBackendHandle(value: NativeSharedBackendHandle) gfx_buffers.Handle { return .{ .id = value.id, .generation = value.generation }; }
 fn sharedBackendView(value: gfx_buffers.Handle) NativeSharedBackendHandle { return .{ .id = value.id, .generation = value.generation }; }
 fn sharedBackendOwner(owner: ProgramProcessHandle, raster: bool) gfx_buffers.Owner { return if (raster) gfx_buffers.raster_owner else graphicsOwner(owner); }
-export fn r4os_zig_program_shared_mutex() callconv(.c) *sync.Mutex { return &gfx_buffers.metadata_lock; }
+export fn r4os_zig_program_shared_mutex() callconv(.c) *sync.Mutex { return gfx_buffers.metadataLock(); }
 export fn r4os_zig_program_shared_prepare(references: usize, leases: usize) callconv(.c) NativeSharedPrepared {
     gfx_buffers.lockPrepared(.{ .references = references, .leases = leases }) catch |err| return .{ .status = gfx_buffer_api.status(err), .out_of_memory = err == error.OutOfMemory };
     return .{ .status = 0, .out_of_memory = false };

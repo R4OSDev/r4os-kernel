@@ -1,131 +1,134 @@
-// Driver memory metadata. The runtime bridge uses the shared BO owner for
-// every access; page walks, MMIO and backing allocation run outside it.
+// Private resident C records; native driver epochs/device nodes own all mutation.
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 const std = @import("std");
 const abi = @import("r4os_kernel_contract");
 const lifetime = @import("../memory/gfx_buffer_owner.zig");
 pub const Owner = lifetime.Owner;
 pub const Error = lifetime.Error;
-
-/// A GPU residency lease holds its exact logical extent. Its last partial
-/// page is allowed only at the BO end, backed by the existing page allocation.
-pub fn mappingRange(offset: u64, bytes: u64, address: u64, object_bytes: u64) bool {
-    return address != 0 and (offset | address) & 4095 == 0 and bytes != 0 and
-        offset < object_bytes and bytes <= object_bytes - offset and
-        address <= std.math.maxInt(u64) - bytes and
-        (bytes & 4095 == 0 or bytes == object_bytes - offset);
+const Node = extern struct { key: u64 = 0, priority: usize = 0, parent: ?*Node = null, children: [2]?*Node = @splat(null) };
+const Tree = extern struct { root: ?*Node = null, xorshift: usize = 0 };
+const Epoch = extern struct { identity: Owner = .{ .kind = .driver, .id = 0, .generation = 0 }, closing: bool = false, mmio_busy: bool = false, mmio_retained: bool = false, mmio_pending: bool = false, devices: usize = 0 };
+const DeviceRecord = extern struct { index: Node = .{}, self_address: usize = 0, state_address: usize = 0, owner: Owner = .{ .kind = .driver, .id = 0, .generation = 0 }, descriptor: abi.GfxDeviceLease = .{}, busy: bool = false };
+const View = extern struct { epochs: [*]Epoch, capacity: usize, devices: *Tree, identity: usize };
+extern fn r4os_rust_gfx_mapping_range(u64, u64, u64, u64) bool;
+extern fn r4os_rust_gfx_driver_model_bind(*const View, u32, u64) bool;
+extern fn r4os_rust_gfx_driver_model_owner(*const View, u32, bool, *Owner) i32;
+extern fn r4os_rust_gfx_driver_model_close(*const View, u32) void;
+extern fn r4os_rust_gfx_driver_model_retire(*const View, *const Owner) bool;
+extern fn r4os_rust_gfx_driver_model_retained(*const View, *const Owner, bool) bool;
+extern fn r4os_rust_gfx_driver_model_reserve(*const View, *const Owner, *const abi.GfxDeviceLease, *DeviceRecord) i32;
+extern fn r4os_rust_gfx_driver_model_matching(*const View, *const Owner, *const abi.GfxDeviceLease, **DeviceRecord) i32;
+extern fn r4os_rust_gfx_driver_model_detach(*const View, *DeviceRecord) i32;
+extern fn r4os_rust_gfx_driver_model_mmio(*const View, *const Owner, bool, bool, bool) void;
+fn status(code: i32) Error!void {
+    return switch (code) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Overflow,
+        3 => error.Unsupported,
+        4 => error.Exhausted,
+        5 => error.Budget,
+        6 => error.Capacity,
+        7 => error.Stale,
+        8 => error.Busy,
+        9 => error.Closed,
+        10 => error.WrongOwner,
+        else => unreachable,
+    };
 }
-
+pub fn mappingRange(offset: u64, bytes: u64, address: u64, object_bytes: u64) bool {
+    return r4os_rust_gfx_mapping_range(offset, bytes, address, object_bytes);
+}
 pub fn State(comptime owner_capacity: usize) type {
     return struct {
         const Self = @This();
-        const Tree = std.Treap(u32, std.math.order);
-        const Epoch = struct {
-            identity: Owner = .{ .kind = .driver, .id = 0, .generation = 0 },
-            closing: bool = false,
-            mmio_busy: bool = false,
-            mmio_retained: bool = false,
-            mmio_pending: bool = false,
-            devices: usize = 0,
-        };
-        pub const Device = struct {
-            index: Tree.Node = undefined,
-            self_address: usize = 0,
-            state_address: usize = 0,
-            owner: Owner = .{ .kind = .driver, .id = 0, .generation = 0 },
-            descriptor: abi.GfxDeviceLease = .{},
-            busy: bool = false,
-        };
-        epochs: [owner_capacity]Epoch = .{Epoch{}} ** owner_capacity,
+        pub const Device = DeviceRecord;
+        epochs: [owner_capacity]Epoch = @splat(.{}),
         devices: Tree = .{},
-
-        // Bind before DriverInit/Work can run. Lazy creation after an owner
-        // snapshot could otherwise miss a concurrent close of its first BO.
+        fn view(self: *Self) View {
+            return .{ .epochs = self.epochs[0..].ptr, .capacity = owner_capacity, .devices = &self.devices, .identity = @intFromPtr(self) };
+        }
         pub fn bind(self: *Self, id: u32, generation: u64) bool {
-            if (id == 0 or generation == 0 or self.find(id) != null) return false;
-            for (&self.epochs) |*epoch| if (epoch.identity.id == 0) {
-                epoch.* = .{ .identity = .{ .kind = .driver, .id = id, .generation = generation } };
-                return true;
-            };
-            return false;
+            const v = self.view();
+            return r4os_rust_gfx_driver_model_bind(&v, id, generation);
         }
         pub fn owner(self: *Self, id: u32, admission: bool) Error!Owner {
-            const epoch = self.find(id) orelse return error.Stale;
-            if (admission and epoch.closing) return error.Closed;
-            return epoch.identity;
+            const v = self.view();
+            var out: Owner = undefined;
+            try status(r4os_rust_gfx_driver_model_owner(&v, id, admission, &out));
+            return out;
         }
         pub fn close(self: *Self, id: u32) void {
-            if (self.find(id)) |epoch| epoch.closing = true;
+            const v = self.view();
+            r4os_rust_gfx_driver_model_close(&v, id);
         }
         pub fn retire(self: *Self, identity: Owner) bool {
-            const epoch = self.matchEpoch(identity) catch return false;
-            if (self.retains(identity)) return false;
-            epoch.* = .{};
-            return true;
+            const v = self.view();
+            return r4os_rust_gfx_driver_model_retire(&v, &identity);
         }
         pub fn retains(self: *Self, identity: Owner) bool {
-            const epoch = self.matchEpoch(identity) catch return true;
-            return epoch.mmio_busy or epoch.mmio_retained or epoch.mmio_pending or epoch.devices != 0;
+            const v = self.view();
+            return r4os_rust_gfx_driver_model_retained(&v, &identity, false);
         }
-        // Caller allocates stable storage before acquiring the BO owner and
-        // keeps it until detach. No allocator or page walk runs in this state.
         pub fn reserve(self: *Self, identity: Owner, descriptor: abi.GfxDeviceLease, record: *Device) Error!void {
-            const epoch = try self.matchEpoch(identity);
-            if (epoch.closing) return error.Closed;
-            if (descriptor.lease.id == 0 or descriptor.lease.generation == 0 or record.self_address != 0 or record.state_address != 0) return error.Stale;
-            var place = self.devices.getEntryFor(descriptor.lease.id);
-            if (place.node != null) return error.Stale;
-            if (epoch.devices == std.math.maxInt(usize)) return error.Exhausted;
-            record.* = .{ .self_address = @intFromPtr(record), .state_address = @intFromPtr(self), .owner = identity, .descriptor = descriptor, .busy = true };
-            place.set(&record.index);
-            epoch.devices += 1;
+            const v = self.view();
+            try status(r4os_rust_gfx_driver_model_reserve(&v, &identity, &descriptor, record));
         }
         pub fn matching(self: *Self, identity: Owner, descriptor: abi.GfxDeviceLease) Error!*Device {
-            _ = try self.matchEpoch(identity);
-            const node = self.devices.getEntryFor(descriptor.lease.id).node orelse return error.Stale;
-            const record: *Device = @fieldParentPtr("index", node);
-            if (record.self_address != @intFromPtr(record) or record.state_address != @intFromPtr(self) or
-                !record.owner.eql(identity) or !std.meta.eql(record.descriptor, descriptor)) return error.Stale;
-            if (record.busy) return error.Busy;
-            return record;
+            const v = self.view();
+            var out: *Device = undefined;
+            try status(r4os_rust_gfx_driver_model_matching(&v, &identity, &descriptor, &out));
+            return out;
         }
-        // Also permits the exact busy record after a failed DMA page walk.
-        // End its common BO use before detaching; free storage after unlock.
         pub fn detach(self: *Self, record: *Device) Error!void {
-            if (record.self_address != @intFromPtr(record) or record.state_address != @intFromPtr(self)) return error.Stale;
-            const epoch = try self.matchEpoch(record.owner);
-            var place = self.devices.getEntryFor(record.descriptor.lease.id);
-            if (place.node != &record.index or epoch.devices == 0) return error.Stale;
-            place.set(null);
-            epoch.devices -= 1;
-            record.* = .{};
+            const v = self.view();
+            try status(r4os_rust_gfx_driver_model_detach(&v, record));
         }
         pub fn beginMmio(self: *Self, identity: Owner) void {
-            const epoch = self.matchEpoch(identity) catch unreachable;
-            std.debug.assert(!epoch.mmio_busy);
-            epoch.mmio_busy = true;
+            const v = self.view();
+            r4os_rust_gfx_driver_model_mmio(&v, &identity, true, false, false);
         }
         pub fn endMmio(self: *Self, identity: Owner, retained: bool, pending: bool) void {
-            const epoch = self.matchEpoch(identity) catch unreachable;
-            std.debug.assert(epoch.mmio_busy);
-            epoch.mmio_busy = false;
-            epoch.mmio_retained = retained;
-            epoch.mmio_pending = pending;
+            const v = self.view();
+            r4os_rust_gfx_driver_model_mmio(&v, &identity, false, retained, pending);
         }
         pub fn pendingMmio(self: *Self, identity: Owner) bool {
-            const epoch = self.matchEpoch(identity) catch return true;
-            return epoch.mmio_busy or epoch.mmio_pending;
-        }
-        fn find(self: *Self, id: u64) ?*Epoch {
-            if (id == 0) return null;
-            for (&self.epochs) |*epoch| if (epoch.identity.id == id) return epoch;
-            return null;
-        }
-        fn matchEpoch(self: *Self, identity: Owner) Error!*Epoch {
-            const epoch = self.find(identity.id) orelse return error.Stale;
-            if (!epoch.identity.eql(identity)) return error.Stale;
-            return epoch;
+            const v = self.view();
+            return r4os_rust_gfx_driver_model_retained(&v, &identity, true);
         }
     };
+}
+
+comptime {
+    if (@sizeOf(Node) != 40 or @alignOf(Node) != 8) @compileError("Native driver memory Node C layout");
+    if (@offsetOf(Node, "key") != 0) @compileError("Native driver memory Node.key C offset");
+    if (@offsetOf(Node, "priority") != 8) @compileError("Native driver memory Node.priority C offset");
+    if (@offsetOf(Node, "parent") != 16) @compileError("Native driver memory Node.parent C offset");
+    if (@offsetOf(Node, "children") != 24) @compileError("Native driver memory Node.children C offset");
+    if (@sizeOf(Tree) != 16 or @alignOf(Tree) != 8) @compileError("Native driver memory Tree C layout");
+    if (@offsetOf(Tree, "root") != 0) @compileError("Native driver memory Tree.root C offset");
+    if (@offsetOf(Tree, "xorshift") != 8) @compileError("Native driver memory Tree.xorshift C offset");
+    if (@sizeOf(Epoch) != 40 or @alignOf(Epoch) != 8) @compileError("Native driver memory Epoch C layout");
+    if (@offsetOf(Epoch, "identity") != 0) @compileError("Native driver memory Epoch.identity C offset");
+    if (@offsetOf(Epoch, "closing") != 24) @compileError("Native driver memory Epoch.closing C offset");
+    if (@offsetOf(Epoch, "mmio_busy") != 25) @compileError("Native driver memory Epoch.mmio_busy C offset");
+    if (@offsetOf(Epoch, "mmio_retained") != 26) @compileError("Native driver memory Epoch.mmio_retained C offset");
+    if (@offsetOf(Epoch, "mmio_pending") != 27) @compileError("Native driver memory Epoch.mmio_pending C offset");
+    if (@offsetOf(Epoch, "devices") != 32) @compileError("Native driver memory Epoch.devices C offset");
+    if (@sizeOf(DeviceRecord) != 168 or @alignOf(DeviceRecord) != 8) @compileError("Native driver memory DeviceRecord C layout");
+    if (@offsetOf(DeviceRecord, "index") != 0) @compileError("Native driver memory DeviceRecord.index C offset");
+    if (@offsetOf(DeviceRecord, "self_address") != 40) @compileError("Native driver memory DeviceRecord.self_address C offset");
+    if (@offsetOf(DeviceRecord, "state_address") != 48) @compileError("Native driver memory DeviceRecord.state_address C offset");
+    if (@offsetOf(DeviceRecord, "owner") != 56) @compileError("Native driver memory DeviceRecord.owner C offset");
+    if (@offsetOf(DeviceRecord, "descriptor") != 80) @compileError("Native driver memory DeviceRecord.descriptor C offset");
+    if (@offsetOf(DeviceRecord, "busy") != 160) @compileError("Native driver memory DeviceRecord.busy C offset");
+    if (@sizeOf(View) != 32 or @alignOf(View) != 8) @compileError("Native driver memory View C layout");
+    if (@offsetOf(View, "epochs") != 0) @compileError("Native driver memory View.epochs C offset");
+    if (@offsetOf(View, "capacity") != 8) @compileError("Native driver memory View.capacity C offset");
+    if (@offsetOf(View, "devices") != 16) @compileError("Native driver memory View.devices C offset");
+    if (@offsetOf(View, "identity") != 24) @compileError("Native driver memory View.identity C offset");
 }
 
 test "driver BO reservations survive interleaved page walks and close before epoch reuse" {
@@ -188,7 +191,8 @@ fn checkDynamicDevices() !void {
         const descriptor = record.descriptor;
         record.busy = false;
         try t.expect((try state.matching(owners[i % 2], descriptor)) == record);
-        var wrong = descriptor; wrong.lease.generation += 1;
+        var wrong = descriptor;
+        wrong.lease.generation += 1;
         try t.expectError(error.Stale, state.matching(owners[i % 2], wrong));
         try t.expectError(error.Stale, state.matching(owners[(i + 1) % 2], descriptor));
         try state.detach(record);

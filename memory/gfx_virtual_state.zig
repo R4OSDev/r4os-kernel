@@ -1,15 +1,43 @@
-// Cross-owner GPU virtual-resource lifetime. Resident caller-allocated nodes;
-// hardware placement, execution, allocation and notification stay outside.
+// Private C projection; all VA lifetime mutation belongs to Rust.
 const std = @import("std");
 const abi = @import("r4os_kernel_contract");
 const bo = @import("gfx_buffer_owner.zig");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const Owner = bo.Owner;
 pub const Handle = bo.Handle;
 pub const Error = bo.Error;
-const Tree = std.Treap(u64, std.math.order);
 pub const Claim = enum(u32) { create = 0, retire = 1 };
-pub const Entry = struct {
-    index: Tree.Node = undefined,
+const Node = extern struct {
+    key: u64 = 0,
+    priority: usize = 0,
+    parent: ?*Node = null,
+    children: [2]?*Node = @splat(null),
+    pub fn next(self: *Node) ?*Node {
+        return r4os_rust_gfx_virtual_node_next(self);
+    }
+};
+const Tree = extern struct {
+    root: ?*Node = null,
+    xorshift: usize = 0,
+    pub fn getMin(self: *const Tree) ?*Node {
+        return r4os_rust_gfx_virtual_tree_first(self);
+    }
+    const Iterator = struct {
+        node: ?*Node,
+        pub fn next(self: *Iterator) ?*Node {
+            const node = self.node orelse return null;
+            self.node = node.next();
+            return node;
+        }
+    };
+    pub fn inorderIterator(self: *const Tree) Iterator {
+        return .{ .node = self.getMin() };
+    }
+};
+pub const Entry = extern struct {
+    index: Node = .{},
     handle: Handle = .{},
     owner: Owner = .{ .kind = .program, .id = 0, .generation = 0 },
     provider: Handle = .{},
@@ -23,217 +51,182 @@ pub const Entry = struct {
     open: bool = true,
     closing: bool = false,
     retired: bool = false,
-    claim: ?Claim = null,
+    has_claim: bool = false,
+    claim: Claim = .create,
     token: abi.GfxVirtualToken = .{},
     address: u64 = 0,
     result: i32 = 0,
-    notifications: u2 = 0,
-
-    pub fn backend(self: *const Entry) bool { return !zeroToken(self.token); }
+    notifications: u8 = 0,
+    pub fn claimValue(self: *const Entry) ?Claim {
+        return if (self.has_claim) self.claim else null;
+    }
+    fn call(self: anytype, op: u32, value: u32, reason: i32, out: ?*anyopaque) Error!void {
+        return nativeResult(r4os_rust_gfx_virtual_entry(@constCast(self), op, value, reason, out));
+    }
+    pub fn backend(self: *const Entry) bool {
+        var out: bool = undefined;
+        self.call(0, 0, 0, &out) catch unreachable;
+        return out;
+    }
     pub fn status(self: *const Entry) abi.GfxVirtualStatus {
-        return .{ .resource = publicHandle(self.handle), .parent = self.request.parent, .kind = self.request.kind,
-            .flags = @as(u32, @intFromBool(self.result != 0)) | (@as(u32, @intFromBool(self.retired)) << 1) |
-                (@as(u32, @intFromBool(self.closing)) << 2) | (@as(u32, @intFromBool(self.claim != null)) << 3),
-            .result = self.result, .address = if (self.result == 1 and !self.closing) self.address else 0,
-            .byte_length = self.request.byte_length, .deadline_ns = self.request.deadline_ns };
+        var out: abi.GfxVirtualStatus = undefined;
+        self.call(1, 0, 0, &out) catch unreachable;
+        return out;
     }
     pub fn settled(self: *const Entry, until: u32) bool {
-        return if (until == 0) self.result != 0 else self.retired;
-    }
-    fn finishResult(self: *Entry, result: i32) void {
-        if (self.result != 0) return;
-        self.result = result;
-        self.notifications |= 1;
-    }
-    // Parent metadata remains linked until the child handle is released, but
-    // physical parent retirement only waits for physical child retirement.
-    fn settleRetirement(self: *Entry) void {
-        if (self.retired or !self.closing or self.claim != null or self.backend() or self.live_children != 0 or self.executions != 0) return;
-        self.retired = true;
-        self.notifications |= 2;
-        if (self.parent) |parent| {
-            std.debug.assert(parent.live_children != 0);
-            parent.live_children -= 1;
-            parent.settleRetirement();
-        }
+        var out: bool = undefined;
+        self.call(2, until, 0, &out) catch unreachable;
+        return out;
     }
     pub fn close(self: *Entry, release: bool, reason: i32) void {
-        if (release) self.open = false;
-        self.closing = true;
-        self.finishResult(reason);
-        var child = self.first_child;
-        while (child) |entry| : (child = entry.next_child) entry.close(release, reason);
-        self.settleRetirement();
+        self.call(3, @intFromBool(release), reason, null) catch unreachable;
     }
     pub fn pending(self: *const Entry) ?Claim {
-        if (self.claim != null or self.retired) return null;
-        if (self.closing) return if (self.backend() and self.live_children == 0 and self.executions == 0) .retire else null;
-        return if (self.result == 0) .create else null;
+        var out: u32 = undefined;
+        self.call(4, 0, 0, &out) catch unreachable;
+        return if (out == 2) null else @enumFromInt(out);
     }
     pub fn retainExecution(self: *Entry) Error!void {
-        if (!self.open or self.closing or self.retired) return error.Closed;
-        if (self.request.kind != 2 or self.result != 1 or !self.backend() or self.claim != null) return error.Busy;
-        self.executions = std.math.add(usize, self.executions, 1) catch return error.Exhausted;
+        return self.call(5, 0, 0, null);
     }
     pub fn releaseExecution(self: *Entry) void {
-        std.debug.assert(self.executions != 0 and !self.retired);
-        self.executions -= 1;
-        self.settleRetirement();
+        self.call(6, 0, 0, null) catch unreachable;
     }
 };
-pub fn publicHandle(value: Handle) abi.GfxBufferHandle { return .{ .id = value.id, .generation = value.generation }; }
-fn emptyHandle(value: abi.GfxBufferHandle) bool { return value.id == 0 and value.generation == 0 and value.reserved0 == 0; }
-pub fn zeroToken(value: abi.GfxVirtualToken) bool { return value.opaque0 == 0 and value.opaque1 == 0 and value.opaque2 == 0; }
-fn validHandle(value: abi.GfxBufferHandle) bool { return value.id != 0 and value.generation != 0 and value.reserved0 == 0; }
-pub fn validate(input: abi.GfxVirtualRequest, instant: u64) Error!void {
-    if (input.version != 1 or input.size < @sizeOf(abi.GfxVirtualRequest) or input.adapter_id == 0 or input.memory_generation == 0 or
-        input.reserved0 != 0 or input.reserved1 != 0 or instant == 0 or input.deadline_ns <= instant or input.deadline_ns == std.math.maxInt(u64) or
-        input.byte_length == 0 or input.byte_length & 4095 != 0) return error.Invalid;
-    switch (input.kind) {
-        1 => {
-            const layout_flags = abi.gfx_virtual_flag_blocklinear | abi.gfx_virtual_layout_mask;
-            if (input.flags & ~layout_flags != 0 or input.location > 1) return error.Unsupported;
-            if (input.flags & abi.gfx_virtual_layout_mask != 0 and input.flags & abi.gfx_virtual_flag_blocklinear == 0)
-                return error.Invalid;
-            if (!emptyHandle(input.parent) or !emptyHandle(input.reference) or input.byte_offset != 0 or input.virtual_offset != 0 or
-                input.alignment < 4096 or !std.math.isPowerOfTwo(input.alignment) or input.fixed_address % input.alignment != 0 or
-                input.fixed_address > std.math.maxInt(u64) - input.byte_length) return error.Invalid;
-        },
-        2 => {
-            if (input.flags != 0 or input.location != 0) return error.Unsupported;
-            if (!validHandle(input.parent) or !validHandle(input.reference) or input.alignment != 0 or input.fixed_address != 0 or
-                (input.byte_offset | input.virtual_offset) & 4095 != 0 or input.byte_offset > std.math.maxInt(u64) - input.byte_length or
-                input.virtual_offset > std.math.maxInt(u64) - input.byte_length) return error.Invalid;
-        },
-        else => return error.Unsupported,
-    }
+const NativeArgs = extern struct {
+    owner: Owner = .{ .kind = .program, .id = 0, .generation = 0 },
+    provider: Handle = .{},
+    handle: Handle = .{},
+    input: ?*const abi.GfxVirtualRequest = null,
+    completion: ?*const abi.GfxVirtualCompletion = null,
+    entry: ?*Entry = null,
+    instant: u64 = 0,
+};
+extern fn r4os_rust_gfx_virtual_state_run(*Store, u32, *const NativeArgs, ?*anyopaque) i32;
+extern fn r4os_rust_gfx_virtual_entry(*Entry, u32, u32, i32, ?*anyopaque) i32;
+extern fn r4os_rust_gfx_virtual_validate(*const abi.GfxVirtualRequest, u64) i32;
+extern fn r4os_rust_gfx_virtual_tree_first(*const Tree) ?*Node;
+extern fn r4os_rust_gfx_virtual_node_next(*Node) ?*Node;
+extern fn r4os_rust_gfx_virtual_zero_token(*const abi.GfxVirtualToken) bool;
+fn nativeResult(value: i32) Error!void {
+    return switch (value) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Overflow,
+        3 => error.Unsupported,
+        4 => error.Exhausted,
+        5 => error.Budget,
+        6 => error.Capacity,
+        7 => error.Stale,
+        8 => error.Busy,
+        9 => error.Closed,
+        10 => error.WrongOwner,
+        else => unreachable,
+    };
 }
-pub const Store = struct {
+pub fn publicHandle(value: Handle) abi.GfxBufferHandle {
+    return .{ .id = value.id, .generation = value.generation };
+}
+pub fn zeroToken(value: abi.GfxVirtualToken) bool {
+    return r4os_rust_gfx_virtual_zero_token(&value);
+}
+pub fn validate(input: abi.GfxVirtualRequest, instant: u64) Error!void {
+    return nativeResult(r4os_rust_gfx_virtual_validate(&input, instant));
+}
+pub const Store = extern struct {
     tree: Tree = .{},
     serial: u64 = 0,
-
+    fn call(self: *Store, op: u32, args: NativeArgs, out: ?*anyopaque) Error!void {
+        return nativeResult(r4os_rust_gfx_virtual_state_run(self, op, &args, out));
+    }
+    fn entry(self: *Store, op: u32, args: NativeArgs) Error!*Entry {
+        var out: *Entry = undefined;
+        try self.call(op, args, @ptrCast(&out));
+        return out;
+    }
     pub fn find(self: *Store, handle: Handle) Error!*Entry {
-        // A tree generation is never reused, including after all nodes free.
-        if (handle.id != 1 or handle.generation == 0) return error.Stale;
-        const node = self.tree.getEntryFor(handle.generation).node orelse return error.Stale;
-        return @fieldParentPtr("index", node);
+        return self.entry(0, .{ .handle = handle });
     }
     pub fn owned(self: *Store, handle: Handle, owner: Owner) Error!*Entry {
-        const entry = try self.find(handle);
-        if (!entry.owner.eql(owner)) return error.WrongOwner;
-        if (!entry.open) return error.Closed;
-        return entry;
+        return self.entry(1, .{ .handle = handle, .owner = owner });
     }
     pub fn parent(self: *Store, owner: Owner, provider: Handle, input: abi.GfxVirtualRequest) Error!?*Entry {
-        if (input.kind == 1) return null;
-        const entry = try self.owned(.{ .id = input.parent.id, .generation = input.parent.generation }, owner);
-        if (entry.request.kind != 1 or !entry.provider.eql(provider) or entry.request.adapter_id != input.adapter_id or
-            entry.request.memory_generation != input.memory_generation) return error.Stale;
-        if (entry.closing or entry.result < 0) return error.Closed;
-        if (entry.result != 1 or !entry.backend() or entry.claim != null) return error.Busy;
-        if (input.byte_length > entry.request.byte_length or input.virtual_offset > entry.request.byte_length - input.byte_length) return error.Invalid;
-        var child = entry.first_child;
-        while (child) |value| : (child = value.next_child) {
-            if (!value.retired and input.virtual_offset < value.request.virtual_offset + value.request.byte_length and
-                value.request.virtual_offset < input.virtual_offset + input.byte_length) return error.Busy;
-        }
-        return entry;
+        var out: ?*Entry = undefined;
+        try self.call(2, .{ .owner = owner, .provider = provider, .input = &input }, @ptrCast(&out));
+        return out;
     }
-    pub fn start(self: *Store, entry: *Entry, owner: Owner, provider: Handle, input: abi.GfxVirtualRequest, instant: u64) Error!void {
-        try validate(input, instant);
-        if (entry.handle.id != 0 or !owner.valid() or provider.id == 0 or provider.generation == 0) return error.Invalid;
-        const enclosing = try self.parent(owner, provider, input);
-        if (self.serial == std.math.maxInt(u64)) return error.Exhausted;
-        if (enclosing) |value| if (value.live_children == std.math.maxInt(usize)) return error.Exhausted;
-        self.serial += 1;
-        entry.* = .{ .handle = .{ .id = 1, .generation = self.serial }, .owner = owner, .provider = provider, .request = input, .parent = enclosing };
-        entry.request.size = @sizeOf(abi.GfxVirtualRequest);
-        var place = self.tree.getEntryFor(self.serial);
-        place.set(&entry.index);
-        if (enclosing) |value| {
-            entry.next_child = value.first_child;
-            if (value.first_child) |first| first.previous_child = entry;
-            value.first_child = entry;
-            value.live_children += 1;
-        }
+    pub fn start(self: *Store, value: *Entry, owner: Owner, provider: Handle, input: abi.GfxVirtualRequest, instant: u64) Error!void {
+        return self.call(3, .{ .entry = value, .owner = owner, .provider = provider, .input = &input, .instant = instant }, null);
     }
     pub fn expire(self: *Store, instant: u64) void {
-        var iter = self.tree.inorderIterator();
-        while (iter.next()) |node| {
-            const entry: *Entry = @fieldParentPtr("index", node);
-            if (entry.result == 0 and instant >= entry.request.deadline_ns) entry.close(false, abi.gfx_queue_error_wait_timeout);
-        }
+        self.call(4, .{ .instant = instant }, null) catch unreachable;
     }
     pub fn take(self: *Store, provider: Handle, instant: u64) ?*Entry {
-        self.expire(instant);
-        var iter = self.tree.inorderIterator();
-        while (iter.next()) |node| {
-            const entry: *Entry = @fieldParentPtr("index", node);
-            if (!entry.provider.eql(provider)) continue;
-            if (entry.pending()) |operation| { entry.claim = operation; return entry; }
-        }
-        return null;
+        var out: ?*Entry = undefined;
+        self.call(5, .{ .provider = provider, .instant = instant }, @ptrCast(&out)) catch unreachable;
+        return out;
     }
     pub fn complete(self: *Store, provider: Handle, completion: abi.GfxVirtualCompletion) Error!void {
-        if (completion.version != 1 or completion.size < @sizeOf(abi.GfxVirtualCompletion) or !validHandle(completion.resource) or
-            completion.operation > 1 or completion.result == 0 or completion.result > 1) return error.Invalid;
-        const entry = try self.find(.{ .id = completion.resource.id, .generation = completion.resource.generation });
-        if (!entry.provider.eql(provider)) return error.WrongOwner;
-        const operation = entry.claim orelse return error.Closed;
-        if (@intFromEnum(operation) != completion.operation) return error.Stale;
-        switch (operation) {
-            .create => {
-                if (completion.result == 1) {
-                    if (zeroToken(completion.token) or completion.address == 0 or completion.address & 4095 != 0 or
-                        completion.address > std.math.maxInt(u64) - entry.request.byte_length) return error.Invalid;
-                    if (entry.parent) |enclosing| {
-                        if (completion.address != enclosing.address + entry.request.virtual_offset) return error.Invalid;
-                    } else if (completion.address % entry.request.alignment != 0 or
-                        (entry.request.fixed_address != 0 and completion.address != entry.request.fixed_address)) return error.Invalid;
-                    entry.token = completion.token;
-                    entry.address = completion.address;
-                } else {
-                    if (!zeroToken(completion.token) or completion.address != 0) return error.Invalid;
-                    entry.closing = true;
-                }
-                entry.finishResult(completion.result);
-            },
-            .retire => {
-                if (completion.result != 1 or completion.address != 0 or !std.meta.eql(completion.token, entry.token)) return error.Invalid;
-                entry.token = .{};
-            },
-        }
-        entry.claim = null;
-        entry.settleRetirement();
+        return self.call(6, .{ .provider = provider, .completion = &completion }, null);
     }
     pub fn closeProvider(self: *Store, provider: Handle) void {
-        var iter = self.tree.inorderIterator();
-        while (iter.next()) |node| {
-            const entry: *Entry = @fieldParentPtr("index", node);
-            if (entry.provider.eql(provider)) entry.close(false, abi.gfx_queue_error_device_lost);
-        }
+        self.call(7, .{ .provider = provider }, null) catch unreachable;
     }
     pub fn stopped(self: *Store, owner: Owner) void {
-        var iter = self.tree.inorderIterator();
-        while (iter.next()) |node| {
-            const entry: *Entry = @fieldParentPtr("index", node);
-            if (entry.owner.eql(owner)) entry.close(true, abi.gfx_queue_error_wait_cancelled);
-        }
+        self.call(8, .{ .owner = owner }, null) catch unreachable;
     }
-    pub fn removable(entry: *const Entry) bool {
-        return !entry.open and entry.retired and entry.first_child == null and entry.notifications == 0;
+    pub fn removable(value: *const Entry) bool {
+        var out: bool = undefined;
+        value.call(7, 0, 0, &out) catch unreachable;
+        return out;
     }
-    pub fn remove(self: *Store, entry: *Entry) void {
-        std.debug.assert(removable(entry));
-        if (entry.parent) |enclosing| {
-            if (entry.previous_child) |previous| previous.next_child = entry.next_child else enclosing.first_child = entry.next_child;
-            if (entry.next_child) |next| next.previous_child = entry.previous_child;
-        }
-        var place = self.tree.getEntryForExisting(&entry.index);
-        place.set(null);
-        entry.* = .{};
+    pub fn remove(self: *Store, value: *Entry) void {
+        self.call(9, .{ .entry = value }, null) catch unreachable;
     }
 };
+
+comptime {
+    if (@sizeOf(Node) != 40 or @alignOf(Node) != 8) @compileError("native VA Node");
+    if (@offsetOf(Node, "key") != 0) @compileError("native VA Node.key");
+    if (@offsetOf(Node, "priority") != 8) @compileError("native VA Node.priority");
+    if (@offsetOf(Node, "parent") != 16) @compileError("native VA Node.parent");
+    if (@offsetOf(Node, "children") != 24) @compileError("native VA Node.children");
+    if (@sizeOf(Tree) != 16 or @alignOf(Tree) != 8) @compileError("native VA Tree");
+    if (@offsetOf(Tree, "root") != 0) @compileError("native VA Tree.root");
+    if (@offsetOf(Tree, "xorshift") != 8) @compileError("native VA Tree.xorshift");
+    if (@sizeOf(Entry) != 312 or @alignOf(Entry) != 8) @compileError("native VA Entry");
+    if (@offsetOf(Entry, "index") != 0) @compileError("native VA Entry.index");
+    if (@offsetOf(Entry, "handle") != 40) @compileError("native VA Entry.handle");
+    if (@offsetOf(Entry, "owner") != 56) @compileError("native VA Entry.owner");
+    if (@offsetOf(Entry, "provider") != 80) @compileError("native VA Entry.provider");
+    if (@offsetOf(Entry, "request") != 96) @compileError("native VA Entry.request");
+    if (@offsetOf(Entry, "parent") != 216) @compileError("native VA Entry.parent");
+    if (@offsetOf(Entry, "first_child") != 224) @compileError("native VA Entry.first_child");
+    if (@offsetOf(Entry, "next_child") != 232) @compileError("native VA Entry.next_child");
+    if (@offsetOf(Entry, "previous_child") != 240) @compileError("native VA Entry.previous_child");
+    if (@offsetOf(Entry, "live_children") != 248) @compileError("native VA Entry.live_children");
+    if (@offsetOf(Entry, "executions") != 256) @compileError("native VA Entry.executions");
+    if (@offsetOf(Entry, "open") != 264) @compileError("native VA Entry.open");
+    if (@offsetOf(Entry, "closing") != 265) @compileError("native VA Entry.closing");
+    if (@offsetOf(Entry, "retired") != 266) @compileError("native VA Entry.retired");
+    if (@offsetOf(Entry, "has_claim") != 267) @compileError("native VA Entry.has_claim");
+    if (@offsetOf(Entry, "claim") != 268) @compileError("native VA Entry.claim");
+    if (@offsetOf(Entry, "token") != 272) @compileError("native VA Entry.token");
+    if (@offsetOf(Entry, "address") != 296) @compileError("native VA Entry.address");
+    if (@offsetOf(Entry, "result") != 304) @compileError("native VA Entry.result");
+    if (@offsetOf(Entry, "notifications") != 308) @compileError("native VA Entry.notifications");
+    if (@sizeOf(Store) != 24 or @alignOf(Store) != 8) @compileError("native VA Store");
+    if (@offsetOf(Store, "tree") != 0) @compileError("native VA Store.tree");
+    if (@offsetOf(Store, "serial") != 16) @compileError("native VA Store.serial");
+    if (@sizeOf(NativeArgs) != 88 or @alignOf(NativeArgs) != 8) @compileError("native VA Args");
+    if (@offsetOf(NativeArgs, "owner") != 0) @compileError("native VA Args.owner");
+    if (@offsetOf(NativeArgs, "provider") != 24) @compileError("native VA Args.provider");
+    if (@offsetOf(NativeArgs, "handle") != 40) @compileError("native VA Args.handle");
+    if (@offsetOf(NativeArgs, "input") != 56) @compileError("native VA Args.input");
+    if (@offsetOf(NativeArgs, "completion") != 64) @compileError("native VA Args.completion");
+    if (@offsetOf(NativeArgs, "entry") != 72) @compileError("native VA Args.entry");
+    if (@offsetOf(NativeArgs, "instant") != 80) @compileError("native VA Args.instant");
+}
 
 // Called by the existing native-allocation owner test, not a new test gate.
 pub fn checkLifetime() !void {
@@ -245,9 +238,7 @@ pub fn checkLifetime() !void {
     var range: Entry = .{};
     var binding: Entry = .{};
     var extra: Entry = .{};
-    const input: abi.GfxVirtualRequest = .{ .kind = 1, .adapter_id = 3, .memory_generation = 9,
-        .byte_length = 16384, .alignment = 4096, .deadline_ns = 100,
-        .flags = abi.gfx_virtual_flag_blocklinear | (255 << abi.gfx_virtual_layout_shift) };
+    const input: abi.GfxVirtualRequest = .{ .kind = 1, .adapter_id = 3, .memory_generation = 9, .byte_length = 16384, .alignment = 4096, .deadline_ns = 100, .flags = abi.gfx_virtual_flag_blocklinear | (255 << abi.gfx_virtual_layout_shift) };
     // The broker preserves a driver-specific byte, including IDs unknown to
     // NVIDIA, without interpreting it. Reserved bits and a pitch-only layout
     // ID are invalid before any provider work or resource retention.
@@ -264,8 +255,7 @@ pub fn checkLifetime() !void {
     const token: abi.GfxVirtualToken = .{ .opaque0 = 9, .opaque1 = 8 };
     var completion: abi.GfxVirtualCompletion = .{ .resource = publicHandle(old), .result = 1, .token = token, .address = 0x90000000 };
     try store.complete(provider, completion);
-    var request: abi.GfxVirtualRequest = .{ .kind = 2, .adapter_id = 3, .memory_generation = 9, .parent = publicHandle(old),
-        .reference = .{ .id = 2, .generation = 6 }, .byte_offset = 4096, .virtual_offset = 8192, .byte_length = 4096, .deadline_ns = 100 };
+    var request: abi.GfxVirtualRequest = .{ .kind = 2, .adapter_id = 3, .memory_generation = 9, .parent = publicHandle(old), .reference = .{ .id = 2, .generation = 6 }, .byte_offset = 4096, .virtual_offset = 8192, .byte_length = 4096, .deadline_ns = 100 };
     try store.start(&binding, app, provider, request, 3);
     try t.expectError(error.Busy, store.start(&extra, app, provider, request, 3));
     try t.expect(store.take(provider, 4).? == &binding);
@@ -281,7 +271,7 @@ pub fn checkLifetime() !void {
     completion.address = 0;
     completion.token.opaque2 += 1;
     try t.expectError(error.Invalid, store.complete(provider, completion));
-    try t.expect(binding.claim.? == .retire and !binding.retired);
+    try t.expect(binding.claimValue().? == .retire and !binding.retired);
     completion.token.opaque2 -= 1;
     try store.complete(provider, completion);
     try t.expect(binding.retired and range.live_children == 0);
@@ -304,13 +294,18 @@ pub fn checkLifetime() !void {
     completion = .{ .resource = publicHandle(range.handle), .result = 1, .token = token, .address = 0x90000000 };
     try store.complete(provider, completion);
     try t.expect(range.result == abi.gfx_queue_error_wait_timeout and store.take(provider, 101).? == &range);
-    completion.operation = 1; completion.address = 0;
+    completion.operation = 1;
+    completion.address = 0;
     try store.complete(provider, completion);
-    range.close(true, abi.gfx_queue_error_wait_cancelled); range.notifications = 0; store.remove(&range);
+    range.close(true, abi.gfx_queue_error_wait_cancelled);
+    range.notifications = 0;
+    store.remove(&range);
     try store.start(&range, other, provider, input, 11);
     store.closeProvider(provider);
     try t.expect(range.retired and range.result == abi.gfx_queue_error_device_lost and store.take(provider, 12) == null);
-    range.close(true, abi.gfx_queue_error_wait_cancelled); range.notifications = 0; store.remove(&range);
+    range.close(true, abi.gfx_queue_error_wait_cancelled);
+    range.notifications = 0;
+    store.remove(&range);
     request.byte_offset = std.math.maxInt(u64) - 4095;
     try t.expectError(error.Invalid, validate(request, 1));
     try t.expect(store.tree.getMin() == null);

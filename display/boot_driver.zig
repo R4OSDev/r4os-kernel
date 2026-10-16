@@ -100,36 +100,6 @@ export fn r4os_zig_boot_driver_snapshot(raw: *const anyopaque, out: *Snapshot) c
 export fn r4os_zig_boot_driver_description(raw: *const anyopaque, generation: u64, out: *abi.GfxNativeBootInfo) callconv(.c) void {
     out.* = native.bootDescription(generation, snapshot(raw));
 }
-export fn r4os_zig_boot_buffer_lock(prepared: bool) callconv(.c) bool {
-    if (prepared) buffers.lockPrepared(.{ .references = 1, .leases = 1 }) catch return false else buffers.lock();
-    return true;
-}
-export fn r4os_zig_boot_buffer_unlock() callconv(.c) void {
-    buffers.unlock();
-}
-export fn r4os_zig_boot_buffer_describe(value: *const Handle, id: *const Identity, out: *Description) callconv(.c) bool {
-    const d = buffers.store.describe(handle(value), actual(id)) catch return false;
-    out.* = .{ .bytes = d.bytes, .usage = d.usage, .is_bytes = d.format == .bytes, .is_system = d.location == .system, .portable = d.binding.portable() };
-    return true;
-}
-export fn r4os_zig_boot_buffer_share(value: *const Handle, id: *const Identity, out: *Handle) callconv(.c) bool {
-    _ = id;
-    out.* = wire(buffers.store.share(handle(value), owner) catch return false);
-    return true;
-}
-export fn r4os_zig_boot_buffer_map(value: *const Handle, write: bool, bytes: u64, out: *Mapping) callconv(.c) bool {
-    const mapped = buffers.mapLocked(handle(value), owner, if (write) .cpu_write else .cpu_read, 0, bytes) catch return false;
-    out.* = .{ .lease = wire(mapped.lease), .address = mapped.backing.cpu_address };
-    return true;
-}
-export fn r4os_zig_boot_buffer_unmap(value: *const Handle) callconv(.c) bool {
-    buffers.unmapCpuLocked(handle(value), owner) catch return false;
-    return true;
-}
-export fn r4os_zig_boot_buffer_drop(value: *const Handle) callconv(.c) bool {
-    buffers.drop(handle(value), owner) catch return false;
-    return true;
-}
 
 comptime {
     if (@sizeOf(Identity) != 24 or @alignOf(Identity) != 8) @compileError("Native boot-driver Identity C layout");

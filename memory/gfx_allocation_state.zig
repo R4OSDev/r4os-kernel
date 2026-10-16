@@ -1,13 +1,16 @@
-// Bounded cross-owner allocation metadata. No GPU placement, callback or wait.
+// Fixed C projection of the original native allocation owner.
 const std = @import("std");
 const abi = @import("r4os_kernel_contract");
 const bo = @import("gfx_buffer_owner.zig");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 pub const Owner = bo.Owner;
 pub const Handle = bo.Handle;
 pub const Error = bo.Error;
 pub const result_owner = Owner{ .kind = .kernel, .id = 4, .generation = 1 };
 pub const Phase = enum(u32) { queued, claimed, terminal };
-pub const Entry = struct {
+pub const Entry = extern struct {
     handle: Handle = .{},
     owner: Owner = .{ .kind = .program, .id = 0, .generation = 0 },
     provider: Handle = .{},
@@ -21,125 +24,132 @@ pub const Entry = struct {
     waiters: u32 = 0,
     notification_pending: bool = false,
     publishing: bool = false,
-
     pub fn status(self: *const Entry) abi.GfxNativeStatus {
-        return .{ .request = .{ .id = self.handle.id, .generation = self.handle.generation }, .phase = @intFromEnum(self.phase), .result = self.result, .flags = @intFromBool(self.claimed), .deadline_ns = self.allocation.deadline_ns, .completed_ns = self.completed_ns };
+        var out: abi.GfxNativeStatus = undefined;
+        r4os_rust_gfx_allocation_entry(@constCast(self), 0, 0, 0, &out);
+        return out;
     }
     pub fn terminal(self: *Entry, result: i32, instant: u64) void {
-        if (self.phase == .terminal) return;
-        self.phase = .terminal;
-        self.result = result;
-        self.completed_ns = instant;
-        self.notification_pending = true;
+        r4os_rust_gfx_allocation_entry(self, 1, result, instant, null);
     }
 };
+const NativeView = extern struct { entries: [*]Entry, capacity: usize, serial: *u64 };
+const NativeArgs = extern struct {
+    owner: Owner = .{ .kind = .program, .id = 0, .generation = 0 },
+    provider: Handle = .{},
+    handle: Handle = .{},
+    input: ?*const abi.GfxNativeAllocation = null,
+    instant: u64 = 0,
+    result: i32 = 0,
+};
+extern fn r4os_rust_gfx_allocation_state_run(*const NativeView, u32, *const NativeArgs, ?*anyopaque) i32;
+extern fn r4os_rust_gfx_allocation_entry(*Entry, u32, i32, u64, ?*abi.GfxNativeStatus) void;
+extern fn r4os_rust_gfx_allocation_validate(*const abi.GfxNativeAllocation, u64) i32;
+extern fn r4os_rust_gfx_allocation_matches(*const abi.GfxNativeAllocation, *const bo.layout.Descriptor, *const Owner) bool;
+fn nativeResult(value: i32) Error!void {
+    return switch (value) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Overflow,
+        3 => error.Unsupported,
+        4 => error.Exhausted,
+        5 => error.Budget,
+        6 => error.Capacity,
+        7 => error.Stale,
+        8 => error.Busy,
+        9 => error.Closed,
+        10 => error.WrongOwner,
+        else => unreachable,
+    };
+}
 pub fn validate(input: abi.GfxNativeAllocation, instant: u64) Error!void {
-    if (input.version != 1 or input.size < @sizeOf(abi.GfxNativeAllocation) or input.adapter_id == 0 or
-        input.memory_generation == 0 or input.reserved0 != 0 or instant == 0 or
-        input.deadline_ns <= instant or input.deadline_ns == std.math.maxInt(u64) or
-        input.usage == 0 or input.usage & ~@as(u32, 60) != 0) return error.Invalid;
-    if (input.kind > 1 or input.layout > 1) return error.Unsupported;
-    if (input.kind == 0) {
-        if (input.byte_length == 0 or input.width != 0 or input.height != 0 or input.format != 0 or input.layout != 0) return error.Invalid;
-    } else {
-        if (input.byte_length != 0 or input.width == 0 or input.height == 0 or input.format == 0) return error.Invalid;
-        _ = std.enums.fromInt(bo.layout.Format, input.format) orelse return error.Unsupported;
-    }
+    return nativeResult(r4os_rust_gfx_allocation_validate(&input, instant));
 }
 pub fn matches(input: abi.GfxNativeAllocation, descriptor: bo.layout.Descriptor, driver: Owner) bool {
-    return descriptor.location == .device_local and descriptor.binding.adapter == input.adapter_id and
-        descriptor.binding.device_generation == input.memory_generation and descriptor.binding.driver_owner == driver.id and
-        descriptor.usage & input.usage == input.usage and descriptor.usage & 3 == 0 and
-        (if (input.layout == 0) descriptor.modifier == 0 else descriptor.modifier != 0) and
-        (if (input.kind == 0) descriptor.format == .bytes and descriptor.bytes >= input.byte_length else descriptor.width == input.width and descriptor.height == input.height and @intFromEnum(descriptor.format) == input.format);
+    return r4os_rust_gfx_allocation_matches(&input, &descriptor, &driver);
 }
 pub fn Store(comptime capacity: usize) type {
     return struct {
         const Self = @This();
-        entries: [capacity]Entry = .{Entry{}} ** capacity,
+        entries: [capacity]Entry = @splat(Entry{}),
         serial: u64 = 0,
-
+        fn call(self: anytype, comptime op: u32, args: NativeArgs, out: ?*anyopaque) Error!void {
+            const view = NativeView{ .entries = @constCast(&self.entries), .capacity = capacity, .serial = @constCast(&self.serial) };
+            return nativeResult(r4os_rust_gfx_allocation_state_run(&view, op, &args, out));
+        }
+        fn entry(self: *Self, comptime op: u32, args: NativeArgs) Error!*Entry {
+            var out: *Entry = undefined;
+            try self.call(op, args, @ptrCast(&out));
+            return out;
+        }
         pub fn find(self: *Self, handle: Handle) Error!*Entry {
-            if (handle.id == 0 or handle.id > capacity or handle.generation == 0) return error.Stale;
-            const entry = &self.entries[handle.id - 1];
-            if (!entry.handle.eql(handle)) return error.Stale;
-            return entry;
+            return self.entry(0, .{ .handle = handle });
         }
         pub fn owned(self: *Self, handle: Handle, owner: Owner) Error!*Entry {
-            const entry = try self.find(handle);
-            if (!entry.owner.eql(owner)) return error.WrongOwner;
-            if (!entry.open) return error.Closed;
-            return entry;
+            return self.entry(1, .{ .handle = handle, .owner = owner });
         }
         pub fn start(self: *Self, owner: Owner, provider: Handle, input: abi.GfxNativeAllocation, instant: u64) Error!*Entry {
-            try validate(input, instant);
-            if (!owner.valid() or provider.id == 0 or provider.generation == 0) return error.Invalid;
-            if (self.serial == std.math.maxInt(u64)) return error.Exhausted;
-            var count: usize = 0;
-            for (&self.entries) |entry| if (entry.handle.id != 0 and entry.owner.eql(owner)) {
-                count += 1;
-            };
-            if (count >= 16) return error.Budget;
-            for (&self.entries, 0..) |*entry, i| if (entry.handle.id == 0) {
-                self.serial += 1;
-                entry.* = .{ .handle = .{ .id = @intCast(i + 1), .generation = self.serial }, .owner = owner, .provider = provider, .allocation = input, .open = true };
-                entry.allocation.size = @sizeOf(abi.GfxNativeAllocation);
-                return entry;
-            };
-            return error.Capacity;
+            return self.entry(2, .{ .owner = owner, .provider = provider, .input = &input, .instant = instant });
         }
         pub fn take(self: *Self, provider: Handle, instant: u64) ?*Entry {
-            self.expire(instant);
-            var selected: ?*Entry = null;
-            for (&self.entries) |*entry| if (entry.handle.id != 0 and entry.phase == .queued and entry.provider.eql(provider)) {
-                if (selected == null or entry.handle.generation < selected.?.handle.generation) selected = entry;
-            };
-            if (selected) |entry| {
-                entry.phase = .claimed;
-                entry.claimed = true;
-            }
-            return selected;
+            var out: ?*Entry = undefined;
+            self.call(3, .{ .provider = provider, .instant = instant }, @ptrCast(&out)) catch unreachable;
+            return out;
         }
         pub fn claim(self: *Self, handle: Handle, provider: Handle) Error!*Entry {
-            const entry = try self.find(handle);
-            if (!entry.provider.eql(provider)) return error.WrongOwner;
-            if (!entry.claimed) return error.Closed;
-            return entry;
+            return self.entry(4, .{ .handle = handle, .provider = provider });
         }
         pub fn finish(self: *Self, handle: Handle, provider: Handle, result: i32, instant: u64) Error!void {
-            if (result == 0 or result > 1) return error.Invalid;
-            const entry = try self.claim(handle, provider);
-            entry.claimed = false;
-            entry.terminal(result, instant);
+            return self.call(5, .{ .handle = handle, .provider = provider, .result = result, .instant = instant }, null);
         }
         pub fn close(self: *Self, handle: Handle, owner: Owner, instant: u64) Error!Handle {
-            const entry = try self.owned(handle, owner);
-            entry.open = false;
-            entry.terminal(abi.gfx_queue_error_wait_cancelled, instant);
-            const reference = entry.reference;
-            entry.reference = .{};
-            return reference;
+            var out: Handle = undefined;
+            try self.call(6, .{ .handle = handle, .owner = owner, .instant = instant }, &out);
+            return out;
         }
         pub fn expire(self: *Self, instant: u64) void {
-            for (&self.entries) |*entry| if (entry.handle.id != 0 and entry.phase != .terminal and instant >= entry.allocation.deadline_ns)
-                entry.terminal(abi.gfx_queue_error_wait_timeout, instant);
+            self.call(7, .{ .instant = instant }, null) catch unreachable;
         }
         pub fn closeProvider(self: *Self, provider: Handle, instant: u64) void {
-            for (&self.entries) |*entry| if (entry.handle.id != 0 and entry.provider.eql(provider))
-                entry.terminal(abi.gfx_queue_error_device_lost, instant);
+            self.call(8, .{ .provider = provider, .instant = instant }, null) catch unreachable;
         }
         pub fn retainsProvider(self: *const Self, provider: Handle) bool {
-            for (&self.entries) |entry| if (entry.handle.id != 0 and entry.provider.eql(provider) and entry.claimed) return true;
-            return false;
+            var out: bool = undefined;
+            self.call(9, .{ .provider = provider }, &out) catch unreachable;
+            return out;
         }
         pub fn reap(self: *Self) void {
-            for (&self.entries) |*entry| if (entry.handle.id != 0 and !entry.open and !entry.claimed and
-                entry.reference.id == 0 and entry.waiters == 0 and !entry.notification_pending and !entry.publishing)
-            {
-                entry.* = .{};
-            };
+            self.call(10, .{}, null) catch unreachable;
         }
     };
+}
+
+comptime {
+    if (@sizeOf(Entry) != 168 or @alignOf(Entry) != 8) @compileError("native allocation Entry");
+    if (@offsetOf(Entry, "handle") != 0) @compileError("native allocation Entry.handle");
+    if (@offsetOf(Entry, "owner") != 16) @compileError("native allocation Entry.owner");
+    if (@offsetOf(Entry, "provider") != 40) @compileError("native allocation Entry.provider");
+    if (@offsetOf(Entry, "allocation") != 56) @compileError("native allocation Entry.allocation");
+    if (@offsetOf(Entry, "phase") != 120) @compileError("native allocation Entry.phase");
+    if (@offsetOf(Entry, "result") != 124) @compileError("native allocation Entry.result");
+    if (@offsetOf(Entry, "completed_ns") != 128) @compileError("native allocation Entry.completed_ns");
+    if (@offsetOf(Entry, "open") != 136) @compileError("native allocation Entry.open");
+    if (@offsetOf(Entry, "claimed") != 137) @compileError("native allocation Entry.claimed");
+    if (@offsetOf(Entry, "reference") != 144) @compileError("native allocation Entry.reference");
+    if (@offsetOf(Entry, "waiters") != 160) @compileError("native allocation Entry.waiters");
+    if (@offsetOf(Entry, "notification_pending") != 164) @compileError("native allocation Entry.notification_pending");
+    if (@offsetOf(Entry, "publishing") != 165) @compileError("native allocation Entry.publishing");
+    if (@sizeOf(NativeView) != 24 or @alignOf(NativeView) != 8) @compileError("native allocation View");
+    if (@offsetOf(NativeView, "entries") != 0) @compileError("native allocation View.entries");
+    if (@offsetOf(NativeView, "capacity") != 8) @compileError("native allocation View.capacity");
+    if (@offsetOf(NativeView, "serial") != 16) @compileError("native allocation View.serial");
+    if (@sizeOf(NativeArgs) != 80 or @alignOf(NativeArgs) != 8) @compileError("native allocation Args");
+    if (@offsetOf(NativeArgs, "owner") != 0) @compileError("native allocation Args.owner");
+    if (@offsetOf(NativeArgs, "provider") != 24) @compileError("native allocation Args.provider");
+    if (@offsetOf(NativeArgs, "handle") != 40) @compileError("native allocation Args.handle");
+    if (@offsetOf(NativeArgs, "input") != 56) @compileError("native allocation Args.input");
+    if (@offsetOf(NativeArgs, "instant") != 64) @compileError("native allocation Args.instant");
+    if (@offsetOf(NativeArgs, "result") != 72) @compileError("native allocation Args.result");
 }
 
 test "native allocation close, expiry, ownership and publication retain exact claims" {

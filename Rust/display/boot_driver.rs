@@ -147,40 +147,27 @@ unsafe extern "C" {
         generation: u64,
         out: *mut a::GfxNativeBootInfo,
     );
-    fn r4os_zig_boot_buffer_lock(prepared: bool) -> bool;
-    fn r4os_zig_boot_buffer_unlock();
-    fn r4os_zig_boot_buffer_describe(
-        handle: *const Handle,
-        identity: *const Owner,
-        out: *mut Description,
-    ) -> bool;
-    fn r4os_zig_boot_buffer_share(
-        handle: *const Handle,
-        identity: *const Owner,
-        out: *mut Handle,
-    ) -> bool;
-    fn r4os_zig_boot_buffer_map(
-        handle: *const Handle,
-        write: bool,
-        bytes: u64,
-        out: *mut Mapping,
-    ) -> bool;
-    fn r4os_zig_boot_buffer_unmap(handle: *const Handle) -> bool;
-    fn r4os_zig_boot_buffer_drop(handle: *const Handle) -> bool;
+
 }
 struct BufferLock;
 impl BufferLock {
     fn acquire(prepared: bool) -> Option<Self> {
-        if unsafe { r4os_zig_boot_buffer_lock(prepared) } {
-            Some(Self)
+        if prepared {
+            crate::gfx::buffers::lock_prepared(crate::gfx::buffers::Need {
+                references: 1,
+                leases: 1,
+                objects: 0,
+            })
+            .ok()?;
         } else {
-            None
+            crate::gfx::buffers::lock();
         }
+        Some(Self)
     }
 }
 impl Drop for BufferLock {
     fn drop(&mut self) {
-        unsafe { r4os_zig_boot_buffer_unlock() }
+        crate::gfx::buffers::unlock()
     }
 }
 fn current() -> Option<Bridge> {
@@ -476,7 +463,7 @@ pub unsafe extern "C" fn r4os_rust_boot_driver_capture(saved: *const c_void) -> 
         return false;
     };
     let mut descriptor = Description::default();
-    if !unsafe { r4os_zig_boot_buffer_describe(&caller, &current.identity, &mut descriptor) }
+    if !unsafe { buffer_describe(&caller, &current.identity, &mut descriptor) }
         || !descriptor.is_bytes
         || !descriptor.is_system
         || !descriptor.portable
@@ -485,12 +472,12 @@ pub unsafe extern "C" fn r4os_rust_boot_driver_capture(saved: *const c_void) -> 
     {
         return false;
     }
-    if !unsafe { r4os_zig_boot_buffer_share(&caller, &current.identity, &mut current.reference) } {
+    if !unsafe { buffer_share(&caller, &current.identity, &mut current.reference) } {
         return false;
     }
     publish(Some(current));
     let mut mapped = Mapping::default();
-    if !unsafe { r4os_zig_boot_buffer_map(&current.reference, true, bytes, &mut mapped) } {
+    if !unsafe { buffer_map(&current.reference, true, bytes, &mut mapped) } {
         return false;
     }
     current.lease = mapped.lease;
@@ -513,12 +500,12 @@ pub unsafe extern "C" fn r4os_rust_boot_driver_capture(saved: *const c_void) -> 
     let Some(_lock) = BufferLock::acquire(false) else {
         unreachable!("Blocking BO metadata lock")
     };
-    if !unsafe { r4os_zig_boot_buffer_unmap(&current.lease) } {
+    if !unsafe { buffer_unmap(&current.lease) } {
         return false;
     }
     current.lease = Handle::default();
     publish(Some(current));
-    if !unsafe { r4os_zig_boot_buffer_map(&current.reference, false, bytes, &mut mapped) } {
+    if !unsafe { buffer_map(&current.reference, false, bytes, &mut mapped) } {
         return false;
     }
     current.lease = mapped.lease;
@@ -597,7 +584,7 @@ pub unsafe extern "C" fn r4os_rust_boot_driver_release(adopted: bool) -> bool {
         unreachable!("Blocking BO metadata lock")
     };
     if current.lease.id != 0 {
-        if !unsafe { r4os_zig_boot_buffer_unmap(&current.lease) } {
+        if !unsafe { buffer_unmap(&current.lease) } {
             return false;
         }
         current.lease = Handle::default();
@@ -605,7 +592,7 @@ pub unsafe extern "C" fn r4os_rust_boot_driver_release(adopted: bool) -> bool {
     }
     drop(lock);
     if current.reference.id != 0 {
-        if !unsafe { r4os_zig_boot_buffer_drop(&current.reference) } {
+        if !unsafe { buffer_drop(&current.reference) } {
             return false;
         }
         current.reference = Handle::default();
@@ -649,3 +636,92 @@ const _: () = {
     assert!(core::mem::offset_of!(HoldResult, captured) == 8);
     assert!(core::mem::offset_of!(HoldResult, retained) == 9);
 };
+
+const DISPLAY_BUFFER_OWNER: crate::gfx::types::Owner = crate::gfx::types::Owner {
+    kind: 0,
+    id: 3,
+    generation: 1,
+};
+fn buffer_handle(value: Handle) -> crate::gfx::types::Handle {
+    crate::gfx::types::Handle {
+        id: value.id,
+        generation: value.generation,
+    }
+}
+fn wire_handle(value: crate::gfx::types::Handle) -> Handle {
+    Handle {
+        id: value.id,
+        generation: value.generation,
+    }
+}
+unsafe fn buffer_describe(
+    value: *const Handle,
+    identity: *const Owner,
+    out: *mut Description,
+) -> bool {
+    let identity = unsafe { identity.read() };
+    let owner = crate::gfx::types::Owner {
+        kind: identity.kind,
+        id: identity.id,
+        generation: identity.generation,
+    };
+    let Ok(d) =
+        (unsafe { crate::gfx::buffers::read().describe(buffer_handle(value.read()), owner) })
+    else {
+        return false;
+    };
+    unsafe {
+        out.write(Description {
+            bytes: d.bytes,
+            usage: d.usage,
+            is_bytes: d.format == crate::gfx::layout::BYTES,
+            is_system: d.location == 0,
+            portable: d.binding.portable(),
+        });
+    }
+    true
+}
+unsafe fn buffer_share(value: *const Handle, _: *const Owner, out: *mut Handle) -> bool {
+    let Ok(h) = (unsafe {
+        crate::gfx::buffers::table().share(buffer_handle(value.read()), DISPLAY_BUFFER_OWNER)
+    }) else {
+        return false;
+    };
+    unsafe {
+        out.write(wire_handle(h));
+    }
+    true
+}
+unsafe fn buffer_map(value: *const Handle, write: bool, bytes: u64, out: *mut Mapping) -> bool {
+    let Ok(value) = (unsafe {
+        crate::gfx::buffers::map_locked(
+            buffer_handle(value.read()),
+            DISPLAY_BUFFER_OWNER,
+            if write { 1 } else { 0 },
+            0,
+            bytes,
+        )
+    }) else {
+        return false;
+    };
+    unsafe {
+        out.write(Mapping {
+            lease: wire_handle(value.lease),
+            address: value.backing.cpu_address,
+        });
+    }
+    true
+}
+unsafe fn buffer_unmap(value: *const Handle) -> bool {
+    unsafe {
+        crate::gfx::buffers::unmap_cpu_locked(buffer_handle(value.read()), DISPLAY_BUFFER_OWNER)
+    }
+    .is_ok()
+}
+unsafe fn buffer_drop(value: *const Handle) -> bool {
+    crate::gfx::buffers::drop_reference(
+        unsafe { buffer_handle(value.read()) },
+        DISPLAY_BUFFER_OWNER,
+    )
+    .is_ok()
+}

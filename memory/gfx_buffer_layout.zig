@@ -1,3 +1,6 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 // Hardware-independent buffer layout validation. Addresses are deliberately
 // absent: CPU mappings, DMA page lists and GPU virtual mappings have distinct
 // leases and are never inferred from each other.
@@ -26,22 +29,21 @@ pub const Usage = struct {
     pub const valid: u32 = 63;
 };
 pub const Location = enum(u32) { system = 0, device_local = 1 };
-pub const Binding = struct {
+pub const Binding = extern struct {
     adapter: u32 = 0,
     driver_owner: u32 = 0,
     device_generation: u64 = 0,
 
     pub fn valid(self: Binding) bool {
-        return (self.adapter == 0 and self.driver_owner == 0 and self.device_generation == 0) or
-            (self.adapter != 0 and self.driver_owner != 0 and self.device_generation != 0);
+        return r4os_rust_gfx_layout_binding(&self, false);
     }
 
     pub fn portable(self: Binding) bool {
-        return self.adapter == 0 and self.driver_owner == 0 and self.device_generation == 0;
+        return r4os_rust_gfx_layout_binding(&self, true);
     }
 };
-pub const Plane = struct { offset: u64 = 0, pitch: u64 = 0 };
-pub const Descriptor = struct {
+pub const Plane = extern struct { offset: u64 = 0, pitch: u64 = 0 };
+pub const Descriptor = extern struct {
     bytes: u64,
     alignment: u64 = 4096,
     modifier: u64 = linear_modifier,
@@ -55,76 +57,30 @@ pub const Descriptor = struct {
     binding: Binding = .{},
 };
 pub const Error = error{ Invalid, Overflow, Unsupported };
-pub const Range = struct { offset: u64, bytes: u64 };
-pub const Layout = struct { allocation_bytes: u64, planes: [max_planes]Range, plane_count: u32 };
+pub const Range = extern struct { offset: u64, bytes: u64 };
+pub const Layout = extern struct { allocation_bytes: u64, planes: [max_planes]Range, plane_count: u32 };
 
+extern fn r4os_rust_gfx_layout_span(u64, u64, u64) bool;
+extern fn r4os_rust_gfx_layout_binding(*const Binding, bool) bool;
+extern fn r4os_rust_gfx_layout_validate(*const Descriptor, bool, *Layout) i32;
 pub fn spanFits(total: u64, offset: u64, bytes: u64) bool {
-    return bytes != 0 and offset < total and bytes <= total - offset;
+    return r4os_rust_gfx_layout_span(total, offset, bytes);
 }
-
 pub fn validate(descriptor: Descriptor) Error!Layout {
-    return validateLayout(descriptor, false);
+    return nativeValidate(descriptor, false);
 }
-
-// Only the authenticated driver-owned allocation path may carry an opaque
-// storage modifier. The driver validates its physical/tiled layout; the
-// common owner validates bounded logical planes and retains their backing.
 pub fn validateDriverOwned(descriptor: Descriptor) Error!Layout {
-    if (descriptor.location != .device_local or descriptor.binding.portable() or
-        descriptor.usage & (Usage.cpu_read | Usage.cpu_write) != 0) return error.Unsupported;
-    return validateLayout(descriptor, true);
+    return nativeValidate(descriptor, true);
 }
-
-fn validateLayout(descriptor: Descriptor, owned: bool) Error!Layout {
-    if (descriptor.bytes == 0 or descriptor.alignment == 0 or !std.math.isPowerOfTwo(descriptor.alignment) or
-        descriptor.alignment > (@as(u64, 1) << 30) or descriptor.usage == 0 or
-        (descriptor.usage & ~Usage.valid) != 0 or !descriptor.binding.valid()) return error.Invalid;
-    const native_layout = descriptor.modifier != linear_modifier;
-    if (native_layout and !owned) return error.Unsupported;
-    if (descriptor.location == .device_local and descriptor.binding.portable()) return error.Invalid;
-    const allocation_alignment = @max(@as(u64, 4096), descriptor.alignment);
-    const padded = std.math.add(u64, descriptor.bytes, allocation_alignment - 1) catch return error.Overflow;
-    var result = Layout{ .allocation_bytes = padded & ~(allocation_alignment - 1), .planes = .{Range{ .offset = 0, .bytes = 0 }} ** max_planes, .plane_count = descriptor.plane_count };
-    if (descriptor.format == .bytes) {
-        if (native_layout or descriptor.width != 0 or descriptor.height != 0 or descriptor.plane_count != 0 or
-            (descriptor.usage & (Usage.render | Usage.scanout)) != 0) return error.Invalid;
-    } else {
-        const multi = descriptor.format == .nv12 or descriptor.format == .p010;
-        const count: u32 = if (multi) 2 else 1;
-        if (descriptor.width == 0 or descriptor.height == 0 or descriptor.plane_count != count) return error.Invalid;
-        for (0..count) |index| {
-            const plane = descriptor.planes[index];
-            const sample_bytes: u64 = switch (descriptor.format) {
-                .xrgb8888, .argb8888, .xrgb2101010, .argb2101010 => 4,
-                .abgr16161616f => 8,
-                .p010 => 2,
-                else => 1,
-            };
-            const columns: u64 = if (multi and index == 1) ((@as(u64, descriptor.width) + 1) / 2) * 2 else descriptor.width;
-            const rows: u64 = if (multi and index == 1) (@as(u64, descriptor.height) + 1) / 2 else descriptor.height;
-            const row_bytes = std.math.mul(u64, columns, sample_bytes) catch return error.Overflow;
-            if (plane.pitch < row_bytes or plane.pitch % sample_bytes != 0 or plane.offset % sample_bytes != 0) return error.Invalid;
-            // Complete padded rows are owned, including the final row's tail.
-            var bytes = std.math.mul(u64, plane.pitch, rows) catch return error.Overflow;
-            if (!spanFits(descriptor.bytes, plane.offset, bytes)) return error.Invalid;
-            if (native_layout) {
-                // Physical padding belongs to this plane until the next
-                // ordered offset, or the end of the declared backing extent.
-                // No vendor-specific row/block formula belongs in this owner.
-                const end = if (index + 1 < count) descriptor.planes[index + 1].offset else descriptor.bytes;
-                if (end > descriptor.bytes or end <= plane.offset or bytes > end - plane.offset) return error.Invalid;
-                bytes = end - plane.offset;
-            }
-            for (result.planes[0..index]) |previous| {
-                if (plane.offset < previous.offset + previous.bytes and previous.offset < plane.offset + bytes) return error.Invalid;
-            }
-            result.planes[index] = .{ .offset = plane.offset, .bytes = bytes };
-        }
-    }
-    for (descriptor.planes[descriptor.plane_count..]) |plane| {
-        if (plane.offset != 0 or plane.pitch != 0) return error.Invalid;
-    }
-    return result;
+fn nativeValidate(descriptor: Descriptor, owned: bool) Error!Layout {
+    var out: Layout = undefined;
+    return switch (r4os_rust_gfx_layout_validate(&descriptor, owned, &out)) {
+        0 => out,
+        1 => error.Invalid,
+        2 => error.Overflow,
+        3 => error.Unsupported,
+        else => unreachable,
+    };
 }
 
 test "buffer layout keeps 64-bit sizes and rejects wrapping pitch, maps and padding" {
@@ -150,9 +106,12 @@ test "buffer layout keeps 64-bit sizes and rejects wrapping pitch, maps and padd
     try t.expectEqual(@as(u64, 96), (try validate(image)).planes[0].bytes);
     image.planes[0].pitch = 20;
     try t.expectError(error.Invalid, validate(image));
-    image.format = .xrgb2101010; image.planes[0].pitch = 12; image.bytes = 48;
+    image.format = .xrgb2101010;
+    image.planes[0].pitch = 12;
+    image.bytes = 48;
     try t.expectEqual(@as(u64, 48), (try validate(image)).planes[0].bytes);
-    image.format = .argb2101010; image.planes[0].offset = 2;
+    image.format = .argb2101010;
+    image.planes[0].offset = 2;
     try t.expectError(error.Invalid, validate(image));
 }
 
@@ -185,4 +144,33 @@ test "multi-plane layout validates chroma extents, overlap, bindings and unsuppo
     try t.expectError(error.Invalid, validateDriverOwned(image));
     image.planes[1].offset = 136;
     try t.expectError(error.Invalid, validateDriverOwned(image));
+}
+
+comptime {
+    if (@sizeOf(Binding) != 16 or @alignOf(Binding) != 8) @compileError("Native GFX Binding C layout");
+    if (@offsetOf(Binding, "adapter") != 0) @compileError("Native GFX Binding.adapter C offset");
+    if (@offsetOf(Binding, "driver_owner") != 4) @compileError("Native GFX Binding.driver_owner C offset");
+    if (@offsetOf(Binding, "device_generation") != 8) @compileError("Native GFX Binding.device_generation C offset");
+    if (@sizeOf(Plane) != 16 or @alignOf(Plane) != 8) @compileError("Native GFX Plane C layout");
+    if (@offsetOf(Plane, "offset") != 0) @compileError("Native GFX Plane.offset C offset");
+    if (@offsetOf(Plane, "pitch") != 8) @compileError("Native GFX Plane.pitch C offset");
+    if (@sizeOf(Descriptor) != 128 or @alignOf(Descriptor) != 8) @compileError("Native GFX Descriptor C layout");
+    if (@offsetOf(Descriptor, "bytes") != 0) @compileError("Native GFX Descriptor.bytes C offset");
+    if (@offsetOf(Descriptor, "alignment") != 8) @compileError("Native GFX Descriptor.alignment C offset");
+    if (@offsetOf(Descriptor, "modifier") != 16) @compileError("Native GFX Descriptor.modifier C offset");
+    if (@offsetOf(Descriptor, "width") != 24) @compileError("Native GFX Descriptor.width C offset");
+    if (@offsetOf(Descriptor, "height") != 28) @compileError("Native GFX Descriptor.height C offset");
+    if (@offsetOf(Descriptor, "format") != 32) @compileError("Native GFX Descriptor.format C offset");
+    if (@offsetOf(Descriptor, "plane_count") != 36) @compileError("Native GFX Descriptor.plane_count C offset");
+    if (@offsetOf(Descriptor, "planes") != 40) @compileError("Native GFX Descriptor.planes C offset");
+    if (@offsetOf(Descriptor, "usage") != 104) @compileError("Native GFX Descriptor.usage C offset");
+    if (@offsetOf(Descriptor, "location") != 108) @compileError("Native GFX Descriptor.location C offset");
+    if (@offsetOf(Descriptor, "binding") != 112) @compileError("Native GFX Descriptor.binding C offset");
+    if (@sizeOf(Range) != 16 or @alignOf(Range) != 8) @compileError("Native GFX Range C layout");
+    if (@offsetOf(Range, "offset") != 0) @compileError("Native GFX Range.offset C offset");
+    if (@offsetOf(Range, "bytes") != 8) @compileError("Native GFX Range.bytes C offset");
+    if (@sizeOf(Layout) != 80 or @alignOf(Layout) != 8) @compileError("Native GFX Layout C layout");
+    if (@offsetOf(Layout, "allocation_bytes") != 0) @compileError("Native GFX Layout.allocation_bytes C offset");
+    if (@offsetOf(Layout, "planes") != 8) @compileError("Native GFX Layout.planes C offset");
+    if (@offsetOf(Layout, "plane_count") != 72) @compileError("Native GFX Layout.plane_count C offset");
 }

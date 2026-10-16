@@ -26,3 +26,5 @@ pub mod input;
 pub mod font;
 
 pub mod display;
+
+pub mod gfx;

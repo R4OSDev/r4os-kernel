@@ -18,7 +18,7 @@ const NativeOwner = extern struct {
     generation: u64,
     kind: u8,
     fn from(value: Owner) NativeOwner {
-        return .{ .id = value.id, .generation = value.generation, .kind = @intFromEnum(value.kind) };
+        return .{ .id = value.id, .generation = value.generation, .kind = @intCast(@intFromEnum(value.kind)) };
     }
 };
 const NativeHandle = extern struct { generation: u64 = 0, id: u32 = 0 };

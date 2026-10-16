@@ -269,6 +269,7 @@ pub mod protocol_registry;
 #[path = "../../../Rust/driver/resource_state.rs"]
 pub mod resource_state;
 pub mod driver {
+    pub use crate::mmio_windows;
     pub use crate::protocol_api;
     pub use crate::dma_segments;
     pub use crate::driver_api_admission as api_admission;
@@ -441,3 +442,6 @@ pub mod font;
 
 #[path="../../../Rust/display/mod.rs"]
 pub mod display;
+
+#[path="../../../Rust/gfx/mod.rs"]
+pub mod gfx;

@@ -3,23 +3,31 @@
 // callbacks and actual release happen outside its no-sleep metadata lock.
 const std = @import("std");
 pub const layout = @import("gfx_buffer_layout.zig");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+extern fn r4os_rust_gfx_owner_valid(*const Owner) bool;
+extern fn r4os_rust_gfx_owner_equal(*const Owner, *const Owner) bool;
+extern fn r4os_rust_gfx_handle_equal(*const Handle, *const Handle) bool;
+extern fn r4os_rust_gfx_access_predicate(u32, u8) bool;
+extern fn r4os_rust_gfx_access_conflicts(u32, u32) bool;
 
-pub const Owner = struct {
-    kind: enum { kernel, program, driver },
+pub const Owner = extern struct {
+    kind: enum(u32) { kernel, program, driver },
     id: u64,
     generation: u64,
     pub fn valid(self: Owner) bool {
-        return self.id != 0 and self.generation != 0;
+        return r4os_rust_gfx_owner_valid(&self);
     }
     pub fn eql(a: Owner, b: Owner) bool {
-        return a.kind == b.kind and a.id == b.id and a.generation == b.generation;
+        return r4os_rust_gfx_owner_equal(&a, &b);
     }
 };
-pub const Handle = struct {
+pub const Handle = extern struct {
     id: u32 = 0,
     generation: u64 = 0,
     pub fn eql(a: Handle, b: Handle) bool {
-        return a.id == b.id and a.generation == b.generation;
+        return r4os_rust_gfx_handle_equal(&a, &b);
     }
 };
 pub const Backing = struct {
@@ -30,22 +38,30 @@ pub const Backing = struct {
     cache: enum { unavailable, write_back, write_combining, uncached } = .unavailable,
     driver: ?Owner = null,
 };
-pub const Access = enum { cpu_read, cpu_write, device_read, device_write, scanout, device_mapping, queue_read, queue_write, cpu_persistent_read, cpu_persistent_write };
+pub const Access = enum(u32) { cpu_read, cpu_write, device_read, device_write, scanout, device_mapping, queue_read, queue_write, cpu_persistent_read, cpu_persistent_write };
 pub const Error = layout.Error || error{ Exhausted, Budget, Capacity, Stale, Busy, Closed, WrongOwner };
-pub const Create = struct { buffer: Handle, reference: Handle, bytes: u64 };
+pub const Create = extern struct { buffer: Handle, reference: Handle, bytes: u64 };
 pub const Use = struct { lease: Handle, buffer: Handle, access: Access, backing: Backing, range: layout.Range };
 pub const Release = struct { buffer: Handle, backing: Backing, attempt: u64 };
-pub const OwnedCreate = struct { create: Create, cookie: u64, driver: Owner, binding: layout.Binding };
+pub const OwnedCreate = extern struct { create: Create, cookie: u64, driver: Owner, binding: layout.Binding };
 pub const OwnedRelease = struct { release: Release, driver: Owner, binding: layout.Binding };
-pub const BudgetSnapshot = struct { limit: u64, charged: u64, closing: bool };
-pub const Stats = struct {
-    objects: usize = 0, references: usize = 0, leases: usize = 0,
-    bytes: u64 = 0, retained_bytes: u64 = 0,
-    system_bytes: u64 = 0, device_bytes: u64 = 0,
-    system_backed_bytes: u64 = 0, device_backed_bytes: u64 = 0,
-    system_pinned_bytes: u64 = 0, device_pinned_bytes: u64 = 0,
-    scanout_pinned_bytes: u64 = 0, device_mapped_bytes: u64 = 0,
-    allocating_bytes: u64 = 0, destroying_bytes: u64 = 0,
+pub const BudgetSnapshot = extern struct { limit: u64, charged: u64, closing: bool };
+pub const Stats = extern struct {
+    objects: usize = 0,
+    references: usize = 0,
+    leases: usize = 0,
+    bytes: u64 = 0,
+    retained_bytes: u64 = 0,
+    system_bytes: u64 = 0,
+    device_bytes: u64 = 0,
+    system_backed_bytes: u64 = 0,
+    device_backed_bytes: u64 = 0,
+    system_pinned_bytes: u64 = 0,
+    device_pinned_bytes: u64 = 0,
+    scanout_pinned_bytes: u64 = 0,
+    device_mapped_bytes: u64 = 0,
+    allocating_bytes: u64 = 0,
+    destroying_bytes: u64 = 0,
 };
 
 test "CPU backing release failure remains visible to the exact driver epoch without public references" {
@@ -86,14 +102,17 @@ fn dynamicStorageLifetime() !void {
     const driver: Owner = .{ .kind = .driver, .id = 8, .generation = 17 };
     var first: Create = undefined;
     var first_mapping: Use = undefined;
-    var descriptor: layout.Descriptor = .{ .bytes = 4096, .usage = 63, .format = .argb8888,
-        .width = 32, .height = 32, .plane_count = 1 };
+    var descriptor: layout.Descriptor = .{ .bytes = 4096, .usage = 63, .format = .argb8888, .width = 32, .height = 32, .plane_count = 1 };
     descriptor.planes[0].pitch = 128;
     // These counts cross the old production pools; none is an implementation
     // limit. Storage replacement must preserve IDs, generations and leases.
     for (0..513) |i| {
         inline for (std.enums.values(Pool)) |kind| {
-            const needed: usize = switch (kind) { .objects => 1, .references => 4, .leases => 6 };
+            const needed: usize = switch (kind) {
+                .objects => 1,
+                .references => 4,
+                .leases => 6,
+            };
             if (store.freeSlots(kind, needed) < needed) {
                 const size = @max(8, @field(store, @tagName(kind)).len * 2);
                 const replacement = try t.allocator.alloc(S.Element(kind), size);
@@ -150,7 +169,8 @@ fn deviceBudgetLifetime() !void {
     // A newly configured provider adopts its already represented boot BOs.
     // Native capacity is independent of RAM and its per-program budget.
     try store.setDeviceBudget(gpu, binding, 12288);
-    var large = descriptor; large.bytes = 8192;
+    var large = descriptor;
+    large.bytes = 8192;
     const second = try store.beginOwned(gpu, large, 22);
     const other_cpu = try store.begin(other, .{ .bytes = 4096 });
     try t.expect(store.totalBudgetBytes() == 20480 and store.stats().bytes == 20480);
@@ -159,13 +179,15 @@ fn deviceBudgetLifetime() !void {
     try t.expectEqualDeep(try store.deviceBudget(gpu, binding), try store.queryDeviceBudget(binding.adapter, binding.device_generation));
     try t.expectError(error.Stale, store.queryDeviceBudget(binding.adapter, binding.device_generation + 1));
     const replacement_driver: Owner = .{ .kind = .driver, .id = 5, .generation = 8 };
-    var replacement_binding = binding; replacement_binding.driver_owner = 5;
+    var replacement_binding = binding;
+    replacement_binding.driver_owner = 5;
     try t.expectError(error.Busy, store.setDeviceBudget(replacement_driver, replacement_binding, 8192));
     try t.expectError(error.Budget, store.begin(app, .{ .bytes = 4096 }));
     try store.setDeviceBudget(gpu, binding, 4096);
     try t.expect((try store.deviceBudget(gpu, binding)).charged == 12288 and store.stats().device_bytes == 12288);
     try t.expectError(error.Budget, store.beginOwned(gpu, descriptor, 23));
-    var wrong = binding; wrong.device_generation += 1;
+    var wrong = binding;
+    wrong.device_generation += 1;
     try t.expectError(error.Busy, store.setDeviceBudget(gpu, wrong, 4096));
     try t.expectError(error.Overflow, store.setDeviceBudget(gpu, binding, std.math.maxInt(u64) & ~@as(u64, 4095)));
     try t.expect((try store.deviceBudget(gpu, binding)).limit == 4096);
@@ -181,7 +203,8 @@ fn deviceBudgetLifetime() !void {
     try store.abortOwned(replacement, gpu, true);
     try t.expectError(error.Stale, store.deviceBudget(gpu, binding));
     try t.expect(store.totalBudgetBytes() == 8192);
-    try store.abort(cpu); try store.abort(other_cpu);
+    try store.abort(cpu);
+    try store.abort(other_cpu);
     try t.expectEqualDeep(Stats{}, store.stats());
 }
 
@@ -191,8 +214,7 @@ fn accountingLifetime() !void {
     const app: Owner = .{ .kind = .program, .id = 3, .generation = 1 };
     const gpu: Owner = .{ .kind = .driver, .id = 4, .generation = 7 };
     const binding: layout.Binding = .{ .adapter = 2, .driver_owner = 4, .device_generation = 9 };
-    var raster: layout.Descriptor = .{ .bytes = 1024, .format = .xrgb8888, .width = 16, .height = 16,
-        .plane_count = 1, .usage = layout.Usage.cpu_read | layout.Usage.scanout };
+    var raster: layout.Descriptor = .{ .bytes = 1024, .format = .xrgb8888, .width = 16, .height = 16, .plane_count = 1, .usage = layout.Usage.cpu_read | layout.Usage.scanout };
     raster.planes[0].pitch = 64;
     const cpu = try store.begin(app, raster);
     const native = try store.beginOwned(gpu, .{ .bytes = 4091, .usage = 12, .location = .device_local, .binding = binding }, 19);
@@ -246,8 +268,13 @@ fn ownedBackingLifetime(native_layout: bool) !void {
     const binding: layout.Binding = .{ .adapter = 2, .driver_owner = 7, .device_generation = 9 };
     var desc: layout.Descriptor = .{ .bytes = 4091, .location = .device_local, .binding = binding, .usage = 12 };
     if (native_layout) {
-        desc.modifier = 0x0300000000606010; desc.width = 5; desc.height = 3; desc.format = .nv12; desc.plane_count = 2;
-        desc.planes[0] = .{ .pitch = 64 }; desc.planes[1] = .{ .offset = 2048, .pitch = 64 };
+        desc.modifier = 0x0300000000606010;
+        desc.width = 5;
+        desc.height = 3;
+        desc.format = .nv12;
+        desc.plane_count = 2;
+        desc.planes[0] = .{ .pitch = 64 };
+        desc.planes[1] = .{ .offset = 2048, .pitch = 64 };
         try t.expectError(error.Unsupported, store.begin(driver, desc));
     }
     const reserved = try store.beginOwned(driver, desc, 0x100000001);
@@ -259,7 +286,8 @@ fn ownedBackingLifetime(native_layout: bool) !void {
     var forged = reserved;
     forged.create.bytes -= 1;
     try t.expectError(error.Stale, store.abortOwned(forged, driver, true));
-    forged = reserved; forged.cookie += 1;
+    forged = reserved;
+    forged.cookie += 1;
     try t.expectError(error.Stale, store.commitOwned(forged, driver));
     try t.expectError(error.Busy, store.abortOwned(reserved, driver, false));
     try store.commitOwned(reserved, driver);
@@ -282,15 +310,18 @@ fn ownedBackingLifetime(native_layout: bool) !void {
     try t.expect(cpu_release.buffer.eql(cpu.buffer));
     try store.finishRelease(cpu_release, true);
     try t.expectEqual(@as(?Release, null), store.pendingSystemRelease());
-    var wrong_binding = binding; wrong_binding.device_generation += 1;
+    var wrong_binding = binding;
+    wrong_binding.device_generation += 1;
     try t.expectEqual(@as(?OwnedRelease, null), try store.takeOwnedRelease(driver, wrong_binding));
     try t.expectEqual(@as(?OwnedRelease, null), try store.takeOwnedRelease(stale, binding));
     const release = (try store.takeOwnedRelease(driver, binding)).?;
     try t.expectEqual(@as(?OwnedRelease, null), try store.takeOwnedRelease(driver, binding));
     try t.expectError(error.Busy, store.finishOwnedRelease(release, driver, false));
-    var bad = release; bad.release.backing.bytes += 4096;
+    var bad = release;
+    bad.release.backing.bytes += 4096;
     try t.expectError(error.Stale, store.finishOwnedRelease(bad, driver, true));
-    bad = release; bad.release.attempt += 1;
+    bad = release;
+    bad.release.attempt += 1;
     try t.expectError(error.Stale, store.finishOwnedRelease(bad, driver, true));
     try t.expectError(error.WrongOwner, store.finishOwnedRelease(release, stale, true));
     try t.expectEqual(@as(u64, 4096), store.stats().bytes);
@@ -326,7 +357,8 @@ fn resetBackingLifetime() !void {
     try t.expectError(error.Closed, store.use(imported, app, .device_write, 0, 4096));
     try t.expectEqual(@as(u64, 4096), (try store.describe(cpu.reference, app)).bytes);
     try t.expect((try store.deviceBudget(driver, binding)).closing);
-    var next = binding; next.device_generation += 1;
+    var next = binding;
+    next.device_generation += 1;
     try t.expectError(error.Busy, store.setDeviceBudget(driver, next, 8192));
     try t.expectError(error.Busy, store.endUse(device.lease, driver, false));
     try t.expect((try store.takeOwnedRelease(driver, binding)) == null);
@@ -357,52 +389,149 @@ fn resetBackingLifetime() !void {
     try t.expectEqualDeep(Stats{}, store.stats());
 }
 
-pub const Pool = enum { objects, references, leases };
-/// Production metadata grows outside the enclosing no-sleep owner. Handles
-/// survive replacement; internal record pointers never escape that owner.
-pub fn DynamicTable() type { return StorageTable(null, null, null); }
-/// Fixed backing remains useful for bounded lifetime/fault models.
+// Private C records carry no Zig optional/auto-layout across the boundary.
+const empty_owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 };
+const NativeBacking = extern struct {
+    cookie: u64 = 0,
+    cpu_address: u64 = 0,
+    bytes: u64 = 0,
+    cache: u32 = 0,
+    has_driver: bool = false,
+    driver: Owner = empty_owner,
+    fn from(source: Backing) NativeBacking {
+        return .{ .cookie = source.cookie, .cpu_address = source.cpu_address, .bytes = source.bytes, .cache = @intFromEnum(source.cache), .has_driver = source.driver != null, .driver = source.driver orelse empty_owner };
+    }
+    fn value(self: NativeBacking) Backing {
+        return .{ .cookie = self.cookie, .cpu_address = self.cpu_address, .bytes = self.bytes, .cache = @enumFromInt(self.cache), .driver = if (self.has_driver) self.driver else null };
+    }
+};
+pub const NativeUse = extern struct {
+    lease: Handle,
+    buffer: Handle,
+    access: Access,
+    backing: NativeBacking,
+    range: layout.Range,
+    pub fn from(source: Use) NativeUse {
+        return .{ .lease = source.lease, .buffer = source.buffer, .access = source.access, .backing = NativeBacking.from(source.backing), .range = source.range };
+    }
+    pub fn value(self: NativeUse) Use {
+        return .{ .lease = self.lease, .buffer = self.buffer, .access = self.access, .backing = self.backing.value(), .range = self.range };
+    }
+};
+const NativeRelease = extern struct {
+    buffer: Handle,
+    backing: NativeBacking,
+    attempt: u64,
+    fn from(ticket: Release) NativeRelease {
+        return .{ .buffer = ticket.buffer, .backing = NativeBacking.from(ticket.backing), .attempt = ticket.attempt };
+    }
+    fn value(self: NativeRelease) Release {
+        return .{ .buffer = self.buffer, .backing = self.backing.value(), .attempt = self.attempt };
+    }
+};
+const NativeOwnedRelease = extern struct {
+    release: NativeRelease,
+    driver: Owner,
+    binding: layout.Binding,
+    fn from(ticket: OwnedRelease) NativeOwnedRelease {
+        return .{ .release = NativeRelease.from(ticket.release), .driver = ticket.driver, .binding = ticket.binding };
+    }
+    fn value(self: NativeOwnedRelease) OwnedRelease {
+        return .{ .release = self.release.value(), .driver = self.driver, .binding = self.binding };
+    }
+};
+const NativeOptionalRelease = extern struct { present: bool, value: NativeRelease };
+const NativeOptionalOwnedRelease = extern struct { present: bool, value: NativeOwnedRelease };
+const Object = extern struct {
+    phase: enum(u32) { empty, allocating, live, releasing, destroying } = .empty,
+    handle: Handle = .{},
+    producer: Owner = empty_owner,
+    producer_open: bool = true,
+    descriptor: layout.Descriptor = .{ .bytes = 0 },
+    allocation_bytes: u64 = 0,
+    has_backing: bool = false,
+    backing: NativeBacking = .{},
+    references: u32 = 0,
+    leases: u32 = 0,
+    scanout_leases: u32 = 0,
+    mapping_leases: u32 = 0,
+    release_attempt: u64 = 0,
+    owned_cookie: u64 = 0,
+    owned_reference: Handle = .{},
+    device_lost: bool = false,
+    device_quiesced: bool = false,
+    pub fn backingValue(self: Object) ?Backing {
+        return if (self.has_backing) self.backing.value() else null;
+    }
+};
+const Reference = extern struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = empty_owner, read_only: bool = false, mapping_only: bool = false };
+const Lease = extern struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = empty_owner, access: Access = .cpu_read, range: layout.Range = .{ .offset = 0, .bytes = 0 } };
+const DeviceBudget = extern struct { present: bool = false, driver: Owner = empty_owner, binding: layout.Binding = .{}, bytes: u64 = 0, closing: bool = false };
+const NativeView = extern struct {
+    objects: [*]Object,
+    objects_len: usize,
+    references: [*]Reference,
+    references_len: usize,
+    leases: [*]Lease,
+    leases_len: usize,
+    serial: *u64,
+    committed_bytes: *u64,
+    budget_bytes: u64,
+    producer_budget_bytes: u64,
+    device_budgets: [*]DeviceBudget,
+    device_budgets_len: usize,
+    dynamic_mask: u32,
+};
+pub const NativeArgs = extern struct {
+    owner: Owner = empty_owner,
+    other: Owner = empty_owner,
+    handle: Handle = .{},
+    binding: layout.Binding = .{},
+    offset: u64 = 0,
+    bytes: u64 = 0,
+    value: u64 = 0,
+    flag: bool = false,
+    access: u32 = 0,
+    pool: u32 = 0,
+    input: ?*const anyopaque = null,
+    other_input: ?*const anyopaque = null,
+    buffer: ?*anyopaque = null,
+    len: usize = 0,
+};
+extern fn r4os_rust_gfx_bo_run(*const NativeView, u32, *const NativeArgs, ?*anyopaque) i32;
+fn nativeResult(result: i32) Error!void {
+    return switch (result) {
+        0 => {},
+        1 => error.Invalid,
+        2 => error.Overflow,
+        3 => error.Unsupported,
+        4 => error.Exhausted,
+        5 => error.Budget,
+        6 => error.Capacity,
+        7 => error.Stale,
+        8 => error.Busy,
+        9 => error.Closed,
+        10 => error.WrongOwner,
+        else => unreachable,
+    };
+}
+pub const Pool = enum(u32) { objects, references, leases };
+pub fn DynamicTable() type {
+    return StorageTable(null, null, null);
+}
 pub fn Table(comptime objects: usize, comptime references: usize, comptime leases: usize) type {
     return StorageTable(objects, references, leases);
 }
-fn Slice(comptime SelfPointer: type, comptime Element: type) type {
-    return if (@typeInfo(SelfPointer).pointer.is_const) []const Element else []Element;
+fn Slice(comptime SelfPointer: type, comptime T: type) type {
+    return if (@typeInfo(SelfPointer).pointer.is_const) []const T else []T;
 }
 fn StorageTable(comptime object_capacity: ?usize, comptime reference_capacity: ?usize, comptime lease_capacity: ?usize) type {
     comptime {
-        for ([_]?usize{object_capacity, reference_capacity, lease_capacity}) |capacity|
+        for ([_]?usize{ object_capacity, reference_capacity, lease_capacity }) |capacity|
             if (capacity != null and capacity.? > std.math.maxInt(u32)) @compileError("buffer handle capacity exceeds u32");
     }
     return struct {
         const Self = @This();
-        const Phase = enum { empty, allocating, live, releasing, destroying };
-        const Object = struct {
-            phase: Phase = .empty,
-            handle: Handle = .{},
-            producer: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 },
-            producer_open: bool = true,
-            descriptor: layout.Descriptor = .{ .bytes = 0 },
-            allocation_bytes: u64 = 0,
-            backing: ?Backing = null,
-            references: u32 = 0,
-            leases: u32 = 0,
-            scanout_leases: u32 = 0,
-            mapping_leases: u32 = 0,
-            release_attempt: u64 = 0,
-            owned_cookie: u64 = 0,
-            owned_reference: Handle = .{},
-            device_lost: bool = false,
-            device_quiesced: bool = false,
-        };
-        const Reference = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, read_only: bool = false, mapping_only: bool = false };
-        const Lease = struct { handle: Handle = .{}, buffer: Handle = .{}, owner: Owner = .{ .kind = .kernel, .id = 0, .generation = 0 }, access: Access = .cpu_read, range: layout.Range = .{ .offset = 0, .bytes = 0 } };
-        const DeviceBudget = struct {
-            driver: Owner,
-            binding: layout.Binding,
-            bytes: u64,
-            closing: bool = false,
-        };
-
         objects: if (object_capacity) |n| [n]Object else []Object = if (object_capacity != null) @splat(Object{}) else &.{},
         references: if (reference_capacity) |n| [n]Reference else []Reference = if (reference_capacity != null) @splat(Reference{}) else &.{},
         leases: if (lease_capacity) |n| [n]Lease else []Lease = if (lease_capacity != null) @splat(Lease{}) else &.{},
@@ -410,634 +539,340 @@ fn StorageTable(comptime object_capacity: ?usize, comptime reference_capacity: ?
         committed_bytes: u64 = 0,
         budget_bytes: u64,
         producer_budget_bytes: u64,
-        device_budgets: [@min(object_capacity orelse 16, 16)]?DeviceBudget = @splat(null),
-
+        device_budgets: [@min(object_capacity orelse 16, 16)]DeviceBudget = @splat(DeviceBudget{}),
         pub fn Element(comptime kind: Pool) type {
-            return switch (kind) { .objects => Object, .references => Reference, .leases => Lease };
+            return switch (kind) {
+                .objects => Object,
+                .references => Reference,
+                .leases => Lease,
+            };
         }
-        fn objectsSlice(self: anytype) Slice(@TypeOf(self), Object) {
-            return if (object_capacity != null) &self.objects else self.objects;
+        fn nativeView(self: anytype) NativeView {
+            const objects: Slice(@TypeOf(self), Object) = if (object_capacity != null) &self.objects else self.objects;
+            const references: Slice(@TypeOf(self), Reference) = if (reference_capacity != null) &self.references else self.references;
+            const leases: Slice(@TypeOf(self), Lease) = if (lease_capacity != null) &self.leases else self.leases;
+            return .{ .objects = @constCast(objects.ptr), .objects_len = objects.len, .references = @constCast(references.ptr), .references_len = references.len, .leases = @constCast(leases.ptr), .leases_len = leases.len, .serial = @constCast(&self.serial), .committed_bytes = @constCast(&self.committed_bytes), .budget_bytes = self.budget_bytes, .producer_budget_bytes = self.producer_budget_bytes, .device_budgets = @constCast(&self.device_budgets), .device_budgets_len = self.device_budgets.len, .dynamic_mask = @as(u32, if (object_capacity == null) 1 else 0) | @as(u32, if (reference_capacity == null) 2 else 0) | @as(u32, if (lease_capacity == null) 4 else 0) };
         }
-        fn referencesSlice(self: anytype) Slice(@TypeOf(self), Reference) {
-            return if (reference_capacity != null) &self.references else self.references;
+        fn call(self: anytype, comptime op: u32, args: NativeArgs, out: ?*anyopaque) Error!void {
+            const view = self.nativeView();
+            return nativeResult(r4os_rust_gfx_bo_run(&view, op, &args, out));
         }
-        fn leasesSlice(self: anytype) Slice(@TypeOf(self), Lease) {
-            return if (lease_capacity != null) &self.leases else self.leases;
+        fn result(self: anytype, comptime T: type, comptime op: u32, args: NativeArgs) Error!T {
+            var out: T = undefined;
+            try self.call(op, args, &out);
+            return out;
         }
         pub fn freeSlots(self: *const Self, comptime kind: Pool, needed: usize) usize {
-            const values = switch (kind) { .objects => self.objectsSlice(), .references => self.referencesSlice(), .leases => self.leasesSlice() };
-            var count: usize = 0;
-            for (values) |*value| if (value.handle.id == 0) {
-                count += 1;
-                if (count >= needed) break;
-            };
-            return count;
+            return self.result(usize, 0, .{ .pool = @intFromEnum(kind), .len = needed }) catch unreachable;
         }
-        /// Caller allocated resident replacement before taking the metadata
-        /// owner. Return the detached old storage for release after unlocking.
-        /// The caller initializes the new tail to default records outside the
-        /// owner; the existing prefix is copied from the latest locked state.
-        /// No record pointer may be retained across this owner boundary.
+        /// Allocation and tail initialization precede the metadata owner. Rust
+        /// copies the latest prefix; only then publish this slice under the same
+        /// uninterrupted owner. No Rust borrow survives this publication.
         pub fn replaceStorage(self: *Self, comptime kind: Pool, prepared: []Element(kind)) Error![]Element(kind) {
-            const capacity = switch (kind) { .objects => object_capacity, .references => reference_capacity, .leases => lease_capacity };
-            if (capacity != null) return error.Unsupported;
-            const old = @field(self, @tagName(kind));
-            if (prepared.len <= old.len or prepared.len > std.math.maxInt(u32)) return error.Invalid;
-            const start = @intFromPtr(prepared.ptr);
-            const end = start + std.mem.sliceAsBytes(prepared).len;
-            const previous = @intFromPtr(old.ptr);
-            if (old.len != 0 and start < previous + std.mem.sliceAsBytes(old).len and previous < end) return error.Invalid;
-            @memcpy(prepared[0..old.len], old);
-            @field(self, @tagName(kind)) = prepared;
-            return old;
-        }
-
-        fn belongs(object: *const Object, budget: DeviceBudget) bool {
-            return object.phase != .empty and object.descriptor.location == .device_local and
-                object.producer.eql(budget.driver) and std.meta.eql(object.descriptor.binding, budget.binding);
-        }
-        fn budgetIndex(self: *const Self, producer: Owner, descriptor: layout.Descriptor) ?usize {
-            if (descriptor.location != .device_local or producer.kind != .driver) return null;
-            for (&self.device_budgets, 0..) |*slot, index| if (slot.*) |budget| {
-                if (budget.driver.eql(producer) and std.meta.eql(budget.binding, descriptor.binding)) return index;
+            try self.call(1, .{ .pool = @intFromEnum(kind), .buffer = @ptrCast(prepared.ptr), .len = prepared.len }, null);
+            const capacity = switch (kind) {
+                .objects => object_capacity,
+                .references => reference_capacity,
+                .leases => lease_capacity,
             };
-            return null;
-        }
-        fn chargedDevice(self: *const Self, budget: DeviceBudget) u64 {
-            var bytes: u64 = 0;
-            for (self.objectsSlice()) |*object| if (belongs(object, budget)) { bytes += object.allocation_bytes; };
-            return bytes;
-        }
-        /// Generic accounting limit supplied by the authenticated memory
-        /// provider. It grants no physical allocation or placement policy.
-        /// Live charges may exceed a reduced limit; new admission then waits
-        /// for confirmed retirement instead of forgetting existing backing.
-        pub fn setDeviceBudget(self: *Self, driver: Owner, binding: layout.Binding, bytes: u64) Error!void {
-            if (!driver.valid() or driver.kind != .driver or driver.id > std.math.maxInt(u32) or
-                !binding.valid() or binding.portable() or binding.driver_owner != driver.id or bytes % 4096 != 0) return error.Invalid;
-            var selected: ?usize = null;
-            var empty: ?usize = null;
-            var combined = self.budget_bytes;
-            for (&self.device_budgets, 0..) |*slot, index| {
-                const budget = slot.* orelse { if (empty == null) empty = index; continue; };
-                if (budget.driver.eql(driver) and std.meta.eql(budget.binding, binding)) {
-                    if (budget.closing) return error.Closed;
-                    selected = index;
-                    continue;
-                }
-                // An adapter has one physical admission domain. A new driver
-                // epoch must not double-budget backing retained by the old one.
-                if (budget.binding.adapter == binding.adapter) return error.Busy;
-                combined = std.math.add(u64, combined, budget.bytes) catch return error.Overflow;
+            if (comptime capacity != null) unreachable else {
+                const old = @field(self, @tagName(kind));
+                @field(self, @tagName(kind)) = prepared;
+                return old;
             }
-            _ = std.math.add(u64, combined, bytes) catch return error.Overflow;
-            const index = selected orelse empty orelse return error.Capacity;
-            self.device_budgets[index] = .{ .driver = driver, .binding = binding, .bytes = bytes };
+        }
+        pub fn setDeviceBudget(self: *Self, driver: Owner, binding: layout.Binding, bytes: u64) Error!void {
+            return self.call(2, .{ .owner = driver, .binding = binding, .bytes = bytes }, null);
         }
         pub fn deviceBudget(self: *const Self, driver: Owner, binding: layout.Binding) Error!BudgetSnapshot {
-            for (&self.device_budgets) |*slot| if (slot.*) |budget| {
-                if (budget.driver.eql(driver) and std.meta.eql(budget.binding, binding))
-                    return .{ .limit = budget.bytes, .charged = self.chargedDevice(budget), .closing = budget.closing };
-            };
-            return error.Stale;
+            return self.result(BudgetSnapshot, 3, .{ .owner = driver, .binding = binding });
         }
         pub fn queryDeviceBudget(self: *const Self, adapter: u32, generation: u64) Error!BudgetSnapshot {
-            if (adapter == 0 or generation == 0) return error.Invalid;
-            for (&self.device_budgets) |*slot| if (slot.*) |budget| {
-                if (budget.binding.adapter == adapter and budget.binding.device_generation == generation)
-                    return .{ .limit = budget.bytes, .charged = self.chargedDevice(budget), .closing = budget.closing };
-            };
-            return error.Stale;
+            return self.result(BudgetSnapshot, 4, .{ .access = adapter, .value = generation });
         }
         pub fn sharedChargedBytes(self: *const Self) u64 {
-            var bytes = self.committed_bytes;
-            for (&self.device_budgets) |*slot| if (slot.*) |budget| { bytes -= self.chargedDevice(budget); };
-            return bytes;
+            return self.result(u64, 5, .{}) catch unreachable;
         }
         pub fn totalBudgetBytes(self: *const Self) u64 {
-            var bytes = self.budget_bytes;
-            for (&self.device_budgets) |*slot| if (slot.*) |budget| { bytes += budget.bytes; };
-            return bytes; // Overflow was checked before configuration publication.
+            return self.result(u64, 6, .{}) catch unreachable;
         }
-        fn collectClosedBudgets(self: *Self) void {
-            for (&self.device_budgets) |*slot| if (slot.*) |budget| {
-                if (budget.closing and self.chargedDevice(budget) == 0) slot.* = null;
-            };
-        }
-
         pub fn begin(self: *Self, producer: Owner, descriptor: layout.Descriptor) Error!Create {
-            return self.beginValidated(producer, descriptor, try layout.validate(descriptor));
+            return self.result(Create, 7, .{ .owner = producer, .input = &descriptor });
         }
-        fn beginValidated(self: *Self, producer: Owner, descriptor: layout.Descriptor, validated: layout.Layout) Error!Create {
-            if (!producer.valid()) return error.Invalid;
-            const selected = self.budgetIndex(producer, descriptor);
-            var shared_bytes: u64 = 0;
-            var owner_bytes: u64 = 0;
-            for (self.objectsSlice()) |object| {
-                if (object.phase == .empty or self.budgetIndex(object.producer, object.descriptor) != null) continue;
-                shared_bytes += object.allocation_bytes;
-                if (object.producer.eql(producer)) owner_bytes += object.allocation_bytes;
-            }
-            if (selected) |index| {
-                const budget = self.device_budgets[index].?;
-                if (budget.closing) return error.Closed;
-                const charged = self.chargedDevice(budget);
-                if (charged > budget.bytes or validated.allocation_bytes > budget.bytes - charged) return error.Budget;
-            } else {
-                if (shared_bytes > self.budget_bytes or validated.allocation_bytes > self.budget_bytes - shared_bytes) return error.Budget;
-                if (owner_bytes > self.producer_budget_bytes or validated.allocation_bytes > self.producer_budget_bytes - owner_bytes) return error.Budget;
-            }
-            _ = std.math.add(u64, self.committed_bytes, validated.allocation_bytes) catch return error.Overflow;
-            const slot = self.freeObject() orelse return error.Capacity;
-            const reference_slot = self.freeReference() orelse return error.Capacity;
-            // Reserve both serials before publication, so failure has no live
-            // partially initialized reference or charged memory.
-            if (self.serial > std.math.maxInt(u64) - 2) return error.Exhausted;
-            const handle = try self.nextHandle(slot);
-            const reference = try self.nextHandle(reference_slot);
-            self.objects[slot] = .{ .phase = .allocating, .handle = handle, .producer = producer, .descriptor = descriptor, .allocation_bytes = validated.allocation_bytes, .references = 1 };
-            self.references[reference_slot] = .{ .handle = reference, .buffer = handle, .owner = producer };
-            self.committed_bytes += validated.allocation_bytes;
-            return .{ .buffer = handle, .reference = reference, .bytes = validated.allocation_bytes };
-        }
-
-        // Reserve common lifetime/budget before the driver starts allocating.
-        // This cookie is opaque; it is never interpreted as a VM or GPU address.
         pub fn beginOwned(self: *Self, driver: Owner, descriptor: layout.Descriptor, cookie: u64) Error!OwnedCreate {
-            if (!driver.valid() or driver.kind != .driver or driver.id > std.math.maxInt(u32) or cookie == 0) return error.Invalid;
-            if (descriptor.location != .device_local or descriptor.binding.portable() or
-                descriptor.binding.driver_owner != driver.id or
-                descriptor.usage & (layout.Usage.cpu_read | layout.Usage.cpu_write) != 0) return error.Unsupported;
-            for (self.objectsSlice()) |object| {
-                if (object.phase != .empty and object.producer.eql(driver) and object.owned_cookie == cookie and
-                    std.meta.eql(object.descriptor.binding, descriptor.binding)) return error.Busy;
-            }
-            const ticket = try self.beginValidated(driver, descriptor, try layout.validateDriverOwned(descriptor));
-            const object = try self.findObject(ticket.buffer);
-            object.owned_cookie = cookie;
-            object.owned_reference = ticket.reference;
-            return .{ .create = ticket, .cookie = cookie, .driver = driver, .binding = descriptor.binding };
-        }
-        fn ownedCreation(self: *Self, ticket: OwnedCreate, driver: Owner) Error!*Object {
-            if (!ticket.driver.eql(driver)) return error.WrongOwner;
-            const object = try self.findObject(ticket.create.buffer);
-            if (!object.producer.eql(driver)) return error.WrongOwner;
-            if (object.phase != .allocating or object.owned_cookie == 0 or object.owned_cookie != ticket.cookie or
-                !object.owned_reference.eql(ticket.create.reference) or object.allocation_bytes != ticket.create.bytes or
-                !std.meta.eql(object.descriptor.binding, ticket.binding)) return error.Stale;
-            return object;
+            return self.result(OwnedCreate, 8, .{ .owner = driver, .input = &descriptor, .value = cookie });
         }
         pub fn commitOwned(self: *Self, ticket: OwnedCreate, driver: Owner) Error!void {
-            const object = try self.ownedCreation(ticket, driver);
-            if (!object.producer_open or object.references == 0) return error.Closed;
-            try self.publish(ticket.create, .{ .cookie = ticket.cookie, .bytes = ticket.create.bytes, .driver = driver });
+            return self.call(9, .{ .owner = driver, .input = &ticket }, null);
         }
         pub fn abortOwned(self: *Self, ticket: OwnedCreate, driver: Owner, quiesced: bool) Error!void {
-            _ = try self.ownedCreation(ticket, driver);
-            if (!quiesced) return error.Busy;
-            try self.abort(ticket.create);
+            return self.call(10, .{ .owner = driver, .input = &ticket, .flag = quiesced }, null);
         }
-
         pub fn publish(self: *Self, ticket: Create, backing: Backing) Error!void {
-            const object = try self.findObject(ticket.buffer);
-            if (object.phase != .allocating or object.backing != null) return error.Stale;
-            if (backing.cookie == 0 or backing.bytes < object.allocation_bytes or
-                (backing.cpu_address == 0) != (backing.cache == .unavailable) or
-                (backing.cpu_address != 0 and (backing.cpu_address % object.descriptor.alignment != 0 or
-                    backing.cpu_address > std.math.maxInt(u64) - backing.bytes))) return error.Invalid;
-            if (backing.driver) |driver| {
-                if (driver.kind != .driver or !driver.valid() or object.descriptor.binding.driver_owner != driver.id) return error.Invalid;
-            } else if (object.descriptor.location == .device_local) return error.Invalid;
-            object.backing = backing;
-            // A stopped producer can disappear while the allocator prepares
-            // pages. The result remains represented for deferred release.
-            object.phase = if (object.references == 0 and object.leases == 0) .releasing else .live;
+            const raw = NativeBacking.from(backing);
+            return self.call(11, .{ .input = &ticket, .other_input = &raw }, null);
         }
-
         pub fn abort(self: *Self, ticket: Create) Error!void {
-            const object = try self.findObject(ticket.buffer);
-            if (object.phase != .allocating or object.backing != null) return error.Stale;
-            for (self.referencesSlice()) |*reference| if (reference.buffer.eql(ticket.buffer)) {
-                reference.* = .{};
-            };
-            self.committed_bytes -= object.allocation_bytes;
-            object.* = .{};
-            self.collectClosedBudgets();
+            return self.call(12, .{ .input = &ticket }, null);
         }
-
         pub fn import(self: *Self, buffer: Handle, consumer: Owner) Error!Handle {
-            return self.importMode(buffer, consumer, false);
+            return self.result(Handle, 13, .{ .handle = buffer, .owner = consumer });
         }
-
         pub fn importMode(self: *Self, buffer: Handle, consumer: Owner, read_only: bool) Error!Handle {
-            if (!consumer.valid()) return error.Invalid;
-            const object = try self.findObject(buffer);
-            if (object.phase != .live or !object.producer_open) return error.Closed;
-            // An immutable export cannot be published while a writer still
-            // holds access, including a persistent Vulkan CPU mapping.
-            if (read_only) for (self.leasesSlice()) |lease| {
-                if (lease.handle.id != 0 and lease.buffer.eql(buffer) and writes(lease.access)) return error.Busy;
-            };
-            const slot = self.freeReference() orelse return error.Capacity;
-            const reference = try self.nextHandle(slot);
-            self.references[slot] = .{ .handle = reference, .buffer = buffer, .owner = consumer, .read_only = read_only };
-            object.references += 1;
-            return reference;
+            return self.result(Handle, 14, .{ .handle = buffer, .owner = consumer, .flag = read_only });
         }
-
         pub fn describe(self: *Self, reference: Handle, owner: Owner) Error!layout.Descriptor {
-            const object = try self.referencedObject(reference, owner);
-            if (object.device_lost) return error.Closed;
-            return object.descriptor;
+            return self.result(layout.Descriptor, 15, .{ .handle = reference, .owner = owner });
         }
-
-        // Sharing names a live reference, preserving immutable-export mode.
-        // A bare diagnostic object ID is not an importable reference.
         pub fn share(self: *Self, handle: Handle, consumer: Owner) Error!Handle {
-            if (handle.id == 0 or handle.id > self.references.len or handle.generation == 0) return error.Stale;
-            const item = self.references[handle.id - 1];
-            if (!item.handle.eql(handle)) return error.Stale;
-            if (item.mapping_only) return error.Unsupported;
-            return self.importMode(item.buffer, consumer, item.read_only);
+            return self.result(Handle, 16, .{ .handle = handle, .owner = consumer });
         }
-
         pub fn readOnly(self: *Self, handle: Handle, owner: Owner) Error!bool {
-            return (try self.findReference(handle, owner)).read_only;
+            return self.result(bool, 17, .{ .handle = handle, .owner = owner });
         }
-
         pub fn mappingOnly(self: *Self, handle: Handle, owner: Owner) Error!bool {
-            return (try self.findReference(handle, owner)).mapping_only;
+            return self.result(bool, 18, .{ .handle = handle, .owner = owner });
         }
-
         pub fn drop(self: *Self, handle: Handle, owner: Owner) Error!void {
-            const reference = try self.findReference(handle, owner);
-            const object = try self.findObject(reference.buffer);
-            reference.* = .{};
-            object.references -= 1;
-            self.maybeRelease(object);
+            return self.call(19, .{ .handle = handle, .owner = owner }, null);
         }
-
         pub fn use(self: *Self, reference: Handle, owner: Owner, access: Access, offset: u64, bytes: u64) Error!Use {
-            const ref_record = try self.findReference(reference, owner);
-            if (ref_record.mapping_only and access != .device_mapping) return error.Unsupported;
-            if (ref_record.read_only and writes(access)) return error.Unsupported;
-            const object = try self.referencedObject(reference, owner);
-            if (object.phase != .live or object.device_lost) return error.Closed;
-            if (writes(access)) {
-                for (self.referencesSlice()) |item| if (item.handle.id != 0 and item.buffer.eql(object.handle) and item.read_only) {
-                    return error.Busy;
-                };
-            }
-            // Native address translation covers complete allocated pages.
-            // Padding remains inaccessible to CPU/execution/queue users;
-            // only the mapping-only reference may retain that backing tail.
-            const limit = if (ref_record.mapping_only) object.allocation_bytes else object.descriptor.bytes;
-            if (!layout.spanFits(limit, offset, bytes)) return error.Invalid;
-            const backing = object.backing orelse return error.Busy;
-            const required: u32 = switch (access) {
-                .cpu_read, .cpu_persistent_read => layout.Usage.cpu_read,
-                .cpu_write => layout.Usage.cpu_write,
-                .cpu_persistent_write => layout.Usage.cpu_read | layout.Usage.cpu_write,
-                .device_read, .queue_read => layout.Usage.transfer_source,
-                .device_write, .queue_write => layout.Usage.transfer_target | layout.Usage.render,
-                .scanout => layout.Usage.scanout,
-                .device_mapping => 0,
-            };
-            if (required != 0 and (object.descriptor.usage & required) == 0) return error.Unsupported;
-            if (persistentCpu(access) and (object.descriptor.location != .system or backing.cache != .write_back or
-                object.descriptor.usage & required != required)) return error.Unsupported;
-            if (isCpu(access) and backing.cpu_address == 0) return error.Unsupported;
-            if (access == .cpu_read and backing.cache == .write_combining) return error.Unsupported;
-            for (self.leasesSlice()) |lease| {
-                if (lease.handle.id != 0 and lease.buffer.eql(object.handle) and conflicts(lease.access, access)) return error.Busy;
-            }
-            const slot = self.freeLease() orelse return error.Capacity;
-            const token = try self.nextHandle(slot);
-            self.leases[slot] = .{ .handle = token, .buffer = object.handle, .owner = owner, .access = access, .range = .{ .offset = offset, .bytes = bytes } };
-            object.leases += 1;
-            if (access == .scanout) object.scanout_leases += 1;
-            if (access == .device_mapping) object.mapping_leases += 1;
-            return .{ .lease = token, .buffer = object.handle, .access = access, .backing = backing, .range = .{ .offset = offset, .bytes = bytes } };
+            return (try self.result(NativeUse, 20, .{ .handle = reference, .owner = owner, .access = @intFromEnum(access), .offset = offset, .bytes = bytes })).value();
         }
-
-        // The queue owner must first validate ordering against every existing
-        // conflicting queue use while holding this same metadata lock. Queued
-        // uses may overlap each other, but exclude conflicting CPU/device maps.
-        // Ownership changes atomically with admission, before producer cleanup.
         pub fn reserveQueued(self: *Self, reference: Handle, producer: Owner, queue_owner: Owner, write: bool, offset: u64, bytes: u64) Error!Use {
-            if (queue_owner.kind != .kernel or !queue_owner.valid()) return error.Invalid;
-            const result = try self.use(reference, producer, if (write) .queue_write else .queue_read, offset, bytes);
-            const lease = try self.findLease(result.lease, producer);
-            lease.owner = queue_owner;
-            return result;
+            return (try self.result(NativeUse, 21, .{ .handle = reference, .owner = producer, .other = queue_owner, .flag = write, .offset = offset, .bytes = bytes })).value();
         }
-
-        // Only a validated, active native job may hand its existing queue
-        // lease to a driver. Producer exit closes public imports, but cannot
-        // revoke backing already held by that job. The new reference retains
-        // the whole BO for address translation, never for CPU access, sharing
-        // or execution. Those permissions and extents remain with queue uses.
         pub fn retainQueued(self: *Self, handle: Handle, queue_owner: Owner, driver: Owner) Error!Handle {
-            if (queue_owner.kind != .kernel or !queue_owner.valid() or driver.kind != .driver or !driver.valid()) return error.Invalid;
-            const lease = try self.findLease(handle, queue_owner);
-            if (!queued(lease.access)) return error.Unsupported;
-            const object = try self.findObject(lease.buffer);
-            if (object.phase != .live or object.device_lost or object.backing == null) return error.Closed;
-            const slot = self.freeReference() orelse return error.Capacity;
-            const reference = try self.nextHandle(slot);
-            self.references[slot] = .{ .handle = reference, .buffer = object.handle, .owner = driver, .mapping_only = true };
-            object.references += 1;
-            return reference;
+            return self.result(Handle, 22, .{ .handle = handle, .owner = queue_owner, .other = driver });
         }
-
-        /// Direct presentation retains a read-only full reference so the
-        /// display owner can acquire its own real device-read lease. Its
-        /// presence excludes new writers until final DMA-context retirement.
         pub fn retainScanout(self: *Self, handle: Handle, queue_owner: Owner, driver: Owner) Error!Handle {
-            const lease = try self.findLease(handle, queue_owner);
-            const object = try self.findObject(lease.buffer);
-            if (lease.access != .queue_read or object.descriptor.location != .device_local or
-                object.descriptor.usage & layout.Usage.scanout == 0) return error.Unsupported;
-            const reference = try self.retainQueued(handle, queue_owner, driver);
-            const retained = self.findReference(reference, driver) catch unreachable;
-            retained.mapping_only = false; retained.read_only = true;
-            return reference;
+            return self.result(Handle, 23, .{ .handle = handle, .owner = queue_owner, .other = driver });
         }
-
-        // GPU/DMA/scanout leases need an engine/TLB completion or a proven
-        // stop. A timeout, cancel request, or producer death is not that proof.
         pub fn endUse(self: *Self, handle: Handle, owner: Owner, device_quiesced: bool) Error!void {
-            const lease = try self.findLease(handle, owner);
-            if (isDevice(lease.access) and !device_quiesced) return error.Busy;
-            const object = try self.findObject(lease.buffer);
-            if (lease.access == .scanout) object.scanout_leases -= 1;
-            if (lease.access == .device_mapping) object.mapping_leases -= 1;
-            lease.* = .{};
-            object.leases -= 1;
-            self.maybeRelease(object);
+            return self.call(24, .{ .handle = handle, .owner = owner, .flag = device_quiesced }, null);
         }
-
         pub fn useInfo(self: *Self, handle: Handle, owner: Owner) Error!Use {
-            const lease = try self.findLease(handle, owner);
-            const object = try self.findObject(lease.buffer);
-            return .{ .lease = handle, .buffer = object.handle, .access = lease.access, .backing = object.backing orelse return error.Busy, .range = lease.range };
+            return (try self.result(NativeUse, 25, .{ .handle = handle, .owner = owner })).value();
         }
-
         pub fn bufferFor(self: *Self, handle: Handle, owner: Owner) Error!Handle {
-            return (try self.findReference(handle, owner)).buffer;
+            return self.result(Handle, 26, .{ .handle = handle, .owner = owner });
         }
-
-        /// Exact adapter/memory epoch only. Logical loss stops new access but
-        /// does not revoke existing DMA leases. After an independently proven
-        /// stop, the driver can retire native backing even if applications
-        /// still hold invalid references; those references remain closeable.
         pub fn loseDevice(self: *Self, driver: Owner, binding: layout.Binding, quiesced: bool) Error!void {
-            if (!driver.valid() or driver.kind != .driver or !binding.valid() or binding.portable()) return error.Invalid;
-            if (binding.driver_owner != driver.id) return error.WrongOwner;
-            for (&self.device_budgets) |*slot| if (slot.*) |*budget| {
-                if (budget.driver.eql(driver) and std.meta.eql(budget.binding, binding)) budget.closing = true;
-            };
-            for (self.objectsSlice()) |*object| {
-                if (object.phase == .empty or object.descriptor.location != .device_local or
-                    !object.producer.eql(driver) or !std.meta.eql(object.descriptor.binding, binding)) continue;
-                object.device_lost = true;
-                object.device_quiesced = object.device_quiesced or quiesced;
-                object.producer_open = false;
-                self.maybeRelease(object);
-            }
-            self.collectClosedBudgets();
+            return self.call(27, .{ .owner = driver, .binding = binding, .flag = quiesced }, null);
         }
-
-        // Called only after the program lifecycle has stopped every CPU task.
-        // Imported references of other consumers and all device uses survive.
         pub fn stoppedOwner(self: *Self, owner: Owner) void {
-            for (&self.device_budgets) |*slot| if (slot.*) |*budget| {
-                if (budget.driver.eql(owner)) budget.closing = true;
-            };
-            for (self.objectsSlice()) |*object| {
-                if (object.phase != .empty and object.producer.eql(owner)) object.producer_open = false;
-            }
-            for (self.referencesSlice()) |*reference| {
-                if (reference.handle.id == 0 or !reference.owner.eql(owner)) continue;
-                const object = self.findObject(reference.buffer) catch unreachable;
-                reference.* = .{};
-                object.references -= 1;
-            }
-            for (self.leasesSlice()) |*lease| {
-                if (lease.handle.id == 0 or !lease.owner.eql(owner) or isDevice(lease.access)) continue;
-                const object = self.findObject(lease.buffer) catch unreachable;
-                lease.* = .{};
-                object.leases -= 1;
-            }
-            for (self.objectsSlice()) |*object| if (object.phase != .empty) {
-                self.maybeRelease(object);
-            };
-            self.collectClosedBudgets();
+            self.call(28, .{ .owner = owner }, null) catch unreachable;
         }
-
-        // Returning a ticket does not release its budget or slot. The caller
-        // must acknowledge successful VM/TLB or backend destruction outside
-        // the metadata lock. Failure remains discoverable and retryable.
         pub fn pendingReleaseForOwner(self: *const Self, producer: Owner) bool {
-            for (self.objectsSlice()) |object| {
-                if ((object.phase == .releasing or object.phase == .destroying) and object.producer.eql(producer)) return true;
-                if (object.phase == .allocating and object.owned_cookie != 0 and object.producer.eql(producer)) return true;
-            }
-            return false;
+            return self.result(bool, 29, .{ .owner = producer }) catch unreachable;
         }
-
         pub fn pendingRelease(self: *Self) ?Release {
-            return self.pendingFiltered(null, false);
+            const raw = self.result(NativeOptionalRelease, 30, .{}) catch unreachable;
+            return if (raw.present) raw.value.value() else null;
         }
         pub fn pendingSystemRelease(self: *Self) ?Release {
-            return self.pendingFiltered(null, true);
+            const raw = self.result(NativeOptionalRelease, 31, .{}) catch unreachable;
+            return if (raw.present) raw.value.value() else null;
         }
         pub fn takeOwnedRelease(self: *Self, driver: Owner, binding: layout.Binding) Error!?OwnedRelease {
-            if (!driver.valid() or driver.kind != .driver or !binding.valid() or binding.portable() or binding.driver_owner != driver.id) return error.Invalid;
-            const filter: OwnedRelease = .{ .release = undefined, .driver = driver, .binding = binding };
-            const ticket = self.pendingFiltered(filter, false) orelse return null;
-            return .{ .release = ticket, .driver = driver, .binding = binding };
+            const raw = try self.result(NativeOptionalOwnedRelease, 32, .{ .owner = driver, .binding = binding });
+            return if (raw.present) raw.value.value() else null;
         }
-        fn pendingFiltered(self: *Self, owned: ?OwnedRelease, system_only: bool) ?Release {
-            for (self.objectsSlice()) |*object| if (object.phase == .releasing) {
-                const backing = object.backing orelse continue;
-                if (system_only and backing.driver != null) continue;
-                if (owned) |filter| {
-                    const driver = backing.driver orelse continue;
-                    if (object.owned_cookie == 0 or !driver.eql(filter.driver) or !std.meta.eql(object.descriptor.binding, filter.binding)) continue;
-                }
-                if (object.release_attempt == std.math.maxInt(u64)) continue;
-                object.release_attempt += 1;
-                object.phase = .destroying;
-                return .{ .buffer = object.handle, .backing = backing, .attempt = object.release_attempt };
-            };
-            return null;
-        }
-
         pub fn finishOwnedRelease(self: *Self, ticket: OwnedRelease, driver: Owner, quiesced: bool) Error!void {
-            if (!ticket.driver.eql(driver)) return error.WrongOwner;
-            const object = try self.findObject(ticket.release.buffer);
-            const backing = object.backing orelse return error.Stale;
-            if (backing.driver == null or !backing.driver.?.eql(driver)) return error.WrongOwner;
-            if (object.owned_cookie == 0 or !std.meta.eql(object.descriptor.binding, ticket.binding) or
-                !std.meta.eql(backing, ticket.release.backing) or object.release_attempt != ticket.release.attempt or
-                object.phase != .destroying) return error.Stale;
-            // Unlike the CPU retry collector, an unconfirmed hardware release
-            // keeps this exact claimed ticket. It cannot be issued twice.
-            if (!quiesced) return error.Busy;
-            try self.finishRelease(ticket.release, true);
+            const raw = NativeOwnedRelease.from(ticket);
+            return self.call(33, .{ .input = &raw, .owner = driver, .flag = quiesced }, null);
         }
-
         pub fn finishRelease(self: *Self, ticket: Release, released: bool) Error!void {
-            const object = try self.findObject(ticket.buffer);
-            if (object.release_attempt != ticket.attempt) return error.Stale;
-            if (object.phase != .destroying or object.leases != 0 or
-                (object.references != 0 and !(object.device_lost and object.device_quiesced))) return error.Busy;
-            const backing = object.backing orelse return error.Stale;
-            if (backing.cookie != ticket.backing.cookie) return error.Stale;
-            if (!released) {
-                object.phase = .releasing;
-                return error.Busy;
-            }
-            self.committed_bytes -= object.allocation_bytes;
-            if (object.references == 0) {
-                object.* = .{};
-            } else {
-                // Retain handle identity for close only, never the freed GPU
-                // allocation/cookie or its charged physical capacity.
-                object.phase = .live;
-                object.backing = null;
-                object.owned_cookie = 0;
-                object.owned_reference = .{};
-                object.allocation_bytes = 0;
-            }
-            self.collectClosedBudgets();
+            const raw = NativeRelease.from(ticket);
+            return self.call(34, .{ .input = &raw, .flag = released }, null);
         }
-
         pub fn retainsDriver(self: *const Self, owner: Owner) bool {
-            for (self.objectsSlice()) |object| {
-                if (object.phase != .empty and object.owned_cookie != 0 and object.producer.eql(owner)) return true;
-            }
-            for (self.objectsSlice()) |object| if (object.backing) |backing| if (backing.driver) |driver| {
-                if (driver.eql(owner)) return true;
-            };
-            for (self.leasesSlice()) |lease| {
-                if (lease.handle.id != 0 and lease.owner.eql(owner) and isDevice(lease.access)) return true;
-            }
-            return false;
+            return self.result(bool, 35, .{ .owner = owner }) catch unreachable;
         }
-
         pub fn stats(self: *const Self) Stats {
-            var result = Stats{ .bytes = self.committed_bytes };
-            // One pass over objects. Aliases,
-            // overlapping ranges and multiple lease kinds never double-charge
-            // backing. These are overlapping subsets, not sums of allocation.
-            for (self.objectsSlice()) |object| {
-                if (object.phase == .empty) continue;
-                result.objects += 1;
-                result.references += object.references;
-                result.leases += object.leases;
-                if (!object.producer_open or object.phase == .releasing or object.phase == .destroying) result.retained_bytes += object.allocation_bytes;
-                const bytes = object.allocation_bytes;
-                const device = object.descriptor.location == .device_local;
-                if (device) result.device_bytes += bytes else result.system_bytes += bytes;
-                if (object.phase == .allocating) result.allocating_bytes += bytes;
-                if (object.phase == .releasing or object.phase == .destroying) result.destroying_bytes += bytes;
-                if (object.backing != null) {
-                    if (device) result.device_backed_bytes += bytes else result.system_backed_bytes += bytes;
-                    if (object.leases != 0) {
-                        if (device) result.device_pinned_bytes += bytes else result.system_pinned_bytes += bytes;
-                    }
-                }
-                if (object.scanout_leases != 0) result.scanout_pinned_bytes += bytes;
-                if (object.mapping_leases != 0) result.device_mapped_bytes += bytes;
-            }
-            std.debug.assert(result.system_bytes + result.device_bytes == result.bytes);
-            return result;
-        }
-
-        fn maybeRelease(_: *Self, object: *Object) void {
-            if (object.phase != .live or object.leases != 0) return;
-            if (object.device_lost and object.device_quiesced and object.backing == null and object.owned_cookie == 0) {
-                if (object.references == 0) object.* = .{};
-                return;
-            }
-            if (object.references == 0 or (object.device_lost and object.device_quiesced)) object.phase = .releasing;
-        }
-        fn nextHandle(self: *Self, slot: usize) Error!Handle {
-            if (self.serial == std.math.maxInt(u64) or slot >= std.math.maxInt(u32)) return error.Exhausted;
-            self.serial += 1;
-            return .{ .id = @intCast(slot + 1), .generation = self.serial };
-        }
-        fn findObject(self: *Self, handle: Handle) Error!*Object {
-            if (handle.id == 0 or handle.id > self.objects.len or handle.generation == 0) return error.Stale;
-            const item = &self.objects[handle.id - 1];
-            if (item.phase == .empty or !item.handle.eql(handle)) return error.Stale;
-            return item;
-        }
-        fn findReference(self: *Self, handle: Handle, owner: Owner) Error!*Reference {
-            if (handle.id == 0 or handle.id > self.references.len or handle.generation == 0) return error.Stale;
-            const item = &self.references[handle.id - 1];
-            if (!item.handle.eql(handle)) return error.Stale;
-            if (!item.owner.eql(owner)) return error.WrongOwner;
-            return item;
-        }
-        fn referencedObject(self: *Self, handle: Handle, owner: Owner) Error!*Object {
-            return self.findObject((try self.findReference(handle, owner)).buffer);
-        }
-        fn findLease(self: *Self, handle: Handle, owner: Owner) Error!*Lease {
-            if (handle.id == 0 or handle.id > self.leases.len or handle.generation == 0) return error.Stale;
-            const item = &self.leases[handle.id - 1];
-            if (!item.handle.eql(handle)) return error.Stale;
-            if (!item.owner.eql(owner)) return error.WrongOwner;
-            return item;
-        }
-        fn freeObject(self: *const Self) ?usize {
-            for (self.objectsSlice(), 0..) |item, index| if (item.phase == .empty) {
-                return index;
-            };
-            return null;
-        }
-        fn freeReference(self: *const Self) ?usize {
-            for (self.referencesSlice(), 0..) |item, index| if (item.handle.id == 0) {
-                return index;
-            };
-            return null;
-        }
-        fn freeLease(self: *const Self) ?usize {
-            for (self.leasesSlice(), 0..) |item, index| if (item.handle.id == 0) {
-                return index;
-            };
-            return null;
+            return self.result(Stats, 36, .{}) catch unreachable;
         }
     };
 }
 
+comptime {
+    if (@sizeOf(Owner) != 24 or @alignOf(Owner) != 8) @compileError("native BO Owner layout");
+    if (@offsetOf(Owner, "kind") != 0) @compileError("native BO Owner.kind");
+    if (@offsetOf(Owner, "id") != 8) @compileError("native BO Owner.id");
+    if (@offsetOf(Owner, "generation") != 16) @compileError("native BO Owner.generation");
+    if (@sizeOf(Handle) != 16 or @alignOf(Handle) != 8) @compileError("native BO Handle layout");
+    if (@offsetOf(Handle, "id") != 0) @compileError("native BO Handle.id");
+    if (@offsetOf(Handle, "generation") != 8) @compileError("native BO Handle.generation");
+    if (@sizeOf(layout.Binding) != 16 or @alignOf(layout.Binding) != 8) @compileError("native BO Binding layout");
+    if (@offsetOf(layout.Binding, "adapter") != 0) @compileError("native BO Binding.adapter");
+    if (@offsetOf(layout.Binding, "driver_owner") != 4) @compileError("native BO Binding.driver_owner");
+    if (@offsetOf(layout.Binding, "device_generation") != 8) @compileError("native BO Binding.device_generation");
+    if (@sizeOf(layout.Plane) != 16 or @alignOf(layout.Plane) != 8) @compileError("native BO Plane layout");
+    if (@offsetOf(layout.Plane, "offset") != 0) @compileError("native BO Plane.offset");
+    if (@offsetOf(layout.Plane, "pitch") != 8) @compileError("native BO Plane.pitch");
+    if (@sizeOf(layout.Range) != 16 or @alignOf(layout.Range) != 8) @compileError("native BO Range layout");
+    if (@offsetOf(layout.Range, "offset") != 0) @compileError("native BO Range.offset");
+    if (@offsetOf(layout.Range, "bytes") != 8) @compileError("native BO Range.bytes");
+    if (@sizeOf(layout.Descriptor) != 128 or @alignOf(layout.Descriptor) != 8) @compileError("native BO Descriptor layout");
+    if (@offsetOf(layout.Descriptor, "bytes") != 0) @compileError("native BO Descriptor.bytes");
+    if (@offsetOf(layout.Descriptor, "alignment") != 8) @compileError("native BO Descriptor.alignment");
+    if (@offsetOf(layout.Descriptor, "modifier") != 16) @compileError("native BO Descriptor.modifier");
+    if (@offsetOf(layout.Descriptor, "width") != 24) @compileError("native BO Descriptor.width");
+    if (@offsetOf(layout.Descriptor, "height") != 28) @compileError("native BO Descriptor.height");
+    if (@offsetOf(layout.Descriptor, "format") != 32) @compileError("native BO Descriptor.format");
+    if (@offsetOf(layout.Descriptor, "plane_count") != 36) @compileError("native BO Descriptor.plane_count");
+    if (@offsetOf(layout.Descriptor, "planes") != 40) @compileError("native BO Descriptor.planes");
+    if (@offsetOf(layout.Descriptor, "usage") != 104) @compileError("native BO Descriptor.usage");
+    if (@offsetOf(layout.Descriptor, "location") != 108) @compileError("native BO Descriptor.location");
+    if (@offsetOf(layout.Descriptor, "binding") != 112) @compileError("native BO Descriptor.binding");
+    if (@sizeOf(NativeBacking) != 56 or @alignOf(NativeBacking) != 8) @compileError("native BO Backing layout");
+    if (@offsetOf(NativeBacking, "cookie") != 0) @compileError("native BO Backing.cookie");
+    if (@offsetOf(NativeBacking, "cpu_address") != 8) @compileError("native BO Backing.cpu_address");
+    if (@offsetOf(NativeBacking, "bytes") != 16) @compileError("native BO Backing.bytes");
+    if (@offsetOf(NativeBacking, "cache") != 24) @compileError("native BO Backing.cache");
+    if (@offsetOf(NativeBacking, "has_driver") != 28) @compileError("native BO Backing.has_driver");
+    if (@offsetOf(NativeBacking, "driver") != 32) @compileError("native BO Backing.driver");
+    if (@sizeOf(Create) != 40 or @alignOf(Create) != 8) @compileError("native BO Create layout");
+    if (@offsetOf(Create, "buffer") != 0) @compileError("native BO Create.buffer");
+    if (@offsetOf(Create, "reference") != 16) @compileError("native BO Create.reference");
+    if (@offsetOf(Create, "bytes") != 32) @compileError("native BO Create.bytes");
+    if (@sizeOf(NativeUse) != 112 or @alignOf(NativeUse) != 8) @compileError("native BO Use layout");
+    if (@offsetOf(NativeUse, "lease") != 0) @compileError("native BO Use.lease");
+    if (@offsetOf(NativeUse, "buffer") != 16) @compileError("native BO Use.buffer");
+    if (@offsetOf(NativeUse, "access") != 32) @compileError("native BO Use.access");
+    if (@offsetOf(NativeUse, "backing") != 40) @compileError("native BO Use.backing");
+    if (@offsetOf(NativeUse, "range") != 96) @compileError("native BO Use.range");
+    if (@sizeOf(NativeRelease) != 80 or @alignOf(NativeRelease) != 8) @compileError("native BO Release layout");
+    if (@offsetOf(NativeRelease, "buffer") != 0) @compileError("native BO Release.buffer");
+    if (@offsetOf(NativeRelease, "backing") != 16) @compileError("native BO Release.backing");
+    if (@offsetOf(NativeRelease, "attempt") != 72) @compileError("native BO Release.attempt");
+    if (@sizeOf(OwnedCreate) != 88 or @alignOf(OwnedCreate) != 8) @compileError("native BO OwnedCreate layout");
+    if (@offsetOf(OwnedCreate, "create") != 0) @compileError("native BO OwnedCreate.create");
+    if (@offsetOf(OwnedCreate, "cookie") != 40) @compileError("native BO OwnedCreate.cookie");
+    if (@offsetOf(OwnedCreate, "driver") != 48) @compileError("native BO OwnedCreate.driver");
+    if (@offsetOf(OwnedCreate, "binding") != 72) @compileError("native BO OwnedCreate.binding");
+    if (@sizeOf(NativeOwnedRelease) != 120 or @alignOf(NativeOwnedRelease) != 8) @compileError("native BO OwnedRelease layout");
+    if (@offsetOf(NativeOwnedRelease, "release") != 0) @compileError("native BO OwnedRelease.release");
+    if (@offsetOf(NativeOwnedRelease, "driver") != 80) @compileError("native BO OwnedRelease.driver");
+    if (@offsetOf(NativeOwnedRelease, "binding") != 104) @compileError("native BO OwnedRelease.binding");
+    if (@sizeOf(NativeOptionalRelease) != 88 or @alignOf(NativeOptionalRelease) != 8) @compileError("native BO OptionalRelease layout");
+    if (@offsetOf(NativeOptionalRelease, "present") != 0) @compileError("native BO OptionalRelease.present");
+    if (@offsetOf(NativeOptionalRelease, "value") != 8) @compileError("native BO OptionalRelease.value");
+    if (@sizeOf(NativeOptionalOwnedRelease) != 128 or @alignOf(NativeOptionalOwnedRelease) != 8) @compileError("native BO OptionalOwnedRelease layout");
+    if (@offsetOf(NativeOptionalOwnedRelease, "present") != 0) @compileError("native BO OptionalOwnedRelease.present");
+    if (@offsetOf(NativeOptionalOwnedRelease, "value") != 8) @compileError("native BO OptionalOwnedRelease.value");
+    if (@sizeOf(BudgetSnapshot) != 24 or @alignOf(BudgetSnapshot) != 8) @compileError("native BO BudgetSnapshot layout");
+    if (@offsetOf(BudgetSnapshot, "limit") != 0) @compileError("native BO BudgetSnapshot.limit");
+    if (@offsetOf(BudgetSnapshot, "charged") != 8) @compileError("native BO BudgetSnapshot.charged");
+    if (@offsetOf(BudgetSnapshot, "closing") != 16) @compileError("native BO BudgetSnapshot.closing");
+    if (@sizeOf(Stats) != 120 or @alignOf(Stats) != 8) @compileError("native BO Stats layout");
+    if (@offsetOf(Stats, "objects") != 0) @compileError("native BO Stats.objects");
+    if (@offsetOf(Stats, "references") != 8) @compileError("native BO Stats.references");
+    if (@offsetOf(Stats, "leases") != 16) @compileError("native BO Stats.leases");
+    if (@offsetOf(Stats, "bytes") != 24) @compileError("native BO Stats.bytes");
+    if (@offsetOf(Stats, "retained_bytes") != 32) @compileError("native BO Stats.retained_bytes");
+    if (@offsetOf(Stats, "system_bytes") != 40) @compileError("native BO Stats.system_bytes");
+    if (@offsetOf(Stats, "device_bytes") != 48) @compileError("native BO Stats.device_bytes");
+    if (@offsetOf(Stats, "system_backed_bytes") != 56) @compileError("native BO Stats.system_backed_bytes");
+    if (@offsetOf(Stats, "device_backed_bytes") != 64) @compileError("native BO Stats.device_backed_bytes");
+    if (@offsetOf(Stats, "system_pinned_bytes") != 72) @compileError("native BO Stats.system_pinned_bytes");
+    if (@offsetOf(Stats, "device_pinned_bytes") != 80) @compileError("native BO Stats.device_pinned_bytes");
+    if (@offsetOf(Stats, "scanout_pinned_bytes") != 88) @compileError("native BO Stats.scanout_pinned_bytes");
+    if (@offsetOf(Stats, "device_mapped_bytes") != 96) @compileError("native BO Stats.device_mapped_bytes");
+    if (@offsetOf(Stats, "allocating_bytes") != 104) @compileError("native BO Stats.allocating_bytes");
+    if (@offsetOf(Stats, "destroying_bytes") != 112) @compileError("native BO Stats.destroying_bytes");
+    if (@sizeOf(Object) != 312 or @alignOf(Object) != 8) @compileError("native BO Object layout");
+    if (@offsetOf(Object, "phase") != 0) @compileError("native BO Object.phase");
+    if (@offsetOf(Object, "handle") != 8) @compileError("native BO Object.handle");
+    if (@offsetOf(Object, "producer") != 24) @compileError("native BO Object.producer");
+    if (@offsetOf(Object, "producer_open") != 48) @compileError("native BO Object.producer_open");
+    if (@offsetOf(Object, "descriptor") != 56) @compileError("native BO Object.descriptor");
+    if (@offsetOf(Object, "allocation_bytes") != 184) @compileError("native BO Object.allocation_bytes");
+    if (@offsetOf(Object, "has_backing") != 192) @compileError("native BO Object.has_backing");
+    if (@offsetOf(Object, "backing") != 200) @compileError("native BO Object.backing");
+    if (@offsetOf(Object, "references") != 256) @compileError("native BO Object.references");
+    if (@offsetOf(Object, "leases") != 260) @compileError("native BO Object.leases");
+    if (@offsetOf(Object, "scanout_leases") != 264) @compileError("native BO Object.scanout_leases");
+    if (@offsetOf(Object, "mapping_leases") != 268) @compileError("native BO Object.mapping_leases");
+    if (@offsetOf(Object, "release_attempt") != 272) @compileError("native BO Object.release_attempt");
+    if (@offsetOf(Object, "owned_cookie") != 280) @compileError("native BO Object.owned_cookie");
+    if (@offsetOf(Object, "owned_reference") != 288) @compileError("native BO Object.owned_reference");
+    if (@offsetOf(Object, "device_lost") != 304) @compileError("native BO Object.device_lost");
+    if (@offsetOf(Object, "device_quiesced") != 305) @compileError("native BO Object.device_quiesced");
+    if (@sizeOf(Reference) != 64 or @alignOf(Reference) != 8) @compileError("native BO Reference layout");
+    if (@offsetOf(Reference, "handle") != 0) @compileError("native BO Reference.handle");
+    if (@offsetOf(Reference, "buffer") != 16) @compileError("native BO Reference.buffer");
+    if (@offsetOf(Reference, "owner") != 32) @compileError("native BO Reference.owner");
+    if (@offsetOf(Reference, "read_only") != 56) @compileError("native BO Reference.read_only");
+    if (@offsetOf(Reference, "mapping_only") != 57) @compileError("native BO Reference.mapping_only");
+    if (@sizeOf(Lease) != 80 or @alignOf(Lease) != 8) @compileError("native BO Lease layout");
+    if (@offsetOf(Lease, "handle") != 0) @compileError("native BO Lease.handle");
+    if (@offsetOf(Lease, "buffer") != 16) @compileError("native BO Lease.buffer");
+    if (@offsetOf(Lease, "owner") != 32) @compileError("native BO Lease.owner");
+    if (@offsetOf(Lease, "access") != 56) @compileError("native BO Lease.access");
+    if (@offsetOf(Lease, "range") != 64) @compileError("native BO Lease.range");
+    if (@sizeOf(DeviceBudget) != 64 or @alignOf(DeviceBudget) != 8) @compileError("native BO DeviceBudget layout");
+    if (@offsetOf(DeviceBudget, "present") != 0) @compileError("native BO DeviceBudget.present");
+    if (@offsetOf(DeviceBudget, "driver") != 8) @compileError("native BO DeviceBudget.driver");
+    if (@offsetOf(DeviceBudget, "binding") != 32) @compileError("native BO DeviceBudget.binding");
+    if (@offsetOf(DeviceBudget, "bytes") != 48) @compileError("native BO DeviceBudget.bytes");
+    if (@offsetOf(DeviceBudget, "closing") != 56) @compileError("native BO DeviceBudget.closing");
+    if (@sizeOf(NativeView) != 104 or @alignOf(NativeView) != 8) @compileError("native BO RawView layout");
+    if (@offsetOf(NativeView, "objects") != 0) @compileError("native BO RawView.objects");
+    if (@offsetOf(NativeView, "objects_len") != 8) @compileError("native BO RawView.objects_len");
+    if (@offsetOf(NativeView, "references") != 16) @compileError("native BO RawView.references");
+    if (@offsetOf(NativeView, "references_len") != 24) @compileError("native BO RawView.references_len");
+    if (@offsetOf(NativeView, "leases") != 32) @compileError("native BO RawView.leases");
+    if (@offsetOf(NativeView, "leases_len") != 40) @compileError("native BO RawView.leases_len");
+    if (@offsetOf(NativeView, "serial") != 48) @compileError("native BO RawView.serial");
+    if (@offsetOf(NativeView, "committed_bytes") != 56) @compileError("native BO RawView.committed_bytes");
+    if (@offsetOf(NativeView, "budget_bytes") != 64) @compileError("native BO RawView.budget_bytes");
+    if (@offsetOf(NativeView, "producer_budget_bytes") != 72) @compileError("native BO RawView.producer_budget_bytes");
+    if (@offsetOf(NativeView, "device_budgets") != 80) @compileError("native BO RawView.device_budgets");
+    if (@offsetOf(NativeView, "device_budgets_len") != 88) @compileError("native BO RawView.device_budgets_len");
+    if (@offsetOf(NativeView, "dynamic_mask") != 96) @compileError("native BO RawView.dynamic_mask");
+    if (@sizeOf(NativeArgs) != 152 or @alignOf(NativeArgs) != 8) @compileError("native BO Args layout");
+    if (@offsetOf(NativeArgs, "owner") != 0) @compileError("native BO Args.owner");
+    if (@offsetOf(NativeArgs, "other") != 24) @compileError("native BO Args.other");
+    if (@offsetOf(NativeArgs, "handle") != 48) @compileError("native BO Args.handle");
+    if (@offsetOf(NativeArgs, "binding") != 64) @compileError("native BO Args.binding");
+    if (@offsetOf(NativeArgs, "offset") != 80) @compileError("native BO Args.offset");
+    if (@offsetOf(NativeArgs, "bytes") != 88) @compileError("native BO Args.bytes");
+    if (@offsetOf(NativeArgs, "value") != 96) @compileError("native BO Args.value");
+    if (@offsetOf(NativeArgs, "flag") != 104) @compileError("native BO Args.flag");
+    if (@offsetOf(NativeArgs, "access") != 108) @compileError("native BO Args.access");
+    if (@offsetOf(NativeArgs, "pool") != 112) @compileError("native BO Args.pool");
+    if (@offsetOf(NativeArgs, "input") != 120) @compileError("native BO Args.input");
+    if (@offsetOf(NativeArgs, "other_input") != 128) @compileError("native BO Args.other_input");
+    if (@offsetOf(NativeArgs, "buffer") != 136) @compileError("native BO Args.buffer");
+    if (@offsetOf(NativeArgs, "len") != 144) @compileError("native BO Args.len");
+}
+
 pub fn isCpu(access: Access) bool {
-    return access == .cpu_read or access == .cpu_write or persistentCpu(access);
+    return r4os_rust_gfx_access_predicate(@intFromEnum(access), 0);
 }
 fn isDevice(access: Access) bool {
-    return !isCpu(access);
+    return r4os_rust_gfx_access_predicate(@intFromEnum(access), 1);
 }
 fn persistentCpu(access: Access) bool {
-    return access == .cpu_persistent_read or access == .cpu_persistent_write;
+    return r4os_rust_gfx_access_predicate(@intFromEnum(access), 2);
 }
 fn execution(access: Access) bool {
-    return access == .device_read or access == .device_write or queued(access);
+    return r4os_rust_gfx_access_predicate(@intFromEnum(access), 3);
 }
 fn conflicts(first: Access, second: Access) bool {
-    if (first == .device_mapping or second == .device_mapping) return false;
-    // Address lifetime and explicit CPU/GPU synchronization are independent.
-    // Ordinary CPU maps and scanout remain exclusive against writers.
-    if ((persistentCpu(first) and execution(second)) or (persistentCpu(second) and execution(first))) return false;
-    if (queued(first) and queued(second)) return false;
-    return writes(first) or writes(second);
+    return r4os_rust_gfx_access_conflicts(@intFromEnum(first), @intFromEnum(second));
 }
 fn queued(access: Access) bool {
-    return access == .queue_read or access == .queue_write;
+    return r4os_rust_gfx_access_predicate(@intFromEnum(access), 4);
 }
 fn writes(access: Access) bool {
-    return access == .cpu_write or access == .cpu_persistent_write or access == .device_write or access == .queue_write;
+    return r4os_rust_gfx_access_predicate(@intFromEnum(access), 5);
+}
+
+comptime {
+    if (@sizeOf(Owner) != 24 or @alignOf(Owner) != 8 or @offsetOf(Owner, "kind") != 0 or @offsetOf(Owner, "id") != 8 or @offsetOf(Owner, "generation") != 16) @compileError("Native BO identity C layout");
+    if (@sizeOf(Handle) != 16 or @alignOf(Handle) != 8 or @offsetOf(Handle, "id") != 0 or @offsetOf(Handle, "generation") != 8 or @sizeOf(Access) != 4) @compileError("Native BO handle/access C layout");
 }
 
 test "producer exit preserves imported pixels and outstanding scanout until explicit release" {
@@ -1179,3 +1014,133 @@ fn persistentCpuLifetime() !void {
         try other.finishRelease(other.pendingRelease().?, true);
     }
 }
+
+/// Stateless view of the one native runtime owner. Only immutable admission
+/// limits are projected here; no second table, generation or resource is held.
+pub fn GlobalTable(comptime budget: u64, comptime producer_budget: u64) type {
+    return struct {
+        const Self = @This();
+        budget_bytes: u64 = budget,
+        producer_budget_bytes: u64 = producer_budget,
+        fn call(_: *const Self, comptime op: u32, args: NativeArgs, out: ?*anyopaque) Error!void {
+            return nativeResult(r4os_rust_gfx_global_bo_run(op, &args, out));
+        }
+        fn result(self: *const Self, comptime T: type, comptime op: u32, args: NativeArgs) Error!T {
+            var out: T = undefined;
+            try self.call(op, args, &out);
+            return out;
+        }
+        pub fn setDeviceBudget(self: *const Self, driver: Owner, binding: layout.Binding, bytes: u64) Error!void {
+            return self.call(2, .{ .owner = driver, .binding = binding, .bytes = bytes }, null);
+        }
+        pub fn deviceBudget(self: *const Self, driver: Owner, binding: layout.Binding) Error!BudgetSnapshot {
+            return self.result(BudgetSnapshot, 3, .{ .owner = driver, .binding = binding });
+        }
+        pub fn queryDeviceBudget(self: *const Self, adapter: u32, generation: u64) Error!BudgetSnapshot {
+            return self.result(BudgetSnapshot, 4, .{ .access = adapter, .value = generation });
+        }
+        pub fn sharedChargedBytes(self: *const Self) u64 {
+            return self.result(u64, 5, .{}) catch unreachable;
+        }
+        pub fn totalBudgetBytes(self: *const Self) u64 {
+            return self.result(u64, 6, .{}) catch unreachable;
+        }
+        pub fn begin(self: *const Self, producer: Owner, descriptor: layout.Descriptor) Error!Create {
+            return self.result(Create, 7, .{ .owner = producer, .input = &descriptor });
+        }
+        pub fn beginOwned(self: *const Self, driver: Owner, descriptor: layout.Descriptor, cookie: u64) Error!OwnedCreate {
+            return self.result(OwnedCreate, 8, .{ .owner = driver, .input = &descriptor, .value = cookie });
+        }
+        pub fn commitOwned(self: *const Self, ticket: OwnedCreate, driver: Owner) Error!void {
+            return self.call(9, .{ .owner = driver, .input = &ticket }, null);
+        }
+        pub fn abortOwned(self: *const Self, ticket: OwnedCreate, driver: Owner, quiesced: bool) Error!void {
+            return self.call(10, .{ .owner = driver, .input = &ticket, .flag = quiesced }, null);
+        }
+        pub fn publish(self: *const Self, ticket: Create, backing: Backing) Error!void {
+            const raw = NativeBacking.from(backing);
+            return self.call(11, .{ .input = &ticket, .other_input = &raw }, null);
+        }
+        pub fn abort(self: *const Self, ticket: Create) Error!void {
+            return self.call(12, .{ .input = &ticket }, null);
+        }
+        pub fn import(self: *const Self, buffer: Handle, consumer: Owner) Error!Handle {
+            return self.result(Handle, 13, .{ .handle = buffer, .owner = consumer });
+        }
+        pub fn importMode(self: *const Self, buffer: Handle, consumer: Owner, read_only: bool) Error!Handle {
+            return self.result(Handle, 14, .{ .handle = buffer, .owner = consumer, .flag = read_only });
+        }
+        pub fn describe(self: *const Self, reference: Handle, owner: Owner) Error!layout.Descriptor {
+            return self.result(layout.Descriptor, 15, .{ .handle = reference, .owner = owner });
+        }
+        pub fn share(self: *const Self, handle: Handle, consumer: Owner) Error!Handle {
+            return self.result(Handle, 16, .{ .handle = handle, .owner = consumer });
+        }
+        pub fn readOnly(self: *const Self, handle: Handle, owner: Owner) Error!bool {
+            return self.result(bool, 17, .{ .handle = handle, .owner = owner });
+        }
+        pub fn mappingOnly(self: *const Self, handle: Handle, owner: Owner) Error!bool {
+            return self.result(bool, 18, .{ .handle = handle, .owner = owner });
+        }
+        pub fn drop(self: *const Self, handle: Handle, owner: Owner) Error!void {
+            return self.call(19, .{ .handle = handle, .owner = owner }, null);
+        }
+        pub fn use(self: *const Self, reference: Handle, owner: Owner, access: Access, offset: u64, bytes: u64) Error!Use {
+            return (try self.result(NativeUse, 20, .{ .handle = reference, .owner = owner, .access = @intFromEnum(access), .offset = offset, .bytes = bytes })).value();
+        }
+        pub fn reserveQueued(self: *const Self, reference: Handle, producer: Owner, queue_owner: Owner, write: bool, offset: u64, bytes: u64) Error!Use {
+            return (try self.result(NativeUse, 21, .{ .handle = reference, .owner = producer, .other = queue_owner, .flag = write, .offset = offset, .bytes = bytes })).value();
+        }
+        pub fn retainQueued(self: *const Self, handle: Handle, queue_owner: Owner, driver: Owner) Error!Handle {
+            return self.result(Handle, 22, .{ .handle = handle, .owner = queue_owner, .other = driver });
+        }
+        pub fn retainScanout(self: *const Self, handle: Handle, queue_owner: Owner, driver: Owner) Error!Handle {
+            return self.result(Handle, 23, .{ .handle = handle, .owner = queue_owner, .other = driver });
+        }
+        pub fn endUse(self: *const Self, handle: Handle, owner: Owner, device_quiesced: bool) Error!void {
+            return self.call(24, .{ .handle = handle, .owner = owner, .flag = device_quiesced }, null);
+        }
+        pub fn useInfo(self: *const Self, handle: Handle, owner: Owner) Error!Use {
+            return (try self.result(NativeUse, 25, .{ .handle = handle, .owner = owner })).value();
+        }
+        pub fn bufferFor(self: *const Self, handle: Handle, owner: Owner) Error!Handle {
+            return self.result(Handle, 26, .{ .handle = handle, .owner = owner });
+        }
+        pub fn loseDevice(self: *const Self, driver: Owner, binding: layout.Binding, quiesced: bool) Error!void {
+            return self.call(27, .{ .owner = driver, .binding = binding, .flag = quiesced }, null);
+        }
+        pub fn stoppedOwner(self: *const Self, owner: Owner) void {
+            self.call(28, .{ .owner = owner }, null) catch unreachable;
+        }
+        pub fn pendingReleaseForOwner(self: *const Self, producer: Owner) bool {
+            return self.result(bool, 29, .{ .owner = producer }) catch unreachable;
+        }
+        pub fn pendingRelease(self: *const Self) ?Release {
+            const raw = self.result(NativeOptionalRelease, 30, .{}) catch unreachable;
+            return if (raw.present) raw.value.value() else null;
+        }
+        pub fn pendingSystemRelease(self: *const Self) ?Release {
+            const raw = self.result(NativeOptionalRelease, 31, .{}) catch unreachable;
+            return if (raw.present) raw.value.value() else null;
+        }
+        pub fn takeOwnedRelease(self: *const Self, driver: Owner, binding: layout.Binding) Error!?OwnedRelease {
+            const raw = try self.result(NativeOptionalOwnedRelease, 32, .{ .owner = driver, .binding = binding });
+            return if (raw.present) raw.value.value() else null;
+        }
+        pub fn finishOwnedRelease(self: *const Self, ticket: OwnedRelease, driver: Owner, quiesced: bool) Error!void {
+            const raw = NativeOwnedRelease.from(ticket);
+            return self.call(33, .{ .input = &raw, .owner = driver, .flag = quiesced }, null);
+        }
+        pub fn finishRelease(self: *const Self, ticket: Release, released: bool) Error!void {
+            const raw = NativeRelease.from(ticket);
+            return self.call(34, .{ .input = &raw, .flag = released }, null);
+        }
+        pub fn retainsDriver(self: *const Self, owner: Owner) bool {
+            return self.result(bool, 35, .{ .owner = owner }) catch unreachable;
+        }
+        pub fn stats(self: *const Self) Stats {
+            return self.result(Stats, 36, .{}) catch unreachable;
+        }
+    };
+}
+extern fn r4os_rust_gfx_global_bo_run(u32, *const NativeArgs, ?*anyopaque) i32;

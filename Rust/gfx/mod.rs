@@ -1,0 +1,19 @@
+//! Native generic graphics resources; hardware policy remains with R4Ds.
+pub mod allocation_api;
+pub mod allocation_state;
+pub mod allocations;
+pub mod budget_api;
+pub mod buffer_api;
+pub mod buffer_owner;
+pub mod buffers;
+pub mod driver_memory;
+pub mod driver_memory_state;
+pub mod layout;
+pub mod owned_buffers;
+pub mod stats_wire;
+pub mod telemetry;
+pub mod telemetry_api;
+pub mod types;
+pub mod virtual_api;
+pub mod virtual_runtime;
+pub mod virtual_state;

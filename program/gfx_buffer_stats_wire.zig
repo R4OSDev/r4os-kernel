@@ -1,15 +1,14 @@
 //! Released statistics prefixes; no allocation, budget or residency policy.
-const std = @import("std");
 const a = @import("r4os_kernel_contract");
+extern fn r4os_rust_gfx_stats_capacity(*const a.GfxBufferStats) u32;
+extern fn r4os_rust_gfx_stats_write(*a.GfxBufferStats, u32, *const a.GfxBufferStats) void;
 pub fn capacity(pointer: *const a.GfxBufferStats) ?u32 {
-    if (@intFromPtr(pointer) == 0 or @intFromPtr(pointer) % @alignOf(a.GfxBufferStats) != 0 or
-        pointer.version != 1 or pointer.size < 56) return null;
-    comptime std.debug.assert(@sizeOf(a.GfxBufferStats) == 136 and @offsetOf(a.GfxBufferStats, "system_bytes") == 56);
-    return if (pointer.size >= 136) 136 else 56;
+    const count = r4os_rust_gfx_stats_capacity(pointer);
+    return if (count == 0) null else count;
 }
 pub fn write(pointer: *a.GfxBufferStats, count: u32, value: a.GfxBufferStats) void {
-    std.debug.assert(count == 56 or count == 136);
-    var snapshot = value;
-    snapshot.size = count;
-    @memcpy(@as([*]u8, @ptrCast(pointer))[0..count], std.mem.asBytes(&snapshot)[0..count]);
+    r4os_rust_gfx_stats_write(pointer, count, &value);
+}
+comptime {
+    if (@sizeOf(a.GfxBufferStats) != 136 or @alignOf(a.GfxBufferStats) != 8 or @offsetOf(a.GfxBufferStats, "system_bytes") != 56) @compileError("Native graphics statistics prefix layout");
 }
