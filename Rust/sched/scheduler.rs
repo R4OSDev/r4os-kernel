@@ -1152,7 +1152,7 @@ fn irq_leave(guard: ExternalIrqFpuGuard) {
     }
     fpu::restore_initial();
 }
-unsafe fn sleep(ticks: u64, reason: *const u8, len: usize) {
+pub(crate) unsafe fn sleep(ticks: u64, reason: *const u8, len: usize) {
     if ticks == 0 {
         yield_task();
         return;

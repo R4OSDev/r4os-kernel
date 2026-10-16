@@ -1,4 +1,6 @@
-const bootlog = @import("../../kernel/bootlog.zig");
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
 const builtin = @import("builtin");
 
 pub const MAX_CONTROLLERS: usize = 4;
@@ -14,13 +16,13 @@ pub const FLAG_POLL_FALLBACK: u32 = 1 << 5;
 pub const FLAG_MULTI_TRANSFER: u32 = 1 << 6;
 pub const FLAG_HOTPLUG: u32 = 1 << 7;
 
-pub const Source = enum {
+pub const Source = enum(u8) {
     builtin,
     preload,
     disk,
 };
 
-pub const State = enum {
+pub const State = enum(u8) {
     registered,
     active,
     failed,
@@ -93,7 +95,7 @@ pub const Descriptor = extern struct {
     status: ?*const fn (?*anyopaque, *Status) callconv(.c) i32 = null,
 };
 
-pub const Controller = struct {
+pub const Controller = extern struct {
     used: bool = false,
     name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
     name_len: usize = 0,
@@ -106,315 +108,10 @@ pub const Controller = struct {
     polls: u64 = 0,
 };
 
-pub const CleanupResult = struct {
+pub const CleanupResult = extern struct {
     removed: u32 = 0,
     failed: bool = false,
 };
-
-var controllers: [MAX_CONTROLLERS]Controller = .{Controller{}} ** MAX_CONTROLLERS;
-
-pub fn reset() void {
-    controllers = .{Controller{}} ** MAX_CONTROLLERS;
-}
-
-pub fn registerBuiltIn(name: []const u8, descriptor: *const Descriptor) ?usize {
-    if (findByName(name) != null) return null;
-    const index = freeSlot() orelse return null;
-    const slot = &controllers[index];
-    slot.* = .{
-        .used = true,
-        .source = .builtin,
-        .state = .active,
-        .descriptor = descriptor,
-    };
-    copyName(name, slot);
-    if (!builtin.is_test) {
-        bootlog.puts("[USBHC] register built-in ");
-        bootlog.puts(slot.name[0..slot.name_len]);
-        bootlog.puts("\r\n");
-    }
-    return index;
-}
-
-pub fn register(name: []const u8, descriptor: *const Descriptor, owner_id: u32) ?usize {
-    if (findByName(name) != null) return null;
-    const index = freeSlot() orelse return null;
-    const slot = &controllers[index];
-    slot.* = .{
-        .used = true,
-        .source = sourceFromRaw(descriptor.source),
-        .owner_id = owner_id,
-        .state = .registered,
-        .descriptor = descriptor,
-    };
-    copyName(name, slot);
-    if (!builtin.is_test) {
-        bootlog.puts("[USBHC] register backend ");
-        bootlog.puts(slot.name[0..slot.name_len]);
-        bootlog.puts(" source=");
-        bootlog.puts(sourceLabel(slot.source));
-        bootlog.puts("\r\n");
-    }
-    return index;
-}
-
-pub fn setState(index: usize, state: State) bool {
-    if (index >= controllers.len or !controllers[index].used) return false;
-    controllers[index].state = state;
-    return true;
-}
-
-pub fn controllerId(index: usize) u32 {
-    return @intCast(index + 1);
-}
-
-pub fn indexFromControllerId(id: u32) ?usize {
-    if (id == 0 or id > controllers.len) return null;
-    const index: usize = @intCast(id - 1);
-    if (!controllers[index].used) return null;
-    return index;
-}
-
-pub fn unregister(index: usize) bool {
-    if (index >= controllers.len or !controllers[index].used) return false;
-    if (controllers[index].descriptor) |descriptor| {
-        if (descriptor.shutdown) |shutdown| {
-            if (shutdown(descriptor.context) < 0) {
-                controllers[index].state = .failed;
-                controllers[index].failures +%= 1;
-                return false;
-            }
-        }
-    }
-    controllers[index] = .{};
-    return true;
-}
-
-pub fn unregisterByName(name: []const u8, owner_id: u32) bool {
-    const index = findByName(name) orelse return false;
-    if (controllers[index].owner_id != owner_id) return false;
-    return unregister(index);
-}
-
-pub fn cleanupOwner(owner_id: u32) CleanupResult {
-    if (owner_id == 0) return .{};
-    var result: CleanupResult = .{};
-    var index: usize = 0;
-    while (index < controllers.len) : (index += 1) {
-        if (!controllers[index].used or controllers[index].owner_id != owner_id) continue;
-        if (unregister(index)) {
-            result.removed += 1;
-        } else {
-            result.failed = true;
-        }
-    }
-    return result;
-}
-
-pub fn count() usize {
-    var n: usize = 0;
-    for (controllers) |controller| {
-        if (controller.used) n += 1;
-    }
-    return n;
-}
-
-pub fn at(index: usize) ?*const Controller {
-    if (index >= controllers.len or !controllers[index].used) return null;
-    return &controllers[index];
-}
-
-pub fn statusAt(index: usize, out: *Status) i32 {
-    const slot = mutableAt(index) orelse return -1;
-    out.* = .{
-        .state = stateRaw(slot.state),
-        .source = sourceRaw(slot.source),
-        .transfers = slot.transfers,
-        .failures = slot.failures,
-        .polls = slot.polls,
-    };
-    const descriptor = slot.descriptor orelse return 0;
-    if (descriptor.status) |callback| {
-        const result = callback(descriptor.context, out);
-        if (result < 0) {
-            slot.failures +%= 1;
-            return result;
-        }
-    }
-    out.state = stateRaw(slot.state);
-    out.source = sourceRaw(slot.source);
-    out.flags |= descriptor.flags;
-    if (out.transfers < slot.transfers) out.transfers = slot.transfers;
-    if (out.failures < slot.failures) out.failures = slot.failures;
-    if (out.polls < slot.polls) out.polls = slot.polls;
-    return 0;
-}
-
-pub fn scan(index: usize) i32 {
-    const slot = mutableAt(index) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.port_scan orelse return fail(slot, -3);
-    const result = callback(descriptor.context);
-    return account(slot, result, false);
-}
-
-pub fn addressDevice(index: usize, port: u8, out: *DeviceHandle) i32 {
-    const slot = mutableAt(index) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.address_device orelse return fail(slot, -3);
-    const result = callback(descriptor.context, port, out);
-    if (result >= 0) out.controller_id = controllerId(index);
-    return account(slot, result, false);
-}
-
-pub fn configureDevice(device: *const DeviceHandle, configuration: u8) i32 {
-    const slot = controllerForDevice(device) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.configure_device orelse return fail(slot, -3);
-    return account(slot, callback(descriptor.context, device, configuration), false);
-}
-
-pub fn controlTransfer(device: *const DeviceHandle, request: *const ControlRequest, buffer: []u8) i32 {
-    const slot = controllerForDevice(device) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.control_transfer orelse return fail(slot, -3);
-    return account(slot, callback(descriptor.context, device, request, buffer.ptr, @intCast(buffer.len)), true);
-}
-
-pub fn bulkTransfer(endpoint: *const EndpointHandle, buffer: []u8, direction: u32) i32 {
-    const slot = controllerForDevice(&endpoint.device) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.bulk_transfer orelse return fail(slot, -3);
-    return account(slot, callback(descriptor.context, endpoint, buffer.ptr, @intCast(buffer.len), direction), true);
-}
-
-pub fn interruptTransfer(endpoint: *const EndpointHandle, buffer: []u8, actual: *u32) i32 {
-    const slot = controllerForDevice(&endpoint.device) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.interrupt_transfer orelse return fail(slot, -3);
-    return account(slot, callback(descriptor.context, endpoint, buffer.ptr, @intCast(buffer.len), actual), true);
-}
-
-pub fn resetPort(index: usize, port: u8) i32 {
-    const slot = mutableAt(index) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.reset_port orelse return fail(slot, -3);
-    return account(slot, callback(descriptor.context, port), false);
-}
-
-pub fn clearHalt(endpoint: *const EndpointHandle) i32 {
-    const slot = controllerForDevice(&endpoint.device) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.clear_halt orelse return fail(slot, -3);
-    return account(slot, callback(descriptor.context, endpoint), false);
-}
-
-pub fn resetEndpoint(endpoint: *const EndpointHandle) i32 {
-    const slot = controllerForDevice(&endpoint.device) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.reset_endpoint orelse return fail(slot, -3);
-    return account(slot, callback(descriptor.context, endpoint), false);
-}
-
-pub fn poll(index: usize) i32 {
-    const slot = mutableAt(index) orelse return -1;
-    const descriptor = slot.descriptor orelse return fail(slot, -2);
-    const callback = descriptor.poll orelse return fail(slot, -3);
-    slot.polls +%= 1;
-    return account(slot, callback(descriptor.context), false);
-}
-
-pub fn findByName(name: []const u8) ?usize {
-    var index: usize = 0;
-    while (index < controllers.len) : (index += 1) {
-        const controller = &controllers[index];
-        if (!controller.used) continue;
-        if (eqIgnoreCase(controller.name[0..controller.name_len], name)) return index;
-    }
-    return null;
-}
-
-pub fn sourceLabel(source: Source) []const u8 {
-    return switch (source) {
-        .builtin => "built-in",
-        .preload => "preload",
-        .disk => "disk",
-    };
-}
-
-fn freeSlot() ?usize {
-    var index: usize = 0;
-    while (index < controllers.len) : (index += 1) {
-        if (!controllers[index].used) return index;
-    }
-    return null;
-}
-
-fn mutableAt(index: usize) ?*Controller {
-    if (index >= controllers.len or !controllers[index].used) return null;
-    return &controllers[index];
-}
-
-fn controllerForDevice(device: *const DeviceHandle) ?*Controller {
-    const index = indexFromControllerId(device.controller_id) orelse return null;
-    return mutableAt(index);
-}
-
-fn account(slot: *Controller, result: i32, transfer: bool) i32 {
-    if (transfer) slot.transfers +%= 1;
-    if (result < 0) slot.failures +%= 1;
-    return result;
-}
-
-fn fail(slot: *Controller, result: i32) i32 {
-    slot.failures +%= 1;
-    return result;
-}
-
-fn stateRaw(state: State) u32 {
-    return switch (state) {
-        .registered => 0,
-        .active => 1,
-        .failed => 2,
-    };
-}
-
-fn sourceRaw(source: Source) u32 {
-    return switch (source) {
-        .builtin => 0,
-        .preload => 1,
-        .disk => 2,
-    };
-}
-
-fn sourceFromRaw(source: u32) Source {
-    return switch (source) {
-        1 => .preload,
-        2 => .disk,
-        else => .builtin,
-    };
-}
-
-fn copyName(name: []const u8, slot: *Controller) void {
-    const n = if (name.len < slot.name.len) name.len else slot.name.len - 1;
-    if (n > 0) @memcpy(slot.name[0..n], name[0..n]);
-    slot.name[n] = 0;
-    slot.name_len = n;
-}
-
-fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (upper(a[i]) != upper(b[i])) return false;
-    }
-    return true;
-}
-
-fn upper(ch: u8) u8 {
-    if (ch >= 'a' and ch <= 'z') return ch - ('a' - 'A');
-    return ch;
-}
 
 var test_shutdown_ok = true;
 var test_shutdowns: u32 = 0;
@@ -550,4 +247,222 @@ test "failed host shutdown vetoes unregister and owner cleanup" {
     try testing.expect(!cleanup.failed);
     try testing.expectEqual(@as(u32, 1), cleanup.removed);
     try testing.expectEqual(@as(usize, 0), count());
+}
+
+comptime {
+    if (@sizeOf(Status) != 80 or
+        @alignOf(Status) != 8 or
+        @offsetOf(Status, "state") != 0 or
+        @offsetOf(Status, "source") != 4 or
+        @offsetOf(Status, "ports") != 8 or
+        @offsetOf(Status, "devices") != 12 or
+        @offsetOf(Status, "transfers") != 16 or
+        @offsetOf(Status, "failures") != 24 or
+        @offsetOf(Status, "flags") != 32 or
+        @offsetOf(Status, "queue_depth") != 36 or
+        @offsetOf(Status, "reserved0") != 38 or
+        @offsetOf(Status, "max_transfer_bytes") != 40 or
+        @offsetOf(Status, "active_transfers") != 44 or
+        @offsetOf(Status, "completions") != 48 or
+        @offsetOf(Status, "interrupts") != 56 or
+        @offsetOf(Status, "polls") != 64 or
+        @offsetOf(Status, "cancellations") != 72) @compileError("USB Status private C layout");
+}
+
+comptime {
+    if (@sizeOf(DeviceHandle) != 12 or
+        @alignOf(DeviceHandle) != 4 or
+        @offsetOf(DeviceHandle, "controller_id") != 0 or
+        @offsetOf(DeviceHandle, "port") != 4 or
+        @offsetOf(DeviceHandle, "slot_id") != 5 or
+        @offsetOf(DeviceHandle, "speed") != 6 or
+        @offsetOf(DeviceHandle, "config_value") != 7 or
+        @offsetOf(DeviceHandle, "vendor_id") != 8 or
+        @offsetOf(DeviceHandle, "product_id") != 10) @compileError("USB DeviceHandle private C layout");
+}
+
+comptime {
+    if (@sizeOf(EndpointHandle) != 24 or
+        @alignOf(EndpointHandle) != 4 or
+        @offsetOf(EndpointHandle, "device") != 0 or
+        @offsetOf(EndpointHandle, "kind") != 12 or
+        @offsetOf(EndpointHandle, "address") != 16 or
+        @offsetOf(EndpointHandle, "endpoint_id") != 17 or
+        @offsetOf(EndpointHandle, "max_packet") != 18 or
+        @offsetOf(EndpointHandle, "interval") != 20 or
+        @offsetOf(EndpointHandle, "max_burst") != 21) @compileError("USB EndpointHandle private C layout");
+}
+
+comptime {
+    if (@sizeOf(ControlRequest) != 12 or
+        @alignOf(ControlRequest) != 4 or
+        @offsetOf(ControlRequest, "request_type") != 0 or
+        @offsetOf(ControlRequest, "request") != 1 or
+        @offsetOf(ControlRequest, "value") != 2 or
+        @offsetOf(ControlRequest, "index_value") != 4 or
+        @offsetOf(ControlRequest, "length") != 6 or
+        @offsetOf(ControlRequest, "direction") != 8) @compileError("USB ControlRequest private C layout");
+}
+
+comptime {
+    if (@sizeOf(Descriptor) != 120 or
+        @alignOf(Descriptor) != 8 or
+        @offsetOf(Descriptor, "version") != 0 or
+        @offsetOf(Descriptor, "size") != 4 or
+        @offsetOf(Descriptor, "flags") != 8 or
+        @offsetOf(Descriptor, "source") != 12 or
+        @offsetOf(Descriptor, "context") != 16 or
+        @offsetOf(Descriptor, "port_scan") != 24 or
+        @offsetOf(Descriptor, "address_device") != 32 or
+        @offsetOf(Descriptor, "configure_device") != 40 or
+        @offsetOf(Descriptor, "control_transfer") != 48 or
+        @offsetOf(Descriptor, "bulk_transfer") != 56 or
+        @offsetOf(Descriptor, "interrupt_transfer") != 64 or
+        @offsetOf(Descriptor, "reset_port") != 72 or
+        @offsetOf(Descriptor, "clear_halt") != 80 or
+        @offsetOf(Descriptor, "reset_endpoint") != 88 or
+        @offsetOf(Descriptor, "poll") != 96 or
+        @offsetOf(Descriptor, "shutdown") != 104 or
+        @offsetOf(Descriptor, "status") != 112) @compileError("USB Descriptor private C layout");
+}
+
+comptime {
+    if (@sizeOf(Controller) != 96 or
+        @alignOf(Controller) != 8 or
+        @offsetOf(Controller, "used") != 0 or
+        @offsetOf(Controller, "name") != 1 or
+        @offsetOf(Controller, "name_len") != 40 or
+        @offsetOf(Controller, "source") != 48 or
+        @offsetOf(Controller, "owner_id") != 52 or
+        @offsetOf(Controller, "state") != 56 or
+        @offsetOf(Controller, "descriptor") != 64 or
+        @offsetOf(Controller, "transfers") != 72 or
+        @offsetOf(Controller, "failures") != 80 or
+        @offsetOf(Controller, "polls") != 88) @compileError("USB Controller private C layout");
+}
+
+comptime {
+    if (@sizeOf(CleanupResult) != 8 or
+        @alignOf(CleanupResult) != 4 or
+        @offsetOf(CleanupResult, "removed") != 0 or
+        @offsetOf(CleanupResult, "failed") != 4) @compileError("USB CleanupResult private C layout");
+}
+
+extern fn r4os_rust_usb_host_reset() void;
+extern fn r4os_rust_usb_host_register([*]const u8, usize, *const Descriptor, u32, bool, ?*const fn ([*]const u8, usize) callconv(.c) void) usize;
+extern fn r4os_rust_usb_host_set_state(usize, u8) bool;
+extern fn r4os_rust_usb_host_id(usize) u32;
+extern fn r4os_rust_usb_host_index(u32) usize;
+extern fn r4os_rust_usb_host_unregister(usize) bool;
+extern fn r4os_rust_usb_host_unregister_name([*]const u8, usize, u32) bool;
+extern fn r4os_rust_usb_host_cleanup(u32, *CleanupResult) void;
+extern fn r4os_rust_usb_host_count() usize;
+extern fn r4os_rust_usb_host_at(usize, *Controller) bool;
+extern fn r4os_rust_usb_host_find([*]const u8, usize) usize;
+extern fn r4os_rust_usb_host_status(usize, *Status) i32;
+extern fn r4os_rust_usb_host_scan(usize) i32;
+extern fn r4os_rust_usb_host_poll(usize) i32;
+extern fn r4os_rust_usb_host_address(usize, u8, *DeviceHandle) i32;
+extern fn r4os_rust_usb_host_configure(*const DeviceHandle, u8) i32;
+extern fn r4os_rust_usb_host_control(*const DeviceHandle, *const ControlRequest, [*]u8, usize) i32;
+extern fn r4os_rust_usb_host_bulk(*const EndpointHandle, [*]u8, usize, u32) i32;
+extern fn r4os_rust_usb_host_interrupt(*const EndpointHandle, [*]u8, usize, *u32) i32;
+extern fn r4os_rust_usb_host_reset_port(usize, u8) i32;
+extern fn r4os_rust_usb_host_clear_halt(*const EndpointHandle) i32;
+extern fn r4os_rust_usb_host_reset_endpoint(*const EndpointHandle) i32;
+fn optionalIndex(index: usize) ?usize {
+    return if (index == @import("std").math.maxInt(usize)) null else index;
+}
+pub fn reset() void {
+    r4os_rust_usb_host_reset();
+}
+pub fn registerBuiltIn(name: []const u8, descriptor: *const Descriptor) ?usize {
+    return optionalIndex(r4os_rust_usb_host_register(name.ptr, name.len, descriptor, 0, true, if (builtin.is_test) null else logRegistration));
+}
+pub fn register(name: []const u8, descriptor: *const Descriptor, owner_id: u32) ?usize {
+    return optionalIndex(r4os_rust_usb_host_register(name.ptr, name.len, descriptor, owner_id, false, if (builtin.is_test) null else logRegistration));
+}
+pub fn setState(index: usize, state: State) bool {
+    return r4os_rust_usb_host_set_state(index, @intFromEnum(state));
+}
+pub fn controllerId(index: usize) u32 {
+    return r4os_rust_usb_host_id(index);
+}
+pub fn indexFromControllerId(id: u32) ?usize {
+    return optionalIndex(r4os_rust_usb_host_index(id));
+}
+pub fn unregister(index: usize) bool {
+    return r4os_rust_usb_host_unregister(index);
+}
+pub fn unregisterByName(name: []const u8, owner_id: u32) bool {
+    return r4os_rust_usb_host_unregister_name(name.ptr, name.len, owner_id);
+}
+pub fn cleanupOwner(owner_id: u32) CleanupResult {
+    var out: CleanupResult = undefined;
+    r4os_rust_usb_host_cleanup(owner_id, &out);
+    return out;
+}
+pub fn count() usize {
+    return r4os_rust_usb_host_count();
+}
+pub fn at(index: usize) ?Controller {
+    var out: Controller = undefined;
+    return if (r4os_rust_usb_host_at(index, &out)) out else null;
+}
+pub fn statusAt(index: usize, out: *Status) i32 {
+    return r4os_rust_usb_host_status(index, out);
+}
+pub fn scan(index: usize) i32 {
+    return r4os_rust_usb_host_scan(index);
+}
+pub fn addressDevice(index: usize, port: u8, out: *DeviceHandle) i32 {
+    return r4os_rust_usb_host_address(index, port, out);
+}
+pub fn configureDevice(device: *const DeviceHandle, configuration: u8) i32 {
+    return r4os_rust_usb_host_configure(device, configuration);
+}
+pub fn controlTransfer(device: *const DeviceHandle, request: *const ControlRequest, buffer: []u8) i32 {
+    return r4os_rust_usb_host_control(device, request, buffer.ptr, buffer.len);
+}
+pub fn bulkTransfer(endpoint: *const EndpointHandle, buffer: []u8, direction: u32) i32 {
+    return r4os_rust_usb_host_bulk(endpoint, buffer.ptr, buffer.len, direction);
+}
+pub fn interruptTransfer(endpoint: *const EndpointHandle, buffer: []u8, actual: *u32) i32 {
+    return r4os_rust_usb_host_interrupt(endpoint, buffer.ptr, buffer.len, actual);
+}
+pub fn resetPort(index: usize, port: u8) i32 {
+    return r4os_rust_usb_host_reset_port(index, port);
+}
+pub fn clearHalt(endpoint: *const EndpointHandle) i32 {
+    return r4os_rust_usb_host_clear_halt(endpoint);
+}
+pub fn resetEndpoint(endpoint: *const EndpointHandle) i32 {
+    return r4os_rust_usb_host_reset_endpoint(endpoint);
+}
+pub fn poll(index: usize) i32 {
+    return r4os_rust_usb_host_poll(index);
+}
+pub fn findByName(name: []const u8) ?usize {
+    return optionalIndex(r4os_rust_usb_host_find(name.ptr, name.len));
+}
+pub fn sourceLabel(source: Source) []const u8 {
+    return switch (source) {
+        .builtin => "built-in",
+        .preload => "preload",
+        .disk => "disk",
+    };
+}
+
+fn logRegistration(text: [*]const u8, len: usize) callconv(.c) void {
+    @import("../../kernel/bootlog.zig").puts(text[0..len]);
+}
+
+// Private metadata admission only. Fixtures run the exact bounded algorithms
+// in one host thread; they neither execute privileged guards nor simulate IRQs.
+export fn r4os_zig_usb_host_metadata_enter() callconv(.c) u64 {
+    if (builtin.is_test) return 0;
+    return @import("../../arch/x86_64/interrupts.zig").saveAndDisableRuntime();
+}
+export fn r4os_zig_usb_host_metadata_leave(flags: u64) callconv(.c) void {
+    if (!builtin.is_test) @import("../../arch/x86_64/interrupts.zig").restore(flags);
 }

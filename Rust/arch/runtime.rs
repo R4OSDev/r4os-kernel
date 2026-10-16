@@ -44,10 +44,10 @@ fn flags() -> u64 {
     unsafe { core::arch::asm!("pushfq", "pop {}", out(reg) value, options(preserves_flags)) };
     value
 }
-fn cli() {
+pub(crate) fn cli() {
     unsafe { core::arch::asm!("cli", options(nostack)) };
 }
-fn sti() {
+pub(crate) fn sti() {
     unsafe { core::arch::asm!("sti", options(nostack)) };
 }
 fn hlt() {
@@ -64,14 +64,14 @@ fn tsc() -> u64 {
 pub fn enabled() -> bool {
     ENABLED.load(Ordering::Acquire)
 }
-fn restore_local(saved: u64) {
+pub(crate) fn restore_local(saved: u64) {
     if saved & IF != 0 {
         sti();
     } else {
         cli();
     }
 }
-fn save_local() -> u64 {
+pub(crate) fn save_local() -> u64 {
     let saved = flags();
     cli();
     saved

@@ -1,3 +1,54 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+// Native USB event owner. This file only projects private fixed C records.
+extern fn r4os_rust_usb_event_data(*const Event) bool;
+extern fn r4os_rust_usb_event_pointer(*const Event, *u64) bool;
+extern fn r4os_rust_usb_event_port(*const Event) u16;
+extern fn r4os_rust_usb_port_action(bool, bool, bool) u8;
+extern fn r4os_rust_usb_ports_reset(*PortChanges) void;
+extern fn r4os_rust_usb_ports_route(*PortChanges, *const Event, u8) bool;
+extern fn r4os_rust_usb_ports_take(*PortChanges) u8;
+extern fn r4os_rust_usb_ports_retry(*PortChanges, u8) void;
+extern fn r4os_rust_usb_ports_snapshot(*const PortChanges, *PortChangeSnapshot) void;
+extern fn r4os_rust_usb_match_transfer(u8, u8, u64, *NativeMatch) void;
+extern fn r4os_rust_usb_match_td(u8, u8, *const [32]u64, u8, *NativeMatch) void;
+extern fn r4os_rust_usb_match_command(u64, *NativeMatch) void;
+extern fn r4os_rust_usb_event_matches(*const Event, *const NativeMatch) bool;
+extern fn r4os_rust_usb_normalize_pointer(u64) u64;
+extern fn r4os_rust_usb_mailbox_reset(*Mailbox) void;
+extern fn r4os_rust_usb_mailbox_enqueue(*Mailbox, *const Event) bool;
+extern fn r4os_rust_usb_mailbox_take(*Mailbox, *const NativeMatch, *Event) bool;
+extern fn r4os_rust_usb_mailbox_purge(*Mailbox, *const NativeMatch) usize;
+extern fn r4os_rust_usb_mailbox_purge_slot(*Mailbox, u8) usize;
+extern fn r4os_rust_usb_mailbox_clear(*Mailbox) usize;
+extern fn r4os_rust_usb_mailbox_count(*const Mailbox) usize;
+extern fn r4os_rust_usb_mailbox_snapshot(*const Mailbox, *Snapshot) void;
+extern fn r4os_rust_usb_router_self_test() bool;
+pub const NativeMatch = extern struct {
+    tag: u8 = 0,
+    slot_id: u8 = 0,
+    endpoint_id: u8 = 0,
+    trb_count: u8 = 1,
+    trb_phys: [32]u64 = .{0} ** 32,
+};
+pub fn toNative(value: Match) NativeMatch {
+    return switch (value) {
+        .transfer => |t| .{ .slot_id = t.slot_id, .endpoint_id = t.endpoint_id, .trb_count = t.trb_count, .trb_phys = t.trb_phys },
+        .command => |c| blk: {
+            var out: NativeMatch = .{ .tag = 1, .trb_count = 0 };
+            out.trb_phys[0] = c.trb_phys;
+            break :blk out;
+        },
+    };
+}
+pub fn fromNative(value: NativeMatch) Match {
+    return switch (value.tag) {
+        0 => .{ .transfer = .{ .slot_id = value.slot_id, .endpoint_id = value.endpoint_id, .trb_count = value.trb_count, .trb_phys = value.trb_phys } },
+        1 => .{ .command = .{ .trb_phys = value.trb_phys[0] } },
+        else => unreachable,
+    };
+}
 pub const CAPACITY: usize = 256;
 
 pub const TRANSFER_EVENT_TYPE: u8 = 32;
@@ -11,7 +62,7 @@ pub const MAX_TRANSFER_TRB_POINTERS: usize = 32;
 
 const TRB_POINTER_MASK: u64 = ~@as(u64, 0x0f);
 
-pub const Event = struct {
+pub const Event = extern struct {
     event_type: u8 = 0,
     code: u8 = 0,
     slot_id: u8 = 0,
@@ -21,22 +72,21 @@ pub const Event = struct {
     control: u32 = 0,
 
     pub fn hasEventData(self: Event) bool {
-        return self.event_type == TRANSFER_EVENT_TYPE and (self.control & EVENT_DATA_BIT) != 0;
+        return r4os_rust_usb_event_data(&self);
     }
 
     pub fn trbPointer(self: Event) ?u64 {
-        if (self.hasEventData()) return null;
-        if (self.event_type != TRANSFER_EVENT_TYPE and self.event_type != COMMAND_COMPLETION_EVENT_TYPE) return null;
-        return normalizeTrbPointer(self.parameter);
+        var out: u64 = undefined;
+        return if (r4os_rust_usb_event_pointer(&self, &out)) out else null;
     }
 
     pub fn portId(self: Event) ?u8 {
-        if (self.event_type != PORT_STATUS_CHANGE_EVENT_TYPE) return null;
-        return @truncate(self.parameter >> 24);
+        const value = r4os_rust_usb_event_port(&self);
+        return if (value == 256) null else @intCast(value);
     }
 };
 
-pub const PortAction = enum {
+pub const PortAction = enum(u8) {
     acknowledge,
     remove,
     enumerate,
@@ -44,13 +94,10 @@ pub const PortAction = enum {
 };
 
 pub fn decidePortAction(has_runtime: bool, connected: bool, connection_changed: bool) PortAction {
-    if (connection_changed and has_runtime) return if (connected) .replace else .remove;
-    if (!connected) return if (has_runtime) .remove else .acknowledge;
-    if (!has_runtime) return .enumerate;
-    return .acknowledge;
+    return @enumFromInt(r4os_rust_usb_port_action(has_runtime, connected, connection_changed));
 }
 
-pub const PortChangeSnapshot = struct {
+pub const PortChangeSnapshot = extern struct {
     pending_mask: u16 = 0,
     pending: u8 = 0,
     events: u64 = 0,
@@ -62,7 +109,7 @@ pub const PortChangeSnapshot = struct {
     high_water: u8 = 0,
 };
 
-pub const PortChanges = struct {
+pub const PortChanges = extern struct {
     pending_mask: u16 = 0,
     events: u64 = 0,
     queued: u64 = 0,
@@ -77,85 +124,40 @@ pub const PortChanges = struct {
     }
 
     pub fn reset(self: *PortChanges) void {
-        self.* = .{};
+        r4os_rust_usb_ports_reset(self);
     }
 
     // Returns true for every Port Status Change Event, including malformed
     // port IDs. Callers must not feed a consumed port event into the generic
     // stale-event path merely because the ID is unusable.
     pub fn route(self: *PortChanges, event: Event, max_ports: u8) bool {
-        const port = event.portId() orelse return false;
-        self.events +%= 1;
-        if (port == 0 or port > max_ports or port > 16) {
-            self.invalid +%= 1;
-            return true;
-        }
-
-        const shift: u4 = @intCast(port - 1);
-        const bit = @as(u16, 1) << shift;
-        if ((self.pending_mask & bit) != 0) {
-            self.coalesced +%= 1;
-            return true;
-        }
-        self.pending_mask |= bit;
-        self.queued +%= 1;
-        const count = maskCount(self.pending_mask);
-        if (count > self.high_water) self.high_water = count;
-        return true;
+        return r4os_rust_usb_ports_route(self, &event, max_ports);
     }
 
     pub fn takeNext(self: *PortChanges) ?u8 {
-        var index: u5 = 0;
-        while (index < 16) : (index += 1) {
-            const shift: u4 = @intCast(index);
-            const bit = @as(u16, 1) << shift;
-            if ((self.pending_mask & bit) == 0) continue;
-            self.pending_mask &= ~bit;
-            self.taken +%= 1;
-            return @intCast(index + 1);
-        }
-        return null;
+        const port = r4os_rust_usb_ports_take(self);
+        return if (port == 0) null else port;
     }
 
     pub fn retry(self: *PortChanges, port: u8) void {
-        if (port == 0 or port > 16) return;
-        const shift: u4 = @intCast(port - 1);
-        self.pending_mask |= @as(u16, 1) << shift;
-        self.retries +%= 1;
+        r4os_rust_usb_ports_retry(self, port);
     }
 
     pub fn snapshot(self: *const PortChanges) PortChangeSnapshot {
-        return .{
-            .pending_mask = self.pending_mask,
-            .pending = maskCount(self.pending_mask),
-            .events = self.events,
-            .queued = self.queued,
-            .coalesced = self.coalesced,
-            .invalid = self.invalid,
-            .taken = self.taken,
-            .retries = self.retries,
-            .high_water = self.high_water,
-        };
+        var out: PortChangeSnapshot = undefined;
+        r4os_rust_usb_ports_snapshot(self, &out);
+        return out;
     }
 };
 
-fn maskCount(mask: u16) u8 {
-    var value = mask;
-    var count: u8 = 0;
-    while (value != 0) : (value >>= 1) {
-        if ((value & 1) != 0) count += 1;
-    }
-    return count;
-}
-
-pub const TransferMatch = struct {
+pub const TransferMatch = extern struct {
     slot_id: u8,
     endpoint_id: u8,
     trb_phys: [MAX_TRANSFER_TRB_POINTERS]u64,
     trb_count: u8,
 };
 
-pub const CommandMatch = struct {
+pub const CommandMatch = extern struct {
     trb_phys: u64,
 };
 
@@ -164,12 +166,12 @@ pub const Match = union(enum) {
     command: CommandMatch,
 };
 
-pub const EnqueueResult = enum {
+pub const EnqueueResult = enum(u8) {
     queued,
     overflow,
 };
 
-pub const Snapshot = struct {
+pub const Snapshot = extern struct {
     pending: usize = 0,
     queued: u64 = 0,
     delivered: u64 = 0,
@@ -178,7 +180,7 @@ pub const Snapshot = struct {
     high_water: usize = 0,
 };
 
-pub const Mailbox = struct {
+pub const Mailbox = extern struct {
     events: [CAPACITY]Event = .{Event{}} ** CAPACITY,
     count: usize = 0,
     queued: u64 = 0,
@@ -192,108 +194,47 @@ pub const Mailbox = struct {
     }
 
     pub fn reset(self: *Mailbox) void {
-        self.* = .{};
+        r4os_rust_usb_mailbox_reset(self);
     }
 
     pub fn enqueue(self: *Mailbox, event: Event) EnqueueResult {
-        if (self.count >= CAPACITY) {
-            self.overflows += 1;
-            return .overflow;
-        }
-
-        self.events[self.count] = event;
-        self.count += 1;
-        self.queued += 1;
-        if (self.count > self.high_water) self.high_water = self.count;
-        return .queued;
+        return if (r4os_rust_usb_mailbox_enqueue(self, &event)) .queued else .overflow;
     }
 
     pub fn take(self: *Mailbox, expected: Match) ?Event {
-        var index: usize = 0;
-        while (index < self.count) : (index += 1) {
-            if (!matches(self.events[index], expected)) continue;
-            const event = self.removeAt(index);
-            self.delivered += 1;
-            return event;
-        }
-        return null;
+        const wire = toNative(expected);
+        var out: Event = undefined;
+        return if (r4os_rust_usb_mailbox_take(self, &wire, &out)) out else null;
     }
 
     pub fn purge(self: *Mailbox, expected: Match) usize {
-        var removed: usize = 0;
-        var index: usize = 0;
-        while (index < self.count) {
-            if (!matches(self.events[index], expected)) {
-                index += 1;
-                continue;
-            }
-            _ = self.removeAt(index);
-            removed += 1;
-        }
-        self.purged += removed;
-        return removed;
+        const wire = toNative(expected);
+        return r4os_rust_usb_mailbox_purge(self, &wire);
     }
 
     pub fn purgeSlot(self: *Mailbox, slot_id: u8) usize {
-        var removed: usize = 0;
-        var index: usize = 0;
-        while (index < self.count) {
-            if (self.events[index].slot_id != slot_id) {
-                index += 1;
-                continue;
-            }
-            _ = self.removeAt(index);
-            removed += 1;
-        }
-        self.purged += removed;
-        return removed;
+        return r4os_rust_usb_mailbox_purge_slot(self, slot_id);
     }
 
     pub fn clear(self: *Mailbox) usize {
-        const removed = self.count;
-        var index: usize = 0;
-        while (index < self.count) : (index += 1) self.events[index] = .{};
-        self.count = 0;
-        self.purged += removed;
-        return removed;
+        return r4os_rust_usb_mailbox_clear(self);
     }
 
     pub fn pendingCount(self: *const Mailbox) usize {
-        return self.count;
+        return r4os_rust_usb_mailbox_count(self);
     }
 
     pub fn snapshot(self: *const Mailbox) Snapshot {
-        return .{
-            .pending = self.count,
-            .queued = self.queued,
-            .delivered = self.delivered,
-            .overflows = self.overflows,
-            .purged = self.purged,
-            .high_water = self.high_water,
-        };
-    }
-
-    fn removeAt(self: *Mailbox, index: usize) Event {
-        const removed = self.events[index];
-        var cursor = index;
-        while (cursor + 1 < self.count) : (cursor += 1) {
-            self.events[cursor] = self.events[cursor + 1];
-        }
-        self.count -= 1;
-        self.events[self.count] = .{};
-        return removed;
+        var out: Snapshot = undefined;
+        r4os_rust_usb_mailbox_snapshot(self, &out);
+        return out;
     }
 };
 
 pub fn transferMatch(slot_id: u8, endpoint_id: u8, trb_phys: u64) Match {
-    var pointers: [MAX_TRANSFER_TRB_POINTERS]u64 = .{0} ** MAX_TRANSFER_TRB_POINTERS;
-    pointers[0] = normalizeTrbPointer(trb_phys);
-    return .{ .transfer = .{
-        .slot_id = slot_id,
-        .endpoint_id = endpoint_id,
-        .trb_phys = pointers,
-        .trb_count = 1,
-    } };
+    var out: NativeMatch = undefined;
+    r4os_rust_usb_match_transfer(slot_id, endpoint_id, trb_phys, &out);
+    return fromNative(out);
 }
 
 pub fn transferTdMatch(
@@ -302,83 +243,28 @@ pub fn transferTdMatch(
     trb_phys: [MAX_TRANSFER_TRB_POINTERS]u64,
     trb_count: u8,
 ) Match {
-    var normalized: [MAX_TRANSFER_TRB_POINTERS]u64 = .{0} ** MAX_TRANSFER_TRB_POINTERS;
-    const count: usize = @min(@as(usize, trb_count), MAX_TRANSFER_TRB_POINTERS);
-    var index: usize = 0;
-    while (index < count) : (index += 1) {
-        normalized[index] = normalizeTrbPointer(trb_phys[index]);
-    }
-    return .{ .transfer = .{
-        .slot_id = slot_id,
-        .endpoint_id = endpoint_id,
-        .trb_phys = normalized,
-        .trb_count = @intCast(count),
-    } };
+    var out: NativeMatch = undefined;
+    r4os_rust_usb_match_td(slot_id, endpoint_id, &trb_phys, trb_count, &out);
+    return fromNative(out);
 }
 
 pub fn commandMatch(trb_phys: u64) Match {
-    return .{ .command = .{ .trb_phys = normalizeTrbPointer(trb_phys) } };
+    var out: NativeMatch = undefined;
+    r4os_rust_usb_match_command(trb_phys, &out);
+    return fromNative(out);
 }
 
 pub fn matches(event: Event, expected: Match) bool {
-    return switch (expected) {
-        .transfer => |transfer| matchesTransfer(event, transfer),
-        .command => |command| event.event_type == COMMAND_COMPLETION_EVENT_TYPE and
-            normalizeTrbPointer(event.parameter) == normalizeTrbPointer(command.trb_phys),
-    };
-}
-
-fn matchesTransfer(event: Event, expected: TransferMatch) bool {
-    if (event.event_type != TRANSFER_EVENT_TYPE or event.hasEventData()) return false;
-    if (event.slot_id != expected.slot_id or event.endpoint_id != expected.endpoint_id) return false;
-    const pointer = normalizeTrbPointer(event.parameter);
-    const count: usize = @min(@as(usize, expected.trb_count), MAX_TRANSFER_TRB_POINTERS);
-    var index: usize = 0;
-    while (index < count) : (index += 1) {
-        if (pointer == expected.trb_phys[index]) return true;
-    }
-    return false;
+    const wire = toNative(expected);
+    return r4os_rust_usb_event_matches(&event, &wire);
 }
 
 pub fn normalizeTrbPointer(value: u64) u64 {
-    return value & TRB_POINTER_MASK;
+    return r4os_rust_usb_normalize_pointer(value);
 }
 
 pub fn selfTest() bool {
-    var mailbox = Mailbox.init();
-    const hid = Event{
-        .event_type = TRANSFER_EVENT_TYPE,
-        .code = 1,
-        .slot_id = 2,
-        .endpoint_id = 3,
-        .parameter = 0x2000,
-        .control = 1,
-    };
-    const storage = Event{
-        .event_type = TRANSFER_EVENT_TYPE,
-        .code = 1,
-        .slot_id = 4,
-        .endpoint_id = 5,
-        .parameter = 0x4000,
-        .control = 1,
-    };
-    const command = Event{
-        .event_type = COMMAND_COMPLETION_EVENT_TYPE,
-        .code = 1,
-        .slot_id = 4,
-        .parameter = 0x6000,
-        .control = 1,
-    };
-
-    if (mailbox.enqueue(hid) != .queued) return false;
-    if (mailbox.enqueue(storage) != .queued) return false;
-    if (mailbox.enqueue(command) != .queued) return false;
-    const routed_storage = mailbox.take(transferMatch(4, 5, 0x4000)) orelse return false;
-    if (routed_storage.parameter != storage.parameter) return false;
-    const routed_command = mailbox.take(commandMatch(0x6000)) orelse return false;
-    if (routed_command.parameter != command.parameter) return false;
-    const routed_hid = mailbox.take(transferMatch(2, 3, 0x2000)) orelse return false;
-    return routed_hid.parameter == hid.parameter and mailbox.pendingCount() == 0;
+    return r4os_rust_usb_router_self_test();
 }
 
 test "HID completion survives an MSC waiter" {
@@ -676,4 +562,13 @@ test "port lifecycle decision distinguishes replace from harmless changes" {
 test "router self test" {
     const testing = @import("std").testing;
     try testing.expect(selfTest());
+}
+
+comptime {
+    if (@sizeOf(Event) != 24 or @offsetOf(Event, "parameter") != 8 or
+        @sizeOf(NativeMatch) != 264 or @offsetOf(NativeMatch, "trb_phys") != 8 or
+        @sizeOf(PortChanges) != 64 or @offsetOf(PortChanges, "high_water") != 56 or
+        @sizeOf(PortChangeSnapshot) != 64 or @offsetOf(PortChangeSnapshot, "pending") != 2 or
+        @sizeOf(Mailbox) != 6192 or @offsetOf(Mailbox, "count") != 6144 or
+        @sizeOf(Snapshot) != 48) @compileError("USB router private C layout");
 }

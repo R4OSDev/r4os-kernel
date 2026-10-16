@@ -1,3 +1,10 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+// Native USB owner: stateless compatibility facade.
+extern fn r4os_rust_usb_endpoint_state(u8) u8;
+extern fn r4os_rust_usb_endpoint_prepare(u8) u8;
+extern fn r4os_rust_usb_endpoint_refresh(u8) bool;
 // Pure xHCI endpoint-recovery policy shared by the real driver and its host
 // contract.  A transfer timeout does not imply Halted: a Running endpoint
 // must first be stopped, while a protocol stall leaves it Halted and requires
@@ -13,7 +20,7 @@ pub const EndpointState = enum(u8) {
     error_state = 4,
 };
 
-pub const PrepareAction = enum {
+pub const PrepareAction = enum(u8) {
     reconfigure,
     set_dequeue,
     stop,
@@ -23,30 +30,16 @@ pub const PrepareAction = enum {
 pub const context_state_error_completion: u8 = 19;
 
 pub fn stateFromRaw(raw: u8) ?EndpointState {
-    return switch (raw) {
-        0 => .disabled,
-        1 => .running,
-        2 => .halted,
-        3 => .stopped,
-        4 => .error_state,
-        else => null,
-    };
+    const value = r4os_rust_usb_endpoint_state(raw);
+    return if (value == 255) null else @enumFromInt(value);
 }
 
 pub fn prepareAction(state: EndpointState) PrepareAction {
-    return switch (state) {
-        .running => .stop,
-        .halted => .reset,
-        // xHCI 1.2 section 4.6.10 explicitly permits Set TR Dequeue
-        // Pointer in both Stopped and Error.  Error is not the same as
-        // Disabled and does not require endpoint reconfiguration.
-        .stopped, .error_state => .set_dequeue,
-        .disabled => .reconfigure,
-    };
+    return @enumFromInt(r4os_rust_usb_endpoint_prepare(@intFromEnum(state)));
 }
 
 pub fn completionNeedsStateRefresh(completion_code: u8) bool {
-    return completion_code == context_state_error_completion;
+    return r4os_rust_usb_endpoint_refresh(completion_code);
 }
 
 test "running timeout stops before dequeue update" {

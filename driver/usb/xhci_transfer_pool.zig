@@ -1,3 +1,21 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+// Native generation-bound transfer owner; compatibility calls only.
+extern fn r4os_rust_usb_pool_reset(*Pool) void;
+extern fn r4os_rust_usb_pool_begin(*Pool, u8, *const event_router.NativeMatch, u64) u32;
+extern fn r4os_rust_usb_pool_owns(*const Pool, *const event_router.Event) bool;
+extern fn r4os_rust_usb_pool_matching(*const Pool, *const event_router.Event) u32;
+extern fn r4os_rust_usb_pool_complete(*Pool, u32, *const event_router.Event) bool;
+extern fn r4os_rust_usb_pool_timeout(*Pool, u32) bool;
+extern fn r4os_rust_usb_pool_cancel(*Pool, u32) bool;
+extern fn r4os_rust_usb_pool_release(*Pool, u32) bool;
+extern fn r4os_rust_usb_pool_match(*const Pool, u32, *event_router.NativeMatch) bool;
+extern fn r4os_rust_usb_pool_state(*const Pool, u32) u8;
+extern fn r4os_rust_usb_pool_timed_out(*const Pool, u8, u8) u32;
+extern fn r4os_rust_usb_pool_cancel_endpoint(*Pool, u8, u8) u32;
+extern fn r4os_rust_usb_pool_purge_slot(*Pool, u8) u32;
+extern fn r4os_rust_usb_pool_snapshot(*const Pool, *Snapshot) void;
 const event_router = @import("xhci_event_router.zig");
 
 pub const MAX_TRANSFERS: usize = 32;
@@ -18,16 +36,16 @@ pub const State = enum(u8) {
     failed,
 };
 
-pub const Entry = struct {
+pub const Entry = extern struct {
     generation: u16 = 0,
     state: State = .free,
     kind: Kind = .control,
-    match: event_router.Match = event_router.transferMatch(0, 0, 0),
+    match: event_router.NativeMatch = .{},
     timeout_token: u64 = 0,
     completion: event_router.Event = .{},
 };
 
-pub const Snapshot = struct {
+pub const Snapshot = extern struct {
     active: u32 = 0,
     high_water: u32 = 0,
     submitted: u64 = 0,
@@ -38,7 +56,7 @@ pub const Snapshot = struct {
     stale_handles: u64 = 0,
 };
 
-pub const Pool = struct {
+pub const Pool = extern struct {
     entries: [MAX_TRANSFERS]Entry = .{Entry{}} ** MAX_TRANSFERS,
     next_generation: u16 = 1,
     active: u32 = 0,
@@ -55,206 +73,70 @@ pub const Pool = struct {
     }
 
     pub fn reset(self: *Pool) void {
-        self.* = .{};
+        r4os_rust_usb_pool_reset(self);
     }
 
     pub fn begin(self: *Pool, kind: Kind, match: event_router.Match, timeout_token: u64) ?u32 {
-        const index = self.freeIndex() orelse return null;
-        const generation = self.takeGeneration();
-        self.entries[index] = .{
-            .generation = generation,
-            .state = .submitted,
-            .kind = kind,
-            .match = match,
-            .timeout_token = timeout_token,
-        };
-        self.active += 1;
-        self.submitted +%= 1;
-        if (self.active > self.high_water) self.high_water = self.active;
-        return encodeHandle(index, generation);
+        const wire = event_router.toNative(match);
+        const handle = r4os_rust_usb_pool_begin(self, @intFromEnum(kind), &wire, timeout_token);
+        return if (handle == 0) null else handle;
     }
 
     pub fn owns(self: *const Pool, event: event_router.Event) bool {
-        for (self.entries) |entry| {
-            if (!isLive(entry.state)) continue;
-            if (event_router.matches(event, entry.match)) return true;
-        }
-        return false;
+        return r4os_rust_usb_pool_owns(self, &event);
     }
 
     pub fn matchingHandle(self: *const Pool, event: event_router.Event) ?u32 {
-        for (self.entries, 0..) |entry, index| {
-            if (!isLive(entry.state)) continue;
-            if (!event_router.matches(event, entry.match)) continue;
-            return encodeHandle(index, entry.generation);
-        }
-        return null;
+        const handle = r4os_rust_usb_pool_matching(self, &event);
+        return if (handle == 0) null else handle;
     }
 
     pub fn complete(self: *Pool, handle: u32, event: event_router.Event) bool {
-        const entry = self.entryForHandle(handle) orelse return false;
-        if (entry.state != .submitted or !event_router.matches(event, entry.match)) return false;
-        entry.completion = event;
-        entry.state = if (event.code == 1 or event.code == 13) .completed else .failed;
-        self.active -= 1;
-        if (entry.state == .completed) {
-            self.completed +%= 1;
-        } else {
-            self.failed +%= 1;
-        }
-        return true;
+        return r4os_rust_usb_pool_complete(self, handle, &event);
     }
 
     pub fn markTimeout(self: *Pool, handle: u32) bool {
-        const entry = self.entryForHandle(handle) orelse return false;
-        if (entry.state != .submitted) return false;
-        entry.state = .timed_out;
-        self.active -= 1;
-        self.timed_out +%= 1;
-        return true;
+        return r4os_rust_usb_pool_timeout(self, handle);
     }
 
     pub fn cancel(self: *Pool, handle: u32) bool {
-        const entry = self.entryForHandle(handle) orelse return false;
-        if (entry.state != .submitted and entry.state != .timed_out) return false;
-        if (entry.state == .submitted) self.active -= 1;
-        entry.state = .cancelled;
-        self.cancelled +%= 1;
-        return true;
+        return r4os_rust_usb_pool_cancel(self, handle);
     }
 
     pub fn release(self: *Pool, handle: u32) bool {
-        const entry = self.entryForHandle(handle) orelse return false;
-        if (entry.state == .submitted) return false;
-        entry.* = .{};
-        return true;
+        return r4os_rust_usb_pool_release(self, handle);
     }
 
     pub fn matchForHandle(self: *const Pool, handle: u32) ?event_router.Match {
-        const decoded = decodeHandle(handle) orelse return null;
-        const entry = &self.entries[decoded.index];
-        if (entry.generation != decoded.generation or entry.state == .free) return null;
-        return entry.match;
+        var out: event_router.NativeMatch = undefined;
+        return if (r4os_rust_usb_pool_match(self, handle, &out)) event_router.fromNative(out) else null;
     }
 
     pub fn stateForHandle(self: *const Pool, handle: u32) ?State {
-        const decoded = decodeHandle(handle) orelse return null;
-        const entry = &self.entries[decoded.index];
-        if (entry.generation != decoded.generation or entry.state == .free) return null;
-        return entry.state;
+        const value = r4os_rust_usb_pool_state(self, handle);
+        return if (value == 255) null else @enumFromInt(value);
     }
 
     pub fn timedOutHandle(self: *const Pool, slot_id: u8, endpoint_id: u8) ?u32 {
-        for (self.entries, 0..) |entry, index| {
-            if (entry.state != .timed_out) continue;
-            const transfer = switch (entry.match) {
-                .transfer => |value| value,
-                .command => continue,
-            };
-            if (transfer.slot_id == slot_id and transfer.endpoint_id == endpoint_id) {
-                return encodeHandle(index, entry.generation);
-            }
-        }
-        return null;
+        const handle = r4os_rust_usb_pool_timed_out(self, slot_id, endpoint_id);
+        return if (handle == 0) null else handle;
     }
 
     pub fn cancelEndpoint(self: *Pool, slot_id: u8, endpoint_id: u8) u32 {
-        var count: u32 = 0;
-        for (&self.entries) |*entry| {
-            if (entry.state == .free) continue;
-            const transfer = switch (entry.match) {
-                .transfer => |value| value,
-                .command => continue,
-            };
-            if (transfer.slot_id != slot_id or transfer.endpoint_id != endpoint_id) continue;
-            if (entry.state == .submitted) self.active -= 1;
-            if (entry.state == .submitted or entry.state == .timed_out) {
-                entry.state = .cancelled;
-                self.cancelled +%= 1;
-            }
-            entry.* = .{};
-            count += 1;
-        }
-        return count;
+        return r4os_rust_usb_pool_cancel_endpoint(self, slot_id, endpoint_id);
     }
 
     pub fn purgeSlot(self: *Pool, slot_id: u8) u32 {
-        var count: u32 = 0;
-        for (&self.entries) |*entry| {
-            if (entry.state == .free) continue;
-            const transfer = switch (entry.match) {
-                .transfer => |value| value,
-                .command => continue,
-            };
-            if (transfer.slot_id != slot_id) continue;
-            if (entry.state == .submitted) self.active -= 1;
-            if (entry.state == .submitted or entry.state == .timed_out) self.cancelled +%= 1;
-            entry.* = .{};
-            count += 1;
-        }
-        return count;
+        return r4os_rust_usb_pool_purge_slot(self, slot_id);
     }
 
     pub fn snapshot(self: *const Pool) Snapshot {
-        return .{
-            .active = self.active,
-            .high_water = self.high_water,
-            .submitted = self.submitted,
-            .completed = self.completed,
-            .timed_out = self.timed_out,
-            .cancelled = self.cancelled,
-            .failed = self.failed,
-            .stale_handles = self.stale_handles,
-        };
-    }
-
-    fn freeIndex(self: *const Pool) ?usize {
-        for (self.entries, 0..) |entry, index| {
-            if (entry.state == .free) return index;
-        }
-        return null;
-    }
-
-    fn takeGeneration(self: *Pool) u16 {
-        const generation = self.next_generation;
-        self.next_generation +%= 1;
-        if (self.next_generation == 0) self.next_generation = 1;
-        return generation;
-    }
-
-    fn entryForHandle(self: *Pool, handle: u32) ?*Entry {
-        const decoded = decodeHandle(handle) orelse {
-            self.stale_handles +%= 1;
-            return null;
-        };
-        const entry = &self.entries[decoded.index];
-        if (entry.generation != decoded.generation or entry.state == .free) {
-            self.stale_handles +%= 1;
-            return null;
-        }
-        return entry;
+        var out: Snapshot = undefined;
+        r4os_rust_usb_pool_snapshot(self, &out);
+        return out;
     }
 };
 
-const DecodedHandle = struct {
-    index: usize,
-    generation: u16,
-};
-
-fn encodeHandle(index: usize, generation: u16) u32 {
-    return (@as(u32, generation) << 8) | @as(u32, @intCast(index + 1));
-}
-
-fn decodeHandle(handle: u32) ?DecodedHandle {
-    const raw_index = handle & 0xff;
-    const generation: u16 = @truncate(handle >> 8);
-    if (raw_index == 0 or raw_index > MAX_TRANSFERS or generation == 0) return null;
-    return .{ .index = @intCast(raw_index - 1), .generation = generation };
-}
-
-fn isLive(state: State) bool {
-    return state == .submitted or state == .timed_out;
-}
 
 test "parallel endpoint-bound transfers complete independently" {
     const testing = @import("std").testing;
@@ -321,4 +203,10 @@ test "failed segment completion terminates only its exact transfer" {
     try testing.expectEqual(State.submitted, pool.stateForHandle(survivor).?);
     try testing.expectEqual(@as(u64, 1), pool.snapshot().failed);
     try testing.expectEqual(@as(u32, 1), pool.snapshot().active);
+}
+
+comptime {
+    if (@sizeOf(Entry) != 304 or @offsetOf(Entry, "match") != 8 or @offsetOf(Entry, "completion") != 280 or
+        @sizeOf(Pool) != 9792 or @offsetOf(Pool, "next_generation") != 9728 or @offsetOf(Pool, "submitted") != 9744 or
+        @sizeOf(Snapshot) != 56) @compileError("USB pool private C layout");
 }

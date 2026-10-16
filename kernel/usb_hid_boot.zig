@@ -1,14 +1,11 @@
 // USB HID boot boundary for boot-adjacent keyboard and mouse bindings.
 
-const bootlog = @import("bootlog.zig");
-const driver_registry = @import("../driver/registry.zig");
-const fatal = @import("fatal.zig");
-const k = @import("log.zig");
+const Text = @import("../driver/usb/core.zig").Text;
 const storage_boot = @import("storage_boot.zig");
 const usb_hid = @import("../driver/usb/hid.zig");
 const xhci = @import("../driver/usb/xhci.zig");
 
-pub const Phase = enum {
+pub const Phase = enum(u8) {
     not_started,
     dependency_missing,
     no_hid,
@@ -19,7 +16,7 @@ pub const Phase = enum {
     failed,
 };
 
-pub const RegistryState = enum {
+pub const RegistryState = enum(u8) {
     none,
     loaded,
     initialized,
@@ -52,327 +49,135 @@ pub const Status = struct {
     reason: []const u8 = "not started",
 };
 
-var current: Status = .{};
-
+const RawStatus = extern struct {
+    phase: u8 = 0,
+    attempted: bool = false,
+    initialized: bool = false,
+    init_returned_bound: bool = false,
+    active: bool = false,
+    failed: bool = false,
+    fatal: bool = false,
+    registry_slot_present: bool = false,
+    registry_state: u8 = 0,
+    keyboard_present: bool = false,
+    keyboard_bound: bool = false,
+    mouse_present: bool = false,
+    mouse_bound: bool = false,
+    unsupported_hid: u8 = 0,
+    missing_endpoint_hid: u8 = 0,
+    setup_warnings: u8 = 0,
+    failures: u64 = 0,
+    boot_dispatch_failures: u64 = 0,
+    protocol_required_missing: u8 = 0,
+    report_descriptor_malformed: bool = false,
+    boot_source: Text = Text.init("none"),
+    reason: Text = Text.init("not started"),
+};
+const XhciStatus = extern struct { interrupt_recoveries: u64, interrupt_pending_timeouts: u64, interrupt_halted_checks: u64 };
+const Peers = extern struct {
+    storage_ready: *const fn () callconv(.c) bool,
+    hid_init: *const fn () callconv(.c) bool,
+    hid_status: *const fn (*RawStatus) callconv(.c) void,
+    xhci_status: *const fn (*XhciStatus) callconv(.c) void,
+    port_start: *const fn () callconv(.c) bool,
+    hid_start: *const fn () callconv(.c) bool,
+};
+const peers: Peers = .{ .storage_ready = storageReady, .hid_init = hidInit, .hid_status = hidStatus, .xhci_status = xhciStatus, .port_start = portStart, .hid_start = hidStart };
+extern fn r4os_rust_usb_hid_boot_init(*const Peers) bool;
+extern fn r4os_rust_usb_hid_boot_initialized() bool;
+extern fn r4os_rust_usb_hid_boot_active() bool;
+extern fn r4os_rust_usb_hid_boot_status(*RawStatus) void;
+extern fn r4os_rust_usb_hid_boot_phase(u8) Text;
+extern fn r4os_rust_usb_hid_boot_registry(u8) Text;
+extern fn r4os_rust_usb_hid_boot_dump() void;
+extern fn r4os_rust_usb_hid_boot_start(*const Peers) bool;
 pub fn init() bool {
-    if (current.attempted) {
-        bootlog.puts("[USBHIDBOOT] init skipped phase=");
-        bootlog.puts(phaseName(current.phase));
-        bootlog.puts(" fatal=");
-        bootlog.puts(yesNo(current.fatal));
-        bootlog.puts("\r\n");
-        return !current.fatal;
-    }
-
-    current = .{
-        .attempted = true,
-        .reason = "starting",
-    };
-
-    if (!storage_boot.isControllersInitialized()) {
-        return failFatal("USB-HID boot before storage controllers", "storage controllers missing");
-    }
-
-    const slot = driver_registry.beginLoad("USBHID", 3, 1);
-    current.registry_slot_present = slot != null;
-    current.registry_state = if (slot != null) .loaded else .none;
-    if (slot == null) {
-        bootlog.puts("[USBHIDBOOT][WARN] registry slot missing; continuing without registry owner\r\n");
-    }
-
-    current.init_returned_bound = usb_hid.init();
-    classify(usb_hid.status());
-    applyRegistryState(slot);
-    dumpStatusToBootlog();
-    emitBootStatusLine();
-    return true;
+    return r4os_rust_usb_hid_boot_init(&peers);
 }
-
 pub fn isInitialized() bool {
-    return current.attempted and current.initialized and !current.fatal;
+    return r4os_rust_usb_hid_boot_initialized();
 }
-
 pub fn isActive() bool {
-    return current.active and !current.fatal;
+    return r4os_rust_usb_hid_boot_active();
 }
-
 pub fn status() Status {
-    return current;
+    var raw: RawStatus = undefined;
+    r4os_rust_usb_hid_boot_status(&raw);
+    var out: Status = undefined;
+    inline for (@import("std").meta.fields(Status)) |field| {
+        if (comptime field.type == []const u8) @field(out, field.name) = @field(raw, field.name).slice() else if (comptime field.type == Phase or field.type == RegistryState) @field(out, field.name) = @enumFromInt(@field(raw, field.name)) else @field(out, field.name) = @field(raw, field.name);
+    }
+    return out;
 }
-
 pub fn phaseName(phase: Phase) []const u8 {
-    return switch (phase) {
-        .not_started => "not-started",
-        .dependency_missing => "dependency-missing",
-        .no_hid => "no-hid",
-        .keyboard_bound => "keyboard-bound",
-        .mouse_bound => "mouse-bound",
-        .keyboard_mouse_bound => "keyboard-mouse-bound",
-        .warning => "warning",
-        .failed => "failed",
-    };
+    return r4os_rust_usb_hid_boot_phase(@intFromEnum(phase)).slice();
 }
-
 pub fn registryStateName(state: RegistryState) []const u8 {
-    return switch (state) {
-        .none => "none",
-        .loaded => "loaded",
-        .initialized => "initialized",
-        .active => "active",
-        .failed => "failed",
-    };
+    return r4os_rust_usb_hid_boot_registry(@intFromEnum(state)).slice();
 }
-
 pub fn dumpStatus() void {
-    k.puts("USB-HID boot\r\n");
-    k.puts("  phase=");
-    k.puts(phaseName(current.phase));
-    k.puts(" initialized=");
-    k.puts(yesNo(current.initialized));
-    k.puts(" active=");
-    k.puts(yesNo(current.active));
-    k.puts(" failed=");
-    k.puts(yesNo(current.failed));
-    k.puts(" fatal=");
-    k.puts(yesNo(current.fatal));
-    k.puts(" registry=");
-    k.puts(registryStateName(current.registry_state));
-    k.puts(" continue=");
-    k.puts(yesNo(canContinueBoot()));
-    k.puts("\r\n");
-    k.puts("  keyboard=");
-    k.puts(bindingName(current.keyboard_present, current.keyboard_bound));
-    k.puts(" mouse=");
-    k.puts(bindingName(current.mouse_present, current.mouse_bound));
-    k.puts(" unsupported=");
-    k.putDec(current.unsupported_hid);
-    k.puts(" missing-ep=");
-    k.putDec(current.missing_endpoint_hid);
-    k.puts("\r\n");
-    k.puts("  setup-warn=");
-    k.putDec(current.setup_warnings);
-    k.puts(" failures=");
-    k.putDec(current.failures);
-    k.puts(" r4p-required-missing=");
-    k.putDec(current.protocol_required_missing);
-    k.puts(" boot-source=");
-    k.puts(current.boot_source);
-    k.puts(" reason=");
-    k.puts(current.reason);
-    k.puts("\r\n");
+    r4os_rust_usb_hid_boot_dump();
 }
-
-fn classify(hid_status: usb_hid.Status) void {
-    current.initialized = hid_status.initialized;
-    current.keyboard_present = hid_status.keyboard_present;
-    current.keyboard_bound = hid_status.keyboard_bound;
-    current.mouse_present = hid_status.mouse_present;
-    current.mouse_bound = hid_status.mouse_bound;
-    current.unsupported_hid = hid_status.unsupported_hid;
-    current.missing_endpoint_hid = hid_status.missing_endpoint_hid;
-    current.setup_warnings = hid_status.setup_warnings;
-    current.failures = hid_status.failures;
-    current.boot_dispatch_failures = hid_status.boot_dispatch_failures;
-    current.protocol_required_missing = hid_status.protocol_required_missing;
-    current.report_descriptor_malformed = hid_status.report_descriptor_malformed;
-    current.boot_source = hid_status.boot_source;
-    current.reason = hid_status.reason;
-
-    const any_bound = hid_status.keyboard_bound or hid_status.mouse_bound;
-    const any_present = hid_status.keyboard_present or hid_status.mouse_present;
-    const has_warning = hid_status.setup_warnings != 0 or
-        hid_status.missing_endpoint_hid != 0 or
-        hid_status.unsupported_hid != 0 or
-        hid_status.protocol_required_missing != 0 or
-        hid_status.boot_dispatch_failures != 0 or
-        hid_status.report_descriptor_malformed;
-    const bind_failed = hid_status.failures != 0 or
-        (hid_status.keyboard_present and !hid_status.keyboard_bound) or
-        (hid_status.mouse_present and !hid_status.mouse_bound);
-
-    current.active = any_bound;
-    current.failed = false;
-    current.fatal = false;
-
-    if (any_bound) {
-        current.phase = if (has_warning)
-            .warning
-        else if (hid_status.keyboard_bound and hid_status.mouse_bound)
-            .keyboard_mouse_bound
-        else if (hid_status.keyboard_bound)
-            .keyboard_bound
-        else
-            .mouse_bound;
-        return;
-    }
-
-    if (bind_failed) {
-        current.phase = .failed;
-        current.failed = true;
-        return;
-    }
-
-    if (any_present or hid_status.missing_endpoint_hid != 0 or hid_status.unsupported_hid != 0 or hid_status.protocol_required_missing != 0) {
-        current.phase = .warning;
-        if (hid_status.missing_endpoint_hid != 0) current.reason = "USB HID present without usable interrupt-in endpoint";
-        if (hid_status.unsupported_hid != 0 and hid_status.missing_endpoint_hid == 0) current.reason = "USB HID present but unsupported for boot input";
-        if (hid_status.protocol_required_missing != 0) current.reason = hid_status.reason;
-        return;
-    }
-
-    current.phase = .no_hid;
-    current.reason = "no USB HID boot device found";
-}
-
-fn applyRegistryState(slot: ?usize) void {
-    if (slot == null) return;
-
-    if (current.failed) {
-        driver_registry.setState(slot.?, .failed);
-        current.registry_state = .failed;
-        return;
-    }
-
-    driver_registry.setState(slot.?, .initialized);
-    current.registry_state = .initialized;
-    if (current.active) {
-        driver_registry.setState(slot.?, .active);
-        current.registry_state = .active;
-    }
-}
-
-fn failFatal(message: []const u8, reason: []const u8) bool {
-    current.phase = .dependency_missing;
-    current.failed = true;
-    current.fatal = true;
-    current.reason = reason;
-    dumpStatusToBootlog();
-    return fatal.fail(.usb, message);
-}
-
-fn dumpStatusToBootlog() void {
-    bootlog.puts("[USBHIDBOOT] status phase=");
-    bootlog.puts(phaseName(current.phase));
-    bootlog.puts(" outcome=");
-    bootlog.puts(outcomeName());
-    bootlog.puts(" initialized=");
-    bootlog.puts(yesNo(current.initialized));
-    bootlog.puts(" init_bound=");
-    bootlog.puts(yesNo(current.init_returned_bound));
-    bootlog.puts(" active=");
-    bootlog.puts(yesNo(current.active));
-    bootlog.puts(" failed=");
-    bootlog.puts(yesNo(current.failed));
-    bootlog.puts(" fatal=");
-    bootlog.puts(yesNo(current.fatal));
-    bootlog.puts(" registry=");
-    bootlog.puts(registryStateName(current.registry_state));
-    bootlog.puts(" registry_slot=");
-    bootlog.puts(yesNo(current.registry_slot_present));
-    bootlog.puts(" boot_continue=");
-    bootlog.puts(yesNo(canContinueBoot()));
-    bootlog.puts(" keyboard=");
-    bootlog.puts(bindingName(current.keyboard_present, current.keyboard_bound));
-    bootlog.puts(" mouse=");
-    bootlog.puts(bindingName(current.mouse_present, current.mouse_bound));
-    bootlog.puts(" unsupported=");
-    bootlog.putDec(current.unsupported_hid);
-    bootlog.puts(" missing_ep=");
-    bootlog.putDec(current.missing_endpoint_hid);
-    bootlog.puts(" setup_warn=");
-    bootlog.putDec(current.setup_warnings);
-    bootlog.puts(" failures=");
-    bootlog.putDec(current.failures);
-    bootlog.puts(" dispatch_failures=");
-    bootlog.putDec(current.boot_dispatch_failures);
-    bootlog.puts(" r4p_required_missing=");
-    bootlog.putDec(current.protocol_required_missing);
-    bootlog.puts(" source=");
-    bootlog.puts(current.boot_source);
-    bootlog.puts(" reason=");
-    bootlog.puts(current.reason);
-    // 0.56.16: Halt-Recovery-Zaehler des built-in xHCI sichtbar machen
-    // (Abnahme: im fehlerfreien QEMU-Lauf recoveries=0, pending_timeouts=0).
-    const xs = xhci.status();
-    bootlog.puts(" xhci_recoveries=");
-    bootlog.putDec(xs.interrupt_recoveries);
-    bootlog.puts(" xhci_pending_timeouts=");
-    bootlog.putDec(xs.interrupt_pending_timeouts);
-    bootlog.puts(" xhci_halted_checks=");
-    bootlog.putDec(xs.interrupt_halted_checks);
-    bootlog.puts("\r\n");
-}
-
-// Runtime-Tasks erst nach initTaskRuntime starten: Der controller-eigene
-// Porttask bleibt auch ohne Boot-HID aktiv, damit Hotplug-Events den Eventring
-// nicht fuellen und neue Geraete autonom in den USB-Katalog gelangen. Der
-// HID-Poller bleibt an eine tatsaechliche Bindung gekoppelt.
 pub fn startPollTask() bool {
-    if (!xhci.startPortTask()) return false;
-    if (!current.active) return true;
+    return r4os_rust_usb_hid_boot_start(&peers);
+}
+fn storageReady() callconv(.c) bool {
+    return storage_boot.isControllersInitialized();
+}
+fn hidInit() callconv(.c) bool {
+    return usb_hid.init();
+}
+fn portStart() callconv(.c) bool {
+    return xhci.startPortTask();
+}
+fn hidStart() callconv(.c) bool {
     return usb_hid.startPollTask();
 }
-
-fn emitBootStatusLine() void {
-    k.puts("  USBHID ");
-    switch (current.phase) {
-        .no_hid => k.puts("[not found]\r\n"),
-        .keyboard_bound => k.puts("keyboard [active]\r\n"),
-        .mouse_bound => k.puts("mouse [active]\r\n"),
-        .keyboard_mouse_bound => k.puts("keyboard+mouse [active]\r\n"),
-        .warning => {
-            if (current.active) {
-                k.puts(bindingSummary());
-                k.puts(" [warn]\r\n");
-            } else {
-                k.puts("[warn]\r\n");
-            }
-        },
-        .failed => k.puts("[failed]\r\n"),
-        .dependency_missing => k.puts("[fatal]\r\n"),
-        .not_started => k.puts("[not started]\r\n"),
-    }
-    // 0.56.16: Halt-Recovery-Zaehler auf COM1 (Bootlog allein landet nicht
-    // im Test-Log - Lektion aus dem [LAPIC]-Marker). Abnahme-Kriterium:
-    // recoveries=0 und pending_timeouts=0 im fehlerfreien QEMU-Lauf.
-    if (current.active) {
-        const xs = xhci.status();
-        k.puts("  USBHID xhci: recoveries=");
-        k.putDec(xs.interrupt_recoveries);
-        k.puts(" pending_timeouts=");
-        k.putDec(xs.interrupt_pending_timeouts);
-        k.puts(" halted_checks=");
-        k.putDec(xs.interrupt_halted_checks);
-        k.puts("\r\n");
-    }
+fn xhciStatus(out: *XhciStatus) callconv(.c) void {
+    const value = xhci.status();
+    out.* = .{ .interrupt_recoveries = value.interrupt_recoveries, .interrupt_pending_timeouts = value.interrupt_pending_timeouts, .interrupt_halted_checks = value.interrupt_halted_checks };
 }
-
-fn bindingSummary() []const u8 {
-    if (current.keyboard_bound and current.mouse_bound) return "keyboard+mouse";
-    if (current.keyboard_bound) return "keyboard";
-    if (current.mouse_bound) return "mouse";
-    return "no-binding";
+fn hidStatus(out: *RawStatus) callconv(.c) void {
+    const value = usb_hid.status();
+    out.* = .{};
+    out.initialized = value.initialized;
+    out.keyboard_present = value.keyboard_present;
+    out.keyboard_bound = value.keyboard_bound;
+    out.mouse_present = value.mouse_present;
+    out.mouse_bound = value.mouse_bound;
+    out.unsupported_hid = value.unsupported_hid;
+    out.missing_endpoint_hid = value.missing_endpoint_hid;
+    out.setup_warnings = value.setup_warnings;
+    out.failures = value.failures;
+    out.boot_dispatch_failures = value.boot_dispatch_failures;
+    out.protocol_required_missing = value.protocol_required_missing;
+    out.report_descriptor_malformed = value.report_descriptor_malformed;
+    out.boot_source = Text.init(value.boot_source);
+    out.reason = Text.init(value.reason);
 }
-
-fn bindingName(present: bool, bound: bool) []const u8 {
-    if (bound) return "bound";
-    if (present) return "detected";
-    return "no";
-}
-
-fn outcomeName() []const u8 {
-    if (current.fatal) return "fatal";
-    if (current.failed) return "failed";
-    if (current.active) return "active";
-    if (current.phase == .no_hid) return "not-found";
-    if (current.phase == .warning) return "warning";
-    return phaseName(current.phase);
-}
-
-fn canContinueBoot() bool {
-    return !current.fatal;
-}
-
-fn yesNo(value: bool) []const u8 {
-    return if (value) "yes" else "no";
+comptime {
+    if (@sizeOf(RawStatus) != 72 or
+        @offsetOf(RawStatus, "phase") != 0 or
+        @offsetOf(RawStatus, "attempted") != 1 or
+        @offsetOf(RawStatus, "initialized") != 2 or
+        @offsetOf(RawStatus, "init_returned_bound") != 3 or
+        @offsetOf(RawStatus, "active") != 4 or
+        @offsetOf(RawStatus, "failed") != 5 or
+        @offsetOf(RawStatus, "fatal") != 6 or
+        @offsetOf(RawStatus, "registry_slot_present") != 7 or
+        @offsetOf(RawStatus, "registry_state") != 8 or
+        @offsetOf(RawStatus, "keyboard_present") != 9 or
+        @offsetOf(RawStatus, "keyboard_bound") != 10 or
+        @offsetOf(RawStatus, "mouse_present") != 11 or
+        @offsetOf(RawStatus, "mouse_bound") != 12 or
+        @offsetOf(RawStatus, "unsupported_hid") != 13 or
+        @offsetOf(RawStatus, "missing_endpoint_hid") != 14 or
+        @offsetOf(RawStatus, "setup_warnings") != 15 or
+        @offsetOf(RawStatus, "failures") != 16 or
+        @offsetOf(RawStatus, "boot_dispatch_failures") != 24 or
+        @offsetOf(RawStatus, "protocol_required_missing") != 32 or
+        @offsetOf(RawStatus, "report_descriptor_malformed") != 33 or
+        @offsetOf(RawStatus, "boot_source") != 40 or
+        @offsetOf(RawStatus, "reason") != 56) @compileError("USB HID boot private C layout");
+    if (@sizeOf(Peers) != 48 or @sizeOf(XhciStatus) != 24) @compileError("USB HID boot peers");
 }

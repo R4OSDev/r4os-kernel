@@ -1,3 +1,8 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+// Native USB owner: stateless compatibility facade.
+extern fn r4os_rust_usb_ticks(u32, u32) u64;
 // Linux uses the USB reset-recovery minimum plus margin before enumeration.
 // The extra margin matters after firmware-to-kernel xHCI ownership handoff,
 // where the port can still report Enabled/U0 although the device must be put
@@ -30,9 +35,7 @@ pub const SCSI_READY_BUDGET_MS: u32 = 2_000;
 pub const SCSI_CAPACITY_BUDGET_MS: u32 = 500;
 
 pub fn ticksForMilliseconds(milliseconds: u32, frequency_hz: u32) u64 {
-    if (milliseconds == 0 or frequency_hz == 0) return 0;
-    const scaled = @as(u64, milliseconds) * @as(u64, frequency_hz);
-    return @max(@as(u64, 1), (scaled + 999) / 1000);
+    return r4os_rust_usb_ticks(milliseconds, frequency_hz);
 }
 
 test "millisecond delays round up to at least one tick" {

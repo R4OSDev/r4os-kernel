@@ -1,86 +1,11 @@
-const native_tasks = @import("../../sched/task.zig");
-const protocol_api = @import("../../kernel/protocol_api.zig");
-const r4p = @import("../../program/r4p.zig");
-const r4p_contract = @import("../../net/r4p_contract.zig");
-const keyboard = @import("../input/keyboard.zig");
-const hid_set1 = @import("../input/hid_set1.zig");
-const timer_core = @import("../../kernel/timer.zig");
-const hid_poll_idle_ticks: u64 = @max(1, (10 * @as(u64, timer_core.DEFAULT_HZ)) / 1000);
-const mouse = @import("../input/mouse.zig");
+// Native HID owner; stateless fixed projections to existing kernel peers.
 const usb_core = @import("core.zig");
-const hid_report = @import("hid_report.zig");
-const xhci = @import("xhci.zig");
-const usb_host = @import("host_controller.zig");
-const k = @import("../../kernel/log.zig");
-const sched_task = @import("../../sched/task.zig");
-const scheduler = @import("../../sched/scheduler.zig");
-
-const MOUSE_POLL_BUDGET: usize = 8;
-const REPORT_BUFFER_LEN: usize = 32;
-const REPORT_DESCRIPTOR_MAX: usize = 512;
-// One boot-keyboard report can replace six old usages with six new usages and
-// change all eight modifiers. Polling pauses before taking ownership unless
-// the canonical queue can accept that complete worst-case transition burst.
-const KEYBOARD_REPORT_QUEUE_RESERVE: u32 = (r4p_contract.USB_HID_BOOT_MAX_KEYS * 2) + 8;
-
-const HidKind = enum {
-    keyboard,
-    mouse,
-    consumer,
-};
-
-const HidInterfaceCandidate = struct {
-    number: u8 = 0,
-    class_code: u8 = 0,
-    subclass: u8 = 0,
-    protocol: u8 = 0,
-    endpoint_address: u8 = 0,
-    endpoint_max_packet: u16 = 0,
-    endpoint_interval: u8 = 0,
-    report_descriptor_len: u16 = 0,
-};
-
-const AggregateFlag = enum {
-    protocol,
-    idle,
-};
-
-const HidBinding = struct {
-    present: bool = false,
-    bound: bool = false,
-    port: u8 = 0,
-    device: xhci.DeviceHandle = .{},
-    endpoint: xhci.EndpointHandle = .{},
-    interface_number: u8 = 0,
-    endpoint_address: u8 = 0,
-    endpoint_interval: u8 = 0,
-    endpoint_max_packet: u16 = 0,
-    report_descriptor_len: u16 = 0,
-    report_descriptor_read_len: u16 = 0,
-    report_summary: hid_report.Summary = .{},
-    report_wire: r4p_contract.HidReportSummary = .{},
-    consumer_pressed: [16]u8 = @splat(0),
-    consumer_caps: u32 = 0,
-    report_protocol: bool = false,
-    polls: u64 = 0,
-    no_reports: u64 = 0,
-    reports: u64 = 0,
-    duplicate_reports: u64 = 0,
-    failures: u64 = 0,
-    setup_warnings: u8 = 0,
-    protocol_ok: bool = false,
-    idle_ok: bool = false,
-    report_id_heuristic: bool = false,
-    report_descriptor_ok: bool = false,
-    report_descriptor_malformed: bool = false,
-    last_report_request_len: u8 = 0,
-    last_report_residue: u32 = 0,
-    last_report_len: u8 = 0,
-    last_nonzero_report_len: u8 = 0,
-    last_report: [REPORT_BUFFER_LEN]u8 = .{0} ** REPORT_BUFFER_LEN,
-    last_nonzero_report: [REPORT_BUFFER_LEN]u8 = .{0} ** REPORT_BUFFER_LEN,
-};
-
+const keyboard = @import("../input/keyboard.zig");
+const mouse = @import("../input/mouse.zig");
+const hid_set1 = @import("../input/hid_set1.zig");
+const platform_input = @import("../input/platform_input.zig");
+const r4p_contract = @import("../../net/r4p_contract.zig");
+const Text = usb_core.Text;
 pub const Status = struct {
     initialized: bool = false,
     keyboard_present: bool = false,
@@ -135,878 +60,246 @@ pub const Status = struct {
     boot_last_result: i32 = 0,
     reason: []const u8 = "not initialized",
 };
-
-var current: Status = .{};
-var keyboard_binding: HidBinding = .{};
-var mouse_binding: HidBinding = .{};
-var consumer_binding: HidBinding = .{};
-const platform_input = @import("../input/platform_input.zig");
-var service_polls: u64 = 0;
-var keyboard_backpressure_active = false;
-var keyboard_backpressure_polls: u64 = 0;
-var topology_reconciles: u64 = 0;
-var boot_r4p_classify: u64 = 0;
-var boot_r4p_keyboard: u64 = 0;
-var boot_r4p_mouse: u64 = 0;
-var boot_dispatch_failures: u64 = 0;
-var boot_last_result: i32 = 0;
-
+const NativeStatus = extern struct {
+    initialized: bool,
+    keyboard_present: bool,
+    keyboard_bound: bool,
+    mouse_present: bool,
+    mouse_bound: bool,
+    unsupported_hid: u8,
+    missing_endpoint_hid: u8,
+    port: u8,
+    interface_number: u8,
+    endpoint_address: u8,
+    endpoint_interval: u8,
+    endpoint_max_packet: u16,
+    polls: u64,
+    no_reports: u64,
+    reports: u64,
+    duplicate_reports: u64,
+    service_polls: u64,
+    decoded_keys: u64,
+    decoded_mouse: u64,
+    drops: u64,
+    keyboard_backpressure_active: bool,
+    keyboard_backpressure_polls: u64,
+    keyboard_queue_capacity: u32,
+    keyboard_queue_pending: u32,
+    keyboard_queue_free: u32,
+    keyboard_queue_drops: u64,
+    topology_reconciles: u64,
+    failures: u64,
+    setup_warnings: u8,
+    protocol_ok: bool,
+    idle_ok: bool,
+    report_id_heuristic: bool,
+    report_descriptor_ok: bool,
+    report_descriptor_malformed: bool,
+    last_report_request_len: u8,
+    last_report_residue: u32,
+    last_report_len: u8,
+    last_nonzero_report_len: u8,
+    last_modifiers: u8,
+    last_usage: u8,
+    last_mouse_buttons: u8,
+    last_mouse_dx: i32,
+    last_mouse_dy: i32,
+    last_mouse_wheel: i32,
+    boot_source: Text,
+    boot_r4p_classify: u64,
+    boot_r4p_keyboard: u64,
+    boot_r4p_mouse: u64,
+    protocol_required_missing: u8,
+    boot_dispatch_failures: u64,
+    boot_last_result: i32,
+    reason: Text,
+};
+comptime {
+    if (@sizeOf(NativeStatus) != 248 or @alignOf(NativeStatus) != 8) @compileError("HID status C layout");
+    if (@offsetOf(NativeStatus, "initialized") != 0) @compileError("HID status initialized C offset");
+    if (@offsetOf(NativeStatus, "keyboard_present") != 1) @compileError("HID status keyboard_present C offset");
+    if (@offsetOf(NativeStatus, "keyboard_bound") != 2) @compileError("HID status keyboard_bound C offset");
+    if (@offsetOf(NativeStatus, "mouse_present") != 3) @compileError("HID status mouse_present C offset");
+    if (@offsetOf(NativeStatus, "mouse_bound") != 4) @compileError("HID status mouse_bound C offset");
+    if (@offsetOf(NativeStatus, "unsupported_hid") != 5) @compileError("HID status unsupported_hid C offset");
+    if (@offsetOf(NativeStatus, "missing_endpoint_hid") != 6) @compileError("HID status missing_endpoint_hid C offset");
+    if (@offsetOf(NativeStatus, "port") != 7) @compileError("HID status port C offset");
+    if (@offsetOf(NativeStatus, "interface_number") != 8) @compileError("HID status interface_number C offset");
+    if (@offsetOf(NativeStatus, "endpoint_address") != 9) @compileError("HID status endpoint_address C offset");
+    if (@offsetOf(NativeStatus, "endpoint_interval") != 10) @compileError("HID status endpoint_interval C offset");
+    if (@offsetOf(NativeStatus, "endpoint_max_packet") != 12) @compileError("HID status endpoint_max_packet C offset");
+    if (@offsetOf(NativeStatus, "polls") != 16) @compileError("HID status polls C offset");
+    if (@offsetOf(NativeStatus, "no_reports") != 24) @compileError("HID status no_reports C offset");
+    if (@offsetOf(NativeStatus, "reports") != 32) @compileError("HID status reports C offset");
+    if (@offsetOf(NativeStatus, "duplicate_reports") != 40) @compileError("HID status duplicate_reports C offset");
+    if (@offsetOf(NativeStatus, "service_polls") != 48) @compileError("HID status service_polls C offset");
+    if (@offsetOf(NativeStatus, "decoded_keys") != 56) @compileError("HID status decoded_keys C offset");
+    if (@offsetOf(NativeStatus, "decoded_mouse") != 64) @compileError("HID status decoded_mouse C offset");
+    if (@offsetOf(NativeStatus, "drops") != 72) @compileError("HID status drops C offset");
+    if (@offsetOf(NativeStatus, "keyboard_backpressure_active") != 80) @compileError("HID status keyboard_backpressure_active C offset");
+    if (@offsetOf(NativeStatus, "keyboard_backpressure_polls") != 88) @compileError("HID status keyboard_backpressure_polls C offset");
+    if (@offsetOf(NativeStatus, "keyboard_queue_capacity") != 96) @compileError("HID status keyboard_queue_capacity C offset");
+    if (@offsetOf(NativeStatus, "keyboard_queue_pending") != 100) @compileError("HID status keyboard_queue_pending C offset");
+    if (@offsetOf(NativeStatus, "keyboard_queue_free") != 104) @compileError("HID status keyboard_queue_free C offset");
+    if (@offsetOf(NativeStatus, "keyboard_queue_drops") != 112) @compileError("HID status keyboard_queue_drops C offset");
+    if (@offsetOf(NativeStatus, "topology_reconciles") != 120) @compileError("HID status topology_reconciles C offset");
+    if (@offsetOf(NativeStatus, "failures") != 128) @compileError("HID status failures C offset");
+    if (@offsetOf(NativeStatus, "setup_warnings") != 136) @compileError("HID status setup_warnings C offset");
+    if (@offsetOf(NativeStatus, "protocol_ok") != 137) @compileError("HID status protocol_ok C offset");
+    if (@offsetOf(NativeStatus, "idle_ok") != 138) @compileError("HID status idle_ok C offset");
+    if (@offsetOf(NativeStatus, "report_id_heuristic") != 139) @compileError("HID status report_id_heuristic C offset");
+    if (@offsetOf(NativeStatus, "report_descriptor_ok") != 140) @compileError("HID status report_descriptor_ok C offset");
+    if (@offsetOf(NativeStatus, "report_descriptor_malformed") != 141) @compileError("HID status report_descriptor_malformed C offset");
+    if (@offsetOf(NativeStatus, "last_report_request_len") != 142) @compileError("HID status last_report_request_len C offset");
+    if (@offsetOf(NativeStatus, "last_report_residue") != 144) @compileError("HID status last_report_residue C offset");
+    if (@offsetOf(NativeStatus, "last_report_len") != 148) @compileError("HID status last_report_len C offset");
+    if (@offsetOf(NativeStatus, "last_nonzero_report_len") != 149) @compileError("HID status last_nonzero_report_len C offset");
+    if (@offsetOf(NativeStatus, "last_modifiers") != 150) @compileError("HID status last_modifiers C offset");
+    if (@offsetOf(NativeStatus, "last_usage") != 151) @compileError("HID status last_usage C offset");
+    if (@offsetOf(NativeStatus, "last_mouse_buttons") != 152) @compileError("HID status last_mouse_buttons C offset");
+    if (@offsetOf(NativeStatus, "last_mouse_dx") != 156) @compileError("HID status last_mouse_dx C offset");
+    if (@offsetOf(NativeStatus, "last_mouse_dy") != 160) @compileError("HID status last_mouse_dy C offset");
+    if (@offsetOf(NativeStatus, "last_mouse_wheel") != 164) @compileError("HID status last_mouse_wheel C offset");
+    if (@offsetOf(NativeStatus, "boot_source") != 168) @compileError("HID status boot_source C offset");
+    if (@offsetOf(NativeStatus, "boot_r4p_classify") != 184) @compileError("HID status boot_r4p_classify C offset");
+    if (@offsetOf(NativeStatus, "boot_r4p_keyboard") != 192) @compileError("HID status boot_r4p_keyboard C offset");
+    if (@offsetOf(NativeStatus, "boot_r4p_mouse") != 200) @compileError("HID status boot_r4p_mouse C offset");
+    if (@offsetOf(NativeStatus, "protocol_required_missing") != 208) @compileError("HID status protocol_required_missing C offset");
+    if (@offsetOf(NativeStatus, "boot_dispatch_failures") != 216) @compileError("HID status boot_dispatch_failures C offset");
+    if (@offsetOf(NativeStatus, "boot_last_result") != 224) @compileError("HID status boot_last_result C offset");
+    if (@offsetOf(NativeStatus, "reason") != 232) @compileError("HID status reason C offset");
+}
 pub const Options = struct {
     bind_mouse: bool = true,
 };
-var options: Options = .{};
-
-pub fn init() bool {
-    return initWithOptions(.{});
-}
-
-// Boot environments choose their admitted input classes once. Topology
-// reconciliation keeps the same choice when devices appear later.
-pub fn initWithOptions(selected: Options) bool {
-    if (!xhci.acquireControllerOwnership()) return false;
-    defer xhci.releaseControllerOwnership();
-    options = selected;
-    current = .{ .initialized = true, .reason = "no USB HID boot device found" };
-    keyboard_binding = .{};
-    mouse_binding = .{};
-    consumer_binding = .{};
-    platform_input.usb(false);
-    service_polls = 0;
-    keyboard_backpressure_active = false;
-    keyboard_backpressure_polls = 0;
-    topology_reconciles = 0;
-    boot_r4p_classify = 0;
-    boot_r4p_keyboard = 0;
-    boot_r4p_mouse = 0;
-    boot_dispatch_failures = 0;
-    boot_last_result = 0;
-    xhci.setTopologyHook(topologyChangedHook);
-
-    var index: usize = 0;
-    while (usb_core.deviceAt(index)) |dev| : (index += 1) {
-        scanDevice(dev);
-    }
-
-    refreshAggregateStatus();
-    if (current.keyboard_bound and current.mouse_bound) {
-        current.reason = "USB HID boot keyboard bound; USB HID boot mouse bound";
-        if (current.setup_warnings != 0) current.reason = "USB HID boot keyboard bound; USB HID boot mouse bound; optional class setup warning";
-    }
-    return current.keyboard_bound or current.mouse_bound or consumer_binding.bound;
-}
-
-fn topologyChangedHook() callconv(.c) void {
-    topology_reconciles +%= 1;
-    reconcileBindings();
-    if (keyboard_binding.bound or mouse_binding.bound or consumer_binding.bound) _ = startPollTask();
-}
-
-fn reconcileBindings() void {
-    if (!xhci.acquireControllerOwnership()) {
-        current.reason = "USB HID topology reconcile ownership failed";
-        return;
-    }
-    defer xhci.releaseControllerOwnership();
-
-    if (keyboard_binding.present and !bindingStillPublished(&keyboard_binding)) keyboard_binding = .{};
-    if (mouse_binding.present and !bindingStillPublished(&mouse_binding)) mouse_binding = .{};
-    if (consumer_binding.present and !bindingStillPublished(&consumer_binding)) consumer_binding = .{};
-    if (!keyboard_binding.bound) {
-        keyboard_backpressure_active = false;
-        keyboard.setPollHook(null);
-    }
-    if (!mouse_binding.bound) mouse.setPollHook(null);
-
-    current.unsupported_hid = 0;
-    current.missing_endpoint_hid = 0;
-    current.protocol_required_missing = 0;
-    var index: usize = 0;
-    while (usb_core.deviceAt(index)) |dev| : (index += 1) scanDevice(dev);
-
-    refreshAggregateStatus();
-    if (current.keyboard_bound and current.mouse_bound) {
-        current.reason = "USB HID boot keyboard bound; USB HID boot mouse bound";
-    } else if (current.keyboard_bound) {
-        current.reason = "USB HID boot keyboard bound";
-    } else if (current.mouse_bound) {
-        current.reason = "USB HID boot mouse bound";
-    } else {
-        current.reason = "no USB HID boot device found";
-    }
-}
-
-fn bindingStillPublished(binding: *const HidBinding) bool {
-    if (!binding.present or binding.port == 0 or binding.device.slot_id == 0) return false;
-    var index: usize = 0;
-    while (usb_core.deviceAt(index)) |dev| : (index += 1) {
-        if (!dev.active or !dev.configured) continue;
-        if (dev.port == binding.port and dev.slot_id == binding.device.slot_id) {
-            const live = xhci.deviceHandleFromCore(dev);
-            return live.generation != 0 and live.generation == binding.device.generation;
-        }
-    }
-    return false;
-}
-
-fn scanDevice(dev: *const usb_core.Device) void {
-    var records_seen = false;
-    var iface_index: usize = 0;
-    while (iface_index < @as(usize, dev.interface_record_count) and iface_index < usb_core.MAX_USB_INTERFACES) : (iface_index += 1) {
-        const iface = dev.interfaces[iface_index];
-        if (!iface.active) continue;
-        records_seen = true;
-        handleCandidate(dev, .{
-            .number = iface.number,
-            .class_code = iface.class_code,
-            .subclass = iface.subclass,
-            .protocol = iface.protocol,
-            .endpoint_address = chooseInterruptEndpoint(iface.interrupt_in_endpoint_address, iface.first_endpoint_address, iface.first_endpoint_attributes),
-            .endpoint_max_packet = if (iface.interrupt_in_endpoint_address != 0) iface.interrupt_in_endpoint_max_packet else iface.first_endpoint_max_packet,
-            .endpoint_interval = if (iface.interrupt_in_endpoint_address != 0) iface.interrupt_in_endpoint_interval else iface.first_endpoint_interval,
-            .report_descriptor_len = iface.hid_report_descriptor_len,
-        });
-    }
-    if (!records_seen) {
-        handleCandidate(dev, .{
-            .number = dev.first_interface_number,
-            .class_code = dev.first_interface_class,
-            .subclass = dev.first_interface_subclass,
-            .protocol = dev.first_interface_protocol,
-            .endpoint_address = chooseInterruptEndpoint(0, dev.first_endpoint_address, dev.first_endpoint_attributes),
-            .endpoint_max_packet = dev.first_endpoint_max_packet,
-            .endpoint_interval = dev.first_endpoint_interval,
-            .report_descriptor_len = dev.hid_report_descriptor_len,
-        });
-    }
-}
-
-fn chooseInterruptEndpoint(interrupt_in: u8, first_address: u8, first_attributes: u8) u8 {
-    if (interrupt_in != 0) return interrupt_in;
-    if ((first_address & 0x80) != 0 and (first_attributes & 0x03) == 0x03) return first_address;
-    return 0;
-}
-
-fn handleCandidate(dev: *const usb_core.Device, candidate: HidInterfaceCandidate) void {
-    if (candidate.class_code != 0x03) return;
-    if (!options.bind_mouse and candidate.subclass == 0x01 and candidate.protocol == 0x02) return;
-    // Non-boot HID interfaces use the advertised report descriptor. Keep
-    // boot keyboard/mouse transport and their negotiated protocol intact.
-    if (candidate.subclass == 0 and candidate.protocol == 0 and candidateHasInterruptEndpoint(candidate)) {
-        if (consumer_binding.bound or !hidProtocolRolesReady()) return;
-        fillBinding(&consumer_binding, dev, candidate);
-        consumer_binding.report_protocol = true;
-        readReportDescriptor(&consumer_binding);
-        const decoded = hid_report.consumer(&consumer_binding.report_wire, &.{}) orelse return;
-        if (!consumer_binding.report_descriptor_ok or decoded.capabilities == 0) return;
-        consumer_binding.consumer_caps = decoded.capabilities;
-        if (bindDevice(&consumer_binding, .consumer)) platform_input.usb(true);
-        return;
-    }
-    const kind = classifyCandidate(candidate) orelse {
-        if (candidate.subclass == 0x01 and !candidateHasInterruptEndpoint(candidate)) {
-            current.missing_endpoint_hid += 1;
-            current.reason = "USB HID boot device missing interrupt-in endpoint";
-        } else if (candidate.subclass != 0x01 or (candidate.protocol != 0x01 and candidate.protocol != 0x02)) {
-            current.unsupported_hid += 1;
-        }
-        return;
-    };
-    if (kind == .keyboard) {
-        if (keyboard_binding.bound) return;
-        current.keyboard_present = true;
-        fillBinding(&keyboard_binding, dev, candidate);
-        if (bindDevice(&keyboard_binding, .keyboard)) {
-            current.keyboard_bound = true;
-            keyboard.setPollHook(pollHook);
-            current.reason = if (keyboard_binding.setup_warnings == 0) "USB HID boot keyboard bound" else "USB HID boot keyboard bound; optional class setup warning";
-        } else {
-            current.reason = "USB HID keyboard bind failed";
-        }
-        return;
-    }
-    if (kind == .mouse) {
-        if (!options.bind_mouse) return;
-        if (mouse_binding.bound) return;
-        current.mouse_present = true;
-        fillBinding(&mouse_binding, dev, candidate);
-        if (bindDevice(&mouse_binding, .mouse)) {
-            current.mouse_bound = true;
-            mouse.setPollHook(mousePollHook);
-            current.reason = if (mouse_binding.setup_warnings == 0) "USB HID boot mouse bound" else "USB HID boot mouse bound; optional class setup warning";
-        } else {
-            current.reason = "USB HID mouse bind failed";
-        }
-        return;
-    }
-    current.unsupported_hid += 1;
-}
-
-fn classifyCandidate(candidate: HidInterfaceCandidate) ?HidKind {
-    if (!hidProtocolRolesReady()) {
-        recordRequiredProtocolBlock(candidate);
-        return null;
-    }
-    return classifyCandidateR4p(candidate);
-}
-
-fn classifyCandidateR4p(candidate: HidInterfaceCandidate) ?HidKind {
-    if (!r4p.hasActiveR4p("usb.hid_boot")) return null;
-    var op: r4p_contract.UsbHidBootOp = .{
-        .class_code = candidate.class_code,
-        .subclass = candidate.subclass,
-        .protocol = candidate.protocol,
-        .endpoint_address = candidate.endpoint_address,
-        .endpoint_max_packet = candidate.endpoint_max_packet,
-    };
-    if (!dispatchBoot(r4p_contract.USB_HID_BOOT_OP_CLASSIFY_INTERFACE, &op)) return null;
-    if (op.result != r4p_contract.USB_HID_BOOT_RESULT_OK) return null;
-    boot_r4p_classify +%= 1;
-    return switch (op.kind) {
-        r4p_contract.USB_HID_BOOT_KIND_KEYBOARD => .keyboard,
-        r4p_contract.USB_HID_BOOT_KIND_MOUSE => .mouse,
-        else => null,
-    };
-}
-
-fn candidateHasInterruptEndpoint(candidate: HidInterfaceCandidate) bool {
-    return (candidate.endpoint_address & 0x80) != 0 and candidate.endpoint_max_packet != 0;
-}
-
-fn hidProtocolRolesReady() bool {
-    return r4p.hasActiveR4p("usb.hid_report") and r4p.hasActiveR4p("usb.hid_boot");
-}
-
-fn recordRequiredProtocolBlock(candidate: HidInterfaceCandidate) void {
-    if (candidate.class_code != 0x03 or candidate.subclass != 0x01) return;
-    if (candidate.protocol != 0x01 and candidate.protocol != 0x02) return;
-    if (!candidateHasInterruptEndpoint(candidate)) return;
-    current.protocol_required_missing +|= 1;
-    current.reason = missingProtocolReason();
-}
-
-fn missingProtocolReason() []const u8 {
-    const report_missing = !r4p.hasActiveR4p("usb.hid_report");
-    const boot_missing = !r4p.hasActiveR4p("usb.hid_boot");
-    if (report_missing and boot_missing) return "HIDREPORT.R4P and USBHID.R4P required";
-    if (report_missing) return "HIDREPORT.R4P required";
-    if (boot_missing) return "USBHID.R4P required";
-    return "USB HID R4P required";
-}
-
-fn dispatchBoot(opcode: u32, op: *r4p_contract.UsbHidBootOp) bool {
-    var buffer = protocol_api.ProtocolBuffer{
-        .data = op,
-        .len = @sizeOf(r4p_contract.UsbHidBootOp),
-        .capacity = @sizeOf(r4p_contract.UsbHidBootOp),
-        .flags = 0,
-        .reserved = 0,
-    };
-    var out: protocol_api.ProtocolBuffer = .{};
-    const result = r4p.dispatch("usb.hid_boot", opcode, &buffer, &out);
-    boot_last_result = result;
-    if (result != r4p_contract.USB_HID_BOOT_RESULT_OK and result != r4p_contract.USB_HID_BOOT_RESULT_IGNORED) {
-        boot_dispatch_failures +%= 1;
-        return false;
-    }
-    return true;
-}
-
-pub fn status() Status {
-    refreshAggregateStatus();
-    return current;
-}
-
-pub fn diagnosticPoll() void {
-    servicePoll();
-}
-
-pub fn servicePoll() void {
-    service_polls +%= 1;
-    pollKeyboard();
-    pollMouse();
-    _ = pollBinding(&consumer_binding, .consumer);
-    platform_input.usb(consumer_binding.bound and consumer_binding.consumer_caps != 0);
-}
-
-// 0.56.17: Autonomer Input-Poll-Task (Befund 7.1). Bisher trieben nur die
-// poll_hooks in keyboard.readChar/mouse.snapshotForApi das USB-HID-Polling -
-// ohne Konsumenten stand die Eingabe still. Der Task pollt selbst im
-// 1-Tick-Takt (10 ms, passend zum typischen Endpoint-bInterval von 8-10 ms);
-// die poll_hooks bleiben als Fallback bestehen. Start aus main.zig NACH
-// initTaskRuntime (task.init() wischt fruehere Threads).
-const POLL_TASK_MARKER_FIRST: u64 = 300; // erster Marker nach ~3 s
-const POLL_TASK_MARKER_INTERVAL: u64 = 6000; // danach alle ~60 s
-
-var poll_task_started = false;
-var poll_task_id: u32 = 0;
-var poll_task_iterations: u64 = 0;
-
-pub const PollTaskSummary = struct {
+pub const PollTaskSummary = extern struct {
     started: bool = false,
     task_id: u32 = 0,
     iterations: u64 = 0,
 };
 
-pub fn pollTaskSummary() PollTaskSummary {
+extern fn r4os_rust_usb_hid_status(*NativeStatus) void;
+extern fn r4os_rust_usb_hid_init(bool) bool;
+extern fn r4os_rust_usb_hid_service_poll() void;
+extern fn r4os_rust_usb_hid_start_poll_task() bool;
+extern fn r4os_rust_usb_hid_poll_task_summary(*PollTaskSummary) void;
+pub fn init() bool {
+    return initWithOptions(.{});
+}
+pub fn initWithOptions(selected: Options) bool {
+    return r4os_rust_usb_hid_init(selected.bind_mouse);
+}
+pub fn status() Status {
+    var out: NativeStatus = undefined;
+    r4os_rust_usb_hid_status(&out);
     return .{
-        .started = poll_task_started,
-        .task_id = poll_task_id,
-        .iterations = poll_task_iterations,
+        .initialized = out.initialized,
+        .keyboard_present = out.keyboard_present,
+        .keyboard_bound = out.keyboard_bound,
+        .mouse_present = out.mouse_present,
+        .mouse_bound = out.mouse_bound,
+        .unsupported_hid = out.unsupported_hid,
+        .missing_endpoint_hid = out.missing_endpoint_hid,
+        .port = out.port,
+        .interface_number = out.interface_number,
+        .endpoint_address = out.endpoint_address,
+        .endpoint_interval = out.endpoint_interval,
+        .endpoint_max_packet = out.endpoint_max_packet,
+        .polls = out.polls,
+        .no_reports = out.no_reports,
+        .reports = out.reports,
+        .duplicate_reports = out.duplicate_reports,
+        .service_polls = out.service_polls,
+        .decoded_keys = out.decoded_keys,
+        .decoded_mouse = out.decoded_mouse,
+        .drops = out.drops,
+        .keyboard_backpressure_active = out.keyboard_backpressure_active,
+        .keyboard_backpressure_polls = out.keyboard_backpressure_polls,
+        .keyboard_queue_capacity = out.keyboard_queue_capacity,
+        .keyboard_queue_pending = out.keyboard_queue_pending,
+        .keyboard_queue_free = out.keyboard_queue_free,
+        .keyboard_queue_drops = out.keyboard_queue_drops,
+        .topology_reconciles = out.topology_reconciles,
+        .failures = out.failures,
+        .setup_warnings = out.setup_warnings,
+        .protocol_ok = out.protocol_ok,
+        .idle_ok = out.idle_ok,
+        .report_id_heuristic = out.report_id_heuristic,
+        .report_descriptor_ok = out.report_descriptor_ok,
+        .report_descriptor_malformed = out.report_descriptor_malformed,
+        .last_report_request_len = out.last_report_request_len,
+        .last_report_residue = out.last_report_residue,
+        .last_report_len = out.last_report_len,
+        .last_nonzero_report_len = out.last_nonzero_report_len,
+        .last_modifiers = out.last_modifiers,
+        .last_usage = out.last_usage,
+        .last_mouse_buttons = out.last_mouse_buttons,
+        .last_mouse_dx = out.last_mouse_dx,
+        .last_mouse_dy = out.last_mouse_dy,
+        .last_mouse_wheel = out.last_mouse_wheel,
+        .boot_source = out.boot_source.slice(),
+        .boot_r4p_classify = out.boot_r4p_classify,
+        .boot_r4p_keyboard = out.boot_r4p_keyboard,
+        .boot_r4p_mouse = out.boot_r4p_mouse,
+        .protocol_required_missing = out.protocol_required_missing,
+        .boot_dispatch_failures = out.boot_dispatch_failures,
+        .boot_last_result = out.boot_last_result,
+        .reason = out.reason.slice(),
     };
 }
-
+pub fn servicePoll() void {
+    r4os_rust_usb_hid_service_poll();
+}
+pub fn diagnosticPoll() void {
+    r4os_rust_usb_hid_service_poll();
+}
 pub fn startPollTask() bool {
-    if (poll_task_started) return true;
-    const worker = sched_task.createKernelThreadBlockedWithRole("usb-hid-poll", pollTaskMain, .input) orelse {
-        k.puts("USBHID poll-task create failed\r\n");
-        return false;
-    };
-    poll_task_started = true;
-    poll_task_id = native_tasks.get(worker, .id);
-    sched_task.markReady(worker, timer_core.tickCount());
-    k.puts("USBHID poll-task started id=");
-    k.putDec(native_tasks.get(worker, .id));
-    k.puts("\r\n");
-    return true;
+    return r4os_rust_usb_hid_start_poll_task();
 }
-
-fn pollTaskMain() callconv(.c) void {
-    while (true) {
-        servicePoll();
-        poll_task_iterations +%= 1;
-        if (poll_task_iterations == POLL_TASK_MARKER_FIRST or
-            (poll_task_iterations > POLL_TASK_MARKER_FIRST and
-                (poll_task_iterations - POLL_TASK_MARKER_FIRST) % POLL_TASK_MARKER_INTERVAL == 0))
-        {
-            emitPollTaskMarker();
-        }
-        // 0.56.29: 10 ms Echtzeit-Raster (wie 1 Tick bei 100 Hz) - bei
-        // 1000 Hz wuerde 1 Tick sonst 1000 MMIO-Pollrunden/s bedeuten.
-        scheduler.sleepTicksWithReason(hid_poll_idle_ticks, "usb-hid-poll-idle");
-    }
+pub fn pollTaskSummary() PollTaskSummary {
+    var out: PollTaskSummary = undefined;
+    r4os_rust_usb_hid_poll_task_summary(&out);
+    return out;
 }
-
-// COM1-Marker: belegt autonomes Polling ohne Konsumenten und verifiziert
-// den 0.56.16-Halted-Check unter Dauer-Polling (halted_checks>0 bei
-// weiterhin aktiven Bindings = Output-Context-Offset korrekt).
-fn emitPollTaskMarker() void {
-    const xs = xhci.status();
-    const keys = keyboard.stats();
-    k.puts("[USBHIDPOLL] service_polls=");
-    k.putDec(service_polls);
-    k.puts(" interrupt_polls=");
-    k.putDec(xs.interrupt_polls);
-    k.puts(" reports=");
-    k.putDec(xs.interrupt_reports);
-    k.puts(" no_report=");
-    k.putDec(xs.interrupt_no_report);
-    k.puts(" halted_checks=");
-    k.putDec(xs.interrupt_halted_checks);
-    k.puts(" recoveries=");
-    k.putDec(xs.interrupt_recoveries);
-    k.puts(" pending_timeouts=");
-    k.putDec(xs.interrupt_pending_timeouts);
-    k.puts(" ring_enqueue=");
-    k.putDec(xs.interrupt_enqueue);
-    k.puts(" ring_pcs=");
-    k.putDec(xs.interrupt_cycle);
-    k.puts(" link_c=");
-    k.putDec(xs.interrupt_link_cycle);
-    k.puts(" ring_wraps=");
-    k.putDec(xs.interrupt_ring_wraps);
-    k.puts(" pending=");
-    k.putDec(@intFromBool(xs.interrupt_pending));
-    k.puts(" pending_index=");
-    k.putDec(xs.interrupt_pending_index);
-    k.puts(" pending_streak=");
-    k.putDec(xs.interrupt_pending_streak);
-    k.puts(" ep_state=");
-    k.putDec(xs.last_interrupt_ep_state);
-    k.puts(" event_wraps=");
-    k.putDec(xs.event_ring_wraps);
-    k.puts(" events=");
-    k.putDec(xs.events);
-    k.puts(" event_dequeue=");
-    k.putDec(xs.event_dequeue);
-    k.puts(" event_ccs=");
-    k.putDec(xs.event_cycle);
-    k.puts(" event_raw_c=");
-    k.putDec(xs.event_raw_cycle);
-    k.puts(" event_raw_type=");
-    k.putDec(xs.event_raw_type);
-    k.puts(" event_raw_code=");
-    k.putDec(xs.event_raw_code);
-    k.puts(" event_commits=");
-    k.putDec(xs.event_erdp_commits);
-    k.puts(" event_max_batch=");
-    k.putDec(xs.event_max_batch);
-    k.puts(" event_tick_waits=");
-    k.putDec(xs.event_tick_deadline_waits);
-    k.puts(" event_hpet_waits=");
-    k.putDec(xs.event_hpet_deadline_waits);
-    k.puts(" event_tsc_waits=");
-    k.putDec(xs.event_tsc_deadline_waits);
-    k.puts(" event_hpet_timeouts=");
-    k.putDec(xs.event_hpet_timeouts);
-    k.puts(" event_tsc_timeouts=");
-    k.putDec(xs.event_tsc_timeouts);
-    k.puts(" event_cpu_guard_timeouts=");
-    k.putDec(xs.event_cpu_guard_timeouts);
-    k.puts(" ring_full=");
-    k.putDec(xs.ring_full);
-    k.puts(" stale_events=");
-    k.putDec(xs.stale_events);
-    k.puts(" port_events=");
-    k.putDec(xs.port_change_events);
-    k.puts(" port_pending=");
-    k.putDec(xs.port_change_pending);
-    k.puts(" port_coalesced=");
-    k.putDec(xs.port_change_coalesced);
-    k.puts(" keyboard_pending=");
-    k.putDec(keys.queue_pending);
-    k.puts(" keyboard_free=");
-    k.putDec(keys.queue_capacity - keys.queue_pending);
-    k.puts(" keyboard_drops=");
-    k.putDec(keys.dropped_count);
-    k.puts(" backpressure=");
-    k.putDec(@intFromBool(keyboard_backpressure_active));
-    k.puts(" backpressure_polls=");
-    k.putDec(keyboard_backpressure_polls);
-    k.puts(" erdp=0x");
-    k.putHex(xs.erdp0, 16);
-    k.puts(" iman=0x");
-    k.putHex(xs.iman0, 8);
-    k.puts(" usbsts=0x");
-    k.putHex(xs.usbsts, 8);
-    k.puts(" hw_dequeue=0x");
-    k.putHex(xs.interrupt_hw_dequeue, 16);
-    k.puts(" deferred_pending=");
-    k.putDec(xs.deferred_events_pending);
-    k.puts(" deferred_queued=");
-    k.putDec(xs.deferred_events_queued);
-    k.puts(" deferred_delivered=");
-    k.putDec(xs.deferred_events_delivered);
-    k.puts(" deferred_overflows=");
-    k.putDec(xs.deferred_events_overflows);
-    k.puts(" deferred_purged=");
-    k.putDec(xs.deferred_events_purged);
-    k.puts("\r\n");
+const QueueStats = extern struct { capacity: u32, pending: u32, drops: u64 };
+export fn r4os_zig_usb_hid_queue(out: *QueueStats) void {
+    const value = keyboard.stats();
+    out.* = .{ .capacity = value.queue_capacity, .pending = value.queue_pending, .drops = value.dropped_count };
 }
-
-fn fillBinding(binding: *HidBinding, dev: *const usb_core.Device, candidate: HidInterfaceCandidate) void {
-    const device = xhci.deviceHandleFromCore(dev);
-    binding.* = .{
-        .present = true,
-        .port = dev.port,
-        .device = device,
-        .endpoint = .{
-            .device = device,
-            .kind = .interrupt_in,
-            .address = candidate.endpoint_address,
-            .max_packet = candidate.endpoint_max_packet,
-            .interval = candidate.endpoint_interval,
-        },
-        .interface_number = candidate.number,
-        .endpoint_address = candidate.endpoint_address,
-        .endpoint_interval = candidate.endpoint_interval,
-        .endpoint_max_packet = candidate.endpoint_max_packet,
-        .report_descriptor_len = candidate.report_descriptor_len,
-    };
+export fn r4os_zig_usb_hid_can_accept(count: u32) bool {
+    return keyboard.canAccept(count);
 }
-
-fn bindDevice(binding: *HidBinding, kind: HidKind) bool {
-    if (!xhci.selectDeviceHandle(&binding.device)) {
-        binding.failures += 1;
-        current.reason = switch (kind) {
-            .keyboard => "USB HID keyboard select failed",
-            .mouse => "USB HID mouse select failed",
-            .consumer => "USB HID Consumer select failed",
-        };
-        return false;
-    }
-    binding.bound = bindInterruptInput(binding);
-    return binding.bound;
+export fn r4os_zig_usb_hid_platform_usb(value: bool) void {
+    platform_input.usb(value);
 }
-
-fn bindInterruptInput(binding: *HidBinding) bool {
-    if (!xhci.setConfigurationForHandle(&binding.device)) {
-        binding.setup_warnings += 1;
-    }
-    if (binding.report_protocol) {
-        // SET_PROTOCOL is defined only for boot subclasses; reset selects
-        // report protocol for the dedicated Consumer interface.
-        binding.protocol_ok = true;
-    } else if (!xhci.setHidBootProtocolForHandle(&binding.device, binding.interface_number)) {
-        binding.setup_warnings += 1;
-    } else {
-        binding.protocol_ok = true;
-    }
-    if (!xhci.setHidIdleForHandle(&binding.device, binding.interface_number)) {
-        binding.setup_warnings += 1;
-    } else {
-        binding.idle_ok = true;
-    }
-    if (!binding.report_protocol) readReportDescriptor(binding);
-    if (!xhci.configureInterruptInEndpointHandle(&binding.endpoint)) {
-        binding.failures += 1;
-        current.reason = "interrupt endpoint configure failed";
-        return false;
-    }
-    return true;
+export fn r4os_zig_usb_hid_consumer(usage: u16) void {
+    platform_input.consumer(usage);
 }
-
-fn readReportDescriptor(binding: *HidBinding) void {
-    if (binding.report_descriptor_len == 0) return;
-    var report_desc: [REPORT_DESCRIPTOR_MAX]u8 = .{0} ** REPORT_DESCRIPTOR_MAX;
-    const actual = xhci.getHidReportDescriptorForHandle(&binding.device, binding.interface_number, binding.report_descriptor_len, report_desc[0..]) orelse {
-        binding.setup_warnings += 1;
-        return;
-    };
-    binding.report_descriptor_read_len = @intCast(actual);
-    binding.report_summary = hid_report.parse(report_desc[0..actual], &binding.report_wire);
-    binding.report_descriptor_ok = binding.report_summary.parsed and !binding.report_summary.malformed;
-    binding.report_descriptor_malformed = binding.report_summary.malformed;
-    if (binding.report_summary.has_report_id) binding.report_id_heuristic = true;
+export fn r4os_zig_usb_hid_set_keyboard_hook(hook: ?keyboard.PollHook) void {
+    keyboard.setPollHook(hook);
 }
-
-fn pollHook() callconv(.c) void {
-    pollKeyboard();
+export fn r4os_zig_usb_hid_set_mouse_hook(hook: ?mouse.PollHook) void {
+    mouse.setPollHook(hook);
 }
-
-fn mousePollHook() callconv(.c) void {
-    pollMouse();
-}
-
-fn pollKeyboard() void {
-    _ = pollBinding(&keyboard_binding, .keyboard);
-}
-
-fn pollMouse() void {
-    var count: usize = 0;
-    while (count < MOUSE_POLL_BUDGET) : (count += 1) {
-        if (!pollBinding(&mouse_binding, .mouse)) break;
-    }
-}
-
-fn pollBinding(binding: *HidBinding, kind: HidKind) bool {
-    if (!binding.bound) return false;
-    if (kind == .keyboard) {
-        if (!keyboard.canAccept(KEYBOARD_REPORT_QUEUE_RESERVE)) {
-            keyboard_backpressure_active = true;
-            keyboard_backpressure_polls +%= 1;
-            return false;
-        }
-        keyboard_backpressure_active = false;
-    }
-    if (!xhci.acquireControllerOwnership()) {
-        binding.failures += 1;
-        return false;
-    }
-    defer xhci.releaseControllerOwnership();
-    if (!ensureSelected(binding, kind)) return false;
-    var report: [REPORT_BUFFER_LEN]u8 = .{0} ** REPORT_BUFFER_LEN;
-    const report_len = reportTransferLength(binding);
-    binding.polls += 1;
-    var host_endpoint = xhci.usbHostEndpointHandle(binding.endpoint);
-    var actual_len: u32 = 0;
-    switch (usb_host.interruptTransfer(&host_endpoint, report[0..report_len], &actual_len)) {
-        0 => {
-            binding.no_reports += 1;
-            return false;
-        },
-        1 => {},
-        else => {
-            binding.failures += 1;
-            return false;
-        },
-    }
-    const actual_report_len = if (actual_len == 0 or actual_len > report_len)
-        actualReportLength(report_len)
-    else
-        @as(usize, @intCast(actual_len));
-    binding.last_report_request_len = clippedU8(xhci.lastInterruptRequestedLength());
-    binding.last_report_residue = xhci.lastInterruptResidue();
-    binding.reports += 1;
-    if (reportHasNonzero(report[0..actual_report_len])) {
-        binding.last_nonzero_report = report;
-        binding.last_nonzero_report_len = @intCast(actual_report_len);
-    }
-    if (shouldSuppressDuplicate(binding, kind, report[0..actual_report_len])) {
-        binding.duplicate_reports += 1;
-        return true;
-    }
-    switch (kind) {
-        .keyboard => decodeKeyboardReport(binding, report[0..actual_report_len]),
-        .mouse => decodeMouseReport(binding, report[0..actual_report_len]),
-        .consumer => decodeConsumerReport(binding, report[0..actual_report_len]),
-    }
-    binding.last_report = report;
-    binding.last_report_len = @intCast(actual_report_len);
-    return true;
-}
-
-fn reportTransferLength(binding: *const HidBinding) usize {
-    var len: usize = binding.endpoint_max_packet;
-    if (len < 8) len = 8;
-    if (len > REPORT_BUFFER_LEN) len = REPORT_BUFFER_LEN;
-    return len;
-}
-
-fn actualReportLength(requested_len: usize) usize {
-    const actual = xhci.lastInterruptActualLength();
-    if (actual == 0 or actual > requested_len) return requested_len;
-    return actual;
-}
-
-fn clippedU8(value: usize) u8 {
-    if (value > 255) return 255;
-    return @intCast(value);
-}
-
-fn ensureSelected(binding: *HidBinding, kind: HidKind) bool {
-    const xs = xhci.status();
-    const exact_runtime = binding.device.slot_id != 0 and
-        xs.addressed_slot_id == binding.device.slot_id and
-        xs.addressed_port == binding.device.port;
-    if (exact_runtime and
-        xs.interrupt_endpoint_configured and
-        !xs.interrupt_endpoint_faulted and
-        xs.interrupt_endpoint_address == binding.endpoint_address)
-        return true;
-    if (!xhci.selectDeviceHandle(&binding.device)) {
-        binding.failures += 1;
-        current.reason = switch (kind) {
-            .keyboard => "USB HID keyboard select failed",
-            .mouse => "USB HID mouse select failed",
-            .consumer => "USB HID Consumer select failed",
-        };
-        return false;
-    }
-    const selected = xhci.status();
-    if (selected.addressed_slot_id == binding.device.slot_id and
-        selected.addressed_port == binding.device.port and
-        selected.interrupt_endpoint_configured and
-        !selected.interrupt_endpoint_faulted and
-        selected.interrupt_endpoint_address == binding.endpoint_address)
-    {
-        return true;
-    }
-    return bindInterruptInput(binding);
-}
-
-fn decodeConsumerReport(binding: *HidBinding, report: []const u8) void {
-    const decoded = hid_report.consumer(&binding.report_wire, report) orelse {
-        binding.failures += 1;
-        return;
-    };
-    if (decoded.report_id >= binding.consumer_pressed.len) return;
-    const pressed: u8 = @intCast(decoded.pressed);
-    const rising = pressed & ~binding.consumer_pressed[decoded.report_id];
-    binding.consumer_pressed[decoded.report_id] = pressed;
-    if (rising & 1 != 0) platform_input.consumer(0x6f);
-    if (rising & 2 != 0) platform_input.consumer(0x70);
-}
-
-fn decodeKeyboardReport(binding: *HidBinding, report: []const u8) void {
-    if (decodeKeyboardReportR4p(binding, report)) return;
-    binding.failures += 1;
-    current.reason = "USB HID keyboard R4P decode failed";
-}
-
-fn decodeMouseReport(binding: *const HidBinding, report: []const u8) void {
-    _ = binding;
-    if (decodeMouseReportR4p(report)) return;
-    current.reason = "USB HID mouse R4P decode failed";
-}
-
-fn decodeKeyboardReportR4p(binding: *HidBinding, report: []const u8) bool {
-    if (!r4p.hasActiveR4p("usb.hid_boot")) return false;
-    if (report.len > r4p_contract.USB_HID_BOOT_MAX_REPORT or binding.last_report_len > r4p_contract.USB_HID_BOOT_MAX_REPORT) return false;
-    var op: r4p_contract.UsbHidBootOp = .{
-        .protocol_ok = if (binding.protocol_ok) 1 else 0,
-        .report_len = @intCast(report.len),
-        .previous_len = binding.last_report_len,
-    };
-    if (report.len != 0) @memcpy(op.report[0..report.len], report);
-    const prev_len: usize = binding.last_report_len;
-    if (prev_len != 0) @memcpy(op.previous[0..prev_len], binding.last_report[0..prev_len]);
-    if (!dispatchBoot(r4p_contract.USB_HID_BOOT_OP_DECODE_KEYBOARD, &op)) return false;
-    if (op.result != r4p_contract.USB_HID_BOOT_RESULT_OK) return false;
-    boot_r4p_keyboard +%= 1;
-    if ((op.flags & r4p_contract.USB_HID_BOOT_FLAG_REPORT_ID_HEURISTIC) != 0) {
-        binding.report_id_heuristic = true;
-        current.report_id_heuristic = true;
-    }
-    handleModifiers(op.old_modifiers, op.new_modifiers);
-    current.last_modifiers = op.new_modifiers;
-    injectReleasedUsages(&op);
-    var i: usize = 0;
-    while (i < op.key_count and i < op.keys.len) : (i += 1) {
-        const usage = op.keys[i];
-        if (usage == 0) continue;
-        current.last_usage = usage;
-        if (injectUsage(usage, true)) {
-            current.decoded_keys += 1;
-        } else {
-            current.drops += 1;
-        }
-    }
-    return true;
-}
-
-fn decodeMouseReportR4p(report: []const u8) bool {
-    if (!r4p.hasActiveR4p("usb.hid_boot")) return false;
-    if (report.len > r4p_contract.USB_HID_BOOT_MAX_REPORT) return false;
-    var op: r4p_contract.UsbHidBootOp = .{ .report_len = @intCast(report.len) };
-    if (report.len != 0) @memcpy(op.report[0..report.len], report);
-    if (!dispatchBoot(r4p_contract.USB_HID_BOOT_OP_DECODE_MOUSE, &op)) return false;
-    if (op.result != r4p_contract.USB_HID_BOOT_RESULT_OK) return false;
-    boot_r4p_mouse +%= 1;
-    current.last_mouse_buttons = op.mouse_buttons;
-    current.last_mouse_dx = op.mouse_dx;
-    current.last_mouse_dy = op.mouse_dy;
-    current.last_mouse_wheel = op.mouse_wheel;
-    mouse.injectRelativePacketWheel(op.mouse_dx, op.mouse_dy, op.mouse_buttons, op.mouse_wheel);
-    current.decoded_mouse += 1;
-    return true;
-}
-
-fn handleModifiers(old_mods: u8, new_mods: u8) void {
-    const bits = [_]u8{ 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80 };
-    for (bits) |bit| {
-        const was = (old_mods & bit) != 0;
-        const is = (new_mods & bit) != 0;
-        if (was == is) continue;
-        injectCode(hid_set1.modifierToCode(bit).?, is);
-    }
-}
-
-fn injectUsage(usage: u8, down: bool) bool {
-    const code = hid_set1.usageToCode(usage) orelse return false;
-    injectCode(code, down);
-    return true;
-}
-
 fn injectCode(code: hid_set1.Code, down: bool) void {
     if (code.extended) keyboard.injectScancode(0xE0);
     keyboard.injectScancode(if (down) code.make else code.make | 0x80);
 }
-
-fn injectReleasedUsages(op: *const r4p_contract.UsbHidBootOp) void {
+export fn r4os_zig_usb_hid_inject_usage(usage: u8, down: bool) bool {
+    const code = hid_set1.usageToCode(usage) orelse return false;
+    injectCode(code, down);
+    return true;
+}
+export fn r4os_zig_usb_hid_inject_modifier(bit: u8, down: bool) void {
+    injectCode(hid_set1.modifierToCode(bit).?, down);
+}
+export fn r4os_zig_usb_hid_released(op: *const r4p_contract.UsbHidBootOp, out: [*]u8, capacity: usize) usize {
     const previous_len: usize = @min(op.previous_len, op.previous.len);
     const report_len: usize = @min(op.report_len, op.report.len);
     const previous_offset: usize = @min(@as(usize, op.previous_offset), previous_len);
     const report_offset: usize = @min(@as(usize, op.report_offset), report_len);
-    var released: [r4p_contract.USB_HID_BOOT_MAX_KEYS]u8 = undefined;
-    const released_count = hid_set1.collectReleasedUsages(
-        op.previous[0..previous_len],
-        previous_offset,
-        op.report[0..report_len],
-        report_offset,
-        released[0..],
-    );
-    for (released[0..released_count]) |usage| {
-        if (injectUsage(usage, false)) {
-            current.decoded_keys += 1;
-        } else {
-            current.drops += 1;
-        }
-    }
+    return hid_set1.collectReleasedUsages(op.previous[0..previous_len], previous_offset, op.report[0..report_len], report_offset, out[0..capacity]);
 }
-
-fn refreshAggregateStatus() void {
-    platform_input.usb(consumer_binding.bound and consumer_binding.consumer_caps != 0);
-    const keyboard_queue = keyboard.stats();
-    current.keyboard_present = keyboard_binding.present;
-    current.keyboard_bound = keyboard_binding.bound;
-    current.mouse_present = mouse_binding.present;
-    current.mouse_bound = mouse_binding.bound;
-    current.polls = keyboard_binding.polls + mouse_binding.polls;
-    current.no_reports = keyboard_binding.no_reports + mouse_binding.no_reports;
-    current.reports = keyboard_binding.reports + mouse_binding.reports;
-    current.duplicate_reports = keyboard_binding.duplicate_reports + mouse_binding.duplicate_reports;
-    current.service_polls = service_polls;
-    current.keyboard_backpressure_active = keyboard_backpressure_active;
-    current.keyboard_backpressure_polls = keyboard_backpressure_polls;
-    current.keyboard_queue_capacity = keyboard_queue.queue_capacity;
-    current.keyboard_queue_pending = keyboard_queue.queue_pending;
-    current.keyboard_queue_free = keyboard_queue.queue_capacity - keyboard_queue.queue_pending;
-    current.keyboard_queue_drops = keyboard_queue.dropped_count;
-    current.topology_reconciles = topology_reconciles;
-    current.failures = keyboard_binding.failures + mouse_binding.failures;
-    current.setup_warnings = keyboard_binding.setup_warnings +| mouse_binding.setup_warnings;
-    current.report_id_heuristic = current.report_id_heuristic or keyboard_binding.report_id_heuristic or mouse_binding.report_id_heuristic;
-    current.report_descriptor_ok = reportDescriptorAggregateOk();
-    current.report_descriptor_malformed = keyboard_binding.report_descriptor_malformed or mouse_binding.report_descriptor_malformed;
-    current.last_report_len = @max(keyboard_binding.last_report_len, mouse_binding.last_report_len);
-    current.last_nonzero_report_len = @max(keyboard_binding.last_nonzero_report_len, mouse_binding.last_nonzero_report_len);
-    current.last_report_request_len = @max(keyboard_binding.last_report_request_len, mouse_binding.last_report_request_len);
-    current.last_report_residue = @max(keyboard_binding.last_report_residue, mouse_binding.last_report_residue);
-    current.boot_source = r4p.requiredSourceName("usb.hid_boot");
-    current.boot_r4p_classify = boot_r4p_classify;
-    current.boot_r4p_keyboard = boot_r4p_keyboard;
-    current.boot_r4p_mouse = boot_r4p_mouse;
-    current.boot_dispatch_failures = boot_dispatch_failures;
-    current.boot_last_result = boot_last_result;
-    current.protocol_ok = aggregateOk(.protocol);
-    current.idle_ok = aggregateOk(.idle);
-    const primary = if (keyboard_binding.bound or keyboard_binding.present) &keyboard_binding else if (mouse_binding.present) &mouse_binding else &consumer_binding;
-    current.port = primary.port;
-    current.interface_number = primary.interface_number;
-    current.endpoint_address = primary.endpoint_address;
-    current.endpoint_interval = primary.endpoint_interval;
-    current.endpoint_max_packet = primary.endpoint_max_packet;
-}
-
-fn reportDescriptorAggregateOk() bool {
-    var have_report = false;
-    if (keyboard_binding.bound and keyboard_binding.report_descriptor_read_len != 0) {
-        have_report = true;
-        if (!keyboard_binding.report_descriptor_ok) return false;
-    }
-    if (mouse_binding.bound and mouse_binding.report_descriptor_read_len != 0) {
-        have_report = true;
-        if (!mouse_binding.report_descriptor_ok) return false;
-    }
-    return have_report;
-}
-
-fn aggregateOk(flag: AggregateFlag) bool {
-    var have_bound = false;
-    if (keyboard_binding.bound) {
-        have_bound = true;
-        if (flag == .protocol and !keyboard_binding.protocol_ok) return false;
-        if (flag == .idle and !keyboard_binding.idle_ok) return false;
-    }
-    if (mouse_binding.bound) {
-        have_bound = true;
-        if (flag == .protocol and !mouse_binding.protocol_ok) return false;
-        if (flag == .idle and !mouse_binding.idle_ok) return false;
-    }
-    return have_bound;
-}
-
-fn reportsEqual(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (a[i] != b[i]) return false;
-    }
-    return true;
-}
-
-fn shouldSuppressDuplicate(binding: *const HidBinding, kind: HidKind, report: []const u8) bool {
-    if (!reportsEqual(report, binding.last_report[0..binding.last_report_len])) return false;
-    return switch (kind) {
-        .keyboard, .consumer => true,
-        .mouse => !reportHasNonzero(report),
-    };
-}
-
-fn reportHasNonzero(report: []const u8) bool {
-    var i: usize = 0;
-    while (i < report.len) : (i += 1) {
-        if (report[i] != 0) return true;
-    }
-    return false;
+export fn r4os_zig_usb_hid_mouse(dx: i32, dy: i32, buttons: u8, wheel: i32) void {
+    mouse.injectRelativePacketWheel(dx, dy, buttons, wheel);
 }

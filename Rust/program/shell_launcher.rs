@@ -18,14 +18,6 @@ pub struct Bytes {
     pub len: usize,
 }
 #[repr(C)]
-struct MscStatus {
-    present: bool,
-    block_registered: bool,
-    read_failures: u64,
-    transport_failures: u64,
-    reason: Bytes,
-}
-#[repr(C)]
 struct Config {
     path: Bytes,
     args: Bytes,
@@ -43,7 +35,6 @@ unsafe extern "C" {
         shell: bool,
         host: u32,
     ) -> u8;
-    fn r4os_zig_program_shell_msc(output: *mut MscStatus);
     fn r4os_zig_program_shell_fatal(reason: Bytes) -> !;
 }
 fn span(value: &[u8]) -> Bytes {
@@ -221,14 +212,13 @@ fn crash(path: &[u8]) -> ! {
     if boot_drive().is_null() {
         unsafe { storage_boot::r4os_rust_storage_boot(6, ptr::null()) };
     }
-    let mut status = core::mem::MaybeUninit::<MscStatus>::uninit();
-    unsafe { r4os_zig_program_shell_msc(status.as_mut_ptr()) };
-    let status = unsafe { status.assume_init() };
+    let snapshot = crate::usb::msc::snapshot();
+    let status = snapshot.status;
     if status.present && !status.block_registered {
-        fatal(unsafe { bytes(status.reason) });
+        fatal(&snapshot.reason[..snapshot.reason_len]);
     }
     if status.present && (status.read_failures != 0 || status.transport_failures != 0) {
-        fatal(unsafe { bytes(status.reason) });
+        fatal(&snapshot.reason[..snapshot.reason_len]);
     }
     if boot_drive().is_null() {
         fatal(b"Boot drive C: not mounted");
@@ -314,7 +304,5 @@ pub unsafe extern "C" fn r4os_rust_program_shell_start(
 }
 const _: () = {
     assert!(core::mem::size_of::<Bytes>() == 16);
-    assert!(core::mem::size_of::<MscStatus>() == 40);
     assert!(core::mem::size_of::<Config>() == 32);
-    assert!(core::mem::offset_of!(MscStatus, reason) == 24);
 };

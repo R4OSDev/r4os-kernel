@@ -8,6 +8,8 @@ pub mod loader;
 pub mod program;
 #[path = "../../../Rust/service/mod.rs"]
 pub mod service;
+#[path = "../../../Rust/usb/mod.rs"]
+pub mod usb;
 // The existing Zig fixtures call the exact migrated owner implementations.
 // This host-only archive has no boot entry, MMIO execution or kernel runtime.
 #[path = "../../../Rust/memory/blocks.rs"]

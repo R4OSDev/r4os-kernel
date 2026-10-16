@@ -112,6 +112,26 @@ pub fn prepare_stack() {
     core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 impl Lock {
+    /// Native owner storage, matching the original zeroed C lock initializer.
+    pub(crate) const fn new(class: u8, rank: u8) -> Self {
+        Self {
+            class,
+            rank,
+            state: AtomicU8::new(0),
+            owner_cpu_plus_one: AtomicU8::new(0),
+            depth: [const { UnsafeCell::new(0) }; MAX_CPUS],
+            acquired_tsc: [const { UnsafeCell::new(0) }; MAX_CPUS],
+            acquisitions: AtomicU64::new(0),
+            nested_acquisitions: AtomicU64::new(0),
+            collisions: AtomicU64::new(0),
+            wait_spins: AtomicU64::new(0),
+            max_wait_spins: AtomicU64::new(0),
+            hold_cycles: AtomicU64::new(0),
+            max_hold_cycles: AtomicU64::new(0),
+            order_violations: AtomicU64::new(0),
+        }
+    }
+
     pub fn acquire(&self) -> Token {
         let saved = flags();
         cli();

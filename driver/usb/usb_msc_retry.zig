@@ -1,3 +1,10 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+// Native USB owner: stateless compatibility facade.
+extern fn r4os_rust_usb_retry_transport(bool, bool, u8) bool;
+extern fn r4os_rust_usb_retry_scsi(bool, bool, bool, u8, u8, u8, u8) bool;
+extern fn r4os_rust_usb_transient_not_ready(u8, u8) bool;
 // Pure retry policy for USB Mass Storage BOT commands.
 //
 // BOT/xHCI recovery repairs the transport, but it does not replay the SCSI
@@ -14,9 +21,7 @@ pub fn shouldRetryTransport(
     last_recovery_ok: bool,
     retries: u8,
 ) bool {
-    return last_failure_transport and
-        last_recovery_ok and
-        retries < transport_retry_limit;
+    return r4os_rust_usb_retry_transport(last_failure_transport, last_recovery_ok, retries);
 }
 
 // A valid SCSI sense result is the device's state contract. Unit Attention
@@ -33,25 +38,11 @@ pub fn shouldRetryScsiFailure(
     ascq: u8,
     retries: u8,
 ) bool {
-    if (last_failure_transport) return last_recovery_ok;
-    if (!sense_valid) return retries == 0;
-    return switch (sense_key) {
-        0x06 => true, // Unit Attention is cleared by the sense exchange.
-        0x02 => transientNotReady(asc, ascq),
-        else => false,
-    };
+    return r4os_rust_usb_retry_scsi(last_failure_transport, last_recovery_ok, sense_valid, sense_key, asc, ascq, retries);
 }
 
 pub fn transientNotReady(asc: u8, ascq: u8) bool {
-    if (asc == 0x3A) return false; // Medium not present.
-    if (asc != 0x04) return true;
-    return switch (ascq) {
-        0x02, // Initializing command required; START STOP is not issued here.
-        0x03, // Manual intervention required.
-        0x12, // Logical unit offline.
-        => false,
-        else => true,
-    };
+    return r4os_rust_usb_transient_not_ready(asc, ascq);
 }
 
 test "successful transport recovery permits the first retry" {

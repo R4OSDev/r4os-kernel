@@ -362,7 +362,7 @@ pub(crate) unsafe fn guard_metadata(g: *const UnwindGuard) -> GuardMetadata {
 unsafe fn guard_free(g: *const UnwindGuard) -> bool {
     unsafe { (*g).owner == 0 && (*g).owner_generation == 0 && !(*g).boot_owner && (*g).depth == 0 }
 }
-unsafe fn guard_owned(g: *const UnwindGuard) -> bool {
+pub(crate) unsafe fn guard_owned(g: *const UnwindGuard) -> bool {
     let _runtime = runtime::RuntimeGuard::acquire();
     unsafe {
         let t = current();
@@ -373,7 +373,7 @@ unsafe fn guard_owned(g: *const UnwindGuard) -> bool {
         (*g).owner == (*c).id && (*g).owner_generation == (*c).generation && (*g).depth != 0
     }
 }
-unsafe fn guard_try(g: *mut UnwindGuard) -> bool {
+pub(crate) unsafe fn guard_try(g: *mut UnwindGuard) -> bool {
     unsafe {
         let t = current();
         if t.is_null() {
@@ -431,7 +431,7 @@ unsafe fn guard_permanent(g: *const UnwindGuard) -> bool {
 unsafe extern "C" fn guard_needed(raw: *mut c_void) -> bool {
     unsafe { !guard_free(raw.cast()) }
 }
-unsafe fn guard_enter(g: *mut UnwindGuard, timeout: u64) -> bool {
+pub(crate) unsafe fn guard_enter(g: *mut UnwindGuard, timeout: u64) -> bool {
     unsafe {
         if guard_try(g) {
             return true;
@@ -467,7 +467,7 @@ unsafe fn guard_enter(g: *mut UnwindGuard, timeout: u64) -> bool {
         }
     }
 }
-unsafe fn guard_leave(g: *mut UnwindGuard) -> bool {
+pub(crate) unsafe fn guard_leave(g: *mut UnwindGuard) -> bool {
     unsafe {
         let t = current();
         if t.is_null() {

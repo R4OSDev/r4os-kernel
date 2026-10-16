@@ -1,0 +1,556 @@
+//! Sole event-ring consumer and exact live-TD routing. Interrupts only wake
+//! workers; they never consume controller state or acknowledge a transfer.
+use super::{
+    event_router::{self, Event, Match},
+    ring_cycle, timing,
+    wait_types::{Deadline, Wait},
+    xhci::*,
+    xhci_constants::*,
+    xhci_diag as diag,
+    xhci_state::{current, state},
+    xhci_types::{DeviceRuntime, Trb},
+};
+use crate::{boot::foundation::puts, sched::sync_types::Text};
+use core::ptr;
+#[derive(Clone, Copy)]
+enum TimeoutClock {
+    Ticks,
+    Hpet,
+    Tsc,
+    TscFallback,
+    RecoveryBudget,
+    CpuGuard,
+}
+impl TimeoutClock {
+    fn label(self) -> &'static [u8] {
+        match self {
+            Self::Ticks => b"ticks",
+            Self::Hpet => b"hpet",
+            Self::Tsc => b"tsc",
+            Self::TscFallback => b"tsc-fallback",
+            Self::RecoveryBudget => b"recovery-budget",
+            Self::CpuGuard => b"cpu-guard",
+        }
+    }
+}
+pub(super) unsafe fn current_interrupt_owner_match() -> Option<Match> {
+    unsafe {
+        if !(*current()).interrupt_pending
+            || (*current()).interrupt_pending_trb_phys == 0
+            || (*current()).addressed_slot_id == 0
+            || (*current()).interrupt_endpoint_id == 0
+        {
+            return None;
+        }
+        Some(Match::transfer(
+            (*current()).addressed_slot_id,
+            (*current()).interrupt_endpoint_id,
+            (*current()).interrupt_pending_trb_phys,
+        ))
+    }
+}
+fn runtime_interrupt_owner_match(rt: DeviceRuntime) -> Option<Match> {
+    if !rt.active
+        || !rt.interrupt_pending
+        || rt.interrupt_pending_trb_phys == 0
+        || rt.slot_id == 0
+        || rt.interrupt_endpoint_id == 0
+    {
+        return None;
+    }
+    Some(Match::transfer(
+        rt.slot_id,
+        rt.interrupt_endpoint_id,
+        rt.interrupt_pending_trb_phys,
+    ))
+}
+unsafe fn event_has_live_owner(event: Event) -> bool {
+    unsafe {
+        if (*state()).transfer_objects.matching_handle(event).is_some() {
+            return true;
+        }
+        if (*state())
+            .active_command
+            .is_some_and(|m| event_router::matches(event, m))
+        {
+            return true;
+        }
+        if current_interrupt_owner_match().is_some_and(|m| event_router::matches(event, m)) {
+            return true;
+        }
+        for i in 0..8 {
+            if (*state()).active_runtime_index == Some(i) {
+                continue;
+            }
+            if runtime_interrupt_owner_match(ptr::addr_of!((*state()).runtimes[i]).read())
+                .is_some_and(|m| event_router::matches(event, m))
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+unsafe fn clear_overflowed_interrupt_owner(event: Event) -> bool {
+    unsafe {
+        if let Some(handle) = (*state()).transfer_objects.matching_handle(event) {
+            (*state()).transfer_objects.cancel(handle);
+            (*state()).transfer_objects.release(handle);
+        }
+        if current_interrupt_owner_match().is_some_and(|m| event_router::matches(event, m)) {
+            (*current()).interrupt_pending = false;
+            (*current()).interrupt_pending_trb_phys = 0;
+            (*current()).interrupt_transfer_handle = 0;
+            (*current()).interrupt_pending_streak = 0;
+            return true;
+        }
+        for i in 0..8 {
+            if (*state()).active_runtime_index == Some(i) {
+                continue;
+            }
+            let rt = ptr::addr_of_mut!((*state()).runtimes[i]);
+            if !runtime_interrupt_owner_match(rt.read())
+                .is_some_and(|m| event_router::matches(event, m))
+            {
+                continue;
+            }
+            (*rt).interrupt_pending = false;
+            (*rt).interrupt_pending_trb_phys = 0;
+            (*rt).interrupt_transfer_handle = 0;
+            (*rt).interrupt_pending_streak = 0;
+            return true;
+        }
+        false
+    }
+}
+pub(super) unsafe fn route_foreign_event(event: Event) {
+    unsafe {
+        if (*state())
+            .pending_port_changes
+            .route(event, (*current()).port_count_seen)
+        {
+            return;
+        }
+        if event_has_live_owner(event) {
+            if (*state()).deferred_events.enqueue(event) {
+                return;
+            }
+            clear_overflowed_interrupt_owner(event);
+        }
+        record_stale_event(event);
+        (*current()).stale_events += 1;
+    }
+}
+pub(super) unsafe fn poll_matching_event(expected: Match) -> Option<Event> {
+    unsafe {
+        if let Some(e) = (*state()).deferred_events.take(expected) {
+            return Some(e);
+        }
+        drain_event_batch(expected)
+    }
+}
+pub(super) unsafe fn drain_event_batch(expected: Match) -> Option<Event> {
+    unsafe {
+        let mut matched = None;
+        let mut processed = 0u16;
+        for _ in 0..1024 {
+            let Some(event) = poll_event() else {
+                break;
+            };
+            processed = processed.wrapping_add(1);
+            if matched.is_none() && event_router::matches(event, expected) {
+                matched = Some(event);
+            } else {
+                route_foreign_event(event);
+            }
+        }
+        commit_event_batch(processed);
+        matched
+    }
+}
+pub(super) unsafe fn wait_matching_event_within(
+    expected: Match,
+    budget: Option<&Deadline>,
+) -> Option<Event> {
+    unsafe {
+        (*current()).last_wait_cancelled = false;
+        if let Some(e) = (*state()).deferred_events.take(expected) {
+            return Some(e);
+        }
+        if let Some(e) = drain_event_batch(expected) {
+            return Some(e);
+        }
+        let mut wait = Wait::begin(
+            timing::XHCI_EVENT_TIMEOUT_MS,
+            Text::literal(b"xhci-event"),
+            0,
+        );
+        if wait.deadline.uses_tick_deadline() {
+            (*current()).event_tick_deadline_waits =
+                (*current()).event_tick_deadline_waits.wrapping_add(1);
+        } else if wait.deadline.uses_hpet_deadline() {
+            (*current()).event_hpet_deadline_waits =
+                (*current()).event_hpet_deadline_waits.wrapping_add(1);
+        } else if wait.deadline.uses_tsc_deadline() {
+            (*current()).event_tsc_deadline_waits =
+                (*current()).event_tsc_deadline_waits.wrapping_add(1);
+        } else {
+            (*current()).event_guard_waits = (*current()).event_guard_waits.wrapping_add(1);
+        }
+        let mut guard = 0u32;
+        let clock = loop {
+            if let Some(i) = (*state()).active_runtime_index {
+                let rt = ptr::addr_of!((*state()).runtimes[i]).read();
+                if super::xhci_owner::transaction_owned(rt) && rt.detach_pending {
+                    (*current()).last_wait_cancelled = true;
+                    wait.finish(false);
+                    return None;
+                }
+            }
+            if budget.is_some_and(Deadline::expired_any) {
+                break TimeoutClock::RecoveryBudget;
+            }
+            if wait.deadline.expired() {
+                break TimeoutClock::Ticks;
+            }
+            if wait.deadline.hpet_expired() {
+                break TimeoutClock::Hpet;
+            }
+            if wait.deadline.tsc_expired() {
+                break if wait.deadline.uses_fallback_tsc() {
+                    TimeoutClock::TscFallback
+                } else {
+                    TimeoutClock::Tsc
+                };
+            }
+            if let Some(e) = drain_event_batch(expected) {
+                wait.finish(true);
+                return Some(e);
+            }
+            if let Some(e) = (*state()).deferred_events.take(expected) {
+                wait.finish(true);
+                return Some(e);
+            }
+            if guard >= COMMAND_WAIT_GUARD {
+                break TimeoutClock::CpuGuard;
+            }
+            idle_device_wait(&mut wait);
+            guard = guard.wrapping_add(1);
+        };
+        let ticks = wait.deadline.elapsed_ticks();
+        let hpet = wait.deadline.elapsed_hpet();
+        let tsc = wait.deadline.elapsed_tsc();
+        wait.finish(false);
+        match clock {
+            TimeoutClock::Ticks => {
+                (*current()).event_tick_timeouts = (*current()).event_tick_timeouts.wrapping_add(1)
+            }
+            TimeoutClock::Hpet => {
+                (*current()).event_hpet_timeouts = (*current()).event_hpet_timeouts.wrapping_add(1)
+            }
+            TimeoutClock::RecoveryBudget => {
+                (*current()).event_recovery_budget_timeouts =
+                    (*current()).event_recovery_budget_timeouts.wrapping_add(1)
+            }
+            TimeoutClock::Tsc | TimeoutClock::TscFallback => {
+                (*current()).event_tsc_timeouts = (*current()).event_tsc_timeouts.wrapping_add(1)
+            }
+            TimeoutClock::CpuGuard => {
+                (*current()).event_guard_timeouts =
+                    (*current()).event_guard_timeouts.wrapping_add(1);
+                (*current()).event_cpu_guard_timeouts =
+                    (*current()).event_cpu_guard_timeouts.wrapping_add(1);
+            }
+        }
+        let token = diag::begin();
+        if expected.tag == 0 && token.valid() {
+            close_last_sync_transfer_incident();
+            (*state()).last_sync_transfer_incident = token;
+        }
+        timeout_diagnostic(expected, clock, ticks, hpet, tsc, guard);
+        if expected.tag == 1 {
+            diag::resolve(token);
+        }
+        None
+    }
+}
+unsafe fn timeout_diagnostic(
+    expected: Match,
+    clock: TimeoutClock,
+    ticks: u64,
+    hpet: u64,
+    tsc: u64,
+    guard: u32,
+) {
+    unsafe {
+        // Screen and persistent console retain their original distinct sinks.
+        diag::write(b"[XHCI] event timeout owner=");
+        if expected.tag == 0 {
+            diag::write(b"transfer slot=");
+            diag::dec(expected.slot_id);
+            diag::write(b" ep=");
+            diag::dec(expected.endpoint_id);
+            diag::write(b" trb=");
+            diag::hex(expected.trb_phys[0]);
+        } else {
+            diag::write(b"command trb=");
+            diag::hex(expected.trb_phys[0]);
+        }
+        diag::write(b" clock=");
+        diag::write(clock.label());
+        diag::write(b" elapsed_ticks=");
+        diag::dec(ticks);
+        diag::write(b" elapsed_hpet=");
+        diag::dec(hpet);
+        diag::write(b" elapsed_tsc=");
+        diag::dec(tsc);
+        diag::write(b" guard=");
+        diag::dec(guard);
+        diag::end();
+        puts(b"[XHCI] event timeout owner=");
+        if expected.tag == 0 {
+            puts(b"transfer slot=");
+            diag::console_dec(expected.slot_id);
+            puts(b" ep=");
+            diag::console_dec(expected.endpoint_id);
+            puts(b" trb=0x");
+            diag::console_hex(expected.trb_phys[0], 16);
+        } else {
+            puts(b"command trb=0x");
+            diag::console_hex(expected.trb_phys[0], 16);
+        }
+        puts(b" clock=");
+        puts(clock.label());
+        puts(b" elapsed_ticks=");
+        diag::console_dec(ticks);
+        puts(b" elapsed_hpet=");
+        diag::console_dec(hpet);
+        puts(b" elapsed_tsc=");
+        diag::console_dec(tsc);
+        puts(b" guard=");
+        diag::console_dec(guard);
+        puts(b"\r\n");
+        puts(b"[XHCI] hw usbcmd=0x");
+        diag::console_hex(read_op32(OP_USBCMD), 8);
+        puts(b" usbsts=0x");
+        diag::console_hex(read_op32(OP_USBSTS), 8);
+        puts(b" iman=0x");
+        diag::console_hex(read_rt32(RT_IR0_IMAN), 8);
+        puts(b" erdp=0x");
+        diag::console_hex(read_rt64(RT_IR0_ERDP), 16);
+        puts(b"\r\n");
+        let next = if (*state()).event_ring_virt != 0 {
+            volatile_read32(
+                (*state()).event_ring_virt + u64::from((*current()).event_dequeue) * 16 + 12,
+            )
+        } else {
+            0
+        };
+        diag::write(b"[XHCI] hw usbcmd=");
+        diag::hex(read_op32(OP_USBCMD));
+        diag::write(b" usbsts=");
+        diag::hex(read_op32(OP_USBSTS));
+        diag::write(b" iman=");
+        diag::hex(read_rt32(RT_IR0_IMAN));
+        diag::write(b" erdp=");
+        diag::hex(read_rt64(RT_IR0_ERDP));
+        diag::end();
+        diag::write(b"[XHCI] ring deq=");
+        diag::dec((*current()).event_dequeue);
+        diag::write(b" cycle=");
+        diag::dec((*current()).event_cycle);
+        diag::write(b" next=");
+        diag::hex(next);
+        diag::write(b" events=");
+        diag::dec((*current()).events);
+        diag::write(b" last=");
+        diag::dec((*current()).last_event_type);
+        diag::write(b"/");
+        diag::dec((*current()).last_event_code);
+        diag::end();
+        if expected.tag == 0 {
+            diag::write(b"[XHCI] target epstate=");
+            if let Some(s) = endpoint_state(expected.endpoint_id) {
+                diag::dec(s as u8);
+            } else {
+                diag::write(b"unknown");
+            }
+            if (*current()).addressed_port != 0 {
+                diag::write(b" portsc=");
+                diag::hex(read_op32(
+                    OP_PORT_BASE + u64::from((*current()).addressed_port - 1) * OP_PORT_STRIDE,
+                ));
+            }
+            diag::end();
+        }
+    }
+}
+pub(super) unsafe fn submit_command(parameter: u64, status: u32, control: u32) -> Option<Event> {
+    unsafe { submit_command_within(parameter, status, control, None) }
+}
+pub(super) unsafe fn submit_command_within(
+    parameter: u64,
+    status: u32,
+    control: u32,
+    budget: Option<&Deadline>,
+) -> Option<Event> {
+    unsafe {
+        if !(*current()).controller_running
+            || (*state()).command_ring_virt == 0
+            || (*state()).active_command.is_some()
+            || budget.is_some_and(Deadline::expired_any)
+        {
+            return None;
+        }
+        let enqueue = (*current()).command_enqueue;
+        if usize::from(enqueue) >= COMMAND_TRB_COUNT - 1 {
+            (*current()).ring_full += 1;
+            return None;
+        }
+        let ring = (*state()).command_ring_virt as *mut Trb;
+        let physical = (*current()).command_ring_phys + u64::from(enqueue) * 16;
+        let cycle = if (*current()).command_cycle != 0 {
+            TRB_CYCLE
+        } else {
+            0
+        };
+        ring.add(usize::from(enqueue)).write(Trb {
+            parameter,
+            status,
+            control: control | cycle,
+        });
+        dma_fence();
+        (*current()).last_command_type = ((control >> TRB_TYPE_SHIFT) & 0x3f) as u8;
+        (*current()).commands += 1;
+        let advance =
+            ring_cycle::after_submission(enqueue, (*current()).command_cycle, COMMAND_TRB_COUNT);
+        if advance.wrapped {
+            update_link_trb(
+                (*state()).command_ring_virt,
+                COMMAND_TRB_COUNT,
+                advance.link_cycle,
+                false,
+            );
+            (*current()).command_ring_wraps += 1;
+        }
+        (*current()).command_enqueue = advance.next_enqueue;
+        (*current()).command_cycle = advance.next_producer_cycle;
+        let expected = Match::command(physical);
+        (*state()).active_command = Some(expected);
+        write_doorbell(0, 0);
+        let result = wait_matching_event_within(expected, budget);
+        (*state()).active_command = None;
+        if result.is_none() {
+            if !(*current()).last_wait_cancelled {
+                (*current()).timeouts += 1;
+            }
+            (*current()).reason = Text::literal(if (*current()).last_wait_cancelled {
+                b"USB device detached during command"
+            } else {
+                b"timeout waiting for xHCI command completion"
+            });
+        }
+        result
+    }
+}
+pub(super) unsafe fn wait_transfer_completion_within(
+    expected: Match,
+    budget: Option<&Deadline>,
+) -> Option<Event> {
+    unsafe {
+        let result = wait_matching_event_within(expected, budget);
+        if result.is_none() {
+            if !(*current()).last_wait_cancelled {
+                (*current()).timeouts += 1;
+            }
+            (*current()).reason = Text::literal(if (*current()).last_wait_cancelled {
+                b"USB device detached during transfer"
+            } else {
+                b"timeout waiting for xHCI transfer event"
+            });
+        }
+        result
+    }
+}
+pub(super) unsafe fn poll_event() -> Option<Event> {
+    unsafe {
+        let addr = (*state()).event_ring_virt + u64::from((*current()).event_dequeue) * 16;
+        let expected = if (*current()).event_cycle != 0 {
+            TRB_CYCLE
+        } else {
+            0
+        };
+        if volatile_read32(addr + 12) & TRB_CYCLE != expected {
+            return None;
+        }
+        dma_fence();
+        let parameter = volatile_read64(addr);
+        let status = volatile_read32(addr + 8);
+        let control = volatile_read32(addr + 12);
+        if control & TRB_CYCLE != expected {
+            return None;
+        }
+        (*current()).events += 1;
+        (*current()).event_dequeue += 1;
+        if usize::from((*current()).event_dequeue) >= EVENT_TRB_COUNT {
+            (*current()).event_dequeue = 0;
+            (*current()).event_cycle = u8::from((*current()).event_cycle == 0);
+            (*current()).event_ring_wraps += 1;
+        }
+        let event_type = ((control >> TRB_TYPE_SHIFT) & 0x3f) as u8;
+        let code = (status >> 24) as u8;
+        if code == COMPLETION_EVENT_RING_FULL_ERROR {
+            (*current()).ring_full += 1;
+        }
+        if u32::from(event_type) == TRB_TYPE_TRANSFER_EVENT {
+            (*current()).transfer_events += 1;
+        }
+        let out = Event {
+            event_type,
+            code,
+            slot_id: (control >> 24) as u8,
+            endpoint_id: ((control >> 16) & 31) as u8,
+            parameter,
+            length: status & 0x00ff_ffff,
+            control,
+        };
+        (*current()).last_event_type = out.event_type;
+        (*current()).last_event_code = out.code;
+        (*current()).last_event_slot = out.slot_id;
+        (*current()).last_event_endpoint = out.endpoint_id;
+        (*current()).last_event_parameter = out.parameter;
+        (*current()).last_event_length = out.length;
+        Some(out)
+    }
+}
+pub(super) unsafe fn commit_event_batch(processed: u16) {
+    unsafe {
+        if processed == 0 {
+            return;
+        }
+        (*current()).event_max_batch = (*current()).event_max_batch.max(processed);
+        dma_fence();
+        if read_op32(OP_USBSTS) & USBSTS_EINT != 0 {
+            write_op32(OP_USBSTS, USBSTS_EINT);
+            read_op32(OP_USBSTS);
+        }
+        let iman = read_rt32(RT_IR0_IMAN);
+        if iman & IMAN_IP != 0 {
+            write_rt32(RT_IR0_IMAN, iman | IMAN_IP);
+            read_rt32(RT_IR0_IMAN);
+        }
+        let dequeue = (*current()).event_ring_phys + u64::from((*current()).event_dequeue) * 16;
+        write_rt64(RT_IR0_ERDP, dequeue | ERDP_EHB);
+        read_rt64(RT_IR0_ERDP);
+        (*current()).event_erdp_commits = (*current()).event_erdp_commits.wrapping_add(1);
+        rearm_event_irq();
+    }
+}
+unsafe fn record_stale_event(event: Event) {
+    unsafe {
+        (*current()).last_stale_event_type = event.event_type;
+        (*current()).last_stale_event_code = event.code;
+        (*current()).last_stale_event_slot = event.slot_id;
+        (*current()).last_stale_event_endpoint = event.endpoint_id;
+    }
+}

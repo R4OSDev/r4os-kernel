@@ -28,13 +28,13 @@ impl MemoryEntry {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct BootModule {
-    address: *const u8,
-    size: usize,
-    path: *const u8,
-    path_len: usize,
-    cmdline: *const u8,
-    cmdline_len: usize,
-    valid: bool,
+    pub(crate) address: *const u8,
+    pub(crate) size: usize,
+    pub(crate) path: *const u8,
+    pub(crate) path_len: usize,
+    pub(crate) cmdline: *const u8,
+    pub(crate) cmdline_len: usize,
+    pub(crate) valid: bool,
 }
 impl BootModule {
     const EMPTY: Self = Self {

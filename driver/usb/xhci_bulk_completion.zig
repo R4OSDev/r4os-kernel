@@ -1,7 +1,12 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+// Native USB owner: stateless compatibility facade.
+extern fn r4os_rust_usb_bulk_completion(bool, u32, u8, u32, *Evaluation) void;
 pub const COMPLETION_SUCCESS: u8 = 1;
 pub const COMPLETION_SHORT_PACKET: u8 = 13;
 
-pub const Evaluation = struct {
+pub const Evaluation = extern struct {
     accepted: bool,
     actual_len: u32,
 };
@@ -10,13 +15,9 @@ pub const Evaluation = struct {
 // successful terminal condition for IN endpoints; the Event TRB length is the
 // untransferred residue. OUT transfers must complete without a short packet.
 pub fn evaluate(in_direction: bool, requested: u32, completion_code: u8, residue: u32) Evaluation {
-    if (residue > requested) return .{ .accepted = false, .actual_len = 0 };
-    const accepted = (completion_code == COMPLETION_SUCCESS and residue == 0) or
-        (in_direction and completion_code == COMPLETION_SHORT_PACKET);
-    return .{
-        .accepted = accepted,
-        .actual_len = if (accepted) requested - residue else 0,
-    };
+    var out: Evaluation = undefined;
+    r4os_rust_usb_bulk_completion(in_direction, requested, completion_code, residue, &out);
+    return out;
 }
 
 test "bulk IN accepts exact and short completions" {
@@ -56,4 +57,11 @@ test "only IN completion code 13 represents a short transfer" {
     try testing.expect(!evaluate(true, 64, COMPLETION_SUCCESS, 17).accepted);
     try testing.expect(!evaluate(true, 64, 12, 17).accepted);
     try testing.expect(!evaluate(false, 64, COMPLETION_SHORT_PACKET, 17).accepted);
+}
+
+comptime {
+    if (@sizeOf(Evaluation) != 8 or
+        @alignOf(Evaluation) != 4 or
+        @offsetOf(Evaluation, "accepted") != 0 or
+        @offsetOf(Evaluation, "actual_len") != 4) @compileError("USB Evaluation private C layout");
 }

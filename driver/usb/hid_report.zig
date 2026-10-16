@@ -1,5 +1,4 @@
-const protocol_api = @import("../../kernel/protocol_api.zig");
-const r4p = @import("../../program/r4p.zig");
+const Text = @import("core.zig").Text;
 const r4p_contract = @import("../../net/r4p_contract.zig");
 
 const MAX_FIELDS: usize = r4p_contract.HID_REPORT_MAX_FIELDS;
@@ -13,13 +12,7 @@ pub const UsagePage = enum(u16) {
     unknown = 0xFFFF,
 
     pub fn fromRaw(value: u32) UsagePage {
-        return switch (@as(u16, @truncate(value))) {
-            0x01 => .generic_desktop,
-            0x07 => .keyboard,
-            0x09 => .button,
-            0x0C => .consumer,
-            else => .unknown,
-        };
+        return @enumFromInt(r4os_rust_usb_usage_page(value));
     }
 };
 
@@ -29,7 +22,7 @@ pub const FieldKind = enum(u8) {
     feature,
 };
 
-pub const Field = struct {
+pub const Field = extern struct {
     kind: FieldKind = .input,
     usage_page: UsagePage = .unknown,
     usage_min: u32 = 0,
@@ -48,7 +41,7 @@ pub const Field = struct {
     constant: bool = false,
 };
 
-pub const Summary = struct {
+pub const Summary = extern struct {
     parsed: bool = false,
     malformed: bool = false,
     has_report_id: bool = false,
@@ -66,7 +59,7 @@ pub const Summary = struct {
     usage_y: bool = false,
     usage_wheel: bool = false,
     usage_buttons: bool = false,
-    reason: []const u8 = "not parsed",
+    reason: Text = Text.init("not parsed"),
 };
 
 pub const Status = struct {
@@ -77,123 +70,77 @@ pub const Status = struct {
     last_result: i32 = 0,
 };
 
-var status_state: Status = .{};
-
+const RawStatus = extern struct { source: Text, r4p_parse: u64, required_missing: u64, dispatch_failures: u64, last_result: i32 };
+extern fn r4os_rust_usb_usage_page(u32) u16;
+extern fn r4os_rust_usb_hid_report_parse([*]const u8, usize, *r4p_contract.HidReportSummary, *Summary) void;
+extern fn r4os_rust_usb_hid_report_status(*RawStatus) void;
+extern fn r4os_rust_usb_hid_report_source() Text;
+extern fn r4os_rust_usb_hid_consumer(*const r4p_contract.HidReportSummary, [*]const u8, usize, *r4p_contract.HidConsumerOp) bool;
 pub fn parse(bytes: []const u8, wire: *r4p_contract.HidReportSummary) Summary {
-    if (!r4p.hasActiveR4p("usb.hid_report")) {
-        status_state.required_missing +%= 1;
-        return .{ .reason = "HIDREPORT.R4P required" };
-    }
-    return parseR4p(bytes, wire) orelse .{ .malformed = true, .reason = "HIDREPORT.R4P dispatch failed" };
-}
-
-pub fn status() Status {
-    status_state.source = r4p.requiredSourceName("usb.hid_report");
-    return status_state;
-}
-
-pub fn sourceName() []const u8 {
-    return r4p.requiredSourceName("usb.hid_report");
-}
-
-fn parseR4p(bytes: []const u8, wire: *r4p_contract.HidReportSummary) ?Summary {
-    if (bytes.len > r4p_contract.HID_REPORT_MAX_DESCRIPTOR) {
-        status_state.dispatch_failures +%= 1;
-        status_state.last_result = r4p_contract.HID_REPORT_RESULT_BAD_LENGTH;
-        return null;
-    }
-    var op: r4p_contract.HidReportOp = .{ .descriptor_len = @intCast(bytes.len) };
-    if (bytes.len != 0) @memcpy(op.descriptor[0..bytes.len], bytes);
-    var buffer = protocol_api.ProtocolBuffer{
-        .data = &op,
-        .len = @sizeOf(r4p_contract.HidReportOp),
-        .capacity = @sizeOf(r4p_contract.HidReportOp),
-        .flags = 0,
-        .reserved = 0,
-    };
-    var out: protocol_api.ProtocolBuffer = .{};
-    const result = r4p.dispatch("usb.hid_report", r4p_contract.HID_REPORT_OP_PARSE, &buffer, &out);
-    status_state.last_result = result;
-    if (result != r4p_contract.HID_REPORT_RESULT_OK or op.result != r4p_contract.HID_REPORT_RESULT_OK) {
-        status_state.dispatch_failures +%= 1;
-        status_state.last_result = if (result != r4p_contract.HID_REPORT_RESULT_OK) result else op.result;
-        return null;
-    }
-    status_state.r4p_parse +%= 1;
-    wire.* = op.summary;
-    return summaryFromR4p(op.summary);
-}
-
-fn summaryFromR4p(in_summary: r4p_contract.HidReportSummary) Summary {
-    var out: Summary = .{
-        .parsed = in_summary.parsed != 0,
-        .malformed = in_summary.malformed != 0,
-        .has_report_id = in_summary.has_report_id != 0,
-        .report_ids = in_summary.report_ids,
-        .input_fields = in_summary.input_fields,
-        .output_fields = in_summary.output_fields,
-        .feature_fields = in_summary.feature_fields,
-        .field_count = in_summary.field_count,
-        .input_bits = in_summary.input_bits,
-        .usage_keyboard = in_summary.usage_keyboard != 0,
-        .usage_mouse = in_summary.usage_mouse != 0,
-        .usage_pointer = in_summary.usage_pointer != 0,
-        .usage_x = in_summary.usage_x != 0,
-        .usage_y = in_summary.usage_y != 0,
-        .usage_wheel = in_summary.usage_wheel != 0,
-        .usage_buttons = in_summary.usage_buttons != 0,
-        .reason = reasonName(in_summary.reason_code),
-    };
-    var i: usize = 0;
-    while (i < out.field_count and i < MAX_FIELDS) : (i += 1) {
-        out.fields[i] = fieldFromR4p(in_summary.fields[i]);
-    }
+    var out: Summary = undefined;
+    r4os_rust_usb_hid_report_parse(bytes.ptr, bytes.len, wire, &out);
     return out;
 }
-
-fn fieldFromR4p(in_field: r4p_contract.HidReportField) Field {
-    return .{
-        .kind = switch (in_field.kind) {
-            r4p_contract.HID_REPORT_KIND_OUTPUT => .output,
-            r4p_contract.HID_REPORT_KIND_FEATURE => .feature,
-            else => .input,
-        },
-        .usage_page = UsagePage.fromRaw(in_field.usage_page),
-        .usage_min = in_field.usage_min,
-        .usage_max = in_field.usage_max,
-        .usages = in_field.usages,
-        .usage_count = in_field.usage_count,
-        .report_id = in_field.report_id,
-        .bit_offset = in_field.bit_offset,
-        .bit_size = in_field.bit_size,
-        .count = in_field.count,
-        .logical_min = in_field.logical_min,
-        .logical_max = in_field.logical_max,
-        .flags = in_field.flags,
-        .relative = in_field.relative != 0,
-        .variable = in_field.variable != 0,
-        .constant = in_field.constant != 0,
-    };
+pub fn status() Status {
+    var out: RawStatus = undefined;
+    r4os_rust_usb_hid_report_status(&out);
+    return .{ .source = out.source.slice(), .r4p_parse = out.r4p_parse, .required_missing = out.required_missing, .dispatch_failures = out.dispatch_failures, .last_result = out.last_result };
 }
-
-fn reasonName(code: u16) []const u8 {
-    return switch (code) {
-        r4p_contract.HID_REPORT_REASON_PARSED => "parsed",
-        r4p_contract.HID_REPORT_REASON_TRUNCATED_LONG_ITEM => "truncated long item",
-        r4p_contract.HID_REPORT_REASON_TRUNCATED_LONG_PAYLOAD => "truncated long payload",
-        r4p_contract.HID_REPORT_REASON_TRUNCATED_SHORT_ITEM => "truncated short item",
-        else => "not parsed",
-    };
+pub fn sourceName() []const u8 {
+    return r4os_rust_usb_hid_report_source().slice();
 }
-
-// Decode remains external. No callbacks or pointers survive this dispatch.
 pub fn consumer(summary: *const r4p_contract.HidReportSummary, report: []const u8) ?r4p_contract.HidConsumerOp {
-    if (report.len > 32 or !r4p.hasActiveR4p("usb.hid_report")) return null;
-    var request: r4p_contract.HidConsumerOp = .{ .summary_address = @intFromPtr(summary), .report_len = @intCast(report.len) };
-    @memcpy(request.report[0..report.len], report);
-    const buffer: protocol_api.ProtocolBuffer = .{ .data = &request, .len = @sizeOf(@TypeOf(request)), .capacity = @sizeOf(@TypeOf(request)), .flags = 0, .reserved = 0 };
-    var output: protocol_api.ProtocolBuffer = .{};
-    if (r4p.dispatch("usb.hid_report", r4p_contract.HID_REPORT_OP_CONSUMER, &buffer, &output) != 0 or request.capabilities > 3 or request.pressed > 3 or
-        (request.report_id != 0xffffffff and request.report_id >= 16)) return null;
-    return request;
+    var out: r4p_contract.HidConsumerOp = undefined;
+    return if (r4os_rust_usb_hid_consumer(summary, report.ptr, report.len, &out)) out else null;
+}
+comptime {
+    if (@sizeOf(Field) != 64 or
+        @alignOf(Field) != 4 or
+        @offsetOf(Field, "kind") != 0 or
+        @offsetOf(Field, "usage_page") != 2 or
+        @offsetOf(Field, "usage_min") != 4 or
+        @offsetOf(Field, "usage_max") != 8 or
+        @offsetOf(Field, "usages") != 12 or
+        @offsetOf(Field, "usage_count") != 44 or
+        @offsetOf(Field, "report_id") != 45 or
+        @offsetOf(Field, "bit_offset") != 46 or
+        @offsetOf(Field, "bit_size") != 48 or
+        @offsetOf(Field, "count") != 49 or
+        @offsetOf(Field, "logical_min") != 52 or
+        @offsetOf(Field, "logical_max") != 56 or
+        @offsetOf(Field, "flags") != 60 or
+        @offsetOf(Field, "relative") != 61 or
+        @offsetOf(Field, "variable") != 62 or
+        @offsetOf(Field, "constant") != 63) @compileError("USB report Field C layout");
+}
+comptime {
+    if (@sizeOf(Summary) != 1608 or
+        @alignOf(Summary) != 8 or
+        @offsetOf(Summary, "parsed") != 0 or
+        @offsetOf(Summary, "malformed") != 1 or
+        @offsetOf(Summary, "has_report_id") != 2 or
+        @offsetOf(Summary, "report_ids") != 3 or
+        @offsetOf(Summary, "input_fields") != 4 or
+        @offsetOf(Summary, "output_fields") != 5 or
+        @offsetOf(Summary, "feature_fields") != 6 or
+        @offsetOf(Summary, "fields") != 8 or
+        @offsetOf(Summary, "field_count") != 1544 or
+        @offsetOf(Summary, "input_bits") != 1546 or
+        @offsetOf(Summary, "usage_keyboard") != 1578 or
+        @offsetOf(Summary, "usage_mouse") != 1579 or
+        @offsetOf(Summary, "usage_pointer") != 1580 or
+        @offsetOf(Summary, "usage_x") != 1581 or
+        @offsetOf(Summary, "usage_y") != 1582 or
+        @offsetOf(Summary, "usage_wheel") != 1583 or
+        @offsetOf(Summary, "usage_buttons") != 1584 or
+        @offsetOf(Summary, "reason") != 1592) @compileError("USB report Summary C layout");
+}
+comptime {
+    if (@sizeOf(RawStatus) != 48 or
+        @alignOf(RawStatus) != 8 or
+        @offsetOf(RawStatus, "source") != 0 or
+        @offsetOf(RawStatus, "r4p_parse") != 16 or
+        @offsetOf(RawStatus, "required_missing") != 24 or
+        @offsetOf(RawStatus, "dispatch_failures") != 32 or
+        @offsetOf(RawStatus, "last_result") != 40) @compileError("USB report RawStatus C layout");
 }

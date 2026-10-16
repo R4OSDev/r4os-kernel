@@ -1,34 +1,26 @@
+comptime {
+    if (@import("builtin").is_test) _ = @import("rust_owner_test");
+}
+// Native USB owner: stateless compatibility facade.
+extern fn r4os_rust_usb_trb_chain(u64, u32, *Plan) bool;
 pub const PAGE_BYTES: u32 = 4096;
 pub const MAX_SEGMENTS: usize = 16;
 pub const MAX_TRANSFER_BYTES: u32 = PAGE_BYTES * MAX_SEGMENTS;
 
-pub const Segment = struct {
+pub const Segment = extern struct {
     phys: u64 = 0,
     len: u32 = 0,
 };
 
-pub const Plan = struct {
+pub const Plan = extern struct {
     segments: [MAX_SEGMENTS]Segment = .{Segment{}} ** MAX_SEGMENTS,
     count: u8 = 0,
     bytes: u32 = 0,
 };
 
 pub fn build(phys: u64, bytes: u32) ?Plan {
-    if (phys == 0 or bytes == 0 or bytes > MAX_TRANSFER_BYTES) return null;
-    var out: Plan = .{ .bytes = bytes };
-    var cursor = phys;
-    var remaining = bytes;
-    while (remaining != 0) {
-        if (out.count >= MAX_SEGMENTS) return null;
-        const page_offset: u32 = @intCast(cursor & (PAGE_BYTES - 1));
-        const available = PAGE_BYTES - page_offset;
-        const length = @min(remaining, available);
-        out.segments[out.count] = .{ .phys = cursor, .len = length };
-        out.count += 1;
-        cursor += length;
-        remaining -= length;
-    }
-    return out;
+    var out: Plan = undefined;
+    return if (r4os_rust_usb_trb_chain(phys, bytes, &out)) out else null;
 }
 
 test "64 KiB transfer becomes a bounded page chain" {
@@ -54,4 +46,19 @@ test "zero and oversized transfers are rejected" {
     const testing = @import("std").testing;
     try testing.expect(build(0x1000, 0) == null);
     try testing.expect(build(0x1000, MAX_TRANSFER_BYTES + 1) == null);
+}
+
+comptime {
+    if (@sizeOf(Segment) != 16 or
+        @alignOf(Segment) != 8 or
+        @offsetOf(Segment, "phys") != 0 or
+        @offsetOf(Segment, "len") != 8) @compileError("USB Segment private C layout");
+}
+
+comptime {
+    if (@sizeOf(Plan) != 264 or
+        @alignOf(Plan) != 8 or
+        @offsetOf(Plan, "segments") != 0 or
+        @offsetOf(Plan, "count") != 256 or
+        @offsetOf(Plan, "bytes") != 260) @compileError("USB Plan private C layout");
 }

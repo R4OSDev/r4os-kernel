@@ -20,3 +20,8 @@ pub mod foundation {
         unsafe { r4os_zig_kernel_dec(value) };
     }
 }
+
+// The exact failure owner is compiled for new boot-owner references; host
+// USB registry cases never execute machine boot or framebuffer output.
+#[path = "../../../Rust/boot/fatal.rs"]
+pub mod fatal;
