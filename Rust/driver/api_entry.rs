@@ -24,7 +24,6 @@ unsafe extern "C" {
         owner: u32,
         descriptor: *const c_void,
     ) -> i32;
-    fn r4os_zig_driver_synth(name: *const u8, descriptor: *const a::SynthEngine) -> i32;
 }
 fn puts(s: &[u8]) {
     unsafe { log::r4os_rust_bootlog_write(s.as_ptr(), s.len()) }
@@ -212,7 +211,32 @@ pub unsafe extern "C" fn r4os_rust_driver_synth(name: *const u8, d: *const a::Sy
     if !unsafe { validation::r4os_rust_driver_synth_valid(d) } {
         return -1;
     }
-    unsafe { r4os_zig_driver_synth(name, d) }
+    unsafe {
+        crate::audio::core::register_external_synth_engine_z(
+            name,
+            crate::audio::types::SynthRegistration {
+                flags: ptr::addr_of!((*d).flags).read(),
+                context: ptr::addr_of!((*d).context).read(),
+                send: ptr::addr_of!((*d).midi_send).read(),
+                render: ptr::addr_of!((*d).render).read(),
+                stop: ptr::addr_of!((*d).stop).read(),
+                status: ptr::addr_of!((*d).status).read(),
+                opl3_reset: ptr::addr_of!((*d).opl3_reset).read(),
+                opl3_write: ptr::addr_of!((*d).opl3_write_register).read(),
+                sid_acquire: ptr::addr_of!((*d).sid_acquire).read(),
+                sid_release: ptr::addr_of!((*d).sid_release).read(),
+                sid_model: ptr::addr_of!((*d).sid_set_model).read(),
+                sid_write: ptr::addr_of!((*d).sid_write_register).read(),
+                sid_load: ptr::addr_of!((*d).sid_load_data).read(),
+                sid_init: ptr::addr_of!((*d).sid_init).read(),
+                sid_play: ptr::addr_of!((*d).sid_play_frame).read(),
+                sid_pcm: ptr::addr_of!((*d).sid_render_pcm).read(),
+                render_pcm: validation::r4os_rust_driver_synth_pcm(d),
+                external: true,
+                ..Default::default()
+            },
+        )
+    }
 }
 /// # Safety
 /// The readable name preserves the original informational input registration.

@@ -1,6 +1,11 @@
 //! Original R4D audio registry and callback admission. A copied slot carries
 //! identity across foreign code; the real audio core still owns device cleanup.
-use crate::{boot::log, contract as a, driver::api_admission as admission};
+use crate::{
+    audio::{backend_contract::Limits, core as audio, types::BackendRegistration},
+    boot::log,
+    contract as a,
+    driver::api_admission as admission,
+};
 use core::{
     cell::UnsafeCell,
     ffi::c_void,
@@ -106,26 +111,7 @@ unsafe fn valid(d: *const a::AudioBackend) -> bool {
     }
     true
 }
-unsafe extern "C" {
-    fn r4os_zig_audio_register(
-        name: *const u8,
-        descriptor: *const a::AudioBackend,
-        context: *mut c_void,
-        write: unsafe extern "C" fn(*mut c_void, *const u8, u32, u32, u16, u16) -> i32,
-        stop: unsafe extern "C" fn(*mut c_void) -> i32,
-        status: unsafe extern "C" fn(*mut c_void, *mut a::AudioBackendStatus) -> i32,
-    ) -> i32;
-    fn r4os_zig_audio_register_outputs(
-        name: *const u8,
-        len: usize,
-        query: a::AudioOutputQueryFn,
-        select: a::AudioOutputSelectFn,
-        active: a::AudioOutputActiveFn,
-        idle: Option<unsafe extern "C" fn(*mut c_void) -> i32>,
-    ) -> bool;
-    fn r4os_zig_audio_unregister(name: *const u8, len: usize, terminated: bool) -> i32;
-    fn r4os_zig_audio_closing(name: *const u8, len: usize, closing: bool) -> bool;
-}
+
 /// # Safety
 /// The resident descriptor keeps the original versioned prefix and callback
 /// lifetime under the existing R4D/audio admission through confirmed teardown.
@@ -152,7 +138,25 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_register(
     }
     let context = unsafe { ptr::addr_of_mut!((*STATE.0.get())[index]).cast::<c_void>() };
     unsafe { ptr::write(context.cast::<Record>(), record) };
-    let result = unsafe { r4os_zig_audio_register(name, descriptor, context, write, stop, status) };
+    let result = unsafe {
+        audio::register_external_audio_backend_z(
+            name,
+            BackendRegistration {
+                context,
+                write: Some(write),
+                stop: Some(stop),
+                status: Some(status),
+                limits_present: true,
+                limits: Limits {
+                    formats: (*descriptor).formats,
+                    min_rate: (*descriptor).min_rate,
+                    max_rate: (*descriptor).max_rate,
+                    max_channels: (*descriptor).max_channels,
+                },
+                ..Default::default()
+            },
+        )
+    };
     if result != 0 {
         unsafe { ptr::write(context.cast(), Record::EMPTY) };
         return -3;
@@ -160,12 +164,13 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_register(
     let version = unsafe { (*descriptor).version };
     if has_outputs(version)
         && !unsafe {
-            r4os_zig_audio_register_outputs(
-                record.name.as_ptr(),
-                record.name_len,
-                output_query,
-                output_select,
-                output_active,
+            audio::register_external_audio_outputs(
+                &record.name[..record.name_len],
+                a::AudioOutputExtension {
+                    query: output_query,
+                    select: output_select,
+                    active: output_active,
+                },
                 if version == a::audio_backend_idle_version {
                     Some(idle)
                 } else {
@@ -174,7 +179,7 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_register(
             )
         }
     {
-        if unsafe { r4os_zig_audio_unregister(name, 0, true) } == 0 {
+        if unsafe { audio::unregister_audio_backend_z(name) } == 0 {
             unsafe { ptr::write(context.cast(), Record::EMPTY) };
         }
         return -3;
@@ -189,7 +194,7 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_register(
 /// admission; failure retains the exact callback record and its owner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_audio_unregister(name: *const u8) -> i32 {
-    let result = unsafe { r4os_zig_audio_unregister(name, 0, true) };
+    let result = unsafe { audio::unregister_audio_backend_z(name) };
     if result != 0 {
         return result;
     }
@@ -209,7 +214,7 @@ pub extern "C" fn r4os_rust_driver_audio_closing(owner: u32, closing: bool) -> b
         let r = unsafe { (*STATE.0.get())[i] };
         if r.used
             && r.owner == owner
-            && !unsafe { r4os_zig_audio_closing(r.name.as_ptr(), r.name_len, closing) }
+            && !unsafe { audio::set_audio_backend_closing(&r.name[..r.name_len], closing) }
         {
             return false;
         }
@@ -242,7 +247,7 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_cleanup(owner: u32, out: *mut Cl
             result.failed = true;
             continue;
         }
-        if unsafe { r4os_zig_audio_unregister(r.name.as_ptr(), r.name_len, false) } != 0 {
+        if unsafe { audio::unregister_audio_backend_by_name(&r.name[..r.name_len]) } != 0 {
             result.failed = true;
             continue;
         }

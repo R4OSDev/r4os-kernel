@@ -1,90 +1,55 @@
 const std = @import("std");
-const count_work = @import("builtin").is_test or
-    (@hasDecl(@import("root"), "audio_work_counters") and @import("root").audio_work_counters);
-pub const Work = struct { accumulations: u64 = 0, sample_writes: u64 = 0, direct_bytes: u64 = 0 };
-pub var work: Work = .{};
-
+const count_work = @import("builtin").is_test or (@hasDecl(@import("root"), "audio_work_counters") and @import("root").audio_work_counters);
+pub const Work = extern struct { accumulations: u64 = 0, sample_writes: u64 = 0, direct_bytes: u64 = 0 };
+extern var r4os_rust_audio_mixer_work: Work;
+pub const work = &r4os_rust_audio_mixer_work;
 pub const Source = struct { ring: []const u8, read_pos: usize, volume: u32 };
-
-/// Sources already own at least output.len bytes; the stream owner retains
-/// them until the backend acknowledges the complete mixed block.
-pub fn mix(sources: []const Source, output: []u8) void {
-    if (sources.len == 1 and sources[0].volume == 65_536) {
-        const source = sources[0];
-        const first = @min(output.len, source.ring.len - source.read_pos);
-        @memcpy(output[0..first], source.ring[source.read_pos..][0..first]);
-        @memcpy(output[first..], source.ring[0 .. output.len - first]);
-        if (count_work) work.direct_bytes += output.len;
-        return;
-    }
-    var byte_offset: usize = 0;
-    while (byte_offset < output.len) : (byte_offset += 2) {
-        var total: i64 = 0;
-        for (sources) |source| {
-            total = accumulateSample(total, ringReadS16(source.ring, source.read_pos, byte_offset), source.volume);
-        }
-        writeS16(output, byte_offset, clampSample(total));
-    }
-}
-
-pub const Owner = struct {
+const WireSource = extern struct { ring: [*]const u8, len: usize, read_pos: usize, volume: u32 };
+pub const Owner = extern struct {
     instance_id: u32 = 0,
     generation: u64 = 0,
-
-    pub fn valid(self: Owner) bool {
-        return (self.instance_id == 0 and self.generation == 0) or
-            (self.instance_id != 0 and self.generation != 0);
+    pub fn valid(self: @This()) bool {
+        return call(7, .{ .volume = self.instance_id, .total = @bitCast(self.generation) }) != 0;
     }
 };
-
+const Reader = *const fn (?*const anyopaque, usize, *WireSource) callconv(.c) void;
+const Args = extern struct { ring: ?[*]u8 = null, ring_len: usize = 0, data: ?[*]const u8 = null, data_len: usize = 0, position: ?*usize = null, used: ?*usize = null, offset: usize = 0, volume: u32 = 0, total: i64 = 0, sample: i16 = 0, sources: ?*const anyopaque = null, count: usize = 0, work: ?*Work = if (count_work) work else null, reader: ?Reader = null };
+extern fn r4os_rust_audio_mixer(op: u32, args: *const Args) i64;
+fn call(op: u32, args: Args) i64 {
+    return r4os_rust_audio_mixer(op, &args);
+}
+fn readSource(raw: ?*const anyopaque, index: usize, out: *WireSource) callconv(.c) void {
+    const sources: [*]const Source = @ptrCast(@alignCast(raw.?));
+    const source = sources[index];
+    out.* = .{ .ring = source.ring.ptr, .len = source.ring.len, .read_pos = source.read_pos, .volume = source.volume };
+}
+pub fn mix(sources: []const Source, output: []u8) void {
+    _ = call(0, .{ .ring = output.ptr, .ring_len = output.len, .sources = sources.ptr, .count = sources.len, .reader = readSource });
+}
 pub fn sameOwner(a: Owner, b: Owner) bool {
-    return a.instance_id == b.instance_id and a.generation == b.generation;
+    return call(8, .{ .ring = @ptrCast(@constCast(&a)), .data = @ptrCast(&b) }) != 0;
 }
-
 pub fn ringWrite(ring: []u8, write_pos: *usize, used: *usize, data: []const u8) usize {
-    if (ring.len == 0 or used.* >= ring.len or data.len == 0) return 0;
-    const count = @min(data.len, ring.len - used.*);
-    const first = @min(count, ring.len - write_pos.*);
-    @memcpy(ring[write_pos.* .. write_pos.* + first], data[0..first]);
-    if (first < count) @memcpy(ring[0 .. count - first], data[first..count]);
-    write_pos.* = (write_pos.* + count) % ring.len;
-    used.* += count;
-    return count;
+    return @intCast(call(1, .{ .ring = ring.ptr, .ring_len = ring.len, .position = write_pos, .used = used, .data = data.ptr, .data_len = data.len }));
 }
-
 pub fn ringReadS16(ring: []const u8, read_pos: usize, byte_offset: usize) i16 {
-    if (ring.len < 2) return 0;
-    const low_index = (read_pos + byte_offset) % ring.len;
-    const high_index = (low_index + 1) % ring.len;
-    const word = @as(u16, ring[low_index]) | (@as(u16, ring[high_index]) << 8);
-    return @bitCast(word);
+    return @intCast(call(2, .{ .ring = @constCast(ring.ptr), .ring_len = ring.len, .offset = read_pos, .data_len = byte_offset }));
 }
-
 pub fn ringConsume(ring_len: usize, read_pos: *usize, used: *usize, byte_count: usize) void {
-    if (ring_len == 0 or used.* == 0) return;
-    const count = @min(byte_count, used.*);
-    read_pos.* = (read_pos.* + count) % ring_len;
-    used.* -= count;
+    _ = call(3, .{ .ring_len = ring_len, .position = read_pos, .used = used, .offset = byte_count });
 }
-
 pub fn accumulateSample(total: i64, sample: i16, volume_fixed: u32) i64 {
-    if (count_work) work.accumulations += 1;
-    return total + @divTrunc(@as(i64, sample) * @as(i64, volume_fixed), 65_536);
+    return call(4, .{ .total = total, .sample = sample, .volume = volume_fixed });
 }
-
 pub fn clampSample(total: i64) i16 {
-    if (total > 32_767) return 32_767;
-    if (total < -32_768) return -32_768;
-    return @intCast(total);
+    return @intCast(call(5, .{ .total = total }));
 }
-
 pub fn writeS16(out: []u8, offset: usize, sample: i16) void {
-    if (count_work) work.sample_writes += 1;
-    const word: u16 = @bitCast(sample);
-    out[offset] = @truncate(word);
-    out[offset + 1] = @truncate(word >> 8);
+    _ = call(6, .{ .ring = out.ptr, .ring_len = out.len, .offset = offset, .sample = sample });
 }
-
+comptime {
+    if (@sizeOf(Owner) != 16 or @sizeOf(WireSource) != 32 or @sizeOf(Args) != 112) @compileError("private mixer layout");
+}
 test "stream owners include the generation" {
     const first = Owner{ .instance_id = 7, .generation = 11 };
     try std.testing.expect(first.valid());
@@ -125,7 +90,7 @@ test "mix keeps unity PCM bit exact across wrap, and still scales and saturates 
     for (&ring, 0..) |*b, i| b.* = @truncate(i * 31 + 17);
     const source = Source{ .ring = &ring, .read_pos = 12, .volume = 65536 };
     var out: [12]u8 = undefined;
-    work = .{};
+    work.* = .{};
     mix(&.{source}, &out);
     for (0..6) |i| try std.testing.expectEqual(ringReadS16(&ring, 12, i * 2), ringReadS16(&out, 0, i * 2));
     try std.testing.expectEqual(@as(u64, 0), work.accumulations);

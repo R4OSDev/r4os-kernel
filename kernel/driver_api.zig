@@ -1449,19 +1449,6 @@ extern fn r4os_rust_driver_audio_register(name: [*:0]const u8, descriptor: *cons
 extern fn r4os_rust_driver_audio_unregister(name: [*:0]const u8) i32;
 extern fn r4os_rust_driver_audio_closing(owner: u32, closing: bool) bool;
 extern fn r4os_rust_driver_audio_cleanup(owner: u32, out: *AudioOwnerCleanupResult) void;
-export fn r4os_zig_audio_register(name: [*:0]const u8, descriptor: *const AudioBackendDescriptor, context: ?*anyopaque, write: audio.WritePcmCtxFn, stop: audio.StopPcmCtxFn, status: audio.StatusCtxFn) callconv(.c) i32 {
-    return audio.registerExternalAudioBackendZ(name, .{ .formats = descriptor.formats, .min_rate = descriptor.min_rate, .max_rate = descriptor.max_rate, .max_channels = descriptor.max_channels }, context, write, stop, status);
-}
-export fn r4os_zig_audio_register_outputs(name: [*]const u8, len: usize, query: outputs_contract.AudioOutputQueryFn, select: outputs_contract.AudioOutputSelectFn, active: outputs_contract.AudioOutputActiveFn, idle: ?audio.StopPcmCtxFn) callconv(.c) bool {
-    return audio.registerExternalAudioOutputs(name[0..len], .{ .query = query, .select = select, .active = active }, idle);
-}
-export fn r4os_zig_audio_unregister(name: [*]const u8, len: usize, terminated: bool) callconv(.c) i32 {
-    return if (terminated) audio.unregisterAudioBackendZ(@ptrCast(name)) else audio.unregisterAudioBackendByName(name[0..len]);
-}
-export fn r4os_zig_audio_closing(name: [*]const u8, len: usize, closing: bool) callconv(.c) bool {
-    return audio.setAudioBackendClosing(name[0..len], closing);
-}
-
 extern fn r4os_rust_driver_storage_valid(d: *const StorageBackendDescriptor) bool;
 extern fn r4os_rust_driver_storage_submit(d: *const StorageBackendDescriptor) ?StorageSubmitFn;
 extern fn r4os_rust_driver_storage_cancel(d: *const StorageBackendDescriptor) ?StorageCancelFn;
@@ -1701,10 +1688,6 @@ export fn r4os_zig_driver_usb(op: u8, name: ?[*]const u8, len: usize, owner: u32
 export fn r4os_zig_driver_blit(register: bool, name: [*]const u8, len: usize, owner: u32, descriptor: ?*const anyopaque) callconv(.c) i32 {
     return if (register) display_blit.register(owner, name[0..len], @ptrCast(@alignCast(descriptor.?))) else display_blit.unregister(owner, name[0..len]);
 }
-export fn r4os_zig_driver_synth(name: [*:0]const u8, d: *const SynthEngineDescriptor) callconv(.c) i32 {
-    return audio.registerExternalSynthEngineZ(name, d.flags, d.context, d.midi_send, d.render, d.stop, d.status, d.opl3_reset, d.opl3_write_register, d.sid_acquire, d.sid_release, d.sid_set_model, d.sid_write_register, d.sid_load_data, d.sid_init, d.sid_play_frame, d.sid_render_pcm, synthRenderPcm(d));
-}
-
 const NativeGfxIdentity = extern struct { id: u64, generation: u64 };
 fn gfxIdentity(value: NativeGfxIdentity) gfx_buffers.Owner {
     return .{ .kind = .driver, .id = value.id, .generation = value.generation };

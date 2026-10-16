@@ -28,3 +28,5 @@ pub mod font;
 pub mod display;
 
 pub mod gfx;
+
+pub mod audio;

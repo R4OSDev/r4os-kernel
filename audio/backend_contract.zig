@@ -1,46 +1,30 @@
 const std = @import("std");
-
 pub const FORMAT_S16LE: u16 = 1;
 pub const FORMAT_U8: u16 = 2;
-pub const FORMAT_FLAG_S16LE: u32 = 1 << 0;
-pub const FORMAT_FLAG_U8: u32 = 1 << 1;
-
+pub const FORMAT_FLAG_S16LE: u32 = 1;
+pub const FORMAT_FLAG_U8: u32 = 2;
 pub const EndMode = enum { idle, stop };
 pub const EndCallback = *const fn (?*anyopaque) callconv(.c) i32;
-
-/// Ordinary PCM completion may retain a hardware-owned silent carrier.
-/// A closing owner or physical output change must always use Stop. Errors
-/// including Busy retain their exact meaning; Idle failure is no Stop ack.
+extern fn r4os_rust_audio_contract(op: u32, limits: ?*const Limits, rate: u32, channels: u16, format: u16, closing: bool, context: ?*anyopaque, stop: ?EndCallback, idle: ?EndCallback) i32;
 pub fn finishPcm(mode: EndMode, closing: bool, context: ?*anyopaque, stop: ?EndCallback, idle: ?EndCallback) i32 {
-    if (mode == .idle and !closing) if (idle) |callback| return callback(context);
-    if (stop) |callback| return callback(context);
-    return 0;
+    return r4os_rust_audio_contract(if (mode == .idle) 0 else 1, null, 0, 0, 0, closing, context, stop, idle);
 }
-
-pub const Limits = struct {
+pub const Limits = extern struct {
     formats: u32 = 0,
     min_rate: u32 = 0,
     max_rate: u32 = 0,
     max_channels: u16 = 0,
-
-    pub fn accepts(self: Limits, rate: u32, channels: u16, format: u16) bool {
-        if (rate == 0 or channels == 0 or self.max_channels == 0) return false;
-        if (self.min_rate != 0 and rate < self.min_rate) return false;
-        if (self.max_rate != 0 and rate > self.max_rate) return false;
-        if (channels > self.max_channels) return false;
-        const format_flag = formatFlag(format) orelse return false;
-        return (self.formats & format_flag) != 0;
+    pub fn accepts(self: @This(), rate: u32, channels: u16, format: u16) bool {
+        return r4os_rust_audio_contract(2, &self, rate, channels, format, false, null, null, null) != 0;
     }
 };
-
 pub fn formatFlag(format: u16) ?u32 {
-    return switch (format) {
-        FORMAT_S16LE => FORMAT_FLAG_S16LE,
-        FORMAT_U8 => FORMAT_FLAG_U8,
-        else => null,
-    };
+    const flag = r4os_rust_audio_contract(3, null, 0, 0, format, false, null, null, null);
+    return if (flag == 0) null else @intCast(flag);
 }
-
+comptime {
+    if (@sizeOf(Limits) != 16 or @offsetOf(Limits, "max_channels") != 12) @compileError("private audio limits layout");
+}
 test "audio backend limits accept only the declared write domain" {
     const limits = Limits{
         .formats = FORMAT_FLAG_S16LE | FORMAT_FLAG_U8,

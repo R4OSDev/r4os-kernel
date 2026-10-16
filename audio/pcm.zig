@@ -1,262 +1,77 @@
-pub const TARGET_RATE: u32 = 48_000;
+const count_work = @import("builtin").is_test or (@hasDecl(@import("root"), "audio_work_counters") and @import("root").audio_work_counters);
+pub const TARGET_RATE: u32 = 48000;
 pub const TARGET_CHANNELS: u16 = 2;
 pub const FORMAT_S16LE: u16 = 1;
 pub const FORMAT_U8: u16 = 2;
 pub const TARGET_FRAME_BYTES: usize = 4;
-const PHASE_ONE: u64 = 65_536;
-const count_work = @import("builtin").is_test or
-    (@hasDecl(@import("root"), "audio_work_counters") and @import("root").audio_work_counters);
-pub const Work = struct { sample_reads: u64 = 0, sample_writes: u64 = 0, interpolations: u64 = 0, direct_bytes: u64 = 0 };
-pub var work: Work = .{};
-
-pub const ResamplerState = struct {
+pub const Work = extern struct { sample_reads: u64 = 0, sample_writes: u64 = 0, interpolations: u64 = 0, direct_bytes: u64 = 0 };
+extern var r4os_rust_audio_pcm_work: Work;
+pub const work = &r4os_rust_audio_pcm_work;
+const StereoFrame = extern struct { left: i16 = 0, right: i16 = 0 };
+pub const ResamplerState = extern struct {
     rate: u32 = 0,
     channels: u16 = 0,
     format: u16 = 0,
     phase_q16: u64 = 0,
     phase_remainder: u32 = 0,
-    previous: StereoFrame = .{ .left = 0, .right = 0 },
+    previous: StereoFrame = .{},
     previous_valid: bool = false,
     chunk_done: bool = false,
-
-    pub fn reset(self: *ResamplerState) void {
-        self.* = .{};
+    pub fn reset(self: *@This()) void {
+        _ = call(0, .{ .state = self });
     }
-
-    pub fn resetIfFormatChanged(self: *ResamplerState, rate: u32, channels: u16, format: u16) void {
-        if (self.rate == rate and self.channels == channels and self.format == format) return;
-        self.* = .{ .rate = rate, .channels = channels, .format = format };
+    pub fn resetIfFormatChanged(self: *@This(), rate: u32, channels: u16, format: u16) void {
+        _ = call(1, .{ .state = self, .rate = rate, .channels = channels, .format = format });
     }
-
-    pub fn beginChunk(self: *ResamplerState, rate: u32, channels: u16, format: u16) void {
-        self.resetIfFormatChanged(rate, channels, format);
-        self.chunk_done = false;
+    pub fn beginChunk(self: *@This(), rate: u32, channels: u16, format: u16) void {
+        _ = call(2, .{ .state = self, .rate = rate, .channels = channels, .format = format });
     }
 };
-
+const Span = extern struct { pointer: ?[*]const u8 = null, len: usize = 0 };
+const Args = extern struct { state: ?*ResamplerState = null, input: ?[*]const u8 = null, input_len: usize = 0, output: ?[*]u8 = null, output_len: usize = 0, rate: u32 = 0, channels: u16 = 0, format: u16 = 0, start: usize = 0, work: ?*Work = if (count_work) work else null, span: ?*Span = null };
+extern fn r4os_rust_audio_pcm(op: u32, args: *const Args) usize;
+fn call(op: u32, args: Args) usize {
+    return r4os_rust_audio_pcm(op, &args);
+}
 pub fn sourceFrameBytes(channels: u16, format: u16) ?usize {
-    if (channels == 0 or channels > 2) return null;
-    return switch (format) {
-        FORMAT_S16LE => @as(usize, channels) * 2,
-        FORMAT_U8 => @as(usize, channels),
-        else => null,
-    };
+    const n = call(3, .{ .channels = channels, .format = format });
+    return if (n == 0) null else n;
 }
-
 pub fn outputFrameCount(input_len: usize, rate: u32, channels: u16, format: u16) usize {
-    if (rate == 0) return 0;
-    const frame_bytes = sourceFrameBytes(channels, format) orelse return 0;
-    const input_frames = input_len / frame_bytes;
-    if (input_frames == 0) return 0;
-    const frames = (@as(u64, input_frames) * TARGET_RATE + rate - 1) / rate;
-    return @intCast(frames);
+    return call(4, .{ .input_len = input_len, .rate = rate, .channels = channels, .format = format });
 }
-
-/// Borrow a bounded native-format span until the caller copies it into its
-/// own ring/DMA storage. Null requires conversion; an empty span makes no
-/// progress. Fractional phase must retain interpolation, even at target rate.
 pub fn takeDirectChunk(state: *ResamplerState, input: []const u8, rate: u32, channels: u16, format: u16, max_bytes: usize) ?[]const u8 {
-    if (rate != TARGET_RATE or channels != TARGET_CHANNELS or format != FORMAT_S16LE or input.len < TARGET_FRAME_BYTES) return null;
-    state.resetIfFormatChanged(rate, channels, format);
-    if (state.previous_valid or state.phase_q16 & (PHASE_ONE - 1) != 0) return null;
-    if (state.chunk_done) return input[0..0];
-    const frames = input.len / TARGET_FRAME_BYTES;
-    const limit = @as(u64, frames) * PHASE_ONE;
-    if (state.phase_q16 >= limit) {
-        state.phase_q16 -= limit;
-        state.chunk_done = true;
-        return input[0..0];
-    }
-    const first: usize = @intCast(state.phase_q16 / PHASE_ONE);
-    const count = @min(frames - first, max_bytes / TARGET_FRAME_BYTES);
-    state.phase_q16 += @as(u64, count) * PHASE_ONE;
-    if (state.phase_q16 >= limit) {
-        state.phase_q16 -= limit;
-        state.chunk_done = true;
-    }
-    if (count_work) work.direct_bytes += count * TARGET_FRAME_BYTES;
-    return input[first * TARGET_FRAME_BYTES ..][0 .. count * TARGET_FRAME_BYTES];
+    var span: Span = .{};
+    if (call(5, .{ .state = state, .input = input.ptr, .input_len = input.len, .rate = rate, .channels = channels, .format = format, .output_len = max_bytes, .span = &span }) == 0) return null;
+    return if (span.len == 0) input[0..0] else span.pointer.?[0..span.len];
 }
-
-pub fn convertToStereoS16(
-    input: []const u8,
-    rate: u32,
-    channels: u16,
-    format: u16,
-    output: []u8,
-    start_output_frame: usize,
-) usize {
-    if (rate == 0) return 0;
-    const frame_bytes = sourceFrameBytes(channels, format) orelse return 0;
-    const input_frames = input.len / frame_bytes;
-    if (input_frames == 0) return 0;
-
-    const total_output_frames = outputFrameCount(input.len, rate, channels, format);
-    if (start_output_frame >= total_output_frames) return 0;
-
-    var out_pos: usize = 0;
-    var out_frame = start_output_frame;
-    while (out_pos + TARGET_FRAME_BYTES <= output.len and out_frame < total_output_frames) : (out_frame += 1) {
-        const scaled = (@as(u64, out_frame) * rate * 65_536) / TARGET_RATE;
-        var src_index: usize = @intCast(scaled >> 16);
-        if (src_index >= input_frames) src_index = input_frames - 1;
-        const next_index = if (src_index + 1 < input_frames) src_index + 1 else src_index;
-        const frac: u32 = @truncate(scaled & 0xFFFF);
-
-        const a = readFrame(input, src_index, channels, format);
-        const b = readFrame(input, next_index, channels, format);
-        const left = lerpS16(a.left, b.left, frac);
-        const right = lerpS16(a.right, b.right, frac);
-        writeS16(output, out_pos, left);
-        writeS16(output, out_pos + 2, right);
-        out_pos += TARGET_FRAME_BYTES;
-    }
-    return out_pos;
+pub fn convertToStereoS16(input: []const u8, rate: u32, channels: u16, format: u16, output: []u8, start_output_frame: usize) usize {
+    return call(6, .{ .input = input.ptr, .input_len = input.len, .rate = rate, .channels = channels, .format = format, .output = output.ptr, .output_len = output.len, .start = start_output_frame });
 }
-
-/// Consume one caller-owned chunk in bounded output slices. A fractional
-/// position after its last sample waits for the next chunk instead of inventing
-/// a repeated boundary sample. Only that last decoded frame is retained.
-pub fn convertStreamingToStereoS16(
-    state: *ResamplerState,
-    input: []const u8,
-    rate: u32,
-    channels: u16,
-    format: u16,
-    output: []u8,
-) usize {
-    if (state.chunk_done or rate == 0) return 0;
-    const frame_bytes = sourceFrameBytes(channels, format) orelse return 0;
-    const input_frames = input.len / frame_bytes;
-    if (input_frames == 0) return 0;
-
-    if (takeDirectChunk(state, input, rate, channels, format, output.len)) |direct| {
-        @memcpy(output[0..direct.len], direct);
-        return direct.len;
-    }
-
-    state.resetIfFormatChanged(rate, channels, format);
-    const prefix: usize = @intFromBool(state.previous_valid);
-    const last_position = @as(u64, input_frames + prefix - 1) * PHASE_ONE;
-    var out_pos: usize = 0;
-    while (out_pos + TARGET_FRAME_BYTES <= output.len and state.phase_q16 <= last_position) {
-        const src_index: usize = @intCast(state.phase_q16 / PHASE_ONE);
-        const frac: u32 = @truncate(state.phase_q16 & (PHASE_ONE - 1));
-        const a = streamingFrame(state, input, src_index, prefix, channels, format);
-        const b = if (frac == 0) a else streamingFrame(state, input, src_index + 1, prefix, channels, format);
-        writeS16(output, out_pos, lerpS16(a.left, b.left, frac));
-        writeS16(output, out_pos + 2, lerpS16(a.right, b.right, frac));
-        out_pos += TARGET_FRAME_BYTES;
-        advancePhase(state);
-    }
-    if (state.phase_q16 > last_position) {
-        state.phase_q16 -= last_position;
-        state.previous = readFrame(input, input_frames - 1, channels, format);
-        state.previous_valid = true;
-        state.chunk_done = true;
-    }
-    return out_pos;
+pub fn convertStreamingToStereoS16(state: *ResamplerState, input: []const u8, rate: u32, channels: u16, format: u16, output: []u8) usize {
+    return call(7, .{ .state = state, .input = input.ptr, .input_len = input.len, .rate = rate, .channels = channels, .format = format, .output = output.ptr, .output_len = output.len });
 }
-
-fn streamingFrame(state: *const ResamplerState, input: []const u8, index: usize, prefix: usize, channels: u16, format: u16) StereoFrame {
-    if (prefix != 0 and index == 0) return state.previous;
-    return readFrame(input, index - prefix, channels, format);
-}
-
-fn advancePhase(state: *ResamplerState) void {
-    const numerator = @as(u64, state.rate) * PHASE_ONE;
-    state.phase_q16 += numerator / TARGET_RATE;
-    state.phase_remainder += @intCast(numerator % TARGET_RATE);
-    if (state.phase_remainder >= TARGET_RATE) {
-        state.phase_q16 += 1;
-        state.phase_remainder -= TARGET_RATE;
-    }
-}
-
-/// End-of-stream alone extends the last sample to its full source-frame
-/// duration. May be called repeatedly with bounded output; no input is borrowed.
-/// A new chunk must not begin until this final tail is fully drained.
 pub fn finishStreamingToStereoS16(state: *ResamplerState, output: []u8) usize {
-    if (!state.chunk_done or !state.previous_valid) return 0;
-    var out_pos: usize = 0;
-    while (out_pos + TARGET_FRAME_BYTES <= output.len and state.phase_q16 < PHASE_ONE) {
-        writeS16(output, out_pos, state.previous.left);
-        writeS16(output, out_pos + 2, state.previous.right);
-        out_pos += TARGET_FRAME_BYTES;
-        advancePhase(state);
-    }
-    if (state.phase_q16 >= PHASE_ONE) {
-        state.previous_valid = false;
-        state.phase_q16 = 0;
-        state.phase_remainder = 0;
-    }
-    return out_pos;
+    return call(8, .{ .state = state, .output = output.ptr, .output_len = output.len });
 }
-
-/// Output retained only to complete the final source frame's duration.
 pub fn pendingTailBytes(state: *const ResamplerState) usize {
-    if (!state.chunk_done or !state.previous_valid or state.rate == 0 or state.phase_q16 >= PHASE_ONE) return 0;
-    const remaining = (PHASE_ONE - state.phase_q16) * TARGET_RATE - state.phase_remainder;
-    const step = @as(u64, state.rate) * PHASE_ONE;
-    return @intCast(((remaining + step - 1) / step) * TARGET_FRAME_BYTES);
+    return call(9, .{ .state = @constCast(state) });
 }
-
-const StereoFrame = struct {
-    left: i16,
-    right: i16,
-};
-
-fn readFrame(input: []const u8, frame_index: usize, channels: u16, format: u16) StereoFrame {
-    const frame_bytes = sourceFrameBytes(channels, format) orelse return .{ .left = 0, .right = 0 };
-    const pos = frame_index * frame_bytes;
-    if (format == FORMAT_S16LE) {
-        const left = readS16(input, pos);
-        const right = if (channels == 2) readS16(input, pos + 2) else left;
-        return .{ .left = left, .right = right };
-    }
-
-    const left = u8ToS16(input[pos]);
-    const right = if (channels == 2) u8ToS16(input[pos + 1]) else left;
-    return .{ .left = left, .right = right };
+fn readS16(input: []const u8, pos: usize) i16 {
+    return @bitCast(@as(u16, @truncate(call(10, .{ .input = input.ptr, .input_len = input.len, .start = pos }))));
 }
-
-fn readS16(data: []const u8, pos: usize) i16 {
-    if (count_work) work.sample_reads += 1;
-    const word = @as(u16, data[pos]) | (@as(u16, data[pos + 1]) << 8);
-    return @bitCast(word);
+fn writeS16(output: []u8, pos: usize, value: i16) void {
+    _ = call(11, .{ .output = output.ptr, .output_len = output.len, .start = pos, .rate = @as(u16, @bitCast(value)) });
 }
-
-fn writeS16(data: []u8, pos: usize, value: i16) void {
-    if (count_work) work.sample_writes += 1;
-    const word: u16 = @bitCast(value);
-    data[pos] = @truncate(word);
-    data[pos + 1] = @truncate(word >> 8);
+comptime {
+    if (@sizeOf(ResamplerState) != 32 or @alignOf(ResamplerState) != 8 or @offsetOf(ResamplerState, "previous") != 20 or @sizeOf(Args) != 72) @compileError("private PCM layout");
 }
-
-fn u8ToS16(value: u8) i16 {
-    return (@as(i16, @intCast(value)) - 128) << 8;
-}
-
-fn lerpS16(a: i16, b: i16, frac: u32) i16 {
-    if (count_work) work.interpolations += 1;
-    const av = @as(i64, a);
-    const bv = @as(i64, b);
-    const mixed = av + @divTrunc((bv - av) * @as(i64, frac), 65_536);
-    return clampI16(mixed);
-}
-
-fn clampI16(value: i64) i16 {
-    if (value > 32_767) return 32_767;
-    if (value < -32_768) return -32_768;
-    return @intCast(value);
-}
-
 test "native PCM is bit exact with bounded partial outputs and borrowed input ownership" {
     const std = @import("std");
     const input = [_]u8{ 0, 128, 255, 127, 255, 255, 0, 0, 52, 18, 204, 237, 0xaa };
     var state = ResamplerState{};
     state.beginChunk(TARGET_RATE, 2, FORMAT_S16LE);
-    work = .{};
+    work.* = .{};
     var out: [5]u8 = .{0xcc} ** 5;
     try std.testing.expectEqual(@as(usize, 0), convertStreamingToStereoS16(&state, &input, TARGET_RATE, 2, FORMAT_S16LE, out[0..3]));
     try std.testing.expectEqual(@as(u64, 0), state.phase_q16);
@@ -284,7 +99,7 @@ test "format changes reset phase while fractional native phase and other formats
     const native = [_]u8{ 0, 128, 255, 127, 255, 255, 0, 0 };
     state.beginChunk(TARGET_RATE, 2, FORMAT_S16LE);
     state.phase_q16 = 1;
-    work = .{};
+    work.* = .{};
     try std.testing.expectEqual(@as(usize, 4), convertStreamingToStereoS16(&state, &native, TARGET_RATE, 2, FORMAT_S16LE, &out));
     try std.testing.expectEqual(@as(u64, 1), state.phase_q16);
     try std.testing.expectEqual(@as(usize, 4), finishStreamingToStereoS16(&state, out[4..]));

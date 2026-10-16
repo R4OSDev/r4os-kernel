@@ -72,3 +72,4 @@ pub mod gfx_queue_api;
 pub mod r4draw;
 pub mod r4desk;
 pub mod r4desk_frame;
+pub mod r4audio;

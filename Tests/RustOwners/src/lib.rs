@@ -445,3 +445,6 @@ pub mod display;
 
 #[path="../../../Rust/gfx/mod.rs"]
 pub mod gfx;
+
+#[path="../../../Rust/audio/mod.rs"]
+pub mod audio;

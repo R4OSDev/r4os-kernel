@@ -1,21 +1,6 @@
-const bootlog = @import("../kernel/bootlog.zig");
-const std = @import("std");
-const heap = @import("../memory/heap.zig");
-const phys = @import("../memory/phys.zig");
-const sync = @import("../sched/sync.zig");
-const scheduler = @import("../sched/scheduler.zig");
-const task_context = @import("../sched/task_context.zig");
-const sched_task = @import("../sched/task.zig");
-const timer = @import("../kernel/timer.zig");
-const protocol_api = @import("../kernel/protocol_api.zig");
-const r4p = @import("../program/r4p.zig");
-const r4x_api = @import("../program/r4x_api.zig");
-const r4p_contract = @import("../net/r4p_contract.zig");
-const k = @import("../kernel/log.zig");
+const outputs_contract = @import("r4os_kernel_contract");
 const backend_contract = @import("backend_contract.zig");
 const mixer = @import("mixer.zig");
-const pcm = @import("pcm.zig");
-const outputs_contract = @import("r4os_kernel_contract");
 pub const AudioOutputInfo = outputs_contract.AudioOutputInfo;
 pub const AudioOutputExtension = outputs_contract.AudioOutputExtension;
 
@@ -33,7 +18,7 @@ const SID_RENDER_BYTES: usize = 3840;
 const SYNTH_RENDER_MAX_FRAMES: u32 = 1024;
 const SYNTH_RENDER_MAX_BYTES: usize = SYNTH_RENDER_MAX_FRAMES * @sizeOf(i16) * DEFAULT_CHANNELS;
 const SYNTH_ENGINE_FLAG_MIDI: u32 = 1 << 0;
-const MIX_QUANTUM_BYTES: usize = 480 * pcm.TARGET_FRAME_BYTES;
+const MIX_QUANTUM_BYTES: usize = 480 * 4;
 
 pub const StreamOwner = mixer.Owner;
 pub const kernel_stream_owner: StreamOwner = .{};
@@ -123,190 +108,7 @@ pub const SynthSidInitCtxFn = *const fn (?*anyopaque, u32, u32, u32) callconv(.c
 pub const SynthSidPlayFrameCtxFn = *const fn (?*anyopaque, u32, u32, u32) callconv(.c) i32;
 pub const SynthSidRenderPcmCtxFn = *const fn (?*anyopaque, u32, [*]u8, u32) callconv(.c) i32;
 
-pub const StreamState = enum(u8) {
-    empty,
-    open,
-    closed,
-};
-
-const Stream = struct {
-    state: StreamState = .empty,
-    id: u32 = 0,
-    owner: StreamOwner = .{},
-    rate: u32 = 0,
-    channels: u16 = 0,
-    format: u16 = 0,
-    volume: u32 = 0x0001_0000,
-    ring: []u8 = &empty_ring,
-    read_pos: usize = 0,
-    write_pos: usize = 0,
-    available: usize = 0,
-    deferred_once: bool = false,
-    resampler: pcm.ResamplerState = .{},
-    total_written: u64 = 0,
-    transaction: bool = false,
-    read_reserved: bool = false,
-};
-
-const NamedBackend = struct {
-    active: bool = false,
-    name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
-    name_len: usize = 0,
-    ptr: ?*const anyopaque = null,
-};
-
-const SynthEngine = struct {
-    registered: bool = false,
-    flags: u32 = 0,
-    name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
-    name_len: usize = 0,
-    ptr: ?*const anyopaque = null,
-    context: ?*anyopaque = null,
-    midi_send: ?SynthMidiSendFn = null,
-    render: ?SynthRenderFn = null,
-    stop: ?SynthStopFn = null,
-    midi_send_ctx: ?SynthMidiSendCtxFn = null,
-    render_ctx: ?SynthRenderCtxFn = null,
-    render_pcm_ctx: ?SynthRenderPcmCtxFn = null,
-    stop_ctx: ?SynthStopCtxFn = null,
-    status_ctx: ?SynthStatusCtxFn = null,
-    opl3_reset_ctx: ?SynthOpl3ResetCtxFn = null,
-    opl3_write_register_ctx: ?SynthOpl3WriteRegisterCtxFn = null,
-    sid_acquire_ctx: ?SynthSidAcquireCtxFn = null,
-    sid_release_ctx: ?SynthSidReleaseCtxFn = null,
-    sid_set_model_ctx: ?SynthSidSetModelCtxFn = null,
-    sid_write_register_ctx: ?SynthSidWriteRegisterCtxFn = null,
-    sid_load_data_ctx: ?SynthSidLoadDataCtxFn = null,
-    sid_init_ctx: ?SynthSidInitCtxFn = null,
-    sid_play_frame_ctx: ?SynthSidPlayFrameCtxFn = null,
-    sid_render_pcm_ctx: ?SynthSidRenderPcmCtxFn = null,
-    external_contract: bool = false,
-    migration_bridge: bool = false,
-    pcm_pending: [SYNTH_RENDER_MAX_BYTES]u8 = .{0} ** SYNTH_RENDER_MAX_BYTES,
-    pcm_pending_len: u32 = 0,
-    sends: u64 = 0,
-    renders: u64 = 0,
-    stops: u64 = 0,
-};
-
-const AudioBackend = struct {
-    registered: bool = false,
-    active: bool = false,
-    closing: bool = false,
-    name: [MAX_NAME]u8 = .{0} ** MAX_NAME,
-    name_len: usize = 0,
-    ptr: ?*const anyopaque = null,
-    context: ?*anyopaque = null,
-    write_pcm: ?WritePcmFn = null,
-    stop_pcm: ?StopPcmFn = null,
-    write_pcm_ctx: ?WritePcmCtxFn = null,
-    stop_pcm_ctx: ?StopPcmCtxFn = null,
-    idle_pcm_ctx: ?StopPcmCtxFn = null,
-    status_ctx: ?StatusCtxFn = null,
-    pcm_limits: ?BackendPcmLimits = null,
-    outputs: ?AudioOutputExtension = null,
-};
-
-var empty_ring: [0]u8 = .{};
-var streams: [MAX_STREAMS]Stream = .{Stream{}} ** MAX_STREAMS;
-var stream_lock = sync.Mutex.initClass("audio-streams", sync.LockRank.audio_core, .sleepable);
-// The output permit serializes callback lifetime, not stream metadata. It may
-// span a backend wait; no tracked mutex or no-sleep owner spans that callback.
-var output_permit = sync.Semaphore.init(1, 1);
-var output_owner: usize = 0;
-var output_present: u8 = 0;
-const OutputGuard = struct {
-    unwind: task_context.UnwindToken,
-
-    fn acquire(wait: bool) ?OutputGuard {
-        const identity = if (scheduler.current()) |t| @intFromPtr(t) else 1;
-        if (@atomicLoad(usize, &output_owner, .acquire) == identity) return null;
-        const unwind = task_context.enterUnwind();
-        if (!unwind.admitted()) return null;
-        if (output_permit.acquire(if (wait) sync.WAIT_FOREVER else 0) != .signaled) {
-            _ = task_context.leaveUnwind(unwind);
-            return null;
-        }
-        @atomicStore(usize, &output_owner, identity, .release);
-        return .{ .unwind = unwind };
-    }
-
-    fn release(self: OutputGuard) void {
-        @atomicStore(usize, &output_owner, 0, .release);
-        _ = output_permit.release(1);
-        _ = task_context.leaveUnwind(self.unwind);
-    }
-};
-
-// A caller with an active stream/output lease must reacquire state even when
-// cancellation interrupts a contended wait, so its reservations can unwind.
-fn lockStreamState() void {
-    while (!stream_lock.lock(sync.WAIT_FOREVER)) scheduler.yield();
-}
-var progress_event = sync.EventV2.initMode(false, .auto_reset);
-var mix_progress_due: u64 = std.math.maxInt(u64);
-var backend_progress_due: u64 = std.math.maxInt(u64);
-var progress_worker_started = false;
-var mix_scratch: [MIX_QUANTUM_BYTES]u8 = .{0} ** MIX_QUANTUM_BYTES;
-var next_stream_id: u32 = 1;
-var audio_backends: [MAX_AUDIO_BACKENDS]AudioBackend = .{AudioBackend{}} ** MAX_AUDIO_BACKENDS;
-var active_audio_slot: ?usize = null;
-var initial_output_pending: bool = false;
-var mixer_backend: NamedBackend = .{};
-var synth_engines: [MAX_SYNTH_ENGINES]SynthEngine = .{SynthEngine{}} ** MAX_SYNTH_ENGINES;
-var active_midi_synth_slot: ?usize = null;
-var total_stream_writes: u64 = 0;
-var total_backend_ok: u64 = 0;
-var total_backend_fail: u64 = 0;
-var stream_available_high_water: u64 = 0;
-var stream_write_truncations: u64 = 0;
-var stream_dropped_bytes: u64 = 0;
-var stream_write_total_ticks: u64 = 0;
-var stream_write_max_ticks: u64 = 0;
-var stream_write_last_ticks: u64 = 0;
-var backend_write_calls: u64 = 0;
-var backend_write_total_ticks: u64 = 0;
-var backend_write_max_ticks: u64 = 0;
-var backend_write_last_ticks: u64 = 0;
-var sid_acquired: bool = false;
-var sid_write_count: u64 = 0;
-var sid_last_register: u8 = 0;
-var sid_last_value: u8 = 0;
-var midi_acquired: bool = false;
-var midi_send_count: u64 = 0;
-var midi_last_channel: u8 = 0;
-var midi_last_status: u8 = 0;
-var midi_last_data1: u8 = 0;
-var midi_last_data2: u8 = 0;
-var midi_render_ticks: u64 = 0;
-var midi_r4p_classify: u64 = 0;
-var midi_missing_required: u64 = 0;
-var midi_dispatch_failures: u64 = 0;
-var midi_last_result: i32 = 0;
-var midi_last_event: u8 = 0;
-var opl3_r4p_register: u64 = 0;
-var opl3_r4p_midi: u64 = 0;
-var opl3_missing_required: u64 = 0;
-var opl3_dispatch_failures: u64 = 0;
-var opl3_last_result: i32 = 0;
-var opl3_last_write_kind: u8 = 0;
-var opl3_last_action: u8 = 0;
-var sid_model_option: []const u8 = "8580";
-var sid_last_result: i32 = 0;
-var sid_pcm_writes: u64 = 0;
-var sid_pcm_ok: u64 = 0;
-var sid_pcm_fail: u64 = 0;
-var sid_pcm_pending: [SID_RENDER_BYTES]u8 = .{0} ** SID_RENDER_BYTES;
-var sid_pcm_pending_len: u32 = 0;
-var sid_r4p_model: u64 = 0;
-var sid_r4p_register: u64 = 0;
-var sid_r4p_io: u64 = 0;
-var sid_missing_required: u64 = 0;
-var sid_dispatch_failures: u64 = 0;
-var sid_last_kind: u8 = 0;
-var sid_last_voice: u8 = 0;
-
-pub const PerformanceSummary = struct {
+pub const PerformanceSummary = extern struct {
     max_streams: u32 = @intCast(MAX_STREAMS),
     open_streams: u32 = 0,
     closed_streams: u32 = 0,
@@ -348,1918 +150,429 @@ pub const PerformanceSummary = struct {
     midi_renders: u64 = 0,
 };
 
+pub const BackendFamilyStatus = extern struct { registered: bool = false, active: bool = false, has_output: bool = false };
+const WireSpan = extern struct {
+    pointer: ?[*]const u8 = null,
+    len: usize = 0,
+    fn bytes(self: @This()) []const u8 {
+        return if (self.len == 0) "" else self.pointer.?[0..self.len];
+    }
+};
+const WireMidiProtocolStatus = extern struct {
+    source: WireSpan = .{},
+    classify: u64 = 0,
+    missing_required: u64 = 0,
+    dispatch_fail: u64 = 0,
+    last_result: i32 = 0,
+    last_event: u8 = 0,
+};
+const WireOpl3ProtocolStatus = extern struct {
+    source: WireSpan = .{},
+    registers: u64 = 0,
+    midi: u64 = 0,
+    missing_required: u64 = 0,
+    dispatch_fail: u64 = 0,
+    last_result: i32 = 0,
+    last_kind: u8 = 0,
+    last_action: u8 = 0,
+};
+const WireSidProtocolStatus = extern struct {
+    source: WireSpan = .{},
+    model: u64 = 0,
+    register: u64 = 0,
+    io: u64 = 0,
+    missing_required: u64 = 0,
+    dispatch_fail: u64 = 0,
+    last_result: i32 = 0,
+    last_kind: u8 = 0,
+    last_voice: u8 = 0,
+};
+const BackendRegistration = extern struct { pointer: ?*const anyopaque = null, context: ?*anyopaque = null, write_legacy: usize = 0, stop_legacy: usize = 0, write: ?WritePcmCtxFn = null, stop: ?StopPcmCtxFn = null, status: ?StatusCtxFn = null, limits_present: bool = false, limits: BackendPcmLimits = .{} };
+const SynthRegistration = extern struct { flags: u32 = 0, pointer: ?*const anyopaque = null, context: ?*anyopaque = null, send_legacy: usize = 0, render_legacy: usize = 0, stop_legacy: usize = 0, send: ?SynthMidiSendCtxFn = null, render: ?SynthRenderCtxFn = null, render_pcm: ?SynthRenderPcmCtxFn = null, stop: ?SynthStopCtxFn = null, status: ?SynthStatusCtxFn = null, opl3_reset: ?SynthOpl3ResetCtxFn = null, opl3_write: ?SynthOpl3WriteRegisterCtxFn = null, sid_acquire: ?SynthSidAcquireCtxFn = null, sid_release: ?SynthSidReleaseCtxFn = null, sid_model: ?SynthSidSetModelCtxFn = null, sid_write: ?SynthSidWriteRegisterCtxFn = null, sid_load: ?SynthSidLoadDataCtxFn = null, sid_init: ?SynthSidInitCtxFn = null, sid_play: ?SynthSidPlayFrameCtxFn = null, sid_pcm: ?SynthSidRenderPcmCtxFn = null, external: bool = false, migration: bool = false };
+const Args = [32]usize;
+extern fn r4os_rust_audio_core(op: u32, args: *const Args) u64;
+fn call(op: u32, args: Args) u64 {
+    return r4os_rust_audio_core(op, &args);
+}
 pub fn init() void {
-    @atomicStore(u64, &mix_progress_due, std.math.maxInt(u64), .release);
-    @atomicStore(u64, &backend_progress_due, std.math.maxInt(u64), .release);
-    for (&streams) |*stream| {
-        const reusable_ring = stream.ring;
-        stream.* = .{};
-        if (reusable_ring.len == RING_BYTES) stream.ring = reusable_ring;
-    }
-    stream_lock = sync.Mutex.initClass("audio-streams", sync.LockRank.audio_core, .sleepable);
-    output_permit = sync.Semaphore.init(1, 1);
-    output_owner = 0;
-    output_present = 0;
-    next_stream_id = 1;
-    audio_backends = .{AudioBackend{}} ** MAX_AUDIO_BACKENDS;
-    active_audio_slot = null;
-    mixer_backend = .{};
-    synth_engines = .{SynthEngine{}} ** MAX_SYNTH_ENGINES;
-    active_midi_synth_slot = null;
-    total_stream_writes = 0;
-    total_backend_ok = 0;
-    total_backend_fail = 0;
-    stream_available_high_water = 0;
-    stream_write_truncations = 0;
-    stream_dropped_bytes = 0;
-    stream_write_total_ticks = 0;
-    stream_write_max_ticks = 0;
-    stream_write_last_ticks = 0;
-    backend_write_calls = 0;
-    backend_write_total_ticks = 0;
-    backend_write_max_ticks = 0;
-    backend_write_last_ticks = 0;
-    sid_acquired = false;
-    sid_write_count = 0;
-    sid_last_register = 0;
-    sid_last_value = 0;
-    midi_acquired = false;
-    midi_send_count = 0;
-    midi_last_channel = 0;
-    midi_last_status = 0;
-    midi_last_data1 = 0;
-    midi_last_data2 = 0;
-    midi_render_ticks = 0;
-    midi_r4p_classify = 0;
-    midi_missing_required = 0;
-    midi_dispatch_failures = 0;
-    midi_last_result = 0;
-    midi_last_event = 0;
-    opl3_r4p_register = 0;
-    opl3_r4p_midi = 0;
-    opl3_missing_required = 0;
-    opl3_dispatch_failures = 0;
-    opl3_last_result = 0;
-    opl3_last_write_kind = 0;
-    opl3_last_action = 0;
-    sid_model_option = "8580";
-    sid_last_result = 0;
-    sid_pcm_writes = 0;
-    sid_pcm_ok = 0;
-    sid_pcm_fail = 0;
-    sid_pcm_pending_len = 0;
-    resetSidProtocolCounters();
-    registerMixerBackend("SimpleKernelMixer", null);
-    bootlog.puts("[AUDIO] core ready pcm u8/s16le mono/stereo\r\n");
+    const args: Args = .{0} ** 32;
+    _ = call(0, args);
 }
-
-// The kernel owns these stream rings and their backend callbacks. This worker
-// only completes pending output; it has no app policy and no idle polling.
 pub fn startProgressWorker() bool {
-    if (progress_worker_started) return true;
-    _ = sched_task.createKernelThreadWithRole("audio-progress", progressWorker, .short_completion) orelse return false;
-    progress_worker_started = true;
-    return true;
+    const args: Args = .{0} ** 32;
+    return call(1, args) != 0;
 }
-
-fn scheduleProgress(pending: *u64, milliseconds: u64) void {
-    const ticks = @max(@as(u64, 1), (milliseconds * timer.frequency() + 999) / 1000);
-    const due = timer.deadlineAfterNow(ticks);
-    var previous = @atomicLoad(u64, pending, .acquire);
-    while (due < previous) {
-        previous = @cmpxchgWeak(u64, pending, previous, due, .acq_rel, .acquire) orelse {
-            progress_event.signal();
-            return;
-        };
-    }
-}
-
-fn progressWorker() callconv(.c) void {
-    while (true) {
-        const now = timer.tickCount();
-        if (runProgressIfDue(now)) continue;
-        const due = nextProgressTick();
-        _ = progress_event.waitResult(if (due == std.math.maxInt(u64)) sync.WAIT_FOREVER else due -| now);
-    }
-}
-
-fn nextProgressTick() u64 {
-    return @min(@atomicLoad(u64, &mix_progress_due, .acquire), @atomicLoad(u64, &backend_progress_due, .acquire));
-}
-
-fn claimProgress(pending: *u64, now: u64) bool {
-    const due = @atomicLoad(u64, pending, .acquire);
-    return due != std.math.maxInt(u64) and now >= due and
-        @cmpxchgStrong(u64, pending, due, std.math.maxInt(u64), .acq_rel, .acquire) == null;
-}
-
-fn runProgressIfDue(now: u64) bool {
-    if (now < nextProgressTick()) return false;
-    if (claimProgress(&mix_progress_due, now)) {
-        lockStreamState();
-        const result = pumpAvailableLocked(true);
-        _ = stream_lock.unlock();
-        if (result == r4x_api.service_api_result_busy) scheduleProgress(&mix_progress_due, 2);
-    }
-    if (claimProgress(&backend_progress_due, now)) serviceBackendProgressLocked();
-    return true;
-}
-
-fn serviceBackendProgressLocked() void {
-    const output_guard = OutputGuard.acquire(false) orelse {
-        scheduleProgress(&backend_progress_due, 2);
-        return;
-    };
-    defer output_guard.release();
-    // Drivers already advance their owned DMA queue in this bounded callback.
-    // A successful write gets one delayed observation even before the first
-    // completion interrupt; a contended driver explicitly requests a retry.
-    const slot = active_audio_slot orelse return;
-    const backend = &audio_backends[slot];
-    if (backend.closing) return;
-    if (backend.status_ctx) |status| {
-        var value: BackendStatus = .{};
-        if (status(backend.context, &value) == r4x_api.service_api_result_busy) scheduleProgress(&backend_progress_due, 2);
-    }
-}
-
 pub fn configureSidModel(model: []const u8) void {
-    sid_model_option = model;
-    _ = applyConfiguredSidModel();
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(model.ptr);
+    args[1] = model.len;
+    _ = call(2, args);
 }
-
 pub fn applyConfiguredSidModel() i32 {
-    if (sidEngine()) |engine| {
-        if (engine.sid_set_model_ctx) |set_model| {
-            sid_last_result = set_model(engine.context, sidModelId());
-            return sid_last_result;
-        }
-    }
-    return r4x_api.service_api_result_no_endpoint;
+    const args: Args = .{0} ** 32;
+    return @bitCast(@as(u32, @truncate(call(3, args))));
 }
-
 pub fn sidModelNameZ() [*:0]const u8 {
-    if (nameEq(sid_model_option, "6581")) return "6581";
-    return "8580";
+    const args: Args = .{0} ** 32;
+    return @ptrFromInt(call(4, args));
 }
-
 pub fn sidProtocolStatus() SidProtocolStatus {
-    return .{
-        .source = r4p.requiredSourceName("audio.sid"),
-        .model = sid_r4p_model,
-        .register = sid_r4p_register,
-        .io = sid_r4p_io,
-        .missing_required = sid_missing_required,
-        .dispatch_fail = sid_dispatch_failures,
-        .last_result = sid_last_result,
-        .last_kind = sid_last_kind,
-        .last_voice = sid_last_voice,
-    };
+    var args: Args = .{0} ** 32;
+    var out: WireSidProtocolStatus = undefined;
+    args[31] = @intFromPtr(&out);
+    _ = call(5, args);
+    return .{ .source = out.source.bytes(), .model = out.model, .register = out.register, .io = out.io, .missing_required = out.missing_required, .dispatch_fail = out.dispatch_fail, .last_result = out.last_result, .last_kind = out.last_kind, .last_voice = out.last_voice };
 }
-
 pub fn openStream(rate: u32, channels: u16, format: u16) i32 {
-    return openStreamForOwner(kernel_stream_owner, rate, channels, format);
+    var args: Args = .{0} ** 32;
+    args[0] = rate;
+    args[1] = channels;
+    args[2] = format;
+    return @bitCast(@as(u32, @truncate(call(6, args))));
 }
-
 pub fn openStreamForOwner(owner: StreamOwner, rate: u32, channels: u16, format: u16) i32 {
-    if (!owner.valid() or !validStreamFormat(rate, channels, format)) return r4x_api.service_api_result_invalid;
-    const output_guard = OutputGuard.acquire(true) orelse return r4x_api.service_api_result_busy;
-    defer output_guard.release();
-    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
-    defer _ = stream_lock.unlock();
-    if (!activeOutputPresent()) return r4x_api.service_api_result_no_endpoint;
-    const slot = freeStreamSlotLocked() orelse return r4x_api.service_api_result_full;
-    const ring = if (streams[slot].ring.len == RING_BYTES)
-        streams[slot].ring
-    else
-        heap.alloc(RING_BYTES, 16) orelse return -3;
-    const id = next_stream_id;
-    next_stream_id +%= 1;
-    if (next_stream_id == 0) next_stream_id = 1;
-
-    streams[slot] = .{
-        .state = .open,
-        .id = id,
-        .owner = owner,
-        .rate = rate,
-        .channels = channels,
-        .format = format,
-        .ring = ring,
-    };
-    bootlog.puts("[AUDIO] stream open id=");
-    bootlog.putDec(id);
-    bootlog.puts("\r\n");
-    return @intCast(id);
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(&owner);
+    args[1] = rate;
+    args[2] = channels;
+    args[3] = format;
+    return @bitCast(@as(u32, @truncate(call(7, args))));
 }
-
 pub fn writeStream(id: u32, ptr: [*]const u8, byte_count: u32) i32 {
-    return writeStreamForOwner(kernel_stream_owner, id, ptr, byte_count);
+    var args: Args = .{0} ** 32;
+    args[0] = id;
+    args[1] = @intFromPtr(ptr);
+    args[2] = byte_count;
+    return @bitCast(@as(u32, @truncate(call(8, args))));
 }
-
 pub fn writeStreamForOwner(owner: StreamOwner, id: u32, ptr: [*]const u8, byte_count: u32) i32 {
-    const write_start = timer.tickCount();
-    if (!owner.valid()) return r4x_api.service_api_result_invalid;
-    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
-    defer _ = stream_lock.unlock();
-    const stream = streamByOwnerLocked(owner, id) orelse return r4x_api.service_api_result_not_found;
-    if (byte_count == 0) return 0;
-    if (stream.transaction) return r4x_api.service_api_result_busy;
-    if (!activeOutputPresent()) return r4x_api.service_api_result_no_endpoint;
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) return r4x_api.service_api_result_busy;
-    stream.transaction = true;
-    defer {
-        stream.transaction = false;
-        _ = task_context.leaveUnwind(unwind);
-    }
-    defer recordTickStat(&stream_write_total_ticks, &stream_write_max_ticks, &stream_write_last_ticks, write_start);
-    const frame_bytes = pcm.sourceFrameBytes(stream.channels, stream.format) orelse return r4x_api.service_api_result_invalid;
-    const requested_bytes: usize = @intCast(byte_count);
-    const requested_frames = requested_bytes / frame_bytes;
-    if (requested_frames == 0) return r4x_api.service_api_result_invalid;
-    var fitting_frames: usize = @intCast((@as(u64, (stream.ring.len - stream.available) / pcm.TARGET_FRAME_BYTES) * stream.rate) / pcm.TARGET_RATE);
-    if (fitting_frames == 0) {
-        const result = pumpAvailableLocked(true);
-        if (result < 0) return result;
-        fitting_frames = @intCast((@as(u64, (stream.ring.len - stream.available) / pcm.TARGET_FRAME_BYTES) * stream.rate) / pcm.TARGET_RATE);
-    }
-    const accepted_frames = @min(requested_frames, fitting_frames);
-    if (accepted_frames == 0) return r4x_api.service_api_result_busy;
-    const accepted_bytes = accepted_frames * frame_bytes;
-    const input = ptr[0..accepted_bytes];
-    const capacity = stream.ring.len - stream.available;
-    var resampler = stream.resampler;
-    const rate = stream.rate;
-    const channels = stream.channels;
-    const format = stream.format;
-    // Only this writer may append or mutate its phase. Consumers may drain
-    // committed bytes concurrently, so the reserved free capacity only grows.
-    _ = stream_lock.unlock();
-    var converted: [RING_BYTES]u8 = undefined;
-    resampler.beginChunk(rate, channels, format);
-    const output = pcm.takeDirectChunk(&resampler, input, rate, channels, format, capacity) orelse blk: {
-        const produced = pcm.convertStreamingToStereoS16(&resampler, input, rate, channels, format, converted[0..capacity]);
-        break :blk converted[0..produced];
-    };
-    lockStreamState();
-    // Conversion failure cannot publish a partial chunk or advance its phase.
-    if (!resampler.chunk_done) return r4x_api.service_api_result_busy;
-    const was_empty = stream.available == 0;
-    std.debug.assert(mixer.ringWrite(stream.ring, &stream.write_pos, &stream.available, output) == output.len);
-    stream.resampler = resampler;
-    if (was_empty) stream.deferred_once = false;
-    stream_available_high_water = @max(stream_available_high_water, stream.available);
-    stream.total_written +%= accepted_bytes;
-    total_stream_writes +%= 1;
-    if (accepted_bytes < requested_bytes) stream_write_truncations +%= 1;
-    if (pumpAvailableLocked(false) == r4x_api.service_api_result_busy) scheduleProgress(&mix_progress_due, 2);
-    return @intCast(accepted_bytes);
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(&owner);
+    args[1] = id;
+    args[2] = @intFromPtr(ptr);
+    args[3] = byte_count;
+    return @bitCast(@as(u32, @truncate(call(9, args))));
 }
-
 pub fn closeStream(id: u32) i32 {
-    return closeStreamForOwner(kernel_stream_owner, id);
+    var args: Args = .{0} ** 32;
+    args[0] = id;
+    return @bitCast(@as(u32, @truncate(call(10, args))));
 }
-
 pub fn closeStreamForOwner(owner: StreamOwner, id: u32) i32 {
-    if (!owner.valid()) return r4x_api.service_api_result_invalid;
-    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
-    defer _ = stream_lock.unlock();
-    const stream = streamByOwnerLocked(owner, id) orelse return r4x_api.service_api_result_not_found;
-    if (stream.transaction or stream.read_reserved) return r4x_api.service_api_result_busy;
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) return r4x_api.service_api_result_busy;
-    stream.transaction = true;
-    defer {
-        stream.transaction = false;
-        _ = task_context.leaveUnwind(unwind);
-    }
-    const finish_result = finishStreamPcmLocked(stream);
-    if (finish_result < 0) return finish_result;
-    const pump_result = pumpAvailableLocked(true);
-    if (pump_result < 0) return pump_result;
-    const stop_result = stopClosingStreamsLocked(1);
-    if (stop_result < 0) return stop_result;
-    if (!releaseStreamLocked(stream)) return r4x_api.service_api_result_busy;
-    bootlog.puts("[AUDIO] stream close id=");
-    bootlog.putDec(id);
-    bootlog.puts("\r\n");
-    return 0;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(&owner);
+    args[1] = id;
+    return @bitCast(@as(u32, @truncate(call(11, args))));
 }
-
 pub fn closeStreamsForOwner(owner: StreamOwner) bool {
-    if (!owner.valid() or (owner.instance_id == 0 and owner.generation == 0)) return false;
-    if (!stream_lock.lock(sync.WAIT_FOREVER)) return false;
-    defer _ = stream_lock.unlock();
-
-    var reserved: [MAX_STREAMS]bool = .{false} ** MAX_STREAMS;
-    for (&streams, 0..) |*stream, index| {
-        if (stream.state != .open or !mixer.sameOwner(stream.owner, owner)) continue;
-        if (stream.transaction or stream.read_reserved) return false;
-        reserved[index] = true;
-    }
-    const unwind = task_context.enterUnwind();
-    if (!unwind.admitted()) return false;
-    for (&streams, 0..) |*stream, index| {
-        if (reserved[index]) stream.transaction = true;
-    }
-    defer {
-        for (&streams, 0..) |*stream, index| {
-            if (reserved[index]) stream.transaction = false;
-        }
-        _ = task_context.leaveUnwind(unwind);
-    }
-    var matching: u32 = 0;
-    var owner_queued = false;
-    for (&streams, 0..) |*stream, index| {
-        if (!reserved[index]) continue;
-        if (finishStreamPcmLocked(stream) < 0) return false;
-        matching += 1;
-        owner_queued = owner_queued or stream.available != 0;
-    }
-    if (matching == 0) return true;
-    if (owner_queued and activeOutputPresent() and pumpAvailableLocked(true) < 0) return false;
-    if (stopClosingStreamsLocked(matching) < 0) return false;
-    for (&streams, 0..) |*stream, index| {
-        if (reserved[index] and stream.read_reserved) return false;
-        if (!reserved[index] and stream.state == .open and mixer.sameOwner(stream.owner, owner)) return false;
-    }
-
-    var released = true;
-    for (&streams, 0..) |*stream, index| {
-        if (!reserved[index]) continue;
-        stream_dropped_bytes +%= stream.available;
-        stream.available = 0;
-        if (!releaseStreamLocked(stream)) released = false;
-    }
-    return released;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(&owner);
+    return call(12, args) != 0;
 }
-
 pub fn closeAllStreams() bool {
-    // No external caller currently uses this internal entry point. Report a
-    // retry instead of discarding storage borrowed by another continuation.
-    const output_guard = OutputGuard.acquire(false) orelse return false;
-    defer output_guard.release();
-    if (!stream_lock.lock(sync.WAIT_FOREVER)) return false;
-    for (&streams) |*stream| {
-        if (stream.transaction or stream.read_reserved) {
-            _ = stream_lock.unlock();
-            return false;
-        }
-    }
-    for (&streams) |*stream| stream.transaction = true;
-    _ = stream_lock.unlock();
-    const stopped = stopActivePcmOwned();
-    lockStreamState();
-    for (&streams) |*stream| stream.transaction = false;
-    if (stopped < 0) {
-        _ = stream_lock.unlock();
-        return false;
-    }
-    for (&streams) |*stream| {
-        if (stream.state != .open) continue;
-        stream_dropped_bytes +%= stream.available + pcm.pendingTailBytes(&stream.resampler);
-        _ = releaseStreamLocked(stream);
-    }
-    _ = stream_lock.unlock();
-    return true;
+    const args: Args = .{0} ** 32;
+    return call(13, args) != 0;
 }
-
 pub fn setVolume(id: u32, fixed_volume: u32) i32 {
-    return setVolumeForOwner(kernel_stream_owner, id, fixed_volume);
+    var args: Args = .{0} ** 32;
+    args[0] = id;
+    args[1] = fixed_volume;
+    return @bitCast(@as(u32, @truncate(call(14, args))));
 }
-
 pub fn setVolumeForOwner(owner: StreamOwner, id: u32, fixed_volume: u32) i32 {
-    if (!owner.valid()) return r4x_api.service_api_result_invalid;
-    if (!stream_lock.lock(sync.WAIT_FOREVER)) return r4x_api.service_api_result_busy;
-    defer _ = stream_lock.unlock();
-    const stream = streamByOwnerLocked(owner, id) orelse return r4x_api.service_api_result_not_found;
-    stream.volume = fixed_volume;
-    return 0;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(&owner);
+    args[1] = id;
+    args[2] = fixed_volume;
+    return @bitCast(@as(u32, @truncate(call(15, args))));
 }
-
 pub fn sidAcquire() i32 {
-    const engine = sidEngine() orelse return -1;
-    const acquire = engine.sid_acquire_ctx orelse return -3;
-    if (sid_acquired) return -2;
-    const result = acquire(engine.context);
-    sid_last_result = result;
-    if (result > 0) {
-        sid_acquired = true;
-        sid_pcm_pending_len = 0;
-    }
-    return result;
+    const args: Args = .{0} ** 32;
+    return @bitCast(@as(u32, @truncate(call(16, args))));
 }
-
 pub fn sidWriteRegister(handle: u32, register: u8, value: u8) i32 {
-    const engine = sidEngine() orelse return -3;
-    const write_register = engine.sid_write_register_ctx orelse return -3;
-    if (handle != 1 or !sid_acquired) return -1;
-    if (register >= SID_REGISTER_COUNT) return -2;
-    sid_last_register = register;
-    sid_last_value = value;
-    sid_write_count += 1;
-    sid_last_result = write_register(engine.context, handle, register, value);
-    return sid_last_result;
+    var args: Args = .{0} ** 32;
+    args[0] = handle;
+    args[1] = register;
+    args[2] = value;
+    return @bitCast(@as(u32, @truncate(call(17, args))));
 }
-
 pub fn sidRelease(handle: u32) i32 {
-    const engine = sidEngine() orelse return -3;
-    const release = engine.sid_release_ctx orelse return -3;
-    if (handle != 1 or !sid_acquired) return -1;
-    sid_last_result = release(engine.context, handle);
-    sid_acquired = false;
-    sid_pcm_pending_len = 0;
-    return sid_last_result;
+    var args: Args = .{0} ** 32;
+    args[0] = handle;
+    return @bitCast(@as(u32, @truncate(call(18, args))));
 }
-
 pub fn sidLoadData(handle: u32, load_addr: u16, ptr: [*]const u8, byte_count: u32) i32 {
-    const engine = sidEngine() orelse return -3;
-    const load_data = engine.sid_load_data_ctx orelse return -3;
-    if (handle != 1 or !sid_acquired) return -1;
-    if (byte_count == 0 or byte_count > 65_536) return -2;
-    sid_last_result = load_data(engine.context, handle, load_addr, ptr, byte_count);
-    return if (sid_last_result == 0) @intCast(byte_count) else sid_last_result;
+    var args: Args = .{0} ** 32;
+    args[0] = handle;
+    args[1] = load_addr;
+    args[2] = @intFromPtr(ptr);
+    args[3] = byte_count;
+    return @bitCast(@as(u32, @truncate(call(19, args))));
 }
-
 pub fn sidInit(handle: u32, init_addr: u16, song: u16) i32 {
-    const engine = sidEngine() orelse return -3;
-    const init_sid = engine.sid_init_ctx orelse return -3;
-    if (handle != 1 or !sid_acquired) return -1;
-    sid_last_result = init_sid(engine.context, handle, init_addr, song);
-    return sid_last_result;
+    var args: Args = .{0} ** 32;
+    args[0] = handle;
+    args[1] = init_addr;
+    args[2] = song;
+    return @bitCast(@as(u32, @truncate(call(20, args))));
 }
-
 pub fn sidPlayFrame(handle: u32, play_addr: u16, frame_hz: u16) i32 {
-    const engine = sidEngine() orelse return -3;
-    const play_frame = engine.sid_play_frame_ctx orelse return -3;
-    const render_pcm = engine.sid_render_pcm_ctx orelse return -3;
-    if (handle != 1 or !sid_acquired) return -1;
-    if (sid_pcm_pending_len != 0) return flushPendingSidPcm();
-    sid_last_result = play_frame(engine.context, handle, play_addr, frame_hz);
-    if (sid_last_result != 0) return sid_last_result;
-
-    const rendered = render_pcm(engine.context, handle, sid_pcm_pending[0..].ptr, SID_RENDER_BYTES);
-    sid_last_result = rendered;
-    if (rendered <= 0 or rendered > SID_RENDER_BYTES or (@as(u32, @intCast(rendered)) % pcm.TARGET_FRAME_BYTES) != 0) {
-        sid_pcm_fail +%= 1;
-        total_backend_fail +%= 1;
-        return if (rendered < 0) rendered else r4x_api.service_api_result_invalid;
-    }
-    sid_pcm_pending_len = @intCast(rendered);
-    sid_pcm_writes +%= 1;
-    engine.renders +%= 1;
-    return flushPendingSidPcm();
+    var args: Args = .{0} ** 32;
+    args[0] = handle;
+    args[1] = play_addr;
+    args[2] = frame_hz;
+    return @bitCast(@as(u32, @truncate(call(21, args))));
 }
-
 pub fn sidStop(handle: u32) i32 {
-    const engine = sidEngine() orelse return -3;
-    const stop = engine.stop_ctx orelse return -3;
-    if (handle != 1 or !sid_acquired) return -1;
-    sid_last_result = stop(engine.context);
-    if (sid_last_result == 0) engine.stops +%= 1;
-    sid_pcm_pending_len = 0;
-    stopActivePcm();
-    return sid_last_result;
+    var args: Args = .{0} ** 32;
+    args[0] = handle;
+    return @bitCast(@as(u32, @truncate(call(22, args))));
 }
-
-fn flushPendingSidPcm() i32 {
-    const len: usize = @intCast(sid_pcm_pending_len);
-    if (len == 0) return 0;
-    const result = writeActivePcm(sid_pcm_pending[0..len], DEFAULT_RATE, DEFAULT_CHANNELS, FORMAT_S16LE) orelse r4x_api.service_api_result_no_endpoint;
-    sid_last_result = result;
-    if (result == 0) {
-        sid_pcm_pending_len = 0;
-        sid_pcm_ok +%= 1;
-        total_backend_ok +%= 1;
-    } else if (result != r4x_api.service_api_result_busy) {
-        sid_pcm_fail +%= 1;
-        total_backend_fail +%= 1;
-    }
-    return result;
-}
-
 pub fn midiOpenSynth(backend_z: [*:0]const u8) i32 {
-    var buf: [MAX_NAME]u8 = undefined;
-    const requested = copyZ(backend_z, buf[0..]) orelse return -1;
-    if (midi_acquired) return -3;
-    const selected = if (requested.len == 0)
-        findRenderableSynthEngine() orelse return -4
-    else blk: {
-        const slot = findSynthEngine(requested) orelse return -2;
-        if (!synthCanRenderMidi(slot)) return -4;
-        break :blk slot;
-    };
-    synth_engines[selected].pcm_pending_len = 0;
-    active_midi_synth_slot = selected;
-    midi_acquired = true;
-    return 1;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(backend_z);
+    return @bitCast(@as(u32, @truncate(call(23, args))));
 }
-
 pub fn midiSend(handle: u32, channel: u8, status: u8, data1: u8, data2: u8) i32 {
-    if (handle != 1 or !midi_acquired) return -1;
-    if (channel > 15) return -2;
-    if (status == 0) {
-        const encoded_frames = @as(u32, data1) | (@as(u32, data2) << 8);
-        const requested_frames = if (encoded_frames == 0) SYNTH_RENDER_MAX_FRAMES else encoded_frames;
-        if (requested_frames > SYNTH_RENDER_MAX_FRAMES) return r4x_api.service_api_result_invalid;
-        return renderActiveMidiSynth(requested_frames);
-    }
-    const event = classifyMidiEvent(channel, status, data1, data2) orelse return -3;
-    midi_last_channel = channel;
-    midi_last_status = event.normalized_status;
-    midi_last_data1 = data1;
-    midi_last_data2 = data2;
-    midi_last_event = event.event;
-    midi_send_count += 1;
-    return sendActiveMidiSynth(channel, event.normalized_status, data1, data2);
+    var args: Args = .{0} ** 32;
+    args[0] = handle;
+    args[1] = channel;
+    args[2] = status;
+    args[3] = data1;
+    args[4] = data2;
+    return @bitCast(@as(u32, @truncate(call(24, args))));
 }
-
 pub fn midiClose(handle: u32) i32 {
-    if (handle != 1 or !midi_acquired) return -1;
-    const stop_result = stopActiveMidiSynth();
-    if (active_midi_synth_slot) |slot| synth_engines[slot].pcm_pending_len = 0;
-    active_midi_synth_slot = null;
-    midi_acquired = false;
-    stopPcmIfNoStreams();
-    return stop_result;
+    var args: Args = .{0} ** 32;
+    args[0] = handle;
+    return @bitCast(@as(u32, @truncate(call(25, args))));
 }
-
 pub fn midiProtocolStatus() MidiProtocolStatus {
-    return .{
-        .source = r4p.requiredSourceName("audio.midi"),
-        .classify = midi_r4p_classify,
-        .missing_required = midi_missing_required,
-        .dispatch_fail = midi_dispatch_failures,
-        .last_result = midi_last_result,
-        .last_event = midi_last_event,
-    };
+    var args: Args = .{0} ** 32;
+    var out: WireMidiProtocolStatus = undefined;
+    args[31] = @intFromPtr(&out);
+    _ = call(26, args);
+    return .{ .source = out.source.bytes(), .classify = out.classify, .missing_required = out.missing_required, .dispatch_fail = out.dispatch_fail, .last_result = out.last_result, .last_event = out.last_event };
 }
-
 pub fn opl3ProtocolStatus() Opl3ProtocolStatus {
-    return .{
-        .source = r4p.requiredSourceName("audio.opl3"),
-        .registers = opl3_r4p_register,
-        .midi = opl3_r4p_midi,
-        .missing_required = opl3_missing_required,
-        .dispatch_fail = opl3_dispatch_failures,
-        .last_result = opl3_last_result,
-        .last_kind = opl3_last_write_kind,
-        .last_action = opl3_last_action,
-    };
+    var args: Args = .{0} ** 32;
+    var out: WireOpl3ProtocolStatus = undefined;
+    args[31] = @intFromPtr(&out);
+    _ = call(27, args);
+    return .{ .source = out.source.bytes(), .registers = out.registers, .midi = out.midi, .missing_required = out.missing_required, .dispatch_fail = out.dispatch_fail, .last_result = out.last_result, .last_kind = out.last_kind, .last_action = out.last_action };
 }
-
 pub fn opl3Reset() i32 {
-    var op: r4p_contract.AudioOpl3Op = .{};
-    if (r4p.hasActiveR4p("audio.opl3")) _ = dispatchOpl3(r4p_contract.AUDIO_OPL3_OP_RESET, &op);
-    const slot = findSynthEngine("OPL3") orelse return -2;
-    const reset = synth_engines[slot].opl3_reset_ctx orelse return -3;
-    return reset(synth_engines[slot].context);
+    const args: Args = .{0} ** 32;
+    return @bitCast(@as(u32, @truncate(call(28, args))));
 }
-
 pub fn opl3WriteRegister(bank: u8, reg: u8, value: u8) i32 {
-    _ = classifyOpl3Register(bank, reg, value) orelse return -1;
-    const slot = findSynthEngine("OPL3") orelse return -2;
-    const write = synth_engines[slot].opl3_write_register_ctx orelse return -3;
-    return write(synth_engines[slot].context, bank, reg, value);
+    var args: Args = .{0} ** 32;
+    args[0] = bank;
+    args[1] = reg;
+    args[2] = value;
+    return @bitCast(@as(u32, @truncate(call(29, args))));
 }
-
 pub fn opl3RunRegisterDemo() void {
-    _ = opl3Reset();
-    _ = opl3WriteRegister(1, 0x05, 0x01);
-    _ = opl3WriteRegister(0, 0x01, 0x20);
-    _ = opl3WriteRegister(0, 0x20, 0x21);
-    _ = opl3WriteRegister(0, 0x23, 0x01);
-    _ = opl3WriteRegister(0, 0x40, 0x18);
-    _ = opl3WriteRegister(0, 0x43, 0x00);
-    _ = opl3WriteRegister(0, 0x60, 0xF3);
-    _ = opl3WriteRegister(0, 0x63, 0xF3);
-    _ = opl3WriteRegister(0, 0x80, 0x77);
-    _ = opl3WriteRegister(0, 0x83, 0x77);
-    _ = opl3WriteRegister(0, 0xE0, 0x00);
-    _ = opl3WriteRegister(0, 0xE3, 0x00);
-    _ = opl3WriteRegister(0, 0xA0, 0x98);
-    _ = opl3WriteRegister(0, 0xB0, 0x31);
-    _ = opl3WriteRegister(0, 0xC0, 0x31);
+    const args: Args = .{0} ** 32;
+    _ = call(30, args);
 }
-
 pub fn opl3RenderBlock() i32 {
-    const slot = findSynthEngine("OPL3") orelse return -2;
-    return renderSynthPcm(slot, SYNTH_RENDER_MAX_FRAMES);
+    const args: Args = .{0} ** 32;
+    return @bitCast(@as(u32, @truncate(call(31, args))));
 }
-
 pub fn opl3Stop() i32 {
-    const slot = findSynthEngine("OPL3") orelse return -2;
-    if (synth_engines[slot].stop_ctx) |stop| {
-        const result = stop(synth_engines[slot].context);
-        if (result >= 0) synth_engines[slot].stops += 1;
-        return result;
-    }
-    return 0;
+    const args: Args = .{0} ** 32;
+    return @bitCast(@as(u32, @truncate(call(32, args))));
 }
-
 pub fn allocDmaBuffer(bytes: u32, alignment: u32) u64 {
-    _ = alignment;
-    if (bytes == 0 or bytes > phys.FRAME_SIZE) return 0;
-    return phys.allocFrame() orelse 0;
+    var args: Args = .{0} ** 32;
+    args[0] = bytes;
+    args[1] = alignment;
+    return call(33, args);
 }
-
 pub fn freeDmaBuffer(phys_addr: u64, bytes: u32) void {
-    _ = bytes;
-    if (phys_addr == 0) return;
-    phys.freeFrame(phys_addr);
+    var args: Args = .{0} ** 32;
+    args[0] = phys_addr;
+    args[1] = bytes;
+    _ = call(34, args);
 }
-
 pub fn registerAudioBackendZ(name: [*:0]const u8, backend: *const anyopaque) i32 {
-    var buf: [MAX_NAME]u8 = undefined;
-    const name_slice = copyZ(name, buf[0..]) orelse return -1;
-    return if (registerAudioBackendInternal(name_slice, backend, null, null, null, null, null, null, null)) 0 else -2;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name);
+    args[1] = @intFromPtr(backend);
+    return @bitCast(@as(u32, @truncate(call(35, args))));
 }
-
 pub fn registerMixerBackendZ(name: [*:0]const u8, backend: *const anyopaque) i32 {
-    return registerZ(&mixer_backend, name, backend, "mixer");
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name);
+    args[1] = @intFromPtr(backend);
+    return @bitCast(@as(u32, @truncate(call(36, args))));
 }
-
 pub fn registerSynthEngineZ(name: [*:0]const u8, engine: *const anyopaque) i32 {
-    var buf: [MAX_NAME]u8 = undefined;
-    const name_slice = copyZ(name, buf[0..]) orelse return -1;
-    return if (registerSynthEngine(name_slice, engine)) 0 else -2;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name);
+    args[1] = @intFromPtr(engine);
+    return @bitCast(@as(u32, @truncate(call(37, args))));
 }
-
 pub fn registerAudioBackend(name: []const u8, backend: ?*const anyopaque) void {
-    _ = registerAudioBackendInternal(name, backend, null, null, null, null, null, null, null);
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    args[2] = if (backend) |v| @intFromPtr(v) else 0;
+    _ = call(38, args);
 }
-
 pub fn registerExternalAudioBackendZ(name: [*:0]const u8, limits: BackendPcmLimits, context: ?*anyopaque, write_pcm: WritePcmCtxFn, stop_pcm: ?StopPcmCtxFn, status: ?StatusCtxFn) i32 {
-    var buf: [MAX_NAME]u8 = undefined;
-    const name_slice = copyZ(name, buf[0..]) orelse return -1;
-    return if (registerAudioBackendInternal(name_slice, null, null, null, context, write_pcm, stop_pcm, status, limits)) 0 else -2;
+    const config = BackendRegistration{ .context = context, .write = write_pcm, .stop = stop_pcm, .status = status, .limits_present = true, .limits = limits };
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name);
+    args[1] = @intFromPtr(&config);
+    return @bitCast(@as(u32, @truncate(call(39, args))));
 }
-
 pub fn registerExternalAudioOutputs(name: []const u8, outputs: AudioOutputExtension, idle_pcm: ?StopPcmCtxFn) bool {
-    const output_guard = OutputGuard.acquire(true) orelse return false;
-    defer output_guard.release();
-    const slot = findAudioBackend(name) orelse return false;
-    if (audio_backends[slot].closing) return false;
-    audio_backends[slot].outputs = outputs;
-    audio_backends[slot].idle_pcm_ctx = idle_pcm;
-    initial_output_pending = true;
-    return true;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    args[2] = @intFromPtr(&outputs);
+    args[3] = if (idle_pcm) |v| @intFromPtr(v) else 0;
+    return call(40, args) != 0;
 }
-
-fn outputRecordLocked(slot: usize, index: u32, out: *AudioOutputInfo) i32 {
-    const backend = &audio_backends[slot];
-    out.* = .{};
-    if (!backend.registered or backend.closing or (backend.write_pcm == null and backend.write_pcm_ctx == null)) return 0;
-    if (backend.outputs) |outputs| {
-        const result = outputs.query(@intFromPtr(backend.context), index, out);
-        if (result != 1) return result;
-        if (out.version != 1 or out.size != @sizeOf(AudioOutputInfo) or
-            std.mem.indexOfScalar(u8, &out.id, 0) == null or std.mem.indexOfScalar(u8, &out.name, 0) == null) return -1;
-        out.flags &= ~outputs_contract.audio_output_flag_active;
-        if (active_audio_slot == slot and outputs.active(@intFromPtr(backend.context)) == @as(i32, @intCast(index))) out.flags |= outputs_contract.audio_output_flag_active;
-        return 1;
-    }
-    if (index != 0) return 0;
-    @memcpy(out.id[0..backend.name_len], backend.name[0..backend.name_len]);
-    @memcpy(out.name[0..backend.name_len], backend.name[0..backend.name_len]);
-    out.availability = outputs_contract.audio_output_available;
-    if (backend.status_ctx) |status| {
-        var value: BackendStatus = .{};
-        if (status(backend.context, &value) < 0 or value.active == 0) out.availability = outputs_contract.audio_output_unavailable;
-    }
-    if (active_audio_slot == slot) out.flags = outputs_contract.audio_output_flag_active;
-    out.preferred_rate = DEFAULT_RATE;
-    out.channels = DEFAULT_CHANNELS;
-    out.format = FORMAT_S16LE;
-    return 1;
-}
-
 pub fn audioOutputInfo(index: u32, out: *AudioOutputInfo) i32 {
-    const output_guard = OutputGuard.acquire(true) orelse return r4x_api.service_api_result_busy;
-    defer output_guard.release();
-    var ordinal: u32 = 0;
-    for (0..audio_backends.len) |slot| {
-        for (0..32) |local| {
-            const result = outputRecordLocked(slot, @intCast(local), out);
-            if (result < 0) return result;
-            if (result == 0) break;
-            if (ordinal == index) return 1;
-            ordinal += 1;
-        }
-    }
-    out.* = .{};
-    return 0;
+    var args: Args = .{0} ** 32;
+    args[0] = index;
+    args[1] = @intFromPtr(out);
+    return @bitCast(@as(u32, @truncate(call(41, args))));
 }
-
-fn selectOutputLocked(slot: usize, local: u32) i32 {
-    const backend = &audio_backends[slot];
-    if (backend.outputs) |outputs| {
-        const result = outputs.select(@intFromPtr(backend.context), local);
-        if (result < 0) return result;
-    }
-    if (active_audio_slot != slot) {
-        const stopped = stopActivePcmOwned();
-        if (stopped < 0) return stopped;
-        setActiveAudioBackend(slot);
-    }
-    return 0;
-}
-
 pub fn audioSelectOutput(id: []const u8) i32 {
-    if (id.len == 0 or id.len >= 64) return r4x_api.service_api_result_invalid;
-    const output_guard = OutputGuard.acquire(true) orelse return r4x_api.service_api_result_busy;
-    defer output_guard.release();
-    var record: AudioOutputInfo = .{};
-    for (0..audio_backends.len) |slot| {
-        for (0..32) |local| {
-            const result = outputRecordLocked(slot, @intCast(local), &record);
-            if (result < 0) return result;
-            if (result == 0) break;
-            const len = std.mem.indexOfScalar(u8, &record.id, 0) orelse return -1;
-            if (!std.mem.eql(u8, id, record.id[0..len])) continue;
-            if (record.availability != outputs_contract.audio_output_available) return r4x_api.service_api_result_no_endpoint;
-            const selected = selectOutputLocked(slot, @intCast(local));
-            if (selected == 0) initial_output_pending = false;
-            return selected;
-        }
-    }
-    return r4x_api.service_api_result_no_endpoint;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(id.ptr);
+    args[1] = id.len;
+    return @bitCast(@as(u32, @truncate(call(42, args))));
 }
-
-fn resolveInitialOutputLocked() void {
-    if (!initial_output_pending) return;
-    var best_slot: ?usize = null;
-    var best_local: u32 = 0;
-    var best_score: u32 = 0;
-    var record: AudioOutputInfo = .{};
-    for (0..audio_backends.len) |slot| {
-        for (0..32) |local| {
-            const result = outputRecordLocked(slot, @intCast(local), &record);
-            if (result < 0) return; // Retry the complete snapshot later.
-            if (result == 0) break;
-            if (record.availability != outputs_contract.audio_output_available) continue;
-            const score: u32 = if (record.kind == outputs_contract.audio_output_kind_hdmi) 100 else if (audio_backends[slot].outputs != null and audio_backends[slot].outputs.?.active(@intFromPtr(audio_backends[slot].context)) == @as(i32, @intCast(local))) 20 else 1;
-            if (score <= best_score) continue;
-            best_score = score;
-            best_slot = slot;
-            best_local = @intCast(local);
-        }
-    }
-    if (best_slot) |slot| {
-        if (selectOutputLocked(slot, best_local) == 0) initial_output_pending = false;
-    }
-}
-
 pub fn registerExternalSynthEngineZ(name: [*:0]const u8, flags: u32, context: ?*anyopaque, send_midi: ?SynthMidiSendCtxFn, render: ?SynthRenderCtxFn, stop: ?SynthStopCtxFn, status: ?SynthStatusCtxFn, opl3_reset: ?SynthOpl3ResetCtxFn, opl3_write_register: ?SynthOpl3WriteRegisterCtxFn, sid_acquire: ?SynthSidAcquireCtxFn, sid_release: ?SynthSidReleaseCtxFn, sid_set_model: ?SynthSidSetModelCtxFn, sid_write_register: ?SynthSidWriteRegisterCtxFn, sid_load_data: ?SynthSidLoadDataCtxFn, sid_init: ?SynthSidInitCtxFn, sid_play_frame: ?SynthSidPlayFrameCtxFn, sid_render_pcm: ?SynthSidRenderPcmCtxFn, render_pcm: ?SynthRenderPcmCtxFn) i32 {
-    var buf: [MAX_NAME]u8 = undefined;
-    const name_slice = copyZ(name, buf[0..]) orelse return -1;
-    return if (registerSynthEngineInternal(name_slice, flags, null, null, null, null, context, send_midi, render, render_pcm, stop, status, opl3_reset, opl3_write_register, sid_acquire, sid_release, sid_set_model, sid_write_register, sid_load_data, sid_init, sid_play_frame, sid_render_pcm, true, false)) 0 else -2;
+    const config = SynthRegistration{ .flags = flags, .context = context, .external = true, .send = send_midi, .render = render, .render_pcm = render_pcm, .stop = stop, .status = status, .opl3_reset = opl3_reset, .opl3_write = opl3_write_register, .sid_acquire = sid_acquire, .sid_release = sid_release, .sid_model = sid_set_model, .sid_write = sid_write_register, .sid_load = sid_load_data, .sid_init = sid_init, .sid_play = sid_play_frame, .sid_pcm = sid_render_pcm };
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name);
+    args[1] = @intFromPtr(&config);
+    return @bitCast(@as(u32, @truncate(call(43, args))));
 }
-
 pub fn unregisterAudioBackendByName(name: []const u8) i32 {
-    const output_guard = OutputGuard.acquire(true) orelse return r4x_api.service_api_result_busy;
-    defer output_guard.release();
-    const slot = findAudioBackend(name) orelse return -1;
-    const was_active = active_audio_slot == slot;
-    if (was_active) {
-        const result = stopActivePcmOwned();
-        if (result < 0) return result;
-    }
-    audio_backends[slot] = .{};
-    if (was_active) {
-        active_audio_slot = null;
-        @atomicStore(u8, &output_present, 0, .release);
-        activateFirstNativeBackend();
-    }
-    bootlog.puts("[AUDIO] audio backend unregistered ");
-    bootlog.puts(name);
-    bootlog.puts(" [OK]\r\n");
-    return 0;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    return @bitCast(@as(u32, @truncate(call(44, args))));
 }
-
 pub fn unregisterAudioBackendZ(name: [*:0]const u8) i32 {
-    var buf: [MAX_NAME]u8 = undefined;
-    const name_slice = copyZ(name, buf[0..]) orelse return -1;
-    return unregisterAudioBackendByName(name_slice);
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name);
+    return @bitCast(@as(u32, @truncate(call(45, args))));
 }
-
 pub fn registerSynthEngine(name: []const u8, engine: ?*const anyopaque) bool {
-    return registerSynthEngineInternal(name, 0, engine, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, nameEq(name, "SID"));
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    args[2] = if (engine) |v| @intFromPtr(v) else 0;
+    return call(46, args) != 0;
 }
-
 pub fn registerNativeSynthEngine(name: []const u8, send_midi: ?SynthMidiSendFn, render: ?SynthRenderFn, stop: ?SynthStopFn) void {
-    _ = registerSynthEngineInternal(name, if (send_midi != null) SYNTH_ENGINE_FLAG_MIDI else 0, null, send_midi, render, stop, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, false, false);
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    args[2] = if (send_midi) |v| @intFromPtr(v) else 0;
+    args[3] = if (render) |v| @intFromPtr(v) else 0;
+    args[4] = if (stop) |v| @intFromPtr(v) else 0;
+    _ = call(47, args);
 }
-
-fn registerSynthEngineInternal(name: []const u8, flags: u32, engine: ?*const anyopaque, send_midi: ?SynthMidiSendFn, render: ?SynthRenderFn, stop: ?SynthStopFn, context: ?*anyopaque, send_midi_ctx: ?SynthMidiSendCtxFn, render_ctx: ?SynthRenderCtxFn, render_pcm_ctx: ?SynthRenderPcmCtxFn, stop_ctx: ?SynthStopCtxFn, status_ctx: ?SynthStatusCtxFn, opl3_reset_ctx: ?SynthOpl3ResetCtxFn, opl3_write_register_ctx: ?SynthOpl3WriteRegisterCtxFn, sid_acquire_ctx: ?SynthSidAcquireCtxFn, sid_release_ctx: ?SynthSidReleaseCtxFn, sid_set_model_ctx: ?SynthSidSetModelCtxFn, sid_write_register_ctx: ?SynthSidWriteRegisterCtxFn, sid_load_data_ctx: ?SynthSidLoadDataCtxFn, sid_init_ctx: ?SynthSidInitCtxFn, sid_play_frame_ctx: ?SynthSidPlayFrameCtxFn, sid_render_pcm_ctx: ?SynthSidRenderPcmCtxFn, external_contract: bool, migration_bridge: bool) bool {
-    const slot = findSynthEngine(name) orelse freeSynthEngineSlot() orelse {
-        bootlog.puts("[AUDIO][WARN] synth engine registry full\r\n");
-        return false;
-    };
-    const entry = &synth_engines[slot];
-    const sends = entry.sends;
-    const renders = entry.renders;
-    const stops = entry.stops;
-    entry.* = .{
-        .registered = true,
-        .flags = flags,
-        .ptr = engine,
-        .context = context,
-        .midi_send = send_midi,
-        .render = render,
-        .stop = stop,
-        .midi_send_ctx = send_midi_ctx,
-        .render_ctx = render_ctx,
-        .render_pcm_ctx = render_pcm_ctx,
-        .stop_ctx = stop_ctx,
-        .status_ctx = status_ctx,
-        .opl3_reset_ctx = opl3_reset_ctx,
-        .opl3_write_register_ctx = opl3_write_register_ctx,
-        .sid_acquire_ctx = sid_acquire_ctx,
-        .sid_release_ctx = sid_release_ctx,
-        .sid_set_model_ctx = sid_set_model_ctx,
-        .sid_write_register_ctx = sid_write_register_ctx,
-        .sid_load_data_ctx = sid_load_data_ctx,
-        .sid_init_ctx = sid_init_ctx,
-        .sid_play_frame_ctx = sid_play_frame_ctx,
-        .sid_render_pcm_ctx = sid_render_pcm_ctx,
-        .external_contract = external_contract,
-        .migration_bridge = migration_bridge,
-        .sends = sends,
-        .renders = renders,
-        .stops = stops,
-    };
-    entry.name_len = if (name.len < MAX_NAME) name.len else MAX_NAME - 1;
-    if (entry.name_len > 0) @memcpy(entry.name[0..entry.name_len], name[0..entry.name_len]);
-    bootlog.puts("[AUDIO] synth engine registered ");
-    bootlog.puts(entry.name[0..entry.name_len]);
-    if (external_contract) {
-        bootlog.puts(" external");
-    } else if (migration_bridge) {
-        bootlog.puts(" migration");
-    } else {
-        bootlog.puts(if (send_midi != null or render != null) " native" else " generic");
-    }
-    bootlog.puts(" [OK]\r\n");
-    return true;
-}
-
 pub fn registerNativeAudioBackend(name: []const u8, write_pcm: WritePcmFn, stop_pcm: ?StopPcmFn) void {
-    _ = registerAudioBackendInternal(name, null, write_pcm, stop_pcm, null, null, null, null, null);
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    args[2] = @intFromPtr(write_pcm);
+    args[3] = if (stop_pcm) |v| @intFromPtr(v) else 0;
+    _ = call(48, args);
 }
-
 pub fn selectAudioBackend(name: []const u8) bool {
-    const output_guard = OutputGuard.acquire(true) orelse return false;
-    defer output_guard.release();
-    const slot = findAudioBackend(name) orelse {
-        bootlog.puts("[AUDIO][WARN] audio backend not found ");
-        bootlog.puts(name);
-        bootlog.puts("\r\n");
-        return false;
-    };
-    if (audio_backends[slot].closing) return false;
-    if (audio_backends[slot].write_pcm == null and audio_backends[slot].write_pcm_ctx == null) {
-        bootlog.puts("[AUDIO][WARN] audio backend has no PCM output ");
-        bootlog.puts(name);
-        bootlog.puts("\r\n");
-        return false;
-    }
-    if (active_audio_slot == slot) return true;
-    if (stopActivePcmOwned() < 0) return false;
-    setActiveAudioBackend(slot);
-    return true;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    return call(49, args) != 0;
 }
-
 pub fn unregisterAudioBackend(name: []const u8) bool {
-    return unregisterAudioBackendByName(name) == 0;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    return call(50, args) != 0;
 }
-
-// R4D cleanup closes callback admission before DriverShutdown starts. Taking
-// the output permit first drains an in-flight callback; cancellation alone
-// may reopen it. Failed shutdown keeps the registered context quarantined.
 pub fn setAudioBackendClosing(name: []const u8, closing: bool) bool {
-    const output_guard = OutputGuard.acquire(true) orelse return false;
-    defer output_guard.release();
-    const slot = findAudioBackend(name) orelse return false;
-    audio_backends[slot].closing = closing;
-    if (active_audio_slot == slot) @atomicStore(u8, &output_present, @intFromBool(!closing and
-        (audio_backends[slot].write_pcm != null or audio_backends[slot].write_pcm_ctx != null)), .release);
-    return true;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    args[2] = @intFromBool(closing);
+    return call(51, args) != 0;
 }
-
 pub fn audioBackendRegistered(name: []const u8) bool {
-    const output_guard = OutputGuard.acquire(true) orelse return false;
-    defer output_guard.release();
-    return findAudioBackend(name) != null;
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    return call(52, args) != 0;
 }
-
-pub const BackendFamilyStatus = struct { registered: bool = false, active: bool = false, has_output: bool = false };
-
-// A driver may publish one backend per controller (for example HDA-0000).
-// Boot status observes the whole family in one snapshot without callbacks.
 pub fn audioBackendFamilyStatus(family: []const u8) BackendFamilyStatus {
-    const output_guard = OutputGuard.acquire(true) orelse return .{};
-    defer output_guard.release();
-    var result: BackendFamilyStatus = .{};
-    for (&audio_backends, 0..) |*backend, slot| {
-        if (!backend.registered) continue;
-        const name = backend.name[0..backend.name_len];
-        if (name.len < family.len or !std.ascii.eqlIgnoreCase(name[0..family.len], family)) continue;
-        if (name.len != family.len and name[family.len] != '-') continue;
-        result.registered = true;
-        if (backend.closing) continue;
-        result.active = result.active or (active_audio_slot == slot and backend.active);
-        result.has_output = result.has_output or backend.write_pcm != null or backend.write_pcm_ctx != null;
-    }
-    return result;
-}
-
-pub fn audioBackendActive(name: []const u8) bool {
-    const output_guard = OutputGuard.acquire(true) orelse return false;
-    defer output_guard.release();
-    const slot = findAudioBackend(name) orelse return false;
-    return active_audio_slot == slot and audio_backends[slot].active and !audio_backends[slot].closing;
-}
-
-pub fn audioBackendHasOutput(name: []const u8) bool {
-    const output_guard = OutputGuard.acquire(true) orelse return false;
-    defer output_guard.release();
-    const slot = findAudioBackend(name) orelse return false;
-    return audio_backends[slot].write_pcm != null or audio_backends[slot].write_pcm_ctx != null;
-}
-
-pub fn performanceSummary() PerformanceSummary {
-    if (!stream_lock.lock(sync.WAIT_FOREVER)) return .{};
-    var out = PerformanceSummary{
-        .total_stream_writes = total_stream_writes,
-        .backend_ok = total_backend_ok,
-        .backend_fail = total_backend_fail,
-        .stream_available_high_water_bytes = stream_available_high_water,
-        .stream_write_truncations = stream_write_truncations,
-        .stream_dropped_bytes = stream_dropped_bytes,
-        .stream_write_total_ticks = stream_write_total_ticks,
-        .stream_write_max_ticks = stream_write_max_ticks,
-        .stream_write_last_ticks = stream_write_last_ticks,
-        .backend_write_calls = backend_write_calls,
-        .backend_write_total_ticks = backend_write_total_ticks,
-        .backend_write_max_ticks = backend_write_max_ticks,
-        .backend_write_last_ticks = backend_write_last_ticks,
-        .sid_writes = sid_write_count,
-        .sid_pcm_writes = sid_pcm_writes,
-        .sid_pcm_fail = sid_pcm_fail,
-        .midi_sends = midi_send_count,
-        .midi_renders = midi_render_ticks,
-    };
-    var i: usize = 0;
-    while (i < streams.len) : (i += 1) {
-        out.stream_ring_bytes +%= @intCast(streams[i].ring.len);
-        switch (streams[i].state) {
-            .open => {
-                out.open_streams += 1;
-                out.stream_available_bytes +%= @intCast(streams[i].available);
-            },
-            .closed => out.closed_streams += 1,
-            .empty => {},
-        }
-    }
-    _ = stream_lock.unlock();
-    const output_guard = OutputGuard.acquire(false) orelse return out;
-    defer output_guard.release();
-    i = 0;
-    while (i < audio_backends.len) : (i += 1) {
-        const backend = &audio_backends[i];
-        if (!backend.registered) continue;
-        out.registered_backends += 1;
-        if (backend.active and !backend.closing) out.active_backends += 1;
-        if (backend.closing) continue;
-        if (backend.status_ctx) |status_fn| {
-            var status: BackendStatus = .{ .active = if (backend.active) 1 else 0 };
-            if (status_fn(backend.context, &status) == 0) {
-                out.backend_status_writes +%= status.writes;
-                out.backend_status_underruns +%= status.underruns;
-                out.backend_status_errors +%= status.errors;
-                out.backend_status_refills +%= status.refills;
-                out.backend_status_silence_refills +%= status.silence_refills;
-                out.backend_status_buffer_bytes +%= status.buffer_bytes;
-                out.backend_status_queued_buffers +%= status.queued_buffers;
-                out.backend_status_last_buffer_bytes +%= status.last_buffer_bytes;
-                if (status.total_write_ticks > out.backend_write_total_ticks) out.backend_write_total_ticks = status.total_write_ticks;
-                if (status.max_write_ticks > out.backend_write_max_ticks) out.backend_write_max_ticks = status.max_write_ticks;
-                if (status.last_write_ticks > out.backend_write_last_ticks) out.backend_write_last_ticks = status.last_write_ticks;
-                out.backend_status_refill_total_ticks +%= status.total_refill_ticks;
-                if (status.max_refill_ticks > out.backend_status_refill_max_ticks) out.backend_status_refill_max_ticks = status.max_refill_ticks;
-                if (status.last_refill_ticks > out.backend_status_refill_last_ticks) out.backend_status_refill_last_ticks = status.last_refill_ticks;
-            }
-        }
-    }
-    i = 0;
-    while (i < synth_engines.len) : (i += 1) {
-        if (synth_engines[i].registered) out.registered_synths += 1;
-    }
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(family.ptr);
+    args[1] = family.len;
+    var out: BackendFamilyStatus = undefined;
+    args[31] = @intFromPtr(&out);
+    _ = call(53, args);
     return out;
 }
-
+pub fn audioBackendActive(name: []const u8) bool {
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    return call(54, args) != 0;
+}
+pub fn audioBackendHasOutput(name: []const u8) bool {
+    var args: Args = .{0} ** 32;
+    args[0] = @intFromPtr(name.ptr);
+    args[1] = name.len;
+    return call(55, args) != 0;
+}
+pub fn performanceSummary() PerformanceSummary {
+    var args: Args = .{0} ** 32;
+    var out: PerformanceSummary = undefined;
+    args[31] = @intFromPtr(&out);
+    _ = call(56, args);
+    return out;
+}
 pub fn dumpStatus() void {
-    const output_guard = OutputGuard.acquire(false) orelse return;
-    defer output_guard.release();
-    k.puts("Audio:\r\n");
-    k.puts("  Backend: ");
-    if (active_audio_slot) |slot| {
-        const backend = &audio_backends[slot];
-        k.puts(backend.name[0..backend.name_len]);
-    } else {
-        k.puts("none");
-    }
-    k.puts("\r\n");
-    k.puts("  Mixer: ");
-    if (mixer_backend.active) {
-        k.puts(mixer_backend.name[0..mixer_backend.name_len]);
-    } else {
-        k.puts("none");
-    }
-    k.puts("\r\n");
-    k.puts("  Writes: total=");
-    k.putDec(total_stream_writes);
-    k.puts(" backend_ok=");
-    k.putDec(total_backend_ok);
-    k.puts(" backend_fail=");
-    k.putDec(total_backend_fail);
-    k.puts("\r\n");
-    dumpAudioBackends();
-    dumpSynthEngines();
-    dumpSidStatus();
-    dumpMidiStatus();
-
-    lockStreamState();
-    defer _ = stream_lock.unlock();
-    var open_count: u32 = 0;
-    var i: usize = 0;
-    while (i < streams.len) : (i += 1) {
-        const s = &streams[i];
-        if (s.state != .open) continue;
-        open_count += 1;
-        k.puts("  Stream ");
-        k.putDec(s.id);
-        k.puts(": rate=");
-        k.putDec(s.rate);
-        k.puts(" ch=");
-        k.putDec(s.channels);
-        k.puts(" fmt=");
-        k.putDec(s.format);
-        k.puts(" bytes=");
-        k.putDec(s.total_written);
-        k.puts("\r\n");
-    }
-    if (open_count == 0) k.puts("  Streams: none open\r\n");
+    const args: Args = .{0} ** 32;
+    _ = call(57, args);
 }
-
-fn dumpSidStatus() void {
-    k.puts("  SID: available=");
-    const engine = sidEngine();
-    k.puts(if (engine != null) "yes" else "no");
-    k.puts(" external=");
-    k.puts(if (engine != null and engine.?.external_contract) "yes" else "no");
-    k.puts(" acquired=");
-    k.puts(if (sid_acquired) "yes" else "no");
-    k.puts(" model=");
-    k.puts(sidModelNameZ());
-    k.puts(" writes=");
-    k.putDec(sid_write_count);
-    k.puts(" last_reg=");
-    k.putDec(sid_last_register);
-    k.puts(" last_val=");
-    k.putDec(sid_last_value);
-    k.puts(" last=");
-    putSigned(sid_last_result);
-    k.puts(" pcm=");
-    k.putDec(sid_pcm_writes);
-    k.puts(" ok=");
-    k.putDec(sid_pcm_ok);
-    k.puts(" fail=");
-    k.putDec(sid_pcm_fail);
-    if (engine) |synth| {
-        if (synth.status_ctx) |status_fn| {
-            var status = SynthStatus{};
-            if (status_fn(synth.context, &status) == 0) {
-                k.puts(" r4d_renders=");
-                k.putDec(status.renders);
-                k.puts(" r4d_stops=");
-                k.putDec(status.stops);
-                k.puts(" r4d_last=");
-                putSigned(status.last_result);
-            }
-        }
-    }
-    k.puts("\r\n");
+export fn r4os_zig_audio_log(data: [*]const u8, len: usize) callconv(.c) void {
+    @import("../kernel/log.zig").puts(data[0..len]);
 }
-
-fn dumpMidiStatus() void {
-    k.puts("  MIDI: available=");
-    k.puts(if (findSynthEngine("MIDI") != null or findSynthEngine("OPL3") != null) "yes" else "no");
-    k.puts(" acquired=");
-    k.puts(if (midi_acquired) "yes" else "no");
-    k.puts(" sends=");
-    k.putDec(midi_send_count);
-    k.puts(" last_ch=");
-    k.putDec(midi_last_channel);
-    k.puts(" last_status=");
-    k.putDec(midi_last_status);
-    k.puts(" data=");
-    k.putDec(midi_last_data1);
-    k.putc('/');
-    k.putDec(midi_last_data2);
-    k.puts(" render_ticks=");
-    k.putDec(midi_render_ticks);
-    k.puts(" source=");
-    k.puts(r4p.requiredSourceName("audio.midi"));
-    k.puts(" r4p=");
-    k.putDec(midi_r4p_classify);
-    k.puts("/");
-    k.putDec(midi_dispatch_failures);
-    k.puts(" required_missing=");
-    k.putDec(midi_missing_required);
-    k.puts(" event=");
-    k.putDec(midi_last_event);
-    k.puts("\r\n");
-    k.puts("  OPL3 engine: external=");
-    k.puts(if (findSynthEngine("OPL3") != null) "yes" else "no");
-    k.puts(" source=");
-    k.puts(r4p.requiredSourceName("audio.opl3"));
-    k.puts(" r4p=");
-    k.putDec(opl3_r4p_register);
-    k.puts("/");
-    k.putDec(opl3_r4p_midi);
-    k.puts("/");
-    k.putDec(opl3_dispatch_failures);
-    k.puts(" required_missing=");
-    k.putDec(opl3_missing_required);
-    k.puts(" kind=");
-    k.putDec(opl3_last_write_kind);
-    k.puts(" action=");
-    k.putDec(opl3_last_action);
-    k.puts("\r\n");
-}
-
-fn sendActiveMidiSynth(channel: u8, status: u8, data1: u8, data2: u8) i32 {
-    const slot = active_midi_synth_slot orelse return r4x_api.service_api_result_no_endpoint;
-    const engine = &synth_engines[slot];
-    if (engine.midi_send_ctx) |send| {
-        const result = send(engine.context, channel, status, data1, data2);
-        if (result >= 0) engine.sends +%= 1;
-        return result;
-    }
-    if (engine.midi_send) |send| {
-        send(channel, status, data1, data2);
-        engine.sends +%= 1;
-        return 0;
-    }
-    return r4x_api.service_api_result_no_endpoint;
-}
-
-fn classifyMidiEvent(channel: u8, status: u8, data1: u8, data2: u8) ?r4p_contract.AudioMidiOp {
-    if (classifyMidiEventR4p(channel, status, data1, data2)) |op| {
-        midi_last_event = op.event;
-        return op;
-    }
-    midi_missing_required +%= 1;
-    midi_last_result = -5;
-    midi_last_event = r4p_contract.AUDIO_MIDI_EVENT_IGNORE;
-    return null;
-}
-
-fn classifyMidiEventR4p(channel: u8, status: u8, data1: u8, data2: u8) ?r4p_contract.AudioMidiOp {
-    if (!r4p.hasActiveR4p("audio.midi")) return null;
-    var op = r4p_contract.AudioMidiOp{
-        .channel = channel,
-        .status = status,
-        .data1 = data1,
-        .data2 = data2,
-    };
-    if (!dispatchMidi(r4p_contract.AUDIO_MIDI_OP_CLASSIFY_EVENT, &op) or op.result != r4p_contract.AUDIO_MIDI_RESULT_OK) return null;
-    midi_r4p_classify +%= 1;
-    return op;
-}
-
-fn dispatchMidi(opcode: u32, op: *r4p_contract.AudioMidiOp) bool {
-    var buffer = protocol_api.ProtocolBuffer{
-        .data = op,
-        .len = @sizeOf(r4p_contract.AudioMidiOp),
-        .capacity = @sizeOf(r4p_contract.AudioMidiOp),
-        .flags = 0,
-        .reserved = 0,
-    };
-    var out: protocol_api.ProtocolBuffer = .{};
-    const result = r4p.dispatch("audio.midi", opcode, &buffer, &out);
-    midi_last_result = result;
-    if (result != r4p_contract.AUDIO_MIDI_RESULT_OK) {
-        midi_dispatch_failures +%= 1;
-        return false;
-    }
-    return true;
-}
-
-fn classifyOpl3Register(bank: u8, reg: u8, value: u8) ?r4p_contract.AudioOpl3Op {
-    if (classifyOpl3RegisterR4p(bank, reg, value)) |op| {
-        opl3_last_write_kind = op.write_kind;
-        return op;
-    }
-    opl3_missing_required +%= 1;
-    opl3_last_result = -5;
-    opl3_last_write_kind = r4p_contract.AUDIO_OPL3_WRITE_OTHER;
-    return null;
-}
-
-fn classifyOpl3RegisterR4p(bank: u8, reg: u8, value: u8) ?r4p_contract.AudioOpl3Op {
-    if (!r4p.hasActiveR4p("audio.opl3")) return null;
-    var op = r4p_contract.AudioOpl3Op{
-        .bank = bank,
-        .register = reg,
-        .value = value,
-    };
-    if (!dispatchOpl3(r4p_contract.AUDIO_OPL3_OP_WRITE_REGISTER, &op) or op.result != r4p_contract.AUDIO_OPL3_RESULT_OK) return null;
-    opl3_r4p_register +%= 1;
-    opl3_last_write_kind = op.write_kind;
-    return op;
-}
-
-fn classifyOpl3Midi(channel: u8, status: u8, data1: u8, data2: u8) ?r4p_contract.AudioOpl3Op {
-    if (classifyOpl3MidiR4p(channel, status, data1, data2)) |op| {
-        opl3_last_action = op.action;
-        return op;
-    }
-    opl3_missing_required +%= 1;
-    opl3_last_result = -5;
-    opl3_last_action = r4p_contract.AUDIO_OPL3_ACTION_IGNORE;
-    return null;
-}
-
-fn classifyOpl3MidiR4p(channel: u8, status: u8, data1: u8, data2: u8) ?r4p_contract.AudioOpl3Op {
-    if (!r4p.hasActiveR4p("audio.opl3")) return null;
-    var op = r4p_contract.AudioOpl3Op{
-        .channel = channel,
-        .status = status,
-        .data1 = data1,
-        .data2 = data2,
-    };
-    if (!dispatchOpl3(r4p_contract.AUDIO_OPL3_OP_MIDI_EVENT, &op) or op.result != r4p_contract.AUDIO_OPL3_RESULT_OK) return null;
-    opl3_r4p_midi +%= 1;
-    opl3_last_action = op.action;
-    return op;
-}
-
-fn dispatchOpl3(opcode: u32, op: *r4p_contract.AudioOpl3Op) bool {
-    var buffer = protocol_api.ProtocolBuffer{
-        .data = op,
-        .len = @sizeOf(r4p_contract.AudioOpl3Op),
-        .capacity = @sizeOf(r4p_contract.AudioOpl3Op),
-        .flags = 0,
-        .reserved = 0,
-    };
-    var out: protocol_api.ProtocolBuffer = .{};
-    const result = r4p.dispatch("audio.opl3", opcode, &buffer, &out);
-    opl3_last_result = result;
-    if (result != r4p_contract.AUDIO_OPL3_RESULT_OK) {
-        opl3_dispatch_failures +%= 1;
-        return false;
-    }
-    return true;
-}
-
-fn classifySidModel(model: u8) ?r4p_contract.AudioSidOp {
-    if (!r4p.hasActiveR4p("audio.sid")) {
-        sid_missing_required +%= 1;
-        sid_last_result = -5;
-        return null;
-    }
-    var op = r4p_contract.AudioSidOp{ .model = model };
-    if (!dispatchSid(r4p_contract.AUDIO_SID_OP_CONFIGURE_MODEL, &op) or op.result != r4p_contract.AUDIO_SID_RESULT_OK) return null;
-    sid_r4p_model +%= 1;
-    return op;
-}
-
-fn classifySidRegister(register: u8, value: u8) ?r4p_contract.AudioSidOp {
-    if (!r4p.hasActiveR4p("audio.sid")) {
-        sid_missing_required +%= 1;
-        sid_last_result = -5;
-        sid_last_kind = r4p_contract.AUDIO_SID_REGISTER_OTHER;
-        sid_last_voice = 0;
-        return null;
-    }
-    var op = r4p_contract.AudioSidOp{
-        .register = register,
-        .value = value,
-    };
-    if (!dispatchSid(r4p_contract.AUDIO_SID_OP_WRITE_REGISTER, &op) or op.result != r4p_contract.AUDIO_SID_RESULT_OK) return null;
-    sid_r4p_register +%= 1;
-    sid_last_kind = op.kind;
-    sid_last_voice = op.voice;
-    return op;
-}
-
-fn resolveSidIoAddress(address: u16, value: u8) ?r4p_contract.AudioSidOp {
-    if (!r4p.hasActiveR4p("audio.sid")) {
-        sid_missing_required +%= 1;
-        sid_last_result = -5;
-        sid_last_kind = r4p_contract.AUDIO_SID_REGISTER_OTHER;
-        sid_last_voice = 0;
-        return null;
-    }
-    var op = r4p_contract.AudioSidOp{
-        .address = address,
-        .value = value,
-    };
-    if (!dispatchSid(r4p_contract.AUDIO_SID_OP_RESOLVE_IO, &op) or op.result != r4p_contract.AUDIO_SID_RESULT_OK) return null;
-    sid_r4p_io +%= 1;
-    sid_last_kind = op.kind;
-    sid_last_voice = op.voice;
-    return op;
-}
-
-fn dispatchSid(opcode: u32, op: *r4p_contract.AudioSidOp) bool {
-    var buffer = protocol_api.ProtocolBuffer{
-        .data = op,
-        .len = @sizeOf(r4p_contract.AudioSidOp),
-        .capacity = @sizeOf(r4p_contract.AudioSidOp),
-        .flags = 0,
-        .reserved = 0,
-    };
-    var out: protocol_api.ProtocolBuffer = .{};
-    const result = r4p.dispatch("audio.sid", opcode, &buffer, &out);
-    sid_last_result = result;
-    if (result != r4p_contract.AUDIO_SID_RESULT_OK) {
-        sid_dispatch_failures +%= 1;
-        return false;
-    }
-    return true;
-}
-
-fn resetSidProtocolCounters() void {
-    sid_r4p_model = 0;
-    sid_r4p_register = 0;
-    sid_r4p_io = 0;
-    sid_missing_required = 0;
-    sid_dispatch_failures = 0;
-    sid_last_result = 0;
-    sid_last_kind = 0;
-    sid_last_voice = 0;
-}
-
-fn renderActiveMidiSynth(requested_frames: u32) i32 {
-    const slot = active_midi_synth_slot orelse return r4x_api.service_api_result_no_endpoint;
-    midi_render_ticks +%= 1;
-    return renderSynthPcm(slot, requested_frames);
-}
-
-fn stopActiveMidiSynth() i32 {
-    const slot = active_midi_synth_slot orelse return 0;
-    const engine = &synth_engines[slot];
-    if (engine.stop_ctx) |stop| {
-        const result = stop(engine.context);
-        if (result >= 0) engine.stops +%= 1;
-        return result;
-    }
-    if (engine.stop) |stop| {
-        stop();
-        engine.stops +%= 1;
+export fn r4os_zig_audio_legacy(op: u32, code: usize, data: ?[*]const u8, len: usize, rate: u32, channels: u16, format: u16, a0: u8, b0: u8, c0: u8, d0: u8) callconv(.c) i32 {
+    switch (op) {
+        0 => {
+            const f: WritePcmFn = @ptrFromInt(code);
+            return @intFromBool(f(data.?[0..len], rate, channels, format));
+        },
+        1 => {
+            const f: StopPcmFn = @ptrFromInt(code);
+            f();
+        },
+        2 => {
+            const f: SynthMidiSendFn = @ptrFromInt(code);
+            f(a0, b0, c0, d0);
+        },
+        3 => {
+            const f: SynthStopFn = @ptrFromInt(code);
+            f();
+        },
+        else => unreachable,
     }
     return 0;
 }
-
-fn renderSynthPcm(slot: usize, requested_frames: u32) i32 {
-    if (requested_frames == 0 or requested_frames > SYNTH_RENDER_MAX_FRAMES) return r4x_api.service_api_result_invalid;
-    const engine = &synth_engines[slot];
-    if (engine.pcm_pending_len != 0) return flushPendingSynthPcm(engine);
-    const render_pcm = engine.render_pcm_ctx orelse return r4x_api.service_api_result_no_endpoint;
-    const capacity = requested_frames * @as(u32, @intCast(pcm.TARGET_FRAME_BYTES));
-    const rendered = render_pcm(engine.context, engine.pcm_pending[0..].ptr, capacity, DEFAULT_RATE, DEFAULT_CHANNELS, FORMAT_S16LE);
-    if (rendered < 0) return rendered;
-    if (rendered == 0) return 0;
-    if (rendered != @as(i32, @intCast(capacity))) return r4x_api.service_api_result_invalid;
-    engine.pcm_pending_len = @intCast(rendered);
-    engine.renders +%= 1;
-    return flushPendingSynthPcm(engine);
-}
-
-fn flushPendingSynthPcm(engine: *SynthEngine) i32 {
-    const len: usize = @intCast(engine.pcm_pending_len);
-    if (len == 0) return 0;
-    const result = writeActivePcm(engine.pcm_pending[0..len], DEFAULT_RATE, DEFAULT_CHANNELS, FORMAT_S16LE) orelse r4x_api.service_api_result_no_endpoint;
-    if (result == 0) {
-        engine.pcm_pending_len = 0;
-        total_backend_ok +%= 1;
-    } else if (result != r4x_api.service_api_result_busy) {
-        total_backend_fail +%= 1;
-    }
-    return result;
-}
-
-fn registerMixerBackend(name: []const u8, backend: ?*const anyopaque) void {
-    storeBackend(&mixer_backend, name, backend);
-    bootlog.puts("[AUDIO] mixer backend ");
-    bootlog.puts(name);
-    bootlog.puts(" [OK]\r\n");
-}
-
-fn registerAudioBackendInternal(name: []const u8, backend: ?*const anyopaque, write_pcm: ?WritePcmFn, stop_pcm: ?StopPcmFn, context: ?*anyopaque, write_pcm_ctx: ?WritePcmCtxFn, stop_pcm_ctx: ?StopPcmCtxFn, status_ctx: ?StatusCtxFn, pcm_limits: ?BackendPcmLimits) bool {
-    const output_guard = OutputGuard.acquire(true) orelse return false;
-    defer output_guard.release();
-    const slot = findAudioBackend(name) orelse freeAudioBackendSlot() orelse {
-        bootlog.puts("[AUDIO][WARN] audio backend registry full\r\n");
-        return false;
-    };
-
-    const was_active = active_audio_slot == slot;
-    const entry = &audio_backends[slot];
-    if (entry.closing) return false;
-    entry.* = .{
-        .registered = true,
-        .active = false,
-        .ptr = backend,
-        .context = context,
-        .write_pcm = write_pcm,
-        .stop_pcm = stop_pcm,
-        .write_pcm_ctx = write_pcm_ctx,
-        .stop_pcm_ctx = stop_pcm_ctx,
-        .status_ctx = status_ctx,
-        .pcm_limits = pcm_limits,
-    };
-    entry.name_len = if (name.len < MAX_NAME) name.len else MAX_NAME - 1;
-    if (entry.name_len > 0) @memcpy(entry.name[0..entry.name_len], name[0..entry.name_len]);
-
-    bootlog.puts("[AUDIO] audio backend registered ");
-    bootlog.puts(entry.name[0..entry.name_len]);
-    bootlog.puts(if (write_pcm != null) " native" else if (write_pcm_ctx != null) " r4d" else " generic");
-    bootlog.puts(" [OK]\r\n");
-
-    if (was_active or (active_audio_slot == null and (write_pcm != null or write_pcm_ctx != null))) setActiveAudioBackend(slot);
-    return true;
-}
-
-fn setActiveAudioBackend(slot: usize) void {
-    var i: usize = 0;
-    while (i < audio_backends.len) : (i += 1) {
-        audio_backends[i].active = false;
-    }
-    audio_backends[slot].active = true;
-    active_audio_slot = slot;
-    @atomicStore(u8, &output_present, @intFromBool(!audio_backends[slot].closing and
-        (audio_backends[slot].write_pcm != null or audio_backends[slot].write_pcm_ctx != null)), .release);
-    bootlog.puts("[AUDIO] active audio backend ");
-    bootlog.puts(audio_backends[slot].name[0..audio_backends[slot].name_len]);
-    bootlog.puts(" [OK]\r\n");
-}
-
-fn writeActivePcm(data: []const u8, rate: u32, channels: u16, format: u16) ?i32 {
-    const output_guard = OutputGuard.acquire(false) orelse return r4x_api.service_api_result_busy;
-    defer output_guard.release();
-    return writeActivePcmOwned(data, rate, channels, format);
-}
-
-fn writeActivePcmOwned(data: []const u8, rate: u32, channels: u16, format: u16) ?i32 {
-    resolveInitialOutputLocked();
-    const slot = active_audio_slot orelse return null;
-    const backend = &audio_backends[slot];
-    if (backend.closing) return r4x_api.service_api_result_busy;
-    if (backend.pcm_limits) |limits| {
-        if (!limits.accepts(rate, channels, format)) return r4x_api.service_api_result_invalid;
-    }
-    const result = if (backend.write_pcm) |write_pcm|
-        if (write_pcm(data, rate, channels, format)) @as(i32, 0) else @as(i32, -1)
-    else if (backend.write_pcm_ctx) |write_pcm_ctx|
-        write_pcm_ctx(backend.context, data.ptr, @intCast(data.len), rate, channels, format)
-    else
-        return null;
-    if (result == 0) scheduleProgress(&backend_progress_due, 10);
-    return result;
-}
-
-fn stopActivePcm() void {
-    _ = stopActivePcmResult();
-}
-
-fn stopActivePcmResult() i32 {
-    const output_guard = OutputGuard.acquire(false) orelse return r4x_api.service_api_result_busy;
-    defer output_guard.release();
-    return idleActivePcmOwned();
-}
-
-// Only ordinary last-client/synth completion uses Idle. Route replacement,
-// unregister and owner shutdown retain the physical Stop barrier below.
-fn idleActivePcmOwned() i32 {
-    const slot = active_audio_slot orelse return 0;
-    const backend = &audio_backends[slot];
-    if (backend.stop_pcm) |stop_pcm| { stop_pcm(); return 0; }
-    return backend_contract.finishPcm(.idle, backend.closing, backend.context, backend.stop_pcm_ctx, backend.idle_pcm_ctx);
-}
-
-fn stopActivePcmOwned() i32 {
-    const slot = active_audio_slot orelse return 0;
-    const backend = &audio_backends[slot];
-    if (backend.stop_pcm) |stop_pcm| {
-        stop_pcm();
-        return 0;
-    }
-    return backend_contract.finishPcm(.stop, backend.closing, backend.context, backend.stop_pcm_ctx, backend.idle_pcm_ctx);
-}
-
-fn activateFirstNativeBackend() void {
-    var i: usize = 0;
-    while (i < audio_backends.len) : (i += 1) {
-        if (!audio_backends[i].registered or audio_backends[i].closing or (audio_backends[i].write_pcm == null and audio_backends[i].write_pcm_ctx == null)) continue;
-        setActiveAudioBackend(i);
-        return;
-    }
-    bootlog.puts("[AUDIO][WARN] no active audio backend\r\n");
-}
-
-fn dumpAudioBackends() void {
-    k.puts("  Backends:");
-    var count: u32 = 0;
-    var i: usize = 0;
-    while (i < audio_backends.len) : (i += 1) {
-        const backend = &audio_backends[i];
-        if (!backend.registered) continue;
-        count += 1;
-        k.puts(" ");
-        if (backend.active) k.puts("*");
-        k.puts(backend.name[0..backend.name_len]);
-        k.puts(if (backend.write_pcm != null) "(native)" else if (backend.write_pcm_ctx != null) "(r4d)" else "(generic)");
-    }
-    if (count == 0) k.puts(" none");
-    k.puts("\r\n");
-    dumpAudioBackendStatuses();
-}
-
-fn dumpAudioBackendStatuses() void {
-    var i: usize = 0;
-    while (i < audio_backends.len) : (i += 1) {
-        const backend = &audio_backends[i];
-        if (!backend.registered or backend.closing) continue;
-        const status_fn = backend.status_ctx orelse continue;
-        var status: BackendStatus = .{ .active = if (backend.active) 1 else 0 };
-        const result = status_fn(backend.context, &status);
-        k.puts("  Backend ");
-        k.puts(backend.name[0..backend.name_len]);
-        k.puts(" status: ");
-        if (result != 0) {
-            k.puts("rc=");
-            putSigned(result);
-            k.puts("\r\n");
-            continue;
-        }
-        k.puts("active=");
-        k.puts(if (status.active != 0) "yes" else "no");
-        k.puts(" writes=");
-        k.putDec(status.writes);
-        k.puts(" underruns=");
-        k.putDec(status.underruns);
-        k.puts(" errors=");
-        k.putDec(status.errors);
-        k.puts(" last=");
-        putSigned(status.last_result);
-        k.puts("\r\n");
-    }
-}
-
-fn dumpSynthEngines() void {
-    k.puts("  Synths:");
-    var count: u32 = 0;
-    var i: usize = 0;
-    while (i < synth_engines.len) : (i += 1) {
-        const synth = &synth_engines[i];
-        if (!synth.registered) continue;
-        count += 1;
-        k.puts(" ");
-        if (active_midi_synth_slot == i) k.puts("*");
-        k.puts(synth.name[0..synth.name_len]);
-        k.puts("(");
-        if (synth.external_contract) k.puts("r4d:");
-        if (synth.migration_bridge) k.puts("migration:");
-        if (synth.midi_send != null or synth.midi_send_ctx != null) k.puts("midi");
-        if (synth.render != null or synth.render_ctx != null) k.puts("+pcm");
-        if (synth.midi_send == null and synth.render == null and synth.midi_send_ctx == null and synth.render_ctx == null) k.puts("generic");
-        k.puts(")");
-    }
-    if (count == 0) k.puts(" none");
-    k.puts("\r\n");
-    dumpSynthEngineCounters();
-}
-
-fn dumpSynthEngineCounters() void {
-    var i: usize = 0;
-    while (i < synth_engines.len) : (i += 1) {
-        const synth = &synth_engines[i];
-        if (!synth.registered) continue;
-        if (synth.sends == 0 and synth.renders == 0 and synth.stops == 0) continue;
-        k.puts("  Synth ");
-        k.puts(synth.name[0..synth.name_len]);
-        k.puts(": sends=");
-        k.putDec(synth.sends);
-        k.puts(" renders=");
-        k.putDec(synth.renders);
-        k.puts(" stops=");
-        k.putDec(synth.stops);
-        k.puts("\r\n");
-    }
-}
-
-fn findAudioBackend(name: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < audio_backends.len) : (i += 1) {
-        const backend = &audio_backends[i];
-        if (!backend.registered) continue;
-        if (nameEq(backend.name[0..backend.name_len], name)) return i;
-    }
-    return null;
-}
-
-fn findSynthEngine(name: []const u8) ?usize {
-    var i: usize = 0;
-    while (i < synth_engines.len) : (i += 1) {
-        const synth = &synth_engines[i];
-        if (!synth.registered) continue;
-        if (nameEq(synth.name[0..synth.name_len], name)) return i;
-    }
-    return null;
-}
-
-fn sidEngine() ?*SynthEngine {
-    const slot = findSynthEngine("SID") orelse return null;
-    return &synth_engines[slot];
-}
-
-fn sidModelId() u32 {
-    if (nameEq(sid_model_option, "6581")) return r4p_contract.AUDIO_SID_MODEL_6581;
-    return r4p_contract.AUDIO_SID_MODEL_8580;
-}
-
-fn findRenderableSynthEngine() ?usize {
-    if (findSynthEngine("OPL3")) |slot| {
-        if (synthCanRenderMidi(slot)) return slot;
-    }
-    if (findSynthEngine("MIDI")) |slot| {
-        if (synthCanRenderMidi(slot)) return slot;
-    }
-    var i: usize = 0;
-    while (i < synth_engines.len) : (i += 1) {
-        if (!synth_engines[i].registered) continue;
-        if (synthCanRenderMidi(i)) return i;
-    }
-    return null;
-}
-
-fn synthCanRenderMidi(slot: usize) bool {
-    const synth = &synth_engines[slot];
-    return (synth.flags & SYNTH_ENGINE_FLAG_MIDI) != 0 and
-        (synth.midi_send != null or synth.midi_send_ctx != null) and
-        synth.render_pcm_ctx != null;
-}
-
-fn freeAudioBackendSlot() ?usize {
-    var i: usize = 0;
-    while (i < audio_backends.len) : (i += 1) {
-        if (!audio_backends[i].registered) return i;
-    }
-    return null;
-}
-
-fn recordTickStat(total: *u64, max: *u64, last: *u64, start_tick: u64) void {
-    const now = timer.tickCount();
-    const elapsed = if (now >= start_tick) now - start_tick else 0;
-    total.* +%= elapsed;
-    last.* = elapsed;
-    if (elapsed > max.*) max.* = elapsed;
-}
-
-fn putSigned(value: i32) void {
-    if (value < 0) {
-        k.puts("-");
-        k.putDec(@intCast(-value));
-    } else {
-        k.putDec(@intCast(value));
-    }
-}
-
-fn freeSynthEngineSlot() ?usize {
-    var i: usize = 0;
-    while (i < synth_engines.len) : (i += 1) {
-        if (!synth_engines[i].registered) return i;
-    }
-    return null;
-}
-
-fn registerZ(target: *NamedBackend, name_z: [*:0]const u8, backend: *const anyopaque, kind: []const u8) i32 {
-    var buf: [MAX_NAME]u8 = undefined;
-    const name = copyZ(name_z, buf[0..]) orelse return -1;
-    storeBackend(target, name, backend);
-    bootlog.puts("[AUDIO] ");
-    bootlog.puts(kind);
-    bootlog.puts(" backend ");
-    bootlog.puts(name);
-    bootlog.puts(" [OK]\r\n");
-    return 0;
-}
-
-fn storeBackend(target: *NamedBackend, name: []const u8, backend: ?*const anyopaque) void {
-    target.* = .{ .active = true, .ptr = backend };
-    target.name_len = if (name.len < MAX_NAME) name.len else MAX_NAME - 1;
-    if (target.name_len > 0) @memcpy(target.name[0..target.name_len], name[0..target.name_len]);
-}
-
-fn validStreamFormat(rate: u32, channels: u16, format: u16) bool {
-    if (rate == 0 or rate > 192_000) return false;
-    if (channels == 0 or channels > 2) return false;
-    return format == FORMAT_S16LE or format == FORMAT_U8;
-}
-
-fn activeOutputPresent() bool {
-    return @atomicLoad(u8, &output_present, .acquire) != 0;
-}
-
-fn freeStreamSlotLocked() ?usize {
-    var i: usize = 0;
-    while (i < streams.len) : (i += 1) {
-        if (streams[i].state == .empty or streams[i].state == .closed) return i;
-    }
-    return null;
-}
-
-fn streamByOwnerLocked(owner: StreamOwner, id: u32) ?*Stream {
-    var i: usize = 0;
-    while (i < streams.len) : (i += 1) {
-        if (streams[i].state == .open and streams[i].id == id and mixer.sameOwner(streams[i].owner, owner)) return &streams[i];
-    }
-    return null;
-}
-
-fn openStreamCountLocked() u32 {
-    var count: u32 = 0;
-    var i: usize = 0;
-    while (i < streams.len) : (i += 1) {
-        if (streams[i].state == .open) count += 1;
-    }
-    return count;
-}
-
-fn releaseStreamLocked(stream: *Stream) bool {
-    if (stream.read_reserved) return false;
-    const id = stream.id;
-    const reusable_ring = stream.ring;
-    stream.* = .{ .state = .closed, .id = id, .ring = reusable_ring };
-    return true;
-}
-
-// Called with stream metadata held. Open takes the output permit first, so
-// the last-stream decision cannot race a new stream while the stop runs.
-fn stopClosingStreamsLocked(closing_count: u32) i32 {
-    if (openStreamCountLocked() != closing_count or sid_acquired or midi_acquired) return 0;
-    _ = stream_lock.unlock();
-    const output_guard = OutputGuard.acquire(false) orelse {
-        lockStreamState();
-        return r4x_api.service_api_result_busy;
-    };
-    lockStreamState();
-    defer output_guard.release();
-    if (openStreamCountLocked() != closing_count or sid_acquired or midi_acquired) return 0;
-    _ = stream_lock.unlock();
-    const result = idleActivePcmOwned();
-    lockStreamState();
-    return result;
-}
-
-// Only a confirmed end of this stream extends its final interpolation sample.
-// Keep pending PCM and phase owned if backend backpressure interrupts close.
-fn finishStreamPcmLocked(stream: *Stream) i32 {
-    while (stream.resampler.previous_valid) {
-        if (!stream.resampler.chunk_done) return r4x_api.service_api_result_busy;
-        const free_bytes = stream.ring.len - stream.available;
-        var scratch: [MIX_QUANTUM_BYTES]u8 = undefined;
-        var resampler = stream.resampler;
-        _ = stream_lock.unlock();
-        const produced = pcm.finishStreamingToStereoS16(&resampler, scratch[0..@min(free_bytes, scratch.len)]);
-        lockStreamState();
-        stream.resampler = resampler;
-        if (mixer.ringWrite(stream.ring, &stream.write_pos, &stream.available, scratch[0..produced]) != produced)
-            return r4x_api.service_api_result_busy;
-        if (!stream.resampler.previous_valid) return 0;
-        const pump_result = pumpAvailableLocked(true);
-        if (pump_result < 0) return pump_result;
-    }
-    return 0;
-}
-
-fn pumpAvailableLocked(force: bool) i32 {
-    _ = stream_lock.unlock();
-    defer lockStreamState();
-    const output_guard = OutputGuard.acquire(false) orelse return r4x_api.service_api_result_busy;
-    defer output_guard.release();
-    return pumpAvailableOutputOwned(force);
-}
-
-fn pumpAvailableOutputOwned(force: bool) i32 {
-    lockStreamState();
-    defer _ = stream_lock.unlock();
-    const max_passes = MAX_STREAMS * (RING_BYTES / MIX_QUANTUM_BYTES + 2);
-    var pass: usize = 0;
-    while (pass < max_passes) : (pass += 1) {
-        var selected: [MAX_STREAMS]bool = .{false} ** MAX_STREAMS;
-        var open_count: u32 = 0;
-        var ready_count: u32 = 0;
-        var single_ready: usize = 0;
-        var chunk_bytes: usize = MIX_QUANTUM_BYTES;
-
-        for (&streams, 0..) |*stream, index| {
-            if (stream.state != .open) continue;
-            open_count += 1;
-            if (stream.available < pcm.TARGET_FRAME_BYTES) continue;
-            ready_count += 1;
-            single_ready = index;
-        }
-        if (ready_count == 0) return 0;
-
-        if (ready_count == 1) {
-            const stream = &streams[single_ready];
-            if (open_count > 1 and !force and !stream.deferred_once) {
-                stream.deferred_once = true;
-                scheduleProgress(&mix_progress_due, 2);
-                return 0;
-            }
-            selected[single_ready] = true;
-            chunk_bytes = @min(chunk_bytes, stream.available);
-        } else {
-            for (&streams, 0..) |*stream, index| {
-                if (stream.state != .open or stream.available < pcm.TARGET_FRAME_BYTES) continue;
-                selected[index] = true;
-                chunk_bytes = @min(chunk_bytes, stream.available);
-            }
-        }
-
-        chunk_bytes -= chunk_bytes % pcm.TARGET_FRAME_BYTES;
-        if (chunk_bytes == 0) return 0;
-        var sources: [MAX_STREAMS]mixer.Source = undefined;
-        var source_count: usize = 0;
-        for (&streams, 0..) |*stream, index| {
-            if (!selected[index]) continue;
-            stream.read_reserved = true;
-            sources[source_count] = .{ .ring = stream.ring, .read_pos = stream.read_pos, .volume = stream.volume };
-            source_count += 1;
-        }
-        _ = stream_lock.unlock();
-        mixer.mix(sources[0..source_count], mix_scratch[0..chunk_bytes]);
-
-        const backend_start = timer.tickCount();
-        const result = writeActivePcmOwned(
-            mix_scratch[0..chunk_bytes],
-            pcm.TARGET_RATE,
-            pcm.TARGET_CHANNELS,
-            pcm.FORMAT_S16LE,
-        ) orelse r4x_api.service_api_result_no_endpoint;
-        lockStreamState();
-        for (&streams, 0..) |*stream, index| {
-            if (selected[index]) stream.read_reserved = false;
-        }
-        backend_write_calls +%= 1;
-        recordTickStat(&backend_write_total_ticks, &backend_write_max_ticks, &backend_write_last_ticks, backend_start);
-        if (result != 0) {
-            if (result != r4x_api.service_api_result_busy) total_backend_fail +%= 1;
-            return result;
-        }
-        total_backend_ok +%= 1;
-        for (&streams, 0..) |*stream, index| {
-            if (!selected[index]) continue;
-            mixer.ringConsume(stream.ring.len, &stream.read_pos, &stream.available, chunk_bytes);
-            stream.deferred_once = false;
-        }
-    }
-    return r4x_api.service_api_result_busy;
-}
-
-fn stopPcmIfNoStreams() void {
-    const output_guard = OutputGuard.acquire(false) orelse return;
-    defer output_guard.release();
-    lockStreamState();
-    const empty = openStreamCountLocked() == 0;
-    _ = stream_lock.unlock();
-    if (empty) _ = idleActivePcmOwned();
-}
-
-fn copyZ(ptr: [*:0]const u8, out: []u8) ?[]const u8 {
-    var len: usize = 0;
-    while (len < out.len and ptr[len] != 0) : (len += 1) out[len] = ptr[len];
-    if (len == out.len) return null;
-    return out[0..len];
-}
-
-fn nameEq(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    var i: usize = 0;
-    while (i < a.len) : (i += 1) {
-        if (upper(a[i]) != upper(b[i])) return false;
-    }
-    return true;
-}
-
-fn upper(c: u8) u8 {
-    if (c >= 'a' and c <= 'z') return c - ('a' - 'A');
-    return c;
+comptime {
+    if (@sizeOf(StreamOwner) != 16 or @sizeOf(BackendPcmLimits) != 16 or @sizeOf(BackendRegistration) != 80 or @sizeOf(SynthRegistration) != 176) @compileError("private audio record layout");
 }
