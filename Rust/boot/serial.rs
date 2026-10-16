@@ -11,21 +11,21 @@ const TIMEOUT: usize = 1_000_000;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Stats {
-    ring_size: u64,
-    pending: u64,
-    ring_bytes: u64,
-    sync_bytes: u64,
-    full_stalls: u64,
-    dropped_bytes: u64,
-    sync_failures: u64,
-    sync_mode: bool,
-    sync_uart_available: bool,
-    write_calls: u64,
-    bulk_calls: u64,
-    lock_acquisitions: u64,
-    uart_status_reads: u64,
-    drain_calls: u64,
-    max_span: u64,
+    pub(crate) ring_size: u64,
+    pub(crate) pending: u64,
+    pub(crate) ring_bytes: u64,
+    pub(crate) sync_bytes: u64,
+    pub(crate) full_stalls: u64,
+    pub(crate) dropped_bytes: u64,
+    pub(crate) sync_failures: u64,
+    pub(crate) sync_mode: bool,
+    pub(crate) sync_uart_available: bool,
+    pub(crate) write_calls: u64,
+    pub(crate) bulk_calls: u64,
+    pub(crate) lock_acquisitions: u64,
+    pub(crate) uart_status_reads: u64,
+    pub(crate) drain_calls: u64,
+    pub(crate) max_span: u64,
 }
 impl Stats {
     const EMPTY: Self = Self {

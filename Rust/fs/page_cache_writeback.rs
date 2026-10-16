@@ -81,9 +81,7 @@ unsafe fn dirty_sectors_batch(device: usize, batch: u64) -> u64 {
         count
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_pgcache_diagnostic(op: u8, token: u64, value: u64, extra: u64) -> u64;
-}
+
 unsafe fn fallback(device: Option<usize>) {
     unsafe {
         STATS.policy_full_scan_fallbacks.fetch_add(1, Relaxed);
@@ -94,7 +92,7 @@ unsafe fn fallback(device: Option<usize>) {
                 observed = observed.wrapping_add(1);
             }
         }
-        r4os_zig_pgcache_diagnostic(3, 0, device.map_or(u64::MAX, |d| d as u64), observed);
+        crate::fs::page_cache::diagnostic(3, 0, device.map_or(u64::MAX, |d| d as u64), observed);
     }
 }
 pub(super) fn record(reason: Reason, written: u64, start: u64) {

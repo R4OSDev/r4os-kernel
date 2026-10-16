@@ -43,16 +43,12 @@ static ATTEMPTS: Attempts = Attempts(UnsafeCell::new(0));
 pub extern "C" fn r4os_rust_program_launch_attempts() -> u64 {
     unsafe { ATTEMPTS.0.get().read() }
 }
-unsafe extern "C" {
-    fn r4os_zig_program_entry_boot_active() -> bool;
-    fn r4os_zig_program_entry_boot_detail(value: Bytes);
-    fn r4os_zig_program_launch_service_stage(name: Bytes, activity: Bytes);
-}
+
 fn report(enabled: bool, text: &[u8]) {
     entry::report_stage(enabled, text, true);
 }
 fn detail(text: &[u8]) {
-    unsafe { r4os_zig_program_entry_boot_detail(util::span(text)) }
+    unsafe { program_entry_boot_detail(util::span(text)) }
 }
 struct FsGuard {
     guard: request::Guard,
@@ -114,7 +110,7 @@ fn bdec(value: u64) {
 }
 unsafe fn fs_wait(enabled: bool, letter: u8) {
     unsafe {
-        if !enabled || !r4os_zig_program_entry_boot_active() {
+        if !enabled || !crate::display::bootscreen::is_active() {
             return;
         }
         let mut snapshot = MaybeUninit::<request::GateSnapshot>::uninit();
@@ -184,7 +180,7 @@ unsafe fn fs_wait(enabled: bool, letter: u8) {
                 len: (*core).wait_reason.len,
             };
         }
-        r4os_zig_program_launch_service_stage(owner, activity);
+        program_launch_service_stage(owner, activity);
         blog(b"[FSGATE] desktop wait owner_task=");
         bdec(u64::from(snapshot.owner_task_id));
         blog(b" owner_generation=");
@@ -881,7 +877,7 @@ pub unsafe extern "C" fn r4os_rust_program_launch_path(
     handle: *mut crate::contract::ProgramProcessHandle,
 ) -> i32 {
     unsafe {
-        let boot = mode == 1 && r4os_zig_program_entry_boot_active();
+        let boot = mode == 1 && crate::display::bootscreen::is_active();
         if mode == 1 {
             report(boot, b"Pfad pruefen");
         }
@@ -1029,3 +1025,13 @@ const _: () = {
     assert!(mem::offset_of!(File, origin) == 936);
     assert!(mem::offset_of!(File, origin_len) == 1064);
 };
+
+unsafe fn program_launch_service_stage(name: Bytes, activity: Bytes) {
+    unsafe {
+        crate::display::bootscreen::service_stage(name.data, name.len, activity.data, activity.len)
+    }
+}
+
+unsafe fn program_entry_boot_detail(value: Bytes) {
+    unsafe { crate::display::bootscreen::set_detail(value.data, value.len) }
+}

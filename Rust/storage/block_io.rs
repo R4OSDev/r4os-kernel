@@ -51,10 +51,7 @@ pub struct Input {
     pub len: usize,
     pub ownership: u8,
 }
-unsafe extern "C" {
-    // Stateless immutable legacy device view only; all request execution is native.
-    fn r4os_zig_block_io_view(device: *mut c_void, out: *mut View);
-}
+
 struct Pin(block_registry::Pin);
 impl Pin {
     fn acquire(index: usize) -> Option<Self> {
@@ -70,7 +67,7 @@ impl Pin {
     fn view(&self) -> View {
         let mut out = MaybeUninit::uninit();
         unsafe {
-            r4os_zig_block_io_view(self.device(), out.as_mut_ptr());
+            block_io_view(self.device(), out.as_mut_ptr());
             out.assume_init()
         }
     }
@@ -607,3 +604,7 @@ const _: () = {
     assert!(core::mem::size_of::<View>() == 64);
     assert!(core::mem::size_of::<Input>() == 56);
 };
+
+unsafe fn block_io_view(device: *mut c_void, out: *mut View) {
+    unsafe { out.write(crate::storage::block_device::io_view(device)) }
+}

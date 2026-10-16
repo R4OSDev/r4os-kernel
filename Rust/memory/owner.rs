@@ -1,7 +1,7 @@
 //! Ranked, CPU-bound no-sleep owners. Resident C-layout storage can be
-//! declared by a not-yet-migrated owner, but only Rust mutates the lock state.
+//! embedded in stable native records; only its owner mutates the lock state.
 use super::{layout, owner_policy};
-use crate::build_bridge::config;
+use crate::build_config::config;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
@@ -49,14 +49,23 @@ pub struct Lock {
 // admission and observer counters are atomic. No exclusive Lock reference is
 // created, including reentrant acquisitions or concurrent metric snapshots.
 unsafe impl Sync for Lock {}
+// Original named owner storage; one native instance per existing class.
+static NAMED: [Lock; 10] = [
+    Lock::new(0, 1),
+    Lock::new(1, 2),
+    Lock::new(2, 2),
+    Lock::new(3, 2),
+    Lock::new(4, 5),
+    Lock::new(5, 10),
+    Lock::new(6, 20),
+    Lock::new(7, 30),
+    Lock::new(8, 70),
+    Lock::new(9, 80),
+];
 static HELD_RANK: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
-unsafe extern "C" {
-    fn r4os_zig_owner_cpu() -> u32;
-    fn r4os_zig_owner_runtime_depth() -> u32;
-    fn r4os_zig_named_owner(class: u8) -> *const Lock;
-}
+
 fn cpu() -> usize {
-    (unsafe { r4os_zig_owner_cpu() }) as usize
+    ({ crate::arch::percpu::current_index() }) as usize
 }
 fn flags() -> u64 {
     let value;
@@ -88,7 +97,7 @@ fn tsc() -> u64 {
     (high as u64) << 32 | low as u64
 }
 pub fn fault_allowed() -> bool {
-    HELD_RANK[cpu()].load(Ordering::Relaxed) == 0 && unsafe { r4os_zig_owner_runtime_depth() } == 0
+    HELD_RANK[cpu()].load(Ordering::Relaxed) == 0 && unsafe { owner_runtime_depth() } == 0
 }
 pub fn prepare_stack() {
     if !fault_allowed() {
@@ -258,7 +267,7 @@ impl Guard {
 // entry. Prepared physical release plans retain the exact token across C
 // calls, rather than keeping a Rust guard or mutable table borrow alive.
 pub(super) fn named(class: u8) -> &'static Lock {
-    unsafe { &*r4os_zig_named_owner(class) }
+    unsafe { &*named_owner(class) }
 }
 /// Passive admission check for a native caller in another kernel domain.
 /// It never lends the lock/token or acquires an additional owner.
@@ -327,4 +336,12 @@ pub(crate) const CLASS_NAMES: [&[u8]; 10] = [
 pub(crate) fn stats_for_class(class: u8) -> Stats {
     assert!((class as usize) < CLASS_NAMES.len());
     named(class).stats()
+}
+
+unsafe fn owner_runtime_depth() -> u32 {
+    unsafe { crate::arch::percpu::r4os_rust_percpu_depth().read() }
+}
+
+unsafe fn named_owner(class: u8) -> *const Lock {
+    &NAMED[class as usize] as *const Lock
 }

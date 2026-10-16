@@ -1649,30 +1649,11 @@ struct BufferStats {
     allocating_bytes: u64,
     destroying_bytes: u64,
 }
-unsafe extern "C" {
-    fn r4os_zig_program_test_buffer_stats(out: *mut BufferStats);
-    fn r4os_zig_program_test_buffer_collect();
-    fn r4os_zig_program_domain_gfx_buffer_map(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        access: u32,
-        offset: u64,
-        bytes: u64,
-        out: *mut c::GfxBufferMap,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_buffer_unmap(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_buffer_release(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-    ) -> i32;
-}
+
 unsafe fn buffer_stats() -> BufferStats {
     unsafe {
         let mut out = MaybeUninit::uninit();
-        r4os_zig_program_test_buffer_stats(out.as_mut_ptr());
+        program_test_buffer_stats(out.as_mut_ptr());
         out.assume_init()
     }
 }
@@ -1691,7 +1672,7 @@ unsafe fn shared_lifecycle(heap: &heap::Stats, base: &t::Stats) -> bool {
         let buffers = buffer_stats();
         let vm = graphics_usage();
         let passed = shared_inner();
-        r4os_zig_program_test_buffer_collect();
+        crate::gfx::buffers::collect();
         let after = buffer_stats();
         let vm_after = graphics_usage();
         if !passed
@@ -1869,7 +1850,7 @@ unsafe fn shared_inner() -> bool {
             shared_raster::r4os_rust_program_shared_export(consumer_a, &map_a.lease, &mut exported)
                 == c::gfx_buffer_result_ok
                 && exported.flags == 1
-                && r4os_zig_program_domain_gfx_buffer_map(
+                && program_domain_gfx_buffer_map(
                     consumer_a,
                     &exported.reference,
                     0,
@@ -1898,17 +1879,11 @@ unsafe fn shared_inner() -> bool {
         );
         let mut denied = c::GfxBufferMap::default();
         check!(
-            r4os_zig_program_domain_gfx_buffer_map(
-                consumer_a,
-                &exported.reference,
-                1,
-                0,
-                64,
-                &mut denied
-            ) == c::gfx_buffer_error_unsupported
-                && r4os_zig_program_domain_gfx_buffer_unmap(consumer_a, &exported_map.lease)
+            program_domain_gfx_buffer_map(consumer_a, &exported.reference, 1, 0, 64, &mut denied)
+                == c::gfx_buffer_error_unsupported
+                && program_domain_gfx_buffer_unmap(consumer_a, &exported_map.lease)
                     == c::gfx_buffer_result_ok
-                && r4os_zig_program_domain_gfx_buffer_release(consumer_a, &exported.reference)
+                && program_domain_gfx_buffer_release(consumer_a, &exported.reference)
                     == c::gfx_buffer_result_ok
         );
         check!(shared_raster::create(owner_a, info, &mut handle) == 0);
@@ -1998,3 +1973,83 @@ const _: () = {
     assert!(mem::offset_of!(BufferStats, allocating_bytes) == 104);
     assert!(mem::offset_of!(BufferStats, destroying_bytes) == 112);
 };
+
+unsafe fn program_domain_gfx_buffer_release(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(3, &args, core::ptr::null_mut()) }
+}
+
+unsafe fn program_domain_gfx_buffer_map(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    access: u32,
+    offset: u64,
+    bytes: u64,
+    out: *mut c::GfxBufferMap,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        access,
+        offset,
+        bytes,
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(4, &args, out.cast()) }
+}
+
+unsafe fn program_domain_gfx_buffer_unmap(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(6, &args, core::ptr::null_mut()) }
+}
+
+unsafe fn program_test_buffer_stats(out: *mut BufferStats) {
+    unsafe {
+        crate::gfx::buffers::lock();
+        let value = crate::gfx::buffers::read().stats();
+        crate::gfx::buffers::unlock();
+        out.write(BufferStats {
+            objects: value.objects as u64,
+            references: value.references as u64,
+            leases: value.leases as u64,
+            bytes: value.bytes,
+            retained_bytes: value.retained_bytes,
+            system_bytes: value.system_bytes,
+            device_bytes: value.device_bytes,
+            system_backed_bytes: value.system_backed_bytes,
+            device_backed_bytes: value.device_backed_bytes,
+            system_pinned_bytes: value.system_pinned_bytes,
+            device_pinned_bytes: value.device_pinned_bytes,
+            scanout_pinned_bytes: value.scanout_pinned_bytes,
+            device_mapped_bytes: value.device_mapped_bytes,
+            allocating_bytes: value.allocating_bytes,
+            destroying_bytes: value.destroying_bytes,
+        });
+    }
+}

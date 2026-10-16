@@ -220,19 +220,12 @@ pub struct AcpiInput {
 unsafe extern "C" {
     fn r4os_read_cr3() -> u64;
     fn r4os_write_cr3(value: u64);
-    fn r4os_zig_root_inputs(output: *mut Inputs);
-    fn r4os_zig_root_ecam(
-        base: u64,
-        start: u8,
-        end: u8,
-        output_base: *mut u64,
-        output_bytes: *mut u64,
-    ) -> bool;
+
 }
 fn inputs() -> Inputs {
     let mut output = Inputs::default();
     unsafe {
-        r4os_zig_root_inputs(&mut output);
+        root_inputs(&mut output);
     }
     output
 }
@@ -822,7 +815,7 @@ impl State {
         let mut base = 0;
         let mut bytes = 0;
         if !unsafe {
-            r4os_zig_root_ecam(
+            root_ecam(
                 acpi.mcfg_base,
                 acpi.start_bus,
                 acpi.end_bus,
@@ -1322,3 +1315,55 @@ const _: () = {
     assert!(core::mem::size_of::<AcpiInput>() == 160);
     assert!(core::mem::size_of::<Mapping>() == 56);
 };
+
+unsafe fn root_ecam(
+    base: u64,
+    start: u8,
+    end: u8,
+    output_base: *mut u64,
+    output_bytes: *mut u64,
+) -> bool {
+    let mut out = core::mem::MaybeUninit::uninit();
+    if !unsafe {
+        crate::platform::pci_scan::r4os_rust_pci_ecam_window(base, start, end, out.as_mut_ptr())
+    } {
+        return false;
+    }
+    let out = unsafe { out.assume_init() };
+    unsafe {
+        output_base.write(out.base);
+        output_bytes.write(out.bytes)
+    };
+    true
+}
+
+unsafe fn root_inputs(output: *mut Inputs) {
+    let source = crate::boot::info::r4os_rust_boot_info();
+    let source_view = unsafe { &*source };
+    let mut metadata = super::heap::Metadata::default();
+    let mut heap = super::heap::Stats::default();
+    unsafe {
+        super::heap::r4os_rust_heap_metadata(&mut metadata);
+        super::heap::r4os_rust_heap_stats(&mut heap)
+    };
+    let mut input = Inputs {
+        legacy_info: source as u64,
+        map_address: source_view.memory as u64,
+        map_bytes: (source_view.memory_count
+            * core::mem::size_of::<crate::boot::info::MemoryEntry>()) as u64,
+        framebuffer_record: 0,
+        framebuffer_address: 0,
+        framebuffer_bytes: 0,
+        heap_metadata_base: metadata.base,
+        heap_metadata_bytes: metadata.len,
+        heap_base: heap.base,
+        heap_committed: heap.committed_bytes as u64,
+    };
+    if !source_view.framebuffer.is_null() {
+        let fb = unsafe { &*source_view.framebuffer };
+        input.framebuffer_record = source_view.framebuffer as u64;
+        input.framebuffer_address = fb.address as u64;
+        input.framebuffer_bytes = fb.pitch.checked_mul(fb.height).unwrap_or(0)
+    }
+    unsafe { output.write(input) };
+}

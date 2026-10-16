@@ -17,3 +17,6 @@ pub mod log_route;
 
 pub mod instrumentation;
 pub mod log_event;
+
+mod probes;
+mod version;

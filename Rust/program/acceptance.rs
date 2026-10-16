@@ -60,18 +60,7 @@ impl Scenario {
         ipi: 0,
     };
 }
-unsafe extern "C" {
-    fn r4os_zig_program_service_entry(name: Bytes, out: *mut service_api::Entry) -> bool;
-    fn r4os_zig_program_service_install(
-        name: Bytes,
-        path: Bytes,
-        args: Bytes,
-        mode: u8,
-        description: Bytes,
-    ) -> i32;
-    fn r4os_zig_program_service_name_mutate(op: u8, name: Bytes, code: i32, text: Bytes) -> i32;
-    fn r4os_zig_program_process_desktop_signal();
-}
+
 fn span(s: &[u8]) -> Bytes {
     Bytes {
         data: s.as_ptr(),
@@ -528,9 +517,12 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
         let mut handles = [c::ProgramProcessHandle::default(); 3];
         let mut service = c::ServiceInfo::default();
         let mut existing = MaybeUninit::<service_api::Entry>::uninit();
-        let registered = !r4os_zig_program_service_entry(span(b"CLIPSVC"), existing.as_mut_ptr());
+        let registered = !crate::program::service_api::native_service_entry(
+            span(b"CLIPSVC"),
+            existing.as_mut_ptr(),
+        );
         if registered
-            && r4os_zig_program_service_install(
+            && crate::program::service_api::native_service_install(
                 span(b"CLIPSVC"),
                 span(b"C:\\R4OS\\SERVICES\\CLIPSVC.R4X"),
                 span(b"/RUN"),
@@ -618,7 +610,7 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
                 if gui_events::r4os_rust_program_gui_event_push(handle.instance_id, &key) != 0 {
                     return false;
                 }
-                r4os_zig_program_process_desktop_signal();
+                crate::service::desktop_events::r4os_rust_desktop_signal();
                 while gui_events::r4os_rust_program_gui_revision_read(handle.instance_id)
                     == revision
                 {
@@ -707,8 +699,12 @@ pub unsafe extern "C" fn r4os_rust_program_parallel_acceptance() -> bool {
                 && cleanup;
         }
         if registered {
-            cleanup = (r4os_zig_program_service_name_mutate(4, span(b"CLIPSVC"), 0, span(b""))
-                == 0)
+            cleanup = (crate::program::service_api::native_service_name_mutate(
+                4,
+                span(b"CLIPSVC"),
+                0,
+                span(b""),
+            ) == 0)
                 && cleanup;
         }
         let cleanup_start = timer::tick_count();

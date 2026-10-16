@@ -60,38 +60,25 @@ struct Mount {
     name: Label,
     report: *mut Report,
 }
-unsafe extern "C" {
-    fn r4os_zig_media_device(index: usize, out: *mut DeviceInfo) -> bool;
-    fn r4os_zig_normal_drive(operation: u8, input: *const DriveRequest) -> bool;
-    fn r4os_zig_normal_log(text: *const u8, len: usize);
-    fn r4os_zig_normal_decimal(value: u64);
-    fn r4os_zig_mbr_hex(value: u64, digits: u8);
-    fn r4os_zig_mbr_probe(
-        input: *const Probe,
-        context: *mut c_void,
-        consumer: unsafe extern "C" fn(*mut c_void, *mut c_void),
-    ) -> bool;
-    fn r4os_zig_mbr_lookup(volume: *mut c_void, path: *const u8, len: usize, attr: *mut u8) -> u8;
-    fn r4os_zig_mbr_list(volume: *mut c_void);
-}
+
 fn put(v: &[u8]) {
     unsafe {
-        r4os_zig_normal_log(v.as_ptr(), v.len());
+        normal_log(v.as_ptr(), v.len());
     }
 }
 fn raw(v: Label) {
     unsafe {
-        r4os_zig_normal_log(v.data, v.len);
+        normal_log(v.data, v.len);
     }
 }
 fn dec(v: u64) {
-    unsafe {
-        r4os_zig_normal_decimal(v);
+    {
+        crate::boot::log_route::dec(v);
     }
 }
 fn hex(v: u64) {
-    unsafe {
-        r4os_zig_mbr_hex(v, 2);
+    {
+        crate::boot::log_route::hex(v, 2);
     }
 }
 fn gpt_label(partition: bool, value: u8) -> Label {
@@ -164,7 +151,7 @@ fn drive(operation: u8, letter: u8) -> bool {
         name: Label::new(b""),
         volume: ptr::null_mut(),
     };
-    unsafe { r4os_zig_normal_drive(operation, &input) }
+    unsafe { crate::storage::normal_boot::drive_dispatch(operation, &input) }
 }
 /// # Safety
 /// Original early boot scan, before user mount admission. Output owns one
@@ -175,7 +162,7 @@ pub unsafe extern "C" fn r4os_rust_mbr_scan(index: usize, out: *mut Report) {
         out.write(Report::default());
     }
     let mut info = MaybeUninit::uninit();
-    if !unsafe { r4os_zig_media_device(index, info.as_mut_ptr()) } {
+    if !unsafe { media_device(index, info.as_mut_ptr()) } {
         put(b"  Partition scan: block device missing\r\n");
         return;
     }
@@ -479,7 +466,7 @@ unsafe fn signature(index: usize, lba: u64, report: *mut Report) -> u8 {
 unsafe fn mount(mut context: Mount) {
     let report = context.report;
     let mut info = MaybeUninit::uninit();
-    if !unsafe { r4os_zig_media_device(context.index, info.as_mut_ptr()) } {
+    if !unsafe { media_device(context.index, info.as_mut_ptr()) } {
         unsafe {
             note(report, 0, Label::new(b"partition-device"));
         }
@@ -533,7 +520,7 @@ unsafe fn mount(mut context: Mount) {
         sectors: context.sectors,
         kind: if context.hint == 0 { 2 } else { 3 },
     };
-    if !unsafe { r4os_zig_mbr_probe(&input, ptr::addr_of_mut!(context).cast(), mounted) } {
+    if !unsafe { mbr_probe(&input, ptr::addr_of_mut!(context).cast(), mounted) } {
         if context.hint == 0 {
             put(b"      FAT32: not mounted (invalid BPB or unsupported layout)\r\n");
             unsafe {
@@ -549,7 +536,7 @@ unsafe fn mount(mut context: Mount) {
 }
 unsafe fn exists(volume: *mut c_void, path: &[u8]) -> bool {
     let mut attr = 0;
-    unsafe { r4os_zig_mbr_lookup(volume, path.as_ptr(), path.len(), &mut attr) == 0 }
+    unsafe { mbr_lookup(volume, path.as_ptr(), path.len(), &mut attr) == 0 }
 }
 unsafe extern "C" fn mounted(raw_context: *mut c_void, volume: *mut c_void) {
     let c = unsafe { &*raw_context.cast::<Mount>() };
@@ -572,7 +559,7 @@ unsafe extern "C" fn mounted(raw_context: *mut c_void, volume: *mut c_void) {
     .enumerate()
     {
         let mut attr = 0;
-        match unsafe { r4os_zig_mbr_lookup(volume, path.as_ptr(), path.len(), &mut attr) } {
+        match unsafe { mbr_lookup(volume, path.as_ptr(), path.len(), &mut attr) } {
             0 => {
                 if *directory && attr & 0x10 == 0 {
                     continue;
@@ -589,7 +576,7 @@ unsafe extern "C" fn mounted(raw_context: *mut c_void, volume: *mut c_void) {
         (*report).best_system_score = (*report).best_system_score.max(score);
         (*report).marker_found_mask |= found;
         (*report).marker_io_mask |= io;
-        r4os_zig_mbr_list(volume);
+        mbr_list(volume);
     }
     put(b"      R4OS system markers: ");
     dec(u64::from(score));
@@ -626,7 +613,7 @@ unsafe extern "C" fn mounted(raw_context: *mut c_void, volume: *mut c_void) {
         && (unsafe { exists(volume, b"/BOOT/LIMINE.CONF") }
             || unsafe { exists(volume, b"/LIMINE-BIOS.SYS") })
     {
-        if !unsafe { r4os_zig_normal_drive(5, &input) } {
+        if !unsafe { crate::storage::normal_boot::drive_dispatch(5, &input) } {
             unsafe {
                 note(report, 20, Label::new(b"boot-mount-generation"));
             }
@@ -662,13 +649,13 @@ unsafe extern "C" fn mounted(raw_context: *mut c_void, volume: *mut c_void) {
         name: c.name,
         volume,
     };
-    if unsafe { r4os_zig_normal_drive(1, &input) } {
+    if unsafe { crate::storage::normal_boot::drive_dispatch(1, &input) } {
         if letter == b'C' {
             drive(4, b'C');
         }
-        if !unsafe { r4os_zig_normal_drive(2, &input) } {
+        if !unsafe { crate::storage::normal_boot::drive_dispatch(2, &input) } {
             unsafe {
-                r4os_zig_normal_drive(3, &input);
+                crate::storage::normal_boot::drive_dispatch(3, &input);
                 note(report, 20, Label::new(b"mount-generation"));
             }
             return;
@@ -700,3 +687,93 @@ const _: () = {
     assert!(core::mem::size_of::<Report>() == 40);
     assert!(core::mem::size_of::<Probe>() == 32);
 };
+
+unsafe fn normal_log(text: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
+}
+
+unsafe fn media_device(index: usize, out: *mut DeviceInfo) -> bool {
+    let _guard = crate::memory::owner::Guard::acquire(1);
+    let mut view = MaybeUninit::uninit();
+    if !unsafe {
+        crate::storage::block_registry::r4os_rust_block_registry_slot(
+            index,
+            1,
+            0,
+            true,
+            view.as_mut_ptr(),
+        )
+    } {
+        return false;
+    }
+    let view = unsafe { view.assume_init() };
+    let c = unsafe {
+        core::ptr::addr_of!((*view.device.cast::<super::block_device::Device>()).config).read()
+    };
+    unsafe {
+        out.write(DeviceInfo {
+            index,
+            bus: c.bus,
+            name: Label {
+                data: c.name.data,
+                len: c.name.len,
+            },
+            model: Label {
+                data: c.model.data,
+                len: c.model.len,
+            },
+            driver: Label {
+                data: c.driver.data,
+                len: c.driver.len,
+            },
+            sector_bytes: c.sector_size,
+            sectors: c.sector_count,
+            writable: c.writable,
+        });
+    }
+    true
+}
+
+unsafe fn mbr_probe(
+    input: *const Probe,
+    context: *mut c_void,
+    consumer: unsafe extern "C" fn(*mut c_void, *mut c_void),
+) -> bool {
+    unsafe {
+        let a = &*input;
+        assert!(matches!(a.kind, 2 | 3));
+        let Some(v) = crate::fs::vfs_backends::probe(a.kind == 3, a.index, a.lba, a.sectors, true)
+        else {
+            return false;
+        };
+        let mut v = Some(v);
+        consumer(context, ptr::from_mut(&mut v).cast());
+        true
+    }
+}
+
+unsafe fn mbr_lookup(volume: *mut c_void, path: *const u8, len: usize, attr: *mut u8) -> u8 {
+    unsafe {
+        let a = crate::fs::vfs_types::Args {
+            volume: crate::storage::media_inventory::volume(volume),
+            name: crate::fs::vfs_types::Bytes { data: path, len },
+            ..Default::default()
+        };
+        let mut e = MaybeUninit::<crate::fs::vfs_types::Entry>::uninit();
+        let r = crate::fs::vfs::r4os_rust_vfs_run(1, &a, e.as_mut_ptr().cast());
+        if r.status == 0 {
+            attr.write(e.assume_init().attr);
+        }
+        r.status.try_into().unwrap()
+    }
+}
+
+unsafe fn mbr_list(volume: *mut c_void) {
+    unsafe {
+        let a = crate::fs::vfs_types::Args {
+            volume: crate::storage::media_inventory::volume(volume),
+            ..Default::default()
+        };
+        crate::fs::vfs::r4os_rust_vfs_run(29, &a, ptr::null_mut());
+    }
+}

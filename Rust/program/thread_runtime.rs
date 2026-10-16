@@ -25,7 +25,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 type Entry = unsafe extern "C" fn();
-unsafe extern "C" {}
+
 pub(super) unsafe fn imported(instance: *const ProgramInstance, address: u64) -> bool {
     unsafe {
         let runtime = (*instance)

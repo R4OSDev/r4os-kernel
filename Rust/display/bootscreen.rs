@@ -16,7 +16,7 @@ const BACKGROUND: u32 = 0x041318;
 const FOREGROUND: u32 = 0xf0f0f0;
 const DETAIL: u32 = 0xb8d5d8;
 const ERROR: u32 = 0xff8a80;
-static ASSET: &[u8] = include_bytes!("../../kernel/generated/BOOTSCREEN.R4B");
+static ASSET: &[u8] = include_bytes!("../../Assets/Bootscreen/Generated/BOOTSCREEN.R4B");
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Geometry {

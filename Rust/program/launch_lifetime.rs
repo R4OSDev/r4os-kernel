@@ -44,17 +44,13 @@ pub struct Options {
     pub forced_cpu_present: bool,
     pub reserved: u8,
 }
-unsafe extern "C" {
-    fn r4os_zig_program_entry_boot_active() -> bool;
-    fn r4os_zig_program_entry_boot_detail(value: Bytes);
-    fn r4os_zig_program_launch_metric(rows: bool) -> u32;
-}
+
 fn report(enabled: bool, text: &[u8]) {
     entry::report_stage(enabled, text, true);
 }
 fn detail(text: &[u8]) {
     unsafe {
-        r4os_zig_program_entry_boot_detail(Bytes {
+        program_entry_boot_detail(Bytes {
             data: text.as_ptr(),
             len: text.len(),
         })
@@ -259,8 +255,8 @@ unsafe fn inherit_console(instance: *mut ProgramInstance, id: u32) {
 }
 unsafe fn console_metrics(instance: *mut ProgramInstance) {
     unsafe {
-        let cols = r4os_zig_program_launch_metric(false);
-        let rows = r4os_zig_program_launch_metric(true);
+        let cols = program_launch_metric(false);
+        let rows = program_launch_metric(true);
         let console = payload::console(instance);
         (*console).state.cols = if cols == 0 { 80 } else { cols }.clamp(1, 512);
         (*console).state.rows = if rows == 0 { 25 } else { rows }.clamp(1, 256);
@@ -375,7 +371,7 @@ unsafe fn foreground(
         (*exit_state::state()).foreground_id = (*instance).id;
         (*exit_state::state()).foreground_present = true;
         (*exit_state::state()).foreground_generation = handle.generation;
-        let boot = r4os_zig_program_entry_boot_active();
+        let boot = crate::display::bootscreen::is_active();
         mark_ready(task);
         loop {
             if ready(handle) {
@@ -774,3 +770,11 @@ const _: () = {
     assert!(mem::offset_of!(Options, forced_cpu_present) == 38);
     assert!(mem::offset_of!(Options, reserved) == 39);
 };
+
+unsafe fn program_entry_boot_detail(value: Bytes) {
+    unsafe { crate::display::bootscreen::set_detail(value.data, value.len) }
+}
+
+unsafe fn program_launch_metric(rows: bool) -> u32 {
+    crate::boot::log_route::r4os_rust_log_control(if rows { 11 } else { 10 }, 0, 0, 0, 0)
+}

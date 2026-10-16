@@ -17,10 +17,7 @@ const ENV: usize = contract::environment_block_max;
 const NAME: usize = contract::environment_name_max;
 const VALUE: usize = contract::environment_value_max;
 const PATH: usize = contract::file_path_max_bytes as usize + 1;
-unsafe extern "C" {
-    // The existing R4SYS filesystem owner retains target resolution and I/O.
-    fn r4os_zig_program_data_file_info(path: *const u8, out: *mut contract::FileInfo) -> i32;
-}
+
 unsafe fn bytes<'a>(input: Bytes) -> &'a [u8] {
     if input.len == 0 {
         &[]
@@ -428,7 +425,7 @@ unsafe fn cwd_set(instance: *mut ProgramInstance, value: &[u8]) -> i32 {
         absolute[1] = b':';
         ptr::copy_nonoverlapping(path, absolute.as_mut_ptr().add(2), len);
         let mut info = contract::FileInfo::default();
-        if r4os_zig_program_data_file_info(absolute.as_ptr(), &mut info) != 1
+        if program_data_file_info(absolute.as_ptr(), &mut info) != 1
             || info.exists == 0
             || info.is_dir == 0
         {
@@ -772,3 +769,7 @@ const _: () = {
     assert!(PATH == 1024);
     assert!(mem::size_of::<t::Process>() == 1200);
 };
+
+unsafe fn program_data_file_info(path: *const u8, out: *mut contract::FileInfo) -> i32 {
+    unsafe { crate::program::system::directory::r4os_rust_sys_file_info(path.cast(), out.cast()) }
+}

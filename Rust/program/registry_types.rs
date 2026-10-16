@@ -1,5 +1,5 @@
 //! Stable program registry C views; native admission borrows exact records.
-//! Productive Zig and Rust check every field offset and original core budget.
+//! Native consumers check every field offset and the original core budget.
 //! Every record retains its stable allocation and exact generation until
 //! original task/payload/image/VM/DMA/completion release acknowledgments.
 //! Notifications share the native process namespace; opaque payload pointers

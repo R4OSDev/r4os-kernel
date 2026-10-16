@@ -15,11 +15,9 @@ static CACHED: Storage = Storage(UnsafeCell::new((
     acpi::Info::EMPTY,
     pci_inventory::Status::EMPTY,
 )));
-unsafe extern "C" {
-    fn r4os_zig_platform_boot_step(operation: u8, info: *const acpi::Info) -> bool;
-}
+
 fn step(operation: u8, info: *const acpi::Info) -> bool {
-    unsafe { r4os_zig_platform_boot_step(operation, info) }
+    unsafe { platform_boot_step(operation, info) }
 }
 pub fn initialized() -> bool {
     INITIALIZED.load(Ordering::Acquire)
@@ -79,4 +77,50 @@ pub unsafe extern "C" fn r4os_rust_platform_boot_pci(output: *mut pci_inventory:
     }
     unsafe { output.write(core::ptr::addr_of!((*CACHED.0.get()).1).read()) };
     true
+}
+
+unsafe fn platform_boot_step(operation: u8, info: *const acpi::Info) -> bool {
+    match operation {
+        0 => crate::memory::boot::core_ready(),
+        1 => {
+            let i = unsafe { info.read() };
+            let raw = crate::memory::root::AcpiInput {
+                rsdp: i.rsdp_phys,
+                xsdt: i.xsdt_phys,
+                rsdt: u64::from(i.rsdt_phys),
+                mcfg: i.mcfg_phys,
+                madt: i.madt_phys,
+                fadt: i.fadt_phys,
+                hpet: i.hpet_phys,
+                dsdt: i.fadt_dsdt_phys,
+                x_dsdt: i.fadt_x_dsdt_phys,
+                lapic: i.madt_lapic_address,
+                first_ioapic: u64::from(i.madt_first_ioapic_address),
+                hpet_base: i.hpet_base,
+                mcfg_base: i.mcfg_base,
+                reset_address: i.fadt_reset_address,
+                ioapics: i.madt_ioapics.map(|a| u64::from(a.address)),
+                ioapic_count: i.madt_ioapic_count,
+                start_bus: i.mcfg_start_bus,
+                end_bus: i.mcfg_end_bus,
+                reset_address_space: i.fadt_reset_address_space,
+                found: i.found,
+                reset_supported: i.fadt_reset_supported,
+                reset_valid: i.fadt_reset_gas_valid,
+            };
+            unsafe { crate::memory::boot::r4os_rust_memory_finalize(&raw) }
+        }
+        2 => {
+            crate::boot::log_route::puts(b"  Platform mappings [OK]\r\n");
+            true
+        }
+        3 => {
+            let message = b"Platform boot before memory core";
+            unsafe {
+                crate::boot::fatal::r4os_rust_fatal_record(9, message.as_ptr(), message.len())
+            };
+            false
+        }
+        _ => false,
+    }
 }

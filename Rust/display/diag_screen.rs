@@ -345,3 +345,8 @@ const _: () = {
     assert!(core::mem::offset_of!(TextView, pointer) == 0);
     assert!(core::mem::offset_of!(TextView, len) == 8);
 };
+
+/// Synchronous text span; the slice owns the complete readable lifetime.
+pub fn text(bytes: &[u8]) {
+    unsafe { write(bytes.as_ptr(), bytes.len()) }
+}

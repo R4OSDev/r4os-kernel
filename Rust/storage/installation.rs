@@ -1,10 +1,10 @@
-//! Native installation manifest owner. Generic Zig std JSON decoding remains
-//! a temporary stateless substrate; every R4OS rule and match is owned here.
+//! Native installation manifest and matching rules. The bounded native JSON
+//! decoder borrows the original caller arena; no schema/topology rule changed.
 use crate::storage::{
     guid,
     partition_table::{self, Label, Partition},
 };
-use core::{ffi::c_void, ptr, slice};
+use core::slice;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Part {
@@ -29,29 +29,9 @@ pub struct TableView {
     pub partitions: *const Partition,
     pub count: usize,
 }
-#[repr(C)]
 #[derive(Clone, Copy)]
-pub struct JsonMeta {
-    pub found: bool,
-    pub kind: u8,
-    pub child: *const c_void,
-    pub text: *const u8,
-    pub len: usize,
-}
-impl JsonMeta {
-    const EMPTY: Self = Self {
-        found: false,
-        kind: 0,
-        child: ptr::null(),
-        text: ptr::null(),
-        len: 0,
-    };
-}
-type JsonReader = unsafe extern "C" fn(*const c_void, u8, *const u8, usize, usize, *mut JsonMeta);
-#[derive(Clone, Copy)]
-struct Node {
-    handle: *const c_void,
-    read: JsonReader,
+struct Node<'a> {
+    value: super::installation_json::Node<'a>,
 }
 #[repr(i32)]
 #[derive(Clone, Copy)]
@@ -75,46 +55,30 @@ enum Error {
     DuplicateBootPath = 17,
     Version = 18,
 }
-impl Node {
-    fn query(self, op: u8, key: &[u8], index: usize) -> JsonMeta {
-        let mut out = JsonMeta::EMPTY;
-        unsafe { (self.read)(self.handle, op, key.as_ptr(), key.len(), index, &mut out) };
-        out
-    }
-    fn meta(self) -> JsonMeta {
-        self.query(0, &[], 0)
+impl<'a> Node<'a> {
+    fn meta(self) -> super::installation_json::Meta<'a> {
+        self.value.meta()
     }
     fn field(self, key: &[u8]) -> Result<Self, Error> {
         if self.meta().kind != 1 {
             return Err(Error::ExpectedObject);
         }
-        let meta = self.query(1, key, 0);
-        if !meta.found {
-            return Err(Error::MissingField);
-        }
-        Ok(Self {
-            handle: meta.child,
-            read: self.read,
-        })
+        self.value
+            .field(key)
+            .map(|value| Self { value })
+            .ok_or(Error::MissingField)
     }
     fn at(self, index: usize) -> Self {
-        let m = self.query(2, &[], index);
-        assert!(m.found);
         Self {
-            handle: m.child,
-            read: self.read,
+            value: self.value.at(index).expect("Original JSON array bounds"),
         }
     }
-    fn string<'a>(self) -> Result<&'a [u8], Error> {
+    fn string(self) -> Result<&'a [u8], Error> {
         let m = self.meta();
         if m.kind != 3 {
             return Err(Error::ExpectedString);
         }
-        Ok(if m.len == 0 {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(m.text, m.len) }
-        })
+        Ok(m.text)
     }
     fn uuid(self) -> Result<[u8; 16], Error> {
         let text = self.string()?;
@@ -132,7 +96,7 @@ impl Node {
         if m.kind != 4 || m.len == 0 {
             return Err(Error::ExpectedInteger);
         }
-        let text = unsafe { slice::from_raw_parts(m.text, m.len) };
+        let text = m.text;
         // Original validation checks every byte before parsing the number;
         // a suffix error takes precedence over overflow in an earlier prefix.
         if !text.iter().all(u8::is_ascii_digit) {
@@ -183,7 +147,7 @@ fn boot_path(path: &[u8]) -> bool {
     }
     true
 }
-fn parse(root: Node) -> Result<Manifest, Error> {
+fn parse(root: Node<'_>) -> Result<Manifest, Error> {
     if root.field(b"schema")?.uint()? != 1 {
         return Err(Error::UnsupportedSchema);
     }
@@ -325,23 +289,33 @@ pub unsafe extern "C" fn r4os_rust_installation_text(
     };
     0
 }
-/// # Safety
-/// Root and all nodes/strings remain alive in the immutable generic JSON
-/// document until this call returns. Reader copies only fixed C metadata,
-/// never waits or mutates the DOM; output is exclusive aligned Manifest.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_installation_parse(
-    root: *const c_void,
-    read: JsonReader,
-    out: *mut Manifest,
-) -> i32 {
-    match parse(Node { handle: root, read }) {
-        Ok(m) => {
-            unsafe { out.write(m) };
-            0
-        }
-        Err(e) => e as i32,
+/// Original size/BOM, schema and topology rules over a native generic DOM.
+pub(crate) fn parse_bytes(input: &[u8], scratch: &mut [u8]) -> Result<Manifest, &'static [u8]> {
+    if input.is_empty() || input.len() > 16384 {
+        return Err(b"ManifestSize");
     }
+    let input = input.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(input);
+    let root = super::installation_json::decode(input, scratch)?;
+    parse(Node { value: root }).map_err(|e| match e {
+        Error::ManifestSize => b"ManifestSize".as_slice(),
+        Error::UnsupportedSchema => b"UnsupportedSchema",
+        Error::UnsupportedSectorSize => b"UnsupportedSectorSize",
+        Error::ExpectedObject => b"ExpectedObject",
+        Error::MissingField => b"MissingField",
+        Error::ExpectedString => b"ExpectedString",
+        Error::InvalidGuid => b"InvalidGuid",
+        Error::ExpectedInteger => b"ExpectedInteger",
+        Error::IntegerOverflow => b"IntegerOverflow",
+        Error::PartitionRoles => b"PartitionRoles",
+        Error::PartitionRange => b"PartitionRange",
+        Error::PartitionType => b"PartitionType",
+        Error::DuplicatePartitionGuid => b"DuplicatePartitionGuid",
+        Error::PartitionOverlap => b"PartitionOverlap",
+        Error::BootFiles => b"BootFiles",
+        Error::BootPath => b"BootPath",
+        Error::DuplicateBootPath => b"DuplicateBootPath",
+        Error::Version => b"Version",
+    })
 }
 /// # Safety
 /// Initialized manifest/table/UUID are readable and disjoint from mutation;
@@ -358,5 +332,4 @@ const _: () = {
     assert!(core::mem::size_of::<Part>() == 48);
     assert!(core::mem::size_of::<Manifest>() == 272);
     assert!(core::mem::size_of::<TableView>() == 40);
-    assert!(core::mem::size_of::<JsonMeta>() == 32);
 };

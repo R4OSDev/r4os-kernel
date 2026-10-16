@@ -34,26 +34,17 @@ pub struct Measurement {
     pub baseline: i32,
     pub line_height: u32,
 }
-unsafe extern "C" {
-    fn r4os_zig_program_font_control(op: u8, id: u32) -> u32;
-    fn r4os_zig_program_font_catalog(id: u32, out: *mut Catalog) -> bool;
-    fn r4os_zig_program_font_measure(
-        id: u32,
-        text: *const u8,
-        max_bytes: usize,
-        out: *mut Measurement,
-    );
-}
+
 pub(super) fn renderable(id: u32) -> bool {
-    unsafe { r4os_zig_program_font_control(0, id) != 0 }
+    unsafe { program_font_control(0, id) != 0 }
 }
 pub(super) fn normalize(id: u32) -> u32 {
-    unsafe { r4os_zig_program_font_control(1, id) }
+    unsafe { program_font_control(1, id) }
 }
 pub(super) unsafe fn measure(id: u32, text: *const u8, max: usize) -> Measurement {
     unsafe {
         let mut out = MaybeUninit::uninit();
-        r4os_zig_program_font_measure(id, text, max, out.as_mut_ptr());
+        program_font_measure(id, text, max, out.as_mut_ptr());
         out.assume_init()
     }
 }
@@ -78,7 +69,7 @@ pub(super) unsafe fn fill(id: u32, selected: bool, out: *mut Info) -> i32 {
                 kind: 0,
                 flags: c::gui_font_flag_renderable
                     | c::gui_font_flag_builtin
-                    | if selected || r4os_zig_program_font_control(2, 0) == c::gui_font_builtin_id {
+                    | if selected || program_font_control(2, 0) == c::gui_font_builtin_id {
                         c::gui_font_flag_selected
                     } else {
                         0
@@ -102,7 +93,7 @@ pub(super) unsafe fn fill(id: u32, selected: bool, out: *mut Info) -> i32 {
             return 1;
         }
         let mut catalog = MaybeUninit::<Catalog>::uninit();
-        if !r4os_zig_program_font_catalog(id, catalog.as_mut_ptr()) {
+        if !program_font_catalog(id, catalog.as_mut_ptr()) {
             return 0;
         }
         let catalog = catalog.assume_init();
@@ -238,3 +229,64 @@ const _: () = {
     assert!(mem::offset_of!(Measurement, baseline) == 8);
     assert!(mem::offset_of!(Measurement, line_height) == 12);
 };
+
+unsafe fn program_font_control(op: u8, id: u32) -> u32 {
+    crate::font::owner::with_catalog(|s| match op {
+        0 => u32::from(s.is_renderable(id)),
+        1 => s.normalize_id(id),
+        2 => s.current_font_id(),
+        _ => panic!("Invalid font query"),
+    })
+}
+
+unsafe fn program_font_measure(id: u32, text: *const u8, max_bytes: usize, out: *mut Measurement) {
+    crate::font::owner::with_catalog(|s| unsafe {
+        let mut m = crate::font::types::TextMetrics::default();
+        crate::font::ffi::r4os_rust_font_state_measure_z_with_font(s, id, text, max_bytes, &mut m);
+        out.write(Measurement {
+            width: m.width,
+            height: m.height,
+            baseline: i32::from(m.baseline),
+            line_height: m.line_height,
+        });
+    });
+}
+
+unsafe fn program_font_catalog(id: u32, out: *mut Catalog) -> bool {
+    let Some(e) = crate::font::owner::with_catalog(|s| s.catalog_entry_for_id(id)) else {
+        return false;
+    };
+    unsafe {
+        out.write(Catalog {
+            info: Info {
+                kind: e.kind as _,
+                weight: e.weight as _,
+                style_flags: e.style_flags,
+                charset_flags: e.charset_flags,
+                width: e.width as _,
+                height: e.height as _,
+                max_advance: e.max_advance as _,
+                line_height: e.line_height as _,
+                baseline: e.baseline as _,
+                glyph_count: e.glyph_count,
+                strike_count: e.strike_count as _,
+                path: e.path,
+                family: e.family,
+                face: e.face,
+                style: e.style,
+                status: e.status,
+                ..Default::default()
+            },
+            reserved: 0,
+            path_len: e.path_len,
+            family_len: e.family_len,
+            face_len: e.face_len,
+            style_len: e.style_len,
+            status_len: e.status_len,
+            renderable: e.renderable,
+            selected: e.selected,
+            reserved2: [0; 6],
+        });
+    }
+    true
+}

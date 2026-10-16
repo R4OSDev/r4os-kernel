@@ -282,11 +282,7 @@ pub(super) unsafe fn release(owned: bool) {
         }
     }
 }
-unsafe extern "C" {
-    // Existing diagnostic owner only: begin(0), resolve(1), relock line(2),
-    // index divergence line(3). Token is its original exact u64 generation.
-    fn r4os_zig_pgcache_diagnostic(op: u8, token: u64, value: u64, extra: u64) -> u64;
-}
+
 pub(super) unsafe fn relock(owned: bool) {
     unsafe {
         if !owned {
@@ -302,12 +298,12 @@ pub(super) unsafe fn relock(owned: bool) {
             STATS.lock_timeouts.fetch_add(1, Relaxed);
             slices = slices.wrapping_add(1);
             if token == 0 {
-                token = r4os_zig_pgcache_diagnostic(0, 0, 0, 0);
+                token = crate::fs::page_cache::diagnostic(0, 0, 0, 0);
             }
-            r4os_zig_pgcache_diagnostic(2, token, slices, 0);
+            crate::fs::page_cache::diagnostic(2, token, slices, 0);
         }
         if token != 0 {
-            r4os_zig_pgcache_diagnostic(1, token, 0, 0);
+            crate::fs::page_cache::diagnostic(1, token, 0, 0);
         }
     }
 }

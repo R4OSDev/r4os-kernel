@@ -13,15 +13,6 @@ pub struct XhciStatus {
     pub interrupt_pending_timeouts: u64,
     pub interrupt_halted_checks: u64,
 }
-#[repr(C)]
-pub struct Peers {
-    pub storage_ready: unsafe extern "C" fn() -> bool,
-    pub hid_init: unsafe extern "C" fn() -> bool,
-    pub hid_status: unsafe extern "C" fn(*mut Status),
-    pub xhci_status: unsafe extern "C" fn(*mut XhciStatus),
-    pub port_start: unsafe extern "C" fn() -> bool,
-    pub hid_start: unsafe extern "C" fn() -> bool,
-}
 struct Storage(UnsafeCell<Status>);
 // SAFETY: status is initialized only by the linear BSP bootstrap. Afterwards
 // it is immutable; starting resident poll tasks never mutates this record.
@@ -118,11 +109,16 @@ impl Sink {
         }
     }
 }
-fn xhci_status(peers: &Peers) -> XhciStatus {
+fn xhci_status() -> XhciStatus {
     let mut out = MaybeUninit::uninit();
     unsafe {
-        (peers.xhci_status)(out.as_mut_ptr());
-        out.assume_init()
+        super::xhci_api::r4os_rust_usb_xhci_status(out.as_mut_ptr());
+        let value = out.assume_init();
+        XhciStatus {
+            interrupt_recoveries: value.interrupt_recoveries,
+            interrupt_pending_timeouts: value.interrupt_pending_timeouts,
+            interrupt_halted_checks: value.interrupt_halted_checks,
+        }
     }
 }
 fn classify(input: Status) {
@@ -215,7 +211,7 @@ fn apply_registry(slot: usize) {
     }
     publish(value);
 }
-fn emit_boot_line(peers: &Peers) {
+fn emit_boot_line() {
     let value = status();
     let sink = Sink(false);
     sink.text(b"  USBHID ");
@@ -238,7 +234,7 @@ fn emit_boot_line(peers: &Peers) {
         _ => panic!("USB HID boot phase"),
     }
     if value.active {
-        let xs = xhci_status(peers);
+        let xs = xhci_status();
         sink.text(b"  USBHID xhci: recoveries=");
         sink.dec(xs.interrupt_recoveries);
         sink.text(b" pending_timeouts=");
@@ -248,7 +244,7 @@ fn emit_boot_line(peers: &Peers) {
         sink.text(b"\r\n");
     }
 }
-unsafe fn init(peers: &Peers) -> bool {
+unsafe fn init() -> bool {
     let value = status();
     if value.attempted {
         let sink = Sink(true);
@@ -264,14 +260,14 @@ unsafe fn init(peers: &Peers) -> bool {
         reason: Text::literal(b"starting"),
         ..Status::EMPTY
     });
-    if !unsafe { (peers.storage_ready)() } {
+    if !unsafe { crate::storage::boot::r4os_rust_storage_boot(3, core::ptr::null()) != 0 } {
         let mut value = status();
         value.phase = 1;
         value.failed = true;
         value.fatal = true;
         value.reason = Text::literal(b"storage controllers missing");
         publish(value);
-        dump_boot_status(peers);
+        dump_boot_status();
         let message = b"USB-HID boot before storage controllers";
         unsafe { fatal::r4os_rust_fatal_record(16, message.as_ptr(), message.len()) };
         return false;
@@ -286,24 +282,24 @@ unsafe fn init(peers: &Peers) -> bool {
             b"[USBHIDBOOT][WARN] registry slot missing; continuing without registry owner\r\n",
         );
     }
-    let bound = unsafe { (peers.hid_init)() };
+    let bound = super::hid::r4os_rust_usb_hid_init(true);
     let mut value = status();
     value.init_returned_bound = bound;
     publish(value);
     let mut input = MaybeUninit::uninit();
-    unsafe { (peers.hid_status)(input.as_mut_ptr()) };
+    unsafe { project_hid(input.as_mut_ptr()) };
     classify(unsafe { input.assume_init() });
     apply_registry(slot);
-    dump_boot_status(peers);
-    emit_boot_line(peers);
+    dump_boot_status();
+    emit_boot_line();
     true
 }
 /// # Safety
 /// Exact BSP bootstrap peers and resident original owner projections. No
 /// peer may recursively start a new boot-HID initialization generation.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_usb_hid_boot_init(peers: *const Peers) -> bool {
-    unsafe { init(&*peers) }
+pub unsafe extern "C" fn r4os_rust_usb_hid_boot_init() -> bool {
+    unsafe { init() }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_usb_hid_boot_initialized() -> bool {
@@ -336,18 +332,16 @@ pub extern "C" fn r4os_rust_usb_hid_boot_dump() {
 /// # Safety
 /// Exact retained task-start peers after task-runtime initialization.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_usb_hid_boot_start(peers: *const Peers) -> bool {
-    let peers = unsafe { &*peers };
-    if !unsafe { (peers.port_start)() } {
+pub unsafe extern "C" fn r4os_rust_usb_hid_boot_start() -> bool {
+    if !unsafe { super::xhci_api::r4os_rust_usb_xhci_start_port_task() } {
         return false;
     }
     if !status().active {
         return true;
     }
-    unsafe { (peers.hid_start)() }
+    super::hid::start_poll_task()
 }
 const _: () = {
-    assert!(core::mem::size_of::<Peers>() == 48);
     assert!(core::mem::size_of::<XhciStatus>() == 24);
 };
 fn dump_status() {
@@ -391,7 +385,7 @@ fn dump_status() {
     sink.text(b"\r\n");
 }
 
-fn dump_boot_status(peers: &Peers) {
+fn dump_boot_status() {
     let value = status();
     let sink = Sink(true);
     sink.text(b"[USBHIDBOOT] status phase=");
@@ -434,7 +428,7 @@ fn dump_boot_status(peers: &Peers) {
     sink.text(text(value.boot_source));
     sink.text(b" reason=");
     sink.text(text(value.reason));
-    let xs = xhci_status(peers);
+    let xs = xhci_status();
     sink.text(b" xhci_recoveries=");
     sink.dec(xs.interrupt_recoveries);
     sink.text(b" xhci_pending_timeouts=");
@@ -442,4 +436,27 @@ fn dump_boot_status(peers: &Peers) {
     sink.text(b" xhci_halted_checks=");
     sink.dec(xs.interrupt_halted_checks);
     sink.text(b"\r\n");
+}
+
+unsafe fn project_hid(out: *mut Status) {
+    let value = super::hid::status();
+    unsafe {
+        out.write(Status {
+            initialized: value.initialized,
+            keyboard_present: value.keyboard_present,
+            keyboard_bound: value.keyboard_bound,
+            mouse_present: value.mouse_present,
+            mouse_bound: value.mouse_bound,
+            unsupported_hid: value.unsupported_hid,
+            missing_endpoint_hid: value.missing_endpoint_hid,
+            setup_warnings: value.setup_warnings,
+            failures: value.failures,
+            boot_dispatch_failures: value.boot_dispatch_failures,
+            protocol_required_missing: value.protocol_required_missing,
+            report_descriptor_malformed: value.report_descriptor_malformed,
+            boot_source: value.boot_source,
+            reason: value.reason,
+            ..Status::EMPTY
+        });
+    }
 }

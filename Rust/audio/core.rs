@@ -10,7 +10,7 @@ use crate::{
     contract as a,
     fs::vfs_types::Bytes,
     loader::r4p,
-    memory::{heap, phys},
+    memory::heap,
     platform::timer,
     sched::{
         scheduler, sync_locks, sync_objects,
@@ -212,48 +212,11 @@ static OUTPUT_PRESENT: AtomicU8 = AtomicU8::new(0);
 static PROGRESS: Resident<Event> = Resident(UnsafeCell::new(Event::AUTO));
 static MIX_DUE: AtomicU64 = AtomicU64::new(u64::MAX);
 static BACKEND_DUE: AtomicU64 = AtomicU64::new(u64::MAX);
-unsafe extern "C" {
-    fn r4os_zig_audio_log(text: *const u8, len: usize);
-    fn r4os_zig_audio_legacy(
-        op: u32,
-        code: usize,
-        data: *const u8,
-        len: usize,
-        rate: u32,
-        channels: u16,
-        format: u16,
-        a: u8,
-        b: u8,
-        c: u8,
-        d: u8,
-    ) -> i32;
-}
+
 pub(super) fn log(s: &[u8]) {
-    unsafe { r4os_zig_audio_log(s.as_ptr(), s.len()) }
+    unsafe { audio_log(s.as_ptr(), s.len()) }
 }
-fn log_dec(mut value: u64) {
-    let mut buf = [0; 20];
-    let mut n = 0;
-    if value == 0 {
-        log(b"0");
-        return;
-    }
-    while value != 0 {
-        buf[n] = b'0' + (value % 10) as u8;
-        n += 1;
-        value /= 10;
-    }
-    buf[..n].reverse();
-    log(&buf[..n]);
-}
-fn signed(value: i32) {
-    if value < 0 {
-        log(b"-");
-        log_dec((-value) as u64);
-    } else {
-        log_dec(value as u64);
-    }
-}
+
 fn boot(s: &[u8]) {
     unsafe { bootlog::r4os_rust_bootlog_write(s.as_ptr(), s.len()) }
 }
@@ -616,21 +579,7 @@ pub(crate) unsafe fn sid_model_name_z() -> *const u8 {
         c"8580".as_ptr().cast()
     }
 }
-pub(crate) unsafe fn sid_protocol_status() -> SidProtocolStatus {
-    unsafe {
-        SidProtocolStatus {
-            source: protocol_source(b"audio.sid"),
-            model: g!(sid_r4p_model),
-            register: g!(sid_r4p_register),
-            io: g!(sid_r4p_io),
-            missing_required: g!(sid_missing_required),
-            dispatch_fail: g!(sid_dispatch_failures),
-            last_result: g!(sid_last_result),
-            last_kind: g!(sid_last_kind),
-            last_voice: g!(sid_last_voice),
-        }
-    }
-}
+
 pub(crate) unsafe fn open_stream(rate: u32, channels: u16, format: u16) -> i32 {
     unsafe { open_stream_for_owner(Owner::KERNEL, rate, channels, format) }
 }
@@ -935,47 +884,7 @@ pub(crate) unsafe fn close_streams_for_owner(owner: Owner) -> bool {
         released
     }
 }
-pub(crate) unsafe fn close_all_streams() -> bool {
-    unsafe {
-        let Some(_output) = OutputGuard::acquire(false) else {
-            return false;
-        };
-        if !lock() {
-            return false;
-        }
-        for i in 0..MAX_STREAMS {
-            let p = stream(i);
-            if (*p).transaction || (*p).read_reserved {
-                unlock();
-                return false;
-            }
-        }
-        for i in 0..MAX_STREAMS {
-            (*stream(i)).transaction = true;
-        }
-        unlock();
-        let stopped = stop_active_pcm_owned();
-        relock();
-        for i in 0..MAX_STREAMS {
-            (*stream(i)).transaction = false;
-        }
-        if stopped < 0 {
-            unlock();
-            return false;
-        }
-        for i in 0..MAX_STREAMS {
-            let p = stream(i);
-            if (*p).state != StreamState::Open {
-                continue;
-            }
-            g!(stream_dropped_bytes) = g!(stream_dropped_bytes)
-                .wrapping_add(((*p).available + pcm::pending_tail_bytes(&(*p).resampler)) as u64);
-            release_stream(p);
-        }
-        unlock();
-        true
-    }
-}
+
 pub(crate) unsafe fn set_volume(id: u32, volume: u32) -> i32 {
     unsafe { set_volume_for_owner(Owner::KERNEL, id, volume) }
 }
@@ -1234,32 +1143,7 @@ pub(crate) unsafe fn midi_close(handle: u32) -> i32 {
         stopped
     }
 }
-pub(crate) unsafe fn midi_protocol_status() -> MidiProtocolStatus {
-    unsafe {
-        MidiProtocolStatus {
-            source: protocol_source(b"audio.midi"),
-            classify: g!(midi_r4p_classify),
-            missing_required: g!(midi_missing_required),
-            dispatch_fail: g!(midi_dispatch_failures),
-            last_result: g!(midi_last_result),
-            last_event: g!(midi_last_event),
-        }
-    }
-}
-pub(crate) unsafe fn opl3_protocol_status() -> Opl3ProtocolStatus {
-    unsafe {
-        Opl3ProtocolStatus {
-            source: protocol_source(b"audio.opl3"),
-            registers: g!(opl3_r4p_register),
-            midi: g!(opl3_r4p_midi),
-            missing_required: g!(opl3_missing_required),
-            dispatch_fail: g!(opl3_dispatch_failures),
-            last_result: g!(opl3_last_result),
-            last_kind: g!(opl3_last_write_kind),
-            last_action: g!(opl3_last_action),
-        }
-    }
-}
+
 pub(crate) unsafe fn opl3_reset() -> i32 {
     unsafe {
         let mut op = a::AudioOpl3Op::default();
@@ -1287,30 +1171,7 @@ pub(crate) unsafe fn opl3_write_register(bank: u8, reg: u8, value: u8) -> i32 {
         write(c.context, bank, reg, value)
     }
 }
-pub(crate) unsafe fn opl3_run_register_demo() {
-    unsafe {
-        opl3_reset();
-        for (bank, reg, value) in [
-            (1, 0x05, 0x01),
-            (0, 0x01, 0x20),
-            (0, 0x20, 0x21),
-            (0, 0x23, 0x01),
-            (0, 0x40, 0x18),
-            (0, 0x43, 0x00),
-            (0, 0x60, 0xf3),
-            (0, 0x63, 0xf3),
-            (0, 0x80, 0x77),
-            (0, 0x83, 0x77),
-            (0, 0xe0, 0),
-            (0, 0xe3, 0),
-            (0, 0xa0, 0x98),
-            (0, 0xb0, 0x31),
-            (0, 0xc0, 0x31),
-        ] {
-            opl3_write_register(bank, reg, value);
-        }
-    }
-}
+
 pub(crate) unsafe fn opl3_render_block() -> i32 {
     unsafe {
         let Some(slot) = find_synth(b"OPL3") else {
@@ -1336,39 +1197,14 @@ pub(crate) unsafe fn opl3_stop() -> i32 {
         0
     }
 }
-pub(crate) unsafe fn alloc_dma_buffer(bytes: u32, _alignment: u32) -> u64 {
-    unsafe {
-        if bytes == 0 || bytes > 4096 {
-            return 0;
-        }
-        let mut address = 0;
-        if phys::r4os_rust_phys_alloc(&mut address) {
-            address
-        } else {
-            0
-        }
-    }
-}
-pub(crate) fn free_dma_buffer(address: u64, _bytes: u32) {
-    if address != 0 {
-        phys::r4os_rust_phys_free(address);
-    }
-}
+
 fn role(name: &[u8]) -> Bytes {
     Bytes {
         data: name.as_ptr(),
         len: name.len(),
     }
 }
-unsafe fn protocol_source(name: &[u8]) -> Span {
-    unsafe {
-        let s = r4p::r4os_rust_r4p_source(role(name), true);
-        Span {
-            pointer: s.data,
-            len: s.len,
-        }
-    }
-}
+
 unsafe fn has_protocol(name: &[u8]) -> bool {
     unsafe { r4p::r4os_rust_r4p_has_active(role(name)) }
 }
@@ -1482,23 +1318,7 @@ unsafe fn send_active_midi(channel: u8, status: u8, data1: u8, data2: u8) -> i32
             }
             return result;
         }
-        if c.send_legacy != 0 {
-            r4os_zig_audio_legacy(
-                2,
-                c.send_legacy,
-                ptr::null(),
-                0,
-                0,
-                0,
-                0,
-                channel,
-                status,
-                data1,
-                data2,
-            );
-            (*p).sends = (*p).sends.wrapping_add(1);
-            return 0;
-        }
+
         NO_ENDPOINT
     }
 }
@@ -1516,10 +1336,7 @@ unsafe fn stop_active_midi() -> i32 {
             }
             return result;
         }
-        if c.stop_legacy != 0 {
-            r4os_zig_audio_legacy(3, c.stop_legacy, ptr::null(), 0, 0, 0, 0, 0, 0, 0, 0);
-            (*p).stops = (*p).stops.wrapping_add(1);
-        }
+
         0
     }
 }
@@ -1622,17 +1439,7 @@ pub(crate) unsafe fn register_synth_engine_z(name: *const u8, pointer: *const c_
         }
     }
 }
-pub(crate) unsafe fn register_audio_backend(name: &[u8], pointer: *const c_void) {
-    unsafe {
-        register_audio_backend_internal(
-            name,
-            BackendRegistration {
-                pointer,
-                ..Default::default()
-            },
-        );
-    }
-}
+
 pub(crate) unsafe fn register_external_audio_backend_z(
     name: *const u8,
     config: BackendRegistration,
@@ -1676,7 +1483,7 @@ unsafe fn output_record(slot: usize, index: u32, out: *mut a::AudioOutputInfo) -
         let p = backend(slot);
         out.write(a::AudioOutputInfo::default());
         let c = (*p).config;
-        if !(*p).registered || (*p).closing || (c.write_legacy == 0 && c.write.is_none()) {
+        if !(*p).registered || (*p).closing || (c.write.is_none()) {
             return 0;
         }
         if let Some(outputs) = (*p).outputs {
@@ -1924,25 +1731,7 @@ pub(crate) unsafe fn register_synth_engine(name: &[u8], pointer: *const c_void) 
         )
     }
 }
-pub(crate) unsafe fn register_native_synth_engine(
-    name: &[u8],
-    send: usize,
-    render: usize,
-    stop: usize,
-) {
-    unsafe {
-        register_synth_internal(
-            name,
-            SynthRegistration {
-                flags: if send != 0 { 1 } else { 0 },
-                send_legacy: send,
-                render_legacy: render,
-                stop_legacy: stop,
-                ..Default::default()
-            },
-        );
-    }
-}
+
 unsafe fn register_synth_internal(name: &[u8], config: SynthRegistration) -> bool {
     unsafe {
         let Some(slot) = find_synth(name).or_else(|| free_synth_slot()) else {
@@ -1974,8 +1763,6 @@ unsafe fn register_synth_internal(name: &[u8], config: SynthRegistration) -> boo
             b" external"
         } else if config.migration {
             b" migration"
-        } else if config.send_legacy != 0 || config.render_legacy != 0 {
-            b" native"
         } else {
             b" generic"
         });
@@ -1983,53 +1770,7 @@ unsafe fn register_synth_internal(name: &[u8], config: SynthRegistration) -> boo
         true
     }
 }
-pub(crate) unsafe fn register_native_audio_backend(name: &[u8], write: usize, stop: usize) {
-    unsafe {
-        register_audio_backend_internal(
-            name,
-            BackendRegistration {
-                write_legacy: write,
-                stop_legacy: stop,
-                ..Default::default()
-            },
-        );
-    }
-}
-pub(crate) unsafe fn select_audio_backend(name: &[u8]) -> bool {
-    unsafe {
-        let Some(_output) = OutputGuard::acquire(true) else {
-            return false;
-        };
-        let Some(slot) = find_backend(name) else {
-            boot(b"[AUDIO][WARN] audio backend not found ");
-            boot(name);
-            boot(b"\r\n");
-            return false;
-        };
-        let p = backend(slot);
-        if (*p).closing {
-            return false;
-        }
-        let c = (*p).config;
-        if c.write_legacy == 0 && c.write.is_none() {
-            boot(b"[AUDIO][WARN] audio backend has no PCM output ");
-            boot(name);
-            boot(b"\r\n");
-            return false;
-        }
-        if g!(active_audio_slot) == Some(slot) {
-            return true;
-        }
-        if stop_active_pcm_owned() < 0 {
-            return false;
-        }
-        set_active_backend(slot);
-        true
-    }
-}
-pub(crate) unsafe fn unregister_audio_backend(name: &[u8]) -> bool {
-    unsafe { unregister_audio_backend_by_name(name) == 0 }
-}
+
 pub(crate) unsafe fn set_audio_backend_closing(name: &[u8], closing: bool) -> bool {
     unsafe {
         let Some(_output) = OutputGuard::acquire(true) else {
@@ -2042,10 +1783,7 @@ pub(crate) unsafe fn set_audio_backend_closing(name: &[u8], closing: bool) -> bo
         (*p).closing = closing;
         if g!(active_audio_slot) == Some(slot) {
             let c = (*p).config;
-            OUTPUT_PRESENT.store(
-                u8::from(!closing && (c.write_legacy != 0 || c.write.is_some())),
-                Ordering::Release,
-            );
+            OUTPUT_PRESENT.store(u8::from(!closing && (c.write.is_some())), Ordering::Release);
         }
         true
     }
@@ -2082,7 +1820,7 @@ pub(crate) unsafe fn audio_backend_family_status(family: &[u8]) -> BackendFamily
             }
             result.active |= g!(active_audio_slot) == Some(slot) && (*p).active;
             let c = (*p).config;
-            result.has_output |= c.write_legacy != 0 || c.write.is_some();
+            result.has_output |= c.write.is_some();
         }
         result
     }
@@ -2108,7 +1846,7 @@ pub(crate) unsafe fn audio_backend_has_output(name: &[u8]) -> bool {
             return false;
         };
         let c = (*backend(slot)).config;
-        c.write_legacy != 0 || c.write.is_some()
+        c.write.is_some()
     }
 }
 unsafe fn register_mixer_backend(name: &[u8], pointer: *const c_void) {
@@ -2169,18 +1907,13 @@ unsafe fn register_audio_backend_internal(name: &[u8], config: BackendRegistrati
         }
         boot(b"[AUDIO] audio backend registered ");
         boot(slice::from_raw_parts(ptr::addr_of!((*p).name).cast(), len));
-        boot(if config.write_legacy != 0 {
-            b" native"
-        } else if config.write.is_some() {
+        boot(if config.write.is_some() {
             b" r4d"
         } else {
             b" generic"
         });
         boot(b" [OK]\r\n");
-        if was_active
-            || (g!(active_audio_slot).is_none()
-                && (config.write_legacy != 0 || config.write.is_some()))
-        {
+        if was_active || (g!(active_audio_slot).is_none() && (config.write.is_some())) {
             set_active_backend(slot);
         }
         true
@@ -2196,7 +1929,7 @@ unsafe fn set_active_backend(slot: usize) {
         g!(active_audio_slot) = Some(slot);
         let c = (*p).config;
         OUTPUT_PRESENT.store(
-            u8::from(!(*p).closing && (c.write_legacy != 0 || c.write.is_some())),
+            u8::from(!(*p).closing && (c.write.is_some())),
             Ordering::Release,
         );
         boot(b"[AUDIO] active audio backend ");
@@ -2234,26 +1967,7 @@ unsafe fn write_active_pcm_owned(
         if c.limits_present && !c.limits.accepts(rate, channels, format) {
             return Some(INVALID);
         }
-        let result = if c.write_legacy != 0 {
-            if r4os_zig_audio_legacy(
-                0,
-                c.write_legacy,
-                data.as_ptr(),
-                data.len(),
-                rate,
-                channels,
-                format,
-                0,
-                0,
-                0,
-                0,
-            ) != 0
-            {
-                0
-            } else {
-                -1
-            }
-        } else if let Some(write) = c.write {
+        let result = if let Some(write) = c.write {
             write(
                 c.context,
                 data.as_ptr(),
@@ -2291,10 +2005,7 @@ unsafe fn idle_active_pcm_owned() -> i32 {
         };
         let p = backend(slot);
         let c = (*p).config;
-        if c.stop_legacy != 0 {
-            r4os_zig_audio_legacy(1, c.stop_legacy, ptr::null(), 0, 0, 0, 0, 0, 0, 0, 0);
-            return 0;
-        }
+
         backend_contract::finish_pcm(EndMode::Idle, (*p).closing, c.context, c.stop, (*p).idle)
     }
 }
@@ -2305,10 +2016,7 @@ unsafe fn stop_active_pcm_owned() -> i32 {
         };
         let p = backend(slot);
         let c = (*p).config;
-        if c.stop_legacy != 0 {
-            r4os_zig_audio_legacy(1, c.stop_legacy, ptr::null(), 0, 0, 0, 0, 0, 0, 0, 0);
-            return 0;
-        }
+
         backend_contract::finish_pcm(EndMode::Stop, (*p).closing, c.context, c.stop, (*p).idle)
     }
 }
@@ -2317,7 +2025,7 @@ unsafe fn activate_first_backend() {
         for i in 0..MAX_AUDIO_BACKENDS {
             let p = backend(i);
             let c = (*p).config;
-            if !(*p).registered || (*p).closing || (c.write_legacy == 0 && c.write.is_none()) {
+            if !(*p).registered || (*p).closing || (c.write.is_none()) {
                 continue;
             }
             set_active_backend(i);
@@ -2395,7 +2103,7 @@ unsafe fn find_renderable_synth() -> Option<usize> {
 unsafe fn synth_can_render_midi(slot: usize) -> bool {
     unsafe {
         let c = (*synth(slot)).config;
-        c.flags & 1 != 0 && (c.send_legacy != 0 || c.send.is_some()) && c.render_pcm.is_some()
+        c.flags & 1 != 0 && (c.send.is_some()) && c.render_pcm.is_some()
     }
 }
 unsafe fn free_backend_slot() -> Option<usize> {
@@ -2788,295 +2496,7 @@ pub(crate) unsafe fn performance_summary() -> PerformanceSummary {
         out
     }
 }
-fn yes(value: bool) -> &'static [u8] {
-    if value { b"yes" } else { b"no" }
-}
-unsafe fn backend_name<'a>(p: *const AudioBackend) -> &'a [u8] {
-    unsafe { slice::from_raw_parts(ptr::addr_of!((*p).name).cast(), (*p).name_len) }
-}
-unsafe fn synth_name<'a>(p: *const SynthEngine) -> &'a [u8] {
-    unsafe { slice::from_raw_parts(ptr::addr_of!((*p).name).cast(), (*p).name_len) }
-}
-pub(crate) unsafe fn dump_status() {
-    unsafe {
-        let Some(_output) = OutputGuard::acquire(false) else {
-            return;
-        };
-        log(b"Audio:\r\n");
-        log(b"  Backend: ");
-        if let Some(slot) = g!(active_audio_slot) {
-            log(backend_name(backend(slot)));
-        } else {
-            log(b"none");
-        }
-        log(b"\r\n");
-        log(b"  Mixer: ");
-        if g!(mixer_backend).active {
-            let p = ptr::addr_of!(g!(mixer_backend));
-            log(slice::from_raw_parts(
-                ptr::addr_of!((*p).name).cast(),
-                (*p).name_len,
-            ));
-        } else {
-            log(b"none");
-        }
-        log(b"\r\n");
-        log(b"  Writes: total=");
-        log_dec(g!(total_stream_writes));
-        log(b" backend_ok=");
-        log_dec(g!(total_backend_ok));
-        log(b" backend_fail=");
-        log_dec(g!(total_backend_fail));
-        log(b"\r\n");
-        dump_audio_backends();
-        dump_synth_engines();
-        dump_sid_status();
-        dump_midi_status();
-        relock();
-        let _lock = StreamLock;
-        let mut open_count = 0;
-        for i in 0..MAX_STREAMS {
-            let p = stream(i);
-            if (*p).state != StreamState::Open {
-                continue;
-            }
-            open_count += 1;
-            log(b"  Stream ");
-            log_dec((*p).id as u64);
-            log(b": rate=");
-            log_dec((*p).rate as u64);
-            log(b" ch=");
-            log_dec((*p).channels as u64);
-            log(b" fmt=");
-            log_dec((*p).format as u64);
-            log(b" bytes=");
-            log_dec((*p).total_written);
-            log(b"\r\n");
-        }
-        if open_count == 0 {
-            log(b"  Streams: none open\r\n");
-        }
-    }
-}
-unsafe fn dump_sid_status() {
-    unsafe {
-        log(b"  SID: available=");
-        let engine = sid_engine();
-        log(yes(engine.is_some()));
-        log(b" external=");
-        log(yes(engine.is_some_and(|p| (*p).config.external)));
-        log(b" acquired=");
-        log(yes(g!(sid_acquired)));
-        log(b" model=");
-        let z = sid_model_name_z();
-        log(slice::from_raw_parts(z, 4));
-        log(b" writes=");
-        log_dec(g!(sid_write_count));
-        log(b" last_reg=");
-        log_dec(g!(sid_last_register) as u64);
-        log(b" last_val=");
-        log_dec(g!(sid_last_value) as u64);
-        log(b" last=");
-        signed(g!(sid_last_result));
-        log(b" pcm=");
-        log_dec(g!(sid_pcm_writes));
-        log(b" ok=");
-        log_dec(g!(sid_pcm_ok));
-        log(b" fail=");
-        log_dec(g!(sid_pcm_fail));
-        if let Some(p) = engine {
-            let c = (*p).config;
-            if let Some(status_fn) = c.status {
-                let mut status = SynthStatus::default();
-                if status_fn(c.context, &mut status) == 0 {
-                    log(b" r4d_renders=");
-                    log_dec(status.renders);
-                    log(b" r4d_stops=");
-                    log_dec(status.stops);
-                    log(b" r4d_last=");
-                    signed(status.last_result);
-                }
-            }
-        }
-        log(b"\r\n");
-    }
-}
-unsafe fn dump_midi_status() {
-    unsafe {
-        log(b"  MIDI: available=");
-        log(yes(
-            find_synth(b"MIDI").is_some() || find_synth(b"OPL3").is_some()
-        ));
-        log(b" acquired=");
-        log(yes(g!(midi_acquired)));
-        log(b" sends=");
-        log_dec(g!(midi_send_count));
-        log(b" last_ch=");
-        log_dec(g!(midi_last_channel) as u64);
-        log(b" last_status=");
-        log_dec(g!(midi_last_status) as u64);
-        log(b" data=");
-        log_dec(g!(midi_last_data1) as u64);
-        log(b"/");
-        log_dec(g!(midi_last_data2) as u64);
-        log(b" render_ticks=");
-        log_dec(g!(midi_render_ticks));
-        log(b" source=");
-        log(protocol_source(b"audio.midi").bytes());
-        log(b" r4p=");
-        log_dec(g!(midi_r4p_classify));
-        log(b"/");
-        log_dec(g!(midi_dispatch_failures));
-        log(b" required_missing=");
-        log_dec(g!(midi_missing_required));
-        log(b" event=");
-        log_dec(g!(midi_last_event) as u64);
-        log(b"\r\n");
-        log(b"  OPL3 engine: external=");
-        log(yes(find_synth(b"OPL3").is_some()));
-        log(b" source=");
-        log(protocol_source(b"audio.opl3").bytes());
-        log(b" r4p=");
-        log_dec(g!(opl3_r4p_register));
-        log(b"/");
-        log_dec(g!(opl3_r4p_midi));
-        log(b"/");
-        log_dec(g!(opl3_dispatch_failures));
-        log(b" required_missing=");
-        log_dec(g!(opl3_missing_required));
-        log(b" kind=");
-        log_dec(g!(opl3_last_write_kind) as u64);
-        log(b" action=");
-        log_dec(g!(opl3_last_action) as u64);
-        log(b"\r\n");
-    }
-}
-unsafe fn dump_audio_backends() {
-    unsafe {
-        log(b"  Backends:");
-        let mut count = 0;
-        for i in 0..MAX_AUDIO_BACKENDS {
-            let p = backend(i);
-            if !(*p).registered {
-                continue;
-            }
-            count += 1;
-            log(b" ");
-            if (*p).active {
-                log(b"*");
-            }
-            log(backend_name(p));
-            let c = (*p).config;
-            log(if c.write_legacy != 0 {
-                b"(native)"
-            } else if c.write.is_some() {
-                b"(r4d)"
-            } else {
-                b"(generic)"
-            });
-        }
-        if count == 0 {
-            log(b" none");
-        }
-        log(b"\r\n");
-        dump_audio_backend_statuses();
-    }
-}
-unsafe fn dump_audio_backend_statuses() {
-    unsafe {
-        for i in 0..MAX_AUDIO_BACKENDS {
-            let p = backend(i);
-            if !(*p).registered || (*p).closing {
-                continue;
-            }
-            let c = (*p).config;
-            let Some(status_fn) = c.status else { continue };
-            let mut status = BackendStatus {
-                active: u32::from((*p).active),
-                ..Default::default()
-            };
-            let result = status_fn(c.context, &mut status);
-            log(b"  Backend ");
-            log(backend_name(p));
-            log(b" status: ");
-            if result != 0 {
-                log(b"rc=");
-                signed(result);
-                log(b"\r\n");
-                continue;
-            }
-            log(b"active=");
-            log(yes(status.active != 0));
-            log(b" writes=");
-            log_dec(status.writes);
-            log(b" underruns=");
-            log_dec(status.underruns);
-            log(b" errors=");
-            log_dec(status.errors);
-            log(b" last=");
-            signed(status.last_result);
-            log(b"\r\n");
-        }
-    }
-}
-unsafe fn dump_synth_engines() {
-    unsafe {
-        log(b"  Synths:");
-        let mut count = 0;
-        for i in 0..MAX_SYNTH_ENGINES {
-            let p = synth(i);
-            if !(*p).registered {
-                continue;
-            }
-            count += 1;
-            log(b" ");
-            if g!(active_midi_synth_slot) == Some(i) {
-                log(b"*");
-            }
-            log(synth_name(p));
-            log(b"(");
-            let c = (*p).config;
-            if c.external {
-                log(b"r4d:");
-            }
-            if c.migration {
-                log(b"migration:");
-            }
-            if c.send_legacy != 0 || c.send.is_some() {
-                log(b"midi");
-            }
-            if c.render_legacy != 0 || c.render.is_some() {
-                log(b"+pcm");
-            }
-            if c.send_legacy == 0 && c.render_legacy == 0 && c.send.is_none() && c.render.is_none()
-            {
-                log(b"generic");
-            }
-            log(b")");
-        }
-        if count == 0 {
-            log(b" none");
-        }
-        log(b"\r\n");
-        dump_synth_counters();
-    }
-}
-unsafe fn dump_synth_counters() {
-    unsafe {
-        for i in 0..MAX_SYNTH_ENGINES {
-            let p = synth(i);
-            if !(*p).registered || ((*p).sends == 0 && (*p).renders == 0 && (*p).stops == 0) {
-                continue;
-            }
-            log(b"  Synth ");
-            log(synth_name(p));
-            log(b": sends=");
-            log_dec((*p).sends);
-            log(b" renders=");
-            log_dec((*p).renders);
-            log(b" stops=");
-            log_dec((*p).stops);
-            log(b"\r\n");
-        }
-    }
+
+unsafe fn audio_log(text: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
 }

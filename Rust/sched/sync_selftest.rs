@@ -49,12 +49,9 @@ fn exit() -> ! {
     scheduler::r4os_rust_scheduler_control(12, 0, 0);
     panic!("Task exit returned")
 }
-unsafe extern "C" {
-    fn r4os_zig_kernel_write(text: *const u8, len: usize);
-    fn r4os_zig_kernel_dec(value: u64);
-}
+
 fn puts(text: &[u8]) {
-    unsafe { r4os_zig_kernel_write(text.as_ptr(), text.len()) };
+    unsafe { kernel_write(text.as_ptr(), text.len()) };
 }
 fn fail(reason: &[u8]) -> bool {
     puts(b"SYNCCHECK FAIL reason=");
@@ -213,10 +210,14 @@ pub extern "C" fn r4os_rust_sync_selftest() -> bool {
             return fail(b"if-event-off");
         }
         puts(b"SYNCCHECK OK mutex_elapsed=");
-        r4os_zig_kernel_dec(elapsed);
+        crate::boot::log_route::dec(elapsed);
         puts(b" event_iters=");
-        r4os_zig_kernel_dec(u64::from(EVENT_ITERS));
+        crate::boot::log_route::dec(u64::from(EVENT_ITERS));
         puts(b" if_preserve=on/off\r\n");
         true
     }
+}
+
+unsafe fn kernel_write(text: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
 }

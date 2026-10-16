@@ -41,10 +41,7 @@ pub struct ResourceView {
     pub file_offset: usize,
     pub catalog: *const super::resources::Catalog,
 }
-unsafe extern "C" {
-    fn r4os_zig_mod_log(op: u8, value: u64, data: *const u8, len: usize);
-    fn r4os_zig_mod_platform(index: usize, out: *mut Platform) -> bool;
-}
+
 pub(crate) unsafe fn bytes<'a>(v: Bytes) -> &'a [u8] {
     if v.len == 0 {
         &[]
@@ -59,13 +56,13 @@ pub fn span(v: &[u8]) -> Bytes {
     }
 }
 pub fn log(text: &[u8]) {
-    unsafe { r4os_zig_mod_log(0, 0, text.as_ptr(), text.len()) };
+    unsafe { mod_log(0, 0, text.as_ptr(), text.len()) };
 }
 pub fn decimal(value: u64) {
-    unsafe { r4os_zig_mod_log(1, value, ptr::null(), 0) };
+    unsafe { mod_log(1, value, ptr::null(), 0) };
 }
 fn hex(value: u64) {
-    unsafe { r4os_zig_mod_log(2, value, ptr::null(), 0) };
+    unsafe { mod_log(2, value, ptr::null(), 0) };
 }
 pub fn counter(index: usize) -> u32 {
     COUNTERS[index].load(Ordering::Relaxed)
@@ -219,7 +216,7 @@ pub unsafe extern "C" fn r4os_rust_mod_platform_group(name: Bytes) -> u64 {
     let name = unsafe { bytes(name) };
     for i in 0..6 {
         let mut meta = core::mem::MaybeUninit::<Platform>::uninit();
-        if !unsafe { r4os_zig_mod_platform(i, meta.as_mut_ptr()) } {
+        if !unsafe { mod_platform(i, meta.as_mut_ptr()) } {
             return u64::MAX;
         }
         let meta = unsafe { meta.assume_init() };
@@ -241,7 +238,7 @@ pub unsafe extern "C" fn r4os_rust_mod_init(peers: &state::Peers) {
     LIBRARIES_ACTIVE.store(false, Ordering::Release);
     for i in 0..6 {
         let mut meta = core::mem::MaybeUninit::<Platform>::uninit();
-        if !unsafe { r4os_zig_mod_platform(i, meta.as_mut_ptr()) } {
+        if !unsafe { mod_platform(i, meta.as_mut_ptr()) } {
             return;
         }
         let meta = unsafe { meta.assume_init() };
@@ -529,3 +526,68 @@ const _: () = {
     assert!(offset_of!(ResourceView, file_offset) == 936);
     assert!(offset_of!(ResourceView, catalog) == 944);
 };
+
+unsafe fn mod_log(op: u8, value: u64, data: *const u8, len: usize) {
+    match op {
+        0 => unsafe { crate::boot::log_route::r4os_rust_log_write(0, data, len) },
+        1 => crate::boot::log_route::dec(value),
+        2 => crate::boot::log_route::hex(value, 16),
+        _ => unreachable!(),
+    }
+}
+
+use crate::{build_config::config as kernel_config, contract as platform_contract};
+const fn platform_queries() -> [platform_contract::R4LQuery; kernel_config::PLATFORM_API_COUNT] {
+    let mut out = [const {
+        platform_contract::R4LQuery {
+            magic: platform_contract::r4l_abi_magic,
+            abi_version: platform_contract::r4l_abi_version,
+            size: platform_contract::r4l_query_struct_size,
+            group: 0,
+            kernel_bridge: 0,
+            reserved: 0,
+        }
+    }; kernel_config::PLATFORM_API_COUNT];
+    let mut i = 0;
+    while i < out.len() {
+        out[i].group = kernel_config::PLATFORM_APIS[i].1;
+        i += 1;
+    }
+    out
+}
+static PLATFORM_QUERIES: [platform_contract::R4LQuery; kernel_config::PLATFORM_API_COUNT] =
+    platform_queries();
+
+unsafe fn mod_platform(index: usize, out: *mut Platform) -> bool {
+    let Some(&(name, group)) = kernel_config::PLATFORM_APIS.get(index) else {
+        return false;
+    };
+    unsafe {
+        out.write(Platform {
+            name: Bytes {
+                data: name.as_ptr(),
+                len: name.len(),
+            },
+            group,
+            query: core::ptr::addr_of!(PLATFORM_QUERIES[index]) as u64,
+        });
+    }
+    true
+}
+
+pub(crate) fn native_peers() -> state::Peers {
+    unsafe extern "C" fn free(data: *mut u8, size: usize) -> u8 {
+        u8::from(unsafe { crate::memory::heap::r4os_rust_heap_free(data, size) } != 0)
+    }
+    unsafe extern "C" fn log(data: *const u8, len: usize) {
+        crate::boot::log_route::puts(unsafe { core::slice::from_raw_parts(data, len) });
+    }
+    state::Peers {
+        scratch_size: super::registry_loader::r4os_rust_mod_scratch_layout(false),
+        scratch_align: super::registry_loader::r4os_rust_mod_scratch_layout(true),
+        alloc: crate::memory::heap::r4os_rust_heap_alloc,
+        free,
+        publication: r4os_rust_mod_publication,
+        log,
+    }
+}

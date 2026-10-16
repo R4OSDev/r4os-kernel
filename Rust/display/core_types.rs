@@ -1,5 +1,5 @@
 //! Private copied display values. Names are borrowed resident spans; only
-//! fixed C representations cross the temporary legacy owner facade.
+//! native value projections preserve their exact lifetime and layout.
 use super::{blit_backend, framebuffer::Framebuffer};
 use core::ptr;
 #[repr(C)]
@@ -173,70 +173,24 @@ impl Default for PresentCapabilities {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy)]
-pub struct LegacyBackend {
-    pub owner: usize,
-    pub adapter_id: u32,
-    pub target: Target,
-    pub context: usize,
-    pub commit: usize,
-    pub restore: usize,
-    pub begin_cpu: usize,
-    pub end_cpu: usize,
-}
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct LegacyHolder {
-    pub owner: usize,
-    pub adapter_id: u32,
-    pub expected_generation: u64,
-    pub context: usize,
-    pub capture: usize,
-    pub restore: usize,
-    pub restore_adopted: usize,
-    pub release: usize,
-    pub release_adopted: usize,
-}
-#[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct BootHoldResult {
     pub generation: u64,
     pub captured: bool,
     pub retained: bool,
 }
-// Native callbacks are typed Rust/C function pointers. The temporary legacy
-// variants invoke a typed Zig thunk with its unchanged Zig signature; no
-// function is called through a cast between incompatible calling conventions.
 #[derive(Clone, Copy)]
-pub enum Commit {
-    Native(unsafe extern "C" fn(usize, u64, *const BootSnapshot) -> u32),
-    Legacy(usize),
-}
+pub struct Commit(pub unsafe extern "C" fn(usize, u64, *const BootSnapshot) -> u32);
 #[derive(Clone, Copy)]
-pub enum Restore {
-    Native(unsafe extern "C" fn(usize, u64, *const BootSnapshot) -> bool),
-    Legacy(usize),
-}
+pub struct Restore(pub unsafe extern "C" fn(usize, u64, *const BootSnapshot) -> bool);
 #[derive(Clone, Copy)]
-pub enum BeginCpu {
-    Native(unsafe extern "C" fn(usize) -> bool),
-    Legacy(usize),
-}
+pub struct BeginCpu(pub unsafe extern "C" fn(usize) -> bool);
 #[derive(Clone, Copy)]
-pub enum EndCpu {
-    Native(unsafe extern "C" fn(usize, bool, *const Rect) -> u32),
-    Legacy(usize),
-}
+pub struct EndCpu(pub unsafe extern "C" fn(usize, bool, *const Rect) -> u32);
 #[derive(Clone, Copy)]
-pub enum Capture {
-    Native(unsafe extern "C" fn(usize, *const BootSnapshot) -> bool),
-    Legacy(usize),
-}
+pub struct Capture(pub unsafe extern "C" fn(usize, *const BootSnapshot) -> bool);
 #[derive(Clone, Copy)]
-pub enum Release {
-    Native(unsafe extern "C" fn(usize) -> bool),
-    Legacy(usize),
-}
+pub struct Release(pub unsafe extern "C" fn(usize) -> bool);
 #[derive(Clone, Copy)]
 pub struct Backend {
     pub owner: usize,
@@ -260,133 +214,46 @@ pub struct Holder {
     pub release: Release,
     pub release_adopted: Option<Release>,
 }
-impl From<LegacyBackend> for Backend {
-    fn from(value: LegacyBackend) -> Self {
-        Self {
-            owner: value.owner,
-            adapter_id: value.adapter_id,
-            target: value.target,
-            context: value.context,
-            commit: Commit::Legacy(value.commit),
-            restore: Restore::Legacy(value.restore),
-            begin_cpu: if value.begin_cpu == 0 {
-                None
-            } else {
-                Some(BeginCpu::Legacy(value.begin_cpu))
-            },
-            end_cpu: if value.end_cpu == 0 {
-                None
-            } else {
-                Some(EndCpu::Legacy(value.end_cpu))
-            },
-        }
-    }
-}
-impl From<LegacyHolder> for Holder {
-    fn from(value: LegacyHolder) -> Self {
-        Self {
-            owner: value.owner,
-            adapter_id: value.adapter_id,
-            expected_generation: value.expected_generation,
-            context: value.context,
-            capture: Capture::Legacy(value.capture),
-            restore: Restore::Legacy(value.restore),
-            restore_adopted: if value.restore_adopted == 0 {
-                None
-            } else {
-                Some(Restore::Legacy(value.restore_adopted))
-            },
-            release: Release::Legacy(value.release),
-            release_adopted: if value.release_adopted == 0 {
-                None
-            } else {
-                Some(Release::Legacy(value.release_adopted))
-            },
-        }
-    }
-}
-unsafe extern "C" {
-    fn r4os_zig_display_callback(
-        op: u32,
-        code: usize,
-        context: usize,
-        generation: u64,
-        saved: *const BootSnapshot,
-        changed: bool,
-        damage: *const Rect,
-    ) -> u32;
-}
 impl Commit {
     /// # Safety
     /// Exact callback, resident context and admitted snapshot/damage match their original retained lifetime.
     pub unsafe fn call(self, context: usize, generation: u64, saved: *const BootSnapshot) -> u32 {
-        match self {
-            Self::Native(f) => unsafe { f(context, generation, saved) },
-            Self::Legacy(code) => unsafe {
-                r4os_zig_display_callback(0, code, context, generation, saved, false, ptr::null())
-            },
-        }
+        unsafe { (self.0)(context, generation, saved) }
     }
 }
 impl Restore {
     /// # Safety
     /// Exact callback, resident context and admitted snapshot/damage match their original retained lifetime.
     pub unsafe fn call(self, context: usize, generation: u64, saved: *const BootSnapshot) -> bool {
-        match self {
-            Self::Native(f) => unsafe { f(context, generation, saved) },
-            Self::Legacy(code) => unsafe {
-                r4os_zig_display_callback(1, code, context, generation, saved, false, ptr::null())
-                    != 0
-            },
-        }
+        unsafe { (self.0)(context, generation, saved) }
     }
 }
 impl BeginCpu {
     /// # Safety
     /// Exact callback, resident context and admitted snapshot/damage match their original retained lifetime.
     pub unsafe fn call(self, context: usize) -> bool {
-        match self {
-            Self::Native(f) => unsafe { f(context) },
-            Self::Legacy(code) => unsafe {
-                r4os_zig_display_callback(2, code, context, 0, ptr::null(), false, ptr::null()) != 0
-            },
-        }
+        unsafe { (self.0)(context) }
     }
 }
 impl EndCpu {
     /// # Safety
     /// Exact callback, resident context and admitted snapshot/damage match their original retained lifetime.
     pub unsafe fn call(self, context: usize, changed: bool, damage: *const Rect) -> u32 {
-        match self {
-            Self::Native(f) => unsafe { f(context, changed, damage) },
-            Self::Legacy(code) => unsafe {
-                r4os_zig_display_callback(3, code, context, 0, ptr::null(), changed, damage)
-            },
-        }
+        unsafe { (self.0)(context, changed, damage) }
     }
 }
 impl Capture {
     /// # Safety
     /// Exact callback, resident context and admitted snapshot/damage match their original retained lifetime.
     pub unsafe fn call(self, context: usize, saved: *const BootSnapshot) -> bool {
-        match self {
-            Self::Native(f) => unsafe { f(context, saved) },
-            Self::Legacy(code) => unsafe {
-                r4os_zig_display_callback(4, code, context, 0, saved, false, ptr::null()) != 0
-            },
-        }
+        unsafe { (self.0)(context, saved) }
     }
 }
 impl Release {
     /// # Safety
     /// Exact callback, resident context and admitted snapshot/damage match their original retained lifetime.
     pub unsafe fn call(self, context: usize) -> bool {
-        match self {
-            Self::Native(f) => unsafe { f(context) },
-            Self::Legacy(code) => unsafe {
-                r4os_zig_display_callback(5, code, context, 0, ptr::null(), false, ptr::null()) != 0
-            },
-        }
+        unsafe { (self.0)(context) }
     }
 }
 const _: () = {

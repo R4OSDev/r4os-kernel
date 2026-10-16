@@ -115,9 +115,7 @@ static DETECTED: AtomicBool = AtomicBool::new(false);
 static OSXSAVE: AtomicBool = AtomicBool::new(false);
 static XCR0: AtomicU64 = AtomicU64::new(0);
 static MODULE_SIMD: AtomicBool = AtomicBool::new(false);
-unsafe extern "C" {
-    fn r4os_zig_cpu_log(status: *const Status, modules_simd: bool);
-}
+
 fn cpuid(leaf: u32, subleaf: u32) -> core::arch::x86_64::CpuidResult {
     core::arch::x86_64::__cpuid_count(leaf, subleaf)
 }
@@ -252,7 +250,7 @@ pub fn detect() -> Status {
     XCR0.store(value.xcr0, Ordering::Release);
     OSXSAVE.store(value.features.osxsave, Ordering::Release);
     DETECTED.store(true, Ordering::Release);
-    unsafe { r4os_zig_cpu_log(&value, MODULE_SIMD.load(Ordering::Acquire)) };
+    unsafe { cpu_log(&value, MODULE_SIMD.load(Ordering::Acquire)) };
     value
 }
 pub fn snapshot() -> Status {
@@ -318,3 +316,42 @@ const _: () = {
     assert!(core::mem::offset_of!(Status, features) == 152);
     assert!(core::mem::offset_of!(Status, vendor_len) == 16);
 };
+
+unsafe fn cpu_log(status: *const Status, modules_simd: bool) {
+    use crate::boot::log::{r4os_rust_bootlog_dec as dec, text as puts};
+    let s = unsafe { status.read() };
+
+    puts(b"[CPU] vendor=");
+    puts(&s.vendor[..s.vendor_len as usize]);
+    puts(b" family=");
+    dec(u64::from(s.display_family));
+    puts(b" model=");
+    dec(u64::from(s.display_model));
+    puts(b" stepping=");
+    dec(u64::from(s.stepping));
+    puts(b" apic=");
+    dec(u64::from(s.apic_id));
+    puts(b" features=");
+    puts(if s.features.long_mode {
+        b"lm"
+    } else {
+        b"no-lm"
+    });
+    puts(b",");
+    puts(if s.features.pat { b"pat" } else { b"no-pat" });
+    puts(b",");
+    puts(if s.features.mtrr { b"mtrr" } else { b"no-mtrr" });
+    puts(b",");
+    puts(if s.features.invariant_tsc {
+        b"invtsc"
+    } else {
+        b"tsc-variable"
+    });
+    puts(b",");
+    puts(if s.features.avx { b"avx" } else { b"no-avx" });
+    puts(b",");
+    puts(if s.features.avx2 { b"avx2" } else { b"no-avx2" });
+    puts(b" modules_simd=");
+    puts(if modules_simd { b"allowed" } else { b"blocked" });
+    puts(b"\r\n");
+}

@@ -10,16 +10,7 @@ use crate::{
 };
 use core::ptr;
 unsafe extern "C" {
-    fn r4os_zig_task_probe_work_submit(
-        lane: usize,
-        handler: unsafe extern "C" fn(usize) -> i32,
-        deadline: u64,
-        budget: u32,
-        key: u64,
-        deadline_lane: bool,
-        out: *mut u32,
-    ) -> i32;
-    fn r4os_zig_task_probe_work(operation: u8, handle: u32, timeout: u64, out: *mut i32) -> i32;
+
     fn r4os_rust_task_identity(
         op: u8,
         id: u32,
@@ -41,7 +32,7 @@ pub unsafe fn work_fpu() -> bool {
         let mut passed = true;
         for lane in 0..2 {
             let mut handle = 0;
-            let submitted = r4os_zig_task_probe_work_submit(
+            let submitted = task_probe_work_submit(
                 lane,
                 fpu::callback,
                 now().saturating_add(1000),
@@ -54,12 +45,12 @@ pub unsafe fn work_fpu() -> bool {
                 return fail(b"fpu-work-submit");
             }
             let mut result = -1;
-            if r4os_zig_task_probe_work(0, handle, 2000, &mut result) != 0 {
-                r4os_zig_task_probe_work(1, handle, 0, ptr::null_mut());
-                r4os_zig_task_probe_work(2, handle, 0, ptr::null_mut());
+            if task_probe_work(0, handle, 2000, &mut result) != 0 {
+                task_probe_work(1, handle, 0, ptr::null_mut());
+                task_probe_work(2, handle, 0, ptr::null_mut());
                 return fail(b"fpu-work-wait");
             }
-            if r4os_zig_task_probe_work(2, handle, 0, ptr::null_mut()) != 0 {
+            if task_probe_work(2, handle, 0, ptr::null_mut()) != 0 {
                 return fail(b"fpu-work-release");
             }
             puts(b"TASKREG08201 fpu-work lane=");
@@ -203,5 +194,46 @@ pub unsafe fn reserve_probe() -> bool {
             return false;
         }
         unpin(t) && release(v.id, v.generation)
+    }
+}
+
+unsafe fn task_probe_work(operation: u8, handle: u32, timeout: u64, out: *mut i32) -> i32 {
+    unsafe {
+        match operation {
+            0 => crate::driver::work::r4os_rust_driver_work_wait(handle, timeout, out),
+            1 => crate::driver::work::r4os_rust_driver_work_cancel(handle),
+            2 => crate::driver::work::r4os_rust_driver_work_release(handle),
+            _ => panic!("Invalid task probe work operation"),
+        }
+    }
+}
+
+unsafe fn task_probe_work_submit(
+    lane: usize,
+    handler: unsafe extern "C" fn(usize) -> i32,
+    deadline: u64,
+    budget: u32,
+    key: u64,
+    deadline_lane: bool,
+    out: *mut u32,
+) -> i32 {
+    unsafe {
+        if !deadline_lane {
+            return crate::driver::work::r4os_rust_driver_work_submit(
+                0, handler, lane, 0, false, out,
+            );
+        }
+        let r = crate::contract::DriverWorkRequest {
+            version: crate::contract::driver_work_request_version,
+            size: core::mem::size_of::<crate::contract::DriverWorkRequest>() as u32,
+            handler,
+            context: lane,
+            flags: 0,
+            work_class: crate::contract::driver_work_class_audio_refill,
+            serial_key: key,
+            deadline_tick: deadline,
+            budget_ticks: u64::from(budget),
+        };
+        crate::driver::work::r4os_rust_driver_work_request(0, &r, out)
     }
 }

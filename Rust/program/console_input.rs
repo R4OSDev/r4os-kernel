@@ -77,31 +77,25 @@ fn state() -> *mut State {
 pub extern "C" fn r4os_rust_program_console_input_state() -> *mut State {
     state()
 }
-unsafe extern "C" {
-    // Existing physical keyboard owner: read-only generation/pending, signal,
-    // UTF-32 read and its actual blocking wait. No console routing lives here.
-    fn r4os_zig_program_console_keyboard(op: u8) -> u64;
-    fn r4os_zig_program_console_keyboard_read(out: *mut u32) -> bool;
-    fn r4os_zig_program_console_keyboard_wait(last: u64, timeout: u64, out: *mut u64) -> u32;
-}
+
 macro_rules! add {
     ($field:ident,$value:expr) => {
         (*state()).$field = (*state()).$field.wrapping_add($value);
     };
 }
 unsafe fn keyboard_generation() -> u64 {
-    unsafe { r4os_zig_program_console_keyboard(0) }
+    unsafe { program_console_keyboard(0) }
 }
 unsafe fn keyboard_pending() -> bool {
-    unsafe { r4os_zig_program_console_keyboard(1) != 0 }
+    unsafe { program_console_keyboard(1) != 0 }
 }
 unsafe fn keyboard_signal() {
-    unsafe { r4os_zig_program_console_keyboard(2) };
+    unsafe { program_console_keyboard(2) };
 }
 unsafe fn keyboard_read() -> Option<u32> {
     unsafe {
         let mut out = MaybeUninit::uninit();
-        if r4os_zig_program_console_keyboard_read(out.as_mut_ptr()) {
+        if crate::input::keyboard::r4os_rust_input_keyboard_read(out.as_mut_ptr()) {
             Some(out.assume_init())
         } else {
             None
@@ -375,7 +369,7 @@ unsafe fn wait(last: u64, timeout: u64, out: *mut u64) -> i32 {
                     return contract::console_input_wait_timeout;
                 }
                 add!(wait_blocks, 1);
-                return wait_result(r4os_zig_program_console_keyboard_wait(last, timeout, out));
+                return wait_result(program_console_keyboard_wait(last, timeout, out));
             }
             if !lock(console) {
                 return contract::console_input_wait_error_failed;
@@ -430,7 +424,7 @@ unsafe fn wait(last: u64, timeout: u64, out: *mut u64) -> i32 {
             return contract::console_input_wait_timeout;
         }
         add!(wait_blocks, 1);
-        wait_result(r4os_zig_program_console_keyboard_wait(last, timeout, out))
+        wait_result(program_console_keyboard_wait(last, timeout, out))
     }
 }
 unsafe fn signal_payload(console: *mut t::Console) {
@@ -714,3 +708,23 @@ const _: () = {
     assert!(mem::size_of::<WaitContext>() == 24);
     assert!(mem::offset_of!(WaitContext, last) == 16);
 };
+
+unsafe fn program_console_keyboard(op: u8) -> u64 {
+    match op {
+        0 => crate::input::keyboard::generation(),
+        1 => u64::from(crate::input::keyboard::pending()),
+        2 => {
+            crate::input::keyboard::signal_activity();
+            0
+        }
+        _ => panic!("Invalid keyboard operation"),
+    }
+}
+
+unsafe fn program_console_keyboard_wait(last: u64, timeout: u64, out: *mut u64) -> u32 {
+    let (r, next) = crate::input::keyboard::wait(last, timeout);
+    unsafe {
+        out.write(next);
+    }
+    r as u32
+}

@@ -72,9 +72,7 @@ static SOURCE: AtomicU32 = AtomicU32::new(0);
 static GENERATION: AtomicU32 = AtomicU32::new(0);
 static PUBLISHED: AtomicU64 = AtomicU64::new(0);
 static FALLBACK: AtomicU32 = AtomicU32::new(0);
-unsafe extern "C" {
-    fn r4os_zig_clock_cpu(operation: u8, index: u32) -> u64;
-}
+
 #[derive(Clone, Copy, Default)]
 struct Correlation {
     hpet: u64,
@@ -448,7 +446,7 @@ fn fallback_to_hpet(failure: u32) {
     }
 }
 pub fn finalize_cpu(index: u32) -> bool {
-    if index as usize >= MAX_CPUS || unsafe { r4os_zig_clock_cpu(0, index) } == 0 {
+    if index as usize >= MAX_CPUS || unsafe { clock_cpu(0, index) } == 0 {
         return false;
     }
     let bit = 1 << index;
@@ -568,8 +566,7 @@ pub fn snapshot() -> Status {
             | (u32::from(TSC_INVARIANT.load(Ordering::Acquire)) << 1)
             | (u32::from(TSC_CALIBRATED.load(Ordering::Acquire)) << 2)
             | (u32::from(HPET_CONFIGURED.load(Ordering::Acquire)) << 3),
-        registered_cpu_mask: REGISTERED.load(Ordering::Acquire)
-            & unsafe { r4os_zig_clock_cpu(1, 0) },
+        registered_cpu_mask: REGISTERED.load(Ordering::Acquire) & unsafe { clock_cpu(1, 0) },
         max_cpu_skew_ns: MAX_SKEW.load(Ordering::Acquire),
         calibration_error_ppm: CALIBRATION_ERROR.load(Ordering::Acquire),
         fallback_reason: FALLBACK.load(Ordering::Acquire),
@@ -649,3 +646,26 @@ const _: () = {
     assert!(core::mem::size_of::<Status>() == 56);
     assert!(core::mem::offset_of!(Status, registered_cpu_mask) == 32);
 };
+
+unsafe fn clock_cpu(operation: u8, index: u32) -> u64 {
+    match operation {
+        0 => u64::from(crate::arch::percpu::state(index) == 3),
+        1 => crate::arch::percpu::r4os_rust_percpu_control(6, 0, 0, 0),
+        _ => panic!("Invalid clock CPU query"),
+    }
+}
+
+pub(crate) fn fallback_name(reason: u32) -> &'static [u8] {
+    match reason {
+        0 => b"none",
+        1 => b"no-tsc",
+        2 => b"non-invariant-without-reference",
+        3 => b"frequency-unavailable",
+        4 => b"calibration-unstable",
+        5 => b"frequency-mismatch",
+        6 => b"cpu-skew",
+        7 => b"tsc-discontinuity",
+        8 => b"hpet-unavailable",
+        _ => unreachable!(),
+    }
+}

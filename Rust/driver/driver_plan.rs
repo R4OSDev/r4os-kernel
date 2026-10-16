@@ -82,17 +82,7 @@ static STATE: Shared = Shared(UnsafeCell::new(State {
     count: 0,
     summary: Summary::EMPTY,
 }));
-unsafe extern "C" {
-    fn r4os_zig_driver_plan_config(
-        config: *const c_void,
-        operation: u8,
-        index: usize,
-        out: *mut Span,
-    ) -> u64;
-    fn r4os_zig_driver_plan_disabled(config: *const c_void, name: *const u8, len: usize) -> bool;
-    fn r4os_zig_driver_plan_load(name: *const u8, len: usize) -> u8;
-    fn r4os_zig_driver_plan_effect(operation: u8, name: *const u8, len: usize, value: u32);
-}
+
 fn change<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let flags = runtime::save_runtime();
     let result = unsafe { f(&mut *STATE.0.get()) };
@@ -103,7 +93,7 @@ fn snapshot() -> Summary {
     change(|s| s.summary)
 }
 unsafe fn input(config: *const c_void, operation: u8, index: usize) -> u64 {
-    unsafe { r4os_zig_driver_plan_config(config, operation, index, ptr::null_mut()) }
+    unsafe { driver_plan_config(config, operation, index, ptr::null_mut()) }
 }
 unsafe fn name<'a>(config: *const c_void, operation: u8, index: usize) -> &'a [u8] {
     let mut out = Span {
@@ -111,7 +101,7 @@ unsafe fn name<'a>(config: *const c_void, operation: u8, index: usize) -> &'a [u
         len: 0,
     };
     unsafe {
-        r4os_zig_driver_plan_config(config, operation, index, &mut out);
+        driver_plan_config(config, operation, index, &mut out);
         if out.len == 0 {
             &[]
         } else {
@@ -120,7 +110,7 @@ unsafe fn name<'a>(config: *const c_void, operation: u8, index: usize) -> &'a [u
     }
 }
 fn effect(operation: u8, name: &[u8], value: u32) {
-    unsafe { r4os_zig_driver_plan_effect(operation, name.as_ptr(), name.len(), value) };
+    unsafe { driver_plan_effect(operation, name.as_ptr(), name.len(), value) };
 }
 unsafe fn begin(config: *const c_void) {
     let count = unsafe { input(config, 0, 0) } as usize;
@@ -234,7 +224,7 @@ fn load(name: &[u8]) {
             }
         }
     }
-    let result = unsafe { r4os_zig_driver_plan_load(name.as_ptr(), name.len()) };
+    let result = unsafe { driver_plan_load(name.as_ptr(), name.len()) };
     record(result);
     let audio_result = match result {
         0 => 0,
@@ -291,7 +281,7 @@ pub unsafe extern "C" fn r4os_rust_driver_plan_control(operation: u8, config: *c
             }
             2 => {
                 ensure(config);
-                if r4os_zig_driver_plan_disabled(config, b"PS2".as_ptr(), 3) {
+                if driver_plan_disabled(config, b"PS2".as_ptr(), 3) {
                     effect(12, b"", 0);
                     let slot = registry::r4os_rust_driver_registry_find(b"PS2".as_ptr(), 3);
                     if slot != usize::MAX {
@@ -305,7 +295,7 @@ pub unsafe extern "C" fn r4os_rust_driver_plan_control(operation: u8, config: *c
                         });
                     }
                 }
-                if r4os_zig_driver_plan_disabled(config, b"ATAPIO".as_ptr(), 6) {
+                if driver_plan_disabled(config, b"ATAPIO".as_ptr(), 6) {
                     effect(15, b"", 0);
                     change(|s| {
                         s.summary.atapio_disable_ignored = true;
@@ -324,4 +314,119 @@ pub unsafe extern "C" fn r4os_rust_driver_plan_control(operation: u8, config: *c
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_plan_summary(out: *mut Summary) {
     unsafe { out.write(snapshot()) };
+}
+
+unsafe fn driver_plan_config(
+    config: *const c_void,
+    operation: u8,
+    index: usize,
+    out: *mut Span,
+) -> u64 {
+    unsafe {
+        let c = config.cast::<crate::boot::config::Config>();
+        match operation {
+            0 => (*c).driver_count as u64,
+            1 => (*c).disabled_count as u64,
+            2 => u64::from((*c).auto_acpi),
+            3 => u64::from((*c).auto_pci),
+            4 | 5 => {
+                let v = if operation == 4 {
+                    crate::boot::config::driver_name(index)
+                } else {
+                    crate::boot::config::disabled_name(index)
+                };
+                out.write(Span {
+                    pointer: v.data,
+                    len: v.len,
+                });
+                0
+            }
+            _ => panic!("Invalid driver plan input"),
+        }
+    }
+}
+
+unsafe fn driver_plan_disabled(config: *const c_void, name: *const u8, len: usize) -> bool {
+    unsafe {
+        crate::boot::config::is_disabled(config.cast(), core::slice::from_raw_parts(name, len))
+    }
+}
+
+unsafe fn driver_plan_load(name: *const u8, len: usize) -> u8 {
+    unsafe {
+        crate::loader::r4d::r4os_rust_r4d_load(crate::fs::vfs_types::Bytes { data: name, len })
+    }
+}
+
+unsafe fn driver_plan_effect(operation: u8, name: *const u8, len: usize, value: u32) {
+    use crate::boot::log as l;
+    let name = unsafe { core::slice::from_raw_parts(name, len) };
+    match operation {
+        0 => l::text(b"[PLAN] build\r\n"),
+        1 => l::text(b"[PLAN] AUTO=ACPI enabled\r\n"),
+        2 => l::text(b"[PLAN] AUTO=PCI enabled\r\n"),
+        3..=5 => {
+            l::text(if operation == 3 {
+                b"[PLAN][WARN] skip "
+            } else {
+                b"[PLAN] skip "
+            });
+            l::text(name);
+            l::text(match operation {
+                3 => b" plan capacity reached\r\n",
+                4 => b" disabled by CONFIG.R4S\r\n",
+                5 => b" already planned\r\n",
+                _ => unreachable!(),
+            });
+        }
+        6 => {
+            l::text(b"[PLAN] drivers selected=");
+            l::r4os_rust_bootlog_dec(u64::from(value));
+            l::text(b"\r\n");
+        }
+        7 => {
+            unsafe {
+                crate::display::bootscreen::driver(name.as_ptr(), name.len());
+            }
+            l::text(b"[PLAN] load ");
+            l::text(name);
+            l::text(b"\r\n");
+        }
+        8 => {
+            l::text(b"[PLAN] ");
+            l::text(name);
+            l::text(b" already ");
+            l::text(registry::source_name((value & 255).try_into().unwrap()));
+            l::text(b"/");
+            l::text(registry::state_name((value >> 8).try_into().unwrap()));
+            l::text(b"\r\n");
+        }
+        9 => {
+            if matches!(value, 2 | 3 | 4 | 6) {
+                unsafe {
+                    crate::display::bootscreen::driver_error(name.as_ptr(), name.len());
+                }
+            }
+            l::text(b"[PLAN][WARN] load failed ");
+            l::text(name);
+            l::text(b" result=");
+            let r = crate::loader::r4d::r4os_rust_r4d_result_name(value.try_into().unwrap());
+            unsafe {
+                l::text(core::slice::from_raw_parts(r.data, r.len));
+            }
+            l::text(b"\r\n");
+        }
+        10 => unsafe { crate::audio::boot::report_ac97(value) },
+        11 => unsafe { crate::audio::boot::report_hda(value) },
+        12 => l::text(b"[PLAN] disable PS2 core input\r\n"),
+        13 => {
+            registry::set_state_logged(value as usize, 4);
+            crate::input::keyboard::disable();
+            crate::input::mouse::disable();
+            registry::set_state_logged(value as usize, 5);
+        }
+        14 => l::text(b"[PLAN][WARN] PS2 registry entry missing\r\n"),
+        15 => l::text(b"[PLAN][WARN] DISABLE=ATAPIO ignored after boot-storage init\r\n"),
+        _ => panic!("Invalid driver plan event"),
+    }
 }

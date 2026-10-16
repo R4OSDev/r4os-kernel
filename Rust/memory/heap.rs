@@ -5,7 +5,7 @@ use super::{
     owner::{self, Token},
     phys,
 };
-#[cfg(all(not(test), not(r4os_owner_fixture)))]
+#[cfg(not(test))]
 use core::alloc::{GlobalAlloc, Layout};
 use core::{
     cell::UnsafeCell,
@@ -522,16 +522,6 @@ fn control<T>(operation: impl FnOnce(&mut Control) -> T) -> T {
     operation(unsafe { &mut *CONTROL.0.get() })
 }
 
-unsafe extern "C" {
-    fn r4os_zig_heap_can_wait() -> bool;
-    fn r4os_zig_heap_wait_growth() -> bool;
-    fn r4os_zig_heap_wake_growth();
-    fn r4os_zig_heap_reserve(base: u64, bytes: u64) -> u32;
-    fn r4os_zig_heap_commit(id: u32, offset: u64, bytes: u64) -> bool;
-    fn r4os_zig_heap_uncommit(id: u32, offset: u64, bytes: u64) -> bool;
-    fn r4os_zig_heap_fault(kind: u8, offset: u64);
-    fn r4os_zig_owner_runtime_depth() -> u32;
-}
 struct HeapGuard {
     token: Token,
     unwind: Unwind,
@@ -561,7 +551,7 @@ impl HeapGuard {
         if reentry {
             if report {
                 unsafe {
-                    r4os_zig_heap_fault(0, 0);
+                    heap_fault(0, 0);
                 }
             }
             lock.release(token);
@@ -577,10 +567,10 @@ impl HeapGuard {
         })
     }
     fn can_drop(&self) -> bool {
-        self.token.previous_rank == 0 && unsafe { r4os_zig_owner_runtime_depth() } == 0
+        self.token.previous_rank == 0 && unsafe { owner_runtime_depth() } == 0
     }
     fn can_wait(&self) -> bool {
-        self.can_drop() && self.token.flags & (1 << 9) != 0 && unsafe { r4os_zig_heap_can_wait() }
+        self.can_drop() && self.token.flags & (1 << 9) != 0 && unsafe { heap_can_wait() }
     }
     fn suspend(&self) {
         control(|control| control.in_heap = false);
@@ -598,7 +588,7 @@ impl Drop for HeapGuard {
         if self.wake_growth {
             owner::named(4).release(self.token);
             unsafe {
-                r4os_zig_heap_wake_growth();
+                heap_wake_growth();
             }
             // Kill admission stays closed until every sleeper can observe the
             // actual completion. Reacquire before releasing the exact token.
@@ -626,7 +616,7 @@ fn flush_diagnostics() {
     });
     if kind != 0 {
         unsafe {
-            r4os_zig_heap_fault(kind, offset as u64);
+            heap_fault(kind, offset as u64);
         }
     }
 }
@@ -652,7 +642,7 @@ fn finish_tail() -> bool {
     if bytes == 0 {
         return true;
     }
-    if !unsafe { r4os_zig_heap_uncommit(id, start as u64, bytes as u64) } {
+    if !unsafe { heap_uncommit(id, start as u64, bytes as u64) } {
         control(|control| control.uncommit_failures = control.uncommit_failures.wrapping_add(1));
         return false;
     }
@@ -693,7 +683,7 @@ fn commit_pages(start: usize, pages: usize, guard: &mut HeapGuard) -> bool {
     if drop_owner {
         guard.suspend();
     }
-    let committed = unsafe { r4os_zig_heap_commit(id, start as u64, (pages * PAGE) as u64) };
+    let committed = unsafe { heap_commit(id, start as u64, (pages * PAGE) as u64) };
     if drop_owner {
         guard.resume();
     }
@@ -715,7 +705,7 @@ fn grow(min_extra: usize, guard: &mut HeapGuard) -> bool {
             return false;
         }
         guard.suspend();
-        let result = unsafe { r4os_zig_heap_wait_growth() };
+        let result = unsafe { heap_wait_growth() };
         guard.resume();
         return result;
     }
@@ -801,7 +791,7 @@ pub extern "C" fn r4os_rust_heap_init() -> bool {
         control.corruption_reported = reported;
         control.corruption_count = count;
     });
-    let id = unsafe { r4os_zig_heap_reserve(BASE, WINDOW as u64) };
+    let id = unsafe { heap_reserve(BASE, WINDOW as u64) };
     control(|control| control.range_id = id);
     if id == 0 {
         return false;
@@ -1118,13 +1108,13 @@ pub extern "C" fn r4os_rust_heap_boot_invariant() -> bool {
             && control.bins[bin(control.heap_top)] == 0
     })
 }
-#[cfg(all(not(test), not(r4os_owner_fixture)))]
+#[cfg(not(test))]
 struct KernelAllocator;
 // Host owner fixtures never install a kernel allocator into the host runtime.
-#[cfg(all(not(test), not(r4os_owner_fixture)))]
+#[cfg(not(test))]
 #[global_allocator]
 static ALLOCATOR: KernelAllocator = KernelAllocator;
-#[cfg(all(not(test), not(r4os_owner_fixture)))]
+#[cfg(not(test))]
 unsafe impl GlobalAlloc for KernelAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         r4os_rust_heap_alloc(layout.size(), layout.align())
@@ -1139,11 +1129,11 @@ unsafe impl GlobalAlloc for KernelAllocator {
 // rustc's allocation dispatch rather than the C facade used by Zig callers.
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_heap_allocator_probe() -> bool {
-    #[cfg(any(test, r4os_owner_fixture))]
+    #[cfg(test)]
     {
         false
     }
-    #[cfg(all(not(test), not(r4os_owner_fixture)))]
+    #[cfg(not(test))]
     {
         if !INITIALIZED.load(Ordering::Acquire) {
             return false;
@@ -1193,3 +1183,109 @@ const _: () = {
     assert!(core::mem::size_of::<Metadata>() == 16);
     assert!(core::mem::size_of::<Unwind>() == 16);
 };
+
+unsafe fn owner_runtime_depth() -> u32 {
+    unsafe { crate::arch::percpu::r4os_rust_percpu_depth().read() }
+}
+
+unsafe fn heap_can_wait() -> bool {
+    let current = crate::sched::scheduler::current();
+    if current.is_null() {
+        return false;
+    }
+    let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+    let core = unsafe { crate::sched::task::scheduler_view(current) };
+    core.preempt_depth == 0 && core.held_locks == 0
+}
+
+unsafe fn heap_commit(id: u32, offset: u64, bytes: u64) -> bool {
+    crate::memory::vm_transactions::r4os_rust_vm_commit(id, offset, bytes) == 0
+}
+
+unsafe fn heap_uncommit(id: u32, offset: u64, bytes: u64) -> bool {
+    crate::memory::vm_transactions::r4os_rust_vm_uncommit(id, offset, bytes) == 0
+}
+
+unsafe fn heap_reserve(base: u64, bytes: u64) -> u32 {
+    if base != BASE {
+        return 0;
+    }
+    let request = super::vm_ranges::Reserve {
+        eviction_allowed: true,
+        window: 1,
+        kind: 2,
+        owner: 0,
+        owner_id: 0,
+        name_ptr: b"kernel-heap".as_ptr(),
+        name_len: 11,
+        flags: 2,
+        base,
+        len: bytes,
+    };
+    let mut id = 0;
+    if unsafe { super::vm_pager_api::r4os_rust_vm_reserve_fixed(&request, &mut id) } == 0 {
+        id
+    } else {
+        0
+    }
+}
+
+unsafe fn heap_fault(kind: u8, offset: u64) {
+    use crate::boot::log_route as log;
+    if kind == 0 {
+        log::puts(b"HEAP REENTRY detected (non-preempt invariant violated)\r\n");
+        return;
+    }
+    log::puts(b"HEAP CORRUPT kind=");
+    log::puts(match kind {
+        1 => b"unlink-header",
+        2 => b"unlink-next",
+        3 => b"unlink-prev",
+        _ => b"unknown",
+    });
+    log::puts(b" off=0x");
+    log::hex(offset, 12);
+    log::puts(b"\r\n");
+}
+
+unsafe fn heap_wait_growth() -> bool {
+    use crate::sched::{
+        sync_types::{Text, WaitRequest},
+        sync_wait,
+    };
+    let request = WaitRequest {
+        timeout: u64::MAX,
+        reason: Text::literal(b"heap-growth"),
+        predicate: Some(growth_active),
+        context: core::ptr::addr_of!(GROWTH_CONTEXT).cast_mut().cast(),
+        release: None,
+        release_context: core::ptr::null_mut(),
+        flags: 0,
+        consume_runtime: false,
+    };
+    (unsafe { sync_wait::r4os_rust_sync_wait(GROWTH_WAITERS.0.get(), &request) })
+        == crate::sched::task::task_types::WaitResult::Signaled as u32
+}
+
+unsafe fn heap_wake_growth() {
+    let _ = unsafe {
+        crate::sched::sync_wait::r4os_rust_sync_queue(
+            GROWTH_WAITERS.0.get(),
+            1,
+            core::ptr::null_mut(),
+            0,
+            core::ptr::null_mut(),
+        )
+    };
+}
+
+struct GrowthWaiters(UnsafeCell<crate::sched::sync_types::WaitQueue>);
+// SAFETY: existing runtime admission owns enrollment/wakes; no queue reference
+// crosses a wait or is shared with a second queue implementation.
+unsafe impl Sync for GrowthWaiters {}
+static GROWTH_WAITERS: GrowthWaiters =
+    GrowthWaiters(UnsafeCell::new(crate::sched::sync_types::WaitQueue::EMPTY));
+static GROWTH_CONTEXT: u8 = 0;
+unsafe extern "C" fn growth_active(_: *mut core::ffi::c_void) -> bool {
+    r4os_rust_heap_growing()
+}

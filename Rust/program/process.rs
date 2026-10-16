@@ -16,11 +16,7 @@ struct ConsoleLink {
     parent: Handle,
     hosted: bool,
 }
-unsafe extern "C" {
-    fn r4os_zig_program_process_console_link(instance: *const ProgramInstance) -> ConsoleLink;
-    fn r4os_zig_program_process_input(handle: Handle);
-    fn r4os_zig_program_process_desktop_signal();
-}
+
 fn signal() {
     unsafe { sync_objects::r4os_rust_sync_event((*state()).event, 0, 0) };
 }
@@ -64,7 +60,7 @@ unsafe fn descends(slot: *const ProgramRegistrySlot, host: Handle) -> bool {
         if (*slot).instance.console_payload.is_null() {
             return false;
         }
-        let mut parent = r4os_zig_program_process_console_link(&(*slot).instance).parent;
+        let mut parent = program_process_console_link(&(*slot).instance).parent;
         while registry::valid(parent) {
             if registry::equal(parent, host) {
                 return true;
@@ -80,7 +76,7 @@ unsafe fn descends(slot: *const ProgramRegistrySlot, host: Handle) -> bool {
                 return false;
             }
             current = parent;
-            parent = r4os_zig_program_process_console_link(&(*p).instance).parent;
+            parent = program_process_console_link(&(*p).instance).parent;
         }
         false
     }
@@ -137,7 +133,7 @@ unsafe fn close_clients() {
                         continue;
                     }
                     let parent = registry::lookup_handle(
-                        r4os_zig_program_process_console_link(&(*slot).instance).parent,
+                        program_process_console_link(&(*slot).instance).parent,
                         false,
                     );
                     if parent.is_null()
@@ -161,14 +157,14 @@ unsafe fn close_clients() {
         let Some(h) = changed else {
             return;
         };
-        unsafe { r4os_zig_program_process_input(h) };
+        unsafe { program_process_input(h) };
     }
 }
 unsafe fn hosted(instance: *const ProgramInstance) -> bool {
     unsafe {
         (*instance).role == 2
             && (*instance).app_class == 0
-            && r4os_zig_program_process_console_link(instance).hosted
+            && program_process_console_link(instance).hosted
     }
 }
 /// # Safety
@@ -371,8 +367,8 @@ pub unsafe extern "C" fn r4os_rust_program_process_close(input: *const Handle) -
             registry::epoch();
         }
         registry::unlock();
-        r4os_zig_program_process_input(h);
-        r4os_zig_program_process_desktop_signal();
+        program_process_input(h);
+        crate::service::desktop_events::r4os_rust_desktop_signal();
         close_clients();
     }
     0
@@ -520,3 +516,23 @@ const _: () = {
     assert!(core::mem::size_of::<ConsoleLink>() == 24);
     assert!(core::mem::offset_of!(ConsoleLink, hosted) == 16);
 };
+
+unsafe fn program_process_input(handle: Handle) {
+    crate::program::console_input::r4os_rust_program_console_input_signal_handle(handle);
+}
+
+unsafe fn program_process_console_link(instance: *const ProgramInstance) -> ConsoleLink {
+    unsafe {
+        let c = (*instance)
+            .console_payload
+            .cast::<crate::program::payload_types::Console>();
+        ConsoleLink {
+            parent: Handle {
+                instance_id: (*c).io_target_id,
+                reserved: 0,
+                generation: (*c).io_target_generation,
+            },
+            hosted: (*c).host != 0,
+        }
+    }
+}

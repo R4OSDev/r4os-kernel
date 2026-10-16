@@ -84,11 +84,9 @@ struct Storage(UnsafeCell<Status>);
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new(Status::EMPTY));
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
-unsafe extern "C" {
-    fn r4os_zig_irq_boot_step(operation: u8) -> bool;
-}
+
 fn step(operation: u8) -> bool {
-    unsafe { r4os_zig_irq_boot_step(operation) }
+    unsafe { irq_boot_step(operation) }
 }
 pub fn initialized() -> bool {
     INITIALIZED.load(Ordering::Acquire)
@@ -422,3 +420,22 @@ const _: () = {
     assert!(core::mem::offset_of!(Status, timer_handoff) == 352);
     assert!(core::mem::offset_of!(Status, final_irq_status) == 392);
 };
+
+unsafe fn irq_boot_step(operation: u8) -> bool {
+    use crate::boot::{fatal, log_route};
+    match operation {
+        0 => {
+            let message = b"Platform IRQ boot before platform state";
+            unsafe { fatal::r4os_rust_fatal_record(11, message.as_ptr(), message.len()) };
+            return false;
+        }
+        1 => log_route::puts(b"  Platform IRQ [IOAPIC]\r\n"),
+        2 => log_route::puts(b"  IOAPIC legacy routing [PIC fallback]\r\n"),
+        3 => log_route::puts(b"  Timer [HPET]\r\n"),
+        4 => log_route::puts(b"  Timer [LAPIC]\r\n"),
+        5 => log_route::puts(b"  Modern timer [PIT fallback]\r\n"),
+        6 => super::time::log_status(),
+        _ => return false,
+    }
+    true
+}

@@ -3,7 +3,7 @@
 use super::{blocks, heap, map, paging, phys, root};
 use crate::{
     boot::{fatal, foundation, info},
-    build_bridge::config,
+    build_config::config,
 };
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 const CORE: u32 = 1;
@@ -11,6 +11,9 @@ const SUMMARY: u32 = 2;
 const DEVICES: u32 = 4;
 const SWITCHED: u32 = 8;
 static FLAGS: AtomicU32 = AtomicU32::new(0);
+pub(crate) fn core_ready() -> bool {
+    FLAGS.load(Ordering::Acquire) & CORE != 0
+}
 static USABLE: AtomicU64 = AtomicU64::new(0);
 static LARGEST_BASE: AtomicU64 = AtomicU64::new(0);
 static LARGEST_LEN: AtomicU64 = AtomicU64::new(0);
@@ -21,12 +24,9 @@ pub struct Snapshot {
     pub largest_base: u64,
     pub largest_len: u64,
 }
-unsafe extern "C" {
-    // Fixed cuts to the still active display/VM/SMP/diagnostic owners.
-    fn r4os_zig_memory_step(operation: u8, argument: u64) -> bool;
-}
+
 fn step(operation: u8, argument: u64) -> bool {
-    unsafe { r4os_zig_memory_step(operation, argument) }
+    unsafe { memory_step(operation, argument) }
 }
 fn phase(name: &[u8], result: &[u8]) {
     foundation::puts(b"MemoryBoot: ");
@@ -188,3 +188,29 @@ pub unsafe extern "C" fn r4os_rust_memory_snapshot(output: *mut Snapshot) {
     }
 }
 const _: () = assert!(core::mem::size_of::<Snapshot>() == 32);
+
+unsafe fn memory_step(operation: u8, argument: u64) -> bool {
+    use super::{boot_diagnostics as d, vm_pager_api as vm};
+    match operation {
+        0 => d::memory_map(),
+        1 => d::blocks_summary(),
+        2 => {
+            crate::arch::smp::r4os_rust_smp_control(1, 0);
+        }
+        3 => d::physical(),
+        4 => d::paging(),
+        5 => d::root(),
+        6 => return unsafe { vm::r4os_rust_vm_pager_init() },
+        7 => vm::r4os_rust_vm_dump_stats(),
+        8 => return crate::display::manager::enable_framebuffer_write_combining(),
+        9 => d::heap(),
+        10 => return super::heap_probes::self_test(),
+        11 => return vm::r4os_rust_vm_metadata_invariant(),
+        12 => return crate::display::boot_display::prepare_pixel_backing(argument),
+        13 => crate::boot::log_route::puts(b"  Memory [OK]\r\n"),
+        14 => d::devices(),
+        15 => d::cr3(),
+        _ => return false,
+    }
+    true
+}

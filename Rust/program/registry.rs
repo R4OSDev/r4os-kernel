@@ -23,7 +23,7 @@ const CONSUMED: u8 = 3;
 const IDLE: u8 = 0;
 const COMPLETED: u8 = 1;
 const DEFERRED: u8 = 2;
-unsafe extern "C" {}
+
 pub fn visible(v: u8) -> bool {
     matches!(v, PUBLISH | RUN | EXIT | DONE)
 }

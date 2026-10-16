@@ -628,14 +628,7 @@ pub fn restore_boot_backend(owner: usize, generation: u64) -> Result<(), Error> 
     restore_boot_locked(owner, generation)
 }
 fn mode_pending() -> bool {
-    #[cfg(r4os_owner_fixture)]
-    {
-        false
-    }
-    #[cfg(not(r4os_owner_fixture))]
-    {
-        super::native_driver::mode_pending()
-    }
+    super::native_driver::mode_pending()
 }
 pub fn begin_device_reset(owner: usize, generation: u64, adapter: u32) -> Result<u64, Error> {
     let _execution = execution()?;
@@ -1150,7 +1143,7 @@ fn publish_stats_with_mapping(boot_mapping: Option<Mapping>) {
         };
         unsafe { copy_name(&mut (*p).completed_output_name, output_name.bytes()) };
     }
-    #[cfg(not(r4os_owner_fixture))]
+
     super::outputs::boot_active(value.registered && value.kind == BOOTFB);
 }
 fn publish_geometry_locked(value: Stats) {
@@ -2075,8 +2068,8 @@ pub fn probe_rejected_takeover() -> bool {
             mapping,
         },
         context: 0,
-        commit: Commit::Native(rejected_commit),
-        restore: Restore::Native(rejected_restore),
+        commit: Commit(rejected_commit),
+        restore: Restore(rejected_restore),
         begin_cpu: None,
         end_cpu: None,
     };
@@ -2200,10 +2193,6 @@ pub unsafe extern "C" fn r4os_rust_display_core(
         2 => store!(bool, begin_system_transition(args.value)),
         3 => store!(bool, system_transition_quiesced()),
         4 => store!(BackendView, backend_view()),
-        5 => hold_boot(Holder::from(unsafe {
-            args.input.cast::<LegacyHolder>().read()
-        }))
-        .map(|v| unsafe { out.cast::<BootHoldResult>().write(v) }),
         6 => finish_boot(args.owner, args.generation, args.operation)
             .map(|v| unsafe { out.cast::<bool>().write(v) }),
         7 => store!(Optional<BootSnapshot>, optional(boot_snapshot())),
@@ -2214,21 +2203,6 @@ pub unsafe extern "C" fn r4os_rust_display_core(
             reject_native_backend();
             Ok(())
         }
-        12 => prepare_native(Backend::from(unsafe {
-            args.input.cast::<LegacyBackend>().read()
-        }))
-        .map(|v| unsafe { out.cast::<u64>().write(v) }),
-        13 => prepare_held_native(
-            Backend::from(unsafe { args.input.cast::<LegacyBackend>().read() }),
-            args.generation,
-        )
-        .map(|v| unsafe { out.cast::<u64>().write(v) }),
-        14 => prepare_recovered_native(
-            Backend::from(unsafe { args.input.cast::<LegacyBackend>().read() }),
-            args.generation,
-            args.other_generation,
-        )
-        .map(|v| unsafe { out.cast::<u64>().write(v) }),
         15 => abort_native(args.owner, args.generation),
         16 => commit_native(args.owner, args.generation)
             .map(|v| unsafe { out.cast::<u32>().write(v) }),
@@ -2466,68 +2440,4 @@ unsafe fn bootfb_present_xrgb32_rect(
         true,
     );
     true
-}
-#[cfg(r4os_owner_fixture)]
-#[repr(C)]
-pub struct HeldView {
-    pub has: bool,
-    pub generation: u64,
-    pub captured: bool,
-    pub effects: bool,
-}
-/// # Safety
-/// Existing serial original fixtures hold exclusive test ownership of the
-/// actual native manager. Only fixed private projections cross this boundary;
-/// no second transition/device state is constructed in the host facade.
-#[cfg(r4os_owner_fixture)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_display_fixture(
-    op: u32,
-    value: u64,
-    input: *const core::ffi::c_void,
-    out: *mut core::ffi::c_void,
-) {
-    let p = context();
-    unsafe {
-        match op {
-            0 => out.cast::<backend::Manager>().write((*p).manager),
-            1 => (*p).manager = input.cast::<backend::Manager>().read(),
-            2 => (*p).manager.serial = value,
-            3 => (*p).system_transition = value != 0,
-            4 => {
-                (*p).primary = if value == 0 {
-                    ptr::null_mut()
-                } else {
-                    ptr::addr_of_mut!((*p).boot)
-                }
-            }
-            5 => (*p).boot = Device::empty(true),
-            6 => (*p).native = Device::empty(false),
-            7 => (*p).native_backend = None,
-            8 => (*p).native_hold_generation = value,
-            9 => (*p).native_reset_generation = value,
-            10 => (*p).native_restore_confirmed = value != 0,
-            11 => (*p).held_boot = None,
-            12 => (*p).completed_backend = EMPTY_BACKEND,
-            13 => (*p).completed_stats = Stats::default(),
-            14 => (*p).present_generation = value,
-            15 => (*p).completed_fence = value,
-            16 => (*p).saved_boot = None,
-            17 => {
-                let v = (*p).held_boot;
-                out.cast::<HeldView>().write(HeldView {
-                    has: v.is_some(),
-                    generation: v.map_or(0, |h| h.generation),
-                    captured: v.is_some_and(|h| h.captured),
-                    effects: v.is_some_and(|h| h.effects),
-                });
-            }
-            18 => out.cast::<bool>().write((*p).native_backend.is_some()),
-            19 => out.cast::<u64>().write((*p).retired_reset_generation),
-            20 => out.cast::<u64>().write((*p).native_hold_generation),
-            21 => out.cast::<bool>().write((*p).system_transition),
-            24 => publish_stats(),
-            _ => panic!("private original display fixture projection"),
-        }
-    }
 }

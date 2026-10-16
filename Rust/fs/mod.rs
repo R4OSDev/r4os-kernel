@@ -1,5 +1,5 @@
-//! Kernel filesystem owners. Private C facades retain existing consumers
-//! while each original policy/state owner moves here exactly once.
+//! Native filesystem policy and state owners. Copied request values bind
+//! the sole mount, cache, FAT and NTFS runtimes directly.
 pub mod copy_transfer;
 pub mod directory_changes;
 pub mod directory_growth;
@@ -67,3 +67,5 @@ pub mod request;
 pub mod request_scope;
 pub mod vfs;
 pub mod vfs_types;
+
+pub(crate) mod vfs_backends;

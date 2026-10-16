@@ -102,12 +102,10 @@ fn state<T>(f: impl FnOnce(&mut Runtime) -> T) -> T {
     let _guard = LOCK.acquire();
     f(unsafe { &mut *CURRENT.0.get() })
 }
-unsafe extern "C" {
-    fn r4os_zig_input_mouse_bounds(out: *mut Bounds);
-}
+
 fn limits() -> (i32, i32) {
     let mut b = Bounds::default();
-    unsafe { r4os_zig_input_mouse_bounds(&mut b) };
+    unsafe { input_mouse_bounds(&mut b) };
     (
         b.width.saturating_sub(1).min(i32::MAX as u32) as i32,
         b.height.saturating_sub(1).min(i32::MAX as u32) as i32,
@@ -477,3 +475,13 @@ const _: () = {
     assert!(core::mem::offset_of!(Stats, buttons) == 52);
     assert!(core::mem::offset_of!(Stats, present) == 53);
 };
+
+unsafe fn input_mouse_bounds(out: *mut Bounds) {
+    let b = crate::display::surface_pipeline::pixel_bounds();
+    unsafe {
+        out.write(Bounds {
+            width: b as u32,
+            height: (b >> 32) as u32,
+        });
+    }
+}

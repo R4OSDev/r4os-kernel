@@ -1,6 +1,5 @@
 param()
 $BuildArguments = @($args)
-$runOwnerTests=@($BuildArguments|Where-Object {$_ -ceq 'test' -or ($_ -cnotmatch '^-' -and $_ -cmatch '-test$')}).Count -ne 0
 Set-StrictMode -Version 3.0
 $ErrorActionPreference = 'Stop'
 $kernel = $PSScriptRoot
@@ -22,36 +21,27 @@ $repositories = Resolve-KernelPath $kernel $settings.REPOSITORIES_ROOT
 $contract = Resolve-KernelPath $repositories $settings.CONTRACT_ROOT
 $devkit = Resolve-KernelPath $workspace $settings.DEVKIT_ROOT
 $artifacts = Resolve-KernelPath $workspace $settings.ARTIFACTS_ROOT
-$zig = Join-Path (Resolve-KernelPath $devkit $settings.ZIG_ROOT) ('zig'+$(if($IsWindows){'.exe'}else{''}))
 $rust = Join-Path $devkit 'Setup/Rust.ps1'
-if (-not (Test-Path -LiteralPath $zig -PathType Leaf)) { throw 'Pinned Zig is missing; initialize the DevKit.' }
 if (-not (Test-Path -LiteralPath $rust -PathType Leaf)) { throw 'Pinned Rust starter is missing; initialize the DevKit.' }
 $pin = Get-Content -LiteralPath (Join-Path $devkit 'Setup/RustToolchain.json') -Raw | ConvertFrom-Json
-if ($pin.rust_version -cne '1.99.0' -or $pin.kernel_target -cne 'x86_64-unknown-none') { throw 'Review and update the Kernel Rust pin before changing its toolchain.' }
-$contractPackageId=$null
-if (Test-Path -LiteralPath (Join-Path $contract 'build.zig.zon')) {
-    $graphText=@(& pwsh -NoLogo -NoProfile -File $rust cargo metadata --locked --format-version 1 --manifest-path (Join-Path $kernel 'Cargo.toml')) -join "`n"
-    if($LASTEXITCODE -ne 0){throw 'Cannot resolve the exact Cargo Contract pin.'}
-    $graph=$graphText|ConvertFrom-Json
-    $package=@($graph.packages|Where-Object name -CEQ 'r4os-contract')
-    if($package.Count -ne 1){throw 'Kernel must resolve exactly one canonical Contract crate.'}
-    $contractPackageId=$package[0].id
-    $pinnedContract=[IO.Path]::GetFullPath((Join-Path (Split-Path $package[0].manifest_path -Parent) '../../..'))
-    foreach($relative in @('API/ApiContract.json','Generated/SDK/Zig/abi.zig','Generated/SDK/Zig/abi_generated.zig',
-        'Generated/Kernel/Zig/r4x_api_generated.zig','Generated/SDK/Rust/src/lib.rs')) {
-        if((Get-FileHash -LiteralPath (Join-Path $contract $relative)).Hash -cne (Get-FileHash -LiteralPath (Join-Path $pinnedContract $relative)).Hash) {
-            throw ('Local Zig and pinned Rust Contract differ: '+$relative+'. Publish and update both Kernel pins before building an ABI change.')
-        }
-    }
-}
+if ($pin.rust_version -cne '1.99.0' -or $pin.kernel_target -cne 'x86_64-unknown-none') { throw 'Review the checked Kernel profile before changing its Rust toolchain.' }
 $specs = @(Get-Content -LiteralPath (Join-Path $kernel 'BuildOptions.json') -Raw | ConvertFrom-Json)
 $selected = [ordered]@{}
 foreach ($spec in $specs) { $selected[$spec.name] = $spec.default }
+$command='build'
 foreach ($argument in $BuildArguments) {
-    if ($argument -notmatch '^-D([^=]+)=(.*)$') { continue }
+    if ($argument -in @('-h','--help')) {
+        Write-Host 'Kernel/Build.sh [build|install|check|clippy|fmt] [-DOPTION=VALUE]'
+        Write-Host 'The kernel always uses the pinned checked Rust release profile.'
+        foreach($spec in $specs){Write-Host ('  -D'+$spec.name+'=VALUE  '+$spec.description)}
+        exit 0
+    }
+    if ($argument -in @('build','install','check','clippy','fmt')) { $command=if($argument -ceq 'install'){'build'}else{$argument}; continue }
+    if ($argument -ceq '-Doptimize=ReleaseSafe') { continue }
+    if ($argument -notmatch '^-D([^=]+)=(.*)$') { throw ('Unsupported Kernel command or retired Zig test selector: '+$argument) }
     $name,$value = $Matches[1],$Matches[2]
     $spec = @($specs | Where-Object name -CEQ $name)
-    if ($spec.Count -eq 0) { continue }
+    if ($spec.Count -ne 1) { throw ('Unknown Kernel option: '+$name) }
     if ($spec[0].type -ceq 'bool') {
         if ($value -cnotin @('true','false')) { throw ('Kernel Boolean needs true/false: '+$name) }
         $selected[$name] = if($value -ceq 'true'){1}else{0}
@@ -61,21 +51,33 @@ foreach ($argument in $BuildArguments) {
         $selected[$name] = $number
     }
 }
+$manifest=Join-Path $kernel 'Cargo.toml'
+$graphText=@(& pwsh -NoLogo -NoProfile -File $rust cargo metadata --locked --format-version 1 --manifest-path $manifest) -join "`n"
+if($LASTEXITCODE -ne 0){throw 'Cannot resolve the exact Cargo Contract pin.'}
+$graph=$graphText|ConvertFrom-Json
+$package=@($graph.packages|Where-Object name -CEQ 'r4os-contract')
+if($package.Count -ne 1){throw 'Kernel must resolve exactly one canonical Contract crate.'}
+$pinnedContract=[IO.Path]::GetFullPath((Join-Path (Split-Path $package[0].manifest_path -Parent) '../../..'))
+foreach($relative in @('API/ApiContract.json','Generated/SDK/Rust/Cargo.toml','Generated/SDK/Rust/src/lib.rs')) {
+    if((Get-FileHash -LiteralPath (Join-Path $contract $relative)).Hash -cne (Get-FileHash -LiteralPath (Join-Path $pinnedContract $relative)).Hash) {
+        throw ('Workspace and pinned Rust Contract differ: '+$relative+'. Publish and update the Kernel pin before building an ABI change.')
+    }
+}
 $configuration = [Collections.Generic.List[string]]::new()
 $configuration.Add('FORMAT=1')
 $flags = [uint64]0
-$zigArguments = [Collections.Generic.List[string]]::new()
-foreach ($argument in $BuildArguments) {
-    if ($argument -match '^-D([^=]+)=' -and $selected.Contains($Matches[1])) { continue }
-    if ($argument -match '^-Drust-archive=') { throw 'The Kernel builder owns the Rust archive; callers cannot substitute it.' }
-    $zigArguments.Add($argument)
-}
 foreach ($spec in $specs) {
     $number = $selected[$spec.name]
     $value = if ($spec.type -ceq 'bool') { if($number){'true'}else{'false'} } else { [string]$number }
     $configuration.Add($spec.config.ToUpperInvariant()+'='+$value)
-    $zigArguments.Add('-D'+$spec.name+'='+$value)
     if ($spec.type -ceq 'bool' -and $number -ne 0) { $flags = $flags -bor ([uint64]1 -shl [int]$spec.bit) }
+}
+$platformSpec=Get-Content -Raw -LiteralPath (Join-Path $contract 'API/ApiContract.json') | ConvertFrom-Json
+$platformGroups=@($platformSpec.groups | Where-Object kind -CEQ 'kernel_table')
+$configuration.Add('PLATFORM_API_COUNT='+[string]$platformGroups.Count)
+for($platformIndex=0;$platformIndex -lt $platformGroups.Count;$platformIndex++){
+    $group=$platformGroups[$platformIndex]
+    $configuration.Add('PLATFORM_API_'+[string]$platformIndex+'='+[string]$group.name+','+[string]$group.id)
 }
 $configuration.Add('FLAGS='+[string]$flags)
 $bytes = [Text.Encoding]::UTF8.GetBytes(($configuration -join "`n")+"`n")
@@ -96,66 +98,37 @@ $environment = @{
 }
 $saved = @{}
 foreach ($key in $environment.Keys) { $saved[$key]=[Environment]::GetEnvironmentVariable($key,'Process'); Set-Item -LiteralPath ('Env:'+$key) -Value $environment[$key] }
-$elf = Join-Path $kernel 'zig-out/bin/r4os.elf'
-$oldHash = if(Test-Path -LiteralPath $elf){(Get-FileHash -LiteralPath $elf).Hash.ToLowerInvariant()}else{''}
 try {
-    & pwsh -NoLogo -NoProfile -File $rust cargo build --locked --release --manifest-path (Join-Path $kernel 'Cargo.toml') --target $pin.kernel_target --target-dir $rustOutput
-    if ($LASTEXITCODE -ne 0) { throw 'Cargo Kernel build failed.' }
-    $archive = Join-Path $rustOutput ($pin.kernel_target+'/release/libr4os_kernel.a')
-    if (-not (Test-Path -LiteralPath $archive)) { throw 'Cargo did not produce a native Kernel archive.' }
-    $zigArguments.Add('-Drust-archive='+$archive)
-    if ($runOwnerTests) {
-        # Run the existing Zig owner fixtures against native Rust C exports.
-        # The isolated host archive has no boot entry or platform execution.
-        $ownerGraphText=@(& pwsh -NoLogo -NoProfile -File $rust cargo metadata --locked --offline --format-version 1 --manifest-path (Join-Path $kernel 'Tests/RustOwners/Cargo.toml')) -join "`n"
-        if($LASTEXITCODE -ne 0){throw 'Cannot resolve the owner fixture Contract pin.'}
-        $ownerGraph=$ownerGraphText|ConvertFrom-Json
-        $ownerContract=@($ownerGraph.packages|Where-Object name -CEQ 'r4os-contract')
-        if($ownerContract.Count -ne 1 -or $null -eq $contractPackageId -or $ownerContract[0].id -cne $contractPackageId){
-            throw 'Host owner fixtures and Kernel must use the same canonical Contract pin.'
-        }
-        $bareFlags=$env:CARGO_ENCODED_RUSTFLAGS
-        try {
-            $env:CARGO_ENCODED_RUSTFLAGS=@('-Ccode-model=small','-Crelocation-model=static','-Coverflow-checks=yes','-Cdebug-assertions=yes','-Cpanic=abort','-Clto=off') -join [char]31
-            $ownerOutput=Join-Path $artifacts 'Kernel/RustOwners'
-            # Like Contract ABI tests, Linux executes the actual bare SysV
-            # implementation. Windows needs native COFF for its host runner.
-            $ownerTarget=if($IsLinux){$pin.kernel_target}else{'x86_64-pc-windows-msvc'}
-            & pwsh -NoLogo -NoProfile -File $rust cargo build --locked --release --manifest-path (Join-Path $kernel 'Tests/RustOwners/Cargo.toml') --target $ownerTarget --target-dir $ownerOutput
-            if ($LASTEXITCODE -ne 0) { throw 'Rust host owner fixture build failed.' }
-            $ownerArchive=Join-Path $ownerOutput ($ownerTarget+'/release/'+$(if($IsWindows){'r4os_kernel_owner_fixture.lib'}else{'libr4os_kernel_owner_fixture.a'}))
-            if (-not (Test-Path -LiteralPath $ownerArchive)) { throw 'Rust host owner archive missing.' }
-            $zigArguments.Add('-Drust-owner-test-archive='+$ownerArchive)
-        } finally { $env:CARGO_ENCODED_RUSTFLAGS=$bareFlags }
+    if($command -ceq 'fmt') {
+        & pwsh -NoLogo -NoProfile -File $rust cargo fmt --manifest-path $manifest -- --check
+        if($LASTEXITCODE -ne 0){throw 'Kernel Rust formatting check failed.'}
+        exit 0
     }
-    if (Test-Path -LiteralPath (Join-Path $contract 'build.zig.zon')) { $zigArguments.Add('--fork='+$contract) }
-    Push-Location $kernel
-    try { & $zig build @($zigArguments.ToArray()); $result=$LASTEXITCODE } finally { Pop-Location }
-    if ($result -ne 0) { throw ('Native Kernel linking/test failed: '+$result) }
-    if (Test-Path -LiteralPath $elf) {
-        $hash=(Get-FileHash -LiteralPath $elf).Hash.ToLowerInvariant()
-        $steps=@($BuildArguments | Where-Object {$_ -notmatch '^-'})
-        $linked=($steps.Count -eq 0 -or $steps -contains 'install' -or $hash -cne $oldHash)
-        if ($linked) {
-            # Zig's source-level strip does not remove debug carried by native
-            # Rust/core objects. Apply the existing final-ELF strip contract.
-            if ($selected['strip-kernel'] -ne 0) {
-                & pwsh -NoLogo -NoProfile -File $rust llvm-objcopy --strip-all $elf
-                if ($LASTEXITCODE -ne 0) { throw 'Final Kernel ELF stripping failed.' }
-                $hash=(Get-FileHash -LiteralPath $elf).Hash.ToLowerInvariant()
-            }
-            $version=([IO.File]::ReadAllText((Join-Path $kernel 'VERSION.R4S')).TrimStart([char]0xFEFF).Trim() -split '=',2)[1]
-            $rustVersion=(@(& pwsh -NoLogo -NoProfile -File $rust rustc --version) -join ' ').Trim()
-            if($LASTEXITCODE -ne 0){throw 'Rust version query failed.'}
-            $zigVersion=(@(& $zig version) -join ' ').Trim()
-            if($LASTEXITCODE -ne 0){throw 'Zig version query failed.'}
-            $metadata=[ordered]@{schema=1; artifact='r4os.elf'; sha256=$hash; kernel_version=$version; languages=@('zig','rust');
-                compilers=[ordered]@{zig=$zigVersion;rust=$rustVersion}; configuration_sha256=$configurationId; options=$selected;
-                profiles=[ordered]@{zig=@{optimize='ReleaseSafe';red_zone=$false;simd=$false;code_model='kernel'};
-                    rust=@{profile='release';opt_level=3;overflow_checks=$true;debug_assertions=$true;panic='abort';lto=$false;red_zone=$false;simd=$false;code_model='kernel';relocation_model='static';target=$pin.kernel_target;rustflags=$rustFlags}}}
-            [IO.File]::WriteAllText((Join-Path $kernel 'zig-out/bin/r4os.build.json'),($metadata|ConvertTo-Json -Depth 20)+"`n",[Text.UTF8Encoding]::new($false))
-        }
+    $cargoArguments=@('cargo',$command,'--locked','--release','--manifest-path',$manifest,'--target',$pin.kernel_target,'--target-dir',$rustOutput)
+    if($command -ceq 'clippy'){$cargoArguments+=@('--','-D','warnings')}
+    & pwsh -NoLogo -NoProfile -File $rust @cargoArguments
+    if ($LASTEXITCODE -ne 0) { throw ('Cargo Kernel '+$command+' failed.') }
+    if($command -cne 'build'){exit 0}
+    $binary=Join-Path $rustOutput ($pin.kernel_target+'/release/r4os')
+    if(-not(Test-Path -LiteralPath $binary -PathType Leaf)){throw 'Cargo did not produce the native Kernel ELF.'}
+    # Preserve the established distribution artifact path on both hosts.
+    $destination=Join-Path $kernel 'zig-out/bin'
+    [void][IO.Directory]::CreateDirectory($destination)
+    $elf=Join-Path $destination 'r4os.elf'
+    Copy-Item -LiteralPath $binary -Destination $elf -Force
+    if ($selected['strip-kernel'] -ne 0) {
+        & pwsh -NoLogo -NoProfile -File $rust llvm-objcopy --strip-all $elf
+        if ($LASTEXITCODE -ne 0) { throw 'Final Kernel ELF stripping failed.' }
     }
+    $hash=(Get-FileHash -LiteralPath $elf).Hash.ToLowerInvariant()
+    $version=([IO.File]::ReadAllText((Join-Path $kernel 'VERSION.R4S')).TrimStart([char]0xFEFF).Trim() -split '=',2)[1]
+    $rustVersion=(@(& pwsh -NoLogo -NoProfile -File $rust rustc --version) -join ' ').Trim()
+    if($LASTEXITCODE -ne 0){throw 'Rust version query failed.'}
+    $metadata=[ordered]@{schema=1;artifact='r4os.elf';sha256=$hash;kernel_version=$version;languages=@('rust','assembly');
+        compilers=[ordered]@{rust=$rustVersion};configuration_sha256=$configurationId;options=$selected;
+        profiles=[ordered]@{rust=@{profile='release';opt_level=3;overflow_checks=$true;debug_assertions=$true;panic='abort';lto=$false;
+            red_zone=$false;simd=$false;code_model='kernel';relocation_model='static';target=$pin.kernel_target;rustflags=$rustFlags;linker='rust-lld'}}}
+    [IO.File]::WriteAllText((Join-Path $destination 'r4os.build.json'),($metadata|ConvertTo-Json -Depth 20)+"`n",[Text.UTF8Encoding]::new($false))
 } finally {
     foreach($key in $saved.Keys) { if($null -eq $saved[$key]){Remove-Item -LiteralPath ('Env:'+$key) -ErrorAction SilentlyContinue}else{Set-Item -LiteralPath ('Env:'+$key) -Value $saved[$key]} }
 }

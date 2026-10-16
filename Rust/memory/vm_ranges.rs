@@ -1,5 +1,5 @@
 //! Resident VM range storage and reservation owner.
-//! During the pager migration, Zig holds only raw C leases into this table.
+//! Native pager operations retain exact raw leases into this resident table.
 //! A lease is admitted by the VM owner; Rust references end before returning
 //! or calling any path that may wait/reenter a VM operation.
 use super::{blocks, virt_policy, vm_index};

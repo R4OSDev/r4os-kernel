@@ -141,15 +141,13 @@ unsafe fn event(i: usize) -> *mut Event {
     unsafe { EVENTS.0.get().cast::<Event>().add(i) }
 }
 // Queue availability/wakeup stays with the existing display queue (.83.23).
-unsafe extern "C" {
-    fn r4os_zig_gfx_queue_peer(operation: u32) -> bool;
-}
+
 pub(crate) fn available() -> bool {
-    unsafe { r4os_zig_gfx_queue_peer(0) }
+    unsafe { gfx_queue_peer(0) }
 }
 pub(crate) fn wake() {
     unsafe {
-        r4os_zig_gfx_queue_peer(1);
+        gfx_queue_peer(1);
     }
 }
 fn now() -> u64 {
@@ -767,4 +765,15 @@ pub unsafe extern "C" fn r4os_rust_gfx_allocation_receive(
 ) -> i32 {
     let args = unsafe { args.read() };
     unsafe { receive(args.owner, args.handle, out) }
+}
+
+unsafe fn gfx_queue_peer(operation: u32) -> bool {
+    match operation {
+        0 => crate::display::queue::available(),
+        1 => {
+            crate::display::queue::wake();
+            true
+        }
+        _ => panic!("Invalid graphics queue link"),
+    }
 }

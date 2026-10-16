@@ -10,10 +10,7 @@ use crate::{
     sched::task::task_api,
 };
 use core::{mem::MaybeUninit, slice};
-unsafe extern "C" {
-    fn r4os_zig_crash_screen_sync();
-    fn r4os_zig_crash_screen_putc(ch: u8);
-}
+
 const FLAG_MESSAGE: u16 = 1 << 4;
 const FLAG_CPU: u16 = 1 << 0;
 const FLAG_PAGE_FAULT: u16 = 1 << 1;
@@ -26,7 +23,7 @@ fn fixed_z(bytes: &[u8]) -> &[u8] {
     &bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len())]
 }
 fn serial_putc(ch: u8) {
-    unsafe { r4os_zig_crash_screen_putc(ch) }
+    crate::boot::log_route::console_putc_raw(ch)
 }
 fn serial_puts(text: &[u8]) {
     for &ch in text {
@@ -61,7 +58,9 @@ fn serial_flag(name: &[u8], value: u8) {
     serial_putc(b' ');
 }
 fn serial_mirror(r: &CrashReport) {
-    unsafe { r4os_zig_crash_screen_sync() }
+    {
+        crate::boot::log_route::serial_enter_sync()
+    }
     serial_puts(b"[CRASH] cause=");
     serial_puts(crash::cause_name(r.cause));
     serial_puts(b" stop=0x");

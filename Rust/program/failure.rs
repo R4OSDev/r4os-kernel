@@ -44,9 +44,7 @@ static LOCK: Cell<Mutex> = Cell::new(Mutex {
     name: Text::literal(b"r4x-lifecycle-failure"),
     ..Mutex::EMPTY
 });
-unsafe extern "C" {
-    fn r4os_zig_program_selftest_option(group: u8) -> Bytes;
-}
+
 fn lock() -> bool {
     unsafe { sync_locks::r4os_rust_sync_mutex(LOCK.get(), 1, u64::MAX) }
 }
@@ -54,7 +52,7 @@ fn unlock() {
     unsafe { sync_locks::r4os_rust_sync_mutex(LOCK.get(), 2, 0) };
 }
 pub(super) fn allowed(group: u8) -> bool {
-    let v = unsafe { r4os_zig_program_selftest_option(group) };
+    let v = unsafe { program_selftest_option(group) };
     let text = if v.len == 0 {
         &[][..]
     } else {
@@ -214,3 +212,22 @@ const _: () = {
     assert!(core::mem::size_of::<Snapshot>() == 12);
     assert!(core::mem::offset_of!(Snapshot, recovered) == 8);
 };
+
+unsafe fn program_selftest_option(group: u8) -> Bytes {
+    unsafe {
+        let value = crate::boot::config::option_value(
+            crate::boot::config::get(),
+            if group == 1 {
+                b"PROGRAMREGISTRY"
+            } else {
+                b"PROGRAMLIFECYCLE"
+            },
+            b"selftest",
+        )
+        .unwrap_or(b"");
+        Bytes {
+            data: value.as_ptr(),
+            len: value.len(),
+        }
+    }
+}

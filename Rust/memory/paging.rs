@@ -96,7 +96,7 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
 unsafe extern "C" {
     fn r4os_read_cr3() -> u64;
     fn r4os_invlpg(address: usize);
-    fn r4os_zig_paging_shootdown(base: u64, pages: u64) -> bool;
+
 }
 fn state<T>(operation: impl FnOnce(&mut State) -> T) -> T {
     // Callers retain owner 6. No operation closure invokes an external owner.
@@ -253,7 +253,7 @@ fn wrong_owner(mapping: bool) -> bool {
     if mapping { fail_map() } else { fail_unmap() }
 }
 fn invalidate(base: u64, pages: u64) -> bool {
-    unsafe { r4os_zig_paging_shootdown(base, pages) }
+    unsafe { paging_shootdown(base, pages) }
 }
 fn restore_count(pages: u64) {
     state(|state| {
@@ -654,3 +654,11 @@ pub unsafe extern "C" fn r4os_rust_paging_stats(output: *mut Stats) {
     }
 }
 const _: () = assert!(core::mem::size_of::<Stats>() == 184);
+
+unsafe fn paging_shootdown(base: u64, pages: u64) -> bool {
+    let mut result = core::mem::MaybeUninit::uninit();
+    unsafe {
+        crate::arch::tlb::r4os_rust_tlb_invalidate(base, pages, result.as_mut_ptr());
+        result.assume_init().ok
+    }
+}

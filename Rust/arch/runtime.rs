@@ -1,7 +1,7 @@
 //! Single scheduler/wait/IRQ runtime owner. Context switch releases the outer
 //! token after outgoing RSP is durable, below the incoming saved context.
 //! Unrelated owners never borrow this admission.
-use crate::{build_bridge::config, memory::owner};
+use crate::{build_config::config, memory::owner};
 use core::{
     marker::PhantomData,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
@@ -212,7 +212,6 @@ pub struct RuntimeGuard {
     _cpu_bound: PhantomData<*mut ()>,
 }
 impl RuntimeGuard {
-    #[cfg(not(r4os_owner_fixture))]
     pub fn acquire() -> Self {
         Self {
             flags: save_runtime(),
@@ -220,18 +219,11 @@ impl RuntimeGuard {
         }
     }
     // Serialized host metadata fixtures never execute privileged hardware.
-    #[cfg(r4os_owner_fixture)]
-    pub fn acquire() -> Self {
-        Self {
-            flags: 0,
-            _cpu_bound: PhantomData,
-        }
-    }
 }
 impl Drop for RuntimeGuard {
     fn drop(&mut self) {
         let _ = self.flags;
-        #[cfg(not(r4os_owner_fixture))]
+
         restore_runtime(self.flags);
     }
 }

@@ -75,41 +75,7 @@ pub struct Entry {
     pub modified_time: u16,
     pub modified_date: u16,
 }
-unsafe extern "C" {
-    // Stateless legacy immutable device projection and original FS owners.
-    fn r4os_zig_media_device(index: usize, out: *mut DeviceInfo) -> bool;
-    fn r4os_zig_media_volumes_reset();
-    fn r4os_zig_media_probe(
-        index: usize,
-        partition: usize,
-        kind: u8,
-        lba: u32,
-        sectors: u64,
-    ) -> *mut c_void;
-    fn r4os_zig_media_entry(
-        volume: *mut c_void,
-        path: *const u8,
-        len: usize,
-        out: *mut Entry,
-    ) -> bool;
-    fn r4os_zig_media_read(
-        volume: *mut c_void,
-        entry: *const Entry,
-        offset: usize,
-        out: *mut u8,
-        len: usize,
-    ) -> usize;
-    // Existing native installation rules + temporary original generic JSON
-    // decoder/allocator; no media/manifest selection policy belongs here.
-    fn r4os_zig_media_manifest(
-        bytes: *const u8,
-        len: usize,
-        scratch: *mut u8,
-        scratch_len: usize,
-        out: *mut Manifest,
-        error: *mut Label,
-    ) -> bool;
-}
+
 unsafe extern "C" fn read_sector(ctx: *mut c_void, lba: u64, out: *mut u8) -> bool {
     let index = unsafe { ctx.cast::<usize>().read() };
     unsafe { block_io::r4os_rust_block_read(index, lba, 1, out, 512, false) }
@@ -121,7 +87,7 @@ unsafe extern "C" fn read_sector(ctx: *mut c_void, lba: u64, out: *mut u8) -> bo
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_media_scan() {
     unsafe {
-        r4os_zig_media_volumes_reset();
+        media_volumes_reset();
     }
     for index in 0..MAX_DEVICES {
         let p = unsafe { record(index) };
@@ -135,7 +101,7 @@ pub unsafe extern "C" fn r4os_rust_media_scan() {
     let count = block_registry::r4os_rust_block_registry_query(1, 0).min(MAX_DEVICES);
     for index in 0..count {
         let mut info = MaybeUninit::uninit();
-        if !unsafe { r4os_zig_media_device(index, info.as_mut_ptr()) } {
+        if !unsafe { media_device(index, info.as_mut_ptr()) } {
             continue;
         }
         let info = unsafe { info.assume_init() };
@@ -228,7 +194,7 @@ pub(crate) unsafe fn probe(index: usize, partition: usize) -> Volume {
         return unsafe { v.read() };
     }
     let token = unsafe {
-        r4os_zig_media_probe(
+        media_probe(
             info.index,
             partition,
             kind,
@@ -291,9 +257,7 @@ pub(crate) unsafe fn read_installation(index: usize) {
         }
         let path = b"/boot/r4os-installation.json";
         let mut entry = MaybeUninit::uninit();
-        if !unsafe {
-            r4os_zig_media_entry(volume.token, path.as_ptr(), path.len(), entry.as_mut_ptr())
-        } {
+        if !unsafe { media_entry(volume.token, path.as_ptr(), path.len(), entry.as_mut_ptr()) } {
             continue;
         }
         let entry = unsafe { entry.assume_init() };
@@ -309,9 +273,7 @@ pub(crate) unsafe fn read_installation(index: usize) {
             }
             continue;
         };
-        if unsafe { r4os_zig_media_read(volume.token, &entry, 0, bytes.data, bytes.len) }
-            != bytes.len
-        {
+        if unsafe { media_read(volume.token, &entry, 0, bytes.data, bytes.len) } != bytes.len {
             continue;
         }
         let Some(scratch) = Buffer::allocate(128 * 1024) else {
@@ -320,7 +282,7 @@ pub(crate) unsafe fn read_installation(index: usize) {
         let mut manifest = MaybeUninit::uninit();
         let mut error = MaybeUninit::uninit();
         if !unsafe {
-            r4os_zig_media_manifest(
+            media_manifest(
                 bytes.data,
                 bytes.len,
                 scratch.data,
@@ -364,3 +326,199 @@ const _: () = {
     assert!(core::mem::size_of::<DeviceInfo>() == 88);
     assert!(core::mem::size_of::<Entry>() == 840);
 };
+
+use crate::fs::{vfs, vfs_types as fs_types};
+struct VolumeSlots([UnsafeCell<Option<fs_types::Volume>>; MAX_DEVICES * MAX_PARTITIONS]);
+// SAFETY: exclusive boot scan precedes users; the stationary exact tokens
+// survive every synchronous probe/consumer/mount and are reset only at boot.
+unsafe impl Sync for VolumeSlots {}
+static VOLUMES: VolumeSlots =
+    VolumeSlots([const { UnsafeCell::new(None) }; MAX_DEVICES * MAX_PARTITIONS]);
+pub(crate) unsafe fn volume(token: *mut c_void) -> fs_types::Volume {
+    unsafe {
+        token
+            .cast::<Option<fs_types::Volume>>()
+            .read()
+            .expect("Live exact volume token")
+    }
+}
+fn entry_value(v: fs_types::Entry) -> Entry {
+    Entry {
+        name: v.name,
+        name_len: v.name_len,
+        attr: v.attr,
+        node: v.node,
+        node_generation: v.generation,
+        fat_lba: v.directory_lba,
+        has_fat_lba: v.has_lba,
+        fat_offset: v.directory_offset,
+        reparse: v.reparse,
+        size: v.size,
+        created_time: v.times[0],
+        created_date: v.times[1],
+        access_date: v.times[2],
+        modified_time: v.times[3],
+        modified_date: v.times[4],
+    }
+}
+fn vfs_entry(v: Entry) -> fs_types::Entry {
+    fs_types::Entry {
+        name: v.name,
+        name_len: v.name_len,
+        attr: v.attr,
+        node: v.node,
+        generation: v.node_generation,
+        directory_lba: v.fat_lba,
+        has_lba: v.has_fat_lba,
+        directory_offset: v.fat_offset,
+        reparse: v.reparse,
+        size: v.size,
+        times: [
+            v.created_time,
+            v.created_date,
+            v.access_date,
+            v.modified_time,
+            v.modified_date,
+        ],
+    }
+}
+
+unsafe fn media_volumes_reset() {
+    for slot in &VOLUMES.0 {
+        unsafe {
+            slot.get().write(None);
+        }
+    }
+}
+
+unsafe fn media_probe(
+    index: usize,
+    partition: usize,
+    kind: u8,
+    lba: u32,
+    sectors: u64,
+) -> *mut c_void {
+    assert!(index < MAX_DEVICES && partition < MAX_PARTITIONS);
+    assert!(matches!(kind, 3 | 4));
+    let Some(v) =
+        (unsafe { crate::fs::vfs_backends::probe(kind == 4, index, lba, sectors, false) })
+    else {
+        return ptr::null_mut();
+    };
+    let slot = VOLUMES.0[index * MAX_PARTITIONS + partition].get();
+    unsafe {
+        slot.write(Some(v));
+    }
+    slot.cast()
+}
+
+unsafe fn media_device(index: usize, out: *mut DeviceInfo) -> bool {
+    let _guard = crate::memory::owner::Guard::acquire(1);
+    let mut view = MaybeUninit::uninit();
+    if !unsafe {
+        crate::storage::block_registry::r4os_rust_block_registry_slot(
+            index,
+            1,
+            0,
+            true,
+            view.as_mut_ptr(),
+        )
+    } {
+        return false;
+    }
+    let view = unsafe { view.assume_init() };
+    let c = unsafe {
+        core::ptr::addr_of!((*view.device.cast::<super::block_device::Device>()).config).read()
+    };
+    unsafe {
+        out.write(DeviceInfo {
+            index,
+            bus: c.bus,
+            name: Label {
+                data: c.name.data,
+                len: c.name.len,
+            },
+            model: Label {
+                data: c.model.data,
+                len: c.model.len,
+            },
+            driver: Label {
+                data: c.driver.data,
+                len: c.driver.len,
+            },
+            sector_bytes: c.sector_size,
+            sectors: c.sector_count,
+            writable: c.writable,
+        });
+    }
+    true
+}
+
+unsafe fn media_entry(volume: *mut c_void, path: *const u8, len: usize, out: *mut Entry) -> bool {
+    unsafe {
+        let v = crate::storage::media_inventory::volume(volume);
+        let a = fs_types::Args {
+            volume: v,
+            name: fs_types::Bytes { data: path, len },
+            ..Default::default()
+        };
+        let mut e = MaybeUninit::<fs_types::Entry>::uninit();
+        let result = vfs::r4os_rust_vfs_run(1, &a, e.as_mut_ptr().cast());
+        if result.status != 0 {
+            return false;
+        }
+        out.write(entry_value(e.assume_init()));
+        true
+    }
+}
+
+unsafe fn media_read(
+    volume: *mut c_void,
+    entry: *const Entry,
+    offset: usize,
+    out: *mut u8,
+    len: usize,
+) -> usize {
+    unsafe {
+        let v = crate::storage::media_inventory::volume(volume);
+        let e = vfs_entry(entry.read());
+        let a = fs_types::Args {
+            volume: v,
+            entry: &e,
+            offset: offset as u64,
+            buffer: out,
+            buffer_len: len,
+            ..Default::default()
+        };
+        let result = vfs::r4os_rust_vfs_run(6, &a, ptr::null_mut());
+        if result.present {
+            result.value.try_into().unwrap()
+        } else {
+            usize::MAX
+        }
+    }
+}
+
+unsafe fn media_manifest(
+    bytes: *const u8,
+    len: usize,
+    scratch: *mut u8,
+    scratch_len: usize,
+    out: *mut Manifest,
+    error: *mut Label,
+) -> bool {
+    unsafe {
+        let input = core::slice::from_raw_parts(bytes, len);
+        let scratch = core::slice::from_raw_parts_mut(scratch, scratch_len);
+        match crate::storage::installation::parse_bytes(input, scratch) {
+            Ok(m) => {
+                out.write(m);
+                true
+            }
+            Err(e) => {
+                error.write(Label::new(e));
+                false
+            }
+        }
+    }
+}

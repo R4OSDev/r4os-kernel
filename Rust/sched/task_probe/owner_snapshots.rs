@@ -55,9 +55,7 @@ pub struct Baseline {
     pub fpu: u64,
 }
 unsafe extern "C" {
-    fn r4os_zig_task_probe_vm(out: *mut Vm);
-    fn r4os_zig_task_probe_owners(out: *mut Owners);
-    fn r4os_zig_task_probe_network(out: *mut Network);
+
     fn r4os_rust_task_control(operation: u8, a: u64, b: u64) -> u64;
 }
 pub unsafe fn create(
@@ -95,7 +93,7 @@ pub unsafe fn baseline() -> Baseline {
         let mut p = phys::Stats::default();
         phys::r4os_rust_phys_stats(&mut p);
         let mut v = Vm::default();
-        r4os_zig_task_probe_vm(&mut v);
+        task_probe_vm(&mut v);
         Baseline {
             tasks: r4os_rust_task_control(1, 0, 0),
             heap_used: h.used_bytes,
@@ -115,14 +113,91 @@ pub unsafe fn matches(expected: Baseline) -> bool {
 pub unsafe fn owners() -> Owners {
     unsafe {
         let mut out = Owners::default();
-        r4os_zig_task_probe_owners(&mut out);
+        task_probe_owners(&mut out);
         out
     }
 }
 pub unsafe fn network() -> Network {
     unsafe {
         let mut out = Network::default();
-        r4os_zig_task_probe_network(&mut out);
+        task_probe_network(&mut out);
         out
+    }
+}
+
+unsafe fn task_probe_network(out: *mut Network) {
+    let mut s = core::mem::MaybeUninit::uninit();
+    unsafe {
+        crate::net::rx_runtime::r4os_rust_net_rx_runtime_summary(s.as_mut_ptr());
+        let s = s.assume_init();
+        out.write(Network {
+            started: s.started,
+            id: s.task_id,
+            generation: s.task_generation,
+            polls: s.polls,
+            iterations: s.iterations,
+        });
+    }
+}
+
+unsafe fn task_probe_vm(out: *mut Vm) {
+    let mut s = core::mem::MaybeUninit::uninit();
+    unsafe {
+        crate::memory::vm_query::r4os_rust_vm_stats(s.as_mut_ptr());
+        let s = s.assume_init();
+        out.write(Vm {
+            ranges: s.active_ranges,
+            reserved: s.reserved_bytes,
+            committed: s.committed_bytes,
+            resident: s.resident_bytes,
+        });
+    }
+}
+
+unsafe fn task_probe_owners(out: *mut Owners) {
+    unsafe {
+        let mut a = MaybeUninit::uninit();
+        let mut b = MaybeUninit::uninit();
+        let mut c = MaybeUninit::uninit();
+        let mut d = MaybeUninit::uninit();
+        let mut e = MaybeUninit::uninit();
+        let mut f = MaybeUninit::uninit();
+        crate::service::ipc::r4os_rust_ipc_performance(0, false, a.as_mut_ptr());
+        crate::driver::work::r4os_rust_driver_work_summary(b.as_mut_ptr());
+        crate::storage::block_workers::r4os_rust_block_workers_summary(c.as_mut_ptr());
+        crate::net::rx_runtime::r4os_rust_net_rx_runtime_summary(d.as_mut_ptr());
+        crate::usb::hid::r4os_rust_usb_hid_poll_task_summary(e.as_mut_ptr());
+        crate::usb::hid::r4os_rust_usb_hid_status(f.as_mut_ptr());
+        let (a, b, c, d, e, f) = (
+            a.assume_init(),
+            b.assume_init(),
+            c.assume_init(),
+            d.assume_init(),
+            e.assume_init(),
+            f.assume_init(),
+        );
+        out.write(Owners {
+            ipc: Owner {
+                started: a.worker_started as u64,
+                id: a.worker_task_id,
+            },
+            work: Owner {
+                started: b.worker_started as u64,
+                id: b.worker_task_id,
+            },
+            block: Owner {
+                started: c.worker_started as u64,
+                id: c.worker_task_id,
+            },
+            net: Owner {
+                started: u64::from(d.started),
+                id: d.task_id,
+            },
+            input: Owner {
+                started: u64::from(e.started),
+                id: e.task_id,
+            },
+            input_bound: f.keyboard_bound || f.mouse_bound,
+        });
     }
 }

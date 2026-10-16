@@ -109,17 +109,10 @@ fn parse_bool(value: &[u8]) -> Option<bool> {
         None
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_net_boot_option(
-        config: *const c_void,
-        key: *const u8,
-        key_len: usize,
-        out: *mut Text,
-    ) -> bool;
-}
+
 unsafe fn option<'a>(config: *const c_void, key: &[u8]) -> Option<&'a [u8]> {
     let mut out = Text::literal(b"");
-    if unsafe { r4os_zig_net_boot_option(config, key.as_ptr(), key.len(), &mut out) } {
+    if unsafe { net_boot_option(config, key.as_ptr(), key.len(), &mut out) } {
         Some(if out.len == 0 {
             &[]
         } else {
@@ -335,3 +328,22 @@ const _: () = {
     assert!(core::mem::offset_of!(Settings, invalid_options) == 24);
     assert!(core::mem::offset_of!(Settings, last_error) == 32);
 };
+
+unsafe fn net_boot_option(
+    config: *const c_void,
+    key: *const u8,
+    key_len: usize,
+    out: *mut Text,
+) -> bool {
+    unsafe {
+        let key = core::slice::from_raw_parts(key, key_len);
+        let Some(value) = crate::boot::config::option_value(config.cast(), b"NET", key) else {
+            return false;
+        };
+        out.write(Text {
+            pointer: value.as_ptr(),
+            len: value.len(),
+        });
+        true
+    }
+}

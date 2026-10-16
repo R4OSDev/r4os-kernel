@@ -233,9 +233,7 @@ fn runtime(port: usize) -> *mut Runtime {
             .add(port)
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_ahci_register(port: u8, source: u8, context: *mut c_void, name: Label) -> usize;
-}
+
 fn put(text: &[u8]) {
     unsafe {
         log::r4os_rust_bootlog_write(text.as_ptr(), text.len());
@@ -493,8 +491,7 @@ fn configure() {
             }
             (*rt).device_present = true;
             (*c).active_sata_ports += 1;
-            let index =
-                r4os_zig_ahci_register(port as u8, (*state()).source, rt.cast(), name(port as u8));
+            let index = ahci_register(port as u8, (*state()).source, rt.cast(), name(port as u8));
             if index == usize::MAX {
                 (*rt).last_error = Label::new(b"block-register-failed");
                 snapshot(rt);
@@ -850,3 +847,48 @@ const _: () = {
     assert!(core::mem::size_of::<Status>() == 1104);
     assert!(core::mem::offset_of!(Status, first_ports) == 128);
 };
+
+unsafe fn ahci_register(port: u8, source: u8, context: *mut c_void, name: Label) -> usize {
+    use crate::storage::{block_device as b, block_registry::Text};
+    let mut cfg = b::Config::new(
+        Text {
+            data: name.data,
+            len: name.len,
+        },
+        block_read,
+    );
+    cfg.driver = b::text(b"AHCI");
+    cfg.bus = 2;
+    cfg.controller = b::text(b"ich9-ahci");
+    cfg.port = port;
+    cfg.sector_size = 512;
+    cfg.max_sectors = 8;
+    cfg.writable = true;
+    cfg.source = source;
+    cfg.context = context;
+    cfg.write = Some(block_write);
+    cfg.flush = Some(block_flush);
+    unsafe { b::register(cfg) }.unwrap_or(usize::MAX)
+}
+
+unsafe extern "C" fn block_read(
+    ctx: *mut c_void,
+    lba: u64,
+    sectors: u16,
+    out: *mut u8,
+    len: usize,
+) -> bool {
+    unsafe { r4os_rust_ahci_io(ctx, 0, lba, sectors, out, len) }
+}
+unsafe extern "C" fn block_write(
+    ctx: *mut c_void,
+    lba: u64,
+    sectors: u16,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    unsafe { r4os_rust_ahci_io(ctx, 1, lba, sectors, data.cast_mut(), len) }
+}
+unsafe extern "C" fn block_flush(ctx: *mut c_void) -> bool {
+    unsafe { r4os_rust_ahci_io(ctx, 2, 0, 0, ptr::null_mut(), 0) }
+}

@@ -522,10 +522,7 @@ fn wait_activity(mut observed: u64) -> bool {
     (unsafe { sync_wait::r4os_rust_sync_wait(ACTIVITY.queue.get(), &request) })
         == crate::sched::task::task_types::WaitResult::Signaled as u32
 }
-unsafe extern "C" {
-    fn r4os_zig_vm_file_read(path: *const u8, offset: u64, buffer: *mut u8, bytes: u32) -> i32;
-    fn r4os_zig_vm_file_write(path: *const u8, offset: u64, buffer: *const u8, bytes: u32) -> i32;
-}
+
 pub(super) fn begin_writeback(
     id: u32,
     offset: u64,
@@ -795,7 +792,7 @@ fn page_in_fault(index: usize, address: u64, page: u64, token: owner::Token) -> 
             ptr::with_exposed_provenance_mut::<u8>(phys::r4os_rust_phys_to_virt(frame) as usize);
         held.release();
         let io_status = unsafe {
-            r4os_zig_vm_file_read(
+            crate::program::system::io::r4os_rust_sys_file_read_at(
                 path.as_ptr(),
                 prepared.backing_offset,
                 memory,
@@ -1151,7 +1148,7 @@ fn evict_resident(id: u32, page: u64, backing: backing::Result, path: *const u8)
         }
         held.release();
         let io_status = unsafe {
-            r4os_zig_vm_file_write(
+            crate::program::system::io::r4os_rust_sys_file_write_at(
                 owned_path.as_ptr(),
                 prepared.backing_offset,
                 pointer,
@@ -1733,9 +1730,7 @@ pub(super) unsafe fn pager_cleanup(pointer: *mut Range, operation: u8, slot: usi
         _ => unreachable!(),
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_vm_reclaimer_address() -> usize;
-}
+
 pub(super) unsafe fn init() -> bool {
     unsafe { vm_ranges::r4os_rust_vm_ranges_init() };
     let mut order = ptr::null();
@@ -1746,6 +1741,6 @@ pub(super) unsafe fn init() -> bool {
     }
     ps::with(|s| s.reset());
     unsafe { vm_transactions::r4os_rust_vm_publish_ready() };
-    reclaim::r4os_rust_reclaim_register_vm(unsafe { r4os_zig_vm_reclaimer_address() });
+    reclaim::register_vm();
     true
 }

@@ -7,7 +7,7 @@ use crate::{
     sched::task_context,
 };
 use core::sync::atomic::{
-    AtomicBool, AtomicU32, AtomicU64, AtomicUsize,
+    AtomicBool, AtomicU32, AtomicU64,
     Ordering::{Acquire, Relaxed, Release},
 };
 pub const DIAGNOSTIC: u32 = 1;
@@ -197,20 +197,8 @@ static COUNTERS: Counters = Counters {
     last_after_free_frames: AtomicU64::new(0),
 };
 static IN_RECLAIM: AtomicBool = AtomicBool::new(false);
-static VM_RECLAIMER: AtomicUsize = AtomicUsize::new(0);
-static STACK_RECLAIMER: AtomicUsize = AtomicUsize::new(0);
-unsafe extern "C" {
-    fn r4os_zig_reclaim_ntfs(requested: u32);
-    fn r4os_zig_reclaim_vm_invoke(
-        callback: usize,
-        reason: u32,
-        frames: u32,
-        owner: u64,
-        owner_present: bool,
-        output: *mut SourceResult,
-    );
-    fn r4os_zig_reclaim_stack_invoke(callback: usize, stacks: u32) -> u32;
-}
+static VM_RECLAIMER: AtomicBool = AtomicBool::new(false);
+static STACK_RECLAIMER: AtomicBool = AtomicBool::new(false);
 fn free_frames() -> u64 {
     let mut stats = phys::Stats::default();
     unsafe { phys::r4os_rust_phys_stats(&mut stats) };
@@ -255,13 +243,14 @@ unsafe fn reclaim(reason: u32, raw_requested: u32, vm_owner: Option<u64>) -> Res
         unsafe { task_context::leave(unwind) };
         return result;
     }
-    unsafe { r4os_zig_reclaim_ntfs(requested) };
+    let _ = unsafe { crate::fs::ntfs_adapter::reclaim(requested) };
     let mut stack = SourceResult::INIT;
     let stack_reclaimer = STACK_RECLAIMER.load(Acquire);
-    if stack_reclaimer != 0 {
+    if stack_reclaimer {
         let requested_stacks = requested.saturating_add(STACK_FRAMES - 1) / STACK_FRAMES;
-        let returned_stacks =
-            unsafe { r4os_zig_reclaim_stack_invoke(stack_reclaimer, requested_stacks) };
+        let returned_stacks = unsafe {
+            crate::sched::task::task_api::r4os_rust_task_control(17, u64::from(requested_stacks), 0)
+        } as u32;
         stack.returned_frames = returned_stacks.saturating_mul(STACK_FRAMES);
         stack.returned_bytes = u64::from(returned_stacks).saturating_mul(STACK_BYTES);
     }
@@ -277,20 +266,8 @@ unsafe fn reclaim(reason: u32, raw_requested: u32, vm_owner: Option<u64>) -> Res
     }
     let mut vm = SourceResult::INIT;
     let non_vm = stack.returned_frames.saturating_add(cache.returned_frames);
-    if non_vm < requested {
-        let callback = VM_RECLAIMER.load(Acquire);
-        if callback != 0 {
-            unsafe {
-                r4os_zig_reclaim_vm_invoke(
-                    callback,
-                    reason,
-                    requested - non_vm,
-                    vm_owner.unwrap_or(0),
-                    vm_owner.is_some(),
-                    &mut vm,
-                )
-            };
-        }
+    if non_vm < requested && VM_RECLAIMER.load(Acquire) {
+        vm = super::vm_pager::reclaim_evict(reason, requested - non_vm, vm_owner);
     }
     let after = free_frames();
     let result = Result {
@@ -417,13 +394,11 @@ fn snapshot() -> Summary {
     }
 }
 /// Register the exact existing callback address; C dispatch changes no state.
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_reclaim_register_vm(callback: usize) {
-    VM_RECLAIMER.store(callback, Release);
+pub(crate) fn register_vm() {
+    VM_RECLAIMER.store(true, Release)
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_reclaim_register_stack(callback: usize) {
-    STACK_RECLAIMER.store(callback, Release);
+pub(crate) fn register_stack() {
+    STACK_RECLAIMER.store(true, Release)
 }
 /// # Safety
 /// Caller permits original bounded, waiting reclaim and retains exact task

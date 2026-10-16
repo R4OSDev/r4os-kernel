@@ -2,7 +2,7 @@
 //! tables; per-CPU dispatch identity stays local. No Rust reference spans R4D.
 use crate::{
     arch::{ioapic, percpu, pic, runtime, smp_policy::MAX_CPUS},
-    build_bridge::config,
+    build_config::config,
     contract,
     platform::{monotonic, timer},
     sched::scheduler,
@@ -111,9 +111,7 @@ const fn initial() -> State {
 struct Shared(UnsafeCell<State>);
 unsafe impl Sync for Shared {}
 static STATE: Shared = Shared(UnsafeCell::new(initial()));
-unsafe extern "C" {
-    fn r4os_zig_irq_router_bad_handler(where_code: u8, irq: u8, address: u64, owner: u32);
-}
+
 fn raw() -> *mut State {
     STATE.0.get()
 }
@@ -131,7 +129,7 @@ fn report(where_code: u8, irq: u8, handler: Handler, owner: u32) {
     };
     runtime::restore_runtime(flags);
     if publish {
-        unsafe { r4os_zig_irq_router_bad_handler(where_code, irq, handler as usize as u64, owner) };
+        unsafe { irq_router_bad_handler(where_code, irq, handler as usize as u64, owner) };
     }
 }
 unsafe fn entry(index: usize, slot: usize) -> *mut Entry {
@@ -512,4 +510,21 @@ const _: () = {
 // Typed passive projection of the existing CPU-local dispatch depth.
 pub(crate) fn in_dispatch() -> bool {
     r4os_rust_irq_router_local(false) != 0
+}
+
+unsafe fn irq_router_bad_handler(where_code: u8, irq: u8, address: u64, owner: u32) {
+    use crate::boot::log_route as l;
+    l::puts(b"IRQROUTER BAD HANDLER ");
+    l::puts(match where_code {
+        0 => b"register",
+        1 => b"dispatch",
+        _ => panic!("Invalid IRQ handler diagnostic"),
+    });
+    l::puts(b" irq=");
+    l::dec(u64::from(irq));
+    l::puts(b" ptr=0x");
+    l::hex(address, 16);
+    l::puts(b" owner=");
+    l::dec(u64::from(owner));
+    l::puts(b"\r\n");
 }

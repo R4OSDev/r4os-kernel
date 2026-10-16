@@ -70,9 +70,7 @@ struct Storage(UnsafeCell<[Record; 8]>);
 // SAFETY: the historical R4D execution owner serializes these hardware calls.
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new([Record::EMPTY; 8]));
-unsafe extern "C" {
-    fn r4os_zig_driver_msi_log(msix: bool, irq: u8, vector: u32);
-}
+
 fn owner() -> u32 {
     admission::r4os_rust_driver_api_runtime_owner(false)
 }
@@ -264,7 +262,7 @@ fn enable_msix(
     }
     unsafe {
         (*STATE.0.get())[slot] = candidate;
-        r4os_zig_driver_msi_log(true, irq, vector)
+        driver_msi_log(true, irq, vector)
     };
     i32::from(irq)
 }
@@ -397,7 +395,7 @@ pub extern "C" fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, fun
     }
     unsafe {
         (*STATE.0.get())[slot] = candidate;
-        r4os_zig_driver_msi_log(false, irq, vector)
+        driver_msi_log(false, irq, vector)
     };
     i32::from(irq)
 }
@@ -466,4 +464,17 @@ pub unsafe extern "C" fn r4os_rust_driver_msi_cleanup(id: u32, out: *mut Cleanup
         result.removed += 1
     }
     unsafe { ptr::write(out, result) };
+}
+
+unsafe fn driver_msi_log(msix: bool, irq: u8, vector: u32) {
+    use crate::boot::log as l;
+    l::text(if msix {
+        b"[R4D] MSI-X prepared irq="
+    } else {
+        b"[R4D] MSI enabled irq="
+    });
+    l::r4os_rust_bootlog_dec(irq.into());
+    l::text(b" vector=");
+    l::r4os_rust_bootlog_dec(vector.into());
+    l::text(b"\r\n");
 }

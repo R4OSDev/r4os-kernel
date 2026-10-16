@@ -70,7 +70,6 @@ pub(super) unsafe fn state(slot: usize) -> *mut State {
     unsafe { STATES.0.get().cast::<State>().add(slot) }
 }
 pub(super) unsafe fn cache(s: *mut State) -> *mut Cache {
-    #[cfg(not(r4os_owner_fixture))]
     let _owner = crate::memory::owner::Guard::acquire(1);
     unsafe {
         let c = ptr::addr_of_mut!((*s).cache).cast::<Cache>();
@@ -187,7 +186,7 @@ pub(super) unsafe fn release(s: *mut State) {
         }
         (*s).upcase = ptr::null_mut();
         (*s).scratch = ptr::null_mut();
-        #[cfg(not(r4os_owner_fixture))]
+
         let _owner = crate::memory::owner::Guard::acquire(1);
         (*s).in_use = false;
         super::ntfs_volume_cache::with(cache(s), |cache| cache.invalidate_external());
@@ -285,7 +284,6 @@ pub(super) unsafe fn inspect(device: usize, first: u32, bound: Option<u64>) -> O
         (*s).mft_count = info.mft_run_count;
         super::ntfs_volume_cache::with(cache(s), |cache| cache.begin_mount(1000));
         {
-            #[cfg(not(r4os_owner_fixture))]
             let _owner = crate::memory::owner::Guard::acquire(1);
             (*s).in_use = true;
         }
@@ -298,7 +296,7 @@ pub(super) unsafe fn inspect(device: usize, first: u32, bound: Option<u64>) -> O
             (*s).upcase = heap::r4os_rust_heap_alloc(131072, 8);
             if (*s).upcase.is_null() {
                 fat_state::log(b"      NTFS mount failed: upcase alloc\r\n");
-                #[cfg(not(r4os_owner_fixture))]
+
                 let _owner = crate::memory::owner::Guard::acquire(1);
                 (*s).in_use = false;
                 return None;

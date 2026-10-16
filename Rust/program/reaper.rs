@@ -9,16 +9,7 @@ use crate::{
     sched::{scheduler, sync_objects},
 };
 use core::{mem, ptr};
-unsafe extern "C" {
-    fn r4os_zig_program_reap_action(
-        op: u8,
-        handle: Handle,
-        slot: *mut ProgramRegistrySlot,
-        node: *mut ProgramCompletionNode,
-        report: bool,
-    ) -> bool;
-    fn r4os_zig_program_reap_report(report: bool, stage: u8);
-}
+
 unsafe fn deferred(handle: Handle) -> u8 {
     unsafe { retire_phase::r4os_rust_program_retire_defer(handle) }
 }
@@ -60,7 +51,7 @@ unsafe fn action(
             6 => super::async_io::release_ranges(h),
             10 => super::instance_storage::detach(ptr::addr_of_mut!((*s).instance), n),
             11 => super::instance_storage::release(ptr::addr_of_mut!((*s).instance), n),
-            _ => r4os_zig_program_reap_action(op, h, s, n, r),
+            _ => program_reap_action(op, h, s, n, r),
         }
     }
 }
@@ -125,7 +116,7 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
         while phase != 5 {
             match phase {
                 0 => {
-                    r4os_zig_program_reap_report(report, 0);
+                    program_reap_report(report, 0);
                     if !action(0, handle, slot, node, report) {
                         return deferred(handle);
                     }
@@ -138,7 +129,7 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
                     phase = 1;
                 }
                 1 => {
-                    r4os_zig_program_reap_report(report, 1);
+                    program_reap_report(report, 1);
                     action(1, handle, slot, node, report);
                     if !action(2, handle, slot, node, report) {
                         return deferred(handle);
@@ -149,7 +140,7 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
                     if !action(4, handle, slot, node, report) {
                         return deferred(handle);
                     }
-                    r4os_zig_program_reap_report(report, 2);
+                    program_reap_report(report, 2);
                     if !action(5, handle, slot, node, report) {
                         return deferred(handle);
                     }
@@ -174,7 +165,7 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
                     phase = 2;
                 }
                 2 => {
-                    r4os_zig_program_reap_report(report, 3);
+                    program_reap_report(report, 3);
                     if !(*slot).retire_output_detached {
                         if !action(10, handle, slot, node, report) {
                             return deferred(handle);
@@ -190,7 +181,7 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
                     phase = 3;
                 }
                 3 => {
-                    r4os_zig_program_reap_report(report, 4);
+                    program_reap_report(report, 4);
                     if !(*slot).retire_storage_released {
                         if !action(11, handle, slot, node, report) {
                             return deferred(handle);
@@ -206,7 +197,7 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
                     phase = 4;
                 }
                 4 => {
-                    r4os_zig_program_reap_report(report, 5);
+                    program_reap_report(report, 5);
                     if !(*slot).retire_image_stack_released {
                         if !action(12, handle, slot, node, report) {
                             return deferred(handle);
@@ -231,7 +222,7 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
                 _ => unreachable!(),
             }
         }
-        r4os_zig_program_reap_report(report, 6);
+        program_reap_report(report, 6);
         if failure::consume(13) {
             return deferred(handle);
         }
@@ -272,7 +263,7 @@ pub unsafe extern "C" fn r4os_rust_program_reap_slot(slot: *mut ProgramRegistryS
         };
         registry::clear_slot(current);
         registry::unlock();
-        r4os_zig_program_reap_report(report, 7);
+        program_reap_report(report, 7);
         if auto_consume {
             completions::release(node);
         }
@@ -322,4 +313,58 @@ pub extern "C" fn r4os_rust_program_reaper_main() -> ! {
         }
         unsafe { sync_objects::r4os_rust_sync_event((*state()).event, 2, u64::MAX) };
     }
+}
+
+unsafe fn program_reap_action(
+    op: u8,
+    handle: Handle,
+    slot: *mut ProgramRegistrySlot,
+    node: *mut ProgramCompletionNode,
+    report: bool,
+) -> bool {
+    let _ = report;
+    unsafe {
+        match op {
+            7 => crate::program::system::stream::r4os_rust_sys_stream_cleanup(
+                handle.instance_id,
+                handle.generation,
+                0,
+                0,
+                false,
+            ),
+            8 => crate::storage::operations::release_owner(crate::storage::operations::Args {
+                program: handle.instance_id,
+                program_generation: handle.generation,
+                ..Default::default()
+            }),
+            9 => crate::audio::core::close_streams_for_owner(crate::audio::mixer::Owner {
+                instance_id: handle.instance_id,
+                generation: handle.generation,
+            }),
+            10 => crate::program::instance_storage::detach(
+                core::ptr::addr_of_mut!((*slot).instance),
+                node,
+            ),
+            11 => crate::program::instance_storage::release(
+                core::ptr::addr_of_mut!((*slot).instance),
+                node,
+            ),
+            _ => panic!("Invalid process reap peer action"),
+        }
+    }
+}
+
+unsafe fn program_reap_report(report: bool, stage: u8) {
+    let detail: &[u8] = match stage {
+        0 => b"SERVMAN: Abbruchpruefung",
+        1 => b"SERVMAN: Taskabbau",
+        2 => b"SERVMAN: I/O-Abbau",
+        3 => b"SERVMAN: Ausgabeabbau",
+        4 => b"SERVMAN: Kontextabbau",
+        5 => b"SERVMAN: Imageabbau",
+        6 => b"SERVMAN: Abschluss",
+        7 => b"SERVMAN: Bereit",
+        _ => panic!("Invalid reap stage"),
+    };
+    crate::program::entry::report_stage(report, detail, false);
 }

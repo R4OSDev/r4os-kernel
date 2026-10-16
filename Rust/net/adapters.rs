@@ -74,7 +74,7 @@ pub struct NativeAdapter {
     pub ops: NativeAdapterOps,
 }
 impl NativeAdapter {
-    pub(super) const EMPTY: Self = Self {
+    pub(crate) const EMPTY: Self = Self {
         registration_id: 0,
         name: Text::literal(b""),
         driver: Text::literal(b""),

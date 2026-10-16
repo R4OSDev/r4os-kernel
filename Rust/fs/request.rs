@@ -303,12 +303,7 @@ pub struct Stall {
     pub progress: u64,
     pub total: u64,
 }
-unsafe extern "C" {
-    // 0 = absent volume, 1 = volume with exact mounted reference,
-    // 2 = existing volume without an admitted mounted reference.
-    fn r4os_zig_fs_request_volume(letter: u8, output: *mut Reference) -> u8;
-    fn r4os_zig_fs_request_stall(snapshot: *const Stall);
-}
+
 fn read_only(kind: u32) -> bool {
     matches!(kind, 1 | 2 | 3 | 10 | 11 | 12 | 19 | 20)
 }
@@ -421,7 +416,7 @@ unsafe fn acquire_gate(lane: u8, mutation: bool) -> bool {
                 progress: state.progress.load(Relaxed),
                 total: state.total.load(Relaxed),
             };
-            unsafe { r4os_zig_fs_request_stall(&snapshot) };
+            unsafe { fs_request_stall(&snapshot) };
         }
         if slices >= SLICE_LIMIT {
             return false;
@@ -565,8 +560,7 @@ pub unsafe extern "C" fn r4os_rust_fs_request_begin(
         } else {
             for index in 0..usize::from(plan.count) {
                 let mut reference = Reference::default();
-                let result =
-                    unsafe { r4os_zig_fs_request_volume(b'A' + plan.lanes[index], &mut reference) };
+                let result = unsafe { fs_request_volume(b'A' + plan.lanes[index], &mut reference) };
                 if result == 0 {
                     continue;
                 }
@@ -882,4 +876,58 @@ impl Drop for ScopedRead {
             self.finish(false);
         }
     }
+}
+
+unsafe fn fs_request_volume(letter: u8, output: *mut Reference) -> u8 {
+    let Some(volume) = crate::fs::vfs::mounted_volume(letter) else {
+        return 0;
+    };
+    if !volume.has_ref {
+        return 2;
+    }
+    unsafe { output.write(volume.reference) };
+    1
+}
+
+unsafe fn fs_request_stall(snapshot: *const Stall) {
+    use crate::{boot::log_route as log, display::diag_screen as diag};
+    let s = unsafe { &*snapshot };
+    let incident = diag::begin_resolvable();
+    diag::text(b"[FSGATE] stall slice=");
+    diag::number(s.slices.into(), false);
+    diag::text(b" holder_task=");
+    diag::number(s.owner.into(), false);
+    diag::text(b" depth=");
+    diag::number(s.depth.into(), false);
+    diag::text(b" active_kind=");
+    diag::number(s.kind.into(), false);
+    diag::text(b" active_drive=");
+    diag::number(s.drive.into(), false);
+    if s.phase != 0 {
+        diag::text(b" phase=");
+        diag::number(s.phase.into(), false);
+        diag::text(b" progress=");
+        diag::number(s.progress, false);
+        diag::text(b"/");
+        diag::number(s.total, false)
+    }
+    diag::end_line();
+    let _ = diag::resolve(incident);
+    log::puts(b"[FSGATE] stall slice=");
+    log::dec(s.slices.into());
+    log::puts(b" holder_task=");
+    log::dec(s.owner.into());
+    log::puts(b" active_kind=");
+    log::dec(s.kind.into());
+    log::puts(b" active_drive=");
+    log::dec(s.drive.into());
+    if s.phase != 0 {
+        log::puts(b" phase=");
+        log::dec(s.phase.into());
+        log::puts(b" progress=");
+        log::dec(s.progress);
+        log::puts(b"/");
+        log::dec(s.total)
+    }
+    log::puts(b"\r\n");
 }

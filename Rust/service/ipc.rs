@@ -2,7 +2,7 @@
 //! admission/completion publication. No channel borrow spans wait or handler.
 use super::{ipc_types::*, queue};
 use crate::{
-    build_bridge::config,
+    build_config::config,
     driver::irq_router,
     fs::vfs_types::Bytes,
     platform::{clock_math, monotonic, timer},
@@ -28,7 +28,7 @@ const STAMP: monotonic::Stamp = monotonic::Stamp {
 struct Message {
     meta: queue::SlotMeta,
     channel_generation: u64,
-    handler: usize,
+    handler: Option<Handler>,
     completion: Completion,
     submitted_at: monotonic::Stamp,
     started_at: monotonic::Stamp,
@@ -47,7 +47,7 @@ impl Message {
             completion_published: false,
         },
         channel_generation: 0,
-        handler: 0,
+        handler: None,
         completion: Completion {
             completed: 0,
             queue: WaitQueue::EMPTY,
@@ -70,7 +70,7 @@ struct Channel {
     receives: u64,
     drops: u64,
     service_name: Bytes,
-    handler: usize,
+    handler: Option<Handler>,
     handler_owner: u32,
     queue: [Message; QUEUE_DEPTH],
     lifetime: Lifetime,
@@ -100,7 +100,7 @@ impl Channel {
             data: ptr::null(),
             len: 0,
         },
-        handler: 0,
+        handler: None,
         handler_owner: 0,
         queue: [const { Message::EMPTY }; QUEUE_DEPTH],
         lifetime: Lifetime::EMPTY,
@@ -143,17 +143,8 @@ static ECHO_TESTS: AtomicU64 = AtomicU64::new(0);
 static IRQ_DENIED: AtomicU64 = AtomicU64::new(0);
 static IDLE_WAITS: AtomicU64 = AtomicU64::new(0);
 static WAKES: AtomicU64 = AtomicU64::new(0);
-unsafe extern "C" {
-    // Preserve the typed Zig handler ABI until its later assigned owner wave.
-    // This hook stores no channel, slot or worker state.
-    fn r4os_zig_ipc_handler(
-        handler: usize,
-        channel: u32,
-        data: Bytes,
-        output: *mut u8,
-        capacity: usize,
-    ) -> i32;
-}
+pub type Handler = unsafe fn(u32, Bytes, *mut u8, usize) -> i32;
+
 fn channel(index: usize) -> *mut Channel {
     assert!(index < MAX_CHANNELS);
     CHANNELS.0.get().cast::<Channel>().wrapping_add(index)
@@ -308,7 +299,7 @@ unsafe fn reset(slot: *mut Message) {
             ..queue::SlotMeta::default()
         };
         (*slot).channel_generation = 0;
-        (*slot).handler = 0;
+        (*slot).handler = None;
         (*slot).submitted_at = STAMP;
         (*slot).started_at = STAMP;
     }
@@ -326,7 +317,7 @@ unsafe fn prepare(ch: *mut Channel, slot: *mut Message, mode: u8, len: usize) {
             ..queue::SlotMeta::default()
         };
         (*slot).channel_generation = (*ch).generation;
-        (*slot).handler = 0;
+        (*slot).handler = None;
         (*slot).completion = Completion {
             completed: 0,
             queue: WaitQueue::EMPTY,
@@ -611,9 +602,7 @@ unsafe fn admit_handler(
         }
         let generation = (*ch).generation;
         let handler = (*ch).handler;
-        if handler == 0 {
-            return None;
-        }
+        handler?;
         if mode == queue::QUEUED_RESPONSE {
             (*ch).lifetime.send_calls = (*ch).lifetime.send_calls.wrapping_add(1);
         } else {
@@ -666,7 +655,10 @@ unsafe fn admit_handler(
                 leave_unwind(unwind);
                 return None;
             }
-            if !(*ch).active || (*ch).generation != generation || (*ch).handler != handler {
+            if !(*ch).active
+                || (*ch).generation != generation
+                || (*ch).handler.map(|f| f as usize) != handler.map(|f| f as usize)
+            {
                 guard.release();
                 release_permit(ch);
                 leave_unwind(unwind);
@@ -883,7 +875,7 @@ unsafe fn invoke_direct(
         };
         let ch = guard.channel;
         let handler = (*ch).handler;
-        if handler == 0 {
+        if handler.is_none() {
             guard.release();
             return fail();
         }
@@ -911,7 +903,7 @@ unsafe fn invoke_direct(
         }
         guard.release();
         let started = stamp();
-        let produced = r4os_zig_ipc_handler(handler, id, payload, response, capacity);
+        let produced = handler.unwrap()(id, payload, response, capacity);
         let completed = stamp();
         let Some(mut guard) = ChannelGuard::acquire(i) else {
             return fail();
@@ -1007,7 +999,7 @@ pub(crate) unsafe fn send(id: u32, payload: Bytes) -> i32 {
         if !(*ch).active {
             activate(ch, id);
         }
-        let handler = (*ch).handler != 0;
+        let handler = (*ch).handler.is_some();
         let on_worker = current_worker().is_some();
         guard.release();
         if !handler {
@@ -1059,7 +1051,7 @@ struct WorkerTarget {
     channel_generation: u64,
     slot: usize,
     slot_generation: u64,
-    handler: usize,
+    handler: Option<Handler>,
 }
 unsafe fn take_next(lane: usize) -> Option<WorkerTarget> {
     unsafe {
@@ -1082,7 +1074,7 @@ unsafe fn take_next(lane: usize) -> Option<WorkerTarget> {
             }
             let slot = message(ch, selection.selection.index);
             let handler = (*slot).handler;
-            if handler == 0 {
+            if handler.is_none() {
                 (*slot).meta.result = -1;
                 (*slot).meta.state = queue::HANDLER_DONE;
                 let completion = ptr::addr_of_mut!((*slot).completion);
@@ -1142,13 +1134,7 @@ unsafe fn run_target(lane: usize, target: WorkerTarget) {
             len: usize::from((*slot).meta.len),
         };
         let response = ptr::addr_of_mut!((*worker(lane)).response).cast();
-        let produced = r4os_zig_ipc_handler(
-            target.handler,
-            (*ch).id,
-            payload,
-            response,
-            MAX_MESSAGE_SIZE,
-        );
+        let produced = target.handler.unwrap()((*ch).id, payload, response, MAX_MESSAGE_SIZE);
         let completed = stamp();
         let Some(mut guard) = ChannelGuard::acquire(target.channel) else {
             return;
@@ -1269,10 +1255,8 @@ pub unsafe extern "C" fn r4os_rust_ipc_control(operation: u8, id: u32) -> i32 {
     }
 }
 /// # Safety
-/// Name and opaque original handler address retain their original kernel
-/// lifetime. This hook transports the address, never calls the Zig ABI as C.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_ipc_register(id: u32, name: Bytes, handler: usize) -> i32 {
+/// Name and typed resident handler retain their kernel lifetime.
+pub unsafe fn register(id: u32, name: Bytes, handler: Option<Handler>) -> i32 {
     unsafe {
         if deny_irq() {
             return fail();
@@ -1287,7 +1271,9 @@ pub unsafe extern "C" fn r4os_rust_ipc_register(id: u32, name: Bytes, handler: u
         if !(*ch).active {
             activate(ch, id);
         }
-        if (*ch).handler != handler || !same_text((*ch).service_name, name) {
+        if (*ch).handler.map(|f| f as usize) != handler.map(|f| f as usize)
+            || !same_text((*ch).service_name, name)
+        {
             (*ch).generation = next((*ch).generation);
         }
         (*ch).service_name = name;
@@ -1368,7 +1354,7 @@ pub unsafe extern "C" fn r4os_rust_ipc_channel(id: u32, output: *mut ChannelInfo
             queued: select(ch, 4, 0).selection.index as u32,
             queue_depth: QUEUE_DEPTH as u32,
             max_message_size: MAX_MESSAGE_SIZE as u32,
-            has_handler: u32::from((*ch).handler != 0),
+            has_handler: u32::from((*ch).handler.is_some()),
             opens: (*ch).opens,
             closes: (*ch).closes,
             sends: (*ch).sends,

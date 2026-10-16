@@ -1,7 +1,7 @@
 //! Single CPU-local table. BSP configures immutable identities before AP
 //! publication; runtime admission serializes lifecycle and scheduling masks.
 //! The CPU-bound depth slot is raw C storage, accessed with local IF=0.
-#[cfg(not(r4os_owner_fixture))]
+
 use super::msr;
 use super::{runtime::RuntimeGuard, smp_policy::MAX_CPUS};
 use core::{
@@ -45,7 +45,7 @@ static READY: AtomicBool = AtomicBool::new(false);
 static SCHEDULABLE: AtomicU64 = AtomicU64::new(0);
 static PRODUCTIVE_KERNEL: AtomicU64 = AtomicU64::new(0);
 static PRODUCTIVE_R4X: AtomicU64 = AtomicU64::new(0);
-#[cfg(not(r4os_owner_fixture))]
+
 unsafe extern "C" {
     fn r4os_current_cpu_index() -> u32;
 }
@@ -58,9 +58,6 @@ fn local(index: u32) -> Option<*mut CpuLocal> {
     }
 }
 pub fn current_index() -> u32 {
-    #[cfg(r4os_owner_fixture)]
-    return 0;
-    #[cfg(not(r4os_owner_fixture))]
     {
         if !READY.load(Ordering::Acquire) {
             return 0;
@@ -71,14 +68,12 @@ pub fn current_index() -> u32 {
 }
 fn install(index: u32) {
     let Some(local) = local(index) else { return };
-    #[cfg(not(r4os_owner_fixture))]
+
     unsafe {
         // R4OS does not swapgs; both bases retain the exact installed slot.
         msr::write(0xc000_0101, local.addr() as u64);
         msr::write(0xc000_0102, local.addr() as u64);
     }
-    #[cfg(r4os_owner_fixture)]
-    let _ = local;
 }
 fn init_bsp(apic_id: u32) {
     for index in 0..MAX_CPUS as u32 {

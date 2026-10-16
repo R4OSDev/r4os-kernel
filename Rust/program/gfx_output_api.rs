@@ -350,6 +350,7 @@ pub unsafe fn request_brightness(
     })())
 }
 #[repr(C)]
+#[derive(Default)]
 pub struct Args {
     pub owner: Owner,
     pub ticket: u64,

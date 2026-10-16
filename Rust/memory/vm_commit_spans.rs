@@ -420,6 +420,3 @@ const _: () = {
     assert!(core::mem::offset_of!(Span, prev) == 24);
     assert!(core::mem::size_of::<Stats>() == 32);
 };
-#[cfg(r4os_owner_fixture)]
-#[path = "../../Tests/RustOwners/vm_metadata_cases.rs"]
-mod owner_cases;

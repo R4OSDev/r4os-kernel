@@ -186,3 +186,94 @@ pub extern "C" fn r4os_rust_driver_boot(operation: u8) -> bool {
     runtime::restore_runtime(flags);
     initialized
 }
+
+pub(crate) fn get(slot: usize) -> Option<Entry> {
+    let mut e = core::mem::MaybeUninit::uninit();
+    unsafe { r4os_rust_driver_registry_get(slot, e.as_mut_ptr()).then(|| e.assume_init()) }
+}
+pub(crate) fn source_name(v: u8) -> &'static [u8] {
+    match v {
+        0 => b"builtin",
+        1 => b"r4d",
+        2 => b"preload",
+        _ => panic!("Invalid driver source"),
+    }
+}
+pub(crate) fn state_name(v: u8) -> &'static [u8] {
+    match v {
+        0 => b"EMPTY",
+        1 => b"GELADEN",
+        2 => b"INITIALISIERT",
+        3 => b"AKTIV",
+        4 => b"SHUTDOWN",
+        5 => b"ENTLADEN",
+        6 => b"FAILED",
+        7 => b"QUARANTINED",
+        _ => panic!("Invalid driver state"),
+    }
+}
+pub(crate) fn type_name(v: u16) -> &'static [u8] {
+    match v {
+        1 => b"audio",
+        2 => b"storage",
+        3 => b"input",
+        4 => b"synth",
+        5 => b"net",
+        6 => b"display",
+        255 => b"misc",
+        _ => b"unknown",
+    }
+}
+pub(crate) fn log_state(slot: usize) {
+    if let Some(e) = get(slot) {
+        use crate::boot::log as l;
+        l::text(b"[DRIVER] ");
+        l::text(&e.name[..e.name_len]);
+        l::text(b" (");
+        l::text(source_name(e.source));
+        l::text(b"/");
+        l::text(type_name(e.driver_type));
+        l::text(b") -> ");
+        l::text(state_name(e.state));
+        l::text(b"\r\n");
+    }
+}
+pub(crate) fn set_state_logged(slot: usize, state: u8) {
+    r4os_rust_driver_registry_set_state(slot, state);
+    log_state(slot);
+}
+pub(crate) unsafe fn begin_logged(
+    name: &[u8],
+    kind: u16,
+    version: u32,
+    source: u8,
+) -> Option<usize> {
+    let slot = unsafe {
+        r4os_rust_driver_registry_begin(name.as_ptr(), name.len(), kind, version, source)
+    };
+    if slot == usize::MAX {
+        None
+    } else {
+        log_state(slot);
+        Some(slot)
+    }
+}
+pub(crate) fn log_registry() {
+    use crate::boot::log as l;
+    l::text(b"[DRIVER] registry:\r\n");
+    for slot in 0..MAX_DRIVERS {
+        if let Some(e) = get(slot) {
+            l::text(b"[DRIVER]   ");
+            l::text(&e.name[..e.name_len]);
+            l::text(b" src=");
+            l::text(source_name(e.source));
+            l::text(b" type=");
+            l::text(type_name(e.driver_type));
+            l::text(b" v=");
+            l::r4os_rust_bootlog_dec(u64::from(e.version));
+            l::text(b" state=");
+            l::text(state_name(e.state));
+            l::text(b"\r\n");
+        }
+    }
+}

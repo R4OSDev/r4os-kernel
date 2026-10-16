@@ -133,9 +133,7 @@ static GUARD: Guard = Guard(UnsafeCell::new(UnwindGuard {
         },
     },
 }));
-unsafe extern "C" {
-    fn r4os_zig_r4d_table() -> *const api::DriverApi;
-}
+
 fn span(s: &[u8]) -> t::Bytes {
     ctl::span(s)
 }
@@ -695,7 +693,7 @@ fn init_module(slot: usize, source: u8) -> u8 {
         admission::r4os_rust_driver_api_leave();
         return LOAD_FAILED;
     }
-    let result = unsafe { init(r4os_zig_r4d_table()) };
+    let result = unsafe { init(crate::driver::api_admission::table()) };
     admission::r4os_rust_driver_api_leave();
     if result != 0 {
         log(b"[R4D] init failed code=");

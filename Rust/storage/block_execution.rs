@@ -36,27 +36,11 @@ pub struct View {
     pub bus: u8,
     pub queue_depth: *mut u16,
 }
-unsafe extern "C" {
-    // Temporary stateless view/backend adapters to original Zig ABI call
-    // shapes. Their bodies must only copy fields or call the exact backend;
-    // Rust owns validation, publication, timeout, cancellation and cleanup.
-    fn r4os_zig_block_execution_view(device: *mut c_void, out: *mut View);
-    fn r4os_zig_block_backend(
-        device: *mut c_void,
-        request: *const block_state::Execution,
-        operation: u8,
-        reason: u32,
-    ) -> i32;
-    // Generic diagnostic substrate belongs to its later migration wave.
-    // Token generations remain exact and are resolved on every return.
-    fn r4os_zig_block_incident_resolve(generation: u64);
-    // Pure leaf projection of drive metadata (drive ownership migrates .14).
-    fn r4os_zig_block_mount_index(index: usize, out: *mut usize) -> bool;
-}
+
 pub(crate) unsafe fn view(device: *mut c_void) -> View {
     let mut out = MaybeUninit::uninit();
     unsafe {
-        r4os_zig_block_execution_view(device, out.as_mut_ptr());
+        block_execution_view(device, out.as_mut_ptr());
         out.assume_init()
     }
 }
@@ -88,7 +72,7 @@ impl Drop for Incident {
     fn drop(&mut self) {
         if self.0 != 0 {
             unsafe {
-                r4os_zig_block_incident_resolve(self.0);
+                block_incident_resolve(self.0);
             }
         }
     }
@@ -465,7 +449,9 @@ unsafe fn execute(
         3 if !v.io.has_flush => 0,
         0 => 2,
         1..=3 => {
-            if unsafe { r4os_zig_block_backend(device, &request, request.kind, 0) } != 0 {
+            if unsafe { crate::storage::block_device::backend(device, &request, request.kind, 0) }
+                != 0
+            {
                 0
             } else {
                 block_requests::r4os_rust_block_backend_error(request.kind)
@@ -488,7 +474,7 @@ unsafe fn submit(device: *mut c_void, v: View, request: block_state::Execution) 
         }
         return;
     };
-    let result = unsafe { r4os_zig_block_backend(device, &request, 4, 0) };
+    let result = unsafe { crate::storage::block_device::backend(device, &request, 4, 0) };
     if result == 0 {
         return;
     }
@@ -603,7 +589,7 @@ unsafe fn cancel(device: *mut c_void, v: View, request: block_state::Execution, 
     stat(v, 1, 37, 1);
     accounting::r4os_rust_block_runtime_change(1, 24, 1);
     unsafe {
-        r4os_zig_block_backend(device, &request, 5, reason);
+        crate::storage::block_device::backend(device, &request, 5, reason);
     }
 }
 unsafe fn abort(device: *mut c_void, v: View, id: u64, error: u8, reason: u32) -> Abort {
@@ -923,7 +909,7 @@ unsafe fn reset(device: *mut c_void, reason: u32) -> bool {
     accounting::r4os_rust_block_runtime_change(1, 25, 1);
     // A zero backend result is the existing independent physical quiescence
     // acknowledgement. No stale completion or logical close can substitute.
-    if unsafe { r4os_zig_block_backend(device, ptr::null(), 6, reason) } != 0 {
+    if unsafe { crate::storage::block_device::backend(device, ptr::null(), 6, reason) } != 0 {
         let _lock = unsafe { lock(device, v) };
         state(v, 5, 0, 0, 0);
         return false;
@@ -974,7 +960,7 @@ pub struct Retirement {
 unsafe fn mounted(index: usize) -> bool {
     for letter in 0..26 {
         let mut device = 0;
-        if unsafe { r4os_zig_block_mount_index(letter, &mut device) } && device == index {
+        if unsafe { block_mount_index(letter, &mut device) } && device == index {
             return true;
         }
     }
@@ -1231,7 +1217,7 @@ pub unsafe extern "C" fn r4os_rust_block_exclude(bus: u8) -> bool {
     }
     for mounted in 0..26 {
         let mut index = 0;
-        if unsafe { r4os_zig_block_mount_index(mounted, &mut index) }
+        if unsafe { block_mount_index(mounted, &mut index) }
             && let Some(slot) = unsafe { registered(index, 1, 0) }
             && unsafe { view(slot.device) }.bus == bus
         {
@@ -1295,4 +1281,23 @@ pub unsafe extern "C" fn r4os_rust_block_device_operation(
         block_registry::r4os_rust_block_registry_unpin(&mut pin);
     }
     result
+}
+
+unsafe fn block_incident_resolve(generation: u64) {
+    let _ = crate::display::diag_screen::resolve(generation);
+}
+
+unsafe fn block_execution_view(device: *mut c_void, out: *mut View) {
+    unsafe { out.write(crate::storage::block_device::execution_view(device)) }
+}
+
+unsafe fn block_mount_index(index: usize, out: *mut usize) -> bool {
+    unsafe {
+        let p = crate::fs::drive::r4os_rust_fs_drive_lookup(2, index);
+        if p.is_null() || !(*p).has_block {
+            return false;
+        }
+        out.write((*p).block_index);
+        true
+    }
 }

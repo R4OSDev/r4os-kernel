@@ -1,7 +1,7 @@
 //! Fixed bootlog storage, guarded by the original rank-70 owner.
 use super::owner::Guard;
 use core::cell::UnsafeCell;
-const CAPACITY: usize = 65536;
+pub(crate) const CAPACITY: usize = 65536;
 struct State {
     bytes: [u8; CAPACITY],
     cursor: usize,
@@ -118,4 +118,38 @@ pub unsafe extern "C" fn r4os_rust_bootlog_read(
         unsafe { output.add(index).write(state.bytes[source]) };
     }
     count
+}
+
+/// Synchronous bounded ring append from a retained native span.
+pub fn text(bytes: &[u8]) {
+    unsafe { r4os_rust_bootlog_write(bytes.as_ptr(), bytes.len()) }
+}
+
+/// Bounded original log-line formatting; raw owner names need not be UTF-8.
+pub(crate) struct Line<const N: usize> {
+    bytes: [u8; N],
+    len: usize,
+}
+impl<const N: usize> Line<N> {
+    pub(crate) fn new() -> Self {
+        Self {
+            bytes: [0; N],
+            len: 0,
+        }
+    }
+    pub(crate) fn append(&mut self, bytes: &[u8]) {
+        let end = self.len.checked_add(bytes.len()).expect("Log line size");
+        assert!(end <= N, "Original log line capacity");
+        self.bytes[self.len..end].copy_from_slice(bytes);
+        self.len = end;
+    }
+    pub(crate) fn emit(self) {
+        text(&self.bytes[..self.len]);
+    }
+}
+impl<const N: usize> core::fmt::Write for Line<N> {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        self.append(text.as_bytes());
+        Ok(())
+    }
 }

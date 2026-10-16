@@ -23,3 +23,9 @@ pub mod normal_boot;
 pub mod operations;
 pub mod partition_table;
 pub mod split;
+
+pub(crate) mod block_device;
+
+pub(crate) mod installation_json;
+
+pub(crate) mod block_probes;

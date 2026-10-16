@@ -7,23 +7,7 @@ use crate::{
     },
 };
 use core::{ffi::c_void, ptr};
-unsafe extern "C" {
-    fn r4os_zig_driver_usb(
-        op: u8,
-        name: *const u8,
-        len: usize,
-        owner: u32,
-        source: u32,
-        descriptor: *const a::UsbHostController,
-    ) -> isize;
-    fn r4os_zig_driver_blit(
-        register: bool,
-        name: *const u8,
-        len: usize,
-        owner: u32,
-        descriptor: *const c_void,
-    ) -> i32;
-}
+
 fn puts(s: &[u8]) {
     unsafe { log::r4os_rust_bootlog_write(s.as_ptr(), s.len()) }
 }
@@ -112,14 +96,14 @@ pub unsafe extern "C" fn r4os_rust_driver_usb_register(
         return -1;
     }
     let slice = unsafe { text(name) };
-    if unsafe { r4os_zig_driver_usb(0, slice.as_ptr(), slice.len(), 0, 0, ptr::null()) } != 0 {
+    if unsafe { driver_usb(0, slice.as_ptr(), slice.len(), 0, 0, ptr::null()) } != 0 {
         puts(b"[R4D][ERROR] usb host duplicate name ");
         unsafe { put_z(name) };
         puts(b"\r\n");
         return -2;
     }
     let index = unsafe {
-        r4os_zig_driver_usb(
+        driver_usb(
             1,
             slice.as_ptr(),
             slice.len(),
@@ -140,7 +124,7 @@ pub unsafe extern "C" fn r4os_rust_driver_usb_register(
 pub unsafe extern "C" fn r4os_rust_driver_usb_unregister(name: *const u8) -> i32 {
     let slice = unsafe { text(name) };
     if unsafe {
-        r4os_zig_driver_usb(
+        driver_usb(
             2,
             slice.as_ptr(),
             slice.len(),
@@ -171,7 +155,7 @@ pub unsafe extern "C" fn r4os_rust_driver_usb_activate(name: *const u8, source: 
         return -2;
     }
     (unsafe {
-        r4os_zig_driver_usb(
+        driver_usb(
             3,
             ptr::null(),
             0,
@@ -194,7 +178,7 @@ pub unsafe extern "C" fn r4os_rust_driver_blit(
         return -1;
     }
     let slice = unsafe { text(name) };
-    let result = unsafe { r4os_zig_driver_blit(register, slice.as_ptr(), slice.len(), owner, d) };
+    let result = unsafe { driver_blit(register, slice.as_ptr(), slice.len(), owner, d) };
     if register && result == 0 {
         puts(b"[R4D] register display blit backend ");
         unsafe { put_z(name) };
@@ -245,4 +229,59 @@ pub unsafe extern "C" fn r4os_rust_driver_input(name: *const u8) -> i32 {
     unsafe { put_z(name) };
     puts(b"\r\n");
     0
+}
+
+unsafe fn driver_blit(
+    register: bool,
+    name: *const u8,
+    len: usize,
+    owner: u32,
+    descriptor: *const c_void,
+) -> i32 {
+    unsafe {
+        if register {
+            crate::display::blit_backend::r4os_rust_display_blit_register(
+                owner,
+                name,
+                len,
+                descriptor.cast(),
+            )
+        } else {
+            crate::display::blit_backend::r4os_rust_display_blit_unregister(owner, name, len)
+        }
+    }
+}
+
+unsafe fn driver_usb(
+    op: u8,
+    name: *const u8,
+    len: usize,
+    owner: u32,
+    source: u32,
+    descriptor: *const a::UsbHostController,
+) -> isize {
+    unsafe {
+        use crate::usb::host_controller as h;
+        match op {
+            0 => isize::from(h::r4os_rust_usb_host_find(name, len) != usize::MAX),
+            1 => {
+                let i = h::r4os_rust_usb_host_register(
+                    name,
+                    len,
+                    descriptor.cast(),
+                    owner,
+                    false,
+                    Some(crate::boot::log::r4os_rust_bootlog_write),
+                );
+                if i == usize::MAX {
+                    -1
+                } else {
+                    i.try_into().unwrap()
+                }
+            }
+            2 => isize::from(h::r4os_rust_usb_host_unregister_name(name, len, owner)),
+            3 => crate::usb::xhci_api::r4os_rust_usb_xhci_activate(owner, source) as isize,
+            _ => panic!("Invalid USB host operation"),
+        }
+    }
 }

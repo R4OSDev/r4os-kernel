@@ -63,11 +63,7 @@ fn state() -> *mut State {
 pub extern "C" fn r4os_rust_program_console_state() -> *mut State {
     state()
 }
-unsafe extern "C" {
-    // Current-console selection still belongs to the input/context owner.
-    // Raw serial/framebuffer and desktop event owners retain their own work.
-    fn r4os_zig_program_console_sink(op: u8, a: u32, b: u32);
-}
+
 pub(super) struct OutputGuard;
 impl OutputGuard {
     pub(super) fn acquire() -> Option<Self> {
@@ -625,9 +621,9 @@ unsafe fn mirror(instance: *const ProgramInstance, ch: u8) {
         if (*payload::console(instance)).host != 2 {
             return;
         }
-        r4os_zig_program_console_sink(0, u32::from(ch), 0);
+        program_console_sink(0, u32::from(ch), 0);
         if raw_presenter(instance) {
-            r4os_zig_program_console_sink(1, u32::from(ch), 0);
+            program_console_sink(1, u32::from(ch), 0);
         }
     }
 }
@@ -776,7 +772,7 @@ unsafe fn revision(instance: *mut ProgramInstance, present: bool, output: bool) 
             }
         }
         if present {
-            r4os_zig_program_console_sink(4, 0, 0);
+            program_console_sink(4, 0, 0);
         }
     }
 }
@@ -796,7 +792,7 @@ unsafe fn clear_state(instance: *mut ProgramInstance) {
         (*console).state.cursor_y = 0;
         (*console).state.cursor_visible = 1;
         if raw_presenter(instance) {
-            r4os_zig_program_console_sink(2, 0, 0);
+            program_console_sink(2, 0, 0);
         }
     }
 }
@@ -1423,7 +1419,7 @@ pub unsafe extern "C" fn r4os_rust_program_console_host(
                 (*console).state.fg = a;
                 (*console).state.bg = b;
                 if raw_presenter(instance) {
-                    r4os_zig_program_console_sink(3, a, b);
+                    program_console_sink(3, a, b);
                 }
                 revision(instance, true, false);
                 1
@@ -1478,6 +1474,21 @@ const _: () = {
 
 pub(super) unsafe fn sink(op: u8, a: u32, b: u32) {
     unsafe {
-        r4os_zig_program_console_sink(op, a, b);
+        program_console_sink(op, a, b);
+    }
+}
+
+unsafe fn program_console_sink(op: u8, a: u32, b: u32) {
+    use crate::boot::log_route as log;
+    match op {
+        0 => log::serial_putc_raw(u8::try_from(a).unwrap()),
+        1 => log::console_putc_raw(u8::try_from(a).unwrap()),
+        2 => log::clear_console(),
+        3 => {
+            log::r4os_rust_log_control(6, a, b, 0, 0);
+        }
+        4 => crate::service::desktop_events::r4os_rust_desktop_signal(),
+        5 => crate::boot::log::text(&[u8::try_from(a).unwrap()]),
+        _ => panic!("Invalid console sink"),
     }
 }

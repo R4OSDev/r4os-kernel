@@ -274,55 +274,19 @@ impl Drop for Locked {
 fn lock() -> Option<Locked> {
     Locked::acquire(LOCK.0.get())
 }
-unsafe extern "C" {
-    fn r4os_zig_program_async_option(retry: bool, out: *mut Bytes) -> bool;
-    // Lower R4SYS/service owners perform only the selected primitive operation.
-    fn r4os_zig_program_async_file(
-        kind: u32,
-        path: *const u8,
-        offset: u64,
-        data: *const u8,
-        len: u32,
-        out: *mut u8,
-        out_len: u32,
-        flags: u32,
-    ) -> i32;
-    fn r4os_zig_program_async_file_info(path: *const u8, out: *mut c::FileInfo) -> i32;
-    fn r4os_zig_program_async_service_submit(
-        handle: u32,
-        client: u32,
-        op: u16,
-        data: *const u8,
-        len: u32,
-        timeout: u64,
-        token: *mut task_context::Unwind,
-    ) -> i32;
-    fn r4os_zig_program_async_service_take(
-        handle: u32,
-        id: u32,
-        header: *mut Header,
-        data: *mut u8,
-        len: u32,
-    ) -> i32;
-    fn r4os_zig_program_async_service_control(
-        wait: bool,
-        handle: u32,
-        id: u32,
-        timeout: u64,
-    ) -> i32;
-}
+
 fn retry_allowed() -> bool {
     unsafe {
         let mut value = Bytes {
             data: ptr::null(),
             len: 0,
         };
-        if !r4os_zig_program_async_option(false, &mut value)
+        if !program_async_option(false, &mut value)
             || !slice::from_raw_parts(value.data, value.len).eq_ignore_ascii_case(b"yes")
         {
             return false;
         }
-        !r4os_zig_program_async_option(true, &mut value)
+        !program_async_option(true, &mut value)
             || slice::from_raw_parts(value.data, value.len).eq_ignore_ascii_case(b"yes")
     }
 }
@@ -1348,7 +1312,7 @@ pub(super) unsafe fn cancel(handle: Handle, caller: Option<(u32, u64)>) -> bool 
                 return true;
             };
             if value.service_request_id != 0 {
-                r4os_zig_program_async_service_control(
+                program_async_service_control(
                     false,
                     value.service_handle,
                     value.service_request_id,
@@ -1586,7 +1550,7 @@ pub(super) unsafe fn release_ranges(handle: Handle) -> bool {
 unsafe fn file_info(path: *const u8) -> i32 {
     unsafe {
         let mut info = c::FileInfo::default();
-        let result = r4os_zig_program_async_file_info(path, &mut info);
+        let result = program_async_file_info(path, &mut info);
         if result == 0 {
             return NOT_FOUND;
         }
@@ -1645,7 +1609,7 @@ unsafe fn perform(req: *mut Request) -> i32 {
             Kind::Lock => file_lock(req),
             Kind::Service => perform_service(req),
             kind => {
-                let result = r4os_zig_program_async_file(
+                let result = program_async_file(
                     kind as u32,
                     path,
                     (*req).offset,
@@ -1753,7 +1717,7 @@ unsafe fn service_core(
             timer::r4os_rust_timer_control(6, start, timeout)
         };
         let mut token = task_context::Unwind::EMPTY;
-        let raw = r4os_zig_program_async_service_submit(
+        let raw = program_async_service_submit(
             handle,
             (*instance).id,
             op,
@@ -1767,19 +1731,18 @@ unsafe fn service_core(
         }
         let id = raw as u32;
         if !publish_service(req, id) {
-            r4os_zig_program_async_service_control(false, handle, id, 0);
+            program_async_service_control(false, handle, id, 0);
             task_context::leave(token);
             return CANCELLED;
         }
         if !task_context::leave(token) {
-            r4os_zig_program_async_service_control(false, handle, id, 0);
+            program_async_service_control(false, handle, id, 0);
             clear_service(req, id);
             return BUSY;
         }
         let _identity = ServiceIdentity(req, id);
         loop {
-            let result =
-                r4os_zig_program_async_service_take(handle, id, header, response, capacity);
+            let result = program_async_service_take(handle, id, header, response, capacity);
             if result < 0 {
                 return result;
             }
@@ -1791,16 +1754,16 @@ unsafe fn service_core(
                 break;
             }
             let remaining = if forever { u64::MAX } else { deadline - now };
-            let waited = r4os_zig_program_async_service_control(true, handle, id, remaining);
+            let waited = program_async_service_control(true, handle, id, remaining);
             if waited == c::service_api_result_timeout {
                 break;
             }
             if waited < 0 {
-                r4os_zig_program_async_service_control(false, handle, id, 0);
+                program_async_service_control(false, handle, id, 0);
                 return waited;
             }
         }
-        r4os_zig_program_async_service_control(false, handle, id, 0);
+        program_async_service_control(false, handle, id, 0);
         c::service_api_result_timeout
     }
 }
@@ -1852,7 +1815,7 @@ pub struct StreamOwner {
     pub task_generation: u64,
     pub program_generation: u64,
 }
-unsafe fn stream_owner() -> Option<StreamOwner> {
+pub(crate) unsafe fn stream_owner() -> Option<StreamOwner> {
     unsafe {
         let thread = threads::current();
         let owner = if !thread.is_null() {
@@ -1907,3 +1870,105 @@ const _: () = {
     assert!(mem::offset_of!(StreamOwner, task_generation) == 8);
     assert!(mem::offset_of!(StreamOwner, program_generation) == 16);
 };
+
+unsafe fn program_async_file_info(path: *const u8, out: *mut c::FileInfo) -> i32 {
+    unsafe { crate::program::system::directory::r4os_rust_sys_file_info(path.cast(), out.cast()) }
+}
+
+unsafe fn program_async_service_control(wait: bool, handle: u32, id: u32, timeout: u64) -> i32 {
+    unsafe {
+        crate::service::ffi::r4os_rust_services_endpoint_control(
+            if wait { 4 } else { 5 },
+            handle,
+            id,
+            if wait { timeout } else { 0 },
+        )
+    }
+}
+
+unsafe fn program_async_service_submit(
+    handle: u32,
+    client: u32,
+    op: u16,
+    data: *const u8,
+    len: u32,
+    timeout: u64,
+    token: *mut task_context::Unwind,
+) -> i32 {
+    unsafe {
+        crate::service::ffi::r4os_rust_services_request(
+            handle,
+            client,
+            op,
+            Bytes {
+                data: if len == 0 { b"".as_ptr() } else { data },
+                len: len as usize,
+            },
+            timeout,
+            true,
+            token,
+        )
+    }
+}
+
+unsafe fn program_async_service_take(
+    handle: u32,
+    id: u32,
+    header: *mut Header,
+    data: *mut u8,
+    len: u32,
+) -> i32 {
+    unsafe {
+        crate::service::ffi::r4os_rust_services_recv(handle, id, false, header, data, len as usize)
+    }
+}
+
+unsafe fn program_async_option(retry: bool, out: *mut Bytes) -> bool {
+    unsafe {
+        let Some(value) = crate::boot::config::option_value(
+            crate::boot::config::get(),
+            b"TASKREGISTRY",
+            if retry {
+                b"async-retire-retry"
+            } else {
+                b"selftest"
+            },
+        ) else {
+            return false;
+        };
+        out.write(Bytes {
+            data: value.as_ptr(),
+            len: value.len(),
+        });
+        true
+    }
+}
+
+// Preserve the existing async file operation projection and its exact buffers.
+#[allow(clippy::too_many_arguments)]
+unsafe fn program_async_file(
+    kind: u32,
+    path: *const u8,
+    offset: u64,
+    data: *const u8,
+    len: u32,
+    out: *mut u8,
+    out_len: u32,
+    flags: u32,
+) -> i32 {
+    unsafe {
+        use crate::program::system::{io, stream_api as stream};
+        match kind {
+            1 => io::r4os_rust_sys_file_read(path, out, out_len),
+            2 => io::r4os_rust_sys_file_read_at(path, offset, out, out_len),
+            3 => io::r4os_rust_sys_file_write(path, data, len),
+            4 => io::r4os_rust_sys_file_append(path, data, len),
+            5 => stream::r4os_rust_sys_stream_begin(path, flags),
+            6 => stream::r4os_rust_sys_stream_write(path, offset, data, len, flags),
+            7 => stream::r4os_rust_sys_stream_finish(path, offset, flags),
+            8 => stream::r4os_rust_sys_stream_abort(path),
+            10 => io::r4os_rust_sys_file_write_at(path, offset, data, len),
+            _ => panic!("Invalid async filesystem operation"),
+        }
+    }
+}

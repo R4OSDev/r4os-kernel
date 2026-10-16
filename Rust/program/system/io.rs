@@ -9,7 +9,7 @@ use crate::{
     arch::runtime::RuntimeGuard,
     sched::{scheduler, task},
 };
-use core::{cell::UnsafeCell, ffi::c_void, ptr};
+use core::{cell::UnsafeCell, ptr};
 macro_rules! some {
     ($value:expr,$error:expr) => {
         match $value {
@@ -330,44 +330,6 @@ pub unsafe extern "C" fn r4os_rust_sys_file_append(
         }
         request.ok = true;
         i32::try_from(len).expect("File append result")
-    }
-}
-unsafe extern "C" {
-    fn r4os_zig_sys_rewrite(
-        address: usize,
-        input: Bytes,
-        output: *mut u8,
-        capacity: usize,
-        context: *const c_void,
-        result: *mut usize,
-    ) -> bool;
-}
-/// # Safety
-/// Caller retains disjoint input/output and original rewrite/context handles.
-/// Rewrite must neither enter R4SYS nor block on another filesystem request.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_sys_rewrite(
-    raw: Bytes,
-    input: *mut u8,
-    input_capacity: usize,
-    output: *mut u8,
-    output_capacity: usize,
-    context: *const c_void,
-    rewrite: usize,
-) -> i32 {
-    unsafe {
-        rewrite_with(
-            raw,
-            input,
-            input_capacity,
-            output,
-            output_capacity,
-            |source, dest, capacity| {
-                let mut result = 0;
-                r4os_zig_sys_rewrite(rewrite, source, dest, capacity, context, &mut result)
-                    .then_some(result)
-            },
-        )
     }
 }
 // Original request/lane and write algorithm shared by exact typed native callers.

@@ -49,12 +49,7 @@ struct Table(UnsafeCell<[Slot; 27]>);
 // boot reset is BSP-only. Copied values retain their original mount identity.
 unsafe impl Sync for Table {}
 static MOUNTS: Table = Table(UnsafeCell::new([EMPTY; 27]));
-unsafe extern "C" {
-    fn r4os_zig_vfs_fat(op: u8, args: *const Args, output: *mut Entry) -> Output;
-    fn r4os_zig_vfs_ntfs(op: u8, args: *const Args, output: *mut Entry) -> Output;
-    fn r4os_zig_vfs_activity();
-    fn r4os_zig_vfs_location(volume: *const Volume, output: *mut t::Location) -> bool;
-}
+
 fn drive_index(letter: u8) -> Option<usize> {
     let upper = letter.to_ascii_uppercase();
     if upper.is_ascii_uppercase() {
@@ -100,7 +95,7 @@ unsafe fn region(v: Volume) -> Option<Region> {
         )
     } else {
         let mut out = t::Location::default();
-        if !unsafe { r4os_zig_vfs_location(&v, &mut out) } {
+        if !unsafe { crate::fs::vfs_backends::location(&v, &mut out) } {
             return None;
         }
         (out.device, out.first, out.count)
@@ -245,7 +240,7 @@ pub unsafe extern "C" fn r4os_rust_vfs_mount(
                     true
                 }
             };
-            unsafe { r4os_zig_vfs_activity() };
+            crate::service::desktop_events::r4os_rust_desktop_signal();
             result
         }
         6 => {
@@ -373,8 +368,8 @@ unsafe fn notify(v: Volume, parent: u64) {
 }
 unsafe fn backend(operation: u8, args: Args, output: *mut Entry) -> Output {
     match args.volume.kind {
-        0 => unsafe { r4os_zig_vfs_fat(operation, &args, output) },
-        1 => unsafe { r4os_zig_vfs_ntfs(operation, &args, output) },
+        0 => unsafe { crate::fs::vfs_backends::fat(operation, &args, output) },
+        1 => unsafe { crate::fs::vfs_backends::ntfs(operation, &args, output) },
         _ => unreachable!(),
     }
 }

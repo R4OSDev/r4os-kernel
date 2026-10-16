@@ -39,9 +39,7 @@ static COUNTERS: Counters = Counters(UnsafeCell::new(Stats::EMPTY));
 fn counters(operation: impl FnOnce(&mut Stats)) {
     operation(unsafe { &mut *COUNTERS.0.get() });
 }
-unsafe extern "C" {
-    fn r4os_zig_vm_reschedule();
-}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_vm_initialized() -> bool {
     READY.load(Ordering::Acquire)
@@ -217,7 +215,7 @@ impl Drop for Lease {
 fn reschedule(owner: &mut Option<Guard>) {
     drop(owner.take());
     unsafe {
-        r4os_zig_vm_reschedule();
+        vm_reschedule();
     }
     *owner = Some(Guard::acquire(5));
 }
@@ -751,3 +749,7 @@ pub unsafe extern "C" fn r4os_rust_vm_transaction_stats(output: *mut Stats) {
 const _: () = {
     assert!(core::mem::size_of::<Stats>() == 32);
 };
+
+unsafe fn vm_reschedule() {
+    crate::sched::scheduler::safe_reschedule();
+}

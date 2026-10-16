@@ -32,25 +32,20 @@ pub struct DriveRequest {
     pub name: Label,
     pub volume: *mut c_void,
 }
-unsafe extern "C" {
-    fn r4os_zig_normal_identity(out: *mut BootIdentity);
-    fn r4os_zig_normal_drive(operation: u8, input: *const DriveRequest) -> bool;
-    fn r4os_zig_normal_log(text: *const u8, len: usize);
-    fn r4os_zig_normal_decimal(value: u64);
-}
+
 fn put(text: &[u8]) {
     unsafe {
-        r4os_zig_normal_log(text.as_ptr(), text.len());
+        normal_log(text.as_ptr(), text.len());
     }
 }
 fn raw(text: Label) {
     unsafe {
-        r4os_zig_normal_log(text.data, text.len);
+        normal_log(text.data, text.len);
     }
 }
 fn decimal(value: u64) {
-    unsafe {
-        r4os_zig_normal_decimal(value);
+    {
+        crate::boot::log_route::dec(value);
     }
 }
 fn print_guid(value: [u8; 16]) {
@@ -77,7 +72,7 @@ fn drive(operation: u8, letter: u8) -> bool {
         name: Label::new(b""),
         volume: ptr::null_mut(),
     };
-    unsafe { r4os_zig_normal_drive(operation, &input) }
+    unsafe { crate::storage::normal_boot::drive_dispatch(operation, &input) }
 }
 unsafe extern "C" fn getter(raw: *const c_void, index: usize, out: *mut boot_source::DeviceView) {
     unsafe {
@@ -136,12 +131,12 @@ unsafe fn mount_letter(index: usize, partition: usize, letter: u8, role: u8) -> 
         name: info.name,
         volume: volume.token,
     };
-    if !unsafe { r4os_zig_normal_drive(1, &input) } {
+    if !unsafe { crate::storage::normal_boot::drive_dispatch(1, &input) } {
         return false;
     }
-    if !unsafe { r4os_zig_normal_drive(2, &input) } {
+    if !unsafe { crate::storage::normal_boot::drive_dispatch(2, &input) } {
         unsafe {
-            r4os_zig_normal_drive(3, &input);
+            crate::storage::normal_boot::drive_dispatch(3, &input);
         }
         return false;
     }
@@ -204,7 +199,7 @@ unsafe fn mount() -> ResultRecord {
     }
     let mut identity = MaybeUninit::uninit();
     unsafe {
-        r4os_zig_normal_identity(identity.as_mut_ptr());
+        normal_identity(identity.as_mut_ptr());
     }
     let identity = unsafe { identity.assume_init() };
     put(b"[INSTALLBOOT] executable=");
@@ -305,7 +300,7 @@ unsafe fn mount() -> ResultRecord {
         name: Label::new(b""),
         volume: boot_volume.token,
     };
-    if !unsafe { r4os_zig_normal_drive(5, &input) }
+    if !unsafe { crate::storage::normal_boot::drive_dispatch(5, &input) }
         || !unsafe { mount_letter(source.device_index, system, b'C', 1) }
         || !unsafe { mount_letter(source.device_index, data, b'D', 2) }
     {
@@ -352,3 +347,66 @@ const _: () = {
     assert!(core::mem::size_of::<ResultRecord>() == 32);
     assert!(core::mem::size_of::<DriveRequest>() == 48);
 };
+
+unsafe fn normal_log(text: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
+}
+
+pub(crate) unsafe fn drive_dispatch(operation: u8, input: *const DriveRequest) -> bool {
+    unsafe {
+        use crate::fs::{drive, vfs};
+        let a = &*input;
+        match operation {
+            0 => !drive::r4os_rust_fs_drive_lookup(1, a.letter as usize).is_null(),
+            1 => drive::r4os_rust_fs_drive_mount(
+                a.letter,
+                a.kind,
+                a.role,
+                false,
+                a.name.data,
+                a.name.len,
+                a.bytes,
+                a.index,
+                true,
+            ),
+            2 | 5 => {
+                let v = media::volume(a.volume);
+                vfs::r4os_rust_vfs_mount(
+                    if operation == 2 { 2 } else { 1 },
+                    a.letter,
+                    &v,
+                    ptr::null(),
+                    ptr::null_mut(),
+                )
+            }
+            3 => {
+                drive::r4os_rust_fs_drive_control(2, a.letter);
+                true
+            }
+            4 => drive::r4os_rust_fs_drive_control(1, a.letter) != 0,
+            _ => panic!("Invalid normal mount operation"),
+        }
+    }
+}
+
+unsafe fn normal_identity(out: *mut BootIdentity) {
+    unsafe {
+        let p = (*crate::boot::info::r4os_rust_boot_info()).executable;
+        let s = &*p;
+        out.write(BootIdentity {
+            loaded: boot_source::Identity {
+                present: s.present,
+                generic_media: s.media_type == 0,
+                path: Label {
+                    data: s.path_bytes.as_ptr(),
+                    len: s.path_len,
+                },
+                path_truncated: s.path_truncated,
+                disk_guid: s.disk_guid,
+                partition_guid: s.partition_guid,
+            },
+            mbr_disk_id: s.mbr_disk_id,
+            partition_index: s.partition_index,
+        });
+    }
+}

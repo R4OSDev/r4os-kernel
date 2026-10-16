@@ -72,9 +72,6 @@ static HISTORY: Canonical = Canonical(UnsafeCell::new(History {
         node: 0,
     }); CAPACITY],
 }));
-unsafe extern "C" {
-    fn r4os_zig_fs_directory_activity();
-}
 
 /// # Safety
 /// State is aligned resident storage serialized by its caller. Publish input
@@ -116,7 +113,7 @@ pub unsafe extern "C" fn r4os_rust_fs_directory_changes(
                 let _guard = Guard::acquire(1);
                 unsafe { (&mut *HISTORY.0.get()).publish(mount.read(), node) };
             }
-            unsafe { r4os_zig_fs_directory_activity() };
+            unsafe { fs_directory_activity() };
             0
         }
         1 => {
@@ -167,3 +164,7 @@ const _: () = {
     assert!(core::mem::size_of::<History>() == 6152);
     assert!(core::mem::size_of::<Cursor>() == 40);
 };
+
+unsafe fn fs_directory_activity() {
+    crate::service::desktop_events::r4os_rust_desktop_signal();
+}

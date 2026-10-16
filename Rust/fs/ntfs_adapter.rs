@@ -410,7 +410,6 @@ pub unsafe extern "C" fn r4os_rust_ntfs_adapter(
                 }
             }
             3 => {
-                #[cfg(not(r4os_owner_fixture))]
                 let _owner = crate::memory::owner::Guard::acquire(1);
                 for i in 0..s::VOLUMES {
                     let st = s::state(i);
@@ -426,7 +425,6 @@ pub unsafe extern "C" fn r4os_rust_ntfs_adapter(
                 Output::default()
             }
             4 => {
-                #[cfg(not(r4os_owner_fixture))]
                 let _owner = crate::memory::owner::Guard::acquire(1);
                 for i in 0..s::VOLUMES {
                     let st = s::state(i);
@@ -580,8 +578,7 @@ unsafe fn publish_absent_backup(a: Args) -> Output {
         }
     }
 }
-unsafe fn reclaim(requested: u32) -> t::MetadataReclaimResult {
-    #[cfg(not(r4os_owner_fixture))]
+pub(crate) unsafe fn reclaim(requested: u32) -> t::MetadataReclaimResult {
     let _owner = crate::memory::owner::Guard::acquire(1);
     unsafe {
         let requested = requested.min(8);
@@ -618,7 +615,6 @@ unsafe fn reclaim(requested: u32) -> t::MetadataReclaimResult {
 }
 
 pub(crate) unsafe fn summary() -> t::MetadataCacheSummary {
-    #[cfg(not(r4os_owner_fixture))]
     let _owner = crate::memory::owner::Guard::acquire(1);
     unsafe {
         let mut out = t::MetadataCacheSummary::EMPTY;

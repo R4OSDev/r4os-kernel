@@ -1,7 +1,7 @@
 //! Sequential AP startup/shutdown, private low-memory trampolines and IPIs.
 //! The BSP owns configuration until execution publication; terminal shutdown
 //! owns the stop counter. Native per-CPU lifecycle atomics publish AP progress.
-//! Raw Task callbacks retain the task owner until its separate migration.
+//! Raw Task callbacks bind the native task owner without a second lifecycle.
 use super::{
     fpu, lapic, msr, percpu, runtime,
     smp_policy::{self, Candidate, MAX_CPUS, Plan},
@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     arch::pit,
-    build_bridge::config,
+    build_config::config,
     memory::{blocks, paging, phys},
     platform::{cpu, monotonic},
 };
@@ -110,14 +110,7 @@ unsafe extern "C" {
     fn r4os_read_cr0() -> u64;
     fn r4os_read_cr3() -> u64;
     fn r4os_read_cr4() -> u64;
-    fn r4os_zig_smp_log(
-        event: u8,
-        index: u32,
-        value: u64,
-        text: *const u8,
-        len: usize,
-        status: *const Status,
-    );
+
 }
 fn boot() -> *mut Boot {
     BOOT.0.get()
@@ -154,7 +147,7 @@ fn snapshot() -> Status {
 }
 fn log(event: u8, index: u32, value: u64, text: &[u8]) {
     let status = snapshot();
-    unsafe { r4os_zig_smp_log(event, index, value, text.as_ptr(), text.len(), &status) };
+    unsafe { smp_log(event, index, value, text.as_ptr(), text.len(), &status) };
 }
 fn apic(index: u32) -> Option<u32> {
     let id = percpu::r4os_rust_percpu_control(8, index, 0, 0);
@@ -588,3 +581,55 @@ const _: () = {
     assert!(core::mem::offset_of!(TrampolineConfig, progress) == 0x4e);
     assert!(core::mem::offset_of!(TrampolineConfig, protected_offset) == 0x50);
 };
+
+unsafe fn smp_log(
+    event: u8,
+    index: u32,
+    value: u64,
+    text: *const u8,
+    len: usize,
+    status: *const Status,
+) {
+    use crate::boot::log_route::{dec, puts};
+    match event {
+        0 => {
+            puts(b"[SMP] low-memory trampolines reserved=");
+            dec(value);
+        }
+        1 | 2 => {
+            puts(b"[SMP] ap=");
+            dec(u64::from(index));
+            puts(b" apic=");
+            dec(u64::from(apic(index).unwrap_or(0)));
+            puts(b" failed=");
+            puts(unsafe { core::slice::from_raw_parts(text, len) });
+            if event == 2 {
+                puts(b" progress=");
+                dec(value);
+            }
+        }
+        3 => {
+            let s = unsafe { status.read() };
+            puts(b"[SMP] stage=");
+            puts(unsafe { core::slice::from_raw_parts(text, len) });
+            puts(b" discovered=");
+            dec(u64::from(s.discovered));
+            puts(b" started=");
+            dec(u64::from(s.started));
+            puts(b" online=");
+            dec(u64::from(s.online));
+            puts(b" failed=");
+            dec(u64::from(s.failed));
+            puts(b" fallback=");
+            puts(if s.online == 1 { b"1cpu" } else { b"no" });
+        }
+        4 => {
+            puts(b"[SMP] trampoline invalid size=");
+            dec(value);
+        }
+        5 => puts(b"[SMP] trampoline low-memory reservation missing"),
+        6 => puts(b"[SMP] trampoline identity mapping failed"),
+        _ => unreachable!(),
+    }
+    puts(b"\r\n");
+}

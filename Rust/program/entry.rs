@@ -61,8 +61,7 @@ pub struct Trace {
 }
 unsafe extern "C" {
     // Bounded metadata projections into owners not yet migrated in this file.
-    fn r4os_zig_program_entry_boot_active() -> bool;
-    fn r4os_zig_program_entry_boot_detail(detail: Bytes);
+
     fn r4os_call_program(entry: usize, arg: usize, stack_top: u64) -> i32;
 }
 fn span(bytes: &[u8]) -> Bytes {
@@ -79,10 +78,10 @@ unsafe fn bytes<'a>(bytes: Bytes) -> &'a [u8] {
     }
 }
 pub(super) fn report_stage(enabled: bool, detail: &[u8], launch: bool) {
-    if !enabled || !unsafe { r4os_zig_program_entry_boot_active() } {
+    if !enabled || !{ crate::display::bootscreen::is_active() } {
         return;
     }
-    unsafe { r4os_zig_program_entry_boot_detail(span(detail)) };
+    unsafe { program_entry_boot_detail(span(detail)) };
     if launch {
         stack::blog(b"[LAUNCH] shell stage=");
         stack::blog(detail);
@@ -91,7 +90,7 @@ pub(super) fn report_stage(enabled: bool, detail: &[u8], launch: bool) {
 }
 unsafe fn boot_detail(enabled: bool, detail: &[u8]) {
     if enabled {
-        unsafe { r4os_zig_program_entry_boot_detail(span(detail)) };
+        unsafe { program_entry_boot_detail(span(detail)) };
     }
 }
 fn cstring(bytes: &[u8]) -> usize {
@@ -308,7 +307,7 @@ unsafe fn main(shell: bool) -> ! {
         }
         if shell {
             let s = exit_state::state();
-            let report = r4os_zig_program_entry_boot_active()
+            let report = crate::display::bootscreen::is_active()
                 && (*s).shell_present
                 && (*s).shell_id == (*thread).instance_id
                 && (*s).shell_generation == (*thread).instance_generation;
@@ -345,7 +344,7 @@ unsafe fn main(shell: bool) -> ! {
             ..Handle::default()
         };
         let s = exit_state::state();
-        let report = r4os_zig_program_entry_boot_active()
+        let report = crate::display::bootscreen::is_active()
             && (*s).foreground_present
             && (*s).foreground_id == handle.instance_id
             && (*s).foreground_generation == handle.generation;
@@ -485,3 +484,7 @@ const _: () = {
     assert!(mem::size_of::<Trace>() == 32);
     assert!(mem::offset_of!(Trace, mode) == 16);
 };
+
+unsafe fn program_entry_boot_detail(detail: Bytes) {
+    unsafe { crate::display::bootscreen::set_detail(detail.data, detail.len) }
+}

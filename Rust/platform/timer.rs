@@ -3,7 +3,7 @@
 use super::{clock_math as math, clocksource};
 use crate::{
     arch::{hpet, ioapic, lapic, pit, runtime::RuntimeGuard},
-    build_bridge::config,
+    build_config::config,
 };
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 pub const NO_DEADLINE: u64 = u64::MAX;
@@ -62,11 +62,17 @@ static LATE: AtomicU64 = AtomicU64::new(0);
 static MAX_LATENESS: AtomicU64 = AtomicU64::new(0);
 static LAST_LATENESS: AtomicU64 = AtomicU64::new(0);
 static LAST_IRQ: AtomicU64 = AtomicU64::new(0);
-unsafe extern "C" {
-    fn r4os_zig_timer_serial_drain();
-}
+
 pub fn active_backend() -> u32 {
     BACKEND.load(Ordering::Acquire)
+}
+pub(crate) fn backend_name() -> &'static [u8] {
+    match active_backend() {
+        0 => b"PIT",
+        1 => b"HPET",
+        2 => b"LAPIC timer",
+        _ => panic!("Invalid timer backend"),
+    }
 }
 pub fn frequency() -> u32 {
     HZ.load(Ordering::Acquire)
@@ -243,7 +249,7 @@ fn fallback_pit() {
 }
 fn on_irq() -> u64 {
     if config::ENABLE_COM1_DEBUG {
-        unsafe { r4os_zig_timer_serial_drain() };
+        crate::boot::serial::r4os_rust_serial_drain();
     }
     match active_backend() {
         0 => pit::on_tick(),

@@ -14,9 +14,7 @@ struct Span {
     pointer: *const u8,
     len: usize,
 }
-unsafe extern "C" {
-    fn r4os_zig_task_probe_option(out: *mut Span);
-}
+
 fn option_is(value: &[u8], wanted: &[u8]) -> bool {
     value.len() == wanted.len()
         && value
@@ -31,7 +29,7 @@ pub extern "C" fn r4os_rust_task_registry_selftest() -> bool {
             pointer: core::ptr::null(),
             len: 0,
         };
-        r4os_zig_task_probe_option(&mut option);
+        task_probe_option(&mut option);
         if option.pointer.is_null() {
             return true;
         }
@@ -57,5 +55,20 @@ pub extern "C" fn r4os_rust_task_registry_selftest() -> bool {
             return true;
         }
         run::run()
+    }
+}
+
+unsafe fn task_probe_option(out: *mut Span) {
+    unsafe {
+        let v = crate::boot::config::option_value(
+            crate::boot::config::get(),
+            b"TASKREGISTRY",
+            b"selftest",
+        )
+        .unwrap_or(b"");
+        out.write(Span {
+            pointer: v.as_ptr(),
+            len: v.len(),
+        });
     }
 }

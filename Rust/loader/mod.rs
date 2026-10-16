@@ -1,5 +1,5 @@
-//! Native kernel module loading owners. Private C facades preserve existing
-//! callers until the remaining implementation owners migrate.
+//! Native kernel module loading owners. Immutable value projections bind
+//! the sole registry, image, resource and resolver owners directly.
 pub mod boot;
 pub mod file;
 pub mod format;

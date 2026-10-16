@@ -138,9 +138,7 @@ static DATA: Owner = Owner(UnsafeCell::new(Data {
     demand_loads: 0,
 }));
 static GATE: AtomicU8 = AtomicU8::new(0);
-unsafe extern "C" {
-    fn r4os_zig_r4p_dump();
-}
+
 fn now() -> u64 {
     super::performance::now()
 }
@@ -1133,7 +1131,7 @@ pub extern "C" fn r4os_rust_r4p_finish_preload() {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_r4p_dump() {
-    unsafe { r4os_zig_r4p_dump() }
+    unsafe { r4p_dump() }
 }
 /// # Safety
 /// Resident role and exact caller-owned protocol buffers through all callbacks.
@@ -1193,4 +1191,8 @@ pub unsafe extern "C" fn r4os_rust_r4p_status(role: t::Bytes) -> RoleStatus {
         builtin_fallback: reg_entry(role, 0).is_some(),
         state: entry.map_or(0, |v| role_state(v.state)),
     }
+}
+
+unsafe fn r4p_dump() {
+    crate::driver::protocol_registry::dump_status();
 }

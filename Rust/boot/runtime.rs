@@ -3,7 +3,7 @@
 use crate::{
     arch::{runtime, smp, smp_policy::Candidate},
     boot::{fatal, foundation},
-    build_bridge::config,
+    build_config::config,
     driver::work,
     fs::page_cache,
     loader::{boot, r4p},
@@ -20,16 +20,9 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
-unsafe extern "C" {
-    // Typed presentation/instrumentation and still-assigned audio peers own
-    // their state; these cuts have no second runtime initialization flag.
-    fn r4os_zig_runtime_status(data: *const u8, len: usize);
-    fn r4os_zig_runtime_stack_reclaimer() -> usize;
-    fn r4os_zig_runtime_audio(progress_worker: bool) -> bool;
-    fn r4os_zig_kernel_hex(value: u64, width: u8);
-}
+
 fn status(text: &[u8]) {
-    unsafe { r4os_zig_runtime_status(text.as_ptr(), text.len()) };
+    unsafe { runtime_status(text.as_ptr(), text.len()) };
 }
 unsafe fn start_smp() -> bool {
     unsafe {
@@ -76,7 +69,7 @@ pub unsafe extern "C" fn r4os_rust_runtime_boot_init() -> bool {
         if task_api::r4os_rust_task_control(0, 0, 0) == 0 {
             return false;
         }
-        reclaim::r4os_rust_reclaim_register_stack(r4os_zig_runtime_stack_reclaimer());
+        reclaim::register_stack();
         foundation::puts(b"  Task system ");
         foundation::puts(b"[OK]\r\n");
         status(b"Scheduler starten");
@@ -114,7 +107,7 @@ pub unsafe extern "C" fn r4os_rust_runtime_boot_init() -> bool {
         }
         foundation::puts(b"  Page-cache policy worker ");
         foundation::puts(b"[OK]\r\n");
-        if !r4os_zig_runtime_audio(true) {
+        if !runtime_audio(true) {
             return false;
         }
         foundation::puts(b"  Audio progress worker [OK]\r\n");
@@ -127,7 +120,7 @@ pub unsafe extern "C" fn r4os_rust_runtime_boot_init() -> bool {
 fn page_fault_test() -> ! {
     let address = 0xffff_ff00_0000_0000u64;
     foundation::puts(b"  Triggering test page fault at 0x");
-    unsafe { r4os_zig_kernel_hex(address, 16) };
+    crate::boot::log_route::hex(address, 16);
     foundation::puts(b"...\r\n");
     unsafe { ptr::with_exposed_provenance_mut::<u8>(address as usize).write_volatile(0xcc) };
     runtime::halt_forever()
@@ -142,7 +135,7 @@ pub unsafe extern "C" fn r4os_rust_runtime_boot_start() -> ! {
         let start = crate::loader::performance::begin_r4p_runtime();
         r4p::r4os_rust_r4p_load_all();
         crate::loader::performance::finish_r4p_runtime(start);
-        r4os_zig_runtime_audio(false);
+        runtime_audio(false);
         r4p::r4os_rust_r4p_dump();
         foundation::puts(b"  Loader [OK]\r\n");
         if !r4os_rust_runtime_boot_init() {
@@ -168,5 +161,19 @@ pub unsafe extern "C" fn r4os_rust_runtime_boot_start() -> ! {
         let mut memory = MaybeUninit::<memory_boot::Snapshot>::uninit();
         memory_boot::r4os_rust_memory_snapshot(memory.as_mut_ptr());
         shell_launcher::r4os_rust_program_shell_start(config, memory.assume_init().usable)
+    }
+}
+
+unsafe fn runtime_status(data: *const u8, len: usize) {
+    unsafe { crate::display::bootscreen::set_status(data, len) }
+}
+
+unsafe fn runtime_audio(progress_worker: bool) -> bool {
+    unsafe {
+        if progress_worker {
+            return crate::audio::core::start_progress_worker();
+        }
+        crate::audio::core::apply_configured_sid_model();
+        true
     }
 }

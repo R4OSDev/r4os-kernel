@@ -5,32 +5,6 @@ use core::{
     sync::atomic::{AtomicBool, AtomicPtr, Ordering},
 };
 
-#[repr(C)]
-pub struct ModulePeers {
-    pub registry: unsafe extern "C" fn(),
-    pub log: unsafe extern "C" fn(*const u8, usize),
-}
-
-#[repr(C)]
-pub struct Fonts {
-    pub registered: u32,
-    pub rejected: u32,
-}
-
-#[repr(C)]
-pub struct LoaderPeers {
-    pub controllers: unsafe extern "C" fn() -> bool,
-    pub fail: unsafe extern "C" fn(*const u8, usize) -> bool,
-    pub libraries: unsafe extern "C" fn(),
-    pub drivers: unsafe extern "C" fn(),
-    pub summary: unsafe extern "C" fn(),
-    pub config: unsafe extern "C" fn() -> *const c_void,
-    pub fonts: unsafe extern "C" fn() -> Fonts,
-    pub log: unsafe extern "C" fn(*const u8, usize),
-    pub decimal: unsafe extern "C" fn(u64),
-    pub status: unsafe extern "C" fn(*const u8, usize),
-}
-
 // As before, initialization is called by the linear BSP bootstrap. There is
 // no additional reservation, retry policy or owner held across peer calls.
 static MODULE_READY: AtomicBool = AtomicBool::new(false);
@@ -41,14 +15,15 @@ static CONFIG: AtomicPtr<c_void> = AtomicPtr::new(core::ptr::null_mut());
 /// The BSP bootstrap supplies live peers that preserve their existing owner
 /// contracts. Registry initialization has completed before it returns.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_module_boot_init(peers: &ModulePeers) {
+pub unsafe extern "C" fn r4os_rust_module_boot_init() {
     if MODULE_READY.load(Ordering::Acquire) {
         return;
     }
-    unsafe { (peers.registry)() };
+    let peers = super::registry_control::native_peers();
+    unsafe { super::registry_control::r4os_rust_mod_init(&peers) };
     MODULE_READY.store(true, Ordering::Release);
-    unsafe { (peers.log)(b"  Module registry ".as_ptr(), 18) };
-    unsafe { (peers.log)(b"[OK]\r\n".as_ptr(), 6) };
+    crate::boot::log_route::puts(b"  Module registry ");
+    crate::boot::log_route::puts(b"[OK]\r\n");
 }
 
 #[unsafe(no_mangle)]
@@ -56,38 +31,40 @@ pub extern "C" fn r4os_rust_module_boot_ready() -> bool {
     MODULE_READY.load(Ordering::Acquire)
 }
 
-unsafe fn log(peers: &LoaderPeers, text: &[u8]) {
-    unsafe { (peers.log)(text.as_ptr(), text.len()) };
+fn log(text: &[u8]) {
+    crate::boot::log_route::puts(text);
 }
 
 /// # Safety
 /// The linear BSP caller supplies live peer functions. Returned config stays
 /// resident, and no peer recursively starts another bootstrap generation.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_loader_boot_init(peers: &LoaderPeers) -> bool {
+pub unsafe extern "C" fn r4os_rust_loader_boot_init() -> bool {
     if LOADER_READY.load(Ordering::Acquire) {
         return true;
     }
-    if !unsafe { (peers.controllers)() } {
+    if !unsafe { crate::storage::boot::r4os_rust_storage_boot(3, core::ptr::null()) != 0 } {
         let text = b"Loader boot before storage controllers";
-        return unsafe { (peers.fail)(text.as_ptr(), text.len()) };
+        unsafe { crate::boot::fatal::r4os_rust_fatal_record(10, text.as_ptr(), text.len()) };
+        return false;
     }
     super::performance::begin_filesystem_loader();
-    unsafe { (peers.libraries)() };
-    unsafe { (peers.drivers)() };
-    unsafe { (peers.summary)() };
-    let config = unsafe { (peers.config)() };
+    let peers = super::registry_control::native_peers();
+    unsafe { super::registry_loader::r4os_rust_mod_load_libraries(&peers) };
+    unsafe { super::r4d::r4os_rust_r4d_discover() };
+    super::registry_control::r4os_rust_mod_summary();
+    let config: *const c_void = unsafe { crate::boot::config::load() }.cast();
     CONFIG.store(config.cast_mut(), Ordering::Relaxed);
-    let fonts = unsafe { (peers.fonts)() };
-    unsafe { log(peers, b"[FONT] catalog loaded=") };
-    unsafe { (peers.decimal)(u64::from(fonts.registered)) };
-    unsafe { log(peers, b" rejected=") };
-    unsafe { (peers.decimal)(u64::from(fonts.rejected)) };
-    unsafe { log(peers, b"\r\n") };
+    let fonts = crate::font::catalog_io::reload_installed();
+    log(b"[FONT] catalog loaded=");
+    crate::boot::log_route::dec(u64::from(fonts.registered));
+    log(b" rejected=");
+    crate::boot::log_route::dec(u64::from(fonts.rejected));
+    log(b"\r\n");
     super::performance::finish_filesystem_loader();
     LOADER_READY.store(true, Ordering::Release);
     let text = b"  Loader config [OK]\r\n";
-    unsafe { (peers.status)(text.as_ptr(), text.len()) };
+    log(text);
     true
 }
 
@@ -103,24 +80,3 @@ pub extern "C" fn r4os_rust_loader_boot_config() -> *const c_void {
     }
     CONFIG.load(Ordering::Relaxed)
 }
-
-const _: () = {
-    use core::mem::{offset_of, size_of};
-    assert!(size_of::<ModulePeers>() == 16);
-    assert!(offset_of!(ModulePeers, registry) == 0);
-    assert!(offset_of!(ModulePeers, log) == 8);
-    assert!(size_of::<Fonts>() == 8);
-    assert!(offset_of!(Fonts, registered) == 0);
-    assert!(offset_of!(Fonts, rejected) == 4);
-    assert!(size_of::<LoaderPeers>() == 80);
-    assert!(offset_of!(LoaderPeers, controllers) == 0);
-    assert!(offset_of!(LoaderPeers, fail) == 8);
-    assert!(offset_of!(LoaderPeers, libraries) == 16);
-    assert!(offset_of!(LoaderPeers, drivers) == 24);
-    assert!(offset_of!(LoaderPeers, summary) == 32);
-    assert!(offset_of!(LoaderPeers, config) == 40);
-    assert!(offset_of!(LoaderPeers, fonts) == 48);
-    assert!(offset_of!(LoaderPeers, log) == 56);
-    assert!(offset_of!(LoaderPeers, decimal) == 64);
-    assert!(offset_of!(LoaderPeers, status) == 72);
-};

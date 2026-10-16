@@ -272,9 +272,7 @@ unsafe impl Sync for Storage {}
 static PMM: Storage = Storage(UnsafeCell::new(State::EMPTY));
 // Address conversion remains callable without the mutable PMM boundary.
 static HHDM: AtomicU64 = AtomicU64::new(0);
-unsafe extern "C" {
-    fn r4os_zig_pmm_fault(kind: u8, address: u64);
-}
+
 fn align_up(value: u64, alignment: u64) -> Option<u64> {
     Some(value.checked_add(alignment - 1)? & !(alignment - 1))
 }
@@ -447,7 +445,7 @@ pub extern "C" fn r4os_rust_phys_free(address: u64) {
     let _guard = Guard::acquire(7);
     let fault = unsafe { (&mut *PMM.0.get()).free_one(address) };
     if fault != 0 {
-        unsafe { r4os_zig_pmm_fault(fault, address) };
+        unsafe { pmm_fault(fault, address) };
     }
 }
 #[unsafe(no_mangle)]
@@ -478,3 +476,17 @@ pub extern "C" fn r4os_rust_virt_to_phys(address: u64) -> u64 {
 const _: () = {
     assert!(core::mem::size_of::<Stats>() == 96 && core::mem::size_of::<Extent>() == 16);
 };
+
+unsafe fn pmm_fault(kind: u8, address: u64) {
+    use crate::boot::log_route as log;
+    log::puts(b"PMM FAULT ");
+    log::puts(match kind {
+        1 => b"BAD-FREE-ALIGN",
+        2 => b"BAD-FREE-RANGE",
+        3 => b"DOUBLE-FREE",
+        _ => b"UNKNOWN",
+    });
+    log::puts(b" frame=0x");
+    log::hex(address, 16);
+    log::puts(b"\r\n");
+}

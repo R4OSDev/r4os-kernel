@@ -7,20 +7,18 @@ use crate::{
     platform::{acpi, cpu, pci, pcie},
 };
 use core::{arch::asm, ptr};
-unsafe extern "C" {
-    fn r4os_zig_terminal_log(op: u8, text: *const u8, len: usize, value: u64, width: usize);
-}
+
 fn log(s: &[u8]) {
-    unsafe { r4os_zig_terminal_log(0, s.as_ptr(), s.len(), 0, 0) }
+    unsafe { terminal_log(0, s.as_ptr(), s.len(), 0, 0) }
 }
 fn dec(v: u64) {
-    unsafe { r4os_zig_terminal_log(1, ptr::null(), 0, v, 0) }
+    unsafe { terminal_log(1, ptr::null(), 0, v, 0) }
 }
 fn hex(v: u64, w: usize) {
-    unsafe { r4os_zig_terminal_log(2, ptr::null(), 0, v, w) }
+    unsafe { terminal_log(2, ptr::null(), 0, v, w) }
 }
 fn flush() {
-    unsafe { r4os_zig_terminal_log(3, ptr::null(), 0, 0, 0) }
+    unsafe { terminal_log(3, ptr::null(), 0, 0, 0) }
 }
 fn boot(s: &[u8]) {
     unsafe { bootlog::r4os_rust_bootlog_write(s.as_ptr(), s.len()) }
@@ -356,4 +354,14 @@ pub unsafe extern "C" fn r4os_rust_terminal_poweroff() -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_terminal_power_status() {
     dump_status()
+}
+
+unsafe fn terminal_log(op: u8, text: *const u8, len: usize, value: u64, width: usize) {
+    match op {
+        0 => unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) },
+        1 => crate::boot::log_route::dec(value),
+        2 => crate::boot::log_route::hex(value, u8::try_from(width).expect("hex width")),
+        3 => crate::boot::log_route::serial_flush(),
+        _ => unreachable!(),
+    }
 }

@@ -60,3 +60,64 @@ pub unsafe extern "C" fn r4os_rust_time_set_state(input: *const TimeState) -> i3
 const _: () = {
     assert!(core::mem::size_of::<TimeState>() == 32);
 };
+
+pub(crate) fn log_status() {
+    use crate::boot::log::{r4os_rust_bootlog_dec as dec, text as puts};
+    fn two(value: u8) {
+        if value < 10 {
+            crate::boot::log::text(b"0");
+        }
+        crate::boot::log::r4os_rust_bootlog_dec(u64::from(value));
+    }
+    let now = rtc::read_date_time(century());
+    puts(b"[TIME] rtc=");
+    two(now.day);
+    puts(b"-");
+    two(now.month);
+    puts(b"-");
+    dec(u64::from(now.year));
+    puts(b" ");
+    two(now.hour);
+    puts(b":");
+    two(now.minute);
+    puts(b":");
+    two(now.second);
+    puts(b" century=");
+    puts(match now.century_source {
+        0 => b"pivot",
+        1 => b"fadt",
+        2 => b"fallback",
+        _ => unreachable!(),
+    });
+    puts(b" monotonic=");
+    let clock = super::monotonic::snapshot();
+    puts(match clock.source {
+        0 => b"unavailable",
+        1 => b"TSC",
+        2 => b"HPET main counter",
+        3 => timer::backend_name(),
+        _ => unreachable!(),
+    });
+    puts(b" event=");
+    puts(timer::backend_name());
+    let hardware = super::clocksource::snapshot();
+    puts(b" source_hz=");
+    dec(hardware.frequency_hz);
+    puts(b" tsc_invariant=");
+    puts(if hardware.flags & 2 != 0 {
+        b"yes"
+    } else {
+        b"no"
+    });
+    puts(b" hpet_calibrated=");
+    puts(if hardware.flags & 4 != 0 {
+        b"yes"
+    } else {
+        b"no"
+    });
+    puts(b" calibration_ppm=");
+    dec(hardware.calibration_error_ppm);
+    puts(b" fallback=");
+    puts(super::clocksource::fallback_name(hardware.fallback_reason));
+    puts(b"\r\n");
+}

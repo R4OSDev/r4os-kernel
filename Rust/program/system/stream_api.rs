@@ -18,18 +18,7 @@ macro_rules! some {
 }
 const OPEN: u32 =
     c::file_stream_open_create | c::file_stream_open_truncate | c::file_stream_open_lease;
-unsafe extern "C" {
-    // Error-only presentation reads peer diagnostic snapshots. It makes no
-    // stream/admission/cleanup decision and owns no persistent stream state.
-    fn r4os_zig_sys_stream_error(
-        admission: bool,
-        letter: u8,
-        phase: u32,
-        offset: u64,
-        len: u32,
-        volume: *const fs::Volume,
-    );
-}
+
 /// # Safety
 /// Original NUL-terminated path and admitted caller lifetime through the
 /// exact filesystem request. Only its exact slot may own a storage lease.
@@ -157,7 +146,7 @@ impl Drop for ErrorLog {
     fn drop(&mut self) {
         if !self.ok {
             unsafe {
-                r4os_zig_sys_stream_error(
+                sys_stream_error(
                     false,
                     self.letter,
                     self.phase,
@@ -211,7 +200,7 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_write(
         let mut request = match admission {
             Some(value) => value,
             None => {
-                r4os_zig_sys_stream_error(true, letter, 0, offset, len, &volume);
+                sys_stream_error(true, letter, 0, offset, len, &volume);
                 return c::file_stream_error_io;
             }
         };
@@ -552,4 +541,60 @@ pub unsafe extern "C" fn r4os_rust_sys_storage_use(input: *const u8, out: *mut u
             },
         }
     }
+}
+
+unsafe fn sys_stream_error(
+    admission: bool,
+    letter: u8,
+    phase: u32,
+    offset: u64,
+    len: u32,
+    volume: *const fs::Volume,
+) {
+    use crate::boot::log_route as log;
+    if admission {
+        log::puts(b"[FSSTREAM] write admission failed\r\n");
+        return;
+    }
+    let volume = unsafe { volume.read() };
+    log::puts(b"[FSSTREAM] write failed drive=");
+    log::putc(letter);
+    log::puts(b" phase=");
+    log::dec(u64::from(phase));
+    log::puts(b" offset=");
+    log::dec(offset);
+    log::puts(b" bytes=");
+    log::dec(u64::from(len));
+    log::puts(b" lookup=");
+    let a = crate::fs::vfs_types::Args {
+        volume,
+        ..Default::default()
+    };
+    let v = unsafe { crate::fs::vfs::r4os_rust_vfs_run(4, &a, core::ptr::null_mut()) };
+    log::dec(v.value);
+    if volume.kind == 1 {
+        log::puts(b" append=");
+        log::dec(u64::from(crate::fs::ntfs_volume_names::append_stage()));
+    }
+    log::puts(b"\r\n");
+    let mut cache = core::mem::MaybeUninit::uninit();
+    unsafe {
+        crate::fs::page_cache::r4os_rust_pagecache_summary(cache.as_mut_ptr());
+    }
+    let cache = unsafe { cache.assume_init() };
+    log::puts(b"[FSSTREAM] cache read/write/writeback/alloc/lock failures=");
+    let values = [
+        cache.read_errors,
+        cache.write_errors,
+        cache.writeback_errors,
+        cache.payload_allocation_failures,
+        cache.lock_timeouts,
+    ];
+    for (i, v) in values.into_iter().enumerate() {
+        if i != 0 {
+            log::puts(b"/");
+        }
+        log::dec(v);
+    }
+    log::puts(b"\r\n");
 }

@@ -12,10 +12,7 @@ struct OptionView {
     key: Span,
     value: Span,
 }
-unsafe extern "C" {
-    fn r4os_zig_driver_option_count() -> usize;
-    fn r4os_zig_driver_option(index: usize, out: *mut OptionView);
-}
+
 struct Buffer(UnsafeCell<[u8; 65]>);
 // SAFETY: the original R4D synchronous option lookup serializes this reusable
 // result; consumers retain no permission to use it after another query.
@@ -32,10 +29,10 @@ unsafe fn matches(z: *const u8, span: Span) -> bool {
 /// admission; the shared result buffer remains borrowed until the next lookup.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_option(driver: *const u8, key: *const u8) -> *const u8 {
-    let count = unsafe { r4os_zig_driver_option_count() };
+    let count = unsafe { driver_option_count() };
     for i in 0..count {
         let mut option = core::mem::MaybeUninit::uninit();
-        unsafe { r4os_zig_driver_option(i, option.as_mut_ptr()) };
+        unsafe { driver_option(i, option.as_mut_ptr()) };
         let option = unsafe { option.assume_init() };
         if !unsafe { matches(driver, option.driver) } || !unsafe { matches(key, option.key) } {
             continue;
@@ -51,4 +48,31 @@ pub unsafe extern "C" fn r4os_rust_driver_option(driver: *const u8, key: *const 
         return destination;
     }
     EMPTY.as_ptr()
+}
+
+unsafe fn driver_option_count() -> usize {
+    unsafe { (*crate::boot::config::get()).option_count }
+}
+
+unsafe fn driver_option(index: usize, out: *mut OptionView) {
+    unsafe {
+        let config = crate::boot::config::get();
+        let opt = core::ptr::addr_of!((*config).options)
+            .cast::<crate::boot::config::OptionRecord>()
+            .add(index);
+        out.write(OptionView {
+            driver: Span {
+                pointer: core::ptr::addr_of!((*opt).driver).cast(),
+                len: (*opt).driver_len,
+            },
+            key: Span {
+                pointer: core::ptr::addr_of!((*opt).key).cast(),
+                len: (*opt).key_len,
+            },
+            value: Span {
+                pointer: core::ptr::addr_of!((*opt).value).cast(),
+                len: (*opt).value_len,
+            },
+        });
+    }
 }

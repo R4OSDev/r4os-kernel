@@ -353,24 +353,13 @@ pub struct XhciInput {
     pub polls: u64,
     pub cancellations: u64,
 }
-unsafe extern "C" {
-    fn r4os_zig_inventory_scalar(operation: u8, argument: u64) -> u64;
-    fn r4os_zig_inventory_display(out: *mut DisplayInput);
-    fn r4os_zig_inventory_block(index: u64, out: *mut BlockInput) -> bool;
-    fn r4os_zig_inventory_usb(index: u64, out: *mut UsbInput) -> bool;
-    fn r4os_zig_inventory_hid(out: *mut HidInput);
-    fn r4os_zig_inventory_msc(out: *mut MscInput);
-    fn r4os_zig_inventory_driver(index: u64, out: *mut DriverInput) -> bool;
-    fn r4os_zig_inventory_protocol(index: u64, out: *mut ProtocolInput) -> bool;
-    fn r4os_zig_inventory_net(index: u64, out: *mut NetInput) -> bool;
-    fn r4os_zig_inventory_xhci(with_status: bool, out: *mut XhciInput);
-}
+
 fn scalar(operation: u8, argument: u64) -> u64 {
-    unsafe { r4os_zig_inventory_scalar(operation, argument) }
+    unsafe { inventory_scalar(operation, argument) }
 }
 fn block_at(index: usize) -> Option<BlockInput> {
     let mut value = MaybeUninit::uninit();
-    if unsafe { r4os_zig_inventory_block(index as u64, value.as_mut_ptr()) } {
+    if unsafe { inventory_block(index as u64, value.as_mut_ptr()) } {
         Some(unsafe { value.assume_init() })
     } else {
         None
@@ -379,21 +368,21 @@ fn block_at(index: usize) -> Option<BlockInput> {
 fn hid() -> HidInput {
     let mut value = MaybeUninit::uninit();
     unsafe {
-        r4os_zig_inventory_hid(value.as_mut_ptr());
+        inventory_hid(value.as_mut_ptr());
         value.assume_init()
     }
 }
 fn msc() -> MscInput {
     let mut value = MaybeUninit::uninit();
     unsafe {
-        r4os_zig_inventory_msc(value.as_mut_ptr());
+        inventory_msc(value.as_mut_ptr());
         value.assume_init()
     }
 }
 fn xhci(with_status: bool) -> XhciInput {
     let mut value = MaybeUninit::uninit();
     unsafe {
-        r4os_zig_inventory_xhci(with_status, value.as_mut_ptr());
+        inventory_xhci(with_status, value.as_mut_ptr());
         value.assume_init()
     }
 }
@@ -519,7 +508,7 @@ fn collect(snapshot: *mut Snapshot) {
     add_usb(snapshot);
     for index in 0..scalar(5, 0) as usize {
         let mut entry = MaybeUninit::uninit();
-        if !unsafe { r4os_zig_inventory_driver(index as u64, entry.as_mut_ptr()) } {
+        if !unsafe { inventory_driver(index as u64, entry.as_mut_ptr()) } {
             continue;
         }
         let entry = unsafe { entry.assume_init() };
@@ -554,7 +543,7 @@ fn collect(snapshot: *mut Snapshot) {
     add_network(snapshot);
     for index in 0..scalar(6, 0) as usize {
         let mut entry = MaybeUninit::uninit();
-        if !unsafe { r4os_zig_inventory_protocol(index as u64, entry.as_mut_ptr()) } {
+        if !unsafe { inventory_protocol(index as u64, entry.as_mut_ptr()) } {
             continue;
         }
         let entry = unsafe { entry.assume_init() };
@@ -665,7 +654,7 @@ fn add_platform(snapshot: *mut Snapshot) {
         ),
     );
     let mut display = MaybeUninit::<DisplayInput>::uninit();
-    unsafe { r4os_zig_inventory_display(display.as_mut_ptr()) };
+    unsafe { inventory_display(display.as_mut_ptr()) };
     let display = unsafe { display.assume_init() };
     add(
         snapshot,
@@ -760,7 +749,7 @@ fn add_usb(snapshot: *mut Snapshot) {
     let mut index = 0;
     loop {
         let mut device = MaybeUninit::<UsbInput>::uninit();
-        if !unsafe { r4os_zig_inventory_usb(index, device.as_mut_ptr()) } {
+        if !unsafe { inventory_usb(index, device.as_mut_ptr()) } {
             break;
         }
         index += 1;
@@ -988,7 +977,7 @@ fn add_network(snapshot: *mut Snapshot) {
     let mut index = 0;
     while index < scalar(8, 0) as usize {
         let mut adapter = MaybeUninit::<NetInput>::uninit();
-        if unsafe { r4os_zig_inventory_net(index as u64, adapter.as_mut_ptr()) } {
+        if unsafe { inventory_net(index as u64, adapter.as_mut_ptr()) } {
             let adapter = unsafe { adapter.assume_init() };
             let note = network_note(snapshot, index, &adapter);
             add(
@@ -1431,4 +1420,265 @@ fn note_for(
         b""
     };
     Text::new(text)
+}
+
+unsafe fn inventory_scalar(operation: u8, argument: u64) -> u64 {
+    use crate::{fs::drive, net::adapters, storage::block_registry as block};
+    match operation {
+        0 => block::r4os_rust_block_registry_query(0, 0) as u64,
+        1 => block::r4os_rust_block_registry_query(1, 0) as u64,
+        2 => {
+            u64::from(!unsafe { drive::r4os_rust_fs_drive_lookup(1, argument as usize) }.is_null())
+        }
+        3 => {
+            let p = unsafe { drive::r4os_rust_fs_drive_lookup(1, (argument as u8) as usize) };
+            u64::from(
+                !p.is_null()
+                    && unsafe { (*p).has_block && (*p).block_index == (argument >> 8) as usize },
+            )
+        }
+        4 => block::r4os_rust_block_registry_query(2, 4) as u64,
+        5 => crate::driver::registry::MAX_DRIVERS as u64,
+        6 => crate::driver::protocol_registry::MAX_PROTOCOLS as u64,
+        7 => u64::from(adapters::r4os_rust_net_adapter_has_device(
+            (argument >> 16) as u16,
+            argument as u16,
+        )),
+        8 => adapters::r4os_rust_net_adapter_count() as u64,
+        _ => 0,
+    }
+}
+
+unsafe fn inventory_block(index: u64, out: *mut BlockInput) -> bool {
+    let Some(v) = crate::storage::block_device::config(index as usize) else {
+        return false;
+    };
+    unsafe {
+        out.write(BlockInput {
+            name: Text {
+                pointer: v.name.data,
+                bytes: v.name.len as u64,
+            },
+            driver: Text {
+                pointer: v.driver.data,
+                bytes: v.driver.len as u64,
+            },
+            bus: v.bus,
+            source: v.source,
+            port: v.port,
+            removable: v.removable,
+            writable: v.writable,
+        });
+    }
+    true
+}
+
+unsafe fn inventory_display(out: *mut DisplayInput) {
+    let v = crate::display::manager::stats();
+    unsafe {
+        out.write(DisplayInput {
+            name: Text {
+                pointer: v.name.pointer,
+                bytes: v.name.len as u64,
+            },
+            policy: Text::new(crate::display::manager::cache_policy_name(
+                v.mapping.cache_policy,
+            )),
+        });
+    }
+}
+
+unsafe fn inventory_usb(index: u64, out: *mut UsbInput) -> bool {
+    let mut v = MaybeUninit::uninit();
+    if !unsafe { crate::usb::core::r4os_rust_usb_core_at(index as usize, v.as_mut_ptr()) } {
+        return false;
+    }
+    let v = unsafe { v.assume_init() };
+    unsafe {
+        out.write(UsbInput {
+            configured: v.configured,
+            vendor_id: v.vendor_id,
+            product_id: v.product_id,
+            class: v.device_class,
+            subclass: v.device_subclass,
+            protocol: v.device_protocol,
+            interface_class: v.first_interface_class,
+            interface_subclass: v.first_interface_subclass,
+            interface_protocol: v.first_interface_protocol,
+        });
+    }
+    true
+}
+
+unsafe fn inventory_hid(out: *mut HidInput) {
+    let v = crate::usb::hid::status();
+    unsafe {
+        out.write(HidInput {
+            keyboard: v.keyboard_bound,
+            mouse: v.mouse_bound,
+            missing: u32::from(v.protocol_required_missing),
+            source: Text {
+                pointer: v.boot_source.pointer,
+                bytes: v.boot_source.len as u64,
+            },
+        });
+    }
+}
+
+unsafe fn inventory_msc(out: *mut MscInput) {
+    let v = crate::usb::msc::snapshot().status;
+    unsafe {
+        out.write(MscInput {
+            registered: v.block_registered,
+            write_protected: v.write_protected,
+            external: crate::usb::msc::has_external_owner(),
+            missing: v.protocol_required_missing,
+            bot: Text {
+                pointer: v.bot_source.pointer,
+                bytes: v.bot_source.len as u64,
+            },
+            scsi: Text {
+                pointer: v.scsi_source.pointer,
+                bytes: v.scsi_source.len as u64,
+            },
+        });
+    }
+}
+
+unsafe fn inventory_driver(index: u64, out: *mut DriverInput) -> bool {
+    use crate::driver::registry as r;
+    let Some(v) = r::get(index as usize) else {
+        return false;
+    };
+    unsafe {
+        out.write(DriverInput {
+            kind: v.driver_type,
+            name: v.name,
+            name_len: v.name_len as u64,
+            source: Text::new(r::source_name(v.source)),
+            state: Text::new(r::state_name(v.state)),
+            type_name: Text::new(r::type_name(v.driver_type)),
+        });
+    }
+    true
+}
+
+unsafe fn inventory_protocol(index: u64, out: *mut ProtocolInput) -> bool {
+    use crate::driver::protocol_registry as r;
+    let Some(v) = r::get(index as usize) else {
+        return false;
+    };
+    unsafe {
+        out.write(ProtocolInput {
+            category: v.category,
+            role: v.role,
+            role_len: v.role_len as u64,
+            source: Text::new(r::source_name(v.source)),
+            state: Text::new(r::state_name(v.state)),
+            note: v.note,
+            note_len: v.note_len as u64,
+        });
+    }
+    true
+}
+
+unsafe fn inventory_net(index: u64, out: *mut NetInput) -> bool {
+    use crate::net::{adapters, config};
+    let Some(v) = adapters::snapshot(index as usize) else {
+        return false;
+    };
+    let settings = config::settings();
+    let source = config::source_name();
+    unsafe {
+        out.write(NetInput {
+            name: Text {
+                pointer: v.name.pointer,
+                bytes: v.name.len as u64,
+            },
+            driver: Text {
+                pointer: v.driver.pointer,
+                bytes: v.driver.len as u64,
+            },
+            link: Text::new(match v.link {
+                0 => b"unknown",
+                1 => b"down",
+                2 => b"up",
+                _ => unreachable!(),
+            }),
+            last_error: Text {
+                pointer: v.stats.last_error.pointer,
+                bytes: v.stats.last_error.len as u64,
+            },
+            config_source: Text {
+                pointer: source.pointer,
+                bytes: source.len as u64,
+            },
+            rx: v.stats.rx_packets,
+            tx: v.stats.tx_packets,
+            errors: v.stats.errors,
+            mac: v.mac,
+            ip: settings.local_ip,
+            gateway: settings.gateway_ip,
+            bus: v.bus,
+            bus_no: v.bus_no,
+            device_no: v.device_no,
+            function_no: v.function_no,
+            vendor_id: v.vendor_id,
+            device_id: v.device_id,
+        });
+    }
+    true
+}
+
+unsafe fn inventory_xhci(with_status: bool, out: *mut XhciInput) {
+    use crate::usb::{host_controller as host, types};
+    let mut result = XhciInput {
+        present: false,
+        exists: false,
+        status_ok: false,
+        source: 0,
+        state: 0,
+        source_label: Text::EMPTY,
+        flags: 0,
+        queue_depth: 0,
+        max_transfer_bytes: 0,
+        active_transfers: 0,
+        completions: 0,
+        interrupts: 0,
+        polls: 0,
+        cancellations: 0,
+    };
+    let index = unsafe { host::r4os_rust_usb_host_find(b"XHCI".as_ptr(), 4) };
+    if index != usize::MAX {
+        result.present = true;
+        let mut value = MaybeUninit::uninit();
+        if unsafe { host::r4os_rust_usb_host_at(index, value.as_mut_ptr()) } {
+            let value = unsafe { value.assume_init() };
+            result.exists = true;
+            result.source = value.source;
+            result.state = value.state;
+            result.source_label = Text::new(match value.source {
+                0 => b"built-in",
+                1 => b"preload",
+                2 => b"disk",
+                _ => unreachable!(),
+            });
+            if with_status {
+                let mut status = types::HostStatus::EMPTY;
+                result.status_ok =
+                    unsafe { host::r4os_rust_usb_host_status(index, &mut status) } == 0;
+                result.flags = status.flags;
+                result.queue_depth = status.queue_depth;
+                result.max_transfer_bytes = status.max_transfer_bytes;
+                result.active_transfers = status.active_transfers;
+                result.completions = status.completions;
+                result.interrupts = status.interrupts;
+                result.polls = status.polls;
+                result.cancellations = status.cancellations;
+            }
+        }
+    }
+    unsafe {
+        out.write(result);
+    }
 }

@@ -2,7 +2,7 @@
 //! addresses; no registry/endpoint reference survives a wait or foreign call.
 use super::registry_types::*;
 use crate::{
-    build_bridge::config,
+    build_config::config,
     contract as c,
     fs::vfs_types::Bytes,
     platform::monotonic,

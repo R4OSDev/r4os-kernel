@@ -1,6 +1,16 @@
 ﻿R4OS Kernel - Herkunft
 =======================
 
+Aktueller Stand 0.83.27 / Kernel 0.1.287
+----------------------------------------
+Die folgenden Ausgangs- und Besitzerabgleiche dokumentieren die historische
+Zig-Uebernahme. Die produktiven Implementierungen und der Link sind jetzt
+Rust und notwendige Assembly; Support-/SDK- und Recoverykopien behalten ihre
+eigenen Besitzer. Originalquellen bleiben im Gitverlauf und hashgebundenen
+Migrationsarchiv. Aktuelle Besitzer: README.md und die Workspaceanleitungen
+Docs/Core/KernelRustMigration.txt / KernelRustFinal.txt. Lizenz- und
+Urhebervermerke der Uebernahme gelten weiter.
+
 Kanonischer Quellstand der Uebernahme:
 
     Repository: R4mbo/R4OS

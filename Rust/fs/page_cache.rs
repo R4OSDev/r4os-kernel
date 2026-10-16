@@ -202,3 +202,46 @@ pub unsafe extern "C" fn r4os_rust_pagecache_invalidate_device(device: usize) {
         wb::invalidate_device(device);
     }
 }
+
+pub(crate) fn diagnostic(op: u8, token: u64, value: u64, extra: u64) -> u64 {
+    use crate::display::diag_screen as d;
+    match op {
+        0 => d::begin_resolvable(),
+        1 => u64::from(d::resolve(token)),
+        2 => {
+            d::text(b"[PGCACHE] relock stalled slice=");
+            d::number(value, false);
+            d::end_line();
+            0
+        }
+        3 => {
+            let incident = d::begin_resolvable();
+            d::text(b"[PGCACHE] dirty index fallback dev=");
+            if value == u64::MAX {
+                d::text(b"all")
+            } else {
+                d::number(value, false)
+            }
+            d::text(b" observed=");
+            d::number(extra, false);
+            d::end_line();
+            let _ = d::resolve(incident);
+            0
+        }
+        4 | 5 => {
+            let incident = d::begin_resolvable();
+            d::text(if op == 4 {
+                b"[PGCACHE] busy read failed dev="
+            } else {
+                b"[PGCACHE] busy bulk read failed dev="
+            });
+            d::number(value, false);
+            d::text(b" page=");
+            d::number(extra, false);
+            d::end_line();
+            let _ = d::resolve(incident);
+            0
+        }
+        _ => unreachable!(),
+    }
+}

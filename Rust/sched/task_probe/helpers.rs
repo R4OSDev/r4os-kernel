@@ -14,8 +14,7 @@ use crate::{
 };
 use core::{ffi::c_void, ptr};
 unsafe extern "C" {
-    fn r4os_zig_kernel_write(text: *const u8, len: usize);
-    fn r4os_zig_kernel_dec(value: u64);
+
     pub fn r4os_rust_task_control(op: u8, a: u64, b: u64) -> u64;
     fn r4os_rust_task_mutate(
         op: u8,
@@ -35,10 +34,10 @@ unsafe extern "C" {
     fn r4os_rust_task_snapshot(op: u8, argument: u64, output: *mut c_void, len: usize) -> u64;
 }
 pub fn puts(text: &[u8]) {
-    unsafe { r4os_zig_kernel_write(text.as_ptr(), text.len()) };
+    unsafe { kernel_write(text.as_ptr(), text.len()) };
 }
 pub fn dec(value: u64) {
-    unsafe { r4os_zig_kernel_dec(value) };
+    crate::boot::log_route::dec(value);
 }
 pub fn fail(reason: &[u8]) -> bool {
     puts(b"TASKREG05910 result: FAILED reason=");
@@ -238,4 +237,8 @@ pub fn lock_stats() -> crate::sched::sync_types::LockSummary {
     let mut out = crate::sched::sync_types::LockSummary::default();
     unsafe { sync_stats::r4os_rust_sync_lock_summary(&mut out) };
     out
+}
+
+unsafe fn kernel_write(text: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
 }

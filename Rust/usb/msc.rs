@@ -18,6 +18,7 @@ use crate::{
         sync_types::{Text, UnwindGuard, WaitQueue},
     },
 };
+use core::ffi::c_void;
 use core::{
     cell::UnsafeCell,
     ptr,
@@ -70,9 +71,7 @@ struct DeviceBinding {
     input: EndpointHandle,
     output: EndpointHandle,
 }
-unsafe extern "C" {
-    fn r4os_zig_usb_msc_register(current: *mut Status, index: usize, source: u8) -> usize;
-}
+
 fn item(index: usize) -> *mut Medium {
     assert!(index < MAX_MEDIA);
     unsafe { MEDIA.0.get().cast::<Medium>().add(index) }
@@ -264,7 +263,7 @@ unsafe fn initialize_medium(current: *mut Status, binding: DeviceBinding) -> boo
         }
         (*current).max_sectors_per_request =
             (MAX_TRANSFER_BYTES / (*current).sector_size).min(65535) as u16;
-        let registered = r4os_zig_usb_msc_register(
+        let registered = usb_msc_register(
             current,
             (*medium(current)).index,
             SOURCE.load(Ordering::Acquire),
@@ -660,4 +659,60 @@ pub unsafe extern "C" fn r4os_rust_usb_msc_flush(current: *mut Status) -> bool {
         return false;
     }
     unsafe { flush_block(current) }
+}
+
+unsafe fn usb_msc_register(current: *mut Status, index: usize, source: u8) -> usize {
+    use crate::storage::{block_device as b, block_registry::Text};
+    let s = unsafe { &*current };
+    assert!(s.model_len <= s.model.len());
+    let mut cfg = b::Config::new(b::text(MEDIA_NAMES[index]), block_read);
+    cfg.model = Text {
+        data: s.model.as_ptr(),
+        len: s.model_len,
+    };
+    cfg.driver = b::text(b"USBMSC");
+    cfg.bus = 4;
+    cfg.controller = b::text(b"xhci");
+    cfg.port = s.port;
+    cfg.sector_size = s.sector_size;
+    cfg.sector_count = s.sector_count;
+    cfg.max_sectors = s.max_sectors_per_request;
+    cfg.removable = true;
+    cfg.writable = !s.write_protected;
+    cfg.owns_retry = true;
+    cfg.source = source;
+    cfg.context = current.cast();
+    cfg.write = if cfg.writable {
+        Some(block_write)
+    } else {
+        None
+    };
+    cfg.flush = Some(block_flush);
+    unsafe { b::register(cfg) }.unwrap_or(usize::MAX)
+}
+
+const MEDIA_NAMES: [&[u8]; 16] = [
+    b"usb0", b"usb1", b"usb2", b"usb3", b"usb4", b"usb5", b"usb6", b"usb7", b"usb8", b"usb9",
+    b"usb10", b"usb11", b"usb12", b"usb13", b"usb14", b"usb15",
+];
+unsafe extern "C" fn block_read(
+    ctx: *mut c_void,
+    lba: u64,
+    sectors: u16,
+    out: *mut u8,
+    len: usize,
+) -> bool {
+    unsafe { r4os_rust_usb_msc_read(ctx.cast(), lba, sectors, out, len) }
+}
+unsafe extern "C" fn block_write(
+    ctx: *mut c_void,
+    lba: u64,
+    sectors: u16,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    unsafe { r4os_rust_usb_msc_write(ctx.cast(), lba, sectors, data, len) }
+}
+unsafe extern "C" fn block_flush(ctx: *mut c_void) -> bool {
+    unsafe { r4os_rust_usb_msc_flush(ctx.cast()) }
 }

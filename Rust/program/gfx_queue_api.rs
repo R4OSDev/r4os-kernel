@@ -568,6 +568,7 @@ pub unsafe fn release(owner: Owner, input: *const a::GfxFence, cancel: bool) -> 
     })())
 }
 #[repr(C)]
+#[derive(Default)]
 pub struct Args {
     pub owner: Owner,
     pub value: u64,

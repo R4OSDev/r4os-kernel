@@ -1,5 +1,5 @@
 //! Original module-registry byte admission, image layout, relocations and R4L
-//! table validation. Registry claims and publication migrate separately.
+//! table validation. Registry claims and publication keep their own owner.
 //! Private callers supply bounded, resident C records; outputs are initialized
 //! only as far as the original Zig operation wrote them.
 use super::r4m::{self, Header, RelocationRecord};

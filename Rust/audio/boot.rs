@@ -81,15 +81,12 @@ pub struct OptionalSpan {
     pub present: bool,
     pub value: Span,
 }
-unsafe extern "C" {
-    fn r4os_zig_audio_boot_fail(text: *const u8, len: usize) -> bool;
-    fn r4os_zig_audio_boot_status(text: *const u8, len: usize);
-}
+
 fn log(text: &[u8]) {
     audio::log(text)
 }
 fn status_line(text: &[u8]) {
-    unsafe { r4os_zig_audio_boot_status(text.as_ptr(), text.len()) }
+    unsafe { audio_boot_status(text.as_ptr(), text.len()) }
 }
 fn boot(text: &[u8]) {
     unsafe { bootlog::r4os_rust_bootlog_write(text.as_ptr(), text.len()) }
@@ -100,7 +97,7 @@ fn yes(v: bool) -> &'static [u8] {
 unsafe fn fail(message: &[u8], reason: &'static [u8]) -> bool {
     unsafe {
         g!(reason) = Span::literal(reason);
-        r4os_zig_audio_boot_fail(message.as_ptr(), message.len())
+        audio_boot_fail(message.as_ptr(), message.len())
     }
 }
 unsafe fn driver(config: *const c_void, name: &[u8], disabled: bool) -> bool {
@@ -576,3 +573,12 @@ const _: () = {
     assert!(size_of::<Status>() == 152);
     assert!(size_of::<OptionalSpan>() == 24);
 };
+
+unsafe fn audio_boot_status(text: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
+}
+
+unsafe fn audio_boot_fail(text: *const u8, len: usize) -> bool {
+    unsafe { crate::boot::fatal::r4os_rust_fatal_record(14, text, len) };
+    false
+}

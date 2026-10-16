@@ -79,14 +79,7 @@ fn name(generation: u64) -> Bytes {
     Bytes { data: out, len: 12 }
 }
 fn catalog_admitted() -> bool {
-    #[cfg(r4os_owner_fixture)]
-    {
-        true
-    }
-    #[cfg(not(r4os_owner_fixture))]
-    {
-        crate::sched::scheduler::current().is_null() || crate::fs::request::owns_drive(b'C')
-    }
+    crate::sched::scheduler::current().is_null() || crate::fs::request::owns_drive(b'C')
 }
 fn directory(v: Volume) -> Option<u64> {
     match io::resolve(v, span(DIRECTORY)) {

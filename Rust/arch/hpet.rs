@@ -89,9 +89,7 @@ static WIDTH: AtomicU32 = AtomicU32::new(0);
 static EXTENSION: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static HZ: AtomicU32 = AtomicU32::new(0);
-unsafe extern "C" {
-    fn r4os_zig_hpet_log(status: *const Status);
-}
+
 fn state() -> Status {
     unsafe { *STATE.0.get() }
 }
@@ -110,7 +108,7 @@ fn write(offset: u64, value: u64) {
 }
 fn log(mut value: Status) {
     value.timer_ticks = TICKS.load(Ordering::Relaxed);
-    unsafe { r4os_zig_hpet_log(&value) };
+    unsafe { hpet_log(&value) };
 }
 fn map(base: u64) -> bool {
     let page = base & !4095;
@@ -512,3 +510,57 @@ const _: () = {
     assert!(core::mem::size_of::<Status>() == 96);
     assert!(core::mem::offset_of!(Status, timer_hz) == 88);
 };
+
+unsafe fn hpet_log(status: *const Status) {
+    use crate::boot::log::{
+        r4os_rust_bootlog_dec as dec, r4os_rust_bootlog_hex as hex, text as puts,
+    };
+    let s = unsafe { status.read() };
+
+    puts(b"[HPET] ");
+    puts(if s.has(AVAILABLE) {
+        b"available"
+    } else {
+        b"missing"
+    });
+    puts(b" mapped=");
+    puts(if s.has(MAPPED) { b"yes" } else { b"no" });
+    puts(b" enabled=");
+    puts(if s.has(ENABLED) { b"yes" } else { b"no" });
+    puts(b" base=0x");
+    hex(s.phys_base, 16);
+    puts(b" period_fs=");
+    dec(u64::from(s.period_fs));
+    puts(b" freq_hz=");
+    dec(s.frequency_hz);
+    puts(b" counter=");
+    dec(s.counter);
+    puts(b" timer0_irq=");
+    puts(if s.flags & 128 != 0 { b"on" } else { b"off" });
+    puts(b" timer_hz=");
+    dec(u64::from(s.timer_hz));
+    puts(b" timer_ticks=");
+    dec(s.timer_ticks);
+    puts(b" reason=");
+    puts(match s.reason {
+        0 => b"not initialized",
+        1 => b"ACPI HPET missing",
+        2 => b"HPET MMIO mapping failed",
+        3 => b"HPET main counter did not advance within bounded qualification",
+        4 => b"MMIO mapped, main counter enabled, interrupts disabled",
+        5 => b"HPET timer unavailable",
+        6 => b"HPET legacy replacement not supported",
+        7 => b"HPET comparator 0 is not periodic capable",
+        8 => b"HPET comparator 0 periodic legacy IRQ0 active",
+        9 => b"HPET comparator 0 setup incomplete",
+        10 => b"HPET one-shot unavailable",
+        11 => b"HPET one-shot needs legacy IRQ0 replacement",
+        12 => b"HPET comparator 0 one-shot legacy IRQ0 ready",
+        13 => b"HPET one-shot setup incomplete",
+        14 => b"HPET comparator 0 one-shot armed",
+        15 => b"HPET comparator 0 one-shot disarmed",
+        16 => b"HPET main counter enabled, comparator interrupts disabled",
+        _ => unreachable!(),
+    });
+    puts(b"\r\n");
+}

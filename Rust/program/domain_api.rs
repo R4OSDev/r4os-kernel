@@ -4,261 +4,7 @@
 use super::context;
 use crate::contract as c;
 use core::ptr;
-unsafe extern "C" {
-    fn r4os_zig_program_domain_audio_open_stream(
-        owner: c::ProgramProcessHandle,
-        rate: u32,
-        channels: u16,
-        format: u16,
-    ) -> i32;
-    fn r4os_zig_program_domain_audio_output_info(index: u32, out: *mut c::AudioOutputInfo) -> i32;
-    fn r4os_zig_program_domain_audio_select_output(id: *const u8, len: usize) -> i32;
-    fn r4os_zig_program_domain_audio_write(
-        owner: c::ProgramProcessHandle,
-        stream_id: u32,
-        data_ptr: *const u8,
-        byte_count: u32,
-    ) -> i32;
-    fn r4os_zig_program_domain_audio_close(owner: c::ProgramProcessHandle, stream_id: u32) -> i32;
-    fn r4os_zig_program_domain_audio_set_volume(
-        owner: c::ProgramProcessHandle,
-        stream_id: u32,
-        fixed_volume: u32,
-    ) -> i32;
-    fn r4os_zig_program_domain_remote_frame_acquire(owner: c::ProgramProcessHandle) -> i32;
-    fn r4os_zig_program_domain_remote_frame_release(owner: c::ProgramProcessHandle) -> i32;
-    fn r4os_zig_program_domain_remote_frame_publish(
-        owner: c::ProgramProcessHandle,
-        info: *const c::RemoteFrameInfo,
-        pixels: *const u32,
-        count: u32,
-    ) -> i32;
-    fn r4os_zig_program_domain_remote_frame_publish_regions(
-        owner: c::ProgramProcessHandle,
-        info: *const c::RemoteFrameInfo,
-        pixels: *const u32,
-        count: u32,
-        regions: *const c::DisplayDamageRect,
-        region_count: u32,
-    ) -> i32;
-    fn r4os_zig_program_domain_remote_frame_snapshot_acquire(
-        owner: c::ProgramProcessHandle,
-        expected: u32,
-        info: *mut c::RemoteFrameInfo,
-        lease: *mut c::RemoteFrameLease,
-    ) -> i32;
-    fn r4os_zig_program_domain_remote_frame_snapshot_release(
-        owner: c::ProgramProcessHandle,
-        lease: *const c::RemoteFrameLease,
-    ) -> i32;
-    fn r4os_zig_program_domain_remote_frame_source_reset(owner: c::ProgramProcessHandle) -> i32;
-    fn r4os_zig_program_domain_gfx_buffer_create(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferDescriptor,
-        output: *mut c::GfxBufferReference,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_virtual_start(
-        owner: c::ProgramProcessHandle,
-        closed: *mut bool,
-        input: *const c::GfxVirtualRequest,
-        output: *mut c::GfxVirtualStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_virtual_query(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        output: *mut c::GfxVirtualStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_virtual_close(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        mode: u32,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_virtual_wait(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        until: u32,
-        timeout: u64,
-        output: *mut c::GfxVirtualStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_native_start(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxNativeAllocation,
-        output: *mut c::GfxNativeStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_native_query(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        output: *mut c::GfxNativeStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_native_receive(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        output: *mut c::GfxBufferReference,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_native_close(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_native_wait(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        timeout_ticks: u64,
-        output: *mut c::GfxNativeStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_queue_open(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxQueueConfig,
-        output: *mut c::GfxQueueHandle,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_atomic_test(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxAtomicState,
-        output: *mut c::GfxAtomicResult,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_atomic_commit(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxAtomicState,
-        output: *mut c::GfxAtomicResult,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_atomic_submit(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxAtomicState,
-        confirmation_ms: u32,
-        output: *mut c::GfxModeStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_atomic_test_color(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxModeColorRequest,
-        output: *mut c::GfxAtomicResult,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_atomic_submit_color(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxModeColorRequest,
-        confirmation_ms: u32,
-        output: *mut c::GfxModeStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_refresh_request(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxRefreshRequest,
-        output: *mut c::GfxRefreshRequest,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_power_request(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxPowerRequest,
-        output: *mut c::GfxPowerRequest,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_atomic_resolve(
-        owner: c::ProgramProcessHandle,
-        ticket: u64,
-        action: u32,
-        output: *mut c::GfxModeStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_queue_close(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxQueueHandle,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_queue_submit(
-        owner: c::ProgramProcessHandle,
-        queue: *const c::GfxQueueHandle,
-        input: *const c::GfxSubmission,
-        output: *mut c::GfxFenceStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_queue_submit_render_list(
-        owner: c::ProgramProcessHandle,
-        queue: *const c::GfxQueueHandle,
-        input: *const c::GfxSubmission,
-        list: *const c::GfxRenderList,
-        output: *mut c::GfxFenceStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_queue_submit_render_grid_list(
-        owner: c::ProgramProcessHandle,
-        queue: *const c::GfxQueueHandle,
-        input: *const c::GfxSubmission,
-        list: *const c::GfxRenderGridList,
-        output: *mut c::GfxFenceStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_queue_submit_output(
-        owner: c::ProgramProcessHandle,
-        queue: *const c::GfxQueueHandle,
-        input: *const c::GfxSubmission,
-        target: *const c::GfxOutputTarget,
-        output: *mut c::GfxFenceStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_queue_submit_render_color_list(
-        owner: c::ProgramProcessHandle,
-        queue: *const c::GfxQueueHandle,
-        input: *const c::GfxSubmission,
-        list: *const c::GfxRenderColorList,
-        output: *mut c::GfxFenceStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_queue_submit_native(
-        owner: c::ProgramProcessHandle,
-        queue: *const c::GfxQueueHandle,
-        input: *const c::GfxSubmission,
-        native: *const c::GfxNativeSubmission,
-        output: *mut c::GfxFenceStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_queue_submit_render_color_grid_list(
-        owner: c::ProgramProcessHandle,
-        queue: *const c::GfxQueueHandle,
-        input: *const c::GfxSubmission,
-        list: *const c::GfxRenderColorGridList,
-        output: *mut c::GfxFenceStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_fence_cancel(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxFence,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_fence_release(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxFence,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_buffer_describe(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        output: *mut c::GfxBufferDescriptor,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_buffer_import(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        output: *mut c::GfxBufferReference,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_buffer_release(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_buffer_map(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        access: u32,
-        offset: u64,
-        bytes: u64,
-        output: *mut c::GfxBufferMap,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_buffer_unmap(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_buffer_map_persistent(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBufferHandle,
-        access: u32,
-        offset: u64,
-        bytes: u64,
-        output: *mut c::GfxBufferMap,
-    ) -> i32;
-    fn r4os_zig_program_domain_gfx_brightness_request(
-        owner: c::ProgramProcessHandle,
-        input: *const c::GfxBrightnessRequest,
-        output: *mut c::GfxBrightnessRequest,
-    ) -> i32;
-    fn r4os_zig_program_domain_display_cursor_submit(
-        owner: c::ProgramProcessHandle,
-        input: *const c::DisplayCursorRequest,
-        output: *mut c::DisplayCursorStatus,
-    ) -> i32;
-    fn r4os_zig_program_domain_remote_publisher(owner: c::ProgramProcessHandle) -> bool;
-}
+
 /// # Safety
 /// Original resident canonical input/output buffers and exact program execution
 /// lifetime; the existing lower owner retains its admission/ACK contract.
@@ -272,7 +18,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_audio_open_stream(
         let Some(owner) = context::handle() else {
             return c::service_api_result_invalid;
         };
-        r4os_zig_program_domain_audio_open_stream(owner, rate, channels, format)
+        program_domain_audio_open_stream(owner, rate, channels, format)
     }
 }
 /// # Safety
@@ -283,7 +29,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_audio_output_info(
     index: u32,
     out: *mut c::AudioOutputInfo,
 ) -> i32 {
-    unsafe { r4os_zig_program_domain_audio_output_info(index, out) }
+    unsafe { program_domain_audio_output_info(index, out) }
 }
 /// # Safety
 /// Original resident canonical input/output buffers and exact program execution
@@ -298,7 +44,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_audio_select_output(id: *const
         if len == 64 {
             return c::service_api_result_invalid;
         }
-        r4os_zig_program_domain_audio_select_output(id.cast(), len)
+        program_domain_audio_select_output(id.cast(), len)
     }
 }
 /// # Safety
@@ -314,7 +60,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_audio_write(
         let Some(owner) = context::handle() else {
             return c::service_api_result_invalid;
         };
-        r4os_zig_program_domain_audio_write(owner, stream_id, data_ptr, byte_count)
+        program_domain_audio_write(owner, stream_id, data_ptr, byte_count)
     }
 }
 /// # Safety
@@ -326,7 +72,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_audio_close(stream_id: u32) ->
         let Some(owner) = context::handle() else {
             return c::service_api_result_invalid;
         };
-        r4os_zig_program_domain_audio_close(owner, stream_id)
+        program_domain_audio_close(owner, stream_id)
     }
 }
 /// # Safety
@@ -341,7 +87,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_audio_set_volume(
         let Some(owner) = context::handle() else {
             return c::service_api_result_invalid;
         };
-        r4os_zig_program_domain_audio_set_volume(owner, stream_id, fixed_volume)
+        program_domain_audio_set_volume(owner, stream_id, fixed_volume)
     }
 }
 /// # Safety
@@ -353,7 +99,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_remote_frame_acquire() -> i32 
         let Some(owner) = context::handle() else {
             return c::remote_frame_error_unavailable;
         };
-        r4os_zig_program_domain_remote_frame_acquire(owner)
+        program_domain_remote_frame_acquire(owner)
     }
 }
 /// # Safety
@@ -365,7 +111,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_remote_frame_release() -> i32 
         let Some(owner) = context::handle() else {
             return c::remote_frame_error_unavailable;
         };
-        r4os_zig_program_domain_remote_frame_release(owner)
+        program_domain_remote_frame_release(owner)
     }
 }
 /// # Safety
@@ -381,10 +127,10 @@ pub unsafe extern "C" fn r4os_rust_program_domain_remote_frame_publish(
         let Some(owner) = context::handle() else {
             return c::remote_frame_error_unavailable;
         };
-        if !r4os_zig_program_domain_remote_publisher(owner) {
+        if !program_domain_remote_publisher(owner) {
             return c::remote_frame_error_unavailable;
         }
-        r4os_zig_program_domain_remote_frame_publish(owner, info, pixels, count)
+        program_domain_remote_frame_publish(owner, info, pixels, count)
     }
 }
 /// # Safety
@@ -402,10 +148,10 @@ pub unsafe extern "C" fn r4os_rust_program_domain_remote_frame_publish_regions(
         let Some(owner) = context::handle() else {
             return c::remote_frame_error_unavailable;
         };
-        if !r4os_zig_program_domain_remote_publisher(owner) {
+        if !program_domain_remote_publisher(owner) {
             return c::remote_frame_error_unavailable;
         }
-        r4os_zig_program_domain_remote_frame_publish_regions(
+        program_domain_remote_frame_publish_regions(
             owner,
             info,
             pixels,
@@ -431,7 +177,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_remote_frame_snapshot_acquire(
         let Some(owner) = context::handle() else {
             return c::remote_frame_error_unavailable;
         };
-        r4os_zig_program_domain_remote_frame_snapshot_acquire(owner, expected, info, lease)
+        program_domain_remote_frame_snapshot_acquire(owner, expected, info, lease)
     }
 }
 /// # Safety
@@ -448,7 +194,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_remote_frame_snapshot_release(
         let Some(owner) = context::handle() else {
             return c::remote_frame_error_unavailable;
         };
-        r4os_zig_program_domain_remote_frame_snapshot_release(owner, lease)
+        program_domain_remote_frame_snapshot_release(owner, lease)
     }
 }
 /// # Safety
@@ -460,7 +206,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_remote_frame_source_reset() ->
         let Some(owner) = context::handle() else {
             return c::remote_frame_error_unavailable;
         };
-        r4os_zig_program_domain_remote_frame_source_reset(owner)
+        program_domain_remote_frame_source_reset(owner)
     }
 }
 /// # Safety
@@ -475,7 +221,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_buffer_create(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_buffer_create(owner, input, output)
+        program_domain_gfx_buffer_create(owner, input, output)
     }
 }
 /// # Safety
@@ -494,7 +240,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_virtual_start(
         if instance.is_null() {
             return c::gfx_buffer_error_unavailable;
         }
-        r4os_zig_program_domain_gfx_virtual_start(
+        program_domain_gfx_virtual_start(
             owner,
             ptr::addr_of_mut!((*instance).gfx_virtual_closed),
             input,
@@ -514,7 +260,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_virtual_query(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_virtual_query(owner, input, output)
+        program_domain_gfx_virtual_query(owner, input, output)
     }
 }
 /// # Safety
@@ -529,7 +275,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_virtual_close(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_virtual_close(owner, input, mode)
+        program_domain_gfx_virtual_close(owner, input, mode)
     }
 }
 /// # Safety
@@ -546,7 +292,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_virtual_wait(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_virtual_wait(owner, input, until, timeout, output)
+        program_domain_gfx_virtual_wait(owner, input, until, timeout, output)
     }
 }
 /// # Safety
@@ -561,7 +307,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_native_start(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_native_start(owner, input, output)
+        program_domain_gfx_native_start(owner, input, output)
     }
 }
 /// # Safety
@@ -576,7 +322,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_native_query(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_native_query(owner, input, output)
+        program_domain_gfx_native_query(owner, input, output)
     }
 }
 /// # Safety
@@ -591,7 +337,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_native_receive(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_native_receive(owner, input, output)
+        program_domain_gfx_native_receive(owner, input, output)
     }
 }
 /// # Safety
@@ -605,7 +351,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_native_close(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_native_close(owner, input)
+        program_domain_gfx_native_close(owner, input)
     }
 }
 /// # Safety
@@ -621,7 +367,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_native_wait(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_native_wait(owner, input, timeout_ticks, output)
+        program_domain_gfx_native_wait(owner, input, timeout_ticks, output)
     }
 }
 /// # Safety
@@ -636,7 +382,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_queue_open(
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_queue_open(owner, input, output)
+        program_domain_gfx_queue_open(owner, input, output)
     }
 }
 /// # Safety
@@ -651,7 +397,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_atomic_test(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_atomic_test(owner, input, output)
+        program_domain_gfx_atomic_test(owner, input, output)
     }
 }
 /// # Safety
@@ -666,7 +412,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_atomic_commit(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_atomic_commit(owner, input, output)
+        program_domain_gfx_atomic_commit(owner, input, output)
     }
 }
 /// # Safety
@@ -682,7 +428,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_atomic_submit(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_atomic_submit(owner, input, confirmation_ms, output)
+        program_domain_gfx_atomic_submit(owner, input, confirmation_ms, output)
     }
 }
 /// # Safety
@@ -697,7 +443,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_atomic_test_color(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_atomic_test_color(owner, input, output)
+        program_domain_gfx_atomic_test_color(owner, input, output)
     }
 }
 /// # Safety
@@ -713,7 +459,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_atomic_submit_color(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_atomic_submit_color(owner, input, confirmation_ms, output)
+        program_domain_gfx_atomic_submit_color(owner, input, confirmation_ms, output)
     }
 }
 /// # Safety
@@ -728,7 +474,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_refresh_request(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_refresh_request(owner, input, output)
+        program_domain_gfx_refresh_request(owner, input, output)
     }
 }
 /// # Safety
@@ -743,7 +489,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_power_request(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_power_request(owner, input, output)
+        program_domain_gfx_power_request(owner, input, output)
     }
 }
 /// # Safety
@@ -759,7 +505,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_atomic_resolve(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_atomic_resolve(owner, ticket, action, output)
+        program_domain_gfx_atomic_resolve(owner, ticket, action, output)
     }
 }
 /// # Safety
@@ -773,7 +519,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_queue_close(
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_queue_close(owner, input)
+        program_domain_gfx_queue_close(owner, input)
     }
 }
 /// # Safety
@@ -789,7 +535,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_queue_submit(
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_queue_submit(owner, queue, input, output)
+        program_domain_gfx_queue_submit(owner, queue, input, output)
     }
 }
 /// # Safety
@@ -806,7 +552,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_queue_submit_render_list(
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_queue_submit_render_list(owner, queue, input, list, output)
+        program_domain_gfx_queue_submit_render_list(owner, queue, input, list, output)
     }
 }
 /// # Safety
@@ -823,7 +569,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_queue_submit_render_grid_l
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_queue_submit_render_grid_list(owner, queue, input, list, output)
+        program_domain_gfx_queue_submit_render_grid_list(owner, queue, input, list, output)
     }
 }
 /// # Safety
@@ -840,7 +586,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_queue_submit_output(
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_queue_submit_output(owner, queue, input, target, output)
+        program_domain_gfx_queue_submit_output(owner, queue, input, target, output)
     }
 }
 /// # Safety
@@ -857,9 +603,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_queue_submit_render_color_
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_queue_submit_render_color_list(
-            owner, queue, input, list, output,
-        )
+        program_domain_gfx_queue_submit_render_color_list(owner, queue, input, list, output)
     }
 }
 /// # Safety
@@ -876,7 +620,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_queue_submit_native(
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_queue_submit_native(owner, queue, input, native, output)
+        program_domain_gfx_queue_submit_native(owner, queue, input, native, output)
     }
 }
 /// # Safety
@@ -893,9 +637,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_queue_submit_render_color_
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_queue_submit_render_color_grid_list(
-            owner, queue, input, list, output,
-        )
+        program_domain_gfx_queue_submit_render_color_grid_list(owner, queue, input, list, output)
     }
 }
 /// # Safety
@@ -909,7 +651,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_fence_cancel(
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_fence_cancel(owner, input)
+        program_domain_gfx_fence_cancel(owner, input)
     }
 }
 /// # Safety
@@ -923,7 +665,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_fence_release(
         let Some(owner) = context::handle() else {
             return c::gfx_queue_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_fence_release(owner, input)
+        program_domain_gfx_fence_release(owner, input)
     }
 }
 /// # Safety
@@ -938,7 +680,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_buffer_describe(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_buffer_describe(owner, input, output)
+        program_domain_gfx_buffer_describe(owner, input, output)
     }
 }
 /// # Safety
@@ -953,7 +695,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_buffer_import(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_buffer_import(owner, input, output)
+        program_domain_gfx_buffer_import(owner, input, output)
     }
 }
 /// # Safety
@@ -967,7 +709,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_buffer_release(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_buffer_release(owner, input)
+        program_domain_gfx_buffer_release(owner, input)
     }
 }
 /// # Safety
@@ -985,7 +727,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_buffer_map(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_buffer_map(owner, input, access, offset, bytes, output)
+        program_domain_gfx_buffer_map(owner, input, access, offset, bytes, output)
     }
 }
 /// # Safety
@@ -999,7 +741,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_buffer_unmap(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_buffer_unmap(owner, input)
+        program_domain_gfx_buffer_unmap(owner, input)
     }
 }
 /// # Safety
@@ -1017,9 +759,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_buffer_map_persistent(
         let Some(owner) = context::handle() else {
             return c::gfx_buffer_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_buffer_map_persistent(
-            owner, input, access, offset, bytes, output,
-        )
+        program_domain_gfx_buffer_map_persistent(owner, input, access, offset, bytes, output)
     }
 }
 /// # Safety
@@ -1034,7 +774,7 @@ pub unsafe extern "C" fn r4os_rust_program_domain_gfx_brightness_request(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_gfx_brightness_request(owner, input, output)
+        program_domain_gfx_brightness_request(owner, input, output)
     }
 }
 /// # Safety
@@ -1049,6 +789,901 @@ pub unsafe extern "C" fn r4os_rust_program_domain_display_cursor_submit(
         let Some(owner) = context::handle() else {
             return c::gfx_output_error_unavailable;
         };
-        r4os_zig_program_domain_display_cursor_submit(owner, input, output)
+        program_domain_display_cursor_submit(owner, input, output)
+    }
+}
+
+unsafe fn program_domain_gfx_buffer_create(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferDescriptor,
+    output: *mut c::GfxBufferReference,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(0, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_buffer_describe(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    output: *mut c::GfxBufferDescriptor,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(1, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_buffer_import(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    output: *mut c::GfxBufferReference,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(2, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_buffer_release(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(3, &args, core::ptr::null_mut()) }
+}
+
+unsafe fn program_domain_gfx_buffer_map(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    access: u32,
+    offset: u64,
+    bytes: u64,
+    output: *mut c::GfxBufferMap,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        access,
+        offset,
+        bytes,
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(4, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_buffer_unmap(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(6, &args, core::ptr::null_mut()) }
+}
+
+unsafe fn program_domain_gfx_buffer_map_persistent(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    access: u32,
+    offset: u64,
+    bytes: u64,
+    output: *mut c::GfxBufferMap,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        access,
+        offset,
+        bytes,
+        ..Default::default()
+    };
+    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(5, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_native_start(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxNativeAllocation,
+    output: *mut c::GfxNativeStatus,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe {
+        crate::gfx::allocation_api::r4os_rust_gfx_allocation_api(false, 0, &args, output.cast())
+    }
+}
+
+unsafe fn program_domain_gfx_native_query(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    output: *mut c::GfxNativeStatus,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe {
+        crate::gfx::allocation_api::r4os_rust_gfx_allocation_api(false, 1, &args, output.cast())
+    }
+}
+
+unsafe fn program_domain_gfx_native_receive(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    output: *mut c::GfxBufferReference,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe {
+        crate::gfx::allocation_api::r4os_rust_gfx_allocation_api(false, 2, &args, output.cast())
+    }
+}
+
+unsafe fn program_domain_gfx_native_close(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe {
+        crate::gfx::allocation_api::r4os_rust_gfx_allocation_api(
+            false,
+            3,
+            &args,
+            core::ptr::null_mut(),
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_native_wait(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    timeout_ticks: u64,
+    output: *mut c::GfxNativeStatus,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        value: timeout_ticks,
+        ..Default::default()
+    };
+    unsafe {
+        crate::gfx::allocation_api::r4os_rust_gfx_allocation_api(false, 4, &args, output.cast())
+    }
+}
+
+unsafe fn program_domain_gfx_virtual_start(
+    owner: c::ProgramProcessHandle,
+    closed: *mut bool,
+    input: *const c::GfxVirtualRequest,
+    output: *mut c::GfxVirtualStatus,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        other_input: closed.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::gfx::virtual_api::r4os_rust_gfx_virtual_api(false, 0, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_virtual_query(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    output: *mut c::GfxVirtualStatus,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::gfx::virtual_api::r4os_rust_gfx_virtual_api(false, 1, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_virtual_close(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    mode: u32,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        access: mode,
+        ..Default::default()
+    };
+    unsafe {
+        crate::gfx::virtual_api::r4os_rust_gfx_virtual_api(false, 2, &args, core::ptr::null_mut())
+    }
+}
+
+unsafe fn program_domain_gfx_virtual_wait(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBufferHandle,
+    until: u32,
+    timeout: u64,
+    output: *mut c::GfxVirtualStatus,
+) -> i32 {
+    let args = crate::gfx::buffer_owner::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        access: until,
+        value: timeout,
+        ..Default::default()
+    };
+    unsafe { crate::gfx::virtual_api::r4os_rust_gfx_virtual_api(false, 3, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_queue_open(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxQueueConfig,
+    output: *mut c::GfxQueueHandle,
+) -> i32 {
+    let args = crate::program::gfx_queue_api::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        which: 0,
+        ..Default::default()
+    };
+    unsafe { crate::program::gfx_queue_api::r4os_rust_gfx_queue_api(3, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_queue_close(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxQueueHandle,
+) -> i32 {
+    let args = crate::program::gfx_queue_api::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        which: 0,
+        ..Default::default()
+    };
+    unsafe {
+        crate::program::gfx_queue_api::r4os_rust_gfx_queue_api(4, &args, core::ptr::null_mut())
+    }
+}
+
+unsafe fn program_domain_gfx_queue_submit(
+    owner: c::ProgramProcessHandle,
+    queue: *const c::GfxQueueHandle,
+    input: *const c::GfxSubmission,
+    output: *mut c::GfxFenceStatus,
+) -> i32 {
+    let args = crate::program::gfx_queue_api::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        which: 0,
+        queue,
+        ..Default::default()
+    };
+    unsafe { crate::program::gfx_queue_api::r4os_rust_gfx_queue_api(5, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_queue_submit_native(
+    owner: c::ProgramProcessHandle,
+    queue: *const c::GfxQueueHandle,
+    input: *const c::GfxSubmission,
+    native: *const c::GfxNativeSubmission,
+    output: *mut c::GfxFenceStatus,
+) -> i32 {
+    let args = crate::program::gfx_queue_api::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        which: 0,
+        queue,
+        extra: native.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::program::gfx_queue_api::r4os_rust_gfx_queue_api(6, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_queue_submit_render_list(
+    owner: c::ProgramProcessHandle,
+    queue: *const c::GfxQueueHandle,
+    input: *const c::GfxSubmission,
+    list: *const c::GfxRenderList,
+    output: *mut c::GfxFenceStatus,
+) -> i32 {
+    let args = crate::program::gfx_queue_api::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        which: 1,
+        queue,
+        extra: list.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::program::gfx_queue_api::r4os_rust_gfx_queue_api(5, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_queue_submit_render_grid_list(
+    owner: c::ProgramProcessHandle,
+    queue: *const c::GfxQueueHandle,
+    input: *const c::GfxSubmission,
+    list: *const c::GfxRenderGridList,
+    output: *mut c::GfxFenceStatus,
+) -> i32 {
+    let args = crate::program::gfx_queue_api::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        which: 2,
+        queue,
+        extra: list.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::program::gfx_queue_api::r4os_rust_gfx_queue_api(5, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_queue_submit_render_color_list(
+    owner: c::ProgramProcessHandle,
+    queue: *const c::GfxQueueHandle,
+    input: *const c::GfxSubmission,
+    list: *const c::GfxRenderColorList,
+    output: *mut c::GfxFenceStatus,
+) -> i32 {
+    let args = crate::program::gfx_queue_api::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        which: 3,
+        queue,
+        extra: list.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::program::gfx_queue_api::r4os_rust_gfx_queue_api(5, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_queue_submit_render_color_grid_list(
+    owner: c::ProgramProcessHandle,
+    queue: *const c::GfxQueueHandle,
+    input: *const c::GfxSubmission,
+    list: *const c::GfxRenderColorGridList,
+    output: *mut c::GfxFenceStatus,
+) -> i32 {
+    let args = crate::program::gfx_queue_api::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        which: 4,
+        queue,
+        extra: list.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::program::gfx_queue_api::r4os_rust_gfx_queue_api(5, &args, output.cast()) }
+}
+
+unsafe fn program_domain_gfx_queue_submit_output(
+    owner: c::ProgramProcessHandle,
+    queue: *const c::GfxQueueHandle,
+    input: *const c::GfxSubmission,
+    target: *const c::GfxOutputTarget,
+    output: *mut c::GfxFenceStatus,
+) -> i32 {
+    let args = crate::program::gfx_queue_api::Args {
+        owner: crate::gfx::types::Owner {
+            kind: 1,
+            id: u64::from(owner.instance_id),
+            generation: owner.generation,
+        },
+        input: input.cast(),
+        which: 5,
+        queue,
+        extra: target.cast(),
+        ..Default::default()
+    };
+    unsafe { crate::program::gfx_queue_api::r4os_rust_gfx_queue_api(5, &args, output.cast()) }
+}
+
+unsafe fn program_domain_display_cursor_submit(
+    owner: c::ProgramProcessHandle,
+    input: *const c::DisplayCursorRequest,
+    output: *mut c::DisplayCursorStatus,
+) -> i32 {
+    let owner = crate::gfx::types::Owner {
+        kind: 1,
+        id: u64::from(owner.instance_id),
+        generation: owner.generation,
+    };
+    unsafe {
+        crate::display::cursor_work::r4os_rust_display_cursor_work(
+            3,
+            &owner,
+            input.cast(),
+            output.cast(),
+        )
+    }
+}
+
+unsafe fn program_domain_audio_close(owner: c::ProgramProcessHandle, stream_id: u32) -> i32 {
+    unsafe {
+        crate::audio::core::close_stream_for_owner(
+            crate::audio::mixer::Owner {
+                instance_id: owner.instance_id,
+                generation: owner.generation,
+            },
+            stream_id,
+        )
+    }
+}
+
+unsafe fn program_domain_audio_open_stream(
+    owner: c::ProgramProcessHandle,
+    rate: u32,
+    channels: u16,
+    format: u16,
+) -> i32 {
+    unsafe {
+        crate::audio::core::open_stream_for_owner(
+            crate::audio::mixer::Owner {
+                instance_id: owner.instance_id,
+                generation: owner.generation,
+            },
+            rate,
+            channels,
+            format,
+        )
+    }
+}
+
+unsafe fn program_domain_audio_write(
+    owner: c::ProgramProcessHandle,
+    stream_id: u32,
+    data_ptr: *const u8,
+    byte_count: u32,
+) -> i32 {
+    unsafe {
+        crate::audio::core::write_stream_for_owner(
+            crate::audio::mixer::Owner {
+                instance_id: owner.instance_id,
+                generation: owner.generation,
+            },
+            stream_id,
+            data_ptr,
+            byte_count,
+        )
+    }
+}
+
+unsafe fn program_domain_audio_set_volume(
+    owner: c::ProgramProcessHandle,
+    stream_id: u32,
+    fixed_volume: u32,
+) -> i32 {
+    unsafe {
+        crate::audio::core::set_volume_for_owner(
+            crate::audio::mixer::Owner {
+                instance_id: owner.instance_id,
+                generation: owner.generation,
+            },
+            stream_id,
+            fixed_volume,
+        )
+    }
+}
+
+unsafe fn program_domain_audio_output_info(index: u32, out: *mut c::AudioOutputInfo) -> i32 {
+    unsafe { crate::audio::core::audio_output_info(index, out) }
+}
+
+unsafe fn program_domain_audio_select_output(id: *const u8, len: usize) -> i32 {
+    unsafe {
+        crate::audio::core::audio_select_output(if len == 0 {
+            &[]
+        } else {
+            core::slice::from_raw_parts(id, len)
+        })
+    }
+}
+
+unsafe fn program_domain_gfx_atomic_test(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxAtomicState,
+    output: *mut c::GfxAtomicResult,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_output_api::atomic(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            output,
+            false,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_atomic_commit(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxAtomicState,
+    output: *mut c::GfxAtomicResult,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_output_api::atomic(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            output,
+            true,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_atomic_submit(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxAtomicState,
+    confirmation_ms: u32,
+    output: *mut c::GfxModeStatus,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_output_api::submit(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            confirmation_ms,
+            output,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_atomic_submit_color(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxModeColorRequest,
+    confirmation_ms: u32,
+    output: *mut c::GfxModeStatus,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_output_api::submit_color(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            confirmation_ms,
+            output,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_atomic_test_color(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxModeColorRequest,
+    output: *mut c::GfxAtomicResult,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_output_api::test_color(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            output,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_atomic_resolve(
+    owner: c::ProgramProcessHandle,
+    ticket: u64,
+    action: u32,
+    output: *mut c::GfxModeStatus,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_output_api::resolve(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            ticket,
+            action,
+            output,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_brightness_request(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxBrightnessRequest,
+    output: *mut c::GfxBrightnessRequest,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_output_api::request_brightness(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            output,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_refresh_request(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxRefreshRequest,
+    output: *mut c::GfxRefreshRequest,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_output_api::request_refresh(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            output,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_power_request(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxPowerRequest,
+    output: *mut c::GfxPowerRequest,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_output_api::request_power(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            output,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_fence_cancel(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxFence,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_queue_api::release(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            true,
+        )
+    }
+}
+
+unsafe fn program_domain_gfx_fence_release(
+    owner: c::ProgramProcessHandle,
+    input: *const c::GfxFence,
+) -> i32 {
+    unsafe {
+        crate::program::gfx_queue_api::release(
+            crate::gfx::types::Owner {
+                kind: 1,
+                id: u64::from(owner.instance_id),
+                generation: owner.generation,
+            },
+            input,
+            false,
+        )
+    }
+}
+
+unsafe fn program_domain_remote_frame_acquire(owner: c::ProgramProcessHandle) -> i32 {
+    {
+        crate::program::r4desk_frame::acquire(crate::program::remote_frame_state::Owner {
+            id: owner.instance_id,
+            generation: owner.generation,
+        })
+    }
+}
+
+unsafe fn program_domain_remote_frame_release(owner: c::ProgramProcessHandle) -> i32 {
+    {
+        crate::program::r4desk_frame::release(crate::program::remote_frame_state::Owner {
+            id: owner.instance_id,
+            generation: owner.generation,
+        })
+    }
+}
+
+unsafe fn program_domain_remote_frame_source_reset(owner: c::ProgramProcessHandle) -> i32 {
+    {
+        crate::program::r4desk_frame::source_reset(crate::program::remote_frame_state::Owner {
+            id: owner.instance_id,
+            generation: owner.generation,
+        })
+    }
+}
+
+unsafe fn program_domain_remote_publisher(owner: c::ProgramProcessHandle) -> bool {
+    {
+        crate::program::r4desk_frame::publisher(crate::program::remote_frame_state::Owner {
+            id: owner.instance_id,
+            generation: owner.generation,
+        })
+    }
+}
+
+unsafe fn program_domain_remote_frame_publish(
+    owner: c::ProgramProcessHandle,
+    info: *const c::RemoteFrameInfo,
+    pixels: *const u32,
+    count: u32,
+) -> i32 {
+    let _ = owner;
+    unsafe { crate::program::r4desk_frame::publish(info, pixels, count) }
+}
+
+unsafe fn program_domain_remote_frame_publish_regions(
+    owner: c::ProgramProcessHandle,
+    info: *const c::RemoteFrameInfo,
+    pixels: *const u32,
+    count: u32,
+    regions: *const c::DisplayDamageRect,
+    region_count: u32,
+) -> i32 {
+    let _ = owner;
+    unsafe {
+        crate::program::r4desk_frame::publish_regions(info, pixels, count, regions, region_count)
+    }
+}
+
+unsafe fn program_domain_remote_frame_snapshot_acquire(
+    owner: c::ProgramProcessHandle,
+    expected: u32,
+    info: *mut c::RemoteFrameInfo,
+    lease: *mut c::RemoteFrameLease,
+) -> i32 {
+    unsafe {
+        crate::program::r4desk_frame::snapshot_acquire(
+            crate::program::remote_frame_state::Owner {
+                id: owner.instance_id,
+                generation: owner.generation,
+            },
+            expected,
+            info,
+            lease,
+        )
+    }
+}
+
+unsafe fn program_domain_remote_frame_snapshot_release(
+    owner: c::ProgramProcessHandle,
+    lease: *const c::RemoteFrameLease,
+) -> i32 {
+    unsafe {
+        crate::program::r4desk_frame::snapshot_release(
+            crate::program::remote_frame_state::Owner {
+                id: owner.instance_id,
+                generation: owner.generation,
+            },
+            lease,
+        )
     }
 }

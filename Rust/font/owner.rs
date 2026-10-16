@@ -2,7 +2,7 @@
 //! a nonblocking writer reservation spans file I/O without a no-sleep owner.
 use super::types::*;
 use crate::sched::task_context::Unwind;
-#[cfg(not(r4os_owner_fixture))]
+
 use crate::{arch::runtime::RuntimeGuard, sched::task_context};
 use core::{
     cell::UnsafeCell,
@@ -39,24 +39,16 @@ fn payload(index: u8) -> *mut CachedFont {
     }
 }
 fn enter_unwind() -> Unwind {
-    #[cfg(r4os_owner_fixture)]
-    {
-        Unwind::EMPTY
-    }
-    #[cfg(not(r4os_owner_fixture))]
     {
         let _guard = RuntimeGuard::acquire();
         unsafe { task_context::enter() }
     }
 }
 fn leave_unwind(token: Unwind) {
-    #[cfg(not(r4os_owner_fixture))]
     {
         let _guard = RuntimeGuard::acquire();
         let _ = unsafe { task_context::leave(token) };
     }
-    #[cfg(r4os_owner_fixture)]
-    let _ = token;
 }
 #[repr(C)]
 pub struct View {

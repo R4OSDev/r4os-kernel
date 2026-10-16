@@ -22,13 +22,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 static REBOOT: AtomicBool = AtomicBool::new(false);
-unsafe extern "C" {
-    fn r4os_zig_sys_bootlog_info(out: *mut c::BootLogInfo);
-    fn r4os_zig_sys_bootlog_read(snapshot: bool, offset: usize, out: *mut u8, len: usize) -> usize;
-    fn r4os_zig_sys_power_transition(operation: u8, ticks: u64, reason: Bytes) -> bool;
-    fn r4os_zig_sys_serial_flush();
-    fn r4os_zig_sys_version() -> Bytes;
-}
+
 /// # Safety
 /// Nullable public output retains original validation. A nonnull output is
 /// exclusive caller storage through the bounded capacity snapshot.
@@ -91,7 +85,7 @@ pub unsafe extern "C" fn r4os_rust_sys_monotonic(out: *mut c::MonotonicClockInfo
 unsafe fn boot_info() -> c::BootLogInfo {
     unsafe {
         let mut info = MaybeUninit::uninit();
-        r4os_zig_sys_bootlog_info(info.as_mut_ptr());
+        sys_bootlog_info(info.as_mut_ptr());
         info.assume_init()
     }
 }
@@ -168,7 +162,7 @@ pub unsafe extern "C" fn r4os_rust_sys_bootlog_read(
         } else {
             small.as_mut_ptr().cast()
         };
-        let written = r4os_zig_sys_bootlog_read(false, offset, resident, max);
+        let written = sys_bootlog_read(false, offset, resident, max);
         ptr::copy_nonoverlapping(resident, out, written);
         i32::try_from(written).expect("Boot log read result")
     }
@@ -228,7 +222,7 @@ unsafe fn save_log(stage: &[u8]) {
         log::puts(b"[RESET] checkpoint=");
         log::puts(stage);
         log::puts(b" kernel=");
-        log::puts(r4os_zig_sys_version().slice());
+        log::puts(sys_version().slice());
         log::puts(b" ticks=");
         log::dec(timer::tick_count());
         log::puts(b"\r\n");
@@ -241,7 +235,7 @@ unsafe fn save_log(stage: &[u8]) {
             log::puts(b"[RESET] diagnostic allocation failed\r\n");
             return;
         }
-        let count = r4os_zig_sys_bootlog_read(true, 0, allocated.pointer, len);
+        let count = sys_bootlog_read(true, 0, allocated.pointer, len);
         let mut path = [0u8; 19];
         path::write_z(&mut path, b"C:\\TEMP\\REBOOT.LOG");
         let written = io::r4os_rust_sys_file_write(path.as_ptr(), allocated.pointer, count as u32);
@@ -271,28 +265,25 @@ pub unsafe extern "C" fn r4os_rust_sys_reboot() {
         log::puts(b"System reboot.\r\n");
         flush_registry();
         flush_page_cache();
-        r4os_zig_sys_power_transition(0, 0, Bytes::EMPTY);
+        sys_power_transition(0, 0, Bytes::EMPTY);
         save_log(b"begin");
-        let display = r4os_zig_sys_power_transition(
-            1,
-            u64::from((timer::frequency() / 4).max(1)),
-            Bytes::EMPTY,
-        );
+        let display =
+            sys_power_transition(1, u64::from((timer::frequency() / 4).max(1)), Bytes::EMPTY);
         log::puts(if display {
             b"[RESET] display-drain=OK\r\n"
         } else {
             b"[RESET] display-drain=FAILED\r\n"
         });
         save_log(b"display-drained");
-        let network = r4os_zig_sys_power_transition(2, 0, Bytes::from_slice(b"reboot"));
+        let network = sys_power_transition(2, 0, Bytes::from_slice(b"reboot"));
         log::puts(if network {
             b"[RESET] network-drain=OK\r\n"
         } else {
             b"[RESET] network-drain=FAILED\r\n"
         });
         save_log(b"network-drained");
-        let drivers = display && network && r4os_zig_sys_power_transition(3, 0, Bytes::EMPTY);
-        let released = drivers && r4os_zig_sys_power_transition(4, 0, Bytes::EMPTY);
+        let drivers = display && network && sys_power_transition(3, 0, Bytes::EMPTY);
+        let released = drivers && sys_power_transition(4, 0, Bytes::EMPTY);
         log::puts(if drivers {
             b"[RESET] driver-shutdown=OK\r\n"
         } else {
@@ -308,11 +299,11 @@ pub unsafe extern "C" fn r4os_rust_sys_reboot() {
                 b"[RESET][ERROR] device handoff unsafe; powering off instead of warm reset\r\n",
             );
             save_log(b"poweroff-device-handoff");
-            r4os_zig_sys_serial_flush();
+            crate::boot::log_route::serial_flush();
             crate::arch::terminal_power::poweroff();
         }
         save_log(b"warm-reset-ready");
-        r4os_zig_sys_serial_flush();
+        crate::boot::log_route::serial_flush();
         crate::arch::terminal_power::reboot();
     }
 }
@@ -324,7 +315,56 @@ pub unsafe extern "C" fn r4os_rust_sys_poweroff() -> ! {
         log::puts(b"System poweroff.\r\n");
         flush_registry();
         flush_page_cache();
-        r4os_zig_sys_serial_flush();
+        crate::boot::log_route::serial_flush();
         crate::arch::terminal_power::poweroff()
+    }
+}
+
+unsafe fn sys_bootlog_info(out: *mut c::BootLogInfo) {
+    unsafe {
+        let mut raw = core::mem::MaybeUninit::uninit();
+        crate::boot::log::r4os_rust_bootlog_info(raw.as_mut_ptr());
+        let v = raw.assume_init();
+        out.write(c::BootLogInfo {
+            capacity: crate::boot::log::CAPACITY.try_into().unwrap(),
+            length: v.length.try_into().unwrap(),
+            flags: v.flags,
+            reserved: 0,
+            total_written: v.total_written,
+            dropped_bytes: v.dropped_bytes,
+        });
+    }
+}
+
+unsafe fn sys_bootlog_read(snapshot: bool, offset: usize, out: *mut u8, len: usize) -> usize {
+    unsafe { crate::boot::log::r4os_rust_bootlog_read(if snapshot { 0 } else { offset }, out, len) }
+}
+
+unsafe fn sys_version() -> Bytes {
+    let text = crate::build_config::config::KERNEL_VERSION_TEXT;
+    Bytes {
+        data: text.as_ptr(),
+        len: text.len(),
+    }
+}
+
+unsafe fn sys_power_transition(operation: u8, ticks: u64, reason: Bytes) -> bool {
+    unsafe {
+        match operation {
+            0 => {
+                crate::arch::terminal_power::r4os_rust_terminal_power_status();
+                true
+            }
+            1 => crate::display::manager::begin_system_transition(ticks),
+            2 => crate::net::cleanup::r4os_rust_net_cleanup_transition(
+                crate::sched::sync_types::Text {
+                    pointer: reason.data,
+                    len: reason.len,
+                },
+            ),
+            3 => crate::loader::r4d::r4os_rust_r4d_transition(),
+            4 => crate::display::manager::system_transition_quiesced(),
+            _ => panic!("Invalid system transition"),
+        }
     }
 }

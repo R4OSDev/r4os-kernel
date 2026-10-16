@@ -4,7 +4,7 @@
 use super::{image::Image, memory, registry_types::ProgramInstance, vm};
 use crate::{
     boot::{foundation as console, log as bootlog},
-    build_bridge::config,
+    build_config::config,
     contract::ProgramStackPerformanceInfo,
     memory::{vm_query, vm_ranges, vm_transactions},
     platform::timer,

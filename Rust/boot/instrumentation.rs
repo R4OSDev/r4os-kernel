@@ -1,6 +1,6 @@
 //! Compile-time optional work only. Functional clocks, deadlines, owner
 //! accounting, guards and resource cleanup never depend on this capture.
-use crate::{build_bridge::config, platform::monotonic};
+use crate::{build_config::config, platform::monotonic};
 pub const DETAILED: bool = config::ENABLE_METRICS;
 pub const WORK_CRITICAL_STRIDE: u32 = 64;
 pub fn capture() -> monotonic::Stamp {

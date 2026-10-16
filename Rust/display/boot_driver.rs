@@ -2,6 +2,7 @@
 //! their admission/resource operations behind typed projections until .22/.23.
 //! This module alone owns the bridge, exact execution guard and capture loops.
 use super::framebuffer::{self as fb, Framebuffer};
+pub use crate::gfx::types::{Handle, Owner};
 use crate::{
     contract as a,
     driver::{api_admission, irq_router},
@@ -9,19 +10,6 @@ use crate::{
     sched::sync_types::{Text, UnwindGuard, WaitQueue},
 };
 use core::{cell::UnsafeCell, ffi::c_void, mem::MaybeUninit, ptr};
-#[repr(C)]
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub struct Owner {
-    pub kind: u32,
-    pub id: u64,
-    pub generation: u64,
-}
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct Handle {
-    pub id: u32,
-    pub generation: u64,
-}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Snapshot {
@@ -743,11 +731,11 @@ unsafe fn native_hold(
         adapter_id: request.adapter_id,
         expected_generation: request.generation,
         context: 0,
-        capture: c::Capture::Native(capture_holder),
-        restore: c::Restore::Native(restore_holder),
-        restore_adopted: Some(c::Restore::Native(restore_adopted)),
-        release: c::Release::Native(release_holder),
-        release_adopted: Some(c::Release::Native(release_adopted)),
+        capture: c::Capture(capture_holder),
+        restore: c::Restore(restore_holder),
+        restore_adopted: Some(c::Restore(restore_adopted)),
+        release: c::Release(release_holder),
+        release_adopted: Some(c::Release(release_adopted)),
     };
     match super::manager::hold_boot(holder) {
         Ok(result) => {

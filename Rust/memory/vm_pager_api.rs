@@ -1,5 +1,5 @@
-//! Typed private C value facade. All VM/pager decisions and mutable state
-//! belong to native owners; Zig clients retain their original public types.
+//! Typed native VM/pager value interface. Decisions and mutable state
+//! remain at the sole reservation, pager and backing owners.
 use super::{
     owner::Guard, reclaim, virt_policy, vm_page_state as ps, vm_pager as pager,
     vm_pager_diagnostics as diag, vm_pager_types::*, vm_ranges, vm_transactions,

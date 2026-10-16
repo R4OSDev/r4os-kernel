@@ -3,7 +3,6 @@
 use super::owner::{self, Guard, Token};
 use crate::boot::info;
 use core::cell::UnsafeCell;
-use core::ffi::c_void;
 
 pub const MAX_BLOCKS: usize = 8192;
 const ID_CAPACITY: usize = MAX_BLOCKS * 2;
@@ -1761,44 +1760,6 @@ pub extern "C" fn r4os_rust_blocks_count(owner: u8, owner_id: u64) -> u64 {
     })
     .unwrap_or(0)
 }
-unsafe extern "C" {
-    // Fixed private marshaller, not an admitted external callback. It only
-    // writes one record into the already resident native Zig output buffer.
-    fn r4os_zig_blocks_snapshot_write(context: *mut c_void, index: usize, block: *const Block);
-}
-/// # Safety
-/// context, output and capacity describe live resident caller storage;
-/// The fixed native-record marshaller must not reenter an owner, allocate,
-/// block or retain the record pointer.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_blocks_snapshot(
-    context: *mut c_void,
-    capacity: usize,
-    output: *mut Snapshot,
-) {
-    let result = with_table(|table| {
-        let mut result = Snapshot::default();
-        for entry in &table.entries {
-            if !entry.active() {
-                continue;
-            }
-            result.total += 1;
-            if result.copied < capacity {
-                unsafe {
-                    r4os_zig_blocks_snapshot_write(context, result.copied, entry);
-                }
-                result.copied += 1;
-            } else {
-                result.truncated = true;
-            }
-        }
-        Ok(result)
-    })
-    .unwrap_or_default();
-    unsafe {
-        output.write(result);
-    }
-}
 /// # Safety
 /// output is exclusive live storage with the asserted C Summary layout.
 #[unsafe(no_mangle)]
@@ -1840,9 +1801,6 @@ const _: () = {
 
 // Host-only cases exercise the real table algorithms without privileged
 // lock instructions. This module is absent from the product archive.
-#[cfg(r4os_owner_fixture)]
-#[path = "../../Tests/RustOwners/blocks_cases.rs"]
-mod owner_cases;
 
 /// Pointer-free passive copy under the same physical-memory catalog owner.
 pub(crate) struct DiagnosticBlock {

@@ -55,14 +55,9 @@ unsafe fn clear_claim(task: *mut Task) {
     runtime::restore_runtime(flags);
 }
 fn puts(text: &[u8]) {
-    unsafe { extern_write(text.as_ptr(), text.len()) };
+    unsafe { kernel_write(text.as_ptr(), text.len()) };
 }
-unsafe extern "C" {
-    #[link_name = "r4os_zig_kernel_write"]
-    fn extern_write(text: *const u8, len: usize);
-    #[link_name = "r4os_zig_kernel_dec"]
-    fn extern_dec(value: u64);
-}
+
 pub(super) unsafe fn complete_release(task: *mut Task, token: task_context::Unwind) -> bool {
     unsafe {
         let result = complete_admitted(task);
@@ -311,7 +306,7 @@ pub(super) unsafe fn release_dead(id: u32, generation: Option<u64>) -> bool {
                 (*registry::raw()).recycle_guard_hits.wrapping_add(1);
             if generation.is_none() {
                 puts(b"TASK RECYCLE GUARD: releaseDead deferred for current task (id=");
-                extern_dec(u64::from((*c).id));
+                crate::boot::log_route::dec(u64::from((*c).id));
                 puts(b")\r\n");
             }
             runtime::restore_runtime(flags);
@@ -356,4 +351,8 @@ pub(super) unsafe fn reap() -> u32 {
         resources::retry_rollback();
         reaped
     }
+}
+
+unsafe fn kernel_write(text: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
 }

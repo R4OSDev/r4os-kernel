@@ -623,6 +623,7 @@ pub unsafe fn remote_input_status(out: *mut a::RemoteInputStatus) -> i32 {
     })
 }
 #[repr(C)]
+#[derive(Default)]
 pub struct Args {
     pub owner: Owner,
     pub a: u64,

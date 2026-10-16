@@ -32,17 +32,7 @@ impl Drop for OwnerGuard {
         admission::r4os_rust_driver_api_leave();
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_driver_resource_read_owned(
-        id: u32,
-        resource: u64,
-        offset: u64,
-        out: *mut u8,
-        length: u32,
-        deadline: u64,
-    ) -> i32;
-    fn r4os_zig_driver_platform_input(id: u32, epoch: u64, kind: u32, value: u32) -> i32;
-}
+
 /// # Safety
 /// The caller provides an aligned resident versioned C prefix of its declared
 /// size and retains the admitted driver identity through the call and any wait.
@@ -138,7 +128,7 @@ extern "C" fn platform_input(kind: u32, value: u32) -> i32 {
     let Some((id, epoch)) = identity() else {
         return a::driver_resource_error_owner;
     };
-    unsafe { r4os_zig_driver_platform_input(id, epoch, kind, value) }
+    crate::input::platform_input::r4os_rust_input_platform_submit(id, epoch, kind, value)
 }
 unsafe extern "C" fn resource_stat(
     name: *const u8,
@@ -168,7 +158,7 @@ unsafe extern "C" fn resource_read(
     if length == 0 || length > a::driver_resource_max_read_bytes {
         return a::driver_resource_error_invalid;
     }
-    unsafe { r4os_zig_driver_resource_read_owned(g.0, id, offset, out, length, deadline) }
+    unsafe { driver_resource_read_owned(g.0, id, offset, out, length, deadline) }
 }
 unsafe extern "C" fn resource_acpi_stat(
     signature: u32,
@@ -203,6 +193,28 @@ unsafe extern "C" fn resource_acpi_read(
             out,
             length as usize,
             deadline,
+        )
+    }
+}
+
+unsafe fn driver_resource_read_owned(
+    id: u32,
+    resource: u64,
+    offset: u64,
+    out: *mut u8,
+    length: u32,
+    deadline: u64,
+) -> i32 {
+    let mut plan = core::mem::MaybeUninit::<crate::driver::resources::ReadPlan>::uninit();
+    unsafe {
+        crate::driver::resources::r4os_rust_driver_resource_read(
+            id,
+            resource,
+            offset,
+            out,
+            length as usize,
+            deadline,
+            plan.as_mut_ptr().cast(),
         )
     }
 }

@@ -128,7 +128,7 @@ struct Probe {
     filesystem: u32,
 }
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Args {
     pub generation: u64,
     pub id: u64,
@@ -145,21 +145,7 @@ pub struct Args {
     pub task: u32,
     pub task_generation: u64,
 }
-unsafe extern "C" {
-    fn r4os_zig_ops_drive(letter: u8, out: *mut DriveMetadata);
-    fn r4os_zig_ops_volume(slot: u32, out: *mut VolumeMetadata) -> bool;
-    fn r4os_zig_ops_mount_reference(letter: u8, out: *mut Reference) -> bool;
-    fn r4os_zig_ops_unmount(reference: Reference) -> bool;
-    fn r4os_zig_ops_cache(index: usize, first: u64, count: u64) -> bool;
-    fn r4os_zig_ops_forget(filesystem: u8, index: usize, first: u64, count: u64);
-    fn r4os_zig_ops_probe(
-        input: *const Probe,
-        context: *mut c_void,
-        consume: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32,
-    ) -> i32;
-    fn r4os_zig_normal_drive(operation: u8, input: *const DriveRequest) -> bool;
-    fn r4os_zig_ops_create_cleanup(entry: unsafe extern "C" fn() -> !) -> bool;
-}
+
 unsafe fn reset_record(r: *mut Record) {
     unsafe {
         ptr::write_bytes(r, 0, 1);
@@ -352,7 +338,7 @@ fn claim_use(id: u64, region: Region) -> Result<Use> {
 fn drive(letter: u8) -> DriveMetadata {
     let mut out = MaybeUninit::uninit();
     unsafe {
-        r4os_zig_ops_drive(letter, out.as_mut_ptr());
+        ops_drive(letter, out.as_mut_ptr());
         out.assume_init()
     }
 }
@@ -800,7 +786,7 @@ unsafe fn volume_info(
             return Err(api::storage_error_stale);
         }
         let mut metadata = MaybeUninit::uninit();
-        if !r4os_zig_ops_volume(slot, metadata.as_mut_ptr()) {
+        if !ops_volume(slot, metadata.as_mut_ptr()) {
             return Err(api::storage_error_stale);
         }
         let metadata = metadata.assume_init();
@@ -895,12 +881,12 @@ unsafe fn remember_mounts(op: *mut Operation) -> Result<()> {
 }
 fn forget(region: Region) {
     unsafe {
-        r4os_zig_ops_forget(0, region.device.slot as usize, region.first, region.count);
-        r4os_zig_ops_forget(1, region.device.slot as usize, region.first, region.count);
+        ops_forget(0, region.device.slot as usize, region.first, region.count);
+        ops_forget(1, region.device.slot as usize, region.first, region.count);
     }
 }
 fn cache(region: Region) -> bool {
-    unsafe { r4os_zig_ops_cache(region.device.slot as usize, region.first, region.count) }
+    unsafe { ops_cache(region.device.slot as usize, region.first, region.count) }
 }
 struct Preparing {
     op: *mut Operation,
@@ -1020,7 +1006,7 @@ unsafe fn prepare(target: api::StorageTarget) -> Result<*mut Operation> {
         }
         for detached in 0..(*op).saved_count {
             let value = saved(op, detached);
-            if !r4os_zig_ops_unmount(value.reference) {
+            if !ops_unmount(value.reference) {
                 for i in 0..detached {
                     let _ = restore(saved(op, i));
                 }
@@ -1081,16 +1067,16 @@ unsafe extern "C" fn publish_volume(context: *mut c_void, volume: *mut c_void) -
             name: (*p).name,
             volume,
         };
-        if !r4os_zig_normal_drive(1, &request) {
+        if !crate::storage::normal_boot::drive_dispatch(1, &request) {
             return api::storage_error_capacity;
         }
-        if !r4os_zig_normal_drive(2, &request) {
-            r4os_zig_normal_drive(3, &request);
+        if !crate::storage::normal_boot::drive_dispatch(2, &request) {
+            crate::storage::normal_boot::drive_dispatch(3, &request);
             return api::storage_error_capacity;
         }
         (*r).errors[(*p).index] = 0;
         assert!(
-            r4os_zig_ops_mount_reference((*p).letter, (*p).reference.as_mut_ptr()),
+            ops_mount_reference((*p).letter, (*p).reference.as_mut_ptr()),
             "Published mount lost exact access reference"
         );
         0
@@ -1131,7 +1117,7 @@ unsafe fn publish_mount(r: *mut Record, index: usize, letter: u8, role: u8) -> R
             },
             reference: MaybeUninit::uninit(),
         };
-        let code = r4os_zig_ops_probe(&input, ptr::addr_of_mut!(context).cast(), publish_volume);
+        let code = ops_probe(&input, ptr::addr_of_mut!(context).cast(), publish_volume);
         if code != 0 {
             return Err(code);
         }
@@ -1217,7 +1203,7 @@ unsafe fn claim_begin(target: *const api::StorageTarget, out: *mut u64) -> Resul
         out.write(0);
         let _gate = Gate::enter()?;
         if !(*state()).cleanup_started {
-            if !r4os_zig_ops_create_cleanup(cleanup_main) {
+            if !ops_create_cleanup(cleanup_main) {
                 return Err(api::storage_error_capacity);
             }
             (*state()).cleanup_started = true
@@ -1461,7 +1447,7 @@ fn use_end(id: u64) -> Result<i32> {
     )?;
     Ok(0)
 }
-fn release_owner(a: Args) -> bool {
+pub(crate) fn release_owner(a: Args) -> bool {
     let input = Input {
         owner: Owner {
             program: a.program,
@@ -1558,3 +1544,152 @@ const _: () = {
     assert!(mem::size_of::<VolumeMetadata>() == 8);
     assert!(mem::size_of::<Probe>() == 32);
 };
+
+unsafe fn ops_cache(index: usize, first: u64, count: u64) -> bool {
+    unsafe { crate::fs::page_cache::r4os_rust_pagecache_flush_range(index, first, count) }
+}
+
+unsafe fn ops_drive(letter: u8, out: *mut DriveMetadata) {
+    unsafe {
+        use crate::fs::{drive, vfs, vfs_types::Volume};
+        let d = drive::r4os_rust_fs_drive_lookup(1, letter as usize);
+        let mut v = MaybeUninit::<Volume>::uninit();
+        let mut value = DriveMetadata {
+            present: !d.is_null(),
+            has_vfs: vfs::r4os_rust_vfs_mount(
+                4,
+                letter,
+                ptr::null(),
+                ptr::null(),
+                v.as_mut_ptr().cast(),
+            ),
+            kind: 0,
+            role: 0,
+            bytes: 0,
+            index: usize::MAX,
+            name: [0; 32],
+        };
+        if !d.is_null() {
+            value.kind = (*d).kind;
+            value.role = (*d).role;
+            value.bytes = (*d).bytes;
+            value.index = if (*d).has_block {
+                (*d).block_index
+            } else {
+                usize::MAX
+            };
+            let n = (*d).name.len.min(31);
+            ptr::copy_nonoverlapping((*d).name.data, value.name.as_mut_ptr(), n);
+        }
+        out.write(value);
+    }
+}
+
+unsafe fn ops_volume(slot: u32, out: *mut VolumeMetadata) -> bool {
+    unsafe {
+        use crate::fs::{drive, vfs, vfs_types::Volume};
+        let mut v = MaybeUninit::<Volume>::uninit();
+        let letter = if slot == 26 {
+            0
+        } else {
+            u8::try_from(u32::from(b'A') + slot).unwrap()
+        };
+        if !vfs::r4os_rust_vfs_mount(
+            if slot == 26 { 3 } else { 4 },
+            letter,
+            ptr::null(),
+            ptr::null(),
+            v.as_mut_ptr().cast(),
+        ) {
+            return false;
+        }
+        let v = v.assume_init();
+        let d = if slot == 26 {
+            ptr::null_mut()
+        } else {
+            drive::r4os_rust_fs_drive_lookup(1, letter as usize)
+        };
+        out.write(VolumeMetadata {
+            filesystem: if v.kind == 0 {
+                api::storage_filesystem_fat32
+            } else {
+                api::storage_filesystem_ntfs
+            },
+            role: if d.is_null() { 0 } else { u32::from((*d).role) },
+        });
+        true
+    }
+}
+
+unsafe fn ops_mount_reference(letter: u8, out: *mut Reference) -> bool {
+    unsafe {
+        let mut v = MaybeUninit::<crate::fs::vfs_types::Volume>::uninit();
+        if !crate::fs::vfs::r4os_rust_vfs_mount(
+            4,
+            letter,
+            ptr::null(),
+            ptr::null(),
+            v.as_mut_ptr().cast(),
+        ) {
+            return false;
+        }
+        let v = v.assume_init();
+        if !v.has_ref {
+            return false;
+        }
+        out.write(v.reference);
+        true
+    }
+}
+
+unsafe fn ops_unmount(reference: Reference) -> bool {
+    unsafe { crate::fs::vfs::r4os_rust_vfs_mount(5, 0, ptr::null(), &reference, ptr::null_mut()) }
+}
+
+unsafe fn ops_forget(filesystem: u8, index: usize, first: u64, count: u64) {
+    assert!(filesystem <= 1);
+    unsafe { crate::fs::vfs_backends::forget(filesystem == 1, index, first, count) }
+}
+
+unsafe fn ops_probe(
+    input: *const Probe,
+    context: *mut c_void,
+    consume: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32,
+) -> i32 {
+    unsafe {
+        let a = &*input;
+        let ntfs = match a.filesystem {
+            api::storage_filesystem_fat32 => false,
+            api::storage_filesystem_ntfs => true,
+            _ => return api::storage_error_unsupported,
+        };
+        let Some(v) = crate::fs::vfs_backends::probe(ntfs, a.index, a.lba, a.sectors, false) else {
+            return api::storage_error_remount;
+        };
+        let mut v = Some(v);
+        consume(context, ptr::from_mut(&mut v).cast())
+    }
+}
+
+unsafe fn ops_create_cleanup(entry: unsafe extern "C" fn() -> !) -> bool {
+    let _ = entry;
+    let r = crate::sched::task::task_api::CreateRequest {
+        name: b"storage-cleanup".as_ptr(),
+        name_len: 15,
+        state: 1,
+        role: 3,
+        needs_fpu: true,
+        smp_eligible: false,
+        smp_r4x: false,
+        owner_kind: 0,
+        owner_context: ptr::null_mut(),
+        entry: Some(cleanup_entry),
+    };
+    let mut failure = 0;
+    !unsafe { crate::sched::task::task_api::r4os_rust_task_create(&r, true, &mut failure) }
+        .is_null()
+}
+
+unsafe extern "C" fn cleanup_entry() {
+    unsafe { cleanup_main() }
+}

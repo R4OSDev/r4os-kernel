@@ -1,5 +1,5 @@
 //! Normalize bootloader data once, before any allocator or task exists.
-//! Zig readers receive only C layouts and immutable views of resident storage.
+//! Native readers receive immutable views of resident normalized storage.
 use super::limine;
 use core::ptr::{addr_of, addr_of_mut, null, null_mut};
 
@@ -50,16 +50,16 @@ impl BootModule {
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct ExecutableSource {
-    present: bool,
-    media_type: u32,
-    partition_index: u32,
-    mbr_disk_id: u32,
-    disk_guid: [u8; 16],
-    partition_guid: [u8; 16],
-    filesystem_uuid: [u8; 16],
-    path_bytes: [u8; 256],
-    path_len: usize,
-    path_truncated: bool,
+    pub(crate) present: bool,
+    pub(crate) media_type: u32,
+    pub(crate) partition_index: u32,
+    pub(crate) mbr_disk_id: u32,
+    pub(crate) disk_guid: [u8; 16],
+    pub(crate) partition_guid: [u8; 16],
+    pub(crate) filesystem_uuid: [u8; 16],
+    pub(crate) path_bytes: [u8; 256],
+    pub(crate) path_len: usize,
+    pub(crate) path_truncated: bool,
 }
 impl ExecutableSource {
     const EMPTY: Self = Self {

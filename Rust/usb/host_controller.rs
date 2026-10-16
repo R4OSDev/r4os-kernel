@@ -4,19 +4,16 @@ use super::types::{
     CleanupResult, ControlRequest, Controller, HostDescriptor, HostDevice, HostEndpoint, HostStatus,
 };
 use core::{cell::UnsafeCell, ffi::c_void, mem, slice};
-unsafe extern "C" {
-    fn r4os_zig_usb_host_metadata_enter() -> u64;
-    fn r4os_zig_usb_host_metadata_leave(flags: u64);
-}
+
 struct MetadataGuard(u64);
 impl MetadataGuard {
     fn enter() -> Self {
-        Self(unsafe { r4os_zig_usb_host_metadata_enter() })
+        Self(crate::arch::runtime::save_runtime())
     }
 }
 impl Drop for MetadataGuard {
     fn drop(&mut self) {
-        unsafe { r4os_zig_usb_host_metadata_leave(self.0) };
+        crate::arch::runtime::restore_runtime(self.0);
     }
 }
 const CAPACITY: usize = 4;

@@ -118,10 +118,7 @@ unsafe extern "C" {
     fn r4os_load_gdt(pointer: *const TablePointer);
     fn r4os_load_tss(selector: u16);
     fn r4os_load_idt(pointer: *const TablePointer);
-    fn r4os_zig_exception_inner(frame: *const InterruptFrame, address: u64, private_stack: bool);
-    fn r4os_zig_prepare_fault_stack(address: u64, rsp: u64, bytes: usize) -> usize;
-    fn r4os_zig_fault_fpu_save(state: *mut u8);
-    fn r4os_zig_fault_fpu_restore(state: *const u8);
+
     fn isr0();
     fn isr1();
     fn isr2();
@@ -333,7 +330,7 @@ pub unsafe extern "C" fn exceptionDispatch(frame: *const InterruptFrame) {
     } else {
         address = 0;
     }
-    unsafe { r4os_zig_exception_inner(frame, address, false) }
+    unsafe { exception_inner(frame, address, false) }
 }
 #[unsafe(no_mangle)]
 /// # Safety
@@ -347,8 +344,7 @@ pub unsafe extern "C" fn preparePageFaultFrame(
         return 0;
     }
     const BYTES: usize = size_of::<InterruptFrame>() + 16;
-    let destination =
-        unsafe { r4os_zig_prepare_fault_stack(address, interrupted_rsp(frame), BYTES) };
+    let destination = unsafe { prepare_fault_stack(address, interrupted_rsp(frame), BYTES) };
     if destination != 0 {
         unsafe {
             core::ptr::copy_nonoverlapping(frame.cast::<u8>(), destination as *mut u8, BYTES)
@@ -364,9 +360,9 @@ unsafe fn page_fault_private(frame: *const InterruptFrame, address: u64) {
     // module calls. A scheduler image or the shared exception IST cannot do so.
     let mut image = FaultFpu([0; 4096]);
     unsafe {
-        r4os_zig_fault_fpu_save(image.0.as_mut_ptr());
-        r4os_zig_exception_inner(frame, address, true);
-        r4os_zig_fault_fpu_restore(image.0.as_ptr());
+        fault_fpu_save(image.0.as_mut_ptr());
+        exception_inner(frame, address, true);
+        fault_fpu_restore(image.0.as_ptr());
     }
 }
 #[unsafe(no_mangle)]
@@ -378,8 +374,153 @@ pub unsafe extern "C" fn pageFaultDispatch(
     private: u32,
 ) {
     if private == 0 {
-        unsafe { r4os_zig_exception_inner(frame, address, false) };
+        unsafe { exception_inner(frame, address, false) };
     } else {
         unsafe { page_fault_private(frame, address) };
+    }
+}
+
+unsafe fn fault_fpu_save(state: *mut u8) {
+    unsafe { crate::arch::fpu::r4os_rust_fpu_buffer(1, state, 4096) };
+}
+
+unsafe fn fault_fpu_restore(state: *const u8) {
+    unsafe { crate::arch::fpu::r4os_rust_fpu_buffer(2, state.cast_mut(), 4096) };
+}
+
+unsafe fn prepare_fault_stack(address: u64, rsp: u64, bytes: usize) -> usize {
+    let mut out = 0;
+    if unsafe {
+        crate::program::fault::r4os_rust_program_fault_prepare(address, rsp, bytes as u64, &mut out)
+    } {
+        out as usize
+    } else {
+        0
+    }
+}
+
+unsafe fn exception_inner(frame: *const InterruptFrame, address: u64, private_stack: bool) {
+    unsafe {
+        use crate::{boot::crash, boot::log_route as l, display::crash_screen, sched::scheduler};
+        if (*frame).vector == 14
+            && crate::program::fault::r4os_rust_program_fault_handle(
+                address,
+                (*frame).error_code,
+                private_stack,
+            )
+        {
+            return;
+        }
+        l::puts(b"[SMP] exception cpu=");
+        l::dec(u64::from(crate::arch::percpu::current_index()));
+        let current = scheduler::current().cast::<crate::sched::task::task_types::Task>();
+        if !current.is_null() {
+            let t = (*current).core.get();
+            l::puts(b" task=");
+            l::dec(u64::from(core::ptr::addr_of!((*t).id).read()));
+            l::puts(b"/");
+            let name = core::ptr::addr_of!((*t).name).read();
+            l::puts(core::slice::from_raw_parts(name.pointer, name.len));
+            l::puts(b" state_raw=");
+            l::dec(core::ptr::addr_of!((*t).state).read() as u64);
+            l::puts(b" running_cpu=");
+            l::dec(u64::from(core::ptr::addr_of!((*t).running_cpu).read()));
+            l::puts(b" saved_rsp=0x");
+            l::hex(core::ptr::addr_of!((*t).rsp).read(), 16);
+            l::puts(b" stack=0x");
+            l::hex(core::ptr::addr_of!((*t).stack_base).read(), 16);
+            l::puts(b"..0x");
+            l::hex(core::ptr::addr_of!((*t).stack_top).read(), 16);
+        }
+        let f = frame.read();
+        let rsp = interrupted_rsp(frame);
+        l::puts(b" rip=0x");
+        l::hex(f.rip, 16);
+        l::puts(b" interrupted_rsp=0x");
+        l::hex(rsp, 16);
+        l::puts(b"\r\n");
+        let reentrant = crash::r4os_rust_crash_enter() != 0;
+        let cpu = crash::CpuFrameSnapshot {
+            registers: crash::CpuRegisters {
+                r15: f.r15,
+                r14: f.r14,
+                r13: f.r13,
+                r12: f.r12,
+                r11: f.r11,
+                r10: f.r10,
+                r9: f.r9,
+                r8: f.r8,
+                rsi: f.rsi,
+                rdi: f.rdi,
+                rbp: f.rbp,
+                rdx: f.rdx,
+                rcx: f.rcx,
+                rbx: f.rbx,
+                rax: f.rax,
+            },
+            vector: f.vector,
+            error_code: f.error_code,
+            rip: f.rip,
+            rsp,
+            cs: f.cs,
+            rflags: f.rflags,
+        };
+        let mut memory = crash::FaultMemoryInfo::default();
+        if f.vector == 14 {
+            let mut block = core::mem::MaybeUninit::uninit();
+            if crate::memory::blocks::r4os_rust_blocks_read(1, 0, address, block.as_mut_ptr()) {
+                let b = block.assume_init();
+                memory = crash::FaultMemoryInfo {
+                    state: 2,
+                    block_id: b.id,
+                    owner: b.owner,
+                    owner_id: b.owner_id,
+                    kind: b.kind,
+                    status: b.status,
+                    phys_base: b.phys_base,
+                    phys_len: b.phys_len,
+                    virt_base: b.virt_base,
+                    virt_len: b.virt_len,
+                };
+            } else {
+                memory.state = 1;
+                memory.owner = 254;
+                memory.kind = 13;
+                memory.status = 254;
+            }
+        }
+        let mut context = crash::ExecutionContext::default();
+        crate::program::peer_lifetime::r4os_rust_program_peer_crash(
+            core::ptr::null(),
+            0,
+            f.rip,
+            true,
+            &mut context,
+        );
+        let message: &[u8] = if reentrant {
+            b"Reentrant CPU exception while handling crash"
+        } else {
+            b"Unhandled CPU exception"
+        };
+        let input = crash::BuildInput {
+            cause: crash::r4os_rust_crash_vector_cause(f.vector),
+            phase: 0,
+            ticks: crate::platform::timer::tick_count(),
+            cpu: &cpu,
+            cr2: address,
+            memory: &memory,
+            context: &context,
+            message: message.as_ptr(),
+            message_len: message.len(),
+        };
+        let report = crash::build(&input);
+        if reentrant {
+            crash_screen::r4os_rust_crash_screen_serial(&report);
+        } else {
+            crash_screen::r4os_rust_crash_screen_render(&report);
+        }
+        loop {
+            core::arch::asm!("cli", "hlt", options(nomem, nostack));
+        }
     }
 }

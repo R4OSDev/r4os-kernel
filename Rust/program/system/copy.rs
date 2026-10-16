@@ -18,7 +18,7 @@ use core::{
     ffi::c_void,
     mem::size_of,
     ptr,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 macro_rules! some {
     ($value:expr,$error:expr) => {
@@ -29,10 +29,9 @@ macro_rules! some {
     };
 }
 static SEQUENCE: AtomicU32 = AtomicU32::new(0);
-static CANCEL: AtomicUsize = AtomicUsize::new(0);
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_sys_copy_cancel_provider(address: usize) {
-    CANCEL.store(address, Ordering::Release);
+static CANCEL: AtomicBool = AtomicBool::new(false);
+pub(crate) fn install_program_cancellation() {
+    CANCEL.store(true, Ordering::Release)
 }
 struct CopyIo {
     lease: *mut request::Guard,
@@ -52,9 +51,8 @@ unsafe fn stage<'a>(io: *const CopyIo) -> &'a [u8] {
     unsafe { core::slice::from_raw_parts(ptr::addr_of!((*io).stage).cast(), (*io).stage_len) }
 }
 unsafe extern "C" fn cancelled(_: *mut c_void) -> bool {
-    let address = CANCEL.load(Ordering::Acquire);
-    address != 0
-        && unsafe { core::mem::transmute::<usize, unsafe extern "C" fn() -> u32>(address)() } != 0
+    CANCEL.load(Ordering::Acquire)
+        && unsafe { super::super::process::r4os_rust_program_process_legacy(3, 0) } != 0
 }
 unsafe extern "C" fn prepare(context: *mut c_void) -> bool {
     unsafe {

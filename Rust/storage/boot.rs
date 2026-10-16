@@ -95,28 +95,9 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
 fn state() -> *mut State {
     STATE.0.get()
 }
-unsafe extern "C" {
-    fn r4os_zig_storage_boot_foundation(operation: u8) -> bool;
-    fn r4os_zig_storage_boot_registry(
-        operation: u8,
-        index: usize,
-        name: Label,
-        kind: u16,
-        version: u32,
-        out: *mut RegistryEntry,
-    ) -> usize;
-    fn r4os_zig_storage_boot_usb(operation: u8, index: usize) -> usize;
-    fn r4os_zig_storage_boot_block(index: usize, out: *mut BlockBasic) -> bool;
-    fn r4os_zig_storage_boot_device_diagnostics(index: usize, out: *mut DeviceDiagnostics) -> bool;
-    fn r4os_zig_storage_boot_backend(index: usize, out: *mut BackendStatus) -> bool;
-    fn r4os_zig_storage_boot_fail(message: Label) -> bool;
-    fn r4os_zig_storage_boot_output(operation: u8, text: Label, value: u64);
-    fn r4os_zig_storage_boot_data_role() -> usize;
-    fn r4os_zig_storage_boot_data_root(consume: unsafe extern "C" fn(*mut c_void));
-    fn r4os_zig_storage_boot_data_path(context: *mut c_void, operation: u8, text: Label) -> bool;
-}
+
 fn output(operation: u8, text: &'static [u8], value: u64) {
-    unsafe { r4os_zig_storage_boot_output(operation, Label::new(text), value) }
+    unsafe { storage_boot_output(operation, Label::new(text), value) }
 }
 fn put(text: &'static [u8]) {
     output(0, text, 0)
@@ -125,10 +106,10 @@ fn dec(value: u64) {
     output(1, b"", value)
 }
 fn fail(text: Label) -> bool {
-    unsafe { r4os_zig_storage_boot_fail(text) }
+    unsafe { storage_boot_fail(text) }
 }
 fn usb(operation: u8, index: usize) -> usize {
-    unsafe { r4os_zig_storage_boot_usb(operation, index) }
+    unsafe { storage_boot_usb(operation, index) }
 }
 fn registry(
     operation: u8,
@@ -138,9 +119,7 @@ fn registry(
     version: u32,
     out: *mut RegistryEntry,
 ) -> usize {
-    unsafe {
-        r4os_zig_storage_boot_registry(operation, index, Label::new(name), kind, version, out)
-    }
+    unsafe { storage_boot_registry(operation, index, Label::new(name), kind, version, out) }
 }
 fn find(name: &'static [u8]) -> usize {
     registry(0, 0, name, 0, 0, ptr::null_mut())
@@ -166,7 +145,7 @@ fn slots() -> usize {
 }
 fn basic(index: usize) -> Option<BlockBasic> {
     let mut out = MaybeUninit::uninit();
-    if unsafe { r4os_zig_storage_boot_block(index, out.as_mut_ptr()) } {
+    if unsafe { storage_boot_block(index, out.as_mut_ptr()) } {
         Some(unsafe { out.assume_init() })
     } else {
         None
@@ -383,7 +362,7 @@ unsafe extern "C" fn data_directories(context: *mut c_void) {
         let count = name.len().min(14);
         path[1..1 + count].copy_from_slice(&name[..count]);
         if unsafe {
-            r4os_zig_storage_boot_data_path(
+            storage_boot_data_path(
                 context,
                 0,
                 Label {
@@ -394,28 +373,28 @@ unsafe extern "C" fn data_directories(context: *mut c_void) {
         } {
             continue;
         }
-        let ok = unsafe { r4os_zig_storage_boot_data_path(context, 1, Label::new(name)) };
+        let ok = unsafe { storage_boot_data_path(context, 1, Label::new(name)) };
         put(b"  D:\\");
         put(name);
         put(if ok { b" [OK]\r\n" } else { b" [WARN]\r\n" });
     }
 }
 fn data_layout() {
-    if unsafe { r4os_zig_storage_boot_data_role() } != 2 {
+    if unsafe { storage_boot_data_role() } != 2 {
         return;
     }
-    unsafe { r4os_zig_storage_boot_data_root(data_directories) }
+    unsafe { storage_boot_data_root(data_directories) }
 }
 fn foundation() -> bool {
     unsafe {
         if (*state()).foundation {
             return true;
         }
-        if !r4os_zig_storage_boot_foundation(0) {
+        if !storage_boot_foundation(0) {
             return fail(Label::new(b"Storage foundation before memory core"));
         }
         for operation in 1..=5 {
-            r4os_zig_storage_boot_foundation(operation);
+            storage_boot_foundation(operation);
         }
         (*state()).foundation = true;
         put(b"  Storage foundation ");
@@ -461,7 +440,7 @@ fn diag_text(text: &'static [u8]) {
     output(4, text, 0)
 }
 fn diag_raw(text: Label) {
-    unsafe { r4os_zig_storage_boot_output(4, text, 0) }
+    unsafe { storage_boot_output(4, text, 0) }
 }
 fn diag_dec(value: u64) {
     output(5, b"", value)
@@ -494,7 +473,7 @@ fn diagnostics() {
     for index in 0..count {
         let e = unsafe { (*state()).evidence[index] };
         let mut d = MaybeUninit::uninit();
-        if !unsafe { r4os_zig_storage_boot_device_diagnostics(e.index, d.as_mut_ptr()) } {
+        if !unsafe { storage_boot_device_diagnostics(e.index, d.as_mut_ptr()) } {
             diag_text(b"dev#");
             diag_dec(e.index as u64);
             diag_line(b" unavailable after scan");
@@ -598,7 +577,7 @@ fn diagnostics() {
         diag_dec(d.completion_ticks);
         diag_end();
         let mut backend = MaybeUninit::uninit();
-        if unsafe { r4os_zig_storage_boot_backend(e.index, backend.as_mut_ptr()) } {
+        if unsafe { storage_boot_backend(e.index, backend.as_mut_ptr()) } {
             let backend = unsafe { backend.assume_init() };
             diag_text(b"  backend-state=");
             diag_dec(u64::from(backend.state));
@@ -636,3 +615,303 @@ const _: () = {
     assert!(core::mem::size_of::<BackendStatus>() == 40);
     assert!(core::mem::size_of::<DeviceDiagnostics>() == 144);
 };
+
+unsafe fn storage_boot_foundation(operation: u8) -> bool {
+    unsafe {
+        match operation {
+            0 => return crate::memory::boot::core_ready(),
+            1 => {
+                crate::fs::drive::r4os_rust_fs_drive_control(0, 0);
+            }
+            2 => {
+                crate::fs::vfs::r4os_rust_vfs_mount(
+                    0,
+                    0,
+                    ptr::null(),
+                    ptr::null(),
+                    ptr::null_mut(),
+                );
+            }
+            3 => super::block_device::init(),
+            4 => crate::fs::page_cache::r4os_rust_pagecache_init(),
+            5 => crate::fs::request::r4os_rust_fs_request_init(),
+            _ => panic!("Invalid storage foundation step"),
+        };
+        true
+    }
+}
+
+unsafe fn storage_boot_registry(
+    operation: u8,
+    index: usize,
+    name: Label,
+    kind: u16,
+    version: u32,
+    out: *mut RegistryEntry,
+) -> usize {
+    use crate::driver::registry as r;
+    match operation {
+        0 => unsafe { r::r4os_rust_driver_registry_find(name.data, name.len) },
+        1 => {
+            let Some(e) = r::get(index) else {
+                return 0;
+            };
+            unsafe {
+                out.write(RegistryEntry {
+                    source: e.source,
+                    state: e.state,
+                });
+            }
+            1
+        }
+        2 => unsafe {
+            r::begin_logged(
+                core::slice::from_raw_parts(name.data, name.len),
+                kind,
+                version,
+                0,
+            )
+            .unwrap_or(usize::MAX)
+        },
+        3 => {
+            r::set_state_logged(index, version.try_into().unwrap());
+            0
+        }
+        _ => panic!("Invalid storage registry operation"),
+    }
+}
+
+unsafe fn storage_boot_block(index: usize, out: *mut BlockBasic) -> bool {
+    let Some(c) = super::block_device::config(index) else {
+        return false;
+    };
+    unsafe {
+        out.write(BlockBasic {
+            bus: c.bus,
+            source: c.source,
+        });
+    }
+    true
+}
+
+unsafe fn storage_boot_usb(operation: u8, index: usize) -> usize {
+    unsafe {
+        use crate::usb::{host_controller as host, msc, xhci_api};
+        match operation {
+            0 => host::r4os_rust_usb_host_find(b"XHCI".as_ptr(), 4),
+            1 => {
+                let mut c = MaybeUninit::uninit();
+                if !host::r4os_rust_usb_host_at(index, c.as_mut_ptr()) {
+                    return usize::MAX;
+                }
+                c.assume_init().source as usize
+            }
+            2 => usize::from(xhci_api::r4os_rust_usb_xhci_probe()),
+            3 => {
+                msc::set_owner(1);
+                0
+            }
+            4 => {
+                msc::set_owner(0);
+                0
+            }
+            5 => usize::from(msc::init()),
+            6 => msc::block_device_count(),
+            7 => msc::device_index().unwrap_or(usize::MAX),
+            8 => usize::from(msc::reselect_active_device()),
+            _ => panic!("Invalid storage USB boot step"),
+        }
+    }
+}
+
+unsafe fn storage_boot_backend(index: usize, out: *mut BackendStatus) -> bool {
+    unsafe {
+        let mut v = crate::contract::StorageBackendStatus::default();
+        let ok = crate::driver::api_storage::r4os_rust_driver_storage_status(index, &mut v);
+        out.write(BackendStatus {
+            state: v.state,
+            last_error: v.last_error,
+            last_lba: v.last_lba,
+            last_sectors: v.last_sectors,
+            recoveries: v.recoveries,
+            recovery_failures: v.recovery_failures,
+        });
+        ok
+    }
+}
+
+unsafe fn storage_boot_fail(message: Label) -> bool {
+    unsafe {
+        crate::boot::fatal::r4os_rust_fatal_record(7, message.data, message.len);
+    }
+    false
+}
+
+unsafe fn storage_boot_output(operation: u8, text: Label, value: u64) {
+    use crate::{boot::log_route as l, display::diag_screen as diag};
+    unsafe {
+        match operation {
+            0 | 2 => l::puts(core::slice::from_raw_parts(text.data, text.len)),
+            1 => l::dec(value),
+            3 => diag::begin(),
+            4 => diag::write(text.data, text.len),
+            5 => diag::r4os_rust_diag_number(value, false),
+            6 => diag::r4os_rust_diag_number(value, true),
+            7 => {
+                diag::write(text.data, text.len);
+                diag::end_line();
+            }
+            8 => diag::end_line(),
+            _ => panic!("Invalid storage boot output"),
+        }
+    }
+}
+
+struct DataContext {
+    volume: crate::fs::vfs_types::Volume,
+    root: u64,
+}
+fn tag(category: u8, value: u8) -> Label {
+    let bytes: &'static [u8] = match category {
+        0 => match value {
+            0 => b"unknown",
+            1 => b"ata",
+            2 => b"ahci",
+            3 => b"nvme",
+            4 => b"usb",
+            5 => b"ram",
+            6 => b"virtio",
+            _ => unreachable!(),
+        },
+        1 => match value {
+            0 => b"builtin",
+            1 => b"preload",
+            2 => b"disk",
+            _ => unreachable!(),
+        },
+        2 => match value {
+            0 => b"registered",
+            1 => b"active",
+            2 => b"busy",
+            3 => b"recovering",
+            4 => b"failed",
+            _ => unreachable!(),
+        },
+        3 => match value {
+            0 => b"none",
+            1 => b"busy",
+            2 => b"invalid_request",
+            3 => b"request_too_large",
+            4 => b"out_of_range",
+            5 => b"buffer_too_small",
+            6 => b"no_writer",
+            7 => b"timeout",
+            8 => b"backend_read",
+            9 => b"backend_write",
+            10 => b"backend_flush",
+            11 => b"cancelled",
+            12 => b"reset",
+            13 => b"shutdown",
+            _ => unreachable!(),
+        },
+        _ => unreachable!(),
+    };
+    Label::new(bytes)
+}
+
+unsafe fn storage_boot_device_diagnostics(index: usize, out: *mut DeviceDiagnostics) -> bool {
+    let Some(c) = super::block_device::config(index) else {
+        return false;
+    };
+    let Some(d) = super::block_diagnostics::device_snapshot(index) else {
+        return false;
+    };
+    let s = d.stats;
+    unsafe {
+        out.write(DeviceDiagnostics {
+            name: Label {
+                data: c.name.data,
+                len: c.name.len,
+            },
+            bus: tag(0, c.bus),
+            source: tag(1, c.source),
+            state: tag(2, d.state),
+            last_error: tag(3, s.last_error),
+            sector_size: c.sector_size,
+            sector_count: c.sector_count,
+            read_failures: s.read_failures,
+            read_ops: s.read_ops,
+            read_sectors: s.read_sectors,
+            last_lba: s.last_request.lba,
+            completion_ticks: s.completion_last_ticks,
+            last_sectors: s.last_request.sectors,
+        });
+    }
+    true
+}
+
+unsafe fn storage_boot_data_role() -> usize {
+    unsafe {
+        let d = crate::fs::drive::r4os_rust_fs_drive_lookup(1, b'D' as usize);
+        if d.is_null() {
+            usize::MAX
+        } else {
+            (*d).role as usize
+        }
+    }
+}
+
+unsafe fn storage_boot_data_root(consume: unsafe extern "C" fn(*mut c_void)) {
+    unsafe {
+        use crate::fs::{vfs, vfs_types as f};
+        let mut volume = MaybeUninit::<f::Volume>::uninit();
+        if !vfs::r4os_rust_vfs_mount(
+            4,
+            b'D',
+            ptr::null(),
+            ptr::null(),
+            volume.as_mut_ptr().cast(),
+        ) {
+            return;
+        }
+        let volume = volume.assume_init();
+        let a = f::Args {
+            volume,
+            name: f::Bytes {
+                data: b"\\".as_ptr(),
+                len: 1,
+            },
+            ..Default::default()
+        };
+        let root = vfs::r4os_rust_vfs_run(0, &a, ptr::null_mut());
+        if !root.present {
+            return;
+        }
+        let mut c = DataContext {
+            volume,
+            root: root.value,
+        };
+        consume(ptr::from_mut(&mut c).cast());
+    }
+}
+
+unsafe fn storage_boot_data_path(context: *mut c_void, operation: u8, text: Label) -> bool {
+    unsafe {
+        use crate::fs::{vfs, vfs_types as f};
+        let c = context.cast::<DataContext>().read();
+        let a = f::Args {
+            volume: c.volume,
+            parent: c.root,
+            name: f::Bytes {
+                data: text.data,
+                len: text.len,
+            },
+            ..Default::default()
+        };
+        match operation {
+            0 => vfs::r4os_rust_vfs_run(0, &a, ptr::null_mut()).present,
+            1 => vfs::r4os_rust_vfs_run(15, &a, ptr::null_mut()).present,
+            _ => panic!("Invalid data directory operation"),
+        }
+    }
+}

@@ -19,12 +19,7 @@ static mut PENDING: Pending = Pending {
         bytes: [0; 128],
     },
 };
-unsafe extern "C" {
-    fn r4os_zig_fatal_record_display(message: *const u8, len: usize);
-    fn r4os_zig_fatal_display(message: *const u8, len: usize);
-    fn r4os_zig_fatal_ticks() -> u64;
-    fn r4os_zig_crash_output(report: *const crash::CrashReport, reentrant: bool);
-}
+
 pub fn halt() -> ! {
     loop {
         unsafe { core::arch::asm!("cli", "hlt", options(nomem, nostack)) };
@@ -59,7 +54,7 @@ pub unsafe extern "C" fn r4os_rust_fatal_record(phase: u8, message: *const u8, l
     }
     unsafe {
         addr_of_mut!(PENDING).write(pending);
-        r4os_zig_fatal_record_display(message, len);
+        fatal_record_display(message, len);
     }
 }
 pub fn kernel(phase: u8, message: &[u8]) -> ! {
@@ -71,11 +66,11 @@ pub fn rust_panic(message: &[u8]) -> ! {
 }
 fn terminal(cause: u8, phase: u8, message: &[u8]) -> ! {
     super::performance::fail_fatal();
-    unsafe { r4os_zig_fatal_display(message.as_ptr(), message.len()) };
+    unsafe { fatal_display(message.as_ptr(), message.len()) };
     let input = BuildInput {
         cause,
         phase,
-        ticks: unsafe { r4os_zig_fatal_ticks() },
+        ticks: unsafe { fatal_ticks() },
         cpu: null(),
         cr2: 0,
         memory: null(),
@@ -85,7 +80,7 @@ fn terminal(cause: u8, phase: u8, message: &[u8]) -> ! {
     };
     let report = unsafe { crash::build(&input) };
     let reentrant = crash::r4os_rust_crash_enter() != 0;
-    unsafe { r4os_zig_crash_output(&report, reentrant) };
+    unsafe { crash_output(&report, reentrant) };
     halt()
 }
 #[unsafe(no_mangle)]
@@ -114,17 +109,7 @@ pub unsafe extern "C" fn r4os_rust_kernel_fatal(phase: u8, message: *const u8, l
     };
     kernel(phase, text)
 }
-#[unsafe(no_mangle)]
-/// # Safety
-/// message retains len resident readable bytes until terminal halt.
-pub unsafe extern "C" fn r4os_rust_zig_panic(message: *const u8, len: usize) -> ! {
-    let text = if len == 0 {
-        &[]
-    } else {
-        unsafe { core::slice::from_raw_parts(message, len) }
-    };
-    terminal(6, PHASE.load(Ordering::Relaxed), text)
-}
+
 #[unsafe(no_mangle)]
 /// # Safety
 /// message retains len resident readable bytes until terminal halt.
@@ -135,4 +120,26 @@ pub unsafe extern "C" fn r4os_rust_panic_fatal(message: *const u8, len: usize) -
         unsafe { core::slice::from_raw_parts(message, len) }
     };
     rust_panic(text)
+}
+
+unsafe fn fatal_ticks() -> u64 {
+    crate::platform::timer::r4os_rust_timer_control(5, 0, 0)
+}
+
+unsafe fn fatal_display(message: *const u8, len: usize) {
+    unsafe { crate::display::bootscreen::set_error(message, len) }
+}
+
+unsafe fn fatal_record_display(message: *const u8, len: usize) {
+    unsafe { crate::display::bootscreen::set_error(message, len) };
+    crate::boot::foundation::r4os_rust_boot_unroute();
+}
+
+unsafe fn crash_output(report: *const crash::CrashReport, reentrant: bool) {
+    crate::boot::foundation::r4os_rust_boot_unroute();
+    if reentrant {
+        unsafe { crate::display::crash_screen::r4os_rust_crash_screen_serial(report) }
+    } else {
+        let _ = unsafe { crate::display::crash_screen::r4os_rust_crash_screen_render(report) };
+    }
 }

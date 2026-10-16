@@ -2,7 +2,7 @@
 //! calibration never mutates BSP state. EOI/TLB IPIs never acquire runtime.
 use super::{hpet, msr, runtime::RuntimeGuard};
 use crate::{
-    build_bridge::config,
+    build_config::config,
     memory::{paging, phys},
 };
 use core::{
@@ -102,9 +102,7 @@ static FLAGS: AtomicU32 = AtomicU32::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static CURRENT_COUNT: AtomicU32 = AtomicU32::new(0);
 static HZ: AtomicU32 = AtomicU32::new(0);
-unsafe extern "C" {
-    fn r4os_zig_lapic_log(event: u8, status: *const Status);
-}
+
 fn state() -> Status {
     let mut value = unsafe { *STATE.0.get() };
     value.timer_ticks = TICKS.load(Ordering::Relaxed);
@@ -118,7 +116,7 @@ fn publish(value: Status) {
     FLAGS.store(value.flags, Ordering::Release);
 }
 fn log(event: u8, value: Status) {
-    unsafe { r4os_zig_lapic_log(event, &value) };
+    unsafe { lapic_log(event, &value) };
 }
 fn read(register: u32) -> u32 {
     if MODE_X2.load(Ordering::Acquire) {
@@ -573,3 +571,88 @@ const _: () = {
     assert!(core::mem::offset_of!(Status, flags) == 40);
     assert!(core::mem::offset_of!(Status, timer_reason) == 77);
 };
+
+unsafe fn lapic_log(event: u8, status: *const Status) {
+    use crate::boot::log::{
+        r4os_rust_bootlog_dec as dec, r4os_rust_bootlog_hex as hex, text as puts,
+    };
+    let s = unsafe { status.read() };
+
+    match event {
+        0 => {
+            let mode: &[u8] = if s.has(X2APIC) {
+                b"x2apic"
+            } else if s.virt_base != 0 {
+                b"xapic"
+            } else {
+                b"none"
+            };
+            crate::boot::log_route::puts(b"[LAPIC] mode=");
+            crate::boot::log_route::puts(mode);
+            crate::boot::log_route::puts(b"\r\n");
+            puts(b"[LAPIC] mode=");
+            puts(mode);
+            puts(b" ");
+            puts(if s.has(AVAILABLE) {
+                b"available"
+            } else {
+                b"missing"
+            });
+            puts(b" enabled=");
+            puts(if s.has(ENABLED) && s.has(SOFTWARE) {
+                b"yes"
+            } else {
+                b"no"
+            });
+            puts(b" base=0x");
+            hex(s.phys_base, 16);
+            puts(b" id=");
+            dec(u64::from(s.id));
+            puts(b" ver=0x");
+            hex(u64::from(s.version), 2);
+            puts(b" reason=");
+            puts(match s.reason {
+                0 => b"not initialized",
+                1 => b"MADT has no enabled LAPIC",
+                2 => b"x2APIC MSR mode active, PIC/IOAPIC routing unchanged",
+                3 => b"LAPIC base missing",
+                4 => b"LAPIC MMIO mapping failed",
+                5 => b"xAPIC MMIO enabled, PIC/IOAPIC routing unchanged",
+                _ => unreachable!(),
+            });
+            puts(b"\r\n");
+        }
+        1 | 2 => {
+            puts(b"[LAPIC] timer=");
+            puts(if event == 2 { b"active" } else { b"off" });
+            puts(b" hz=");
+            dec(u64::from(s.timer_frequency_hz));
+            puts(b" initial=");
+            dec(u64::from(s.timer_initial_count));
+            puts(b" hpet_ticks=");
+            dec(s.calibration_hpet_ticks);
+            puts(b" lapic_ticks=");
+            dec(u64::from(s.calibration_lapic_ticks));
+            puts(b" reason=");
+            puts(match s.timer_reason {
+                0 => b"timer not initialized",
+                1 => b"LAPIC not enabled",
+                2 => b"HPET reference clock unavailable",
+                3 => b"HPET reference too slow",
+                4 => b"LAPIC timer did not count during calibration",
+                5 => b"LAPIC calibration denominator is zero",
+                6 => b"LAPIC calibrated count out of range",
+                7 => b"calibrated against HPET",
+                8 => b"periodic LAPIC timer active",
+                9 => b"LAPIC one-shot unavailable without calibration",
+                10 => b"LAPIC one-shot ready",
+                11 => b"LAPIC one-shot armed",
+                12 => b"LAPIC one-shot disarmed",
+                13 => b"LAPIC periodic resume unavailable",
+                _ => unreachable!(),
+            });
+            puts(b"\r\n");
+        }
+        _ => unreachable!(),
+    }
+}

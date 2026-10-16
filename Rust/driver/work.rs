@@ -2,7 +2,7 @@
 //! metadata only; callbacks, completion publication/waits and task construction
 //! remain outside it with exact original lifetime barriers.
 use crate::{
-    build_bridge::config,
+    build_config::config,
     contract as a,
     driver::{irq_router, work_queue as q},
     memory::owner,
@@ -491,10 +491,7 @@ fn sync_legacy(s: &mut State) {
     s.summary.active_workers = s.book.running_count;
     s.summary.queue_high_water = s.book.queue_high_water;
 }
-unsafe extern "C" {
-    fn r4os_zig_work_display_init() -> bool;
-    fn r4os_zig_work_invoke_owned(owner: u32, handler: Handler, context: usize) -> i32;
-}
+
 fn append_final(s: &mut State, id: u32, slot: usize) {
     let Some(i) = index(id) else { return };
     let tail = s.owner_final_tail[i];
@@ -685,7 +682,7 @@ fn create_worker(deadline: bool) -> u32 {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_work_init() -> bool {
-    if !unsafe { r4os_zig_work_display_init() } {
+    if !{ crate::display::queue::init() } {
         return false;
     }
     if unsafe {
@@ -1322,7 +1319,9 @@ fn run(slot: usize, deadline: bool) {
         }
     }
     let result = if owned {
-        unsafe { r4os_zig_work_invoke_owned(id, handler, context) }
+        unsafe {
+            crate::driver::api_admission::r4os_rust_driver_api_invoke_owned(id, handler, context)
+        }
     } else {
         unsafe { handler(context) }
     };

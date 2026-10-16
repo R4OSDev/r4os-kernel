@@ -42,15 +42,6 @@ impl Status {
         reason: Text::literal(b"not initialized"),
     };
 }
-#[repr(C)]
-pub struct Peers {
-    pub core_init: unsafe extern "C" fn(),
-    pub core_count: unsafe extern "C" fn() -> usize,
-    pub core_configure: unsafe extern "C" fn(*const c_void),
-    pub ipc_init: unsafe extern "C" fn(),
-    pub services_init: unsafe extern "C" fn(),
-    pub status_line: unsafe extern "C" fn(*const u8, usize),
-}
 struct Storage(UnsafeCell<Status>);
 // SAFETY: original linear BSP bootstrap is the only writer; short runtime
 // admission also protects concurrent passive copies. No peer borrow escapes.
@@ -96,8 +87,8 @@ fn bootlog(value: &[u8]) {
 fn bootdec(value: usize) {
     log::r4os_rust_bootlog_dec(value as u64);
 }
-fn line(peers: &Peers, value: &[u8]) {
-    unsafe { (peers.status_line)(value.as_ptr(), value.len()) };
+fn line(value: &[u8]) {
+    crate::boot::log_route::puts(value);
 }
 fn mark_contract(reason: &'static [u8]) {
     update(|s| {
@@ -121,7 +112,7 @@ fn fail(message: &'static [u8], reason: &'static [u8]) -> bool {
     unsafe { fatal::r4os_rust_fatal_record(15, message.as_ptr(), message.len()) };
     false
 }
-fn prepare_contract(peers: &Peers) -> bool {
+fn prepare_contract() -> bool {
     let s = status();
     if s.failed {
         return false;
@@ -131,7 +122,7 @@ fn prepare_contract(peers: &Peers) -> bool {
     }
     mark_contract(b"contract ready; waiting for productive init");
     bootlog(b"[NETBOOT] contract [OK]\r\n");
-    line(peers, b"  Network boot [contract]\r\n");
+    line(b"  Network boot [contract]\r\n");
     true
 }
 fn ready_reason(s: Status) -> &'static [u8] {
@@ -145,7 +136,7 @@ fn ready_reason(s: Status) -> &'static [u8] {
         b"network/ipc ready"
     }
 }
-unsafe fn init(peers: &Peers) -> bool {
+unsafe fn init() -> bool {
     let s = status();
     if s.failed {
         return false;
@@ -163,9 +154,9 @@ unsafe fn init(peers: &Peers) -> bool {
     if config.is_null() {
         return fail(b"Network boot config missing", b"loader config missing");
     }
-    unsafe { init_with_config(peers, config) }
+    unsafe { init_with_config(config) }
 }
-unsafe fn init_with_config(peers: &Peers, loaded: *const c_void) -> bool {
+unsafe fn init_with_config(loaded: *const c_void) -> bool {
     let s = status();
     if s.failed {
         return false;
@@ -176,8 +167,8 @@ unsafe fn init_with_config(peers: &Peers, loaded: *const c_void) -> bool {
     if !s.contract_ready {
         mark_contract(b"contract ready");
     }
-    unsafe { (peers.core_init)() };
-    let count = unsafe { (peers.core_count)() };
+    unsafe { super::bindings::init() };
+    let count = super::adapters::r4os_rust_net_adapter_count();
     update(|s| {
         s.core_ready = true;
         s.adapter_count = count;
@@ -188,7 +179,7 @@ unsafe fn init_with_config(peers: &Peers, loaded: *const c_void) -> bool {
     bootlog(b"\r\n");
     unsafe {
         config::apply_boot_config(loaded);
-        (peers.core_configure)(loaded)
+        super::bindings::configure_injection(loaded)
     };
     let config = config::settings();
     let source = config::source_name();
@@ -213,13 +204,13 @@ unsafe fn init_with_config(peers: &Peers, loaded: *const c_void) -> bool {
     bootlog(b"[NETBOOT] serial-link [OK] present=");
     bootlog(yes_no(present));
     bootlog(b"\r\n");
-    unsafe { (peers.ipc_init)() };
+    unsafe { crate::service::ipc::r4os_rust_ipc_control(0, 0) };
     update(|s| {
         s.ipc_ready = true;
         s.phase = 5;
     });
     bootlog(b"[NETBOOT] ipc [OK]\r\n");
-    unsafe { (peers.services_init)() };
+    super::ipc_services::r4os_rust_net_ipc_init();
     update(|s| {
         s.net_ipc_services_ready = true;
         s.phase = 6;
@@ -228,7 +219,7 @@ unsafe fn init_with_config(peers: &Peers, loaded: *const c_void) -> bool {
     bootlog(b"[NETBOOT] net-ipc-services [OK]\r\n");
     dump_status_bootlog();
     emit_boot_status_line();
-    line(peers, b"  Network boot [OK]\r\n");
+    line(b"  Network boot [OK]\r\n");
     true
 }
 fn dump_status_bootlog() {
@@ -308,14 +299,14 @@ fn emit_boot_status_line() {
 /// # Safety
 /// Exact stable boot peer table; callbacks retain each original owner.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_network_boot_prepare(peers: *const Peers) -> bool {
-    prepare_contract(unsafe { &*peers })
+pub unsafe extern "C" fn r4os_rust_network_boot_prepare() -> bool {
+    prepare_contract()
 }
 /// # Safety
 /// Linear BSP bootstrap and exact stable peer table; resident boot config.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_network_boot_init(peers: *const Peers) -> bool {
-    unsafe { init(&*peers) }
+pub unsafe extern "C" fn r4os_rust_network_boot_init() -> bool {
+    unsafe { init() }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_network_boot_ready() -> bool {

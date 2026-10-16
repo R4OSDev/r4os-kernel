@@ -1,7 +1,14 @@
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 fn main() {
-    println!("cargo::rustc-check-cfg=cfg(r4os_owner_fixture)");
+    let manifest =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("Kernel manifest directory"));
+    let script = manifest.join("linker.ld");
+    println!("cargo::rerun-if-changed=linker.ld");
+    println!("cargo::rustc-link-arg-bin=r4os=-T{}", script.display());
+    println!("cargo::rustc-link-arg-bin=r4os=--build-id=none");
+    println!("cargo::rustc-link-arg-bin=r4os=-zmax-page-size=4096");
+
     println!("cargo::rerun-if-env-changed=R4OS_KERNEL_BUILD_CONFIG");
     println!("cargo::rerun-if-changed=VERSION.R4S");
     let path = env::var("R4OS_KERNEL_BUILD_CONFIG").expect(
@@ -30,6 +37,28 @@ fn main() {
         .parse()
         .expect("u64 build flags");
     let mut generated = format!("pub const BUILD_FLAGS: u64 = {flags};\n");
+    let platform_count: usize = values
+        .remove("PLATFORM_API_COUNT")
+        .expect("Contract platform metadata")
+        .parse()
+        .expect("Platform API count");
+    generated.push_str(&format!("pub const PLATFORM_API_COUNT:usize={platform_count};\npub const PLATFORM_APIS:[(&[u8],u32);PLATFORM_API_COUNT]=[\n"));
+    for index in 0..platform_count {
+        let value = values
+            .remove(&format!("PLATFORM_API_{index}"))
+            .expect("Ordered Contract platform entry");
+        let (name, group) = value.split_once(',').expect("Contract platform name,group");
+        assert!(
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_'),
+            "Contract platform name"
+        );
+        let group: u32 = group.parse().expect("Contract platform group");
+        generated.push_str(&format!("(b\"{name}\",{group}),\n"));
+    }
+    generated.push_str("];\n");
     for (key, value) in values {
         if value == "true" || value == "false" {
             generated.push_str(&format!("pub const {key}: bool = {value};\n"));
@@ -46,9 +75,23 @@ fn main() {
         .expect("Canonical kernel version");
     let parts: Vec<u32> = version
         .split('.')
-        .map(|v| v.parse().expect("Version integer"))
+        .map(|v| {
+            assert!(
+                !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()),
+                "Decimal kernel version component"
+            );
+            assert!(
+                v.len() == 1 || !v.starts_with('0'),
+                "Canonical kernel version component"
+            );
+            v.parse().expect("Version integer")
+        })
         .collect();
     assert_eq!(parts.len(), 3);
+    assert!(version.len() < 16, "Kernel metadata version capacity");
+    generated.push_str(&format!(
+        "pub const KERNEL_VERSION_TEXT: &[u8] = b\"{version}\";\n"
+    ));
     for (name, value) in ["MAJOR", "MINOR", "PATCH"].into_iter().zip(parts) {
         generated.push_str(&format!("pub const KERNEL_{name}: u32 = {value};\n"));
     }

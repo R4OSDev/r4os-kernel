@@ -13,15 +13,7 @@ use core::{
     mem, ptr,
     sync::atomic::{AtomicBool, Ordering},
 };
-unsafe extern "C" {
-    fn r4os_zig_program_exit_stop_admission(instance: *mut ProgramInstance);
-    fn r4os_zig_program_exit_console_snapshot(
-        instance: *const ProgramInstance,
-        node: *mut ProgramCompletionNode,
-    );
-    fn r4os_zig_program_exit_console_close(console: *mut c_void);
-    fn r4os_zig_program_exit_notify(operation: u8, handle: Handle);
-}
+
 struct Operation(task_context::Unwind);
 impl Operation {
     fn enter() -> Option<Self> {
@@ -87,7 +79,7 @@ pub unsafe extern "C" fn r4os_rust_program_exit_commit(h: Handle, code: i32, req
         (*slot).pin_count += 1;
         registry::unlock();
         let _lease = Lease(raw);
-        r4os_zig_program_exit_stop_admission(instance);
+        program_exit_stop_admission(instance);
         if !registry::lock() {
             return 2;
         }
@@ -127,7 +119,7 @@ pub unsafe extern "C" fn r4os_rust_program_exit_commit(h: Handle, code: i32, req
             (*node).flags |= 4;
         }
         if !(*instance).console_payload.is_null() {
-            r4os_zig_program_exit_console_snapshot(instance, node);
+            program_exit_console_snapshot(instance, node);
         }
         (*node).sequence = completions::r4os_rust_program_history_append(
             h,
@@ -163,16 +155,16 @@ pub unsafe extern "C" fn r4os_rust_program_exit_commit(h: Handle, code: i32, req
         }
         registry::unlock();
         if !console.is_null() {
-            r4os_zig_program_exit_console_close(console);
+            program_exit_console_close(console);
         }
         if boot_shell_exited {
             crate::boot::performance::fail_shell_exited(h.instance_id);
         }
         completions::orphan(h);
-        r4os_zig_program_exit_notify(1, h);
-        r4os_zig_program_exit_notify(2, h);
-        r4os_zig_program_exit_notify(3, h);
-        r4os_zig_program_exit_notify(4, h);
+        program_exit_notify(1, h);
+        program_exit_notify(2, h);
+        program_exit_notify(3, h);
+        program_exit_notify(4, h);
         0
     }
 }
@@ -185,7 +177,7 @@ pub unsafe extern "C" fn r4os_rust_program_exit_begin(h: Handle, code: i32, reas
         return false;
     }
     unsafe {
-        r4os_zig_program_exit_notify(5, h);
+        program_exit_notify(5, h);
         sync_objects::r4os_rust_sync_event((*super::registry_state::state()).event, 0, 0)
     };
     true
@@ -197,5 +189,68 @@ pub unsafe extern "C" fn r4os_rust_program_exit_begin(h: Handle, code: i32, reas
 pub unsafe extern "C" fn r4os_rust_program_exit_mark(h: Handle, code: i32) {
     while !unsafe { r4os_rust_program_exit_begin(h, code, 0) } {
         scheduler::yield_task();
+    }
+}
+
+unsafe fn program_exit_console_close(console: *mut c_void) {
+    unsafe {
+        let p = console.cast::<crate::program::payload_types::Console>();
+        crate::sched::sync_objects::queue_close_cancelled(core::ptr::addr_of_mut!((*p).input_wait));
+    }
+}
+
+unsafe fn program_exit_console_snapshot(
+    instance: *const ProgramInstance,
+    node: *mut ProgramCompletionNode,
+) {
+    unsafe {
+        let p = (*instance)
+            .console_payload
+            .cast::<crate::program::payload_types::Console>();
+        if !p.is_null() {
+            (*node).console_state = (*p).state;
+            (*node).output_revision = (*p).revision;
+            let t = (*p).transcript_payload;
+            (*node).output_length = if t.is_null() { 0 } else { (*t).output_len };
+        }
+    }
+}
+
+unsafe fn program_exit_stop_admission(instance: *mut ProgramInstance) {
+    unsafe {
+        crate::gfx::virtual_runtime::stop_admission(core::ptr::addr_of_mut!(
+            (*instance).gfx_virtual_closed
+        ));
+    }
+}
+
+unsafe fn program_exit_notify(operation: u8, handle: Handle) {
+    let owner = crate::gfx::types::Owner {
+        kind: 1,
+        id: u64::from(handle.instance_id),
+        generation: handle.generation,
+    };
+    unsafe {
+        match operation {
+            1 => crate::display::queue::stopped(owner),
+            2 => crate::gfx::allocations::stopped(owner),
+            3 => crate::gfx::virtual_runtime::stopped(owner),
+            4 => {
+                let t = crate::sched::scheduler::current()
+                    .cast::<crate::sched::task::task_types::Task>();
+                crate::program::thread_retire::r4os_rust_program_threads_terminate(
+                    handle,
+                    -9,
+                    !t.is_null(),
+                    if t.is_null() {
+                        0
+                    } else {
+                        (*(*t).core.get()).id
+                    },
+                );
+            }
+            5 => crate::program::process::r4os_rust_program_process_clients(0, handle),
+            _ => panic!("Invalid process exit notification"),
+        }
     }
 }

@@ -241,8 +241,6 @@ pub type SynthSidRenderPcmCtxFn = unsafe extern "C" fn(*mut c_void, u32, *mut u8
 pub struct BackendRegistration {
     pub pointer: *const c_void,
     pub context: *mut c_void,
-    pub write_legacy: usize,
-    pub stop_legacy: usize,
     pub write: Option<WritePcmCtxFn>,
     pub stop: Option<StopPcmCtxFn>,
     pub status: Option<StatusCtxFn>,
@@ -255,9 +253,6 @@ pub struct SynthRegistration {
     pub flags: u32,
     pub pointer: *const c_void,
     pub context: *mut c_void,
-    pub send_legacy: usize,
-    pub render_legacy: usize,
-    pub stop_legacy: usize,
     pub send: Option<SynthMidiSendCtxFn>,
     pub render: Option<SynthRenderCtxFn>,
     pub render_pcm: Option<SynthRenderPcmCtxFn>,
@@ -371,8 +366,6 @@ impl AudioBackend {
         config: BackendRegistration {
             pointer: ptr::null(),
             context: ptr::null_mut(),
-            write_legacy: 0,
-            stop_legacy: 0,
             write: None,
             stop: None,
             status: None,
@@ -408,9 +401,6 @@ impl SynthEngine {
             flags: 0,
             pointer: ptr::null(),
             context: ptr::null_mut(),
-            send_legacy: 0,
-            render_legacy: 0,
-            stop_legacy: 0,
             send: None,
             render: None,
             render_pcm: None,
@@ -437,8 +427,8 @@ impl SynthEngine {
     };
 }
 const _: () = {
-    assert!(size_of::<BackendRegistration>() == 80);
-    assert!(size_of::<SynthRegistration>() == 176);
+    assert!(size_of::<BackendRegistration>() == 64);
+    assert!(size_of::<SynthRegistration>() == 152);
 };
 
 const _: () = {

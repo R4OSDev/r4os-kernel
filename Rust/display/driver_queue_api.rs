@@ -384,6 +384,7 @@ pub unsafe fn scanout_retire_requested(id: u32, input: *const a::GfxFence) -> i3
         .map_or_else(api::error_code, i32::from)
 }
 #[repr(C)]
+#[derive(Default)]
 pub struct Args {
     pub owner: Owner,
     pub value: u64,

@@ -9,21 +9,14 @@ static SLOT: AtomicUsize = AtomicUsize::new(usize::MAX);
 static KEYBOARD_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static COMPLETED: AtomicBool = AtomicBool::new(false);
 static MOUSE_STATUS: AtomicU8 = AtomicU8::new(0);
-unsafe extern "C" {
-    fn r4os_zig_input_boot_registry_begin() -> usize;
-    fn r4os_zig_input_boot_registry_state(slot: usize, state: u8);
-    fn r4os_zig_input_boot_mode(out: *mut Bounds) -> bool;
-}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_input_boot_keyboard() {
     if KEYBOARD_INITIALIZED.load(Ordering::Acquire) {
         return;
     }
     if SLOT.load(Ordering::Acquire) == usize::MAX {
-        SLOT.store(
-            unsafe { r4os_zig_input_boot_registry_begin() },
-            Ordering::Release,
-        );
+        SLOT.store(unsafe { input_boot_registry_begin() }, Ordering::Release);
     }
     keyboard::init();
     KEYBOARD_INITIALIZED.store(true, Ordering::Release);
@@ -38,7 +31,7 @@ pub extern "C" fn r4os_rust_input_boot_mouse() {
         return;
     }
     let mut bounds = Bounds::default();
-    if !unsafe { r4os_zig_input_boot_mode(&mut bounds) } {
+    if !unsafe { input_boot_mode(&mut bounds) } {
         MOUSE_STATUS.store(3, Ordering::Release);
         return;
     }
@@ -56,15 +49,33 @@ pub extern "C" fn r4os_rust_input_boot_complete() {
     let slot = SLOT.load(Ordering::Acquire);
     if slot != usize::MAX {
         if KEYBOARD_INITIALIZED.load(Ordering::Acquire) {
-            unsafe {
-                r4os_zig_input_boot_registry_state(slot, 2);
-                r4os_zig_input_boot_registry_state(slot, 3);
+            {
+                crate::driver::registry::set_state_logged(slot, 2);
+                crate::driver::registry::set_state_logged(slot, 3);
             }
         } else {
-            unsafe {
-                r4os_zig_input_boot_registry_state(slot, 6);
+            {
+                crate::driver::registry::set_state_logged(slot, 6);
             }
         }
     }
     COMPLETED.store(true, Ordering::Release);
+}
+
+unsafe fn input_boot_mode(out: *mut Bounds) -> bool {
+    let s = crate::display::manager::stats();
+    if !s.registered {
+        return false;
+    }
+    unsafe {
+        out.write(Bounds {
+            width: s.mode.width,
+            height: s.mode.height,
+        });
+    }
+    true
+}
+
+unsafe fn input_boot_registry_begin() -> usize {
+    unsafe { crate::driver::registry::begin_logged(b"PS2", 3, 1, 0).unwrap_or(usize::MAX) }
 }

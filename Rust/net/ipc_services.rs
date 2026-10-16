@@ -1,7 +1,7 @@
 //! Original NIPC network service coordination and text/binary replies.
 //! Request scratch belongs to this activation; native metadata admission ends
 //! before TCP, IPC, R4D/R4P, console or filesystem calls. Wire codecs never read
-//! Rust padding. The temporary registration peer invokes the old Zig ABI only.
+//! Rust padding. Queue admission retains typed resident native handlers.
 use super::{cleanup, ipc_net as net, ipc_state as state, ipc_types::*, timing};
 use crate::{
     boot::log,
@@ -380,13 +380,11 @@ fn drain_service_queues() {
         while unsafe { ipc::recv(id, scratch.as_mut_ptr(), scratch.len()) } > 0 {}
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_net_ipc_register(id: u32);
-}
+
 fn init() {
     for id in 2..=5 {
         unsafe {
-            r4os_zig_net_ipc_register(id);
+            net_ipc_register(id);
         }
     }
 }
@@ -3018,4 +3016,22 @@ fn write_tcp_handle_usage(w: &mut Writer<'_>) {
     w.num(state::count());
     w.text(b"/".as_slice());
     w.num(TCP_SERVICE_HANDLES);
+}
+
+unsafe fn net_ipc_register(id: u32) {
+    let name = service_name(id);
+    unsafe {
+        crate::service::ipc::register(
+            id,
+            Bytes {
+                data: name.as_ptr(),
+                len: name.len(),
+            },
+            Some(native_handler),
+        );
+    }
+}
+
+unsafe fn native_handler(id: u32, data: Bytes, output: *mut u8, capacity: usize) -> i32 {
+    unsafe { r4os_rust_net_ipc_handle(id, data.data, data.len, output, capacity) }
 }

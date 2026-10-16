@@ -7,7 +7,7 @@ use super::{
         task_types::{Bytes, HeldLockRecord, State, Task, WaitResult},
     },
 };
-use crate::{arch::runtime, build_bridge::config, platform::timer, sched::scheduler};
+use crate::{arch::runtime, build_config::config, platform::timer, sched::scheduler};
 use core::{ffi::c_void, ptr};
 const NO_RANK: u8 = 255;
 fn current() -> *mut Task {

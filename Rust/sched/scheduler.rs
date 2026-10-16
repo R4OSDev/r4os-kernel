@@ -4,7 +4,7 @@ pub use super::scheduler_types::{CpuPreemptionStats, Stats, StructureStats};
 use super::task_context;
 use crate::{
     arch::{fpu, lapic, percpu, pit, runtime, smp_policy::MAX_CPUS},
-    build_bridge::config,
+    build_config::config,
     memory::owner,
     platform::timer,
 };
@@ -260,9 +260,9 @@ impl ExternalIrqFpuGuard {
     };
 }
 unsafe extern "C" {
-    #[cfg(not(r4os_owner_fixture))]
+
     fn r4os_context_switch(old_rsp: *mut u64, new_rsp: u64);
-    fn r4os_zig_scheduler_log(event: u8, task: Task, a: u64, b: u64);
+
 }
 // Keep scalar native projections visible to the caller; a single field
 // access must not materialize the complete temporary TaskView.
@@ -283,15 +283,9 @@ fn task_query(operation: u8, a: u64) -> Task {
     ptr::with_exposed_provenance_mut(query(operation, ptr::null_mut(), a) as usize)
 }
 fn log(event: u8, task: Task, a: u64, b: u64) {
-    unsafe { r4os_zig_scheduler_log(event, task, a, b) }
+    unsafe { scheduler_log(event, task, a, b) }
 }
 unsafe fn switch_context(outgoing: *mut u64, incoming: u64) {
-    #[cfg(r4os_owner_fixture)]
-    {
-        let _ = (outgoing, incoming);
-        panic!("Physical context switch requires the kernel guest");
-    }
-    #[cfg(not(r4os_owner_fixture))]
     unsafe {
         r4os_context_switch(outgoing, incoming);
     }
@@ -821,7 +815,7 @@ pub fn preempt_pending(preemptible: bool) -> bool {
     });
     true
 }
-fn safe_reschedule() -> bool {
+pub(crate) fn safe_reschedule() -> bool {
     change(|s| s.safe_reschedule_point_count = s.safe_reschedule_point_count.wrapping_add(1));
     if !enabled() {
         return false;
@@ -880,7 +874,7 @@ fn has_other_ready() -> bool {
     runtime::restore_runtime(flags);
     ready
 }
-fn exit_current(retire: bool) -> ! {
+pub(crate) fn exit_current(retire: bool) -> ! {
     let flags = runtime::save_runtime();
     preempt_disable();
     let task = current();
@@ -1432,4 +1426,136 @@ pub fn wakeup_checkpoint() -> u64 {
     let value = read(|s| s.wakeup_reschedule_request_count);
     runtime::restore_runtime(flags);
     value
+}
+
+unsafe fn scheduler_log(event: u8, task: Task, a: u64, b: u64) {
+    use crate::boot::log_route as l;
+    match event {
+        0 => {
+            l::puts(b"[TIMER] deadline_queue=ordered idle=");
+            l::puts(if a != 0 {
+                b"one-shot"
+            } else {
+                b"periodic-fallback"
+            });
+            l::puts(b" backend=");
+            l::puts(crate::platform::timer::backend_name());
+            l::puts(b"\r\n");
+        }
+        1 => {
+            l::puts(b"[SMP] productive cpu=");
+            l::dec(a);
+            l::puts(b" task=");
+            let t = unsafe {
+                (*task.cast::<crate::sched::task::task_types::Task>())
+                    .core
+                    .get()
+            };
+            let name = unsafe { core::ptr::addr_of!((*t).name).read() };
+            l::puts(unsafe { core::slice::from_raw_parts(name.pointer, name.len) });
+            l::puts(b" class=r4x\r\n");
+        }
+        2 => {
+            let t = unsafe {
+                (*task.cast::<crate::sched::task::task_types::Task>())
+                    .core
+                    .get()
+            };
+            l::puts(b"[SMP] switch boundary violation cpu=");
+            l::dec(a);
+            l::puts(b" task=");
+            l::dec(u64::from(unsafe { core::ptr::addr_of!((*t).id).read() }));
+            l::puts(b"/");
+            let name = unsafe { core::ptr::addr_of!((*t).name).read() };
+            l::puts(unsafe { core::slice::from_raw_parts(name.pointer, name.len) });
+            l::puts(b" depth=");
+            l::dec(b);
+            l::puts(b" state=");
+            l::puts(
+                match unsafe { core::ptr::addr_of!((*t).state).read() } as u8 {
+                    0 => b"unused",
+                    1 => b"ready",
+                    2 => b"running",
+                    3 => b"blocked",
+                    4 => b"dead",
+                    _ => unreachable!(),
+                },
+            );
+            l::puts(b"\r\n");
+        }
+        3 => {
+            let t = unsafe {
+                (*task.cast::<crate::sched::task::task_types::Task>())
+                    .core
+                    .get()
+            };
+            l::puts(b"TASK EXIT INVARIANT: owned synchronization remains id=");
+            l::dec(u64::from(unsafe { core::ptr::addr_of!((*t).id).read() }));
+            l::puts(b" locks=");
+            l::dec(u64::from(unsafe {
+                core::ptr::addr_of!((*t).held_lock_count).read()
+            }));
+            l::puts(b" unwind=");
+            l::dec(u64::from(unsafe {
+                core::ptr::addr_of!((*t).unwind_guard_count).read()
+            }));
+            l::puts(b" objects=");
+            let held = unsafe { core::ptr::addr_of!((*t).held_locks).read() };
+            let mut wrote = false;
+            for h in held {
+                if !h.active {
+                    continue;
+                }
+                if wrote {
+                    l::puts(b",");
+                }
+                l::puts(unsafe { core::slice::from_raw_parts(h.name.pointer, h.name.len) });
+                l::puts(b"=");
+                l::hex(h.object_id, 16);
+                l::puts(b"@");
+                l::dec(u64::from(h.rank));
+                wrote = true;
+            }
+            if !wrote {
+                l::puts(b"none");
+            }
+            l::puts(b"\r\n");
+        }
+        4 => {
+            l::puts(b"TASK EXIT INVARIANT: transition rejected id=");
+            let t = unsafe {
+                (*task.cast::<crate::sched::task::task_types::Task>())
+                    .core
+                    .get()
+            };
+            l::dec(u64::from(unsafe { core::ptr::addr_of!((*t).id).read() }));
+            l::puts(b"\r\n");
+        }
+        5 => l::puts(b"IRQ FPU GUARD task identity changed inside handler\r\n"),
+        6 => l::puts(b"SCHEDPRIO FAIL busy-spawn\r\n"),
+        7 => {
+            let mut s = core::mem::MaybeUninit::uninit();
+            unsafe {
+                r4os_rust_scheduler_stats(s.as_mut_ptr());
+            }
+            let s = unsafe { s.assume_init() };
+            l::puts(if a != 0 {
+                b"SCHEDPRIO OK"
+            } else {
+                b"SCHEDPRIO FAIL"
+            });
+            l::puts(b" high_latency_max=");
+            l::dec(b);
+            l::puts(b" bar=3 picks_high=");
+            l::dec(s.priority_picks_high);
+            l::puts(b" picks_normal=");
+            l::dec(s.priority_picks_normal);
+            l::puts(b" rr_picks=");
+            l::dec(s.priority_rr_picks);
+            l::puts(b" selects=");
+            l::dec(s.priority_selects);
+            l::puts(b"\r\n");
+        }
+        _ => panic!("Invalid scheduler diagnostic"),
+    }
 }

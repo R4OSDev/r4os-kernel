@@ -1,28 +1,19 @@
-//! Boot ordering stays in the entry owner. Each not-yet-migrated subsystem
-//! is reached through a bounded private C call, never through Zig slices.
-use crate::build_bridge::config;
-
-unsafe extern "C" {
-    fn r4os_zig_boot_action(action: u32) -> bool;
-    fn r4os_zig_boot_step(phase: u8, progress: u8, text: *const u8, len: usize);
-    fn r4os_zig_boot_status(text: *const u8, len: usize);
-    fn r4os_zig_boot_require(ok: bool, phase: u8, text: *const u8, len: usize);
-    fn r4os_zig_runtime_start() -> !;
-}
+//! Linear BSP boot sequence. Every subsystem call binds its native owner;
+//! external modules retain the unchanged public C tables.
+use crate::build_config::config;
 
 fn action(id: u32) -> bool {
-    // SAFETY: the BSP owns this linear boot sequence; the private bridge
-    // dispatches only the exact named subsystem cuts described in main.zig.
-    unsafe { r4os_zig_boot_action(id) }
+    // SAFETY: the BSP owns the complete linear initialization sequence.
+    unsafe { boot_action(id) }
 }
 fn step(phase: u8, progress: u8, text: &[u8]) {
-    unsafe { r4os_zig_boot_step(phase, progress, text.as_ptr(), text.len()) }
+    unsafe { boot_step(phase, progress, text.as_ptr(), text.len()) }
 }
 fn status(text: &[u8]) {
-    unsafe { r4os_zig_boot_status(text.as_ptr(), text.len()) }
+    unsafe { boot_status(text.as_ptr(), text.len()) }
 }
 fn require(ok: bool, phase: u8, text: &[u8]) {
-    unsafe { r4os_zig_boot_require(ok, phase, text.as_ptr(), text.len()) }
+    unsafe { boot_require(ok, phase, text.as_ptr(), text.len()) }
 }
 fn require_test(ok: bool, text: &[u8]) {
     if !ok {
@@ -30,14 +21,13 @@ fn require_test(ok: bool, text: &[u8]) {
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn kmain() -> ! {
+pub fn start() -> ! {
     action(0); // version metadata
     unsafe { super::limine::keep_requests() };
     action(1); // crash/fatal/COM1, before memory or task initialization
     action(2); // resident BootInfo, boot display, non-visible log routing
     step(1, 4, b"Startbild");
-    action(3); // exact Rust/Zig build configuration and early fault probes
+    action(3); // selected Rust configuration and explicit early fault probes
     step(2, 9, b"CPU initialisieren");
     action(4);
     step(3, 13, b"Timer initialisieren");
@@ -114,5 +104,172 @@ pub extern "C" fn kmain() -> ! {
         action(36);
     }
     status(b"Runtime starten");
-    unsafe { r4os_zig_runtime_start() }
+    unsafe { runtime_start() }
+}
+
+unsafe fn runtime_start() -> ! {
+    unsafe { crate::boot::runtime::r4os_rust_runtime_boot_start() }
+}
+
+unsafe fn boot_step(phase: u8, progress: u8, text: *const u8, len: usize) {
+    super::fatal::r4os_rust_fatal_phase(phase);
+    crate::display::bootscreen::r4os_rust_boot_screen_phase(progress);
+    unsafe {
+        crate::display::bootscreen::set_status(text, len);
+    }
+}
+
+unsafe fn boot_status(text: *const u8, len: usize) {
+    unsafe {
+        crate::display::bootscreen::set_status(text, len);
+    }
+}
+
+unsafe fn boot_require(ok: bool, phase: u8, text: *const u8, len: usize) {
+    if !ok {
+        unsafe {
+            super::fatal::r4os_rust_fatal_pending(phase, text, len);
+        }
+    }
+    super::fatal::r4os_rust_fatal_phase(phase);
+}
+
+unsafe fn boot_action(action: u32) -> bool {
+    use crate::{
+        arch, display, driver, input, loader, memory, net, platform, sched, service, storage, usb,
+    };
+    match action {
+        0 => super::version::keep(),
+        1 => {
+            super::crash::r4os_rust_crash_reset();
+            super::fatal::r4os_rust_fatal_init();
+            super::fatal::r4os_rust_fatal_phase(1);
+            super::foundation::r4os_rust_com_debug_boot();
+        }
+        2 => {
+            {
+                super::info::r4os_rust_boot_info_init();
+            }
+            display::boot_display::init();
+            super::foundation::r4os_rust_boot_redirect();
+        }
+        3 => {
+            crate::build_config::r4os_rust_boot_probe();
+            if config::ENABLE_KERNEL_FATAL_TEST {
+                super::fatal::kernel(1, b"Kernel fatal crash test");
+            }
+            if config::ENABLE_CRASH_SCREEN_TEST {
+                super::probes::crash_renderer();
+            }
+        }
+        4 => super::foundation::r4os_rust_cpu_boot(),
+        5 => {
+            platform::timer_boot::r4os_rust_timer_boot_control(0);
+        }
+        6 => {
+            driver::registry::r4os_rust_driver_boot(0);
+        }
+        7 => {
+            input::boot::r4os_rust_input_boot_keyboard();
+            input::boot::r4os_rust_input_boot_mouse();
+            input::boot::r4os_rust_input_boot_complete();
+        }
+        8 => return super::foundation::r4os_rust_boot_intro(),
+        9 => return unsafe { memory::boot::r4os_rust_memory_core() },
+        10 => memory::boot_diagnostics::blocks_summary(),
+        11 => return unsafe { storage::boot::r4os_rust_storage_boot(0, core::ptr::null()) != 0 },
+        12 => unsafe {
+            loader::boot::r4os_rust_module_boot_init();
+        },
+        13 => return platform::boot::init(),
+        14 => return unsafe { usb::preload::r4os_rust_usb_preload_init() },
+        15 => unsafe {
+            service::boot::r4os_rust_service_boot_init();
+        },
+        16 => {
+            super::fatal::r4os_rust_fatal_phase(9);
+            let mut pci = core::mem::MaybeUninit::uninit();
+            if !unsafe { platform::boot::r4os_rust_platform_boot_pci(pci.as_mut_ptr()) } {
+                super::fatal::kernel(9, b"PCIe status missing after platform boot");
+            }
+        }
+        17 => {
+            let mut pci = core::mem::MaybeUninit::uninit();
+            let ready = unsafe { platform::boot::r4os_rust_platform_boot_pci(pci.as_mut_ptr()) };
+            assert!(ready, "Platform PCI status retained after validation");
+            let pci = unsafe { pci.assume_init() };
+            let counts = storage::boot::Counts {
+                xhci: pci.xhci_count,
+                ahci: pci.ahci_count,
+                nvme: pci.nvme_count,
+            };
+            return unsafe { storage::boot::r4os_rust_storage_boot(2, &counts) != 0 };
+        }
+        20 => return unsafe { loader::boot::r4os_rust_loader_boot_init() },
+        21 => return platform::irq_boot::init(),
+        22 => {
+            return unsafe {
+                crate::audio::boot::r4os_rust_audio_boot(0, 0, core::ptr::null_mut())
+            };
+        }
+        23 => return unsafe { net::boot::r4os_rust_network_boot_init() },
+        24 => return unsafe { usb::hid_boot::r4os_rust_usb_hid_boot_init() },
+        25 => return unsafe { super::runtime::r4os_rust_runtime_boot_init() },
+        26 => return driver::driver_policy::r4os_rust_driver_policy_init(),
+        27 => {
+            let quick = super::probes::smp_enabled();
+            if quick {
+                let mut memory = core::mem::MaybeUninit::uninit();
+                unsafe {
+                    memory::boot::r4os_rust_memory_snapshot(memory.as_mut_ptr());
+                }
+                let memory = unsafe { memory.assume_init() };
+                arch::smp_probe::run(memory.usable);
+                super::probes::nvme_interrupt();
+                if unsafe { net::tcp::r4os_rust_net_tcp_performance_contract_probe() } {
+                    super::log_route::puts(b"[TCPBURSTPROBE] result=OK write_bytes=4068 segments=3 catalog=48 delayed_ack_ms=40\r\n");
+                } else {
+                    super::log_route::puts(b"[TCPBURSTPROBE] result=FAILED\r\n");
+                    super::fatal::kernel(13, b"TCP burst probe failed");
+                }
+                super::log_route::puts(b"[QUICKPROBE] result=DONE\r\n");
+            }
+        }
+        28 => unsafe {
+            net::rx_runtime::r4os_rust_net_rx_runtime_start(&net::bindings::RX);
+        },
+        29 => {
+            net::dhcp_client::r4os_rust_dhcp_client_start();
+        }
+        30 => {
+            return !config::ENABLE_BOOT_SELFTESTS
+                || sched::sync_selftest::r4os_rust_sync_selftest();
+        }
+        31 => {
+            return !(config::ENABLE_BOOT_SELFTESTS || config::ENABLE_BLOCK_DISPATCH_SELFTEST)
+                || storage::block_probes::parallel_dispatch();
+        }
+        32 => unsafe {
+            usb::hid_boot::r4os_rust_usb_hid_boot_start();
+        },
+        33 => {
+            return !config::ENABLE_BOOT_SELFTESTS
+                || sched::scheduler::r4os_rust_scheduler_control(16, 0, 0) != 0;
+        }
+        34 => super::log_route::puts(if config::ENABLE_BOOT_SELFTESTS {
+            b"BOOTSELFTEST OK heap=1 page_tables=1 sync=1 priority=1\r\n"
+        } else {
+            b"BOOTSELFTEST OFF heap=0 page_tables=0 sync=0 priority=0\r\n"
+        }),
+        35 => {
+            sched::task_probe::r4os_rust_task_registry_selftest();
+        }
+        36 => {
+            if config::ENABLE_STACK_GUARD_TEST {
+                super::probes::stack_guard_task();
+            }
+        }
+        _ => super::fatal::kernel(1, b"Invalid private boot cut"),
+    }
+    true
 }

@@ -44,7 +44,7 @@ static CHANGE: Resident<Option<Change>> = Resident(UnsafeCell::new(None));
 static EXECUTION: Resident<crate::sched::sync_types::UnwindGuard> = Resident(UnsafeCell::new(
     ownership::execution(b"additional-native-mode"),
 ));
-unsafe extern "C" {}
+
 fn execution() -> Result<ownership::RecursiveExecution, Error> {
     unsafe { ownership::RecursiveExecution::acquire(EXECUTION.0.get()) }
 }

@@ -1,5 +1,5 @@
 //! Fixed private service records; original fixtures lend the same layouts.
-use crate::build_bridge::config;
+use crate::build_config::config;
 use crate::sched::sync_types::{Mutex, Semaphore, Text, WaitQueue};
 pub const MAX_SERVICES: usize = 16;
 pub const MAX_ENDPOINTS: usize = MAX_SERVICES;

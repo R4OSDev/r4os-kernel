@@ -109,12 +109,7 @@ unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new(Status::EMPTY));
 static FLAGS: AtomicU32 = AtomicU32::new(0);
 static NEXT_RUNTIME_TARGET: AtomicU32 = AtomicU32::new(1);
-unsafe extern "C" {
-    fn r4os_zig_ioapic_inputs(output: *mut Input);
-    fn r4os_zig_ioapic_cpu_mask() -> u64;
-    fn r4os_zig_ioapic_cpu_id(index: u32, output: *mut u32) -> bool;
-    fn r4os_zig_ioapic_log(event: u8, status: *const Status);
-}
+
 fn state() -> Status {
     unsafe { *STATE.0.get() }
 }
@@ -125,12 +120,12 @@ fn publish(value: Status) {
 fn inputs() -> Input {
     let mut value = core::mem::MaybeUninit::uninit();
     unsafe {
-        r4os_zig_ioapic_inputs(value.as_mut_ptr());
+        ioapic_inputs(value.as_mut_ptr());
         value.assume_init()
     }
 }
 fn log(event: u8, value: Status) {
-    unsafe { r4os_zig_ioapic_log(event, &value) };
+    unsafe { ioapic_log(event, &value) };
 }
 fn read_reg(value: Status, register: u8) -> u32 {
     let selector = core::ptr::with_exposed_provenance_mut::<u32>(value.virt_base as usize);
@@ -227,7 +222,7 @@ fn refresh(mut value: Status, index: u8) -> Status {
 }
 fn choose_target() -> u8 {
     let fallback = inputs().bsp_id;
-    if unsafe { r4os_zig_ioapic_cpu_mask() }.count_ones() <= 1 {
+    if unsafe { ioapic_cpu_mask() }.count_ones() <= 1 {
         return fallback;
     }
     for _ in 0..MAX_CPUS {
@@ -236,7 +231,7 @@ fn choose_target() -> u8 {
             continue;
         }
         let mut apic_id = 0;
-        if unsafe { r4os_zig_ioapic_cpu_id(index, &mut apic_id) } && apic_id <= 0xff {
+        if unsafe { ioapic_cpu_id(index, &mut apic_id) } && apic_id <= 0xff {
             return apic_id as u8;
         }
     }
@@ -412,3 +407,133 @@ const _: () = {
     assert!(core::mem::size_of::<Status>() == 144);
     assert!(core::mem::offset_of!(Status, routes) == 80);
 };
+
+unsafe fn ioapic_cpu_mask() -> u64 {
+    crate::arch::percpu::r4os_rust_percpu_control(14, 0, 0, 0)
+}
+
+unsafe fn ioapic_cpu_id(index: u32, output: *mut u32) -> bool {
+    if crate::arch::percpu::r4os_rust_percpu_control(13, index, 0, 0) == 0 {
+        return false;
+    }
+    let id = crate::arch::percpu::r4os_rust_percpu_control(8, index, 0, 0);
+    if id == u64::MAX {
+        return false;
+    }
+    unsafe {
+        output.write(u32::try_from(id).unwrap());
+    }
+    true
+}
+
+unsafe fn ioapic_log(event: u8, status: *const Status) {
+    use crate::boot::log::{
+        r4os_rust_bootlog_dec as dec, r4os_rust_bootlog_hex as hex, text as puts,
+    };
+    let s = unsafe { status.read() };
+
+    match event {
+        0 => {
+            puts(b"[IOAPIC] ");
+            puts(if s.flags & AVAILABLE != 0 {
+                b"available"
+            } else {
+                b"missing"
+            });
+            puts(b" mapped=");
+            puts(if s.mapped() { b"yes" } else { b"no" });
+            puts(b" routing=");
+            puts(if s.flags & ROUTING != 0 {
+                b"active"
+            } else {
+                b"off"
+            });
+            puts(b" id=");
+            dec(u64::from(s.reg_id));
+            puts(b"/");
+            dec(u64::from(s.madt_id));
+            puts(b" ver=0x");
+            hex(u64::from(s.version), 2);
+            puts(b" redirs=");
+            dec(if s.mapped() {
+                u64::from(s.max_redirection_entry) + 1
+            } else {
+                0
+            });
+            puts(b" gsi_base=");
+            dec(u64::from(s.gsi_base));
+            puts(b" route_irq0_gsi=");
+            dec(u64::from(s.routes[0].gsi));
+            puts(b" route_irq1_gsi=");
+            dec(u64::from(s.routes[1].gsi));
+            puts(b" route_irq12_gsi=");
+            dec(u64::from(s.routes[3].gsi));
+            puts(b" reason=");
+            puts(match s.reason {
+                0 => b"not initialized",
+                1 => b"MADT has no IOAPIC",
+                2 => b"IOAPIC MMIO mapping failed",
+                3 => b"MMIO mapped, redirection table visible, routing unchanged",
+                4 => b"legacy IRQ0/1/12 routed through IOAPIC",
+                5 => b"IOAPIC routing incomplete, PIC fallback required",
+                _ => unreachable!(),
+            });
+            puts(b"\r\n");
+        }
+        1 => {
+            puts(b"[IOAPIC] routing=");
+            puts(if s.flags & ROUTING != 0 {
+                b"active"
+            } else {
+                b"incomplete"
+            });
+            puts(b" programmed=");
+            dec(u64::from(s.programmed_routes));
+            puts(b" irq0=");
+            dec(u64::from(s.routes[0].gsi));
+            puts(b" irq1=");
+            dec(u64::from(s.routes[1].gsi));
+            puts(b" irq12=");
+            dec(u64::from(s.routes[3].gsi));
+            puts(b"\r\n");
+        }
+        2 => puts(b"[IOAPIC][WARN] legacy route activation skipped, IOAPIC not mapped\r\n"),
+        3 => puts(b"[IOAPIC][WARN] legacy route activation skipped, route out of range\r\n"),
+        _ => unreachable!(),
+    }
+}
+
+unsafe fn ioapic_inputs(output: *mut Input) {
+    let mut info = core::mem::MaybeUninit::uninit();
+    let mut local = core::mem::MaybeUninit::uninit();
+    unsafe {
+        crate::platform::acpi::r4os_rust_acpi_info(info.as_mut_ptr());
+        super::lapic::r4os_rust_lapic_status(local.as_mut_ptr());
+    }
+    let info = unsafe { info.assume_init() };
+    let local = unsafe { local.assume_init() };
+    let mut value = Input {
+        phys_base: info.madt_first_ioapic_address,
+        gsi_base: info.madt_first_ioapic_gsi_base,
+        ioapic_count: info.madt_ioapic_count,
+        iso_count: info.madt_iso_count,
+        madt_id: info.madt_first_ioapic_id,
+        bsp_id: local.id,
+        reserved: [0; 2],
+        isos: [Iso::default(); 16],
+    };
+    for (destination, source) in value
+        .isos
+        .iter_mut()
+        .zip(info.madt_isos.iter())
+        .take((info.madt_iso_count as usize).min(16))
+    {
+        *destination = Iso {
+            gsi: source.gsi,
+            flags: source.flags,
+            bus: source.bus,
+            source: source.source,
+        };
+    }
+    unsafe { output.write(value) };
+}

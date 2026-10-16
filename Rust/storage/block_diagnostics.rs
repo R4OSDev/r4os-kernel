@@ -26,11 +26,7 @@ pub(crate) struct DeviceSnapshot {
     pub controller: [u8; 32],
     pub stats: crate::storage::block_accounting::Stats,
 }
-unsafe extern "C" {
-    // Temporary layout-only projection of the resident Zig Device aggregate.
-    // No callback, I/O, allocation or wait; admission remains in this owner.
-    fn r4os_zig_block_diagnostic_snapshot(device: *mut c_void, out: *mut DeviceSnapshot);
-}
+
 pub(crate) fn device_snapshot(index: usize) -> Option<DeviceSnapshot> {
     let _owner = Guard::acquire(1);
     let mut slot = MaybeUninit::uninit();
@@ -40,34 +36,29 @@ pub(crate) fn device_snapshot(index: usize) -> Option<DeviceSnapshot> {
         }
         let slot = slot.assume_init();
         let mut out = MaybeUninit::uninit();
-        r4os_zig_block_diagnostic_snapshot(slot.device, out.as_mut_ptr());
+        crate::storage::block_device::diagnostic(slot.device, out.as_mut_ptr());
         Some(out.assume_init())
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_block_text(channel: u8, text: *const u8, len: usize);
-    fn r4os_zig_block_decimal(channel: u8, value: u64);
-    fn r4os_zig_block_line(channel: u8);
-    fn r4os_zig_block_incident_begin() -> u64;
-}
+
 fn put(channel: u8, bytes: &[u8]) {
     unsafe {
-        r4os_zig_block_text(channel, bytes.as_ptr(), bytes.len());
+        block_text(channel, bytes.as_ptr(), bytes.len());
     }
 }
 fn raw(channel: u8, text: Text) {
     unsafe {
-        r4os_zig_block_text(channel, text.pointer, text.len);
+        block_text(channel, text.pointer, text.len);
     }
 }
 fn number(channel: u8, value: u64) {
     unsafe {
-        r4os_zig_block_decimal(channel, value);
+        block_decimal(channel, value);
     }
 }
 fn line(channel: u8) {
     unsafe {
-        r4os_zig_block_line(channel);
+        block_line(channel);
     }
 }
 fn label(category: u8, value: u8) -> &'static [u8] {
@@ -143,7 +134,7 @@ pub unsafe extern "C" fn r4os_rust_block_label(category: u8, value: u8, out: *mu
 unsafe fn incident(token: *mut u64) {
     if unsafe { token.read() } == 0 {
         unsafe {
-            token.write(r4os_zig_block_incident_begin());
+            token.write(crate::display::diag_screen::begin_resolvable());
         }
     }
 }
@@ -459,3 +450,27 @@ const _: () = {
     assert!(core::mem::offset_of!(DeviceSnapshot, controller) == 112);
     assert!(core::mem::offset_of!(DeviceSnapshot, stats) == 144);
 };
+
+unsafe fn block_decimal(channel: u8, value: u64) {
+    if channel == 1 {
+        crate::display::diag_screen::number(value, false)
+    } else {
+        crate::boot::log_route::dec(value)
+    }
+}
+
+unsafe fn block_text(channel: u8, text: *const u8, len: usize) {
+    if channel == 1 {
+        unsafe { crate::display::diag_screen::write(text, len) }
+    } else {
+        unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
+    }
+}
+
+unsafe fn block_line(channel: u8) {
+    if channel == 1 {
+        crate::display::diag_screen::end_line()
+    } else {
+        crate::boot::log_route::puts(b"\r\n")
+    }
+}

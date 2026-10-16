@@ -104,14 +104,7 @@ impl Section {
 struct Resolved {
     address: u64,
 }
-unsafe extern "C" {
-    fn r4os_zig_program_image_read(
-        source: *const c_void,
-        offset: usize,
-        out: *mut u8,
-        len: usize,
-    ) -> bool;
-}
+
 fn span(v: &[u8]) -> Bytes {
     Bytes {
         data: v.as_ptr(),
@@ -296,7 +289,7 @@ fn payload(r: &Request, sections: &[Section], offsets: &[usize], image: Image) -
             return false;
         }
         if !unsafe {
-            r4os_zig_program_image_read(
+            program_image_read(
                 r.source,
                 section.file_off as usize,
                 image.code.add(off),
@@ -655,3 +648,24 @@ const _: () = {
     assert!(core::mem::size_of::<Request>() == 96);
     assert!(core::mem::offset_of!(Request, file_size) == 80);
 };
+
+unsafe fn program_image_read(
+    source: *const c_void,
+    offset: usize,
+    out: *mut u8,
+    len: usize,
+) -> bool {
+    unsafe {
+        crate::loader::file::r4os_rust_module_file_exact(
+            source.cast(),
+            offset,
+            out,
+            len,
+            crate::fs::vfs_types::Bytes {
+                data: b"r4x-section-payload".as_ptr(),
+                len: 19,
+            },
+            true,
+        )
+    }
+}

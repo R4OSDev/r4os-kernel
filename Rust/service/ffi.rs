@@ -1,4 +1,4 @@
-//! Private fixed-layout transports for unchanged Zig kernel consumers. Every
+//! Private fixed-layout transports between native service consumers. Every
 //! mutable registry/endpoint owner and algorithm is native; these store none.
 use super::{
     endpoint,

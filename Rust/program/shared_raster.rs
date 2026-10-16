@@ -228,51 +228,14 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
 fn state() -> *mut State {
     STATE.0.get()
 }
-unsafe extern "C" {
-    // Stateless typed leaves into the separate remaining BO/platform owners.
-    fn r4os_zig_program_shared_mutex() -> *mut Mutex;
-    fn r4os_zig_program_shared_prepare(references: usize, leases: usize) -> Prepared;
-    fn r4os_zig_program_shared_create(
-        owner: Owner,
-        info: c::GuiSharedRasterCreateInfo,
-        xrgb: bool,
-        out: *mut Created,
-    ) -> bool;
-    fn r4os_zig_program_shared_import(
-        buffer: BackendHandle,
-        owner: Owner,
-        raster: bool,
-        read_only: bool,
-        out: *mut BackendHandle,
-    ) -> i32;
-    fn r4os_zig_program_shared_drop(
-        reference: BackendHandle,
-        owner: Owner,
-        raster: bool,
-        locked: bool,
-    ) -> i32;
-    fn r4os_zig_program_shared_map(
-        reference: BackendHandle,
-        write: bool,
-        bytes: usize,
-        out: *mut BackendHandle,
-    ) -> bool;
-    fn r4os_zig_program_shared_unmap(lease: BackendHandle) -> bool;
-    fn r4os_zig_program_shared_use(lease: BackendHandle, out: *mut BackendHandle) -> bool;
-    fn r4os_zig_program_shared_reference(
-        reference: BackendHandle,
-        owner: Owner,
-        out: *mut c::GfxBufferReference,
-    ) -> bool;
-    fn r4os_zig_program_shared_stopped(op: u8, owner: Owner);
-}
+
 pub(super) fn lock() {
-    while !unsafe { sync_locks::r4os_rust_sync_mutex(r4os_zig_program_shared_mutex(), 0, 0) } {
+    while !unsafe { sync_locks::r4os_rust_sync_mutex(program_shared_mutex(), 0, 0) } {
         core::hint::spin_loop();
     }
 }
 fn unlock() {
-    unsafe { sync_locks::r4os_rust_sync_mutex(r4os_zig_program_shared_mutex(), 2, 0) };
+    unsafe { sync_locks::r4os_rust_sync_mutex(program_shared_mutex(), 2, 0) };
 }
 struct Metadata;
 impl Metadata {
@@ -281,7 +244,7 @@ impl Metadata {
         Self
     }
     fn prepared(references: usize, leases: usize) -> Result<Self, Prepared> {
-        let result = unsafe { r4os_zig_program_shared_prepare(references, leases) };
+        let result = unsafe { program_shared_prepare(references, leases) };
         if result.status == 0 {
             Ok(Self)
         } else {
@@ -385,7 +348,7 @@ unsafe fn clear_resource(resource: *mut Resource) -> FreeSet {
 fn free_memories(set: FreeSet) {
     for allocation in set.memories.into_iter().flatten() {
         assert_eq!(
-            unsafe { r4os_zig_program_shared_drop(allocation.reference, NO_OWNER, true, false) },
+            unsafe { program_shared_drop(allocation.reference, NO_OWNER, true, false) },
             0
         );
     }
@@ -401,7 +364,7 @@ pub(super) fn graphics_owner(owner: Owner) -> GraphicsOwner {
 unsafe fn end_write(buffer: *mut Buffer) {
     unsafe {
         if (*buffer).write_lease.id != 0 {
-            assert!(r4os_zig_program_shared_unmap((*buffer).write_lease));
+            assert!(program_shared_unmap((*buffer).write_lease));
         }
         (*buffer).write_lease = NO_BACKEND;
         (*buffer).write_token = 0;
@@ -412,7 +375,7 @@ unsafe fn retain_frame(buffer: *mut Buffer) -> bool {
         if (*buffer).frame_refs == 0 {
             assert!(!(*buffer).memory.is_null());
             let mut lease = MaybeUninit::uninit();
-            if !r4os_zig_program_shared_map(
+            if !program_shared_map(
                 (*buffer).reference,
                 false,
                 (*buffer).bytes,
@@ -431,7 +394,7 @@ unsafe fn drop_frame(buffer: *mut Buffer) {
         assert!((*buffer).frame_refs != 0);
         (*buffer).frame_refs -= 1;
         if (*buffer).frame_refs == 0 {
-            assert!(r4os_zig_program_shared_unmap((*buffer).frame_lease));
+            assert!(program_shared_unmap((*buffer).frame_lease));
             (*buffer).frame_lease = NO_BACKEND;
         }
     }
@@ -498,7 +461,7 @@ unsafe fn allocate(owner: Owner, info: c::GuiSharedRasterCreateInfo) -> Option<C
             }
         }
         let mut created = MaybeUninit::uninit();
-        if !r4os_zig_program_shared_create(
+        if !program_shared_create(
             owner,
             info,
             info.format == c::gui_shared_raster_format_xrgb32,
@@ -508,24 +471,17 @@ unsafe fn allocate(owner: Owner, info: c::GuiSharedRasterCreateInfo) -> Option<C
         }
         let mut created = created.assume_init();
         let Ok(metadata) = Metadata::prepared(1, 0) else {
-            r4os_zig_program_shared_drop(created.reference, owner, false, false);
+            program_shared_drop(created.reference, owner, false, false);
             return None;
         };
         let mut bridge = MaybeUninit::uninit();
-        if r4os_zig_program_shared_import(
-            created.buffer,
-            NO_OWNER,
-            true,
-            false,
-            bridge.as_mut_ptr(),
-        ) != 0
-        {
+        if program_shared_import(created.buffer, NO_OWNER, true, false, bridge.as_mut_ptr()) != 0 {
             drop(metadata);
-            r4os_zig_program_shared_drop(created.reference, owner, false, false);
+            program_shared_drop(created.reference, owner, false, false);
             return None;
         }
         assert_eq!(
-            r4os_zig_program_shared_drop(created.reference, owner, false, true),
+            program_shared_drop(created.reference, owner, false, true),
             0
         );
         created.reference = bridge.assume_init();
@@ -679,7 +635,7 @@ pub(super) unsafe fn map_write(
                     continue;
                 }
                 let mut lease = MaybeUninit::uninit();
-                if !r4os_zig_program_shared_map(
+                if !program_shared_map(
                     (*buffer).reference,
                     true,
                     (*buffer).bytes,
@@ -1127,7 +1083,7 @@ pub(super) unsafe fn acquire(
             return c::gui_frame_error_unavailable;
         }
         let mut backing = MaybeUninit::uninit();
-        if !r4os_zig_program_shared_map(
+        if !program_shared_map(
             (*buffer).reference,
             false,
             (*buffer).bytes,
@@ -1220,7 +1176,7 @@ pub(super) unsafe fn release(consumer: Owner, lease: c::GuiSharedRasterLease) ->
             return c::gui_frame_error_stale;
         }
         (*buffer).lease_refs -= 1;
-        assert!(r4os_zig_program_shared_unmap((*found).backing_lease));
+        assert!(program_shared_unmap((*found).backing_lease));
         found.write(EMPTY_LEASE);
         let stats = stats_locked(owner, false);
         if !stats.is_null() {
@@ -1263,7 +1219,7 @@ pub(super) unsafe fn release_process(owner: Owner) {
                     (*stats).release_count = (*stats).release_count.wrapping_add(1);
                 }
             }
-            assert!(r4os_zig_program_shared_unmap((*record).backing_lease));
+            assert!(program_shared_unmap((*record).backing_lease));
             record.write(EMPTY_LEASE);
         }
         for index in 0..RESOURCES {
@@ -1285,15 +1241,15 @@ pub(super) unsafe fn release_process(owner: Owner) {
                 stats.write(EMPTY_STATS);
             }
         }
-        r4os_zig_program_shared_stopped(0, owner);
+        program_shared_stopped(0, owner);
         drop(metadata);
         for op in 1..=7 {
-            r4os_zig_program_shared_stopped(op, owner);
+            program_shared_stopped(op, owner);
         }
         for set in &sets[..count] {
             free_memories(set.assume_init());
         }
-        r4os_zig_program_shared_stopped(8, owner);
+        program_shared_stopped(8, owner);
     }
 }
 pub(super) fn snapshot(owner: Owner) -> Stats {
@@ -1389,11 +1345,11 @@ unsafe fn export_raster(
                 continue;
             }
             let mut buffer = MaybeUninit::uninit();
-            if !r4os_zig_program_shared_use(record.backing_lease, buffer.as_mut_ptr()) {
+            if !program_shared_use(record.backing_lease, buffer.as_mut_ptr()) {
                 return c::gfx_buffer_error_stale;
             }
             let mut reference = MaybeUninit::uninit();
-            let status = r4os_zig_program_shared_import(
+            let status = program_shared_import(
                 buffer.assume_init(),
                 consumer,
                 false,
@@ -1403,7 +1359,7 @@ unsafe fn export_raster(
             if status != 0 {
                 return status;
             }
-            assert!(r4os_zig_program_shared_reference(
+            assert!(program_shared_reference(
                 reference.assume_init(),
                 consumer,
                 value.as_mut_ptr()
@@ -1837,3 +1793,198 @@ const _: () = {
     assert!(mem::offset_of!(Stats, used) == 80);
     assert!(mem::offset_of!(Stats, reserved) == 81);
 };
+
+unsafe fn program_shared_mutex() -> *mut Mutex {
+    crate::gfx::buffers::r4os_rust_gfx_buffers_mutex()
+}
+
+use crate::gfx::{buffer_api, buffers as bo, layout as bo_layout, types as bo_types};
+fn bo_handle(v: BackendHandle) -> bo_types::Handle {
+    bo_types::Handle {
+        id: v.id,
+        generation: v.generation,
+    }
+}
+fn raster_handle(v: bo_types::Handle) -> BackendHandle {
+    BackendHandle {
+        id: v.id,
+        generation: v.generation,
+        reserved: 0,
+    }
+}
+fn bo_owner(v: Owner, raster: bool) -> bo_types::Owner {
+    if raster {
+        bo::RASTER_OWNER
+    } else {
+        let o = graphics_owner(v);
+        bo_types::Owner {
+            kind: o.kind,
+            id: o.id,
+            generation: o.generation,
+        }
+    }
+}
+
+unsafe fn program_shared_prepare(references: usize, leases: usize) -> Prepared {
+    match bo::lock_prepared(bo::Need {
+        references,
+        leases,
+        ..Default::default()
+    }) {
+        Ok(()) => Prepared {
+            status: 0,
+            out_of_memory: false,
+            reserved: [0; 3],
+        },
+        Err(e) => Prepared {
+            status: buffer_api::status(e),
+            out_of_memory: matches!(e, bo_types::Error::OutOfMemory),
+            reserved: [0; 3],
+        },
+    }
+}
+
+unsafe fn program_shared_create(
+    owner: Owner,
+    info: c::GuiSharedRasterCreateInfo,
+    xrgb: bool,
+    out: *mut Created,
+) -> bool {
+    let mut d = bo_layout::Descriptor {
+        bytes: info.data_bytes,
+        width: info.width,
+        height: info.height,
+        format: if xrgb {
+            bo_layout::XRGB8888
+        } else {
+            bo_layout::R8
+        },
+        plane_count: 1,
+        usage: 7,
+        ..bo_layout::Descriptor::EMPTY
+    };
+    d.planes[0] = bo_layout::Plane {
+        offset: u64::from(info.data_offset),
+        pitch: u64::from(info.stride_bytes),
+    };
+    let Ok(a) = bo::create(bo_owner(owner, false), d) else {
+        return false;
+    };
+    unsafe {
+        out.write(Created {
+            buffer: raster_handle(a.buffer),
+            reference: raster_handle(a.reference),
+            address: a.address,
+            bytes: a.bytes,
+        });
+    }
+    true
+}
+
+unsafe fn program_shared_import(
+    buffer: BackendHandle,
+    owner: Owner,
+    raster: bool,
+    read_only: bool,
+    out: *mut BackendHandle,
+) -> i32 {
+    match unsafe { bo::table().import_mode(bo_handle(buffer), bo_owner(owner, raster), read_only) }
+    {
+        Ok(r) => {
+            unsafe {
+                out.write(raster_handle(r));
+            }
+            0
+        }
+        Err(e) => buffer_api::status(e),
+    }
+}
+
+unsafe fn program_shared_drop(
+    reference: BackendHandle,
+    owner: Owner,
+    raster: bool,
+    locked: bool,
+) -> i32 {
+    let result = if locked {
+        unsafe { bo::table().drop_reference(bo_handle(reference), bo_owner(owner, raster)) }
+    } else {
+        bo::drop_reference(bo_handle(reference), bo_owner(owner, raster))
+    };
+    match result {
+        Ok(()) => 0,
+        Err(e) => buffer_api::status(e),
+    }
+}
+
+unsafe fn program_shared_map(
+    reference: BackendHandle,
+    write: bool,
+    bytes: usize,
+    out: *mut BackendHandle,
+) -> bool {
+    let Ok(v) = (unsafe {
+        bo::map_locked(
+            bo_handle(reference),
+            bo::RASTER_OWNER,
+            u32::from(write),
+            0,
+            bytes as u64,
+        )
+    }) else {
+        return false;
+    };
+    unsafe {
+        out.write(raster_handle(v.lease));
+    }
+    true
+}
+
+unsafe fn program_shared_unmap(lease: BackendHandle) -> bool {
+    unsafe { bo::unmap_cpu_locked(bo_handle(lease), bo::RASTER_OWNER).is_ok() }
+}
+
+unsafe fn program_shared_use(lease: BackendHandle, out: *mut BackendHandle) -> bool {
+    let Ok(v) = (unsafe { bo::read().use_info(bo_handle(lease), bo::RASTER_OWNER) }) else {
+        return false;
+    };
+    unsafe {
+        out.write(raster_handle(v.buffer));
+    }
+    true
+}
+
+unsafe fn program_shared_reference(
+    reference: BackendHandle,
+    owner: Owner,
+    out: *mut c::GfxBufferReference,
+) -> bool {
+    let Ok(v) =
+        (unsafe { buffer_api::reference_locked(bo_handle(reference), bo_owner(owner, false)) })
+    else {
+        return false;
+    };
+    unsafe {
+        out.write(v);
+    }
+    true
+}
+
+unsafe fn program_shared_stopped(op: u8, owner: Owner) {
+    let actor = bo_owner(owner, false);
+    match op {
+        0 => unsafe { bo::table().stopped_owner(actor) },
+        1 => crate::display::queue::stopped(actor),
+        2 => crate::gfx::allocations::stopped(actor),
+        3 => crate::gfx::virtual_runtime::stopped(actor),
+        4 => crate::display::cursor_work::stopped(actor),
+        5 => crate::display::outputs::refresh_stopped(actor),
+        6 => crate::display::outputs::power_stopped(actor),
+        7 => crate::program::r4desk_frame::stopped(crate::program::remote_frame_state::Owner {
+            id: owner.instance_id,
+            generation: owner.generation,
+        }),
+        8 => bo::collect(),
+        _ => panic!("Invalid raster stop notification"),
+    }
+}

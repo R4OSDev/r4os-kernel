@@ -8,7 +8,7 @@ use super::{
 };
 use crate::{
     boot::{foundation, log},
-    build_bridge::config,
+    build_config::config,
     platform::pci_inventory,
     sched::sync_types::Text,
     service::{ipc, ipc_types::ChannelInfo},
@@ -122,9 +122,6 @@ pub struct TcpPerformance {
     pub window_scale_negotiated: u64,
 }
 
-unsafe extern "C" {
-    fn r4os_zig_net_console_hex(value: u64, digits: usize);
-}
 fn dec(value: impl Into<u64>) {
     foundation::dec(value.into());
 }
@@ -630,11 +627,11 @@ fn log_rx() {
         if bs.offered_capabilities != 0 {
             foundation::puts(b" nic_caps=");
             unsafe {
-                r4os_zig_net_console_hex(bs.accepted_capabilities, 16);
+                net_console_hex(bs.accepted_capabilities, 16);
             };
             foundation::puts(b"/");
             unsafe {
-                r4os_zig_net_console_hex(bs.offered_capabilities, 16);
+                net_console_hex(bs.offered_capabilities, 16);
             };
             foundation::puts(b" nic_offload=");
             dec(bs.rx_offload_packets);
@@ -808,3 +805,7 @@ const _: () = {
     assert!(core::mem::offset_of!(TcpPerformance, mss_negotiated) == 184);
     assert!(core::mem::offset_of!(TcpPerformance, window_scale_negotiated) == 192);
 };
+
+unsafe fn net_console_hex(value: u64, digits: usize) {
+    crate::boot::log_route::hex(value, u8::try_from(digits).expect("hex width"));
+}

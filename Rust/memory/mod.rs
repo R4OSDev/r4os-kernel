@@ -26,3 +26,6 @@ pub mod vm_pager_types;
 pub mod vm_query;
 pub mod vm_ranges;
 pub mod vm_transactions;
+
+pub(crate) mod boot_diagnostics;
+pub(crate) mod heap_probes;

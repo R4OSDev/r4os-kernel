@@ -281,9 +281,7 @@ pub fn code(error: Error) -> i32 {
 }
 // Log transport remains with the existing kernel log sink. This thunk has no
 // state and preserves raw serial plus explicit boot-ring publication exactly.
-unsafe extern "C" {
-    fn r4os_zig_native_display_log(bytes: *const u8, len: usize);
-}
+
 struct Message<const N: usize> {
     bytes: [u8; N],
     len: usize,
@@ -296,7 +294,7 @@ impl<const N: usize> Message<N> {
         }
     }
     fn emit(&self) {
-        unsafe { r4os_zig_native_display_log(self.bytes.as_ptr(), self.len) }
+        unsafe { native_display_log(self.bytes.as_ptr(), self.len) }
     }
     fn text(&self) -> &str {
         core::str::from_utf8(&self.bytes[..self.len]).expect("ASCII diagnostic")
@@ -677,10 +675,10 @@ fn prepare_impl(
                     framebuffer: ptr::addr_of_mut!((*b).frame),
                 },
                 context: b.addr(),
-                commit: core_display::Commit::Native(commit),
-                restore: core_display::Restore::Native(restore),
-                begin_cpu: Some(core_display::BeginCpu::Native(begin_cpu)),
-                end_cpu: Some(core_display::EndCpu::Native(end_cpu)),
+                commit: core_display::Commit(commit),
+                restore: core_display::Restore(restore),
+                begin_cpu: Some(core_display::BeginCpu(begin_cpu)),
+                end_cpu: Some(core_display::EndCpu(end_cpu)),
             };
             (*b).generation = if reset_generation != 0 {
                 display::prepare_recovered_native(candidate, held_generation, reset_generation)?
@@ -2230,59 +2228,7 @@ pub unsafe extern "C" fn r4os_rust_display_native_driver(
 
 // Private projections for the existing console-restoration oracle only. No
 // fixture backup or state inspection API is compiled into the product image.
-#[cfg(r4os_owner_fixture)]
-static FIXTURE_SAVED: Resident<(Option<ResetRecord>, Option<ConsoleReceipt>)> =
-    Resident(UnsafeCell::new((None, None)));
-/// # Safety
-/// Original serial host fixture holds the display lifecycle and restores the
-/// saved native records before the case returns. No physical proof is created.
-#[cfg(r4os_owner_fixture)]
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_native_driver_fixture(op: u32, args: *const Args) -> i32 {
-    let args = unsafe { args.read() };
-    unsafe {
-        match op {
-            0 => {
-                *FIXTURE_SAVED.0.get() = (*RESET.0.get(), *CONSOLE.0.get());
-                0
-            }
-            1 => {
-                let saved = *FIXTURE_SAVED.0.get();
-                *RESET.0.get() = saved.0;
-                *CONSOLE.0.get() = saved.1;
-                0
-            }
-            2 => {
-                *RESET.0.get() = Some(ResetRecord {
-                    driver: args.owner,
-                    backend: a::GfxBackendBinding {
-                        adapter_id: args.value,
-                        device_generation: 1,
-                        reset_generation: 1,
-                        ..Default::default()
-                    },
-                    original_generation: args.generation - 1,
-                    generation: args.generation,
-                    retired: true,
-                    terminal_released: false,
-                    resumed_backend: None,
-                    reported_step: ResetStep::None,
-                    reported_result: 0,
-                });
-                *CONSOLE.0.get() = None;
-                0
-            }
-            3 => restore_after_reset(args.value, args.generation).map_or_else(|e| e as i32, |()| 0),
-            4 => i32::from(owns_restored_console(
-                args.owner,
-                args.generation,
-                args.value,
-            )),
-            5 => i32::from((*RESET.0.get()).is_none()),
-            _ => panic!("native driver fixture operation"),
-        }
-    }
-}
+
 const _: () = {
     assert!(size_of::<Args>() == 104);
     assert!(core::mem::offset_of!(Args, backend) == 24);
@@ -2295,3 +2241,10 @@ const _: () = {
     assert!(core::mem::offset_of!(Args, second) == 96);
     assert!(size_of::<cursor_work::Binding>() == 88);
 };
+
+unsafe fn native_display_log(bytes: *const u8, len: usize) {
+    unsafe {
+        crate::boot::log_route::r4os_rust_log_write(1, bytes, len);
+        crate::boot::log::r4os_rust_bootlog_write(bytes, len)
+    };
+}

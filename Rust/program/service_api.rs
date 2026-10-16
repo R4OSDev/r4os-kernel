@@ -61,72 +61,7 @@ pub struct Reservation {
     slot: usize,
     generation: u64,
 }
-unsafe extern "C" {
-    fn r4os_zig_program_service_entry(name: Bytes, out: *mut Entry) -> bool;
-    fn r4os_zig_program_service_index(retry: bool, index: u32, out: *mut Target) -> bool;
-    fn r4os_zig_program_service_target_entry(target: *const Target, out: *mut Entry) -> bool;
-    fn r4os_zig_program_service_target_note(target: *const Target) -> bool;
-    fn r4os_zig_program_service_target_mutate(
-        op: u8,
-        target: *const Target,
-        code: i32,
-        text: Bytes,
-    ) -> i32;
-    fn r4os_zig_program_service_name_mutate(op: u8, name: Bytes, code: i32, text: Bytes) -> i32;
-    fn r4os_zig_program_service_info(
-        op: u8,
-        name: Bytes,
-        target: *const Target,
-        out: *mut c::ServiceInfo,
-        ticks: u64,
-    ) -> i32;
-    fn r4os_zig_program_service_detail(
-        by_name: bool,
-        name: Bytes,
-        target: *const Target,
-        out: *mut c::ServiceDetail,
-        ticks: u64,
-    ) -> i32;
-    fn r4os_zig_program_service_begin(
-        name: Bytes,
-        identity: *mut Reservation,
-        entry: *mut Entry,
-    ) -> i32;
-    fn r4os_zig_program_service_complete(identity: *const Reservation, id: u32, ticks: u64)
-    -> bool;
-    fn r4os_zig_program_service_fail(identity: *const Reservation, code: i32, text: Bytes);
-    fn r4os_zig_program_service_cancel(name: Bytes, generation: u64);
-    fn r4os_zig_program_service_mode(name: Bytes, mode: u8) -> i32;
-    fn r4os_zig_program_service_install(
-        name: Bytes,
-        path: Bytes,
-        args: Bytes,
-        mode: u8,
-        description: Bytes,
-    ) -> i32;
-    fn r4os_zig_program_service_endpoint_register(
-        name: Bytes,
-        id: u32,
-        flags: u32,
-        out: *mut c::ServiceInfo,
-        ticks: u64,
-    ) -> i32;
-    fn r4os_zig_program_service_endpoint_control(op: u8, handle: u32, timeout: u64) -> i32;
-    fn r4os_zig_program_service_endpoint_recv(
-        handle: u32,
-        header: *mut c::ServiceMessageHeader,
-        output: *mut u8,
-        len: usize,
-    ) -> i32;
-    fn r4os_zig_program_service_endpoint_reply(
-        handle: u32,
-        id: u32,
-        status: i32,
-        data: Bytes,
-    ) -> i32;
-    fn r4os_zig_program_service_boot(op: u8, name: Bytes, stage: Bytes);
-    fn r4os_zig_program_entry_boot_active() -> bool;
-}
+
 fn span(s: &[u8]) -> Bytes {
     Bytes {
         data: s.as_ptr(),
@@ -136,7 +71,7 @@ fn span(s: &[u8]) -> Bytes {
 unsafe fn entry(name: &[u8]) -> Option<Entry> {
     unsafe {
         let mut out = MaybeUninit::uninit();
-        if r4os_zig_program_service_entry(span(name), out.as_mut_ptr()) {
+        if crate::program::service_api::native_service_entry(span(name), out.as_mut_ptr()) {
             Some(out.assume_init())
         } else {
             None
@@ -146,7 +81,7 @@ unsafe fn entry(name: &[u8]) -> Option<Entry> {
 unsafe fn target_entry(target: &Target) -> Option<Entry> {
     unsafe {
         let mut out = MaybeUninit::uninit();
-        if r4os_zig_program_service_target_entry(target, out.as_mut_ptr()) {
+        if program_service_target_entry(target, out.as_mut_ptr()) {
             Some(out.assume_init())
         } else {
             None
@@ -187,7 +122,7 @@ fn registry_result(result: i32) -> i32 {
 }
 unsafe fn boot_caller() -> bool {
     unsafe {
-        if !r4os_zig_program_entry_boot_active() {
+        if !crate::display::bootscreen::is_active() {
             return false;
         }
         let state = exit_state::state();
@@ -201,18 +136,20 @@ unsafe fn boot_caller() -> bool {
 unsafe fn report(op: u8, name: &[u8], stage: &[u8]) {
     unsafe {
         if boot_caller() {
-            r4os_zig_program_service_boot(op, span(name), span(stage));
+            program_service_boot(op, span(name), span(stage));
         }
     }
 }
 unsafe fn status(name: &[u8], out: *mut c::ServiceInfo) -> i32 {
-    unsafe { r4os_zig_program_service_info(0, span(name), ptr::null(), out, timer::tick_count()) }
+    unsafe { program_service_info(0, span(name), ptr::null(), out, timer::tick_count()) }
 }
 unsafe fn mutate(op: u8, name: &[u8], code: i32, text: &[u8]) -> i32 {
-    unsafe { r4os_zig_program_service_name_mutate(op, span(name), code, span(text)) }
+    unsafe {
+        crate::program::service_api::native_service_name_mutate(op, span(name), code, span(text))
+    }
 }
 unsafe fn mark_target(op: u8, target: &Target, code: i32, text: &[u8]) -> bool {
-    unsafe { r4os_zig_program_service_target_mutate(op, target, code, span(text)) == 0 }
+    unsafe { program_service_target_mutate(op, target, code, span(text)) == 0 }
 }
 unsafe fn old_exit(id: u32, stopping: bool) -> Option<i32> {
     unsafe {
@@ -279,7 +216,7 @@ unsafe fn refresh_target(target: &mut Target) -> bool {
         if entry.id == 0 {
             return true;
         }
-        if !r4os_zig_program_service_target_note(target) {
+        if !program_service_target_note(target) {
             return false;
         }
         let mut snapshot = MaybeUninit::uninit();
@@ -474,7 +411,7 @@ unsafe fn start(name: &[u8], out: *mut c::ServiceInfo) -> i32 {
         let _unwind = Unwind(task_context::enter());
         let mut identity = Reservation::default();
         let mut raw = MaybeUninit::<Entry>::uninit();
-        let reserved = r4os_zig_program_service_begin(span(name), &mut identity, raw.as_mut_ptr());
+        let reserved = program_service_begin(span(name), &mut identity, raw.as_mut_ptr());
         if reserved != 0 {
             status(name, out);
             report(3, name, b"");
@@ -485,7 +422,7 @@ unsafe fn start(name: &[u8], out: *mut c::ServiceInfo) -> i32 {
         report(1, name, b"Pfad pruefen");
         let mut path = [MaybeUninit::<u8>::uninit(); 1024];
         let Some(target) = resolve(&entry.path[..entry.path_len], path.as_mut_ptr().cast()) else {
-            r4os_zig_program_service_fail(&identity, -1, span(b"path invalid or not service R4X"));
+            program_service_fail(&identity, -1, span(b"path invalid or not service R4X"));
             status(name, out);
             report(3, name, b"");
             return c::service_api_result_bad_path;
@@ -502,12 +439,12 @@ unsafe fn start(name: &[u8], out: *mut c::ServiceInfo) -> i32 {
             &mut handle,
         );
         if raw_id <= 0 {
-            r4os_zig_program_service_fail(&identity, raw_id, span(b"spawn failed"));
+            program_service_fail(&identity, raw_id, span(b"spawn failed"));
             status(name, out);
             report(3, name, b"");
             return c::service_api_result_spawn_failed;
         }
-        if !r4os_zig_program_service_complete(&identity, handle.instance_id, timer::tick_count()) {
+        if !program_service_complete(&identity, handle.instance_id, timer::tick_count()) {
             launch_lifetime::cancel_published(handle);
             completions::r4os_rust_program_completion_access(4, handle, ptr::null_mut());
             status(name, out);
@@ -527,7 +464,7 @@ unsafe fn stop(name: &[u8], out: *mut c::ServiceInfo, timeout: u64) -> i32 {
         };
         let name = &entry.name[..entry.name_len];
         if entry.state == STARTING && entry.id == 0 {
-            r4os_zig_program_service_cancel(span(name), entry.start_generation);
+            program_service_cancel(span(name), entry.start_generation);
         }
         if matches!(entry.state, DISABLED | STOPPED | FAILED) || entry.id == 0 {
             return status(name, out);
@@ -587,7 +524,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_info(
         }
         for attempt in 0..3 {
             let mut target = MaybeUninit::uninit();
-            if !r4os_zig_program_service_index(attempt != 0, index, target.as_mut_ptr()) {
+            if !program_service_index(attempt != 0, index, target.as_mut_ptr()) {
                 report(2, b"", b"");
                 out.write(c::ServiceInfo::default());
                 return 0;
@@ -596,8 +533,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_info(
             if !refresh_target(&mut target) {
                 continue;
             }
-            let result =
-                r4os_zig_program_service_info(2, span(b""), &target, out, timer::tick_count());
+            let result = program_service_info(2, span(b""), &target, out, timer::tick_count());
             if result != BUSY {
                 return result;
             }
@@ -619,7 +555,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_detail(
         }
         for attempt in 0..3 {
             let mut target = MaybeUninit::uninit();
-            if !r4os_zig_program_service_index(attempt != 0, index, target.as_mut_ptr()) {
+            if !program_service_index(attempt != 0, index, target.as_mut_ptr()) {
                 report(2, b"", b"");
                 out.write(c::ServiceDetail::default());
                 return 0;
@@ -628,13 +564,8 @@ pub unsafe extern "C" fn r4os_rust_program_service_detail(
             if !refresh_target(&mut target) {
                 continue;
             }
-            let result = r4os_zig_program_service_detail(
-                false,
-                span(b""),
-                &target,
-                out,
-                timer::tick_count(),
-            );
+            let result =
+                program_service_detail(false, span(b""), &target, out, timer::tick_count());
             if result != BUSY {
                 return result;
             }
@@ -672,7 +603,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_named(
         match op {
             0 | 1 => {
                 refresh_name(name);
-                r4os_zig_program_service_info(op, span(name), ptr::null(), out, timer::tick_count())
+                program_service_info(op, span(name), ptr::null(), out, timer::tick_count())
             }
             2 => start(name, out),
             3 => {
@@ -716,7 +647,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_named(
                         return result;
                     }
                 }
-                let result = r4os_zig_program_service_mode(span(name), mode);
+                let result = program_service_mode(span(name), mode);
                 if result != 0 {
                     return registry_result(result);
                 }
@@ -757,7 +688,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_detail_name(
             return INVALID;
         };
         refresh_name(name);
-        r4os_zig_program_service_detail(true, span(name), ptr::null(), out, timer::tick_count())
+        program_service_detail(true, span(name), ptr::null(), out, timer::tick_count())
     }
 }
 /// # Safety
@@ -808,7 +739,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_install(
             report(3, name, b"");
             return c::service_api_result_bad_path;
         };
-        let result = r4os_zig_program_service_install(
+        let result = crate::program::service_api::native_service_install(
             span(name),
             span(full),
             span(args),
@@ -847,7 +778,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_register(
         let Some(name) = zcopy(name, &mut buffer) else {
             return INVALID;
         };
-        r4os_zig_program_service_endpoint_register(span(name), id, flags, out, timer::tick_count())
+        program_service_endpoint_register(span(name), id, flags, out, timer::tick_count())
     }
 }
 /// # Safety
@@ -858,7 +789,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_endpoint(
     handle: u32,
     timeout: u64,
 ) -> i32 {
-    unsafe { r4os_zig_program_service_endpoint_control(op, handle, timeout) }
+    unsafe { program_service_endpoint_control(op, handle, timeout) }
 }
 /// # Safety
 /// Resident header and byte span retain the original endpoint validation order.
@@ -873,7 +804,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_recv(
         if header.is_null() || capacity > 4096 || out.is_null() {
             return INVALID;
         }
-        r4os_zig_program_service_endpoint_recv(handle, header, out, capacity as usize)
+        program_service_endpoint_recv(handle, header, out, capacity as usize)
     }
 }
 /// # Safety
@@ -901,7 +832,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_reply(
                 len: len as usize,
             }
         };
-        let result = r4os_zig_program_service_endpoint_reply(handle, id, status, bytes);
+        let result = program_service_endpoint_reply(handle, id, status, bytes);
         scheduler::r4os_rust_scheduler_control(11, 0, 0);
         result
     }
@@ -952,3 +883,303 @@ const _: () = {
     assert!(mem::offset_of!(Reservation, slot) == 0);
     assert!(mem::offset_of!(Reservation, generation) == 8);
 };
+
+use crate::service::{ffi as sf, registry_types as st};
+fn empty_service_bytes() -> Bytes {
+    Bytes {
+        data: ptr::null(),
+        len: 0,
+    }
+}
+fn entry_value(v: st::Entry) -> Entry {
+    Entry {
+        id: v.instance_id,
+        state: v.state,
+        mode: v.start_mode,
+        reserved: 0,
+        start_generation: v.start_generation,
+        name_len: v.name_len,
+        path_len: v.path_len,
+        args_len: v.args_len,
+        name: v.name,
+        path: v.path,
+        args: v.args,
+    }
+}
+unsafe fn target_native(p: *const Target) -> st::ApiIndexTarget {
+    unsafe {
+        let t = &*p;
+        st::ApiIndexTarget {
+            registry_generation: t.registry_generation,
+            api_index: t.index,
+            service_slot: t.slot,
+            instance_id: t.id,
+            state: u8::try_from(t.state).unwrap(),
+            name: t.name,
+            name_len: t.name_len,
+        }
+    }
+}
+fn target_value(t: st::ApiIndexTarget) -> Target {
+    Target {
+        registry_generation: t.registry_generation,
+        slot: t.service_slot,
+        name_len: t.name_len,
+        index: t.api_index,
+        id: t.instance_id,
+        state: u32::from(t.state),
+        reserved: 0,
+        name: t.name,
+    }
+}
+unsafe fn reservation_native(p: *const Reservation) -> st::StartReservation {
+    unsafe {
+        st::StartReservation {
+            slot: (*p).slot,
+            generation: (*p).generation,
+            ..Default::default()
+        }
+    }
+}
+
+pub(crate) unsafe fn native_service_entry(name: Bytes, out: *mut Entry) -> bool {
+    let mut value = st::Entry::EMPTY;
+    if !unsafe { sf::r4os_rust_services_get(1, 0, name, ptr::null(), &mut value, ptr::null_mut()) }
+    {
+        return false;
+    }
+    unsafe {
+        out.write(entry_value(value));
+    }
+    true
+}
+
+pub(crate) unsafe fn native_service_install(
+    name: Bytes,
+    path: Bytes,
+    args: Bytes,
+    mode: u8,
+    description: Bytes,
+) -> i32 {
+    unsafe { sf::r4os_rust_services_register(name, path, args, mode, description) }
+}
+
+pub(crate) unsafe fn native_service_name_mutate(
+    op: u8,
+    name: Bytes,
+    code: i32,
+    text: Bytes,
+) -> i32 {
+    let operation = match op {
+        0 => 4,
+        1 => 5,
+        2 => 6,
+        3 => 7,
+        4 => 0,
+        _ => panic!("Invalid service name change"),
+    };
+    unsafe {
+        sf::r4os_rust_services_name(
+            operation,
+            name,
+            0,
+            0,
+            if matches!(op, 1 | 2) { code } else { 0 },
+            0,
+            if op == 2 { text } else { empty_service_bytes() },
+        )
+    }
+}
+
+unsafe fn program_service_index(retry: bool, index: u32, out: *mut Target) -> bool {
+    let mut t = st::ApiIndexTarget::EMPTY;
+    if !unsafe {
+        sf::r4os_rust_services_get(
+            if retry { 4 } else { 3 },
+            index as usize,
+            empty_service_bytes(),
+            ptr::null(),
+            ptr::null_mut(),
+            &mut t,
+        )
+    } {
+        return false;
+    }
+    unsafe {
+        out.write(target_value(t));
+    }
+    true
+}
+
+unsafe fn program_service_target_entry(target: *const Target, out: *mut Entry) -> bool {
+    let mut e = st::Entry::EMPTY;
+    let target = unsafe { target_native(target) };
+    if !unsafe {
+        sf::r4os_rust_services_get(
+            2,
+            0,
+            empty_service_bytes(),
+            &target,
+            &mut e,
+            ptr::null_mut(),
+        )
+    } {
+        return false;
+    }
+    unsafe {
+        out.write(entry_value(e));
+    }
+    true
+}
+
+unsafe fn program_service_target_note(target: *const Target) -> bool {
+    let target = unsafe { target_native(target) };
+    unsafe { sf::r4os_rust_services_target(3, &target, 0, empty_service_bytes()) != 0 }
+}
+
+unsafe fn program_service_target_mutate(
+    op: u8,
+    target: *const Target,
+    code: i32,
+    text: Bytes,
+) -> i32 {
+    assert!(op <= 2);
+    let t = unsafe { target_native(target) };
+    unsafe {
+        sf::r4os_rust_services_target(
+            op,
+            &t,
+            if op == 0 { 0 } else { code },
+            if op == 2 { text } else { empty_service_bytes() },
+        )
+    }
+}
+
+unsafe fn program_service_info(
+    op: u8,
+    name: Bytes,
+    target: *const Target,
+    out: *mut c::ServiceInfo,
+    ticks: u64,
+) -> i32 {
+    unsafe {
+        match op {
+            0 => sf::r4os_rust_services_info(2, 0, name, ptr::null(), out, ticks),
+            1 => sf::r4os_rust_services_info(3, 0, name, ptr::null(), out, ticks),
+            2 => {
+                let t = target_native(target);
+                sf::r4os_rust_services_info(1, 0, empty_service_bytes(), &t, out, ticks)
+            }
+            _ => panic!("Invalid service info query"),
+        }
+    }
+}
+
+unsafe fn program_service_detail(
+    by_name: bool,
+    name: Bytes,
+    target: *const Target,
+    out: *mut c::ServiceDetail,
+    ticks: u64,
+) -> i32 {
+    unsafe {
+        if by_name {
+            sf::r4os_rust_services_detail(2, 0, name, ptr::null(), out, ticks)
+        } else {
+            let t = target_native(target);
+            sf::r4os_rust_services_detail(1, 0, empty_service_bytes(), &t, out, ticks)
+        }
+    }
+}
+
+unsafe fn program_service_begin(name: Bytes, identity: *mut Reservation, entry: *mut Entry) -> i32 {
+    let mut r = st::StartReservation::default();
+    let result =
+        unsafe { sf::r4os_rust_services_start(0, name, &mut r, 0, 0, 0, empty_service_bytes()) };
+    if result == 0 {
+        unsafe {
+            identity.write(Reservation {
+                slot: r.slot,
+                generation: r.generation,
+            });
+            entry.write(entry_value(r.entry));
+        }
+    }
+    result
+}
+
+unsafe fn program_service_complete(identity: *const Reservation, id: u32, ticks: u64) -> bool {
+    let mut r = unsafe { reservation_native(identity) };
+    unsafe {
+        sf::r4os_rust_services_start(
+            1,
+            empty_service_bytes(),
+            &mut r,
+            id,
+            ticks,
+            0,
+            empty_service_bytes(),
+        ) != 0
+    }
+}
+
+unsafe fn program_service_fail(identity: *const Reservation, code: i32, text: Bytes) {
+    let mut r = unsafe { reservation_native(identity) };
+    unsafe {
+        sf::r4os_rust_services_start(2, empty_service_bytes(), &mut r, 0, 0, code, text);
+    }
+}
+
+unsafe fn program_service_cancel(name: Bytes, generation: u64) {
+    unsafe {
+        sf::r4os_rust_services_name(9, name, 0, 0, 0, generation, empty_service_bytes());
+    }
+}
+
+unsafe fn program_service_mode(name: Bytes, mode: u8) -> i32 {
+    unsafe { sf::r4os_rust_services_name(8, name, mode, 0, 0, 0, empty_service_bytes()) }
+}
+
+unsafe fn program_service_endpoint_register(
+    name: Bytes,
+    id: u32,
+    flags: u32,
+    out: *mut c::ServiceInfo,
+    ticks: u64,
+) -> i32 {
+    unsafe { sf::r4os_rust_services_endpoint_register(name, id, flags, out, ticks) }
+}
+
+unsafe fn program_service_endpoint_control(op: u8, handle: u32, timeout: u64) -> i32 {
+    assert!(op <= 3);
+    unsafe {
+        sf::r4os_rust_services_endpoint_control(op, handle, 0, if op == 3 { timeout } else { 0 })
+    }
+}
+
+unsafe fn program_service_endpoint_recv(
+    handle: u32,
+    header: *mut c::ServiceMessageHeader,
+    output: *mut u8,
+    len: usize,
+) -> i32 {
+    unsafe { sf::r4os_rust_services_recv(handle, 0, true, header, output, len) }
+}
+
+unsafe fn program_service_endpoint_reply(handle: u32, id: u32, status: i32, data: Bytes) -> i32 {
+    unsafe { sf::r4os_rust_services_reply(handle, id, status, data) }
+}
+
+unsafe fn program_service_boot(op: u8, name: Bytes, stage: Bytes) {
+    unsafe {
+        match op {
+            0 => crate::display::bootscreen::service(name.data, name.len),
+            1 => crate::display::bootscreen::service_stage(
+                name.data, name.len, stage.data, stage.len,
+            ),
+            2 => crate::display::bootscreen::set_detail(b"Dienstplan fertig".as_ptr(), 17),
+            3 => crate::display::bootscreen::service_error(name.data, name.len),
+            _ => panic!("Invalid service boot event"),
+        }
+    }
+}

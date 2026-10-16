@@ -2,7 +2,7 @@
 //! They bind the exact native program owners, without a callback registry or
 //! another copy of program state. Legacy entries retain their exact prefixes.
 use crate::{
-    build_bridge::config,
+    build_config::config,
     contract as c,
     program::{diagnostics, execution_inventory},
 };

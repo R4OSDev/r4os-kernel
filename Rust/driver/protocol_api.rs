@@ -27,9 +27,7 @@ static TABLE: Table = Table(UnsafeCell::new(contract::ProtocolApi {
     free,
     file_read,
 }));
-unsafe extern "C" {
-    fn r4os_zig_protocol_file_read(path: *const u8, out: *mut u8, len: u32) -> i32;
-}
+
 unsafe fn length(text: *const u8) -> usize {
     let mut len = 0;
     while len < 512 && unsafe { text.add(len).read() != 0 } {
@@ -99,7 +97,7 @@ unsafe extern "C" fn free(pointer: *mut c_void, bytes: u32) {
     unsafe { heap::r4os_rust_heap_free(pointer.cast(), bytes as usize) };
 }
 unsafe extern "C" fn file_read(path: *const u8, out: *mut u8, len: u32) -> i32 {
-    unsafe { r4os_zig_protocol_file_read(path, out, len) }
+    unsafe { protocol_file_read(path, out, len) }
 }
 /// # Safety
 /// R4P receives the canonical Contract table for its existing guarded module
@@ -120,3 +118,7 @@ const _: () = {
     assert!(mem::size_of::<contract::ProtocolApi>() == 88);
     assert!(mem::offset_of!(contract::ProtocolApi, file_read) == 80);
 };
+
+unsafe fn protocol_file_read(path: *const u8, out: *mut u8, len: u32) -> i32 {
+    unsafe { crate::program::system::io::r4os_rust_sys_file_read(path.cast(), out.cast(), len) }
+}

@@ -114,20 +114,10 @@ pub struct Io {
     pub name: t::Bytes,
     pub verbose: bool,
 }
-unsafe extern "C" {
-    fn r4os_zig_module_file_log(
-        kind: u8,
-        name: *const u8,
-        name_len: usize,
-        verbose: bool,
-        offset: usize,
-        wanted: usize,
-        got: usize,
-    );
-}
+
 fn report(kind: u8, name: t::Bytes, verbose: bool, offset: usize, wanted: usize, got: usize) {
     if verbose {
-        unsafe { r4os_zig_module_file_log(kind, name.data, name.len, true, offset, wanted, got) };
+        unsafe { module_file_log(kind, name.data, name.len, true, offset, wanted, got) };
     }
 }
 fn short_read(name: t::Bytes, verbose: bool, offset: usize, wanted: usize, got: usize) {
@@ -415,3 +405,53 @@ const _: () = {
     assert!(core::mem::size_of::<Io>() == 40);
     assert!(core::mem::size_of::<Output>() == 16);
 };
+
+unsafe fn module_file_log(
+    kind: u8,
+    name: *const u8,
+    name_len: usize,
+    verbose: bool,
+    offset: usize,
+    wanted: usize,
+    got: usize,
+) {
+    if !verbose {
+        return;
+    }
+    use crate::boot::log_route as l;
+    let name = if name_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(name, name_len) }
+    };
+    match kind {
+        0 | 1 => {
+            l::puts(b"[MODFILE] ");
+            l::puts(if kind == 0 { b"request" } else { b"read" });
+            l::puts(b" failed ");
+            l::puts(name)
+        }
+        2 => {
+            l::puts(b"[MODFILE] short read ");
+            l::puts(name);
+            l::puts(b" offset=");
+            l::dec(offset as u64);
+            l::puts(b" want=");
+            l::dec(wanted as u64);
+            l::puts(b" got=");
+            l::dec(got as u64)
+        }
+        3 => {
+            l::puts(b"[MODFILE] range failed ");
+            l::puts(name);
+            l::puts(b" offset=");
+            l::dec(offset as u64);
+            l::puts(b" len=");
+            l::dec(wanted as u64);
+            l::puts(b" file=");
+            l::dec(got as u64)
+        }
+        _ => unreachable!(),
+    }
+    l::puts(b"\r\n");
+}

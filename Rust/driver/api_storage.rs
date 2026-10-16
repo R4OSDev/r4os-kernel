@@ -30,13 +30,7 @@ struct Storage(UnsafeCell<[Record; 8]>);
 // these stable slots. Only copied records span I/O or foreign callbacks.
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new([Record::EMPTY; 8]));
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-pub struct Token {
-    pub index: usize,
-    pub generation: u64,
-    pub active: bool,
-}
+pub use crate::storage::block_execution::Retirement as Token;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Entry {
@@ -70,21 +64,7 @@ impl Drop for Callback {
         unsafe { admission::r4os_rust_driver_api_storage_leave(&self.0) }
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_block_find(name: *const u8, len: usize) -> bool;
-    fn r4os_zig_block_register(
-        name: *const u8,
-        len: usize,
-        owner: u32,
-        d: *const a::StorageBackend,
-        context: *mut c_void,
-    ) -> isize;
-    fn r4os_zig_block_unregister(index: usize) -> bool;
-    fn r4os_zig_block_recovery(index: usize, finish: bool, success: bool);
-    fn r4os_zig_block_prepare(index: usize, out: *mut Token) -> bool;
-    fn r4os_zig_block_token(token: *mut Token, commit: bool) -> bool;
-    fn r4os_zig_block_registration_log(name: *const u8, len: usize, index: usize, source: u32);
-}
+
 fn puts(text: &[u8]) {
     unsafe { log::r4os_rust_bootlog_write(text.as_ptr(), text.len()) }
 }
@@ -131,7 +111,7 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_register(
         return -1;
     }
     let input = unsafe { name(text) };
-    if unsafe { r4os_zig_block_find(input.as_ptr(), input.len()) } {
+    if unsafe { block_find(input.as_ptr(), input.len()) } {
         puts(b"[R4D][ERROR] storage backend duplicate name ");
         puts(input);
         puts(b"\r\n");
@@ -153,7 +133,7 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_register(
     unsafe { ptr::write(raw, r) };
     // Core registration receives stable name and callback context addresses.
     let index = unsafe {
-        r4os_zig_block_register(
+        block_register(
             ptr::addr_of!((*raw).name).cast(),
             r.name_len,
             r.owner,
@@ -167,9 +147,7 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_register(
         return -4;
     }
     unsafe { (*raw).block_index = index as usize };
-    unsafe {
-        r4os_zig_block_registration_log(r.name.as_ptr(), r.name_len, index as usize, (*d).source)
-    };
+    unsafe { block_registration_log(r.name.as_ptr(), r.name_len, index as usize, (*d).source) };
     i32::try_from(index).expect("Original bounded block index")
 }
 /// # Safety
@@ -180,7 +158,7 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_unregister(text: *const u8) ->
     let Some((i, r)) = (unsafe { find(text) }) else {
         return -1;
     };
-    if !unsafe { r4os_zig_block_unregister(r.block_index) } {
+    if !unsafe { block_unregister(r.block_index) } {
         return -2;
     }
     if let Some(shutdown) = unsafe { (*r.descriptor).shutdown } {
@@ -200,7 +178,7 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_recovery(
     let Some((_, r)) = (unsafe { find(text) }) else {
         return -1;
     };
-    unsafe { r4os_zig_block_recovery(r.block_index, finish, ok != 0) };
+    unsafe { block_recovery(r.block_index, finish, ok != 0) };
     0
 }
 /// # Safety
@@ -239,7 +217,7 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_prepare(owner: u32, plan: *mut
             continue;
         }
         let mut token = MaybeUninit::uninit();
-        if !unsafe { r4os_zig_block_prepare(r.block_index, token.as_mut_ptr()) } {
+        if !unsafe { block_prepare(r.block_index, token.as_mut_ptr()) } {
             unsafe { r4os_rust_driver_storage_cancel_plan(plan) };
             return false;
         }
@@ -262,7 +240,7 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_cancel_plan(plan: *mut Plan) {
         unsafe { (*plan).count -= 1 };
         let i = unsafe { (*plan).count };
         let t = unsafe { ptr::addr_of_mut!((*plan).entries[i].token) };
-        unsafe { r4os_zig_block_token(t, false) };
+        unsafe { block_token(t, false) };
     }
 }
 /// # Safety
@@ -280,7 +258,7 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_commit(plan: *mut Plan, out: *
         let r = record_at(index);
         let token = unsafe { ptr::addr_of_mut!((*plan).entries[i].token) };
         if !r.used {
-            unsafe { r4os_zig_block_token(token, false) };
+            unsafe { block_token(token, false) };
             result.remaining = result.remaining.saturating_add(1);
             continue;
         }
@@ -294,13 +272,13 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_commit(plan: *mut Plan, out: *
                 puts(b" code=");
                 log::r4os_rust_bootlog_dec(i64::from(code).unsigned_abs());
                 puts(b"\r\n");
-                unsafe { r4os_zig_block_token(token, false) };
+                unsafe { block_token(token, false) };
                 result.remaining = result.remaining.saturating_add(1);
                 continue;
             }
         }
-        if !unsafe { r4os_zig_block_token(token, true) } {
-            unsafe { r4os_zig_block_token(token, false) };
+        if !unsafe { block_token(token, true) } {
+            unsafe { block_token(token, false) };
             result.remaining = result.remaining.saturating_add(1);
             continue;
         }
@@ -407,5 +385,209 @@ pub unsafe extern "C" fn r4os_rust_driver_storage_control(
             return -1;
         };
         unsafe { f((*r.descriptor).context, handle, reason) }
+    }
+}
+
+unsafe fn block_unregister(index: usize) -> bool {
+    unsafe { crate::storage::block_execution::r4os_rust_block_unregister(index) }
+}
+
+unsafe fn block_find(name: *const u8, len: usize) -> bool {
+    (unsafe { crate::storage::block_registry::r4os_rust_block_registry_find(name, len) })
+        != usize::MAX
+}
+
+unsafe fn block_prepare(index: usize, out: *mut Token) -> bool {
+    unsafe { crate::storage::block_execution::r4os_rust_block_retirement_prepare(index, out) }
+}
+
+unsafe fn block_token(token: *mut Token, commit: bool) -> bool {
+    unsafe {
+        if commit {
+            crate::storage::block_execution::r4os_rust_block_retirement_commit(token)
+        } else {
+            crate::storage::block_execution::r4os_rust_block_retirement_cancel(token)
+        }
+    }
+}
+
+unsafe fn block_recovery(index: usize, finish: bool, success: bool) {
+    let _ = unsafe {
+        crate::storage::block_execution::r4os_rust_block_device_operation(
+            index,
+            if finish {
+                if success { 2 } else { 3 }
+            } else {
+                1
+            },
+            0,
+            0,
+            0,
+            0,
+        )
+    };
+}
+
+unsafe fn block_register(
+    name: *const u8,
+    len: usize,
+    owner: u32,
+    d: *const a::StorageBackend,
+    context: *mut c_void,
+) -> isize {
+    use crate::storage::{block_device as b, block_registry::Text};
+    let asynchronous = unsafe { validation::r4os_rust_driver_storage_submit(d) }.is_some();
+    let controller = unsafe { ptr::addr_of!((*d).controller).cast::<u8>() };
+    let mut controller_len = 0;
+    while controller_len < 32 && unsafe { controller.add(controller_len).read() } != 0 {
+        controller_len += 1
+    }
+    let mut config = b::Config::new(Text { data: name, len }, block_read);
+    unsafe {
+        config.driver = b::text(b"R4D");
+        let bus = ptr::addr_of!((*d).bus).read();
+        config.bus = if (1..=6).contains(&bus) { bus as u8 } else { 0 };
+        config.controller = if controller_len == 0 {
+            b::text(b"R4D")
+        } else {
+            Text {
+                data: controller,
+                len: controller_len,
+            }
+        };
+        config.sector_size = ptr::addr_of!((*d).sector_size).read();
+        config.sector_count = ptr::addr_of!((*d).sector_count).read();
+        config.max_sectors = ptr::addr_of!((*d).max_sectors_per_request).read();
+        config.queue_depth = if asynchronous {
+            ptr::addr_of!((*d).queue_depth).read()
+        } else {
+            1
+        };
+        config.timeout = ptr::addr_of!((*d).timeout_ticks).read();
+        let flags = ptr::addr_of!((*d).flags).read();
+        config.removable = flags & a::storage_backend_flag_removable != 0;
+        config.writable = flags & a::storage_backend_flag_writable != 0;
+        let source = ptr::addr_of!((*d).source).read();
+        config.source = match source {
+            1 => 1,
+            2 => 2,
+            _ => 0,
+        };
+        config.owner = owner;
+        config.context = context;
+        config.write = if ptr::addr_of!((*d).write).read().is_some() {
+            Some(block_write)
+        } else {
+            None
+        };
+        config.flush = if ptr::addr_of!((*d).flush).read().is_some() {
+            Some(block_flush)
+        } else {
+            None
+        };
+        config.submit = if asynchronous {
+            Some(block_submit)
+        } else {
+            None
+        };
+        config.cancel = if validation::r4os_rust_driver_storage_cancel(d).is_some() {
+            Some(block_cancel)
+        } else {
+            None
+        };
+        config.reset = if validation::r4os_rust_driver_storage_reset(d).is_some() {
+            Some(block_reset)
+        } else {
+            None
+        };
+    }
+    unsafe { b::register(config) }.map_or(-1, |index| isize::try_from(index).expect("block slot"))
+}
+
+unsafe extern "C" fn block_read(
+    ctx: *mut c_void,
+    lba: u64,
+    sectors: u16,
+    out: *mut u8,
+    len: usize,
+) -> bool {
+    unsafe {
+        r4os_rust_driver_storage_io(
+            ctx,
+            false,
+            lba,
+            sectors,
+            out,
+            u32::try_from(len).expect("block read bytes"),
+        )
+    }
+}
+unsafe extern "C" fn block_write(
+    ctx: *mut c_void,
+    lba: u64,
+    sectors: u16,
+    data: *const u8,
+    len: usize,
+) -> bool {
+    unsafe {
+        r4os_rust_driver_storage_io(
+            ctx,
+            true,
+            lba,
+            sectors,
+            data.cast_mut(),
+            u32::try_from(len).expect("block write bytes"),
+        )
+    }
+}
+unsafe extern "C" fn block_flush(ctx: *mut c_void) -> bool {
+    unsafe { r4os_rust_driver_storage_flush(ctx) }
+}
+unsafe extern "C" fn block_submit(
+    ctx: *mut c_void,
+    input: *const crate::storage::block_device::AsyncRequest,
+) -> i32 {
+    let r = unsafe { input.read() };
+    let buffer = match r.kind {
+        1 => r.buffer as u64,
+        2 => r.const_buffer as u64,
+        0 | 3 => 0,
+        _ => unreachable!(),
+    };
+    let public = a::StorageRequest {
+        version: a::storage_request_version,
+        size: core::mem::size_of::<a::StorageRequest>() as u32,
+        flags: 0,
+        handle: r.handle,
+        operation: r.kind.into(),
+        lba: r.lba,
+        sectors: r.sectors.into(),
+        buffer_bytes: u32::try_from(r.buffer_len).expect("block async bytes"),
+        buffer_addr: buffer,
+        complete: r.complete,
+    };
+    unsafe { r4os_rust_driver_storage_async(ctx, &public) }
+}
+unsafe extern "C" fn block_cancel(ctx: *mut c_void, handle: u64, reason: u32) -> i32 {
+    unsafe { r4os_rust_driver_storage_control(ctx, false, handle, reason) }
+}
+unsafe extern "C" fn block_reset(ctx: *mut c_void, reason: u32) -> i32 {
+    unsafe { r4os_rust_driver_storage_control(ctx, true, 0, reason) }
+}
+
+unsafe fn block_registration_log(name: *const u8, len: usize, index: usize, source: u32) {
+    use crate::boot::log as l;
+    unsafe {
+        l::text(b"[R4D] register storage backend ");
+        l::text(core::slice::from_raw_parts(name, len));
+        l::text(b" block=");
+        l::r4os_rust_bootlog_dec(index as u64);
+        l::text(b" source=");
+        l::text(match source {
+            1 => b"preload",
+            2 => b"disk",
+            _ => b"built-in",
+        });
+        l::text(b"\r\n");
     }
 }

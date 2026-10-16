@@ -71,45 +71,23 @@ impl Drop for Call {
     }
 }
 pub struct StateGuard {
-    #[cfg(not(r4os_owner_fixture))]
     _owner: crate::memory::owner::Guard,
 }
 impl Drop for StateGuard {
-    fn drop(&mut self) {
-        #[cfg(r4os_owner_fixture)]
-        unsafe {
-            r4os_owner_fixture_display_state(false)
-        };
-    }
+    fn drop(&mut self) {}
 }
 pub fn enter_state() -> StateGuard {
-    #[cfg(not(r4os_owner_fixture))]
     {
         StateGuard {
             _owner: crate::memory::owner::Guard::acquire(0),
         }
     }
-    #[cfg(r4os_owner_fixture)]
-    {
-        unsafe { r4os_owner_fixture_display_state(true) };
-        StateGuard {}
-    }
 }
 pub fn retain_call() -> Unwind {
-    #[cfg(not(r4os_owner_fixture))]
-    {
-        unsafe { crate::sched::task_context::enter() }
-    }
-    #[cfg(r4os_owner_fixture)]
-    {
-        Unwind::EMPTY
-    }
+    unsafe { crate::sched::task_context::enter() }
 }
 pub fn release_call(token: Unwind) {
-    #[cfg(not(r4os_owner_fixture))]
     let _ = unsafe { crate::sched::task_context::leave(token) };
-    #[cfg(r4os_owner_fixture)]
-    let _ = token;
 }
 /// # Safety
 /// The exact resident execution guard outlives admission and every callback.
@@ -151,25 +129,10 @@ pub unsafe extern "C" fn r4os_rust_display_execution(
 
 // Host transport exists only in the original-owner fixture archive. The
 // product always executes its original native runtime/program owners above.
-#[cfg(r4os_owner_fixture)]
-unsafe extern "C" {
-    fn r4os_owner_fixture_display_state(enter: bool);
-    fn r4os_owner_fixture_display_guard(
-        guard: *mut UnwindGuard,
-        operation: u8,
-        timeout: u64,
-    ) -> bool;
-}
+
 /// # Safety
 /// Exact resident guard outlives admission and all nested callbacks. Host
 /// fixtures substitute only OS mutex/thread admission, never display results.
 pub(super) unsafe fn raw_guard(guard: *mut UnwindGuard, operation: u8, timeout: u64) -> bool {
-    #[cfg(not(r4os_owner_fixture))]
-    {
-        unsafe { crate::sched::sync_locks::r4os_rust_sync_guard(guard, operation, timeout) }
-    }
-    #[cfg(r4os_owner_fixture)]
-    {
-        unsafe { r4os_owner_fixture_display_guard(guard, operation, timeout) }
-    }
+    unsafe { crate::sched::sync_locks::r4os_rust_sync_guard(guard, operation, timeout) }
 }

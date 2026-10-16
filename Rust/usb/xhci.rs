@@ -1,4 +1,4 @@
-//! Sole native controller assembly. Zig exposes fixed compatibility records
+//! Sole native controller assembly. Native callers use fixed copied records
 //! and stateless incident/console hooks; no legacy controller state remains.
 pub(super) use super::xhci_async::*;
 pub(super) use super::xhci_boot::*;

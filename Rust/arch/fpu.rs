@@ -82,15 +82,15 @@ unsafe extern "C" {
     fn r4os_xsetbv(index: u32, value: u64);
     fn r4os_fninit();
     fn r4os_init_simd(avx_enabled: u32, inherited: *mut u64);
-    #[cfg(not(r4os_owner_fixture))]
+
     fn r4os_fxsave(dest: *mut u8);
-    #[cfg(not(r4os_owner_fixture))]
+
     fn r4os_fxrstor(source: *const u8);
-    #[cfg(not(r4os_owner_fixture))]
+
     fn r4os_xsave(dest: *mut u8, mask: u64);
-    #[cfg(not(r4os_owner_fixture))]
+
     fn r4os_xrstor(source: *const u8, mask: u64);
-    fn r4os_zig_fpu_log(event: u8, status: *const Status, inherited: *const u64);
+
 }
 fn config() -> Status {
     unsafe { CONFIG.0.get().read() }
@@ -114,7 +114,7 @@ fn snapshot() -> Status {
 }
 fn log(event: u8, inherited: &[u64; 3]) {
     let value = snapshot();
-    unsafe { r4os_zig_fpu_log(event, &value, inherited.as_ptr()) };
+    unsafe { fpu_log(event, &value, inherited.as_ptr()) };
 }
 fn cpuid(leaf: u32, subleaf: u32) -> core::arch::x86_64::CpuidResult {
     core::arch::x86_64::__cpuid_count(leaf, subleaf)
@@ -154,14 +154,6 @@ fn detect_bytes(mask: u64) -> Option<u32> {
     Some(leaf.ebx)
 }
 fn save_raw(value: Status, output: *mut u8) {
-    #[cfg(r4os_owner_fixture)]
-    {
-        let _ = output;
-        if value.backend != 0 {
-            panic!("FPU save requires the kernel guest");
-        }
-    }
-    #[cfg(not(r4os_owner_fixture))]
     match value.backend {
         1 => unsafe { r4os_fxsave(output) },
         2 => unsafe { r4os_xsave(output, value.xcr0_mask) },
@@ -169,14 +161,6 @@ fn save_raw(value: Status, output: *mut u8) {
     }
 }
 fn restore_raw(value: Status, source: *const u8) {
-    #[cfg(r4os_owner_fixture)]
-    {
-        let _ = source;
-        if value.backend != 0 {
-            panic!("FPU restore requires the kernel guest");
-        }
-    }
-    #[cfg(not(r4os_owner_fixture))]
     match value.backend {
         1 => unsafe { r4os_fxrstor(source) },
         2 => unsafe { r4os_xrstor(source, value.xcr0_mask) },
@@ -348,3 +332,71 @@ const _: () = {
     assert!(core::mem::offset_of!(Status, cr0) == 32);
     assert!(core::mem::offset_of!(Status, task_state_bytes) == 72);
 };
+
+unsafe fn fpu_log(event: u8, status: *const Status, inherited: *const u64) {
+    use crate::boot::log::{
+        r4os_rust_bootlog_dec as dec, r4os_rust_bootlog_hex as hex, text as puts,
+    };
+    let s = unsafe { status.read() };
+
+    if event == 2 {
+        puts(b"[FPU] initial SIMD normalized inherited-xmm0=");
+        puts(
+            if unsafe { inherited.read() != 0 || inherited.add(1).read() != 0 } {
+                b"nonzero"
+            } else {
+                b"zero"
+            },
+        );
+        puts(b" inherited-mxcsr=0x");
+        hex(unsafe { inherited.add(2).read() }, 8);
+        puts(b" initial-mxcsr=0x00001F80\r\n");
+    }
+    puts(b"[FPU] ");
+    puts(match event {
+        0 => b"missing fxsr/sse/sse2",
+        1 => b"invalid xsave state size",
+        2 => b"ready",
+        _ => unreachable!(),
+    });
+    puts(b" backend=");
+    puts(match s.backend {
+        1 => b"fxsave",
+        2 => b"xsave",
+        _ => b"none",
+    });
+    puts(b" state=");
+    dec(u64::from(s.state_bytes));
+    puts(b"/");
+    dec(u64::from(s.state_storage_bytes));
+    puts(b" xcr0=0x");
+    hex(s.xcr0_mask, 16);
+    puts(b" abi=");
+    puts(match s.simd_abi {
+        1 => b"sse2",
+        2 => b"avx",
+        3 => b"avx2",
+        _ => b"none",
+    });
+    puts(b" avx=");
+    puts(if s.avx_enabled {
+        b"on"
+    } else if s.avx_supported {
+        b"off"
+    } else {
+        b"no"
+    });
+    puts(b" avx2=");
+    puts(if s.avx2_enabled {
+        b"on"
+    } else if s.avx2_supported {
+        b"off"
+    } else {
+        b"no"
+    });
+    puts(b" cr0=0x");
+    hex(s.cr0, 16);
+    puts(b" cr4=0x");
+    hex(s.cr4, 16);
+    puts(b"\r\n");
+}

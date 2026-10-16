@@ -4,7 +4,7 @@ use super::{adapters, backend_admission::CallbackGuard, backend_contract, rx_han
 use crate::{
     arch::runtime::RuntimeGuard,
     boot::foundation,
-    build_bridge::config,
+    build_config::config,
     driver::irq_router,
     memory::owner::Guard,
     platform::monotonic,

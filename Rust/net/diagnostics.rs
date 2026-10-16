@@ -595,12 +595,10 @@ fn capability_probe() -> bool {
     }
     ok
 }
-unsafe extern "C" {
-    fn r4os_zig_net_console_hex(value: u64, digits: usize);
-}
+
 fn hex(value: u64, digits: usize) {
     unsafe {
-        r4os_zig_net_console_hex(value, digits);
+        net_console_hex(value, digits);
     }
 }
 fn environment_absence() -> bool {
@@ -1416,3 +1414,7 @@ entry!(r4os_rust_net_diag_timing, timing_probe);
 entry!(r4os_rust_net_diag_corpus, corpus_probe);
 entry!(r4os_rust_net_diag_negative, negative_probe);
 entry!(r4os_rust_net_diag_r4p, r4p_probe);
+
+unsafe fn net_console_hex(value: u64, digits: usize) {
+    crate::boot::log_route::hex(value, u8::try_from(digits).expect("hex width"));
+}

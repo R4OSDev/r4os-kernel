@@ -8,7 +8,7 @@ function Get-R4KernelBuildMetadata {
     if ($metadata.schema -ne 1 -or $metadata.artifact -cne 'r4os.elf' -or $metadata.sha256 -cne $hash) {
         throw 'Kernel build metadata does not describe this exact ELF; rebuild before exporting compiler/profile data.'
     }
-    if ($metadata.languages.Count -eq 0 -or @($metadata.languages | Where-Object {$_ -cnotin @('zig','rust')}).Count) { throw 'Invalid Kernel implementation languages.' }
+    if ($metadata.languages.Count -eq 0 -or @($metadata.languages | Where-Object {$_ -cnotin @('zig','rust','assembly')}).Count) { throw 'Invalid Kernel implementation languages.' }
     if ($metadata.languages -ccontains 'rust') {
         $profile=$metadata.profiles.rust
         if ($profile.target -cne 'x86_64-unknown-none' -or $profile.overflow_checks -ne $true -or

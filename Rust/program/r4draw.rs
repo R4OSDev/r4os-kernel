@@ -14,21 +14,16 @@ use core::{
     ffi::c_void,
     mem::size_of,
     ptr,
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
-// Set once during the original linear API initialization. Raw legacy code
-// addresses are invoked only by the exact Zig-signature thunk, never cast C.
-static DISPLAY_USED: AtomicUsize = AtomicUsize::new(0);
-static FONT_CHANGED: AtomicUsize = AtomicUsize::new(0);
+// Published at the original platform configuration point; callbacks now bind
+// their typed native program owner without a foreign code address.
+static DISPLAY_USED: AtomicBool = AtomicBool::new(false);
+static FONT_CHANGED: AtomicBool = AtomicBool::new(false);
 static REVISION: AtomicU32 = AtomicU32::new(0);
-unsafe extern "C" {
-    fn r4os_zig_r4draw_hook(code: usize);
-}
-pub fn set_display_used_hook(code: usize) {
-    DISPLAY_USED.store(code, Ordering::Relaxed)
-}
-pub fn set_font_changed_hook(code: usize) {
-    FONT_CHANGED.store(code, Ordering::Relaxed)
+pub(crate) fn install_program_hooks() {
+    DISPLAY_USED.store(true, Ordering::Relaxed);
+    FONT_CHANGED.store(true, Ordering::Relaxed)
 }
 pub fn mark_display_used() {
     let mut previous = REVISION.load(Ordering::Acquire);
@@ -43,9 +38,8 @@ pub fn mark_display_used() {
             Err(value) => previous = value,
         }
     }
-    let hook = DISPLAY_USED.load(Ordering::Relaxed);
-    if hook != 0 {
-        unsafe { r4os_zig_r4draw_hook(hook) }
+    if DISPLAY_USED.load(Ordering::Relaxed) {
+        let _ = super::program_api::r4os_rust_program_api_action(5);
     }
 }
 pub fn screen_width() -> u32 {
@@ -625,9 +619,8 @@ pub fn font_reload() -> i32 {
     if result.unavailable {
         return -1;
     }
-    let hook = FONT_CHANGED.load(Ordering::Relaxed);
-    if hook != 0 {
-        unsafe { r4os_zig_r4draw_hook(hook) }
+    if FONT_CHANGED.load(Ordering::Relaxed) {
+        super::gui_events::r4os_rust_program_gui_font_changed();
     }
     i32::try_from(result.registered).expect("font registered count")
 }
@@ -635,6 +628,7 @@ pub fn font_revision() -> u32 {
     font::owner::revision()
 }
 #[repr(C)]
+#[derive(Default)]
 pub struct Args {
     pub a: u64,
     pub b: u64,
@@ -656,14 +650,6 @@ pub unsafe extern "C" fn r4os_rust_r4draw(op: u32, args: *const Args, out: *mut 
     let signed = |v: i32| v as i64 as u64;
     unsafe {
         match op {
-            0 => {
-                set_display_used_hook(args.a as usize);
-                0
-            }
-            1 => {
-                set_font_changed_hook(args.a as usize);
-                0
-            }
             2 => {
                 mark_display_used();
                 0

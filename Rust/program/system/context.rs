@@ -9,10 +9,7 @@ use crate::{
         task::{self, task_api},
     },
 };
-use core::{
-    mem::MaybeUninit,
-    sync::atomic::{AtomicUsize, Ordering},
-};
+use core::sync::atomic::{AtomicBool, Ordering};
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Target {
@@ -28,81 +25,74 @@ pub struct StreamOwner {
     pub program_id: u32,
     pub program_generation: u64,
 }
-static PATH: AtomicUsize = AtomicUsize::new(0);
-static STREAM: AtomicUsize = AtomicUsize::new(0);
-static MODULE: AtomicUsize = AtomicUsize::new(0);
-unsafe extern "C" {
-    fn r4os_zig_sys_path_resolve(
-        address: usize,
-        raw: Bytes,
-        out: *mut u8,
-        target: *mut Target,
-    ) -> bool;
-    fn r4os_zig_sys_stream_owner(address: usize, out: *mut StreamOwner) -> bool;
-    fn r4os_zig_sys_module_running(address: usize, letter: u8, path: Bytes) -> i32;
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_sys_set_provider(operation: u8, address: usize) {
-    match operation {
-        0 => &PATH,
-        1 => &STREAM,
-        2 => &MODULE,
-        _ => panic!("R4SYS provider"),
-    }
-    .store(address, Ordering::Release);
+static PATH: AtomicBool = AtomicBool::new(false);
+static STREAM: AtomicBool = AtomicBool::new(false);
+static MODULE: AtomicBool = AtomicBool::new(false);
+pub(crate) fn install_program_providers() {
+    PATH.store(true, Ordering::Release);
+    STREAM.store(true, Ordering::Release);
+    MODULE.store(true, Ordering::Release);
 }
 pub(super) unsafe fn resolve(raw: &[u8], out: &mut path::Buffer<1024>) -> Option<Target> {
-    unsafe {
-        let address = PATH.load(Ordering::Acquire);
-        if address == 0 {
-            return None;
-        }
-        let mut target = MaybeUninit::uninit();
-        if r4os_zig_sys_path_resolve(
-            address,
-            Bytes::from_slice(raw),
-            out.as_mut_ptr(),
-            target.as_mut_ptr(),
-        ) {
-            Some(target.assume_init())
-        } else {
-            None
-        }
+    if !PATH.load(Ordering::Acquire) {
+        return None;
     }
+    let target = unsafe {
+        super::super::program_api::resolve(
+            crate::fs::vfs_types::Bytes {
+                data: raw.as_ptr(),
+                len: raw.len(),
+            },
+            out.as_mut_ptr(),
+        )
+    }?;
+    Some(Target {
+        drive_ref: target.drive,
+        path: Bytes {
+            data: target.path.data,
+            len: target.path.len,
+        },
+    })
 }
 pub(super) unsafe fn owner() -> Option<StreamOwner> {
-    unsafe {
-        let address = STREAM.load(Ordering::Acquire);
-        if address != 0 {
-            let mut out = MaybeUninit::uninit();
-            if r4os_zig_sys_stream_owner(address, out.as_mut_ptr()) {
-                return Some(out.assume_init());
-            }
-        }
-        let current = scheduler::current();
-        if current.is_null() {
-            return None;
-        }
-        let (id, generation) = task::immutable_identity(current);
-        Some(StreamOwner {
-            kind: 1,
-            id,
-            generation,
-            ..Default::default()
-        })
+    if STREAM.load(Ordering::Acquire)
+        && let Some(owner) = unsafe { super::super::async_io::stream_owner() }
+    {
+        return Some(StreamOwner {
+            kind: 0,
+            id: owner.task,
+            generation: owner.task_generation,
+            program_id: owner.program,
+            program_generation: owner.program_generation,
+        });
     }
+    let current = scheduler::current();
+    if current.is_null() {
+        return None;
+    }
+    let (id, generation) = unsafe { task::immutable_identity(current) };
+    Some(StreamOwner {
+        kind: 1,
+        id,
+        generation,
+        ..Default::default()
+    })
 }
 pub(super) fn has_owner_provider() -> bool {
-    STREAM.load(Ordering::Acquire) != 0
+    STREAM.load(Ordering::Acquire)
 }
 pub(super) unsafe fn module_running(letter: u8, path: &[u8]) -> i32 {
+    if !MODULE.load(Ordering::Acquire) {
+        return -2;
+    }
     unsafe {
-        let address = MODULE.load(Ordering::Acquire);
-        if address == 0 {
-            -2
-        } else {
-            r4os_zig_sys_module_running(address, letter, Bytes::from_slice(path))
-        }
+        super::super::launch::r4os_rust_program_launch_running(
+            letter,
+            crate::fs::vfs_types::Bytes {
+                data: path.as_ptr(),
+                len: path.len(),
+            },
+        )
     }
 }
 pub(super) fn boot_subtree(value: &[u8]) -> bool {

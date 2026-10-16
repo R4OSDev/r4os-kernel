@@ -81,7 +81,7 @@ unsafe fn build(cwd: &[u8], arg: &[u8], out: *mut u8) -> Option<usize> {
         }
     }
 }
-pub(super) unsafe fn resolve(raw: Bytes, out: *mut u8) -> Option<Target> {
+pub(crate) unsafe fn resolve(raw: Bytes, out: *mut u8) -> Option<Target> {
     unsafe {
         if raw.len == 0 {
             return None;
@@ -523,9 +523,7 @@ pub unsafe extern "C" fn r4os_rust_program_api_module_path(out: *mut u8, capacit
         len as i32
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_program_api_display_used();
-}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_program_api_action(op: u8) -> i32 {
     unsafe {
@@ -552,7 +550,7 @@ pub extern "C" fn r4os_rust_program_api_action(op: u8) -> i32 {
                 result
             }
             4 => {
-                r4os_zig_program_api_display_used();
+                crate::program::r4draw::mark_display_used();
                 0
             }
             5 => {

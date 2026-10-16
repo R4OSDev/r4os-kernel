@@ -7,7 +7,7 @@ use super::{
 };
 use crate::{
     arch::{fpu, percpu, runtime, smp_policy},
-    build_bridge::config,
+    build_config::config,
     memory::heap,
     platform::timer,
     sched::task_context,
@@ -25,16 +25,14 @@ const PATTERN: u8 = 0xa5;
 unsafe extern "C" {
     // Each VM operation is independently admitted by the existing memory
     // owner; no registry state or native task layout crosses this boundary.
-    fn r4os_zig_task_vm(operation: u8, id: u32, output: *mut u64) -> u32;
-    fn r4os_zig_kernel_write(text: *const u8, len: usize);
-    fn r4os_zig_kernel_dec(value: u64);
+
     fn taskEntryTrampoline() -> !;
 }
 fn puts(text: &[u8]) {
-    unsafe { r4os_zig_kernel_write(text.as_ptr(), text.len()) }
+    unsafe { kernel_write(text.as_ptr(), text.len()) }
 }
 fn dec(value: u64) {
-    unsafe { r4os_zig_kernel_dec(value) }
+    crate::boot::log_route::dec(value)
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -217,7 +215,7 @@ pub(super) unsafe fn measure(task: *mut Task) {
     }
 }
 pub fn release_stack_direct(stack: GuardedStack) -> bool {
-    stack.range_id == 0 || unsafe { r4os_zig_task_vm(4, stack.range_id, null_mut()) == 0 }
+    stack.range_id == 0 || unsafe { task_vm(4, stack.range_id, null_mut()) == 0 }
 }
 unsafe fn anchor_fresh(owner: *mut Task, stack: GuardedStack) {
     if release_stack_direct(stack) {
@@ -258,11 +256,11 @@ pub(super) unsafe fn alloc_stack(owner: *mut Task) -> Option<GuardedStack> {
         (*r).stack_cache_misses = (*r).stack_cache_misses.wrapping_add(1);
         runtime::restore_runtime(flags);
         let mut id = 0u64;
-        if r4os_zig_task_vm(0, 0, &mut id) != 0 {
+        if task_vm(0, 0, &mut id) != 0 {
             return None;
         }
         let mut base = 0u64;
-        if r4os_zig_task_vm(1, id as u32, &mut base) != 0 {
+        if task_vm(1, id as u32, &mut base) != 0 {
             anchor_fresh(
                 owner,
                 GuardedStack {
@@ -278,9 +276,7 @@ pub(super) unsafe fn alloc_stack(owner: *mut Task) -> Option<GuardedStack> {
             top: base + GUARD_SIZE + STACK_SIZE,
             ..GuardedStack::EMPTY
         };
-        if r4os_zig_task_vm(2, id as u32, null_mut()) != 0
-            || r4os_zig_task_vm(3, id as u32, null_mut()) != 0
-        {
+        if task_vm(2, id as u32, null_mut()) != 0 || task_vm(3, id as u32, null_mut()) != 0 {
             anchor_fresh(owner, stack);
             return None;
         }
@@ -886,4 +882,81 @@ pub(crate) unsafe fn create_critical(
         record_created(role, timestamp().wrapping_sub(started));
         task
     }
+}
+
+unsafe fn kernel_write(text: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
+}
+
+unsafe fn task_vm(operation: u8, id: u32, output: *mut u64) -> u32 {
+    use crate::memory::{vm_query as query, vm_ranges as ranges, vm_transactions as vm};
+    let code = match operation {
+        0 => {
+            let r = ranges::Reserve {
+                eviction_allowed: true,
+                window: 7,
+                kind: 4,
+                owner: 0,
+                owner_id: 0,
+                name_ptr: b"kernel-task-stack".as_ptr(),
+                name_len: 17,
+                flags: 2 | (1 << 63),
+                base: 0,
+                len: 80 * 1024,
+            };
+            let mut id = 0;
+            let c = unsafe { ranges::r4os_rust_vm_reserve(&r, 4096, &mut id) };
+            if c == 0 {
+                unsafe {
+                    output.write(u64::from(id));
+                }
+            }
+            c
+        }
+        1 => {
+            let mut r = core::mem::MaybeUninit::uninit();
+            if !unsafe { query::r4os_rust_vm_range_info(id, r.as_mut_ptr()) } {
+                return 1;
+            }
+            unsafe {
+                output.write(r.assume_init().base);
+            }
+            return 0;
+        }
+        2 => vm::r4os_rust_vm_protect_guard(id, 0, 16 * 1024, false),
+        3 => vm::r4os_rust_vm_commit(id, 16 * 1024, 64 * 1024),
+        4 => vm::r4os_rust_vm_release(id),
+        _ => panic!("Invalid task stack VM operation"),
+    };
+    if code != 0 {
+        use crate::boot::log_route as l;
+        l::puts(match operation {
+            0 => b"Task stack reserve failed: ",
+            2 => b"Task stack guard failed: ",
+            3 => b"Task stack commit failed: ",
+            4 => b"Task stack release failed: ",
+            _ => unreachable!(),
+        });
+        l::puts(match code {
+            1 => b"NotInitialized",
+            2 => b"TableFull",
+            3 => b"EmptyRange",
+            4 => b"BadAlignment",
+            5 => b"Overflow",
+            6 => b"NoSpace",
+            7 => b"Overlap",
+            8 => b"NotFound",
+            9 => b"AlreadyCommitted",
+            10 => b"NotCommitted",
+            11 => b"GuardRange",
+            12 => b"OutOfMemory",
+            13 => b"MapFailed",
+            14 => b"Busy",
+            15 => b"OutsideWindow",
+            _ => unreachable!(),
+        });
+        l::puts(b"\r\n");
+        return 1;
+    }
+    0
 }

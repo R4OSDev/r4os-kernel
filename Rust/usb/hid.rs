@@ -44,22 +44,7 @@ pub struct QueueStats {
     pub pending: u32,
     pub drops: u64,
 }
-unsafe extern "C" {
-    fn r4os_zig_usb_hid_queue(out: *mut QueueStats);
-    fn r4os_zig_usb_hid_can_accept(count: u32) -> bool;
-    fn r4os_zig_usb_hid_platform_usb(value: bool);
-    fn r4os_zig_usb_hid_consumer(usage: u16);
-    fn r4os_zig_usb_hid_set_keyboard_hook(hook: Option<unsafe extern "C" fn()>);
-    fn r4os_zig_usb_hid_set_mouse_hook(hook: Option<unsafe extern "C" fn()>);
-    fn r4os_zig_usb_hid_inject_usage(usage: u8, down: bool) -> bool;
-    fn r4os_zig_usb_hid_inject_modifier(bit: u8, down: bool);
-    fn r4os_zig_usb_hid_released(
-        op: *const c::UsbHidBootOp,
-        out: *mut u8,
-        capacity: usize,
-    ) -> usize;
-    fn r4os_zig_usb_hid_mouse(dx: i32, dy: i32, buttons: u8, wheel: i32);
-}
+
 struct State {
     current: Status,
     bindings: [HidBinding; 3],
@@ -119,7 +104,7 @@ fn active(name: &'static [u8]) -> bool {
 fn queue_stats() -> QueueStats {
     let mut out = QueueStats::default();
     unsafe {
-        r4os_zig_usb_hid_queue(&mut out);
+        usb_hid_queue(&mut out);
     }
     out
 }
@@ -179,7 +164,7 @@ pub fn init(selected: Options) -> bool {
         for kind in [Kind::Keyboard, Kind::Mouse, Kind::Consumer] {
             binding(kind).write(HidBinding::EMPTY);
         }
-        r4os_zig_usb_hid_platform_usb(false);
+        usb_hid_platform_usb(false);
         (*state()).service_polls = 0;
         (*state()).keyboard_backpressure_active = false;
         (*state()).keyboard_backpressure_polls = 0;
@@ -255,10 +240,10 @@ unsafe fn reconcile_bindings() {
         }
         if !(*binding(Kind::Keyboard)).bound {
             (*state()).keyboard_backpressure_active = false;
-            r4os_zig_usb_hid_set_keyboard_hook(None);
+            usb_hid_set_keyboard_hook(None);
         }
         if !(*binding(Kind::Mouse)).bound {
-            r4os_zig_usb_hid_set_mouse_hook(None);
+            usb_hid_set_mouse_hook(None);
         }
         (*current()).unsupported_hid = 0;
         (*current()).missing_endpoint_hid = 0;
@@ -404,7 +389,7 @@ unsafe fn handle_candidate(dev: super::types::Device, cand: Candidate) {
             }
             (*b).consumer_caps = decoded.capabilities;
             if bind_device(b, Kind::Consumer) {
-                r4os_zig_usb_hid_platform_usb(true);
+                usb_hid_platform_usb(true);
             }
             return;
         }
@@ -433,7 +418,7 @@ unsafe fn handle_candidate(dev: super::types::Device, cand: Candidate) {
             Kind::Keyboard => {
                 if bound {
                     (*current()).keyboard_bound = true;
-                    r4os_zig_usb_hid_set_keyboard_hook(Some(keyboard_poll_hook));
+                    usb_hid_set_keyboard_hook(Some(keyboard_poll_hook));
                     (*current()).reason = Text::literal(if (*b).setup_warnings == 0 {
                         b"USB HID boot keyboard bound"
                     } else {
@@ -446,7 +431,7 @@ unsafe fn handle_candidate(dev: super::types::Device, cand: Candidate) {
             Kind::Mouse => {
                 if bound {
                     (*current()).mouse_bound = true;
-                    r4os_zig_usb_hid_set_mouse_hook(Some(mouse_poll_hook));
+                    usb_hid_set_mouse_hook(Some(mouse_poll_hook));
                     (*current()).reason = Text::literal(if (*b).setup_warnings == 0 {
                         b"USB HID boot mouse bound"
                     } else {
@@ -618,7 +603,7 @@ unsafe fn poll_binding(b: *mut HidBinding, kind: Kind) -> bool {
             return false;
         }
         if kind == Kind::Keyboard {
-            if !r4os_zig_usb_hid_can_accept(KEYBOARD_REPORT_QUEUE_RESERVE) {
+            if !usb_hid_can_accept(KEYBOARD_REPORT_QUEUE_RESERVE) {
                 (*state()).keyboard_backpressure_active = true;
                 (*state()).keyboard_backpressure_polls =
                     (*state()).keyboard_backpressure_polls.wrapping_add(1);
@@ -711,10 +696,10 @@ unsafe fn decode_consumer(b: *mut HidBinding, report: &[u8]) {
         let rising = pressed & !(*b).consumer_pressed[index];
         (*b).consumer_pressed[index] = pressed;
         if rising & 1 != 0 {
-            r4os_zig_usb_hid_consumer(0x6f);
+            usb_hid_consumer(0x6f);
         }
         if rising & 2 != 0 {
-            r4os_zig_usb_hid_consumer(0x70);
+            usb_hid_consumer(0x70);
         }
     }
 }
@@ -753,12 +738,12 @@ unsafe fn decode_keyboard(b: *mut HidBinding, report: &[u8]) -> bool {
             let old = op.old_modifiers & bit != 0;
             let new = op.new_modifiers & bit != 0;
             if old != new {
-                r4os_zig_usb_hid_inject_modifier(bit, new);
+                usb_hid_inject_modifier(bit, new);
             }
         }
         (*current()).last_modifiers = op.new_modifiers;
         let mut released = [0; c::usb_hid_boot_max_keys];
-        let count = r4os_zig_usb_hid_released(&op, released.as_mut_ptr(), released.len());
+        let count = usb_hid_released(&op, released.as_mut_ptr(), released.len());
         for usage in &released[..count] {
             record_injected_usage(*usage, false);
         }
@@ -774,7 +759,7 @@ unsafe fn decode_keyboard(b: *mut HidBinding, report: &[u8]) -> bool {
 }
 unsafe fn record_injected_usage(usage: u8, down: bool) {
     unsafe {
-        if r4os_zig_usb_hid_inject_usage(usage, down) {
+        if usb_hid_inject_usage(usage, down) {
             (*current()).decoded_keys += 1;
         } else {
             (*current()).drops += 1;
@@ -801,14 +786,14 @@ unsafe fn decode_mouse(report: &[u8]) -> bool {
         (*current()).last_mouse_dx = op.mouse_dx;
         (*current()).last_mouse_dy = op.mouse_dy;
         (*current()).last_mouse_wheel = op.mouse_wheel;
-        r4os_zig_usb_hid_mouse(op.mouse_dx, op.mouse_dy, op.mouse_buttons, op.mouse_wheel);
+        usb_hid_mouse(op.mouse_dx, op.mouse_dy, op.mouse_buttons, op.mouse_wheel);
         (*current()).decoded_mouse += 1;
         true
     }
 }
 unsafe fn refresh_aggregate_status() {
     unsafe {
-        r4os_zig_usb_hid_platform_usb(
+        usb_hid_platform_usb(
             (*binding(Kind::Consumer)).bound && (*binding(Kind::Consumer)).consumer_caps != 0,
         );
         let q = queue_stats();
@@ -922,7 +907,7 @@ pub fn service_poll() {
         poll_binding(binding(Kind::Keyboard), Kind::Keyboard);
         poll_mouse();
         poll_binding(binding(Kind::Consumer), Kind::Consumer);
-        r4os_zig_usb_hid_platform_usb(
+        usb_hid_platform_usb(
             (*binding(Kind::Consumer)).bound && (*binding(Kind::Consumer)).consumer_caps != 0,
         );
     }
@@ -1124,5 +1109,74 @@ pub extern "C" fn r4os_rust_usb_hid_start_poll_task() -> bool {
 pub unsafe extern "C" fn r4os_rust_usb_hid_poll_task_summary(out: *mut PollTaskSummary) {
     unsafe {
         out.write(poll_task_summary());
+    }
+}
+
+unsafe fn usb_hid_can_accept(count: u32) -> bool {
+    crate::input::keyboard::r4os_rust_input_keyboard_accept(count)
+}
+
+unsafe fn usb_hid_consumer(usage: u16) {
+    crate::input::platform_input::r4os_rust_input_platform_consumer(u32::from(usage));
+}
+
+unsafe fn usb_hid_mouse(dx: i32, dy: i32, buttons: u8, wheel: i32) {
+    crate::input::mouse::r4os_rust_input_mouse_inject(dx, dy, buttons, wheel);
+}
+
+unsafe fn usb_hid_platform_usb(value: bool) {
+    crate::input::platform_input::r4os_rust_input_platform_usb(value);
+}
+
+unsafe fn usb_hid_set_keyboard_hook(hook: Option<unsafe extern "C" fn()>) {
+    crate::input::keyboard::r4os_rust_input_keyboard_poll_hook(hook);
+}
+
+unsafe fn usb_hid_set_mouse_hook(hook: Option<unsafe extern "C" fn()>) {
+    crate::input::mouse::r4os_rust_input_mouse_poll_hook(hook);
+}
+
+unsafe fn usb_hid_queue(out: *mut QueueStats) {
+    let s = crate::input::keyboard::snapshot();
+    unsafe {
+        out.write(QueueStats {
+            capacity: s.queue_capacity,
+            pending: s.queue_pending,
+            drops: s.dropped_count,
+        });
+    }
+}
+
+unsafe fn usb_hid_inject_modifier(bit: u8, down: bool) {
+    let code = crate::input::hid_set1::modifier_to_code(bit).unwrap();
+    if code.extended {
+        crate::input::keyboard::controller_byte(0xE0);
+    }
+    crate::input::keyboard::controller_byte(if down { code.make } else { code.make | 0x80 });
+}
+
+unsafe fn usb_hid_inject_usage(usage: u8, down: bool) -> bool {
+    let Some(code) = crate::input::hid_set1::usage_to_code(usage) else {
+        return false;
+    };
+    if code.extended {
+        crate::input::keyboard::controller_byte(0xE0);
+    }
+    crate::input::keyboard::controller_byte(if down { code.make } else { code.make | 0x80 });
+    true
+}
+
+unsafe fn usb_hid_released(op: *const c::UsbHidBootOp, out: *mut u8, capacity: usize) -> usize {
+    unsafe {
+        let op = &*op;
+        let pl = usize::from(op.previous_len).min(op.previous.len());
+        let cl = usize::from(op.report_len).min(op.report.len());
+        crate::input::hid_set1::collect_released(
+            &op.previous[..pl],
+            usize::from(op.previous_offset).min(pl),
+            &op.report[..cl],
+            usize::from(op.report_offset).min(cl),
+            core::slice::from_raw_parts_mut(out, capacity),
+        )
     }
 }

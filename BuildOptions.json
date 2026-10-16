@@ -1,20 +1,137 @@
 [
-  {"name":"exception-test","config":"enable_exception_test","type":"bool","default":0,"bit":0,"description":"Trigger an invalid-opcode exception after IDT initialization"},
-  {"name":"page-fault-test","config":"enable_page_fault_test","type":"bool","default":0,"bit":1,"description":"Trigger a page fault after paging initialization"},
-  {"name":"general-protection-test","config":"enable_general_protection_test","type":"bool","default":0,"bit":2,"description":"Trigger a general-protection fault after IDT initialization"},
-  {"name":"crash-screen-test","config":"enable_crash_screen_test","type":"bool","default":0,"bit":3,"description":"Render the existing crash-screen fixture"},
-  {"name":"kernel-fatal-test","config":"enable_kernel_fatal_test","type":"bool","default":0,"bit":4,"description":"Trigger the existing terminal KernelFatal path"},
-  {"name":"zig-panic-test","config":"enable_zig_panic_test","type":"bool","default":0,"bit":5,"description":"Trigger the existing Zig panic path during transition"},
-  {"name":"com1-debug","config":"enable_com1_debug","type":"bool","default":1,"bit":6,"description":"Enable early COM1 output"},
-  {"name":"metrics","config":"enable_metrics","type":"bool","default":0,"bit":7,"description":"Enable detail timing, stack scans and diagnostic instrumentation"},
-  {"name":"force-x2apic","config":"force_x2apic","type":"bool","default":0,"bit":8,"description":"Force x2APIC when supported"},
-  {"name":"stack-guard-test","config":"enable_stack_guard_test","type":"bool","default":0,"bit":9,"description":"Trigger the existing kernel stack guard test"},
-  {"name":"boot-selftests","config":"enable_boot_selftests","type":"bool","default":0,"bit":10,"description":"Run existing invasive boot selftests"},
-  {"name":"display-reject-test","config":"display_reject_test","type":"bool","default":0,"bit":11,"description":"Run bounded native-display rejection without hardware programming"},
-  {"name":"block-dispatch-selftest","config":"enable_block_dispatch_selftest","type":"bool","default":0,"bit":12,"description":"Run existing block-dispatch boot selftests"},
-  {"name":"net-loss-test","config":"enable_net_loss_test","type":"bool","default":0,"bit":13,"description":"Enable bounded receive loss injection"},
-  {"name":"smp-fail-ap-index","config":"smp_fail_ap_index","type":"u32","default":4294967295,"description":"Leave the selected AP offline"},
-  {"name":"strip-kernel","config":"strip_kernel","type":"bool","default":1,"bit":14,"description":"Strip debug and symbol sections from the installed ELF"},
-  {"name":"rust-panic-test","config":"rust_panic_test","type":"bool","default":0,"bit":15,"description":"Trigger Rust panic through the terminal KernelFatal path"},
-  {"name":"rust-overflow-test","config":"rust_overflow_test","type":"bool","default":0,"bit":16,"description":"Prove checked Rust release arithmetic through the terminal fatal path"}
+  {
+    "name": "exception-test",
+    "config": "enable_exception_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 0,
+    "description": "Trigger an invalid-opcode exception after IDT initialization"
+  },
+  {
+    "name": "page-fault-test",
+    "config": "enable_page_fault_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 1,
+    "description": "Trigger a page fault after paging initialization"
+  },
+  {
+    "name": "general-protection-test",
+    "config": "enable_general_protection_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 2,
+    "description": "Trigger a general-protection fault after IDT initialization"
+  },
+  {
+    "name": "crash-screen-test",
+    "config": "enable_crash_screen_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 3,
+    "description": "Render the existing crash-screen fixture"
+  },
+  {
+    "name": "kernel-fatal-test",
+    "config": "enable_kernel_fatal_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 4,
+    "description": "Trigger the existing terminal KernelFatal path"
+  },
+  {
+    "name": "com1-debug",
+    "config": "enable_com1_debug",
+    "type": "bool",
+    "default": 1,
+    "bit": 6,
+    "description": "Enable early COM1 output"
+  },
+  {
+    "name": "metrics",
+    "config": "enable_metrics",
+    "type": "bool",
+    "default": 0,
+    "bit": 7,
+    "description": "Enable detail timing, stack scans and diagnostic instrumentation"
+  },
+  {
+    "name": "force-x2apic",
+    "config": "force_x2apic",
+    "type": "bool",
+    "default": 0,
+    "bit": 8,
+    "description": "Force x2APIC when supported"
+  },
+  {
+    "name": "stack-guard-test",
+    "config": "enable_stack_guard_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 9,
+    "description": "Trigger the existing kernel stack guard test"
+  },
+  {
+    "name": "boot-selftests",
+    "config": "enable_boot_selftests",
+    "type": "bool",
+    "default": 0,
+    "bit": 10,
+    "description": "Run existing invasive boot selftests"
+  },
+  {
+    "name": "display-reject-test",
+    "config": "display_reject_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 11,
+    "description": "Run bounded native-display rejection without hardware programming"
+  },
+  {
+    "name": "block-dispatch-selftest",
+    "config": "enable_block_dispatch_selftest",
+    "type": "bool",
+    "default": 0,
+    "bit": 12,
+    "description": "Run existing block-dispatch boot selftests"
+  },
+  {
+    "name": "net-loss-test",
+    "config": "enable_net_loss_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 13,
+    "description": "Enable bounded receive loss injection"
+  },
+  {
+    "name": "smp-fail-ap-index",
+    "config": "smp_fail_ap_index",
+    "type": "u32",
+    "default": 4294967295,
+    "description": "Leave the selected AP offline"
+  },
+  {
+    "name": "strip-kernel",
+    "config": "strip_kernel",
+    "type": "bool",
+    "default": 1,
+    "bit": 14,
+    "description": "Strip debug and symbol sections from the installed ELF"
+  },
+  {
+    "name": "rust-panic-test",
+    "config": "rust_panic_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 15,
+    "description": "Trigger Rust panic through the terminal KernelFatal path"
+  },
+  {
+    "name": "rust-overflow-test",
+    "config": "rust_overflow_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 16,
+    "description": "Prove checked Rust release arithmetic through the terminal fatal path"
+  }
 ]

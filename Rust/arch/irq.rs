@@ -3,11 +3,9 @@
 //! state reference survives a physical task switch.
 use super::{interrupt_frame::InterruptFrame, ioapic, lapic, percpu, pic, runtime};
 use crate::{platform::timer, sched::scheduler};
-unsafe extern "C" {
-    fn r4os_zig_irq_event(operation: u8, a: u64, b: u64) -> u64;
-}
+
 fn event(operation: u8, a: u64, b: u64) -> u64 {
-    unsafe { r4os_zig_irq_event(operation, a, b) }
+    unsafe { irq_event(operation, a, b) }
 }
 fn eoi() {
     lapic::r4os_rust_lapic_control(8, 0, 0);
@@ -80,5 +78,23 @@ pub unsafe fn dispatch_ipi(frame: *const InterruptFrame) {
             eoi();
         }
         _ => eoi(),
+    }
+}
+
+unsafe fn irq_event(operation: u8, a: u64, b: u64) -> u64 {
+    let _ = b;
+    match operation {
+        0 => u64::from(crate::program::peer_lifetime::r4os_rust_program_peer_preemptible(a)),
+        5 => {
+            crate::input::i8042::on_irq(a.try_into().unwrap());
+            0
+        }
+        6 => {
+            unsafe {
+                crate::driver::irq_router::r4os_rust_irq_router_dispatch(a.try_into().unwrap());
+            }
+            0
+        }
+        _ => panic!("Invalid IRQ owner operation"),
     }
 }

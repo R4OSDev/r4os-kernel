@@ -6,7 +6,7 @@ pub mod registry_batch;
 mod registry_build;
 pub mod registry_state;
 
-pub mod context;
+pub(crate) mod context;
 pub mod directory;
 mod fs;
 pub mod io;
@@ -18,7 +18,7 @@ mod stream_state;
 
 pub mod atomic;
 pub mod control;
-pub mod copy;
+pub(crate) mod copy;
 pub mod resources;
 
 mod abi;

@@ -1,6 +1,6 @@
 //! Canonical R4D resource runtime. DriverApi's existing wait-spanning execution
-//! owner serializes all calls except the passive clock. File plans belong to
-//! the still-Zig loader/filesystem owner and retain its exact captured source.
+//! owner serializes all calls except the passive clock. File plans retain the native loader
+//! source and exact captured resource record through existing filesystem waits.
 use crate::driver::{
     registry::MAX_DRIVERS,
     resource_state::{self, Binding, State},
@@ -29,29 +29,6 @@ static STATE: ResourceState = ResourceState(UnsafeCell::new(State {
 struct Lookup {
     index: usize,
     bytes: u64,
-}
-unsafe extern "C" {
-    fn r4os_zig_driver_resource_name_valid(name: *const u8, len: usize) -> bool;
-    fn r4os_zig_driver_resource_lookup(
-        slot: usize,
-        generation: u32,
-        name: *const u8,
-        len: usize,
-        out: *mut Lookup,
-    ) -> i32;
-    fn r4os_zig_driver_resource_prepare(
-        slot: usize,
-        generation: u32,
-        index: usize,
-        plan: *mut c_void,
-        bytes: *mut u64,
-    ) -> i32;
-    fn r4os_zig_driver_resource_read(
-        plan: *const c_void,
-        offset: u64,
-        out: *mut u8,
-        len: usize,
-    ) -> bool;
 }
 
 /// # Safety
@@ -93,7 +70,7 @@ pub unsafe extern "C" fn r4os_rust_driver_resource_stat(
     unsafe {
         if (*out).version != 1
             || (*out).size < mem::size_of::<a::DriverResourceInfo>() as u32
-            || !r4os_zig_driver_resource_name_valid(name, len)
+            || !crate::loader::resources::r4os_rust_module_resource_name(name, len)
         {
             return a::driver_resource_error_invalid;
         }
@@ -102,8 +79,7 @@ pub unsafe extern "C" fn r4os_rust_driver_resource_stat(
             return a::driver_resource_error_stale;
         };
         let mut lookup = Lookup { index: 0, bytes: 0 };
-        let status =
-            r4os_zig_driver_resource_lookup(b.slot, b.module_generation, name, len, &mut lookup);
+        let status = driver_resource_lookup(b.slot, b.module_generation, name, len, &mut lookup);
         if status != a::driver_resource_ok {
             return status;
         }
@@ -154,7 +130,7 @@ pub unsafe extern "C" fn r4os_rust_driver_resource_read(
             return a::driver_resource_error_stale;
         }
         let mut bytes = 0;
-        let status = r4os_zig_driver_resource_prepare(
+        let status = driver_resource_prepare(
             b.slot,
             b.module_generation,
             index as usize,
@@ -171,7 +147,7 @@ pub unsafe extern "C" fn r4os_rust_driver_resource_read(
         if started >= deadline {
             return a::driver_resource_error_deadline;
         }
-        let ok = r4os_zig_driver_resource_read(plan, offset, out, len);
+        let ok = driver_resource_read(plan, offset, out, len);
         let finished = r4os_rust_driver_resource_now();
         if finished < started || finished >= deadline {
             return a::driver_resource_error_deadline;
@@ -266,5 +242,93 @@ pub unsafe extern "C" fn r4os_rust_driver_resource_acpi_read(
             return a::driver_resource_error_deadline;
         }
         i32::try_from(len).expect("Validated firmware read length exceeds i32")
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ReadPlan {
+    source: crate::loader::file::Source,
+    file_offset: usize,
+    record_offset: usize,
+}
+unsafe fn resource_view(
+    slot: usize,
+    generation: u32,
+) -> Option<crate::loader::registry_control::ResourceView> {
+    let mut v = core::mem::MaybeUninit::uninit();
+    if unsafe {
+        crate::loader::registry_control::r4os_rust_mod_resources(slot, generation, v.as_mut_ptr())
+    } {
+        Some(unsafe { v.assume_init() })
+    } else {
+        None
+    }
+}
+
+unsafe fn driver_resource_lookup(
+    slot: usize,
+    generation: u32,
+    name: *const u8,
+    len: usize,
+    out: *mut Lookup,
+) -> i32 {
+    unsafe {
+        let Some(v) = resource_view(slot, generation) else {
+            return a::driver_resource_error_source;
+        };
+        let i = crate::loader::resources::r4os_rust_module_resource_find(v.catalog, name, len);
+        if i == usize::MAX {
+            return a::driver_resource_error_not_found;
+        }
+        out.write(Lookup {
+            index: i,
+            bytes: u64::from((*v.catalog).records[i].bytes),
+        });
+        a::driver_resource_ok
+    }
+}
+
+unsafe fn driver_resource_prepare(
+    slot: usize,
+    generation: u32,
+    index: usize,
+    plan: *mut c_void,
+    bytes: *mut u64,
+) -> i32 {
+    unsafe {
+        let Some(v) = resource_view(slot, generation) else {
+            return a::driver_resource_error_source;
+        };
+        if index >= (*v.catalog).count {
+            return a::driver_resource_error_stale;
+        }
+        let record = (*v.catalog).records[index];
+        if record.kind != 3 {
+            return a::driver_resource_error_stale;
+        }
+        plan.cast::<ReadPlan>().write(ReadPlan {
+            source: v.source,
+            file_offset: v.file_offset,
+            record_offset: record.offset as usize,
+        });
+        bytes.write(u64::from(record.bytes));
+        a::driver_resource_ok
+    }
+}
+
+unsafe fn driver_resource_read(plan: *const c_void, offset: u64, out: *mut u8, len: usize) -> bool {
+    unsafe {
+        let plan = plan.cast::<ReadPlan>().read();
+        crate::loader::file::r4os_rust_module_file_exact(
+            &plan.source,
+            plan.file_offset + plan.record_offset + usize::try_from(offset).unwrap(),
+            out,
+            len,
+            crate::fs::vfs_types::Bytes {
+                data: b"driver-resource".as_ptr(),
+                len: 15,
+            },
+            false,
+        )
     }
 }

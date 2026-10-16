@@ -15,9 +15,7 @@ use core::{mem::MaybeUninit, ptr};
 const MAIN: u32 = 1;
 const GUARD: u64 = 4096;
 const HEADROOM: u64 = 64 * 1024;
-unsafe extern "C" {
-    fn r4os_zig_program_fault_demand(address: u64, error: u64, owner: u32) -> bool;
-}
+
 unsafe fn grow_thread(thread: *mut Thread, address: u64) -> bool {
     unsafe {
         let before = (*thread).stack.committed_size;
@@ -137,7 +135,7 @@ pub unsafe extern "C" fn r4os_rust_program_fault_handle(
             let instance = super::context::execution();
             if !instance.is_null()
                 && vm::profile_limit(2, instance, 4096)
-                && r4os_zig_program_fault_demand(address, error, (*instance).id)
+                && program_fault_demand(address, error, (*instance).id)
             {
                 return true;
             }
@@ -192,5 +190,11 @@ pub unsafe extern "C" fn r4os_rust_program_fault_handle(
             return grow_thread(thread_owner, address);
         }
         false
+    }
+}
+
+unsafe fn program_fault_demand(address: u64, error: u64, owner: u32) -> bool {
+    unsafe {
+        crate::memory::vm_pager_api::r4os_rust_vm_demand_fault(address, error, 3, u64::from(owner))
     }
 }

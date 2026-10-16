@@ -58,10 +58,7 @@ static STATE: Canonical = Canonical(UnsafeCell::new(State {
     current: 2,
     initialized: false,
 }));
-unsafe extern "C" {
-    fn r4os_zig_fs_drive_text(data: *const u8, len: usize);
-    fn r4os_zig_fs_drive_decimal(value: usize);
-}
+
 fn upper(letter: u8) -> u8 {
     letter.to_ascii_uppercase()
 }
@@ -327,16 +324,16 @@ pub unsafe extern "C" fn r4os_rust_fs_drive_cwd(
     true
 }
 fn text(value: Label) {
-    unsafe { r4os_zig_fs_drive_text(value.data, value.len) };
+    unsafe { fs_drive_text(value.data, value.len) };
 }
 fn puts(value: &'static [u8]) {
     text(label(value));
 }
 fn character(value: u8) {
-    unsafe { r4os_zig_fs_drive_text(&value, 1) };
+    unsafe { fs_drive_text(&value, 1) };
 }
 fn decimal(value: usize) {
-    unsafe { r4os_zig_fs_drive_decimal(value) };
+    unsafe { fs_drive_decimal(value) };
 }
 
 /// # Safety
@@ -432,3 +429,11 @@ const _: () = {
     assert!(offset_of!(Drive, cwd_len) == 1072);
     assert!(size_of::<Drive>() == 1080);
 };
+
+unsafe fn fs_drive_text(data: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, data, len) }
+}
+
+unsafe fn fs_drive_decimal(value: usize) {
+    crate::boot::log_route::dec(value as u64);
+}

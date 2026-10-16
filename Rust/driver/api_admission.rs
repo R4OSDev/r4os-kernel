@@ -213,19 +213,14 @@ pub extern "C" fn r4os_rust_driver_api_runtime_owner(runtime: bool) -> u32 {
     let thread = threads::r4os_rust_driver_thread_current(0, 0) as u32;
     if thread != 0 { thread } else { active() }
 }
-unsafe extern "C" {
-    fn r4os_zig_driver_module_identity(slot: usize, generation: *mut u32) -> bool;
-    fn r4os_zig_driver_gfx_bind(id: u32, epoch: u64) -> bool;
-    fn r4os_zig_driver_gfx_discard(id: u32, epoch: u64) -> bool;
-    fn r4os_zig_driver_owned_buffer_admit() -> i32;
-}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_api_bind(id: u32, slot: usize) -> bool {
     if owner() != id || !owned() {
         return false;
     }
     let mut generation = 0;
-    if !unsafe { r4os_zig_driver_module_identity(slot, &mut generation) } {
+    if !unsafe { driver_module_identity(slot, &mut generation) } {
         return false;
     }
     let state = unsafe { resources::r4os_rust_driver_resource_state() };
@@ -252,14 +247,14 @@ pub extern "C" fn r4os_rust_driver_api_bind(id: u32, slot: usize) -> bool {
         finish();
         return false;
     }
-    if !unsafe { r4os_zig_driver_gfx_bind(id, epoch) } {
+    if !{ crate::gfx::driver_memory::bind(id, epoch) } {
         assert!(semaphores::r4os_rust_driver_semaphore_discard(id, epoch));
         assert!(threads::r4os_rust_driver_thread_discard(id, epoch));
         finish();
         return false;
     }
     if !heap::r4os_rust_driver_heap_bind(id, epoch) {
-        assert!(unsafe { r4os_zig_driver_gfx_discard(id, epoch) });
+        assert!({ crate::gfx::driver_memory::discard_empty_binding(id, epoch) });
         assert!(semaphores::r4os_rust_driver_semaphore_discard(id, epoch));
         assert!(threads::r4os_rust_driver_thread_discard(id, epoch));
         finish();
@@ -344,7 +339,7 @@ pub unsafe extern "C" fn r4os_rust_driver_api_invoke_owned(
     if !r4os_rust_driver_api_enter(id, 0) {
         return a::driver_work_owner_busy;
     }
-    let admission = unsafe { r4os_zig_driver_owned_buffer_admit() };
+    let admission = unsafe { driver_owned_buffer_admit() };
     if admission != 0 {
         r4os_rust_driver_api_leave();
         return admission;
@@ -367,13 +362,10 @@ static TABLE: TableStorage = TableStorage {
 };
 /// # Safety
 /// Fixed C callback template is valid under bootstrap/lifecycle admission.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_driver_api_table(
-    template: *const a::DriverApi,
-) -> *mut a::DriverApi {
+pub(crate) fn table() -> *mut a::DriverApi {
     let value = TABLE.value.get().cast::<a::DriverApi>();
     if !unsafe { *TABLE.initialized.get() } {
-        let input = unsafe { ptr::read(template) };
+        let input = super::api_callbacks::template();
         assert!(
             input.magic == 0x31495044
                 && input.version == a::driver_api_version
@@ -385,4 +377,25 @@ pub unsafe extern "C" fn r4os_rust_driver_api_table(
         }
     }
     value
+}
+
+unsafe fn driver_module_identity(slot: usize, generation: *mut u32) -> bool {
+    let entry = crate::loader::registry_control::r4os_rust_mod_entry(slot);
+    if entry.is_null() {
+        return false;
+    }
+    unsafe {
+        if (*entry).kind != 3 {
+            return false;
+        }
+        generation.write((*entry).generation);
+    }
+    true
+}
+
+unsafe fn driver_owned_buffer_admit() -> i32 {
+    match crate::driver::api_gfx::identity(0, true) {
+        Ok(_) => 0,
+        Err(code) => code,
+    }
 }

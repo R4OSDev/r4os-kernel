@@ -17,20 +17,17 @@ use core::{
     ptr,
     sync::atomic::{AtomicI32, Ordering},
 };
-unsafe extern "C" {
-    fn r4os_zig_program_peer_vm_release(id: u32) -> bool;
-    fn r4os_zig_program_peer_backing_release(id: u32);
-}
+
 pub(super) unsafe fn notifications_cleanup(instance: *mut ProgramInstance) -> bool {
     unsafe {
         notifications::r4os_rust_notifications_cleanup(ptr::addr_of_mut!((*instance).notifications))
     }
 }
 pub(super) unsafe fn vm_release(id: u32) -> bool {
-    unsafe { r4os_zig_program_peer_vm_release(id) }
+    unsafe { program_peer_vm_release(id) }
 }
 pub(super) unsafe fn backing_release(id: u32) {
-    unsafe { r4os_zig_program_peer_backing_release(id) }
+    unsafe { program_peer_backing_release(id) }
 }
 pub(super) unsafe fn resource_step(instance: *mut ProgramInstance) -> bool {
     unsafe {
@@ -352,3 +349,23 @@ const _: () = {
     assert!(mem::offset_of!(ExecutionContext, instruction_offset) == 40);
     assert!(mem::offset_of!(ExecutionContext, tag) == 48);
 };
+
+unsafe fn program_peer_vm_release(id: u32) -> bool {
+    let mut count = 0;
+    unsafe {
+        crate::memory::vm_pager_api::r4os_rust_vm_release_owner(
+            3,
+            u64::from(id),
+            0,
+            false,
+            &mut count,
+        ) == 0
+    }
+}
+
+unsafe fn program_peer_backing_release(id: u32) {
+    let mut result = core::mem::MaybeUninit::uninit();
+    unsafe {
+        crate::memory::backing_store::r4os_rust_backing_release_r4x_owner(id, result.as_mut_ptr());
+    }
+}

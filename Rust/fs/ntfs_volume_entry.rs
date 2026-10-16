@@ -318,7 +318,6 @@ fn status(tag: u32) -> WriteStatus {
 /// The caller exclusively owns a properly initialized resident native Cache;
 /// value arguments and output addresses follow the private C layouts.
 pub unsafe extern "C" fn r4_ntfs_metadata(op: u32, input: *const Args) -> u64 {
-    #[cfg(not(r4os_owner_fixture))]
     let _owner = crate::memory::owner::Guard::acquire(1);
     unsafe {
         let a = input.read();

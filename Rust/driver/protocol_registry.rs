@@ -364,3 +364,74 @@ pub(crate) fn diagnostic_entry(role: &[u8]) -> Option<Entry> {
             .map(|slot| row(slot).read())
     }
 }
+
+pub(crate) fn source_name(source: u8) -> &'static [u8] {
+    match source {
+        0 => b"builtin",
+        1 => b"r4p",
+        2 => b"preload",
+        _ => unreachable!(),
+    }
+}
+pub(crate) fn category_name(category: u16) -> &'static [u8] {
+    match category {
+        1 => b"net",
+        2 => b"usb",
+        3 => b"audio",
+        4 => b"data",
+        255 => b"misc",
+        _ => b"unknown",
+    }
+}
+pub(crate) fn state_name(state: u8) -> &'static [u8] {
+    match state {
+        0 => b"empty",
+        1 => b"loaded",
+        2 => b"active",
+        3 => b"fallback",
+        4 => b"blocked",
+        5 => b"error",
+        6 => b"disabled",
+        _ => unreachable!(),
+    }
+}
+pub(crate) fn get(slot: usize) -> Option<Entry> {
+    let mut out = mem::MaybeUninit::uninit();
+    unsafe { r4os_rust_protocol_registry_get(slot, out.as_mut_ptr()).then(|| out.assume_init()) }
+}
+pub(crate) fn dump_status() {
+    use crate::boot::log_route::{dec, puts};
+    puts(b"Protocol registry\r\n");
+    let mut shown = 0;
+    for slot in 0..MAX_PROTOCOLS {
+        let Some(e) = get(slot) else { continue };
+        shown += 1;
+        puts(b"  ");
+        puts(&e.role[..e.role_len]);
+        puts(b" name=");
+        puts(&e.name[..e.name_len]);
+        puts(b" src=");
+        puts(source_name(e.source));
+        puts(b" cat=");
+        puts(category_name(e.category));
+        puts(b" state=");
+        puts(state_name(e.state));
+        if e.last_error != 0 {
+            puts(b" err=");
+            if e.last_error < 0 {
+                puts(b"-");
+                dec(i64::from(e.last_error).unsigned_abs());
+            } else {
+                dec(e.last_error as u64);
+            }
+        }
+        if e.note_len > 0 {
+            puts(b" note=");
+            puts(&e.note[..e.note_len]);
+        }
+        puts(b"\r\n");
+    }
+    if shown == 0 {
+        puts(b"  none\r\n");
+    }
+}

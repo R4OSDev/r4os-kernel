@@ -53,22 +53,17 @@ struct BackendCleanup {
     removed: u32,
     failed: bool,
 }
-unsafe extern "C" {
-    fn r4os_zig_driver_cleanup_owner(op: u8, owner: u32) -> u64;
-    fn r4os_zig_driver_usb_cleanup(owner: u32, out: *mut BackendCleanup);
-    fn r4os_zig_driver_cleanup_log(event: u8, owner: u32, counts: *const Counts);
-    fn r4os_zig_net_mutation(op: u8) -> bool;
-}
+
 fn bound(owner: u32) -> bool {
     owner != 0
         && admission::r4os_rust_driver_api_owner_scalar(0) == owner
         && admission::r4os_rust_driver_api_owner_scalar(1) != 0
 }
 fn backend(op: u8, owner: u32) -> u64 {
-    unsafe { r4os_zig_driver_cleanup_owner(op, owner) }
+    unsafe { driver_cleanup_owner(op, owner) }
 }
 fn log(event: u8, owner: u32) {
-    unsafe { r4os_zig_driver_cleanup_log(event, owner, ptr::null()) }
+    unsafe { driver_cleanup_log(event, owner, ptr::null()) }
 }
 fn close_data(owner: u32) {
     unsafe {
@@ -90,7 +85,7 @@ unsafe fn net_finish(token: *mut Token, quarantine: bool) {
         return;
     }
     unsafe {
-        r4os_zig_net_mutation(if quarantine { 2 } else { 1 });
+        net_mutation(if quarantine { 2 } else { 1 });
         (*token).net_mutation_active = false;
     }
 }
@@ -110,7 +105,7 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_prepare(owner: u32, out: *mut 
         return false;
     }
     if net::r4os_rust_driver_net_has_owner(owner) {
-        if !unsafe { r4os_zig_net_mutation(0) } {
+        if !unsafe { net_mutation(0) } {
             unsafe { storage::r4os_rust_driver_storage_cancel_plan(&mut token.storage_plan) };
             return false;
         }
@@ -299,7 +294,7 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_commit(token: *mut Token) -> b
     }
     count.audio = result.removed;
     let mut result = MaybeUninit::uninit();
-    unsafe { r4os_zig_driver_usb_cleanup(owner, result.as_mut_ptr()) };
+    unsafe { driver_usb_cleanup(owner, result.as_mut_ptr()) };
     let result = unsafe { result.assume_init() };
     if result.failed {
         unsafe { (*token).active = false };
@@ -387,7 +382,7 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_commit(token: *mut Token) -> b
     {
         return true;
     }
-    unsafe { r4os_zig_driver_cleanup_log(0, owner, &count) };
+    unsafe { driver_cleanup_log(0, owner, &count) };
     true
 }
 struct Owner;
@@ -418,3 +413,105 @@ const _: () = {
     assert!(size_of::<Token>() == 280 && offset_of!(Token, storage_plan) == 8);
     assert!(size_of::<Counts>() == 72);
 };
+
+unsafe fn net_mutation(op: u8) -> bool {
+    use crate::net::backend_admission as n;
+    match op {
+        0 => return n::r4os_rust_net_mutation_begin(),
+        1 => n::r4os_rust_net_mutation_end(),
+        2 => n::r4os_rust_net_mutation_quarantine(),
+        _ => panic!("Invalid backend mutation"),
+    };
+    true
+}
+
+unsafe fn driver_usb_cleanup(owner: u32, out: *mut BackendCleanup) {
+    let mut value = core::mem::MaybeUninit::uninit();
+    unsafe {
+        crate::usb::host_controller::r4os_rust_usb_host_cleanup(owner, value.as_mut_ptr());
+        let v = value.assume_init();
+        out.write(BackendCleanup {
+            removed: v.removed,
+            failed: v.failed,
+        });
+    }
+}
+
+unsafe fn driver_cleanup_owner(op: u8, owner: u32) -> u64 {
+    use crate::{
+        display::{blit_backend, manager, native_driver, queue},
+        gfx::driver_memory,
+    };
+    match op {
+        0 => return u64::from(manager::retains_driver_owner(owner as usize)),
+        1 => return u64::from(native_driver::retained(owner)),
+        2 => return u64::from(driver_memory::retained(owner)),
+        3 => return u64::from(queue::retains_driver(owner)),
+        4 => return u64::from(blit_backend::r4os_rust_display_blit_cleanup(0, owner) != 0),
+        5 => {
+            blit_backend::r4os_rust_display_blit_cleanup(1, owner);
+        }
+        6 => queue::closing_driver(owner),
+        7 => driver_memory::begin_close(owner),
+        8 => driver_memory::finish_owner(owner),
+        9 => crate::input::platform_input::r4os_rust_input_platform_remove(owner),
+        10 => return u64::from(blit_backend::r4os_rust_display_blit_cleanup(2, owner)),
+        _ => panic!("Invalid driver cleanup operation"),
+    };
+    0
+}
+
+unsafe fn driver_cleanup_log(event: u8, owner: u32, counts: *const Counts) {
+    use crate::boot::log::{self as l, Line};
+    use core::fmt::Write;
+    match event {
+        0 => {
+            let c = unsafe { &*counts };
+            let e = crate::driver::registry::get(
+                usize::try_from(owner.checked_sub(1).unwrap()).unwrap(),
+            );
+            let name = e
+                .as_ref()
+                .map_or(b"unknown".as_slice(), |v| &v.name[..v.name_len]);
+            let mut line = Line::<640>::new();
+            write!(line,"[R4D] cleanup owner={} irq={} work={} threads={} semaphores={} dma={} cpu-heap={} cpu-bytes={} msi={} audio={} storage={} usb-host={} display-blit={} net={} name=",owner,c.irq,c.work,c.threads,c.semaphores,c.dma,c.cpu_heap,c.cpu_bytes,c.msi,c.audio,c.storage,c.usb_host,c.display_blit,c.net).unwrap();
+            line.append(name);
+            line.append(b" result=complete\r\n");
+            line.emit();
+        }
+        1 => {
+            let mut line = Line::<128>::new();
+            write!(
+                line,
+                "[R4D] cleanup owner={} thread-callbacks=active resources=quarantined\r\n",
+                owner
+            )
+            .unwrap();
+            line.emit();
+        }
+        3 => l::text(b"[R4D] audio-finalize=FAILED resources=quarantined\r\n"),
+        7 => l::text(b"[R4D] cleanup work=quiesced graphics=retained resources=quarantined\r\n"),
+        11 => {
+            l::text(b"[R4D] cleanup veto owner=");
+            l::r4os_rust_bootlog_dec(u64::from(owner));
+            l::text(b" backend-busy\r\n");
+        }
+        2 | 4 | 5 | 6 | 8 | 9 | 10 => {
+            l::text(b"[R4D] cleanup owner=");
+            l::r4os_rust_bootlog_dec(u64::from(owner));
+            l::text(match event {
+                2 => b" net-finalize=FAILED resources=quarantined\r\n",
+                4 => b" usb-host-finalize=FAILED resources=quarantined\r\n",
+                5 => b" msi-disable=FAILED resources=quarantined\r\n",
+                6 => b" work-quiesce=FAILED dma=retained resources=quarantined\r\n",
+                8 => b" threads=retained dma=retained cpu-heap=retained resources=quarantined\r\n",
+                9 => {
+                    b" semaphores=retained dma=retained cpu-heap=retained resources=quarantined\r\n"
+                }
+                10 => b" cpu-heap=retained resources=quarantined\r\n",
+                _ => unreachable!(),
+            });
+        }
+        _ => panic!("Invalid cleanup diagnostic"),
+    }
+}

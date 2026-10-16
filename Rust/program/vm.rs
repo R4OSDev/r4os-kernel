@@ -12,7 +12,7 @@ const INVALID: i32 = -1;
 const OWNER: i32 = -3;
 const FLAGS: i32 = -11;
 const LIMIT: i32 = -13;
-unsafe extern "C" {}
+
 fn stats() -> vm_query::Stats {
     let mut out = MaybeUninit::uninit();
     unsafe {

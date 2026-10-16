@@ -6,12 +6,12 @@ use super::{
     ipv4, packet_io as io, packet_views::OwnedIpv4Packet, protocol_stats as stats, rx_handoff,
     rx_runtime, tcp_wire, transmit, udp_sockets,
 };
-use crate::{build_bridge::config as build_config, memory::owner::Guard, sched::sync_types::Text};
+use crate::{build_config::config as build_config, memory::owner::Guard, sched::sync_types::Text};
 use core::{cell::UnsafeCell, mem::MaybeUninit, ptr};
 #[repr(C)]
 pub struct Peers {
-    pub rx: *const rx_runtime::RxPeers,
-    pub arp: *const stats::ArpPeers,
+    pub rx: &'static rx_runtime::RxPeers,
+    pub arp: &'static stats::ArpPeers,
 }
 struct PeerStorage(UnsafeCell<*const Peers>);
 // SAFETY: singleton bootstrap installs one immutable kernel-lifetime table.

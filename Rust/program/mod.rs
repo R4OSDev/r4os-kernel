@@ -75,3 +75,5 @@ pub mod util;
 pub mod vm;
 
 pub mod r4dev;
+
+pub(crate) mod platform_callbacks;

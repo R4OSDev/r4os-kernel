@@ -1,6 +1,6 @@
 //! The early boot cuts are Rust owned; later CPU/clock/input/display owners
 //! publish only fixed snapshots or perform their explicitly named work.
-use crate::{arch::tables, build_bridge::config};
+use crate::{arch::tables, build_config::config};
 use core::sync::atomic::{AtomicBool, Ordering};
 static CPU_INITIALIZED: AtomicBool = AtomicBool::new(false);
 static REDIRECT: AtomicBool = AtomicBool::new(false);
@@ -16,11 +16,7 @@ pub struct IntroInfo {
     glyph_width: u32,
     glyph_height: u32,
 }
-unsafe extern "C" {
-    fn r4os_zig_cpu_foundation();
-    fn r4os_zig_boot_console(output: *mut IntroInfo) -> i32;
-    fn r4os_zig_boot_foundation_summary();
-}
+
 pub fn puts(text: &[u8]) {
     super::log_route::puts(text);
 }
@@ -40,7 +36,7 @@ pub extern "C" fn r4os_rust_cpu_boot() {
     tables::r4os_rust_idt_init();
     puts(b"  IDT loaded ");
     puts(b"[OK]\r\n");
-    unsafe { r4os_zig_cpu_foundation() };
+    unsafe { cpu_foundation() };
     CPU_INITIALIZED.store(true, Ordering::Relaxed);
 }
 #[unsafe(no_mangle)]
@@ -57,7 +53,7 @@ pub extern "C" fn r4os_rust_boot_intro() -> bool {
         return false;
     }
     let mut info = IntroInfo::default();
-    let result = unsafe { r4os_zig_boot_console(&mut info) };
+    let result = unsafe { boot_console(&mut info) };
     if result != 0 {
         let text: &[u8] = if result == -1 {
             b"No framebuffer in BootInfo"
@@ -67,7 +63,7 @@ pub extern "C" fn r4os_rust_boot_intro() -> bool {
         unsafe { super::fatal::r4os_rust_fatal_record(1, text.as_ptr(), text.len()) };
         return false;
     }
-    unsafe { r4os_zig_boot_foundation_summary() };
+    unsafe { boot_foundation_summary() };
     if config::ENABLE_EXCEPTION_TEST {
         puts(b"  Triggering test exception...\r\n");
         unsafe { core::arch::asm!("ud2", options(nostack)) };
@@ -145,4 +141,66 @@ pub extern "C" fn r4os_rust_com_debug_boot() {
     } else {
         unsafe { super::log_route::set_serial(None, None, None, None) };
     }
+}
+
+unsafe fn cpu_foundation() {
+    crate::arch::pic::init();
+    crate::platform::cpu::detect();
+    crate::arch::smp::r4os_rust_smp_control(0, 0);
+    crate::platform::monotonic::r4os_rust_monotonic_control(1, 0);
+    if !crate::arch::fpu::init() {
+        crate::boot::fatal::kernel(2, b"FPU/SSE task-state init failed");
+    }
+}
+
+unsafe fn boot_console(output: *mut IntroInfo) -> i32 {
+    let Some(state) = crate::display::boot_display::get() else {
+        return -1;
+    };
+    let stats = crate::display::manager::stats();
+    if !stats.registered {
+        return -2;
+    }
+    let mode = stats.mode;
+    let (w, h) = crate::font::owner::with_catalog(|s| (s.glyph_width(), s.glyph_height()));
+    unsafe {
+        output.write(IntroInfo {
+            width: mode.width,
+            height: mode.height,
+            bpp: u32::from(mode.bpp),
+            cols: state.console_metrics.cols,
+            rows: state.console_metrics.rows,
+            scale: state.console_metrics.scale,
+            glyph_width: w,
+            glyph_height: h,
+        });
+    }
+    0
+}
+
+unsafe fn boot_foundation_summary() {
+    use crate::{boot::log_route as l, input::boot as input, platform::timer};
+    l::puts(b"  Booted via Limine ");
+    l::puts(b"[OK]\r\n");
+    l::puts(b"  CPU tables / PIC ");
+    l::puts(b"[OK]\r\n");
+    l::puts(b"  Timer core ");
+    l::puts(timer::backend_name());
+    l::puts(b" ");
+    l::dec(u64::from(timer::frequency()));
+    l::puts(b" Hz [OK]\r\n");
+    l::puts(b"  Keyboard IRQ ");
+    l::puts(if input::r4os_rust_input_boot_keyboard_ready() {
+        b"[OK]\r\n"
+    } else {
+        b"[not ready]\r\n"
+    });
+    l::puts(b"  Mouse IRQ ");
+    l::puts(match input::r4os_rust_input_boot_mouse_status() {
+        0 => b"[not ready]\r\n",
+        1 => b"[OK]\r\n",
+        2 => b"[not found]\r\n",
+        3 => b"[no display]\r\n",
+        _ => unreachable!(),
+    });
 }

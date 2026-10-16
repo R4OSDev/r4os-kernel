@@ -303,9 +303,7 @@ pub(super) unsafe fn fill_run(
         }
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_pgcache_diagnostic(op: u8, token: u64, value: u64, extra: u64) -> u64;
-}
+
 pub(super) unsafe fn read_sector(device: usize, lba: u64, out: *mut u8, len: usize) -> bool {
     unsafe {
         if len < SECTOR {
@@ -358,7 +356,7 @@ pub(super) unsafe fn read_sector(device: usize, lba: u64, out: *mut u8, len: usi
                 busy += 1;
                 if busy > c::BUSY_TICKS {
                     STATS.read_errors.fetch_add(1, Relaxed);
-                    r4os_zig_pgcache_diagnostic(4, 0, device as u64, page);
+                    crate::fs::page_cache::diagnostic(4, 0, device as u64, page);
                     return false;
                 }
                 if !c::wait_busy(held.owned) {
@@ -489,7 +487,7 @@ pub(super) unsafe fn read_sectors(
                 if (*e).io_busy {
                     busy += 1;
                     if busy > c::BUSY_TICKS {
-                        r4os_zig_pgcache_diagnostic(5, 0, device as u64, page);
+                        crate::fs::page_cache::diagnostic(5, 0, device as u64, page);
                         STATS.read_errors.fetch_add(1, Relaxed);
                         return false;
                     }

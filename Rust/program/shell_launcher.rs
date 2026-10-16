@@ -22,20 +22,7 @@ struct Config {
     path: Bytes,
     args: Bytes,
 }
-unsafe extern "C" {
-    fn r4os_zig_program_shell_init(usable_bytes: u64);
-    fn r4os_zig_program_shell_config(config: *const c_void, output: *mut Config);
-    fn r4os_zig_program_shell_text(channel: u8, value: Bytes);
-    fn r4os_zig_program_shell_run(
-        boot: *mut c_void,
-        working: *mut c_void,
-        path: Bytes,
-        args: Bytes,
-        shell: bool,
-        host: u32,
-    ) -> u8;
-    fn r4os_zig_program_shell_fatal(reason: Bytes) -> !;
-}
+
 fn span(value: &[u8]) -> Bytes {
     Bytes {
         data: value.as_ptr(),
@@ -50,7 +37,7 @@ unsafe fn bytes<'a>(value: Bytes) -> &'a [u8] {
     }
 }
 fn text(channel: u8, value: &[u8]) {
-    unsafe { r4os_zig_program_shell_text(channel, span(value)) }
+    unsafe { program_shell_text(channel, span(value)) }
 }
 fn log(value: &[u8]) {
     text(1, value)
@@ -63,8 +50,7 @@ fn run(
     shell: bool,
     host: u32,
 ) -> u8 {
-    let result =
-        unsafe { r4os_zig_program_shell_run(boot, working, span(path), span(args), shell, host) };
+    let result = unsafe { program_shell_run(boot, working, span(path), span(args), shell, host) };
     assert!(result <= FAILED);
     result
 }
@@ -193,7 +179,7 @@ fn retire() -> ! {
     unreachable!("Retired boot task returned")
 }
 fn fatal(reason: &[u8]) -> ! {
-    unsafe { r4os_zig_program_shell_fatal(span(reason)) }
+    unsafe { program_shell_fatal(span(reason)) }
 }
 fn crash(path: &[u8]) -> ! {
     crate::boot::performance::fail_no_shell();
@@ -231,10 +217,10 @@ pub unsafe extern "C" fn r4os_rust_program_shell_start(
     config: *const c_void,
     usable_bytes: u64,
 ) -> ! {
-    unsafe { r4os_zig_program_shell_init(usable_bytes) };
+    unsafe { program_shell_init(usable_bytes) };
     log(b"[LAUNCH] Legacy shell runtime bridge disabled; external shell required\r\n");
     let mut values = core::mem::MaybeUninit::<Config>::uninit();
-    unsafe { r4os_zig_program_shell_config(config, values.as_mut_ptr()) };
+    unsafe { program_shell_config(config, values.as_mut_ptr()) };
     let values = unsafe { values.assume_init() };
     let path = unsafe { bytes(values.path) };
     let args = unsafe { bytes(values.args) };
@@ -304,3 +290,80 @@ const _: () = {
     assert!(core::mem::size_of::<Bytes>() == 16);
     assert!(core::mem::size_of::<Config>() == 32);
 };
+
+unsafe fn program_shell_init(usable_bytes: u64) {
+    unsafe { crate::program::runtime_tables::r4os_rust_program_runtime_initialize(usable_bytes) };
+}
+
+unsafe fn program_shell_config(config: *const c_void, output: *mut Config) {
+    unsafe {
+        let path = crate::boot::config::shell_path(config.cast());
+        let args = crate::boot::config::shell_args(config.cast());
+        output.write(Config {
+            path: Bytes {
+                data: path.data,
+                len: path.len,
+            },
+            args: Bytes {
+                data: args.data,
+                len: args.len,
+            },
+        });
+    }
+}
+
+unsafe fn program_shell_run(
+    boot: *mut c_void,
+    working: *mut c_void,
+    path: Bytes,
+    args: Bytes,
+    shell: bool,
+    host: u32,
+) -> u8 {
+    unsafe {
+        let p = crate::fs::vfs_types::Bytes {
+            data: path.data,
+            len: path.len,
+        };
+        let a = crate::fs::vfs_types::Bytes {
+            data: args.data,
+            len: args.len,
+        };
+        u8::try_from(crate::program::launch::r4os_rust_program_launch_path(
+            u8::from(shell),
+            boot.cast(),
+            p,
+            a,
+            working.cast(),
+            if shell {
+                u8::try_from(host).unwrap()
+            } else {
+                0
+            },
+            ptr::null_mut(),
+        ))
+        .unwrap()
+    }
+}
+
+unsafe fn program_shell_fatal(reason: Bytes) -> ! {
+    unsafe { crate::boot::fatal::r4os_rust_kernel_fatal(18, reason.data, reason.len) }
+}
+
+unsafe fn program_shell_text(channel: u8, value: Bytes) {
+    unsafe {
+        let bytes = if value.len == 0 {
+            &[]
+        } else {
+            slice::from_raw_parts(value.data, value.len)
+        };
+        match channel {
+            0 => crate::boot::log_route::puts(bytes),
+            1 => crate::boot::log::text(bytes),
+            2 => crate::display::bootscreen::set_status(value.data, value.len),
+            3 => crate::display::bootscreen::set_detail(value.data, value.len),
+            4 => crate::display::bootscreen::clear_detail(),
+            _ => panic!("Invalid shell output channel"),
+        }
+    }
+}

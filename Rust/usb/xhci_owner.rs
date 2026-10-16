@@ -13,16 +13,12 @@ use crate::{
     sched::{scheduler, sync_locks, task::task_registry},
 };
 use core::ptr;
-unsafe extern "C" {
-    fn r4os_zig_usb_xhci_incident_begin() -> u64;
-    fn r4os_zig_usb_xhci_incident_resolve(generation: u64) -> bool;
-    fn r4os_zig_usb_xhci_diag_line(text: *const u8, len: usize);
-}
+
 fn incident_line(text: &[u8]) {
-    let token = unsafe { r4os_zig_usb_xhci_incident_begin() };
+    let token = unsafe { usb_xhci_incident_begin() };
     unsafe {
-        r4os_zig_usb_xhci_diag_line(text.as_ptr(), text.len());
-        r4os_zig_usb_xhci_incident_resolve(token)
+        usb_xhci_diag_line(text.as_ptr(), text.len());
+        crate::display::diag_screen::resolve(token)
     };
 }
 fn ownership() -> *mut crate::sched::sync_types::UnwindGuard {
@@ -172,4 +168,13 @@ pub(super) unsafe fn idle_device_wait(wait: *mut Wait) {
         },
         "xHCI pinned runtime changed during wait"
     );
+}
+
+unsafe fn usb_xhci_incident_begin() -> u64 {
+    crate::display::diag_screen::begin_resolvable()
+}
+
+unsafe fn usb_xhci_diag_line(text: *const u8, len: usize) {
+    unsafe { crate::display::diag_screen::write(text, len) };
+    crate::display::diag_screen::end_line();
 }

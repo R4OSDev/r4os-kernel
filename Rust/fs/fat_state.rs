@@ -405,24 +405,20 @@ pub(super) unsafe fn cooperate(steps: &mut u32) {
         }
     }
 }
-unsafe extern "C" {
-    fn r4os_zig_fat_text(data: *const u8, len: usize);
-    fn r4os_zig_fat_decimal(value: u64);
-    fn r4os_zig_fat_char(value: u8);
-}
+
 pub fn log(s: &[u8]) {
     unsafe {
-        r4os_zig_fat_text(s.as_ptr(), s.len());
+        fat_text(s.as_ptr(), s.len());
     }
 }
 pub fn decimal(v: u64) {
-    unsafe {
-        r4os_zig_fat_decimal(v);
+    {
+        crate::boot::log_route::dec(v);
     }
 }
 pub fn character(v: u8) {
-    unsafe {
-        r4os_zig_fat_char(v);
+    {
+        crate::boot::log_route::putc(v);
     }
 }
 pub fn timestamp() -> (u16, u16) {
@@ -852,4 +848,8 @@ pub(super) unsafe fn ensure_scanned(v: Volume) {
         STATS.inusemap_deferred_builds.fetch_add(1, Relaxed);
         cross_check(v, s, info);
     }
+}
+
+unsafe fn fat_text(data: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, data, len) }
 }

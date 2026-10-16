@@ -43,7 +43,7 @@ impl Entry {
     }
 }
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct Args {
     pub volume: Mounted,
     pub entry: *const Entry,

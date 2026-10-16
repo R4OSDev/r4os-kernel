@@ -12,10 +12,7 @@ use core::{
     ptr,
     sync::atomic::{AtomicBool, Ordering},
 };
-unsafe extern "C" {
-    fn r4os_zig_program_info_terminal(instance: *const ProgramInstance) -> bool;
-    fn r4os_zig_program_info_window(instance: *const ProgramInstance) -> i32;
-}
+
 #[repr(C)]
 pub struct Snapshot {
     pub id: u32,
@@ -68,7 +65,7 @@ pub(super) unsafe fn instance_info(instance: *const ProgramInstance) -> Info {
         {
             flags |= 2;
         }
-        if r4os_zig_program_info_terminal(instance) {
+        if program_info_terminal(instance) {
             flags |= 4;
         }
         let usage = vm_stats(instance, false);
@@ -80,7 +77,7 @@ pub(super) unsafe fn instance_info(instance: *const ProgramInstance) -> Info {
             state: instance_state(instance),
             flags,
             exit_code: (*instance).exit_code,
-            window_id: r4os_zig_program_info_window(instance),
+            window_id: program_info_window(instance),
             memory_profile: (*instance).memory_profile,
             reserved0: [0; 3],
             memory_reserved_limit: (*instance).memory_limits.vm_reserve_limit,
@@ -365,3 +362,26 @@ const _: () = {
     assert!(core::mem::offset_of!(Snapshot, exit_code) == 12);
     assert!(core::mem::size_of::<Info>() == 112);
 };
+
+unsafe fn program_info_terminal(instance: *const ProgramInstance) -> bool {
+    unsafe {
+        let p = (*instance)
+            .console_payload
+            .cast::<crate::program::payload_types::Console>();
+        !p.is_null() && (*p).host == 2
+    }
+}
+
+unsafe fn program_info_window(instance: *const ProgramInstance) -> i32 {
+    unsafe {
+        let p = (*instance)
+            .gui_payload
+            .cast::<crate::program::payload_types::Gui>();
+        if p.is_null() {
+            -1
+        } else {
+            core::sync::atomic::AtomicI32::from_ptr(core::ptr::addr_of_mut!((*p).window_id))
+                .load(Ordering::Acquire)
+        }
+    }
+}

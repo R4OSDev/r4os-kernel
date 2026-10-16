@@ -167,19 +167,15 @@ pub(super) fn invariant() -> bool {
     }
     true
 }
-unsafe extern "C" {
-    fn r4os_zig_vm_puts(text: *const u8, len: usize);
-    fn r4os_zig_vm_dec(value: u64);
-    fn r4os_zig_vm_hex(value: u64, width: u8);
-}
+
 fn text(value: &[u8]) {
-    unsafe { r4os_zig_vm_puts(value.as_ptr(), value.len()) }
+    unsafe { vm_puts(value.as_ptr(), value.len()) }
 }
 fn dec(value: u64) {
-    unsafe { r4os_zig_vm_dec(value) }
+    crate::boot::log_route::dec(value)
 }
 fn hex(value: u64) {
-    unsafe { r4os_zig_vm_hex(value, 16) }
+    crate::boot::log_route::hex(value, 16)
 }
 pub(super) fn dump() {
     let _held = Guard::acquire(5);
@@ -258,4 +254,8 @@ pub(super) fn hot_stats() -> HotPathStats {
     out.commit_span_step_max = commits.commit_span_step_max;
     out.page_state_span_active = ps::with(|s| s.active);
     out
+}
+
+unsafe fn vm_puts(text: *const u8, len: usize) {
+    unsafe { crate::boot::log_route::r4os_rust_log_write(0, text, len) }
 }

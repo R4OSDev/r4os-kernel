@@ -1,6 +1,6 @@
 //! Stable platform API tables and program runtime initialization. Canonical
 //! Contract defaults supply every header and reserved slot. Typed readonly
-//! callback projections have no backing tables or program state in Zig.
+//! native C callbacks carry the unchanged public slot signatures and records.
 use super::{async_io, reaper, registry_state};
 use crate::{contract as c, sched::task::task_api};
 use core::{
@@ -59,168 +59,249 @@ impl<T: Default> Table<T> {
     }
 }
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
-unsafe extern "C" {
-    fn r4os_zig_program_runtime_bindings(group: u8, out: *mut usize, count: usize);
-    fn r4os_zig_program_runtime_register(op: u8, value: u64);
-}
+
 static SYS: Table<c::R4XStartR4Sys> = Table::new();
 fn configure_sys() {
-    let mut bindings = [0usize; 153];
-    unsafe { r4os_zig_program_runtime_bindings(1, bindings.as_mut_ptr(), bindings.len()) };
     let value = c::R4XStartR4Sys {
-        write: bindings[0],
-        putc: bindings[1],
-        sleep_ticks: bindings[2],
-        ticks: bindings[3],
-        env_get: bindings[4],
-        dir_entry: bindings[5],
-        program_should_close: bindings[6],
-        program_class: bindings[7],
-        program_instance: bindings[8],
-        service_status: bindings[9],
-        service_open: bindings[10],
-        service_close: bindings[11],
-        service_call: bindings[12],
-        service_endpoint_register: bindings[13],
-        service_endpoint_unregister: bindings[14],
-        service_endpoint_poll: bindings[15],
-        service_endpoint_recv: bindings[16],
-        service_endpoint_reply: bindings[17],
-        service_detail_by_name: bindings[18],
-        service_start: bindings[19],
-        service_stop: bindings[20],
-        service_restart: bindings[21],
-        service_install: bindings[22],
-        service_remove: bindings[23],
-        vm_reserve: bindings[24],
-        vm_commit: bindings[25],
-        vm_decommit: bindings[26],
-        vm_release: bindings[27],
-        vm_query: bindings[28],
-        thread_create: bindings[29],
-        thread_exit: bindings[30],
-        thread_join: bindings[31],
-        thread_current: bindings[32],
-        thread_status: bindings[33],
-        io_file_read: bindings[34],
-        io_file_read_at: bindings[35],
-        io_file_write: bindings[36],
-        io_file_append: bindings[37],
-        io_file_stream_begin: bindings[38],
-        io_file_stream_write: bindings[39],
-        io_file_stream_finish: bindings[40],
-        io_file_stream_abort: bindings[41],
-        io_service_call: bindings[42],
-        io_status: bindings[43],
-        io_wait: bindings[44],
-        io_close: bindings[45],
-        task_yield: bindings[46],
-        system_halt: bindings[47],
-        system_reboot: bindings[48],
-        system_poweroff: bindings[49],
-        time_state: bindings[50],
-        time_set_state: bindings[51],
-        time_seconds_since_midnight: bindings[52],
-        dir_list: bindings[53],
-        dir_create: bindings[54],
-        dir_delete: bindings[55],
-        drive_info: bindings[56],
-        file_info: bindings[57],
-        file_delete: bindings[58],
-        file_rename: bindings[59],
-        file_copy: bindings[60],
-        file_move: bindings[61],
-        file_read: bindings[62],
-        file_write: bindings[63],
-        file_read_at: bindings[64],
-        file_append: bindings[65],
-        file_stream_begin: bindings[66],
-        file_stream_write: bindings[67],
-        file_stream_finish: bindings[68],
-        file_stream_abort: bindings[69],
-        env_set: bindings[70],
-        registry_key_info: bindings[71],
-        registry_enum_key: bindings[72],
-        registry_enum_value: bindings[73],
-        registry_get_value: bindings[74],
-        registry_set_value: bindings[75],
-        registry_delete_value: bindings[76],
-        service_info: bindings[77],
-        service_detail: bindings[78],
-        service_set_start_mode: bindings[79],
-        service_endpoint_wait: bindings[80],
-        program_run: bindings[81],
-        program_launch: bindings[82],
-        program_spawn: bindings[83],
-        program_kill: bindings[84],
-        program_status: bindings[85],
-        program_request_close: bindings[86],
-        program_reap_instance: bindings[87],
-        boot_log_info: bindings[88],
-        boot_log_read: bindings[89],
-        program_spawn_handle: bindings[90],
-        program_open_handle: bindings[91],
-        program_handle_status: bindings[92],
-        program_handle_request_close: bindings[93],
-        program_handle_kill: bindings[94],
-        program_handle_wait: bindings[95],
-        program_handle_reap: bindings[96],
-        program_completion_read: bindings[97],
-        program_inventory_begin: bindings[98],
-        program_inventory_programs: bindings[99],
-        program_inventory_tasks: bindings[100],
-        program_inventory_threads: bindings[101],
-        thread_create_handle: bindings[102],
-        thread_handle_join: bindings[103],
-        thread_handle_status: bindings[104],
-        file_replace_atomic: bindings[105],
-        file_delete_if_match: bindings[106],
-        file_update_atomic_checked: bindings[107],
-        path_names_equal_collated: bindings[108],
-        file_update_cleanup_checked: bindings[109],
-        file_stream_declare_publish: bindings[110],
-        module_resource_stat: bindings[111],
-        module_resource_read: bindings[112],
-        program_module_path: bindings[113],
-        program_module_running: bindings[114],
-        monotonic_clock: bindings[115],
-        boot_ready: bindings[116],
-        registry_snapshot_begin: bindings[117],
-        registry_snapshot_page: bindings[118],
-        registry_batch_mutate: bindings[119],
-        io_file_write_at: bindings[120],
-        io_file_info: bindings[121],
-        io_file_lock: bindings[122],
-        storage_inventory: bindings[123],
-        storage_device: bindings[124],
-        storage_partition: bindings[125],
-        storage_volume: bindings[126],
-        storage_claim_begin: bindings[127],
-        storage_claim_end: bindings[128],
-        storage_read: bindings[129],
-        storage_claim_read: bindings[130],
-        storage_claim_write: bindings[131],
-        storage_claim_flush: bindings[132],
-        storage_rescan: bindings[133],
-        storage_mount: bindings[134],
-        storage_unmount: bindings[135],
-        storage_use_begin: bindings[136],
-        storage_use_end: bindings[137],
-        directory_change_begin: bindings[138],
-        directory_change_poll: bindings[139],
-        file_copy_buffered: bindings[140],
-        notification_create: bindings[141],
-        notification_query: bindings[142],
-        notification_notify: bindings[143],
-        notification_wait: bindings[144],
-        notification_close: bindings[145],
-        program_local_get: bindings[146],
-        program_local_publish: bindings[147],
-        thread_current_handle: bindings[148],
-        cpu_capacity: bindings[149],
-        program_exit: bindings[150],
-        platform_input_snapshot: bindings[151],
-        directory_next: bindings[152],
+        write: super::platform_callbacks::sys_write as *const () as usize,
+        putc: super::platform_callbacks::sys_putc as *const () as usize,
+        sleep_ticks: crate::program::system::control::r4os_rust_sys_sleep as *const () as usize,
+        ticks: crate::program::system::control::r4os_rust_sys_ticks as *const () as usize,
+        env_get: crate::program::process_data::r4os_rust_program_data_env_api_get as *const ()
+            as usize,
+        dir_entry: crate::program::system::directory::r4os_rust_sys_dir_entry as *const () as usize,
+        program_should_close: super::platform_callbacks::sys_program_should_close as *const ()
+            as usize,
+        program_class: super::platform_callbacks::sys_program_class as *const () as usize,
+        program_instance: crate::program::info::r4os_rust_program_info_index as *const () as usize,
+        service_status: super::platform_callbacks::sys_service_status as *const () as usize,
+        service_open: super::platform_callbacks::sys_service_open as *const () as usize,
+        service_close: super::platform_callbacks::sys_service_close as *const () as usize,
+        service_call: super::platform_callbacks::sys_service_call as *const () as usize,
+        service_endpoint_register: crate::program::service_api::r4os_rust_program_service_register
+            as *const () as usize,
+        service_endpoint_unregister: super::platform_callbacks::sys_service_endpoint_unregister
+            as *const () as usize,
+        service_endpoint_poll: super::platform_callbacks::sys_service_endpoint_poll as *const ()
+            as usize,
+        service_endpoint_recv: crate::program::service_api::r4os_rust_program_service_recv
+            as *const () as usize,
+        service_endpoint_reply: crate::program::service_api::r4os_rust_program_service_reply
+            as *const () as usize,
+        service_detail_by_name: crate::program::service_api::r4os_rust_program_service_detail_name
+            as *const () as usize,
+        service_start: super::platform_callbacks::sys_service_start as *const () as usize,
+        service_stop: super::platform_callbacks::sys_service_stop as *const () as usize,
+        service_restart: super::platform_callbacks::sys_service_restart as *const () as usize,
+        service_install: crate::program::service_api::r4os_rust_program_service_install as *const ()
+            as usize,
+        service_remove: super::platform_callbacks::sys_service_remove as *const () as usize,
+        vm_reserve: crate::program::vm::r4os_rust_program_vm_reserve as *const () as usize,
+        vm_commit: crate::program::vm::r4os_rust_program_vm_commit as *const () as usize,
+        vm_decommit: super::platform_callbacks::sys_vm_decommit as *const () as usize,
+        vm_release: super::platform_callbacks::sys_vm_release as *const () as usize,
+        vm_query: crate::program::vm::r4os_rust_program_vm_query as *const () as usize,
+        thread_create: super::platform_callbacks::sys_thread_create as *const () as usize,
+        thread_exit: super::platform_callbacks::sys_thread_exit as *const () as usize,
+        thread_join: super::platform_callbacks::sys_thread_join as *const () as usize,
+        thread_current: super::platform_callbacks::sys_thread_current as *const () as usize,
+        thread_status: super::platform_callbacks::sys_thread_status as *const () as usize,
+        io_file_read: super::platform_callbacks::sys_io_file_read as *const () as usize,
+        io_file_read_at: super::platform_callbacks::sys_io_file_read_at as *const () as usize,
+        io_file_write: super::platform_callbacks::sys_io_file_write as *const () as usize,
+        io_file_append: super::platform_callbacks::sys_io_file_append as *const () as usize,
+        io_file_stream_begin: super::platform_callbacks::sys_io_file_stream_begin as *const ()
+            as usize,
+        io_file_stream_write: super::platform_callbacks::sys_io_file_stream_write as *const ()
+            as usize,
+        io_file_stream_finish: super::platform_callbacks::sys_io_file_stream_finish as *const ()
+            as usize,
+        io_file_stream_abort: super::platform_callbacks::sys_io_file_stream_abort as *const ()
+            as usize,
+        io_service_call: super::platform_callbacks::sys_io_service_call as *const () as usize,
+        io_status: super::platform_callbacks::sys_io_status as *const () as usize,
+        io_wait: super::platform_callbacks::sys_io_wait as *const () as usize,
+        io_close: super::platform_callbacks::sys_io_close as *const () as usize,
+        task_yield: crate::program::system::control::r4os_rust_sys_yield as *const () as usize,
+        system_halt: super::platform_callbacks::sys_system_halt as *const () as usize,
+        system_reboot: crate::program::system::control::r4os_rust_sys_reboot as *const () as usize,
+        system_poweroff: super::platform_callbacks::sys_system_poweroff as *const () as usize,
+        time_state: crate::program::system::control::r4os_rust_sys_time_state as *const () as usize,
+        time_set_state: crate::program::system::control::r4os_rust_sys_time_set as *const ()
+            as usize,
+        time_seconds_since_midnight: crate::program::system::control::r4os_rust_sys_seconds
+            as *const () as usize,
+        dir_list: crate::program::system::directory::r4os_rust_sys_dir_list as *const () as usize,
+        dir_create: crate::program::system::namespace::r4os_rust_sys_dir_create as *const ()
+            as usize,
+        dir_delete: crate::program::system::namespace::r4os_rust_sys_dir_delete as *const ()
+            as usize,
+        drive_info: crate::program::system::directory::r4os_rust_sys_drive_info as *const ()
+            as usize,
+        file_info: crate::program::system::directory::r4os_rust_sys_file_info as *const () as usize,
+        file_delete: crate::program::system::namespace::r4os_rust_sys_file_delete as *const ()
+            as usize,
+        file_rename: crate::program::system::namespace::r4os_rust_sys_file_rename as *const ()
+            as usize,
+        file_copy: crate::program::system::copy::r4os_rust_sys_file_copy as *const () as usize,
+        file_move: crate::program::system::copy::r4os_rust_sys_file_move as *const () as usize,
+        file_read: super::platform_callbacks::sys_file_read as *const () as usize,
+        file_write: super::platform_callbacks::sys_file_write as *const () as usize,
+        file_read_at: super::platform_callbacks::sys_file_read_at as *const () as usize,
+        file_append: super::platform_callbacks::sys_file_append as *const () as usize,
+        file_stream_begin: super::platform_callbacks::sys_file_stream_begin as *const () as usize,
+        file_stream_write: super::platform_callbacks::sys_file_stream_write as *const () as usize,
+        file_stream_finish: super::platform_callbacks::sys_file_stream_finish as *const () as usize,
+        file_stream_abort: super::platform_callbacks::sys_file_stream_abort as *const () as usize,
+        env_set: crate::program::process_data::r4os_rust_program_data_env_api_set as *const ()
+            as usize,
+        registry_key_info: crate::program::system::registry_api::r4os_rust_sys_registry_key_info
+            as *const () as usize,
+        registry_enum_key: crate::program::system::registry_api::r4os_rust_sys_registry_enum_key
+            as *const () as usize,
+        registry_enum_value: crate::program::system::registry_api::r4os_rust_sys_registry_enum_value
+            as *const () as usize,
+        registry_get_value: crate::program::system::registry_api::r4os_rust_sys_registry_get
+            as *const () as usize,
+        registry_set_value: crate::program::system::registry_api::r4os_rust_sys_registry_set
+            as *const () as usize,
+        registry_delete_value: crate::program::system::registry_api::r4os_rust_sys_registry_delete
+            as *const () as usize,
+        service_info: crate::program::service_api::r4os_rust_program_service_info as *const ()
+            as usize,
+        service_detail: crate::program::service_api::r4os_rust_program_service_detail as *const ()
+            as usize,
+        service_set_start_mode: super::platform_callbacks::sys_service_set_start_mode as *const ()
+            as usize,
+        service_endpoint_wait: super::platform_callbacks::sys_service_endpoint_wait as *const ()
+            as usize,
+        program_run: super::platform_callbacks::sys_program_run as *const () as usize,
+        program_launch: super::platform_callbacks::sys_program_launch as *const () as usize,
+        program_spawn: super::platform_callbacks::sys_program_spawn as *const () as usize,
+        program_kill: super::platform_callbacks::sys_program_kill as *const () as usize,
+        program_status: crate::program::info::r4os_rust_program_info_status as *const () as usize,
+        program_request_close: super::platform_callbacks::sys_program_request_close as *const ()
+            as usize,
+        program_reap_instance: super::platform_callbacks::sys_program_reap_instance as *const ()
+            as usize,
+        boot_log_info: crate::program::system::control::r4os_rust_sys_bootlog_info as *const ()
+            as usize,
+        boot_log_read: crate::program::system::control::r4os_rust_sys_bootlog_read as *const ()
+            as usize,
+        program_spawn_handle: super::platform_callbacks::sys_program_spawn_handle as *const ()
+            as usize,
+        program_open_handle: crate::program::process::r4os_rust_program_process_open as *const ()
+            as usize,
+        program_handle_status: crate::program::info::r4os_rust_program_info_handle as *const ()
+            as usize,
+        program_handle_request_close: crate::program::process::r4os_rust_program_process_close
+            as *const () as usize,
+        program_handle_kill: crate::program::process::r4os_rust_program_process_kill as *const ()
+            as usize,
+        program_handle_wait: crate::program::process::r4os_rust_program_process_wait as *const ()
+            as usize,
+        program_handle_reap: crate::program::process::r4os_rust_program_process_reap as *const ()
+            as usize,
+        program_completion_read: crate::program::program_api::r4os_rust_program_api_completion_read
+            as *const () as usize,
+        program_inventory_begin:
+            crate::program::execution_inventory::r4os_rust_program_execution_begin as *const ()
+                as usize,
+        program_inventory_programs: crate::program::inventory::r4os_rust_program_inventory_programs
+            as *const () as usize,
+        program_inventory_tasks:
+            crate::program::execution_inventory::r4os_rust_program_execution_tasks as *const ()
+                as usize,
+        program_inventory_threads:
+            crate::program::execution_inventory::r4os_rust_program_execution_threads as *const ()
+                as usize,
+        thread_create_handle: super::platform_callbacks::sys_thread_create_handle as *const ()
+            as usize,
+        thread_handle_join: super::platform_callbacks::sys_thread_handle_join as *const () as usize,
+        thread_handle_status: super::platform_callbacks::sys_thread_handle_status as *const ()
+            as usize,
+        file_replace_atomic: super::platform_callbacks::sys_file_replace_atomic as *const ()
+            as usize,
+        file_delete_if_match: crate::program::system::namespace::r4os_rust_sys_file_delete_match
+            as *const () as usize,
+        file_update_atomic_checked: crate::program::system::atomic::r4os_rust_sys_update_checked
+            as *const () as usize,
+        path_names_equal_collated: crate::program::system::namespace::r4os_rust_sys_names_equal
+            as *const () as usize,
+        file_update_cleanup_checked: crate::program::system::atomic::r4os_rust_sys_update_cleanup
+            as *const () as usize,
+        file_stream_declare_publish: crate::program::system::atomic::r4os_rust_sys_stream_declare
+            as *const () as usize,
+        module_resource_stat: crate::program::system::resources::r4os_rust_sys_resource_stat
+            as *const () as usize,
+        module_resource_read: crate::program::system::resources::r4os_rust_sys_resource_read
+            as *const () as usize,
+        program_module_path: crate::program::program_api::r4os_rust_program_api_module_path
+            as *const () as usize,
+        program_module_running: crate::program::system::io::r4os_rust_sys_module_running
+            as *const () as usize,
+        monotonic_clock: crate::program::system::control::r4os_rust_sys_monotonic as *const ()
+            as usize,
+        boot_ready: super::platform_callbacks::sys_boot_ready as *const () as usize,
+        registry_snapshot_begin:
+            crate::program::system::registry_api::r4os_rust_sys_registry_snapshot_begin as *const ()
+                as usize,
+        registry_snapshot_page:
+            crate::program::system::registry_api::r4os_rust_sys_registry_snapshot_page as *const ()
+                as usize,
+        registry_batch_mutate: crate::program::system::registry_batch::r4os_rust_sys_registry_batch
+            as *const () as usize,
+        io_file_write_at: super::platform_callbacks::sys_io_file_write_at as *const () as usize,
+        io_file_info: super::platform_callbacks::sys_io_file_info as *const () as usize,
+        io_file_lock: super::platform_callbacks::sys_io_file_lock as *const () as usize,
+        storage_inventory: super::platform_callbacks::sys_storage_inventory as *const () as usize,
+        storage_device: super::platform_callbacks::sys_storage_device as *const () as usize,
+        storage_partition: super::platform_callbacks::sys_storage_partition as *const () as usize,
+        storage_volume: super::platform_callbacks::sys_storage_volume as *const () as usize,
+        storage_claim_begin: super::platform_callbacks::sys_storage_claim_begin as *const ()
+            as usize,
+        storage_claim_end: super::platform_callbacks::sys_storage_claim_end as *const () as usize,
+        storage_read: super::platform_callbacks::sys_storage_read as *const () as usize,
+        storage_claim_read: super::platform_callbacks::sys_storage_claim_read as *const () as usize,
+        storage_claim_write: super::platform_callbacks::sys_storage_claim_write as *const ()
+            as usize,
+        storage_claim_flush: super::platform_callbacks::sys_storage_claim_flush as *const ()
+            as usize,
+        storage_rescan: super::platform_callbacks::sys_storage_rescan as *const () as usize,
+        storage_mount: super::platform_callbacks::sys_storage_mount as *const () as usize,
+        storage_unmount: super::platform_callbacks::sys_storage_unmount as *const () as usize,
+        storage_use_begin: crate::program::system::stream_api::r4os_rust_sys_storage_use
+            as *const () as usize,
+        storage_use_end: super::platform_callbacks::sys_storage_use_end as *const () as usize,
+        directory_change_begin:
+            crate::program::system::directory::r4os_rust_sys_directory_change_begin as *const ()
+                as usize,
+        directory_change_poll:
+            crate::program::system::directory::r4os_rust_sys_directory_change_poll as *const ()
+                as usize,
+        file_copy_buffered: crate::program::system::copy::r4os_rust_sys_file_copy_buffered
+            as *const () as usize,
+        notification_create: super::platform_callbacks::sys_notification_create as *const ()
+            as usize,
+        notification_query: super::platform_callbacks::sys_notification_query as *const () as usize,
+        notification_notify: super::platform_callbacks::sys_notification_notify as *const ()
+            as usize,
+        notification_wait: super::platform_callbacks::sys_notification_wait as *const () as usize,
+        notification_close: super::platform_callbacks::sys_notification_close as *const () as usize,
+        program_local_get: super::platform_callbacks::sys_program_local_get as *const () as usize,
+        program_local_publish: super::platform_callbacks::sys_program_local_publish as *const ()
+            as usize,
+        thread_current_handle:
+            crate::program::thread_runtime::r4os_rust_program_thread_current_handle as *const ()
+                as usize,
+        cpu_capacity: crate::program::system::control::r4os_rust_sys_cpu_capacity as *const ()
+            as usize,
+        program_exit: crate::program::thread_runtime::r4os_rust_program_thread_program_exit
+            as *const () as usize,
+        platform_input_snapshot: crate::input::platform_input::r4os_rust_input_platform_snapshot
+            as *const () as usize,
+        directory_next: crate::program::system::directory::r4os_rust_sys_directory_next as *const ()
+            as usize,
         ..Default::default()
     };
     SYS.configure(value);
@@ -390,73 +471,119 @@ const _: () = {
 };
 static DESK: Table<c::R4XStartR4Desk> = Table::new();
 fn configure_desk() {
-    let mut bindings = [0usize; 64];
-    unsafe { r4os_zig_program_runtime_bindings(2, bindings.as_mut_ptr(), bindings.len()) };
     let value = c::R4XStartR4Desk {
-        read_key: bindings[0],
-        mouse_state: bindings[1],
-        mouse_show: bindings[2],
-        mouse_hide: bindings[3],
-        keyboard_layout_current: bindings[4],
-        keyboard_layout_at: bindings[5],
-        keyboard_layout_set: bindings[6],
-        program_set_window: bindings[7],
-        program_set_console_host: bindings[8],
-        program_request_host_launch: bindings[9],
-        program_take_host_launch: bindings[10],
-        program_window_id: bindings[11],
-        gui_window_info: bindings[12],
-        gui_set_window_info: bindings[13],
-        gui_poll_event: bindings[14],
-        gui_push_event: bindings[15],
-        gui_set_text: bindings[16],
-        gui_text: bindings[17],
-        gui_revision: bindings[18],
-        gui_command: bindings[19],
-        gui_set_title: bindings[20],
-        gui_title: bindings[21],
-        gui_set_min_size: bindings[22],
-        gui_min_size: bindings[23],
-        console_output: bindings[24],
-        console_revision: bindings[25],
-        console_state: bindings[26],
-        console_set_metrics: bindings[27],
-        console_push_key: bindings[28],
-        console_write: bindings[29],
-        console_read: bindings[30],
-        clipboard_write: bindings[31],
-        clipboard_read: bindings[32],
-        clipboard_revision: bindings[33],
-        clipboard_info: bindings[34],
-        clipboard_clear: bindings[35],
-        read_key_codepoint: bindings[36],
-        remote_frame_info: bindings[37],
-        remote_frame_read: bindings[38],
-        remote_frame_wait: bindings[39],
-        remote_frame_publish: bindings[40],
-        remote_input_push: bindings[41],
-        remote_input_poll: bindings[42],
-        remote_input_status: bindings[43],
-        desktop_activity_wait: bindings[44],
-        remote_frame_map: bindings[45],
-        program_current_console_host: bindings[46],
-        program_request_desktop: bindings[47],
-        program_spawn_with_console_host: bindings[48],
-        program_spawn_with_console_host_handle: bindings[49],
-        program_set_window_handle: bindings[50],
-        console_push_input: bindings[51],
-        remote_frame_acquire: bindings[52],
-        remote_frame_release: bindings[53],
-        remote_frame_consumers: bindings[54],
-        remote_frame_publish_regions: bindings[55],
-        console_input_wait: bindings[56],
-        physical_key_poll: bindings[57],
-        mouse_motion: bindings[58],
-        remote_frame_snapshot_acquire: bindings[59],
-        remote_frame_snapshot_release: bindings[60],
-        remote_frame_source_reset: bindings[61],
-        remote_frame_capture_stats: bindings[62],
-        desktop_activity_notify: bindings[63],
+        read_key: super::platform_callbacks::desk_read_key as *const () as usize,
+        mouse_state: super::platform_callbacks::desk_mouse_state as *const () as usize,
+        mouse_show: super::platform_callbacks::desk_mouse_show as *const () as usize,
+        mouse_hide: super::platform_callbacks::desk_mouse_hide as *const () as usize,
+        keyboard_layout_current: super::platform_callbacks::desk_keyboard_layout_current
+            as *const () as usize,
+        keyboard_layout_at: super::platform_callbacks::desk_keyboard_layout_at as *const ()
+            as usize,
+        keyboard_layout_set: super::platform_callbacks::desk_keyboard_layout_set as *const ()
+            as usize,
+        program_set_window: super::platform_callbacks::desk_program_set_window as *const ()
+            as usize,
+        program_set_console_host: crate::program::program_api::r4os_rust_program_api_console_host
+            as *const () as usize,
+        program_request_host_launch: crate::program::program_api::r4os_rust_program_api_host_request
+            as *const () as usize,
+        program_take_host_launch: crate::program::program_api::r4os_rust_program_api_host_take
+            as *const () as usize,
+        program_window_id: super::platform_callbacks::desk_program_window_id as *const () as usize,
+        gui_window_info: crate::program::gui_events::r4os_rust_program_gui_window_info as *const ()
+            as usize,
+        gui_set_window_info: crate::program::gui_events::r4os_rust_program_gui_window_set
+            as *const () as usize,
+        gui_poll_event: crate::program::gui_events::r4os_rust_program_gui_event_poll as *const ()
+            as usize,
+        gui_push_event: crate::program::gui_events::r4os_rust_program_gui_event_push as *const ()
+            as usize,
+        gui_set_text: super::platform_callbacks::desk_gui_set_text as *const () as usize,
+        gui_text: super::platform_callbacks::desk_gui_text as *const () as usize,
+        gui_revision: crate::program::gui_events::r4os_rust_program_gui_revision_read as *const ()
+            as usize,
+        gui_command: crate::program::gui_api::r4os_rust_program_gui_api_command as *const ()
+            as usize,
+        gui_set_title: super::platform_callbacks::desk_gui_set_title as *const () as usize,
+        gui_title: super::platform_callbacks::desk_gui_title as *const () as usize,
+        gui_set_min_size: super::platform_callbacks::desk_gui_set_min_size as *const () as usize,
+        gui_min_size: crate::program::gui_events::r4os_rust_program_gui_min_size as *const ()
+            as usize,
+        console_output: crate::program::console::r4os_rust_program_console_api_output as *const ()
+            as usize,
+        console_revision: crate::program::console::r4os_rust_program_console_api_revision
+            as *const () as usize,
+        console_state: crate::program::console::r4os_rust_program_console_api_state as *const ()
+            as usize,
+        console_set_metrics: crate::program::console::r4os_rust_program_console_api_metrics
+            as *const () as usize,
+        console_push_key: super::platform_callbacks::desk_console_push_key as *const () as usize,
+        console_write: super::platform_callbacks::desk_console_write as *const () as usize,
+        console_read: crate::program::console_input::r4os_rust_program_console_input_api_read
+            as *const () as usize,
+        clipboard_write: super::platform_callbacks::desk_clipboard_write as *const () as usize,
+        clipboard_read: super::platform_callbacks::desk_clipboard_read as *const () as usize,
+        clipboard_revision: super::platform_callbacks::desk_clipboard_revision as *const ()
+            as usize,
+        clipboard_info: super::platform_callbacks::desk_clipboard_info as *const () as usize,
+        clipboard_clear: super::platform_callbacks::desk_clipboard_clear as *const () as usize,
+        read_key_codepoint: super::platform_callbacks::desk_read_key_codepoint as *const ()
+            as usize,
+        remote_frame_info: super::platform_callbacks::desk_remote_frame_info as *const () as usize,
+        remote_frame_read: super::platform_callbacks::desk_remote_frame_read as *const () as usize,
+        remote_frame_wait: super::platform_callbacks::desk_remote_frame_wait as *const () as usize,
+        remote_frame_publish:
+            crate::program::domain_api::r4os_rust_program_domain_remote_frame_publish as *const ()
+                as usize,
+        remote_input_push: super::platform_callbacks::desk_remote_input_push as *const () as usize,
+        remote_input_poll: super::platform_callbacks::desk_remote_input_poll as *const () as usize,
+        remote_input_status: super::platform_callbacks::desk_remote_input_status as *const ()
+            as usize,
+        desktop_activity_wait: super::platform_callbacks::desk_desktop_activity_wait as *const ()
+            as usize,
+        remote_frame_map: super::platform_callbacks::desk_remote_frame_map as *const () as usize,
+        program_current_console_host: super::platform_callbacks::desk_program_current_console_host
+            as *const () as usize,
+        program_request_desktop: super::platform_callbacks::desk_program_request_desktop
+            as *const () as usize,
+        program_spawn_with_console_host:
+            super::platform_callbacks::desk_program_spawn_with_console_host as *const () as usize,
+        program_spawn_with_console_host_handle:
+            super::platform_callbacks::desk_program_spawn_with_console_host_handle as *const ()
+                as usize,
+        program_set_window_handle: super::platform_callbacks::desk_program_set_window_handle
+            as *const () as usize,
+        console_push_input: super::platform_callbacks::desk_console_push_input as *const ()
+            as usize,
+        remote_frame_acquire:
+            crate::program::domain_api::r4os_rust_program_domain_remote_frame_acquire as *const ()
+                as usize,
+        remote_frame_release:
+            crate::program::domain_api::r4os_rust_program_domain_remote_frame_release as *const ()
+                as usize,
+        remote_frame_consumers: super::platform_callbacks::desk_remote_frame_consumers as *const ()
+            as usize,
+        remote_frame_publish_regions:
+            crate::program::domain_api::r4os_rust_program_domain_remote_frame_publish_regions
+                as *const () as usize,
+        console_input_wait: crate::program::console_input::r4os_rust_program_console_input_wait
+            as *const () as usize,
+        physical_key_poll: super::platform_callbacks::desk_physical_key_poll as *const () as usize,
+        mouse_motion: super::platform_callbacks::desk_mouse_motion as *const () as usize,
+        remote_frame_snapshot_acquire:
+            crate::program::domain_api::r4os_rust_program_domain_remote_frame_snapshot_acquire
+                as *const () as usize,
+        remote_frame_snapshot_release:
+            crate::program::domain_api::r4os_rust_program_domain_remote_frame_snapshot_release
+                as *const () as usize,
+        remote_frame_source_reset:
+            crate::program::domain_api::r4os_rust_program_domain_remote_frame_source_reset
+                as *const () as usize,
+        remote_frame_capture_stats: super::platform_callbacks::desk_remote_frame_capture_stats
+            as *const () as usize,
+        desktop_activity_notify: super::platform_callbacks::desk_desktop_activity_notify
+            as *const () as usize,
         ..Default::default()
     };
     DESK.configure(value);
@@ -535,121 +662,119 @@ const _: () = {
 };
 static DRAW: Table<c::R4XStartR4Draw> = Table::new();
 fn configure_draw() {
-    let mut bindings = [0usize; 112];
-    unsafe { r4os_zig_program_runtime_bindings(3, bindings.as_mut_ptr(), bindings.len()) };
     let value = c::R4XStartR4Draw {
-        screen_width: bindings[0],
-        screen_height: bindings[1],
-        clear: bindings[2],
-        rect: bindings[3],
-        text: bindings[4],
-        display_revision: bindings[5],
-        display_begin_frame: bindings[6],
-        display_begin_frame_rect: bindings[7],
-        display_present: bindings[8],
-        display_blit_xrgb32: bindings[9],
-        gui_clear: bindings[10],
-        gui_rect: bindings[11],
-        gui_draw_text: bindings[12],
-        gui_draw_text_ex: bindings[13],
-        gui_blit: bindings[14],
-        gui_raster_read: bindings[15],
-        gui_present: bindings[16],
-        font_count: bindings[17],
-        font_info: bindings[18],
-        font_measure: bindings[19],
-        gui_set_font: bindings[20],
-        gui_font: bindings[21],
-        text_font: bindings[22],
-        font_reload: bindings[23],
-        font_glyph_row: bindings[24],
-        gui_blend_alpha8: bindings[25],
-        gui_frame_begin: bindings[26],
-        gui_frame_append: bindings[27],
-        gui_frame_commit: bindings[28],
-        gui_frame_cancel: bindings[29],
-        gui_frame_info: bindings[30],
-        gui_frame_read: bindings[31],
-        display_blit_xrgb32_stride: bindings[32],
-        display_present_regions: bindings[33],
-        display_present_capabilities: bindings[34],
-        display_present_completion: bindings[35],
-        gui_frame_begin_damage: bindings[36],
-        gui_frame_generation_info: bindings[37],
-        gui_frame_generation_read: bindings[38],
-        font_glyph_bitmap: bindings[39],
-        font_revision: bindings[40],
-        gui_frame_begin_replace: bindings[41],
-        gui_frame_stream_info: bindings[42],
-        gui_shared_raster_create: bindings[43],
-        gui_shared_raster_destroy: bindings[44],
-        gui_shared_raster_map_write: bindings[45],
-        gui_shared_raster_publish: bindings[46],
-        gui_shared_raster_acquire: bindings[47],
-        gui_shared_raster_release: bindings[48],
-        gfx_buffer_create: bindings[49],
-        gfx_buffer_describe: bindings[50],
-        gfx_buffer_import: bindings[51],
-        gfx_buffer_release: bindings[52],
-        gfx_buffer_map: bindings[53],
-        gfx_buffer_unmap: bindings[54],
-        gfx_buffer_export_raster: bindings[55],
-        gfx_buffer_stats: bindings[56],
-        gfx_queue_open: bindings[57],
-        gfx_queue_close: bindings[58],
-        gfx_queue_submit: bindings[59],
-        gfx_fence_query: bindings[60],
-        gfx_fence_wait: bindings[61],
-        gfx_fence_cancel: bindings[62],
-        gfx_fence_release: bindings[63],
-        gfx_queue_backend: bindings[64],
-        gfx_output_revision: bindings[65],
-        gfx_output_info: bindings[66],
-        gfx_output_mode: bindings[67],
-        gfx_output_edid: bindings[68],
-        gfx_atomic_test: bindings[69],
-        gfx_atomic_commit: bindings[70],
-        gfx_atomic_submit: bindings[71],
-        gfx_atomic_status: bindings[72],
-        gfx_atomic_resolve: bindings[73],
-        display_presentation_stats: bindings[74],
-        display_cursor_info: bindings[75],
-        display_cursor_submit: bindings[76],
-        display_cursor_status: bindings[77],
-        gfx_queue_backend_info: bindings[78],
-        gfx_native_start: bindings[79],
-        gfx_native_query: bindings[80],
-        gfx_native_receive: bindings[81],
-        gfx_native_close: bindings[82],
-        gfx_native_wait: bindings[83],
-        gfx_queue_submit_render_list: bindings[84],
-        display_presentation_info: bindings[85],
-        display_presentation_feedback: bindings[86],
-        display_output_target: bindings[87],
-        gfx_queue_submit_output: bindings[88],
-        display_output_presentation_info: bindings[89],
-        display_output_presentation_feedback: bindings[90],
-        gfx_queue_submit_render_grid_list: bindings[91],
-        gfx_output_color: bindings[92],
-        gfx_queue_submit_render_color_list: bindings[93],
-        gfx_atomic_test_color: bindings[94],
-        gfx_atomic_submit_color: bindings[95],
-        gfx_output_refresh: bindings[96],
-        gfx_refresh_request: bindings[97],
-        gfx_memory_budget: bindings[98],
-        gfx_telemetry: bindings[99],
-        gfx_output_power: bindings[100],
-        gfx_power_request: bindings[101],
-        gfx_virtual_start: bindings[102],
-        gfx_virtual_query: bindings[103],
-        gfx_virtual_close: bindings[104],
-        gfx_virtual_wait: bindings[105],
-        gfx_buffer_map_persistent: bindings[106],
-        gfx_queue_backend_properties: bindings[107],
-        gfx_queue_submit_native: bindings[108],
-        gfx_queue_submit_render_color_grid_list: bindings[109],
-        gfx_output_brightness: bindings[110],
-        gfx_brightness_request: bindings[111],
+        screen_width: super::platform_callbacks::draw_screen_width as *const () as usize,
+        screen_height: super::platform_callbacks::draw_screen_height as *const () as usize,
+        clear: super::platform_callbacks::draw_clear as *const () as usize,
+        rect: super::platform_callbacks::draw_rect as *const () as usize,
+        text: super::platform_callbacks::draw_text as *const () as usize,
+        display_revision: super::platform_callbacks::draw_display_revision as *const () as usize,
+        display_begin_frame: super::platform_callbacks::draw_display_begin_frame as *const () as usize,
+        display_begin_frame_rect: super::platform_callbacks::draw_display_begin_frame_rect as *const () as usize,
+        display_present: super::platform_callbacks::draw_display_present as *const () as usize,
+        display_blit_xrgb32: super::platform_callbacks::draw_display_blit_xrgb32 as *const () as usize,
+        gui_clear: crate::program::gui_draw::r4os_rust_program_gui_clear as *const () as usize,
+        gui_rect: crate::program::gui_draw::r4os_rust_program_gui_rect as *const () as usize,
+        gui_draw_text: super::platform_callbacks::draw_gui_draw_text as *const () as usize,
+        gui_draw_text_ex: super::platform_callbacks::draw_gui_draw_text_ex as *const () as usize,
+        gui_blit: crate::program::gui_draw::r4os_rust_program_gui_blit as *const () as usize,
+        gui_raster_read: crate::program::gui_api::r4os_rust_program_gui_api_raster as *const () as usize,
+        gui_present: super::platform_callbacks::draw_gui_present as *const () as usize,
+        font_count: super::platform_callbacks::draw_font_count as *const () as usize,
+        font_info: super::platform_callbacks::draw_font_info as *const () as usize,
+        font_measure: super::platform_callbacks::draw_font_measure as *const () as usize,
+        gui_set_font: crate::program::gui_font::r4os_rust_program_gui_font_set as *const () as usize,
+        gui_font: crate::program::gui_font::r4os_rust_program_gui_font_get as *const () as usize,
+        text_font: super::platform_callbacks::draw_text_font as *const () as usize,
+        font_reload: super::platform_callbacks::draw_font_reload as *const () as usize,
+        font_glyph_row: super::platform_callbacks::draw_font_glyph_row as *const () as usize,
+        gui_blend_alpha8: crate::program::gui_draw::r4os_rust_program_gui_alpha as *const () as usize,
+        gui_frame_begin: super::platform_callbacks::draw_gui_frame_begin as *const () as usize,
+        gui_frame_append: crate::program::gui_api::r4os_rust_program_gui_api_append as *const () as usize,
+        gui_frame_commit: super::platform_callbacks::draw_gui_frame_commit as *const () as usize,
+        gui_frame_cancel: super::platform_callbacks::draw_gui_frame_cancel as *const () as usize,
+        gui_frame_info: super::platform_callbacks::draw_gui_frame_info as *const () as usize,
+        gui_frame_read: crate::program::gui_api::r4os_rust_program_gui_api_read as *const () as usize,
+        display_blit_xrgb32_stride: super::platform_callbacks::draw_display_blit_xrgb32_stride as *const () as usize,
+        display_present_regions: super::platform_callbacks::draw_display_present_regions as *const () as usize,
+        display_present_capabilities: super::platform_callbacks::draw_display_present_capabilities as *const () as usize,
+        display_present_completion: super::platform_callbacks::draw_display_present_completion as *const () as usize,
+        gui_frame_begin_damage: super::platform_callbacks::draw_gui_frame_begin_damage as *const () as usize,
+        gui_frame_generation_info: super::platform_callbacks::draw_gui_frame_generation_info as *const () as usize,
+        gui_frame_generation_read: crate::program::gui_api::r4os_rust_program_gui_api_generation_read as *const () as usize,
+        font_glyph_bitmap: super::platform_callbacks::draw_font_glyph_bitmap as *const () as usize,
+        font_revision: super::platform_callbacks::draw_font_revision as *const () as usize,
+        gui_frame_begin_replace: super::platform_callbacks::draw_gui_frame_begin_replace as *const () as usize,
+        gui_frame_stream_info: super::platform_callbacks::draw_gui_frame_stream_info as *const () as usize,
+        gui_shared_raster_create: crate::program::shared_raster::r4os_rust_program_shared_api_create as *const () as usize,
+        gui_shared_raster_destroy: crate::program::shared_raster::r4os_rust_program_shared_api_destroy as *const () as usize,
+        gui_shared_raster_map_write: crate::program::shared_raster::r4os_rust_program_shared_api_write as *const () as usize,
+        gui_shared_raster_publish: crate::program::shared_raster::r4os_rust_program_shared_api_publish as *const () as usize,
+        gui_shared_raster_acquire: crate::program::shared_raster::r4os_rust_program_shared_api_acquire as *const () as usize,
+        gui_shared_raster_release: crate::program::shared_raster::r4os_rust_program_shared_api_release as *const () as usize,
+        gfx_buffer_create: crate::program::domain_api::r4os_rust_program_domain_gfx_buffer_create as *const () as usize,
+        gfx_buffer_describe: crate::program::domain_api::r4os_rust_program_domain_gfx_buffer_describe as *const () as usize,
+        gfx_buffer_import: crate::program::domain_api::r4os_rust_program_domain_gfx_buffer_import as *const () as usize,
+        gfx_buffer_release: crate::program::domain_api::r4os_rust_program_domain_gfx_buffer_release as *const () as usize,
+        gfx_buffer_map: crate::program::domain_api::r4os_rust_program_domain_gfx_buffer_map as *const () as usize,
+        gfx_buffer_unmap: crate::program::domain_api::r4os_rust_program_domain_gfx_buffer_unmap as *const () as usize,
+        gfx_buffer_export_raster: crate::program::shared_raster::r4os_rust_program_shared_api_export as *const () as usize,
+        gfx_buffer_stats: super::platform_callbacks::draw_gfx_buffer_stats as *const () as usize,
+        gfx_queue_open: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_open as *const () as usize,
+        gfx_queue_close: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_close as *const () as usize,
+        gfx_queue_submit: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_submit as *const () as usize,
+        gfx_fence_query: super::platform_callbacks::draw_gfx_fence_query as *const () as usize,
+        gfx_fence_wait: super::platform_callbacks::draw_gfx_fence_wait as *const () as usize,
+        gfx_fence_cancel: crate::program::domain_api::r4os_rust_program_domain_gfx_fence_cancel as *const () as usize,
+        gfx_fence_release: crate::program::domain_api::r4os_rust_program_domain_gfx_fence_release as *const () as usize,
+        gfx_queue_backend: super::platform_callbacks::draw_gfx_queue_backend as *const () as usize,
+        gfx_output_revision: super::platform_callbacks::draw_gfx_output_revision as *const () as usize,
+        gfx_output_info: super::platform_callbacks::draw_gfx_output_info as *const () as usize,
+        gfx_output_mode: super::platform_callbacks::draw_gfx_output_mode as *const () as usize,
+        gfx_output_edid: super::platform_callbacks::draw_gfx_output_edid as *const () as usize,
+        gfx_atomic_test: crate::program::domain_api::r4os_rust_program_domain_gfx_atomic_test as *const () as usize,
+        gfx_atomic_commit: crate::program::domain_api::r4os_rust_program_domain_gfx_atomic_commit as *const () as usize,
+        gfx_atomic_submit: crate::program::domain_api::r4os_rust_program_domain_gfx_atomic_submit as *const () as usize,
+        gfx_atomic_status: super::platform_callbacks::draw_gfx_atomic_status as *const () as usize,
+        gfx_atomic_resolve: crate::program::domain_api::r4os_rust_program_domain_gfx_atomic_resolve as *const () as usize,
+        display_presentation_stats: super::platform_callbacks::draw_display_presentation_stats as *const () as usize,
+        display_cursor_info: super::platform_callbacks::draw_display_cursor_info as *const () as usize,
+        display_cursor_submit: crate::program::domain_api::r4os_rust_program_domain_display_cursor_submit as *const () as usize,
+        display_cursor_status: super::platform_callbacks::draw_display_cursor_status as *const () as usize,
+        gfx_queue_backend_info: super::platform_callbacks::draw_gfx_queue_backend_info as *const () as usize,
+        gfx_native_start: crate::program::domain_api::r4os_rust_program_domain_gfx_native_start as *const () as usize,
+        gfx_native_query: crate::program::domain_api::r4os_rust_program_domain_gfx_native_query as *const () as usize,
+        gfx_native_receive: crate::program::domain_api::r4os_rust_program_domain_gfx_native_receive as *const () as usize,
+        gfx_native_close: crate::program::domain_api::r4os_rust_program_domain_gfx_native_close as *const () as usize,
+        gfx_native_wait: crate::program::domain_api::r4os_rust_program_domain_gfx_native_wait as *const () as usize,
+        gfx_queue_submit_render_list: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_submit_render_list as *const () as usize,
+        display_presentation_info: super::platform_callbacks::draw_display_presentation_info as *const () as usize,
+        display_presentation_feedback: super::platform_callbacks::draw_display_presentation_feedback as *const () as usize,
+        display_output_target: super::platform_callbacks::draw_display_output_target as *const () as usize,
+        gfx_queue_submit_output: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_submit_output as *const () as usize,
+        display_output_presentation_info: super::platform_callbacks::draw_display_output_presentation_info as *const () as usize,
+        display_output_presentation_feedback: super::platform_callbacks::draw_display_output_presentation_feedback as *const () as usize,
+        gfx_queue_submit_render_grid_list: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_submit_render_grid_list as *const () as usize,
+        gfx_output_color: super::platform_callbacks::draw_gfx_output_color as *const () as usize,
+        gfx_queue_submit_render_color_list: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_submit_render_color_list as *const () as usize,
+        gfx_atomic_test_color: crate::program::domain_api::r4os_rust_program_domain_gfx_atomic_test_color as *const () as usize,
+        gfx_atomic_submit_color: crate::program::domain_api::r4os_rust_program_domain_gfx_atomic_submit_color as *const () as usize,
+        gfx_output_refresh: super::platform_callbacks::draw_gfx_output_refresh as *const () as usize,
+        gfx_refresh_request: crate::program::domain_api::r4os_rust_program_domain_gfx_refresh_request as *const () as usize,
+        gfx_memory_budget: super::platform_callbacks::draw_gfx_memory_budget as *const () as usize,
+        gfx_telemetry: super::platform_callbacks::draw_gfx_telemetry as *const () as usize,
+        gfx_output_power: super::platform_callbacks::draw_gfx_output_power as *const () as usize,
+        gfx_power_request: crate::program::domain_api::r4os_rust_program_domain_gfx_power_request as *const () as usize,
+        gfx_virtual_start: crate::program::domain_api::r4os_rust_program_domain_gfx_virtual_start as *const () as usize,
+        gfx_virtual_query: crate::program::domain_api::r4os_rust_program_domain_gfx_virtual_query as *const () as usize,
+        gfx_virtual_close: crate::program::domain_api::r4os_rust_program_domain_gfx_virtual_close as *const () as usize,
+        gfx_virtual_wait: crate::program::domain_api::r4os_rust_program_domain_gfx_virtual_wait as *const () as usize,
+        gfx_buffer_map_persistent: crate::program::domain_api::r4os_rust_program_domain_gfx_buffer_map_persistent as *const () as usize,
+        gfx_queue_backend_properties: super::platform_callbacks::draw_gfx_queue_backend_properties as *const () as usize,
+        gfx_queue_submit_native: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_submit_native as *const () as usize,
+        gfx_queue_submit_render_color_grid_list: crate::program::domain_api::r4os_rust_program_domain_gfx_queue_submit_render_color_grid_list as *const () as usize,
+        gfx_output_brightness: super::platform_callbacks::draw_gfx_output_brightness as *const () as usize,
+        gfx_brightness_request: crate::program::domain_api::r4os_rust_program_domain_gfx_brightness_request as *const () as usize,
         ..Default::default()
     };
     DRAW.configure(value);
@@ -775,44 +900,66 @@ const _: () = {
 };
 static NET: Table<c::R4XStartR4Net> = Table::new();
 fn configure_net() {
-    let mut bindings = [0usize; 35];
-    unsafe { r4os_zig_program_runtime_bindings(4, bindings.as_mut_ptr(), bindings.len()) };
     let value = c::R4XStartR4Net {
-        tcp_connect: bindings[0],
-        tcp_write: bindings[1],
-        tcp_read: bindings[2],
-        tcp_close: bindings[3],
-        tcp_summary: bindings[4],
-        tcp_connection: bindings[5],
-        tcp_echo_listen_once: bindings[6],
-        tcp_accept_read_once: bindings[7],
-        net_ipv4_send: bindings[8],
-        net_ipv4_recv: bindings[9],
-        net_config_get: bindings[10],
-        net_config_set: bindings[11],
-        net_dns_resolve: bindings[12],
-        net_dns_resolve_server: bindings[13],
-        net_dhcp_acquire: bindings[14],
-        net_dhcp_renew: bindings[15],
-        net_dhcp_release: bindings[16],
-        net_dhcp_status: bindings[17],
-        net_detail_get: bindings[18],
-        net_diag_run: bindings[19],
-        ipc_open: bindings[20],
-        ipc_send: bindings[21],
-        ipc_recv: bindings[22],
-        ipc_poll: bindings[23],
-        ipc_close: bindings[24],
-        ipc_summary: bindings[25],
-        ipc_channel: bindings[26],
-        serial_link_status: bindings[27],
-        serial_link_poll: bindings[28],
-        serial_link_send_message: bindings[29],
-        serial_link_host_test: bindings[30],
-        serial_link_inbox: bindings[31],
-        net_service_request: bindings[32],
-        ipc_performance: bindings[33],
-        tcp_performance: bindings[34],
+        tcp_connect: crate::program::network_api::r4os_rust_r4net_tcp_connect as *const () as usize,
+        tcp_write: crate::program::network_api::r4os_rust_r4net_tcp_write as *const () as usize,
+        tcp_read: crate::program::network_api::r4os_rust_r4net_tcp_read as *const () as usize,
+        tcp_close: crate::program::network_api::r4os_rust_r4net_tcp_close as *const () as usize,
+        tcp_summary: crate::program::network_api::r4os_rust_r4net_tcp_summary as *const () as usize,
+        tcp_connection: crate::program::network_api::r4os_rust_r4net_tcp_connection as *const ()
+            as usize,
+        tcp_echo_listen_once: crate::program::network_api::r4os_rust_r4net_tcp_echo_listen_once
+            as *const () as usize,
+        tcp_accept_read_once: crate::program::network_api::r4os_rust_r4net_tcp_accept_read_once
+            as *const () as usize,
+        net_ipv4_send: crate::program::network_api::r4os_rust_r4net_net_ipv4_send as *const ()
+            as usize,
+        net_ipv4_recv: crate::program::network_api::r4os_rust_r4net_net_ipv4_recv as *const ()
+            as usize,
+        net_config_get: crate::program::network_api::r4os_rust_r4net_net_config_get as *const ()
+            as usize,
+        net_config_set: crate::program::network_api::r4os_rust_r4net_net_config_set as *const ()
+            as usize,
+        net_dns_resolve: crate::program::network_api::r4os_rust_r4net_net_dns_resolve as *const ()
+            as usize,
+        net_dns_resolve_server: crate::program::network_api::r4os_rust_r4net_net_dns_resolve_server
+            as *const () as usize,
+        net_dhcp_acquire: crate::program::network_api::r4os_rust_r4net_net_dhcp_acquire as *const ()
+            as usize,
+        net_dhcp_renew: crate::program::network_api::r4os_rust_r4net_net_dhcp_renew as *const ()
+            as usize,
+        net_dhcp_release: crate::program::network_api::r4os_rust_r4net_net_dhcp_release as *const ()
+            as usize,
+        net_dhcp_status: crate::program::network_api::r4os_rust_r4net_net_dhcp_status as *const ()
+            as usize,
+        net_detail_get: crate::program::network_api::r4os_rust_r4net_net_detail_get as *const ()
+            as usize,
+        net_diag_run: crate::program::network_api::r4os_rust_r4net_net_diag_run as *const ()
+            as usize,
+        ipc_open: crate::program::network_api::r4os_rust_r4net_ipc_open as *const () as usize,
+        ipc_send: crate::program::network_api::r4os_rust_r4net_ipc_send as *const () as usize,
+        ipc_recv: crate::program::network_api::r4os_rust_r4net_ipc_recv as *const () as usize,
+        ipc_poll: crate::program::network_api::r4os_rust_r4net_ipc_poll as *const () as usize,
+        ipc_close: crate::program::network_api::r4os_rust_r4net_ipc_close as *const () as usize,
+        ipc_summary: crate::program::network_api::r4os_rust_r4net_ipc_summary as *const () as usize,
+        ipc_channel: crate::program::network_api::r4os_rust_r4net_ipc_channel as *const () as usize,
+        serial_link_status: crate::program::network_api::r4os_rust_r4net_serial_link_status
+            as *const () as usize,
+        serial_link_poll: crate::program::network_api::r4os_rust_r4net_serial_link_poll as *const ()
+            as usize,
+        serial_link_send_message:
+            crate::program::network_api::r4os_rust_r4net_serial_link_send_message as *const ()
+                as usize,
+        serial_link_host_test: crate::program::network_api::r4os_rust_r4net_serial_link_host_test
+            as *const () as usize,
+        serial_link_inbox: crate::program::network_api::r4os_rust_r4net_serial_link_inbox
+            as *const () as usize,
+        net_service_request: crate::program::network_api::r4os_rust_r4net_net_service_request
+            as *const () as usize,
+        ipc_performance: crate::program::network_api::r4os_rust_r4net_ipc_performance as *const ()
+            as usize,
+        tcp_performance: crate::program::network_api::r4os_rust_r4net_tcp_performance as *const ()
+            as usize,
         ..Default::default()
     };
     NET.configure(value);
@@ -861,30 +1008,42 @@ const _: () = {
 };
 static AUDIO: Table<c::R4XStartR4Audio> = Table::new();
 fn configure_audio() {
-    let mut bindings = [0usize; 21];
-    unsafe { r4os_zig_program_runtime_bindings(5, bindings.as_mut_ptr(), bindings.len()) };
     let value = c::R4XStartR4Audio {
-        audio_open_stream: bindings[0],
-        audio_write: bindings[1],
-        audio_close: bindings[2],
-        audio_set_volume: bindings[3],
-        sid_acquire: bindings[4],
-        sid_write_register: bindings[5],
-        sid_release: bindings[6],
-        sid_load_data: bindings[7],
-        sid_init: bindings[8],
-        sid_play_frame: bindings[9],
-        sid_stop: bindings[10],
-        sid_model_name: bindings[11],
-        midi_open_synth: bindings[12],
-        midi_send: bindings[13],
-        midi_close: bindings[14],
-        opl3_write_register: bindings[15],
-        opl3_reset: bindings[16],
-        opl3_render_block: bindings[17],
-        opl3_stop: bindings[18],
-        audio_output_info: bindings[19],
-        audio_select_output: bindings[20],
+        audio_open_stream: crate::program::domain_api::r4os_rust_program_domain_audio_open_stream
+            as *const () as usize,
+        audio_write: crate::program::domain_api::r4os_rust_program_domain_audio_write as *const ()
+            as usize,
+        audio_close: crate::program::domain_api::r4os_rust_program_domain_audio_close as *const ()
+            as usize,
+        audio_set_volume: crate::program::domain_api::r4os_rust_program_domain_audio_set_volume
+            as *const () as usize,
+        sid_acquire: crate::program::r4audio::r4os_rust_r4audio_sid_acquire as *const () as usize,
+        sid_write_register: crate::program::r4audio::r4os_rust_r4audio_sid_write_register
+            as *const () as usize,
+        sid_release: crate::program::r4audio::r4os_rust_r4audio_sid_release as *const () as usize,
+        sid_load_data: crate::program::r4audio::r4os_rust_r4audio_sid_load_data as *const ()
+            as usize,
+        sid_init: crate::program::r4audio::r4os_rust_r4audio_sid_init as *const () as usize,
+        sid_play_frame: crate::program::r4audio::r4os_rust_r4audio_sid_play_frame as *const ()
+            as usize,
+        sid_stop: crate::program::r4audio::r4os_rust_r4audio_sid_stop as *const () as usize,
+        sid_model_name: crate::program::r4audio::r4os_rust_r4audio_sid_model_name as *const ()
+            as usize,
+        midi_open_synth: crate::program::r4audio::r4os_rust_r4audio_midi_open_synth as *const ()
+            as usize,
+        midi_send: crate::program::r4audio::r4os_rust_r4audio_midi_send as *const () as usize,
+        midi_close: crate::program::r4audio::r4os_rust_r4audio_midi_close as *const () as usize,
+        opl3_write_register: crate::program::r4audio::r4os_rust_r4audio_opl3_write_register
+            as *const () as usize,
+        opl3_reset: crate::program::r4audio::r4os_rust_r4audio_opl3_reset as *const () as usize,
+        opl3_render_block: crate::program::r4audio::r4os_rust_r4audio_opl3_render_block as *const ()
+            as usize,
+        opl3_stop: crate::program::r4audio::r4os_rust_r4audio_opl3_stop as *const () as usize,
+        audio_output_info: crate::program::domain_api::r4os_rust_program_domain_audio_output_info
+            as *const () as usize,
+        audio_select_output:
+            crate::program::domain_api::r4os_rust_program_domain_audio_select_output as *const ()
+                as usize,
         ..Default::default()
     };
     AUDIO.configure(value);
@@ -1065,9 +1224,12 @@ const _: () = {
 pub(super) fn configure(group: u8) {
     match group {
         0 => {
-            for op in 0..7 {
-                unsafe { r4os_zig_program_runtime_register(op, 0) }
-            }
+            super::system::context::install_program_providers();
+            super::system::copy::install_program_cancellation();
+            unsafe {
+                crate::storage::access_runtime::r4os_rust_storage_access_resolver(storage_owner)
+            };
+            super::r4draw::install_program_hooks();
             for group in 1..=6 {
                 configure(group);
             }
@@ -1101,11 +1263,14 @@ pub unsafe extern "C" fn r4os_rust_program_runtime_initialize(usable: u64) {
     }
     async_io::r4os_rust_program_async_initialize();
     configure(0);
-    unsafe {
-        r4os_zig_program_runtime_register(10, usable);
-        r4os_zig_program_runtime_register(11, 0);
-        r4os_zig_program_runtime_register(12, 0);
-    }
+    let _ = usable; // The original setRuntimeContext intentionally did no work.
+    crate::boot::log_route::set_output_hook(
+        Some(super::console_input::r4os_rust_program_console_print_hook),
+        true,
+    );
+    crate::input::keyboard::r4os_rust_input_keyboard_input_hook(Some(
+        super::console_input::r4os_rust_program_console_keyboard_hook,
+    ));
     unsafe {
         if !(*registry_state::state()).reaper_started {
             let name = b"r4x-reaper";
@@ -1138,4 +1303,19 @@ pub extern "C" fn r4os_rust_program_runtime_configure(group: u8) {
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_program_runtime_group(group: u32) -> usize {
     interface(group)
+}
+
+unsafe extern "C" fn storage_owner(output: *mut crate::storage::access_state::Owner) -> bool {
+    let Some(owner) = (unsafe { super::async_io::stream_owner() }) else {
+        return false;
+    };
+    unsafe {
+        output.write(crate::storage::access_state::Owner {
+            task: owner.task,
+            task_generation: owner.task_generation,
+            program: owner.program,
+            program_generation: owner.program_generation,
+        })
+    };
+    true
 }

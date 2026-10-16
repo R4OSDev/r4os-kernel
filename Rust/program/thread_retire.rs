@@ -16,16 +16,7 @@ use crate::{
     storage::operations,
 };
 use core::{mem, ptr};
-unsafe extern "C" {
-    // Each peer owns its existing independent async-I/O or R4SYS namespace.
-    fn r4os_zig_program_thread_retire_peer(
-        operation: u8,
-        handle: Handle,
-        task: u32,
-        generation: u64,
-    ) -> bool;
-    fn r4os_zig_program_thread_task_retired(task: u32, generation: u64);
-}
+
 fn report(enabled: bool, detail: &[u8]) {
     super::entry::report_stage(enabled, detail, false);
 }
@@ -201,7 +192,7 @@ pub(super) unsafe fn release_task(
     }
     match unsafe { task_api::r4os_rust_task_identity(6, id, generation, ptr::null_mut(), 0) } {
         0 | 2 => {
-            unsafe { r4os_zig_program_thread_task_retired(id, generation) };
+            unsafe { program_thread_task_retired(id, generation) };
             true
         }
         1 => false,
@@ -266,7 +257,7 @@ pub(super) unsafe fn complete(
             return false;
         }
         report(report_boot, b"SERVMAN: Streams loesen");
-        if !r4os_zig_program_thread_retire_peer(2, handle, task_id, task_generation) {
+        if !program_thread_retire_peer(2, handle, task_id, task_generation) {
             report(report_boot, b"SERVMAN: Streams warten");
             clear_claim(thread, keep_join);
             return false;
@@ -423,4 +414,28 @@ pub unsafe extern "C" fn r4os_rust_program_thread_release_created(
         let c = task_registry::core(task.cast());
         release_task((*c).id, (*c).generation, id, generation)
     }
+}
+
+unsafe fn program_thread_retire_peer(
+    operation: u8,
+    handle: Handle,
+    task: u32,
+    generation: u64,
+) -> bool {
+    assert!(operation == 2);
+    unsafe {
+        crate::program::system::stream::r4os_rust_sys_stream_cleanup(
+            handle.instance_id,
+            handle.generation,
+            task,
+            generation,
+            true,
+        )
+    }
+}
+
+unsafe fn program_thread_task_retired(task: u32, generation: u64) {
+    crate::display::queue::retired_task(task, generation);
+    crate::gfx::allocations::retired_task(task, generation);
+    crate::gfx::virtual_runtime::retired_task(task, generation);
 }
