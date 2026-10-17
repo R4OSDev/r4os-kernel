@@ -248,7 +248,7 @@ fn fallback_pit() {
     activate_origins();
 }
 fn on_irq() -> u64 {
-    if config::ENABLE_COM1_DEBUG {
+    if config::ENABLE_COM1_DEBUG && crate::boot::serial::debug_active() {
         crate::boot::serial::r4os_rust_serial_drain();
     }
     match active_backend() {

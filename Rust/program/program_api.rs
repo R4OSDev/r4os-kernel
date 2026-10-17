@@ -542,10 +542,13 @@ pub extern "C" fn r4os_rust_program_api_action(op: u8) -> i32 {
                 if instance.is_null() || (*instance).role != 1 {
                     return c::boot_ready_error_not_boot_shell;
                 }
-                let result = crate::boot::performance::complete_ready((*instance).id);
+                let id = (*instance).id;
+                crate::boot::serial_policy::prepare();
+                let result = crate::boot::performance::complete_ready(id);
                 if result == c::boot_ready_result_completed {
                     crate::display::bootscreen::complete();
                     crate::boot::foundation::r4os_rust_boot_release();
+                    crate::boot::serial_policy::successful_ready();
                 }
                 result
             }

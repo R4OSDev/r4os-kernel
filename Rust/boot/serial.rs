@@ -1,6 +1,7 @@
 //! The one COM1 stream keeps its fixed ring, drop accounting and bounded
 //! synchronous shutdown policy. COM2 remains a caller-owned raw port.
 use super::owner::Guard;
+use super::serial_admission as admission;
 use crate::arch::io::{inb, outb};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
@@ -49,6 +50,8 @@ impl Stats {
 struct State {
     ring: [u8; CAPACITY],
     stats: Stats,
+    known_uart: bool,
+    fifo: usize,
 }
 struct Storage(UnsafeCell<State>);
 // SAFETY: the existing serial owner covers all state/ring accesses. Atomics
@@ -58,12 +61,48 @@ unsafe impl Sync for Storage {}
 static SERIAL: Storage = Storage(UnsafeCell::new(State {
     ring: [0; CAPACITY],
     stats: Stats::EMPTY,
+    known_uart: false,
+    fifo: 1,
 }));
 static HEAD: AtomicUsize = AtomicUsize::new(0);
 static TAIL: AtomicUsize = AtomicUsize::new(0);
 fn pending() -> usize {
     HEAD.load(Ordering::Relaxed)
         .wrapping_sub(TAIL.load(Ordering::Relaxed))
+}
+
+/// Only the original early bootstrap may attach debug sinks. A later panic,
+/// shutdown or old initialization callback cannot reacquire a released port.
+pub(super) fn init_debug() -> bool {
+    if !admission::begin_init() {
+        return false;
+    }
+    r4os_rust_serial_init(COM1);
+    let scratch = unsafe { inb(COM1 + 7) };
+    let present = r4os_rust_serial_present(COM1);
+    unsafe {
+        outb(COM1 + 7, scratch);
+    }
+    let fifo = if present && unsafe { inb(COM1 + 2) } & 0xc0 == 0xc0 {
+        FIFO
+    } else {
+        1
+    };
+    {
+        let _owner = Guard::acquire(1);
+        unsafe {
+            (*SERIAL.0.get()).known_uart = present;
+            (*SERIAL.0.get()).fifo = fifo;
+        }
+    }
+    admission::initialized();
+    true
+}
+pub(crate) fn debug_active() -> bool {
+    admission::active()
+}
+pub(crate) fn debug_claims_com1() -> bool {
+    admission::claims_com1()
 }
 
 #[unsafe(no_mangle)]
@@ -175,10 +214,13 @@ impl State {
 /// # Safety
 /// Caller keeps len readable bytes resident until return, outside the TX ring.
 pub unsafe extern "C" fn r4os_rust_serial_write(data: *const u8, len: usize) {
-    if len == 0 {
+    if len == 0 || !admission::active() {
         return;
     }
     let _guard = Guard::acquire(1);
+    let Some(_writer) = admission::admit() else {
+        return;
+    };
     let state = unsafe { &mut *SERIAL.0.get() };
     state.stats.write_calls = state.stats.write_calls.wrapping_add(1);
     if len > 1 {
@@ -227,15 +269,24 @@ pub unsafe extern "C" fn r4os_rust_serial_write(data: *const u8, len: usize) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_serial_drain() {
-    if pending() == 0 {
+    if !admission::active() || pending() == 0 {
         return;
     }
     let _guard = Guard::acquire(1);
+    let Some(_writer) = admission::admit() else {
+        return;
+    };
     unsafe { &mut *SERIAL.0.get() }.drain();
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_serial_flush() {
+    if !admission::active() {
+        return;
+    }
     let _guard = Guard::acquire(1);
+    let Some(_writer) = admission::admit() else {
+        return;
+    };
     let state = unsafe { &mut *SERIAL.0.get() };
     while pending() != 0 {
         if !state.ready_sync() {
@@ -248,12 +299,163 @@ pub extern "C" fn r4os_rust_serial_flush() {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_serial_sync() {
+    if !admission::active() {
+        return;
+    }
     let _guard = Guard::acquire(1);
+    let Some(_writer) = admission::admit() else {
+        return;
+    };
     // Do not hold a Rust &mut across the intentional nested owner acquisition.
     unsafe {
         (*SERIAL.0.get()).stats.sync_mode = true;
     }
     r4os_rust_serial_flush();
+}
+
+const CLOSE_MESSAGE: &[u8] =
+    b"[COM1] Debugging wird nach dem Boot abgeschaltet; Anschluss wird freigegeben.\r\n";
+struct CloseBudget {
+    start: u64,
+    ticks: u64,
+    polls: usize,
+}
+impl CloseBudget {
+    fn new() -> Self {
+        Self {
+            start: crate::platform::timer::tick_count(),
+            ticks: (u64::from(crate::platform::timer::frequency()) * 3).max(1),
+            polls: 0,
+        }
+    }
+    fn live(&self) -> bool {
+        self.polls < TIMEOUT
+            && crate::platform::timer::tick_count().wrapping_sub(self.start) < self.ticks
+    }
+    fn wait(&mut self) -> bool {
+        self.polls += 1;
+        if !self.live() {
+            return false;
+        }
+        if self.polls.is_multiple_of(64) {
+            let reason = b"com1-debug-close";
+            unsafe {
+                crate::sched::scheduler::sleep(1, reason.as_ptr(), reason.len());
+            }
+        } else {
+            core::hint::spin_loop();
+        }
+        true
+    }
+    fn ready(&mut self, mask: u8) -> bool {
+        loop {
+            if !self.live() {
+                return false;
+            }
+            let status = unsafe { inb(COM1 + 5) };
+            if status == 0xff {
+                return false;
+            }
+            if status & mask == mask {
+                return true;
+            }
+            if !self.wait() {
+                return false;
+            }
+        }
+    }
+}
+/// Valid task context only. The atomic claim closes admission first, then
+/// waits outside all no-sleep owners. Admitted writers finish under the old
+/// serial owner; their counters drop before that owner can permit preemption.
+pub(super) fn close_after_boot() -> bool {
+    if !admission::begin_close() {
+        return false;
+    }
+    unsafe {
+        super::log_route::set_serial(None, None, None, None);
+    }
+    let mut budget = CloseBudget::new();
+    while admission::writers() != 0 {
+        if !budget.wait() {
+            return close_result(false);
+        }
+    }
+    let (known, fifo) = {
+        let _owner = Guard::acquire(1);
+        unsafe { ((*SERIAL.0.get()).known_uart, (*SERIAL.0.get()).fifo) }
+    };
+    if !known {
+        return close_result(false);
+    }
+    while pending() != 0 {
+        if !budget.ready(0x20) {
+            return close_result(false);
+        }
+        let mut bytes = [0u8; FIFO];
+        let (tail, count) = {
+            let _owner = Guard::acquire(1);
+            let tail = TAIL.load(Ordering::Relaxed);
+            let count = pending().min(fifo);
+            for (index, byte) in bytes[..count].iter_mut().enumerate() {
+                *byte =
+                    unsafe { (*SERIAL.0.get()).ring[tail.wrapping_add(index) & (CAPACITY - 1)] };
+            }
+            (tail, count)
+        };
+        for byte in &bytes[..count] {
+            unsafe {
+                outb(COM1, *byte);
+            }
+        }
+        let _owner = Guard::acquire(1);
+        TAIL.store(tail.wrapping_add(count), Ordering::Relaxed);
+    }
+    {
+        let _owner = Guard::acquire(1);
+        let stats = unsafe { &mut (*SERIAL.0.get()).stats };
+        stats.write_calls = stats.write_calls.wrapping_add(1);
+        stats.bulk_calls = stats.bulk_calls.wrapping_add(1);
+        stats.lock_acquisitions = stats.lock_acquisitions.wrapping_add(1);
+        stats.max_span = stats.max_span.max(CLOSE_MESSAGE.len() as u64);
+    }
+    let mut offset = 0;
+    while offset < CLOSE_MESSAGE.len() {
+        if !budget.ready(0x20) {
+            return close_result(false);
+        }
+        let count = fifo.min(CLOSE_MESSAGE.len() - offset);
+        for byte in &CLOSE_MESSAGE[offset..offset + count] {
+            unsafe {
+                outb(COM1, *byte);
+            }
+        }
+        offset += count;
+        let _owner = Guard::acquire(1);
+        let stats = unsafe { &mut (*SERIAL.0.get()).stats };
+        stats.sync_bytes = stats.sync_bytes.wrapping_add(count as u64);
+    }
+    // THRE alone acknowledges no shift-register completion. Both transmitter
+    // states must be genuinely empty before a normal owner may claim COM1.
+    close_result(budget.ready(0x60))
+}
+fn close_result(released: bool) -> bool {
+    // A stuck admitted writer may still own the metadata lock. Failure must
+    // retain the port without waiting on that same owner beyond the budget.
+    if !released && admission::writers() != 0 {
+        admission::finish(false);
+        return false;
+    }
+    {
+        let _owner = Guard::acquire(1);
+        let stats = unsafe { &mut (*SERIAL.0.get()).stats };
+        stats.sync_uart_available = false;
+        if !released {
+            stats.sync_failures = stats.sync_failures.wrapping_add(1);
+        }
+    }
+    admission::finish(released);
+    !debug_claims_com1()
 }
 #[unsafe(no_mangle)]
 /// # Safety

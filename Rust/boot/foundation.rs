@@ -128,8 +128,7 @@ unsafe extern "C" fn serial_putc(byte: u8) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_com_debug_boot() {
-    if config::ENABLE_COM1_DEBUG {
-        super::serial::r4os_rust_serial_init(0x3f8);
+    if config::ENABLE_COM1_DEBUG && super::serial::init_debug() {
         unsafe {
             super::log_route::set_serial(
                 Some(serial_putc),
@@ -138,7 +137,7 @@ pub extern "C" fn r4os_rust_com_debug_boot() {
                 Some(super::serial::r4os_rust_serial_sync),
             );
         };
-    } else {
+    } else if !config::ENABLE_COM1_DEBUG {
         unsafe { super::log_route::set_serial(None, None, None, None) };
     }
 }
