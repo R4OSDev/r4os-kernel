@@ -4,7 +4,10 @@ use super::{
     file, format as fmt, r4m, registry_control as ctl, registry_queries as query,
     registry_state as state, resources,
 };
-use crate::fs::{vfs, vfs_types as t};
+use crate::{
+    fs::{vfs, vfs_types as t},
+    memory::scratch::Scratch as ResidentScratch,
+};
 use core::{
     ffi::c_void,
     mem::{self, MaybeUninit},
@@ -214,7 +217,8 @@ unsafe fn metadata<'a>(
     }
 }
 // The same native bounded reader serves loader-local R4D/R4P metadata
-// probes. Keep its two-window workspace in this short call frame.
+// probes. Allocate its two windows in their final resident location, retaining
+// the exact caller task until the last read has returned and release is acked.
 #[inline(never)]
 pub(crate) unsafe fn metadata_probe(
     source: *const file::Source,
@@ -222,7 +226,7 @@ pub(crate) unsafe fn metadata_probe(
     output: &mut [u8],
     name: &[u8],
 ) -> Option<usize> {
-    let mut reader = MaybeUninit::<Reader>::uninit();
+    let reader = ResidentScratch::<Reader>::new()?;
     unsafe { reader_init(reader.as_mut_ptr(), source) };
     let h = unsafe { header(reader.as_mut_ptr(), expected, name) }?;
     unsafe { metadata(reader.as_mut_ptr(), &h, output, name) }.map(|s| s.len())
@@ -1120,12 +1124,13 @@ unsafe fn pending_file_name<'a>(p: *const Pending) -> &'a [u8] {
 unsafe fn pending_path<'a>(p: *const Pending) -> &'a [u8] {
     unsafe { slice::from_raw_parts(ptr::addr_of!((*p).path).cast(), (*p).path_len) }
 }
-// The two-window metadata reader belongs only to this probe. Keep its
-// large workspace out of the caller frame retained by dependency recursion.
+// The two-window metadata reader belongs only to this resident probe workspace.
 #[inline(never)]
-unsafe fn probe(source: file::Source, file_name: &[u8], out: *mut Pending) -> bool {
-    let mut reader = MaybeUninit::<Reader>::uninit();
-    unsafe { reader_init(reader.as_mut_ptr(), ptr::from_ref(&source)) };
+unsafe fn probe(source: *const file::Source, file_name: &[u8], out: *mut Pending) -> bool {
+    let Some(reader) = ResidentScratch::<Reader>::new() else {
+        return report(b"[MOD] metadata reader allocation failed: ", file_name);
+    };
+    unsafe { reader_init(reader.as_mut_ptr(), source) };
     let Some(h) = (unsafe { header(reader.as_mut_ptr(), 2, b"r4l-metadata-probe") }) else {
         return false;
     };
@@ -1143,18 +1148,18 @@ unsafe fn probe(source: file::Source, file_name: &[u8], out: *mut Pending) -> bo
         ctl::add(ctl::DUPLICATE);
         return report(b"[MOD] resolver duplicate provider module=", name);
     }
-    let mut p = Pending {
-        used: true,
-        state: 1,
-        file_size: source.entry.size as usize,
-        source: MaybeUninit::new(source),
-        ..Pending::EMPTY
-    };
-    p.file_name_len = copy(file_name, &mut p.file_name);
-    p.name_len = copy(name, &mut p.name);
-    p.path_len = copy(b"C:\\R4OS\\LIBS\\", &mut p.path);
-    p.path_len += copy(file_name, &mut p.path[p.path_len..]);
-    unsafe { ptr::write(out, p) };
+    unsafe {
+        ptr::write(out, Pending::EMPTY);
+        ptr::copy_nonoverlapping(source, ptr::addr_of_mut!((*out).source).cast(), 1);
+        (*out).file_size = (*source).entry.size as usize;
+        (*out).file_name_len = copy(file_name, &mut (*out).file_name);
+        (*out).name_len = copy(name, &mut (*out).name);
+        (*out).path_len = copy(b"C:\\R4OS\\LIBS\\", &mut (*out).path);
+        let prefix = (*out).path_len;
+        (*out).path_len += copy(file_name, &mut (&mut (*out).path)[prefix..]);
+        (*out).used = true;
+        (*out).state = 1;
+    }
     true
 }
 unsafe fn duplicates(pending: *mut Pending, count: usize) {
@@ -1398,11 +1403,14 @@ pub unsafe extern "C" fn r4os_rust_mod_load_libraries(peers: &state::Peers) {
         return;
     }
     let dir = result.value;
+    // This scan owns the fixed 32-record set through dependency resolution.
+    // Keep it off the bounded boot/task stack and initialize only in place.
+    let Some(storage) = ResidentScratch::<[Pending; 32]>::new() else {
+        ctl::log(b"[MOD] pending library workspace allocation failed\r\n");
+        return;
+    };
     ctl::r4os_rust_mod_libraries_active(true);
     ctl::log(b"[MOD] scanning /R4OS/LIBS\r\n");
-    // The original fixed32 records occupy one resident boot/task-stack array.
-    // Initialize each record in place; never make a second36KB array copy.
-    let mut storage = MaybeUninit::<[Pending; 32]>::uninit();
     let pending = storage.as_mut_ptr().cast::<Pending>();
     for i in 0..32 {
         unsafe { ptr::write(pending.add(i), Pending::EMPTY) };
@@ -1445,7 +1453,7 @@ pub unsafe extern "C" fn r4os_rust_mod_load_libraries(peers: &state::Peers) {
             if entry.size != 0
                 && unsafe {
                     probe(
-                        file::Source {
+                        &file::Source {
                             volume,
                             entry,
                             drive: b'C',

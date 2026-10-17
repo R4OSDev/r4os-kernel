@@ -29,3 +29,4 @@ pub mod vm_transactions;
 
 pub(crate) mod boot_diagnostics;
 pub(crate) mod heap_probes;
+pub(crate) mod scratch;

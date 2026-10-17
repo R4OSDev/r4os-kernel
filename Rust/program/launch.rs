@@ -16,6 +16,7 @@ use crate::{
         vfs_types::{self as t, Bytes},
     },
     loader::{file, r4m},
+    memory::scratch::Scratch,
     sched::task::{
         task_api, task_registry,
         task_types::{ExecutionOwnerKind, State as TaskState, Task},
@@ -302,22 +303,18 @@ struct Reader {
     stamp: u64,
 }
 impl Reader {
-    fn new(source: file::Source, size: usize) -> Self {
-        file::r4os_rust_module_file_note_init();
-        Self {
-            source,
-            size,
-            windows: [const {
-                file::Window {
-                    valid: false,
-                    offset: 0,
-                    len: 0,
-                    stamp: 0,
-                    bytes: [MaybeUninit::new(0); 4096],
-                }
-            }; 2],
-            stamp: 0,
+    unsafe fn create(source: *const file::Source) -> Option<Scratch<Self>> {
+        let workspace = Scratch::<Self>::new()?;
+        let reader = workspace.as_mut_ptr();
+        unsafe {
+            ptr::addr_of_mut!((*reader).size).write((*source).entry.size as usize);
+            ptr::copy_nonoverlapping(source, ptr::addr_of_mut!((*reader).source), 1);
+            file::r4os_rust_module_file_reset(
+                ptr::addr_of_mut!((*reader).windows).cast(),
+                ptr::addr_of_mut!((*reader).stamp),
+            );
         }
+        Some(workspace)
     }
 }
 #[repr(C)]
@@ -534,11 +531,11 @@ unsafe fn metadata(
 }
 pub(super) unsafe fn classify(file: &File, policy: u32) -> Option<u8> {
     unsafe {
-        let mut reader = Reader::new(file.source, file.source.entry.size as usize);
-        let header = header(&mut reader, b"r4x-classify-header", false)?;
+        let reader = Reader::create(ptr::addr_of!(file.source))?;
+        let header = header(reader.as_mut_ptr(), b"r4x-classify-header", false)?;
         let class = util::class(policy, header.flags);
-        let export = exports(&mut reader, header, false)?;
-        if metadata(&mut reader, header, class, export, false) {
+        let export = exports(reader.as_mut_ptr(), header, false)?;
+        if metadata(reader.as_mut_ptr(), header, class, export, false) {
             Some(class)
         } else {
             None
@@ -698,8 +695,11 @@ pub(super) unsafe fn run(
             return 2;
         }
         report(options.report_boot, b"Header laden");
-        let mut reader = Reader::new(file.source, file.source.entry.size as usize);
-        let Some(header) = header(&mut reader, b"r4x-image-header", true) else {
+        let Some(reader) = Reader::create(ptr::addr_of!(file.source)) else {
+            lifetime::error(options, -8);
+            return 2;
+        };
+        let Some(header) = header(reader.as_mut_ptr(), b"r4x-image-header", true) else {
             lifetime::error(options, -9);
             return 2;
         };
@@ -715,7 +715,7 @@ pub(super) unsafe fn run(
         }
         report(options.report_boot, b"Image laden");
         let bridge = image::Reader {
-            context: ptr::addr_of_mut!(reader).cast(),
+            context: reader.as_mut_ptr().cast(),
             read: cached,
         };
         let request = image::Request {
@@ -732,6 +732,9 @@ pub(super) unsafe fn run(
             return 2;
         }
         let loaded = loaded.assume_init();
+        // No load callback retains the reader after image_load returns.
+        // Release its cache and kill pin before publishing/running the child.
+        drop(reader);
         if let Some(trace) = trace {
             log_loader(
                 trace,
