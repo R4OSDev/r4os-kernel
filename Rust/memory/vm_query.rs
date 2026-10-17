@@ -1,11 +1,32 @@
 //! Coherent VM range/window/owner snapshots under the existing VM owner.
 use super::{
     owner::Guard,
-    phys, virt_policy, vm_index,
+    phys, virt_policy, vm_budget, vm_index,
     vm_ranges::{self, Range},
     vm_transactions,
 };
 use core::mem::MaybeUninit;
+const APP_SYSTEM_RESERVE_FRAMES: u64 = 384;
+
+/// Narrow admission views under the same VM owner as the range transitions.
+/// Public diagnostic snapshots and their owner/window/kind filters stay below.
+pub(crate) fn admission_application(owner: u64) -> vm_budget::Usage {
+    let _owner = Guard::acquire(5);
+    if !vm_transactions::r4os_rust_vm_initialized() {
+        return vm_budget::Usage::default();
+    }
+    vm_ranges::budget_application(owner)
+}
+pub(crate) fn admission_system() -> (vm_budget::Usage, u64) {
+    let _owner = Guard::acquire(5);
+    if !vm_transactions::r4os_rust_vm_initialized() {
+        return (vm_budget::Usage::default(), 0);
+    }
+    (
+        vm_ranges::budget_global(),
+        phys::free_frames().saturating_sub(APP_SYSTEM_RESERVE_FRAMES),
+    )
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Stats {
@@ -90,7 +111,7 @@ fn largest(window: u8) -> (u64, u64) {
 fn stats() -> Stats {
     let _owner = Guard::acquire(5);
     let mut stats = Stats {
-        app_system_reserve_frames: 384,
+        app_system_reserve_frames: APP_SYSTEM_RESERVE_FRAMES,
         ..Stats::default()
     };
     if !vm_transactions::r4os_rust_vm_initialized() {
@@ -138,9 +159,9 @@ fn stats() -> Stats {
         phys::r4os_rust_phys_stats(physical.as_mut_ptr());
     }
     let physical = unsafe { physical.assume_init() };
-    if physical.free_frames > 384 {
-        stats.app_available_frames = physical.free_frames - 384;
-    }
+    stats.app_available_frames = physical
+        .free_frames
+        .saturating_sub(APP_SYSTEM_RESERVE_FRAMES);
     stats
 }
 fn owner_stats(owner: u8, owner_id: u64, window: u8, kind: u8) -> OwnerStats {

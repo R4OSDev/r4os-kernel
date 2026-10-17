@@ -2,7 +2,8 @@
 //! Native pager operations retain exact raw leases into this resident table.
 //! A lease is admitted by the VM owner; Rust references end before returning
 //! or calling any path that may wait/reenter a VM operation.
-use super::{blocks, virt_policy, vm_index};
+use super::{blocks, virt_policy, vm_budget, vm_index};
+use crate::contract;
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::ptr;
@@ -110,6 +111,52 @@ struct Storage(UnsafeCell<MaybeUninit<[Range; RANGES]>>);
 // admits every later access, including the bounded legacy pager's C leases.
 unsafe impl Sync for Storage {}
 static TABLE: Storage = Storage(UnsafeCell::new(MaybeUninit::uninit()));
+struct Budgets(UnsafeCell<vm_budget::Ledger<RANGES>>);
+// SAFETY: initialization and every delta/query use the same VM owner as TABLE.
+// These are derived sums; only the exact range transition authorizes a delta.
+unsafe impl Sync for Budgets {}
+static BUDGETS: Budgets = Budgets(UnsafeCell::new(vm_budget::Ledger::EMPTY));
+
+fn contribution(range: &Range) -> vm_budget::Contribution {
+    if !range.active() {
+        return vm_budget::Contribution::default();
+    }
+    vm_budget::Contribution {
+        usage: vm_budget::Usage {
+            reserved: range.len,
+            committed: range.committed_bytes,
+            resident: range.resident_bytes,
+        },
+        application: (range.owner == contract::memory_owner_r4x_instance
+            && range.window == contract::memory_window_r4x_vm
+            && range.kind == contract::memory_kind_virtual_range)
+            .then_some(range.owner_id),
+    }
+}
+/// # Safety
+/// Caller retains the VM owner and the exact resident TABLE range. The closure
+/// ends before any handoff or I/O; no ledger reference spans the mutation.
+pub(super) unsafe fn update_ptr<T>(
+    range: *mut Range,
+    operation: impl FnOnce(&mut Range) -> T,
+) -> T {
+    let before = contribution(unsafe { &*range });
+    let result = operation(unsafe { &mut *range });
+    let after = contribution(unsafe { &*range });
+    if before != after {
+        unsafe { (&mut *BUDGETS.0.get()).change(before, after) };
+    }
+    result
+}
+pub(super) fn budget_global() -> vm_budget::Usage {
+    unsafe { (&*BUDGETS.0.get()).global() }
+}
+pub(super) fn budget_application(owner: u64) -> vm_budget::Usage {
+    unsafe { (&*BUDGETS.0.get()).application(owner) }
+}
+pub(super) fn budget_invariant() -> bool {
+    unsafe { (&*BUDGETS.0.get()).matches(|index| contribution(&read(index))) }
+}
 pub(super) fn slot(index: usize) -> *mut Range {
     assert!(index < RANGES);
     unsafe { TABLE.0.get().cast::<Range>().add(index) }
@@ -122,12 +169,13 @@ pub(super) fn read(index: usize) -> Range {
 }
 pub(super) fn update<T>(index: usize, operation: impl FnOnce(&mut Range) -> T) -> T {
     // No pointer/reference to a different owner is retained by this closure.
-    operation(unsafe { &mut *slot(index) })
+    unsafe { update_ptr(slot(index), operation) }
 }
 /// # Safety
 /// Singleton BSP initialization before any reader or C lease is admitted.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_vm_ranges_init() -> *mut Range {
+    unsafe { (&mut *BUDGETS.0.get()).reset() };
     for index in 0..RANGES {
         unsafe {
             slot(index).write(Range::EMPTY);

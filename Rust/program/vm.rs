@@ -1,5 +1,5 @@
 //! Original R4X VM API admission, profile limits and reserve-only diagnostic.
-//! Native VM/block owners provide snapshots and complete admitted transactions.
+//! Native VM/block owners provide narrow budgets and complete admitted transactions.
 use super::{memory, registry_types::ProgramInstance, stack};
 use crate::{
     contract::{self, ProgramVmRegionInfo as Info, ProgramVmReserveProbe as Probe},
@@ -13,17 +13,11 @@ const OWNER: i32 = -3;
 const FLAGS: i32 = -11;
 const LIMIT: i32 = -13;
 
-fn stats() -> vm_query::Stats {
+// The explicit reserve probe still needs the complete diagnostic snapshot.
+fn diagnostic_stats() -> vm_query::Stats {
     let mut out = MaybeUninit::uninit();
     unsafe {
         vm_query::r4os_rust_vm_stats(out.as_mut_ptr());
-        out.assume_init()
-    }
-}
-unsafe fn dynamic(instance: *const ProgramInstance) -> vm_query::OwnerStats {
-    let mut out = MaybeUninit::uninit();
-    unsafe {
-        vm_query::r4os_rust_vm_owner_stats(3, u64::from((*instance).id), 6, 4, out.as_mut_ptr());
         out.assume_init()
     }
 }
@@ -32,32 +26,23 @@ pub(super) unsafe fn profile_limit(
     instance: *const ProgramInstance,
     add: u64,
 ) -> bool {
-    let stats = unsafe { dynamic(instance) };
+    let stats = vm_query::admission_application(unsafe { u64::from((*instance).id) });
     let (current, limit) = unsafe {
         match operation {
-            0 => (
-                stats.reserved_bytes,
-                (*instance).memory_limits.vm_reserve_limit,
-            ),
-            1 => (
-                stats.committed_bytes,
-                (*instance).memory_limits.vm_commit_limit,
-            ),
-            2 => (
-                stats.resident_bytes,
-                (*instance).memory_limits.resident_limit,
-            ),
+            0 => (stats.reserved, (*instance).memory_limits.vm_reserve_limit),
+            1 => (stats.committed, (*instance).memory_limits.vm_commit_limit),
+            2 => (stats.resident, (*instance).memory_limits.resident_limit),
             _ => unreachable!(),
         }
     };
     current.checked_add(add).is_some_and(|next| next <= limit)
 }
 pub(super) fn system_limit(add: u64) -> bool {
-    let stats = stats();
-    let available = stats.app_available_frames * PAGE;
-    let budget = stats.resident_bytes.saturating_add(available);
+    let (stats, available_frames) = vm_query::admission_system();
+    let available = available_frames * PAGE;
+    let budget = stats.resident.saturating_add(available);
     stats
-        .committed_bytes
+        .committed
         .checked_add(add)
         .is_some_and(|next| next <= budget)
 }
@@ -284,7 +269,7 @@ fn block_summary() -> blocks::Summary {
 }
 fn before(out: &mut Probe) {
     let blocks = block_summary();
-    let virt = stats();
+    let virt = diagnostic_stats();
     out.active_before = blocks.active_blocks;
     out.committed_before = blocks.committed_bytes;
     out.largest_free_before = virt.largest_free_virtual_len;
@@ -296,7 +281,7 @@ fn during(out: &mut Probe) {
 }
 fn after(out: &mut Probe) {
     let blocks = block_summary();
-    let virt = stats();
+    let virt = diagnostic_stats();
     out.active_after = blocks.active_blocks;
     out.committed_after = blocks.committed_bytes;
     out.largest_free_after = virt.largest_free_virtual_len;

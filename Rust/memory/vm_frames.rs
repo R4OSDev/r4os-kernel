@@ -7,7 +7,7 @@ use super::{
     owner::{self, Guard},
     page_batch::MAX_EXTENT_PAGES,
     paging, phys,
-    vm_ranges::Range,
+    vm_ranges::{self, Range},
 };
 use core::mem::MaybeUninit;
 const OUT_OF_MEMORY: u32 = 12;
@@ -286,12 +286,13 @@ pub unsafe extern "C" fn r4os_rust_vm_uncommit_extent(
         phys::r4os_rust_phys_free_extent(extent.base, extent.count);
     }
     let bytes = extent.count * PAGE;
-    {
-        let range = unsafe { &mut *range };
-        range.resident_bytes = range.resident_bytes.saturating_sub(bytes);
-        if logical {
-            range.committed_bytes = range.committed_bytes.saturating_sub(bytes);
-        }
+    unsafe {
+        vm_ranges::update_ptr(range, |range| {
+            range.resident_bytes = range.resident_bytes.saturating_sub(bytes);
+            if logical {
+                range.committed_bytes = range.committed_bytes.saturating_sub(bytes);
+            }
+        });
     }
     release.commit();
     0

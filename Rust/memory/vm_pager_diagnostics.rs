@@ -165,7 +165,7 @@ pub(super) fn invariant() -> bool {
             return false;
         }
     }
-    true
+    vm_ranges::budget_invariant()
 }
 
 fn text(value: &[u8]) {

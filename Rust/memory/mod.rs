@@ -16,6 +16,7 @@ pub mod phys;
 pub mod reclaim;
 pub mod root;
 pub mod virt_policy;
+pub(crate) mod vm_budget;
 pub mod vm_commit_spans;
 pub mod vm_frames;
 pub mod vm_index;

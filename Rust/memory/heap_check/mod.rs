@@ -93,9 +93,14 @@ pub(crate) fn run(
         state.report.failed_case = last;
     }
     state.cleanup();
+    let budgets_match = {
+        let _vm = super::owner::Guard::acquire(5);
+        !super::vm_transactions::r4os_rust_vm_initialized() || super::vm_ranges::budget_invariant()
+    };
     if state.report.owned_live_blocks == 0
         && state.report.vm_live_reservations == 0
         && state.report.cleanup_errors == 0
+        && budgets_match
     {
         state.report.flags |= c::kernel_heap_check_flag_cleanup_complete;
     } else {

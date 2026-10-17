@@ -463,6 +463,11 @@ pub unsafe extern "C" fn r4os_rust_phys_stats(output: *mut Stats) {
     };
     unsafe { output.write(result) };
 }
+/// Current allocator truth, without projecting the diagnostic Stats record.
+pub(crate) fn free_frames() -> u64 {
+    let _guard = Guard::acquire(7);
+    unsafe { (&*PMM.0.get()).stats.free_frames }
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_phys_to_virt(address: u64) -> u64 {
     address

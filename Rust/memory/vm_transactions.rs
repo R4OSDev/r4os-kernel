@@ -113,7 +113,7 @@ fn block_committed(range: Range) -> Result<(), u32> {
     }
 }
 unsafe fn update<T>(range: *mut Range, operation: impl FnOnce(&mut Range) -> T) -> T {
-    operation(unsafe { &mut *range })
+    unsafe { vm_ranges::update_ptr(range, operation) }
 }
 unsafe fn snapshot(range: *const Range) -> Range {
     unsafe { range.read() }

@@ -1565,8 +1565,10 @@ pub(super) unsafe fn demand_commit(pointer: *mut Range, offset: u64, bytes: u64)
             return Err(error);
         }
         unsafe {
-            ptr::addr_of_mut!((*pointer).committed_bytes).write(next);
-            ptr::addr_of_mut!((*pointer).status).write(2);
+            vm_ranges::update_ptr(pointer, |range| {
+                range.committed_bytes = next;
+                range.status = 2;
+            });
         }
         let status =
             unsafe { blocks::r4os_rust_blocks_change(range.block_id, 1, next, ptr::null()) };
@@ -1669,15 +1671,16 @@ pub(super) unsafe fn uncommit_demand(
                 ps::with(|s| s.remove_reserved(current, first_page, end_page, &mut splits))?;
                 let _publication = Held::acquire();
                 unsafe {
-                    if !(*pointer).partial_uncommit_accounted {
-                        if skip && bytes > (*pointer).committed_bytes {
-                            (*pointer).committed_bytes = 0;
-                        } else {
-                            (*pointer).committed_bytes =
-                                (*pointer).committed_bytes.saturating_sub(bytes);
+                    vm_ranges::update_ptr(pointer, |range| {
+                        if !range.partial_uncommit_accounted {
+                            if skip && bytes > range.committed_bytes {
+                                range.committed_bytes = 0;
+                            } else {
+                                range.committed_bytes = range.committed_bytes.saturating_sub(bytes);
+                            }
+                            range.partial_uncommit_accounted = true;
                         }
-                        (*pointer).partial_uncommit_accounted = true;
-                    }
+                    });
                 }
                 Ok(())
             })();
