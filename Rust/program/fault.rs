@@ -2,12 +2,13 @@
 //! and SIMD state remain on the exact task stack before any waiting pager I/O.
 //! The remaining pager and async-I/O owners retain their own admitted work.
 use super::{
-    registry_types::ProgramInstance,
     stack,
+    stack_fault::{self, Failure},
     threads::{self, Thread},
     vm,
 };
 use crate::{
+    contract as c,
     memory::{owner, virt_policy},
     sched::{scheduler, task::task_registry},
 };
@@ -16,14 +17,12 @@ const MAIN: u32 = 1;
 const GUARD: u64 = 4096;
 const HEADROOM: u64 = 64 * 1024;
 
-unsafe fn grow_thread(thread: *mut Thread, address: u64) -> bool {
+unsafe fn grow_thread(thread: *mut Thread, address: u64) -> Result<(), Failure> {
     unsafe {
         let before = (*thread).stack.committed_size;
-        if !stack::grow(ptr::addr_of_mut!((*thread).stack), address) {
-            return false;
-        }
+        stack::grow(ptr::addr_of_mut!((*thread).stack), address)?;
         if !(*thread).stack.serial_telemetry {
-            return true;
+            return Ok(());
         }
         stack::blog(b"[R4X] thread stack grow owner=");
         stack::bdec(u64::from((*thread).instance_id));
@@ -34,7 +33,7 @@ unsafe fn grow_thread(thread: *mut Thread, address: u64) -> bool {
         stack::blog(b" -> ");
         stack::bdec((*thread).stack.committed_size);
         stack::blog(b"\r\n");
-        true
+        Ok(())
     }
 }
 unsafe fn prepare(address: u64, rsp: u64, bytes: u64) -> Option<u64> {
@@ -66,11 +65,17 @@ unsafe fn prepare(address: u64, rsp: u64, bytes: u64) -> Option<u64> {
                 if stack::contains_instance(instance, rsp - 1) {
                     let floor = frame.saturating_sub(HEADROOM);
                     if floor < (*instance).program_stack_base + GUARD {
+                        stack_fault::preparation_failed(
+                            address,
+                            rsp,
+                            Failure::new(c::stack_fault_reason_continuation_headroom),
+                        );
                         return None;
                     }
                     if floor < (*instance).program_stack_committed_base
-                        && !stack::grow_instance(instance, floor)
+                        && let Err(failure) = stack::grow_instance(instance, floor)
                     {
+                        stack_fault::preparation_failed(address, rsp, failure);
                         return None;
                     }
                     return Some(frame);
@@ -78,9 +83,17 @@ unsafe fn prepare(address: u64, rsp: u64, bytes: u64) -> Option<u64> {
             } else if stack::contains(ptr::addr_of!((*thread).stack), rsp - 1) {
                 let floor = frame.saturating_sub(HEADROOM);
                 if floor < (*thread).stack.base + (*thread).stack.guard_size {
+                    stack_fault::preparation_failed(
+                        address,
+                        rsp,
+                        Failure::new(c::stack_fault_reason_continuation_headroom),
+                    );
                     return None;
                 }
-                if floor < (*thread).stack.committed_base && !grow_thread(thread, floor) {
+                if floor < (*thread).stack.committed_base
+                    && let Err(failure) = grow_thread(thread, floor)
+                {
+                    stack_fault::preparation_failed(address, rsp, failure);
                     return None;
                 }
                 return Some(frame);
@@ -91,6 +104,13 @@ unsafe fn prepare(address: u64, rsp: u64, bytes: u64) -> Option<u64> {
             || frame < (*core).stack_base
             || frame - (*core).stack_base < 32 * 1024
         {
+            if rsp > (*core).stack_base && rsp <= (*core).stack_top {
+                stack_fault::preparation_failed(
+                    address,
+                    rsp,
+                    Failure::new(c::stack_fault_reason_continuation_headroom),
+                );
+            }
             return None;
         }
         Some(frame)
@@ -120,17 +140,12 @@ pub unsafe extern "C" fn r4os_rust_program_fault_handle(
     address: u64,
     error: u64,
     pageable: bool,
+    rsp: u64,
 ) -> bool {
     unsafe {
         if error & 1 != 0 || !owner::fault_allowed() {
             return false;
         }
-        let task = scheduler::current();
-        let current_id = if task.is_null() {
-            None
-        } else {
-            Some((*task_registry::core(task.cast())).id)
-        };
         if pageable {
             let instance = super::context::execution();
             if !instance.is_null()
@@ -145,51 +160,30 @@ pub unsafe extern "C" fn r4os_rust_program_fault_handle(
             if (*thread).flags & MAIN != 0 {
                 let instance = (*thread).owner_instance;
                 if !instance.is_null() && stack::contains_instance(instance, address) {
-                    return stack::grow_instance(instance, address);
+                    return growth_result(
+                        stack::grow_instance(instance, address),
+                        address,
+                        rsp,
+                        error,
+                    );
                 }
             } else if stack::contains(ptr::addr_of!((*thread).stack), address) {
-                return grow_thread(thread, address);
+                return growth_result(grow_thread(thread, address), address, rsp, error);
             }
         }
-        let mut stack_owner: *mut ProgramInstance = ptr::null_mut();
-        let mut thread_owner: *mut Thread = ptr::null_mut();
-        let mut cursor = (*threads::state()).head;
-        while !cursor.is_null() {
-            let thread = cursor;
-            cursor = (*thread).registry_next;
-            if !(*thread).used {
-                continue;
-            }
-            if (*thread).flags & MAIN != 0 {
-                let instance = (*thread).owner_instance;
-                if instance.is_null() || !stack::contains_instance(instance, address) {
-                    continue;
-                }
-                if current_id.is_some_and(|id| (*thread).task_id == id) {
-                    return stack::grow_instance(instance, address);
-                }
-                if stack_owner.is_null() {
-                    stack_owner = instance;
-                }
-                continue;
-            }
-            if !stack::contains(ptr::addr_of!((*thread).stack), address) {
-                continue;
-            }
-            if current_id.is_some_and(|id| (*thread).task_id == id) {
-                return grow_thread(thread, address);
-            }
-            if thread_owner.is_null() {
-                thread_owner = thread;
-            }
-        }
-        if !stack_owner.is_null() {
-            return stack::grow_instance(stack_owner, address);
-        }
-        if !thread_owner.is_null() {
-            return grow_thread(thread_owner, address);
-        }
+        // Only the retained current execution binding admits stack growth.
+        // An address in another task's reservation is not ownership proof.
         false
+    }
+}
+
+unsafe fn growth_result(result: Result<(), Failure>, address: u64, rsp: u64, error: u64) -> bool {
+    match result {
+        Ok(()) => true,
+        Err(failure) => {
+            unsafe { stack_fault::growth_failed(address, rsp, error, failure) };
+            false
+        }
     }
 }
 

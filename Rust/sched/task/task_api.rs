@@ -92,37 +92,33 @@ pub struct ReapStats {
     pub pending: usize,
 }
 /// # Safety
-/// Exclusive C output; range lookup and copied borrowed name retain the caller
-/// snapshot/lifetime contract and the existing runtime admission.
+/// Exception context with IF off; only the exact current task's resident guard
+/// and borrowed name are read. No runtime acquisition or registry traversal.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_task_guard_hit(address: u64, output: *mut GuardHit) -> bool {
-    let flags = runtime::save_runtime();
-    let mut found = false;
     unsafe {
-        let mut task = (*registry::raw()).head;
-        while !task.is_null() {
-            let c = registry::core(task);
-            if (*c).state != State::Unused
-                && (*c).stack_base != 0
-                && address >= (*c).stack_base - 16 * 1024
-                && address < (*c).stack_base
-            {
-                output.write(GuardHit {
-                    name: Span {
-                        pointer: (*c).name.pointer,
-                        len: (*c).name.len,
-                    },
-                    id: (*c).id,
-                    stack_base: (*c).stack_base,
-                });
-                found = true;
-                break;
-            }
-            task = (*c).registry_next;
+        let task = crate::sched::scheduler::current();
+        if task.is_null() {
+            return false;
         }
+        let c = registry::core(task.cast());
+        if (*c).stack_range_id == 0
+            || (*c).stack_base == 0
+            || address >= (*c).stack_base
+            || (*c).stack_base - address > resources::GUARD_SIZE
+        {
+            return false;
+        }
+        output.write(GuardHit {
+            name: Span {
+                pointer: (*c).name.pointer,
+                len: (*c).name.len,
+            },
+            id: (*c).id,
+            stack_base: (*c).stack_base,
+        });
+        true
     }
-    runtime::restore_runtime(flags);
-    found
 }
 /// # Safety
 /// Exclusive aligned C output; all role/donation counters share runtime owner.

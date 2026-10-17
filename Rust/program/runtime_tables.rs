@@ -1162,13 +1162,14 @@ fn configure_dev() {
         performance_lock: r4dev::telemetry::r4os_rust_r4dev_performance_lock as *const () as usize,
         performance_stack: r4dev::telemetry::r4os_rust_r4dev_performance_stack as *const ()
             as usize,
+        stack_fault: super::stack_fault::snapshot as *const () as usize,
         ..Default::default()
     };
     DEV.configure(value);
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 392);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 400);
     assert!(mem::offset_of!(c::R4XStartR4Dev, magic) == 0);
     assert!(mem::offset_of!(c::R4XStartR4Dev, abi_version) == 4);
     assert!(mem::offset_of!(c::R4XStartR4Dev, size) == 8);

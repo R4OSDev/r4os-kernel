@@ -23,12 +23,10 @@ fn fixed_z(bytes: &[u8]) -> &[u8] {
     &bytes[..bytes.iter().position(|&c| c == 0).unwrap_or(bytes.len())]
 }
 fn serial_putc(ch: u8) {
-    crate::boot::log_route::console_putc_raw(ch)
+    crate::boot::log_route::serial_write_raw(&[ch])
 }
 fn serial_puts(text: &[u8]) {
-    for &ch in text {
-        serial_putc(ch)
-    }
+    crate::boot::log_route::serial_write_raw(text)
 }
 fn serial_hex(value: u64, digits: u8) {
     for i in (0..digits).rev() {
@@ -395,6 +393,57 @@ unsafe fn draw_framebuffer(f: &Framebuffer, report: &CrashReport) {
         r.flag(b"rsvd", report.page_fault.reserved_bit);
         r.flag(b"ifetch", report.page_fault.instruction_fetch);
         r.newline();
+    }
+    if let Some(stack) = crate::program::stack_fault::for_report(report) {
+        use crate::{contract as c, program::stack_fault};
+        r.puts(b"Stack: ");
+        r.puts(stack_fault::kind_name(stack.stack_kind));
+        r.puts(b"  ");
+        r.put_line(stack_fault::reason_name(stack.reason));
+        r.puts(b"Task: ");
+        if stack.flags & c::stack_fault_flag_task != 0 {
+            r.dec(u64::from(stack.task_id));
+            r.puts(b"/");
+            r.dec(stack.task_generation);
+        } else {
+            r.puts(b"unavailable");
+        }
+        r.puts(b"  Instance: ");
+        if stack.flags & c::stack_fault_flag_instance != 0 {
+            r.dec(u64::from(stack.instance_id));
+            r.puts(b"/");
+            r.dec(stack.instance_generation);
+        } else {
+            r.puts(b"unavailable");
+        }
+        r.puts(b"  Thread: ");
+        if stack.flags & c::stack_fault_flag_thread != 0 {
+            r.dec(u64::from(stack.thread_id));
+            r.puts(b"/");
+            r.dec(stack.thread_generation);
+        } else {
+            r.puts(b"unavailable");
+        }
+        r.newline();
+        if stack.flags & c::stack_fault_flag_bounds != 0 {
+            r.puts(b"Reserve: 0x");
+            r.hex(stack.reserve_base, 16);
+            r.puts(b"  bytes=");
+            r.dec(stack.reserve_bytes);
+            r.newline();
+            r.puts(b"Committed: 0x");
+            r.hex(stack.committed_base, 16);
+            r.puts(b"  bytes=");
+            r.dec(stack.committed_bytes);
+            r.newline();
+            r.puts(b"Guard: 0x");
+            r.hex(stack.guard_base, 16);
+            r.puts(b"  bytes=");
+            r.dec(stack.guard_bytes);
+            r.newline();
+        } else {
+            r.put_line(b"Stack bounds unavailable.");
+        }
     }
     if report.flags & FLAG_MEMORY != 0 {
         r.newline();

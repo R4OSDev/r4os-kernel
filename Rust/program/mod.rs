@@ -66,6 +66,7 @@ pub mod service_api;
 pub mod shared_raster;
 pub mod shell_launcher;
 pub mod stack;
+pub mod stack_fault;
 pub mod system;
 pub mod thread_join;
 pub mod thread_retire;

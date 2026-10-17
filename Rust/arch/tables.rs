@@ -340,6 +340,7 @@ pub unsafe extern "C" fn preparePageFaultFrame(
     frame: *const InterruptFrame,
     address: u64,
 ) -> usize {
+    crate::program::stack_fault::begin_fault();
     if unsafe { (*frame).error_code } & 1 != 0 {
         return 0;
     }
@@ -407,10 +408,18 @@ unsafe fn exception_inner(frame: *const InterruptFrame, address: u64, private_st
                 address,
                 (*frame).error_code,
                 private_stack,
+                interrupted_rsp(frame),
             )
         {
             return;
         }
+        crate::program::stack_fault::exception(
+            (*frame).vector as u32,
+            address,
+            interrupted_rsp(frame),
+            (*frame).error_code,
+        );
+        crate::program::stack_fault::emit();
         l::puts(b"[SMP] exception cpu=");
         l::dec(u64::from(crate::arch::percpu::current_index()));
         let current = scheduler::current().cast::<crate::sched::task::task_types::Task>();
@@ -465,30 +474,10 @@ unsafe fn exception_inner(frame: *const InterruptFrame, address: u64, private_st
             cs: f.cs,
             rflags: f.rflags,
         };
-        let mut memory = crash::FaultMemoryInfo::default();
-        if f.vector == 14 {
-            let mut block = core::mem::MaybeUninit::uninit();
-            if crate::memory::blocks::r4os_rust_blocks_read(1, 0, address, block.as_mut_ptr()) {
-                let b = block.assume_init();
-                memory = crash::FaultMemoryInfo {
-                    state: 2,
-                    block_id: b.id,
-                    owner: b.owner,
-                    owner_id: b.owner_id,
-                    kind: b.kind,
-                    status: b.status,
-                    phys_base: b.phys_base,
-                    phys_len: b.phys_len,
-                    virt_base: b.virt_base,
-                    virt_len: b.virt_len,
-                };
-            } else {
-                memory.state = 1;
-                memory.owner = 254;
-                memory.kind = 13;
-                memory.status = 254;
-            }
-        }
+        // Fatal attribution never acquires the physical owner or scans its
+        // 8192-entry catalogue. Proven stack bounds are already resident;
+        // unavailable general MemoryBlock attribution must stay unavailable.
+        let memory = crash::FaultMemoryInfo::default();
         let mut context = crash::ExecutionContext::default();
         crate::program::peer_lifetime::r4os_rust_program_peer_crash(
             core::ptr::null(),
@@ -523,4 +512,27 @@ unsafe fn exception_inner(frame: *const InterruptFrame, address: u64, private_st
             core::arch::asm!("cli", "hlt", options(nomem, nostack));
         }
     }
+}
+
+/// Resident exception stacks have no guard reservation. Only an interrupted
+/// RSP in the exact current CPU's static arrays establishes these bounds.
+pub(crate) fn exception_stack_bounds(rsp: u64) -> Option<(u64, u64)> {
+    let cpu = crate::arch::percpu::current_index() as usize;
+    let normal = unsafe {
+        core::ptr::addr_of!(FAULT_STACKS.0)
+            .cast::<[u8; STACK_SIZE]>()
+            .add(cpu)
+    } as u64;
+    let double = unsafe {
+        core::ptr::addr_of!(DOUBLE_FAULT_STACKS.0)
+            .cast::<[u8; STACK_SIZE]>()
+            .add(cpu)
+    } as u64;
+    for base in [normal, double] {
+        let top = base + STACK_SIZE as u64;
+        if rsp > base && rsp <= top {
+            return Some((base, top));
+        }
+    }
+    None
 }

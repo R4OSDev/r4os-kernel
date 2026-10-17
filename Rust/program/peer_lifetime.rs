@@ -186,7 +186,7 @@ pub unsafe extern "C" fn r4os_rust_program_peer_contains(
 /// # Safety
 /// Exclusive canonical crash output and IRQ-safe retained task/thread records.
 /// scan=false requires the original exact nonnull instance; scan=true uses
-/// current execution first, then the stable intrusive thread owner index.
+/// only the retained current execution. A matching foreign RIP is not proof.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_peer_crash(
     instance: *const ProgramInstance,
@@ -208,20 +208,6 @@ pub unsafe extern "C" fn r4os_rust_program_peer_crash(
         };
         let instance = context::execution();
         if !instance.is_null() {
-            out.write(crash_context(instance, task, rip));
-            return;
-        }
-        let mut thread = (*threads::state()).head;
-        while !thread.is_null() {
-            let node = thread;
-            thread = (*node).registry_next;
-            if !(*node).used {
-                continue;
-            }
-            let instance = (*node).owner_instance;
-            if instance.is_null() || !contains(instance, rip) {
-                continue;
-            }
             out.write(crash_context(instance, task, rip));
             return;
         }

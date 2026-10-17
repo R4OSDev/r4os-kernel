@@ -1,11 +1,11 @@
 //! R4X image/stack resources and atomic per-profile telemetry. Every release
 //! retains its exact partial-commit state until the lower VM owner acknowledges.
 //! Metrics only control poison/scans/timing; guards and ownership are functional.
-use super::{image::Image, memory, registry_types::ProgramInstance, vm};
+use super::{image::Image, memory, registry_types::ProgramInstance, stack_fault::Failure, vm};
 use crate::{
     boot::{foundation as console, log as bootlog},
     build_config::config,
-    contract::ProgramStackPerformanceInfo,
+    contract::{self as c, ProgramStackPerformanceInfo},
     memory::{vm_query, vm_ranges, vm_transactions},
     platform::timer,
     sched::task::{task_registry, task_resources, task_types::Role},
@@ -775,15 +775,16 @@ pub(super) unsafe fn contains(stack: *const Stack, address: u64) -> bool {
         address >= (*stack).base && address < end
     }
 }
-pub(super) unsafe fn grow_instance(instance: *mut ProgramInstance, address: u64) -> bool {
+pub(super) unsafe fn grow_instance(
+    instance: *mut ProgramInstance,
+    address: u64,
+) -> Result<(), Failure> {
     unsafe {
         let Some(mut stack) = from_instance(instance) else {
-            return false;
+            return Err(Failure::new(c::stack_fault_reason_unknown));
         };
         let before = stack.committed_size;
-        if !grow(&mut stack, address) {
-            return false;
-        }
+        grow(&mut stack, address)?;
         r4os_rust_program_stack_to_instance(instance, &stack);
         if stack.serial_telemetry {
             blog(b"[R4X] stack grow owner=");
@@ -794,7 +795,7 @@ pub(super) unsafe fn grow_instance(instance: *mut ProgramInstance, address: u64)
             bdec(stack.committed_size);
             blog(b"\r\n");
         }
-        true
+        Ok(())
     }
 }
 pub(super) fn blog(text: &[u8]) {
@@ -803,29 +804,21 @@ pub(super) fn blog(text: &[u8]) {
 pub(super) fn bdec(value: u64) {
     bootlog::r4os_rust_bootlog_dec(value);
 }
-pub(super) unsafe fn grow(stack: *mut Stack, address: u64) -> bool {
+pub(super) unsafe fn grow(stack: *mut Stack, address: u64) -> Result<(), Failure> {
     unsafe {
         if (*stack).range_id == 0 || (*stack).guard_size == 0 {
-            return false;
+            return Err(Failure::new(c::stack_fault_reason_unknown));
         }
         let fault_page = address & !(PAGE - 1);
         if fault_page < (*stack).base + (*stack).guard_size {
-            if fault_page >= (*stack).base {
-                blog(b"[R4X] STACK EXHAUSTED fault=");
-                bootlog::r4os_rust_bootlog_hex(address, 16);
-                blog(b" base=");
-                bootlog::r4os_rust_bootlog_hex((*stack).base, 16);
-                blog(b" committed_base=");
-                bootlog::r4os_rust_bootlog_hex((*stack).committed_base, 16);
-                blog(b" reserve=");
-                bdec((*stack).reserve_size);
-                blog(b"\r\n");
-                console::puts(b"[R4X] STACK EXHAUSTED (app stack reserve aufgebraucht)\r\n");
-            }
-            return false;
+            return Err(Failure::new(if fault_page >= (*stack).base {
+                c::stack_fault_reason_reserve_exhausted
+            } else {
+                c::stack_fault_reason_unknown
+            }));
         }
         if fault_page >= (*stack).committed_base {
-            return false;
+            return Err(Failure::new(c::stack_fault_reason_unknown));
         }
         let mut desired = (*stack).committed_base
             - GROW.min((*stack).committed_base - ((*stack).base + (*stack).guard_size));
@@ -836,28 +829,35 @@ pub(super) unsafe fn grow(stack: *mut Stack, address: u64) -> bool {
             desired = (*stack).base + (*stack).guard_size;
         }
         if desired >= (*stack).committed_base {
-            return false;
+            return Err(Failure::new(c::stack_fault_reason_reserve_exhausted));
         }
         let len = (*stack).committed_base - desired;
         if !vm::system_limit(len) {
-            return false;
+            return Err(Failure::new(c::stack_fault_reason_physical_budget));
         }
         let old_guard_base = (*stack).guard_base;
         let old_guard_size = (*stack).guard_size;
-        if vm_transactions::r4os_rust_vm_protect_guard((*stack).range_id, 0, 0, true) != 0 {
-            return false;
+        let code = vm_transactions::r4os_rust_vm_protect_guard((*stack).range_id, 0, 0, true);
+        if code != 0 {
+            return Err(Failure::vm(c::stack_fault_reason_vm_guard, code));
         }
         let code =
             vm_transactions::r4os_rust_vm_commit((*stack).range_id, desired - (*stack).base, len);
         if code != 0 {
-            error(b"R4X stack grow failed: ", code);
             vm_transactions::r4os_rust_vm_protect_guard(
                 (*stack).range_id,
                 old_guard_base - (*stack).base,
                 old_guard_size,
                 false,
             );
-            return false;
+            return Err(Failure::vm(
+                if code == 12 {
+                    c::stack_fault_reason_physical_budget
+                } else {
+                    c::stack_fault_reason_vm_commit
+                },
+                code,
+            ));
         }
         let new_guard_base = desired - (*stack).guard_size;
         let code = vm_transactions::r4os_rust_vm_protect_guard(
@@ -867,7 +867,6 @@ pub(super) unsafe fn grow(stack: *mut Stack, address: u64) -> bool {
             false,
         );
         if code != 0 {
-            error(b"R4X stack guard move failed: ", code);
             vm_transactions::r4os_rust_vm_uncommit((*stack).range_id, desired - (*stack).base, len);
             vm_transactions::r4os_rust_vm_protect_guard(
                 (*stack).range_id,
@@ -875,13 +874,13 @@ pub(super) unsafe fn grow(stack: *mut Stack, address: u64) -> bool {
                 old_guard_size,
                 false,
             );
-            return false;
+            return Err(Failure::vm(c::stack_fault_reason_vm_guard, code));
         }
         poison(desired, len);
         (*stack).committed_base = desired;
         (*stack).committed_size += len;
         (*stack).guard_base = new_guard_base;
-        true
+        Ok(())
     }
 }
 /// # Safety
