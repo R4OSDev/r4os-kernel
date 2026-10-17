@@ -114,7 +114,27 @@ pub(super) unsafe fn run_limit(device: usize, requested: u16) -> u16 {
             return 0;
         }
         let capacity = c::capacity();
-        policy::fill_run_page_limit(requested.min(2), info.max_sectors, 8, capacity.active_pages)
+        // Unknown controller capability cannot justify an enlarged transfer.
+        // The block owner still splits a single page for sub-page controllers.
+        let confirmed = if info.max_sectors == 0 { 1 } else { requested };
+        let index = &*policy::global_index();
+        let used = COUNT as u16 - index.free_count;
+        let spare = capacity
+            .active_pages
+            .saturating_sub(used)
+            .min(index.free_count);
+        let clean: u16 = index.devices.iter().map(|d| d.clean).sum();
+        let busy_dirty: u16 = index.devices.iter().map(|d| d.busy_dirty).sum();
+        let clean_ready = clean.saturating_sub(index.busy_count - busy_dirty);
+        // No second pin/budget ledger: use the authoritative existing index.
+        // One-page fallback can fill the already admitted demand entry.
+        let available = spare.saturating_add(clean_ready).max(1);
+        policy::fill_run_page_limit(
+            requested.min(confirmed).min(policy::MAX_FILL_PAGES),
+            info.max_sectors,
+            8,
+            capacity.active_pages.min(available),
+        )
     }
 }
 pub(super) fn readable_mask(sectors: usize) -> u8 {
@@ -141,12 +161,24 @@ pub(super) unsafe fn fill_run(
             return false;
         }
         let sector_count = info.sectors;
-        let limit = ((len / PAGE).min(COUNT) as u16).min(run_limit(device, requested));
-        if limit < 2 {
-            return false;
+        let mut limit = ((len / PAGE).min(usize::from(policy::MAX_FILL_PAGES)) as u16)
+            .min(run_limit(device, requested));
+        if speculative {
+            limit = limit.min(worker::fill_budget(device));
         }
-        let mut indices = [MaybeUninit::<u16>::uninit(); COUNT];
-        let mut masks = [MaybeUninit::<u8>::uninit(); COUNT];
+        if limit < 2 {
+            // Capacity can contract after the caller planned its staging.
+            // Preserve progress on its exact already admitted demand page.
+            if speculative || requested == 0 {
+                return false;
+            }
+            let Some(i) = c::find(device, first) else {
+                return false;
+            };
+            return !(*c::entry(i)).io_busy && fill(guard, i);
+        }
+        let mut indices = [MaybeUninit::<u16>::uninit(); policy::MAX_FILL_PAGES as usize];
+        let mut masks = [MaybeUninit::<u8>::uninit(); policy::MAX_FILL_PAGES as usize];
         let mut reserved = 0usize;
         let mut total = 0u16;
         let mut page = first;

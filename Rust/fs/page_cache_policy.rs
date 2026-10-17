@@ -10,6 +10,8 @@ pub const MAX_ENTRIES: usize = 512;
 pub const MAX_DEVICES: usize = 8;
 pub const NO_INDEX: u16 = 0xffff;
 pub const NO_DEVICE: u8 = 0xff;
+/// At most64KB of resident staging per synchronous fill operation.
+pub const MAX_FILL_PAGES: u16 = 16;
 const DIRTY_HIGH_PAGES: u16 = 64;
 const DIRTY_LOW_PAGES: u16 = 32;
 

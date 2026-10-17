@@ -272,11 +272,27 @@ fn resident_budget(capacity: &policy::Capacity) -> u16 {
     if capacity.read_ahead_pages == 0 {
         0
     } else {
-        capacity.read_ahead_pages.min(2)
+        capacity.read_ahead_pages.min(policy::MAX_FILL_PAGES)
     }
 }
 fn free_floor(capacity: &policy::Capacity) -> u16 {
     (capacity.active_pages / 8).clamp(8, 32)
+}
+// Shared fill admission retains the dormant speculative path's free floor
+// and per-device resident budget. This does not enable speculative I/O.
+pub(super) unsafe fn fill_budget(dev: usize) -> u16 {
+    unsafe {
+        if dev >= DEVICES {
+            return 0;
+        }
+        let cap = c::capacity();
+        let index = &*policy::global_index();
+        let used = c::COUNT as u16 - index.free_count;
+        resident_budget(&cap)
+            .saturating_sub((*ahead(dev)).resident_pages)
+            .min(cap.active_pages.saturating_sub(used))
+            .min(index.free_count.saturating_sub(free_floor(&cap)))
+    }
 }
 pub(super) unsafe fn schedule_readahead(dev: usize, lba: u64, count: u32) {
     unsafe {
