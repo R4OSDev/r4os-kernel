@@ -1,4 +1,4 @@
-//! Fixed private C records and original SYSUPD journal v2--v5 bytes.
+//! Fixed private C records and canonical SYSUPD journal v5 bytes.
 use super::claim::{bytes, span};
 use crate::fs::vfs_types::Bytes;
 pub const MAX_PATH: usize = 1024;
@@ -638,16 +638,7 @@ pub fn valid(j: &Journal) -> bool {
         }
         5..=7 => committed == j.payload_count && rolled == 0,
         8 => true,
-        9 => {
-            committed == 0
-                && if j.rollback_markers_present {
-                    rolled == j.payload_count
-                } else {
-                    j.payloads[..j.payload_count as usize]
-                        .iter()
-                        .all(|e| !e.replace_required || e.rolled_back)
-                }
-        }
+        9 => committed == 0 && rolled == j.payload_count,
         _ => false,
     }
 }
@@ -908,8 +899,8 @@ pub fn copy_z(out: &mut [u8], v: &[u8]) -> Option<usize> {
     out[..v.len()].copy_from_slice(v);
     Some(v.len())
 }
-fn known_lines(data: &[u8], modern: bool, component_format: bool, current: bool) -> bool {
-    const COMMON: &[&[u8]] = &[
+fn known_lines(data: &[u8]) -> bool {
+    const ALLOWED: &[&[u8]] = &[
         b"R4U_JOURNAL=",
         b"TRANSACTION_GENERATION=",
         b"JOURNAL_GENERATION=",
@@ -921,8 +912,6 @@ fn known_lines(data: &[u8], modern: bool, component_format: bool, current: bool)
         b"COMMITTED=",
         b"ROLLED_BACK=",
         b"REBOOT=",
-    ];
-    const MODERN: &[&[u8]] = &[
         b"MANIFEST_CHECKSUM=",
         b"COMPONENT_DIGEST=",
         b"COMPONENTS=",
@@ -931,27 +920,17 @@ fn known_lines(data: &[u8], modern: bool, component_format: bool, current: bool)
         b"PACKAGE_VERSION=",
         b"SOURCE_RELEASE=",
         b"RELEASE=",
+        b"PACKAGE_PAYLOADS=",
+        b"BATCH=",
     ];
     for raw in lines(data) {
         let line = trim(raw);
         if line.is_empty() {
             return false;
         }
-        if line.starts_with(b"PAYLOAD;") {
-            continue;
-        }
-        if line.starts_with(b"COMPONENT;") {
-            if !component_format {
-                return false;
-            }
-            continue;
-        }
-        if !COMMON.iter().any(|p| line.starts_with(p))
-            && !(modern && MODERN.iter().any(|p| line.starts_with(p)))
-            && !(component_format && line.starts_with(b"PACKAGE_PAYLOADS="))
-            && !(current && line.starts_with(b"BATCH="))
-            && !(!modern
-                && (line.starts_with(b"SOURCE_VERSION=") || line.starts_with(b"TARGET_VERSION=")))
+        if !line.starts_with(b"PAYLOAD;")
+            && !line.starts_with(b"COMPONENT;")
+            && !ALLOWED.iter().any(|p| line.starts_with(p))
         {
             return false;
         }
@@ -1028,27 +1007,14 @@ pub unsafe fn parse(data: &[u8], slot: u8, journal: *mut Journal) -> bool {
             }
             let jf = |key: &[u8]| journal_field(data, key);
             let version = jf(b"R4U_JOURNAL=")?;
-            let current = same(version, b"5");
-            let component_format = current || same(version, b"4");
-            let prior = same(version, b"3");
-            let modern = component_format || prior;
-            if (!modern && !same(version, b"2"))
-                || !known_lines(&data[..marker], modern, component_format, current)
-            {
+            if !same(version, b"5") || !known_lines(&data[..marker]) {
                 return None;
             }
             let reboot = yes_no(jf(b"REBOOT=")?)?;
-            let foundation = if modern {
-                let v = jf(b"PRIORITY=")?;
-                if same(v, b"foundation") {
-                    true
-                } else if same(v, b"normal") {
-                    false
-                } else {
-                    return None;
-                }
-            } else {
-                false
+            let foundation = match jf(b"PRIORITY=")? {
+                v if same(v, b"foundation") => true,
+                v if same(v, b"normal") => false,
+                _ => return None,
             };
             // All scalar initializer expressions were evaluated before the original
             // whole-record assignment. Preserve that failure boundary without a copy.
@@ -1057,49 +1023,19 @@ pub unsafe fn parse(data: &[u8], slot: u8, journal: *mut Journal) -> bool {
             let phase = (0..10).find(|p| same(jf(b"PHASE=").unwrap_or(b""), phase_text(*p)))?;
             let package_digest = num32(jf(b"PACKAGE_DIGEST=").unwrap_or(b""))?;
             let package_length = number(jf(b"PACKAGE_LENGTH=").unwrap_or(b""))?;
-            let manifest_checksum = if modern {
-                num32(jf(b"MANIFEST_CHECKSUM=").unwrap_or(b""))?
-            } else {
-                0
+            let manifest_checksum = num32(jf(b"MANIFEST_CHECKSUM=").unwrap_or(b""))?;
+            let component_digest = num32(jf(b"COMPONENT_DIGEST=").unwrap_or(b""))?;
+            let component_count = num32(jf(b"COMPONENTS=").unwrap_or(b""))?;
+            let components_bound = match jf(b"COMPONENT_BINDING=")? {
+                v if same(v, b"bound") => true,
+                v if same(v, b"legacy") => false,
+                _ => return None,
             };
-            let component_digest = if modern {
-                num32(jf(b"COMPONENT_DIGEST=").unwrap_or(b""))?
-            } else {
-                0
-            };
-            let component_count = if modern {
-                num32(jf(b"COMPONENTS=").unwrap_or(b""))?
-            } else {
-                0
-            };
-            let components_bound = if component_format {
-                let v = jf(b"COMPONENT_BINDING=")?;
-                if same(v, b"bound") {
-                    true
-                } else if same(v, b"legacy") {
-                    false
-                } else {
-                    return None;
-                }
-            } else {
-                false
-            };
-            let package_payload_count = num32(
-                jf(if component_format {
-                    b"PACKAGE_PAYLOADS="
-                } else {
-                    b"PAYLOADS="
-                })
-                .unwrap_or(b""),
-            )?;
+            let package_payload_count = num32(jf(b"PACKAGE_PAYLOADS=").unwrap_or(b""))?;
             let payload_count = num32(jf(b"PAYLOADS=").unwrap_or(b""))?;
             let committed_count = num32(jf(b"COMMITTED=").unwrap_or(b""))?;
             let rollback_count = num32(jf(b"ROLLED_BACK=").unwrap_or(b""))?;
-            let batch = if current {
-                yes_no(jf(b"BATCH=")?)?
-            } else {
-                false
-            };
+            let batch = yes_no(jf(b"BATCH=")?)?;
             reset(journal);
             let j = &mut *journal;
             j.valid = true;
@@ -1134,31 +1070,13 @@ pub unsafe fn parse(data: &[u8], slot: u8, journal: *mut Journal) -> bool {
             j.source_len = normalize(&mut j.source_path[..MAX_PATH], jf(b"SOURCE=")?)?;
             j.source_version_len = copy_z(
                 &mut j.source_version[..MAX_VERSION],
-                jf(if modern {
-                    b"SOURCE_RELEASE="
-                } else {
-                    b"SOURCE_VERSION="
-                })?,
+                jf(b"SOURCE_RELEASE=")?,
             )?;
-            j.target_version_len = copy_z(
-                &mut j.target_version[..MAX_VERSION],
-                jf(if modern {
-                    b"RELEASE="
-                } else {
-                    b"TARGET_VERSION="
-                })?,
+            j.target_version_len = copy_z(&mut j.target_version[..MAX_VERSION], jf(b"RELEASE=")?)?;
+            j.package_version_len = copy_z(
+                &mut j.package_version[..MAX_VERSION],
+                jf(b"PACKAGE_VERSION=")?,
             )?;
-            j.package_version_len = if modern {
-                copy_z(
-                    &mut j.package_version[..MAX_VERSION],
-                    jf(b"PACKAGE_VERSION=")?,
-                )?
-            } else {
-                copy_z(
-                    &mut j.package_version[..MAX_VERSION],
-                    &j.target_version[..j.target_version_len],
-                )?
-            };
             if !version_valid(j.source_version())
                 || !version_valid(j.target_version())
                 || !version_valid(j.package_version())
@@ -1167,11 +1085,11 @@ pub unsafe fn parse(data: &[u8], slot: u8, journal: *mut Journal) -> bool {
                 return None;
             }
             let (mut seen_payloads, mut seen_components) = ([false; 34], [false; 32]);
-            let (mut found, mut found_components, mut marker_count) = (0u32, 0u32, 0u32);
+            let (mut found, mut found_components) = (0u32, 0u32);
             for raw in lines(&data[..marker]) {
                 let line = trim(raw);
                 if line.starts_with(b"COMPONENT;") {
-                    if !component_format || !known_fields(line, true) {
+                    if !known_fields(line, true) {
                         return None;
                     }
                     let i = num32(field(line, b"index=")?)? as usize;
@@ -1274,10 +1192,7 @@ pub unsafe fn parse(data: &[u8], slot: u8, journal: *mut Journal) -> bool {
                 }
                 e.replace_required = boolean(field(line, b"required=")?)?;
                 e.committed = boolean(field(line, b"committed=")?)?;
-                if let Some(v) = field(line, b"rolled_back=") {
-                    marker_count += 1;
-                    e.rolled_back = boolean(v)?
-                }
+                e.rolled_back = boolean(field(line, b"rolled_back=")?)?;
                 if (e.committed && e.rolled_back)
                     || (!e.replace_required
                         && (!e.target_existed
@@ -1288,31 +1203,11 @@ pub unsafe fn parse(data: &[u8], slot: u8, journal: *mut Journal) -> bool {
                 }
                 found += 1;
             }
-            if (component_format && j.components_bound && found_components != j.component_count)
-                || (component_format && !j.components_bound && found_components != 0)
+            if (j.components_bound && found_components != j.component_count)
+                || (!j.components_bound && found_components != 0)
                 || found != j.payload_count
-                || (marker_count != 0 && marker_count != j.payload_count)
             {
                 return None;
-            }
-            j.rollback_markers_present = marker_count != 0;
-            if marker_count == 0 && j.rollback_count != 0 {
-                let mut remaining = j.rollback_count;
-                let mut cursor = j.payload_count as usize;
-                while cursor > 0 && remaining > 0 {
-                    cursor -= 1;
-                    j.payloads[cursor].rolled_back = true;
-                    if j.payloads[cursor].replace_required {
-                        remaining -= 1
-                    }
-                }
-                if remaining != 0 {
-                    return None;
-                }
-                j.rollback_count = j.payloads[..j.payload_count as usize]
-                    .iter()
-                    .filter(|e| e.rolled_back)
-                    .count() as u32
             }
             if !valid(j) {
                 return None;
