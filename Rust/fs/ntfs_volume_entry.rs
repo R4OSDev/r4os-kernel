@@ -108,6 +108,28 @@ pub(super) unsafe fn read_file(
     out: Buffer,
 ) -> Option<usize> {
     unsafe {
+        read_file_guarded(
+            v,
+            number,
+            name,
+            offset,
+            out,
+            ptr::null_mut(),
+            Default::default(),
+        )
+    }
+}
+
+pub(super) unsafe fn read_file_guarded(
+    v: Volume,
+    number: u64,
+    name: Option<View>,
+    offset: usize,
+    out: Buffer,
+    guard: *mut super::request::Guard,
+    reference: crate::storage::access_state::Reference,
+) -> Option<usize> {
+    unsafe {
         let mut utf16 = [0u8; 510];
         let stream = if let Some(name) = name {
             let n = text::to_utf16(name.get(), &mut utf16)?;
@@ -119,7 +141,7 @@ pub(super) unsafe fn read_file(
         if r::collect(v, number, 0x80, stream, &mut attr) != Lookup::Found {
             return None;
         }
-        read::attribute(v.io, &attr, offset, out)
+        super::ntfs_read_buffers::read(v.io, &attr, offset, out, guard, reference)
     }
 }
 

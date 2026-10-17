@@ -106,6 +106,17 @@ pub(super) unsafe fn read(
     len: usize,
     range: bool,
 ) -> Option<usize> {
+    unsafe { read_guarded(volume, entry, offset, out, len, range, ptr::null_mut()) }
+}
+pub(super) unsafe fn read_guarded(
+    volume: Volume,
+    entry: &Entry,
+    offset: u64,
+    out: *mut u8,
+    len: usize,
+    range: bool,
+    read_guard: *mut request::Guard,
+) -> Option<usize> {
     unsafe {
         let result = run(
             if range { op::READ_RANGE } else { op::READ },
@@ -115,6 +126,7 @@ pub(super) unsafe fn read(
                 offset,
                 buffer: out,
                 buffer_len: len,
+                read_guard,
                 ..Default::default()
             },
             ptr::null_mut(),

@@ -102,6 +102,7 @@ pub struct Args {
     pub cursor: *mut u64,
     pub progress: *mut Progress,
     pub flag: bool,
+    pub read_guard: *mut super::request::Guard,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]

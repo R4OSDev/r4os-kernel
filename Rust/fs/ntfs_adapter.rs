@@ -103,12 +103,14 @@ unsafe fn read(a: Args, whole: bool) -> Output {
         } else {
             a.buffer
         };
-        result(core_entry::read_file(
+        result(core_entry::read_file_guarded(
             v,
             e.record,
             None,
             if whole { 0 } else { a.number as usize },
             out,
+            a.read_guard,
+            a.read_reference,
         ))
     }
 }

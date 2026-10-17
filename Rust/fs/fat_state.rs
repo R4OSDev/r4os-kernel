@@ -186,6 +186,7 @@ pub fn runtime(i: usize) -> *mut Runtime {
     }
 }
 #[inline(never)]
+// Caller holds the short storage metadata owner; no caller/IO pointers here.
 pub(super) unsafe fn next_clock() -> u64 {
     unsafe {
         let s = STATE.0.get();
@@ -211,6 +212,7 @@ pub(super) unsafe fn runtime_for(v: Volume, create: bool) -> Option<*mut Runtime
 }
 #[inline(never)]
 pub(super) unsafe fn forget(device: usize, first: u64, count: u64) {
+    let _metadata = crate::memory::owner::Guard::acquire(1);
     unsafe {
         for i in 0..VOLUMES {
             let s = runtime(i);
@@ -252,6 +254,7 @@ pub(super) unsafe fn forget(device: usize, first: u64, count: u64) {
 }
 #[inline(never)]
 pub(super) unsafe fn invalidate_extents() {
+    let _metadata = crate::memory::owner::Guard::acquire(1);
     unsafe {
         for i in 0..EXTENTS {
             (*extent(i)).valid = false;
@@ -260,6 +263,7 @@ pub(super) unsafe fn invalidate_extents() {
 }
 #[inline(never)]
 pub(super) unsafe fn invalidate_append() {
+    let _metadata = crate::memory::owner::Guard::acquire(1);
     unsafe {
         (*append()).valid = false;
         invalidate_extents();

@@ -348,6 +348,11 @@ pub(crate) unsafe fn queue_wait_unless(
     }
 }
 /// # Safety
+/// Stable resident Queue; operation0 is the native owner's exact WakeOne edge.
+pub(crate) unsafe fn queue_wake_one(queue: *mut WaitQueue) -> bool {
+    unsafe { wait::r4os_rust_sync_queue(queue, 0, ptr::null_mut(), 0, ptr::null_mut()) != 0 }
+}
+/// # Safety
 /// Stable resident Queue under its existing runtime-owned lifetime.
 pub(crate) unsafe fn queue_wake_all(queue: *mut WaitQueue) -> usize {
     unsafe { wait::r4os_rust_sync_queue(queue, 1, ptr::null_mut(), 0, ptr::null_mut()) as usize }

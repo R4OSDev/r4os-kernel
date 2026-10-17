@@ -153,17 +153,11 @@ pub(super) unsafe fn compressed(
                 if bytes > 65536 {
                     return false;
                 }
-                let input = Buffer {
-                    data: ptr::addr_of_mut!((*v.scratch).comp_in).cast::<u8>(),
-                    len: bytes as usize,
-                };
+                let input = v.compressed_input(bytes as usize);
                 if !io::runs(v, run_span(attr), byte_offset, input, None, ptr::null_mut()) {
                     return false;
                 }
-                let decoded = Buffer {
-                    data: ptr::addr_of_mut!((*v.scratch).comp_out).cast::<u8>(),
-                    len: unit_bytes as usize,
-                };
+                let decoded = v.compressed_output(unit_bytes as usize);
                 let Some(n) = ntfs_format_lznt1::decompress(
                     core::slice::from_raw_parts(input.data, input.len),
                     core::slice::from_raw_parts_mut(decoded.data, decoded.len),

@@ -78,6 +78,7 @@ fn matches(e: s::Extent, v: Volume, file: Entry) -> bool {
 }
 #[inline(never)]
 pub(super) unsafe fn cached(v: Volume, file: Entry, target: usize) -> Option<ReadCursor> {
+    let _metadata = crate::memory::owner::Guard::acquire(1);
     unsafe {
         let mut best = None;
         let mut best_index = 0;
@@ -124,6 +125,7 @@ pub(super) unsafe fn remember_extent(
     cluster: u32,
     count: usize,
 ) {
+    let _metadata = crate::memory::owner::Guard::acquire(1);
     unsafe {
         if file.first_cluster < 2 || !(2..EOC).contains(&cluster) || count == 0 {
             return;
@@ -541,20 +543,19 @@ pub(super) unsafe fn write_range(v: Volume, e: Entry, offset: usize, data: Bytes
         Some(data.len)
     }
 }
-unsafe fn append_matches(v: Volume, parent: u32, name: Bytes) -> bool {
+unsafe fn append_matches(a: &s::AppendCache, v: Volume, parent: u32, name: Bytes) -> bool {
     unsafe {
-        let a = s::append();
-        if !(*a).valid
-            || (*a).device != v.device_index
-            || (*a).partition != v.partition_lba
-            || (*a).parent != parent
-            || (*a).name_len != name.len
+        if !a.valid
+            || a.device != v.device_index
+            || a.partition != v.partition_lba
+            || a.parent != parent
+            || a.name_len != name.len
             || name.len > NAME_MAX
         {
             return false;
         }
         for i in 0..name.len {
-            if (*a).name[i] != name.get(i) {
+            if a.name[i] != name.get(i) {
                 return false;
             }
         }
@@ -569,10 +570,13 @@ pub(super) unsafe fn append_location(
     expected: Option<u32>,
 ) -> Option<Location> {
     unsafe {
-        if !append_matches(v, parent, name) {
+        let a = {
+            let _metadata = crate::memory::owner::Guard::acquire(1);
+            s::append().read()
+        };
+        if !append_matches(&a, v, parent, name) {
             return None;
         }
-        let a = s::append().read();
         if expected.is_some_and(|size| a.size != size) {
             return None;
         }
@@ -595,10 +599,13 @@ pub(super) unsafe fn append_location(
 #[inline(never)]
 pub(super) unsafe fn append_last(v: Volume, parent: u32, name: Bytes, size: u32) -> Option<u32> {
     unsafe {
-        if !append_matches(v, parent, name) {
+        let a = {
+            let _metadata = crate::memory::owner::Guard::acquire(1);
+            s::append().read()
+        };
+        if !append_matches(&a, v, parent, name) {
             return None;
         }
-        let a = s::append().read();
         if a.size != size || a.last < 2 {
             None
         } else {
@@ -617,8 +624,7 @@ pub(super) unsafe fn remember_append(
     last: u32,
 ) {
     unsafe {
-        let a = s::append();
-        a.write(s::AppendCache {
+        let mut snapshot = s::AppendCache {
             valid: true,
             device: v.device_index,
             partition: v.partition_lba,
@@ -631,11 +637,14 @@ pub(super) unsafe fn remember_append(
             size,
             last,
             ..s::AppendCache::EMPTY
-        });
-        if (*a).name_len > 0 {
-            name.sub(0, (*a).name_len)
-                .copy(core::ptr::addr_of_mut!((*a).name).cast::<u8>());
+        };
+        if snapshot.name_len > 0 {
+            name.sub(0, snapshot.name_len)
+                .copy(core::ptr::addr_of_mut!(snapshot.name).cast::<u8>());
         }
+        // Caller name bytes are staged before the no-sleep metadata owner.
+        let _metadata = crate::memory::owner::Guard::acquire(1);
+        s::append().write(snapshot);
     }
 }
 #[inline(never)]

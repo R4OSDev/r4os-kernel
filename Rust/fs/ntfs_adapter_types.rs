@@ -57,4 +57,6 @@ pub struct Args {
     pub device: usize,
     pub state: *mut core::ffi::c_void,
     pub flag: bool,
+    pub read_guard: *mut super::request::Guard,
+    pub read_reference: crate::storage::access_state::Reference,
 }

@@ -2,6 +2,12 @@
 //! Only native sync owns the exact wait-spanning guards. Metadata snapshots
 //! use independent atomic scalars, never borrow mutable state across a wait.
 use super::request_scope::{Plan, drive_code, r4os_rust_fs_scope_plan};
+#[path = "request_access.rs"]
+mod access;
+#[path = "request_payload.rs"]
+mod payload;
+pub(super) use payload::PayloadBorrow;
+
 use crate::{
     arch::pit::DEFAULT_HZ,
     platform::timer,
@@ -282,6 +288,12 @@ pub struct Guard {
     pub active: bool,
     pub uses: [Use; LANES],
     pub unwind: task_context::Unwind,
+    access_mode: u8,
+    access_owned: bool,
+    access_owner: access::Owner,
+    read_reference: Reference,
+    read_reference_present: bool,
+    parallel_payload: bool,
 }
 #[repr(C)]
 pub struct GateSnapshot {
@@ -355,6 +367,15 @@ unsafe fn release_plan(plan: &Plan, mut acquired: u8) {
     while acquired != 0 {
         acquired -= 1;
         let _ = unsafe { gate_op(plan.lanes[usize::from(acquired)], false, 3, 0) };
+    }
+}
+unsafe fn release_access(plan: &Plan, mut acquired: u8, mode: u8, owner: access::Owner) {
+    while acquired != 0 {
+        acquired -= 1;
+        assert!(
+            access::release(plan.lanes[usize::from(acquired)], mode, owner),
+            "FS admission rollback"
+        );
     }
 }
 unsafe fn cancel_admission(
@@ -435,6 +456,9 @@ pub unsafe extern "C" fn r4os_rust_fs_request_init() {
         }
         STATES[index].clear();
         MUTATION_PROGRESS[index].store(0, Relaxed);
+    }
+    unsafe {
+        access::reset();
     }
     STATS.clear();
 }
@@ -541,6 +565,11 @@ pub unsafe extern "C" fn r4os_rust_fs_request_begin(
     let mut uses = [Use::EMPTY; LANES];
     let mut mutations = 0u8;
     let runtime_owned = !scheduler::current().is_null();
+    let access_owner = access::current();
+    let mut read_reference = Reference::default();
+    let mut read_reference_present = false;
+    let mut mode = access::WRITE;
+    let mut parallel_payload = false;
     if runtime_owned {
         if has_bound {
             if ref_count > LANES {
@@ -555,6 +584,10 @@ pub unsafe extern "C" fn r4os_rust_fs_request_begin(
                         return false;
                     };
                     uses[index] = token;
+                    if index == 0 && plan.count == 1 && ref_count == 1 {
+                        read_reference = bound.reference;
+                        read_reference_present = true;
+                    }
                 }
             }
         } else {
@@ -573,16 +606,29 @@ pub unsafe extern "C" fn r4os_rust_fs_request_begin(
                     return false;
                 };
                 uses[index] = token;
-            }
-        }
-        if !read_only(kind) {
-            let mut nested_backend = false;
-            for index in 0..LANES {
-                if unsafe { gate_op(index as u8, false, 0, 0) } {
-                    nested_backend = true;
-                    break;
+                if index == 0 && plan.count == 1 {
+                    read_reference = reference;
+                    read_reference_present = true;
                 }
             }
+        }
+        if read_only(kind) && plan.count == 1 && read_reference_present {
+            mode = access::READ;
+        }
+        let mut nested_backend = false;
+        for index in 0..LANES {
+            if unsafe { gate_op(index as u8, false, 0, 0) } {
+                nested_backend = true;
+                break;
+            }
+        }
+        parallel_payload =
+            mode == access::READ && !nested_backend && matches!(kind, 2 | 3 | 19 | 20);
+        // Returning a payload backend must not turn a nested cross-drive
+        // request into a blocking acquisition. Two outer readers could
+        // otherwise wait behind each other's pending writers.
+        nested_backend |= access::owns_any(access_owner);
+        if mode == access::WRITE {
             while mutations < plan.count {
                 let lane = plan.lanes[usize::from(mutations)];
                 let admitted = if immediate || nested_backend {
@@ -596,6 +642,22 @@ pub unsafe extern "C" fn r4os_rust_fs_request_begin(
                 }
                 mutations += 1;
             }
+        }
+        let mut access_count = 0u8;
+        while access_count < plan.count {
+            if !access::acquire(
+                plan.lanes[usize::from(access_count)],
+                mode,
+                access_owner,
+                immediate || nested_backend,
+            ) {
+                unsafe {
+                    release_access(&plan, access_count, mode, access_owner);
+                    cancel_admission(&plan, mutations, &uses, unwind);
+                }
+                return false;
+            }
+            access_count += 1;
         }
         let mut acquired = 0u8;
         while acquired < plan.count {
@@ -611,6 +673,7 @@ pub unsafe extern "C" fn r4os_rust_fs_request_begin(
                 }
                 unsafe {
                     release_plan(&plan, acquired);
+                    release_access(&plan, access_count, mode, access_owner);
                     cancel_admission(&plan, mutations, &uses, unwind);
                 }
                 return false;
@@ -669,12 +732,18 @@ pub unsafe extern "C" fn r4os_rust_fs_request_begin(
         lanes: plan.lanes,
         lane_count: plan.count,
         gates_locked: runtime_owned,
-        mutations_locked: runtime_owned && !read_only(kind),
+        mutations_locked: runtime_owned && mode == access::WRITE,
         lanes_active: true,
         start_tick: timer::tick_count(),
         active: true,
         uses,
         unwind,
+        access_mode: mode,
+        access_owned: runtime_owned,
+        access_owner,
+        read_reference,
+        read_reference_present,
+        parallel_payload,
     };
     unsafe { output.write(result) };
     true
@@ -706,6 +775,19 @@ unsafe fn finish_lanes(guard: *mut Guard) {
         }
         (*guard).lanes_active = false;
         (*guard).gates_locked = false;
+        if (*guard).access_owned {
+            let plan = Plan {
+                lanes: (*guard).lanes,
+                count: (*guard).lane_count,
+            };
+            release_access(
+                &plan,
+                plan.count,
+                (*guard).access_mode,
+                (*guard).access_owner,
+            );
+            (*guard).access_owned = false;
+        }
     }
 }
 
@@ -831,7 +913,7 @@ const _: () = {
     assert!(size_of::<Summary>() == 184);
     assert!(size_of::<BoundMount>() == 24);
     assert!(size_of::<Use>() == 48);
-    assert!(size_of::<Guard>() == 1320);
+    assert!(size_of::<Guard>() == 1368);
     assert!(size_of::<GateSnapshot>() == 32);
     assert!(size_of::<Stall>() == 40);
 };

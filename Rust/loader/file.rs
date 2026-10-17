@@ -197,6 +197,7 @@ pub unsafe extern "C" fn r4os_rust_module_file_range(
         offset: offset as u64,
         buffer: out,
         buffer_len: len,
+        read_guard: guard.as_mut_ptr(),
         ..t::Args::default()
     };
     let result = unsafe { vfs::r4os_rust_vfs_run(t::op::READ_RANGE, &args, ptr::null_mut()) };

@@ -119,7 +119,18 @@ pub unsafe extern "C" fn r4os_rust_sys_file_read(input: *const u8, out: *mut u8,
         if entry.size > u64::from(len) {
             return -5;
         }
-        let count = some!(fs::read(volume, &entry, 0, out, len as usize, false), -6);
+        let count = some!(
+            fs::read_guarded(
+                volume,
+                &entry,
+                0,
+                out,
+                len as usize,
+                false,
+                ptr::addr_of_mut!(request.guard)
+            ),
+            -6
+        );
         request.ok = true;
         i32::try_from(count).expect("File read result")
     }
@@ -220,7 +231,15 @@ pub unsafe extern "C" fn r4os_rust_sys_file_read_at(
         if entry.is_dir() {
             return -4;
         }
-        let count = match fs::read(volume, &entry, offset, out, len as usize, true) {
+        let count = match fs::read_guarded(
+            volume,
+            &entry,
+            offset,
+            out,
+            len as usize,
+            true,
+            ptr::addr_of_mut!(request.guard),
+        ) {
             Some(count) => count,
             None => {
                 record_failure(3, -6, 0);

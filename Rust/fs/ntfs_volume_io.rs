@@ -23,6 +23,48 @@ pub struct Io {
     pub scratch: *mut Scratch,
     pub cache: *mut Cache,
     pub work_counters: bool,
+    pub read_scratch: *mut ReadScratch,
+}
+/// One synchronous data phase owns this resident task-local sector buffer.
+#[repr(C)]
+pub struct ReadScratch {
+    pub sector: [u8; 512],
+    pub input: *mut u8,
+    pub output: *mut u8,
+}
+impl Io {
+    unsafe fn sector_buffer(self) -> Buffer {
+        unsafe {
+            Buffer {
+                data: if self.read_scratch.is_null() {
+                    ptr::addr_of_mut!((*self.scratch).sector).cast()
+                } else {
+                    ptr::addr_of_mut!((*self.read_scratch).sector).cast()
+                },
+                len: 512,
+            }
+        }
+    }
+    pub(super) unsafe fn compressed_input(self, len: usize) -> Buffer {
+        assert!(len <= 65536);
+        let data = if self.read_scratch.is_null() {
+            unsafe { ptr::addr_of_mut!((*self.scratch).comp_in).cast() }
+        } else {
+            unsafe { (*self.read_scratch).input }
+        };
+        assert!(!data.is_null());
+        Buffer { data, len }
+    }
+    pub(super) unsafe fn compressed_output(self, len: usize) -> Buffer {
+        assert!(len <= 65536);
+        let data = if self.read_scratch.is_null() {
+            unsafe { ptr::addr_of_mut!((*self.scratch).comp_out).cast() }
+        } else {
+            unsafe { (*self.read_scratch).output }
+        };
+        assert!(!data.is_null());
+        Buffer { data, len }
+    }
 }
 #[derive(Clone, Copy)]
 pub struct Runs {
@@ -49,7 +91,7 @@ pub(super) unsafe fn write(v: Io, lba: u64, count: u32, data: Buffer, kind: Muta
             return false;
         }
         if count != 0 && !v.cache.is_null() {
-            (*v.cache).invalidate(kind)
+            super::ntfs_volume_cache::with(v.cache, |cache| cache.invalidate(kind))
         }
         (v.device.write)(v.device.context, lba, count, data.data, data.len)
     }
@@ -134,10 +176,7 @@ pub(super) unsafe fn lcn(
                 remaining -= piece.len;
                 continue;
             }
-            let sector = Buffer {
-                data: ptr::addr_of_mut!((*v.scratch).sector).cast::<u8>(),
-                len: 512,
-            };
+            let sector = v.sector_buffer();
             if !read(v, lba, 1, sector) {
                 return false;
             }

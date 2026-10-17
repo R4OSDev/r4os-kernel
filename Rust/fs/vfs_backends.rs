@@ -168,6 +168,11 @@ pub(crate) unsafe fn fat(op: u8, args: *const Args, out: *mut Entry) -> Output {
         },
         ..Default::default()
     };
+    let _payload = if matches!(op, 5 | 6) {
+        unsafe { super::request::PayloadBorrow::begin(a.read_guard, a.volume.reference) }
+    } else {
+        None
+    };
     let mut e = MaybeUninit::<f::Entry>::uninit();
     let mut result = unsafe {
         fat::r4os_rust_fat_run(
@@ -211,6 +216,8 @@ pub(crate) unsafe fn ntfs(op: u8, args: *const Args, out: *mut Entry) -> Output 
         device: 0,
         state: ptr::null_mut(),
         flag: a.flag,
+        read_guard: a.read_guard,
+        read_reference: a.volume.reference,
     };
     let which = match op {
         0 => 7,
@@ -341,6 +348,8 @@ pub(crate) unsafe fn location(volume: *const Volume, out: *mut super::vfs_types:
         device: 0,
         state: ptr::null_mut(),
         flag: false,
+        read_guard: ptr::null_mut(),
+        read_reference: Default::default(),
     };
     unsafe { ntfs_adapter::r4os_rust_ntfs_adapter(2, &args, out.cast()).present }
 }

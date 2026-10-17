@@ -159,6 +159,7 @@ pub(super) unsafe fn build(v: Mounted) -> t::Volume {
                 scratch: (*s).scratch,
                 cache: cache(s),
                 work_counters: false,
+                read_scratch: ptr::null_mut(),
             },
             record_bytes: (*s).record,
             index_block_bytes: (*s).index,
