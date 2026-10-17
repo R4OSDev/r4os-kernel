@@ -141,7 +141,14 @@ pub(super) unsafe fn read_file_guarded(
         if r::collect(v, number, 0x80, stream, &mut attr) != Lookup::Found {
             return None;
         }
-        super::ntfs_read_buffers::read(v.io, &attr, offset, out, guard, reference)
+        let identity = super::ntfs_decoded_key::Identity {
+            reference,
+            record: number,
+            stream,
+        };
+        let mut io = v.io;
+        io.read_identity = ptr::addr_of!(identity);
+        super::ntfs_read_buffers::read(io, &attr, offset, out, guard, reference)
     }
 }
 

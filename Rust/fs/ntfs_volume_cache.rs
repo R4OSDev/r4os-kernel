@@ -76,6 +76,7 @@ pub struct Cache {
     paths: [PathEntry; 8],
     generation: u64,
     mount_generation: u64,
+    content_revision: u64,
     negative_ttl_ticks: u64,
     access_clock: u64,
     reclaim_cursor: usize,
@@ -98,7 +99,22 @@ impl Cache {
         unsafe {
             core::ptr::write_bytes(out, 0, 1);
             (*out).generation = 1;
+            (*out).content_revision = 1;
             core::ptr::addr_of_mut!((*out).counters).write(MetadataCacheSummary::EMPTY)
+        }
+    }
+    /// Data revisions remain independent of selective metadata retention.
+    /// Exhaustion disables decoded reuse rather than permitting an ABA epoch.
+    fn advance_content(&mut self) {
+        if self.content_revision != 0 {
+            self.content_revision = self.content_revision.checked_add(1).unwrap_or(0);
+        }
+    }
+    pub(super) fn content_stamp(&self) -> Option<(u64, u64)> {
+        if self.mount_generation == 0 || self.content_revision == 0 {
+            None
+        } else {
+            Some((self.mount_generation, self.content_revision))
         }
     }
     pub fn free_clusters(&self, total: u64) -> Option<u64> {
@@ -114,6 +130,7 @@ impl Cache {
         self.free_valid = free <= total
     }
     pub fn begin_mount(&mut self, ttl: u64) {
+        self.advance_content();
         self.free_valid = false;
         let n = self.clear_all().total();
         self.mount_generation = next_generation(self.mount_generation);
@@ -123,6 +140,7 @@ impl Cache {
         inc!(self, invalidated_entries, n)
     }
     pub fn invalidate_external(&mut self) {
+        self.advance_content();
         self.free_valid = false;
         let n = self.clear_all().total();
         self.generation = next_generation(self.generation);
@@ -130,6 +148,7 @@ impl Cache {
         inc!(self, invalidated_entries, n)
     }
     pub fn invalidate(&mut self, mutation: Mutation) {
+        self.advance_content();
         match mutation {
             Mutation::Payload => inc!(self, payload_write_retentions, 1),
             Mutation::Record(number) => {

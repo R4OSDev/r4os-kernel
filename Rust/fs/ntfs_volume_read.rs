@@ -153,21 +153,30 @@ pub(super) unsafe fn compressed(
                 if bytes > 65536 {
                     return false;
                 }
-                let input = v.compressed_input(bytes as usize);
-                if !io::runs(v, run_span(attr), byte_offset, input, None, ptr::null_mut()) {
-                    return false;
+                let key =
+                    super::ntfs_decoded_key::Key::new(v, attr, unit_index, unit_bytes as usize);
+                if let Some(pin) = key.and_then(|key| super::ntfs_decoded_cache::lookup(key)) {
+                    pin.copy(inside, dest);
+                } else {
+                    let input = v.compressed_input(bytes as usize);
+                    if !io::runs(v, run_span(attr), byte_offset, input, None, ptr::null_mut()) {
+                        return false;
+                    }
+                    let decoded = v.compressed_output(unit_bytes as usize);
+                    let Some(n) = ntfs_format_lznt1::decompress(
+                        core::slice::from_raw_parts(input.data, input.len),
+                        core::slice::from_raw_parts_mut(decoded.data, decoded.len),
+                    ) else {
+                        return false;
+                    };
+                    if n < decoded.len {
+                        ptr::write_bytes(decoded.data.add(n), 0, decoded.len - n)
+                    }
+                    if let Some(key) = key {
+                        super::ntfs_decoded_cache::remember(key, decoded);
+                    }
+                    ptr::copy_nonoverlapping(decoded.data.add(inside), dest.data, take)
                 }
-                let decoded = v.compressed_output(unit_bytes as usize);
-                let Some(n) = ntfs_format_lznt1::decompress(
-                    core::slice::from_raw_parts(input.data, input.len),
-                    core::slice::from_raw_parts_mut(decoded.data, decoded.len),
-                ) else {
-                    return false;
-                };
-                if n < decoded.len {
-                    ptr::write_bytes(decoded.data.add(n), 0, decoded.len - n)
-                }
-                ptr::copy_nonoverlapping(decoded.data.add(inside), dest.data, take)
             }
             out_pos += take;
             pos += take as u64;

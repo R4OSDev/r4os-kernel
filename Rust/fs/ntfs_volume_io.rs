@@ -24,6 +24,7 @@ pub struct Io {
     pub cache: *mut Cache,
     pub work_counters: bool,
     pub read_scratch: *mut ReadScratch,
+    pub read_identity: *const super::ntfs_decoded_key::Identity,
 }
 /// One synchronous data phase owns this resident task-local sector buffer.
 #[repr(C)]

@@ -243,6 +243,10 @@ unsafe fn reclaim(reason: u32, raw_requested: u32, vm_owner: Option<u64>) -> Res
         unsafe { task_context::leave(unwind) };
         return result;
     }
+    // Bounded decoded data returns its actual resident allocation to the heap
+    // outside metadata ownership. It is not an invented physical-page receipt;
+    // existing returned-frame fields still name their exact physical owners.
+    let _ = unsafe { crate::fs::ntfs_decoded_cache::reclaim(requested as usize) };
     let _ = unsafe { crate::fs::ntfs_adapter::reclaim(requested) };
     let mut stack = SourceResult::INIT;
     let stack_reclaimer = STACK_RECLAIMER.load(Acquire);

@@ -17,6 +17,8 @@ pub mod glob;
 pub mod ntfs_adapter;
 pub mod ntfs_adapter_state;
 pub mod ntfs_adapter_types;
+pub mod ntfs_decoded_cache;
+pub mod ntfs_decoded_key;
 pub mod ntfs_format;
 pub mod ntfs_format_lznt1;
 pub mod ntfs_format_names;

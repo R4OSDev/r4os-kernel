@@ -412,6 +412,24 @@ pub unsafe extern "C" fn r4os_rust_ntfs_adapter(
                 }
             }
             3 => {
+                for i in 0..s::VOLUMES {
+                    let cache = {
+                        let _owner = crate::memory::owner::Guard::acquire(1);
+                        let st = s::state(i);
+                        if (*st).in_use
+                            && (*st).device == a.device
+                            && u64::from((*st).partition) >= a.number
+                            && u64::from((*st).partition) - a.number < a.count
+                        {
+                            Some(s::cache(st))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(cache) = cache {
+                        super::ntfs_decoded_cache::forget(cache);
+                    }
+                }
                 let _owner = crate::memory::owner::Guard::acquire(1);
                 for i in 0..s::VOLUMES {
                     let st = s::state(i);

@@ -417,6 +417,7 @@ pub(super) unsafe fn mount(
                 cache: ptr::null_mut(),
                 work_counters: work,
                 read_scratch: ptr::null_mut(),
+                read_identity: ptr::null(),
             },
             record_bytes: boot.file_record_bytes,
             index_block_bytes: boot.index_block_bytes,
