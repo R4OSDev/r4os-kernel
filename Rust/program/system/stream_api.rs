@@ -173,7 +173,10 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_write(
         if flags != 0 {
             return c::file_stream_error_unsupported;
         }
-        if offset > u32::MAX as u64 || u64::from(len) > u32::MAX as u64 - offset {
+        if !super::io::transfer_len_fits(u64::from(len))
+            || offset > u32::MAX as u64
+            || u64::from(len) > u32::MAX as u64 - offset
+        {
             return c::file_stream_error_too_large;
         }
         let mut raw_buffer = path::Buffer::<1024>::new();

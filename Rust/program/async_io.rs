@@ -615,6 +615,12 @@ unsafe fn submit(
         if matches!(kind, Kind::Read | Kind::ReadAt) && out_len != 0 && out == 0 {
             return INVALID;
         }
+        if kind != Kind::Lock
+            && (!super::system::io::transfer_len_fits(len)
+                || !super::system::io::transfer_len_fits(out_len))
+        {
+            return TOO_LARGE;
+        }
         let instance = context::current();
         if instance.is_null()
             || AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).done)).load(Ordering::Acquire)
@@ -1587,7 +1593,8 @@ fn normalize_write(result: i32) -> i32 {
 unsafe fn perform(req: *mut Request) -> i32 {
     unsafe {
         if (*req).kind != Kind::Lock
-            && ((*req).data_len > u64::from(u32::MAX) || (*req).out_len > u64::from(u32::MAX))
+            && (!super::system::io::transfer_len_fits((*req).data_len)
+                || !super::system::io::transfer_len_fits((*req).out_len))
         {
             return TOO_LARGE;
         }

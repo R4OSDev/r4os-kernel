@@ -7,9 +7,16 @@ use super::{
 };
 use crate::{
     arch::runtime::RuntimeGuard,
+    contract as c,
     sched::{scheduler, task},
 };
 use core::{cell::UnsafeCell, ptr};
+
+// Positive i32 byte results require a per-transfer bound; offsets and file
+// sizes retain their existing u64 fields.
+pub(crate) const fn transfer_len_fits(len: u64) -> bool {
+    len <= i32::MAX as u64
+}
 macro_rules! some {
     ($value:expr,$error:expr) => {
         match $value {
@@ -89,6 +96,9 @@ pub(super) unsafe fn lookup_stage(volume: fs::Volume) -> u32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_sys_file_read(input: *const u8, out: *mut u8, len: u32) -> i32 {
     unsafe {
+        if !transfer_len_fits(u64::from(len)) {
+            return c::file_stream_error_too_large;
+        }
         let mut buffers = PathBuffers::new();
         let target = some!(buffers.resolve(input), -1);
         let volume = some!(ctx::volume(target), -2);
@@ -124,6 +134,9 @@ pub unsafe extern "C" fn r4os_rust_sys_file_write(
     len: u32,
 ) -> i32 {
     unsafe {
+        if !transfer_len_fits(u64::from(len)) {
+            return c::file_stream_error_too_large;
+        }
         let mut buffers = PathBuffers::new();
         let target = some!(buffers.resolve(input), -1);
         let volume = some!(ctx::volume(target), -2);
@@ -178,6 +191,9 @@ pub unsafe extern "C" fn r4os_rust_sys_file_read_at(
     len: u32,
 ) -> i32 {
     unsafe {
+        if !transfer_len_fits(u64::from(len)) {
+            return c::file_stream_error_too_large;
+        }
         if offset > usize::MAX as u64 {
             return -8;
         }
@@ -225,6 +241,9 @@ pub unsafe extern "C" fn r4os_rust_sys_file_write_at(
     len: u32,
 ) -> i32 {
     unsafe {
+        if !transfer_len_fits(u64::from(len)) {
+            return c::file_stream_error_too_large;
+        }
         if offset > usize::MAX as u64 {
             return -8;
         }
@@ -290,6 +309,9 @@ pub unsafe extern "C" fn r4os_rust_sys_file_append(
     len: u32,
 ) -> i32 {
     unsafe {
+        if !transfer_len_fits(u64::from(len)) {
+            return c::file_stream_error_too_large;
+        }
         let mut buffers = PathBuffers::new();
         let target = some!(buffers.resolve(input), -1);
         let volume = some!(ctx::volume(target), -2);
