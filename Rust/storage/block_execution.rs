@@ -783,17 +783,31 @@ unsafe fn wait(device: *mut c_void, id: u64, timeout: u64) -> block_requests::Re
 /// the stateless view adapter must never wait, allocate, mutate or re-enter.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_block_complete(handle: u64, result: i32, bytes: u32) {
+    unsafe {
+        complete_receipt(handle, result, bytes);
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompletionReceipt {
+    Accepted,
+    Duplicate,
+    Late,
+}
+/// The existing IRQ completion body, with its exact disposition for the caller.
+/// Normal callbacks discard this value; no diagnostic hook or global reset.
+#[inline(always)]
+pub(crate) unsafe fn complete_receipt(handle: u64, result: i32, bytes: u32) -> CompletionReceipt {
     let encoded_request = handle & 255;
     let encoded_device = (handle >> 8) & 255;
     if encoded_request == 0 || encoded_device == 0 {
         accounting::r4os_rust_block_runtime_change(1, 27, 1);
-        return;
+        return CompletionReceipt::Late;
     }
     let request_index = (encoded_request - 1) as usize;
     let device_index = (encoded_device - 1) as usize;
     if device_index >= 16 || request_index >= 16 {
         accounting::r4os_rust_block_runtime_change(1, 27, 1);
-        return;
+        return CompletionReceipt::Late;
     }
     let lane = {
         let _owner = Guard::acquire(1);
@@ -808,7 +822,7 @@ pub unsafe extern "C" fn r4os_rust_block_complete(handle: u64, result: i32, byte
             )
         } {
             accounting::r4os_rust_block_runtime_change(1, 27, 1);
-            return;
+            return CompletionReceipt::Late;
         }
         let registered = unsafe { registered.assume_init() };
         let v = unsafe { view(registered.device) };
@@ -816,7 +830,7 @@ pub unsafe extern "C" fn r4os_rust_block_complete(handle: u64, result: i32, byte
         if unsafe { (*p).state != 2 || (*p).backend_handle != handle } {
             stat(v, 1, 40, 1);
             accounting::r4os_rust_block_runtime_change(1, 27, 1);
-            return;
+            return CompletionReceipt::Late;
         }
         if !unsafe {
             dispatch::r4os_rust_storage_latch(
@@ -830,7 +844,7 @@ pub unsafe extern "C" fn r4os_rust_block_complete(handle: u64, result: i32, byte
         } {
             stat(v, 1, 39, 1);
             accounting::r4os_rust_block_runtime_change(1, 26, 1);
-            return;
+            return CompletionReceipt::Duplicate;
         }
         block_workers::r4os_rust_block_worker_lane(v.lane)
     };
@@ -838,6 +852,7 @@ pub unsafe extern "C" fn r4os_rust_block_complete(handle: u64, result: i32, byte
         accounting::r4os_rust_block_runtime_change(1, 2, 1);
         block_workers::r4os_rust_block_worker_signal(lane);
     }
+    CompletionReceipt::Accepted
 }
 /// # Safety
 /// Boot/runtime caller owns this registered index; exact operation pin/unwind
@@ -1032,7 +1047,25 @@ pub unsafe extern "C" fn r4os_rust_block_retirement_prepare(
     index: usize,
     out: *mut Retirement,
 ) -> bool {
-    let Some(slot) = (unsafe { retirement(index, 0) }) else {
+    unsafe { prepare_retirement(index, None, out) }
+}
+#[inline(always)]
+unsafe fn prepare_retirement(
+    index: usize,
+    expected: Option<crate::storage::access_state::Reference>,
+    out: *mut Retirement,
+) -> bool {
+    let begun = if let Some(reference) = expected {
+        let mut slot = MaybeUninit::uninit();
+        if unsafe { block_registry::begin_retirement(reference, slot.as_mut_ptr()) } {
+            Some(unsafe { slot.assume_init() })
+        } else {
+            None
+        }
+    } else {
+        unsafe { retirement(index, 0) }
+    };
+    let Some(slot) = begun else {
         return false;
     };
     if unsafe { mounted(index) } {
@@ -1112,8 +1145,18 @@ pub unsafe extern "C" fn r4os_rust_block_retirement_cancel(token: *mut Retiremen
 /// partial removal: failed commit returns all original admission barriers.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_block_unregister(index: usize) -> bool {
+    unsafe { unregister(index, None) }
+}
+pub(crate) unsafe fn unregister_exact(reference: crate::storage::access_state::Reference) -> bool {
+    unsafe { unregister(reference.slot as usize, Some(reference)) }
+}
+#[inline(always)]
+unsafe fn unregister(
+    index: usize,
+    expected: Option<crate::storage::access_state::Reference>,
+) -> bool {
     let mut token = MaybeUninit::uninit();
-    if !unsafe { r4os_rust_block_retirement_prepare(index, token.as_mut_ptr()) } {
+    if !unsafe { prepare_retirement(index, expected, token.as_mut_ptr()) } {
         return false;
     }
     let mut token = unsafe { token.assume_init() };
@@ -1300,4 +1343,20 @@ unsafe fn block_mount_index(index: usize, out: *mut usize) -> bool {
         out.write((*p).block_index);
         true
     }
+}
+
+pub(crate) unsafe fn reset_exact(
+    reference: crate::storage::access_state::Reference,
+    reason: u32,
+) -> bool {
+    let mut pin = MaybeUninit::uninit();
+    if !unsafe { block_registry::pin_exact(reference, pin.as_mut_ptr()) } {
+        return false;
+    }
+    let mut pin = unsafe { pin.assume_init() };
+    let done = unsafe { reset(pin.device, reason) };
+    unsafe {
+        block_registry::r4os_rust_block_registry_unpin(&mut pin);
+    }
+    done
 }

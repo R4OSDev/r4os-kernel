@@ -61,6 +61,13 @@ impl Pin {
         }
         Some(Self(unsafe { out.assume_init() }))
     }
+    fn exact(reference: Reference) -> Option<Self> {
+        let mut out = MaybeUninit::uninit();
+        if !unsafe { block_registry::pin_exact(reference, out.as_mut_ptr()) } {
+            return None;
+        }
+        Some(Self(unsafe { out.assume_init() }))
+    }
     fn device(&self) -> *mut c_void {
         self.0.device
     }
@@ -328,7 +335,28 @@ pub unsafe extern "C" fn r4os_rust_block_read(
     len: usize,
     trusted: bool,
 ) -> bool {
-    let Some(pin) = Pin::acquire(index) else {
+    unsafe { read_pinned(Pin::acquire(index), lba, sectors, out, len, trusted) }
+}
+pub(crate) unsafe fn read_exact(
+    reference: Reference,
+    lba: u64,
+    sectors: u16,
+    out: *mut u8,
+    len: usize,
+    trusted: bool,
+) -> bool {
+    unsafe { read_pinned(Pin::exact(reference), lba, sectors, out, len, trusted) }
+}
+#[inline(always)]
+unsafe fn read_pinned(
+    pin: Option<Pin>,
+    lba: u64,
+    sectors: u16,
+    out: *mut u8,
+    len: usize,
+    trusted: bool,
+) -> bool {
+    let Some(pin) = pin else {
         return false;
     };
     let view = pin.view();
@@ -473,11 +501,14 @@ pub unsafe extern "C" fn r4os_rust_block_write_batch(
     if count == 0 || count > 4 {
         return 0;
     }
-    let Some(pin) = Pin::acquire(index) else {
+    let expected = unsafe { expected.read() };
+    if index != expected.slot as usize {
+        return 0;
+    }
+    let Some(pin) = Pin::exact(expected) else {
         return 0;
     };
     let view = pin.view();
-    let expected = unsafe { expected.read() };
     if view.reference.slot != expected.slot
         || view.reference.generation != expected.generation
         || !view.writable
@@ -565,7 +596,14 @@ pub unsafe extern "C" fn r4os_rust_block_write_batch(
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_block_flush(index: usize) -> bool {
-    let Some(pin) = Pin::acquire(index) else {
+    flush_pinned(Pin::acquire(index))
+}
+pub(crate) fn flush_exact(reference: Reference) -> bool {
+    flush_pinned(Pin::exact(reference))
+}
+#[inline(always)]
+fn flush_pinned(pin: Option<Pin>) -> bool {
+    let Some(pin) = pin else {
         return false;
     };
     let view = pin.view();

@@ -144,11 +144,14 @@ impl<const MAX: usize> Ledger<MAX> {
         }
     }
     pub(crate) fn cleanup_except(&mut self, controller: *mut Task) -> bool {
+        self.finish_except(controller, true)
+    }
+    pub(crate) fn finish_except(&mut self, controller: *mut Task, kill: bool) -> bool {
         let mut ok = true;
         for i in 0..self.count {
             let r = self.records[i];
             if !r.done && (controller.is_null() || r.task != controller) {
-                ok &= self.finish(r.id, r.generation, true) == Some(true);
+                ok &= self.finish(r.id, r.generation, kill) == Some(true);
             }
         }
         ok

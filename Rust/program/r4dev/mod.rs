@@ -37,3 +37,5 @@ pub mod protocol;
 pub mod scheduler;
 pub mod smp;
 pub mod storage;
+
+pub mod block_queue;

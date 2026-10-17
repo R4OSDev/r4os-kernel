@@ -1083,6 +1083,7 @@ fn configure_dev() {
     use super::r4dev;
     const HEAP_CHECK: c::R4DevFns::memory_kernel_heap_check = r4dev::memory::kernel_heap_check;
     const SCHEDULER_CHECK: c::R4DevFns::scheduler_kernel_check = r4dev::scheduler::kernel_check;
+    const BLOCK_QUEUE_CHECK: c::R4DevFns::storage_block_queue_check = r4dev::block_queue::check;
     const SMP_CHECK: c::R4DevFns::smp_kernel_check = r4dev::smp::check;
     const SMP_SNAPSHOT: c::R4DevFns::performance_smp_tlb = r4dev::smp::snapshot;
     r4dev::providers::install();
@@ -1169,6 +1170,7 @@ fn configure_dev() {
         stack_fault: super::stack_fault::snapshot as *const () as usize,
         memory_kernel_heap_check: HEAP_CHECK as *const () as usize,
         scheduler_kernel_check: SCHEDULER_CHECK as *const () as usize,
+        storage_block_queue_check: BLOCK_QUEUE_CHECK as *const () as usize,
         smp_kernel_check: SMP_CHECK as *const () as usize,
         performance_smp_tlb: SMP_SNAPSHOT as *const () as usize,
         ..Default::default()
@@ -1177,7 +1179,8 @@ fn configure_dev() {
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 432);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 440);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, storage_block_queue_check) == 432);
     assert!(mem::offset_of!(c::R4XStartR4Dev, smp_kernel_check) == 416);
     assert!(mem::offset_of!(c::R4XStartR4Dev, performance_smp_tlb) == 424);
     assert!(mem::offset_of!(c::R4XStartR4Dev, scheduler_kernel_check) == 408);

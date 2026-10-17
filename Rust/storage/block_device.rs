@@ -157,6 +157,9 @@ unsafe extern "C" fn initialize(
 /// Config text and callback context retain the original backend lifetime until
 /// confirmed unregister. Registration and worker startup retain their owners.
 pub(crate) unsafe fn register(config: Config) -> Option<usize> {
+    unsafe { register_reference(config) }.map(|v| v.slot as usize)
+}
+pub(crate) unsafe fn register_reference(config: Config) -> Option<Reference> {
     let info = Registration {
         name: config.name,
         model: config.model,
@@ -180,7 +183,7 @@ pub(crate) unsafe fn register(config: Config) -> Option<usize> {
             slot.as_mut_ptr(),
         )
     } {
-        Some(unsafe { slot.assume_init() }.index)
+        Some(unsafe { slot.assume_init() }.reference)
     } else {
         None
     }
@@ -329,4 +332,34 @@ pub(crate) unsafe fn diagnostic(raw: *mut c_void, out: *mut block_diagnostics::D
     label_copy(&mut snapshot.driver, config.driver);
     label_copy(&mut snapshot.controller, config.controller);
     unsafe { out.write(snapshot) };
+}
+
+/// Exact own diagnostic facts, copied under storage admission. No lifetime loan
+/// escapes and a reused registry index cannot be mistaken for this backend.
+pub(crate) fn probe_facts(reference: Reference) -> Option<(u32, u32, accounting::Stats)> {
+    let _owner = crate::memory::owner::Guard::acquire(1);
+    let mut slot = MaybeUninit::uninit();
+    if !unsafe {
+        block_registry::r4os_rust_block_registry_slot(
+            reference.slot as usize,
+            0,
+            0,
+            true,
+            slot.as_mut_ptr(),
+        )
+    } {
+        return None;
+    }
+    let slot = unsafe { slot.assume_init() };
+    if slot.reference != reference {
+        return None;
+    }
+    let p = slot.device.cast::<Device>();
+    let mut stats = accounting::Stats::default();
+    unsafe {
+        accounting::r4os_rust_block_stats_snapshot(ptr::addr_of!((*p).stats), &mut stats);
+        let queued =
+            block_requests::r4os_rust_block_select(ptr::addr_of!((*p).slots).cast(), 3, 0) as u32;
+        Some(((*p).active, queued, stats))
+    }
 }

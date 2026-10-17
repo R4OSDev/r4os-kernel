@@ -305,12 +305,22 @@ pub unsafe extern "C" fn r4os_rust_block_registry_retire(
     op: u8,
     out: *mut SlotView,
 ) -> bool {
+    unsafe { retire(index, op, None, out) }
+}
+pub(crate) unsafe fn begin_retirement(reference: Reference, out: *mut SlotView) -> bool {
+    unsafe { retire(reference.slot as usize, 0, Some(reference), out) }
+}
+#[inline(always)]
+unsafe fn retire(index: usize, op: u8, expected: Option<Reference>, out: *mut SlotView) -> bool {
     let _owner = Guard::acquire(1);
     let r = REGISTRY.0.get();
     if index >= unsafe { (*r).slot_count } {
         return false;
     }
     let mut s = unsafe { (*r).slots[index] };
+    if expected.is_some_and(|v| v != s.reference) {
+        return false;
+    }
     match op {
         0 => {
             if !s.used || s.retiring || s.retire_generation == u64::MAX {
@@ -384,6 +394,13 @@ pub struct Pin {
 /// Its resident device remains alive until this token is consumed by unpin.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_block_registry_pin(index: usize, out: *mut Pin) -> bool {
+    unsafe { pin(index, None, out) }
+}
+pub(crate) unsafe fn pin_exact(reference: Reference, out: *mut Pin) -> bool {
+    unsafe { pin(reference.slot as usize, Some(reference), out) }
+}
+#[inline(always)]
+unsafe fn pin(index: usize, expected: Option<Reference>, out: *mut Pin) -> bool {
     let unwind = unsafe { task_context::enter() };
     if !unwind.admitted() {
         return false;
@@ -394,6 +411,7 @@ pub unsafe extern "C" fn r4os_rust_block_registry_pin(index: usize, out: *mut Pi
         if index >= r.slot_count
             || !visible(r.slots[index], r.excluded)
             || r.slots[index].pins == u32::MAX
+            || expected.is_some_and(|v| v != r.slots[index].reference)
         {
             None
         } else {
