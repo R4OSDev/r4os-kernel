@@ -49,20 +49,20 @@ pub(super) unsafe fn attribute(
             );
             return Some(want);
         }
-        if (*attr).flags & 1 != 0 {
-            return compressed(v, attr, offset64, part(out, 0, want)).then_some(want);
-        }
         let initialized =
             (want as u64).min((*attr).initialized_size.saturating_sub(offset64)) as usize;
-        if !io::runs(
-            v,
-            run_span(attr),
-            offset64,
-            part(out, 0, initialized),
-            None,
-            ptr::null_mut(),
-        ) {
-            return None;
+        // Compression may decode a whole physical unit, but only initialized
+        // logical bytes belong to the caller. Do not read the zero-only tail.
+        if initialized != 0 {
+            let prefix = part(out, 0, initialized);
+            let ok = if (*attr).flags & 1 != 0 {
+                compressed(v, attr, offset64, prefix)
+            } else {
+                io::runs(v, run_span(attr), offset64, prefix, None, ptr::null_mut())
+            };
+            if !ok {
+                return None;
+            }
         }
         if initialized < want {
             ptr::write_bytes(out.data.add(initialized), 0, want - initialized);
