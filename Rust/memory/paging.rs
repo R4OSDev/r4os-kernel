@@ -334,6 +334,17 @@ pub extern "C" fn r4os_rust_paging_map(
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_paging_unmap(address: u64, locked: bool) -> bool {
+    unmap(address, locked, core::ptr::null_mut())
+}
+/// Exact own invalidation result, captured under the same page-table owner.
+/// The optional receipt never replaces the existing rollback/retention rules.
+pub(crate) fn unmap_with_receipt(address: u64) -> (bool, crate::arch::tlb::Result) {
+    let mut receipt = crate::arch::tlb::Result::default();
+    let ok = unmap(address, false, core::ptr::addr_of_mut!(receipt));
+    (ok, receipt)
+}
+#[inline(always)]
+fn unmap(address: u64, locked: bool, receipt: *mut crate::arch::tlb::Result) -> bool {
     let _guard = if locked {
         None
     } else {
@@ -354,7 +365,13 @@ pub extern "C" fn r4os_rust_paging_unmap(address: u64, locked: bool) -> bool {
         return fail_unmap();
     }
     write(entry, 0);
-    if !invalidate(address, 1) {
+    let result = paging_shootdown_result(address, 1);
+    if !receipt.is_null() {
+        unsafe {
+            receipt.write(result);
+        }
+    }
+    if !result.ok {
         shootdown_failure();
         write(entry, previous);
         restore_count(1);
@@ -656,9 +673,12 @@ pub unsafe extern "C" fn r4os_rust_paging_stats(output: *mut Stats) {
 const _: () = assert!(core::mem::size_of::<Stats>() == 184);
 
 unsafe fn paging_shootdown(base: u64, pages: u64) -> bool {
+    paging_shootdown_result(base, pages).ok
+}
+fn paging_shootdown_result(base: u64, pages: u64) -> crate::arch::tlb::Result {
     let mut result = core::mem::MaybeUninit::uninit();
     unsafe {
         crate::arch::tlb::r4os_rust_tlb_invalidate(base, pages, result.as_mut_ptr());
-        result.assume_init().ok
+        result.assume_init()
     }
 }

@@ -1,5 +1,9 @@
 //! Existing bounded SMP/TLB/owner/clock diagnostic, with one native state owner.
-//! Task and wait objects stay with their 0.83.11 owner behind fixed C cuts.
+//! Functional cases share exact native task and mapping owners.
+mod cases;
+mod live;
+mod mapping;
+mod workers;
 use crate::{arch::runtime, boot::serial, memory::owner, platform::clocksource};
 use crate::{
     arch::{percpu, smp, smp_policy::MAX_CPUS, tlb},
@@ -10,8 +14,10 @@ use crate::{
 use core::{
     ffi::c_void,
     ptr,
-    sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
+pub(crate) use live::check;
+use workers::worker_main;
 const PAGE: u64 = 4096;
 const TIMEOUT: u64 = 10_000_000_000;
 const ITERATIONS: u64 = 4_000_000;
@@ -37,15 +43,57 @@ static CLOCK_STARTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_C
 static CLOCK_ENDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static TICK_STARTS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 static TICK_ENDS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
-#[repr(C)]
-pub struct TlbProbe {
-    range_id: u32,
-    address: u64,
-    old_frame: u64,
-    new_frame: u64,
-    mapped_frame: u64,
+type TlbProbe = mapping::Mapping;
+static ABORT: AtomicBool = AtomicBool::new(false);
+static PROBING: AtomicBool = AtomicBool::new(false);
+static OWNED_POINTERS: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+static OWNED_SIZES: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+struct Session {
+    mapping: TlbProbe,
+    tasks: crate::sched::task::diagnostic::Ledger<{ MAX_CPUS + 1 }>,
+    controller: *mut crate::sched::task::task_types::Task,
+    retained: bool,
+    online_mask: u64,
+    placement_mask: u64,
+    expected: u64,
+    actual: u64,
+    stage: u32,
+    checked_clock: Option<clocksource::Status>,
+}
+struct SessionCell(core::cell::UnsafeCell<Session>);
+// One admitted BSP controller owns this ledger; workers use only atomics.
+unsafe impl Sync for SessionCell {}
+static SESSION: SessionCell = SessionCell(core::cell::UnsafeCell::new(Session {
+    mapping: TlbProbe::EMPTY,
+    tasks: crate::sched::task::diagnostic::Ledger::EMPTY,
+    controller: ptr::null_mut(),
+    retained: false,
+    online_mask: 0,
+    placement_mask: 0,
+    expected: 0,
+    actual: 0,
+    stage: 0,
+    checked_clock: None,
+}));
+struct ProbeGate(bool);
+impl Drop for ProbeGate {
+    fn drop(&mut self) {
+        if self.0 {
+            PROBING.store(false, Ordering::Release);
+        }
+    }
+}
+fn probe_gate() -> Option<ProbeGate> {
+    PROBING
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| ProbeGate(true))
+}
+fn session() -> *mut Session {
+    SESSION.0.get()
 }
 #[repr(C)]
+#[derive(Default)]
 pub struct HeapReport {
     pub ok: bool,
     pub iterations: u64,
@@ -114,14 +162,6 @@ fn work(index: u32) -> u64 {
 fn elapsed(start: monotonic::Stamp) -> Option<u64> {
     monotonic::elapsed(start, monotonic::capture())
 }
-fn task_call(
-    operation: u8,
-    task: *mut c_void,
-    value: u64,
-    entry: Option<unsafe extern "C" fn()>,
-) -> u64 {
-    unsafe { smp_probe_task(operation, task, value, entry) }
-}
 fn remote(mask: u64) -> Option<u32> {
     (0..MAX_CPUS as u32).find(|&i| i != percpu::current_index() && mask & (1 << i) != 0)
 }
@@ -133,22 +173,43 @@ fn tlb_stats() -> tlb::Stats {
     }
 }
 struct Cleanup {
-    probe: TlbProbe,
+    probe: *mut TlbProbe,
     pending: bool,
-    release_workers: bool,
+}
+fn stop_workers() -> bool {
+    ABORT.store(true, Ordering::Release);
+    RELEASE.store(1, Ordering::Release);
+    PHASE.store(3, Ordering::Release);
+    RETIRE.store(1, Ordering::Release);
+    unsafe { (*session()).tasks.cleanup_except((*session()).controller) }
+}
+fn retained_allocations() -> u64 {
+    OWNED_POINTERS
+        .iter()
+        .filter(|p| p.load(Ordering::Acquire) != 0)
+        .count() as u64
 }
 impl Drop for Cleanup {
     fn drop(&mut self) {
-        // Match original defer order: wake retiring workers before cleanup.
-        if self.release_workers {
-            RETIRE.store(1, Ordering::Release);
-        }
-        if self.pending {
-            unsafe { smp_probe_cleanup(&mut self.probe) };
+        let workers = stop_workers();
+        unsafe {
+            if !workers || retained_allocations() != 0 {
+                (*session()).retained = true;
+            }
+            if self.pending {
+                if workers {
+                    if !smp_probe_cleanup(self.probe) {
+                        (*session()).retained = true;
+                    }
+                } else {
+                    (*self.probe).retained = true;
+                }
+            }
         }
     }
 }
 fn reset(address: u64) {
+    ABORT.store(false, Ordering::Release);
     for index in 0..MAX_CPUS {
         RESULTS[index].store(0, Ordering::Relaxed);
         CLOCK_STARTS[index].store(0, Ordering::Relaxed);
@@ -173,363 +234,35 @@ fn reset(address: u64) {
     RETIRE.store(0, Ordering::Release);
 }
 pub fn run(usable: u64) -> bool {
-    let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
-    let count = online.count_ones();
-    if count <= 1 {
-        text(1, b"");
-        return true;
-    }
-    let mut probe = core::mem::MaybeUninit::uninit();
-    if !unsafe { smp_probe_setup(probe.as_mut_ptr()) } {
-        return fail(b"tlb-setup");
-    }
-    let mut cleanup = Cleanup {
-        probe: unsafe { probe.assume_init() },
-        pending: true,
-        release_workers: false,
+    let Some(mut gate) = probe_gate() else {
+        return fail(b"probe-busy-or-retained");
     };
-    let start = monotonic::capture();
-    let mut expected = 0;
-    for index in 0..MAX_CPUS as u32 {
-        if online & (1 << index) != 0 {
-            expected ^= work(index);
-        }
-    }
-    if elapsed(start).is_none() {
-        return fail(b"clock-sequential");
-    }
-    reset(cleanup.probe.address);
-    cleanup.release_workers = true;
-    let mut workers = [ptr::null_mut(); MAX_CPUS];
-    let mut created = 0;
-    for index in 0..MAX_CPUS as u32 {
-        if online & (1 << index) == 0 {
-            continue;
-        }
-        let worker: *mut c_void =
-            ptr::with_exposed_provenance_mut(
-                task_call(0, ptr::null_mut(), 0, Some(worker_main)) as usize
-            );
-        if worker.is_null() {
-            return fail(b"worker-create");
-        }
-        if task_call(1, worker, u64::from(index), None) == 0 {
-            return fail(b"worker-bind");
-        }
-        workers[created] = worker;
-        created += 1;
-    }
-    let ready_tick = timer::tick_count();
-    let mut placement = 0;
-    for worker in workers.iter().take(count as usize) {
-        if worker.is_null() {
-            return fail(b"worker-missing");
-        }
-        let target = task_call(2, *worker, ready_tick, None);
-        let bit = 1u64 << target;
-        if online & bit == 0 || placement & bit != 0 {
-            FAILURES.fetch_add(1, Ordering::AcqRel);
-        }
-        placement |= bit;
-    }
-    let tlb_start = monotonic::capture();
-    RELEASE.store(1, Ordering::Release);
-    for index in 1..MAX_CPUS as u32 {
-        if online & (1 << index) != 0 {
-            smp::r4os_rust_smp_control(4, index);
-        }
-    }
-    let mut tlb_runtime_ok = true;
-    while TLB_READY.load(Ordering::Acquire) & online != online {
-        scheduler::yield_task();
-        if elapsed(tlb_start).unwrap_or(0) >= TIMEOUT {
-            tlb_runtime_ok = false;
-            break;
-        }
-    }
-    if paging::r4os_rust_paging_unmap(cleanup.probe.address, false) {
-        cleanup.probe.mapped_frame = 0;
-        if paging::r4os_rust_paging_map(
-            cleanup.probe.address,
-            cleanup.probe.new_frame,
-            2 | (1 << 63),
-            false,
-        ) {
-            cleanup.probe.mapped_frame = cleanup.probe.new_frame;
-        } else {
-            tlb_runtime_ok = false;
-            if paging::r4os_rust_paging_map(
-                cleanup.probe.address,
-                cleanup.probe.old_frame,
-                2 | (1 << 63),
-                false,
-            ) {
-                cleanup.probe.mapped_frame = cleanup.probe.old_frame;
-            }
-        }
-    } else {
-        tlb_runtime_ok = false;
-    }
-    PHASE.store(2, Ordering::Release);
-    while TLB_UPDATED.load(Ordering::Acquire) & online != online {
-        scheduler::yield_task();
-        if elapsed(tlb_start).unwrap_or(0) >= TIMEOUT {
-            tlb_runtime_ok = false;
-            break;
-        }
-    }
-    let before = tlb_stats();
-    let mut timeout_rejected = false;
-    let mut frame_retained = false;
-    if cleanup.probe.mapped_frame == cleanup.probe.new_frame
-        && let Some(cpu) = remote(online)
-        && tlb::r4os_rust_tlb_control(1, cpu)
-    {
-        timeout_rejected = !paging::r4os_rust_paging_unmap(cleanup.probe.address, false);
-        tlb::r4os_rust_tlb_control(2, 0);
-        let mut mapped = 0;
-        frame_retained =
-            unsafe { paging::r4os_rust_paging_read(cleanup.probe.address, 0, false, &mut mapped) }
-                && mapped == cleanup.probe.new_frame
-                && blocks::r4os_rust_blocks_prefix(cleanup.probe.new_frame, PAGE, false) == PAGE;
-    }
-    let after = tlb_stats();
-    tlb_runtime_ok = tlb_runtime_ok
-        && timeout_rejected
-        && frame_retained
-        && after.timeouts == before.timeouts + 1
-        && after.expected_timeouts == before.expected_timeouts + 1;
-    let deadline_before = timer::deadline_stats();
-    let parallel_start = monotonic::capture();
-    PHASE.store(3, Ordering::Release);
-    while DONE.load(Ordering::Acquire) < count {
-        scheduler::yield_task();
-        let Some(time) = elapsed(parallel_start) else {
-            return fail(b"clock-parallel");
-        };
-        if time >= TIMEOUT {
-            return fail(b"timeout");
-        }
-    }
-    if elapsed(parallel_start).is_none() {
-        return fail(b"clock-parallel");
-    }
-    let mut actual = 0;
-    let mut clock_samples = true;
-    for (index, result) in RESULTS.iter().enumerate() {
-        if online & (1 << index) == 0 {
-            continue;
-        }
-        actual ^= result.load(Ordering::Relaxed);
-        clock_samples = clock_samples
-            && CLOCK_STARTS[index].load(Ordering::Relaxed) != 0
-            && CLOCK_ENDS[index].load(Ordering::Relaxed)
-                > CLOCK_STARTS[index].load(Ordering::Relaxed)
-            && TICK_ENDS[index].load(Ordering::Relaxed)
-                >= TICK_STARTS[index].load(Ordering::Relaxed);
-    }
-    let observed = CPUS.load(Ordering::Acquire);
-    let failures = FAILURES.load(Ordering::Acquire);
-    let regressions = REGRESSIONS.load(Ordering::Acquire);
-    let deadline_after = timer::deadline_stats();
-    let clock = crate::platform::clocksource::snapshot();
-    let irq_delta = deadline_after
-        .timer_irqs
-        .wrapping_sub(deadline_before.timer_irqs);
-    let clock_ok = clock.source != 0
-        && clock_samples
-        && clock.registered_cpu_mask & online == online
-        && regressions == 0
-        && irq_delta != 0;
-    let mut heap_output = core::mem::MaybeUninit::uninit();
-    unsafe { smp_probe_heap(heap_output.as_mut_ptr()) };
-    let heap_probe = unsafe { heap_output.assume_init() };
-    let heap_ok = heap_probe.ok;
-    let stale = TLB_FAILURES.load(Ordering::Acquire);
-    let ready = TLB_READY.load(Ordering::Acquire);
-    let updated = TLB_UPDATED.load(Ordering::Acquire);
-    let cleaned = unsafe { smp_probe_cleanup(&mut cleanup.probe) };
-    cleanup.pending = false;
-    RETIRE.store(1, Ordering::Release);
-    let final_tlb = tlb_stats();
-    let mut runtime_output = core::mem::MaybeUninit::uninit();
-    let mut owner_output = core::mem::MaybeUninit::uninit();
-    let mut serial_output = core::mem::MaybeUninit::uninit();
-    let serial_ok = unsafe {
-        smp_probe_counters(
-            runtime_output.as_mut_ptr(),
-            owner_output.as_mut_ptr(),
-            serial_output.as_mut_ptr(),
-        )
+    let Some(_admission) = crate::sched::task_context::Admission::acquire(false) else {
+        return false;
     };
-    let runtime_stats = unsafe { runtime_output.assume_init() };
-    let owner_stats = unsafe { owner_output.assume_init() };
-    let serial_stats = unsafe { serial_output.assume_init() };
-    let lock_base =
-        runtime_stats.legacy_global_acquisitions == 0 && owner_stats.order_violations == 0;
-    let owner_done = OWNER_DONE.load(Ordering::Acquire);
-    let owner_failures = OWNER_FAILURES.load(Ordering::Acquire);
-    let lock_ok = lock_base
-        && owner_failures == 0
-        && owner_done & online == online
-        && MUTEX_COUNT.load(Ordering::Relaxed) == u64::from(count) * STRESS;
-    let r4l_ok = if let Some(cpu) = remote(online) {
-        unsafe { smp_probe_finish(0, cpu, usable) }
-    } else {
-        false
-    };
-    let owners_ok = unsafe { smp_probe_finish(1, 0, 0) };
-    let tlb_ok = tlb_runtime_ok
-        && cleaned
-        && stale == 0
-        && ready & online == online
-        && updated & online == online
-        && final_tlb.timeouts == final_tlb.expected_timeouts
-        && final_tlb.successes != 0;
-    let ok = owners_ok
-        && failures == 0
-        && clock_ok
-        && placement == online
-        && observed == online
-        && actual == expected
-        && heap_ok
-        && tlb_ok
-        && lock_ok
-        && serial_ok
-        && r4l_ok;
-    let report = Report {
-        ok,
-        clock_ok,
-        tlb_ok,
-        lock_ok,
-        serial_ok,
-        timeout_rejected,
-        frame_retained,
-        tlb_cleanup_ok: cleaned,
-        online_count: count,
-        failures,
-        clock_regressions: regressions,
-        tlb_failures: stale,
-        owner_failures,
-        online_mask: online,
-        observed_mask: observed,
-        tlb_ready_mask: ready,
-        tlb_updated_mask: updated,
-        owner_done_mask: owner_done,
-        irq_delta,
-        heap_probe,
-        clock_status: clock,
-        tlb_stats: final_tlb,
-        runtime_stats,
-        owner_stats,
-        serial_stats,
-    };
-    unsafe { smp_probe_report(&report) };
-    ok
-}
-fn owner_stress(cpu: u32, bit: u64) {
-    for iteration in 0..STRESS {
-        let size = if iteration == 0 {
-            (cpu as usize + 1) * 512 * 1024
-        } else {
-            64 + ((iteration + u64::from(cpu)) & 7) as usize * 32
-        };
-        let memory = heap::r4os_rust_heap_alloc(size, 16);
-        if memory.is_null() {
-            OWNER_FAILURES.fetch_add(1, Ordering::AcqRel);
-            continue;
-        }
-        let witness = (iteration ^ u64::from(cpu)) as u8;
-        unsafe {
-            memory.write(witness);
-            memory.add(size - 1).write(!witness)
-        };
-        let valid = unsafe { memory.read() == witness && memory.add(size - 1).read() == !witness };
-        let freed = unsafe { heap::r4os_rust_heap_free(memory, size) };
-        if !valid || freed != 0 {
-            OWNER_FAILURES.fetch_add(1, Ordering::AcqRel);
-        }
-        if !unsafe { smp_probe_mutex(1) } {
-            OWNER_FAILURES.fetch_add(1, Ordering::AcqRel);
-            break;
-        }
-        // Keep checked arithmetic and the original exact sleepable mutex.
-        let count = MUTEX_COUNT.load(Ordering::Relaxed) + 1;
-        MUTEX_COUNT.store(count, Ordering::Relaxed);
-        if !unsafe { smp_probe_mutex(2) } {
-            OWNER_FAILURES.fetch_add(1, Ordering::AcqRel);
-            break;
-        }
+    unsafe {
+        session().write(Session {
+            mapping: TlbProbe::EMPTY,
+            tasks: crate::sched::task::diagnostic::Ledger::EMPTY,
+            controller: ptr::null_mut(),
+            retained: false,
+            online_mask: 0,
+            placement_mask: 0,
+            expected: 0,
+            actual: 0,
+            stage: 0,
+            checked_clock: None,
+        });
     }
-    OWNER_DONE.fetch_or(bit, Ordering::AcqRel);
-}
-unsafe extern "C" fn worker_main() {
-    let cpu = percpu::current_index();
-    while RELEASE.load(Ordering::Acquire) == 0 {
-        core::hint::spin_loop();
+    live::clear_cancel();
+    reset(0);
+    let result = cases::run(usable, false);
+    if !result || unsafe { (*session()).retained } {
+        gate.0 = false;
     }
-    if cpu as usize >= MAX_CPUS {
-        FAILURES.fetch_add(1, Ordering::AcqRel);
-    } else {
-        let bit = 1u64 << cpu;
-        let previous = CPUS.fetch_or(bit, Ordering::AcqRel);
-        if previous & bit != 0 {
-            FAILURES.fetch_add(1, Ordering::AcqRel);
-        } else {
-            let word =
-                ptr::with_exposed_provenance::<u64>(ADDRESS.load(Ordering::Acquire) as usize);
-            if PHASE.load(Ordering::Acquire) != 1 || unsafe { word.read_volatile() } != OLD {
-                TLB_FAILURES.fetch_add(1, Ordering::AcqRel);
-            }
-            TLB_READY.fetch_or(bit, Ordering::AcqRel);
-            while PHASE.load(Ordering::Acquire) < 2 {
-                scheduler::yield_task();
-            }
-            if unsafe { word.read_volatile() } != NEW {
-                TLB_FAILURES.fetch_add(1, Ordering::AcqRel);
-            }
-            TLB_UPDATED.fetch_or(bit, Ordering::AcqRel);
-            while PHASE.load(Ordering::Acquire) < 3 {
-                scheduler::yield_task();
-            }
-            owner_stress(cpu, bit);
-            let start = monotonic::now_nanoseconds().unwrap_or(0);
-            let tick_start = timer::tick_count();
-            let mut prior = start;
-            for _ in 0..256 {
-                let now = monotonic::now_nanoseconds().unwrap_or(0);
-                if now < prior {
-                    REGRESSIONS.fetch_add(1, Ordering::AcqRel);
-                }
-                prior = now;
-            }
-            let index = cpu as usize;
-            RESULTS[index].store(work(cpu), Ordering::Relaxed);
-            let tick_end = timer::tick_count();
-            let end = monotonic::now_nanoseconds().unwrap_or(0);
-            CLOCK_STARTS[index].store(start, Ordering::Relaxed);
-            CLOCK_ENDS[index].store(end, Ordering::Relaxed);
-            TICK_STARTS[index].store(tick_start, Ordering::Relaxed);
-            TICK_ENDS[index].store(tick_end, Ordering::Relaxed);
-            let deadline = timer::r4os_rust_timer_control(6, tick_start, 2);
-            if start == 0
-                || end <= start
-                || tick_end < tick_start
-                || deadline <= tick_start
-                || timer::r4os_rust_timer_control(8, tick_start, deadline) != 2
-            {
-                FAILURES.fetch_add(1, Ordering::AcqRel);
-            }
-        }
-    }
-    DONE.fetch_add(1, Ordering::Release);
-    while RETIRE.load(Ordering::Acquire) == 0 {
-        scheduler::yield_task();
-    }
+    result
 }
 const _: () = {
-    assert!(core::mem::size_of::<TlbProbe>() == 40);
-    assert!(core::mem::offset_of!(TlbProbe, address) == 8);
     assert!(core::mem::size_of::<Report>() == 576);
     assert!(core::mem::offset_of!(Report, online_mask) == 32);
     assert!(core::mem::size_of::<HeapReport>() == 104);
@@ -596,120 +329,10 @@ fn probe_hex(value: u64, width: u8) {
 }
 
 unsafe fn smp_probe_setup(output: *mut TlbProbe) -> bool {
-    use crate::memory::{phys, vm_query as vq, vm_ranges as vr, vm_transactions as vm};
-    let r = vr::Reserve {
-        eviction_allowed: true,
-        window: 0,
-        kind: 4,
-        owner: 0,
-        owner_id: 0,
-        name_ptr: b"tlb-acceptance".as_ptr(),
-        name_len: 14,
-        flags: 2 | (1 << 63),
-        base: 0,
-        len: PAGE,
-    };
-    let mut id = 0;
-    if unsafe { vr::r4os_rust_vm_reserve(&r, PAGE, &mut id) } != 0 {
-        return false;
-    }
-    let mut range = core::mem::MaybeUninit::uninit();
-    if !unsafe { vq::r4os_rust_vm_range_info(id, range.as_mut_ptr()) } {
-        vm::r4os_rust_vm_release(id);
-        return false;
-    }
-    let range = unsafe { range.assume_init() };
-    let Some(old) = claim_probe_frame(b"tlb-probe-old") else {
-        vm::r4os_rust_vm_release(id);
-        return false;
-    };
-    let Some(new) = claim_probe_frame(b"tlb-probe-new") else {
-        release_probe_frame(old);
-        vm::r4os_rust_vm_release(id);
-        return false;
-    };
-    unsafe {
-        ptr::with_exposed_provenance_mut::<u64>(phys::r4os_rust_phys_to_virt(old) as usize)
-            .write_volatile(OLD);
-        ptr::with_exposed_provenance_mut::<u64>(phys::r4os_rust_phys_to_virt(new) as usize)
-            .write_volatile(NEW);
-    }
-    if !paging::r4os_rust_paging_map(range.base, old, 2 | (1 << 63), false) {
-        release_probe_frame(old);
-        release_probe_frame(new);
-        vm::r4os_rust_vm_release(id);
-        return false;
-    }
-    unsafe {
-        output.write(TlbProbe {
-            range_id: id,
-            address: range.base,
-            old_frame: old,
-            new_frame: new,
-            mapped_frame: old,
-        });
-    }
-    true
+    unsafe { (&mut *output).acquire() }
 }
-
 unsafe fn smp_probe_cleanup(probe: *mut TlbProbe) -> bool {
-    let p = unsafe { &mut *probe };
-    let mut ok = true;
-    if p.mapped_frame != 0 {
-        let mut frame = 0;
-        if unsafe { paging::r4os_rust_paging_read(p.address, 0, false, &mut frame) }
-            && frame == p.mapped_frame
-            && paging::r4os_rust_paging_unmap(p.address, false)
-        {
-            p.mapped_frame = 0;
-        } else {
-            ok = false;
-        }
-    }
-    if p.mapped_frame != p.old_frame {
-        ok = release_probe_frame(p.old_frame) && ok;
-    }
-    if p.mapped_frame != p.new_frame {
-        ok = release_probe_frame(p.new_frame) && ok;
-    }
-    if p.mapped_frame == 0 && crate::memory::vm_transactions::r4os_rust_vm_release(p.range_id) != 0
-    {
-        ok = false;
-    }
-    ok
-}
-
-unsafe fn smp_probe_task(
-    operation: u8,
-    task: *mut c_void,
-    value: u64,
-    entry: Option<unsafe extern "C" fn()>,
-) -> u64 {
-    use crate::sched::task::task_api;
-    match operation {
-        0 => {
-            let r = task_api::CreateRequest {
-                name: b"smp-kwork".as_ptr(),
-                name_len: 9,
-                state: 3,
-                role: 1,
-                needs_fpu: true,
-                smp_eligible: true,
-                smp_r4x: false,
-                owner_kind: 0,
-                owner_context: ptr::null_mut(),
-                entry,
-            };
-            let mut failure = 0;
-            unsafe { task_api::r4os_rust_task_create(&r, false, &mut failure) }.addr() as u64
-        }
-        1 => unsafe { task_api::r4os_rust_task_mutate(24, task, value, 0, ptr::null(), 0) },
-        2 => unsafe {
-            task_api::r4os_rust_task_mutate(0, task, value, 0, ptr::null(), 0);
-            task_api::r4os_rust_task_field(task, 24)
-        },
-        _ => unreachable!(),
-    }
+    unsafe { (&mut *probe).cleanup() }
 }
 
 unsafe fn smp_probe_mutex(operation: u8) -> bool {

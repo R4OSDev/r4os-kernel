@@ -147,6 +147,32 @@ unsafe fn complete_admitted(task: *mut Task) -> bool {
         false
     }
 }
+/// Bind an owned unpublished SMP task while its descriptor stays pinned.
+/// The existing private task mutator delegates the same native contract here.
+pub(crate) unsafe fn bind_diagnostic_cpu(task: *mut Task, cpu: u32) -> bool {
+    if cpu >= registry::MAX_CPUS as u32
+        || crate::arch::percpu::r4os_rust_percpu_control(13, cpu, 0, 0) == 0
+    {
+        return false;
+    }
+    let _runtime = runtime::RuntimeGuard::acquire();
+    unsafe {
+        if !registry::contains(task) {
+            return false;
+        }
+        let c = registry::core(task);
+        let accepted = (*c).state == State::Blocked
+            && (*c).smp_eligible
+            && !(*c).ready_linked
+            && !(*c).timeout_linked
+            && (*c).running_cpu == 0xff;
+        if accepted {
+            (*c).home_cpu = cpu as u8;
+            (*c).home_cpu_bound = true;
+        }
+        accepted
+    }
+}
 pub(crate) unsafe fn pin(task: *mut Task) -> bool {
     let flags = runtime::save_runtime();
     let result = unsafe {

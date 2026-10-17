@@ -8,7 +8,7 @@ use super::{
     },
 };
 use crate::{
-    arch::{fpu, percpu, runtime},
+    arch::{fpu, runtime},
     platform::timer,
 };
 use core::{
@@ -400,25 +400,11 @@ pub unsafe extern "C" fn r4os_rust_task_mutate(
                 u64::from(accepted)
             }
             24 => {
-                if a >= registry::MAX_CPUS as u64
-                    || percpu::r4os_rust_percpu_control(13, a as u32, 0, 0) == 0
-                {
-                    return 0;
+                if a > u64::from(u32::MAX) {
+                    0
+                } else {
+                    u64::from(lifetime::bind_diagnostic_cpu(task, a as u32))
                 }
-                let f = runtime::save_runtime();
-                let c = registry::core(task);
-                let accepted = registry::contains(task)
-                    && (*c).state == State::Blocked
-                    && (*c).smp_eligible
-                    && !(*c).ready_linked
-                    && !(*c).timeout_linked
-                    && (*c).running_cpu == 0xff;
-                if accepted {
-                    (*c).home_cpu = a as u8;
-                    (*c).home_cpu_bound = true;
-                }
-                runtime::restore_runtime(f);
-                u64::from(accepted)
             }
             25 => {
                 let f = runtime::save_runtime();

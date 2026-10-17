@@ -1,5 +1,6 @@
 //! Canonical native dynamic tasks. All still-Zig consumers receive opaque
 //! handles and fixed C records; typed scheduler access stays inside Rust.
+pub(crate) mod diagnostic;
 pub(crate) mod task_api;
 pub(crate) mod task_lifecycle;
 pub(crate) mod task_registry;

@@ -35,7 +35,7 @@ unsafe extern "C" {
     fn r4os_invlpg(address: usize);
 }
 #[repr(C)]
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub struct Result {
     pub ok: bool,
     pub generation: u64,
@@ -164,6 +164,12 @@ fn invalidate(base: u64, pages: u64) -> Result {
     result.offline_mask = offline;
     result.spins = limit;
     result
+}
+pub(crate) fn registered() -> bool {
+    SENDER.load(Ordering::Acquire) != 0
+}
+pub(crate) fn isolated_injection_active() -> bool {
+    DIAGNOSTIC.load(Ordering::Acquire)
 }
 pub fn handle_ipi() {
     let generation = REQUEST_GENERATION.load(Ordering::Acquire);
