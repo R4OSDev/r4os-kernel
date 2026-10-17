@@ -1,5 +1,7 @@
 //! Boundary-tag kernel allocator: original bins, coalescence, poison,
 //! growth serialization and exact partial-tail retention.
+mod release;
+
 use super::{
     heap_policy as policy,
     owner::{self, Token},
@@ -89,6 +91,7 @@ struct Control {
     pending_uncommit_start: usize,
     pending_uncommit_bytes: usize,
     pending_uncommit_pressure: bool,
+    next_release_id: u64,
     commit_calls: u64,
     commit_failures: u64,
     committed_pages_total: u64,
@@ -127,6 +130,7 @@ impl Control {
         pending_uncommit_start: 0,
         pending_uncommit_bytes: 0,
         pending_uncommit_pressure: false,
+        next_release_id: 0,
         commit_calls: 0,
         commit_failures: 0,
         committed_pages_total: 0,
@@ -195,13 +199,16 @@ impl Control {
         self.free_blocks -= 1;
         self.free_bytes -= size;
     }
-    fn release_block(&mut self, mut offset: usize, mut size: usize) {
+    fn release_block(&mut self, offset: usize, size: usize) {
         if size >= OVERHEAD + GRANULE {
             unsafe {
                 core::ptr::write_bytes(payload(offset), 0xdd, size - OVERHEAD);
             }
             self.poison_bytes = self.poison_bytes.wrapping_add((size - OVERHEAD) as u64);
         }
+        self.publish_free(offset, size);
+    }
+    fn publish_free(&mut self, mut offset: usize, mut size: usize) {
         let next_offset = offset + size;
         if next_offset < self.heap_top {
             let next = read(next_offset);
@@ -339,6 +346,14 @@ impl Control {
                 });
             }
             return self.classify(offset);
+        }
+        if header & release::RETIRING != 0 {
+            return Some(Validation {
+                kind: 1,
+                offset,
+                size,
+                requested: 0,
+            });
         }
         let requested = read(offset + 8) as usize;
         if requested > size - OVERHEAD {
@@ -631,48 +646,19 @@ fn pressure() -> bool {
     }
     frames.total_frames != 0 && frames.free_frames <= (frames.total_frames / 32).max(512)
 }
-fn finish_tail() -> bool {
-    let (id, start, bytes, pressure) = control(|control| {
-        if control.pending_uncommit_bytes != 0 {
-            control.uncommit_calls = control.uncommit_calls.wrapping_add(1);
-        }
-        (
-            control.range_id,
-            control.pending_uncommit_start,
-            control.pending_uncommit_bytes,
-            control.pending_uncommit_pressure,
-        )
-    });
-    if bytes == 0 {
-        return true;
-    }
-    if !unsafe { heap_uncommit(id, start as u64, bytes as u64) } {
-        control(|control| control.uncommit_failures = control.uncommit_failures.wrapping_add(1));
-        return false;
-    }
-    control(|control| {
-        control.uncommitted_pages_total = control
-            .uncommitted_pages_total
-            .wrapping_add((bytes / PAGE) as u64);
-        if pressure {
-            control.pressure_releases = control.pressure_releases.wrapping_add(1);
-        }
-        control.pending_uncommit_start = 0;
-        control.pending_uncommit_bytes = 0;
-        control.pending_uncommit_pressure = false;
-    });
-    true
+fn finish_tail(guard: &mut HeapGuard) -> bool {
+    release::finish_tail(guard)
 }
-fn release_tail() {
+fn release_tail(guard: &mut HeapGuard) {
     if control(|control| GROWTH.load(Ordering::Acquire) != 0 || control.growth_cleanup_pending) {
         return;
     }
-    if !finish_tail() {
+    if !finish_tail(guard) {
         return;
     }
     let pressure = pressure();
     if control(|control| control.retire_tail(pressure)) {
-        let _ = finish_tail();
+        let _ = finish_tail(guard);
     }
 }
 fn commit_pages(start: usize, pages: usize, guard: &mut HeapGuard) -> bool {
@@ -713,7 +699,7 @@ fn grow(min_extra: usize, guard: &mut HeapGuard) -> bool {
         guard.resume();
         return result;
     }
-    if !finish_tail() {
+    if !finish_tail(guard) {
         return false;
     }
     // Preserve the original overflow rejection before page division.
@@ -868,35 +854,59 @@ pub extern "C" fn r4os_rust_heap_alloc(requested: usize, alignment: usize) -> *m
 /// allocation (or a still-mapped invalid/free diagnostic pointer).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_heap_free(pointer: *mut u8, len: usize) -> u8 {
-    let Some(_guard) = HeapGuard::enter() else {
+    let Some(mut guard) = HeapGuard::enter() else {
         return 1;
     };
-    let result = control(|control| free_locked(control, pointer, len));
-    if result == 0 {
-        release_tail();
+    let value = match control(|control| validate_free(control, pointer, len)) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let retiring = if release::can_unlock(&guard, value.size) {
+        control(|control| {
+            release::prepare(control, value.offset, value.size, Some(value.requested))
+        })
+    } else {
+        None
+    };
+    if let Some(retiring) = retiring {
+        release::finish(retiring, &mut guard);
+    } else {
+        control(|control| {
+            control.active_blocks -= 1;
+            control.used_bytes -= value.requested;
+            control.release_block(value.offset, value.size);
+        });
     }
-    result
+    release_tail(&mut guard);
+    0
 }
-fn free_locked(control: &mut Control, pointer: *mut u8, len: usize) -> u8 {
+fn validate_free(control: &mut Control, pointer: *mut u8, len: usize) -> Result<Validation, u8> {
     if !INITIALIZED.load(Ordering::Acquire) || len == 0 {
         control.invalid_free_errors += 1;
-        return 1;
+        return Err(1);
     }
     let Some(value) = control.validate(pointer, len) else {
         control.invalid_free_errors += 1;
-        return 1;
+        return Err(1);
     };
     match value.kind {
         1 => {
             control.double_free_errors += 1;
-            return 2;
+            return Err(2);
         }
         2 => {
             control.size_mismatch_errors += 1;
-            return 3;
+            return Err(3);
         }
         _ => {}
     }
+    Ok(value)
+}
+fn free_locked(control: &mut Control, pointer: *mut u8, len: usize) -> u8 {
+    let value = match validate_free(control, pointer, len) {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
     control.active_blocks -= 1;
     control.used_bytes -= value.requested;
     control.release_block(value.offset, value.size);
@@ -925,7 +935,7 @@ pub(super) unsafe fn rust_deallocate_probe(pointer: *mut u8, len: usize, alignme
 /// The retained live allocation belongs exclusively to this diagnostic. Keep
 /// both frees before tail uncommit or another allocator user can reuse it.
 pub(super) unsafe fn duplicate_free_probe(pointer: *mut u8, len: usize) -> (bool, bool) {
-    let Some(_guard) = HeapGuard::enter() else {
+    let Some(mut guard) = HeapGuard::enter() else {
         return (false, false);
     };
     let (released, rejected) = control(|control| {
@@ -938,7 +948,7 @@ pub(super) unsafe fn duplicate_free_probe(pointer: *mut u8, len: usize) -> (bool
         (released, rejected)
     });
     if released {
-        release_tail();
+        release_tail(&mut guard);
     }
     (released, rejected)
 }
@@ -949,9 +959,11 @@ enum Resize {
     Trim,
 }
 fn resize(pointer: *mut u8, len: usize, new_size: usize, alignment: usize) -> Resize {
-    let Some(_guard) = HeapGuard::enter() else {
+    let Some(mut guard) = HeapGuard::enter() else {
         return Resize::Failed;
     };
+    let allow_unlocked = guard.can_drop();
+    let mut retiring = None;
     let result = control(|control| {
         let Some(value) = control.validate(pointer, len) else {
             control.invalid_free_errors += 1;
@@ -982,7 +994,12 @@ fn resize(pointer: *mut u8, len: usize, new_size: usize, alignment: usize) -> Re
             let trim = size - need >= MIN_BLOCK;
             if trim {
                 write_used(offset, need, new_size);
-                control.release_block(offset + need, size - need);
+                if allow_unlocked && size - need >= PAGE {
+                    retiring = release::prepare(control, offset + need, size - need, None);
+                }
+                if retiring.is_none() {
+                    control.release_block(offset + need, size - need);
+                }
             } else {
                 write_used(offset, size, new_size);
             }
@@ -1010,8 +1027,11 @@ fn resize(pointer: *mut u8, len: usize, new_size: usize, alignment: usize) -> Re
         }
         Resize::Copy
     });
+    if let Some(retiring) = retiring {
+        release::finish(retiring, &mut guard);
+    }
     if matches!(result, Resize::Trim) {
-        release_tail();
+        release_tail(&mut guard);
     }
     result
 }
