@@ -134,6 +134,12 @@ pub(super) unsafe fn remember_extent(
         for i in 0..s::EXTENTS {
             let e = s::extent(i).read();
             if matches(e, v, file) && e.cluster_index == index {
+                // A pure overwrite may learn a single position inside a
+                // wider, still valid chain mapping. Retain that coverage.
+                if e.cluster == cluster && e.count >= count {
+                    (*s::extent(i)).last_use = s::next_clock();
+                    return;
+                }
                 target = Some(i);
                 break;
             }
@@ -441,13 +447,13 @@ pub(super) unsafe fn copy_clusters(src: Volume, dst: Volume, e: Entry, dest: u32
 }
 #[inline(never)]
 pub(super) unsafe fn write_from(v: Volume, start: u32, in_cluster: usize, data: Bytes) -> bool {
-    unsafe { write_spans(v, start, in_cluster, data) }
+    unsafe { write_spans(v, start, in_cluster, data).is_some() }
 }
-unsafe fn write_spans(v: Volume, start: u32, offset: usize, data: Bytes) -> bool {
+unsafe fn write_spans(v: Volume, start: u32, offset: usize, data: Bytes) -> Option<u32> {
     unsafe {
         let size = v.cluster_bytes() as usize;
         if offset >= size {
-            return false;
+            return None;
         }
         let mut cluster = start;
         let mut inside = offset;
@@ -475,7 +481,7 @@ unsafe fn write_spans(v: Volume, start: u32, offset: usize, data: Bytes) -> bool
                             u16::try_from(full).expect("write sectors"),
                             data.sub(written, bytes),
                         ) {
-                            return false;
+                            return None;
                         }
                         written += bytes;
                         si += u8::try_from(full).expect("write sectors");
@@ -486,15 +492,15 @@ unsafe fn write_spans(v: Volume, start: u32, offset: usize, data: Bytes) -> bool
                 let count = (SECTOR - so).min(data.len - written);
                 if so == 0 && count == SECTOR {
                     if !s::write(v, u64::from(lba), 1, data.sub(written, SECTOR)) {
-                        return false;
+                        return None;
                     }
                 } else {
                     if !s::read(v.device_index, u64::from(lba), 1, Buffer::of(&mut sector)) {
-                        return false;
+                        return None;
                     }
                     data.sub(written, count).copy(sector.as_mut_ptr().add(so));
                     if !s::write(v, u64::from(lba), 1, Bytes::of(&sector)) {
-                        return false;
+                        return None;
                     }
                 }
                 written += count;
@@ -503,17 +509,32 @@ unsafe fn write_spans(v: Volume, start: u32, offset: usize, data: Bytes) -> bool
                 s::cooperate(&mut steps);
             }
             if written >= data.len {
-                return true;
+                return Some(cluster);
             }
-            let Some(next) = s::fat_entry(v, cluster) else {
-                return false;
-            };
+            let next = s::fat_entry(v, cluster)?;
             cluster = next;
             STATS.cluster_walk_steps.fetch_add(1, Relaxed);
             inside = 0;
             guard += 1;
         }
-        written >= data.len
+        (written >= data.len).then_some(cluster)
+    }
+}
+/// Only copied cache values survive I/O; mutation admission keeps this exact
+/// file chain stable. Extents may cover the target or a known preceding point.
+unsafe fn write_start(v: Volume, e: Entry, target: usize) -> Option<u32> {
+    unsafe {
+        let cursor = cached(v, e, target).unwrap_or(ReadCursor {
+            index: 0,
+            cluster: e.first_cluster,
+            remaining: 1,
+        });
+        let distance = target.checked_sub(cursor.index)?;
+        let contiguous = distance.min(cursor.remaining.saturating_sub(1));
+        let cluster = cursor
+            .cluster
+            .checked_add(u32::try_from(contiguous).ok()?)?;
+        chain::nth(v, cluster, distance - contiguous)
     }
 }
 #[inline(never)]
@@ -528,14 +549,23 @@ pub(super) unsafe fn write_range(v: Volume, e: Entry, offset: usize, data: Bytes
             op.ok = true;
             return Some(0);
         }
-        s::invalidate_extents();
         if data.len > e.size as usize - offset || e.first_cluster < 2 {
             return None;
         }
         let size = v.cluster_bytes() as usize;
-        let first = chain::nth(v, e.first_cluster, offset / size)?;
-        if !write_spans(v, first, offset % size, data) || !s::flush_mutation(v) {
+        let first = write_start(v, e, offset / size)?;
+        let last = write_spans(v, first, offset % size, data)?;
+        if !s::flush_mutation(v) {
             return None;
+        }
+        // Pure overwrites do not alter the chain. Commit only known positions
+        // after the original mutation/flush acknowledgement: start for repeat
+        // writes and end for a following adjacent write, including fragments.
+        let first_index = offset / size;
+        let last_index = (offset + data.len - 1) / size;
+        remember_extent(v, e, first_index, first, 1);
+        if last_index != first_index {
+            remember_extent(v, e, last_index, last, 1);
         }
         STATS.file_write_ranges.fetch_add(1, Relaxed);
         STATS.file_write_bytes.fetch_add(data.len as u64, Relaxed);
