@@ -20,8 +20,6 @@ pub type PollHook = unsafe extern "C" fn();
 struct State {
     queue: cp::Queue,
     physical: physical::Queue,
-    shift_down: bool,
-    ctrl_down: bool,
     alt_down: bool,
     altgr_down: bool,
     modifier_stale_resets: u64,
@@ -41,8 +39,6 @@ unsafe impl Sync for Storage {}
 static CURRENT: Storage = Storage(UnsafeCell::new(State {
     queue: cp::Queue::EMPTY,
     physical: physical::Queue::EMPTY,
-    shift_down: false,
-    ctrl_down: false,
     alt_down: false,
     altgr_down: false,
     modifier_stale_resets: 0,
@@ -97,15 +93,19 @@ pub fn generation() -> u64 {
     unsafe { sync_objects::queue_read_sequence(ACTIVITY.queue.get(), ACTIVITY.sequence.get()) }
 }
 impl State {
+    fn shift_down(&self) -> bool {
+        self.physical.held[0xe1] || self.physical.held[0xe5]
+    }
+    fn ctrl_down(&self) -> bool {
+        self.physical.held[0xe0] || self.physical.held[0xe4]
+    }
     fn modifiers(&self) -> u8 {
-        u8::from(self.shift_down)
-            | (u8::from(self.ctrl_down) << 1)
+        u8::from(self.shift_down())
+            | (u8::from(self.ctrl_down()) << 1)
             | (u8::from(self.alt_down) << 2)
             | (u8::from(self.altgr_down) << 3)
     }
     fn reset_modifiers(&mut self) {
-        self.shift_down = false;
-        self.ctrl_down = false;
         self.alt_down = false;
         self.altgr_down = false;
         self.extended = false;
@@ -149,14 +149,7 @@ impl State {
                     self.altgr_down = false;
                     return w;
                 }
-                0x1d => {
-                    self.ctrl_down = true;
-                    return w;
-                }
-                0x9d => {
-                    self.ctrl_down = false;
-                    return w;
-                }
+                0x1d | 0x9d => return w,
                 _ => {}
             }
             if scan & 0x80 != 0 {
@@ -181,22 +174,7 @@ impl State {
             return w;
         }
         match scan {
-            0x2a | 0x36 => {
-                self.shift_down = true;
-                return w;
-            }
-            0xaa | 0xb6 => {
-                self.shift_down = false;
-                return w;
-            }
-            0x1d => {
-                self.ctrl_down = true;
-                return w;
-            }
-            0x9d => {
-                self.ctrl_down = false;
-                return w;
-            }
+            0x2a | 0x36 | 0xaa | 0xb6 | 0x1d | 0x9d => return w,
             0x38 => {
                 self.alt_down = true;
                 return w;
@@ -210,15 +188,15 @@ impl State {
         if scan & 0x80 != 0 {
             return w;
         }
-        let special = if scan == 0x01 && self.ctrl_down {
+        let special = if scan == 0x01 && self.ctrl_down() {
             Some(0x83)
         } else if scan == 0x3d {
             Some(0x82)
         } else if scan == 0x0f && self.alt_down {
-            Some(if self.shift_down { 0x87 } else { 0x85 })
+            Some(if self.shift_down() { 0x87 } else { 0x85 })
         } else if scan == 0x3e && self.alt_down {
             Some(0x86)
-        } else if scan == 0x0f && self.shift_down {
+        } else if scan == 0x0f && self.shift_down() {
             Some(0x84)
         } else {
             None
@@ -227,13 +205,13 @@ impl State {
             self.push(ch, &mut w);
             return w;
         }
-        if self.ctrl_down
+        if self.ctrl_down()
             && let Some(ch) = key_layout::ctrl_char(self.layout, scan)
         {
             self.push(u32::from(ch), &mut w);
             return w;
         }
-        let mapped = key_layout::translate(self.layout, scan, self.shift_down, self.altgr_down);
+        let mapped = key_layout::translate(self.layout, scan, self.shift_down(), self.altgr_down);
         if mapped.has_character() {
             self.push(mapped.codepoint, &mut w)
         } else if mapped.ascii != 0 {
