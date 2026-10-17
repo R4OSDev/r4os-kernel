@@ -221,8 +221,14 @@ pub(super) fn retransmit(id: u32, kind: SegmentKind, reason: &[u8]) -> u8 {
     result
 }
 fn wait_established(id: u32, deadline: u64) -> bool {
+    let Some(target) = tcp_wait::Target::connection(id, tcp_wait::Need::Established) else {
+        return false;
+    };
     poll();
     loop {
+        if !target.current() {
+            return false;
+        }
         if established(id) {
             return true;
         }
@@ -233,13 +239,21 @@ fn wait_established(id: u32, deadline: u64) -> bool {
         if now >= deadline {
             return established(id);
         }
-        tcp_wait::r4os_rust_net_tcp_wait_established(id, SLICE.min(deadline - now));
+        if !target.wait(SLICE.min(deadline - now)) {
+            return false;
+        }
     }
 }
 unsafe fn wait_read(id: u32, out: *mut u8, len: usize, ticks: u64) -> Option<i32> {
+    let Some(target) = tcp_wait::Target::connection(id, tcp_wait::Need::Readable) else {
+        return Some(-1);
+    };
     poll();
     let deadline = timing::Deadline::start(ticks, 1);
     loop {
+        if !target.current() {
+            return Some(-1);
+        }
         let got = unsafe { tcp::r4os_rust_net_tcp_read(id, out, len) };
         if got > 0 {
             window_update(id);
@@ -251,7 +265,9 @@ unsafe fn wait_read(id: u32, out: *mut u8, len: usize, ticks: u64) -> Option<i32
         if deadline.expired_now() {
             return None;
         }
-        tcp_wait::r4os_rust_net_tcp_wait_readable(id, SLICE);
+        if !target.wait(SLICE) {
+            return Some(-1);
+        }
     }
 }
 fn window_update(id: u32) {
@@ -392,34 +408,8 @@ unsafe fn read(id: u32, out: *mut u8, len: usize, available: bool) -> i32 {
     timeout(b"read-timeout");
     0
 }
-fn data_on_port(port: u16) -> Option<u32> {
-    let mut id = 0;
-    if unsafe { tcp::r4os_rust_net_tcp_connection_with_data_on_port(port, &mut id) } {
-        Some(id)
-    } else {
-        None
-    }
-}
-fn connection_on_port(port: u16) -> Option<u32> {
-    let mut id = 0;
-    if unsafe { tcp::r4os_rust_net_tcp_connection_on_port(port, &mut id) } {
-        Some(id)
-    } else {
-        None
-    }
-}
 fn has_listener(port: u16) -> bool {
     unsafe { tcp::r4os_rust_net_tcp_has_listener(port) }
-}
-fn close_listener(port: u16) {
-    unsafe {
-        tcp::r4os_rust_net_tcp_close_listener(port);
-    }
-}
-fn abort_port(port: u16) {
-    unsafe {
-        tcp::r4os_rust_net_tcp_abort_connections_on_port(port, b"listen-timeout".as_ptr(), 14);
-    }
 }
 fn claim(id: u32) {
     unsafe {
@@ -459,10 +449,21 @@ unsafe fn accept_read(
     } else if !unsafe { tcp::r4os_rust_net_tcp_listen(port) } {
         return BAD_STATE;
     }
+    let Some(target) = tcp_wait::Target::listener(port, tcp_wait::Need::PortData) else {
+        return BAD_STATE;
+    };
+    let listener = target.listener_identity();
     let deadline = timing::Deadline::start(timing::DEFAULT_TCP_LISTEN_TIMEOUT_TICKS, 0);
     loop {
         poll();
-        if let Some(id) = data_on_port(port) {
+        let next = match tcp::query_listener(listener, true) {
+            Ok(value) => value,
+            Err(()) => {
+                error(b"listen-closed");
+                return BAD_STATE;
+            }
+        };
+        if let Some(id) = next {
             let got = unsafe { tcp::r4os_rust_net_tcp_read(id, out, len) };
             if got > 0 {
                 if mode != ReadAccept::EchoOnce {
@@ -479,7 +480,7 @@ unsafe fn accept_read(
                     close(id);
                 }
                 if mode != ReadAccept::ReadOnListener {
-                    close_listener(port);
+                    tcp::finish_listener(listener, false);
                 }
                 return got;
             }
@@ -487,13 +488,15 @@ unsafe fn accept_read(
         if deadline.expired_now() {
             break;
         }
-        tcp_wait::r4os_rust_net_tcp_wait_port_data(port, SLICE);
+        if !target.wait(SLICE) {
+            error(b"listen-closed");
+            return BAD_STATE;
+        }
     }
     if mode == ReadAccept::ReadOnListener {
         timeout(b"accept-timeout");
     } else {
-        close_listener(port);
-        abort_port(port);
+        tcp::finish_listener(listener, true);
         timeout(b"listen-timeout");
     }
     0
@@ -526,10 +529,21 @@ unsafe fn accept(port: u16, id_out: *mut u32, polling: bool) -> i32 {
             return BAD_STATE;
         }
     }
+    let Some(target) = tcp_wait::Target::listener(port, tcp_wait::Need::PortConnection) else {
+        return BAD_STATE;
+    };
+    let listener = target.listener_identity();
     let deadline = timing::Deadline::start(timing::DEFAULT_TCP_LISTEN_TIMEOUT_TICKS, 0);
     loop {
         poll();
-        if let Some(id) = connection_on_port(port) {
+        let next = match tcp::query_listener(listener, false) {
+            Ok(value) => value,
+            Err(()) => {
+                error(b"listen-closed");
+                return BAD_STATE;
+            }
+        };
+        if let Some(id) = next {
             unsafe {
                 id_out.write(id);
             }
@@ -545,7 +559,10 @@ unsafe fn accept(port: u16, id_out: *mut u32, polling: bool) -> i32 {
             timeout(b"accept-timeout");
             return 0;
         }
-        tcp_wait::r4os_rust_net_tcp_wait_port_connection(port, SLICE);
+        if !target.wait(SLICE) {
+            error(b"listen-closed");
+            return BAD_STATE;
+        }
     }
 }
 fn drive_close(id: u32) -> bool {

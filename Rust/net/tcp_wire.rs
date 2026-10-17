@@ -3,7 +3,7 @@
 //! stays in the same frame through native TCP operations and any send/wait.
 use super::{
     ipv4, protocol_runtime, r4p_contract as wire, readers, tcp, tcp_client, tcp_rto,
-    tcp_runtime::ConnectionIdentity, tcp_wait, timing,
+    tcp_runtime::ConnectionIdentity, timing,
 };
 use crate::sched::sync_types::Text;
 use core::mem::MaybeUninit;
@@ -164,7 +164,6 @@ pub(super) unsafe fn rx(packet: NativeIpView, checksum: bool) {
             tcp_rto::r4os_rust_tcp_rto_release(&identity);
         }
     }
-    tcp_wait::r4os_rust_net_tcp_activity_signal();
 }
 pub(super) unsafe fn tx(packet: NativeIpView) {
     let Some(op) = (unsafe { decode(packet, true, false) }) else {

@@ -594,7 +594,7 @@ fn log_rx() {
     foundation::puts(b" acc=");
     dec(t.accepts);
     foundation::puts(b" tcp_sig=");
-    dec(tcp_wait::r4os_rust_net_tcp_activity_count());
+    dec(tcp_wait::activity_count());
     foundation::puts(b" rto_srtt=");
     dec(rto_status.last_ticks);
     foundation::puts(b"/");

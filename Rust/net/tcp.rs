@@ -270,6 +270,7 @@ pub struct Connection {
     pub used: bool,
     pub id: u32,
     pub generation: u32,
+    pub listener_generation: u64,
     pub state: State,
     pub local_port: u16,
     pub remote_port: u16,
@@ -312,6 +313,7 @@ impl Connection {
         used: false,
         id: 0,
         generation: 0,
+        listener_generation: 0,
         state: State::Closed,
         local_port: 0,
         remote_port: 0,
@@ -371,11 +373,13 @@ impl OutOfOrderSegment {
 pub struct Listener {
     pub used: bool,
     pub port: u16,
+    pub generation: u64,
 }
 impl Listener {
     pub const EMPTY: Self = Self {
         used: false,
         port: 0,
+        generation: 0,
     };
 }
 struct Storage<T>(UnsafeCell<T>);
@@ -394,6 +398,8 @@ static LISTENERS: Storage<[Listener; MAX_LISTENERS]> =
     Storage(UnsafeCell::new([Listener::EMPTY; MAX_LISTENERS]));
 static NEXT_ID: Storage<u32> = Storage(UnsafeCell::new(1));
 static NEXT_PORT: Storage<u16> = Storage(UnsafeCell::new(49152));
+// Never reset on close/abort or a later TCP reset: a port is not a lifetime.
+static NEXT_LISTENER_GENERATION: Storage<u64> = Storage(UnsafeCell::new(1));
 fn stats() -> *mut Stats {
     STATS.0.get()
 }
@@ -512,6 +518,7 @@ unsafe fn reset_connection_slot(c: &mut Connection) {
     c.used = false;
     c.id = 0;
     c.generation = 0;
+    c.listener_generation = 0;
     c.state = State::Closed;
     c.local_port = 0;
     c.remote_port = 0;
@@ -668,7 +675,7 @@ pub(super) unsafe fn summary() -> Summary {
         }
     }
 }
-unsafe fn connection_info(index: u32) -> Option<ConnectionInfo> {
+pub(super) unsafe fn connection_info(index: u32) -> Option<ConnectionInfo> {
     if index as usize >= MAX_CONNECTIONS {
         return None;
     }
@@ -763,6 +770,61 @@ pub(super) unsafe fn has_listener(port: u16) -> bool {
         (0..MAX_LISTENERS).any(|slot| (*listener(slot)).used && (*listener(slot)).port == port)
     }
 }
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ListenerIdentity {
+    pub slot: usize,
+    pub port: u16,
+    pub generation: u64,
+}
+pub(super) unsafe fn listener_identity(port: u16) -> Option<ListenerIdentity> {
+    unsafe {
+        (0..MAX_LISTENERS).find_map(|slot| {
+            let l = &*listener(slot);
+            (l.used && l.port == port).then_some(ListenerIdentity {
+                slot,
+                port,
+                generation: l.generation,
+            })
+        })
+    }
+}
+pub(super) fn query_listener(identity: ListenerIdentity, data: bool) -> Result<Option<u32>, ()> {
+    let Some(_guard) = super::tcp_owner::Guard::acquire() else {
+        return Err(());
+    };
+    unsafe {
+        if listener_identity(identity.port) != Some(identity) {
+            return Err(());
+        }
+        Ok(if data {
+            connection_with_data_on_port(identity.port)
+        } else {
+            connection_on_port(identity.port)
+        })
+    }
+}
+pub(super) fn finish_listener(identity: ListenerIdentity, abort: bool) {
+    let Some(_guard) = super::tcp_owner::Guard::acquire() else {
+        return;
+    };
+    unsafe {
+        if listener_identity(identity.port) == Some(identity) {
+            close_listener(identity.port);
+        }
+        if abort {
+            for slot in 0..MAX_CONNECTIONS {
+                let c = &mut *connection(slot);
+                if c.used
+                    && c.local_port == identity.port
+                    && c.listener_generation == identity.generation
+                {
+                    reset_connection_slot(c);
+                    (*stats()).last_error = text(b"listen-timeout");
+                }
+            }
+        }
+    }
+}
 pub(super) unsafe fn listen(port: u16) -> bool {
     unsafe {
         if port == 0 {
@@ -776,7 +838,17 @@ pub(super) unsafe fn listen(port: u16) -> bool {
             if l.used {
                 continue;
             }
-            *l = Listener { used: true, port };
+            let generation = *NEXT_LISTENER_GENERATION.0.get();
+            if generation == 0 {
+                (*stats()).last_error = text(b"listen-generation");
+                return false;
+            }
+            *l = Listener {
+                used: true,
+                port,
+                generation,
+            };
+            *NEXT_LISTENER_GENERATION.0.get() = generation.checked_add(1).unwrap_or(0);
             (*stats()).last_error = text(b"listen");
             return true;
         }
@@ -798,12 +870,12 @@ pub(super) unsafe fn close_listener(port: u16) {
 }
 pub(super) unsafe fn accept_inbound(view: SegmentView, initial_seq: u32) -> Option<u32> {
     unsafe {
-        if !has_listener(view.dest_port) || view.flags & FLAG_SYN == 0 || view.flags & FLAG_ACK != 0
-        {
+        let listener = listener_identity(view.dest_port)?;
+        if view.flags & FLAG_SYN == 0 || view.flags & FLAG_ACK != 0 {
             return None;
         }
         if let Some(c) = match_connection(view) {
-            if (*c).state == State::SynReceived {
+            if (*c).state == State::SynReceived && (*c).listener_generation == listener.generation {
                 return Some((*c).id);
             }
             reset_connection_slot(&mut *c);
@@ -819,6 +891,7 @@ pub(super) unsafe fn accept_inbound(view: SegmentView, initial_seq: u32) -> Opti
         c.id = *NEXT_ID.0.get();
         c.generation = next_slot_generation(slot);
         c.state = State::SynReceived;
+        c.listener_generation = listener.generation;
         c.local_port = view.dest_port;
         c.remote_port = view.source_port;
         c.remote_ip = view.source_ip;
@@ -942,11 +1015,13 @@ pub(super) unsafe fn identity_active(identity: ConnectionIdentity) -> bool {
 }
 pub(super) unsafe fn connection_with_data_on_port(port: u16) -> Option<u32> {
     unsafe {
+        let listener = listener_identity(port)?;
         for slot in 0..MAX_CONNECTIONS {
             let c = &*connection(slot);
             if c.used
                 && c.state == State::Established
                 && c.local_port == port
+                && c.listener_generation == listener.generation
                 && !c.accepted_claimed
                 && c.rx_len != 0
             {
@@ -958,11 +1033,13 @@ pub(super) unsafe fn connection_with_data_on_port(port: u16) -> Option<u32> {
 }
 pub(super) unsafe fn connection_on_port(port: u16) -> Option<u32> {
     unsafe {
+        let listener = listener_identity(port)?;
         for slot in 0..MAX_CONNECTIONS {
             let c = &*connection(slot);
             if c.used
                 && c.state == State::Established
                 && c.local_port == port
+                && c.listener_generation == listener.generation
                 && !c.accepted_claimed
             {
                 return Some(c.id);
@@ -3311,10 +3388,13 @@ pub unsafe extern "C" fn r4os_rust_net_tcp_graceful_close_probe() -> bool {
 /// ownership and stable diagnostic-string lifetimes remain in force.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_net_tcp_performance_contract_probe() -> bool {
-    let Some(_guard) = super::tcp_owner::Guard::acquire() else {
-        return false;
+    let original = {
+        let Some(_guard) = super::tcp_owner::Guard::acquire() else {
+            return false;
+        };
+        unsafe { performance_contract_probe() }
     };
-    unsafe { performance_contract_probe() }
+    original && super::tcp_wait::check()
 }
 
 impl RetransmitPlan {
@@ -3420,5 +3500,36 @@ pub(super) unsafe fn wait_observation_word(slot: usize) -> u64 {
             }
         }
         u64::from(c.id) | (u64::from(c.local_port) << 32) | (flags << 48)
+    }
+}
+/// Non-owning projection only, under the exact TCP task owner. Native
+/// connection generation/ID and listener generation remain the authorities.
+pub(super) unsafe fn wait_observations(
+    connections: &mut [(u64, u64); MAX_CONNECTIONS],
+    listeners: &mut [(u64, u64); MAX_LISTENERS],
+) {
+    unsafe {
+        for (slot, out) in listeners.iter_mut().enumerate() {
+            let l = &*listener(slot);
+            *out = (if l.used { l.generation } else { 0 }, 0);
+        }
+        for (slot, out) in connections.iter_mut().enumerate() {
+            let c = &*connection(slot);
+            if !c.used || c.id == 0 || c.generation == 0 {
+                *out = (0, 0);
+                continue;
+            }
+            let flags = wait_observation_word(slot) >> 48;
+            *out = (u64::from(c.id) | (u64::from(c.generation) << 32), flags);
+            if flags & 8 == 0 || c.listener_generation == 0 {
+                continue;
+            }
+            for (index, observed) in listeners.iter_mut().enumerate() {
+                if observed.0 == c.listener_generation && (*listener(index)).port == c.local_port {
+                    observed.1 |= flags & 24;
+                    break;
+                }
+            }
+        }
     }
 }
