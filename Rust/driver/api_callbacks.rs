@@ -63,11 +63,13 @@ pub(super) unsafe extern "C" fn driver_release_irq(irq: u8) -> i32 {
     crate::driver::api_entry::r4os_rust_driver_irq_legacy(true)
 }
 
-pub(super) unsafe extern "C" fn driver_register_audio_backend(
-    name: *const u8,
-    backend: *const core::ffi::c_void,
+/// Reserved legacy audio/synth slots retain their exact ABI. Rejection reads
+/// no caller bytes and acquires no owner, registry, callback or allocation.
+pub(super) unsafe extern "C" fn driver_register_retired_backend(
+    _: *const u8,
+    _: *const core::ffi::c_void,
 ) -> i32 {
-    unsafe { crate::audio::core::register_audio_backend_z(name, backend) }
+    -1
 }
 
 pub(super) unsafe extern "C" fn driver_register_storage_backend(
@@ -83,13 +85,6 @@ pub(super) unsafe extern "C" fn driver_register_input_backend(
 ) -> i32 {
     let _ = backend;
     unsafe { crate::driver::api_entry::r4os_rust_driver_input(name) }
-}
-
-pub(super) unsafe extern "C" fn driver_register_synth_engine(
-    name: *const u8,
-    engine: *const core::ffi::c_void,
-) -> i32 {
-    unsafe { crate::audio::core::register_synth_engine_z(name, engine) }
 }
 
 pub(super) unsafe extern "C" fn driver_register_mixer_backend(
@@ -294,10 +289,10 @@ pub(super) fn template() -> DriverApi {
         request_irq: super::api_callbacks::driver_request_irq,
         release_irq: super::api_callbacks::driver_release_irq,
         get_option: crate::driver::api_options::r4os_rust_driver_option,
-        register_audio_backend: super::api_callbacks::driver_register_audio_backend,
+        register_audio_backend: super::api_callbacks::driver_register_retired_backend,
         register_storage_backend: super::api_callbacks::driver_register_storage_backend,
         register_input_backend: super::api_callbacks::driver_register_input_backend,
-        register_synth_engine: super::api_callbacks::driver_register_synth_engine,
+        register_synth_engine: super::api_callbacks::driver_register_retired_backend,
         register_mixer_backend: super::api_callbacks::driver_register_mixer_backend,
         register_net_backend: super::api_callbacks::driver_register_net_backend,
         alloc_dma_region: super::api_callbacks::driver_alloc_dma_region,

@@ -239,7 +239,6 @@ pub type SynthSidRenderPcmCtxFn = unsafe extern "C" fn(*mut c_void, u32, *mut u8
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct BackendRegistration {
-    pub pointer: *const c_void,
     pub context: *mut c_void,
     pub write: Option<WritePcmCtxFn>,
     pub stop: Option<StopPcmCtxFn>,
@@ -251,7 +250,6 @@ pub struct BackendRegistration {
 #[derive(Clone, Copy, Default)]
 pub struct SynthRegistration {
     pub flags: u32,
-    pub pointer: *const c_void,
     pub context: *mut c_void,
     pub send: Option<SynthMidiSendCtxFn>,
     pub render: Option<SynthRenderCtxFn>,
@@ -269,7 +267,6 @@ pub struct SynthRegistration {
     pub sid_play: Option<SynthSidPlayFrameCtxFn>,
     pub sid_pcm: Option<SynthSidRenderPcmCtxFn>,
     pub external: bool,
-    pub migration: bool,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -364,7 +361,6 @@ impl AudioBackend {
         name: [0; 32],
         name_len: 0,
         config: BackendRegistration {
-            pointer: ptr::null(),
             context: ptr::null_mut(),
             write: None,
             stop: None,
@@ -399,7 +395,6 @@ impl SynthEngine {
         name_len: 0,
         config: SynthRegistration {
             flags: 0,
-            pointer: ptr::null(),
             context: ptr::null_mut(),
             send: None,
             render: None,
@@ -417,7 +412,6 @@ impl SynthEngine {
             sid_play: None,
             sid_pcm: None,
             external: false,
-            migration: false,
         },
         pcm_pending: [0; 4096],
         pcm_pending_len: 0,
@@ -427,8 +421,8 @@ impl SynthEngine {
     };
 }
 const _: () = {
-    assert!(size_of::<BackendRegistration>() == 64);
-    assert!(size_of::<SynthRegistration>() == 152);
+    assert!(size_of::<BackendRegistration>() == 56);
+    assert!(size_of::<SynthRegistration>() == 144);
 };
 
 const _: () = {

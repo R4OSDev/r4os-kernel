@@ -153,7 +153,6 @@ pub unsafe extern "C" fn r4os_rust_driver_audio_register(
                     max_rate: (*descriptor).max_rate,
                     max_channels: (*descriptor).max_channels,
                 },
-                ..Default::default()
             },
         )
     };

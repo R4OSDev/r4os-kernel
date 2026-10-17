@@ -216,7 +216,6 @@ pub unsafe extern "C" fn r4os_rust_driver_synth(name: *const u8, d: *const a::Sy
                 sid_pcm: ptr::addr_of!((*d).sid_render_pcm).read(),
                 render_pcm: validation::r4os_rust_driver_synth_pcm(d),
                 external: true,
-                ..Default::default()
             },
         )
     }

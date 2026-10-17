@@ -1394,25 +1394,6 @@ unsafe fn flush_pending_synth_pcm(p: *mut SynthEngine) -> i32 {
         result
     }
 }
-pub(crate) unsafe fn register_audio_backend_z(name: *const u8, pointer: *const c_void) -> i32 {
-    unsafe {
-        let mut buf = [0; MAX_NAME];
-        let Some(name) = copy_z(name, &mut buf) else {
-            return -1;
-        };
-        if register_audio_backend_internal(
-            name,
-            BackendRegistration {
-                pointer,
-                ..Default::default()
-            },
-        ) {
-            0
-        } else {
-            -2
-        }
-    }
-}
 pub(crate) unsafe fn register_mixer_backend_z(name: *const u8, pointer: *const c_void) -> i32 {
     unsafe {
         let mut buf = [0; MAX_NAME];
@@ -1426,20 +1407,6 @@ pub(crate) unsafe fn register_mixer_backend_z(name: *const u8, pointer: *const c
         0
     }
 }
-pub(crate) unsafe fn register_synth_engine_z(name: *const u8, pointer: *const c_void) -> i32 {
-    unsafe {
-        let mut buf = [0; MAX_NAME];
-        let Some(name) = copy_z(name, &mut buf) else {
-            return -1;
-        };
-        if register_synth_engine(name, pointer) {
-            0
-        } else {
-            -2
-        }
-    }
-}
-
 pub(crate) unsafe fn register_external_audio_backend_z(
     name: *const u8,
     config: BackendRegistration,
@@ -1719,19 +1686,6 @@ pub(crate) unsafe fn unregister_audio_backend_z(name: *const u8) -> i32 {
         unregister_audio_backend_by_name(name)
     }
 }
-pub(crate) unsafe fn register_synth_engine(name: &[u8], pointer: *const c_void) -> bool {
-    unsafe {
-        register_synth_internal(
-            name,
-            SynthRegistration {
-                pointer,
-                migration: name_eq(name, b"SID"),
-                ..Default::default()
-            },
-        )
-    }
-}
-
 unsafe fn register_synth_internal(name: &[u8], config: SynthRegistration) -> bool {
     unsafe {
         let Some(slot) = find_synth(name).or_else(|| free_synth_slot()) else {
@@ -1759,13 +1713,7 @@ unsafe fn register_synth_internal(name: &[u8], config: SynthRegistration) -> boo
         }
         boot(b"[AUDIO] synth engine registered ");
         boot(slice::from_raw_parts(ptr::addr_of!((*p).name).cast(), len));
-        boot(if config.external {
-            b" external"
-        } else if config.migration {
-            b" migration"
-        } else {
-            b" generic"
-        });
+        boot(b" external");
         boot(b" [OK]\r\n");
         true
     }
@@ -1907,11 +1855,7 @@ unsafe fn register_audio_backend_internal(name: &[u8], config: BackendRegistrati
         }
         boot(b"[AUDIO] audio backend registered ");
         boot(slice::from_raw_parts(ptr::addr_of!((*p).name).cast(), len));
-        boot(if config.write.is_some() {
-            b" r4d"
-        } else {
-            b" generic"
-        });
+        boot(b" r4d");
         boot(b" [OK]\r\n");
         if was_active || (g!(active_audio_slot).is_none() && (config.write.is_some())) {
             set_active_backend(slot);
