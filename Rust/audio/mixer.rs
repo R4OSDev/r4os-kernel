@@ -1,5 +1,30 @@
 //! Original S16 ring and saturating fixed-point mixer, unchanged budgets.
 use core::{ptr, slice};
+/// Canonical productive stream capacity; wider private facade inputs retain
+/// the original generic path rather than introducing an artificial limit.
+pub(crate) const MAX_SOURCES: usize = 8;
+
+#[derive(Clone, Copy)]
+struct Cursor(Source);
+impl Cursor {
+    const EMPTY: Self = Self(Source::EMPTY);
+    fn new(mut source: Source) -> Self {
+        if source.len >= 2 && source.read_pos >= source.len {
+            source.read_pos %= source.len;
+        }
+        Self(source)
+    }
+    unsafe fn sample(&mut self) -> i16 {
+        let source = &mut self.0;
+        if source.len < 2 {
+            return 0;
+        }
+        let low = source.read_pos;
+        let high = if low + 1 == source.len { 0 } else { low + 1 };
+        source.read_pos = if high + 1 == source.len { 0 } else { high + 1 };
+        unsafe { i16::from_le_bytes([source.ring.add(low).read(), source.ring.add(high).read()]) }
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Work {
@@ -61,6 +86,25 @@ unsafe fn mix_indexed(
             output[first..].copy_from_slice(&ring[..len - first]);
             if !work.is_null() {
                 (*work).direct_bytes += len as u64;
+            }
+            return;
+        }
+        if count <= MAX_SOURCES {
+            // Read reservations keep each source stable for this complete
+            // call. Only local copied positions advance; actual consumption
+            // remains with the original backend acknowledgement owner.
+            let mut cursors = [Cursor::EMPTY; MAX_SOURCES];
+            for (i, cursor) in cursors[..count].iter_mut().enumerate() {
+                *cursor = Cursor::new(source_at(i));
+            }
+            let mut byte_offset = 0;
+            while byte_offset < output.len() {
+                let mut total = 0;
+                for cursor in &mut cursors[..count] {
+                    total = accumulate_sample(total, cursor.sample(), cursor.0.volume, work);
+                }
+                write_s16(output, byte_offset, clamp_sample(total), work);
+                byte_offset += 2;
             }
             return;
         }
