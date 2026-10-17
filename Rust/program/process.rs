@@ -477,22 +477,22 @@ pub unsafe extern "C" fn r4os_rust_program_process_reap(
         completions::r4os_rust_program_completion_access(2, *input, out)
     }
 }
+/// Read the executing pinned instance's cooperative close flag.
+pub(crate) fn should_close() -> bool {
+    unsafe {
+        let instance = super::context::current();
+        !instance.is_null()
+            && AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).close_requested))
+                .load(Ordering::Acquire)
+    }
+}
 /// # Safety
-/// Original legacy value API; history cannot resurrect an already consumed ID.
-/// Op3 uses the original current-instance admission before the atomic flag read.
+/// Original legacy value/output contracts; current execution remains pinned.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_process_legacy(op: u8, id: u32) -> i32 {
     unsafe {
         if op == 3 {
-            let instance = super::context::current();
-            return if instance.is_null() {
-                0
-            } else {
-                i32::from(
-                    AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).close_requested))
-                        .load(Ordering::Acquire),
-                )
-            };
+            return i32::from(should_close());
         }
         let mut h = Handle::default();
         if r4os_rust_program_process_open(id, &mut h) != 0 {

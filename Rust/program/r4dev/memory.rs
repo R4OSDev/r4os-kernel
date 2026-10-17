@@ -1,4 +1,4 @@
-//! Existing passive memory observations and explicitly requested reclaim.
+//! Passive memory observations, explicit reclaim and owned heap checks.
 //! Owner snapshots are copied; block names never escape a released catalog.
 use super::snapshot;
 use crate::{
@@ -8,6 +8,35 @@ use crate::{
     program::context,
 };
 use core::{mem, mem::MaybeUninit};
+/// # Safety
+/// Caller retains a resident exclusive v1 header and its advertised output
+/// capacity. The exact task unwind token survives every wait and publication.
+pub unsafe extern "C" fn kernel_heap_check(out: *mut c::ProgramKernelHeapCheck) -> i32 {
+    use crate::memory::heap_check;
+    if out.is_null()
+        || unsafe { (*out).version } != c::kernel_heap_check_version
+        || unsafe { (*out).size } < mem::size_of::<c::ProgramKernelHeapCheck>() as u32
+    {
+        return -1;
+    }
+    let Some(admission) = heap_check::Admission::acquire(true) else {
+        unsafe {
+            out.write(c::ProgramKernelHeapCheck::default());
+        }
+        return 0;
+    };
+    let report = heap_check::run(
+        &admission,
+        c::kernel_heap_check_case_rust_allocator,
+        c::kernel_heap_check_case_resident_commit,
+        crate::program::process::should_close,
+    );
+    unsafe {
+        out.write(report);
+    }
+    i32::from(report.status != c::kernel_heap_check_status_unavailable)
+}
+
 /// # Safety
 /// Caller owns one resident canonical memory-summary output until return.
 #[unsafe(no_mangle)]

@@ -3,6 +3,7 @@ pub mod backing_types;
 pub mod blocks;
 pub mod boot;
 pub mod heap;
+pub(crate) mod heap_check;
 pub mod heap_policy;
 pub mod layout;
 pub mod map;

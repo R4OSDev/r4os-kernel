@@ -217,6 +217,10 @@ impl Control {
                 let previous_size = block_size(previous);
                 let previous_offset = offset - previous_size;
                 self.unlink_free(previous_offset, previous_size);
+                // This formerly used header becomes interior free payload.
+                // Do not leave a plausible used header/footer pair behind.
+                write(offset, 0);
+                write(offset + 8, 0);
                 offset = previous_offset;
                 size += previous_size;
             }
@@ -867,35 +871,76 @@ pub unsafe extern "C" fn r4os_rust_heap_free(pointer: *mut u8, len: usize) -> u8
     let Some(_guard) = HeapGuard::enter() else {
         return 1;
     };
-    let result = control(|control| {
-        if !INITIALIZED.load(Ordering::Acquire) || len == 0 {
-            control.invalid_free_errors += 1;
-            return 1;
-        }
-        let Some(value) = control.validate(pointer, len) else {
-            control.invalid_free_errors += 1;
-            return 1;
-        };
-        match value.kind {
-            1 => {
-                control.double_free_errors += 1;
-                return 2;
-            }
-            2 => {
-                control.size_mismatch_errors += 1;
-                return 3;
-            }
-            _ => {}
-        }
-        control.active_blocks -= 1;
-        control.used_bytes -= value.requested;
-        control.release_block(value.offset, value.size);
-        0
-    });
+    let result = control(|control| free_locked(control, pointer, len));
     if result == 0 {
         release_tail();
     }
     result
+}
+fn free_locked(control: &mut Control, pointer: *mut u8, len: usize) -> u8 {
+    if !INITIALIZED.load(Ordering::Acquire) || len == 0 {
+        control.invalid_free_errors += 1;
+        return 1;
+    }
+    let Some(value) = control.validate(pointer, len) else {
+        control.invalid_free_errors += 1;
+        return 1;
+    };
+    match value.kind {
+        1 => {
+            control.double_free_errors += 1;
+            return 2;
+        }
+        2 => {
+            control.size_mismatch_errors += 1;
+            return 3;
+        }
+        _ => {}
+    }
+    control.active_blocks -= 1;
+    control.used_bytes -= value.requested;
+    control.release_block(value.offset, value.size);
+    0
+}
+/// Retain the allocator owner across rustc's void dealloc and the exact
+/// resulting block state. No foreign allocation can reuse this address.
+pub(super) unsafe fn rust_deallocate_probe(pointer: *mut u8, len: usize, alignment: usize) -> bool {
+    let _owner = super::owner::Guard::acquire(4);
+    if !control(|state| state.validate(pointer, len).is_some_and(|v| v.kind == 0)) {
+        return false;
+    }
+    let Ok(layout) = core::alloc::Layout::from_size_align(len, alignment) else {
+        return false;
+    };
+    unsafe {
+        crate::alloc::alloc::dealloc(pointer, layout);
+    }
+    control(|state| {
+        pointer.addr() as u64 >= BASE + state.heap_top as u64
+            || state
+                .classify((pointer.addr() as u64 - BASE) as usize - HEADER)
+                .is_some_and(|v| v.kind == 1)
+    })
+}
+/// The retained live allocation belongs exclusively to this diagnostic. Keep
+/// both frees before tail uncommit or another allocator user can reuse it.
+pub(super) unsafe fn duplicate_free_probe(pointer: *mut u8, len: usize) -> (bool, bool) {
+    let Some(_guard) = HeapGuard::enter() else {
+        return (false, false);
+    };
+    let (released, rejected) = control(|control| {
+        let before = control.double_free_errors;
+        let released = free_locked(control, pointer, len) == 0;
+        let rejected = released
+            && before != u64::MAX
+            && free_locked(control, pointer, len) == 2
+            && before.checked_add(1) == Some(control.double_free_errors);
+        (released, rejected)
+    });
+    if released {
+        release_tail();
+    }
+    (released, rejected)
 }
 enum Resize {
     Done,
@@ -1123,59 +1168,6 @@ unsafe impl GlobalAlloc for KernelAllocator {
         unsafe {
             r4os_rust_heap_free(pointer, layout.size());
         }
-    }
-}
-// One bounded extension of the existing diagnostic HeapCheck exercises
-// rustc's allocation dispatch rather than the C facade used by Zig callers.
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_heap_allocator_probe() -> bool {
-    #[cfg(test)]
-    {
-        false
-    }
-    #[cfg(not(test))]
-    {
-        if !INITIALIZED.load(Ordering::Acquire) {
-            return false;
-        }
-        let mut before = Stats::default();
-        unsafe {
-            r4os_rust_heap_stats(&mut before);
-        }
-        let Ok(layout) = Layout::from_size_align(64, 64) else {
-            return false;
-        };
-        let original = unsafe { crate::alloc::alloc::alloc(layout) };
-        if original.is_null() {
-            return false;
-        }
-        unsafe {
-            original.write_bytes(0x6a, 64);
-        }
-        let resized = unsafe { crate::alloc::alloc::realloc(original, layout, 160) };
-        if resized.is_null() {
-            unsafe {
-                crate::alloc::alloc::dealloc(original, layout);
-            }
-            return false;
-        }
-        let valid = resized.addr().is_multiple_of(64)
-            && unsafe { core::slice::from_raw_parts(resized, 64) }
-                .iter()
-                .all(|byte| *byte == 0x6a);
-        let Ok(layout) = Layout::from_size_align(160, 64) else {
-            return false;
-        };
-        unsafe {
-            crate::alloc::alloc::dealloc(resized, layout);
-        }
-        let mut after = Stats::default();
-        unsafe {
-            r4os_rust_heap_stats(&mut after);
-        }
-        valid
-            && before.used_bytes == after.used_bytes
-            && before.active_blocks == after.active_blocks
     }
 }
 const _: () = {

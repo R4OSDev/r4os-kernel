@@ -1,8 +1,6 @@
 //! Existing explicitly requested heap boot checks and bounded SMP acceptance.
 //! These checks use the production allocator and retain the original oracles.
-use super::{
-    blocks, heap, paging, phys, vm_pager_api as vm, vm_query, vm_ranges, vm_transactions as tx,
-};
+use super::{blocks, heap, heap_check, paging, phys};
 use crate::boot::log_route::{dec, puts};
 use core::mem::MaybeUninit;
 
@@ -34,16 +32,6 @@ fn paging_stats() -> paging::Stats {
         out.assume_init()
     }
 }
-fn vm_stats() -> super::vm_pager_types::HotPathStats {
-    let mut out = MaybeUninit::uninit();
-    unsafe {
-        vm::r4os_rust_vm_hot_stats(out.as_mut_ptr());
-        out.assume_init()
-    }
-}
-fn release(p: *mut u8, len: usize) -> bool {
-    unsafe { heap::r4os_rust_heap_free(p, len) == 0 }
-}
 fn fail(reason: &[u8]) -> bool {
     puts(b"HEAPCHECK FAIL reason=");
     puts(reason);
@@ -51,208 +39,19 @@ fn fail(reason: &[u8]) -> bool {
     false
 }
 pub(super) fn self_test() -> bool {
-    if !heap::r4os_rust_heap_initialized() {
-        return fail(b"not-initialized");
-    }
-    if !heap::r4os_rust_heap_allocator_probe() {
-        return fail(b"rust-allocator");
-    }
-    let sizes = [24, 400, 6000];
-    let mut held = [core::ptr::null_mut(); 3];
-    for (i, size) in sizes.iter().copied().enumerate() {
-        let p = heap::r4os_rust_heap_alloc(size, 8);
-        if p.is_null() {
-            return fail(b"alloc-basic");
-        }
-        unsafe {
-            p.write_bytes(0xa0 + i as u8, size);
-        }
-        held[i] = p;
-    }
-    for (i, (p, size)) in held.into_iter().zip(sizes).enumerate() {
-        if unsafe { core::slice::from_raw_parts(p, size) }
-            .iter()
-            .any(|b| *b != 0xa0 + i as u8)
-        {
-            return fail(b"pattern");
-        }
-        if !release(p, size) {
-            return fail(b"free-basic");
-        }
-    }
-    let aligned = heap::r4os_rust_heap_alloc(100, 4096);
-    if aligned.is_null() {
-        return fail(b"alloc-aligned");
-    }
-    if aligned.addr() & 4095 != 0 {
-        return fail(b"alignment");
-    }
-    if !release(aligned, 100) {
-        return fail(b"free-aligned");
-    }
-    let df_before = stats().double_free_errors;
-    let probe = heap::r4os_rust_heap_alloc(64, 1);
-    if probe.is_null() {
-        return fail(b"alloc-df");
-    }
-    if !release(probe, 64) {
-        return fail(b"free-df1");
-    }
-    if release(probe, 64) {
-        return fail(b"double-free-accepted");
-    }
-    if stats().double_free_errors != df_before + 1 {
-        return fail(b"double-free-count");
-    }
-    let mut slots: [Option<(*mut u8, usize)>; 200] = [None; 200];
-    let mut rng = 0x9e37_79b9_7f4a_7c15u64;
-    for _ in 0..2000 {
-        rng = rng
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        let slot = ((rng >> 33) % 200) as usize;
-        if let Some((p, len)) = slots[slot] {
-            let ok = release(p, len);
-            if !ok {
-                return fail(b"churn-free");
-            }
-            slots[slot] = None;
-        } else {
-            let len = 16 + ((rng >> 8) & 0x7ff) as usize;
-            let p = heap::r4os_rust_heap_alloc(len, 8);
-            if p.is_null() {
-                return fail(b"churn-alloc");
-            }
-            slots[slot] = Some((p, len));
-        }
-    }
-    for entry in &mut slots {
-        if let Some((p, len)) = *entry {
-            if !release(p, len) {
-                return fail(b"churn-cleanup");
-            }
-            *entry = None;
-        }
+    let report = heap_check::boot_range(1, 5);
+    if report.status != crate::contract::kernel_heap_check_status_passed {
+        return fail(b"owned-heap-check");
     }
     let s = stats();
-    if s.used_bytes != 0 || s.active_blocks != 0 {
-        return fail(b"leak");
-    }
     puts(b"HEAPCHECK OK ops=");
-    dec(2000);
+    dec(u64::from(report.churn_ops));
     puts(b" committed=");
     dec(s.committed_bytes as u64);
     puts(b" largest_free=");
     dec(s.largest_free as u64);
     puts(b"\r\n");
     true
-}
-
-struct Reservation(u32);
-impl Drop for Reservation {
-    fn drop(&mut self) {
-        if self.0 != 0 {
-            tx::r4os_rust_vm_release(self.0);
-        }
-    }
-}
-fn reserve(window: u8, owner: u8, len: u64, name: &'static [u8]) -> Option<Reservation> {
-    let r = vm_ranges::Reserve {
-        eviction_allowed: true,
-        window,
-        kind: 4,
-        owner,
-        owner_id: 0,
-        name_ptr: name.as_ptr(),
-        name_len: name.len(),
-        flags: 2 | (1 << 63),
-        base: 0,
-        len,
-    };
-    let mut id = 0;
-    if unsafe { vm_ranges::r4os_rust_vm_reserve(&r, 4096, &mut id) } == 0 {
-        Some(Reservation(id))
-    } else {
-        None
-    }
-}
-fn range(id: u32) -> Option<vm_ranges::Range> {
-    let mut r = MaybeUninit::uninit();
-    unsafe { vm_query::r4os_rust_vm_range_info(id, r.as_mut_ptr()).then(|| r.assume_init()) }
-}
-fn resident_commit_probe() -> bool {
-    const BYTES: u64 = 257 * 4096;
-    let before = vm_stats();
-    let Some(mut allocation) = reserve(0, 0, BYTES, b"resident-commit-probe") else {
-        return false;
-    };
-    let id = allocation.0;
-    let Some(info) = range(id) else {
-        return false;
-    };
-    let memory = core::ptr::with_exposed_provenance_mut::<u8>(info.base as usize);
-    if tx::r4os_rust_vm_commit(id, BYTES - 4096, 4096) != 0 {
-        return false;
-    }
-    unsafe {
-        memory.add(BYTES as usize - 1).write(0xa5);
-    }
-    if tx::r4os_rust_vm_commit(id, 0, BYTES) != 9 {
-        return false;
-    }
-    let Some(partial) = range(id) else {
-        return false;
-    };
-    if partial.committed_bytes != 4096
-        || partial.resident_bytes != 4096
-        || unsafe { memory.add(BYTES as usize - 1).read() } != 0xa5
-    {
-        return false;
-    }
-    for offset in (0..BYTES - 4096).step_by(4096) {
-        let mut frame = 0;
-        if unsafe { paging::r4os_rust_paging_read(info.base + offset, 3, false, &mut frame) } {
-            return false;
-        }
-    }
-    if tx::r4os_rust_vm_uncommit(id, BYTES - 4096, 4096) != 0
-        || tx::r4os_rust_vm_commit(id, 0, BYTES) != 0
-    {
-        return false;
-    }
-    if unsafe { core::slice::from_raw_parts(memory, BYTES as usize) }
-        .iter()
-        .any(|b| *b != 0)
-    {
-        return false;
-    }
-    let Some(complete) = range(id) else {
-        return false;
-    };
-    if complete.committed_bytes != BYTES || complete.resident_bytes != BYTES {
-        return false;
-    }
-    if tx::r4os_rust_vm_release(id) != 0 {
-        return false;
-    }
-    allocation.0 = 0;
-    let after = vm_stats();
-    if after.resident_commit_batches - before.resident_commit_batches < 6
-        || after.resident_commit_max_batch_pages > 64
-        || after.resident_commit_unlocked_zero_bytes - before.resident_commit_unlocked_zero_bytes
-            < BYTES
-        || after.resident_rollback_batches == before.resident_rollback_batches
-    {
-        return false;
-    }
-    let impossible = (phys_stats().free_frames + 1) * 4096;
-    let Some(oom) = reserve(4, 3, impossible, b"resident-oom-probe") else {
-        return false;
-    };
-    if tx::r4os_rust_vm_commit(oom.0, 0, impossible) != 12 {
-        return false;
-    }
-    range(oom.0).is_some_and(|empty| empty.committed_bytes == 0 && empty.resident_bytes == 0)
 }
 
 pub(crate) fn acceptance() -> crate::arch::smp_probe::HeapReport {
@@ -262,25 +61,8 @@ pub(crate) fn acceptance() -> crate::arch::smp_probe::HeapReport {
     let b0 = block_stats();
     let p0 = phys_stats();
     let map0 = paging_stats();
-    let mut completed = 0u64;
-    while completed < ITERATIONS {
-        let p = heap::r4os_rust_heap_alloc(REQUEST, 16);
-        if p.is_null() {
-            break;
-        }
-        let pattern = (0x51 + completed) as u8;
-        unsafe {
-            p.write_bytes(pattern, REQUEST);
-        }
-        if unsafe { p.read() != pattern || p.add(REQUEST - 1).read() != pattern } {
-            release(p, REQUEST);
-            break;
-        }
-        if !release(p, REQUEST) {
-            break;
-        }
-        completed += 1;
-    }
+    let own = heap_check::boot_range(6, 6);
+    let completed = u64::from(own.acceptance_iterations);
     let after = stats();
     let b1 = block_stats();
     let p1 = phys_stats();
@@ -311,7 +93,8 @@ pub(crate) fn acceptance() -> crate::arch::smp_probe::HeapReport {
         && b1.claim_rollbacks == b0.claim_rollbacks
         && ((pages == 0 && extents == 0 && maps == 0)
             || (pages > 0 && extents > 0 && maps > 0 && claims <= pages));
-    let ok = completed == ITERATIONS
+    let ok = own.status == crate::contract::kernel_heap_check_status_passed
+        && completed == ITERATIONS
         && restored
         && retention
         && churn
@@ -319,7 +102,7 @@ pub(crate) fn acceptance() -> crate::arch::smp_probe::HeapReport {
         && after.commit_failures == before.commit_failures
         && after.uncommit_failures == before.uncommit_failures
         && poison >= REQUEST as u64 * ITERATIONS
-        && resident_commit_probe();
+        && heap_check::boot_range(7, 7).status == crate::contract::kernel_heap_check_status_passed;
     crate::arch::smp_probe::HeapReport {
         ok,
         iterations: completed,

@@ -1081,6 +1081,7 @@ const _: () = {
 static DEV: Table<c::R4XStartR4Dev> = Table::new();
 fn configure_dev() {
     use super::r4dev;
+    const HEAP_CHECK: c::R4DevFns::memory_kernel_heap_check = r4dev::memory::kernel_heap_check;
     r4dev::providers::install();
     let value = c::R4XStartR4Dev {
         device_inventory_summary: r4dev::devices::r4os_rust_r4dev_device_inventory_summary
@@ -1163,13 +1164,15 @@ fn configure_dev() {
         performance_stack: r4dev::telemetry::r4os_rust_r4dev_performance_stack as *const ()
             as usize,
         stack_fault: super::stack_fault::snapshot as *const () as usize,
+        memory_kernel_heap_check: HEAP_CHECK as *const () as usize,
         ..Default::default()
     };
     DEV.configure(value);
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 400);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 408);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, memory_kernel_heap_check) == 400);
     assert!(mem::offset_of!(c::R4XStartR4Dev, magic) == 0);
     assert!(mem::offset_of!(c::R4XStartR4Dev, abi_version) == 4);
     assert!(mem::offset_of!(c::R4XStartR4Dev, size) == 8);

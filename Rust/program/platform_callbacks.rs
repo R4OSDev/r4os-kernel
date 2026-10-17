@@ -10,9 +10,7 @@ pub(super) unsafe extern "C" fn sys_putc(ch: u8) {
 }
 
 pub(super) unsafe extern "C" fn sys_program_should_close() -> u32 {
-    unsafe { crate::program::process::r4os_rust_program_process_legacy(3, 0) }
-        .try_into()
-        .expect("checked callback result")
+    u32::from(super::process::should_close())
 }
 
 pub(super) unsafe extern "C" fn sys_program_class(path_ptr: *const u8, policy_raw: u32) -> i32 {
