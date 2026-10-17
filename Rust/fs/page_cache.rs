@@ -1,5 +1,5 @@
-//! Complete cache API owner. The temporary Zig file only projects fixed
-//! records/buffers and calls these separate native entries.
+//! Cache API owner. Fixed caller records and raw buffers bind the native
+//! read/write, policy and writeback owners.
 use super::{
     page_cache_policy as policy, page_cache_read as read, page_cache_state as c,
     page_cache_stats::Summary, page_cache_worker as worker, page_cache_write as write,

@@ -1,17 +1,13 @@
-//! Original quarter-second dirty-policy worker. Speculative read-ahead
-//! remains disabled and its dormant helper is never called by the worker.
-use super::{
-    page_cache_policy as policy, page_cache_read as read, page_cache_state as c,
-    page_cache_writeback as wb,
-};
+//! Quarter-second dirty writeback and capacity trimming; speculative I/O is disabled.
+use super::{page_cache_policy as policy, page_cache_state as c, page_cache_writeback as wb};
 use crate::{
     arch::pit::DEFAULT_HZ,
-    memory::{heap, phys},
+    memory::phys,
     platform::{clock_math, timer},
     sched::{sync_objects, task},
     storage::block_registry,
 };
-use c::{COUNT, DEVICES, FULL, Held, PAGE, STATS};
+use c::{COUNT, DEVICES, FULL, Held, STATS};
 use core::{ffi::c_void, ptr, sync::atomic::Ordering::Relaxed};
 #[repr(C)]
 struct Create {
@@ -83,7 +79,7 @@ unsafe extern "C" fn main() {
                     }
                 }
             }
-            // This is the original idle action. Do not call read_ahead_one() here.
+            // Idle policy trims clean excess capacity without speculative I/O.
             if pages == 0 && !failed {
                 trim_one();
             }
@@ -369,119 +365,5 @@ pub(super) unsafe fn create_readahead(dev: usize, page: u64) -> Option<usize> {
         }
         c::link(i);
         Some(i)
-    }
-}
-#[allow(dead_code)] // Original dormant model. The productive worker never calls this.
-unsafe fn read_ahead_one() -> bool {
-    unsafe {
-        let Some(mut held) = Held::acquire() else {
-            return false;
-        };
-        let Some(_unwind) = c::Operation::enter() else {
-            return false;
-        };
-        for probe in 0..DEVICES {
-            let dev = (usize::from((*c::state()).readahead_cursor) + probe) % DEVICES;
-            let a = ahead(dev);
-            if !(*a).pending || (*a).inflight {
-                continue;
-            }
-            (*c::state()).readahead_cursor = ((dev + 1) % DEVICES) as u8;
-            let mut request = core::mem::MaybeUninit::<policy::ReadAheadRequest>::uninit();
-            if !policy::r4os_rust_fs_cache_readahead(
-                a,
-                3,
-                0,
-                0,
-                ptr::null(),
-                false,
-                request.as_mut_ptr(),
-            ) {
-                continue;
-            }
-            let request = request.assume_init();
-            let cap = c::capacity();
-            let budget = resident_budget(&cap);
-            if budget == 0
-                || request.pages == 0
-                || request.pages > budget.saturating_sub((*a).resident_pages)
-                || c::index(14, 0, 0, false) + usize::from(request.pages)
-                    > usize::from(cap.active_pages)
-                || (*policy::global_index()).free_count <= free_floor(&cap)
-            {
-                policy::r4os_rust_fs_cache_readahead(a, 4, 0, 0, &request, false, ptr::null_mut());
-                STATS.read_ahead_budget_skips.fetch_add(1, Relaxed);
-                continue;
-            }
-            let first = request.page * 8;
-            if c::find(dev, first).is_some() {
-                policy::r4os_rust_fs_cache_readahead(a, 4, 0, 0, &request, false, ptr::null_mut());
-                STATS.read_ahead_budget_skips.fetch_add(1, Relaxed);
-                continue;
-            }
-            let mut staging = ptr::null_mut();
-            let bytes = usize::from(request.pages) * PAGE;
-            if request.pages >= 2 {
-                held.unlock();
-                staging = heap::r4os_rust_heap_alloc(bytes, 16);
-                held.relock();
-            }
-            let result = if request.pages >= 2 && !staging.is_null() {
-                read::fill_run(held.owned, dev, first, request.pages, staging, bytes, true)
-            } else if request.pages == 1 {
-                if let Some(i) = create_readahead(dev, first) {
-                    read::FillOutcome {
-                        ok: read::fill(held.owned, i),
-                        pages: 1,
-                        sectors: 8,
-                    }
-                } else {
-                    read::FillOutcome::default()
-                }
-            } else {
-                read::FillOutcome::default()
-            };
-            if policy::r4os_rust_fs_cache_readahead(
-                a,
-                4,
-                0,
-                0,
-                &request,
-                result.ok,
-                ptr::null_mut(),
-            ) {
-                for offset in 0..result.pages {
-                    let page = first + u64::from(offset) * 8;
-                    if let Some(i) = c::find(dev, page) {
-                        let e = c::entry(i);
-                        if !(*e).read_ahead {
-                            (*e).read_ahead = true;
-                            (*a).resident_pages += 1;
-                            STATS.read_ahead_issued.fetch_add(1, Relaxed);
-                            STATS.read_ahead_pages_issued.fetch_add(1, Relaxed);
-                        }
-                    }
-                }
-            } else {
-                for offset in 0..result.pages {
-                    if let Some(i) = c::find(dev, first + u64::from(offset) * 8) {
-                        let e = c::entry(i);
-                        if !(*e).io_busy && (*e).dirty_mask == 0 {
-                            c::clear(i, false);
-                        }
-                    }
-                }
-                if staging.is_null() && request.pages >= 2 {
-                    STATS.read_ahead_budget_skips.fetch_add(1, Relaxed);
-                }
-            }
-            if !staging.is_null() {
-                held.unlock();
-                heap::r4os_rust_heap_free(staging, bytes);
-                held.relock();
-            }
-            return true;
-        }
-        false
     }
 }

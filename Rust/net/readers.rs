@@ -310,7 +310,7 @@ unsafe fn tcp(
     (r, Some(op))
 }
 
-// Paired temporary compatibility exports follow.
+// Paired native packet entries retain copied operation reports.
 
 /// # Safety
 /// Exact paired resident/stack inputs and disjoint readable packet. Outputs

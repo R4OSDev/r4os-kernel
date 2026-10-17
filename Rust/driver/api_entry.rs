@@ -280,7 +280,7 @@ unsafe fn driver_usb(
                 }
             }
             2 => isize::from(h::r4os_rust_usb_host_unregister_name(name, len, owner)),
-            3 => crate::usb::xhci_api::r4os_rust_usb_xhci_activate(owner, source) as isize,
+            3 => crate::usb::xhci_api::activate(owner, source) as isize,
             _ => panic!("Invalid USB host operation"),
         }
     }

@@ -1,5 +1,4 @@
-//! Complete native FAT owner entry. Every I/O operation has its own bounded
-//! non-inlined frame. The Zig facade only projects original public values.
+//! Native FAT operations, each with a bounded non-inlined I/O frame.
 use super::{
     fat_directory as d, fat_files as f, fat_mutation as m, fat_names as n, fat_state as s,
     fat_types::*, vfs_types::Result as Output,

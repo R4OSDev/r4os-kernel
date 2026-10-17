@@ -261,6 +261,16 @@ impl CatalogState {
     pub fn max_advance_for_font(&self, id: u32) -> u32 {
         self.cached_font(id).map_or(8, |f| u32::from(f.max_advance))
     }
+    /// Measure a bounded zero-terminated raw span under the caller's exact lease.
+    /// # Safety
+    /// The readable text bound and catalog/task pins survive the full operation.
+    pub unsafe fn measure_z_raw(&self, id: u32, text: *const u8, max: usize) -> TextMetrics {
+        let mut len = 0;
+        while len < max && unsafe { text.add(len).read() } != 0 {
+            len += 1;
+        }
+        unsafe { self.measure_raw(id, text, len) }
+    }
     /// Raw caller bytes remain raw across any fault; the exact catalogue lease
     /// and task unwind pin outlive the complete metadata/glyph operation.
     /// # Safety

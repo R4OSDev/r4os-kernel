@@ -75,17 +75,6 @@ pub(super) unsafe fn device_handle_from_core(device: Device) -> DeviceHandle {
         }
     }
 }
-pub(super) unsafe fn interrupt_in_handle_from_core(device: Device) -> EndpointHandle {
-    EndpointHandle {
-        device: unsafe { device_handle_from_core(device) },
-        kind: 1,
-        address: device.first_endpoint_address,
-        endpoint_id: super::xhci::endpoint_dci(device.first_endpoint_address),
-        max_packet: device.first_endpoint_max_packet,
-        interval: device.first_endpoint_interval,
-        ..EndpointHandle::EMPTY
-    }
-}
 pub(super) unsafe fn bulk_in_handle_from_core(device: Device) -> EndpointHandle {
     EndpointHandle {
         device: unsafe { device_handle_from_core(device) },

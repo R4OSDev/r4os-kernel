@@ -1,6 +1,5 @@
-//! Task resource construction and exact failed-release anchors. Not integrated
-//! yet. Only scalar VM calls cross the temporary owner boundary. Runtime flags
-//! are explicit around metadata changes, never held over heap/VM operations.
+//! Task resource construction and exact failed-release anchors. Runtime flags
+//! protect metadata changes and never remain held over heap/VM operations.
 use super::{
     task_registry as registry,
     task_types::{Bytes, CreateFailure, Entry, Role, State, Task, TaskCore},

@@ -377,7 +377,7 @@ fn start(plan: Plan) -> bool {
             continue;
         }
         if percpu::state(index) != 3
-            || !monotonic::r4os_rust_monotonic_control(5, index)
+            || !crate::platform::clocksource::finalize_cpu(index)
             || !transition(index, 3, 8)
         {
             fail_ap(index, false, b"clock-registration");
@@ -491,7 +491,7 @@ pub extern "C" fn r4os_ap_entry(index: u64) -> ! {
         percpu::r4os_rust_percpu_control(5, index, 0, 0);
         runtime::halt_forever();
     }
-    monotonic::r4os_rust_monotonic_control(4, index);
+    crate::platform::clocksource::register_cpu(index);
     if !transition(index, 2, 3) {
         runtime::halt_forever();
     }

@@ -98,10 +98,7 @@ unsafe fn host_bulk(
     len: usize,
     direction: u32,
 ) -> Option<u32> {
-    let mut host = super::types::HostEndpoint::EMPTY;
-    unsafe {
-        xhci_api::r4os_rust_usb_xhci_usb_host_endpoint_handle(endpoint, &mut host);
-    }
+    let host = unsafe { xhci_api::host_endpoint_handle(*endpoint) };
     let result = unsafe { host_controller::r4os_rust_usb_host_bulk(&host, bytes, len, direction) };
     if result < 0 {
         None
@@ -289,9 +286,7 @@ unsafe fn fail_transport(current: *mut Status) -> bool {
         (*current).failures += 1;
         (*current).transport_failures += 1;
         let token = IncidentToken {
-            generation: xhci_api::r4os_rust_usb_xhci_take_device_incident(ptr::addr_of!(
-                (*current).device
-            )),
+            generation: xhci_api::take_device_incident((*current).device),
         };
         if token.valid() {
             if (*current).transport_incident.valid()
@@ -423,10 +418,7 @@ unsafe fn set_protocol_reason(current: *mut Status, detail: &[u8]) {
 unsafe fn set_transport_reason(current: *mut Status, stage: &[u8]) {
     unsafe {
         let mut xs = mem::MaybeUninit::uninit();
-        if !xhci_api::r4os_rust_usb_xhci_status_for_device(
-            ptr::addr_of!((*current).device),
-            xs.as_mut_ptr(),
-        ) {
+        if !xhci_api::status_for_device((*current).device, &mut xs) {
             return;
         }
         let xs = xs.assume_init();

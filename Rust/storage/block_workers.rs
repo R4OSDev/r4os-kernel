@@ -60,7 +60,7 @@ struct Create {
     entry: Option<unsafe extern "C" fn()>,
 }
 unsafe extern "C" {
-    // Same native owner interfaces used by the existing Zig task facade.
+    // Use the canonical native task owner interfaces.
     fn r4os_rust_task_create(input: *const Create, critical: bool, failure: *mut u8)
     -> *mut c_void;
     fn r4os_rust_task_control(operation: u8, a: u64, b: u64) -> u64;

@@ -105,13 +105,6 @@ unsafe fn fill_once(guard: bool, i: usize) -> bool {
         ok
     }
 }
-#[derive(Default)]
-pub(super) struct FillOutcome {
-    pub ok: bool,
-    pub pages: u16,
-    #[allow(dead_code)] // Original dormant model retains the completed-sector count.
-    pub sectors: u16,
-}
 pub(super) unsafe fn run_limit(device: usize, requested: u16) -> u16 {
     unsafe {
         let Some(info) = block_registry::cache_view(device) else {
@@ -139,18 +132,18 @@ pub(super) unsafe fn fill_run(
     staging: *mut u8,
     len: usize,
     speculative: bool,
-) -> FillOutcome {
+) -> bool {
     unsafe {
         let Some(info) = block_registry::cache_view(device) else {
-            return FillOutcome::default();
+            return false;
         };
         if info.sector_bytes != SECTOR as u32 {
-            return FillOutcome::default();
+            return false;
         }
         let sector_count = info.sectors;
         let limit = ((len / PAGE).min(COUNT) as u16).min(run_limit(device, requested));
         if limit < 2 {
-            return FillOutcome::default();
+            return false;
         }
         let mut indices = [MaybeUninit::<u16>::uninit(); COUNT];
         let mut masks = [MaybeUninit::<u8>::uninit(); COUNT];
@@ -201,17 +194,13 @@ pub(super) unsafe fn fill_run(
         }
         if reserved < 2 {
             if reserved == 0 {
-                return FillOutcome::default();
+                return false;
             }
             let i = usize::from(indices[0].assume_init());
             let e = c::entry(i);
             (*e).io_busy = false;
             c::index(7, i, 0, (*e).dirty_mask != 0);
-            return FillOutcome {
-                ok: fill(guard, i),
-                pages: 1,
-                sectors: total.min(8),
-            };
+            return fill(guard, i);
         }
         let bytes = usize::from(total) * SECTOR;
         STATS.fill_run_requests.fetch_add(1, Relaxed);
@@ -296,11 +285,7 @@ pub(super) unsafe fn fill_run(
                 c::clear(i, false);
             }
         }
-        FillOutcome {
-            ok,
-            pages: reserved as u16,
-            sectors: total,
-        }
+        ok
     }
 }
 
@@ -524,7 +509,6 @@ pub(super) unsafe fn read_sectors(
                             staging.len,
                             false,
                         )
-                        .ok
                     } else {
                         fill(held.owned, i)
                     };

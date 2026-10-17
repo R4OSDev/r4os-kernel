@@ -379,7 +379,7 @@ unsafe fn tcp(
     r
 }
 
-// The paired C exports below are the temporary Zig compatibility boundary.
+// Paired packet entries retain exact borrowed buffers and copied reports.
 
 /// # Safety
 /// Exact paired stack parameters/report and readable input/writable output

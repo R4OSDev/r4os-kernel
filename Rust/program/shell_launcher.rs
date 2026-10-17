@@ -218,7 +218,7 @@ pub unsafe extern "C" fn r4os_rust_program_shell_start(
     usable_bytes: u64,
 ) -> ! {
     unsafe { program_shell_init(usable_bytes) };
-    log(b"[LAUNCH] Legacy shell runtime bridge disabled; external shell required\r\n");
+    log(b"[LAUNCH] External shell launcher ready\r\n");
     let mut values = core::mem::MaybeUninit::<Config>::uninit();
     unsafe { program_shell_config(config, values.as_mut_ptr()) };
     let values = unsafe { values.assume_init() };

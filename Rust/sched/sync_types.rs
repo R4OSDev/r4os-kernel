@@ -1,5 +1,5 @@
-//! Native synchronization: only fixed C records cross the temporary
-//! Zig facade. All mutation/ownership and task fields stay with Rust.
+//! Native synchronization records. Exact task/runtime owners retain all
+//! mutation and task state; ABI projections contain only fixed values.
 use crate::sched::wait_node::QueueCore;
 use core::ffi::c_void;
 #[repr(C)]

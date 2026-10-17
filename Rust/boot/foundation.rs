@@ -147,7 +147,7 @@ unsafe fn cpu_foundation() {
     crate::arch::pic::init();
     crate::platform::cpu::detect();
     crate::arch::smp::r4os_rust_smp_control(0, 0);
-    crate::platform::monotonic::r4os_rust_monotonic_control(1, 0);
+    crate::platform::clocksource::configure_cpu();
     if !crate::arch::fpu::init() {
         crate::boot::fatal::kernel(2, b"FPU/SSE task-state init failed");
     }

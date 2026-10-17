@@ -1,5 +1,5 @@
 //! Original logical I/O splitting, bounce/direct ownership and batch drains.
-//! Only resident C pointers/snapshots cross the temporary execution leaf;
+//! Only resident raw pointers/snapshots cross the native execution owner;
 //! no Rust buffer/registry reference or no-sleep guard crosses a wait/backend.
 use crate::{
     memory::heap,

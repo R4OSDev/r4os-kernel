@@ -1,5 +1,5 @@
-//! Private FAT value records. No compiler-specific optional/union layout
-//! crosses the temporary Zig facade. Caller buffers remain raw through waits.
+//! Private FAT state and value records. Caller buffers remain raw through
+//! waits; public results use fixed projections.
 use crate::storage::access_state::Reference;
 use core::ptr;
 pub const SECTOR: usize = 512;

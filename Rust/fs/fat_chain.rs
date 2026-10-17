@@ -136,29 +136,6 @@ pub(super) unsafe fn next_free(s: *const s::Runtime, requested: u32) -> u32 {
     }
 }
 #[inline(never)]
-#[allow(dead_code)] // Original unused single-cluster allocation helper.
-pub(super) unsafe fn allocated_one(v: Volume, c: u32) {
-    unsafe {
-        let h = hint_for(v);
-        if c >= (*h).next {
-            (*h).next = c + 1;
-        }
-        if let Some(state) = s::runtime_for(v, false) {
-            if (*state).map_ready && s::map_free(state, c) {
-                s::map_mark(state, c, true);
-                if (*state).free > 0 {
-                    (*state).free -= 1;
-                }
-            } else if !(*state).map_ready && (*state).free > 0 {
-                (*state).free -= 1;
-            }
-            if c >= (*state).next {
-                (*state).next = next_free(state, c + 1);
-            }
-        }
-    }
-}
-#[inline(never)]
 pub(super) unsafe fn allocated_range(v: Volume, first: u32, count: usize) {
     unsafe {
         if first < 2 || count == 0 {
@@ -241,40 +218,6 @@ pub(super) unsafe fn free(v: Volume, start: u32) -> bool {
             guard += 1;
         }
         false
-    }
-}
-#[inline(never)]
-#[allow(dead_code)] // Original dormant single-cluster search path.
-pub(super) unsafe fn find_one(v: Volume, start: u32) -> Option<u32> {
-    unsafe {
-        s::ensure_scanned(v);
-        let end = s::alloc_end(v);
-        let normal = if start >= 2 && start < end { start } else { 3 };
-        let mut c = next_start(v, normal);
-        let mut steps = 0;
-        while c < end {
-            STATS.alloc_search_steps.fetch_add(1, Relaxed);
-            s::cooperate(&mut steps);
-            if s::fat_entry(v, c)? == 0 {
-                allocated_one(v, c);
-                return Some(c);
-            }
-            c += 1;
-        }
-        if c != normal {
-            c = normal;
-            let stop = next_start(v, normal);
-            while c < stop && c < end {
-                STATS.alloc_search_steps.fetch_add(1, Relaxed);
-                s::cooperate(&mut steps);
-                if s::fat_entry(v, c)? == 0 {
-                    allocated_one(v, c);
-                    return Some(c);
-                }
-                c += 1;
-            }
-        }
-        None
     }
 }
 unsafe fn scan_map(v: Volume, start: u32, stop: u32, wanted: usize, mut best: Run) -> Option<Run> {

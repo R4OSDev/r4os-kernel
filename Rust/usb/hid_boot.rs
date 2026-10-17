@@ -110,10 +110,8 @@ impl Sink {
     }
 }
 fn xhci_status() -> XhciStatus {
-    let mut out = MaybeUninit::uninit();
     unsafe {
-        super::xhci_api::r4os_rust_usb_xhci_status(out.as_mut_ptr());
-        let value = out.assume_init();
+        let value = super::xhci::status();
         XhciStatus {
             interrupt_recoveries: value.interrupt_recoveries,
             interrupt_pending_timeouts: value.interrupt_pending_timeouts,
@@ -333,7 +331,7 @@ pub extern "C" fn r4os_rust_usb_hid_boot_dump() {
 /// Exact retained task-start peers after task-runtime initialization.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_usb_hid_boot_start() -> bool {
-    if !unsafe { super::xhci_api::r4os_rust_usb_xhci_start_port_task() } {
+    if !unsafe { super::xhci_api::start_port_task() } {
         return false;
     }
     if !status().active {

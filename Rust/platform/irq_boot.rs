@@ -158,7 +158,7 @@ pub fn init() -> bool {
     );
     current.hpet_visible = current.hpet_status.flags & 1 != 0;
     current.hpet_initialized = current.hpet_status.flags & 6 == 6;
-    monotonic::r4os_rust_monotonic_control(3, 0);
+    monotonic::attach_hpet();
     if ioapic::r4os_rust_ioapic_control(4, 0, false) {
         pic::r4os_rust_pic_control(3, 0);
         current.ioapic_status = ioapic_status();

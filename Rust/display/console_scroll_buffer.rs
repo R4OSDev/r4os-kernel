@@ -42,7 +42,7 @@ pub fn fill(cells: &mut [Cell], value: Cell) {
 }
 #[expect(
     clippy::too_many_arguments,
-    reason = "Preserve the original framebuffer/scroll argument contract during migration"
+    reason = "Preserve the framebuffer/scroll geometry contract"
 )]
 pub fn scroll_pixels_up(
     pixels: &mut [u32],

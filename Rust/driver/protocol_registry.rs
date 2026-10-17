@@ -44,8 +44,6 @@ pub struct Registration {
     pub name_len: usize,
     pub role: *const u8,
     pub role_len: usize,
-    pub note: *const u8,
-    pub note_len: usize,
     pub category: u16,
     pub version: u16,
     pub api_version: u32,
@@ -58,7 +56,7 @@ const _: () = {
     assert!(mem::offset_of!(Entry, name_len) == 48);
     assert!(mem::offset_of!(Entry, role_len) == 120);
     assert!(mem::offset_of!(Entry, note_len) == 224);
-    assert!(mem::size_of::<Registration>() == 56);
+    assert!(mem::size_of::<Registration>() == 40);
 };
 fn row(slot: usize) -> *mut Entry {
     ENTRIES.0.get().cast::<Entry>().wrapping_add(slot)
@@ -71,35 +69,18 @@ unsafe fn bytes<'a>(pointer: *const u8, len: usize) -> &'a [u8] {
     }
 }
 unsafe fn find(role: &[u8], mode: u8) -> Option<usize> {
-    let mut fallback = None;
+    assert!(matches!(mode, 1 | 2), "Invalid protocol lookup mode");
     for slot in 0..MAX_PROTOCOLS {
-        let e = unsafe { row(slot).read() };
-        if !e.used || !e.role[..e.role_len].eq_ignore_ascii_case(role) {
-            continue;
-        }
-        match mode {
-            0 => {
-                if e.source == 0 {
-                    return Some(slot);
-                }
-            }
-            1 => {
-                if e.source == 1 || e.source == 2 {
-                    return Some(slot);
-                }
-            }
-            2 => {
-                if (e.source == 1 || e.source == 2) && e.state == 2 {
-                    return Some(slot);
-                }
-                if fallback.is_none() && (e.state == 2 || e.state == 3) {
-                    fallback = Some(slot);
-                }
-            }
-            _ => panic!("Invalid protocol lookup mode"),
+        let entry = unsafe { row(slot).read() };
+        if entry.used
+            && matches!(entry.source, 1 | 2)
+            && entry.role[..entry.role_len].eq_ignore_ascii_case(role)
+            && (mode == 1 || entry.state == 2)
+        {
+            return Some(slot);
         }
     }
-    fallback
+    None
 }
 fn copy(source: &[u8], output: &mut [u8]) -> usize {
     output.fill(0);
@@ -124,12 +105,12 @@ pub unsafe extern "C" fn r4os_rust_protocol_registry_register(
     operation: u8,
     input: *const Registration,
 ) -> usize {
+    assert!(matches!(operation, 1..=3), "Invalid protocol registration");
     let flags = runtime::save_runtime();
     let result = unsafe {
         let r = &*input;
         let role = bytes(r.role, r.role_len);
-        let builtin = operation == 0;
-        if find(role, if builtin { 0 } else { 1 }).is_some() {
+        if find(role, 1).is_some() {
             usize::MAX
         } else {
             let mut slot = None;
@@ -143,12 +124,11 @@ pub unsafe extern "C" fn r4os_rust_protocol_registry_register(
                 let mut entry = Entry {
                     used: true,
                     source: match operation {
-                        0 => 0,
                         1 | 2 => 1,
                         3 => 2,
                         _ => panic!("Invalid protocol registration"),
                     },
-                    state: if builtin { 3 } else { 1 },
+                    state: 1,
                     category: r.category,
                     version: r.version,
                     api_version: r.api_version,
@@ -158,7 +138,6 @@ pub unsafe extern "C" fn r4os_rust_protocol_registry_register(
                 entry.role_len = copy(role, &mut entry.role);
                 entry.note_len = copy(
                     match operation {
-                        0 => bytes(r.note, r.note_len),
                         2 => b"installed; lazy",
                         _ => b"loaded",
                     },
@@ -316,7 +295,7 @@ pub unsafe extern "C" fn r4os_rust_protocol_registry_query(
         match operation {
             0 => {
                 if let Some(slot) = find(role, 2) {
-                    i32::from((*row(slot)).state == 2 || (*row(slot)).state == 3)
+                    i32::from((*row(slot)).state == 2)
                 } else {
                     0
                 }
@@ -331,7 +310,7 @@ pub unsafe extern "C" fn r4os_rust_protocol_registry_query(
             2 => {
                 if let Some(slot) = find(role, 2) {
                     match (*row(slot)).state {
-                        2 | 3 => 1,
+                        2 => 1,
                         1 => 0,
                         4 => -5,
                         5 => -1,
@@ -354,15 +333,10 @@ pub unsafe extern "C" fn r4os_rust_protocol_registry_query(
     result
 }
 
-/// Preserve the original public diagnostic preference: an installed R4P row,
-/// including its failed/disabled state, precedes the built-in fallback row.
+/// Installed/preloaded R4P state, including failed or disabled registrations.
 pub(crate) fn diagnostic_entry(role: &[u8]) -> Option<Entry> {
     let _owner = runtime::RuntimeGuard::acquire();
-    unsafe {
-        find(role, 1)
-            .or_else(|| find(role, 0))
-            .map(|slot| row(slot).read())
-    }
+    unsafe { find(role, 1).map(|slot| row(slot).read()) }
 }
 
 pub(crate) fn source_name(source: u8) -> &'static [u8] {

@@ -141,80 +141,9 @@ pub fn snapshot() -> Snapshot {
         event,
     }
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_monotonic_control(operation: u8, value: u32) -> bool {
-    match operation {
-        0 => {
-            clocksource::early_init();
-            true
-        }
-        1 => {
-            clocksource::configure_cpu();
-            true
-        }
-        2 => {
-            attach_periodic();
-            true
-        }
-        3 => {
-            let prior = now_nanoseconds().unwrap_or_else(timer::event_nanoseconds);
-            clocksource::attach_hpet(prior);
-            true
-        }
-        4 => clocksource::register_cpu(value),
-        5 => clocksource::finalize_cpu(value),
-        6 => clocksource::periodic_validate(),
-        _ => panic!("Invalid private monotonic operation"),
-    }
-}
-/// # Safety
-/// Caller owns one aligned writable fixed C snapshot until return.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_monotonic_snapshot(output: *mut Snapshot) {
-    unsafe { output.write(snapshot()) };
-}
-/// # Safety
-/// Caller owns an aligned writable u64, written only for an available clock.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_monotonic_now(output: *mut u64) -> bool {
-    let Some(now) = now_nanoseconds() else {
-        return false;
-    };
-    unsafe { output.write(now) };
-    true
-}
-/// # Safety
-/// Caller owns one aligned writable fixed C stamp until return.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_monotonic_capture(output: *mut Stamp) {
-    unsafe { output.write(capture()) };
-}
-/// # Safety
-/// Input stamp is resident/readable; output is aligned/writable until return.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_monotonic_resolve(
-    stamp: *const Stamp,
-    output: *mut u64,
-) -> bool {
-    let Some(value) = resolve(unsafe { stamp.read() }) else {
-        return false;
-    };
-    unsafe { output.write(value) };
-    true
-}
-/// # Safety
-/// Inputs are resident C stamps, output is aligned/writable until return.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_monotonic_elapsed(
-    start: *const Stamp,
-    end: *const Stamp,
-    output: *mut u64,
-) -> bool {
-    let Some(value) = elapsed(unsafe { start.read() }, unsafe { end.read() }) else {
-        return false;
-    };
-    unsafe { output.write(value) };
-    true
+pub fn attach_hpet() {
+    let prior = now_nanoseconds().unwrap_or_else(timer::event_nanoseconds);
+    clocksource::attach_hpet(prior);
 }
 /// # Safety
 /// R4SYS/R4D retain the initialized writable Contract output for this call.

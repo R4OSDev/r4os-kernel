@@ -1,5 +1,5 @@
-//! Private C facade for still-Zig kernel consumers. Every pointer is an opaque
-//! live task handle or a fixed C projection, never a native Rust task layout.
+//! Task entry points with opaque live handles and fixed projections.
+//! Exact lifecycle, scheduler and resource owners retain native task state.
 use super::{
     task_lifecycle as lifetime, task_registry as registry, task_resources as resources,
     task_snapshots as snapshots,

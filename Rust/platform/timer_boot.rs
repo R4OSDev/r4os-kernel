@@ -14,7 +14,7 @@ pub extern "C" fn r4os_rust_timer_boot_control(operation: u8) -> bool {
         0 => {
             if !INITIALIZED.load(Ordering::Acquire) {
                 timer::init_pit(pit::DEFAULT_HZ);
-                monotonic::r4os_rust_monotonic_control(2, 0);
+                monotonic::attach_periodic();
                 INITIALIZED.store(true, Ordering::Release);
             }
             true

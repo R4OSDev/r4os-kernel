@@ -30,8 +30,8 @@ pub struct State {
     pub probe_active: bool,
 }
 struct Storage(UnsafeCell<State>);
-// SAFETY: every later access is atomic, including the original private Zig
-// probe's reset/read views. There is one backing record and no cached mirror.
+// SAFETY: every later access, including diagnostic reset/read, is atomic.
+// There is one backing record and no cached mirror.
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new(State {
     entries_started: 0,

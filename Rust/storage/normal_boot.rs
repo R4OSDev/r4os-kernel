@@ -151,7 +151,7 @@ unsafe fn mount_letter(index: usize, partition: usize, letter: u8, role: u8) -> 
 /// # Safety
 /// Exclusive original early boot mount admission. Boot info and inventory stay
 /// resident; FS tokens keep their owner's lifetime. Output is one exclusive C
-/// tagged result; the public Zig Result facade keeps its original vocabulary.
+/// tagged result; public results retain the established vocabulary.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_normal_mount(out: *mut ResultRecord) {
     unsafe {

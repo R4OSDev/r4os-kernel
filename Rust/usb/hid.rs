@@ -109,11 +109,7 @@ fn queue_stats() -> QueueStats {
     out
 }
 fn source() -> Text {
-    let value = unsafe { r4p::r4os_rust_r4p_source(role(b"usb.hid_boot"), true) };
-    Text {
-        pointer: value.data,
-        len: value.len,
-    }
+    Text::literal(r4p::source(b"usb.hid_boot"))
 }
 fn roles_ready() -> bool {
     active(b"usb.hid_report") && active(b"usb.hid_boot")

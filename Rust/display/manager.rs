@@ -34,15 +34,13 @@ struct Device {
     frame: *mut Framebuffer,
     ops: &'static DeviceOps,
 }
-// Preserve the original six-method framebuffer vtable seam.
+// Native framebuffer operations; common XRGB presentation uses regions.
 #[allow(clippy::type_complexity)]
 #[derive(Default)]
 struct DeviceOps {
     fill: Option<fn(*mut Device, u32) -> bool>,
     rect: Option<fn(*mut Device, i32, i32, u32, u32, u32) -> bool>,
     present_packed32_rect: Option<unsafe fn(*mut Device, u64, u64, u64, u64, &[u8], u64) -> bool>,
-    #[allow(dead_code)] // Retain the original vtable seam; common XRGB uses the regions path.
-    present_xrgb32_rect: Option<unsafe fn(*mut Device, u64, u64, u64, u64, &[u8], u64) -> bool>,
     put_packed32: Option<fn(*mut Device, u64, u64, u32) -> bool>,
     put_xrgb32: Option<fn(*mut Device, u64, u64, u32) -> bool>,
 }
@@ -50,7 +48,6 @@ static EMPTY_OPS: DeviceOps = DeviceOps {
     fill: None,
     rect: None,
     present_packed32_rect: None,
-    present_xrgb32_rect: None,
     put_packed32: None,
     put_xrgb32: None,
 };
@@ -58,7 +55,6 @@ static BOOTFB_OPS: DeviceOps = DeviceOps {
     fill: Some(bootfb_fill),
     rect: Some(bootfb_rect),
     present_packed32_rect: Some(bootfb_present_packed32_rect),
-    present_xrgb32_rect: Some(bootfb_present_xrgb32_rect),
     put_packed32: Some(bootfb_put_packed32),
     put_xrgb32: Some(bootfb_put_xrgb32),
 };
@@ -2376,68 +2372,4 @@ unsafe fn bootfb_present_packed32_rect(
     stride: u64,
 ) -> bool {
     unsafe { bootfb_copy_packed32_rect(device, REASON_PACKED32, x, y, w, h, src, stride) }
-}
-unsafe fn bootfb_present_xrgb32_rect(
-    device: *mut Device,
-    x: u64,
-    y: u64,
-    w: u64,
-    h: u64,
-    src: &[u8],
-    stride: u64,
-) -> bool {
-    let frame = unsafe { (*device).frame };
-    if frame.is_null() {
-        return false;
-    }
-    let frame = unsafe { frame.read() };
-    if !fb::supports_rgb32(&frame) || w == 0 || h == 0 || x >= frame.width || y >= frame.height {
-        return false;
-    }
-    let clipped_w = w.min(frame.width - x);
-    let clipped_h = h.min(frame.height - y);
-    let stride_bytes = stride * 4;
-    let row_bytes = clipped_w * 4;
-    if (src.len() as u64) < (clipped_h - 1) * stride_bytes + row_bytes {
-        return false;
-    }
-    if fb::is_native_xrgb32(&frame) {
-        return unsafe {
-            bootfb_copy_packed32_rect(
-                device,
-                REASON_XRGB32,
-                x,
-                y,
-                clipped_w,
-                clipped_h,
-                src,
-                stride,
-            )
-        };
-    }
-    for row in 0..clipped_h {
-        let offset = usize::try_from(row * stride_bytes).expect("converted row offset");
-        for column in 0..clipped_w {
-            let pixel_offset =
-                offset + usize::try_from(column * 4).expect("converted pixel offset");
-            unsafe {
-                fb::put_packed(
-                    &frame,
-                    x + column,
-                    y + row,
-                    fb::pack_rgb(&frame, read_xrgb32(src, pixel_offset)),
-                );
-            }
-        }
-    }
-    record_present(
-        device,
-        REASON_XRGB32,
-        u32::try_from(x).expect("converted x"),
-        u32::try_from(y).expect("converted y"),
-        u32::try_from(clipped_w).expect("converted width"),
-        u32::try_from(clipped_h).expect("converted height"),
-        true,
-    );
-    true
 }

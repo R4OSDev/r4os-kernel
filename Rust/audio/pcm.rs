@@ -368,8 +368,8 @@ fn clamp_i16(value: i64) -> i16 {
         value.try_into().unwrap()
     }
 }
-// Diagnostic work counters are never passed by the productive core. The old
-// Zig test facade borrows this exact resident record, with no shadow copy.
+// Diagnostic callers borrow this exact resident work record without a shadow
+// copy; the productive core never passes diagnostic counters.
 #[unsafe(no_mangle)]
 pub static mut r4os_rust_audio_pcm_work: Work = Work {
     sample_reads: 0,

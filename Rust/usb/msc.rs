@@ -133,11 +133,7 @@ fn active(name: &'static [u8]) -> bool {
     unsafe { r4p::r4os_rust_r4p_has_active(role(name)) }
 }
 fn source_name(name: &'static [u8]) -> Text {
-    let s = unsafe { r4p::r4os_rust_r4p_source(role(name), true) };
-    Text {
-        pointer: s.data,
-        len: s.len,
-    }
+    Text::literal(r4p::source(name))
 }
 fn missing_reason() -> Text {
     Text::literal(match (active(b"usb.msc_bot"), active(b"usb.scsi_block")) {

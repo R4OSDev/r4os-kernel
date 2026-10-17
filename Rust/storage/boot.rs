@@ -706,7 +706,7 @@ unsafe fn storage_boot_usb(operation: u8, index: usize) -> usize {
                 }
                 c.assume_init().source as usize
             }
-            2 => usize::from(xhci_api::r4os_rust_usb_xhci_probe()),
+            2 => usize::from(xhci_api::probe()),
             3 => {
                 msc::set_owner(1);
                 0

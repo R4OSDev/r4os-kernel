@@ -22,11 +22,7 @@ fn role() -> Bytes {
     }
 }
 fn source() -> Text {
-    let s = unsafe { r4p::r4os_rust_r4p_source(role(), true) };
-    Text {
-        pointer: s.data,
-        len: s.len,
-    }
+    Text::literal(r4p::source(b"usb.hid_report"))
 }
 pub fn usage_page(value: u32) -> u16 {
     match value as u16 {

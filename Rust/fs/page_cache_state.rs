@@ -90,7 +90,6 @@ pub(super) struct State {
     pub worker_id: u32,
     pub failure_until: [u64; DEVICES],
     pub readahead: [policy::ReadAhead; DEVICES],
-    pub readahead_cursor: u8,
     pub reference_frames: u64,
     pub capacity: policy::Capacity,
     pub window_busy: bool,
@@ -118,7 +117,6 @@ static CACHE: Resident = Resident(UnsafeCell::new(State {
     worker_id: 0,
     failure_until: [0; DEVICES],
     readahead: [const { readahead_empty() }; DEVICES],
-    readahead_cursor: 0,
     reference_frames: 0,
     capacity: policy::Capacity {
         ram_pages: 64,
@@ -713,7 +711,6 @@ pub(super) unsafe fn reset() {
         });
         (*s).worker_started = false;
         (*s).worker_id = 0;
-        (*s).readahead_cursor = 0;
         let mut physical = phys::Stats::default();
         phys::r4os_rust_phys_stats(&mut physical);
         (*s).reference_frames = physical.free_frames;

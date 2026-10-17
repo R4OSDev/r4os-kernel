@@ -1,5 +1,5 @@
 //! Original stable block registry, retirement, operation pins and controller identities.
-//! Device/request storage remains with the temporary leaf; metadata mutations
+//! Device/request storage remains with its storage owner; metadata mutations
 //! occur only here under the original short storage owner, never across I/O.
 use crate::{
     memory::owner::Guard,

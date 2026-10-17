@@ -147,7 +147,7 @@ pub unsafe fn fill(f: &Framebuffer, rgb: u32) {
 /// through the synchronous present; stride/length are original element bounds.
 #[expect(
     clippy::too_many_arguments,
-    reason = "Preserve the original framebuffer/scroll argument contract during migration"
+    reason = "Preserve the framebuffer/scroll geometry contract"
 )]
 pub unsafe fn blit_packed(
     f: &Framebuffer,

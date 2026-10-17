@@ -241,8 +241,7 @@ unsafe fn program_font_control(op: u8, id: u32) -> u32 {
 
 unsafe fn program_font_measure(id: u32, text: *const u8, max_bytes: usize, out: *mut Measurement) {
     crate::font::owner::with_catalog(|s| unsafe {
-        let mut m = crate::font::types::TextMetrics::default();
-        crate::font::ffi::r4os_rust_font_state_measure_z_with_font(s, id, text, max_bytes, &mut m);
+        let m = (*s).measure_z_raw(id, text, max_bytes);
         out.write(Measurement {
             width: m.width,
             height: m.height,

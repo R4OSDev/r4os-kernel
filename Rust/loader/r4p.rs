@@ -261,8 +261,6 @@ fn registration(info: &Info) -> registry::Registration {
         name_len: info.name.len,
         role: info.role.data.as_ptr(),
         role_len: info.role.len,
-        note: b"".as_ptr(),
-        note_len: 0,
         category: info.category,
         version: 1,
         api_version: api::protocol_api_version,
@@ -1165,20 +1163,12 @@ pub unsafe extern "C" fn r4os_rust_r4p_dispatch(
 pub unsafe extern "C" fn r4os_rust_r4p_has_active(role: t::Bytes) -> bool {
     ensure_active(unsafe { bytes(role) })
 }
-/// # Safety
-/// Readable role for this passive selection only; no activation is performed.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_r4p_source(role: t::Bytes, required: bool) -> t::Bytes {
-    let Some(entry) = reg_entry(unsafe { bytes(role) }, 1) else {
-        return span(if required { b"none" } else { b"fallback" });
-    };
-    span(if entry.state == 2 {
-        source_name(entry.source)
-    } else if required {
-        b"none"
-    } else {
-        b"fallback"
-    })
+/// Passive source for a required R4P role; absence never selects a fallback.
+pub fn source(role: &[u8]) -> &'static [u8] {
+    match reg_entry(role, 1) {
+        Some(entry) if entry.state == 2 => source_name(entry.source),
+        _ => b"none",
+    }
 }
 /// # Safety
 /// Readable resident role; output is a copied passive C status snapshot.
@@ -1188,7 +1178,7 @@ pub unsafe extern "C" fn r4os_rust_r4p_status(role: t::Bytes) -> RoleStatus {
     let entry = reg_entry(role, 1);
     RoleStatus {
         active_r4p: active(role).is_some(),
-        builtin_fallback: reg_entry(role, 0).is_some(),
+        builtin_fallback: false,
         state: entry.map_or(0, |v| role_state(v.state)),
     }
 }

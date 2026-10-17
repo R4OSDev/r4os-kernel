@@ -158,7 +158,7 @@ pub unsafe extern "C" fn r4os_rust_net_config_rewrite(
     let output = if output_len == 0 {
         &mut []
     } else {
-        // Zig may supply uninitialized scratch. Initialize it before forming
+        // Callers may supply uninitialized scratch. Initialize it before forming
         // a Rust byte slice; only the returned prefix is part of the result.
         unsafe { core::ptr::write_bytes(output, 0, output_len) };
         unsafe { core::slice::from_raw_parts_mut(output, output_len) }

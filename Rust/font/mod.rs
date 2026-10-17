@@ -1,7 +1,6 @@
 pub mod builtin;
 pub mod catalog_io;
 pub mod decode;
-pub mod ffi;
 pub mod format;
 pub mod owner;
 pub mod state;

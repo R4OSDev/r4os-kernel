@@ -1,5 +1,5 @@
-//! Canonical native dynamic tasks. All still-Zig consumers receive opaque
-//! handles and fixed C records; typed scheduler access stays inside Rust.
+//! Canonical native dynamic tasks. External callers receive opaque handles
+//! and fixed records; the scheduler retains exact typed task access.
 pub(crate) mod diagnostic;
 pub(crate) mod task_api;
 pub(crate) mod task_lifecycle;
