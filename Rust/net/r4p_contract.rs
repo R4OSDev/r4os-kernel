@@ -110,22 +110,9 @@ pub const TCP_RESULT_BAD_STATE: i32 = -2;
 pub const TCP_RESULT_BUFFER_SMALL: i32 = -3;
 pub const TCP_RESULT_SHORT: i32 = -4;
 pub const TCP_RESULT_CHECKSUM: i32 = -5;
-pub const R4SL_OP_BUILD_FRAME: u32 = 1;
-pub const R4SL_OP_PARSE_BYTES: u32 = 2;
-pub const R4SL_OP_RESET_PARSER: u32 = 3;
-pub const R4SL_OP_SUMMARY: u32 = 5;
-pub const R4SL_RESULT_OK: i32 = 0;
-pub const R4SL_RESULT_NEED_MORE: i32 = 1;
-pub const R4SL_RESULT_BAD_MAGIC: i32 = -1;
-pub const R4SL_RESULT_BAD_VERSION: i32 = -2;
-pub const R4SL_RESULT_BAD_LENGTH: i32 = -3;
-pub const R4SL_RESULT_CHECKSUM: i32 = -4;
-pub const R4SL_RESULT_OVERFLOW: i32 = -5;
-pub const R4SL_RESULT_BUFFER_SMALL: i32 = -6;
-pub const R4SL_RESULT_BAD_STATE: i32 = -7;
 pub use crate::contract::{
-    ArpOp, DhcpOp, DnsOp, EthernetFrameOp, IcmpOp, Ipv4Op, R4slOp, R4slSummary, TcpOp,
-    TcpR4pConnectionInfo, TcpR4pSummary, UdpOp,
+    ArpOp, DhcpOp, DnsOp, EthernetFrameOp, IcmpOp, Ipv4Op, TcpOp, TcpR4pConnectionInfo,
+    TcpR4pSummary, UdpOp,
 };
 
 const _: () = {
@@ -288,31 +275,4 @@ const _: () = {
     assert!(core::mem::offset_of!(TcpOp, info) == 152);
     assert!(core::mem::offset_of!(TcpOp, payload) == 192);
     assert!(core::mem::offset_of!(TcpOp, segment) == 1728);
-};
-const _: () = {
-    assert!(core::mem::size_of::<R4slSummary>() == 64);
-    assert!(core::mem::align_of::<R4slSummary>() == 8);
-    assert!(core::mem::offset_of!(R4slSummary, parsed_frames) == 0);
-    assert!(core::mem::offset_of!(R4slSummary, built_frames) == 8);
-    assert!(core::mem::offset_of!(R4slSummary, loopback_tests) == 16);
-    assert!(core::mem::offset_of!(R4slSummary, bad_magic) == 24);
-    assert!(core::mem::offset_of!(R4slSummary, bad_version) == 32);
-    assert!(core::mem::offset_of!(R4slSummary, bad_length) == 40);
-    assert!(core::mem::offset_of!(R4slSummary, checksum_errors) == 48);
-    assert!(core::mem::offset_of!(R4slSummary, overflows) == 56);
-};
-const _: () = {
-    assert!(core::mem::size_of::<R4slOp>() == 880);
-    assert!(core::mem::align_of::<R4slOp>() == 8);
-    assert!(core::mem::offset_of!(R4slOp, frame_type) == 0);
-    assert!(core::mem::offset_of!(R4slOp, completed) == 1);
-    assert!(core::mem::offset_of!(R4slOp, reserved0) == 2);
-    assert!(core::mem::offset_of!(R4slOp, payload_len) == 4);
-    assert!(core::mem::offset_of!(R4slOp, frame_len) == 8);
-    assert!(core::mem::offset_of!(R4slOp, input_len) == 12);
-    assert!(core::mem::offset_of!(R4slOp, result) == 16);
-    assert!(core::mem::offset_of!(R4slOp, summary) == 24);
-    assert!(core::mem::offset_of!(R4slOp, payload) == 88);
-    assert!(core::mem::offset_of!(R4slOp, frame) == 344);
-    assert!(core::mem::offset_of!(R4slOp, input) == 610);
 };

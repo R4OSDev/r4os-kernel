@@ -2,14 +2,8 @@
 use super::network_api::copy_fixed;
 use crate::{
     contract::*,
-    net::{cleanup, ipc_net as shared, protocol_runtime, serial_link, telemetry, timing},
+    net::{cleanup, protocol_runtime, telemetry, timing},
 };
-pub const SERIAL_LINK_PAYLOAD_MAX: usize = 256;
-pub const SERIAL_LINK_RESULT_OK: i32 = 0;
-pub const SERIAL_LINK_RESULT_NO_PORT: i32 = -1;
-pub const SERIAL_LINK_RESULT_NOT_INITIALIZED: i32 = -2;
-pub const SERIAL_LINK_RESULT_TOO_LARGE: i32 = -3;
-pub const SERIAL_LINK_RESULT_FAILED: i32 = -4;
 pub const NET_CONFIG_FLAG_CONFIGURED: u32 = 1 << 0;
 pub const NET_CONFIG_FLAG_DNS_CONFIGURED: u32 = 1 << 1;
 pub const NET_CONFIG_FLAG_ADAPTER_PRESENT: u32 = 1 << 2;
@@ -226,50 +220,7 @@ pub(super) fn fill_tcp_connection_info(out: &mut TcpConnectionInfo, info: TcpCon
         last_payload_len: info.last_payload_len,
     };
 }
-pub(super) fn fill_serial_link_status(out: &mut SerialLinkStatus) {
-    let status = shared::capture(serial_link::r4os_rust_serial_link_snapshot);
-    *out = SerialLinkStatus {
-        present: u32::from(status.present),
-        initialized: u32::from(status.initialized),
-        port_base: status.port_base,
-        version: serial_link::VERSION,
-        max_payload: serial_link::MAX_PAYLOAD as u16,
-        last_type: status.last_type,
-        last_payload_len: status.last_payload_len,
-        last_message_len: status.last_message_len,
-        loopback_tests: status.loopback_tests,
-        host_tests: status.host_tests,
-        message_tx: status.message_tx,
-        message_rx: status.message_rx,
-        tx_skipped: status.tx_skipped,
-        tx_frames: status.tx_frames,
-        tx_bytes: status.tx_bytes,
-        rx_frames: status.rx_frames,
-        rx_bytes: status.rx_bytes,
-        polls: status.polls,
-        bad_magic: status.bad_magic,
-        bad_version: status.bad_version,
-        bad_length: status.bad_length,
-        checksum_errors: status.checksum_errors,
-        overflows: status.overflows,
-        timeouts: status.timeouts,
-        r4p_build: status.r4p_build,
-        r4p_parse: status.r4p_parse,
-        r4p_self: status.r4p_self,
-        r4p_fallbacks: 0,
-        r4p_dispatch_failures: status.r4p_dispatch_failures,
-        ..SerialLinkStatus::default()
-    };
-    copy_fixed(&mut out.last_error, status.last_error);
-    let payload_len = usize::from(status.last_payload_len);
-    let message_len = usize::from(status.last_message_len);
-    if payload_len != 0 {
-        out.last_payload[..payload_len].copy_from_slice(&status.last_payload[..payload_len]);
-    }
-    if message_len != 0 {
-        out.last_message[..message_len].copy_from_slice(&status.last_message[..message_len]);
-    }
-}
+
 pub(super) fn project_ipc_performance(
     s: crate::service::ipc_types::PerformanceSummary,
 ) -> IpcPerformanceSummary {

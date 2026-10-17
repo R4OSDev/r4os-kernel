@@ -37,8 +37,6 @@ pub mod r4p_contract;
 pub mod readers;
 pub mod rx_handoff;
 pub mod rx_runtime;
-pub mod serial_link;
-pub mod serial_runtime;
 pub mod tcp;
 pub mod tcp_client;
 mod tcp_owner;

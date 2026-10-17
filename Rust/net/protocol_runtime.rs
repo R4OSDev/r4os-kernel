@@ -1,6 +1,6 @@
 //! Sole R4P accounting and TCP wire-result labels. Queries combine copied
-//! counters with the real passive loader/SerialLink state after admission.
-use super::{r4p_contract as wire, serial_link, tcp, tcp_owner};
+//! counters with passive loader state after admission; slot8 is retired.
+use super::{r4p_contract as wire, tcp, tcp_owner};
 use crate::{fs::vfs_types::Bytes, loader::r4p, memory::owner::Guard, sched::sync_types::Text};
 use core::cell::UnsafeCell;
 #[repr(u8)]
@@ -14,7 +14,7 @@ enum Kind {
     Dhcp,
     Dns,
     Tcp,
-    SerialLink,
+    Reserved8,
 }
 impl Kind {
     fn from_code(value: u8) -> Self {
@@ -27,7 +27,7 @@ impl Kind {
             5 => Self::Dhcp,
             6 => Self::Dns,
             7 => Self::Tcp,
-            8 => Self::SerialLink,
+            8 => Self::Reserved8,
             _ => panic!("Exact network protocol kind"),
         }
     }
@@ -41,7 +41,7 @@ impl Kind {
             Self::Dhcp => b"net.dhcp",
             Self::Dns => b"net.dns",
             Self::Tcp => b"net.tcp",
-            Self::SerialLink => b"net.serial_link",
+            Self::Reserved8 => b"",
         }
     }
 }
@@ -87,10 +87,13 @@ impl State {
 }
 struct Storage(UnsafeCell<State>);
 // SAFETY: resident state uses short network metadata admission. Loader and
-// SerialLink queries, task/TCP admission and caller output run after release.
+// Task/TCP admission and caller output run after release.
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new(State::EMPTY));
 fn note(kind: Kind, metric: Metric, amount: u64) {
+    if matches!(kind, Kind::Reserved8) {
+        return;
+    }
     let _guard = Guard::acquire(2);
     unsafe {
         let row = &mut (*STATE.0.get()).protocols[kind as usize];
@@ -133,17 +136,22 @@ pub struct R4pRuntimeStatus {
     pub dispatch_failures: u64,
 }
 fn snapshot(kind: Kind) -> ProtocolRuntimeStats {
-    let counts = if matches!(kind, Kind::SerialLink) {
-        let s = serial_link::snapshot();
-        Counters {
-            rx: s.r4p_parse,
-            tx: s.r4p_build,
-            control: s.r4p_self,
-            build: s.r4p_build,
-            classify: 0,
-            failures: s.r4p_dispatch_failures,
-        }
-    } else {
+    if matches!(kind, Kind::Reserved8) {
+        return ProtocolRuntimeStats {
+            active_r4p: false,
+            r4p_state: 0,
+            builtin_fallback: false,
+            fallback_policy: 0,
+            fallback_decision: 0,
+            r4p_rx: 0,
+            r4p_tx: 0,
+            r4p_control: 0,
+            r4p_build: 0,
+            r4p_classify: 0,
+            dispatch_failures: 0,
+        };
+    }
+    let counts = {
         let _guard = Guard::acquire(2);
         unsafe { (*STATE.0.get()).protocols[kind as usize] }
     };
@@ -189,7 +197,7 @@ pub unsafe extern "C" fn r4os_rust_net_protocol_runtime(kind: u8, out: *mut Prot
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_net_r4p_runtime(out: *mut R4pRuntimeStatus) {
     let mut s = R4pRuntimeStatus {
-        protocol_count: 9,
+        protocol_count: 8,
         active: 0,
         missing: 0,
         r4p_rx: 0,
@@ -199,7 +207,7 @@ pub unsafe extern "C" fn r4os_rust_net_r4p_runtime(out: *mut R4pRuntimeStatus) {
         r4p_classify: 0,
         dispatch_failures: 0,
     };
-    for code in 0..9 {
+    for code in 0..8 {
         let row = snapshot(Kind::from_code(code));
         if row.active_r4p {
             s.active += 1;

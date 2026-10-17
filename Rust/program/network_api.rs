@@ -8,8 +8,8 @@ use crate::{
     net::{
         adapter_runtime, adapters, app_ipv4, cleanup, config, config_writer, dhcp_client,
         diagnostics, dns_client, frames, ipc_net as shared, ipc_services, packet_pool,
-        protocol_runtime, protocol_stats, rx_runtime, serial_link, serial_runtime, tcp, tcp_client,
-        telemetry, timing, udp_runtime, udp_sockets,
+        protocol_runtime, protocol_stats, rx_runtime, tcp, tcp_client, telemetry, timing,
+        udp_runtime, udp_sockets,
     },
     sched::sync_types::Text,
     service::{ipc, ipc_types as channel},
@@ -564,87 +564,44 @@ pub unsafe extern "C" fn r4os_rust_r4net_udp_status(out: *mut UdpStatus) -> i32 
 /// Canonical caller retains readable inputs and exclusive writable outputs,
 /// with their declared alignment/extent, through the complete operation.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_r4net_serial_link_status(out: *mut SerialLinkStatus) -> i32 {
-    serial_link::r4os_rust_serial_link_poll();
-    let mut value = SerialLinkStatus::default();
-    project::fill_serial_link_status(&mut value);
-    unsafe {
-        out.write(value);
-    }
-    1
+pub unsafe extern "C" fn r4os_rust_r4net_serial_link_status(_out: *mut SerialLinkStatus) -> i32 {
+    // Reserved published ABI slot. No buffer access, UART, loader or work.
+    crate::contract::err_no_fn
 }
 /// # Safety
 /// Canonical caller retains readable inputs and exclusive writable outputs,
 /// with their declared alignment/extent, through the complete operation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4net_serial_link_poll() -> i32 {
-    serial_link::r4os_rust_serial_link_poll();
-    1
+    // Reserved published ABI slot. No buffer access, UART, loader or work.
+    crate::contract::err_no_fn
 }
 /// # Safety
 /// Canonical caller retains readable inputs and exclusive writable outputs,
 /// with their declared alignment/extent, through the complete operation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4net_serial_link_send_message(
-    data: *const u8,
-    len: u32,
+    _data: *const u8,
+    _len: u32,
 ) -> i32 {
-    if len as usize > SERIAL_LINK_PAYLOAD_MAX {
-        return SERIAL_LINK_RESULT_TOO_LARGE;
-    }
-    if unsafe { serial_link::r4os_rust_serial_link_send_message(data, len as usize) } {
-        return len as i32;
-    }
-    let s = shared::capture(serial_link::r4os_rust_serial_link_snapshot);
-    if !s.present {
-        return SERIAL_LINK_RESULT_NO_PORT;
-    }
-    if !s.initialized {
-        return SERIAL_LINK_RESULT_NOT_INITIALIZED;
-    }
-    SERIAL_LINK_RESULT_FAILED
+    // Reserved published ABI slot. No buffer access, UART, loader or work.
+    crate::contract::err_no_fn
 }
 /// # Safety
 /// Canonical caller retains readable inputs and exclusive writable outputs,
 /// with their declared alignment/extent, through the complete operation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4net_serial_link_host_test() -> i32 {
-    serial_link::r4os_rust_serial_link_poll();
-    let s = shared::capture(serial_link::r4os_rust_serial_link_snapshot);
-    if !s.present {
-        return SERIAL_LINK_RESULT_NO_PORT;
-    }
-    if !s.initialized {
-        return SERIAL_LINK_RESULT_NOT_INITIALIZED;
-    }
-    SERIAL_LINK_RESULT_FAILED
+    // Reserved published ABI slot. No buffer access, UART, loader or work.
+    crate::contract::err_no_fn
 }
 /// # Safety
 /// Canonical caller retains readable inputs and exclusive writable outputs,
 /// with their declared alignment/extent, through the complete operation.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_r4net_serial_link_inbox(out: *mut SerialLinkMessage) -> i32 {
-    serial_link::r4os_rust_serial_link_poll();
-    let mut message = MaybeUninit::<serial_runtime::Message>::uninit();
-    if !unsafe { serial_link::r4os_rust_serial_link_message(message.as_mut_ptr()) } {
-        unsafe {
-            out.write(SerialLinkMessage::default());
-        }
-        return 0;
-    }
-    let message = unsafe { message.assume_init() };
-    let mut value = SerialLinkMessage {
-        len: message.len,
-        ..SerialLinkMessage::default()
-    };
-    let len = message.len as usize;
-    if len != 0 {
-        value.data[..len].copy_from_slice(&message.data[..len]);
-    }
-    unsafe {
-        out.write(value);
-    }
-    message.len as i32
+pub unsafe extern "C" fn r4os_rust_r4net_serial_link_inbox(_out: *mut SerialLinkMessage) -> i32 {
+    // Reserved published ABI slot. No buffer access, UART, loader or work.
+    crate::contract::err_no_fn
 }
 fn trim(mut value: &[u8]) -> &[u8] {
     while matches!(value.first(), Some(b' ' | b'\t')) {
@@ -1081,7 +1038,7 @@ fn detail(index: u32) -> (i32, NetDetailSnapshot) {
 
     let tcp_stats = shared::tcp_stats();
     copy_fixed(&mut out.tcp_last_error, tcp_stats.last_error);
-    for kind in 0..9 {
+    for kind in 0..8 {
         let mut stats = MaybeUninit::uninit();
         unsafe {
             protocol_runtime::r4os_rust_net_protocol_runtime(kind, stats.as_mut_ptr());

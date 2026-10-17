@@ -1,6 +1,6 @@
 //! Sole network/IPC boot coordinator. Peers perform work at their existing
 //! owners; every status publication is a small copy outside peer calls.
-use super::{config, serial_link, tcp};
+use super::{config, tcp};
 use crate::{
     arch::runtime::RuntimeGuard,
     boot::{fatal, foundation, log},
@@ -15,11 +15,9 @@ pub struct Status {
     pub contract_ready: bool,
     pub core_ready: bool,
     pub boot_config_applied: bool,
-    pub serial_link_ready: bool,
     pub ipc_ready: bool,
     pub net_ipc_services_ready: bool,
     pub adapter_count: usize,
-    pub serial_link_present: bool,
     pub config_invalid_options: u64,
     pub config_source: Text,
     pub failed: bool,
@@ -31,11 +29,9 @@ impl Status {
         contract_ready: false,
         core_ready: false,
         boot_config_applied: false,
-        serial_link_ready: false,
         ipc_ready: false,
         net_ipc_services_ready: false,
         adapter_count: 0,
-        serial_link_present: false,
         config_invalid_options: 0,
         config_source: Text::literal(b"none"),
         failed: false,
@@ -71,7 +67,7 @@ fn phase_name(phase: u8) -> &'static [u8] {
         1 => b"contract-ready",
         2 => b"core-ready",
         3 => b"boot-config-applied",
-        4 => b"serial-link-ready",
+        4 => b"retired",
         5 => b"ipc-ready",
         6 => b"net-ipc-services-ready",
         7 => b"failed",
@@ -130,8 +126,6 @@ fn ready_reason(s: Status) -> &'static [u8] {
         b"network/ipc ready with invalid net config options"
     } else if s.adapter_count == 0 {
         b"network/ipc ready without adapter"
-    } else if !s.serial_link_present {
-        b"network/ipc ready without serial link"
     } else {
         b"network/ipc ready"
     }
@@ -194,16 +188,6 @@ unsafe fn init_with_config(loaded: *const c_void) -> bool {
     bootlog(b" invalid=");
     log::r4os_rust_bootlog_dec(config.invalid_options);
     bootlog(b"\r\n");
-    serial_link::init();
-    let present = serial_link::snapshot().present;
-    update(|s| {
-        s.serial_link_ready = true;
-        s.serial_link_present = present;
-        s.phase = 4;
-    });
-    bootlog(b"[NETBOOT] serial-link [OK] present=");
-    bootlog(yes_no(present));
-    bootlog(b"\r\n");
     unsafe { crate::service::ipc::r4os_rust_ipc_control(0, 0) };
     update(|s| {
         s.ipc_ready = true;
@@ -230,8 +214,6 @@ fn dump_status_bootlog() {
         (b" contract=".as_slice(), s.contract_ready),
         (b" core=", s.core_ready),
         (b" config=", s.boot_config_applied),
-        (b" serial=", s.serial_link_ready),
-        (b" serial_present=", s.serial_link_present),
         (b" ipc=", s.ipc_ready),
         (b" services=", s.net_ipc_services_ready),
     ] {
@@ -260,7 +242,6 @@ fn dump_status_log() {
     foundation::puts(yes_no(s.core_ready));
     for (label, value) in [
         (b" config=".as_slice(), s.boot_config_applied),
-        (b" serial=", s.serial_link_ready),
         (b" ipc=", s.ipc_ready),
         (b" services=", s.net_ipc_services_ready),
     ] {
@@ -283,8 +264,6 @@ fn emit_boot_status_line() {
     foundation::puts(bytes(s.config_source));
     foundation::puts(b" adapters=");
     foundation::dec(s.adapter_count as u64);
-    foundation::puts(b" com2=");
-    foundation::puts(yes_no(s.serial_link_present));
     foundation::puts(b" invalid=");
     foundation::dec(s.config_invalid_options);
     foundation::puts(b" [OK]\r\n");
@@ -335,19 +314,17 @@ pub unsafe extern "C" fn r4os_rust_network_boot_phase(phase: u8, out: *mut Text)
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<Status>() == 72);
+    assert!(core::mem::size_of::<Status>() == 64);
     assert!(core::mem::align_of::<Status>() == 8);
     assert!(core::mem::offset_of!(Status, phase) == 0);
     assert!(core::mem::offset_of!(Status, contract_ready) == 1);
     assert!(core::mem::offset_of!(Status, core_ready) == 2);
     assert!(core::mem::offset_of!(Status, boot_config_applied) == 3);
-    assert!(core::mem::offset_of!(Status, serial_link_ready) == 4);
-    assert!(core::mem::offset_of!(Status, ipc_ready) == 5);
-    assert!(core::mem::offset_of!(Status, net_ipc_services_ready) == 6);
+    assert!(core::mem::offset_of!(Status, ipc_ready) == 4);
+    assert!(core::mem::offset_of!(Status, net_ipc_services_ready) == 5);
     assert!(core::mem::offset_of!(Status, adapter_count) == 8);
-    assert!(core::mem::offset_of!(Status, serial_link_present) == 16);
-    assert!(core::mem::offset_of!(Status, config_invalid_options) == 24);
-    assert!(core::mem::offset_of!(Status, config_source) == 32);
-    assert!(core::mem::offset_of!(Status, failed) == 48);
-    assert!(core::mem::offset_of!(Status, reason) == 56);
+    assert!(core::mem::offset_of!(Status, config_invalid_options) == 16);
+    assert!(core::mem::offset_of!(Status, config_source) == 24);
+    assert!(core::mem::offset_of!(Status, failed) == 40);
+    assert!(core::mem::offset_of!(Status, reason) == 48);
 };
