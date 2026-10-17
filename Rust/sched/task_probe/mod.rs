@@ -1,8 +1,9 @@
 //! Canonical native orchestration of the existing explicit TaskRegistry cases.
-//! Only still-Zig owner snapshots/operations cross fixed private C cuts.
+//! Native owner operations retain their exact task and resource identities.
 mod deadlines;
 mod fpu;
 mod helpers;
+pub(crate) mod live;
 mod owner_snapshots;
 mod resources;
 mod roles;
@@ -24,6 +25,16 @@ fn option_is(value: &[u8], wanted: &[u8]) -> bool {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_task_registry_selftest() -> bool {
+    let Some(mut gate) = crate::sched::kernel_check::gate() else {
+        return false;
+    };
+    let result = boot_cases();
+    if !result || resources::retained_work() {
+        gate.retain();
+    }
+    result
+}
+fn boot_cases() -> bool {
     unsafe {
         let mut option = Span {
             pointer: core::ptr::null(),

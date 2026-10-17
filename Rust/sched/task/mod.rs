@@ -10,6 +10,24 @@ use crate::sched::scheduler::TaskView;
 use core::{ffi::c_void, ptr};
 pub(crate) use task_types::Task;
 
+/// Enroll one owned, pinned, non-running diagnostic task through the real
+/// deadline owner. Caller supplies an absolute future tick under runtime admission.
+pub(crate) unsafe fn diagnostic_timeout(task: *mut Task, tick: u64, reason: &'static [u8]) {
+    let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+    unsafe {
+        task_registry::begin_wait(
+            task,
+            tick,
+            crate::platform::timer::tick_count(),
+            task_types::Bytes {
+                pointer: reason.as_ptr(),
+                len: reason.len(),
+            },
+            0,
+        );
+    }
+}
+
 /// # Safety
 /// Non-null exact task remains resident through the call. Identity fields are
 /// immutable for that incarnation; no mutable scheduler metadata is sampled.

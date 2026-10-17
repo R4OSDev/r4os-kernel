@@ -75,10 +75,10 @@ pub unsafe fn mutate(op: u8, t: *mut Task, a: u64, b: u64) -> u64 {
     unsafe { r4os_rust_task_mutate(op, t.cast(), a, b, ptr::null(), 0) }
 }
 pub unsafe fn pin(t: *mut Task) -> bool {
-    unsafe { mutate(17, t, 0, 0) != 0 }
+    unsafe { crate::sched::task::task_lifecycle::pin(t) }
 }
 pub unsafe fn unpin(t: *mut Task) -> bool {
-    unsafe { mutate(18, t, 0, 0) != 0 }
+    unsafe { crate::sched::task::task_lifecycle::unpin(t) }
 }
 pub unsafe fn identity(op: u8, id: u32, generation: u64) -> u64 {
     unsafe { r4os_rust_task_identity(op, id, generation, ptr::null_mut(), 0) }
@@ -87,15 +87,28 @@ pub unsafe fn alive(id: u32, generation: u64) -> bool {
     unsafe { r4os_rust_task_control(19, u64::from(id), generation) != 0 }
 }
 pub unsafe fn release(id: u32, generation: u64) -> bool {
-    unsafe { identity(5, id, generation) != 0 }
+    if crate::sched::kernel_check::live() {
+        return crate::sched::kernel_check::tasks::finish(id, generation, false).unwrap_or(false);
+    }
+    unsafe { crate::sched::task::task_lifecycle::release_dead(id, Some(generation)) }
 }
 pub unsafe fn kill(id: u32, generation: u64) -> bool {
-    unsafe { identity(3, id, generation) != 0 }
+    unsafe { crate::sched::task::task_lifecycle::kill(id, Some(generation)) }
 }
 pub unsafe fn retire(id: u32, generation: u64) -> u64 {
-    unsafe { identity(6, id, generation) }
+    if crate::sched::kernel_check::live() {
+        return if crate::sched::kernel_check::tasks::finish(id, generation, true) == Some(true) {
+            2
+        } else {
+            1
+        };
+    }
+    unsafe { crate::sched::task::task_lifecycle::retire(id, generation) as u64 }
 }
 pub fn drain_resources() {
+    if crate::sched::kernel_check::live() {
+        return;
+    }
     unsafe {
         r4os_rust_task_control(16, 0, 0);
         r4os_rust_task_control(17, 0, 0);
@@ -163,6 +176,15 @@ pub fn reason_is(value: Bytes, wanted: &[u8]) -> bool {
 }
 pub unsafe fn create(name: &'static [u8], entry: Entry, state: State, role: Role) -> *mut Task {
     unsafe {
+        if crate::sched::kernel_check::live() {
+            let t = crate::sched::kernel_check::tasks::create(name, entry, role);
+            if !t.is_null() && state == State::Ready && !crate::sched::kernel_check::tasks::start(t)
+            {
+                crate::sched::kernel_check::tasks::finish_task(t, true);
+                return ptr::null_mut();
+            }
+            return t;
+        }
         let mut failure = CreateFailure::None;
         super::owner_snapshots::create(name, entry, state, role, &mut failure)
     }

@@ -8,7 +8,14 @@ use crate::{
         task_types::{Bytes, CreateFailure, Role, State},
     },
 };
-use core::ptr;
+use core::{
+    ptr,
+    sync::atomic::{AtomicU32, Ordering},
+};
+static WORK_HANDLES: [AtomicU32; 2] = [const { AtomicU32::new(0) }; 2];
+pub(super) fn retained_work() -> bool {
+    WORK_HANDLES.iter().any(|v| v.load(Ordering::Acquire) != 0)
+}
 unsafe extern "C" {
 
     fn r4os_rust_task_identity(
@@ -24,13 +31,16 @@ pub unsafe fn kill_id(id: u32) -> bool {
 }
 pub unsafe fn work_fpu() -> bool {
     unsafe {
+        if retained_work() {
+            return fail(b"fpu-work-retained");
+        }
         let mut status = core::mem::MaybeUninit::uninit();
         owner::r4os_rust_fpu_status(status.as_mut_ptr());
         if !status.assume_init().avx_enabled {
             return fail(b"fpu-work-avx-unavailable");
         }
         let mut passed = true;
-        for lane in 0..2 {
+        for (lane, slot) in WORK_HANDLES.iter().enumerate() {
             let mut handle = 0;
             let submitted = task_probe_work_submit(
                 lane,
@@ -44,14 +54,34 @@ pub unsafe fn work_fpu() -> bool {
             if submitted != 0 {
                 return fail(b"fpu-work-submit");
             }
+            slot.store(handle, Ordering::Release);
+            if crate::sched::kernel_check::live() {
+                crate::sched::kernel_check::update(|r| {
+                    r.work_submitted += 1;
+                    r.live_work += 1;
+                });
+            }
             let mut result = -1;
-            if task_probe_work(0, handle, 2000, &mut result) != 0 {
+            let completed = task_probe_work(0, handle, 2000, &mut result) == 0;
+            if !completed {
                 task_probe_work(1, handle, 0, ptr::null_mut());
-                task_probe_work(2, handle, 0, ptr::null_mut());
-                return fail(b"fpu-work-wait");
+                // Cancellation requests do not finish a running callback.
+                if task_probe_work(0, handle, 2000, &mut result) != 0 {
+                    return fail(b"fpu-work-completion-retained");
+                }
             }
             if task_probe_work(2, handle, 0, ptr::null_mut()) != 0 {
-                return fail(b"fpu-work-release");
+                return fail(b"fpu-work-release-retained");
+            }
+            slot.store(0, Ordering::Release);
+            if crate::sched::kernel_check::live() {
+                crate::sched::kernel_check::update(|r| {
+                    r.work_released += 1;
+                    r.live_work -= 1;
+                });
+            }
+            if !completed {
+                return fail(b"fpu-work-wait");
             }
             puts(b"TASKREG08201 fpu-work lane=");
             puts(if lane == 0 { b"normal" } else { b"deadline" });
@@ -65,7 +95,7 @@ pub unsafe fn work_fpu() -> bool {
             b"TASKREG08201 fpu-work FAIL lanes=2 irq-boundary=actual\r\n"
         });
         if passed && fpu::callback(2) != 0 {
-            return fail(b"fpu-kernel-main");
+            return fail(b"fpu-caller-irq");
         }
         passed
     }

@@ -755,7 +755,7 @@ fn wake_task(task: Task, result: u32) -> bool {
     runtime::restore_runtime(flags);
     true
 }
-fn publish_created(task: Task) -> bool {
+pub(crate) fn publish_created(task: Task) -> bool {
     let flags = runtime::save_runtime();
     preempt_disable();
     let item = view(task);

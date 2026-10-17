@@ -34,4 +34,5 @@ pub mod devices;
 pub mod display;
 pub mod paging;
 pub mod protocol;
+pub mod scheduler;
 pub mod storage;

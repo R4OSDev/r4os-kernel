@@ -4,33 +4,14 @@ mod allocations;
 mod cases;
 
 use super::heap;
-use crate::{arch::runtime::RuntimeGuard, contract as c, sched::task_context};
+use crate::contract as c;
+pub(crate) use crate::sched::task_context::Admission;
 use allocations::State;
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-pub(crate) struct Admission(task_context::Unwind);
-impl Admission {
-    pub(crate) fn acquire(require_task: bool) -> Option<Self> {
-        let _runtime = RuntimeGuard::acquire();
-        let token = unsafe { task_context::enter() };
-        if !token.admitted() || require_task && !token.context_present {
-            return None;
-        }
-        Some(Self(token))
-    }
-}
-impl Drop for Admission {
-    fn drop(&mut self) {
-        let _runtime = RuntimeGuard::acquire();
-        assert!(
-            unsafe { task_context::leave(self.0) },
-            "heap check unwind identity"
-        );
-    }
-}
 struct Cell(UnsafeCell<State>);
 // Only RUNNING's successful CAS admits ledger access. Busy readers touch no
 // ledger storage; a failed cleanup retains it without any automatic retry.

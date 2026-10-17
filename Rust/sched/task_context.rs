@@ -3,6 +3,25 @@
 //! leave must never select whichever task happens to be current later.
 use crate::arch::{percpu, smp_policy::MAX_CPUS};
 use core::cell::UnsafeCell;
+/// Keeps the original task resident through blocking native work and output.
+/// Runtime admission covers only the counter transitions, never the work.
+pub(crate) struct Admission(Unwind);
+impl Admission {
+    pub(crate) fn acquire(require_task: bool) -> Option<Self> {
+        let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+        let token = unsafe { enter() };
+        if !token.admitted() || require_task && !token.context_present {
+            return None;
+        }
+        Some(Self(token))
+    }
+}
+impl Drop for Admission {
+    fn drop(&mut self) {
+        let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+        assert!(unsafe { leave(self.0) }, "native task unwind identity");
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Unwind {

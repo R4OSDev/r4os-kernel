@@ -1,14 +1,13 @@
 //! Original bounded SYNCCHECK cases: recursive contention, auto-reset event
 //! ping-pong and the exact caller IF on/off through both blocking paths.
+//! Shared boot/live body; the exclusive diagnostic gate retains all identities.
 use super::{
-    sync_locks, sync_objects,
+    kernel_check::{self, tasks},
+    scheduler, sync_locks, sync_objects,
     sync_types::{Event, Mutex},
-    task::{
-        task_resources as resources,
-        task_types::{Bytes, CreateFailure, ExecutionOwnerKind, Role, State},
-    },
+    task::task_types::{Role, Task},
 };
-use crate::{arch::runtime, platform::timer, sched::scheduler};
+use crate::{arch::runtime, platform::timer};
 use core::{
     cell::UnsafeCell,
     ptr,
@@ -16,8 +15,8 @@ use core::{
 };
 const EVENT_ITERS: u32 = 200;
 struct Objects(UnsafeCell<(Mutex, Event, Event)>);
-// SAFETY: original selftest runs on the boot caller and BSP-only partner Tasks;
-// actual object mutations use native synchronization's runtime admissions.
+// Only the admitted BSP controller and its BSP children access the objects.
+// Reset follows exact child retirement; failed cleanup retains the gate.
 unsafe impl Sync for Objects {}
 static OBJECTS: Objects = Objects(UnsafeCell::new((Mutex::EMPTY, Event::AUTO, Event::AUTO)));
 static STOP: AtomicBool = AtomicBool::new(false);
@@ -59,28 +58,16 @@ fn fail(reason: &[u8]) -> bool {
     puts(b"\r\n");
     false
 }
-fn spawn(name: &'static [u8], entry: unsafe extern "C" fn()) -> bool {
-    unsafe {
-        let mut failure = CreateFailure::None;
-        !resources::create(
-            resources::CreateArgs {
-                name: Bytes {
-                    pointer: name.as_ptr(),
-                    len: name.len(),
-                },
-                state: State::Ready,
-                needs_fpu: true,
-                entry: Some(entry),
-                role: Role::Interactive,
-                smp_eligible: false,
-                smp_r4x: false,
-                owner_kind: ExecutionOwnerKind::None,
-                owner_context: ptr::null_mut(),
-            },
-            &mut failure,
-        )
-        .is_null()
+fn spawn(name: &'static [u8], entry: unsafe extern "C" fn()) -> Option<*mut Task> {
+    let task = tasks::create(name, entry, Role::Interactive);
+    if task.is_null() {
+        return None;
     }
+    if !tasks::start(task) {
+        tasks::finish_task(task, true);
+        return None;
+    }
+    Some(task)
 }
 unsafe extern "C" fn holder() {
     unsafe {
@@ -139,9 +126,9 @@ fn event_preserves_if(enabled: bool) -> bool {
     unsafe {
         if_event().write(Event::AUTO);
         IF_PARTNER_DONE.store(false, Ordering::Release);
-        if !spawn(b"sync-st-if-evt", if_partner) {
+        let Some(child) = spawn(b"sync-st-if-evt", if_partner) else {
             return false;
-        }
+        };
         let original = runtime::r4os_rust_runtime_control(2, 0);
         if enabled {
             runtime::r4os_rust_runtime_control(1, 0);
@@ -149,17 +136,60 @@ fn event_preserves_if(enabled: bool) -> bool {
         let result = sync_objects::r4os_rust_sync_event(if_event(), 2, 200);
         let after = runtime::r4os_rust_runtime_control(2, 0);
         runtime::r4os_rust_runtime_control(3, original);
-        result == 1 && IF_PARTNER_DONE.load(Ordering::Acquire) && (after & (1 << 9) != 0) == enabled
+        let joined = tasks::finish_task(child, false);
+        joined
+            && result == 1
+            && IF_PARTNER_DONE.load(Ordering::Acquire)
+            && (after & (1 << 9) != 0) == enabled
     }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_sync_selftest() -> bool {
+    kernel_check::boot_sync()
+}
+
+pub(crate) fn stop() {
+    STOP.store(true, Ordering::Release);
+}
+
+fn recursive_mutex() -> bool {
     unsafe {
+        if !sync_locks::r4os_rust_sync_mutex(mutex(), 1, 50) {
+            return false;
+        }
+        let recursive = sync_locks::r4os_rust_sync_mutex(mutex(), 1, 0);
+        let (id, generation) = tasks::identity(scheduler::current().cast());
+        let exact = (*mutex()).owner == id
+            && (*mutex()).owner_generation == generation
+            && (*mutex()).depth == 2;
+        let first = !recursive || sync_locks::r4os_rust_sync_mutex(mutex(), 2, 0);
+        let last = sync_locks::r4os_rust_sync_mutex(mutex(), 2, 0);
+        recursive
+            && exact
+            && first
+            && last
+            && (*mutex()).owner == 0
+            && (*mutex()).owner_generation == 0
+            && (*mutex()).depth == 0
+            && (*mutex()).queue.core.count == 0
+            && (*mutex()).donation_rank == 255
+    }
+}
+
+pub(crate) fn cases() -> bool {
+    unsafe {
+        OBJECTS
+            .0
+            .get()
+            .write((Mutex::EMPTY, Event::AUTO, Event::AUTO));
+        if !recursive_mutex() {
+            return fail(b"mutex-recursion");
+        }
         STOP.store(false, Ordering::Release);
         HOLDER_DONE.store(false, Ordering::Release);
-        if !spawn(b"sync-st-hold", holder) {
+        let Some(holder_task) = spawn(b"sync-st-hold", holder) else {
             return fail(b"holder-spawn");
-        }
+        };
         sleep(3, b"sync-st-warm");
         let t0 = timer::tick_count();
         let got = sync_locks::r4os_rust_sync_mutex(mutex(), 1, 50);
@@ -173,7 +203,7 @@ pub extern "C" fn r4os_rust_sync_selftest() -> bool {
             guard += 1;
             sleep(1, b"sync-st-join");
         }
-        if guard >= 2000 {
+        if guard >= 2000 || !tasks::finish_task(holder_task, false) {
             return fail(b"holder-join");
         }
         if elapsed > 200 {
@@ -181,9 +211,9 @@ pub extern "C" fn r4os_rust_sync_selftest() -> bool {
         }
         event().write(Event::AUTO);
         PARTNER_DONE.store(false, Ordering::Release);
-        if !spawn(b"sync-st-evt", partner) {
+        let Some(partner_task) = spawn(b"sync-st-evt", partner) else {
             return fail(b"partner-spawn");
-        }
+        };
         for _ in 0..EVENT_ITERS {
             if sync_objects::r4os_rust_sync_event(event(), 2, 200) != 1 {
                 return fail(b"event-lost");
@@ -194,7 +224,7 @@ pub extern "C" fn r4os_rust_sync_selftest() -> bool {
             guard += 1;
             sleep(1, b"sync-st-join2");
         }
-        if guard >= 2000 {
+        if guard >= 2000 || !tasks::finish_task(partner_task, false) {
             return fail(b"partner-join");
         }
         if !sleep_preserves_if(true) {
@@ -209,6 +239,10 @@ pub extern "C" fn r4os_rust_sync_selftest() -> bool {
         if !event_preserves_if(false) {
             return fail(b"if-event-off");
         }
+        kernel_check::update(|r| {
+            r.event_iterations = u64::from(EVENT_ITERS);
+            r.if_checks = 4;
+        });
         puts(b"SYNCCHECK OK mutex_elapsed=");
         crate::boot::log_route::dec(elapsed);
         puts(b" event_iters=");

@@ -61,7 +61,10 @@ fn puts(text: &[u8]) {
 pub(super) unsafe fn complete_release(task: *mut Task, token: task_context::Unwind) -> bool {
     unsafe {
         let result = complete_admitted(task);
-        task_context::leave(token);
+        let flags = runtime::save_runtime();
+        let returned = task_context::leave(token);
+        runtime::restore_runtime(flags);
+        assert!(returned, "Task release unwind identity");
         result
     }
 }
@@ -144,7 +147,7 @@ unsafe fn complete_admitted(task: *mut Task) -> bool {
         false
     }
 }
-pub(super) unsafe fn pin(task: *mut Task) -> bool {
+pub(crate) unsafe fn pin(task: *mut Task) -> bool {
     let flags = runtime::save_runtime();
     let result = unsafe {
         if !registry::contains(task)
@@ -200,6 +203,64 @@ pub(crate) unsafe fn unpin(task: *mut Task) -> bool {
         true
     }
 }
+
+/// Diagnostic retirement never substitutes registry absence for a metadata
+/// free acknowledgment. Pending retains the caller's last pin. Retained has
+/// handed teardown to this owner and must never be retried through a raw task
+/// pointer or converted to success by a later registry lookup.
+pub(crate) enum DiagnosticRetire {
+    Pending,
+    Released,
+    Retained,
+}
+pub(crate) unsafe fn retire_diagnostic_pin(
+    task: *mut Task,
+    id: u32,
+    generation: u64,
+) -> DiagnosticRetire {
+    unsafe {
+        let flags = runtime::save_runtime();
+        if !registry::contains(task) {
+            runtime::restore_runtime(flags);
+            return DiagnosticRetire::Retained;
+        }
+        let c = registry::core(task);
+        if (*c).id != id || (*c).generation != generation {
+            runtime::restore_runtime(flags);
+            return DiagnosticRetire::Retained;
+        }
+        if (*c).pin_count != 1
+            || (*c).state != State::Dead
+            || (*c).running_cpu != 0xff
+            || is_current(task)
+            || !(*c).wait_node.queue.is_null()
+            || (*c).held_lock_count != 0
+            || (*c).unwind_guard_count != 0
+            || (*c).release_in_progress
+        {
+            runtime::restore_runtime(flags);
+            return DiagnosticRetire::Pending;
+        }
+        (*c).retire_pending = true;
+        registry::link_reap(task);
+        (*c).pin_count = 0;
+        let token = claim(task);
+        if token.is_none() {
+            (*c).pin_count = 1;
+        }
+        runtime::restore_runtime(flags);
+        let Some(token) = token else {
+            return DiagnosticRetire::Pending;
+        };
+        // This exact claim excludes the background reaper throughout resource
+        // and metadata teardown. No runtime owner spans those operations.
+        if complete_release(task, token) {
+            DiagnosticRetire::Released
+        } else {
+            DiagnosticRetire::Retained
+        }
+    }
+}
 pub(super) unsafe fn finish_current(task: *mut Task, retire: bool) -> bool {
     let flags = runtime::save_runtime();
     let result = unsafe {
@@ -217,7 +278,7 @@ pub(super) unsafe fn finish_current(task: *mut Task, retire: bool) -> bool {
     runtime::restore_runtime(flags);
     result
 }
-pub(super) unsafe fn kill(id: u32, generation: Option<u64>) -> bool {
+pub(crate) unsafe fn kill(id: u32, generation: Option<u64>) -> bool {
     let flags = runtime::save_runtime();
     let result = unsafe {
         let task = match generation {
@@ -246,7 +307,7 @@ pub(super) unsafe fn kill(id: u32, generation: Option<u64>) -> bool {
     runtime::restore_runtime(flags);
     result
 }
-pub(super) unsafe fn retire(id: u32, generation: u64) -> RetireResult {
+pub(crate) unsafe fn retire(id: u32, generation: u64) -> RetireResult {
     unsafe {
         if id == 0 || generation == 0 {
             return RetireResult::Gone;
@@ -287,7 +348,7 @@ pub(super) unsafe fn retire(id: u32, generation: u64) -> RetireResult {
         }
     }
 }
-pub(super) unsafe fn release_dead(id: u32, generation: Option<u64>) -> bool {
+pub(crate) unsafe fn release_dead(id: u32, generation: Option<u64>) -> bool {
     unsafe {
         let flags = runtime::save_runtime();
         let task = match generation {

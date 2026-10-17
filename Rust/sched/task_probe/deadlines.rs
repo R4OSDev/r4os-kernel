@@ -138,27 +138,38 @@ unsafe fn clean(probes: &mut [*mut Task; STORM]) -> bool {
         ok
     }
 }
-pub unsafe fn storm() -> bool {
+pub(super) unsafe fn allocate(
+    probes: &mut [*mut Task; STORM],
+    entry: crate::sched::task::task_types::Entry,
+) -> bool {
     unsafe {
-        let mut probes = [ptr::null_mut(); STORM];
         for i in 0..STORM {
             let t = create(
                 b"taskreg-deadline-storm",
-                workers::short_main,
+                entry,
                 State::Blocked,
                 Role::Interactive,
             );
             if t.is_null() {
-                clean(&mut probes);
+                clean(probes);
                 return false;
             }
             if !pin(t) {
                 let v = view(t);
                 retire(v.id, v.generation);
-                clean(&mut probes);
+                clean(probes);
                 return false;
             }
             probes[i] = t;
+        }
+        true
+    }
+}
+pub unsafe fn storm() -> bool {
+    unsafe {
+        let mut probes = [ptr::null_mut(); STORM];
+        if !allocate(&mut probes, workers::short_main) {
+            return false;
         }
         let flags = runtime::save_runtime();
         for t in probes {

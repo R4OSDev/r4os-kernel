@@ -95,7 +95,9 @@ unsafe fn clean_directed() -> bool {
             }
             (*raw()).directed_tasks[i] = ptr::null_mut();
         }
-        r4os_rust_task_control(16, 0, 0);
+        if !crate::sched::kernel_check::live() {
+            r4os_rust_task_control(16, 0, 0);
+        }
         ok
     }
 }
@@ -219,7 +221,9 @@ unsafe fn clean_budget() -> bool {
             }
             (*raw()).budget_tasks[i] = ptr::null_mut();
         }
-        r4os_rust_task_control(16, 0, 0);
+        if !crate::sched::kernel_check::live() {
+            r4os_rust_task_control(16, 0, 0);
+        }
         ok
     }
 }
@@ -316,7 +320,9 @@ unsafe fn clean_inversion(holder: *mut Task, waiter: *mut Task) -> bool {
                 ok = false;
             }
         }
-        r4os_rust_task_control(16, 0, 0);
+        if !crate::sched::kernel_check::live() {
+            r4os_rust_task_control(16, 0, 0);
+        }
         ok
     }
 }
@@ -377,7 +383,25 @@ pub unsafe fn inversion() -> bool {
             spins += 1;
             yield_task();
         }
-        if view(waiter).state != State::Blocked {
+        if view(waiter).state != State::Blocked || !reason_is(view(waiter).reason, b"mutex") {
+            clean_inversion(holder, waiter);
+            return false;
+        }
+        // Foreign locks can advance global counters. Prove the exact own
+        // holder, waiter's rank and private mutex before allowing release.
+        let donated = {
+            let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+            let rank = crate::sched::task::scheduler_view(waiter.cast()).dispatch_rank;
+            let c = crate::sched::task::task_registry::core(holder);
+            let m = ptr::addr_of!((*raw()).inversion_mutex);
+            rank < 3
+                && (*m).owner == (*c).id
+                && (*m).owner_generation == (*c).generation
+                && (*m).donation_rank == rank
+                && (*c).inherited_rank_counts[rank as usize] != 0
+                && crate::sched::task::scheduler_view(holder.cast()).dispatch_rank <= rank
+        };
+        if !donated {
             clean_inversion(holder, waiter);
             return false;
         }
@@ -391,6 +415,10 @@ pub unsafe fn inversion() -> bool {
         }
         let after = lock_stats();
         let m = ptr::addr_of!((*raw()).inversion_mutex);
+        let donation_returned = {
+            let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+            (*crate::sched::task::task_registry::core(holder)).inherited_rank_counts == [0; 4]
+        };
         let ok = (*raw()).inversion_holder_done
             && (*raw()).inversion_waiter_done
             && (*raw()).inversion_acquired
@@ -398,6 +426,7 @@ pub unsafe fn inversion() -> bool {
             && (*m).owner_generation == 0
             && (*m).depth == 0
             && (*m).donation_rank == 255
+            && donation_returned
             && after.role_inversions > before.role_inversions
             && after.role_donations > before.role_donations
             && after.role_donation_releases > before.role_donation_releases
