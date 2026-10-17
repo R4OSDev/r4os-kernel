@@ -171,17 +171,24 @@ impl Lock {
             .is_err()
         {
             collided = true;
-            if config::ENABLE_METRICS {
-                spins = spins.saturating_add(1);
-            }
-            // Existing IF=1 callers remain able to service TLB IPIs while
-            // contending; IRQ/no-sleep IF=0 callers never borrow interrupts.
-            if saved & IF != 0 {
-                sti();
-                pause();
-                cli();
-            } else {
-                pause();
+            loop {
+                if config::ENABLE_METRICS {
+                    spins = spins.saturating_add(1);
+                }
+                // Existing IF=1 callers remain able to service TLB IPIs while
+                // contending; IRQ/no-sleep IF=0 callers never borrow interrupts.
+                if saved & IF != 0 {
+                    sti();
+                    pause();
+                    cli();
+                } else {
+                    pause();
+                }
+                // Observation is only a retry hint. Ownership still requires
+                // the successful Acquire CAS above, including after an IRQ.
+                if self.state.load(Ordering::Relaxed) == 0 {
+                    break;
+                }
             }
         }
         if collided {

@@ -101,20 +101,27 @@ fn acquire(saved: u64) {
         .is_err()
     {
         collided = true;
-        if config::ENABLE_METRICS {
-            spins = spins.saturating_add(1);
-        }
-        let holder = OWNER_CPU_PLUS_ONE.load(Ordering::Acquire);
-        let this_cpu = u8::try_from(cpu + 1).expect("Runtime CPU identity exceeds owner field");
-        if holder != 0 && holder != this_cpu {
-            cpu_collision = true;
-        }
-        if saved & IF != 0 {
-            sti();
-            core::hint::spin_loop();
-            cli();
-        } else {
-            core::hint::spin_loop();
+        loop {
+            if config::ENABLE_METRICS {
+                spins = spins.saturating_add(1);
+            }
+            let holder = OWNER_CPU_PLUS_ONE.load(Ordering::Acquire);
+            let this_cpu = u8::try_from(cpu + 1).expect("Runtime CPU identity exceeds owner field");
+            if holder != 0 && holder != this_cpu {
+                cpu_collision = true;
+            }
+            if saved & IF != 0 {
+                sti();
+                core::hint::spin_loop();
+                cli();
+            } else {
+                core::hint::spin_loop();
+            }
+            // Keep the old IRQ progress window, but avoid repeated writing
+            // attempts while held. This load grants no runtime admission.
+            if LOCK.load(Ordering::Relaxed) == 0 {
+                break;
+            }
         }
     }
     if collided {
