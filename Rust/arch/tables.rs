@@ -420,6 +420,30 @@ unsafe fn exception_inner(frame: *const InterruptFrame, address: u64, private_st
             (*frame).error_code,
         );
         crate::program::stack_fault::emit();
+        if (*frame).vector == 14
+            && !private_stack
+            && let Some(boundary) = crate::program::fault::abort_exhausted(
+                address,
+                (*frame).error_code,
+                interrupted_rsp(frame),
+                (*frame).rip,
+                (*frame).rflags,
+            )
+        {
+            let target = frame.cast_mut();
+            (*target).rip = super::callback_abort::r4os_rust_callback_resume as *const () as u64;
+            (*target).rdi = boundary as u64;
+            (*target).rsi = crate::program::fault::STACK_EXHAUSTED_EXIT as i64 as u64;
+            // Resume with IF retained and the SysV direction/control contract.
+            // The existing boundary restores MXCSR/x87 and callee registers.
+            (*target).rflags &= !((1 << 8) | (1 << 10) | (1 << 16) | (1 << 18));
+            target
+                .cast::<u8>()
+                .add(size_of::<InterruptFrame>())
+                .cast::<u64>()
+                .write((*boundary).rsp);
+            return;
+        }
         l::puts(b"[SMP] exception cpu=");
         l::dec(u64::from(crate::arch::percpu::current_index()));
         let current = scheduler::current().cast::<crate::sched::task::task_types::Task>();

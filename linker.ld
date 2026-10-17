@@ -20,7 +20,11 @@ SECTIONS {
         KEEP(*(.limine_reqs_z_end))
     } :requests
     . = ALIGN(4096);
-    .text : { *(.text .text.*) } :text
+    .text : {
+        __r4os_kernel_text_start = .;
+        *(.text .text.*)
+        __r4os_kernel_text_end = .;
+    } :text
     . = ALIGN(4096);
     .rodata : { *(.rodata .rodata.*) *(.data.rel.ro .data.rel.ro.*) } :rodata
     .r4os.kernel.meta : ALIGN(4) { KEEP(*(.r4os.kernel.meta)) } :rodata

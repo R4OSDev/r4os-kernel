@@ -1,16 +1,19 @@
 .text
+.macro save_frame base
+    movq %rsp, 0(\base)
+    movq %rbx, 8(\base)
+    movq %rbp, 16(\base)
+    movq %r12, 24(\base)
+    movq %r13, 32(\base)
+    movq %r14, 40(\base)
+    movq %r15, 48(\base)
+    stmxcsr 56(\base)
+    fnstcw 60(\base)
+.endm
 .p2align 4
 .globl r4os_rust_callback_invoke
 r4os_rust_callback_invoke:
-    movq %rsp, 0(%rdx)
-    movq %rbx, 8(%rdx)
-    movq %rbp, 16(%rdx)
-    movq %r12, 24(%rdx)
-    movq %r13, 32(%rdx)
-    movq %r14, 40(%rdx)
-    movq %r15, 48(%rdx)
-    stmxcsr 56(%rdx)
-    fnstcw 60(%rdx)
+    save_frame %rdx
     movq %rdi, %rax
     movq %rsi, %rdi
     pushq %rdx
@@ -26,6 +29,20 @@ r4os_rust_callback_invoke:
     movq 48(%rdx), %r15
     cld
     ret
+.p2align 4
+.globl r4os_rust_program_invoke
+r4os_rust_program_invoke:
+    save_frame %rcx
+    movq %rdi, %rax
+    movq %rcx, %r15
+    movq %rdx, %rsp
+    andq $-16, %rsp
+    subq $16, %rsp
+    movq %rsi, %rdi
+    call *%rax
+    movl %eax, %esi
+    movq %r15, %rdi
+    jmp r4os_rust_callback_resume
 .p2align 4
 .globl r4os_rust_callback_resume
 r4os_rust_callback_resume:

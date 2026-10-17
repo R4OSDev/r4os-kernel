@@ -5,7 +5,7 @@ use super::{
     exit, exit_state, registry, registry_types::ProgramInstance, stack, thread_runtime, threads,
 };
 use crate::{
-    arch::percpu,
+    arch::{callback_abort as abort, percpu},
     boot::foundation as console,
     contract::{
         self, ProgramProcessHandle as Handle, R4XStartContext as Context, R4XStartImport as Import,
@@ -63,6 +63,30 @@ unsafe extern "C" {
     // Bounded metadata projections into owners not yet migrated in this file.
 
     fn r4os_call_program(entry: usize, arg: usize, stack_top: u64) -> i32;
+}
+
+unsafe fn invoke(thread: *mut threads::Thread, entry: usize, arg: usize, top: u64) -> i32 {
+    unsafe {
+        if thread.is_null() || !(*thread).execution_pinned || !(*thread).fault_frame.is_null() {
+            return r4os_call_program(entry, arg, top);
+        }
+        let flags: u64;
+        core::arch::asm!("pushfq", "pop {}", out(reg) flags, options(preserves_flags));
+        if flags & ((1 << 9) | (1 << 10)) != 1 << 9 {
+            return r4os_call_program(entry, arg, top);
+        }
+        let mut frame = abort::Frame::default();
+        (*thread).stack_exhausted = false;
+        (*thread).fault_frame = ptr::addr_of_mut!(frame);
+        let code = abort::r4os_rust_program_invoke(entry, arg, top, ptr::addr_of_mut!(frame));
+        (*thread).fault_frame = ptr::null_mut();
+        if (*thread).stack_exhausted {
+            // This runs on the retained kernel stack after restoring its
+            // callee registers. No module epilogue/callback is resumed.
+            thread_runtime::exit_thread(thread, code, Some(contract::program_exit_reason_failed));
+        }
+        code
+    }
 }
 fn span(bytes: &[u8]) -> Bytes {
     Bytes {
@@ -288,7 +312,13 @@ unsafe fn call(instance: *mut ProgramInstance) -> i32 {
         }
         AtomicU64::from_ptr(ptr::addr_of_mut!((*STATE.0.get()).entries_started))
             .fetch_add(1, Ordering::Relaxed);
-        let exit_code = r4os_call_program(entry, view.context.addr(), (*instance).stack_top);
+        let thread = threads::current();
+        let thread = if !thread.is_null() && (*thread).owner_instance == instance {
+            thread
+        } else {
+            ptr::null_mut()
+        };
+        let exit_code = invoke(thread, entry, view.context.addr(), (*instance).stack_top);
         if let Some(mut stack) = stack::from_instance(instance) {
             stack::r4os_rust_program_stack_measure(&mut stack);
             stack::r4os_rust_program_stack_to_instance(instance, &stack);
@@ -404,7 +434,7 @@ pub unsafe extern "C" fn r4os_rust_program_entry_worker() -> ! {
         (*thread).entry = entry;
         threads::mark(thread, true, 0);
         note_parallel(instance, true);
-        let code = r4os_call_program(entry, (*thread).arg, (*thread).stack.top);
+        let code = invoke(thread, entry, (*thread).arg, (*thread).stack.top);
         stack::r4os_rust_program_stack_measure(ptr::addr_of_mut!((*thread).stack));
         if (*thread).stack.serial_telemetry {
             stack::r4os_rust_program_stack_log(

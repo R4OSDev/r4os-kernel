@@ -1,6 +1,7 @@
 //! Original SysV callback/abort boundary, with no Rust frame or Drop between
 //! assembly and the callback. Admission and exact live frame ownership belong
-//! to the existing DriverThread owner; no cleanup is implied by a transfer.
+//! to the exact driver/program execution owner; no cleanup is implied by a
+//! transfer. Program entry retains this frame on its separate kernel stack.
 pub type Handler = unsafe extern "sysv64" fn(usize) -> i32;
 #[repr(C)]
 #[derive(Default)]
@@ -27,6 +28,15 @@ unsafe extern "sysv64" {
     /// Callback and frame remain valid through return. The exact calling task
     /// owns this frame and retains its existing lifetime/abort admission.
     pub fn r4os_rust_callback_invoke(handler: Handler, context: usize, frame: *mut Frame) -> i32;
+    /// # Safety
+    /// Exact pinned program task; frame stays resident on its original kernel
+    /// stack while the callback executes on the separate guarded module stack.
+    pub fn r4os_rust_program_invoke(
+        entry: usize,
+        context: usize,
+        stack_top: u64,
+        frame: *mut Frame,
+    ) -> i32;
     /// # Safety
     /// Only the same task may resume this still-live frame, after all kernel
     /// owners have returned. Skipped frames have no implicit foreign cleanup.

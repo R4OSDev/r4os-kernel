@@ -71,6 +71,10 @@ pub struct Thread {
     pub retire_pending: bool,
     pub used: bool,
     pub(super) _padding0: [u8; 3],
+    // Only this exact pinned execution writes its resident kernel return
+    // anchor. The fault path consumes it without touching the module stack.
+    pub(super) fault_frame: *mut crate::arch::callback_abort::Frame,
+    pub(super) stack_exhausted: bool,
 }
 impl Default for Thread {
     fn default() -> Self {
@@ -110,11 +114,13 @@ impl Default for Thread {
             retire_pending: false,
             used: false,
             _padding0: [0; 3],
+            fault_frame: ptr::null_mut(),
+            stack_exhausted: false,
         }
     }
 }
 const _: () = {
-    assert!(mem::size_of::<Thread>() == 320);
+    assert!(mem::size_of::<Thread>() == 336);
     assert!(mem::align_of::<Thread>() == 8);
     assert!(mem::size_of::<OptionalLease>() == 40);
     assert!(mem::offset_of!(OptionalLease, present) == 32);
@@ -132,6 +138,8 @@ const _: () = {
     assert!(mem::offset_of!(Thread, instance_id) == 276);
     assert!(mem::offset_of!(Thread, instance_generation) == 112);
     assert!(mem::offset_of!(Thread, execution_pinned) == 310);
+    assert!(mem::offset_of!(Thread, fault_frame) == 320);
+    assert!(mem::offset_of!(Thread, stack_exhausted) == 328);
     assert!(mem::offset_of!(Thread, console_input_lease) == 0);
     assert!(mem::offset_of!(Thread, spawn_transaction_depth) == 268);
     assert!(mem::offset_of!(Thread, exit_deferred) == 309);

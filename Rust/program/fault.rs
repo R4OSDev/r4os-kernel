@@ -8,6 +8,7 @@ use super::{
     vm,
 };
 use crate::{
+    arch::{callback_abort, percpu},
     contract as c,
     memory::{owner, virt_policy},
     sched::{scheduler, task::task_registry},
@@ -16,6 +17,103 @@ use core::{mem::MaybeUninit, ptr};
 const MAIN: u32 = 1;
 const GUARD: u64 = 4096;
 const HEADROOM: u64 = 64 * 1024;
+pub(crate) const STACK_EXHAUSTED_EXIT: i32 = -4096;
+
+unsafe extern "C" {
+    static __r4os_kernel_text_start: u8;
+    static __r4os_kernel_text_end: u8;
+}
+
+/// Only the exact pinned program execution may abandon module frames. Called
+/// on the exception IST with IF=0; no lock, allocation or waiting is allowed.
+/// The caller rewrites IRET to the existing callback resume boundary, so the
+/// process exit owner runs later on its retained healthy kernel stack.
+pub(crate) unsafe fn abort_exhausted(
+    address: u64,
+    error: u64,
+    rsp: u64,
+    rip: u64,
+    flags: u64,
+) -> Option<*const callback_abort::Frame> {
+    unsafe {
+        if error & !2 != 0 || flags & ((1 << 9) | (1 << 10)) != 1 << 9 || !owner::fault_allowed() {
+            return None;
+        }
+        let current = scheduler::current();
+        let thread = threads::current();
+        if current.is_null() || thread.is_null() {
+            return None;
+        }
+        let task = task_registry::core(current.cast());
+        if (*task).state != crate::sched::task::task_types::State::Running
+            || u32::from((*task).running_cpu) != percpu::current_index()
+            || (*task).preempt_disable_depth != 0
+            || (*task).held_lock_count != 0
+            || (*task).unwind_guard_count != 0
+            || (*task).wait_handoff_guard_pending
+            || (*thread).state != 2
+            || !(*thread).execution_pinned
+            || (*thread).stack_exhausted
+            || (*thread).generation == 0
+            || (*thread).instance_generation == 0
+            || (*thread).spawn_transaction_depth != 0
+        {
+            return None;
+        }
+        // current() has already checked the exact task id/generation. Its
+        // execution pin retains owner_instance for instance_generation until
+        // unpin_execution; neither registry nor thread records can be reused.
+        let instance = (*thread).owner_instance;
+        if instance.is_null() || !(*instance).used || (*instance).id != (*thread).instance_id {
+            return None;
+        }
+        let program_stack = if (*thread).flags & MAIN != 0 {
+            stack::from_instance(instance)?
+        } else {
+            ptr::addr_of!((*thread).stack).read()
+        };
+        if program_stack.range_id == 0
+            || program_stack.guard_size != GUARD
+            || address < program_stack.base
+            || address - program_stack.base >= GUARD
+            || rsp < program_stack.base
+            || rsp - program_stack.base >= program_stack.reserve_size
+            || rsp.abs_diff(address) > GUARD
+        {
+            return None;
+        }
+        let base = (*instance).program_image_base;
+        if !(rip >= base && rip - base < (*instance).program_image_size as u64)
+            && !super::thread_runtime::imported(instance, rip)
+        {
+            return None;
+        }
+        let frame = (*thread).fault_frame;
+        let frame_address = frame.addr() as u64;
+        if frame.is_null()
+            || frame_address & 7 != 0
+            || frame_address < (*task).stack_base
+            || frame_address > (*task).stack_top.saturating_sub(64)
+        {
+            return None;
+        }
+        let saved_rsp = (*frame).rsp;
+        if saved_rsp & 15 != 8
+            || saved_rsp < (*task).stack_base.saturating_add(32 * 1024)
+            || saved_rsp > frame_address.saturating_sub(8)
+        {
+            return None;
+        }
+        let return_pc = (saved_rsp as *const u64).read();
+        if return_pc < ptr::addr_of!(__r4os_kernel_text_start) as u64
+            || return_pc >= ptr::addr_of!(__r4os_kernel_text_end) as u64
+        {
+            return None;
+        }
+        (*thread).stack_exhausted = true;
+        Some(frame)
+    }
+}
 
 unsafe fn grow_thread(thread: *mut Thread, address: u64) -> Result<(), Failure> {
     unsafe {
