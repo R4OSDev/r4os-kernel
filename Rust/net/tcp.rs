@@ -1402,7 +1402,7 @@ pub(super) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
             if let Some(c) = match_connection(view) {
                 let c = &mut *c;
                 if !reset_seq_acceptable(c, view) {
-                    c.rx_drops += 1;
+                    c.rx_drops = c.rx_drops.saturating_add(1);
                     (*stats()).rx_drops += 1;
                     (*stats()).last_error = text(b"rst-stale");
                     return Some(view);
@@ -1442,7 +1442,7 @@ pub(super) unsafe fn apply_rx_view(view: SegmentView) -> Option<SegmentView> {
                 if (view.payload.len != 0 || view.flags & FLAG_FIN != 0)
                     && !segment_seq_acceptable(c, view)
                 {
-                    c.rx_drops += 1;
+                    c.rx_drops = c.rx_drops.saturating_add(1);
                     (*stats()).rx_drops += 1;
                     (*stats()).last_error = text(b"seq-stale");
                     return Some(view);
@@ -1511,7 +1511,9 @@ unsafe fn accept_in_order_payload(c: &mut Connection, seq: u32, bytes: &[u8]) {
         let copied = write_rx(c, bytes);
         if copied < bytes.len() {
             let dropped = bytes.len() - copied;
-            c.rx_drops += u32::try_from(dropped).expect("TCP drops");
+            c.rx_drops = c
+                .rx_drops
+                .saturating_add(u32::try_from(dropped).expect("TCP drops"));
             (*stats()).rx_drops += dropped as u64;
         }
         c.rx_bytes += copied as u64;
@@ -1531,7 +1533,9 @@ unsafe fn accept_in_order_payload(c: &mut Connection, seq: u32, bytes: &[u8]) {
 unsafe fn store_out_of_order_payload(c: &mut Connection, seq: u32, bytes: &[u8]) {
     unsafe {
         if bytes.len() > OUT_OF_ORDER_SLOT_SIZE {
-            c.rx_drops += u32::try_from(bytes.len()).expect("TCP large OOO");
+            c.rx_drops = c
+                .rx_drops
+                .saturating_add(u32::try_from(bytes.len()).expect("TCP large OOO"));
             (*stats()).rx_drops += bytes.len() as u64;
             (*stats()).last_error = text(b"ooo-large");
             return;
@@ -1553,14 +1557,14 @@ unsafe fn store_out_of_order_payload(c: &mut Connection, seq: u32, bytes: &[u8])
         let Some(index) = find_out_of_order_free(c)
             .or_else(|| select_out_of_order_replacement(c, seq, bytes.len()))
         else {
-            c.rx_drops += bytes.len() as u32;
+            c.rx_drops = c.rx_drops.saturating_add(bytes.len() as u32);
             (*stats()).rx_drops += bytes.len() as u64;
             (*stats()).last_error = text(b"ooo-full");
             return;
         };
         let slot = &mut c.out_of_order[index];
         if slot.valid {
-            c.rx_drops += slot.len as u32;
+            c.rx_drops = c.rx_drops.saturating_add(slot.len as u32);
             (*stats()).rx_drops += slot.len as u64;
         }
         slot.payload[..bytes.len()].copy_from_slice(bytes);
@@ -1895,9 +1899,39 @@ pub(super) unsafe fn buffer_limit_probe() -> bool {
         if apply_rx_view(view).is_none() {
             return false;
         }
-        (*stats()).rx_drops == before + 1
-            && (*c).rx_drops == 1
-            && payload((*stats()).last_error) == b"rx-full"
+        if (*stats()).rx_drops != before + 1
+            || (*c).rx_drops != 1
+            || payload((*stats()).last_error) != b"rx-full"
+        {
+            return false;
+        }
+
+        // Only this owned probe connection is seeded while the TCP owner is
+        // held. No early return may publish the synthetic near-limit value.
+        (*c).rx_drops = u32::MAX - 1;
+        let stale_reset = probe_view(remote, c, (*c).ack.wrapping_sub(1), (*c).seq, FLAG_RST, b"");
+        let at_limit = apply_rx_view(stale_reset).is_some()
+            && (*c).rx_drops == u32::MAX
+            && payload((*stats()).last_error) == b"rst-stale";
+        let stale_data = probe_view(
+            remote,
+            c,
+            (*c).ack.wrapping_sub(1),
+            (*c).seq,
+            FLAG_ACK | FLAG_PSH,
+            b"X",
+        );
+        let packet_held = apply_rx_view(stale_data).is_some()
+            && (*c).rx_drops == u32::MAX
+            && payload((*stats()).last_error) == b"seq-stale";
+        let full = probe_view(remote, c, (*c).ack, (*c).seq, FLAG_ACK | FLAG_PSH, b"XYZ");
+        let bytes_held = apply_rx_view(full).is_some()
+            && (*c).rx_drops == u32::MAX
+            && (*stats()).rx_drops == before + 6
+            && payload((*stats()).last_error) == b"rx-full";
+        // Retain only the real packet/byte accounting for later diagnostics.
+        (*c).rx_drops = ((*stats()).rx_drops - before).min(u64::from(u32::MAX)) as u32;
+        at_limit && packet_held && bytes_held
     }
 }
 unsafe fn small_out_of_order_probe() -> bool {
