@@ -3,6 +3,8 @@
 use super::owner::{self, Guard, Token};
 use crate::boot::info;
 use core::cell::UnsafeCell;
+mod release_batch;
+pub(super) use release_batch::{Batch as ReleaseBatch, Owner as ReleaseOwner};
 
 pub const MAX_BLOCKS: usize = 8192;
 const ID_CAPACITY: usize = MAX_BLOCKS * 2;

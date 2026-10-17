@@ -141,10 +141,15 @@ unsafe fn partial(range: *mut Range, operation: u8, base: u64, len: u64, reset: 
         });
     }
 }
-unsafe fn uncommit_span(range: *mut Range, start: u64, len: u64, skip: bool) -> Result<(), u32> {
+unsafe fn uncommit_span(
+    range: *mut Range,
+    start: u64,
+    len: u64,
+    skip: bool,
+) -> Result<super::vm_release::Proof, u32> {
     let current = unsafe { snapshot(range) };
     if current.window == 6 {
-        return check(unsafe { super::vm_pager::uncommit_demand(range, start, len, skip) });
+        return unsafe { super::vm_pager::uncommit_demand(range, start, len, skip) };
     }
     let end = start.checked_add(len).ok_or(5u32)?;
     let mut address =
@@ -153,8 +158,11 @@ unsafe fn uncommit_span(range: *mut Range, start: u64, len: u64, skip: bool) -> 
         } else {
             start
         };
+    let mut proof = super::vm_release::Proof::default();
     while address < end {
-        let Some(frame) = vm_frames::mapped(address, false) else {
+        let maximum = ((end - address) / PAGE).min(BATCH);
+        let released = unsafe { super::vm_release::uncommit(range, address, maximum, true) }?;
+        if released.pages == 0 {
             if !skip {
                 return Err(10);
             }
@@ -163,28 +171,14 @@ unsafe fn uncommit_span(range: *mut Range, start: u64, len: u64, skip: bool) -> 
                 partial(range, 1, address, 0, false);
             }
             continue;
-        };
-        let maximum = ((end - address) / PAGE).min(BATCH);
-        let claimed = blocks::r4os_rust_blocks_prefix(frame, maximum * PAGE, false) / PAGE;
-        if claimed == 0 {
-            return Err(10);
         }
-        let mut pages = 1;
-        while pages < claimed {
-            if vm_frames::mapped(address + pages * PAGE, false) != Some(frame + pages * PAGE) {
-                break;
-            }
-            pages += 1;
-        }
-        check(unsafe {
-            vm_frames::r4os_rust_vm_uncommit_extent(range, address, frame, pages, true, false)
-        })?;
-        address += pages * PAGE;
+        address += released.pages * PAGE;
+        proof.append(released);
         unsafe {
             partial(range, 1, address, 0, false);
         }
     }
-    Ok(())
+    Ok(proof)
 }
 struct Lease {
     range: *mut Range,
@@ -409,7 +403,7 @@ fn commit(id: u32, offset: u64, raw_len: u64) -> Result<(), u32> {
     }
     result
 }
-fn uncommit(id: u32, offset: u64, raw_len: u64) -> Result<(), u32> {
+fn uncommit(id: u32, offset: u64, raw_len: u64) -> Result<super::vm_release::Proof, u32> {
     let _owner = Guard::acquire(5);
     if !r4os_rust_vm_initialized() {
         return Err(1);
@@ -448,11 +442,20 @@ fn uncommit(id: u32, offset: u64, raw_len: u64) -> Result<(), u32> {
         });
     }
     block_committed(unsafe { snapshot(range) })?;
-    result?;
+    let proof = result?;
     unsafe {
         partial(range, 2, 0, 0, false);
     }
-    Ok(())
+    Ok(proof)
+}
+/// Exact value-only receipts for the existing explicit owned VM diagnostic.
+/// Ordinary API callers retain their original status-code contract.
+pub(super) fn uncommit_with_proof(
+    id: u32,
+    offset: u64,
+    len: u64,
+) -> Result<super::vm_release::Proof, u32> {
+    uncommit(id, offset, len)
 }
 fn guard(id: u32, offset: u64, raw_len: u64, clear: bool) -> Result<(), u32> {
     let _owner = Guard::acquire(5);
@@ -501,7 +504,7 @@ fn guard(id: u32, offset: u64, raw_len: u64, clear: bool) -> Result<(), u32> {
     });
     Ok(())
 }
-fn code(result: Result<(), u32>) -> u32 {
+fn code<T>(result: Result<T, u32>) -> u32 {
     result.err().unwrap_or(0)
 }
 fn remove_commit_span(id: u32, base: u64, len: u64) -> Result<(), u32> {

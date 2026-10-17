@@ -426,36 +426,72 @@ pub extern "C" fn r4os_rust_paging_unmap_batch(
     pages: u64,
     locked: bool,
 ) -> bool {
+    unmap_batch_release(
+        virtual_base,
+        physical_base,
+        pages,
+        locked,
+        |page| physical_base + page * PAGE,
+        || true,
+    )
+    .is_ok()
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ReleaseError {
+    Mapping,
+    Tlb,
+    Physical,
+}
+fn batch_unmap_failure(reason: ReleaseError) -> Result<crate::arch::tlb::Result, ReleaseError> {
+    fail_unmap();
+    Err(reason)
+}
+fn unmap_batch_release(
+    virtual_base: u64,
+    first_physical: u64,
+    pages: u64,
+    locked: bool,
+    expected: impl Fn(u64) -> u64,
+    release: impl FnOnce() -> bool,
+) -> Result<crate::arch::tlb::Result, ReleaseError> {
     let _guard = if locked {
         None
     } else {
         Some(Guard::acquire(6))
     };
     if !owner::named(6).held() {
-        return wrong_owner(false);
+        wrong_owner(false);
+        return Err(ReleaseError::Mapping);
     }
-    if !active_matches() || !batch_valid(virtual_base, physical_base, pages) {
-        return fail_unmap();
+    if !active_matches() || !batch_valid(virtual_base, first_physical, pages) {
+        return batch_unmap_failure(ReleaseError::Mapping);
     }
     let root = root();
     let mut leaves = batch::Leaves::new(root, virtual_base);
     let mut previous = [MaybeUninit::<u64>::uninit(); 64];
     for page in 0..pages {
-        let offset = page * PAGE;
         let Some(leaf) = leaves.prepare(page, false) else {
-            return fail_unmap();
+            return batch_unmap_failure(ReleaseError::Mapping);
         };
         let value = read(leaf.entry);
-        if leaf.huge || value & PRESENT == 0 || value & MASK != physical_base + offset {
-            return fail_unmap();
+        if leaf.huge || value & PRESENT == 0 || value & MASK != expected(page) {
+            return batch_unmap_failure(ReleaseError::Mapping);
         }
         previous[page as usize].write(value);
     }
     for page in 0..pages {
         write(leaves.entry(page), 0);
     }
-    if !invalidate(virtual_base, pages) {
+    let receipt = paging_shootdown_result(virtual_base, pages);
+    let failure = if !receipt.ok {
         shootdown_failure();
+        Some(ReleaseError::Tlb)
+    } else if !release() {
+        Some(ReleaseError::Physical)
+    } else {
+        None
+    };
+    if let Some(reason) = failure {
         for page in 0..pages {
             // Every saved slot was filled during the successful preflight.
             write(leaves.entry(page), unsafe {
@@ -464,7 +500,7 @@ pub extern "C" fn r4os_rust_paging_unmap_batch(
         }
         restore_count(pages);
         restore_failure(virtual_base, pages);
-        return fail_unmap();
+        return batch_unmap_failure(reason);
     }
     state(|state| {
         state.stats.unmap_pages = state.stats.unmap_pages.wrapping_add(pages);
@@ -472,7 +508,50 @@ pub extern "C" fn r4os_rust_paging_unmap_batch(
         state.stats.unmap_batch_pages = state.stats.unmap_batch_pages.wrapping_add(pages);
         state.stats.unmap_batch_max_pages = state.stats.unmap_batch_max_pages.max(pages);
     });
-    true
+    Ok(receipt)
+}
+/// Read a virtual prefix into caller-owned resident preparation storage.
+/// The VM owner and continuously held page-table owner keep these identities
+/// bound until release_frames rechecks them before any PTE mutation.
+pub(super) fn release_frames_snapshot(
+    base: u64,
+    frames: &mut [u64],
+) -> Result<usize, ReleaseError> {
+    if !owner::named(6).held() || !active_matches() || !batch_valid(base, 0, frames.len() as u64) {
+        return Err(ReleaseError::Mapping);
+    }
+    let mut leaves = batch::Leaves::new(root(), base);
+    for (page, output) in frames.iter_mut().enumerate() {
+        let Some(leaf) = leaves.prepare(page as u64, false) else {
+            return Ok(page);
+        };
+        if leaf.huge {
+            return Err(ReleaseError::Mapping);
+        }
+        let value = read(leaf.entry);
+        if value & PRESENT == 0 {
+            return Ok(page);
+        }
+        *output = value & MASK;
+    }
+    Ok(frames.len())
+}
+/// The exact page-table owner is already held. The callback retains the
+/// prepared physical owner, performs no waiting/reentry and either frees
+/// every prepared frame or leaves all of them intact on rejection.
+pub(super) fn release_frames(
+    base: u64,
+    frames: &[u64],
+    release: impl FnOnce() -> bool,
+) -> Result<crate::arch::tlb::Result, ReleaseError> {
+    unmap_batch_release(
+        base,
+        frames.first().copied().unwrap_or(0),
+        frames.len() as u64,
+        true,
+        |page| frames[page as usize],
+        release,
+    )
 }
 /// # Safety
 /// output is exclusive C storage. Locked reads are only admitted by owner 6.

@@ -285,7 +285,14 @@ pub unsafe extern "C" fn r4os_rust_vm_uncommit_extent(
     } else {
         phys::r4os_rust_phys_free_extent(extent.base, extent.count);
     }
-    let bytes = extent.count * PAGE;
+    unsafe { account_release(range, extent.count, logical) };
+    release.commit();
+    0
+}
+/// # Safety
+/// Same exact range and VM owner as the acknowledged physical release.
+pub(super) unsafe fn account_release(range: *mut Range, pages: u64, logical: bool) {
+    let bytes = pages * PAGE;
     unsafe {
         vm_ranges::update_ptr(range, |range| {
             range.resident_bytes = range.resident_bytes.saturating_sub(bytes);
@@ -294,8 +301,6 @@ pub unsafe extern "C" fn r4os_rust_vm_uncommit_extent(
             }
         });
     }
-    release.commit();
-    0
 }
 
 fn reclaim_pressure(reason: u32, frames: u32) -> u32 {

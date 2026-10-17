@@ -440,6 +440,72 @@ pub extern "C" fn r4os_rust_phys_free_extent(address: u64, count: u64) {
     state.stats.extent_frees = state.stats.extent_frees.wrapping_add(1);
     state.stats.extent_freed_frames = state.stats.extent_freed_frames.wrapping_add(count);
 }
+/// A prepared VM release retains the physical catalogue owner across its TLB
+/// acknowledgement. Validate the entire bounded set before changing any bit;
+/// a rejected set keeps every frame and reports an operational error.
+pub(super) fn validate_release_extents(extents: &[Extent]) -> bool {
+    let _owner = Guard::acquire(7);
+    release_extents_valid(unsafe { &mut *PMM.0.get() }, extents)
+}
+fn release_extents_valid(state: &mut State, extents: &[Extent]) -> bool {
+    if !state.initialized {
+        return false;
+    }
+    let mut pages = 0;
+    if extents.is_empty() || extents.len() > super::page_batch::MAX_EXTENT_PAGES as usize {
+        state.stats.bad_free_errors = state.stats.bad_free_errors.wrapping_add(1);
+        return false;
+    }
+    for (index, extent) in extents.iter().copied().enumerate() {
+        if extent.base == 0
+            || !extent.base.is_multiple_of(FRAME)
+            || extent.count == 0
+            || extent.count > super::page_batch::MAX_EXTENT_PAGES
+        {
+            state.stats.bad_free_errors = state.stats.bad_free_errors.wrapping_add(1);
+            return false;
+        }
+        pages += extent.count;
+        let first = extent.base / FRAME;
+        let Some(end) = first.checked_add(extent.count) else {
+            state.stats.bad_free_errors = state.stats.bad_free_errors.wrapping_add(1);
+            return false;
+        };
+        if pages > super::page_batch::MAX_EXTENT_PAGES || end > state.stats.total_frames {
+            state.stats.bad_free_errors = state.stats.bad_free_errors.wrapping_add(1);
+            return false;
+        }
+        for earlier in &extents[..index] {
+            let earlier_first = earlier.base / FRAME;
+            let earlier_end = earlier_first + earlier.count;
+            if first < earlier_end && earlier_first < end {
+                state.stats.double_free_errors = state.stats.double_free_errors.wrapping_add(1);
+                return false;
+            }
+        }
+        for frame in first..end {
+            if !state.used(frame) {
+                state.stats.double_free_errors = state.stats.double_free_errors.wrapping_add(1);
+                return false;
+            }
+        }
+    }
+    true
+}
+pub(super) fn release_extents_checked(extents: &[Extent]) -> bool {
+    let _owner = Guard::acquire(7);
+    let state = unsafe { &mut *PMM.0.get() };
+    if !release_extents_valid(state, extents) {
+        return false;
+    }
+    for extent in extents {
+        state.free_contiguous(extent.base, extent.count);
+        state.stats.extent_frees = state.stats.extent_frees.wrapping_add(1);
+        state.stats.extent_freed_frames =
+            state.stats.extent_freed_frames.wrapping_add(extent.count);
+    }
+    true
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_phys_free(address: u64) {
     let _guard = Guard::acquire(7);

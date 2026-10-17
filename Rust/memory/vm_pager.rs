@@ -72,10 +72,6 @@ fn mapped(address: u64) -> bool {
     let mut value = 0;
     unsafe { paging::r4os_rust_paging_read(address, 3, false, &mut value) }
 }
-fn frame(address: u64) -> Option<u64> {
-    let mut value = 0;
-    unsafe { paging::r4os_rust_paging_read(address, 0, false, &mut value) }.then_some(value)
-}
 fn dirty(address: u64) -> bool {
     let mut value = 0;
     (unsafe { paging::r4os_rust_paging_read(address, 4, false, &mut value) }) && value != 0
@@ -1598,8 +1594,8 @@ pub(super) unsafe fn uncommit_demand(
     start: u64,
     bytes: u64,
     skip: bool,
-) -> u32 {
-    code((|| {
+) -> Result<super::vm_release::Proof, u32> {
+    (|| {
         let range = unsafe { pointer.read() };
         if !skip && !covered(range, start, bytes) {
             return Err(NOT_COMMITTED);
@@ -1620,6 +1616,7 @@ pub(super) unsafe fn uncommit_demand(
                     start
                 };
                 let mut committed = range.commit_span_head.get();
+                let mut proof = super::vm_release::Proof::default();
                 while address < end {
                     while let Some(slot) = committed {
                         let span = vm_commit_spans::read(usize::from(slot));
@@ -1635,35 +1632,18 @@ pub(super) unsafe fn uncommit_demand(
                         break;
                     }
                     let span_end = end.min(span.base + span.len);
-                    let Some(physical) = frame(address) else {
+                    let max_pages = ((span_end - address) / PAGE).min(page_batch::MAX_EXTENT_PAGES);
+                    let released =
+                        unsafe { super::vm_release::uncommit(pointer, address, max_pages, false) }?;
+                    if released.pages == 0 {
                         address += PAGE;
                         unsafe {
                             vm_transactions::r4os_rust_vm_partial(pointer, 1, address, 0, false)
                         };
                         continue;
-                    };
-                    let max_pages = ((span_end - address) / PAGE).min(page_batch::MAX_EXTENT_PAGES);
-                    let claimed =
-                        blocks::r4os_rust_blocks_prefix(physical, max_pages * PAGE, false) / PAGE;
-                    if claimed == 0 {
-                        return Err(NOT_COMMITTED);
                     }
-                    let mut run = 1;
-                    while run < claimed {
-                        let Some(next) = frame(address + run * PAGE) else {
-                            break;
-                        };
-                        if next != physical + run * PAGE {
-                            break;
-                        }
-                        run += 1;
-                    }
-                    check(unsafe {
-                        vm_frames::r4os_rust_vm_uncommit_extent(
-                            pointer, address, physical, run, false, false,
-                        )
-                    })?;
-                    address += run * PAGE;
+                    address += released.pages * PAGE;
+                    proof.append(released);
                     unsafe { vm_transactions::r4os_rust_vm_partial(pointer, 1, address, 0, false) };
                 }
                 commit_change(1, range.id, start, bytes, &mut commit_ticket)?;
@@ -1682,14 +1662,14 @@ pub(super) unsafe fn uncommit_demand(
                         }
                     });
                 }
-                Ok(())
+                Ok(proof)
             })();
             ps::with(|s| s.release_reserved(&mut splits));
             result
         })();
         release_commit_ticket(commit_ticket);
         result
-    })())
+    })()
 }
 fn remove_address(slot: usize) {
     let Some(position) = vm_index::position(slot) else {

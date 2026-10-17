@@ -27,6 +27,7 @@ pub mod vm_pager_diagnostics;
 pub mod vm_pager_types;
 pub mod vm_query;
 pub mod vm_ranges;
+pub(crate) mod vm_release;
 pub mod vm_transactions;
 
 pub(crate) mod boot_diagnostics;

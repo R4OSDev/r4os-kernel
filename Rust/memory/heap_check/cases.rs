@@ -218,6 +218,97 @@ fn resident(state: &mut State, cancelled: fn() -> bool) -> bool {
         return false;
     }
     state.report.expected_vm_errors += 1;
-    range(oom).is_some_and(|empty| empty.committed_bytes == 0 && empty.resident_bytes == 0)
-        && state.release_reservation(1)
+    if !range(oom).is_some_and(|empty| empty.committed_bytes == 0 && empty.resident_bytes == 0)
+        || !state.release_reservation(1)
+    {
+        return false;
+    }
+    fragmented_release(state, cancelled)
+}
+
+fn fragmented_release(state: &mut State, cancelled: fn() -> bool) -> bool {
+    const PAGE: u64 = 4096;
+    const PAGES: u64 = 64;
+    const BYTES: u64 = PAGES * PAGE;
+    if cancelled() || !state.reserve(0, 0, 0, BYTES) || !state.reserve(1, 0, 0, BYTES) {
+        return false;
+    }
+    let a = state.reservation(0);
+    let b = state.reservation(1);
+    let (Some(first), Some(other)) = (range(a), range(b)) else {
+        return false;
+    };
+    let first_memory = core::ptr::with_exposed_provenance_mut::<u8>(first.base as usize);
+    let other_memory = core::ptr::with_exposed_provenance_mut::<u8>(other.base as usize);
+    // Use ordinary owned VM commits, alternating one page of each live range.
+    // No PMM bitmap injection, special allocator policy or foreign resource.
+    for page in 0..PAGES {
+        let offset = page * PAGE;
+        if cancelled()
+            || tx::r4os_rust_vm_commit(a, offset, PAGE) != 0
+            || tx::r4os_rust_vm_commit(b, offset, PAGE) != 0
+        {
+            return false;
+        }
+        unsafe {
+            first_memory
+                .add(offset as usize)
+                .write_volatile(0xa0 ^ page as u8);
+            other_memory
+                .add(offset as usize)
+                .write_volatile(0xc0 ^ page as u8);
+        }
+    }
+    let mut physical_runs = 0;
+    let mut previous = 0u64;
+    for page in 0..PAGES {
+        let mut physical = 0;
+        if !unsafe {
+            paging::r4os_rust_paging_read(first.base + page * PAGE, 0, false, &mut physical)
+        } {
+            return false;
+        }
+        if page == 0 || previous.checked_add(PAGE) != Some(physical) {
+            physical_runs += 1;
+        }
+        previous = physical;
+    }
+    if physical_runs < 2 {
+        return false; // An unfragmented setup cannot prove this boundary.
+    }
+    let Ok(proof) = tx::uncommit_with_proof(a, 0, BYTES) else {
+        return false;
+    };
+    if proof.pages != PAGES
+        || proof.rounds != 1
+        || proof.max_pages != PAGES
+        || !proof.all_acknowledged
+        || !proof.last.ok
+        || proof.last.generation == 0
+        || !range(a).is_some_and(|value| value.committed_bytes == 0 && value.resident_bytes == 0)
+    {
+        return false;
+    }
+    for page in 0..PAGES {
+        let address = page * PAGE;
+        let mut physical = 0;
+        if unsafe { paging::r4os_rust_paging_read(first.base + address, 3, false, &mut physical) }
+            || !unsafe {
+                paging::r4os_rust_paging_read(other.base + address, 0, false, &mut physical)
+            }
+        {
+            return false;
+        }
+        let extent = phys::Extent {
+            base: physical,
+            count: 1,
+        };
+        if !phys::validate_release_extents(core::slice::from_ref(&extent))
+            || crate::memory::blocks::r4os_rust_blocks_prefix(physical, PAGE, false) != PAGE
+            || unsafe { other_memory.add(address as usize).read_volatile() } != (0xc0 ^ page as u8)
+        {
+            return false;
+        }
+    }
+    state.release_reservation(0) && state.release_reservation(1)
 }
