@@ -24,8 +24,6 @@ struct State {
     ctrl_down: bool,
     alt_down: bool,
     altgr_down: bool,
-    modifier_tick: u64,
-    modifier_key_seen: bool,
     modifier_stale_resets: u64,
     extended: bool,
     layout: u32,
@@ -47,8 +45,6 @@ static CURRENT: Storage = Storage(UnsafeCell::new(State {
     ctrl_down: false,
     alt_down: false,
     altgr_down: false,
-    modifier_tick: 0,
-    modifier_key_seen: false,
     modifier_stale_resets: 0,
     extended: false,
     layout: 0,
@@ -107,38 +103,12 @@ impl State {
             | (u8::from(self.alt_down) << 2)
             | (u8::from(self.altgr_down) << 3)
     }
-    fn modifier_event(&mut self) {
-        self.modifier_tick = timer::tick_count();
-        self.modifier_key_seen = false;
-    }
-    fn nonmodifier_key(&mut self) {
-        if self.ctrl_down || self.alt_down || self.altgr_down {
-            self.modifier_key_seen = true;
-        }
-    }
-    fn clear_stale(&mut self) {
-        if !self.modifier_key_seen || (!self.ctrl_down && !self.alt_down && !self.altgr_down) {
-            return;
-        }
-        let hz = timer::frequency();
-        if hz == 0 || self.modifier_tick == 0 {
-            return;
-        }
-        let now = timer::tick_count();
-        if now < self.modifier_tick {
-            self.modifier_tick = now;
-            return;
-        }
-        let timeout = (u64::from(hz) * 750 / 1000).max(1);
-        if now - self.modifier_tick < timeout {
-            return;
-        }
+    fn reset_modifiers(&mut self) {
+        self.shift_down = false;
         self.ctrl_down = false;
         self.alt_down = false;
         self.altgr_down = false;
         self.extended = false;
-        self.modifier_key_seen = false;
-        self.modifier_stale_resets = self.modifier_stale_resets.wrapping_add(1);
     }
     fn push(&mut self, codepoint: u32, wake: &mut Wake) {
         if !self.queue.try_push(codepoint) {
@@ -154,6 +124,7 @@ impl State {
             self.extended = true;
             return w;
         }
+        let resets = self.physical.overflow_resets;
         if let Some(usage) = physical::set1_usage(scan & 0x7f, self.extended)
             && self
                 .physical
@@ -161,27 +132,29 @@ impl State {
         {
             w.desktop = true;
         }
+        if self.physical.overflow_resets != resets {
+            // The physical queue dropped this scan while publishing Reset.
+            // Keep the text/status projection in that same reset state.
+            self.reset_modifiers();
+            return w;
+        }
         if self.extended {
             self.extended = false;
             match scan {
                 0x38 => {
                     self.altgr_down = true;
-                    self.modifier_event();
                     return w;
                 }
                 0xb8 => {
                     self.altgr_down = false;
-                    self.modifier_event();
                     return w;
                 }
                 0x1d => {
                     self.ctrl_down = true;
-                    self.modifier_event();
                     return w;
                 }
                 0x9d => {
                     self.ctrl_down = false;
-                    self.modifier_event();
                     return w;
                 }
                 _ => {}
@@ -189,7 +162,6 @@ impl State {
             if scan & 0x80 != 0 {
                 return w;
             }
-            self.nonmodifier_key();
             let ch = match scan {
                 0x48 => Some(0x80),
                 0x50 => Some(0x81),
@@ -211,32 +183,26 @@ impl State {
         match scan {
             0x2a | 0x36 => {
                 self.shift_down = true;
-                self.modifier_event();
                 return w;
             }
             0xaa | 0xb6 => {
                 self.shift_down = false;
-                self.modifier_event();
                 return w;
             }
             0x1d => {
                 self.ctrl_down = true;
-                self.modifier_event();
                 return w;
             }
             0x9d => {
                 self.ctrl_down = false;
-                self.modifier_event();
                 return w;
             }
             0x38 => {
                 self.alt_down = true;
-                self.modifier_event();
                 return w;
             }
             0xb8 => {
                 self.alt_down = false;
-                self.modifier_event();
                 return w;
             }
             _ => {}
@@ -244,7 +210,6 @@ impl State {
         if scan & 0x80 != 0 {
             return w;
         }
-        self.nonmodifier_key();
         let special = if scan == 0x01 && self.ctrl_down {
             Some(0x83)
         } else if scan == 0x3d {
@@ -289,7 +254,10 @@ pub fn init() {
     unsafe {
         sync_objects::queue_reopen(ACTIVITY.queue.get());
     }
-    state(|s| s.physical.clear());
+    state(|s| {
+        s.physical.clear();
+        s.reset_modifiers();
+    });
     drain_output();
     pic::unmask(IRQ);
 }
@@ -298,13 +266,7 @@ pub fn disable() {
     state(|s| {
         s.queue.clear();
         s.physical.clear();
-        s.shift_down = false;
-        s.ctrl_down = false;
-        s.alt_down = false;
-        s.altgr_down = false;
-        s.modifier_tick = 0;
-        s.modifier_key_seen = false;
-        s.extended = false;
+        s.reset_modifiers();
     });
     unsafe {
         sync_objects::queue_close_cancelled(ACTIVITY.queue.get());
@@ -326,10 +288,7 @@ pub fn read_codepoint() -> Option<u32> {
     if let Some(poll) = poll {
         unsafe { poll() }
     }
-    let hook = state(|s| {
-        s.clear_stale();
-        s.input_hook
-    });
+    let hook = state(|s| s.input_hook);
     if let Some(hook) = hook {
         let value = unsafe { hook() };
         if value != 0 {
