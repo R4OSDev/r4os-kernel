@@ -50,10 +50,6 @@ fn fail(reason: &[u8]) -> bool {
     puts(b"\r\n");
     false
 }
-fn cycles() -> u64 {
-    unsafe { core::arch::x86_64::_rdtsc() }
-}
-
 pub(super) fn self_test() -> bool {
     if !heap::r4os_rust_heap_initialized() {
         return fail(b"not-initialized");
@@ -110,28 +106,20 @@ pub(super) fn self_test() -> bool {
     }
     let mut slots: [Option<(*mut u8, usize)>; 200] = [None; 200];
     let mut rng = 0x9e37_79b9_7f4a_7c15u64;
-    let (mut alloc_cycles, mut free_cycles, mut alloc_ops, mut free_ops) = (0u64, 0u64, 0u64, 0u64);
-    let start = cycles();
     for _ in 0..2000 {
         rng = rng
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         let slot = ((rng >> 33) % 200) as usize;
         if let Some((p, len)) = slots[slot] {
-            let t = cycles();
             let ok = release(p, len);
-            free_cycles = free_cycles.wrapping_add(cycles().wrapping_sub(t));
-            free_ops += 1;
             if !ok {
                 return fail(b"churn-free");
             }
             slots[slot] = None;
         } else {
             let len = 16 + ((rng >> 8) & 0x7ff) as usize;
-            let t = cycles();
             let p = heap::r4os_rust_heap_alloc(len, 8);
-            alloc_cycles = alloc_cycles.wrapping_add(cycles().wrapping_sub(t));
-            alloc_ops += 1;
             if p.is_null() {
                 return fail(b"churn-alloc");
             }
@@ -146,19 +134,12 @@ pub(super) fn self_test() -> bool {
             *entry = None;
         }
     }
-    let total = cycles().wrapping_sub(start);
     let s = stats();
     if s.used_bytes != 0 || s.active_blocks != 0 {
         return fail(b"leak");
     }
     puts(b"HEAPCHECK OK ops=");
     dec(2000);
-    puts(b" alloc_avg=");
-    dec(alloc_cycles.checked_div(alloc_ops).unwrap_or(0));
-    puts(b" free_avg=");
-    dec(free_cycles.checked_div(free_ops).unwrap_or(0));
-    puts(b" churn=");
-    dec(total);
     puts(b" committed=");
     dec(s.committed_bytes as u64);
     puts(b" largest_free=");

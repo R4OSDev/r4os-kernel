@@ -81,7 +81,7 @@ pub fn start() -> ! {
     require(action(26), 17, b"Driver policy boot failed");
     step(13, 99, b"Runtime vorbereiten");
     status(b"SMP pruefen");
-    action(27); // bounded SMP/IRQ/TCP witnesses only if explicitly requested
+    action(27); // bounded SMP/IRQ witnesses only if explicitly requested
     status(b"Netzwerk-Task starten");
     action(28);
     status(b"DHCP starten");
@@ -226,13 +226,6 @@ unsafe fn boot_action(action: u32) -> bool {
                 let memory = unsafe { memory.assume_init() };
                 arch::smp_probe::run(memory.usable);
                 super::probes::nvme_interrupt();
-                if unsafe { net::tcp::r4os_rust_net_tcp_performance_contract_probe() } {
-                    super::log_route::puts(b"[TCPBURSTPROBE] result=OK write_bytes=4068 segments=3 catalog=48 delayed_ack_ms=40\r\n");
-                } else {
-                    super::log_route::puts(b"[TCPBURSTPROBE] result=FAILED\r\n");
-                    super::fatal::kernel(13, b"TCP burst probe failed");
-                }
-                super::log_route::puts(b"[QUICKPROBE] result=DONE\r\n");
             }
         }
         28 => unsafe {

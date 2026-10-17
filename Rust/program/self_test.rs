@@ -1624,12 +1624,6 @@ pub(super) unsafe fn run() -> bool {
         true
     }
 }
-/// # Safety
-/// Same original single-test admission and failure seam restoration as run().
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_program_storage_self_test() -> bool {
-    unsafe { run() }
-}
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct BufferStats {

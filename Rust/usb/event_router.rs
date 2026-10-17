@@ -565,10 +565,6 @@ pub unsafe extern "C" fn r4os_rust_usb_mailbox_snapshot(
 ) {
     unsafe { out.write((*mailbox).snapshot()) }
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_usb_router_self_test() -> bool {
-    self_test()
-}
 const _: () = {
     assert!(core::mem::size_of::<Event>() == 24);
     assert!(core::mem::offset_of!(Event, parameter) == 8);

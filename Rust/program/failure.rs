@@ -204,10 +204,6 @@ pub unsafe extern "C" fn r4os_rust_program_failure_snapshot(out: *mut Snapshot) 
     }
     unlock();
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_program_selftest_allowed(group: u8) -> bool {
-    allowed(group)
-}
 const _: () = {
     assert!(core::mem::size_of::<Snapshot>() == 12);
     assert!(core::mem::offset_of!(Snapshot, recovered) == 8);

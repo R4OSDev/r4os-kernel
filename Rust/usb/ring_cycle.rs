@@ -83,10 +83,6 @@ pub unsafe extern "C" fn r4os_rust_usb_ring_advance(
 ) {
     unsafe { out.write(after_submission(enqueue, producer, count)) };
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_usb_ring_self_test() -> bool {
-    self_test()
-}
 const _: () = {
     assert!(core::mem::size_of::<Advance>() == 6);
     assert!(core::mem::align_of::<Advance>() == 2);

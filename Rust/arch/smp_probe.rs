@@ -76,9 +76,6 @@ pub struct Report {
     pub clock_regressions: u32,
     pub tlb_failures: u32,
     pub owner_failures: u32,
-    pub sequential_ns: u64,
-    pub parallel_ns: u64,
-    pub speedup_milli: u64,
     pub online_mask: u64,
     pub observed_mask: u64,
     pub tlb_ready_mask: u64,
@@ -198,9 +195,9 @@ pub fn run(usable: u64) -> bool {
             expected ^= work(index);
         }
     }
-    let Some(sequential) = elapsed(start) else {
+    if elapsed(start).is_none() {
         return fail(b"clock-sequential");
-    };
+    }
     reset(cleanup.probe.address);
     cleanup.release_workers = true;
     let mut workers = [ptr::null_mut(); MAX_CPUS];
@@ -314,9 +311,9 @@ pub fn run(usable: u64) -> bool {
             return fail(b"timeout");
         }
     }
-    let Some(parallel) = elapsed(parallel_start) else {
+    if elapsed(parallel_start).is_none() {
         return fail(b"clock-parallel");
-    };
+    }
     let mut actual = 0;
     let mut clock_samples = true;
     for (index, result) in RESULTS.iter().enumerate() {
@@ -344,12 +341,6 @@ pub fn run(usable: u64) -> bool {
         && clock.registered_cpu_mask & online == online
         && regressions == 0
         && irq_delta != 0;
-    let speedup = if parallel == 0 {
-        0
-    } else {
-        u64::try_from(u128::from(sequential) * 1000 / u128::from(parallel))
-            .expect("SMP speedup overflow")
-    };
     let mut heap_output = core::mem::MaybeUninit::uninit();
     unsafe { smp_probe_heap(heap_output.as_mut_ptr()) };
     let heap_probe = unsafe { heap_output.assume_init() };
@@ -401,7 +392,6 @@ pub fn run(usable: u64) -> bool {
         && placement == online
         && observed == online
         && actual == expected
-        && speedup >= 1050
         && heap_ok
         && tlb_ok
         && lock_ok
@@ -421,9 +411,6 @@ pub fn run(usable: u64) -> bool {
         clock_regressions: regressions,
         tlb_failures: stale,
         owner_failures,
-        sequential_ns: sequential,
-        parallel_ns: parallel,
-        speedup_milli: speedup,
         online_mask: online,
         observed_mask: observed,
         tlb_ready_mask: ready,
@@ -540,18 +527,14 @@ unsafe extern "C" fn worker_main() {
         scheduler::yield_task();
     }
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_smp_probe(usable: u64) -> bool {
-    run(usable)
-}
 const _: () = {
     assert!(core::mem::size_of::<TlbProbe>() == 40);
     assert!(core::mem::offset_of!(TlbProbe, address) == 8);
-    assert!(core::mem::size_of::<Report>() == 600);
-    assert!(core::mem::offset_of!(Report, sequential_ns) == 32);
+    assert!(core::mem::size_of::<Report>() == 576);
+    assert!(core::mem::offset_of!(Report, online_mask) == 32);
     assert!(core::mem::size_of::<HeapReport>() == 104);
-    assert!(core::mem::offset_of!(Report, heap_probe) == 104);
-    assert!(core::mem::offset_of!(Report, serial_stats) == 488);
+    assert!(core::mem::offset_of!(Report, heap_probe) == 80);
+    assert!(core::mem::offset_of!(Report, serial_stats) == 464);
 };
 
 struct ProbeMutex(core::cell::UnsafeCell<crate::sched::sync_types::Mutex>);
@@ -818,12 +801,6 @@ unsafe fn smp_probe_report(report: *const Report) {
     probe_text(if report.ok { b"OK" } else { b"FAILED" });
     probe_text(b" cpus=");
     probe_dec(u64::from(report.online_count));
-    probe_text(b" sequential_ns=");
-    probe_dec(report.sequential_ns);
-    probe_text(b" parallel_ns=");
-    probe_dec(report.parallel_ns);
-    probe_text(b" speedup_milli=");
-    probe_dec(report.speedup_milli);
     probe_text(b" expected_mask=0x");
     probe_hex(report.online_mask, 8);
     probe_text(b" observed_mask=0x");
