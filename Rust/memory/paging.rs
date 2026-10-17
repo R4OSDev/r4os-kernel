@@ -8,6 +8,7 @@ use super::{
     phys,
 };
 use core::{cell::UnsafeCell, mem::MaybeUninit};
+mod batch;
 const PAGE: u64 = 4096;
 const MASK: u64 = 0x000f_ffff_ffff_f000;
 const PRESENT: u64 = 1;
@@ -393,20 +394,19 @@ pub extern "C" fn r4os_rust_paging_map_batch(
         return fail_map();
     }
     let root = root();
+    let mut leaves = batch::Leaves::new(root, virtual_base);
     for page in 0..pages {
-        let address = virtual_base + page * PAGE;
-        let Some(table) = get_or_create(root, address) else {
+        let Some(leaf) = leaves.prepare(page, true) else {
             return fail_map();
         };
-        if read(at(table, index(address, 12))) & PRESENT != 0 {
+        if leaf.huge || read(leaf.entry) & PRESENT != 0 {
             return fail_map();
         }
     }
     for page in 0..pages {
         let address = virtual_base + page * PAGE;
-        let table = get_table(root, address).expect("preflight page table");
         write(
-            at(table, index(address, 12)),
+            leaves.entry(page),
             ((physical_base + page * PAGE) & MASK) | flags | PRESENT,
         );
         state(|state| state.stats.map_pages = state.stats.map_pages.wrapping_add(1));
@@ -438,29 +438,27 @@ pub extern "C" fn r4os_rust_paging_unmap_batch(
         return fail_unmap();
     }
     let root = root();
+    let mut leaves = batch::Leaves::new(root, virtual_base);
     let mut previous = [MaybeUninit::<u64>::uninit(); 64];
     for page in 0..pages {
         let offset = page * PAGE;
-        let Some(leaf) = leaf(root, virtual_base + offset) else {
+        let Some(leaf) = leaves.prepare(page, false) else {
             return fail_unmap();
         };
         let value = read(leaf.entry);
-        if leaf.huge || value & MASK != physical_base + offset {
+        if leaf.huge || value & PRESENT == 0 || value & MASK != physical_base + offset {
             return fail_unmap();
         }
         previous[page as usize].write(value);
     }
     for page in 0..pages {
-        let leaf = leaf(root, virtual_base + page * PAGE).expect("preflight leaf");
-        write(leaf.entry, 0);
+        write(leaves.entry(page), 0);
     }
     if !invalidate(virtual_base, pages) {
         shootdown_failure();
         for page in 0..pages {
-            let address = virtual_base + page * PAGE;
-            let table = get_table(root, address).expect("rollback parent");
             // Every saved slot was filled during the successful preflight.
-            write(at(table, index(address, 12)), unsafe {
+            write(leaves.entry(page), unsafe {
                 previous[page as usize].assume_init_read()
             });
         }
@@ -612,24 +610,29 @@ pub extern "C" fn r4os_rust_paging_write_combining(address: u64, bytes: u64) -> 
     let root = root();
     while base < end {
         let pages = ((end - base) / PAGE).min(page_batch::MAX_EXTENT_PAGES);
+        let mut leaves = batch::Leaves::new(root, base);
         let mut previous = [MaybeUninit::<u64>::uninit(); 64];
         for page in 0..pages {
-            let Some(leaf) = leaf(root, base + page * PAGE) else {
+            let Some(leaf) = leaves.prepare(page, false) else {
                 return false;
             };
-            previous[page as usize].write(read(leaf.entry));
+            let value = read(leaf.entry);
+            if value & PRESENT == 0 {
+                return false;
+            }
+            previous[page as usize].write(value);
         }
         for page in 0..pages {
-            let leaf = leaf(root, base + page * PAGE).expect("WC preflight leaf");
+            let leaf = leaves.leaf(page);
             let mut value = (read(leaf.entry) & !CACHE_DISABLE) | WRITE_THROUGH;
+            // The saved path distinguishes huge-leaf PAT from a 4-KB PTE.
             value |= if leaf.huge { HUGE_PAT } else { PAT };
             write(leaf.entry, value);
         }
         if !invalidate(base, pages) {
             shootdown_failure();
             for page in 0..pages {
-                let leaf = leaf(root, base + page * PAGE).expect("WC rollback leaf");
-                write(leaf.entry, unsafe {
+                write(leaves.entry(page), unsafe {
                     previous[page as usize].assume_init_read()
                 });
             }
