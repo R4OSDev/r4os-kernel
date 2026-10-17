@@ -26,6 +26,7 @@ pub struct Slot {
     pub backend_handle: u64,
     pub completion_latch: Latch,
     pub execution_mode: u8,
+    pub(crate) observation: *const crate::storage::block_observation::Subscription,
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -221,7 +222,7 @@ pub unsafe extern "C" fn r4os_rust_block_oldest(
     unsafe { ptr::write(out, result) };
 }
 const _: () = {
-    assert!(core::mem::size_of::<Slot>() == 144);
+    assert!(core::mem::size_of::<Slot>() == 152);
     assert!(core::mem::offset_of!(Slot, backend_handle) == 104);
     assert!(core::mem::offset_of!(Slot, completion_latch) == 112);
     assert!(core::mem::size_of::<Snapshot>() == 32);

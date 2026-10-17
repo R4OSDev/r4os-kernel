@@ -29,3 +29,7 @@ pub(crate) mod block_device;
 pub(crate) mod installation_json;
 
 pub(crate) mod block_probes;
+
+pub(crate) mod block_observation;
+
+pub(crate) mod nvme_check;

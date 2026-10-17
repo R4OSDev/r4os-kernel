@@ -27,6 +27,7 @@ pub struct AsyncRequest {
     pub const_buffer: *const u8,
     pub buffer_len: usize,
     pub complete: unsafe extern "C" fn(u64, i32, u32),
+    pub(crate) observation: *const crate::storage::block_observation::Subscription,
 }
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -281,6 +282,7 @@ pub(crate) unsafe fn backend(
                     const_buffer: r.const_buffer,
                     buffer_len: r.buffer_len,
                     complete: block_execution::r4os_rust_block_complete,
+                    observation: r.observation,
                 };
                 config.submit.expect("block submit")(config.context, &input)
             }

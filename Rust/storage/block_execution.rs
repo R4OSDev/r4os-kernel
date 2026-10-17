@@ -202,6 +202,7 @@ pub unsafe extern "C" fn r4os_rust_block_enqueue(
                 start_tick: 0,
                 mode: 0,
                 backend_handle: 0,
+                observation: a.observation,
             };
             unsafe {
                 block_state::r4os_rust_block_slot_enqueue(
@@ -682,6 +683,15 @@ pub unsafe extern "C" fn r4os_rust_block_wait(
     }
 }
 unsafe fn wait(device: *mut c_void, id: u64, timeout: u64) -> block_requests::ResultRecord {
+    unsafe { wait_receipted(device, id, timeout, ptr::null_mut()) }
+}
+#[inline(always)]
+pub(crate) unsafe fn wait_receipted(
+    device: *mut c_void,
+    id: u64,
+    timeout: u64,
+    receipt: *mut crate::storage::block_observation::ReadReceipt,
+) -> block_requests::ResultRecord {
     let v = unsafe { view(device) };
     let mut counted = false;
     let mut slices = 0u32;
@@ -707,6 +717,30 @@ unsafe fn wait(device: *mut c_void, id: u64, timeout: u64) -> block_requests::Re
         let completed = {
             let _owner = Guard::acquire(1);
             if unsafe { (*p).state } == 3 {
+                if !receipt.is_null() {
+                    let mut flags = crate::contract::kernel_nvme_check_receipt_completed;
+                    unsafe {
+                        if (*p).execution_mode == 1 {
+                            flags |= crate::contract::kernel_nvme_check_receipt_runtime;
+                        }
+                        if (*p).backend_handle != 0 {
+                            flags |= crate::contract::kernel_nvme_check_receipt_asynchronous;
+                        }
+                        if !(*p).cancel_requested
+                            && !(*p).timeout_requested
+                            && (*p).completion_override == 0
+                        {
+                            flags |= crate::contract::kernel_nvme_check_receipt_clean;
+                        }
+                        receipt.write(crate::storage::block_observation::ReadReceipt {
+                            flags,
+                            reserved0: 0,
+                            request_id: (*p).id,
+                            backend_handle: (*p).backend_handle,
+                            bytes: if (*p).ok { (*p).buffer_len as u64 } else { 0 },
+                        });
+                    }
+                }
                 Some(block_requests::ResultRecord {
                     ok: unsafe { (*p).ok },
                     err: unsafe { (*p).err },

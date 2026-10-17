@@ -566,7 +566,20 @@ unsafe extern "C" fn block_submit(
         buffer_addr: buffer,
         complete: r.complete,
     };
-    unsafe { r4os_rust_driver_storage_async(ctx, &public) }
+    if r.observation.is_null() {
+        return unsafe { r4os_rust_driver_storage_async(ctx, &public) };
+    }
+    let subscription = unsafe { &*r.observation };
+    let mut observed = a::StorageObservedRequest {
+        base: public,
+        observation_version: a::storage_observation_version,
+        reserved0: 0,
+        cookie: subscription.cookie,
+        observe: Some(subscription.observe),
+    };
+    observed.base.size = core::mem::size_of::<a::StorageObservedRequest>() as u32;
+    observed.base.flags = a::storage_request_flag_observation;
+    unsafe { r4os_rust_driver_storage_async(ctx, &observed.base) }
 }
 unsafe extern "C" fn block_cancel(ctx: *mut c_void, handle: u64, reason: u32) -> i32 {
     unsafe { r4os_rust_driver_storage_control(ctx, false, handle, reason) }

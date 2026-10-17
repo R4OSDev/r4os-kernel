@@ -21,6 +21,7 @@ pub struct Execution {
     pub start_tick: u64,
     pub mode: u8,
     pub backend_handle: u64,
+    pub(crate) observation: *const crate::storage::block_observation::Subscription,
 }
 impl Execution {
     unsafe fn from_slot(index: usize, p: *const Slot) -> Self {
@@ -38,6 +39,7 @@ impl Execution {
                 start_tick: (*p).start_tick,
                 mode: (*p).execution_mode,
                 backend_handle: (*p).backend_handle,
+                observation: (*p).observation,
             }
         }
     }
@@ -86,6 +88,7 @@ pub unsafe extern "C" fn r4os_rust_block_slot_enqueue(
         (*slot).const_buffer = a.const_buffer;
         (*slot).buffer_len = a.buffer_len;
         (*slot).buffer_ownership = a.buffer_ownership;
+        (*slot).observation = a.observation;
         (*slot).submit_tick = tick
     };
 }
@@ -273,7 +276,7 @@ pub unsafe extern "C" fn r4os_rust_block_execution(
     unsafe { out.write(Execution::from_slot(index, slot)) }
 }
 const _: () = {
-    assert!(core::mem::size_of::<Execution>() == 96);
+    assert!(core::mem::size_of::<Execution>() == 104);
     assert!(core::mem::offset_of!(Execution, backend_handle) == 88);
     assert!(core::mem::size_of::<Finish>() == 24);
     assert!(core::mem::size_of::<Abort>() == 6);

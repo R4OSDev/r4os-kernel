@@ -39,3 +39,5 @@ pub mod smp;
 pub mod storage;
 
 pub mod block_queue;
+
+pub mod nvme;

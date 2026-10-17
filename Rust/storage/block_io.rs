@@ -50,6 +50,7 @@ pub struct Input {
     pub data: *const u8,
     pub len: usize,
     pub ownership: u8,
+    pub(crate) observation: *const crate::storage::block_observation::Subscription,
 }
 
 struct Pin(block_registry::Pin);
@@ -203,6 +204,38 @@ unsafe fn read_chunk(
     out: *mut u8,
     trusted: bool,
 ) -> u8 {
+    unsafe {
+        read_chunk_observed(
+            device,
+            view,
+            lba,
+            sectors,
+            out,
+            trusted,
+            ReadObservation::NONE,
+        )
+    }
+}
+struct ReadObservation {
+    subscription: *const crate::storage::block_observation::Subscription,
+    receipt: *mut crate::storage::block_observation::ReadReceipt,
+}
+impl ReadObservation {
+    const NONE: Self = Self {
+        subscription: ptr::null(),
+        receipt: ptr::null_mut(),
+    };
+}
+#[inline(always)]
+unsafe fn read_chunk_observed(
+    device: *mut c_void,
+    view: View,
+    lba: u64,
+    sectors: u16,
+    out: *mut u8,
+    trusted: bool,
+    observation: ReadObservation,
+) -> u8 {
     let bytes = usize::from(sectors) * view.sector_size as usize;
     let worker = block_workers::r4os_rust_block_workers_ready();
     let pointer = if worker && !trusted {
@@ -233,6 +266,7 @@ unsafe fn read_chunk(
                 data: ptr::null(),
                 len: bytes,
                 ownership: owner,
+                observation: observation.subscription,
             },
         )
     }) else {
@@ -243,7 +277,18 @@ unsafe fn read_chunk(
     unsafe {
         crate::storage::block_execution::r4os_rust_block_schedule(device, worker);
     }
-    let result = unsafe { wait(device, view, id) };
+    let result = if observation.receipt.is_null() {
+        unsafe { wait(device, view, id) }
+    } else {
+        unsafe {
+            crate::storage::block_execution::wait_receipted(
+                device,
+                id,
+                timeout(view),
+                observation.receipt,
+            )
+        }
+    };
     if result.buffer_detached {
         bounce.release = false;
     }
@@ -306,6 +351,7 @@ unsafe fn write_chunk(
                 data: buffer,
                 len: bytes,
                 ownership: owner,
+                observation: ptr::null(),
             },
         )
     }) else {
@@ -561,6 +607,7 @@ pub unsafe extern "C" fn r4os_rust_block_write_batch(
                         data: job.data,
                         len: bytes,
                         ownership: if worker { 2 } else { 0 },
+                        observation: ptr::null(),
                     },
                 )
             }) else {
@@ -621,6 +668,7 @@ fn flush_pinned(pin: Option<Pin>) -> bool {
                 data: ptr::null(),
                 len: 0,
                 ownership: 0,
+                observation: ptr::null(),
             },
         )
     }) else {
@@ -640,9 +688,46 @@ const _: () = {
     assert!(core::mem::size_of::<Transfer>() == 4);
     assert!(core::mem::size_of::<Write>() == 40);
     assert!(core::mem::size_of::<View>() == 64);
-    assert!(core::mem::size_of::<Input>() == 56);
+    assert!(core::mem::size_of::<Input>() == 64);
 };
 
 unsafe fn block_io_view(device: *mut c_void, out: *mut View) {
     unsafe { out.write(crate::storage::block_device::io_view(device)) }
+}
+
+/// Exactly one resident read through the existing splitter/chunk/queue owner.
+/// The subscription and receipt remain resident until real completion.
+pub(crate) unsafe fn read_observed(
+    reference: Reference,
+    lba: u64,
+    out: *mut u8,
+    len: usize,
+    observation: *const crate::storage::block_observation::Subscription,
+    receipt: *mut crate::storage::block_observation::ReadReceipt,
+) -> bool {
+    let Some(pin) = Pin::exact(reference) else {
+        return false;
+    };
+    let view = pin.view();
+    if observation.is_null()
+        || receipt.is_null()
+        || len != view.sector_size as usize
+        || validate(view, lba, 1, len) != 0
+    {
+        return false;
+    }
+    unsafe {
+        read_chunk_observed(
+            pin.device(),
+            view,
+            lba,
+            1,
+            out,
+            true,
+            ReadObservation {
+                subscription: observation,
+                receipt,
+            },
+        ) == 0
+    }
 }
