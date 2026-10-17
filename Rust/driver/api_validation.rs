@@ -191,34 +191,15 @@ pub unsafe extern "C" fn r4os_rust_driver_usb_valid(d: *const a::UsbHostControll
     }
     true
 }
-pub type TransmitPacket =
-    unsafe extern "C" fn(*mut core::ffi::c_void, *const a::NetTxRequest) -> i32;
-/// # Safety
-/// The resident descriptor has its declared C prefix under driver admission.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_driver_net_packet(
-    d: *const a::NetBackend,
-) -> Option<TransmitPacket> {
-    if field!(d, version) < 2 || field!(d, size) < size_of::<a::NetBackend>() as u32 {
-        None
-    } else {
-        field!(d, transmit_packet)
-    }
-}
 /// # Safety
 /// The resident descriptor has its declared C prefix under driver admission.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_net_valid(d: *const a::NetBackend) -> bool {
     let version = field!(d, version);
-    if version != 1 && version != a::net_backend_version {
+    if version != a::net_backend_version {
         return error(b"[R4D][ERROR] net backend version mismatch\r\n");
     }
-    let required = if version == 1 {
-        offset_of!(a::NetBackend, offered_capabilities)
-    } else {
-        size_of::<a::NetBackend>()
-    };
-    if field!(d, size) < required as u32 {
+    if field!(d, size) < size_of::<a::NetBackend>() as u32 {
         return error(b"[R4D][ERROR] net backend descriptor too small\r\n");
     }
     if !(576..=1500).contains(&field!(d, mtu)) {
@@ -240,7 +221,7 @@ pub unsafe extern "C" fn r4os_rust_driver_net_valid(d: *const a::NetBackend) -> 
     if let Some(f) = field!(d, shutdown) {
         valid &= f as *const () as u64 >= 0xffff800000000000;
     }
-    if let Some(f) = unsafe { r4os_rust_driver_net_packet(d) } {
+    if let Some(f) = field!(d, transmit_packet) {
         valid &= f as *const () as u64 >= 0xffff800000000000;
     }
     if !valid {

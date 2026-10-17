@@ -72,7 +72,6 @@ fn find_adapter(index: usize) -> Option<Record> {
     }
 }
 #[repr(C)]
-#[derive(Default)]
 struct Offer {
     offered: u64,
     required: u64,
@@ -105,16 +104,8 @@ impl Drop for Callback {
 fn puts(s: &[u8]) {
     unsafe { log::r4os_rust_bootlog_write(s.as_ptr(), s.len()) }
 }
+// Registration validated the complete v2 header before reading any offer field.
 unsafe fn offer(d: *const a::NetBackend) -> Offer {
-    if unsafe { (*d).version } < 2 || unsafe { (*d).size } < size_of::<a::NetBackend>() as u32 {
-        return Offer {
-            rx_queues: 1,
-            tx_queues: 1,
-            rx_segments: 1,
-            tx_segments: 1,
-            ..Offer::default()
-        };
-    }
     unsafe {
         Offer {
             offered: (*d).offered_capabilities,
