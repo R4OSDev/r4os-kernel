@@ -1,5 +1,6 @@
 //! Canonical native dynamic tasks. External callers receive opaque handles
 //! and fixed records; the scheduler retains exact typed task access.
+pub(crate) mod balance;
 pub(crate) mod diagnostic;
 pub(crate) mod task_api;
 pub(crate) mod task_lifecycle;

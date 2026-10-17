@@ -169,6 +169,7 @@ pub(crate) unsafe fn bind_diagnostic_cpu(task: *mut Task, cpu: u32) -> bool {
         if accepted {
             (*c).home_cpu = cpu as u8;
             (*c).home_cpu_bound = true;
+            (*c).cpu_affinity_bound = true;
         }
         accepted
     }

@@ -27,6 +27,7 @@ struct CpuState {
     initialized: bool,
     boot_depth: u32,
     pending: bool,
+    balance_next_cpu: u32,
 }
 impl CpuState {
     const EMPTY: Self = Self {
@@ -35,6 +36,7 @@ impl CpuState {
         initialized: false,
         boot_depth: 0,
         pending: false,
+        balance_next_cpu: 0,
     };
 }
 struct State {
@@ -471,6 +473,7 @@ fn refresh_pending(running: Task) {
     }
 }
 fn next_ready(force_priority: bool) -> Task {
+    refill_ready();
     let ordinal = change(|s| {
         s.priority_selects = s.priority_selects.wrapping_add(1);
         s.priority_selects
@@ -707,6 +710,75 @@ fn park_blocked(task: Task) {
     }
     runtime::restore_runtime(flags);
 }
+// Runtime admission covers queue transfer, exact target publication and IPI.
+fn balance_ready(target: u32, source: u32) -> bool {
+    if !cpu_state(target).initialized {
+        return false;
+    }
+    let moved = unsafe {
+        super::task::balance::pull(
+            source,
+            target,
+            cpu_state(source).current.cast(),
+            tick(),
+            QUANTUM,
+        )
+    };
+    if moved.is_null() {
+        return false;
+    }
+    cpu_change(target, |s| s.pending = true);
+    change(|s| {
+        s.wakeup_reschedule_request_count = s.wakeup_reschedule_request_count.wrapping_add(1)
+    });
+    send_reschedule(target);
+    true
+}
+fn refill_ready() {
+    let target = percpu::current_index();
+    if ready_count() != 0 || !enabled() {
+        return;
+    }
+    let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
+    if online.count_ones() < 2 {
+        return;
+    }
+    let start = local().balance_next_cpu;
+    for offset in 0..MAX_CPUS as u32 {
+        let source = (start + offset) % MAX_CPUS as u32;
+        if source == target
+            || online & (1 << source) == 0
+            || query(3, ptr::null_mut(), u64::from(source)) < 2
+        {
+            continue;
+        }
+        // One donor and at most eight candidates per attempt. Rotate donors
+        // even when their bounded prefix contains only bound tasks.
+        local_change(|s| s.balance_next_cpu = (source + 1) % MAX_CPUS as u32);
+        balance_ready(target, source);
+        return;
+    }
+}
+fn balance_idle(source: u32) {
+    if query(3, ptr::null_mut(), u64::from(source)) < 2 {
+        return;
+    }
+    let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
+    for offset in 1..MAX_CPUS as u32 {
+        let target = (source + offset) % MAX_CPUS as u32;
+        if online & (1 << target) == 0
+            || !cpu_state(target).initialized
+            || query(3, ptr::null_mut(), u64::from(target)) != 0
+        {
+            continue;
+        }
+        let running = cpu_state(target).current;
+        if !running.is_null() && view(running).cpu_idle {
+            balance_ready(target, source);
+            return;
+        }
+    }
+}
 fn notify_ready(task: Task) {
     let item = view(task);
     let target = item.home_cpu;
@@ -730,6 +802,7 @@ fn notify_ready(task: Task) {
             }
         }
     }
+    balance_idle(target);
 }
 fn wake_task(task: Task, result: u32) -> bool {
     let flags = runtime::save_runtime();
@@ -931,6 +1004,7 @@ fn wait_until_deadline() {
     let flags = runtime::save_runtime();
     let bsp = percpu::current_index() == 0;
     let due = bsp && poll_timed();
+    refill_ready();
     if due || ready_count() != 0 {
         runtime::restore_runtime(flags);
         return;
@@ -961,6 +1035,9 @@ fn timer_preemption(now: u64, preemptible: bool) -> bool {
                 s.preemption_deferred_no_task_count.wrapping_add(1)
         });
         return false;
+    }
+    if view(running).cpu_idle {
+        refill_ready();
     }
     if ready_count() == 0 {
         set_pending(false);
@@ -1073,6 +1150,10 @@ pub fn on_tick(now: u64, preemptible: bool, secondary: bool) -> bool {
 }
 pub fn on_reschedule(preemptible: bool) {
     let flags = runtime::save_runtime();
+    let running = local().current;
+    if !running.is_null() && view(running).cpu_idle {
+        refill_ready();
+    }
     if preempt_pending(preemptible) {
         let index = percpu::current_index() as usize;
         change(|s| {

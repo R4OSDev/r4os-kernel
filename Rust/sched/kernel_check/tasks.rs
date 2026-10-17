@@ -20,6 +20,10 @@ pub(crate) fn create(name: &'static [u8], entry: Entry, role: Role) -> *mut Task
     assert!(live(), "diagnostic task outside admitted session");
     unsafe { (&mut *LEDGER.0.get()).create(name, entry, role, None) }
 }
+pub(crate) fn create_on_cpu(name: &'static [u8], entry: Entry, role: Role, cpu: u32) -> *mut Task {
+    assert!(live(), "diagnostic task outside admitted session");
+    unsafe { (&mut *LEDGER.0.get()).create(name, entry, role, Some(cpu)) }
+}
 pub(crate) fn finish_task(t: *mut Task, kill: bool) -> bool {
     unsafe { (&mut *LEDGER.0.get()).finish_task(t, kill) }
 }

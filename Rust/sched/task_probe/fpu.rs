@@ -7,6 +7,14 @@ unsafe extern "C" {
     fn r4os_task_probe_ymm_store(destination: *mut u64);
     fn r4os_task_probe_initial_fpu(destination: *mut u64, control: *mut u32);
 }
+pub(super) unsafe fn load(value: &[u64; 4]) {
+    unsafe { r4os_task_probe_ymm_load(value.as_ptr()) };
+}
+pub(super) unsafe fn read() -> [u64; 4] {
+    let mut value = [0; 4];
+    unsafe { r4os_task_probe_ymm_store(value.as_mut_ptr()) };
+    value
+}
 pub(crate) unsafe extern "C" fn callback(lane: usize) -> i32 {
     unsafe {
         let expected = [

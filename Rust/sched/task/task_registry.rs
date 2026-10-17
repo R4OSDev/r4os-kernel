@@ -59,6 +59,7 @@ pub struct ReadyQueue {
     pub dispatch_counts: [usize; ROLE_COUNT],
     pub ranks: [Index; ROLE_COUNT],
     pub warning_cursor: *mut Task,
+    pub balance_cursor: *mut Task,
 }
 impl ReadyQueue {
     const EMPTY: Self = Self {
@@ -75,6 +76,7 @@ impl ReadyQueue {
             }
         }; ROLE_COUNT],
         warning_cursor: null_mut(),
+        balance_cursor: null_mut(),
     };
 }
 pub struct Registry {
@@ -461,9 +463,18 @@ pub(super) unsafe fn link_ready(task: *mut Task) {
         if (*c).ready_linked {
             return;
         }
-        let q = queue_for(task);
         (*c).ready_order = (*raw()).next_ready_order;
         (*raw()).next_ready_order += 1;
+        append_ready(task);
+    }
+}
+/// Caller has assigned ready_order. Migration uses this only for an empty
+/// target queue, preserving both global ready age and per-rank ordering.
+pub(super) unsafe fn append_ready(task: *mut Task) {
+    unsafe {
+        let c = core(task);
+        assert!(!(*c).ready_linked);
+        let q = queue_for(task);
         (*c).ready_rank = dispatch_rank(task);
         task_index::insert(
             ptr::addr_of_mut!((*q).ranks[(*c).ready_rank as usize]),
@@ -482,6 +493,9 @@ pub(super) unsafe fn link_ready(task: *mut Task) {
         (*c).ready_linked = true;
         if (*q).warning_cursor.is_null() {
             (*q).warning_cursor = task;
+        }
+        if (*q).balance_cursor.is_null() {
+            (*q).balance_cursor = task;
         }
         (*q).count += 1;
         (*q).dispatch_counts[dispatch_rank(task) as usize] += 1;
@@ -516,6 +530,13 @@ pub(super) unsafe fn unlink_ready(task: *mut Task) {
                 (*c).ready_next
             };
         }
+        if (*q).balance_cursor == task {
+            (*q).balance_cursor = if (*c).ready_next.is_null() {
+                (*q).head
+            } else {
+                (*c).ready_next
+            };
+        }
         (*c).ready_prev = null_mut();
         (*c).ready_next = null_mut();
         (*c).ready_linked = false;
@@ -536,8 +557,9 @@ pub(super) unsafe fn select_home(task: *mut Task) {
             (*c).home_cpu_bound = true;
             return;
         }
-        if (*c).home_cpu_bound
-            && percpu::r4os_rust_percpu_control(13, u32::from((*c).home_cpu), 0, 0) != 0
+        if (*c).cpu_affinity_bound
+            || ((*c).home_cpu_bound
+                && percpu::r4os_rust_percpu_control(13, u32::from((*c).home_cpu), 0, 0) != 0)
         {
             return;
         }
@@ -745,6 +767,7 @@ pub(super) unsafe fn mark_running(task: *mut Task) {
         unlink_ready(task);
         unlink_timeout(task);
         let cpu = percpu::current_index();
+        assert!(!(*c).cpu_affinity_bound || u32::from((*c).home_cpu) == cpu);
         (*c).home_cpu = cpu as u8;
         (*c).home_cpu_bound = true;
         (*c).running_cpu = cpu as u8;
