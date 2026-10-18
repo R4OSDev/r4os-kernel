@@ -302,12 +302,14 @@ fn configure_sys() {
             as *const () as usize,
         directory_next: crate::program::system::directory::r4os_rust_sys_directory_next as *const ()
             as usize,
+        thread_placement_get: super::thread_placement::get as *const () as usize,
+        thread_placement_set: super::thread_placement::set as *const () as usize,
         ..Default::default()
     };
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1264);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1280);
     assert!(mem::offset_of!(c::R4XStartR4Sys, magic) == 0);
     assert!(mem::offset_of!(c::R4XStartR4Sys, abi_version) == 4);
     assert!(mem::offset_of!(c::R4XStartR4Sys, size) == 8);

@@ -8,6 +8,16 @@ pub(crate) fn choose(
     domains: &[Domain; MAX_CPUS],
     previous: Option<u32>,
 ) -> Option<u32> {
+    choose_with_preference(mask, loads, domains, previous, None)
+}
+
+pub(crate) fn choose_with_preference(
+    mask: u64,
+    loads: &[usize; MAX_CPUS],
+    domains: &[Domain; MAX_CPUS],
+    previous: Option<u32>,
+    preferred: Option<u32>,
+) -> Option<u32> {
     let mut candidates = mask & ((1u64 << MAX_CPUS) - 1);
     if candidates == 0 {
         return None;
@@ -18,7 +28,7 @@ pub(crate) fn choose(
         .fold(0u64, |mask, (i, &load)| mask | (u64::from(load != 0) << i));
     let previous = previous.filter(|&cpu| cpu < MAX_CPUS as u32);
     let mut best = None;
-    let mut best_key = (usize::MAX, true, 3u8, u32::MAX);
+    let mut best_key = (usize::MAX, true, true, 3u8, u32::MAX);
     while candidates != 0 {
         let cpu = candidates.trailing_zeros();
         candidates &= candidates - 1;
@@ -34,7 +44,13 @@ pub(crate) fn choose(
                 2
             }
         });
-        let key = (loads[cpu as usize], occupied_core, locality, cpu);
+        let key = (
+            loads[cpu as usize],
+            occupied_core,
+            preferred.is_some_and(|hint| hint != cpu),
+            locality,
+            cpu,
+        );
         if key < best_key {
             best_key = key;
             best = Some(cpu);
@@ -44,6 +60,7 @@ pub(crate) fn choose(
     // admissible CPU already has work, never at the cost of a truly idle CPU
     // or a better physical-core class. No task can be hidden by a preference.
     if best_key.0 != 0
+        && preferred.is_none()
         && let Some(old) = previous
         && mask & (1 << old) != 0
     {

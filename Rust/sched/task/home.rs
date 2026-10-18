@@ -30,7 +30,9 @@ pub(super) unsafe fn select(task: *mut Task) {
         if old_current == task {
             return;
         }
-        let mask = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
+        let mask = super::thread_placement::allowed(task);
+        let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
+        let preferred = (*c).placement_applied.preferred;
         let previous = ((*c).home_cpu_bound && old < registry::MAX_CPUS as u32).then_some(old);
         let now = (*c).ready_since_tick;
         if previous.is_some()
@@ -40,7 +42,7 @@ pub(super) unsafe fn select(task: *mut Task) {
         {
             return;
         }
-        if previous.is_some() && mask & (1 << old) != 0 {
+        if preferred.is_none() && previous.is_some() && mask & (1 << old) != 0 {
             let old_load = balance::workload(old, old_current);
             // All admitted exact currents have work: every possible load is
             // at least one and every core occupied, including unknown domains.
@@ -53,7 +55,8 @@ pub(super) unsafe fn select(task: *mut Task) {
             // other CPU can improve that exact chooser key. Check only its
             // confirmed siblings, retaining flat behavior for unknown domains.
             if old_load == 0 {
-                let mut siblings = cpu_topology::domains()[old as usize].core & mask & !(1 << old);
+                let mut siblings =
+                    cpu_topology::domains()[old as usize].core & online & !(1 << old);
                 let mut core_busy = false;
                 while siblings != 0 {
                     let cpu = siblings.trailing_zeros();
@@ -70,7 +73,7 @@ pub(super) unsafe fn select(task: *mut Task) {
         }
         let mut loads = [0usize; registry::MAX_CPUS];
         for (cpu, load) in loads.iter_mut().enumerate() {
-            if mask & (1 << cpu) == 0 {
+            if online & (1 << cpu) == 0 {
                 continue;
             }
             let current = scheduler::current_on_cpu(cpu as u32).cast::<Task>();
@@ -79,7 +82,13 @@ pub(super) unsafe fn select(task: *mut Task) {
             }
             *load = balance::workload(cpu as u32, current);
         }
-        if let Some(target) = placement::choose(mask, &loads, cpu_topology::domains(), previous) {
+        if let Some(target) = placement::choose_with_preference(
+            mask,
+            &loads,
+            cpu_topology::domains(),
+            previous,
+            preferred,
+        ) {
             if previous.is_some() && target != old {
                 (*c).last_migration_tick = now.max(1);
                 (*c).last_migration_periodic = false;

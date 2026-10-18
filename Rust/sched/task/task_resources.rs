@@ -609,6 +609,7 @@ unsafe fn create_admitted(
         c.write(TaskCore {
             name: args.name,
             state: args.state,
+            allocation_role: args.role,
             home_cpu: if running { cpu } else { 0 },
             home_cpu_bound: running,
             running_cpu: if running { cpu } else { 0xff },
@@ -740,6 +741,38 @@ unsafe fn prepare_critical() -> bool {
         true
     }
 }
+pub(crate) unsafe fn create_bsp_idle(entry: Entry) -> *mut Task {
+    unsafe {
+        let mut failure = CreateFailure::None;
+        let task = create(
+            CreateArgs {
+                name: Bytes {
+                    pointer: b"cpu0-idle".as_ptr(),
+                    len: 9,
+                },
+                state: State::Blocked,
+                needs_fpu: true,
+                entry: Some(entry),
+                role: Role::Batch,
+                smp_eligible: false,
+                smp_r4x: false,
+                owner_kind: super::task_types::ExecutionOwnerKind::None,
+                owner_context: null_mut(),
+            },
+            &mut failure,
+        );
+        if !task.is_null() {
+            let _owner = runtime::RuntimeGuard::acquire();
+            let core = registry::core(task);
+            (*core).cpu_idle = true;
+            (*core).home_cpu = 0;
+            (*core).home_cpu_bound = true;
+            (*core).cpu_affinity_bound = true;
+        }
+        task
+    }
+}
+
 pub(super) unsafe fn init() -> bool {
     unsafe {
         registry::reset();
@@ -841,6 +874,7 @@ pub(crate) unsafe fn create_critical(
             critical_reserve_slot: index as u8,
             name,
             state,
+            allocation_role: role,
             rsp: initial_rsp(bundle.stack.top),
             stack_base: bundle.stack.base,
             stack_top: bundle.stack.top,

@@ -69,6 +69,7 @@ pub mod stack;
 pub mod stack_fault;
 pub mod system;
 pub mod thread_join;
+pub mod thread_placement;
 pub mod thread_retire;
 pub mod thread_runtime;
 pub mod threads;

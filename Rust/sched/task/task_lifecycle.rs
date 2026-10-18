@@ -85,7 +85,9 @@ unsafe fn complete_admitted(task: *mut Task) -> bool {
                 ..registry::GuardedStack::EMPTY
             });
         }
-        let role = (*c).role;
+        // Match each release to its actual creation bucket even when a public
+        // work-class request changed the live scheduling role in the meantime.
+        let role = (*c).allocation_role;
         let high_water = (*c).stack_high_water_bytes;
         let flags = runtime::save_runtime();
         if !registry::contains(task) || !(*c).release_in_progress || !eligible(task) {

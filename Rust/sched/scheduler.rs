@@ -1,7 +1,7 @@
 //! One scheduler state owner; runtime admission is mandatory after SMP start.
 //! Counters, pending decisions and CPU slots have no foreign/live Rust borrow.
 pub use super::scheduler_types::{CpuPreemptionStats, Stats, StructureStats};
-use super::task_context;
+use super::{task::thread_placement, task_context};
 use crate::{
     arch::{fpu, percpu, pit, runtime, smp_policy::MAX_CPUS},
     build_config::config,
@@ -45,6 +45,7 @@ impl CpuState {
 struct State {
     cpu: [CpuState; MAX_CPUS],
     balance_at: [u64; MAX_CPUS],
+    placement_outgoing: [Task; MAX_CPUS],
     yield_count: u64,
     sleep_count: u64,
     wake_count: u64,
@@ -112,6 +113,7 @@ impl State {
     const EMPTY: Self = Self {
         cpu: [CpuState::EMPTY; MAX_CPUS],
         balance_at: [0; MAX_CPUS],
+        placement_outgoing: [ptr::null_mut(); MAX_CPUS],
         yield_count: 0,
         sleep_count: 0,
         wake_count: 0,
@@ -380,6 +382,11 @@ fn init() -> bool {
     publish_current(first);
     local_change(|s| s.initialized = true);
     unsafe { task_context::bind(view(first).unwind_slot) };
+    let idle = unsafe { super::task::task_resources::create_bsp_idle(bsp_idle_entry) };
+    if idle.is_null() {
+        return false;
+    }
+    local_change(|s| s.idle = idle.cast());
     change(|s| s.initialized = true);
     let deadline = timer::r4os_rust_timer_control(11, 0, 0);
     log(0, ptr::null_mut(), deadline, 0);
@@ -420,6 +427,12 @@ pub fn init_secondary(index: u32) -> bool {
     percpu::r4os_rust_percpu_control(9, index, 1, 0);
     true
 }
+unsafe extern "C" fn bsp_idle_entry() {
+    // BSP timeout/timer work remains in the existing owner. This continuation
+    // owns a boot-initialized FPU buffer as those paths can reach callbacks.
+    secondary_loop()
+}
+
 pub fn secondary_loop() -> ! {
     runtime::r4os_rust_runtime_control(1, 0);
     loop {
@@ -586,10 +599,31 @@ fn require_switch(outgoing: Task) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_finish_context_switch() {
+    let cpu = percpu::current_index() as usize;
+    let outgoing = change(|s| core::mem::replace(&mut s.placement_outgoing[cpu], ptr::null_mut()));
+    // cpu.S has published outgoing RSP and installed the incoming stack.
+    // Runtime admission still excludes every foreign scheduler mutation.
+    unsafe { thread_placement::finish_switch(outgoing.cast()) };
     if !runtime::release_for_switch() {
         runtime::halt_forever();
     }
 }
+pub(crate) fn request_placement_switch(cpu: u32) {
+    cpu_change(cpu, |s| s.pending = true);
+    send_reschedule(cpu);
+}
+fn stage_placement(old: Task, depth: u32) -> bool {
+    let staged = unsafe { thread_placement::stage(old.cast(), depth) };
+    if staged {
+        let cpu = percpu::current_index() as usize;
+        change(|s| {
+            assert!(s.placement_outgoing[cpu].is_null());
+            s.placement_outgoing[cpu] = old;
+        });
+    }
+    staged
+}
+
 pub fn yield_task() {
     if !enabled() {
         return;
@@ -608,17 +642,19 @@ pub fn yield_task() {
         restore_productive(old);
     }
     mutate(1, old, now, 0);
+    let departing = stage_placement(old, 1);
     let priority_wakeup = local().pending && urgent(old);
     let selected = next_ready(priority_wakeup);
     let next = if selected.is_null() {
         set_pending(false);
-        if view(old).state == 2 {
+        if view(old).state == 2 && !departing {
             preempt_enable();
             runtime::restore_runtime(flags);
             return;
         }
         let idle = local().idle;
         if idle.is_null() {
+            assert!(!departing, "placement requires initialized idle");
             preempt_enable();
             runtime::restore_runtime(flags);
             return;
@@ -668,8 +704,15 @@ pub fn preempt_from_irq() {
     if old.is_null() || view(old).state != 2 {
         return;
     }
+    let departing = stage_placement(old, 0);
     let wakeup = local().pending && urgent(old);
-    let next = next_ready(wakeup);
+    let selected = next_ready(wakeup);
+    let next = if selected.is_null() && departing {
+        local().idle
+    } else {
+        selected
+    };
+    assert!(!departing || !next.is_null(), "placement requires idle");
     if next.is_null() {
         set_pending(false);
         return;
@@ -679,7 +722,7 @@ pub fn preempt_from_irq() {
         set_pending(false);
         return;
     }
-    mutate(2, old, now, 0);
+    mutate(if view(old).cpu_idle { 3 } else { 2 }, old, now, 0);
     let latency = mutate(5, next, now, 0);
     record_ready(next, latency);
     mutate(0, next, 0, 0);
@@ -959,7 +1002,7 @@ pub fn preempt_pending(preemptible: bool) -> bool {
     if running.is_null() || view(running).state != 2 {
         return false;
     }
-    if !urgent(running) {
+    if !urgent(running) && !unsafe { thread_placement::pending(running.cast()) } {
         set_pending(false);
         return false;
     }
@@ -1131,7 +1174,8 @@ fn timer_preemption(now: u64, preemptible: bool) -> bool {
         // empty/idle refill remains independent of this periodic deadline.
         balance_checkpoint(now);
     }
-    if ready_count() == 0 {
+    let placement = unsafe { thread_placement::pending(running.cast()) };
+    if ready_count() == 0 && !placement {
         set_pending(false);
         change(|s| {
             s.preemption_deferred_no_ready_count =
@@ -1144,7 +1188,7 @@ fn timer_preemption(now: u64, preemptible: bool) -> bool {
         set_pending(false);
     }
     let ticks = since(now, view(running).last_scheduled_tick);
-    if !priority && ticks < QUANTUM {
+    if !priority && !placement && ticks < QUANTUM {
         change(|s| {
             s.preemption_deferred_quantum_count =
                 s.preemption_deferred_quantum_count.wrapping_add(1)

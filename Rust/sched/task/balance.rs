@@ -12,6 +12,15 @@ const CANDIDATES: usize = 8;
 /// Runtime admission and the exact task lifetime remain with the caller.
 /// Initial/wake rehome and queued transfer share every saved-state barrier.
 pub(crate) unsafe fn placeable(candidate: *mut Task, initial: bool) -> bool {
+    unsafe {
+        !candidate.is_null()
+            && (*registry::core(candidate)).smp_eligible
+            && !(*registry::core(candidate)).cpu_affinity_bound
+            && saved_continuation(candidate, initial)
+    }
+}
+
+pub(crate) unsafe fn saved_continuation(candidate: *mut Task, initial: bool) -> bool {
     if candidate.is_null() {
         return false;
     }
@@ -19,9 +28,8 @@ pub(crate) unsafe fn placeable(candidate: *mut Task, initial: bool) -> bool {
         let c = registry::core(candidate);
         (*c).state == State::Ready
             && (*c).running_cpu == 0xff
-            && (*c).smp_eligible
             && !(*c).cpu_idle
-            && !(*c).cpu_affinity_bound
+            && !(*c).placement_deferred
             && (initial
                 || matches!(
                     (*c).execution_owner_kind,
@@ -161,6 +169,7 @@ pub(crate) unsafe fn pull(
             };
             (*from).balance_cursor = next;
             if candidate != target_current
+                && super::thread_placement::allows(candidate, target)
                 && eligible(
                     candidate,
                     current,

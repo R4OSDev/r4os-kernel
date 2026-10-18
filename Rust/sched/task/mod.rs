@@ -9,6 +9,7 @@ pub(crate) mod task_registry;
 pub(crate) mod task_resources;
 pub(crate) mod task_snapshots;
 pub(crate) mod task_types;
+pub(crate) mod thread_placement;
 use crate::sched::scheduler::TaskView;
 use core::{ffi::c_void, ptr};
 pub(crate) use task_types::Task;

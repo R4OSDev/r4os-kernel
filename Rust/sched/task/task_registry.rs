@@ -385,6 +385,8 @@ unsafe fn adjust_rank(task: *mut Task, old: u8, new: u8) {
 pub(super) unsafe fn reset_activation(task: *mut Task) {
     unsafe {
         let old = dispatch_rank(task);
+        (*core(task)).placement_preferred_ticks = 4;
+        (*core(task)).placement_preferred_dispatches = 4;
         let role = (*core(task)).role;
         configure_role(task, role);
         (*core(task)).role_activations = (*core(task)).role_activations.wrapping_add(1);
@@ -463,9 +465,13 @@ pub(super) unsafe fn link_ready(task: *mut Task) {
         if (*c).ready_linked {
             return;
         }
-        (*c).ready_order = (*raw()).next_ready_order;
-        (*raw()).next_ready_order += 1;
-        append_ready(task);
+        if !(*c).placement_deferred || (*c).ready_order == 0 {
+            (*c).ready_order = (*raw()).next_ready_order;
+            (*raw()).next_ready_order += 1;
+        }
+        if !(*c).placement_deferred {
+            append_ready(task);
+        }
     }
 }
 /// Caller has assigned ready_order. Ordinary new enqueue keeps its linked-tail
@@ -797,6 +803,7 @@ pub(super) unsafe fn mark_running(task: *mut Task) {
         unlink_timeout(task);
         let cpu = percpu::current_index();
         assert!(!(*c).cpu_affinity_bound || u32::from((*c).home_cpu) == cpu);
+        assert!((*c).placement_revision == 0 || super::thread_placement::allows(task, cpu));
         (*c).home_cpu = cpu as u8;
         (*c).home_cpu_bound = true;
         (*c).running_cpu = cpu as u8;
