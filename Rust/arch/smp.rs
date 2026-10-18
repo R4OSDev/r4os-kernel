@@ -13,7 +13,7 @@ use crate::{
     arch::pit,
     build_config::config,
     memory::{blocks, paging, phys},
-    platform::{cpu, monotonic},
+    platform::{cpu, cpu_topology, monotonic},
 };
 use core::{
     cell::UnsafeCell,
@@ -437,6 +437,7 @@ fn start(plan: Plan) -> bool {
         return true;
     }
     if !lapic::is_enabled() {
+        cpu_topology::seal(1);
         publish(Status {
             initialized: true,
             ..Status::EMPTY
@@ -454,14 +455,18 @@ fn start(plan: Plan) -> bool {
     };
     unsafe { ptr::addr_of_mut!((*boot()).topology).write(plan) };
     publish(value);
+    let start_epoch = epoch().checked_add(1).expect("AP epoch overflow");
+    let ids = unsafe { ptr::addr_of!((*boot()).topology.apic_ids).read() };
+    if !cpu_topology::seed_plan(&ids[..count as usize], start_epoch) {
+        crate::boot::fatal::kernel(11, b"cpu-topology-plan");
+    }
     let root = unsafe { r4os_read_cr3() } & 0x000f_ffff_ffff_f000;
     let Some(shared_1g) = paging::ap_boot_uses_1g(root) else {
         log(7, 0, root, b"shared-root-unconfirmed");
         return false;
     };
     unsafe {
-        ptr::addr_of_mut!((*boot()).epoch)
-            .write(epoch().checked_add(1).expect("AP epoch overflow"));
+        ptr::addr_of_mut!((*boot()).epoch).write(start_epoch);
         ptr::addr_of_mut!((*boot()).shared_1g).write(shared_1g);
     }
     RELEASE.store(false, Ordering::Release);
@@ -537,6 +542,7 @@ fn activate() {
         return;
     }
     unsafe { tlb::r4os_rust_tlb_register(Some(send_tlb_ipi)) };
+    cpu_topology::seal(percpu::r4os_rust_percpu_control(6, 0, 0, 0));
     RELEASE.store(true, Ordering::Release);
     for index in 1..configured() {
         let before = percpu::state(index);
@@ -643,9 +649,19 @@ pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> !
     if !ap_admission::qualify(index, start_epoch) {
         runtime::halt_forever();
     }
-    if lapic::r4os_rust_lapic_control(1, 0, 0) == 0
-        || !crate::sched::scheduler::init_secondary(index)
-    {
+    if lapic::r4os_rust_lapic_control(1, 0, 0) == 0 {
+        percpu::r4os_rust_percpu_control(5, index, 0, 0);
+        runtime::halt_forever();
+    }
+    if !cpu_topology::capture(
+        index,
+        apic_id as u32,
+        start_epoch,
+        core::arch::x86_64::__cpuid_count,
+    ) {
+        reject(b"cpu-topology-identity");
+    }
+    if !crate::sched::scheduler::init_secondary(index) {
         percpu::r4os_rust_percpu_control(5, index, 0, 0);
         runtime::halt_forever();
     }
@@ -714,6 +730,9 @@ pub extern "C" fn r4os_rust_smp_control(operation: u8, index: u32) -> u64 {
             let id = cpu::local_apic_id();
             if id == u32::MAX {
                 crate::boot::fatal::kernel(2, b"bsp-apic-identity");
+            }
+            if !cpu_topology::capture(0, id, 1, core::arch::x86_64::__cpuid_count) {
+                crate::boot::fatal::kernel(2, b"bsp-topology-identity");
             }
             percpu::r4os_rust_percpu_control(0, id, 0, 0);
             0

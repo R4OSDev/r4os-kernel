@@ -94,6 +94,9 @@ fn init_bsp(apic_id: u32) {
 pub fn state(index: u32) -> u8 {
     local(index).map_or(0, |local| unsafe { (*local).state.load(Ordering::Acquire) })
 }
+pub(crate) fn is_schedulable(index: u32) -> bool {
+    index < MAX_CPUS as u32 && SCHEDULABLE.load(Ordering::Acquire) & (1 << index) != 0
+}
 fn allowed(from: u8, to: u8) -> bool {
     match from {
         1 => to == 2 || to == 7,
@@ -228,9 +231,7 @@ pub extern "C" fn r4os_rust_percpu_control(
         10 | 12 => u64::from(
             flag(index, operation == 12).is_some_and(|flag| flag.load(Ordering::Acquire) != 0),
         ),
-        13 => u64::from(
-            index < MAX_CPUS as u32 && SCHEDULABLE.load(Ordering::Acquire) & (1 << index) != 0,
-        ),
+        13 => u64::from(is_schedulable(index)),
         14 => SCHEDULABLE.load(Ordering::Acquire),
         15 => u64::from(SCHEDULABLE.load(Ordering::Acquire).count_ones()),
         16 => lifecycle_mask(false),

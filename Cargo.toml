@@ -16,7 +16,7 @@ test = false
 bench = false
 
 [dependencies]
-r4os-contract = { git = "https://github.com/R4OSDev/r4os-contract.git", rev = "f8b3d45f571a5116baf69d44f7731084e1eb4dfa" }
+r4os-contract = { git = "https://github.com/R4OSDev/r4os-contract.git", rev = "6d2feb313aa8892e8a3df7cb7f2e9545e4544362" }
 
 [profile.release]
 opt-level = 3

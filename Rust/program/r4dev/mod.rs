@@ -1,4 +1,4 @@
-//! R4DEV projects native owner snapshots into the unchanged Contract. Passive
+//! R4DEV projects native owner snapshots into the canonical Contract. Passive
 //! observations and explicitly requested probes keep their existing split.
 use core::mem::MaybeUninit;
 pub mod boot;
@@ -30,6 +30,7 @@ pub mod memory;
 
 pub mod memory_probes;
 
+pub(crate) mod cpu_topology;
 pub mod devices;
 pub mod display;
 pub mod paging;
