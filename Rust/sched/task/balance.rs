@@ -8,6 +8,42 @@ use crate::arch::percpu;
 use core::ptr;
 const CANDIDATES: usize = 8;
 
+/// # Safety
+/// Runtime admission and the exact task lifetime remain with the caller.
+/// Initial/wake rehome and queued transfer share every saved-state barrier.
+pub(crate) unsafe fn placeable(candidate: *mut Task, initial: bool) -> bool {
+    if candidate.is_null() {
+        return false;
+    }
+    unsafe {
+        let c = registry::core(candidate);
+        (*c).state == State::Ready
+            && (*c).running_cpu == 0xff
+            && (*c).smp_eligible
+            && !(*c).cpu_idle
+            && !(*c).cpu_affinity_bound
+            && (initial
+                || matches!(
+                    (*c).execution_owner_kind,
+                    ExecutionOwnerKind::None | ExecutionOwnerKind::ProgramThread
+                ))
+            && !(*c).retire_pending
+            && !(*c).release_in_progress
+            && !(*c).rollback_pending
+            && (*c).preempt_disable_depth == 0
+            && (*c).held_lock_count == 0
+            && !(*c).wait_handoff_guard_pending
+            && (*c).wait_node.queue.is_null()
+            && !(*c).timeout_linked
+            && (*c).wake_tick == 0
+            && (*c).rsp != 0
+            && (!(*c).uses_fpu || ((*c).fpu_state_valid && (*c).fpu_state.is_some()))
+    }
+}
+pub(crate) unsafe fn relocatable(candidate: *mut Task) -> bool {
+    unsafe { placeable(candidate, false) }
+}
+
 unsafe fn eligible(
     candidate: *mut Task,
     current: *mut Task,
@@ -21,28 +57,9 @@ unsafe fn eligible(
     unsafe {
         let c = registry::core(candidate);
         candidate != current
-            && (*c).state == State::Ready
+            && relocatable(candidate)
             && (*c).ready_linked
             && u32::from((*c).home_cpu) == source
-            && (*c).running_cpu == 0xff
-            && (*c).smp_eligible
-            && !(*c).cpu_idle
-            && !(*c).cpu_affinity_bound
-            && matches!(
-                (*c).execution_owner_kind,
-                ExecutionOwnerKind::None | ExecutionOwnerKind::ProgramThread
-            )
-            && !(*c).retire_pending
-            && !(*c).release_in_progress
-            && !(*c).rollback_pending
-            && (*c).preempt_disable_depth == 0
-            && (*c).held_lock_count == 0
-            && !(*c).wait_handoff_guard_pending
-            && (*c).wait_node.queue.is_null()
-            && !(*c).timeout_linked
-            && (*c).wake_tick == 0
-            && (*c).rsp != 0
-            && (!(*c).uses_fpu || ((*c).fpu_state_valid && (*c).fpu_state.is_some()))
             && ((*c).last_migration_tick == 0
                 || now().saturating_sub((*c).last_migration_tick) >= cooldown)
     }

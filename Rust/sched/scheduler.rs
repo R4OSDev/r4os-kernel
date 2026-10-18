@@ -17,6 +17,7 @@ const QUANTUM: u64 = {
     let ticks = (30 * pit::DEFAULT_HZ) / 1000;
     if ticks == 0 { 1 } else { ticks as u64 }
 };
+pub(crate) const PLACEMENT_COOLDOWN: u64 = QUANTUM;
 const LONG_WARN: u64 = pit::DEFAULT_HZ as u64;
 const STARVE_WARN: u64 = 2 * pit::DEFAULT_HZ as u64;
 type Task = *mut c_void;
@@ -27,6 +28,7 @@ struct CpuState {
     initialized: bool,
     boot_depth: u32,
     pending: bool,
+    current_work: bool,
     balance_next_cpu: u32,
 }
 impl CpuState {
@@ -36,6 +38,7 @@ impl CpuState {
         initialized: false,
         boot_depth: 0,
         pending: false,
+        current_work: false,
         balance_next_cpu: 0,
     };
 }
@@ -221,6 +224,37 @@ pub(crate) unsafe fn current_on_cpu(index: u32) -> Task {
     }
     cpu_state(index).current
 }
+// Runtime admission serializes the pointer and its derived work floor. Ready
+// exact currents still contribute at least one unit, whether linked or not.
+pub(crate) fn current_has_work(index: u32) -> bool {
+    index < MAX_CPUS as u32 && cpu_state(index).initialized && cpu_state(index).current_work
+}
+pub(crate) fn all_current_have_work(mut mask: u64) -> bool {
+    if mask == 0 || mask >> MAX_CPUS != 0 {
+        return false;
+    }
+    while mask != 0 {
+        let cpu = mask.trailing_zeros();
+        mask &= mask - 1;
+        if !current_has_work(cpu) {
+            return false;
+        }
+    }
+    true
+}
+pub(crate) fn note_current_state(cpu: u32, task: Task, work: bool) {
+    if cpu < MAX_CPUS as u32 && cpu_state(cpu).current == task {
+        cpu_change(cpu, |s| s.current_work = work);
+    }
+}
+fn publish_current(task: Task) {
+    let item = view(task);
+    let work = !item.cpu_idle && matches!(item.state, 1 | 2);
+    local_change(|s| {
+        s.current = task;
+        s.current_work = work;
+    });
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TaskView {
@@ -341,10 +375,8 @@ fn init() -> bool {
     if first.is_null() {
         return false;
     }
-    local_change(|s| {
-        s.current = first;
-        s.initialized = true
-    });
+    publish_current(first);
+    local_change(|s| s.initialized = true);
     unsafe { task_context::bind(view(first).unwind_slot) };
     change(|s| s.initialized = true);
     let deadline = timer::r4os_rust_timer_control(11, 0, 0);
@@ -376,6 +408,7 @@ pub fn init_secondary(index: u32) -> bool {
     unsafe { task_context::bind(ptr::null_mut()) };
     cpu_change(index, |s| {
         s.current = idle;
+        s.current_work = false;
         s.boot_depth = 0;
         s.pending = false;
         s.initialized = true
@@ -612,7 +645,7 @@ pub fn yield_task() {
     mutate(7, next, 0, 0);
     note_productive(next);
     preempt_enable();
-    local_change(|s| s.current = next);
+    publish_current(next);
     unsafe { task_context::bind(view(next).unwind_slot) };
     refresh_pending(next);
     require_switch(old);
@@ -651,7 +684,7 @@ pub fn preempt_from_irq() {
     mutate(6, old, 0, 0);
     mutate(7, next, 0, 0);
     note_productive(next);
-    local_change(|s| s.current = next);
+    publish_current(next);
     unsafe { task_context::bind(view(next).unwind_slot) };
     if wakeup {
         change(|s| {
@@ -714,9 +747,9 @@ fn park_blocked(task: Task) {
     runtime::restore_runtime(flags);
 }
 // Runtime admission covers queue transfer, exact target publication and IPI.
-fn balance_ready(target: u32, source: u32) -> bool {
+fn balance_ready(target: u32, source: u32) -> Task {
     if !cpu_state(target).initialized {
-        return false;
+        return ptr::null_mut();
     }
     let moved = unsafe {
         super::task::balance::pull(
@@ -729,14 +762,14 @@ fn balance_ready(target: u32, source: u32) -> bool {
         )
     };
     if moved.is_null() {
-        return false;
+        return ptr::null_mut();
     }
     cpu_change(target, |s| s.pending = true);
     change(|s| {
         s.wakeup_reschedule_request_count = s.wakeup_reschedule_request_count.wrapping_add(1)
     });
     send_reschedule(target);
-    true
+    moved.cast()
 }
 fn refill_ready() {
     let target = percpu::current_index();
@@ -770,34 +803,55 @@ fn refill_ready() {
         return;
     }
 }
-fn balance_idle(source: u32) {
+fn balance_idle(source: u32, ready_time: u64) -> Task {
+    let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
+    if all_current_have_work(online & !(1 << source)) {
+        return ptr::null_mut();
+    }
     let current = cpu_state(source).current.cast();
     if unsafe { super::task::balance::workload(source, current) } <= 1
-        || unsafe { super::task::balance::singleton_blocked(source, current, tick, QUANTUM) }
+        || unsafe {
+            super::task::balance::singleton_blocked(source, current, || ready_time, QUANTUM)
+        }
     {
-        return;
+        return ptr::null_mut();
     }
-    let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
-    for offset in 1..MAX_CPUS as u32 {
-        let target = (source + offset) % MAX_CPUS as u32;
-        if online & (1 << target) == 0
-            || !cpu_state(target).initialized
-            || query(3, ptr::null_mut(), u64::from(target)) != 0
-        {
+    let mut idle = 0;
+    let mut loads = [0usize; MAX_CPUS];
+    for (index, load) in loads.iter_mut().enumerate() {
+        let cpu = index as u32;
+        if online & (1 << cpu) == 0 || !cpu_state(cpu).initialized {
             continue;
         }
-        let running = cpu_state(target).current;
-        if !running.is_null() && view(running).cpu_idle {
-            balance_ready(target, source);
-            return;
+        let running = cpu_state(cpu).current;
+        *load = unsafe { super::task::balance::workload(cpu, running.cast()) };
+        if cpu != source && *load == 0 && !running.is_null() && view(running).cpu_idle {
+            idle |= 1 << cpu;
         }
     }
+    super::placement::choose(
+        idle,
+        &loads,
+        crate::platform::cpu_topology::domains(),
+        Some(source),
+    )
+    .map_or(ptr::null_mut(), |target| balance_ready(target, source))
 }
 // Runtime admission retains this exact published Ready task. Also used by the
 // existing live diagnostic after releasing its own temporary affinity pin.
+// Both production callers have just published ready_since_tick; the live
+// caller re-notifies within that same runtime admission. Reuse that functional
+// time snapshot for wake cooldowns rather than publishing the global clock again.
 pub(crate) fn notify_ready(task: Task) {
     let item = view(task);
     let target = item.home_cpu;
+    let moved = balance_idle(target, item.ready_since_tick);
+    // The exact sole Ready task has already been published and notified on
+    // its real destination. An empty former queue needs no source IPI.
+    // Retain the original source notification whenever other Ready work stays.
+    if moved == task && query(3, ptr::null_mut(), u64::from(target)) == 0 {
+        return;
+    }
     let local_cpu = percpu::current_index();
     if target != local_cpu && percpu::r4os_rust_percpu_control(13, target, 0, 0) != 0 {
         cpu_change(target, |s| s.pending = true);
@@ -818,7 +872,6 @@ pub(crate) fn notify_ready(task: Task) {
             }
         }
     }
-    balance_idle(target);
 }
 fn wake_task(task: Task, result: u32) -> bool {
     let flags = runtime::save_runtime();

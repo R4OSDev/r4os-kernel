@@ -195,7 +195,20 @@ pub fn wait_summary() -> crate::sched::sync_types::WaitSummary {
     out
 }
 pub unsafe fn queue_valid() -> bool {
+    let _owner = runtime::RuntimeGuard::acquire();
     unsafe {
+        for cpu in 0..crate::arch::smp_policy::MAX_CPUS as u32 {
+            let current = scheduler::current_on_cpu(cpu).cast::<Task>();
+            let work = if current.is_null() {
+                false
+            } else {
+                let c = registry::core(current);
+                !(*c).cpu_idle && matches!((*c).state, State::Ready | State::Running)
+            };
+            if scheduler::current_has_work(cpu) != work {
+                return false;
+            }
+        }
         let mut value = core::mem::MaybeUninit::<QueueView>::uninit();
         r4os_rust_task_snapshot(
             3,

@@ -9,7 +9,7 @@ unsafe fn ready_count(cpu: u32) -> usize {
 
 // No foreign queue is changed to manufacture an idle CPU. Retry while ordinary
 // work occupies the source queue or all other CPUs; every attempt is bounded.
-fn release(source: u32) -> Result<Option<u32>, ()> {
+fn release(source: u32) -> Result<Option<(u32, u64)>, ()> {
     let _runtime = RuntimeGuard::acquire();
     unsafe {
         let parent = scheduler::current().cast::<Task>();
@@ -24,17 +24,46 @@ fn release(source: u32) -> Result<Option<u32>, ()> {
             return Ok(None);
         }
         let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
-        let target = (1..registry::MAX_CPUS as u32).find_map(|offset| {
-            let cpu = (source + offset) % registry::MAX_CPUS as u32;
-            if online & (1 << cpu) == 0 || ready_count(cpu) != 0 {
-                return None;
+        let (mut idle_mask, mut busy) = (0u64, 0u64);
+        for cpu in 0..registry::MAX_CPUS as u32 {
+            if online & (1 << cpu) == 0 {
+                continue;
             }
             let current = scheduler::current_on_cpu(cpu).cast::<Task>();
-            (!current.is_null() && (*registry::core(current)).cpu_idle).then_some((cpu, current))
-        });
-        let Some((target, idle)) = target else {
+            if balance::workload(cpu, current) != 0 {
+                busy |= 1 << cpu;
+            }
+            if cpu != source
+                && ready_count(cpu) == 0
+                && !current.is_null()
+                && (*registry::core(current)).cpu_idle
+            {
+                idle_mask |= 1 << cpu;
+            }
+        }
+        if idle_mask == 0 {
             return Ok(None);
-        };
+        }
+        let domains = crate::platform::cpu_topology::domains();
+        let free_core = domains.iter().enumerate().fold(0u64, |mask, (cpu, d)| {
+            mask | if idle_mask & (1 << cpu) != 0 && d.core != 0 && d.core & busy == 0 {
+                1 << cpu
+            } else {
+                0
+            }
+        });
+        // Where another known core exists, observe its actual idle boundary;
+        // do not clear foreign queues to manufacture the SMT preference case.
+        let source_core = domains[source as usize].core;
+        let other_known_core = domains
+            .iter()
+            .enumerate()
+            .any(|(cpu, d)| online & (1 << cpu) != 0 && d.core != 0 && d.core & source_core == 0);
+        if source_core != 0 && other_known_core && free_core == 0 {
+            return Ok(None);
+        }
+        let target = idle_mask.trailing_zeros();
+        let idle = scheduler::current_on_cpu(target).cast::<Task>();
         let t = TASKS[0].load(Ordering::Acquire);
         let c = registry::core(t);
         let parent_before = facts(parent);
@@ -59,6 +88,13 @@ fn release(source: u32) -> Result<Option<u32>, ()> {
         // the production Ready notification, including pending and exact IPI.
         (*c).cpu_affinity_bound = false;
         scheduler::notify_ready(t.cast());
+        let target = u32::from((*c).home_cpu);
+        let target_core = domains[target as usize].core;
+        if idle_mask & (1 << target) == 0
+            || (free_core != 0 && target_core != 0 && target_core & busy != 0)
+        {
+            return Err(());
+        }
         if facts(t) != before
             || facts(parent) != parent_before
             || scheduler::current() != parent.cast()
@@ -78,7 +114,7 @@ fn release(source: u32) -> Result<Option<u32>, ()> {
         {
             return Err(());
         }
-        Ok(Some(target))
+        Ok(Some((target, free_core)))
     }
 }
 
@@ -111,7 +147,7 @@ pub(super) fn run() -> bool {
         }
         tasks::sleep(1, b"spectra-single-enrollment");
     }
-    let target = loop {
+    let (target, free_core) = loop {
         match release(source) {
             Ok(Some(cpu)) => break cpu,
             Err(()) => {
@@ -140,6 +176,11 @@ pub(super) fn run() -> bool {
     let clean = finish(false) && unsafe { helpers::queue_valid() };
     if valid && clean {
         helpers::puts(b"TASKREG0859 single-ready PASS tasks=1 donor=running target=previously-idle pinned=excluded physical-current=preserved fpu=1 unwind=1 ready=preserved own=retired\r\n");
+        helpers::puts(b"TASKREG08511 placement PASS target=");
+        helpers::dec(u64::from(target));
+        helpers::puts(b" free-core-mask=");
+        helpers::dec(free_core);
+        helpers::puts(b" pinned=preserved\r\n");
     }
     valid && clean
 }

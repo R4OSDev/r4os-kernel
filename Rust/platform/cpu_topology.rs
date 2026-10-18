@@ -1,6 +1,8 @@
 //! One immutable local CPUID image per exact boot descriptor. BSP owns the
 //! bounded plan; each CPU publishes only its own slot before Online. Sealing
 //! checks qualified peers before the AP release barrier. No allocation/wait.
+#[path = "cpu_topology/domains.rs"]
+mod domains;
 use super::cpu_topology_decode::{Discovery, Geometry, discover};
 use crate::arch::smp_policy::MAX_CPUS;
 use core::{
@@ -9,6 +11,7 @@ use core::{
     mem::MaybeUninit,
     sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering},
 };
+pub(crate) use domains::Domain;
 struct Slot {
     described: AtomicU8,
     apic: UnsafeCell<u32>,
@@ -67,6 +70,19 @@ static PLAN_READY: AtomicBool = AtomicBool::new(false);
 static SEALED: AtomicBool = AtomicBool::new(false);
 static QUALIFIED: AtomicU64 = AtomicU64::new(0);
 static TRUSTED: AtomicU64 = AtomicU64::new(0);
+struct DomainStore(UnsafeCell<[Domain; MAX_CPUS]>);
+// BSP writes once before SEALED Release; immutable references are returned
+// only after Acquire, and no later boot/hotplug writer exists.
+unsafe impl Sync for DomainStore {}
+static DOMAINS: DomainStore = DomainStore(UnsafeCell::new([Domain::EMPTY; MAX_CPUS]));
+static FLAT_DOMAINS: [Domain; MAX_CPUS] = [Domain::EMPTY; MAX_CPUS];
+pub(crate) fn domains() -> &'static [Domain; MAX_CPUS] {
+    if SEALED.load(Ordering::Acquire) {
+        unsafe { &*DOMAINS.0.get() }
+    } else {
+        &FLAT_DOMAINS
+    }
+}
 #[derive(Clone, Copy)]
 pub(crate) struct Snapshot {
     pub index: u32,
@@ -197,6 +213,8 @@ pub(crate) fn seal(qualified: u64) {
             }
         }
     }
+    let (trusted, domains) = domains::derive(trusted);
+    unsafe { DOMAINS.0.get().write(domains) };
     QUALIFIED.store(qualified, Ordering::Relaxed);
     TRUSTED.store(trusted, Ordering::Relaxed);
     SEALED.store(true, Ordering::Release);

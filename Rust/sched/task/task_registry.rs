@@ -3,7 +3,7 @@
 //! physical context switch.
 use super::task_types::{Role, State, Task, TaskCore};
 use crate::{
-    arch::{percpu, smp_policy},
+    arch::percpu,
     sched::task_index::{self, Index},
 };
 use core::{
@@ -550,29 +550,7 @@ pub(super) unsafe fn unlink_ready(task: *mut Task) {
     }
 }
 pub(super) unsafe fn select_home(task: *mut Task) {
-    unsafe {
-        let c = core(task);
-        if !(*c).smp_eligible {
-            (*c).home_cpu = 0;
-            (*c).home_cpu_bound = true;
-            return;
-        }
-        if (*c).cpu_affinity_bound
-            || ((*c).home_cpu_bound
-                && percpu::r4os_rust_percpu_control(13, u32::from((*c).home_cpu), 0, 0) != 0)
-        {
-            return;
-        }
-        let mut loads = [0usize; MAX_CPUS];
-        for (index, load) in loads.iter_mut().enumerate() {
-            *load = (*raw()).ready[index].count
-                + usize::from(percpu::r4os_rust_percpu_control(12, index as u32, 0, 0) != 0);
-        }
-        let mask = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
-        (*c).home_cpu =
-            smp_policy::r4os_rust_smp_least_loaded(mask, loads.as_ptr(), loads.len()) as u8;
-        (*c).home_cpu_bound = true;
-    }
+    unsafe { super::home::select(task) }
 }
 pub(super) unsafe fn link_timeout(task: *mut Task) {
     unsafe {
@@ -700,6 +678,7 @@ pub(super) unsafe fn link_registry(task: *mut Task) {
         (*raw()).count += 1;
         (*raw()).peak = (*raw()).peak.max((*raw()).count);
         if (*c).state == State::Ready {
+            select_home(task);
             link_ready(task);
         }
         if (*c).state == State::Blocked && (*c).wake_tick != 0 {
@@ -736,6 +715,22 @@ pub(super) unsafe fn unlink_registry(task: *mut Task) {
     }
 }
 
+pub(super) unsafe fn refresh_current_work(task: *mut Task) {
+    unsafe {
+        let c = core(task);
+        let cpu = if (*c).running_cpu == 0xff {
+            (*c).home_cpu
+        } else {
+            (*c).running_cpu
+        };
+        crate::sched::scheduler::note_current_state(
+            u32::from(cpu),
+            task.cast(),
+            !(*c).cpu_idle && matches!((*c).state, State::Ready | State::Running),
+        );
+    }
+}
+
 pub(super) unsafe fn mark_ready(task: *mut Task, now: u64) {
     unsafe {
         let c = core(task);
@@ -745,6 +740,7 @@ pub(super) unsafe fn mark_ready(task: *mut Task, now: u64) {
         let blocked = (*c).state == State::Blocked;
         unlink_timeout(task);
         (*c).state = State::Ready;
+        refresh_current_work(task);
         (*c).running_cpu = 0xff;
         (*c).ready_since_tick = now;
         if blocked {
@@ -773,6 +769,7 @@ pub(super) unsafe fn mark_running(task: *mut Task) {
         (*c).running_cpu = cpu as u8;
         percpu::r4os_rust_percpu_control(11, cpu, u64::from(!(*c).cpu_idle), 0);
         (*c).state = State::Running;
+        refresh_current_work(task);
         (*c).ready_since_tick = 0;
         if blocked {
             bump_epoch();
@@ -788,6 +785,7 @@ pub(super) unsafe fn park_idle(task: *mut Task) {
         unlink_ready(task);
         unlink_timeout(task);
         (*c).state = State::Blocked;
+        refresh_current_work(task);
         (*c).running_cpu = 0xff;
         (*c).ready_since_tick = 0;
     }
@@ -877,6 +875,7 @@ pub(super) unsafe fn begin_wait(
         (*c).wait_result = super::task_types::WaitResult::None;
         (*c).ready_since_tick = 0;
         (*c).state = State::Blocked;
+        refresh_current_work(task);
         link_timeout(task);
         bump_epoch();
     }
@@ -898,6 +897,7 @@ pub(super) unsafe fn finish_wait(
         (*c).max_wait_ticks = (*c).max_wait_ticks.max(ticks);
         unlink_timeout(task);
         (*c).state = State::Ready;
+        refresh_current_work(task);
         (*c).ready_since_tick = now;
         (*c).wake_tick = 0;
         (*c).blocked_since_tick = 0;
@@ -926,6 +926,7 @@ pub(super) unsafe fn transition_dead(
         unlink_ready(task);
         unlink_timeout(task);
         (*c).state = State::Dead;
+        refresh_current_work(task);
         // The exact executing CPU remains bound until switched_out().
         (*c).ready_since_tick = 0;
         (*c).wake_tick = 0;

@@ -1,3 +1,4 @@
+pub(crate) mod placement;
 pub mod scheduler;
 pub mod scheduler_types;
 pub mod task;

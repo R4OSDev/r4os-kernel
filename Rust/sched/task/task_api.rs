@@ -958,9 +958,11 @@ pub unsafe extern "C" fn r4os_rust_task_set_field(task: *mut c_void, field: u8, 
             }
             29 => {
                 (*c).cpu_idle = value != 0;
+                registry::refresh_current_work(task.cast());
             }
             31 => {
                 (*c).state = state(value as u8);
+                registry::refresh_current_work(task.cast());
             }
             32 => {
                 (*c).rsp = value;

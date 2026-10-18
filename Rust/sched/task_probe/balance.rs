@@ -1,5 +1,6 @@
 //! One missing live fairness boundary: already-started tasks wake on an
 //! uneven queue, migrate with FPU/unwind state, and retire exactly once.
+mod placement;
 mod single;
 use super::{fpu, helpers};
 use crate::{
@@ -31,6 +32,7 @@ static ENTERED: AtomicU32 = AtomicU32::new(0);
 static DONE: AtomicU32 = AtomicU32::new(0);
 static FAILURES: AtomicU32 = AtomicU32::new(0);
 static ABORT: AtomicBool = AtomicBool::new(false);
+static INITIAL_BARRIER: AtomicBool = AtomicBool::new(false);
 struct Events(UnsafeCell<[Event; COUNT]>);
 // Only this admitted session uses the events; all event metadata transitions
 // retain the existing runtime owner, and reset follows actual task retirement.
@@ -108,6 +110,13 @@ unsafe extern "C" fn worker() {
     ];
     unsafe { fpu::load(&expected) };
     ENTERED.fetch_or(1 << index, Ordering::Release);
+    while INITIAL_BARRIER.load(Ordering::Acquire)
+        && ENTERED.load(Ordering::Acquire) != ALL
+        && !ABORT.load(Ordering::Acquire)
+        && !kernel_check::cancelled()
+    {
+        scheduler::yield_task();
+    }
     let result = unsafe { sync_objects::r4os_rust_sync_event(event(index), 2, u64::MAX) };
     let observed = unsafe { fpu::read() };
     let last = percpu::current_index();
@@ -216,6 +225,7 @@ fn prepare() -> bool {
     DONE.store(0, Ordering::Relaxed);
     FAILURES.store(0, Ordering::Relaxed);
     ABORT.store(false, Ordering::Release);
+    INITIAL_BARRIER.store(false, Ordering::Release);
     for i in 0..COUNT {
         FIRST[i].store(u32::MAX, Ordering::Relaxed);
         LAST[i].store(u32::MAX, Ordering::Relaxed);
@@ -295,5 +305,5 @@ fn many() -> bool {
     valid && clean
 }
 pub(super) fn run() -> bool {
-    many() && single::run()
+    many() && single::run() && placement::run()
 }
