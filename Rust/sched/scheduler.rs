@@ -212,6 +212,15 @@ pub fn current() -> Task {
         ptr::null_mut()
     }
 }
+/// # Safety
+/// Caller holds runtime admission; the copied exact task pointer remains
+/// resident under that owner and must not escape into a blocking operation.
+pub(crate) unsafe fn current_on_cpu(index: u32) -> Task {
+    if index as usize >= MAX_CPUS || !cpu_state(index).initialized {
+        return ptr::null_mut();
+    }
+    cpu_state(index).current
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct TaskView {
@@ -714,6 +723,7 @@ fn balance_ready(target: u32, source: u32) -> bool {
             source,
             target,
             cpu_state(source).current.cast(),
+            cpu_state(target).current.cast(),
             tick(),
             QUANTUM,
         )
@@ -742,7 +752,14 @@ fn refill_ready() {
         let source = (start + offset) % MAX_CPUS as u32;
         if source == target
             || online & (1 << source) == 0
-            || query(3, ptr::null_mut(), u64::from(source)) < 2
+            || !unsafe {
+                super::task::balance::imbalanced(
+                    source,
+                    target,
+                    cpu_state(source).current.cast(),
+                    cpu_state(target).current.cast(),
+                )
+            }
         {
             continue;
         }
@@ -754,7 +771,10 @@ fn refill_ready() {
     }
 }
 fn balance_idle(source: u32) {
-    if query(3, ptr::null_mut(), u64::from(source)) < 2 {
+    let current = cpu_state(source).current.cast();
+    if unsafe { super::task::balance::workload(source, current) } <= 1
+        || unsafe { super::task::balance::singleton_blocked(source, current, tick, QUANTUM) }
+    {
         return;
     }
     let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
@@ -773,7 +793,9 @@ fn balance_idle(source: u32) {
         }
     }
 }
-fn notify_ready(task: Task) {
+// Runtime admission retains this exact published Ready task. Also used by the
+// existing live diagnostic after releasing its own temporary affinity pin.
+pub(crate) fn notify_ready(task: Task) {
     let item = view(task);
     let target = item.home_cpu;
     let local_cpu = percpu::current_index();

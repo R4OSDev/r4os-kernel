@@ -1,5 +1,6 @@
 //! One missing live fairness boundary: already-started tasks wake on an
 //! uneven queue, migrate with FPU/unwind state, and retire exactly once.
+mod single;
 use super::{fpu, helpers};
 use crate::{
     arch::{percpu, runtime::RuntimeGuard},
@@ -133,12 +134,12 @@ unsafe extern "C" fn worker() {
         FAILURES.fetch_add(1, Ordering::Relaxed);
     }
 }
-fn enrolled() -> bool {
+fn enrolled(count: usize) -> bool {
     let _runtime = RuntimeGuard::acquire();
-    if ENTERED.load(Ordering::Acquire) != ALL {
+    if ENTERED.load(Ordering::Acquire) != (1 << count) - 1 {
         return false;
     }
-    TASKS.iter().enumerate().all(|(i, p)| unsafe {
+    TASKS[..count].iter().enumerate().all(|(i, p)| unsafe {
         let t = p.load(Ordering::Acquire);
         if t.is_null() {
             return false;
@@ -204,11 +205,7 @@ fn finish(abort: bool) -> bool {
     }
     clean
 }
-pub(super) fn run() -> bool {
-    if percpu::r4os_rust_percpu_control(15, 0, 0, 0) < 3 {
-        helpers::puts(b"TASKREG08427 rebalance unavailable: requires controller, source and idle capacity\r\n");
-        return true;
-    }
+fn prepare() -> bool {
     if TASKS.iter().any(|v| !v.load(Ordering::Acquire).is_null()) {
         return false;
     }
@@ -219,6 +216,21 @@ pub(super) fn run() -> bool {
     DONE.store(0, Ordering::Relaxed);
     FAILURES.store(0, Ordering::Relaxed);
     ABORT.store(false, Ordering::Release);
+    for i in 0..COUNT {
+        FIRST[i].store(u32::MAX, Ordering::Relaxed);
+        LAST[i].store(u32::MAX, Ordering::Relaxed);
+        RUNS[i].store(0, Ordering::Relaxed);
+    }
+    true
+}
+fn many() -> bool {
+    if percpu::r4os_rust_percpu_control(15, 0, 0, 0) < 3 {
+        helpers::puts(b"TASKREG08427 rebalance unavailable: requires controller, source and idle capacity\r\n");
+        return true;
+    }
+    if !prepare() {
+        return false;
+    }
     let source = percpu::current_index();
     for (i, role) in [
         Role::Input,
@@ -229,9 +241,6 @@ pub(super) fn run() -> bool {
     .into_iter()
     .enumerate()
     {
-        FIRST[i].store(u32::MAX, Ordering::Relaxed);
-        LAST[i].store(u32::MAX, Ordering::Relaxed);
-        RUNS[i].store(0, Ordering::Relaxed);
         let t = tasks::create_on_cpu(b"spectra-rebalance", worker, role, source);
         if t.is_null() {
             finish(true);
@@ -246,7 +255,7 @@ pub(super) fn run() -> bool {
         }
     }
     let end = timer::tick_count().saturating_add(2000);
-    while !enrolled() {
+    while !enrolled(COUNT) {
         if kernel_check::cancelled()
             || FAILURES.load(Ordering::Acquire) != 0
             || timer::tick_count() >= end
@@ -284,4 +293,7 @@ pub(super) fn run() -> bool {
         helpers::puts(b" pinned=1 fpu=4 unwind=4 ready=preserved own=retired\r\n");
     }
     valid && clean
+}
+pub(super) fn run() -> bool {
+    many() && single::run()
 }
