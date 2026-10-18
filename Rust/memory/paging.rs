@@ -9,6 +9,7 @@ use super::{
 };
 use core::{cell::UnsafeCell, mem::MaybeUninit};
 mod batch;
+mod cache;
 const PAGE: u64 = 4096;
 const MASK: u64 = 0x000f_ffff_ffff_f000;
 const PRESENT: u64 = 1;
@@ -213,6 +214,36 @@ struct Leaf {
     entry: *mut u64,
     huge: bool,
     bytes: u64,
+}
+/// Hardware-register windows require confirmed strict UC semantics. An
+/// inherited alias is borrowed only when its real physical/cache type agrees.
+pub(crate) fn ensure_mmio(address: u64, physical: u64) -> bool {
+    ensure_mmio_candidate(address, physical, false)
+}
+pub(crate) fn ensure_mmio_candidate(address: u64, physical: u64, for_wc: bool) -> bool {
+    use crate::arch::{memory_types as types, pat};
+    let Some(bits) = pat::cache_bits(types::UC, false) else {
+        return false;
+    };
+    if !aligned(address) || !aligned(physical) {
+        return false;
+    }
+    {
+        let _owner = Guard::acquire(6);
+        if !active_matches() {
+            return false;
+        }
+        if let Some(leaf) = leaf(root(), address) {
+            let value = read(leaf.entry);
+            if value & PRESENT != 0 {
+                let actual = (value & MASK & !(leaf.bytes - 1)) | (address & (leaf.bytes - 1));
+                let kind = pat::effective_at(types::decode(value, leaf.huge), physical);
+                return actual == physical
+                    && (kind == Some(types::UC) || (for_wc && kind == Some(types::WC)));
+            }
+        }
+    }
+    r4os_rust_paging_map(address, physical, WRITABLE | (1 << 63) | bits, false)
 }
 fn leaf(root: u64, address: u64) -> Option<Leaf> {
     let pml4 = read(at(table(root), index(address, 39)));
@@ -700,53 +731,7 @@ pub extern "C" fn r4os_rust_paging_dirty(address: u64, clear: bool) -> bool {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_paging_write_combining(address: u64, bytes: u64) -> bool {
-    let _guard = Guard::acquire(6);
-    if !active_matches() || bytes == 0 || address.checked_add(bytes).is_none() {
-        return false;
-    }
-    let start = address & !(PAGE - 1);
-    let end = (address + bytes + PAGE - 1) & !(PAGE - 1);
-    let mut base = start;
-    let root = root();
-    while base < end {
-        let pages = ((end - base) / PAGE).min(page_batch::MAX_EXTENT_PAGES);
-        let mut leaves = batch::Leaves::new(root, base);
-        let mut previous = [MaybeUninit::<u64>::uninit(); 64];
-        for page in 0..pages {
-            let Some(leaf) = leaves.prepare(page, false) else {
-                return false;
-            };
-            let value = read(leaf.entry);
-            if value & PRESENT == 0 {
-                return false;
-            }
-            previous[page as usize].write(value);
-        }
-        for page in 0..pages {
-            let leaf = leaves.leaf(page);
-            let mut value = (read(leaf.entry) & !CACHE_DISABLE) | WRITE_THROUGH;
-            // The saved path distinguishes huge-leaf PAT from a 4-KB PTE.
-            value |= if leaf.huge { HUGE_PAT } else { PAT };
-            write(leaf.entry, value);
-        }
-        if !invalidate(base, pages) {
-            shootdown_failure();
-            for page in 0..pages {
-                write(leaves.entry(page), unsafe {
-                    previous[page as usize].assume_init_read()
-                });
-            }
-            restore_count(pages);
-            restore_failure(base, pages);
-            return false;
-        }
-        state(|state| {
-            state.stats.write_combining_pages =
-                state.stats.write_combining_pages.wrapping_add(pages)
-        });
-        base += pages * PAGE;
-    }
-    true
+    cache::write_combining(address, bytes)
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_paging_active(r4os: bool) -> bool {

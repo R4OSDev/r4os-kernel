@@ -209,9 +209,7 @@ unsafe fn create(s: *mut State, b: Backend, owner: Owner, r: Request) -> Result<
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_mmio_cache_selector(pat: u64, memory_type: u8) -> u8 {
-    (0..8)
-        .find(|&i| (pat >> (i * 8)) as u8 == memory_type)
-        .unwrap_or(255)
+    crate::arch::memory_types::selector(pat, memory_type).unwrap_or(255)
 }
 /// # Safety
 /// Aligned private C records are resident and exclusive under the enclosing

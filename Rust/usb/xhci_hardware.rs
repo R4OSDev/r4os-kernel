@@ -145,10 +145,7 @@ pub(super) fn map_mmio(base: u64, bytes: u64) -> bool {
     while mapped < bytes {
         let physical = (base + mapped) & !4095;
         let virtual_page = phys::r4os_rust_phys_to_virt(physical);
-        let mut result = 0;
-        if !unsafe { paging::r4os_rust_paging_read(virtual_page, 3, false, &mut result) }
-            && !paging::r4os_rust_paging_map(virtual_page, physical, 2 | 16 | (1 << 63), false)
-        {
+        if !paging::ensure_mmio(virtual_page, physical) {
             return false;
         }
         mapped += 4096;

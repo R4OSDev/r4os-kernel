@@ -65,7 +65,8 @@ fn write(entry: *mut u64, value: u64) {
     }
 }
 fn sanitize(flags: u64) -> u64 {
-    flags & !MASK & !HUGE
+    // Builder inputs use normalized 4-KB attributes: bit7 is PAT here.
+    flags & !MASK
 }
 fn release_private_frame(frame: u64) {
     if frame == 0 {
@@ -155,8 +156,8 @@ impl Builder {
         if split && value & PRESENT != 0 && value & HUGE != 0 {
             let frame = self.allocate()?;
             let child = table(frame)?;
-            let base = value & MASK;
-            let flags = sanitize(value & !MASK & !HUGE);
+            let base = value & MASK & !(HUGE_BYTES - 1);
+            let flags = (value & !MASK & !HUGE) | if value & (1 << 12) != 0 { 1 << 7 } else { 0 };
             for page in 0..512 {
                 write(
                     at(child, page),
@@ -211,7 +212,9 @@ impl Builder {
         if read(entry) & PRESENT != 0 {
             return false;
         }
-        write(entry, (physical & MASK) | sanitize(flags) | PRESENT | HUGE);
+        let attributes =
+            (sanitize(flags) & !HUGE) | if flags & (1 << 7) != 0 { 1 << 12 } else { 0 };
+        write(entry, (physical & MASK) | attributes | PRESENT | HUGE);
         true
     }
     pub(super) fn map_range(
@@ -311,8 +314,8 @@ fn huge_walk(address: u64, entry: u64, bytes: u64, level: u8) -> Walk {
     Walk {
         mapped: true,
         virt: address,
-        phys: (entry & MASK) | (address & (bytes - 1)),
-        flags: entry & !MASK,
+        phys: (entry & MASK & !(bytes - 1)) | (address & (bytes - 1)),
+        flags: (entry & !MASK & !HUGE) | if entry & (1 << 12) != 0 { 1 << 7 } else { 0 },
         level,
         huge: true,
     }

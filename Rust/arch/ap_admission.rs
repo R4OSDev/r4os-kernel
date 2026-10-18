@@ -23,7 +23,7 @@ impl Record {
     }
 }
 static RECORDS: [Record; MAX_CPUS] = [const { Record::empty() }; MAX_CPUS];
-const REASONS: [&[u8]; 14] = [
+const REASONS: [&[u8]; 28] = [
     b"ap-identity",
     b"ap-epoch",
     b"xsave-components",
@@ -38,6 +38,20 @@ const REASONS: [&[u8]; 14] = [
     b"fpu-controls",
     b"lapic-capabilities",
     b"tsc-capabilities",
+    b"pat-unavailable",
+    b"pat-invalid",
+    b"pat-default-wb",
+    b"pat-uc-selector",
+    b"pat-cache-control",
+    b"pat-start-window",
+    b"pat-readback",
+    b"mtrr-unavailable",
+    b"mtrr-addressing",
+    b"mtrr-type",
+    b"mtrr-fixed",
+    b"mtrr-range",
+    b"mtrr-mismatch",
+    b"mtrr-ambiguous",
 ];
 pub(crate) fn prepare(index: u32, apic_id: u32, epoch: u64) -> bool {
     let Some(record) = RECORDS.get(index as usize) else {
@@ -102,6 +116,9 @@ pub(crate) fn failure(index: u32, epoch: u64) -> Option<&'static [u8]> {
     })
 }
 pub(crate) fn qualify(index: u32, epoch: u64) -> bool {
+    if !super::pat::qualified(index) {
+        return false;
+    }
     let Some(record) = RECORDS.get(index as usize) else {
         return false;
     };
@@ -120,10 +137,11 @@ pub(crate) fn observed(index: u32, epoch: u64) -> Option<u32> {
     (id != u32::MAX).then_some(id)
 }
 pub(crate) fn qualified(index: u32, apic_id: u32, epoch: u64) -> bool {
-    RECORDS.get(index as usize).is_some_and(|record| {
-        record.phase.load(Ordering::Acquire) == 2
-            && record.epoch.load(Ordering::Relaxed) == epoch
-            && record.expected_id.load(Ordering::Relaxed) == apic_id
-            && record.observed_id.load(Ordering::Relaxed) == apic_id
-    })
+    super::pat::qualified(index)
+        && RECORDS.get(index as usize).is_some_and(|record| {
+            record.phase.load(Ordering::Acquire) == 2
+                && record.epoch.load(Ordering::Relaxed) == epoch
+                && record.expected_id.load(Ordering::Relaxed) == apic_id
+                && record.observed_id.load(Ordering::Relaxed) == apic_id
+        })
 }

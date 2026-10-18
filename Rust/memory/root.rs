@@ -19,8 +19,9 @@ const HUGE_BYTES: u64 = 2 * layout::MIB;
 const RW: u64 = 2 | (1 << 63);
 const RO: u64 = 1 << 63;
 const DIRECT: u64 = RW | (1 << 8);
-const FB: u64 = RW | (1 << 3) | (1 << 7);
-const MMIO: u64 = RW | (1 << 4);
+fn mmio_flags() -> Option<u64> {
+    Some(RW | crate::arch::pat::cache_bits(crate::arch::memory_types::UC, false)?)
+}
 const PROBES: u32 = (1 << 9) - 1;
 const POST: u32 = (1 << 8) - 1;
 const DEV_FB: u32 = 1;
@@ -219,7 +220,6 @@ pub struct AcpiInput {
 }
 unsafe extern "C" {
     fn r4os_read_cr3() -> u64;
-    fn r4os_write_cr3(value: u64);
 
 }
 fn inputs() -> Inputs {
@@ -694,6 +694,7 @@ impl State {
         result
     }
     fn framebuffer(&mut self, root: u64) -> bool {
+        use crate::arch::{memory_types as types, pat};
         let input = inputs();
         if input.framebuffer_record == 0 || input.framebuffer_bytes == 0 {
             return false;
@@ -708,11 +709,33 @@ impl State {
         };
         let mut offset = 0;
         let mut current = start;
+        let mut recorded = None;
         while current < end {
             let source = walk(root, current);
             if !source.mapped {
                 return false;
             }
+            let Some(kind) = pat::effective_at(types::decode(source.flags, false), source.phys)
+            else {
+                return false;
+            };
+            let (attributes, policy) = if types::cacheable(kind) {
+                // Preserve a firmware cacheable framebuffer, rather than
+                // silently converting a live WB/WT alias to WC.
+                (source.flags & ((1 << 3) | (1 << 4) | (1 << 7)), 0)
+            } else if let Some(bits) = pat::cache_bits(types::WC, false) {
+                (bits, 1)
+            } else {
+                let Some(bits) = pat::cache_bits(types::UC, false) else {
+                    return false;
+                };
+                (bits, 2)
+            };
+            let flags = RW | attributes;
+            if recorded.is_some_and(|old| old != (flags, policy)) {
+                return false;
+            }
+            recorded = Some((flags, policy));
             let Some(address) =
                 layout::FRAMEBUFFER_BASE.checked_add(self.framebuffer_offset + offset)
             else {
@@ -720,7 +743,10 @@ impl State {
             };
             if !self
                 .builder
-                .map_page(address, align_down(source.phys), FB, true)
+                .map_page(current, align_down(source.phys), flags, true)
+                || !self
+                    .builder
+                    .map_page(address, align_down(source.phys), flags, true)
             {
                 return false;
             }
@@ -728,13 +754,16 @@ impl State {
             offset += PAGE;
         }
         let len = end - start;
+        let Some((flags, policy)) = recorded else {
+            return false;
+        };
         self.record(
             b"framebuffer-window",
             align_down(walk(root, start).phys),
             layout::FRAMEBUFFER_BASE + self.framebuffer_offset,
             len,
-            FB,
-            1,
+            flags,
+            policy,
         );
         self.framebuffer_offset += len;
         self.stats.framebuffer_bytes += len;
@@ -828,6 +857,9 @@ impl State {
         self.mmio(b"pcie-ecam", base, bytes, DEV_ECAM)
     }
     fn mmio(&mut self, name: &'static [u8], physical: u64, bytes: u64, bit: u32) -> bool {
+        let Some(flags) = mmio_flags() else {
+            return false;
+        };
         if physical == 0 || bytes == 0 {
             return true;
         }
@@ -857,7 +889,7 @@ impl State {
         let mut mapped = RangeStats::default();
         if !self
             .builder
-            .map_range(address, base, len, MMIO, true, &mut mapped)
+            .map_range(address, base, len, flags, true, &mut mapped)
             || !self.direct_mmio(base, len)
         {
             return false;
@@ -871,10 +903,13 @@ impl State {
         self.mmio_offset = next;
         self.stats.mmio_bytes += len;
         self.stats.device_probe_bits |= bit;
-        self.record(name, base, address, len, MMIO, 2);
+        self.record(name, base, address, len, flags, 2);
         true
     }
     fn direct_mmio(&mut self, physical: u64, bytes: u64) -> bool {
+        let Some(flags) = mmio_flags() else {
+            return false;
+        };
         if physical == 0 || bytes == 0 {
             return true;
         }
@@ -889,7 +924,7 @@ impl State {
             let previous = walk(self.builder.pml4_phys, address);
             if previous.mapped {
                 if align_down(previous.phys) != frame
-                    || !self.builder.map_page(address, frame, MMIO, true)
+                    || !self.builder.map_page(address, frame, flags, true)
                 {
                     return false;
                 }
@@ -900,12 +935,12 @@ impl State {
                 && address & (HUGE_BYTES - 1) == 0
                 && frame & (HUGE_BYTES - 1) == 0
             {
-                if !self.builder.map_huge(address, frame, MMIO) {
+                if !self.builder.map_huge(address, frame, flags) {
                     return false;
                 }
                 offset += HUGE_BYTES;
             } else {
-                if !self.builder.map_page(address, frame, MMIO, false) {
+                if !self.builder.map_page(address, frame, flags, false) {
                     return false;
                 }
                 offset += PAGE;
@@ -1006,8 +1041,8 @@ impl State {
             let old = old_raw & MASK;
             self.stats.old_cr3 = old;
             self.stats.new_cr3 = root;
-            unsafe {
-                r4os_write_cr3(root);
+            if !crate::arch::pat::switch_boot_root(root) {
+                return false;
             }
             let active = unsafe { r4os_read_cr3() } & MASK;
             self.stats.active_cr3 = active;
@@ -1015,8 +1050,8 @@ impl State {
                 || !paging::r4os_rust_paging_adopt(root, 2)
                 || !self.check_switch(root, true)
             {
-                unsafe {
-                    r4os_write_cr3(old_raw);
+                if !crate::arch::pat::switch_boot_root(old_raw) {
+                    return false;
                 }
                 paging::r4os_rust_paging_adopt(old, 1);
                 self.stats.active_cr3 = unsafe { r4os_read_cr3() } & MASK;

@@ -282,21 +282,16 @@ pub fn snapshot() -> Status {
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_cpu_control(operation: u8, value: u64) -> u64 {
     match operation {
-        0 => u64::from({
-            let s = snapshot();
-            s.features.pat && s.features.msr
-        }),
+        0 => u64::from(crate::arch::pat::local_table().is_some()),
         1 => u64::from({
             let s = snapshot();
             s.features.mtrr && s.features.msr
         }),
         2 => u64::from({
-            let s = snapshot();
-            s.features.pat && s.features.mtrr && s.features.msr && ((s.pat_msr >> 40) & 255) == 1
+            crate::arch::pat::cache_bits(crate::arch::memory_types::WC, false).is_some()
         }),
         3 => u64::from({
-            let s = snapshot();
-            s.features.pat && s.features.msr && ((s.pat_msr >> 40) & 255) == 1
+            crate::arch::pat::cache_bits(crate::arch::memory_types::WC, false).is_some()
         }),
         4 => u64::from(super::module_cpu::allowed()),
         6 => {

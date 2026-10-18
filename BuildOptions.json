@@ -148,5 +148,12 @@
     "type": "u32",
     "default": 4294967295,
     "description": "Inject a mismatching YMM offset on one AP before XSETBV; isolated negative boot only"
+  },
+  {
+    "name": "ap-pat-readback-test-index",
+    "config": "ap_pat_readback_test_index",
+    "type": "u32",
+    "default": 4294967295,
+    "description": "Reject one AP at the PAT readback comparison; isolated negative boot only"
   }
 ]

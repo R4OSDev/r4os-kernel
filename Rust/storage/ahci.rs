@@ -311,10 +311,7 @@ fn map_mmio(physical: u64) -> bool {
     for offset in (0..0x2000).step_by(4096) {
         let pa = (physical + offset) & !4095;
         let va = phys::r4os_rust_phys_to_virt(pa);
-        let mut ignored = 0;
-        if !unsafe { paging::r4os_rust_paging_read(va, 3, false, &mut ignored) }
-            && !paging::r4os_rust_paging_map(va, pa, 2 | 16 | (1 << 63), false)
-        {
+        if !paging::ensure_mmio(va, pa) {
             return false;
         }
     }

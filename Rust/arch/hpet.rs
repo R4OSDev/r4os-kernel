@@ -113,10 +113,7 @@ fn log(mut value: Status) {
 fn map(base: u64) -> bool {
     let page = base & !4095;
     let virtual_page = phys::r4os_rust_phys_to_virt(page);
-    let mut found = 0;
-    if !unsafe { paging::r4os_rust_paging_read(virtual_page, 3, false, &mut found) }
-        && !paging::r4os_rust_paging_map(virtual_page, page, 2 | 16 | (1 << 63), false)
-    {
+    if !paging::ensure_mmio(virtual_page, page) {
         return false;
     }
     BASE.store(phys::r4os_rust_phys_to_virt(base), Ordering::Release);

@@ -147,6 +147,12 @@ unsafe fn cpu_foundation() {
     crate::platform::cpu::detect();
     crate::platform::module_cpu::require_hardware();
     crate::arch::smp::r4os_rust_smp_control(0, 0);
+    if let Err(reason) = crate::arch::pat::adopt_bsp() {
+        crate::boot::log_route::puts(b"[PAT] BSP contract rejected reason=");
+        crate::boot::log_route::puts(reason);
+        crate::boot::log_route::puts(b"\r\n");
+        crate::boot::fatal::kernel(2, reason);
+    }
     crate::platform::clocksource::configure_cpu();
     if !crate::arch::fpu::init() {
         crate::boot::fatal::kernel(2, b"FPU/SSE task-state init failed");

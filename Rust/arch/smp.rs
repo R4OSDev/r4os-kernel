@@ -3,7 +3,7 @@
 //! owns the stop counter. Native per-CPU lifecycle atomics publish AP progress.
 //! Raw Task callbacks bind the native task owner without a second lifecycle.
 use super::{
-    ap_admission, fpu, lapic, msr, percpu, runtime,
+    ap_admission, fpu, lapic, msr, pat, percpu, runtime,
     smp_policy::{self, Candidate, MAX_CPUS, Plan},
     tables, tlb,
 };
@@ -472,6 +472,7 @@ fn start(plan: Plan) -> bool {
         let mut value = current();
         value.started += 1;
         publish(value);
+        pat::log_ap(index);
         log(8, index, epoch(), b"qualified");
     }
     log(3, 0, 0, b"parked");
@@ -598,6 +599,9 @@ pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> !
     tables::r4os_rust_idt_load();
     if percpu::state(index) != 2 {
         runtime::halt_forever();
+    }
+    if let Err(reason) = pat::init_ap(index) {
+        reject(reason);
     }
     if let Err(reason) = fpu::init_ap(index) {
         reject(reason);

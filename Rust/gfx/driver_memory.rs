@@ -476,7 +476,10 @@ unsafe extern "C" fn backend(
                     out.write(0);
                     return true;
                 }
-                let memory_type = (cpu::snapshot().pat_msr >> (selector * 8)) as u8;
+                let Some(memory_type) = crate::arch::pat::effective_at(selector as u8, physical)
+                else {
+                    return false;
+                };
                 out.write(match memory_type {
                     0 => 2,
                     1 => 1,
@@ -490,20 +493,23 @@ unsafe extern "C" fn backend(
                         if cpu::r4os_rust_cpu_control(0, 0) == 0 {
                             return false;
                         }
-                        let selector =
-                            windows::r4os_rust_mmio_cache_selector(cpu::snapshot().pat_msr, 0);
-                        if selector == 255 {
+                        let Some(bits) =
+                            crate::arch::pat::cache_bits(crate::arch::memory_types::UC, false)
+                        else {
                             return false;
-                        }
-                        (if selector & 1 != 0 { 1 << 3 } else { 0 })
-                            | (if selector & 2 != 0 { 1 << 4 } else { 0 })
-                            | (if selector & 4 != 0 { 1 << 7 } else { 0 })
+                        };
+                        bits
                     }
                     1 => {
                         if cpu::r4os_rust_cpu_control(2, 0) == 0 {
                             return false;
                         }
-                        (1 << 3) | (1 << 7)
+                        let Some(bits) =
+                            crate::arch::pat::cache_bits(crate::arch::memory_types::WC, false)
+                        else {
+                            return false;
+                        };
+                        bits
                     }
                     _ => return false,
                 };

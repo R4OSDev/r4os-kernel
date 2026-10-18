@@ -264,17 +264,16 @@ pub unsafe extern "C" fn r4os_rust_driver_pci_map(
     while mapped < total {
         let physical = page + mapped;
         let address = phys::r4os_rust_phys_to_virt(physical);
-        let mut value = 0;
-        if !unsafe { paging::r4os_rust_paging_read(address, 3, false, &mut value) }
-            && !paging::r4os_rust_paging_map(address, physical, 2 | (1 << 4) | (1 << 63), false)
-        {
+        if !paging::ensure_mmio_candidate(address, physical, flags & 1 != 0) {
             return -6;
         }
         mapped += 4096
     }
     let address = phys::r4os_rust_phys_to_virt(base);
-    if flags & 1 != 0 {
-        paging::r4os_rust_paging_write_combining(address, requested);
+    if flags & 1 != 0
+        && (raw & 8 == 0 || !paging::r4os_rust_paging_write_combining(address, requested))
+    {
+        return -7;
     }
     unsafe {
         ptr::write(

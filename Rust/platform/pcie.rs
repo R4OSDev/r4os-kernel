@@ -149,8 +149,8 @@ pub fn activate_mapped_aperture() -> bool {
     };
     let last = window.base + window.bytes - 1;
     CHECKS.fetch_add(2, Ordering::Relaxed);
-    let first_mapped = mapped(phys::r4os_rust_phys_to_virt(window.base));
-    let last_mapped = mapped(phys::r4os_rust_phys_to_virt(last));
+    let first_mapped = paging::ensure_mmio(phys::r4os_rust_phys_to_virt(window.base), window.base);
+    let last_mapped = paging::ensure_mmio(phys::r4os_rust_phys_to_virt(last & !4095), last & !4095);
     if first_mapped {
         HITS.fetch_add(1, Ordering::Relaxed);
     } else {
@@ -161,7 +161,15 @@ pub fn activate_mapped_aperture() -> bool {
     } else {
         MISSES.fetch_add(1, Ordering::Relaxed);
     }
-    let ready = first_mapped && last_mapped;
+    let mut ready = first_mapped && last_mapped;
+    if ready {
+        for page in (window.base..window.base + window.bytes).step_by(4096) {
+            if !paging::ensure_mmio(phys::r4os_rust_phys_to_virt(page), page) {
+                ready = false;
+                break;
+            }
+        }
+    }
     state(|state| {
         state.status.aperture_ready = ready;
         state.status.reason = if ready { 4 } else { 5 };
@@ -204,16 +212,16 @@ fn ensure_mapped(address: u64) -> bool {
     CHECKS.fetch_add(1, Ordering::Relaxed);
     if !mapped(virtual_address) {
         MISSES.fetch_add(1, Ordering::Relaxed);
-        if !paging::r4os_rust_paging_map(virtual_address, page, 2 | 16 | (1 << 63), false) {
-            MALFORMED
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                    value.checked_add(1)
-                })
-                .expect("PCIe malformed-read counter overflow");
-            return false;
-        }
     } else {
         HITS.fetch_add(1, Ordering::Relaxed);
+    }
+    if !paging::ensure_mmio(virtual_address, page) {
+        MALFORMED
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(1)
+            })
+            .expect("PCIe malformed-read counter overflow");
+        return false;
     }
     true
 }
