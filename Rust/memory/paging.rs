@@ -156,6 +156,27 @@ fn next(table: *mut u64, slot: usize) -> Option<*mut u64> {
         Some(self::table(entry & MASK))
     }
 }
+/// Only require the AP's optional 1-GB format when the shared live root
+/// actually contains such leaves. No page-table borrow crosses AP startup.
+pub(crate) fn ap_boot_uses_1g(expected_root: u64) -> Option<bool> {
+    let _owner = Guard::acquire(6);
+    if !active_matches() || root() != expected_root {
+        return None;
+    }
+    for pml4_index in 0..512 {
+        let entry = read(at(table(expected_root), pml4_index));
+        if entry & PRESENT == 0 {
+            continue;
+        }
+        let pdpt = table(entry & MASK);
+        for pdpt_index in 0..512 {
+            if read(at(pdpt, pdpt_index)) & (PRESENT | HUGE) == PRESENT | HUGE {
+                return Some(true);
+            }
+        }
+    }
+    Some(false)
+}
 fn next_or_create(table: *mut u64, slot: usize) -> Option<*mut u64> {
     let entry = at(table, slot);
     if read(entry) & PRESENT == 0 {

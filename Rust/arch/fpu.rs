@@ -1,6 +1,7 @@
 //! Singleton BSP FPU selection and canonical task/AP/IRQ initial image.
 //! Configuration is immutable before AP release; no live state borrow crosses
 //! an assembly or foreign call. Task buffers retain the existing exact owner.
+use super::xstate_layout::Layout;
 use crate::platform::cpu;
 use core::{
     cell::UnsafeCell,
@@ -68,6 +69,14 @@ struct Image(UnsafeCell<[u8; STORAGE_BYTES]>);
 // SAFETY: BSP fills once before publication, all later consumers only read.
 unsafe impl Sync for Image {}
 static CONFIG: Config = Config(UnsafeCell::new(Status::EMPTY));
+struct SharedLayout(UnsafeCell<Layout>);
+// SAFETY: BSP fills before INITIALIZED release; all APs only copy afterward.
+unsafe impl Sync for SharedLayout {}
+static LAYOUT: SharedLayout = SharedLayout(UnsafeCell::new(Layout {
+    ymm_bytes: 0,
+    ymm_offset: 0,
+    ymm_flags: 0,
+}));
 static INITIAL: Image = Image(UnsafeCell::new([0; STORAGE_BYTES]));
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static SAVES: AtomicU64 = AtomicU64::new(0);
@@ -118,6 +127,14 @@ fn log(event: u8, inherited: &[u64; 3]) {
 }
 fn cpuid(leaf: u32, subleaf: u32) -> core::arch::x86_64::CpuidResult {
     core::arch::x86_64::__cpuid_count(leaf, subleaf)
+}
+fn local_layout() -> Layout {
+    let component = cpuid(0x0d, 2);
+    Layout {
+        ymm_bytes: component.eax,
+        ymm_offset: component.ebx,
+        ymm_flags: component.ecx,
+    }
 }
 fn xgetbv() -> u64 {
     let low: u32;
@@ -238,6 +255,9 @@ pub fn init() -> bool {
     let initial = INITIAL.0.get().cast::<u8>();
     save_raw(value, initial);
     restore_raw(value, initial);
+    if value.backend == 2 {
+        unsafe { LAYOUT.0.get().write(local_layout()) };
+    }
     publish(value);
     log(2, &inherited);
     true
@@ -264,27 +284,60 @@ pub fn restore_initial() -> bool {
     RESTORES.fetch_add(1, Ordering::Relaxed);
     true
 }
+/// Local admission precedes XSETBV and the first common image restore.
+pub(crate) fn init_ap(index: u32) -> Result<(), &'static [u8]> {
+    if !crate::platform::module_cpu::allowed() || !INITIALIZED.load(Ordering::Acquire) {
+        return Err(b"xsave-backend");
+    }
+    if let Some(reason) = crate::platform::module_cpu::hardware_failure() {
+        return Err(reason);
+    }
+    let value = config();
+    if value.backend != 2 || value.xcr0_mask != crate::build_config::config::MODULE_CPU_XCR0_MASK {
+        return Err(b"xsave-backend");
+    }
+    let mut local = local_layout();
+    if index == crate::build_config::config::AP_XSAVE_LAYOUT_TEST_INDEX {
+        // Explicit isolated negative probe; no control/state instruction has
+        // yet consumed this AP's layout or the common image.
+        local.ymm_offset = local.ymm_offset.saturating_add(64);
+    }
+    let shared = unsafe { LAYOUT.0.get().read() };
+    if !shared.compatible(local, value.state_bytes, value.state_storage_bytes) {
+        return Err(b"xsave-layout");
+    }
+    // Preserve only this AP's locally established architectural controls.
+    // In particular no unqualified BSP CR4 features are copied here.
+    let cr0 = (unsafe { r4os_read_cr0() } & !(CR0_EM | CR0_TS)) | CR0_MP | CR0_NE;
+    let cr4 = unsafe { r4os_read_cr4() } | CR4_OSFXSR | CR4_OSXMMEXCPT | CR4_OSXSAVE;
+    unsafe {
+        r4os_write_cr0(cr0);
+        r4os_write_cr4(cr4);
+    }
+    if cpuid(1, 0).ecx & (1 << 27) == 0 || unsafe { r4os_read_cr4() } & CR4_OSXSAVE == 0 {
+        return Err(b"osxsave");
+    }
+    unsafe { r4os_xsetbv(0, value.xcr0_mask) };
+    if xgetbv() != value.xcr0_mask {
+        return Err(b"xcr0");
+    }
+    if cpuid(0x0d, 0).ebx != value.state_bytes {
+        return Err(b"xsave-size");
+    }
+    if unsafe { r4os_read_cr0() } & (CR0_EM | CR0_TS) != 0
+        || unsafe { r4os_read_cr0() } & (CR0_MP | CR0_NE) != CR0_MP | CR0_NE
+        || unsafe { r4os_read_cr4() } & (CR4_OSFXSR | CR4_OSXMMEXCPT) != CR4_OSFXSR | CR4_OSXMMEXCPT
+    {
+        return Err(b"fpu-controls");
+    }
+    unsafe { r4os_fninit() };
+    restore_raw(value, INITIAL.0.get().cast::<u8>());
+    Ok(())
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_fpu_control(operation: u8) -> u64 {
     match operation {
         0 => u64::from(init()),
-        1 => u64::from({
-            if active_bytes() == 0 {
-                false
-            } else {
-                let value = config();
-                unsafe {
-                    r4os_write_cr0(value.cr0);
-                    r4os_write_cr4(value.cr4);
-                    if value.backend == 2 {
-                        r4os_xsetbv(0, value.xcr0_mask)
-                    }
-                    r4os_fninit();
-                }
-                restore_raw(value, INITIAL.0.get().cast::<u8>());
-                true
-            }
-        }),
         2 => u64::from(restore_initial()),
         3 => active_bytes() as u64,
         _ => panic!("Invalid private FPU control"),

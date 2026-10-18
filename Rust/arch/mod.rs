@@ -1,3 +1,4 @@
+pub(crate) mod ap_admission;
 pub mod callback_abort;
 pub mod fpu;
 pub mod hpet;
@@ -18,3 +19,4 @@ pub mod smp_probe;
 pub mod tables;
 pub mod terminal_power;
 pub mod tlb;
+pub(crate) mod xstate_layout;

@@ -5,6 +5,24 @@ use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
+/// Local architectural identity, independent of the BSP's inventory/model.
+/// The early 32-bit trampoline applies the same hierarchy before MSR writes.
+pub(crate) fn local_apic_id() -> u32 {
+    use core::arch::x86_64::__cpuid_count as query;
+    let maximum = query(0, 0).eax;
+    for leaf in [0x1f, 0x0b] {
+        if maximum >= leaf {
+            let value = query(leaf, 0);
+            if value.ebx & 0xffff != 0 && value.ecx & 0xff00 != 0 {
+                return value.edx;
+            }
+        }
+    }
+    if query(0x8000_0000, 0).eax >= 0x8000_001e && query(0x8000_0001, 0).ecx & (1 << 22) != 0 {
+        return query(0x8000_001e, 0).eax;
+    }
+    query(1, 0).ebx >> 24
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Features {

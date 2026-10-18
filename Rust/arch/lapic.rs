@@ -145,6 +145,11 @@ pub fn is_enabled() -> bool {
     FLAGS.load(Ordering::Acquire) & (ENABLED | SOFTWARE) == (ENABLED | SOFTWARE)
         && (BASE.load(Ordering::Acquire) != 0 || MODE_X2.load(Ordering::Acquire))
 }
+pub(crate) fn local_capabilities_valid() -> bool {
+    let features = core::arch::x86_64::__cpuid_count(1, 0);
+    features.edx & ((1 << 5) | (1 << 9)) == (1 << 5) | (1 << 9)
+        && (!MODE_X2.load(Ordering::Acquire) || features.ecx & (1 << 21) != 0)
+}
 fn init_current() -> bool {
     if BASE.load(Ordering::Acquire) == 0 && !MODE_X2.load(Ordering::Acquire) {
         return false;

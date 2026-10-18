@@ -3,7 +3,7 @@
 //! owns the stop counter. Native per-CPU lifecycle atomics publish AP progress.
 //! Raw Task callbacks bind the native task owner without a second lifecycle.
 use super::{
-    fpu, lapic, msr, percpu, runtime,
+    ap_admission, fpu, lapic, msr, percpu, runtime,
     smp_policy::{self, Candidate, MAX_CPUS, Plan},
     tables, tlb,
 };
@@ -57,6 +57,8 @@ struct Boot {
     topology: Plan,
     reported_failures: u64,
     low_pages: [u64; MAX_CPUS],
+    epoch: u64,
+    shared_1g: bool,
 }
 struct Storage(UnsafeCell<Boot>);
 // SAFETY: startup/activation are single BSP operations before public task
@@ -73,6 +75,8 @@ static BOOT: Storage = Storage(UnsafeCell::new(Boot {
     },
     reported_failures: 0,
     low_pages: [0; MAX_CPUS],
+    epoch: 0,
+    shared_1g: false,
 }));
 #[repr(align(64))]
 struct BootStacks(UnsafeCell<[[u8; STACK_SIZE]; MAX_CPUS]>);
@@ -101,13 +105,17 @@ struct TrampolineConfig {
     protected_offset: u32,
     protected_selector: u16,
     protected_padding: u16,
+    epoch: u64,
+    apic_id: u32,
+    early_failure: u32,
+    observed_id: u32,
+    page_constraints: u32,
 }
 unsafe extern "C" {
     static r4os_ap_trampoline_start: u8;
     static r4os_ap_trampoline_protected_mode: u8;
     static r4os_ap_trampoline_long_mode: u8;
     static r4os_ap_trampoline_end: u8;
-    fn r4os_read_cr0() -> u64;
     fn r4os_read_cr3() -> u64;
     fn r4os_read_cr4() -> u64;
 
@@ -128,6 +136,9 @@ fn low_page(index: u32) -> u64 {
 }
 fn current() -> Status {
     unsafe { ptr::addr_of!((*boot()).status).read() }
+}
+fn epoch() -> u64 {
+    unsafe { ptr::addr_of!((*boot()).epoch).read() }
 }
 fn publish(value: Status) {
     unsafe { ptr::addr_of_mut!((*boot()).status).write(value) }
@@ -183,6 +194,9 @@ fn wait_for(index: u32, wanted: u8, timeout: u64) -> bool {
         if state == 7 || state == 6 {
             return false;
         }
+        if wanted == 3 && startup_failure(index).is_some() {
+            return false;
+        }
         if let Some(start) = started {
             if monotonic::now_nanoseconds()
                 .unwrap_or(start)
@@ -198,6 +212,41 @@ fn wait_for(index: u32, wanted: u8, timeout: u64) -> bool {
         spins += 1;
     }
     true
+}
+fn early_rejection(index: u32) -> Option<*const TrampolineConfig> {
+    let low = low_page(index);
+    if low == 0 || progress(index) != 0xfe {
+        return None;
+    }
+    core::sync::atomic::fence(Ordering::Acquire);
+    let config =
+        (phys::r4os_rust_phys_to_virt(low) as usize + CONFIG_OFFSET) as *const TrampolineConfig;
+    if unsafe { ptr::addr_of!((*config).magic).read_unaligned() } != 0x5234_4f53_4150_3031
+        || unsafe { ptr::addr_of!((*config).cpu_index).read_unaligned() } != u64::from(index)
+        || unsafe { ptr::addr_of!((*config).epoch).read_unaligned() } != epoch()
+        || unsafe { ptr::addr_of!((*config).apic_id).read_unaligned() } != apic(index)?
+    {
+        return None;
+    }
+    Some(config)
+}
+fn startup_failure(index: u32) -> Option<&'static [u8]> {
+    if let Some(reason) = ap_admission::failure(index, epoch()) {
+        return Some(reason);
+    }
+    let config = early_rejection(index)?;
+    Some(
+        match unsafe { ptr::addr_of!((*config).early_failure).read_volatile() } {
+            1 => b"msr",
+            2 => b"pae",
+            3 => b"long_mode",
+            4 => b"nx",
+            5 => b"ap-identity",
+            6 => b"ap-bootstrap-config",
+            7 => b"1g-pages",
+            _ => b"ap-bootstrap",
+        },
+    )
 }
 fn fail_ap(index: u32, timeout: bool, reason: &[u8]) {
     if percpu::r4os_rust_percpu_control(5, index, 0, 0) == 0 {
@@ -242,6 +291,11 @@ fn reserve_low_memory() {
             phys::r4os_rust_phys_free_contiguous(page, 1);
             break;
         }
+        // No earlier boot's progress/epoch may be interpreted before this
+        // boot prepares the private trampoline (including pre-SIPI failure).
+        unsafe {
+            ptr::write_bytes(phys::r4os_rust_phys_to_virt(page) as *mut u8, 0, PAGE);
+        }
         unsafe {
             ptr::addr_of_mut!((*boot()).low_pages)
                 .cast::<u64>()
@@ -253,6 +307,13 @@ fn reserve_low_memory() {
     log(0, 0, u64::from(reserved), b"");
 }
 fn prepare_trampoline(index: u32) -> Option<u64> {
+    let root = unsafe { r4os_read_cr3() } & 0x000f_ffff_ffff_f000;
+    // The SIPI trampoline loads a 32-bit CR3 into the established four-level
+    // layout. Unsupported roots exclude the AP instead of truncating CR3.
+    if root == 0 || root > u64::from(u32::MAX) || unsafe { r4os_read_cr4() } & (1 << 12) != 0 {
+        log(7, index, root, b"root-not-representable");
+        return None;
+    }
     let start = ptr::addr_of!(r4os_ap_trampoline_start).addr();
     let protected = ptr::addr_of!(r4os_ap_trampoline_protected_mode).addr();
     let long = ptr::addr_of!(r4os_ap_trampoline_long_mode).addr();
@@ -289,11 +350,12 @@ fn prepare_trampoline(index: u32) -> Option<u64> {
         unsafe { STACKS.0.get().cast::<u8>().add(index as usize * STACK_SIZE) }.addr() + STACK_SIZE;
     let config = TrampolineConfig {
         magic: 0x5234_4f53_4150_3031,
-        cr3: unsafe { r4os_read_cr3() },
-        cr0: unsafe { r4os_read_cr0() },
-        cr4: unsafe { r4os_read_cr4() },
-        // LMA is read-only current-CPU state and must not enter the AP WRMSR.
-        efer: (unsafe { msr::read(0xc000_0080) } & !(1 << 10)) | (1 << 8),
+        cr3: root,
+        cr0: 0x8001_0033,
+        cr4: 1 << 5,
+        // Only LME and shared-page NXE. The AP validates both locally before
+        // WRMSR; no optional BSP EFER state is inherited.
+        efer: (unsafe { msr::read(0xc000_0080) } & (1 << 11)) | (1 << 8),
         entry: r4os_ap_entry as *const () as u64,
         stack: stack as u64,
         cpu_index: u64::from(index),
@@ -308,6 +370,11 @@ fn prepare_trampoline(index: u32) -> Option<u64> {
             .expect("AP protected jump overflow"),
         protected_selector: 24,
         protected_padding: 0,
+        epoch: epoch(),
+        apic_id: apic(index)?,
+        early_failure: 0,
+        observed_id: u32::MAX,
+        page_constraints: u32::from(unsafe { ptr::addr_of!((*boot()).shared_1g).read() }),
     };
     unsafe {
         page.add(CONFIG_OFFSET)
@@ -338,6 +405,16 @@ fn start(plan: Plan) -> bool {
     };
     unsafe { ptr::addr_of_mut!((*boot()).topology).write(plan) };
     publish(value);
+    let root = unsafe { r4os_read_cr3() } & 0x000f_ffff_ffff_f000;
+    let Some(shared_1g) = paging::ap_boot_uses_1g(root) else {
+        log(7, 0, root, b"shared-root-unconfirmed");
+        return false;
+    };
+    unsafe {
+        ptr::addr_of_mut!((*boot()).epoch)
+            .write(epoch().checked_add(1).expect("AP epoch overflow"));
+        ptr::addr_of_mut!((*boot()).shared_1g).write(shared_1g);
+    }
     RELEASE.store(false, Ordering::Release);
     if count > 1 {
         runtime::r4os_rust_runtime_control(6, 0);
@@ -350,6 +427,10 @@ fn start(plan: Plan) -> bool {
                 .read()
         };
         if percpu::r4os_rust_percpu_control(3, index, u64::from(id), 0) == 0 {
+            continue;
+        }
+        if !ap_admission::prepare(index, id, epoch()) {
+            fail_ap(index, false, b"ap-admission-identity");
             continue;
         }
         if index == config::SMP_FAIL_AP_INDEX {
@@ -373,10 +454,15 @@ fn start(plan: Plan) -> bool {
             continue;
         }
         if !wait_for(index, 3, START_TIMEOUT) {
-            fail_ap(index, true, b"startup-timeout");
+            if let Some(reason) = startup_failure(index) {
+                fail_ap(index, false, reason);
+            } else {
+                fail_ap(index, true, b"startup-timeout");
+            }
             continue;
         }
-        if percpu::state(index) != 3
+        if !ap_admission::qualified(index, id, epoch())
+            || percpu::state(index) != 3
             || !crate::platform::clocksource::finalize_cpu(index)
             || !transition(index, 3, 8)
         {
@@ -386,6 +472,7 @@ fn start(plan: Plan) -> bool {
         let mut value = current();
         value.started += 1;
         publish(value);
+        log(8, index, epoch(), b"qualified");
     }
     log(3, 0, 0, b"parked");
     true
@@ -399,6 +486,11 @@ fn activate() {
     RELEASE.store(true, Ordering::Release);
     for index in 1..configured() {
         let before = percpu::state(index);
+        if before == 8 && !apic(index).is_some_and(|id| ap_admission::qualified(index, id, epoch()))
+        {
+            fail_ap(index, false, b"ap-admission-identity");
+            continue;
+        }
         if before == 8 && !wait_for(index, 4, START_TIMEOUT) {
             fail_ap(index, true, b"activation-timeout");
         } else if before == 7 {
@@ -473,19 +565,47 @@ fn irq_target(ordinal: u32) -> u32 {
     bsp
 }
 #[unsafe(no_mangle)]
-pub extern "C" fn r4os_ap_entry(index: u64) -> ! {
+pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> ! {
     if index == 0 || index >= MAX_CPUS as u64 {
         runtime::halt_forever();
     }
     let index = index as u32;
+    let reject = |reason: &'static [u8]| -> ! {
+        ap_admission::reject(index, start_epoch, reason);
+        runtime::halt_forever()
+    };
+    if apic_id > u64::from(u32::MAX) {
+        reject(b"ap-identity");
+    }
+    if let Err(reason) = ap_admission::begin(index, apic_id as u32, start_epoch) {
+        reject(reason);
+    }
+    // Rust's bare target uses integer registers only. The module baseline
+    // and common XSAVE image must be admitted before any FPU/SIMD operation.
+    if let Some(reason) = crate::platform::module_cpu::hardware_failure() {
+        reject(reason);
+    }
+    if !lapic::local_capabilities_valid() {
+        reject(b"lapic-capabilities");
+    }
+    if crate::platform::clocksource::active_source() == 1
+        && core::arch::x86_64::__cpuid_count(1, 0).edx & (1 << 4) == 0
+    {
+        reject(b"tsc-capabilities");
+    }
     tables::r4os_rust_gdt_init(index);
     percpu::r4os_rust_percpu_control(1, index, 0, 0);
     tables::r4os_rust_idt_load();
     if percpu::state(index) != 2 {
         runtime::halt_forever();
     }
-    if fpu::r4os_rust_fpu_control(1) == 0
-        || lapic::r4os_rust_lapic_control(1, 0, 0) == 0
+    if let Err(reason) = fpu::init_ap(index) {
+        reject(reason);
+    }
+    if !ap_admission::qualify(index, start_epoch) {
+        runtime::halt_forever();
+    }
+    if lapic::r4os_rust_lapic_control(1, 0, 0) == 0
         || !crate::sched::scheduler::init_secondary(index)
     {
         percpu::r4os_rust_percpu_control(5, index, 0, 0);
@@ -503,6 +623,9 @@ pub extern "C" fn r4os_ap_entry(index: u64) -> ! {
         core::hint::spin_loop();
     }
     if percpu::state(index) != 8 {
+        runtime::halt_forever();
+    }
+    if !ap_admission::qualified(index, apic_id as u32, start_epoch) {
         runtime::halt_forever();
     }
     if lapic::r4os_rust_lapic_control(3, 0, pit::DEFAULT_HZ) == 0 {
@@ -577,9 +700,14 @@ pub unsafe extern "C" fn r4os_rust_smp_status(output: *mut Status) {
 const _: () = {
     assert!(core::mem::size_of::<Status>() == 36);
     assert!(core::mem::offset_of!(Status, discovered) == 4);
-    assert!(core::mem::size_of::<TrampolineConfig>() == 88);
+    assert!(core::mem::size_of::<TrampolineConfig>() == 112);
     assert!(core::mem::offset_of!(TrampolineConfig, progress) == 0x4e);
     assert!(core::mem::offset_of!(TrampolineConfig, protected_offset) == 0x50);
+    assert!(core::mem::offset_of!(TrampolineConfig, epoch) == 0x58);
+    assert!(core::mem::offset_of!(TrampolineConfig, apic_id) == 0x60);
+    assert!(core::mem::offset_of!(TrampolineConfig, early_failure) == 0x64);
+    assert!(core::mem::offset_of!(TrampolineConfig, observed_id) == 0x68);
+    assert!(core::mem::offset_of!(TrampolineConfig, page_constraints) == 0x6c);
 };
 
 unsafe fn smp_log(
@@ -597,12 +725,49 @@ unsafe fn smp_log(
             dec(value);
         }
         1 | 2 => {
+            // Only an authenticated AP result carries observed identity.
+            // Pre-SIPI failures retain the original diagnostic marker.
+            let early = early_rejection(index);
+            let admission_failure = ap_admission::failure(index, epoch()).is_some();
             puts(b"[SMP] ap=");
             dec(u64::from(index));
             puts(b" apic=");
             dec(u64::from(apic(index).unwrap_or(0)));
+            if early.is_some() || admission_failure {
+                puts(b" epoch=");
+                dec(epoch());
+                puts(b" observed-apic=");
+                if let Some(config) = early {
+                    dec(u64::from(unsafe {
+                        ptr::addr_of!((*config).observed_id).read_volatile()
+                    }));
+                } else if let Some(id) = ap_admission::observed(index, epoch()) {
+                    dec(u64::from(id));
+                } else {
+                    puts(b"unknown");
+                }
+            }
             puts(b" failed=");
             puts(unsafe { core::slice::from_raw_parts(text, len) });
+            if early.is_some() {
+                puts(b" phase=pre-cr4");
+            } else if admission_failure {
+                let reason = unsafe { core::slice::from_raw_parts(text, len) };
+                puts(
+                    if [
+                        b"osxsave".as_slice(),
+                        b"xcr0",
+                        b"xsave-size",
+                        b"fpu-controls",
+                    ]
+                    .contains(&reason)
+                    {
+                        b" phase=state-readback"
+                    } else {
+                        b" phase=pre-fpu-controls"
+                    },
+                );
+            }
             if event == 2 {
                 puts(b" progress=");
                 dec(value);
@@ -629,6 +794,19 @@ unsafe fn smp_log(
         }
         5 => puts(b"[SMP] trampoline low-memory reservation missing"),
         6 => puts(b"[SMP] trampoline identity mapping failed"),
+        7 => {
+            puts(b"[SMP] bootstrap-root rejected=");
+            puts(unsafe { core::slice::from_raw_parts(text, len) });
+        }
+        8 => {
+            puts(b"[SMP] ap=");
+            dec(u64::from(index));
+            puts(b" apic=");
+            dec(u64::from(apic(index).unwrap_or(0)));
+            puts(b" epoch=");
+            dec(value);
+            puts(b" qualification=allowed baseline=r4os-avx2-v1 xcr0=7 image=verified");
+        }
         _ => unreachable!(),
     }
     puts(b"\r\n");

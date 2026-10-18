@@ -41,9 +41,8 @@ r4os_ap_trampoline_start:
     // Establish a flat 32-bit protected-mode data segment before any access
     // through the physical config pointer.  Real-mode segment caches retain
     // a 64 KiB limit on KVM and hardware even for 32-bit offsets.
-    movl %cs:0x0810, %eax
-    andl $0x7fffffff, %eax
-    orl $1, %eax
+    // Fixed legacy controls only. Do not inherit optional BSP CR0 state.
+    movl $0x33, %eax
     movl %eax, %cr0
     ljmpl *%cs:0x0850
 
@@ -53,26 +52,144 @@ r4os_ap_trampoline_protected_mode:
     movw %ax, %ds
     movw %ax, %es
     movb $9, 0x4e(%ebx)
+    movl %ebx, %esi
 
-    movl 0x18(%ebx), %eax
+    // CPUID clobbers EBX. ESI alone retains the private config pointer.
+    // No optional CR4/EFER bits or FPU state are touched before these checks.
+    xorl %eax, %eax
+    xorl %ecx, %ecx
+    cpuid
+    movl %eax, %edi
+    cmpl $1, %edi
+    jb .Lap_config
+    cmpl $0x1f, %edi
+    jb .Lap_id_b
+    movl $0x1f, %eax
+    xorl %ecx, %ecx
+    cpuid
+    testl $0xffff, %ebx
+    jz .Lap_id_b
+    testl $0xff00, %ecx
+    jnz .Lap_id_found
+.Lap_id_b:
+    cmpl $0x0b, %edi
+    jb .Lap_id_extended
+    movl $0x0b, %eax
+    xorl %ecx, %ecx
+    cpuid
+    testl $0xffff, %ebx
+    jz .Lap_id_extended
+    testl $0xff00, %ecx
+    jnz .Lap_id_found
+.Lap_id_extended:
+    movl $0x80000000, %eax
+    xorl %ecx, %ecx
+    cpuid
+    cmpl $0x8000001e, %eax
+    jb .Lap_id_legacy
+    movl $0x80000001, %eax
+    xorl %ecx, %ecx
+    cpuid
+    testl $(1 << 22), %ecx
+    jz .Lap_id_legacy
+    movl $0x8000001e, %eax
+    xorl %ecx, %ecx
+    cpuid
+    movl %eax, %edx
+    jmp .Lap_id_found
+.Lap_id_legacy:
+    movl $1, %eax
+    xorl %ecx, %ecx
+    cpuid
+    movl %ebx, %edx
+    shrl $24, %edx
+.Lap_id_found:
+    movl %edx, 0x68(%esi)
+    cmpl 0x60(%esi), %edx
+    jne .Lap_identity
+    movl 0x58(%esi), %eax
+    orl 0x5c(%esi), %eax
+    jz .Lap_config
+
+    movl $1, %eax
+    xorl %ecx, %ecx
+    cpuid
+    testl $(1 << 5), %edx
+    jz .Lap_msr
+    testl $(1 << 6), %edx
+    jz .Lap_pae
+    movl $0x80000000, %eax
+    xorl %ecx, %ecx
+    cpuid
+    cmpl $0x80000001, %eax
+    jb .Lap_long_mode_missing
+    movl $0x80000001, %eax
+    xorl %ecx, %ecx
+    cpuid
+    testl $(1 << 29), %edx
+    jz .Lap_long_mode_missing
+    testl $1, 0x6c(%esi)
+    jz .Lap_nx_check
+    testl $(1 << 26), %edx
+    jz .Lap_1g_missing
+.Lap_nx_check:
+    testl $(1 << 11), 0x20(%esi)
+    jz .Lap_minimal
+    testl $(1 << 20), %edx
+    jz .Lap_nx
+.Lap_minimal:
+    // A checked four-level PAE root, LME and (only when required) NXE.
+    // OSXSAVE/OSFXSR and every module requirement are checked in integer-only
+    // Rust before local FPU controls, XSETBV or the first common XRSTOR.
+    movl $0x20, %eax
     movl %eax, %cr4
-    movl 0x08(%ebx), %eax
+    movl 0x08(%esi), %eax
     movl %eax, %cr3
-    movb $10, 0x4e(%ebx)
+    movb $10, 0x4e(%esi)
 
     movl $0xC0000080, %ecx
-    movl 0x20(%ebx), %eax
-    movl 0x24(%ebx), %edx
+    movl 0x20(%esi), %eax
+    xorl %edx, %edx
     wrmsr
-    movb $11, 0x4e(%ebx)
+    movb $11, 0x4e(%esi)
 
-    movl 0x10(%ebx), %eax
+    movl $0x80010033, %eax
     movl %eax, %cr0
+    movl %esi, %ebx
     movb $12, 0x4e(%ebx)
     ljmpl *0x40(%ebx)
 
+.Lap_msr:
+    movl $1, %eax
+    jmp .Lap_reject
+.Lap_pae:
+    movl $2, %eax
+    jmp .Lap_reject
+.Lap_long_mode_missing:
+    movl $3, %eax
+    jmp .Lap_reject
+.Lap_nx:
+    movl $4, %eax
+    jmp .Lap_reject
+.Lap_identity:
+    movl $5, %eax
+    jmp .Lap_reject
+.Lap_config:
+    movl $6, %eax
+    jmp .Lap_reject
+.Lap_1g_missing:
+    movl $7, %eax
+.Lap_reject:
+    movl %eax, 0x64(%esi)
+    movb $0xfe, 0x4e(%esi)
+.Lap_halt:
+    cli
+    hlt
+    jmp .Lap_halt
+
 .code64
 r4os_ap_trampoline_long_mode:
+    movl %ebx, %ebx
     movb $13, 0x4e(%rbx)
     movw $0x10, %ax
     movw %ax, %ds
@@ -83,6 +200,8 @@ r4os_ap_trampoline_long_mode:
     andq $-16, %rsp
     xorq %rbp, %rbp
     movq 0x38(%rbx), %rdi
+    movq 0x58(%rbx), %rsi
+    movl 0x60(%rbx), %edx
     movq 0x28(%rbx), %rax
     movb $15, 0x4e(%rbx)
     call *%rax
