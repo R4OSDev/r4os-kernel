@@ -128,50 +128,6 @@ pub extern "C" fn r4os_rust_serial_present(base: u16) -> bool {
         inb(base + 7) == 0xa5
     }
 }
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_serial_putc(base: u16, byte: u8) {
-    let mut spins = 0;
-    unsafe {
-        while inb(base + 5) & 0x20 == 0 {
-            if spins >= TIMEOUT {
-                return;
-            }
-            spins += 1;
-        }
-        outb(base, byte);
-    }
-}
-#[unsafe(no_mangle)]
-/// # Safety
-/// Caller owns this port and keeps len readable resident bytes until return.
-pub unsafe extern "C" fn r4os_rust_serial_available(
-    base: u16,
-    data: *const u8,
-    len: usize,
-) -> usize {
-    if len == 0 || unsafe { inb(base + 5) } & 0x20 == 0 {
-        return 0;
-    }
-    let count = len.min(FIFO);
-    for index in 0..count {
-        unsafe { outb(base, data.add(index).read()) };
-    }
-    count
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_serial_getc(base: u16) -> i32 {
-    unsafe {
-        if inb(base + 5) & 1 == 0 {
-            -1
-        } else {
-            i32::from(inb(base))
-        }
-    }
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_serial_has_data(base: u16) -> bool {
-    unsafe { inb(base + 5) & 1 != 0 }
-}
 
 impl State {
     fn drain(&mut self) {

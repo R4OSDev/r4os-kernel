@@ -844,7 +844,7 @@ unsafe fn program_domain_gfx_buffer_import(
     unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(2, &args, output.cast()) }
 }
 
-unsafe fn program_domain_gfx_buffer_release(
+pub(super) unsafe fn program_domain_gfx_buffer_release(
     owner: c::ProgramProcessHandle,
     input: *const c::GfxBufferHandle,
 ) -> i32 {
@@ -860,7 +860,7 @@ unsafe fn program_domain_gfx_buffer_release(
     unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(3, &args, core::ptr::null_mut()) }
 }
 
-unsafe fn program_domain_gfx_buffer_map(
+pub(super) unsafe fn program_domain_gfx_buffer_map(
     owner: c::ProgramProcessHandle,
     input: *const c::GfxBufferHandle,
     access: u32,
@@ -883,7 +883,7 @@ unsafe fn program_domain_gfx_buffer_map(
     unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(4, &args, output.cast()) }
 }
 
-unsafe fn program_domain_gfx_buffer_unmap(
+pub(super) unsafe fn program_domain_gfx_buffer_unmap(
     owner: c::ProgramProcessHandle,
     input: *const c::GfxBufferHandle,
 ) -> i32 {

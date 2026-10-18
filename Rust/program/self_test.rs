@@ -1,9 +1,15 @@
 //! Original program-storage/GUI diagnostic cases, with unchanged failure seams,
 //! expected values, rollback ordering and ownership baselines. No new test suite.
 use super::{
+    domain_api::{
+        program_domain_gfx_buffer_map, program_domain_gfx_buffer_release,
+        program_domain_gfx_buffer_unmap,
+    },
     gui_batch, gui_draw, gui_events, gui_flow as flow, gui_lifetime as life, gui_storage as gs,
     gui_view as view, instance_storage as storage, memory, payload, payload_types as t,
-    process_data, registry_types::ProgramInstance, shared_raster, threads,
+    process_data,
+    registry_types::ProgramInstance,
+    shared_raster, threads,
 };
 use crate::{
     arch::runtime,
@@ -1967,61 +1973,6 @@ const _: () = {
     assert!(mem::offset_of!(BufferStats, allocating_bytes) == 104);
     assert!(mem::offset_of!(BufferStats, destroying_bytes) == 112);
 };
-
-unsafe fn program_domain_gfx_buffer_release(
-    owner: c::ProgramProcessHandle,
-    input: *const c::GfxBufferHandle,
-) -> i32 {
-    let args = crate::gfx::buffer_owner::Args {
-        owner: crate::gfx::types::Owner {
-            kind: 1,
-            id: u64::from(owner.instance_id),
-            generation: owner.generation,
-        },
-        input: input.cast(),
-        ..Default::default()
-    };
-    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(3, &args, core::ptr::null_mut()) }
-}
-
-unsafe fn program_domain_gfx_buffer_map(
-    owner: c::ProgramProcessHandle,
-    input: *const c::GfxBufferHandle,
-    access: u32,
-    offset: u64,
-    bytes: u64,
-    out: *mut c::GfxBufferMap,
-) -> i32 {
-    let args = crate::gfx::buffer_owner::Args {
-        owner: crate::gfx::types::Owner {
-            kind: 1,
-            id: u64::from(owner.instance_id),
-            generation: owner.generation,
-        },
-        input: input.cast(),
-        access,
-        offset,
-        bytes,
-        ..Default::default()
-    };
-    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(4, &args, out.cast()) }
-}
-
-unsafe fn program_domain_gfx_buffer_unmap(
-    owner: c::ProgramProcessHandle,
-    input: *const c::GfxBufferHandle,
-) -> i32 {
-    let args = crate::gfx::buffer_owner::Args {
-        owner: crate::gfx::types::Owner {
-            kind: 1,
-            id: u64::from(owner.instance_id),
-            generation: owner.generation,
-        },
-        input: input.cast(),
-        ..Default::default()
-    };
-    unsafe { crate::gfx::buffer_api::r4os_rust_gfx_buffer_api(6, &args, core::ptr::null_mut()) }
-}
 
 unsafe fn program_test_buffer_stats(out: *mut BufferStats) {
     unsafe {
