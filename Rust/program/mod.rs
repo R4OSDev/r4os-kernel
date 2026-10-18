@@ -78,5 +78,12 @@ pub mod vm;
 pub mod r4dev;
 
 pub(crate) mod platform_callbacks;
+mod platform_callbacks_async_io;
+mod platform_callbacks_desktop;
+mod platform_callbacks_drawing;
+mod platform_callbacks_files_storage;
+mod platform_callbacks_process;
+mod platform_callbacks_services;
+mod platform_callbacks_system;
 
 pub(crate) mod serial_api;
