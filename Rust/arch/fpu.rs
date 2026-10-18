@@ -101,7 +101,7 @@ fn publish(mut value: Status) {
     unsafe { CONFIG.0.get().write(value) };
     INITIALIZED.store(true, Ordering::Release);
 }
-fn snapshot() -> Status {
+pub(crate) fn snapshot() -> Status {
     if !INITIALIZED.load(Ordering::Acquire) {
         return Status::EMPTY;
     }
@@ -175,7 +175,6 @@ pub fn init() -> bool {
     let mut value = Status::EMPTY;
     if !info.features.fxsr || !info.features.sse || !info.features.sse2 {
         publish(value);
-        cpu::r4os_rust_cpu_control(5, 0);
         log(0, &[0; 3]);
         return false;
     }
@@ -184,7 +183,9 @@ pub fn init() -> bool {
     let mut cr4 = unsafe { r4os_read_cr4() } | CR4_OSFXSR | CR4_OSXMMEXCPT;
     value.avx_supported = info.features.avx && component_supported(info, AVX);
     value.avx2_supported = value.avx_supported && info.features.avx2;
-    let mask = if value.avx_supported {
+    let mask = if crate::build_config::config::CPU_BASELINE_YMM_TEST {
+        X87_SSE
+    } else if value.avx_supported {
         X87_SSE | AVX
     } else {
         X87_SSE
@@ -204,7 +205,6 @@ pub fn init() -> bool {
                 value.cr0 = unsafe { r4os_read_cr0() };
                 value.cr4 = unsafe { r4os_read_cr4() };
                 publish(value);
-                cpu::r4os_rust_cpu_control(5, 0);
                 log(1, &[0; 3]);
                 return false;
             };
@@ -239,7 +239,6 @@ pub fn init() -> bool {
     save_raw(value, initial);
     restore_raw(value, initial);
     publish(value);
-    cpu::r4os_rust_cpu_control(5, 1);
     log(2, &inherited);
     true
 }

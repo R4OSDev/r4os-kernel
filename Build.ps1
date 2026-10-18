@@ -58,13 +58,39 @@ $graph=$graphText|ConvertFrom-Json
 $package=@($graph.packages|Where-Object name -CEQ 'r4os-contract')
 if($package.Count -ne 1){throw 'Kernel must resolve exactly one canonical Contract crate.'}
 $pinnedContract=[IO.Path]::GetFullPath((Join-Path (Split-Path $package[0].manifest_path -Parent) '../../..'))
-foreach($relative in @('API/ApiContract.json','Generated/SDK/Rust/Cargo.toml','Generated/SDK/Rust/src/lib.rs')) {
+foreach($relative in @('API/ApiContract.json','Module/CpuBaseline.json','Generated/SDK/Rust/Cargo.toml','Generated/SDK/Rust/src/lib.rs')) {
     if((Get-FileHash -LiteralPath (Join-Path $contract $relative)).Hash -cne (Get-FileHash -LiteralPath (Join-Path $pinnedContract $relative)).Hash) {
         throw ('Workspace and pinned Rust Contract differ: '+$relative+'. Publish and update the Kernel pin before building an ABI change.')
     }
 }
 $configuration = [Collections.Generic.List[string]]::new()
 $configuration.Add('FORMAT=1')
+$moduleCpuPath = Join-Path $contract 'Module/CpuBaseline.json'
+$moduleCpu = Get-Content -LiteralPath $moduleCpuPath -Raw | ConvertFrom-Json
+if ($moduleCpu.format -ne 1 -or $moduleCpu.cpu_model -cne 'x86_64' -or
+    $moduleCpu.xcr0_mask -ne 7 -or $moduleCpu.name -cnotmatch '^[a-z0-9_-]{1,48}$' -or
+    $moduleCpu.requirements.Count -lt 1 -or $moduleCpu.requirements.Count -gt 32) {
+    throw 'Invalid canonical module CPU baseline; review its architecture and XSTATE contract.'
+}
+$configuration.Add('MODULE_CPU_NAME='+$moduleCpu.name)
+$configuration.Add('MODULE_CPU_SHA256='+(Get-FileHash -LiteralPath $moduleCpuPath -Algorithm SHA256).Hash.ToLowerInvariant())
+$configuration.Add('MODULE_CPU_XCR0_MASK='+[string]$moduleCpu.xcr0_mask)
+$configuration.Add('MODULE_CPU_REQUIREMENT_COUNT='+[string]$moduleCpu.requirements.Count)
+$cpuNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$cpuBits = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+$cpuRegisters = @{eax=0;ebx=1;ecx=2;edx=3}
+for ($cpuIndex=0; $cpuIndex -lt $moduleCpu.requirements.Count; $cpuIndex++) {
+    $requirement = $moduleCpu.requirements[$cpuIndex]
+    if ($requirement.name -cnotmatch '^[a-z0-9_]{1,32}$' -or
+        -not $cpuRegisters.ContainsKey([string]$requirement.register) -or
+        [uint32]$requirement.bit -ge 32 -or -not $cpuNames.Add([string]$requirement.name)) {
+        throw 'Invalid or duplicate canonical CPU requirement.'
+    }
+    $cpuRow = [string][uint32]$requirement.leaf+','+[string][uint32]$requirement.subleaf+','+
+        [string]$cpuRegisters[[string]$requirement.register]+','+[string][uint32]$requirement.bit
+    if (-not $cpuBits.Add($cpuRow)) { throw 'Duplicate canonical CPUID requirement.' }
+    $configuration.Add('MODULE_CPU_REQUIREMENT_'+[string]$cpuIndex+'='+$requirement.name+','+$cpuRow)
+}
 $flags = [uint64]0
 foreach ($spec in $specs) {
     $number = $selected[$spec.name]

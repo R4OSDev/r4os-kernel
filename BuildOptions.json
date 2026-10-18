@@ -133,5 +133,13 @@
     "default": 0,
     "bit": 16,
     "description": "Prove checked Rust release arithmetic through the terminal fatal path"
+  },
+  {
+    "name": "cpu-baseline-ymm-test",
+    "config": "cpu_baseline_ymm_test",
+    "type": "bool",
+    "default": 0,
+    "bit": 17,
+    "description": "Initialize XSAVE without YMM to prove module rejection; isolated negative boot only"
   }
 ]

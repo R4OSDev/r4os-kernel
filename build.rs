@@ -37,6 +37,59 @@ fn main() {
         .parse()
         .expect("u64 build flags");
     let mut generated = format!("pub const BUILD_FLAGS: u64 = {flags};\n");
+    let cpu_name = values
+        .remove("MODULE_CPU_NAME")
+        .expect("Module CPU profile");
+    assert!(!cpu_name.is_empty() && cpu_name.len() <= 48);
+    assert!(
+        cpu_name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+    );
+    let cpu_hash = values
+        .remove("MODULE_CPU_SHA256")
+        .expect("Module CPU profile hash");
+    assert!(cpu_hash.len() == 64 && cpu_hash.bytes().all(|b| b.is_ascii_hexdigit()));
+    let xcr0: u64 = values
+        .remove("MODULE_CPU_XCR0_MASK")
+        .expect("Module XSTATE mask")
+        .parse()
+        .expect("XSTATE bitmap");
+    assert_eq!(
+        xcr0, 7,
+        "Review the FPU layout before enabling another module XSTATE profile"
+    );
+    let cpu_count: usize = values
+        .remove("MODULE_CPU_REQUIREMENT_COUNT")
+        .expect("Module CPU requirements")
+        .parse()
+        .expect("CPU requirement count");
+    assert!((1..=32).contains(&cpu_count));
+    generated.push_str(&format!("pub const MODULE_CPU_NAME:&[u8]=b\"{cpu_name}\";\npub const MODULE_CPU_SHA256:&[u8]=b\"{cpu_hash}\";\npub const MODULE_CPU_XCR0_MASK:u64={xcr0};\npub const MODULE_CPU_REQUIREMENTS:[(&[u8],u32,u32,u8,u8);{cpu_count}]=[\n"));
+    for index in 0..cpu_count {
+        let value = values
+            .remove(&format!("MODULE_CPU_REQUIREMENT_{index}"))
+            .expect("Ordered CPU requirement");
+        let row: Vec<&str> = value.split(',').collect();
+        assert_eq!(row.len(), 5);
+        let name = row[0];
+        assert!(
+            !name.is_empty()
+                && name.len() <= 32
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        );
+        let leaf: u32 = row[1].parse().expect("CPUID leaf");
+        let subleaf: u32 = row[2].parse().expect("CPUID subleaf");
+        let register: u8 = row[3].parse().expect("CPUID register");
+        let bit: u8 = row[4].parse().expect("CPUID bit");
+        assert!(register < 4 && bit < 32);
+        generated.push_str(&format!(
+            "(b\"{name}\",{leaf},{subleaf},{register},{bit}),\n"
+        ));
+    }
+    generated.push_str("];\n");
     let platform_count: usize = values
         .remove("PLATFORM_API_COUNT")
         .expect("Contract platform metadata")

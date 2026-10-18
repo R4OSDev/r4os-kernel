@@ -145,11 +145,13 @@ pub extern "C" fn r4os_rust_com_debug_boot() {
 unsafe fn cpu_foundation() {
     crate::arch::pic::init();
     crate::platform::cpu::detect();
+    crate::platform::module_cpu::require_hardware();
     crate::arch::smp::r4os_rust_smp_control(0, 0);
     crate::platform::clocksource::configure_cpu();
     if !crate::arch::fpu::init() {
         crate::boot::fatal::kernel(2, b"FPU/SSE task-state init failed");
     }
+    crate::platform::module_cpu::admit_bsp();
 }
 
 unsafe fn boot_console(output: *mut IntroInfo) -> i32 {

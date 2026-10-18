@@ -989,6 +989,11 @@ pub unsafe extern "C" fn r4os_rust_mod_prepare(
     peers: &state::Peers,
     out: *mut state::Prepared,
 ) -> bool {
+    if !crate::platform::module_cpu::allowed() {
+        return report(b"[MOD] CPU module baseline not admitted: ", unsafe {
+            bytes(default)
+        });
+    }
     let Some(mut lease) = (unsafe { Lease::begin(peers) }) else {
         return false;
     };

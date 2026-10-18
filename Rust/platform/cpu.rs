@@ -114,7 +114,6 @@ static INFO: Storage = Storage(UnsafeCell::new(core::mem::MaybeUninit::uninit())
 static DETECTED: AtomicBool = AtomicBool::new(false);
 static OSXSAVE: AtomicBool = AtomicBool::new(false);
 static XCR0: AtomicU64 = AtomicU64::new(0);
-static MODULE_SIMD: AtomicBool = AtomicBool::new(false);
 
 fn cpuid(leaf: u32, subleaf: u32) -> core::arch::x86_64::CpuidResult {
     core::arch::x86_64::__cpuid_count(leaf, subleaf)
@@ -250,7 +249,7 @@ pub fn detect() -> Status {
     XCR0.store(value.xcr0, Ordering::Release);
     OSXSAVE.store(value.features.osxsave, Ordering::Release);
     DETECTED.store(true, Ordering::Release);
-    unsafe { cpu_log(&value, MODULE_SIMD.load(Ordering::Acquire)) };
+    unsafe { cpu_log(&value, super::module_cpu::allowed()) };
     value
 }
 pub fn snapshot() -> Status {
@@ -281,11 +280,7 @@ pub extern "C" fn r4os_rust_cpu_control(operation: u8, value: u64) -> u64 {
             let s = snapshot();
             s.features.pat && s.features.msr && ((s.pat_msr >> 40) & 255) == 1
         }),
-        4 => u64::from(MODULE_SIMD.load(Ordering::Acquire)),
-        5 => {
-            MODULE_SIMD.store(value != 0, Ordering::Release);
-            0
-        }
+        4 => u64::from(super::module_cpu::allowed()),
         6 => {
             if !DETECTED.load(Ordering::Acquire) {
                 detect();
