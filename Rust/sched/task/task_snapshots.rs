@@ -291,6 +291,10 @@ unsafe fn queues_held() -> QueueSnapshot {
                 if (*c).ready_rank as usize != rank {
                     out.valid = false;
                 }
+                if !previous.is_null() && (*registry::core(previous)).ready_order > (*c).ready_order
+                {
+                    out.valid = false;
+                }
                 previous = cursor;
                 cursor = (*c).ready_next;
             }

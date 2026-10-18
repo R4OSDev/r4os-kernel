@@ -119,8 +119,7 @@ pub(crate) unsafe fn imbalanced(
         return false;
     }
     unsafe {
-        (*registry::queue(target)).count == 0
-            && (*registry::queue(source)).count != 0
+        (*registry::queue(source)).count != 0
             && workload(source, current) > workload(target, target_current).saturating_add(1)
     }
 }
@@ -133,13 +132,17 @@ pub(crate) unsafe fn pull(
     target: u32,
     current: *mut Task,
     target_current: *mut Task,
-    now: u64,
+    mut now: impl FnMut() -> u64,
     cooldown: u64,
 ) -> *mut Task {
     if !unsafe { imbalanced(source, target, current, target_current) } {
         return ptr::null_mut();
     }
     unsafe {
+        // One functional snapshot per bounded attempt, only once a structural
+        // candidate needs cooldown/admission time. Bound-only prefixes never
+        // publish the global clock merely to discover they cannot move.
+        let mut time = None;
         let from = registry::queue(source);
         let mut candidate = if (*from).balance_cursor.is_null() {
             (*from).head
@@ -157,11 +160,21 @@ pub(crate) unsafe fn pull(
                 (*c).ready_next
             };
             (*from).balance_cursor = next;
-            if eligible(candidate, current, source, || now, cooldown) {
+            if candidate != target_current
+                && eligible(
+                    candidate,
+                    current,
+                    source,
+                    || *time.get_or_insert_with(&mut now),
+                    cooldown,
+                )
+            {
+                let stamp = *time.get_or_insert_with(&mut now);
                 registry::unlink_ready(candidate);
                 (*c).home_cpu = target as u8;
                 (*c).home_cpu_bound = true;
-                (*c).last_migration_tick = now.max(1);
+                (*c).last_migration_tick = stamp.max(1);
+                (*c).last_migration_periodic = false;
                 // Existing ready_order/time, role budgets, task generation,
                 // saved RSP/FPU and exact unwind counter are not re-created.
                 registry::append_ready(candidate);
@@ -172,4 +185,12 @@ pub(crate) unsafe fn pull(
         }
     }
     ptr::null_mut()
+}
+/// # Safety
+/// The exact successful transfer remains resident under the same runtime
+/// admission. This receipt records origin only; it never admits migration.
+pub(crate) unsafe fn mark_periodic(task: *mut Task) {
+    unsafe {
+        (*registry::core(task)).last_migration_periodic = true;
+    }
 }

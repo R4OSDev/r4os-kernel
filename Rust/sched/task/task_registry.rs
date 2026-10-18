@@ -468,28 +468,61 @@ pub(super) unsafe fn link_ready(task: *mut Task) {
         append_ready(task);
     }
 }
-/// Caller has assigned ready_order. Migration uses this only for an empty
-/// target queue, preserving both global ready age and per-rank ordering.
+/// Caller has assigned ready_order. Ordinary new enqueue keeps its linked-tail
+/// fast path. An older migration uses the four existing rank AVL roots to find
+/// its global successor, preserving global FIFO and every rank's order.
 pub(super) unsafe fn append_ready(task: *mut Task) {
     unsafe {
         let c = core(task);
         assert!(!(*c).ready_linked);
         let q = queue_for(task);
         (*c).ready_rank = dispatch_rank(task);
-        task_index::insert(
+        let rank = (*c).ready_rank as usize;
+        let same_rank = task_index::insert(
             ptr::addr_of_mut!((*q).ranks[(*c).ready_rank as usize]),
             task.cast(),
             READY_OFFSET,
             ready_before,
         );
-        (*c).ready_prev = (*q).tail;
-        (*c).ready_next = null_mut();
-        if (*q).tail.is_null() {
+        let mut following = null_mut::<Task>();
+        if !(*q).tail.is_null() && ready_before(task.cast(), (*q).tail.cast()) {
+            following = same_rank.following.cast();
+            for other in 0..ROLE_COUNT {
+                if other == rank {
+                    continue;
+                }
+                let found = task_index::neighbors(
+                    ptr::addr_of_mut!((*q).ranks[other]),
+                    task.cast(),
+                    READY_OFFSET,
+                    ready_before,
+                )
+                .following
+                .cast::<Task>();
+                if !found.is_null()
+                    && (following.is_null() || ready_before(found.cast(), following.cast()))
+                {
+                    following = found;
+                }
+            }
+        }
+        let previous = if following.is_null() {
+            (*q).tail
+        } else {
+            (*core(following)).ready_prev
+        };
+        (*c).ready_prev = previous;
+        (*c).ready_next = following;
+        if previous.is_null() {
             (*q).head = task;
         } else {
-            (*core((*q).tail)).ready_next = task;
+            (*core(previous)).ready_next = task;
         }
-        (*q).tail = task;
+        if following.is_null() {
+            (*q).tail = task;
+        } else {
+            (*core(following)).ready_prev = task;
+        }
         (*c).ready_linked = true;
         if (*q).warning_cursor.is_null() {
             (*q).warning_cursor = task;

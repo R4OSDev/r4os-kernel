@@ -44,6 +44,7 @@ impl CpuState {
 }
 struct State {
     cpu: [CpuState; MAX_CPUS],
+    balance_at: [u64; MAX_CPUS],
     yield_count: u64,
     sleep_count: u64,
     wake_count: u64,
@@ -110,6 +111,7 @@ struct State {
 impl State {
     const EMPTY: Self = Self {
         cpu: [CpuState::EMPTY; MAX_CPUS],
+        balance_at: [0; MAX_CPUS],
         yield_count: 0,
         sleep_count: 0,
         wake_count: 0,
@@ -747,7 +749,7 @@ fn park_blocked(task: Task) {
     runtime::restore_runtime(flags);
 }
 // Runtime admission covers queue transfer, exact target publication and IPI.
-fn balance_ready(target: u32, source: u32) -> Task {
+fn balance_ready(target: u32, source: u32, now: impl FnMut() -> u64) -> Task {
     if !cpu_state(target).initialized {
         return ptr::null_mut();
     }
@@ -757,7 +759,7 @@ fn balance_ready(target: u32, source: u32) -> Task {
             target,
             cpu_state(source).current.cast(),
             cpu_state(target).current.cast(),
-            tick(),
+            now,
             QUANTUM,
         )
     };
@@ -776,15 +778,30 @@ fn refill_ready() {
     if ready_count() != 0 || !enabled() {
         return;
     }
+    refill_from_sources(target, tick);
+}
+fn balance_checkpoint(now: u64) {
+    let index = slot(percpu::current_index());
+    if now < read(|s| s.balance_at[index]) {
+        return;
+    }
+    change(|s| s.balance_at[index] = now.saturating_add(QUANTUM));
+    let moved = refill_from_sources(percpu::current_index(), || now);
+    if !moved.is_null() {
+        unsafe { super::task::balance::mark_periodic(moved.cast()) };
+    }
+}
+fn refill_from_sources(target: u32, now: impl FnMut() -> u64) -> Task {
     let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
     if online.count_ones() < 2 {
-        return;
+        return ptr::null_mut();
     }
     let start = local().balance_next_cpu;
     for offset in 0..MAX_CPUS as u32 {
         let source = (start + offset) % MAX_CPUS as u32;
         if source == target
             || online & (1 << source) == 0
+            || !cpu_state(source).initialized
             || !unsafe {
                 super::task::balance::imbalanced(
                     source,
@@ -799,24 +816,23 @@ fn refill_ready() {
         // One donor and at most eight candidates per attempt. Rotate donors
         // even when their bounded prefix contains only bound tasks.
         local_change(|s| s.balance_next_cpu = (source + 1) % MAX_CPUS as u32);
-        balance_ready(target, source);
-        return;
+        return balance_ready(target, source, now);
     }
+    ptr::null_mut()
 }
-fn balance_idle(source: u32, ready_time: u64) -> Task {
+fn balance_wake(source: u32, ready_time: u64) -> Task {
     let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
-    if all_current_have_work(online & !(1 << source)) {
-        return ptr::null_mut();
-    }
     let current = cpu_state(source).current.cast();
-    if unsafe { super::task::balance::workload(source, current) } <= 1
+    let source_load = unsafe { super::task::balance::workload(source, current) };
+    if source_load <= 1
+        || (source_load <= 2 && all_current_have_work(online & !(1 << source)))
         || unsafe {
             super::task::balance::singleton_blocked(source, current, || ready_time, QUANTUM)
         }
     {
         return ptr::null_mut();
     }
-    let mut idle = 0;
+    let mut targets = 0;
     let mut loads = [0usize; MAX_CPUS];
     for (index, load) in loads.iter_mut().enumerate() {
         let cpu = index as u32;
@@ -825,17 +841,19 @@ fn balance_idle(source: u32, ready_time: u64) -> Task {
         }
         let running = cpu_state(cpu).current;
         *load = unsafe { super::task::balance::workload(cpu, running.cast()) };
-        if cpu != source && *load == 0 && !running.is_null() && view(running).cpu_idle {
-            idle |= 1 << cpu;
+        if cpu != source && !running.is_null() && source_load > load.saturating_add(1) {
+            targets |= 1 << cpu;
         }
     }
     super::placement::choose(
-        idle,
+        targets,
         &loads,
         crate::platform::cpu_topology::domains(),
         Some(source),
     )
-    .map_or(ptr::null_mut(), |target| balance_ready(target, source))
+    .map_or(ptr::null_mut(), |target| {
+        balance_ready(target, source, || ready_time)
+    })
 }
 // Runtime admission retains this exact published Ready task. Also used by the
 // existing live diagnostic after releasing its own temporary affinity pin.
@@ -845,7 +863,7 @@ fn balance_idle(source: u32, ready_time: u64) -> Task {
 pub(crate) fn notify_ready(task: Task) {
     let item = view(task);
     let target = item.home_cpu;
-    let moved = balance_idle(target, item.ready_since_tick);
+    let moved = balance_wake(target, item.ready_since_tick);
     // The exact sole Ready task has already been published and notified on
     // its real destination. An empty former queue needs no source IPI.
     // Retain the original source notification whenever other Ready work stays.
@@ -1107,6 +1125,11 @@ fn timer_preemption(now: u64, preemptible: bool) -> bool {
     }
     if view(running).cpu_idle {
         refill_ready();
+    } else {
+        // Use the already published functional IRQ time. Nonempty destinations
+        // receive at most one bounded donor attempt per CPU and quantum; urgent
+        // empty/idle refill remains independent of this periodic deadline.
+        balance_checkpoint(now);
     }
     if ready_count() == 0 {
         set_pending(false);

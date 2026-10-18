@@ -78,7 +78,7 @@ fn release(source: u32) -> Result<Option<(u32, u64)>, ()> {
             || ready_count(source) != 1
             || balance::workload(source, parent) != 2
             || balance::workload(target, idle) != 0
-            || !balance::pull(source, target, parent, idle, timer::tick_count(), 1).is_null()
+            || !balance::pull(source, target, parent, idle, timer::tick_count, 1).is_null()
             || facts(t) != before
             || facts(parent) != parent_before
         {

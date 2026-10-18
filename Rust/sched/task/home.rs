@@ -82,6 +82,7 @@ pub(super) unsafe fn select(task: *mut Task) {
         if let Some(target) = placement::choose(mask, &loads, cpu_topology::domains(), previous) {
             if previous.is_some() && target != old {
                 (*c).last_migration_tick = now.max(1);
+                (*c).last_migration_periodic = false;
             }
             (*c).home_cpu = target as u8;
             (*c).home_cpu_bound = true;

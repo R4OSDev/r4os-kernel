@@ -128,6 +128,31 @@ unsafe fn rebalance(index: *mut Index, start: Node, offset: usize) {
     }
 }
 /// # Safety
+/// Caller retains the index owner and stable ordered records. The probe need
+/// not belong to this index. Search one AVL path, without touching membership.
+pub(crate) unsafe fn neighbors(
+    index: *mut Index,
+    probe: Node,
+    offset: usize,
+    less: Less,
+) -> Neighbors {
+    unsafe {
+        let mut result = Neighbors::default();
+        let mut cursor = (*index).root;
+        while !cursor.is_null() {
+            (*index).visits = (*index).visits.wrapping_add(1);
+            if less(probe, cursor) {
+                result.following = cursor;
+                cursor = (*links(cursor, offset)).left;
+            } else {
+                result.previous = cursor;
+                cursor = (*links(cursor, offset)).right;
+            }
+        }
+        result
+    }
+}
+/// # Safety
 /// Caller serializes aligned stable records and valid memberships. The offset
 /// selects Links in each node; ordering is pure and cannot wait or reschedule.
 pub unsafe fn insert(index: *mut Index, node: Node, offset: usize, less: Less) -> Neighbors {
