@@ -3,6 +3,7 @@ pub mod boot;
 pub mod clock_math;
 pub mod clocksource;
 pub mod cpu;
+pub(crate) mod cpu_identity;
 pub mod device_inventory;
 pub mod firmware_tables;
 pub mod firmware_view;

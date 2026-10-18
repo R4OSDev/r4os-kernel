@@ -1,6 +1,6 @@
 //! Single IOAPIC selector/window and routing owner. Existing runtime admission
 //! serializes each MMIO transaction; no global reference crosses a C callback.
-use super::runtime::RuntimeGuard;
+use super::{runtime::RuntimeGuard, smp};
 use crate::memory::{paging, phys};
 use core::{
     cell::UnsafeCell,
@@ -10,7 +10,6 @@ const AVAILABLE: u32 = 1;
 const MAPPED: u32 = 2;
 const ROUTING: u32 = 4;
 const MASKED: u32 = 1 << 16;
-const MAX_CPUS: u32 = 32;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Iso {
@@ -26,9 +25,9 @@ pub struct Input {
     pub gsi_base: u32,
     pub ioapic_count: u32,
     pub iso_count: u32,
+    pub bsp_id: u32,
     pub madt_id: u8,
-    pub bsp_id: u8,
-    pub reserved: [u8; 2],
+    pub reserved: [u8; 3],
     pub isos: [Iso; 16],
 }
 #[repr(C)]
@@ -45,7 +44,7 @@ pub struct IrqRoute {
     pub flags: u16,
     pub irq: u8,
     pub vector: u8,
-    pub target_lapic: u8,
+    pub target_lapic: u32,
     pub redir_index: u8,
     pub present: bool,
     pub in_range: bool,
@@ -200,6 +199,9 @@ fn program(value: Status, route: IrqRoute) -> bool {
     if !route.present || !route.in_range {
         return false;
     }
+    let Some(high) = smp::irq_redirection(route.target_lapic) else {
+        return false;
+    };
     let low_register = 0x10 + route.redir_index * 2;
     let mut low = u32::from(route.vector);
     if route.flags & 3 == 3 {
@@ -208,7 +210,7 @@ fn program(value: Status, route: IrqRoute) -> bool {
     if (route.flags >> 2) & 3 == 3 {
         low |= 1 << 15;
     }
-    write_reg(value, low_register + 1, u32::from(route.target_lapic) << 24);
+    write_reg(value, low_register + 1, high);
     write_reg(value, low_register, low);
     true
 }
@@ -220,22 +222,9 @@ fn refresh(mut value: Status, index: u8) -> Status {
     }
     value
 }
-fn choose_target() -> u8 {
-    let fallback = inputs().bsp_id;
-    if unsafe { ioapic_cpu_mask() }.count_ones() <= 1 {
-        return fallback;
-    }
-    for _ in 0..MAX_CPUS {
-        let index = NEXT_RUNTIME_TARGET.fetch_add(1, Ordering::Relaxed) % MAX_CPUS;
-        if index == 0 {
-            continue;
-        }
-        let mut apic_id = 0;
-        if unsafe { ioapic_cpu_id(index, &mut apic_id) } && apic_id <= 0xff {
-            return apic_id as u8;
-        }
-    }
-    fallback
+fn choose_target() -> Option<u32> {
+    smp::legacy_irq_target(NEXT_RUNTIME_TARGET.fetch_add(1, Ordering::Relaxed))
+        .map(|target| target.apic_id)
 }
 pub fn init(input: Input) -> Status {
     let _owner = RuntimeGuard::acquire();
@@ -285,6 +274,15 @@ fn activate_routes(mut value: Status) -> bool {
         log(3, value);
         return false;
     }
+    let Some(target) = smp::legacy_irq_target(0) else {
+        value.reason = 6;
+        publish(value);
+        log(4, value);
+        return false;
+    };
+    for slot in [0, 1, 3] {
+        value.routes[slot].target_lapic = target.apic_id;
+    }
     for index in 0..=value.max_redirection_entry {
         let low = 0x10 + index * 2;
         write_reg(value, low, read_reg(value, low) | MASKED);
@@ -330,6 +328,14 @@ pub extern "C" fn r4os_rust_ioapic_control(operation: u8, irq: u8, masked: bool)
         1 => {
             let register = 0x10 + route.redir_index * 2;
             let low = read_reg(value, register);
+            if !masked {
+                // Unmasking is a fresh grant. Validate the real programmed
+                // physical destination; masking remains possible for teardown.
+                let high = read_reg(value, register + 1);
+                if low & (1 << 11) != 0 || smp::irq_redirection(high >> 24).is_none() {
+                    return false;
+                }
+            }
             write_reg(
                 value,
                 register,
@@ -343,7 +349,10 @@ pub extern "C" fn r4os_rust_ioapic_control(operation: u8, irq: u8, masked: bool)
         }
         3 => {
             route.flags = 0x000f;
-            route.target_lapic = choose_target();
+            let Some(target) = choose_target() else {
+                return false;
+            };
+            route.target_lapic = target;
             if !program(value, route) {
                 return false;
             }
@@ -392,36 +401,19 @@ pub fn reason_name(code: u8) -> &'static [u8] {
         3 => b"MMIO mapped, redirection table visible, routing unchanged",
         4 => b"legacy IRQ0/1/12 routed through IOAPIC",
         5 => b"IOAPIC routing incomplete, PIC fallback required",
+        6 => b"no live conventional IOAPIC destination; routing unchanged",
         _ => panic!("Invalid ioapic diagnostic code"),
     }
 }
 const _: () = {
     assert!(core::mem::size_of::<Iso>() == 8);
-    assert!(core::mem::size_of::<Input>() == 148);
-    assert!(core::mem::offset_of!(Input, isos) == 20);
+    assert!(core::mem::size_of::<Input>() == 152);
+    assert!(core::mem::offset_of!(Input, isos) == 24);
     assert!(core::mem::size_of::<RedirectionEntry>() == 12);
     assert!(core::mem::size_of::<IrqRoute>() == 16);
     assert!(core::mem::size_of::<Status>() == 144);
     assert!(core::mem::offset_of!(Status, routes) == 80);
 };
-
-unsafe fn ioapic_cpu_mask() -> u64 {
-    crate::arch::percpu::r4os_rust_percpu_control(14, 0, 0, 0)
-}
-
-unsafe fn ioapic_cpu_id(index: u32, output: *mut u32) -> bool {
-    if crate::arch::percpu::r4os_rust_percpu_control(13, index, 0, 0) == 0 {
-        return false;
-    }
-    let id = crate::arch::percpu::r4os_rust_percpu_control(8, index, 0, 0);
-    if id == u64::MAX {
-        return false;
-    }
-    unsafe {
-        output.write(u32::try_from(id).unwrap());
-    }
-    true
-}
 
 unsafe fn ioapic_log(event: u8, status: *const Status) {
     use crate::boot::log::{
@@ -466,15 +458,7 @@ unsafe fn ioapic_log(event: u8, status: *const Status) {
             puts(b" route_irq12_gsi=");
             dec(u64::from(s.routes[3].gsi));
             puts(b" reason=");
-            puts(match s.reason {
-                0 => b"not initialized",
-                1 => b"MADT has no IOAPIC",
-                2 => b"IOAPIC MMIO mapping failed",
-                3 => b"MMIO mapped, redirection table visible, routing unchanged",
-                4 => b"legacy IRQ0/1/12 routed through IOAPIC",
-                5 => b"IOAPIC routing incomplete, PIC fallback required",
-                _ => unreachable!(),
-            });
+            puts(reason_name(s.reason));
             puts(b"\r\n");
         }
         1 => {
@@ -496,6 +480,7 @@ unsafe fn ioapic_log(event: u8, status: *const Status) {
         }
         2 => puts(b"[IOAPIC][WARN] legacy route activation skipped, IOAPIC not mapped\r\n"),
         3 => puts(b"[IOAPIC][WARN] legacy route activation skipped, route out of range\r\n"),
+        4 => puts(b"[IOAPIC][WARN] no live conventional destination; legacy routing unchanged\r\n"),
         _ => unreachable!(),
     }
 }
@@ -516,7 +501,7 @@ unsafe fn ioapic_inputs(output: *mut Input) {
         iso_count: info.madt_iso_count,
         madt_id: info.madt_first_ioapic_id,
         bsp_id: local.id,
-        reserved: [0; 2],
+        reserved: [0; 3],
         isos: [Iso::default(); 16],
     };
     for (destination, source) in value

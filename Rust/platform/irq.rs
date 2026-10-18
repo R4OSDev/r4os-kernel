@@ -27,7 +27,7 @@ pub struct Status {
     pub iso_count: u32,
     pub nmi_count: u32,
     pub lapic_address: u64,
-    pub lapic_id: u8,
+    pub lapic_id: u32,
     pub lapic_version: u8,
     pub lapic_svr: u32,
     pub first_ioapic_id: u8,
@@ -272,6 +272,6 @@ pub unsafe extern "C" fn r4os_rust_irq_view_status(output: *mut Status) {
     unsafe { output.write(snapshot()) };
 }
 const _: () = {
-    assert!(core::mem::size_of::<Status>() == 104);
-    assert!(core::mem::offset_of!(Status, fallback_reason) == 100);
+    assert!(core::mem::size_of::<Status>() == 112);
+    assert!(core::mem::offset_of!(Status, fallback_reason) == 104);
 };

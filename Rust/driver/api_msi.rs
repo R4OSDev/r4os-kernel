@@ -1,7 +1,7 @@
 //! Original eight single-message MSI/MSI-X ownership and explicit rollback.
 //! No hardware release is published until its exact configuration readback.
 use crate::{
-    arch::smp,
+    arch::{apic_target::Target, smp},
     contract as a,
     driver::{api_admission as admission, api_platform as platform, utilities},
 };
@@ -43,6 +43,7 @@ struct Record {
     address_high: u32,
     data: u32,
     vector_control: u32,
+    target: Option<Target>,
 }
 impl Record {
     const EMPTY: Self = Self {
@@ -64,6 +65,7 @@ impl Record {
         address_high: 0,
         data: 0,
         vector_control: 0,
+        target: None,
     };
 }
 struct Storage(UnsafeCell<[Record; 8]>);
@@ -165,10 +167,11 @@ fn enable_msix(
     id: u32,
     slot: usize,
     irq: u8,
-    vector: u32,
     cap: u16,
     status: u32,
+    target: Target,
 ) -> i32 {
+    let vector = 32 + u32::from(irq);
     let header = d.read(cap);
     if header == u32::MAX {
         return -1;
@@ -209,6 +212,9 @@ fn enable_msix(
         return -8;
     }
     let table = region.virt_addr + u64::from(g.offset);
+    let Some(message) = smp::irq_message(target, vector) else {
+        return -8;
+    };
     let candidate = Record {
         used: true,
         msix: true,
@@ -223,16 +229,16 @@ fn enable_msix(
         address_high: read_table(table, 4),
         data: read_table(table, 8),
         vector_control: read_table(table, 12),
+        target: Some(target),
     };
     let masked = (control & !0x8000) | 0x4000;
     if !write_control(d, cap, header, masked) {
         return -4;
     }
     write_table(table, 12, candidate.vector_control | 1);
-    let target = smp::r4os_rust_smp_control(5, (slot + 1) as u32) as u32;
-    write_table(table, 0, 0xfee0_0000 | (target << 12));
+    write_table(table, 0, message.address);
     write_table(table, 4, 0);
-    write_table(table, 8, vector);
+    write_table(table, 8, message.data);
     fence();
     if !write_control(d, cap, header, masked | 0x8000)
         || !write_control(d, cap, header, (control | 0x8000) & !0x4000)
@@ -288,7 +294,17 @@ pub extern "C" fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, fun
         {
             continue;
         }
-        return if r.owner == id { i32::from(r.irq) } else { -6 };
+        return if r.owner != id {
+            -6
+        } else if r
+            .target
+            .and_then(|t| smp::irq_message(t, 32 + u32::from(r.irq)))
+            .is_some()
+        {
+            i32::from(r.irq)
+        } else {
+            -8
+        };
     }
     let status = d.read(4);
     if status == u32::MAX || status & (1 << 20) == 0 {
@@ -336,8 +352,13 @@ pub extern "C" fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, fun
     }
     let irq = 24 + slot as u8;
     let vector = 32 + u32::from(irq);
+    let Some(target) = smp::legacy_irq_target((slot + 1) as u32) else {
+        // No conventional physical destination: leave device configuration,
+        // MSI-X table and the ownership record untouched.
+        return -8;
+    };
     if cap == 0 {
-        return enable_msix(d, id, slot, irq, vector, msix, status);
+        return enable_msix(d, id, slot, irq, msix, status, target);
     }
     let header = d.read(cap);
     if header == u32::MAX {
@@ -348,15 +369,17 @@ pub extern "C" fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, fun
         return -7;
     }
     let wide = control & (1 << 7) != 0;
-    let address = 0xfee0_0000 | ((smp::r4os_rust_smp_control(5, (slot + 1) as u32) as u32) << 12);
-    if !d.write(cap + 4, address) {
+    let Some(message) = smp::irq_message(target, vector) else {
+        return -8;
+    };
+    if !d.write(cap + 4, message.address) {
         return -4;
     }
     if wide {
-        if !d.write(cap + 8, 0) || !d.write(cap + 12, vector) {
+        if !d.write(cap + 8, 0) || !d.write(cap + 12, message.data) {
             return -4;
         }
-    } else if !d.write(cap + 8, vector) {
+    } else if !d.write(cap + 8, message.data) {
         return -4;
     }
     let candidate = Record {
@@ -367,6 +390,7 @@ pub extern "C" fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, fun
         capability: cap,
         control,
         command: status as u16,
+        target: Some(target),
         ..Record::EMPTY
     };
     if !d.write(
@@ -405,6 +429,12 @@ pub extern "C" fn r4os_rust_driver_msi_unmask(id: u32, irq: u8) -> bool {
         let r = unsafe { (*STATE.0.get())[i] };
         if !r.used || !r.msix || r.owner != id || r.irq != irq {
             continue;
+        }
+        if r.target
+            .and_then(|target| smp::irq_message(target, 32 + u32::from(r.irq)))
+            .is_none()
+        {
+            return false;
         }
         let control = read_table(r.table, 12);
         write_table(r.table, 12, control & !1);

@@ -1,4 +1,5 @@
 pub(crate) mod ap_admission;
+pub(crate) mod apic_target;
 pub mod callback_abort;
 pub mod fpu;
 pub mod hpet;

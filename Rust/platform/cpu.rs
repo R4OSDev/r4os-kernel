@@ -8,20 +8,7 @@ use core::{
 /// Local architectural identity, independent of the BSP's inventory/model.
 /// The early 32-bit trampoline applies the same hierarchy before MSR writes.
 pub(crate) fn local_apic_id() -> u32 {
-    use core::arch::x86_64::__cpuid_count as query;
-    let maximum = query(0, 0).eax;
-    for leaf in [0x1f, 0x0b] {
-        if maximum >= leaf {
-            let value = query(leaf, 0);
-            if value.ebx & 0xffff != 0 && value.ecx & 0xff00 != 0 {
-                return value.edx;
-            }
-        }
-    }
-    if query(0x8000_0000, 0).eax >= 0x8000_001e && query(0x8000_0001, 0).ecx & (1 << 22) != 0 {
-        return query(0x8000_001e, 0).eax;
-    }
-    query(1, 0).ebx >> 24
+    super::cpu_identity::identify(core::arch::x86_64::__cpuid_count)
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -71,7 +58,7 @@ pub struct Status {
     pub display_model: u16,
     pub display_family: u16,
     pub processor_type: u8,
-    pub apic_id: u8,
+    pub apic_id: u32,
     pub logical_processors: u8,
     pub clflush_line_bytes: u16,
     pub physical_address_bits: u8,
@@ -182,7 +169,7 @@ pub fn detect() -> Status {
         if value.base_family == 6 || value.base_family == 15 {
             value.display_model += model << 4;
         }
-        value.apic_id = (r.ebx >> 24) as u8;
+        value.apic_id = local_apic_id();
         value.logical_processors = (r.ebx >> 16) as u8;
         value.clflush_line_bytes = u16::from((r.ebx >> 8) as u8) * 8;
         value.features.tsc = bit(r.edx, 4);
@@ -302,7 +289,7 @@ pub extern "C" fn r4os_rust_cpu_control(operation: u8, value: u64) -> u64 {
             OSXSAVE.store(true, Ordering::Release);
             0
         }
-        7 => u64::from(cpuid(1, 0).ebx >> 24),
+        7 => u64::from(local_apic_id()),
         _ => panic!("Invalid private CPU operation"),
     }
 }
@@ -320,8 +307,8 @@ pub unsafe extern "C" fn r4os_rust_cpu_status(output: *mut Status) {
 }
 const _: () = {
     assert!(core::mem::size_of::<Features>() == 28);
-    assert!(core::mem::size_of::<Status>() == 184);
-    assert!(core::mem::offset_of!(Status, features) == 152);
+    assert!(core::mem::size_of::<Status>() == 192);
+    assert!(core::mem::offset_of!(Status, features) == 160);
     assert!(core::mem::offset_of!(Status, vendor_len) == 16);
 };
 

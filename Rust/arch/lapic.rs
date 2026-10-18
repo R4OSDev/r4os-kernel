@@ -1,6 +1,6 @@
 //! CPU-local APIC registers/IPIs and the single BSP timer state. AP timer
 //! calibration never mutates BSP state. EOI/TLB IPIs never acquire runtime.
-use super::{hpet, msr, runtime::RuntimeGuard};
+use super::{apic_target, hpet, msr, percpu, runtime::RuntimeGuard};
 use crate::{
     build_config::config,
     memory::{paging, phys},
@@ -49,7 +49,7 @@ pub struct Status {
     pub timer_divide: u32,
     pub timer_lvt: u32,
     pub calibration_lapic_ticks: u32,
-    pub id: u8,
+    pub id: u32,
     pub version: u8,
     pub max_lvt: u8,
     pub timer_vector: u8,
@@ -102,6 +102,7 @@ static FLAGS: AtomicU32 = AtomicU32::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static CURRENT_COUNT: AtomicU32 = AtomicU32::new(0);
 static HZ: AtomicU32 = AtomicU32::new(0);
+static BSP_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn state() -> Status {
     let mut value = unsafe { *STATE.0.get() };
@@ -145,6 +146,22 @@ pub fn is_enabled() -> bool {
     FLAGS.load(Ordering::Acquire) & (ENABLED | SOFTWARE) == (ENABLED | SOFTWARE)
         && (BASE.load(Ordering::Acquire) != 0 || MODE_X2.load(Ordering::Acquire))
 }
+pub(crate) fn bsp_apic_id() -> Option<u32> {
+    if !is_enabled() {
+        return None;
+    }
+    u32::try_from(BSP_ID.load(Ordering::Acquire)).ok()
+}
+fn local_id() -> u32 {
+    if MODE_X2.load(Ordering::Acquire) {
+        read(ID)
+    } else {
+        read(ID) >> 24
+    }
+}
+pub(crate) fn can_target(id: u32) -> bool {
+    is_enabled() && apic_target::icr(u64::from(id), 0xf0, MODE_X2.load(Ordering::Acquire)).is_some()
+}
 pub(crate) fn local_capabilities_valid() -> bool {
     let features = core::arch::x86_64::__cpuid_count(1, 0);
     features.edx & ((1 << 5) | (1 << 9)) == (1 << 5) | (1 << 9)
@@ -161,6 +178,9 @@ fn init_current() -> bool {
     unsafe { msr::write(APIC_BASE, base) };
     write(SVR, (read(SVR) & !0xff) | 0x100 | 0xff);
     read(SVR) & 0x100 != 0
+        && local_id() == crate::platform::cpu::local_apic_id()
+        && u64::from(local_id())
+            == percpu::r4os_rust_percpu_control(8, percpu::current_index(), 0, 0)
 }
 fn map(base: u64) -> bool {
     let page = base & !4095;
@@ -171,7 +191,12 @@ fn map(base: u64) -> bool {
     BASE.store(phys::r4os_rust_phys_to_virt(base), Ordering::Release);
     true
 }
-pub fn init(address: u64, enabled_count: u32, supports_x2: bool) -> Status {
+pub fn init(
+    address: u64,
+    enabled_count: u32,
+    supports_x2: bool,
+    topology_needs_x2: bool,
+) -> Status {
     let _owner = RuntimeGuard::acquire();
     let mut value = Status {
         phys_base: address,
@@ -179,6 +204,8 @@ pub fn init(address: u64, enabled_count: u32, supports_x2: bool) -> Status {
         ..Status::EMPTY
     };
     BASE.store(0, Ordering::Release);
+    MODE_X2.store(false, Ordering::Release);
+    BSP_ID.store(u64::MAX, Ordering::Release);
     TICKS.store(0, Ordering::Relaxed);
     if address == 0 || enabled_count == 0 {
         publish(value);
@@ -194,11 +221,20 @@ pub fn init(address: u64, enabled_count: u32, supports_x2: bool) -> Status {
     if value.phys_base == 0 {
         value.phys_base = value.msr_base;
     }
-    if config::FORCE_X2APIC && !value.has(X2APIC) && supports_x2 {
+    let expected = crate::platform::cpu::local_apic_id();
+    let needs_x2 = apic_target::legacy_id(u64::from(expected)).is_none();
+    if (config::FORCE_X2APIC || needs_x2 || topology_needs_x2) && !value.has(X2APIC) && supports_x2
+    {
         unsafe { msr::write(APIC_BASE, apic_base | BASE_ENABLE | BASE_X2) };
         let forced = unsafe { msr::read(APIC_BASE) };
         value.set(X2APIC, forced & BASE_X2 != 0);
         value.set(ENABLED, forced & BASE_ENABLE != 0);
+    }
+    if expected == u32::MAX
+        || (needs_x2 && !value.has(X2APIC))
+        || (value.has(X2APIC) && !supports_x2)
+    {
+        crate::boot::fatal::kernel(11, b"bsp-apic-transport");
     }
     if value.has(X2APIC) {
         MODE_X2.store(true, Ordering::Release);
@@ -206,7 +242,7 @@ pub fn init(address: u64, enabled_count: u32, supports_x2: bool) -> Status {
             unsafe { msr::write(APIC_BASE, msr::read(APIC_BASE) | BASE_ENABLE | BASE_X2) };
             value.flags |= ENABLED;
         }
-        value.id = read(ID) as u8;
+        value.id = read(ID);
         value.reason = 2;
     } else {
         if value.phys_base == 0 {
@@ -226,9 +262,13 @@ pub fn init(address: u64, enabled_count: u32, supports_x2: bool) -> Status {
             unsafe { msr::write(APIC_BASE, apic_base | BASE_ENABLE) };
             value.flags |= ENABLED;
         }
-        value.id = (read(ID) >> 24) as u8;
+        value.id = read(ID) >> 24;
         value.reason = 5;
     }
+    if value.id != expected || u64::from(expected) != percpu::r4os_rust_percpu_control(8, 0, 0, 0) {
+        crate::boot::fatal::kernel(11, b"bsp-apic-identity");
+    }
+    BSP_ID.store(u64::from(value.id), Ordering::Release);
     let version = read(VERSION);
     value.version = version as u8;
     value.max_lvt = (version >> 16) as u8;
@@ -286,16 +326,23 @@ fn start_secondary(requested_hz: u32) -> bool {
     write(INITIAL, initial as u32);
     true
 }
-fn write_icr(apic_id: u32, low: u32) -> bool {
-    if MODE_X2.load(Ordering::Acquire) {
-        unsafe { msr::write(0x830, (u64::from(apic_id) << 32) | u64::from(low)) };
-        return true;
-    }
-    if apic_id > 0xff || BASE.load(Ordering::Acquire) == 0 {
+fn write_icr(apic_id: u64, low: u32) -> bool {
+    if !is_enabled() {
         return false;
     }
-    write(ICR + 0x10, apic_id << 24);
-    write(ICR, low);
+    let x2 = MODE_X2.load(Ordering::Acquire);
+    let Some(message) = apic_target::icr(apic_id, low, x2) else {
+        return false;
+    };
+    if x2 {
+        unsafe { msr::write(0x830, message.msr()) };
+        return true;
+    }
+    if BASE.load(Ordering::Acquire) == 0 {
+        return false;
+    }
+    write(ICR + 0x10, message.high);
+    write(ICR, message.low);
     true
 }
 fn wait_icr() -> bool {
@@ -325,7 +372,7 @@ fn delay_microseconds(microseconds: u64) {
         spins -= 1;
     }
 }
-fn init_sipi(apic_id: u32, vector: u8) -> bool {
+fn init_sipi(apic_id: u64, vector: u8) -> bool {
     if !is_enabled() || vector == 0 {
         return false;
     }
@@ -476,16 +523,16 @@ pub extern "C" fn r4os_rust_lapic_control(operation: u8, a: u64, b: u32) -> u64 
         0 => return u64::from(is_enabled()),
         1 => return u64::from(init_current()),
         2 => {
-            return u64::from(if MODE_X2.load(Ordering::Acquire) {
-                read(ID)
+            return if is_enabled() {
+                u64::from(local_id())
             } else {
-                read(ID) >> 24
-            });
+                u64::MAX
+            };
         }
         3 => return u64::from(start_secondary(b)),
-        4 => return u64::from(init_sipi(a as u32, b as u8)),
-        5 | 6 => return u64::from(write_icr(a as u32, b) && wait_icr()),
-        7 => return u64::from(is_enabled() && b >= 0x20 && write_icr(a as u32, b) && wait_icr()),
+        4 => return u64::from(u8::try_from(b).is_ok_and(|vector| init_sipi(a, vector))),
+        5 | 6 => return u64::from(write_icr(a, b) && wait_icr()),
+        7 => return u64::from(write_icr(a, b) && wait_icr()),
         8 => {
             if is_enabled() {
                 write(EOI, 0);
@@ -530,17 +577,6 @@ pub extern "C" fn r4os_rust_lapic_control(operation: u8, a: u64, b: u32) -> u64 
     }
 }
 /// # Safety
-/// BSP startup supplies aligned writable fixed C output; feature bit is detected.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_lapic_init(
-    address: u64,
-    enabled_count: u32,
-    supports_x2: bool,
-    output: *mut Status,
-) {
-    unsafe { output.write(init(address, enabled_count, supports_x2)) };
-}
-/// # Safety
 /// Caller owns one aligned writable fixed C output until return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_lapic_status(output: *mut Status) {
@@ -569,9 +605,9 @@ pub fn timer_reason_name(code: u8) -> &'static [u8] {
     }
 }
 const _: () = {
-    assert!(core::mem::size_of::<Status>() == 80);
+    assert!(core::mem::size_of::<Status>() == 88);
     assert!(core::mem::offset_of!(Status, flags) == 40);
-    assert!(core::mem::offset_of!(Status, timer_reason) == 77);
+    assert!(core::mem::offset_of!(Status, timer_reason) == 80);
 };
 
 unsafe fn lapic_log(event: u8, status: *const Status) {

@@ -180,11 +180,11 @@ fn refresh(index: usize) {
         (*stats(index)).shared = shared;
     }
 }
-fn enable(irq: u8, flags: u32) {
+fn enable(irq: u8, flags: u32) -> bool {
     let index = irq as usize;
     if flags & 4 != 0 {
         unsafe { (*stats(index)).masked = 0 };
-        return;
+        return true;
     }
     if ioapic::r4os_rust_ioapic_control(0, 0, false) {
         if flags & 2 != 0 && ioapic::r4os_rust_ioapic_control(3, irq, false) {
@@ -192,20 +192,23 @@ fn enable(irq: u8, flags: u32) {
                 pic::unmask(irq);
             }
             unsafe { (*stats(index)).masked = 0 };
-            return;
+            return true;
         }
         if ioapic::r4os_rust_ioapic_control(2, irq, false) {
             if irq < 16 {
                 pic::unmask(irq);
             }
             unsafe { (*stats(index)).masked = 0 };
-            return;
+            return true;
         }
+        return false;
     }
     if irq < 16 {
         pic::unmask(irq);
         unsafe { (*stats(index)).masked = 0 };
+        return true;
     }
+    false
 }
 fn disable(irq: u8) {
     if ioapic::r4os_rust_ioapic_control(0, 0, false) {
@@ -251,7 +254,13 @@ fn register_inner(irq: u8, handler: Handler, context: usize, flags: u32, owner: 
         })
     };
     refresh(index);
-    enable(irq, flags);
+    if !enable(irq, flags) {
+        // The existing runtime owner also serializes dispatch. Withdraw only
+        // this unpublished hardware grant; existing shared handlers remain.
+        unsafe { entry(index, slot).write(Entry::EMPTY) };
+        refresh(index);
+        return -5;
+    }
     0
 }
 /// # Safety

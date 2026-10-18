@@ -129,6 +129,12 @@ pub fn init() -> bool {
         info.madt_lapic_address,
         info.madt_lapic_enabled_count,
         cpu::snapshot().features.x2apic,
+        info.madt_cpu_entries
+            .iter()
+            .take((info.madt_lapic_count as usize).min(32))
+            .any(|entry| {
+                entry.flags & 3 != 0 && entry.apic_id >= 0xff && entry.apic_id != u32::MAX
+            }),
     );
     let mut input = ioapic::Input {
         phys_base: info.madt_first_ioapic_address,
@@ -137,7 +143,7 @@ pub fn init() -> bool {
         iso_count: info.madt_iso_count,
         madt_id: info.madt_first_ioapic_id,
         bsp_id: lapic_status().id,
-        reserved: [0; 2],
+        reserved: [0; 3],
         isos: [ioapic::Iso::default(); 16],
     };
     for index in 0..(info.madt_iso_count as usize).min(16) {
@@ -416,9 +422,9 @@ pub unsafe extern "C" fn r4os_rust_irq_boot_status(output: *mut Status) {
 }
 const _: () = {
     assert!(core::mem::size_of::<Handoff>() == 40);
-    assert!(core::mem::size_of::<Status>() == 504);
-    assert!(core::mem::offset_of!(Status, timer_handoff) == 352);
-    assert!(core::mem::offset_of!(Status, final_irq_status) == 392);
+    assert!(core::mem::size_of::<Status>() == 520);
+    assert!(core::mem::offset_of!(Status, timer_handoff) == 360);
+    assert!(core::mem::offset_of!(Status, final_irq_status) == 400);
 };
 
 unsafe fn irq_boot_step(operation: u8) -> bool {

@@ -3,7 +3,9 @@
 //! owns the stop counter. Native per-CPU lifecycle atomics publish AP progress.
 //! Raw Task callbacks bind the native task owner without a second lifecycle.
 use super::{
-    ap_admission, fpu, lapic, msr, pat, percpu, runtime,
+    ap_admission,
+    apic_target::{self, Target},
+    fpu, lapic, msr, pat, percpu, runtime,
     smp_policy::{self, Candidate, MAX_CPUS, Plan},
     tables, tlb,
 };
@@ -162,11 +164,58 @@ fn log(event: u8, index: u32, value: u64, text: &[u8]) {
 }
 fn apic(index: u32) -> Option<u32> {
     let id = percpu::r4os_rust_percpu_control(8, index, 0, 0);
-    if id == u64::MAX {
-        None
-    } else {
-        Some(id as u32)
+    u32::try_from(id).ok()
+}
+fn identity_target(index: u32) -> Option<Target> {
+    if index >= MAX_CPUS as u32 {
+        return None;
     }
+    let id = apic(index)?;
+    let generation = if index == 0 {
+        // The BSP has one confirmed identity for this boot, including the
+        // early phase before the AP plan/epoch has been published.
+        if lapic::bsp_apic_id() != Some(id) || !pat::qualified(0) {
+            return None;
+        }
+        1
+    } else {
+        let generation = epoch();
+        if !ap_admission::qualified(index, id, generation) {
+            return None;
+        }
+        generation
+    };
+    Some(Target {
+        index,
+        apic_id: id,
+        epoch: generation,
+    })
+}
+fn live_target(index: u32) -> Option<Target> {
+    if percpu::state(index) != 4 || percpu::r4os_rust_percpu_control(13, index, 0, 0) == 0 {
+        return None;
+    }
+    identity_target(index)
+}
+pub(crate) fn legacy_irq_target(ordinal: u32) -> Option<Target> {
+    apic_target::select(ordinal, live_target)
+}
+pub(crate) fn irq_message(target: Target, vector: u32) -> Option<apic_target::Message> {
+    if !apic_target::current(target, live_target) {
+        return None;
+    }
+    apic_target::message(u64::from(target.apic_id), vector)
+}
+pub(crate) fn irq_redirection(id: u32) -> Option<u32> {
+    for index in 0..MAX_CPUS as u32 {
+        let Some(target) = live_target(index).filter(|t| t.apic_id == id) else {
+            continue;
+        };
+        if apic_target::current(target, live_target) {
+            return apic_target::redirection_high(u64::from(id));
+        }
+    }
+    None
 }
 fn transition(index: u32, from: u8, to: u8) -> bool {
     percpu::r4os_rust_percpu_control(4, index, u64::from(from), to) != 0
@@ -433,6 +482,10 @@ fn start(plan: Plan) -> bool {
             fail_ap(index, false, b"ap-admission-identity");
             continue;
         }
+        if !lapic::can_target(id) {
+            fail_ap(index, false, b"apic-transport");
+            continue;
+        }
         if index == config::SMP_FAIL_AP_INDEX {
             fail_ap(index, false, b"diagnostic-injection");
             continue;
@@ -508,11 +561,14 @@ fn stop_others() {
         return;
     }
     for index in 1..configured() {
+        let Some(target) = live_target(index) else {
+            continue;
+        };
         if !transition(index, 4, 5) {
             continue;
         }
-        if let Some(id) = apic(index) {
-            lapic::r4os_rust_lapic_control(6, u64::from(id), 0xf1);
+        if percpu::state(index) == 5 && apic_target::current(target, identity_target) {
+            lapic::r4os_rust_lapic_control(6, u64::from(target.apic_id), 0xf1);
         }
     }
     for index in 1..configured() {
@@ -526,44 +582,22 @@ fn stop_others() {
         }
     }
 }
-fn send_reschedule(index: u32) {
-    if index == percpu::current_index() || percpu::r4os_rust_percpu_control(13, index, 0, 0) == 0 {
+pub(crate) fn send_reschedule(index: u32) {
+    if index == percpu::current_index() {
         return;
     }
-    if let Some(id) = apic(index) {
-        lapic::r4os_rust_lapic_control(5, u64::from(id), 0xf0);
+    if let Some(target) = live_target(index).filter(|t| apic_target::current(*t, live_target)) {
+        lapic::r4os_rust_lapic_control(5, u64::from(target.apic_id), 0xf0);
     }
 }
 unsafe extern "C" fn send_tlb_ipi(index: u32, vector: u8) -> bool {
-    if index == percpu::current_index() || percpu::state(index) != 4 {
+    if index == percpu::current_index() {
         return false;
     }
-    let Some(id) = apic(index) else {
+    let Some(target) = live_target(index).filter(|t| apic_target::current(*t, live_target)) else {
         return false;
     };
-    lapic::r4os_rust_lapic_control(7, u64::from(id), u32::from(vector)) != 0
-}
-fn irq_target(ordinal: u32) -> u32 {
-    let mask = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
-    let bsp = unsafe {
-        ptr::addr_of!((*boot()).topology.apic_ids)
-            .cast::<u32>()
-            .read()
-    };
-    if mask.count_ones() <= 1 {
-        return bsp;
-    }
-    let mut remaining = ordinal % mask.count_ones();
-    for index in 0..MAX_CPUS as u32 {
-        if mask & (1 << index) == 0 {
-            continue;
-        }
-        if remaining == 0 {
-            return apic(index).unwrap_or(bsp);
-        }
-        remaining -= 1;
-    }
-    bsp
+    lapic::r4os_rust_lapic_control(7, u64::from(target.apic_id), u32::from(vector)) != 0
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> ! {
@@ -663,7 +697,13 @@ pub unsafe extern "C" fn r4os_rust_smp_start(candidates: *const Candidate, len: 
         } else {
             unsafe { core::slice::from_raw_parts(candidates, len) }
         };
-        smp_policy::plan(lapic::r4os_rust_lapic_control(2, 0, 0) as u32, values)
+        let Some(bsp) = lapic::bsp_apic_id() else {
+            return false;
+        };
+        if apic(0) != Some(bsp) {
+            crate::boot::fatal::kernel(11, b"bsp-apic-identity");
+        }
+        smp_policy::plan(bsp, values)
     };
     start(plan)
 }
@@ -671,7 +711,11 @@ pub unsafe extern "C" fn r4os_rust_smp_start(candidates: *const Candidate, len: 
 pub extern "C" fn r4os_rust_smp_control(operation: u8, index: u32) -> u64 {
     match operation {
         0 => {
-            percpu::r4os_rust_percpu_control(0, cpu::r4os_rust_cpu_control(7, 0) as u32, 0, 0);
+            let id = cpu::local_apic_id();
+            if id == u32::MAX {
+                crate::boot::fatal::kernel(2, b"bsp-apic-identity");
+            }
+            percpu::r4os_rust_percpu_control(0, id, 0, 0);
             0
         }
         1 => {
@@ -690,7 +734,7 @@ pub extern "C" fn r4os_rust_smp_control(operation: u8, index: u32) -> u64 {
             send_reschedule(index);
             0
         }
-        5 => u64::from(irq_target(index)),
+        5 => legacy_irq_target(index).map_or(u64::MAX, |t| u64::from(t.apic_id)),
         6 => u64::from(configured()),
         _ => panic!("Invalid private SMP operation"),
     }

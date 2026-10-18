@@ -3,7 +3,7 @@
 pub use super::scheduler_types::{CpuPreemptionStats, Stats, StructureStats};
 use super::task_context;
 use crate::{
-    arch::{fpu, lapic, percpu, pit, runtime, smp_policy::MAX_CPUS},
+    arch::{fpu, percpu, pit, runtime, smp_policy::MAX_CPUS},
     build_config::config,
     memory::owner,
     platform::timer,
@@ -320,13 +320,7 @@ fn preempt_depth() -> u32 {
     }
 }
 fn send_reschedule(index: u32) {
-    if index == percpu::current_index() || percpu::r4os_rust_percpu_control(13, index, 0, 0) == 0 {
-        return;
-    }
-    let apic = percpu::r4os_rust_percpu_control(8, index, 0, 0);
-    if apic != u64::MAX {
-        lapic::r4os_rust_lapic_control(5, apic, 0xf0);
-    }
+    crate::arch::smp::send_reschedule(index);
 }
 fn init() -> bool {
     unsafe { task_context::bind(ptr::null_mut()) };
