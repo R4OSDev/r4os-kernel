@@ -155,7 +155,7 @@ pub unsafe fn directed() -> bool {
             }
         }
         let safe_before = structure();
-        let switched = scheduler::r4os_rust_scheduler_control(11, 0, 0) != 0;
+        let switched = scheduler::safe_reschedule();
         let safe_after = structure();
         let mut spins = 0;
         while (*raw()).directed_results + (*raw()).directed_failures < DIRECTED as u32
@@ -507,7 +507,7 @@ pub unsafe fn wake_probe() -> bool {
         let published = current() == caller
             && after_signal.wakeup_reschedule_requests > before.wakeup_reschedule_requests
             && after_signal.reschedule_pending;
-        let switched = scheduler::r4os_rust_scheduler_control(11, 0, 0) != 0;
+        let switched = scheduler::safe_reschedule();
         let after_safe = structure();
         spins = 0;
         while !(*raw()).wake_completed && spins < WAIT_BUDGET {

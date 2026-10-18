@@ -509,13 +509,19 @@ unsafe fn process_one(peers: &RxPeers) -> bool {
     }
     true
 }
-unsafe fn process_batch(budget: usize, peers: &RxPeers) -> usize {
+unsafe fn process_batch(budget: usize, peers: &RxPeers, cooperative: bool) -> usize {
     if budget == 0 {
         return 0;
     }
     let mut processed = 0;
     while processed < budget && unsafe { process_one(peers) } {
         processed += 1;
+        // Only the task-owned outer batch opts in. A frame's exact claim and
+        // protocol callback have returned; no RX Critical or PollGuard spans
+        // this point. Nested/polled callers retain their original no-switch path.
+        if cooperative && processed.is_multiple_of(8) && processed < budget {
+            scheduler::safe_reschedule();
+        }
     }
     if processed == 0 {
         return 0;
@@ -694,7 +700,7 @@ unsafe fn poll(_rounds: usize, mask: u16, peers: &RxPeers) {
     };
     if depth != 0 && depth < NESTED_LIMIT && is_current() {
         unsafe {
-            process_batch(1, peers);
+            process_batch(1, peers, false);
         }
     }
 }
@@ -762,7 +768,7 @@ pub unsafe extern "C" fn r4os_rust_net_rx_runtime_process_batch(
     budget: usize,
     peers: *const RxPeers,
 ) -> usize {
-    unsafe { process_batch(budget, &*peers) }
+    unsafe { process_batch(budget, &*peers, false) }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_net_rx_runtime_has_ready() -> bool {
@@ -792,7 +798,7 @@ unsafe extern "C" fn task_main() {
         }
         let scheduled = take_scheduled();
         let peers = peers();
-        let mut processed = unsafe { process_batch(BATCH_BUDGET, peers) };
+        let mut processed = unsafe { process_batch(BATCH_BUDGET, peers, true) };
         let first = {
             let _critical = Critical::acquire();
             unsafe { (*state()).rx_task_iterations == 0 }
@@ -816,7 +822,7 @@ unsafe extern "C" fn task_main() {
                     peers,
                 );
                 if processed < BATCH_BUDGET {
-                    processed += process_batch(BATCH_BUDGET - processed, peers);
+                    processed += process_batch(BATCH_BUDGET - processed, peers, true);
                 }
             }
         }
@@ -837,8 +843,10 @@ unsafe extern "C" fn task_main() {
                 (peers.log)();
             }
         }
-        // The completed batch/maintenance, not the requested historic poll rounds,
-        // is the activation bound. Next loop consumes the existing Event watchdog.
+        // Maintenance/log callbacks and all queue/adapter owners have returned.
+        // A signaled Event can return immediately under sustained traffic, so
+        // waiting at the next loop alone does not guarantee competing progress.
+        scheduler::safe_reschedule();
         let _ = processed;
     }
 }

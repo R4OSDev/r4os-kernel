@@ -1,5 +1,5 @@
 //! One scheduler state owner; runtime admission is mandatory after SMP start.
-//! Counters, pending decisions and CPU slots have no foreign/live Rust borrow.
+//! Early safe-point counters use separate atomics; no State borrow spans a switch.
 pub use super::scheduler_types::{CpuPreemptionStats, Stats, StructureStats};
 use super::{task::thread_placement, task_context};
 use crate::{
@@ -8,7 +8,12 @@ use crate::{
     memory::owner,
     platform::timer,
 };
-use core::{cell::UnsafeCell, ffi::c_void, ptr};
+use core::{
+    cell::UnsafeCell,
+    ffi::c_void,
+    ptr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 const ROLE_COUNT: usize = 4;
 const BUCKETS: usize = 5;
 const WAIT_FOREVER: u64 = u64::MAX;
@@ -87,10 +92,6 @@ struct State {
     preemption_deferred_max_ticks: u64,
     wakeup_reschedule_request_count: u64,
     wakeup_preemption_switch_count: u64,
-    safe_reschedule_point_count: u64,
-    safe_reschedule_switch_count: u64,
-    safe_reschedule_deferred_irq_count: u64,
-    safe_reschedule_deferred_owner_count: u64,
     ready_candidate_visit_count: u64,
     timeout_candidate_visit_count: u64,
     warning_candidate_visit_count: u64,
@@ -155,10 +156,6 @@ impl State {
         preemption_deferred_max_ticks: 0,
         wakeup_reschedule_request_count: 0,
         wakeup_preemption_switch_count: 0,
-        safe_reschedule_point_count: 0,
-        safe_reschedule_switch_count: 0,
-        safe_reschedule_deferred_irq_count: 0,
-        safe_reschedule_deferred_owner_count: 0,
         ready_candidate_visit_count: 0,
         timeout_candidate_visit_count: 0,
         warning_candidate_visit_count: 0,
@@ -178,6 +175,33 @@ impl State {
         ready_latency_role_buckets: [[0; BUCKETS]; ROLE_COUNT],
     };
 }
+// Safe points reject outer owners before taking Runtime. Their counters must
+// therefore live outside State: an atomic field access through a concurrent
+// whole-State mutable reference would still violate that owner's borrowing.
+struct CooperationCounters {
+    points: AtomicU64,
+    switches: AtomicU64,
+    deferred_irq: AtomicU64,
+    deferred_owner: AtomicU64,
+}
+impl CooperationCounters {
+    const fn new() -> Self {
+        Self {
+            points: AtomicU64::new(0),
+            switches: AtomicU64::new(0),
+            deferred_irq: AtomicU64::new(0),
+            deferred_owner: AtomicU64::new(0),
+        }
+    }
+    // The original singleton scheduler reset precedes AP publication.
+    fn reset(&self) {
+        self.points.store(0, Ordering::Relaxed);
+        self.switches.store(0, Ordering::Relaxed);
+        self.deferred_irq.store(0, Ordering::Relaxed);
+        self.deferred_owner.store(0, Ordering::Relaxed);
+    }
+}
+static COOPERATION: CooperationCounters = CooperationCounters::new();
 struct Storage(UnsafeCell<State>);
 // SAFETY: singleton initialization precedes APs. Runtime owner serializes every
 // later scheduling mutation. Current-CPU reads retain the old local IRQ/task
@@ -375,6 +399,7 @@ fn init() -> bool {
         return false;
     }
     change(|s| *s = State::EMPTY);
+    COOPERATION.reset();
     let first = task_query(1, 0);
     if first.is_null() {
         return false;
@@ -1019,23 +1044,18 @@ pub fn preempt_pending(preemptible: bool) -> bool {
     true
 }
 pub(crate) fn safe_reschedule() -> bool {
-    change(|s| s.safe_reschedule_point_count = s.safe_reschedule_point_count.wrapping_add(1));
-    if !enabled() {
-        return false;
-    }
+    COOPERATION.points.fetch_add(1, Ordering::Relaxed);
     if !owner::fault_allowed() {
-        change(|s| {
-            s.safe_reschedule_deferred_owner_count =
-                s.safe_reschedule_deferred_owner_count.wrapping_add(1)
-        });
+        COOPERATION.deferred_owner.fetch_add(1, Ordering::Relaxed);
         return false;
     }
     let flags = runtime::save_runtime();
+    if !enabled() {
+        runtime::restore_runtime(flags);
+        return false;
+    }
     if flags & (1 << 9) == 0 {
-        change(|s| {
-            s.safe_reschedule_deferred_irq_count =
-                s.safe_reschedule_deferred_irq_count.wrapping_add(1)
-        });
+        COOPERATION.deferred_irq.fetch_add(1, Ordering::Relaxed);
         runtime::restore_runtime(flags);
         return false;
     }
@@ -1045,12 +1065,16 @@ pub(crate) fn safe_reschedule() -> bool {
         return false;
     }
     let item = view(running);
-    if item.state != 2 || ready_count() == 0 {
+    // An admitted placement change can need the real local idle continuation,
+    // even without another Ready task or an expired quantum. Apply it only at
+    // the existing full-save boundary, with the same owner/IRQ guards below.
+    let placement = unsafe { thread_placement::pending(running.cast()) };
+    if item.state != 2 || ready_count() == 0 && !placement {
         set_pending(false);
         runtime::restore_runtime(flags);
         return false;
     }
-    let priority = local().pending && urgent(running);
+    let priority = placement || local().pending && urgent(running);
     if !priority {
         set_pending(false);
     }
@@ -1059,15 +1083,12 @@ pub(crate) fn safe_reschedule() -> bool {
         return false;
     }
     if preempt_depth() != 0 || item.held_locks != 0 || item.handoff_pending {
-        change(|s| {
-            s.safe_reschedule_deferred_owner_count =
-                s.safe_reschedule_deferred_owner_count.wrapping_add(1)
-        });
+        COOPERATION.deferred_owner.fetch_add(1, Ordering::Relaxed);
         runtime::restore_runtime(flags);
         return false;
     }
     runtime::restore_runtime(flags);
-    change(|s| s.safe_reschedule_switch_count = s.safe_reschedule_switch_count.wrapping_add(1));
+    COOPERATION.switches.fetch_add(1, Ordering::Relaxed);
     yield_task();
     true
 }
@@ -1580,10 +1601,10 @@ pub unsafe extern "C" fn r4os_rust_scheduler_stats(output: *mut Stats) {
         role_picks: s.role_picks,
         ready_latency_role_samples: s.ready_latency_role_samples,
         ready_latency_role_buckets: s.ready_latency_role_buckets,
-        safe_reschedule_points: s.safe_reschedule_point_count,
-        safe_reschedule_switches: s.safe_reschedule_switch_count,
-        safe_reschedule_deferred_irq: s.safe_reschedule_deferred_irq_count,
-        safe_reschedule_deferred_owner: s.safe_reschedule_deferred_owner_count,
+        safe_reschedule_points: COOPERATION.points.load(Ordering::Relaxed),
+        safe_reschedule_switches: COOPERATION.switches.load(Ordering::Relaxed),
+        safe_reschedule_deferred_irq: COOPERATION.deferred_irq.load(Ordering::Relaxed),
+        safe_reschedule_deferred_owner: COOPERATION.deferred_owner.load(Ordering::Relaxed),
     });
     unsafe { output.write(value) };
     runtime::restore_runtime(flags);
@@ -1601,10 +1622,10 @@ pub unsafe extern "C" fn r4os_rust_scheduler_structure(output: *mut StructureSta
         timeout_storm_deferrals: s.timeout_storm_deferral_count,
         wakeup_reschedule_requests: s.wakeup_reschedule_request_count,
         wakeup_preemption_switches: s.wakeup_preemption_switch_count,
-        safe_reschedule_points: s.safe_reschedule_point_count,
-        safe_reschedule_switches: s.safe_reschedule_switch_count,
-        safe_reschedule_deferred_irq: s.safe_reschedule_deferred_irq_count,
-        safe_reschedule_deferred_owner: s.safe_reschedule_deferred_owner_count,
+        safe_reschedule_points: COOPERATION.points.load(Ordering::Relaxed),
+        safe_reschedule_switches: COOPERATION.switches.load(Ordering::Relaxed),
+        safe_reschedule_deferred_irq: COOPERATION.deferred_irq.load(Ordering::Relaxed),
+        safe_reschedule_deferred_owner: COOPERATION.deferred_owner.load(Ordering::Relaxed),
         reschedule_pending: pending,
     });
     unsafe { output.write(value) };

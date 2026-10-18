@@ -833,7 +833,7 @@ pub unsafe extern "C" fn r4os_rust_program_service_reply(
             }
         };
         let result = program_service_endpoint_reply(handle, id, status, bytes);
-        scheduler::r4os_rust_scheduler_control(11, 0, 0);
+        scheduler::safe_reschedule();
         result
     }
 }

@@ -4,7 +4,7 @@ use crate::{
     arch::pit::DEFAULT_HZ,
     memory::phys,
     platform::{clock_math, timer},
-    sched::{sync_objects, task},
+    sched::{scheduler, sync_objects, task},
     storage::block_registry,
 };
 use c::{COUNT, DEVICES, FULL, Held, STATS};
@@ -72,7 +72,12 @@ unsafe extern "C" fn main() {
             while pages < 4 {
                 match background_one() {
                     Outcome::None => break,
-                    Outcome::Wrote => pages += 1,
+                    Outcome::Wrote => {
+                        pages += 1;
+                        // Exact writeback and its Held/Operation admissions
+                        // have returned; no cache metadata loan spans a switch.
+                        scheduler::safe_reschedule();
+                    }
                     Outcome::Failed => {
                         failed = true;
                         break;
@@ -82,6 +87,7 @@ unsafe extern "C" fn main() {
             // Idle policy trims clean excess capacity without speculative I/O.
             if pages == 0 && !failed {
                 trim_one();
+                scheduler::safe_reschedule();
             }
             if pages == 4 && prompt_wake() {
                 c::sleep((DEFAULT_HZ as u64 / 100).max(1), b"pgcache-policy-yield");

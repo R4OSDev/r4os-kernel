@@ -46,11 +46,18 @@ static ABORT: AtomicU8 = AtomicU8::new(0);
 static FAILURES: AtomicU32 = AtomicU32::new(0);
 static CPU: AtomicU32 = AtomicU32::new(u32::MAX);
 static COOPERATIVE: AtomicU64 = AtomicU64::new(0);
+static COOP_PROGRESS_NS: AtomicU64 = AtomicU64::new(0);
+static COOP_MAX_WORK_NS: AtomicU64 = AtomicU64::new(0);
+static COOP_MAX_GAP_NS: AtomicU64 = AtomicU64::new(0);
 struct Scenario {
     ok: bool,
     exit: i32,
     timer: u64,
     ipi: u64,
+    cooperative: u64,
+    progress_ns: u64,
+    max_work_ns: u64,
+    max_gap_ns: u64,
 }
 impl Scenario {
     const EMPTY: Self = Self {
@@ -58,6 +65,10 @@ impl Scenario {
         exit: -1,
         timer: 0,
         ipi: 0,
+        cooperative: 0,
+        progress_ns: 0,
+        max_work_ns: 0,
+        max_gap_ns: 0,
     };
 }
 
@@ -115,7 +126,7 @@ unsafe extern "C" fn witness() {
     unsafe {
         CPU.store(percpu::current_index(), Ordering::Release);
         let mode = MODE.load(Ordering::Relaxed);
-        if mode != 2 {
+        if mode < 2 {
             STARTED.store(1, Ordering::Release);
         }
         let flag = FLAG.load(Ordering::Relaxed);
@@ -136,25 +147,41 @@ unsafe extern "C" fn witness() {
                     failure();
                 }
             }
-            2 => {
+            2 | 3 => {
                 let token = task_context::enter();
                 if token.admitted() {
                     let buffer = crate::memory::heap::r4os_rust_heap_alloc(64 * 1024, 1);
                     if !buffer.is_null() {
                         let mut value = 0u8;
+                        let progress = monotonic::capture();
+                        let mut previous = progress;
                         STARTED.store(1, Ordering::Release);
                         while flag.load(Ordering::Acquire) != 1
                             && ABORT.load(Ordering::Acquire) == 0
                         {
+                            let work = monotonic::capture();
                             value = value.wrapping_add(1);
                             ptr::write_bytes(buffer, value, 64 * 1024);
-                            if scheduler::r4os_rust_scheduler_control(11, 0, 0) != 0 {
+                            if let Some(ns) = monotonic::elapsed(work, monotonic::capture()) {
+                                COOP_MAX_WORK_NS.fetch_max(ns, Ordering::Relaxed);
+                            }
+                            if scheduler::safe_reschedule() {
                                 COOPERATIVE.fetch_add(1, Ordering::Relaxed);
                             }
+                            let reached = monotonic::capture();
+                            if let Some(ns) = monotonic::elapsed(previous, reached) {
+                                // Includes actual suspension; this is an observed
+                                // probe interval, never a real-time guarantee.
+                                COOP_MAX_GAP_NS.fetch_max(ns, Ordering::Relaxed);
+                            }
+                            previous = reached;
                             if buffer.read() != value || buffer.add(64 * 1024 - 1).read() != value {
                                 failure();
                                 break;
                             }
+                        }
+                        if let Some(ns) = monotonic::elapsed(progress, monotonic::capture()) {
+                            COOP_PROGRESS_NS.store(ns, Ordering::Relaxed);
                         }
                         crate::memory::heap::r4os_rust_heap_free(buffer, 64 * 1024);
                     } else {
@@ -218,12 +245,19 @@ unsafe fn scenario(file: &launch::File, working: *mut Drive, cpu: u32, mode: u8)
         FAILURES.store(0, Ordering::Release);
         CPU.store(u32::MAX, Ordering::Release);
         COOPERATIVE.store(0, Ordering::Relaxed);
+        COOP_PROGRESS_NS.store(0, Ordering::Relaxed);
+        COOP_MAX_WORK_NS.store(0, Ordering::Relaxed);
+        COOP_MAX_GAP_NS.store(0, Ordering::Relaxed);
         flag.store(3, Ordering::Release);
         let request = task_api::CreateRequest {
             name: b"r4l-preempt-witness".as_ptr(),
             name_len: 19,
             state: 3,
-            role: if mode == 2 { 2 } else { 0 },
+            role: match mode {
+                2 => 2,
+                3 => 3,
+                _ => 0,
+            },
             needs_fpu: true,
             smp_eligible: true,
             smp_r4x: false,
@@ -366,7 +400,7 @@ unsafe fn scenario(file: &launch::File, working: *mut Drive, cpu: u32, mode: u8)
         let switched = match mode {
             0 => timer_switches != 0,
             1 => ipi != 0,
-            2 => COOPERATIVE.load(Ordering::Relaxed) != 0,
+            2 | 3 => COOPERATIVE.load(Ordering::Relaxed) != 0,
             _ => unreachable!(),
         };
         let exit = if completion_ok {
@@ -386,6 +420,10 @@ unsafe fn scenario(file: &launch::File, working: *mut Drive, cpu: u32, mode: u8)
             exit,
             timer: timer_switches,
             ipi,
+            cooperative: COOPERATIVE.load(Ordering::Relaxed),
+            progress_ns: COOP_PROGRESS_NS.load(Ordering::Relaxed),
+            max_work_ns: COOP_MAX_WORK_NS.load(Ordering::Relaxed),
+            max_gap_ns: COOP_MAX_GAP_NS.load(Ordering::Relaxed),
         }
     }
 }
@@ -398,6 +436,7 @@ pub unsafe extern "C" fn r4os_rust_program_preemption_acceptance(cpu: u32, usabl
         let mut timer_result = Scenario::EMPTY;
         let mut ipi = Scenario::EMPTY;
         let mut cooperative = Scenario::EMPTY;
+        let mut urgent = Scenario::EMPTY;
         let mut generation = 0;
         if cpu != 0 && cpu < MAX_CPUS as u32 && percpu::r4os_rust_percpu_control(13, cpu, 0, 0) != 0
         {
@@ -431,6 +470,7 @@ pub unsafe extern "C" fn r4os_rust_program_preemption_acceptance(cpu: u32, usabl
                 timer_result = scenario(&file, working, cpu, 0);
                 ipi = scenario(&file, working, cpu, 1);
                 cooperative = scenario(&file, working, cpu, 2);
+                urgent = scenario(&file, working, cpu, 3);
                 let flag = FLAG.load(Ordering::Relaxed);
                 if !flag.is_null() {
                     AtomicU64::from_ptr(flag).store(0, Ordering::Release);
@@ -438,7 +478,7 @@ pub unsafe extern "C" fn r4os_rust_program_preemption_acceptance(cpu: u32, usabl
                 FLAG.store(ptr::null_mut(), Ordering::Relaxed);
             })();
         }
-        let ok = timer_result.ok && ipi.ok && cooperative.ok;
+        let ok = timer_result.ok && ipi.ok && cooperative.ok && urgent.ok;
         if !ipi.ok {
             log(b"[R4LPREEMPT] IPI scenario timer_switches=");
             dec(ipi.timer);
@@ -449,11 +489,27 @@ pub unsafe extern "C" fn r4os_rust_program_preemption_acceptance(cpu: u32, usabl
             log(b"\r\n");
         }
         log(b"[KERNELCOOP] result=");
-        log(if cooperative.ok { b"OK" } else { b"FAILED" });
+        log(if cooperative.ok && urgent.ok {
+            b"OK"
+        } else {
+            b"FAILED"
+        });
         log(b" switches=");
-        dec(COOPERATIVE.load(Ordering::Relaxed));
+        dec(cooperative.cooperative);
         log(b" exit=");
         dec(cooperative.exit as i64 as u64);
+        log(b" urgent_switches=");
+        dec(urgent.cooperative);
+        log(b" urgent_exit=");
+        dec(urgent.exit as i64 as u64);
+        log(b" equal_progress_ns=");
+        dec(cooperative.progress_ns);
+        log(b" urgent_progress_ns=");
+        dec(urgent.progress_ns);
+        log(b" max_work_ns=");
+        dec(cooperative.max_work_ns.max(urgent.max_work_ns));
+        log(b" max_gap_ns=");
+        dec(cooperative.max_gap_ns.max(urgent.max_gap_ns));
         log(b"\r\n");
         log(b"[R4LPREEMPT] result=");
         log(if ok { b"OK" } else { b"FAILED" });

@@ -513,9 +513,19 @@ unsafe fn submit(device: *mut c_void, v: View, request: block_state::Execution) 
 /// Exact pinned device stays admitted through each backend and completion;
 /// caller selected the execution mode before publishing any borrowed buffer.
 pub unsafe fn pump(device: *mut c_void, mode: u8) -> bool {
+    let Some(_unwind) = task_context::Admission::acquire(false) else {
+        return false;
+    };
     let v = unsafe { view(device) };
     let mut worked = false;
+    let mut steps = 0;
     loop {
+        // One busy device must not drain a continuously replenished queue
+        // before the controller can visit its other devices. Inline boot work
+        // still drains fully; it has no worker that could resume a short pass.
+        if mode == 1 && steps == 8 {
+            break;
+        }
         if let Some((request, completion)) = unsafe { ready(device, v) } {
             worked = true;
             let mut result = MaybeUninit::uninit();
@@ -532,6 +542,10 @@ pub unsafe fn pump(device: *mut c_void, mode: u8) -> bool {
             unsafe {
                 finish(device, v, request, result.ok, result.err);
             }
+            steps += 1;
+            // Exact completion, wakes and detached-buffer release are done;
+            // the device pin and task unwind anchor remain, without a lock.
+            scheduler::safe_reschedule();
             continue;
         }
         let Some(request) = (unsafe { begin(device, v, mode) }) else {
@@ -548,6 +562,10 @@ pub unsafe fn pump(device: *mut c_void, mode: u8) -> bool {
                 finish(device, v, request, result.ok, result.err);
             }
         }
+        steps += 1;
+        // An asynchronous request is fully published, or inline completion is
+        // acknowledged. Never suspend inside the backend/queue transition.
+        scheduler::safe_reschedule();
     }
     worked
 }
@@ -1223,6 +1241,7 @@ pub unsafe fn pump_controller(lane: u8) -> bool {
                 unsafe {
                     block_registry::r4os_rust_block_registry_unpin(&mut pin);
                 }
+                scheduler::safe_reschedule();
             }
         }
         index += 1;

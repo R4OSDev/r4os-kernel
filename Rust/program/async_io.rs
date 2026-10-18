@@ -544,7 +544,7 @@ unsafe extern "C" fn worker_main() {
             (*req).completed_tick = timer::tick_count();
             sync_objects::r4os_rust_sync_completion(ptr::addr_of_mut!((*req).completion), 1, 0);
             drop(guard);
-            scheduler::r4os_rust_scheduler_control(11, 0, 0);
+            scheduler::safe_reschedule();
         }
     }
 }

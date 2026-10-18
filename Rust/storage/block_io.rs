@@ -3,7 +3,10 @@
 //! no Rust buffer/registry reference or no-sleep guard crosses a wait/backend.
 use crate::{
     memory::heap,
-    sched::task_context::Unwind,
+    sched::{
+        scheduler,
+        task_context::{Admission, Unwind},
+    },
     storage::{
         access_state::Reference, block_accounting as accounting, block_registry, block_requests,
         block_workers, split,
@@ -143,6 +146,21 @@ fn validate(view: View, lba: u64, sectors: u16, bytes: usize) -> u8 {
         sectors,
         bytes,
     )
+}
+// Bound synchronous copy/CPU work while respecting a smaller backend limit.
+// A single unusually large sector remains indivisible; ordinary sector sizes
+// fit this 64-KB boundary. DMA waits retain the existing worker/completion path.
+fn synchronous_limit(view: View) -> u16 {
+    // Preserve split_init's original rejection of an invalid zero sector size.
+    if view.sector_size == 0 {
+        return 0;
+    }
+    let bytes = (64 * 1024 / view.sector_size as usize).clamp(1, u16::MAX as usize) as u16;
+    if view.max_sectors == 0 {
+        bytes
+    } else {
+        bytes.min(view.max_sectors)
+    }
 }
 fn ownership(worker: bool, trusted: bool) -> u8 {
     if !worker {
@@ -402,6 +420,9 @@ unsafe fn read_pinned(
     len: usize,
     trusted: bool,
 ) -> bool {
+    let Some(_unwind) = Admission::acquire(false) else {
+        return false;
+    };
     let Some(pin) = pin else {
         return false;
     };
@@ -415,7 +436,7 @@ unsafe fn read_pinned(
     if !unsafe {
         split::r4os_rust_storage_split_init(
             sectors,
-            view.max_sectors,
+            synchronous_limit(view),
             view.sector_size as usize,
             iterator.as_mut_ptr(),
         )
@@ -443,6 +464,8 @@ unsafe fn read_pinned(
         {
             return false;
         }
+        // Chunk resources and physical completion are fully acknowledged.
+        scheduler::safe_reschedule();
     }
     true
 }
@@ -462,6 +485,12 @@ pub unsafe extern "C" fn r4os_rust_block_write(
     unsafe {
         out.write(Transfer::default());
     }
+    let Some(_unwind) = Admission::acquire(false) else {
+        unsafe {
+            (*out).error = 1;
+        }
+        return;
+    };
     let Some(pin) = Pin::acquire(index) else {
         unsafe {
             (*out).error = 2;
@@ -488,7 +517,7 @@ pub unsafe extern "C" fn r4os_rust_block_write(
     if !unsafe {
         split::r4os_rust_storage_split_init(
             sectors,
-            view.max_sectors,
+            synchronous_limit(view),
             view.sector_size as usize,
             iterator.as_mut_ptr(),
         )
@@ -525,6 +554,8 @@ pub unsafe extern "C" fn r4os_rust_block_write(
         unsafe {
             (*out).sectors_completed += chunk.sectors;
         }
+        // Publish the durable prefix before permitting another task to run.
+        scheduler::safe_reschedule();
     }
 }
 /// # Safety
@@ -547,6 +578,9 @@ pub unsafe extern "C" fn r4os_rust_block_write_batch(
     if count == 0 || count > 4 {
         return 0;
     }
+    let Some(_unwind) = Admission::acquire(false) else {
+        return 0;
+    };
     let expected = unsafe { expected.read() };
     if index != expected.slot as usize {
         return 0;
@@ -638,6 +672,8 @@ pub unsafe extern "C" fn r4os_rust_block_write_batch(
             break;
         }
         first += admitted;
+        // All admitted siblings in this wave have returned their real receipt.
+        scheduler::safe_reschedule();
     }
     pending_max
 }

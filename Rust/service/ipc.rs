@@ -1180,7 +1180,6 @@ unsafe fn run_target(lane: usize, target: WorkerTarget) {
         guard.release();
         sync_objects::r4os_rust_sync_completion(completion, 0, 0);
         publish_completion(target);
-        scheduler::r4os_rust_scheduler_control(11, 0, 0);
     }
 }
 unsafe extern "C" fn worker_main() {
@@ -1190,6 +1189,10 @@ unsafe extern "C" fn worker_main() {
     loop {
         if let Some(target) = unsafe { take_next(lane) } {
             unsafe { run_target(lane, target) };
+            // Every handler outcome has relinquished its ChannelGuard and
+            // settled its exact message/completion/permit before this point.
+            // This also covers abandoned or stale early-return outcomes.
+            scheduler::safe_reschedule();
             continue;
         }
         increment(&IDLE_WAITS, 1);

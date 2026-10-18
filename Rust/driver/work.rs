@@ -645,7 +645,7 @@ fn publish(slot: usize, handle: u32) {
         }
     }
     critical.leave(owner);
-    scheduler::r4os_rust_scheduler_control(11, 0, 0);
+    scheduler::safe_reschedule();
 }
 fn create_worker(deadline: bool) -> u32 {
     let mut failure = CreateFailure::None;
