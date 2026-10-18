@@ -316,6 +316,7 @@ pub(crate) unsafe fn kill(id: u32, generation: Option<u64>) -> bool {
             false
         } else {
             let c = registry::core(task);
+            crate::serial::cancel_task(id, (*c).generation);
             if matches!((*c).state, State::Unused | State::Dead | State::Running)
                 || is_current(task)
                 || (*c).critical_reserve_slot != registry::NO_RESERVE
@@ -350,6 +351,7 @@ pub(crate) unsafe fn retire(id: u32, generation: u64) -> RetireResult {
             return RetireResult::Pending;
         }
         let c = registry::core(task);
+        crate::serial::cancel_task(id, generation);
         if (*c).state != State::Dead {
             if (*c).state == State::Unused
                 || (*c).critical_reserve_slot != registry::NO_RESERVE

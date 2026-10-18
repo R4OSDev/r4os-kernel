@@ -31,3 +31,5 @@ pub mod gfx;
 
 pub mod audio;
 pub mod update;
+
+pub(crate) mod serial;

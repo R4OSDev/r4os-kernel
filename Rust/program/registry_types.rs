@@ -50,7 +50,8 @@ pub struct ProgramInstance {
     pub desktop_requested: bool,
     pub done: bool,
     pub storage_teardown_blocked: bool,
-    _padding0: [u8; 2],
+    pub serial_closed: bool,
+    _padding0: [u8; 1],
 }
 
 #[repr(C)]
@@ -219,6 +220,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ProgramInstance, memory_tag) == 231);
     assert!(core::mem::offset_of!(ProgramInstance, used) == 247);
     assert!(core::mem::offset_of!(ProgramInstance, gfx_virtual_closed) == 248);
+    assert!(core::mem::offset_of!(ProgramInstance, serial_closed) == 254);
     assert!(core::mem::offset_of!(ProgramInstance, display_used) == 249);
     assert!(core::mem::offset_of!(ProgramInstance, close_requested) == 250);
     assert!(core::mem::offset_of!(ProgramInstance, desktop_requested) == 251);

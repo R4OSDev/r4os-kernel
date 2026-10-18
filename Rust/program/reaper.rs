@@ -37,9 +37,12 @@ unsafe fn action(
                 true
             }
             2 => super::thread_retire::r4os_rust_program_threads_release(h, r),
-            3 => super::process_data::r4os_rust_program_data_local_cleanup(ptr::addr_of_mut!(
-                (*s).instance
-            )),
+            3 => {
+                crate::serial::reap_process(h)
+                    && super::process_data::r4os_rust_program_data_local_cleanup(ptr::addr_of_mut!(
+                        (*s).instance
+                    ))
+            }
             4 => super::peer_lifetime::notifications_cleanup(ptr::addr_of_mut!((*s).instance)),
             12 => super::peer_lifetime::resource_step(ptr::addr_of_mut!((*s).instance)),
             13 => super::peer_lifetime::vm_release(h.instance_id),

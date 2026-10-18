@@ -79,6 +79,12 @@ pub unsafe extern "C" fn r4os_rust_program_exit_commit(h: Handle, code: i32, req
         (*slot).pin_count += 1;
         registry::unlock();
         let _lease = Lease(raw);
+        {
+            let _runtime = RuntimeGuard::acquire();
+            AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).serial_closed))
+                .store(true, Ordering::Release);
+            crate::serial::stop_process(h);
+        }
         program_exit_stop_admission(instance);
         if !registry::lock() {
             return 2;

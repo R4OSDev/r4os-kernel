@@ -369,7 +369,7 @@ pub(crate) fn table() -> *mut a::DriverApi {
         assert!(
             input.magic == 0x31495044
                 && input.version == a::driver_api_version
-                && input.size == 656
+                && input.size == core::mem::size_of::<a::DriverApi>() as u32
         );
         unsafe {
             ptr::write(value, input);

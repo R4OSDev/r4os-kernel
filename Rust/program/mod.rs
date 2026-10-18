@@ -78,3 +78,5 @@ pub mod vm;
 pub mod r4dev;
 
 pub(crate) mod platform_callbacks;
+
+pub(crate) mod serial_api;

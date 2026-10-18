@@ -100,6 +100,9 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_prepare(owner: u32, out: *mut 
     if backend(0, owner) != 0 || backend(1, owner) != 0 {
         return false;
     }
+    if !crate::serial::driver_close(owner) {
+        return false;
+    }
     let mut token = Token::empty(owner);
     if !unsafe { storage::r4os_rust_driver_storage_prepare(owner, &mut token.storage_plan) } {
         return false;
@@ -193,6 +196,9 @@ pub extern "C" fn r4os_rust_driver_system_transition(owner: u32, op: u8) -> bool
             if backend(4, owner) == 0 {
                 return false;
             }
+            if !crate::serial::driver_close(owner) {
+                return false;
+            }
             close_data(owner);
             threads::r4os_rust_driver_thread_stop_existing(owner);
             true
@@ -250,6 +256,10 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_commit(token: *mut Token) -> b
         return false;
     }
     if backend(2, owner) != 0 || backend(3, owner) != 0 {
+        unsafe { r4os_rust_driver_cleanup_quarantine(token) };
+        return false;
+    }
+    if !crate::serial::driver_quiesced(owner) {
         unsafe { r4os_rust_driver_cleanup_quarantine(token) };
         return false;
     }

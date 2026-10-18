@@ -1090,6 +1090,21 @@ fn configure_dev() {
     const SMP_SNAPSHOT: c::R4DevFns::performance_smp_tlb = r4dev::smp::snapshot;
     r4dev::providers::install();
     let value = c::R4XStartR4Dev {
+        serial_count: super::serial_api::count as c::R4DevFns::serial_count as *const () as usize,
+        serial_port_at: super::serial_api::port_at as c::R4DevFns::serial_port_at as *const ()
+            as usize,
+        serial_open: super::serial_api::open as c::R4DevFns::serial_open as *const () as usize,
+        serial_configure: super::serial_api::configure as c::R4DevFns::serial_configure as *const ()
+            as usize,
+        serial_read: super::serial_api::read as c::R4DevFns::serial_read as *const () as usize,
+        serial_write: super::serial_api::write as c::R4DevFns::serial_write as *const () as usize,
+        serial_drain: super::serial_api::drain as c::R4DevFns::serial_drain as *const () as usize,
+        serial_status: super::serial_api::status as c::R4DevFns::serial_status as *const ()
+            as usize,
+        serial_cancel: super::serial_api::cancel as c::R4DevFns::serial_cancel as *const ()
+            as usize,
+        serial_close: super::serial_api::close as c::R4DevFns::serial_close as *const () as usize,
+
         device_inventory_summary: r4dev::devices::r4os_rust_r4dev_device_inventory_summary
             as *const () as usize,
         device_inventory_record: r4dev::devices::r4os_rust_r4dev_device_inventory_record
@@ -1183,7 +1198,7 @@ fn configure_dev() {
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 456);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 536);
     assert!(mem::offset_of!(c::R4XStartR4Dev, usb_contract_check) == 448);
     assert!(mem::offset_of!(c::R4XStartR4Dev, storage_nvme_check) == 440);
     assert!(mem::offset_of!(c::R4XStartR4Dev, storage_block_queue_check) == 432);
