@@ -132,23 +132,28 @@ impl Projection {
         owner_program_generation: 0,
     };
 }
-struct Slots(UnsafeCell<[Slot; 16]>);
+// Keep room for one stream per supported CPU plus concurrent system/export
+// streams. Payload/projection bounds and retirement masks share this limit.
+pub(super) const CAPACITY: usize = crate::arch::smp_policy::MAX_CPUS * 2;
+const _: () = assert!(CAPACITY <= u64::BITS as usize);
+struct Slots(UnsafeCell<[Slot; CAPACITY]>);
 // SAFETY: Per-drive request gates serialize payload access; the program-state
 // owner serializes the separate reservation projection. A reader must filter
 // the projection under that owner before touching a lane's mutable payload.
 unsafe impl Sync for Slots {}
-static SLOTS: Slots = Slots(UnsafeCell::new([const { Slot::EMPTY }; 16]));
-struct ProjectionTable(UnsafeCell<[Projection; 16]>);
+static SLOTS: Slots = Slots(UnsafeCell::new([const { Slot::EMPTY }; CAPACITY]));
+struct ProjectionTable(UnsafeCell<[Projection; CAPACITY]>);
 // SAFETY: All projection access is under the existing program-state owner.
 unsafe impl Sync for ProjectionTable {}
-static PROJECTIONS: ProjectionTable = ProjectionTable(UnsafeCell::new([Projection::EMPTY; 16]));
+static PROJECTIONS: ProjectionTable =
+    ProjectionTable(UnsafeCell::new([Projection::EMPTY; CAPACITY]));
 static GENERATION: AtomicU32 = AtomicU32::new(1);
 pub(super) fn slot(index: usize) -> *mut Slot {
-    assert!(index < 16);
+    assert!(index < CAPACITY);
     unsafe { SLOTS.0.get().cast::<Slot>().add(index) }
 }
 pub(super) fn lane_owned(index: usize, letter: u8) -> bool {
-    assert!(index < 16);
+    assert!(index < CAPACITY);
     let _guard = Guard::acquire(0);
     let owner = unsafe { PROJECTIONS.0.get().cast::<Projection>().add(index).read() };
     owner.reserved && owner.drive_letter == letter
@@ -156,7 +161,7 @@ pub(super) fn lane_owned(index: usize, letter: u8) -> bool {
 pub(super) unsafe fn reserve(letter: u8, owner: Option<StreamOwner>) -> Option<*mut Slot> {
     unsafe {
         let _guard = Guard::acquire(0);
-        for index in 0..16 {
+        for index in 0..CAPACITY {
             let projection = PROJECTIONS.0.get().cast::<Projection>().add(index);
             if (*projection).reserved {
                 continue;
@@ -182,7 +187,7 @@ pub(super) unsafe fn reserve(letter: u8, owner: Option<StreamOwner>) -> Option<*
 pub(super) unsafe fn release(slot: *mut Slot) {
     unsafe {
         let _guard = Guard::acquire(0);
-        for index in 0..16 {
+        for index in 0..CAPACITY {
             if self::slot(index) == slot {
                 PROJECTIONS
                     .0
@@ -489,6 +494,6 @@ pub(super) unsafe fn bind_ancestors(
     }
 }
 pub(super) unsafe fn projection_locked(index: usize) -> Projection {
-    assert!(index < 16);
+    assert!(index < CAPACITY);
     unsafe { PROJECTIONS.0.get().cast::<Projection>().add(index).read() }
 }

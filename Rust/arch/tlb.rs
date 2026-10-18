@@ -171,8 +171,29 @@ pub(crate) fn registered() -> bool {
 pub(crate) fn isolated_injection_active() -> bool {
     DIAGNOSTIC.load(Ordering::Acquire)
 }
+/// A fault may contend for a memory owner with IF=0 while that owner waits
+/// for this CPU's invalidation. Service only the lock-free TLB request; keep
+/// interrupt flags and the caller's existing owners intact. The isolated
+/// DROP_ACK probe retains its original IRQ-only missing-ACK contract.
+pub(crate) fn service_pending() {
+    // Capture before the diagnostic flag: observing an injected generation
+    // also observes its earlier DIAGNOSTIC publication. Never reread a newer
+    // generation after that check or consume DROP_ACK through this poll.
+    let generation = REQUEST_GENERATION.load(Ordering::Acquire);
+    if DIAGNOSTIC.load(Ordering::Acquire) {
+        return;
+    }
+    if generation != 0
+        && ACKS[percpu::current_index() as usize].load(Ordering::Acquire) != generation
+    {
+        handle_request(generation, false);
+    }
+}
 pub fn handle_ipi() {
     let generation = REQUEST_GENERATION.load(Ordering::Acquire);
+    handle_request(generation, true);
+}
+fn handle_request(generation: u64, allow_drop: bool) {
     if generation == 0 {
         return;
     }
@@ -184,7 +205,7 @@ pub fn handle_ipi() {
     let base = REQUEST_BASE.load(Ordering::Acquire);
     let pages = REQUEST_PAGES.load(Ordering::Acquire);
     flush_local(base, pages);
-    if DROP_ACK.load(Ordering::Acquire) & bit != 0 {
+    if allow_drop && DROP_ACK.load(Ordering::Acquire) & bit != 0 {
         DROP_ACK.fetch_and(!bit, Ordering::AcqRel);
         return;
     }

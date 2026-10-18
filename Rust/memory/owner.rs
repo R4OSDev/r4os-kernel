@@ -175,13 +175,15 @@ impl Lock {
                 if config::ENABLE_METRICS {
                     spins = spins.saturating_add(1);
                 }
-                // Existing IF=1 callers remain able to service TLB IPIs while
-                // contending; IRQ/no-sleep IF=0 callers never borrow interrupts.
+                // IF=1 callers service ordinary IPIs. Fault/IRQ IF=0 callers
+                // must also acknowledge a pending TLB request: its sender may
+                // hold this owner. They never borrow enabled interrupts.
                 if saved & IF != 0 {
                     sti();
                     pause();
                     cli();
                 } else {
+                    crate::arch::tlb::service_pending();
                     pause();
                 }
                 // Observation is only a retry hint. Ownership still requires

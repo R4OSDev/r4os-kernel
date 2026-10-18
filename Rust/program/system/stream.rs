@@ -85,7 +85,7 @@ pub(super) unsafe fn find(
     owner_only: bool,
 ) -> Option<*mut s::Slot> {
     unsafe {
-        for index in 0..16 {
+        for index in 0..s::CAPACITY {
             if !s::lane_owned(index, letter) {
                 continue;
             }
@@ -104,7 +104,7 @@ pub(super) unsafe fn reap(letter: u8) {
     unsafe {
         // A volume request never authorizes reads/cleanup in a foreign lane.
         // Dead foreign slots remain for their own next gate entry or exact retire.
-        for index in 0..16 {
+        for index in 0..s::CAPACITY {
             if !s::lane_owned(index, letter) {
                 continue;
             }
@@ -157,7 +157,7 @@ pub(super) unsafe fn collision(
     ignored: *const s::Slot,
 ) -> bool {
     unsafe {
-        for index in 0..16 {
+        for index in 0..s::CAPACITY {
             if !s::lane_owned(index, letter) {
                 continue;
             }
@@ -183,7 +183,7 @@ pub(super) unsafe fn invalidate(
         if collision(letter, boot, parent, entry, name, ptr::null()) {
             return false;
         }
-        for index in 0..16 {
+        for index in 0..s::CAPACITY {
             if !s::lane_owned(index, letter) {
                 continue;
             }
@@ -228,7 +228,7 @@ pub(super) unsafe fn invalidate(
 pub(super) unsafe fn subtree(letter: u8, boot: bool, directory: &[u8], entry: &fs::Entry) -> bool {
     unsafe {
         reap(letter);
-        for index in 0..16 {
+        for index in 0..s::CAPACITY {
             if !s::lane_owned(index, letter) {
                 continue;
             }
@@ -292,7 +292,7 @@ fn lane(letter: u8) -> Option<u8> {
     }
 }
 struct Plan {
-    lanes: [u16; 26],
+    lanes: [u64; 26],
     invalid: bool,
 }
 impl Plan {
@@ -307,13 +307,13 @@ unsafe fn plan(cleanup: Cleanup) -> Plan {
             lanes: [0; 26],
             invalid: false,
         };
-        for index in 0..16 {
+        for index in 0..s::CAPACITY {
             let owner = s::projection_locked(index);
             if !owner_matches(owner, cleanup) {
                 continue;
             }
             if let Some(lane) = lane(owner.drive_letter) {
-                plan.lanes[usize::from(lane)] |= 1u16 << index;
+                plan.lanes[usize::from(lane)] |= 1u64 << index;
             } else {
                 plan.invalid = true;
             }
@@ -323,7 +323,7 @@ unsafe fn plan(cleanup: Cleanup) -> Plan {
 }
 unsafe fn still_matches(index: usize, expected: u8, cleanup: Cleanup) -> bool {
     unsafe {
-        if index >= 16 {
+        if index >= s::CAPACITY {
             return false;
         }
         let _guard = Guard::acquire(0);
@@ -349,8 +349,8 @@ unsafe fn release(cleanup: Cleanup) -> bool {
                 return false;
             };
             let mut released = true;
-            for index in 0..16 {
-                if mask & (1u16 << index) == 0 || !still_matches(index, lane, cleanup) {
+            for index in 0..s::CAPACITY {
+                if mask & (1u64 << index) == 0 || !still_matches(index, lane, cleanup) {
                     continue;
                 }
                 let slot = s::slot(index);
