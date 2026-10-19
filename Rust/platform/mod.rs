@@ -11,6 +11,7 @@ pub mod firmware_tables;
 pub mod firmware_view;
 pub mod irq;
 pub mod irq_boot;
+pub(crate) mod madt_cpu;
 pub(crate) mod module_cpu;
 pub mod monotonic;
 pub(crate) mod numa;

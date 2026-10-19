@@ -7,7 +7,7 @@ use core::{
     sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
 const IF: u64 = 1 << 9;
-const MAX_CPUS: usize = 32;
+use crate::arch::smp_policy::MAX_CPUS;
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static LOCK: AtomicU8 = AtomicU8::new(0);
 static OWNER_CPU_PLUS_ONE: AtomicU8 = AtomicU8::new(0);

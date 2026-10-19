@@ -1,9 +1,9 @@
 //! Shared IRQ-independent hardware clock. Original bounded qualification,
 //! CPU correlations, watchdog demotion and monotonically published maximum.
 use super::{clock_math as math, cpu};
+use crate::arch::smp_policy::MAX_CPUS;
 use crate::arch::{hpet, runtime};
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
-const MAX_CPUS: usize = 32;
 const MIN_HZ: u64 = 1_000_000;
 const MAX_HZ: u64 = 10_000_000_000;
 #[repr(C)]

@@ -1,11 +1,11 @@
 //! Ranked, CPU-bound no-sleep owners. Resident C-layout storage can be
 //! embedded in stable native records; only its owner mutates the lock state.
 use super::{layout, owner_policy};
+use crate::arch::smp_policy::MAX_CPUS;
 use crate::build_config::config;
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-const MAX_CPUS: usize = 32;
 const IF: u64 = 1 << 9;
 const STACK_HEADROOM: u64 = 64 * 1024;
 #[repr(C)]
@@ -322,10 +322,10 @@ pub extern "C" fn r4os_rust_owner_prepare_stack() {
 }
 const _: () = {
     assert!(core::mem::size_of::<Token>() == 16 && core::mem::offset_of!(Token, cpu_index) == 8);
-    assert!(core::mem::size_of::<Lock>() == 392 && core::mem::offset_of!(Lock, depth) == 4);
+    assert!(core::mem::size_of::<Lock>() == 712 && core::mem::offset_of!(Lock, depth) == 4);
     assert!(
-        core::mem::offset_of!(Lock, acquired_tsc) == 72
-            && core::mem::offset_of!(Lock, acquisitions) == 328
+        core::mem::offset_of!(Lock, acquired_tsc) == 136
+            && core::mem::offset_of!(Lock, acquisitions) == 648
     );
     assert!(core::mem::size_of::<Stats>() == 64);
 };

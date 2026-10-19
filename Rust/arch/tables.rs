@@ -4,7 +4,7 @@ use core::ffi::c_void;
 use core::mem::{offset_of, size_of};
 use core::ptr::{addr_of, addr_of_mut};
 
-pub const MAX_CPUS: usize = 32;
+pub use crate::arch::smp_policy::MAX_CPUS;
 const STACK_SIZE: usize = 16 * 1024;
 #[repr(C, packed)]
 struct TablePointer {

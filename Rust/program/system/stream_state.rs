@@ -135,7 +135,7 @@ impl Projection {
 // Keep room for one stream per supported CPU plus concurrent system/export
 // streams. Payload/projection bounds and retirement masks share this limit.
 pub(super) const CAPACITY: usize = crate::arch::smp_policy::MAX_CPUS * 2;
-const _: () = assert!(CAPACITY <= u64::BITS as usize);
+const _: () = assert!(CAPACITY <= u128::BITS as usize);
 struct Slots(UnsafeCell<[Slot; CAPACITY]>);
 // SAFETY: Per-drive request gates serialize payload access; the program-state
 // owner serializes the separate reservation projection. A reader must filter

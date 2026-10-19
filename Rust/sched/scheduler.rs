@@ -258,7 +258,7 @@ pub(crate) fn current_has_work(index: u32) -> bool {
     index < MAX_CPUS as u32 && cpu_state(index).initialized && cpu_state(index).current_work
 }
 pub(crate) fn all_current_have_work(mut mask: u64) -> bool {
-    if mask == 0 || mask >> MAX_CPUS != 0 {
+    if mask == 0 || mask & crate::arch::smp_policy::CPU_MASK != mask {
         return false;
     }
     while mask != 0 {

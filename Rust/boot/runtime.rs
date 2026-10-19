@@ -1,7 +1,7 @@
 //! Original singleton BSP runtime/worker/launcher startup. State publication
 //! and orchestration are native; no state borrow spans callbacks or waits.
 use crate::{
-    arch::{runtime, smp, smp_policy::Candidate},
+    arch::{runtime, smp},
     boot::{fatal, foundation},
     build_config::config,
     driver::work,
@@ -31,25 +31,8 @@ unsafe fn start_smp() -> bool {
             return false;
         }
         let info = info.assume_init();
-        let mut candidates = [Candidate {
-            apic_id: 0,
-            enabled: false,
-            online_capable: false,
-        }; 32];
-        let count = (info.madt_lapic_count as usize).min(candidates.len());
-        for (out, input) in candidates
-            .iter_mut()
-            .zip(info.madt_cpu_entries.iter())
-            .take(count)
-        {
-            *out = Candidate {
-                apic_id: input.apic_id,
-                enabled: input.flags & 1 != 0,
-                online_capable: input.flags & 2 != 0,
-            };
-        }
         status(b"SMP starten");
-        if !smp::r4os_rust_smp_start(candidates.as_ptr(), count) {
+        if !smp::start_firmware(info.madt_cpus.plan) {
             return false;
         }
         smp::r4os_rust_smp_control(2, 0);

@@ -292,7 +292,7 @@ fn lane(letter: u8) -> Option<u8> {
     }
 }
 struct Plan {
-    lanes: [u64; 26],
+    lanes: [u128; 26],
     invalid: bool,
 }
 impl Plan {
@@ -313,7 +313,7 @@ unsafe fn plan(cleanup: Cleanup) -> Plan {
                 continue;
             }
             if let Some(lane) = lane(owner.drive_letter) {
-                plan.lanes[usize::from(lane)] |= 1u64 << index;
+                plan.lanes[usize::from(lane)] |= 1u128 << index;
             } else {
                 plan.invalid = true;
             }
@@ -350,7 +350,7 @@ unsafe fn release(cleanup: Cleanup) -> bool {
             };
             let mut released = true;
             for index in 0..s::CAPACITY {
-                if mask & (1u64 << index) == 0 || !still_matches(index, lane, cleanup) {
+                if mask & (1u128 << index) == 0 || !still_matches(index, lane, cleanup) {
                     continue;
                 }
                 let slot = s::slot(index);

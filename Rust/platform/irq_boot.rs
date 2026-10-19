@@ -129,12 +129,7 @@ pub fn init() -> bool {
         info.madt_lapic_address,
         info.madt_lapic_enabled_count,
         cpu::snapshot().features.x2apic,
-        info.madt_cpu_entries
-            .iter()
-            .take((info.madt_lapic_count as usize).min(32))
-            .any(|entry| {
-                entry.flags & 3 != 0 && entry.apic_id >= 0xff && entry.apic_id != u32::MAX
-            }),
+        info.madt_cpus.requires_x2apic,
     );
     let mut input = ioapic::Input {
         phys_base: info.madt_first_ioapic_address,

@@ -1,6 +1,6 @@
 //! Static ACPI reader. Packed firmware is decoded from bytes, never through
 //! aligned Rust references. The BSP publishes one immutable resident snapshot.
-use super::firmware_tables;
+use super::{firmware_tables, madt_cpu};
 use crate::{
     boot::info as boot,
     memory::{paging, phys},
@@ -8,22 +8,6 @@ use crate::{
 use core::{cell::UnsafeCell, slice};
 const HEADER: usize = 36;
 const MAX_SDT_LENGTH: usize = 1024 * 1024;
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct MadtCpu {
-    pub acpi_uid: u32,
-    pub apic_id: u32,
-    pub flags: u32,
-    pub x2apic: bool,
-}
-impl MadtCpu {
-    const EMPTY: Self = Self {
-        acpi_uid: 0,
-        apic_id: 0,
-        flags: 0,
-        x2apic: false,
-    };
-}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct MadtIoApic {
@@ -82,7 +66,7 @@ pub struct Info {
     pub madt_iso_count: u32,
     pub madt_nmi_count: u32,
     pub madt_malformed_entries: u32,
-    pub madt_cpu_entries: [MadtCpu; 32],
+    pub madt_cpus: madt_cpu::Catalog,
     pub madt_first_ioapic_id: u8,
     pub madt_first_ioapic_address: u32,
     pub madt_first_ioapic_gsi_base: u32,
@@ -149,7 +133,7 @@ impl Info {
         madt_iso_count: 0,
         madt_nmi_count: 0,
         madt_malformed_entries: 0,
-        madt_cpu_entries: [MadtCpu::EMPTY; 32],
+        madt_cpus: madt_cpu::Catalog::EMPTY,
         madt_first_ioapic_id: 0,
         madt_first_ioapic_address: 0,
         madt_first_ioapic_gsi_base: 0,
@@ -280,8 +264,8 @@ fn log(event: u8, a: u64, b: u64, c: u64, info: &Info) {
             dec(u64::from(info.madt_iso_count));
             puts(b" nmi=");
             dec(u64::from(info.madt_nmi_count));
-            if info.madt_lapic_count != 0 {
-                let first_cpu = info.madt_cpu_entries[0];
+            if info.madt_cpus.present & 1 != 0 {
+                let first_cpu = info.madt_cpus.entries[0];
                 puts(b" cpu0_apic=");
                 dec(u64::from(first_cpu.apic_id));
                 puts(if first_cpu.x2apic {
@@ -548,6 +532,12 @@ fn inspect_madt(info: &mut Info) {
     let bytes = table.bytes();
     info.madt_lapic_address = u64::from(read32(bytes, HEADER));
     info.madt_flags = read32(bytes, HEADER + 4);
+    info.madt_cpus = if let Some(catalog) = madt_cpu::decode(bytes, super::cpu::local_apic_id()) {
+        catalog
+    } else {
+        info.madt_malformed_entries += 1;
+        madt_cpu::Catalog::EMPTY
+    };
     let mut offset = HEADER + 8;
     while offset + 2 <= table.length {
         let kind = bytes[offset];
@@ -558,18 +548,8 @@ fn inspect_madt(info: &mut Info) {
         }
         match kind {
             0 if length >= 8 => {
-                let flags = read32(bytes, offset + 4);
-                let index = info.madt_lapic_count as usize;
-                if index < 32 {
-                    info.madt_cpu_entries[index] = MadtCpu {
-                        acpi_uid: u32::from(bytes[offset + 2]),
-                        apic_id: u32::from(bytes[offset + 3]),
-                        flags,
-                        x2apic: false,
-                    };
-                }
                 info.madt_lapic_count += 1;
-                if flags & 1 != 0 {
+                if read32(bytes, offset + 4) & 1 != 0 {
                     info.madt_lapic_enabled_count += 1;
                 }
             }
@@ -615,18 +595,8 @@ fn inspect_madt(info: &mut Info) {
                 info.madt_lapic_address = read64(bytes, offset + 4);
             }
             9 if length >= 16 => {
-                let flags = read32(bytes, offset + 8);
-                let index = info.madt_lapic_count as usize;
-                if index < 32 {
-                    info.madt_cpu_entries[index] = MadtCpu {
-                        acpi_uid: read32(bytes, offset + 12),
-                        apic_id: read32(bytes, offset + 4),
-                        flags,
-                        x2apic: true,
-                    };
-                }
                 info.madt_lapic_count += 1;
-                if flags & 1 != 0 {
+                if read32(bytes, offset + 8) & 1 != 0 {
                     info.madt_lapic_enabled_count += 1;
                 }
                 info.madt_x2apic_count += 1;
@@ -911,11 +881,11 @@ pub unsafe extern "C" fn r4os_rust_acpi_info(output: *mut Info) {
     unsafe { output.write(snapshot()) };
 }
 const _: () = {
-    assert!(core::mem::size_of::<MadtCpu>() == 16);
+    assert!(core::mem::size_of::<madt_cpu::Cpu>() == 16);
     assert!(core::mem::size_of::<MadtIoApic>() == 12);
     assert!(core::mem::size_of::<InterruptSourceOverride>() == 12);
-    assert!(core::mem::size_of::<Info>() == 1000);
-    assert!(core::mem::offset_of!(Info, madt_cpu_entries) == 136);
-    assert!(core::mem::offset_of!(Info, s5_reason) == 983);
-    assert!(core::mem::offset_of!(Info, hpet_base) == 984);
+    assert!(core::mem::size_of::<Info>() == 1816);
+    assert!(core::mem::offset_of!(Info, madt_cpus) == 136);
+    assert!(core::mem::offset_of!(Info, s5_reason) == 1799);
+    assert!(core::mem::offset_of!(Info, hpet_base) == 1800);
 };

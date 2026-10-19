@@ -1,6 +1,9 @@
 //! Original bounded topology, placement, TLB-mask and synthetic-stack policy.
-//! Fixed C snapshots preserve the existing Zig fixtures and assembly contract.
-pub const MAX_CPUS: usize = 32;
+//! CPU masks and every per-CPU owner share this single capacity. These are
+//! private native layouts; public CPU sets remain extensible word vectors.
+pub const MAX_CPUS: usize = 64;
+const _: () = assert!(MAX_CPUS > 0 && MAX_CPUS <= u64::BITS as usize);
+pub const CPU_MASK: u64 = u64::MAX >> (u64::BITS as usize - MAX_CPUS);
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Candidate {
@@ -9,34 +12,53 @@ pub struct Candidate {
     pub online_capable: bool,
 }
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct Plan {
     pub apic_ids: [u32; MAX_CPUS],
     pub count: u32,
     pub duplicates: u32,
     pub disabled: u32,
+    // Eligible records beyond the retained plan, not a count of unique CPUs.
+    pub omitted: u32,
+    pub invalid: u32,
 }
-pub(crate) fn plan(bsp: u32, candidates: &[Candidate]) -> Plan {
-    let mut result = Plan {
+impl Plan {
+    pub const EMPTY: Self = Self {
         apic_ids: [0; MAX_CPUS],
-        count: 1,
+        count: 0,
         duplicates: 0,
         disabled: 0,
+        omitted: 0,
+        invalid: 0,
     };
-    result.apic_ids[0] = bsp;
-    for candidate in candidates {
+    pub(crate) fn new(bsp: u32) -> Self {
+        let mut result = Self {
+            count: 1,
+            ..Self::EMPTY
+        };
+        result.apic_ids[0] = bsp;
+        result
+    }
+    pub(crate) fn consider(&mut self, candidate: Candidate) {
         if !candidate.enabled && !candidate.online_capable {
-            result.disabled += 1;
-            continue;
+            self.disabled += 1;
+        } else if candidate.apic_id == u32::MAX {
+            // This value is the x2APIC broadcast destination, never a CPU.
+            self.invalid += 1;
+        } else if self.apic_ids[..self.count as usize].contains(&candidate.apic_id) {
+            self.duplicates += 1;
+        } else if self.count as usize == MAX_CPUS {
+            self.omitted += 1;
+        } else {
+            self.apic_ids[self.count as usize] = candidate.apic_id;
+            self.count += 1;
         }
-        if result.apic_ids[..result.count as usize].contains(&candidate.apic_id) {
-            result.duplicates += 1;
-            continue;
-        }
-        if result.count as usize >= MAX_CPUS {
-            break;
-        }
-        result.apic_ids[result.count as usize] = candidate.apic_id;
-        result.count += 1;
+    }
+}
+pub(crate) fn plan(bsp: u32, candidates: &[Candidate]) -> Plan {
+    let mut result = Plan::new(bsp);
+    for &candidate in candidates {
+        result.consider(candidate);
     }
     result
 }
@@ -122,7 +144,7 @@ pub unsafe extern "C" fn r4os_rust_initial_stack(top: u64, output: *mut InitialS
 const _: () = {
     assert!(core::mem::size_of::<Candidate>() == 8);
     assert!(core::mem::offset_of!(Candidate, enabled) == 4);
-    assert!(core::mem::size_of::<Plan>() == 140);
-    assert!(core::mem::offset_of!(Plan, count) == 128);
+    assert!(core::mem::size_of::<Plan>() == MAX_CPUS * 4 + 20);
+    assert!(core::mem::offset_of!(Plan, count) == MAX_CPUS * 4);
     assert!(core::mem::size_of::<InitialStack>() == 32);
 };

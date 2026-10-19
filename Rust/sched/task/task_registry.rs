@@ -17,7 +17,7 @@ pub const ROLE_COUNT: usize = 4;
 pub const STACK_CACHE_LIMIT: usize = 8;
 pub const CRITICAL_RESERVE_COUNT: usize = 4;
 pub const NO_RESERVE: u8 = 0xff;
-pub const MAX_CPUS: usize = 32;
+pub use crate::arch::smp_policy::MAX_CPUS;
 pub const NO_RANK: u8 = 0xff;
 
 #[derive(Clone, Copy)]

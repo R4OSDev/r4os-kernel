@@ -69,12 +69,7 @@ struct Storage(UnsafeCell<Boot>);
 unsafe impl Sync for Storage {}
 static BOOT: Storage = Storage(UnsafeCell::new(Boot {
     status: Status::EMPTY,
-    topology: Plan {
-        apic_ids: [0; MAX_CPUS],
-        count: 0,
-        duplicates: 0,
-        disabled: 0,
-    },
+    topology: Plan::EMPTY,
     reported_failures: 0,
     low_pages: [0; MAX_CPUS],
     epoch: 0,
@@ -446,6 +441,7 @@ fn start(plan: Plan) -> bool {
         return true;
     }
     let count = plan.count;
+    log(9, plan.omitted, u64::from(plan.invalid), b"");
     let value = Status {
         initialized: true,
         discovered: count,
@@ -691,6 +687,31 @@ pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> !
     }
     crate::sched::scheduler::secondary_loop()
 }
+/// The complete boot decoder already selected bounded dense slots. No raw
+/// firmware list or temporary borrow survives AP notification.
+pub(crate) fn start_firmware(plan: Plan) -> bool {
+    if current().initialized {
+        return true;
+    }
+    if !lapic::is_enabled() {
+        return start(Plan::EMPTY);
+    }
+    let Some(bsp) = lapic::bsp_apic_id() else {
+        return false;
+    };
+    if apic(0) != Some(bsp) {
+        crate::boot::fatal::kernel(11, b"bsp-apic-identity");
+    }
+    let plan = if plan.count == 0 {
+        Plan::new(bsp)
+    } else {
+        plan
+    };
+    if plan.count as usize > MAX_CPUS || plan.apic_ids[0] != bsp {
+        crate::boot::fatal::kernel(11, b"firmware-cpu-plan");
+    }
+    start(plan)
+}
 /// # Safety
 /// Caller retains len resident initialized Candidate records, with no concurrent
 /// mutation. The input borrow ends before AP notification or scheduler calls.
@@ -700,12 +721,7 @@ pub unsafe extern "C" fn r4os_rust_smp_start(candidates: *const Candidate, len: 
         return true;
     }
     if !lapic::is_enabled() {
-        return start(Plan {
-            apic_ids: [0; MAX_CPUS],
-            count: 0,
-            duplicates: 0,
-            disabled: 0,
-        });
+        return start(Plan::EMPTY);
     }
     let plan = {
         let values = if len == 0 {
@@ -873,6 +889,14 @@ unsafe fn smp_log(
             puts(b" epoch=");
             dec(value);
             puts(b" qualification=allowed baseline=r4os-avx2-v1 xcr0=7 image=verified");
+        }
+        9 => {
+            puts(b"[SMP] capacity=");
+            dec(MAX_CPUS as u64);
+            puts(b" omitted-eligible-records=");
+            dec(u64::from(index));
+            puts(b" invalid-apic-records=");
+            dec(value);
         }
         _ => unreachable!(),
     }

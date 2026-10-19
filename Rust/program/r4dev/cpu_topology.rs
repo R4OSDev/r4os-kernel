@@ -10,28 +10,9 @@ use crate::{
 };
 use core::{mem, ptr};
 fn firmware_uid(apic: u32) -> Result<Option<u32>, ()> {
-    let info = acpi::snapshot();
-    let entries =
-        &info.madt_cpu_entries[..(info.madt_lapic_count as usize).min(info.madt_cpu_entries.len())];
-    let mut uid = None;
-    for entry in entries
-        .iter()
-        .filter(|e| e.flags & 3 != 0 && e.apic_id == apic)
-    {
-        if uid.is_some_and(|u| u != entry.acpi_uid) {
-            return Err(());
-        }
-        uid = Some(entry.acpi_uid);
-    }
-    if let Some(uid) = uid
-        && entries
-            .iter()
-            .any(|e| e.flags & 3 != 0 && e.acpi_uid == uid && e.apic_id != apic)
-    {
-        return Err(());
-    }
-    Ok(uid)
+    acpi::snapshot().madt_cpus.firmware_uid(apic)
 }
+
 fn cache_status(s: CacheState) -> u32 {
     match s {
         CacheState::Unavailable => c::cpu_topology_cache_unavailable,

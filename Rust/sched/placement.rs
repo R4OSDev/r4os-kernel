@@ -39,7 +39,7 @@ pub(crate) fn better_targets(
     efficient: bool,
     memory: Option<Preference>,
 ) -> u64 {
-    let mask = mask & ((1u64 << MAX_CPUS) - 1);
+    let mask = mask & crate::arch::smp_policy::CPU_MASK;
     if old as usize >= MAX_CPUS || mask & (1 << old) == 0 {
         return 0;
     }
@@ -90,7 +90,7 @@ pub(crate) fn choose_for_memory(
     efficient: bool,
     memory: Option<Preference>,
 ) -> Option<u32> {
-    let mut candidates = mask & ((1u64 << MAX_CPUS) - 1);
+    let mut candidates = mask & crate::arch::smp_policy::CPU_MASK;
     if candidates == 0 {
         return None;
     }
