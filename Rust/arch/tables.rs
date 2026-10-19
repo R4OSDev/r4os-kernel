@@ -341,7 +341,8 @@ pub unsafe extern "C" fn preparePageFaultFrame(
     address: u64,
 ) -> usize {
     crate::program::stack_fault::begin_fault();
-    if unsafe { (*frame).error_code } & 1 != 0 {
+    let error = unsafe { (*frame).error_code };
+    if error & 1 != 0 && error != 3 {
         return 0;
     }
     const BYTES: usize = size_of::<InterruptFrame>() + 16;

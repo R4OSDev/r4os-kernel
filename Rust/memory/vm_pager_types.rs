@@ -474,6 +474,7 @@ pub struct PageWriteback {
     pub unwind: Unwind,
     pub active: bool,
     pub completed: bool,
+    pub dirty_before: bool,
 }
 impl PageWriteback {
     pub const EMPTY: Self = Self {
@@ -483,6 +484,7 @@ impl PageWriteback {
         unwind: Unwind::EMPTY,
         active: false,
         completed: false,
+        dirty_before: false,
     };
 }
 pub(super) type SplitSlots = [Option<u16>; 2];

@@ -142,7 +142,7 @@ isr_common:
 
     # An interrupt may hit at either SysV stack phase. Preserve the exact
     # frame pointer in a callee-saved register and align the call stack before
-    # entering Zig. The saved guest r12 is already part of the frame above.
+    # entering Rust. The saved guest r12 is already part of the frame above.
     movq %rsp, %rdi
     movq %rsp, %r12
     andq $-16, %rsp

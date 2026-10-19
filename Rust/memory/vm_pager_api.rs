@@ -103,7 +103,18 @@ pub unsafe extern "C" fn r4os_rust_vm_demand_fault(
     owner: u8,
     owner_id: u64,
 ) -> bool {
-    pager::handle_demand_fault(address, error, owner, owner_id)
+    demand_fault(address, error, owner, owner_id, u64::MAX)
+}
+/// Exact program execution supplies its immutable resident limit. Admission
+/// includes pending page-ins before the VM owner is released for file I/O.
+pub(crate) fn demand_fault(
+    address: u64,
+    error: u64,
+    owner: u8,
+    owner_id: u64,
+    resident_limit: u64,
+) -> bool {
+    pager::handle_demand_fault(address, error, owner, owner_id, resident_limit)
 }
 /// # Safety
 /// Input/output are disjoint C values valid until this bounded call returns.

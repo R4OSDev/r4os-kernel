@@ -165,21 +165,26 @@ pub unsafe extern "C" fn r4os_rust_program_vm_reserve(
         let Some(len) = memory::page_align(size) else {
             return INVALID;
         };
-        if !profile_limit(0, instance, len) {
-            return LIMIT;
-        }
-        let region = match stack::reserve(
-            6,
-            4,
-            (*instance).id,
-            size,
-            alignment,
-            b"r4x-vm-region",
-            map_flags,
-            !(*instance).parallel_execution,
-        ) {
-            Ok(id) => id,
-            Err(code) => return error(code),
+        // The quota snapshot and publication share the VM owner. No caller
+        // output or waiting I/O is copied while this outer admission is held.
+        let region = {
+            let _vm = crate::memory::owner::Guard::acquire(5);
+            if !profile_limit(0, instance, len) {
+                return LIMIT;
+            }
+            match stack::reserve(
+                6,
+                4,
+                (*instance).id,
+                size,
+                alignment,
+                b"r4x-vm-region",
+                map_flags,
+                true,
+            ) {
+                Ok(id) => id,
+                Err(code) => return error(code),
+            }
         };
         let code = fill((*instance).id, region, out);
         if code != 0 {
@@ -211,6 +216,9 @@ pub unsafe extern "C" fn r4os_rust_program_vm_commit(
         if instance.is_null() {
             return NO_INSTANCE;
         }
+        // Window6 demand commit is metadata-only; resident commit is already
+        // bounded to64 pages and retains this owner for its complete operation.
+        let _vm = crate::memory::owner::Guard::acquire(5);
         if !profile_limit(1, instance, commit_len) || !system_limit(commit_len) {
             return LIMIT;
         }

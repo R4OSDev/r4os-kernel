@@ -54,6 +54,7 @@ pub struct Range {
     pub guard_len: u64,
     pub block_id: u32,
     pub pager_io_count: u32,
+    pub pager_in_count: u32,
     pub resident_commit_active: bool,
     pub resident_commit_failed: bool,
     pub resident_commit_base: u64,
@@ -90,6 +91,7 @@ impl Range {
         guard_len: 0,
         block_id: 0,
         pager_io_count: 0,
+        pager_in_count: 0,
         resident_commit_active: false,
         resident_commit_failed: false,
         resident_commit_base: 0,
@@ -131,6 +133,7 @@ fn contribution(range: &Range) -> vm_budget::Contribution {
             && range.window == contract::memory_window_r4x_vm
             && range.kind == contract::memory_kind_virtual_range)
             .then_some(range.owner_id),
+        pending_resident: u64::from(range.pager_in_count) * 4096,
     }
 }
 /// # Safety

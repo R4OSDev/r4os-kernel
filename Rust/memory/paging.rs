@@ -18,6 +18,7 @@ const WRITE_THROUGH: u64 = 1 << 3;
 const CACHE_DISABLE: u64 = 1 << 4;
 const ACCESSED: u64 = 1 << 5;
 const DIRTY: u64 = 1 << 6;
+const CR0_WP: u64 = 1 << 16;
 const PAT: u64 = 1 << 7;
 const HUGE: u64 = 1 << 7;
 const HUGE_PAT: u64 = 1 << 12;
@@ -96,6 +97,8 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
     stats: Stats::EMPTY,
 }));
 unsafe extern "C" {
+    fn r4os_read_cr0() -> u64;
+    fn r4os_write_cr0(value: u64);
     fn r4os_read_cr3() -> u64;
     fn r4os_invlpg(address: usize);
 
@@ -327,6 +330,12 @@ fn restore_failure(base: u64, pages: u64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_paging_init() -> bool {
     let _guard = Guard::acquire(6);
+    // Programs and drivers execute at CPL0. A pager's read-only writeback
+    // interval therefore requires WP here as well as in the AP trampoline.
+    unsafe { r4os_write_cr0(r4os_read_cr0() | CR0_WP) };
+    if unsafe { r4os_read_cr0() } & CR0_WP == 0 {
+        return false;
+    }
     let root = unsafe { r4os_read_cr3() } & MASK;
     state(|state| {
         state.stats.init_runs += 1;
@@ -728,6 +737,58 @@ pub extern "C" fn r4os_rust_paging_dirty(address: u64, clear: bool) -> bool {
     restore_count(1);
     restore_failure(address, 1);
     false
+}
+/// Caller pins the exact ordinary VM mapping under the VM owner. Only its
+/// writable bit changes; physical identity, cache type and other flags stay.
+fn update_writable(entry: *mut u64, writable: bool) -> u64 {
+    // Hardware may set Accessed/Dirty while the software PT owner is held.
+    // A load/store replacement could erase a racing dirty receipt.
+    let entry = unsafe { core::sync::atomic::AtomicU64::from_ptr(entry) };
+    if writable {
+        entry.fetch_or(WRITABLE, core::sync::atomic::Ordering::SeqCst)
+    } else {
+        entry.fetch_and(!WRITABLE, core::sync::atomic::Ordering::SeqCst)
+    }
+}
+pub(crate) fn set_writable(address: u64, writable: bool) -> bool {
+    let _guard = Guard::acquire(6);
+    if !active_matches() || !aligned(address) {
+        return false;
+    }
+    let Some(leaf) = leaf(root(), address) else {
+        return false;
+    };
+    if leaf.huge {
+        return false;
+    }
+    let previous = update_writable(leaf.entry, writable);
+    if (previous & WRITABLE != 0) == writable {
+        return true;
+    }
+    if invalidate(address, 1) {
+        return true;
+    }
+    shootdown_failure();
+    update_writable(leaf.entry, previous & WRITABLE != 0);
+    restore_count(1);
+    restore_failure(address, 1);
+    false
+}
+/// A write fault can arrive after its writeback interval has already ended.
+/// Refresh this CPU only after confirming the current mapping permits retry.
+pub(crate) fn retry_writable(address: u64) -> bool {
+    let _guard = Guard::acquire(6);
+    if !active_matches() || !aligned(address) {
+        return false;
+    }
+    let Some(leaf) = leaf(root(), address) else {
+        return false;
+    };
+    if read(leaf.entry) & WRITABLE == 0 {
+        return false;
+    }
+    flush(address);
+    true
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_paging_write_combining(address: u64, bytes: u64) -> bool {

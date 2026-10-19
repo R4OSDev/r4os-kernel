@@ -8,10 +8,7 @@ use super::{
     vm_ranges::{self, OptionalSlot, Range},
     vm_transactions,
 };
-use crate::{
-    arch::percpu,
-    sched::{sync_types, sync_wait, task_context},
-};
+use crate::sched::{sync_types, sync_wait, task_context};
 use core::{cell::UnsafeCell, ffi::c_void, mem::MaybeUninit, ptr};
 
 // Same CPU-bound VM owner; a token is explicitly consumed before waiting.
@@ -134,11 +131,6 @@ fn uncommit_page(index: usize, address: u64) -> Result<(), u32> {
     check(unsafe {
         vm_frames::r4os_rust_vm_uncommit_extent(vm_ranges::slot(index), address, 0, 1, false, true)
     })
-}
-fn free_frames() -> u64 {
-    let mut value = phys::Stats::default();
-    unsafe { phys::r4os_rust_phys_stats(&mut value) };
-    value.free_frames
 }
 fn can_commit(range: Range) -> bool {
     unsafe { vm_frames::r4os_rust_vm_can_commit(&range, 1) }
@@ -519,6 +511,111 @@ fn wait_activity(mut observed: u64) -> bool {
         == crate::sched::task::task_types::WaitResult::Signaled as u32
 }
 
+/// An executing file request retains its exact pageable buffer before taking
+/// any filesystem gate. The existing pager count excludes eviction and VM
+/// mutation; pre-faulting here prevents a filesystem/pager lock cycle.
+pub(crate) struct BufferLease {
+    region_id: u32,
+    unwind: task_context::Unwind,
+}
+impl Drop for BufferLease {
+    fn drop(&mut self) {
+        if self.region_id != 0 {
+            {
+                let _held = Held::acquire();
+                let index = lookup(self.region_id).expect("live file buffer range");
+                vm_ranges::update(index, |range| {
+                    assert!(range.pager_io_count != 0);
+                    range.pager_io_count -= 1;
+                });
+            }
+            wake_activity();
+        }
+        if self.unwind.admitted() {
+            unsafe { task_context::leave(self.unwind) };
+        }
+    }
+}
+pub(crate) fn file_buffer(
+    address: u64,
+    bytes: u64,
+    write: bool,
+    owner_id: u64,
+    resident_limit: u64,
+) -> Result<BufferLease, u32> {
+    let mut lease = BufferLease {
+        region_id: 0,
+        unwind: task_context::Unwind::EMPTY,
+    };
+    if bytes == 0 {
+        return Ok(lease);
+    }
+    let end = address.checked_add(bytes).ok_or(OVERFLOW)?;
+    let mut window = MaybeUninit::<virt_policy::Window>::uninit();
+    unsafe { virt_policy::r4os_rust_vm_window(6, window.as_mut_ptr()) };
+    let window = unsafe { window.assume_init() };
+    if address >= window.base + window.len || end <= window.base {
+        return Ok(lease);
+    }
+    if address < window.base || end > window.base + window.len {
+        return Err(OUTSIDE_WINDOW);
+    }
+    lease.unwind = unsafe { task_context::enter() };
+    if !lease.unwind.admitted() {
+        return Err(BUSY);
+    }
+    let mut waited = None;
+    loop {
+        let observed = sequence();
+        let mut held = Held::acquire();
+        let index = query(4, address);
+        if index == usize::MAX {
+            return Err(NOT_FOUND);
+        }
+        let range = vm_ranges::read(index);
+        if range.window != 6
+            || range.kind != 4
+            || range.owner != 3
+            || range.owner_id != owner_id
+            || range.partial_uncommit_len != 0
+            || (write && range.flags & 2 == 0)
+            || waited.is_some_and(|id| id != range.id)
+        {
+            return Err(OUTSIDE_WINDOW);
+        }
+        inside(range, address - range.base, bytes)?;
+        let first = address & !(PAGE - 1);
+        let last = (end - 1) & !(PAGE - 1);
+        if !covered(range, first, last - first + PAGE) {
+            return Err(NOT_COMMITTED);
+        }
+        if range.pager_io_count != 0 {
+            waited = Some(range.id);
+            held.release();
+            if !wait_activity(observed) {
+                return Err(BUSY);
+            }
+            continue;
+        }
+        vm_ranges::update(index, |range| range.pager_io_count += 1);
+        lease.region_id = range.id;
+        held.release();
+        let mut page = first;
+        loop {
+            if !handle_demand_fault(page, if write { 3 } else { 0 }, 3, owner_id, resident_limit) {
+                return Err(MAP_FAILED);
+            }
+            if page == last {
+                return Ok(lease);
+            }
+            if ((page - first) / PAGE + 1).is_multiple_of(64) {
+                crate::sched::scheduler::safe_reschedule();
+            }
+            page += PAGE;
+        }
+    }
+}
+
 pub(super) fn begin_writeback(
     id: u32,
     offset: u64,
@@ -526,9 +623,6 @@ pub(super) fn begin_writeback(
     pointer: *const u8,
 ) -> Result<PageWriteback, u32> {
     let _held = Held::acquire();
-    if percpu::current_index() != 0 {
-        return Err(BUSY);
-    }
     let index = lookup(id)?;
     let range = vm_ranges::read(index);
     let bytes = pages.checked_mul(PAGE).ok_or(OVERFLOW)?;
@@ -547,6 +641,7 @@ pub(super) fn begin_writeback(
         return Err(NOT_COMMITTED);
     }
     let first = offset / PAGE;
+    let mut dirty_before = false;
     for i in 0..pages {
         let state = ps::with(|s| s.fault_in_range(range, first + i)).ok_or(NOT_COMMITTED)?;
         if state.flags & (page_state_flag_busy | page_state_flag_pinned) != 0 {
@@ -555,6 +650,7 @@ pub(super) fn begin_writeback(
         if state.flags & page_state_flag_resident == 0 || !mapped(start + i * PAGE) {
             return Err(NOT_COMMITTED);
         }
+        dirty_before |= state.flags & page_state_flag_dirty != 0;
     }
     let unwind = unsafe { task_context::enter() };
     if !unwind.admitted() {
@@ -573,8 +669,26 @@ pub(super) fn begin_writeback(
         return Err(error);
     }
     for i in 0..pages {
+        // Freeze all CPU writers before observing the final dirty epoch and
+        // exposing these bytes to file I/O. CPL0 also obeys WP on every CPU.
+        if !paging::set_writable(start + i * PAGE, false) {
+            restore_write_access(range, first, pages);
+            let _ = ps::set(
+                id,
+                first,
+                pages,
+                page_state_flag_dirty,
+                page_state_flag_busy,
+                None,
+                true,
+            );
+            unsafe { task_context::leave(unwind) };
+            return Err(MAP_FAILED);
+        }
+        dirty_before |= dirty(start + i * PAGE);
         // A new hardware dirty epoch begins only after its real TLB ACK.
         if !paging::r4os_rust_paging_dirty(start + i * PAGE, true) {
+            restore_write_access(range, first, pages);
             let _ = ps::set(
                 id,
                 first,
@@ -596,7 +710,21 @@ pub(super) fn begin_writeback(
         unwind,
         active: true,
         completed: false,
+        dirty_before,
     })
+}
+fn restore_write_access(range: Range, first: u64, pages: u64) {
+    for i in 0..pages {
+        let address = range.base + (first + i) * PAGE;
+        if mapped(address) {
+            // A failed restoration cannot release the range/unwind barriers
+            // or strand waiting writers behind a falsely completed interval.
+            assert!(
+                paging::set_writable(address, range.flags & 2 != 0),
+                "pager write-access restoration"
+            );
+        }
+    }
 }
 pub(super) fn end_writeback(writeback: &mut PageWriteback) {
     if !writeback.active {
@@ -605,6 +733,7 @@ pub(super) fn end_writeback(writeback: &mut PageWriteback) {
     let mut held = Held::acquire();
     if let Some(index) = ps::index(writeback.region_id) {
         let range = vm_ranges::read(index);
+        restore_write_access(range, writeback.region_offset / PAGE, writeback.page_count);
         let add = if writeback.completed {
             0
         } else {
@@ -728,19 +857,7 @@ fn page_in_fault(index: usize, address: u64, page: u64, token: owner::Token) -> 
     let Some(backing) = backing_result() else {
         return page_in_failure(index, page, true);
     };
-    let active_path = unsafe { bs::r4os_rust_backing_active_path() };
-    if active_path.is_null() {
-        return page_in_failure(index, page, true);
-    }
-    let mut path = [0u8; backing::MAX_BACKING_PATH + 1];
-    let mut len = 0;
-    while unsafe { active_path.add(len).read() } != 0 {
-        len += 1
-    }
-    if len >= backing::MAX_BACKING_PATH {
-        return page_in_failure(index, page, true);
-    }
-    unsafe { ptr::copy_nonoverlapping(active_path, path.as_mut_ptr(), len) };
+    let path = backing.path;
     let unwind = unsafe { task_context::enter() };
     if !unwind.admitted() {
         return page_in_failure(index, page, false);
@@ -750,7 +867,10 @@ fn page_in_fault(index: usize, address: u64, page: u64, token: owner::Token) -> 
         unsafe { task_context::leave(unwind) };
         return result;
     }
-    vm_ranges::update(index, |range| range.pager_io_count += 1);
+    vm_ranges::update(index, |range| {
+        range.pager_io_count += 1;
+        range.pager_in_count += 1;
+    });
     let mut private_frame = None;
     let mut published = false;
     let result = (|| {
@@ -829,19 +949,32 @@ fn page_in_fault(index: usize, address: u64, page: u64, token: owner::Token) -> 
     // The live pager count and exact unwind anchor pin this range throughout
     // I/O. Clear the metadata before waking, without entering runtime under VM.
     let _ = ps::set(range.id, page, 1, 0, page_state_flag_busy, None, true);
-    vm_ranges::update(index, |range| range.pager_io_count -= 1);
+    vm_ranges::update(index, |range| {
+        range.pager_io_count -= 1;
+        range.pager_in_count -= 1;
+    });
     held.release();
     wake_activity();
     held.reacquire();
     unsafe { task_context::leave(unwind) };
     result
 }
-pub(super) fn handle_demand_fault(address: u64, error_code: u64, owner: u8, owner_id: u64) -> bool {
+pub(super) fn handle_demand_fault(
+    address: u64,
+    error_code: u64,
+    owner: u8,
+    owner_id: u64,
+    resident_limit: u64,
+) -> bool {
+    let write_protection = error_code == 3;
+    if error_code & !2 != 0 && !write_protection {
+        return false;
+    }
     let mut waited = None;
     loop {
         let observed = sequence();
         let mut held = Held::acquire();
-        if !ready() || error_code & 1 != 0 {
+        if !ready() {
             return false;
         }
         let address = address & !(PAGE - 1);
@@ -854,6 +987,9 @@ pub(super) fn handle_demand_fault(address: u64, error_code: u64, owner: u8, owne
             return false;
         }
         if range.kind != 4 || range.partial_uncommit_len != 0 {
+            return false;
+        }
+        if write_protection && range.flags & 2 == 0 {
             return false;
         }
         if waited.is_some_and(|id| id != range.id) {
@@ -873,11 +1009,8 @@ pub(super) fn handle_demand_fault(address: u64, error_code: u64, owner: u8, owne
         if let Some(state) = ps::with(|s| s.fault_in_range(range, page)) {
             if state.flags & page_state_flag_busy != 0
                 && range.pager_io_count != 0
-                && !mapped(address)
+                && (!mapped(address) || write_protection)
             {
-                if percpu::current_index() != 0 {
-                    return false;
-                }
                 waited = Some(range.id);
                 held.release();
                 if !wait_activity(observed) {
@@ -886,24 +1019,20 @@ pub(super) fn handle_demand_fault(address: u64, error_code: u64, owner: u8, owne
                 continue;
             }
             if mapped(address) {
-                return waited.is_some();
+                return !write_protection || paging::retry_writable(address);
             }
-            if !can_commit(range) {
+            if !can_commit(range) || !resident_admitted(owner_id, resident_limit) {
                 fault_failure(index);
                 return false;
             }
             if state.flags & page_state_flag_slot_bound != 0 {
-                if percpu::current_index() != 0 {
-                    fault_failure(index);
-                    return false;
-                }
                 return page_in_fault(index, address, page, held.take());
             }
         }
         if mapped(address) {
-            return waited.is_some();
+            return !write_protection || paging::retry_writable(address);
         }
-        if !can_commit(range) {
+        if !can_commit(range) || !resident_admitted(owner_id, resident_limit) {
             fault_failure(index);
             return false;
         }
@@ -932,6 +1061,12 @@ pub(super) fn handle_demand_fault(address: u64, error_code: u64, owner: u8, owne
         return true;
     }
 }
+fn resident_admitted(owner_id: u64, limit: u64) -> bool {
+    vm_ranges::budget_application(owner_id)
+        .resident
+        .checked_add(PAGE)
+        .is_some_and(|resident| resident <= limit)
+}
 
 fn pager_page_out_failure(dirty: bool) {
     ps::with(|s| {
@@ -943,19 +1078,8 @@ fn pager_page_out_failure(dirty: bool) {
         }
     });
 }
-fn clear_eviction_busy(id: u32, page: u64) {
-    let _ = ps::set(id, page, 1, 0, page_state_flag_busy, None, true);
-}
 fn mark_eviction_error(id: u32, page: u64) {
-    let _ = ps::set(
-        id,
-        page,
-        1,
-        page_state_flag_error,
-        page_state_flag_busy,
-        None,
-        true,
-    );
+    let _ = ps::set(id, page, 1, page_state_flag_error, 0, None, true);
 }
 fn release_eviction_slot(backing: backing::Result, reservation: u32, owner: u32, id: u32) {
     slot_probe(backing::SlotInput {
@@ -995,7 +1119,6 @@ fn evict_clean_bound(
         ..backing::PageIoInput::INIT
     };
     if io_prepare(input).status != backing::page_io_status_ready {
-        clear_eviction_busy(range.id, page);
         ps::with(|s| {
             s.summary.eviction_slot_failures = s.summary.eviction_slot_failures.wrapping_add(1)
         });
@@ -1004,24 +1127,22 @@ fn evict_clean_bound(
             ..EvictionStep::EMPTY
         };
     }
-    let before = free_frames();
-    match make_nonresident(range.id, page * PAGE, 1) {
-        Ok(returned) => ps::with(|s| {
-            s.summary.page_out_nonresident_pages =
-                s.summary.page_out_nonresident_pages.wrapping_add(returned)
-        }),
+    let returned = match make_nonresident(range.id, page * PAGE, 1) {
+        Ok(returned) => {
+            ps::with(|s| {
+                s.summary.page_out_nonresident_pages =
+                    s.summary.page_out_nonresident_pages.wrapping_add(returned)
+            });
+            u32::try_from(returned).expect("returned pages")
+        }
         Err(_) => {
-            clear_eviction_busy(range.id, page);
             ps::with(|s| s.summary.eviction_failures = s.summary.eviction_failures.wrapping_add(1));
             return EvictionStep {
                 outcome: EvictionOutcome::Failed,
                 ..EvictionStep::EMPTY
             };
         }
-    }
-    clear_eviction_busy(range.id, page);
-    let after = free_frames();
-    let returned = u32::try_from(after.saturating_sub(before)).expect("physical frame delta");
+    };
     if returned == 0 {
         ps::with(|s| s.summary.eviction_failures = s.summary.eviction_failures.wrapping_add(1));
         return EvictionStep {
@@ -1052,18 +1173,22 @@ fn evict_resident(id: u32, page: u64, backing: backing::Result, path: *const u8)
         return EvictionStep::EMPTY;
     }
     let address = range.base + page * PAGE;
-    let dirty = state.flags & page_state_flag_dirty != 0 || dirty(address);
-    if state.flags & page_state_flag_slot_bound != 0 && !dirty {
-        return evict_clean_bound(index, page, state, backing);
-    }
     let pointer = ptr::with_exposed_provenance::<u8>(address as usize);
     let Ok(mut writeback) = begin_writeback(id, page * PAGE, 1, pointer) else {
         return EvictionStep {
             outcome: EvictionOutcome::Failed,
-            dirty,
+            dirty: true,
             ..EvictionStep::EMPTY
         };
     };
+    let dirty = writeback.dirty_before;
+    if state.flags & page_state_flag_slot_bound != 0 && !dirty {
+        let result = evict_clean_bound(index, page, state, backing);
+        writeback.completed = matches!(result.outcome, EvictionOutcome::Returned);
+        held.release();
+        end_writeback(&mut writeback);
+        return result;
+    }
     // Its exact I/O count and unwind anchor retain mappings after releasing
     // the original outer owner. EndWriteback must run after its final release.
     held.release();
@@ -1399,10 +1524,6 @@ pub(super) fn reclaim_evict(
     let requested = if raw_requested == 0 { 1 } else { raw_requested };
     let mut result = reclaim::SourceResult::INIT;
     if !ready() {
-        return result;
-    }
-    if percpu::current_index() != 0 {
-        result.failures = 1;
         return result;
     }
     note(|s| s.eviction_attempts = s.eviction_attempts.wrapping_add(1));

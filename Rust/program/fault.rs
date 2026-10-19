@@ -5,7 +5,6 @@ use super::{
     stack,
     stack_fault::{self, Failure},
     threads::{self, Thread},
-    vm,
 };
 use crate::{
     arch::{callback_abort, percpu},
@@ -241,17 +240,25 @@ pub unsafe extern "C" fn r4os_rust_program_fault_handle(
     rsp: u64,
 ) -> bool {
     unsafe {
-        if error & 1 != 0 || !owner::fault_allowed() {
+        if (error & !2 != 0 && error != 3) || !owner::fault_allowed() {
             return false;
         }
         if pageable {
             let instance = super::context::execution();
             if !instance.is_null()
-                && vm::profile_limit(2, instance, 4096)
-                && program_fault_demand(address, error, (*instance).id)
+                && crate::memory::vm_pager_api::demand_fault(
+                    address,
+                    error,
+                    3,
+                    u64::from((*instance).id),
+                    (*instance).memory_limits.resident_limit,
+                )
             {
                 return true;
             }
+        }
+        if error & 1 != 0 {
+            return false;
         }
         let thread = threads::current();
         if !thread.is_null() {
@@ -282,11 +289,5 @@ unsafe fn growth_result(result: Result<(), Failure>, address: u64, rsp: u64, err
             unsafe { stack_fault::growth_failed(address, rsp, error, failure) };
             false
         }
-    }
-}
-
-unsafe fn program_fault_demand(address: u64, error: u64, owner: u32) -> bool {
-    unsafe {
-        crate::memory::vm_pager_api::r4os_rust_vm_demand_fault(address, error, 3, u64::from(owner))
     }
 }

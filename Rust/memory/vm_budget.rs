@@ -11,11 +11,12 @@ pub(crate) struct Usage {
 pub(super) struct Contribution {
     pub usage: Usage,
     pub application: Option<u64>,
+    pub pending_resident: u64,
 }
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
-struct Total([u128; 3]);
+struct Total([u128; 4]);
 impl Total {
-    const ZERO: Self = Self([0; 3]);
+    const ZERO: Self = Self([0; 4]);
     fn replace(&mut self, before: Usage, after: Usage) {
         for (total, (old, new)) in self.0.iter_mut().zip([
             (before.reserved, after.reserved),
@@ -32,6 +33,14 @@ impl Total {
             committed: narrow(self.0[1]),
             resident: narrow(self.0[2]),
         }
+    }
+    fn pending_replace(&mut self, before: u64, after: u64) {
+        self.0[3] = self.0[3] - u128::from(before) + u128::from(after);
+    }
+    fn admitted_usage(self) -> Usage {
+        let mut usage = self.usage();
+        usage.resident = (self.0[2] + self.0[3]).min(u128::from(u64::MAX)) as u64;
+        usage
     }
 }
 #[derive(Clone, Copy)]
@@ -81,7 +90,7 @@ impl<const N: usize> Ledger<N> {
         }
         None
     }
-    fn insert(&mut self, owner: u64, usage: Usage) {
+    fn insert(&mut self, owner: u64, usage: Usage, pending: u64) {
         let home = Self::home(owner);
         for distance in 0..N {
             let entry = &mut self.applications[(home + distance) & (N - 1)];
@@ -89,6 +98,7 @@ impl<const N: usize> Ledger<N> {
                 entry.owner = owner;
                 entry.ranges += 1;
                 entry.bytes.replace(Usage::default(), usage);
+                entry.bytes.pending_replace(0, pending);
                 return;
             }
         }
@@ -96,10 +106,11 @@ impl<const N: usize> Ledger<N> {
         // must be available before reserve can publish another contribution.
         unreachable!("VM budget keys exceed live range capacity");
     }
-    fn remove(&mut self, owner: u64, usage: Usage) {
+    fn remove(&mut self, owner: u64, usage: Usage, pending: u64) {
         let at = self.find(owner).expect("published VM budget owner");
         let entry = &mut self.applications[at];
         entry.bytes.replace(usage, Usage::default());
+        entry.bytes.pending_replace(pending, 0);
         entry.ranges -= 1;
         if entry.ranges != 0 {
             return;
@@ -128,19 +139,24 @@ impl<const N: usize> Ledger<N> {
             return;
         }
         self.bytes.replace(before.usage, after.usage);
+        self.bytes
+            .pending_replace(before.pending_resident, after.pending_resident);
         match (before.application, after.application) {
             (Some(old), Some(new)) if old == new => {
                 let at = self.find(old).expect("published VM budget owner");
                 self.applications[at]
                     .bytes
                     .replace(before.usage, after.usage);
+                self.applications[at]
+                    .bytes
+                    .pending_replace(before.pending_resident, after.pending_resident);
             }
             (old, new) => {
                 if let Some(owner) = old {
-                    self.remove(owner, before.usage);
+                    self.remove(owner, before.usage, before.pending_resident);
                 }
                 if let Some(owner) = new {
-                    self.insert(owner, after.usage);
+                    self.insert(owner, after.usage, after.pending_resident);
                 }
             }
         }
@@ -149,8 +165,9 @@ impl<const N: usize> Ledger<N> {
         self.bytes.usage()
     }
     pub fn application(&self, owner: u64) -> Usage {
-        self.find(owner)
-            .map_or(Usage::default(), |at| self.applications[at].bytes.usage())
+        self.find(owner).map_or(Usage::default(), |at| {
+            self.applications[at].bytes.admitted_usage()
+        })
     }
     /// Existing explicit diagnostics may scan ranges. This is never used by
     /// admission and keeps verification scratch independent of range capacity.
@@ -159,6 +176,7 @@ impl<const N: usize> Ledger<N> {
         for slot in 0..N {
             let contribution = range(slot);
             global.replace(Usage::default(), contribution.usage);
+            global.pending_replace(0, contribution.pending_resident);
             if let Some(owner) = contribution.application
                 && self.find(owner).is_none()
             {
@@ -184,6 +202,7 @@ impl<const N: usize> Ledger<N> {
                 let contribution = range(slot);
                 if contribution.application == Some(entry.owner) {
                     bytes.replace(Usage::default(), contribution.usage);
+                    bytes.pending_replace(0, contribution.pending_resident);
                     ranges += 1;
                 }
             }

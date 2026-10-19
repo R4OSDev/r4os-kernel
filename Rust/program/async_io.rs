@@ -1616,6 +1616,33 @@ unsafe fn perform(req: *mut Request) -> i32 {
             Kind::Lock => file_lock(req),
             Kind::Service => perform_service(req),
             kind => {
+                // Admission happens outside async/FS locks. Pageable client
+                // buffers remain resident through the actual backend return,
+                // before publishing completion or allowing Close/Cancel reuse.
+                let read = matches!(kind, Kind::Read | Kind::ReadAt);
+                let write = matches!(
+                    kind,
+                    Kind::Write | Kind::Append | Kind::WriteAt | Kind::StreamWrite
+                );
+                let _buffer = if read || write {
+                    let (address, bytes) = if read {
+                        ((*req).out, (*req).out_len)
+                    } else {
+                        ((*req).data, (*req).data_len)
+                    };
+                    match crate::memory::vm_pager::file_buffer(
+                        address as u64,
+                        bytes,
+                        read,
+                        u64::from((*req).owner_id),
+                        (*(*req).owner_instance).memory_limits.resident_limit,
+                    ) {
+                        Ok(lease) => Some(lease),
+                        Err(_) => return BUSY,
+                    }
+                } else {
+                    None
+                };
                 let result = program_async_file(
                     kind as u32,
                     path,
