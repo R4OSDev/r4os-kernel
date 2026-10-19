@@ -7,7 +7,12 @@ use crate::sched::task::{
     task_types::{Entry, Role, Task},
 };
 use core::cell::UnsafeCell;
-struct Cell(UnsafeCell<Ledger<96>>);
+// The complete selected profile keeps historical receipts for earlier cases
+// before admitting the 65-task deadline case. 96 entries exhausted that
+// session despite every earlier task being reaped. This bounds diagnostic
+// history only; it is not the system Task capacity or a cleanup shortcut.
+const SESSION_RECORDS: usize = 128;
+struct Cell(UnsafeCell<Ledger<SESSION_RECORDS>>);
 // Exclusive gate -> BSP controller -> DONE acquire -> original caller.
 unsafe impl Sync for Cell {}
 static LEDGER: Cell = Cell(UnsafeCell::new(Ledger::EMPTY));

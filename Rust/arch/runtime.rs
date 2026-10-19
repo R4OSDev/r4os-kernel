@@ -76,6 +76,25 @@ pub(crate) fn save_local() -> u64 {
     cli();
     saved
 }
+// Only the current LOCK owner writes these counters. Nested admission also
+// retains LOCK; finish_outer runs before its Release store, even after depth
+// reaches zero during a switch. The only reset precedes AP startup. Passive
+// snapshots still use atomic loads, so keep atomic storage but avoid a second
+// locked read/modify/write while admission already excludes other writers.
+// ACQUISITIONS is deliberately excluded: contenders update it before LOCK.
+#[inline]
+fn add_owned(counter: &AtomicU64, amount: u64) {
+    counter.store(
+        counter.load(Ordering::Relaxed).wrapping_add(amount),
+        Ordering::Relaxed,
+    );
+}
+#[inline]
+fn max_owned(counter: &AtomicU64, value: u64) {
+    if value > counter.load(Ordering::Relaxed) {
+        counter.store(value, Ordering::Relaxed);
+    }
+}
 fn acquire(saved: u64) {
     if !enabled() {
         return;
@@ -90,7 +109,7 @@ fn acquire(saved: u64) {
     let previous = unsafe { depth.read() };
     if previous != 0 {
         unsafe { depth.write(previous.saturating_add(1)) };
-        NESTED.fetch_add(1, Ordering::Relaxed);
+        add_owned(&NESTED, 1);
         return;
     }
     let mut spins = 0u64;
@@ -125,14 +144,14 @@ fn acquire(saved: u64) {
         }
     }
     if collided {
-        COLLISIONS.fetch_add(1, Ordering::Relaxed);
+        add_owned(&COLLISIONS, 1);
     }
     if cpu_collision {
-        CPU_COLLISIONS.fetch_add(1, Ordering::Relaxed);
+        add_owned(&CPU_COLLISIONS, 1);
     }
     if config::ENABLE_METRICS && collided {
-        WAIT_SPINS.fetch_add(spins, Ordering::Relaxed);
-        MAX_WAIT_SPINS.fetch_max(spins, Ordering::Relaxed);
+        add_owned(&WAIT_SPINS, spins);
+        max_owned(&MAX_WAIT_SPINS, spins);
     }
     OWNER_CPU_PLUS_ONE.store(
         u8::try_from(cpu + 1).expect("Runtime CPU identity exceeds owner field"),
@@ -146,8 +165,8 @@ fn acquire(saved: u64) {
 fn finish_outer(cpu: u32) {
     if config::ENABLE_METRICS {
         let cycles = tsc().wrapping_sub(ACQUIRED_TSC[cpu as usize].load(Ordering::Relaxed));
-        HOLD_CYCLES.fetch_add(cycles, Ordering::Relaxed);
-        MAX_HOLD_CYCLES.fetch_max(cycles, Ordering::Relaxed);
+        add_owned(&HOLD_CYCLES, cycles);
+        max_owned(&MAX_HOLD_CYCLES, cycles);
     }
     OWNER_CPU_PLUS_ONE.store(0, Ordering::Release);
 }
