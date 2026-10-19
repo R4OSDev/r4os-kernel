@@ -59,7 +59,52 @@ pub struct Stats {
     pub generation: u64,
 }
 fn online_mask() -> u64 {
-    percpu::r4os_rust_percpu_control(16, 0, 0, 0)
+    percpu::tlb_mask()
+}
+/// Includes global translations. Only the current quiescent CPU uses this
+/// barrier; it touches resident kernel storage and retains its idle stack.
+pub(crate) fn flush_all_local() {
+    let cr4: u64;
+    unsafe {
+        core::arch::asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        if cr4 & (1 << 7) != 0 {
+            core::arch::asm!("mov cr4, {}", in(reg) cr4 & !(1 << 7), options(nostack, preserves_flags));
+            core::arch::asm!("mov cr4, {}", in(reg) cr4, options(nostack, preserves_flags));
+        } else {
+            r4os_write_cr3(r4os_read_cr3());
+        }
+    }
+    LOCAL_RELOADS.fetch_add(1, Ordering::Relaxed);
+}
+/// The page-table owner excludes a new request while the exact parked epoch
+/// leaves participation. No old request or ACK is promoted to a new epoch.
+pub(crate) fn withdraw_cpu(parked: &super::cpu_lifecycle::Parked) -> Option<u64> {
+    let index = parked.index();
+    if !owner::held(6)
+        || DIAGNOSTIC.load(Ordering::Acquire)
+        || crate::platform::cpu_topology::epoch(index) != parked.epoch()
+    {
+        return None;
+    }
+    let generation = REQUEST_GENERATION.load(Ordering::Acquire);
+    if REQUEST_TARGET.load(Ordering::Acquire) & (1u64 << index) != 0
+        && ACKS[index as usize].load(Ordering::Acquire) != generation
+    {
+        return None;
+    }
+    percpu::withdraw_tlb(parked).then_some(generation)
+}
+pub(crate) fn rearm_cpu(stopped: &super::cpu_lifecycle::Stopped) -> bool {
+    let index = stopped.index();
+    if !stopped.current()
+        || !owner::held(6)
+        || percpu::state(index) != percpu::OFFLINE
+        || percpu::tlb_mask() & (1u64 << index) != 0
+    {
+        return false;
+    }
+    ACKS[index as usize].store(0, Ordering::Release);
+    true
 }
 fn flush_local(base: u64, pages: u64) {
     if pages >= FULL_RELOAD {

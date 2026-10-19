@@ -43,8 +43,15 @@ unsafe impl Sync for Storage {}
 static LOCALS: Storage = Storage(UnsafeCell::new([const { CpuLocal::empty() }; MAX_CPUS]));
 static READY: AtomicBool = AtomicBool::new(false);
 static SCHEDULABLE: AtomicU64 = AtomicU64::new(0);
+// A parked IF=0 CPU still polls invalidations until the page-table owner
+// withdraws its exact quiescent epoch. Scheduling admission is independent.
+static TLB_PARTICIPANTS: AtomicU64 = AtomicU64::new(0);
 static PRODUCTIVE_KERNEL: AtomicU64 = AtomicU64::new(0);
 static PRODUCTIVE_R4X: AtomicU64 = AtomicU64::new(0);
+pub(crate) const DRAINING: u8 = 9;
+pub(crate) const PARKED: u8 = 10;
+pub(crate) const OFFLINE: u8 = 11;
+pub(crate) const STOP_PENDING: u8 = 12;
 
 unsafe extern "C" {
     fn r4os_current_cpu_index() -> u32;
@@ -87,6 +94,7 @@ fn init_bsp(apic_id: u32) {
     }
     install(0);
     SCHEDULABLE.store(1, Ordering::Release);
+    TLB_PARTICIPANTS.store(1, Ordering::Release);
     PRODUCTIVE_KERNEL.store(0, Ordering::Release);
     PRODUCTIVE_R4X.store(0, Ordering::Release);
     READY.store(true, Ordering::Release);
@@ -97,14 +105,24 @@ pub fn state(index: u32) -> u8 {
 pub(crate) fn is_schedulable(index: u32) -> bool {
     index < MAX_CPUS as u32 && SCHEDULABLE.load(Ordering::Acquire) & (1 << index) != 0
 }
+pub(crate) fn tlb_mask() -> u64 {
+    TLB_PARTICIPANTS.load(Ordering::Acquire)
+}
+pub(crate) fn is_online(index: u32) -> bool {
+    matches!(state(index), 4 | DRAINING | PARKED | STOP_PENDING)
+}
 fn allowed(from: u8, to: u8) -> bool {
     match from {
         1 => to == 2 || to == 7,
         2 => to == 3 || to == 7,
         3 => to == 8 || to == 7,
         8 => to == 4 || to == 7,
-        4 => to == 5,
+        4 => to == 5 || to == DRAINING,
         5 => to == 6,
+        DRAINING => to == PARKED || to == 4 || to == 5,
+        PARKED => to == 4 || to == 5,
+        OFFLINE => to == 1,
+        STOP_PENDING => false,
         0 | 6 | 7 => false,
         _ => panic!("Invalid private CPU lifecycle state"),
     }
@@ -124,9 +142,16 @@ fn transition_held(index: u32, from: u8, to: u8) -> bool {
     }
     let bit = 1u64 << index;
     if to == 4 {
+        TLB_PARTICIPANTS.fetch_or(bit, Ordering::AcqRel);
         SCHEDULABLE.fetch_or(bit, Ordering::AcqRel);
     } else {
         SCHEDULABLE.fetch_and(!bit, Ordering::AcqRel);
+        if to == 6 || to == 7 {
+            TLB_PARTICIPANTS.fetch_and(!bit, Ordering::AcqRel);
+        }
+    }
+    if to == 4 || from == 4 {
+        super::cpu_lifecycle::capacity_changed();
     }
     true
 }
@@ -146,7 +171,7 @@ fn configure(index: u32, apic_id: u32) -> bool {
     true
 }
 fn transition(index: u32, from: u8, to: u8) -> bool {
-    if !allowed(from, to) {
+    if !allowed(from, to) || from == 8 && to == 4 && !crate::memory::owner::held(6) {
         return false;
     }
     let _owner = RuntimeGuard::acquire();
@@ -164,11 +189,98 @@ fn lifecycle_mask(qualified: bool) -> u64 {
     let mut mask = 0;
     for index in 0..MAX_CPUS as u32 {
         let current = state(index);
-        if current == 4 || (qualified && (current == 8 || current == 5)) {
+        if matches!(current, 4 | DRAINING | PARKED | STOP_PENDING)
+            || (qualified && (current == 8 || current == 5))
+        {
             mask |= 1 << index;
         }
     }
     mask
+}
+
+/// Caller retains runtime admission and the lifecycle controller claim.
+pub(crate) fn begin_drain(index: u32) -> bool {
+    index != 0 && transition(index, 4, DRAINING)
+}
+pub(crate) fn cancel_unparked(index: u32) -> bool {
+    index != 0 && transition(index, DRAINING, 4)
+}
+/// Executed only from this AP's actual idle continuation after switch release.
+pub(crate) fn park_current() -> bool {
+    let index = current_index();
+    index != 0 && transition(index, DRAINING, PARKED)
+}
+/// Before TLB withdrawal only, the AP can resume its own exact old epoch.
+pub(crate) fn resume_current() -> bool {
+    let index = current_index();
+    index != 0
+        && tlb_mask() & (1u64 << index) != 0
+        && matches!(state(index), DRAINING | PARKED)
+        && transition(index, state(index), 4)
+}
+/// Requires the exact parked proof and the existing page-table owner.
+pub(crate) fn withdraw_tlb(parked: &super::cpu_lifecycle::Parked) -> bool {
+    let index = parked.index();
+    if index == 0 || state(index) != PARKED || is_schedulable(index) {
+        return false;
+    }
+    let bit = 1u64 << index;
+    TLB_PARTICIPANTS.fetch_and(!bit, Ordering::AcqRel) & bit != 0
+}
+/// No runtime owner is taken after TLB withdrawal. The AP is already parked
+/// with IF=0 and can never dispatch work; only its own stop may change state.
+pub(crate) fn arm_stop(index: u32) -> bool {
+    let Some(local) = local(index) else {
+        return false;
+    };
+    index != 0
+        && !is_schedulable(index)
+        && tlb_mask() & (1u64 << index) == 0
+        && unsafe {
+            (*local)
+                .state
+                .compare_exchange(PARKED, STOP_PENDING, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
+}
+pub(crate) fn confirm_stopped_current() -> bool {
+    let index = current_index();
+    let Some(local) = local(index) else {
+        return false;
+    };
+    index != 0
+        && !is_schedulable(index)
+        && tlb_mask() & (1u64 << index) == 0
+        && unsafe {
+            (*local)
+                .state
+                .compare_exchange(STOP_PENDING, OFFLINE, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        }
+}
+/// A terminal system stop never becomes a reusable logical stop receipt.
+pub(crate) fn terminal_parked_current() -> bool {
+    let index = current_index();
+    let Some(local) = local(index) else {
+        return false;
+    };
+    let state = state(index);
+    if index == 0 || !matches!(state, PARKED | STOP_PENDING | 5) {
+        return false;
+    }
+    SCHEDULABLE.fetch_and(!(1u64 << index), Ordering::AcqRel);
+    TLB_PARTICIPANTS.fetch_and(!(1u64 << index), Ordering::AcqRel);
+    unsafe {
+        (*local)
+            .state
+            .compare_exchange(state, 6, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+}
+pub(crate) fn rearm(stopped: &super::cpu_lifecycle::Stopped, next: u64) -> bool {
+    next > stopped.epoch()
+        && crate::platform::cpu_topology::epoch(stopped.index()) == next
+        && transition(stopped.index(), OFFLINE, 1)
 }
 fn flag(index: u32, work: bool) -> Option<&'static AtomicU8> {
     let local = local(index)?;

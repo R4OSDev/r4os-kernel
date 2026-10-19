@@ -461,9 +461,22 @@ unsafe extern "C" fn bsp_idle_entry() {
 pub fn secondary_loop() -> ! {
     runtime::r4os_rust_runtime_control(1, 0);
     loop {
+        crate::arch::cpu_lifecycle::idle_checkpoint();
         yield_task();
+        crate::arch::cpu_lifecycle::idle_checkpoint();
         wait_until_deadline();
     }
+}
+/// Caller holds runtime admission; execution has reached the permanent idle
+/// continuation after cpu.S saved the outgoing frame and released its owner.
+pub(crate) fn idle_switch_complete(index: u32) -> bool {
+    let cpu = cpu_state(index);
+    index == percpu::current_index()
+        && cpu.initialized
+        && cpu.current == cpu.idle
+        && !cpu.current.is_null()
+        && !cpu.current_work
+        && read(|s| s.placement_outgoing[index as usize].is_null())
 }
 pub(crate) fn preempt_disable() {
     change(|s| s.preempt_disable_call_count = s.preempt_disable_call_count.wrapping_add(1));
@@ -549,6 +562,9 @@ fn refresh_pending(running: Task) {
     }
 }
 fn next_ready(force_priority: bool) -> Task {
+    if !percpu::is_schedulable(percpu::current_index()) {
+        return ptr::null_mut();
+    }
     refill_ready();
     let ordinal = change(|s| {
         s.priority_selects = s.priority_selects.wrapping_add(1);
@@ -637,8 +653,26 @@ pub(crate) fn request_placement_switch(cpu: u32) {
     cpu_change(cpu, |s| s.pending = true);
     send_reschedule(cpu);
 }
+pub(crate) fn request_cpu_drain(cpu: u32, epoch: u64) -> bool {
+    cpu_change(cpu, |s| s.pending = true);
+    crate::arch::smp::request_drain_reschedule(cpu, epoch)
+}
 fn stage_placement(old: Task, depth: u32) -> bool {
-    let staged = unsafe { thread_placement::stage(old.cast(), depth) };
+    let draining =
+        percpu::state(percpu::current_index()) == percpu::DRAINING && !view(old).cpu_idle;
+    let staged = unsafe {
+        if draining {
+            thread_placement::stage_cpu_drain(old.cast(), depth)
+        } else {
+            thread_placement::stage(old.cast(), depth)
+        }
+    };
+    if draining && !staged {
+        crate::arch::cpu_lifecycle::note_busy(
+            percpu::current_index(),
+            crate::arch::cpu_lifecycle::Reason::Resources,
+        );
+    }
     if staged {
         let cpu = percpu::current_index() as usize;
         change(|s| {
@@ -1027,7 +1061,10 @@ pub fn preempt_pending(preemptible: bool) -> bool {
     if running.is_null() || view(running).state != 2 {
         return false;
     }
-    if !urgent(running) && !unsafe { thread_placement::pending(running.cast()) } {
+    if !urgent(running)
+        && !unsafe { thread_placement::pending(running.cast()) }
+        && !(percpu::state(percpu::current_index()) == percpu::DRAINING && !view(running).cpu_idle)
+    {
         set_pending(false);
         return false;
     }
@@ -1068,7 +1105,8 @@ pub(crate) fn safe_reschedule() -> bool {
     // An admitted placement change can need the real local idle continuation,
     // even without another Ready task or an expired quantum. Apply it only at
     // the existing full-save boundary, with the same owner/IRQ guards below.
-    let placement = unsafe { thread_placement::pending(running.cast()) };
+    let placement = unsafe { thread_placement::pending(running.cast()) }
+        || (percpu::state(percpu::current_index()) == percpu::DRAINING && !item.cpu_idle);
     if item.state != 2 || ready_count() == 0 && !placement {
         set_pending(false);
         runtime::restore_runtime(flags);
@@ -1195,7 +1233,8 @@ fn timer_preemption(now: u64, preemptible: bool) -> bool {
         // empty/idle refill remains independent of this periodic deadline.
         balance_checkpoint(now);
     }
-    let placement = unsafe { thread_placement::pending(running.cast()) };
+    let placement = unsafe { thread_placement::pending(running.cast()) }
+        || (percpu::state(percpu::current_index()) == percpu::DRAINING && !view(running).cpu_idle);
     if ready_count() == 0 && !placement {
         set_pending(false);
         change(|s| {
@@ -1308,6 +1347,16 @@ pub fn on_tick(now: u64, preemptible: bool, secondary: bool) -> bool {
 pub fn on_reschedule(preemptible: bool) {
     let flags = runtime::save_runtime();
     let running = local().current;
+    if percpu::state(percpu::current_index()) == percpu::DRAINING
+        && !preemptible
+        && !running.is_null()
+        && !view(running).cpu_idle
+    {
+        crate::arch::cpu_lifecycle::note_busy(
+            percpu::current_index(),
+            crate::arch::cpu_lifecycle::Reason::KernelContext,
+        );
+    }
     if !running.is_null() && view(running).cpu_idle {
         refill_ready();
     }

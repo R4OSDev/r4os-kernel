@@ -256,8 +256,33 @@ unsafe fn apply(task: *mut Task) {
 /// Remove a pending physical current from selection, preserving its exact FIFO
 /// age. It remains private under the held runtime owner until finish_switch.
 pub(crate) unsafe fn stage(task: *mut Task, depth: u32) -> bool {
+    unsafe { stage_impl(task, depth, false) }
+}
+/// The same physical saved-context handoff can drain a sole task to its idle
+/// continuation without inventing a public policy revision or a new budget.
+pub(crate) unsafe fn stage_cpu_drain(task: *mut Task, depth: u32) -> bool {
+    if task.is_null() {
+        return false;
+    }
     unsafe {
-        if !pending(task) {
+        let core = registry::core(task);
+        if !(*core).smp_eligible
+            || (*core).cpu_affinity_bound
+            || (*core).cpu_idle
+            || !matches!(
+                (*core).execution_owner_kind,
+                ExecutionOwnerKind::None | ExecutionOwnerKind::ProgramThread
+            )
+            || allowed(task) == 0
+        {
+            return false;
+        }
+        stage_impl(task, depth, true)
+    }
+}
+unsafe fn stage_impl(task: *mut Task, depth: u32, drain: bool) -> bool {
+    unsafe {
+        if !drain && !pending(task) {
             return false;
         }
         let core = registry::core(task);
@@ -289,8 +314,31 @@ pub(crate) unsafe fn finish_switch(task: *mut Task) {
             return;
         }
         assert!((*core).rsp != 0 && (!(*core).uses_fpu || (*core).fpu_state_valid));
-        apply(task);
+        let old_home = u32::from((*core).home_cpu);
+        if pending(task) {
+            apply(task);
+        } else {
+            // CPU withdrawal is a physical save/rehome, not a new class
+            // request. In particular kernel roles need not equal Policy's
+            // default class, and their consumed budgets must survive.
+            (*core).placement_deferred = false;
+            if (*core).state == State::Ready {
+                home::select(task);
+                if !allows(task, u32::from((*core).home_cpu)) {
+                    (*core).home_cpu = allowed(task).trailing_zeros() as u8;
+                    (*core).home_cpu_bound = true;
+                }
+                if (*core).ready_order != 0 {
+                    registry::append_ready(task);
+                } else {
+                    registry::link_ready(task);
+                }
+            }
+        }
         if (*core).state == State::Ready {
+            if u32::from((*core).home_cpu) != old_home {
+                crate::arch::cpu_lifecycle::note_migration(old_home);
+            }
             scheduler::notify_ready(task.cast());
         }
     }

@@ -1,6 +1,6 @@
-//! One immutable local CPUID image per exact boot descriptor. BSP owns the
-//! bounded plan; each CPU publishes only its own slot before Online. Sealing
-//! checks qualified peers before the AP release barrier. No allocation/wait.
+//! Immutable local CPUID images and domains, with an atomic execution epoch.
+//! Reuse must freshly reproduce the retained hardware facts; published data
+//! is never overwritten while a scheduler or passive reader can retain it.
 #[path = "cpu_topology/domains.rs"]
 mod domains;
 use super::cpu_topology_decode::{Discovery, Geometry, discover};
@@ -15,7 +15,8 @@ pub(crate) use domains::Domain;
 struct Slot {
     described: AtomicU8,
     apic: UnsafeCell<u32>,
-    epoch: UnsafeCell<u64>,
+    epoch: AtomicU64,
+    captured_epoch: AtomicU64,
     capturing: AtomicBool,
     ready: AtomicBool,
     data: UnsafeCell<MaybeUninit<Discovery>>,
@@ -25,15 +26,20 @@ impl Slot {
         Self {
             described: AtomicU8::new(0),
             apic: UnsafeCell::new(0),
-            epoch: UnsafeCell::new(0),
+            epoch: AtomicU64::new(0),
+            captured_epoch: AtomicU64::new(0),
             capturing: AtomicBool::new(false),
             ready: AtomicBool::new(false),
             data: UnsafeCell::new(MaybeUninit::uninit()),
         }
     }
     fn descriptor(&self) -> Option<(u32, u64)> {
-        (self.described.load(Ordering::Acquire) == 2)
-            .then(|| unsafe { (self.apic.get().read(), self.epoch.get().read()) })
+        (self.described.load(Ordering::Acquire) == 2).then(|| {
+            (
+                unsafe { self.apic.get().read() },
+                self.epoch.load(Ordering::Acquire),
+            )
+        })
     }
     // Only BSP startup describes slots; release publication precedes readers.
     fn describe(&self, apic: u32, epoch: u64) -> bool {
@@ -49,8 +55,8 @@ impl Slot {
         }
         unsafe {
             self.apic.get().write(apic);
-            self.epoch.get().write(epoch);
         }
+        self.epoch.store(epoch, Ordering::Relaxed);
         self.described.store(2, Ordering::Release);
         true
     }
@@ -60,9 +66,9 @@ impl Slot {
             .then(|| unsafe { (*self.data.get()).assume_init_read() })
     }
 }
-// BSP is the sole descriptor writer. A CAS admits one local data writer per
-// slot. Data and descriptors are immutable after their release publications;
-// readers acquire readiness before copying, and no reference escapes a copy.
+// BSP is the sole immutable APIC/initial-data descriptor writer. Execution and
+// captured epochs are atomic; reuse only compares freshly read data with the
+// immutable image. No data writer can race a reader after initial publication.
 unsafe impl Sync for Slot {}
 static SLOTS: [Slot; MAX_CPUS] = [const { Slot::new() }; MAX_CPUS];
 static COUNT: AtomicU32 = AtomicU32::new(0);
@@ -72,7 +78,7 @@ static QUALIFIED: AtomicU64 = AtomicU64::new(0);
 static TRUSTED: AtomicU64 = AtomicU64::new(0);
 struct DomainStore(UnsafeCell<[Domain; MAX_CPUS]>);
 // BSP writes once before SEALED Release; immutable references are returned
-// only after Acquire, and no later boot/hotplug writer exists.
+// only after Acquire. Logical reuse never mutates published domain storage.
 unsafe impl Sync for DomainStore {}
 static DOMAINS: DomainStore = DomainStore(UnsafeCell::new([Domain::EMPTY; MAX_CPUS]));
 static FLAT_DOMAINS: [Domain; MAX_CPUS] = [Domain::EMPTY; MAX_CPUS];
@@ -95,6 +101,57 @@ pub(crate) struct Snapshot {
 }
 pub(crate) fn count() -> u32 {
     COUNT.load(Ordering::Acquire)
+}
+
+pub(crate) fn epoch(index: u32) -> u64 {
+    SLOTS
+        .get(index as usize)
+        .and_then(Slot::descriptor)
+        .map_or(0, |(_, epoch)| epoch)
+}
+
+/// Only the CPU lifecycle owner can possess this receipt. Withdrawal leaves
+/// immutable hardware/cache facts resident, but removes current qualification.
+pub(crate) fn withdraw(stopped: &crate::arch::cpu_lifecycle::Stopped) -> bool {
+    if !stopped.current() {
+        return false;
+    }
+    QUALIFIED.fetch_and(!(1u64 << stopped.index()), Ordering::AcqRel);
+    true
+}
+
+pub(crate) fn rearm(stopped: &crate::arch::cpu_lifecycle::Stopped, next: u64) -> bool {
+    let index = stopped.index();
+    let Some(slot) = SLOTS.get(index as usize) else {
+        return false;
+    };
+    if !stopped.current()
+        || !SEALED.load(Ordering::Acquire)
+        || next <= stopped.epoch()
+        || slot.descriptor() != Some((stopped.apic_id(), stopped.epoch()))
+    {
+        return false;
+    }
+    QUALIFIED.fetch_and(!(1u64 << index), Ordering::AcqRel);
+    slot.epoch
+        .compare_exchange(stopped.epoch(), next, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
+}
+
+/// Fresh AP admission, PAT/XSAVE, clock and capture precede this publication.
+pub(crate) fn qualify_epoch(index: u32, epoch: u64) -> bool {
+    let Some(slot) = SLOTS.get(index as usize) else {
+        return false;
+    };
+    if index == 0
+        || slot.descriptor().map(|(_, e)| e) != Some(epoch)
+        || slot.captured_epoch.load(Ordering::Acquire) != epoch
+        || !slot.ready.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    QUALIFIED.fetch_or(1u64 << index, Ordering::AcqRel);
+    true
 }
 
 /// BSP startup only, before notifying APs. Full IDs include failed/pending
@@ -155,6 +212,18 @@ pub(crate) fn capture(
         return false;
     }
     if slot.ready.load(Ordering::Acquire) {
+        if slot.captured_epoch.load(Ordering::Acquire) == epoch {
+            return true;
+        }
+        // A physical CPU whose facts changed cannot reuse immutable scheduler
+        // domains. Leave it unavailable instead of updating borrowed images.
+        if !SEALED.load(Ordering::Acquire)
+            || slot.read() != Some(discover(apic, query))
+            || slot.descriptor() != Some((apic, epoch))
+        {
+            return false;
+        }
+        slot.captured_epoch.store(epoch, Ordering::Release);
         return true;
     }
     if SEALED.load(Ordering::Acquire)
@@ -169,6 +238,7 @@ pub(crate) fn capture(
     unsafe {
         (*slot.data.get()).write(data);
     }
+    slot.captured_epoch.store(epoch, Ordering::Relaxed);
     slot.ready.store(true, Ordering::Release);
     if index == 0 {
         let _ = COUNT.compare_exchange(0, 1, Ordering::Release, Ordering::Relaxed);
@@ -233,13 +303,15 @@ pub(crate) fn snapshot(index: u32) -> Option<Snapshot> {
     let slot = &SLOTS[index as usize];
     let (apic_id, start_epoch) = slot.descriptor()?;
     let sealed = SEALED.load(Ordering::Acquire);
+    let captured = slot.captured_epoch.load(Ordering::Acquire) == start_epoch;
+    let qualified = sealed && QUALIFIED.load(Ordering::Acquire) & (1 << index) != 0 && captured;
     Some(Snapshot {
         index,
         apic_id,
         start_epoch,
         sealed,
-        qualified: sealed && QUALIFIED.load(Ordering::Relaxed) & (1 << index) != 0,
-        trusted: sealed && TRUSTED.load(Ordering::Relaxed) & (1 << index) != 0,
-        data: slot.read(),
+        qualified,
+        trusted: qualified && TRUSTED.load(Ordering::Relaxed) & (1 << index) != 0,
+        data: if captured { slot.read() } else { None },
     })
 }

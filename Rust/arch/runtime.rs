@@ -134,6 +134,10 @@ fn acquire(saved: u64) {
                 core::hint::spin_loop();
                 cli();
             } else {
+                // A reschedule/drain IPI can contend here while another CPU
+                // needs its TLB ACK before releasing the page-table/runtime
+                // dependency. Service only the independent invalidation owner.
+                super::tlb::service_pending();
                 core::hint::spin_loop();
             }
             // Keep the old IRQ progress window, but avoid repeated writing
@@ -243,6 +247,42 @@ impl RuntimeGuard {
             flags: save_runtime(),
             _cpu_bound: PhantomData,
         }
+    }
+    /// A parked IF=0 AP must keep polling TLB requests instead of waiting for
+    /// this owner behind a page-table requester. No guard exists on refusal.
+    pub(crate) fn try_acquire() -> Option<Self> {
+        let saved = save_local();
+        owner::prepare_stack();
+        if enabled() {
+            let cpu = current_cpu();
+            let pointer = depth();
+            let previous = unsafe { pointer.read() };
+            if previous != 0 {
+                unsafe { pointer.write(previous.saturating_add(1)) };
+                add_owned(&NESTED, 1);
+            } else {
+                if LOCK
+                    .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                    .is_err()
+                {
+                    restore_local(saved);
+                    return None;
+                }
+                OWNER_CPU_PLUS_ONE.store(
+                    u8::try_from(cpu + 1).expect("Runtime CPU identity exceeds owner field"),
+                    Ordering::Release,
+                );
+                if config::ENABLE_METRICS {
+                    ACQUIRED_TSC[cpu as usize].store(tsc(), Ordering::Relaxed);
+                }
+                unsafe { pointer.write(1) };
+            }
+            ACQUISITIONS.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(Self {
+            flags: saved,
+            _cpu_bound: PhantomData,
+        })
     }
     // Serialized host metadata fixtures never execute privileged hardware.
 }

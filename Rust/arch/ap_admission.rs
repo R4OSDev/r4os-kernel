@@ -67,6 +67,26 @@ pub(crate) fn prepare(index: u32, apic_id: u32, epoch: u64) -> bool {
     record.phase.store(1, Ordering::Release);
     true
 }
+pub(crate) fn rearm(stopped: &super::cpu_lifecycle::Stopped, next: u64) -> bool {
+    let index = stopped.index();
+    let Some(record) = RECORDS.get(index as usize) else {
+        return false;
+    };
+    if !stopped.current()
+        || next <= stopped.epoch()
+        || record.epoch.load(Ordering::Acquire) != stopped.epoch()
+        || record.expected_id.load(Ordering::Relaxed) != stopped.apic_id()
+        || record
+            .phase
+            .compare_exchange(2, 0, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return false;
+    }
+    record.observed_id.store(u32::MAX, Ordering::Relaxed);
+    record.failure.store(0, Ordering::Relaxed);
+    prepare(index, stopped.apic_id(), next)
+}
 pub(crate) fn begin(index: u32, apic_id: u32, epoch: u64) -> Result<(), &'static [u8]> {
     let Some(record) = RECORDS.get(index as usize) else {
         return Err(b"ap-identity");

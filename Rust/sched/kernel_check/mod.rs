@@ -46,7 +46,7 @@ static REPORT: Cell = Cell(UnsafeCell::new(c::ProgramKernelSchedulerCheck {
     role_mask: 0,
     unwind_checks: 0,
 }));
-pub(crate) struct Gate(bool);
+pub(crate) struct Gate(bool, Option<crate::arch::cpu_lifecycle::ProbeLease>);
 impl Gate {
     pub(crate) fn retain(&mut self) {
         self.0 = false;
@@ -57,13 +57,16 @@ impl Drop for Gate {
         if self.0 {
             LIVE.store(false, Ordering::Release);
             BUSY.store(false, Ordering::Release);
+        } else if let Some(lease) = self.1.take() {
+            core::mem::forget(lease);
         }
     }
 }
 pub(crate) fn gate() -> Option<Gate> {
+    let lease = crate::arch::cpu_lifecycle::probe_lease()?;
     BUSY.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .ok()
-        .map(|_| Gate(true))
+        .map(|_| Gate(true, Some(lease)))
 }
 pub(crate) fn live() -> bool {
     LIVE.load(Ordering::Acquire)

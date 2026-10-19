@@ -1,4 +1,5 @@
-//! Legacy CF8/CFC cycles retain their boot/driver-init caller admission.
+//! Legacy CF8/CFC address/data cycles share one CPU-bound leaf owner. Live
+//! CPU/IRQ handover can coexist with driver configuration on another CPU.
 //! Device discovery publishes its bounded cache before concurrent observers;
 //! live access counters are atomic and no state borrow crosses port/log calls.
 use super::pci_scan::{Device, MAX_DEVICES};
@@ -48,30 +49,40 @@ fn address(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
         | u32::from(offset & 0xfc)
 }
 pub fn read_config32(bus: u8, device: u8, function: u8, offset: u8) -> u32 {
+    let _ports = crate::memory::owner::pci_config_guard();
     READS.fetch_add(1, Ordering::Relaxed);
-    unsafe {
+    let value = unsafe {
         io::outl(0xcf8, address(bus, device, function, offset));
         io::inl(0xcfc)
-    }
+    };
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
+    value
 }
 pub fn write_config32(bus: u8, device: u8, function: u8, offset: u8, value: u32) {
+    let _ports = crate::memory::owner::pci_config_guard();
     WRITES.fetch_add(1, Ordering::Relaxed);
     unsafe {
         io::outl(0xcf8, address(bus, device, function, offset));
         io::outl(0xcfc, value)
     };
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 pub fn write_config8(bus: u8, device: u8, function: u8, offset: u8, value: u8) {
+    let _ports = crate::memory::owner::pci_config_guard();
     WRITES.fetch_add(1, Ordering::Relaxed);
     unsafe {
         io::outl(0xcf8, address(bus, device, function, offset));
         io::outb(0xcfc + u16::from(offset & 3), value)
     };
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
 }
 fn read_config16(bus: u8, device: u8, function: u8, offset: u8) -> u16 {
     (read_config32(bus, device, function, offset & 0xfc) >> ((offset & 2) * 8)) as u16
 }
 fn write_config16(bus: u8, device: u8, function: u8, offset: u8, value: u16) {
+    // Retain the same owner through the whole read/modify/write. Nested
+    // scalar cycles preserve exact CPU/IF and cannot lose a concurrent update.
+    let _ports = crate::memory::owner::pci_config_guard();
     let aligned = offset & 0xfc;
     let shift = (offset & 2) * 8;
     let mut current = read_config32(bus, device, function, aligned);

@@ -64,7 +64,7 @@ pub(crate) enum CacheState {
     Invalid = 2,
     Truncated = 3,
 }
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Discovery {
     pub vendor: [u8; 12],
     pub geometry: Result<Geometry, Problem>,

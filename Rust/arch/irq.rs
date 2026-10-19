@@ -70,8 +70,13 @@ pub unsafe fn dispatch_ipi(frame: *const InterruptFrame) {
         }
         0xf1 => {
             eoi();
-            percpu::r4os_rust_percpu_control(4, percpu::current_index(), 5, 6);
-            runtime::halt_forever();
+            // A stale stop vector cannot stop a newly qualified execution
+            // epoch. Logical park uses its separately authenticated receipts.
+            if super::cpu_lifecycle::is_terminal()
+                && percpu::r4os_rust_percpu_control(4, percpu::current_index(), 5, 6) != 0
+            {
+                runtime::halt_forever();
+            }
         }
         0xf2 => {
             super::tlb::handle_ipi();

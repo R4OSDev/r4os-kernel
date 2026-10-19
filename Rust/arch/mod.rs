@@ -1,6 +1,7 @@
 pub(crate) mod ap_admission;
 pub(crate) mod apic_target;
 pub mod callback_abort;
+pub(crate) mod cpu_lifecycle;
 pub mod fpu;
 pub mod hpet;
 pub mod interrupt_frame;

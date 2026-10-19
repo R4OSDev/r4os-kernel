@@ -433,6 +433,15 @@ pub fn register_cpu(index: u32) -> bool {
     REGISTERED.fetch_or(1 << index, Ordering::AcqRel);
     true
 }
+pub(crate) fn withdraw_cpu(stopped: &crate::arch::cpu_lifecycle::Stopped) -> bool {
+    if !stopped.current() {
+        return false;
+    }
+    let index = stopped.index();
+    REGISTERED.fetch_and(!(1u64 << index), Ordering::AcqRel);
+    CORRECTIONS[index as usize].store(0, Ordering::Release);
+    true
+}
 fn fallback_to_hpet(failure: u32) {
     let prior = last_published();
     reason(failure);

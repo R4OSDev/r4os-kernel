@@ -30,6 +30,12 @@ pub(crate) fn check(_admission: &Admission) -> c::ProgramKernelSmpCheck {
         report.status = c::kernel_smp_check_status_busy;
         return report;
     };
+    let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
+    report.online_mask = online;
+    report.online_count = online.count_ones();
+    if report.online_count < 2 {
+        return report;
+    }
     if retained_allocations() != 0 {
         gate.0 = false;
         report.status = c::kernel_smp_check_status_failed;

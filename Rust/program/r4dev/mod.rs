@@ -30,6 +30,7 @@ pub mod memory;
 
 pub mod memory_probes;
 
+pub(crate) mod cpu_lifecycle;
 pub(crate) mod cpu_topology;
 pub mod devices;
 pub mod display;

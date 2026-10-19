@@ -18,7 +18,7 @@ use crate::{
 use core::{
     cell::UnsafeCell,
     ptr,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 const PAGE: usize = 4096;
 const CONFIG_OFFSET: usize = 0x800;
@@ -81,7 +81,7 @@ struct BootStacks(UnsafeCell<[[u8; STACK_SIZE]; MAX_CPUS]>);
 // the raw top address. Rust never lends or initializes a live AP stack slice.
 unsafe impl Sync for BootStacks {}
 static STACKS: BootStacks = BootStacks(UnsafeCell::new([[0; STACK_SIZE]; MAX_CPUS]));
-static RELEASE: AtomicBool = AtomicBool::new(false);
+static RELEASE_EPOCH: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 #[repr(C, packed)]
 struct TrampolineConfig {
     magic: u64,
@@ -132,12 +132,17 @@ fn low_page(index: u32) -> u64 {
     }
 }
 fn current() -> Status {
+    let _runtime = runtime::RuntimeGuard::acquire();
     unsafe { ptr::addr_of!((*boot()).status).read() }
 }
-fn epoch() -> u64 {
+fn boot_epoch() -> u64 {
     unsafe { ptr::addr_of!((*boot()).epoch).read() }
 }
+fn epoch(index: u32) -> u64 {
+    cpu_topology::epoch(index)
+}
 fn publish(value: Status) {
+    let _runtime = runtime::RuntimeGuard::acquire();
     unsafe { ptr::addr_of_mut!((*boot()).status).write(value) }
 }
 fn snapshot() -> Status {
@@ -146,7 +151,7 @@ fn snapshot() -> Status {
     value.failed = 0;
     for index in 0..configured() {
         match percpu::state(index) {
-            4 => value.online += 1,
+            4 | percpu::DRAINING | percpu::PARKED | percpu::STOP_PENDING => value.online += 1,
             7 => value.failed += 1,
             _ => {}
         }
@@ -174,7 +179,7 @@ fn identity_target(index: u32) -> Option<Target> {
         }
         1
     } else {
-        let generation = epoch();
+        let generation = epoch(index);
         if !ap_admission::qualified(index, id, generation) {
             return None;
         }
@@ -267,7 +272,7 @@ fn early_rejection(index: u32) -> Option<*const TrampolineConfig> {
         (phys::r4os_rust_phys_to_virt(low) as usize + CONFIG_OFFSET) as *const TrampolineConfig;
     if unsafe { ptr::addr_of!((*config).magic).read_unaligned() } != 0x5234_4f53_4150_3031
         || unsafe { ptr::addr_of!((*config).cpu_index).read_unaligned() } != u64::from(index)
-        || unsafe { ptr::addr_of!((*config).epoch).read_unaligned() } != epoch()
+        || unsafe { ptr::addr_of!((*config).epoch).read_unaligned() } != epoch(index)
         || unsafe { ptr::addr_of!((*config).apic_id).read_unaligned() } != apic(index)?
     {
         return None;
@@ -275,7 +280,7 @@ fn early_rejection(index: u32) -> Option<*const TrampolineConfig> {
     Some(config)
 }
 fn startup_failure(index: u32) -> Option<&'static [u8]> {
-    if let Some(reason) = ap_admission::failure(index, epoch()) {
+    if let Some(reason) = ap_admission::failure(index, epoch(index)) {
         return Some(reason);
     }
     let config = early_rejection(index)?;
@@ -414,7 +419,7 @@ fn prepare_trampoline(index: u32) -> Option<u64> {
             .expect("AP protected jump overflow"),
         protected_selector: 24,
         protected_padding: 0,
-        epoch: epoch(),
+        epoch: epoch(index),
         apic_id: apic(index)?,
         early_failure: 0,
         observed_id: u32::MAX,
@@ -426,6 +431,51 @@ fn prepare_trampoline(index: u32) -> Option<u64> {
             .write_unaligned(config)
     };
     Some(low)
+}
+fn launch_secondary(index: u32, id: u32) -> bool {
+    if !lapic::can_target(id) {
+        fail_ap(index, false, b"apic-transport");
+        return false;
+    }
+    if index == config::SMP_FAIL_AP_INDEX {
+        fail_ap(index, false, b"diagnostic-injection");
+        return false;
+    }
+    let Some(page) = prepare_trampoline(index) else {
+        fail_ap(index, false, b"trampoline");
+        return false;
+    };
+    if !crate::sched::scheduler::prepare_secondary(index) {
+        fail_ap(index, false, b"idle-task");
+        return false;
+    }
+    if !transition(index, 1, 2) {
+        return false;
+    }
+    let vector = u8::try_from(page >> 12).expect("SIPI vector overflow");
+    if lapic::r4os_rust_lapic_control(4, u64::from(id), u32::from(vector)) == 0 {
+        fail_ap(index, false, b"init-sipi");
+        return false;
+    }
+    if !wait_for(index, 3, START_TIMEOUT) {
+        if let Some(reason) = startup_failure(index) {
+            fail_ap(index, false, reason);
+        } else {
+            fail_ap(index, true, b"startup-timeout");
+        }
+        return false;
+    }
+    if !ap_admission::qualified(index, id, epoch(index))
+        || percpu::state(index) != 3
+        || !crate::platform::clocksource::finalize_cpu(index)
+        || !transition(index, 3, 8)
+    {
+        fail_ap(index, false, b"clock-registration");
+        return false;
+    }
+    pat::log_ap(index, epoch(index) > boot_epoch());
+    log(8, index, epoch(index), b"qualified");
+    true
 }
 fn start(plan: Plan) -> bool {
     if current().initialized {
@@ -451,7 +501,7 @@ fn start(plan: Plan) -> bool {
     };
     unsafe { ptr::addr_of_mut!((*boot()).topology).write(plan) };
     publish(value);
-    let start_epoch = epoch().checked_add(1).expect("AP epoch overflow");
+    let start_epoch = boot_epoch().checked_add(1).expect("AP epoch overflow");
     let ids = unsafe { ptr::addr_of!((*boot()).topology.apic_ids).read() };
     if !cpu_topology::seed_plan(&ids[..count as usize], start_epoch) {
         crate::boot::fatal::kernel(11, b"cpu-topology-plan");
@@ -465,7 +515,9 @@ fn start(plan: Plan) -> bool {
         ptr::addr_of_mut!((*boot()).epoch).write(start_epoch);
         ptr::addr_of_mut!((*boot()).shared_1g).write(shared_1g);
     }
-    RELEASE.store(false, Ordering::Release);
+    for release in &RELEASE_EPOCH {
+        release.store(0, Ordering::Release);
+    }
     if count > 1 {
         runtime::r4os_rust_runtime_control(6, 0);
     }
@@ -479,55 +531,16 @@ fn start(plan: Plan) -> bool {
         if percpu::r4os_rust_percpu_control(3, index, u64::from(id), 0) == 0 {
             continue;
         }
-        if !ap_admission::prepare(index, id, epoch()) {
+        if !ap_admission::prepare(index, id, epoch(index)) {
             fail_ap(index, false, b"ap-admission-identity");
             continue;
         }
-        if !lapic::can_target(id) {
-            fail_ap(index, false, b"apic-transport");
-            continue;
-        }
-        if index == config::SMP_FAIL_AP_INDEX {
-            fail_ap(index, false, b"diagnostic-injection");
-            continue;
-        }
-        let Some(page) = prepare_trampoline(index) else {
-            fail_ap(index, false, b"trampoline");
-            continue;
-        };
-        if !crate::sched::scheduler::prepare_secondary(index) {
-            fail_ap(index, false, b"idle-task");
-            continue;
-        }
-        if !transition(index, 1, 2) {
-            continue;
-        }
-        let vector = u8::try_from(page >> 12).expect("SIPI vector overflow");
-        if lapic::r4os_rust_lapic_control(4, u64::from(id), u32::from(vector)) == 0 {
-            fail_ap(index, false, b"init-sipi");
-            continue;
-        }
-        if !wait_for(index, 3, START_TIMEOUT) {
-            if let Some(reason) = startup_failure(index) {
-                fail_ap(index, false, reason);
-            } else {
-                fail_ap(index, true, b"startup-timeout");
-            }
-            continue;
-        }
-        if !ap_admission::qualified(index, id, epoch())
-            || percpu::state(index) != 3
-            || !crate::platform::clocksource::finalize_cpu(index)
-            || !transition(index, 3, 8)
-        {
-            fail_ap(index, false, b"clock-registration");
+        if !launch_secondary(index, id) {
             continue;
         }
         let mut value = current();
         value.started += 1;
         publish(value);
-        pat::log_ap(index);
-        log(8, index, epoch(), b"qualified");
     }
     log(3, 0, 0, b"parked");
     true
@@ -539,10 +552,17 @@ fn activate() {
     }
     unsafe { tlb::r4os_rust_tlb_register(Some(send_tlb_ipi)) };
     cpu_topology::seal(percpu::r4os_rust_percpu_control(6, 0, 0, 0));
-    RELEASE.store(true, Ordering::Release);
+    for index in 1..configured() {
+        if percpu::state(index) == 8
+            && apic(index).is_some_and(|id| ap_admission::qualified(index, id, epoch(index)))
+        {
+            RELEASE_EPOCH[index as usize].store(epoch(index), Ordering::Release);
+        }
+    }
     for index in 1..configured() {
         let before = percpu::state(index);
-        if before == 8 && !apic(index).is_some_and(|id| ap_admission::qualified(index, id, epoch()))
+        if before == 8
+            && !apic(index).is_some_and(|id| ap_admission::qualified(index, id, epoch(index)))
         {
             fail_ap(index, false, b"ap-admission-identity");
             continue;
@@ -559,14 +579,22 @@ fn activate() {
     log(3, 0, 0, b"active");
 }
 fn stop_others() {
+    super::cpu_lifecycle::terminal();
     if !current().initialized {
         return;
     }
     for index in 1..configured() {
-        let Some(target) = live_target(index) else {
+        let before = percpu::state(index);
+        if matches!(
+            before,
+            percpu::PARKED | percpu::STOP_PENDING | percpu::OFFLINE
+        ) {
+            continue;
+        }
+        let Some(target) = identity_target(index) else {
             continue;
         };
-        if !transition(index, 4, 5) {
+        if !matches!(before, 4 | percpu::DRAINING) || !transition(index, before, 5) {
             continue;
         }
         if percpu::state(index) == 5 && apic_target::current(target, identity_target) {
@@ -574,7 +602,10 @@ fn stop_others() {
         }
     }
     for index in 1..configured() {
-        if percpu::state(index) != 5 {
+        if !matches!(
+            percpu::state(index),
+            5 | percpu::PARKED | percpu::STOP_PENDING
+        ) {
             continue;
         }
         if !wait_for(index, 6, STOP_TIMEOUT) {
@@ -596,7 +627,8 @@ unsafe extern "C" fn send_tlb_ipi(index: u32, vector: u8) -> bool {
     if index == percpu::current_index() {
         return false;
     }
-    let Some(target) = live_target(index).filter(|t| apic_target::current(*t, live_target)) else {
+    let Some(target) = identity_target(index).filter(|_| percpu::tlb_mask() & (1u64 << index) != 0)
+    else {
         return false;
     };
     lapic::r4os_rust_lapic_control(7, u64::from(target.apic_id), u32::from(vector)) != 0
@@ -632,6 +664,8 @@ pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> !
     }
     tables::r4os_rust_gdt_init(index);
     percpu::r4os_rust_percpu_control(1, index, 0, 0);
+    super::cpu_lifecycle::install(index, start_epoch);
+    tlb::flush_all_local();
     tables::r4os_rust_idt_load();
     if percpu::state(index) != 2 {
         runtime::halt_forever();
@@ -665,9 +699,9 @@ pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> !
     if !transition(index, 2, 3) {
         runtime::halt_forever();
     }
-    while !RELEASE.load(Ordering::Acquire) {
+    while RELEASE_EPOCH[index as usize].load(Ordering::Acquire) != start_epoch {
         let state = percpu::state(index);
-        if state == 7 || state == 6 {
+        if state == 7 || state == 6 || super::cpu_lifecycle::is_terminal() {
             runtime::halt_forever();
         }
         core::hint::spin_loop();
@@ -682,10 +716,102 @@ pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> !
         percpu::r4os_rust_percpu_control(5, index, 0, 0);
         runtime::halt_forever();
     }
-    if !transition(index, 8, 4) {
+    if !publish_online(index, start_epoch) {
         runtime::halt_forever();
     }
     crate::sched::scheduler::secondary_loop()
+}
+fn publish_online(index: u32, start_epoch: u64) -> bool {
+    let started = monotonic::now_nanoseconds();
+    for _ in 0..20_000_000 {
+        if percpu::state(index) != 8
+            || epoch(index) != start_epoch
+            || super::cpu_lifecycle::is_terminal()
+            || started.is_some_and(|start| {
+                monotonic::now_nanoseconds()
+                    .is_some_and(|now| now.saturating_sub(start) >= START_TIMEOUT)
+            })
+        {
+            return false;
+        }
+        // Runtime precedes PageTableOwner everywhere else too. Both attempts
+        // are bounded; no owner is retained while waiting for either one.
+        if let Some(_runtime) = runtime::RuntimeGuard::try_acquire()
+            && let Some(_pages) = crate::memory::owner::Guard::try_acquire(6)
+        {
+            if percpu::state(index) != 8 || epoch(index) != start_epoch {
+                return false;
+            }
+            // Serialize the final full/global flush and membership grant
+            // against the exact invalidation request/mapping owner. A request
+            // cannot miss the new CPU after this barrier.
+            tlb::flush_all_local();
+            return transition(index, 8, 4);
+        }
+        tlb::service_pending();
+        core::hint::spin_loop();
+    }
+    false
+}
+/// Permanent private bootstrap/idle storage is retained across logical stops.
+pub(crate) fn idle_stack_contains(index: u32, rsp: u64) -> bool {
+    if index == 0 || index as usize >= MAX_CPUS {
+        return false;
+    }
+    let start = unsafe { STACKS.0.get().cast::<u8>().add(index as usize * STACK_SIZE) } as u64;
+    (start..start + STACK_SIZE as u64).contains(&rsp)
+}
+pub(crate) fn request_drain_reschedule(index: u32, expected: u64) -> bool {
+    let Some(target) = identity_target(index)
+        .filter(|t| t.epoch == expected && percpu::state(index) == percpu::DRAINING)
+    else {
+        return false;
+    };
+    lapic::r4os_rust_lapic_control(5, u64::from(target.apic_id), 0xf0) != 0
+}
+pub(crate) fn notify_irq(target: Target, vector: u32) -> bool {
+    apic_target::current(target, live_target)
+        && lapic::r4os_rust_lapic_control(7, u64::from(target.apic_id), vector) != 0
+}
+/// Exact stop consumption and owner withdrawal precede a fresh execution epoch.
+/// The same real trampoline/qualification path is used for boot and reuse.
+pub(crate) fn restart(stopped: &super::cpu_lifecycle::Stopped) -> bool {
+    if !stopped.current() {
+        return false;
+    }
+    let index = stopped.index();
+    let Some(next) = stopped.epoch().checked_add(1) else {
+        return false;
+    };
+    {
+        let Some(_tables) = crate::memory::owner::Guard::try_acquire(6) else {
+            return false;
+        };
+        if !tlb::rearm_cpu(stopped) {
+            return false;
+        }
+    }
+    if !ap_admission::rearm(stopped, next) || !cpu_topology::rearm(stopped, next) {
+        return false;
+    }
+    RELEASE_EPOCH[index as usize].store(0, Ordering::Release);
+    unsafe {
+        let old = ptr::addr_of!((*boot()).reported_failures).read();
+        ptr::addr_of_mut!((*boot()).reported_failures).write(old & !(1u64 << index));
+    }
+    if !percpu::rearm(stopped, next) || !launch_secondary(index, stopped.apic_id()) {
+        return false;
+    }
+    if !cpu_topology::qualify_epoch(index, next) {
+        fail_ap(index, false, b"cpu-requalification");
+        return false;
+    }
+    RELEASE_EPOCH[index as usize].store(next, Ordering::Release);
+    if !wait_for(index, 4, START_TIMEOUT) {
+        fail_ap(index, true, b"activation-timeout");
+        return false;
+    }
+    true
 }
 /// The complete boot decoder already selected bounded dense slots. No raw
 /// firmware list or temporary borrow survives AP notification.
@@ -751,6 +877,7 @@ pub extern "C" fn r4os_rust_smp_control(operation: u8, index: u32) -> u64 {
                 crate::boot::fatal::kernel(2, b"bsp-topology-identity");
             }
             percpu::r4os_rust_percpu_control(0, id, 0, 0);
+            super::cpu_lifecycle::install(0, 1);
             0
         }
         1 => {
@@ -801,7 +928,20 @@ unsafe fn smp_log(
     len: usize,
     status: *const Status,
 ) {
-    use crate::boot::log_route::{dec, puts};
+    // Runtime CPU control reports through its explicit caller. Retain fresh
+    // qualification/failure records without injecting them into queued module
+    // text/JSON. Cold-boot diagnostics keep their original console route.
+    let record_only = matches!(event, 1 | 2 | 8) && epoch(index) > boot_epoch();
+    let puts: fn(&[u8]) = if record_only {
+        crate::boot::log::text
+    } else {
+        crate::boot::log_route::puts
+    };
+    let dec: fn(u64) = if record_only {
+        |value| crate::boot::log::r4os_rust_bootlog_dec(value)
+    } else {
+        crate::boot::log_route::dec
+    };
     match event {
         0 => {
             puts(b"[SMP] low-memory trampolines reserved=");
@@ -811,20 +951,20 @@ unsafe fn smp_log(
             // Only an authenticated AP result carries observed identity.
             // Pre-SIPI failures retain the original diagnostic marker.
             let early = early_rejection(index);
-            let admission_failure = ap_admission::failure(index, epoch()).is_some();
+            let admission_failure = ap_admission::failure(index, epoch(index)).is_some();
             puts(b"[SMP] ap=");
             dec(u64::from(index));
             puts(b" apic=");
             dec(u64::from(apic(index).unwrap_or(0)));
             if early.is_some() || admission_failure {
                 puts(b" epoch=");
-                dec(epoch());
+                dec(epoch(index));
                 puts(b" observed-apic=");
                 if let Some(config) = early {
                     dec(u64::from(unsafe {
                         ptr::addr_of!((*config).observed_id).read_volatile()
                     }));
-                } else if let Some(id) = ap_admission::observed(index, epoch()) {
+                } else if let Some(id) = ap_admission::observed(index, epoch(index)) {
                     dec(u64::from(id));
                 } else {
                     puts(b"unknown");

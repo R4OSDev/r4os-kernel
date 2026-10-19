@@ -50,7 +50,7 @@ pub struct Lock {
 // created, including reentrant acquisitions or concurrent metric snapshots.
 unsafe impl Sync for Lock {}
 // Original named owner storage; one native instance per existing class.
-static NAMED: [Lock; 10] = [
+static NAMED: [Lock; 11] = [
     Lock::new(0, 1),
     Lock::new(1, 2),
     Lock::new(2, 2),
@@ -61,6 +61,9 @@ static NAMED: [Lock; 10] = [
     Lock::new(7, 30),
     Lock::new(8, 70),
     Lock::new(9, 80),
+    // Last leaf: only paired PCI configuration port instructions, never a
+    // callback, allocation, mapping operation or acquisition of another owner.
+    Lock::new(10, 85),
 ];
 static HELD_RANK: [AtomicU8; MAX_CPUS] = [const { AtomicU8::new(0) }; MAX_CPUS];
 
@@ -214,6 +217,50 @@ impl Lock {
             outermost: true,
         }
     }
+    /// One bounded admission attempt. Refusal restores exactly the caller's
+    /// IF and constructs no guard/token that could release a foreign owner.
+    pub(crate) fn try_acquire(&self) -> Option<Token> {
+        let saved = flags();
+        cli();
+        prepare_stack();
+        let slot = cpu();
+        let owner = (slot + 1) as u8;
+        let previous = HELD_RANK[slot].load(Ordering::Relaxed);
+        let depth = unsafe { self.depth[slot].get().read() };
+        if self.owner_cpu_plus_one.load(Ordering::Acquire) == owner && depth != 0 {
+            unsafe { self.depth[slot].get().write(depth.saturating_add(1)) };
+            self.nested_acquisitions.fetch_add(1, Ordering::Relaxed);
+            self.acquisitions.fetch_add(1, Ordering::Relaxed);
+            return Some(Token {
+                flags: saved,
+                cpu_index: slot as u32,
+                previous_rank: previous,
+                outermost: false,
+            });
+        }
+        if !owner_policy::order_allowed(previous, self.rank)
+            || self
+                .state
+                .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
+                .is_err()
+        {
+            restore(saved);
+            return None;
+        }
+        self.acquisitions.fetch_add(1, Ordering::Relaxed);
+        self.owner_cpu_plus_one.store(owner, Ordering::Release);
+        unsafe { self.depth[slot].get().write(1) };
+        if config::ENABLE_METRICS {
+            unsafe { self.acquired_tsc[slot].get().write(tsc()) };
+        }
+        HELD_RANK[slot].store(self.rank, Ordering::Relaxed);
+        Some(Token {
+            flags: saved,
+            cpu_index: slot as u32,
+            previous_rank: previous,
+            outermost: true,
+        })
+    }
     pub fn release(&self, token: Token) {
         let slot = cpu();
         let owner = (slot + 1) as u8;
@@ -271,6 +318,17 @@ impl Guard {
             _cpu_bound: PhantomData,
         }
     }
+    pub(crate) fn try_acquire(class: u8) -> Option<Self> {
+        let lock = named(class);
+        lock.try_acquire().map(|token| Self {
+            lock,
+            token,
+            _cpu_bound: PhantomData,
+        })
+    }
+}
+pub(crate) fn pci_config_guard() -> Guard {
+    Guard::acquire(10)
 }
 // Named storage is resident for the kernel lifetime and initialized before
 // entry. Prepared physical release plans retain the exact token across C
@@ -330,7 +388,7 @@ const _: () = {
     assert!(core::mem::size_of::<Stats>() == 64);
 };
 
-pub(crate) const CLASS_NAMES: [&[u8]; 10] = [
+pub(crate) const CLASS_NAMES: [&[u8]; 11] = [
     b"program_state",
     b"storage",
     b"network",
@@ -341,6 +399,7 @@ pub(crate) const CLASS_NAMES: [&[u8]; 10] = [
     b"physical_memory",
     b"boot_log",
     b"serial_output",
+    b"pci_config",
 ];
 pub(crate) fn stats_for_class(class: u8) -> Stats {
     assert!((class as usize) < CLASS_NAMES.len());

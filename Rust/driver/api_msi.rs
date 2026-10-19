@@ -5,7 +5,12 @@ use crate::{
     contract as a,
     driver::{api_admission as admission, api_platform as platform, utilities},
 };
-use core::{cell::UnsafeCell, mem::MaybeUninit, ptr};
+use core::{
+    cell::UnsafeCell,
+    mem::MaybeUninit,
+    ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 #[derive(Clone, Copy)]
 struct Device {
     kind: u8,
@@ -44,6 +49,9 @@ struct Record {
     data: u32,
     vector_control: u32,
     target: Option<Target>,
+    ready: bool,
+    pending_source: Option<Target>,
+    uncertain: bool,
 }
 impl Record {
     const EMPTY: Self = Self {
@@ -66,12 +74,29 @@ impl Record {
         data: 0,
         vector_control: 0,
         target: None,
+        ready: false,
+        pending_source: None,
+        uncertain: false,
     };
 }
 struct Storage(UnsafeCell<[Record; 8]>);
-// SAFETY: the historical R4D execution owner serializes these hardware calls.
+// SAFETY: every record access holds the short nonblocking route gate. Device
+// operations also retain their existing exact R4D admission.
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new([Record::EMPTY; 8]));
+static ROUTE_GATE: AtomicBool = AtomicBool::new(false);
+struct RouteGuard;
+impl Drop for RouteGuard {
+    fn drop(&mut self) {
+        ROUTE_GATE.store(false, Ordering::Release);
+    }
+}
+fn route_claim() -> Option<RouteGuard> {
+    ROUTE_GATE
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()
+        .map(|_| RouteGuard)
+}
 
 fn owner() -> u32 {
     admission::r4os_rust_driver_api_runtime_owner(false)
@@ -162,6 +187,215 @@ fn restore(r: Record) -> bool {
         restore_msi(r)
     }
 }
+
+#[derive(Clone, Copy)]
+struct Active {
+    header: u32,
+    low: u32,
+    high: u32,
+    data: u32,
+    mask: u32,
+}
+fn active(r: Record) -> Option<Active> {
+    let header = r.device.read(r.capability);
+    if header == u32::MAX || header as u8 != if r.msix { 0x11 } else { 5 } {
+        return None;
+    }
+    let wide = header & (1 << 23) != 0;
+    let (low, high, data, mask) = if r.msix {
+        if r.table == 0 {
+            return None;
+        }
+        (
+            read_table(r.table, 0),
+            read_table(r.table, 4),
+            read_table(r.table, 8),
+            read_table(r.table, 12),
+        )
+    } else {
+        (
+            r.device.read(r.capability + 4),
+            if wide {
+                r.device.read(r.capability + 8)
+            } else {
+                0
+            },
+            r.device.read(r.capability + if wide { 12 } else { 8 }),
+            0,
+        )
+    };
+    Some(Active {
+        header,
+        low,
+        high,
+        data,
+        mask,
+    })
+}
+fn same_active(a: Active, b: Active) -> bool {
+    a.header == b.header
+        && a.low == b.low
+        && a.high == b.high
+        && a.data == b.data
+        && a.mask == b.mask
+}
+// A rollback restores the exact *active* configuration, never the firmware
+// restore record. Original teardown bytes remain owned until driver cleanup.
+fn write_active(r: Record, image: Active) -> bool {
+    let d = r.device;
+    let control = (image.header >> 16) as u16;
+    if !write_control(
+        d,
+        r.capability,
+        image.header,
+        if r.msix {
+            control | 0x4000
+        } else {
+            control & !1
+        },
+    ) {
+        return false;
+    }
+    let disabled = d.read(r.capability);
+    if disabled == u32::MAX
+        || if r.msix {
+            disabled >> 16 & 0x4000 == 0
+        } else {
+            disabled >> 16 & 1 != 0
+        }
+    {
+        return false;
+    }
+    if r.msix {
+        write_table(r.table, 12, image.mask | 1);
+        fence();
+        if read_table(r.table, 12) & 1 == 0 {
+            return false;
+        }
+        write_table(r.table, 0, image.low);
+        write_table(r.table, 4, image.high);
+        write_table(r.table, 8, image.data);
+        fence();
+        if read_table(r.table, 0) != image.low
+            || read_table(r.table, 4) != image.high
+            || read_table(r.table, 8) != image.data
+        {
+            return false;
+        }
+        write_table(r.table, 12, image.mask);
+        fence();
+    } else {
+        if !d.write(r.capability + 4, image.low) {
+            return false;
+        }
+        if control & (1 << 7) != 0 && !d.write(r.capability + 8, image.high) {
+            return false;
+        }
+        if !d.write(
+            r.capability + if control & (1 << 7) != 0 { 12 } else { 8 },
+            image.data,
+        ) {
+            return false;
+        }
+    }
+    write_control(d, r.capability, image.header, control)
+        && active(r).is_some_and(|read| same_active(read, image))
+}
+
+/// Move only exact current routes of a draining CPU. Every pending old edge
+/// gets one status-poll notification on the new receiver before park admission.
+/// Busy retains the route and the original driver resources/configuration.
+pub(crate) fn migrate_cpu(
+    index: u32,
+    epoch: u64,
+) -> Result<u32, crate::arch::cpu_lifecycle::Reason> {
+    use crate::arch::{apic_target, cpu_lifecycle::Reason, percpu};
+    if percpu::state(index) != percpu::DRAINING
+        || crate::platform::cpu_topology::epoch(index) != epoch
+    {
+        return Err(Reason::Epoch);
+    }
+    let _route = route_claim().ok_or(Reason::Irq)?;
+    let mut count = 0;
+    for slot in 0..8 {
+        let mut r = unsafe { (*STATE.0.get())[slot] };
+        if !r.used {
+            continue;
+        }
+        if r.uncertain {
+            return Err(Reason::Irq);
+        }
+        if r.pending_source.is_some_and(|source| source.index == index) {
+            let target = r.target.ok_or(Reason::Irq)?;
+            if !smp::notify_irq(target, 32 + u32::from(r.irq)) {
+                return Err(Reason::Irq);
+            }
+            r.pending_source = None;
+            unsafe {
+                (*STATE.0.get())[slot] = r;
+            }
+        }
+        let source = r.target.ok_or(Reason::Irq)?;
+        if source.index != index {
+            continue;
+        }
+        if source.epoch != epoch {
+            return Err(Reason::Epoch);
+        }
+        let target = smp::legacy_irq_target(0).ok_or(Reason::Irq)?;
+        let message = smp::irq_message(target, 32 + u32::from(r.irq)).ok_or(Reason::Irq)?;
+        let previous = active(r).ok_or(Reason::Irq)?;
+        let old = apic_target::message(u64::from(source.apic_id), 32 + u32::from(r.irq))
+            .ok_or(Reason::Irq)?;
+        let command = r.device.read(4);
+        if previous.low != old.address
+            || previous.high != 0
+            || previous.data != old.data
+            || command == u32::MAX
+            || command & (1 << 10) == 0
+            || if r.msix {
+                previous.header >> 16 & 0x8000 == 0
+            } else {
+                previous.header >> 16 & 1 == 0
+            }
+        {
+            return Err(Reason::Irq);
+        }
+        let next = Active {
+            low: message.address,
+            high: 0,
+            data: message.data,
+            ..previous
+        };
+        if !write_active(r, next) {
+            if !write_active(r, previous) {
+                r.uncertain = true;
+                unsafe {
+                    (*STATE.0.get())[slot] = r;
+                }
+            }
+            return Err(Reason::Irq);
+        }
+        let notify =
+            r.ready && (!r.msix || previous.mask & 1 == 0 && previous.header >> 16 & 0x4000 == 0);
+        r.target = Some(target);
+        r.pending_source = if notify { Some(source) } else { None };
+        unsafe {
+            (*STATE.0.get())[slot] = r;
+        }
+        if notify {
+            if !smp::notify_irq(target, 32 + u32::from(r.irq)) {
+                return Err(Reason::Irq);
+            }
+            r.pending_source = None;
+            unsafe {
+                (*STATE.0.get())[slot] = r;
+            }
+        }
+        count += 1;
+    }
+    Ok(count)
+}
 fn enable_msix(
     d: Device,
     id: u32,
@@ -230,6 +464,9 @@ fn enable_msix(
         data: read_table(table, 8),
         vector_control: read_table(table, 12),
         target: Some(target),
+        ready: false,
+        pending_source: None,
+        uncertain: false,
     };
     let masked = (control & !0x8000) | 0x4000;
     if !write_control(d, cap, header, masked) {
@@ -274,6 +511,9 @@ fn enable_msix(
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, function: u8) -> i32 {
+    let Some(_route) = route_claim() else {
+        return -8;
+    };
     let id = owner();
     if id == 0 {
         return -6;
@@ -294,7 +534,9 @@ pub extern "C" fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, fun
         {
             continue;
         }
-        return if r.owner != id {
+        return if r.uncertain {
+            -8
+        } else if r.owner != id {
             -6
         } else if r
             .target
@@ -391,6 +633,7 @@ pub extern "C" fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, fun
         control,
         command: status as u16,
         target: Some(target),
+        ready: true,
         ..Record::EMPTY
     };
     if !d.write(
@@ -425,10 +668,16 @@ pub extern "C" fn r4os_rust_driver_msi_enable(kind: u8, bus: u8, device: u8, fun
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_msi_unmask(id: u32, irq: u8) -> bool {
+    let Some(_route) = route_claim() else {
+        return false;
+    };
     for i in 0..8 {
         let r = unsafe { (*STATE.0.get())[i] };
         if !r.used || !r.msix || r.owner != id || r.irq != irq {
             continue;
+        }
+        if r.uncertain {
+            return false;
         }
         if r.target
             .and_then(|target| smp::irq_message(target, 32 + u32::from(r.irq)))
@@ -439,12 +688,21 @@ pub extern "C" fn r4os_rust_driver_msi_unmask(id: u32, irq: u8) -> bool {
         let control = read_table(r.table, 12);
         write_table(r.table, 12, control & !1);
         fence();
-        return read_table(r.table, 12) & 1 == 0;
+        let ready = read_table(r.table, 12) & 1 == 0;
+        if ready {
+            unsafe {
+                (*STATE.0.get())[i].ready = true;
+            }
+        }
+        return ready;
     }
     true
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_msi_disable(kind: u8, bus: u8, device: u8, function: u8) -> i32 {
+    let Some(_route) = route_claim() else {
+        return -8;
+    };
     let id = owner();
     for i in 0..8 {
         let r = unsafe { (*STATE.0.get())[i] };
@@ -477,6 +735,15 @@ pub struct Cleanup {
 /// driver hardware admission and stays valid through configuration readback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_msi_cleanup(id: u32, out: *mut Cleanup) {
+    let Some(_route) = route_claim() else {
+        unsafe {
+            out.write(Cleanup {
+                removed: 0,
+                failed: true,
+            });
+        }
+        return;
+    };
     let mut result = Cleanup {
         removed: 0,
         failed: false,

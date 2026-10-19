@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "r4os-contract"
 version = "0.1.0"
-source = "git+https://github.com/R4OSDev/r4os-contract.git?rev=a47e12b4d58e97185b59b12386c9580d9b4a090d#a47e12b4d58e97185b59b12386c9580d9b4a090d"
+source = "git+https://github.com/R4OSDev/r4os-contract.git?rev=747e93cd876f3ea36525aac218048f42962c492c#747e93cd876f3ea36525aac218048f42962c492c"
 
 [[package]]
 name = "r4os-kernel"

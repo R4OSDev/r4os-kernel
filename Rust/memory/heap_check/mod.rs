@@ -47,6 +47,10 @@ pub(crate) fn run(
         return report;
     }
     report.flags = c::kernel_heap_check_flag_initialized;
+    let Some(_cpus) = crate::arch::cpu_lifecycle::probe_lease() else {
+        report.status = c::kernel_heap_check_status_busy;
+        return report;
+    };
     if RUNNING
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .is_err()

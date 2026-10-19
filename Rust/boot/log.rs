@@ -143,6 +143,9 @@ impl<const N: usize> Line<N> {
         self.bytes[self.len..end].copy_from_slice(bytes);
         self.len = end;
     }
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
     pub(crate) fn emit(self) {
         text(&self.bytes[..self.len]);
     }

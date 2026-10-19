@@ -75,19 +75,24 @@ static SESSION: SessionCell = SessionCell(core::cell::UnsafeCell::new(Session {
     stage: 0,
     checked_clock: None,
 }));
-struct ProbeGate(bool);
+struct ProbeGate(bool, Option<super::cpu_lifecycle::ProbeLease>);
 impl Drop for ProbeGate {
     fn drop(&mut self) {
         if self.0 {
             PROBING.store(false, Ordering::Release);
+        } else if let Some(lease) = self.1.take() {
+            // The existing retained session cannot be reused before reboot.
+            // Its real resources also retain stable CPU membership.
+            core::mem::forget(lease);
         }
     }
 }
 fn probe_gate() -> Option<ProbeGate> {
+    let lease = super::cpu_lifecycle::probe_lease()?;
     PROBING
         .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
         .ok()
-        .map(|_| ProbeGate(true))
+        .map(|_| ProbeGate(true, Some(lease)))
 }
 fn session() -> *mut Session {
     SESSION.0.get()

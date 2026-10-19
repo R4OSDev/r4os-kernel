@@ -326,6 +326,42 @@ fn start_secondary(requested_hz: u32) -> bool {
     write(INITIAL, initial as u32);
     true
 }
+pub(crate) struct PausedTimer {
+    cpu: u32,
+    divider: u32,
+    lvt: u32,
+    initial: u32,
+}
+/// Local IF=0 quiescent AP only. Do not mutate the BSP timer snapshot.
+pub(crate) fn pause_secondary() -> Option<PausedTimer> {
+    let cpu = percpu::current_index();
+    if cpu == 0 || !is_enabled() {
+        return None;
+    }
+    let token = PausedTimer {
+        cpu,
+        divider: read(DIVIDE),
+        lvt: read(LVT),
+        initial: read(INITIAL),
+    };
+    if token.lvt == u32::MAX {
+        return None;
+    }
+    write(LVT, token.lvt | MASKED);
+    write(INITIAL, 0);
+    (read(LVT) & MASKED != 0 && read(INITIAL) == 0).then_some(token)
+}
+/// A pre-withdrawal cancellation restores only this AP's retained timer.
+pub(crate) fn resume_secondary(token: PausedTimer) -> bool {
+    if token.cpu != percpu::current_index() {
+        return false;
+    }
+    write(DIVIDE, token.divider);
+    write(LVT, token.lvt | MASKED);
+    write(INITIAL, token.initial);
+    write(LVT, token.lvt);
+    read(DIVIDE) == token.divider && read(LVT) == token.lvt && read(INITIAL) == token.initial
+}
 fn write_icr(apic_id: u64, low: u32) -> bool {
     if !is_enabled() {
         return false;

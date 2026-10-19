@@ -4,7 +4,7 @@ use super::{runtime::RuntimeGuard, smp};
 use crate::memory::{paging, phys};
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 const AVAILABLE: u32 = 1;
 const MAPPED: u32 = 2;
@@ -108,6 +108,7 @@ unsafe impl Sync for Storage {}
 static STATE: Storage = Storage(UnsafeCell::new(Status::EMPTY));
 static FLAGS: AtomicU32 = AtomicU32::new(0);
 static NEXT_RUNTIME_TARGET: AtomicU32 = AtomicU32::new(1);
+static HANDOVER_UNCERTAIN: AtomicBool = AtomicBool::new(false);
 
 fn state() -> Status {
     unsafe { *STATE.0.get() }
@@ -225,6 +226,81 @@ fn refresh(mut value: Status, index: u8) -> Status {
 fn choose_target() -> Option<u32> {
     smp::legacy_irq_target(NEXT_RUNTIME_TARGET.fetch_add(1, Ordering::Relaxed))
         .map(|target| target.apic_id)
+}
+/// Inspect the hardware table, including runtime PCI routes absent from the
+/// four cached boot routes. Shared selector/window transactions retain runtime.
+pub(crate) fn migrate_cpu(index: u32, epoch: u64) -> Result<u32, super::cpu_lifecycle::Reason> {
+    use super::{cpu_lifecycle::Reason, percpu};
+    let _owner = RuntimeGuard::acquire();
+    if percpu::state(index) != percpu::DRAINING
+        || crate::platform::cpu_topology::epoch(index) != epoch
+    {
+        return Err(Reason::Epoch);
+    }
+    if HANDOVER_UNCERTAIN.load(Ordering::Acquire) {
+        return Err(Reason::Irq);
+    }
+    let mut value = state();
+    if !value.mapped() {
+        return Ok(0);
+    }
+    // IOREGSEL has eight bits. Reject malformed hardware geometry rather than
+    // wrapping a redirection register into an unrelated control register.
+    if value.max_redirection_entry > 119 {
+        return Err(Reason::Irq);
+    }
+    let source = percpu::r4os_rust_percpu_control(8, index, 0, 0);
+    let Some(target) = smp::legacy_irq_target(0) else {
+        return Err(Reason::Irq);
+    };
+    let high = smp::irq_redirection(target.apic_id).ok_or(Reason::Irq)?;
+    let mut count = 0;
+    for entry in 0..=value.max_redirection_entry {
+        let old = redirection(value, entry);
+        if u64::from(old.high >> 24) != source {
+            continue;
+        }
+        // A level interrupt still awaiting its genuine EOI cannot change
+        // destination; an in-flight delivery also retains its old receiver.
+        if old.low & ((1 << 11) | (7 << 8) | (1 << 12) | (1 << 14)) != 0 {
+            return Err(Reason::Irq);
+        }
+        let register = 0x10 + entry * 2;
+        write_reg(value, register, old.low | MASKED);
+        let masked = redirection(value, entry);
+        if masked.low & MASKED == 0 || masked.low & ((1 << 12) | (1 << 14)) != 0 {
+            write_reg(value, register, old.low);
+            return Err(Reason::Irq);
+        }
+        write_reg(value, register + 1, high);
+        write_reg(value, register, old.low);
+        let new = redirection(value, entry);
+        if new.high != high || new.low & !((1 << 12) | (1 << 14)) != old.low {
+            write_reg(value, register, old.low | MASKED);
+            write_reg(value, register + 1, old.high);
+            write_reg(value, register, old.low);
+            let rolled = redirection(value, entry);
+            if rolled.high != old.high || rolled.low & !((1 << 12) | (1 << 14)) != old.low {
+                HANDOVER_UNCERTAIN.store(true, Ordering::Release);
+            }
+            return Err(Reason::Irq);
+        }
+        for route in &mut value.routes {
+            if route.in_range && route.redir_index == entry {
+                route.target_lapic = target.apic_id;
+            }
+        }
+        value = refresh(value, entry);
+        publish(value);
+        if old.low & MASKED == 0 && !smp::notify_irq(target, old.low & 0xff) {
+            // Hardware has moved but the old pending edge is unconfirmed.
+            // Keep the source online and refuse later withdrawal until reset.
+            HANDOVER_UNCERTAIN.store(true, Ordering::Release);
+            return Err(Reason::Irq);
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 pub fn init(input: Input) -> Status {
     let _owner = RuntimeGuard::acquire();

@@ -1092,6 +1092,9 @@ fn configure_dev() {
     const SMP_SNAPSHOT: c::R4DevFns::performance_smp_tlb = r4dev::smp::snapshot;
     const CPU_TOPOLOGY: c::R4DevFns::cpu_topology = r4dev::cpu_topology::info;
     const CPU_CACHE: c::R4DevFns::cpu_cache_topology = r4dev::cpu_topology::cache;
+    const CPU_LIFECYCLE: c::R4DevFns::cpu_lifecycle = r4dev::cpu_lifecycle::control;
+    const CPU_LIFECYCLE_CHECK: c::R4DevFns::kernel_cpu_lifecycle_check =
+        r4dev::cpu_lifecycle::check;
     r4dev::providers::install();
     let value = c::R4XStartR4Dev {
         serial_count: super::serial_api::count as c::R4DevFns::serial_count as *const () as usize,
@@ -1198,13 +1201,19 @@ fn configure_dev() {
         performance_smp_tlb: SMP_SNAPSHOT as *const () as usize,
         cpu_topology: CPU_TOPOLOGY as *const () as usize,
         cpu_cache_topology: CPU_CACHE as *const () as usize,
+        cpu_lifecycle: CPU_LIFECYCLE as *const () as usize,
+        kernel_cpu_lifecycle_check: CPU_LIFECYCLE_CHECK as *const () as usize,
         ..Default::default()
     };
     DEV.configure(value);
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 552);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 568);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_lifecycle) == 552);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, kernel_cpu_lifecycle_check) == 560);
+    assert!(mem::size_of::<c::CpuLifecycleInfo>() == 128);
+    assert!(mem::size_of::<c::ProgramKernelCpuLifecycleCheck>() == 128);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_topology) == 536);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_cache_topology) == 544);
     assert!(mem::size_of::<c::CpuTopologyInfo>() == 112);

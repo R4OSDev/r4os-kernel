@@ -141,6 +141,16 @@ pub(crate) fn qualified(index: u32) -> bool {
         && VERIFIED.load(Ordering::Acquire) & (1 << index) != 0
         && READBACKS[index as usize].load(Ordering::Relaxed) == common.table
 }
+pub(crate) fn withdraw(stopped: &super::cpu_lifecycle::Stopped) -> bool {
+    if !stopped.current() {
+        return false;
+    }
+    let index = stopped.index() as usize;
+    VERIFIED.fetch_and(!(1u64 << index), Ordering::AcqRel);
+    READBACKS[index].store(0, Ordering::Release);
+    BEFORE[index].store(0, Ordering::Release);
+    true
+}
 /// Confirm the current CPU's real register, not just the saved BSP snapshot.
 pub(crate) fn local_table() -> Option<u64> {
     let common = contract()?;
@@ -245,12 +255,28 @@ pub(crate) fn log(index: u32, before: u64, actual: u64) {
     });
     puts(b" mtrr=equivalent\r\n");
 }
-pub(crate) fn log_ap(index: u32) {
+pub(crate) fn log_ap(index: u32, record_only: bool) {
     if qualified(index) {
         let value = READBACKS[index as usize].load(Ordering::Acquire);
         // This line states the confirmed table; the exact SMP identity/epoch
         // is emitted alongside it by the startup owner.
-        log(index, BEFORE[index as usize].load(Ordering::Relaxed), value);
+        let before = BEFORE[index as usize].load(Ordering::Relaxed);
+        if record_only {
+            use core::fmt::Write;
+            let mut line = crate::boot::log::Line::<192>::new();
+            write!(
+                &mut line,
+                "[PAT] cpu={index} table=0x{value:016X} selectors wb={} uc={} wc={} sync={} mtrr=equivalent\r\n",
+                types::selector(value, types::WB).unwrap_or(255),
+                types::selector(value, types::UC).unwrap_or(255),
+                types::selector(value, types::WC).unwrap_or(255),
+                if before == value { "same" } else { "updated" }
+            )
+            .expect("Bounded PAT record");
+            line.emit();
+        } else {
+            log(index, before, value);
+        }
     }
 }
 /// The boot root owner changes device aliases before releasing any AP. Keep
