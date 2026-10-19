@@ -19,6 +19,22 @@ unsafe fn valid<T>(out: *mut T) -> bool {
     }
 }
 /// # Safety
+/// Exclusive initialized fixed output/capacity. No CPU operation or callback.
+pub(crate) unsafe extern "C" fn microcode(index: u32, out: *mut c::CpuMicrocodeInfo) -> i32 {
+    if !unsafe { valid(out) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match crate::arch::microcode::snapshot(index) {
+        Ok(value) => {
+            unsafe {
+                out.write(value);
+            }
+            c::cpu_capabilities_ok
+        }
+        Err(reason) => reason,
+    }
+}
+/// # Safety
 /// Exclusive initialized fixed record; resident metadata only, no CPU work.
 pub(crate) unsafe extern "C" fn machine_info(index: u32, out: *mut c::CpuMachineInfo) -> i32 {
     if !unsafe { valid(out) } {

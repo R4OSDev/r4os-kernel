@@ -1114,6 +1114,7 @@ fn configure_dev() {
     const CPU_IDLE: c::R4DevFns::cpu_idle_info = r4dev::cpu_capabilities::idle;
     const CPU_MACHINE_INFO: c::R4DevFns::cpu_machine_info = r4dev::cpu_capabilities::machine_info;
     const CPU_MACHINE_BANK: c::R4DevFns::cpu_machine_bank = r4dev::cpu_capabilities::machine_bank;
+    const CPU_MICROCODE_INFO: c::R4DevFns::cpu_microcode_info = r4dev::cpu_capabilities::microcode;
     r4dev::providers::install();
     let value = c::R4XStartR4Dev {
         serial_count: super::serial_api::count as c::R4DevFns::serial_count as *const () as usize,
@@ -1235,13 +1236,15 @@ fn configure_dev() {
         cpu_idle_info: CPU_IDLE as *const () as usize,
         cpu_machine_info: CPU_MACHINE_INFO as *const () as usize,
         cpu_machine_bank: CPU_MACHINE_BANK as *const () as usize,
+        cpu_microcode_info: CPU_MICROCODE_INFO as *const () as usize,
         ..Default::default()
     };
     DEV.configure(value);
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 672);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 680);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_microcode_info) == 672);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_machine_info) == 656);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_machine_bank) == 664);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_idle_info) == 648);

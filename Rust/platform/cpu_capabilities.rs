@@ -144,7 +144,9 @@ pub(crate) fn capture(index: u32, epoch: u64) -> bool {
         os.mtrr_default,
         u64::from(os.flags),
     ]);
-    cpu_topology::epoch(index) == epoch && slot.publish(epoch, words).is_ok()
+    cpu_topology::epoch(index) == epoch
+        && crate::arch::microcode::finalize(index, epoch, &raw)
+        && slot.publish(epoch, words).is_ok()
 }
 pub(crate) fn snapshot(index: u32) -> Result<Snapshot, i32> {
     if index >= cpu_topology::count() {

@@ -658,6 +658,23 @@ pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> !
     if let Err(reason) = ap_admission::begin(index, apic_id as u32, start_epoch) {
         reject(reason);
     }
+    // Install local exception/GS state before optional protected microcode
+    // instructions. The minimal architectural MSR requirement permits this
+    // bootstrap only; all feature/module/PAT/FPU admission follows the patch.
+    if core::arch::x86_64::__cpuid_count(1, 0).edx & (1 << 5) == 0 {
+        reject(b"ap-bootstrap-msr");
+    }
+    tables::r4os_rust_gdt_init(index);
+    percpu::r4os_rust_percpu_control(1, index, 0, 0);
+    super::cpu_lifecycle::install(index, start_epoch);
+    tlb::flush_all_local();
+    tables::r4os_rust_idt_load();
+    if percpu::state(index) != 2 {
+        runtime::halt_forever();
+    }
+    if !super::microcode::prepare_ap(index, start_epoch) {
+        reject(b"ap-early-microcode");
+    }
     // Rust's bare target uses integer registers only. The module baseline
     // and common XSAVE image must be admitted before any FPU/SIMD operation.
     if let Some(reason) = crate::platform::module_cpu::hardware_failure() {
@@ -670,14 +687,6 @@ pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> !
         && core::arch::x86_64::__cpuid_count(1, 0).edx & (1 << 4) == 0
     {
         reject(b"tsc-capabilities");
-    }
-    tables::r4os_rust_gdt_init(index);
-    percpu::r4os_rust_percpu_control(1, index, 0, 0);
-    super::cpu_lifecycle::install(index, start_epoch);
-    tlb::flush_all_local();
-    tables::r4os_rust_idt_load();
-    if percpu::state(index) != 2 {
-        runtime::halt_forever();
     }
     if let Err(reason) = pat::init_ap(index) {
         reject(reason);

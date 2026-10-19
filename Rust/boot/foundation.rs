@@ -144,6 +144,9 @@ pub extern "C" fn r4os_rust_com_debug_boot() {
 
 unsafe fn cpu_foundation() {
     crate::arch::pic::init();
+    if !crate::arch::microcode::prepare_bsp() {
+        crate::boot::fatal::kernel(2, b"Early CPU microcode preparation failed");
+    }
     crate::platform::cpu::detect();
     crate::platform::module_cpu::require_hardware();
     crate::arch::smp::r4os_rust_smp_control(0, 0);
