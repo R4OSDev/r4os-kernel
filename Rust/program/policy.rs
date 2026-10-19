@@ -58,9 +58,13 @@ pub unsafe extern "C" fn r4os_rust_program_start_accepts(
 /// The metadata pointer names the caller's resident bytes for this call.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_parallel(data: *const u8, len: usize) -> u8 {
+    parallel_owner(unsafe { bytes(data, len) }, b"runtime.parallel=")
+}
+
+pub(super) fn parallel_owner(metadata: &[u8], key: &[u8]) -> u8 {
     let mut found = None;
-    for item in unsafe { bytes(data, len) }.split(|value| *value == 0) {
-        if let Some(value) = item.strip_prefix(b"runtime.parallel=") {
+    for item in metadata.split(|value| *value == 0) {
+        if let Some(value) = item.strip_prefix(key) {
             if found.is_some() {
                 return u8::MAX;
             }
@@ -97,4 +101,29 @@ pub extern "C" fn r4os_rust_program_natural_exit(
     scheduler_task_present: bool,
 ) -> bool {
     exited && (execution_pinned || scheduler_task_present)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parallel_owner;
+    #[test]
+    fn separate_main_and_worker_declarations() {
+        let meta = b"runtime.parallel=bsp\0runtime.workers=owned-v1\0";
+        assert_eq!(parallel_owner(meta, b"runtime.parallel="), 0);
+        assert_eq!(parallel_owner(meta, b"runtime.workers="), 1);
+        assert_eq!(
+            parallel_owner(b"runtime.parallel=owned-v1", b"runtime.workers="),
+            0
+        );
+    }
+    #[test]
+    fn unknown_and_duplicate_worker_declarations_reject() {
+        for meta in [
+            b"runtime.workers=unknown".as_slice(),
+            b"runtime.workers=owned-v1\0runtime.workers=bsp",
+            b"runtime.workers=owned-v1\0runtime.workers=owned-v1",
+        ] {
+            assert_eq!(parallel_owner(meta, b"runtime.workers="), u8::MAX);
+        }
+    }
 }

@@ -173,6 +173,7 @@ unsafe fn create(
         (*instance).role = role;
         (*instance).app_class = class;
         (*instance).parallel_execution = role == 2 && value.parallel_execution;
+        (*instance).parallel_workers = value.parallel_workers;
         (*instance).desktop_host = value.desktop_host;
         (*instance).entry = ptr::with_exposed_provenance(value.entry as usize);
         (*instance).stack_top = stack.top;

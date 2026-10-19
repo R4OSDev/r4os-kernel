@@ -51,7 +51,7 @@ pub struct ProgramInstance {
     pub done: bool,
     pub storage_teardown_blocked: bool,
     pub serial_closed: bool,
-    _padding0: [u8; 1],
+    pub parallel_workers: bool,
 }
 
 #[repr(C)]
@@ -226,6 +226,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ProgramInstance, desktop_requested) == 251);
     assert!(core::mem::offset_of!(ProgramInstance, done) == 252);
     assert!(core::mem::offset_of!(ProgramInstance, storage_teardown_blocked) == 253);
+    assert!(core::mem::offset_of!(ProgramInstance, parallel_workers) == 255);
     assert!(core::mem::size_of::<ProgramInstance>() == 256);
     assert!(core::mem::align_of::<ProgramInstance>() == 8);
     assert!(core::mem::offset_of!(ProgramRegistrySlot, generation) == 0);

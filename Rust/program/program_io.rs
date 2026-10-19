@@ -1,6 +1,8 @@
 //! Program output/capture and byte/codepoint facade counters. The retired
 //! memory/allocator slots keep their existing zero/null/error behavior.
-use super::{console, console_input, context, payload, registry_types::ProgramInstance, util};
+use super::{
+    console, console_input, context, payload, registry_types::ProgramInstance, threads, util,
+};
 use crate::{arch::percpu, contract, fs::vfs_types::Bytes, sched::scheduler};
 use core::{cell::UnsafeCell, ffi::c_void, mem, ptr};
 struct Capture {
@@ -70,7 +72,7 @@ unsafe fn smoke(instance: *const ProgramInstance, stream: u32, ch: u8) {
 }
 pub(super) unsafe fn output(stream: u32, data: Bytes) {
     unsafe {
-        if data.len == 0 {
+        if data.len == 0 || threads::compute_worker() {
             return;
         }
         let data_bytes = util::bytes(data);
@@ -186,6 +188,9 @@ pub unsafe extern "C" fn r4os_rust_program_io_print(text: *const u8) {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_program_io_key(byte: bool) -> u32 {
+    if threads::compute_worker() {
+        return 0;
+    }
     unsafe {
         let state = console_input::r4os_rust_program_console_input_state();
         (*state).read_calls = (*state).read_calls.wrapping_add(1);
@@ -209,6 +214,9 @@ pub unsafe extern "C" fn r4os_rust_program_io_write(
     legacy: bool,
 ) -> i32 {
     unsafe {
+        if threads::compute_worker() {
+            return -2;
+        }
         if legacy {
             if stream > 2 {
                 return -1;

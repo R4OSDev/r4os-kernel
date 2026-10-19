@@ -907,6 +907,9 @@ unsafe fn emit(
 }
 unsafe fn route(stream: u32, data: &[u8], normalize: bool) -> bool {
     unsafe {
+        if super::threads::compute_worker() {
+            return false;
+        }
         if data.is_empty() {
             return true;
         }
@@ -1401,6 +1404,9 @@ pub unsafe extern "C" fn r4os_rust_program_console_host(
     out: *mut contract::ConsoleState,
 ) -> i32 {
     unsafe {
+        if super::threads::compute_worker() {
+            return 0;
+        }
         let instance = super::console_input::current();
         match op {
             0 => i32::from(!instance.is_null()),

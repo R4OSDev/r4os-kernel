@@ -150,6 +150,9 @@ unsafe fn target(handle: contract::ProgramProcessHandle) -> *mut ProgramInstance
 }
 pub(super) unsafe fn current() -> *mut ProgramInstance {
     unsafe {
+        if threads::compute_worker() {
+            return ptr::null_mut();
+        }
         let instance = context::current();
         if instance.is_null() || (*instance).app_class != 0 {
             return ptr::null_mut();
@@ -227,6 +230,9 @@ unsafe fn push(instance: *mut ProgramInstance, data: &[u8]) -> usize {
 }
 unsafe fn read_codepoint() -> Option<u32> {
     unsafe {
+        if threads::compute_worker() {
+            return None;
+        }
         if (*state()).capture_present {
             if (*state()).capture_pos >= (*state()).capture.len {
                 return None;
@@ -311,6 +317,9 @@ impl Drop for InputLease {
 }
 unsafe fn wait(last: u64, timeout: u64, out: *mut u64) -> i32 {
     unsafe {
+        if threads::compute_worker() {
+            return contract::console_input_wait_error_invalid;
+        }
         if out.is_null() {
             return contract::console_input_wait_error_invalid;
         }
@@ -567,6 +576,9 @@ pub unsafe extern "C" fn r4os_rust_program_console_input_api_read(
     capacity: u32,
 ) -> i32 {
     unsafe {
+        if threads::compute_worker() {
+            return 0;
+        }
         add!(read_calls, 1);
         if capacity == 0 {
             return 0;

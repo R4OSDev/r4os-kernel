@@ -43,6 +43,9 @@ pub extern "C" fn r4os_rust_program_gui_events_state() -> *mut State {
 }
 pub(super) unsafe fn allowed(instance: *const ProgramInstance) -> bool {
     unsafe {
+        if threads::compute_worker() {
+            return false;
+        }
         if !(*instance).parallel_execution {
             return true;
         }

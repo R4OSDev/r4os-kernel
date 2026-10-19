@@ -165,6 +165,15 @@ const _: () = {
 pub(super) const MAIN: u32 = 1;
 pub(super) const JOINABLE: u32 = 2;
 pub(super) const JOINED: u32 = 4;
+pub(super) const COMPUTE_WORKER: u32 = crate::contract::thread_flag_compute_worker;
+
+/// Compute descendants never become a console/GUI producer, even on the BSP.
+pub(super) fn compute_worker() -> bool {
+    unsafe {
+        let thread = current();
+        !thread.is_null() && (*thread).flags & COMPUTE_WORKER != 0
+    }
+}
 #[repr(C)]
 pub struct State {
     pub head: *mut Thread,

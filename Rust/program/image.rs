@@ -54,6 +54,7 @@ pub struct Loaded {
     pub entry: u64,
     pub memory: memory::Contract,
     pub parallel_execution: bool,
+    pub parallel_workers: bool,
     pub desktop_host: bool,
     pub imports: [ImportSeed; 16],
     pub import_count: u32,
@@ -223,7 +224,7 @@ fn exports(r: &Request, sections: &[Section]) -> Option<(bool, bool)> {
     }
     Some((v1, v2))
 }
-fn metadata(r: &Request, v1: bool, v2: bool) -> Option<(memory::Contract, bool, bool)> {
+fn metadata(r: &Request, v1: bool, v2: bool) -> Option<(memory::Contract, bool, bool, bool)> {
     let mut c = ReadContext {
         reader: r.reader,
         name: span(b"r4x-metadata-probe"),
@@ -251,11 +252,20 @@ fn metadata(r: &Request, v1: bool, v2: bool) -> Option<(memory::Contract, bool, 
     if parallel == u8::MAX {
         return None;
     }
+    let workers = policy::parallel_owner(meta, b"runtime.workers=");
+    if workers == u8::MAX {
+        return None;
+    }
     let desktop = unsafe { policy::r4os_rust_program_desktop_host(meta.as_ptr(), meta.len()) };
     if desktop == u8::MAX {
         return None;
     }
-    Some((memory, parallel == 1, desktop == 1 && r.app_class == 1))
+    Some((
+        memory,
+        parallel == 1,
+        workers == 1,
+        desktop == 1 && r.app_class == 1,
+    ))
 }
 fn align(value: usize, alignment: usize) -> Option<usize> {
     Some(value.checked_add(alignment - 1)? & !(alignment - 1))
@@ -535,6 +545,7 @@ fn relocations(
     }
     Some(())
 }
+#[allow(clippy::too_many_arguments)]
 fn finish(
     r: &Request,
     sections: &[Section],
@@ -542,6 +553,7 @@ fn finish(
     image: Image,
     memory: memory::Contract,
     parallel: bool,
+    workers: bool,
     desktop: bool,
 ) -> Option<Loaded> {
     if !payload(r, sections, offsets, image) {
@@ -582,6 +594,7 @@ fn finish(
         entry: unsafe { image.code.add(offset) }.addr() as u64,
         memory,
         parallel_execution: parallel,
+        parallel_workers: workers,
         desktop_host: desktop,
         imports: seeds,
         import_count: r.header.import_count,
@@ -609,7 +622,7 @@ pub unsafe extern "C" fn r4os_rust_program_image_load(
         log(b"Invalid R4M0 exports\r\n");
         return false;
     };
-    let Some((memory, parallel, desktop)) = metadata(r, v1, v2) else {
+    let Some((memory, parallel, workers, desktop)) = metadata(r, v1, v2) else {
         return false;
     };
     let mut offsets = [0usize; 16];
@@ -626,7 +639,9 @@ pub unsafe extern "C" fn r4os_rust_program_image_load(
     }
     let image = unsafe { image.assume_init() };
     unsafe { ptr::write_bytes(image.code, 0, image.len) };
-    let Some(loaded) = finish(r, sections, &offsets, image, memory, parallel, desktop) else {
+    let Some(loaded) = finish(
+        r, sections, &offsets, image, memory, parallel, workers, desktop,
+    ) else {
         super::stack::r4os_rust_program_image_release(image.range_id);
         return false;
     };

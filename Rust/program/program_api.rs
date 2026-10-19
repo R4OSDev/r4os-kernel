@@ -155,6 +155,9 @@ pub unsafe extern "C" fn r4os_rust_program_api_launch(
     unsafe {
         let handles = mode == 2;
         let invalid = if handles { -1 } else { -2 };
+        if mode != 3 && super::threads::compute_worker() {
+            return invalid;
+        }
         if handles {
             if out.is_null() || path.is_null() || args.is_null() {
                 return -1;
@@ -325,6 +328,9 @@ pub unsafe extern "C" fn r4os_rust_program_api_window(
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_program_api_console_host(id: u32, host: u32) -> i32 {
     unsafe {
+        if super::threads::compute_worker() {
+            return -3;
+        }
         process::r4os_rust_program_process_signal();
         let Some(lease) = Lease::id(id) else {
             return -1;
@@ -527,6 +533,15 @@ pub unsafe extern "C" fn r4os_rust_program_api_module_path(out: *mut u8, capacit
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_program_api_action(op: u8) -> i32 {
     unsafe {
+        if super::threads::compute_worker() {
+            return if op == 1 {
+                0
+            } else if op == 3 {
+                c::boot_ready_error_not_boot_shell
+            } else {
+                -1
+            };
+        }
         match op {
             0 => window_id(),
             1 => console::r4os_rust_program_console_host(4, 0, 0, ptr::null_mut()),

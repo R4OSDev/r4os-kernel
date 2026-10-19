@@ -102,7 +102,7 @@ unsafe fn create(
         }
         out.write(JoinHandle::default());
         let mut admission = Admission(false);
-        if flags != 0 {
+        if flags & !crate::contract::thread_create_flag_compute_worker != 0 {
             return -10;
         }
         let instance = super::context::current();
@@ -110,6 +110,11 @@ unsafe fn create(
             || AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).done)).load(Ordering::Acquire)
         {
             return -2;
+        }
+        let compute = flags & crate::contract::thread_create_flag_compute_worker != 0
+            || threads::compute_worker();
+        if compute && !(*instance).parallel_workers {
+            return -10;
         }
         let mut handle = Handle::default();
         if !super::context::r4os_rust_program_context_handle(&mut handle) {
@@ -147,7 +152,7 @@ unsafe fn create(
             stack::r4os_rust_program_stack_free(&mut stack);
             return -4;
         }
-        let parallel = (*instance).parallel_execution;
+        let parallel = (*instance).parallel_execution || compute;
         let request = task_api::CreateRequest {
             name: b"r4x-thread".as_ptr(),
             name_len: 10,
@@ -176,7 +181,7 @@ unsafe fn create(
             task_id: (*task_core).id,
             task_generation: (*task_core).generation,
             state: 1,
-            flags: threads::JOINABLE,
+            flags: threads::JOINABLE | if compute { threads::COMPUTE_WORKER } else { 0 },
             entry,
             arg: arg as usize,
             stack,
