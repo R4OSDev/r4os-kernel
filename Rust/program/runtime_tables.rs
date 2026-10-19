@@ -1111,6 +1111,7 @@ fn configure_dev() {
     const CPU_HINT: c::R4DevFns::cpu_performance_hint = crate::platform::cpu_power::hints::info;
     const CPU_FIRMWARE: c::R4DevFns::cpu_firmware_performance =
         crate::platform::cpu_power::firmware::call;
+    const CPU_IDLE: c::R4DevFns::cpu_idle_info = r4dev::cpu_capabilities::idle;
     r4dev::providers::install();
     let value = c::R4XStartR4Dev {
         serial_count: super::serial_api::count as c::R4DevFns::serial_count as *const () as usize,
@@ -1229,13 +1230,15 @@ fn configure_dev() {
         cpu_cppc: CPU_CPPC as *const () as usize,
         cpu_performance_hint: CPU_HINT as *const () as usize,
         cpu_firmware_performance: CPU_FIRMWARE as *const () as usize,
+        cpu_idle_info: CPU_IDLE as *const () as usize,
         ..Default::default()
     };
     DEV.configure(value);
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 648);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 656);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_idle_info) == 648);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_firmware_performance) == 640);
     assert!(mem::size_of::<c::CpuFirmwareInfo>() == 192);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_capabilities) == 568);

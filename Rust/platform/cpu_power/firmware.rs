@@ -43,7 +43,7 @@ static STATE: Storage = Storage(UnsafeCell::new(State {
     next_cookie: 1,
     next_token: 1,
 }));
-fn identity() -> Option<(u32, u64)> {
+pub(crate) fn identity() -> Option<(u32, u64)> {
     if irq_router::r4os_rust_irq_router_local(false) != 0 {
         return None;
     }
@@ -121,6 +121,9 @@ pub(crate) extern "C" fn unregister(role: u32, cookie: u64) -> i32 {
     if b.active != 0 || s.domains.iter().any(Option::is_some) {
         return c::cpu_capabilities_error_busy;
     }
+    if role == 0 && !crate::arch::cpu_idle::withdraw_owner_locked(&_runtime, id.0) {
+        return c::cpu_capabilities_error_busy;
+    }
     s.bindings[role as usize] = None;
     0
 }
@@ -164,6 +167,11 @@ pub(crate) fn finish_close_locked(_runtime: &RuntimeGuard, owner: u32) -> bool {
 }
 pub(crate) fn facade_live_locked(_runtime: &RuntimeGuard, owner: u32, epoch: u64) -> bool {
     unsafe { &*STATE.0.get() }.bindings[1].is_some_and(|b| (b.owner, b.epoch) == (owner, epoch))
+}
+pub(crate) fn idle_publisher_locked(_: &RuntimeGuard, id: (u32, u64), cookie: u64) -> bool {
+    unsafe { &*STATE.0.get() }.bindings[0].is_some_and(|b| {
+        (b.owner, b.epoch, b.cookie) == (id.0, id.1, cookie) && !b.closing && cookie != 0
+    })
 }
 pub(crate) fn busy_locked(_runtime: &RuntimeGuard, mask: u64) -> bool {
     unsafe { &*STATE.0.get() }

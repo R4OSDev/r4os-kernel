@@ -19,6 +19,23 @@ unsafe fn valid<T>(out: *mut T) -> bool {
     }
 }
 /// # Safety
+/// Exclusive initialized resident fixed record; no hardware instruction/query
+/// occurs beyond a copy of canonical metadata and idle software counters.
+pub(crate) unsafe extern "C" fn idle(index: u32, out: *mut c::CpuIdleInfo) -> i32 {
+    if !unsafe { valid(out) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match crate::arch::cpu_idle::info(index) {
+        Ok(value) => {
+            unsafe {
+                out.write(value);
+            }
+            0
+        }
+        Err(reason) => reason,
+    }
+}
+/// # Safety
 /// Exclusive resident initialized header/capacity; output/tail unchanged on error.
 pub(crate) unsafe extern "C" fn info(index: u32, out: *mut c::CpuCapabilitiesInfo) -> i32 {
     if !unsafe { valid(out) } {

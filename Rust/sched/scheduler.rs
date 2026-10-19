@@ -1201,10 +1201,18 @@ fn wait_until_deadline() {
     if bsp {
         timer::r4os_rust_timer_control(12, query(8, ptr::null_mut(), 0), 0);
     }
+    let idle_entry = {
+        let owner = runtime::RuntimeGuard::acquire();
+        crate::arch::cpu_idle::prepare_locked(&owner)
+    };
     if !runtime::release_for_switch() {
         runtime::halt_forever();
     }
-    runtime::r4os_rust_runtime_control(13, 0);
+    if let Some(entry) = idle_entry {
+        crate::arch::cpu_idle::enter(entry);
+    } else {
+        crate::arch::cpu_idle::hlt();
+    }
     runtime::r4os_rust_runtime_control(0, 0);
     if bsp {
         let leave = runtime::save_runtime();
@@ -1212,6 +1220,16 @@ fn wait_until_deadline() {
         runtime::restore_runtime(leave);
     }
     runtime::restore_runtime(flags);
+}
+/// Exact final MONITOR/MWAIT boundary: recheck absolute due work and Ready
+/// under the same Runtime owner as HLT admission, then release it before the
+/// instruction. Later remote enqueues retain their existing reschedule IPI.
+pub(crate) fn idle_entry_still_empty() -> bool {
+    let _owner = runtime::RuntimeGuard::acquire();
+    let index = percpu::current_index();
+    let due = index == 0 && wake_expired(tick());
+    refill_ready();
+    !due && ready_count() == 0 && idle_switch_complete(index)
 }
 fn timer_preemption(now: u64, preemptible: bool) -> bool {
     change(|s| {

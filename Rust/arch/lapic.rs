@@ -105,6 +105,7 @@ static FLAGS: AtomicU32 = AtomicU32::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 static CURRENT_COUNT: AtomicU32 = AtomicU32::new(0);
 static HZ: AtomicU32 = AtomicU32::new(0);
+static IDLE_COUNT_RATE: AtomicU64 = AtomicU64::new(0);
 static BSP_ID: AtomicU64 = AtomicU64::new(u64::MAX);
 
 fn state() -> Status {
@@ -121,6 +122,14 @@ fn publish(value: Status) {
     unsafe { STATE.0.get().write(value) };
     CURRENT_COUNT.store(value.timer_current_count, Ordering::Relaxed);
     HZ.store(value.timer_frequency_hz, Ordering::Release);
+    // Rounded periodic calibration plus one tick's rounding margin yields a
+    // conservative upper rate, hence a lower remaining-time budget.
+    IDLE_COUNT_RATE.store(
+        u64::from(value.timer_initial_count)
+            .saturating_add(1)
+            .saturating_mul(u64::from(value.timer_frequency_hz)),
+        Ordering::Release,
+    );
     FLAGS.store(value.flags, Ordering::Release);
 }
 fn log(event: u8, value: Status) {
@@ -152,6 +161,26 @@ fn write(register: u32, value: u32) {
 pub fn is_enabled() -> bool {
     FLAGS.load(Ordering::Acquire) & (ENABLED | SOFTWARE) == (ENABLED | SOFTWARE)
         && (BASE.load(Ordering::Acquire) != 0 || MODE_X2.load(Ordering::Acquire))
+}
+/// IF0 local observation only. A masked/disarmed/replaced timer never proves
+/// an idle wake deadline. ARAT is separately mandatory at CPU entry admission.
+pub(crate) fn idle_budget_us() -> Option<u64> {
+    if !is_enabled() {
+        return None;
+    }
+    let lvt = read(LVT);
+    if lvt & MASKED != 0 || lvt & 255 != VECTOR {
+        return None;
+    }
+    if lvt & (1 << 18) != 0 {
+        return deadline::idle_budget_us();
+    }
+    let rate = IDLE_COUNT_RATE.load(Ordering::Acquire);
+    let count = read(CURRENT);
+    if count == 0 || rate == 0 {
+        return None;
+    }
+    Some(u64::from(count).saturating_mul(1_000_000) / rate)
 }
 pub(crate) fn bsp_apic_id() -> Option<u32> {
     if !is_enabled() {

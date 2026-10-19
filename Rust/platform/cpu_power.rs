@@ -82,6 +82,7 @@ impl SystemTransition {
         state.active == 0
             && state.controls.iter().all(Option::is_none)
             && firmware::returned_locked(&_runtime)
+            && !crate::arch::cpu_idle::active_locked(&_runtime)
     }
     pub(crate) fn commit(self) {
         // Keep the admitted cohort and closed ownership through the terminal
@@ -195,6 +196,10 @@ pub(crate) fn unregister(cookie: u64) -> i32 {
         return c::cpu_capabilities_error_busy;
     }
     state.closing = true;
+    if !crate::arch::cpu_idle::withdraw_owner_locked(&_runtime, owner) {
+        state.closing = false;
+        return c::cpu_capabilities_error_busy;
+    }
     state.binding = None;
     hints::clear(&_runtime);
     c::cpu_capabilities_ok
@@ -202,6 +207,9 @@ pub(crate) fn unregister(cookie: u64) -> i32 {
 /// Rejected preparation does not leave a live provider silently closed.
 pub(crate) fn prepare_close(owner: u32) -> bool {
     let _runtime = RuntimeGuard::acquire();
+    if !crate::arch::cpu_idle::withdraw_owner_locked(&_runtime, owner) {
+        return false;
+    }
     if !firmware::prepare_close_locked(&_runtime, owner) {
         return false;
     }

@@ -472,6 +472,19 @@ pub(super) fn active(cpu: u32) -> bool {
         && clocksource::deadline_clock(cpu)
             .is_some_and(|(_, g)| g == t.generation.load(Ordering::Acquire))
 }
+pub(super) fn idle_budget_us() -> Option<u64> {
+    let t = local();
+    if !current(t) || !active(percpu::current_index()) {
+        return None;
+    }
+    let next = t.next.load(Ordering::Acquire);
+    let now = super::read_tsc();
+    let hz = t.frequency.load(Ordering::Acquire);
+    if next <= now || hz == 0 {
+        return None;
+    }
+    u64::try_from(u128::from(next - now) * 1_000_000 / u128::from(hz)).ok()
+}
 pub(crate) fn log(cpu: u32) {
     use core::fmt::Write;
     let Some(t) = TIMERS.get(cpu as usize) else {

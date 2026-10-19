@@ -56,12 +56,45 @@ pub(crate) unsafe extern "C" fn query(out: *mut c::DriverCpuPowerApi) -> i32 {
         firmware_execute: cpu_power::firmware::transport as *const () as usize as u64,
         firmware_control: firmware_control as *const () as usize as u64,
         firmware_cpu_info: cpu_power::firmware::cpu_info as *const () as usize as u64,
+        idle_publish: idle_publish as *const () as usize as u64,
+        idle_policy: idle_policy as *const () as usize as u64,
         ..Default::default()
     };
     unsafe {
         ptr::copy_nonoverlapping(ptr::from_ref(&value).cast::<u8>(), out.cast::<u8>(), bytes)
     };
     c::cpu_capabilities_ok
+}
+unsafe extern "C" fn idle_publish(input: *const c::CpuIdleDescriptor) -> i32 {
+    if !unsafe { valid(input) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    let Some(id) = cpu_power::firmware::identity() else {
+        return c::cpu_capabilities_error_context;
+    };
+    let value = unsafe { input.read() };
+    let runtime = crate::arch::runtime::RuntimeGuard::acquire();
+    if !cpu_power::firmware::idle_publisher_locked(&runtime, id, value.firmware_generation) {
+        return c::cpu_capabilities_error_epoch;
+    }
+    crate::arch::cpu_idle::publish_locked(&runtime, id, value)
+}
+unsafe extern "C" fn idle_policy(input: *const c::CpuIdlePolicy) -> i32 {
+    if !unsafe { valid(input) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    let Some(id) = cpu_power::firmware::identity() else {
+        return c::cpu_capabilities_error_context;
+    };
+    let value = unsafe { input.read() };
+    let runtime = crate::arch::runtime::RuntimeGuard::acquire();
+    if value.provider_generation == 0
+        || cpu_power::provider_cookie_locked(&runtime, id.0, id.1)
+            != Some(value.provider_generation)
+    {
+        return c::cpu_capabilities_error_epoch;
+    }
+    crate::arch::cpu_idle::policy_locked(&runtime, id, value)
 }
 unsafe extern "C" fn firmware_register(
     role: u32,

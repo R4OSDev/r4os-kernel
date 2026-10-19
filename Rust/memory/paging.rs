@@ -794,6 +794,30 @@ pub(crate) fn retry_writable(address: u64) -> bool {
 pub extern "C" fn r4os_rust_paging_write_combining(address: u64, bytes: u64) -> bool {
     cache::write_combining(address, bytes)
 }
+/// Nonblocking admission for a permanent kernel MONITOR page. Observe its
+/// actual leaf/PAT selector and physical MTRR type without changing mappings.
+/// Never wait for a page-table owner while scheduler Runtime is held.
+pub(crate) fn resident_writeback_page(address: u64) -> bool {
+    use crate::arch::{memory_types as types, pat};
+    if !aligned(address) {
+        return false;
+    }
+    let Some(_guard) = Guard::try_acquire(6) else {
+        return false;
+    };
+    if !active_matches() {
+        return false;
+    }
+    let Some(entry) = leaf(root(), address) else {
+        return false;
+    };
+    let value = read(entry.entry);
+    if value & (PRESENT | WRITABLE) != PRESENT | WRITABLE {
+        return false;
+    }
+    let physical = (value & MASK & !(entry.bytes - 1)) | (address & (entry.bytes - 1));
+    pat::effective_at(types::decode(value, entry.huge), physical) == Some(types::WB)
+}
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_paging_active(r4os: bool) -> bool {
     let _guard = Guard::acquire(6);
