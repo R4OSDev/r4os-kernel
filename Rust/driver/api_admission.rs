@@ -111,6 +111,56 @@ pub(crate) fn configure_callbacks(id: u32, parallel: bool) -> bool {
 pub(crate) fn callbacks_parallel() -> bool {
     owned() && STATE.parallel_callbacks.load(Ordering::Acquire)
 }
+/// Exact nested firmware routing only. Both modules and this task must already
+/// have resident call leases. Existing storage_enter still rejects arbitrary
+/// cross-owner nesting; no lifecycle/runtime guard spans the external call.
+pub(crate) struct FirmwareRoute {
+    slot: usize,
+    task: u32,
+    previous: u32,
+    routed: u32,
+    depth: u32,
+}
+impl FirmwareRoute {
+    pub(crate) fn acquire(previous: u32, routed: u32) -> Option<Self> {
+        if previous == 0 || routed == 0 || previous == routed {
+            return None;
+        }
+        let _runtime = RuntimeGuard::acquire();
+        let task = current_task_id();
+        let callbacks = unsafe { &mut *STATE.callbacks.get() };
+        let (slot, entry) = callbacks
+            .iter_mut()
+            .enumerate()
+            .find(|(_, e)| e.used && e.task_id == task)?;
+        if entry.owner != previous || entry.depth == 0 {
+            return None;
+        }
+        let depth = entry.depth;
+        entry.owner = routed;
+        Some(Self {
+            slot,
+            task,
+            previous,
+            routed,
+            depth,
+        })
+    }
+}
+impl Drop for FirmwareRoute {
+    fn drop(&mut self) {
+        let _runtime = RuntimeGuard::acquire();
+        let entry = unsafe { &mut (*STATE.callbacks.get())[self.slot] };
+        assert!(
+            entry.used
+                && entry.task_id == self.task
+                && entry.owner == self.routed
+                && entry.depth == self.depth,
+            "exact firmware route return"
+        );
+        entry.owner = self.previous;
+    }
+}
 // Scalar temporary facade reads; no mutable guard or canonical owner escapes.
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_api_owner_scalar(op: u8) -> u32 {

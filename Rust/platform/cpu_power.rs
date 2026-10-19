@@ -12,6 +12,8 @@ use core::{
     mem, ptr,
     sync::atomic::{AtomicBool, Ordering},
 };
+#[path = "cpu_power/firmware.rs"]
+pub(crate) mod firmware;
 #[path = "cpu_power/hints.rs"]
 pub(crate) mod hints;
 
@@ -77,7 +79,9 @@ impl SystemTransition {
         let state = unsafe { &*STATE.0.get() };
         // New callbacks are closed except exact existing returns. Both their
         // resident controls and callback frames must have really completed.
-        state.active == 0 && state.controls.iter().all(Option::is_none)
+        state.active == 0
+            && state.controls.iter().all(Option::is_none)
+            && firmware::returned_locked(&_runtime)
     }
     pub(crate) fn commit(self) {
         // Keep the admitted cohort and closed ownership through the terminal
@@ -90,6 +94,31 @@ impl Drop for SystemTransition {
     fn drop(&mut self) {
         SYSTEM_TRANSITION.store(false, Ordering::Release);
     }
+}
+pub(crate) fn transitioning() -> bool {
+    SYSTEM_TRANSITION.load(Ordering::Acquire)
+}
+pub(crate) fn provider_matches_locked(_runtime: &RuntimeGuard, id: (u32, u64)) -> bool {
+    unsafe { &*STATE.0.get() }
+        .binding
+        .is_some_and(|b| (b.owner, b.epoch) == id)
+}
+pub(crate) fn provider_cookie_locked(
+    _runtime: &RuntimeGuard,
+    owner: u32,
+    epoch: u64,
+) -> Option<u64> {
+    unsafe { &*STATE.0.get() }
+        .binding
+        .filter(|b| (b.owner, b.epoch) == (owner, epoch))
+        .map(|b| b.cookie)
+}
+pub(crate) fn direct_busy_locked(_runtime: &RuntimeGuard, mask: u64) -> bool {
+    unsafe { &*STATE.0.get() }
+        .controls
+        .iter()
+        .enumerate()
+        .any(|(cpu, c)| c.is_some() && mask & (1u64 << cpu) != 0)
 }
 
 pub(crate) fn owner_identity(allow_closing: bool) -> Option<(u32, u64)> {
@@ -159,7 +188,10 @@ pub(crate) fn unregister(cookie: u64) -> i32 {
     if cookie == 0 || (binding.owner, binding.epoch, binding.cookie) != (owner, epoch, cookie) {
         return c::cpu_capabilities_error_epoch;
     }
-    if state.active != 0 || state.controls.iter().any(Option::is_some) {
+    if state.active != 0
+        || state.controls.iter().any(Option::is_some)
+        || firmware::facade_live_locked(&_runtime, owner, epoch)
+    {
         return c::cpu_capabilities_error_busy;
     }
     state.closing = true;
@@ -170,11 +202,15 @@ pub(crate) fn unregister(cookie: u64) -> i32 {
 /// Rejected preparation does not leave a live provider silently closed.
 pub(crate) fn prepare_close(owner: u32) -> bool {
     let _runtime = RuntimeGuard::acquire();
+    if !firmware::prepare_close_locked(&_runtime, owner) {
+        return false;
+    }
     let state = unsafe { &mut *STATE.0.get() };
     if !state.binding.is_some_and(|b| b.owner == owner) {
         return true;
     }
     if state.active != 0 || state.controls.iter().any(Option::is_some) {
+        firmware::cancel_close_locked(&_runtime, owner);
         return false;
     }
     state.closing = true;
@@ -182,6 +218,7 @@ pub(crate) fn prepare_close(owner: u32) -> bool {
 }
 pub(crate) fn cancel_close(owner: u32) {
     let _runtime = RuntimeGuard::acquire();
+    firmware::cancel_close_locked(&_runtime, owner);
     let state = unsafe { &mut *STATE.0.get() };
     if state.binding.is_some_and(|b| b.owner == owner) {
         state.closing = false;
@@ -189,6 +226,9 @@ pub(crate) fn cancel_close(owner: u32) {
 }
 pub(crate) fn finish_close(owner: u32) -> bool {
     let _runtime = RuntimeGuard::acquire();
+    if !firmware::finish_close_locked(&_runtime, owner) {
+        return false;
+    }
     let state = unsafe { &mut *STATE.0.get() };
     if !state.binding.is_some_and(|b| b.owner == owner) {
         return true;
@@ -278,6 +318,9 @@ pub(crate) fn control_acquire(cpu: u32, epoch: u64) -> Result<u64, i32> {
     let _runtime = RuntimeGuard::acquire();
     let state = unsafe { &mut *STATE.0.get() };
     if SYSTEM_TRANSITION.load(Ordering::Acquire) {
+        return Err(c::cpu_capabilities_error_busy);
+    }
+    if cpu < 64 && firmware::busy_locked(&_runtime, 1u64 << cpu) {
         return Err(c::cpu_capabilities_error_busy);
     }
     if !state.binding.is_some_and(|b| {

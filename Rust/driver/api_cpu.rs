@@ -51,12 +51,52 @@ pub(crate) unsafe extern "C" fn query(out: *mut c::DriverCpuPowerApi) -> i32 {
         register_compare_write: compare_write as *const () as usize as u64,
         register_cppc: register_cppc as *const () as usize as u64,
         rank_publish: rank_publish as *const () as usize as u64,
+        firmware_register: firmware_register as *const () as usize as u64,
+        firmware_unregister: cpu_power::firmware::unregister as *const () as usize as u64,
+        firmware_execute: cpu_power::firmware::transport as *const () as usize as u64,
+        firmware_control: firmware_control as *const () as usize as u64,
+        firmware_cpu_info: cpu_power::firmware::cpu_info as *const () as usize as u64,
         ..Default::default()
     };
     unsafe {
         ptr::copy_nonoverlapping(ptr::from_ref(&value).cast::<u8>(), out.cast::<u8>(), bytes)
     };
     c::cpu_capabilities_ok
+}
+unsafe extern "C" fn firmware_register(
+    role: u32,
+    backend: *const c::CpuFirmwareBackend,
+    out: *mut u64,
+) -> i32 {
+    if !unsafe { valid(backend) } || out.is_null() || !out.is_aligned() {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match cpu_power::firmware::register(role, unsafe { backend.read() }) {
+        Ok(cookie) => {
+            unsafe { out.write(cookie) };
+            0
+        }
+        Err(reason) => reason,
+    }
+}
+unsafe extern "C" fn firmware_control(
+    operation: u32,
+    cpu: u32,
+    epoch: u64,
+    mask: u64,
+    expected: u64,
+    out: *mut u64,
+) -> i32 {
+    if out.is_null() || !out.is_aligned() {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match cpu_power::firmware::control(operation, cpu, epoch, mask, expected) {
+        Ok(token) => {
+            unsafe { out.write(token) };
+            0
+        }
+        Err(reason) => reason,
+    }
 }
 unsafe extern "C" fn register(backend: *const c::CpuPowerBackend, cookie: *mut u64) -> i32 {
     if !unsafe { valid(backend) } || cookie.is_null() || !cookie.is_aligned() {
