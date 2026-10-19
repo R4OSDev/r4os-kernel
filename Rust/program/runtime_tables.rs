@@ -9,6 +9,7 @@ use core::{
     ptr,
     sync::atomic::{AtomicBool, AtomicU8, Ordering},
 };
+const _: c::R4SysFns::system_power_transition = crate::program::system::control::power_transition;
 struct Table<T> {
     data: UnsafeCell<MaybeUninit<T>>,
     phase: AtomicU8,
@@ -304,12 +305,14 @@ fn configure_sys() {
             as usize,
         thread_placement_get: super::thread_placement::get as *const () as usize,
         thread_placement_set: super::thread_placement::set as *const () as usize,
+        system_power_transition: crate::program::system::control::power_transition as *const ()
+            as usize,
         ..Default::default()
     };
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1280);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1288);
     assert!(mem::offset_of!(c::R4XStartR4Sys, magic) == 0);
     assert!(mem::offset_of!(c::R4XStartR4Sys, abi_version) == 4);
     assert!(mem::offset_of!(c::R4XStartR4Sys, size) == 8);
@@ -367,6 +370,7 @@ const _: () = {
     assert!(mem::offset_of!(c::R4XStartR4Sys, system_halt) == 416);
     assert!(mem::offset_of!(c::R4XStartR4Sys, system_reboot) == 424);
     assert!(mem::offset_of!(c::R4XStartR4Sys, system_poweroff) == 432);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, system_power_transition) == 1280);
     assert!(mem::offset_of!(c::R4XStartR4Sys, time_state) == 440);
     assert!(mem::offset_of!(c::R4XStartR4Sys, time_set_state) == 448);
     assert!(mem::offset_of!(c::R4XStartR4Sys, time_seconds_since_midnight) == 456);

@@ -854,6 +854,27 @@ pub unsafe extern "C" fn r4os_rust_program_service_lifecycle(
         }
     }
 }
+/// Normal system transitions fence new CPU controls first, then use the
+/// existing cooperative stop and real process-exit acknowledgement. No
+/// registry reference or Runtime owner survives its bounded waits. A policy
+/// service cannot synchronously stop itself/its ancestor to authorize reset.
+pub(crate) fn prepare_cpu_power_stop(timeout: u64) -> bool {
+    unsafe {
+        let name = b"POWERSVC";
+        refresh_name(name);
+        let Some(current) = entry(name) else {
+            return true;
+        };
+        if current.id != 0 && descends(current.id) {
+            return false;
+        }
+        let mut out = c::ServiceInfo::default();
+        stop(name, &mut out, timeout) == c::service_api_result_ok
+            && (out.state == u32::from(STOPPED)
+                || out.state == u32::from(DISABLED)
+                || out.state == u32::from(FAILED))
+    }
+}
 const _: () = {
     assert!(mem::size_of::<Entry>() == 1192);
     assert!(mem::size_of::<Target>() == 72);

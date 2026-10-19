@@ -19,6 +19,7 @@ mod stream_state;
 pub mod atomic;
 pub mod control;
 pub(crate) mod copy;
+mod cpu_power;
 pub mod resources;
 
 mod abi;

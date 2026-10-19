@@ -7,7 +7,11 @@ use crate::{
     platform::{cpu_capabilities as catalog, cpu_registers::Session, monotonic},
     sched::task_context::Admission,
 };
-use core::{cell::UnsafeCell, mem, ptr};
+use core::{
+    cell::UnsafeCell,
+    mem, ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 #[path = "cpu_power/hints.rs"]
 pub(crate) mod hints;
 
@@ -49,6 +53,45 @@ static STATE: Storage = Storage(UnsafeCell::new(Metadata {
     next_control: 1,
 }));
 
+// A terminal transition closes new hardware ownership before asking the
+// external policy owner to return existing requests. No governor lives here.
+static SYSTEM_TRANSITION: AtomicBool = AtomicBool::new(false);
+pub(crate) struct SystemTransition {
+    _membership: life::ProbeLease,
+}
+impl SystemTransition {
+    pub(crate) fn acquire() -> Option<Self> {
+        SYSTEM_TRANSITION
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        let Some(membership) = life::probe_lease() else {
+            SYSTEM_TRANSITION.store(false, Ordering::Release);
+            return None;
+        };
+        Some(Self {
+            _membership: membership,
+        })
+    }
+    pub(crate) fn returned(&self) -> bool {
+        let _runtime = RuntimeGuard::acquire();
+        let state = unsafe { &*STATE.0.get() };
+        // New callbacks are closed except exact existing returns. Both their
+        // resident controls and callback frames must have really completed.
+        state.active == 0 && state.controls.iter().all(Option::is_none)
+    }
+    pub(crate) fn commit(self) {
+        // Keep the admitted cohort and closed ownership through the terminal
+        // call itself; releasing here would reopen a logical offline race.
+        // Terminal stop does not wait for ProbeLease. Reset starts fresh state.
+        mem::forget(self);
+    }
+}
+impl Drop for SystemTransition {
+    fn drop(&mut self) {
+        SYSTEM_TRANSITION.store(false, Ordering::Release);
+    }
+}
+
 pub(crate) fn owner_identity(allow_closing: bool) -> Option<(u32, u64)> {
     let owner = admission::r4os_rust_driver_api_runtime_owner(false);
     if owner == 0 {
@@ -86,7 +129,7 @@ pub(crate) fn register(backend: c::CpuPowerBackend) -> Result<u64, i32> {
     }
     let _runtime = RuntimeGuard::acquire();
     let state = unsafe { &mut *STATE.0.get() };
-    if state.binding.is_some() || state.active != 0 {
+    if state.binding.is_some() || state.active != 0 || SYSTEM_TRANSITION.load(Ordering::Acquire) {
         return Err(c::cpu_capabilities_error_busy);
     }
     let cookie = state.next_cookie;
@@ -182,7 +225,11 @@ pub(crate) fn register_performance(cookie: u64, backend: c::CpuPerformanceBacken
     {
         return c::cpu_capabilities_error_epoch;
     }
-    if state.closing || state.active != 0 || binding.performance.is_some() {
+    if state.closing
+        || state.active != 0
+        || binding.performance.is_some()
+        || SYSTEM_TRANSITION.load(Ordering::Acquire)
+    {
         return c::cpu_capabilities_error_busy;
     }
     binding.performance = Some(backend);
@@ -213,7 +260,11 @@ pub(crate) fn register_cppc(cookie: u64, backend: c::CpuCppcBackend) -> i32 {
     {
         return c::cpu_capabilities_error_epoch;
     }
-    if state.closing || state.active != 0 || binding.cppc.is_some() {
+    if state.closing
+        || state.active != 0
+        || binding.cppc.is_some()
+        || SYSTEM_TRANSITION.load(Ordering::Acquire)
+    {
         return c::cpu_capabilities_error_busy;
     }
     binding.cppc = Some(backend);
@@ -226,6 +277,9 @@ pub(crate) fn control_acquire(cpu: u32, epoch: u64) -> Result<u64, i32> {
     let membership = life::probe_lease().ok_or(c::cpu_capabilities_error_busy)?;
     let _runtime = RuntimeGuard::acquire();
     let state = unsafe { &mut *STATE.0.get() };
+    if SYSTEM_TRANSITION.load(Ordering::Acquire) {
+        return Err(c::cpu_capabilities_error_busy);
+    }
     if !state.binding.is_some_and(|b| {
         (b.owner, b.epoch) == identity && (b.performance.is_some() || b.cppc.is_some())
     }) || state.closing
@@ -323,7 +377,7 @@ impl Drop for ControlCall {
 }
 struct Lease(Binding);
 impl Lease {
-    fn acquire() -> Result<Option<Self>, i32> {
+    fn acquire(returning: Option<(u32, u64, u64)>) -> Result<Option<Self>, i32> {
         let binding = {
             let _runtime = RuntimeGuard::acquire();
             let state = unsafe { &mut *STATE.0.get() };
@@ -331,6 +385,23 @@ impl Lease {
                 return Ok(None);
             };
             if state.closing {
+                return Err(c::cpu_capabilities_error_busy);
+            }
+            if SYSTEM_TRANSITION.load(Ordering::Acquire)
+                && !returning.is_some_and(|(cpu, epoch, token)| {
+                    state
+                        .controls
+                        .get(cpu as usize)
+                        .and_then(Option::as_ref)
+                        .is_some_and(|control| {
+                            token != 0
+                                && control.token == token
+                                && control.cpu_epoch == epoch
+                                && control.owner == binding.owner
+                                && control.owner_epoch == binding.epoch
+                        })
+                })
+            {
                 return Err(c::cpu_capabilities_error_busy);
             }
             state.active = state
@@ -417,7 +488,7 @@ unsafe fn observe(cpu: u32, epoch: u64, out: *mut c::CpuPowerInfo, capture: bool
     {
         return c::cpu_capabilities_error_busy;
     }
-    let lease = match Lease::acquire() {
+    let lease = match Lease::acquire(None) {
         Ok(Some(lease)) => lease,
         Ok(None) if !capture => {
             let value = c::CpuPowerInfo {
@@ -520,7 +591,12 @@ pub(crate) unsafe extern "C" fn performance(
         Ok(session) => session,
         Err(reason) => return reason,
     };
-    let lease = match Lease::acquire() {
+    let returning = (request.operation == c::cpu_performance_op_release).then_some((
+        request.cpu_index,
+        request.epoch,
+        request.lease,
+    ));
+    let lease = match Lease::acquire(returning) {
         Ok(Some(lease)) => lease,
         Ok(None) => return c::cpu_capabilities_error_unsupported,
         Err(reason) => return reason,
@@ -578,7 +654,12 @@ pub(crate) unsafe extern "C" fn cppc(
         Ok(session) => session,
         Err(reason) => return reason,
     };
-    let lease = match Lease::acquire() {
+    let returning = (request.operation == c::cpu_performance_op_release).then_some((
+        request.cpu_index,
+        request.epoch,
+        request.lease,
+    ));
+    let lease = match Lease::acquire(returning) {
         Ok(Some(lease)) => lease,
         Ok(None) => return c::cpu_capabilities_error_unsupported,
         Err(reason) => return reason,

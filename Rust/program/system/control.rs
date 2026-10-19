@@ -248,9 +248,16 @@ unsafe fn save_log(stage: &[u8]) {
 /// # Safety
 /// Original terminal system-halt caller; registry remains active until flush.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_sys_halt() -> ! {
+pub unsafe extern "C" fn r4os_rust_sys_halt() {
+    let Some(transition) = super::cpu_power::prepare_immediate() else {
+        return;
+    };
+    unsafe { halt_ready(transition) }
+}
+unsafe fn halt_ready(transition: crate::platform::cpu_power::SystemTransition) -> ! {
     log::puts(b"System halted.\r\n");
     unsafe { flush_registry() };
+    transition.commit();
     runtime::halt_forever()
 }
 /// # Safety
@@ -262,6 +269,15 @@ pub unsafe extern "C" fn r4os_rust_sys_reboot() {
         if REBOOT.swap(true, Ordering::AcqRel) {
             return;
         }
+        let Some(transition) = super::cpu_power::prepare_immediate() else {
+            REBOOT.store(false, Ordering::Release);
+            return;
+        };
+        reboot_ready(transition)
+    }
+}
+unsafe fn reboot_ready(transition: crate::platform::cpu_power::SystemTransition) -> ! {
+    unsafe {
         log::puts(b"System reboot.\r\n");
         flush_registry();
         flush_page_cache();
@@ -300,23 +316,65 @@ pub unsafe extern "C" fn r4os_rust_sys_reboot() {
             );
             save_log(b"poweroff-device-handoff");
             crate::boot::log_route::serial_flush();
+            transition.commit();
             crate::arch::terminal_power::poweroff();
         }
         save_log(b"warm-reset-ready");
         crate::boot::log_route::serial_flush();
+        transition.commit();
         crate::arch::terminal_power::reboot();
     }
 }
 /// # Safety
 /// Original explicit terminal poweroff caller, after required persistent flushes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn r4os_rust_sys_poweroff() -> ! {
+pub unsafe extern "C" fn r4os_rust_sys_poweroff() {
+    let Some(transition) = super::cpu_power::prepare_immediate() else {
+        return;
+    };
+    unsafe { poweroff_ready(transition) }
+}
+unsafe fn poweroff_ready(transition: crate::platform::cpu_power::SystemTransition) -> ! {
     unsafe {
         log::puts(b"System poweroff.\r\n");
         flush_registry();
         flush_page_cache();
         crate::boot::log_route::serial_flush();
+        transition.commit();
         crate::arch::terminal_power::poweroff()
+    }
+}
+
+/// # Safety
+/// Canonical optional R4SYS call in an ordinary BSP task with IF/fault
+/// admission. The explicit wait budget is bounded; refusal preserves resources
+/// and returns without stopping peers. Success becomes terminal and never returns.
+pub(crate) unsafe extern "C" fn power_transition(action: u32, timeout_ticks: u64) -> i32 {
+    if action > c::power_transition_action_poweroff {
+        return c::power_transition_error_invalid;
+    }
+    if !crate::arch::cpu_lifecycle::caller_context() {
+        return c::power_transition_error_context;
+    }
+    let Some(_caller) = task_context::Admission::acquire(true) else {
+        return c::power_transition_error_context;
+    };
+    let transition = match super::cpu_power::prepare(timeout_ticks) {
+        Ok(value) => value,
+        Err(reason) => return reason,
+    };
+    unsafe {
+        match action {
+            c::power_transition_action_halt => halt_ready(transition),
+            c::power_transition_action_reboot => {
+                if REBOOT.swap(true, Ordering::AcqRel) {
+                    return c::power_transition_error_busy;
+                }
+                reboot_ready(transition)
+            }
+            c::power_transition_action_poweroff => poweroff_ready(transition),
+            _ => unreachable!(),
+        }
     }
 }
 

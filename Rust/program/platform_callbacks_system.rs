@@ -5,10 +5,10 @@ pub(super) unsafe extern "C" fn sys_write(data: *const u8, len: u32) -> i32 {
 pub(super) unsafe extern "C" fn sys_putc(ch: u8) {
     crate::program::program_io::r4os_rust_program_io_byte(1, ch, false);
 }
-pub(super) unsafe extern "C" fn sys_system_halt() -> () {
+pub(super) unsafe extern "C" fn sys_system_halt() {
     unsafe { crate::program::system::control::r4os_rust_sys_halt() }
 }
-pub(super) unsafe extern "C" fn sys_system_poweroff() -> () {
+pub(super) unsafe extern "C" fn sys_system_poweroff() {
     unsafe { crate::program::system::control::r4os_rust_sys_poweroff() }
 }
 pub(super) unsafe extern "C" fn sys_boot_ready() -> i32 {
