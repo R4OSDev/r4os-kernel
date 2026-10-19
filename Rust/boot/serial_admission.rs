@@ -23,6 +23,15 @@ pub(super) fn initialized() {
 pub(super) fn active() -> bool {
     PHASE.load(SeqCst) == ACTIVE
 }
+/// Terminal hardware failure only. Close admission without waiting, retain
+/// the boot claim forever, and permit direct output only after true writer
+/// absence. A busy/interrupted writer forbids emergency PIO, never a spin.
+pub(super) fn emergency() -> bool {
+    PHASE
+        .compare_exchange(ACTIVE, FAILED, SeqCst, SeqCst)
+        .is_ok()
+        && WRITERS.load(SeqCst) == 0
+}
 /// Only construct while holding the existing serial owner. Drop before that
 /// owner: caller kill/preemption cannot strand an admitted writer count.
 pub(super) struct Writer;

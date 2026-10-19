@@ -58,6 +58,9 @@ pub unsafe extern "C" fn r4os_rust_fatal_record(phase: u8, message: *const u8, l
     }
 }
 pub fn kernel(phase: u8, message: &[u8]) -> ! {
+    if crate::arch::machine_check::terminal_active() {
+        halt();
+    }
     PHASE.store(phase, Ordering::Relaxed);
     terminal(5, phase, message)
 }

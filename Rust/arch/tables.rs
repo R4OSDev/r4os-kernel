@@ -66,6 +66,9 @@ static mut TSS: [TssSlot; MAX_CPUS] = [TssSlot {
 }; MAX_CPUS];
 static mut DOUBLE_FAULT_STACKS: Stacks = Stacks([[0; STACK_SIZE]; MAX_CPUS]);
 static mut FAULT_STACKS: Stacks = Stacks([[0; STACK_SIZE]; MAX_CPUS]);
+// #MC must survive a nested protected-read #GP on IST2 and must never share
+// the NMI/double-fault stack or normal task/runtime stack.
+static mut MACHINE_CHECK_STACKS: Stacks = Stacks([[0; STACK_SIZE]; MAX_CPUS]);
 const INITIAL_GDT: [u64; 5] = [0, 0x00AF9A000000FFFF, 0x00CF92000000FFFF, 0, 0];
 static mut GDT: [[u64; 5]; MAX_CPUS] = [INITIAL_GDT; MAX_CPUS];
 #[repr(C)]
@@ -209,6 +212,9 @@ pub extern "C" fn r4os_rust_gdt_init(index: u32) {
         wire.rsp0 = fault_top;
         wire.ist1 = double_top;
         wire.ist2 = fault_top;
+        wire.ist3 = addr_of!(MACHINE_CHECK_STACKS.0)
+            .cast::<u8>()
+            .add((slot + 1) * STACK_SIZE) as u64;
         tss.write(TssSlot { wire, tail: [0; 8] });
         let base = tss as u64;
         let limit = size_of::<TssSlot>() as u64 - 1;
@@ -231,7 +237,8 @@ pub extern "C" fn r4os_rust_gdt_init(index: u32) {
 }
 fn ist(vector: u64) -> u8 {
     match vector {
-        2 | 8 | 18 => 1,
+        2 | 8 => 1,
+        18 => 3,
         10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30 => 2,
         _ => 0,
     }
@@ -322,6 +329,15 @@ pub unsafe extern "C" fn ipiDispatch(frame: *const InterruptFrame) {
 /// # Safety
 /// The exception assembly owns and retains this complete register frame.
 pub unsafe extern "C" fn exceptionDispatch(frame: *const InterruptFrame) {
+    if unsafe { super::machine_check::recover(frame.cast_mut()) } {
+        return;
+    }
+    if unsafe { (*frame).vector } == 18 {
+        unsafe { super::machine_check::fatal(frame) };
+    }
+    if super::machine_check::terminal_active() {
+        crate::boot::fatal::halt();
+    }
     if unsafe { super::safe_msr::recover(frame.cast_mut()) } {
         return;
     }
@@ -343,6 +359,9 @@ pub unsafe extern "C" fn preparePageFaultFrame(
     frame: *const InterruptFrame,
     address: u64,
 ) -> usize {
+    if super::machine_check::terminal_active() {
+        crate::boot::fatal::halt();
+    }
     crate::program::stack_fault::begin_fault();
     let error = unsafe { (*frame).error_code };
     if error & 1 != 0 && error != 3 {
@@ -378,6 +397,9 @@ pub unsafe extern "C" fn pageFaultDispatch(
     address: u64,
     private: u32,
 ) {
+    if super::machine_check::terminal_active() {
+        crate::boot::fatal::halt();
+    }
     if private == 0 {
         unsafe { exception_inner(frame, address, false) };
     } else {
@@ -556,7 +578,12 @@ pub(crate) fn exception_stack_bounds(rsp: u64) -> Option<(u64, u64)> {
             .cast::<[u8; STACK_SIZE]>()
             .add(cpu)
     } as u64;
-    for base in [normal, double] {
+    let machine = unsafe {
+        core::ptr::addr_of!(MACHINE_CHECK_STACKS.0)
+            .cast::<[u8; STACK_SIZE]>()
+            .add(cpu)
+    } as u64;
+    for base in [normal, double, machine] {
         let top = base + STACK_SIZE as u64;
         if rsp > base && rsp <= top {
             return Some((base, top));

@@ -4,7 +4,7 @@ use super::owner::Guard;
 use super::serial_admission as admission;
 use crate::arch::io::{inb, outb};
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 const COM1: u16 = 0x3f8;
 const CAPACITY: usize = 8192;
 const FIFO: usize = 16;
@@ -66,6 +66,7 @@ static SERIAL: Storage = Storage(UnsafeCell::new(State {
 }));
 static HEAD: AtomicUsize = AtomicUsize::new(0);
 static TAIL: AtomicUsize = AtomicUsize::new(0);
+static EMERGENCY_UART: AtomicBool = AtomicBool::new(false);
 fn pending() -> usize {
     HEAD.load(Ordering::Relaxed)
         .wrapping_sub(TAIL.load(Ordering::Relaxed))
@@ -95,6 +96,7 @@ pub(super) fn init_debug() -> bool {
             (*SERIAL.0.get()).fifo = fifo;
         }
     }
+    EMERGENCY_UART.store(present, Ordering::Release);
     admission::initialized();
     true
 }
@@ -103,6 +105,51 @@ pub(crate) fn debug_active() -> bool {
 }
 pub(crate) fn debug_claims_com1() -> bool {
     admission::claims_com1()
+}
+
+/// The terminal #MC path cannot acquire diagnostic/serial owners or call an
+/// unloadable UART sink. This lease exists only for retained early COM1 with
+/// zero admitted writers. Released/busy/absent hardware leaves RAM evidence.
+pub(crate) struct Emergency {
+    budget: usize,
+}
+pub(crate) fn emergency() -> Option<Emergency> {
+    if EMERGENCY_UART.load(Ordering::Acquire) && admission::emergency() {
+        Some(Emergency { budget: 2_000_000 })
+    } else {
+        None
+    }
+}
+impl Emergency {
+    pub(crate) fn write(&mut self, text: &[u8]) {
+        for &byte in text {
+            let mut ready = false;
+            for _ in 0..256 {
+                if self.budget == 0 {
+                    return;
+                }
+                self.budget -= 1;
+                if unsafe { inb(COM1 + 5) } & 0x20 != 0 {
+                    ready = true;
+                    break;
+                }
+            }
+            if !ready {
+                self.budget = 0;
+                return;
+            }
+            unsafe {
+                outb(COM1, byte);
+            }
+        }
+    }
+    pub(crate) fn hex(&mut self, value: u64) {
+        let mut text = [b'0'; 16];
+        for (i, byte) in text.iter_mut().enumerate() {
+            *byte = b"0123456789ABCDEF"[((value >> ((15 - i) * 4)) & 15) as usize];
+        }
+        self.write(&text);
+    }
 }
 
 #[unsafe(no_mangle)]

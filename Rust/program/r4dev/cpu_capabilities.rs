@@ -19,6 +19,44 @@ unsafe fn valid<T>(out: *mut T) -> bool {
     }
 }
 /// # Safety
+/// Exclusive initialized fixed record; resident metadata only, no CPU work.
+pub(crate) unsafe extern "C" fn machine_info(index: u32, out: *mut c::CpuMachineInfo) -> i32 {
+    if !unsafe { valid(out) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match crate::arch::machine_check::info(index) {
+        Ok(value) => {
+            unsafe {
+                out.write(value);
+            }
+            c::cpu_capabilities_ok
+        }
+        Err(reason) => reason,
+    }
+}
+/// # Safety
+/// Same fixed record/tail contract; exact original capture identity required.
+pub(crate) unsafe extern "C" fn machine_bank(
+    index: u32,
+    epoch: u64,
+    sequence: u64,
+    ordinal: u32,
+    out: *mut c::CpuMachineBank,
+) -> i32 {
+    if !unsafe { valid(out) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match crate::arch::machine_check::bank(index, epoch, sequence, ordinal) {
+        Ok(value) => {
+            unsafe {
+                out.write(value);
+            }
+            c::cpu_capabilities_ok
+        }
+        Err(reason) => reason,
+    }
+}
+/// # Safety
 /// Exclusive initialized resident fixed record; no hardware instruction/query
 /// occurs beyond a copy of canonical metadata and idle software counters.
 pub(crate) unsafe extern "C" fn idle(index: u32, out: *mut c::CpuIdleInfo) -> i32 {

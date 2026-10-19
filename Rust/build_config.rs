@@ -38,6 +38,11 @@ impl Write for PanicText {
 #[cfg(not(test))]
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
+    // Hardware-failure capture must never enter normal formatting/output or
+    // try to acquire a diagnostic owner, including an internal capture panic.
+    if crate::arch::machine_check::terminal_active() {
+        crate::boot::fatal::halt();
+    }
     let mut message = PanicText {
         bytes: [0; 256],
         len: 0,

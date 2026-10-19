@@ -126,6 +126,13 @@ pub(crate) fn capture(index: u32, epoch: u64) -> bool {
             }
         }
     }
+    // The local MCA owner may set documented CR4.MCE only after its resident
+    // error capture is ready. Publish the actual resulting control state so
+    // passive capability data remains coherent with native readback.
+    crate::arch::machine_check::prepare(index, epoch, &raw);
+    unsafe {
+        core::arch::asm!("mov {}, cr4",out(reg)os.cr4,options(nomem,nostack,preserves_flags));
+    }
     let mut words = [0; decode::WORDS + OS_WORDS];
     words[..decode::WORDS].copy_from_slice(&raw.encode());
     words[decode::WORDS..].copy_from_slice(&[

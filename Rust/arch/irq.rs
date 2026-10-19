@@ -14,6 +14,9 @@ fn eoi() {
 /// isr.S retains the complete frame and FPU image on the exact interrupted task
 /// stack. Local runtime/IF follows that stack through physical preemption.
 pub unsafe fn dispatch(frame: *const InterruptFrame) {
+    if super::machine_check::terminal_active() {
+        crate::boot::fatal::halt();
+    }
     let saved = runtime::save_runtime();
     let vector = unsafe { core::ptr::addr_of!((*frame).vector).read() };
     if !(0x20..0x40).contains(&vector) {
@@ -67,6 +70,9 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
 /// Same exact assembly frame contract. TLB completion remains independent of
 /// runtime admission while another CPU can retain the page-table owner.
 pub unsafe fn dispatch_ipi(frame: *const InterruptFrame) {
+    if super::machine_check::terminal_active() {
+        crate::boot::fatal::halt();
+    }
     match unsafe { core::ptr::addr_of!((*frame).vector).read() } {
         0xf0 => {
             eoi();
