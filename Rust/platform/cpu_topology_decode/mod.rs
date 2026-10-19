@@ -41,6 +41,7 @@ pub(crate) struct Class {
     pub leaf: u32,
     pub kind: u32,
     pub model: u32,
+    pub signature: u32,
     pub efficiency: Option<u32>,
     pub heterogeneous: bool,
     pub asymmetric: bool,
@@ -126,6 +127,7 @@ fn hierarchy(leaf: u32, apic: u32, query: &mut impl FnMut(u32, u32) -> CpuidResu
                     leaf,
                     kind: r.ebx >> 28,
                     model: (r.ebx >> 24) & 15,
+                    signature: query(1, 0).eax,
                     efficiency: (r.eax & (1 << 29) != 0).then_some((r.ebx >> 16) & 0xff),
                     heterogeneous: false,
                     asymmetric: false,
@@ -234,15 +236,18 @@ pub(crate) fn discover(apic: u32, mut query: impl FnMut(u32, u32) -> CpuidResult
         Ok((g, c)) => (Ok(g), c),
         Err(e) => (Err(e), None),
     };
-    if intel && base.eax >= 0x1a && query(7, 0).edx & (1 << 15) != 0 {
+    // 1A can also exist on homogeneous Intel parts. Its nonzero native ID
+    // enumerates the leaf; the independent hybrid feature remains a fact.
+    if intel && base.eax >= 0x1a {
         let raw = query(0x1a, 0).eax;
-        if raw >> 24 != 0 {
+        if raw != 0 {
             class = Some(Class {
                 leaf: 0x1a,
                 kind: raw >> 24,
                 model: raw & 0x00ff_ffff,
+                signature: query(1, 0).eax,
                 efficiency: None,
-                heterogeneous: true,
+                heterogeneous: query(7, 0).edx & (1 << 15) != 0,
                 asymmetric: false,
             });
         }

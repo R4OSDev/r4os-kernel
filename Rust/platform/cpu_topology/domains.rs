@@ -1,5 +1,7 @@
 //! Bounded boot-only domain construction; the scheduler never rescans CPUID
 //! images. Contradictory qualified peer counts/vendors lose geometry trust.
+#[path = "capacity.rs"]
+mod capacity;
 use super::{SLOTS, count};
 use crate::{
     arch::smp_policy::MAX_CPUS,
@@ -10,9 +12,20 @@ use crate::{
 pub(crate) struct Domain {
     pub core: u64,
     pub cache: u64,
+    pub capacity: u16,
+    pub capacity_scope: u64,
+    pub faster: u64,
+    pub slower: u64,
 }
 impl Domain {
-    pub const EMPTY: Self = Self { core: 0, cache: 0 };
+    pub const EMPTY: Self = Self {
+        core: 0,
+        cache: 0,
+        capacity: 0,
+        capacity_scope: 0,
+        faster: 0,
+        slower: 0,
+    };
 }
 fn base(id: u32, bits: u32) -> u32 {
     id >> bits
@@ -93,5 +106,6 @@ pub(super) fn derive(local_valid: u64) -> (u64, [Domain; MAX_CPUS]) {
             }
         }
     }
+    capacity::derive(trusted, &mut result);
     (trusted, result)
 }

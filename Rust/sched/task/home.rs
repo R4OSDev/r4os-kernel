@@ -1,6 +1,9 @@
 //! Initial/wake home selection only for an unlinked saved continuation.
 //! Exact physical-current and resource barriers precede topology preferences.
-use super::{balance, task_registry as registry, task_types::Task};
+use super::{
+    balance, task_registry as registry,
+    task_types::{Role, Task},
+};
 use crate::{
     arch::percpu,
     platform::cpu_topology,
@@ -33,6 +36,7 @@ pub(super) unsafe fn select(task: *mut Task) {
         let mask = super::thread_placement::allowed(task);
         let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
         let preferred = (*c).placement_applied.preferred;
+        let efficient = (*c).role == Role::Batch;
         let previous = ((*c).home_cpu_bound && old < registry::MAX_CPUS as u32).then_some(old);
         let now = (*c).ready_since_tick;
         if previous.is_some()
@@ -42,12 +46,16 @@ pub(super) unsafe fn select(task: *mut Task) {
         {
             return;
         }
+        // The old CPU shortcuts may skip load probes only when a comparable
+        // static class/rank cannot improve this exact task's work preference.
         if preferred.is_none() && previous.is_some() && mask & (1 << old) != 0 {
             let old_load = balance::workload(old, old_current);
+            let better =
+                placement::better_capacity_targets(mask, cpu_topology::domains(), old, efficient);
             // All admitted exact currents have work: every possible load is
             // at least one and every core occupied, including unknown domains.
             // A prior CPU with one unit is already optimal in all chooser keys.
-            if old_load == 1 && scheduler::all_current_have_work(mask) {
+            if old_load == 1 && better == 0 && scheduler::all_current_have_work(mask) {
                 return;
             }
             // Zero load on the prior CPU with no busy sibling is already
@@ -66,7 +74,9 @@ pub(super) unsafe fn select(task: *mut Task) {
                         break;
                     }
                 }
-                if !core_busy {
+                // Better static hints cannot beat zero load while their exact
+                // currents already supply at least one unit of work.
+                if !core_busy && (better == 0 || scheduler::all_current_have_work(better)) {
                     return;
                 }
             }
@@ -88,6 +98,7 @@ pub(super) unsafe fn select(task: *mut Task) {
             cpu_topology::domains(),
             previous,
             preferred,
+            efficient,
         ) {
             if previous.is_some() && target != old {
                 (*c).last_migration_tick = now.max(1);
