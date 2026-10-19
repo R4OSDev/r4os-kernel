@@ -151,6 +151,9 @@ pub struct TaskCore {
     pub stack_base: u64,
     pub stack_top: u64,
     pub stack_range_id: u32,
+    // Physical page holding the saved top-of-stack frame; zero means unknown.
+    // Resident for this exact stack lifetime, including cache/reserve reuse.
+    pub memory_anchor: u64,
     pub stack_high_water_bytes: u64,
     pub stack_high_water_measured: bool,
     pub role: Role,
@@ -257,6 +260,7 @@ impl Default for TaskCore {
             stack_base: 0,
             stack_top: 0,
             stack_range_id: 0,
+            memory_anchor: 0,
             stack_high_water_bytes: 0,
             stack_high_water_measured: false,
             role: Role::Interactive,

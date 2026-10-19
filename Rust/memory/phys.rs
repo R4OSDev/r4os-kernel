@@ -2,6 +2,10 @@
 //! The exact bitmap, counters and initialized state have one Rust owner.
 use super::{blocks, map, owner::Guard};
 use crate::boot::info;
+use crate::{
+    arch::percpu,
+    platform::{numa, numa_decode::MAX_NODES},
+};
 use core::cell::UnsafeCell;
 use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -32,6 +36,8 @@ struct State {
     bitmap: *mut u8,
     stats: Stats,
     next_hint: u64,
+    local_hints: [u64; MAX_NODES],
+    local_exhausted: u64,
     initialized: bool,
     fault_reported: bool,
 }
@@ -53,6 +59,8 @@ impl State {
             extent_freed_frames: 0,
         },
         next_hint: 0,
+        local_hints: [0; MAX_NODES],
+        local_exhausted: 0,
         initialized: false,
         fault_reported: false,
     };
@@ -69,6 +77,11 @@ impl State {
                 byte.read() & !mask
             })
         };
+        if !used {
+            // Only a hint: any returned frame makes all local misses stale.
+            // Bitmap ownership/capacity and exact frees remain authoritative.
+            self.local_exhausted = 0;
+        }
     }
     fn mark_range(&mut self, base: u64, len: u64, used: bool) {
         if len == 0 {
@@ -112,6 +125,67 @@ impl State {
         }
     }
     fn alloc_one(&mut self) -> Option<u64> {
+        if !self.initialized || self.stats.free_frames == 0 {
+            return None;
+        }
+        if let Some(local) = numa::local_memory(percpu::current_index()) {
+            let node = local.node as usize;
+            if self.local_exhausted & (1 << node) == 0 {
+                let hint = self.local_hints[node];
+                // Two clipped passes wrap the existing cursor across all
+                // bounded, sorted ranges of this node without hiding holes.
+                for second in [false, true] {
+                    for range in local.ranges.iter().filter(|r| r.node == local.node) {
+                        let first = range.base.div_ceil(FRAME).max(1);
+                        let last = (range.end / FRAME).min(self.stats.total_frames);
+                        let (first, last) = if second {
+                            (first, last.min(hint))
+                        } else {
+                            (first.max(hint), last)
+                        };
+                        if let Some(frame) = self.alloc_between(first, last) {
+                            self.local_hints[node] = frame / FRAME + 1;
+                            return Some(frame);
+                        }
+                    }
+                }
+                self.local_exhausted |= 1 << node;
+            }
+        }
+        self.alloc_any()
+    }
+    fn alloc_between(&mut self, first: u64, last: u64) -> Option<u64> {
+        let mut frame = first;
+        let words = self.words();
+        while frame < last {
+            if let Some(words) = words {
+                let index = frame / 64;
+                let bit = (frame % 64) as u32;
+                let mut word = unsafe { words.add(index as usize).read() };
+                if bit != 0 {
+                    word |= (1u64 << bit) - 1;
+                }
+                let valid = (last - index * 64).min(64) as u32;
+                if valid < 64 {
+                    word |= u64::MAX << valid;
+                }
+                if word == u64::MAX {
+                    frame = (index + 1) * 64;
+                    continue;
+                }
+                frame = index * 64 + u64::from((!word).trailing_zeros());
+            } else if self.used(frame) {
+                frame += 1;
+                continue;
+            }
+            self.set_used(frame, true);
+            self.stats.free_frames -= 1;
+            self.next_hint = frame + 1;
+            return Some(frame * FRAME);
+        }
+        None
+    }
+    fn alloc_any(&mut self) -> Option<u64> {
         if !self.initialized {
             return None;
         }
@@ -187,9 +261,27 @@ impl State {
         if count > addressable {
             return None;
         }
+        if let Some(local) = numa::local_memory(percpu::current_index()) {
+            for range in local.ranges.iter().filter(|r| r.node == local.node) {
+                let first = range.base.div_ceil(FRAME).max(1);
+                let last = (range.end / FRAME).min(addressable);
+                if let Some(frame) = self.contiguous_between(count, first, last) {
+                    self.local_hints[local.node as usize] = frame / FRAME + count;
+                    return Some(frame);
+                }
+            }
+        }
+        // A locality miss never turns existing system capacity or a required
+        // DMA maximum into a new restriction. Keep the full original fallback.
+        self.contiguous_between(count, 1, addressable)
+    }
+    fn contiguous_between(&mut self, count: u64, first: u64, last: u64) -> Option<u64> {
+        if first >= last || count > last - first {
+            return None;
+        }
         let words = self.words();
-        let mut start = 1;
-        while start <= addressable - count {
+        let mut start = first;
+        while start <= last - count {
             if let Some(words) = words
                 && self.used(start)
                 && start & 63 == 0
@@ -382,9 +474,10 @@ pub unsafe extern "C" fn r4os_rust_phys_extent(maximum_count: u64, output: *mut 
     drop(_nested);
     let state = unsafe { &mut *PMM.0.get() };
     let start = base / FRAME;
+    let local_end = numa::range_end(base).map_or(state.stats.total_frames, |end| end / FRAME);
     let mut count = 1;
     while count < maximum_count
-        && start + count < state.stats.total_frames
+        && start + count < state.stats.total_frames.min(local_end)
         && !state.used(start + count)
     {
         state.set_used(start + count, true);

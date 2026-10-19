@@ -989,12 +989,21 @@ pub unsafe extern "C" fn r4os_rust_task_set_field(task: *mut c_void, field: u8, 
                 (*c).wait_handoff_guard_pending = value != 0;
             }
             43 => {
+                if (*c).stack_base != value {
+                    (*c).memory_anchor = 0;
+                }
                 (*c).stack_base = value;
             }
             44 => {
+                if (*c).stack_top != value {
+                    (*c).memory_anchor = 0;
+                }
                 (*c).stack_top = value;
             }
             45 => {
+                if (*c).stack_range_id != value as u32 {
+                    (*c).memory_anchor = 0;
+                }
                 (*c).stack_range_id = value as u32;
             }
             46 => {

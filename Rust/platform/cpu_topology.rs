@@ -188,6 +188,13 @@ pub(crate) fn seal(qualified: u64) {
     if SEALED.load(Ordering::Acquire) {
         return;
     }
+    let mut apics = [u32::MAX; MAX_CPUS];
+    for (i, apic) in apics.iter_mut().enumerate().take(count() as usize) {
+        if let Some((id, _)) = SLOTS[i].descriptor() {
+            *apic = id;
+        }
+    }
+    super::numa::seal(&apics[..count() as usize], qualified);
     let mut trusted = 0;
     for (i, slot) in SLOTS.iter().enumerate().take(count() as usize) {
         if qualified & (1 << i) != 0 && slot.read().is_some_and(|d| d.geometry.is_ok()) {

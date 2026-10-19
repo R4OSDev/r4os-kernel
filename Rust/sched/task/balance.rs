@@ -4,7 +4,7 @@ use super::{
     task_registry as registry,
     task_types::{ExecutionOwnerKind, State, Task},
 };
-use crate::arch::percpu;
+use crate::{arch::percpu, platform::numa};
 use core::ptr;
 const CANDIDATES: usize = 8;
 
@@ -157,6 +157,8 @@ pub(crate) unsafe fn pull(
         } else {
             (*from).balance_cursor
         };
+        let mut selected: *mut Task = ptr::null_mut();
+        let mut proximity = None;
         for _ in 0..(*from).count.min(CANDIDATES) {
             if candidate.is_null() {
                 break;
@@ -178,19 +180,40 @@ pub(crate) unsafe fn pull(
                     cooldown,
                 )
             {
-                let stamp = *time.get_or_insert_with(&mut now);
-                registry::unlink_ready(candidate);
-                (*c).home_cpu = target as u8;
-                (*c).home_cpu_bound = true;
-                (*c).last_migration_tick = stamp.max(1);
-                (*c).last_migration_periodic = false;
-                // Existing ready_order/time, role budgets, task generation,
-                // saved RSP/FPU and exact unwind counter are not re-created.
-                registry::append_ready(candidate);
-                registry::bump_epoch();
-                return candidate;
+                let key = numa::preference(1 << target, (*c).memory_anchor).map(|p| p.key(target));
+                if selected.is_null() {
+                    selected = candidate;
+                    proximity = key;
+                } else if let (Some(key), Some(old_key)) = (key, proximity)
+                    && key < old_key
+                    && registry::dispatch_rank(candidate) <= registry::dispatch_rank(selected)
+                    && (*c).ready_order <= (*registry::core(selected)).ready_order
+                {
+                    // Nearness cannot replace older/stronger work with a
+                    // younger or weaker task. Keep every original age/rank.
+                    selected = candidate;
+                    proximity = Some(key);
+                }
+                // Unknown/one-node behavior is the original first-eligible
+                // fast path. A confirmed local anchor cannot improve further.
+                if proximity.is_none() || proximity == Some(0) {
+                    break;
+                }
             }
             candidate = next;
+        }
+        if !selected.is_null() {
+            let c = registry::core(selected);
+            let stamp = *time.get_or_insert_with(&mut now);
+            registry::unlink_ready(selected);
+            (*c).home_cpu = target as u8;
+            (*c).home_cpu_bound = true;
+            (*c).last_migration_tick = stamp.max(1);
+            (*c).last_migration_periodic = false;
+            // Saved frames, exact owners, ready_order/time and budgets stay.
+            registry::append_ready(selected);
+            registry::bump_epoch();
+            return selected;
         }
     }
     ptr::null_mut()

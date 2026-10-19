@@ -13,6 +13,8 @@ pub mod irq;
 pub mod irq_boot;
 pub(crate) mod module_cpu;
 pub mod monotonic;
+pub(crate) mod numa;
+pub(crate) mod numa_decode;
 pub mod pci;
 pub mod pci_inventory;
 pub mod pci_scan;

@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     arch::percpu,
-    platform::cpu_topology,
+    platform::{cpu_topology, numa},
     sched::{placement, scheduler},
 };
 
@@ -46,12 +46,13 @@ pub(super) unsafe fn select(task: *mut Task) {
         {
             return;
         }
+        let memory = numa::preference(mask, (*c).memory_anchor);
         // The old CPU shortcuts may skip load probes only when a comparable
         // static class/rank cannot improve this exact task's work preference.
         if preferred.is_none() && previous.is_some() && mask & (1 << old) != 0 {
             let old_load = balance::workload(old, old_current);
             let better =
-                placement::better_capacity_targets(mask, cpu_topology::domains(), old, efficient);
+                placement::better_targets(mask, cpu_topology::domains(), old, efficient, memory);
             // All admitted exact currents have work: every possible load is
             // at least one and every core occupied, including unknown domains.
             // A prior CPU with one unit is already optimal in all chooser keys.
@@ -92,13 +93,14 @@ pub(super) unsafe fn select(task: *mut Task) {
             }
             *load = balance::workload(cpu as u32, current);
         }
-        if let Some(target) = placement::choose_with_preference(
+        if let Some(target) = placement::choose_for_memory(
             mask,
             &loads,
             cpu_topology::domains(),
             previous,
             preferred,
             efficient,
+            memory,
         ) {
             if previous.is_some() && target != old {
                 (*c).last_migration_tick = now.max(1);

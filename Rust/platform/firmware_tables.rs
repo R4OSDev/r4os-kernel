@@ -199,6 +199,40 @@ pub fn catalog() -> *mut Catalog {
     CATALOG.0.get()
 }
 
+/// Conservative work hint, never locality/admission data. Before discovery
+/// completes retain stack anchors; a sealed catalog without a valid SRAT
+/// cannot yield a NUMA preference later in this boot. Bytes are still fully
+/// authenticated by boot_table before any proximity facts are published.
+pub(crate) fn may_have_srat() -> bool {
+    let catalog = unsafe { &*catalog() };
+    !catalog.sealed
+        || (catalog.root_valid
+            && !catalog.failed
+            && catalog.records[..catalog.count as usize]
+                .iter()
+                .any(|r| r.signature == u32::from_le_bytes(*b"SRAT") && r.valid))
+}
+
+/// Boot-only view of one unique, checksum/digest-verified retained table.
+/// The sealed catalog and its firmware backing stay immutable and resident.
+/// Duplicates, incomplete roots and changed bytes never become locality data.
+pub(crate) fn boot_table(signature: [u8; 4]) -> Result<Option<&'static [u8]>, i32> {
+    let catalog = unsafe { &*catalog() };
+    let signature = u32::from_le_bytes(signature);
+    let info = match catalog.stat(signature, 0) {
+        Ok(info) => info,
+        Err(NOT_FOUND) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    if !matches!(catalog.stat(signature, 1), Err(NOT_FOUND)) {
+        return Err(CORRUPT);
+    }
+    let record = &catalog.records[(info.handle as u32 - 1) as usize];
+    Ok(Some(unsafe {
+        slice::from_raw_parts(record.address as *const u8, record.bytes as usize)
+    }))
+}
+
 pub fn retained_backing(base: u64, bytes: u64, entries: &[MemoryEntry]) -> bool {
     if base == 0 || bytes == 0 {
         return false;

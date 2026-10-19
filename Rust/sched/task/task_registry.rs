@@ -25,6 +25,7 @@ pub struct GuardedStack {
     pub range_id: u32,
     pub base: u64,
     pub top: u64,
+    pub memory_anchor: u64,
     pub release_pending: bool,
     pub release_in_progress: bool,
 }
@@ -33,6 +34,7 @@ impl GuardedStack {
         range_id: 0,
         base: 0,
         top: 0,
+        memory_anchor: 0,
         release_pending: false,
         release_in_progress: false,
     };

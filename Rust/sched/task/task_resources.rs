@@ -7,8 +7,8 @@ use super::{
 use crate::{
     arch::{fpu, percpu, runtime, smp_policy},
     build_config::config,
-    memory::heap,
-    platform::timer,
+    memory::{heap, paging},
+    platform::{numa, timer},
     sched::task_context,
 };
 use core::{
@@ -223,6 +223,7 @@ unsafe fn anchor_fresh(owner: *mut Task, stack: GuardedStack) {
     unsafe {
         let c = registry::core(owner);
         (*c).stack_range_id = stack.range_id;
+        (*c).memory_anchor = stack.memory_anchor;
         (*c).stack_base = stack.base;
         (*c).stack_top = stack.top;
     }
@@ -269,7 +270,7 @@ pub(super) unsafe fn alloc_stack(owner: *mut Task) -> Option<GuardedStack> {
             );
             return None;
         }
-        let stack = GuardedStack {
+        let mut stack = GuardedStack {
             range_id: id as u32,
             base: base + GUARD_SIZE,
             top: base + GUARD_SIZE + STACK_SIZE,
@@ -278,6 +279,15 @@ pub(super) unsafe fn alloc_stack(owner: *mut Task) -> Option<GuardedStack> {
         if task_vm(2, id as u32, null_mut()) != 0 || task_vm(3, id as u32, null_mut()) != 0 {
             anchor_fresh(owner, stack);
             return None;
+        }
+        // The private committed range is resident and has not been published.
+        // Query once here, never walk PTEs under the scheduler's Home hot path.
+        // Failure loses only the optional proximity hint, not the real stack.
+        let mut frame = 0;
+        if numa::stack_anchor_needed()
+            && paging::r4os_rust_paging_read(stack.top - 4096, 0, false, &mut frame)
+        {
+            stack.memory_anchor = frame;
         }
         poison(stack);
         Some(stack)
@@ -328,12 +338,14 @@ pub(super) unsafe fn release_unpublished(task: *mut Task) -> bool {
                 range_id: (*c).stack_range_id,
                 base: (*c).stack_base,
                 top: (*c).stack_top,
+                memory_anchor: (*c).memory_anchor,
                 ..GuardedStack::EMPTY
             };
             if !release_stack_direct(stack) {
                 return false;
             }
             (*c).stack_range_id = 0;
+            (*c).memory_anchor = 0;
             (*c).stack_base = 0;
             (*c).stack_top = 0;
         }
@@ -464,6 +476,7 @@ pub(super) unsafe fn release_task_stack(task: *mut Task) -> bool {
     unsafe {
         let c = registry::core(task);
         if (*c).stack_range_id == 0 {
+            (*c).memory_anchor = 0;
             (*c).stack_base = 0;
             (*c).stack_top = 0;
             return true;
@@ -473,6 +486,7 @@ pub(super) unsafe fn release_task_stack(task: *mut Task) -> bool {
             range_id: (*c).stack_range_id,
             base: (*c).stack_base,
             top: (*c).stack_top,
+            memory_anchor: (*c).memory_anchor,
             ..GuardedStack::EMPTY
         };
         let f = runtime::save_runtime();
@@ -487,6 +501,7 @@ pub(super) unsafe fn release_task_stack(task: *mut Task) -> bool {
             return false;
         }
         (*c).stack_range_id = 0;
+        (*c).memory_anchor = 0;
         (*c).stack_base = 0;
         (*c).stack_top = 0;
         true
@@ -597,6 +612,7 @@ unsafe fn create_admitted(
         (*c).stack_base = stack.base;
         (*c).stack_top = stack.top;
         (*c).stack_range_id = stack.range_id;
+        (*c).memory_anchor = stack.memory_anchor;
         if args.needs_fpu && !allocate_fpu(task) {
             failed(failure, CreateFailure::Fpu);
             rollback(task);
@@ -623,6 +639,7 @@ unsafe fn create_admitted(
             stack_base: stack.base,
             stack_top: stack.top,
             stack_range_id: stack.range_id,
+            memory_anchor: stack.memory_anchor,
             created_tick: now,
             ready_since_tick: if args.state == State::Ready { now } else { 0 },
             last_scheduled_tick: if running { now } else { 0 },
@@ -677,6 +694,7 @@ pub(super) unsafe fn reset_critical(index: usize) {
             stack_base: bundle.stack.base,
             stack_top: bundle.stack.top,
             stack_range_id: bundle.stack.range_id,
+            memory_anchor: bundle.stack.memory_anchor,
             fpu_state: bundle.fpu_state,
             fpu_state_bytes: bundle.fpu_state.map_or(0, |b| b.len as u32),
             fpu_state_valid: bundle.fpu_state.is_some(),
@@ -725,6 +743,7 @@ unsafe fn prepare_critical() -> bool {
             (*c).stack_base = stack.base;
             (*c).stack_top = stack.top;
             (*c).stack_range_id = stack.range_id;
+            (*c).memory_anchor = stack.memory_anchor;
             if !allocate_fpu(task) {
                 note_failure(CreateFailure::Fpu);
                 rollback(task);
@@ -879,6 +898,7 @@ pub(crate) unsafe fn create_critical(
             stack_base: bundle.stack.base,
             stack_top: bundle.stack.top,
             stack_range_id: bundle.stack.range_id,
+            memory_anchor: bundle.stack.memory_anchor,
             created_tick: now,
             ready_since_tick: if state == State::Ready { now } else { 0 },
             last_scheduled_tick: if running { now } else { 0 },

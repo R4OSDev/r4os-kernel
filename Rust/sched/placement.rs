@@ -1,6 +1,9 @@
 //! Shared bounded CPU preference. Admission/frames/queues stay with the task
 //! owner; immutable boot domains add no clock reads or detailed metrics.
-use crate::{arch::smp_policy::MAX_CPUS, platform::cpu_topology::Domain};
+use crate::{
+    arch::smp_policy::MAX_CPUS,
+    platform::{cpu_topology::Domain, numa::Preference},
+};
 
 pub(crate) fn choose(
     mask: u64,
@@ -29,19 +32,43 @@ fn capacity_key(domain: Domain, active: bool, efficient: bool) -> u16 {
         u16::MAX - domain.capacity
     }
 }
-pub(crate) fn better_capacity_targets(
+pub(crate) fn better_targets(
     mask: u64,
     domains: &[Domain; MAX_CPUS],
     old: u32,
     efficient: bool,
+    memory: Option<Preference>,
 ) -> u64 {
     let mask = mask & ((1u64 << MAX_CPUS) - 1);
-    if old as usize >= MAX_CPUS || mask & (1 << old) == 0 || !capacity_available(mask, domains) {
+    if old as usize >= MAX_CPUS || mask & (1 << old) == 0 {
         return 0;
     }
-    let d = domains[old as usize];
-    let better = if efficient { d.slower } else { d.faster };
-    better & mask
+    let active = capacity_available(mask, domains);
+    if memory.is_none() {
+        if !active {
+            return 0;
+        }
+        let d = domains[old as usize];
+        return mask & if efficient { d.slower } else { d.faster };
+    }
+    let old_key = (
+        capacity_key(domains[old as usize], active, efficient),
+        memory.map_or(0, |p| p.key(old)),
+    );
+    let mut remaining = mask;
+    let mut better = 0;
+    while remaining != 0 {
+        let cpu = remaining.trailing_zeros();
+        remaining &= remaining - 1;
+        let key = (
+            capacity_key(domains[cpu as usize], active, efficient),
+            memory.map_or(0, |p| p.key(cpu)),
+        );
+        if key < old_key {
+            better |= 1 << cpu;
+        }
+    }
+    better
 }
 
 pub(crate) fn choose_with_preference(
@@ -51,6 +78,17 @@ pub(crate) fn choose_with_preference(
     previous: Option<u32>,
     preferred: Option<u32>,
     efficient: bool,
+) -> Option<u32> {
+    choose_for_memory(mask, loads, domains, previous, preferred, efficient, None)
+}
+pub(crate) fn choose_for_memory(
+    mask: u64,
+    loads: &[usize; MAX_CPUS],
+    domains: &[Domain; MAX_CPUS],
+    previous: Option<u32>,
+    preferred: Option<u32>,
+    efficient: bool,
+    memory: Option<Preference>,
 ) -> Option<u32> {
     let mut candidates = mask & ((1u64 << MAX_CPUS) - 1);
     if candidates == 0 {
@@ -63,7 +101,7 @@ pub(crate) fn choose_with_preference(
         .fold(0u64, |mask, (i, &load)| mask | (u64::from(load != 0) << i));
     let previous = previous.filter(|&cpu| cpu < MAX_CPUS as u32);
     let mut best = None;
-    let mut best_key = (usize::MAX, true, true, u16::MAX, 3u8, u32::MAX);
+    let mut best_key = (usize::MAX, true, true, u16::MAX, u16::MAX, 3u8, u32::MAX);
     while candidates != 0 {
         let cpu = candidates.trailing_zeros();
         candidates &= candidates - 1;
@@ -84,6 +122,7 @@ pub(crate) fn choose_with_preference(
             occupied_core,
             preferred.is_some_and(|hint| hint != cpu),
             capacity_key(d, capacity_active, efficient),
+            memory.map_or(0, |p| p.key(cpu)),
             locality,
             cpu,
         );
@@ -105,7 +144,10 @@ pub(crate) fn choose_with_preference(
         let occupied = load != 0 || domains[old as usize].core & busy != 0;
         if load <= best_key.0.saturating_add(1)
             && occupied <= best_key.1
-            && capacity_key(domains[old as usize], capacity_active, efficient) <= best_key.3
+            && (
+                capacity_key(domains[old as usize], capacity_active, efficient),
+                memory.map_or(0, |p| p.key(old)),
+            ) <= (best_key.3, best_key.4)
         {
             return Some(old);
         }
