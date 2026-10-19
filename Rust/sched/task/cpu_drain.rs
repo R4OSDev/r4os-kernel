@@ -174,14 +174,20 @@ pub(crate) unsafe fn move_saved(cpu: u32) -> Result<u32, Reason> {
                             );
                         }
                     }
-                    let target = placement::choose_for_memory(
+                    let target = placement::choose_for_context(
                         mask,
                         &loads,
                         cpu_topology::domains(),
                         None,
                         (*c).placement_applied.preferred,
                         (*c).role == super::task_types::Role::Batch,
-                        numa::preference(mask, (*c).memory_anchor),
+                        placement::Context {
+                            memory: numa::preference(mask, (*c).memory_anchor),
+                            ranks: crate::platform::cpu_power::hints::ranks(
+                                mask,
+                                (*c).role == super::task_types::Role::Batch,
+                            ),
+                        },
                     )
                     .ok_or(Reason::Resources)?;
                     // Wait node, timeout order, object, saved frame, FPU buffer

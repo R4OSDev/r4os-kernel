@@ -8,6 +8,8 @@ use crate::{
     sched::task_context::Admission,
 };
 use core::{cell::UnsafeCell, mem, ptr};
+#[path = "cpu_power/hints.rs"]
+pub(crate) mod hints;
 
 #[derive(Clone, Copy)]
 struct Binding {
@@ -16,6 +18,7 @@ struct Binding {
     cookie: u64,
     backend: c::CpuPowerBackend,
     performance: Option<c::CpuPerformanceBackend>,
+    cppc: Option<c::CpuCppcBackend>,
 }
 struct Control {
     owner: u32,
@@ -96,6 +99,7 @@ pub(crate) fn register(backend: c::CpuPowerBackend) -> Result<u64, i32> {
         cookie,
         backend,
         performance: None,
+        cppc: None,
     });
     state.closing = false;
     Ok(cookie)
@@ -117,6 +121,7 @@ pub(crate) fn unregister(cookie: u64) -> i32 {
     }
     state.closing = true;
     state.binding = None;
+    hints::clear(&_runtime);
     c::cpu_capabilities_ok
 }
 /// Rejected preparation does not leave a live provider silently closed.
@@ -149,6 +154,7 @@ pub(crate) fn finish_close(owner: u32) -> bool {
         return false;
     }
     state.binding = None;
+    hints::clear(&_runtime);
     true
 }
 pub(crate) fn register_performance(cookie: u64, backend: c::CpuPerformanceBackend) -> i32 {
@@ -182,6 +188,37 @@ pub(crate) fn register_performance(cookie: u64, backend: c::CpuPerformanceBacken
     binding.performance = Some(backend);
     0
 }
+pub(crate) fn register_cppc(cookie: u64, backend: c::CpuCppcBackend) -> i32 {
+    if backend.version != 1
+        || backend.size < mem::size_of::<c::CpuCppcBackend>() as u32
+        || backend.execute == 0
+        || backend.flags != c::cpu_power_backend_flag_parallel
+        || backend.reserved0 != 0
+    {
+        return c::cpu_capabilities_error_invalid;
+    }
+    let Some(identity) = lifecycle_identity() else {
+        return c::cpu_capabilities_error_context;
+    };
+    if owner_identity(false) != Some(identity) {
+        return c::cpu_capabilities_error_context;
+    }
+    let _runtime = RuntimeGuard::acquire();
+    let state = unsafe { &mut *STATE.0.get() };
+    let Some(binding) = state.binding.as_mut() else {
+        return c::cpu_capabilities_error_epoch;
+    };
+    if cookie == 0
+        || (binding.owner, binding.epoch, binding.cookie) != (identity.0, identity.1, cookie)
+    {
+        return c::cpu_capabilities_error_epoch;
+    }
+    if state.closing || state.active != 0 || binding.cppc.is_some() {
+        return c::cpu_capabilities_error_busy;
+    }
+    binding.cppc = Some(backend);
+    0
+}
 /// Called only with the caller's current-CPU Session already retained. This
 /// independent resident membership survives callback return/caller cancellation.
 pub(crate) fn control_acquire(cpu: u32, epoch: u64) -> Result<u64, i32> {
@@ -189,10 +226,9 @@ pub(crate) fn control_acquire(cpu: u32, epoch: u64) -> Result<u64, i32> {
     let membership = life::probe_lease().ok_or(c::cpu_capabilities_error_busy)?;
     let _runtime = RuntimeGuard::acquire();
     let state = unsafe { &mut *STATE.0.get() };
-    if !state
-        .binding
-        .is_some_and(|b| (b.owner, b.epoch) == identity && b.performance.is_some())
-        || state.closing
+    if !state.binding.is_some_and(|b| {
+        (b.owner, b.epoch) == identity && (b.performance.is_some() || b.cppc.is_some())
+    }) || state.closing
     {
         return Err(c::cpu_capabilities_error_context);
     }
@@ -508,6 +544,61 @@ pub(crate) unsafe extern "C" fn performance(
     }
     if value.version != 1
         || value.size != mem::size_of::<c::CpuPerformanceInfo>() as u32
+        || value.cpu_index != request.cpu_index
+        || value.epoch != request.epoch
+    {
+        return c::cpu_capabilities_error_invalid;
+    }
+    value.provider_generation = lease.0.cookie;
+    unsafe { out.write(value) };
+    0
+}
+
+/// # Safety
+/// Same initialized resident input/output and complete receipt contract as performance.
+pub(crate) unsafe extern "C" fn cppc(
+    request: *const c::CpuPerformanceRequest,
+    out: *mut c::CpuCppcInfo,
+) -> i32 {
+    if request.is_null()
+        || !request.is_aligned()
+        || out.is_null()
+        || !out.is_aligned()
+        || unsafe {
+            (*request).version != 1
+                || (*request).size < mem::size_of::<c::CpuPerformanceRequest>() as u32
+                || (*out).version != 1
+                || (*out).size < mem::size_of::<c::CpuCppcInfo>() as u32
+        }
+    {
+        return c::cpu_capabilities_error_invalid;
+    }
+    let request = unsafe { request.read() };
+    let _session = match Session::acquire(request.cpu_index, request.epoch) {
+        Ok(session) => session,
+        Err(reason) => return reason,
+    };
+    let lease = match Lease::acquire() {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return c::cpu_capabilities_error_unsupported,
+        Err(reason) => return reason,
+    };
+    let Some(backend) = lease.0.cppc else {
+        return c::cpu_capabilities_error_unsupported;
+    };
+    let Some(_callback) = Callback::acquire(lease.0.owner) else {
+        return c::cpu_capabilities_error_busy;
+    };
+    type Execute =
+        unsafe extern "C" fn(usize, *const c::CpuPerformanceRequest, *mut c::CpuCppcInfo) -> i32;
+    let execute: Execute = unsafe { mem::transmute(backend.execute as usize) };
+    let mut value = c::CpuCppcInfo::default();
+    let result = unsafe { execute(backend.context as usize, &request, &mut value) };
+    if result != 0 {
+        return result;
+    }
+    if value.version != 1
+        || value.size != mem::size_of::<c::CpuCppcInfo>() as u32
         || value.cpu_index != request.cpu_index
         || value.epoch != request.epoch
     {

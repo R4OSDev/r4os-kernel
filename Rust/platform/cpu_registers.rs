@@ -74,6 +74,18 @@ impl Session {
         {
             return Err(c::cpu_capabilities_error_unsupported);
         }
+        if matches!(
+            id,
+            c::cpu_register_id_amd_cppc_capabilities1
+                | c::cpu_register_id_amd_cppc_capabilities2
+                | c::cpu_register_id_amd_cppc_request
+                | c::cpu_register_id_amd_cppc_status
+        ) && unsafe { safe_msr::read_exact(self.index, self.epoch, 0xc001_02b1) }
+            .map_err(register_error)?
+            != 1
+        {
+            return Err(c::cpu_capabilities_error_unsupported);
+        }
         // Local IDT and exact epoch come from real boot qualification. Select
         // established the architectural feature or exact verified model.
         // Intel's signature latch is read through its exact architectural
@@ -113,6 +125,13 @@ impl Session {
         }
         if id == c::cpu_register_id_intel_hwp_request
             && unsafe { safe_msr::read_exact(self.index, self.epoch, 0x770) }
+                .map_err(register_error)?
+                != 1
+        {
+            return Err(c::cpu_capabilities_error_unsupported);
+        }
+        if id == c::cpu_register_id_amd_cppc_request
+            && unsafe { safe_msr::read_exact(self.index, self.epoch, 0xc001_02b1) }
                 .map_err(register_error)?
                 != 1
         {
@@ -262,7 +281,25 @@ fn native_skylake_hwp(s: &Snapshot) -> bool {
         // separate models/contracts. Never guess effective ownership there.
         && [16, 18, 22].iter().all(|&b| bit(&s.raw, 6, 0, 0, b) == Some(false))
 }
+fn native_cezanne_cppc(s: &Snapshot) -> bool {
+    // AMD PPR56569-A1 public3.03,1.8 explicitly covers19h50h..5Fh.
+    // Its title is not a CPUID signature/stepping conversion. Newer models
+    // and the separate Milan telemetry profile have no admission here.
+    s.raw.vendor() == *b"AuthenticAMD"
+        && bit(&s.raw, 1, 0, 2, 31) == Some(false)
+        && s.raw
+            .signature()
+            .is_some_and(|(family, model, _)| family == 0x19 && (0x50..=0x5f).contains(&model))
+        && bit(&s.raw, 0x8000_0008, 0, 1, 27) == Some(true)
+}
 fn writable(s: &Snapshot, id: u32, expected: u64, requested: u64) -> bool {
+    if native_cezanne_cppc(s) {
+        return match id {
+            c::cpu_register_id_amd_cppc_enable => expected == 0 && requested == 1,
+            c::cpu_register_id_amd_cppc_request => (expected | requested) >> 32 == 0,
+            _ => false,
+        };
+    }
     if !native_skylake_hwp(s) {
         return false;
     }
@@ -374,6 +411,21 @@ fn select(s: &Snapshot, id: u32) -> Option<(u32, &'static [u8])> {
             if native_skylake_hwp(s) && bit(raw, 6, 0, 0, 11) == Some(true) =>
         {
             Some((0x772, b"intel-hwp-package"))
+        }
+        c::cpu_register_id_amd_cppc_capabilities1 if native_cezanne_cppc(s) => {
+            Some((0xc001_02b0, b"amd-cppc-cap1"))
+        }
+        c::cpu_register_id_amd_cppc_enable if native_cezanne_cppc(s) => {
+            Some((0xc001_02b1, b"amd-cppc-enable"))
+        }
+        c::cpu_register_id_amd_cppc_capabilities2 if native_cezanne_cppc(s) => {
+            Some((0xc001_02b2, b"amd-cppc-cap2"))
+        }
+        c::cpu_register_id_amd_cppc_request if native_cezanne_cppc(s) => {
+            Some((0xc001_02b3, b"amd-cppc-request"))
+        }
+        c::cpu_register_id_amd_cppc_status if native_cezanne_cppc(s) => {
+            Some((0xc001_02b4, b"amd-cppc-status"))
         }
         _ => None,
     }

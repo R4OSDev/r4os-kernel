@@ -1103,6 +1103,8 @@ fn configure_dev() {
     const CPU_POWER_INFO: c::R4DevFns::cpu_power_info = crate::platform::cpu_power::info;
     const CPU_POWER_CAPTURE: c::R4DevFns::cpu_power_capture = crate::platform::cpu_power::capture;
     const CPU_PERFORMANCE: c::R4DevFns::cpu_performance = crate::platform::cpu_power::performance;
+    const CPU_CPPC: c::R4DevFns::cpu_cppc = crate::platform::cpu_power::cppc;
+    const CPU_HINT: c::R4DevFns::cpu_performance_hint = crate::platform::cpu_power::hints::info;
     r4dev::providers::install();
     let value = c::R4XStartR4Dev {
         serial_count: super::serial_api::count as c::R4DevFns::serial_count as *const () as usize,
@@ -1218,13 +1220,15 @@ fn configure_dev() {
         cpu_power_info: CPU_POWER_INFO as *const () as usize,
         cpu_power_capture: CPU_POWER_CAPTURE as *const () as usize,
         cpu_performance: CPU_PERFORMANCE as *const () as usize,
+        cpu_cppc: CPU_CPPC as *const () as usize,
+        cpu_performance_hint: CPU_HINT as *const () as usize,
         ..Default::default()
     };
     DEV.configure(value);
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 624);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 640);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_capabilities) == 568);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_feature) == 576);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_register_read) == 584);
@@ -1232,6 +1236,8 @@ const _: () = {
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_power_info) == 600);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_power_capture) == 608);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_performance) == 616);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_cppc) == 624);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_performance_hint) == 632);
     assert!(mem::size_of::<c::CpuPerformanceRequest>() == 64);
     assert!(mem::size_of::<c::CpuPerformanceInfo>() == 176);
     assert!(mem::size_of::<c::CpuCapabilitiesInfo>() == 272);

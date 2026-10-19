@@ -49,6 +49,8 @@ pub(crate) unsafe extern "C" fn query(out: *mut c::DriverCpuPowerApi) -> i32 {
         control_acquire: control_acquire as *const () as usize as u64,
         control_release: control_release as *const () as usize as u64,
         register_compare_write: compare_write as *const () as usize as u64,
+        register_cppc: register_cppc as *const () as usize as u64,
+        rank_publish: rank_publish as *const () as usize as u64,
         ..Default::default()
     };
     unsafe {
@@ -85,6 +87,35 @@ unsafe extern "C" fn register_performance(
         return c::cpu_capabilities_error_context;
     }
     cpu_power::register_performance(cookie, unsafe { backend.read() })
+}
+unsafe extern "C" fn register_cppc(cookie: u64, backend: *const c::CpuCppcBackend) -> i32 {
+    if !unsafe { valid(backend) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    if !admission::callbacks_parallel() {
+        return c::cpu_capabilities_error_context;
+    }
+    cpu_power::register_cppc(cookie, unsafe { backend.read() })
+}
+unsafe extern "C" fn rank_publish(input: *const c::CpuPerformanceHint, sequence: *mut u64) -> i32 {
+    if !unsafe { valid(input) } || sequence.is_null() || !sequence.is_aligned() {
+        return c::cpu_capabilities_error_invalid;
+    }
+    if !admitted() {
+        return c::cpu_capabilities_error_context;
+    }
+    let input = unsafe { input.read() };
+    let _session = match Session::acquire(input.cpu_index, input.epoch) {
+        Ok(session) => session,
+        Err(reason) => return reason,
+    };
+    match cpu_power::hints::publish(input) {
+        Ok(value) => {
+            unsafe { sequence.write(value) };
+            0
+        }
+        Err(reason) => reason,
+    }
 }
 unsafe extern "C" fn feature(
     cpu: u32,
