@@ -25,6 +25,13 @@ use core::{
 };
 const COUNT: usize = 4;
 const ALL: u32 = (1 << COUNT) - 1;
+fn wait_capacity(reason: &'static [u8]) {
+    // Absolute timer wakes can observe the same ready service/shell peers at
+    // each tick boundary. Let that real work execute before observing quiet
+    // capacity again; callers keep their original deadline and exact facts.
+    tasks::sleep(1, reason);
+    scheduler::yield_task();
+}
 static TASKS: [AtomicPtr<Task>; COUNT] = [const { AtomicPtr::new(ptr::null_mut()) }; COUNT];
 static FIRST: [AtomicU32; COUNT] = [const { AtomicU32::new(u32::MAX) }; COUNT];
 static LAST: [AtomicU32; COUNT] = [const { AtomicU32::new(u32::MAX) }; COUNT];

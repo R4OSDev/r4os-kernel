@@ -68,7 +68,7 @@ unsafe fn baseline_delta(expected: Baseline) {
         puts(b"\r\n");
     }
 }
-pub unsafe fn run() -> bool {
+pub(super) unsafe fn prepare() -> bool {
     unsafe {
         if !resources::work_fpu() {
             return fail(b"fpu-work");
@@ -84,6 +84,14 @@ pub unsafe fn run() -> bool {
         reset();
         if !projection(b"warm") {
             return fail(b"queue-warm");
+        }
+        true
+    }
+}
+pub unsafe fn run() -> bool {
+    unsafe {
+        if !prepare() {
+            return false;
         }
         let deadline_ok = deadlines::probe();
         if !deadlines::storm() {

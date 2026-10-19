@@ -30,15 +30,30 @@ pub unsafe fn probe() -> bool {
         ok = (timer::r4os_rust_timer_control(12, early, 0) != 0) && ok;
         let irq_before = timer::deadline_stats().timer_irqs;
         let one_shot_before = timer::r4os_rust_timer_control(16, 0, 0);
-        scheduler::r4os_rust_scheduler_control(7, 0, 0);
         runtime::restore_runtime(flags);
-        sleep(EARLY_TICKS, b"taskreg-deadline-probe");
+        // Keep the original real-IRQ/lateness bounds, but isolate hardware
+        // delivery from a task switch. Sleep can legally finish through the
+        // BSP's due-wait poll after a different IRQ/IPI; restoring productive
+        // work then cancels its idle timer before that IRQ is delivered.
+        // No runtime owner spans this bounded IF-on hardware interval.
+        for _ in 0..1_000_000 {
+            if timer::r4os_rust_timer_control(16, 0, 0) > one_shot_before
+                || now().saturating_sub(start) >= EARLY_TICKS + LATENESS_BAR
+            {
+                break;
+            }
+            core::hint::spin_loop();
+        }
         let finish = runtime::save_runtime();
         let armed_end = timer::deadline_stats();
         let one_shot_end = timer::r4os_rust_timer_control(16, 0, 0);
         let elapsed = now() - start;
         ok = (timer::r4os_rust_timer_control(13, 0, 0) != 0) && ok;
+        scheduler::r4os_rust_scheduler_control(7, 0, 0);
         runtime::restore_runtime(finish);
+        let sleep_start = now();
+        sleep(EARLY_TICKS, b"taskreg-deadline-probe");
+        let sleep_elapsed = now().saturating_sub(sleep_start);
         let after = timer::deadline_stats();
         (*raw()).deadline_elapsed = elapsed;
         (*raw()).deadline_total_irqs = armed_end.timer_irqs - irq_before;
@@ -52,6 +67,7 @@ pub unsafe fn probe() -> bool {
             && after.periodic_resumes >= before.periodic_resumes + 2
             && after.runtime_fallbacks == before.runtime_fallbacks
             && elapsed >= EARLY_TICKS
+            && sleep_elapsed >= EARLY_TICKS
             && (*raw()).deadline_irqs >= 1
             && (*raw()).deadline_irqs <= IRQ_BAR
             && armed_end.last_lateness_ticks <= LATENESS_BAR;
@@ -62,6 +78,8 @@ pub unsafe fn probe() -> bool {
             dec(u64::from((*raw()).deadline_checkpointed));
             puts(b" elapsed=");
             dec(elapsed);
+            puts(b" sleep_elapsed=");
+            dec(sleep_elapsed);
             puts(b" irqs=");
             dec((*raw()).deadline_irqs);
             puts(b" one_shot_irqs=");

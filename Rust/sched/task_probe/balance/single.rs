@@ -9,7 +9,53 @@ unsafe fn ready_count(cpu: u32) -> usize {
 
 // No foreign queue is changed to manufacture an idle CPU. Retry while ordinary
 // work occupies the source queue or all other CPUs; every attempt is bounded.
-fn release(source: u32) -> Result<Option<(u32, u64)>, ()> {
+#[derive(Default)]
+struct Capacity {
+    queued: u64,
+    no_idle: u64,
+    no_core: u64,
+    source_ready: u64,
+    idle: u64,
+    busy: u64,
+    free_core: u64,
+    parent: u32,
+    ids: [u32; 3],
+    roles: [u8; 3],
+    names: [[u8; 32]; 3],
+    lengths: [usize; 3],
+}
+impl Capacity {
+    fn log(&self) {
+        helpers::puts(b"TASKREG08525 single-capacity");
+        for (label, value) in [
+            (b" queued=".as_slice(), self.queued),
+            (b" no_idle=".as_slice(), self.no_idle),
+            (b" no_core=".as_slice(), self.no_core),
+            (b" source_ready=".as_slice(), self.source_ready),
+            (b" idle=".as_slice(), self.idle),
+            (b" busy=".as_slice(), self.busy),
+            (b" free_core=".as_slice(), self.free_core),
+            (b" parent=".as_slice(), u64::from(self.parent)),
+        ] {
+            helpers::puts(label);
+            helpers::dec(value);
+        }
+        helpers::puts(b"\r\n");
+        for i in 0..self.ids.len() {
+            if self.ids[i] == 0 {
+                continue;
+            }
+            helpers::puts(b"TASKREG08525 source-ready id=");
+            helpers::dec(u64::from(self.ids[i]));
+            helpers::puts(b" role=");
+            helpers::dec(u64::from(self.roles[i]));
+            helpers::puts(b" name=");
+            helpers::puts(&self.names[i][..self.lengths[i]]);
+            helpers::puts(b"\r\n");
+        }
+    }
+}
+fn release(source: u32, capacity: &mut Capacity) -> Result<Option<(u32, u64)>, ()> {
     let _runtime = RuntimeGuard::acquire();
     unsafe {
         let parent = scheduler::current().cast::<Task>();
@@ -20,7 +66,27 @@ fn release(source: u32) -> Result<Option<(u32, u64)>, ()> {
         if (*parent_core).state != State::Running || (*parent_core).cpu_idle {
             return Err(());
         }
-        if ready_count(source) != 0 {
+        capacity.source_ready = ready_count(source) as u64;
+        if capacity.source_ready != 0 {
+            if capacity.queued == 0 {
+                capacity.parent = (*parent_core).id;
+                let mut task = (*registry::raw()).ready[source as usize].head;
+                for i in 0..capacity.ids.len() {
+                    if task.is_null() {
+                        break;
+                    }
+                    let core = registry::core(task);
+                    capacity.ids[i] = (*core).id;
+                    capacity.roles[i] = (*core).role as u8;
+                    let name = (*core).name;
+                    let len = name.len.min(capacity.names[i].len());
+                    capacity.names[i][..len]
+                        .copy_from_slice(core::slice::from_raw_parts(name.pointer, len));
+                    capacity.lengths[i] = len;
+                    task = (*core).ready_next;
+                }
+            }
+            capacity.queued += 1;
             return Ok(None);
         }
         let online = percpu::r4os_rust_percpu_control(14, 0, 0, 0);
@@ -41,7 +107,10 @@ fn release(source: u32) -> Result<Option<(u32, u64)>, ()> {
                 idle_mask |= 1 << cpu;
             }
         }
+        capacity.idle = idle_mask;
+        capacity.busy = busy;
         if idle_mask == 0 {
+            capacity.no_idle += 1;
             return Ok(None);
         }
         let domains = crate::platform::cpu_topology::domains();
@@ -59,7 +128,9 @@ fn release(source: u32) -> Result<Option<(u32, u64)>, ()> {
             .iter()
             .enumerate()
             .any(|(cpu, d)| online & (1 << cpu) != 0 && d.core != 0 && d.core & source_core == 0);
+        capacity.free_core = free_core;
         if source_core != 0 && other_known_core && free_core == 0 {
+            capacity.no_core += 1;
             return Ok(None);
         }
         let target = idle_mask.trailing_zeros();
@@ -147,8 +218,9 @@ pub(super) fn run() -> bool {
         }
         tasks::sleep(1, b"spectra-single-enrollment");
     }
+    let mut capacity = Capacity::default();
     let (target, free_core) = loop {
-        match release(source) {
+        match release(source, &mut capacity) {
             Ok(Some(cpu)) => break cpu,
             Err(()) => {
                 finish(true);
@@ -158,10 +230,12 @@ pub(super) fn run() -> bool {
         }
         if kernel_check::cancelled() || timer::tick_count() >= end {
             finish(true);
+            capacity.log();
             return helpers::fail(b"single-ready-idle");
         }
-        tasks::sleep(1, b"spectra-single-capacity");
+        wait_capacity(b"spectra-single-capacity");
     };
+    capacity.log();
     while DONE.load(Ordering::Acquire) != 1 {
         if kernel_check::cancelled() || timer::tick_count() >= end {
             finish(true);

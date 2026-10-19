@@ -117,7 +117,7 @@ pub(super) fn run() -> bool {
             finish(true);
             return helpers::fail(b"placement-initial-idle");
         }
-        tasks::sleep(1, b"spectra-placement-capacity");
+        wait_capacity(b"spectra-placement-capacity");
     };
     while !enrolled(COUNT) {
         if kernel_check::cancelled() || timer::tick_count() >= end {
@@ -147,7 +147,7 @@ pub(super) fn run() -> bool {
             finish(true);
             return false;
         }
-        tasks::sleep(1, b"spectra-placement-wake-capacity");
+        wait_capacity(b"spectra-placement-wake-capacity");
     }
     while DONE.load(Ordering::Acquire) != ALL {
         if kernel_check::cancelled() || timer::tick_count() >= end {

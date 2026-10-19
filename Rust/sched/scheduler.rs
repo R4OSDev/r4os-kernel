@@ -382,7 +382,7 @@ fn ready_count() -> u64 {
 fn set_pending(value: bool) {
     local_change(|s| s.pending = value)
 }
-fn preempt_depth() -> u32 {
+pub(crate) fn preempt_depth() -> u32 {
     let task = current();
     if task.is_null() {
         local().boot_depth

@@ -306,7 +306,7 @@ pub(super) fn run() -> bool {
             clean(true);
             return false;
         }
-        tasks::sleep(1, b"spectra-occupied-capacity");
+        wait_capacity(b"spectra-occupied-capacity");
     }
     while BUSY.load(Ordering::Acquire) != 7 {
         if kernel_check::cancelled() || timer::tick_count() >= end {

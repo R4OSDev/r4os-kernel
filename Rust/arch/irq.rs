@@ -21,6 +21,11 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
         return;
     }
     let irq = (vector - 0x20) as u8;
+    if irq == 0 && !lapic::on_timer_irq() {
+        eoi();
+        runtime::restore_runtime(saved);
+        return;
+    }
     let rip = unsafe { core::ptr::addr_of!((*frame).rip).read() };
     let preemptible = event(0, rip, 0) != 0;
     if runtime::current_cpu() != 0 && irq == 0 {

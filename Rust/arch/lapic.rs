@@ -1,5 +1,7 @@
-//! CPU-local APIC registers/IPIs and the single BSP timer state. AP timer
-//! calibration never mutates BSP state. EOI/TLB IPIs never acquire runtime.
+//! CPU-local APIC registers/IPIs, CPU-local deadline timers and the retained
+//! BSP count-timer snapshot. EOI/TLB IPIs never acquire runtime.
+mod deadline;
+mod deadline_math;
 use super::{apic_target, hpet, msr, percpu, runtime::RuntimeGuard};
 use crate::{
     build_config::config,
@@ -17,6 +19,7 @@ const CALIBRATED: u32 = 16;
 const ONE_SHOT: u32 = 32;
 const BSP: u32 = 64;
 const X2APIC: u32 = 128;
+const TSC_DEADLINE: u32 = 256;
 const APIC_BASE: u32 = 0x1b;
 const BASE_ENABLE: u64 = 1 << 11;
 const BASE_X2: u64 = 1 << 10;
@@ -108,6 +111,10 @@ fn state() -> Status {
     let mut value = unsafe { *STATE.0.get() };
     value.timer_ticks = TICKS.load(Ordering::Relaxed);
     value.timer_current_count = CURRENT_COUNT.load(Ordering::Relaxed);
+    value.set(TSC_DEADLINE, deadline::active(0));
+    if !value.has(TSC_DEADLINE) && value.timer_reason == 14 {
+        value.timer_reason = 15;
+    }
     value
 }
 fn publish(value: Status) {
@@ -166,6 +173,76 @@ pub(crate) fn local_capabilities_valid() -> bool {
     let features = core::arch::x86_64::__cpuid_count(1, 0);
     features.edx & ((1 << 5) | (1 << 9)) == (1 << 5) | (1 << 9)
         && (!MODE_X2.load(Ordering::Acquire) || features.ecx & (1 << 21) != 0)
+}
+fn local_deadline_capable() -> bool {
+    let zero = core::arch::x86_64::__cpuid_count(0, 0);
+    if zero.eax < 1 {
+        return false;
+    }
+    let one = core::arch::x86_64::__cpuid_count(1, 0);
+    let intel = zero.ebx == u32::from_le_bytes(*b"Genu")
+        && zero.edx == u32::from_le_bytes(*b"ineI")
+        && zero.ecx == u32::from_le_bytes(*b"ntel");
+    let maximum = core::arch::x86_64::__cpuid_count(0x8000_0000, 0).eax;
+    let invariant = (0x8000_0007..=0x8fff_ffff).contains(&maximum)
+        && core::arch::x86_64::__cpuid_count(0x8000_0007, 0).edx & (1 << 8) != 0;
+    deadline_math::hardware_allowed(one.ecx, one.edx, one.eax, intel, invariant)
+}
+fn read_tsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    unsafe {
+        core::arch::asm!("lfence", "rdtsc", out("eax") low, out("edx") high, options(nostack, preserves_flags));
+    }
+    (u64::from(high) << 32) | u64::from(low)
+}
+fn deadline_fence() {
+    unsafe {
+        core::arch::asm!("mfence", options(nostack, preserves_flags));
+    }
+}
+/// Pre-topology timer handoff only selects the already validated count path.
+/// Actual deadline arm still waits for the later nonzero CPU epoch.
+pub(crate) fn deadline_candidate() -> bool {
+    percpu::current_index() == 0
+        && is_enabled()
+        && local_deadline_capable()
+        && crate::platform::clocksource::deadline_clock(0).is_some()
+}
+/// The BSP starts with the validated count timer. Select deadline mode only
+/// after topology has supplied a nonzero exact CPU epoch.
+pub(crate) fn qualify_bsp_timer() {
+    let _owner = RuntimeGuard::acquire();
+    if percpu::current_index() != 0 {
+        return;
+    }
+    if crate::platform::timer::active_backend() != 2 {
+        deadline::external_backend();
+        return;
+    }
+    let mut value = state();
+    if value.has(CALIBRATED)
+        && value.has(TIMER_ENABLED)
+        && !value.has(ONE_SHOT)
+        && deadline::start(value.timer_initial_count, value.timer_frequency_hz)
+    {
+        value.flags |= TSC_DEADLINE;
+        value.timer_lvt = read(LVT);
+        value.timer_reason = 14;
+        publish(value);
+    }
+}
+pub(crate) fn on_timer_irq() -> bool {
+    deadline::on_irq()
+}
+pub(crate) fn revalidate_current_timer() {
+    deadline::revalidate();
+}
+pub(crate) fn log_timer(cpu: u32) {
+    deadline::log(cpu);
+}
+pub(crate) fn deadline_boot_check() -> bool {
+    deadline::boot_check()
 }
 fn init_current() -> bool {
     if BASE.load(Ordering::Acquire) == 0 && !MODE_X2.load(Ordering::Acquire) {
@@ -324,6 +401,7 @@ fn start_secondary(requested_hz: u32) -> bool {
     write(DIVIDE, 3);
     write(LVT, VECTOR | PERIODIC);
     write(INITIAL, initial as u32);
+    let _ = deadline::start(initial as u32, hz);
     true
 }
 pub(crate) struct PausedTimer {
@@ -331,6 +409,8 @@ pub(crate) struct PausedTimer {
     divider: u32,
     lvt: u32,
     initial: u32,
+    epoch: u64,
+    deadline: Option<deadline::Paused>,
 }
 /// Local IF=0 quiescent AP only. Do not mutate the BSP timer snapshot.
 pub(crate) fn pause_secondary() -> Option<PausedTimer> {
@@ -338,12 +418,18 @@ pub(crate) fn pause_secondary() -> Option<PausedTimer> {
     if cpu == 0 || !is_enabled() {
         return None;
     }
+    let paused = deadline::pause().ok()?;
     let token = PausedTimer {
         cpu,
         divider: read(DIVIDE),
         lvt: read(LVT),
         initial: read(INITIAL),
+        epoch: crate::platform::cpu_topology::epoch(cpu),
+        deadline: paused,
     };
+    if token.deadline.is_some() {
+        return Some(token);
+    }
     if token.lvt == u32::MAX {
         return None;
     }
@@ -353,8 +439,14 @@ pub(crate) fn pause_secondary() -> Option<PausedTimer> {
 }
 /// A pre-withdrawal cancellation restores only this AP's retained timer.
 pub(crate) fn resume_secondary(token: PausedTimer) -> bool {
-    if token.cpu != percpu::current_index() {
+    if token.cpu != percpu::current_index()
+        || token.epoch == 0
+        || token.epoch != crate::platform::cpu_topology::epoch(token.cpu)
+    {
         return false;
+    }
+    if let Some(deadline) = token.deadline {
+        return deadline::resume(deadline);
     }
     write(DIVIDE, token.divider);
     write(LVT, token.lvt | MASKED);
@@ -427,13 +519,14 @@ fn init_sipi(apic_id: u64, vector: u8) -> bool {
     write_icr(apic_id, 0x600 | u32::from(vector)) && wait_icr()
 }
 fn stop_value(mut value: Status) -> Status {
+    deadline::stop();
     if BASE.load(Ordering::Acquire) != 0 || MODE_X2.load(Ordering::Acquire) {
         write(INITIAL, 0);
         write(LVT, VECTOR | MASKED);
         value.timer_lvt = read(LVT);
         value.timer_current_count = read(CURRENT);
     }
-    value.flags &= !(TIMER_ENABLED | ONE_SHOT);
+    value.flags &= !(TIMER_ENABLED | ONE_SHOT | TSC_DEADLINE);
     value
 }
 fn timer_failure(mut value: Status, reason: u8) -> bool {
@@ -492,6 +585,15 @@ fn one_shot(mut value: Status) -> bool {
         publish(value);
         return false;
     }
+    if deadline::one_shot() {
+        value.timer_lvt = read(LVT);
+        value.timer_current_count = 0;
+        value.flags |= TIMER_ENABLED | ONE_SHOT | TSC_DEADLINE;
+        value.timer_reason = 10;
+        publish(value);
+        return true;
+    }
+    value.flags &= !TSC_DEADLINE;
     write(DIVIDE, 3);
     write(INITIAL, 0);
     write(LVT, VECTOR | MASKED);
@@ -503,10 +605,22 @@ fn one_shot(mut value: Status) -> bool {
     true
 }
 fn arm(ticks: u64) -> u64 {
+    arm_absolute(ticks, None)
+}
+pub(crate) fn arm_absolute(ticks: u64, absolute_ns: Option<u64>) -> u64 {
     if !state().has(ONE_SHOT) && !one_shot(state()) {
         return 0;
     }
     let mut value = state();
+    if let Some(ticks) = deadline::arm_with(ticks, absolute_ns) {
+        value.timer_lvt = read(LVT);
+        value.timer_current_count = 0;
+        value.flags |= TIMER_ENABLED | TSC_DEADLINE;
+        value.timer_reason = 11;
+        publish(value);
+        return ticks;
+    }
+    value.flags &= !TSC_DEADLINE;
     let count_per_tick = u64::from(value.timer_initial_count);
     if count_per_tick == 0 {
         return 0;
@@ -528,6 +642,13 @@ fn disarm(mut value: Status) {
     if !value.has(ONE_SHOT) {
         return;
     }
+    if deadline::disarm() {
+        value.timer_lvt = read(LVT);
+        value.timer_current_count = 0;
+        value.timer_reason = 12;
+        publish(value);
+        return;
+    }
     write(INITIAL, 0);
     write(LVT, VECTOR | MASKED);
     value.timer_lvt = read(LVT);
@@ -541,6 +662,16 @@ fn resume(mut value: Status) -> bool {
         publish(value);
         return false;
     }
+    if deadline::resume_periodic() {
+        value.timer_lvt = read(LVT);
+        value.timer_current_count = 0;
+        value.flags |= TIMER_ENABLED | TSC_DEADLINE;
+        value.flags &= !ONE_SHOT;
+        value.timer_reason = 14;
+        publish(value);
+        return true;
+    }
+    value.flags &= !TSC_DEADLINE;
     write(DIVIDE, 3);
     write(LVT, VECTOR | PERIODIC);
     write(INITIAL, value.timer_initial_count);
@@ -637,6 +768,8 @@ pub fn timer_reason_name(code: u8) -> &'static [u8] {
         11 => b"LAPIC one-shot armed",
         12 => b"LAPIC one-shot disarmed",
         13 => b"LAPIC periodic resume unavailable",
+        14 => b"qualified TSC-deadline timer active",
+        15 => b"TSC-deadline revoked; calibrated count timer retained",
         _ => panic!("Invalid lapic diagnostic code"),
     }
 }

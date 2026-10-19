@@ -264,6 +264,9 @@ fn on_irq() -> u64 {
     let count = IRQ_COUNT.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     if count & 0x3ff == 0 {
         clocksource::periodic_validate();
+        if active_backend() == 2 {
+            lapic::revalidate_current_timer();
+        }
     }
     let now = tick_count();
     LAST_IRQ.store(now, Ordering::Release);
@@ -277,7 +280,11 @@ fn on_irq() -> u64 {
             LATE.fetch_add(1, Ordering::Relaxed);
             MAX_LATENESS.fetch_max(lateness, Ordering::Relaxed);
         }
-        ARMED.store(NO_DEADLINE, Ordering::Release);
+        // Early queued vectors and finite hardware checkpoints do not retire
+        // a still-future logical deadline. Idle rearm retains that exact due.
+        if armed != NO_DEADLINE && now >= armed {
+            ARMED.store(NO_DEADLINE, Ordering::Release);
+        }
     }
     now
 }
@@ -337,7 +344,18 @@ fn enter_idle(requested: u64) -> bool {
     let delta = math::bounded_deadline_delta(now, requested, MAX_FINITE.saturating_sub(now));
     let programmed = match active_backend() {
         1 => hpet::r4os_rust_hpet_control(9, delta, frequency()),
-        2 => lapic::r4os_rust_lapic_control(14, delta, 0),
+        2 => {
+            // `requested` is an absolute logical tick, not a whole interval
+            // starting partway through the current tick. Invert the existing
+            // exact event scale before the clock owner maps it to local TSC.
+            let raw_tick = requested
+                .saturating_sub(TICK_EPOCH.load(Ordering::Acquire))
+                .checked_add(TICK_ORIGIN.load(Ordering::Acquire));
+            let ns = raw_tick
+                .and_then(|tick| scale().invert_ceil(tick))
+                .and_then(|ns| MODERN_ORIGIN.load(Ordering::Acquire).checked_add(ns));
+            lapic::arm_absolute(delta, ns)
+        }
         0 => 0,
         _ => panic!("Invalid one-shot backend"),
     };

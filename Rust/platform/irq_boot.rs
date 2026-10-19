@@ -212,26 +212,26 @@ fn handoff(current: *mut Status) {
             fallback_reason: Text::new(b"PIT remains active until a modern timer validates"),
         }
     };
-    let hpet = hpet_attempt(current);
-    if hpet.ok {
-        unsafe {
-            (*current).timer_handoff.active_backend = timer::active_backend() as u8;
-            (*current).timer_handoff.validated_ticks = hpet.ticks;
-            (*current).timer_handoff.fallback_reason = Text::new(b"HPET timer active")
-        };
-        log_timer(b"HPET", hpet.ticks);
-        step(3);
+    // Keep the former HPET-first order unless an actually qualified deadline
+    // candidate needs the LAPIC event route. Clocksource remains independent.
+    // The count timer is validated here; SMP later supplies the exact epoch.
+    let preferred = if lapic::deadline_candidate() {
+        Some(lapic_attempt(current))
+    } else {
+        None
+    };
+    if let Some(attempt) = preferred.filter(|attempt| attempt.ok) {
+        accepted_handoff(current, attempt, true);
         return;
     }
-    let lapic = lapic_attempt(current);
+    let hpet = hpet_attempt(current);
+    if hpet.ok {
+        accepted_handoff(current, hpet, false);
+        return;
+    }
+    let lapic = preferred.unwrap_or_else(|| lapic_attempt(current));
     if lapic.ok {
-        unsafe {
-            (*current).timer_handoff.active_backend = timer::active_backend() as u8;
-            (*current).timer_handoff.validated_ticks = lapic.ticks;
-            (*current).timer_handoff.fallback_reason = Text::new(b"LAPIC timer active")
-        };
-        log_timer(b"LAPIC", lapic.ticks);
-        step(4);
+        accepted_handoff(current, lapic, true);
         return;
     }
     timer::r4os_rust_timer_control(3, 0, 0);
@@ -246,6 +246,19 @@ fn handoff(current: *mut Status) {
         }
     };
     step(5);
+}
+fn accepted_handoff(current: *mut Status, attempt: Attempt, local: bool) {
+    unsafe {
+        (*current).timer_handoff.active_backend = timer::active_backend() as u8;
+        (*current).timer_handoff.validated_ticks = attempt.ticks;
+        (*current).timer_handoff.fallback_reason = Text::new(if local {
+            b"LAPIC timer active"
+        } else {
+            b"HPET timer active"
+        });
+    }
+    log_timer(if local { b"LAPIC" } else { b"HPET" }, attempt.ticks);
+    step(if local { 4 } else { 3 });
 }
 fn hpet_attempt(current: *mut Status) -> Attempt {
     if !unsafe { (*current).ioapic_routing_active } {

@@ -486,6 +486,7 @@ fn start(plan: Plan) -> bool {
     if !crate::platform::cpu_capabilities::capture(0, cpu_topology::epoch(0)) {
         crate::boot::fatal::kernel(11, b"cpu-capability-publication");
     }
+    lapic::qualify_bsp_timer();
     if !lapic::is_enabled() {
         cpu_topology::seal(1);
         publish(Status {
@@ -582,6 +583,9 @@ fn activate() {
     value.activated = true;
     publish(value);
     log(3, 0, 0, b"active");
+    for index in 0..configured() {
+        lapic::log_timer(index);
+    }
 }
 fn stop_others() {
     super::cpu_lifecycle::terminal();

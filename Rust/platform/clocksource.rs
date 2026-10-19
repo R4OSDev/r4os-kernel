@@ -70,6 +70,7 @@ static REGISTERED: AtomicU64 = AtomicU64::new(0);
 static MAX_SKEW: AtomicU64 = AtomicU64::new(0);
 static SOURCE: AtomicU32 = AtomicU32::new(0);
 static GENERATION: AtomicU32 = AtomicU32::new(0);
+static TRANSITION: AtomicBool = AtomicBool::new(false);
 static PUBLISHED: AtomicU64 = AtomicU64::new(0);
 static FALLBACK: AtomicU32 = AtomicU32::new(0);
 
@@ -118,6 +119,46 @@ pub fn active_source() -> u32 {
 pub fn generation() -> u32 {
     GENERATION.load(Ordering::Acquire)
 }
+/// A qualified scale for this exact CPU, independently from the event timer.
+/// Consumers must retain/recheck the generation; this is a copied value, not
+/// a clock lease. A watchdog/source change immediately revokes qualification.
+pub(crate) fn deadline_clock(index: u32) -> Option<(u64, u32)> {
+    if index as usize >= MAX_CPUS || TRANSITION.load(Ordering::SeqCst) || active_source() != 1 {
+        return None;
+    }
+    let generation = generation();
+    let frequency = TSC_HZ.load(Ordering::Acquire);
+    if generation == 0
+        || generation == u32::MAX
+        || !(MIN_HZ..=MAX_HZ).contains(&frequency)
+        || !TSC_SCALE.get().valid()
+        || (!TSC_INVARIANT.load(Ordering::Acquire) && !TSC_CALIBRATED.load(Ordering::Acquire))
+        || REGISTERED.load(Ordering::Acquire) & (1u64 << index) == 0
+        || active_source() != 1
+        || self::generation() != generation
+        || TRANSITION.load(Ordering::SeqCst)
+    {
+        return None;
+    }
+    Some((frequency, generation))
+}
+/// Invert this same qualified clock projection onto the actual local counter.
+/// No corrected/foreign counter value is written to a CPU's deadline MSR.
+pub(crate) fn local_tsc_deadline(index: u32, expected: u32, ns: u64) -> Option<u64> {
+    if deadline_clock(index)?.1 != expected {
+        return None;
+    }
+    let adjusted = EARLY_ORIGIN
+        .load(Ordering::Acquire)
+        .checked_add(TSC_SCALE.get().invert_ceil(ns)?)?;
+    let correction = CORRECTIONS[index as usize].load(Ordering::Acquire);
+    let raw = if correction >= 0 {
+        adjusted.checked_sub(correction as u64)?
+    } else {
+        adjusted.checked_add(correction.unsigned_abs())?
+    };
+    (deadline_clock(index)?.1 == expected && raw != 0 && raw != u64::MAX).then_some(raw)
+}
 pub fn last_published() -> u64 {
     PUBLISHED.load(Ordering::Acquire)
 }
@@ -143,8 +184,12 @@ fn activate(source: u32) {
     if active_source() == source {
         return;
     }
-    GENERATION.fetch_add(1, Ordering::AcqRel);
+    TRANSITION.store(true, Ordering::SeqCst);
+    // The fixed public generation cannot be extended or allowed to repeat.
+    // Its exhausted value permanently refuses new deadline qualifications.
+    let _ = GENERATION.try_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_add(1));
     SOURCE.store(source, Ordering::Release);
+    TRANSITION.store(false, Ordering::SeqCst);
 }
 fn install_tsc(frequency: u64) {
     if !(MIN_HZ..=MAX_HZ).contains(&frequency) {
@@ -454,6 +499,24 @@ fn fallback_to_hpet(failure: u32) {
         activate(0);
     }
 }
+/// Explicit isolated boot selector only; no userland or live CHECK can demote
+/// the global clock. This exercises the real generation/fallback mechanism.
+pub(crate) fn deadline_boot_fallback() -> bool {
+    let selected = unsafe {
+        crate::boot::config::option_value(crate::boot::config::get(), b"TASKREGISTRY", b"selftest")
+    }
+    .is_some_and(|v| v.eq_ignore_ascii_case(b"tsc-deadline"));
+    if !selected
+        || runtime::current_cpu() != 0
+        || crate::sched::scheduler::preempt_depth() == 0
+        || active_source() != 1
+        || !HPET_CONFIGURED.load(Ordering::Acquire)
+    {
+        return false;
+    }
+    fallback_to_hpet(9);
+    active_source() == 2
+}
 pub fn finalize_cpu(index: u32) -> bool {
     if index as usize >= MAX_CPUS || unsafe { clock_cpu(0, index) } == 0 {
         return false;
@@ -675,6 +738,7 @@ pub(crate) fn fallback_name(reason: u32) -> &'static [u8] {
         6 => b"cpu-skew",
         7 => b"tsc-discontinuity",
         8 => b"hpet-unavailable",
+        9 => b"isolated-deadline-boot-check",
         _ => unreachable!(),
     }
 }

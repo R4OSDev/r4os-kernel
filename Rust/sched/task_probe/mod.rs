@@ -46,6 +46,26 @@ fn boot_cases() -> bool {
             return true;
         }
         let value = core::slice::from_raw_parts(option.pointer, option.len);
+        if option_is(value, b"tsc-deadline") {
+            if !run::prepare() {
+                return false;
+            }
+            // Reuse the original strict checkpoint/earlier-IRQ and bounded
+            // idle-timeout oracles before the isolated hardware/source cases.
+            let idle = deadlines::probe() && deadlines::storm();
+            let line = if idle {
+                b"[TSCDEADLINE-IDLE] result=PASS checkpoint=finite earlier=real-irq due=65 bounded=64+1 future=held\r\n".as_slice()
+            } else {
+                b"[TSCDEADLINE-CHECK] result=FAILED stage=legacy-idle\r\n".as_slice()
+            };
+            crate::boot::log::text(line);
+            crate::boot::log_route::serial_write_raw(line);
+            if !idle {
+                crate::arch::lapic::log_timer(0);
+                return false;
+            }
+            return crate::arch::lapic::deadline_boot_check();
+        }
         if option_is(value, b"idle-deadline") {
             if !deadlines::storm() {
                 return helpers::fail(b"idle-deadline");

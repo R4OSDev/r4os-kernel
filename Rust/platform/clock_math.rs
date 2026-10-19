@@ -50,6 +50,15 @@ impl FixedScale {
         }
         clamp64((u128::from(value) * u128::from(self.multiplier)) >> self.shift)
     }
+    /// First raw counter whose exact existing floor scale reaches `value`.
+    /// Used to preserve an absolute event deadline across both clock scales.
+    pub(crate) fn invert_ceil(self, value: u64) -> Option<u64> {
+        if !self.valid() || self.shift > 63 {
+            return None;
+        }
+        let scaled = u128::from(value) << self.shift;
+        u64::try_from(scaled.div_ceil(u128::from(self.multiplier))).ok()
+    }
 }
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
