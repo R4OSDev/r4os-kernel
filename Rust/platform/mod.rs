@@ -8,6 +8,7 @@ pub(crate) mod cpu_capabilities_decode;
 pub(crate) mod cpu_capabilities_features;
 pub(crate) mod cpu_capabilities_store;
 pub(crate) mod cpu_identity;
+pub(crate) mod cpu_power;
 pub(crate) mod cpu_registers;
 pub(crate) mod cpu_topology;
 pub(crate) mod cpu_topology_decode;

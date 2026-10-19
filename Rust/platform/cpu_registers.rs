@@ -65,10 +65,16 @@ impl Session {
         let (msr, name) = select(&s, id).ok_or(c::cpu_capabilities_error_unsupported)?;
         // Local IDT and exact epoch come from real boot qualification. Select
         // established the architectural feature or exact verified model.
-        let value = unsafe { safe_msr::read(msr) }.map_err(|reason| match reason {
-            safe_msr::Error::Busy => c::cpu_capabilities_error_busy,
-            safe_msr::Error::Fault => c::cpu_capabilities_error_fault,
-        })?;
+        // Intel's signature latch is read through its exact architectural
+        // zero-preload/CPUID1 procedure. This is neither a microcode update
+        // nor a caller-controlled write. AMD PATCH_LEVEL is strictly read-only.
+        if id == c::cpu_register_id_microcode && s.raw.vendor() == *b"GenuineIntel" {
+            unsafe { safe_msr::write_exact(self.index, self.epoch, msr, 0) }
+                .map_err(register_error)?;
+            let _ = core::arch::x86_64::__cpuid(1);
+        }
+        let value =
+            unsafe { safe_msr::read_exact(self.index, self.epoch, msr) }.map_err(register_error)?;
         let mut out = c::CpuRegisterInfo {
             cpu_index: self.index,
             register_id: id,
@@ -164,6 +170,24 @@ impl Session {
         Ok(out)
     }
 }
+fn register_error(reason: safe_msr::Error) -> i32 {
+    match reason {
+        safe_msr::Error::Busy => c::cpu_capabilities_error_busy,
+        safe_msr::Error::Fault => c::cpu_capabilities_error_fault,
+    }
+}
+fn native_haswell(s: &Snapshot) -> bool {
+    s.raw.vendor() == *b"GenuineIntel"
+        && bit(&s.raw, 1, 0, 2, 31) == Some(false)
+        && s.raw
+            .signature()
+            .is_some_and(|(family, model, _)| family == 6 && matches!(model, 0x3c | 0x45 | 0x46))
+}
+fn native_milan_b1(s: &Snapshot) -> bool {
+    s.raw.vendor() == *b"AuthenticAMD"
+        && bit(&s.raw, 1, 0, 2, 31) == Some(false)
+        && s.raw.signature() == Some((0x19, 1, 1))
+}
 /// Pure whitelist. Optional feature absence, other models and unknown vendors
 /// cannot be promoted merely because RDMSR exists or the CPU brand looks alike.
 fn select(s: &Snapshot, id: u32) -> Option<(u32, &'static [u8])> {
@@ -199,6 +223,38 @@ fn select(s: &Snapshot, id: u32) -> Option<(u32, &'static [u8])> {
                 }) =>
         {
             Some((0xce, b"intel-platform-info"))
+        }
+        c::cpu_register_id_microcode if native_haswell(s) || native_milan_b1(s) => {
+            Some((0x8b, b"microcode"))
+        }
+        c::cpu_register_id_intel_temperature_target if native_haswell(s) => {
+            Some((0x1a2, b"intel-temp-target"))
+        }
+        c::cpu_register_id_intel_thermal_status
+            if native_haswell(s)
+                && bit(raw, 1, 0, 3, 22) == Some(true)
+                && bit(raw, 6, 0, 0, 0) == Some(true) =>
+        {
+            Some((0x19c, b"intel-thermal-status"))
+        }
+        c::cpu_register_id_intel_energy_unit if native_haswell(s) => {
+            Some((0x606, b"intel-energy-unit"))
+        }
+        c::cpu_register_id_intel_package_energy if native_haswell(s) => {
+            Some((0x611, b"intel-pkg-energy"))
+        }
+        c::cpu_register_id_intel_core_energy if native_haswell(s) => {
+            Some((0x639, b"intel-core-energy"))
+        }
+        c::cpu_register_id_amd_pstate0 if native_milan_b1(s) => Some((0xc001_0064, b"amd-pstate0")),
+        c::cpu_register_id_amd_energy_unit if native_milan_b1(s) => {
+            Some((0xc001_0299, b"amd-energy-unit"))
+        }
+        c::cpu_register_id_amd_package_energy if native_milan_b1(s) => {
+            Some((0xc001_029b, b"amd-pkg-energy"))
+        }
+        c::cpu_register_id_amd_core_energy if native_milan_b1(s) => {
+            Some((0xc001_029a, b"amd-core-energy"))
         }
         _ => None,
     }

@@ -2,6 +2,7 @@
 pub mod api_admission;
 pub mod api_audio;
 pub mod api_cleanup;
+pub(crate) mod api_cpu;
 pub mod api_dma;
 pub mod api_entry;
 pub mod api_gfx;

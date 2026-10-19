@@ -132,6 +132,15 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_prepare(owner: u32, out: *mut 
         return false;
     }
     token.audio_prepared = true;
+    if !crate::platform::cpu_power::prepare_close(owner) {
+        audio::r4os_rust_driver_audio_closing(owner, false);
+        backend(5, owner);
+        unsafe {
+            storage::r4os_rust_driver_storage_cancel_plan(&mut token.storage_plan);
+            net_finish(&mut token, false)
+        };
+        return false;
+    }
     token.active = true;
     unsafe { ptr::write(out, token) };
     true
@@ -157,6 +166,7 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_cancel(token: *mut Token) -> b
     if unsafe { (*token).audio_prepared } {
         audio::r4os_rust_driver_audio_closing(owner, false);
     }
+    crate::platform::cpu_power::cancel_close(owner);
     unsafe { (*token).active = false };
     true
 }
@@ -199,6 +209,9 @@ pub extern "C" fn r4os_rust_driver_system_transition(owner: u32, op: u8) -> bool
             if !crate::serial::driver_close(owner) {
                 return false;
             }
+            if !crate::platform::cpu_power::prepare_close(owner) {
+                return false;
+            }
             close_data(owner);
             threads::r4os_rust_driver_thread_stop_existing(owner);
             true
@@ -213,6 +226,7 @@ pub extern "C" fn r4os_rust_driver_system_transition(owner: u32, op: u8) -> bool
                 || backend(2, owner) != 0
                 || backend(3, owner) != 0
                 || !threads::r4os_rust_driver_thread_quiesced(owner)
+                || !crate::platform::cpu_power::prepare_close(owner)
             {
                 return false;
             }
@@ -247,6 +261,7 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_commit(token: *mut Token) -> b
         if unsafe { (*token).audio_prepared } {
             audio::r4os_rust_driver_audio_closing(owner, false);
         }
+        crate::platform::cpu_power::cancel_close(owner);
         unsafe { (*token).active = false };
         return false;
     }
@@ -260,6 +275,10 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_commit(token: *mut Token) -> b
         return false;
     }
     if !crate::serial::driver_quiesced(owner) {
+        unsafe { r4os_rust_driver_cleanup_quarantine(token) };
+        return false;
+    }
+    if !crate::platform::cpu_power::finish_close(owner) {
         unsafe { r4os_rust_driver_cleanup_quarantine(token) };
         return false;
     }
