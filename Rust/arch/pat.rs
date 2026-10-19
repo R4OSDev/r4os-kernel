@@ -3,7 +3,7 @@
 //! The BSP's complete live table is adopted without rewriting firmware state.
 use super::{
     memory_types::{self as types, Mtrrs},
-    msr, percpu,
+    percpu, safe_msr,
     smp_policy::MAX_CPUS,
 };
 use core::{
@@ -63,8 +63,8 @@ fn capture_mtrrs() -> Result<Mtrrs, &'static [u8]> {
     if !(32..=52).contains(&bits) {
         return Err(b"mtrr-addressing");
     }
-    let cap = unsafe { msr::read(0xfe) };
-    let default = unsafe { msr::read(0x2ff) };
+    let cap = unsafe { safe_msr::read(0xfe) }.map_err(|_| b"mtrr-msr-access".as_slice())?;
+    let default = unsafe { safe_msr::read(0x2ff) }.map_err(|_| b"mtrr-msr-access".as_slice())?;
     let kind = default as u8;
     if !types::valid_type(kind) || kind == types::UC_MINUS {
         return Err(b"mtrr-type");
@@ -86,7 +86,8 @@ fn capture_mtrrs() -> Result<Mtrrs, &'static [u8]> {
         .into_iter()
         .enumerate()
         {
-            let value = unsafe { msr::read(number) };
+            let value =
+                unsafe { safe_msr::read(number) }.map_err(|_| b"mtrr-msr-access".as_slice())?;
             for byte in 0..8 {
                 let kind = (value >> (byte * 8)) as u8;
                 if !types::valid_type(kind) || kind == types::UC_MINUS {
@@ -97,8 +98,10 @@ fn capture_mtrrs() -> Result<Mtrrs, &'static [u8]> {
         }
     }
     for index in 0..(cap as u8) {
-        let base = unsafe { msr::read(0x200 + 2 * u32::from(index)) };
-        let mask = unsafe { msr::read(0x201 + 2 * u32::from(index)) };
+        let base = unsafe { safe_msr::read(0x200 + 2 * u32::from(index)) }
+            .map_err(|_| b"mtrr-msr-access".as_slice())?;
+        let mask = unsafe { safe_msr::read(0x201 + 2 * u32::from(index)) }
+            .map_err(|_| b"mtrr-msr-access".as_slice())?;
         if !result.append(base, mask) {
             return Err(b"mtrr-range");
         }
@@ -107,7 +110,7 @@ fn capture_mtrrs() -> Result<Mtrrs, &'static [u8]> {
 }
 pub(crate) fn adopt_bsp() -> Result<(), &'static [u8]> {
     capabilities()?;
-    let table = unsafe { msr::read(PAT_MSR) };
+    let table = unsafe { safe_msr::read(PAT_MSR) }.map_err(|_| b"pat-msr-access".as_slice())?;
     if !types::valid_pat(table) {
         return Err(b"pat-invalid");
     }
@@ -157,7 +160,7 @@ pub(crate) fn local_table() -> Option<u64> {
     if !qualified(percpu::current_index()) {
         return None;
     }
-    let actual = unsafe { msr::read(PAT_MSR) };
+    let actual = unsafe { safe_msr::read(PAT_MSR) }.ok()?;
     (actual == common.table).then_some(actual)
 }
 pub(crate) fn cache_bits(kind: u8, huge: bool) -> Option<u64> {
@@ -187,18 +190,21 @@ fn program_ap(table: u64) -> Result<(), &'static [u8]> {
     // AP is private, IF=0 and has no device users. WB RAM remains WB at PAT0.
     // No-fill cache mode, writeback/invalidation, and a global-aware full
     // translation flush bracket the complete, validated MSR write.
-    unsafe {
+    let written = unsafe {
         r4os_write_cr0((cr0 | (1 << 30)) & !(1 << 29));
         core::arch::asm!("wbinvd", options(nostack));
         r4os_write_cr4(cr4 & !(1 << 7));
         r4os_write_cr3(cr3);
-        msr::write(PAT_MSR, table);
+        let written = safe_msr::write(PAT_MSR, table);
         core::arch::asm!("wbinvd", options(nostack));
         r4os_write_cr3(cr3);
         r4os_write_cr4(cr4);
         r4os_write_cr0(cr0);
-    }
-    Ok(())
+        written
+    };
+    // A rejected write must still restore the exact cache/TLB/control window
+    // before the startup owner can reject/quarantine this AP.
+    written.map_err(|_| b"pat-msr-access".as_slice())
 }
 pub(crate) fn init_ap(index: u32) -> Result<(), &'static [u8]> {
     let Some(common) = contract() else {
@@ -212,7 +218,7 @@ pub(crate) fn init_ap(index: u32) -> Result<(), &'static [u8]> {
         return Err(b"pat-start-window");
     }
     capabilities()?;
-    let before = unsafe { msr::read(PAT_MSR) };
+    let before = unsafe { safe_msr::read(PAT_MSR) }.map_err(|_| b"pat-msr-access".as_slice())?;
     if !types::valid_pat(before) || before as u8 != types::WB {
         return Err(b"pat-invalid");
     }
@@ -223,7 +229,7 @@ pub(crate) fn init_ap(index: u32) -> Result<(), &'static [u8]> {
     if before != common.table {
         program_ap(common.table)?;
     }
-    let actual = unsafe { msr::read(PAT_MSR) };
+    let actual = unsafe { safe_msr::read(PAT_MSR) }.map_err(|_| b"pat-msr-access".as_slice())?;
     if actual != common.table || index == crate::build_config::config::AP_PAT_READBACK_TEST_INDEX {
         return Err(b"pat-readback");
     }

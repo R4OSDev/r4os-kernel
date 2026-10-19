@@ -322,6 +322,9 @@ pub unsafe extern "C" fn ipiDispatch(frame: *const InterruptFrame) {
 /// # Safety
 /// The exception assembly owns and retains this complete register frame.
 pub unsafe extern "C" fn exceptionDispatch(frame: *const InterruptFrame) {
+    if unsafe { super::safe_msr::recover(frame.cast_mut()) } {
+        return;
+    }
     let address: u64;
     if unsafe { (*frame).vector } == 14 {
         unsafe {

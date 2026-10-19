@@ -1095,6 +1095,11 @@ fn configure_dev() {
     const CPU_LIFECYCLE: c::R4DevFns::cpu_lifecycle = r4dev::cpu_lifecycle::control;
     const CPU_LIFECYCLE_CHECK: c::R4DevFns::kernel_cpu_lifecycle_check =
         r4dev::cpu_lifecycle::check;
+    const CPU_CAPABILITIES: c::R4DevFns::cpu_capabilities = r4dev::cpu_capabilities::info;
+    const CPU_FEATURE: c::R4DevFns::cpu_feature = r4dev::cpu_capabilities::feature;
+    const CPU_REGISTER_READ: c::R4DevFns::cpu_register_read = r4dev::cpu_capabilities::read;
+    const CPU_REGISTER_CHECK: c::R4DevFns::kernel_cpu_register_check =
+        r4dev::cpu_capabilities::check;
     r4dev::providers::install();
     let value = c::R4XStartR4Dev {
         serial_count: super::serial_api::count as c::R4DevFns::serial_count as *const () as usize,
@@ -1203,13 +1208,25 @@ fn configure_dev() {
         cpu_cache_topology: CPU_CACHE as *const () as usize,
         cpu_lifecycle: CPU_LIFECYCLE as *const () as usize,
         kernel_cpu_lifecycle_check: CPU_LIFECYCLE_CHECK as *const () as usize,
+        cpu_capabilities: CPU_CAPABILITIES as *const () as usize,
+        cpu_feature: CPU_FEATURE as *const () as usize,
+        cpu_register_read: CPU_REGISTER_READ as *const () as usize,
+        kernel_cpu_register_check: CPU_REGISTER_CHECK as *const () as usize,
         ..Default::default()
     };
     DEV.configure(value);
 }
 
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Dev>() == 568);
+    assert!(mem::size_of::<c::R4XStartR4Dev>() == 600);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_capabilities) == 568);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_feature) == 576);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_register_read) == 584);
+    assert!(mem::offset_of!(c::R4XStartR4Dev, kernel_cpu_register_check) == 592);
+    assert!(mem::size_of::<c::CpuCapabilitiesInfo>() == 272);
+    assert!(mem::size_of::<c::CpuFeatureInfo>() == 112);
+    assert!(mem::size_of::<c::CpuRegisterInfo>() == 80);
+    assert!(mem::size_of::<c::ProgramKernelCpuRegisterCheck>() == 128);
     assert!(mem::offset_of!(c::R4XStartR4Dev, cpu_lifecycle) == 552);
     assert!(mem::offset_of!(c::R4XStartR4Dev, kernel_cpu_lifecycle_check) == 560);
     assert!(mem::size_of::<c::CpuLifecycleInfo>() == 128);

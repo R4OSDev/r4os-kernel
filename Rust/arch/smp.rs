@@ -481,6 +481,11 @@ fn start(plan: Plan) -> bool {
     if current().initialized {
         return true;
     }
+    // Paging/FPU/IRQ foundation is now complete. Early topology capture alone
+    // could not describe the actually enabled BSP control state.
+    if !crate::platform::cpu_capabilities::capture(0, cpu_topology::epoch(0)) {
+        crate::boot::fatal::kernel(11, b"cpu-capability-publication");
+    }
     if !lapic::is_enabled() {
         cpu_topology::seal(1);
         publish(Status {
@@ -690,6 +695,9 @@ pub extern "C" fn r4os_ap_entry(index: u64, start_epoch: u64, apic_id: u64) -> !
         core::arch::x86_64::__cpuid_count,
     ) {
         reject(b"cpu-topology-identity");
+    }
+    if !crate::platform::cpu_capabilities::capture(index, start_epoch) {
+        reject(b"cpu-capability-publication");
     }
     if !crate::sched::scheduler::init_secondary(index) {
         percpu::r4os_rust_percpu_control(5, index, 0, 0);

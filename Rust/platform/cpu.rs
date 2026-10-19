@@ -1,9 +1,8 @@
 //! BSP CPU discovery and the existing module-SIMD/OSXSAVE publication.
 //! Discovery finishes before AP observers; no State reference crosses logging.
-use crate::arch::msr;
 use core::{
     cell::UnsafeCell,
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
 };
 /// Local architectural identity, independent of the BSP's inventory/model.
 /// The early 32-bit trampoline applies the same hierarchy before MSR writes.
@@ -119,6 +118,31 @@ static INFO: Storage = Storage(UnsafeCell::new(core::mem::MaybeUninit::uninit())
 static DETECTED: AtomicBool = AtomicBool::new(false);
 static OSXSAVE: AtomicBool = AtomicBool::new(false);
 static XCR0: AtomicU64 = AtomicU64::new(0);
+// The fixed legacy inventory has no status fields. Keep a distinct operational
+// error observation for the new catalog instead of reporting a failed read as
+// a measured zero. This does not qualify PAT/MTRR for memory consumers.
+static INVENTORY_MSR_FAILURES: AtomicU32 = AtomicU32::new(0);
+pub(crate) fn inventory_msr_failures() -> u32 {
+    INVENTORY_MSR_FAILURES.load(Ordering::Acquire)
+}
+unsafe fn inventory_msr(id: u32, flag: u32) -> u64 {
+    match unsafe { crate::arch::safe_msr::read(id) } {
+        Ok(value) => value,
+        Err(error) => {
+            INVENTORY_MSR_FAILURES.fetch_or(flag, Ordering::Release);
+            use crate::boot::log_route::{dec, puts};
+            puts(b"[CPU] optional inventory MSR unavailable id=");
+            dec(u64::from(id));
+            puts(b" reason=");
+            puts(match error {
+                crate::arch::safe_msr::Error::Busy => b"busy",
+                crate::arch::safe_msr::Error::Fault => b"fault",
+            });
+            puts(b"\r\n");
+            0
+        }
+    }
+}
 
 fn cpuid(leaf: u32, subleaf: u32) -> core::arch::x86_64::CpuidResult {
     core::arch::x86_64::__cpuid_count(leaf, subleaf)
@@ -145,6 +169,7 @@ fn trimmed(bytes: &[u8]) -> u64 {
     len as u64
 }
 pub fn detect() -> Status {
+    INVENTORY_MSR_FAILURES.store(0, Ordering::Release);
     let mut value = Status::default();
     let leaf = cpuid(0, 0);
     value.max_basic_leaf = leaf.eax;
@@ -244,10 +269,10 @@ pub fn detect() -> Status {
         value.xcr0 = xgetbv(0);
     }
     if value.features.msr && value.features.pat {
-        value.pat_msr = unsafe { msr::read(0x277) };
+        value.pat_msr = unsafe { inventory_msr(0x277, 1) };
     }
     if value.features.msr && value.features.mtrr {
-        value.mtrr_cap = unsafe { msr::read(0xfe) };
+        value.mtrr_cap = unsafe { inventory_msr(0xfe, 2) };
     }
     value.detected = true;
     unsafe { (*INFO.0.get()).write(value) };

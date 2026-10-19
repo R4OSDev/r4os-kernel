@@ -17,6 +17,7 @@ pub mod pic;
 pub mod pit;
 pub mod rtc;
 pub mod runtime;
+pub(crate) mod safe_msr;
 pub mod smp;
 pub mod smp_policy;
 pub mod smp_probe;
