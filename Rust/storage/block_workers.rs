@@ -2,15 +2,39 @@
 //! generation-bound snapshots; no storage guard crosses creation/wait/wake.
 use crate::{
     memory::owner::Guard,
-    sched::{scheduler, sync_objects, sync_types::Event, task},
+    sched::{
+        scheduler, sync_objects,
+        sync_types::Event,
+        task::{self, task_api},
+    },
     storage::{block_accounting as accounting, block_registry},
 };
-use core::{cell::UnsafeCell, ffi::c_void, ptr};
+use core::{
+    cell::UnsafeCell,
+    ptr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 const NO_LANE: u8 = 255;
+static EXECUTED_CPUS: AtomicU64 = AtomicU64::new(0);
+static R4D_CPUS: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn note_backend(cpu: u32, qualified_r4d: bool) {
+    // Private projection of the present <=32-CPU scheduler, never admission.
+    EXECUTED_CPUS.fetch_or(1u64 << cpu, Ordering::Relaxed);
+    if qualified_r4d {
+        R4D_CPUS.fetch_or(1u64 << cpu, Ordering::Relaxed);
+    }
+}
+pub(crate) fn execution_cpus() -> (u64, u64) {
+    (
+        EXECUTED_CPUS.load(Ordering::Relaxed),
+        R4D_CPUS.load(Ordering::Relaxed),
+    )
+}
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct Identity {
     pub started: bool,
+    pub parallel: bool,
     pub id: u32,
     pub generation: u64,
 }
@@ -22,6 +46,7 @@ impl Controller {
     const EMPTY: Self = Self {
         identity: Identity {
             started: false,
+            parallel: false,
             id: 0,
             generation: 0,
         },
@@ -40,34 +65,13 @@ unsafe impl Sync for Workers {}
 static WORKERS: Workers = Workers(UnsafeCell::new(State {
     primary: Identity {
         started: false,
+        parallel: false,
         id: 0,
         generation: 0,
     },
     primary_lane: NO_LANE,
     controllers: [const { Controller::EMPTY }; 8],
 }));
-#[repr(C)]
-struct Create {
-    name: *const u8,
-    name_len: usize,
-    state: u8,
-    role: u8,
-    needs_fpu: bool,
-    smp_eligible: bool,
-    smp_r4x: bool,
-    owner_kind: u8,
-    owner_context: *mut c_void,
-    entry: Option<unsafe extern "C" fn()>,
-}
-unsafe extern "C" {
-    // Use the canonical native task owner interfaces.
-    fn r4os_rust_task_create(input: *const Create, critical: bool, failure: *mut u8)
-    -> *mut c_void;
-    fn r4os_rust_task_control(operation: u8, a: u64, b: u64) -> u64;
-    // Temporary call into the not-yet-migrated block execution leaf; this
-    // does not own worker identities, events, accounting or lane selection.
-
-}
 fn primary() -> Identity {
     let _owner = Guard::acquire(1);
     unsafe { (*WORKERS.0.get()).primary }
@@ -87,7 +91,8 @@ fn identity_alive(value: Identity) -> bool {
     value.started
         && value.id != 0
         && value.generation != 0
-        && unsafe { r4os_rust_task_control(19, u64::from(value.id), value.generation) } != 0
+        && unsafe { task_api::r4os_rust_task_control(19, u64::from(value.id), value.generation) }
+            != 0
 }
 fn event(lane: u8) -> *mut Event {
     assert!(lane < 8);
@@ -137,33 +142,48 @@ pub extern "C" fn r4os_rust_block_worker_start(lane: u8, critical: bool) -> bool
         b"block-work7",
     ];
     let name = NAMES[usize::from(lane)];
-    let input = Create {
+    // Keep the critical primary task as the permanent BSP fallback. Secondary
+    // controller admission derives from its exact reviewed backend records.
+    let parallel = !critical && block_registry::controller_parallel(lane);
+    let input = task_api::CreateRequest {
         name: name.as_ptr(),
         name_len: name.len(),
-        state: 1,
+        state: 3,
         role: 3,
         needs_fpu: true,
-        smp_eligible: false,
+        smp_eligible: parallel,
         smp_r4x: false,
         owner_kind: 0,
         owner_context: ptr::null_mut(),
         entry: Some(worker_main),
     };
     let mut failure = 0;
-    let created = unsafe { r4os_rust_task_create(&input, critical, &mut failure) };
+    let created = unsafe { task_api::r4os_rust_task_create(&input, critical, &mut failure) };
     if created.is_null() {
         return false;
     }
-    // New ready task cannot end until the shared entry discovers its exact
-    // published lane. Read only immutable task identity, then publish it.
+    // Publish the exact identity before Ready can execute on another CPU.
     let (id, generation) = unsafe { task::immutable_identity(created) };
-    let _owner = Guard::acquire(1);
+    {
+        let _owner = Guard::acquire(1);
+        unsafe {
+            (*WORKERS.0.get()).controllers[usize::from(lane)].identity = Identity {
+                started: true,
+                parallel,
+                id,
+                generation,
+            };
+        }
+    }
     unsafe {
-        (*WORKERS.0.get()).controllers[usize::from(lane)].identity = Identity {
-            started: true,
-            id,
-            generation,
-        };
+        task_api::r4os_rust_task_mutate(
+            0,
+            created,
+            crate::platform::timer::tick_count(),
+            0,
+            ptr::null(),
+            0,
+        );
     }
     true
 }
@@ -214,7 +234,9 @@ pub extern "C" fn r4os_rust_block_workers_start() -> bool {
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_block_worker_lane(lane: u8) -> u8 {
-    if r4os_rust_block_worker_alive(lane) {
+    let identity = controller(lane);
+    if identity_alive(identity) && (!identity.parallel || block_registry::controller_parallel(lane))
+    {
         return lane;
     }
     let primary = primary_lane();
@@ -274,11 +296,8 @@ fn current_lane() -> u8 {
     NO_LANE
 }
 unsafe extern "C" fn worker_main() {
-    let mut lane = current_lane();
-    while lane == NO_LANE {
-        scheduler::yield_task();
-        lane = current_lane();
-    }
+    let lane = current_lane();
+    assert!(lane < 8, "Published block worker identity");
     loop {
         if unsafe { crate::storage::block_execution::pump_controller(lane) } {
             continue;
@@ -290,6 +309,5 @@ unsafe extern "C" fn worker_main() {
     }
 }
 const _: () = {
-    assert!(core::mem::size_of::<Create>() == 40);
     assert!(core::mem::size_of::<Identity>() == 16);
 };

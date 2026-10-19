@@ -44,6 +44,43 @@ impl Execution {
         }
     }
 }
+/// Exact retained request under device admission. The AP caller cannot invoke
+/// an unreviewed backend; its original worker must dispatch this cancellation.
+pub(crate) unsafe fn defer_cancel(slot: *mut Slot, request: Execution, reason: u32) -> bool {
+    let _owner = Guard::acquire(1);
+    if !(1..=3).contains(&reason)
+        || unsafe {
+            (*slot).state != 2
+                || (*slot).id != request.id
+                || (*slot).backend_handle != request.backend_handle
+                || request.backend_handle == 0
+        }
+    {
+        return false;
+    }
+    if unsafe { (*slot).pending_cancel_reason } == 0 {
+        unsafe {
+            (*slot).pending_cancel_reason = u8::try_from(reason).expect("bounded cancel reason")
+        };
+    }
+    true
+}
+/// Original worker owns the exact device pin/queue while taking one pending
+/// command. Completion/reset of an older incarnation cannot target a new slot.
+pub(crate) unsafe fn take_cancel(slots: *mut Slot) -> Option<(Execution, u32)> {
+    let _owner = Guard::acquire(1);
+    for index in 0..16 {
+        let slot = unsafe { slots.add(index) };
+        let reason = unsafe { (*slot).pending_cancel_reason };
+        if reason == 0 || unsafe { (*slot).state != 2 || (*slot).backend_handle == 0 } {
+            continue;
+        }
+        let request = unsafe { Execution::from_slot(index, slot) };
+        unsafe { (*slot).pending_cancel_reason = 0 };
+        return Some((request, u32::from(reason)));
+    }
+    None
+}
 #[repr(C)]
 #[derive(Default)]
 pub struct Finish {

@@ -1,5 +1,13 @@
-//! Original PPI1 table and current execution slot. The loader keeps its
-//! existing serialized module-call discipline; no new dispatch model is added.
+//! Original PPI1 table and exact task-bound execution scopes. Module owners
+//! serialize stateful callbacks; nested calls restore their previous identity.
+use crate::{
+    arch::runtime::RuntimeGuard,
+    sched::{
+        scheduler,
+        task::{task_registry, task_types::Task},
+        task_context::Admission,
+    },
+};
 use crate::{contract, driver::protocol_registry, memory::heap};
 use core::{
     cell::UnsafeCell,
@@ -8,7 +16,66 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 const NO_SLOT: usize = usize::MAX;
-static CURRENT_SLOT: AtomicUsize = AtomicUsize::new(NO_SLOT);
+// Before task creation only the exclusive bootstrap may execute PPI code.
+static BOOT_SLOT: AtomicUsize = AtomicUsize::new(NO_SLOT);
+
+pub(crate) struct Execution {
+    task: *mut Task,
+    previous: usize,
+    _unwind: Admission,
+}
+impl Execution {
+    /// The caller retains the exact module's sleepable call owner and code.
+    pub(crate) fn enter(slot: usize) -> Option<Self> {
+        let task = scheduler::current().cast::<Task>();
+        let unwind = Admission::acquire(!task.is_null())?;
+        let _runtime = RuntimeGuard::acquire();
+        assert_eq!(
+            scheduler::current().cast::<Task>(),
+            task,
+            "PPI admission task"
+        );
+        let previous = if task.is_null() {
+            BOOT_SLOT.swap(slot, Ordering::Relaxed)
+        } else {
+            unsafe {
+                let core = task_registry::core(task);
+                let previous = (*core).protocol_slot;
+                (*core).protocol_slot = slot;
+                previous
+            }
+        };
+        Some(Self {
+            task,
+            previous,
+            _unwind: unwind,
+        })
+    }
+}
+impl Drop for Execution {
+    fn drop(&mut self) {
+        let _runtime = RuntimeGuard::acquire();
+        assert_eq!(
+            scheduler::current().cast::<Task>(),
+            self.task,
+            "PPI task scope"
+        );
+        if self.task.is_null() {
+            BOOT_SLOT.store(self.previous, Ordering::Relaxed);
+        } else {
+            unsafe { (*task_registry::core(self.task)).protocol_slot = self.previous };
+        }
+    }
+}
+fn current_slot() -> usize {
+    let _runtime = RuntimeGuard::acquire();
+    let task = scheduler::current().cast::<Task>();
+    if task.is_null() {
+        BOOT_SLOT.load(Ordering::Relaxed)
+    } else {
+        unsafe { (*task_registry::core(task)).protocol_slot }
+    }
+}
 struct Table(UnsafeCell<contract::ProtocolApi>);
 // The table is installed before R4P init and retained through module calls.
 unsafe impl Sync for Table {}
@@ -36,7 +103,7 @@ unsafe fn length(text: *const u8) -> usize {
     len
 }
 fn slot_id() -> u32 {
-    let slot = CURRENT_SLOT.load(Ordering::Relaxed);
+    let slot = current_slot();
     if slot == NO_SLOT {
         u32::MAX
     } else {
@@ -53,7 +120,7 @@ unsafe extern "C" fn log_error(text: *const u8) {
     unsafe { crate::boot::log_event::protocol(2, slot_id(), text) };
 }
 unsafe extern "C" fn register_role(role: *const u8, _category: u32, _flags: u32) -> i32 {
-    let slot = CURRENT_SLOT.load(Ordering::Relaxed);
+    let slot = current_slot();
     if slot == NO_SLOT {
         return -6;
     }
@@ -75,7 +142,7 @@ unsafe extern "C" fn register_role(role: *const u8, _category: u32, _flags: u32)
     0
 }
 unsafe extern "C" fn set_status(state: u32, note: *const u8) -> i32 {
-    let slot = CURRENT_SLOT.load(Ordering::Relaxed);
+    let slot = current_slot();
     if slot == NO_SLOT {
         return -6;
     }
@@ -105,14 +172,6 @@ unsafe extern "C" fn file_read(path: *const u8, out: *mut u8, len: u32) -> i32 {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_protocol_table() -> *mut contract::ProtocolApi {
     TABLE.0.get()
-}
-#[unsafe(no_mangle)]
-pub extern "C" fn r4os_rust_protocol_slot(operation: u8, slot: usize) {
-    match operation {
-        0 => CURRENT_SLOT.store(slot, Ordering::Relaxed),
-        1 => CURRENT_SLOT.store(NO_SLOT, Ordering::Relaxed),
-        _ => panic!("Invalid protocol execution scope"),
-    }
 }
 const _: () = {
     assert!(mem::size_of::<contract::ProtocolApi>() == 88);

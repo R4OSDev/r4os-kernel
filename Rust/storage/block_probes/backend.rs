@@ -30,6 +30,16 @@ pub(super) unsafe extern "C" fn fast_read(
     }
     true
 }
+pub(super) unsafe extern "C" fn legacy_read(
+    context: *mut c_void,
+    lba: u64,
+    sectors: u16,
+    out: *mut u8,
+    len: usize,
+) -> bool {
+    LEGACY_CPU.store(crate::arch::percpu::current_index(), Ordering::Release);
+    unsafe { fast_read(context, lba, sectors, out, len) }
+}
 pub(super) unsafe extern "C" fn slow_request() {
     let Some(_active) = Requester::enter() else {
         return;
@@ -42,6 +52,38 @@ pub(super) unsafe extern "C" fn fast_request() {
         return;
     };
     set(1, read(FAST.load(Ordering::Acquire), 0, 1));
+    signal(3);
+}
+pub(super) unsafe extern "C" fn legacy_submit(
+    context: *mut c_void,
+    input: *const device::AsyncRequest,
+) -> i32 {
+    let result = unsafe { submit(context, input) };
+    if result != 0 {
+        return result;
+    }
+    let r = unsafe { input.read() };
+    if r.lba == 0 {
+        let ok = unsafe { legacy_read(context, r.lba, r.sectors, r.buffer, r.buffer_len) };
+        unsafe { (r.complete)(r.handle, if ok { 0 } else { -1 }, r.buffer_len as u32) };
+        PENDING.fetch_and(!1, Ordering::Release);
+    }
+    0
+}
+pub(super) unsafe extern "C" fn legacy_cancel(
+    context: *mut c_void,
+    handle: u64,
+    reason: u32,
+) -> i32 {
+    LEGACY_CANCEL_CPU.store(crate::arch::percpu::current_index(), Ordering::Release);
+    unsafe { cancel(context, handle, reason) }
+}
+pub(super) unsafe extern "C" fn legacy_timeout() {
+    let Some(_active) = Requester::enter() else {
+        return;
+    };
+    LEGACY_CALLER_CPU.store(crate::arch::percpu::current_index(), Ordering::Release);
+    set(1, read(FAST.load(Ordering::Acquire), 3, 1));
     signal(3);
 }
 

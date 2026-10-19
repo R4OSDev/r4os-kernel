@@ -14,7 +14,11 @@ use crate::{
         task::{self, task_resources, task_types},
     },
 };
-use core::{cell::UnsafeCell, ptr};
+use core::{
+    cell::UnsafeCell,
+    ptr,
+    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+};
 const MAX_ADAPTERS: usize = 8;
 const BATCH_BUDGET: usize = 32;
 const ALL_ADAPTERS: u16 = (1 << MAX_ADAPTERS) - 1;
@@ -175,6 +179,13 @@ struct EventStorage(UnsafeCell<Event>);
 // SAFETY: native Event owns its runtime admission; bootstrap alone resets it.
 unsafe impl Sync for EventStorage {}
 static EVENT: EventStorage = EventStorage(UnsafeCell::new(Event::AUTO));
+static AP_EVENT: EventStorage = EventStorage(UnsafeCell::new(Event::AUTO));
+static AP_TASK_ID: AtomicU32 = AtomicU32::new(0);
+static AP_TASK_GENERATION: AtomicU64 = AtomicU64::new(0);
+static EXECUTED_CPUS: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn execution_cpus() -> u64 {
+    EXECUTED_CPUS.load(Ordering::Relaxed)
+}
 struct PollOwner(UnsafeCell<UnwindGuard>);
 // SAFETY: exact native task guard operations own its fields and generation.
 unsafe impl Sync for PollOwner {}
@@ -187,6 +198,29 @@ const POLL_INITIAL: UnwindGuard = UnwindGuard {
     queue: WaitQueue::EMPTY,
 };
 static POLL: PollOwner = PollOwner(UnsafeCell::new(POLL_INITIAL));
+const PROCESS_INITIAL: UnwindGuard = UnwindGuard {
+    name: Text::literal(b"net-rx-process"),
+    ..POLL_INITIAL
+};
+static PROCESS: PollOwner = PollOwner(UnsafeCell::new(PROCESS_INITIAL));
+struct Processing;
+impl Processing {
+    fn acquire() -> Option<Self> {
+        crate::memory::owner::prepare_stack();
+        unsafe { sync_locks::guard_try(PROCESS.0.get()) }.then(|| Self)
+    }
+}
+impl Drop for Processing {
+    fn drop(&mut self) {
+        assert!(
+            unsafe { sync_locks::guard_leave(PROCESS.0.get()) },
+            "Exact RX processing owner"
+        );
+        // Re-evaluate the live route after this frame's exact release. This
+        // also hands a newly unqualified enumeration back to the BSP.
+        signal_frames();
+    }
+}
 struct Critical {
     owner: Option<Guard>,
 }
@@ -290,7 +324,11 @@ pub unsafe extern "C" fn r4os_rust_net_rx_runtime_reset() {
         (*state()).net_poll_nested = 0;
 
         EVENT.0.get().write(Event::AUTO);
+        AP_EVENT.0.get().write(Event::AUTO);
+        AP_TASK_ID.store(0, Ordering::Release);
+        AP_TASK_GENERATION.store(0, Ordering::Release);
         POLL.0.get().write(POLL_INITIAL);
+        PROCESS.0.get().write(PROCESS_INITIAL);
     }
 }
 
@@ -298,6 +336,31 @@ fn signal() {
     unsafe {
         sync_objects::event_signal(EVENT.0.get());
     }
+}
+fn signal_frames() {
+    if !super::backend_admission::callbacks_open() || !has_ready() {
+        return;
+    }
+    if unsafe { sync_locks::guard_metadata(PROCESS.0.get()) }.depth != 0 {
+        return;
+    }
+    if AP_TASK_ID.load(Ordering::Acquire) != 0 && adapters::parallel_callbacks() {
+        unsafe { sync_objects::event_signal(AP_EVENT.0.get()) };
+    } else {
+        signal();
+    }
+}
+fn is_ap_current() -> bool {
+    let current = scheduler::current();
+    if current.is_null() {
+        return false;
+    }
+    let id = AP_TASK_ID.load(Ordering::Acquire);
+    if id == 0 {
+        return false;
+    }
+    let (actual, generation) = unsafe { task::immutable_identity(current) };
+    actual == id && generation == AP_TASK_GENERATION.load(Ordering::Acquire)
 }
 fn now_ns() -> u64 {
     monotonic::now_nanoseconds().unwrap_or(0)
@@ -321,6 +384,9 @@ fn is_current() -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_net_rx_runtime_schedule(index: usize) -> bool {
     let Some(_callback) = CallbackGuard::acquire() else {
+        return false;
+    };
+    let Some(_processing) = Processing::acquire() else {
         return false;
     };
     if index >= adapters::r4os_rust_net_adapter_count() {
@@ -429,7 +495,7 @@ pub unsafe extern "C" fn r4os_rust_net_rx_runtime_receive(
         }
     };
     if should_signal {
-        signal();
+        signal_frames();
     }
     match result {
         rx_handoff::EnqueueResult::Accepted => {
@@ -447,6 +513,16 @@ unsafe fn process_one(peers: &RxPeers) -> bool {
     let Some(_callback) = CallbackGuard::acquire() else {
         return false;
     };
+    // One production AP processor retains FIFO order. The counted callback
+    // pins this same enumeration through selection, protocol work and release.
+    // Exact diagnostic peer tables keep their original explicit owner.
+    if AP_TASK_ID.load(Ordering::Acquire) != 0
+        && ptr::eq(peers, unsafe { *PEERS.0.get() })
+        && is_ap_current() != adapters::parallel_callbacks()
+    {
+        signal_frames();
+        return false;
+    }
     // Keep the exact queue claim occupied through protocol completion. Copy its
     // bytes while admitted so another producer never mutates a whole Queue while
     // protocol code holds a Rust reference into one of that Queue's payloads.
@@ -474,6 +550,7 @@ unsafe fn process_one(peers: &RxPeers) -> bool {
             (*state()).rx_processing_depth = (*state()).rx_processing_depth.wrapping_add(1);
         }
     }
+    let cpu = crate::arch::percpu::current_index();
     let protocol_ok = unsafe {
         (peers.process)(
             claim.adapter_index,
@@ -482,6 +559,9 @@ unsafe fn process_one(peers: &RxPeers) -> bool {
             &claim.metadata,
         )
     };
+    if protocol_ok && ptr::eq(peers, unsafe { *PEERS.0.get() }) {
+        EXECUTED_CPUS.fetch_or(1u64 << cpu, Ordering::Relaxed);
+    }
     {
         let _critical = Critical::acquire();
         unsafe {
@@ -827,7 +907,7 @@ unsafe extern "C" fn task_main() {
             }
         }
         if has_ready() {
-            signal();
+            signal_frames();
         }
         let iterations = {
             let _critical = Critical::acquire();
@@ -848,6 +928,16 @@ unsafe extern "C" fn task_main() {
         // waiting at the next loop alone does not guarantee competing progress.
         scheduler::safe_reschedule();
         let _ = processed;
+    }
+}
+unsafe extern "C" fn ap_task_main() {
+    loop {
+        unsafe { sync_objects::event_wait(AP_EVENT.0.get(), u64::MAX) };
+        unsafe { process_batch(BATCH_BUDGET, peers(), true) };
+        if has_ready() {
+            signal_frames();
+        }
+        scheduler::safe_reschedule();
     }
 }
 /// # Safety
@@ -872,7 +962,7 @@ pub unsafe extern "C" fn r4os_rust_net_rx_runtime_start(input: *const RxPeers) -
                     pointer: b"net-rx".as_ptr(),
                     len: 6,
                 },
-                state: task_types::State::Ready,
+                state: task_types::State::Blocked,
                 needs_fpu: true,
                 entry: Some(task_main),
                 role: task_types::Role::ShortCompletion,
@@ -896,6 +986,55 @@ pub unsafe extern "C" fn r4os_rust_net_rx_runtime_start(input: *const RxPeers) -
             (*s).rx_task_started = true;
             (*s).rx_task_id = id;
             (*s).rx_task_generation = generation;
+        }
+    }
+    unsafe {
+        task::task_api::r4os_rust_task_mutate(
+            0,
+            worker.cast(),
+            timing::now_ticks(),
+            0,
+            ptr::null(),
+            0,
+        )
+    };
+    // Poll, maintenance and unqualified callbacks retain the original BSP task.
+    // Failure to allocate this optional processor preserves that whole path.
+    if crate::arch::percpu::r4os_rust_percpu_control(14, 0, 0, 0).count_ones() > 1 {
+        let ap = unsafe {
+            task_resources::create(
+                task_resources::CreateArgs {
+                    name: task_types::Bytes {
+                        pointer: b"net-rx-ap".as_ptr(),
+                        len: 9,
+                    },
+                    state: task_types::State::Blocked,
+                    needs_fpu: true,
+                    entry: Some(ap_task_main),
+                    role: task_types::Role::ShortCompletion,
+                    smp_eligible: true,
+                    smp_r4x: false,
+                    owner_kind: task_types::ExecutionOwnerKind::None,
+                    owner_context: ptr::null_mut(),
+                },
+                &mut failure,
+            )
+        };
+        if !ap.is_null() {
+            let (id, generation) = unsafe { task::immutable_identity(ap.cast()) };
+            AP_TASK_GENERATION.store(generation, Ordering::Release);
+            AP_TASK_ID.store(id, Ordering::Release);
+            unsafe {
+                task::task_api::r4os_rust_task_mutate(
+                    0,
+                    ap.cast(),
+                    timing::now_ticks(),
+                    0,
+                    ptr::null(),
+                    0,
+                )
+            };
+            signal_frames();
         }
     }
     foundation::puts(b"NET rx-task started id=");

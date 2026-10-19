@@ -85,6 +85,7 @@ struct Module {
     quarantined: bool,
     name: Name,
     kind: u16,
+    parallel_callbacks: bool,
     module_slot: usize,
     init: Option<Init>,
     shutdown: Option<Shutdown>,
@@ -95,6 +96,7 @@ impl Module {
         quarantined: false,
         name: Name::EMPTY,
         kind: 0,
+        parallel_callbacks: false,
         module_slot: 0,
         init: None,
         shutdown: None,
@@ -337,6 +339,7 @@ fn type_parse(name: &[u8]) -> Option<u16> {
 struct Info {
     name: Name,
     kind: u16,
+    parallel_callbacks: bool,
 }
 fn meta_value<'a>(meta: &'a [u8], prefix: &[u8]) -> Option<&'a [u8]> {
     let mut offset = 0;
@@ -354,9 +357,18 @@ fn info_meta(meta: &[u8], default: &[u8]) -> Option<Info> {
         log(b"[R4D] invalid R4M0 driver type\r\n");
         return None;
     };
+    let parallel_callbacks = match meta_value(meta, b"r4d.parallel_callbacks=") {
+        None => false,
+        Some(b"owned-v1") => true,
+        Some(_) => {
+            log(b"[R4D] invalid callback ownership declaration\r\n");
+            return None;
+        }
+    };
     Some(Info {
         name: Name::full(name),
         kind,
+        parallel_callbacks,
     })
 }
 fn info_bytes(data: &[u8], default: &[u8]) -> Option<Info> {
@@ -550,6 +562,7 @@ fn descriptor(
                 used: true,
                 name: Name::stored(info.name.bytes()),
                 kind: info.kind,
+                parallel_callbacks: info.parallel_callbacks,
                 module_slot,
                 init: Some(mem::transmute::<usize, Init>(init as usize)),
                 shutdown: Some(mem::transmute::<usize, Shutdown>(shutdown as usize)),
@@ -693,6 +706,9 @@ fn init_module(slot: usize, source: u8) -> u8 {
         admission::r4os_rust_driver_api_leave();
         return LOAD_FAILED;
     }
+    assert!(admission::configure_callbacks(owner, unsafe {
+        (*p).parallel_callbacks
+    }));
     let result = unsafe { init(crate::driver::api_admission::table()) };
     admission::r4os_rust_driver_api_leave();
     if result != 0 {

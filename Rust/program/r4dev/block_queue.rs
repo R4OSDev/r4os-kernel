@@ -18,6 +18,23 @@ pub unsafe extern "C" fn check(out: *mut c::ProgramKernelBlockQueueCheck) -> i32
         return 0;
     };
     let report = block_probes::check(&admission);
+    if report.status == c::kernel_block_queue_check_status_passed {
+        // Passive observations only during this explicit native diagnosis.
+        // Content, cancellation and retirement retain their separate oracles.
+        let block = crate::storage::block_workers::execution_cpus();
+        crate::boot::log_route::puts(b"WORKERCPU block=");
+        for (label, mask) in [
+            (b"".as_slice(), block.0),
+            (b" r4d_block=", block.1),
+            (b" cache_policy=", crate::fs::page_cache::worker_cpus()),
+            (b" rx_frames=", crate::net::rx_runtime::execution_cpus()),
+            (b" ipc_handlers=", crate::service::ipc::execution_cpus()),
+        ] {
+            crate::boot::log_route::puts(label);
+            crate::boot::log_route::dec(mask);
+        }
+        crate::boot::log_route::puts(b"\r\n");
+    }
     unsafe {
         out.write(report);
     }

@@ -23,6 +23,7 @@ pub struct Slot {
     pub caller_detached: bool,
     pub cancel_requested: bool,
     pub completion_override: u8,
+    pub(crate) pending_cancel_reason: u8,
     pub backend_handle: u64,
     pub completion_latch: Latch,
     pub execution_mode: u8,

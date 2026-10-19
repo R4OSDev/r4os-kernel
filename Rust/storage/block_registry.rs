@@ -46,6 +46,7 @@ pub struct Registration {
     pub writable: bool,
     pub owns_retry: bool,
     pub async_submit: bool,
+    pub parallel_callbacks: bool,
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -94,6 +95,7 @@ impl Slot {
             writable: false,
             owns_retry: false,
             async_submit: false,
+            parallel_callbacks: false,
         },
         lane: 255,
     };
@@ -222,6 +224,15 @@ pub unsafe extern "C" fn r4os_rust_block_registry_register(
     if lane == 255 {
         return false;
     }
+    // A live physical controller retains one callback admission class. After
+    // exact unregister/quiescence an old name may be reused conservatively.
+    if unsafe {
+        (*REGISTRY.0.get()).slots.iter().any(|s| {
+            s.used && s.lane == lane && s.info.parallel_callbacks != info.parallel_callbacks
+        })
+    } {
+        return false;
+    }
     if index == unsafe { (*REGISTRY.0.get()).slot_count } {
         unsafe { (*REGISTRY.0.get()).slot_count += 1 };
     }
@@ -261,6 +272,22 @@ pub unsafe extern "C" fn r4os_rust_block_registry_register(
         out.write(row.view(index))
     };
     true
+}
+pub(crate) fn controller_parallel(lane: u8) -> bool {
+    if lane >= 8 {
+        return false;
+    }
+    let _owner = Guard::acquire(1);
+    let mut found = false;
+    for slot in unsafe { &(*REGISTRY.0.get()).slots } {
+        if slot.used && slot.lane == lane {
+            if !slot.info.parallel_callbacks {
+                return false;
+            }
+            found = true;
+        }
+    }
+    found
 }
 /// # Safety
 /// Caller output is aligned exclusive C storage. Mode0 reads any used slot

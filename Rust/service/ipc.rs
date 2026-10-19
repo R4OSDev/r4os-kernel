@@ -1,4 +1,4 @@
-//! Stable channel queues, five independent BSP handler lanes and exact
+//! Stable channel queues, five BSP lanes plus bounded reviewed AP workers and exact
 //! admission/completion publication. No channel borrow spans wait or handler.
 use super::{ipc_types::*, queue};
 use crate::{
@@ -19,6 +19,8 @@ pub const MAX_CHANNELS: usize = 16;
 pub const QUEUE_DEPTH: usize = 8;
 pub const MAX_MESSAGE_SIZE: usize = 4096;
 const WORKER_COUNT: usize = 5;
+const MAX_AP_WORKERS: usize = 4;
+const MAX_WORKERS: usize = WORKER_COUNT + MAX_AP_WORKERS;
 const FOREVER: u64 = u64::MAX;
 const STAMP: monotonic::Stamp = monotonic::Stamp {
     raw: 0,
@@ -29,6 +31,7 @@ struct Message {
     meta: queue::SlotMeta,
     channel_generation: u64,
     handler: Option<Handler>,
+    parallel: bool,
     completion: Completion,
     submitted_at: monotonic::Stamp,
     started_at: monotonic::Stamp,
@@ -48,6 +51,7 @@ impl Message {
         },
         channel_generation: 0,
         handler: None,
+        parallel: false,
         completion: Completion {
             completed: 0,
             queue: WaitQueue::EMPTY,
@@ -71,6 +75,7 @@ struct Channel {
     drops: u64,
     service_name: Bytes,
     handler: Option<Handler>,
+    parallel: bool,
     handler_owner: u32,
     queue: [Message; QUEUE_DEPTH],
     lifetime: Lifetime,
@@ -101,6 +106,7 @@ impl Channel {
             len: 0,
         },
         handler: None,
+        parallel: false,
         handler_owner: 0,
         queue: [const { Message::EMPTY }; QUEUE_DEPTH],
         lifetime: Lifetime::EMPTY,
@@ -127,11 +133,12 @@ struct Channels(UnsafeCell<[Channel; MAX_CHANNELS]>);
 // boot is single BSP before tasks. No whole-channel assignment/recycling.
 unsafe impl Sync for Channels {}
 static CHANNELS: Channels = Channels(UnsafeCell::new([const { Channel::EMPTY }; MAX_CHANNELS]));
-struct Workers(UnsafeCell<[Worker; WORKER_COUNT]>);
-// SAFETY: boot publishes immutable task IDs before markReady. Each exact BSP
+struct Workers(UnsafeCell<[Worker; MAX_WORKERS]>);
+// SAFETY: boot publishes immutable task IDs before markReady. Each exact
 // worker owns cursor/response; Event has its independent scheduler admission.
 unsafe impl Sync for Workers {}
-static WORKERS: Workers = Workers(UnsafeCell::new([const { Worker::new() }; WORKER_COUNT]));
+static WORKERS: Workers = Workers(UnsafeCell::new([const { Worker::new() }; MAX_WORKERS]));
+static AP_WORKERS: AtomicU32 = AtomicU32::new(0);
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static STARTED: AtomicBool = AtomicBool::new(false);
 static WORKER_TASK_ID: AtomicU32 = AtomicU32::new(0);
@@ -143,6 +150,10 @@ static ECHO_TESTS: AtomicU64 = AtomicU64::new(0);
 static IRQ_DENIED: AtomicU64 = AtomicU64::new(0);
 static IDLE_WAITS: AtomicU64 = AtomicU64::new(0);
 static WAKES: AtomicU64 = AtomicU64::new(0);
+static EXECUTED_CPUS: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn execution_cpus() -> u64 {
+    EXECUTED_CPUS.load(Ordering::Relaxed)
+}
 pub type Handler = unsafe fn(u32, Bytes, *mut u8, usize) -> i32;
 
 fn channel(index: usize) -> *mut Channel {
@@ -150,7 +161,7 @@ fn channel(index: usize) -> *mut Channel {
     CHANNELS.0.get().cast::<Channel>().wrapping_add(index)
 }
 fn worker(index: usize) -> *mut Worker {
-    assert!(index < WORKER_COUNT);
+    assert!(index < MAX_WORKERS);
     WORKERS.0.get().cast::<Worker>().wrapping_add(index)
 }
 fn index(id: u32) -> Option<usize> {
@@ -300,6 +311,7 @@ unsafe fn reset(slot: *mut Message) {
         };
         (*slot).channel_generation = 0;
         (*slot).handler = None;
+        (*slot).parallel = false;
         (*slot).submitted_at = STAMP;
         (*slot).started_at = STAMP;
     }
@@ -318,6 +330,7 @@ unsafe fn prepare(ch: *mut Channel, slot: *mut Message, mode: u8, len: usize) {
         };
         (*slot).channel_generation = (*ch).generation;
         (*slot).handler = None;
+        (*slot).parallel = false;
         (*slot).completion = Completion {
             completed: 0,
             queue: WaitQueue::EMPTY,
@@ -326,8 +339,21 @@ unsafe fn prepare(ch: *mut Channel, slot: *mut Message, mode: u8, len: usize) {
         (*slot).started_at = STAMP;
     }
 }
+fn parallel_workers_available() -> bool {
+    AP_WORKERS.load(Ordering::Acquire) != 0 && crate::net::adapters::parallel_callbacks()
+}
 fn signal(index: usize) {
     unsafe { sync_objects::r4os_rust_sync_event(ptr::addr_of_mut!((*worker(index)).event), 0, 0) };
+    let count = AP_WORKERS.load(Ordering::Acquire) as usize;
+    if count != 0 && parallel_workers_available() {
+        unsafe {
+            sync_objects::r4os_rust_sync_event(
+                ptr::addr_of_mut!((*worker(WORKER_COUNT + index % count)).event),
+                0,
+                0,
+            )
+        };
+    }
 }
 fn current_worker() -> Option<usize> {
     let current = scheduler::current();
@@ -335,24 +361,27 @@ fn current_worker() -> Option<usize> {
         return None;
     }
     let (id, _) = unsafe { task::immutable_identity(current) };
-    (0..WORKER_COUNT).find(|&i| unsafe { (*worker(i)).task_id.load(Ordering::Acquire) == id })
+    (0..MAX_WORKERS).find(|&i| unsafe { (*worker(i)).task_id.load(Ordering::Acquire) == id })
 }
 fn start_workers() -> bool {
     if STARTED.load(Ordering::Acquire) {
         return true;
     }
-    for lane in 0..WORKER_COUNT {
+    let online = crate::arch::percpu::r4os_rust_percpu_control(14, 0, 0, 0).count_ones() as usize;
+    let capacity = WORKER_COUNT + online.saturating_sub(1).min(MAX_AP_WORKERS);
+    for lane in 0..capacity {
         if unsafe { (*worker(lane)).task_id.load(Ordering::Acquire) } != 0 {
             continue;
         }
-        let name = b"ipc-worker";
+        let parallel = lane >= WORKER_COUNT;
+        let name: &[u8] = if parallel { b"ipc-ap" } else { b"ipc-worker" };
         let input = task::task_api::CreateRequest {
             name: name.as_ptr(),
             name_len: name.len(),
             state: 3,
             role: 1,
             needs_fpu: true,
-            smp_eligible: false,
+            smp_eligible: parallel,
             smp_r4x: false,
             owner_kind: 0,
             owner_context: ptr::null_mut(),
@@ -361,6 +390,9 @@ fn start_workers() -> bool {
         let mut failure = 0;
         let created = unsafe { task::task_api::r4os_rust_task_create(&input, false, &mut failure) };
         if created.is_null() {
+            if parallel {
+                break;
+            }
             return false;
         }
         let (id, _) = unsafe { task::immutable_identity(created) };
@@ -376,6 +408,10 @@ fn start_workers() -> bool {
             );
         }
     }
+    let ap_count = (WORKER_COUNT..MAX_WORKERS)
+        .filter(|&i| unsafe { (*worker(i)).task_id.load(Ordering::Acquire) != 0 })
+        .count();
+    AP_WORKERS.store(ap_count as u32, Ordering::Release);
     WORKER_TASK_ID.store(
         unsafe { (*worker(0)).task_id.load(Ordering::Acquire) },
         Ordering::Release,
@@ -602,6 +638,7 @@ unsafe fn admit_handler(
         }
         let generation = (*ch).generation;
         let handler = (*ch).handler;
+        let parallel = (*ch).parallel;
         handler?;
         if mode == queue::QUEUED_RESPONSE {
             (*ch).lifetime.send_calls = (*ch).lifetime.send_calls.wrapping_add(1);
@@ -676,6 +713,7 @@ unsafe fn admit_handler(
         prepare(ch, slot, mode, payload.len);
         (*slot).channel_generation = (*ch).generation;
         (*slot).handler = handler;
+        (*slot).parallel = parallel;
         (*slot).submitted_at = stamp();
         if payload.len != 0 {
             ptr::copy_nonoverlapping(
@@ -1052,13 +1090,21 @@ struct WorkerTarget {
     slot: usize,
     slot_generation: u64,
     handler: Option<Handler>,
+    parallel: bool,
 }
 unsafe fn take_next(lane: usize) -> Option<WorkerTarget> {
+    let on_ap_worker = lane >= WORKER_COUNT;
+    // Native handlers still validate their exact backend at each callback;
+    // topology changes may make a previously accepted operation return Busy.
+    let parallel_backends = parallel_workers_available();
+    if on_ap_worker && !parallel_backends {
+        return None;
+    }
     unsafe {
         let cursor = (*worker(lane)).cursor;
         for offset in 0..MAX_CHANNELS {
             let i = (cursor + offset) % MAX_CHANNELS;
-            if i % WORKER_COUNT != lane {
+            if !on_ap_worker && i % WORKER_COUNT != lane {
                 continue;
             }
             let Some(mut guard) = ChannelGuard::acquire(i) else {
@@ -1073,6 +1119,13 @@ unsafe fn take_next(lane: usize) -> Option<WorkerTarget> {
                 continue;
             }
             let slot = message(ch, selection.selection.index);
+            let parallel = (*slot).parallel && parallel_backends;
+            // Original BSP lanes may help qualified work as well. A bounded
+            // AP pool must not reduce the independent waiting capacity when
+            // several DNS/TCP handlers are already blocked.
+            if on_ap_worker && !parallel {
+                continue;
+            }
             let handler = (*slot).handler;
             if handler.is_none() {
                 (*slot).meta.result = -1;
@@ -1094,6 +1147,7 @@ unsafe fn take_next(lane: usize) -> Option<WorkerTarget> {
                 slot: selection.selection.index,
                 slot_generation: (*slot).meta.generation,
                 handler,
+                parallel: (*slot).parallel,
             };
             guard.release();
             return Some(target);
@@ -1134,7 +1188,11 @@ unsafe fn run_target(lane: usize, target: WorkerTarget) {
             len: usize::from((*slot).meta.len),
         };
         let response = ptr::addr_of_mut!((*worker(lane)).response).cast();
+        let cpu = crate::arch::percpu::current_index();
         let produced = target.handler.unwrap()((*ch).id, payload, response, MAX_MESSAGE_SIZE);
+        if target.parallel && produced >= 0 {
+            EXECUTED_CPUS.fetch_or(1u64 << cpu, Ordering::Relaxed);
+        }
         let completed = stamp();
         let Some(mut guard) = ChannelGuard::acquire(target.channel) else {
             return;
@@ -1189,6 +1247,16 @@ unsafe extern "C" fn worker_main() {
     loop {
         if let Some(target) = unsafe { take_next(lane) } {
             unsafe { run_target(lane, target) };
+            // A previous BSP owner can finish after AP admission was published.
+            // Wake its queued successor only after the exact handler settled.
+            let pending = if let Some(guard) = ChannelGuard::acquire(target.channel) {
+                unsafe { select(guard.channel, 2, 0).kind != 0 }
+            } else {
+                false
+            };
+            if pending {
+                signal(target.channel % WORKER_COUNT);
+            }
             // Every handler outcome has relinquished its ChannelGuard and
             // settled its exact message/completion/permit before this point.
             // This also covers abandoned or stale early-return outcomes.
@@ -1259,7 +1327,9 @@ pub unsafe extern "C" fn r4os_rust_ipc_control(operation: u8, id: u32) -> i32 {
 }
 /// # Safety
 /// Name and typed resident handler retain their kernel lifetime.
-pub unsafe fn register(id: u32, name: Bytes, handler: Option<Handler>) -> i32 {
+/// `parallel` additionally requires an audited complete native handler path;
+/// it never admits a foreign callback missing its own backend declaration.
+pub unsafe fn register(id: u32, name: Bytes, handler: Option<Handler>, parallel: bool) -> i32 {
     unsafe {
         if deny_irq() {
             return fail();
@@ -1276,11 +1346,13 @@ pub unsafe fn register(id: u32, name: Bytes, handler: Option<Handler>) -> i32 {
         }
         if (*ch).handler.map(|f| f as usize) != handler.map(|f| f as usize)
             || !same_text((*ch).service_name, name)
+            || (*ch).parallel != parallel
         {
             (*ch).generation = next((*ch).generation);
         }
         (*ch).service_name = name;
         (*ch).handler = handler;
+        (*ch).parallel = parallel;
         0
     }
 }

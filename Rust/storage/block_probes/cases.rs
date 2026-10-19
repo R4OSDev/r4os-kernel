@@ -69,6 +69,18 @@ pub(super) fn run() -> bool {
     };
     FAST.store(fast, Ordering::Release);
     let mut ok = true;
+    // A live reviewed controller cannot silently acquire a foreign admission
+    // class. Any unexpected success is recorded and really unregistered.
+    if let Some(unexpected) = unsafe {
+        session::register_policy(config(
+            b"dispatch-test-mixed",
+            b"dispatch-test-controller-fast",
+            legacy_read,
+        ))
+    } {
+        let _ = unregister(unexpected);
+        ok = false;
+    }
     let mut slow_started = false;
     let mut fast_started = false;
     let mut fast_observed = false;
@@ -103,6 +115,7 @@ pub(super) fn run() -> bool {
         && after.bounce_allocations == before.bounce_allocations
         && after.bounce_copy_bytes == before.bounce_copy_bytes
         && ok;
+    let old_reference = reference(slow).expect("Own live slow device");
     let f = unregister(fast);
     let s = unregister(slow);
     ok = f && s && ok;
@@ -110,8 +123,76 @@ pub(super) fn run() -> bool {
     if !case(1, sync) {
         return false;
     }
+    if !case(1, legacy_fallback(old_reference)) {
+        return false;
+    }
     let asynchronous = async_dispatch();
     sync && asynchronous
+}
+fn legacy_fallback(old: crate::storage::access_state::Reference) -> bool {
+    let mut c = config(
+        b"dispatch-test-legacy",
+        b"dispatch-test-controller-fast",
+        legacy_read,
+    );
+    c.sector_count = 8;
+    c.timeout = 50;
+    c.submit = Some(legacy_submit);
+    c.cancel = Some(legacy_cancel);
+    let Some(legacy) = (unsafe { session::register_policy(c) }) else {
+        return false;
+    };
+    // Both old devices and their requesters already returned their real
+    // retirement receipts. The old AP worker stays alive but routes this new
+    // unqualified incarnation through the original BSP primary.
+    let old_rejected = !unsafe { io::read_exact(old, 0, 1, buffer(1), 512, true) };
+    FAST.store(legacy, Ordering::Release);
+    LEGACY_CPU.store(u32::MAX, Ordering::Release);
+    set(1, false);
+    unsafe {
+        buffer(1).write_bytes(0, 512);
+        EVENTS.0[3].get().write(Event::AUTO);
+    }
+    let started = !create(b"blk-test-legacy", fast_request).is_null();
+    let completed = started && done(3);
+    let joined = finish_workers();
+    let cpu = LEGACY_CPU.load(Ordering::Acquire);
+    let content = completed
+        && flag(1)
+        && unsafe { core::slice::from_raw_parts(buffer(1), 512) }
+            .iter()
+            .all(|&b| b == 0x46);
+    let mut cancelled = false;
+    if joined && content {
+        set(1, true);
+        LEGACY_CALLER_CPU.store(u32::MAX, Ordering::Release);
+        LEGACY_CANCEL_CPU.store(u32::MAX, Ordering::Release);
+        unsafe { EVENTS.0[3].get().write(Event::AUTO) };
+        let started =
+            !session::create_on(b"blk-legacy-ap-cancel", legacy_timeout, Some(1)).is_null();
+        cancelled = started && done(3);
+    }
+    let cancelled = cancelled
+        && !flag(1)
+        && LEGACY_CALLER_CPU.load(Ordering::Acquire) == 1
+        && LEGACY_CANCEL_CPU.load(Ordering::Acquire) == 0
+        && TIMEOUT_CANCELS.load(Ordering::Acquire) == 1
+        && PENDING.load(Ordering::Acquire) == 0;
+    let joined_cancel = finish_workers();
+    let removed = unregister(legacy);
+    let ok = old_rejected && joined && content && cpu == 0 && cancelled && joined_cancel && removed;
+    puts(b"BLOCKCALLBACKCHECK ");
+    puts(if ok { b"OK" } else { b"FAIL" });
+    puts(b" legacy_cpu=");
+    dec(u64::from(cpu));
+    puts(b" old_reference_rejected=");
+    dec(u64::from(old_rejected));
+    puts(b" mixed_class_rejected=1 cancel_caller_cpu=");
+    dec(u64::from(LEGACY_CALLER_CPU.load(Ordering::Acquire)));
+    puts(b" cancel_backend_cpu=");
+    dec(u64::from(LEGACY_CANCEL_CPU.load(Ordering::Acquire)));
+    puts(b"\r\n");
+    ok
 }
 fn async_result(ok: bool, b: &accounting::RuntimeSummary, a: &accounting::RuntimeSummary) -> bool {
     puts(b"BLOCKASYNCCHECK ");
@@ -300,10 +381,20 @@ fn async_dispatch() -> bool {
     if ok && !wait_submissions(4) {
         ok = false;
     }
-    if !done(8) {
+    let timeout_returned = done(8);
+    if !timeout_returned {
         ok = false;
     }
-    ok = !flag(5) && TIMEOUT_CANCELS.load(Ordering::Acquire) == 1 && ok;
+    let timeout_failed = !flag(5);
+    let timeout_cancels = TIMEOUT_CANCELS.load(Ordering::Acquire);
+    puts(b"BLOCKTIMEOUTCHECK returned=");
+    dec(u64::from(timeout_returned));
+    puts(b" failed_io=");
+    dec(u64::from(timeout_failed));
+    puts(b" cancels=");
+    dec(u64::from(timeout_cancels));
+    puts(b"\r\n");
+    ok = timeout_failed && timeout_cancels == 1 && ok;
     if !case(32, ok) {
         return async_result(false, &before, &summary());
     }

@@ -443,6 +443,7 @@ unsafe fn block_register(
         controller_len += 1
     }
     let mut config = b::Config::new(Text { data: name, len }, block_read);
+    config.parallel_callbacks = admission::callbacks_parallel();
     unsafe {
         config.driver = b::text(b"R4D");
         let bus = ptr::addr_of!((*d).bus).read();

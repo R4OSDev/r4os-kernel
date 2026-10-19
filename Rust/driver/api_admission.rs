@@ -15,7 +15,7 @@ use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
     ptr,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -32,6 +32,7 @@ pub struct CallbackToken {
 }
 struct Storage {
     owner: AtomicU32,
+    parallel_callbacks: AtomicBool,
     guard: UnsafeCell<UnwindGuard>,
     callbacks: UnsafeCell<[Callback; 8]>,
 }
@@ -41,6 +42,7 @@ struct Storage {
 unsafe impl Sync for Storage {}
 static STATE: Storage = Storage {
     owner: AtomicU32::new(0),
+    parallel_callbacks: AtomicBool::new(false),
     guard: UnsafeCell::new(UnwindGuard {
         owner: 0,
         owner_generation: 0,
@@ -93,9 +95,21 @@ pub extern "C" fn r4os_rust_driver_api_leave() -> bool {
         return false;
     }
     if unsafe { (*STATE.guard.get()).depth == 1 } {
+        STATE.parallel_callbacks.store(false, Ordering::Release);
         STATE.owner.store(0, Ordering::Relaxed);
     }
     unsafe { sync_locks::r4os_rust_sync_guard(STATE.guard.get(), 3, 0) }
+}
+/// Loader-owned immutable declaration, admitted only for this exact init scope.
+pub(crate) fn configure_callbacks(id: u32, parallel: bool) -> bool {
+    if !owned() || owner() != id {
+        return false;
+    }
+    STATE.parallel_callbacks.store(parallel, Ordering::Release);
+    true
+}
+pub(crate) fn callbacks_parallel() -> bool {
+    owned() && STATE.parallel_callbacks.load(Ordering::Acquire)
 }
 // Scalar temporary facade reads; no mutable guard or canonical owner escapes.
 #[unsafe(no_mangle)]

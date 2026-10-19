@@ -67,6 +67,7 @@ pub struct NativeAdapter {
     pub flags: u32,
     pub link: u8,
     pub lifecycle: u8,
+    pub parallel_callbacks: bool,
     pub registered_tick: u64,
     pub state_changed_tick: u64,
     pub stats: NativeAdapterStats,
@@ -89,6 +90,7 @@ impl NativeAdapter {
         flags: 5,
         link: 0,
         lifecycle: 1,
+        parallel_callbacks: false,
         registered_tick: 0,
         state_changed_tick: 0,
         stats: NativeAdapterStats::EMPTY,
@@ -156,6 +158,15 @@ unsafe fn entry(index: usize) -> Option<&'static mut NativeAdapter> {
 pub(crate) fn snapshot(index: usize) -> Option<NativeAdapter> {
     let _guard = Guard::acquire(2);
     unsafe { entry(index).copied() }
+}
+/// Derived from this same registry. Callback admission pins the enumeration
+/// through a work unit; an unknown provider keeps the original BSP path.
+pub(crate) fn parallel_callbacks() -> bool {
+    let _guard = Guard::acquire(2);
+    unsafe {
+        let s = &*state();
+        s.count != 0 && s.entries[..s.count].iter().all(|a| a.parallel_callbacks)
+    }
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_net_adapters_reset() {

@@ -15,7 +15,7 @@ struct DeviceRecord {
 pub(super) struct Session {
     pub tasks: diagnostic::Ledger<16>,
     pub controller: *mut Task,
-    devices: [DeviceRecord; 3],
+    devices: [DeviceRecord; 4],
     count: usize,
     unregistered: u64,
     pub attempted: u32,
@@ -115,8 +115,13 @@ pub(super) fn reference(index: usize) -> Option<Reference> {
     }
     None
 }
-pub(super) unsafe fn register(config: device::Config) -> Option<usize> {
-    if cancelled() || unsafe { (*session()).count } == 3 {
+pub(super) unsafe fn register(mut config: device::Config) -> Option<usize> {
+    // Only this exact diagnostic's reviewed resident backend functions enter.
+    config.parallel_callbacks = true;
+    unsafe { register_policy(config) }
+}
+pub(super) unsafe fn register_policy(config: device::Config) -> Option<usize> {
+    if cancelled() || unsafe { (*session()).count } == 4 {
         return None;
     }
     let reference = unsafe { device::register_reference(config) }?;
@@ -212,10 +217,17 @@ pub(super) fn unregister(index: usize) -> bool {
     }
 }
 pub(super) fn create(name: &'static [u8], entry: unsafe extern "C" fn()) -> *mut c_void {
+    create_on(name, entry, None)
+}
+pub(super) fn create_on(
+    name: &'static [u8],
+    entry: unsafe extern "C" fn(),
+    cpu: Option<u32>,
+) -> *mut c_void {
     if cancelled() {
         return ptr::null_mut();
     }
-    let task = unsafe { (*session()).tasks.create(name, entry, Role::Batch, None) };
+    let task = unsafe { (*session()).tasks.create(name, entry, Role::Batch, cpu) };
     if task.is_null() {
         return ptr::null_mut();
     }
@@ -369,7 +381,6 @@ pub(super) fn collect(run_id: u64) -> c::ProgramKernelBlockQueueCheck {
         cleanup_errors: unsafe { (*s).cleanup_errors },
         controllers_registered: unsafe { (*s).count as u64 },
         controllers_unregistered: unsafe { (*s).unregistered },
-        async_submissions: u64::from(SUBMISSIONS.load(Ordering::Acquire)),
         completion_receipts: u64::from(ACCEPTED.load(Ordering::Acquire)),
         duplicate_rejections: u64::from(DUPLICATE_REJECTED.load(Ordering::Acquire)),
         late_rejections: u64::from(LATE_REJECTED.load(Ordering::Acquire)),
@@ -392,6 +403,7 @@ pub(super) fn collect(run_id: u64) -> c::ProgramKernelBlockQueueCheck {
         } else {
             record.stats
         };
+        out.async_submissions += stats.async_submissions;
         out.async_completions += stats.async_completions;
         out.read_ops += stats.read_ops;
         out.write_ops += stats.write_ops;

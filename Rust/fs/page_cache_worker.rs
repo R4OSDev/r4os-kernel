@@ -8,23 +8,13 @@ use crate::{
     storage::block_registry,
 };
 use c::{COUNT, DEVICES, FULL, Held, STATS};
-use core::{ffi::c_void, ptr, sync::atomic::Ordering::Relaxed};
-#[repr(C)]
-struct Create {
-    name: *const u8,
-    name_len: usize,
-    state: u8,
-    role: u8,
-    needs_fpu: bool,
-    smp_eligible: bool,
-    smp_r4x: bool,
-    owner_kind: u8,
-    owner_context: *mut c_void,
-    entry: Option<unsafe extern "C" fn()>,
-}
-unsafe extern "C" {
-    fn r4os_rust_task_create(input: *const Create, critical: bool, failure: *mut u8)
-    -> *mut c_void;
+use core::{
+    ptr,
+    sync::atomic::{AtomicU64, Ordering::Relaxed},
+};
+static EXECUTED_CPUS: AtomicU64 = AtomicU64::new(0);
+pub(super) fn execution_cpus() -> u64 {
+    EXECUTED_CPUS.load(Relaxed)
 }
 pub(super) unsafe fn start() -> bool {
     unsafe {
@@ -32,20 +22,22 @@ pub(super) unsafe fn start() -> bool {
             return true;
         }
         let name = b"pgcache-wb";
-        let input = Create {
+        let input = task::task_api::CreateRequest {
             name: name.as_ptr(),
             name_len: name.len(),
-            state: 1,
+            state: 3,
             role: 3,
             needs_fpu: true,
-            smp_eligible: false,
+            // Original Held/Operation and queued block owners retain every
+            // entry/window/backend lifetime; no direct unaudited AP callback.
+            smp_eligible: true,
             smp_r4x: false,
             owner_kind: 0,
             owner_context: ptr::null_mut(),
             entry: Some(main),
         };
         let mut failure = 0;
-        let worker = r4os_rust_task_create(&input, false, &mut failure);
+        let worker = task::task_api::r4os_rust_task_create(&input, false, &mut failure);
         if worker.is_null() {
             return false;
         }
@@ -54,6 +46,7 @@ pub(super) unsafe fn start() -> bool {
         (*c::state()).worker_id = id;
         STATS.policy_worker_started.store(1, Relaxed);
         STATS.policy_worker_task_id.store(id, Relaxed);
+        task::task_api::r4os_rust_task_mutate(0, worker, timer::tick_count(), 0, ptr::null(), 0);
         c::signal();
         true
     }
@@ -167,7 +160,11 @@ unsafe fn background_one() -> Outcome {
             return Outcome::Failed;
         };
         let now = timer::tick_count();
-        let Some((i, dev, pressure)) = select(now) else {
+        let selected = select(now);
+        // Capture the CPU of the actual owned selection, before any backend
+        // wait or safe reschedule. Empty policy scans are explicitly included.
+        EXECUTED_CPUS.fetch_or(1u64 << crate::arch::percpu::current_index(), Relaxed);
+        let Some((i, dev, pressure)) = selected else {
             return Outcome::None;
         };
         let before = STATS.writeback_sectors.load(Relaxed);

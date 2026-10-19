@@ -78,6 +78,9 @@ pub unsafe extern "C" fn r4os_rust_pagecache_init() {
 pub unsafe extern "C" fn r4os_rust_pagecache_start() -> bool {
     unsafe { worker::start() }
 }
+pub(crate) fn worker_cpus() -> u64 {
+    worker::execution_cpus()
+}
 /// # Safety
 /// Aligned writable output receives a batch only on successful cache admission.
 #[unsafe(no_mangle)]

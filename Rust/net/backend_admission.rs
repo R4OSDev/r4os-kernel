@@ -111,6 +111,9 @@ pub(super) fn enter() -> bool {
     CALLBACKS.fetch_sub(1, Ordering::Release);
     false
 }
+pub(crate) fn callbacks_open() -> bool {
+    !CLOSED.load(Ordering::Acquire)
+}
 pub(super) fn leave() {
     CALLBACKS.fetch_sub(1, Ordering::Release);
 }

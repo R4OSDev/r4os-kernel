@@ -16,8 +16,36 @@ use crate::{
         block_registry, block_requests, block_state, block_workers, dispatch,
     },
 };
-use core::{ffi::c_void, mem::MaybeUninit, ptr};
+use core::{
+    ffi::c_void,
+    mem::MaybeUninit,
+    ptr,
+    sync::atomic::{AtomicU64, Ordering},
+};
 const SLICE: u64 = 5 * pit::DEFAULT_HZ as u64;
+// Resident wake epochs belong to the original 16 device slots. Reuse never
+// resets them; a waiter always snapshots before checking its exact request.
+// A wake before enrollment must force a retry, including a synchronous cancel
+// callback whose completion has already been consumed by another CPU.
+static WAKE_EPOCHS: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
+#[derive(Clone, Copy)]
+struct WakeEpoch {
+    index: usize,
+    observed: u64,
+}
+impl WakeEpoch {
+    fn snapshot(v: View) -> Self {
+        let index = usize::from(v.index);
+        Self {
+            index,
+            observed: WAKE_EPOCHS[index].load(Ordering::Acquire),
+        }
+    }
+}
+unsafe extern "C" fn epoch_unchanged(context: *mut c_void) -> bool {
+    let epoch = unsafe { &*context.cast::<WakeEpoch>() };
+    WAKE_EPOCHS[epoch.index].load(Ordering::Acquire) == epoch.observed
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct View {
@@ -99,17 +127,25 @@ unsafe fn lock(device: *mut c_void, v: View) -> DeviceLock {
         }
     }
 }
-unsafe fn wake(queue: *mut WaitQueue, all: bool) {
+unsafe fn wake(v: View, queue: *mut WaitQueue, all: bool) {
+    // Publish before taking Runtime for wake: its wait predicate and actual
+    // enrollment share that owner, so either the change or the wake is seen.
+    WAKE_EPOCHS[usize::from(v.index)].fetch_add(1, Ordering::Release);
     unsafe {
         sync_wait::r4os_rust_sync_queue(queue, u8::from(all), ptr::null_mut(), 0, ptr::null_mut());
     }
 }
-unsafe fn queue_wait(queue: *mut WaitQueue, timeout: u64, reason: &'static [u8]) -> u32 {
+unsafe fn queue_wait(
+    queue: *mut WaitQueue,
+    timeout: u64,
+    reason: &'static [u8],
+    mut epoch: WakeEpoch,
+) -> u32 {
     let request = WaitRequest {
         timeout,
         reason: Text::literal(reason),
-        predicate: None,
-        context: ptr::null_mut(),
+        predicate: Some(epoch_unchanged),
+        context: ptr::addr_of_mut!(epoch).cast(),
         release: None,
         release_context: ptr::null_mut(),
         flags: 0,
@@ -180,6 +216,7 @@ pub unsafe extern "C" fn r4os_rust_block_enqueue(
         clock_math::finite_deadline(start, budget)
     };
     loop {
+        let epoch = WakeEpoch::snapshot(v);
         let owner = unsafe { lock(device, v) };
         if unsafe { v.state.resetting.read() } {
             drop(owner);
@@ -236,6 +273,7 @@ pub unsafe extern "C" fn r4os_rust_block_enqueue(
                 v.slot_available,
                 if forever { u64::MAX } else { deadline - now },
                 b"block-slot",
+                epoch,
             )
         };
         if result == 1 {
@@ -394,7 +432,7 @@ unsafe fn finish(
     }
     if !transition.caller_detached {
         unsafe {
-            wake(v.completion_available, true);
+            wake(v, v.completion_available, true);
         }
         stat(v, 1, 13, 1);
         accounting::r4os_rust_block_runtime_change(1, 10, 1);
@@ -404,7 +442,7 @@ unsafe fn finish(
     if transition.caller_detached {
         unsafe {
             block_state::r4os_rust_block_slot_clear(p);
-            wake(v.slot_available, false);
+            wake(v, v.slot_available, false);
         }
     }
     drop(owner);
@@ -548,6 +586,19 @@ pub unsafe fn pump(device: *mut c_void, mode: u8) -> bool {
             scheduler::safe_reschedule();
             continue;
         }
+        let pending_cancel = {
+            let _owner = unsafe { lock(device, v) };
+            unsafe { block_state::take_cancel(v.slots) }
+        };
+        if let Some((request, reason)) = pending_cancel {
+            // Backend admission belongs to this exact controller worker. A
+            // borrowed AP buffer/caller remains retained until real completion.
+            unsafe { cancel(device, v, request, reason) };
+            worked = true;
+            steps += 1;
+            scheduler::safe_reschedule();
+            continue;
+        }
         let Some(request) = (unsafe { begin(device, v, mode) }) else {
             break;
         };
@@ -605,6 +656,19 @@ unsafe fn cancel(device: *mut c_void, v: View, request: block_state::Execution, 
     if request.backend_handle == 0 || !v.has_cancel {
         return;
     }
+    if !unsafe { crate::storage::block_device::callbacks_allowed(device) } {
+        let pending = {
+            let _owner = unsafe { lock(device, v) };
+            unsafe { block_state::defer_cancel(slot(v, request.slot_index), request, reason) }
+        };
+        if pending {
+            let lane = block_workers::r4os_rust_block_worker_lane(v.lane);
+            if lane != 255 {
+                block_workers::r4os_rust_block_worker_signal(lane);
+            }
+        }
+        return;
+    }
     stat(v, 1, 37, 1);
     accounting::r4os_rust_block_runtime_change(1, 24, 1);
     unsafe {
@@ -643,7 +707,7 @@ unsafe fn abort(device: *mut c_void, v: View, id: u64, error: u8, reason: u32) -
             }
             unsafe {
                 block_state::r4os_rust_block_slot_clear(p);
-                wake(v.slot_available, false);
+                wake(v, v.slot_available, false);
             }
             Abort::Done(result(error, false))
         }
@@ -722,6 +786,7 @@ pub(crate) unsafe fn wait_receipted(
         clock_math::finite_deadline(start, timeout)
     };
     loop {
+        let epoch = WakeEpoch::snapshot(v);
         let owner = unsafe { lock(device, v) };
         let index = unsafe { select(v, 2, id) };
         if index == usize::MAX {
@@ -771,7 +836,7 @@ pub(crate) unsafe fn wait_receipted(
         if let Some(done) = completed {
             unsafe {
                 block_state::r4os_rust_block_slot_clear(p);
-                wake(v.slot_available, false);
+                wake(v, v.slot_available, false);
             }
             return done;
         }
@@ -783,7 +848,8 @@ pub(crate) unsafe fn wait_receipted(
             continue;
         }
         if forever {
-            let wait = unsafe { queue_wait(v.completion_available, SLICE, b"block-completion") };
+            let wait =
+                unsafe { queue_wait(v.completion_available, SLICE, b"block-completion", epoch) };
             if wait == 1 {
                 continue;
             }
@@ -805,8 +871,14 @@ pub(crate) unsafe fn wait_receipted(
         let now = timer::tick_count();
         let mut waited = 2;
         if now < deadline {
-            waited =
-                unsafe { queue_wait(v.completion_available, deadline - now, b"block-completion") };
+            waited = unsafe {
+                queue_wait(
+                    v.completion_available,
+                    deadline - now,
+                    b"block-completion",
+                    epoch,
+                )
+            };
             if waited == 1 {
                 continue;
             }
@@ -823,7 +895,12 @@ pub(crate) unsafe fn wait_receipted(
                     }
                 }
                 unsafe {
-                    queue_wait(v.completion_available, SLICE, b"block-direct-completion");
+                    queue_wait(
+                        v.completion_available,
+                        SLICE,
+                        b"block-direct-completion",
+                        epoch,
+                    );
                 }
             }
         }
@@ -924,7 +1001,7 @@ pub unsafe extern "C" fn r4os_rust_block_reset(index: usize, reason: u32) -> boo
 }
 unsafe fn reset(device: *mut c_void, reason: u32) -> bool {
     let v = unsafe { view(device) };
-    if !v.has_reset {
+    if !v.has_reset || !unsafe { crate::storage::block_device::callbacks_allowed(device) } {
         return false;
     }
     let mut active: [MaybeUninit<block_state::Execution>; 16] =
@@ -962,7 +1039,7 @@ unsafe fn reset(device: *mut c_void, reason: u32) -> bool {
         }
     }
     unsafe {
-        wake(v.completion_available, true);
+        wake(v, v.completion_available, true);
     }
     drop(owner);
     for i in 0..count {
@@ -1012,8 +1089,8 @@ unsafe fn reset(device: *mut c_void, reason: u32) -> bool {
     let _lock = unsafe { lock(device, v) };
     state(v, 6, 0, 0, 0);
     unsafe {
-        wake(v.slot_available, true);
-        wake(v.completion_available, true);
+        wake(v, v.slot_available, true);
+        wake(v, v.completion_available, true);
     }
     true
 }

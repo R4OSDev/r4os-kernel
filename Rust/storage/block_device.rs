@@ -47,6 +47,7 @@ pub struct Config {
     pub owns_retry: bool,
     pub source: u8,
     pub owner: u32,
+    pub parallel_callbacks: bool,
     pub context: *mut c_void,
     pub read: Read,
     pub write: Option<Write>,
@@ -74,6 +75,7 @@ impl Config {
             owns_retry: false,
             source: 0,
             owner: 0,
+            parallel_callbacks: false,
             context: ptr::null_mut(),
             read,
             write: None,
@@ -174,6 +176,7 @@ pub(crate) unsafe fn register_reference(config: Config) -> Option<Reference> {
         writable: config.writable,
         owns_retry: config.owns_retry,
         async_submit: config.submit.is_some(),
+        parallel_callbacks: config.parallel_callbacks,
     };
     let mut slot = MaybeUninit::uninit();
     if unsafe {
@@ -241,6 +244,10 @@ pub(crate) unsafe fn execution_view(raw: *mut c_void) -> block_execution::View {
 }
 /// Registry pin and exact execution record remain admitted until completion.
 /// All callback fields/context are copied before invoking the backend.
+pub(crate) unsafe fn callbacks_allowed(raw: *mut c_void) -> bool {
+    crate::arch::percpu::current_index() == 0
+        || unsafe { ptr::addr_of!((*raw.cast::<Device>()).config.parallel_callbacks).read() }
+}
 pub(crate) unsafe fn backend(
     raw: *mut c_void,
     request: *const block_state::Execution,
@@ -248,7 +255,13 @@ pub(crate) unsafe fn backend(
     reason: u32,
 ) -> i32 {
     let config = unsafe { ptr::addr_of!((*raw.cast::<Device>()).config).read() };
-    unsafe {
+    let cpu = crate::arch::percpu::current_index();
+    // Ordinary AP callers queue through their exact controller worker. An
+    // unavailable worker must not turn an unaudited callback into inline AP I/O.
+    if !unsafe { callbacks_allowed(raw) } {
+        return if operation <= 3 { 0 } else { -1 };
+    }
+    let result = unsafe {
         match operation {
             1 => {
                 let r = request.read();
@@ -294,7 +307,11 @@ pub(crate) unsafe fn backend(
             6 => config.reset.expect("block reset")(config.context, reason),
             _ => unreachable!(),
         }
+    };
+    if (operation <= 3 && result != 0) || (operation == 4 && result == 0) {
+        block_workers::note_backend(cpu, config.owner != 0 && config.parallel_callbacks);
     }
+    result
 }
 fn label_copy(out: &mut [u8; 32], text: Text) {
     out.fill(0);

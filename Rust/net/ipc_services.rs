@@ -826,6 +826,7 @@ unsafe fn net_ipc_register(id: u32) {
                 len: name.len(),
             },
             Some(native_handler),
+            true,
         );
     }
 }

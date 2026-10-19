@@ -13,6 +13,7 @@ use core::{
 #[derive(Clone, Copy)]
 struct Record {
     used: bool,
+    parallel_callbacks: bool,
     owner: u32,
     registration: u32,
     name: [u8; 32],
@@ -24,6 +25,7 @@ impl Record {
     fn empty() -> Self {
         Self {
             used: false,
+            parallel_callbacks: false,
             owner: 0,
             registration: 0,
             name: [0; 32],
@@ -70,6 +72,9 @@ fn find_adapter(index: usize) -> Option<Record> {
     } else {
         find_registration(i32::try_from(id).expect("Original non-reused Net registration"))
     }
+}
+fn callback_allowed(record: Record) -> bool {
+    crate::arch::percpu::current_index() == 0 || record.parallel_callbacks
 }
 #[repr(C)]
 struct Offer {
@@ -157,6 +162,7 @@ pub unsafe extern "C" fn r4os_rust_driver_net_register(
     r.used = true;
     r.owner = admission::r4os_rust_driver_api_owner_scalar(0);
     r.descriptor = d;
+    r.parallel_callbacks = admission::callbacks_parallel();
     r.negotiation = selected;
     while r.name_len < 31 && unsafe { *name.add(r.name_len) } != 0 {
         r.name[r.name_len] = unsafe { *name.add(r.name_len) };
@@ -164,7 +170,15 @@ pub unsafe extern "C" fn r4os_rust_driver_net_register(
     }
     let p = unsafe { raw().add(i) };
     unsafe { ptr::write(p, r) };
-    let index = unsafe { net_register(ptr::addr_of!((*p).name).cast(), r.name_len, d, &selected) };
+    let index = unsafe {
+        net_register(
+            ptr::addr_of!((*p).name).cast(),
+            r.name_len,
+            d,
+            &selected,
+            r.parallel_callbacks,
+        )
+    };
     if index < 0 {
         unsafe { ptr::write(p, Record::empty()) };
         puts(b"[R4D][ERROR] net core adapter table full\r\n");
@@ -230,6 +244,9 @@ pub unsafe extern "C" fn r4os_rust_driver_net_transmit(
     let Some(r) = find_adapter(index) else {
         return 6;
     };
+    if !callback_allowed(r) {
+        return 3;
+    }
     let Some(tx) = (unsafe { (*r.descriptor).transmit }) else {
         return 5;
     };
@@ -245,6 +262,7 @@ pub unsafe extern "C" fn r4os_rust_driver_net_transmit(
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_net_poll(index: usize) {
     if let Some(r) = find_adapter(index)
+        && callback_allowed(r)
         && let Some(poll) = unsafe { (*r.descriptor).poll }
     {
         unsafe { poll((*r.descriptor).context) };
@@ -260,6 +278,9 @@ pub unsafe extern "C" fn r4os_rust_driver_net_status(
     let Some(r) = find_adapter(index) else {
         return -1;
     };
+    if !callback_allowed(r) {
+        return -3;
+    }
     let Some(status) = (unsafe { (*r.descriptor).status }) else {
         return -2;
     };
@@ -499,6 +520,7 @@ unsafe fn net_register(
     len: usize,
     d: *const a::NetBackend,
     selected: *const a::NetBackendNegotiation,
+    parallel_callbacks: bool,
 ) -> isize {
     unsafe {
         use crate::net::adapters::{NativeAdapter, NativeAdapterOps};
@@ -520,6 +542,7 @@ unsafe fn net_register(
             mtu: d.mtu,
             flags: 1 | if d.flags & 2 != 0 { 4 } else { 0 },
             backend: selected.read(),
+            parallel_callbacks,
             link: u8::from(d.flags & 1 != 0),
             ops: NativeAdapterOps {
                 transmit: if d.transmit.is_some() {

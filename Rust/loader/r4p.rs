@@ -9,13 +9,15 @@ use crate::{
     driver::{protocol_api as ppi, protocol_registry as registry},
     fs::{request, vfs, vfs_types as t},
     memory::heap,
-    sched::scheduler,
+    sched::{
+        sync_locks,
+        sync_types::{Text as GuardText, UnwindGuard, WaitQueue},
+    },
 };
 use core::{
     cell::UnsafeCell,
     mem::{self, MaybeUninit},
     ptr, slice,
-    sync::atomic::{AtomicU8, Ordering},
 };
 const N: usize = 32;
 const DEP: usize = 16;
@@ -137,7 +139,40 @@ static DATA: Owner = Owner(UnsafeCell::new(Data {
     cataloged_candidates: 0,
     demand_loads: 0,
 }));
-static GATE: AtomicU8 = AtomicU8::new(0);
+const CALL_OWNER: UnwindGuard = UnwindGuard {
+    owner: 0,
+    owner_generation: 0,
+    boot_owner: false,
+    depth: 0,
+    name: GuardText::literal(b"r4p-call"),
+    queue: WaitQueue::EMPTY,
+};
+struct CallOwners(UnsafeCell<[UnwindGuard; N]>);
+// Only the native exact task/generation-bound guard mutates each record.
+unsafe impl Sync for CallOwners {}
+static CALLS: CallOwners = CallOwners(UnsafeCell::new([const { CALL_OWNER }; N]));
+struct ActivationOwner(UnsafeCell<UnwindGuard>);
+unsafe impl Sync for ActivationOwner {}
+static ACTIVATION: ActivationOwner = ActivationOwner(UnsafeCell::new(CALL_OWNER));
+struct Serial(*mut UnwindGuard);
+impl Serial {
+    fn acquire(owner: *mut UnwindGuard) -> Option<Self> {
+        crate::memory::owner::prepare_stack();
+        unsafe { sync_locks::guard_enter(owner, u64::MAX) }.then(|| Self(owner))
+    }
+    fn module(index: usize) -> Option<Self> {
+        assert!(index < N);
+        Self::acquire(unsafe { CALLS.0.get().cast::<UnwindGuard>().add(index) })
+    }
+}
+impl Drop for Serial {
+    fn drop(&mut self) {
+        assert!(
+            unsafe { sync_locks::guard_leave(self.0) },
+            "Exact R4P call owner"
+        );
+    }
+}
 
 fn now() -> u64 {
     super::performance::now()
@@ -173,6 +208,18 @@ fn md(i: usize) -> *mut Module {
             .cast::<Module>()
             .add(i)
     }
+}
+fn module_snapshot(index: usize) -> Module {
+    let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+    unsafe { md(index).read() }
+}
+fn publish_module(index: usize, value: Module) {
+    let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+    unsafe { md(index).write(value) };
+}
+fn mark_initialized(index: usize) {
+    let _runtime = crate::arch::runtime::RuntimeGuard::acquire();
+    unsafe { (*md(index)).initialized = true };
 }
 fn cd(i: usize) -> *mut Candidate {
     unsafe {
@@ -282,14 +329,14 @@ fn catalog_slot(role: &[u8]) -> Option<usize> {
 }
 fn active(role: &[u8]) -> Option<usize> {
     for i in 0..N {
-        let p = md(i);
-        if unsafe { !(*p).used || !(*p).initialized } {
+        let module = module_snapshot(i);
+        if !module.used || !module.initialized {
             continue;
         }
-        if !same(unsafe { (*p).info.role.bytes() }, role) {
+        if !same(module.info.role.bytes(), role) {
             continue;
         }
-        if let Some(entry) = reg_get(unsafe { (*p).registry_slot })
+        if let Some(entry) = reg_get(module.registry_slot)
             && module_source(entry.source)
             && entry.state == 2
         {
@@ -314,7 +361,7 @@ fn ensure_initialized() {
     registry::r4os_rust_protocol_registry_reset();
     for i in 0..N {
         unsafe {
-            ptr::write(md(i), Module::EMPTY);
+            publish_module(i, Module::EMPTY);
             ptr::write(cd(i), Candidate::EMPTY);
         }
     }
@@ -326,7 +373,6 @@ fn ensure_initialized() {
         (*DATA.0.get()).cataloged_candidates = 0;
         (*DATA.0.get()).demand_loads = 0;
     }
-    GATE.store(0, Ordering::Relaxed);
     unsafe {
         (*DATA.0.get()).initialized = true;
     }
@@ -611,18 +657,16 @@ fn load_bytes_info(data: &[u8], info: Info, name: &[u8], path: &[u8], source: u8
     let Some(module_slot) = prepared.commit() else {
         return false;
     };
-    unsafe {
-        ptr::write(
-            md(slot),
-            module(
-                info,
-                source,
-                module_slot,
-                registry_slot,
-                [init, shutdown, query, dispatch],
-            ),
-        )
-    };
+    publish_module(
+        slot,
+        module(
+            info,
+            source,
+            module_slot,
+            registry_slot,
+            [init, shutdown, query, dispatch],
+        ),
+    );
     true
 }
 fn catalog(source: file::Source, name: &[u8]) -> bool {
@@ -729,17 +773,17 @@ fn load_candidate(index: usize) -> Option<usize> {
     let query = prepared.export(b"ProtocolQuery")?;
     let dispatch = prepared.export(b"ProtocolDispatch")?;
     let module_slot = prepared.commit()?;
+    publish_module(
+        slot,
+        module(
+            info,
+            1,
+            module_slot,
+            registry_slot,
+            [init, shutdown, query, dispatch],
+        ),
+    );
     unsafe {
-        ptr::write(
-            md(slot),
-            module(
-                info,
-                1,
-                module_slot,
-                registry_slot,
-                [init, shutdown, query, dispatch],
-            ),
-        );
         (*p).module_index = Some(slot);
     }
     Some(slot)
@@ -761,6 +805,10 @@ fn init_module(index: usize) {
     let role = unsafe { (*p).info.role };
     let source = unsafe { (*p).source };
     let slot = unsafe { (*p).registry_slot };
+    let Some(_call) = Serial::module(index) else {
+        mutate(slot, 1, 0, -5, b"call owner unavailable");
+        return;
+    };
     report(b"[R4P] load ", name.bytes(), b" role=");
     log(role.bytes());
     log(b" source=");
@@ -771,9 +819,13 @@ fn init_module(index: usize) {
         return;
     };
     let start = now();
-    ppi::r4os_rust_protocol_slot(0, slot);
-    let result = unsafe { init(ppi::r4os_rust_protocol_table()) };
-    ppi::r4os_rust_protocol_slot(1, 0);
+    let result = {
+        let Some(_scope) = ppi::Execution::enter(slot) else {
+            mutate(slot, 1, 0, -5, b"execution scope unavailable");
+            return;
+        };
+        unsafe { init(ppi::r4os_rust_protocol_table()) }
+    };
     super::performance::add_r4p_init_ticks(start);
     if result != 0 {
         mutate(slot, 1, 0, result, b"init failed");
@@ -788,9 +840,13 @@ fn init_module(index: usize) {
         mutate(slot, 3, 0, 0, b"active; query export missing");
         return;
     };
-    ppi::r4os_rust_protocol_slot(0, slot);
-    let q = unsafe { query(&mut status) };
-    ppi::r4os_rust_protocol_slot(1, 0);
+    let q = {
+        let Some(_scope) = ppi::Execution::enter(slot) else {
+            mutate(slot, 1, 0, -5, b"query scope unavailable");
+            return;
+        };
+        unsafe { query(&mut status) }
+    };
     if q == 0 {
         mutate(slot, 4, status.state, 0, &status.note[..zlen(&status.note)]);
     } else {
@@ -842,9 +898,7 @@ fn resolve_init() {
                     -5,
                     b"dependency missing",
                 );
-                unsafe {
-                    (*p).initialized = true;
-                }
+                mark_initialized(i);
                 progress = true;
             } else if state == 3 {
                 mutate(
@@ -854,15 +908,11 @@ fn resolve_init() {
                     -5,
                     b"dependency blocked",
                 );
-                unsafe {
-                    (*p).initialized = true;
-                }
+                mark_initialized(i);
                 progress = true;
             } else if state == 0 {
                 init_module(i);
-                unsafe {
-                    (*p).initialized = true;
-                }
+                mark_initialized(i);
                 progress = true;
             }
         }
@@ -877,9 +927,7 @@ fn resolve_init() {
                 -5,
                 b"dependency cycle or unresolved dependency",
             );
-            unsafe {
-                (*p).initialized = true;
-            }
+            mark_initialized(i);
         }
     }
     super::performance::add_r4p_resolve_ticks(start);
@@ -907,8 +955,8 @@ fn activate(index: usize, depth: usize) -> u8 {
                 _ => b"dependency blocked".as_slice(),
             };
             mutate(unsafe { (*m).registry_slot }, 2, 0, -5, note);
+            mark_initialized(slot);
             unsafe {
-                (*m).initialized = true;
                 (*p).state = 2;
             }
             refresh();
@@ -916,8 +964,8 @@ fn activate(index: usize, depth: usize) -> u8 {
         }
     }
     init_module(slot);
+    mark_initialized(slot);
     unsafe {
-        (*m).initialized = true;
         (*p).state = 2;
     }
     refresh();
@@ -966,28 +1014,13 @@ fn ensure_serial(role: &[u8], depth: usize) -> bool {
     }
     false
 }
-struct Activation;
-impl Activation {
-    fn acquire() -> Self {
-        while GATE
-            .compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            scheduler::yield_task();
-        }
-        Self
-    }
-}
-impl Drop for Activation {
-    fn drop(&mut self) {
-        GATE.store(0, Ordering::Release);
-    }
-}
 fn ensure_active(role: &[u8]) -> bool {
     if active(role).is_some() {
         return true;
     }
-    let _gate = Activation::acquire();
+    let Some(_gate) = Serial::acquire(ACTIVATION.0.get()) else {
+        return false;
+    };
     ensure_serial(role, 0)
 }
 fn load_all() {
@@ -1099,6 +1132,9 @@ pub struct RoleStatus {
 /// Original linear boot or first shell catalog admission; no concurrent reset.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_r4p_load_all() {
+    let Some(_gate) = Serial::acquire(ACTIVATION.0.get()) else {
+        return;
+    };
     load_all()
 }
 /// # Safety
@@ -1147,15 +1183,17 @@ pub unsafe extern "C" fn r4os_rust_r4p_dispatch(
     let Some(slot) = active(role) else {
         return -5;
     };
-    let m = md(slot);
-    let Some(dispatch) = (unsafe { (*m).dispatch }) else {
+    let m = module_snapshot(slot);
+    let Some(dispatch) = m.dispatch else {
         return -4;
     };
-    let registry_slot = unsafe { (*m).registry_slot };
-    ppi::r4os_rust_protocol_slot(0, registry_slot);
-    let result = unsafe { dispatch(op, input, output) };
-    ppi::r4os_rust_protocol_slot(1, 0);
-    result
+    let Some(_call) = Serial::module(slot) else {
+        return -5;
+    };
+    let Some(_scope) = ppi::Execution::enter(m.registry_slot) else {
+        return -5;
+    };
+    unsafe { dispatch(op, input, output) }
 }
 /// # Safety
 /// Exact resident role through potential lazy I/O, dependency and module work.
