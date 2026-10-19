@@ -1,4 +1,4 @@
-//! Named, read-only local operations for external hardware owners. There is
+//! Named local operations for external hardware owners. There is
 //! no caller-supplied MSR address and no speculative model-register scan.
 use super::{
     cpu_capabilities::{self as catalog, LocalIrq, Snapshot, bit},
@@ -63,6 +63,17 @@ impl Session {
         let _irq = LocalIrq::acquire();
         let s = self.current()?;
         let (msr, name) = select(&s, id).ok_or(c::cpu_capabilities_error_unsupported)?;
+        if matches!(
+            id,
+            c::cpu_register_id_intel_hwp_capabilities
+                | c::cpu_register_id_intel_hwp_request
+                | c::cpu_register_id_intel_hwp_package
+        ) && unsafe { safe_msr::read_exact(self.index, self.epoch, 0x770) }
+            .map_err(register_error)?
+            != 1
+        {
+            return Err(c::cpu_capabilities_error_unsupported);
+        }
         // Local IDT and exact epoch come from real boot qualification. Select
         // established the architectural feature or exact verified model.
         // Intel's signature latch is read through its exact architectural
@@ -85,6 +96,60 @@ impl Session {
             ..Default::default()
         };
         out.name[..name.len()].copy_from_slice(name);
+        Ok(out)
+    }
+    pub(crate) fn compare_write(
+        &self,
+        token: u64,
+        id: u32,
+        expected: u64,
+        requested: u64,
+    ) -> Result<c::CpuRegisterWriteInfo, i32> {
+        let _irq = LocalIrq::acquire();
+        let s = self.current()?;
+        let (msr, _) = select(&s, id).ok_or(c::cpu_capabilities_error_unsupported)?;
+        if !writable(&s, id, expected, requested) {
+            return Err(c::cpu_capabilities_error_unsupported);
+        }
+        if id == c::cpu_register_id_intel_hwp_request
+            && unsafe { safe_msr::read_exact(self.index, self.epoch, 0x770) }
+                .map_err(register_error)?
+                != 1
+        {
+            return Err(c::cpu_capabilities_error_unsupported);
+        }
+        let before =
+            unsafe { safe_msr::read_exact(self.index, self.epoch, msr) }.map_err(register_error)?;
+        let mut out = c::CpuRegisterWriteInfo {
+            cpu_index: self.index,
+            register_id: id,
+            epoch: self.epoch,
+            lease: token,
+            expected,
+            requested,
+            observed_before: before,
+            flags: c::cpu_register_write_flag_before,
+            ..Default::default()
+        };
+        if before != expected {
+            out.last_error = c::cpu_capabilities_error_busy;
+            return Ok(out);
+        }
+        out.flags |= c::cpu_register_write_flag_attempted;
+        match unsafe { safe_msr::write_exact(self.index, self.epoch, msr, requested) } {
+            Ok(()) => out.flags |= c::cpu_register_write_flag_written,
+            Err(reason) => out.last_error = register_error(reason),
+        }
+        match unsafe { safe_msr::read_exact(self.index, self.epoch, msr) } {
+            Ok(value) => {
+                out.observed_after = value;
+                out.flags |= c::cpu_register_write_flag_after;
+                if value != requested && out.last_error == 0 {
+                    out.last_error = c::cpu_capabilities_error_busy;
+                }
+            }
+            Err(reason) => out.last_error = register_error(reason),
+        }
         Ok(out)
     }
     pub(crate) fn check(&self) -> Result<c::ProgramKernelCpuRegisterCheck, i32> {
@@ -188,6 +253,46 @@ fn native_milan_b1(s: &Snapshot) -> bool {
         && bit(&s.raw, 1, 0, 2, 31) == Some(false)
         && s.raw.signature() == Some((0x19, 1, 1))
 }
+fn native_skylake_hwp(s: &Snapshot) -> bool {
+    s.raw.vendor() == *b"GenuineIntel"
+        && bit(&s.raw, 1, 0, 2, 31) == Some(false)
+        && s.raw.signature().is_some_and(|(family, model, _)| family == 6 && matches!(model, 0x4e | 0x5e))
+        && bit(&s.raw, 6, 0, 0, 7) == Some(true)
+        // PECI overrides, posted fast access and later package polarity are
+        // separate models/contracts. Never guess effective ownership there.
+        && [16, 18, 22].iter().all(|&b| bit(&s.raw, 6, 0, 0, b) == Some(false))
+}
+fn writable(s: &Snapshot, id: u32, expected: u64, requested: u64) -> bool {
+    if !native_skylake_hwp(s) {
+        return false;
+    }
+    match id {
+        c::cpu_register_id_intel_hwp_enable => expected == 0 && requested == 1,
+        c::cpu_register_id_intel_hwp_request => {
+            let raw = &s.raw;
+            let epp = if bit(raw, 6, 0, 0, 10) == Some(true) {
+                0xff00_0000
+            } else {
+                0
+            };
+            let fields = 0x00ff_ffff | epp;
+            let mut known = fields;
+            if bit(raw, 6, 0, 0, 9) == Some(true) {
+                known |= 0x3ffu64 << 32;
+            }
+            if bit(raw, 6, 0, 0, 11) == Some(true) {
+                known |= 1u64 << 42;
+            }
+            if bit(raw, 6, 0, 0, 17) == Some(true) {
+                known |= 0x1fu64 << 59;
+            }
+            expected & !known == 0
+                && expected & (1u64 << 42) == 0
+                && (expected ^ requested) & !fields == 0
+        }
+        _ => false,
+    }
+}
 /// Pure whitelist. Optional feature absence, other models and unknown vendors
 /// cannot be promoted merely because RDMSR exists or the CPU brand looks alike.
 fn select(s: &Snapshot, id: u32) -> Option<(u32, &'static [u8])> {
@@ -255,6 +360,20 @@ fn select(s: &Snapshot, id: u32) -> Option<(u32, &'static [u8])> {
         }
         c::cpu_register_id_amd_core_energy if native_milan_b1(s) => {
             Some((0xc001_029a, b"amd-core-energy"))
+        }
+        c::cpu_register_id_intel_hwp_enable if native_skylake_hwp(s) => {
+            Some((0x770, b"intel-hwp-enable"))
+        }
+        c::cpu_register_id_intel_hwp_capabilities if native_skylake_hwp(s) => {
+            Some((0x771, b"intel-hwp-caps"))
+        }
+        c::cpu_register_id_intel_hwp_request if native_skylake_hwp(s) => {
+            Some((0x774, b"intel-hwp-request"))
+        }
+        c::cpu_register_id_intel_hwp_package
+            if native_skylake_hwp(s) && bit(raw, 6, 0, 0, 11) == Some(true) =>
+        {
+            Some((0x772, b"intel-hwp-package"))
         }
         _ => None,
     }

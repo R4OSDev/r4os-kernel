@@ -1,7 +1,7 @@
-//! External CPU observation routing and exact callback lifetime only. Model
-//! policy, samples and unit decoding belong to CPUPOWER.R4D.
+//! External CPU observation/control routing and exact callback/hardware lifetime.
+//! Model policy, parameters, snapshots and actual restoration belong to CPUPOWER.
 use crate::{
-    arch::runtime::RuntimeGuard,
+    arch::{cpu_lifecycle as life, runtime::RuntimeGuard},
     contract as c,
     driver::{api_admission as admission, heap},
     platform::{cpu_capabilities as catalog, cpu_registers::Session, monotonic},
@@ -15,12 +15,23 @@ struct Binding {
     epoch: u64,
     cookie: u64,
     backend: c::CpuPowerBackend,
+    performance: Option<c::CpuPerformanceBackend>,
+}
+struct Control {
+    owner: u32,
+    owner_epoch: u64,
+    cpu_epoch: u64,
+    token: u64,
+    active: bool,
+    _membership: life::ProbeLease,
 }
 struct Metadata {
     binding: Option<Binding>,
     next_cookie: u64,
     active: u32,
     closing: bool,
+    controls: [Option<Control>; 64],
+    next_control: u64,
 }
 struct Storage(UnsafeCell<Metadata>);
 // All metadata transitions/copies use RuntimeGuard. No borrowed metadata or
@@ -31,6 +42,8 @@ static STATE: Storage = Storage(UnsafeCell::new(Metadata {
     next_cookie: 1,
     active: 0,
     closing: false,
+    controls: [const { None }; 64],
+    next_control: 1,
 }));
 
 pub(crate) fn owner_identity(allow_closing: bool) -> Option<(u32, u64)> {
@@ -82,6 +95,7 @@ pub(crate) fn register(backend: c::CpuPowerBackend) -> Result<u64, i32> {
         epoch,
         cookie,
         backend,
+        performance: None,
     });
     state.closing = false;
     Ok(cookie)
@@ -98,7 +112,7 @@ pub(crate) fn unregister(cookie: u64) -> i32 {
     if cookie == 0 || (binding.owner, binding.epoch, binding.cookie) != (owner, epoch, cookie) {
         return c::cpu_capabilities_error_epoch;
     }
-    if state.active != 0 {
+    if state.active != 0 || state.controls.iter().any(Option::is_some) {
         return c::cpu_capabilities_error_busy;
     }
     state.closing = true;
@@ -112,7 +126,7 @@ pub(crate) fn prepare_close(owner: u32) -> bool {
     if !state.binding.is_some_and(|b| b.owner == owner) {
         return true;
     }
-    if state.active != 0 {
+    if state.active != 0 || state.controls.iter().any(Option::is_some) {
         return false;
     }
     state.closing = true;
@@ -131,11 +145,145 @@ pub(crate) fn finish_close(owner: u32) -> bool {
     if !state.binding.is_some_and(|b| b.owner == owner) {
         return true;
     }
-    if !state.closing || state.active != 0 {
+    if !state.closing || state.active != 0 || state.controls.iter().any(Option::is_some) {
         return false;
     }
     state.binding = None;
     true
+}
+pub(crate) fn register_performance(cookie: u64, backend: c::CpuPerformanceBackend) -> i32 {
+    if backend.version != 1
+        || backend.size < mem::size_of::<c::CpuPerformanceBackend>() as u32
+        || backend.execute == 0
+        || backend.flags != c::cpu_power_backend_flag_parallel
+        || backend.reserved0 != 0
+    {
+        return c::cpu_capabilities_error_invalid;
+    }
+    let Some(identity) = lifecycle_identity() else {
+        return c::cpu_capabilities_error_context;
+    };
+    if owner_identity(false) != Some(identity) {
+        return c::cpu_capabilities_error_context;
+    }
+    let _runtime = RuntimeGuard::acquire();
+    let state = unsafe { &mut *STATE.0.get() };
+    let Some(binding) = state.binding.as_mut() else {
+        return c::cpu_capabilities_error_epoch;
+    };
+    if cookie == 0
+        || (binding.owner, binding.epoch, binding.cookie) != (identity.0, identity.1, cookie)
+    {
+        return c::cpu_capabilities_error_epoch;
+    }
+    if state.closing || state.active != 0 || binding.performance.is_some() {
+        return c::cpu_capabilities_error_busy;
+    }
+    binding.performance = Some(backend);
+    0
+}
+/// Called only with the caller's current-CPU Session already retained. This
+/// independent resident membership survives callback return/caller cancellation.
+pub(crate) fn control_acquire(cpu: u32, epoch: u64) -> Result<u64, i32> {
+    let identity = owner_identity(false).ok_or(c::cpu_capabilities_error_context)?;
+    let membership = life::probe_lease().ok_or(c::cpu_capabilities_error_busy)?;
+    let _runtime = RuntimeGuard::acquire();
+    let state = unsafe { &mut *STATE.0.get() };
+    if !state
+        .binding
+        .is_some_and(|b| (b.owner, b.epoch) == identity && b.performance.is_some())
+        || state.closing
+    {
+        return Err(c::cpu_capabilities_error_context);
+    }
+    let slot = state
+        .controls
+        .get_mut(cpu as usize)
+        .ok_or(c::cpu_capabilities_error_index)?;
+    if slot.is_some() {
+        return Err(c::cpu_capabilities_error_busy);
+    }
+    let token = state.next_control;
+    state.next_control = token.checked_add(1).ok_or(c::cpu_capabilities_error_busy)?;
+    *slot = Some(Control {
+        owner: identity.0,
+        owner_epoch: identity.1,
+        cpu_epoch: epoch,
+        token,
+        active: false,
+        _membership: membership,
+    });
+    Ok(token)
+}
+pub(crate) fn control_release(cpu: u32, epoch: u64, token: u64) -> i32 {
+    let Some(identity) = owner_identity(false) else {
+        return c::cpu_capabilities_error_context;
+    };
+    let _runtime = RuntimeGuard::acquire();
+    let state = unsafe { &mut *STATE.0.get() };
+    let Some(slot) = state.controls.get_mut(cpu as usize) else {
+        return c::cpu_capabilities_error_index;
+    };
+    let Some(control) = slot.as_ref() else {
+        return c::cpu_capabilities_error_epoch;
+    };
+    if token == 0
+        || (
+            control.owner,
+            control.owner_epoch,
+            control.cpu_epoch,
+            control.token,
+        ) != (identity.0, identity.1, epoch, token)
+    {
+        return c::cpu_capabilities_error_epoch;
+    }
+    if control.active {
+        return c::cpu_capabilities_error_busy;
+    }
+    *slot = None;
+    0
+}
+pub(crate) struct ControlCall {
+    cpu: u32,
+    token: u64,
+}
+impl ControlCall {
+    pub(crate) fn acquire(cpu: u32, epoch: u64, token: u64) -> Result<Self, i32> {
+        let identity = owner_identity(false).ok_or(c::cpu_capabilities_error_context)?;
+        let _runtime = RuntimeGuard::acquire();
+        let state = unsafe { &mut *STATE.0.get() };
+        let control = state
+            .controls
+            .get_mut(cpu as usize)
+            .and_then(Option::as_mut)
+            .ok_or(c::cpu_capabilities_error_epoch)?;
+        if token == 0
+            || (
+                control.owner,
+                control.owner_epoch,
+                control.cpu_epoch,
+                control.token,
+            ) != (identity.0, identity.1, epoch, token)
+        {
+            return Err(c::cpu_capabilities_error_epoch);
+        }
+        if state.closing || control.active {
+            return Err(c::cpu_capabilities_error_busy);
+        }
+        control.active = true;
+        Ok(Self { cpu, token })
+    }
+}
+impl Drop for ControlCall {
+    fn drop(&mut self) {
+        let _runtime = RuntimeGuard::acquire();
+        let state = unsafe { &mut *STATE.0.get() };
+        let control = state.controls[self.cpu as usize]
+            .as_mut()
+            .expect("live CPU control");
+        assert!(control.token == self.token && control.active);
+        control.active = false;
+    }
 }
 struct Lease(Binding);
 impl Lease {
@@ -309,4 +457,63 @@ pub(crate) unsafe extern "C" fn info(cpu: u32, epoch: u64, out: *mut c::CpuPower
 /// Same output contract; explicit admitted local task/CPU epoch is required.
 pub(crate) unsafe extern "C" fn capture(cpu: u32, epoch: u64, out: *mut c::CpuPowerInfo) -> i32 {
     unsafe { observe(cpu, epoch, out, true) }
+}
+/// # Safety
+/// Resident initialized fixed input and exclusive output/tail for this call.
+/// A completed hardware attempt is represented by its receipt, not discarded
+/// because its readback failed or because the caller later abandons the token.
+pub(crate) unsafe extern "C" fn performance(
+    request: *const c::CpuPerformanceRequest,
+    out: *mut c::CpuPerformanceInfo,
+) -> i32 {
+    if request.is_null()
+        || !request.is_aligned()
+        || out.is_null()
+        || !out.is_aligned()
+        || unsafe {
+            (*request).version != 1
+                || (*request).size < mem::size_of::<c::CpuPerformanceRequest>() as u32
+                || (*out).version != 1
+                || (*out).size < mem::size_of::<c::CpuPerformanceInfo>() as u32
+        }
+    {
+        return c::cpu_capabilities_error_invalid;
+    }
+    let request = unsafe { request.read() };
+    let _session = match Session::acquire(request.cpu_index, request.epoch) {
+        Ok(session) => session,
+        Err(reason) => return reason,
+    };
+    let lease = match Lease::acquire() {
+        Ok(Some(lease)) => lease,
+        Ok(None) => return c::cpu_capabilities_error_unsupported,
+        Err(reason) => return reason,
+    };
+    let Some(backend) = lease.0.performance else {
+        return c::cpu_capabilities_error_unsupported;
+    };
+    let Some(_callback) = Callback::acquire(lease.0.owner) else {
+        return c::cpu_capabilities_error_busy;
+    };
+    type Execute = unsafe extern "C" fn(
+        usize,
+        *const c::CpuPerformanceRequest,
+        *mut c::CpuPerformanceInfo,
+    ) -> i32;
+    let execute: Execute = unsafe { mem::transmute(backend.execute as usize) };
+    let mut value = c::CpuPerformanceInfo::default();
+    let result = unsafe { execute(backend.context as usize, &request, &mut value) };
+    if result != 0 {
+        return result;
+    }
+    if value.version != 1
+        || value.size != mem::size_of::<c::CpuPerformanceInfo>() as u32
+        || value.cpu_index != request.cpu_index
+        || value.epoch != request.epoch
+    {
+        return c::cpu_capabilities_error_invalid;
+    }
+    value.provider_generation = lease.0.cookie;
+    unsafe { out.write(value) };
+    0
 }

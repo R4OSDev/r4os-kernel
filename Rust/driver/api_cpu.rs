@@ -33,11 +33,7 @@ pub(crate) unsafe extern "C" fn query(out: *mut c::DriverCpuPowerApi) -> i32 {
     if !admitted() || admission::r4os_rust_driver_api_owner_scalar(1) == 0 {
         return c::cpu_capabilities_error_context;
     }
-    let bytes = if capacity >= mem::size_of::<c::DriverCpuPowerApi>() as u32 {
-        mem::size_of::<c::DriverCpuPowerApi>()
-    } else {
-        64
-    };
+    let bytes = (capacity as usize).min(mem::size_of::<c::DriverCpuPowerApi>()) & !7;
     let value = c::DriverCpuPowerApi {
         size: bytes as u32,
         register_backend: register as *const () as usize as u64,
@@ -48,6 +44,11 @@ pub(crate) unsafe extern "C" fn query(out: *mut c::DriverCpuPowerApi) -> i32 {
         register_read: read as *const () as usize as u64,
         clock: clock as *const () as usize as u64,
         counters_read: counters as *const () as usize as u64,
+        feature: feature as *const () as usize as u64,
+        register_performance: register_performance as *const () as usize as u64,
+        control_acquire: control_acquire as *const () as usize as u64,
+        control_release: control_release as *const () as usize as u64,
+        register_compare_write: compare_write as *const () as usize as u64,
         ..Default::default()
     };
     unsafe {
@@ -72,6 +73,89 @@ unsafe extern "C" fn register(backend: *const c::CpuPowerBackend, cookie: *mut u
 }
 extern "C" fn unregister(cookie: u64) -> i32 {
     cpu_power::unregister(cookie)
+}
+unsafe extern "C" fn register_performance(
+    cookie: u64,
+    backend: *const c::CpuPerformanceBackend,
+) -> i32 {
+    if !unsafe { valid(backend) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    if !admission::callbacks_parallel() {
+        return c::cpu_capabilities_error_context;
+    }
+    cpu_power::register_performance(cookie, unsafe { backend.read() })
+}
+unsafe extern "C" fn feature(
+    cpu: u32,
+    epoch: u64,
+    ordinal: u32,
+    out: *mut c::CpuFeatureInfo,
+) -> i32 {
+    if !admitted() {
+        return c::cpu_capabilities_error_context;
+    }
+    unsafe { r4dev::cpu_capabilities::feature(cpu, epoch, ordinal, out) }
+}
+unsafe extern "C" fn control_acquire(cpu: u32, epoch: u64, token: *mut u64) -> i32 {
+    if token.is_null() || !token.is_aligned() {
+        return c::cpu_capabilities_error_invalid;
+    }
+    if !admitted() {
+        return c::cpu_capabilities_error_context;
+    }
+    let _session = match Session::acquire(cpu, epoch) {
+        Ok(session) => session,
+        Err(reason) => return reason,
+    };
+    match cpu_power::control_acquire(cpu, epoch) {
+        Ok(value) => {
+            unsafe { token.write(value) };
+            0
+        }
+        Err(reason) => reason,
+    }
+}
+extern "C" fn control_release(cpu: u32, epoch: u64, token: u64) -> i32 {
+    if !admitted() {
+        return c::cpu_capabilities_error_context;
+    }
+    let _session = match Session::acquire(cpu, epoch) {
+        Ok(session) => session,
+        Err(reason) => return reason,
+    };
+    cpu_power::control_release(cpu, epoch, token)
+}
+unsafe extern "C" fn compare_write(
+    cpu: u32,
+    epoch: u64,
+    token: u64,
+    id: u32,
+    expected: u64,
+    requested: u64,
+    out: *mut c::CpuRegisterWriteInfo,
+) -> i32 {
+    if !unsafe { valid(out) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    if !admitted() {
+        return c::cpu_capabilities_error_context;
+    }
+    let _control = match cpu_power::ControlCall::acquire(cpu, epoch, token) {
+        Ok(control) => control,
+        Err(reason) => return reason,
+    };
+    let session = match Session::acquire(cpu, epoch) {
+        Ok(session) => session,
+        Err(reason) => return reason,
+    };
+    match session.compare_write(token, id, expected, requested) {
+        Ok(value) => {
+            unsafe { out.write(value) };
+            0
+        }
+        Err(reason) => reason,
+    }
 }
 extern "C" fn current() -> u32 {
     if admitted() {
