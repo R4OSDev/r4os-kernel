@@ -755,6 +755,12 @@ pub fn yield_task() {
     mutate(17, ptr::null_mut(), 0, 0);
 }
 pub fn preempt_from_irq() {
+    preempt_irq(0, false);
+}
+pub(crate) fn preempt_timer_from_irq(rip: u64) {
+    preempt_irq(rip, true);
+}
+fn preempt_irq(rip: u64, timer: bool) {
     if !enabled() {
         return;
     }
@@ -780,6 +786,9 @@ pub fn preempt_from_irq() {
         mutate(0, old, 0, 0);
         set_pending(false);
         return;
+    }
+    if timer {
+        crate::sched::fpu_observation::timer_switch(rip);
     }
     mutate(if view(old).cpu_idle { 3 } else { 2 }, old, now, 0);
     let latency = mutate(5, next, now, 0);

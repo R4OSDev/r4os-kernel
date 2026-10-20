@@ -73,6 +73,10 @@ fn boot_cases() -> bool {
             helpers::puts(b"TASKREG08244 idle-timeout PASS due=65 bounded=64+1 future=held timer-irq=unchanged\r\n");
             return true;
         }
+        // Bounded guard-only selection, without reserve admission injection.
+        if option_is(value, b"fpu-guards") {
+            return resources::work_fpu();
+        }
         if option_is(value, b"fpu-work") {
             if !resources::work_fpu() {
                 return false;
@@ -80,7 +84,7 @@ fn boot_cases() -> bool {
             if !resources::reserve_probe() {
                 return helpers::fail(b"fpu-reserve");
             }
-            helpers::puts(b"TASKREG08201 fpu-reserve PASS admission=oom reuse=2 initial=clean irq-preserved=yes\r\n");
+            helpers::puts(b"TASKREG08201 fpu-reserve PASS admission=oom reuse=2 initial=clean guard-roundtrip=preserved\r\n");
             return true;
         }
         if !option_is(value, b"yes") {

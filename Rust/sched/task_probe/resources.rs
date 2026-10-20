@@ -90,9 +90,9 @@ pub unsafe fn work_fpu() -> bool {
             passed &= result == 0;
         }
         puts(if passed {
-            b"TASKREG08201 fpu-work PASS lanes=2 irq-boundary=actual\r\n"
+            b"TASKREG08201 fpu-work PASS lanes=2 irq-boundary=guard-roundtrip\r\n"
         } else {
-            b"TASKREG08201 fpu-work FAIL lanes=2 irq-boundary=actual\r\n"
+            b"TASKREG08201 fpu-work FAIL lanes=2 irq-boundary=guard-roundtrip\r\n"
         });
         if passed && fpu::callback(2) != 0 {
             return fail(b"fpu-caller-irq");

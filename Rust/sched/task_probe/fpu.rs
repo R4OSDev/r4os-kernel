@@ -1,4 +1,5 @@
-//! Original actual IRQ/YMM probe. The compiler remains no-SIMD; explicit
+//! Private integer-only guard-roundtrip probe, not hardware IRQ evidence.
+//! The compiler remains no-SIMD; explicit
 //! assembly performs only the same three probe operations as the old source.
 use crate::{arch::runtime, sched::scheduler};
 core::arch::global_asm!(include_str!("fpu.S"), options(att_syntax));

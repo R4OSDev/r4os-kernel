@@ -16,3 +16,5 @@ pub mod sync_stats;
 pub mod sync_types;
 pub mod sync_wait;
 pub mod task_probe;
+
+pub(crate) mod fpu_observation;

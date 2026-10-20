@@ -45,3 +45,5 @@ pub mod block_queue;
 
 pub mod nvme;
 pub mod usb;
+
+pub(crate) mod fpu_observation;

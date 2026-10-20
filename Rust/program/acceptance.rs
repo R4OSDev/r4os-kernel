@@ -45,6 +45,12 @@ static DONE: AtomicU8 = AtomicU8::new(0);
 static ABORT: AtomicU8 = AtomicU8::new(0);
 static FAILURES: AtomicU32 = AtomicU32::new(0);
 static CPU: AtomicU32 = AtomicU32::new(u32::MAX);
+// One bounded IPI case may be woken by a timer before the reschedule IPI.
+// Keep the same R4L work alive and re-enroll; a timer wake never proves IPI.
+const IPI_WAKE_LIMIT: u32 = 8;
+static IPI_BASE: AtomicU64 = AtomicU64::new(0);
+static IPI_WAKES: AtomicU32 = AtomicU32::new(0);
+static IPI_TIMER_RACES: AtomicU32 = AtomicU32::new(0);
 static COOPERATIVE: AtomicU64 = AtomicU64::new(0);
 static COOP_PROGRESS_NS: AtomicU64 = AtomicU64::new(0);
 static COOP_MAX_WORK_NS: AtomicU64 = AtomicU64::new(0);
@@ -55,6 +61,8 @@ struct Scenario {
     timer: u64,
     ipi: u64,
     cooperative: u64,
+    ipi_wakes: u32,
+    ipi_timer_races: u32,
     progress_ns: u64,
     max_work_ns: u64,
     max_gap_ns: u64,
@@ -66,6 +74,8 @@ impl Scenario {
         timer: 0,
         ipi: 0,
         cooperative: 0,
+        ipi_wakes: 0,
+        ipi_timer_races: 0,
         progress_ns: 0,
         max_work_ns: 0,
         max_gap_ns: 0,
@@ -143,8 +153,27 @@ unsafe extern "C" fn witness() {
                 }
             }
             1 => {
-                if sync_objects::r4os_rust_sync_event(EVENT.0.get(), 2, u64::MAX) != 1 {
-                    failure();
+                loop {
+                    if sync_objects::r4os_rust_sync_event(EVENT.0.get(), 2, u64::MAX) != 1 {
+                        failure();
+                        break;
+                    }
+                    if ABORT.load(Ordering::Acquire) != 0 {
+                        break;
+                    }
+                    let observed = preemption(percpu::current_index());
+                    if observed
+                        .reschedule_ipi_switches
+                        .wrapping_sub(IPI_BASE.load(Ordering::Acquire))
+                        != 0
+                    {
+                        break;
+                    }
+                    // The timer legitimately won this wake. Do not finish the
+                    // library's sentinel loop or claim IPI; consume/reset the
+                    // manual event before the next exact wait enrollment.
+                    IPI_TIMER_RACES.fetch_add(1, Ordering::Relaxed);
+                    sync_objects::r4os_rust_sync_event(EVENT.0.get(), 1, 0);
                 }
             }
             2 | 3 => {
@@ -228,7 +257,7 @@ unsafe fn scenario(file: &launch::File, working: *mut Drive, cpu: u32, mode: u8)
             return Scenario::EMPTY;
         }
         let flag = AtomicU64::from_ptr(flag);
-        let before = preemption(cpu);
+        let mut before = preemption(cpu);
         let start = monotonic::capture();
         let tick = timer::tick_count();
         let entry_flags = flags();
@@ -245,6 +274,9 @@ unsafe fn scenario(file: &launch::File, working: *mut Drive, cpu: u32, mode: u8)
         FAILURES.store(0, Ordering::Release);
         CPU.store(u32::MAX, Ordering::Release);
         COOPERATIVE.store(0, Ordering::Relaxed);
+        IPI_BASE.store(0, Ordering::Relaxed);
+        IPI_WAKES.store(0, Ordering::Relaxed);
+        IPI_TIMER_RACES.store(0, Ordering::Relaxed);
         COOP_PROGRESS_NS.store(0, Ordering::Relaxed);
         COOP_MAX_WORK_NS.store(0, Ordering::Relaxed);
         COOP_MAX_GAP_NS.store(0, Ordering::Relaxed);
@@ -329,7 +361,32 @@ unsafe fn scenario(file: &launch::File, working: *mut Drive, cpu: u32, mode: u8)
                 }
                 task_api::r4os_rust_task_mutate(0, task, timer::tick_count(), 0, ptr::null(), 0);
             } else if !timed_out && flag.load(Ordering::Acquire) == 1 {
-                signal();
+                // Baseline after actual PREEMPT_SPIN entry, not witness startup.
+                // No timing/counter success is inferred from a signal request.
+                before = preemption(cpu);
+                IPI_BASE.store(before.reschedule_ipi_switches, Ordering::Release);
+                while DONE.load(Ordering::Acquire) == 0 && !ready(handle) {
+                    if expired(start, tick) {
+                        timed_out = true;
+                        break;
+                    }
+                    if sync_wait::r4os_rust_sync_queue(
+                        ptr::addr_of_mut!((*EVENT.0.get()).queue),
+                        6,
+                        ptr::null_mut(),
+                        0,
+                        ptr::null_mut(),
+                    ) != 0
+                    {
+                        if IPI_WAKES.load(Ordering::Relaxed) >= IPI_WAKE_LIMIT {
+                            timed_out = true;
+                            break;
+                        }
+                        IPI_WAKES.fetch_add(1, Ordering::Relaxed);
+                        signal();
+                    }
+                    scheduler::yield_task();
+                }
             }
         }
         while !timed_out && !ready(handle) {
@@ -421,6 +478,8 @@ unsafe fn scenario(file: &launch::File, working: *mut Drive, cpu: u32, mode: u8)
             timer: timer_switches,
             ipi,
             cooperative: COOPERATIVE.load(Ordering::Relaxed),
+            ipi_wakes: IPI_WAKES.load(Ordering::Relaxed),
+            ipi_timer_races: IPI_TIMER_RACES.load(Ordering::Relaxed),
             progress_ns: COOP_PROGRESS_NS.load(Ordering::Relaxed),
             max_work_ns: COOP_MAX_WORK_NS.load(Ordering::Relaxed),
             max_gap_ns: COOP_MAX_GAP_NS.load(Ordering::Relaxed),
@@ -511,6 +570,11 @@ pub unsafe extern "C" fn r4os_rust_program_preemption_acceptance(cpu: u32, usabl
         log(b" max_gap_ns=");
         dec(cooperative.max_gap_ns.max(urgent.max_gap_ns));
         log(b"\r\n");
+        log(b"[R4LPREEMPT] IPI event qualification wakes=");
+        dec(ipi.ipi_wakes.into());
+        log(b" timer_races=");
+        dec(ipi.ipi_timer_races.into());
+        log(b" limit=8 live-library-baseline=yes\r\n");
         log(b"[R4LPREEMPT] result=");
         log(if ok { b"OK" } else { b"FAILED" });
         log(b" cpu=");

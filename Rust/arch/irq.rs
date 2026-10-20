@@ -31,11 +31,14 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
     }
     let rip = unsafe { core::ptr::addr_of!((*frame).rip).read() };
     let preemptible = event(0, rip, 0) != 0;
+    if irq == 0 {
+        crate::sched::fpu_observation::timer(rip);
+    }
     if runtime::current_cpu() != 0 && irq == 0 {
         let preempt = scheduler::on_tick(timer::tick_count(), preemptible, true);
         eoi();
         if preempt {
-            scheduler::preempt_from_irq();
+            scheduler::preempt_timer_from_irq(rip);
         }
         runtime::restore_runtime(saved);
         return;
@@ -53,7 +56,7 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
         }
         _ => {}
     }
-    event(6, u64::from(irq), 0);
+    event(6, u64::from(irq), rip);
     if !ioapic::r4os_rust_ioapic_control(0, 0, false) || irq < 16 {
         pic::r4os_rust_pic_control(4, irq);
     }
@@ -62,7 +65,11 @@ pub unsafe fn dispatch(frame: *const InterruptFrame) {
         preempt = scheduler::preempt_pending(preemptible);
     }
     if preempt {
-        scheduler::preempt_from_irq();
+        if irq == 0 {
+            scheduler::preempt_timer_from_irq(rip);
+        } else {
+            scheduler::preempt_from_irq();
+        }
     }
     runtime::restore_runtime(saved);
 }
@@ -98,7 +105,6 @@ pub unsafe fn dispatch_ipi(frame: *const InterruptFrame) {
 }
 
 unsafe fn irq_event(operation: u8, a: u64, b: u64) -> u64 {
-    let _ = b;
     match operation {
         0 => u64::from(crate::program::peer_lifetime::r4os_rust_program_peer_preemptible(a)),
         5 => {
@@ -107,7 +113,7 @@ unsafe fn irq_event(operation: u8, a: u64, b: u64) -> u64 {
         }
         6 => {
             unsafe {
-                crate::driver::irq_router::r4os_rust_irq_router_dispatch(a.try_into().unwrap());
+                crate::driver::irq_router::dispatch_observed(a.try_into().unwrap(), b);
             }
             0
         }

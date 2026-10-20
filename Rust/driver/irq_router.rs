@@ -422,6 +422,11 @@ fn record(index: usize, start: monotonic::Stamp, end: monotonic::Stamp, handler:
 /// No Rust state borrow or resource-owning Drop spans a foreign callback.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_irq_router_dispatch(irq: u8) {
+    unsafe { dispatch_observed(irq, 0) };
+}
+/// # Safety
+/// Real dispatch supplies the actual saved RIP under existing IRQ runtime admission.
+pub(crate) unsafe fn dispatch_observed(irq: u8, rip: u64) {
     if irq as usize >= MAX_IRQS {
         return;
     }
@@ -472,6 +477,9 @@ pub unsafe extern "C" fn r4os_rust_irq_router_dispatch(irq: u8) {
         }
         let mut guard = MaybeUninit::<scheduler::ExternalIrqFpuGuard>::uninit();
         unsafe { scheduler::r4os_rust_scheduler_irq_enter(guard.as_mut_ptr()) };
+        if e.owner != 0 {
+            crate::sched::fpu_observation::external(rip, irq, e.owner, handler as usize as u64);
+        }
         last_result = unsafe { handler(irq, e.context) };
         unsafe { scheduler::r4os_rust_scheduler_irq_leave(guard.as_ptr()) };
         if config::ENABLE_METRICS {

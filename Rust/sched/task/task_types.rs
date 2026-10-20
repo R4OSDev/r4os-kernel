@@ -200,6 +200,7 @@ pub struct TaskCore {
     pub uses_fpu: bool,
     // Exact nested PPI execution identity; scopes pin this task through waits.
     pub protocol_slot: usize,
+    pub(crate) fpu_observation: crate::sched::fpu_observation::Observation,
 }
 
 impl Default for TaskCore {
@@ -306,6 +307,7 @@ impl Default for TaskCore {
             fpu_state_valid: false,
             uses_fpu: false,
             protocol_slot: usize::MAX,
+            fpu_observation: Default::default(),
         }
     }
 }
