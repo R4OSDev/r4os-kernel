@@ -59,7 +59,9 @@ unsafe fn in_cluster(
                 if lfn.active && !lfn.complete(raw) {
                     return ClusterLookup::Io;
                 }
-                let found = n::make_entry(raw, lfn, u64::from(lba), off as u16);
+                let Some(found) = n::make_entry(raw, lfn, u64::from(lba), off as u16) else {
+                    return ClusterLookup::Io;
+                };
                 if !s::entry_cluster_valid(v, found) {
                     return ClusterLookup::Io;
                 }
@@ -160,7 +162,9 @@ pub(super) unsafe fn find_location(
                     if lfn.active && (!lfn.complete(raw) || count != usize::from(lfn.total)) {
                         return Lookup::Io;
                     }
-                    let found = n::make_entry(raw, &lfn, u64::from(lba), off as u16);
+                    let Some(found) = n::make_entry(raw, &lfn, u64::from(lba), off as u16) else {
+                        return Lookup::Io;
+                    };
                     if !s::entry_cluster_valid(v, found) {
                         return Lookup::Io;
                     }
@@ -208,7 +212,7 @@ pub(super) unsafe fn optional_location(
 #[inline(never)]
 pub(super) unsafe fn resolve(v: Volume, path: Bytes, out: *mut Entry) -> Lookup {
     unsafe {
-        if !s::valid_cluster(v, v.root_cluster) {
+        if !n::valid_path(path.view()) || !s::valid_cluster(v, v.root_cluster) {
             return Lookup::Io;
         }
         let mut cluster = v.root_cluster;
@@ -253,7 +257,7 @@ pub(super) unsafe fn resolve(v: Volume, path: Bytes, out: *mut Entry) -> Lookup 
 #[inline(never)]
 pub(super) unsafe fn resolve_path(v: Volume, path: Bytes, out: *mut u32) -> Lookup {
     unsafe {
-        if !s::valid_cluster(v, v.root_cluster) {
+        if !n::valid_path(path.view()) || !s::valid_cluster(v, v.root_cluster) {
             return Lookup::Io;
         }
         let mut cluster = v.root_cluster;
@@ -378,7 +382,9 @@ unsafe fn enumerate(
                     if lfn.active && !lfn.complete(raw) {
                         return Lookup::Io;
                     }
-                    let e = n::make_entry(raw, &lfn, u64::from(lba), off as u16);
+                    let Some(e) = n::make_entry(raw, &lfn, u64::from(lba), off as u16) else {
+                        return Lookup::Io;
+                    };
                     lfn.reset();
                     match mode {
                         0 => print_entry(e),
@@ -606,12 +612,11 @@ pub(super) unsafe fn next(
                 if guard.lfn.active && !guard.lfn.complete(raw) {
                     return Next::Io;
                 }
-                out.write(n::make_entry(
-                    raw,
-                    &guard.lfn,
-                    u64::from(lba),
-                    (off - 32) as u16,
-                ));
+                let Some(found) = n::make_entry(raw, &guard.lfn, u64::from(lba), (off - 32) as u16)
+                else {
+                    return Next::Io;
+                };
+                out.write(found);
                 guard.lfn.reset();
                 return Next::Found;
             }
@@ -685,7 +690,7 @@ pub(super) unsafe fn build_entries(
     out: &mut [u8],
 ) -> Option<usize> {
     unsafe {
-        if out.len() < SLOT_MAX * 32 {
+        if !n::valid(name.view()) || out.len() < SLOT_MAX * 32 {
             return None;
         }
         let mut short = [0; 11];

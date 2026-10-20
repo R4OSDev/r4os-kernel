@@ -81,7 +81,7 @@ unsafe fn build_directory(
 #[inline(never)]
 pub(super) unsafe fn create(v: Volume, parent: u64, name: View) -> WriteStatus {
     unsafe {
-        if name.len == 0 || name.len > NAME_MAX {
+        if !names::valid(name.get()) {
             return WriteStatus::Invalid;
         }
         if v.geometry().cluster_bytes != v.index_block_bytes {
@@ -142,7 +142,7 @@ pub(super) unsafe fn create(v: Volume, parent: u64, name: View) -> WriteStatus {
 #[inline(never)]
 pub(super) unsafe fn delete(v: Volume, parent: u64, name: View) -> WriteStatus {
     unsafe {
-        if name.len == 0 || name.len > NAME_MAX {
+        if !names::valid(name.get()) {
             return WriteStatus::Invalid;
         }
         let mut found = LookupResult::EMPTY;

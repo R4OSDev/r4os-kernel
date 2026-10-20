@@ -1,4 +1,4 @@
-//! Original strict VFAT chain, BMP-only UTF conversions and ASCII collation.
+//! Strict VFAT chain, shared R4STD UTF8/UTF16 and existing ASCII collation.
 use super::fat_types::*;
 pub fn upper(c: u8) -> u8 {
     if c.is_ascii_lowercase() {
@@ -48,93 +48,13 @@ pub fn valid_short(name: &[u8]) -> bool {
     build_short(name, &mut [0; 11])
 }
 pub fn utf8_units(name: &[u8], out: &mut [u16]) -> Option<usize> {
-    let mut i = 0;
-    let mut pos = 0;
-    while i < name.len() {
-        let b = name[i];
-        let unit;
-        if b < 0x80 {
-            unit = u16::from(b);
-            i += 1;
-        } else if b & 0xe0 == 0xc0 {
-            if b < 0xc2 || i + 1 >= name.len() {
-                return None;
-            }
-            let b1 = name[i + 1];
-            if b1 & 0xc0 != 0x80 {
-                return None;
-            }
-            unit = (u16::from(b & 0x1f) << 6) | u16::from(b1 & 0x3f);
-            i += 2;
-        } else if b & 0xf0 == 0xe0 {
-            if i + 2 >= name.len() {
-                return None;
-            }
-            let b1 = name[i + 1];
-            let b2 = name[i + 2];
-            if b1 & 0xc0 != 0x80
-                || b2 & 0xc0 != 0x80
-                || (b == 0xe0 && b1 < 0xa0)
-                || (b == 0xed && b1 >= 0xa0)
-            {
-                return None;
-            }
-            unit = (u16::from(b & 0x0f) << 12) | (u16::from(b1 & 0x3f) << 6) | u16::from(b2 & 0x3f);
-            i += 3;
-        } else {
-            return None;
-        }
-        if pos >= out.len() {
-            return None;
-        }
-        out[pos] = unit;
-        pos += 1;
-    }
-    Some(pos)
+    r4os_text_core::utf16::from_utf8(name, out).ok()
 }
 pub fn units_utf8(units: &[u16], out: &mut [u8]) -> Option<usize> {
-    let mut pos = 0;
-    for &unit in units {
-        if unit < 0x80 {
-            if pos >= out.len() {
-                return None;
-            }
-            out[pos] = unit as u8;
-            pos += 1;
-        } else if unit < 0x800 {
-            if pos + 2 > out.len() {
-                return None;
-            }
-            out[pos] = 0xc0 | (unit >> 6) as u8;
-            out[pos + 1] = 0x80 | (unit & 0x3f) as u8;
-            pos += 2;
-        } else {
-            if (0xd800..0xe000).contains(&unit) || pos + 3 > out.len() {
-                return None;
-            }
-            out[pos] = 0xe0 | (unit >> 12) as u8;
-            out[pos + 1] = 0x80 | ((unit >> 6) & 0x3f) as u8;
-            out[pos + 2] = 0x80 | (unit & 0x3f) as u8;
-            pos += 3;
-        }
-    }
-    Some(pos)
+    r4os_text_core::utf16::to_utf8(units, out).ok()
 }
 pub fn well_formed(units: &[u16]) -> bool {
-    let mut i = 0;
-    while i < units.len() {
-        let unit = units[i];
-        if (0xd800..=0xdbff).contains(&unit) {
-            if i + 1 >= units.len() || !(0xdc00..=0xdfff).contains(&units[i + 1]) {
-                return false;
-            }
-            i += 1;
-        } else if (0xdc00..=0xdfff).contains(&unit) {
-            return false;
-        }
-        i += 1;
-    }
-    true
+    char::decode_utf16(units.iter().copied()).all(|scalar| scalar.is_ok())
 }
 pub fn valid_long(name: &[u8]) -> bool {
     if name.is_empty() || name.len() >= NAME_MAX || name[0] == b'.' || name[name.len() - 1] == b'.'
@@ -147,7 +67,7 @@ pub fn valid_long(name: &[u8]) -> bool {
     };
     let mut text = false;
     for &unit in &units[..n] {
-        if unit < 0x20 || unit == 0x7f {
+        if unit < 0x20 || unit == 0x7f || unit == 0xffff {
             return false;
         }
         match unit {
@@ -161,6 +81,12 @@ pub fn valid_long(name: &[u8]) -> bool {
 pub fn valid(name: &[u8]) -> bool {
     valid_short(name) || valid_long(name)
 }
+/// Validate every component before the first lookup/cache or mutation.
+pub fn valid_path(path: &[u8]) -> bool {
+    path.split(|b| matches!(b, b'/' | b'\\'))
+        .filter(|part| !part.is_empty())
+        .all(valid)
+}
 pub fn equal_ascii(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(&a, &b)| upper(a) == upper(b))
 }
@@ -171,29 +97,37 @@ pub fn equal_collated(a: &[u8], b: &[u8]) -> Option<bool> {
         Some(equal_ascii(a, b))
     }
 }
-pub fn short_to_buffer(raw: &[u8], out: &mut [u8]) -> usize {
+/// OEM encoding is absent from a FAT short entry. Without an explicit codepage,
+/// accept printable ASCII only; never reinterpret arbitrary OEM bytes as UTF8.
+pub fn short_to_buffer(raw: &[u8], out: &mut [u8]) -> Option<usize> {
+    if raw.len() < 11 || raw[..11].iter().any(|b| !(0x20..=0x7e).contains(b)) {
+        return None;
+    }
     let mut end = 8;
     while end > 0 && raw[end - 1] == b' ' {
         end -= 1;
     }
-    out[..end].copy_from_slice(&raw[..end]);
-    let mut len = end;
+    if end == 0 {
+        return None;
+    }
     let mut ext = 11;
     while ext > 8 && raw[ext - 1] == b' ' {
         ext -= 1;
     }
-    if ext > 8 {
-        out[len] = b'.';
-        len += 1;
-        out[len..len + ext - 8].copy_from_slice(&raw[8..ext]);
-        len += ext - 8;
+    let len = end + if ext > 8 { 1 + ext - 8 } else { 0 };
+    if len > out.len() {
+        return None;
     }
-    len
+    out[..end].copy_from_slice(&raw[..end]);
+    if ext > 8 {
+        out[end] = b'.';
+        out[end + 1..len].copy_from_slice(&raw[8..ext]);
+    }
+    Some(len)
 }
 pub fn short_equals(raw: &[u8], name: &[u8]) -> bool {
     let mut out = [0; NAME_MAX];
-    let n = short_to_buffer(raw, &mut out);
-    equal_ascii(&out[..n], name)
+    short_to_buffer(raw, &mut out).is_some_and(|n| equal_ascii(&out[..n], name))
 }
 pub fn checksum(short: [u8; 11]) -> u8 {
     let mut sum = 0u8;
@@ -292,7 +226,10 @@ impl Lfn {
         checksum(short) == self.checksum && well_formed(&self.units[..self.len])
     }
 }
-pub fn make_entry(raw: &[u8], lfn: &Lfn, lba: u64, offset: u16) -> Entry {
+pub fn make_entry(raw: &[u8], lfn: &Lfn, lba: u64, offset: u16) -> Option<Entry> {
+    if raw.len() < 32 {
+        return None;
+    }
     let mut out = Entry {
         attr: raw[11],
         has_directory_lba: true,
@@ -307,14 +244,15 @@ pub fn make_entry(raw: &[u8], lfn: &Lfn, lba: u64, offset: u16) -> Entry {
         modified_date: le16(&raw[24..26]),
         ..Entry::EMPTY
     };
-    if lfn.len > 0
-        && let Some(n) = units_utf8(&lfn.units[..lfn.len], &mut out.name)
-    {
-        out.name_len = n;
-        return out;
+    if lfn.active || lfn.len > 0 {
+        if !lfn.complete(raw) || lfn.units[..lfn.len].contains(&0) {
+            return None;
+        }
+        out.name_len = units_utf8(&lfn.units[..lfn.len], &mut out.name)?;
+        return Some(out);
     }
-    out.name_len = short_to_buffer(&raw[..11], &mut out.name);
-    out
+    out.name_len = short_to_buffer(&raw[..11], &mut out.name)?;
+    Some(out)
 }
 pub fn write_lfn(out: &mut [u8], units: &[u16], seq: usize, total: usize, sum: u8) {
     out.fill(0);

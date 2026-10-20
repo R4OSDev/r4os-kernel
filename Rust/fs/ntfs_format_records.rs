@@ -227,7 +227,7 @@ pub fn file_name(s: &[u8]) -> Option<FileName> {
     }
     let n = s[0x40];
     let end = 0x42 + usize::from(n) * 2;
-    if s.len() < end {
+    if s.len() < end || !super::ntfs_format_names::valid_utf16(&s[0x42..end]) {
         return None;
     }
     Some(FileName {

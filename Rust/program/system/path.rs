@@ -1,5 +1,18 @@
 //! Original bounded C-string/path primitives, with caller-owned buffers.
 use core::mem::MaybeUninit;
+/// Validate raw paths before normalization or any filesystem/cache access.
+/// Drive prefixes do not consume the first component's UTF16 name budget.
+pub(super) fn valid_unicode(value: &[u8]) -> bool {
+    let path = if value.len() >= 2 && value[0].is_ascii_alphabetic() && value[1] == b':' {
+        &value[2..]
+    } else {
+        value
+    };
+    !path.contains(&0)
+        && path
+            .split(|b| separator(*b))
+            .all(|part| r4os_text_core::utf16::units_required(part).is_ok_and(|units| units <= 255))
+}
 // Original undefined caller scratch: only a written prefix becomes a byte
 // slice. No initialized Rust byte reference covers uninitialized storage.
 pub(super) struct Buffer<const N: usize>(MaybeUninit<[u8; N]>);

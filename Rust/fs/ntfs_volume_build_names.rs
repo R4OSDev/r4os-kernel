@@ -5,6 +5,9 @@ use super::{
     ntfs_volume_records::{put16, put32, put64},
     ntfs_volume_types::Volume,
 };
+pub fn valid(name: &[u8]) -> bool {
+    names::valid_name(name)
+}
 pub fn safe83(name: &[u8]) -> bool {
     let mut dot = None;
     for (i, c) in name.iter().copied().enumerate() {
@@ -45,7 +48,7 @@ pub fn value(
 ) -> Option<usize> {
     let namespace = if safe83(name) { 3 } else { 0 };
     let flags = if directory { 0x1000_0000 } else { 0x20 };
-    if 0x42 > out.len() {
+    if !valid(name) || 0x42 > out.len() {
         return None;
     }
     let n = names::to_utf16(name, &mut out[0x42..])?;

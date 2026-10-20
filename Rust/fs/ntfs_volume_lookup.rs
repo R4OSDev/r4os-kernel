@@ -103,7 +103,7 @@ pub(super) unsafe fn lookup(
     depth: u32,
 ) -> Lookup {
     unsafe {
-        if name.len == 0 || name.len > 768 {
+        if !text::valid_name(name.get()) {
             return Lookup::Io;
         }
         let target_buf = core::ptr::addr_of_mut!((*v.scratch()).name_utf16).cast::<u8>();
@@ -310,6 +310,9 @@ unsafe fn uncached(
 #[inline(never)]
 pub(super) unsafe fn resolve_path(v: Volume, path: View, out: *mut u64) -> Lookup {
     unsafe {
+        if !text::valid_path(path.get()) {
+            return Lookup::Io;
+        }
         let mut record = 5;
         let mut start = 0;
         let mut depth = 0;
@@ -355,6 +358,9 @@ pub(super) unsafe fn resolve_path(v: Volume, path: View, out: *mut u64) -> Looku
 #[inline(never)]
 pub(super) unsafe fn resolve_entry(v: Volume, path: View, out: *mut ResolvedEntry) -> Lookup {
     unsafe {
+        if !text::valid_path(path.get()) {
+            return Lookup::Io;
+        }
         let mut dir = 5;
         let mut result: Option<Entry> = None;
         let mut parent = 5;

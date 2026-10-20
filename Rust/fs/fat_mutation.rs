@@ -10,14 +10,14 @@ use s::STATS;
 #[inline(never)]
 pub(super) unsafe fn write_file(original: Volume, parent: u32, name: Bytes, data: Bytes) -> bool {
     unsafe {
+        if !n::valid(name.view()) {
+            return false;
+        }
         let mut op = s::Operation::begin(6);
         let Some(v) = s::mutation(original) else {
             return false;
         };
         s::invalidate_append();
-        if !n::valid(name.view()) {
-            return false;
-        }
         let mut loc = MaybeUninit::<Location>::uninit();
         match d::find_location(v, parent, name, loc.as_mut_ptr()) {
             Lookup::Found => {
@@ -98,13 +98,13 @@ unsafe fn append_internal(
     data: Bytes,
 ) -> Append {
     unsafe {
+        if !n::valid(name.view()) {
+            return Append::Invalid;
+        }
         let Some(v) = s::mutation(original) else {
             return Append::Io;
         };
         s::invalidate_extents();
-        if !n::valid(name.view()) {
-            return Append::Invalid;
-        }
         let loc = if let Some(loc) = f::append_location(v, parent, name, expected) {
             loc
         } else {
@@ -353,14 +353,14 @@ pub(super) unsafe fn copy(
 #[inline(never)]
 pub(super) unsafe fn make_directory(original: Volume, parent: u32, name: Bytes) -> bool {
     unsafe {
+        if !n::valid(name.view()) {
+            return false;
+        }
         let mut op = s::Operation::begin(9);
         let Some(v) = s::mutation(original) else {
             return false;
         };
         s::invalidate_append();
-        if !n::valid(name.view()) {
-            return false;
-        }
         let mut e = MaybeUninit::uninit();
         if d::find(v, parent, name, e.as_mut_ptr()) != Lookup::NotFound {
             return false;
@@ -388,6 +388,9 @@ pub(super) unsafe fn make_directory(original: Volume, parent: u32, name: Bytes) 
 #[inline(never)]
 pub(super) unsafe fn delete(original: Volume, parent: u32, name: Bytes) -> bool {
     unsafe {
+        if !n::valid(name.view()) {
+            return false;
+        }
         let mut op = s::Operation::begin(10);
         let Some(v) = s::mutation(original) else {
             return false;
@@ -408,6 +411,9 @@ pub(super) unsafe fn delete(original: Volume, parent: u32, name: Bytes) -> bool 
 #[inline(never)]
 pub(super) unsafe fn delete_match(v: Volume, parent: u32, name: Bytes, expected: Entry) -> Delete {
     unsafe {
+        if !n::valid(name.view()) {
+            return Delete::Io;
+        }
         let mut op = s::Operation::begin(10);
         s::invalidate_append();
         s::invalidate_extents();
@@ -448,6 +454,9 @@ pub(super) unsafe fn delete_match(v: Volume, parent: u32, name: Bytes, expected:
 #[inline(never)]
 pub(super) unsafe fn remove_directory(original: Volume, parent: u32, name: Bytes) -> bool {
     unsafe {
+        if !n::valid(name.view()) {
+            return false;
+        }
         let mut op = s::Operation::begin(11);
         let Some(v) = s::mutation(original) else {
             return false;
@@ -469,6 +478,9 @@ pub(super) unsafe fn remove_directory(original: Volume, parent: u32, name: Bytes
 #[inline(never)]
 pub(super) unsafe fn rename(original: Volume, parent: u32, old: Bytes, new: Bytes) -> Rename {
     unsafe {
+        if !n::valid(old.view()) || !n::valid(new.view()) {
+            return Rename::Io;
+        }
         let mut op = s::Operation::begin(12);
         let Some(v) = s::mutation(original) else {
             return Rename::Io;
@@ -530,6 +542,9 @@ pub(super) unsafe fn attributes(
     clear: u8,
 ) -> bool {
     unsafe {
+        if !n::valid(name.view()) {
+            return false;
+        }
         let mut op = s::Operation::begin(13);
         let Some(v) = s::mutation(original) else {
             return false;
@@ -574,16 +589,16 @@ pub(super) unsafe fn replace(
     consume: bool,
 ) -> Replace {
     unsafe {
-        s::invalidate_append();
-        s::invalidate_extents();
-        if !consume {
-            return Replace::NotAtomic;
-        }
         if !n::valid(target_name.view())
             || !n::valid(staged_name.view())
             || !n::valid_short(backup_name.view())
         {
             return Replace::Invalid;
+        }
+        s::invalidate_append();
+        s::invalidate_extents();
+        if !consume {
+            return Replace::NotAtomic;
         }
         if n::equal_ascii(target_name.view(), staged_name.view())
             || n::equal_ascii(target_name.view(), backup_name.view())
@@ -696,14 +711,14 @@ pub(super) unsafe fn replace_create(
     backup_name: Bytes,
 ) -> Replace {
     unsafe {
-        s::invalidate_append();
-        s::invalidate_extents();
         if !n::valid(target_name.view())
             || !n::valid_short(staged_name.view())
             || !n::valid_short(backup_name.view())
         {
             return Replace::Invalid;
         }
+        s::invalidate_append();
+        s::invalidate_extents();
         if !n::valid_short(target_name.view()) {
             return Replace::NotAtomic;
         }

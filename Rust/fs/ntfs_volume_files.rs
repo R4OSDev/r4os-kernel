@@ -11,7 +11,7 @@ use core::ptr;
 #[inline(never)]
 pub(super) unsafe fn create(v: Volume, parent: u64, name: View, data: View) -> WriteStatus {
     unsafe {
-        if name.len == 0 || name.len > 768 {
+        if !names::valid(name.get()) {
             return WriteStatus::Invalid;
         }
         let mut existing = LookupResult::EMPTY;
@@ -180,7 +180,7 @@ pub(super) unsafe fn create(v: Volume, parent: u64, name: View, data: View) -> W
 #[inline(never)]
 pub(super) unsafe fn write(v: Volume, parent: u64, name: View, data: View) -> WriteStatus {
     unsafe {
-        if name.len == 0 || name.len > 768 {
+        if !names::valid(name.get()) {
             return WriteStatus::Invalid;
         }
         let mut found = LookupResult::EMPTY;
@@ -210,7 +210,7 @@ pub(super) unsafe fn write(v: Volume, parent: u64, name: View, data: View) -> Wr
 #[inline(never)]
 pub(super) unsafe fn delete(v: Volume, parent: u64, name: View) -> WriteStatus {
     unsafe {
-        if name.len == 0 || name.len > 768 {
+        if !names::valid(name.get()) {
             return WriteStatus::Invalid;
         }
         let mut found = LookupResult::EMPTY;

@@ -26,7 +26,7 @@ pub(super) unsafe fn append(
 ) -> WriteStatus {
     unsafe {
         diag::append_at(1);
-        if name.len == 0 || name.len > 768 {
+        if !super::ntfs_format_names::valid_name(name.get()) {
             return WriteStatus::Invalid;
         }
         let mut found = LookupResult::EMPTY;

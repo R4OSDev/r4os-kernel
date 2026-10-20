@@ -36,11 +36,7 @@ pub(super) unsafe fn publish(
     staged_name: View,
 ) -> ReplaceResult {
     unsafe {
-        if target_name.len == 0
-            || target_name.len > NAME_MAX
-            || staged_name.len == 0
-            || staged_name.len > NAME_MAX
-        {
+        if !names::valid(target_name.get()) || !names::valid(staged_name.get()) {
             return ReplaceResult::Invalid;
         }
         match canonical::equal(v, target_name, staged_name) {
@@ -243,8 +239,7 @@ pub(super) unsafe fn replace(
         if !consume_stage {
             return ReplaceResult::NotAtomic;
         }
-        if target_name.len == 0
-            || target_name.len > NAME_MAX
+        if !names::valid(target_name.get())
             || !names::safe83(staged_name.get())
             || !names::safe83(backup_name.get())
         {

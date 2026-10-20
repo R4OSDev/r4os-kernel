@@ -350,11 +350,7 @@ pub(super) unsafe fn rename(
     new_name: View,
 ) -> WriteStatus {
     unsafe {
-        if old_name.len == 0
-            || old_name.len > NAME_MAX
-            || new_name.len == 0
-            || new_name.len > NAME_MAX
-        {
+        if !text::valid_name(old_name.get()) || !text::valid_name(new_name.get()) {
             return WriteStatus::Invalid;
         }
         let mut subject = LookupResult::EMPTY;

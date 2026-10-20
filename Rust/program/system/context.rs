@@ -34,7 +34,7 @@ pub(crate) fn install_program_providers() {
     MODULE.store(true, Ordering::Release);
 }
 pub(super) unsafe fn resolve(raw: &[u8], out: &mut path::Buffer<1024>) -> Option<Target> {
-    if !PATH.load(Ordering::Acquire) {
+    if !path::valid_unicode(raw) || !PATH.load(Ordering::Acquire) {
         return None;
     }
     let target = unsafe {
