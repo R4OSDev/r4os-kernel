@@ -14,5 +14,8 @@ pub fn glyph_height() -> u32 {
     owner::with_catalog(types::CatalogState::glyph_height)
 }
 pub fn glyph_row(c: u8, row: u32) -> u8 {
-    owner::with_catalog(|s| s.glyph_row(c, row))
+    glyph_row_scalar(u32::from(c), row)
+}
+pub fn glyph_row_scalar(c: u32, row: u32) -> u8 {
+    owner::with_catalog(|s| s.glyph_row_scalar(c, row))
 }

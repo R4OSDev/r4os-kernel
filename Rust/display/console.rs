@@ -8,6 +8,10 @@ struct Cells(UnsafeCell<MaybeUninit<[scroll::Cell; scroll::MAX_CELLS]>>);
 // serializes cell writes, and backing_valid admits reads only after full clear.
 unsafe impl Sync for Cells {}
 static CELLS: Cells = Cells(UnsafeCell::new(MaybeUninit::uninit()));
+struct Wraps(UnsafeCell<[u64; 1024]>);
+// SAFETY: the same sole native-console admission covers cells and row markers.
+unsafe impl Sync for Wraps {}
+static WRAPS: Wraps = Wraps(UnsafeCell::new([0; 1024]));
 fn cell_ptr() -> *mut scroll::Cell {
     CELLS.0.get().cast()
 }
@@ -34,6 +38,7 @@ pub struct Console {
     pub pixel_backing_valid: bool,
     pub pixel_backing_width: u64,
     pub pixel_backing_height: u64,
+    decoder: r4os_text_core::Output,
 }
 impl Console {
     /// # Safety
@@ -74,6 +79,7 @@ impl Console {
             pixel_backing_valid: false,
             pixel_backing_width: 0,
             pixel_backing_height: 0,
+            decoder: r4os_text_core::Output::EMPTY,
         }
     }
     fn frame(&self) -> &fb::Framebuffer {
@@ -149,6 +155,10 @@ impl Console {
         self.cur_y = y.min(max_y);
     }
     pub fn clear(&mut self) {
+        self.decoder = r4os_text_core::Output::EMPTY;
+        unsafe {
+            (*WRAPS.0.get()).fill(0);
+        }
         if !self.usable() {
             return;
         }
@@ -159,6 +169,10 @@ impl Console {
         self.reset_pixels(self.bg, self.bg, false);
     }
     pub fn clear_framed(&mut self, border: u32, inner: u32) {
+        self.decoder = r4os_text_core::Output::EMPTY;
+        unsafe {
+            (*WRAPS.0.get()).fill(0);
+        }
         if !self.usable() {
             return;
         }
@@ -188,28 +202,34 @@ impl Console {
     pub fn invalidate_external(&mut self) {
         self.invalidate_backing();
     }
-    pub fn putc(&mut self, c: u8) {
+    pub fn putc(&mut self, byte: u8) {
+        for scalar in self.decoder.push(0, byte).into_iter().flatten() {
+            self.put_scalar(scalar);
+        }
+    }
+    pub fn put_scalar(&mut self, c: u32) {
         if !self.usable() {
             return;
         }
         match c {
-            b'\n' => self.newline(),
-            b'\r' => self.cur_x = self.margin_left,
+            10 => self.newline_kind(false),
+            13 => self.cur_x = self.margin_left,
             8 => self.backspace(),
-            b'\t' => {
-                let next = (self.cur_x + 4) & !3;
-                while self.cur_x < next && self.cur_x < self.text_right() {
-                    self.draw_glyph(b' ');
-                    self.cur_x += 1;
+            12 => self.clear(),
+            9 => {
+                let count = 4 - (self.cur_x - self.margin_left) % 4;
+                for _ in 0..count {
+                    self.put_scalar(32);
                 }
             }
-            _ => {
+            _ if r4os_text_core::printable(c) => {
                 if self.cur_x >= self.text_right() {
-                    self.newline()
+                    self.newline_kind(true);
                 }
                 self.draw_glyph(c);
                 self.cur_x += 1;
             }
+            _ => {}
         }
     }
     /// # Safety
@@ -246,7 +266,24 @@ impl Console {
             self.puts_raw(bytes[pos..].as_ptr(), bytes.len() - pos);
         }
     }
-    fn newline(&mut self) {
+    fn row_soft(&self, row: u32) -> bool {
+        row < 65536 && unsafe { (*WRAPS.0.get())[row as usize / 64] & (1u64 << (row % 64)) != 0 }
+    }
+    fn mark_soft(&self, row: u32, soft: bool) {
+        if row >= 65536 {
+            return;
+        }
+        unsafe {
+            let word = &mut (*WRAPS.0.get())[row as usize / 64];
+            let mask = 1u64 << (row % 64);
+            if soft {
+                *word |= mask;
+            } else {
+                *word &= !mask;
+            }
+        }
+    }
+    fn newline_kind(&mut self, soft: bool) {
         if !self.usable() {
             return;
         }
@@ -256,15 +293,23 @@ impl Console {
             self.scroll();
             self.cur_y = self.text_bottom() - 1;
         }
+        self.mark_soft(self.cur_y, soft);
     }
     fn backspace(&mut self) {
-        if !self.usable() || self.cur_x <= self.margin_left {
+        if !self.usable() {
             return;
         }
+        if self.cur_x <= self.margin_left {
+            if self.cur_y <= self.margin_top || !self.row_soft(self.cur_y) {
+                return;
+            }
+            self.cur_y -= 1;
+            self.cur_x = self.text_right();
+        }
         self.cur_x -= 1;
-        self.draw_glyph(b' ');
+        self.draw_glyph(32);
     }
-    fn draw_glyph(&mut self, c: u8) {
+    fn draw_glyph(&mut self, c: u32) {
         let gw = font::glyph_width();
         let gh = font::glyph_height();
         let px = self.cur_x * gw * self.scale;
@@ -275,7 +320,7 @@ impl Console {
         let shadow = self.pixel_framebuffer();
         let target = shadow.as_ref().unwrap_or(self.frame());
         for row in 0..gh {
-            let bits = font::glyph_row(c, row);
+            let bits = font::glyph_row_scalar(c, row);
             for col in 0..gw {
                 let shift = gw - 1 - col;
                 assert!(shift < 8, "Original u3 console glyph shift");
@@ -304,6 +349,10 @@ impl Console {
         }
     }
     fn scroll(&mut self) {
+        for row in self.margin_top..self.text_bottom().saturating_sub(1) {
+            self.mark_soft(row, self.row_soft(row + 1));
+        }
+        self.mark_soft(self.text_bottom().saturating_sub(1), false);
         let line_h = font::glyph_height() * self.scale;
         let cw = font::glyph_width() * self.scale;
         let visible_h = u64::from(self.text_bottom() - self.margin_top) * u64::from(line_h);
@@ -316,7 +365,7 @@ impl Console {
         let move_h = visible_h - u64::from(line_h);
         let mut moved = false;
         if let Some(count) = self.backing_count() {
-            let blank = self.cell(b' ');
+            let blank = self.cell(32);
             let cells = unsafe { slice::from_raw_parts_mut(cell_ptr(), count) };
             if scroll::scroll_up(
                 cells,
@@ -380,12 +429,12 @@ impl Console {
             return;
         };
         let outer = scroll::Cell {
-            glyph: b' ',
+            glyph: 32,
             foreground: fb::pack_rgb(self.frame(), self.fg),
             background: fb::pack_rgb(self.frame(), outer_rgb),
         };
         let inner = scroll::Cell {
-            glyph: b' ',
+            glyph: 32,
             foreground: outer.foreground,
             background: fb::pack_rgb(self.frame(), inner_rgb),
         };
@@ -494,14 +543,14 @@ impl Console {
     fn backing_index(&self, row: u32, col: u32) -> usize {
         row as usize * self.cols as usize + col as usize
     }
-    fn cell(&self, glyph: u8) -> scroll::Cell {
+    fn cell(&self, glyph: u32) -> scroll::Cell {
         scroll::Cell {
             glyph,
             foreground: fb::pack_rgb(self.frame(), self.fg),
             background: fb::pack_rgb(self.frame(), self.bg),
         }
     }
-    fn remember(&self, col: u32, row: u32, glyph: u8, foreground: u32, background: u32) {
+    fn remember(&self, col: u32, row: u32, glyph: u32, foreground: u32, background: u32) {
         let Some(count) = self.backing_count() else {
             return;
         };
@@ -534,7 +583,7 @@ impl Console {
                         let index = self.backing_index(row, col);
                         assert!(index < count);
                         let stored = unsafe { cell_ptr().add(index).read() };
-                        let bits = font::glyph_row(stored.glyph, glyph_row);
+                        let bits = font::glyph_row_scalar(stored.glyph, glyph_row);
                         for gc in 0..gw {
                             let shift = gw - 1 - gc;
                             assert!(shift < 8, "Original u3 console glyph shift");
@@ -736,7 +785,8 @@ pub unsafe extern "C" fn r4os_rust_console_put_dec(this: *mut Console, value: u6
 }
 
 const _: () = {
-    assert!(core::mem::size_of::<Console>() == 104);
+    assert!(core::mem::size_of::<Console>() == 136);
+    assert!(core::mem::offset_of!(Console, decoder) == 104);
     assert!(core::mem::align_of::<Console>() == 8);
     assert!(core::mem::offset_of!(Console, framebuffer) == 0);
     assert!(core::mem::offset_of!(Console, cols) == 8);

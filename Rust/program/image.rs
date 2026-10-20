@@ -412,17 +412,19 @@ fn imports(r: &Request, resolved: &mut [Resolved], seeds: &mut [ImportSeed]) -> 
             }
         }
         if group == 0 && symbol != b"Query" {
-            log(b"[R4X] named import module=");
-            log(module);
-            log(b" symbol=");
-            log(symbol);
-            log(b" need=");
-            modules::decimal(u64::from(v.min_version));
-            log(b" have=");
-            modules::decimal(u64::from(result.version));
-            log(b" generation=");
-            modules::decimal(u64::from(result.generation));
-            log(b"\r\n");
+            let mut record = crate::boot::record::Record::new();
+            record.text(b"[R4X] named import module=");
+            record.text(module);
+            record.text(b" symbol=");
+            record.text(symbol);
+            record.text(b" need=");
+            record.decimal(u64::from(v.min_version));
+            record.text(b" have=");
+            record.decimal(u64::from(result.version));
+            record.text(b" generation=");
+            record.decimal(u64::from(result.generation));
+            record.text(b"\r\n");
+            log(record.as_bytes());
         }
         seeds[i] = seed;
     }

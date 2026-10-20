@@ -169,6 +169,7 @@ pub struct ProgramCompletionNode {
     pub role: u8,
     pub exit_reason: u8,
     _padding0: [u8; 4],
+    pub text_info: contract::ConsoleTextInfo,
 }
 
 #[repr(C)]
@@ -326,7 +327,8 @@ const _: () = {
     assert!(core::mem::offset_of!(ProgramCompletionNode, app_class) == 169);
     assert!(core::mem::offset_of!(ProgramCompletionNode, role) == 170);
     assert!(core::mem::offset_of!(ProgramCompletionNode, exit_reason) == 171);
-    assert!(core::mem::size_of::<ProgramCompletionNode>() == 176);
+    assert!(core::mem::offset_of!(ProgramCompletionNode, text_info) == 176);
+    assert!(core::mem::size_of::<ProgramCompletionNode>() == 208);
     assert!(core::mem::align_of::<ProgramCompletionNode>() == 8);
     assert!(core::mem::offset_of!(ExitRecord, handle) == 0);
     assert!(core::mem::offset_of!(ExitRecord, sequence) == 16);

@@ -884,6 +884,8 @@ pub(crate) unsafe extern "C" fn push_events(
         return contract::console_input_wait_error_invalid;
     };
     crate::memory::owner::prepare_stack();
+    add!(push_calls, 1);
+    add!(batch_calls, 1);
     if count == 0 {
         return 0;
     }

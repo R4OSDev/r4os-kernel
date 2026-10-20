@@ -355,8 +355,8 @@ pub extern "C" fn r4os_rust_program_api_console_host(id: u32, host: u32) -> i32 
     }
 }
 /// # Safety
-/// Canonical exact handle/read count and output byte span are resident, aligned
-/// and exclusive. Registry admission retains detached output until copy ends.
+/// Canonical handle/count and caller output spans stay alive under exact task
+/// admission. Byte offsets remain raw; no UTF8 boundary reinterpretation.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_api_completion_read(
     handle: *const Handle,
@@ -365,41 +365,72 @@ pub unsafe extern "C" fn r4os_rust_program_api_completion_read(
     capacity: u32,
     out_read: *mut u32,
 ) -> i32 {
+    if handle.is_null() || out_read.is_null() {
+        return -1;
+    }
+    let Some(_task) = crate::sched::task_context::Admission::acquire(true) else {
+        return -5;
+    };
+    crate::memory::owner::prepare_stack();
+    let handle = unsafe { handle.read() };
+    if !registry::valid(handle) {
+        return -1;
+    }
     unsafe {
-        if handle.is_null() || out_read.is_null() || !registry::valid(handle.read()) {
-            return -1;
-        }
         out_read.write(0);
-        if out.is_null() {
-            return -1;
-        }
-        let Some(_guard) = Registry::acquire() else {
-            return -5;
+    }
+    if out.is_null() {
+        return -1;
+    }
+    unsafe { copy_completion_snapshot(handle, offset, out, capacity, out_read) }
+}
+#[inline(never)]
+unsafe fn copy_completion_snapshot(
+    handle: Handle,
+    offset: u32,
+    out: *mut u8,
+    capacity: u32,
+    out_read: *mut u32,
+) -> i32 {
+    unsafe {
+        let mut resident = [0u8; 16384];
+        let count = {
+            let Some(_guard) = Registry::acquire() else {
+                return -5;
+            };
+            let node = registry::completion_handle(handle);
+            if node.is_null() {
+                return registry::missing(handle);
+            }
+            if (*node).state != 2 {
+                return -5;
+            }
+            let transcript = (*node).output_payload.cast::<t::ConsoleTranscript>();
+            if transcript.is_null() || (*node).flags & 2 == 0 {
+                return -12;
+            }
+            let start = offset as usize;
+            let len = (*node).output_length as usize;
+            if start > len || len > resident.len() {
+                return -13;
+            }
+            let count = (capacity as usize).min(len - start);
+            if count != 0
+                && console::r4os_rust_program_console_read(
+                    transcript,
+                    start,
+                    resident.as_mut_ptr(),
+                    count,
+                    false,
+                ) != count
+            {
+                return -13;
+            }
+            count
         };
-        let handle = handle.read();
-        let node = registry::completion_handle(handle);
-        if node.is_null() {
-            return registry::missing(handle);
-        }
-        if (*node).state != 2 {
-            return -5;
-        }
-        let transcript = (*node).output_payload.cast::<t::ConsoleTranscript>();
-        if transcript.is_null() || (*node).flags & 2 == 0 {
-            return -12;
-        }
-        let start = offset as usize;
-        let len = (*node).output_length as usize;
-        if start > len {
-            return -13;
-        }
-        let count = (capacity as usize).min(len - start);
-        if count != 0
-            && console::r4os_rust_program_console_read(transcript, start, out, count, false)
-                != count
-        {
-            return -13;
-        }
+        // The immutable backing may now be reaped; only our resident bytes are
+        // used for the final caller writes, after releasing Registry.
+        core::ptr::copy_nonoverlapping(resident.as_ptr(), out, count);
         out_read.write(count as u32);
         0
     }

@@ -112,6 +112,16 @@ fn console_write(console: *mut Console, text: &[u8]) {
 pub fn console_putc_raw(byte: u8) {
     console_byte(snapshot().console, byte);
 }
+pub fn console_scalar_raw(scalar: u32) {
+    let console = snapshot().console;
+    if !console.is_null()
+        && let Some(_lease) = Lease::acquire()
+    {
+        unsafe {
+            (*console).put_scalar(scalar);
+        }
+    }
+}
 pub fn putc(byte: u8) {
     let state = snapshot();
     if state.intercept_serial

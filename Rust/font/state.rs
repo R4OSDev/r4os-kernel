@@ -122,18 +122,21 @@ impl CatalogState {
         decode::indexed_id(&self.active_index, cp, None)
     }
     pub fn glyph_row(&self, c: u8, row: u32) -> u8 {
+        self.glyph_row_scalar(u32::from(c), row)
+    }
+    pub fn glyph_row_scalar(&self, c: u32, row: u32) -> u8 {
         if self.active_present {
             if row >= u32::from(self.active.height) {
                 return 0;
             }
-            if let Some(id) = self.active_glyph_id(u32::from(c)) {
+            if let Some(id) = self.active_glyph_id(c) {
                 return self.active_glyphs[id][row as usize][0];
             }
         }
         if row >= 8 {
             0
         } else {
-            builtin::glyph(u32::from(c))[row as usize]
+            builtin::glyph(c)[row as usize]
         }
     }
     pub fn glyph_pixel(&self, c: u8, row: u32, col: u32) -> bool {

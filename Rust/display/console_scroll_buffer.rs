@@ -5,14 +5,14 @@ pub const MAX_PIXEL_BYTES: usize = 64 * 1024 * 1024;
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Cell {
-    pub glyph: u8,
+    pub glyph: u32,
     pub foreground: u32,
     pub background: u32,
 }
 impl Default for Cell {
     fn default() -> Self {
         Self {
-            glyph: b' ',
+            glyph: u32::from(b' '),
             foreground: 0,
             background: 0,
         }

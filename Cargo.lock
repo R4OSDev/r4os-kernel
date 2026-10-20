@@ -5,11 +5,17 @@ version = 4
 [[package]]
 name = "r4os-contract"
 version = "0.1.0"
-source = "git+https://github.com/R4OSDev/r4os-contract.git?rev=ceabf2b47044131057115ad338a4f5b9b4c67a7d#ceabf2b47044131057115ad338a4f5b9b4c67a7d"
+source = "git+https://github.com/R4OSDev/r4os-contract.git?rev=83adde8379270ffeb721e5c7e38de21c0ed3f286#83adde8379270ffeb721e5c7e38de21c0ed3f286"
 
 [[package]]
 name = "r4os-kernel"
 version = "0.0.0"
 dependencies = [
  "r4os-contract",
+ "r4os-text-core",
 ]
+
+[[package]]
+name = "r4os-text-core"
+version = "0.1.0"
+source = "git+https://github.com/R4OSDev/r4os-libraries.git?rev=86586b02ebe88b06a11ae71d4a41be19efca4330#86586b02ebe88b06a11ae71d4a41be19efca4330"

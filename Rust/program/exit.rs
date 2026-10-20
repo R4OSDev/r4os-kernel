@@ -85,6 +85,7 @@ pub unsafe extern "C" fn r4os_rust_program_exit_commit(h: Handle, code: i32, req
                 .store(true, Ordering::Release);
             crate::serial::stop_process(h);
         }
+        super::console::finish(instance);
         program_exit_stop_admission(instance);
         if !registry::lock() {
             return 2;
@@ -215,6 +216,7 @@ unsafe fn program_exit_console_snapshot(
             .cast::<crate::program::payload_types::Console>();
         if !p.is_null() {
             (*node).console_state = (*p).state;
+            (*node).text_info = super::console::text_info(p);
             (*node).output_revision = (*p).revision;
             let t = (*p).transcript_payload;
             (*node).output_length = if t.is_null() { 0 } else { (*t).output_len };

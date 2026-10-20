@@ -61,9 +61,6 @@ pub fn log(text: &[u8]) {
 pub fn decimal(value: u64) {
     unsafe { mod_log(1, value, ptr::null(), 0) };
 }
-fn hex(value: u64) {
-    unsafe { mod_log(2, value, ptr::null(), 0) };
-}
 pub fn counter(index: usize) -> u32 {
     COUNTERS[index].load(Ordering::Relaxed)
 }
@@ -123,36 +120,38 @@ fn kind_name(kind: u16) -> &'static [u8] {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_mod_publication(p: *const state::Entry) {
     let v = unsafe { view(p) };
-    log(b"[MOD] load ");
-    log(unsafe { bytes(v.name) });
-    log(b" kind=");
-    log(kind_name(v.kind));
-    log(b" sections=");
-    decimal(u64::from(v.section_count));
-    log(b" image=0x");
-    hex(unsafe { (*p).base });
-    log(b" size=");
-    decimal(unsafe { (*p).size as u64 });
-    log(b" bss=");
-    log(if unsafe { (*p).bss_zeroed } {
+    let mut record = crate::boot::record::Record::new();
+    record.text(b"[MOD] load ");
+    record.text(unsafe { bytes(v.name) });
+    record.text(b" kind=");
+    record.text(kind_name(v.kind));
+    record.text(b" sections=");
+    record.decimal(u64::from(v.section_count));
+    record.text(b" image=0x");
+    record.hex(unsafe { (*p).base });
+    record.text(b" size=");
+    record.decimal(unsafe { (*p).size as u64 });
+    record.text(b" bss=");
+    record.text(if unsafe { (*p).bss_zeroed } {
         b"zero"
     } else {
         b"bad"
     });
     if unsafe { (*p).pinned } {
-        log(b" generation=");
-        decimal(u64::from(v.generation));
-        log(b" pinned");
+        record.text(b" generation=");
+        record.decimal(u64::from(v.generation));
+        record.text(b" pinned");
     }
     if unsafe { (*p).import_count } != 0 {
-        log(b" imports_resolved=");
-        decimal(u64::from(unsafe { (*p).resolved_import_count }));
+        record.text(b" imports_resolved=");
+        record.decimal(u64::from(unsafe { (*p).resolved_import_count }));
     }
     if unsafe { (*p).reloc_count } != 0 {
-        log(b" relocs=");
-        decimal(u64::from(unsafe { (*p).reloc_count }));
+        record.text(b" relocs=");
+        record.decimal(u64::from(unsafe { (*p).reloc_count }));
     }
-    log(b"\r\n");
+    record.text(b"\r\n");
+    log(record.as_bytes());
 }
 fn resolver_errors() {
     if [MISSING, SYMBOL, VERSION, CYCLE, DUPLICATE, UNRESOLVED]

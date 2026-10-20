@@ -556,12 +556,12 @@ unsafe fn append_reference(
         true
     }
 }
-unsafe fn ensure_writer(instance: *mut ProgramInstance) -> *mut t::ConsoleOutput {
+unsafe fn ensure_writer(instance: *mut ProgramInstance, needed: usize) -> *mut t::ConsoleOutput {
     unsafe {
         let console = payload::console(instance);
         let writer = (*console).writer_payload;
         if !writer.is_null() {
-            if (*writer).next_sequence < CAPACITY as u64 {
+            if (*writer).next_sequence + needed as u64 <= CAPACITY as u64 {
                 return writer;
             }
             let replacement = allocate_output((*instance).id);
@@ -588,7 +588,7 @@ pub struct SourceByte {
 }
 unsafe fn source_byte(instance: *mut ProgramInstance, ch: u8) -> Option<SourceByte> {
     unsafe {
-        let writer = ensure_writer(instance);
+        let writer = ensure_writer(instance, 1);
         if writer.is_null() {
             return None;
         }
@@ -654,8 +654,8 @@ unsafe fn pending(instance: *mut ProgramInstance) {
         sync_locks::r4os_rust_sync_mutex(mutex, 2, 0);
     }
 }
-unsafe fn printable(ch: u8) -> bool {
-    ch >= 0x20 && ch != 0x7f
+fn printable(ch: u32) -> bool {
+    r4os_text_core::printable(ch)
 }
 unsafe fn lines(transcript: *const t::ConsoleTranscript, cols: u32) -> u32 {
     unsafe {
@@ -664,19 +664,23 @@ unsafe fn lines(transcript: *const t::ConsoleTranscript, cols: u32) -> u32 {
         let mut line_len = 0;
         let mut offset = 0;
         let mut buffer = [0u8; 256];
+        let mut decoder = r4os_text_core::Stream::EMPTY;
         while offset < (*transcript).output_len as usize {
             let count = read(transcript, offset, buffer.as_mut_ptr(), buffer.len());
             if count == 0 {
                 break;
             }
-            for &ch in &buffer[..count] {
-                if ch == b'\r' {
+            for &byte in &buffer[..count] {
+                let r4os_text_core::Decoded::Scalar(ch) = decoder.push(byte) else {
+                    continue;
+                };
+                if ch == 13 {
                     continue;
                 }
-                if ch == b'\n' || line_len >= cols {
+                if ch == 10 || line_len >= cols {
                     lines += 1;
                     line_len = 0;
-                    if ch == b'\n' {
+                    if ch == 10 {
                         continue;
                     }
                 }
@@ -722,20 +726,20 @@ unsafe fn row(instance: *mut ProgramInstance) {
 unsafe fn clamp_cursor(instance: *mut ProgramInstance) {
     unsafe {
         let console = payload::console(instance);
-        let maxx = i32::try_from((*console).state.cols.saturating_sub(1)).expect("Console cols");
+        let maxx = i32::try_from((*console).state.cols).expect("Console cols");
         let maxy = i32::try_from((*console).state.rows.saturating_sub(1)).expect("Console rows");
         (*console).state.cursor_x = (*console).state.cursor_x.max(0).min(maxx);
         (*console).state.cursor_y = (*console).state.cursor_y.max(0).min(maxy);
     }
 }
-unsafe fn cursor(instance: *mut ProgramInstance, ch: u8) {
+unsafe fn cursor(instance: *mut ProgramInstance, ch: u32) {
     unsafe {
         let console = payload::console(instance);
-        if ch == b'\r' {
+        if ch == 13 {
             (*console).state.cursor_x = 0;
             return;
         }
-        if ch == b'\n' {
+        if ch == 10 {
             (*console).state.cursor_x = 0;
             row(instance);
             return;
@@ -743,13 +747,12 @@ unsafe fn cursor(instance: *mut ProgramInstance, ch: u8) {
         if !printable(ch) {
             return;
         }
-        (*console).state.cursor_x += 1;
         if (*console).state.cursor_x >= i32::try_from((*console).state.cols).expect("Console cols")
         {
             (*console).state.cursor_x = 0;
             row(instance);
         }
-        clamp_cursor(instance);
+        (*console).state.cursor_x += 1;
     }
 }
 unsafe fn revision(instance: *mut ProgramInstance, present: bool, output: bool) {
@@ -806,19 +809,25 @@ unsafe fn backspace(instance: *mut ProgramInstance) {
     unsafe {
         let console = payload::console(instance);
         let transcript = transcript(instance);
-        if transcript.is_null() {
+        if transcript.is_null() || (*transcript).output_len == 0 {
             return;
         }
-        if (*transcript).segment_count != 0 && (*transcript).output_len != 0 {
+        let mut tail = [0u8; 4];
+        let count = read_tail(transcript, tail.as_mut_ptr(), 4);
+        if matches!(tail[count - 1], 10 | 13) {
+            return;
+        }
+        let mut length = 1;
+        while length < count && r4os_text_core::continuation(tail[count - length]) {
+            length += 1;
+        }
+        for _ in 0..length {
             let tail =
                 ptr::addr_of_mut!((*transcript).segments[(*transcript).segment_count as usize - 1]);
             (*tail).length -= 1;
             (*transcript).output_len -= 1;
             if (*tail).length == 0 {
                 let output = (*tail).payload;
-                if output.is_null() {
-                    return;
-                }
                 (*transcript).segment_count -= 1;
                 (*transcript).segments[(*transcript).segment_count as usize] = EMPTY_SEGMENT;
                 release(output, true);
@@ -860,7 +869,6 @@ unsafe fn emit(
                     }
                 }
                 *target_changed = true;
-                mirror(target, ch);
             }
             return;
         }
@@ -875,22 +883,16 @@ unsafe fn emit(
         );
         if appended {
             stream_count(source, stream);
-            cursor(source, ch);
             *source_changed = true;
         }
         if !target.is_null() {
             if target == source {
                 *target_changed = appended;
-                if appended {
-                    mirror(target, ch);
-                }
             } else {
                 let shown = append_reference(target, stored.payload, stored.sequence, false);
                 if shown {
                     stream_count(target, stream);
-                    cursor(target, ch);
                     *target_changed = true;
-                    mirror(target, ch);
                 }
                 if appended && shown {
                     add!(shared_bytes, 1);
@@ -899,80 +901,235 @@ unsafe fn emit(
         }
     }
 }
-unsafe fn route(stream: u32, data: &[u8], normalize: bool) -> bool {
+const WRITE_BYTES: usize = 4096;
+// A tab expands to at most four spaces; legacy/invalid-byte replacement needs
+// at most three UTF8 bytes per input byte. A prefix from the previous write can
+// add one extra replacement. The separate close batch needs at most nine bytes.
+const SERIAL_BYTES: usize = WRITE_BYTES * 4 + 3;
+struct SerialBatch {
+    bytes: [u8; SERIAL_BYTES],
+    len: usize,
+}
+impl SerialBatch {
+    fn push(&mut self, bytes: &[u8]) {
+        assert!(
+            bytes.len() <= self.bytes.len() - self.len,
+            "bounded resident console batch"
+        );
+        self.bytes[self.len..self.len + bytes.len()].copy_from_slice(bytes);
+        self.len += bytes.len();
+    }
+    fn publish(&self) {
+        crate::boot::log_route::serial_write_raw(&self.bytes[..self.len]);
+    }
+}
+unsafe fn trim_scalar_head(instance: *mut ProgramInstance) {
     unsafe {
-        if super::threads::compute_worker() {
-            return false;
+        let transcript = transcript(instance);
+        let mut prefix = [0u8; 4];
+        let count = read(transcript, 0, prefix.as_mut_ptr(), prefix.len());
+        let trim = prefix[..count]
+            .iter()
+            .take_while(|&&b| r4os_text_core::continuation(b))
+            .count();
+        if trim != 0 {
+            drop_prefix(instance, trim);
         }
-        if data.is_empty() {
-            return true;
+        (*payload::console(instance)).state.output_len = (*transcript).output_len;
+    }
+}
+#[allow(clippy::too_many_arguments)]
+unsafe fn emit_scalar(
+    source: *mut ProgramInstance,
+    target: *mut ProgramInstance,
+    stream: u32,
+    scalar: u32,
+    inherited: bool,
+    source_changed: &mut bool,
+    target_changed: &mut bool,
+    serial: &mut SerialBatch,
+) {
+    unsafe {
+        // Console controls are presentation operations. A tab is expanded once
+        // into canonical spaces so all consumers share the same cells.
+        if scalar == 9 {
+            let x = (*payload::console(source)).state.cursor_x.max(0) as usize;
+            for _ in 0..(4 - x % 4) {
+                emit_scalar(
+                    source,
+                    target,
+                    stream,
+                    32,
+                    inherited,
+                    source_changed,
+                    target_changed,
+                    serial,
+                );
+            }
+            return;
         }
-        let source = super::context::current();
-        if source.is_null() || (*source).app_class != 0 {
+        if !r4os_text_core::printable(scalar) && !matches!(scalar, 8 | 10 | 12 | 13) {
+            return;
+        }
+        let mut encoded = [0; 4];
+        let Some(text) = r4os_text_core::encode(scalar, &mut encoded) else {
+            return;
+        };
+        if !matches!(scalar, 8 | 12) && ensure_writer(source, text.len()).is_null() {
+            return;
+        }
+        for &byte in text.as_bytes() {
+            emit(
+                source,
+                target,
+                stream,
+                byte,
+                inherited,
+                source_changed,
+                target_changed,
+            );
+        }
+        trim_scalar_head(source);
+        if !matches!(scalar, 8 | 12) {
+            cursor(source, scalar);
+        }
+        if !target.is_null() {
+            if target != source {
+                trim_scalar_head(target);
+                if !matches!(scalar, 8 | 12) {
+                    cursor(target, scalar);
+                }
+            }
+            if (*payload::console(target)).host == 2 {
+                serial.push(text.as_bytes());
+                if raw_presenter(target) {
+                    crate::boot::log_route::console_scalar_raw(scalar);
+                }
+            }
+        }
+    }
+}
+unsafe fn route(stream: u32, data: &[u8], normalize: bool) -> bool {
+    if super::threads::compute_worker() || stream > 2 {
+        return false;
+    }
+    let Some(_task) = crate::sched::task_context::Admission::acquire(false) else {
+        return false;
+    };
+    crate::memory::owner::prepare_stack();
+    let source = unsafe { super::context::current() };
+    unsafe { route_instance(source, stream, data, normalize, false) }
+}
+// Caller accesses are staged before OutputGuard; serial sees only this resident
+// bounded batch, never a pageable caller pointer or a formatter callback.
+#[inline(never)]
+unsafe fn route_instance(
+    source: *mut ProgramInstance,
+    stream: u32,
+    data: &[u8],
+    normalize: bool,
+    finish: bool,
+) -> bool {
+    unsafe {
+        if source.is_null() || (*source).app_class != 0 || (*source).console_payload.is_null() {
             return false;
         }
         let console = payload::console(source);
         let inherited = (*console).io_target_id != 0;
-        let mut lease = None;
-        let target = if inherited {
-            lease = Lease::handle(contract::ProgramProcessHandle {
+        let lease = if inherited {
+            Lease::handle(contract::ProgramProcessHandle {
                 instance_id: (*console).io_target_id,
                 reserved: 0,
                 generation: (*console).io_target_generation,
-            });
+            })
+        } else {
+            None
+        };
+        let target = if inherited {
             match lease.as_ref() {
                 Some(pin) if (*pin.0.instance).app_class == 0 => pin.0.instance,
                 _ => ptr::null_mut(),
             }
+        } else if (*source).role == 2 || ((*source).role == 1 && (*console).host != 0) {
+            source
         } else {
-            let target = super::console_input::current();
-            if target.is_null() {
-                return false;
-            }
-            target
+            return false;
         };
-        let Some(_guard) = OutputGuard::acquire() else {
-            return true;
-        };
-        add!(write_calls, 1);
-        let mut source_changed = false;
-        let mut target_changed = false;
-        for &ch in data {
-            if normalize && ch == b'\r' {
-                continue;
+        let mut offset = 0;
+        loop {
+            let count = (data.len() - offset).min(WRITE_BYTES);
+            let mut staged = [0u8; WRITE_BYTES];
+            if count != 0 {
+                staged[..count].copy_from_slice(&data[offset..offset + count]);
             }
-            if normalize && ch == b'\n' {
-                emit(
-                    source,
-                    target,
-                    stream,
-                    b'\r',
-                    inherited,
-                    &mut source_changed,
-                    &mut target_changed,
-                );
-                emit(
-                    source,
-                    target,
-                    stream,
-                    b'\n',
-                    inherited,
-                    &mut source_changed,
-                    &mut target_changed,
-                );
-            } else {
-                emit(
-                    source,
-                    target,
-                    stream,
-                    ch,
-                    inherited,
-                    &mut source_changed,
-                    &mut target_changed,
-                );
+            let mut serial = SerialBatch {
+                bytes: [0; SERIAL_BYTES],
+                len: 0,
+            };
+            // All staging pages have been touched before the output owner.
+            crate::memory::owner::prepare_stack();
+            let Some(guard) = OutputGuard::acquire() else {
+                return true;
+            };
+            if (*console).text.closed {
+                return true;
             }
-        }
-        if !target.is_null() {
+            if offset == 0 {
+                add!(write_calls, 1);
+            }
+            let mut source_changed = false;
+            let mut target_changed = false;
+            for &byte in &staged[..count] {
+                for scalar in (*console)
+                    .text
+                    .push(stream as usize, byte)
+                    .into_iter()
+                    .flatten()
+                {
+                    if normalize && scalar == 13 {
+                        continue;
+                    }
+                    if normalize && scalar == 10 {
+                        emit_scalar(
+                            source,
+                            target,
+                            stream,
+                            13,
+                            inherited,
+                            &mut source_changed,
+                            &mut target_changed,
+                            &mut serial,
+                        );
+                    }
+                    emit_scalar(
+                        source,
+                        target,
+                        stream,
+                        scalar,
+                        inherited,
+                        &mut source_changed,
+                        &mut target_changed,
+                        &mut serial,
+                    );
+                }
+            }
+            if finish {
+                for index in 0..3 {
+                    if let Some(scalar) = (*console).text.finish(index) {
+                        emit_scalar(
+                            source,
+                            target,
+                            index as u32,
+                            scalar,
+                            inherited,
+                            &mut source_changed,
+                            &mut target_changed,
+                            &mut serial,
+                        );
+                    }
+                }
+                (*console).text.closed = true;
+            }
             if target == source {
                 if source_changed || target_changed {
                     revision(source, true, true);
@@ -981,17 +1138,152 @@ unsafe fn route(stream: u32, data: &[u8], normalize: bool) -> bool {
                 if source_changed {
                     revision(source, false, true);
                 }
-                if target_changed {
+                if !target.is_null() && target_changed {
                     revision(target, true, true);
                 }
             }
-        } else if source_changed {
-            revision(source, false, true);
+            // One serial enqueue per resident write batch. Native rendering and
+            // formatting have completed before acquiring the UART owner.
+            serial.publish();
+            drop(guard);
+            offset += count;
+            if offset == data.len() {
+                break;
+            }
         }
-        // Keep the exact target pin until the output guard has been released.
-        drop(_guard);
         drop(lease);
         true
+    }
+}
+pub(super) unsafe fn finish(instance: *mut ProgramInstance) {
+    let Some(_task) = crate::sched::task_context::Admission::acquire(false) else {
+        return;
+    };
+    crate::memory::owner::prepare_stack();
+    unsafe {
+        let routed = route_instance(instance, 0, &[], false, true);
+        if !routed
+            && !instance.is_null()
+            && !(*instance).console_payload.is_null()
+            && let Some(_guard) = OutputGuard::acquire()
+        {
+            // A console without a presentation target has never admitted text.
+            // Close its metadata as well; there is no pending decoder to drain.
+            let text = &mut (*payload::console(instance)).text;
+            assert!(text.pending() == 0);
+            text.closed = true;
+        }
+    }
+}
+pub(super) unsafe fn text_info(console: *const t::Console) -> contract::ConsoleTextInfo {
+    let text = unsafe { (*console).text };
+    contract::ConsoleTextInfo {
+        encoding: text.encoding,
+        pending_bytes: text.pending(),
+        decode_errors: text.errors,
+        truncated_sequences: text.truncated,
+        flags: u32::from(text.closed),
+        ..Default::default()
+    }
+}
+/// # Safety
+/// Exact fixed handle input/output spans belong to the admitted caller. No
+/// registry/output/pin owner survives the final pageable output copy.
+pub(crate) unsafe extern "C" fn api_text_info(
+    handle: *const contract::ProgramProcessHandle,
+    output: *mut contract::ConsoleTextInfo,
+) -> i32 {
+    if handle.is_null()
+        || output.is_null()
+        || !(handle as usize).is_multiple_of(8)
+        || !(output as usize).is_multiple_of(4)
+    {
+        return -1;
+    }
+    let Some(_task) = crate::sched::task_context::Admission::acquire(true) else {
+        return -1;
+    };
+    crate::memory::owner::prepare_stack();
+    let handle = unsafe { handle.read() };
+    if !registry::valid(handle) {
+        return -1;
+    }
+    let snapshot = if let Some(lease) = unsafe { Lease::handle(handle) } {
+        let instance = lease.0.instance;
+        if unsafe { (*instance).app_class != 0 || (*instance).console_payload.is_null() } {
+            return -1;
+        }
+        let Some(guard) = OutputGuard::acquire() else {
+            return -1;
+        };
+        let snapshot = unsafe { text_info(payload::console(instance)) };
+        drop(guard);
+        drop(lease);
+        snapshot
+    } else {
+        if !registry::lock() {
+            return -1;
+        }
+        let node = unsafe { registry::completion_handle(handle) };
+        let snapshot = if node.is_null() || unsafe { (*node).app_class != 0 } {
+            None
+        } else {
+            Some(unsafe { (*node).text_info })
+        };
+        registry::unlock();
+        let Some(snapshot) = snapshot else {
+            return -1;
+        };
+        snapshot
+    };
+    unsafe {
+        output.write(snapshot);
+    }
+    0
+}
+/// # Safety
+/// Exact fixed handle input retained by the admitted task until its copy.
+pub(crate) unsafe extern "C" fn api_set_encoding(
+    handle: *const contract::ProgramProcessHandle,
+    encoding: u32,
+) -> i32 {
+    if handle.is_null()
+        || !(handle as usize).is_multiple_of(8)
+        || !r4os_text_core::supported(encoding)
+    {
+        return -1;
+    }
+    let Some(_task) = crate::sched::task_context::Admission::acquire(true) else {
+        return -1;
+    };
+    let handle = unsafe { handle.read() };
+    if !registry::valid(handle) {
+        return -1;
+    }
+    let Some(lease) = (unsafe { Lease::handle(handle) }) else {
+        if !registry::lock() {
+            return -1;
+        }
+        let node = unsafe { registry::completion_handle(handle) };
+        let closed_console = !node.is_null() && unsafe { (*node).app_class == 0 };
+        registry::unlock();
+        return if closed_console { -2 } else { -1 };
+    };
+    let instance = lease.0.instance;
+    if unsafe { (*instance).app_class != 0 || (*instance).console_payload.is_null() } {
+        return -1;
+    }
+    let Some(_guard) = OutputGuard::acquire() else {
+        return -1;
+    };
+    if unsafe { AtomicBool::from_ptr(ptr::addr_of_mut!((*instance).done)).load(Ordering::Acquire) }
+    {
+        return -2;
+    }
+    if unsafe { (*payload::console(instance)).text.configure(encoding) } {
+        0
+    } else {
+        -2
     }
 }
 /// # Safety
@@ -1096,7 +1388,7 @@ pub unsafe extern "C" fn r4os_rust_program_console_source(
 pub unsafe extern "C" fn r4os_rust_program_console_writer(
     instance: *mut ProgramInstance,
 ) -> *mut t::ConsoleOutput {
-    unsafe { ensure_writer(instance) }
+    unsafe { ensure_writer(instance, 1) }
 }
 /// # Safety
 /// Exact retained instance and original caller admission for the selected work.
@@ -1140,7 +1432,7 @@ pub unsafe extern "C" fn r4os_rust_program_console_instance(
                 true
             }
             10 => {
-                cursor(instance, u8::try_from(value).expect("Console char"));
+                cursor(instance, u32::try_from(value).expect("Console scalar"));
                 true
             }
             11 => {
@@ -1186,7 +1478,7 @@ pub unsafe extern "C" fn r4os_rust_program_console_lines(
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_program_console_printable(ch: u8) -> bool {
-    unsafe { printable(ch) }
+    printable(u32::from(ch))
 }
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_program_console_stream(raw: u32) -> bool {
@@ -1237,67 +1529,80 @@ pub unsafe extern "C" fn r4os_rust_program_console_emit(
     }
 }
 /// # Safety
-/// Valid writable output span of capacity bytes. Lookup pins its exact instance.
+/// Valid writable output span of capacity bytes; task admission protects the
+/// caller while a resident snapshot is copied under the exact owner.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_console_api_output(
     id: u32,
     out: *mut u8,
     capacity: u32,
 ) -> i32 {
+    if capacity == 0 || out.is_null() {
+        return -2;
+    }
+    let Some(_task) = crate::sched::task_context::Admission::acquire(true) else {
+        return -1;
+    };
+    crate::memory::owner::prepare_stack();
+    unsafe { copy_output_snapshot(id, out, capacity) }
+}
+#[inline(never)]
+unsafe fn copy_output_snapshot(id: u32, out: *mut u8, capacity: u32) -> i32 {
     unsafe {
-        if capacity == 0 {
-            return -2;
-        }
-        if let Some(lease) = Lease::id(id) {
+        let mut resident = [0u8; CAPACITY];
+        let length = if let Some(lease) = Lease::id(id) {
             let instance = lease.0.instance;
-            if (*instance).console_payload.is_null() {
-                out.write(0);
+            if (*instance).app_class != 0 || (*instance).console_payload.is_null() {
                 return -3;
             }
-            let Some(_guard) = OutputGuard::acquire() else {
-                out.write(0);
+            let Some(guard) = OutputGuard::acquire() else {
                 return -1;
             };
             let transcript = transcript(instance);
-            if transcript.is_null() {
-                out.write(0);
-                return -3;
-            }
-            let count = read_tail(transcript, out, (capacity - 1) as usize);
-            out.add(count).write(0);
-            return i32::try_from(count).expect("Console output count");
-        }
-        if !registry::lock() {
-            return -1;
-        }
-        let completion = registry::completion_id(id);
-        let result = if completion.is_null() {
-            -1
-        } else if (*completion).app_class != 0 {
-            out.write(0);
-            -3
-        } else if (*completion).output_payload.is_null() {
-            out.write(0);
-            0
-        } else {
-            let length = (*completion).output_length as usize;
-            let count = ((capacity - 1) as usize).min(length);
-            let copied = read(
-                (*completion).output_payload.cast(),
-                length - count,
-                out,
-                count,
-            );
-            if copied != count {
-                out.write(0);
-                -1
+            let length = if transcript.is_null() {
+                0
             } else {
-                out.add(count).write(0);
-                i32::try_from(count).expect("Console completion count")
+                read_tail(transcript, resident.as_mut_ptr(), CAPACITY)
+            };
+            drop(guard);
+            drop(lease);
+            length
+        } else {
+            if !registry::lock() {
+                return -1;
+            }
+            let node = registry::completion_id(id);
+            let result = if node.is_null() {
+                None
+            } else if (*node).app_class != 0 {
+                Some(Err(-3))
+            } else if (*node).output_payload.is_null() {
+                Some(Ok(0))
+            } else {
+                let count = ((*node).output_length as usize).min(CAPACITY);
+                let copied = read(
+                    (*node).output_payload.cast(),
+                    0,
+                    resident.as_mut_ptr(),
+                    count,
+                );
+                Some(if copied == count { Ok(count) } else { Err(-1) })
+            };
+            registry::unlock();
+            match result {
+                Some(Ok(length)) => length,
+                Some(Err(error)) => return error,
+                None => return -1,
             }
         };
-        registry::unlock();
-        result
+        let mut start = length.saturating_sub((capacity as usize) - 1);
+        while start < length && r4os_text_core::continuation(resident[start]) {
+            start += 1;
+        }
+        let count = r4os_text_core::complete_prefix(&resident[start..length]);
+        ptr::copy_nonoverlapping(resident.as_ptr().add(start), out, count);
+        out.add(count).write(0);
+        count as i32
     }
 }
 #[unsafe(no_mangle)]
@@ -1325,40 +1630,55 @@ pub extern "C" fn r4os_rust_program_console_api_revision(id: u32) -> u32 {
     }
 }
 /// # Safety
-/// Exclusive canonical ConsoleState output; lookup retains the exact owner.
+/// Exclusive ConsoleState output retained by the admitted caller; no registry,
+/// output owner or instance pin spans the final pageable write.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_program_console_api_state(
     id: u32,
     out: *mut contract::ConsoleState,
 ) -> i32 {
-    unsafe {
+    if out.is_null() {
+        return -1;
+    }
+    let Some(_task) = crate::sched::task_context::Admission::acquire(true) else {
+        return -1;
+    };
+    crate::memory::owner::prepare_stack();
+    let result = unsafe {
         if let Some(lease) = Lease::id(id) {
             let instance = lease.0.instance;
             if (*instance).app_class != 0 {
-                out.write(Default::default());
                 return -2;
             }
             refresh(instance);
-            out.write((*payload::console(instance)).state);
-            return 0;
-        }
-        if !registry::lock() {
-            out.write(Default::default());
-            return -1;
-        }
-        let node = registry::completion_id(id);
-        let result = if node.is_null() {
-            out.write(Default::default());
-            -1
-        } else if (*node).app_class != 0 {
-            out.write(Default::default());
-            -2
+            let Some(guard) = OutputGuard::acquire() else {
+                return -1;
+            };
+            let snapshot = (*payload::console(instance)).state;
+            drop(guard);
+            drop(lease);
+            Some(snapshot)
         } else {
-            out.write((*node).console_state);
-            0
-        };
-        registry::unlock();
-        result
+            if !registry::lock() {
+                return -1;
+            }
+            let node = registry::completion_id(id);
+            let snapshot = if node.is_null() || (*node).app_class != 0 {
+                None
+            } else {
+                Some((*node).console_state)
+            };
+            registry::unlock();
+            snapshot
+        }
+    };
+    if let Some(snapshot) = result {
+        unsafe {
+            out.write(snapshot);
+        }
+        0
+    } else {
+        -1
     }
 }
 #[unsafe(no_mangle)]
@@ -1375,6 +1695,9 @@ pub extern "C" fn r4os_rust_program_console_api_metrics(id: u32, cols: u32, rows
         if (*instance).app_class != 0 {
             return -3;
         }
+        let Some(_guard) = OutputGuard::acquire() else {
+            return -1;
+        };
         let cols = cols.clamp(1, 512);
         let rows = rows.clamp(1, 256);
         let console = payload::console(instance);

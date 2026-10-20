@@ -16,6 +16,7 @@ pub(crate) mod serial_policy;
 pub mod performance;
 
 pub mod log_route;
+pub mod record;
 
 pub mod instrumentation;
 pub mod log_event;
