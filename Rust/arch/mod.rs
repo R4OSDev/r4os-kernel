@@ -36,5 +36,6 @@ pub mod smp_probe;
 pub mod tables;
 pub mod terminal_power;
 pub mod tlb;
+pub(crate) mod xsaveopt;
 pub(crate) mod xstate_contract;
 pub(crate) mod xstate_layout;

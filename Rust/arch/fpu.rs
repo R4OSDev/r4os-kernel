@@ -160,6 +160,7 @@ unsafe extern "C" {
     fn r4os_fxrstor(source: *const u8);
     fn r4os_xsave(dest: *mut u8, mask: u64);
     fn r4os_xrstor(source: *const u8, mask: u64);
+    fn r4os_xsaveopt(dest: *mut u8, mask: u64);
 }
 fn config() -> Status {
     unsafe { CONFIG.0.get().read() }.status()
@@ -369,6 +370,7 @@ pub fn init() -> bool {
     save_raw(value, initial);
     restore_raw(value, initial);
     publish(value, layout);
+    super::xsaveopt::report(0, value.backend == 2 && super::xsaveopt::local_supported());
     LOCAL_READY[0].store(true, Ordering::Release);
     log(2, &inherited);
     true
@@ -380,6 +382,7 @@ pub fn restore_initial() -> bool {
     let Some(d) = descriptor() else {
         return false;
     };
+    super::xsaveopt::clear();
     restore_raw(d.status(), d.initial);
     RESTORES.fetch_add(1, Ordering::Relaxed);
     true
@@ -390,6 +393,11 @@ pub(crate) fn init_ap(index: u32) -> Result<(), &'static [u8]> {
         return Err(b"cpu-index");
     };
     ready.store(false, Ordering::Release);
+    super::xsaveopt::reset(index);
+    let optional = super::xsaveopt::local_supported();
+    if super::xsaveopt::required() && !optional {
+        return Err(b"xsaveopt-common");
+    }
     if !crate::platform::module_cpu::allowed() || !INITIALIZED.load(Ordering::Acquire) {
         return Err(b"xsave-backend");
     }
@@ -439,6 +447,7 @@ pub(crate) fn init_ap(index: u32) -> Result<(), &'static [u8]> {
     }
     unsafe { r4os_fninit() };
     restore_raw(value, d.initial);
+    super::xsaveopt::report(index, optional);
     ready.store(true, Ordering::Release);
     Ok(())
 }
@@ -471,10 +480,12 @@ pub unsafe extern "C" fn r4os_rust_fpu_buffer(operation: u8, buffer: *mut u8, le
             TASK_BYTES.fetch_add(u64::from(d.contract.bytes), Ordering::Relaxed);
         }
         1 => {
+            super::xsaveopt::clear();
             save_raw(value, buffer);
             SAVES.fetch_add(1, Ordering::Relaxed);
         }
         2 => {
+            super::xsaveopt::clear();
             restore_raw(value, buffer);
             RESTORES.fetch_add(1, Ordering::Relaxed);
         }
@@ -560,4 +571,36 @@ unsafe fn fpu_log(event: u8, status: *const Status, inherited: *const u64) {
     puts(b" cr4=0x");
     hex(s.cr4, 16);
     puts(b"\r\n");
+}
+
+/// # Safety
+/// Exact native id/generation/image under existing runtime admission and IF=0.
+/// Initial headers come from operation0; no image borrow survives a switch.
+pub(crate) unsafe fn save_task(buffer: *mut u8, len: usize, id: u32, generation: u64) -> bool {
+    let Some(d) = descriptor() else {
+        return false;
+    };
+    if !d.contract.buffer(buffer.addr(), len) {
+        return false;
+    }
+    let optional =
+        d.contract.standard() && super::xsaveopt::matching(id, generation, buffer.addr());
+    if optional {
+        unsafe { r4os_xsaveopt(buffer, d.contract.mask) };
+    } else {
+        save_raw(d.status(), buffer);
+    }
+    SAVES.fetch_add(1, Ordering::Relaxed);
+    super::xsaveopt::saved(optional);
+    true
+}
+/// # Safety
+/// Same exact task/image admission; hardware XRSTOR_INFO additionally enforces
+/// CPL/VMX/address/standard-layout correspondence before modified optimization.
+pub(crate) unsafe fn restore_task(buffer: *mut u8, len: usize, id: u32, generation: u64) -> bool {
+    if !unsafe { r4os_rust_fpu_buffer(2, buffer, len) } {
+        return false;
+    }
+    super::xsaveopt::restored(id, generation, buffer.addr());
+    true
 }

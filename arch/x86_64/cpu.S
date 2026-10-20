@@ -182,6 +182,15 @@ r4os_xsave:
     xsave64 (%rdi)
     ret
 
+.global r4os_xsaveopt
+.type r4os_xsaveopt, @function
+r4os_xsaveopt:
+    mov %esi, %eax
+    mov %rsi, %rdx
+    shr $32, %rdx
+    xsaveopt64 (%rdi)
+    ret
+
 .global r4os_xrstor
 .type r4os_xrstor, @function
 r4os_xrstor:

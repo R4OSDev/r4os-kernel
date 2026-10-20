@@ -558,6 +558,7 @@ fn activate() {
     }
     unsafe { tlb::r4os_rust_tlb_register(Some(send_tlb_ipi)) };
     cpu_topology::seal(percpu::r4os_rust_percpu_control(6, 0, 0, 0));
+    super::xsaveopt::seal(configured());
     for index in 1..configured() {
         if percpu::state(index) == 8
             && apic(index).is_some_and(|id| ap_admission::qualified(index, id, epoch(index)))

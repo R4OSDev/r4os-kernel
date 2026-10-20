@@ -162,5 +162,12 @@
     "type": "u32",
     "default": 0,
     "description": "Private early BSP-only FPU backend fixture:1=FXSAVE,2=XSAVE mask3; real supported instructions, no modules admitted, no CPU feature override"
+  },
+  {
+    "name": "xsaveopt-policy",
+    "config": "xsaveopt_policy",
+    "type": "u32",
+    "default": 1,
+    "description": "Optional standard task save:0=classic,1=auto only after all configured CPUs qualify before AP release; no new XSTATE component"
   }
 ]

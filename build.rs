@@ -117,6 +117,9 @@ fn main() {
             generated.push_str(&format!("pub const {key}: bool = {value};\n"));
         } else {
             let value: u32 = value.parse().expect("u32 kernel option");
+            if key == "XSAVEOPT_POLICY" {
+                assert!(value <= 1, "XSAVEOPT policy is0classic or1auto");
+            }
             if key == "FPU_BACKEND_DIAGNOSTIC" {
                 assert!(value <= 2, "FPU backend diagnostic selector is 0, 1 or 2");
             }

@@ -65,6 +65,7 @@ pub(crate) fn publish_task(cpu: u32, id: u32, generation: u64) {
     };
     let n = s.seq.load(Ordering::Relaxed);
     s.seq.store(n.wrapping_add(1), Ordering::Release);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
     s.id.store(id, Ordering::Relaxed);
     s.generation.store(generation, Ordering::Relaxed);
     s.seq.store(n.wrapping_add(2), Ordering::Release);
@@ -75,8 +76,10 @@ fn task(cpu: u32) -> Option<(u32, u64)> {
     if n & 1 != 0 {
         return None;
     }
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
     let id = s.id.load(Ordering::Relaxed);
     let generation = s.generation.load(Ordering::Relaxed);
+    core::sync::atomic::compiler_fence(Ordering::SeqCst);
     if id == 0 || generation == 0 || n != s.seq.load(Ordering::Acquire) {
         None
     } else {

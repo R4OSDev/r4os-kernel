@@ -5,6 +5,7 @@ mod deadlines;
 mod fpu;
 mod fpu_contract;
 mod fpu_environment;
+mod fpu_opt;
 mod helpers;
 pub(crate) mod live;
 mod owner_snapshots;
@@ -74,6 +75,9 @@ fn boot_cases() -> bool {
             }
             helpers::puts(b"TASKREG08244 idle-timeout PASS due=65 bounded=64+1 future=held timer-irq=unchanged\r\n");
             return true;
+        }
+        if option_is(value, b"xsaveopt") {
+            return fpu_opt::run();
         }
         if option_is(value, b"xstate-contract") {
             return fpu_contract::run();

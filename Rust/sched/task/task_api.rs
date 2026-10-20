@@ -351,6 +351,9 @@ pub unsafe extern "C" fn r4os_rust_task_mutate(
             19 | 20 => {
                 let c = registry::core(task);
                 if !(*c).uses_fpu {
+                    if operation == 20 {
+                        crate::arch::xsaveopt::clear();
+                    }
                     if operation == 19 {
                         (*registry::raw()).fpu_lazy_skips =
                             (*registry::raw()).fpu_lazy_skips.wrapping_add(1);
@@ -360,11 +363,21 @@ pub unsafe extern "C" fn r4os_rust_task_mutate(
                 let valid = (*c).fpu_state_valid
                     && fpu::descriptor().is_some_and(|d| (*c).fpu_state_bytes == d.contract.bytes)
                     && (*c).fpu_state.is_some_and(|bytes| {
-                        fpu::r4os_rust_fpu_buffer(
-                            if operation == 19 { 1 } else { 2 },
-                            bytes.pointer.cast_mut(),
-                            bytes.len,
-                        )
+                        if operation == 19 {
+                            fpu::save_task(
+                                bytes.pointer.cast_mut(),
+                                bytes.len,
+                                (*c).id,
+                                (*c).generation,
+                            )
+                        } else {
+                            fpu::restore_task(
+                                bytes.pointer.cast_mut(),
+                                bytes.len,
+                                (*c).id,
+                                (*c).generation,
+                            )
+                        }
                     });
                 if !valid {
                     (*c).fpu_state_valid = false;
