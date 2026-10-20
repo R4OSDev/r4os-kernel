@@ -93,6 +93,8 @@ static TABLE: Table = Table(UnsafeCell::new(contract::ProtocolApi {
     alloc,
     free,
     file_read,
+    cpu_acceleration_info: Some(crate::program::r4dev::cpu_capabilities::acceleration_info),
+    cpu_acceleration_work: Some(crate::program::r4dev::cpu_capabilities::acceleration_work),
 }));
 
 unsafe fn length(text: *const u8) -> usize {
@@ -174,8 +176,11 @@ pub unsafe extern "C" fn r4os_rust_protocol_table() -> *mut contract::ProtocolAp
     TABLE.0.get()
 }
 const _: () = {
-    assert!(mem::size_of::<contract::ProtocolApi>() == 88);
+    assert!(mem::size_of::<contract::ProtocolApi>() == 104);
     assert!(mem::offset_of!(contract::ProtocolApi, file_read) == 80);
+    assert!(mem::offset_of!(contract::ProtocolApi, cpu_acceleration_info) == 88);
+    assert!(mem::offset_of!(contract::ProtocolApi, cpu_acceleration_work) == 96);
+    assert!(contract::protocol_api_version == 1);
 };
 
 unsafe fn protocol_file_read(path: *const u8, out: *mut u8, len: u32) -> i32 {

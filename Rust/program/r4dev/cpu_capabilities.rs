@@ -19,6 +19,46 @@ unsafe fn valid<T>(out: *mut T) -> bool {
     }
 }
 /// # Safety
+/// Exclusive initialized fixed output/capacity; cached metadata only.
+pub(crate) unsafe extern "C" fn acceleration_info(out: *mut c::CpuAccelerationInfo) -> i32 {
+    if !unsafe { valid(out) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match crate::platform::cpu_acceleration::info() {
+        Ok(value) => {
+            unsafe { out.write(value) };
+            0
+        }
+        Err(reason) => reason,
+    }
+}
+/// # Safety
+/// Caller retains a live aligned typed function slot, pure resident staged
+/// work/context, and exclusive output through the synchronous exact window.
+pub(crate) unsafe extern "C" fn acceleration_work(
+    kind: u32,
+    iterations: u32,
+    work: *const c::CpuPureWorkFn,
+    context: u64,
+    out: *mut c::CpuAccelerationWork,
+) -> i32 {
+    if !unsafe { valid(out) } || work.is_null() || !work.is_aligned() {
+        return c::cpu_capabilities_error_invalid;
+    }
+    // Never materialize an invalid zero Rust function pointer.
+    if unsafe { work.cast::<u64>().read() } == 0 {
+        return c::cpu_capabilities_error_invalid;
+    }
+    let callback = unsafe { work.read() };
+    match crate::platform::cpu_acceleration::work(kind, iterations, callback, context) {
+        Ok(scope) => {
+            unsafe { out.write(scope.value) };
+            0
+        }
+        Err(reason) => reason,
+    }
+}
+/// # Safety
 /// Exclusive initialized fixed output/capacity; cached copies only.
 pub(crate) unsafe extern "C" fn pmu_info(index: u32, out: *mut c::CpuPmuInfo) -> i32 {
     if !unsafe { valid(out) } {

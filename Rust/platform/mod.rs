@@ -3,6 +3,8 @@ pub mod boot;
 pub mod clock_math;
 pub mod clocksource;
 pub mod cpu;
+pub(crate) mod cpu_acceleration;
+pub(crate) mod cpu_acceleration_window;
 pub(crate) mod cpu_capabilities;
 pub(crate) mod cpu_capabilities_decode;
 pub(crate) mod cpu_capabilities_features;

@@ -294,9 +294,29 @@ const FEATURES: &[Feature] = &[
         Any,
         Efer(10),
     ),
+    // Optional hints/ISA stay separate from the common compiler baseline.
+    f(c::cpu_feature_id_sha, b"sha", 7, 1, 29, Any, Sse),
+    f(c::cpu_feature_id_erms, b"erms", 7, 1, 9, Any, None),
+    f(c::cpu_feature_id_fsrm, b"fsrm", 7, 3, 4, Any, None),
+    f(c::cpu_feature_id_bmi1, b"bmi1", 7, 1, 3, Any, None),
+    f(c::cpu_feature_id_bmi2, b"bmi2", 7, 1, 8, Any, None),
+    f(c::cpu_feature_id_adx, b"adx", 7, 1, 19, Any, None),
 ];
 pub(crate) fn count() -> u32 {
     FEATURES.len() as u32
+}
+pub(crate) fn by_id(s: &Snapshot, cpu: u32, id: u32) -> Option<c::CpuFeatureInfo> {
+    let index = FEATURES.iter().position(|f| f.id == id)?;
+    feature(s, cpu, index as u32).ok()
+}
+pub(crate) fn usable(s: &Snapshot, cpu: u32, id: u32) -> bool {
+    by_id(s, cpu, id).is_some_and(|f| {
+        f.hardware_state == c::cpu_feature_hardware_present
+            && matches!(
+                f.os_state,
+                c::cpu_feature_os_enabled | c::cpu_feature_os_not_applicable
+            )
+    })
 }
 fn applicable(v: Vendor, raw: &super::cpu_capabilities_decode::Raw) -> bool {
     let name = raw.vendor();
