@@ -19,6 +19,68 @@ unsafe fn valid<T>(out: *mut T) -> bool {
     }
 }
 /// # Safety
+/// Exclusive initialized fixed output/capacity; cached copies only.
+pub(crate) unsafe extern "C" fn pmu_info(index: u32, out: *mut c::CpuPmuInfo) -> i32 {
+    if !unsafe { valid(out) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match crate::platform::cpu_pmu::info(index) {
+        Ok(value) => {
+            unsafe { out.write(value) };
+            0
+        }
+        Err(reason) => reason,
+    }
+}
+/// # Safety
+/// The caller retains a live aligned typed callback slot, resident pure work
+/// and context, and exclusive output through this synchronous call. No Rust
+/// reference to the slot/output survives the module callback.
+pub(crate) unsafe extern "C" fn pmu_measure(
+    index: u32,
+    epoch: u64,
+    event: u32,
+    iterations: u32,
+    work: *const c::PmuWorkFn,
+    context: u64,
+    out: *mut c::CpuPmuResult,
+) -> i32 {
+    if !unsafe { valid(out) } || work.is_null() || !work.is_aligned() {
+        return c::cpu_capabilities_error_invalid;
+    }
+    // Read raw bits before creating a nonnull Rust function-pointer value.
+    if unsafe { work.cast::<u64>().read() } == 0 {
+        return c::cpu_capabilities_error_invalid;
+    }
+    let callback = unsafe { work.read() };
+    match crate::platform::cpu_pmu::measure(index, epoch, event, iterations, callback, context) {
+        Ok(measured) => {
+            unsafe { out.write(measured.value) };
+            0
+        }
+        Err(reason) => reason,
+    }
+}
+/// # Safety
+/// Exclusive fixed output; exact original identity, no hardware operation.
+pub(crate) unsafe extern "C" fn pmu_result(
+    index: u32,
+    epoch: u64,
+    generation: u64,
+    out: *mut c::CpuPmuResult,
+) -> i32 {
+    if !unsafe { valid(out) } {
+        return c::cpu_capabilities_error_invalid;
+    }
+    match crate::platform::cpu_pmu::result(index, epoch, generation) {
+        Ok(value) => {
+            unsafe { out.write(value) };
+            0
+        }
+        Err(reason) => reason,
+    }
+}
+/// # Safety
 /// Exclusive initialized fixed output/capacity. No CPU operation or callback.
 pub(crate) unsafe extern "C" fn microcode(index: u32, out: *mut c::CpuMicrocodeInfo) -> i32 {
     if !unsafe { valid(out) } {
