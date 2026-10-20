@@ -61,6 +61,7 @@ pub unsafe extern "C" fn r4os_rust_driver_resource_api(out: *mut a::DriverResour
         acpi_read_at: resource_acpi_read as *const () as usize as u64,
         platform_query: platform_query as *const () as usize as u64,
         cpu_power_query: super::api_cpu::query as *const () as usize as u64,
+        entropy_query: super::entropy::query as *const () as usize as u64,
         ..a::DriverResourceApi::default()
     };
     if !unsafe { resource_state::r4os_rust_resource_publish(out, &value) } {

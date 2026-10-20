@@ -17,6 +17,8 @@ pub mod api_validation;
 pub mod dma_segments;
 pub mod driver_plan;
 pub mod driver_policy;
+pub(crate) mod entropy;
+pub(crate) mod entropy_policy;
 pub mod heap;
 pub mod irq_router;
 pub mod memory_owner;

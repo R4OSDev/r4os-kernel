@@ -10,13 +10,14 @@ use crate::{
     contract as c,
     sched::task_context::Admission,
 };
-const FEATURES: [(u32, u64); 6] = [
+const FEATURES: [(u32, u64); 7] = [
     (c::cpu_feature_id_sha, c::cpu_accel_feature_sha as u64),
     (c::cpu_feature_id_erms, c::cpu_accel_feature_erms as u64),
     (c::cpu_feature_id_fsrm, c::cpu_accel_feature_fsrm as u64),
     (c::cpu_feature_id_bmi1, c::cpu_accel_feature_bmi1 as u64),
     (c::cpu_feature_id_bmi2, c::cpu_accel_feature_bmi2 as u64),
     (c::cpu_feature_id_adx, c::cpu_accel_feature_adx as u64),
+    (c::cpu_feature_id_rdrand, c::cpu_accel_feature_rdrand as u64),
 ];
 fn masks(s: &Snapshot, index: u32) -> (u64, u64) {
     let (mut hardware, mut os) = (0, 0);
@@ -51,7 +52,7 @@ pub(crate) fn info() -> Result<c::CpuAccelerationInfo, i32> {
     let s = catalog::at_epoch(index, epoch)?;
     let (hardware, os) = masks(&s, index);
     let configured = cpu_topology::count();
-    let (mut common, mut known) = (63u64, 0u32);
+    let (mut common, mut known) = (127u64, 0u32);
     for cpu in 0..configured {
         if let Ok(peer) = catalog::snapshot(cpu) {
             common &= masks(&peer, cpu).0;
@@ -137,7 +138,7 @@ pub(crate) fn work(
     callback: c::CpuPureWorkFn,
     context: u64,
 ) -> Result<Work, i32> {
-    if kind > c::cpu_accel_work_kind_sha256
+    if kind > c::cpu_accel_work_kind_rdrand
         || iterations == 0
         || iterations > c::cpu_accel_max_iterations
     {
@@ -152,6 +153,8 @@ pub(crate) fn work(
     if !baseline_ready(&s, index)
         || kind == c::cpu_accel_work_kind_sha256
             && !features::usable(&s, index, c::cpu_feature_id_sha)
+        || kind == c::cpu_accel_work_kind_rdrand
+            && !features::usable(&s, index, c::cpu_feature_id_rdrand)
     {
         return Err(c::cpu_capabilities_error_unsupported);
     }
@@ -191,6 +194,8 @@ pub(crate) fn work(
         },
         granted_mask: if kind == c::cpu_accel_work_kind_sha256 {
             c::cpu_accel_feature_sha as u64
+        } else if kind == c::cpu_accel_work_kind_rdrand {
+            c::cpu_accel_feature_rdrand as u64
         } else {
             0
         },

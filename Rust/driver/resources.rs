@@ -46,6 +46,23 @@ unsafe fn binding(owner: u32) -> Option<Binding> {
     }
     Some(unsafe { value.read() })
 }
+/// Copied identity only under the exact wait-spanning DriverApi owner. Closing
+/// bindings remain usable solely for the owner's terminal unregister/cleanup.
+pub(crate) fn owned_binding(owner: u32, allow_closing: bool) -> Option<Binding> {
+    if owner == 0
+        || owner as usize > MAX_DRIVERS
+        || super::api_admission::r4os_rust_driver_api_owner_scalar(2) != owner
+    {
+        return None;
+    }
+    let value = unsafe {
+        ptr::addr_of!((*STATE.0.get()).bindings)
+            .cast::<Binding>()
+            .add(owner as usize - 1)
+            .read()
+    };
+    (value.epoch != 0 && (allow_closing || !value.closing)).then_some(value)
+}
 fn valid_read(len: usize, deadline: u64) -> bool {
     len != 0
         && len <= a::driver_resource_max_read_bytes as usize

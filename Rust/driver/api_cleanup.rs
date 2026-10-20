@@ -66,6 +66,7 @@ fn log(event: u8, owner: u32) {
     unsafe { driver_cleanup_log(event, owner, ptr::null()) }
 }
 fn close_data(owner: u32) {
+    super::entropy::close(owner);
     unsafe {
         resource_state::r4os_rust_resource_state_mutate(
             resources::r4os_rust_driver_resource_state(),
@@ -95,6 +96,9 @@ unsafe fn net_finish(token: *mut Token, quarantine: bool) {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_driver_cleanup_prepare(owner: u32, out: *mut Token) -> bool {
     if !bound(owner) {
+        return false;
+    }
+    if !super::entropy::prepare_close(owner) {
         return false;
     }
     if backend(0, owner) != 0 || backend(1, owner) != 0 {
@@ -189,6 +193,7 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_quarantine(token: *mut Token) 
     {
         return false;
     }
+    super::entropy::retained(unsafe { (*token).owner });
     unsafe {
         storage::r4os_rust_driver_storage_cancel_plan(ptr::addr_of_mut!((*token).storage_plan));
         net_finish(token, true);
@@ -199,6 +204,9 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_quarantine(token: *mut Token) 
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_driver_system_transition(owner: u32, op: u8) -> bool {
     if !bound(owner) {
+        return false;
+    }
+    if !super::entropy::prepare_close(owner) {
         return false;
     }
     match op {
@@ -279,6 +287,10 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_commit(token: *mut Token) -> b
         return false;
     }
     if !crate::platform::cpu_power::finish_close(owner) {
+        unsafe { r4os_rust_driver_cleanup_quarantine(token) };
+        return false;
+    }
+    if !super::entropy::ready_to_finish(owner) {
         unsafe { r4os_rust_driver_cleanup_quarantine(token) };
         return false;
     }
@@ -385,6 +397,10 @@ pub unsafe extern "C" fn r4os_rust_driver_cleanup_commit(token: *mut Token) -> b
     count.cpu_heap = result.released;
     count.cpu_bytes = result.bytes;
     backend(9, owner);
+    assert!(
+        super::entropy::finish(owner),
+        "entropy final cleanup identity"
+    );
     unsafe {
         resource_state::r4os_rust_resource_state_mutate(
             resources::r4os_rust_driver_resource_state(),

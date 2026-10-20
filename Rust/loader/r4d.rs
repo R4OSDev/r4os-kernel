@@ -855,7 +855,10 @@ fn transition() -> bool {
     let mut stopped = 0;
     for i in 0..N {
         let d = unsafe { ptr::read(md(i)) };
-        if d.used && d.quarantined && transition_kind(d.kind) {
+        if d.used
+            && d.quarantined
+            && (transition_kind(d.kind) || crate::driver::entropy::has_module(d.module_slot))
+        {
             report(
                 b"[R4D] system-transition quarantined module blocks warm reset name=",
                 d.name.bytes(),
@@ -866,7 +869,10 @@ fn transition() -> bool {
     }
     for index in (0..N).rev() {
         let p = rt(index);
-        if unsafe { !(*p).used || !transition_kind((*p).kind) } {
+        if unsafe {
+            !(*p).used
+                || !(transition_kind((*p).kind) || crate::driver::entropy::has_owner((*p).owner))
+        } {
             continue;
         }
         if unsafe { (*p).quarantined } {
@@ -891,7 +897,7 @@ fn transition() -> bool {
             continue;
         }
         let display = unsafe { (*p).kind == 6 };
-        let audio = unsafe { (*p).kind == 1 };
+        let audio = unsafe { (*p).kind == 1 } || crate::driver::entropy::has_owner(owner);
         if display && !cleanup::r4os_rust_driver_system_transition(owner, 0) {
             quarantine(p);
             log(b"[R4D] system-transition display admission failed\r\n");

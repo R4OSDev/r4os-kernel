@@ -307,12 +307,16 @@ fn configure_sys() {
         thread_placement_set: super::thread_placement::set as *const () as usize,
         system_power_transition: crate::program::system::control::power_transition as *const ()
             as usize,
+        entropy_source_info: crate::driver::entropy::info as *const () as usize,
+        entropy_fill: crate::driver::entropy::fill as *const () as usize,
         ..Default::default()
     };
     SYS.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1288);
+    assert!(mem::size_of::<c::R4XStartR4Sys>() == 1304);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, entropy_source_info) == 1288);
+    assert!(mem::offset_of!(c::R4XStartR4Sys, entropy_fill) == 1296);
     assert!(mem::offset_of!(c::R4XStartR4Sys, magic) == 0);
     assert!(mem::offset_of!(c::R4XStartR4Sys, abi_version) == 4);
     assert!(mem::offset_of!(c::R4XStartR4Sys, size) == 8);
