@@ -8,3 +8,4 @@ pub mod metadata;
 pub mod mouse;
 pub mod physical_key;
 pub mod platform_input;
+pub mod text_events;

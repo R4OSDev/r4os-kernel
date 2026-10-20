@@ -194,34 +194,49 @@ pub unsafe extern "C" fn r4os_rust_program_diagnostic_input(
         (*out).gui_mouse_move_evicted =
             (*gui_events::r4os_rust_program_gui_events_state()).mouse_move_evicted;
         (*out).gui_rejected = (*gui_events::r4os_rust_program_gui_events_state()).rejected;
-        (*out).console_push_calls =
-            (*console_input::r4os_rust_program_console_input_state()).push_calls;
-        (*out).console_batch_calls =
-            (*console_input::r4os_rust_program_console_input_state()).batch_calls;
-        (*out).console_bytes_attempted =
-            (*console_input::r4os_rust_program_console_input_state()).bytes_attempted;
-        (*out).console_bytes_accepted =
-            (*console_input::r4os_rust_program_console_input_state()).bytes_accepted;
-        (*out).console_full_events =
-            (*console_input::r4os_rust_program_console_input_state()).full_events;
-        (*out).console_read_calls =
-            (*console_input::r4os_rust_program_console_input_state()).read_calls;
-        (*out).console_read_empty =
-            (*console_input::r4os_rust_program_console_input_state()).read_empty;
-        (*out).console_read_bytes =
-            (*console_input::r4os_rust_program_console_input_state()).read_bytes;
-        (*out).console_wait_calls =
-            (*console_input::r4os_rust_program_console_input_state()).wait_calls;
-        (*out).console_wait_blocks =
-            (*console_input::r4os_rust_program_console_input_state()).wait_blocks;
-        (*out).console_wait_immediate =
-            (*console_input::r4os_rust_program_console_input_state()).wait_immediate;
-        (*out).console_wait_wakes =
-            (*console_input::r4os_rust_program_console_input_state()).wait_wakes;
-        (*out).console_wait_timeouts =
-            (*console_input::r4os_rust_program_console_input_state()).wait_timeouts;
+        (*out).console_push_calls = (*console_input::r4os_rust_program_console_input_state())
+            .push_calls
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_batch_calls = (*console_input::r4os_rust_program_console_input_state())
+            .batch_calls
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_bytes_attempted = (*console_input::r4os_rust_program_console_input_state())
+            .bytes_attempted
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_bytes_accepted = (*console_input::r4os_rust_program_console_input_state())
+            .bytes_accepted
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_full_events = (*console_input::r4os_rust_program_console_input_state())
+            .full_events
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_read_calls = (*console_input::r4os_rust_program_console_input_state())
+            .read_calls
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_read_empty = (*console_input::r4os_rust_program_console_input_state())
+            .read_empty
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_read_bytes = (*console_input::r4os_rust_program_console_input_state())
+            .read_bytes
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_wait_calls = (*console_input::r4os_rust_program_console_input_state())
+            .wait_calls
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_wait_blocks = (*console_input::r4os_rust_program_console_input_state())
+            .wait_blocks
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_wait_immediate = (*console_input::r4os_rust_program_console_input_state())
+            .wait_immediate
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_wait_wakes = (*console_input::r4os_rust_program_console_input_state())
+            .wait_wakes
+            .load(core::sync::atomic::Ordering::Relaxed);
+        (*out).console_wait_timeouts = (*console_input::r4os_rust_program_console_input_state())
+            .wait_timeouts
+            .load(core::sync::atomic::Ordering::Relaxed);
         (*out).console_wait_cancellations =
-            (*console_input::r4os_rust_program_console_input_state()).wait_cancellations;
+            (*console_input::r4os_rust_program_console_input_state())
+                .wait_cancellations
+                .load(core::sync::atomic::Ordering::Relaxed);
         (*out).console_output_write_calls =
             (*console::r4os_rust_program_console_state()).write_calls;
         (*out).console_output_source_bytes =

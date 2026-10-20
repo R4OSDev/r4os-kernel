@@ -94,7 +94,8 @@ pub struct Console {
     pub host: u32,
     pub io_target_id: u32,
     pub state: contract::ConsoleState,
-    pub input_queue: [u8; 4096],
+    pub input_queue: [u32; 4096],
+    pub input_pending_bytes: u32,
 }
 
 #[repr(C)]
@@ -670,12 +671,13 @@ const _: () = {
     assert!(mem::offset_of!(ConsoleTranscript, segment_count) == 6160);
     assert!(mem::offset_of!(ConsoleTranscript, output_len) == 6164);
     assert!(mem::offset_of!(ConsoleTranscript, segments) == 0);
-    assert!(mem::size_of::<Console>() == 4368);
+    assert!(mem::size_of::<Console>() == 16664);
     assert!(mem::align_of::<Console>() == 8);
     assert!(mem::offset_of!(Console, header) == 176);
     assert!(mem::offset_of!(Console, transcript_payload) == 0);
     assert!(mem::offset_of!(Console, writer_payload) == 8);
     assert!(mem::offset_of!(Console, input_queue) == 272);
+    assert!(mem::offset_of!(Console, input_pending_bytes) == 16656);
     assert!(mem::offset_of!(Console, input_head) == 16);
     assert!(mem::offset_of!(Console, input_tail) == 24);
     assert!(mem::offset_of!(Console, input_high_water) == 192);

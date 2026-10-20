@@ -594,12 +594,16 @@ fn configure_desk() {
             as *const () as usize,
         desktop_activity_notify: super::platform_callbacks::desk_desktop_activity_notify
             as *const () as usize,
+        console_read_events: super::console_input::read_events as *const () as usize,
+        console_push_events: super::console_input::push_events as *const () as usize,
         ..Default::default()
     };
     DESK.configure(value);
 }
 const _: () = {
-    assert!(mem::size_of::<c::R4XStartR4Desk>() == 536);
+    assert!(mem::size_of::<c::R4XStartR4Desk>() == 552);
+    assert!(mem::offset_of!(c::R4XStartR4Desk, console_read_events) == 536);
+    assert!(mem::offset_of!(c::R4XStartR4Desk, console_push_events) == 544);
     assert!(mem::offset_of!(c::R4XStartR4Desk, magic) == 0);
     assert!(mem::offset_of!(c::R4XStartR4Desk, abi_version) == 4);
     assert!(mem::offset_of!(c::R4XStartR4Desk, size) == 8);

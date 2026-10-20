@@ -1,7 +1,10 @@
 //! Sole keyboard decoder/queues. Short IRQ-safe metadata never spans polling
 //! callbacks or scheduler work. The wait predicate sees an atomic projection;
 //! publication precedes the Runtime-owned sequence increment and wake.
-use super::{codepoint_queue as cp, key_layout, metadata::MetadataLock, physical_key as physical};
+use super::{
+    codepoint_queue as cp, key_layout, metadata::MetadataLock, physical_key as physical,
+    text_events,
+};
 use crate::{
     arch::{io, pic},
     platform::timer,
@@ -111,7 +114,10 @@ impl State {
         self.extended = false;
     }
     fn push(&mut self, codepoint: u32, wake: &mut Wake) {
-        if !self.queue.try_push(codepoint) {
+        let Some(word) = text_events::native_word(codepoint) else {
+            return;
+        };
+        if !self.queue.try_push(word) {
             return;
         }
         self.decoded_count = self.decoded_count.wrapping_add(1);
@@ -262,6 +268,9 @@ pub fn controller_byte(scan: u8) {
     publish(w);
 }
 pub fn read_codepoint() -> Option<u32> {
+    read_codepoint_limited(false)
+}
+pub(crate) fn read_codepoint_limited(byte: bool) -> Option<u32> {
     let poll = state(|s| s.poll_hook);
     if let Some(poll) = poll {
         unsafe { poll() }
@@ -271,6 +280,20 @@ pub fn read_codepoint() -> Option<u32> {
         let value = unsafe { hook() };
         if value != 0 {
             return Some(u32::from(value));
+        }
+    }
+    state(|s| text_events::take_legacy(&mut s.queue, byte))
+}
+pub(crate) fn read_event_word() -> Option<u32> {
+    let poll = state(|s| s.poll_hook);
+    if let Some(poll) = poll {
+        unsafe { poll() }
+    }
+    let hook = state(|s| s.input_hook);
+    if let Some(hook) = hook {
+        let value = unsafe { hook() };
+        if value != 0 {
+            return text_events::native_word(u32::from(value));
         }
     }
     state(|s| s.queue.pop())
@@ -478,7 +501,7 @@ const _: () = {
 /// # Safety
 /// Caller retains readable text or an aligned exclusive output, as appropriate. Wait outputs remain live through scheduling; no runtime/metadata lock spans the call.
 pub unsafe extern "C" fn r4os_rust_input_keyboard_read_char(out: *mut u8) -> bool {
-    let Some(value) = read_codepoint() else {
+    let Some(value) = read_codepoint_limited(true) else {
         return false;
     };
     let Ok(value) = u8::try_from(value) else {

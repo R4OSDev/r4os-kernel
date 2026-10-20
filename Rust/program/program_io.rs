@@ -193,13 +193,19 @@ pub extern "C" fn r4os_rust_program_io_key(byte: bool) -> u32 {
     }
     unsafe {
         let state = console_input::r4os_rust_program_console_input_state();
-        (*state).read_calls = (*state).read_calls.wrapping_add(1);
+        (*state)
+            .read_calls
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let mut value = 0;
         if !console_input::r4os_rust_program_console_input_read(&mut value, byte) {
-            (*state).read_empty = (*state).read_empty.wrapping_add(1);
+            (*state)
+                .read_empty
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
             return 0;
         }
-        (*state).read_bytes = (*state).read_bytes.wrapping_add(1);
+        (*state)
+            .read_bytes
+            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         value
     }
 }

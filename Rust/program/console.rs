@@ -640,13 +640,7 @@ unsafe fn stream_count(instance: *mut ProgramInstance, stream: u32) {
 }
 pub(super) unsafe fn pending_locked(console: *mut t::Console) {
     unsafe {
-        (*console).state.stdin_pending =
-            u32::try_from(if (*console).input_head >= (*console).input_tail {
-                (*console).input_head - (*console).input_tail
-            } else {
-                4096 - (*console).input_tail + (*console).input_head
-            })
-            .expect("Console pending bytes");
+        (*console).state.stdin_pending = (*console).input_pending_bytes;
     }
 }
 unsafe fn pending(instance: *mut ProgramInstance) {

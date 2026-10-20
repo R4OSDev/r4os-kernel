@@ -46,6 +46,13 @@ impl Queue {
         self.high_water = self.high_water.max(self.pending_count());
         true
     }
+    pub fn peek(&self) -> Option<u32> {
+        if self.head == self.tail {
+            None
+        } else {
+            Some(self.items[self.tail])
+        }
+    }
     pub fn pop(&mut self) -> Option<u32> {
         if self.head == self.tail {
             return None;
