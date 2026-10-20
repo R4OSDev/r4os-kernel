@@ -89,7 +89,7 @@ pub fn elapsed(start: Stamp, end: Stamp) -> Option<u64> {
 }
 pub fn snapshot() -> Snapshot {
     let event = timer::event_info();
-    let hardware = clocksource::snapshot();
+    let hardware = clocksource::monotonic_metadata();
     let source = active_source();
     let frequency = match source {
         1 | 2 => hardware.frequency_hz,
@@ -114,7 +114,7 @@ pub fn snapshot() -> Snapshot {
                 | contract::monotonic_clock_flag_irq_independent
                 | contract::monotonic_clock_flag_early_origin
                 | contract::monotonic_clock_flag_calibrated;
-            if hardware.flags & 2 != 0 {
+            if hardware.invariant {
                 flags |= contract::monotonic_clock_flag_invariant;
             }
         }

@@ -621,14 +621,34 @@ pub fn now_nanoseconds() -> Option<u64> {
     };
     Some(publish(candidate))
 }
-pub fn snapshot() -> Status {
-    let source = active_source();
-    let frequency = match source {
+fn source_frequency(source: u32) -> u64 {
+    match source {
         0 => 0,
         1 => TSC_HZ.load(Ordering::Acquire),
         2 => HPET_HZ.load(Ordering::Acquire),
         _ => panic!("Invalid hardware clock source"),
-    };
+    }
+}
+/// The public monotonic record needs no CPU membership/diagnostic scan.
+/// Read these fields freshly from the same source facts; no second cache or
+/// copied CPU/clock qualification survives a source/lifecycle transition.
+pub(crate) struct MonotonicMetadata {
+    pub frequency_hz: u64,
+    pub resolution_ns: u64,
+    pub invariant: bool,
+}
+#[inline]
+pub(crate) fn monotonic_metadata() -> MonotonicMetadata {
+    let frequency = source_frequency(active_source());
+    MonotonicMetadata {
+        frequency_hz: frequency,
+        resolution_ns: math::resolution_nanoseconds(frequency, 1),
+        invariant: TSC_INVARIANT.load(Ordering::Acquire),
+    }
+}
+pub fn snapshot() -> Status {
+    let source = active_source();
+    let frequency = source_frequency(source);
     Status {
         source,
         generation: generation(),
