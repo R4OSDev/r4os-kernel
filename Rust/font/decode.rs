@@ -172,6 +172,16 @@ pub fn parse(bytes: &[u8]) -> Option<Parsed<'_>> {
             && glyphs > 0
             && glyphs as usize <= MAX_GLYPHS
         {
+            // Validate scalar/provenance records before catalogue publication.
+            // Legacy tags describe provenance, never byte-valued codepoints.
+            let mut mapped = [INVALID_CODEPOINT; MAX_GLYPHS];
+            if p.charset_flags & !7 != 0
+                || p.charset_flags & 4 == 0
+                || !map_metadata_valid(map, p.charset_flags)
+                || !load_map(map, glyphs, &mut mapped)
+            {
+                return None;
+            }
             p.strike_id = id;
             p.width = width as u8;
             p.height = height as u8;
@@ -266,6 +276,7 @@ fn load_bitmap(
         return false;
     }
     let mut loaded = 0u32;
+    let mut seen = [false; MAX_GLYPHS];
     for i in 0..count as usize {
         let off = 8 + i * f::BITMAP_GLYPH_RECORD_SIZE;
         let id = f::read_u32(&table[off..]);
@@ -292,6 +303,10 @@ fn load_bitmap(
         {
             return false;
         }
+        if seen[id as usize] {
+            return false;
+        }
+        seen[id as usize] = true;
         for y in 0..usize::from(height) {
             for x in 0..usize::from(row) {
                 out[id as usize][y][x] = table[offset as usize + y * usize::from(row) + x];
@@ -301,12 +316,43 @@ fn load_bitmap(
     }
     loaded >= glyphs
 }
+fn map_metadata_valid(table: &[u8], flags: u32) -> bool {
+    if table.len() < 4 {
+        return false;
+    }
+    let count = f::read_u32(table);
+    if count as usize > MAX_GLYPHS * 2
+        || !records_fit(table.len(), 4, count, f::GLYPH_MAP_RECORD_SIZE)
+    {
+        return false;
+    }
+    for record in table[4..4 + count as usize * f::GLYPH_MAP_RECORD_SIZE]
+        .as_chunks::<{ f::GLYPH_MAP_RECORD_SIZE }>()
+        .0
+    {
+        let charset = f::read_u16(&record[2..]);
+        if f::read_u16(record) != 0
+            || f::read_u32(&record[12..]) != 0
+            || !match charset {
+                437 => flags & 1 != 0,
+                1252 => flags & 2 != 0,
+                0xffff => true,
+                _ => false,
+            }
+        {
+            return false;
+        }
+    }
+    true
+}
 fn load_map(table: &[u8], glyphs: u32, out: &mut [u32; MAX_GLYPHS]) -> bool {
     if table.len() < 4 {
         return false;
     }
     let count = f::read_u32(table);
-    if !records_fit(table.len(), 4, count, f::GLYPH_MAP_RECORD_SIZE) {
+    if count as usize > MAX_GLYPHS * 2
+        || !records_fit(table.len(), 4, count, f::GLYPH_MAP_RECORD_SIZE)
+    {
         return false;
     }
     let mut mapped = 0;
@@ -314,10 +360,15 @@ fn load_map(table: &[u8], glyphs: u32, out: &mut [u32; MAX_GLYPHS]) -> bool {
         let off = 4 + i * f::GLYPH_MAP_RECORD_SIZE;
         let cp = f::read_u32(&table[off + 4..]);
         let id = f::read_u32(&table[off + 8..]);
-        if cp <= 0x10ffff && id < glyphs && (id as usize) < MAX_GLYPHS {
-            out[id as usize] = cp;
-            mapped += 1;
+        if char::from_u32(cp).is_none() || id >= glyphs || id as usize >= MAX_GLYPHS {
+            return false;
         }
+        let slot = &mut out[id as usize];
+        if *slot != INVALID_CODEPOINT && *slot != cp {
+            return false;
+        }
+        *slot = cp;
+        mapped += 1;
     }
     mapped > 0
 }
@@ -412,6 +463,10 @@ pub fn indexed_id(index: &GlyphIndex, cp: u32, probes: Option<&mut u16>) -> Opti
         Some(usize::from(index.glyph_ids[low]))
     }
 }
+
+#[cfg(test)]
+#[path = "decode_tests.rs"]
+mod tests;
 pub fn path_equals(a: &[u8], b: &[u8]) -> bool {
     fn normalize(b: u8) -> u8 {
         if b == b'/' {

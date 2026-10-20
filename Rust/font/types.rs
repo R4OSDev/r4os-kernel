@@ -4,7 +4,7 @@ pub const GLYPH_W: u8 = 8;
 pub const GLYPH_H: u8 = 8;
 pub const MAX_GLYPH_W: u8 = 40;
 pub const MAX_GLYPH_H: usize = 40;
-pub const MAX_GLYPHS: usize = 256;
+pub const MAX_GLYPHS: usize = 512;
 pub const MAX_BYTES_PER_ROW: usize = 5;
 pub const MAX_CATALOG_FONTS: usize = 64;
 pub const MAX_FONT_PATH: usize = 96;
@@ -201,7 +201,7 @@ impl CachedFont {
         index: GlyphIndex::EMPTY,
     };
 }
-/// Initialize resident cache storage in place, without a50KB stack temporary.
+/// Initialize resident cache storage in place, without a106KB stack temporary.
 /// # Safety
 /// Caller owns resident aligned cache storage of the complete CachedFont size; it does not alias the immutable initialization template.
 pub unsafe fn reset_cached(out: *mut CachedFont) {
@@ -265,11 +265,11 @@ pub const CATALOG_BANK_BYTES: usize =
     mem::size_of::<CatalogState>() + mem::size_of::<[CachedFont; MAX_CATALOG_FONTS]>();
 
 const _: () = {
-    assert!(core::mem::size_of::<GlyphIndex>() == 1540);
+    assert!(core::mem::size_of::<GlyphIndex>() == 3076);
     assert!(core::mem::align_of::<GlyphIndex>() == 4);
     assert!(core::mem::offset_of!(GlyphIndex, count) == 0);
     assert!(core::mem::offset_of!(GlyphIndex, codepoints) == 4);
-    assert!(core::mem::offset_of!(GlyphIndex, glyph_ids) == 1028);
+    assert!(core::mem::offset_of!(GlyphIndex, glyph_ids) == 2052);
 };
 const _: () = {
     assert!(core::mem::size_of::<GlyphBitmap>() == 344);
@@ -342,7 +342,7 @@ const _: () = {
     assert!(core::mem::offset_of!(ActiveFont, path_len) == 208);
 };
 const _: () = {
-    assert!(core::mem::size_of::<CachedFont>() == 54292);
+    assert!(core::mem::size_of::<CachedFont>() == 108564);
     assert!(core::mem::align_of::<CachedFont>() == 4);
     assert!(core::mem::offset_of!(CachedFont, used) == 0);
     assert!(core::mem::offset_of!(CachedFont, width) == 1);
@@ -354,13 +354,13 @@ const _: () = {
     assert!(core::mem::offset_of!(CachedFont, line_height) == 10);
     assert!(core::mem::offset_of!(CachedFont, baseline) == 12);
     assert!(core::mem::offset_of!(CachedFont, glyphs) == 14);
-    assert!(core::mem::offset_of!(CachedFont, widths) == 51214);
-    assert!(core::mem::offset_of!(CachedFont, advances) == 51470);
-    assert!(core::mem::offset_of!(CachedFont, codepoints) == 51728);
-    assert!(core::mem::offset_of!(CachedFont, index) == 52752);
+    assert!(core::mem::offset_of!(CachedFont, widths) == 102414);
+    assert!(core::mem::offset_of!(CachedFont, advances) == 102926);
+    assert!(core::mem::offset_of!(CachedFont, codepoints) == 103440);
+    assert!(core::mem::offset_of!(CachedFont, index) == 105488);
 };
 const _: () = {
-    assert!(core::mem::size_of::<CatalogState>() == 130328);
+    assert!(core::mem::size_of::<CatalogState>() == 237848);
     assert!(core::mem::align_of::<CatalogState>() == 8);
     assert!(core::mem::offset_of!(CatalogState, revision) == 0);
     assert!(core::mem::offset_of!(CatalogState, catalog) == 8);
@@ -368,11 +368,11 @@ const _: () = {
     assert!(core::mem::offset_of!(CatalogState, cached_fonts) == 22544);
     assert!(core::mem::offset_of!(CatalogState, cached_fonts_len) == 22552);
     assert!(core::mem::offset_of!(CatalogState, temp_cached_font) == 22560);
-    assert!(core::mem::offset_of!(CatalogState, active_present) == 76852);
-    assert!(core::mem::offset_of!(CatalogState, active) == 76856);
-    assert!(core::mem::offset_of!(CatalogState, active_font_id) == 77072);
-    assert!(core::mem::offset_of!(CatalogState, active_glyphs) == 77076);
-    assert!(core::mem::offset_of!(CatalogState, active_glyph_widths) == 128276);
-    assert!(core::mem::offset_of!(CatalogState, active_glyph_advances) == 128532);
-    assert!(core::mem::offset_of!(CatalogState, active_index) == 128788);
+    assert!(core::mem::offset_of!(CatalogState, active_present) == 131124);
+    assert!(core::mem::offset_of!(CatalogState, active) == 131128);
+    assert!(core::mem::offset_of!(CatalogState, active_font_id) == 131344);
+    assert!(core::mem::offset_of!(CatalogState, active_glyphs) == 131348);
+    assert!(core::mem::offset_of!(CatalogState, active_glyph_widths) == 233748);
+    assert!(core::mem::offset_of!(CatalogState, active_glyph_advances) == 234260);
+    assert!(core::mem::offset_of!(CatalogState, active_index) == 234772);
 };

@@ -1,9 +1,9 @@
 //! Original installed-font scan. The exact catalogue writer reservation owns
-//! the64KB resident scratch across I/O; no metadata/spin owner spans a wait.
+//! the128KB resident scratch across I/O; no metadata/spin owner spans a wait.
 use super::{owner, types::*};
 use crate::fs::{request::ScopedRead, vfs};
 use core::{cell::UnsafeCell, mem::MaybeUninit, slice};
-pub const MAX_R4F_FILE_BYTES: usize = 64 * 1024;
+pub const MAX_R4F_FILE_BYTES: usize = 128 * 1024;
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 pub struct ReloadResult {
