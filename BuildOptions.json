@@ -155,5 +155,12 @@
     "type": "u32",
     "default": 4294967295,
     "description": "Reject one AP at the PAT readback comparison; isolated negative boot only"
+  },
+  {
+    "name": "fpu-backend-diagnostic",
+    "config": "fpu_backend_diagnostic",
+    "type": "u32",
+    "default": 0,
+    "description": "Private early BSP-only FPU backend fixture:1=FXSAVE,2=XSAVE mask3; real supported instructions, no modules admitted, no CPU feature override"
   }
 ]

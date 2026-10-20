@@ -49,6 +49,10 @@ r4os_rust_callback_resume:
     movl %esi, %eax
     movq %rdi, %rdx
     movq 0(%rdx), %rsp
+    # Nonlocal exit skips EMMS and module epilogues. Data/status are caller-
+    # saved here; return in x87 mode before restoring the callee-saved controls.
+    # FNINIT is nonwaiting, including a discarded pending x87 condition.
+    fninit
     ldmxcsr 56(%rdx)
     fldcw 60(%rdx)
     movq 8(%rdx), %rbx

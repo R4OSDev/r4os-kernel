@@ -3,6 +3,7 @@
 mod balance;
 mod deadlines;
 mod fpu;
+mod fpu_environment;
 mod helpers;
 pub(crate) mod live;
 mod owner_snapshots;
@@ -72,6 +73,9 @@ fn boot_cases() -> bool {
             }
             helpers::puts(b"TASKREG08244 idle-timeout PASS due=65 bounded=64+1 future=held timer-irq=unchanged\r\n");
             return true;
+        }
+        if option_is(value, b"fpu-environment") {
+            return fpu_environment::run();
         }
         // Bounded guard-only selection, without reserve admission injection.
         if option_is(value, b"fpu-guards") {

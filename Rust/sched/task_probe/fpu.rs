@@ -32,7 +32,23 @@ pub(crate) unsafe extern "C" fn callback(lane: usize) -> i32 {
         scheduler::r4os_rust_scheduler_irq_leave(guard.as_ptr());
         r4os_task_probe_ymm_store(observed.as_mut_ptr());
         runtime::r4os_rust_runtime_control(3, flags);
-        if expected == observed { 0 } else { -1 }
+        if expected != observed {
+            return -1;
+        }
+        match crate::arch::fpu_probe::run(
+            0x4600 + lane as u32,
+            Some(super::fpu_environment::guard),
+            0,
+            64,
+        ) {
+            Ok(_) => 0,
+            Err(reason) => {
+                super::helpers::puts(b"[FPUENV46] guard reason=");
+                super::helpers::puts(reason);
+                super::helpers::puts(b"\r\n");
+                -2
+            }
+        }
     }
 }
 pub(crate) unsafe fn initial() -> ([u64; 4], u32) {

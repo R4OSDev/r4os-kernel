@@ -4,6 +4,7 @@ pub mod callback_abort;
 pub(crate) mod cpu_idle;
 pub(crate) mod cpu_lifecycle;
 pub mod fpu;
+pub(crate) mod fpu_probe;
 pub mod hpet;
 pub mod interrupt_frame;
 pub mod io;

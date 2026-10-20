@@ -200,14 +200,15 @@ pub fn init() -> bool {
     let mut cr4 = unsafe { r4os_read_cr4() } | CR4_OSFXSR | CR4_OSXMMEXCPT;
     value.avx_supported = info.features.avx && component_supported(info, AVX);
     value.avx2_supported = value.avx_supported && info.features.avx2;
-    let mask = if crate::build_config::config::CPU_BASELINE_YMM_TEST {
+    let diagnostic = crate::build_config::config::FPU_BACKEND_DIAGNOSTIC;
+    let mask = if crate::build_config::config::CPU_BASELINE_YMM_TEST || diagnostic == 2 {
         X87_SSE
     } else if value.avx_supported {
         X87_SSE | AVX
     } else {
         X87_SSE
     };
-    if info.features.xsave {
+    if info.features.xsave && diagnostic != 1 {
         cr4 |= CR4_OSXSAVE;
         unsafe {
             r4os_write_cr4(cr4);

@@ -2,6 +2,8 @@
 //! assembly and the callback. Admission and exact live frame ownership belong
 //! to the exact driver/program execution owner; no cleanup is implied by a
 //! transfer. Program entry retains this frame on its separate kernel stack.
+//! Nonlocal resume discards caller-saved x87/MMX data/status and returns in
+//! x87 mode before restoring controls; IRQ/task restores retain full state.
 pub type Handler = unsafe extern "sysv64" fn(usize) -> i32;
 #[repr(C)]
 #[derive(Default)]

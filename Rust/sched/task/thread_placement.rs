@@ -136,6 +136,40 @@ pub(crate) fn set(identity: Identity, policy: Policy) -> i32 {
             Ok(task) => task,
             Err(error) => return error,
         };
+        set_task(task, policy)
+    }
+}
+/// Exact pinned native test task only; shares the normal saved-context policy
+/// owner. No raw running_cpu/home mutation bypasses physical handoff barriers.
+pub(crate) fn set_probe_task(id: u32, generation: u64, policy: Policy) -> i32 {
+    let _runtime = runtime::RuntimeGuard::acquire();
+    unsafe {
+        let task = registry::find_identity(id, generation);
+        if task.is_null() {
+            return c::thread_error_not_found;
+        }
+        let core = registry::core(task);
+        if (*core).execution_owner_kind != ExecutionOwnerKind::None
+            || !(*core).execution_owner_context.is_null()
+            || (*core).pin_count == 0
+            || (*core).cpu_idle
+            || !(*core).smp_eligible
+            || (*core).retire_pending
+            || (*core).release_in_progress
+            || (*core).rollback_pending
+            || !matches!(
+                (*core).state,
+                State::Ready | State::Running | State::Blocked
+            )
+        {
+            return c::thread_error_busy;
+        }
+        set_task(task, policy)
+    }
+}
+// Both callers retain runtime admission, exact identity and lifetime pin.
+unsafe fn set_task(task: *mut Task, policy: Policy) -> i32 {
+    unsafe {
         let core = registry::core(task);
         let admission = admitted(task);
         if admission == 0 {

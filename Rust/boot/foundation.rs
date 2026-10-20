@@ -160,6 +160,9 @@ unsafe fn cpu_foundation() {
     if !crate::arch::fpu::init() {
         crate::boot::fatal::kernel(2, b"FPU/SSE task-state init failed");
     }
+    if crate::build_config::config::FPU_BACKEND_DIAGNOSTIC != 0 {
+        crate::arch::fpu_probe::backend_diagnostic();
+    }
     crate::platform::module_cpu::admit_bsp();
 }
 
