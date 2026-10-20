@@ -132,6 +132,39 @@ pub(crate) unsafe fn imbalanced(
     }
 }
 
+/// A single-use result, valid only within the caller's uninterrupted runtime
+/// admission and while queues, physical currents and membership stay unchanged.
+pub(crate) struct Transfer {
+    source: u32,
+    target: u32,
+    current: *mut Task,
+    target_current: *mut Task,
+}
+
+impl Transfer {
+    #[inline]
+    pub(crate) fn target(&self) -> u32 {
+        self.target
+    }
+}
+
+/// # Safety
+/// Caller retains runtime admission and both exact physical current lifetimes.
+#[inline]
+pub(crate) unsafe fn prepare(
+    source: u32,
+    target: u32,
+    current: *mut Task,
+    target_current: *mut Task,
+) -> Option<Transfer> {
+    unsafe { imbalanced(source, target, current, target_current) }.then_some(Transfer {
+        source,
+        target,
+        current,
+        target_current,
+    })
+}
+
 /// # Safety
 /// Caller holds runtime admission and supplies the source CPU's exact current
 /// task. Even a logically Ready current task still owns its physical stack.
@@ -140,12 +173,29 @@ pub(crate) unsafe fn pull(
     target: u32,
     current: *mut Task,
     target_current: *mut Task,
+    now: impl FnMut() -> u64,
+    cooldown: u64,
+) -> *mut Task {
+    let Some(transfer) = (unsafe { prepare(source, target, current, target_current) }) else {
+        return ptr::null_mut();
+    };
+    unsafe { pull_prepared(transfer, now, cooldown) }
+}
+
+/// # Safety
+/// The caller consumes its exact prepared result without any intervening queue,
+/// physical-current or membership mutation, under the same runtime admission.
+pub(crate) unsafe fn pull_prepared(
+    transfer: Transfer,
     mut now: impl FnMut() -> u64,
     cooldown: u64,
 ) -> *mut Task {
-    if !unsafe { imbalanced(source, target, current, target_current) } {
-        return ptr::null_mut();
-    }
+    let Transfer {
+        source,
+        target,
+        current,
+        target_current,
+    } = transfer;
     unsafe {
         // One functional snapshot per bounded attempt, only once a structural
         // candidate needs cooldown/admission time. Bound-only prefixes never
@@ -170,7 +220,8 @@ pub(crate) unsafe fn pull(
                 (*c).ready_next
             };
             (*from).balance_cursor = next;
-            if candidate != target_current
+            if candidate != current
+                && candidate != target_current
                 && super::thread_placement::allows(candidate, target)
                 && eligible(
                     candidate,

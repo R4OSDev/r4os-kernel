@@ -863,20 +863,12 @@ fn park_blocked(task: Task) {
     runtime::restore_runtime(flags);
 }
 // Runtime admission covers queue transfer, exact target publication and IPI.
-fn balance_ready(target: u32, source: u32, now: impl FnMut() -> u64) -> Task {
+fn balance_ready(transfer: super::task::balance::Transfer, now: impl FnMut() -> u64) -> Task {
+    let target = transfer.target();
     if !cpu_state(target).initialized {
         return ptr::null_mut();
     }
-    let moved = unsafe {
-        super::task::balance::pull(
-            source,
-            target,
-            cpu_state(source).current.cast(),
-            cpu_state(target).current.cast(),
-            now,
-            QUANTUM,
-        )
-    };
+    let moved = unsafe { super::task::balance::pull_prepared(transfer, now, QUANTUM) };
     if moved.is_null() {
         return ptr::null_mut();
     }
@@ -911,26 +903,24 @@ fn refill_from_sources(target: u32, now: impl FnMut() -> u64) -> Task {
         return ptr::null_mut();
     }
     let start = local().balance_next_cpu;
-    for offset in 0..MAX_CPUS as u32 {
-        let source = (start + offset) % MAX_CPUS as u32;
-        if source == target
-            || online & (1 << source) == 0
-            || !cpu_state(source).initialized
-            || !unsafe {
-                super::task::balance::imbalanced(
-                    source,
-                    target,
-                    cpu_state(source).current.cast(),
-                    cpu_state(target).current.cast(),
-                )
-            }
-        {
+    for source in crate::arch::smp_policy::online_from(online & !(1 << target), start) {
+        if !cpu_state(source).initialized {
             continue;
         }
+        let Some(transfer) = (unsafe {
+            super::task::balance::prepare(
+                source,
+                target,
+                cpu_state(source).current.cast(),
+                cpu_state(target).current.cast(),
+            )
+        }) else {
+            continue;
+        };
         // One donor and at most eight candidates per attempt. Rotate donors
         // even when their bounded prefix contains only bound tasks.
         local_change(|s| s.balance_next_cpu = (source + 1) % MAX_CPUS as u32);
-        return balance_ready(target, source, now);
+        return balance_ready(transfer, now);
     }
     ptr::null_mut()
 }
@@ -948,11 +938,11 @@ fn balance_wake(source: u32, ready_time: u64) -> Task {
     }
     let mut targets = 0;
     let mut loads = [0usize; MAX_CPUS];
-    for (index, load) in loads.iter_mut().enumerate() {
-        let cpu = index as u32;
-        if online & (1 << cpu) == 0 || !cpu_state(cpu).initialized {
+    for cpu in crate::arch::smp_policy::online_from(online, 0) {
+        if !cpu_state(cpu).initialized {
             continue;
         }
+        let load = &mut loads[cpu as usize];
         let running = cpu_state(cpu).current;
         *load = unsafe { super::task::balance::workload(cpu, running.cast()) };
         if cpu != source && !running.is_null() && source_load > load.saturating_add(1) {
@@ -966,7 +956,12 @@ fn balance_wake(source: u32, ready_time: u64) -> Task {
         Some(source),
     )
     .map_or(ptr::null_mut(), |target| {
-        balance_ready(target, source, || ready_time)
+        let Some(transfer) = (unsafe {
+            super::task::balance::prepare(source, target, current, cpu_state(target).current.cast())
+        }) else {
+            return ptr::null_mut();
+        };
+        balance_ready(transfer, || ready_time)
     })
 }
 // Runtime admission retains this exact published Ready task. Also used by the

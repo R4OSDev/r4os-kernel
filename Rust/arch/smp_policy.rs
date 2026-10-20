@@ -4,6 +4,42 @@
 pub const MAX_CPUS: usize = 64;
 const _: () = assert!(MAX_CPUS > 0 && MAX_CPUS <= u64::BITS as usize);
 pub const CPU_MASK: u64 = u64::MAX >> (u64::BITS as usize - MAX_CPUS);
+
+/// Same cyclic dense-slot order as `(start + offset) % MAX_CPUS`, skipping
+/// only absent bits. The snapshot grants no membership or task admission.
+pub(crate) struct OnlineOrder {
+    remaining: u64,
+    wrapped: u64,
+}
+
+#[inline]
+pub(crate) fn online_from(mask: u64, start: u32) -> OnlineOrder {
+    let start = start % MAX_CPUS as u32;
+    let suffix = u64::MAX << start;
+    let mask = mask & CPU_MASK;
+    OnlineOrder {
+        remaining: mask & suffix,
+        wrapped: mask & !suffix,
+    }
+}
+
+impl Iterator for OnlineOrder {
+    type Item = u32;
+
+    #[inline]
+    fn next(&mut self) -> Option<u32> {
+        if self.remaining == 0 {
+            self.remaining = self.wrapped;
+            self.wrapped = 0;
+        }
+        if self.remaining == 0 {
+            return None;
+        }
+        let index = self.remaining.trailing_zeros();
+        self.remaining &= self.remaining - 1;
+        Some(index)
+    }
+}
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct Candidate {
@@ -148,3 +184,32 @@ const _: () = {
     assert!(core::mem::offset_of!(Plan, count) == MAX_CPUS * 4);
     assert!(core::mem::size_of::<InitialStack>() == 32);
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn online_order_matches_original_dense_scan() {
+        for mask in [
+            0,
+            1,
+            1u64 << 63,
+            CPU_MASK,
+            0x8000_0000_0000_0003,
+            0xaaaa_aaaa_aaaa_aaaa,
+            0x5555_5555_5555_5555,
+        ] {
+            for start in 0..MAX_CPUS as u32 {
+                let original: std::vec::Vec<_> = (0..MAX_CPUS as u32)
+                    .map(|offset| (start + offset) % MAX_CPUS as u32)
+                    .filter(|&cpu| mask & (1u64 << cpu) != 0)
+                    .collect();
+                assert_eq!(
+                    online_from(mask, start).collect::<std::vec::Vec<_>>(),
+                    original
+                );
+            }
+        }
+    }
+}
