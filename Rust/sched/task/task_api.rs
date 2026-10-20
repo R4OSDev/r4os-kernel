@@ -348,32 +348,37 @@ pub unsafe extern "C" fn r4os_rust_task_mutate(
             }
             17 => u64::from(lifetime::pin(task)),
             18 => u64::from(lifetime::unpin(task)),
-            19 => {
+            19 | 20 => {
                 let c = registry::core(task);
                 if !(*c).uses_fpu {
-                    (*registry::raw()).fpu_lazy_skips =
-                        (*registry::raw()).fpu_lazy_skips.wrapping_add(1);
+                    if operation == 19 {
+                        (*registry::raw()).fpu_lazy_skips =
+                            (*registry::raw()).fpu_lazy_skips.wrapping_add(1);
+                    }
                     return 0;
                 }
-                if (*c).fpu_state_valid
-                    && let Some(bytes) = (*c).fpu_state
-                {
+                let valid = (*c).fpu_state_valid
+                    && fpu::descriptor().is_some_and(|d| (*c).fpu_state_bytes == d.contract.bytes)
+                    && (*c).fpu_state.is_some_and(|bytes| {
+                        fpu::r4os_rust_fpu_buffer(
+                            if operation == 19 { 1 } else { 2 },
+                            bytes.pointer.cast_mut(),
+                            bytes.len,
+                        )
+                    });
+                if !valid {
+                    (*c).fpu_state_valid = false;
+                    panic!(
+                        "Task FP save/restore rejected: id={} generation={} operation={}",
+                        (*c).id,
+                        (*c).generation,
+                        operation
+                    );
+                }
+                if operation == 19 {
                     (*registry::raw()).fpu_lazy_saves =
                         (*registry::raw()).fpu_lazy_saves.wrapping_add(1);
-                    fpu::r4os_rust_fpu_buffer(1, bytes.pointer.cast_mut(), bytes.len);
                 }
-
-                0
-            }
-            20 => {
-                let c = registry::core(task);
-                if (*c).uses_fpu
-                    && (*c).fpu_state_valid
-                    && let Some(bytes) = (*c).fpu_state
-                {
-                    fpu::r4os_rust_fpu_buffer(2, bytes.pointer.cast_mut(), bytes.len);
-                }
-
                 0
             }
             21 => u64::from(crate::sched::wait_node::detach(ptr::addr_of_mut!(

@@ -73,6 +73,28 @@ pub fn current_index() -> u32 {
         if index as usize >= MAX_CPUS { 0 } else { index }
     }
 }
+/// Architectural GS_BASE is available at CPL0 in long mode. Validate its exact
+/// resident slot numerically before any GS dereference in a fatal capture.
+pub(crate) fn checked_current() -> Option<(u32, u32)> {
+    if !READY.load(Ordering::Acquire) {
+        return None;
+    }
+    let base = unsafe { msr::read(0xc000_0101) } as usize;
+    let first = LOCALS.0.get().cast::<CpuLocal>().addr();
+    let stride = core::mem::size_of::<CpuLocal>();
+    let offset = base.checked_sub(first)?;
+    if offset >= stride * MAX_CPUS || offset % stride != 0 {
+        return None;
+    }
+    let index = (offset / stride) as u32;
+    let local = local(index)?;
+    unsafe {
+        if ptr::addr_of!((*local).index).read() != index {
+            return None;
+        }
+        Some((index, ptr::addr_of!((*local).apic_id).read()))
+    }
+}
 fn install(index: u32) {
     let Some(local) = local(index) else { return };
 

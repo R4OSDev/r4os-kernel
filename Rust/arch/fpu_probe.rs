@@ -27,10 +27,7 @@ unsafe extern "sysv64" {
 pub(crate) struct Legacy {
     pub bytes: [u8; 512],
 }
-#[repr(C, align(64))]
-struct State {
-    bytes: [u8; fpu::STORAGE_BYTES],
-}
+type State = fpu::Image;
 pub(crate) fn snapshot() -> Legacy {
     let mut image = Legacy { bytes: [0; 512] };
     unsafe {
@@ -160,9 +157,7 @@ pub(crate) fn backend_diagnostic() -> ! {
     use crate::boot::log_route::{dec, puts};
     let status = fpu::snapshot();
     let mut raw = Raw {
-        saved: State {
-            bytes: [0xa5; fpu::STORAGE_BYTES],
-        },
+        saved: State::filled(0xa5),
         avx: status.avx_enabled,
         ok: true,
     };

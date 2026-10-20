@@ -1,14 +1,15 @@
-//! Singleton BSP FPU selection and canonical task/AP/IRQ initial image.
-//! Configuration is immutable before AP release; no live state borrow crosses
-//! an assembly or foreign call. Task buffers retain the existing exact owner.
-use super::xstate_layout::Layout;
+//! One immutable descriptor and canonical image for task/reserve/IRQ/fault owners.
+use super::{
+    xstate_contract::{self, Contract},
+    xstate_layout::Layout,
+};
 use crate::platform::cpu;
 use core::{
     cell::UnsafeCell,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
-pub const STORAGE_BYTES: usize = 4096;
-pub const STORAGE_ALIGN: usize = 64;
+pub const STORAGE_BYTES: usize = xstate_contract::CAPACITY;
+pub const STORAGE_ALIGN: usize = xstate_contract::ALIGNMENT;
 const CR0_MP: u64 = 1 << 1;
 const CR0_EM: u64 = 1 << 2;
 const CR0_TS: u64 = 1 << 3;
@@ -37,6 +38,7 @@ pub struct Status {
     pub save_count: u64,
     pub restore_count: u64,
     pub task_init_count: u64,
+    /// Cumulative initialized bytes; not current resident task memory.
     pub task_state_bytes: u64,
 }
 impl Status {
@@ -60,25 +62,88 @@ impl Status {
         task_state_bytes: 0,
     };
 }
-struct Config(UnsafeCell<Status>);
-// SAFETY: singleton BSP writes before INITIALIZED release and AP admission.
-// Subsequent configuration reads are copies; task/IRQ counts are separate.
+#[repr(C, align(64))]
+pub(crate) struct Image {
+    pub bytes: [u8; STORAGE_BYTES],
+}
+impl Image {
+    pub const fn filled(byte: u8) -> Self {
+        Self {
+            bytes: [byte; STORAGE_BYTES],
+        }
+    }
+}
+const _: () = {
+    assert!(core::mem::size_of::<Image>() == STORAGE_BYTES);
+    assert!(core::mem::align_of::<Image>() == STORAGE_ALIGN);
+};
+#[derive(Clone, Copy)]
+pub(crate) struct Descriptor {
+    pub contract: Contract,
+    pub layout: Layout,
+    initial: *const u8,
+    avx_supported: bool,
+    avx2_supported: bool,
+    cr0: u64,
+    cr4: u64,
+}
+impl Descriptor {
+    const EMPTY: Self = Self {
+        contract: Contract::DISABLED,
+        layout: Layout {
+            ymm_bytes: 0,
+            ymm_offset: 0,
+            ymm_flags: 0,
+        },
+        initial: core::ptr::null(),
+        avx_supported: false,
+        avx2_supported: false,
+        cr0: 0,
+        cr4: 0,
+    };
+    fn status(self) -> Status {
+        let avx = self.contract.backend == 2 && self.contract.mask & AVX != 0;
+        let avx2 = avx && self.avx2_supported;
+        Status {
+            initialized: true,
+            enabled: self.contract.valid(),
+            backend: self.contract.backend,
+            state_bytes: self.contract.bytes,
+            state_storage_bytes: STORAGE_BYTES as u32,
+            xcr0_mask: self.contract.mask,
+            avx_supported: self.avx_supported,
+            avx_enabled: avx,
+            avx2_supported: self.avx2_supported,
+            avx2_enabled: avx2,
+            simd_abi: if !self.contract.valid() {
+                0
+            } else if avx2 {
+                3
+            } else if avx {
+                2
+            } else {
+                1
+            },
+            cr0: self.cr0,
+            cr4: self.cr4,
+            save_count: 0,
+            restore_count: 0,
+            task_init_count: 0,
+            task_state_bytes: 0,
+        }
+    }
+}
+struct Config(UnsafeCell<Descriptor>);
+// BSP publication precedes AP admission; all later descriptor accesses copy.
 unsafe impl Sync for Config {}
-#[repr(align(64))]
-struct Image(UnsafeCell<[u8; STORAGE_BYTES]>);
-// SAFETY: BSP fills once before publication, all later consumers only read.
-unsafe impl Sync for Image {}
-static CONFIG: Config = Config(UnsafeCell::new(Status::EMPTY));
-struct SharedLayout(UnsafeCell<Layout>);
-// SAFETY: BSP fills before INITIALIZED release; all APs only copy afterward.
-unsafe impl Sync for SharedLayout {}
-static LAYOUT: SharedLayout = SharedLayout(UnsafeCell::new(Layout {
-    ymm_bytes: 0,
-    ymm_offset: 0,
-    ymm_flags: 0,
-}));
-static INITIAL: Image = Image(UnsafeCell::new([0; STORAGE_BYTES]));
+struct Initial(UnsafeCell<Image>);
+// BSP fills the one resident image before publication; consumers only read.
+unsafe impl Sync for Initial {}
+static CONFIG: Config = Config(UnsafeCell::new(Descriptor::EMPTY));
+static INITIAL: Initial = Initial(UnsafeCell::new(Image::filled(0)));
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static LOCAL_READY: [AtomicBool; super::smp_policy::MAX_CPUS] =
+    [const { AtomicBool::new(false) }; super::smp_policy::MAX_CPUS];
 static SAVES: AtomicU64 = AtomicU64::new(0);
 static RESTORES: AtomicU64 = AtomicU64::new(0);
 static TASK_INITS: AtomicU64 = AtomicU64::new(0);
@@ -91,23 +156,49 @@ unsafe extern "C" {
     fn r4os_xsetbv(index: u32, value: u64);
     fn r4os_fninit();
     fn r4os_init_simd(avx_enabled: u32, inherited: *mut u64);
-
     fn r4os_fxsave(dest: *mut u8);
-
     fn r4os_fxrstor(source: *const u8);
-
     fn r4os_xsave(dest: *mut u8, mask: u64);
-
     fn r4os_xrstor(source: *const u8, mask: u64);
-
 }
 fn config() -> Status {
-    unsafe { CONFIG.0.get().read() }
+    unsafe { CONFIG.0.get().read() }.status()
 }
-fn publish(mut value: Status) {
-    value.initialized = true;
-    value.enabled = value.backend != 0;
-    unsafe { CONFIG.0.get().write(value) };
+pub(crate) fn descriptor() -> Option<Descriptor> {
+    if !INITIALIZED.load(Ordering::Acquire) {
+        return None;
+    }
+    let d = unsafe { CONFIG.0.get().read() };
+    if d.contract.valid() && !d.initial.is_null() {
+        Some(d)
+    } else {
+        None
+    }
+}
+pub(crate) fn local_ready(cpu: u32) -> bool {
+    LOCAL_READY
+        .get(cpu as usize)
+        .is_some_and(|r| r.load(Ordering::Acquire))
+}
+fn publish(value: Status, layout: Layout) {
+    let d = Descriptor {
+        contract: Contract {
+            backend: value.backend,
+            mask: value.xcr0_mask,
+            bytes: value.state_bytes,
+        },
+        layout,
+        initial: if value.backend == 0 {
+            core::ptr::null()
+        } else {
+            INITIAL.0.get().cast()
+        },
+        avx_supported: value.avx_supported,
+        avx2_supported: value.avx2_supported,
+        cr0: value.cr0,
+        cr4: value.cr4,
+    };
+    unsafe { CONFIG.0.get().write(d) };
     INITIALIZED.store(true, Ordering::Release);
 }
 pub(crate) fn snapshot() -> Status {
@@ -191,7 +282,7 @@ pub fn init() -> bool {
     let info = cpu::snapshot();
     let mut value = Status::EMPTY;
     if !info.features.fxsr || !info.features.sse || !info.features.sse2 {
-        publish(value);
+        publish(value, Layout::default());
         log(0, &[0; 3]);
         return false;
     }
@@ -222,7 +313,7 @@ pub fn init() -> bool {
                 unsafe { r4os_write_cr4(cr4 & !CR4_OSXSAVE) };
                 value.cr0 = unsafe { r4os_read_cr0() };
                 value.cr4 = unsafe { r4os_read_cr4() };
-                publish(value);
+                publish(value, Layout::default());
                 log(1, &[0; 3]);
                 return false;
             };
@@ -248,6 +339,27 @@ pub fn init() -> bool {
     };
     value.cr0 = unsafe { r4os_read_cr0() };
     value.cr4 = unsafe { r4os_read_cr4() };
+    let layout = if value.backend == 2 {
+        local_layout()
+    } else {
+        Layout::default()
+    };
+    let contract = Contract {
+        backend: value.backend,
+        mask: value.xcr0_mask,
+        bytes: value.state_bytes,
+    };
+    if !contract.valid()
+        || (value.xcr0_mask & AVX != 0
+            && !layout.compatible(layout, value.state_bytes, STORAGE_BYTES as u32))
+    {
+        value.backend = 0;
+        value.state_bytes = 0;
+        value.xcr0_mask = 0;
+        publish(value, Layout::default());
+        log(1, &[0; 3]);
+        return false;
+    }
     let mut inherited = [0u64; 3];
     unsafe {
         r4os_fninit();
@@ -256,37 +368,28 @@ pub fn init() -> bool {
     let initial = INITIAL.0.get().cast::<u8>();
     save_raw(value, initial);
     restore_raw(value, initial);
-    if value.backend == 2 {
-        unsafe { LAYOUT.0.get().write(local_layout()) };
-    }
-    publish(value);
+    publish(value, layout);
+    LOCAL_READY[0].store(true, Ordering::Release);
     log(2, &inherited);
     true
 }
 pub fn active_bytes() -> usize {
-    if !INITIALIZED.load(Ordering::Acquire) {
-        return 0;
-    }
-    let value = config();
-    if value.backend == 0 {
-        0
-    } else {
-        value.state_bytes as usize
-    }
-}
-fn valid_buffer(pointer: *const u8, len: usize, bytes: usize) -> bool {
-    bytes != 0 && len >= bytes && (pointer as usize & (STORAGE_ALIGN - 1)) == 0
+    descriptor().map_or(0, |d| d.contract.bytes as usize)
 }
 pub fn restore_initial() -> bool {
-    if active_bytes() == 0 {
+    let Some(d) = descriptor() else {
         return false;
-    }
-    restore_raw(config(), INITIAL.0.get().cast::<u8>());
+    };
+    restore_raw(d.status(), d.initial);
     RESTORES.fetch_add(1, Ordering::Relaxed);
     true
 }
 /// Local admission precedes XSETBV and the first common image restore.
 pub(crate) fn init_ap(index: u32) -> Result<(), &'static [u8]> {
+    let Some(ready) = LOCAL_READY.get(index as usize) else {
+        return Err(b"cpu-index");
+    };
+    ready.store(false, Ordering::Release);
     if !crate::platform::module_cpu::allowed() || !INITIALIZED.load(Ordering::Acquire) {
         return Err(b"xsave-backend");
     }
@@ -303,7 +406,10 @@ pub(crate) fn init_ap(index: u32) -> Result<(), &'static [u8]> {
         // yet consumed this AP's layout or the common image.
         local.ymm_offset = local.ymm_offset.saturating_add(64);
     }
-    let shared = unsafe { LAYOUT.0.get().read() };
+    let Some(d) = descriptor() else {
+        return Err(b"xstate-descriptor");
+    };
+    let shared = d.layout;
     if !shared.compatible(local, value.state_bytes, value.state_storage_bytes) {
         return Err(b"xsave-layout");
     }
@@ -332,9 +438,11 @@ pub(crate) fn init_ap(index: u32) -> Result<(), &'static [u8]> {
         return Err(b"fpu-controls");
     }
     unsafe { r4os_fninit() };
-    restore_raw(value, INITIAL.0.get().cast::<u8>());
+    restore_raw(value, d.initial);
+    ready.store(true, Ordering::Release);
     Ok(())
 }
+
 #[unsafe(no_mangle)]
 pub extern "C" fn r4os_rust_fpu_control(operation: u8) -> u64 {
     match operation {
@@ -345,21 +453,22 @@ pub extern "C" fn r4os_rust_fpu_control(operation: u8) -> u64 {
     }
 }
 /// # Safety
-/// Caller owns a resident buffer of len bytes for the exact task under runtime
-/// admission; save/init permit writes, restore permits reads only. No alias to
-/// INITIAL is allowed. Existing buffer size/alignment rejection is preserved.
+/// Accepted operands own exact resident memory and lifetime, without INITIAL
+/// aliasing. Rejected numeric address/size/alignment ranges are not accessed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_fpu_buffer(operation: u8, buffer: *mut u8, len: usize) -> bool {
-    let bytes = active_bytes();
-    if !valid_buffer(buffer, len, bytes) {
+    let Some(d) = descriptor() else {
+        return false;
+    };
+    if !d.contract.buffer(buffer.addr(), len) {
         return false;
     }
-    let value = config();
+    let value = d.status();
     match operation {
         0 => {
-            unsafe { core::ptr::copy_nonoverlapping(INITIAL.0.get().cast::<u8>(), buffer, bytes) };
+            unsafe { core::ptr::copy_nonoverlapping(d.initial, buffer, d.contract.bytes as usize) };
             TASK_INITS.fetch_add(1, Ordering::Relaxed);
-            TASK_BYTES.fetch_add(u64::from(value.state_bytes), Ordering::Relaxed);
+            TASK_BYTES.fetch_add(u64::from(d.contract.bytes), Ordering::Relaxed);
         }
         1 => {
             save_raw(value, buffer);
@@ -370,11 +479,11 @@ pub unsafe extern "C" fn r4os_rust_fpu_buffer(operation: u8, buffer: *mut u8, le
             RESTORES.fetch_add(1, Ordering::Relaxed);
         }
         _ => panic!("Invalid private FPU buffer operation"),
-    }
+    };
     true
 }
 /// # Safety
-/// Caller owns a fixed aligned C output until return; no buffer is borrowed.
+/// Exact aligned output remains owned until return.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_fpu_status(output: *mut Status) {
     unsafe { output.write(snapshot()) };
@@ -385,7 +494,6 @@ const _: () = {
     assert!(core::mem::offset_of!(Status, cr0) == 32);
     assert!(core::mem::offset_of!(Status, task_state_bytes) == 72);
 };
-
 unsafe fn fpu_log(event: u8, status: *const Status, inherited: *const u64) {
     use crate::boot::log::{
         r4os_rust_bootlog_dec as dec, r4os_rust_bootlog_hex as hex, text as puts,

@@ -282,6 +282,7 @@ fn publish_current(task: Task) {
         s.current = task;
         s.current_work = work;
     });
+    crate::arch::fpu_fault::publish_task(percpu::current_index(), item.id, item.generation);
 }
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -447,6 +448,8 @@ pub fn init_secondary(index: u32) -> bool {
         s.pending = false;
         s.initialized = true
     });
+    let item = view(idle);
+    crate::arch::fpu_fault::publish_task(index, item.id, item.generation);
     mutate(0, idle, 0, 0);
     unsafe { task_context::bind(view(idle).unwind_slot) };
     percpu::r4os_rust_percpu_control(9, index, 1, 0);
@@ -1410,12 +1413,7 @@ fn irq_enter() -> ExternalIrqFpuGuard {
             restore = true;
         }
     }
-    if !fpu::restore_initial() {
-        if restore {
-            mutate(7, running, 0, 0);
-        }
-        return ExternalIrqFpuGuard::EMPTY;
-    }
+    assert!(fpu::restore_initial(), "IRQ canonical FP restore rejected");
     change(|s| s.external_irq_fpu_guard_entries = s.external_irq_fpu_guard_entries.wrapping_add(1));
     ExternalIrqFpuGuard {
         interrupted_task: running,
@@ -1457,8 +1455,12 @@ fn irq_leave(guard: ExternalIrqFpuGuard) {
         if report {
             log(5, ptr::null_mut(), 0, 0);
         }
+        panic!("IRQ FP owner identity changed");
     }
-    fpu::restore_initial();
+    assert!(
+        fpu::restore_initial(),
+        "IRQ exit canonical FP restore rejected"
+    );
 }
 pub(crate) unsafe fn sleep(ticks: u64, reason: *const u8, len: usize) {
     if ticks == 0 {

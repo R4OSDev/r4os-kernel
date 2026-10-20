@@ -341,6 +341,11 @@ pub unsafe extern "C" fn exceptionDispatch(frame: *const InterruptFrame) {
     if unsafe { super::safe_msr::recover(frame.cast_mut()) } {
         return;
     }
+    if let Some(snapshot) =
+        super::fpu_fault::capture(unsafe { (*frame).vector as u32 }, unsafe { (*frame).rip })
+    {
+        super::fpu_fault::emit(snapshot);
+    }
     let address: u64;
     if unsafe { (*frame).vector } == 14 {
         unsafe {
@@ -376,19 +381,22 @@ pub unsafe extern "C" fn preparePageFaultFrame(
     }
     destination
 }
-#[repr(C, align(64))]
-struct FaultFpu([u8; 4096]);
 #[inline(never)]
 unsafe fn page_fault_private(frame: *const InterruptFrame, address: u64) {
     // This separate task-stack image survives blocking page-in and SIMD-capable
     // module calls. A scheduler image or the shared exception IST cannot do so.
-    let mut image = FaultFpu([0; 4096]);
+    let mut image = super::fpu::Image::filled(0);
     unsafe {
-        fault_fpu_save(image.0.as_mut_ptr());
+        fault_fpu_save(&mut image);
         exception_inner(frame, address, true);
-        fault_fpu_restore(image.0.as_ptr());
+        fault_fpu_restore(&image);
     }
 }
+// An image-capacity extension must explicitly requalify this private task-stack
+// owner. The allocation itself uses Image; this is the independently audited
+// existing stack budget, not another state-size definition.
+const PRIVATE_FAULT_FP_STACK_BUDGET: usize = 4 * 1024;
+const _: () = assert!(size_of::<super::fpu::Image>() <= PRIVATE_FAULT_FP_STACK_BUDGET);
 #[unsafe(no_mangle)]
 /// # Safety
 /// isr.S has switched to the exact resident private frame when private != 0.
@@ -407,12 +415,20 @@ pub unsafe extern "C" fn pageFaultDispatch(
     }
 }
 
-unsafe fn fault_fpu_save(state: *mut u8) {
-    unsafe { crate::arch::fpu::r4os_rust_fpu_buffer(1, state, 4096) };
+unsafe fn fault_fpu_save(state: &mut super::fpu::Image) {
+    assert!(
+        unsafe { super::fpu::r4os_rust_fpu_buffer(1, state.bytes.as_mut_ptr(), state.bytes.len()) },
+        "Private fault FPU save rejected"
+    );
 }
 
-unsafe fn fault_fpu_restore(state: *const u8) {
-    unsafe { crate::arch::fpu::r4os_rust_fpu_buffer(2, state.cast_mut(), 4096) };
+unsafe fn fault_fpu_restore(state: &super::fpu::Image) {
+    assert!(
+        unsafe {
+            super::fpu::r4os_rust_fpu_buffer(2, state.bytes.as_ptr().cast_mut(), state.bytes.len())
+        },
+        "Private fault FPU restore rejected"
+    );
 }
 
 unsafe fn prepare_fault_stack(address: u64, rsp: u64, bytes: usize) -> usize {

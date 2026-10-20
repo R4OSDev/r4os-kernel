@@ -295,10 +295,10 @@ pub(super) unsafe fn alloc_stack(owner: *mut Task) -> Option<GuardedStack> {
 }
 pub(super) unsafe fn allocate_fpu(task: *mut Task) -> bool {
     unsafe {
-        let bytes = fpu::r4os_rust_fpu_control(3) as usize;
-        if bytes == 0 {
+        let Some(descriptor) = fpu::descriptor() else {
             return false;
-        }
+        };
+        let bytes = descriptor.contract.bytes as usize;
         let pointer = heap::r4os_rust_heap_alloc(bytes, fpu::STORAGE_ALIGN);
         if pointer.is_null() {
             return false;
