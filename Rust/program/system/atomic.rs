@@ -109,6 +109,11 @@ pub unsafe extern "C" fn r4os_rust_sys_file_replace(
         if !short(names[1]) || !short(names[2]) {
             return -8;
         }
+        // Create-only FAT publication requires a short target too. Reject
+        // before publish_started so the owned stage remains abortable.
+        if require_owned && volume.kind == 0 && !short(names[0]) {
+            return -8;
+        }
         let mut request = some!(
             if require_owned {
                 fs::Request::claims(23, (*target.drive_ref).letter, volume)
@@ -324,6 +329,10 @@ pub unsafe extern "C" fn r4os_rust_sys_stream_declare(
         }
         let names = paths.map(path::base);
         if !short(names[0]) || !short(names[2]) {
+            return -5;
+        }
+        // Do not mint a durable claim for unsupported create-only FAT LFN.
+        if volume.kind == 0 && !short(names[1]) {
             return -5;
         }
         let letter = (*staged.drive_ref).letter;
