@@ -1,5 +1,6 @@
 //! Explicit work only. A resident BSP controller reuses native boot cases;
 //! AP callers see the immutable report only after the release/acquire handoff.
+pub(crate) mod park;
 pub(crate) mod tasks;
 mod unwind;
 use crate::{

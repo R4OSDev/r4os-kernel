@@ -691,14 +691,23 @@ pub fn yield_task() {
         return;
     }
     let flags = runtime::save_runtime();
+    let switched = yield_owned();
+    runtime::restore_runtime(flags);
+    if switched {
+        mutate(17, ptr::null_mut(), 0, 0);
+    }
+}
+// Retain admission on a no-switch return. A true return is this exact saved
+// stack resuming as Running after the existing physical RSP/FPU handoff; the
+// finish-switch hook has already released Runtime. No Rust borrow spans it.
+fn yield_owned() -> bool {
     change(|s| s.yield_count = s.yield_count.wrapping_add(1));
     let now = tick();
     preempt_disable();
     let old = local().current;
     if old.is_null() {
         preempt_enable();
-        runtime::restore_runtime(flags);
-        return;
+        return false;
     }
     if view(old).state == 2 {
         restore_productive(old);
@@ -711,15 +720,13 @@ pub fn yield_task() {
         set_pending(false);
         if view(old).state == 2 && !departing {
             preempt_enable();
-            runtime::restore_runtime(flags);
-            return;
+            return false;
         }
         let idle = local().idle;
         if idle.is_null() {
             assert!(!departing, "placement requires initialized idle");
             preempt_enable();
-            runtime::restore_runtime(flags);
-            return;
+            return false;
         }
         idle
     } else {
@@ -729,8 +736,7 @@ pub fn yield_task() {
         mutate(0, old, 0, 0);
         preempt_enable();
         set_pending(false);
-        runtime::restore_runtime(flags);
-        return;
+        return false;
     }
     let old_view = view(old);
     if old_view.state == 2 {
@@ -754,8 +760,7 @@ pub fn yield_task() {
     // No state reference or RAII owner spans this physical switch. Assembly
     // publishes outgoing RSP before releasing the unique runtime owner.
     unsafe { switch_context(outgoing, incoming) };
-    runtime::restore_runtime(flags);
-    mutate(17, ptr::null_mut(), 0, 0);
+    true
 }
 pub fn preempt_from_irq() {
     preempt_irq(0, false);
@@ -818,11 +823,26 @@ unsafe fn block_current(object: u64, timeout: u64, reason: *const u8, len: usize
         return ptr::null_mut();
     }
     let flags = runtime::save_runtime();
+    let task = unsafe { block_current_owned(object, timeout, reason, len) };
+    runtime::restore_runtime(flags);
+    task
+}
+/// # Safety
+/// Caller retains canonical runtime admission and resident reason storage.
+/// This bounded enrollment never switches or releases the caller's owner.
+pub(crate) unsafe fn block_current_owned(
+    object: u64,
+    timeout: u64,
+    reason: *const u8,
+    len: usize,
+) -> Task {
+    if !enabled() {
+        return ptr::null_mut();
+    }
     preempt_disable();
     let running = local().current;
     if running.is_null() {
         preempt_enable();
-        runtime::restore_runtime(flags);
         return ptr::null_mut();
     }
     let now = tick();
@@ -841,26 +861,43 @@ unsafe fn block_current(object: u64, timeout: u64, reason: *const u8, len: usize
         s.object_wait_count = s.object_wait_count.wrapping_add(1);
     });
     preempt_enable();
-    runtime::restore_runtime(flags);
     running
 }
 fn park_blocked(task: Task) {
     let flags = runtime::save_runtime();
-    runtime::restore_runtime(flags);
-    while view(task).state == 3 {
-        yield_task();
+    unsafe { park_blocked_owned(task, flags) };
+}
+/// # Safety
+/// Consumes exactly the current task's outer Runtime admission and restores
+/// the caller's IF. Enrollment/queue references have ended; this exact task
+/// remains physically current until the existing RSP/FPU save releases it.
+pub(crate) unsafe fn park_blocked_owned(task: Task, flags: u64) {
+    loop {
+        // Every mutable Task/State observation has Runtime admission. In the
+        // standalone path, a producer may already have woken this current.
+        if view(task).state != 3 {
+            if local().current == task && view(task).state == 1 {
+                let latency = mutate(5, task, tick(), 0);
+                record_ready(task, latency);
+                mutate(0, task, 0, 0);
+            }
+            runtime::restore_runtime(flags);
+            return;
+        }
+        if yield_owned() {
+            // Only dispatch of this exact Running task can resume its stack.
+            // No queue/record or unowned mutable TaskView is inspected here.
+            runtime::restore_runtime(flags);
+            mutate(17, ptr::null_mut(), 0, 0);
+            return;
+        }
         if view(task).state == 3 {
             change(|s| s.idle_wait_count = s.idle_wait_count.wrapping_add(1));
-            wait_until_deadline();
             runtime::restore_runtime(flags);
+            wait_until_deadline();
+            let _ = runtime::save_runtime();
         }
     }
-    if local().current == task && view(task).state == 1 {
-        let latency = mutate(5, task, tick(), 0);
-        record_ready(task, latency);
-        mutate(0, task, 0, 0);
-    }
-    runtime::restore_runtime(flags);
 }
 // Runtime admission covers queue transfer, exact target publication and IPI.
 fn balance_ready(transfer: super::task::balance::Transfer, now: impl FnMut() -> u64) -> Task {

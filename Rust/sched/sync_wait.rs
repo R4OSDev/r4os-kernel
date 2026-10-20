@@ -88,9 +88,7 @@ pub(super) unsafe fn wait(queue: *mut WaitQueue, request: &WaitRequest) -> WaitR
             note(super::sync_stats::WaitMetric::Drops);
             return WaitResult::Failed;
         }
-        let blocked = scheduler::r4os_rust_scheduler_task(
-            0,
-            ptr::null_mut(),
+        let blocked = scheduler::block_current_owned(
             queue.addr() as u64,
             request.timeout,
             request.reason.pointer,
@@ -102,9 +100,11 @@ pub(super) unsafe fn wait(queue: *mut WaitQueue, request: &WaitRequest) -> WaitR
             note(super::sync_stats::WaitMetric::Drops);
             return WaitResult::Failed;
         }
-        leave(flags);
+        // End queue/record use before handing the outer admission directly
+        // to dispatch. A waker cannot interleave until the real saved switch.
+        preempt_enable();
         note(super::sync_stats::WaitMetric::QueueWaits);
-        scheduler::r4os_rust_scheduler_task(1, blocked.cast(), 0, 0, ptr::null(), 0);
+        scheduler::park_blocked_owned(blocked.cast(), flags);
         let resumed = registry::core(blocked);
         let result = (*resumed).wait_result;
         let elapsed = (*resumed).last_wait_ticks;
