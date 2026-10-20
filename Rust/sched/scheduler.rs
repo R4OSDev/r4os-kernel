@@ -350,9 +350,6 @@ fn query(operation: u8, task: Task, a: u64) -> u64 {
 fn mutate(operation: u8, task: Task, a: u64, b: u64) -> u64 {
     unsafe { super::task::scheduler_mutate(operation, task, a, b, ptr::null(), 0) }
 }
-fn text_mutate(operation: u8, task: Task, a: u64, b: u64, text: *const u8, len: usize) -> u64 {
-    unsafe { super::task::scheduler_mutate(operation, task, a, b, text, len) }
-}
 fn task_query(operation: u8, a: u64) -> Task {
     ptr::with_exposed_provenance_mut(query(operation, ptr::null_mut(), a) as usize)
 }
@@ -852,7 +849,18 @@ pub(crate) unsafe fn block_current_owned(
         timer::r4os_rust_timer_control(6, now, timeout)
     };
     let previous = query(8, ptr::null_mut(), 0);
-    text_mutate(14, running, wake, object, reason, len);
+    unsafe {
+        super::task::begin_wait_at(
+            running.cast(),
+            wake,
+            now,
+            super::task::task_types::Bytes {
+                pointer: reason,
+                len,
+            },
+            object,
+        );
+    }
     if percpu::current_index() != 0 && wake != 0 && wake < previous {
         send_reschedule(0);
     }

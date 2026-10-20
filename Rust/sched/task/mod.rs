@@ -15,6 +15,24 @@ use crate::sched::scheduler::TaskView;
 use core::{ffi::c_void, ptr};
 pub(crate) use task_types::Task;
 
+/// # Safety
+/// Exact current task and resident reason under uninterrupted Runtime
+/// admission. `now` is this enrollment's already resolved deadline base,
+/// never a cached raw counter or a value retained through a wait/migration.
+pub(crate) unsafe fn begin_wait_at(
+    task: *mut Task,
+    wake: u64,
+    now: u64,
+    reason: task_types::Bytes,
+    object: u64,
+) {
+    // Keep the legacy task-mutation admission/IF and accounting contract;
+    // this change removes only its redundant clock projection.
+    let flags = crate::arch::runtime::save_runtime();
+    unsafe { task_registry::begin_wait(task, wake, now, reason, object) };
+    crate::arch::runtime::restore_runtime(flags);
+}
+
 /// Enroll one owned, pinned, non-running diagnostic task through the real
 /// deadline owner. Caller supplies an absolute future tick under runtime admission.
 pub(crate) unsafe fn diagnostic_timeout(task: *mut Task, tick: u64, reason: &'static [u8]) {
