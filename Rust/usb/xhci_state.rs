@@ -19,6 +19,9 @@ pub(super) struct State {
     pub registration_id: core::sync::atomic::AtomicU32,
     pub asynchronous: super::xhci_async::AsyncState,
     pub current: Status,
+    pub bulk_cleared_bytes: u64,
+    pub bulk_in_requested_bytes: u64,
+    pub bulk_out_requested_bytes: u64,
     pub command_ring_virt: u64,
     pub event_ring_virt: u64,
     pub erst_virt: u64,
@@ -64,6 +67,9 @@ impl State {
             registration_id: core::sync::atomic::AtomicU32::new(0),
             asynchronous: super::xhci_async::AsyncState::empty(),
             current: Status::EMPTY,
+            bulk_cleared_bytes: 0,
+            bulk_in_requested_bytes: 0,
+            bulk_out_requested_bytes: 0,
             command_ring_virt: 0,
             event_ring_virt: 0,
             erst_virt: 0,
@@ -206,6 +212,56 @@ impl Iterator for Iter {
         self.0 = unsafe { (*p).next };
         Some(Context(p))
     }
+}
+
+// Passive owner-consistent quantities. Count unique owned DMA reservations,
+// including retained nonzero frame fields; active aliases are not counted twice.
+pub(crate) fn buffer_work() -> Option<[u64; 4]> {
+    let mut out = [0u64; 4];
+    for ctx in instances() {
+        if !super::xhci_owner::acquire(ctx) {
+            return None;
+        }
+        unsafe {
+            super::xhci_runtime::persist_active_runtime(ctx);
+            let s = state(ctx);
+            out[0] = out[0].wrapping_add((*s).bulk_cleared_bytes);
+            out[1] = out[1].wrapping_add((*s).bulk_in_requested_bytes);
+            out[2] = out[2].wrapping_add((*s).bulk_out_requested_bytes);
+            let c = current(ctx);
+            for physical in [
+                (*c).command_ring_phys,
+                (*c).event_ring_phys,
+                (*c).erst_phys,
+                (*c).dcbaa_phys,
+                (*c).scratchpad_array_phys,
+            ] {
+                out[3] += u64::from(physical != 0);
+            }
+            for physical in (*s).scratchpad_frames {
+                out[3] += u64::from(physical != 0);
+            }
+            for rt in &(*s).runtimes {
+                for physical in [
+                    rt.device_context_phys,
+                    rt.input_context_phys,
+                    rt.ep0_ring_phys,
+                    rt.interrupt_ring_phys,
+                    rt.interrupt_buffer_phys,
+                    rt.bulk_in_ring_phys,
+                    rt.bulk_out_ring_phys,
+                    rt.descriptor_phys,
+                ] {
+                    out[3] += u64::from(physical != 0);
+                }
+                if rt.bulk_buffer_phys != 0 {
+                    out[3] += u64::from(rt.bulk_buffer_frames);
+                }
+            }
+        }
+        super::xhci_owner::release(ctx);
+    }
+    Some(out)
 }
 
 // Passive diagnostic quantities. IRQ producers remain atomic; no mutable

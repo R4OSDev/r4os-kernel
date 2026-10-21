@@ -285,6 +285,9 @@ pub(super) unsafe fn bulk_out(ctx: Context, data: &[u8]) -> bool {
             (*current(ctx)).last_bulk_result = Text::literal(b"recovery-required");
             return false;
         }
+        (*state(ctx)).bulk_out_requested_bytes = (*state(ctx))
+            .bulk_out_requested_bytes
+            .wrapping_add(data.len() as u64);
         ptr::copy_nonoverlapping(
             data.as_ptr(),
             (*state(ctx)).first_bulk_buffer_virt as *mut u8,
@@ -322,6 +325,12 @@ pub(super) unsafe fn bulk_in(ctx: Context, out: &mut [u8]) -> bool {
             (*current(ctx)).last_bulk_result = Text::literal(b"recovery-required");
             return false;
         }
+        (*state(ctx)).bulk_in_requested_bytes = (*state(ctx))
+            .bulk_in_requested_bytes
+            .wrapping_add(out.len() as u64);
+        (*state(ctx)).bulk_cleared_bytes = (*state(ctx))
+            .bulk_cleared_bytes
+            .wrapping_add(out.len() as u64);
         ptr::write_bytes(
             (*state(ctx)).first_bulk_buffer_virt as *mut u8,
             0,

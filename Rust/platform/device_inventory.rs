@@ -795,12 +795,13 @@ fn add_usb(snapshot: *mut Snapshot) {
             },
         );
     }
-    for mode in 0..4 {
+    for mode in 0..5 {
         let name = match mode {
             0 => b"USB completion work".as_slice(),
             1 => b"USB IRQ work".as_slice(),
             2 => b"USB completion wake".as_slice(),
-            _ => b"USB HID work".as_slice(),
+            3 => b"USB HID work".as_slice(),
+            _ => b"USB buffer work".as_slice(),
         };
         let note = usb_work_note(snapshot, mode);
         add(
@@ -819,7 +820,20 @@ fn usb_work_note(snapshot: *mut Snapshot, mode: u8) -> Text {
     let out = unsafe { &mut *ptr::addr_of_mut!((*snapshot).xhci_note) };
     out.fill(0);
     let mut w = NoteWriter::new(out);
-    if mode == 3 {
+    if mode == 4 {
+        let Some(v) = crate::usb::xhci_state::buffer_work() else {
+            return Text::new(b"unavailable");
+        };
+        for (name, value) in [
+            (b"clear=".as_slice(), v[0]),
+            (b" inbytes=", v[1]),
+            (b" outbytes=", v[2]),
+            (b" pages=", v[3]),
+        ] {
+            w.text(name);
+            w.num(value);
+        }
+    } else if mode == 3 {
         let Some(v) = crate::usb::hid::work_counters() else {
             return Text::new(b"unavailable");
         };
