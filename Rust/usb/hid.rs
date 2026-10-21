@@ -1,5 +1,5 @@
 //! Native HID binding, topology reconciliation and polling owner. Every
-//! binding/status mutation is under the existing reentrant controller guard;
+//! binding/status mutation is under its reentrant class guard;
 //! raw resident identities, never Rust mutable borrows, span module calls.
 use super::{
     core as usb_core, hid_report,
@@ -225,40 +225,27 @@ unsafe fn scan_catalogue() {
     }
 }
 unsafe extern "C" fn topology_changed() {
-    let Some(_g) = Guard::enter() else {
-        return;
-    };
-    unsafe {
-        (*state()).topology_reconciles = (*state()).topology_reconciles.wrapping_add(1);
-        reconcile_bindings();
-        if [Kind::Keyboard, Kind::Mouse, Kind::Consumer]
-            .into_iter()
-            .any(|k| (*binding(k)).bound)
-        {
-            start_poll_task_locked();
+    if let Some(_g) = Guard::enter() {
+        unsafe {
+            (*state()).topology_reconciles = (*state()).topology_reconciles.wrapping_add(1);
+            reconcile_bindings();
+            if [Kind::Keyboard, Kind::Mouse, Kind::Consumer]
+                .into_iter()
+                .any(|k| (*binding(k)).bound)
+            {
+                start_poll_task_locked();
+            }
         }
     }
+    // Do not hold HID admission over storage discovery or media I/O.
+    super::msc::topology_changed();
 }
 unsafe fn binding_still_published(b: *const HidBinding) -> bool {
     unsafe {
         if !(*b).present || (*b).port == 0 || (*b).device.slot_id == 0 {
             return false;
         }
-        let mut index = 0;
-        while let Some(dev) = usb_core::device_at(index) {
-            index += 1;
-            if !dev.active || !dev.configured {
-                continue;
-            }
-            if dev.controller_id == (*b).device.controller_id
-                && dev.port == (*b).port
-                && dev.slot_id == (*b).device.slot_id
-            {
-                let live = xhci::device_handle_from_core(dev);
-                return live.generation != 0 && live.generation == (*b).device.generation;
-            }
-        }
-        false
+        usb_core::contains_device((*b).device)
     }
 }
 unsafe fn reconcile_bindings() {
@@ -922,6 +909,21 @@ unsafe fn aggregate_ok(protocol: bool) -> bool {
         }
         have
     }
+}
+pub(crate) fn binding_for(device: super::xhci_types::DeviceHandle) -> (bool, bool) {
+    let Some(_g) = Guard::enter() else {
+        return (false, false);
+    };
+    let matches = |kind| unsafe {
+        let b = &*binding(kind);
+        b.present
+            && b.bound
+            && b.device.controller_id == device.controller_id
+            && b.device.generation == device.generation
+            && b.device.port == device.port
+            && b.device.slot_id == device.slot_id
+    };
+    (matches(Kind::Keyboard), matches(Kind::Mouse))
 }
 pub fn status() -> Status {
     let Some(_g) = Guard::enter() else {

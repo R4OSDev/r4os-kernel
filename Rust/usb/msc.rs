@@ -21,7 +21,7 @@ use core::ffi::c_void;
 use core::{
     cell::UnsafeCell,
     ptr,
-    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
 };
 const MAX_MEDIA: usize = 16;
 const MAX_TRANSFER_BYTES: u32 = 64 * 1024;
@@ -41,6 +41,7 @@ pub(super) struct Medium {
     pub state: Status,
     pub index: usize,
     pub ownership: UnwindGuard,
+    pub block_reference: crate::storage::access_state::Reference,
     pub data_buffer: [u8; 4096],
 }
 impl Medium {
@@ -48,6 +49,10 @@ impl Medium {
         state: Status::EMPTY,
         index: 0,
         ownership: guard(b"usbmsc-device-bot"),
+        block_reference: crate::storage::access_state::Reference {
+            slot: 0,
+            generation: 0,
+        },
         data_buffer: [0; 4096],
     };
 }
@@ -61,6 +66,7 @@ struct RegistryGuard(UnsafeCell<UnwindGuard>);
 unsafe impl Sync for RegistryGuard {}
 static REGISTRY: RegistryGuard = RegistryGuard(UnsafeCell::new(guard(b"usbmsc-registry")));
 static MEDIA_COUNT: AtomicUsize = AtomicUsize::new(0);
+static MEDIA_ONLINE: [AtomicBool; MAX_MEDIA] = [const { AtomicBool::new(false) }; MAX_MEDIA];
 static LAST_MEDIUM: AtomicUsize = AtomicUsize::new(0);
 static SOURCE: AtomicU8 = AtomicU8::new(0);
 #[derive(Clone, Copy)]
@@ -162,9 +168,6 @@ pub fn init() -> bool {
     let Some(_registry) = Admission::enter(REGISTRY.0.get()) else {
         return false;
     };
-    if MEDIA_COUNT.load(Ordering::Acquire) != 0 {
-        return block_device_count() != 0;
-    }
     let mut index = 0;
     loop {
         let binding = unsafe {
@@ -186,11 +189,14 @@ pub fn init() -> bool {
         {
             continue;
         }
-        let n = MEDIA_COUNT.load(Ordering::Acquire);
-        if n == MAX_MEDIA {
-            break;
+        if selected.device.generation == 0 || already_registered(selected.device) {
+            continue;
         }
-        unsafe {
+        let Some(n) = vacant_medium() else {
+            puts(b"[USBMSC] medium capacity includes retained mounted/offline registrations\r\n");
+            break;
+        };
+        let new_block = unsafe {
             let entry = item(n);
             let Some(_medium) = Admission::enter(ptr::addr_of_mut!((*entry).ownership)) else {
                 return false;
@@ -201,13 +207,111 @@ pub fn init() -> bool {
                 initialized: true,
                 ..Status::EMPTY
             });
-            initialize_medium(current, selected);
+            let registered = initialize_medium(current, selected);
             // Registration identity is immutable after this publication. The
             // counters/error state remain exclusively under the medium guard.
-            MEDIA_COUNT.store(n + 1, Ordering::Release);
+            MEDIA_COUNT.fetch_max(n + 1, Ordering::Release);
+            MEDIA_ONLINE[n].store(registered, Ordering::Release);
+            registered.then_some((*entry).block_reference)
+        };
+        // Initial boot scans later. Release medium admission before scanning:
+        // the independent block worker needs that same BOT guard for its I/O.
+        if !crate::sched::scheduler::current().is_null()
+            && let Some(reference) = new_block
+            && crate::storage::operations::attach_removable(reference).is_err()
+        {
+            puts(b"[USBMSC] medium registered; runtime automount unavailable\r\n");
         }
     }
     block_device_count() != 0
+}
+fn vacant_medium() -> Option<usize> {
+    let count = MEDIA_COUNT.load(Ordering::Acquire);
+    for (i, online) in MEDIA_ONLINE.iter().enumerate().take(count) {
+        if online.load(Ordering::Acquire) {
+            continue;
+        }
+        let entry = item(i);
+        let _medium = Admission::enter(unsafe { ptr::addr_of_mut!((*entry).ownership) })?;
+        if !unsafe { (*entry).state.block_registered } {
+            return Some(i);
+        }
+    }
+    (count < MAX_MEDIA).then_some(count)
+}
+fn already_registered(device: DeviceHandle) -> bool {
+    for i in 0..MEDIA_COUNT.load(Ordering::Acquire) {
+        let entry = item(i);
+        let Some(_medium) = Admission::enter(unsafe { ptr::addr_of_mut!((*entry).ownership) })
+        else {
+            // Never create another owner while an existing one is uncertain.
+            return true;
+        };
+        let bound = unsafe { (*entry).state.device };
+        if bound.controller_id == device.controller_id
+            && bound.generation == device.generation
+            && bound.slot_id == device.slot_id
+            && bound.port == device.port
+        {
+            return true;
+        }
+    }
+    false
+}
+pub(super) fn topology_changed() {
+    // Serialize discovery/retirement, independently of ordinary media I/O.
+    let Some(_discovery) = Admission::enter(REGISTRY.0.get()) else {
+        return;
+    };
+    // Old block callbacks retain their immutable medium/device generation.
+    // Mounted or busy block registrations cannot be recycled by discovery.
+    for (i, online) in MEDIA_ONLINE
+        .iter()
+        .enumerate()
+        .take(MEDIA_COUNT.load(Ordering::Acquire))
+    {
+        let entry = item(i);
+        let Some(_medium) = Admission::enter(unsafe { ptr::addr_of_mut!((*entry).ownership) })
+        else {
+            continue;
+        };
+        unsafe {
+            let s = ptr::addr_of_mut!((*entry).state);
+            if !xhci::device_handle_current((*s).device) {
+                online.store(false, Ordering::Release);
+                if (*s).block_registered {
+                    crate::storage::block_registry::offline_exact((*entry).block_reference);
+                    if crate::storage::block_execution::unregister_exact((*entry).block_reference) {
+                        (*s).block_registered = false;
+                    }
+                }
+                (*s).media_changed = true;
+                (*s).present = false;
+                (*s).reason = Text::literal(
+                    b"USB medium detached; old registration cannot address a replacement",
+                );
+            }
+        }
+    }
+    init();
+}
+pub(crate) fn binding_for(device: DeviceHandle) -> Option<bool> {
+    for i in 0..MEDIA_COUNT.load(Ordering::Acquire) {
+        let entry = item(i);
+        let _medium = Admission::enter(unsafe { ptr::addr_of_mut!((*entry).ownership) })?;
+        let s = unsafe { &(*entry).state };
+        if s.device.controller_id == device.controller_id
+            && s.device.generation == device.generation
+            && s.device.port == device.port
+            && s.device.slot_id == device.slot_id
+            && s.present
+            && s.block_registered
+            && !s.media_changed
+        {
+            return Some(s.write_protected);
+        }
+    }
+    None
 }
 unsafe fn initialize_medium(current: *mut Status, binding: DeviceBinding) -> bool {
     unsafe {
@@ -273,20 +377,23 @@ unsafe fn initialize_medium(current: *mut Status, binding: DeviceBinding) -> boo
     }
 }
 pub fn block_device_count() -> usize {
-    // These two registration fields are written before Release publication,
-    // then retained unchanged through media-change/transport-fault handling.
-    let mut count = 0;
-    for i in 0..MEDIA_COUNT.load(Ordering::Acquire) {
-        if unsafe { (*item(i)).state.block_registered } {
-            count += 1;
-        }
-    }
-    count
+    MEDIA_ONLINE[..MEDIA_COUNT.load(Ordering::Acquire)]
+        .iter()
+        .filter(|v| v.load(Ordering::Acquire))
+        .count()
 }
 pub fn device_index() -> Option<usize> {
-    for i in 0..MEDIA_COUNT.load(Ordering::Acquire) {
+    for (i, online) in MEDIA_ONLINE
+        .iter()
+        .enumerate()
+        .take(MEDIA_COUNT.load(Ordering::Acquire))
+    {
         unsafe {
-            if (*item(i)).state.block_registered {
+            if online.load(Ordering::Acquire) {
+                let _medium = Admission::enter(ptr::addr_of_mut!((*item(i)).ownership))?;
+                if !online.load(Ordering::Acquire) {
+                    continue;
+                }
                 return Some((*item(i)).state.block_index);
             }
         }
@@ -294,14 +401,20 @@ pub fn device_index() -> Option<usize> {
     None
 }
 pub fn reselect_active_device() -> bool {
-    for i in 0..MEDIA_COUNT.load(Ordering::Acquire) {
+    for (i, online) in MEDIA_ONLINE
+        .iter()
+        .enumerate()
+        .take(MEDIA_COUNT.load(Ordering::Acquire))
+    {
         unsafe {
-            if (*item(i)).state.block_registered {
+            if online.load(Ordering::Acquire) {
                 let current = ptr::addr_of_mut!((*item(i)).state);
                 let Some(_op) = begin_operation(current) else {
-                    return false;
+                    continue;
                 };
-                return ensure_selected(current);
+                if ensure_selected(current) {
+                    return true;
+                }
             }
         }
     }
@@ -664,7 +777,13 @@ unsafe fn usb_msc_register(current: *mut Status, index: usize, source: u8) -> us
     };
     cfg.driver = b::text(b"USBMSC");
     cfg.bus = 4;
-    cfg.controller = b::text(b"xhci");
+    let Some(controller) = xhci::controller_name(s.device.controller_id) else {
+        return usize::MAX;
+    };
+    cfg.controller = Text {
+        data: controller.pointer,
+        len: controller.len,
+    };
     cfg.port = s.port;
     cfg.sector_size = s.sector_size;
     cfg.sector_count = s.sector_count;
@@ -680,7 +799,11 @@ unsafe fn usb_msc_register(current: *mut Status, index: usize, source: u8) -> us
         None
     };
     cfg.flush = Some(block_flush);
-    unsafe { b::register(cfg) }.unwrap_or(usize::MAX)
+    let Some(reference) = (unsafe { b::register_reference(cfg) }) else {
+        return usize::MAX;
+    };
+    unsafe { (*medium(current)).block_reference = reference };
+    reference.slot as usize
 }
 
 const MEDIA_NAMES: [&[u8]; 16] = [

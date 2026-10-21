@@ -60,7 +60,11 @@ pub(super) unsafe fn probe_owned(ctx: Context, owner_id: u32, source: u32) -> bo
             probed: true,
             ..Status::EMPTY
         });
-        super::wait::reset_metrics();
+        // Aggregate wait counters cover all controllers; probing one instance
+        // must not erase observations belonging to another live controller.
+        if super::host_controller::r4os_rust_usb_host_count() == 0 {
+            super::wait::reset_metrics();
+        }
         let s = state(ctx);
         (*s).command_ring_virt = 0;
         (*s).event_ring_virt = 0;
@@ -227,11 +231,12 @@ pub(super) unsafe fn status(ctx: Context) -> Status {
 }
 pub(super) unsafe fn activate(ctx: Context, owner_id: u32, source: u32) -> i32 {
     unsafe {
-        if super::host_controller::r4os_rust_usb_host_find(b"XHCI".as_ptr(), 4) != usize::MAX {
+        let name = ctx.name();
+        if super::host_controller::r4os_rust_usb_host_find(name.pointer, name.len) != usize::MAX {
             return -2;
         }
         probe_owned(ctx, owner_id, source);
-        let i = super::host_controller::r4os_rust_usb_host_find(b"XHCI".as_ptr(), 4);
+        let i = super::host_controller::r4os_rust_usb_host_find(name.pointer, name.len);
         if i == usize::MAX {
             -3
         } else {

@@ -65,6 +65,7 @@ struct Slot {
     device: *mut c_void,
     used: bool,
     retiring: bool,
+    offline: bool,
     pins: u32,
     retire_generation: u64,
     reference: Reference,
@@ -76,6 +77,7 @@ impl Slot {
         device: ptr::null_mut(),
         used: false,
         retiring: false,
+        offline: false,
         pins: 0,
         retire_generation: 0,
         reference: Reference {
@@ -155,6 +157,7 @@ unsafe fn find(name: Text) -> Option<usize> {
     for i in 0..r.slot_count {
         let s = r.slots[i];
         if s.used
+            && !s.offline
             && s.info.bus != r.excluded
             && unsafe { s.info.name.bytes().eq_ignore_ascii_case(name.bytes()) }
         {
@@ -164,7 +167,21 @@ unsafe fn find(name: Text) -> Option<usize> {
     None
 }
 fn visible(s: Slot, excluded: u8) -> bool {
-    s.used && !s.retiring && s.info.bus != excluded
+    s.used && !s.retiring && !s.offline && s.info.bus != excluded
+}
+/// Close new I/O for one detached incarnation without recycling its metadata,
+/// mounted references or outstanding execution pins. Retirement stays exact.
+pub(crate) fn offline_exact(reference: Reference) -> bool {
+    let _owner = Guard::acquire(1);
+    let r = unsafe { &mut *REGISTRY.0.get() };
+    let Some(slot) = r.slots.get_mut(reference.slot as usize) else {
+        return false;
+    };
+    if !slot.used || slot.reference != reference {
+        return false;
+    }
+    slot.offline = true;
+    true
 }
 unsafe fn copy_text<const N: usize>(out: &mut [u8; N], text: Text) {
     let n = text.len.min(N - 1);
@@ -260,6 +277,7 @@ pub unsafe extern "C" fn r4os_rust_block_registry_register(
         device,
         used: true,
         retiring: false,
+        offline: false,
         pins: 0,
         retire_generation: generation,
         reference,
@@ -421,13 +439,18 @@ pub struct Pin {
 /// Its resident device remains alive until this token is consumed by unpin.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_block_registry_pin(index: usize, out: *mut Pin) -> bool {
-    unsafe { pin(index, None, out) }
+    unsafe { pin(index, None, false, out) }
 }
 pub(crate) unsafe fn pin_exact(reference: Reference, out: *mut Pin) -> bool {
-    unsafe { pin(reference.slot as usize, Some(reference), out) }
+    unsafe { pin(reference.slot as usize, Some(reference), false, out) }
+}
+/// Only the controller worker uses this to finish already pinned work after
+/// detach. It admits no new request and cannot resurrect an idle offline row.
+pub(crate) unsafe fn pin_existing_work(reference: Reference, out: *mut Pin) -> bool {
+    unsafe { pin(reference.slot as usize, Some(reference), true, out) }
 }
 #[inline(always)]
-unsafe fn pin(index: usize, expected: Option<Reference>, out: *mut Pin) -> bool {
+unsafe fn pin(index: usize, expected: Option<Reference>, drain: bool, out: *mut Pin) -> bool {
     let unwind = unsafe { task_context::enter() };
     if !unwind.admitted() {
         return false;
@@ -436,7 +459,13 @@ unsafe fn pin(index: usize, expected: Option<Reference>, out: *mut Pin) -> bool 
         let _owner = Guard::acquire(1);
         let r = unsafe { &mut *REGISTRY.0.get() };
         if index >= r.slot_count
-            || !visible(r.slots[index], r.excluded)
+            || !(visible(r.slots[index], r.excluded)
+                || (drain
+                    && r.slots[index].used
+                    && !r.slots[index].retiring
+                    && r.slots[index].offline
+                    && r.slots[index].pins != 0
+                    && r.slots[index].info.bus != r.excluded))
             || r.slots[index].pins == u32::MAX
             || expected.is_some_and(|v| v != r.slots[index].reference)
         {

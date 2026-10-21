@@ -1336,6 +1336,55 @@ fn rescan(device: *const api::StorageDeviceRef) -> Result<i32> {
     }
     Ok(0)
 }
+/// Discovery of one newly registered removable USB incarnation. Reuse the
+/// existing runtime gate, exact device lease, decoder and mount publisher;
+/// never reset the boot inventory or rescan unrelated devices.
+pub(crate) fn attach_removable(reference: Reference) -> Result<usize> {
+    let _gate = Gate::enter()?;
+    let identity = identity(reference.slot as usize).ok_or(api::storage_error_stale)?;
+    if identity.reference != reference || identity.bus != 4 {
+        return Err(api::storage_error_stale);
+    }
+    let _use = raw_use(all(&identity))?;
+    let r = record(reference.slot as usize);
+    unsafe {
+        if !(*r).ready || id(r).reference != reference {
+            reset_record(r);
+            scan_record(r, identity, None)?;
+        }
+        if !(*r).layout.valid || incomplete(r) || unsupported(r) {
+            return Err(api::storage_error_unsupported);
+        }
+        let mut mounted = 0;
+        for i in 0..(*r).layout.count {
+            if !matches!(
+                (*r).hints[i],
+                api::storage_filesystem_fat32 | api::storage_filesystem_ntfs
+            ) {
+                continue;
+            }
+            let partition = part(r, i);
+            let region = Region {
+                device: reference,
+                first: partition.first_lba,
+                count: partition.sector_count,
+            };
+            if (0..27)
+                .filter_map(mount_reference)
+                .filter_map(|v| mount_snapshot(v).ok())
+                .any(|v| v.region.overlaps(region))
+            {
+                continue;
+            }
+            let letter = (b'D'..=b'Z')
+                .find(|v| *v != b'R' && !drive(*v).present)
+                .ok_or(api::storage_error_capacity)?;
+            publish_mount(r, i, letter, 0)?;
+            mounted += 1;
+        }
+        Ok(mounted)
+    }
+}
 unsafe fn mount(
     target: *const api::StorageTarget,
     letter_arg: u32,

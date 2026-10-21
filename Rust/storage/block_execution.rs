@@ -1310,7 +1310,7 @@ pub unsafe fn pump_controller(lane: u8) -> bool {
             && block_workers::r4os_rust_block_worker_lane(slot.lane) == lane
         {
             let mut pin = MaybeUninit::uninit();
-            if unsafe { block_registry::r4os_rust_block_registry_pin(index, pin.as_mut_ptr()) } {
+            if unsafe { block_registry::pin_existing_work(slot.reference, pin.as_mut_ptr()) } {
                 let mut pin = unsafe { pin.assume_init() };
                 if unsafe { pump(pin.device, 1) } {
                     worked = true;

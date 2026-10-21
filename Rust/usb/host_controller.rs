@@ -213,14 +213,18 @@ type Interrupt =
 type Port = unsafe extern "C" fn(*mut c_void, u8) -> i32;
 type Endpoint = unsafe extern "C" fn(*mut c_void, *const HostEndpoint) -> i32;
 type Status = unsafe extern "C" fn(*mut c_void, *mut HostStatus) -> i32;
-unsafe fn unregister(index: usize) -> bool {
+unsafe fn unregister(index: usize, expected_id: u32, expected_owner: u32) -> bool {
     let c = {
         let _metadata = MetadataGuard::enter();
         let Some(p) = (unsafe { at(index) }) else {
             return false;
         };
         unsafe {
-            if (*p).closing || (*p).callbacks != 0 {
+            if (*p).id != expected_id
+                || (*p).owner_id != expected_owner
+                || (*p).closing
+                || (*p).callbacks != 0
+            {
                 return false;
             }
             (*p).closing = true;
@@ -376,7 +380,10 @@ pub unsafe extern "C" fn r4os_rust_usb_host_index(id: u32) -> usize {
 /// exclusive. The caller retains the owner/context documented by this module.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn r4os_rust_usb_host_unregister(index: usize) -> bool {
-    unsafe { unregister(index) }
+    let Some(c) = (unsafe { snapshot(index) }) else {
+        return false;
+    };
+    unsafe { unregister(index, c.id, c.owner_id) }
 }
 /// # Safety
 /// Exact live private C records and resident labels/buffers; outputs are
@@ -392,13 +399,30 @@ pub unsafe extern "C" fn r4os_rust_usb_host_unregister_name(
     } else {
         unsafe { slice::from_raw_parts(name, len) }
     };
+    if name.eq_ignore_ascii_case(b"XHCI") {
+        let mut found = false;
+        let mut all = true;
+        for index in 0..CAPACITY {
+            let Some(c) = (unsafe { snapshot(index) }) else {
+                continue;
+            };
+            if c.owner_id != owner
+                || !(c.name[..c.name_len] == *b"XHCI" || c.name[..c.name_len].starts_with(b"XHCI@"))
+            {
+                continue;
+            }
+            found = true;
+            all &= unsafe { unregister(index, c.id, owner) };
+        }
+        return found && all;
+    }
     let Some(index) = (unsafe { find(name) }) else {
         return false;
     };
-    if unsafe { snapshot(index) }.is_none_or(|c| c.owner_id != owner) {
+    let Some(c) = (unsafe { snapshot(index) }) else {
         return false;
-    }
-    unsafe { unregister(index) }
+    };
+    unsafe { unregister(index, c.id, owner) }
 }
 /// # Safety
 /// Exact live private C records and resident labels/buffers; outputs are
@@ -414,7 +438,7 @@ pub unsafe extern "C" fn r4os_rust_usb_host_cleanup(owner: u32, out: *mut Cleanu
             if c.owner_id != owner {
                 continue;
             }
-            if unsafe { unregister(index) } {
+            if unsafe { unregister(index, c.id, owner) } {
                 result.removed += 1;
             } else {
                 result.failed = true;
@@ -516,6 +540,9 @@ pub unsafe extern "C" fn r4os_rust_usb_host_configure(
         Ok(d) => d,
         Err(e) => return e,
     };
+    if d.id != unsafe { (*device).controller_id } {
+        return -1;
+    }
     let f = match unsafe { callback(index, d.configure_device) } {
         Ok(f) => f,
         Err(e) => return e,
@@ -540,6 +567,9 @@ pub unsafe extern "C" fn r4os_rust_usb_host_control(
         Ok(d) => d,
         Err(e) => return e,
     };
+    if d.id != unsafe { (*device).controller_id } {
+        return -1;
+    }
     let f = match unsafe { callback(index, d.control_transfer) } {
         Ok(f) => f,
         Err(e) => return e,
@@ -572,6 +602,9 @@ pub unsafe extern "C" fn r4os_rust_usb_host_bulk(
         Ok(d) => d,
         Err(e) => return e,
     };
+    if d.id != unsafe { (*endpoint).device.controller_id } {
+        return -1;
+    }
     let f = match unsafe { callback(index, d.bulk_transfer) } {
         Ok(f) => f,
         Err(e) => return e,
@@ -604,6 +637,9 @@ pub unsafe extern "C" fn r4os_rust_usb_host_interrupt(
         Ok(d) => d,
         Err(e) => return e,
     };
+    if d.id != unsafe { (*endpoint).device.controller_id } {
+        return -1;
+    }
     let f = match unsafe { callback(index, d.interrupt_transfer) } {
         Ok(f) => f,
         Err(e) => return e,
@@ -643,6 +679,9 @@ unsafe fn endpoint_action(endpoint: *const HostEndpoint, reset: bool) -> i32 {
         Ok(d) => d,
         Err(e) => return e,
     };
+    if d.id != unsafe { (*endpoint).device.controller_id } {
+        return -1;
+    }
     let f = match unsafe {
         callback(
             index,

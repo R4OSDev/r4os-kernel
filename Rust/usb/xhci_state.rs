@@ -114,6 +114,19 @@ struct Catalogue(UnsafeCell<*mut State>);
 // their own UnwindGuard owns hardware/runtime mutation, including after waits.
 unsafe impl Sync for Catalogue {}
 static CATALOGUE: Catalogue = Catalogue(UnsafeCell::new(ptr::null_mut()));
+static ALLOCATION_FAILURES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+fn inventory_bit(device: PciDevice) -> u64 {
+    (0..crate::platform::pci_inventory::count())
+        .find(|i| {
+            crate::platform::pci_inventory::device_at(*i).is_some_and(|d| same_pci(d, device))
+        })
+        .and_then(|i| 1u64.checked_shl(i as u32))
+        .unwrap_or(0)
+}
+pub(crate) fn allocation_failed(device: PciDevice) -> bool {
+    let failures = ALLOCATION_FAILURES.load(core::sync::atomic::Ordering::Acquire);
+    failures != 0 && failures & inventory_bit(device) != 0
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Context(*mut State);
@@ -209,8 +222,23 @@ pub(super) fn ensure(device: PciDevice) -> Option<Context> {
     // No runtime/catalogue owner spans allocation or cleanup.
     let p = unsafe { alloc::alloc::alloc(layout).cast::<State>() };
     if p.is_null() {
+        ALLOCATION_FAILURES.fetch_or(inventory_bit(device), core::sync::atomic::Ordering::Release);
+        let mut record = crate::boot::record::Record::new();
+        record.text(b"[XHCI][WARN] instance allocation failed pci=");
+        record.decimal(u64::from(device.bus));
+        record.text(b":");
+        record.decimal(u64::from(device.device));
+        record.text(b".");
+        record.decimal(u64::from(device.function));
+        record.text(b"\r\n");
+        let bytes = record.as_bytes();
+        unsafe { crate::boot::log::r4os_rust_bootlog_write(bytes.as_ptr(), bytes.len()) };
         return None;
     }
+    ALLOCATION_FAILURES.fetch_and(
+        !inventory_bit(device),
+        core::sync::atomic::Ordering::Release,
+    );
     unsafe {
         p.write(State {
             pci_device: device,

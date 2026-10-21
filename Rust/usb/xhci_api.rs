@@ -70,33 +70,56 @@ pub(crate) unsafe fn probe() -> bool {
     let ps = crate::platform::pci_inventory::snapshot();
     // Preserve the unavailable-backend registration when no controller exists.
     // Activation success describes the driver owner, not present hardware.
-    let Some(ctx) = xhci_state::ensure(ps.first_xhci) else {
-        return false;
-    };
-    let Some(_guard) = Guard::enter(ctx) else {
-        return false;
-    };
-    unsafe { xhci::probe_owned(ctx, 0, 0) }
+    let mut running = false;
+    for device in controller_devices(ps.xhci_count == 0) {
+        let Some(ctx) = xhci_state::ensure(device) else {
+            continue;
+        };
+        let Some(_guard) = Guard::enter(ctx) else {
+            continue;
+        };
+        running |= unsafe { xhci::probe_owned(ctx, 0, 0) };
+    }
+    running
 }
 /// Driver caller retains exact host/module identity through activation.
 pub(crate) unsafe fn activate(owner_id: u32, source: u32) -> i32 {
     let ps = crate::platform::pci_inventory::snapshot();
-    let Some(ctx) = xhci_state::ensure(ps.first_xhci) else {
-        return -1;
-    };
-    let Some(_guard) = Guard::enter(ctx) else {
-        return -1;
-    };
-    unsafe { xhci::activate(ctx, owner_id, source) }
+    let mut first = -1;
+    for device in controller_devices(ps.xhci_count == 0) {
+        let Some(ctx) = xhci_state::ensure(device) else {
+            continue;
+        };
+        let Some(_guard) = Guard::enter(ctx) else {
+            continue;
+        };
+        let result = unsafe { xhci::activate(ctx, owner_id, source) };
+        if result >= 0 && first < 0 {
+            first = result;
+        }
+    }
+    first
+}
+/// Cached PCI inventory only. Configuration-space access stays in driver init.
+fn controller_devices(absent: bool) -> impl Iterator<Item = crate::platform::pci_scan::Device> {
+    (0..crate::platform::pci_inventory::count())
+        .filter_map(crate::platform::pci_inventory::device_at)
+        .filter(|d| d.class_code == 12 && d.subclass == 3 && d.prog_if == 0x30)
+        .chain(absent.then_some(crate::platform::pci_scan::Device::EMPTY))
 }
 pub(super) unsafe fn start_port_task() -> bool {
-    let Some(ctx) = xhci_state::first() else {
-        return true;
-    };
-    let Some(_guard) = Guard::enter(ctx) else {
-        return false;
-    };
-    unsafe { xhci::start_port_task(ctx) }
+    let mut all = true;
+    for ctx in xhci_state::instances() {
+        let Some(_guard) = Guard::enter(ctx) else {
+            all = false;
+            continue;
+        };
+        all &= unsafe { xhci::start_port_task(ctx) };
+    }
+    all
+}
+pub(super) fn controller_name(id: u32) -> Option<crate::sched::sync_types::Text> {
+    xhci_state::for_id(id).map(Context::name)
 }
 pub(super) unsafe fn host_endpoint_handle(handle: EndpointHandle) -> HostEndpoint {
     let Some(_guard) = Guard::for_device(handle.device) else {

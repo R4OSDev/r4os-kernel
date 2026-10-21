@@ -63,6 +63,21 @@ pub(super) unsafe fn remove_controller(controller_id: u32) {
     }
     s.count = keep as u32;
 }
+/// One atomic catalogue observation; compaction by a foreign controller
+/// cannot skip a binding between separate index reads.
+pub(super) fn contains_device(handle: super::xhci_types::DeviceHandle) -> bool {
+    let _guard = RuntimeGuard::acquire();
+    let s = unsafe { &*state() };
+    s.devices[..s.count as usize].iter().any(|d| {
+        d.active
+            && d.configured
+            && d.controller_id == handle.controller_id
+            && d.port == handle.port
+            && d.slot_id == handle.slot_id
+            && d.generation != 0
+            && d.generation == handle.generation
+    })
+}
 pub(super) unsafe fn publish(mut device: Device) -> Option<usize> {
     let _guard = RuntimeGuard::acquire();
     let s = unsafe { &mut *state() };

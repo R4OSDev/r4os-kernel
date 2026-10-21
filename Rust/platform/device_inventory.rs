@@ -280,6 +280,7 @@ pub struct UsbInput {
     pub interface_class: u8,
     pub interface_subclass: u8,
     pub interface_protocol: u8,
+    pub identity: crate::usb::xhci_types::DeviceHandle,
 }
 #[repr(C)]
 pub struct HidInput {
@@ -365,18 +366,24 @@ fn block_at(index: usize) -> Option<BlockInput> {
         None
     }
 }
-fn hid() -> HidInput {
+fn hid(device: &UsbInput) -> HidInput {
     let mut value = MaybeUninit::uninit();
     unsafe {
         inventory_hid(value.as_mut_ptr());
-        value.assume_init()
+        let mut value = value.assume_init();
+        (value.keyboard, value.mouse) = crate::usb::hid::binding_for(device.identity);
+        value
     }
 }
-fn msc() -> MscInput {
+fn msc(device: &UsbInput) -> MscInput {
     let mut value = MaybeUninit::uninit();
     unsafe {
         inventory_msc(value.as_mut_ptr());
-        value.assume_init()
+        let mut value = value.assume_init();
+        let binding = crate::usb::msc::binding_for(device.identity);
+        value.registered = binding.is_some();
+        value.write_protected = binding.unwrap_or(false);
+        value
     }
 }
 fn xhci(pci_function: crate::platform::pci_scan::Device, with_status: bool) -> XhciInput {
@@ -767,9 +774,9 @@ fn add_usb(snapshot: *mut Snapshot) {
             continue;
         }
         let name = usb_name(class, subclass, protocol);
-        let driver = usb_driver(class, subclass, protocol);
-        let status = usb_status(device.configured, class, subclass, protocol);
-        let note = usb_note(class, subclass, protocol);
+        let driver = usb_driver(&device, class, subclass, protocol);
+        let status = usb_status(&device, class, subclass, protocol);
+        let note = usb_note(&device, class, subclass, protocol);
         add(
             snapshot,
             Record {
@@ -807,9 +814,9 @@ fn usb_name(class: u8, subclass: u8, protocol: u8) -> &'static [u8] {
     }
     b"USB device"
 }
-fn usb_driver(class: u8, subclass: u8, protocol: u8) -> &'static [u8] {
-    let hid = hid();
-    let msc = msc();
+fn usb_driver(device: &UsbInput, class: u8, subclass: u8, protocol: u8) -> &'static [u8] {
+    let hid = hid(device);
+    let msc = msc(device);
     if class == 3
         && subclass == 1
         && ((protocol == 1 && hid.keyboard) || (protocol == 2 && hid.mouse))
@@ -821,9 +828,9 @@ fn usb_driver(class: u8, subclass: u8, protocol: u8) -> &'static [u8] {
     }
     b"usb/core"
 }
-fn usb_status(configured: bool, class: u8, subclass: u8, protocol: u8) -> &'static [u8] {
-    let hid = hid();
-    let msc = msc();
+fn usb_status(device: &UsbInput, class: u8, subclass: u8, protocol: u8) -> &'static [u8] {
+    let hid = hid(device);
+    let msc = msc(device);
     if class == 3 && subclass == 1 && protocol == 1 {
         if hid.keyboard {
             return b"bound-input";
@@ -846,15 +853,15 @@ fn usb_status(configured: bool, class: u8, subclass: u8, protocol: u8) -> &'stat
     if class == 8 && msc.missing != 0 {
         return b"blocked";
     }
-    if configured {
+    if device.configured {
         b"configured"
     } else {
         b"addressed"
     }
 }
-fn usb_note(class: u8, subclass: u8, protocol: u8) -> &'static [u8] {
-    let hid = hid();
-    let msc = msc();
+fn usb_note(device: &UsbInput, class: u8, subclass: u8, protocol: u8) -> &'static [u8] {
+    let hid = hid(device);
+    let msc = msc(device);
     if class == 3 && subclass == 1 && protocol == 1 {
         if hid.keyboard {
             return if r4p_source(hid.source) {
@@ -1032,6 +1039,12 @@ fn network_note(snapshot: *mut Snapshot, index: usize, adapter: &NetInput) -> Te
     writer.result()
 }
 fn xhci_note(snapshot: *mut Snapshot, pci_function: crate::platform::pci_scan::Device) -> Text {
+    // record() emits only the requested row's text. Preserve that exact
+    // function's note while collecting subsequent controllers, without a
+    // larger fixed-stack snapshot or borrowed shared note bytes.
+    if unsafe { (*snapshot).count != (*snapshot).requested_text_index } {
+        return Text::EMPTY;
+    }
     let host = xhci(pci_function, true);
     if !host.exists {
         return Text::new(b"xHCI host registry entry unavailable");
@@ -1039,9 +1052,19 @@ fn xhci_note(snapshot: *mut Snapshot, pci_function: crate::platform::pci_scan::D
     let out = unsafe { &mut *ptr::addr_of_mut!((*snapshot).xhci_note) };
     out.fill(0);
     let mut writer = NoteWriter::new(out);
-    writer.text(b"xHCI source=");
+    writer.text(b"xHCI id=");
+    writer.num(u64::from(crate::usb::xhci_state::host_id_for_pci(
+        pci_function,
+    )));
+    writer.text(b" pci=");
+    writer.num(u64::from(pci_function.bus));
+    writer.put(b':');
+    writer.num(u64::from(pci_function.device));
+    writer.put(b'.');
+    writer.num(u64::from(pci_function.function));
+    writer.text(b" source=");
     writer.text(host.source_label.slice());
-    writer.text(b"; sole canonical owner; state=");
+    writer.text(b" state=");
     writer.text(match host.state {
         0 => b"registered",
         1 => b"active",
@@ -1052,15 +1075,9 @@ fn xhci_note(snapshot: *mut Snapshot, pci_function: crate::platform::pci_scan::D
         writer.text(b"; status=unavailable");
         return writer.result();
     }
-    writer.text(b"; dispatch=");
-    writer.text(if host.flags & 15 == 15 {
-        b"port/control/bulk/interrupt"
-    } else {
-        b"partial"
-    });
     writer.text(b"; event=");
     writer.text(if host.flags & 16 != 0 {
-        b"irq+poll"
+        b"irq-cap+poll"
     } else {
         b"poll"
     });
@@ -1239,7 +1256,7 @@ const _: () = {
     assert!(core::mem::size_of::<Text>() == 16);
     assert!(core::mem::size_of::<DisplayInput>() == 32);
     assert!(core::mem::size_of::<BlockInput>() == 40);
-    assert!(core::mem::size_of::<UsbInput>() == 12);
+    assert!(core::mem::size_of::<UsbInput>() == 56);
     assert!(core::mem::size_of::<HidInput>() == 24);
     assert!(core::mem::size_of::<MscInput>() == 48);
     assert!(core::mem::size_of::<DriverInput>() == 96);
@@ -1313,6 +1330,9 @@ fn status_for(
     vendor: u16,
     device: u16,
 ) -> &'static [u8] {
+    if crate::usb::xhci_state::allocation_failed(pci_function) {
+        return b"failed-instance-memory";
+    }
     if vendor == 0x10ec && matches!(device, 0x8139 | 0x8168) && has_net(vendor, device) {
         return b"active-netbackend";
     }
@@ -1411,6 +1431,9 @@ fn note_for(
     } else if class == 1 && subclass == 8 {
         b"NVMe candidate; standard owner is NVME.R4D preload"
     } else if class == 12 && subclass == 3 && prog_if == 0x30 {
+        if crate::usb::xhci_state::allocation_failed(pci_function) {
+            return Text::new(b"xHCI instance allocation failed for this PCI function; other controllers continue");
+        }
         if xhci(pci_function, false).present {
             return xhci_note(snapshot, pci_function);
         }
@@ -1520,6 +1543,13 @@ unsafe fn inventory_usb(index: u64, out: *mut UsbInput) -> bool {
             interface_class: v.first_interface_class,
             interface_subclass: v.first_interface_subclass,
             interface_protocol: v.first_interface_protocol,
+            identity: crate::usb::xhci_types::DeviceHandle {
+                controller_id: v.controller_id,
+                generation: v.generation,
+                port: v.port,
+                slot_id: v.slot_id,
+                ..crate::usb::xhci_types::DeviceHandle::EMPTY
+            },
         });
     }
     true
